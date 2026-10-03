@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32 = **COMPLETE**；R33-A = **COMPLETE（PR #222 MERGED）**；R33-B = **COMPLETE（PR #223 MERGED）**；R33-C = **COMPLETE（PR #224 MERGED）**；R33 = **COMPLETE**；R34-A = **IN REVIEW**；R34-B/C = **NOT STARTED**；R34 = **NOT COMPLETE**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32 = **COMPLETE**；R33-A = **COMPLETE（PR #222 MERGED）**；R33-B = **COMPLETE（PR #223 MERGED）**；R33-C = **COMPLETE（PR #224 MERGED）**；R33 = **COMPLETE**；R34-A = **COMPLETE（PR #225 MERGED）**；R34-B = **IN REVIEW（未合并）**；R34-C = **NOT STARTED**；R34 = **NOT COMPLETE**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
@@ -3391,7 +3391,7 @@ R30 从 exact completed R29 run 与完整 `ExperimentSpec` 建立不可变计划
 缺少证据就标记 unavailable。Synthetic view 留在内存，不回写任何历史 owner。报告 ledger append-only，API 离线，
 Research Workspace 只渲染报告事实，unknown 保持 null；R30 不产生分数、晋级或生命周期状态。
 R30 exit matrix、全量验证和 exact-head CI 均已通过。完整 contract 与 API/UI 边界见
-[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md), [`docs/R32C_ISOLATED_SHADOW_RUNTIME.md`](docs/R32C_ISOLATED_SHADOW_RUNTIME.md), and [`docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance; R32-C runs an exact Shadow version only over frozen Active evidence and stores append-only isolated evidence; R32-D builds an immutable Active/Challenger comparison report from one exact Active evidence envelope, one exact ShadowRun and one explicit spec, appending only its own report table. **R32 and R33 are COMPLETE.** R34-A is IN REVIEW; R34-B/C are NOT STARTED; R34 is NOT COMPLETE.
+[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md), [`docs/R32C_ISOLATED_SHADOW_RUNTIME.md`](docs/R32C_ISOLATED_SHADOW_RUNTIME.md), and [`docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance; R32-C runs an exact Shadow version only over frozen Active evidence and stores append-only isolated evidence; R32-D builds an immutable Active/Challenger comparison report from one exact Active evidence envelope, one exact ShadowRun and one explicit spec, appending only its own report table. **R32 and R33 are COMPLETE.** R34-A is COMPLETE; R34-B is IN REVIEW; R34-C is NOT STARTED; R34 is NOT COMPLETE.
 
 ### 仅作 review signal（不进入 CI gate）
 
@@ -3544,7 +3544,32 @@ GET  /api/portfolio/runtime/snapshots/{snapshot_id}
 
 R34-A 只记录 cycle economic owners、execution participants、as-of risk-exit owners、capital 与 strategy/symbol cost basis 等事实。缺 exact market valuation、classification、turnover window、risk-consumption history、signal intent、pending-capacity history 或 strategy-version return-series owner 时，维度保持 PARTIAL/UNAVAILABLE。成本不是市值；缺失不是零；R33 health 不参与打分。
 
-Cycle owns capital. Lifecycle controls execution permission. Existing exposure still owns risk-exit rights. Snapshot capture 只写自己的 append-only 表，不写正式账本、lifecycle、allocation 或 order；没有 latest/current getter。R34-B allocator policy 与 R34-C production wiring 均保留为后续阶段，本 PR 停在 R34-A review。
+Cycle owns capital. Lifecycle controls execution permission. Existing exposure still owns risk-exit rights. Snapshot capture 只写自己的 append-only 表，不写正式账本、lifecycle、allocation 或 order；没有 latest/current getter。R34-A 已以 merge commit `186e0bf` 合并。
+
+## R34-B authority graph（deterministic multi-strategy allocation policy）
+
+```text
+exact PortfolioRuntimeSnapshot（显式 snapshot_id；指纹验证）
+        + exact cycle-pinned strategy resource declarations
+        + explicit resource intents（显式 intent_kind）
+        ↓
+portfolio_allocation_policy.build_portfolio_allocation_plan（纯、确定性）
+        ↓
+PortfolioAllocationPlan（plan_id == plan_fingerprint；policy version 进指纹）
+        ↓
+portfolio_allocation_repository（append-only; exact plan ID read）
+        ↓
+POST /api/portfolio/allocation/plans
+GET  /api/portfolio/allocation/plans/{plan_id}
+        ↓
+STOP（R34-B 只生成计划，不执行计划）
+```
+
+Authority 裁决：`paper_allocation` 仍是**唯一** allocation arithmetic owner；R34-B 没有创造第三套 allocator。新增的 `position_limits_from_weights` 是唯一算术核，legacy `position_limits` 变成 `StrategyRuntime → effective_weight → position_limits_from_weights` 的适配层，公开签名、输出结构与行为不变（由 300+ 组合差分回归证明）。
+
+Canonical 权重是显式声明，必须严格覆盖 `execution_participant_ids`；`StrategyRuntime` 六个动态因子的缺省 `1.0` 不是 owner evidence，canonical path 绝不消费，R33 health 不映射成数值因子。新资源资格只认 `execution_participant_ids`：`economic_owner_ids` 保留经济归属、`risk_exit_participant_ids` 保留退出权，都不授予新开仓资源。Allocator 不产生 strategy signal、不计算 Risk ALLOW/BLOCK、不改 lifecycle。
+
+缺证据即缺证据：容量缺失不变成 `pending = 0`，市值缺失不让成本价冒充，correlation 缺失不变成 0，分类缺失不生成集中度事实，capacity 仅在 owner-issued `used`/`pending`/`headroom` 齐全时给出 PLANNED（且原样透传，不派生）。v1 实际能力为 `slot_plan` / `conflict_plan` = PLANNED，`capital_plan` / `capacity_plan` = INSUFFICIENT_EVIDENCE，`concentration_adjustment` / `correlation_term` = UNAVAILABLE，整体 `plan_status` = PARTIAL；计划只追加写自己的表，没有 apply/execute 或 latest/current 路径。旧 `portfolio_coordinator` 的文本猜意图路径（`classify_intent` / `sort_intents_by_priority` / `_EXIT_PURPOSE_KEYWORDS` 及三个死常量）因生产调用者为 0 而删除，其余仍有生产 caller 的 legacy 路径保留为 R34-C 收敛目标。完整契约见 [`docs/R34_MULTI_STRATEGY_PORTFOLIO.md`](docs/R34_MULTI_STRATEGY_PORTFOLIO.md)。
 
 ## 架构演进记录（历史批次：模块化与边界固化）
 

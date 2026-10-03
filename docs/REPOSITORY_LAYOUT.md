@@ -92,6 +92,20 @@ R34-A 加入组合运行事实链：`portfolio_runtime`（纯、确定性 exact 
 `paper_schema_migrations` / `db_migrate` 唯一维护；新增路由仅提供
 `POST /api/portfolio/runtime/snapshots` 与 `GET /api/portfolio/runtime/snapshots/{snapshot_id}`。
 它不调用 allocator/coordinator，不写正式 paper ledger、lifecycle 或订单，也没有 current/latest 路由。
+R34-B 加入多策略分配计划链：`portfolio_allocation_policy`（纯、确定性 policy contract：
+canonical 意图词汇、严格权重/声明覆盖校验、证据闸门、`PortfolioAllocationPlan` 构建；
+算术仍全部委托 `paper_allocation.position_limits_from_weights`）、
+`portfolio_allocation_repository`（append-only + exact plan ID 查询）、
+`portfolio_allocation_service`（读取显式 snapshot、验证指纹、装配 exact cycle-pinned 声明、
+评估 policy 并追加计划）。同时 `paper_allocation.position_limits` 被重构为
+`StrategyRuntime → effective_weight → position_limits_from_weights` 的 legacy 适配层，
+公开签名/输出结构与行为不变。新增路由仅
+`POST /api/portfolio/allocation/plans` 与 `GET /api/portfolio/allocation/plans/{plan_id}`。
+旧 `portfolio_coordinator` 的 `classify_intent` / `sort_intents_by_priority` /
+`_EXIT_PURPOSE_KEYWORDS` / 三个 `INTENT_*` 常量因生产调用者为 0 而删除；
+`pending_symbol_amounts`、`pending_risk_exit_codes`、`aggregate_exposure`、
+`symbol_headroom`、`theme_for` 仍有生产 caller，保留到 R34-C 收敛。
+它不写正式 paper ledger、lifecycle、orders 或 risk decision，也不 apply/execute 计划。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

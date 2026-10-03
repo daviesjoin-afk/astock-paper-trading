@@ -86,7 +86,7 @@ research → validation_failed
 
 ### R32 阶段状态与可比较运行上下文
 
-R31、R32、R33 **COMPLETE**；R34-A **IN REVIEW**；R34-B/C **NOT STARTED**；R34 **NOT COMPLETE**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
+R31、R32、R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **IN REVIEW**；R34-C **NOT STARTED**；R34 **NOT COMPLETE**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
 
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 
@@ -309,7 +309,11 @@ StrategyHealthSnapshot → StrategyRetirementPolicy → StrategyRetirementDecisi
 Proposal 与 approval 只追加，不维护 current/latest retirement 状态。执行时重新读取并验证
 decision、snapshot 指纹、immutable version/checksum、当前 lifecycle state 与合法迁移；任何漂移
 都 fail closed。没有自动审批、调度器或后台退休路径；workflow 不写 cash、positions、orders、fills。
-R33-C 已合并，R33 为 **COMPLETE**。R34-A 的 portfolio runtime 是只读 exact facts 快照：经济所有权、执行参与者、risk-exit 参与者与 allocation 分开；没有 exact market/classification/return-series owner 的维度保持 unavailable。R34-A 不 rank、不分配、不写交易或 lifecycle，R34-B/C 尚未开始。
+R33-C 已合并，R33 为 **COMPLETE**。R34-A 的 portfolio runtime 是只读 exact facts 快照：经济所有权、执行参与者、risk-exit 参与者与 allocation 分开；没有 exact market/classification/return-series owner 的维度保持 unavailable。R34-A 不 rank、不分配、不写交易或 lifecycle。
+
+R34-A 已以 merge commit `186e0bf` 合并（**COMPLETE**）。R34-B 在此之上建立**唯一**的确定性多策略分配 policy：输入是 exact `PortfolioRuntimeSnapshot` + exact cycle-pinned 策略资源声明 + 显式资源意图（显式 `intent_kind`），输出是不可变的 `PortfolioAllocationPlan`，`[STOP]` —— 本阶段只生成计划，不执行计划。三个 authority 继续严格分离：Strategy 决定想做什么、Allocator 决定给多少资源以及资源冲突时的先后、Risk 决定是否放行；Allocator 不产生 strategy signal、不计算 Risk ALLOW/BLOCK、不改 lifecycle，也没有 apply/execute 或 latest/current 路由。
+
+canonical 权重是**显式声明**，必须严格覆盖 `execution_participant_ids`；`StrategyRuntime` 六个动态因子的缺省 `1.0` 不是 owner evidence，canonical path 绝不消费，R33 健康证据也不映射成数值因子。缺证据时如实返回 `INSUFFICIENT_EVIDENCE` / `UNAVAILABLE`：容量缺失不变成 `pending = 0`，市值缺失不让成本价冒充，correlation 缺失不变成 0，分类缺失不生成集中度事实。v1 的实际能力是 `slot_plan` / `conflict_plan` = **PLANNED**，`capital_plan` / `capacity_plan` = **INSUFFICIENT_EVIDENCE**，`concentration_adjustment` / `correlation_term` = **UNAVAILABLE**，整体 `plan_status` = **PARTIAL**。完整契约见 [`R34_MULTI_STRATEGY_PORTFOLIO.md`](R34_MULTI_STRATEGY_PORTFOLIO.md)。R34-C 尚未开始。
 
 ### Workspace identity 契约
 

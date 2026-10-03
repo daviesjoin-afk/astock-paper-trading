@@ -2,11 +2,13 @@
 
 ## Scope and baseline
 
-R34 is delivered in three reviewed stages: R34-A captures exact portfolio runtime facts; R34-B consumes those facts for allocation/conflict/capacity policy; R34-C wires approved plans into production and converges callers. This document is the R34-A owner inventory and scope boundary.
+R34 is delivered in three reviewed stages: R34-A captures exact portfolio runtime facts; R34-B consumes those facts for allocation/conflict/capacity policy; R34-C wires approved plans into production and converges callers. This document is the R34 owner inventory and scope boundary for R34-A and R34-B.
 
 R34-A base (`R34_BASE`): `a1ee679b4609b1f7d44f88151614b379f7cc6ffa` (R33-C merge commit; PR #224). Branch: `codex/r34a-portfolio-runtime-facts`.
 
-This stage records what an explicitly selected cycle owned or exposed at a stated time. It does not rank strategies, choose weights, grant or block risk permission, change capital, or place orders. No frontend is planned for R34-A.
+R34-B base: `186e0bfb4e2c4c6da67ecb2c68086ffed1b19f04` (R34-A merge commit; PR #225). Branch: `codex/r34b-portfolio-allocation-policy`. The tree at this merge commit is identical to the approved R34-A head `771921d64d87bf09981e2c58cec309c0a767f4c0`.
+
+R34-A records what an explicitly selected cycle owned or exposed at a stated time. R34-B turns those facts, plus explicit strategy declarations and explicit resource intents, into one deterministic allocation plan. Neither stage ranks strategies, grants or blocks risk permission, changes capital, places orders, or exposes a frontend.
 
 ## Frozen authority boundaries
 
@@ -59,17 +61,211 @@ Pausing, retiring, or archiving a strategy must not detach its cycle account. An
 - Dimensions currently provide bounded capital/accounting and per-account/per-symbol cost basis. Market value, concentration, turnover, risk consumption, signal conflict, pending capacity, and correlation are honestly PARTIAL/UNAVAILABLE because exact owner inputs are absent; no zero, cost-as-market, style guess, or allocation score is emitted.
 - Capture persists only its append-only snapshot row. It reads exact-cycle ownership/pins/lifecycle and bounded as-of lots/accounting; it does not write the formal ledger or lifecycle.
 
+## R34-B owner arbitration
+
+R34-B does **not** create a third allocation implementation. `paper_allocation`
+stays the only owner of allocation arithmetic; the new policy layer only owns a
+contract, strict input validation, the policy version, the evidence gates,
+orchestration of the existing pure arithmetic, and the plan builder.
+
+### `paper_allocation.py` — retained as the sole allocation arithmetic owner
+
+| Symbol | Nature | Production callers | R34-B disposition |
+| --- | --- | --- | --- |
+| `position_limits_from_weights` | pure arithmetic core over **given** weights and declared caps/floors (new) | `portfolio_allocation_policy` (canonical), `position_limits` (legacy) | the single arithmetic site |
+| `position_limits` | legacy adapter: `StrategyRuntime` → `effective_weight()` → core | `paper_trading.py` (`_dynamic_position_limits`) | public signature, output shape and behavior unchanged |
+| `strategy_pool_budget` | pure, `weights=` override only overwrites known keys | `paper_trading.py` | legacy contract unchanged; canonical coverage is validated in the policy before any arithmetic call |
+| `allocation_plan`, `pool_headroom`, `deployable_budget`, `stage_capital_scale`, `minimum_deployable_budget`, `diversification_factor` | pure arithmetic | `paper_trading.py`, `strategy_runtime.py` | reused as-is; never copied |
+| `StrategyRuntime.effective_weight()` (six dynamic factors, default `1.0`) | pure, but the defaults are **not** owner evidence | no external caller | kept for the legacy path; the canonical path never reaches it |
+
+### `portfolio_coordinator.py` — no longer a canonical authority
+
+| Symbol | Nature | Production callers before | R34-B disposition |
+| --- | --- | --- | --- |
+| `classify_intent` | free-text keyword guess of business intent | **0** | **deleted** |
+| `sort_intents_by_priority` | pure sorter over the deleted classification | **0** | **deleted** |
+| `_EXIT_PURPOSE_KEYWORDS` | keyword table for the above | **0** | **deleted** |
+| `INTENT_PRIORITY`, `INTENT_PRIORITY_INDEX`, `INTENT_LABELS` | dead constants once the two functions above were removed | **0** | **deleted**; the canonical vocabulary lives in `portfolio_allocation_policy` |
+| `PORTFOLIO_COORDINATOR_VERSION` | version string | `aggregate_exposure`, `symbol_headroom` | **kept** |
+| `DEFAULT_THEME_MAP`, `theme_for` | legacy static industry→theme map | `paper_trading.py` | **kept**; canonical concentration stays `UNAVAILABLE` |
+| `pending_symbol_amounts`, `pending_risk_exit_codes` | DB-bound; `sqlite3.Error` → `{}` / `set()` | `paper_trading.py` | **kept**; **forbidden** on the canonical path |
+| `_positions_and_quotes` | substitutes position cost when a quote is absent | internal | **forbidden** on the canonical path |
+| `aggregate_exposure`, `symbol_headroom` | pure, but cost-as-market inputs | `paper_trading.py` | **kept**, R34-C migration target |
+
+### Convergence table
+
+| Business rule | Current owner | Canonical future owner | Callers before | R34-B callers after | R34-C migration target | Deletion candidate |
+| --- | --- | --- | --- | --- | --- | --- |
+| Slot allocation arithmetic | `paper_allocation.position_limits` | same, via `position_limits_from_weights` | 1 (`paper_trading`) | 1 legacy + 1 canonical | converge on the core | no |
+| Legacy declaration → weight derivation | `StrategyRuntime.effective_weight` | explicit canonical weights | 1 (`paper_trading`) | unchanged | migrate callers off dynamic factors | no |
+| Resource execution priority | `portfolio_coordinator.classify_intent` / `sort_intents_by_priority` | `portfolio_allocation_policy.INTENT_KINDS` | 0 | **0** | — | **deleted in R34-B** |
+| Pending buy capacity | `portfolio_coordinator.pending_symbol_amounts` | exact as-of capacity dimension (absent) | 3 (`paper_trading`) | 3 legacy | exact capacity owner | no |
+| Risk-exit in-flight codes | `portfolio_coordinator.pending_risk_exit_codes` | exact as-of intents (absent) | 1 (`paper_trading`) | 1 legacy | exact intent evidence | no |
+| Symbol/industry/theme exposure | `portfolio_coordinator.aggregate_exposure` / `symbol_headroom` | market-valued exposure dimension (absent) | 5 (`paper_trading`) | 5 legacy | market valuation owner | no |
+
+## Canonical weight semantics
+
+The canonical weight of a strategy is an **explicit declaration**, supplied by
+the caller and required to cover exactly the snapshot's eligible resource
+strategy ids. The canonical path never reads `StrategyRuntime.health`,
+`regime_fit`, `confidence`, `data_quality`, or `diversification`; those fields
+default to `1.0` in the library and a default is not owner-issued evidence.
+R33 health evidence is not mapped to a numeric factor. A weight set that misses
+a strategy fails closed as `canonical_allocation_weight_set_incomplete`; a weight
+set with a stray strategy fails closed as
+`canonical_allocation_weight_set_exceeds_eligible`. There is no fallback to a
+dynamic factor, no fallback to `1.0`, and no silent ignore.
+
+## R34-B v1 capability boundary
+
+What the current R34-A evidence actually supports, and the resulting honest plan
+status:
+
+| R34-A fact | Status | R34-B component | v1 result |
+| --- | --- | --- | --- |
+| `execution_participant_ids` | AVAILABLE | `slot_plan` | **PLANNED** |
+| explicit `intent_kind` + canonical priority | supplied by the caller | `conflict_plan` | **PLANNED** |
+| `strategy_exposure` | PARTIAL — cost basis only, `market_value_by_account` is `None` | `capital_plan` | **INSUFFICIENT_EVIDENCE** |
+| `capacity` | UNAVAILABLE | `capacity_plan` | **INSUFFICIENT_EVIDENCE** |
+| `concentration` | UNAVAILABLE | `concentration_adjustment` | **UNAVAILABLE** |
+| `correlation` | UNAVAILABLE | `correlation_term` | **UNAVAILABLE** |
+
+Overall `plan_status` for a non-empty eligible set is therefore **PARTIAL**: some
+resource facts are computable, others are not. Forbidden substitutions are
+enforced and asserted: cost basis never becomes market value, missing pending is
+never `0`, missing capacity is never unlimited, missing correlation is never `0`,
+missing classification never creates a concentration fact, and a missing dynamic
+factor is never claimed as `1.0`. Capacity is only reported as `PLANNED` when
+the owner-issued `used`/`pending`/`headroom` facts are actually present, in which
+case they are echoed verbatim rather than derived.
+
+New-resource eligibility reads **only**
+`PortfolioRuntimeSnapshot.execution_participant_ids`. `economic_owner_ids` keeps
+economic ownership and `risk_exit_participant_ids` keeps exit rights; neither
+grants new-entry resources. A paused economic owner therefore retains ownership
+and receives no new-resource allocation, and a risk-exit-only account can exit
+but receives no entry allocation. No second eligibility resolver exists.
+
+## PortfolioAllocationPlan contract
+
+Immutable, fingerprinted, and input-order independent. `plan_id` equals
+`plan_fingerprint`; `created_at` is persistence metadata and never fingerprint
+material; `portfolio-allocation-policy-v1` is bound into the fingerprint, so
+changing allocation arithmetic, priority rules, conflict rules, or required
+evidence requires a policy version bump and old plans do not drift.
+
+Carried fields: `plan_id`, `plan_fingerprint`, `portfolio_snapshot_id`,
+`portfolio_snapshot_fingerprint`, `allocation_policy_version`, `cycle_id`,
+`asof_day`, `decision_at`, `strategy_pins`,
+`eligible_resource_strategy_ids`, `strategy_resource_declarations`,
+`allocation_weights`, `slot_plan`, `capital_plan`, `conflict_plan`,
+`capacity_plan`, `concentration_adjustment`, `correlation_term`,
+`blocking_reasons`, `source_identities`, `source_fingerprints`, `plan_status`.
+
+Conflict policy consumes only explicit intents with an explicit `intent_kind`
+from the canonical vocabulary `RISK_EXIT > TAKE_PROFIT_EXIT > MANUAL_EXIT >
+RISK_REDUCE > NEW_ENTRY > ADD_POSITION`. That ordering is resource *execution*
+priority, never a Risk approval. Opposite intents on one symbol are never netted
+away: both keep their own provenance and their own arbitration result, and a
+RISK_EXIT is never deferred behind an entry. The allocator emits no ALLOW/BLOCK
+and produces no Risk decision; the future production chain remains Strategy
+intent → allocation allowance → Risk authority → execution, with Risk always
+able to block.
+
+`plan_status` uses only `PLANNED`, `PARTIAL`, `INSUFFICIENT_EVIDENCE`, and
+`NO_ELIGIBLE_STRATEGIES`. There is no `GOOD_PORTFOLIO`/`BAD_PORTFOLIO`/`OPTIMAL`,
+no score, no rank, and no winner.
+
+## Persistence, service and API
+
+`portfolio_allocation_plans` is created by migration v31
+(`paper_schema_migrations.ensure_portfolio_allocation_plans`) with
+`CHECK(plan_id = plan_fingerprint)` and append-only `no_update` / `no_delete`
+triggers. The repository exposes `append_plan()` and an exact `get_plan(plan_id)`
+only — no `get_latest_plan`, no `get_current_plan`, no overwrite, no delete. A
+repeated append of the same `plan_id` is idempotent; the same `plan_id` with
+different content is a conflict. No runtime DDL anywhere.
+
+`portfolio_allocation_service` loads the exact named snapshot, verifies its
+fingerprint, loads the exact cycle-pinned declarations (identity from the
+snapshot pins, caps from the exact pinned version's compiled risk profile),
+validates the explicit intents, evaluates the policy, and appends the plan. It
+never writes `paper_accounts`, `paper_cycles`, orders, fills, position lots, risk
+decisions or lifecycle, and never creates schema.
+
+`POST /api/portfolio/allocation/plans` and
+`GET /api/portfolio/allocation/plans/{plan_id}` are the only endpoints. There is
+no `current`, no `latest`, no `rebalance-now`, and no apply/execute path.
+
 ## R34 stage boundary
 
 ```text
-Existing Owners → Portfolio Runtime Facts → PortfolioRuntimeSnapshot → STOP (R34-A)
-PortfolioRuntimeSnapshot → R34-B Allocator Policy → AllocationPlan (reserved)
+Exact Portfolio Snapshot
+        + Exact Strategy Allocation Declarations
+        + Explicit Resource Intents
+        ↓
+Multi-Strategy Allocation Policy (portfolio-allocation-policy-v1)
+        ↓
+PortfolioAllocationPlan
+        ↓
+STOP (R34-B)
 ```
 
-R34-B is responsible for resource allocation, budgets, conflict arbitration, and capacity policy while reusing `paper_allocation` and coordinator ownership. R34-C is responsible for production wiring, old caller migration/removal, and the Portfolio Workspace. Neither is implemented here.
+R34-C is responsible for controlled production wiring, resource reservation and
+sizing, old caller migration/removal, and the Portfolio Workspace:
 
-## R34-A verification and status
+```text
+PortfolioAllocationPlan
+        ↓
+R34-C Controlled Production Wiring
+        ↓
+Sizing / Resource Reservation
+        ↓
+Risk
+        ↓
+Execution
+```
 
-Focused owner suites and `test_portfolio_runtime` pass. Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 12/12 detected; survived/fake/timeout = 0; restore SHA256 PASS. PA21/PA22 guard historical exact owner resolution; PA23 guards the service/schema ownership boundary. Snapshot DDL remains owned by migration v30 and `paper_trading.init_db`.
+## Verification and status
 
-R31, R32, and R33 are COMPLETE. R34-A is IN REVIEW after this PR; R34-B/C and R34 are NOT STARTED/NOT COMPLETE; R35–R37 are NOT STARTED. This PR remains unmerged and undeployed until human review.
+R34-A: focused owner suites and `test_portfolio_runtime` pass; mutation matrix
+`work/r34a_portfolio_runtime_mutation_check.py` reports M-P1…M-P12 12/12
+detected, survived/fake/timeout = 0, restore SHA256 PASS. PA21/PA22 guard
+historical exact owner resolution; PA23 guards the service/schema ownership
+boundary. Snapshot DDL remains owned by migration v30.
+
+R34-B: `test_portfolio_allocation_policy` covers B1–B36 plus the canonical
+business invariants migrated off the deleted text-derived path;
+`test_paper_allocation_limits_equivalence` proves the `position_limits` refactor
+is behavior-equivalent to the pre-refactor arithmetic over a 300+ case sweep
+(0/1/N strategies, varied weights, caps, mins, `account_order`,
+`protected_slot_floor`, `baseline_exposure`, comparing `total_cap`,
+`risk_scale`, `protected_slot_floor`, `limits`, `effective_weights`); mutation
+matrix `work/r34b_allocation_mutation_check.py` reports M-B1…M-B20 20/20
+detected, survived/fake/timeout = 0, restore SHA256 PASS. Plan DDL is owned by
+migration v31.
+
+Review follow-ups closed at this head:
+
+- B31 / B32: a negative pool or slot bound and a negative canonical weight fail
+  closed instead of being fed to the arithmetic (a negative bound previously
+  produced a `PLANNED` plan with negative `total_cap` and negative per-strategy
+  limits).
+- B33: an intent the policy has already denied no longer arbitrates, so a denied
+  `RISK_EXIT` cannot defer a valid entry for the same symbol.
+- B34: the strategy declaration carries an allocation **stage**, not the raw
+  lifecycle state. `paper` is a lifecycle state, not a stage, and passing it
+  straight through fell into the unknown-stage branch and silently declared the
+  quarantined capital scale of `0.0` for every real strategy. The stage now comes
+  from the existing owner mapping `strategy_runtime.lifecycle_stage_for` instead
+  of a second, parallel rule.
+- B35: allocation stage uses exact pinned-version metadata together with the
+  snapshot lifecycle state. The service regression pins v1/pilot, advances the
+  registry head to v2/mature, and verifies the plan retains v1 identity and pilot.
+- B36: only `risk_exit_participant_ids` grants exit eligibility. An economic-only
+  paused owner without an as-of open lot is denied `RISK_EXIT` scope and cannot
+  defer an eligible same-symbol `NEW_ENTRY`.
+
+R31, R32, and R33 are COMPLETE. R34-A is COMPLETE. R34-B is IN REVIEW after this
+PR; R34-C is NOT STARTED; R34 is NOT COMPLETE; R35–R37 are NOT STARTED. This PR
+remains unmerged and undeployed until human review.

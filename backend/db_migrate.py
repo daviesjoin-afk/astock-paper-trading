@@ -332,6 +332,11 @@ MIGRATIONS = {
         # R34-A：精确 cycle/as-of 组合运行事实的 append-only 快照 owner。
         (30, "新增组合运行事实追加快照表（幂等，不回填）",
          paper_schema.ensure_portfolio_runtime_snapshots),
+        # R34-B：多策略分配计划是 policy **输出**的追加式 owner。它不写正式
+        # 账本、不占席位、不下单，也没有 latest/current 这类会诱导「最新计划」
+        # 的路径。DDL 单一事实来源同样在 paper_schema_migrations。
+        (31, "新增多策略分配计划追加证据表（幂等，不回填）",
+         paper_schema.ensure_portfolio_allocation_plans),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

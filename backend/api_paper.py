@@ -10,6 +10,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 import paper_trading as P
+import portfolio_allocation_policy as PAP
+import portfolio_allocation_repository as PAPRepo
+import portfolio_allocation_service as PAS
 import portfolio_runtime as PR
 import portfolio_runtime_repository as PRRepo
 import portfolio_runtime_service as PRS
@@ -18,6 +21,26 @@ import portfolio_runtime_service as PRS
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
 portfolio_runtime_router = APIRouter(prefix="/api/portfolio/runtime",
                                      tags=["portfolio-runtime-facts"])
+portfolio_allocation_router = APIRouter(prefix="/api/portfolio/allocation",
+                                        tags=["portfolio-allocation-policy"])
+
+
+class AllocationIntentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    intent_id: str
+    account_id: str
+    intent_kind: str
+    symbol: str
+    requested_amount: float | None = None
+    source_identity: str = ""
+
+
+class PortfolioAllocationPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    portfolio_snapshot_id: str
+    allocation_weights: dict[str, float]
+    resource_intents: list[AllocationIntentRequest] = []
+    hard_pool_cap: int | None = None
 
 
 class PortfolioRuntimeCaptureRequest(BaseModel):
@@ -50,6 +73,35 @@ def get_portfolio_runtime_snapshot(snapshot_id: str):
     except (PR.PortfolioRuntimeError, PRRepo.PortfolioRuntimeRepositoryError,
             ValueError) as exc:
         status = 404 if str(exc) == "portfolio_snapshot_not_found" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+@portfolio_allocation_router.post("/plans", status_code=201)
+def capture_portfolio_allocation_plan(payload: PortfolioAllocationPlanRequest):
+    """Produce one allocation plan for the exact named snapshot.
+
+    This endpoint only evaluates policy and records the plan. It does not apply
+    the plan, does not place or cancel orders, and emits no Risk ALLOW/BLOCK.
+    """
+    try:
+        return PAS.capture_portfolio_allocation_plan(
+            portfolio_snapshot_id=payload.portfolio_snapshot_id,
+            allocation_weights=payload.allocation_weights,
+            resource_intents=[item.model_dump() for item in payload.resource_intents],
+            hard_pool_cap=payload.hard_pool_cap)
+    except (PAP.PortfolioAllocationPolicyError,
+            PAPRepo.PortfolioAllocationRepositoryError, ValueError) as exc:
+        status = 404 if str(exc) == "portfolio_snapshot_not_found" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@portfolio_allocation_router.get("/plans/{plan_id}")
+def get_portfolio_allocation_plan(plan_id: str):
+    """Read only the exact immutable plan named by its fingerprint ID."""
+    try:
+        return PAS.get_portfolio_allocation_plan(plan_id)
+    except (PAP.PortfolioAllocationPolicyError,
+            PAPRepo.PortfolioAllocationRepositoryError, ValueError) as exc:
+        status = 404 if str(exc) == "portfolio_allocation_plan_not_found" else 400
         raise HTTPException(status_code=status, detail=str(exc)) from exc
 
 # ─── 内存缓存 ───

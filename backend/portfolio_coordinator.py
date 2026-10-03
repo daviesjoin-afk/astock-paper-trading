@@ -4,57 +4,38 @@
 各策略账本保持独立，但 **风险按共享组合汇总**：同一 symbol 的持仓在所有
 策略间合并计算，行业与主题（theme）敞口同样合并。本模块提供：
 
-1. **意图优先级**：``P0 风控退出 > P1 止盈/轮出 > P2 手动卖出 > P3 风险减仓
-   > P4 新开仓 > P5 加仓``。P0 在途时，同一标的的 P5 加仓必须让位。
-2. **聚合敞口**：把持仓 + 在途买单按 symbol / industry / theme 三个维度
+1. **聚合敞口**：把持仓 + 在途买单按 symbol / industry / theme 三个维度
    汇总，供 sizing 与闸门使用。
-3. **symbol 余量**：``symbol_headroom`` 回答"这个 symbol 还能买多少"——
+2. **symbol 余量**：``symbol_headroom`` 回答"这个 symbol 还能买多少"——
    已用 = 全策略持仓市值 + **全策略在途买单金额**。没有在途口径时，两个
    策略同时买入同一标的会各自只看到已成交部分，合计击穿单票上限。
 
 失败语义：数据库读取异常一律按"无在途单"返回空集合（读失败不阻塞主扫描），
-真正的硬上限仍由 sizing 与风控兜底。
+真正的硬上限仍由 sizing 与风控兜底。这两个 fallback（读失败→空集合、
+缺 quote→成本价）是 legacy 兼容语义，属于 R34-C 收敛目标，**不得**被
+canonical 组合分配 policy 消费。
+
+意图优先级**不在**本模块：``classify_intent`` / ``sort_intents_by_priority``
+曾按 purpose 自由文本猜业务语义，磁盘上生产调用者为 0，已于 R34-B 删除。
+canonical 意图词汇与优先级顺序由 ``portfolio_allocation_policy`` 自己拥有，
+且要求上游显式提供 ``intent_kind``，不从 reason/purpose/audit 文本反推。
 """
 from __future__ import annotations
 
 import sqlite3
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 __all__ = [
     "PORTFOLIO_COORDINATOR_VERSION",
-    "INTENT_PRIORITY",
-    "INTENT_PRIORITY_INDEX",
     "DEFAULT_THEME_MAP",
     "aggregate_exposure",
-    "classify_intent",
     "pending_risk_exit_codes",
     "pending_symbol_amounts",
-    "sort_intents_by_priority",
     "symbol_headroom",
     "theme_for",
 ]
 
 PORTFOLIO_COORDINATOR_VERSION = "portfolio-coordinator-v1"
-
-# 意图优先级：数字越小越优先。P0 风控退出永远先于一切买入意图执行。
-INTENT_PRIORITY: tuple[tuple[str, str, str], ...] = (
-    ("P0", "risk_exit", "风控退出（硬止损/强平/崩盘清仓）"),
-    ("P1", "take_profit_exit", "止盈/轮出退出"),
-    ("P2", "manual_exit", "手动卖出"),
-    ("P3", "risk_reduce", "风险减仓（部分止盈/降敞口）"),
-    ("P4", "new_entry", "新开仓"),
-    ("P5", "add_position", "确认加仓"),
-)
-INTENT_PRIORITY_INDEX = {name: index for index, (name, _, _) in enumerate(INTENT_PRIORITY)}
-INTENT_LABELS = {name: label for name, _, label in INTENT_PRIORITY}
-
-# 卖出意图的 purpose 关键字 → 优先级（新买入默认 P4，加仓默认 P5）。
-_EXIT_PURPOSE_KEYWORDS = (
-    ("P0", ("hard_stop", "崩盘", "强平", "liquidation", "risk_exit", "drawdown")),
-    ("P1", ("take_profit", "轮出", "rotation_out", "scale_out")),
-    ("P2", ("manual",)),
-    ("P3", ("reduce", "降敞口", "partial")),
-)
 
 # 行业 → 主题（theme）聚合的保守默认映射；未命中的行业自成主题。
 DEFAULT_THEME_MAP: dict[str, str] = {
@@ -73,39 +54,6 @@ DEFAULT_THEME_MAP: dict[str, str] = {
     "汽车": "汽车制造", "汽车零部件": "汽车制造",
     "运输": "交运物流", "物流": "交运物流", "航空": "交运物流", "港口": "交运物流",
 }
-
-
-def classify_intent(side: str, purpose: str = "") -> dict[str, Any]:
-    """把一笔意图（买卖方向 + 目的）归类到 P0–P5 优先级。"""
-    side_name = str(side or "").strip().lower()
-    purpose_text = str(purpose or "").strip().lower()
-    if side_name == "sell":
-        priority = "P3"
-        for name, keywords in _EXIT_PURPOSE_KEYWORDS:
-            if any(keyword.lower() in purpose_text for keyword in keywords):
-                priority = name
-                break
-    elif side_name == "buy":
-        priority = "P4"
-    else:
-        priority = "P4"
-    if "add" in purpose_text or "加仓" in purpose_text or "scale_in" in purpose_text:
-        priority = "P5" if side_name == "buy" else priority
-    return {
-        "side": side_name or "buy",
-        "priority": priority,
-        "label": INTENT_LABELS.get(priority, priority),
-        "version": PORTFOLIO_COORDINATOR_VERSION,
-    }
-
-
-def sort_intents_by_priority(intents: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """按 P0→P5 稳定排序意图；缺省优先级的意图按 P4 处理。"""
-    def _key(item: Mapping[str, Any]) -> tuple[int, int]:
-        priority = str(item.get("priority") or "")
-        return (INTENT_PRIORITY_INDEX.get(priority, INTENT_PRIORITY_INDEX["P4"]), int(item.get("order", 0)))
-
-    return [dict(item) for item in sorted(intents, key=_key)]
 
 
 def theme_for(industry: Any, theme_map: Mapping[str, str] | None = None) -> str:

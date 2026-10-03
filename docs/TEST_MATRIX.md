@@ -538,5 +538,25 @@
 
 Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 **12/12 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。PA23 additionally guards that the service does not import migrations or invoke snapshot DDL; schema remains in migration v30 / `paper_trading.init_db`.
 
-阶段状态：R31/R32/R33 **COMPLETE**；R34-A **IN REVIEW**；R34-B/C **NOT STARTED**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
+阶段状态：R34-A **COMPLETE**（PR #225 已以 merge commit `186e0bf` 合并，tree 与 approved head 完全一致）。
+
+## R34-B Deterministic Multi-Strategy Allocation Policy（IN REVIEW）
+
+| 契约 | 断言 | 测试 | mutation |
+| --- | --- | --- | --- |
+| 计划身份确定性 | 同精确输入同 fingerprint；`plan_id == plan_fingerprint`；`created_at` 不进指纹；policy version 进指纹；输入顺序（声明/权重/意图）不改变计划 | `test_portfolio_allocation_policy.py` B1–B3、B8、B29；`plan_from_projection` 重建校验 | M-B13 / M-B1 |
+| 快照必须精确 | 只消费显式 `portfolio_snapshot_id`；指纹校验失败即 fail closed；未知 snapshot id 不回退到最新快照 | B4、B5（AST 级无 latest/current）、B27 集成断言 | M-B1 / M-B2 |
+| 声明与权重必须精确覆盖 | `weights.keys()` 与 `declarations` 都必须严格等于 `execution_participant_ids`；缺一个或多余一个都 fail closed；snapshot pin 不被当前 registry head 顶替 | B6、B7、B14 | M-B3 / M-B9 |
+| 唯一算术 owner | slot 数学来自 `paper_allocation.position_limits_from_weights`；`Σ limits ≤ hard cap`；每策略 `≤ 声明上限`；引擎版本与 eligible 来源被记录 | B9、B10、空 eligible 的 `NO_ELIGIBLE_STRATEGIES`；`test_paper_allocation_limits_equivalence.py` 300+ 组合差分 | M-B10 |
+| 缺证据不得变事实 | 缺容量 → INSUFFICIENT_EVIDENCE（`pending` 为 `None` 而非 0）；缺市值 → capital 不可算；成本价不冒充市值；缺 correlation ≠ 0；缺分类不生成集中度 | B15–B20 | M-B6 / M-B7 / M-B8 |
+| 新资源与退出资格只认各自 snapshot 范围 | paused 经济 owner 不得新资源；risk-exit-only 可退出但不得开仓资源；economic-only 无退出权、无权阻塞入场；不重建第二套 eligibility resolver | B11、B12、B36 | M-B4 / M-B5 / M-B20 |
+| 冲突策略 | canonical 词汇与顺序；risk exit 先于一切入场；相反方向意图不净额化、各自保留 provenance；free text 无法制造 `intent_kind`；只有获授 risk-exit eligibility 的 intent 才能阻塞入场 | B21–B23、B33、B36、重复 intent id fail closed；迁移后的 5 条业务不变式 | M-B11 / M-B12 / M-B17 / M-B20 |
+| 不接管 Risk 权限 | 计划中不出现 ALLOW/BLOCK/risk_decision；conflict authority 明确为资源执行优先级而非风险批准 | B24 | — |
+| 持久化与 API 最小面 | append 幂等；同 ID 异内容冲突；串改组件破坏指纹；仅 `append_plan` / `get_plan`；路由仅 plans POST + plans/{id} GET；service 不拥有 schema | B25、B26、B28、架构守卫；B27 集成（全表计数变化仅限本表） | M-B14 |
+| 纯 policy 边界 | policy 只依赖 stdlib + `paper_allocation` + `portfolio_runtime`；无 DB/网络/时钟/provider/AI；不 import 旧 coordinator | B13、B30、架构守卫 | — |
+| 畸形输入必须 fail closed | 负数 pool/slot 上下界与负数 canonical 权重都被拒；被判否的 RISK_EXIT 无法推迟同标的合法入场；声明携带 exact pinned allocation metadata 的 **stage**，不是 lifecycle state 或 current-head metadata | B31–B35（B34 走真实 cycle；B35 走真实 allocation service） | M-B15 / M-B16 / M-B17 / M-B18 / M-B19 |
+
+Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。B35/B36 and M-B19/M-B20 cover historical pinned metadata and economic-only exit denial. 计划 DDL 归 migration v31 / `paper_trading.init_db`。
+
+阶段状态：R31/R32/R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **IN REVIEW**；R34-C **NOT STARTED**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
 
