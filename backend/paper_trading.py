@@ -12023,7 +12023,8 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     intent, contract_reason = _enforce_order_intent(
         conn, account, position["code"],
         {"pick": {"code": position["code"], "price": _num(quote.get("price")),
-                  "reason": "日内回补（同日高抛库存）"}},
+                  "reason": "日内回补（同日高抛库存）"},
+         "order_intent": {"intent_kind": "ADD_POSITION"}},
     )
     if contract_reason is not None:
         return None, contract_reason.get("reason")
@@ -12175,7 +12176,8 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     intent, contract_reason = _enforce_order_intent(
         conn, account, position["code"],
         {"pick": {"code": position["code"], "price": _num(quote.get("price")),
-                  "reason": "波段确认加仓"}},
+                  "reason": "波段确认加仓"},
+         "order_intent": {"intent_kind": "ADD_POSITION"}},
     )
     if contract_reason is not None:
         return None, contract_reason.get("reason")

@@ -85,6 +85,31 @@ class PortfolioOrderIntentOwnerTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_rc14_unapproved_waitlist_markers_do_not_block_resource_intents(self):
+        conn = self._base_orders()
+        try:
+            PSM.ensure_order_allocation_provenance(conn)
+            conn.executemany(
+                "INSERT INTO paper_orders(id,account_id,side,code,status,reason,"
+                "created_at,cycle_id) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (1, "s1", "buy", "AAA", "deferred_capacity", "wait",
+                     "2026-10-03T09:30:00+08:00", 7),
+                    (2, "s1", "buy", "BBB", "entry_frozen_waitlist", "frozen",
+                     "2026-10-03T09:30:00+08:00", 7),
+                ],
+            )
+            evidence = POI.pending_resource_intents(
+                conn, cycle_id=7, asof_day="2026-10-03",
+                decision_at="2026-10-03T09:31:00+08:00",
+            )
+            self.assertEqual("AVAILABLE", evidence["status"])
+            self.assertEqual([], evidence["intents"])
+            self.assertEqual([], evidence["unknown_orders"])
+            self.assertEqual([], evidence["order_identities"])
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

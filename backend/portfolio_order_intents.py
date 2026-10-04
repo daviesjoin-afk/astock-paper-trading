@@ -21,7 +21,7 @@ _PENDING_STATUSES = (
     "pending_limit", "pending_execution", "partially_filled", "pending",
     "recheck_capacity", "execution_retry",
     "manual_execution_retry", "awaiting_batch", "pending_verification",
-    "deferred_capacity", "entry_frozen_waitlist", "unfilled_limit_down",
+    "unfilled_limit_down",
 )
 _BUY_INTENTS = frozenset({"NEW_ENTRY", "ADD_POSITION"})
 _SELL_INTENTS = frozenset({"RISK_EXIT", "TAKE_PROFIT_EXIT", "MANUAL_EXIT",

@@ -965,6 +965,13 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                                   f"{name} 的 {call} 调用没有显式传 cycle_id")
                     self.assertIn('asof_day=_date(asof_day).isoformat()', window)
                     self.assertIn('intent_kind="ADD_POSITION"', window)
+            enforce = body.index("_enforce_order_intent(")
+            allocation = body.index("_build_portfolio_entry_plan(", enforce)
+            self.assertIn(
+                '"order_intent":{"intent_kind":"ADD_POSITION"}',
+                body[enforce:allocation],
+                f"{name} must pass typed ADD_POSITION into enforced OrderIntent mode",
+            )
             self.assertNotIn("_strategy_pool_budget(", body)
             self.assertIn("_entry_plan_sizing_facts(", body)
             self.assertIn("_revalidate_portfolio_entry_plan(", body)
