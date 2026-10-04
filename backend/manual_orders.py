@@ -12,6 +12,9 @@ api_paper.py call sites are unchanged.
 """
 from __future__ import annotations
 
+import datetime as dt
+
+import market_data_contract as MDC
 import market_data_service as MDSvc
 
 
@@ -22,7 +25,7 @@ def _manual_order_plan(
 ):
     # Phase 2 extraction: resolved at call time to avoid a circular import.
     from paper_trading import (
-        ACCOUNT_SPECS,
+        ACTIVE_ACCOUNT_IDS,
         DE,
         ENTRY_FREEZE_ENV,
         ENTRY_FROZEN_WAITLIST_STATUS,
@@ -33,7 +36,7 @@ def _manual_order_plan(
         _asset_type,
         _completed_kline,
         _date,
-        _dynamic_position_limits,
+        _build_portfolio_entry_plan,
         _entry_freeze_enabled,
         _entry_frozen_reason,
         _existing_position_addition_gate,
@@ -50,7 +53,10 @@ def _manual_order_plan(
         _shared_cash,
         _shared_risk_state,
         _strategy_entry_assessment,
-        _strategy_pool_budget,
+        PAPolicy,
+        PAW,
+        PRuntime,
+        PRS,
         _universe_snapshot_time,
         _with_decision_snapshot,
     )
@@ -135,15 +141,69 @@ def _manual_order_plan(
         pending_code for pending_account, pending_code in pending_slots
         if pending_account == account_id
     }
-    count_budget = _dynamic_position_limits(conn)
-    position_limit = max(
-        1,
-        # PR-39：内置账户保持原口径；用户策略账户走 _spec_for 派生，
-        # 不再静默退回硬编码的 5。
-        int(count_budget["limits"].get(
-            account_id, (ACCOUNT_SPECS.get(account_id) or _spec_for(account_id, conn=conn)).get("max_positions", 5)
-        )),
-    )
+    entry_allocation = None
+    if side == "buy":
+        intent_kind = "ADD_POSITION" if code in open_codes else "NEW_ENTRY"
+        try:
+            entry_allocation = _build_portfolio_entry_plan(
+                conn, cycle_id=account["cycle_id"], asof_day=day.isoformat(),
+                decision_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                account_id=account_id, symbol=code, intent_kind=intent_kind,
+            )
+        except (PAPolicy.PortfolioAllocationPolicyError,
+                PRuntime.PortfolioRuntimeError,
+                PAW.AllocationWeightEvidenceUnavailable) as exc:
+            reasons.append(f"精确组合分配证据不可用：{exc}；手动 BUY 已延期")
+            plan.update({"status": "deferred_capacity", "allowed": False,
+                         "qty": 0, "recommended_qty": 0})
+            return plan
+        if entry_allocation["candidate_blocked"]:
+            reasons.append("精确 allocation plan 未批准当前手动 BUY；本次已延期")
+            plan.update({"status": "deferred_capacity", "allowed": False,
+                         "qty": 0, "recommended_qty": 0})
+            plan["risk"]["allocation_plan"] = entry_allocation["plan"]
+            return plan
+        exact_plan = entry_allocation["plan"]
+        slot_plan = exact_plan["slot_plan"]
+        position_limit = int(slot_plan["limits"][str(account_id)])
+        pool_limit = int(slot_plan["total_cap"])
+        capital_plan = exact_plan["capital_plan"]
+        capacity_plan = exact_plan["capacity_plan"]
+        current_amount = float(capital_plan["market_value_by_account"][str(account_id)])
+        pending_strategy_amount = float(capital_plan["pending_by_account"][str(account_id)])
+        allowance_amount = float(capital_plan["allowance_by_strategy"][str(account_id)])
+        total_current_amount = sum(float(value) for value in
+                                   capital_plan["market_value_by_account"].values())
+        total_pending_amount = float(capacity_plan["pending_amount"])
+        total_allowance_amount = sum(float(value) for value in
+                                     capital_plan["allowance_by_strategy"].values())
+        strategy_budget = {
+            "authority": "exact_portfolio_allocation_plan",
+            "current_amount": current_amount,
+            "pending_reserve_amount": pending_strategy_amount,
+            "pending_pool_reserve_amount": total_pending_amount,
+            "allowance_amount": allowance_amount,
+            "absolute_cap_amount": current_amount + pending_strategy_amount + allowance_amount,
+            "pool_cap_amount": total_current_amount + total_pending_amount + total_allowance_amount,
+            "target_pct": round(allowance_amount / max(float(capital_plan["nav"]), 1.0) * 100, 2),
+            "base_target_pct": None, "floor_pct": None,
+            "current_pct": round(current_amount / max(float(capital_plan["nav"]), 1.0) * 100, 2),
+            "market_scale_pct": None, "market_scale_applied": False,
+            "redistribution_amount": 0.0,
+        }
+        plan["risk"]["allocation_provenance"] = {
+            "intent_kind": intent_kind,
+            "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+            "portfolio_snapshot_fingerprint": exact_plan["portfolio_snapshot_fingerprint"],
+            "allocation_plan_id": exact_plan["plan_id"],
+            "allocation_plan_fingerprint": exact_plan["plan_fingerprint"],
+            "allocation_policy_version": exact_plan["allocation_policy_version"],
+            "decision_at": exact_plan["decision_at"],
+        }
+    else:
+        position_limit = 0
+        pool_limit = 0
+        strategy_budget = None
     pool_open_positions = {
         (str(item.get("account_id")), str(item.get("code"))) for item in positions
         if int(_num(item.get("qty"))) >= LOT_SIZE
@@ -157,10 +217,27 @@ def _manual_order_plan(
         all_quotes = dict(all_quotes)
     _, position_value, nav, industries, code_values = _shared_account_exposure(conn, all_quotes, day)
     shared_cash = _shared_cash(conn)
-    strategy_budget = _strategy_pool_budget(
-        conn, account, nav, positions, all_quotes,
-        exclude_reservation_key=exclude_reservation_key,
-    )
+    if entry_allocation is not None:
+        snapshot = entry_allocation["snapshot"]
+        exposure = next(item["facts"] for item in snapshot["dimensions"]
+                        if item["name"] == "strategy_exposure")
+        exact_rows = exposure["market_value_by_position"]
+        nav = float(entry_allocation["plan"]["capital_plan"]["nav"])
+        position_value = sum(float(value) for value in
+                             exposure["market_value_by_account"].values())
+        industry_for_position = {
+            (str(item.get("account_id")), str(item.get("code"))):
+            str(item.get("industry") or "未知") for item in positions
+        }
+        code_values = {}
+        industries = {}
+        for item in exact_rows:
+            symbol = str(item["symbol"])
+            account_key = str(item["account_id"])
+            amount_value = float(item["market_value"])
+            code_values[symbol] = code_values.get(symbol, 0.0) + amount_value
+            industry = industry_for_position.get((account_key, symbol), "未知")
+            industries[industry] = industries.get(industry, 0.0) + amount_value
     risk_state = _shared_risk_state(conn, account, nav, day)
     plan["risk"]["account"] = risk_state
     plan["risk"]["strategy_budget"] = strategy_budget
@@ -181,17 +258,17 @@ def _manual_order_plan(
             code=code, account_id=account_id, open_codes=open_codes,
             committed_open_codes=committed_open_codes,
             pool_open_positions=pool_open_positions,
-            position_limit=position_limit, pool_limit=count_budget["pool_limit"],
+            position_limit=position_limit, pool_limit=pool_limit,
             asof_day=day, conn=conn,
-            allocation_source=count_budget.get("source"),
-            allocation_version=count_budget.get("allocation_version"),
+            allocation_source="exact_portfolio_allocation_plan",
+            allocation_version=entry_allocation["plan"]["allocation_policy_version"],
         )
         plan["risk"]["position_count_gate"] = capacity["gate"]
         plan["risk"]["seat_reserve"] = capacity["reserve"]
         reasons.extend(capacity["reasons"])
         if code in open_codes:
             addition_allowed, addition_reason = _existing_position_addition_gate(
-                conn, account, code, day,
+                conn, account, code, day, slot_plan=slot_plan,
             )
             plan["risk"]["existing_addition_gate"] = {
                 "allowed": addition_allowed, "reason": addition_reason,
@@ -214,11 +291,6 @@ def _manual_order_plan(
             allow_network=not conn.in_transaction,
         ))
         plan["risk"]["market"] = market
-        strategy_budget = _strategy_pool_budget(
-            conn, account, nav, positions, all_quotes, market=market,
-            exclude_reservation_key=exclude_reservation_key,
-        )
-        plan["risk"]["strategy_budget"] = strategy_budget
         # 市场灯门禁沿用既有判定（红灯/未知禁止新开仓），仅由 planner 统一编排。
         if EP.market_gate(market, account_id)["blocked"]:
             reasons.append("市场门控为红灯或未知，禁止新开仓")
@@ -343,6 +415,41 @@ def _manual_order_plan(
         )
         if not cash_check["allowed"]:
             reasons.append(cash_check["reason"])
+        # Revalidate the same named plan snapshot before this attempt can reach
+        # the durable order writer. A changed fact defers this attempt; it does
+        # not silently choose a newer plan.
+        allocation_provenance = plan["risk"]["allocation_provenance"]
+        try:
+            decision_instant = dt.datetime.fromisoformat(
+                allocation_provenance["decision_at"].replace("Z", "+00:00"))
+            reading = MDSvc.read_snapshot(
+                now=decision_instant, asof_day=day.isoformat())
+            checked = PRS.capture_portfolio_runtime_snapshot(
+                conn, cycle_id=account["cycle_id"], asof_day=day.isoformat(),
+                decision_at=allocation_provenance["decision_at"],
+                builtin_scope=ACTIVE_ACCOUNT_IDS,
+                market_evidence_identity=(
+                    MDC.snapshot_fingerprint(reading.snapshot)
+                    if reading.snapshot is not None else None),
+                market_reading=reading)
+            if (checked["snapshot_id"] != allocation_provenance["portfolio_snapshot_id"]
+                    or checked["snapshot_fingerprint"]
+                    != allocation_provenance["portfolio_snapshot_fingerprint"]):
+                reasons.append("allocation snapshot 在执行前发生变化；手动 BUY 已延期")
+        except Exception as exc:
+            reasons.append(f"allocation snapshot 执行前无法复核：{exc}")
+        fresh_positions = _position_rows(conn, asof_day=day)
+        fresh_pending_slots = _pending_position_slots(
+            conn, fresh_positions, exclude_order_key=exclude_reservation_key)
+        fresh_pairs = {
+            (str(item.get("account_id")), str(item.get("code")))
+            for item in fresh_positions
+            if int(_num(item.get("qty"))) >= LOT_SIZE
+        } | fresh_pending_slots
+        if (account_id, code) not in fresh_pairs and (
+                sum(pair[0] == account_id for pair in fresh_pairs) >= position_limit
+                or len(fresh_pairs) >= pool_limit):
+            reasons.append("exact plan slot limit 在执行前已被占用；手动 BUY 已延期")
     plan.update({
         "fill_price": round(fill_price, 4), "amount": round(amount, 2),
         "fees": round(fees, 2), "reasons": list(dict.fromkeys(reasons)),
@@ -451,14 +558,21 @@ def _commit_strategy_buy(
     qty = int(plan["qty"])
     fill_price = _num(plan["fill_price"])
     strategy_stamp = _strategy_stamp(conn, account_id)
+    provenance = ((plan.get("risk") or {}).get("allocation_provenance")
+                  or (detail or {}).get("allocation_provenance") or {})
     cursor = conn.execute(
         """INSERT INTO paper_orders(
            account_id,side,code,name,qty,planned_price,status,reason,
-           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id,
+           allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
+           allocation_plan_fingerprint,allocation_policy_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account_id, "buy", code, plan.get("name"), qty,
          _num(plan.get("planned_price"), fill_price), "pending_execution",
-         reason, _json(detail), _now(), *strategy_stamp, _order_cycle_id(conn)),
+         reason, _json(detail), _now(), *strategy_stamp, _order_cycle_id(conn),
+         provenance.get("intent_kind"), provenance.get("portfolio_snapshot_id"),
+         provenance.get("allocation_plan_id"), provenance.get("allocation_plan_fingerprint"),
+         provenance.get("allocation_policy_version")),
     )
     order_id = int(cursor.lastrowid)
     savepoint = f"strategy_buy_{order_id}"
@@ -728,19 +842,29 @@ def submit_manual_order(
             reason = reason or _entry_frozen_reason("手动委托")
         strategy_stamp = _strategy_stamp(conn, account_id)
         order_cycle_id = _order_cycle_id(conn)
+        provenance = (plan.get("risk") or {}).get("allocation_provenance") or {}
+        intent_kind = provenance.get("intent_kind") or (
+            "MANUAL_EXIT" if str(side).lower() == "sell" else
+            "NEW_ENTRY" if str(side).lower() == "buy" else None)
         cursor = conn.execute(
             """INSERT INTO paper_orders(
                account_id,side,code,name,qty,planned_price,status,reason,risk_payload,
                order_type,origin,expires_at,created_at,
-               strategy_id,strategy_version,strategy_checksum,cycle_id)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               strategy_id,strategy_version,strategy_checksum,cycle_id,
+               allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
+               allocation_plan_fingerprint,allocation_policy_version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 account_id, side, code, plan.get("name"), int(plan.get("qty") or 0),
                 _num(limit_price) if order_type == "limit" else _num(plan.get("quote_price")),
                 status, reason, _json(plan.get("risk") or {}), order_type, "manual",
                 day.isoformat() if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
                 and order_type == "limit" else None, _now(),
-                *strategy_stamp, order_cycle_id,
+                *strategy_stamp, order_cycle_id, intent_kind,
+                provenance.get("portfolio_snapshot_id"),
+                provenance.get("allocation_plan_id"),
+                provenance.get("allocation_plan_fingerprint"),
+                provenance.get("allocation_policy_version"),
             ),
         )
         order_id = cursor.lastrowid

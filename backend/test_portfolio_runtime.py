@@ -20,6 +20,7 @@ import paper_trading as PT
 import paper_cycle_ownership as PCY
 import paper_portfolio_read_model as PPRM
 import api_paper as API
+import market_data_contract as MDC
 import portfolio_runtime as PR
 import portfolio_runtime_repository as PRRepo
 import portfolio_runtime_service as PRS
@@ -56,6 +57,100 @@ def _build(**overrides):
 
 
 class PortfolioRuntimeContractTests(unittest.TestCase):
+    def _fresh_market_reading(self, rows, *, asof="2026-10-01"):
+        snapshot = MDC.MarketDataSnapshot(
+            kind="full_market_snapshot", rows=tuple(rows), as_of=asof,
+            observed_at=f"{asof}T09:30:00+08:00", source="market-owner",
+            complete=True, expected_rows=len(rows),
+            verification=MDC.VERIFICATION_VERIFIED,
+            verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+        )
+        return MDC.MarketDataReading(
+            availability=MDC.AVAILABILITY_AVAILABLE,
+            freshness=MDC.FRESHNESS_FRESH, status=MDC.STATUS_FRESH,
+            policy_name=MDC.LIVE_MARKET_POLICY.name, snapshot=snapshot,
+        )
+
+    def test_rc1_market_valuation_uses_exact_quote_owner_not_position_cost(self):
+        reading = self._fresh_market_reading([
+            {"code": "AAA", "price": 12.5, "quote_at": "2026-10-01T09:30:00+08:00",
+             "source": "source-a"},
+            {"code": "BBB", "price": 7.0, "quote_at": "2026-10-01T09:30:00+08:00",
+             "source": "source-b"},
+        ])
+        dimension = PRS._market_valuation_dimension(
+            owners=("s1", "s2"), asof_day="2026-10-01", reading=reading,
+            expected_identity=MDC.snapshot_fingerprint(reading.snapshot),
+            positions=({"account_id": "s1", "code": "AAA", "qty": 10,
+                        "cost": 99_999.0},
+                       {"account_id": "s2", "code": "BBB", "qty": 3,
+                        "cost": 99_999.0}),
+        )
+        self.assertEqual(dimension.status, PR.AVAILABLE)
+        self.assertEqual(dimension.facts["market_value_by_account"],
+                         {"s1": 125.0, "s2": 21.0})
+        self.assertNotIn("cost", json.dumps(dimension.projection()["facts"]))
+        self.assertIn(MDC.snapshot_fingerprint(reading.snapshot),
+                      dimension.source_identity)
+
+    def test_rc2_missing_exact_quote_is_partial_and_not_cost_filled(self):
+        reading = self._fresh_market_reading([
+            {"code": "AAA", "price": 12.5, "quote_at": "2026-10-01T09:30:00+08:00",
+             "source": "source-a"},
+        ])
+        dimension = PRS._market_valuation_dimension(
+            owners=("s1",), asof_day="2026-10-01", reading=reading,
+            positions=({"account_id": "s1", "code": "MISSING", "qty": 2,
+                        "cost": 99.0},),
+        )
+        self.assertEqual(dimension.status, PR.PARTIAL)
+        self.assertIsNone(dimension.facts["market_value_by_account"]["s1"])
+        self.assertEqual(dimension.projection()["facts"][
+            "missing_quote_symbols_by_account"], {"s1": ["MISSING"]})
+
+    def test_rc3_market_quote_identity_mismatch_fails(self):
+        reading = self._fresh_market_reading([
+            {"code": "AAA", "price": 12.5, "quote_at": "2026-10-01T09:30:00+08:00",
+             "source": "source-a"},
+        ])
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError,
+                                    "market_evidence_identity_mismatch"):
+            PRS._market_valuation_dimension(
+                owners=("s1",), asof_day="2026-10-01", reading=reading,
+                expected_identity="0" * 64,
+                positions=({"account_id": "s1", "code": "AAA", "qty": 2},),
+            )
+
+    def test_rc8_reservation_requires_exact_pending_order_identity(self):
+        reservations = {"status": "AVAILABLE", "reservations": [{
+            "reservation_id": 4, "order_id": "17", "cycle_id": 8,
+            "account_id": "s1", "symbol": "AAA", "side": "buy",
+        }], "unknown_reservations": []}
+        order = {"status": "AVAILABLE", "source_identity": "paper_orders:pending",
+                 "order_identities": [{"order_id": 17, "cycle_id": 8,
+                                        "account_id": "s1", "symbol": "AAA",
+                                        "side": "buy"}]}
+        valid = PRS._reservation_order_identity(reservations, order)
+        self.assertEqual("AVAILABLE", valid["order_identity_validation"]["status"])
+        mismatch = PRS._reservation_order_identity(
+            reservations, {**order, "order_identities": [{
+                **order["order_identities"][0], "account_id": "other"}]})
+        self.assertEqual("UNAVAILABLE", mismatch["status"])
+        self.assertEqual("reservation_order_identity_mismatch",
+                         mismatch["unknown_reservations"][0]["reason"])
+
+    def test_rc9_pending_symbol_projection_uses_verified_reservation_amount_and_fees(self):
+        reservations = {"status": "AVAILABLE", "reservations": [
+            {"symbol": "AAA", "amount": 100.0, "fees": 1.0},
+            {"symbol": "AAA", "amount": 200.0, "fees": 2.0},
+            {"symbol": "BBB", "amount": 50.0, "fees": 1.0},
+        ]}
+        self.assertEqual(
+            {"AAA": 303.0, "BBB": 51.0},
+            PRS._pending_reservations_by_symbol(reservations))
+        unavailable = {**reservations, "status": "UNAVAILABLE"}
+        self.assertIsNone(PRS._pending_reservations_by_symbol(unavailable))
+
     def test_pa1_same_input_has_same_fingerprint(self):
         self.assertEqual(_build().snapshot_fingerprint, _build().snapshot_fingerprint)
 
@@ -117,6 +212,12 @@ class PortfolioRuntimeContractTests(unittest.TestCase):
         self.assertEqual(dimension.status, PR.UNAVAILABLE)
         self.assertNotIn("pending_amount", dimension.facts)
 
+    def test_rc10_runtime_pending_query_failure_is_not_composed_as_empty(self):
+        source = pathlib.Path(PRS.__file__).read_text(encoding="utf-8")
+        self.assertIn("except POI.PendingIntentEvidenceUnavailable:", source)
+        self.assertIn("pending_intents = None", source)
+        self.assertNotIn("pending_intents = []", source)
+
     def test_pa10_cost_basis_does_not_become_market_value(self):
         item = _build()
         facts = item.projection()["dimensions"]
@@ -165,6 +266,49 @@ class PortfolioRuntimeContractTests(unittest.TestCase):
     def test_pa17_capture_does_not_write_lifecycle(self):
         self._with_idle_capture()
 
+    def test_rc7_idle_cycle_without_economic_owners_keeps_nav_unavailable(self):
+        temp = tempfile.TemporaryDirectory(prefix="r34c-market-capture-")
+        old_db = PT.DB_PATH
+        PT.DB_PATH = os.path.join(temp.name, "paper.sqlite3")
+        try:
+            PT.init_db()
+            PT.start_new_cycle(capital=10_000, include_dashboard=False)
+            conn = sqlite3.connect(PT.DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cycle_id = int(conn.execute(
+                "SELECT MAX(id) FROM paper_cycles").fetchone()[0])
+            conn.execute(
+                "UPDATE paper_cycles SET enabled_strategies='[]' WHERE id=?",
+                (cycle_id,),
+            )
+            conn.commit()
+            conn.close()
+            reading = self._fresh_market_reading([], asof="2026-10-03")
+            with PT._db(immediate=True) as conn:
+                result = PRS.capture_portfolio_runtime_snapshot(
+                    conn, cycle_id=cycle_id, asof_day="2026-10-03",
+                    decision_at="2026-10-03T09:31:00+08:00",
+                    builtin_scope=PT.ACTIVE_ACCOUNT_IDS,
+                    market_evidence_identity=MDC.snapshot_fingerprint(reading.snapshot),
+                    market_reading=reading,
+                )
+                conn.commit()
+            dimensions = {item["name"]: item for item in result["dimensions"]}
+            self.assertEqual(dimensions["strategy_exposure"]["status"], PR.AVAILABLE)
+            self.assertEqual(dimensions["strategy_exposure"]["facts"][
+                "market_evidence_identity"], MDC.snapshot_fingerprint(reading.snapshot))
+            self.assertTrue(dimensions["capital"]["facts"][
+                "nav_uses_portfolio_read_model_composer"])
+            # An ownerless cycle has no bounded accounting rows from which the
+            # portfolio read model can prove cash/NAV.  Empty owners are not a
+            # successful zero exposure/capacity observation.
+            self.assertIsNone(dimensions["capital"]["facts"]["nav"])
+            self.assertEqual(dimensions["capital"]["status"], PR.PARTIAL)
+            self.assertEqual(dimensions["capacity"]["status"], PR.UNAVAILABLE)
+        finally:
+            PT.DB_PATH = old_db
+            temp.cleanup()
+
     def _with_idle_capture(self):
         temp = tempfile.TemporaryDirectory(prefix="r34a-")
         old_db = PT.DB_PATH
@@ -183,17 +327,37 @@ class PortfolioRuntimeContractTests(unittest.TestCase):
                                     "paper_fills", "paper_position_lots",
                                     "strategy_lifecycle_events")}
             conn.close()
-            result = PRS.capture_portfolio_runtime_snapshot(
-                cycle_id=cycle_id, asof_day="2026-09-30",
-                decision_at="2026-10-01T09:30:00+08:00")
-            retry = PRS.capture_portfolio_runtime_snapshot(
-                cycle_id=cycle_id, asof_day="2026-09-30",
-                decision_at="2026-10-01T09:30:00+08:00")
+            with PT._db(immediate=True) as conn:
+                result = PRS.capture_portfolio_runtime_snapshot(
+                    conn, cycle_id=cycle_id, asof_day="2026-09-30",
+                    decision_at="2026-10-01T09:30:00+08:00",
+                    builtin_scope=PT.ACTIVE_ACCOUNT_IDS,
+                    market_evidence_identity="f" * 64)
+                retry = PRS.capture_portfolio_runtime_snapshot(
+                    conn, cycle_id=cycle_id, asof_day="2026-09-30",
+                    decision_at="2026-10-01T09:30:00+08:00",
+                    builtin_scope=PT.ACTIVE_ACCOUNT_IDS,
+                    market_evidence_identity="f" * 64)
+                conn.commit()
             self.assertEqual(retry, result)
-            self.assertEqual(PRS.get_portfolio_runtime_snapshot(result["snapshot_id"]), result)
+            with PT._db_readonly() as conn:
+                self.assertEqual(
+                    PRS.get_portfolio_runtime_snapshot(conn, result["snapshot_id"]),
+                    result)
             dimensions = {item["name"]: item for item in result["dimensions"]}
             self.assertEqual(dimensions["correlation"]["status"], PR.UNAVAILABLE)
             self.assertIsNone(dimensions["strategy_exposure"]["facts"]["market_value_by_account"])
+            self.assertIsNone(result["market_evidence_identity"])
+            self.assertEqual(dimensions["signal_conflicts"]["status"], PR.AVAILABLE)
+            self.assertEqual(dimensions["signal_conflicts"]["facts"][
+                "pending_resource_intents"], [])
+            self.assertEqual(dimensions["capacity"]["status"], PR.UNAVAILABLE)
+            self.assertEqual(dimensions["capital"]["status"], PR.PARTIAL)
+            self.assertIsNone(dimensions["capital"]["facts"]["nav"])
+            self.assertTrue(dimensions["capital"]["facts"][
+                "nav_uses_portfolio_read_model_composer"])
+            self.assertTrue(all(value["nav"] is None for value in dimensions["capital"][
+                "facts"]["portfolio_valuation_by_account"].values()))
             check = sqlite3.connect(PT.DB_PATH)
             after = {table: check.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                      for table in before}

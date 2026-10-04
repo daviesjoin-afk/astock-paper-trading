@@ -2,7 +2,7 @@
 """自进化落地通道（A 批闭环）离线测试。
 
 覆盖 evolution_apply 的三条门禁与写读链路：
-- apply_allocation：影子阶段拒绝 / 权重越界拒绝 / 正常应用写入 params 并消费于 _strategy_pool_budget 权重 / 回滚恢复前值
+- apply_allocation：影子阶段拒绝 / 权重越界拒绝 / 正常应用写入 params 并被 exact canonical weight owner 消费 / 回滚恢复前值
 - apply_tuner_proposals：非 consensus 拒绝 / 幅度越界拒绝 / 正常应用写入 adaptive_selection 覆盖 / applied_ids 回写
 - dual_ai_tuner._check_consensus：evolution 参数（步长/幅度比/提案上限）真实约束输出
 """
@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import dual_ai_tuner
 import evolution_apply
+import portfolio_allocation_weights as PAW
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -216,8 +217,8 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
             ).fetchone()["status"]
         self.assertEqual(status, "applied")
 
-    def test_budget_consumes_allocation_overlay(self):
-        """资金分摊覆盖必须被 _strategy_pool_budget 的权重来源消费。"""
+    def test_canonical_weight_owner_consumes_allocation_overlay(self):
+        """已批准的权重覆盖由 exact canonical owner 读取，缺声明不做猜测。"""
         decision_id = self._seed_decision()
         evolution_apply.apply_allocation(
             self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
@@ -226,17 +227,23 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
             rows = [dict(r) for r in conn.execute("SELECT * FROM paper_accounts")]
         finally:
             conn.close()
-        weights_before = {
-            row["id"]: max(0.0, float(row["max_exposure"] or 0.0)) for row in rows}
-        self.assertEqual(weights_before["tq_breakout"], 0.80)
-        # 直接复用消费逻辑：覆盖激活时权重应变为 weight_pct/100
-        for row in rows:
-            params = json.loads(row["params"] or "{}")
-            alloc = params.get("adaptive_allocation") or {}
-            if alloc.get("status") == "active" and alloc.get("weight_pct"):
-                weights_before[row["id"]] = alloc["weight_pct"] / 100.0
-        self.assertAlmostEqual(weights_before["tq_breakout"], 0.40)
-        self.assertAlmostEqual(weights_before["trend_pullback"], 0.25)
+        cycle_id = 1
+        owner_rows = [{**row, "cycle_id": cycle_id} for row in rows]
+        asof_day = max(
+            json.loads(row["params"] or "{}")["adaptive_allocation"]["effective_date"]
+            for row in rows if json.loads(row["params"] or "{}").get("adaptive_allocation")
+        )
+        resolved = PAW.resolve_canonical_allocation_weights(
+            owner_rows,
+            eligible_account_ids=tuple(row["id"] for row in owner_rows),
+            cycle_id=cycle_id,
+            asof_day=asof_day,
+            strategy_pins=[{"account_id": row["id"], "strategy_id": row["id"],
+                            "strategy_version": 1, "strategy_checksum": "a" * 64}
+                           for row in owner_rows],
+        )
+        self.assertAlmostEqual(resolved["weights"]["tq_breakout"], 0.40)
+        self.assertAlmostEqual(resolved["weights"]["trend_pullback"], 0.25)
 
     def test_rollback_restores_no_previous(self):
         decision_id = self._seed_decision()

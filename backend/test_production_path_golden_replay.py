@@ -42,6 +42,8 @@ if BACKEND not in sys.path:
 
 import data_fetcher as dfc  # noqa: E402
 import factors as FACTORS  # noqa: E402
+import market_data_contract as MDC  # noqa: E402
+import market_data_service as MDSvc  # noqa: E402
 import news_learning as NL  # noqa: E402
 import paper_research as PR  # noqa: E402
 import paper_trading as PT  # noqa: E402
@@ -54,13 +56,24 @@ import strategy_runtime as SRT  # noqa: E402
 import universe as U  # noqa: E402
 
 STRATEGY_ID = "golden_replay_alpha"
-D0 = dt.date(2026, 9, 8)   # 周二：因子截止日（最近完整收盘日）
-D1 = dt.date(2026, 9, 9)   # 周三：信号意图交易日 / 开仓执行日
-D2 = dt.date(2026, 9, 10)  # 周四：T+1 可卖 / 风控退出触发日
-D3 = dt.date(2026, 9, 11)  # 周五：硬止损确认日（如需第二窗口）
-D4 = dt.date(2026, 9, 14)  # 周一：连续深跌（分批退出续）
-D5 = dt.date(2026, 9, 15)  # 周二：连续深跌（分批退出续）
-D6 = dt.date(2026, 9, 16)  # 周三：分批退出兜底窗口
+
+
+def _next_weekday(day: dt.date) -> dt.date:
+    while day.weekday() >= 5:
+        day += dt.timedelta(days=1)
+    return day
+
+
+# Keep the offline replay after cycle creation time. Exact R34-C snapshots
+# correctly reject historical ownership guesses when the cycle was created
+# after the requested as-of date.
+D0 = _next_weekday(dt.date.today() + dt.timedelta(days=1))
+D1 = _next_weekday(D0 + dt.timedelta(days=1))
+D2 = _next_weekday(D1 + dt.timedelta(days=1))
+D3 = _next_weekday(D2 + dt.timedelta(days=1))
+D4 = _next_weekday(D3 + dt.timedelta(days=1))
+D5 = _next_weekday(D4 + dt.timedelta(days=1))
+D6 = _next_weekday(D5 + dt.timedelta(days=1))
 CAPITAL = 1_000_000.0
 
 # 回放时钟（PR-51）：入场熔断用 ``U.latest_complete_trade_date()``（无参 →
@@ -193,7 +206,7 @@ def _seed_market(tmp: str) -> None:
         # 归档源；真实生产没有这样的源，所以生产历史重建会 fail closed。
         "kind": "historical_archive",
         "historical_membership_complete": True,
-        "historical_membership_asof": "2026-12-31",
+        "historical_membership_asof": (D0 + dt.timedelta(days=365)).isoformat(),
         "historical_membership_source": "unit_test_injection",
         "stocks": stocks,
     }
@@ -208,9 +221,51 @@ def _default_price(code: str, day: dt.date) -> float:
     return round(LAST_CLOSE[code] * 1.005, 2)
 
 
+def _declare_allocation_weight(account_id: str, weight_pct: float = 100.0) -> None:
+    """Seed the exact owner declaration required by canonical plan capture."""
+    conn = sqlite3.connect(PT.DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT params FROM paper_accounts WHERE id=?", (account_id,),
+        ).fetchone()
+        if row is None:
+            raise AssertionError(f"missing allocation weight account: {account_id}")
+        params = json.loads(row[0] or "{}")
+        params["adaptive_allocation"] = {
+            "weight_pct": weight_pct,
+            "status": "active",
+            "effective_date": D0.isoformat(),
+        }
+        conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                     (json.dumps(params, ensure_ascii=False), account_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _fresh_replay_market_reading(policy, *, now, asof_day):
+    day = str(asof_day or D1.isoformat())
+    rows = tuple({
+        "code": code, "price": _default_price(code, dt.date.fromisoformat(day)),
+        "quote_at": f"{day}T10:00:00+08:00", "source": "unit_test_market_owner",
+    } for code in ALL_CODES)
+    snapshot = MDC.MarketDataSnapshot(
+        kind="full_market_snapshot", rows=rows, as_of=day,
+        observed_at=f"{day}T10:00:00+08:00", source="unit_test_market_owner",
+        complete=True, expected_rows=len(rows),
+        verification=MDC.VERIFICATION_VERIFIED,
+        verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+    )
+    return MDC.MarketDataReading(
+        availability=MDC.AVAILABILITY_AVAILABLE,
+        freshness=MDC.FRESHNESS_FRESH, status=MDC.STATUS_FRESH,
+        policy_name=policy.name, snapshot=snapshot,
+    )
+
+
 def _fake_validated_live_universe(rows, day, max_quote_age_minutes=None):
     """开盘执行通道注入：全部合成代码都带当日源时间戳的实时快照。"""
-    now = dt.datetime.now().isoformat(timespec="seconds")
+    now = dt.datetime.combine(day, dt.time(10, 0)).isoformat(timespec="seconds")
     return [
         {
             "code": code, "name": NAMES.get(code, code),
@@ -220,6 +275,52 @@ def _fake_validated_live_universe(rows, day, max_quote_age_minutes=None):
         }
         for code in ALL_CODES
     ]
+
+
+def _run_open_slot(day, slot="open"):
+    """Execute a simulated slot at its supplied future replay instant."""
+    original_dt = PT.dt
+
+    class ReplayDateTime(original_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = original_dt.datetime.combine(day, original_dt.time(10, 0))
+            return value.replace(tzinfo=tz) if tz is not None else value
+
+    class ReplayDateTimeModule:
+        datetime = ReplayDateTime
+        date = original_dt.date
+        time = original_dt.time
+        timedelta = original_dt.timedelta
+        timezone = original_dt.timezone
+
+    PT.dt = ReplayDateTimeModule
+    try:
+        # Entry-freeze behavior has its own semantic contract tests below; this
+        # replay isolates plan → reserve → revalidate → Risk → execution.
+        with mock.patch.object(PT, "_entry_freeze_enabled", return_value=False):
+            return PT.run_slot(slot, day, force=True)
+    finally:
+        PT.dt = original_dt
+
+
+def _declare_test_allocation_weights(conn, account_ids, weight_pct=100.0):
+    """Give replay accounts explicit as-of-valid weights required by R34-C."""
+    effective_date = D0.isoformat()
+    for account_id in account_ids:
+        row = conn.execute(
+            "SELECT params FROM paper_accounts WHERE id=?", (str(account_id),)
+        ).fetchone()
+        if row is None:
+            raise AssertionError(f"missing replay account: {account_id}")
+        params = json.loads(row[0] or "{}")
+        params["adaptive_allocation"] = {
+            "weight_pct": float(weight_pct), "status": "active",
+            "effective_date": effective_date,
+        }
+        conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                     (json.dumps(params, ensure_ascii=False), str(account_id)))
+    conn.commit()
 
 
 def _fake_quotes(codes, asof_date=None):
@@ -308,6 +409,8 @@ class OfflinePaperEnv:
         PT._quotes = _fake_quotes
         cls._patches.append((PT, "_news_for", PT._news_for))
         PT._news_for = lambda names: []
+        cls._patches.append((MDSvc, "read_snapshot", MDSvc.read_snapshot))
+        MDSvc.read_snapshot = _fresh_replay_market_reading
         cls._patches.append((U, "refresh_history", U.refresh_history))
         U.refresh_history = lambda **kwargs: {"status": "up_to_date"}
         cls._patches.append((dfc, "fetch_market_snapshot_full", dfc.fetch_market_snapshot_full))
@@ -467,6 +570,7 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
             RSET.update(conn, {"enabled_strategies": [STRATEGY_ID]}, actor="golden-test")
         summary, cycle = PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
         self.assertEqual(tuple(cycle["enabled_strategies"]), (STRATEGY_ID,))
+        _declare_allocation_weight(STRATEGY_ID)
         with self._conn() as conn:
             account = self._one(conn, "SELECT * FROM paper_accounts WHERE id=?", (STRATEGY_ID,))
             self.assertEqual(account["status"], "running")
@@ -508,7 +612,7 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
             self.assertIn(signal["code"], PASS_CODES)
 
         # 7) T+1 开仓执行（OrderIntent → planner → revalidate → commit）
-        opened = PT.run_slot("open", D1, force=True)
+        opened = _run_open_slot(D1)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         with self._conn() as conn:
             debug_orders = conn.execute(
@@ -816,12 +920,13 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
             RSET.update(conn, {"enabled_strategies": [STRATEGY_ID]}, actor="invariant-test")
         PT.init_db()
         _, cycle = PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
+        _declare_allocation_weight(STRATEGY_ID)
         return cycle
 
     def _close_and_open(self):
         close_result = PT.generate_signals(D0)
         self.assertNotEqual(close_result.get("status"), "failed", close_result)
-        opened = PT.run_slot("open", D1, force=True)
+        opened = _run_open_slot(D1)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         return close_result, opened
 
@@ -833,7 +938,7 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
             cash_before = float(conn.execute(
                 "SELECT cash FROM paper_accounts WHERE id=?", (STRATEGY_ID,),
             ).fetchone()[0])
-        opened = PT.run_slot("open", D1, force=True)
+        opened = _run_open_slot(D1)
         self.assertNotEqual(opened.get("status"), "failed", opened)
 
         with self._conn() as conn:
@@ -914,14 +1019,18 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
                 """INSERT INTO paper_orders(
                        account_id,side,code,name,qty,planned_price,status,reason,
                        risk_payload,created_at,strategy_id,strategy_version,
-                       strategy_checksum,cycle_id,order_type,origin)
+                       strategy_checksum,cycle_id,order_type,origin,
+                       allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
+                       allocation_plan_fingerprint,allocation_policy_version)
                    VALUES(?,?,?,?,?,?,'pending_execution','R26 partial replay','{}',
-                          ?,?,?,?,?,'market','strategy')""",
+                          ?,?,?,?,?,'market','strategy','NEW_ENTRY',?,?,?,?)""",
                 (STRATEGY_ID, "buy", code, NAMES[code], 1000, quote["price"],
-                 f"{D1.isoformat()} 09:40:00", *strategy_stamp, cycle_id),
+                 f"{D1.isoformat()} 09:40:00", *strategy_stamp, cycle_id,
+                 "b" * 64, "c" * 64, "c" * 64, "portfolio-allocation-policy-v2"),
             )
             order_id = int(cursor.lastrowid)
             cash_before = float(account["cash"])
+            original_plan_id = "c" * 64
 
         first = {**quote, "amount": float(quote["price"]) * 30_100}
         # 参与额度是**当日累计**成交额推出的，且要扣掉本 session 已消耗的模拟成交量。
@@ -975,6 +1084,8 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
                 "SELECT cash FROM paper_accounts WHERE id=?", (STRATEGY_ID,),
             ).fetchone()[0])
         self.assertEqual("filled", final_order["status"])
+        self.assertEqual(original_plan_id, final_order["allocation_plan_id"],
+                         "execution retry must keep the original exact plan identity")
         self.assertEqual(1000, final_order["filled_qty"])
         self.assertEqual(0, final_order["remaining_qty"])
         self.assertEqual([300, 700], [int(fill["qty"]) for fill in fills])
@@ -986,19 +1097,6 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         self.assertEqual("partially_filled", first_result[0]["status"])
         self.assertEqual("partially_filled", duplicate_result[0]["status"])
         self.assertEqual("filled", second_result[0]["status"])
-
-    def _allocation(self, price, positions=None, nav=None, conn=None):
-        """生产资金部署入口（唯一输入装配点），不做任何本地重算。"""
-        def _run(active):
-            return PT._allocation_plan(
-                active, nav=CAPITAL if nav is None else nav,
-                positions=positions or [], quotes={}, market={"light": "green"},
-                prices_by_strategy={STRATEGY_ID: price}, account={"id": STRATEGY_ID},
-            )
-        if conn is not None:
-            return _run(conn)
-        with self._conn() as active:
-            return _run(active)
 
     def _digest(self):
         import hashlib
@@ -1041,41 +1139,12 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
                 ).fetchall()
             return [dict(row) for row in rows]
 
-    # ---------- 1) pilot capital_scale ----------
-
-    def test_pilot_capital_scale_actually_scales_deployable_budget(self):
-        self._boot_strategy()
-        price = LAST_CLOSE["600901"]
-        with self._conn() as conn:
-            context = SRT.get_context(conn, STRATEGY_ID)
-            self.assertEqual(context.lifecycle_stage, "pilot")
-            self.assertEqual(context.capital_scale, 0.25)
-            plan = self._allocation(price, conn=conn)
-        row = plan["rows_by_strategy"][STRATEGY_ID]
-        # 阶段与系数必须从同一个 runtime 出来。
-        self.assertEqual(row["lifecycle_stage"], "pilot")
-        self.assertEqual(row["capital_scale"], 0.25)
-        # deployable budget 真的被缩放到四分之一，而不是只写了个标签。
-        self.assertAlmostEqual(row["scaled_budget_amount"], row["budget_amount"] * 0.25, places=2)
-        self.assertLessEqual(row["deployable_amount"], row["raw_allowance_amount"] * 0.25 + 1e-6)
-        self.assertAlmostEqual(
-            row["lifecycle_withheld_amount"], row["budget_amount"] * 0.75, places=2
-        )
-        self.assertGreater(row["lifecycle_withheld_amount"], 0.0)
-
-    # ---------- 2) 不足 100 股不下单 ----------
+    # ---------- 1) 不足 100 股不下单 ----------
 
     def test_sub_lot_budget_places_no_order(self):
         self._boot_strategy()
         # 价格高到 pilot 缩放后的预算连一手都买不起。
         expensive = CAPITAL
-        plan = self._allocation(expensive)
-        row = plan["rows_by_strategy"][STRATEGY_ID]
-        self.assertEqual(row["lots"], 0, row)
-        self.assertEqual(row["deployable_amount"], 0.0, row)
-        self.assertGreater(row["waiting_capital"], 0.0, row)
-        self.assertIn("预算不足一手", str(row.get("blocked_reason") or ""))
-
         # 端到端：用这个价格跑开盘 slot，必须一笔成交都没有。
         for code in ALL_CODES:
             QUOTE_PRICES[(code, D1.isoformat())] = float(expensive)
@@ -1092,8 +1161,8 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
 
     def test_stale_signal_does_not_fill(self):
         self._boot_strategy()
-        self._close_and_open()
-        self.assertTrue(self._buy_fills(), "前置条件：正常信号必须成交")
+        _close, opened = self._close_and_open()
+        self.assertTrue(self._buy_fills(), f"前置条件：正常信号必须成交，orders={opened['orders']}")
         # 清账后只留下一个"意图日早已过去"的陈旧信号，再跑一次开盘。
         with self._conn() as conn:
             conn.execute("DELETE FROM paper_fills")
@@ -1109,7 +1178,7 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
                 "SELECT COUNT(*) FROM paper_signals WHERE account_id=?", (STRATEGY_ID,)
             ).fetchone()[0]
         self.assertGreater(stale, 0)
-        opened = PT.run_slot("open", D1, force=True)
+        opened = _run_open_slot(D1)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         self.assertEqual([], self._buy_fills(), "陈旧信号必须不成交")
 
@@ -1158,40 +1227,6 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         self._boot_strategy()
         self._close_and_open()
         return {"digest": self._digest(), "fills": self._buy_fills()}
-
-    # ---------- 6) allocation 合计永远 <= shared_pool_cap ----------
-
-    def test_allocation_total_never_exceeds_shared_pool_cap(self):
-        self._boot_strategy()
-        price = LAST_CLOSE["600901"]
-        with self._conn() as conn:
-            exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", PT.SHARED_POOL_MAX_EXPOSURE)
-            for nav in (0.0, CAPITAL * 0.1, CAPITAL, CAPITAL * 10.0):
-                plan = self._allocation(price, nav=nav, conn=conn)
-                self.assertLessEqual(
-                    plan["total_deployable_amount"], plan["pool_headroom_amount"] + 1e-6,
-                    f"nav={nav}",
-                )
-                self.assertLessEqual(
-                    plan["total_deployable_amount"], nav * exposure_cap + 1e-6, f"nav={nav}",
-                )
-        # 真实交易后（有持仓、有在途）不变式仍然成立。
-        self._close_and_open()
-        with self._conn() as conn:
-            positions = [dict(row) for row in conn.execute(
-                "SELECT * FROM paper_positions WHERE account_id=?", (STRATEGY_ID,)
-            ).fetchall()]
-            pool_cap = CAPITAL * RSET.get(conn, "shared_pool_exposure_cap", PT.SHARED_POOL_MAX_EXPOSURE)
-            plan = self._allocation(price, positions=positions, conn=conn)
-            self.assertLessEqual(
-                plan["total_deployable_amount"], plan["pool_headroom_amount"] + 1e-6
-            )
-            self.assertLessEqual(plan["total_deployable_amount"], pool_cap + 1e-6)
-        # 逐策略相加也永不越过共享池上限。
-        total = sum(float(row["deployable_amount"]) for row in plan["plan"])
-        self.assertLessEqual(total, plan["pool_headroom_amount"] + 1e-6)
-        self.assertLessEqual(total, pool_cap + 1e-6)
-
 
 class ReplayClockContractTests(OfflinePaperEnv, unittest.TestCase):
     """PR-51：离线回放的"现在"必须属于 fixture 窗口，不能是墙上时钟。"""

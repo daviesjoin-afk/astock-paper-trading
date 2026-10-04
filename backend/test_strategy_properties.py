@@ -8,7 +8,7 @@
   N ∈ {0, 1, 2, 5, 10, 20, 50}、输入顺序变化、克隆成簇、同票并发下的硬边界。
 
 原则：只调用生产函数（``allocation_plan`` / ``position_limits`` /
-``stage_capital_scale`` / ``strategy_clusters`` / ``portfolio_coordinator``），
+``stage_capital_scale`` / ``strategy_clusters``），
 **不复制任何分配公式**——断言的是"上界与一致性"，不是"算法算出来应该是多少"。
 所有用例都是确定性的（按下标派生，不用 random）。
 """
@@ -24,7 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import paper_allocation as PA
 import paper_trading as PT
-import portfolio_coordinator as PCO
 import strategy_clusters as SC
 
 NAV = 1_000_000.0
@@ -311,73 +310,6 @@ class CloneSybilProperties(unittest.TestCase):
                 for row in plan["plan"]:
                     self.assertLessEqual(row["deployable_amount"], single + 1e-6,
                                          f"{row['strategy_id']} 比独享时拿得还多")
-
-
-class SameSymbolAggregationProperties(unittest.TestCase):
-    """测试组 D：多策略同时买入同一 symbol 时，组合级敞口必须聚合。"""
-
-    SYMBOL = "600901"
-    CAP = 50_000.0
-
-    def _aggregate(self, strategy_count, *, qty_each=1000, pending_each=0.0):
-        positions = [
-            {"code": self.SYMBOL, "qty": qty_each, "cost": PRICE, "industry": "工程机械",
-             "account_id": f"s{index:02d}"}
-            for index in range(strategy_count)
-        ]
-        pending = {self.SYMBOL: pending_each * strategy_count} if pending_each else {}
-        return PCO.aggregate_exposure(
-            positions, {self.SYMBOL: {"price": PRICE}}, pending_by_symbol=pending,
-        )
-
-    def test_exposure_is_summed_across_strategy_ids(self):
-        for count in (1, 2, 5, 20, 50):
-            with self.subTest(strategies=count):
-                aggregate = self._aggregate(count)
-                self.assertAlmostEqual(
-                    count * 1000 * PRICE,
-                    aggregate["by_symbol"][self.SYMBOL], places=2,
-                )
-
-    def test_more_strategies_cannot_unlock_more_symbol_capacity(self):
-        # 单票上限是组合级的：策略 ID 再多，也只能用同一个 cap。
-        for count in (1, 2, 10, 50):
-            with self.subTest(strategies=count):
-                aggregate = self._aggregate(count, qty_each=1000)
-                headroom = PCO.symbol_headroom(
-                    self.SYMBOL, aggregate, cap_amount=self.CAP)
-                if count * 1000 * PRICE >= self.CAP:
-                    self.assertFalse(
-                        headroom["allowed"],
-                        f"{count} 个策略把同一标的合计买过了组合上限仍然放行",
-                    )
-                self.assertLessEqual(
-                    headroom["used_amount"], max(self.CAP, count * 1000 * PRICE) + 1e-6)
-                self.assertGreaterEqual(headroom["headroom_amount"], 0.0)
-
-    def test_pending_buys_from_many_strategies_are_counted_before_filling(self):
-        # 在途买单（还没成交）也必须计入组合敞口，否则多策略各自"看不见对方"。
-        # 10 × 6,000 = 60,000 > cap 50,000 → 必须拒绝；低于 cap 时必须放行（对照）。
-        over = self._aggregate(10, qty_each=0, pending_each=6_000.0)
-        self.assertAlmostEqual(60_000.0, over["pending_by_symbol"][self.SYMBOL], places=2)
-        over_headroom = PCO.symbol_headroom(self.SYMBOL, over, cap_amount=self.CAP)
-        self.assertFalse(over_headroom["allowed"])
-        self.assertEqual(0.0, over_headroom["headroom_amount"])
-
-        under = self._aggregate(10, qty_each=0, pending_each=4_000.0)
-        under_headroom = PCO.symbol_headroom(self.SYMBOL, under, cap_amount=self.CAP)
-        self.assertTrue(under_headroom["allowed"])
-        self.assertAlmostEqual(10_000.0, under_headroom["headroom_amount"], places=2)
-
-    def test_symbol_cap_is_not_multiplied_by_strategy_count(self):
-        # 对照口径：同样的合计在途，不管拆成几个策略，结论必须一致。
-        one = PCO.aggregate_exposure([], None, pending_by_symbol={self.SYMBOL: 60_000.0})
-        many = self._aggregate(10, qty_each=0, pending_each=6_000.0)
-        self.assertEqual(
-            PCO.symbol_headroom(self.SYMBOL, one, cap_amount=self.CAP)["allowed"],
-            PCO.symbol_headroom(self.SYMBOL, many, cap_amount=self.CAP)["allowed"],
-        )
-        self.assertFalse(PCO.symbol_headroom(self.SYMBOL, one, cap_amount=self.CAP)["allowed"])
 
 
 class MinimumLotProperties(unittest.TestCase):

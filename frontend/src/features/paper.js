@@ -425,7 +425,9 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
     ?cny(runtime.deployment.deployable_amount):'—';
   var waiting=(runtime.deployment&&runtime.deployment.waiting_capital!==null&&runtime.deployment.waiting_capital!==undefined)
     ?cny(runtime.deployment.waiting_capital):'—';
-  var blocked=(runtime.deployment&&runtime.deployment.blocked_reason)
+  var blocked=(runtime.allocation_status==='UNAVAILABLE'
+    ?'分配额度与席位未知；请在 Portfolio Workspace 指定 cycle ID 与 plan ID 查询'
+    :(runtime.deployment&&runtime.deployment.blocked_reason))
     ||(runtime.waiting_reason&&runtime.waiting_reason.reason)
     ||(runtime.running?'正常运行，无阻塞':'未参与当前周期');
   var limits='';
@@ -476,7 +478,7 @@ export function renderPaperStrategyCenter(d){
   if(plan.total_deployable_amount!==null&&plan.total_deployable_amount!==undefined) headline.push('本轮可部署 '+cny(plan.total_deployable_amount));
   var guards=(((d.boundaries||{}).shared_guards)||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
   target.innerHTML='<section class="paper-strategy-intro"><div><h3>运行策略</h3>'
-    +'<p>本页只读展示当前周期里各策略的运行状态：参与情况、资金额度、生命周期阶段、席位占用与等待原因。策略定义、DSL、版本与生命周期统一在主导航「策略工坊」维护，本页不提供任何修改入口。</p>'
+    +'<p>本页只读展示当前周期参与状态与风险 / 执行边界。分配额度和席位只在指定 cycle ID 与 plan ID 后可验证，请到“组合计划”查看；本页不会挑选最新计划或推导风险许可。</p>'
     +paperMarketDataHtml(allocation.market_data)
     +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench()">打开策略工坊</button>'
     +'<span class="strategy-builder-hint">'+(headline.join(' · ')||'—')+'</span></div></div></section>'
@@ -649,6 +651,37 @@ export function paperOverviewVariant(){
     :(window._paperWorkspace==='history'?'history':'portfolio');
 }
 
+function workspaceJson(value){
+  return adaptiveEsc(JSON.stringify(value===undefined?null:value,null,2));
+}
+
+export async function loadPortfolioWorkspace(){
+  var cycleInput=$('portfolioWorkspaceCycle'),planInput=$('portfolioWorkspacePlan');
+  var target=$('portfolioWorkspaceResult');
+  if(!cycleInput||!planInput||!target) return;
+  var cycle=String(cycleInput.value||'').trim(),plan=String(planInput.value||'').trim();
+  if(!cycle||!plan){
+    target.innerHTML='<div class="paper-empty">输入明确的 cycle ID 和 plan ID 后读取；页面不会替你选择 latest 或 current。</div>';
+    return;
+  }
+  target.innerHTML='<div class="loading">正在读取指定的周期与计划…</div>';
+  try{
+    var d=await api('/api/portfolio/workspace?cycle_id='+encodeURIComponent(cycle)+'&plan_id='+encodeURIComponent(plan));
+    var snapshot=d.portfolio_snapshot||{},allocation=d.allocation_plan||{};
+    var dims=(snapshot.dimensions||[]).map(function(x){
+      return '<article class="paper-allocation-dimension"><header><b>'+adaptiveEsc(x.name)+'</b><span class="tag '+(x.status==='AVAILABLE'?'tag-ok':'tag-info')+'">'+adaptiveEsc(x.status||'UNAVAILABLE')+'</span></header><p>来源：'+adaptiveEsc(x.provenance||'UNAVAILABLE')+'</p><pre>'+workspaceJson({facts:x.facts,source_identity:x.source_identity,source_fingerprint:x.source_fingerprint,blocking_reasons:x.blocking_reasons})+'</pre></article>';
+    }).join('')||'<div class="paper-empty">快照维度不可用。</div>';
+    target.innerHTML='<div class="paper-allocation-summary"><span>Cycle <b>'+adaptiveEsc(d.cycle_id)+'</b></span><span>As of <b>'+adaptiveEsc(snapshot.asof_day||'UNAVAILABLE')+'</b></span><span>计划状态 <b>'+adaptiveEsc(allocation.plan_status||'UNAVAILABLE')+'</b></span><span>Risk decision <b>UNAVAILABLE</b></span></div>'
+      +'<details class="paper-allocation-identity" open><summary>精确身份、owner 与参与方</summary><pre>'+workspaceJson({snapshot_id:snapshot.snapshot_id,snapshot_fingerprint:snapshot.snapshot_fingerprint,decision_at:snapshot.decision_at,cycle_identity:snapshot.cycle_identity,strategy_pins:snapshot.strategy_pins,economic_owner_ids:snapshot.economic_owner_ids,execution_participant_ids:snapshot.execution_participant_ids,risk_exit_participant_ids:snapshot.risk_exit_participant_ids,source_identities:snapshot.source_identities,market_evidence_identity:snapshot.market_evidence_identity})+'</pre></details>'
+      +'<details class="paper-allocation-identity" open><summary>计划身份与分配结果</summary><pre>'+workspaceJson({plan_id:allocation.plan_id,plan_fingerprint:allocation.plan_fingerprint,allocation_policy_version:allocation.allocation_policy_version,allocation_weights:allocation.allocation_weights,slot_plan:allocation.slot_plan,capital_plan:allocation.capital_plan,capacity_plan:allocation.capacity_plan,conflict_plan:allocation.conflict_plan,concentration_adjustment:allocation.concentration_adjustment,correlation_term:allocation.correlation_term,blocking_reasons:allocation.blocking_reasons})+'</pre></details>'
+      +'<h4>快照事实维度</h4><div class="paper-allocation-grid">'+dims+'</div>'
+      +'<details class="paper-allocation-identity" open><summary>订单计划来源 · '+adaptiveEsc((d.order_provenance||{}).status||'UNAVAILABLE')+'</summary><pre>'+workspaceJson(d.order_provenance)+'</pre></details>'
+      +'<p class="paper-allocation-disclaimer">只读 owner facts。风险决定和生产许可不会从分配计划推导。</p>';
+  }catch(e){
+    target.innerHTML='<div class="banner">指定计划不可用：'+adaptiveEsc(e.message||e)+'</div>';
+  }
+}
+
 export function paperOverviewSignature(d){
   if(!d||typeof d!=='object') return 'null';
   var s=d.shared||{},c=d.cycle||{},curve=d.equity_curve||{},mon=(d.monitor_runs||[])[0]||{};
@@ -743,24 +776,19 @@ export async function renderPaperDashboard(d,auditRequest){
     $('paperOrderAccount').innerHTML=accounts.map(function(a){return '<option value="'+a.id+'">'+paperAccountDisplayName(a)+' · 共享可用 '+cny((d.shared||{}).cash)+'</option>';}).join('');
     if(previousAccount&&accountName[previousAccount]) $('paperOrderAccount').value=previousAccount;
     var shared=d.shared||{};
-    var slotAlloc=shared.slot_allocation||{};
     var entryFreeze=shared.entry_freeze||{};
     var entryFreezeText=entryFreeze.enabled
       ? '新增买入：自动冻结 · '+adaptiveEsc(entryFreeze.reason||'数据门禁未通过')
       : '新增买入：自动开放 · 行情、覆盖和因子门禁通过';
-    var borrowLast=shared.slot_borrow_last||null;
-    var slotText='硬上限 '+(slotAlloc.hard_cap||18)+' · 当前可部署 '+(slotAlloc.deployable_cap||shared.position_limit||18)+' · 已用 '+(shared.dynamic_position_slots_used===undefined?shared.position_count:shared.dynamic_position_slots_used);
-    var borrowText=borrowLast?('最近借位：'+(accountName[borrowLast.from]||borrowLast.from)+' → '+(accountName[borrowLast.account_id]||borrowLast.account_id)+' · 候选 '+fmt(borrowLast.candidate_score,1)+' 分'):'本轮暂无席位借用';
+    var slotText='分配额度请在“组合计划”页输入明确的周期和计划 ID 后查看。';
+    var borrowText='';
     var sharedDayText=shared.today_pnl===null||shared.today_pnl===undefined
       ? '今日 '+(shared.today_pnl_status||'暂无完整收益')
       : '今日 '+cny(shared.today_pnl,true)+'（'+pctTxt(shared.today_return_pct)+'）';
-    var sharedCard='<article class="paper-account-card shared-pool-card"><div class="paper-account-title"><span>总资金池</span><span class="tag tag-ok">'+(shared.strategy_count||accounts.length)+' 策略共用</span></div><div style="margin-top:5px;font-size:11px;color:var(--text-secondary)">'+paperMarketDataHtml(d.market_data)+'</div><div class="paper-account-nav '+pctCls(shared.return_pct)+'">'+cny(shared.nav)+'</div><div style="margin-top:5px;font-size:13px;font-weight:700" class="'+pctCls(shared.today_return_pct)+'">'+sharedDayText+'</div><div style="margin-top:3px;font-size:12px" class="'+pctCls(shared.return_pct)+'">累计 '+pctTxt(shared.return_pct)+' · 盈亏 '+cny(shared.nav-shared.initial_cash,true)+'</div><div class="paper-account-meta"><span>总持仓市值<b>'+cny(shared.market_value)+'</b></span><span>资金利用率<b>'+fmt(shared.fund_utilization_pct,1)+'%</b></span><span>持仓/总上限<b>'+shared.position_count+' / '+(shared.position_limit||18)+'</b></span></div><div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">'+slotText+'<br>'+borrowText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">'+entryFreezeText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">买入决策按策略分别运行；满仓后高分候选进入替补池，先卖弱仓再买强仓，不扩大总席位</div></article>';
+    var sharedCard='<article class="paper-account-card shared-pool-card"><div class="paper-account-title"><span>总资金池</span><span class="tag tag-ok">'+(shared.strategy_count||accounts.length)+' 策略共用</span></div><div style="margin-top:5px;font-size:11px;color:var(--text-secondary)">'+paperMarketDataHtml(d.market_data)+'</div><div class="paper-account-nav '+pctCls(shared.return_pct)+'">'+cny(shared.nav)+'</div><div style="margin-top:5px;font-size:13px;font-weight:700" class="'+pctCls(shared.today_return_pct)+'">'+sharedDayText+'</div><div style="margin-top:3px;font-size:12px" class="'+pctCls(shared.return_pct)+'">累计 '+pctTxt(shared.return_pct)+' · 盈亏 '+cny(shared.nav-shared.initial_cash,true)+'</div><div class="paper-account-meta"><span>总持仓市值<b>'+cny(shared.market_value)+'</b></span><span>资金利用率<b>'+fmt(shared.fund_utilization_pct,1)+'%</b></span><span>持仓/总上限<b>'+shared.position_count+' / '+(shared.position_limit===null||shared.position_limit===undefined?'N/A':shared.position_limit)+'</b></span></div><div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">'+slotText+'<br>'+borrowText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">'+entryFreezeText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">买入决策按策略分别运行；满仓后高分候选进入替补池，先卖弱仓再买强仓，不扩大总席位</div></article>';
     $('paperAccountStrip').innerHTML=sharedCard+accounts.map(function(a){
       var tone=a.id==='trend_pullback'?'swing':(a.id==='sector_rotation'?'rotation':'');
-      var poolPositionPct=Number(a.strategy_position_pct_pool);
-      if(!isFinite(poolPositionPct)) poolPositionPct=Number(a.position_value||0)/Math.max(Number(shared.nav)||1,1)*100;
-      var budgetAmount=Number(a.strategy_budget_amount||0);
-      var budgetUsagePct=budgetAmount>0?Number(a.position_value||0)/budgetAmount*100:null;
+      var budgetUsagePct=null;
       // 每张策略卡只展示本策略实际持仓的损益；共享资金池归因仅保留在总览。
       // 今日收益率以该策略昨日持仓市值（含当日成交基准）为分母，浮盈率以本策略持仓成本为分母。
       var dayText=a.today_pnl===null||a.today_pnl===undefined
@@ -775,7 +803,7 @@ export async function renderPaperDashboard(d,auditRequest){
         +'<div style="margin-top:3px;font-size:12px" class="'+pctCls(a.holding_return_pct)+'">'+holdingText+'</div>'
         +'<div style="margin-top:3px;font-size:12px;color:var(--text-secondary)">已实现 '+cny(a.realized_pnl,true)+' · 策略累计 '+cny(a.total_pnl,true)+'</div>'
         +'<div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">'+a.entry_model_name+' - '+a.risk_profile_name+'</div>'
-        +'<div class="paper-account-meta"><span>持仓成本<b>'+cny(a.position_cost_value)+'</b></span><span>动态预算使用<b>'+(budgetUsagePct===null?'—':fmt(budgetUsagePct,1)+'%')+'</b></span><span>持仓/动态上限<b>'+a.position_count+' / '+a.max_positions+'</b></span></div>'
+        +'<div class="paper-account-meta"><span>持仓成本<b>'+cny(a.position_cost_value)+'</b></span><span>精确计划预算<b>'+(budgetUsagePct===null?'输入计划后查看':fmt(budgetUsagePct,1)+'%')+'</b></span><span>持仓/计划席位上限<b>'+a.position_count+' / '+(a.max_positions===null||a.max_positions===undefined?'—':a.max_positions)+'</b></span></div>'
         +'<div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">累计盈亏 = 历史已实现盈亏 + 当前持仓浮盈亏；今日盈亏按昨收/当日买入成本核算</div></article>';
     }).join('');
     var qualityActionMap={

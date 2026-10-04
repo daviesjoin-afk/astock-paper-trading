@@ -150,7 +150,8 @@ class OrderIntentContractTests(unittest.TestCase):
     def test_intent_style_user_signal_passes_without_qty(self):
         strategy_id = self._make_user_strategy()
         payload = {"decision": {"passed": True},
-                   "pick": {"code": "600000", "score": 0.8, "reason": "user alpha"}}
+                   "pick": {"code": "600000", "score": 0.8, "reason": "user alpha"},
+                   "order_intent": {"intent_kind": "NEW_ENTRY"}}
         intent, reject = PT._enforce_order_intent(
             self.conn, {"id": strategy_id}, "600000", payload,
         )
@@ -159,6 +160,19 @@ class OrderIntentContractTests(unittest.TestCase):
         self.assertEqual("600000", intent.symbol)
         # 契约结构中不允许出现数量字段。
         self.assertNotIn("qty", intent.to_payload())
+        self.assertEqual("NEW_ENTRY", intent.intent_kind)
+
+    def test_free_text_does_not_supply_missing_resource_intent_kind(self):
+        strategy_id = self._make_user_strategy()
+        payload = {"decision": {"passed": True},
+                   "pick": {"code": "600000", "score": 0.8,
+                            "reason": "RISK_EXIT manual_exit add position"}}
+        intent, reject = PT._enforce_order_intent(
+            self.conn, {"id": strategy_id}, "600000", payload,
+        )
+        self.assertIsNone(intent)
+        self.assertEqual("risk_rejected", reject["status"])
+        self.assertIn("explicit_resource_intent_kind_required", reject["reason"])
 
     def test_builtin_payload_with_market_amount_is_not_rejected(self):
         # legacy adapter：main_force_top10 的 amount 是市场成交额，不拒绝。

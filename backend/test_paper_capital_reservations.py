@@ -48,6 +48,33 @@ class PendingReservationAggregateTests(ReservationDatabaseMixin, unittest.TestCa
     def test_empty_is_zero(self):
         self.assertEqual(({}, 0), self.pending())
 
+    def test_r34c_pending_reservation_evidence_preserves_cycle_order_and_source(self):
+        self.add_row("17", cycle_id=8, account_id="s1", code="AAA",
+                     amount=100, fees=2,
+                     created_at="2026-10-03T09:30:00+08:00")
+        evidence = PCR.pending_reservation_evidence(
+            self.conn, asof_day="2026-10-03",
+            decision_at="2026-10-03T09:31:00+08:00")
+        self.assertEqual("AVAILABLE", evidence["status"])
+        self.assertEqual({"s1": 102.0}, evidence["pending_by_account"])
+        row = evidence["reservations"][0]
+        self.assertEqual(8, row["cycle_id"])
+        self.assertEqual("17", row["order_id"])
+        self.assertEqual("AAA", row["symbol"])
+        self.assertEqual("paper_capital_reservations:1", row["source_identity"])
+
+    def test_r34c_reservation_query_failure_is_not_empty(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            with self.assertRaisesRegex(
+                    PCR.CapitalReservationEvidenceUnavailable,
+                    "capital_reservation_query_unavailable"):
+                PCR.pending_reservation_evidence(
+                    conn, asof_day="2026-10-03",
+                    decision_at="2026-10-03T09:31:00+08:00")
+        finally:
+            conn.close()
+
     def test_one_account_and_amount_plus_fees(self):
         self.add_row("1", amount=12, fees=3)
         self.assertEqual(({"a": 15.0}, 15.0), self.pending())

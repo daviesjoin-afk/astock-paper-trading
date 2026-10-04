@@ -7,6 +7,18 @@ can observe call-time monkeypatches and application state.
 """
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
+import json
+import math
+import sqlite3
+
+import market_data_contract as MDC
+
+
+class CapitalReservationEvidenceUnavailable(RuntimeError):
+    """The exact active reservation owner rows cannot be read or validated."""
+
 
 def _as_dict(cursor, row):
     if row is None:
@@ -91,6 +103,93 @@ def pending_buy_reservations(conn, cycle_id=None, exclude_order_key=None, *, num
         for row in rows
     }
     return by_account, sum(by_account.values())
+
+
+def pending_reservation_evidence(conn, *, asof_day, decision_at):
+    """Return exact active BUY reservation rows or fail closed.
+
+    Rows from another cycle remain visible because the formal reservation
+    ledger protects the shared capital pool. Each row retains its own cycle and
+    order identity; a successful empty query is distinct from a failed query.
+    """
+    try:
+        day = dt.date.fromisoformat(str(asof_day)).isoformat()
+    except (TypeError, ValueError) as exc:
+        raise CapitalReservationEvidenceUnavailable(
+            "explicit_reservation_asof_required") from exc
+    decision = MDC._parse_instant(decision_at)
+    if decision is None:
+        raise CapitalReservationEvidenceUnavailable(
+            "explicit_reservation_decision_at_required")
+    decision = decision.astimezone(dt.timezone.utc)
+    try:
+        rows = conn.execute(
+            """SELECT id,cycle_id,order_key,account_id,code,side,amount,fees,
+                      status,created_at
+                 FROM paper_capital_reservations
+                WHERE status='reserved'
+                ORDER BY id"""
+        ).fetchall()
+    except (sqlite3.Error, AttributeError) as exc:
+        raise CapitalReservationEvidenceUnavailable(
+            "capital_reservation_query_unavailable") from exc
+    evidence = []
+    unknown = []
+    by_account = {}
+    for raw in rows:
+        row = dict(raw) if hasattr(raw, "keys") else dict(zip(
+            ("id", "cycle_id", "order_key", "account_id", "code", "side",
+             "amount", "fees", "status", "created_at"), raw, strict=True))
+        created = MDC._parse_instant(row.get("created_at"))
+        try:
+            cycle = int(row.get("cycle_id"))
+            amount = float(row.get("amount"))
+            fees = float(row.get("fees") or 0.0)
+        except (TypeError, ValueError):
+            created = None
+            cycle = None
+            amount = fees = float("nan")
+        if (created is None or cycle is None or cycle <= 0
+                or not str(row.get("order_key") or "").strip()
+                or not str(row.get("account_id") or "").strip()
+                or not str(row.get("code") or "").strip()
+                or str(row.get("side") or "").lower() != "buy"
+                or str(row.get("status") or "") != "reserved"
+                or not math.isfinite(amount) or not math.isfinite(fees)
+                or amount < 0 or fees < 0):
+            unknown.append({"reservation_id": row.get("id"),
+                            "reason": "active_reservation_identity_or_amount_invalid"})
+            continue
+        created = created.astimezone(dt.timezone.utc)
+        if created > decision or MDC.canonical_day(row.get("created_at")) > day:
+            continue
+        item = {
+            "reservation_id": int(row["id"]), "cycle_id": cycle,
+            "order_id": str(row["order_key"]),
+            "account_id": str(row["account_id"]), "symbol": str(row["code"]),
+            "side": "buy", "amount": amount, "fees": fees,
+            "status": "reserved", "created_at": str(row["created_at"]),
+            "source_identity": f"paper_capital_reservations:{int(row['id'])}",
+        }
+        evidence.append(item)
+        by_account[item["account_id"]] = (
+            by_account.get(item["account_id"], 0.0) + amount + fees)
+    evidence.sort(key=lambda item: item["reservation_id"])
+    material = {"asof_day": day, "decision_at": str(decision_at),
+                "reservations": evidence, "unknown": unknown}
+    raw = json.dumps(material, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return {
+        "status": "AVAILABLE" if not unknown else "UNAVAILABLE",
+        "reservations": evidence,
+        "unknown_reservations": unknown,
+        "pending_by_account": {key: round(value, 2)
+                               for key, value in sorted(by_account.items())},
+        "pending_total": round(sum(by_account.values()), 2),
+        "source_identity": "paper_capital_reservations:active_buy_reservations",
+        "source_fingerprint": hashlib.sha256(raw).hexdigest(),
+        "asof_day": day, "decision_at": str(decision_at),
+    }
 
 
 def reserve_shared_capital(

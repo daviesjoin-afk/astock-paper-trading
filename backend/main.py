@@ -32,7 +32,8 @@ import operator_auth
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from api_paper import (portfolio_allocation_router, portfolio_runtime_router,
-                       risk_refresh_status, router as paper_router)
+                       portfolio_workspace_router, risk_refresh_status,
+                       router as paper_router)
 from api_adaptive import router as adaptive_router
 from api_settings import router as settings_router
 import api_strategies as strategies_api
@@ -535,6 +536,7 @@ app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND, "assets")), na
 app.include_router(paper_router)
 app.include_router(portfolio_runtime_router)
 app.include_router(portfolio_allocation_router)
+app.include_router(portfolio_workspace_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)

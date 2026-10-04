@@ -337,6 +337,9 @@ MIGRATIONS = {
         # 的路径。DDL 单一事实来源同样在 paper_schema_migrations。
         (31, "新增多策略分配计划追加证据表（幂等，不回填）",
          paper_schema.ensure_portfolio_allocation_plans),
+        # R34-C：新订单显式意图与 exact plan provenance；历史行保持 NULL。
+        (32, "新增订单 allocation intent 与 exact plan provenance（幂等，不回填）",
+         paper_schema.ensure_order_allocation_provenance),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

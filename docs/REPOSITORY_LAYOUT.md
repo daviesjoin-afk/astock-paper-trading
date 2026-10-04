@@ -101,11 +101,14 @@ canonical 意图词汇、严格权重/声明覆盖校验、证据闸门、`Portf
 `StrategyRuntime → effective_weight → position_limits_from_weights` 的 legacy 适配层，
 公开签名/输出结构与行为不变。新增路由仅
 `POST /api/portfolio/allocation/plans` 与 `GET /api/portfolio/allocation/plans/{plan_id}`。
-旧 `portfolio_coordinator` 的 `classify_intent` / `sort_intents_by_priority` /
-`_EXIT_PURPOSE_KEYWORDS` / 三个 `INTENT_*` 常量因生产调用者为 0 而删除；
-`pending_symbol_amounts`、`pending_risk_exit_codes`、`aggregate_exposure`、
-`symbol_headroom`、`theme_for` 仍有生产 caller，保留到 R34-C 收敛。
+旧 `portfolio_coordinator` 已在确认生产调用者为 0 后整模块删除；其 coordinator 专用行为测试和属性断言也已退休。Typed intents 和 exact reservation facts 由 runtime owner 提供。
 它不写正式 paper ledger、lifecycle、orders 或 risk decision，也不 apply/execute 计划。
+R34-C 生产接线位于 `paper_trading` / `manual_orders`：入口传入显式
+`ResourceIntent`、从 exact snapshot 构建 exact plan、校验 reservation/revalidation，
+随后仍由 Risk 与 Execution owners 决定许可和成交。`portfolio_workspace_service`
+及 `GET /api/portfolio/workspace` 只接收明确的 cycle/plan ID，读取并验证快照、计划与
+订单 provenance；没有 latest/current 选择或交易权限。旧 allocation/slot helper 的无调用
+定义仍待删除，general dashboard 在缺 plan identity 时返回 `UNAVAILABLE`。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

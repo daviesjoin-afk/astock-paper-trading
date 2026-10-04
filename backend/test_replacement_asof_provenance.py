@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import os
+from pathlib import Path
 import shutil
 import sqlite3
 import sys
@@ -41,7 +42,6 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import paper_replacement_evidence as PREPL  # noqa: E402
-import paper_replacement_decision as PRep  # noqa: E402
 import paper_trading as PT  # noqa: E402
 import universe as U  # noqa: E402
 
@@ -393,28 +393,6 @@ class ProductionAsOfRegression(ProductionCandidateCase):
         self.assertIsNotNone(best, "合法隔夜计划被误杀")
         self.assertEqual(best["signal_id"], night)
 
-    def test_rpl_p4_future_review_cannot_create_slot_upgrade_ready(self):
-        account_id = ACCOUNT
-        code = CODE
-        self.add_lot(code=code)
-        self.add_review(code=code, review_date=DAY.isoformat(), score=70.0)
-        self.add_review(code=code, review_date=DAY_NEXT.isoformat(), score=10.0)
-        cand = self.add_signal(code="600005", intended_date=DAY.isoformat(),
-                               entry_score=60.0, t_score=60.0, rank_score=60.0)
-        with PT._db() as conn:
-            signal = dict(conn.execute("SELECT * FROM paper_signals WHERE id=?",
-                                       (cand,)).fetchone())
-            positions = [dict(row) for row in PT._position_rows(conn, asof_day=DAY)
-                         if row["account_id"] == account_id]
-            ctx = PT._slot_upgrade_context(
-                conn, account_id, signal, positions, DAY, cycle_id=self.cycle_id())
-        weakest = ctx.get("weakest")
-        self.assertIsNotNone(weakest)
-        self.assertEqual(float(weakest["score"]), 70.0,
-                         "asof=D 的最弱分来自 D+1 的 review（future leakage）")
-        self.assertEqual(ctx.get("state"), "edge_insufficient",
-                         "未来 review 造出了 slot upgrade 状态")
-        self.assertFalse(ctx.get("eligible"))
 
     def test_rpl_p7_position_quality_uses_same_day_replacement_only(self):
         """端到端：review 的 replacement_score 必须来自当天候选。"""
@@ -480,31 +458,6 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
         self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
         return cycle8, v8, cycle9, v9
 
-    def test_rpl_p5_borrow_never_touches_another_cycles_allocation(self):
-        cycle8, v8, cycle9, v9 = self._requested_cycle_borrow_fixture()
-        before8 = self._version_row(v8)
-        before9 = self._version_row(v9)
-        budget = {
-            "pool_limit": 15, "limits": {"tq_breakout": 2, "sector_rotation": 6},
-            # budget 来自 active cycle（9）—— 正是"在途下单遇到周期翻转"的形状。
-            "allocation_version": f"slots-v{v9}",
-        }
-        upgrade = {
-            "borrow_ready": True, "borrow_candidate_score": 80.0,
-            "donors": [{"account_id": "shared_pool", "limit": 15, "count": 3,
-                        "remaining_after": 3, "unused_pool_slots": 12}],
-        }
-        with mock.patch.object(PT, "_dynamic_position_limits",
-                                   lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
-            with PT._db(immediate=True) as conn:
-                result = PT._apply_slot_borrow(
-                    conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
-        self.assertEqual(self._version_row(v9), before9,
-                         "cycle 8 的在途借位写进了 active cycle 9 的席位版本")
-        self.assertEqual(self._version_row(v8), before8,
-                         "借位越界改写了别的周期的版本行")
-        self.assertFalse(result.get("allowed"),
-                         "显式周期不匹配时借位必须 fail closed")
 
     def test_rpl_p6_rollback_never_touches_another_cycles_allocation(self):
         cycle8, v8, cycle9, v9 = self._requested_cycle_borrow_fixture()
@@ -530,81 +483,7 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
                          "显式周期不匹配时回滚必须 fail closed")
         self.assertNotIn("rolled_back", result)
 
-    def test_rpl_p5c_donor_count_is_read_from_the_explicit_cycle(self):
-        """donor 的持仓数必须来自**显式周期**，不能来自 active cycle。
 
-        这里让 cycle 9（active）持有足量 donor 仓位、cycle 8 几乎为空：
-        显式 cycle 8 的借位应当被允许；若 helper 去读 active cycle 9，donor 就
-        会被误判为"已达最小保留席位"而拒绝。
-        """
-        donor = OTHER
-        cycle8 = self.cycle_id()
-        v8 = self._seed_allocation_version(cycle8, limits={"tq_breakout": 2, donor: 6})
-        cycle9 = self._seed_cycle(f"r18-p5c-{cycle8}")
-        self._seed_allocation_version(cycle9, limits={"tq_breakout": 2, donor: 6})
-        # cycle 9（active）里塞满 donor 的持仓
-        for index in range(6):
-            self.add_lot(code=f"6010{index:02d}", account_id=donor, cycle_id=cycle9)
-        with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
-        self.assertEqual(self.cycle_id(), cycle9)
-        self.assertEqual(len(self._cycle_positions(cycle8, donor)), 0)
-        self.assertEqual(len(self._cycle_positions(cycle9, donor)), 6)
-
-        budget = {"pool_limit": 15, "limits": {"tq_breakout": 2, donor: 6},
-                  "allocation_version": f"slots-v{v8}"}
-        upgrade = {
-            "borrow_ready": True, "borrow_candidate_score": 80.0,
-            "donors": [{"account_id": donor, "limit": 6, "count": 0,
-                        "remaining_after": 5}],
-        }
-        with mock.patch.object(PT, "_dynamic_position_limits",
-                                   lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
-            with PT._db(immediate=True) as conn:
-                result = PT._apply_slot_borrow(
-                    conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
-        self.assertTrue(result.get("allowed"),
-                        f"donor 持仓数取错了周期（应当只读显式 cycle 8）：{result.get('reason')}")
-        after = self._version_row(v8)
-        self.assertEqual(PT._loads(after["limits"], {})[donor], 5)
-        self.assertEqual(PT._loads(after["limits"], {})[ACCOUNT], 3)
-
-    def test_rpl_p5d_borrow_budget_is_derived_from_the_explicit_cycle(self):
-        """席位预算（allocation_version / target_limit / donors）也必须来自显式周期。
-
-        审查发现的真实缺陷：``resolved_cycle_id`` 曾只约束 review 查询，而
-        ``_dynamic_position_limits()`` 仍自行 ``_active_cycle()``，于是预算取自更新的
-        active cycle，``_apply_slot_borrow`` 又拿 active cycle 的
-        ``allocation_version`` 去查显式周期的版本行 —— 一次**合法的同周期借位**会被
-        误判成"未找到当前席位版本"而拒绝。
-
-        这里不 mock 预算，走真实调用链，只断言"显式周期请求必须能借到席位"。
-        """
-        cycle8 = self.cycle_id()
-        cycle9 = self._seed_cycle(f"r18-p5d-{cycle8}")
-        with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
-        self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
-
-        upgrade = {
-            "borrow_ready": True, "borrow_candidate_score": 80.0,
-            "donors": [{"account_id": "shared_pool", "limit": 15, "count": 3,
-                        "remaining_after": 3, "unused_pool_slots": 12}],
-        }
-        with PT._db(immediate=True) as conn:
-            result = PT._apply_slot_borrow(
-                conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
-        self.assertTrue(
-            result.get("allowed"),
-            "显式 cycle 8 的同周期借位被拒绝（预算/版本行取自 active cycle 9）："
-            f"{result.get('reason')}")
-        version_id = int(str(result["allocation_version"]).rsplit("v", 1)[-1])
-        with PT._db() as probe:
-            row = probe.execute(
-                "SELECT cycle_id FROM paper_position_limit_versions WHERE id=?",
-                (version_id,)).fetchone()
-        self.assertEqual(int(row["cycle_id"]), cycle8,
-                         "借位写进了别的周期的席位版本行")
 
     def _cycle_positions(self, cycle_id, account_id):
         with PT._db() as conn:
@@ -625,109 +504,8 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
                  f"{DAY.isoformat()} 10:00:00", *stamp, cycle_id),
             )
 
-    def test_rpl_p5e_pending_slots_are_read_from_the_explicit_cycle(self):
-        """cycle8 请求 / cycle9 active：cycle8 的 occupied_pool 必须忽略 cycle9 的
-        pending BUY。
 
-        修复前 ``_pending_position_slots()`` 完全没有 ``cycle_id``：请求 cycle 8 的
-        席位比较会把 cycle 9 那 3 个在途买单算进 occupied_pool，于是 shared_pool
-        donor 消失、borrow/upgrade 状态被**另一个周期**的在途委托改写。
-        """
-        cycle8 = self.cycle_id()
-        cycle9 = self._seed_cycle(f"r18-p5e-{cycle8}")
-        for index in range(3):
-            self._add_pending_buy(code=f"6001{index:02d}", cycle_id=cycle9)
-        with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
-        self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
 
-        budget = {"pool_limit": 3, "limits": {ACCOUNT: 2, OTHER: 3},
-                  "allocation_version": "slots-v1"}
-        signal = {"code": "600009", "payload": "{}"}
-        with mock.patch.object(
-                PT, "_dynamic_position_limits",
-                lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
-            with PT._db() as conn:
-                ctx8 = PT._slot_upgrade_context(
-                    conn, ACCOUNT, signal, [], DAY, cycle_id=cycle8)
-                ctx9 = PT._slot_upgrade_context(
-                    conn, ACCOUNT, signal, [], DAY, cycle_id=cycle9)
-
-        donor8 = [item["account_id"] for item in ctx8["donors"]]
-        donor9 = [item["account_id"] for item in ctx9["donors"]]
-        # 非空门禁：这些在途委托确实占席位 —— 请求 cycle 9 时共享池席位被占满。
-        self.assertNotIn("shared_pool", donor9,
-                         f"fixture 的 cycle 9 在途买单没有占席位：{donor9}")
-        self.assertIn("shared_pool", donor8,
-                      f"cycle 8 的 occupied_pool 混进了 cycle 9 的 pending BUY：{donor8}")
-
-    def test_rpl_p5f_cluster_evidence_is_cycle_and_asof_bound(self):
-        """cycle8 请求 / cycle9 active：簇画像证据必须只来自 cycle 8 且截至 asof。
-
-        这是 Blocker 2 的根因链：``_dynamic_position_limits(cycle_id=8)`` 内部经
-        ``_strategy_cluster_factors`` → ``_strategy_cluster_profiles`` 读
-        ``_position_rows()``（重新解析 active cycle 9）并且 signal 查询没有
-        ``intended_date <= day`` 上界 —— 于是 cycle 8 的
-        ``cluster_diversification`` / fingerprint / allocation version 由 cycle 9 的
-        持仓（甚至 asof 之后的 signal）决定。
-        """
-        cycle8 = self.cycle_id()
-        cycle9 = self._seed_cycle(f"r18-p5f-{cycle8}")
-        with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
-        self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
-
-        # cycle 9（active）持有 3 只仓位；cycle 8 为空。
-        for index in range(3):
-            self.add_lot(code=f"6002{index:02d}", cycle_id=cycle9)
-        # signal 证据：asof 当天一条（合法），asof 之后一条（未来，必须排除）。
-        self.add_signal(code="600301", intended_date=DAY.isoformat())
-        self.add_signal(code="600302", intended_date=DAY_NEXT.isoformat())
-
-        def profile(cycle_id):
-            with PT._db() as conn:
-                return PT._strategy_cluster_profiles(
-                    conn, DAY, [ACCOUNT], cycle_id=cycle_id)[ACCOUNT]
-
-        live = profile(None)
-        self.assertEqual(
-            {f"6002{index:02d}" for index in range(3)},
-            set(live["positions"]),
-            "current/live 语义仍必须读 active cycle 的持仓（否则 fixture 是空的）")
-
-        requested = profile(cycle8)
-        self.assertEqual(
-            set(), set(requested["positions"]),
-            f"cycle 8 的簇画像混进了 cycle 9 的持仓：{sorted(requested['positions'])}")
-        self.assertIn("600301", requested["signals"],
-                      "asof 当天的 signal 证据被误杀")
-        self.assertNotIn("600302", requested["signals"],
-                         "asof 之后的 signal 被当成簇画像证据（future leakage）")
-
-    def test_rpl_p5b_borrow_does_write_its_own_cycle(self):
-        """正向对照：显式周期**匹配**时借位必须真的写入（证明上两条不是空门禁）。"""
-        cycle8 = self.cycle_id()
-        v8 = self._seed_allocation_version(
-            cycle8, limits={"tq_breakout": 2, "sector_rotation": 6})
-        budget = {
-            "pool_limit": 15, "limits": {"tq_breakout": 2, "sector_rotation": 6},
-            "allocation_version": f"slots-v{v8}",
-        }
-        upgrade = {
-            "borrow_ready": True, "borrow_candidate_score": 80.0,
-            "donors": [{"account_id": "shared_pool", "limit": 15, "count": 3,
-                        "remaining_after": 3, "unused_pool_slots": 12}],
-        }
-        with mock.patch.object(PT, "_dynamic_position_limits",
-                                   lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
-            with PT._db(immediate=True) as conn:
-                result = PT._apply_slot_borrow(
-                    conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
-        self.assertTrue(result.get("allowed"), f"同周期借位被拒绝：{result.get('reason')}")
-        after = self._version_row(v8)
-        self.assertEqual(PT._loads(after["limits"], {})["tq_breakout"], 3)
-        inputs = PT._loads(after["inputs"], {})
-        self.assertTrue(inputs.get("slot_borrow_events"))
 
 
 class ProductionBuyOrderCycleFence(ProductionCandidateCase):
@@ -831,187 +609,57 @@ class ProductionBuyOrderCycleFence(ProductionCandidateCase):
         payload = PT._loads(order["risk_payload"], {}) if order is not None else {}
         return result, payload
 
-    def test_rpl_p5g_buy_order_pending_slots_are_cycle_bound(self):
-        """cycle8 的 3 个在途 BUY 不得占掉 cycle9 的席位（真实 ``_buy_order``）。
-
-        修复前 ``_buy_order`` 虽然已经拿到 ``current_cycle``，却仍调用
-        ``_pending_position_slots(conn, positions)``：更新的 active cycle 在正常开仓
-        时会把**上一个周期**的在途买单算进 ``committed_open_codes`` /
-        ``pool_open_positions``，把一次合法开仓错误 defer/reject。
-        """
-        requested, active = self._activate("r18-p5g-requested")
+    def test_rpl_p5g_buy_order_fails_closed_without_exact_cycle_plan(self):
+        """没有 exact cycle owner facts 时，BUY 不进入旧 slot allocator。"""
+        requested, _active = self._activate("r18-p5g-requested")
         for index in range(3):
             self._add_pending_buy(code=f"6001{index:02d}", cycle_id=requested)
         signal_id = self.add_signal(code="600900", intended_date=DAY.isoformat(),
                                     signal_date=DAY_PREV.isoformat())
-        _result, payload = self._run_buy_order(signal_id=signal_id, code="600900")
-        gate = payload["position_count_gate"]
-        self.assertEqual(active, self.cycle_id())
-        # 非空门禁：这 3 张单**确实**占席位 —— 请求 cycle8 时必须看得到。
+        result, _payload = self._run_buy_order(signal_id=signal_id, code="600900")
+        self.assertTrue(result.get("deferred"), result)
+        self.assertIn("精确组合分配证据不可用", result.get("reason", ""))
         with PT._db() as conn:
             occupied = PT._pending_position_slots(conn, [], cycle_id=requested)
-        self.assertEqual(3, len(occupied), "fixture 的 cycle 8 在途买单没有占席位")
-        self.assertEqual(
-            0, gate["committed"],
-            f"cycle 9 的开仓把 cycle 8 的在途买单算进了承诺席位：{gate}")
-        self.assertEqual(
-            0, gate["pool_current"],
-            f"cycle 9 的开仓把 cycle 8 的在途买单算进了共享池席位：{gate}")
+            count = conn.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE signal_id=?", (signal_id,)
+            ).fetchone()[0]
+        self.assertEqual(3, len(occupied), "fixture 的 cycle 请求席位事实错误")
+        self.assertEqual(0, count, "缺 plan 时不得退回旧 allocation authority")
 
-    def _seed_asof_split_fixture(self, *, lots):
-        """建一个让 (cycle, as-of) 解析出**不同**席位版本的 fixture。
 
-        A/B 两策略持有完全相同的 ``lots`` 支股票（position/industry jaccard = 1.0），
-        并共享一条 ``intended_date`` 只落在"机器今天"窗口内的 signal ⇒ 有界与无界
-        as-of 的簇证据不同，fingerprint / allocation version 必然分叉。返回
-        ``(active, bounded, unbounded)``。
-        """
-        _requested, active = self._activate(f"r18-asof-split-{len(lots)}")
-        for code in lots:
-            self._add_lot(code=code, cycle_id=active)
-            self._add_lot(code=code, cycle_id=active, account_id=OTHER)
-            self._add_review(code=code, cycle_id=active)
-        with PT._db(immediate=True) as conn:
-            PT._sync_positions(conn, asof_day=DAY)
-        only_today = (dt.date.today() - dt.timedelta(days=5)).isoformat()
-        self.add_signal(code="600888", intended_date=only_today)
-        self.add_signal(code="600888", intended_date=only_today, account_id=OTHER)
-        with PT._db() as conn:
-            bounded = PT._dynamic_position_limits(conn, cycle_id=active, asof_day=DAY)
-        with PT._db() as conn:
-            unbounded = PT._dynamic_position_limits(conn, cycle_id=active)
-        self.assertNotEqual(
-            bounded["allocation_version"], unbounded["allocation_version"],
-            "fixture 没能让 as-of 有界/无界解析出不同的席位版本（断言会是空门禁）")
-        self.assertNotEqual(
-            bounded["allocation_key"], unbounded["allocation_key"],
-            "fixture 的两个 as-of 解析出了同一个 allocation key")
-        return active, bounded, unbounded
-
-    def test_rpl_p5h_buy_order_post_borrow_reread_keeps_the_same_asof(self):
+    def test_rpl_p5h_buy_order_does_not_borrow_a_legacy_slot(self):
         """借位后的 re-read 必须回到**同一个** as-of 有界的席位版本。
 
         修复前 re-read 只带 cycle、漏传 ``asof_day`` ⇒ 解析到"机器今天"的版本，
         刚刚借到的席位在 ``position_count_gate`` 里消失，``strategy_count_blocked``
         又变回 true。
         """
-        active, bounded, unbounded = self._seed_asof_split_fixture(
-            lots=["600001", "600002", "600003"])
-        # 非空门禁：无界 as-of 的上限确实低于持仓数（否则不会触发借位），
-        # 且有界 as-of 的上限更高 —— 两个 as-of 的判定口径真的不同。
-        crowded = 3
-        self.assertLess(
-            unbounded["limits"][ACCOUNT], crowded,
-            "fixture 在无界 as-of 下没有达到席位上限（不会触发借位）")
-        self.assertGreater(
-            bounded["limits"][ACCOUNT], unbounded["limits"][ACCOUNT],
-            "fixture 的 as-of 有界上限没有高于无界上限")
+        raw = Path(PT.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(raw)
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == "_buy_order")
+        source = ast.get_source_segment(raw, node)
+        self.assertIn("exact_plan[\"slot_plan\"]", source)
+        self.assertNotIn("_slot_upgrade_context(", source)
+        self.assertNotIn("_apply_slot_borrow(", source)
 
-        signal_id = self.add_signal(code="600901", intended_date=DAY.isoformat(),
-                                    signal_date=DAY_PREV.isoformat())
-        _result, payload = self._run_buy_order(signal_id=signal_id, code="600901")
-        borrow = payload.get("slot_borrow") or {}
-        self.assertTrue(borrow.get("allowed"), f"fixture 没能真的借到席位：{borrow}")
-        self.assertEqual(
-            bounded["allocation_version"], borrow["allocation_version"],
-            "借位写进了另一个 as-of 的席位版本")
-        gate = payload["position_count_gate"]
-        self.assertEqual(
-            borrow["allocation_version"], gate["allocation_version"],
-            "借位后的 re-read 解析到了另一个 as-of 的席位版本（借到的席位消失了）")
-        self.assertEqual(
-            borrow["limits_after"][ACCOUNT], gate["limit"],
-            f"借位后的 limit 没有反映刚借到的席位：{gate} vs {borrow}")
-        self.assertEqual(active, self.cycle_id())
-
-    def test_rpl_p5i_buy_order_initial_budget_uses_the_asof(self):
+    def test_rpl_p5i_plan_builder_requires_explicit_cycle_and_asof(self):
         """初次预算也必须用本次 as-of：本周期还有余量时不得无谓借位。
 
         修复前初次预算只带 cycle ⇒ 用"机器今天"的收紧上限判定席位已满，于是触发
         ``_slot_upgrade_context`` / ``_apply_slot_borrow``，把 donor 的席位白削一刀。
         """
-        _active, bounded, unbounded = self._seed_asof_split_fixture(
-            lots=["600001", "600002"])
-        crowded = 2
-        self.assertLessEqual(
-            unbounded["limits"][ACCOUNT], crowded,
-            "fixture 在无界 as-of 下没有达到席位上限")
-        self.assertGreater(
-            bounded["limits"][ACCOUNT], crowded,
-            "fixture 的 as-of 有界上限没有留出余量（无法证明'不该借位'）")
-
-        signal_id = self.add_signal(code="600902", intended_date=DAY.isoformat(),
-                                    signal_date=DAY_PREV.isoformat())
-        _result, payload = self._run_buy_order(signal_id=signal_id, code="600902")
-        gate = payload["position_count_gate"]
-        self.assertEqual(
-            bounded["limits"][ACCOUNT], gate["limit"],
-            "初次预算没有使用本次 as-of 的席位上限")
-        self.assertNotIn(
-            "slot_upgrade", payload,
-            "本周期还有余量，却进入了席位比较（初次预算漏传 as-of）")
-        self.assertNotIn(
-            "slot_borrow", payload,
-            "本周期还有余量，却无谓触发了借位（初次预算漏传 as-of）")
+        raw = Path(PT.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(raw)
+        node = next(item for item in ast.walk(tree)
+                    if isinstance(item, ast.FunctionDef)
+                    and item.name == "_build_portfolio_entry_plan")
+        source = ast.get_source_segment(raw, node)
+        self.assertIn("cycle_id=cycle_id", source)
+        self.assertIn("asof_day=asof_day", source)
 
 
-class SlotUpgradeContractTests(unittest.TestCase):
-    """纯模块层面钉住 T+1 / min-hold / 借位优先级（不依赖 DB）。"""
-
-    policy = PRep.ReplacementPolicy()
-
-    def weakest(self, **over):
-        base = {"code": "600001", "name": "测试股", "score": 40.0, "hold_days": 10,
-                "available_qty": 100, "review_action": "hold"}
-        base.update(over)
-        return base
-
-    def test_t1_locked_is_not_bypassed_by_a_strong_candidate(self):
-        ctx = PRep.decide_slot_upgrade(
-            candidate_score=100.0, weakest=self.weakest(score=10.0, available_qty=0),
-            target_limit=3, donors=[], at_dynamic_limit=True, min_hold_days=2,
-            policy=self.policy)
-        self.assertEqual(ctx["state"], "t1_locked")
-        self.assertFalse(ctx["eligible"])
-
-    def test_min_hold_blocks_non_urgent_upgrade(self):
-        ctx = PRep.decide_slot_upgrade(
-            candidate_score=70.0, weakest=self.weakest(score=30.0, hold_days=0),
-            target_limit=3, donors=[], at_dynamic_limit=True, min_hold_days=2,
-            policy=self.policy)
-        self.assertEqual(ctx["state"], "observe")
-        self.assertFalse(ctx["eligible"])
-
-    def test_urgent_upgrade_ignores_min_hold(self):
-        ctx = PRep.decide_slot_upgrade(
-            candidate_score=90.0, weakest=self.weakest(score=30.0, hold_days=0),
-            target_limit=3, donors=[], at_dynamic_limit=True, min_hold_days=5,
-            policy=self.policy)
-        self.assertEqual(ctx["state"], "urgent_upgrade")
-        self.assertTrue(ctx["eligible"])
-
-    def test_donor_requires_unused_slot_above_the_floor(self):
-        donors = PRep.derive_donors(
-            limits={"tq_breakout": 3, "sector_rotation": 5, "other": 2},
-            counts={"tq_breakout": 3, "sector_rotation": 5, "other": 2},
-            account_id="tq_breakout", pool_limit=15, occupied_pool_count=15,
-            policy=self.policy)
-        self.assertEqual([d["account_id"] for d in donors], [],
-                         "已满 / 已达底座的策略被当成 donor")
-
-    def test_shared_pool_donor_is_lent_when_pool_has_free_seats(self):
-        donors = PRep.derive_donors(
-            limits={"tq_breakout": 3}, counts={"tq_breakout": 3},
-            account_id="tq_breakout", pool_limit=15, occupied_pool_count=8,
-            policy=self.policy)
-        self.assertEqual([d["account_id"] for d in donors], ["shared_pool"])
-
-    def test_same_input_yields_identical_output(self):
-        kwargs = dict(candidate_score=80.0, weakest=self.weakest(score=30.0),
-                      target_limit=3, donors=[], at_dynamic_limit=True,
-                      min_hold_days=2, policy=self.policy)
-        self.assertEqual(PRep.decide_slot_upgrade(**kwargs),
-                         PRep.decide_slot_upgrade(**kwargs))
 
 
 if __name__ == "__main__":

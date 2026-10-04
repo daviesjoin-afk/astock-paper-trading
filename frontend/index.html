@@ -99,6 +99,7 @@
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="history" onclick="showPaperWorkspace('history',this)"><span class="module-code">历史档案</span><span class="module-copy"><b>&#x4e2a;&#x80a1;&#x6863;&#x6848;</b><small>&#x5386;&#x53f2;&#x4e70;&#x5356;&#x4e0e;&#x635f;&#x76ca;&#x5f52;&#x56e0;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="risk" onclick="showPaperWorkspace('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>&#x98ce;&#x63a7;&#x4e2d;&#x5fc3;</b><small>&#x95e8;&#x7981;&#x3001;&#x98ce;&#x9669;&#x961f;&#x5217;&#x3001;&#x5ba1;&#x8ba1;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="execution" onclick="showPaperWorkspace('execution',this)"><span class="module-code">执行</span><span class="module-copy"><b>执行画像</b><small>七档执行参数 · 批量窗口 · 人工核验</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="allocation" data-testid="paper-allocation-tab" onclick="showPaperWorkspace('allocation',this)"><span class="module-code">组合计划</span><span class="module-copy"><b>Portfolio Workspace</b><small>按明确周期与计划查看只读证据</small></span></button>
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" data-testid="paper-runtime-strategies" hidden><div class="loading">正在读取运行策略状态…</div></div>
@@ -151,6 +152,17 @@
     <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取各策略的风险状态…</div></div>
   </div>
   <div id="paperExecutionView" class="paper-execution-view" hidden><div class="loading">正在读取执行画像与执行队列…</div></div>
+  <div id="paperAllocationView" class="paper-allocation-view" hidden>
+    <section class="panel paper-allocation-panel">
+      <header><div><span class="page-kicker">READ ONLY · EXACT PLAN</span><h3>Portfolio Workspace</h3><p>必须输入明确的 cycle ID 与 plan ID。此页面只展示该计划绑定的快照和订单来源，不会自动选择最新计划，也不会授予交易权限。</p></div></header>
+      <form id="portfolioWorkspaceForm" class="paper-allocation-form" onsubmit="event.preventDefault();loadPortfolioWorkspace()">
+        <label>Cycle ID<input id="portfolioWorkspaceCycle" data-testid="portfolio-workspace-cycle" type="number" min="1" step="1" required></label>
+        <label>Plan ID<input id="portfolioWorkspacePlan" data-testid="portfolio-workspace-plan" type="text" minlength="64" maxlength="64" required autocomplete="off"></label>
+        <button type="submit">读取指定计划</button>
+      </form>
+      <div id="portfolioWorkspaceResult" data-testid="portfolio-workspace-result" aria-live="polite"><div class="paper-empty">输入明确的 cycle ID 和 plan ID 后读取。</div></div>
+    </section>
+  </div>
 </div>
 
 <div id="p-adaptive" class="page adaptive-page">

@@ -540,7 +540,7 @@ Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 **
 
 阶段状态：R34-A **COMPLETE**（PR #225 已以 merge commit `186e0bf` 合并，tree 与 approved head 完全一致）。
 
-## R34-B Deterministic Multi-Strategy Allocation Policy（IN REVIEW）
+## R34-B Deterministic Multi-Strategy Allocation Policy（COMPLETE，PR #226 MERGED）
 
 | 契约 | 断言 | 测试 | mutation |
 | --- | --- | --- | --- |
@@ -558,5 +558,83 @@ Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 **
 
 Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。B35/B36 and M-B19/M-B20 cover historical pinned metadata and economic-only exit denial. 计划 DDL 归 migration v31 / `paper_trading.init_db`。
 
-阶段状态：R31/R32/R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **IN REVIEW**；R34-C **NOT STARTED**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
+阶段状态：R31/R32/R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **COMPLETE（PR #226 MERGED）**；R34-C **IN PROGRESS（未提交审核）**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
+
+## R34-C Production Wiring + Convergence（IN PROGRESS）
+
+- Automatic and manual BUY consume a v2 exact allocation plan and persist typed
+  intent plus snapshot/plan provenance. Manual SELL remains an independent
+  existing-exposure exit.
+- Swing scale-in and intraday buyback now declare `ADD_POSITION`, consume exact
+  slot/capital/capacity facts, revalidate the same snapshot, and persist exact
+  allocation provenance.
+- Runtime capacity includes pending amount grouped by symbol from validated
+  formal BUY reservations. Pending query failure stays unavailable. After
+  proving zero production callers, `portfolio_coordinator.py` and its
+  dedicated behavior tests/coordinator-specific properties were removed.
+- General dashboard and allocation-explain views do not call legacy allocation
+  helpers; without explicit plan identity their allocation fields stay
+  `UNAVAILABLE`. `GET /api/portfolio/workspace` and its UI require explicit
+  cycle/plan IDs and preserve exact owner facts, blockers, and order provenance.
+- Targeted Chromium Workspace interaction covers explicit query identity,
+  no implicit latest/current request, unavailable rendering, hidden-panel
+  navigation, desktop/mobile layout, and browser console/page errors.
+- Focused execution, reservation, intent, runtime, allocation and architecture
+  regressions are being run during wiring. Legacy BUY/capital allocation and
+  slot-borrow decision helpers are removed; Risk capacity-exit review retains
+  its dynamic limit input and legacy rollback recovery remains. A verified
+  empty reservation query issues eligible-account zeros while preserving global
+  `pending_total`; shared exposure includes all economic owners, but allowance
+  weights/pending maps include only execution participants. C0-C35 now have
+  regression traceability below. M-C1-M-C17 are all detected with zero survived,
+  fake, or timeout mutations and byte-for-byte restoration. Exact-head full
+  backend/Docker/frontend/Chromium/security CI and review-thread closure remain
+  outstanding. R34-C and R34 remain incomplete.
+
+### R34-C regression traceability (C0-C35)
+
+| ID | Regression coverage |
+|---|---|
+| C0 | `test_portfolio_runtime` RC1-RC3/RC8-RC10; `test_portfolio_allocation_weights` RC10-RC12; `test_portfolio_order_intents` RC4-RC6 |
+| C1 | `test_guard10g_production_buy_callers_pass_cycle_and_asof` |
+| C2 | `test_workspace_requires_matching_cycle_and_never_looks_up_latest` |
+| C3 | `test_b7_current_registry_head_cannot_replace_a_snapshot_pin`; Workspace order-pin mismatch |
+| C4 | `test_b4_corrupt_snapshot_fingerprint_fails_closed`; `test_corrupt_stored_plan_is_rejected` |
+| C5 | `test_b5_no_latest_or_current_snapshot_fallback`; Workspace named-plan source guard |
+| C6 | `test_c6_c7_paused_owner_exposure_counts_but_receives_no_new_allowance`; `test_b11_paused_economic_owner_gets_no_new_resource` |
+| C7 | `test_b12_risk_exit_only_account_gets_no_entry_resource` |
+| C8 | `test_c8_existing_exposure_sell_path_does_not_require_an_allocation_plan` |
+| C9 | `test_guard10g_production_buy_callers_pass_cycle_and_asof` exact slot-plan source and legacy-caller assertions |
+| C10 | `test_second_buy_is_capped_by_the_shared_pool_not_broken` |
+| C11 | `test_b17_market_value_unavailable_blocks_capital_allocation`; `test_planner_failure_leaves_no_side_effects` |
+| C12 | `test_b16_missing_pending_is_not_pending_zero`; `test_pa9_pending_capacity_failure_is_unavailable_not_zero` |
+| C13 | `test_rc2_missing_exact_quote_is_partial_and_not_cost_filled` |
+| C14 | `test_rc6_pending_reader_query_error_raises_controlled_evidence_failure`; `test_rc10_runtime_pending_query_failure_is_not_composed_as_empty` |
+| C15 | `test_risk_exit_is_never_deferred_behind_an_entry`; `test_rc13_untyped_pending_sell_is_unknown_and_blocks_same_symbol_entry` |
+| C16 | `test_b36_economic_owner_without_risk_exit_right_cannot_block_entry` |
+| C17 | `test_rc5_legacy_pending_sell_is_unknown_not_risk_exit`; `test_rc13_untyped_pending_sell_is_unknown_and_blocks_same_symbol_entry` |
+| C18 | `test_b23_free_text_cannot_manufacture_a_canonical_intent_kind`; `test_free_text_does_not_supply_missing_resource_intent_kind` |
+| C19 | `test_b22_opposite_intents_stay_distinct_and_are_not_netted` |
+| C20 | `test_r26_partial_fill_retry_is_idempotent_and_finishes_same_order` asserts the original plan ID remains on the retried order |
+| C21 | `test_guard10g_production_buy_callers_pass_cycle_and_asof` exact snapshot ID/fingerprint revalidation assertions |
+| C22 | `test_concurrent_entries_cannot_consume_the_same_single_slot` submits four simultaneous BUYs against a three-slot plan |
+| C23 | `test_risk_block_overrides_planned_allocation` |
+| C24 | `test_b24_allocator_emits_no_risk_allow_or_block` |
+| C25 | `test_guard10g_production_buy_callers_pass_cycle_and_asof`; Workspace verifies exact order provenance |
+| C26 | `test_workspace_reads_exact_named_cycle_snapshot_plan_and_orders` appends a later plan and rechecks the original order's plan ID |
+| C27 | `test_pa17_capture_does_not_write_lifecycle` |
+| C28 | `test_pa16_capture_is_read_only_for_formal_ledger` |
+| C29 | `test_c29_workspace_ui_renders_backend_facts_without_allocation_math`; Portfolio Workspace Chromium coverage |
+| C30 | Workspace unavailable facts stay explicit in API/UI rendering tests |
+| C31 | `test_guard10g_production_buy_callers_pass_cycle_and_asof`; dynamic slot limit remains only in Risk capacity-exit review |
+| C32 | Coordinator conflict helpers have zero production callers; obsolete coordinator module and dedicated tests are deleted |
+| C33 | `portfolio_coordinator.py` and its isolated tests are deleted after production caller count reached zero |
+| C34 | `test_rc9_plan_services_are_connection_explicit_and_paper_trading_free`; reservation module direction guard |
+| C35 | `test_b3a_historical_v1_plan_fingerprint_remains_verifiable` |
+
+### R34-C semantic mutation results
+
+`work/r34c_production_wiring_mutation_check.py` result: M-C1-M-C17 all
+**DETECTED**; `survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and
+the focused baseline after restore is green.
 

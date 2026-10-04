@@ -5,7 +5,7 @@
 
 A1 ``apply_allocation``        — Bandit 策略权重 → 共享资金池分摊覆盖
                                   （paper_accounts.params.adaptive_allocation，
-                                  由 paper_trading._strategy_pool_budget 消费）。
+                                  由 exact canonical allocation-weight owner 消费）。
 A3 ``apply_tuner_proposals``   — 双AI共识提案 → 选股因子权重/入场阈值覆盖
                                   （paper_accounts.params.adaptive_selection，
                                   由 paper_trading._adaptive_selection 消费）。

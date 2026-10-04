@@ -66,10 +66,12 @@ class StrategyArchiveReplayTests(G.OfflinePaperEnv, unittest.TestCase):
             G.RSET.update(conn, {"enabled_strategies": [STRATEGY_ID]}, actor="archive-test")
         _, cycle = G.PT.start_new_cycle(capital=G.CAPITAL, include_dashboard=False)
         self.assertEqual(tuple(cycle["enabled_strategies"]), (STRATEGY_ID,))
+        with self._conn() as conn:
+            G._declare_test_allocation_weights(conn, (STRATEGY_ID,))
         close_result = G.PT.generate_signals(G.D0)
         user_rows = [row for row in close_result["accounts"] if row["id"] == STRATEGY_ID]
         self.assertTrue(user_rows and user_rows[0]["created"] > 0, close_result)
-        opened = G.PT.run_slot("open", G.D1, force=True)
+        opened = G._run_open_slot(G.D1)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         with self._conn() as conn:
             buy_fills = conn.execute(
@@ -140,7 +142,7 @@ class StrategyArchiveReplayTests(G.OfflinePaperEnv, unittest.TestCase):
         with self._conn() as conn:
             conn.execute("DELETE FROM paper_jobs WHERE slot='risk'")
             conn.execute("DELETE FROM paper_audit WHERE event='risk_scan_state'")
-        G.PT.run_slot("risk", G.D2, force=True)
+        G._run_open_slot(G.D2, "risk")
         with self._conn() as conn:
             sell_fills = conn.execute(
                 "SELECT code,qty,price,fill_date FROM paper_fills "

@@ -97,7 +97,14 @@ class CycleParticipantResolverTests(G.OfflinePaperEnv, unittest.TestCase):
 
     def _start_cycle(self):
         PT.init_db()
-        return PT.start_new_cycle(capital=G.CAPITAL, include_dashboard=False)
+        summary, cycle = PT.start_new_cycle(capital=G.CAPITAL, include_dashboard=False)
+        with self._conn() as conn:
+            account_ids = tuple(cycle["enabled_strategies"])
+            if account_ids:
+                G._declare_test_allocation_weights(
+                    conn, account_ids, 100.0 / len(account_ids),
+                )
+        return summary, cycle
 
     def _pause_current_cycle(self):
         with self._conn() as conn:
@@ -157,7 +164,7 @@ class CycleParticipantResolverTests(G.OfflinePaperEnv, unittest.TestCase):
         """收盘生成信号 + 开盘执行（与生产 slot 完全相同的 Service 链）。"""
         close_result = PT.generate_signals(G.D0)
         self.assertNotEqual(close_result.get("status"), "failed", close_result)
-        opened = PT.run_slot("open", G.D1, force=True)
+        opened = G._run_open_slot(G.D1)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         return close_result, opened
 
