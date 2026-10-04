@@ -397,8 +397,9 @@ zero, or a latest/current lookup as an exact fact.
   dedicated legacy unit suite plus coordinator-specific property assertions
   were deleted after confirming zero production callers. Optional
   symbol/industry/theme risk caps still fail closed without a strict exposure
-  owner. Full C0-C35/M-C1-M-C17 coverage, exact-head CI, and review-thread
-  closure remain outstanding. R34-C and R34 remain incomplete.
+  owner. C0-C35 traceability and M-C1-M-C17 mutation checks are complete. PR
+  #227 is open for review; final exact-head Docker/remote CI remains pending.
+  R34-C is IN REVIEW, while R34 remains incomplete.
 ### Import graph guard
 
 Current relevant direction:

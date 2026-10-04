@@ -558,9 +558,9 @@ Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 **
 
 Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。B35/B36 and M-B19/M-B20 cover historical pinned metadata and economic-only exit denial. 计划 DDL 归 migration v31 / `paper_trading.init_db`。
 
-阶段状态：R31/R32/R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **COMPLETE（PR #226 MERGED）**；R34-C **IN PROGRESS（未提交审核）**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
+阶段状态：R31/R32/R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **COMPLETE（PR #226 MERGED）**；R34-C **IN REVIEW（PR #227 OPEN）**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
 
-## R34-C Production Wiring + Convergence（IN PROGRESS）
+## R34-C Production Wiring + Convergence（IN REVIEW）
 
 - Automatic and manual BUY consume a v2 exact allocation plan and persist typed
   intent plus snapshot/plan provenance. Manual SELL remains an independent
@@ -579,17 +579,20 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
 - Targeted Chromium Workspace interaction covers explicit query identity,
   no implicit latest/current request, unavailable rendering, hidden-panel
   navigation, desktop/mobile layout, and browser console/page errors.
-- Focused execution, reservation, intent, runtime, allocation and architecture
-  regressions are being run during wiring. Legacy BUY/capital allocation and
+- Full backend pytest, focused execution, reservation, intent, runtime,
+  allocation and architecture regressions pass. Frontend build/unit (157/157),
+  Chromium E2E (36/36), Ruff, compileall, M-C1–M-C17 and local security scan
+  pass. CI-equivalent Docker unittest and remote exact-head checks remain
+  pending. Legacy BUY/capital allocation and
   slot-borrow decision helpers are removed; Risk capacity-exit review retains
   its dynamic limit input and legacy rollback recovery remains. A verified
   empty reservation query issues eligible-account zeros while preserving global
   `pending_total`; shared exposure includes all economic owners, but allowance
-  weights/pending maps include only execution participants. C0-C35 now have
+  weights/pending maps include only execution participants. C0-C35 have
   regression traceability below. M-C1-M-C17 are all detected with zero survived,
-  fake, or timeout mutations and byte-for-byte restoration. Exact-head full
-  backend/Docker/frontend/Chromium/security CI and review-thread closure remain
-  outstanding. R34-C and R34 remain incomplete.
+  fake, or timeout mutations and byte-for-byte restoration. PR #227 is open and
+  remains unmerged; exact-head Docker/remote CI and review-thread closure remain
+  outstanding. R34-C is IN REVIEW and R34 remains incomplete.
 
 ### R34-C regression traceability (C0-C35)
 
