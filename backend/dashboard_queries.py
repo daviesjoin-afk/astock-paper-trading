@@ -21,13 +21,12 @@ def dashboard(include_activity=False, include_history_symbols=False):
     """
 
     from paper_trading import (  # deferred: dashboard_queries stays import-order independent of the monolith
-        ACCOUNT_SPECS, ENTRY_FROZEN_WAITLIST_STATUS, LOT_SIZE, SHARED_POOL_MAX_POSITIONS,
-        STRATEGY_MAX_POSITIONS, _account_metric_inputs, _account_metrics,
-        _account_reference_capital, _active_account_rows, _active_cycle, _date, _db,
-        _dynamic_position_limits, _economic_pool_nav_history, _entry_freeze_status,
-        _hold_days, _latest_price_map, _loads, _market_session, _market_state, _num,
-        _pending_position_slots, _position_rows, _recent_orders_with_archives, _rows,
-        _schedule_cache, _shared_initial_cash, _shared_metrics, _strategy_pool_budget,
+        ACCOUNT_SPECS, ENTRY_FROZEN_WAITLIST_STATUS, _account_metric_inputs, _account_metrics,
+        _account_reference_capital, _active_account_rows, _active_cycle, _db,
+        _economic_pool_nav_history, _entry_freeze_status,
+        _hold_days, _latest_price_map, _loads, _market_session, _num,
+        _position_rows, _recent_orders_with_archives, _rows,
+        _schedule_cache, _shared_initial_cash, _shared_metrics,
         _today_position_performance, dfc, schedule_status,
         _execution_verified_predicate,
     )
@@ -124,100 +123,41 @@ def dashboard(include_activity=False, include_history_symbols=False):
             for row in account_rows
         ]
         shared = _shared_metrics(conn, cycle, positions, quotes)
-        # Publish the same fair-budget calculation used by order sizing so
-        # the dashboard, risk center and audit detail never show three copies
-        # of the global 82% ceiling.
-        account_rows_by_id = {row["id"]: row for row in account_rows}
-        count_budget = _dynamic_position_limits(conn)
-        pending_slots = _pending_position_slots(conn, positions)
-        occupied_pool_slots = len({
-            (str(item.get("account_id")), str(item.get("code")))
-            for item in positions if int(_num(item.get("qty"))) >= LOT_SIZE
-        } | pending_slots)
-        free_pool_slots = max(0, int(count_budget["pool_limit"]) - occupied_pool_slots)
-        shared["dynamic_position_slots_used"] = occupied_pool_slots
-        shared["dynamic_position_slots_available"] = free_pool_slots
+        # Allocation is a fact of one exact, cycle-pinned plan. A general
+        # dashboard request has no plan identity, so do not select a latest
+        # plan or reconstruct limits from the legacy allocator.
+        shared["allocation_status"] = "UNAVAILABLE"
+        shared["allocation_unavailable_reason"] = "explicit_cycle_and_plan_id_required"
+        shared["dynamic_position_slots_used"] = None
+        shared["dynamic_position_slots_available"] = None
         # Make the auto entry circuit-breaker explain itself in the same
         # read-only dashboard response.  A frozen waitlist without these
         # checks looks identical to a strategy producing no candidates.
         shared["entry_freeze"] = _entry_freeze_status()
-        shared["slot_borrow_policy"] = (
-            "高分候选可从共享池未使用席位或其他策略空闲席位借用1席；"
-            f"不突破硬上限{SHARED_POOL_MAX_POSITIONS}，仍须通过行情、资金、T+1与风控门禁"
-        )
-        # Allocation and borrowing are execution controls, so expose the same
-        # version/history that _buy_order used.  The UI can now distinguish
-        # "策略本身有6席" from "本轮从空闲席位借来1席", rather than making a
-        # changed upper limit look like an unexplained manual override.
-        active_version_id = int(str(count_budget.get("allocation_version") or "slots-v0").rsplit("v", 1)[-1] or 0)
-        version_row = conn.execute(
-            "SELECT id,pool_limit,limits,weights,inputs,source,effective_at FROM paper_position_limit_versions WHERE id=?",
-            (active_version_id,),
-        ).fetchone()
-        version_inputs = _loads(version_row["inputs"], {}) if version_row else {}
-        borrow_events = list(version_inputs.get("slot_borrow_events") or [])[-9:]
         shared["slot_allocation"] = {
-            "hard_cap": SHARED_POOL_MAX_POSITIONS,
-            "deployable_cap": int(count_budget.get("pool_limit") or 0),
-            "limits": count_budget.get("limits") or {},
-            "weights": count_budget.get("weights") or {},
-            "version": count_budget.get("allocation_version"),
-            "effective_at": count_budget.get("effective_at"),
-            "source": count_budget.get("source"),
+            "status": "UNAVAILABLE",
+            "reason": "explicit_cycle_and_plan_id_required",
         }
-        shared["slot_borrow_audit"] = borrow_events
-        shared["slot_borrow_last"] = borrow_events[-1] if borrow_events else None
+        shared["slot_borrow_audit"] = []
+        shared["slot_borrow_last"] = None
         for account in accounts:
-            account_source = account_rows_by_id.get(account["id"], account)
-            account["max_positions"] = max(
-                1,
-                int(count_budget["limits"].get(account["id"], (ACCOUNT_SPECS.get(account["id"]) or {}).get("max_positions", 5))),
-            )
-            account["position_limit_dynamic"] = True
-            account["pool_position_limit"] = count_budget["pool_limit"]
-            account["position_limit_source"] = count_budget["source"]
-            account["position_limit_version"] = count_budget["allocation_version"]
-            account["dynamic_position_slots_used"] = occupied_pool_slots
-            account["dynamic_position_slots_available"] = free_pool_slots
-            account["slot_borrow_available"] = bool(
-                free_pool_slots > 0 or int(account.get("max_positions", 0)) < STRATEGY_MAX_POSITIONS
-            )
-            account["slot_borrow_policy"] = "高分候选自动借用1个空闲席位；借位不放宽资金/行情/风控"
-            account["position_limit_excess"] = max(
-                0, int(_num(account.get("position_count"))) - account["max_positions"],
-            )
-            # P3 审计修复（R6）：传入 market 使黄灯系数进入展示预算——
-            # 旧口径黄/红灯下 deployment_remaining 系统性虚高。市场灯用
-            # 已加载的缓存快照计算（allow_network=False，无新增网络开销）。
-            try:
-                _dash_market = _market_state(
-                    _date(None), live_universe=_snapshot_rows,
-                    allow_network=False,
-                )
-            except Exception:
-                _dash_market = None
-            budget = _strategy_pool_budget(
-                conn, account_source,
-                shared.get("nav"), positions, quotes,
-                market=_dash_market,
-            )
-            account["strategy_budget_pct"] = budget["target_pct"]
-            account["strategy_floor_pct"] = budget["floor_pct"]
-            account["strategy_position_pct_pool"] = budget["current_pct"]
-            account["strategy_position_value"] = budget["current_amount"]
-            account["strategy_pending_reserve_amount"] = budget.get("pending_reserve_amount", 0.0)
-            account["strategy_committed_amount"] = budget.get("current_total_amount", budget["current_amount"])
-            account["strategy_budget_amount"] = budget["target_amount"]
-            account["strategy_floor_amount"] = budget["floor_amount"]
-            account["strategy_allowance_amount"] = budget["allowance_amount"]
-            account["strategy_redistribution_amount"] = budget["redistribution_amount"]
-            account["pool_exposure_pct"] = budget["pool_exposure_pct"]
-            account["pool_limit_pct"] = budget["pool_limit_pct"]
-            account["strategy_budget"] = budget
-            # Existing consumers use these names for the visible budget.
-            account["fund_utilization_pct"] = budget["current_pct"]
-            account["deployment_limit_pct"] = budget["target_pct"]
-            account["deployment_remaining"] = budget["allowance_amount"]
+            account["allocation_status"] = "UNAVAILABLE"
+            account["allocation_unavailable_reason"] = "explicit_cycle_and_plan_id_required"
+            for name in (
+                "max_positions", "pool_position_limit", "position_limit_source",
+                "position_limit_version", "dynamic_position_slots_used",
+                "dynamic_position_slots_available", "slot_borrow_available",
+                "position_limit_excess", "strategy_budget_pct", "strategy_floor_pct",
+                "strategy_position_pct_pool", "strategy_position_value",
+                "strategy_pending_reserve_amount", "strategy_committed_amount",
+                "strategy_budget_amount", "strategy_floor_amount",
+                "strategy_allowance_amount", "strategy_redistribution_amount",
+                "pool_exposure_pct", "pool_limit_pct", "fund_utilization_pct",
+                "deployment_limit_pct", "deployment_remaining",
+            ):
+                account[name] = None
+            account["position_limit_dynamic"] = False
+            account["strategy_budget"] = None
         # Never scale strategy P&L to hide a ledger discrepancy.  Publish the
         # independently calculated totals and an explicit reconciliation gap.
         raw_total = sum(_num(account.get("total_pnl")) for account in accounts)
@@ -328,15 +268,9 @@ def dashboard(include_activity=False, include_history_symbols=False):
         account_names = {item["id"]: item["name"] for item in accounts}
         for account in accounts:
             account["position_count"] = sum(1 for p in positions if p["account_id"] == account["id"])
-            account["pending_position_slots"] = sum(
-                1 for pending_account, _ in pending_slots if pending_account == account["id"]
-            )
-            account["committed_position_count"] = (
-                account["position_count"] + account["pending_position_slots"]
-            )
-            account["position_limit_excess"] = max(
-                0, account["position_count"] - int(_num(account.get("max_positions"), 999)),
-            )
+            account["pending_position_slots"] = None
+            account["committed_position_count"] = None
+            account["position_limit_excess"] = None
             account["pending_order_count"] = conn.execute(
                 "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status IN ('pending_limit',?)",
                 (account["id"], ENTRY_FROZEN_WAITLIST_STATUS),
@@ -344,13 +278,13 @@ def dashboard(include_activity=False, include_history_symbols=False):
             account["cooldown_until"] = conn.execute(
                 "SELECT cooldown_until FROM paper_accounts WHERE id=?", (account["id"],)
             ).fetchone()[0]
-        shared["position_limit"] = count_budget["pool_limit"]
-        shared["pending_position_slots"] = len(pending_slots)
-        shared["committed_position_count"] = shared.get("position_count", 0) + len(pending_slots)
-        shared["position_limit_excess"] = max(0, shared.get("position_count", 0) - count_budget["pool_limit"])
-        shared["position_limits"] = count_budget["limits"]
-        shared["position_limit_dynamic"] = True
-        shared["position_limit_version"] = count_budget["allocation_version"]
+        shared["position_limit"] = None
+        shared["pending_position_slots"] = None
+        shared["committed_position_count"] = None
+        shared["position_limit_excess"] = None
+        shared["position_limits"] = None
+        shared["position_limit_dynamic"] = False
+        shared["position_limit_version"] = None
         # Recent activity is a cross-cycle audit view: merge immutable reset
         # snapshots only for the visible activity workspace.  Its archive scan
         # is intentionally never run for a portfolio refresh.

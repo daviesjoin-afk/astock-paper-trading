@@ -156,216 +156,21 @@ class _CapitalCase(unittest.TestCase):
                 (cycle_id, account_id, code, f"测试股_{code}", "Tech", qty, qty, cost,
                  "2026-08-20 10:00:00", "2026-08-21", order_id))
 
-    def budget(self, *, asof_day, cycle_id=None, account_id=ACCOUNT):
-        quotes = dict(self.quotes)
-        with PT._db() as conn:
-            positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
-                conn, quotes, DAY)
-            account = dict(conn.execute(
-                "SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone())
-        with PT._db() as conn:
-            return PT._strategy_pool_budget(
-                conn, account, nav, positions, quotes, market=dict(MARKET),
-                cycle_id=self.cycle_id() if cycle_id is None else cycle_id,
-                asof_day=asof_day,
-            )
-
-    def plan_row(self, *, asof_day, cycle_id=None, account_id=ACCOUNT):
-        quotes = dict(self.quotes)
-        with PT._db() as conn:
-            positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
-                conn, quotes, DAY)
-            account = dict(conn.execute(
-                "SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone())
-        with PT._db() as conn:
-            plan = PT._allocation_plan(
-                conn, nav=nav, positions=positions, quotes=quotes, market=dict(MARKET),
-                account=account,
-                cycle_id=self.cycle_id() if cycle_id is None else cycle_id,
-                asof_day=asof_day,
-            )
-        return (plan.get("rows_by_strategy") or {}).get(account_id) or {}
 
 
-class AdaptiveRiskIsAsOfBound(_CapitalCase):
-    """EC-1 / EC-2 —— adaptive risk overlay 的生效日边界。"""
-
-    def test_ec1_future_adaptive_risk_is_ignored(self):
-        self.quotes[CODE] = _quote(CODE)
-        baseline = self.budget(asof_day=DAY)
-        self.set_account_params(ACCOUNT, adaptive_risk={"max_exposure": 0.30},
-                                adaptive_risk_meta={
-                                    "status": "active",
-                                    "effective_date": DAY_NEXT.isoformat(),
-                                })
-        after = self.budget(asof_day=DAY)
-        self.assertEqual(
-            baseline.get("target_pct"), after.get("target_pct"),
-            "生效日更晚的 adaptive risk 改写了历史 as-of 的资金预算")
-        self.assertEqual(
-            baseline.get("absolute_cap_amount"), after.get("absolute_cap_amount"),
-            "生效日更晚的 adaptive risk 改写了历史 as-of 的绝对上限")
-
-    def test_ec2_same_day_adaptive_risk_applies(self):
-        """不能修成"overlay 永远不生效"：同一天生效的 overlay 必须照常收敛。"""
-        self.quotes[CODE] = _quote(CODE)
-        baseline = self.budget(asof_day=DAY)
-        self.set_account_params(ACCOUNT, adaptive_risk={"max_exposure": 0.30},
-                                adaptive_risk_meta={
-                                    "status": "active",
-                                    "effective_date": DAY.isoformat(),
-                                })
-        with PT._db() as conn:
-            account = dict(conn.execute(
-                "SELECT * FROM paper_accounts WHERE id=?", (ACCOUNT,)).fetchone())
-            profile = PT._risk_profile(account, asof_day=DAY, conn=conn)
-        self.assertLess(
-            float(profile.get("max_exposure")), 0.95,
-            f"同日生效的 adaptive risk 没有收敛风险画像：{profile.get('max_exposure')}")
-        after = self.budget(asof_day=DAY)
-        self.assertLess(
-            after.get("target_pct"), baseline.get("target_pct"),
-            "同日生效的 adaptive risk 没有改变资金预算（overlay 被修死）")
 
 
-class AdaptiveAllocationIsAsOfBound(_CapitalCase):
-    """EC-3 / EC-4 —— adaptive allocation 权重的生效日边界。"""
-
-    def test_ec3_future_adaptive_allocation_is_ignored(self):
-        self.quotes[CODE] = _quote(CODE)
-        baseline = self.budget(asof_day=DAY)
-        self.set_account_params(ACCOUNT, adaptive_allocation={
-            "status": "active", "effective_date": DAY_NEXT.isoformat(), "weight_pct": 90.0,
-        })
-        after = self.budget(asof_day=DAY)
-        self.assertEqual(
-            baseline.get("target_pct"), after.get("target_pct"),
-            "生效日更晚的 adaptive allocation 改写了历史 as-of 的 strategy weight")
-
-    def test_ec4_same_day_adaptive_allocation_applies(self):
-        self.quotes[CODE] = _quote(CODE)
-        baseline = self.budget(asof_day=DAY)
-        self.set_account_params(ACCOUNT, adaptive_allocation={
-            "status": "active", "effective_date": DAY.isoformat(), "weight_pct": 90.0,
-        })
-        with PT._db() as conn:
-            rows = PT._shared_account_rows(conn, self.cycle_id())
-            profiles = {row["id"]: PT._risk_profile(row, asof_day=DAY, conn=conn)
-                        for row in rows if row.get("id")}
-            weights = PT._strategy_pool_weights(conn, rows, profiles, asof_day=DAY)
-        self.assertEqual(weights[ACCOUNT], 0.9, "同日生效的权重没有被采用")
-        after = self.budget(asof_day=DAY)
-        self.assertNotEqual(
-            baseline.get("target_pct"), after.get("target_pct"),
-            "同日生效的 adaptive allocation 没有改变资金预算（overlay 被修死）")
 
 
-class ClusterEvidenceIsAsOfBound(_CapitalCase):
-    """EC-5 / EC-6 —— 相关簇证据的 as-of 边界。"""
-
-    def _two_strategy_lots(self):
-        cycle = self.cycle_id()
-        for code, account_id in (("600001", ACCOUNT), ("600002", ACCOUNT),
-                                 ("600003", ACCOUNT), ("600001", OTHER),
-                                 ("600002", OTHER), ("600004", OTHER)):
-            self.add_lot(account_id=account_id, code=code, cycle_id=cycle)
-
-    def _cluster(self, asof_day):
-        with PT._db() as conn:
-            return PT._strategy_cluster_factors(
-                conn, asof_day,
-                account_ids=[ACCOUNT, OTHER], cycle_id=self.cycle_id())
-
-    def test_ec5_future_cluster_signal_is_ignored(self):
-        self._two_strategy_lots()
-        self.quotes[CODE] = _quote(CODE)
-        baseline = self.budget(asof_day=DAY)
-        clusters_before, _factors = self._cluster(DAY)
-        self.assertEqual(len(clusters_before), 2, "fixture 的两策略本应各自成簇")
-        future_day = (dt.date.today() - dt.timedelta(days=5)).isoformat()
-        for index in range(4):
-            for account_id in (ACCOUNT, OTHER):
-                self.add_signal(account_id=account_id, code=f"6010{index:02d}",
-                                intended_date=future_day)
-        clusters_after, _factors = self._cluster(DAY)
-        self.assertEqual(
-            clusters_before, clusters_after,
-            "只属于机器今天的 signal 重合证据改变了历史 as-of 的簇结构")
-        self.assertEqual(
-            baseline.get("target_pct"), self.budget(asof_day=DAY).get("target_pct"),
-            "未来簇证据改变了历史 as-of 的资金预算")
-
-    def test_ec6_asof_cluster_signal_is_applied(self):
-        """不能修成"簇证据永远为空"：as-of 之内的 signal 必须照常参与归簇。"""
-        self._two_strategy_lots()
-        self.quotes[CODE] = _quote(CODE)
-        from paper_trading import _date
-        in_window = (_date(DAY) - dt.timedelta(days=3)).isoformat()
-        for index in range(4):
-            for account_id in (ACCOUNT, OTHER):
-                self.add_signal(account_id=account_id, code=f"6011{index:02d}",
-                                intended_date=in_window)
-        clusters, _factors = self._cluster(DAY)
-        self.assertEqual(
-            len(clusters), 1,
-            f"as-of 之内的 signal 重合证据没有参与归簇：{clusters}")
 
 
-class ParticipantRowsFollowTheCycle(_CapitalCase):
-    """EC-7 —— participants 只来自显式周期的账本。"""
-
-    def test_ec7_participants_come_from_the_explicit_cycle_only(self):
-        older = self.cycle_id()
-        newer = self.new_cycle(f"r19-ec7-{older}")
-        # 只有 older 周期挂接前两个账户；newer 周期挂接另外两个。
-        with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id IN (?,?)",
-                         (older, ACCOUNT, OTHER))
-            conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id NOT IN (?,?)",
-                         (newer, ACCOUNT, OTHER))
-        with PT._db() as conn:
-            older_ids = {row["id"] for row in PT._shared_account_rows(conn, older)}
-            newer_ids = {row["id"] for row in PT._shared_account_rows(conn, newer)}
-        self.assertEqual(older_ids, {ACCOUNT, OTHER}, "older 周期的参与者不正确")
-        self.assertNotIn(ACCOUNT, newer_ids, "fixture 的周期账本没有分叉")
-        self.quotes[CODE] = _quote(CODE)
-        # 显式 older 周期的预算必须只看到 older 的参与者。
-        with PT._db() as conn:
-            inputs = PT._pool_allocation_inputs(
-                conn, {"id": ACCOUNT}, 100_000.0, [], dict(self.quotes),
-                dict(MARKET), cycle_id=older, asof_day=DAY,
-            )
-        self.assertEqual(set(inputs["rows"] and [row["id"] for row in inputs["rows"]]),
-                         {ACCOUNT, OTHER},
-                         "资金预算的参与者不是显式周期的账本")
 
 
-class PlanAndBudgetShareTheSameFacts(_CapitalCase):
-    """EC-8 —— allocation_plan 与 strategy_pool_budget 消费同一份有界事实。"""
 
-    def test_ec8_plan_and_budget_agree_under_the_same_asof(self):
-        self.quotes[CODE] = _quote(CODE)
-        budget = self.budget(asof_day=DAY)
-        row = self.plan_row(asof_day=DAY)
-        self.assertEqual(
-            budget.get("absolute_cap_amount"), row.get("raw_allowance_amount"),
-            "部署计划与策略预算在同一 (cycle, as-of) 下给出了不同的额度："
-            "两者必须消费同一份装配输入（PR-26 唯一装配点）")
-
-    def test_ec8b_plan_ignores_future_adaptive_allocation(self):
-        self.quotes[CODE] = _quote(CODE)
-        baseline = self.plan_row(asof_day=DAY)
-        self.set_account_params(ACCOUNT, adaptive_allocation={
-            "status": "active", "effective_date": DAY_NEXT.isoformat(), "weight_pct": 90.0,
-        })
-        after = self.plan_row(asof_day=DAY)
-        self.assertEqual(
-            baseline.get("deployable_amount"), after.get("deployable_amount"),
-            "部署计划被生效日更晚的 adaptive allocation 改写（历史 as-of 不可复现）")
 
 
 class ProductionBuyCallersCarryProvenance(_CapitalCase):
-    """EC-9 / EC-10 —— 回补与加仓的预算同样带 (cycle, as-of)。"""
+    """EC-9 / EC-10 —— 回补与加仓使用 exact (cycle, as-of) plans。"""
 
     @staticmethod
     def _call_window(name, call):
@@ -382,14 +187,16 @@ class ProductionBuyCallersCarryProvenance(_CapitalCase):
         raise AssertionError(f"未找到函数 {name}")
 
     def test_ec9_intraday_buyback_budget_carries_cycle_and_asof(self):
-        window = self._call_window("_intraday_buyback", "_strategy_pool_budget(")
+        window = self._call_window("_intraday_buyback", "_build_portfolio_entry_plan(")
         self.assertIn("cycle_id=", window, "回补预算漏传 cycle")
-        self.assertIn("asof_day=asof_day", window, "回补预算漏传 as-of")
+        self.assertIn("asof_day=_date(asof_day).isoformat()", window)
+        self.assertIn('intent_kind="ADD_POSITION"', window)
 
     def test_ec10_swing_scale_in_budget_carries_cycle_and_asof(self):
-        window = self._call_window("_swing_scale_in", "_strategy_pool_budget(")
+        window = self._call_window("_swing_scale_in", "_build_portfolio_entry_plan(")
         self.assertIn("cycle_id=", window, "加仓预算漏传 cycle")
-        self.assertIn("asof_day=asof_day", window, "加仓预算漏传 as-of")
+        self.assertIn("asof_day=_date(asof_day).isoformat()", window)
+        self.assertIn('intent_kind="ADD_POSITION"', window)
 
 
 class ReservedCashIsAGlobalObligation(_CapitalCase):
@@ -442,150 +249,8 @@ class CompiledProfileIsAsOfBound(_CapitalCase):
             f"回放日 {earlier} 早于策略版本创建日 {created}，未来版本的编译帽被融进历史")
 
 
-class ExplicitEmptyCycleHasNoCapital(_CapitalCase):
-    """EC-13 —— 显式 idle 周期（enabled_strategies == []）不得凭空产生预算。"""
-
-    def test_ec13_idle_cycle_does_not_fall_back_to_the_caller_account(self):
-        idle = self.new_cycle(f"r19-ec13-{self.cycle_id()}")
-        with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_cycles SET enabled_strategies=? WHERE id=?",
-                         ("[]", idle))
-        with PT._db() as conn:
-            rows = PT._shared_account_rows(conn, idle)
-        self.assertEqual([], list(rows), "fixture 的 idle 周期本应没有参与者（空门禁）")
-        self.quotes[CODE] = _quote(CODE)
-        with PT._db() as conn:
-            inputs = PT._pool_allocation_inputs(
-                conn, {"id": ACCOUNT}, 100_000.0, [], dict(self.quotes),
-                dict(MARKET), cycle_id=idle, asof_day=DAY,
-            )
-        self.assertEqual(
-            [], list(inputs["rows"]),
-            "显式 idle 周期把调用方账户注入成参与者：零策略周期凭空有了资金表达")
-        self.assertEqual({}, inputs["weights"], "idle 周期产生了策略权重")
 
 
-class DynamicPositionLimitsAreCycleAsOfBound(_CapitalCase):
-    """EC-20 —— seat budget 也必须消费同一个 (cycle, as-of, pinned version)。"""
-
-    def test_ec20_dynamic_position_limits_are_cycle_asof_deterministic(self):
-        import strategy_registry as SR
-        cycle = self.cycle_id()
-        with PT._db() as conn:
-            before = PT._dynamic_position_limits(conn, cycle_id=cycle, asof_day=DAY)
-            current = SR.get_version(ACCOUNT, conn=conn)
-        self.assertIn(ACCOUNT, before["weights"], "fixture 没有生成 seat-budget 权重")
-        # 清掉 baseline 缓存行，确保 after 调用真正走 runtime 组装路径。
-        with PT._db(immediate=True) as conn:
-            conn.execute(
-                "DELETE FROM paper_position_limit_versions WHERE cycle_id=?",
-                (cycle,))
-        # 未来 adaptive risk：历史 as-of 回放不得看见它。
-        self.set_account_params(
-            ACCOUNT, adaptive_risk={"max_exposure": 0.30},
-            adaptive_risk_meta={
-                "status": "active", "effective_date": DAY_NEXT.isoformat(),
-            })
-        # current head 前进到不同风险模板；cycle pin 仍应停在 v1。
-        with PT._db(immediate=True) as conn:
-            SR.save_definition(
-                conn, ACCOUNT,
-                {"metadata": {"style": "trend", "hold": 8, "daily": True, "positions": 3}},
-                expected_version=current.version, actor="r19-test",
-                change_note="ec20 advance current head",
-            )
-        captured = {}
-        original_runtimes = PT._strategy_runtimes
-
-        def spy(*args, **kwargs):
-            captured["profiles"] = kwargs.get("profiles")
-            captured["cycle_id"] = kwargs.get("cycle_id")
-            return original_runtimes(*args, **kwargs)
-
-        with PT._db() as conn:
-            with mock.patch.object(PT, "_strategy_runtimes", side_effect=spy):
-                after = PT._dynamic_position_limits(conn, cycle_id=cycle, asof_day=DAY)
-            head_runtime = PT.SRT.get_context(conn, ACCOUNT).allocation_runtime
-        self.assertNotEqual(
-            before["weights"].get(ACCOUNT), 0.30,
-            "fixture 的未来 adaptive risk 没有形成可区分状态")
-        self.assertNotEqual(
-            before["weights"].get(ACCOUNT), head_runtime.own_exposure_cap_pct,
-            "fixture 的 current head 与 pinned runtime 帽相同，无法区分 provenance")
-        self.assertEqual(
-            cycle, captured.get("cycle_id"),
-            "seat-budget runtime 没有收到 explicit cycle")
-        self.assertIn(
-            ACCOUNT, captured.get("profiles") or {},
-            "seat-budget runtime 没有收到 pinned profiles")
-        self.assertEqual(
-            before["pool_limit"], after["pool_limit"],
-            "seat-budget pool_limit 被未来 adaptive risk / current head 改写")
-        self.assertEqual(
-            before["limits"], after["limits"],
-            "seat-budget limits 被未来 adaptive risk / current head 改写")
-        self.assertEqual(
-            before["weights"], after["weights"],
-            "seat-budget weights 被未来 adaptive risk / current head 改写")
-
-
-    def test_ec20b_explicit_idle_cycle_does_not_reinject_builtins(self):
-        """EC-20b —— explicit idle cycle 的 seat budget 也必须保持空。"""
-        idle = self.new_cycle(f"r19-ec20b-{self.cycle_id()}")
-        with PT._db(immediate=True) as conn:
-            conn.execute(
-                "UPDATE paper_cycles SET enabled_strategies=? WHERE id=?",
-                ("[]", idle))
-        with PT._db() as conn:
-            result = PT._dynamic_position_limits(
-                conn, cycle_id=idle, asof_day=DAY)
-        self.assertEqual({}, result["limits"], "idle cycle 注入了 builtin 席位")
-        self.assertEqual({}, result["weights"], "idle cycle 注入了 builtin 权重")
-        self.assertEqual(0, result["pool_limit"], "idle cycle 产生了非零 pool_limit")
-
-
-    def test_ec20c_user_only_cycle_participates_in_seat_budget(self):
-        """EC-20c —— explicit cycle 的参与者 authority 是 cycle ledger rows。"""
-        import strategy_registry as SR
-        user = "r19_user_only"
-        cycle = self.new_cycle(f"r19-ec20c-{self.cycle_id()}")
-        rule = {
-            "op": "gt", "left": {"op": "field", "name": "close"},
-            "right": {"op": "const", "value": 1},
-        }
-        metadata = {"style": "trend", "daily": True, "hold": 8, "positions": 3}
-        with PT._db(immediate=True) as conn:
-            SR.ensure_schema(conn)
-            SR.create_user_definition(
-                conn, user, "R19 user only", dsl_ast=rule,
-                metadata=metadata, actor="r19-test")
-            conn.execute(
-                "INSERT INTO paper_accounts(id,name,source_strategy,status,"
-                "initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,"
-                "version,created_at,updated_at,cycle_id,risk_profile) "
-                "VALUES(?,?,'strategy_dsl','running',0,0,8,3,0.32,0.9,'v0',?,?,?, 'trend')",
-                (user, user, f"{DAY.isoformat()} 00:00:00",
-                 f"{DAY.isoformat()} 00:00:00", int(cycle)),
-            )
-            conn.execute(
-                "UPDATE paper_cycles SET enabled_strategies=? WHERE id=?",
-                (PT._json([user]), int(cycle)))
-            SR.bind_cycle_versions(conn, int(cycle), [user])
-        with PT._db() as conn:
-            rows = PT._shared_account_rows(conn, cycle)
-            result = PT._dynamic_position_limits(
-                conn, cycle_id=cycle, asof_day=DAY)
-        self.assertEqual(
-            [user], [str(row.get("id")) for row in rows if row.get("id")],
-            "fixture 的 cycle ledger 没有只返回用户策略")
-        self.assertIn(user, result["weights"], "seat budget 丢掉了用户策略权重")
-        self.assertIn(user, result["limits"], "seat budget 丢掉了用户策略席位")
-        self.assertGreater(result["pool_limit"], 0, "用户策略没有获得可用 pool_limit")
-        for builtin in PT.ACCOUNT_SPECS:
-            self.assertNotIn(builtin, result["weights"],
-                             f"用户专属 cycle 错误注入了 builtin 权重：{builtin}")
-            self.assertNotIn(builtin, result["limits"],
-                             f"用户专属 cycle 错误注入了 builtin 席位：{builtin}")
 
 
 class CyclePinnedStrategyVersionIsUsed(_CapitalCase):
@@ -767,69 +432,7 @@ class CyclePinnedStrategyVersionIsUsed(_CapitalCase):
             composite.get("template"), audit.get("template"),
             "生产资金路径缺 pin 时没有 fail closed 到 Composite")
 
-    def test_ec18_cluster_dsl_uses_cycle_pinned_version(self):
-        """EC-18 —— cluster 的结构证据必须取 cycle pin 的 DSL，而不是 current head。"""
-        import strategy_registry as SR
-        cycle = self.cycle_id()
-        pinned_version = self._seed_pinned_cycle(cycle_id=cycle)
-        other = "r19_clone"
-        with PT._db(immediate=True) as conn:
-            SR.ensure_schema(conn)
-            SR.create_user_definition(
-                conn, other, "R19 clone", dsl_ast=dict(self.HEAD_RULE),
-                metadata=dict(self.HEAD_CONFIG), actor="r19-test")
-            SR.bind_cycle_versions(conn, int(cycle), [other])
-        with PT._db() as conn:
-            before = PT._strategy_cluster_profiles(
-                conn, DAY, [self.USER, other], cycle_id=cycle)
-        before_similarity = PT.SC.dsl_ast_similarity(
-            before[self.USER].get("dsl_ast"), before[other].get("dsl_ast"))
-        self.assertLess(
-            before_similarity, PT.SC.DSL_CLONE_THRESHOLD,
-            "fixture 的 v1 与对照策略不应是结构克隆")
-        self._advance_head(expected_version=pinned_version)
-        with PT._db() as conn:
-            after = PT._strategy_cluster_profiles(
-                conn, DAY, [self.USER, other], cycle_id=cycle)
-            clusters, _factors = PT._strategy_cluster_factors(
-                conn, DAY, [self.USER, other], cycle_id=cycle)
-        after_similarity = PT.SC.dsl_ast_similarity(
-            after[self.USER].get("dsl_ast"), after[other].get("dsl_ast"))
-        self.assertLess(
-            after_similarity, PT.SC.DSL_CLONE_THRESHOLD,
-            "cycle 回放的 cluster DSL 吃到了后来 current head 的结构")
-        self.assertNotEqual(
-            PT.SC.cluster_of(self.USER, clusters), PT.SC.cluster_of(other, clusters),
-            "cycle 回放因后来 current head 的 DSL 改变了簇预算")
 
-    def test_ec19_runtime_cap_uses_cycle_pinned_version(self):
-        """EC-19 —— allocation runtime 的版本派生字段必须取 cycle pin。"""
-        cycle = self.cycle_id()
-        pinned_version = self._seed_pinned_cycle(cycle_id=cycle)
-        with PT._db() as conn:
-            account = dict(conn.execute(
-                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
-            before = PT._pool_allocation_inputs(
-                conn, account, CAPITAL, [], {}, dict(MARKET), rows=[account],
-                cycle_id=cycle, asof_day=DAY)
-            pinned_runtime = next(
-                item for item in before["runtimes"] if item.strategy_id == self.USER)
-        self._advance_head(expected_version=pinned_version)
-        with PT._db() as conn:
-            account = dict(conn.execute(
-                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
-            after = PT._pool_allocation_inputs(
-                conn, account, CAPITAL, [], {}, dict(MARKET), rows=[account],
-                cycle_id=cycle, asof_day=DAY)
-            after_runtime = next(
-                item for item in after["runtimes"] if item.strategy_id == self.USER)
-            head_runtime = PT.SRT.get_context(conn, self.USER).allocation_runtime
-        self.assertNotEqual(
-            pinned_runtime.own_exposure_cap_pct, head_runtime.own_exposure_cap_pct,
-            "fixture 的两个版本敞口帽相同，无法区分 provenance")
-        self.assertEqual(
-            pinned_runtime.own_exposure_cap_pct, after_runtime.own_exposure_cap_pct,
-            "cycle 回放的 allocation runtime 敞口帽被后来 current head 改写")
 
 
 class ForeignReservationIsNeverReleased(unittest.TestCase):

@@ -9,7 +9,7 @@ import { compareAdaptiveValidationRun, openAdaptiveValidationRun, refreshAdaptiv
 import { activatePage, refreshApp, showPaperWorkspace, toggleDark } from "./core/navigation.js";
 import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, testModlensRead, triggerEvolution } from "./features/adaptive.js";
 import { loadPaperExecution, verifyExecutionOrder } from "./features/execution.js";
-import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPaperOrderPreview, filterPaperHistoryRows, loadPaperStockHistory, pausePaper, preparePaperSell, previewPaperOrder, refreshPaperResearchValidation, resetPaper, resumePaper, runPaperNow, selectPaperHistoryQuick, setPaperOrderSide, setPaperTerminalFilter, showPaperStockHistory, startPaper, submitPaperOrder, syncPaperCapitalHint, togglePaperLimitPrice } from "./features/paper.js";
+import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPaperOrderPreview, filterPaperHistoryRows, loadPaperStockHistory, loadPortfolioWorkspace, pausePaper, preparePaperSell, previewPaperOrder, refreshPaperResearchValidation, resetPaper, resumePaper, runPaperNow, selectPaperHistoryQuick, setPaperOrderSide, setPaperTerminalFilter, showPaperStockHistory, startPaper, submitPaperOrder, syncPaperCapitalHint, togglePaperLimitPrice } from "./features/paper.js";
 import { applyPaperRiskAuditFilter, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
 import { cancelManualDataUpdate, choosePaperStrategy, chooseStrategy, filterSelectionEvaluationRows, loadDataValidity, loadPaperSelection, loadSelectionEvaluation, refreshSelectionEvaluation, runPaperSelection, showSelectionValidation, startFactorIncrementalUpdate, startInit, startManualDataUpdate, trackRemove } from "./features/selection.js";
 import { clearAiSlotKey, clearOperatorTab, resetSettingsSection, saveAiReviewMode, saveAiSlot, saveSettingsSection, setSettingsSection, testAiSlot, unlockOperatorTab } from "./features/settings.js";
@@ -36,6 +36,7 @@ window.loadAdaptive = loadAdaptive;
 window.loadDataValidity = loadDataValidity;
 window.loadEvolutionStatus = loadEvolutionStatus;
 window.loadPaperExecution = loadPaperExecution;
+window.loadPortfolioWorkspace = loadPortfolioWorkspace;
 window.loadPaperRisk = loadPaperRisk;
 window.loadPaperSelection = loadPaperSelection;
 window.loadPaperStockHistory = loadPaperStockHistory;

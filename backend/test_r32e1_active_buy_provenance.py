@@ -48,6 +48,8 @@ class ActiveBuyDecisionProvenanceTests(unittest.TestCase):
     # inheriting its test methods.
     _quotes = _BuyCase._quotes
     _seed_tradability_archive = _BuyCase._seed_tradability_archive
+    _entry_plan_fixture = _BuyCase._entry_plan_fixture
+    _same_entry_snapshot = _BuyCase._same_entry_snapshot
     add_signal = _BuyCase.add_signal
     run_buy = _BuyCase.run_buy
 

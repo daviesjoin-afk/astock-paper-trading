@@ -42,7 +42,7 @@ from types import MappingProxyType
 import paper_allocation as PA
 import portfolio_runtime as PR
 
-POLICY_VERSION = "portfolio-allocation-policy-v1"
+POLICY_VERSION = "portfolio-allocation-policy-v2"
 PLAN_SCHEMA_VERSION = "portfolio-allocation-plan-v1"
 
 # ─── plan component status ───────────────────────────────────────────────────
@@ -254,39 +254,113 @@ def _gate_reasons(dimension: PR.PortfolioDimension, required_facts) -> tuple[str
     return tuple(sorted({str(reason) for reason in reasons}))
 
 
-def _capital_plan(snapshot: PR.PortfolioRuntimeSnapshot) -> dict:
-    """Market-valued capital allocation is evidence-gated, never zero-filled.
-
-    Requires simultaneously: market-valued ``strategy_exposure`` (cost basis is
-    explicitly not a substitute), exact as-of pending ``capacity``, and an
-    explicit ``nav``. The current R34-A capture supplies none of these, so the
-    honest canonical result is ``INSUFFICIENT_EVIDENCE``. No allowance of ``0``
-    is emitted, because "unknown" and "zero" are different facts.
-
-    Beyond the evidence gate this policy version deliberately does not produce a
-    capital allowance at all; that boundary is reported explicitly rather than
-    filled with a substituted number.
-    """
+def _capital_plan(snapshot: PR.PortfolioRuntimeSnapshot, declarations,
+                  weights, *, shared_pool_max_exposure,
+                  strategy_pool_floor_ratio) -> dict:
+    """Compute exact allowances through paper_allocation's single arithmetic owner."""
     exposure = _dimension(snapshot, "strategy_exposure")
     capacity = _dimension(snapshot, "capacity")
     capital = _dimension(snapshot, "capital")
     missing = (list(_gate_reasons(exposure, ("market_value_by_account",)))
-               + list(_gate_reasons(capacity, ("pending_by_account", "pending_total")))
+               + list(_gate_reasons(capacity, ("pending_by_account", "pending_total",
+                                               "headroom")))
                + list(_gate_reasons(capital, ("nav",))))
+    if shared_pool_max_exposure is None:
+        missing.append("explicit_shared_pool_exposure_cap_unavailable")
+    if strategy_pool_floor_ratio is None:
+        missing.append("explicit_strategy_pool_floor_ratio_unavailable")
     unique = sorted({str(reason) for reason in missing})
-    return {
-        "status": INSUFFICIENT_EVIDENCE,
-        "authority": "resource_allowance_only_not_trade_permission",
-        "allowance_by_strategy": None,
-        "v1_boundary": "capital_allowance_not_computed_in_policy_v1",
-        "blocking_reasons": unique or ["capital_allowance_not_computed_in_policy_v1"],
-        "cost_basis_used_as_market_value": False,
-        "market_value_by_account": (
-            _thaw(exposure.facts.get("market_value_by_account"))
-            if exposure.status == PR.AVAILABLE else None),
-        "required_evidence": ["market_valued_strategy_exposure", "asof_pending_capacity",
-                              "explicit_nav"],
-    }
+    if unique:
+        return {
+            "status": INSUFFICIENT_EVIDENCE,
+            "authority": "resource_allowance_only_not_trade_permission",
+            "allowance_by_strategy": None,
+            "blocking_reasons": unique,
+            "cost_basis_used_as_market_value": False,
+            "market_value_by_account": (
+                _thaw(exposure.facts.get("market_value_by_account"))
+                if exposure.status == PR.AVAILABLE else None),
+            "required_evidence": ["market_valued_strategy_exposure",
+                                  "asof_pending_capacity", "explicit_nav",
+                                  "explicit_pool_allocation_limits"],
+        }
+
+    try:
+        nav = _finite_number(capital.facts["nav"], what="nav")
+        pending_total = _finite_number(capacity.facts["pending_total"],
+                                       what="pending_total")
+        pool_cap = _finite_number(shared_pool_max_exposure,
+                                  what="shared_pool_max_exposure")
+        floor_ratio = _finite_number(strategy_pool_floor_ratio,
+                                     what="strategy_pool_floor_ratio")
+        if nav <= 0 or not 0 <= pool_cap <= 1 or not 0 <= floor_ratio <= 1:
+            raise ValueError
+        values = {str(key): _finite_number(value, what="market_value")
+                  for key, value in dict(
+                      exposure.facts["market_value_by_account"]).items()}
+        pending_by_account = {
+            str(key): _finite_number(value, what="pending_by_account")
+            for key, value in dict(capacity.facts["pending_by_account"]).items()
+        }
+        # Exposure belongs to every economic owner, including paused or
+        # risk-exit-only participants. Only the pending map and weights are
+        # scoped to eligible new-resource participants.
+        if (set(values) != set(snapshot.economic_owner_ids)
+                or not set(weights).issubset(values)
+                or set(pending_by_account) != set(weights)):
+            raise ValueError
+        cash_headroom = _finite_number(capacity.facts.get("headroom"),
+                                       what="capacity_headroom")
+        used = sum(values.values()) + pending_total
+        cash_limited_pool_cap = min(pool_cap, max(used + max(cash_headroom, 0.0), 0.0) / nav)
+        runtime_by_account = {
+            declaration.account_id: declaration.as_runtime(weights[declaration.account_id])
+            for declaration in declarations
+        }
+        arithmetic = PA.allocation_plan(
+            tuple(runtime_by_account.values()), nav=nav, values=values,
+            pending_by_account=pending_by_account, pending_total=pending_total,
+            prices_by_strategy={}, shared_pool_max_exposure=cash_limited_pool_cap,
+            strategy_pool_floor_ratio=floor_ratio,
+        )
+        rows = {str(row["strategy_id"]): row for row in arithmetic["plan"]}
+        allowance = {
+            account: _finite_number(row["scaled_budget_amount"],
+                                    what="scaled_budget_amount")
+            for account, row in rows.items()
+        }
+        stages = {account: str(row["lifecycle_stage"])
+                  for account, row in rows.items()}
+        scales = {account: _finite_number(row["capital_scale"],
+                                           what="capital_scale")
+                  for account, row in rows.items()}
+        return {
+            "status": PLANNED,
+            "authority": "paper_allocation:allocation_plan",
+            "allowance_by_strategy": allowance,
+            "lifecycle_stage_by_strategy": stages,
+            "capital_scale_by_strategy": scales,
+            "raw_allowance_by_strategy": {
+                account: _finite_number(row["raw_allowance_amount"],
+                                        what="raw_allowance_amount")
+                for account, row in rows.items()},
+            "market_value_by_account": values,
+            "pending_by_account": pending_by_account,
+            "pending_total": pending_total,
+            "nav": nav,
+            "capacity_headroom": cash_headroom,
+            "pool_exposure_cap": pool_cap,
+            "cash_limited_pool_exposure_cap": cash_limited_pool_cap,
+            "arithmetic_engine": arithmetic["engine"],
+            "blocking_reasons": [],
+            "cost_basis_used_as_market_value": False,
+            "required_evidence": ["market_valued_strategy_exposure",
+                                  "asof_pending_capacity", "explicit_nav",
+                                  "explicit_pool_allocation_limits"],
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PortfolioAllocationPolicyError(
+            "canonical_capital_evidence_invalid") from exc
 
 
 def _capacity_plan(snapshot: PR.PortfolioRuntimeSnapshot) -> dict:
@@ -394,6 +468,8 @@ def _conflict_plan(snapshot: PR.PortfolioRuntimeSnapshot, intents) -> dict:
     """
     eligible = set(snapshot.execution_participant_ids)
     exit_scope = set(snapshot.risk_exit_participant_ids)
+    conflict_evidence = _dimension(snapshot, "signal_conflicts")
+    unknown_orders = list(conflict_evidence.facts.get("unknown_orders") or ())
     seen = set()
     for intent in intents:
         if intent.intent_id in seen:
@@ -428,6 +504,40 @@ def _conflict_plan(snapshot: PR.PortfolioRuntimeSnapshot, intents) -> dict:
         by_symbol.setdefault(row["symbol"], []).append(row)
     arbitration = []
     deferred: list[str] = []
+    unknown_order_blocks = []
+    unscoped_unknown = any(not str(item.get("symbol") or "").strip()
+                           for item in unknown_orders)
+    if unscoped_unknown:
+        blocked_ids = [row["intent_id"] for row in rows
+                       if row["intent_kind"] in ENTRY_INTENT_KINDS
+                       and row["new_resource_eligible"]]
+        deferred.extend(blocked_ids)
+        unknown_order_blocks.append({
+            "symbol": None, "blocking_order_ids": sorted(
+                int(item["order_id"]) for item in unknown_orders
+                if item.get("order_id") is not None),
+            "deferred_intent_ids": sorted(blocked_ids),
+            "rule": "unscoped_unknown_pending_order_blocks_entries",
+        })
+    else:
+        for symbol in sorted({str(item.get("symbol") or "")
+                              for item in unknown_orders}):
+            blockers = [item for item in unknown_orders
+                        if str(item.get("symbol") or "") == symbol]
+            blocked_ids = [row["intent_id"] for row in rows
+                           if row["symbol"] == symbol
+                           and row["intent_kind"] in ENTRY_INTENT_KINDS
+                           and row["new_resource_eligible"]]
+            if blocked_ids:
+                deferred.extend(blocked_ids)
+                unknown_order_blocks.append({
+                    "symbol": symbol,
+                    "blocking_order_ids": sorted(
+                        int(item["order_id"]) for item in blockers
+                        if item.get("order_id") is not None),
+                    "deferred_intent_ids": sorted(blocked_ids),
+                    "rule": "unknown_pending_order_blocks_same_symbol_entry",
+                })
     for symbol in sorted(by_symbol):
         group = by_symbol[symbol]
         # Only intents the policy actually grants may contend for a symbol. An
@@ -447,12 +557,17 @@ def _conflict_plan(snapshot: PR.PortfolioRuntimeSnapshot, intents) -> dict:
                 "rule": "risk_exit_outranks_new_entry_and_add_position",
             })
     return {
-        "status": PLANNED,
+        "status": (INSUFFICIENT_EVIDENCE if unscoped_unknown else
+                   PARTIAL if unknown_orders else PLANNED),
         "authority": "resource_execution_priority_only_not_risk_approval",
         "intent_ordering": list(INTENT_KINDS),
         "ordered_intents": rows,
         "arbitration": arbitration,
-        "deferred_intent_ids": sorted(deferred),
+        "unknown_order_blocks": unknown_order_blocks,
+        "blocking_reasons": (["unscoped_unknown_pending_order"] if unscoped_unknown
+                             else ["unknown_pending_order_conflict"] if unknown_orders
+                             else []),
+        "deferred_intent_ids": sorted(set(deferred)),
         "opposite_intents_netted": False,
         "intent_kind_source": "explicit_upstream_declaration",
     }
@@ -592,6 +707,9 @@ def build_portfolio_allocation_plan(
     account_order: Mapping[str, int] | None = None,
     baseline_exposure: float | None = None,
     source_identities: Mapping[str, str] | None = None,
+    source_fingerprints: Mapping[str, str] | None = None,
+    shared_pool_max_exposure=None,
+    strategy_pool_floor_ratio=None,
 ) -> PortfolioAllocationPlan:
     """Build one immutable allocation plan from exact, fully explicit inputs.
 
@@ -681,7 +799,10 @@ def build_portfolio_allocation_plan(
         strategy_min_positions=bounds["strategy_min_positions"],
         protected_slot_floor=bounds["protected_slot_floor"], account_order=account_order,
         baseline_exposure=baseline_exposure)
-    capital_plan = _capital_plan(snapshot)
+    capital_plan = _capital_plan(
+        snapshot, declared, validated_weights,
+        shared_pool_max_exposure=shared_pool_max_exposure,
+        strategy_pool_floor_ratio=strategy_pool_floor_ratio)
     capacity_plan = _capacity_plan(snapshot)
     conflict_plan = _conflict_plan(snapshot, explicit_intents)
     concentration = _concentration_adjustment(snapshot)
@@ -713,6 +834,11 @@ def build_portfolio_allocation_plan(
         "allocation_weights": _sha(validated_weights),
         "resource_intents": _sha([intent.projection() for intent in explicit_intents]),
     }
+    for key, value in dict(source_fingerprints or {}).items():
+        fingerprint = str(value)
+        if not _SHA256.fullmatch(fingerprint):
+            raise PortfolioAllocationPolicyError("canonical_source_fingerprint_invalid")
+        fingerprints[str(key)] = fingerprint
 
     material = {
         "plan_schema_version": PLAN_SCHEMA_VERSION,

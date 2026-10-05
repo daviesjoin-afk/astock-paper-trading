@@ -3,7 +3,7 @@
 import { $, charts } from "./dom.js";
 import { loadAdaptive } from "../features/adaptive.js";
 import { loadPaperExecution } from "../features/execution.js";
-import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter } from "../features/paper.js";
+import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPortfolioWorkspace } from "../features/paper.js";
 import { loadPaperRisk } from "../features/risk.js";
 import { loadDataValidity, loadMarketGate, loadPaperSelection, loadStrategies } from "../features/selection.js";
 import { loadSettings } from "../features/settings.js";
@@ -140,14 +140,14 @@ export function renderClock(){ $('clock').textContent = new Date().toLocaleStrin
 
 export function showPaperWorkspace(view,button,options){
   options=options||{};
-  var VIEWS=['strategy','research','portfolio','activity','history','risk','execution'];
+  var VIEWS=['strategy','research','portfolio','activity','history','risk','execution','allocation'];
   if(VIEWS.indexOf(view)<0) view='portfolio';
   VIEWS.forEach(function(key){ var panel=$('paper'+key.charAt(0).toUpperCase()+key.slice(1)+'View'); if(panel) panel.hidden=key!==view; });
   document.querySelectorAll('#p-paper [data-paper-view]').forEach(function(item){ var selected=item.dataset.paperView===view; item.classList.toggle('active',selected); item.setAttribute('aria-selected',selected?'true':'false'); });
   window._paperWorkspace=view;
   sessionStorage.setItem(PAPER_VIEW_KEY,view);
   if(!options.restore) history.replaceState(null,'','#paper/'+view);
-  if(view==='strategy') loadPaperStrategyCenter(); else if(view==='research') loadPaperResearchValidation(); else if(view==='risk') loadPaperRisk(false); else if(view==='execution') loadPaperExecution(); else loadPaper();
+  if(view==='strategy') loadPaperStrategyCenter(); else if(view==='research') loadPaperResearchValidation(); else if(view==='risk') loadPaperRisk(false); else if(view==='execution') loadPaperExecution(); else if(view==='allocation') loadPortfolioWorkspace(); else loadPaper();
 }
 
 // 暗色模式切换
@@ -165,6 +165,7 @@ export async function refreshApp(){
       else if(view==='strategy') await loadPaperStrategyCenter();
       else if(view==='research') await loadPaperResearchValidation();
       else if(view==='execution') await loadPaperExecution(true);
+      else if(view==='allocation') await loadPortfolioWorkspace();
       else await loadPaper({refresh:true});
     }else if(page==='p-select'){
       var jobs=[];

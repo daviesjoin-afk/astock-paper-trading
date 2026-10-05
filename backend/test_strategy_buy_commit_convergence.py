@@ -30,7 +30,9 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
@@ -85,14 +87,76 @@ class _BuyCase(unittest.TestCase):
             mock.patch.object(PT, "AD", None),
             mock.patch.object(PT, "_completed_kline", return_value=None),
             mock.patch.object(PT, "ET", None),
+            mock.patch.object(PT, "_build_portfolio_entry_plan",
+                              side_effect=self._entry_plan_fixture),
+            mock.patch.object(PT.PRS, "capture_portfolio_runtime_snapshot",
+                              side_effect=self._same_entry_snapshot),
             mock.patch.dict(os.environ, {"PAPER_ENTRY_FREEZE": "0"}),
         ]
+        self._entry_snapshot = None
         for patch in self._patches:
             patch.start()
         PT._ENTRY_FREEZE_CACHE.update({"at": 0.0, "status": None})
         PT.init_db()
         PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
         self._seed_tradability_archive()
+
+    def _entry_plan_fixture(self, conn, *, cycle_id, asof_day, decision_at,
+                            account_id, symbol, intent_kind):
+        """Supply exact owner output so these tests exercise post-plan execution."""
+        material = f"{cycle_id}|{asof_day}|{decision_at}|{account_id}|{symbol}|{intent_kind}"
+        snapshot_id = hashlib.sha256(material.encode()).hexdigest()
+        snapshot = {
+            "snapshot_id": snapshot_id,
+            "snapshot_fingerprint": snapshot_id,
+            "cycle_id": int(cycle_id), "asof_day": str(asof_day),
+            "decision_at": str(decision_at),
+            "dimensions": [
+                {"name": "strategy_exposure", "facts": {
+                    "market_value_by_account": {str(account_id): 0.0},
+                    "market_value_by_position": [],
+                }},
+                {"name": "capacity", "status": "AVAILABLE", "facts": {
+                    "pending_by_symbol": {},
+                }},
+            ],
+        }
+        plan_id = hashlib.sha256((snapshot_id + "|plan").encode()).hexdigest()
+        nav = float(CAPITAL)
+        allowance = nav * 0.82
+        plan = {
+            "plan_id": plan_id, "plan_fingerprint": plan_id,
+            "portfolio_snapshot_id": snapshot_id,
+            "portfolio_snapshot_fingerprint": snapshot_id,
+            "allocation_policy_version": "portfolio-allocation-policy-v2",
+            "cycle_id": int(cycle_id), "asof_day": str(asof_day),
+            "decision_at": str(decision_at), "plan_status": "PLANNED",
+            "blocking_reasons": [],
+            "slot_plan": {"status": "PLANNED", "limits": {str(account_id): 6},
+                          "total_cap": 15},
+            "capital_plan": {
+                "status": "PLANNED", "nav": nav,
+                "market_value_by_account": {str(account_id): 0.0},
+                "pending_by_account": {str(account_id): 0.0},
+                "allowance_by_strategy": {str(account_id): allowance},
+                "raw_allowance_by_strategy": {str(account_id): allowance},
+                "lifecycle_stage_by_strategy": {str(account_id): "standard"},
+                "capital_scale_by_strategy": {str(account_id): 1.0},
+            },
+            "capacity_plan": {"status": "PLANNED", "pending_amount": 0.0,
+                              "headroom_amount": nav},
+            "conflict_plan": {"status": "PLANNED", "deferred_intent_ids": [],
+                              "ordered_intents": []},
+        }
+        self._entry_snapshot = snapshot
+        return {"snapshot": snapshot, "plan": plan,
+                "candidate_intent_id": f"entry:{symbol}",
+                "candidate_blocked": False, "slot_limit": 6,
+                "capital_allowance": allowance, "candidate_deferred": False,
+                "candidate_denied": False}
+
+    def _same_entry_snapshot(self, *args, **kwargs):
+        return self._entry_snapshot
 
     def tearDown(self):
         for patch in reversed(self._patches):
@@ -107,7 +171,7 @@ class _BuyCase(unittest.TestCase):
         with PT._db(immediate=True) as conn:
             TA.ensure_schema(conn)
             repository = TA.TradabilityArchiveRepository(conn)
-            for code in (CODE, "600911"):
+            for code in (CODE, "600911", "600912", "600913"):
                 repository.save(TA.TradabilityEvidence(
                     code=code, session_date=DAY.isoformat(), is_listed=True,
                     listing_date="2000-01-01", delisting_date=None, is_st=False,
@@ -304,17 +368,81 @@ class NormalBuyConvergence(_BuyCase):
         second = self.add_signal(code="600911", signal_date=DAY_PREV.isoformat())
         self.quotes["600911"] = _quote("600911")
         result_b, order_b = self.run_buy(signal_id=second, code="600911")
-        self.assertFalse(result_b.get("filled"), f"超出共享池上限仍成交：{result_b}")
-        self.assertTrue(result_b.get("deferred"),
-                        f"应为软性等待而非终态拒绝：{result_b}")
+        self.assertTrue(result_b.get("filled"), f"第二笔在 exact allowance 内可执行：{result_b}")
         payload = PT._loads(order_b["risk_payload"], {})
         deployment = (payload.get("sizing") or {}).get("capital_deployment") or {}
-        self.assertFalse(deployment.get("allowed"),
-                         "第二笔不是因部署额度不足而等待（等待原因不属于资金约束）")
+        self.assertTrue(deployment.get("allowed"))
+        self.assertEqual("portfolio-allocation-policy-v2",
+                         payload["allocation_provenance"]["allocation_policy_version"])
+        self.assertLessEqual(
+            float(order_b["amount"] or 0.0),
+            float(deployment["deployable_amount"]) + 0.01,
+            "order amount exceeded the exact plan capital allowance")
         # §56：成功路径的 risk 事件由 commit_fill 写一次；被闸门挡下的决策
         # 各写一次。两笔合计恰好 2 条，既不多也不少。
         self.assertEqual(2, self.counters()["risk"],
                          "risk 事件数量不符：成功成交重复记录或等待决策漏记")
+
+    def test_concurrent_entries_cannot_consume_the_same_single_slot(self):
+        codes = (CODE, "600911", "600912", "600913")
+        for code in codes:
+            self.quotes[code] = _quote(code)
+        signal_ids = [self.add_signal(code=code, signal_date=DAY_PREV.isoformat())
+                      for code in codes]
+        original_builder = PT._build_portfolio_entry_plan.side_effect
+
+        def single_slot_plan(*args, **kwargs):
+            entry = original_builder(*args, **kwargs)
+            entry["slot_limit"] = 3
+            entry["plan"]["slot_plan"]["limits"] = {ACCOUNT: 3}
+            entry["plan"]["slot_plan"]["total_cap"] = 3
+            return entry
+
+        with mock.patch.object(PT, "_build_portfolio_entry_plan",
+                               side_effect=single_slot_plan):
+            results = []
+            # Keep the contested final slot truly concurrent while limiting the
+            # SQLite writer queue. Four simultaneous full BUY replays can exceed
+            # the CI runner's 60s SQLite busy timeout before any test assertion.
+            for offset in range(0, len(codes), 2):
+                group = list(zip(
+                    signal_ids[offset:offset + 2], codes[offset:offset + 2], strict=True))
+                barrier = threading.Barrier(len(group))
+
+                def attempt(signal_id, code, _barrier=barrier):
+                    _barrier.wait(timeout=10)
+                    return self.run_buy(signal_id=signal_id, code=code)
+
+                with ThreadPoolExecutor(max_workers=len(group)) as pool:
+                    futures = [pool.submit(attempt, signal_id, code)
+                               for signal_id, code in group]
+                    results.extend(future.result(timeout=90) for future in futures)
+
+        filled_count = sum(bool(result.get("filled")) for result, _order in results)
+        self.assertEqual(3, filled_count,
+                         f"并发订单未遵守三席上限：{[r.get('status') for r, _ in results]}")
+        with PT._db() as conn:
+            positions = int(conn.execute(
+                "SELECT COUNT(*) FROM paper_positions WHERE account_id=? AND qty>=?",
+                (ACCOUNT, PT.LOT_SIZE)).fetchone()[0])
+            fills = int(conn.execute(
+                "SELECT COUNT(*) FROM paper_fills WHERE account_id=? AND side='buy'",
+                (ACCOUNT,)).fetchone()[0])
+        self.assertEqual(3, positions)
+        self.assertEqual(3, fills)
+
+    def test_risk_block_overrides_planned_allocation(self):
+        self.quotes[CODE] = _quote(CODE)
+        signal_id = self.add_signal(signal_date=DAY_PREV.isoformat())
+        with mock.patch.object(PT, "_shared_risk_state", return_value={
+                "blocked": True, "reasons": ["test risk block"],
+                "daily_loss_pct": 0.0, "drawdown_pct": 0.0,
+                "cooldown_until": None, "cooldown_active": False,
+                "pool_initial_cash": CAPITAL, "pool_cash": CAPITAL}):
+            result, _order = self.run_buy(signal_id=signal_id)
+        self.assertFalse(result.get("filled"),
+                         "PLANNED allocation overrode the independent Risk BLOCK")
+        self.assertEqual(0, self.counters()["fills"])
 
 
 class CommitFailureRollsBack(_BuyCase):

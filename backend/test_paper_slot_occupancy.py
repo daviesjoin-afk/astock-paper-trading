@@ -257,18 +257,27 @@ class SlotOccupancyFacadeContractTests(unittest.TestCase):
             self.assertIs(custom_rows, kwargs["rows_fn"])
 
     def test_production_consumers_parity(self):
-        # Verify that dashboard_queries and manual_orders import _pending_position_slots
-        # from paper_trading rather than writing custom queries
-        for module_name in ("dashboard_queries.py", "manual_orders.py"):
-            source = pathlib.Path(__file__).with_name(module_name).read_text(encoding="utf-8")
-            tree = ast.parse(source)
-            found = False
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module == "paper_trading":
-                    if any(alias.name == "_pending_position_slots" for alias in node.names):
-                        found = True
-                        break
-            self.assertTrue(found, f"{module_name} must import _pending_position_slots from paper_trading")
+        # Manual execution still uses the canonical slot service. The read-only
+        # dashboard no longer computes pending allocation facts without a named plan.
+        manual = pathlib.Path(__file__).with_name("manual_orders.py").read_text(
+            encoding="utf-8")
+        tree = ast.parse(manual)
+        self.assertTrue(any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "paper_trading"
+            and any(alias.name == "_pending_position_slots" for alias in node.names)
+            for node in ast.walk(tree)
+        ), "manual_orders must import the canonical slot helper")
+
+        dashboard = pathlib.Path(__file__).with_name("dashboard_queries.py").read_text(
+            encoding="utf-8")
+        dashboard_tree = ast.parse(dashboard)
+        self.assertFalse(any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "paper_trading"
+            and any(alias.name == "_pending_position_slots" for alias in node.names)
+            for node in ast.walk(dashboard_tree)
+        ), "dashboard_queries must not compute unnamed allocation facts")
 
 
 class SlotOccupancyArchitectureGuardTests(unittest.TestCase):

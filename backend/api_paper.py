@@ -2,6 +2,7 @@
 """Paper-trading HTTP boundary."""
 from __future__ import annotations
 
+import datetime as dt
 import threading
 import time
 
@@ -16,6 +17,9 @@ import portfolio_allocation_service as PAS
 import portfolio_runtime as PR
 import portfolio_runtime_repository as PRRepo
 import portfolio_runtime_service as PRS
+import portfolio_workspace_service as PWS
+import market_data_contract as MDC
+import market_data_service as MDSvc
 
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -23,6 +27,12 @@ portfolio_runtime_router = APIRouter(prefix="/api/portfolio/runtime",
                                      tags=["portfolio-runtime-facts"])
 portfolio_allocation_router = APIRouter(prefix="/api/portfolio/allocation",
                                         tags=["portfolio-allocation-policy"])
+portfolio_workspace_router = APIRouter(prefix="/api/portfolio",
+                                       tags=["portfolio-workspace"])
+
+
+def _allocation_service_config():
+    return P._portfolio_allocation_service_config()
 
 
 class AllocationIntentRequest(BaseModel):
@@ -55,12 +65,28 @@ class PortfolioRuntimeCaptureRequest(BaseModel):
 def capture_portfolio_runtime_snapshot(payload: PortfolioRuntimeCaptureRequest):
     """Capture facts for the explicitly named cycle and as-of identity."""
     try:
-        return PRS.capture_portfolio_runtime_snapshot(
-            cycle_id=payload.cycle_id, asof_day=payload.asof_day,
-            decision_at=payload.decision_at,
-            market_evidence_identity=payload.market_evidence_identity)
+        decision_at = dt.datetime.fromisoformat(
+            str(payload.decision_at).replace("Z", "+00:00"))
+        if decision_at.tzinfo is None:
+            raise PR.PortfolioRuntimeError(
+                "explicit_decision_at_must_include_timezone")
+        # Read only the named as-of market facts before opening the ledger
+        # transaction. A caller-supplied string is checked against the owner
+        # fingerprint; it never substitutes for a MarketDataReading.
+        market_reading = MDSvc.read_snapshot(
+            MDC.LIVE_MARKET_POLICY, now=decision_at,
+            asof_day=payload.asof_day)
+        with P._db(immediate=True) as conn:
+            result = PRS.capture_portfolio_runtime_snapshot(
+                conn, cycle_id=payload.cycle_id, asof_day=payload.asof_day,
+                decision_at=payload.decision_at,
+                builtin_scope=P.ACTIVE_ACCOUNT_IDS,
+                market_evidence_identity=payload.market_evidence_identity,
+                market_reading=market_reading)
+            conn.commit()
+            return result
     except (PR.PortfolioRuntimeError, PRRepo.PortfolioRuntimeRepositoryError,
-            ValueError) as exc:
+            MDSvc.MarketDataAccessError, ValueError) as exc:
         status = 404 if str(exc) == "explicit_cycle_not_found" else 400
         raise HTTPException(status_code=status, detail=str(exc)) from exc
 
@@ -69,7 +95,8 @@ def capture_portfolio_runtime_snapshot(payload: PortfolioRuntimeCaptureRequest):
 def get_portfolio_runtime_snapshot(snapshot_id: str):
     """Read only the exact immutable snapshot named by its fingerprint ID."""
     try:
-        return PRS.get_portfolio_runtime_snapshot(snapshot_id)
+        with P._db_readonly() as conn:
+            return PRS.get_portfolio_runtime_snapshot(conn, snapshot_id)
     except (PR.PortfolioRuntimeError, PRRepo.PortfolioRuntimeRepositoryError,
             ValueError) as exc:
         status = 404 if str(exc) == "portfolio_snapshot_not_found" else 400
@@ -83,11 +110,15 @@ def capture_portfolio_allocation_plan(payload: PortfolioAllocationPlanRequest):
     the plan, does not place or cancel orders, and emits no Risk ALLOW/BLOCK.
     """
     try:
-        return PAS.capture_portfolio_allocation_plan(
-            portfolio_snapshot_id=payload.portfolio_snapshot_id,
-            allocation_weights=payload.allocation_weights,
-            resource_intents=[item.model_dump() for item in payload.resource_intents],
-            hard_pool_cap=payload.hard_pool_cap)
+        with P._db(immediate=True) as conn:
+            result = PAS.capture_portfolio_allocation_plan(
+                conn, config=_allocation_service_config(),
+                portfolio_snapshot_id=payload.portfolio_snapshot_id,
+                allocation_weights=payload.allocation_weights,
+                resource_intents=[item.model_dump() for item in payload.resource_intents],
+                hard_pool_cap=payload.hard_pool_cap)
+            conn.commit()
+            return result
     except (PAP.PortfolioAllocationPolicyError,
             PAPRepo.PortfolioAllocationRepositoryError, ValueError) as exc:
         status = 404 if str(exc) == "portfolio_snapshot_not_found" else 400
@@ -98,10 +129,28 @@ def capture_portfolio_allocation_plan(payload: PortfolioAllocationPlanRequest):
 def get_portfolio_allocation_plan(plan_id: str):
     """Read only the exact immutable plan named by its fingerprint ID."""
     try:
-        return PAS.get_portfolio_allocation_plan(plan_id)
+        with P._db_readonly() as conn:
+            return PAS.get_portfolio_allocation_plan(conn, plan_id)
     except (PAP.PortfolioAllocationPolicyError,
             PAPRepo.PortfolioAllocationRepositoryError, ValueError) as exc:
         status = 404 if str(exc) == "portfolio_allocation_plan_not_found" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@portfolio_workspace_router.get("/workspace")
+def get_portfolio_workspace(
+    cycle_id: int = Query(..., ge=1),
+    plan_id: str = Query(..., min_length=64, max_length=64),
+):
+    """Read the workspace projection for an explicitly named cycle and plan."""
+    try:
+        with P._db_readonly() as conn:
+            return PWS.get_portfolio_workspace(
+                conn, cycle_id=cycle_id, plan_id=plan_id)
+    except PWS.PortfolioWorkspaceUnavailable as exc:
+        status = 404 if str(exc) in {
+            "portfolio_allocation_plan_not_found", "portfolio_snapshot_not_found",
+        } else 400
         raise HTTPException(status_code=status, detail=str(exc)) from exc
 
 # ─── 内存缓存 ───

@@ -2,7 +2,7 @@
 """自进化落地通道（A 批闭环）离线测试。
 
 覆盖 evolution_apply 的三条门禁与写读链路：
-- apply_allocation：影子阶段拒绝 / 权重越界拒绝 / 正常应用写入 params 并消费于 _strategy_pool_budget 权重 / 回滚恢复前值
+- apply_allocation：影子阶段拒绝 / 权重越界拒绝 / 正常应用写入 params 并被 exact canonical weight owner 消费 / 回滚恢复前值
 - apply_tuner_proposals：非 consensus 拒绝 / 幅度越界拒绝 / 正常应用写入 adaptive_selection 覆盖 / applied_ids 回写
 - dual_ai_tuner._check_consensus：evolution 参数（步长/幅度比/提案上限）真实约束输出
 """
@@ -12,10 +12,12 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import dual_ai_tuner
 import evolution_apply
+import portfolio_allocation_weights as PAW
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -110,7 +112,13 @@ class EvolutionApplyTestBase(unittest.TestCase):
                     id TEXT PRIMARY KEY, name TEXT, source_strategy TEXT,
                     status TEXT, initial_cash REAL, cash REAL, cycle_days INTEGER,
                     max_positions INTEGER, max_weight REAL, max_exposure REAL,
-                    version TEXT, params TEXT, updated_at TEXT);
+                    version TEXT, style TEXT, cycle_id INTEGER,
+                    params TEXT, updated_at TEXT);
+                CREATE TABLE paper_parameter_versions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL, version TEXT NOT NULL, style TEXT NOT NULL,
+                    params TEXT NOT NULL, reason TEXT NOT NULL,
+                    effective_date TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE TABLE paper_audit(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT,
                     event TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL);
@@ -125,10 +133,10 @@ class EvolutionApplyTestBase(unittest.TestCase):
             ):
                 conn.execute(
                     "INSERT INTO paper_accounts(id,name,source_strategy,status,initial_cash,"
-                    "cash,cycle_days,max_positions,max_weight,max_exposure,version,params,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "cash,cycle_days,max_positions,max_weight,max_exposure,version,style,"
+                    "cycle_id,params,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (account_id, account_id, source, "active", 100000.0, 100000.0,
-                     60, 15, 0.10, 0.80, "v1", "{}", _iso_recent()),
+                     60, 15, 0.10, 0.80, "v1", "balanced", 1, "{}", _iso_recent()),
                 )
 
     @contextmanager
@@ -216,27 +224,309 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
             ).fetchone()["status"]
         self.assertEqual(status, "applied")
 
-    def test_budget_consumes_allocation_overlay(self):
-        """资金分摊覆盖必须被 _strategy_pool_budget 的权重来源消费。"""
+    def test_canonical_weight_owner_consumes_allocation_overlay(self):
+        """已批准权重由追加式参数版本 owner 读取。"""
         decision_id = self._seed_decision()
         evolution_apply.apply_allocation(
             self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
         conn = self._paper()
         try:
-            rows = [dict(r) for r in conn.execute("SELECT * FROM paper_accounts")]
+            rows = PAW.read_canonical_allocation_weight_owner_rows(
+                conn, eligible_account_ids=tuple(
+                    row["id"] for row in conn.execute(
+                        "SELECT id FROM paper_accounts ORDER BY id").fetchall()),
+                cycle_id=1,
+            )
         finally:
             conn.close()
-        weights_before = {
-            row["id"]: max(0.0, float(row["max_exposure"] or 0.0)) for row in rows}
-        self.assertEqual(weights_before["tq_breakout"], 0.80)
-        # 直接复用消费逻辑：覆盖激活时权重应变为 weight_pct/100
-        for row in rows:
-            params = json.loads(row["params"] or "{}")
-            alloc = params.get("adaptive_allocation") or {}
-            if alloc.get("status") == "active" and alloc.get("weight_pct"):
-                weights_before[row["id"]] = alloc["weight_pct"] / 100.0
-        self.assertAlmostEqual(weights_before["tq_breakout"], 0.40)
-        self.assertAlmostEqual(weights_before["trend_pullback"], 0.25)
+        cycle_id = 1
+        asof_day = datetime.now(TZ).date().isoformat()
+        resolved = PAW.resolve_canonical_allocation_weights(
+            rows,
+            eligible_account_ids=tuple(row["account_id"] for row in rows),
+            cycle_id=cycle_id,
+            asof_day=asof_day,
+            decision_at=(datetime.now(TZ) + timedelta(minutes=1)).isoformat(),
+            strategy_pins=[{"account_id": row["id"], "strategy_id": row["id"],
+                            "strategy_version": 1, "strategy_checksum": "a" * 64}
+                           for row in self._paper_account_rows()],
+        )
+        self.assertAlmostEqual(resolved["weights"]["tq_breakout"], 0.40)
+        self.assertAlmostEqual(resolved["weights"]["trend_pullback"], 0.25)
+
+    def _paper_account_rows(self):
+        conn = self._paper()
+        try:
+            return [dict(row) for row in conn.execute(
+                "SELECT id FROM paper_accounts ORDER BY id")]
+        finally:
+            conn.close()
+
+    def _allocation_weight_pair(self, decision_at):
+        with self._paper_ctx() as conn:
+            owner_rows = PAW.read_canonical_allocation_weight_owner_rows(
+                conn, eligible_account_ids=("tq_breakout", "trend_pullback"),
+                cycle_id=1)
+        ids = ("tq_breakout", "trend_pullback")
+        resolved = PAW.resolve_canonical_allocation_weights(
+            owner_rows, eligible_account_ids=ids, cycle_id=1,
+            asof_day=datetime.now(TZ).date().isoformat(), decision_at=decision_at,
+            strategy_pins=[{"account_id": account, "strategy_id": account,
+                            "strategy_version": 1,
+                            "strategy_checksum": "a" * 64} for account in ids],
+        )
+        return resolved["weights"]
+
+    def _apply_two_account_weights(self, weights):
+        self._apply_two_account_decision(weights)
+
+    def _apply_two_account_decision(self, weights):
+        import adaptive_engine as engine
+
+        with self._adaptive_ctx() as conn:
+            conn.execute(
+                "UPDATE adaptive_config SET value=? WHERE key='max_strategy_weight_pct'",
+                (json.dumps(100.0),),
+            )
+        decision_id = self._seed_decision(weights=weights)
+        with mock.patch.object(engine, "ACCOUNT_LABELS", {
+                "tq_breakout": "突破策略", "trend_pullback": "回撤策略"}):
+            evolution_apply.apply_allocation(
+                self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+        return decision_id
+
+    def _allocation_params(self, current, previous, marker):
+        return {
+            "adaptive_allocation": current,
+            "adaptive_allocation_previous": previous,
+            "unrelated_parameter": {"marker": marker, "enabled": True},
+        }
+
+    def _fail_decision_applied_update(self):
+        with self._adaptive_ctx() as conn:
+            conn.execute(
+                "CREATE TRIGGER fail_applied_decision BEFORE UPDATE OF status "
+                "ON adaptive_decisions WHEN NEW.status='applied' "
+                "BEGIN SELECT RAISE(ABORT, 'forced status update failure'); END"
+            )
+
+    def _apply_two_account_decision_with_status_failure(self, weights):
+        import adaptive_engine as engine
+
+        decision_id = self._seed_decision(weights=weights)
+        with mock.patch.object(engine, "ACCOUNT_LABELS", {
+                "tq_breakout": "突破策略", "trend_pullback": "回撤策略"}):
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "forced status update failure"):
+                evolution_apply.apply_allocation(
+                    self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+        return decision_id
+
+    def test_rc15_later_weight_apply_cannot_heal_earlier_decision(self):
+        today = datetime.now(TZ).date().isoformat()
+        clock = {"now": f"{today}T09:00:00+08:00"}
+        with mock.patch.object(evolution_apply, "_now", side_effect=lambda: clock["now"]):
+            self._apply_two_account_weights({"tq_breakout": 30.0, "trend_pullback": 70.0})
+            clock["now"] = f"{today}T14:00:00+08:00"
+            self._apply_two_account_weights({"tq_breakout": 40.0, "trend_pullback": 60.0})
+
+        old = self._allocation_weight_pair(f"{today}T10:00:00+08:00")
+        new = self._allocation_weight_pair(f"{today}T15:00:00+08:00")
+        self.assertEqual({"tq_breakout": 0.3, "trend_pullback": 0.7}, old)
+        self.assertEqual({"tq_breakout": 0.4, "trend_pullback": 0.6}, new)
+
+    def test_rc16_rollback_appends_a_replayable_parameter_fact(self):
+        today = datetime.now(TZ).date().isoformat()
+        clock = {"now": f"{today}T09:00:00+08:00"}
+        ids = ("tq_breakout", "trend_pullback")
+        with mock.patch.object(evolution_apply, "_now", side_effect=lambda: clock["now"]):
+            self._apply_two_account_weights({"tq_breakout": 30.0, "trend_pullback": 70.0})
+            clock["now"] = f"{today}T14:00:00+08:00"
+            self._apply_two_account_weights({"tq_breakout": 40.0, "trend_pullback": 60.0})
+            clock["now"] = f"{today}T16:00:00+08:00"
+            for account in ids:
+                evolution_apply.rollback_allocation(
+                    self.paper_path, account, reason="RC16 rollback", confirmed=True)
+
+        self.assertEqual(
+            {"tq_breakout": 0.3, "trend_pullback": 0.7},
+            self._allocation_weight_pair(f"{today}T10:00:00+08:00"),
+        )
+        self.assertEqual(
+            {"tq_breakout": 0.4, "trend_pullback": 0.6},
+            self._allocation_weight_pair(f"{today}T15:00:00+08:00"),
+        )
+        self.assertEqual(
+            {"tq_breakout": 0.3, "trend_pullback": 0.7},
+            self._allocation_weight_pair(f"{today}T17:00:00+08:00"),
+        )
+        with self._paper_ctx() as conn:
+            for account in ids:
+                facts = conn.execute(
+                    "SELECT id,reason FROM paper_parameter_versions "
+                    "WHERE cycle_id=1 AND account_id=? ORDER BY id", (account,),
+                ).fetchall()
+                self.assertEqual(3, len(facts))
+                self.assertEqual(3, len({int(row["id"]) for row in facts}))
+                self.assertIn("adaptive allocation applied", facts[0]["reason"])
+                self.assertIn("adaptive allocation applied", facts[1]["reason"])
+                self.assertIn("RC16 rollback", facts[2]["reason"])
+
+    def test_rc17_compensation_restores_exact_complete_pre_apply_params(self):
+        current = {"weight_pct": 40.0, "decision_id": 101, "status": "active"}
+        previous = {"weight_pct": 30.0, "decision_id": 100, "status": "active"}
+        before = {
+            "tq_breakout": self._allocation_params(current, previous, "keep-me"),
+            "trend_pullback": {"unrelated_parameter": {"marker": "also-keep"}},
+        }
+        with self._paper_ctx() as conn:
+            for account_id, params in before.items():
+                conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                             (json.dumps(params), account_id))
+        self._fail_decision_applied_update()
+
+        self._apply_two_account_decision_with_status_failure(
+            {"tq_breakout": 45.0, "trend_pullback": 55.0})
+
+        for account_id, expected in before.items():
+            self.assertEqual(expected, self._paper_params(account_id))
+        restored = self._paper_params("tq_breakout")
+        self.assertEqual(current, restored["adaptive_allocation"])
+        self.assertEqual(previous, restored["adaptive_allocation_previous"])
+
+    def test_rc18_compensation_keeps_failed_apply_history_replayable(self):
+        today = datetime.now(TZ).date().isoformat()
+        clock = {"now": f"{today}T09:00:00+08:00"}
+        with mock.patch.object(evolution_apply, "_now", side_effect=lambda: clock["now"]):
+            self._apply_two_account_weights({"tq_breakout": 30.0, "trend_pullback": 70.0})
+            clock["now"] = f"{today}T10:00:00+08:00"
+            self._apply_two_account_weights({"tq_breakout": 40.0, "trend_pullback": 60.0})
+            clock["now"] = f"{today}T14:00:00+08:00"
+            self._fail_decision_applied_update()
+            failed_decision = self._apply_two_account_decision_with_status_failure(
+                {"tq_breakout": 45.0, "trend_pullback": 55.0})
+
+        self.assertEqual(
+            {"tq_breakout": 0.4, "trend_pullback": 0.6},
+            self._allocation_weight_pair(f"{today}T15:00:00+08:00"),
+        )
+        for account_id in ("tq_breakout", "trend_pullback"):
+            params = self._paper_params(account_id)
+            self.assertEqual(30.0 if account_id == "tq_breakout" else 70.0,
+                             params["adaptive_allocation_previous"]["weight_pct"])
+        with self._paper_ctx() as conn:
+            for account_id, attempted_weight in (("tq_breakout", 45.0),
+                                                 ("trend_pullback", 55.0)):
+                facts = conn.execute(
+                    "SELECT params,reason,created_at FROM paper_parameter_versions "
+                    "WHERE cycle_id=1 AND account_id=? ORDER BY id", (account_id,),
+                ).fetchall()
+                self.assertEqual(4, len(facts))
+                previous_fact = json.loads(facts[0]["params"])
+                applied_fact = json.loads(facts[1]["params"])
+                attempted = json.loads(facts[2]["params"])
+                expected_attempt = dict(applied_fact)
+                expected_attempt["adaptive_allocation_previous"] = (
+                    applied_fact["adaptive_allocation"])
+                expected_attempt["adaptive_allocation"] = {
+                    "weight_pct": attempted_weight,
+                    "decision_id": failed_decision,
+                    "decision_date": "2026-09-07",
+                    "status": "active",
+                    "effective_date": today,
+                    "applied_at": f"{today}T14:00:00+08:00",
+                    "approved_by": "human",
+                }
+                self.assertEqual(expected_attempt, attempted)
+                self.assertEqual(failed_decision,
+                                 attempted["adaptive_allocation"]["decision_id"])
+                self.assertEqual(attempted_weight,
+                                 attempted["adaptive_allocation"]["weight_pct"])
+                self.assertIn("applied decision_id=", facts[2]["reason"])
+                self.assertIn("compensation rollback", facts[3]["reason"])
+                compensated = json.loads(facts[3]["params"])
+                self.assertEqual(applied_fact, compensated)
+                self.assertEqual(30.0 if account_id == "tq_breakout" else 70.0,
+                                 previous_fact["adaptive_allocation"]["weight_pct"])
+                self.assertEqual(40.0 if account_id == "tq_breakout" else 60.0,
+                                 compensated["adaptive_allocation"]["weight_pct"])
+                self.assertEqual(30.0 if account_id == "tq_breakout" else 70.0,
+                                 compensated["adaptive_allocation_previous"]["weight_pct"])
+
+    def test_rc19_apply_parameter_history_uses_one_batch_timestamp(self):
+        today = datetime.now(TZ).date().isoformat()
+        values = iter(f"{today}T09:00:0{second}+08:00" for second in range(3))
+        with mock.patch.object(evolution_apply, "_now", side_effect=lambda: next(values)):
+            decision_id = self._apply_two_account_decision(
+                {"tq_breakout": 40.0, "trend_pullback": 60.0})
+
+        with self._paper_ctx() as conn:
+            for account_id in ("tq_breakout", "trend_pullback"):
+                fact = conn.execute(
+                    "SELECT params,created_at FROM paper_parameter_versions "
+                    "WHERE account_id=? AND reason=?",
+                    (account_id, f"adaptive allocation applied decision_id={decision_id}"),
+                ).fetchone()
+                account = conn.execute(
+                    "SELECT updated_at FROM paper_accounts WHERE id=?", (account_id,),
+                ).fetchone()
+                applied_at = json.loads(fact["params"])["adaptive_allocation"]["applied_at"]
+                self.assertEqual(fact["created_at"], applied_at)
+                self.assertEqual(fact["created_at"], account["updated_at"])
+            timestamps = conn.execute(
+                "SELECT DISTINCT created_at FROM paper_parameter_versions "
+                "WHERE reason=?", (f"adaptive allocation applied decision_id={decision_id}",),
+            ).fetchall()
+        self.assertEqual(1, len(timestamps))
+
+    def test_rc20_compensation_uses_one_batch_timestamp(self):
+        today = datetime.now(TZ).date().isoformat()
+        before = {
+            "tq_breakout": self._allocation_params(
+                {"weight_pct": 40.0, "decision_id": 101, "status": "active"},
+                {"weight_pct": 30.0, "decision_id": 100, "status": "active"},
+                "tq-before"),
+            "trend_pullback": self._allocation_params(
+                {"weight_pct": 60.0, "decision_id": 101, "status": "active"},
+                {"weight_pct": 70.0, "decision_id": 100, "status": "active"},
+                "trend-before"),
+        }
+        with self._paper_ctx() as conn:
+            for account_id, params in before.items():
+                conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                             (json.dumps(params), account_id))
+        self._fail_decision_applied_update()
+        timestamps = iter(
+            f"{today}T14:00:0{second}+08:00" for second in range(4))
+        with mock.patch.object(evolution_apply, "_now",
+                               side_effect=lambda: next(timestamps)):
+            failed_decision = self._apply_two_account_decision_with_status_failure(
+                {"tq_breakout": 45.0, "trend_pullback": 55.0})
+
+        reason = (
+            "adaptive allocation compensation rollback "
+            f"decision_id={failed_decision}")
+        compensation_times = set()
+        restored_times = set()
+        compensation_rows = []
+        with self._paper_ctx() as conn:
+            for account_id, expected in before.items():
+                fact = conn.execute(
+                    "SELECT params,created_at FROM paper_parameter_versions "
+                    "WHERE cycle_id=1 AND account_id=? AND reason=?",
+                    (account_id, reason),
+                ).fetchone()
+                account = conn.execute(
+                    "SELECT updated_at FROM paper_accounts WHERE id=?", (account_id,),
+                ).fetchone()
+                self.assertIsNotNone(fact)
+                compensation_rows.append(fact)
+                self.assertEqual(expected, json.loads(fact["params"]))
+                self.assertEqual(fact["created_at"], account["updated_at"])
+                compensation_times.add(fact["created_at"])
+                restored_times.add(account["updated_at"])
+        self.assertEqual(2, len(compensation_rows))
+        self.assertEqual(1, len(compensation_times))
+        self.assertEqual(1, len(restored_times))
 
     def test_rollback_restores_no_previous(self):
         decision_id = self._seed_decision()

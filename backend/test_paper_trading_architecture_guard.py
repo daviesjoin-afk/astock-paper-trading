@@ -139,8 +139,6 @@ FORBIDDEN_REPLACEMENT_DEFS = frozenset({"_replacement_score_from_signal"})
 
 #: Guard 9 —— 这些函数必须显式接收 cycle_id，函数体内不得再解析 active cycle。
 EXPLICIT_CYCLE_FUNCTIONS = (
-    "_slot_upgrade_context",
-    "_apply_slot_borrow",
     "_rollback_slot_borrow",
 )
 
@@ -789,14 +787,12 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         self.assertIn("signal_date<=?", body,
                       "candidate 读取缺少 signal_date <= asof 上界（future leakage）")
 
-    def test_guard9f_slot_context_cycle_id_is_required(self):
-        self._assert_kwonly_required("_slot_upgrade_context", "cycle_id")
 
-    def test_guard9g_slot_context_never_resolves_the_active_cycle(self):
-        self._assert_no_active_cycle("_slot_upgrade_context")
 
     def test_guard9h_borrow_and_rollback_require_explicit_cycle(self):
-        for name in ("_apply_slot_borrow", "_rollback_slot_borrow"):
+        # Only compatibility rollback remains for legacy in-flight orders;
+        # new slot-borrow decisions have been retired in favor of exact plans.
+        for name in ("_rollback_slot_borrow",):
             with self.subTest(function=name):
                 self._assert_kwonly_required(name, "cycle_id")
                 self._assert_no_active_cycle(name)
@@ -849,59 +845,7 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         self.assertIn("PRep.choose_best_candidate(", body,
                       "候选排序没有交给纯域模块")
 
-    def test_guard9m_slot_chain_budget_uses_the_explicit_cycle(self):
-        """席位预算查询必须显式传 cycle_id（否则一次借位跨越两个周期）。
 
-        `_dynamic_position_limits()` 自身允许 `cycle_id=None`（= active cycle，冷启动
-        / 容量退出 / 面板读取的既有语义），但 ``_slot_upgrade_context`` /
-        ``_apply_slot_borrow`` 这条在途下单链**必须**把已认领周期传进去，否则
-        reviews / 持仓数看显式周期，而 target_limit / donors / allocation_version
-        看 active cycle —— 同周期借位会被错误拒绝。
-        """
-        raw = _source("paper_trading.py")
-        for name in ("_slot_upgrade_context", "_apply_slot_borrow"):
-            with self.subTest(function=name):
-                # 调用可能跨行，所以按空白归一化后再匹配调用形状。
-                flat = " ".join(_function_source(ast.parse(raw), name, raw).split())
-                self.assertIn(
-                    "_dynamic_position_limits( conn, cycle_id=resolved_cycle_id",
-                    flat,
-                    f"{name} 没有把显式 cycle 交给席位预算查询")
-        # pending 席位读取只发生在 _slot_upgrade_context：它一旦跨周期，active
-        # cycle 的在途买单就会占掉被请求周期的席位。
-        flat = " ".join(
-            _function_source(ast.parse(raw), "_slot_upgrade_context", raw).split())
-        self.assertIn(
-            "_pending_position_slots(conn, positions, cycle_id=resolved_cycle_id",
-            flat,
-            "_slot_upgrade_context 的 pending 席位仍然跨周期（active cycle 的在途"
-            "买单会占掉被请求周期的席位）")
-
-    def test_guard9n_cluster_evidence_follows_the_claimed_cycle(self):
-        """进入 fingerprint / allocation version 的簇证据也必须周期与 as-of 有界。
-
-        ``_dynamic_position_limits`` 允许 ``cycle_id=None``（= active cycle），但
-        ``_slot_upgrade_context`` / ``_apply_slot_borrow`` 传来的显式周期必须一路走到
-        **簇画像**：持仓走 ``positions_for_cycle``、signal 查询有 as-of 上界、成交序列
-        固定同一周期。否则 cycle 8 的预算行由 cycle 9 的持仓（甚至未来 signal）决定。
-        """
-        raw = _source("paper_trading.py")
-        profiles = _function_source(ast.parse(raw), "_strategy_cluster_profiles", raw)
-        self.assertIn("cycle_id=None", profiles,
-                      "_strategy_cluster_profiles 不再接受显式周期")
-        self.assertIn("PPRM.positions_for_cycle(", profiles,
-                      "簇画像的持仓读取没有固定到显式周期（会重新解析 active cycle）")
-        self.assertIn("intended_date<=?", profiles,
-                      "簇画像的 signal 查询缺少 as-of 上界（future leakage）")
-        self.assertIn("cycle_id=cycle_id", profiles,
-                      "簇画像的成交序列没有继承显式周期")
-        # 预算侧必须继续把已认领周期 / as-of 交给簇画像。
-        limits = " ".join(
-            _function_source(ast.parse(raw), "_dynamic_position_limits", raw).split())
-        self.assertIn("_strategy_cluster_factors( conn, asof_day, account_ids=account_ids,"
-                      " cycle_id=cycle_id,",
-                      limits,
-                      "_dynamic_position_limits 没有把显式周期/as-of 交给簇画像")
 
     def test_guard9o_buy_order_capacity_reads_use_the_proven_cycle(self):
         """开仓主路径 ``_buy_order`` 的容量读取也必须钉在已认领周期与 as-of 上。
@@ -923,12 +867,15 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
             "_pending_position_slots(conn, positions, cycle_id=current_cycle[\"id\"])",
             body,
             "_buy_order 的 pending 席位读取没有固定到已认领周期")
-        # 初次预算与借位后的 re-read 都必须是同一组 facts（cycle + as-of）。
-        # 归一化空白后按出现次数断言，避免依赖换行位置。
-        self.assertGreaterEqual(
-            body.count("cycle_id=current_cycle[\"id\"], asof_day=asof_day"), 2,
-            "_buy_order 里带 (cycle, as-of) 的预算读取少于两次"
-            "（初次预算或借位后 re-read 漏传了 provenance）")
+        self.assertIn(
+            "_build_portfolio_entry_plan( conn, cycle_id=current_cycle[\"id\"], asof_day=asof_day",
+            body, "_buy_order 没有基于已认领周期生成 exact allocation plan")
+        self.assertIn("exact_plan[\"portfolio_snapshot_id\"]", body,
+                      "买入审计未绑定 exact snapshot")
+        self.assertIn("exact_plan[\"plan_id\"]", body,
+                      "买入审计未绑定 exact allocation plan")
+        self.assertIn("revalidated_snapshot[\"snapshot_id\"]", body,
+                      "执行前没有复核同一 exact snapshot")
 
     # ── 共用断言 ──────────────────────────────────────────────────────────
     def _assert_kwonly_required(self, name, param):
@@ -983,77 +930,17 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         return "".join(body.split())
 
     # ── capital planning provenance ───────────────────────────────────────
-    def test_guard10a_pool_inputs_accept_explicit_cycle_and_asof(self):
-        tree = ast.parse(_source("paper_trading.py"))
-        node = _function_node(tree, "_pool_allocation_inputs")
-        kwonly = {arg.arg for arg in node.args.kwonlyargs}
-        for param in ("cycle_id", "asof_day"):
-            with self.subTest(param=param):
-                self.assertIn(
-                    param, kwonly,
-                    f"_pool_allocation_inputs 的 {param} 不是 keyword-only："
-                    "证据边界必须显式传入，位置参数可以漏传")
 
-    def test_guard10b_participant_rows_follow_the_explicit_cycle(self):
-        body = self._flat("_pool_allocation_inputs")
-        self.assertIn(
-            "_shared_account_rows(conn,cycle_id)", body,
-            "_pool_allocation_inputs 的参与者账户没有固定到显式周期："
-            "历史 as-of 回放会读到 active cycle 的账本")
 
-    def test_guard10c_risk_profile_is_asof_bound_on_both_paths(self):
-        """rows path 与 account fallback **都**必须带 as-of（§25/§26）。"""
-        body = self._flat("_pool_allocation_inputs")
-        self.assertIn(
-            "_risk_profile(row,asof_day=asof_day,conn=conn,cycle_id=cycle_id)", body,
-            "rows path 的 risk profile 漏传 as-of / cycle")
-        self.assertIn(
-            "_risk_profile(account,asof_day=asof_day,conn=conn,cycle_id=cycle_id)", body,
-            "account fallback 漏传 as-of / cycle：未来 adaptive risk 会污染历史")
 
-    def test_guard10d_adaptive_allocation_weight_is_asof_bound(self):
-        tree = ast.parse(_source("paper_trading.py"))
-        node = _function_node(tree, "_strategy_pool_weights")
-        kwonly = {arg.arg for arg in node.args.kwonlyargs}
-        self.assertIn("asof_day", kwonly,
-                      "_strategy_pool_weights 的 asof_day 不是 keyword-only")
-        body = self._flat("_strategy_pool_weights")
-        self.assertIn(
-            "_runtime_parameter_active(alloc.get(\"effective_date\"),"
-            "asof_day=asof_day,status=alloc.get(\"status\"))",
-            body,
-            "_strategy_pool_weights 没有把 as-of 交给 overlay 激活判定："
-            "生效日更晚的 adaptive allocation 会改写历史 strategy weight")
 
-    def test_guard10e_cluster_evidence_follows_cycle_and_asof(self):
-        body = self._flat("_pool_allocation_inputs")
-        self.assertIn(
-            "_strategy_cluster_factors(conn,asof_day,"
-            "account_ids=list(weights),cycle_id=cycle_id,",
-            body,
-            "簇证据没有继承显式 (cycle, as-of)：机器今天的持仓/未来 signal 会"
-            "改变历史 as-of 的簇结构与簇预算")
 
-    def test_guard10f_strategy_budget_and_allocation_plan_carry_provenance(self):
-        for name in ("_strategy_pool_budget", "_allocation_plan"):
-            with self.subTest(function=name):
-                tree = ast.parse(_source("paper_trading.py"))
-                node = _function_node(tree, name)
-                kwonly = {arg.arg for arg in node.args.kwonlyargs}
-                for param in ("cycle_id", "asof_day"):
-                    self.assertIn(param, kwonly,
-                                  f"{name} 的 {param} 不是 keyword-only")
-                body = self._flat(name)
-                self.assertIn(
-                    "cycle_id=cycle_id,asof_day=asof_day,", body,
-                    f"{name} 没有把 (cycle, as-of) 原样传给 _pool_allocation_inputs")
 
     def test_guard10g_production_buy_callers_pass_cycle_and_asof(self):
-        """三条生产买入路径必须显式传 (cycle, as-of)（§33-§36、§75）。"""
+        """每条生产买入路径都消费 exact plan，而非旧资本分配器。"""
         expectations = {
-            "_buy_order": ("_strategy_pool_budget(", "_allocation_plan("),
-            "_intraday_buyback": ("_strategy_pool_budget(",),
-            "_swing_scale_in": ("_strategy_pool_budget(",),
+            "_intraday_buyback": ("_build_portfolio_entry_plan(",),
+            "_swing_scale_in": ("_build_portfolio_entry_plan(",),
         }
         for name, calls in expectations.items():
             body = self._flat(name)
@@ -1076,35 +963,61 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                     window = body[index:end]
                     self.assertIn("cycle_id=", window,
                                   f"{name} 的 {call} 调用没有显式传 cycle_id")
-                    self.assertIn("asof_day=asof_day", window,
-                                  f"{name} 的 {call} 调用没有显式传 asof_day")
+                    self.assertIn('asof_day=_date(asof_day).isoformat()', window)
+                    self.assertIn('intent_kind="ADD_POSITION"', window)
+            enforce = body.index("_enforce_order_intent(")
+            allocation = body.index("_build_portfolio_entry_plan(", enforce)
+            self.assertIn(
+                '"order_intent":{"intent_kind":"ADD_POSITION"}',
+                body[enforce:allocation],
+                f"{name} must pass typed ADD_POSITION into enforced OrderIntent mode",
+            )
+            self.assertNotIn("_strategy_pool_budget(", body)
 
-    def test_guard10h_reserved_cash_stays_a_global_obligation(self):
-        """在途预占是全局经济义务：参与者有界，但**资金占用**不得按周期过滤。"""
-        body = self._flat("_pool_allocation_inputs")
-        index = body.index("_pending_buy_reservations(")
-        window = body[index:index + 200]
-        self.assertNotIn("cycle_id", window,
-                         "在途预占被按周期过滤：旧周期尚未释放的真实 reserved "
-                         "cash 仍占用同一个资金池，过滤会造成 double-spend")
-        raw = _source("paper_capital_reservations.py")
-        self.assertIn("compatibility parameter intentionally ignored", raw,
-                      "pending_buy_reservations 的 cycle_id 不再是刻意忽略的兼容参数")
+            self.assertIn("_entry_plan_sizing_facts(", body)
+            self.assertIn("_revalidate_portfolio_entry_plan(", body)
+        buy = self._flat("_buy_order")
+        self.assertIn('ifentry_allocation["candidate_blocked"]:', buy,
+                      "exact plan denial must stop the canonical BUY before sizing")
+        self.assertIn('return{"filled":False,"deferred":True,"status":"deferred_capacity"',
+                      buy, "missing exact plan evidence must defer, never fall back")
+        self.assertIn("exact_plan[\"slot_plan\"]", buy)
+        self.assertIn("exact_plan[\"capital_plan\"]", buy)
+        self.assertIn('exact_plan["plan_id"]', buy,
+                      "BUY order must persist its exact allocation plan identity")
+        self.assertIn('allocation_intent_kind,exact_plan["portfolio_snapshot_id"],'
+                      'exact_plan["plan_id"],exact_plan["plan_fingerprint"]', buy,
+                      "order INSERT must retain the exact plan/snapshot provenance")
+        self.assertIn("allowed=notreasons", buy,
+                      "a PLANNED allocation must not override independent entry/Risk blocks")
+        revalidate = self._flat("_revalidate_portfolio_entry_plan")
+        self.assertIn('current["snapshot_id"]==plan["portfolio_snapshot_id"]', revalidate)
+        self.assertIn('current["snapshot_fingerprint"]==plan["portfolio_snapshot_fingerprint"]',
+                      revalidate)
+        self.assertNotIn("_dynamic_position_limits(", buy,
+                         "canonical BUY 仍调用旧动态 slot authority")
+        self.assertNotIn("_strategy_pool_budget(", buy,
+                         "canonical BUY 仍调用旧资金 allocator")
+        self.assertNotIn("_allocation_plan(", buy,
+                         "canonical BUY 仍调用旧部署 allocator")
+        self.assertNotIn("portfolio_coordinator", buy,
+                         "canonical BUY 仍有旧 coordinator fallback")
+        manual = (BACKEND / "manual_orders.py").read_text(encoding="utf-8")
+        self.assertIn('allocation_provenance["portfolio_snapshot_id"]', manual)
+        self.assertIn('allocation_provenance["portfolio_snapshot_fingerprint"]', manual)
+        self.assertNotIn("get_latest_plan(", manual)
 
-    def test_guard10n_explicit_cycle_has_no_single_account_fallback(self):
-        """显式周期的参与者集合就是周期账本；不得再注入调用方账户（§24）。
+    def test_guard10h_canonical_allocation_weight_uses_parameter_history(self):
+        """Canonical production weights use append-only point-in-time owner rows."""
+        body = self._flat("_build_portfolio_entry_plan")
+        self.assertIn("PAW.read_canonical_allocation_weight_owner_rows(", body)
+        self.assertIn("decision_at=decision_at", body)
+        self.assertNotIn(
+            "_shared_account_rows(", body,
+            "canonical allocation weights must not read mutable current account params",
+        )
 
-        否则 `enabled_strategies == []` 的 idle 周期会凭空拿到一份非零预算或
-        部署计划 —— 零策略周期本不该有资金表达。
-        """
-        body = self._flat("_pool_allocation_inputs")
-        self.assertIn(
-            "ifnotrowsandcycle_idisNone:", body,
-            "参与者空列表兜底没有按显式周期设限")
-        self.assertIn(
-            "ifaccountisnotNoneandaccount.get(\"id\")notinvalues"
-            "andcycle_idisNone:", body,
-            "账户补入分支没有按显式周期设限：idle 周期会凭空产生参与者")
+
 
     def test_guard10o_compiled_profile_is_asof_provable(self):
         """历史 as-of 只融合**可证明当时已生效**的编译风险画像（§25）。"""
@@ -1189,24 +1102,6 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                     shape, strict,
                     "strict cycle resolver 混入了非周期 pin 的 fallback")
 
-    def test_guard10r_cluster_dsl_uses_cycle_pinned_version(self):
-        """cluster 的结构证据必须与 explicit cycle 的版本 pin 同源（§25）。"""
-        body = self._flat("_strategy_cluster_profiles")
-        self.assertIn(
-            "SRE.compiled_dsl_for_cycle(conn,account_id,cycle_id=cycle_id)", body,
-            "explicit cycle 的 cluster DSL 没有走 cycle-pinned resolver")
-        cycle_branch = body.split(
-            "ifconnisnotNone:try:ifcycle_idisNone:", 1)[1].split("else:", 1)[1].split("except", 1)[0]
-        self.assertNotIn(
-            "SRT.get_context(", cycle_branch,
-            "explicit cycle 的 cluster DSL 又读了 current head")
-        helper = self._flat("compiled_dsl_for_cycle", "strategy_risk_enforcement.py")
-        self.assertIn(
-            "SR.cycle_version_for_account(conn,str(account_id),cycle_id=int(cycle_id))",
-            helper,
-            "cluster DSL 没有复用 strict cycle version resolver")
-        self.assertNotIn("get_context(", helper,
-                         "cluster DSL helper 回退到了 current runtime context")
 
     def test_guard10s_allocation_runtime_uses_cycle_pinned_fields(self):
         """allocation runtime 的版本派生字段必须与 explicit cycle 同源（§25）。"""
@@ -1231,34 +1126,6 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
             "get_context(", cycle_branch,
             "explicit cycle runtime 又读了 current strategy context")
 
-    def test_guard10t_dynamic_position_limits_are_cycle_asof_bound(self):
-        """seat budget 也必须消费 explicit cycle + as-of + pinned runtime。"""
-        body = self._flat("_dynamic_position_limits")
-        self.assertIn("explicit_cycle=cycle_idisnotNone", body,
-                      "seat budget 没有保存 explicit cycle 语义")
-        self.assertIn(
-            '_risk_profile(row_map.get(account_id)or{"id":account_id}', body,
-            "seat-budget risk profile 没有按账户行解析")
-        self.assertIn(
-            "asof_day=asof_day,conn=conn,cycle_id=cycle_id", body,
-            "seat-budget risk profile 漏传 as-of / cycle / conn")
-        self.assertIn(
-            "_strategy_runtimes(account_ids,weights,diversification=diversification", body,
-            "seat-budget runtime 没有走统一组装")
-        self.assertIn(
-            "conn=conn,profiles=profiles,cycle_id=cycle_id", body,
-            "seat-budget runtime 没有启用 pinned profiles/cycle")
-        self.assertIn(
-            "explicit_empty_cycle=(explicit_cycleand"
-            "PCY.explicit_empty_cycle(conn,cycle_id))", body,
-            "seat budget 没有区分 explicit empty cycle 与 legacy 缺字段")
-        self.assertIn("ifnotaccount_idsandnotexplicit_empty_cycle:", body,
-                      "explicit idle cycle 会重新注入全部 builtin")
-        clusters = self._flat("_strategy_cluster_profiles")
-        self.assertIn(
-            "wanted=[str(item)foritemin(list(ACCOUNT_SPECS)ifaccount_idsisNoneelseaccount_ids)]",
-            clusters,
-            "显式空 account_ids 被 cluster helper 当成默认全量策略")
 
     def test_guard10u_final_buy_sizing_uses_cycle_pinned_version(self):
         """final sizing profile / effective spec 必须与 cycle pin 同源。"""
@@ -1281,15 +1148,6 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertNotIn("compiled_profile_for(conn,account_id)", helper,
                          "effective_spec_for_cycle 回退 current/latest profile")
 
-    def test_guard10v_seat_participants_come_from_cycle_ledger_rows(self):
-        """seat budget 的参与者必须是 cycle ledger rows，不能反向筛 ACCOUNT_SPECS。"""
-        body = self._flat("_dynamic_position_limits")
-        self.assertIn(
-            'account_ids=[str(row.get("id"))forrowinrowsifrow.get("id")]', body,
-            "seat budget 没有直接消费 cycle ledger rows")
-        self.assertNotIn(
-            "account_ids=[keyforkeyinACCOUNT_SPECS", body,
-            "seat budget 仍用 ACCOUNT_SPECS 过滤参与者：用户策略会被丢掉")
 
     # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
     def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):

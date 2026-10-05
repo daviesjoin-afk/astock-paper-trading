@@ -5,7 +5,7 @@
 
 A1 ``apply_allocation``        — Bandit 策略权重 → 共享资金池分摊覆盖
                                   （paper_accounts.params.adaptive_allocation，
-                                  由 paper_trading._strategy_pool_budget 消费）。
+                                  由 exact canonical allocation-weight owner 消费）。
 A3 ``apply_tuner_proposals``   — 双AI共识提案 → 选股因子权重/入场阈值覆盖
                                   （paper_accounts.params.adaptive_selection，
                                   由 paper_trading._adaptive_selection 消费）。
@@ -20,6 +20,7 @@ A2 由 dual_ai_tuner 直接接线：调参边界读取 self_evolution 当前参�
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import sqlite3
 import zoneinfo
@@ -87,10 +88,35 @@ def _baseline_conditions(account_params):
     return {}
 
 
-def _write_account_params(conn, account_id, params):
+def _write_account_params(conn, account_id, params, *, updated_at=None):
     conn.execute(
         "UPDATE paper_accounts SET params=?,updated_at=? WHERE id=?",
-        (_json(params), _now(), account_id),
+        (_json(params), updated_at or _now(), account_id),
+    )
+
+
+def _append_parameter_snapshot(conn, account_row, params, *, reason, created_at):
+    """Append the complete parameter state to the exact account cycle owner."""
+    try:
+        cycle_id = int(account_row["cycle_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "active paper cycle is required to record parameter history") from exc
+    if cycle_id <= 0:
+        raise ValueError("active paper cycle is required to record parameter history")
+    version = str(account_row["version"] or "")
+    style = str(account_row["style"] or "")
+    if not version or not style:
+        raise ValueError("account parameter version/style is unavailable")
+    effective = _aware(created_at)
+    if effective is None:
+        raise ValueError("parameter history created_at must be timezone-aware")
+    conn.execute(
+        """INSERT INTO paper_parameter_versions(
+               cycle_id,account_id,version,style,params,reason,effective_date,created_at
+           ) VALUES(?,?,?,?,?,?,?,?)""",
+        (cycle_id, str(account_row["id"]), version, style, _json(params),
+         str(reason), effective.date().isoformat(), str(created_at)),
     )
 
 
@@ -168,9 +194,10 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
     paper = _paper_connect(paper_db_path)
     try:
         paper.execute("BEGIN")
-        previous_map = {}
+        pre_apply_params = {}
+        written_at = _now()
         rows = paper.execute(
-            "SELECT id,params FROM paper_accounts WHERE id IN (%s)"
+            "SELECT id,params,cycle_id,version,style FROM paper_accounts WHERE id IN (%s)"
             % ",".join("?" * len(weights)),
             tuple(weights.keys()),
         ).fetchall()
@@ -179,8 +206,10 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
             row = by_id.get(account_id)
             if row is None:
                 raise ValueError(f"模拟盘账户 {account_id} 不存在，拒绝应用")
-            params = _account_params(row)
-            previous_map[account_id] = params.get("adaptive_allocation_previous")
+            pre_apply_params[account_id] = copy.deepcopy(_account_params(row))
+        for account_id in weights:
+            row = by_id[account_id]
+            params = copy.deepcopy(pre_apply_params[account_id])
             params["adaptive_allocation_previous"] = params.get("adaptive_allocation")
             params["adaptive_allocation"] = {
                 "weight_pct": weights[account_id],
@@ -188,10 +217,15 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
                 "decision_date": decision_date,
                 "status": "active",
                 "effective_date": effective_date,
-                "applied_at": _now(),
+                "applied_at": written_at,
                 "approved_by": actor,
             }
-            _write_account_params(paper, account_id, params)
+            _write_account_params(paper, account_id, params, updated_at=written_at)
+            _append_parameter_snapshot(
+                paper, row, params,
+                reason=f"adaptive allocation applied decision_id={decision_id}",
+                created_at=written_at,
+            )
         paper.commit()
     except Exception:
         paper.rollback()
@@ -205,8 +239,11 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
                 (_now(), decision_id),
             )
     except Exception:
-        _restore_allocation_snapshot(paper_db_path, {k: v for k, v in
-                                                     ((a, previous_map.get(a)) for a in weights)})
+        _restore_parameter_states(
+            paper_db_path,
+            pre_apply_params,
+            reason=f"adaptive allocation compensation rollback decision_id={decision_id}",
+        )
         paper.close()
         raise
     paper.close()
@@ -214,24 +251,57 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
             "effective_date": effective_date, "approved_by": actor}
 
 
-def _restore_allocation_snapshot(paper_db_path, previous_map):
-    """把 {account_id: previous_allocation_or_None} 写回（补偿/回滚共用）。"""
+def _restore_parameter_states(paper_db_path, pre_apply_params, *, reason):
+    """跨库失败时精确恢复 apply 前的完整账户参数状态。"""
     paper = _paper_connect(paper_db_path)
     try:
         paper.execute("BEGIN")
-        for account_id, previous in previous_map.items():
+        written_at = _now()
+        for account_id, previous_params in pre_apply_params.items():
             row = paper.execute(
-                "SELECT params FROM paper_accounts WHERE id=?", (account_id,)
+                "SELECT id,params,cycle_id,version,style FROM paper_accounts WHERE id=?",
+                (account_id,),
             ).fetchone()
             if row is None:
                 continue
             params = _loads(row["params"], {}) or {}
+            restored = copy.deepcopy(previous_params)
+            if params != restored:
+                _write_account_params(
+                    paper, account_id, restored, updated_at=written_at)
+                _append_parameter_snapshot(
+                    paper, row, restored, reason=reason, created_at=written_at)
+        paper.commit()
+    finally:
+        paper.close()
+
+
+def _rollback_allocation_to_previous(paper_db_path, previous_map, *,
+                                     reason="adaptive allocation rollback"):
+    """按业务语义将 allocation 回滚到 apply 前的 previous 值。"""
+    paper = _paper_connect(paper_db_path)
+    try:
+        paper.execute("BEGIN")
+        written_at = _now()
+        for account_id, previous in previous_map.items():
+            row = paper.execute(
+                "SELECT id,params,cycle_id,version,style FROM paper_accounts WHERE id=?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            params = _loads(row["params"], {}) or {}
+            before = copy.deepcopy(params)
             if previous is None:
                 params.pop("adaptive_allocation", None)
             else:
                 params["adaptive_allocation"] = previous
             params.pop("adaptive_allocation_previous", None)
-            _write_account_params(paper, account_id, params)
+            if params != before:
+                _write_account_params(
+                    paper, account_id, params, updated_at=written_at)
+                _append_parameter_snapshot(
+                    paper, row, params, reason=reason, created_at=written_at)
             _audit(paper, account_id, "adaptive_allocation_rolled_back",
                    {"restored": bool(previous is not None)})
         paper.commit()
@@ -260,7 +330,10 @@ def rollback_allocation(paper_db_path, account_id: str, reason: str = "人工回
     except Exception:
         paper.close()
         raise
-    _restore_allocation_snapshot(paper_db_path, {account_id: previous})
+    _rollback_allocation_to_previous(
+        paper_db_path, {account_id: previous},
+        reason=f"adaptive allocation rollback: {str(reason)[:300]}",
+    )
     return {"rolled_back": True, "account_id": account_id,
             "restored_previous": previous is not None, "reason": str(reason)[:300]}
 

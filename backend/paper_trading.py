@@ -56,6 +56,8 @@ import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
+import portfolio_allocation_policy as PAPolicy
+import portfolio_runtime as PRuntime
 import paper_cycle_service as PCS
 import paper_account_specs as ACS
 import paper_cycle_ownership as PCY
@@ -70,7 +72,6 @@ import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
 import paper_position_review as PReview
 import paper_replacement_decision as PRep
-import paper_replacement_evidence as PREPL
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -78,7 +79,6 @@ import adaptive_selection_compat as ASC
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import paper_slot_service as PSS
-import portfolio_coordinator as PCO
 import strategy_champion as SCM
 import strategy_clusters as SC
 import execution_profiles as EPF
@@ -86,6 +86,9 @@ import execution_planner as EP
 import execution_verification as EV
 import paper_sizing as PSZ
 import order_intent as OI
+import portfolio_allocation_service as PAS
+import portfolio_allocation_weights as PAW
+import portfolio_runtime_service as PRS
 import strategy_policies as SPOL
 import strategy_registry as SR
 import signal_service as SIG
@@ -96,7 +99,7 @@ import strategy_risk_enforcement as SRE
 import paper_risk_evidence as PREv
 import paper_risk_service as PRSVC
 import runtime_settings as RSET
-from market_policy import market_light_scale, market_light_scales
+from market_policy import market_light_scale
 from paper_trading_rules import (
     CHINEXT_PREFIXES,  # noqa: F401 - legacy public compatibility export
     COMMISSION,  # noqa: F401 - legacy public compatibility export
@@ -1276,7 +1279,8 @@ def _with_decision_snapshot(payload=None, **kwargs):
     )
 
 
-def _order_intent_payload(strategy_id, pick, *, asof_day=None, intended_session=None):
+def _order_intent_payload(strategy_id, pick, *, intent_kind, asof_day=None,
+                          intended_session=None):
     """PR-05 OrderIntent：把策略 pick 适配为统一订单意图（纯附加，零行为变更）。
 
     契约见 :mod:`order_intent`：策略只描述意图，最终数量仍完全由
@@ -1293,6 +1297,7 @@ def _order_intent_payload(strategy_id, pick, *, asof_day=None, intended_session=
         )
         intent = OI.order_intent_from_signal(
             strategy_id, pick, now=now, intended_session=intended_session,
+            intent_kind=intent_kind,
         )
     except OI.OrderIntentContractError as exc:
         return None, f"{type(exc).__name__}: {exc}"
@@ -1352,8 +1357,13 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
     if not enforced:
         return None, None
     try:
+        declared_intent = (payload or {}).get("order_intent") or {}
+        intent_kind = str(declared_intent.get("intent_kind") or "")
+        if not intent_kind:
+            raise OI.OrderIntentContractError("explicit_resource_intent_kind_required")
         intent = OI.order_intent_from_signal(
             account_id, {**(payload.get("pick") or {}), "code": code},
+            intent_kind=intent_kind,
         )
         OI.reject_qty_claims({
             key: value for key, value in (payload or {}).items()
@@ -1371,7 +1381,7 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
                 pass
         _risk_log(conn, account_id, code, "buy", "order_intent_rejected", reason, {
             "origin": origin, "contract_version": contract_version,
-            "strategy_id": account_id,
+            "strategy_id": account_id, "intent_kind": intent_kind if "intent_kind" in locals() else None,
         })
         return None, {
             "code": code, "filled": False, "status": "risk_rejected",
@@ -1932,7 +1942,10 @@ def init_db():
                 strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
                 retry_of_order_id INTEGER,
                 execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
-                cycle_id INTEGER
+                cycle_id INTEGER,
+                allocation_intent_kind TEXT, portfolio_snapshot_id TEXT,
+                allocation_plan_id TEXT, allocation_plan_fingerprint TEXT,
+                allocation_policy_version TEXT
             );
             -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
             CREATE TABLE IF NOT EXISTS paper_orders_archive (
@@ -1943,7 +1956,10 @@ def init_db():
                 expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
                 strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER,
                 execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
-                cycle_id INTEGER
+                cycle_id INTEGER,
+                allocation_intent_kind TEXT, portfolio_snapshot_id TEXT,
+                allocation_plan_id TEXT, allocation_plan_fingerprint TEXT,
+                allocation_policy_version TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_signals_archive (
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
@@ -7817,6 +7833,7 @@ def generate_signals(asof_date=None):
                            "news": [n for n in evidence_news if n.get("code") == code]}
                 intent_payload, intent_violation = _order_intent_payload(
                     account["id"], pick, asof_day=day,
+                    intent_kind="NEW_ENTRY",
                     intended_session=_next_weekday(day),
                 )
                 if intent_payload is not None:
@@ -8054,6 +8071,190 @@ STRATEGY_MAX_POSITIONS = 6
 # 该底座只保护"席位数"，不会放宽总暴露、单票/行业上限、行情校验或
 # 单笔风险预算。
 STRATEGY_PROTECTED_SLOT_FLOOR = 2
+
+
+def _portfolio_allocation_service_config(conn=None):
+    """Snapshot the legacy declarative limits for the exact plan builder."""
+    return PAS.AllocationServiceConfig(
+        allocation_slot_caps=ALLOCATION_SLOT_CAPS,
+        allocation_priority_floor_pct=ALLOCATION_PRIORITY_FLOOR_PCT,
+        allocation_own_exposure_cap_pct=ALLOCATION_OWN_EXPOSURE_CAP_PCT,
+        strategy_max_positions=STRATEGY_MAX_POSITIONS,
+        strategy_min_positions=STRATEGY_MIN_POSITIONS,
+        protected_slot_floor=STRATEGY_PROTECTED_SLOT_FLOOR,
+        shared_pool_max_positions=SHARED_POOL_MAX_POSITIONS,
+        account_order={key: index for index, key in enumerate(ACCOUNT_SPECS)},
+        shared_pool_max_exposure=(
+            RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE)
+            if conn is not None else SHARED_POOL_MAX_EXPOSURE),
+        strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
+    )
+
+
+def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
+                                account_id, symbol, intent_kind):
+    """Capture exact facts and one explicit candidate plan on the caller transaction."""
+    asof_day = _date(asof_day).isoformat()
+    instant = dt.datetime.fromisoformat(str(decision_at).replace("Z", "+00:00"))
+    if instant.tzinfo is None:
+        raise PAPolicy.PortfolioAllocationPolicyError(
+            "explicit_decision_at_must_include_timezone")
+    reading = MDSvc.read_snapshot(
+        MDC.LIVE_MARKET_POLICY, now=instant, asof_day=asof_day)
+    snapshot = PRS.capture_portfolio_runtime_snapshot(
+        conn, cycle_id=cycle_id, asof_day=asof_day,
+        decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,
+        market_evidence_identity=MDC.snapshot_fingerprint(reading.snapshot)
+        if reading.snapshot is not None else None,
+        market_reading=reading)
+    eligible_ids = {str(value) for value in snapshot["execution_participant_ids"]}
+    history_rows = PAW.read_canonical_allocation_weight_owner_rows(
+        conn, eligible_account_ids=eligible_ids, cycle_id=cycle_id)
+    weights = PAW.resolve_canonical_allocation_weights(
+        history_rows,
+        eligible_account_ids=eligible_ids,
+        cycle_id=cycle_id, asof_day=asof_day, decision_at=decision_at,
+        strategy_pins=snapshot["strategy_pins"])
+    conflict_dimension = next(
+        (item for item in snapshot["dimensions"]
+         if item["name"] == "signal_conflicts"), None)
+    if conflict_dimension is None:
+        raise PAPolicy.PortfolioAllocationPolicyError(
+            "exact_pending_intent_dimension_unavailable")
+    if conflict_dimension.get("status") == PRuntime.UNAVAILABLE:
+        raise PAPolicy.PortfolioAllocationPolicyError(
+            "exact_pending_intent_dimension_unavailable")
+    existing_intents = [PAPolicy.ResourceIntent(**item) for item in
+                        conflict_dimension["facts"].get(
+                            "pending_resource_intents", ())]
+    candidate_id = (
+        f"entry:{int(cycle_id)}:{str(account_id)}:{str(symbol)}:"
+        f"{str(decision_at)}:{str(intent_kind)}"
+    )
+    existing_intents.append(PAPolicy.ResourceIntent(
+        intent_id=candidate_id, account_id=str(account_id),
+        intent_kind=str(intent_kind), symbol=str(symbol),
+        source_identity=(f"paper_trading:explicit_entry_action:cycle:{int(cycle_id)}"
+                         f":account:{account_id}:symbol:{symbol}"),
+    ))
+    plan = PAS.capture_portfolio_allocation_plan(
+        conn, config=_portfolio_allocation_service_config(conn),
+        portfolio_snapshot_id=snapshot["snapshot_id"],
+        allocation_weights=weights["weights"],
+        allocation_weights_source_identity=weights["source_identity"],
+        allocation_weights_source_fingerprint=weights["source_fingerprint"],
+        resource_intents=existing_intents)
+    candidate_row = next((item for item in plan["conflict_plan"].get(
+        "ordered_intents", ()) if item.get("intent_id") == candidate_id), {})
+    candidate_blocked = any(
+        plan[component]["status"] != PAPolicy.PLANNED
+        for component in ("slot_plan", "capital_plan", "capacity_plan")
+    ) or (
+        candidate_id in plan["conflict_plan"].get("deferred_intent_ids", ())
+        or bool(candidate_row.get("denial_reason"))
+    )
+    capital_allowances = plan["capital_plan"].get("allowance_by_strategy") or {}
+    return {"snapshot": snapshot, "plan": plan,
+            "candidate_intent_id": candidate_id,
+            "allocation_weights_source_fingerprint": weights["source_fingerprint"],
+            "candidate_blocked": candidate_blocked,
+            "slot_limit": plan["slot_plan"]["limits"].get(str(account_id)),
+                "capital_allowance": capital_allowances.get(str(account_id)),
+            "candidate_deferred": candidate_id in plan["conflict_plan"].get(
+                "deferred_intent_ids", ()),
+            "candidate_denied": bool(candidate_row.get("denial_reason"))}
+
+
+def _revalidate_portfolio_entry_plan(conn, entry):
+    """Revalidate the exact decision snapshot; never substitute a newer plan."""
+    plan = entry["plan"]
+    instant = dt.datetime.fromisoformat(str(plan["decision_at"]).replace("Z", "+00:00"))
+    reading = MDSvc.read_snapshot(
+        MDC.LIVE_MARKET_POLICY, now=instant, asof_day=plan["asof_day"])
+    current = PRS.capture_portfolio_runtime_snapshot(
+        conn, cycle_id=plan["cycle_id"], asof_day=plan["asof_day"],
+        decision_at=plan["decision_at"], builtin_scope=ACTIVE_ACCOUNT_IDS,
+        market_evidence_identity=(MDC.snapshot_fingerprint(reading.snapshot)
+                                  if reading.snapshot is not None else None),
+        market_reading=reading)
+    return (current["snapshot_id"] == plan["portfolio_snapshot_id"]
+            and current["snapshot_fingerprint"]
+            == plan["portfolio_snapshot_fingerprint"])
+
+
+def _entry_allocation_provenance(entry, intent_kind):
+    plan = entry["plan"]
+    return {
+        "intent_kind": str(intent_kind),
+        "portfolio_snapshot_id": plan["portfolio_snapshot_id"],
+        "portfolio_snapshot_fingerprint": plan["portfolio_snapshot_fingerprint"],
+        "allocation_plan_id": plan["plan_id"],
+        "allocation_plan_fingerprint": plan["plan_fingerprint"],
+        "allocation_policy_version": plan["allocation_policy_version"],
+        "decision_at": plan["decision_at"],
+    }
+
+
+def _entry_plan_sizing_facts(entry, account_id, positions):
+    """Project sizing inputs from the plan's exact market and capacity owners."""
+    plan = entry["plan"]
+    capital = plan["capital_plan"]
+    capacity = plan["capacity_plan"]
+    exposure = next(item["facts"] for item in entry["snapshot"]["dimensions"]
+                    if item["name"] == "strategy_exposure")
+    capacity_evidence = next(item for item in entry["snapshot"]["dimensions"]
+                             if item["name"] == "capacity")
+    if (capacity_evidence["status"] != PRuntime.AVAILABLE
+            or not isinstance(capacity_evidence["facts"].get("pending_by_symbol"), dict)):
+        raise PAPolicy.PortfolioAllocationPolicyError(
+            "exact_pending_symbol_reservation_evidence_unavailable")
+    rows = exposure["market_value_by_position"]
+    industry_by_position = {
+        (str(row.get("account_id")), str(row.get("code"))):
+        str(row.get("industry") or "未知") for row in positions
+    }
+    code_values = {}
+    industry_values = {}
+    for row in rows:
+        symbol = str(row["symbol"])
+        amount = float(row["market_value"])
+        account = str(row["account_id"])
+        code_values[symbol] = code_values.get(symbol, 0.0) + amount
+        industry = industry_by_position.get((account, symbol), "未知")
+        industry_values[industry] = industry_values.get(industry, 0.0) + amount
+    for symbol, amount in capacity_evidence["facts"]["pending_by_symbol"].items():
+        code_values[str(symbol)] = code_values.get(str(symbol), 0.0) + float(amount)
+    account_key = str(account_id)
+    current_amount = float(capital["market_value_by_account"][account_key])
+    pending_account = float(capital["pending_by_account"][account_key])
+    allowance = float(capital["allowance_by_strategy"][account_key])
+    values = [float(value) for value in capital["market_value_by_account"].values()]
+    allowances = [float(value) for value in capital["allowance_by_strategy"].values()]
+    pending_total = float(capacity["pending_amount"])
+    nav = float(capital["nav"])
+    return {
+        "nav": nav,
+        "position_value": sum(values),
+        "shared_cash": max(0.0, float(capacity["headroom_amount"])),
+        "code_values": code_values,
+        "industry_values": industry_values,
+        "strategy_budget": {
+            "authority": "exact_portfolio_allocation_plan",
+            "current_amount": current_amount,
+            "pending_reserve_amount": pending_account,
+            "pending_pool_reserve_amount": pending_total,
+            "allowance_amount": allowance,
+            "absolute_cap_amount": current_amount + pending_account + allowance,
+            "pool_cap_amount": sum(values) + pending_total + sum(allowances),
+            "target_pct": round(allowance / max(nav, 1.0) * 100, 2),
+            "base_target_pct": None, "floor_pct": None,
+            "current_pct": round(current_amount / max(nav, 1.0) * 100, 2),
+            "market_scale_pct": None, "market_scale_applied": False,
+            "redistribution_amount": 0.0,
+        },
+    }
+
+
 SLOT_UPGRADE_MIN_CANDIDATE_SCORE = 75.0
 SLOT_UPGRADE_MIN_EDGE = 25.0
 # R17：集中换仓决策已抽到 paper_position_review（纯域模块）。它不 import 本模块，
@@ -8135,26 +8336,10 @@ def _cycle_first_trade_day(cycle):
     return started_day
 
 
-def _position_limit_window(now=None):
-    """Return the audit window for a position-allocation version.
-
-    The window is deliberately not the activation gate.  A fingerprint of the
-    active risk inputs is appended by ``_dynamic_position_limits`` so a live
-    risk change creates a new version immediately, while repeated reads under
-    identical inputs reuse one stable version.
-    """
-    now = now or dt.datetime.now()
-    clock = now.strftime("%H:%M")
-    if clock < "12:00":
-        phase = "morning"
-    elif clock < "15:15":
-        phase = "afternoon"
-    else:
-        phase = "after_close"
-    return f"{now.date().isoformat()}:{phase}"
 
 
-def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, count_budget, asof_day, now=None):
+def _entry_deployment_gate(conn, account_id, code, positions, pending_slots,
+                           slot_plan, asof_day, now=None):
     """Gate *new* automatic positions by intraday deployment phase.
 
     The dynamic limits stay the hard, all-day ceiling.  This helper merely
@@ -8184,8 +8369,8 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, cou
             "reason": "14:30 后不新增普通自动仓，保留风控、做T回补和等待池次日重排",
         }
     _, _, stage_pool_cap, stage_strategy_cap, label = stage
-    dynamic_pool = int(count_budget.get("pool_limit") or SHARED_POOL_MAX_POSITIONS)
-    dynamic_strategy = int((count_budget.get("limits") or {}).get(account_id, STRATEGY_MAX_POSITIONS))
+    dynamic_pool = int(slot_plan["total_cap"])
+    dynamic_strategy = int(slot_plan["limits"][str(account_id)])
     pool_cap = min(dynamic_pool, int(stage_pool_cap))
     strategy_cap = min(dynamic_strategy, int(stage_strategy_cap))
     open_pairs = {
@@ -8210,6 +8395,23 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, cou
         ),
     }
 
+def _position_limit_window(now=None):
+    """Return the audit window for a position-allocation version.
+
+    The window is deliberately not the activation gate.  A fingerprint of the
+    active risk inputs is appended by ``_dynamic_position_limits`` so a live
+    risk change creates a new version immediately, while repeated reads under
+    identical inputs reuse one stable version.
+    """
+    now = now or dt.datetime.now()
+    clock = now.strftime("%H:%M")
+    if clock < "12:00":
+        phase = "morning"
+    elif clock < "15:15":
+        phase = "afternoon"
+    else:
+        phase = "after_close"
+    return f"{now.date().isoformat()}:{phase}"
 
 def _strategy_return_series(conn, account_ids, *, days=30, cycle_id=None, asof_day=None):
     """按策略聚合近 N 天的日盈亏序列（已实现盈亏，Pearson 对线性缩放不变）。
@@ -8255,7 +8457,6 @@ def _strategy_return_series(conn, account_ids, *, days=30, cycle_id=None, asof_d
     for account_id, buckets in daily.items():
         series[account_id] = [_num(buckets.get(d)) for d in all_days]
     return series
-
 
 def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None, *, cycle_id=None):
     """收集各策略的相关性画像：持仓/近期信号代码与行业集合（约 14 天窗口）。
@@ -8316,7 +8517,6 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None, *, cycle_i
             profiles[account_id]["returns"] = returns
     return profiles
 
-
 def _strategy_cluster_factors(conn, asof_day=None, account_ids=None, *, cycle_id=None):
     """返回 (clusters, {strategy_id: 分散化系数})；单策略簇系数 = 1.0。"""
     profiles = _strategy_cluster_profiles(conn, asof_day, account_ids, cycle_id=cycle_id)
@@ -8326,7 +8526,6 @@ def _strategy_cluster_factors(conn, asof_day=None, account_ids=None, *, cycle_id
         for account_id in profiles
     }
     return clusters, factors
-
 
 def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=None,
                       profiles=None, cycle_id=None):
@@ -8338,7 +8537,6 @@ def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=
         own_exposure_caps=ALLOCATION_OWN_EXPOSURE_CAP_PCT,
         strategy_max_positions=STRATEGY_MAX_POSITIONS,
     )
-
 
 def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     """Return a versioned allocation inside the 15-slot hard cap.
@@ -8469,238 +8667,30 @@ def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     }
 
 
-def _strategy_pool_weights(conn, rows, profiles, *, asof_day=None):
-    """共享池相对权重：active 的 adaptive_allocation 覆盖优先，否则 max_exposure。
-
-    预算计算与分配解释必须使用**同一个**优先级来源，否则解释与实际分配背离。
-
-    R19：``asof_day`` 一旦可省，历史回放的 strategy weight 会被"生效日更晚"的
-    自进化覆盖改写。
-    """
-    weights = {}
-    for row in rows or []:
-        row_id = row.get("id")
-        if not row_id:
-            continue
-        # A1 自进化落地：人工批准的 Bandit 策略权重覆盖共享池相对权重。
-        # 覆盖按 paper_accounts.params.adaptive_allocation 存储（status=active、
-        # 自带 effective_date），缺省或过期时回落到 max_exposure 基准。
-        row_params = _loads(row.get("params"), {}) or {}
-        alloc = row_params.get("adaptive_allocation") or {}
-        alloc_pct = _num(alloc.get("weight_pct"), 0.0)
-        if (alloc_pct > 0 and alloc.get("status") == "active"
-                and _runtime_parameter_active(
-                    alloc.get("effective_date"), asof_day=asof_day,
-                    status=alloc.get("status"))):
-            weights[row_id] = alloc_pct / 100.0
-        else:
-            profile = profiles.get(row_id) or {}
-            weights[row_id] = max(_num(profile.get("max_exposure"), 0.0), 0.01)
-    return weights
 
 
-def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
-                            exclude_reservation_key=None, rows=None, *,
-                            cycle_id=None, asof_day=None):
-    """共享池分配的**唯一输入装配点**（PR-26）。
-
-    生产预算（:func:`_strategy_pool_budget`）与正式资金部署入口
-    （:func:`_allocation_plan` → ``PA.allocation_plan``）必须消费同一份
-    账户权重、占用估值、在途预占、市场缩放与分散化系数。任何一侧单独
-    装配输入，都会让执行路径与 explainability 看到两个不同的分配结果。
-
-    R19：``cycle_id`` / ``asof_day`` 是**证据边界**：参与者账户（周期账本）、
-    adaptive overlay、相关簇画像全部按这两个值解析；``None`` 保持 current/live。
-
-    **注意**：在途预占 ``pending_total`` **故意**不受周期约束 —— 旧周期尚未释放的
-    真实 reserved cash 仍占用同一个经济共享资金池，按周期过滤会造成 double-spend。
-    """
-    rows = rows if rows is not None else _shared_account_rows(conn, cycle_id)
-    if not rows and cycle_id is None:
-        # §24：单账户兜底只服务于 legacy / live。显式周期的权威参与者集合就是
-        # 周期账本本身：idle 周期解析出空列表，注入调用方账户会凭空造出资金表达。
-        rows = [account] if account is not None else []
-    profiles = {
-        row.get("id"): _risk_profile(row, asof_day=asof_day, conn=conn, cycle_id=cycle_id)
-        for row in rows if row.get("id")
-    }
-    weights = _strategy_pool_weights(conn, rows, profiles, asof_day=asof_day)
-    values = {row.get("id"): 0.0 for row in rows if row.get("id")}
-    if account is not None and account.get("id") not in values and cycle_id is None:
-        # 同上：显式周期下参与者集合就是周期账本，不得再把调用方账户补进来。
-        account_id = account.get("id")
-        profiles[account_id] = _risk_profile(
-            account, asof_day=asof_day, conn=conn, cycle_id=cycle_id)
-        weights[account_id] = max(_num(profiles[account_id].get("max_exposure"), 0.0), 0.01)
-        values[account_id] = 0.0
-    for position in positions or []:
-        account_id = position.get("account_id")
-        if account_id not in values:
-            continue
-        quote = (quotes or {}).get(position.get("code")) or {}
-        price = _num(quote.get("price"), _num(position.get("cost")))
-        values[account_id] += max(0.0, _num(position.get("qty"))) * max(0.0, price)
-
-    pending_by_account, pending_total = _pending_buy_reservations(
-        conn, exclude_order_key=exclude_reservation_key,
-    )
-    market_light = str((market or {}).get("light") or "").lower()
-    # A missing market argument is used by read-only dashboard aggregation;
-    # the execution path always supplies the current market gate.
-    scales = market_light_scales(market_light) if market_light else None
-    # 相关.cluster：资金预算与席位分配使用同一套分散化系数，并施加**绝对**
-    # 簇预算——归一化的有效权重会抵消公共系数，绝对约束才能兜住克隆簇。
-    # R19：簇证据与本次 (cycle, as-of) 同源，否则机器今天/未来 evidence 会改变
-    # 历史 as-of 的簇结构与簇预算。
-    clusters, cluster_factors = _strategy_cluster_factors(
-        conn, asof_day, account_ids=list(weights), cycle_id=cycle_id,
-    )
-    runtimes = _strategy_runtimes(
-        list(weights), weights,
-        diversification={key: cluster_factors.get(key, 1.0) for key in weights},
-        conn=conn, profiles=profiles, cycle_id=cycle_id,
-    )
-    return {
-        "rows": rows,
-        "profiles": profiles,
-        "weights": weights,
-        "values": values,
-        "pending_by_account": pending_by_account,
-        "pending_total": pending_total,
-        "market_light": market_light,
-        "scales": scales,
-        "clusters": clusters,
-        "cluster_factors": cluster_factors,
-        "runtimes": runtimes,
-        "shared_pool_max_exposure": RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
-        "strategy_pool_floor_ratio": STRATEGY_POOL_FLOOR_RATIO,
-    }
 
 
-def _allocation_plan(conn, *, nav, positions, quotes, market=None, prices_by_strategy=None,
-                     account=None, rows=None, exclude_reservation_key=None,
-                     account_order=None, cycle_id=None, asof_day=None):
-    """正式资金部署入口（PR-26）：预算 → 生命周期缩放 → 整手部署。
-
-    返回 ``PA.allocation_plan`` 的原始结果，外加 ``rows_by_strategy``
-    索引。执行路径与 explainability 都只读这份结果，不允许各自重算：
-    - ``shadow``/``quarantined`` 系数 0 → 不部署，预算整笔进 waiting_capital；
-    - ``pilot`` 系数 0.25 → 即使权重最高也只能拿到四分之一预算；
-    - 缩放后不足一手 → ``lots=0``，全部预算进 waiting_capital，绝不产生碎片单。
-
-    R19：``cycle_id`` / ``asof_day`` 原样下传给 :func:`_pool_allocation_inputs`，
-    部署计划与生产预算必须是同一个 (cycle, as-of) 下的同一份证据。
-    """
-    inputs = _pool_allocation_inputs(
-        conn, account, nav, positions, quotes, market,
-        exclude_reservation_key=exclude_reservation_key, rows=rows,
-        cycle_id=cycle_id, asof_day=asof_day,
-    )
-    plan = PA.allocation_plan(
-        inputs["runtimes"],
-        nav=_num(nav),
-        values=inputs["values"],
-        pending_by_account=inputs["pending_by_account"],
-        pending_total=inputs["pending_total"],
-        prices_by_strategy=prices_by_strategy,
-        shared_pool_max_exposure=inputs["shared_pool_max_exposure"],
-        strategy_pool_floor_ratio=inputs["strategy_pool_floor_ratio"],
-        lot_size=LOT_SIZE,
-        account_order=account_order,
-        market_scales=inputs["scales"],
-    )
-    plan["rows_by_strategy"] = {
-        str(row.get("strategy_id")): row for row in (plan.get("plan") or [])
-    }
-    return plan
 
 
-def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None,
-                          exclude_reservation_key=None, *, cycle_id=None, asof_day=None):
-    """Return the fair shared-pool budget for one strategy.
 
-    ``target_amount`` is a soft target, ``floor_amount`` is the amount kept
-    available for the other strategies, and ``allowance_amount`` is the
-    actual additional amount this strategy may open right now.  All values
-    are derived from the same live quote snapshot used by the order gate.
 
-    PR-26: ``absolute_cap_amount`` (what the sizing layer actually consumes)
-    is lifecycle-scaled — a pilot strategy can only deploy a quarter of its
-    allowance and a shadow/quarantined one gets no new capital at all.
 
-    R19: ``cycle_id`` / ``asof_day`` bound the participant ledgers, the adaptive
-    overlays and the cluster evidence to one point in time; the seat budget
-    already carried them (R18) and the capital budget must use the same facts,
-    or a historical entry gets a different quantity because evidence that did
-    not exist at the requested as-of date was visible.
-    """
-    inputs = _pool_allocation_inputs(
-        conn, account, nav, positions, quotes, market,
-        exclude_reservation_key=exclude_reservation_key,
-        cycle_id=cycle_id, asof_day=asof_day,
-    )
-    values = inputs["values"]
-    weights = inputs["weights"]
-    pending_by_account = inputs["pending_by_account"]
-    result = PA.strategy_pool_budget(
-        inputs["runtimes"],
-        account_id=account.get("id"),
-        values=values,
-        pending_by_account=pending_by_account,
-        pending_total=inputs["pending_total"],
-        nav=_num(nav),
-        market_scales=inputs["scales"],
-        shared_pool_max_exposure=inputs["shared_pool_max_exposure"],
-        strategy_pool_floor_ratio=inputs["strategy_pool_floor_ratio"],
-    )
-    cluster = SC.cluster_of(account.get("id"), inputs["clusters"])
-    if len(cluster) > 1:
-        # PR-27 cluster-first：先定簇总预算，再均分给成员——
-        # 簇上限 = 单策略基准 × (1 + novelty bonus)，封顶 +10%；
-        # 每成员的分项上限 = 簇上限 / n，扣除自身已占用后才是新增额度。
-        # 复制 50 份的簇总预算 ≈ 1.1 倍单策略（v1 的 floor 口径是 15 倍），
-        # 且后到的克隆抢不走先到成员的份额（不存在簇 headroom 竞争）。
-        unit_amount = _num(nav) * _num(weights.get(account.get("id"), 0.0))
-        cluster_cap = unit_amount * SC.cluster_budget_multiplier(cluster)
-        per_member_cap = cluster_cap / len(cluster)
-        own_committed = _num(values.get(account.get("id"))) + _num(
-            pending_by_account.get(account.get("id")),
-        )
-        member_headroom = max(0.0, per_member_cap - own_committed)
-        result["cluster_budget"] = {
-            "cluster": sorted(cluster), "cap_amount": round(cluster_cap, 2),
-            "per_member_cap_amount": round(per_member_cap, 2),
-            "committed_amount": round(own_committed, 2),
-            "headroom_amount": round(member_headroom, 2),
-            "version": SC.STRATEGY_CLUSTER_VERSION,
-        }
-        result["allowance_amount"] = min(
-            _num(result.get("allowance_amount")), member_headroom,
-        )
-    # 生命周期阶段来自运行时 Context（PR-26）：阶段系数直接决定本策略
-    # 本轮能部署多少钱，未部署的部分记入 waiting_capital 供审计追踪。
-    runtime = next(
-        (item for item in inputs["runtimes"] if item.strategy_id == account.get("id")),
-        None,
-    )
-    stage_scale, stage_label = PA.stage_capital_scale(runtime) if runtime is not None else (1.0, "standard")
-    allowance = max(0.0, _num(result.get("allowance_amount")))
-    scaled_allowance = allowance * max(0.0, min(1.0, stage_scale))
-    result["lifecycle_stage"] = stage_label
-    result["capital_scale"] = round(stage_scale, 4)
-    result["scaled_allowance_amount"] = round(scaled_allowance, 2)
-    result["lifecycle_waiting_capital"] = round(max(0.0, allowance - scaled_allowance), 2)
-    result["absolute_cap_amount"] = round(
-        _num(result.get("current_total_amount")) + scaled_allowance, 2,
-    )
-    return result
+
+
+
+
+
+
+
+
 
 
 def _entry_execution_scale(market_policy, entry_model, chase_entry, dynamic_news, strategy_budget):
     """Return the one-time sizing multiplier for a new entry.
 
-    ``_strategy_pool_budget`` bakes the green/yellow/red market multiplier
-    into the strategy target and absolute cap.  Multiplying it again here
+    The exact plan's capital allowance already applies the market multiplier.
+    Multiplying it again here
     reduces the *remaining* amount twice, which is especially visible after
     a first fill: e.g. a 65% yellow budget became 65% * 65% before lot
     rounding.
@@ -9009,147 +8999,65 @@ def rollback_strategy_challenger(strategy_id, reason="manual_rollback"):
 
 
 def strategy_allocation_explain():
-    """PR-17：资金分配可解释性——回答"这个策略为什么拿到当前资金"。
-
-    每个策略返回：base_priority、regime（市场灯与缩放）、confidence/health/
-    data_quality/diversification 六因子、capital_scale、目标预算、可用预算、
-    席位上限、以及当前未部署的等待原因。纯只读，不影响任何交易。
-    """
-    # R24：只读路径绝不为此同步刷新 provider（此前每次 read 最坏 ~13.8s 超时）。
-    market_data = MDSvc.read_snapshot(now=MDSvc.now_utc(), asof_day=None)
+    """Return current-cycle participation without inventing an unnamed plan."""
     init_db()
     with _db() as conn:
-        day = _date()
-        cycle = _active_cycle(conn)
-        # 行情估值走缓存快照（离线回落成本价），尽量与执行路径同口径。
-        quotes_map = {str(row.get("code")): row
-                      for row in market_data.rows() if row.get("code")}
-        try:
-            market = _market_state(day, allow_network=False) or {}
-        except Exception:
-            market = {}
-        market_light = str(market.get("light") or "")
-        positions, _position_value, nav, _industries, _code_values = \
-            _shared_account_exposure(conn, quotes_map, day)
-        count_budget = _dynamic_position_limits(conn)
-        rows_map = {row.get("id"): row for row in _shared_account_rows(conn, cycle["id"])}
-        participating = list(count_budget["limits"].keys()) or list(ACCOUNT_SPECS)
-        clusters, cluster_factors = _strategy_cluster_factors(
-            conn, account_ids=participating)
-        # PR-26：正式部署计划只算一次——explainability 与执行路径读同一份
-        # 结果，生命周期阶段/资金系数/可部署金额都取自 plan 行，禁止在此
-        # 重算（历史上这里自己调 PA.stage_capital_scale，与执行口径漂移）。
-        plan = _allocation_plan(
-            conn, nav=nav, positions=positions, quotes=quotes_map, market=market,
-            rows=list(rows_map.values()) or None,
-            account=(rows_map.get(participating[0]) if participating else None),
-        )
-        plan_rows = plan.get("rows_by_strategy") or {}
+        cycle_id = int(_active_cycle_id_readonly(conn) or 0)
+        rows = _shared_account_rows(conn, cycle_id) if cycle_id else []
         strategies = []
-        for account_id in participating:
-            account_row = rows_map.get(account_id) or {"id": account_id}
-            weights = _strategy_pool_weights(conn, list(rows_map.values()), {
-                row_id: _risk_profile(row) for row_id, row in rows_map.items()})
-            runtimes = _strategy_runtimes(
-                participating, weights,
-                diversification={key: cluster_factors.get(key, 1.0) for key in participating},
-                conn=conn,
-            )
-            runtime = next((item for item in runtimes if item.strategy_id == account_id), None)
-            plan_row = plan_rows.get(account_id) or {}
-            budget = _strategy_pool_budget(
-                conn, account_row, nav, positions, quotes_map, market=market,
-            )
-            # 等待原因：该策略最新的未部署信号原因。
-            waiting = conn.execute(
-                """SELECT status,reason,code,intended_date FROM paper_signals
-                    WHERE account_id=? AND intended_date=?
-                      AND status IN ('deferred_capacity','awaiting_batch',
-                                     'pending_verification','entry_frozen_waitlist')
-                    ORDER BY id DESC LIMIT 1""",
-                (account_id, day.isoformat()),
-            ).fetchone()
-            waiting_row = dict(waiting) if waiting is not None else None
-            pending_by_account, pending_total = _pending_buy_reservations(conn)
-            # 生命周期与部署金额一律读 plan 行（同一份 allocation result）。
-            stage_scale = _num(plan_row.get("capital_scale"), budget.get("capital_scale", 1.0))
-            stage_label = str(plan_row.get("lifecycle_stage") or budget.get("lifecycle_stage") or "standard")
+        for row in rows:
+            account_id = str(row.get("id") or "")
+            strategy = SR.get(account_id)
             strategies.append({
                 "strategy_id": account_id,
-                "name": (SR.get(account_id).name if SR.get(account_id) else account_id),
-                "running": account_row.get("status") == "running",
-                # 分配六因子
-                "base_priority": round(_num(weights.get(account_id)), 6),
-                "regime": {
-                    "market_light": market_light or "unknown",
-                    "market_scale_pct": budget.get("market_scale_pct"),
-                    "market_scale_applied": budget.get("market_scale_applied"),
-                },
-                "confidence": round(_num(getattr(runtime, "confidence", 1.0)), 4),
-                "health": round(_num(getattr(runtime, "health", 1.0)), 4),
-                "data_quality": round(_num(getattr(runtime, "data_quality", 1.0)), 4),
-                "diversification": {
-                    "runtime_factor": round(_num(getattr(runtime, "diversification", 1.0)), 4),
-                    "cluster_size": len(SC.cluster_of(account_id, clusters)),
-                    "cluster_members": sorted(SC.cluster_of(account_id, clusters)),
-                },
-                "capital_scale": {
-                    "factor": round(_num(stage_scale), 4),
-                    "lifecycle_stage": stage_label,
-                },
-                # 预算
-                "target_budget": {
-                    "target_amount": budget.get("target_amount"),
-                    "target_pct": budget.get("target_pct"),
-                    "floor_amount": budget.get("floor_amount"),
-                    "priority_floor_amount": budget.get("priority_floor_amount"),
-                    "absolute_cap_amount": budget.get("absolute_cap_amount"),
-                },
-                "available_budget": {
-                    "allowance_amount": budget.get("allowance_amount"),
-                    "current_amount": budget.get("current_amount"),
-                    "pending_reserve_amount": budget.get("pending_reserve_amount"),
-                    "pool_available_amount": budget.get("pool_available_amount"),
-                    "cluster_budget": budget.get("cluster_budget"),
-                },
-                # 正式部署结果（PA.allocation_plan 的同一份行数据）
-                "deployment": {
-                    "raw_allowance_amount": plan_row.get("raw_allowance_amount"),
-                    "scaled_budget_amount": plan_row.get("scaled_budget_amount"),
-                    "deployable_amount": plan_row.get("deployable_amount"),
-                    "waiting_capital": plan_row.get("waiting_capital"),
-                    "lots": plan_row.get("lots"),
-                    "allowed": plan_row.get("allowed"),
-                    "blocked_reason": plan_row.get("blocked_reason"),
-                },
-                "position_limit": int(_num(count_budget["limits"].get(account_id))),
-                "position_count": sum(
-                    1 for item in positions
-                    if item.get("account_id") == account_id
-                    and int(_num(item.get("qty"))) >= LOT_SIZE
-                ),
-                "waiting_reason": {
-                    "status": waiting_row.get("status") if waiting_row else None,
-                    "code": waiting_row.get("code") if waiting_row else None,
-                    "reason": waiting_row.get("reason") if waiting_row else None,
-                    "intended_date": waiting_row.get("intended_date") if waiting_row else None,
-                },
+                "name": strategy.name if strategy else account_id,
+                "running": str(row.get("status") or "") == "running",
+                "allocation_status": "UNAVAILABLE",
+                "allocation_unavailable_reason": "explicit_cycle_and_plan_id_required",
+                "base_priority": None,
+                "regime": {"market_light": None, "market_scale_pct": None,
+                           "market_scale_applied": None},
+                "confidence": None,
+                "health": None,
+                "data_quality": None,
+                "diversification": {"runtime_factor": None,
+                                    "cluster_size": None, "cluster_members": []},
+                "capital_scale": {"factor": None, "lifecycle_stage": None},
+                "target_budget": {"target_amount": None, "target_pct": None,
+                                  "floor_amount": None, "priority_floor_amount": None,
+                                  "absolute_cap_amount": None},
+                "available_budget": {"allowance_amount": None, "current_amount": None,
+                                     "pending_reserve_amount": None,
+                                     "pool_available_amount": None, "cluster_budget": None},
+                "deployment": {"raw_allowance_amount": None,
+                               "scaled_budget_amount": None, "deployable_amount": None,
+                               "waiting_capital": None, "lots": None, "allowed": None,
+                               "blocked_reason": "explicit_cycle_and_plan_id_required"},
+                "position_limit": None,
+                "position_count": None,
+                "waiting_reason": {"status": None, "code": None, "reason": None,
+                                   "intended_date": None},
             })
+        unavailable_market = {
+            "status": MDC.STATUS_UNAVAILABLE,
+            "reason": "explicit_cycle_and_plan_id_required",
+            "observed_at": None,
+            "as_of": None,
+            "verification": None,
+        }
         return {
             "engine": PA.ALLOCATION_ENGINE_VERSION,
-            "nav": round(_num(nav), 2),
-            "pool_limit": int(_num(count_budget["pool_limit"])),
-            "market_light": market_light or "unknown",
-            # R24：只读投影。前端只渲染，不重算 freshness/provider 规则。
-            "market_data": market_data.projection(),
+            "cycle_id": cycle_id or None,
+            "allocation_status": "UNAVAILABLE",
+            "allocation_unavailable_reason": "explicit_cycle_and_plan_id_required",
+            "nav": None,
+            "pool_limit": None,
+            "market_light": None,
+            "market_data": unavailable_market,
             "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
-            # PR-26：部署计划摘要（与执行路径同一份结果）
-            "allocation_plan": {
-                "total_deployable_amount": plan.get("total_deployable_amount"),
-                "total_waiting_capital": plan.get("total_waiting_capital"),
-                "pool_headroom_amount": plan.get("pool_headroom_amount"),
-                "lot_size": plan.get("lot_size"),
-            },
+            "allocation_plan": {"total_deployable_amount": None,
+                                "total_waiting_capital": None,
+                                "pool_headroom_amount": None, "lot_size": None},
             "strategies": strategies,
         }
 
@@ -9325,6 +9233,54 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     slice_continuation = bool(_slice_plan) and int(
         (payload.get("entry_slices") or {}).get("filled") or 0
     ) < len(_slice_plan)
+    declared_intent_kind = getattr(intent, "intent_kind", None)
+    allocation_intent_kind = (
+        str(declared_intent_kind)
+        if declared_intent_kind in PAPolicy.ENTRY_INTENT_KINDS
+        else ("ADD_POSITION" if slice_continuation else "NEW_ENTRY")
+    )
+    try:
+        entry_allocation = _build_portfolio_entry_plan(
+            conn, cycle_id=current_cycle["id"], asof_day=asof_day,
+            decision_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            account_id=account["id"], symbol=code,
+            intent_kind=allocation_intent_kind,
+        )
+    except (PAPolicy.PortfolioAllocationPolicyError,
+            PRuntime.PortfolioRuntimeError,
+            PAW.AllocationWeightEvidenceUnavailable) as exc:
+        allocation_reason = f"精确组合分配证据不可用：{exc}；本次新增资源已延期"
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+            (allocation_reason, signal["id"]),
+        )
+        _risk_log(conn, account["id"], code, "buy",
+                  "portfolio_allocation_unavailable", allocation_reason,
+                  {"intent_kind": allocation_intent_kind,
+                   "cycle_id": int(current_cycle["id"])})
+        return {"filled": False, "deferred": True,
+                "status": "deferred_capacity", "reason": allocation_reason}
+    if entry_allocation["candidate_blocked"]:
+        exact_plan = entry_allocation["plan"]
+        allocation_reason = "；".join(exact_plan.get("blocking_reasons") or ())
+        if not allocation_reason:
+            allocation_reason = (
+                "精确 allocation plan 未批准当前资源意图；本次新增资源已延期")
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+            (allocation_reason, signal["id"]),
+        )
+        _risk_log(conn, account["id"], code, "buy",
+                  "portfolio_allocation_deferred", allocation_reason,
+                  {"intent_kind": allocation_intent_kind,
+                   "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+                   "allocation_plan_id": exact_plan["plan_id"],
+                   "allocation_plan_fingerprint": exact_plan["plan_fingerprint"],
+                   "allocation_policy_version": exact_plan["allocation_policy_version"]})
+        return {"filled": False, "deferred": True,
+                "status": "deferred_capacity", "reason": allocation_reason,
+                "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+                "allocation_plan_id": exact_plan["plan_id"]}
     market_policy = _strategy_market_policy(account, pick, quote, market)
     execution_quote = _execution_quote_status(quote, asof_day)
     signal_quote = payload.get("quote") or {}
@@ -9345,6 +9301,15 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # revalidate → commit 各阶段共用同一份意图）。
     if intent is not None:
         risk["order_intent"] = intent.to_payload()
+    exact_plan = entry_allocation["plan"]
+    risk["allocation_provenance"] = {
+        "intent_kind": allocation_intent_kind,
+        "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+        "portfolio_snapshot_fingerprint": exact_plan["portfolio_snapshot_fingerprint"],
+        "allocation_plan_id": exact_plan["plan_id"],
+        "allocation_plan_fingerprint": exact_plan["plan_fingerprint"],
+        "allocation_policy_version": exact_plan["allocation_policy_version"],
+    }
     reasons = []
     security_scope = _security_scope(code, quote.get("name") or signal.get("name"), quote.get("risk_flag"))
     risk["security_scope"] = security_scope
@@ -9488,13 +9453,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     ) and not chase_entry["allowed"]:
         prefix = "热点加速试仓" if chase_entry.get("required") else "短线追高风控"
         reasons.append(f"{prefix}未通过：{chase_entry.get('reason') or '确认条件不足'}")
-    all_codes = [p["code"] for p in _position_rows(conn, asof_day=asof_day)] + [code]
-    if all_quotes is None:
-        all_quotes = {} if conn.in_transaction else _quotes(all_codes, asof_date=asof_day)
-    else:
-        all_quotes = dict(all_quotes)
-    positions, position_value, nav, industries, code_values = _shared_account_exposure(conn, all_quotes, asof_day)
-    shared_cash = _shared_cash(conn)
+    positions = _position_rows(conn, asof_day=asof_day)
+    sizing_facts = _entry_plan_sizing_facts(
+        entry_allocation, account["id"], positions)
+    position_value = sizing_facts["position_value"]
+    nav = sizing_facts["nav"]
+    code_values = sizing_facts["code_values"]
+    industries = sizing_facts["industry_values"]
+    shared_cash = sizing_facts["shared_cash"]
     open_codes = {
         item["code"] for item in positions
         if item.get("account_id") == account["id"] and int(_num(item.get("qty"))) >= LOT_SIZE
@@ -9534,13 +9500,17 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             timing_block_reasons.append(
                 f"入场时机：{timing_info.get('reason') or timing_info.get('state')}")
             reasons.extend(timing_block_reasons)
-    # R18：预算与 current_cycle + as-of 同源，否则历史 as-of 下算出另一个版本行。
-    count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"], asof_day=asof_day)
+    slot_plan = exact_plan["slot_plan"]
+    pool_limit = int(slot_plan["total_cap"])
+    slot_limits = slot_plan["limits"]
+    if str(account["id"]) not in slot_limits:
+        raise PAPolicy.PortfolioAllocationPolicyError(
+            "exact_plan_slot_limit_missing_for_account")
     minimum_order_amount, minimum_order_detail = _dynamic_minimum_order_amount(
-        current_cycle, nav=nav, position_limit=count_budget.get("pool_limit"), conn=conn,
+        current_cycle, nav=nav, position_limit=pool_limit, conn=conn,
     )
     risk["minimum_order_amount"] = minimum_order_detail
-    position_limit = max(1, int(count_budget["limits"].get(account["id"], spec["max_positions"])))
+    position_limit = int(slot_limits[str(account["id"])])
     pool_open_positions = {
         (str(item.get("account_id")), str(item.get("code"))) for item in positions
         if int(_num(item.get("qty"))) >= LOT_SIZE
@@ -9548,15 +9518,17 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 主力独立席位保障与手动委托共用中央执行计划器的同一实现：
     # 执行路径不再比较账户身份，预留规则由声明式 ExecutionPolicy 表达。
     seat_reserve = EP.seat_reserve_gate(
-        conn, account["id"], pool_open_positions, count_budget["pool_limit"], asof_day,
+        conn, account["id"], pool_open_positions, pool_limit, asof_day,
     )
     mf_seat_interest = int(seat_reserve.get("interest") or 0)
     mf_seat_reserved = bool(seat_reserve.get("reserved"))
     risk["position_count_gate"] = {
         "current": len(open_codes), "committed": len(committed_open_codes), "limit": position_limit,
-        "pool_current": len(pool_open_positions), "pool_limit": count_budget["pool_limit"],
-        "dynamic": True, "source": count_budget["source"],
-        "allocation_version": count_budget["allocation_version"],
+        "pool_current": len(pool_open_positions), "pool_limit": pool_limit,
+        "dynamic": False, "source": "exact_portfolio_allocation_plan",
+        "allocation_version": exact_plan["allocation_policy_version"],
+        "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+        "allocation_plan_id": exact_plan["plan_id"],
         "main_force_seat_reserved": mf_seat_reserved,
         "main_force_seat_interest": mf_seat_interest,
         "seat_reserve": seat_reserve,
@@ -9572,70 +9544,55 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         "risk_exits_affected": False,
     }
     entry_deployment = _entry_deployment_gate(
-        conn, account["id"], code, positions, pending_slots, count_budget, asof_day,
+        conn, account["id"], code, positions, pending_slots, slot_plan, asof_day,
     )
     risk["entry_deployment_gate"] = entry_deployment
     pacing_blocked = code not in committed_open_codes and not entry_deployment["allowed"]
     if pacing_blocked:
         reasons.append(entry_deployment["reason"])
     strategy_count_blocked = code not in committed_open_codes and len(committed_open_codes) >= position_limit
+    if strategy_count_blocked:
+        reasons.append(
+            f"策略持仓及待成交席位已达 exact plan 上限 "
+            f"{len(committed_open_codes)}/{position_limit}")
     pool_count_blocked = (
         (account["id"], code) not in pool_open_positions
-        and len(pool_open_positions) >= count_budget["pool_limit"]
+        and len(pool_open_positions) >= pool_limit
     )
-    # A borrowed seat is a late-session quality allocation tool.  It must not
-    # let a strong opening candidate bypass the staged deployment budget.
-    if strategy_count_blocked and not pacing_blocked:
-        # R18：席位比较/借位必须与上面已经证明过的 current_cycle 同周期 ——
-        # 不再让 helper 自己重新解析 active cycle。
-        upgrade = _slot_upgrade_context(
-            conn, account["id"], signal, positions, asof_day,
-            cycle_id=current_cycle["id"],
-        )
-        risk["slot_upgrade"] = upgrade
-        if upgrade.get("eligible"):
-            borrowed = _apply_slot_borrow(
-                conn, account["id"], upgrade, asof_day, cycle_id=current_cycle["id"],
-            )
-            risk["slot_borrow"] = borrowed
-            if borrowed.get("allowed"):
-                # Re-read the *same* allocation version after the atomic transfer so
-                # sizing / audit use the borrowed seat at once. "Same" needs the borrow's
-                # provenance too (cycle + as-of), else a re-resolved row drops the seat.
-                count_budget = _dynamic_position_limits(
-                    conn, cycle_id=current_cycle["id"], asof_day=asof_day)
-                position_limit = max(1, int(count_budget["limits"].get(account["id"], position_limit)))
-                strategy_count_blocked = len(committed_open_codes) >= position_limit
-                risk["position_count_gate"]["limit"] = position_limit
-                risk["position_count_gate"]["allocation_version"] = count_budget["allocation_version"]
-                if strategy_count_blocked:
-                    reasons.append(
-                        f"策略持仓及待成交席位已达动态上限 {len(committed_open_codes)}/{position_limit}；"
-                        "借位后仍无可用席位"
-                    )
-            else:
-                reasons.append(
-                    f"策略持仓及待成交席位已达动态上限 {len(committed_open_codes)}/{position_limit}；"
-                    f"{upgrade['reason']}；{borrowed.get('reason')}"
-                )
-        else:
-            reasons.append(
-                f"策略持仓及待成交席位已达动态上限 {len(committed_open_codes)}/{position_limit}；"
-                f"{upgrade['reason']}"
-            )
     if pool_count_blocked:
         reasons.append(
-            f"总持仓及待成交席位已达共享硬上限 {len(pool_open_positions)}/{count_budget['pool_limit']}"
+            f"总持仓及待成交席位已达共享硬上限 {len(pool_open_positions)}/{pool_limit}"
         )
     elif mf_seat_reserved:
         reasons.append(
             "共享池仅剩最后 1 席：为主力策略独立席位预留，"
             "待主力建仓或池内席位释放后恢复其他策略买入"
         )
-    strategy_budget = _strategy_pool_budget(
-        conn, account, nav, positions, all_quotes, market=market,
-        cycle_id=current_cycle["id"], asof_day=asof_day,
-    )
+    capital_plan = exact_plan["capital_plan"]
+    capacity_plan = exact_plan["capacity_plan"]
+    account_key = str(account["id"])
+    current_amount = float(capital_plan["market_value_by_account"][account_key])
+    pending_strategy_amount = float(capital_plan["pending_by_account"][account_key])
+    allowance_amount = float(capital_plan["allowance_by_strategy"][account_key])
+    total_current_amount = sum(float(value) for value in
+                               capital_plan["market_value_by_account"].values())
+    total_pending_amount = float(capacity_plan["pending_amount"])
+    total_allowance_amount = sum(float(value) for value in
+                                 capital_plan["allowance_by_strategy"].values())
+    strategy_budget = {
+        "authority": "exact_portfolio_allocation_plan",
+        "current_amount": current_amount,
+        "pending_reserve_amount": pending_strategy_amount,
+        "pending_pool_reserve_amount": total_pending_amount,
+        "allowance_amount": allowance_amount,
+        "absolute_cap_amount": current_amount + pending_strategy_amount + allowance_amount,
+        "pool_cap_amount": total_current_amount + total_pending_amount + total_allowance_amount,
+        "target_pct": round(allowance_amount / max(float(capital_plan["nav"]), 1.0) * 100, 2),
+        "base_target_pct": None, "floor_pct": None,
+        "current_pct": round(current_amount / max(float(capital_plan["nav"]), 1.0) * 100, 2),
+        "market_scale_pct": None, "market_scale_applied": False,
+        "redistribution_amount": 0.0,
+    }
     risk["strategy_budget"] = strategy_budget
     risk_state = _shared_risk_state(conn, account, nav, asof_day)
     risk["account_risk"] = risk_state
@@ -9647,11 +9604,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 组合口径（PR：cross-strategy exposure）：单票占用必须包含**所有策略**
     # 的在途买单，否则两个策略同时买入同一标的会各自只看到已成交部分，
     # 合计击穿单票上限。排除当前信号自身，避免重试单压低自己。
-    pending_by_symbol = PCO.pending_symbol_amounts(
-        conn, exclude_signal_id=signal.get("id"),
-    )
-    pending_same_symbol = pending_by_symbol.get(code, 0.0)
-    code_value += pending_same_symbol
     industry_value = industries.get(signal.get("industry") or "未知", 0.0)
     fill_price = EP.estimated_fill_price(price, "buy")
     if signal_close > 0 and lim > 0:
@@ -9660,27 +9612,30 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 涨停价的成交——现实中该价位根本买不到。
         upper_limit = signal_close * (1 + lim / 100)
         fill_price = min(fill_price, round(upper_limit, 2))
-    # PR-26：资金部署入口。候选价格已知后由 PA.allocation_plan() 决定本策略
-    # 本轮可部署的手数与金额——生命周期阶段（shadow/pilot/quarantined）在
-    # 这里真正生效：试点只拿 25%，隔离/影子不部署，缩放后不足一手则整笔
-    # 预算进 waiting_capital，候选转等待池而不是碎片成交。
-    deployment = None
-    try:
-        plan = _allocation_plan(
-            conn, nav=nav, positions=positions, quotes=all_quotes, market=market,
-            prices_by_strategy={account.get("id"): fill_price} if fill_price > 0 else None,
-            account=account,
-            cycle_id=current_cycle["id"], asof_day=asof_day,
-        )
-        deployment = (plan.get("rows_by_strategy") or {}).get(account.get("id"))
-    except Exception:
-        deployment = None
-    if deployment is not None:
-        risk["capital_deployment"] = deployment
-    # The strategy budget has already applied the current market light to its
-    # remaining amount.  Only independent model/chase/news adjustments belong
-    # here; _entry_execution_scale restores a market multiplier only for
-    # callers that did not receive a market-scaled strategy budget.
+    # The allocation plan already applies the pinned lifecycle scale. Here the
+    # execution path only converts its exact dollar ceiling into a whole-lot cap.
+    stage = capital_plan["lifecycle_stage_by_strategy"][account_key]
+    capital_scale = float(capital_plan["capital_scale_by_strategy"][account_key])
+    raw_allowance = float(capital_plan["raw_allowance_by_strategy"][account_key])
+    deployable_allowance = allowance_amount
+    deployment_lots = (
+        int(deployable_allowance / (LOT_SIZE * fill_price))
+        if fill_price > 0 else 0
+    )
+    deployment = {
+        "lifecycle_stage": stage, "capital_scale": capital_scale,
+        "raw_allowance_amount": raw_allowance,
+        "deployable_amount": deployable_allowance,
+        "waiting_capital": max(0.0, raw_allowance - deployable_allowance),
+        "lots": deployment_lots,
+        "allowed": deployment_lots > 0,
+        "blocked_reason": (None if deployment_lots > 0 else
+                           "精确 capital allowance 不足一手"),
+    }
+    risk["capital_deployment"] = deployment
+    # The exact allocation plan has already applied the market light to its
+    # remaining allowance. Only independent model/chase/news adjustments belong
+    # here; market scaling must not be applied twice.
     risk_scale = _entry_execution_scale(
         market_policy, entry_model, chase_entry, dynamic_news, strategy_budget,
     )
@@ -9856,51 +9811,23 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 新买入不能绕过聚合上限（也不能"略微超限"成交）。
     symbol_aggregate_cap_pct = _num(RSET.get(conn, "symbol_aggregate_cap_pct", 0.0))
     if symbol_aggregate_cap_pct > 0:
-        aggregate = PCO.aggregate_exposure(
-            positions, all_quotes or {}, pending_by_symbol=pending_by_symbol,
-        )
-        symbol_check = PCO.symbol_headroom(
-            code, aggregate, cap_amount=nav * symbol_aggregate_cap_pct / 100.0,
-        )
-        risk["symbol_aggregate_check"] = symbol_check
-        if not symbol_check["allowed"]:
-            reasons.append(str(symbol_check["reason"]))
-        else:
-            headroom = _num(symbol_check["headroom_amount"])
-            headroom_qty = (
-                int(headroom / fill_price // LOT_SIZE) * LOT_SIZE
-                if fill_price > 0 and headroom > 0 else 0
-            )
-            if headroom_qty < qty:
-                qty = max(0, headroom_qty)
-                sizing["symbol_headroom_clamped_qty"] = qty
-    # PR-30 主题（theme）聚合统一检查（可选）：0 = 关闭。与 symbol 聚合同一
-    # 套协调器口径（PCO.aggregate_exposure / theme_for），主题敞口 = 组内
-    # 各行业持仓 + 在途合计，新买入同样不允许"略微超限"成交。
+        risk["symbol_aggregate_check"] = {
+            "status": "UNAVAILABLE",
+            "reason": "strict symbol exposure authority is not available",
+        }
+        reasons.append(
+            "symbol aggregate cap 已配置，但 strict 风险敞口 owner 不可用；延期新开仓")
+    # Theme classification is a Risk policy mapping. Until its strict owner is
+    # available, a configured aggregate cap blocks new entries instead of
+    # consuming the legacy cost-as-market coordinator result.
     theme_aggregate_cap_pct = _num(RSET.get(conn, "theme_aggregate_cap_pct", 0.0))
     if theme_aggregate_cap_pct > 0:
-        aggregate = PCO.aggregate_exposure(
-            positions, all_quotes or {}, pending_by_symbol=pending_by_symbol,
-        )
-        theme = PCO.theme_for(signal.get("industry"))
-        theme_value = (aggregate.get("by_theme") or {}).get(theme, 0.0)
-        theme_cap_amount = nav * theme_aggregate_cap_pct / 100.0
-        proposed = qty * fill_price
         risk["theme_aggregate_check"] = {
-            "theme": theme, "current_amount": round(theme_value, 2),
-            "proposed_amount": round(proposed, 2),
-            "cap_amount": round(theme_cap_amount, 2),
+            "status": "UNAVAILABLE",
+            "reason": "strict theme risk policy owner is not available",
         }
-        if theme_value + proposed > theme_cap_amount:
-            headroom_amount = max(0.0, theme_cap_amount - theme_value)
-            headroom_qty = (
-                int(headroom_amount / fill_price // LOT_SIZE) * LOT_SIZE
-                if fill_price > 0 and headroom_amount > 0 else 0
-            )
-            if headroom_qty < qty:
-                qty = max(0, headroom_qty)
-                sizing["theme_headroom_clamped_qty"] = qty
-                risk["theme_aggregate_check"]["clamped"] = True
+        reasons.append(
+            "theme aggregate cap 已配置，但 strict 风险策略 owner 不可用；延期新开仓")
     # PR-26：最终数量不得超过正式部署计划给出的可部署手数（生命周期缩放
     # 后的整手规模）。权重再高，试点策略也只能部署它那一份缩水预算。
     if deployment is not None:
@@ -10059,6 +9986,57 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     dispatch_blocked = bool(dispatch_plan.get("blocked"))
     if dispatch_blocked:
         reasons.append(str(dispatch_plan["blocked_reason"]))
+    # Re-read the exact same decision instant immediately before dispatch. A
+    # changed reservation, valuation, participant pin, or cycle invalidates this
+    # attempt; it never selects a newer plan implicitly.
+    try:
+        decision_instant = dt.datetime.fromisoformat(
+            str(exact_plan["decision_at"]).replace("Z", "+00:00"))
+        revalidation_reading = MDSvc.read_snapshot(
+            MDC.LIVE_MARKET_POLICY, now=decision_instant,
+            asof_day=exact_plan["asof_day"])
+        revalidated_snapshot = PRS.capture_portfolio_runtime_snapshot(
+            conn, cycle_id=exact_plan["cycle_id"],
+            asof_day=exact_plan["asof_day"],
+            decision_at=exact_plan["decision_at"],
+            builtin_scope=ACTIVE_ACCOUNT_IDS,
+            market_evidence_identity=(
+                MDC.snapshot_fingerprint(revalidation_reading.snapshot)
+                if revalidation_reading.snapshot is not None else None),
+            market_reading=revalidation_reading)
+        revalidation_matches = (
+            revalidated_snapshot["snapshot_id"]
+            == exact_plan["portfolio_snapshot_id"]
+            and revalidated_snapshot["snapshot_fingerprint"]
+            == exact_plan["portfolio_snapshot_fingerprint"]
+        )
+    except Exception as exc:
+        revalidation_matches = False
+        risk["allocation_revalidation_error"] = type(exc).__name__
+    if not revalidation_matches:
+        reasons.append("allocation snapshot 在执行前发生变化或无法复核；本次延期")
+        capacity_deferred = True
+        risk["allocation_revalidation"] = "UNAVAILABLE_OR_STALE"
+    else:
+        current_positions = _position_rows(conn, asof_day=asof_day)
+        current_pending_slots = _pending_position_slots(
+            conn, current_positions, cycle_id=current_cycle["id"])
+        current_pairs = {
+            (str(item.get("account_id")), str(item.get("code")))
+            for item in current_positions
+            if int(_num(item.get("qty"))) >= LOT_SIZE
+        } | current_pending_slots
+        own_pairs = {pair for pair in current_pairs
+                     if pair[0] == str(account["id"])}
+        candidate_pair = (str(account["id"]), str(code))
+        adds_slot = candidate_pair not in current_pairs
+        if adds_slot and (len(own_pairs) >= position_limit
+                          or len(current_pairs) >= pool_limit):
+            reasons.append("exact plan slot limit 在执行前已被占用；本次延期")
+            capacity_deferred = True
+            risk["allocation_revalidation"] = "SLOT_LIMIT_REACHED"
+        else:
+            risk["allocation_revalidation"] = "EXACT_SNAPSHOT_AND_SLOT_LIMIT_VALID"
     # A Q3 sample is worth recording only if every ordinary execution/risk
     # gate also passed.  It must never turn stale quotes, a hard veto or an
     # undersized order into a seemingly valid research observation.
@@ -10135,8 +10113,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         """INSERT INTO paper_orders(
            account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
            fees,status,reason,risk_payload,created_at,executed_at,expires_at,
-           strategy_id,strategy_version,strategy_checksum,retry_of_order_id,cycle_id)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           strategy_id,strategy_version,strategy_checksum,retry_of_order_id,cycle_id,
+           allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
+           allocation_plan_fingerprint,allocation_policy_version)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
          entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
          entry_limit["order_type"],
@@ -10144,7 +10124,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
          None, None, order_status, reason,
          _json(risk), _now(), None, dispatch_plan["expires_at"],
          strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
-         _order_cycle_id(conn, current_cycle["id"])),
+          _order_cycle_id(conn, current_cycle["id"]), allocation_intent_kind,
+          exact_plan["portfolio_snapshot_id"], exact_plan["plan_id"],
+          exact_plan["plan_fingerprint"], exact_plan["allocation_policy_version"]),
     )
     # A frozen order is a waitlist marker, not a second live order.  Once the
     # data gate reopens and this candidate receives a fresh decision, retire
@@ -10719,159 +10701,8 @@ def _best_replacement_candidate(conn, account_id, day, held_codes):
     )
 
 
-def _slot_upgrade_context(conn, account_id, signal, positions, asof_day, *, cycle_id):
-    """Explain whether a full strategy slot can be upgraded by a candidate.
-
-    This is deliberately an explanation/queue helper, not a way around T+1
-    or the shared hard cap.  The actual sell still happens only in
-    ``monitor_risk`` after a fresh exit quote, lot availability and the same
-    score comparison have been checked.
-
-    R18：
-
-    * ``cycle_id`` 是 **keyword-only 且必填** —— 调用方（``_buy_order``）已经证明过
-      "当前周期是谁、账户挂在哪"，本 helper 不得再问一次 ``_active_cycle()``
-      （那正是 §10/§14 的 defect B：一次在途下单的席位比较去读了另一个周期）。
-    * 历史 review 经 :func:`paper_replacement_evidence.latest_position_review` 读取，
-      带 ``review_date <= asof_day`` 上界（defect C：``asof=D`` 不得读到 ``D+1``）；
-      比较与状态机在 :mod:`paper_replacement_decision`（纯域模块）。
-    """
-    resolved_cycle_id = int(cycle_id)
-    # 席位预算同样取自显式周期（否则 reviews/持仓数看 cycle 8，target_limit/donors
-    # 看 active cycle 9），且避免拿 active 的 allocation_version 查别的周期的版本行。
-    count_budget = _dynamic_position_limits(
-        conn, cycle_id=resolved_cycle_id, asof_day=asof_day,
-    )
-    counts = {
-        key: sum(
-            1 for item in positions
-            if item.get("account_id") == key and int(_num(item.get("qty"))) >= LOT_SIZE
-        )
-        for key in count_budget.get("limits", {})
-    }
-    target_limit = int(_num(count_budget.get("limits", {}).get(account_id), 0))
-    pool_limit = int(_num(count_budget.get("pool_limit"), SHARED_POOL_MAX_POSITIONS))
-    # R18：in-flight pending 席位同样固定到显式周期，否则更新的 active cycle 的在途
-    # 买单会占掉被请求周期的席位，直接改变 donor / borrow / upgrade 状态。
-    pending_slots = _pending_position_slots(conn, positions, cycle_id=resolved_cycle_id)
-    occupied_pool = {
-        (str(item.get("account_id")), str(item.get("code")))
-        for item in positions if int(_num(item.get("qty"))) >= LOT_SIZE
-    } | pending_slots
-    # donor 判定（含"共享池还有未分配席位就直接出借"）在纯域模块里。
-    donors = PRep.derive_donors(
-        limits=count_budget.get("limits", {}), counts=counts, account_id=account_id,
-        pool_limit=pool_limit, occupied_pool_count=len(occupied_pool),
-        policy=REPLACEMENT_POLICY,
-    )
-    candidate_score = PRep.score_candidate(signal)
-    held = [
-        item for item in positions
-        if item.get("account_id") == account_id and int(_num(item.get("qty"))) >= LOT_SIZE
-    ]
-    weakest = None
-    for position in held:
-        # R18：历史 review 必须**同时**受显式 cycle_id 与 review_date<=asof_day 约束。
-        # 旧查询只按 ORDER BY id DESC LIMIT 1，于是 asof=D 会读到 D+1 的 review
-        # （future leakage），并且用 active cycle 而非已认领周期。
-        review = PREPL.latest_position_review(
-            conn, cycle_id=resolved_cycle_id, account_id=account_id,
-            code=str(position.get("code") or ""), asof_day=_date(asof_day).isoformat(),
-        )
-        score = _num(review["score"], 100.0) if review else 100.0
-        item = {
-            "code": str(position.get("code") or ""),
-            "name": position.get("name") or position.get("code"),
-            "score": score,
-            "hold_days": _hold_days(position, asof_day),
-            "available_qty": int(_num(position.get("available_qty"))),
-            "review_action": review["action"] if review else None,
-        }
-        if weakest is None or item["score"] < weakest["score"]:
-            weakest = item
-    return PRep.decide_slot_upgrade(
-        candidate_score=candidate_score, weakest=weakest, target_limit=target_limit,
-        donors=donors, at_dynamic_limit=len(held) >= target_limit,
-        min_hold_days=_replacement_min_hold_days(account_id),
-        policy=REPLACEMENT_POLICY,
-    )
 
 
-def _apply_slot_borrow(conn, account_id, upgrade, asof_day, *, cycle_id):
-    """Atomically transfer one unused strategy slot to a strong candidate.
-
-    R18：``cycle_id`` 是 **keyword-only 且必填**。借位必须与产生该 ``upgrade`` 的
-    那一次下单尝试处在**同一个周期**上；席位版本行
-    （``paper_position_limit_versions``）也只用这个显式周期定位与写入。
-    """
-    if not upgrade or not upgrade.get("borrow_ready") or not upgrade.get("donors"):
-        return {"allowed": False, "reason": "未达到动态借位条件"}
-    resolved_cycle_id = int(cycle_id)
-    budget = _dynamic_position_limits(
-        conn, cycle_id=resolved_cycle_id, asof_day=asof_day,
-    )
-    limits = {key: int(_num(value)) for key, value in (budget.get("limits") or {}).items()}
-    donor = next(
-        (item for item in upgrade["donors"]
-         if item.get("account_id") == "shared_pool"
-         or limits.get(item.get("account_id"), 0) == int(_num(item.get("limit")))),
-        None,
-    )
-    account_slot_cap = ALLOCATION_SLOT_CAPS.get(account_id, STRATEGY_MAX_POSITIONS)
-    if donor is None or limits.get(account_id, 0) >= account_slot_cap:
-        return {"allowed": False, "reason": "借位名额已被其他并发下单占用"}
-    donor_id = donor["account_id"]
-    shared_pool_donor = donor_id == "shared_pool"
-    before = dict(limits)
-    if shared_pool_donor:
-        limits[account_id] += 1
-    else:
-        donor_count = sum(
-            1 for item in PPRM.positions_for_cycle(conn, resolved_cycle_id)
-            if item.get("account_id") == donor_id and int(_num(item.get("qty"))) >= LOT_SIZE
-        )
-        if limits[donor_id] - 1 < max(STRATEGY_MIN_POSITIONS, donor_count):
-            return {"allowed": False, "reason": "出让策略已达到最小保留席位"}
-        limits[donor_id] -= 1
-        limits[account_id] += 1
-    # The schema stores the numeric row id as the allocation version; locate that
-    # row by the token returned from _dynamic_position_limits, scoped to the
-    # explicit cycle so a rollover cannot resolve the same token elsewhere.
-    row = conn.execute(
-        "SELECT id,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-        (PRep.allocation_version_id(budget.get("allocation_version", "slots-v0")),
-         resolved_cycle_id),
-    ).fetchone()
-    if row is None:
-        return {"allowed": False, "reason": "未找到当前席位版本，暂不借位"}
-    inputs = _loads(row["inputs"], {})
-    event = {
-        "at": _now(), "account_id": account_id, "from": donor_id,
-        "candidate_score": round(_num(upgrade.get("borrow_candidate_score")), 2),
-        "limits_before": before, "limits_after": limits,
-    }
-    if shared_pool_donor:
-        event["pool_free_before"] = int(_num(donor.get("unused_pool_slots")))
-    history = list(inputs.get("slot_borrow_events") or [])[-9:]
-    history.append(event)
-    inputs["slot_borrow_events"] = history
-    inputs["last_slot_borrow"] = event
-    conn.execute(
-        "UPDATE paper_position_limit_versions SET limits=?,inputs=?,source=?,effective_at=? WHERE id=?",
-        (_json(limits), _json(inputs),
-         "versioned_runtime_active_risk_budget"
-         + ("+pool_slot_borrow" if shared_pool_donor else "+slot_borrow"),
-         _now(), row["id"]),
-    )
-    return {
-        "allowed": True, "from_account": donor_id, "to_account": account_id,
-        "limits_before": before, "limits_after": limits,
-        "allocation_version": budget.get("allocation_version"),
-        "reason": (
-            "从共享池未使用动态席位借用1个席位" if shared_pool_donor
-            else f"高分候选从 {donor_id} 借用1个未使用席位"
-        ),
-    }
 
 
 def _rollback_slot_borrow(conn, borrow, *, cycle_id):
@@ -11630,6 +11461,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     }
                     intent_payload, intent_violation = _order_intent_payload(
                         account["id"], pick, asof_day=day,
+                    intent_kind="NEW_ENTRY",
                         intended_session=day,
                     )
                     if intent_payload is not None:
@@ -11858,7 +11690,8 @@ def run_auction_preselection(asof_date=None, force=False):
     return result
 
 
-def _existing_position_addition_gate(conn, account, code, asof_day, quote=None):
+def _existing_position_addition_gate(conn, account, code, asof_day, quote=None,
+                                    slot_plan=None):
     """Only reinforce high-quality holdings while the count budget is healthy."""
     positions = _position_rows(conn, asof_day=asof_day)
     position = next(
@@ -11871,17 +11704,21 @@ def _existing_position_addition_gate(conn, account, code, asof_day, quote=None):
     )
     if not scope["allowed"]:
         return False, f"{scope['reason']}，存量持仓只允许卖出，不允许加仓或做T回补"
-    count_budget = _dynamic_position_limits(conn)
+    if (not isinstance(slot_plan, dict)
+            or slot_plan.get("status") != PAPolicy.PLANNED
+            or str(account["id"]) not in slot_plan.get("limits", {})):
+        return False, "exact allocation slot plan 不可用，禁止加仓"
     strategy_count = sum(
         1 for item in positions
         if item.get("account_id") == account["id"] and int(_num(item.get("qty"))) >= LOT_SIZE
     )
     pool_count = sum(1 for item in positions if int(_num(item.get("qty"))) >= LOT_SIZE)
-    strategy_limit = int(count_budget["limits"].get(account["id"], 5))
+    strategy_limit = int(slot_plan["limits"][str(account["id"])])
     if strategy_count > strategy_limit:
         return False, f"策略持仓 {strategy_count}/{strategy_limit} 超出动态上限，先完成压缩或换仓"
-    if pool_count > count_budget["pool_limit"]:
-        return False, f"总持仓 {pool_count}/{count_budget['pool_limit']} 超限，暂停追加仓位"
+    pool_limit = int(slot_plan["total_cap"])
+    if pool_count > pool_limit:
+        return False, f"总持仓 {pool_count}/{pool_limit} 超限，暂停追加仓位"
     cycle = _active_cycle(conn)
     review = conn.execute(
         """SELECT score,action FROM paper_position_reviews
@@ -11900,7 +11737,7 @@ def _existing_position_addition_gate(conn, account, code, asof_day, quote=None):
         "downside_warning", "downside_pending_quote", "downside_partial", "downside_full",
     }:
         return False, "该持仓已进入下跌预警/压缩/退出队列，不允许反向加仓"
-    return True, "动态席位正常，持仓质量允许进入策略专属加仓复核"
+    return True, "exact allocation slot plan 正常，持仓质量允许进入策略专属加仓复核"
 
 
 def _opening_event_assessment(conn, account, position, quote, asof_day, cycle):
@@ -12187,7 +12024,8 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     intent, contract_reason = _enforce_order_intent(
         conn, account, position["code"],
         {"pick": {"code": position["code"], "price": _num(quote.get("price")),
-                  "reason": "日内回补（同日高抛库存）"}},
+                  "reason": "日内回补（同日高抛库存）"},
+         "order_intent": {"intent_kind": "ADD_POSITION"}},
     )
     if contract_reason is not None:
         return None, contract_reason.get("reason")
@@ -12201,8 +12039,22 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     sold = _intraday_action_today(conn, cycle["id"], account["id"], position["code"], "t_sell", asof_day)
     if not sold or _intraday_action_today(conn, cycle["id"], account["id"], position["code"], "t_rebuy", asof_day):
         return None, "无待回补的日内卖出"
+    decision_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        entry_allocation = _build_portfolio_entry_plan(
+            conn, cycle_id=cycle["id"], asof_day=_date(asof_day).isoformat(),
+            decision_at=decision_at, account_id=account["id"],
+            symbol=position["code"], intent_kind="ADD_POSITION")
+    except (PAPolicy.PortfolioAllocationPolicyError,
+            PRuntime.PortfolioRuntimeError,
+            PAW.AllocationWeightEvidenceUnavailable) as exc:
+        return None, f"精确组合分配证据不可用：{exc}；日内回补已延期"
+    if entry_allocation["candidate_blocked"]:
+        return None, "精确 allocation plan 未批准日内回补；本次已延期"
+    exact_plan = entry_allocation["plan"]
     addition_allowed, addition_reason = _existing_position_addition_gate(
         conn, account, position["code"], asof_day, quote=quote,
+        slot_plan=exact_plan["slot_plan"],
     )
     if not addition_allowed:
         return None, addition_reason
@@ -12223,19 +12075,19 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     shared_positions = _position_rows(conn, asof_day=asof_day)
     # The caller has already fetched the complete same-round quote snapshot
     # before taking the ledger write lock.  Never call a provider from here.
-    quotes = dict(all_quotes or {})
-    _, value, nav, industries, code_values = _shared_account_exposure(conn, quotes, asof_day)
-    shared_cash = _shared_cash(conn)
-    strategy_budget = _strategy_pool_budget(
-        conn, account, nav, shared_positions, quotes, market=market,
-        cycle_id=cycle["id"], asof_day=asof_day,
-    )
+    sizing_facts = _entry_plan_sizing_facts(entry_allocation, account["id"],
+                                            shared_positions)
+    nav = sizing_facts["nav"]
+    value = sizing_facts["position_value"]
+    shared_cash = sizing_facts["shared_cash"]
+    strategy_budget = sizing_facts["strategy_budget"]
     shared_risk = _shared_risk_state(conn, account, nav, asof_day)
     if shared_risk["blocked"]:
         return None, "；".join(shared_risk["reasons"])
-    code_value = code_values.get(position["code"], 0.0)
+    code_value = sizing_facts["code_values"].get(position["code"], 0.0)
     qty, sizing = _price_aware_qty(
-        nav, shared_cash, value, industries.get(position.get("industry") or "未知", 0.0),
+        nav, shared_cash, value,
+        sizing_facts["industry_values"].get(position.get("industry") or "未知", 0.0),
         code_value, EP.estimated_fill_price(price, "buy"),
         SRE.effective_spec(conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {})["hard_stop"],
         profile,
@@ -12287,6 +12139,10 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
               "sell_price": sold_price, "buy_price": round(fill, 4), "quote_at": quote.get("quote_at"),
               "opening_event": bool(payload.get("opening_event")), "confirmation": confirmation,
               "sizing": sizing}
+    detail["allocation_provenance"] = _entry_allocation_provenance(
+        entry_allocation, "ADD_POSITION")
+    if not _revalidate_portfolio_entry_plan(conn, entry_allocation):
+        return None, "allocation snapshot 在日内回补执行前发生变化或无法复核；本次延期"
     detail = _with_decision_snapshot(
         detail, account_id=account["id"], code=position["code"], side="buy",
         decision=("opening_event_rebuy" if payload.get("opening_event") else "intraday_t_rebuy"),
@@ -12321,18 +12177,29 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     intent, contract_reason = _enforce_order_intent(
         conn, account, position["code"],
         {"pick": {"code": position["code"], "price": _num(quote.get("price")),
-                  "reason": "波段确认加仓"}},
+                  "reason": "波段确认加仓"},
+         "order_intent": {"intent_kind": "ADD_POSITION"}},
     )
     if contract_reason is not None:
         return None, contract_reason.get("reason")
     if account.get("mode") == "intraday_t":
         return None, "日内做T使用专用高抛回补规则"
-    # 意图优先级（PR：intent coordinator）：P5 加仓必须让位于 P0 风控退出。
-    # 同一标的有在途卖出意图时，先让风控退出完成，绝不同时既买又卖。
-    if position["code"] in PCO.pending_risk_exit_codes(conn):
-        return None, "P0 风控退出在途，P5 确认加仓让位（intent priority）"
+    decision_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        entry_allocation = _build_portfolio_entry_plan(
+            conn, cycle_id=cycle["id"], asof_day=_date(asof_day).isoformat(),
+            decision_at=decision_at, account_id=account["id"],
+            symbol=position["code"], intent_kind="ADD_POSITION")
+    except (PAPolicy.PortfolioAllocationPolicyError,
+            PRuntime.PortfolioRuntimeError,
+            PAW.AllocationWeightEvidenceUnavailable) as exc:
+        return None, f"精确组合分配证据不可用：{exc}；波段加仓已延期"
+    if entry_allocation["candidate_blocked"]:
+        return None, "精确 allocation plan 未批准波段加仓（含在途退出/未知订单冲突）；本次已延期"
+    exact_plan = entry_allocation["plan"]
     addition_allowed, addition_reason = _existing_position_addition_gate(
         conn, account, position["code"], asof_day, quote=quote,
+        slot_plan=exact_plan["slot_plan"],
     )
     if not addition_allowed:
         return None, addition_reason
@@ -12387,24 +12254,21 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     positions = _position_rows(conn, asof_day=asof_day)
     # Reuse the pre-fetched quote map; provider/disk I/O is forbidden while
     # the strategy/stock ledger transaction is open.
-    quotes = dict(all_quotes or {})
-    _, position_value, nav, industries, code_values = _shared_account_exposure(conn, quotes, asof_day)
-    shared_cash = _shared_cash(conn)
-    strategy_budget = _strategy_pool_budget(
-        conn, account, nav, positions, quotes, market=market,
-        cycle_id=cycle["id"], asof_day=asof_day,
-    )
+    sizing_facts = _entry_plan_sizing_facts(entry_allocation, account["id"], positions)
+    nav = sizing_facts["nav"]
+    position_value = sizing_facts["position_value"]
+    shared_cash = sizing_facts["shared_cash"]
+    strategy_budget = sizing_facts["strategy_budget"]
     risk_state = _shared_risk_state(conn, account, nav, asof_day)
     if risk_state["blocked"]:
         return None, "；".join(risk_state["reasons"])
     # 加仓同样按组合口径计入所有策略的在途买单（同 symbol 聚合上限不被绕过）。
-    code_value = code_values.get(position["code"], 0.0) + PCO.pending_symbol_amounts(
-        conn, exclude_signal_id=None,
-    ).get(position["code"], 0.0)
+    code_value = sizing_facts["code_values"].get(position["code"], 0.0)
     fill = EP.estimated_fill_price(price, "buy")
     qty, sizing = _price_aware_qty(
         nav, shared_cash, position_value,
-        industries.get(position.get("industry") or "未知", 0.0), code_value, fill,
+        sizing_facts["industry_values"].get(position.get("industry") or "未知", 0.0),
+        code_value, fill,
         _pyr_spec["hard_stop"], profile,
         exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
@@ -12419,18 +12283,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     # 组合级单票上限同样约束确认加仓（P5）：占满即拒绝，有余量则钳制本次片。
     symbol_cap_pct = _num(RSET.get(conn, "symbol_aggregate_cap_pct", 0.0))
     if symbol_cap_pct > 0:
-        aggregate = PCO.aggregate_exposure(
-            positions, quotes, pending_by_symbol=PCO.pending_symbol_amounts(conn),
-        )
-        symbol_check = PCO.symbol_headroom(
-            position["code"], aggregate, cap_amount=nav * symbol_cap_pct / 100.0,
-        )
-        sizing["symbol_aggregate_check"] = symbol_check
-        if not symbol_check["allowed"]:
-            return None, str(symbol_check["reason"])
-        headroom = _num(symbol_check["headroom_amount"])
-        headroom_qty = int(headroom / fill // LOT_SIZE) * LOT_SIZE if fill > 0 and headroom > 0 else 0
-        qty = min(qty, headroom_qty)
+        return None, "symbol aggregate cap 缺少 strict 风险敞口 owner，禁止波段加仓"
     # 趋势策略只补齐首笔观察仓：上限为现有可识别持仓规模，不能因一次
     # 确认把单票直接推到整个账户的最大额度。板块策略仍按其独立小仓确认。
     if account_id == "trend_pullback":
@@ -12472,6 +12325,10 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         "kind": "swing_scale_in", "label": label, "qty": qty, "price": round(fill, 4),
         "pct": pct, "cost": cost, "quote_at": quote.get("quote_at"), "sizing": sizing,
     }
+    detail["allocation_provenance"] = _entry_allocation_provenance(
+        entry_allocation, "ADD_POSITION")
+    if not _revalidate_portfolio_entry_plan(conn, entry_allocation):
+        return None, "allocation snapshot 在波段加仓执行前发生变化或无法复核；本次延期"
     detail = _with_decision_snapshot(
         detail, account_id=account_id, code=position["code"], side="buy",
         decision="swing_scale_in", reason=label, asof_date=asof_day,

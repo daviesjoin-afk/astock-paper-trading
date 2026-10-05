@@ -597,7 +597,7 @@ class MarketDataReadPathTests(unittest.TestCase):
                 payload = PT.strategy_allocation_explain()
         self.assertEqual([], guard.attempts,
                          "allocation-explain 的行情读取访问了 provider")
-        self.assertEqual(MDC.STATUS_STALE, payload["market_data"]["status"])
+        self.assertEqual(MDC.STATUS_UNAVAILABLE, payload["market_data"]["status"])
         self.assertEqual(5, len(payload["strategies"]),
                          "只读投影迁移后策略行数发生变化")
 
@@ -939,9 +939,9 @@ class MarketDataArchitectureGuardTests(unittest.TestCase):
             "fetch_market_snapshot_full", names,
             "strategy_allocation_explain 又直接调用了 provider（R23 债回流）",
         )
-        self.assertIn(
+        self.assertNotIn(
             "read_snapshot", names,
-            "allocation-explain 不再消费 Market Data Authority",
+            "allocation-explain without an explicit plan must not fetch market evidence",
         )
 
     def test_MDG05_frontend_does_not_recompute_freshness(self):
@@ -1058,7 +1058,6 @@ class MarketDataArchitectureGuardTests(unittest.TestCase):
     def test_MDG07_read_only_consumers_use_the_authority_not_the_provider(self):
         """已迁移的只读消费者必须走 authority，而不是回退到 provider。"""
         targets = (
-            ("paper_trading.py", "strategy_allocation_explain", "read_snapshot"),
             ("paper_trading.py", "_market_state", "refresh_rows"),
             ("main.py", "hot", "read_snapshot"),
             ("main.py", "health", "market_health_projection"),

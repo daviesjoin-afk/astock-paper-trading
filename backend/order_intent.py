@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import portfolio_allocation_policy as PAP
+
 __all__ = [
     "ORDER_INTENT_FIELDS",
     "OrderIntent",
@@ -31,7 +33,7 @@ __all__ = [
 
 # 契约字段：策略能表达的“意图”边界。
 ORDER_INTENT_FIELDS = (
-    "symbol", "side", "strength", "urgency",
+    "symbol", "side", "intent_kind", "strength", "urgency",
     "data_asof", "expires_at", "stop_reference", "reason",
 )
 
@@ -138,6 +140,7 @@ class OrderIntent:
     expires_at: str
     stop_reference: str
     reason: str
+    intent_kind: str | None = None
     strategy_id: str = ""
     context: Mapping[str, Any] = field(default_factory=dict)
 
@@ -146,6 +149,13 @@ class OrderIntent:
             raise OrderIntentContractError("OrderIntent.symbol 不能为空")
         if self.side not in _SIDES:
             raise OrderIntentContractError(f"OrderIntent.side 非法: {self.side!r}")
+        if self.intent_kind is not None:
+            if self.intent_kind not in PAP.INTENT_KINDS:
+                raise OrderIntentContractError("OrderIntent.intent_kind 非法")
+            allowed = (PAP.ENTRY_INTENT_KINDS if self.side == "buy"
+                       else PAP.EXIT_INTENT_KINDS)
+            if self.intent_kind not in allowed:
+                raise OrderIntentContractError("OrderIntent.intent_kind_side_mismatch")
         try:
             strength = float(self.strength)
         except (TypeError, ValueError):
@@ -203,6 +213,8 @@ def intent_to_legacy_fields(intent: OrderIntent) -> dict[str, Any]:
     legacy["side"] = intent.side
     legacy["urgency"] = intent.urgency
     legacy["reason"] = intent.reason
+    if intent.intent_kind is not None:
+        legacy["intent_kind"] = intent.intent_kind
     return legacy
 
 
@@ -212,6 +224,7 @@ def order_intent_from_signal(
     *,
     now: dt.datetime | None = None,
     intended_session: dt.date | None = None,
+    intent_kind: str | None = None,
 ) -> OrderIntent:
     """把五套策略现有 pick/signal 负载适配为 OrderIntent（兼容 adapter）。
 
@@ -289,6 +302,7 @@ def order_intent_from_signal(
     return OrderIntent(
         symbol=symbol,
         side=side,
+        intent_kind=intent_kind,
         strength=strength,
         urgency=urgency,
         data_asof=asof.isoformat(),

@@ -1376,6 +1376,27 @@ def ensure_portfolio_allocation_plans(conn):
     return changes
 
 
+def ensure_order_allocation_provenance(conn):
+    """Add nullable R34-C intent/plan evidence without guessing old orders.
+
+    The formal ``db_migrate`` version owns this schema change. NULL remains the
+    explicit unknown state for historical and not-yet-migrated orders.
+    Active and archive columns are appended in the same order because retention
+    archives rows with ``INSERT ... SELECT *``.
+    """
+    definitions = {
+        "allocation_intent_kind": "TEXT",
+        "portfolio_snapshot_id": "TEXT",
+        "allocation_plan_id": "TEXT",
+        "allocation_plan_fingerprint": "TEXT",
+        "allocation_policy_version": "TEXT",
+    }
+    return {
+        table: ensure_columns(conn, table, definitions)
+        for table in ("paper_orders", "paper_orders_archive")
+    }
+
+
 # ─── 策略退休决策（v28 / R33-B） ─────────────────────────────────────────────
 #
 # 不变量::

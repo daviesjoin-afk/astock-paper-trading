@@ -26,7 +26,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import asymmetric_risk as AR
 import entry_lifecycle as ELC
 import paper_allocation as PA
-import portfolio_coordinator as PCO
 import runtime_settings as RSET
 
 STRATEGY_POOL = [
@@ -94,20 +93,8 @@ class PoolExposureInvariantTests(unittest.TestCase):
             self.assertNotIn(removed.strategy_id, allocation["limits"])
 
 
-class SymbolAggregateInvariantTests(unittest.TestCase):
-    """不变式 2：单票 aggregate 不越界。"""
-
-    def test_aggregate_is_never_below_any_single_strategy_view(self):
-        for count in range(2, 13):
-            positions = [
-                {"code": "600000", "qty": 1000, "cost": 10.0,
-                 "industry": "银行", "account_id": f"s{i}"}
-                for i in range(count)
-            ]
-            aggregate = PCO.aggregate_exposure(positions, {"600000": {"price": 10.0}})
-            own_view = PCO.aggregate_exposure([positions[0]], {"600000": {"price": 10.0}})
-            self.assertGreaterEqual(
-                aggregate["by_symbol"]["600000"], own_view["by_symbol"]["600000"])
+class RiskUpdateInvariantTests(unittest.TestCase):
+    """风险画像变更仍受登记与观察期约束。"""
 
     def test_expansion_cannot_exceed_the_cap_no_matter_the_strategy_count(self):
         conn = sqlite3.connect(":memory:")
@@ -127,19 +114,6 @@ class SymbolAggregateInvariantTests(unittest.TestCase):
         self.assertFalse(gate["allowed"])
         self.assertTrue(all("尚未登记" in v or "观察期" in v
                             for v in gate["violations"]))
-
-    def test_symbol_headroom_clamps_any_number_of_pending_buys(self):
-        positions = [
-            {"code": "600000", "qty": 500, "cost": 10.0,
-             "industry": "银行", "account_id": f"s{i}"}
-            for i in range(6)
-        ]
-        aggregate = PCO.aggregate_exposure(
-            positions, {"600000": {"price": 10.0}},
-            pending_by_symbol={"600000": 5000.0})
-        check = PCO.symbol_headroom("600000", aggregate, cap_amount=20000.0)
-        # 30000 持仓 + 5000 在途 > 20000 上限 → 不允许再买。
-        self.assertFalse(check["allowed"])
 
 
 class T1ImmutableTests(unittest.TestCase):
@@ -222,8 +196,9 @@ class IntentPriorityInvariantTests(unittest.TestCase):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trading.py")
         with open(path, "r", encoding="utf-8") as handle:
             body = handle.read()
-        self.assertIn("PCO.pending_risk_exit_codes", body)
-        self.assertIn("P0 风控退出在途", body)
+        self.assertNotIn("pending_risk_exit_codes", body)
+        self.assertIn('intent_kind="ADD_POSITION"', body)
+        self.assertIn("含在途退出/未知订单冲突", body)
 
 
 if __name__ == "__main__":

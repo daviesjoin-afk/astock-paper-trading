@@ -324,9 +324,17 @@ def test_dates(build):
     return sorted({sample.label_start_date for sample in build.partitions["test"]})
 
 
+# These are shared test helpers, not pytest tests; ``build`` is an argument,
+# not a fixture.
+test_dates.__test__ = False
+
+
 def test_start(build):
     dates = test_dates(build)
     return dates[0] if dates else None
+
+
+test_start.__test__ = False
 
 
 # ─────────────────────── prediction identity / immutability ───────────────────────

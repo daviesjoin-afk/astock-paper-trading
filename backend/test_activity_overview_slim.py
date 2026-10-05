@@ -60,6 +60,64 @@ class ActivityOverviewSlimTests(unittest.TestCase):
             "dashboard() needs an explicit include_activity branch",
         )
 
+    def test_dashboard_allocation_fields_fail_closed_without_an_exact_plan(self):
+        body = self._dashboard_source(self.dq_source)
+        self.assertNotIn("_dynamic_position_limits(", body)
+        self.assertNotIn("_strategy_pool_budget(", body)
+        self.assertIn('shared["allocation_status"] = "UNAVAILABLE"', body)
+        self.assertIn('account["allocation_status"] = "UNAVAILABLE"', body)
+
+    def test_allocation_explain_does_not_select_or_build_an_unnamed_plan(self):
+        import ast
+
+        tree = ast.parse(self.pt_source)
+        node = next(
+            item for item in ast.walk(tree)
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "strategy_allocation_explain"
+        )
+        calls = {
+            child.func.attr if isinstance(child.func, ast.Attribute)
+            else getattr(child.func, "id", "")
+            for child in ast.walk(node) if isinstance(child, ast.Call)
+        }
+        for legacy_call in (
+            "_dynamic_position_limits", "_strategy_pool_budget", "_allocation_plan",
+            "capture_portfolio_allocation_plan", "get_portfolio_allocation_plan",
+        ):
+            self.assertNotIn(legacy_call, calls)
+        self.assertIn('"allocation_status": "UNAVAILABLE"', ast.get_source_segment(
+            self.pt_source, node))
+
+    def test_legacy_entry_allocator_and_slot_borrow_paths_are_retired(self):
+        import ast
+
+        tree = ast.parse(self.pt_source)
+        definitions = {node.name for node in tree.body
+                       if isinstance(node, ast.FunctionDef)}
+        for retired in ("_strategy_pool_budget", "_allocation_plan",
+                        "_pool_allocation_inputs", "_slot_upgrade_context",
+                        "_apply_slot_borrow"):
+            self.assertNotIn(retired, definitions)
+        entry = next(node for node in tree.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "_buy_order")
+        calls = {node.func.id for node in ast.walk(entry)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertNotIn("_dynamic_position_limits", calls)
+        self.assertNotIn("_strategy_pool_budget", calls)
+
+    def test_production_entry_and_read_modules_have_no_coordinator_imports(self):
+        import ast
+
+        for filename in ("paper_trading.py", "manual_orders.py", "dashboard_queries.py"):
+            tree = ast.parse(_load_source(os.path.join(BACKEND, filename)))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported = {alias.name for alias in node.names}
+                    self.assertNotIn("portfolio_coordinator", imported, filename)
+                elif isinstance(node, ast.ImportFrom):
+                    self.assertNotEqual("portfolio_coordinator", node.module, filename)
+
     def test_signals_query_is_not_duplicated_outside_the_guard(self):
         body = self._dashboard_source(self.dq_source)
         self.assertEqual(

@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -58,6 +60,44 @@ class _ProvenRiskHarness(unittest.TestCase):
         self.account_id = "tq_breakout"
         self.day = self._inner.day
         self.code = self._inner.code
+        # R34-C snapshots require an explicit cycle owner set and bounded
+        # as-of attachment evidence. The legacy risk harness only marked the
+        # default cycle running, so add those fixture facts for its existing
+        # built-in ledgers.
+        with PT._db(immediate=True) as conn:
+            cycle_id = int(conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?",
+                (self.account_id,),
+            ).fetchone()[0])
+            account_ids = [str(row[0]) for row in conn.execute(
+                "SELECT id FROM paper_accounts WHERE cycle_id=? ORDER BY id",
+                (cycle_id,),
+            )]
+            conn.execute(
+                "UPDATE paper_cycles SET enabled_strategies=?,created_at=? WHERE id=?",
+                (json.dumps(account_ids),
+                 f"{self.day.isoformat()} 09:00:00", cycle_id),
+            )
+            for account_id in account_ids:
+                account = conn.execute(
+                    "SELECT version,style,params FROM paper_accounts WHERE id=?",
+                    (account_id,),
+                ).fetchone()
+                params = json.loads(account[2] or "{}")
+                params["adaptive_allocation"] = {
+                    "weight_pct": 100.0, "status": "active",
+                    "effective_date": self.day.isoformat(),
+                }
+                conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                             (json.dumps(params), account_id))
+                conn.execute(
+                    "INSERT OR IGNORE INTO paper_parameter_versions"
+                    "(cycle_id,account_id,version,style,params,reason,effective_date,created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (cycle_id, account_id, account[0] or 1, account[1] or "trend",
+                     "{}", "deferred-fill exact-owner fixture", self.day.isoformat(),
+                     f"{self.day.isoformat()} 09:00:00"),
+                )
         # 该 harness 把行情字典与 DB 路径放在实例/模块上；这里直接借用，
         # 不复制一份，以免两边的夹具漂移。
         self.quotes_map = self._inner.quotes_map
@@ -1071,6 +1111,63 @@ class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
             (self.account_id,),
         ).fetchone()["cycle_id"])
 
+    def _approved_allocation_plan(self, conn, *, cycle_id, asof_day,
+                                  decision_at, account_id, symbol, intent_kind):
+        """Supply the exact allocation owner fact needed to reach reservation logic."""
+        identity = hashlib.sha256(
+            f"{cycle_id}|{asof_day}|{decision_at}|{account_id}|{symbol}|{intent_kind}"
+            .encode("utf-8")
+        ).hexdigest()
+        allowance = 1_000_000.0
+        plan = {
+            "plan_id": identity, "plan_fingerprint": identity,
+            "portfolio_snapshot_id": identity,
+            "portfolio_snapshot_fingerprint": identity,
+            "allocation_policy_version": "portfolio-allocation-policy-v2",
+            "cycle_id": int(cycle_id), "asof_day": str(asof_day),
+            "decision_at": str(decision_at), "plan_status": "PLANNED",
+            "blocking_reasons": [],
+            "slot_plan": {"status": "PLANNED", "limits": {str(account_id): 10},
+                          "total_cap": 20},
+            "capital_plan": {
+                "status": "PLANNED", "nav": allowance,
+                "market_value_by_account": {str(account_id): 0.0},
+                "pending_by_account": {str(account_id): 0.0},
+                "allowance_by_strategy": {str(account_id): allowance},
+                "raw_allowance_by_strategy": {str(account_id): allowance},
+                "lifecycle_stage_by_strategy": {str(account_id): "standard"},
+                "capital_scale_by_strategy": {str(account_id): 1.0},
+            },
+            "capacity_plan": {"status": "PLANNED", "pending_amount": 0.0,
+                              "headroom_amount": allowance},
+            "conflict_plan": {"status": "PLANNED", "deferred_intent_ids": [],
+                              "ordered_intents": []},
+        }
+        snapshot = {
+            "snapshot_id": identity,
+            "snapshot_fingerprint": identity,
+            "cycle_id": int(cycle_id), "asof_day": str(asof_day),
+            "decision_at": str(decision_at),
+            "dimensions": [
+                {"name": "strategy_exposure", "facts": {
+                    "market_value_by_account": {str(account_id): 0.0},
+                    "market_value_by_position": [],
+                }},
+                {"name": "capacity", "status": "AVAILABLE", "facts": {
+                    "pending_by_symbol": {},
+                }},
+            ],
+        }
+        self._allocation_snapshot = snapshot
+        return {"snapshot": snapshot,
+                "plan": plan, "candidate_intent_id": identity,
+                "candidate_blocked": False, "slot_limit": 10,
+                "capital_allowance": allowance, "candidate_deferred": False,
+                "candidate_denied": False}
+
+    def _same_allocation_snapshot(self, *args, **kwargs):
+        return self._allocation_snapshot
+
     def _seed_pending_buy_with_mismatched_reservation(self, *, triggered):
         """构造 order(cycle 8) + reservation(cycle 9) 的 pending 限价 BUY 订单。
 
@@ -1145,6 +1242,10 @@ class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
 
         with mock.patch.object(PT, "_quotes", return_value=self.quotes_map), \
                 mock.patch.object(PT, "init_db", lambda *a, **k: None), \
+                mock.patch.object(PT, "_build_portfolio_entry_plan",
+                                  side_effect=self._approved_allocation_plan), \
+                mock.patch.object(PT.PRS, "capture_portfolio_runtime_snapshot",
+                                  side_effect=self._same_allocation_snapshot), \
                 mock.patch.object(PT, "_entry_freeze_enabled", lambda: False), \
                 mock.patch.object(PT, "_market_state", return_value=market), \
                 mock.patch.object(PT, "_cached_close_market",

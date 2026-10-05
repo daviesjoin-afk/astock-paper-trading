@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -150,7 +151,8 @@ class OrderIntentContractTests(unittest.TestCase):
     def test_intent_style_user_signal_passes_without_qty(self):
         strategy_id = self._make_user_strategy()
         payload = {"decision": {"passed": True},
-                   "pick": {"code": "600000", "score": 0.8, "reason": "user alpha"}}
+                   "pick": {"code": "600000", "score": 0.8, "reason": "user alpha"},
+                   "order_intent": {"intent_kind": "NEW_ENTRY"}}
         intent, reject = PT._enforce_order_intent(
             self.conn, {"id": strategy_id}, "600000", payload,
         )
@@ -159,6 +161,19 @@ class OrderIntentContractTests(unittest.TestCase):
         self.assertEqual("600000", intent.symbol)
         # 契约结构中不允许出现数量字段。
         self.assertNotIn("qty", intent.to_payload())
+        self.assertEqual("NEW_ENTRY", intent.intent_kind)
+
+    def test_free_text_does_not_supply_missing_resource_intent_kind(self):
+        strategy_id = self._make_user_strategy()
+        payload = {"decision": {"passed": True},
+                   "pick": {"code": "600000", "score": 0.8,
+                            "reason": "RISK_EXIT manual_exit add position"}}
+        intent, reject = PT._enforce_order_intent(
+            self.conn, {"id": strategy_id}, "600000", payload,
+        )
+        self.assertIsNone(intent)
+        self.assertEqual("risk_rejected", reject["status"])
+        self.assertIn("explicit_resource_intent_kind_required", reject["reason"])
 
     def test_builtin_payload_with_market_amount_is_not_rejected(self):
         # legacy adapter：main_force_top10 的 amount 是市场成交额，不拒绝。
@@ -169,6 +184,52 @@ class OrderIntentContractTests(unittest.TestCase):
         )
         self.assertIsNone(reject)
         self.assertIsNone(intent)  # legacy 模式不返回 intent
+
+    def test_synthesized_add_position_callers_pass_the_enforced_gate(self):
+        """强制 OrderIntent 模式下，两个合成加仓入口都越过 kind 校验。"""
+        self._set_contract_version("tq_breakout", 1)
+        account = {"id": "tq_breakout", "mode": "swing"}
+        position = {"code": "600000", "cost": 10.0,
+                    "qty": 100, "entry_date": "2026-10-01"}
+        quote = {"price": 10.2, "pct": 1.0}
+        market = {"light": "green"}
+        caller_args = (
+            self.conn, account, position, quote, market,
+            "2026-10-05", {}, {"id": 1},
+        )
+        gate_results = []
+        planner_calls = []
+        original_enforce = PT._enforce_order_intent
+
+        def enforce_spy(*args, **kwargs):
+            result = original_enforce(*args, **kwargs)
+            gate_results.append((args[3]["order_intent"]["intent_kind"], result))
+            return result
+
+        class PlannerReached(Exception):
+            pass
+
+        def planner_spy(*args, **kwargs):
+            planner_calls.append(kwargs.get("intent_kind"))
+            raise PlannerReached
+
+        with (mock.patch.object(PT, "_enforce_order_intent", side_effect=enforce_spy),
+              mock.patch.object(PT, "_build_portfolio_entry_plan",
+                                side_effect=planner_spy),
+              mock.patch.object(PT, "_execution_quote_status",
+                                return_value={"fresh": True}),
+              mock.patch.object(PT, "_intraday_action_today",
+                                side_effect=[{"payload": "{}"}, None])):
+            for caller in (PT._intraday_buyback, PT._swing_scale_in):
+                with self.subTest(caller=caller.__name__):
+                    with self.assertRaises(PlannerReached):
+                        caller(*caller_args)
+
+        self.assertEqual(["ADD_POSITION", "ADD_POSITION"],
+                         [kind for kind, _ in gate_results])
+        self.assertTrue(all(intent is not None and reject is None
+                            for _, (intent, reject) in gate_results))
+        self.assertEqual(["ADD_POSITION", "ADD_POSITION"], planner_calls)
 
 
 class ExecutionPathGuardTests(unittest.TestCase):

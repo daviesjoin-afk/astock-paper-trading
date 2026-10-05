@@ -6,7 +6,8 @@ verify its fingerprint, load the exact cycle-pinned strategy resource
 declarations, validate the explicit resource intents, evaluate the pure policy,
 and append the plan.
 
-It never creates schema, never writes the formal ledger
+The caller owns the SQLite connection and transaction. This service never
+creates schema, never writes the formal ledger
 (``paper_accounts`` / ``paper_cycles`` / orders / fills / position lots / risk
 decisions / lifecycle), never submits an order, and offers no ``current`` or
 ``latest`` fallback and no apply/execute path. Schema creation stays with the
@@ -14,10 +15,11 @@ formal migration owner.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
 import paper_allocation as PA
-import paper_trading as PT
 import portfolio_allocation_policy as PAP
 import portfolio_allocation_repository as PAPRepo
 import portfolio_runtime as PR
@@ -27,6 +29,21 @@ import strategy_dsl_schema as DSL
 import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_runtime as SRT
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationServiceConfig:
+    """Explicit application-owned limits needed to build pinned declarations."""
+    allocation_slot_caps: Mapping
+    allocation_priority_floor_pct: Mapping
+    allocation_own_exposure_cap_pct: Mapping
+    strategy_max_positions: int
+    strategy_min_positions: int
+    protected_slot_floor: int
+    shared_pool_max_positions: int
+    account_order: Mapping
+    shared_pool_max_exposure: float
+    strategy_pool_floor_ratio: float
 
 
 def _allocation_stage(conn, strategy_id: str, lifecycle_state, *, definition,
@@ -53,7 +70,7 @@ def _allocation_stage(conn, strategy_id: str, lifecycle_state, *, definition,
         current_version=int(version), current_checksum=str(checksum)))
 
 
-def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot):
+def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot, config):
     """Exact cycle-pinned declarations for the eligible execution participants.
 
     Identity comes from the snapshot's exact strategy pins (never from the
@@ -86,11 +103,11 @@ def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot):
             strategy_id=strategy_id,
             strategy_version=version,
             strategy_checksum=checksum,
-            max_positions=int(PT.ALLOCATION_SLOT_CAPS.get(
-                account, soft.get("max_positions", PT.STRATEGY_MAX_POSITIONS))),
-            min_positions=int(PT.STRATEGY_MIN_POSITIONS),
-            priority_floor_pct=PT.ALLOCATION_PRIORITY_FLOOR_PCT.get(account),
-            own_exposure_cap_pct=float(PT.ALLOCATION_OWN_EXPOSURE_CAP_PCT.get(
+            max_positions=int(config.allocation_slot_caps.get(
+                account, soft.get("max_positions", config.strategy_max_positions))),
+            min_positions=int(config.strategy_min_positions),
+            priority_floor_pct=config.allocation_priority_floor_pct.get(account),
+            own_exposure_cap_pct=float(config.allocation_own_exposure_cap_pct.get(
                 account, soft.get("max_exposure", 0.65))),
             lifecycle_stage=stage,
             capital_scale=PA.stage_capital_scale(PA.StrategyRuntime(
@@ -109,19 +126,12 @@ def _intents(values):
     return tuple(result)
 
 
-def _with_connection(work, *, initialize=False):
-    if initialize:
-        with PT._db(immediate=True) as conn:
-            result = work(conn)
-            conn.commit()
-            return result
-    with PT._db_readonly() as conn:
-        return work(conn)
-
-
-def capture_portfolio_allocation_plan(*, portfolio_snapshot_id: str,
+def capture_portfolio_allocation_plan(conn, *, config: AllocationServiceConfig,
+                                      portfolio_snapshot_id: str,
                                       allocation_weights,
-                                      resource_intents=(), hard_pool_cap=None):
+                                      resource_intents=(), hard_pool_cap=None,
+                                      allocation_weights_source_identity=None,
+                                      allocation_weights_source_fingerprint=None):
     """Evaluate the policy for one explicit snapshot and append the plan.
 
     ``allocation_weights`` is a required explicit canonical declaration: the
@@ -131,45 +141,50 @@ def capture_portfolio_allocation_plan(*, portfolio_snapshot_id: str,
     """
     if not isinstance(portfolio_snapshot_id, str) or len(portfolio_snapshot_id) != 64:
         raise PAP.PortfolioAllocationPolicyError("explicit_portfolio_snapshot_id_required")
+    if not isinstance(config, AllocationServiceConfig):
+        raise PAP.PortfolioAllocationPolicyError("explicit_allocation_service_config_required")
     intents = _intents(resource_intents)
+    snapshot = PRRepo.get_snapshot(conn, portfolio_snapshot_id)
+    if snapshot is None:
+        raise PAP.PortfolioAllocationPolicyError("portfolio_snapshot_not_found")
+    if not PR.verify_snapshot_fingerprint(snapshot):
+        raise PAP.PortfolioAllocationPolicyError(
+            "portfolio_snapshot_fingerprint_mismatch")
+    cap = (int(hard_pool_cap) if hard_pool_cap is not None else
+           int(RSET.get(conn, "shared_pool_position_limit",
+                        config.shared_pool_max_positions)))
+    plan = PAP.build_portfolio_allocation_plan(
+        snapshot=snapshot,
+        declarations=_declarations(conn, snapshot, config),
+        weights=allocation_weights,
+        intents=intents,
+        hard_pool_cap=cap,
+        strategy_max_positions=config.strategy_max_positions,
+        strategy_min_positions=config.strategy_min_positions,
+        protected_slot_floor=config.protected_slot_floor,
+        account_order=config.account_order,
+        baseline_exposure=None,
+        source_identities=(
+            {"allocation_weights": str(allocation_weights_source_identity),
+             "allocation_weight_declaration": str(allocation_weights_source_identity)}
+            if allocation_weights_source_identity else None),
+        source_fingerprints=(
+            {"allocation_weight_declaration":
+             str(allocation_weights_source_fingerprint)}
+            if allocation_weights_source_fingerprint else None),
+        shared_pool_max_exposure=config.shared_pool_max_exposure,
+        strategy_pool_floor_ratio=config.strategy_pool_floor_ratio,
+    )
+    return PAPRepo.append_plan(conn, plan).projection()
 
-    def build(conn):
-        snapshot = PRRepo.get_snapshot(conn, portfolio_snapshot_id)
-        if snapshot is None:
-            raise PAP.PortfolioAllocationPolicyError("portfolio_snapshot_not_found")
-        if not PR.verify_snapshot_fingerprint(snapshot):
-            raise PAP.PortfolioAllocationPolicyError(
-                "portfolio_snapshot_fingerprint_mismatch")
-        cap = (int(hard_pool_cap) if hard_pool_cap is not None else
-               int(RSET.get(conn, "shared_pool_position_limit",
-                            PT.SHARED_POOL_MAX_POSITIONS)))
-        plan = PAP.build_portfolio_allocation_plan(
-            snapshot=snapshot,
-            declarations=_declarations(conn, snapshot),
-            weights=allocation_weights,
-            intents=intents,
-            hard_pool_cap=cap,
-            strategy_max_positions=PT.STRATEGY_MAX_POSITIONS,
-            strategy_min_positions=PT.STRATEGY_MIN_POSITIONS,
-            protected_slot_floor=PT.STRATEGY_PROTECTED_SLOT_FLOOR,
-            account_order={key: index for index, key in enumerate(PT.ACCOUNT_SPECS)},
-            baseline_exposure=None,
-        )
-        return PAPRepo.append_plan(conn, plan)
 
-    return _with_connection(build, initialize=True).projection()
-
-
-def get_portfolio_allocation_plan(plan_id: str):
+def get_portfolio_allocation_plan(conn, plan_id: str):
     """Read only the exact immutable plan named by its fingerprint ID."""
-
-    def read(conn):
-        plan = PAPRepo.get_plan(conn, plan_id)
-        if plan is None:
-            raise PAP.PortfolioAllocationPolicyError("portfolio_allocation_plan_not_found")
-        return plan.projection()
-
-    return _with_connection(read)
+    plan = PAPRepo.get_plan(conn, plan_id)
+    if plan is None:
+        raise PAP.PortfolioAllocationPolicyError("portfolio_allocation_plan_not_found")
+    return plan.projection()
 
 
-__all__ = ["capture_portfolio_allocation_plan", "get_portfolio_allocation_plan"]
+__all__ = ["AllocationServiceConfig", "capture_portfolio_allocation_plan",
+           "get_portfolio_allocation_plan"]

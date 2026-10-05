@@ -52,3 +52,4 @@ body.dark .paper-research-note { background:#17382b; border-color:#3c6b58; color
 @media (max-width:980px) { .paper-research-grid { grid-template-columns:1fr; }.paper-research-card { min-height:0; }.paper-research-hero { flex-direction:column; }.paper-research-hero-actions { justify-content:flex-start; min-width:0; } }
 @media (max-width:560px) { .paper-research-hero,.paper-research-table { padding:17px 14px; }.paper-research-hero h3 { font-size:20px; }.paper-research-hero p { font-size:14px; }.paper-research-card dl,.paper-research-outcomes { grid-template-columns:repeat(3,minmax(0,1fr)); }.paper-research-ladder { margin-left:-2px; margin-right:-2px; }.paper-research-table > header { flex-direction:column; } }
 @media (prefers-reduced-motion:reduce) { .paper-research-view * { scroll-behavior:auto !important; transition:none !important; } }
+.paper-execution-view[hidden] { display:none!important; }

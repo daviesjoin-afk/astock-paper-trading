@@ -62,6 +62,8 @@ from test_production_path_golden_replay import (
     OfflinePaperEnv,
     QUOTE_PRICES,
     QUOTE_SCENARIOS,
+    _declare_test_allocation_weights,
+    _run_open_slot,
 )
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -212,6 +214,8 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
 
         summary, cycle = PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
         self.assertEqual(tuple(cycle["enabled_strategies"]), (STRATEGY_ID,))
+        with self._paper_conn() as p_conn:
+            _declare_test_allocation_weights(p_conn, (STRATEGY_ID,))
 
         with self._paper_conn() as p_conn:
             context = SRT.get_context(p_conn, STRATEGY_ID)
@@ -226,7 +230,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
         self.assertTrue(user_rows and user_rows[0]["created"] > 0)
 
         # T+1 开仓执行（开盘批次）
-        opened = PT.run_slot("open", D1, force=True)
+        opened = _run_open_slot(D1)
         self.assertNotEqual(opened.get("status"), "failed")
 
         with self._paper_conn() as p_conn:
@@ -262,7 +266,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
         for code in PASS_CODES:
             QUOTE_PRICES[(code, D2.isoformat())] = round(cost * 0.83, 2)
 
-        PT.run_slot("risk", D2, force=True)
+        _run_open_slot(D2, "risk")
 
         with self._paper_conn() as p_conn:
             sells = p_conn.execute(

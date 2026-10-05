@@ -38,6 +38,19 @@ CHECKSUM = "a" * 64
 OTHER_CHECKSUM = "b" * 64
 
 
+def _capture_service_plan(**kwargs):
+    with PT._db(immediate=True) as conn:
+        result = PAS.capture_portfolio_allocation_plan(
+            conn, config=API._allocation_service_config(), **kwargs)
+        conn.commit()
+        return result
+
+
+def _get_service_plan(plan_id):
+    with PT._db_readonly() as conn:
+        return PAS.get_portfolio_allocation_plan(conn, plan_id)
+
+
 def _dim(name, status, facts=None, reasons=(), source="owner:test",
          source_fingerprint=None):
     if status == PR.UNAVAILABLE:
@@ -77,7 +90,9 @@ def _full_evidence_dimensions():
         _dim("risk_consumption", PR.UNAVAILABLE, reasons=("exact_asof_risk_consumption_owner_unavailable",)),
         _dim("signal_conflicts", PR.UNAVAILABLE, reasons=("exact_asof_strategy_signal_intents_unavailable",)),
         _dim("capacity", PR.AVAILABLE,
-             {"used": 15000.0, "pending": 0.0, "headroom": 67000.0}),
+             {"used": 15000.0, "pending": 0.0, "headroom": 67000.0,
+              "pending_total": 0.0,
+              "pending_by_account": {"s1": 0.0, "s2": 0.0}}),
         _dim("correlation", PR.UNAVAILABLE, reasons=("exact_strategy_version_return_series_unavailable",)),
     )
 
@@ -119,7 +134,9 @@ def _build(snapshot=None, declarations=None, weights=None, intents=(), **overrid
     snapshot = snapshot if snapshot is not None else _snapshot()
     eligible = tuple(snapshot.execution_participant_ids)
     kwargs = {"hard_pool_cap": 10, "strategy_max_positions": 6,
-              "strategy_min_positions": 2, "protected_slot_floor": 2}
+              "strategy_min_positions": 2, "protected_slot_floor": 2,
+              "shared_pool_max_exposure": 0.82,
+              "strategy_pool_floor_ratio": 0.60}
     kwargs.update(overrides)
     return PAP.build_portfolio_allocation_plan(
         snapshot=snapshot,
@@ -170,10 +187,17 @@ class PlanIdentityTests(unittest.TestCase):
 
     def test_b3_policy_version_enters_the_fingerprint(self):
         baseline = _build()
-        with mock.patch.object(PAP, "POLICY_VERSION", "portfolio-allocation-policy-v2"):
+        with mock.patch.object(PAP, "POLICY_VERSION", "portfolio-allocation-policy-v3"):
             changed = _build()
         self.assertNotEqual(baseline.plan_id, changed.plan_id)
         self.assertIn(PAP.POLICY_VERSION, baseline.allocation_policy_version)
+
+    def test_b3a_historical_v1_plan_fingerprint_remains_verifiable(self):
+        with mock.patch.object(PAP, "POLICY_VERSION", "portfolio-allocation-policy-v1"):
+            historical = _build()
+        self.assertEqual(historical.allocation_policy_version,
+                         "portfolio-allocation-policy-v1")
+        self.assertTrue(PAP.verify_plan_fingerprint(historical))
 
     def test_b4_corrupt_snapshot_fingerprint_fails_closed(self):
         snapshot = _snapshot()
@@ -196,8 +220,23 @@ class PlanIdentityTests(unittest.TestCase):
                 self.assertNotIn(forbidden, lowered, msg=f"service calls {name}")
         self.assertEqual(_module_functions(PAS.__file__),
                          {"_allocation_stage", "_declarations", "_intents",
-                          "_with_connection", "capture_portfolio_allocation_plan",
+                          "capture_portfolio_allocation_plan",
                           "get_portfolio_allocation_plan"})
+
+    def test_rc9_plan_services_are_connection_explicit_and_paper_trading_free(self):
+        for path in (PAS.__file__, PRS.__file__):
+            tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+            imports = {
+                alias.name.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            } | {
+                (node.module or "").split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+            }
+            self.assertNotIn("paper_trading", imports, msg=path)
 
     def test_b8_input_order_is_canonical(self):
         snapshot = _snapshot()
@@ -349,6 +388,16 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertIn("exact_market_value_by_account_unavailable",
                       plan.capital_plan["blocking_reasons"])
 
+    def test_b17a_exact_v2_market_capacity_and_nav_compute_owner_allowances(self):
+        plan = _build(snapshot=_snapshot(dimensions=_full_evidence_dimensions()))
+        self.assertEqual(plan.capital_plan["status"], PAP.PLANNED)
+        self.assertEqual(plan.capital_plan["authority"],
+                         "paper_allocation:allocation_plan")
+        self.assertEqual(set(plan.capital_plan["allowance_by_strategy"]), {"s1", "s2"})
+        self.assertLessEqual(
+            sum(plan.capital_plan["allowance_by_strategy"].values()),
+            plan.capacity_plan["headroom_amount"] + 1e-6)
+
     def test_b18_cost_basis_never_substitutes_market_value(self):
         plan = _build()
         self.assertIsNone(plan.capital_plan["market_value_by_account"])
@@ -382,6 +431,33 @@ class EvidenceGateTests(unittest.TestCase):
 
 
 class EligibilityScopeTests(unittest.TestCase):
+    def test_c6_c7_paused_owner_exposure_counts_but_receives_no_new_allowance(self):
+        dimensions = (
+            _dim("capital", PR.AVAILABLE, {"cycle_capital": 100000.0, "nav": 100000.0}),
+            _dim("strategy_exposure", PR.AVAILABLE, {
+                "market_value_by_account": {"s1": 10000.0, "paused": 30000.0},
+            }),
+            _dim("concentration", PR.UNAVAILABLE, reasons=("classification_unavailable",)),
+            _dim("turnover", PR.UNAVAILABLE, reasons=("turnover_unavailable",)),
+            _dim("risk_consumption", PR.UNAVAILABLE, reasons=("risk_unavailable",)),
+            _dim("signal_conflicts", PR.AVAILABLE, {"pending_resource_intents": [],
+                                                       "unknown_orders": []}),
+            _dim("capacity", PR.AVAILABLE, {
+                "used": 40000.0, "pending": 0.0, "pending_total": 0.0,
+                "headroom": 60000.0, "pending_by_account": {"s1": 0.0},
+            }),
+            _dim("correlation", PR.UNAVAILABLE, reasons=("correlation_unavailable",)),
+        )
+        snapshot = _snapshot(economic=("s1", "paused"), execution=("s1",),
+                             risk_exit=("s1", "paused"), dimensions=dimensions)
+        plan = _build(snapshot=snapshot, declarations=_declarations(("s1",)),
+                      weights={"s1": 1.0})
+        self.assertEqual(PAP.PLANNED, plan.capital_plan["status"])
+        self.assertEqual({"s1": 10000.0, "paused": 30000.0},
+                         plan.capital_plan["market_value_by_account"])
+        self.assertNotIn("paused", plan.slot_plan["limits"])
+        self.assertEqual(PAP.PLANNED, plan.plan_status)
+
     def test_b11_paused_economic_owner_gets_no_new_resource(self):
         snapshot = _snapshot(economic=("s1", "paused"), execution=("s1",),
                              risk_exit=("s1", "paused"))
@@ -472,6 +548,47 @@ class ConflictPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(PAP.PortfolioAllocationPolicyError,
                                     "intent_kind_required"):
             PAP.ResourceIntent("x", "s1", "", "600000")
+
+    def test_rc13_untyped_pending_sell_is_unknown_and_blocks_same_symbol_entry(self):
+        dimensions = list(_full_evidence_dimensions())
+        dimensions = [
+            _dim("signal_conflicts", PR.PARTIAL, {
+                "pending_resource_intents": [],
+                "unknown_orders": [{"order_id": 91, "account_id": "s2",
+                                    "cycle_id": 7, "symbol": "600000",
+                                    "side": "sell",
+                                    "reason": "legacy_or_invalid_pending_intent_kind"}],
+            }) if item.name == "signal_conflicts" else item
+            for item in dimensions
+        ]
+        plan = _build(
+            snapshot=_snapshot(dimensions=dimensions),
+            intents=(PAP.ResourceIntent("entry", "s1", "NEW_ENTRY", "600000"),),
+        )
+        self.assertEqual(PAP.PARTIAL, plan.conflict_plan["status"])
+        self.assertEqual(["entry"], list(plan.conflict_plan["deferred_intent_ids"]))
+        self.assertEqual("unknown_pending_order_blocks_same_symbol_entry",
+                         plan.conflict_plan["unknown_order_blocks"][0]["rule"])
+        self.assertEqual("NEW_ENTRY", plan.conflict_plan["ordered_intents"][0][
+            "intent_kind"])
+
+    def test_rc14_unscoped_unknown_pending_order_blocks_all_entries(self):
+        dimensions = [
+            _dim("signal_conflicts", PR.PARTIAL, {
+                "pending_resource_intents": [],
+                "unknown_orders": [{"order_id": 92, "account_id": None,
+                                    "cycle_id": None, "symbol": "",
+                                    "side": "sell", "reason": "identity_unavailable"}],
+            }) if item.name == "signal_conflicts" else item
+            for item in _full_evidence_dimensions()
+        ]
+        plan = _build(
+            snapshot=_snapshot(dimensions=dimensions),
+            intents=(PAP.ResourceIntent("e1", "s1", "NEW_ENTRY", "600000"),
+                     PAP.ResourceIntent("e2", "s2", "ADD_POSITION", "000001")),
+        )
+        self.assertEqual(PAP.INSUFFICIENT_EVIDENCE, plan.conflict_plan["status"])
+        self.assertEqual(["e1", "e2"], list(plan.conflict_plan["deferred_intent_ids"]))
 
     def test_duplicate_intent_id_fails_closed(self):
         with self.assertRaisesRegex(PAP.PortfolioAllocationPolicyError,
@@ -677,7 +794,7 @@ class LedgerImmutabilityTests(unittest.TestCase):
                     market_evidence_identity=None, dimensions=_r34a_dimensions())
                 PRRepo.append_snapshot(conn, snapshot)
 
-            plan = PAS.capture_portfolio_allocation_plan(
+            plan = _capture_service_plan(
                 portfolio_snapshot_id=snapshot.snapshot_id,
                 allocation_weights={strategy_id: 1.0})
             declaration = plan["strategy_resource_declarations"][0]
@@ -719,8 +836,12 @@ class LedgerImmutabilityTests(unittest.TestCase):
                 decision = dt.datetime.combine(
                     attach_day + dt.timedelta(days=1), dt.time(9, 30),
                     tzinfo=dt.timezone(dt.timedelta(hours=8)))
-            snapshot = PRS.capture_portfolio_runtime_snapshot(
-                cycle_id=cycle_id, asof_day=str(attached), decision_at=decision.isoformat())
+            with PT._db(immediate=True) as conn:
+                snapshot = PRS.capture_portfolio_runtime_snapshot(
+                    conn, cycle_id=cycle_id, asof_day=str(attached),
+                    decision_at=decision.isoformat(),
+                    builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
+                conn.commit()
 
             conn = sqlite3.connect(PT.DB_PATH)
             before = self._counts(conn)
@@ -728,7 +849,7 @@ class LedgerImmutabilityTests(unittest.TestCase):
 
             eligible = list(snapshot["execution_participant_ids"])
             self.assertTrue(eligible)
-            plan = PAS.capture_portfolio_allocation_plan(
+            plan = _capture_service_plan(
                 portfolio_snapshot_id=snapshot["snapshot_id"],
                 allocation_weights={account: 1.0 for account in eligible})
 
@@ -773,17 +894,17 @@ class LedgerImmutabilityTests(unittest.TestCase):
             for reason in plan["blocking_reasons"]:
                 self.assertTrue(reason)
 
-            again = PAS.capture_portfolio_allocation_plan(
+            again = _capture_service_plan(
                 portfolio_snapshot_id=snapshot["snapshot_id"],
                 allocation_weights={account: 1.0 for account in eligible})
             self.assertEqual(again["plan_id"], plan["plan_id"])
-            self.assertEqual(PAS.get_portfolio_allocation_plan(plan["plan_id"]), plan)
+            self.assertEqual(_get_service_plan(plan["plan_id"]), plan)
 
             # An unknown snapshot id must fail closed: never fall back to the
             # newest stored snapshot.
             with self.assertRaisesRegex(PAP.PortfolioAllocationPolicyError,
                                         "portfolio_snapshot_not_found"):
-                PAS.capture_portfolio_allocation_plan(
+                _capture_service_plan(
                     portfolio_snapshot_id="f" * 64, allocation_weights={"x": 1.0})
         finally:
             PT.DB_PATH = old_db

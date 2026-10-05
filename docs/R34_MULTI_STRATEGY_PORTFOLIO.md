@@ -150,9 +150,11 @@ but receives no entry allocation. No second eligibility resolver exists.
 
 Immutable, fingerprinted, and input-order independent. `plan_id` equals
 `plan_fingerprint`; `created_at` is persistence metadata and never fingerprint
-material; `portfolio-allocation-policy-v1` is bound into the fingerprint, so
-changing allocation arithmetic, priority rules, conflict rules, or required
-evidence requires a policy version bump and old plans do not drift.
+material; the policy version is bound into the fingerprint, so changing
+allocation arithmetic, priority rules, conflict rules, or required evidence
+requires a policy version bump and old plans do not drift. R34-B plans use
+`portfolio-allocation-policy-v1`. R34-C introduces v2 capital allowance
+semantics while keeping stored v1 plans readable and fingerprint-verifiable.
 
 Carried fields: `plan_id`, `plan_fingerprint`, `portfolio_snapshot_id`,
 `portfolio_snapshot_fingerprint`, `allocation_policy_version`, `cycle_id`,
@@ -204,7 +206,7 @@ Exact Portfolio Snapshot
         + Exact Strategy Allocation Declarations
         + Explicit Resource Intents
         ↓
-Multi-Strategy Allocation Policy (portfolio-allocation-policy-v1)
+Multi-Strategy Allocation Policy (portfolio-allocation-policy-v2)
         ↓
 PortfolioAllocationPlan
         ↓
@@ -266,6 +268,164 @@ Review follow-ups closed at this head:
   paused owner without an as-of open lot is denied `RISK_EXIT` scope and cannot
   defer an eligible same-symbol `NEW_ENTRY`.
 
-R31, R32, and R33 are COMPLETE. R34-A is COMPLETE. R34-B is IN REVIEW after this
-PR; R34-C is NOT STARTED; R34 is NOT COMPLETE; R35–R37 are NOT STARTED. This PR
-remains unmerged and undeployed until human review.
+R31, R32, and R33 are COMPLETE. R34-A and R34-B are COMPLETE (R34-B merged as
+`34ed5d0611b7b9ff03c9ca4461d5b21524af3de3`). R34-C is in progress; R34 is NOT
+COMPLETE; R35–R37 are NOT STARTED. No deployment is authorized.
+
+## R34-C baseline production inventory (base `34ed5d0`)
+
+This inventory is the pre-wiring baseline. In this checkout the requested
+`paper_trading._position_count_budget` name does not exist; its live equivalent
+is `_dynamic_position_limits`.
+
+| Production caller / authority | Current behavior and failure semantics | Canonical replacement | Removal condition |
+| --- | --- | --- | --- |
+| `paper_trading._dynamic_position_limits` (six internal call sites at lines 9034, 9538, 9605, 10742, 10810, 11874); `dashboard_queries` (131); `manual_orders` (138); injected Risk port (11023) | Risk/profile/cluster facts become `StrategyRuntime`, then `paper_allocation.position_limits`; cycle/as-of are optional on legacy reads. This is the live slot allocator. | One exact snapshot-bound allocation plan with explicit weights and current capacity revalidation. | Migrate every production decision/read caller; legacy allocator caller count = 0, then delete it and obsolete adapters.
+| `paper_trading._strategy_pool_budget` (9060, 9635, 12229, 12393); `manual_orders` (160, 217); `dashboard_queries` (199) | Rebuilds weights, position values, pending BUY reservations, market scale, cluster diversification and lifecycle-scaled capital allowance. Missing quotes may use cost in `_pool_allocation_inputs`; reservation evidence is read through the legacy capital-reservation helpers. | Exact owner-issued weight, quote-valued exposure, cash/NAV and typed reservations, consumed by the canonical policy's shared capital arithmetic. | Migrate all production sizing and explainability callers; no legacy capital fallback may remain.
+| `paper_trading._allocation_plan` (9042, 9669) and `_pool_allocation_inputs` | Legacy capital deployment/explainability path; shares the same arithmetic as `_strategy_pool_budget` but independently assembles runtime facts. Exceptions at the primary entry gate are swallowed to `deployment = None`, while budget gates still control sizing. | Exact snapshot + exact named plan; unavailable required evidence blocks/defer entries. | No production caller; remove wrapper and inputs assembler after consumer migration.
+| `PCO.pending_symbol_amounts` (`paper_trading` 9650, 12401, 12423) | Sums pending BUY `qty × planned_price`; SQLite error returns `{}`; `COALESCE(planned_price,0)` can erase unknown price. Exclusion can be by signal id. | Exact-cycle, exact-order typed reservation evidence; read failure is `UNAVAILABLE`, never empty/zero. | Migrate entry/add-position conflict and exposure callers, then delete helper.
+| `PCO.pending_risk_exit_codes` (`paper_trading` 12332) | Treats every pending SELL as a risk exit, regardless of intent kind; SQLite error returns an empty set. | Canonical pending intent reader preserves explicit `RISK_EXIT`, `TAKE_PROFIT_EXIT`, `MANUAL_EXIT`, `RISK_REDUCE`, `NEW_ENTRY`, and `ADD_POSITION`; unknown legacy NULL is UNKNOWN and blocks conflicting entries. | Migrate risk-exit de-duplication caller, then delete helper.
+| `PCO.aggregate_exposure` (`paper_trading` 9859, 9882, 12422) | Aggregates positions, but missing quote falls back to position cost; its pending map is attached as pending metadata rather than fully market-valued exposure. | Exact quote-evidence-bound snapshot valuation and canonical plan capacity evidence. | Migrate all entry/add-position exposure gates; delete fallback aggregation.
+| `PCO.symbol_headroom` (`paper_trading` 9862, 12425) | Computes cap headroom from the above legacy exposure aggregate; no independent persistence or reservation. | Atomic existing order reservation followed by plan revalidation and Risk. | Migrate all callers; remove with legacy exposure path.
+| `PCO.theme_for` (`paper_trading` 9885) | Static industry-to-theme mapping used by the legacy theme exposure calculation. | Exact owner-issued classification in snapshot evidence, or keep the affected component `INSUFFICIENT_EVIDENCE`. | No production caller after exposure migration; remove coordinator module only when every caller is zero.
+| `OrderIntent` → `paper_orders` / execution | `OrderIntent` persists side/urgency/reason/context but has no canonical `intent_kind`; `paper_orders` has no allocation snapshot/plan provenance. Reason/purpose text cannot safely recover the missing kind. | Explicit production-action mapping at the action site; formally migrated nullable typed-kind and exact plan provenance, without guessing historical rows. | All new production orders carry validated typed intent and exact plan provenance; NULL history remains unknown until drained.
+
+### C0 evidence readiness: baseline findings
+
+| Required evidence | Existing owner at the R34-B merge | Readiness before R34-C owner work |
+| --- | --- | --- |
+| Exact cycle and strategy pins | `paper_cycle_ownership.exact_cycle_owner_snapshot`, `strategy_registry` cycle stamps, and `portfolio_runtime_service` | AVAILABLE for the explicit cycle/as-of snapshot. |
+| Exact market quote evidence for market value | `_quotes` supplies transient quote maps, but the runtime snapshot accepts only an identity string and deliberately records `market_value_by_account = None`; concentration is unavailable. | NOT READY: no persisted, verifiable quote observation/value owner is composed into R34-A facts. Cost basis is not a substitute. |
+| Exact cash / NAV | `paper_portfolio_read_model` owns cycle/as-of accounting and reconstructed cash; runtime `capital` can be AVAILABLE/PARTIAL. NAV requires a verified market-valued-position owner plus cash/reservations. | PARTIAL: exact cash exists, but exact portfolio NAV is blocked by missing quote-valued market value and reservation composition. |
+| Exact pending BUY reservation | `paper_capital_reservations` owns atomic reservation/consume/release; `_pending_buy_reservations` and legacy PCO aggregate views do not expose one canonical cycle/as-of typed projection. | NOT READY for canonical plan evidence; reservation failures/unknown price must remain unavailable. |
+| Exact typed pending conflict | No formal order `allocation_intent_kind`; PCO classifies sells by side and cannot distinguish exit classes. | NOT READY: add a migration-owned explicit typed order fact and strict reader; legacy NULL must remain UNKNOWN. |
+
+**C0 conclusion:** R34-A exact owner/cycle pins are ready. Market valuation,
+canonical NAV/reservation composition, and typed pending-conflict facts are not
+yet ready for production plan consumption. Add/compose those owner facts first;
+until then the affected components stay `INSUFFICIENT_EVIDENCE`. No production
+wiring may use cost-as-market, database-error-as-empty, missing reservation as
+zero, or a latest/current lookup as an exact fact.
+
+### C0 owner work progress (R34-C, before production wiring)
+
+- The snapshot capture API now passes an explicit R24 `MarketDataReading` into
+  the runtime evidence composer. Exact quote values are checked against the
+  full snapshot identity, as-of day, verification method, and position owner;
+  missing quotes keep the account market value `None`.
+- NAV is composed by `paper_portfolio_read_model.portfolio_for_context` from
+  bounded cycle/as-of cash and positions plus the verified quote map. The
+  runtime service records per-account NAV and marks capital `PARTIAL` if that
+  composition is unavailable. It does not add a second NAV arithmetic path.
+- Typed pending intents are read from persisted `paper_orders` fields and exact
+  plan provenance. Legacy NULL/invalid intent or plan provenance is surfaced as
+  an explicit unknown order. Query/schema failure is `UNAVAILABLE`; a valid
+  empty result is distinguishable from failure.
+- Exact active BUY reservation rows carry stable owner identity/fingerprint
+  and are cross-checked against the pending-order owner's order/cycle/account/
+  symbol/side identities. The runtime composer issues capacity only when the
+  exact portfolio read model and reservation evidence are both verified:
+  `used` is market-valued position value, `pending` is reserved BUY amount plus
+  fees, and `headroom` is reconstructed cash minus pending. Query, quote, or
+  identity failure leaves capacity `UNAVAILABLE`; an empty reservation set is
+  zero only after a successful exact query.
+- `paper_orders` now has nullable typed intent and exact allocation provenance
+  columns via a formal migration. Historical rows are not backfilled; NULL
+  stays unknown.
+- Canonical weights now resolve only from a complete set of exact cycle
+  account rows with active, as-of-effective `adaptive_allocation.weight_pct`
+  declarations. The resolver returns a cycle/as-of source identity and SHA-256
+  fingerprint. `_strategy_pool_weights`'s `max_exposure` fallback is a Risk
+  ceiling, not an allocation preference, and is not admitted as a plan weight.
+  Missing/inactive declarations fail closed; no equal-weight or `1.0` fallback
+  is invented.
+
+### C0 / M3 production wiring progress
+
+- Policy v2 computes capital allowances by calling the shared
+  `paper_allocation.allocation_plan` arithmetic owner with exact market-valued
+  exposure, exact pending reservation facts, NAV, pinned allocation weights,
+  lifecycle declarations, and explicit pool limits. Missing evidence remains
+  `INSUFFICIENT_EVIDENCE`; v1 plan fingerprints remain verifiable.
+- Both automatic strategy BUY and manual BUY now create an exact plan on the
+  caller's transaction, require planned slot/capital/capacity components and an
+  eligible typed intent, size from that plan, revalidate the same snapshot and
+  current slot occupancy before dispatch, and persist exact snapshot/plan/intent
+  provenance. Missing plan evidence defers the entry without invoking the old
+  BUY-path slot or capital allocator.
+- The manual BUY path no longer calls `_dynamic_position_limits` or
+  `_strategy_pool_budget`; manual SELL remains an existing-exposure exit and
+  does not require an allocation plan. Its pending-order intent is explicitly
+  `MANUAL_EXIT` and NULL historical rows remain unknown.
+- Confirmed swing scale-in and intraday buyback now submit explicit
+  `ADD_POSITION` intents, consume the exact plan's slot/capital/capacity and
+  market-value facts, revalidate the same snapshot before commit, and persist
+  allocation provenance. Their use of `_strategy_pool_budget` and the legacy
+  dynamic slot allocator has been removed. The typed conflict plan now gates
+  scale-in against exact pending exits and unknown same-symbol orders.
+- Capacity facts now include symbol-grouped amounts from validated formal BUY
+  reservations. A successful empty reservation query issues zero per eligible
+  strategy while retaining the exact global `pending_total`; query failure
+  remains unavailable. Shared market value includes every economic owner,
+  including paused/risk-exit-only owners, while only execution participants
+  receive new-resource weights and per-strategy pending allowances. Automatic
+  BUY and existing-position additions use those facts; the failure-as-empty
+  pending-symbol helper has no remaining production caller.
+- General dashboard summaries no longer invoke `_dynamic_position_limits`,
+  `_strategy_pool_budget`, or the legacy pending-slot reader. Since a general
+  dashboard request has no exact plan identity, its allocation and pending
+  slot fields are `UNAVAILABLE`/`null`; users can inspect facts in Portfolio
+  Workspace by supplying an explicit cycle and plan ID. The dashboard does not
+  choose a latest plan or show fallback slot/capital numbers.
+- Portfolio Workspace now has a read-only exact-cycle/exact-plan backend
+  projection and UI. It verifies the named plan/snapshot and related order
+  provenance, renders owner facts and blocking reasons, and leaves risk
+  decision / production permission unavailable.
+- Production convergence is still incomplete. Confirmed scale-in and intraday
+  buyback no longer call old budget or coordinator helpers. The BUY entry path
+  now fails closed when optional symbol/theme aggregate risk caps are enabled,
+  because no strict owner yet issues the required market-valued
+  symbol/industry/theme headroom; it does not consume the coordinator's
+  cost-as-market output. General dashboard and allocation-explain views now
+  withhold allocation amounts unless the user supplies an exact cycle and plan
+  identity through Portfolio Workspace; they do not select or build a plan.
+  The old `_strategy_pool_budget`, `_allocation_plan`, and their input
+  assembler are deleted; `_slot_upgrade_context` and `_apply_slot_borrow` are
+  deleted as well. `_dynamic_position_limits` remains only as Risk's
+  capacity-exit review input, while `_rollback_slot_borrow` remains for
+  recovery of legacy in-flight orders. `portfolio_coordinator.py` and its
+  dedicated legacy unit suite plus coordinator-specific property assertions
+  were deleted after confirming zero production callers. Optional
+  symbol/industry/theme risk caps still fail closed without a strict exposure
+  owner. C0-C35 traceability and M-C1-M-C24 mutation checks are complete. The
+  canonical allocation-weight resolver reads append-only
+  `paper_parameter_versions` rows bounded by cycle, effective date and decision
+  timestamp; current `paper_accounts.params` is not an authority on this path.
+  RC15 proves a later same-day apply cannot change an earlier decision, and
+  RC16 proves rollback appends a replayable historical fact. RC17 proves a
+  failed adaptive status write restores complete pre-apply params; RC18 proves
+  the failed B fact remains replayable after compensation restores A/P; RC19
+  proves all accounts in one apply share one owner timestamp; RC20 proves
+  compensation history and restored account projections share one batch
+  timestamp while preserving each complete pre-apply params snapshot. Mutable current
+  parameter reads on this canonical path: before 1, after 0. Historical
+  parameter owner reads: before 0, after 1. Implementation commit `caf692d`
+  passed local and GitHub CI gates; both inline review threads are resolved.
+  PR #227 remains open and unmerged.
+  R34-C is IN REVIEW, while R34 remains incomplete.
+### Import graph guard
+
+Current relevant direction:
+
+```text
+api_paper ──> paper_trading ──> portfolio_runtime_service
+                          └──> portfolio_allocation_service
+portfolio_runtime_service ──> portfolio facts owners / runtime repository
+portfolio_allocation_service ──> policy / exact repositories / strategy owners
+```
+
+Both plan services now receive an explicit SQLite connection. They do not
+import `paper_trading`, open their own connections, or commit caller-owned
+transactions. API wrappers own transaction boundaries. This keeps the
+production dependency one-way and lets entry orchestration append snapshot and
+plan evidence in the same transaction without a local/lazy import.

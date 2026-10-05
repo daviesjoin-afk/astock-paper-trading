@@ -202,22 +202,6 @@ class BudgetPenaltyTests(unittest.TestCase):
         self.assertLess(per_member, 0.03)
 
 
-class WiringGuardTests(unittest.TestCase):
-    @staticmethod
-    def _source(name="paper_trading.py"):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
-
-    def test_runtime_compilation_feeds_the_diversification_factor(self):
-        body = self._source()
-        self.assertIn("_strategy_cluster_factors", body)
-        self.assertIn("diversification=diversification", body)
-
-    def test_both_budget_paths_use_cluster_factors(self):
-        body = self._source()
-        # 席位分配与资金预算两条路径都要接簇系数。
-        self.assertGreaterEqual(body.count("cluster_factors"), 3)
 
 
 if __name__ == "__main__":
