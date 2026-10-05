@@ -568,6 +568,11 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
 - Swing scale-in and intraday buyback now declare `ADD_POSITION`, consume exact
   slot/capital/capacity facts, revalidate the same snapshot, and persist exact
   allocation provenance.
+- Canonical allocation weights resolve from append-only
+  `paper_parameter_versions`, filtered by cycle, effective date, and decision
+  timestamp. Current `paper_accounts.params` is not historical evidence. RC15
+  covers two same-day applies; RC16 covers apply/apply/rollback replay at three
+  decision times while preserving all three owner facts.
 - Runtime capacity includes pending amount grouped by symbol from validated
   formal BUY reservations. Pending query failure stays unavailable. After
   proving zero production callers, `portfolio_coordinator.py` and its
@@ -581,7 +586,7 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
   navigation, desktop/mobile layout, and browser console/page errors.
 - Full backend pytest, focused execution, reservation, intent, runtime,
   allocation and architecture regressions pass. Frontend build/unit (157/157),
-  Chromium E2E (36/36), Ruff, compileall, M-C1–M-C17 and local security scan
+  Chromium E2E (36/36), Ruff, compileall, M-C1–M-C20 and local security scan
   pass. CI-equivalent Docker unittest and remote exact-head checks remain
   pending. Legacy BUY/capital allocation and
   slot-borrow decision helpers are removed; Risk capacity-exit review retains
@@ -589,7 +594,7 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
   empty reservation query issues eligible-account zeros while preserving global
   `pending_total`; shared exposure includes all economic owners, but allowance
   weights/pending maps include only execution participants. C0-C35 have
-  regression traceability below. M-C1-M-C17 are all detected with zero survived,
+  regression traceability below. M-C1-M-C20 are all detected with zero survived,
   fake, or timeout mutations and byte-for-byte restoration. PR #227 is open and
   remains unmerged; exact-head Docker/remote CI and review-thread closure remain
   outstanding. R34-C is IN REVIEW and R34 remains incomplete.
@@ -637,7 +642,15 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
 
 ### R34-C semantic mutation results
 
-`work/r34c_production_wiring_mutation_check.py` result: M-C1-M-C17 all
+`work/r34c_production_wiring_mutation_check.py` result: M-C1-M-C20 all
 **DETECTED**; `survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and
 the focused baseline after restore is green.
+
+### Allocation-weight historical owner regressions
+
+| ID | Regression coverage |
+|---|---|
+| RC15 | `test_rc15_later_weight_apply_cannot_heal_earlier_decision`: 09:00 30/70 and 14:00 40/60 owner rows on one effective date resolve correctly at 10:00 and 15:00. |
+| RC16 | `test_rc16_rollback_appends_a_replayable_parameter_fact`: 09:00 apply, 14:00 apply, and 16:00 rollback resolve correctly at 10:00/15:00/17:00, retaining all three history rows. |
+| ADD_POSITION | `test_synthesized_add_position_callers_pass_the_enforced_gate`: contract v1 in user mode sends both synthetic callers through typed `ADD_POSITION` enforcement and reaches the planner. |
 

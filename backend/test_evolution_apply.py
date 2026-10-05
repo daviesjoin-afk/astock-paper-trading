@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import dual_ai_tuner
@@ -111,7 +112,13 @@ class EvolutionApplyTestBase(unittest.TestCase):
                     id TEXT PRIMARY KEY, name TEXT, source_strategy TEXT,
                     status TEXT, initial_cash REAL, cash REAL, cycle_days INTEGER,
                     max_positions INTEGER, max_weight REAL, max_exposure REAL,
-                    version TEXT, params TEXT, updated_at TEXT);
+                    version TEXT, style TEXT, cycle_id INTEGER,
+                    params TEXT, updated_at TEXT);
+                CREATE TABLE paper_parameter_versions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL, version TEXT NOT NULL, style TEXT NOT NULL,
+                    params TEXT NOT NULL, reason TEXT NOT NULL,
+                    effective_date TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE TABLE paper_audit(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT,
                     event TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL);
@@ -126,10 +133,10 @@ class EvolutionApplyTestBase(unittest.TestCase):
             ):
                 conn.execute(
                     "INSERT INTO paper_accounts(id,name,source_strategy,status,initial_cash,"
-                    "cash,cycle_days,max_positions,max_weight,max_exposure,version,params,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "cash,cycle_days,max_positions,max_weight,max_exposure,version,style,"
+                    "cycle_id,params,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (account_id, account_id, source, "active", 100000.0, 100000.0,
-                     60, 15, 0.10, 0.80, "v1", "{}", _iso_recent()),
+                     60, 15, 0.10, 0.80, "v1", "balanced", 1, "{}", _iso_recent()),
                 )
 
     @contextmanager
@@ -218,32 +225,121 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
         self.assertEqual(status, "applied")
 
     def test_canonical_weight_owner_consumes_allocation_overlay(self):
-        """已批准的权重覆盖由 exact canonical owner 读取，缺声明不做猜测。"""
+        """已批准权重由追加式参数版本 owner 读取。"""
         decision_id = self._seed_decision()
         evolution_apply.apply_allocation(
             self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
         conn = self._paper()
         try:
-            rows = [dict(r) for r in conn.execute("SELECT * FROM paper_accounts")]
+            rows = PAW.read_canonical_allocation_weight_owner_rows(
+                conn, eligible_account_ids=tuple(
+                    row["id"] for row in conn.execute(
+                        "SELECT id FROM paper_accounts ORDER BY id").fetchall()),
+                cycle_id=1,
+            )
         finally:
             conn.close()
         cycle_id = 1
-        owner_rows = [{**row, "cycle_id": cycle_id} for row in rows]
-        asof_day = max(
-            json.loads(row["params"] or "{}")["adaptive_allocation"]["effective_date"]
-            for row in rows if json.loads(row["params"] or "{}").get("adaptive_allocation")
-        )
+        asof_day = datetime.now(TZ).date().isoformat()
         resolved = PAW.resolve_canonical_allocation_weights(
-            owner_rows,
-            eligible_account_ids=tuple(row["id"] for row in owner_rows),
+            rows,
+            eligible_account_ids=tuple(row["account_id"] for row in rows),
             cycle_id=cycle_id,
             asof_day=asof_day,
+            decision_at=(datetime.now(TZ) + timedelta(minutes=1)).isoformat(),
             strategy_pins=[{"account_id": row["id"], "strategy_id": row["id"],
                             "strategy_version": 1, "strategy_checksum": "a" * 64}
-                           for row in owner_rows],
+                           for row in self._paper_account_rows()],
         )
         self.assertAlmostEqual(resolved["weights"]["tq_breakout"], 0.40)
         self.assertAlmostEqual(resolved["weights"]["trend_pullback"], 0.25)
+
+    def _paper_account_rows(self):
+        conn = self._paper()
+        try:
+            return [dict(row) for row in conn.execute(
+                "SELECT id FROM paper_accounts ORDER BY id")]
+        finally:
+            conn.close()
+
+    def _allocation_weight_pair(self, decision_at):
+        with self._paper_ctx() as conn:
+            owner_rows = PAW.read_canonical_allocation_weight_owner_rows(
+                conn, eligible_account_ids=("tq_breakout", "trend_pullback"),
+                cycle_id=1)
+        ids = ("tq_breakout", "trend_pullback")
+        resolved = PAW.resolve_canonical_allocation_weights(
+            owner_rows, eligible_account_ids=ids, cycle_id=1,
+            asof_day=datetime.now(TZ).date().isoformat(), decision_at=decision_at,
+            strategy_pins=[{"account_id": account, "strategy_id": account,
+                            "strategy_version": 1,
+                            "strategy_checksum": "a" * 64} for account in ids],
+        )
+        return resolved["weights"]
+
+    def _apply_two_account_weights(self, weights):
+        import adaptive_engine as engine
+
+        with self._adaptive_ctx() as conn:
+            conn.execute(
+                "UPDATE adaptive_config SET value=? WHERE key='max_strategy_weight_pct'",
+                (json.dumps(100.0),),
+            )
+        decision_id = self._seed_decision(weights=weights)
+        with mock.patch.object(engine, "ACCOUNT_LABELS", {
+                "tq_breakout": "突破策略", "trend_pullback": "回撤策略"}):
+            evolution_apply.apply_allocation(
+                self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+
+    def test_rc15_later_weight_apply_cannot_heal_earlier_decision(self):
+        today = datetime.now(TZ).date().isoformat()
+        clock = {"now": f"{today}T09:00:00+08:00"}
+        with mock.patch.object(evolution_apply, "_now", side_effect=lambda: clock["now"]):
+            self._apply_two_account_weights({"tq_breakout": 30.0, "trend_pullback": 70.0})
+            clock["now"] = f"{today}T14:00:00+08:00"
+            self._apply_two_account_weights({"tq_breakout": 40.0, "trend_pullback": 60.0})
+
+        old = self._allocation_weight_pair(f"{today}T10:00:00+08:00")
+        new = self._allocation_weight_pair(f"{today}T15:00:00+08:00")
+        self.assertEqual({"tq_breakout": 0.3, "trend_pullback": 0.7}, old)
+        self.assertEqual({"tq_breakout": 0.4, "trend_pullback": 0.6}, new)
+
+    def test_rc16_rollback_appends_a_replayable_parameter_fact(self):
+        today = datetime.now(TZ).date().isoformat()
+        clock = {"now": f"{today}T09:00:00+08:00"}
+        ids = ("tq_breakout", "trend_pullback")
+        with mock.patch.object(evolution_apply, "_now", side_effect=lambda: clock["now"]):
+            self._apply_two_account_weights({"tq_breakout": 30.0, "trend_pullback": 70.0})
+            clock["now"] = f"{today}T14:00:00+08:00"
+            self._apply_two_account_weights({"tq_breakout": 40.0, "trend_pullback": 60.0})
+            clock["now"] = f"{today}T16:00:00+08:00"
+            for account in ids:
+                evolution_apply.rollback_allocation(
+                    self.paper_path, account, reason="RC16 rollback", confirmed=True)
+
+        self.assertEqual(
+            {"tq_breakout": 0.3, "trend_pullback": 0.7},
+            self._allocation_weight_pair(f"{today}T10:00:00+08:00"),
+        )
+        self.assertEqual(
+            {"tq_breakout": 0.4, "trend_pullback": 0.6},
+            self._allocation_weight_pair(f"{today}T15:00:00+08:00"),
+        )
+        self.assertEqual(
+            {"tq_breakout": 0.3, "trend_pullback": 0.7},
+            self._allocation_weight_pair(f"{today}T17:00:00+08:00"),
+        )
+        with self._paper_ctx() as conn:
+            for account in ids:
+                facts = conn.execute(
+                    "SELECT id,reason FROM paper_parameter_versions "
+                    "WHERE cycle_id=1 AND account_id=? ORDER BY id", (account,),
+                ).fetchall()
+                self.assertEqual(3, len(facts))
+                self.assertEqual(3, len({int(row["id"]) for row in facts}))
+                self.assertIn("adaptive allocation applied", facts[0]["reason"])
+                self.assertIn("adaptive allocation applied", facts[1]["reason"])
+                self.assertIn("RC16 rollback", facts[2]["reason"])
 
     def test_rollback_restores_no_previous(self):
         decision_id = self._seed_decision()

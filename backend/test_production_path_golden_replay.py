@@ -226,11 +226,12 @@ def _declare_allocation_weight(account_id: str, weight_pct: float = 100.0) -> No
     conn = sqlite3.connect(PT.DB_PATH)
     try:
         row = conn.execute(
-            "SELECT params FROM paper_accounts WHERE id=?", (account_id,),
+            "SELECT id,cycle_id,version,style,params FROM paper_accounts WHERE id=?",
+            (account_id,),
         ).fetchone()
         if row is None:
             raise AssertionError(f"missing allocation weight account: {account_id}")
-        params = json.loads(row[0] or "{}")
+        params = json.loads(row[4] or "{}")
         params["adaptive_allocation"] = {
             "weight_pct": weight_pct,
             "status": "active",
@@ -238,6 +239,14 @@ def _declare_allocation_weight(account_id: str, weight_pct: float = 100.0) -> No
         }
         conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
                      (json.dumps(params, ensure_ascii=False), account_id))
+        conn.execute(
+            """INSERT INTO paper_parameter_versions(
+                   cycle_id,account_id,version,style,params,reason,effective_date,created_at
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (row[1], row[0], row[2], row[3],
+             json.dumps(params, ensure_ascii=False), "test adaptive allocation owner",
+             D0.isoformat(), f"{D0.isoformat()}T09:00:00+08:00"),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -305,21 +314,30 @@ def _run_open_slot(day, slot="open"):
 
 
 def _declare_test_allocation_weights(conn, account_ids, weight_pct=100.0):
-    """Give replay accounts explicit as-of-valid weights required by R34-C."""
+    """Give replay accounts explicit append-only as-of owner facts."""
     effective_date = D0.isoformat()
     for account_id in account_ids:
         row = conn.execute(
-            "SELECT params FROM paper_accounts WHERE id=?", (str(account_id),)
+            "SELECT id,cycle_id,version,style,params FROM paper_accounts WHERE id=?",
+            (str(account_id),)
         ).fetchone()
         if row is None:
             raise AssertionError(f"missing replay account: {account_id}")
-        params = json.loads(row[0] or "{}")
+        params = json.loads(row[4] or "{}")
         params["adaptive_allocation"] = {
             "weight_pct": float(weight_pct), "status": "active",
             "effective_date": effective_date,
         }
         conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
                      (json.dumps(params, ensure_ascii=False), str(account_id)))
+        conn.execute(
+            """INSERT INTO paper_parameter_versions(
+                   cycle_id,account_id,version,style,params,reason,effective_date,created_at
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (row[1], row[0], row[2], row[3],
+             json.dumps(params, ensure_ascii=False), "test adaptive allocation owner",
+             effective_date, f"{effective_date}T09:00:00+08:00"),
+        )
     conn.commit()
 
 

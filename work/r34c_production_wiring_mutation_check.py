@@ -25,6 +25,11 @@ BASELINE = (
     "test_portfolio_workspace.PortfolioWorkspaceServiceTests.test_workspace_requires_matching_cycle_and_never_looks_up_latest",
     "test_portfolio_allocation_policy.PersistenceTests.test_corrupt_stored_plan_is_rejected",
     "test_paper_trading_architecture_guard.EntryCapitalPlanningIsBounded.test_guard10g_production_buy_callers_pass_cycle_and_asof",
+    "test_paper_trading_architecture_guard.EntryCapitalPlanningIsBounded.test_guard10h_canonical_allocation_weight_uses_parameter_history",
+    "test_evolution_apply.ApplyAllocationTests.test_rc15_later_weight_apply_cannot_heal_earlier_decision",
+    "test_evolution_apply.ApplyAllocationTests.test_rc16_rollback_appends_a_replayable_parameter_fact",
+    "test_order_intent_contract.OrderIntentContractTests.test_synthesized_add_position_callers_pass_the_enforced_gate",
+    "test_portfolio_order_intents.PortfolioOrderIntentOwnerTests.test_rc14_unapproved_waitlist_markers_do_not_block_resource_intents",
 )
 
 POLICY = "backend/portfolio_allocation_policy.py"
@@ -33,6 +38,7 @@ ALLOCATION_REPO = "backend/portfolio_allocation_repository.py"
 WORKSPACE = "backend/portfolio_workspace_service.py"
 PAPER = "backend/paper_trading.py"
 MANUAL = "backend/manual_orders.py"
+WEIGHTS = "backend/portfolio_allocation_weights.py"
 
 GUARD = ("test_paper_trading_architecture_guard.EntryCapitalPlanningIsBounded."
          "test_guard10g_production_buy_callers_pass_cycle_and_asof")
@@ -133,6 +139,34 @@ MUTATIONS = [
         '            and plan.allocation_policy_version == POLICY_VERSION)')],
      "detectors": ["test_portfolio_allocation_policy.PlanIdentityTests."
                    "test_b3a_historical_v1_plan_fingerprint_remains_verifiable"]},
+    {"id": "M-C18", "semantic": "canonical resolver reads mutable current allocation params",
+     "edits": [(WEIGHTS,
+        '"""SELECT id,cycle_id,account_id,version,style,params,reason,\n'
+        '                      effective_date,created_at\n'
+        '                 FROM paper_parameter_versions\n'
+        '                WHERE cycle_id=? AND account_id IN (""" + placeholders + ")",',
+        '"""SELECT rowid AS id,cycle_id,id AS account_id,version,style,params,\n'
+        '                      \'current mutable account params\' AS reason,\n'
+        '                      date(updated_at) AS effective_date,updated_at AS created_at\n'
+        '                 FROM paper_accounts\n'
+        '                WHERE cycle_id=? AND id IN (""" + placeholders + ")",')],
+     "detectors": ["test_evolution_apply.ApplyAllocationTests."
+                   "test_rc15_later_weight_apply_cannot_heal_earlier_decision"]},
+    {"id": "M-C19", "semantic": "unapproved waitlist markers re-enter executable pending intents",
+     "edits": [("backend/portfolio_order_intents.py",
+        '    "unfilled_limit_down",\n)',
+        '    "unfilled_limit_down", "deferred_capacity", "entry_frozen_waitlist",\n)')],
+     "detectors": ["test_portfolio_order_intents.PortfolioOrderIntentOwnerTests."
+                   "test_rc14_unapproved_waitlist_markers_do_not_block_resource_intents"]},
+    {"id": "M-C20", "semantic": "synthesized add-position caller loses its explicit intent kind",
+     "edits": [(PAPER,
+        '        {"pick": {"code": position["code"], "price": _num(quote.get("price")),\n'
+        '                  "reason": "日内回补（同日高抛库存）"},\n'
+        '         "order_intent": {"intent_kind": "ADD_POSITION"}},',
+        '        {"pick": {"code": position["code"], "price": _num(quote.get("price")),\n'
+        '                  "reason": "日内回补（同日高抛库存）"}},')],
+     "detectors": ["test_order_intent_contract.OrderIntentContractTests."
+                   "test_synthesized_add_position_callers_pass_the_enforced_gate"]},
 ]
 
 

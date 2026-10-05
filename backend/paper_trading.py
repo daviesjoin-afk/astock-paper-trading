@@ -8108,11 +8108,12 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
         if reading.snapshot is not None else None,
         market_reading=reading)
     eligible_ids = {str(value) for value in snapshot["execution_participant_ids"]}
-    cycle_rows = _shared_account_rows(conn, cycle_id)
+    history_rows = PAW.read_canonical_allocation_weight_owner_rows(
+        conn, eligible_account_ids=eligible_ids, cycle_id=cycle_id)
     weights = PAW.resolve_canonical_allocation_weights(
-        [row for row in cycle_rows if str(row.get("id")) in eligible_ids],
+        history_rows,
         eligible_account_ids=eligible_ids,
-        cycle_id=cycle_id, asof_day=asof_day,
+        cycle_id=cycle_id, asof_day=asof_day, decision_at=decision_at,
         strategy_pins=snapshot["strategy_pins"])
     conflict_dimension = next(
         (item for item in snapshot["dimensions"]

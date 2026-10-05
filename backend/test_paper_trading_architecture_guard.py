@@ -973,6 +973,7 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                 f"{name} must pass typed ADD_POSITION into enforced OrderIntent mode",
             )
             self.assertNotIn("_strategy_pool_budget(", body)
+
             self.assertIn("_entry_plan_sizing_facts(", body)
             self.assertIn("_revalidate_portfolio_entry_plan(", body)
         buy = self._flat("_buy_order")
@@ -1005,6 +1006,16 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertIn('allocation_provenance["portfolio_snapshot_id"]', manual)
         self.assertIn('allocation_provenance["portfolio_snapshot_fingerprint"]', manual)
         self.assertNotIn("get_latest_plan(", manual)
+
+    def test_guard10h_canonical_allocation_weight_uses_parameter_history(self):
+        """Canonical production weights use append-only point-in-time owner rows."""
+        body = self._flat("_build_portfolio_entry_plan")
+        self.assertIn("PAW.read_canonical_allocation_weight_owner_rows(", body)
+        self.assertIn("decision_at=decision_at", body)
+        self.assertNotIn(
+            "_shared_account_rows(", body,
+            "canonical allocation weights must not read mutable current account params",
+        )
 
 
 

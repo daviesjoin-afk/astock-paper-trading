@@ -397,8 +397,15 @@ zero, or a latest/current lookup as an exact fact.
   dedicated legacy unit suite plus coordinator-specific property assertions
   were deleted after confirming zero production callers. Optional
   symbol/industry/theme risk caps still fail closed without a strict exposure
-  owner. C0-C35 traceability and M-C1-M-C17 mutation checks are complete. PR
-  #227 is open for review; final exact-head Docker/remote CI remains pending.
+  owner. C0-C35 traceability and M-C1-M-C20 mutation checks are complete. The
+  canonical allocation-weight resolver reads append-only
+  `paper_parameter_versions` rows bounded by cycle, effective date and decision
+  timestamp; current `paper_accounts.params` is not an authority on this path.
+  RC15 proves a later same-day apply cannot change an earlier decision, and
+  RC16 proves rollback appends a replayable historical fact. Mutable current
+  parameter reads on this canonical path: before 1, after 0. Historical
+  parameter owner reads: before 0, after 1. PR #227 remains open; final exact-
+  head CI remains pending.
   R34-C is IN REVIEW, while R34 remains incomplete.
 ### Import graph guard
 
