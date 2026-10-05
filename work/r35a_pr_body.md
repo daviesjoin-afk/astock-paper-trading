@@ -128,25 +128,42 @@ pinned baseline / parent / reference 存在。本 PR 的验收标准是**可信�
 | Finding | Fix | Regression |
 | --- | --- | --- |
 | P2 — parent constraints dropped when no override is supplied (`strategy_candidate_service.py`) | `pin_parent_strategy` now inherits `definition.metadata.constraints` from the **exact pinned version** when the caller supplies no override. An empty constraint set is not "unconstrained": it silently discarded the parent's position / exposure / weight limits and made the candidate no longer the parent's semantics. An explicit override still replaces it. | `test_c3e_parent_metadata_constraints_are_inherited_not_dropped` |
-| P2 — same-second proposals collide and lose an event (`strategy_candidate_repository.py`) | Proposal identity now includes microsecond-precision timestamps **and** a process-unique event sequence, so two proposals of the same candidate with the same input in the same second are two distinct append-only history rows instead of one silently collapsed by `INSERT OR IGNORE`. | `test_c6d_every_proposal_occurrence_gets_its_own_identity` |
+| P2 — same-second proposals collide and lose an event (`strategy_candidate_repository.py`) | `proposal_id` is now an **opaque event identity** (`secrets.token_hex(32)`), not a content fingerprint: it no longer depends on a process-local counter, PID, thread id, wall-clock timestamp, or any candidate/proposal content hash as its uniqueness authority. Two proposals of the same candidate with the same input and an **identical `created_at`** are two distinct append-only rows. The event write is a fail-closed plain `INSERT` (no `INSERT OR IGNORE`), so an unexpected id collision raises instead of pretending the second event was recorded. `created_at` stays event timestamp / ordering metadata only. | `test_c6d_every_proposal_occurrence_gets_its_own_identity`; `test_c6e_proposal_event_identity_survives_process_local_identity_reset`; `test_c6f_unexpected_proposal_id_collision_fails_closed`; `test_c6g_proposal_identity_is_not_a_content_fingerprint` |
 
 Both were reproduced before fixing (same-second proposals collapsed to 1 row;
 inherited constraints came back as `{}`).
 
+## Candidate identity vs proposal event identity
+
+```text
+candidate row  → content identity: canonical fingerprint → semantic dedup (idempotent)
+proposal row   → event identity:   opaque event id      → append every occurrence
+```
+
+`proposal_id` is an opaque event id, **not** a proposal content fingerprint. Forbidden
+as uniqueness authority: process-local counter, PID, thread id, second-level (or any)
+wall-clock timestamp, candidate content hash, proposal content hash. `created_at` is
+metadata, not uniqueness authority. Candidate rows keep `INSERT OR IGNORE` (the
+canonical fingerprint **is** the dedup authority); the event table uses a fail-closed
+`INSERT`. The append-only `*_no_update` / `*_no_delete` triggers are unchanged.
+
 ## Focused tests
 
 ```text
-backend/test_r35a_strategy_candidate.py        48 tests  OK   (C1–C10)
-backend/test_strategy_api_contract.py          18 tests  OK   (+ HTTP candidate journey)
-backend/test_db_migrate.py / test_paper_schema_migrations.py / test_strategy_dsl.py
+backend/test_r35a_strategy_candidate.py        51 tests  OK   (C1–C10)
+  incl. C6d / C6e / C6f / C6g (proposal event identity, fail-closed collision)
+backend/test_strategy_api_contract.py / test_db_migrate.py
+  / test_paper_schema_migrations.py / test_strategy_dsl.py
   / test_strategy_parameter_schema.py / test_strategy_registry.py
-  / test_repository_hygiene.py / test_frontend_module_contract.py   118 tests OK
+  / test_repository_hygiene.py                 110 tests OK (skipped=1, focused set)
 frontend/tests/strategy-candidates.test.mjs     6 tests  pass (R35A-C1…C6)
+ruff check backend / compileall / git diff --check   all clean
 ```
 
 C1 deterministic identity · C2 semantic mutation changes identity · C3 parent pinning ·
 C4 arbitrary executable payload rejected · C5 missing provenance fails closed ·
-C6 dedup · C7 append-only identity · C8 persistence round trip · C9 no promotion/execution
+C6 candidate semantic dedup + proposal event identity (C6d/C6e/C6f/C6g) ·
+C7 append-only identity · C8 persistence round trip · C9 no promotion/execution
 authority · C10 current-state leakage cannot rebind a stored candidate.
 
 ## Mutation result
@@ -160,8 +177,9 @@ M-G3 DETECTED (candidate identity becomes random instead of canonical)
 M-G4 DETECTED (a missing parent checksum falls back to the current version)
 M-G5 DETECTED (arbitrary executable candidate payload is accepted)
 M-G6 DETECTED (a parameter-only variant silently drops the parent's constraints)
-M-G7 DETECTED (same-second proposals collapse into one identity and lose an event)
-M-G detected = 7/7
+M-G7 DETECTED (proposal identity degrades to candidate + payload + timestamp and loses an event)
+M-G8 DETECTED (a proposal id collision is silently swallowed by INSERT OR IGNORE)
+M-G detected = 8/8
 survived = 0; fake = 0; timeout = 0
 restore SHA256 = PASS
 baseline after restore = GREEN
@@ -170,8 +188,8 @@ baseline after restore = GREEN
 ## Full verification
 
 ```text
-backend full suite (local, Python 3.14.5)      Ran 5346 tests   OK (skipped=5)
-backend full suite (Docker, --network none)    Ran 5346 tests   OK (skipped=30)
+backend full suite (local, Python 3.14.5)      Ran 5346 tests   OK (skipped=5)   [previous head]
+backend full suite (Docker, --network none)    Ran 5346 tests   OK (skipped=30)  [previous head]
 frontend unit tests (node --test)              163 tests  pass 0 fail
 Chromium E2E (npx playwright test, workers=1)  37 passed
 ruff check backend                             All checks passed!
@@ -179,6 +197,10 @@ python -m compileall -q backend                clean
 git diff --check                               clean
 security leak scan (--scope worktree / all)    kinds none, values 0, exit 0
 ```
+
+本 head 的 focused 验证（P2 proposal-identity 修复）见上；完整 gate 交给 exact-head
+GitHub CI（tests / docker --network none / frontend / Chromium E2E / quality / syntax /
+security）。
 
 ## Architecture / maintainability report
 

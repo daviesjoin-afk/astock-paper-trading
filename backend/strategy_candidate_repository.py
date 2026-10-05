@@ -15,12 +15,25 @@ Dedup authority: a repeated proposal of the same canonical candidate is
 idempotent on ``candidate_id``. The original proposal's source evidence is
 preserved — re-proposals are recorded in ``strategy_candidate_proposals`` rather
 than replacing the candidate row, so去重不会丢掉"谁、什么时候、为什么又提了一次"。
+
+Two identities, two contracts — 不要混：
+
+```text
+candidate row  → content identity (canonical fingerprint) → semantic dedup
+proposal row   → opaque event identity                    → append every occurrence
+```
+
+``proposal_id`` is an **opaque event identity** (``secrets.token_hex(32)``), never a
+fingerprint of the proposal content, and ``created_at`` is metadata, not uniqueness
+authority. Because every occurrence is a real event, the proposal write is a plain
+``INSERT`` (fail closed on an unexpected id collision) rather than
+``INSERT OR IGNORE``, which would silently swallow a second real event.
 """
 from __future__ import annotations
 
 import datetime as dt
-import itertools
 import json
+import secrets
 import sqlite3
 
 import strategy_candidate as SC
@@ -30,20 +43,31 @@ class StrategyCandidateRepositoryError(ValueError):
     pass
 
 
-#: 同一进程内的提案事件序号。提案是**事件**，不是内容的函数：同一秒（甚至同一
-#: 微秒）内对同一候选、同一输入提出两次，是两条独立的历史记录，必须各自有身份。
-#: 只按内容 + 秒级时间戳取 id 会让第二条被 ``INSERT OR IGNORE`` 静默吞掉，
-#: 从而违反"append-only 台账记录每一次提案"的契约。
-_PROPOSAL_SEQUENCE = itertools.count(1)
-
-
 def _proposal_event_identity(created_at: str | None) -> tuple[str, str]:
-    """Return ``(iso_timestamp_with_microseconds, process_unique_sequence)``."""
-    if created_at is None:
-        stamp = dt.datetime.now(dt.timezone.utc).isoformat()
-    else:
-        stamp = str(created_at)
-    return stamp, str(next(_PROPOSAL_SEQUENCE))
+    """Return ``(event_timestamp, opaque_event_id)`` for one proposal occurrence.
+
+    Candidate identity and proposal identity are **different kinds of identity**:
+
+    * a candidate is a *content* identity — canonical specification → deterministic
+      fingerprint → safe to deduplicate;
+    * a proposal is an *event* identity — every occurrence is a new historical fact
+      and must never be deduplicated by content.
+
+    ``proposal_id`` is therefore an **opaque event identity** drawn from the OS
+    CSPRNG (``secrets.token_hex(32)``), not a content fingerprint. It deliberately
+    does **not** depend on any process-local uniqueness authority — no process
+    counter, no PID, no thread id, no wall-clock timestamp, and no candidate /
+    proposal content hash as the uniqueness authority. A process-local counter
+    restarts at 1 after every restart and is not shared across workers, so
+    ``(candidate, payload, created_at, sequence)`` can collide across processes and
+    would let a real proposal event be swallowed.
+
+    ``created_at`` stays what it is: the event timestamp / ordering metadata. It is
+    **not** a uniqueness authority, and two proposals may legitimately carry the
+    exact same ``created_at``.
+    """
+    stamp = dt.datetime.now(dt.timezone.utc).isoformat() if created_at is None else str(created_at)
+    return stamp, secrets.token_hex(32)
 
 
 def _payload(candidate: SC.StrategyCandidate) -> str:
@@ -115,6 +139,12 @@ def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *
     This is how dedup keeps its evidence: the candidate row is written once, but
     every proposal (generator, as-of, hypothesis, model, input fingerprint) is
     appended. Returns the proposal id.
+
+    ``proposal_id`` is an opaque event identity: it is **not** a fingerprint of the
+    proposal content, so two occurrences with an identical candidate, identical
+    payload and an identical ``created_at`` are still two distinct rows. The write
+    is fail-closed (plain ``INSERT``): an unexpected id collision raises instead of
+    pretending the second event was recorded.
     """
     if not isinstance(candidate, SC.StrategyCandidate):
         raise TypeError("canonical strategy candidate is required")
@@ -126,12 +156,9 @@ def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *
         research_provenance=candidate.research_provenance,
         input_fingerprint=input_fingerprint, random_seed=candidate.random_seed,
         model_identity=candidate.model_identity)
-    stamp, sequence = _proposal_event_identity(created_at)
-    proposal_id = SC._sha({"candidate_id": candidate.candidate_id,
-                           "proposal": json.loads(payload), "created_at": stamp,
-                           "event_sequence": sequence})
+    stamp, proposal_id = _proposal_event_identity(created_at)
     conn.execute(
-        """INSERT OR IGNORE INTO strategy_candidate_proposals
+        """INSERT INTO strategy_candidate_proposals
            (proposal_id,candidate_id,input_fingerprint,proposal_json,created_at)
            VALUES(?,?,?,?,?)""",
         (proposal_id, candidate.candidate_id, input_fingerprint, payload, stamp),

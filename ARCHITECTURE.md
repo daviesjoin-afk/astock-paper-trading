@@ -3668,6 +3668,22 @@ API / frontend
 但每次提案的来源证据（generator / as-of / hypothesis / model / input fingerprint）
 追加进 `strategy_candidate_proposals`，因此去重不会丢失"谁、何时、为何又提了一次"。
 
+**Candidate identity 与 proposal identity 是两种身份，契约分开**：
+
+```text
+candidate row  → content identity：canonical fingerprint → 语义去重（幂等）
+proposal row   → event identity：opaque event id        → 每次发生都追加
+```
+
+`proposal_id` 是 **opaque event identity**（`secrets.token_hex(32)`），**不是** proposal
+内容的 fingerprint；它不依赖任何 process-local 权威 —— 没有进程内计数器、PID、thread
+id，也不以墙上时钟或 candidate/proposal 内容哈希作为唯一性权威。`created_at` 只是事件
+时间戳 / 排序元数据，**不是** uniqueness authority，两次提案可以合法地拥有完全相同的
+`created_at`。因此事件表写入是 fail-closed 的普通 `INSERT`（不是 `INSERT OR IGNORE`）：
+意外的 id 碰撞必须报错，而不是假装第二次提案已记录。candidate 行继续使用
+`INSERT OR IGNORE`，因为 canonical fingerprint 本来就是它的去重权威；append-only
+`*_no_update` / `*_no_delete` trigger 保持不变。
+
 R35-A **不**做 promotion、**不**做 execution、**不**修改任何正式策略：`tq_breakout` /
 `main_force_top10` 等只作为 pinned baseline / parent / reference 存在。验收标准是
 **可信的生成基础设施**，不是"证明某个新策略赚钱"——因此本阶段没有任何以收益 /

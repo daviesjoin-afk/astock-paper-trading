@@ -40,6 +40,12 @@ BASELINE = (
     "test_r35a_strategy_candidate.ParentPinningTests.test_c3d_pinning_never_falls_back_to_the_registry_head",
     "test_r35a_strategy_candidate.ParentPinningTests.test_c3e_parent_metadata_constraints_are_inherited_not_dropped",
     "test_r35a_strategy_candidate.LedgerTests.test_c6d_every_proposal_occurrence_gets_its_own_identity",
+    "test_r35a_strategy_candidate.LedgerTests."
+    "test_c6e_proposal_event_identity_survives_process_local_identity_reset",
+    "test_r35a_strategy_candidate.LedgerTests."
+    "test_c6f_unexpected_proposal_id_collision_fails_closed",
+    "test_r35a_strategy_candidate.LedgerTests."
+    "test_c6g_proposal_identity_is_not_a_content_fingerprint",
     "test_r35a_strategy_candidate.CandidateIdentityTests.test_c2e_declared_parameter_contract_is_part_of_the_fingerprint",
     "test_r35a_strategy_candidate.AuthorityBoundaryTests.test_c9_generator_modules_have_no_promotion_or_execution_dependency",
 )
@@ -166,21 +172,33 @@ MUTATIONS = [
          "test_r35a_strategy_candidate.ParentPinningTests."
          "test_c3e_parent_metadata_constraints_are_inherited_not_dropped",
      ]},
-    # M-G7 —— 提案身份退化成"内容 + 秒级时间戳"，同秒第二次提案被吞掉。
+    # M-G7 —— 提案身份退化成"内容 + 时间戳"（opaque 事件身份被换回内容指纹）。
     {"id": "M-G7",
-     "semantic": "same-second proposals collapse into one identity and lose an event",
+     "semantic": "same-timestamp proposals collapse into one identity and lose an event",
      "edits": [(REPOSITORY,
-                '    stamp, sequence = _proposal_event_identity(created_at)\n'
-                '    proposal_id = SC._sha({"candidate_id": candidate.candidate_id,\n'
-                '                           "proposal": json.loads(payload), "created_at": stamp,\n'
-                '                           "event_sequence": sequence})',
-                '    stamp, sequence = _proposal_event_identity(created_at)\n'
+                '    stamp, proposal_id = _proposal_event_identity(created_at)\n',
+                '    stamp, _event_id = _proposal_event_identity(created_at)\n'
                 '    proposal_id = SC._sha({"candidate_id": candidate.candidate_id,\n'
                 '                           "proposal": json.loads(payload),\n'
-                '                           "created_at": stamp[:19]})')],
+                '                           "created_at": stamp})\n')],
      "detectors": [
          "test_r35a_strategy_candidate.LedgerTests."
          "test_c6d_every_proposal_occurrence_gets_its_own_identity",
+         "test_r35a_strategy_candidate.LedgerTests."
+         "test_c6e_proposal_event_identity_survives_process_local_identity_reset",
+         "test_r35a_strategy_candidate.LedgerTests."
+         "test_c6g_proposal_identity_is_not_a_content_fingerprint",
+     ]},
+    # M-G8 —— 事件表写回 INSERT OR IGNORE：id 碰撞被静默吞掉，第二次真实提案
+    # 假装已经记录。必须由 fail-closed 回归（C6f）判为 RED。
+    {"id": "M-G8",
+     "semantic": "a proposal id collision is silently swallowed by INSERT OR IGNORE",
+     "edits": [(REPOSITORY,
+                '        """INSERT INTO strategy_candidate_proposals\n',
+                '        """INSERT OR IGNORE INTO strategy_candidate_proposals\n')],
+     "detectors": [
+         "test_r35a_strategy_candidate.LedgerTests."
+         "test_c6f_unexpected_proposal_id_collision_fails_closed",
      ]},
 ]
 

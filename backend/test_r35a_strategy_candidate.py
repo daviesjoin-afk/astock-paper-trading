@@ -8,7 +8,8 @@ Covers C1…C10 from the R35-A specification:
     C3  parent pinning survives a later parent upgrade
     C4  arbitrary executable source is rejected (fail closed)
     C5  missing provenance fails closed (no latest/current fallback)
-    C6  dedup on canonical candidate identity
+    C6  dedup on canonical candidate identity (candidate) / every occurrence is a
+        new event (proposal)
     C7  append-only identity (no update-into-another-candidate)
     C8  persistence round trip re-verifies the fingerprint
     C9  no promotion / execution authority in the generator production path
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib
 import json
 import os
 import sqlite3
@@ -29,6 +31,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
+from unittest import mock
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
@@ -584,9 +587,8 @@ class LedgerTests(_LedgerFixture):
     def test_c6d_every_proposal_occurrence_gets_its_own_identity(self):
         """同一秒内对同一候选、同一输入提出两次，是两条独立历史记录。
 
-        提案是**事件**而不是内容的函数：如果 proposal id 只由"内容 + 秒级时间戳"
-        决定，第二条会被 ``INSERT OR IGNORE`` 静默吞掉，append-only 台账就丢了
-        一次提案。
+        提案是**事件**而不是内容的函数：如果 proposal id 由"内容 + 时间戳"决定，
+        第二条会被静默吞掉，append-only 台账就丢了一次提案。
         """
         candidate = self._candidates()[0]
         SCRepo.append_candidate(self.conn, candidate)
@@ -596,6 +598,93 @@ class LedgerTests(_LedgerFixture):
                                         created_at="2026-10-05T01:00:00+00:00")
         self.assertNotEqual(first, second)
         self.assertEqual(2, len(SCRepo.list_proposals(self.conn, candidate.candidate_id)))
+
+    def test_c6e_proposal_event_identity_survives_process_local_identity_reset(self):
+        """C6e —— proposal event identity 不依赖任何 process-local 权威。
+
+        场景：同一个 candidate、同一个 input_fingerprint、**完全相同的 proposal
+        payload 与完全相同的 ``created_at``**，连续提出两次；中间把进程级状态
+        清空（模拟进程重启 / 多 worker 各自从 1 开始）。
+
+        契约：proposal_id 是**事件身份**，不是内容指纹。即使时间戳一模一样，
+        两次也必须是两个不同的 id、两行记录。测试刻意固定 ``created_at``，
+        不 sleep、不指望系统时钟产生不同微秒。
+        """
+        candidate = self._candidates()[0]
+        SCRepo.append_candidate(self.conn, candidate)
+        created_at = "2026-10-05T01:00:00+00:00"
+        first = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
+                                       created_at=created_at)
+        # 进程级状态复位：任何 process-local 计数器 / 缓存都从头开始。
+        importlib.reload(SCRepo)
+        self.assertIs(SCRepo, sys.modules["strategy_candidate_repository"])
+        second = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
+                                        created_at=created_at)
+        self.assertNotEqual(first, second)
+        self.assertEqual(64, len(first))
+        self.assertEqual(64, len(second))
+        self.assertTrue(SC._SHA256.fullmatch(first))
+        self.assertTrue(SC._SHA256.fullmatch(second))
+        self.assertEqual(2, self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_candidate_proposals").fetchone()[0])
+        history = SCRepo.list_proposals(self.conn, candidate.candidate_id)
+        self.assertEqual(2, len(history))
+        self.assertEqual({first, second}, {item["proposal_id"] for item in history})
+        # created_at 只是事件时间戳：两条记录可以合法地完全相同。
+        self.assertEqual({created_at}, {item["created_at"] for item in history})
+
+    def test_c6f_unexpected_proposal_id_collision_fails_closed(self):
+        """C6f —— event identity 冲突必须 fail closed，不能静默假装成功。
+
+        人为把 event identity generator 钉成同一个 id：第二次写入必须是 RED
+        （``sqlite3.IntegrityError``），绝不能 ``INSERT OR IGNORE`` → 返回旧
+        proposal → 假装第二次提案已经记录。
+        """
+        candidate = self._candidates()[0]
+        SCRepo.append_candidate(self.conn, candidate)
+        created_at = "2026-10-05T01:00:00+00:00"
+        with mock.patch.object(SCRepo, "_proposal_event_identity",
+                               return_value=(created_at, "e" * 64)):
+            SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
+                                   created_at=created_at)
+            with self.assertRaises(sqlite3.IntegrityError):
+                SCRepo.record_proposal(self.conn, candidate, input_fingerprint="2" * 64,
+                                       created_at=created_at)
+        self.assertEqual(1, self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_candidate_proposals").fetchone()[0])
+        history = SCRepo.list_proposals(self.conn, candidate.candidate_id)
+        self.assertEqual(["1" * 64], [item["input_fingerprint"] for item in history])
+
+    def test_c6g_proposal_identity_is_not_a_content_fingerprint(self):
+        """proposal_id 是 opaque 事件 id，不是 proposal 内容指纹。
+
+        结构上也必须是两套契约：candidate 行按 canonical fingerprint 去重
+        （``INSERT OR IGNORE`` 保留），proposal 行是事件追加（**没有** ``INSERT OR
+        IGNORE``），且身份不再依赖 process-local 计数器。
+        """
+        candidate = self._candidates()[0]
+        SCRepo.append_candidate(self.conn, candidate)
+        created_at = "2026-10-05T01:00:00+00:00"
+        proposal_id = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
+                                             created_at=created_at)
+        row = self.conn.execute(
+            "SELECT proposal_json,created_at FROM strategy_candidate_proposals"
+            " WHERE proposal_id=?", (proposal_id,)).fetchone()
+        content_fingerprint = SC._sha({"candidate_id": candidate.candidate_id,
+                                       "proposal": json.loads(str(row[0])),
+                                       "created_at": str(row[1])})
+        self.assertNotEqual(content_fingerprint, proposal_id)
+        with open(os.path.join(BACKEND, "strategy_candidate_repository.py"),
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        # process-local identity authority 已彻底移除。
+        self.assertNotIn("itertools", source)
+        self.assertNotIn("_PROPOSAL_SEQUENCE", source)
+        self.assertNotIn("event_sequence", source)
+        # 事件表禁止 INSERT OR IGNORE（碰撞必须报错，不能静默吞事件）。
+        self.assertNotIn("INSERT OR IGNORE INTO strategy_candidate_proposals", source)
+        # candidate 表的内容去重权威保持不变。
+        self.assertIn("INSERT OR IGNORE INTO strategy_candidates", source)
 
     def test_c6c_dedup_authority_is_the_fingerprint_not_the_name_or_time(self):
         candidate = self._candidates()[0]

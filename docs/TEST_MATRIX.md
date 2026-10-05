@@ -669,7 +669,7 @@ the focused baseline after restore is green.
 | C3 | `test_c3_parent_upgrade_does_not_change_recorded_candidate_provenance`; `test_c3b_pin_requires_the_exact_version_and_checksum`; `test_c3c_parent_without_declarative_dsl_cannot_be_a_generator_basis`; `test_c3d_pinning_never_falls_back_to_the_registry_head`; `test_c3e_parent_metadata_constraints_are_inherited_not_dropped` |
 | C4 | `test_c4_python_source_eval_exec_and_shell_payloads_are_rejected`; `test_c4b_dynamic_field_and_attribute_access_is_rejected`; `test_c4c_parameter_spec_cannot_be_smuggled_into_a_non_entry_rule`; `test_c4d_unknown_ops_and_oversized_asts_are_rejected` |
 | C5 | `test_c5_missing_parent_version_or_checksum_is_rejected`; `test_c5b_missing_generator_version_asof_and_entry_are_rejected`; `test_c5c_generator_input_requires_explicit_asof_universe_and_regime`; `test_c5d_service_requires_explicit_universe_and_regime`; `test_c5e_undeclared_or_out_of_contract_parameters_are_rejected`; `test_c5f_locked_parameters_cannot_be_varied`; `test_c5g_variant_space_is_bounded_by_the_input_contract` |
-| C6 | `test_c6_same_candidate_is_not_duplicated`; `test_c6b_dedup_keeps_the_proposal_source_evidence`; `test_c6c_dedup_authority_is_the_fingerprint_not_the_name_or_time`; `test_c6d_every_proposal_occurrence_gets_its_own_identity` |
+| C6 | `test_c6_same_candidate_is_not_duplicated`; `test_c6b_dedup_keeps_the_proposal_source_evidence`; `test_c6c_dedup_authority_is_the_fingerprint_not_the_name_or_time`; `test_c6d_every_proposal_occurrence_gets_its_own_identity`; `test_c6e_proposal_event_identity_survives_process_local_identity_reset`; `test_c6f_unexpected_proposal_id_collision_fails_closed`; `test_c6g_proposal_identity_is_not_a_content_fingerprint` |
 | C7 | `test_c7_candidate_rows_cannot_be_updated_or_deleted`; `test_c7b_same_id_with_different_content_is_a_conflict_not_an_overwrite` |
 | C8 | `test_c8_persistence_round_trip_reverifies_the_fingerprint`; `test_c8b_schema_itself_refuses_an_id_that_is_not_the_fingerprint`; `test_c8c_explicit_candidate_id_is_required`; `test_c8d_unknown_candidate_is_absent_not_the_latest_one` |
 | C9 | `test_c9_generator_modules_have_no_promotion_or_execution_dependency`; `test_c9b_pure_candidate_domain_never_takes_a_connection`; `test_c9c_generator_never_writes_a_lifecycle_state`; `test_c9d_candidate_ledger_holds_no_evaluation_or_promotion_columns`; `test_c9e_repository_touches_only_its_own_tables`; `test_c9f_no_runtime_create_or_alter_table_in_the_generator_path` |
@@ -682,7 +682,7 @@ input fingerprint 稳定、台账元数据不进指纹）。读模型：`ReadMod
 
 ### R35-A semantic mutation results
 
-`work/r35a_candidate_mutation_check.py` result: M-G1-M-G7 all **DETECTED**;
+`work/r35a_candidate_mutation_check.py` result: M-G1-M-G8 all **DETECTED**;
 `survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and the focused
 baseline after restore is green.
 
@@ -694,5 +694,22 @@ baseline after restore is green.
 | M-G4 | a missing parent checksum falls back to the current version | C3b / C5 |
 | M-G5 | arbitrary executable candidate payload is accepted | C4 |
 | M-G6 | a parameter-only variant silently drops the parent's constraints | C3e |
-| M-G7 | same-second proposals collapse into one identity and lose an event | C6d |
+| M-G7 | proposal identity degrades to `candidate + payload + timestamp` and loses an event | C6d / C6e / C6g |
+| M-G8 | a proposal id collision is silently swallowed by `INSERT OR IGNORE` | C6f |
+
+### R35-A proposal event identity (candidate vs proposal)
+
+```text
+candidate row  → content identity (canonical fingerprint) → semantic dedup, idempotent
+proposal row   → opaque event identity (secrets.token_hex(32)) → appended every occurrence
+```
+
+`proposal_id` is an opaque event id: it does not depend on a process-local counter,
+PID, thread id, wall-clock timestamp, or any candidate/proposal content hash as its
+uniqueness authority. `created_at` is event timestamp / ordering metadata only, and
+two proposals may carry an identical `created_at`. The proposal write is a plain
+fail-closed `INSERT` (no `INSERT OR IGNORE`): an unexpected id collision raises
+instead of pretending the second event was recorded. Candidate rows keep their
+`INSERT OR IGNORE` because the canonical fingerprint **is** the dedup authority.
+The append-only `*_no_update` / `*_no_delete` triggers are unchanged.
 

@@ -99,18 +99,20 @@ owner；业务代码运行时不做 `CREATE TABLE` / `ALTER TABLE`。两张 appe
 
 ## 八、测试与变异
 
-- C1–C10 contract 回归：`backend/test_r35a_strategy_candidate.py`（48 tests）。
+- C1–C10 contract 回归：`backend/test_r35a_strategy_candidate.py`（51 tests）。
 - HTTP 契约：`backend/test_strategy_api_contract.py` 的
   `test_r35a_candidate_generation_and_read_model_over_http`。
 - 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（6 tests）。
-- 变异：`work/r35a_candidate_mutation_check.py`（M-G1…M-G7，7/7 DETECTED）。
+- 变异：`work/r35a_candidate_mutation_check.py`（M-G1…M-G8，8/8 DETECTED）。
 
 ### 人工复核 P2 修复
 
 - 父策略 `metadata.constraints` 在调用方未给 override 时必须被**继承**（空集不是
   "无约束"，而是丢掉父策略的仓位/敞口/权重上限）。
-- 提案身份必须包含微秒时间戳 + 进程内事件序号：同一秒内同一输入的两次提案是两条
-  独立历史记录，不能被 `INSERT OR IGNORE` 静默合并。
+- 提案身份必须是**独立的事件身份**：`proposal_id` 是 opaque event id
+  （`secrets.token_hex(32)`），不依赖进程内计数器 / PID / thread id / 墙上时钟 /
+  内容哈希作为唯一性权威。同一秒内同一输入的两次提案是两条独立历史记录，事件表写入
+  为 fail-closed 的 `INSERT`（碰撞报错），不能被 `INSERT OR IGNORE` 静默合并。
 
 ## 九、明确不属于 R35-A
 
