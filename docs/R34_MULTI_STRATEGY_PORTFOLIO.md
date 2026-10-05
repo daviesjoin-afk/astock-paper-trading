@@ -397,12 +397,15 @@ zero, or a latest/current lookup as an exact fact.
   dedicated legacy unit suite plus coordinator-specific property assertions
   were deleted after confirming zero production callers. Optional
   symbol/industry/theme risk caps still fail closed without a strict exposure
-  owner. C0-C35 traceability and M-C1-M-C20 mutation checks are complete. The
+  owner. C0-C35 traceability and M-C1-M-C23 mutation checks are complete. The
   canonical allocation-weight resolver reads append-only
   `paper_parameter_versions` rows bounded by cycle, effective date and decision
   timestamp; current `paper_accounts.params` is not an authority on this path.
   RC15 proves a later same-day apply cannot change an earlier decision, and
-  RC16 proves rollback appends a replayable historical fact. Mutable current
+  RC16 proves rollback appends a replayable historical fact. RC17 proves a
+  failed adaptive status write restores complete pre-apply params; RC18 proves
+  the failed B fact remains replayable after compensation restores A/P; RC19
+  proves all accounts in one apply share one owner timestamp. Mutable current
   parameter reads on this canonical path: before 1, after 0. Historical
   parameter owner reads: before 0, after 1. Implementation commit `caf692d`
   passed local and GitHub CI gates; both inline review threads are resolved.

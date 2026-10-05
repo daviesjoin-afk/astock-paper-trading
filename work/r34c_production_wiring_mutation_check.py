@@ -28,6 +28,9 @@ BASELINE = (
     "test_paper_trading_architecture_guard.EntryCapitalPlanningIsBounded.test_guard10h_canonical_allocation_weight_uses_parameter_history",
     "test_evolution_apply.ApplyAllocationTests.test_rc15_later_weight_apply_cannot_heal_earlier_decision",
     "test_evolution_apply.ApplyAllocationTests.test_rc16_rollback_appends_a_replayable_parameter_fact",
+    "test_evolution_apply.ApplyAllocationTests.test_rc17_compensation_restores_exact_complete_pre_apply_params",
+    "test_evolution_apply.ApplyAllocationTests.test_rc18_compensation_keeps_failed_apply_history_replayable",
+    "test_evolution_apply.ApplyAllocationTests.test_rc19_apply_parameter_history_uses_one_batch_timestamp",
     "test_order_intent_contract.OrderIntentContractTests.test_synthesized_add_position_callers_pass_the_enforced_gate",
     "test_portfolio_order_intents.PortfolioOrderIntentOwnerTests.test_rc14_unapproved_waitlist_markers_do_not_block_resource_intents",
 )
@@ -167,6 +170,30 @@ MUTATIONS = [
         '                  "reason": "日内回补（同日高抛库存）"}},')],
      "detectors": ["test_order_intent_contract.OrderIntentContractTests."
                    "test_synthesized_add_position_callers_pass_the_enforced_gate"]},
+    {"id": "M-C21", "semantic": "compensation saves only the previous allocation instead of complete pre-apply params",
+     "edits": [("backend/evolution_apply.py",
+        'pre_apply_params[account_id] = copy.deepcopy(_account_params(row))',
+        'pre_apply_params[account_id] = _account_params(row).get("adaptive_allocation_previous")')],
+     "detectors": ["test_evolution_apply.ApplyAllocationTests."
+                   "test_rc17_compensation_restores_exact_complete_pre_apply_params"]},
+    {"id": "M-C22", "semantic": "compensation discards the prior allocation pointer",
+     "edits": [("backend/evolution_apply.py",
+        'restored = copy.deepcopy(previous_params)\n'
+        '            if params != restored:',
+        'restored = copy.deepcopy(previous_params)\n'
+        '            restored.pop("adaptive_allocation_previous", None)\n'
+        '            if params != restored:')],
+     "detectors": ["test_evolution_apply.ApplyAllocationTests."
+                   "test_rc17_compensation_restores_exact_complete_pre_apply_params"]},
+    {"id": "M-C23", "semantic": "allocation parameter timestamp is generated per account",
+     "edits": [("backend/evolution_apply.py",
+        '        for account_id in weights:\n'
+        '            row = by_id[account_id]',
+        '        for account_id in weights:\n'
+        '            written_at = _now()\n'
+        '            row = by_id[account_id]')],
+     "detectors": ["test_evolution_apply.ApplyAllocationTests."
+                   "test_rc19_apply_parameter_history_uses_one_batch_timestamp"]},
 ]
 
 
