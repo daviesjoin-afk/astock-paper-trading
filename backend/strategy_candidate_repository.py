@@ -19,6 +19,7 @@ than replacing the candidate row, so去重不会丢掉"谁、什么时候、为�
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 import sqlite3
 
@@ -27,6 +28,22 @@ import strategy_candidate as SC
 
 class StrategyCandidateRepositoryError(ValueError):
     pass
+
+
+#: 同一进程内的提案事件序号。提案是**事件**，不是内容的函数：同一秒（甚至同一
+#: 微秒）内对同一候选、同一输入提出两次，是两条独立的历史记录，必须各自有身份。
+#: 只按内容 + 秒级时间戳取 id 会让第二条被 ``INSERT OR IGNORE`` 静默吞掉，
+#: 从而违反"append-only 台账记录每一次提案"的契约。
+_PROPOSAL_SEQUENCE = itertools.count(1)
+
+
+def _proposal_event_identity(created_at: str | None) -> tuple[str, str]:
+    """Return ``(iso_timestamp_with_microseconds, process_unique_sequence)``."""
+    if created_at is None:
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    else:
+        stamp = str(created_at)
+    return stamp, str(next(_PROPOSAL_SEQUENCE))
 
 
 def _payload(candidate: SC.StrategyCandidate) -> str:
@@ -109,9 +126,10 @@ def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *
         research_provenance=candidate.research_provenance,
         input_fingerprint=input_fingerprint, random_seed=candidate.random_seed,
         model_identity=candidate.model_identity)
-    stamp = created_at or dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    stamp, sequence = _proposal_event_identity(created_at)
     proposal_id = SC._sha({"candidate_id": candidate.candidate_id,
-                           "proposal": json.loads(payload), "created_at": stamp})
+                           "proposal": json.loads(payload), "created_at": stamp,
+                           "event_sequence": sequence})
     conn.execute(
         """INSERT OR IGNORE INTO strategy_candidate_proposals
            (proposal_id,candidate_id,input_fingerprint,proposal_json,created_at)

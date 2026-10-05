@@ -72,7 +72,11 @@ def pin_parent_strategy(conn: sqlite3.Connection, *, strategy_id: str,
         intended_market_regime=(intended_market_regime
                                 if intended_market_regime is not None
                                 else metadata.get("intended_market_regime")),
-        constraints=constraints,
+        # 调用方没给约束时**继承父策略那一版自己的约束**，而不是变成空集：
+        # 空集不是"无约束"，而是"把父策略的仓位/敞口/权重上限悄悄丢掉"，
+        # 那会让下游实验读到一份并非父策略语义的候选。
+        constraints=(constraints if constraints is not None
+                     else metadata.get("constraints")),
         exit_spec=metadata.get("exit_spec"),
         factor_spec=metadata.get("factor_spec"),
     )

@@ -313,6 +313,35 @@ class ParentPinningTests(_LedgerFixture):
         self.assertNotEqual(head.checksum, reloaded.parent_strategy_checksum)
         self.assertEqual(pin.identity, reloaded.identity())
 
+    def test_c3e_parent_metadata_constraints_are_inherited_not_dropped(self):
+        """父策略那一版声明的 constraints 必须被候选继承，而不是变成空集。
+
+        空集不是"无约束"：它会让下游实验读到一份并非父策略语义的候选（仓位 /
+        敞口 / 权重上限被悄悄丢掉）。只有调用方**显式**给出 override 时才替换。
+        """
+        inherited = {"max_positions": 5, "max_exposure_pct": 0.6}
+        created = SR.create_user_definition(
+            self.conn, PARENT, "R35A Parent", dsl_ast=_parent_rule(),
+            metadata={"constraints": inherited}, actor="test")
+        result = SCV.generate_and_record_candidates(
+            self.conn, strategy_id=PARENT, strategy_version=1,
+            strategy_checksum=created.current_checksum, asof="2026-10-05",
+            parameter_adjustments={"ma_period": [19]},
+            universe_spec={"scope_kind": "a_share_all"},
+            intended_market_regime="momentum", evidence_count=10)
+        read = SCV.get_candidate(self.conn, result["candidate_ids"][0])
+        self.assertEqual(inherited, read["candidate"]["constraints"])
+
+        overridden = SCV.generate_and_record_candidates(
+            self.conn, strategy_id=PARENT, strategy_version=1,
+            strategy_checksum=created.current_checksum, asof="2026-10-05",
+            parameter_adjustments={"ma_period": [19]},
+            universe_spec={"scope_kind": "a_share_all"},
+            intended_market_regime="momentum", evidence_count=10,
+            constraints={"max_positions": 2})
+        read_override = SCV.get_candidate(self.conn, overridden["candidate_ids"][0])
+        self.assertEqual({"max_positions": 2}, read_override["candidate"]["constraints"])
+
     def test_c3d_pinning_never_falls_back_to_the_registry_head(self):
         """只给 strategy_id 时**必须**拒绝，绝不用 current head 补齐身份。
 
@@ -551,6 +580,22 @@ class LedgerTests(_LedgerFixture):
         # 候选行本身仍然只有一行，且指纹未变。
         self.assertEqual(1, self.conn.execute(
             "SELECT COUNT(*) FROM strategy_candidates").fetchone()[0])
+
+    def test_c6d_every_proposal_occurrence_gets_its_own_identity(self):
+        """同一秒内对同一候选、同一输入提出两次，是两条独立历史记录。
+
+        提案是**事件**而不是内容的函数：如果 proposal id 只由"内容 + 秒级时间戳"
+        决定，第二条会被 ``INSERT OR IGNORE`` 静默吞掉，append-only 台账就丢了
+        一次提案。
+        """
+        candidate = self._candidates()[0]
+        SCRepo.append_candidate(self.conn, candidate)
+        first = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
+                                       created_at="2026-10-05T01:00:00+00:00")
+        second = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
+                                        created_at="2026-10-05T01:00:00+00:00")
+        self.assertNotEqual(first, second)
+        self.assertEqual(2, len(SCRepo.list_proposals(self.conn, candidate.candidate_id)))
 
     def test_c6c_dedup_authority_is_the_fingerprint_not_the_name_or_time(self):
         candidate = self._candidates()[0]

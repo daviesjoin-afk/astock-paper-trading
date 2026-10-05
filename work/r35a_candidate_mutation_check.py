@@ -38,6 +38,8 @@ BASELINE = (
     "test_r35a_strategy_candidate.ParentPinningTests.test_c10_current_registry_head_cannot_replace_a_stored_pin",
     "test_r35a_strategy_candidate.ParentPinningTests.test_c3b_pin_requires_the_exact_version_and_checksum",
     "test_r35a_strategy_candidate.ParentPinningTests.test_c3d_pinning_never_falls_back_to_the_registry_head",
+    "test_r35a_strategy_candidate.ParentPinningTests.test_c3e_parent_metadata_constraints_are_inherited_not_dropped",
+    "test_r35a_strategy_candidate.LedgerTests.test_c6d_every_proposal_occurrence_gets_its_own_identity",
     "test_r35a_strategy_candidate.CandidateIdentityTests.test_c2e_declared_parameter_contract_is_part_of_the_fingerprint",
     "test_r35a_strategy_candidate.AuthorityBoundaryTests.test_c9_generator_modules_have_no_promotion_or_execution_dependency",
 )
@@ -152,6 +154,33 @@ MUTATIONS = [
      "detectors": [
          "test_r35a_strategy_candidate.ExecutablePayloadTests."
          "test_c4_python_source_eval_exec_and_shell_payloads_are_rejected",
+     ]},
+    # M-G6 —— 父策略约束被静默丢弃（候选不再是父策略语义）。
+    {"id": "M-G6",
+     "semantic": "a parameter-only variant silently drops the parent's constraints",
+     "edits": [(SERVICE,
+                '        constraints=(constraints if constraints is not None\n'
+                '                     else metadata.get("constraints")),',
+                '        constraints=None,')],
+     "detectors": [
+         "test_r35a_strategy_candidate.ParentPinningTests."
+         "test_c3e_parent_metadata_constraints_are_inherited_not_dropped",
+     ]},
+    # M-G7 —— 提案身份退化成"内容 + 秒级时间戳"，同秒第二次提案被吞掉。
+    {"id": "M-G7",
+     "semantic": "same-second proposals collapse into one identity and lose an event",
+     "edits": [(REPOSITORY,
+                '    stamp, sequence = _proposal_event_identity(created_at)\n'
+                '    proposal_id = SC._sha({"candidate_id": candidate.candidate_id,\n'
+                '                           "proposal": json.loads(payload), "created_at": stamp,\n'
+                '                           "event_sequence": sequence})',
+                '    stamp, sequence = _proposal_event_identity(created_at)\n'
+                '    proposal_id = SC._sha({"candidate_id": candidate.candidate_id,\n'
+                '                           "proposal": json.loads(payload),\n'
+                '                           "created_at": stamp[:19]})')],
+     "detectors": [
+         "test_r35a_strategy_candidate.LedgerTests."
+         "test_c6d_every_proposal_occurrence_gets_its_own_identity",
      ]},
 ]
 
