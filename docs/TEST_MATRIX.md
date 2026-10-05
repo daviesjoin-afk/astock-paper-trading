@@ -587,17 +587,19 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
 - Full backend pytest, focused execution, reservation, intent, runtime,
   allocation and architecture regressions pass. Frontend build/unit (157/157),
   Chromium E2E (36/36), Ruff, compileall, M-C1–M-C20 and local security scan
-  pass. CI-equivalent Docker unittest and remote exact-head checks remain
-  pending. Legacy BUY/capital allocation and
+  pass. Exact-head Docker `--network none` unittest passed 5295 tests with 30
+  skipped under the required 64 MB tmpfs; all remote exact-head checks passed.
+  RC15/RC16, ADD_POSITION behavior coverage, and M-C1–M-C20 passed. Both review
+  threads are resolved. Allocation-owner implementation commit `caf692d` was
+  tested by all required local and GitHub gates. Legacy BUY/capital allocation and
   slot-borrow decision helpers are removed; Risk capacity-exit review retains
   its dynamic limit input and legacy rollback recovery remains. A verified
   empty reservation query issues eligible-account zeros while preserving global
   `pending_total`; shared exposure includes all economic owners, but allowance
   weights/pending maps include only execution participants. C0-C35 have
   regression traceability below. M-C1-M-C20 are all detected with zero survived,
-  fake, or timeout mutations and byte-for-byte restoration. PR #227 is open and
-  remains unmerged; exact-head Docker/remote CI and review-thread closure remain
-  outstanding. R34-C is IN REVIEW and R34 remains incomplete.
+  fake, or timeout mutations and SHA256 restoration. PR #227 is open and
+  remains unmerged; R34-C is IN REVIEW and R34 remains incomplete.
 
 ### R34-C regression traceability (C0-C35)
 

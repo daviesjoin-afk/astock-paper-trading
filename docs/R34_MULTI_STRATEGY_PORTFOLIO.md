@@ -404,8 +404,9 @@ zero, or a latest/current lookup as an exact fact.
   RC15 proves a later same-day apply cannot change an earlier decision, and
   RC16 proves rollback appends a replayable historical fact. Mutable current
   parameter reads on this canonical path: before 1, after 0. Historical
-  parameter owner reads: before 0, after 1. PR #227 remains open; final exact-
-  head CI remains pending.
+  parameter owner reads: before 0, after 1. Implementation commit `caf692d`
+  passed local and GitHub CI gates; both inline review threads are resolved.
+  PR #227 remains open and unmerged.
   R34-C is IN REVIEW, while R34 remains incomplete.
 ### Import graph guard
 
