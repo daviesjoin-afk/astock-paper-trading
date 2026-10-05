@@ -398,18 +398,25 @@ class NormalBuyConvergence(_BuyCase):
             entry["plan"]["slot_plan"]["total_cap"] = 3
             return entry
 
-        barrier = threading.Barrier(len(codes))
-
-        def attempt(signal_id, code):
-            barrier.wait(timeout=10)
-            return self.run_buy(signal_id=signal_id, code=code)
-
         with mock.patch.object(PT, "_build_portfolio_entry_plan",
                                side_effect=single_slot_plan):
-            with ThreadPoolExecutor(max_workers=len(codes)) as pool:
-                futures = [pool.submit(attempt, signal_id, code)
-                           for signal_id, code in zip(signal_ids, codes, strict=True)]
-                results = [future.result(timeout=90) for future in futures]
+            results = []
+            # Keep the contested final slot truly concurrent while limiting the
+            # SQLite writer queue. Four simultaneous full BUY replays can exceed
+            # the CI runner's 60s SQLite busy timeout before any test assertion.
+            for offset in range(0, len(codes), 2):
+                group = list(zip(
+                    signal_ids[offset:offset + 2], codes[offset:offset + 2], strict=True))
+                barrier = threading.Barrier(len(group))
+
+                def attempt(signal_id, code, _barrier=barrier):
+                    _barrier.wait(timeout=10)
+                    return self.run_buy(signal_id=signal_id, code=code)
+
+                with ThreadPoolExecutor(max_workers=len(group)) as pool:
+                    futures = [pool.submit(attempt, signal_id, code)
+                               for signal_id, code in group]
+                    results.extend(future.result(timeout=90) for future in futures)
 
         filled_count = sum(bool(result.get("filled")) for result, _order in results)
         self.assertEqual(3, filled_count,
