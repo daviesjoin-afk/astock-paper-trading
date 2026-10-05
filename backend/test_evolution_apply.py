@@ -478,6 +478,56 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
             ).fetchall()
         self.assertEqual(1, len(timestamps))
 
+    def test_rc20_compensation_uses_one_batch_timestamp(self):
+        today = datetime.now(TZ).date().isoformat()
+        before = {
+            "tq_breakout": self._allocation_params(
+                {"weight_pct": 40.0, "decision_id": 101, "status": "active"},
+                {"weight_pct": 30.0, "decision_id": 100, "status": "active"},
+                "tq-before"),
+            "trend_pullback": self._allocation_params(
+                {"weight_pct": 60.0, "decision_id": 101, "status": "active"},
+                {"weight_pct": 70.0, "decision_id": 100, "status": "active"},
+                "trend-before"),
+        }
+        with self._paper_ctx() as conn:
+            for account_id, params in before.items():
+                conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                             (json.dumps(params), account_id))
+        self._fail_decision_applied_update()
+        timestamps = iter(
+            f"{today}T14:00:0{second}+08:00" for second in range(4))
+        with mock.patch.object(evolution_apply, "_now",
+                               side_effect=lambda: next(timestamps)):
+            failed_decision = self._apply_two_account_decision_with_status_failure(
+                {"tq_breakout": 45.0, "trend_pullback": 55.0})
+
+        reason = (
+            "adaptive allocation compensation rollback "
+            f"decision_id={failed_decision}")
+        compensation_times = set()
+        restored_times = set()
+        compensation_rows = []
+        with self._paper_ctx() as conn:
+            for account_id, expected in before.items():
+                fact = conn.execute(
+                    "SELECT params,created_at FROM paper_parameter_versions "
+                    "WHERE cycle_id=1 AND account_id=? AND reason=?",
+                    (account_id, reason),
+                ).fetchone()
+                account = conn.execute(
+                    "SELECT updated_at FROM paper_accounts WHERE id=?", (account_id,),
+                ).fetchone()
+                self.assertIsNotNone(fact)
+                compensation_rows.append(fact)
+                self.assertEqual(expected, json.loads(fact["params"]))
+                self.assertEqual(fact["created_at"], account["updated_at"])
+                compensation_times.add(fact["created_at"])
+                restored_times.add(account["updated_at"])
+        self.assertEqual(2, len(compensation_rows))
+        self.assertEqual(1, len(compensation_times))
+        self.assertEqual(1, len(restored_times))
+
     def test_rollback_restores_no_previous(self):
         decision_id = self._seed_decision()
         evolution_apply.apply_allocation(

@@ -586,10 +586,10 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
   navigation, desktop/mobile layout, and browser console/page errors.
 - Full backend pytest, focused execution, reservation, intent, runtime,
   allocation and architecture regressions pass. Frontend build/unit (157/157),
-  Chromium E2E (36/36), Ruff, compileall, M-C1–M-C23 and local security scan
+  Chromium E2E (36/36), Ruff, compileall, M-C1–M-C24 and local security scan
   pass. Exact-head Docker `--network none` unittest passed 5295 tests with 30
   skipped under the required 64 MB tmpfs; all remote exact-head checks passed.
-  RC15–RC19, ADD_POSITION behavior coverage, and M-C1–M-C23 passed. Both review
+  RC15–RC20, ADD_POSITION behavior coverage, and M-C1–M-C24 passed. Both review
   threads are resolved. Allocation-owner implementation commit `caf692d` was
   tested by all required local and GitHub gates. Legacy BUY/capital allocation and
   slot-borrow decision helpers are removed; Risk capacity-exit review retains
@@ -597,7 +597,7 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
   empty reservation query issues eligible-account zeros while preserving global
   `pending_total`; shared exposure includes all economic owners, but allowance
   weights/pending maps include only execution participants. C0-C35 have
-  regression traceability below. M-C1-M-C23 are all detected with zero survived,
+  regression traceability below. M-C1-M-C24 are all detected with zero survived,
   fake, or timeout mutations and SHA256 restoration. PR #227 is open and
   remains unmerged; R34-C is IN REVIEW and R34 remains incomplete.
 
@@ -644,7 +644,7 @@ Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B20 **20/20 D
 
 ### R34-C semantic mutation results
 
-`work/r34c_production_wiring_mutation_check.py` result: M-C1-M-C23 all
+`work/r34c_production_wiring_mutation_check.py` result: M-C1-M-C24 all
 **DETECTED**; `survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and
 the focused baseline after restore is green.
 
@@ -657,5 +657,6 @@ the focused baseline after restore is green.
 | RC17 | `test_rc17_compensation_restores_exact_complete_pre_apply_params`: a failed adaptive `status='applied'` update restores each full pre-apply params object, including current allocation A and previous allocation P. |
 | RC18 | `test_rc18_compensation_keeps_failed_apply_history_replayable`: P at 09:00, A at 10:00, then failed B and compensation at 14:00; the B owner fact remains intact, compensation appends A/P, and the 15:00 resolver returns A. |
 | RC19 | `test_rc19_apply_parameter_history_uses_one_batch_timestamp`: two-account apply shares one timestamp across `applied_at`, account `updated_at`, and parameter history `created_at`. |
+| RC20 | `test_rc20_compensation_uses_one_batch_timestamp`: two-account compensation shares one history/account timestamp and restores each complete pre-apply params snapshot. |
 | ADD_POSITION | `test_synthesized_add_position_callers_pass_the_enforced_gate`: contract v1 in user mode sends both synthetic callers through typed `ADD_POSITION` enforcement and reaches the planner. |
 

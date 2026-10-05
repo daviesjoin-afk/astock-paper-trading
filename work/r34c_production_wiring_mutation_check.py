@@ -31,6 +31,7 @@ BASELINE = (
     "test_evolution_apply.ApplyAllocationTests.test_rc17_compensation_restores_exact_complete_pre_apply_params",
     "test_evolution_apply.ApplyAllocationTests.test_rc18_compensation_keeps_failed_apply_history_replayable",
     "test_evolution_apply.ApplyAllocationTests.test_rc19_apply_parameter_history_uses_one_batch_timestamp",
+    "test_evolution_apply.ApplyAllocationTests.test_rc20_compensation_uses_one_batch_timestamp",
     "test_order_intent_contract.OrderIntentContractTests.test_synthesized_add_position_callers_pass_the_enforced_gate",
     "test_portfolio_order_intents.PortfolioOrderIntentOwnerTests.test_rc14_unapproved_waitlist_markers_do_not_block_resource_intents",
 )
@@ -194,6 +195,14 @@ MUTATIONS = [
         '            row = by_id[account_id]')],
      "detectors": ["test_evolution_apply.ApplyAllocationTests."
                    "test_rc19_apply_parameter_history_uses_one_batch_timestamp"]},
+    {"id": "M-C24", "semantic": "compensation timestamp is generated per account",
+     "edits": [("backend/evolution_apply.py",
+        '        written_at = _now()\n'
+        '        for account_id, previous_params in pre_apply_params.items():',
+        '        for account_id, previous_params in pre_apply_params.items():\n'
+        '            written_at = _now()')],
+     "detectors": ["test_evolution_apply.ApplyAllocationTests."
+                   "test_rc20_compensation_uses_one_batch_timestamp"]},
 ]
 
 
