@@ -1537,3 +1537,127 @@ def ensure_strategy_retirement_workflow(conn):
                 BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
         )
     return changes
+
+
+# ─── 策略候选台账（v33 / R35-A） ─────────────────────────────────────────────
+#
+# 不变量::
+#
+#     strategy_candidates = 「哪个 generator 在哪个显式 as-of 下，从哪个 **pinned
+#     parent** 提出了哪一份 canonical strategy specification」的唯一追加式 owner
+#
+# 三条硬约束，都在 schema 层而不只是代码层：
+#
+# 1. ``CHECK(candidate_id = candidate_fingerprint)`` —— candidate 身份**就是**
+#    canonical 指纹。没有"名字/描述/时间相近"这种第二套去重权威，也不可能出现
+#    "语义相同但 ID 不同"的两个候选。
+# 2. append-only trigger —— 已有候选不得 UPDATE/DELETE 变成另一个候选。改动任何
+#    语义事实产生的是**新的候选行**（新的 candidate_id / fingerprint）。
+# 3. 表里**没有**评估事实列（Sharpe / 收益 / 回撤 / 胜率 / promotion 结果）。
+#    那些属于 R36 / R31 的事实，由各自的 owner 产生；一旦混进候选身份，同一个
+#    候选就会因为"跑过一次"而变成另一个候选。
+#
+# 不变量之外还刻意不建 latest/current 视图或列：读路径只能按显式 candidate ID 取。
+
+STRATEGY_CANDIDATE_COLUMNS = (
+    "candidate_id", "candidate_fingerprint", "candidate_contract_version",
+    "candidate_schema_version", "parent_strategy_id", "parent_strategy_version",
+    "parent_strategy_checksum", "generator_type", "generator_version",
+    "generator_contract_version", "hypothesis_id", "asof", "random_seed",
+    "candidate_json", "created_at",
+)
+
+STRATEGY_CANDIDATE_PROPOSAL_COLUMNS = (
+    "proposal_id", "candidate_id", "input_fingerprint", "proposal_json", "created_at",
+)
+
+
+def strategy_candidate_ddl(table="strategy_candidates"):
+    """``strategy_candidates`` 的规范 DDL（migration 与 ``init_db`` 共用）。"""
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        candidate_id TEXT PRIMARY KEY,
+        candidate_fingerprint TEXT NOT NULL,
+        candidate_contract_version TEXT NOT NULL,
+        candidate_schema_version TEXT NOT NULL,
+        parent_strategy_id TEXT,
+        parent_strategy_version INTEGER,
+        parent_strategy_checksum TEXT,
+        generator_type TEXT NOT NULL,
+        generator_version TEXT NOT NULL,
+        generator_contract_version TEXT NOT NULL,
+        hypothesis_id TEXT,
+        asof TEXT NOT NULL,
+        random_seed INTEGER,
+        candidate_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK(candidate_id = candidate_fingerprint),
+        CHECK(length(candidate_id)=64),
+        -- parent pin 三件套必须同时给出或同时缺席：半个 pin 无法证明绑的是哪一版。
+        CHECK(
+            (parent_strategy_id IS NULL AND parent_strategy_version IS NULL
+             AND parent_strategy_checksum IS NULL)
+            OR (parent_strategy_id IS NOT NULL AND parent_strategy_version > 0
+                AND parent_strategy_checksum IS NOT NULL
+                AND length(parent_strategy_checksum)=64)
+        )
+    )
+    """
+
+
+def strategy_candidate_proposal_ddl(table="strategy_candidate_proposals"):
+    """``strategy_candidate_proposals`` 的规范 DDL（去重的证据侧，append-only）。"""
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        proposal_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL,
+        input_fingerprint TEXT NOT NULL,
+        proposal_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(candidate_id) REFERENCES strategy_candidates(candidate_id)
+    )
+    """
+
+
+def ensure_strategy_candidates(conn):
+    """v33: create the append-only strategy candidate ledger (idempotent, no backfill).
+
+    只创建自己的两张表；不 INSERT/UPDATE 任何正式账本，不写 lifecycle，不写订单，
+    也不发布任何评估结论。升级前的历史里没有候选概念，因此这里**没有回填** ——
+    从既有策略反推"当时提出过哪些候选"是凭空捏造 provenance。
+    """
+    changes = {}
+    if not table_columns(conn, "strategy_candidates"):
+        conn.execute(strategy_candidate_ddl("strategy_candidates"))
+        changes["strategy_candidates"] = "created"
+    else:
+        changes["strategy_candidates"] = "ok"
+    if not table_columns(conn, "strategy_candidate_proposals"):
+        conn.execute(strategy_candidate_proposal_ddl("strategy_candidate_proposals"))
+        changes["strategy_candidate_proposals"] = "created"
+    else:
+        changes["strategy_candidate_proposals"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_candidates_parent"
+        " ON strategy_candidates(parent_strategy_id,parent_strategy_version)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_candidates_generator"
+        " ON strategy_candidates(generator_type,generator_version)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_candidate_proposals_candidate"
+        " ON strategy_candidate_proposals(candidate_id,created_at)"
+    )
+    for table in ("strategy_candidates", "strategy_candidate_proposals"):
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_no_update
+                BEFORE UPDATE ON {table}
+                BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
+        )
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+                BEFORE DELETE ON {table}
+                BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
+        )
+    return changes

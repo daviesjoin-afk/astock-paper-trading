@@ -660,3 +660,37 @@ the focused baseline after restore is green.
 | RC20 | `test_rc20_compensation_uses_one_batch_timestamp`: two-account compensation shares one history/account timestamp and restores each complete pre-apply params snapshot. |
 | ADD_POSITION | `test_synthesized_add_position_callers_pass_the_enforced_gate`: contract v1 in user mode sends both synthetic callers through typed `ADD_POSITION` enforcement and reaches the planner. |
 
+### R35-A strategy candidate contract traceability (C1-C10)
+
+| ID | Regression coverage |
+|---|---|
+| C1 | `test_c1_same_canonical_specification_yields_the_same_fingerprint`; `test_c1b_key_order_and_presentation_never_change_the_fingerprint` |
+| C2 | `test_c2_parameter_mutation_changes_the_fingerprint`; `test_c2b_entry_factor_exit_and_parent_checksum_mutations_all_move_identity`; `test_c2c_identity_material_carries_no_evaluation_result`; `test_c2d_dsl_schema_version_is_part_of_the_fingerprint`; `test_c2e_declared_parameter_contract_is_part_of_the_fingerprint` |
+| C3 | `test_c3_parent_upgrade_does_not_change_recorded_candidate_provenance`; `test_c3b_pin_requires_the_exact_version_and_checksum`; `test_c3c_parent_without_declarative_dsl_cannot_be_a_generator_basis`; `test_c3d_pinning_never_falls_back_to_the_registry_head` |
+| C4 | `test_c4_python_source_eval_exec_and_shell_payloads_are_rejected`; `test_c4b_dynamic_field_and_attribute_access_is_rejected`; `test_c4c_parameter_spec_cannot_be_smuggled_into_a_non_entry_rule`; `test_c4d_unknown_ops_and_oversized_asts_are_rejected` |
+| C5 | `test_c5_missing_parent_version_or_checksum_is_rejected`; `test_c5b_missing_generator_version_asof_and_entry_are_rejected`; `test_c5c_generator_input_requires_explicit_asof_universe_and_regime`; `test_c5d_service_requires_explicit_universe_and_regime`; `test_c5e_undeclared_or_out_of_contract_parameters_are_rejected`; `test_c5f_locked_parameters_cannot_be_varied`; `test_c5g_variant_space_is_bounded_by_the_input_contract` |
+| C6 | `test_c6_same_candidate_is_not_duplicated`; `test_c6b_dedup_keeps_the_proposal_source_evidence`; `test_c6c_dedup_authority_is_the_fingerprint_not_the_name_or_time` |
+| C7 | `test_c7_candidate_rows_cannot_be_updated_or_deleted`; `test_c7b_same_id_with_different_content_is_a_conflict_not_an_overwrite` |
+| C8 | `test_c8_persistence_round_trip_reverifies_the_fingerprint`; `test_c8b_schema_itself_refuses_an_id_that_is_not_the_fingerprint`; `test_c8c_explicit_candidate_id_is_required`; `test_c8d_unknown_candidate_is_absent_not_the_latest_one` |
+| C9 | `test_c9_generator_modules_have_no_promotion_or_execution_dependency`; `test_c9b_pure_candidate_domain_never_takes_a_connection`; `test_c9c_generator_never_writes_a_lifecycle_state`; `test_c9d_candidate_ledger_holds_no_evaluation_or_promotion_columns`; `test_c9e_repository_touches_only_its_own_tables`; `test_c9f_no_runtime_create_or_alter_table_in_the_generator_path` |
+| C10 | `test_c10_current_registry_head_cannot_replace_a_stored_pin`; `test_c3d_pinning_never_falls_back_to_the_registry_head` |
+
+HTTP 契约：`test_strategy_api_contract.test_r35a_candidate_generation_and_read_model_over_http`。
+前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35A-C1…C6）。
+确定性/输入不可变：`DeterminismTests`（同输入同候选、输入不被修改、重复声明值折叠、
+input fingerprint 稳定、台账元数据不进指纹）。读模型：`ReadModelTests`。
+
+### R35-A semantic mutation results
+
+`work/r35a_candidate_mutation_check.py` result: M-G1-M-G5 all **DETECTED**;
+`survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and the focused
+baseline after restore is green.
+
+| ID | Semantic mutation | Detector |
+|---|---|---|
+| M-G1 | candidate provenance re-resolves the parent from the current head | C3 / C3d / C10 |
+| M-G2 | canonical fingerprint ignores parameter values entirely | C2 / C2e |
+| M-G3 | candidate identity becomes random instead of canonical | C1 / C6 |
+| M-G4 | a missing parent checksum falls back to the current version | C3b / C5 |
+| M-G5 | arbitrary executable candidate payload is accepted | C4 |
+

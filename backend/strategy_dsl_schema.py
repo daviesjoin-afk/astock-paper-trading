@@ -16,6 +16,11 @@ MAX_AST_DEPTH = 12
 MAX_AST_NODES = 128
 MAX_ROLLING_WINDOW = 250
 
+#: DSL schema 版本。任何会让同一份 AST 含义改变的 schema 变化都必须递增：
+#: 依赖它的持久化事实（例如 R35-A strategy candidate）要把版本写进自己的指纹，
+#: 否则"同一份 specification"会在 schema 变化后静默得到同一个 fingerprint。
+DSL_SCHEMA_VERSION = "strategy-dsl-schema-v1"
+
 PRICE_FIELDS = frozenset({"open", "high", "low", "close", "volume", "amount"})
 FINANCIAL_FIELDS = frozenset({
     "pe", "pb", "roe", "revenue_yoy", "profit_yoy", "gross_margin", "debt_ratio",

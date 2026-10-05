@@ -194,6 +194,83 @@ class FrontendPayloadContractTests(_ApiFixture):
         self.assertTrue(deleted["deleted"])
         self.assertIsNone(deleted["archived_instead_hint"])
 
+    def test_r35a_candidate_generation_and_read_model_over_http(self):
+        """R35-A：候选生成走真实 HTTP 契约，读模型只发布 backend 事实。"""
+        parameterized = {
+            "op": "strategy",
+            "rule": {"op": "gt", "left": {"op": "field", "name": "close"},
+                     "right": {"op": "indicator", "name": "ma", "window": {
+                         "op": "parameter", "parameter_id": "ma_period", "type": "integer",
+                         "value": 20, "min": 5, "max": 60, "max_step": 2, "locked": False,
+                         "risk_direction": "lower_is_riskier", "min_evidence": 0}}},
+            "parameters": [],
+        }
+        status, created = self._call(API.create_strategy, {
+            "id": "fe_cand", "name": "fe_cand", "dsl_ast": parameterized,
+        }, default_status=201)
+        self.assertEqual(status, 201, created)
+        lifecycle = SVC.lifecycle_read_model("fe_cand")
+
+        payload = {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "asof": "2026-10-05",
+            "parameter_adjustments": {"ma_period": [18, 22]},
+            "universe_spec": {"scope_kind": "a_share_all"},
+            "intended_market_regime": "momentum",
+            "evidence_count": 0,
+            "research_provenance": {"source_kind": "human"},
+        }
+        status, result = self._call(API.generate_strategy_candidates, "fe_cand", payload,
+                                    default_status=201)
+        self.assertEqual(status, 201, result)
+        self.assertEqual(2, result["candidate_count"])
+        self.assertEqual(lifecycle["checksum"],
+                         result["parent_strategy_pin"]["strategy_checksum"])
+
+        candidate_id = result["candidate_ids"][0]
+        status, read = self._call(API.get_strategy_candidate, "fe_cand", candidate_id)
+        self.assertEqual(status, 200, read)
+        self.assertEqual(candidate_id, read["candidate"]["candidate_id"])
+        self.assertEqual("CANDIDATE", read["status"])
+        # 生成路径不发布评估 / 晋级结论。
+        self.assertIsNone(read["evaluation"])
+        self.assertIsNone(read["promotion"])
+        for forbidden in ("sharpe", "max_drawdown", "win_rate", "promotion_result"):
+            self.assertNotIn(forbidden, json.dumps(read).lower())
+
+        # 列表必须按 exact pin 过滤；用另一个 checksum 查不到任何候选。
+        status, listed = self._call(API.list_strategy_candidates, "fe_cand",
+                                    strategy_version=lifecycle["version"],
+                                    strategy_checksum=lifecycle["checksum"])
+        self.assertEqual(status, 200, listed)
+        self.assertEqual(2, len(listed["items"]))
+        self.assertIn("created_at", listed["items"][0]["persistence"])
+        self.assertEqual(candidate_id, listed["items"][0]["candidate"]["candidate_id"])
+        status, other = self._call(API.list_strategy_candidates, "fe_cand",
+                                   strategy_version=lifecycle["version"],
+                                   strategy_checksum="b" * 64)
+        self.assertEqual(200, status)
+        self.assertEqual([], other["items"])
+
+        # 页面身份与候选身份不一致 → 409，绝不把 A 的候选显示成 B 的。
+        status, mismatch = self._call(API.get_strategy_candidate, "fe_life", candidate_id)
+        self.assertEqual(409, status, mismatch)
+
+        # 缺失 provenance / 越权参数一律被拒（形状错误 422，契约拒绝 400/409），
+        # 且不产生任何候选行。
+        for broken in (
+            {**payload, "strategy_checksum": ""},
+            {**payload, "parameter_adjustments": {"ma_period": [40]}},
+            {**payload, "universe_spec": None},
+        ):
+            status, rejected = self._call(API.generate_strategy_candidates, "fe_cand", broken)
+            self.assertIn(status, (400, 409, 422), rejected)
+        status, still = self._call(API.list_strategy_candidates, "fe_cand",
+                                   strategy_version=lifecycle["version"],
+                                   strategy_checksum=lifecycle["checksum"])
+        self.assertEqual(2, len(still["items"]), "被拒绝的请求不得留下候选")
+
     def test_workbench_can_resume_paused_strategy_with_human_reason(self):
         status, created = self._call(API.create_strategy, {
             "id": "fe_resume", "name": "fe_resume", "dsl_ast": RULE,
@@ -362,6 +439,9 @@ class OpenApiContractTests(_ApiFixture):
             "/api/strategies/{strategy_id}/clone": {"post"},
             "/api/strategies/{strategy_id}/versions": {"get"},
             "/api/strategies/{strategy_id}/events": {"get"},
+            # R35-A：候选生成与只读投影（没有 latest/current 路由）。
+            "/api/strategies/{strategy_id}/candidates": {"get", "post"},
+            "/api/strategies/{strategy_id}/candidates/{candidate_id}": {"get"},
         }
         for path, methods in expected.items():
             self.assertIn(path, paths, path)

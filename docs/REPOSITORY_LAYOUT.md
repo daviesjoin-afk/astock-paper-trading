@@ -109,6 +109,17 @@ R34-C 生产接线位于 `paper_trading` / `manual_orders`：入口传入显式
 及 `GET /api/portfolio/workspace` 只接收明确的 cycle/plan ID，读取并验证快照、计划与
 订单 provenance；没有 latest/current 选择或交易权限。旧 allocation/slot helper 的无调用
 定义仍待删除，general dashboard 在缺 plan identity 时返回 `UNAVAILABLE`。
+R35-A 加入受约束的**策略候选**链（事实层，无 promotion/execution 权限）：
+`strategy_candidate`（纯契约：唯一 `StrategyCandidate` 身份与 canonical fingerprint，
+不含任何评估事实）、`strategy_generator`（纯生成边界：`GeneratorInput → StrategyCandidate`，
+无 DB / registry / 时钟 / current 查询，受约束表示复用既有 bounded DSL 与参数契约）、
+`strategy_candidate_repository`（append-only：只按显式 candidate ID 幂等追加/读取
+`strategy_candidates` + `strategy_candidate_proposals`，没有 latest/current getter）、
+`strategy_candidate_service`（按显式 exact version + checksum 从 registry 建立 parent pin，
+再编排生成与追加；不写 lifecycle、不下单）。新增路由仅
+`POST /api/strategies/{id}/candidates`、`GET /api/strategies/{id}/candidates`
+（按 exact version+checksum）与 `GET /api/strategies/{id}/candidates/{candidate_id}`。
+DDL 由 `paper_schema_migrations.ensure_strategy_candidates` 唯一持有（migration v33）。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）
