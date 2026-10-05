@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32 = **COMPLETE**；R33-A = **COMPLETE（PR #222 MERGED）**；R33-B = **COMPLETE（PR #223 MERGED）**；R33-C = **COMPLETE（PR #224 MERGED）**；R33 = **COMPLETE**；R34-A = **COMPLETE（PR #225 MERGED）**；R34-B = **COMPLETE（PR #226 MERGED）**；R34-C = **IN PROGRESS（未提交审核）**；R34 = **NOT COMPLETE**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32 = **COMPLETE**；R33-A = **COMPLETE（PR #222 MERGED）**；R33-B = **COMPLETE（PR #223 MERGED）**；R33-C = **COMPLETE（PR #224 MERGED）**；R33 = **COMPLETE**；R34-A = **COMPLETE（PR #225 MERGED）**；R34-B = **COMPLETE（PR #226 MERGED）**；R34-C = **COMPLETE（PR #227 MERGED）**；R34 = **COMPLETE**；R35-A = **IN REVIEW（未提交审核）**；R35 = **IN PROGRESS**；R36 = **NOT STARTED**；R37 = **NOT STARTED**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
@@ -3391,7 +3391,7 @@ R30 从 exact completed R29 run 与完整 `ExperimentSpec` 建立不可变计划
 缺少证据就标记 unavailable。Synthetic view 留在内存，不回写任何历史 owner。报告 ledger append-only，API 离线，
 Research Workspace 只渲染报告事实，unknown 保持 null；R30 不产生分数、晋级或生命周期状态。
 R30 exit matrix、全量验证和 exact-head CI 均已通过。完整 contract 与 API/UI 边界见
-[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md), [`docs/R32C_ISOLATED_SHADOW_RUNTIME.md`](docs/R32C_ISOLATED_SHADOW_RUNTIME.md), and [`docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance; R32-C runs an exact Shadow version only over frozen Active evidence and stores append-only isolated evidence; R32-D builds an immutable Active/Challenger comparison report from one exact Active evidence envelope, one exact ShadowRun and one explicit spec, appending only its own report table. **R32 and R33 are COMPLETE.** R34-A and R34-B (PR #226) are COMPLETE; R34-C is IN PROGRESS and not yet submitted for review; R34 is NOT COMPLETE.
+[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md), [`docs/R32C_ISOLATED_SHADOW_RUNTIME.md`](docs/R32C_ISOLATED_SHADOW_RUNTIME.md), and [`docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance; R32-C runs an exact Shadow version only over frozen Active evidence and stores append-only isolated evidence; R32-D builds an immutable Active/Challenger comparison report from one exact Active evidence envelope, one exact ShadowRun and one explicit spec, appending only its own report table. **R32 and R33 are COMPLETE.** R34-A (PR #225), R34-B (PR #226) and R34-C (PR #227) are COMPLETE, so **R34 is COMPLETE**. R35-A is IN REVIEW; R35 is IN PROGRESS; R36 and R37 are NOT STARTED.
 
 ### 仅作 review signal（不进入 CI gate）
 
@@ -3571,7 +3571,7 @@ Canonical 权重是显式声明，必须严格覆盖 `execution_participant_ids`
 
 缺证据即缺证据：容量缺失不变成 `pending = 0`，市值缺失不让成本价冒充，correlation 缺失不变成 0，分类缺失不生成集中度事实，capacity 仅在 owner-issued `used`/`pending`/`headroom` 齐全时给出 PLANNED（且原样透传，不派生）。v1 实际能力为 `slot_plan` / `conflict_plan` = PLANNED，`capital_plan` / `capacity_plan` = INSUFFICIENT_EVIDENCE，`concentration_adjustment` / `correlation_term` = UNAVAILABLE，整体 `plan_status` = PARTIAL；计划只追加写自己的表，没有 apply/execute 或 latest/current 路径。旧 `portfolio_coordinator` 的文本猜意图路径（`classify_intent` / `sort_intents_by_priority` / `_EXIT_PURPOSE_KEYWORDS` 及三个死常量）因生产调用者为 0 而删除；R34-C 又在确认零生产引用后删除整个遗留模块与专用测试。pending BUY reservation 已由 exact runtime owner 提供；R34-C 已将 dashboard 与 allocation-explain 读路径改为无精确 plan 时返回 UNAVAILABLE，旧 slot/capital helper 定义及 replacement slot-borrow 相关路径仍待收敛。完整契约见 [`docs/R34_MULTI_STRATEGY_PORTFOLIO.md`](docs/R34_MULTI_STRATEGY_PORTFOLIO.md)。
 
-## R34-C production wiring（IN REVIEW WORK IN PROGRESS）
+## R34-C production wiring（COMPLETE — PR #227 MERGED）
 
 ```text
 Strategy action
@@ -3594,12 +3594,107 @@ latest/current. General summaries without a named plan report allocation as
 `UNAVAILABLE`. The legacy BUY/capital allocation helpers and slot-borrow
 decision helpers have been removed. `_dynamic_position_limits` remains wired
 only to Risk capacity-exit review, and `_rollback_slot_borrow` remains for
-legacy in-flight-order recovery. C0-C35/mutation coverage and exact-head CI
-remain outstanding; R34-C and R34 are not complete.
+legacy in-flight-order recovery. C0-C35/mutation coverage and exact-head CI are
+green on the merged exact head `0b2bb46` (PR #227, 8/8 checks, 0 unresolved
+review threads); R34-C and R34 are **COMPLETE**. The remaining no-caller legacy
+slot/capital helper definitions are a non-blocking cleanup observation, not an
+open authority gap.
 
 ```text
 economic ownership != execution eligibility != risk-exit eligibility
 ```
+
+## R35-A constrained strategy candidate contract（IN REVIEW）
+
+R35 正式进入 **AI-assisted Strategy Evolution**，但 R35-A 的唯一权限是
+**produce StrategyCandidate**。系统必须保持：
+
+```text
+Generator
+    ↓
+StrategyCandidate
+    ↓
+Experiment / Validation
+    ↓
+Lifecycle / Promotion
+    ↓
+Shadow / Paper / Production-Sim
+```
+
+严禁 `Generator → Execution`，也严禁 `Generator → 直接覆盖 active strategy`。
+
+R35-A 新增四个高内聚 capability，各回答一个问题：
+
+| 模块 | 它拥有的业务职责 | 它负责的事实 |
+| --- | --- | --- |
+| `strategy_candidate` | candidate **是什么**（纯契约） | canonical candidate identity / fingerprint |
+| `strategy_generator` | 从显式输入**生成**候选（纯边界） | generator 语义与受约束变体 |
+| `strategy_candidate_repository` | 候选台账**怎么存**（append-only） | candidate 行与提案证据 |
+| `strategy_candidate_service` | 按 exact pin 读 registry 并**编排** | parent pin 的建立 |
+
+依赖方向：
+
+```text
+strategy contracts (strategy_dsl_schema / strategy_parameter_schema)
+        ↓
+candidate / generator domain
+        ↓
+candidate repository / application service
+        ↓
+API / frontend
+```
+
+三条硬性质：
+
+1. **candidate identity ≠ candidate evaluation result。** 台账里**没有**
+   Sharpe / 收益率 / 回撤 / 胜率 / promotion 结果这些列或字段；出现即 fail closed。
+   评估事实属于 R36 / R31，由各自 owner 产生。
+2. **immutable + append-only。** `CHECK(candidate_id = candidate_fingerprint)` 让
+   身份**就是** canonical 指纹，加上 `no_update` / `no_delete` trigger：改动任何语义
+   事实产生的是**另一个** candidate，绝不存在"把旧候选改成新策略"。
+3. **explicit facts in, candidate out。** generator 没有 DB、没有 registry、没有
+   `datetime.now()` 业务 as-of、没有 current/latest 查询；`GeneratorInput` 必须显式
+   携带 parent pin（`strategy_id` + immutable `version` + `checksum`）、as-of、
+   universe、intended regime 与参数调整声明。父策略升级到 v2 不会改变已有候选绑定的
+   v1（由 C3/C10 与 M-G1/M-G4 证明）。
+
+受约束表示**复用**仓库既有 owner，不发明第二套语言：候选只携带
+`strategy_dsl_schema` 校验过的声明式 AST，参数契约由
+`strategy_parameter_schema` 裁决（allowlist / bounds / `max_step` / locked /
+`min_evidence`）。任何"像代码"的 payload（`python` / `eval` / `exec` / shell /
+动态 import / 属性访问）在这里被拒绝，不是因为子串过滤，而是因为**没有那个 op**。
+
+去重的唯一权威是 canonical candidate fingerprint；同一个候选被重复提出时身份不变，
+但每次提案的来源证据（generator / as-of / hypothesis / model / input fingerprint）
+追加进 `strategy_candidate_proposals`，因此去重不会丢失"谁、何时、为何又提了一次"。
+
+**Candidate identity 与 proposal identity 是两种身份，契约分开**：
+
+```text
+candidate row  → content identity：canonical fingerprint → 语义去重（幂等）
+proposal row   → event identity：opaque event id        → 每次发生都追加
+```
+
+`proposal_id` 是 **opaque event identity**（`secrets.token_hex(32)`），**不是** proposal
+内容的 fingerprint；它不依赖任何 process-local 权威 —— 没有进程内计数器、PID、thread
+id，也不以墙上时钟或 candidate/proposal 内容哈希作为唯一性权威。`created_at` 只是事件
+时间戳 / 排序元数据，**不是** uniqueness authority，两次提案可以合法地拥有完全相同的
+`created_at`。因此事件表写入是 fail-closed 的普通 `INSERT`（不是 `INSERT OR IGNORE`）：
+意外的 id 碰撞必须报错，而不是假装第二次提案已记录。candidate 行继续使用
+`INSERT OR IGNORE`，因为 canonical fingerprint 本来就是它的去重权威；append-only
+`*_no_update` / `*_no_delete` trigger 保持不变。
+
+R35-A **不**做 promotion、**不**做 execution、**不**修改任何正式策略：`tq_breakout` /
+`main_force_top10` 等只作为 pinned baseline / parent / reference 存在。验收标准是
+**可信的生成基础设施**，不是"证明某个新策略赚钱"——因此本阶段没有任何以收益 /
+Sharpe / 胜率作为验收条件的断言。DDL 由 `paper_schema_migrations.ensure_strategy_candidates`
+唯一持有（migration v33），业务代码不在运行时 `CREATE TABLE` / `ALTER TABLE`。
+
+```text
+candidate identity != candidate evaluation result
+generator authority = produce candidate (no promotion, no execution)
+```
+
 
 ## 架构演进记录（历史批次：模块化与边界固化）
 

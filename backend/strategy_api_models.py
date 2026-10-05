@@ -168,6 +168,32 @@ class RetirementApprovalRequest(_Request):
     reason: str = Field(default="", max_length=1000)
 
 
+class StrategyCandidateGenerateRequest(_Request):
+    """``POST /api/strategies/{id}/candidates``（R35-A）。
+
+    只接受**显式**的 exact parent version/checksum 与显式 as-of：没有 head 兜底、
+    没有"当前日"、没有隐式窗口。请求体里**没有**任何评估字段（Sharpe / 收益 /
+    晋级结论），因为 candidate identity 不包含它们（``extra="ignore"`` 会丢弃）。
+
+    ``parameter_adjustments`` 是"每个参数要试哪些值"的**显式**声明：generator
+    只在这些值里取值，而且每个值仍要过父策略自己的参数契约（allowlist / bounds /
+    ``max_step`` / locked），越权一律 fail closed。
+    """
+
+    strategy_version: int
+    strategy_checksum: str
+    asof: str
+    parameter_adjustments: dict[str, list[float]]
+    universe_spec: dict[str, Any]
+    intended_market_regime: str
+    evidence_count: int | None = None
+    hypothesis_id: str | None = None
+    research_provenance: dict[str, Any] | None = None
+    random_seed: int | None = None
+    model_identity: dict[str, Any] | None = None
+    constraints: dict[str, Any] | None = None
+
+
 class StrategyCloneRequest(_Request):
     """``POST /api/strategies/{id}/clone``。"""
     new_strategy_id: str | None = None

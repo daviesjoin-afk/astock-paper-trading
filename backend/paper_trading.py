@@ -1899,6 +1899,8 @@ def init_db():
                 PSM.ensure_portfolio_runtime_snapshots(conn)
                 # R34-B（v31）：多策略分配计划追加表（DDL owner 同上）。
                 PSM.ensure_portfolio_allocation_plans(conn)
+                # R35-A（v33）：策略候选台账（DDL 同样只在 paper_schema_migrations）。
+                PSM.ensure_strategy_candidates(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2220,6 +2222,8 @@ def init_db():
         PSM.ensure_portfolio_runtime_snapshots(conn)
         # R34-B v31：多策略分配计划追加表（DDL 同样只在 paper_schema_migrations）。
         PSM.ensure_portfolio_allocation_plans(conn)
+        # R35-A v33：策略候选台账（DDL 同样只在 paper_schema_migrations）。
+        PSM.ensure_strategy_candidates(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

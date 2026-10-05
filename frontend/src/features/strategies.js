@@ -735,17 +735,76 @@ export async function wbLoadChallengerReport(strategyId){
   await wbOpenDetail(strategyId);
 }
 
+/* ================= R35-A：StrategyCandidate 只读台账 =================
+   这一段只渲染 backend 候选台账的事实：candidate identity、parent pin、
+   generator 身份、asof、canonical fingerprint 与 specification 摘要。
+
+   前端**不得**自行判断候选是否优秀 / 能否晋级 / 是否允许进 Shadow：
+   后端在这一层明确不发布 evaluation / promotion（两者都是 null）。
+   因此这里既不排序、也不打分、也不做"哪个更好"的措辞。 */
+export function wbCandidateHtml(candidate){
+  var spec=candidate.parameter_spec||{};
+  var params=(spec.parameters||[]).map(function(item){
+    return adaptiveEsc(item.parameter_id)+'='+adaptiveEsc(String(item.value));
+  }).join(' · ')||'无声明参数';
+  var universe=candidate.universe_spec||{};
+  var scope=[universe.scope_kind,(universe.boards||[]).join('/'),(universe.symbols||[]).join('/')]
+    .filter(Boolean).map(adaptiveEsc).join(' · ');
+  return '<article class="strategy-candidate" data-testid="strategy-candidate">'
+    +'<b>'+adaptiveEsc(candidate.candidate_id||'')+'</b>'
+    +'<dl class="strategy-preview-grid">'
+    +'<dt>Parent pin</dt><dd data-testid="candidate-parent">'+adaptiveEsc(String(candidate.parent_strategy_id||'—'))
+    +' @ v'+adaptiveEsc(String(candidate.parent_strategy_version))
+    +' · <code>'+adaptiveEsc(String(candidate.parent_strategy_checksum||''))+'</code></dd>'
+    +'<dt>Generator</dt><dd>'+adaptiveEsc(candidate.generator_type||'')+' / '+adaptiveEsc(candidate.generator_version||'')
+    +' · contract '+adaptiveEsc(candidate.generator_contract_version||'')+'</dd>'
+    // created_at 是持久化事实（不属于 candidate 指纹），由台账单独发布。
+    +'<dt>Created / asof</dt><dd>'+adaptiveEsc(String(candidate.created_at||'未记录'))+' / '+adaptiveEsc(candidate.asof||'')+'</dd>'
+    +'<dt>Fingerprint</dt><dd data-testid="candidate-fingerprint"><code>'+adaptiveEsc(candidate.candidate_fingerprint||'')+'</code></dd>'
+    +'<dt>Status</dt><dd data-testid="candidate-status">'+adaptiveEsc(String(candidate.status||'CANDIDATE'))+'</dd>'
+    +'<dt>Parameters</dt><dd>'+params+'</dd>'
+    +'<dt>Universe</dt><dd>'+adaptiveEsc(scope||'未声明')+'</dd>'
+    +'<dt>Intended regime</dt><dd>'+adaptiveEsc(candidate.intended_market_regime||'')+'</dd></dl>'
+    +'<details><summary>canonical specification（entry / exit / factor / constraints）</summary><code>'
+    +adaptiveEsc(JSON.stringify({entry_spec:candidate.entry_spec,exit_spec:candidate.exit_spec,
+      factor_spec:candidate.factor_spec,constraints:candidate.constraints,
+      strategy_schema_version:candidate.strategy_schema_version}))+'</code></details>'
+    +'<p class="strategy-candidate-note">评估结论与晋级结论由后端 contract 发布；本页只读台账事实。</p></article>';
+}
+export function wbCandidatesHtml(strategyId,view){
+  var rows=((view&&view.items)||[]).map(function(item){
+    // 每一项是 {candidate, persistence}：created_at 属于台账，不属于候选身份。
+    return wbCandidateHtml(Object.assign({},item.candidate||{},
+      {created_at:(item.persistence||{}).created_at}));
+  }).join('');
+  var pin=(view&&view.parent_strategy_pin)||{};
+  return '<h4>StrategyCandidate 只读台账</h4>'
+    +'<p>只显示绑定到 <b>exact</b> parent v'+adaptiveEsc(String(pin.strategy_version||''))+'</p>'
+    +'<code>'+adaptiveEsc(String(pin.strategy_checksum||''))+'</code>'
+    +'<div data-testid="strategy-candidates">'+(rows||'<p>该 exact version 尚无候选记录。</p>')+'</div>';
+}
+
 export async function wbOpenDetail(strategyId){
   var item;
   try{ item=await api('/api/strategies/'+encodeURIComponent(strategyId)+'?_='+Date.now()); }
   catch(e){ wbRenderNotFound(strategyId,e&&e.message); return null; }
-  var versions=[],lifecycle={},challengerView=null;
+  var versions=[],lifecycle={},challengerView=null,candidatesView=null;
   try{ versions=(await api('/api/strategies/'+encodeURIComponent(strategyId)+'/versions')).items||[]; }catch(e){}
   try{ lifecycle=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/lifecycle'); }catch(e){}
   try{
     challengerView=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/challenger'
       +(WB_STATE.challengerReportId?'?comparison_report_id='+encodeURIComponent(WB_STATE.challengerReportId):''));
   }catch(e){}
+  // R35-A：候选台账只按 **exact** version + checksum 读，绝不查 head / latest。
+  var pinnedVersion=lifecycle.version||item.version||item.current_version||1;
+  var pinnedChecksum=lifecycle.checksum||item.current_checksum||'';
+  if(pinnedChecksum){
+    try{
+      candidatesView=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/candidates'
+        +'?strategy_version='+encodeURIComponent(String(pinnedVersion))
+        +'&strategy_checksum='+encodeURIComponent(pinnedChecksum));
+    }catch(e){}
+  }
   var box=$('wbDetail'); if(!box) return;
   WB_STATE.editingId=strategyId; WB_STATE.editingVersion=item.version||item.current_version;
   var currentVersion=lifecycle.version||item.version||item.current_version||1;
@@ -815,6 +874,7 @@ export async function wbOpenDetail(strategyId){
     +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有 promotion transition 可用。</small>')+'</div>'
     +'<h4>Promotion proposals</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无 proposal。</p>')+'</div></section>'
     +'<section class="strategy-challenger-workspace" data-testid="challenger-workspace">'+wbChallengerHtml(strategyId,challengerView)+'</section>'
+    +'<section class="strategy-candidate-workspace" data-testid="candidate-workspace">'+wbCandidatesHtml(strategyId,candidatesView)+'</section>'
     +'<div class="strategy-detail-columns"><section><h4>运行时摘要</h4><dl class="strategy-preview-grid">'
     +'<dt>ID</dt><dd>'+adaptiveEsc(item.id)+'</dd><dt>来源</dt><dd>'+(item.origin==='user'?'自定义':'内置')+'</dd>'
     +'<dt>生命周期阶段</dt><dd>'+(runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—')+'</dd>'

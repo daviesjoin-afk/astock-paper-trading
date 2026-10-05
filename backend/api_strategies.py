@@ -37,6 +37,10 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import ValidationError
 
 import strategy_api_models as Models
+import strategy_candidate as SC
+import strategy_candidate_repository as SCRepo
+import strategy_candidate_service as SCV
+import strategy_generator as SG
 import strategy_health as SH
 import strategy_health_repository as SHR
 import strategy_health_service as SHV
@@ -95,6 +99,24 @@ def _raise_workflow_http(exc: ValueError) -> None:
     elif any(token in reason for token in (
             "mismatch", "changed", "stale", "conflict", "already", "not_pending",
             "required", "no_executable", "invalid_lifecycle_transition")):
+        status = 409
+    else:
+        status = 400
+    raise HTTPException(status_code=status, detail=reason) from exc
+
+
+def _raise_candidate_http(exc: ValueError) -> None:
+    """Candidate contract rejections are input/identity conflicts, never 5xx.
+
+    ``not_found`` 是 404；身份不符（checksum / fingerprint / parent 不存在）是 409；
+    其余（形状、未声明参数、越界、缺 provenance）是 400。生成域**不会**返回 5xx：
+    它要么给出一个可验证的候选，要么明确拒绝。
+    """
+    reason = str(exc)
+    if "not_found" in reason:
+        status = 404
+    elif any(token in reason for token in (
+            "mismatch", "unavailable", "conflict", "idempotency")):
         status = 409
     else:
         status = 400
@@ -404,6 +426,74 @@ def get_retirement_proposal(proposal_id: str):
     except (RWF.RetirementWorkflowError,
             RWFR.RetirementWorkflowRepositoryError) as exc:
         _raise_workflow_http(exc)
+
+
+# ---------------------------------------------------------------------------
+# R35-A：策略候选（StrategyCandidate）生成与只读投影
+# ---------------------------------------------------------------------------
+
+@router.post("/{strategy_id}/candidates", status_code=201)
+def generate_strategy_candidates(
+    strategy_id: str, payload: Models.StrategyCandidateGenerateRequest | None = None,
+):
+    """Generate constrained candidates from one exact pinned parent version.
+
+    R35-A 只产出 ``StrategyCandidate``：不下单、不改 lifecycle、不产生晋级结论，
+    也不评估候选表现。父策略只作为 pinned baseline 存在。
+    """
+    request = _coerce(Models.StrategyCandidateGenerateRequest, payload)
+    try:
+        return SCV.capture_strategy_candidates(
+            strategy_id,
+            strategy_version=request.strategy_version,
+            strategy_checksum=request.strategy_checksum,
+            asof=request.asof,
+            parameter_adjustments=request.parameter_adjustments,
+            universe_spec=request.universe_spec,
+            intended_market_regime=request.intended_market_regime,
+            evidence_count=request.evidence_count,
+            hypothesis_id=request.hypothesis_id,
+            research_provenance=request.research_provenance,
+            random_seed=request.random_seed,
+            model_identity=request.model_identity,
+            constraints=request.constraints)
+    except (SCV.StrategyCandidateUnavailable, SC.CandidateValidationError,
+            SG.StrategyGeneratorError, SCRepo.StrategyCandidateRepositoryError) as exc:
+        _raise_candidate_http(exc)
+
+
+@router.get("/{strategy_id}/candidates")
+def list_strategy_candidates(
+    strategy_id: str,
+    strategy_version: Annotated[int, Query(ge=1)] = ...,
+    strategy_checksum: Annotated[str, Query(min_length=64, max_length=64)] = ...,
+):
+    """List candidates pinned to one **exact** parent version (never the head)."""
+    try:
+        return SCV.read_parent_candidates(
+            strategy_id, strategy_version=strategy_version,
+            strategy_checksum=strategy_checksum)
+    except (SCV.StrategyCandidateUnavailable, SC.CandidateValidationError,
+            SCRepo.StrategyCandidateRepositoryError) as exc:
+        _raise_candidate_http(exc)
+
+
+@router.get("/{strategy_id}/candidates/{candidate_id}")
+def get_strategy_candidate(strategy_id: str, candidate_id: str):
+    """Read exactly one candidate by id — there is no latest endpoint.
+
+    返回的是 candidate 台账里的只读事实（含 parent pin 与提案历史）。候选是否优秀、
+    能否晋级、能否进 Shadow 一律**不**在这里发布，前端也不得自行判断。
+    """
+    try:
+        result = SCV.read_strategy_candidate(candidate_id)
+    except (SCV.StrategyCandidateUnavailable, SC.CandidateValidationError,
+            SCRepo.StrategyCandidateRepositoryError) as exc:
+        _raise_candidate_http(exc)
+    if str(result["candidate"].get("parent_strategy_id") or "") != str(strategy_id):
+        # 页面身份与候选身份必须一致，否则就是把 A 的候选显示成 B 的。
+        _raise_candidate_http(SC.CandidateValidationError("candidate_strategy_mismatch"))
+    return result
 
 
 # ---------------------------------------------------------------------------

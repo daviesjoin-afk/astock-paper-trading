@@ -340,6 +340,13 @@ MIGRATIONS = {
         # R34-C：新订单显式意图与 exact plan provenance；历史行保持 NULL。
         (32, "新增订单 allocation intent 与 exact plan provenance（幂等，不回填）",
          paper_schema.ensure_order_allocation_provenance),
+        # R35-A：策略候选台账是「哪个 generator 在哪个显式 as-of 下、从哪个 pinned
+        # parent 提出了哪份 canonical specification」的唯一追加式 owner。纯新增两张表
+        # （候选 + 去重证据侧），不写正式账本 / lifecycle / 订单，也没有 latest/current
+        # 读路径。**绝不回填**：升级前的历史里不存在"候选"这个事实，从既有策略反推
+        # 候选 provenance 是捏造。
+        (33, "新增策略候选台账与提案证据表（幂等，不回填，append-only）",
+         paper_schema.ensure_strategy_candidates),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
