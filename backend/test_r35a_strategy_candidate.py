@@ -39,6 +39,7 @@ if BACKEND not in sys.path:
 
 import strategy_candidate as SC
 import strategy_candidate_repository as SCRepo
+import strategy_candidate_search_space as SS
 import strategy_candidate_service as SCV
 import strategy_dsl_schema as DSL
 import strategy_generator as SG
@@ -108,29 +109,49 @@ def _wide_rule():
 
 
 def _pin(*, rule=None, version=1, checksum=CHECKSUM_A, asof="2026-10-05"):
-    return SG.ParentStrategyPin(
+    return SS.ParentStrategyPin(
         strategy_id=PARENT, strategy_version=version, strategy_checksum=checksum,
         dsl_ast=_parent_rule() if rule is None else rule, asof=asof)
 
 
-def _generator_input(*, pin=None, adjustments=None, asof="2026-10-05", **overrides):
+def _search_space(*, pin=None, variants=None, adjustments=None, asof="2026-10-05",
+                  generator_type=SG.PARAMETER_VARIANT_GENERATOR,
+                  generator_version=SG.PARAMETER_VARIANT_VERSION, **overrides):
+    """One explicit R35-B search space with R35-A's defaults."""
     values = {
         "parent_pin": _pin() if pin is None else pin,
-        "parameter_adjustments": {"ma_period": [19, 20, 21]} if adjustments is None
-        else adjustments,
+        "generator_type": generator_type,
+        "generator_version": generator_version,
+        "parameter_variants": ({"ma_period": [19, 20, 21]} if adjustments is None
+                               else adjustments) if variants is None else variants,
         "universe_spec": {"scope_kind": "a_share_all"},
         "intended_market_regime": "momentum",
         "asof": asof,
         "evidence_count": 10,
     }
     values.update(overrides)
-    return SG.GeneratorInput(**values)
+    return SS.CandidateSearchSpace(**values)
 
 
 def _seed_registry(conn, *, rule=None, strategy_id=PARENT, name="R35A Parent"):
     return SR.create_user_definition(
         conn, strategy_id, name, dsl_ast=_parent_rule() if rule is None else rule,
         actor="test")
+
+
+def _propose(conn, candidate, *, input_fingerprint, created_at=None,
+             generation_batch_id=None):
+    """Record one proposal event with the capability identity it belongs to.
+
+    R35-B：proposal 是事件，事件必须说清"是哪个 generator 能力、哪一次请求提出的"。
+    因此能力身份是**必填**参数，而不是从 candidate 上猜（候选已经不带它了）。
+    """
+    return SCRepo.record_proposal(
+        conn, candidate, input_fingerprint=input_fingerprint,
+        generator_type=SG.PARAMETER_VARIANT_GENERATOR,
+        generator_version=SG.PARAMETER_VARIANT_VERSION,
+        generator_contract_version=SG.GENERATOR_CONTRACT_VERSION,
+        generation_batch_id=generation_batch_id, created_at=created_at)
 
 
 class _LedgerFixture(unittest.TestCase):
@@ -140,12 +161,12 @@ class _LedgerFixture(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         self.addCleanup(self._dir.cleanup)
         self.addCleanup(self.conn.close)
-        # DDL owner 是 paper_schema_migrations（migration v33 调用同一个函数）。
+        # DDL owner 是 paper_schema_migrations（migration v33/v34 调用同一个函数）。
         import paper_schema_migrations as PSM
         PSM.ensure_strategy_candidates(self.conn)
 
     def _candidates(self, **kwargs):
-        return SG.generate_parameter_variants(_generator_input(**kwargs))
+        return SG.generate_candidates(_search_space(**kwargs))
 
 
 class CandidateIdentityTests(_LedgerFixture):
@@ -199,8 +220,6 @@ class CandidateIdentityTests(_LedgerFixture):
             candidate = SC.build_strategy_candidate(
                 parent_identity={"strategy_id": PARENT, "strategy_version": 1,
                                  "strategy_checksum": checksum},
-                generator_type=SG.PARAMETER_VARIANT_GENERATOR,
-                generator_version=SG.PARAMETER_VARIANT_VERSION,
                 asof="2026-10-05",
                 entry_spec=_parent_rule() if entry is None else entry,
                 universe_spec={"scope_kind": "a_share_all"},
@@ -231,8 +250,6 @@ class CandidateIdentityTests(_LedgerFixture):
                 SC.build_strategy_candidate(
                     parent_identity={"strategy_id": PARENT, "strategy_version": 1,
                                      "strategy_checksum": CHECKSUM_A},
-                    generator_type=SG.PARAMETER_VARIANT_GENERATOR,
-                    generator_version=SG.PARAMETER_VARIANT_VERSION,
                     asof="2026-10-05",
                     entry_spec=_parent_rule(),
                     universe_spec={"scope_kind": "a_share_all"},
@@ -247,8 +264,11 @@ class CandidateIdentityTests(_LedgerFixture):
         self.assertEqual(DSL.DSL_SCHEMA_VERSION, candidate.strategy_schema_version)
         material = candidate.fingerprint_material()
         self.assertIn("strategy_schema_version", material)
-        self.assertIn("generator_version", material)
-        self.assertIn("generator_contract_version", material)
+        # R35-B：generator 能力身份**不是**候选内容的一部分（它是 proposal 事件 /
+        # batch 的 provenance）。同一份 specification 由不同能力提出必须是同一个
+        # candidate_id，因此材料里不允许出现这三件套。
+        for key in SC.LEGACY_GENERATOR_IDENTITY_KEYS:
+            self.assertNotIn(key, material)
 
     def test_c2e_declared_parameter_contract_is_part_of_the_fingerprint(self):
         """``volume_multiplier`` 只声明在 ``parameters`` 列表里（不在 rule 内联）。
@@ -278,7 +298,7 @@ class ParentPinningTests(_LedgerFixture):
         pin_v1 = SCV.pin_parent_strategy(
             self.conn, strategy_id=PARENT, strategy_version=1,
             strategy_checksum=created.current_checksum, asof="2026-10-05")
-        candidates = SG.generate_parameter_variants(_generator_input(pin=pin_v1))
+        candidates = SG.generate_candidates(_search_space(pin=pin_v1))
         stored = SCRepo.append_candidate(self.conn, candidates[0])
 
         # 父策略后来升级到 v2（不可变新版本）。
@@ -300,8 +320,7 @@ class ParentPinningTests(_LedgerFixture):
             strategy_checksum=created.current_checksum, asof="2026-10-05")
         candidate = SC.build_strategy_candidate(
             parent_identity=pin.identity,
-            generator_type=SG.PARAMETER_VARIANT_GENERATOR,
-            generator_version=SG.PARAMETER_VARIANT_VERSION, asof="2026-10-05",
+            asof="2026-10-05",
             entry_spec=_thaw(pin.dsl_ast),
             universe_spec={"scope_kind": "a_share_all"},
             intended_market_regime="momentum",
@@ -320,7 +339,11 @@ class ParentPinningTests(_LedgerFixture):
         """父策略那一版声明的 constraints 必须被候选继承，而不是变成空集。
 
         空集不是"无约束"：它会让下游实验读到一份并非父策略语义的候选（仓位 /
-        敞口 / 权重上限被悄悄丢掉）。只有调用方**显式**给出 override 时才替换。
+        敞口 / 权重上限被悄悄丢掉）。
+
+        R35-B 收紧为 "inherit, or only tighten"：显式 override 既不能丢掉父策略
+        已有的边界（丢掉 = 放宽），也不能把任何边界放宽。放宽仓位 / 敞口 / 权重上限
+        是风险放大动作，必须走正式 risk evidence gate，不属于 candidate generator。
         """
         inherited = {"max_positions": 5, "max_exposure_pct": 0.6}
         created = SR.create_user_definition(
@@ -335,15 +358,30 @@ class ParentPinningTests(_LedgerFixture):
         read = SCV.get_candidate(self.conn, result["candidate_ids"][0])
         self.assertEqual(inherited, read["candidate"]["constraints"])
 
+        # 收紧是允许的（两个边界都给，且都不放宽）。
+        tightened = {"max_positions": 2, "max_exposure_pct": 0.4}
         overridden = SCV.generate_and_record_candidates(
             self.conn, strategy_id=PARENT, strategy_version=1,
             strategy_checksum=created.current_checksum, asof="2026-10-05",
             parameter_adjustments={"ma_period": [19]},
             universe_spec={"scope_kind": "a_share_all"},
             intended_market_regime="momentum", evidence_count=10,
-            constraints={"max_positions": 2})
+            constraints=tightened)
         read_override = SCV.get_candidate(self.conn, overridden["candidate_ids"][0])
-        self.assertEqual({"max_positions": 2}, read_override["candidate"]["constraints"])
+        self.assertEqual(tightened, read_override["candidate"]["constraints"])
+
+        # 丢掉父策略的边界（= 放宽）与放宽任一上限都必须 fail closed。
+        for expanding in ({"max_positions": 2},
+                          {"max_positions": 9, "max_exposure_pct": 0.6},
+                          {"max_positions": 5, "max_exposure_pct": 0.9}):
+            with self.assertRaises(SS.SearchSpaceError):
+                SCV.generate_and_record_candidates(
+                    self.conn, strategy_id=PARENT, strategy_version=1,
+                    strategy_checksum=created.current_checksum, asof="2026-10-05",
+                    parameter_adjustments={"ma_period": [19]},
+                    universe_spec={"scope_kind": "a_share_all"},
+                    intended_market_regime="momentum", evidence_count=10,
+                    constraints=expanding)
 
     def test_c3d_pinning_never_falls_back_to_the_registry_head(self):
         """只给 strategy_id 时**必须**拒绝，绝不用 current head 补齐身份。
@@ -407,8 +445,7 @@ class ExecutablePayloadTests(_LedgerFixture):
             SC.build_strategy_candidate(
                 parent_identity={"strategy_id": PARENT, "strategy_version": 1,
                                  "strategy_checksum": CHECKSUM_A},
-                generator_type=SG.PARAMETER_VARIANT_GENERATOR,
-                generator_version=SG.PARAMETER_VARIANT_VERSION, asof="2026-10-05",
+                asof="2026-10-05",
                 entry_spec=spec, universe_spec={"scope_kind": "a_share_all"},
                 intended_market_regime="momentum",
                 research_provenance={"source_kind": "human"})
@@ -437,8 +474,7 @@ class ExecutablePayloadTests(_LedgerFixture):
             SC.build_strategy_candidate(
                 parent_identity={"strategy_id": PARENT, "strategy_version": 1,
                                  "strategy_checksum": CHECKSUM_A},
-                generator_type=SG.PARAMETER_VARIANT_GENERATOR,
-                generator_version=SG.PARAMETER_VARIANT_VERSION, asof="2026-10-05",
+                asof="2026-10-05",
                 entry_spec=_parent_rule(),
                 exit_spec=_parent_rule(),  # 第二个 parameter authority
                 universe_spec={"scope_kind": "a_share_all"},
@@ -461,8 +497,6 @@ class MissingProvenanceTests(_LedgerFixture):
         values = {
             "parent_identity": {"strategy_id": PARENT, "strategy_version": 1,
                                 "strategy_checksum": CHECKSUM_A},
-            "generator_type": SG.PARAMETER_VARIANT_GENERATOR,
-            "generator_version": SG.PARAMETER_VARIANT_VERSION,
             "asof": "2026-10-05",
             "entry_spec": _parent_rule(),
             "universe_spec": {"scope_kind": "a_share_all"},
@@ -484,9 +518,7 @@ class MissingProvenanceTests(_LedgerFixture):
             self._build(parent_identity={"strategy_id": PARENT, "strategy_version": 1,
                                          "strategy_checksum": "abc"})
 
-    def test_c5b_missing_generator_version_asof_and_entry_are_rejected(self):
-        with self.assertRaises(SC.CandidateValidationError):
-            self._build(generator_version="")
+    def test_c5b_missing_asof_and_entry_are_rejected(self):
         with self.assertRaises(SC.CandidateValidationError):
             self._build(asof=None)
         with self.assertRaises(SC.CandidateValidationError):
@@ -494,19 +526,24 @@ class MissingProvenanceTests(_LedgerFixture):
         with self.assertRaises(SC.CandidateValidationError):
             self._build(entry_spec=None)
 
-    def test_c5c_generator_input_requires_explicit_asof_universe_and_regime(self):
+    def test_c5c_search_space_requires_explicit_asof_universe_and_regime(self):
         with self.assertRaises(SC.CandidateValidationError):
-            _generator_input(asof=None)
-        with self.assertRaises(SG.StrategyGeneratorError):
-            SG.GeneratorInput(parent_pin=_pin(), parameter_adjustments={"ma_period": [19]},
-                              universe_spec={"scope_kind": "a_share_all"},
-                              intended_market_regime="", asof="2026-10-05",
-                              evidence_count=10)
-        with self.assertRaises(SG.StrategyGeneratorError):
+            _search_space(asof=None)
+        with self.assertRaises(SS.SearchSpaceError):
+            _search_space(intended_market_regime="")
+        with self.assertRaises(SS.SearchSpaceError):
+            _search_space(universe_spec=None)
+        with self.assertRaises(SS.SearchSpaceError):
             # 没有显式 pin 就没有生成基础。
-            SG.GeneratorInput(parent_pin=None, parameter_adjustments={"ma_period": [19]},
-                              universe_spec={"scope_kind": "a_share_all"},
-                              intended_market_regime="momentum", asof="2026-10-05")
+            _search_space(parent_pin=None)
+        with self.assertRaises(SS.SearchSpaceError):
+            # 能力身份必须显式给出（空值不是"用默认"）。
+            _search_space(generator_type="")
+        # 能力必须在**已注册**的封闭词汇里：registry 的 authority 在生成域。
+        with self.assertRaises(SG.StrategyGeneratorError):
+            self._candidates(generator_type="generic")
+        with self.assertRaises(SG.StrategyGeneratorError):
+            self._candidates(generator_version="v9")
 
     def test_c5d_service_requires_explicit_universe_and_regime(self):
         created = _seed_registry(self.conn)
@@ -569,12 +606,10 @@ class LedgerTests(_LedgerFixture):
     def test_c6b_dedup_keeps_the_proposal_source_evidence(self):
         candidate = self._candidates()[0]
         SCRepo.append_candidate(self.conn, candidate)
-        first = SCRepo.record_proposal(self.conn, candidate,
-                                       input_fingerprint="1" * 64,
-                                       created_at="2026-10-05T01:00:00+00:00")
-        second = SCRepo.record_proposal(self.conn, candidate,
-                                        input_fingerprint="2" * 64,
-                                        created_at="2026-10-06T01:00:00+00:00")
+        first = _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                         created_at="2026-10-05T01:00:00+00:00")
+        second = _propose(self.conn, candidate, input_fingerprint="2" * 64,
+                          created_at="2026-10-06T01:00:00+00:00")
         self.assertNotEqual(first, second)
         history = SCRepo.list_proposals(self.conn, candidate.candidate_id)
         self.assertEqual(2, len(history))
@@ -592,10 +627,10 @@ class LedgerTests(_LedgerFixture):
         """
         candidate = self._candidates()[0]
         SCRepo.append_candidate(self.conn, candidate)
-        first = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
-                                       created_at="2026-10-05T01:00:00+00:00")
-        second = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
-                                        created_at="2026-10-05T01:00:00+00:00")
+        first = _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                         created_at="2026-10-05T01:00:00+00:00")
+        second = _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                          created_at="2026-10-05T01:00:00+00:00")
         self.assertNotEqual(first, second)
         self.assertEqual(2, len(SCRepo.list_proposals(self.conn, candidate.candidate_id)))
 
@@ -613,13 +648,13 @@ class LedgerTests(_LedgerFixture):
         candidate = self._candidates()[0]
         SCRepo.append_candidate(self.conn, candidate)
         created_at = "2026-10-05T01:00:00+00:00"
-        first = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
-                                       created_at=created_at)
+        first = _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                         created_at=created_at)
         # 进程级状态复位：任何 process-local 计数器 / 缓存都从头开始。
         importlib.reload(SCRepo)
         self.assertIs(SCRepo, sys.modules["strategy_candidate_repository"])
-        second = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
-                                        created_at=created_at)
+        second = _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                          created_at=created_at)
         self.assertNotEqual(first, second)
         self.assertEqual(64, len(first))
         self.assertEqual(64, len(second))
@@ -645,11 +680,11 @@ class LedgerTests(_LedgerFixture):
         created_at = "2026-10-05T01:00:00+00:00"
         with mock.patch.object(SCRepo, "_proposal_event_identity",
                                return_value=(created_at, "e" * 64)):
-            SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
-                                   created_at=created_at)
+            _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                     created_at=created_at)
             with self.assertRaises(sqlite3.IntegrityError):
-                SCRepo.record_proposal(self.conn, candidate, input_fingerprint="2" * 64,
-                                       created_at=created_at)
+                _propose(self.conn, candidate, input_fingerprint="2" * 64,
+                         created_at=created_at)
         self.assertEqual(1, self.conn.execute(
             "SELECT COUNT(*) FROM strategy_candidate_proposals").fetchone()[0])
         history = SCRepo.list_proposals(self.conn, candidate.candidate_id)
@@ -665,8 +700,8 @@ class LedgerTests(_LedgerFixture):
         candidate = self._candidates()[0]
         SCRepo.append_candidate(self.conn, candidate)
         created_at = "2026-10-05T01:00:00+00:00"
-        proposal_id = SCRepo.record_proposal(self.conn, candidate, input_fingerprint="1" * 64,
-                                             created_at=created_at)
+        proposal_id = _propose(self.conn, candidate, input_fingerprint="1" * 64,
+                               created_at=created_at)
         row = self.conn.execute(
             "SELECT proposal_json,created_at FROM strategy_candidate_proposals"
             " WHERE proposal_id=?", (proposal_id,)).fetchone()
@@ -899,11 +934,12 @@ class DeterminismTests(_LedgerFixture):
         self.assertEqual(2, len({item.candidate_id for item in candidates}))
 
     def test_input_fingerprint_is_stable_and_content_bound(self):
-        first = _generator_input()
-        second = _generator_input()
-        self.assertEqual(first.input_fingerprint, second.input_fingerprint)
-        moved = _generator_input(asof="2026-10-06")
-        self.assertNotEqual(first.input_fingerprint, moved.input_fingerprint)
+        """search-space fingerprint 是 canonical 的：同一空间 → 同一指纹。"""
+        first = _search_space()
+        second = _search_space()
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        moved = _search_space(asof="2026-10-06")
+        self.assertNotEqual(first.fingerprint, moved.fingerprint)
 
     def test_ledger_metadata_never_enters_the_fingerprint(self):
         candidate = self._candidates()[0]

@@ -1,341 +1,218 @@
 # -*- coding: utf-8 -*-
-"""Constrained strategy generator boundary（R35-A）.
+"""Deterministic candidate expansion over an explicit bounded search space（R35-A/B）.
 
-本模块拥有**唯一**的生成权限：``GeneratorInput → StrategyCandidate``。
+一句话 authority：本模块拥有**确定性候选展开** —— 把一份已冻结的
+:class:`~strategy_candidate_search_space.CandidateSearchSpace` 展开成
+``StrategyCandidate`` 元组。
 
 它明确**不拥有**：
 
-* promotion / lifecycle 权限 —— 不 import ``strategy_lifecycle`` / ``strategy_promotion``，
-  不写任何 lifecycle 状态；
-* execution 权限 —— 不 import ``paper_trading`` / ``execution_*`` / ``order_intent``，
-  不下单、不成交、不碰正式账本；
-* "当前状态"读取权 —— 没有 DB 连接、没有 registry、没有 ``datetime.now()`` 业务
-  as-of、没有 latest/current 查询。凡是要参与生成的事实，都必须由上层在
-  :class:`GeneratorInput` 里**显式传入**（explicit facts in, candidate out）。
+* promotion / lifecycle 权限 —— 不 import ``strategy_lifecycle`` /
+  ``strategy_promotion``，不写任何 lifecycle 状态；
+* execution 权限 —— 不 import ``paper_trading`` / ``execution_*`` /
+  ``order_intent``，不下单、不成交、不碰正式账本；
+* evaluation 权限 —— 不 import backtest / PIT / robustness / 评估 owner，
+  没有 score、没有 ranking、没有 winner selection。R35-B 只回答"能生成哪些受约束
+  候选"，不回答"哪个候选更好"；
+* "当前状态"读取权 —— 没有 DB 连接、没有 registry、没有 ``datetime.now()``
+  业务 as-of、没有 latest/current 查询。凡是要参与生成的事实，都必须由上层在
+  search space 里**显式传入**（explicit facts in, candidate out）。
 
-R35-A 只实现一个**确定性**的 parameter variant generator，用来证明整条链路可工作::
+R35-B 的展开能力是一个**显式 registry**，不是不断增长的 ``if/elif`` 链：每个能力
+只声明"它展开哪些维度"，展开本身是同一个确定性笛卡尔展开。因此新增能力不需要碰
+展开逻辑，也不可能出现"某个能力偷偷多展开一个维度"。
 
-    generator → candidate → fingerprint → persistence → reload
-
-它不追求"找到赚钱策略"：本阶段的目标是可信的生成基础设施，不是策略研究结论。
+组合顺序不决定业务结果：``candidate_id`` 是 canonical fingerprint，输出按
+``candidate_id`` 排序，声明顺序（JSON key 顺序 / 参数声明顺序 / alternative 顺序）
+不改变候选集合。超过声明上限**一律拒绝**，绝不静默截断。
 """
 from __future__ import annotations
 
-import hashlib
-import json
-from collections.abc import Mapping, Sequence
+import itertools
 from dataclasses import dataclass
-from types import MappingProxyType
 
 import strategy_candidate as SC
-import strategy_dsl_schema as DSL
+import strategy_candidate_search_space as SS
 import strategy_parameter_schema as SPS
 
-#: generator 契约版本：``GeneratorInput`` 的形状变化必须递增。
-GENERATOR_CONTRACT_VERSION = "strategy-generator-contract-v1"
+#: generator 契约版本：search space / 展开语义变化必须递增。
+#: 它记在 **proposal 事件**与 **generation batch** 上，不参与 candidate fingerprint
+#: （候选是内容身份，同一份 specification 由不同能力提出仍是同一个 candidate）。
+GENERATOR_CONTRACT_VERSION = "strategy-generator-contract-v2"
 
-#: R35-A 唯一的 generator 类型与语义版本。
-PARAMETER_VARIANT_GENERATOR = "parameter_variant"
+#: R35-A 的旧契约版本，仅用于让历史 proposal / batch 行可读。
+GENERATOR_CONTRACT_VERSION_V1 = "strategy-generator-contract-v1"
+
+#: 各能力的语义版本。展开语义变化时必须递增（能力身份在 proposal / batch 上）。
 PARAMETER_VARIANT_VERSION = "v1"
+FACTOR_VARIANT_VERSION = "v1"
+ENTRY_VARIANT_VERSION = "v1"
+EXIT_VARIANT_VERSION = "v1"
+BOUNDED_COMBINATION_VERSION = "v1"
 
-#: 一次生成请求最多产出多少候选。搜索空间上限是**输入契约**的一部分，
-#: 不是"运行时随手截断"：超限一律拒绝，绝不静默丢弃候选。
-MAX_VARIANTS_PER_INPUT = 64
-
-
-class StrategyGeneratorError(ValueError):
-    """Stable rejection from the generator boundary (always fail closed)."""
-
-
-def _canonical(value) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, allow_nan=False)
+#: generator 类型词汇（§16：不允许一个含糊的 ``generic`` 靠自由文本解释）。
+PARAMETER_VARIANT_GENERATOR = "parameter_variant"
+FACTOR_VARIANT_GENERATOR = "factor_variant"
+ENTRY_VARIANT_GENERATOR = "entry_variant"
+EXIT_VARIANT_GENERATOR = "exit_variant"
+BOUNDED_COMBINATION_GENERATOR = "bounded_combination"
 
 
-def _freeze(value):
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    raise StrategyGeneratorError("generator_fact_not_serializable")
+#: 生成边界的拒绝类型。**别名**，不是新类：``SearchSpaceError`` 继承自它，因此
+#: 捕获 ``StrategyGeneratorError`` 一定能覆盖"空间声明非法"与"展开被拒"两种情况。
+#: 若另立一个互不相干的类，空间拒绝会漏过 ``except StrategyGeneratorError``，
+#: 把契约拒绝变成 5xx。
+StrategyGeneratorError = SS.StrategyGeneratorError
 
-
-def _thaw(value):
-    if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_thaw(item) for item in value]
-    return value
-
-
-def _text(value, label: str, *, required: bool = True) -> str | None:
-    if value is None:
-        if required:
-            raise StrategyGeneratorError(f"{label}_is_required")
-        return None
-    text = str(value).strip()
-    if not text:
-        if required:
-            raise StrategyGeneratorError(f"{label}_is_required")
-        return None
-    return text
+#: search space 的拒绝也属于生成边界的拒绝，调用方只需捕获一个类型。
+SearchSpaceError = SS.SearchSpaceError
 
 
 @dataclass(frozen=True, slots=True)
-class ParentStrategyPin:
-    """A parent strategy pinned to an **immutable** exact version.
+class GeneratorCapability:
+    """One registered expansion capability.
 
-    只记 ``strategy_id`` 是不够的：那样未来会从 current registry 重新解释"当时
-    用的是哪一版"。``strategy_version`` + ``strategy_checksum`` 让"哪一版、什么
-    内容"同时被钉住，``dsl_ast`` 则是**那一版**读出来的定义。
-
-    Authority 分工：本类只**记录** pin，不验证它。checksum 的权威在
-    ``strategy_registry``（它自己会对 exact version + checksum 不符直接报错），
-    验证发生在 application service（``strategy_candidate_service``）——它按显式
-    version + checksum 读 registry，再把读到的定义冻结成 pin。纯生成域因此既不
-    依赖 registry，也不可能"顺手去查一下 current"。
+    ``dimensions`` 是**唯一**的能力语义声明：这个能力展开搜索空间的哪几个维度，
+    其余维度各自继承（基数 1）。因此"能力"不是一段会膨胀的分支代码，而是一条
+    可审计的数据。
     """
 
-    strategy_id: str
-    strategy_version: int
-    strategy_checksum: str
-    dsl_ast: Mapping
-    asof: str
-    research_provenance: Mapping | None = None
-    universe_spec: Mapping | None = None
-    intended_market_regime: str | None = None
-    constraints: Mapping | None = None
-    exit_spec: Mapping | None = None
-    factor_spec: Mapping | None = None
-
-    def __post_init__(self):
-        strategy_id = _text(self.strategy_id, "parent_strategy_id")
-        if not SC._IDENT.fullmatch(strategy_id):
-            raise StrategyGeneratorError("parent_strategy_id_is_not_a_canonical_identifier")
-        if isinstance(self.strategy_version, bool) or not isinstance(self.strategy_version, int) \
-                or self.strategy_version < 1:
-            raise StrategyGeneratorError("parent_strategy_version_must_be_a_positive_integer")
-        checksum = _text(self.strategy_checksum, "parent_strategy_checksum")
-        if not SC._SHA256.fullmatch(checksum):
-            raise StrategyGeneratorError("parent_strategy_checksum_must_be_a_sha256_hex_digest")
-        if not isinstance(self.dsl_ast, Mapping):
-            raise StrategyGeneratorError("parent_dsl_ast_must_be_an_object")
-        try:
-            DSL.normalize(self.dsl_ast)
-        except DSL.StrategyDslValidationError as exc:
-            raise StrategyGeneratorError(f"parent_dsl_ast_rejected:{exc}") from exc
-        object.__setattr__(self, "strategy_id", strategy_id)
-        object.__setattr__(self, "strategy_checksum", checksum)
-        object.__setattr__(self, "asof", SC._asof_day(self.asof))
-        object.__setattr__(self, "dsl_ast", _freeze(DSL.normalize(self.dsl_ast)))
-        object.__setattr__(self, "research_provenance",
-                           None if self.research_provenance is None
-                           else _freeze(dict(self.research_provenance)))
-        object.__setattr__(self, "universe_spec",
-                           None if self.universe_spec is None
-                           else _freeze(dict(self.universe_spec)))
-        object.__setattr__(self, "constraints",
-                           None if self.constraints is None
-                           else _freeze(dict(self.constraints)))
-        object.__setattr__(self, "exit_spec",
-                           None if self.exit_spec is None else _freeze(dict(self.exit_spec)))
-        object.__setattr__(self, "factor_spec",
-                           None if self.factor_spec is None else _freeze(dict(self.factor_spec)))
-        object.__setattr__(self, "intended_market_regime",
-                           _text(self.intended_market_regime, "intended_market_regime",
-                                 required=False))
+    generator_type: str
+    generator_version: str
+    dimensions: tuple[str, ...]
 
     @property
-    def identity(self) -> dict:
-        return {"strategy_id": self.strategy_id,
-                "strategy_version": self.strategy_version,
-                "strategy_checksum": self.strategy_checksum}
-
-    def projection(self) -> dict:
-        return {"strategy_id": self.strategy_id,
-                "strategy_version": self.strategy_version,
-                "strategy_checksum": self.strategy_checksum,
-                "asof": self.asof,
-                "dsl_ast": _thaw(self.dsl_ast)}
+    def expands_parameters(self) -> bool:
+        return SS.PARAMETER_DIMENSION in self.dimensions
 
 
-@dataclass(frozen=True, slots=True)
-class GeneratorInput:
-    """The complete, frozen set of facts a generator is allowed to consume.
+#: 唯一的生成能力 registry。key 是 ``generator_type``。
+GENERATOR_CAPABILITIES: dict[str, GeneratorCapability] = {
+    PARAMETER_VARIANT_GENERATOR: GeneratorCapability(
+        PARAMETER_VARIANT_GENERATOR, PARAMETER_VARIANT_VERSION,
+        (SS.PARAMETER_DIMENSION,)),
+    FACTOR_VARIANT_GENERATOR: GeneratorCapability(
+        FACTOR_VARIANT_GENERATOR, FACTOR_VARIANT_VERSION, ("factor",)),
+    ENTRY_VARIANT_GENERATOR: GeneratorCapability(
+        ENTRY_VARIANT_GENERATOR, ENTRY_VARIANT_VERSION, ("entry",)),
+    EXIT_VARIANT_GENERATOR: GeneratorCapability(
+        EXIT_VARIANT_GENERATOR, EXIT_VARIANT_VERSION, ("exit",)),
+    # §17：bounded_combination 只做"显式有限备选集的笛卡尔积"。
+    BOUNDED_COMBINATION_GENERATOR: GeneratorCapability(
+        BOUNDED_COMBINATION_GENERATOR, BOUNDED_COMBINATION_VERSION, SS.DIMENSIONS),
+}
 
-    There is deliberately no DB handle, no registry, no clock and no "current"
-    selector on this object: anything not passed in here simply does not exist
-    for the generator.
+#: R35-A 的别名：parameter variant generator 的名字没变。
+ParentStrategyPin = SS.ParentStrategyPin
+
+
+def resolve_capability(generator_type, generator_version) -> GeneratorCapability:
+    """Resolve one capability by exact type + version, or fail closed."""
+    name = str(generator_type or "").strip()
+    capability = GENERATOR_CAPABILITIES.get(name)
+    if capability is None:
+        raise StrategyGeneratorError("generator_type_is_not_implemented")
+    version = str(generator_version or "").strip()
+    if version != capability.generator_version:
+        raise StrategyGeneratorError("generator_version_is_not_implemented")
+    return capability
+
+
+def _apply_parameters(entry_ast, combination, evidence_count, label: str):
+    """Apply declared parameter values to one entry AST, or fail closed.
+
+    The parameter contract is compiled by the existing owner
+    (``strategy_parameter_schema``): R35-B 不复制第二套参数规则，因此 allowlist /
+    bounds / ``max_step`` / locked / ``min_evidence`` 的裁决点只有一个。
     """
-
-    parent_pin: ParentStrategyPin
-    parameter_adjustments: Mapping
-    universe_spec: Mapping
-    intended_market_regime: str
-    asof: str
-    generator_type: str = PARAMETER_VARIANT_GENERATOR
-    generator_version: str = PARAMETER_VARIANT_VERSION
-    evidence_count: int | None = None
-    hypothesis_id: str | None = None
-    research_provenance: Mapping | None = None
-    random_seed: int | None = None
-    model_identity: Mapping | None = None
-    constraints: Mapping | None = None
-
-    def __post_init__(self):
-        if not isinstance(self.parent_pin, ParentStrategyPin):
-            raise StrategyGeneratorError("explicit_pinned_parent_strategy_is_required")
-        if not isinstance(self.parameter_adjustments, Mapping) or not self.parameter_adjustments:
-            raise StrategyGeneratorError("parameter_adjustments_are_required")
-        adjustments = {}
-        for parameter_id, values in self.parameter_adjustments.items():
-            name = str(parameter_id)
-            if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-                raise StrategyGeneratorError(
-                    f"parameter_variant_values_must_be_a_list:{name}")
-            collected = []
-            for value in values:
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    raise StrategyGeneratorError(
-                        f"parameter_variant_value_must_be_numeric:{name}")
-                if float(value) != float(value) or float(value) in (
-                        float("inf"), float("-inf")):
-                    raise StrategyGeneratorError(
-                        f"parameter_variant_value_must_be_finite:{name}")
-                collected.append(value)
-            if not collected:
-                raise StrategyGeneratorError(f"parameter_variant_values_are_empty:{name}")
-            adjustments[name] = tuple(collected)
-        total = 1
-        for values in adjustments.values():
-            total *= len(values)
-        if total > MAX_VARIANTS_PER_INPUT:
-            raise StrategyGeneratorError("parameter_variant_space_exceeds_the_declared_maximum")
-        seed = self.random_seed
-        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-            raise StrategyGeneratorError("random_seed_must_be_an_integer_or_null")
-        generator_type = _text(self.generator_type, "generator_type")
-        if generator_type != PARAMETER_VARIANT_GENERATOR:
-            raise StrategyGeneratorError("generator_type_is_not_implemented_in_r35a")
-        generator_version = _text(self.generator_version, "generator_version")
-        if generator_version != PARAMETER_VARIANT_VERSION:
-            raise StrategyGeneratorError("generator_version_is_not_implemented_in_r35a")
-        object.__setattr__(self, "generator_type", generator_type)
-        object.__setattr__(self, "generator_version", generator_version)
-        evidence = self.evidence_count
-        if evidence is not None and (isinstance(evidence, bool) or not isinstance(evidence, int)
-                                     or evidence < 0):
-            raise StrategyGeneratorError("evidence_count_must_be_a_non_negative_integer")
-        object.__setattr__(self, "parameter_adjustments", _freeze(adjustments))
-        object.__setattr__(self, "universe_spec", _freeze(dict(self.universe_spec or {})))
-        object.__setattr__(self, "intended_market_regime",
-                           _text(self.intended_market_regime, "intended_market_regime"))
-        object.__setattr__(self, "asof", SC._asof_day(self.asof))
-        object.__setattr__(self, "hypothesis_id",
-                           _text(self.hypothesis_id, "hypothesis_id", required=False))
-        object.__setattr__(self, "research_provenance",
-                           None if self.research_provenance is None
-                           else _freeze(dict(self.research_provenance)))
-        object.__setattr__(self, "model_identity",
-                           None if self.model_identity is None
-                           else _freeze(dict(self.model_identity)))
-        object.__setattr__(self, "constraints",
-                           None if self.constraints is None
-                           else _freeze(dict(self.constraints)))
-
-    def projection(self) -> dict:
-        return {
-            "generator_contract_version": GENERATOR_CONTRACT_VERSION,
-            "generator_type": self.generator_type,
-            "generator_version": self.generator_version,
-            "parent_pin": dict(self.parent_pin.identity),
-            "parent_asof": self.parent_pin.asof,
-            "asof": self.asof,
-            "parameter_adjustments": _thaw(self.parameter_adjustments),
-            "evidence_count": self.evidence_count,
-            "universe_spec": _thaw(self.universe_spec),
-            "intended_market_regime": self.intended_market_regime,
-            "hypothesis_id": self.hypothesis_id,
-            "research_provenance": _thaw(self.research_provenance or {}),
-            "random_seed": self.random_seed,
-            "model_identity": _thaw(self.model_identity or {}),
-            "constraints": _thaw(self.constraints or {}),
-        }
-
-    @property
-    def input_fingerprint(self) -> str:
-        """生成输入的 canonical 身份（同一输入 → 同一组候选）。"""
-        return hashlib.sha256(_canonical(self.projection()).encode("utf-8")).hexdigest()
+    if not combination:
+        return entry_ast
+    schema = SPS.StrategyParameterSchema.from_dsl(entry_ast)
+    try:
+        return schema.apply(entry_ast, combination, evidence_count=evidence_count).dsl_ast
+    except SPS.StrategyParameterAdjustmentError as exc:
+        raise StrategyGeneratorError(f"{label}:{exc}") from exc
 
 
-def _variant_combinations(adjustments: Mapping) -> list[dict]:
-    """确定性展开参数网格：键排序 + 值保持调用方顺序（顺序是输入的一部分）。"""
-    names = sorted(adjustments)
-    combinations: list[dict] = [{}]
-    for name in names:
-        expanded = []
-        for base in combinations:
-            for value in adjustments[name]:
-                candidate = dict(base)
-                candidate[name] = value
-                expanded.append(candidate)
-        combinations = expanded
-    return combinations
-
-
-def generate_parameter_variants(
-    generator_input: GeneratorInput,
+def generate_candidates(
+    search_space: SS.CandidateSearchSpace,
 ) -> tuple[SC.StrategyCandidate, ...]:
-    """Produce deterministic constrained parameter variants of one pinned parent.
+    """Expand one explicit bounded search space into deterministic candidates.
 
-    Deterministic: the same :class:`GeneratorInput` always yields the same
-    candidates in the same order, with the same fingerprints. The parent's DSL
-    **structure** can never change here — only values of parameters that the
-    parent's own parameter contract already declares as editable, in-bounds and
-    within ``max_step``; the existing ``strategy_parameter_schema`` owner
-    enforces every one of those rules.
+    Deterministic: the same search space always yields the same candidates in the
+    same order, with the same fingerprints. The parent's DSL **structure** can never
+    change here except through a slot the caller declared explicitly; parameter
+    values still have to pass the parent's own parameter contract.
 
-    Returns candidates in a stable order and never mutates the input. Duplicate
-    specifications collapse to one candidate (identity, not ordering, is the
-    dedup authority).
+    Returns candidates in a canonical (``candidate_id``) order and never mutates the
+    input. Duplicate specifications collapse to one candidate — identity, not
+    ordering, is the dedup authority.
     """
-    if not isinstance(generator_input, GeneratorInput):
-        raise StrategyGeneratorError("canonical_generator_input_is_required")
-    pin = generator_input.parent_pin
-    schema = SPS.StrategyParameterSchema.from_dsl(pin.dsl_ast)
-    declared = {item.parameter_id for item in schema.parameters}
-    undeclared = sorted(set(generator_input.parameter_adjustments) - declared)
-    if undeclared:
-        raise StrategyGeneratorError(
-            f"parameter_is_not_declared_by_the_pinned_parent:{undeclared[0]}")
+    if not isinstance(search_space, SS.CandidateSearchSpace):
+        raise StrategyGeneratorError("canonical_candidate_search_space_is_required")
+    capability = resolve_capability(search_space.generator_type,
+                                   search_space.generator_version)
+    pin = search_space.parent_pin
+
+    # §8：基数必须在生成**之前**算出来；超限显式拒绝，绝不生成前 N 个再截断
+    # （截断会让 candidate universe 依赖遍历顺序）。
+    cardinality = search_space.cardinality_for(capability.dimensions)
+    if cardinality > search_space.max_candidates:
+        raise StrategyGeneratorError("candidate_space_exceeds_the_declared_maximum")
+
+    values = {dimension: search_space.dimension_values(dimension)
+              for dimension in SS.DIMENSIONS}
+
+    # 参数只允许落在**实际会被使用的** entry 上；未声明的参数在这里就拒绝，
+    # 而不是等到某个组合偶然失败。
+    if search_space.parameter_variants:
+        declared: set[str] = set()
+        for entry_ast in values["entry"]:
+            declared |= {item.parameter_id for item in
+                         SPS.StrategyParameterSchema.from_dsl(entry_ast).parameters}
+        undeclared = sorted(set(search_space.parameter_variants) - declared)
+        if undeclared:
+            raise StrategyGeneratorError(
+                f"parameter_is_not_declared_by_the_pinned_parent:{undeclared[0]}")
+
+    # 能力**不展开**的维度必须只有一个取值：否则就是"声明了 3 个 entry 备选、
+    # 却只用了第 1 个"的静默截断，会让 candidate universe 依赖遍历顺序 ——
+    # 与超限截断是同一类错误，因此同样 fail closed，而不是悄悄取第一个。
+    for dimension in SS.DIMENSIONS:
+        if dimension in capability.dimensions:
+            continue
+        declared_arity = len(values[dimension])
+        if declared_arity != 1:
+            raise StrategyGeneratorError(
+                f"dimension_is_not_expanded_by_this_generator:{dimension}")
+
+    expanded_axes = [values[dimension] for dimension in capability.dimensions]
+    fixed = {dimension: values[dimension][0]
+             for dimension in SS.DIMENSIONS if dimension not in capability.dimensions}
 
     produced: dict[str, SC.StrategyCandidate] = {}
-    for combination in _variant_combinations(generator_input.parameter_adjustments):
-        try:
-            application = schema.apply(pin.dsl_ast, combination,
-                                       evidence_count=generator_input.evidence_count)
-        except SPS.StrategyParameterAdjustmentError as exc:
-            raise StrategyGeneratorError(f"parameter_variant_rejected:{exc}") from exc
+    for combination in itertools.product(*expanded_axes):
+        chosen = dict(fixed)
+        chosen.update(dict(zip(capability.dimensions, combination, strict=True)))
+        entry_ast = _apply_parameters(chosen["entry"], chosen[SS.PARAMETER_DIMENSION],
+                                      search_space.evidence_count, "parameter_variant_rejected")
         candidate = SC.build_strategy_candidate(
             parent_identity=pin.identity,
-            generator_type=generator_input.generator_type,
-            generator_version=generator_input.generator_version,
-            generator_contract_version=GENERATOR_CONTRACT_VERSION,
-            asof=generator_input.asof,
-            entry_spec=application.dsl_ast,
-            universe_spec=generator_input.universe_spec,
-            intended_market_regime=generator_input.intended_market_regime,
-            factor_spec=pin.factor_spec,
-            exit_spec=pin.exit_spec,
-            constraints=(generator_input.constraints
-                         if generator_input.constraints is not None else pin.constraints),
-            hypothesis_id=generator_input.hypothesis_id,
-            research_provenance=(generator_input.research_provenance
-                                 or pin.research_provenance),
-            random_seed=generator_input.random_seed,
-            model_identity=generator_input.model_identity,
+            asof=search_space.asof,
+            entry_spec=entry_ast,
+            universe_spec=SS._thaw(search_space.universe_spec),
+            intended_market_regime=search_space.intended_market_regime,
+            factor_spec=chosen["factor"],
+            exit_spec=chosen["exit"],
+            constraints=SS._thaw(search_space.constraints),
+            hypothesis_id=search_space.hypothesis_id,
+            research_provenance=(SS._thaw(search_space.research_provenance)
+                                 if search_space.research_provenance is not None
+                                 else (SS._thaw(pin.research_provenance)
+                                       if pin.research_provenance is not None else None)),
+            random_seed=search_space.random_seed,
+            model_identity=(SS._thaw(search_space.model_identity)
+                            if search_space.model_identity is not None else None),
         )
         # 去重的唯一权威是 canonical candidate identity；同一个候选被重复提出时
         # 只保留一个身份，绝不制造"语义相同但 ID 不同"的两个策略。
@@ -343,8 +220,18 @@ def generate_parameter_variants(
     return tuple(produced[key] for key in sorted(produced))
 
 
+#: R35-A 的入口名保留：parameter variant 生成仍然是同一个函数，只是输入换成了
+#: 统一的 search space contract。
+generate_parameter_variants = generate_candidates
+
+
 __all__ = [
-    "GENERATOR_CONTRACT_VERSION", "MAX_VARIANTS_PER_INPUT",
-    "PARAMETER_VARIANT_GENERATOR", "PARAMETER_VARIANT_VERSION", "GeneratorInput",
-    "ParentStrategyPin", "StrategyGeneratorError", "generate_parameter_variants",
+    "BOUNDED_COMBINATION_GENERATOR", "BOUNDED_COMBINATION_VERSION",
+    "ENTRY_VARIANT_GENERATOR", "ENTRY_VARIANT_VERSION", "EXIT_VARIANT_GENERATOR",
+    "EXIT_VARIANT_VERSION", "FACTOR_VARIANT_GENERATOR", "FACTOR_VARIANT_VERSION",
+    "GENERATOR_CAPABILITIES", "GENERATOR_CONTRACT_VERSION",
+    "GENERATOR_CONTRACT_VERSION_V1", "GeneratorCapability",
+    "PARAMETER_VARIANT_GENERATOR", "PARAMETER_VARIANT_VERSION",
+    "ParentStrategyPin", "SearchSpaceError", "StrategyGeneratorError",
+    "generate_candidates", "generate_parameter_variants", "resolve_capability",
 ]

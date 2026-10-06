@@ -50,8 +50,28 @@ import strategy_dsl_schema as DSL
 import strategy_parameter_schema as SPS
 
 #: candidate 契约版本。字段语义或指纹材料变化时必须递增。
-CANDIDATE_CONTRACT_VERSION = "strategy-candidate-contract-v1"
-CANDIDATE_SCHEMA_VERSION = "strategy-candidate-v1"
+CANDIDATE_CONTRACT_VERSION = "strategy-candidate-contract-v2"
+
+#: 当前 candidate schema 版本。
+#:
+#: v2（R35-B）把 **generator 能力身份**从 candidate fingerprint 里移出去。原因不是
+#: 审美：candidate 是**内容**身份，而"哪个 generator 能力提出了它"是**事件**
+#: provenance。同一份 canonical specification 由 ``factor_variant`` 与
+#: ``bounded_combination`` 分别提出时，必须得到同一个 ``candidate_id``（候选行 1 条、
+#: proposal 事件 2 条），否则去重权威就分裂成两套。generator 类型 / 语义版本 /
+#: 契约版本因此记在 **proposal 事件**与 **generation batch** 上（见
+#: ``strategy_candidate_repository`` / ``strategy_candidate_search_space``），
+#: 仍然显式、可审计、绝不是自由文本。
+CANDIDATE_SCHEMA_VERSION = "strategy-candidate-v2"
+
+#: R35-A 的历史 schema 版本。v1 行**必须继续可验证**：它们的 fingerprint 材料里
+#: 含 generator 三件套，因此材料是按 ``candidate_schema_version`` 版本化的。
+CANDIDATE_SCHEMA_VERSION_V1 = "strategy-candidate-v1"
+
+#: 只有 v1 材料才携带的键（R35-A generator 身份）。
+LEGACY_GENERATOR_IDENTITY_KEYS = (
+    "generator_type", "generator_version", "generator_contract_version",
+)
 
 #: 允许的 scope 词汇。这是**输入声明**的词汇，不是行情事实的 authority：
 #: 某只票在某个 as-of 是否真的属于某个板块，由 universe / tradability owner 判定。
@@ -319,9 +339,6 @@ class StrategyCandidate:
     parent_strategy_id: str | None
     parent_strategy_version: int | None
     parent_strategy_checksum: str | None
-    generator_type: str
-    generator_version: str
-    generator_contract_version: str
     hypothesis_id: str | None
     research_provenance: Mapping
     strategy_schema_version: str
@@ -336,6 +353,12 @@ class StrategyCandidate:
     random_seed: int | None
     model_identity: Mapping
     candidate_schema_version: str = CANDIDATE_SCHEMA_VERSION
+    #: R35-A 遗留行的 generator 三件套。v2 行上它们是 **None**：generator 能力不再
+    #: 是 candidate identity 的一部分。保留字段是为了让历史行的持久化投影仍可往返
+    #: 重建与自证，而不是给新行留后门。
+    generator_type: str | None = None
+    generator_version: str | None = None
+    generator_contract_version: str | None = None
 
     def projection(self) -> dict:
         """candidate 的完整可持久化材料（不含持久化元数据 ``created_at``）。"""
@@ -365,10 +388,17 @@ class StrategyCandidate:
         }
 
     def fingerprint_material(self) -> dict:
-        """指纹材料 = 全部语义事实，减去 identity 自身与展示/持久化材料。"""
+        """指纹材料 = 全部语义事实，减去 identity 自身与展示/持久化材料。
+
+        v2 材料**不含** generator 能力身份（那是 proposal 事件与 batch 的 provenance，
+        不是候选内容）；v1 材料按历史形状包含它，因此 R35-A 已落库的行仍然自证。
+        """
         material = self.projection()
         material.pop("candidate_id")
         material.pop("candidate_fingerprint")
+        for key in LEGACY_GENERATOR_IDENTITY_KEYS:
+            if self.candidate_schema_version != CANDIDATE_SCHEMA_VERSION_V1:
+                material.pop(key)
         return material
 
     def identity(self) -> dict:
@@ -383,9 +413,6 @@ class StrategyCandidate:
 def build_strategy_candidate(
     *,
     parent_identity: Mapping | None,
-    generator_type: str,
-    generator_version: str,
-    generator_contract_version: str = "strategy-generator-contract-v1",
     asof: str,
     entry_spec,
     universe_spec,
@@ -401,8 +428,12 @@ def build_strategy_candidate(
     """Assemble one immutable candidate from already-captured explicit facts.
 
     Pure：没有 DB、没有 registry、没有机器时钟、没有 current/latest 查询。缺任何一个
-    必需事实（parent version/checksum、generator version、asof）都在这里 fail closed，
-    绝不"偷偷读 latest 补齐"。
+    必需事实（parent version/checksum、asof）都在这里 fail closed，绝不"偷偷读
+    latest 补齐"。
+
+    R35-B 起本函数**不接受** generator 能力身份：候选是内容身份，同一份 canonical
+    specification 无论由哪个 generator 能力提出都是同一个 candidate。generator 的
+    类型 / 版本 / 契约版本属于 proposal 事件与 generation batch 的 provenance。
     """
     parent_id = parent_version = parent_checksum = None
     if parent_identity is not None:
@@ -440,11 +471,6 @@ def build_strategy_candidate(
         "parent_strategy_id": parent_id,
         "parent_strategy_version": parent_version,
         "parent_strategy_checksum": parent_checksum,
-        "generator_type": _declared_text(generator_type, "generator_type", _IDENT),
-        "generator_version": _declared_text(generator_version, "generator_version",
-                                            _VERSION_IDENT),
-        "generator_contract_version": _declared_text(
-            generator_contract_version, "generator_contract_version", _VERSION_IDENT),
         "hypothesis_id": _declared_text(hypothesis_id, "hypothesis_id", required=False),
         "research_provenance": _research_provenance(research_provenance),
         "strategy_schema_version": DSL.DSL_SCHEMA_VERSION,
@@ -465,9 +491,6 @@ def build_strategy_candidate(
         candidate_id=fingerprint, candidate_fingerprint=fingerprint,
         parent_strategy_id=parent_id, parent_strategy_version=parent_version,
         parent_strategy_checksum=parent_checksum,
-        generator_type=material["generator_type"],
-        generator_version=material["generator_version"],
-        generator_contract_version=material["generator_contract_version"],
         hypothesis_id=material["hypothesis_id"],
         research_provenance=_freeze(material["research_provenance"]),
         strategy_schema_version=material["strategy_schema_version"],
@@ -498,11 +521,23 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
     重建是**结构化**的：每个事实按存储形态读回，再由
     :func:`verify_candidate_fingerprint` 重新推导指纹。因此任何被篡改的持久化
     组件都会失败，而不是被悄悄接受成一个"新的候选"。
+
+    R35-A 的 v1 行按 v1 材料重建（含 generator 三件套），R35-B 的 v2 行按 v2 材料
+    重建。两者都必须在**自己的** schema 版本下自证，绝不把 v1 行"升级"成 v2。
     """
     if not isinstance(value, Mapping):
         raise CandidateValidationError("candidate_projection_invalid")
     try:
         parent_id = value.get("parent_strategy_id")
+        schema_version = str(
+            value.get("candidate_schema_version", CANDIDATE_SCHEMA_VERSION))
+        legacy_generator = {}
+        if schema_version == CANDIDATE_SCHEMA_VERSION_V1:
+            for key in LEGACY_GENERATOR_IDENTITY_KEYS:
+                raw = value.get(key)
+                if raw is None:
+                    raise CandidateValidationError("candidate_projection_invalid")
+                legacy_generator[key] = str(raw)
         candidate = StrategyCandidate(
             candidate_id=str(value["candidate_id"]),
             candidate_fingerprint=str(value["candidate_fingerprint"]),
@@ -511,9 +546,6 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
                                      else int(value["parent_strategy_version"])),
             parent_strategy_checksum=(None if value.get("parent_strategy_checksum") is None
                                       else str(value["parent_strategy_checksum"])),
-            generator_type=str(value["generator_type"]),
-            generator_version=str(value["generator_version"]),
-            generator_contract_version=str(value["generator_contract_version"]),
             hypothesis_id=(None if value.get("hypothesis_id") is None
                            else str(value["hypothesis_id"])),
             research_provenance=_freeze(value.get("research_provenance") or {}),
@@ -530,8 +562,10 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
             random_seed=(None if value.get("random_seed") is None
                          else int(value["random_seed"])),
             model_identity=_freeze(value.get("model_identity") or {}),
-            candidate_schema_version=str(
-                value.get("candidate_schema_version", CANDIDATE_SCHEMA_VERSION)),
+            candidate_schema_version=schema_version,
+            generator_type=legacy_generator.get("generator_type"),
+            generator_version=legacy_generator.get("generator_version"),
+            generator_contract_version=legacy_generator.get("generator_contract_version"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise CandidateValidationError("candidate_projection_invalid") from exc
@@ -552,8 +586,10 @@ def candidate_projection_keys() -> tuple[str, ...]:
 
 
 __all__ = [
-    "CANDIDATE_CONTRACT_VERSION", "CANDIDATE_SCHEMA_VERSION", "CONSTRAINT_KEYS",
-    "CandidateValidationError", "FORBIDDEN_EVALUATION_KEYS", "MODEL_IDENTITY_KEYS",
+    "CANDIDATE_CONTRACT_VERSION", "CANDIDATE_SCHEMA_VERSION",
+    "CANDIDATE_SCHEMA_VERSION_V1", "CONSTRAINT_KEYS",
+    "CandidateValidationError", "FORBIDDEN_EVALUATION_KEYS",
+    "LEGACY_GENERATOR_IDENTITY_KEYS", "MODEL_IDENTITY_KEYS",
     "RESEARCH_PROVENANCE_KEYS", "RESEARCH_SOURCE_KINDS", "RULE_ROLES",
     "StrategyCandidate", "UNIVERSE_BOARDS", "UNIVERSE_SCOPE_KINDS",
     "build_strategy_candidate", "candidate_from_projection",

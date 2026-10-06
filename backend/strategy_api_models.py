@@ -25,6 +25,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import strategy_candidate_search_space as SS
+import strategy_generator as SG
+
 
 class _Request(BaseModel):
     """所有请求模型的公共配置：忽略多余字段（见模块 docstring 约束 1）。"""
@@ -168,24 +171,56 @@ class RetirementApprovalRequest(_Request):
     reason: str = Field(default="", max_length=1000)
 
 
+class StrategyCandidateSlotModel(_Request):
+    """One role slot declaration（R35-B）.
+
+    ``kind`` 只能是 ``inherit_parent`` / ``explicit_variant`` / ``absent``：
+    字段"为空"到底表示"没有这个规则"还是"继承 parent"必须**唯一**，因此 slot 只能
+    由 ``kind`` 显式声明；``inherit_parent`` 与 ``absent`` 都不接受
+    ``alternatives``（否则同一份 JSON 会有两种读法）。
+    """
+
+    kind: Literal["inherit_parent", "explicit_variant", "absent"]
+    alternatives: list[dict[str, Any]] | None = None
+
+
 class StrategyCandidateGenerateRequest(_Request):
-    """``POST /api/strategies/{id}/candidates``（R35-A）。
+    """``POST /api/strategies/{id}/candidates``（R35-A/B）。
 
     只接受**显式**的 exact parent version/checksum 与显式 as-of：没有 head 兜底、
     没有"当前日"、没有隐式窗口。请求体里**没有**任何评估字段（Sharpe / 收益 /
     晋级结论），因为 candidate identity 不包含它们（``extra="ignore"`` 会丢弃）。
 
-    ``parameter_adjustments`` 是"每个参数要试哪些值"的**显式**声明：generator
+    ``generator_type`` / ``generator_version`` 显式选择展开能力
+    （``parameter_variant`` / ``factor_variant`` / ``entry_variant`` /
+    ``exit_variant`` / ``bounded_combination``），默认沿用 R35-A 的
+    ``parameter_variant``：能力身份是**显式事实**，绝不靠自由文本解释。
+
+    ``parameter_variants`` 是"每个参数要试哪些值"的**显式**声明：generator
     只在这些值里取值，而且每个值仍要过父策略自己的参数契约（allowlist / bounds /
-    ``max_step`` / locked），越权一律 fail closed。
+    ``max_step`` / locked），越权一律 fail closed。``parameter_adjustments`` 是
+    R35-A 的入口名，两者同时给出即拒绝（同一件事不能有两个真相来源）。
+
+    ``factor_slot`` / ``entry_slot`` / ``exit_slot`` 是**互斥**语义的显式声明：
+    ``inherit_parent`` 表示继承 exact pinned parent 那一版的最终语义（生成阶段就
+    解析成明确值，绝不留下"未来回读 registry"的悬空引用），``absent`` 表示本候选
+    明确没有这个角色。两者都不是"字段为空"。
     """
 
     strategy_version: int
     strategy_checksum: str
     asof: str
-    parameter_adjustments: dict[str, list[float]]
     universe_spec: dict[str, Any]
     intended_market_regime: str
+    generator_type: str = SG.PARAMETER_VARIANT_GENERATOR
+    generator_version: str = SG.PARAMETER_VARIANT_VERSION
+    parameter_variants: dict[str, list[float]] | None = None
+    parameter_adjustments: dict[str, list[float]] | None = None
+    factor_slot: StrategyCandidateSlotModel | None = None
+    entry_slot: StrategyCandidateSlotModel | None = None
+    exit_slot: StrategyCandidateSlotModel | None = None
+    combination_policy: str = SS.CARTESIAN_COMBINATION
+    max_candidates: int = SS.MAX_CANDIDATES_PER_GENERATION_REQUEST
     evidence_count: int | None = None
     hypothesis_id: str | None = None
     research_provenance: dict[str, Any] | None = None

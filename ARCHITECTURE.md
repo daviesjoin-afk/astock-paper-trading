@@ -3688,11 +3688,60 @@ R35-A **不**做 promotion、**不**做 execution、**不**修改任何正式策
 `main_force_top10` 等只作为 pinned baseline / parent / reference 存在。验收标准是
 **可信的生成基础设施**，不是"证明某个新策略赚钱"——因此本阶段没有任何以收益 /
 Sharpe / 胜率作为验收条件的断言。DDL 由 `paper_schema_migrations.ensure_strategy_candidates`
-唯一持有（migration v33），业务代码不在运行时 `CREATE TABLE` / `ALTER TABLE`。
+唯一持有（migration v33/v34），业务代码不在运行时 `CREATE TABLE` / `ALTER TABLE`。
+
+R35-B（**Deterministic Candidate Expansion**）把链路扩展成：
+
+```text
+Pinned Parent Strategy
+        ↓
+Explicit Candidate Search Space   （strategy_candidate_search_space）
+        ↓
+Bounded Deterministic Generators  （strategy_generator capability registry）
+        ↓
+StrategyCandidate[]               （同一个 strategy_candidate authority）
+        ↓
+Candidate Ledger + Proposal / Batch provenance
+```
+
+三条硬性质：
+
+1. **search space 是显式、有限、可 fingerprint 的。** `CandidateSearchSpace` 只接受
+   调用方传入的事实：parent pin、generator 能力/版本、as-of、research provenance、
+   参数变体、factor/entry/exit 备选、组合策略与候选上限。它没有 DB、没有 registry、
+   没有机器时钟，因此不存在"generator 自己去查 current strategy / 今天 / 当前组合"。
+2. **基数在生成前算得出来，超限 fail closed。** `cardinality` 是显式声明的一部分，
+   超过 `MAX_CANDIDATES_PER_GENERATION_REQUEST`（128，契约上限，调用方只能收紧）
+   一律拒绝。**绝不静默截断** —— 截断会让 candidate universe 依赖遍历顺序。
+3. **三种身份，三套契约。**
+
+```text
+candidate row  → content identity (canonical fingerprint)      → semantic dedup
+proposal row   → opaque event identity (secrets.token_hex(32)) → append every occurrence
+batch row      → opaque request identity                       → append every request
+```
+
+generator **能力身份**属于 proposal 事件与 generation batch，**不**属于 candidate
+fingerprint：同一份 canonical specification 由 `factor_variant` 与
+`bounded_combination` 分别提出时，候选行 1 条、proposal 事件 2 条。
+`generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
+契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可
+回答，而 batch identity 本身绝不进候选指纹。
+
+slot 语义必须**唯一**：`inherit_parent`（继承 exact pinned parent 那一版的最终语义，
+生成阶段就解析成明确值）/ `explicit_variant`（显式备选）/ `absent`（本候选没有该
+角色）三者互斥，不允许用 `None` 同时表示三件事。constraints 的规则是 **inherit, or
+only tighten**：放宽仓位 / 敞口 / 权重上限属于风险放大动作，必须走正式 risk
+evidence gate，不属于 candidate generator 的权限。
+
+R35-B 明确**不**拥有 evaluation（backtest / PIT / robustness / scoring / ranking /
+winner selection）、promotion、lifecycle transition、execution、allocation、risk
+override；这些留给 R36 / R37。它只回答"给定明确、有限的搜索空间，确定性地产生哪些
+受约束候选"，不回答"哪个候选赚钱 / 哪个最好 / 哪个该晋级"。
 
 ```text
 candidate identity != candidate evaluation result
-generator authority = produce candidate (no promotion, no execution)
+generator authority = produce candidate (no promotion, no execution, no scoring)
 ```
 
 

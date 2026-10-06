@@ -1900,6 +1900,7 @@ def init_db():
                 # R34-B（v31）：多策略分配计划追加表（DDL owner 同上）。
                 PSM.ensure_portfolio_allocation_plans(conn)
                 # R35-A（v33）：策略候选台账（DDL 同样只在 paper_schema_migrations）。
+                # R35-B（v34）：候选表按内容身份重建 + generation batch 追加表。
                 PSM.ensure_strategy_candidates(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)

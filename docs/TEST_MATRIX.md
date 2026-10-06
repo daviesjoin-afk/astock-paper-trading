@@ -713,3 +713,57 @@ instead of pretending the second event was recorded. Candidate rows keep their
 `INSERT OR IGNORE` because the canonical fingerprint **is** the dedup authority.
 The append-only `*_no_update` / `*_no_delete` triggers are unchanged.
 
+### R35-B deterministic candidate expansion traceability (B1-B12)
+
+| ID | Regression coverage |
+|---|---|
+| B1 | `test_b1_same_search_space_yields_the_same_candidate_set`; `test_b1b_search_space_fingerprint_is_canonical` |
+| B2 | `test_b2_declaration_order_never_changes_the_candidate_set`; `test_b2b_reversed_mapping_keys_do_not_change_identity`; `test_b2c_parameter_declaration_order_never_changes_the_candidate_set` |
+| B3 | `test_b3_oversized_combination_space_is_rejected_not_truncated`; `test_b3b_cardinality_is_computable_before_expansion`; `test_b3c_declared_budget_can_only_tighten_the_contract_ceiling`; `test_b3d_a_dimension_the_capability_does_not_expand_must_be_singular` |
+| B4 | `test_b4_factor_variation_changes_identity` |
+| B5 | `test_b5_entry_variation_changes_identity` |
+| B6 | `test_b6_exit_variation_changes_identity` |
+| B7 | `test_b7_inherited_parent_semantics_are_materialized_in_the_candidate`; `test_b7b_inherited_factor_and_exit_come_from_the_frozen_pin`; `test_b7c_absent_and_inherit_are_not_the_same_declaration` |
+| B8 | `test_b8_arbitrary_executable_payload_is_rejected`; `test_b8b_dynamic_field_lookup_and_unknown_ops_are_rejected`; `test_b8c_structural_mutation_cannot_smuggle_a_second_parameter_authority`; `test_b8d_generator_never_rewrites_parent_structure_implicitly` |
+| B9 | `test_b9_same_semantics_across_generators_dedup_to_one_candidate` |
+| B10 | `test_b10_batch_binds_the_frozen_generation_input`; `test_b10b_generation_input_fingerprint_is_content_bound`; `test_b10c_batch_rows_are_append_only_and_have_no_latest_pointer` |
+| B11 | `test_b11_batch_identity_is_not_candidate_identity` |
+| B12 | `test_b12_generator_path_has_no_evaluation_promotion_or_execution_dependency`; `test_b12b_no_scoring_ranking_or_winner_selection_in_the_generator_path`; `test_b12c_search_space_module_is_a_pure_contract`; `test_b12d_no_runtime_create_or_alter_table_in_the_generator_path`; `test_b12e_no_implicit_current_state_lookup`; `test_b12e2_repository_clock_is_confined_to_persistence_metadata`; `test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain` |
+
+HTTP 契约：`test_strategy_api_contract.test_r35b_search_space_generation_over_http`。
+前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。
+Schema 升级：`CandidateContractUpgradeTests`（v1 行仍自证、v34 重建幂等且不回填）。
+
+### R35-B semantic mutation results
+
+`work/r35b_candidate_expansion_mutation_check.py` result: M-B1-M-B7 all **DETECTED**;
+`survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and the focused
+baseline after restore is green.
+
+| ID | Semantic mutation | Detector |
+|---|---|---|
+| M-B1 | an oversized or partially-declared space is silently truncated | B3 |
+| M-B2 | the canonical fingerprint ignores the factor slot | B4 |
+| M-B3 | the canonical fingerprint ignores the exit slot | B6 |
+| M-B4 | an inherited slot no longer resolves to the pinned parent's semantics | B7b |
+| M-B5 | different generators produce two candidate ids for one specification | B9 |
+| M-B6 | the generation input fingerprint stops binding the frozen input | B10 / B10b |
+| M-B7 | an arbitrary AST is accepted as a slot alternative | B8 |
+
+### R35-B identity layers (candidate / proposal / batch)
+
+```text
+candidate row  → content identity (canonical fingerprint)      → semantic dedup
+proposal row   → opaque event identity (secrets.token_hex(32)) → append every occurrence
+batch row      → opaque request identity                       → append every request
+```
+
+R35-B 把 **generator 能力身份**从 candidate fingerprint 移出：candidate 是内容身份，
+"哪个能力、哪一次请求提出了它"是 proposal 事件与 generation batch 的 provenance。
+因此同一份 canonical specification 由 `factor_variant` 与 `bounded_combination`
+分别提出时，候选行 1 条、proposal 事件 2 条（B9）。candidate schema 因此升级为
+`strategy-candidate-v2`（migration v34 重建候选表并去掉三个 `NOT NULL` 的 generator
+列，forward-only、不回填；历史 v1 行的 `candidate_json` 逐字保留，仍按 v1 材料自证）。
+`generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
+契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可回答。
+

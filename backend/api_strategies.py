@@ -429,17 +429,30 @@ def get_retirement_proposal(proposal_id: str):
 
 
 # ---------------------------------------------------------------------------
-# R35-A：策略候选（StrategyCandidate）生成与只读投影
+# R35-A/B：策略候选（StrategyCandidate）生成与只读投影
 # ---------------------------------------------------------------------------
+
+def _slot_payload(slot):
+    """把 typed slot 模型归一成纯 dict（route 不做任何语义校验）。"""
+    if slot is None:
+        return None
+    if hasattr(slot, "model_dump"):
+        return {key: value for key, value in slot.model_dump().items()
+                if value is not None}
+    return slot
+
 
 @router.post("/{strategy_id}/candidates", status_code=201)
 def generate_strategy_candidates(
     strategy_id: str, payload: Models.StrategyCandidateGenerateRequest | None = None,
 ):
-    """Generate constrained candidates from one exact pinned parent version.
+    """Expand one explicit bounded candidate search space from a pinned parent.
 
-    R35-A 只产出 ``StrategyCandidate``：不下单、不改 lifecycle、不产生晋级结论，
+    R35-A/B 只产出 ``StrategyCandidate``：不下单、不改 lifecycle、不产生晋级结论，
     也不评估候选表现。父策略只作为 pinned baseline 存在。
+
+    空间展开、基数计算与候选构造都在 application service / 纯生成域里；HTTP 这一层
+    只做输入解析、调用与错误映射。
     """
     request = _coerce(Models.StrategyCandidateGenerateRequest, payload)
     try:
@@ -448,7 +461,15 @@ def generate_strategy_candidates(
             strategy_version=request.strategy_version,
             strategy_checksum=request.strategy_checksum,
             asof=request.asof,
+            generator_type=request.generator_type,
+            generator_version=request.generator_version,
+            parameter_variants=request.parameter_variants,
             parameter_adjustments=request.parameter_adjustments,
+            factor_slot=_slot_payload(request.factor_slot),
+            entry_slot=_slot_payload(request.entry_slot),
+            exit_slot=_slot_payload(request.exit_slot),
+            combination_policy=request.combination_policy,
+            max_candidates=request.max_candidates,
             universe_spec=request.universe_spec,
             intended_market_regime=request.intended_market_regime,
             evidence_count=request.evidence_count,
@@ -493,6 +514,26 @@ def get_strategy_candidate(strategy_id: str, candidate_id: str):
     if str(result["candidate"].get("parent_strategy_id") or "") != str(strategy_id):
         # 页面身份与候选身份必须一致，否则就是把 A 的候选显示成 B 的。
         _raise_candidate_http(SC.CandidateValidationError("candidate_strategy_mismatch"))
+    return result
+
+
+@router.get("/{strategy_id}/candidate-generations/{batch_id}")
+def get_candidate_generation_batch(strategy_id: str, batch_id: str):
+    """Read exactly one generation batch by id — there is no latest endpoint.
+
+    R35-B §19/§20：一次生成请求 → 一个 batch identity → N 条 proposal 事件。
+    batch 绑定 exact parent pin、search-space canonical fingerprint、generator
+    能力/契约版本、as-of 与 research provenance，因此"这一批候选是从什么输入生成
+    的"永远可回答。候选优劣、能否晋级一律**不**在这里发布。
+    """
+    try:
+        result = SCV.read_generation_batch(batch_id)
+    except (SCV.StrategyCandidateUnavailable, SC.CandidateValidationError,
+            SCRepo.StrategyCandidateRepositoryError) as exc:
+        _raise_candidate_http(exc)
+    batch = result["generation_batch"]
+    if str(batch.get("parent_strategy_id") or "") != str(strategy_id):
+        _raise_candidate_http(SC.CandidateValidationError("generation_batch_strategy_mismatch"))
     return result
 
 

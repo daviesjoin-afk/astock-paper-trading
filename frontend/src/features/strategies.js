@@ -756,8 +756,12 @@ export function wbCandidateHtml(candidate){
     +'<dt>Parent pin</dt><dd data-testid="candidate-parent">'+adaptiveEsc(String(candidate.parent_strategy_id||'—'))
     +' @ v'+adaptiveEsc(String(candidate.parent_strategy_version))
     +' · <code>'+adaptiveEsc(String(candidate.parent_strategy_checksum||''))+'</code></dd>'
-    +'<dt>Generator</dt><dd>'+adaptiveEsc(candidate.generator_type||'')+' / '+adaptiveEsc(candidate.generator_version||'')
-    +' · contract '+adaptiveEsc(candidate.generator_contract_version||'')+'</dd>'
+    // R35-B：generator 能力属于**提案事件**的 provenance，不再挂在候选行上；
+    // 因此这里显示的是"这个候选由哪次生成请求提出"，缺记录时明说而不是留空。
+    +'<dt>Proposal</dt><dd data-testid="candidate-proposal">'
+    +adaptiveEsc(String(candidate.proposal_generator_type||'未记录'))
+    +' / '+adaptiveEsc(String(candidate.proposal_generator_version||'—'))
+    +' · batch '+adaptiveEsc(String(candidate.proposal_generation_batch_id||'未记录'))+'</dd>'
     // created_at 是持久化事实（不属于 candidate 指纹），由台账单独发布。
     +'<dt>Created / asof</dt><dd>'+adaptiveEsc(String(candidate.created_at||'未记录'))+' / '+adaptiveEsc(candidate.asof||'')+'</dd>'
     +'<dt>Fingerprint</dt><dd data-testid="candidate-fingerprint"><code>'+adaptiveEsc(candidate.candidate_fingerprint||'')+'</code></dd>'
@@ -771,16 +775,49 @@ export function wbCandidateHtml(candidate){
       strategy_schema_version:candidate.strategy_schema_version}))+'</code></details>'
     +'<p class="strategy-candidate-note">评估结论与晋级结论由后端 contract 发布；本页只读台账事实。</p></article>';
 }
+/* R35-B：generation batch 只读摘要。它回答"这一批候选是从什么输入生成的"，
+   不回答"哪一批更好"——后端不发布 evaluation / promotion，前端也不得自行判断。 */
+export function wbGenerationBatchHtml(batch){
+  if(!batch||!batch.batch_id){
+    return '<p data-testid="generation-batch">该候选未记录 generation batch（legacy 台账行）。</p>';
+  }
+  return '<article class="strategy-generation-batch" data-testid="generation-batch">'
+    +'<b data-testid="generation-batch-id">'+adaptiveEsc(String(batch.batch_id))+'</b>'
+    +'<dl class="strategy-preview-grid">'
+    +'<dt>Generator</dt><dd data-testid="generation-batch-generator">'
+    +adaptiveEsc(String(batch.generator_type||''))+' / '+adaptiveEsc(String(batch.generator_version||''))
+    +' · contract '+adaptiveEsc(String(batch.generator_contract_version||''))+'</dd>'
+    +'<dt>Candidate count</dt><dd>'+adaptiveEsc(String(batch.candidate_count))+'</dd>'
+    +'<dt>Parent pin</dt><dd>'+adaptiveEsc(String(batch.parent_strategy_id||'—'))
+    +' @ v'+adaptiveEsc(String(batch.parent_strategy_version))
+    +' · <code>'+adaptiveEsc(String(batch.parent_strategy_checksum||''))+'</code></dd>'
+    +'<dt>As-of</dt><dd>'+adaptiveEsc(String(batch.asof||''))+'</dd>'
+    +'<dt>Search space</dt><dd data-testid="generation-batch-search-space"><code>'
+    +adaptiveEsc(String(batch.search_space_fingerprint||''))+'</code>'
+    +' · '+adaptiveEsc(String(batch.search_space_contract_version||''))+'</dd>'
+    +'<dt>Generation input</dt><dd data-testid="generation-batch-input-fingerprint"><code>'
+    +adaptiveEsc(String(batch.generation_input_fingerprint||''))+'</code></dd></dl>'
+    +'<p class="strategy-candidate-note">batch 只记录生成输入；候选优劣由后端 contract 发布，本页不判断。</p>'
+    +'</article>';
+}
 export function wbCandidatesHtml(strategyId,view){
   var rows=((view&&view.items)||[]).map(function(item){
-    // 每一项是 {candidate, persistence}：created_at 属于台账，不属于候选身份。
+    // 每一项是 {candidate, persistence, proposal}：created_at 属于台账，不属于候选身份；
+    // generator 能力 / batch 属于**提案事件**，同样不属于候选身份。
+    var proposal=item.proposal||{};
     return wbCandidateHtml(Object.assign({},item.candidate||{},
-      {created_at:(item.persistence||{}).created_at}));
+      {created_at:(item.persistence||{}).created_at,
+       proposal_generator_type:proposal.generator_type,
+       proposal_generator_version:proposal.generator_version,
+       proposal_generation_batch_id:proposal.generation_batch_id}));
   }).join('');
   var pin=(view&&view.parent_strategy_pin)||{};
+  // R35-B：batch 摘要按显式 batch id 读取，绝不请求"最新一批"。
+  var batches=((view&&view.generation_batches)||[]).map(wbGenerationBatchHtml).join('');
   return '<h4>StrategyCandidate 只读台账</h4>'
     +'<p>只显示绑定到 <b>exact</b> parent v'+adaptiveEsc(String(pin.strategy_version||''))+'</p>'
     +'<code>'+adaptiveEsc(String(pin.strategy_checksum||''))+'</code>'
+    +(batches?'<div data-testid="generation-batches">'+batches+'</div>':'')
     +'<div data-testid="strategy-candidates">'+(rows||'<p>该 exact version 尚无候选记录。</p>')+'</div>';
 }
 

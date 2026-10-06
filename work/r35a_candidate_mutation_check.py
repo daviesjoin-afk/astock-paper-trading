@@ -28,7 +28,7 @@ BASELINE = (
     "test_r35a_strategy_candidate.ExecutablePayloadTests.test_c4b_dynamic_field_and_attribute_access_is_rejected",
     "test_r35a_strategy_candidate.ExecutablePayloadTests.test_c4d_unknown_ops_and_oversized_asts_are_rejected",
     "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5_missing_parent_version_or_checksum_is_rejected",
-    "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5b_missing_generator_version_asof_and_entry_are_rejected",
+    "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5b_missing_asof_and_entry_are_rejected",
     "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5e_undeclared_or_out_of_contract_parameters_are_rejected",
     "test_r35a_strategy_candidate.LedgerTests.test_c6_same_candidate_is_not_duplicated",
     "test_r35a_strategy_candidate.LedgerTests.test_c6b_dedup_keeps_the_proposal_source_evidence",
@@ -82,7 +82,7 @@ MUTATIONS = [
          (CANDIDATE,
           '        material.pop("candidate_id")\n'
           '        material.pop("candidate_fingerprint")\n'
-          '        return material',
+          '        for key in LEGACY_GENERATOR_IDENTITY_KEYS:\n',
           '        material.pop("candidate_id")\n'
           '        material.pop("candidate_fingerprint")\n'
           '        material.pop("parameter_spec", None)\n'
@@ -94,9 +94,10 @@ MUTATIONS = [
           '                return [_strip(item) for item in value]\n'
           '            return value\n'
           '        material["entry_spec"] = _strip(material["entry_spec"])\n'
-          '        return material'),
+          '        for key in LEGACY_GENERATOR_IDENTITY_KEYS:\n'),
          (CANDIDATE,
-          '    fingerprint = _sha(material)\n',
+          '    fingerprint = _sha(material)\n'
+          '    return StrategyCandidate(',
           '    material.pop("parameter_spec", None)\n'
           '    def _strip_material(value):\n'
           '        if isinstance(value, dict):\n'
@@ -106,7 +107,8 @@ MUTATIONS = [
           '            return [_strip_material(item) for item in value]\n'
           '        return value\n'
           '    material["entry_spec"] = _strip_material(material["entry_spec"])\n'
-          '    fingerprint = _sha(material)\n'),
+          '    fingerprint = _sha(material)\n'
+          '    return StrategyCandidate('),
      ],
      "detectors": [
          "test_r35a_strategy_candidate.CandidateIdentityTests."

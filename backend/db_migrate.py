@@ -347,6 +347,13 @@ MIGRATIONS = {
         # 候选 provenance 是捏造。
         (33, "新增策略候选台账与提案证据表（幂等，不回填，append-only）",
          paper_schema.ensure_strategy_candidates),
+        # R35-B：候选是**内容**身份，generator 能力身份降到 proposal 事件 / batch 上，
+        # 因此候选表按 v2 形状重建（去掉三个 NOT NULL 的 generator 列，否则每个新行
+        # 都被逼着编一个能力身份），并新增 generation batch 追加表。
+        # **绝不回填**：历史 proposal 事件没有 batch 归属，NULL 就是诚实的 legacy
+        # 状态；历史候选行原样保留（candidate_json 逐字搬运，v1 材料仍自证）。
+        (34, "候选表升级为内容身份并新增 generation batch 追加表（幂等，不回填）",
+         paper_schema.ensure_strategy_candidates),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
