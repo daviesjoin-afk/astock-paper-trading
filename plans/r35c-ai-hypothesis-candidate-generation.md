@@ -113,14 +113,33 @@ provider readiness（凭据 / enabled / 地址 / model）
 C2 断言 unsupported research 的 `provider call count = 0` 且 `candidate writes = 0`。
 顺序不是风格问题：反过来的话，一次坏输入会先花掉一次 provider 调用。
 
-**provider readiness 必须是本 service 的强制 gate，不能只放 HTTP route**：本模块的
-authority 就是"一次 AI 候选生成的完整编排边界"，它可以被 CLI / R36 / scheduler /
-其他内部调用**直接**调用；而 `ai_provider_transport.call_json` 刻意只检查
-api_key / base_url / model、**不认识** `enabled`。gate 只放 route 等于"绕过 route 时
-禁用形同不存在"。规则**复用** `ai_review_service.slot_readiness`（R27-B2B 建立的
-canonical 定义），因此禁用槽位在 AI 路径与 R27 research runtime 上判定一致，
-不会出现第二套 readiness 语义。route 只负责把 service 的稳定 reason 映射成 HTTP
-状态码，不重复判定。`ProviderReadinessTests` + M-AIG11 覆盖。
+**provider readiness 与 canonical slot 由本 service 统一强制**，不能只靠 HTTP route：
+本模块的 authority 就是"一次 AI 候选生成的完整编排边界"，它可以被 CLI / R36 /
+scheduler / 其他内部调用**直接**调用；而 `ai_provider_transport.call_json` 刻意只检查
+api_key / base_url / model、**不认识** `enabled`，也不认识槽位词汇。
+
+因此 service 的 provider-config gate 同时做两件不可分开的事：
+
+```text
+provider_config.slot
+        ↓ AIReview.resolve_slot()          ← 既有 authority：ai1 / ai2，legacy alias 归一
+canonical slot（ai1 / ai2），未知即 fail closed
+        ↓ AIReview.slot_readiness()        ← 既有 authority：凭据 → 启用 → 地址 → 模型
+        ↓ 产出的 **canonical** 配置被下游全程复用
+provider 调用 + model_identity
+```
+
+只把 readiness 放 route 等于"绕过 route 时禁用形同不存在"；只把 **slot 归一**放 route
+则更隐蔽：service 直调时 `"AI1"` / `" mimo "` / `"mimo"` / `"deepseek"` 会被原样
+**持久化**进 proposal provenance，同一个槽位在事件身份里裂成多种字符串，破坏本轮建立
+的 provenance 审计。所以 canonical 配置必须在 service 产生，并被 readiness、provider
+调用、model identity **三处复用**，使一次请求从付费调用到 provenance 用同一个身份。
+
+规则**不复制**：槽位归一复用 `ai_review_service.resolve_slot`，readiness 复用
+`ai_review_service.slot_readiness`，service 里不存在第二套槽位表或 readiness 语义。
+route 只负责解析配置并把 service 的稳定 reason 映射成 HTTP 状态码（未就绪 409
+`provider_slot_not_ready:<canonical reason>`，无法归一的槽位 400
+`provider_slot_not_recognised`）。`ProviderReadinessTests` + M-AIG11 / M-AIG16 覆盖。
 
 ## 七、业务日期钉死
 

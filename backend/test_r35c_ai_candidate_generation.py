@@ -267,15 +267,33 @@ class ExactResearchRunTests(_Base):
                 self.assertEqual(before, self.counts())
 
     def test_c1b2_canonical_run_id_and_ints_are_accepted(self):
-        """合法形态：规范十进制字符串与正整数 int（含同一行的两种形态）。"""
+        """合法形态：规范十进制字符串与正整数 int（含同一行的两种形态）。
+
+        两条路径必须是**同一个契约**：HTTP 给字符串，CLI / 内部调用可以直接给 int
+        （台账主键本来就是整数）。此前 helper 接受 int 而 service 外层有 str-only gate，
+        会出现 `_research_run_identity(7)` 接受、`generate_candidates_from_research(7)`
+        却拒绝的内部不一致。
+        """
         run_id = self.record_run(_supported_hypothesis())
         self.assertEqual(run_id, SAICS._research_run_identity(str(run_id)))
         self.assertEqual(run_id, SAICS._research_run_identity(run_id))
+        # 端到端同样接受 int（而不是只在 helper 层接受）。
+        by_str = self.generate(research_run_id=str(run_id))
+        by_int = self.generate(research_run_id=run_id)
+        self.assertEqual(by_str["candidate_ids"], by_int["candidate_ids"])
+        self.assertEqual(by_str["generation_input_fingerprint"],
+                         by_int["generation_input_fingerprint"])
         # bool 是 int 的子类：True 绝不能当成 run 1。
         for bad in (True, False, 0, -1, 1.5, None, []):
             with self.subTest(bad=bad):
                 with self.assertRaises(SAICS.AICandidateGenerationError):
                     SAICS._research_run_identity(bad)
+        # 端到端也拒绝这些形态。
+        for bad in (True, 0, -1, 1.5, None):
+            self.calls.clear()
+            with self.assertRaises(SAICS.AICandidateGenerationError):
+                self.generate(research_run_id=bad)
+            self.assertEqual([], self.calls)
 
     def test_c1b3_strict_identity_is_checked_before_reading_the_ledger(self):
         """形状拒绝必须发生在读账本之前（用 monkeypatch 证明账本从未被读）。"""
@@ -420,18 +438,19 @@ class ProviderReadinessTests(_Base):
         import ai_review_service as AIReview
         source = open(SAICS.__file__, encoding="utf-8").read()
         self.assertIn("AIReview.slot_readiness(", source)
+        self.assertIn("AIReview.resolve_slot(", source)
         for forbidden in ("def slot_readiness", "def _slot_readiness",
-                          "def _provider_ready"):
+                          "def _provider_ready", "def resolve_slot"):
             self.assertNotIn(forbidden, source)
         # 逐个槽位状态与 canonical 判定一致。
         for config in (self._config(enabled=False), self._config(api_key=""),
                        self._config(model=""), self._config()):
             canonical = AIReview.slot_readiness(config)
             if canonical["ready"]:
-                SAICS._require_provider_ready(config)   # 不抛
+                SAICS._canonical_provider_config(config)   # 不抛
             else:
                 with self.assertRaises(SAICS.AICandidateGenerationError) as ctx:
-                    SAICS._require_provider_ready(config)
+                    SAICS._canonical_provider_config(config)
                 self.assertEqual(canonical["reason"], ctx.exception.detail)
 
     def test_readiness_precedes_the_provider_call_but_follows_the_audit_gates(self):
@@ -447,6 +466,66 @@ class ProviderReadinessTests(_Base):
                           provider_config=self._config(enabled=False))
         self.assertEqual(SAICS.REASON_ASOF_MISMATCH, ctx.exception.reason)
         self.assertEqual([], self.calls)
+
+    def test_unknown_slot_is_rejected_by_the_service_itself(self):
+        """P2 残余：service 直调时未知槽位必须 fail closed，不得真发请求、不得持久化。
+
+        之前 canonicalization 只在 route：service 直调时 ``evil-provider`` 会被原样接受，
+        真的调用 provider，并把 ``{"provider": "evil-provider"}`` 写进事件 provenance ——
+        与"``provider`` 只记 canonical ``ai1`` / ``ai2``"的契约冲突。
+        """
+        run_id = self.record_run(_supported_hypothesis())
+        before = self.counts()
+        for bad in ("evil-provider", "", "  ", "ai3", None, 7, "AI!", "ai1 ai2"):
+            with self.subTest(slot=bad):
+                self.calls.clear()
+                with self.assertRaises(SAICS.AICandidateGenerationError) as ctx:
+                    self.generate(research_run_id=str(run_id),
+                                  provider_config=self._config(slot=bad))
+                self.assertEqual(SAICS.REASON_PROVIDER_SLOT_UNKNOWN, ctx.exception.reason)
+                self.assertEqual([], self.calls, "未知槽位不得发起任何 provider 调用")
+        self.assertEqual(before, self.counts(), "未知槽位不得留下任何台账行")
+
+    def test_canonical_slot_is_normalised_before_the_provider_call(self):
+        """canonicalization 必须发生在 service，且下游全程复用同一身份。
+
+        ``AI1`` / ``ai1``（大小写与空白差异）以及既有 legacy alias（``mimo`` → ``ai1``、
+        ``deepseek`` → ``ai2``）都必须归一成 canonical 槽位：**持久化的 provider 恒为
+        ``ai1`` / ``ai2``**，绝不是调用方原样字符串，也绝不是 legacy alias。
+        """
+        run_id = self.record_run(_supported_hypothesis())
+        # 归一结果由既有 authority 决定，这里不重复它的规则，而是断言"与它一致"。
+        for raw, expected in (("ai1", "ai1"), ("AI1", "ai1"), ("  ai1  ", "ai1"),
+                              ("ai2", "ai2"), ("mimo", "ai1"), ("deepseek", "ai2"),
+                              ("MiMo", "ai1")):
+            with self.subTest(raw=raw):
+                self._transport.payload = {"parameter_variants": {"ma_period": [18, 20]}}
+                result = self.generate(research_run_id=str(run_id),
+                                       provider_config=self._config(slot=raw))
+                with self._connection() as conn:
+                    row = conn.execute(
+                        "SELECT proposal_json FROM strategy_candidate_proposals"
+                        " WHERE generation_batch_id=?",
+                        (result["generation_batch_id"],)).fetchone()
+                identity = json.loads(row[0])["model_identity"]
+                self.assertEqual(expected, identity["provider"])
+                # provider 调用收到的也是 canonical 槽位。
+                self.assertEqual(expected, self.calls[-1]["provider_config"]["slot"])
+
+    def test_canonicalisation_reuses_the_authority_not_a_second_copy(self):
+        """不得另写一套槽位归一规则。"""
+        import ai_review_service as AIReview
+        source = open(SAICS.__file__, encoding="utf-8").read()
+        self.assertIn("AIReview.resolve_slot(", source)
+        for forbidden in ("def resolve_slot", "def _resolve_slot",
+                          "LEGACY_PROVIDER_SLOTS", "AI_SLOTS ="):
+            self.assertNotIn(forbidden, source)
+        # 归一结果与 canonical authority 完全一致。
+        for raw in ("ai1", "AI1", "mimo", "deepseek", "ai2"):
+            expected = AIReview.resolve_slot(raw)
+            config = self._config(slot=raw)
+            resolved = SAICS._canonical_provider_config(config)
+            self.assertEqual(expected, resolved["slot"])
 
 
 class AsofPinningTests(_Base):
@@ -698,11 +777,11 @@ class CrossModelDedupTests(_Base):
         # Provider A：model A 提出 ma_period [18, 20]（两种取值顺序都必须等价）。
         self._transport.payload = {"parameter_variants": {"ma_period": [18, 20]}}
         first = self.generate(research_run_id=str(run_id),
-                              provider_config=self._slot("a", "model-a"))
+                              provider_config=self._slot("ai1", "model-a"))
         # Provider B：另一个 model 提出**完全相同**的 search space。
         self._transport.payload = {"parameter_variants": {"ma_period": [20, 18]}}
         second = self.generate(research_run_id=str(run_id),
-                               provider_config=self._slot("b", "model-b"))
+                               provider_config=self._slot("ai2", "model-b"))
 
         self.assertEqual(first["candidate_ids"], second["candidate_ids"])
         with self._connection() as conn:
@@ -775,9 +854,9 @@ class CrossModelDedupTests(_Base):
         run_id = self.record_run(_supported_hypothesis())
         self._transport.payload = {"parameter_variants": {"ma_period": [18, 20]}}
         self.generate(research_run_id=str(run_id),
-                      provider_config=self._slot("a", "model-a"))
+                      provider_config=self._slot("ai1", "model-a"))
         self.generate(research_run_id=str(run_id),
-                      provider_config=self._slot("b", "model-b"))
+                      provider_config=self._slot("ai2", "model-b"))
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT proposal_json FROM strategy_candidate_proposals").fetchall()
@@ -996,7 +1075,7 @@ class AuthorityBoundaryTests(_Base):
     def test_c18h_provider_does_not_see_secrets_in_its_prompt(self):
         run_id = self.record_run(_supported_hypothesis())
         self.generate(research_run_id=str(run_id),
-                      provider_config=self._slot("a", "m", api_key="sk-secret-value"))
+                      provider_config=self._slot("ai1", "m", api_key="sk-secret-value"))
         blob = self.calls[0]["user_prompt"] + self.calls[0]["system_prompt"]
         self.assertNotIn("sk-secret-value", blob)
 
@@ -1088,7 +1167,7 @@ class ProviderProtocolTests(_Base):
         """research run 的 model 与 candidate-proposal 的 model 不是同一个概念。"""
         run_id = self.record_run(_supported_hypothesis())
         self.generate(research_run_id=str(run_id),
-                      provider_config=self._slot("a", "proposal-model"))
+                      provider_config=self._slot("ai1", "proposal-model"))
         with self._connection() as conn:
             run = conn.execute(f"SELECT provider_model FROM {ARR.TABLE}"
                                " WHERE id=?", (run_id,)).fetchone()

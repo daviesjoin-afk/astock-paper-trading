@@ -839,9 +839,10 @@ StrategyCandidate[]（既有 candidate / proposal / batch 三张表，零新表�
 | evidence_count 由 R27 派生、AI 不得自述、进 input fingerprint | `EvidenceCountTests` |
 | model identity 是 candidate-proposal provider，与 research run model 不混用 | `ProviderProtocolTests` |
 | HTTP 契约：请求更窄、凭据不落库、拒绝映射稳定、route 无业务逻辑 | `test_r35c_ai_candidate_http.py` |
-| **provider readiness 由 service 强制**（禁用 / 缺凭据 / 地址 / model → `provider_slot_not_ready`） | `ProviderReadinessTests`（4 tests） |
-| 未就绪槽位的稳定 reason 复用 canonical `slot_readiness`，不复制第二套规则 | `test_readiness_reuses_the_canonical_authority_not_a_second_copy` |
-| run id 必须是**规范十进制**（`" 7"` / `"7 "` / `"007"` / `"+7"` 一律拒绝，且形状拒绝发生在读账本之前） | `test_c1b_non_numeric_or_negative_run_id_fails_closed`、`test_c1b3_strict_identity_is_checked_before_reading_the_ledger` |
+| **provider slot 归一 + readiness 由 service 统一强制**（无法归一 → 400 `provider_slot_not_recognised`；未就绪 → 409 `provider_slot_not_ready:<reason>`） | `ProviderReadinessTests`（7 tests） |
+| canonical slot 归一发生在 service，且下游三处（readiness / provider 调用 / provenance）复用同一身份 | `test_canonical_slot_is_normalised_before_the_provider_call` |
+| 归一规则复用 canonical authority，service 内无第二套槽位表或 readiness 语义 | `test_readiness_reuses_the_canonical_authority_not_a_second_copy`、`test_canonicalisation_reuses_the_authority_not_a_second_copy` |
+| run id 必须是**规范十进制**，且 `int` 与字符串是**同一契约**（`" 7"` / `"7 "` / `"007"` / `"+7"` / `bool` 一律拒绝，形状拒绝在读账本之前） | `test_c1b_non_numeric_or_negative_run_id_fails_closed`、`test_c1b2_canonical_run_id_and_ints_are_accepted`、`test_c1b3_strict_identity_is_checked_before_reading_the_ledger` |
 | `model_identity` 记录 canonical provider 槽位 + model，且进 input fingerprint | `test_c12c_provider_slot_is_recorded_and_bound_into_the_input_fingerprint` |
 | provider 槽位 readiness（**禁用槽位拦在网络之前**；未知槽位映射 400） | `test_disabled_provider_slot_is_rejected_before_the_provider`、`test_unknown_provider_slot_is_a_client_error`、`test_route_does_not_duplicate_the_readiness_rule` |
 | 畸形 proposal 形状是**稳定的拒绝**，不泄漏 `TypeError` / `AttributeError` | `test_malformed_parameter_variants_fail_closed_not_typeerror`、`test_malformed_provider_shape_is_a_provider_error_not_a_crash` |
@@ -858,19 +859,25 @@ StrategyCandidate[]（既有 candidate / proposal / batch 三张表，零新表�
    base_url / model，**不看** `enabled`。第一版只把 gate 放在 HTTP route，于是
    `generate_candidates_from_research()` **直接调用**时禁用形同不存在 —— 而那个 service
    的 authority 正是"完整编排边界"，可以被 CLI / R36 / scheduler 复用。现在 gate 长在
-   **service** 上（route 只映射 reason），规则仍复用 `ai_review_service.slot_readiness`。
-   M-AIG11 直接打破 service 的 gate。
-2. **run id 形状被悄悄归一（P2）**：`" 7"` 曾先 `strip()` 再 `isdigit()`，于是被解析成 7；
+   **service** 上（route 只映射 reason）。M-AIG11 直接打破 service 的 gate。
+2. **service 不归一 provider slot（P2 残余）**：readiness 提到 service 后，slot
+   **canonicalization 仍只在 route**。service 直调时 `"evil-provider"` 被接受并真的发起
+   付费调用；`"AI1"` / `" mimo "` / `"mimo"` / `"deepseek"` 被**原样持久化**进 proposal
+   provenance —— 同一槽位在事件身份里裂成多种字符串。现在 service 的 provider-config
+   gate 同时做 **canonical slot + readiness**，并把 canonical 配置复用给 readiness /
+   provider 调用 / model identity 三处。M-AIG16 覆盖两个边界。
+3. **run id 形状被悄悄归一（P2）**：`" 7"` 曾先 `strip()` 再 `isdigit()`，于是被解析成 7；
    若 7 恰好不存在，回归会以"查无此行"通过 —— 典型的**假绿**。现在只接受
-   `[1-9][0-9]*`，形状拒绝发生在读账本之前。M-AIG15 钉住。
-3. **proposal provenance 缺 provider 槽位（P2）**：只记 `model` 时，`ai1` 与 `ai2` 配
+   `[1-9][0-9]*`。同时收口了"helper 接受 `int`、service 外层 str-only"的内部不一致：
+   两条路径现在是**同一个契约**（HTTP 给字符串，CLI / 内部可给 `int`）。M-AIG15 钉住。
+4. **proposal provenance 缺 provider 槽位（P2）**：只记 `model` 时，`ai1` 与 `ai2` 配
    同一 model 且提出相同 proposal 就无法回答"谁提出的"，`generation_input_fingerprint`
-   也被抹平。现在记录 `{"provider": <canonical slot>, "model": <model>}`（`MODEL_IDENTITY_KEYS`
-   本来就允许 `provider`）。M-AIG16 钉住。
-4. **畸形形状泄漏未分类异常**：`parameter_variants` 是数字 / 字符串时，`len()` /
+   也被抹平。现在记录 `{"provider": <canonical slot>, "model": <model>}`
+   （`MODEL_IDENTITY_KEYS` 本来就允许 `provider`）。
+5. **畸形形状泄漏未分类异常**：`parameter_variants` 是数字 / 字符串时，`len()` /
    `.items()` 抛裸 `TypeError` / `AttributeError`，穿透 proposal 契约变成 5xx。
    现在形状**先于**度量验证。M-AIG13 钉住。
-5. **AI 批次跨策略串台**：切换策略后 `WB_STATE.aiCandidateView` 未清空，B 的详情页会
+6. **AI 批次跨策略串台**：切换策略后 `WB_STATE.aiCandidateView` 未清空，B 的详情页会
    显示 A 的 batch / parent pin / research run。现在按 strategy id 记账。
 
 ### R35-C semantic mutation results
@@ -900,7 +907,7 @@ R35-B 的 `M-X`。
 | M-AIG13 | 畸形 proposal 形状抛未分类异常 | ProviderProtocolTests |
 | M-AIG14 | 损坏 research 行不被翻译（裸 ValueError → 5xx） | ProviderProtocolTests |
 | M-AIG15 | 非规范 run id 被悄悄归一（假绿回归） | `ExactResearchRunTests` |
-| M-AIG16 | proposal provenance 不再记录 provider 槽位 | `CrossModelDedupTests` |
+| M-AIG16 | provider slot 既不校验也不归一，且 provenance 不记录 provider 槽位 | `ProviderReadinessTests` / `CrossModelDedupTests` |
 
 **M-AIG5/M-AIG5b 曾经 SURVIVED，暴露一个真实缺陷**：`FORBIDDEN_PROVIDER_FIELDS`
 当时是**装饰性**的 —— 其中每个字段同时也不在 `_ALLOWED_TOP_LEVEL` 里，因此

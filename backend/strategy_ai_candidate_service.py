@@ -55,6 +55,7 @@ __all__ = [
     "REASON_ASOF_MISMATCH",
     "REASON_AI_CANDIDATE_CAP",
     "REASON_PROVIDER_NOT_READY",
+    "REASON_PROVIDER_SLOT_UNKNOWN",
     "generate_candidates_from_research",
     "plan_research_candidate_generation",
 ]
@@ -75,32 +76,49 @@ REASON_RESEARCH_AUTHORITY = "research_is_not_authoritative"
 REASON_ASOF_MISMATCH = "research_as_of_mismatch"
 REASON_AI_CANDIDATE_CAP = "ai_candidate_cap_exceeded"
 REASON_PROVIDER_NOT_READY = "provider_slot_not_ready"
+REASON_PROVIDER_SLOT_UNKNOWN = "provider_slot_not_recognised"
 
 #: 规范十进制 run id：**没有**前导零、没有正负号、没有空白。``"007"`` 被刻意拒绝 ——
 #: 同一个 run 只应有一个可接受的文本形态，否则"7" 与 "007" 会指向同一行却看起来像两个。
 _CANONICAL_RUN_ID = re.compile(r"[1-9][0-9]*")
 
 
-def _require_provider_ready(provider_config: Any) -> None:
-    """强制 provider 槽位 readiness —— **在网络调用之前**，且由本 service 自己拥有。
+def _canonical_provider_config(provider_config: Any) -> dict:
+    """Resolve + validate a provider config into its **canonical** form.
 
-    为什么必须在 service、而不是只靠 HTTP route：本模块的 authority 就是"一次 AI 候选
-    生成的完整 orchestration boundary"。它可以直接被调用（CLI / R36 / scheduler / 内部
-    复用），而 :func:`ai_provider_transport.call_json` **刻意**只检查
-    ``api_key`` / ``base_url`` / ``model``，**不认识** ``enabled`` —— 所以只把 readiness
-    放在 route，等于"H有人绕过 route 时禁用形同不存在"。把 gate 放在这里，无论调用方是谁
-    都成立。
+    这是本 service 的 provider-config gate，同时做两件**不可分开**的事：
 
-    规则**不复制**：直接复用 ``ai_review_service.slot_readiness``（R27-B2B 建立的
-    canonical 定义，"凭据 → 启用 → 地址 → 模型"），因此禁用槽位在这里得到与 R27 research
-    runtime 完全一致的判定，不会出现第二套 readiness 语义。
+    1. **canonical slot identity** —— ``AIReview.resolve_slot`` 把任意输入归一成
+       ``ai1`` / ``ai2``（legacy alias ``mimo`` → ``ai1``、``deepseek`` → ``ai2``
+       由既有 authority 决定），未知槽位 fail closed。
+    2. **readiness** —— ``AIReview.slot_readiness``（凭据 → 启用 → 地址 → 模型）。
+
+    为什么两件事必须在 service 一起做：本模块是"完整 orchestration boundary"，可以被
+    CLI / R36 / scheduler **直接**调用。若只在 route 归一槽位，service 直调时
+    ``"evil-provider"`` / ``"AI1"`` / ``"mimo"`` 都会被原样接受并**持久化**进
+    proposal provenance —— 同一个槽位在事件身份里裂成多种字符串，破坏刚建立的事件
+    审计。所以 canonical 配置必须在这里产生，并被**下游全程复用**（readiness、
+    provider 调用、model identity），使一次请求从付费调用到 provenance 用的是同一个
+    身份。
+
+    规则**不复制**：槽位归一复用 ``ai_review_service.resolve_slot``，readiness 复用
+    ``ai_review_service.slot_readiness``，不新增第二套语义。
     """
     import ai_review_service as AIReview
-    config = provider_config if isinstance(provider_config, Mapping) else {}
-    readiness = AIReview.slot_readiness(config)
+    config = dict(provider_config) if isinstance(provider_config, Mapping) else {}
+    try:
+        slot = AIReview.resolve_slot(config.get("slot"))
+    except ValueError:
+        # 未知 / 缺失 / 非字符串槽位：fail closed，绝不原样透传。
+        raise AICandidateGenerationError(REASON_PROVIDER_SLOT_UNKNOWN,
+                                         str(config.get("slot") or "")) from None
+    canonical = dict(config)
+    canonical["slot"] = slot
+    readiness = AIReview.slot_readiness(canonical)
     if not readiness["ready"]:
         raise AICandidateGenerationError(REASON_PROVIDER_NOT_READY,
                                          str(readiness["reason"]))
+    return canonical
 
 
 def _research_provenance(run: Mapping[str, Any]) -> dict:
@@ -157,7 +175,7 @@ def _research_run_identity(research_run_id: Any) -> int:
 def plan_research_candidate_generation(
     conn: sqlite3.Connection,
     *,
-    research_run_id: str,
+    research_run_id: str | int,
     strategy_id: str,
     strategy_version: int,
     strategy_checksum: str,
@@ -173,9 +191,10 @@ def plan_research_candidate_generation(
     ``asof`` 可以省略：省略即**采纳 research run 自己的业务日**（那是唯一诚实的取值），
     显式给值则必须**完全一致**，不一致 fail closed。两种形态都不允许"拿旧研究生成新
     日期候选"——省略不是"用今天"，而是"用这条研究本身的日期"。
+    ``research_run_id`` 接受**规范十进制**（见 :func:`_research_run_identity`）：
+    HTTP 路径给字符串，CLI / 内部调用可以直接给 ``int`` —— 台账主键本来就是整数，
+    两条路径必须是同一个契约，不能"helper 接受 int、service 只接受 str"。
     """
-    if not isinstance(research_run_id, str) or not research_run_id.strip():
-        raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, "research_run_id is required")
     run_key = _research_run_identity(research_run_id)
     # R27 的 research ledger 不由 ``init_db`` / ``db_migrate`` 预建，而是由写路径惰性
     # 建表。读函数自己保证 schema 已建是本仓库既有约定（见
@@ -252,7 +271,7 @@ def generate_candidates_from_research(
     research_reader,
     writer,
     provider_config: Any,
-    research_run_id: str,
+    research_run_id: str | int,
     strategy_id: str,
     strategy_version: int,
     strategy_checksum: str,
@@ -286,15 +305,17 @@ def generate_candidates_from_research(
     # 而不是复用调用方那个可能为 None 的入参。
     pinned_asof: str = plan["asof"]
 
-    # ── readiness gate：必须发生在**任何** provider 调用之前 ──
+    # ── provider-config gate：canonical slot + readiness，必须在**任何** provider 调用之前 ──
     #
-    # 放在 research / parent gate 之后、网络调用之前：坏审计输入不先花钱，而未就绪的
-    # 槽位也绝不会被真正调用。二者都满足"拒绝排在付费之前"。
-    _require_provider_ready(provider_config)
+    # 放在 research / parent gate 之后、网络调用之前：坏审计输入不先花钱，未就绪或无法
+    # 归一的槽位也绝不会被真正调用。产出的 **canonical** 配置被下游三处全程复用
+    # （readiness、provider 调用、model identity），因此一次请求从付费调用到 provenance
+    # 用的是同一个槽位身份。
+    canonical_provider_config = _canonical_provider_config(provider_config)
 
     # ── 2/3. 网络调用在写事务之外 ──
     result = SAIPR.propose_candidate_space(
-        provider_config=provider_config,
+        provider_config=canonical_provider_config,
         hypothesis=plan["hypothesis_projection"], run=run,
         available_parameters=_adjustable_parameters(pin),
         max_candidates=int(max_candidates),
@@ -338,8 +359,9 @@ def generate_candidates_from_research(
                 research_provenance=plan["research_provenance"],
                 # model_identity 是"把 hypothesis 变成 candidate proposal 的 provider"，
                 # 与 research run 最初由哪个 model 产生是两件事。provider 没给可靠
-                # version 就留空，不编造。
-                model_identity=_provider_model_identity(provider_config),
+                # version 就留空，不编造。传入 **canonical** 配置，因此持久化的
+                # provider 恒为 ai1 / ai2，绝不会是 legacy alias 或调用方原样字符串。
+                model_identity=_provider_model_identity(canonical_provider_config),
                 # constraints=None → 继承 exact pinned parent（只能收紧）。
                 # R35-C **不开放** AI risk tuning。
                 constraints=None,

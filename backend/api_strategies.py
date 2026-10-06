@@ -131,6 +131,9 @@ def _raise_ai_candidate_http(exc: ValueError) -> None:
         # readiness reason 一并下发给调用方 —— 它只描述槽位配置状态，不含任何凭据内容。
         raise HTTPException(status_code=409,
                             detail=f"{reason}:{detail}" if detail else reason) from exc
+    if reason == SAICS.REASON_PROVIDER_SLOT_UNKNOWN:
+        # 无法归一到 ai1 / ai2 的槽位：客户端输入错误。
+        raise HTTPException(status_code=400, detail=reason) from exc
     if reason == SAICS.REASON_RESEARCH_NOT_FOUND or "not_found" in reason:
         status = 404
     elif reason in (SAICS.REASON_AI_CANDIDATE_CAP, SAIP.Reason.SEARCH_SPACE_REJECTED,

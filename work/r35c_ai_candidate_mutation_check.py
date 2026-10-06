@@ -39,6 +39,12 @@ BASELINE = (
     "test_readiness_reuses_the_canonical_authority_not_a_second_copy",
     "test_r35c_ai_candidate_generation.ProviderReadinessTests."
     "test_readiness_precedes_the_provider_call_but_follows_the_audit_gates",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_unknown_slot_is_rejected_by_the_service_itself",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_canonical_slot_is_normalised_before_the_provider_call",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_canonicalisation_reuses_the_authority_not_a_second_copy",
     "test_r35c_ai_candidate_generation.CrossModelDedupTests."
     "test_c12c_provider_slot_is_recorded_and_bound_into_the_input_fingerprint",
     "test_r35c_ai_candidate_generation.CrossModelDedupTests."
@@ -280,11 +286,11 @@ MUTATIONS = [
     {"id": "M-AIG11",
      "semantic": "the orchestration service stops enforcing provider readiness",
      "edits": [(SERVICE,
-                '    readiness = AIReview.slot_readiness(config)\n'
+                '    readiness = AIReview.slot_readiness(canonical)\n'
                 '    if not readiness["ready"]:\n'
                 '        raise AICandidateGenerationError(REASON_PROVIDER_NOT_READY,\n'
                 '                                         str(readiness["reason"]))\n',
-                '    readiness = AIReview.slot_readiness(config)\n'
+                '    readiness = AIReview.slot_readiness(canonical)\n'
                 '    if False:\n'
                 '        raise AICandidateGenerationError(REASON_PROVIDER_NOT_READY,\n'
                 '                                         str(readiness["reason"]))\n')],
@@ -354,20 +360,34 @@ MUTATIONS = [
          "test_r35c_ai_candidate_generation.ExactResearchRunTests."
          "test_c1b3_strict_identity_is_checked_before_reading_the_ledger",
      ]},
-    # M-AIG16 —— model_identity 不再记录 provider 槽位：只记 model 时，两个槽位配同一
-    # model 且提出相同 proposal 就无法区分"谁提出的"，input fingerprint 也被抹平。
+    # M-AIG16 —— provider slot provenance 的两半同时失守（reviewer 建议强化，不新增 ID）：
+    #   * 非 canonical 输入（"AI1" / " mimo "）被原样持久化 ⇒ 同一槽位在事件身份里裂成
+    #     多种字符串；未知槽位（"evil-provider"）被接受并真的发起付费调用；
+    #   * provenance 干脆不再记录 provider 键。
     {"id": "M-AIG16",
-     "semantic": "the proposal provenance stops recording the provider slot",
+     "semantic": "the provider slot is neither validated nor canonicalised",
      "edits": [(SERVICE,
+                '    try:\n'
+                '        slot = AIReview.resolve_slot(config.get("slot"))\n'
+                '    except ValueError:\n'
+                '        # 未知 / 缺失 / 非字符串槽位：fail closed，绝不原样透传。\n'
+                '        raise AICandidateGenerationError(REASON_PROVIDER_SLOT_UNKNOWN,\n'
+                '                                         str(config.get("slot") or "")) from None\n',
+                '    slot = str(config.get("slot") or "").strip()\n'),
+               (SERVICE,
                 '    provider = str(provider_config.get("slot") or "").strip()\n'
                 '    if provider:\n'
                 '        identity["provider"] = provider\n',
                 '    provider = str(provider_config.get("slot") or "").strip()\n')],
      "detectors": [
+         "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+         "test_unknown_slot_is_rejected_by_the_service_itself",
+         "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+         "test_canonical_slot_is_normalised_before_the_provider_call",
+         "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+         "test_canonicalisation_reuses_the_authority_not_a_second_copy",
          "test_r35c_ai_candidate_generation.CrossModelDedupTests."
          "test_c12c_provider_slot_is_recorded_and_bound_into_the_input_fingerprint",
-         "test_r35c_ai_candidate_generation.CrossModelDedupTests."
-         "test_c12d_provider_identity_is_absent_when_the_slot_is_unknown",
      ]},
 ]
 

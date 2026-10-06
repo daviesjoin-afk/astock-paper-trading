@@ -248,18 +248,27 @@ parent 查找 / prompt 组装 / AST 校验 / 候选展开 / DB INSERT。拒绝�
 research 不自洽 409、请求越界与 search space 被拒 400、provider 协议/transport 失败 502，
 **不**返回 5xx。
 
-**槽位 readiness 必须在网络之前**：`ai_provider_transport.call_json` 只检查
-api_key / base_url / model，**不看** `enabled`；因此"操作员禁用了该槽位"必须由本层用
-`AIReview.slot_readiness()` 拦下（沿用 R27-B2B 的既有定义），否则禁用只挡住 UI、挡不住
-真实付费调用。未知槽位映射成 400，而不是让裸 `ValueError` 变成 5xx。
+**槽位 canonical 化 + readiness 都由 orchestration service 统一强制**：
+`ai_provider_transport.call_json` 只检查 api_key / base_url / model，**既不认识**
+`enabled`、也不认识槽位词汇。而 `strategy_ai_candidate_service` 能被 CLI / R36 /
+scheduler **直接调用**，所以这两件事都必须长在 service 上，且必须**一起**做：
 
-**槽位 readiness 由 orchestration service 强制**：`ai_provider_transport.call_json`
-只检查 api_key / base_url / model，**不看** `enabled`。gate 必须长在
-`strategy_ai_candidate_service` 上（它可以被 CLI / R36 / scheduler 直接调用），规则复用
-`ai_review_service.slot_readiness`（不复制第二套语义）；route 只解析槽位、读取配置并把
-service 的稳定 reason 映射成 HTTP 状态码（未就绪 409，未知槽位 400）。
+```text
+provider_config.slot
+        ↓ AIReview.resolve_slot()       ← 既有 authority：ai1 / ai2；legacy alias 归一
+canonical slot（ai1 / ai2），未知即 fail closed
+        ↓ AIReview.slot_readiness()     ← 既有 authority：凭据 → 启用 → 地址 → 模型
+        ↓ 产出的 canonical 配置被下游**全程复用**
+provider 调用 + model_identity
+```
 
-provider / model provenance 记录 **canonical 槽位身份 + model**：
+只把 readiness 放 route 等于"绕过 route 时禁用形同不存在"；只把 slot 归一放 route 更
+隐蔽：service 直调时 `"AI1"` / `" mimo "` / `"mimo"` / `"deepseek"` 会被**原样持久化**
+进 proposal provenance，同一槽位在事件身份里裂成多种字符串。route 只解析配置并把
+service 的稳定 reason 映射成 HTTP 状态码（未就绪 409
+`provider_slot_not_ready:<reason>`，无法归一的槽位 400 `provider_slot_not_recognised`）。
+
+provider / model provenance 由此记录 **canonical 槽位身份 + model**：
 
 ```text
 model_identity.provider = ai1 / ai2      （canonical slot，不是厂商名）
@@ -269,6 +278,10 @@ model_identity.model    = <provider 自报 model>
 `ai1` 与 `ai2` 可能配同一个 model：只记 model 时"哪个 provider 提出的"在台账上无法
 回答，`generation_input_fingerprint` 也会被抹平。`MODEL_IDENTITY_KEYS` 本来就允许
 `provider`，所以不需要新 schema。
+
+`research_run_id` 接受**规范十进制**，且 `int` 与字符串是**同一契约**：HTTP 给字符串，
+CLI / 内部可直接给 `int`（台账主键本来就是整数）。此前"helper 接受 int、service 外层
+str-only gate"的内部不一致已收口。
 
 前端 `wbAiCandidateHtml()` 只做最小能力：输入 exact research run、显式点击生成、渲染
 `research_run_id` / `hypothesis_id` / research record hash / provider model / parent pin /
@@ -285,12 +298,13 @@ inline handler 必须挂到 `window`（`frontend/src/bridge.js` 的 `window.wbAi
 ## 19. 测试
 
 ```text
-backend/test_r35c_ai_candidate_generation.py    C1–C18 契约（63 tests）
+backend/test_r35c_ai_candidate_generation.py    C1–C18 契约（66 tests）
 backend/test_r35c_ai_candidate_http.py          HTTP 契约（11 tests）
-                                                R35-C 合计 74 tests
-backend full suite (local, Python 3.14.5)       Ran 5467 tests  OK (skipped=5)
+                                                R35-C 合计 77 tests
+backend full suite (local, Python 3.14.5)       Ran 5470 tests  OK (skipped=5)
 frontend (node --test)                          174 tests  pass 0 fail
 ruff check backend / compileall -q backend / git diff --check   all clean
+security leak scan (worktree + history)         kinds: none, values: 0
 ```
 backend/test_r35a_strategy_candidate.py         R35-A 回归
 backend/test_r35b_candidate_expansion.py        R35-B 回归
@@ -348,8 +362,10 @@ reason，并由 C7c 逐个遍历禁止集合钉住。
 | P2 | 畸形 `parameter_variants`（数字 / 字符串）让 `len()` / `.items()` 抛裸 `TypeError` / `AttributeError`，穿透契约变成 5xx | 形状**先于**度量验证 | `test_malformed_parameter_variants_fail_closed_not_typeerror` / M-AIG13 |
 | P2 | 损坏 research 行抛 `ResearchPersistenceError`（`ValueError` 子类）穿透成 5xx | 在服务边界翻译成 `research_not_supported` | `test_corrupt_research_record_is_translated_at_the_service_boundary` / M-AIG14 |
 | P2 | 切换策略后仍显示上一条策略的 AI 批次（把 A 的台账冒充成 B 的） | 批次按 strategy id 记账 | `strategy-candidates.test.mjs` R35C-C6 |
-| **P2** | run id **不是**规范十进制：`" 7"` / `"7 "` / `"007"` 被 `strip()` 后悄悄解析成 7；若 7 恰好不存在，回归会以"查无此行"**假绿**通过 | 只接受 `[1-9][0-9]*`（或 `int > 0`），形状拒绝发生在读账本之前 | `test_c1b…` / `test_c1b3…` / M-AIG15 |
-| **P2** | `model_identity` 只记 `model`：`ai1` 与 `ai2` 配同一 model、提出相同 proposal 时无法回答"哪个 provider 提出的"，`generation_input_fingerprint` 被抹平 | 记录 `{"provider": <canonical slot>, "model": …}` | `test_c12c…` / `test_c12d…` / M-AIG16 |
+| **P2** | service 直调时不归一也不校验 provider slot：`"evil-provider"` 被接受并真的发起付费调用；`"AI1"` / `" mimo "` / `"mimo"` / `"deepseek"` 被**原样持久化**进 provenance，同一槽位裂成多种字符串 | service 的 provider-config gate 同时做 canonical slot + readiness，canonical 配置复用到 readiness / provider 调用 / model identity | `ProviderReadinessTests`（3 条新）/ M-AIG16 |
+| **P2** | `research_run_id` 内部契约不一致：helper 接受 `int`，service 外层却 str-only | 两条路径统一为同一契约（HTTP 给字符串，CLI / 内部可给 `int`） | `test_c1b2_canonical_run_id_and_ints_are_accepted` |
+| P2 | run id **不是**规范十进制：`" 7"` / `"7 "` / `"007"` 被 `strip()` 后悄悄解析成 7；若 7 恰好不存在，回归会以"查无此行"**假绿**通过 | 只接受 `[1-9][0-9]*`（或 `int > 0`），形状拒绝发生在读账本之前 | `test_c1b…` / `test_c1b3…` / M-AIG15 |
+| P2 | `model_identity` 只记 `model`：`ai1` 与 `ai2` 配同一 model、提出相同 proposal 时无法回答"哪个 provider 提出的"，`generation_input_fingerprint` 被抹平 | 记录 `{"provider": <canonical slot>, "model": …}` | `test_c12c…` / `test_c12d…` / M-AIG16 |
 
 第一条与本仓库 R27-B2B 修过的缺陷是**同一个形状**（`deepseek_advisor` 的注释里明确写了
 "被禁用的槽位必须在交给 transport 之前拦下"）。第一版我把 gate 放在 route，等于只在
