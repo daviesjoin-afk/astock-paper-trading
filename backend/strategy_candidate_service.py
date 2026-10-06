@@ -25,6 +25,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+from collections.abc import Mapping
 
 import strategy_candidate as SC
 import strategy_candidate_repository as SCRepo
@@ -43,7 +44,8 @@ def _canonical(value) -> str:
 
 
 def generation_batch_identity(*, search_space: SS.CandidateSearchSpace,
-                              candidate_count: int) -> dict:
+                              candidate_count: int,
+                              extra_material: Mapping | None = None) -> dict:
     """Freeze one generation request's identity and input fingerprint（§19/§20）.
 
     Two identities again, same pattern as candidate vs proposal:
@@ -60,15 +62,28 @@ def generation_batch_identity(*, search_space: SS.CandidateSearchSpace,
     ``batch_id`` 是**请求身份**，不是候选身份：同一个 candidate 可以出现在不同
     batch，反过来两个内容完全相同的请求也是两次独立的请求事件（input fingerprint
     相同，batch identity 不同）。batch identity 绝不进 candidate fingerprint。
+
+    §33：``search_space_fingerprint`` 本身对人工审计还不够 —— 它只能告诉你"是不是这个
+    空间"，不能告诉你"这个空间具体长什么样"。因此 batch 同时持久化
+    ``search_space_material``（canonical search-space 投影 + 调用方附带的额外材料），
+    并保持它落在 ``generation_input_fingerprint`` 之内，所以
+    ``hash(canonical(material)) == search_space_fingerprint`` 永远可重算校验。
+    R35-A/R35-B 早期写入的历史 batch 没有完整 material，保持 legacy 状态、**不回填**，
+    也不凭 candidate 反推旧搜索空间。
     """
     if not isinstance(search_space, SS.CandidateSearchSpace):
         raise StrategyCandidateUnavailable("canonical_candidate_search_space_is_required")
+    search_space_material = {
+        "search_space": search_space.projection(),
+        "extra": dict(extra_material or {}),
+    }
     material = {
         "generation_contract_version": SG.GENERATOR_CONTRACT_VERSION,
         "generator_type": search_space.generator_type,
         "generator_version": search_space.generator_version,
         "search_space_contract_version": search_space.search_space_contract_version,
         "search_space_fingerprint": search_space.fingerprint,
+        "search_space_material": search_space_material,
         "parent_pin": dict(search_space.parent_pin.identity),
         "asof": search_space.asof,
         "research_provenance": SS._thaw(search_space.research_provenance or {}),
@@ -92,8 +107,27 @@ def generation_batch_identity(*, search_space: SS.CandidateSearchSpace,
         "parent_strategy_checksum": search_space.parent_pin.strategy_checksum,
         "asof": search_space.asof,
         "candidate_count": int(candidate_count),
+        "search_space_material": search_space_material,
         "material": material,
     }
+
+
+def verify_batch_search_space_material(batch: Mapping) -> bool:
+    """Re-derive the search-space fingerprint from the persisted batch material.
+
+    ``search_space_fingerprint`` 只是"是不是这个空间"的承诺；能**重算**并对上，
+    才是可审计。历史 R35-A/R35-B batch 没有 ``search_space_material``，返回 ``False``
+    —— legacy 状态保持 unknown，**不**回填、也不凭 candidate 反推旧搜索空间。
+    """
+    material = batch.get("search_space_material") if isinstance(batch, Mapping) else None
+    space = material.get("search_space") if isinstance(material, Mapping) else None
+    if not isinstance(space, Mapping):
+        return False
+    try:
+        return hashlib.sha256(_canonical(space).encode("utf-8")).hexdigest() == str(
+            batch.get("search_space_fingerprint"))
+    except (TypeError, ValueError):
+        return False
 
 
 def pin_parent_strategy(conn: sqlite3.Connection, *, strategy_id: str,
@@ -200,6 +234,7 @@ def generate_and_record_candidates(
     evidence_count: int | None = None, hypothesis_id: str | None = None,
     research_provenance=None, random_seed: int | None = None,
     model_identity=None, constraints=None, created_at: str | None = None,
+    search_space_material: Mapping | None = None,
 ) -> dict:
     """Expand one explicit bounded search space and record the batch + proposals.
 
@@ -229,7 +264,8 @@ def generate_and_record_candidates(
         random_seed=random_seed, model_identity=model_identity, constraints=constraints)
     candidates = SG.generate_candidates(search_space)
     batch = generation_batch_identity(search_space=search_space,
-                                      candidate_count=len(candidates))
+                                      candidate_count=len(candidates),
+                                      extra_material=search_space_material)
     SCRepo.record_generation_batch(conn, batch=batch, created_at=created_at)
     # proposal 事件的 provenance 全部取自 **search space / batch 的显式事实**，
     # 绝不再从 candidate 反推：candidate 是内容身份，不携带 provenance。
@@ -386,6 +422,18 @@ def _with_paper_connection(work, *, immediate: bool = False):
     PT.init_db()
     with PT._db(immediate=immediate) as conn:
         return work(conn)
+
+
+def paper_connection(*, immediate: bool = False):
+    """A short-lived paper DB connection context (R35-C 网络边界使用)。
+
+    R35-C 必须在网络调用**前后各开一次**短连接：LLM 可能要几十秒，绝不能拿着
+    SQLite 写锁等它返回。这里只提供连接生命周期，不改变任何 authority —— 里面的
+    读 / 写函数仍然是 connection-explicit 的那些。
+    """
+    import paper_trading as PT
+    PT.init_db()
+    return PT._db(immediate=immediate)
 
 
 def capture_strategy_candidates(strategy_id: str, **kwargs) -> dict:

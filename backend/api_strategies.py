@@ -36,6 +36,10 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import ValidationError
 
+import ai_review_service as AIReview
+import strategy_ai_candidate_service as SAICS
+import strategy_ai_proposal as SAIP
+import strategy_ai_provider as SAIPR
 import strategy_api_models as Models
 import strategy_candidate as SC
 import strategy_candidate_repository as SCRepo
@@ -99,6 +103,40 @@ def _raise_workflow_http(exc: ValueError) -> None:
     elif any(token in reason for token in (
             "mismatch", "changed", "stale", "conflict", "already", "not_pending",
             "required", "no_executable", "invalid_lifecycle_transition")):
+        status = 409
+    else:
+        status = 400
+    raise HTTPException(status_code=status, detail=reason) from exc
+
+
+def _raise_ai_candidate_http(exc: ValueError) -> None:
+    """R35-C 拒绝的 HTTP 映射（永远不是 5xx）。
+
+    刻意**先**给 AI 生成边界自己的稳定 reason 分类，再退回通用规则：
+
+    * ``research_run_not_found`` → 404（调用方给的 exact run 不存在）
+    * ``research_not_supported`` / ``research_is_not_authoritative`` /
+      ``research_as_of_mismatch`` → 409（历史 research 与本次请求不自洽）
+    * ``ai_candidate_cap_exceeded`` → 400（请求自身越界，不是身份冲突）
+    * provider 协议 / transport 失败 → 502（上游不可用或返回非法协议，而非客户端错误）
+    * 其余（search space 被 R35-B 拒绝、候选契约不符）→ 400
+
+    这条路径**不**返回 5xx：它要么给出一个可验证的候选批次，要么明确拒绝。
+    """
+    reason = str(getattr(exc, "reason", "") or exc)
+    if reason == SAICS.REASON_RESEARCH_NOT_FOUND or "not_found" in reason:
+        status = 404
+    elif reason in (SAICS.REASON_AI_CANDIDATE_CAP, SAIP.Reason.SEARCH_SPACE_REJECTED,
+                    SAIP.Reason.NO_VARIATION, SAIP.Reason.RESOURCE_LIMIT,
+                    SAIP.Reason.INVALID_PROPOSAL_SHAPE):
+        status = 400
+    elif reason in (SAIPR.REASON_TRANSPORT, SAIPR.REASON_INVALID_PROVIDER_RESPONSE):
+        # 上游不可用 / 返回非法协议：是网关侧问题，不是客户端请求错。
+        status = 502
+    elif reason in (SAICS.REASON_RESEARCH_UNSUPPORTED, SAICS.REASON_RESEARCH_AUTHORITY,
+                    SAICS.REASON_ASOF_MISMATCH):
+        status = 409
+    elif any(token in reason for token in ("mismatch", "unavailable", "conflict")):
         status = 409
     else:
         status = 400
@@ -515,6 +553,48 @@ def get_strategy_candidate(strategy_id: str, candidate_id: str):
         # 页面身份与候选身份必须一致，否则就是把 A 的候选显示成 B 的。
         _raise_candidate_http(SC.CandidateValidationError("candidate_strategy_mismatch"))
     return result
+
+
+@router.post("/{strategy_id}/candidate-generations/ai", status_code=201)
+def generate_ai_strategy_candidates(
+    strategy_id: str, payload: Models.StrategyAICandidateGenerateRequest | None = None,
+):
+    """提出一个受约束的候选搜索空间并确定性展开成候选（R35-C）。
+
+    链路：exact canonical R27 research run → AI bounded proposal → R35-B search space
+    → R35-B deterministic generator → candidate / proposal / batch ledgers。
+
+    route 只做四件事：typed 请求、provider 配置解析、调用 orchestration service、
+    错误映射。**不**在这里做 research 资格 gate、parent 查找、prompt 组装、AST 校验、
+    候选展开或 DB 写入。
+
+    AI 只提出 search space。candidate identity、evaluation、ranking、promotion 都不在
+    这条路径上：``supported`` research 只意味着"允许产生研究候选"，不意味着策略可用。
+    """
+    request = _coerce(Models.StrategyAICandidateGenerateRequest, payload)
+    try:
+        # provider 配置复用既有槽位 authority（``ai_review_service``）：不新增
+        # STRATEGY_AI_API_KEY 之类的第二套配置系统，客户端也无法提交任何凭据。
+        with SCV.paper_connection() as conn:
+            provider_config = AIReview.get_slot_config(
+                conn, request.provider_slot or AIReview.AI_SLOTS[0])
+        return SAICS.generate_candidates_from_research(
+            research_reader=SCV.paper_connection,
+            writer=lambda: SCV.paper_connection(immediate=True),
+            provider_config=provider_config,
+            research_run_id=request.research_run_id,
+            strategy_id=strategy_id,
+            strategy_version=request.strategy_version,
+            strategy_checksum=request.strategy_checksum,
+            asof=request.asof,
+            universe_spec=request.universe_spec,
+            intended_market_regime=request.intended_market_regime,
+            max_candidates=request.max_candidates)
+    except (SAICS.AICandidateGenerationError, SAIPR.AIProviderError,
+            SCV.StrategyCandidateUnavailable, SC.CandidateValidationError,
+            SG.StrategyGeneratorError,
+            SCRepo.StrategyCandidateRepositoryError) as exc:
+        _raise_ai_candidate_http(exc)
 
 
 @router.get("/{strategy_id}/candidate-generations/{batch_id}")

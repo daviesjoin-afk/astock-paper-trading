@@ -139,17 +139,16 @@ MUTATIONS = [
          "test_b9_same_semantics_across_generators_dedup_to_one_candidate",
      ]},
     # M-X6 —— generation input fingerprint 不再绑定 frozen input（parent pin +
-    # search-space 指纹）。§20 要求 batch 能回答"这一批候选是从什么输入生成的"，
-    # 丢掉这两项之后不同输入会得到同一个 input fingerprint。
+    # search-space 指纹 + canonical search-space material）。§20 要求 batch 能回答
+    # "这一批候选是从什么输入生成的"；这三项是全部的绑定来源，全部丢掉之后不同输入
+    # 会得到同一个 input fingerprint。
     {"id": "M-X6",
      "semantic": "the generation input fingerprint stops binding the frozen input",
      "edits": [(SERVICE,
-                '        "search_space_contract_version": '
-                'search_space.search_space_contract_version,\n'
                 '        "search_space_fingerprint": search_space.fingerprint,\n'
+                '        "search_space_material": search_space_material,\n'
                 '        "parent_pin": dict(search_space.parent_pin.identity),\n',
-                '        "search_space_contract_version": '
-                'search_space.search_space_contract_version,\n')],
+                '        # mutated: every frozen-input binding field removed\n')],
      "detectors": [
          "test_r35b_candidate_expansion.GenerationBatchTests."
          "test_b10b_generation_input_fingerprint_is_content_bound",

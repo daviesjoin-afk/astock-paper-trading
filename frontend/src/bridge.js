@@ -13,7 +13,7 @@ import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPape
 import { applyPaperRiskAuditFilter, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
 import { cancelManualDataUpdate, choosePaperStrategy, chooseStrategy, filterSelectionEvaluationRows, loadDataValidity, loadPaperSelection, loadSelectionEvaluation, refreshSelectionEvaluation, runPaperSelection, showSelectionValidation, startFactorIncrementalUpdate, startInit, startManualDataUpdate, trackRemove } from "./features/selection.js";
 import { clearAiSlotKey, clearOperatorTab, resetSettingsSection, saveAiReviewMode, saveAiSlot, saveSettingsSection, setSettingsSection, testAiSlot, unlockOperatorTab } from "./features/settings.js";
-import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbApplyPromotionProposal, wbBackToList, wbCloneFirstBuiltin, wbCloneStrategy, wbCreatePromotionProposal, wbDeleteDraft, wbLoadChallengerReport, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateDraft } from "./features/strategies.js";
+import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbAiGenerateCandidates, wbApplyPromotionProposal, wbBackToList, wbCloneFirstBuiltin, wbCloneStrategy, wbCreatePromotionProposal, wbDeleteDraft, wbLoadChallengerReport, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateDraft } from "./features/strategies.js";
 
 window.activatePage = activatePage;
 window.adaptiveEsc = adaptiveEsc;
@@ -104,6 +104,7 @@ window.trackRemove = trackRemove;
 window.triggerEvolution = triggerEvolution;
 window.verifyExecutionOrder = verifyExecutionOrder;
 window.wbAddCondition = wbAddCondition;
+window.wbAiGenerateCandidates = wbAiGenerateCandidates;
 window.wbApplyPromotionProposal = wbApplyPromotionProposal;
 window.wbBackToList = wbBackToList;
 window.wbCloneStrategy = wbCloneStrategy;

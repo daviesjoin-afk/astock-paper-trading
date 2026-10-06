@@ -1283,7 +1283,9 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
             ["ai_analysis.py", "ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
              "ai_research_portfolio_adapter.py", RESEARCH_MODULE, REPOSITORY_MODULE,
              RUNTIME_ADAPTER_MODULE, STRATEGY_ADAPTER_MODULE,
-             "deepseek_advisor.py", "deepseek_research.py"],
+             "deepseek_advisor.py", "deepseek_research.py",
+             # R35-C：AI candidate generation 只读 canonical research ledger。
+             "strategy_ai_candidate_service.py"],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",
         )
 

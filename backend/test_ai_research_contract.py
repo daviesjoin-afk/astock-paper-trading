@@ -173,6 +173,14 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     #: 后续 convergence）。
     "ai_research_runtime_adapter.py",
     "ai_analysis.py",
+    #: R35-C 新增**第十个**：``strategy_ai_candidate_service`` —— AI candidate
+    #: generation 的 orchestration boundary。它**只读** canonical research ledger
+    #: （``ai_research_repository.get_run``）与 ``ResearchHypothesis.HYPOTHESIS_SUPPORTED``
+    #: 这一个 canonical status 常量。它**不**签发 evidence ref（那是 owner adapter 的
+    #: 权力）、**不**重算 research status、**不**新建第二套 research DB / provider
+    #: transport。资格 gate 只看 ``supported``，confidence 不参与 —— 因此它不是把
+    #: research 升级成交易 authority 的接缝，而是"研究允许产生哪些候选"的下游。
+    "strategy_ai_candidate_service.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。

@@ -50,7 +50,7 @@ export var WB_INDICATOR_LABELS={ma:'均线 MA',ema:'指数均线 EMA',rsi:'RSI',
 
 export var WB_STATUS_BADGES={draft:['DRAFT','strategy-status-draft'],candidate:['CANDIDATE','strategy-status-validated'],research:['RESEARCH','strategy-status-validated'],validated:['VALIDATED','strategy-status-validated'],shadow:['SHADOW','strategy-status-draft'],paper:['PAPER','strategy-status-active'],production_sim:['PRODUCTION_SIM','strategy-status-active'],degraded:['DEGRADED','strategy-status-paused'],paused:['PAUSED','strategy-status-paused'],retiring:['RETIRING','strategy-status-paused'],archived:['ARCHIVED','strategy-status-archived'],rejected:['REJECTED','strategy-status-archived'],validation_failed:['VALIDATION_FAILED','strategy-status-archived'],quarantined:['QUARANTINED','strategy-status-paused']};
 
-export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder',challengerReportId:''};
+export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder',challengerReportId:'',pinnedCandidatePin:null,aiCandidateView:null};
 
 export async function loadStrategyWorkbench(force){
   var target=$('wbList'); if(!target) return;
@@ -804,6 +804,50 @@ export function wbGenerationBatchHtml(batch){
     +'<p class="strategy-candidate-note">batch 只记录生成输入；候选优劣由后端 contract 发布，本页不判断。</p>'
     +'</article>';
 }
+/* R35-C：AI candidate generation 面板 —— **最小能力**。
+   它只做三件事：输入 exact research run、发起生成、渲染后端返回的台账事实。
+   刻意**不**做：AI 推荐策略 / 最佳策略 / 最优参数 / 预计收益 / AI Score / 一键上线 /
+   Promote / Deploy。候选优劣与晋级结论由后端 contract 发布；还没有 evaluation，
+   前端就绝不能自己"推荐"。
+
+   面板也不自动触发：必须由人显式点击。scheduler / cron / on-every-research-run 的
+   自动批量搜索属于 R36。 */
+export function wbAiCandidateHtml(strategyId, view){
+  var batch=(view&&view.batch)||null;
+  var result='';
+  if(batch){
+    var candidates=(batch.candidate_ids||[]).map(function(id){
+      return '<li data-testid="ai-candidate-id"><code>'+adaptiveEsc(String(id))+'</code></li>';
+    }).join('');
+    var provenance=(batch.research_provenance||{});
+    result='<div data-testid="ai-candidate-result">'
+      +'<dl class="strategy-preview-grid">'
+      +'<dt>Generation batch</dt><dd data-testid="ai-batch-id"><code>'+adaptiveEsc(String(batch.generation_batch_id||''))+'</code></dd>'
+      +'<dt>Candidate count</dt><dd data-testid="ai-candidate-count">'+adaptiveEsc(String(batch.candidate_count||0))+'</dd>'
+      +'<dt>Parent pin</dt><dd data-testid="ai-parent-pin">'+adaptiveEsc(String((batch.parent_strategy_pin||{}).strategy_id||''))
+      +' @ v'+adaptiveEsc(String((batch.parent_strategy_pin||{}).strategy_version||''))
+      +' · <code>'+adaptiveEsc(String((batch.parent_strategy_pin||{}).strategy_checksum||''))+'</code></dd>'
+      +'<dt>Search space</dt><dd data-testid="ai-search-space"><code>'+adaptiveEsc(String(batch.search_space_fingerprint||''))+'</code></dd>'
+      +'<dt>Generation input</dt><dd data-testid="ai-input-fingerprint"><code>'+adaptiveEsc(String(batch.generation_input_fingerprint||''))+'</code></dd>'
+      +'<dt>Research run</dt><dd data-testid="ai-research-run">'+adaptiveEsc(String(provenance.source_identity||''))
+      +(provenance.hypothesis_id?' · '+adaptiveEsc(String(provenance.hypothesis_id)):'')+'</dd>'
+      +'<dt>Research record hash</dt><dd data-testid="ai-research-record-hash"><code>'+adaptiveEsc(String(provenance.source_fingerprint||''))+'</code></dd></dl>'
+      +(candidates?'<ul data-testid="ai-candidate-ids">'+candidates+'</ul>':'')
+      +'<p class="strategy-candidate-note">以上全部是后端台账事实。本页不评估候选、不排序、不推荐，'
+      +'也不提供上线入口：候选能否晋级由后端 evaluation / promotion authority 决定。</p></div>';
+  }
+  return '<h4>AI research → 受约束候选</h4>'
+    +'<p>输入 <b>exact</b> R27 canonical research run id。AI 只提出一个有界的 search space，'
+    +'候选身份与展开由 R35-B 确定性契约决定；AI 不选择 parent、不控制 universe / regime / constraints、'
+    +'不声明评分或晋级。</p>'
+    +'<div class="strategy-ai-candidate-form">'
+    +'<label>Exact research run id<input id="wbAiResearchRun" data-testid="ai-research-run-input" autocomplete="off"></label>'
+    +'<label>Provider slot<select id="wbAiProviderSlot" data-testid="ai-provider-slot">'
+    +'<option value="">默认槽位</option><option value="ai1">ai1</option><option value="ai2">ai2</option></select></label>'
+    +'<label>Max candidates（≤ 32）<input id="wbAiMaxCandidates" data-testid="ai-max-candidates" type="number" min="1" max="32" value="32"></label>'
+    +'<button type="button" data-testid="ai-generate" onclick="wbAiGenerateCandidates()">生成 AI 候选</button></div>'
+    +'<div data-testid="ai-candidate-panel">'+(result||'<p>尚未发起生成。</p>')+'</div>';
+}
 export function wbCandidatesHtml(strategyId,view){
   var rows=((view&&view.items)||[]).map(function(item){
     // 每一项是 {candidate, persistence, proposal_evidence}：created_at 属于台账，
@@ -824,6 +868,50 @@ export function wbCandidatesHtml(strategyId,view){
     +'<div data-testid="strategy-candidates">'+(rows||'<p>该 exact version 尚无候选记录。</p>')+'</div>';
 }
 
+export async function wbAiGenerateCandidates(){
+  // R35-C：**显式**人工触发 —— 没有 scheduler、没有 cron、没有"每次研究自动生成"。
+  var runInput=$('wbAiResearchRun'), slotInput=$('wbAiProviderSlot'), capInput=$('wbAiMaxCandidates');
+  var researchRunId=String((runInput&&runInput.value)||'').trim();
+  if(!researchRunId){ toast('必须显式提供 exact research run id', true); return; }
+  var strategyId=WB_STATE.editingId, pinned=WB_STATE.pinnedCandidatePin||{};
+  if(!strategyId||!pinned.strategy_checksum){ toast('缺少已 pin 的父策略版本', true); return; }
+  var body={
+    strategy_version:pinned.strategy_version,
+    strategy_checksum:pinned.strategy_checksum,
+    research_run_id:researchRunId,
+    // asof / universe_spec / intended_market_regime 刻意都不传：
+    // as-of 由后端采纳 exact research run 自己的业务日；universe / regime 从 exact
+    // pinned parent 继承。前端无从知道这些事实，自己填一个就等于让前端制造它们 ——
+    // 而 AI 路径本来就不开放对这三者的控制。
+    max_candidates:Number((capInput&&capInput.value)||32),
+  };
+  if(slotInput&&slotInput.value) body.provider_slot=slotInput.value;
+  try{
+    var result=await apiPostJson(
+      '/api/strategies/'+encodeURIComponent(strategyId)+'/candidate-generations/ai', body);
+    // provenance 不在生成响应里，而在 batch / proposal 台账上。**按显式 batch id** 读
+    // 那一条，绝不请求"最新一批"。
+    var batchView=null, batchId=result.generation_batch_id;
+    if(batchId){
+      try{
+        batchView=await api('/api/strategies/'+encodeURIComponent(strategyId)
+          +'/candidate-generations/'+encodeURIComponent(batchId));
+      }catch(e){}
+    }
+    var provenance={};
+    var proposals=(batchView&&batchView.proposals)||[];
+    if(proposals.length&&proposals[0].research_provenance){
+      provenance=proposals[0].research_provenance;
+    }
+    WB_STATE.aiCandidateView=Object.assign({},result,{research_provenance:provenance});
+  }catch(e){
+    toast(String((e&&e.message)||'AI 候选生成被拒绝'), true);
+    return;
+  }
+  // 生成后重新读候选台账，使确认过的候选立刻出现在只读列表里。
+  await wbOpenDetail(strategyId);
+}
+
 export async function wbOpenDetail(strategyId){
   var item;
   try{ item=await api('/api/strategies/'+encodeURIComponent(strategyId)+'?_='+Date.now()); }
@@ -838,6 +926,8 @@ export async function wbOpenDetail(strategyId){
   // R35-A：候选台账只按 **exact** version + checksum 读，绝不查 head / latest。
   var pinnedVersion=lifecycle.version||item.version||item.current_version||1;
   var pinnedChecksum=lifecycle.checksum||item.current_checksum||'';
+  // R35-C 的 AI 路径同样只认这个已 pin 的版本：AI 无权选择 parent。
+  WB_STATE.pinnedCandidatePin={strategy_version:pinnedVersion,strategy_checksum:pinnedChecksum};
   if(pinnedChecksum){
     try{
       candidatesView=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/candidates'
@@ -914,6 +1004,7 @@ export async function wbOpenDetail(strategyId){
     +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有 promotion transition 可用。</small>')+'</div>'
     +'<h4>Promotion proposals</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无 proposal。</p>')+'</div></section>'
     +'<section class="strategy-challenger-workspace" data-testid="challenger-workspace">'+wbChallengerHtml(strategyId,challengerView)+'</section>'
+    +'<section class="strategy-ai-candidate-workspace" data-testid="ai-candidate-workspace">'+wbAiCandidateHtml(strategyId,WB_STATE.aiCandidateView)+'</section>'
     +'<section class="strategy-candidate-workspace" data-testid="candidate-workspace">'+wbCandidatesHtml(strategyId,candidatesView)+'</section>'
     +'<div class="strategy-detail-columns"><section><h4>运行时摘要</h4><dl class="strategy-preview-grid">'
     +'<dt>ID</dt><dd>'+adaptiveEsc(item.id)+'</dd><dt>来源</dt><dd>'+(item.origin==='user'?'自定义':'内置')+'</dd>'

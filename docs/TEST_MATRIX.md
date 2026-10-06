@@ -799,3 +799,77 @@ migration v34 的重建条件是"存在任何 **v1 遗留列**"（`STRATEGY_CAND
 `created_at`，`proposals[-1]` 只是一个稳定但语义错误的"latest"。要看某个 batch 的完整
 输入，用显式的 `GET .../candidate-generations/{batch_id}`。B10d 覆盖。
 
+## R35-C — AI Hypothesis → Constrained Candidate Generation
+
+三个身份层的延续：**AI proposal 不是 candidate**。
+
+```text
+R27 canonical research run（exact id）
+        ↓ strict gate（authority=research / is_authoritative=false / status=supported）
+AI bounded proposal（只是 search-space declaration）
+        ↓ R35-B CandidateSearchSpace → R35-B generator
+StrategyCandidate[]（既有 candidate / proposal / batch 三张表，零新表）
+```
+
+复用 R27（`ai_research_contract` / `ai_research_repository` / `ai_provider_transport`）
+与既有 `ai_review_service` 槽位配置。R27 的 **consumer allowlist 是有意识的决定**：
+`ALLOWED_AI_CONSUMERS` 与 `test_ai_provider_transport.test_RG_05` 本轮显式登记
+`strategy_ai_candidate_service.py`。
+
+| 契约 | 测试 |
+|---|---|
+| C1 exact research run only（无 latest fallback；非数字 / 负数 id 拒绝） | `ExactResearchRunTests` |
+| C2 unsupported / insufficient 在 provider **之前**拒绝（provider calls = 0） | `ResearchGateTests.test_c2`、`test_c2b` |
+| C3 confidence 不参与资格（0.1 与 0.9 结论相同；源码无阈值） | `test_c3`、`test_c3b` |
+| C4 asof 必须等于 research run as_of；省略则采纳 run 自身业务日 | `AsofPinningTests` |
+| C5 AI 不能选 parent | `NoProviderAuthorityTests.test_c5` |
+| C6 AI 不能控制 constraints / universe / regime / asof | `test_c6` |
+| C7 权威与评分字段拒绝；越权字段与未知字段 reason 可区分 | `test_c7`、`test_c7b`、`test_c7c` |
+| C8 非法 DSL / 自由源码拒绝 | `ProposalShapeTests.test_c8`、`test_c8b` |
+| C9 非法参数由既有 parameter schema 拒绝（无第二套 validator） | `test_c9`、`test_c9b` |
+| C10 AI cap 32：超限 reject 不截断；请求上限不得放宽；资源上界显式 | `CandidateCapTests` |
+| C11 no-op proposal 拒绝（`absent` 算变化） | `NoOpProposalTests` |
+| C12 跨 model 同语义仍 dedup，各自保留 model provenance | `CrossModelDedupTests` |
+| C13 provenance 精确绑定 exact run + `record_hash`；换 run 改变 input fingerprint | `ResearchProvenanceTests` |
+| C14 网络调用不占 SQLite 写事务 | `test_c14` |
+| C15 provider 失败零写入（且不重算旧候选） | `test_c15`、`test_c15b` |
+| C16 写失败整批 rollback | `test_c16` |
+| C17 batch 持久化 canonical search space 可自验；篡改不通过；legacy 保持 unknown | `BatchAuditabilityTests` |
+| C18 无 authority 依赖 / 无第二套 transport / 零新 AI 表 / 无新增 facade；research 文本声明为数据 | `AuthorityBoundaryTests` |
+| evidence_count 由 R27 派生、AI 不得自述、进 input fingerprint | `EvidenceCountTests` |
+| model identity 是 candidate-proposal provider，与 research run model 不混用 | `ProviderProtocolTests` |
+| HTTP 契约：请求更窄、凭据不落库、拒绝映射稳定、route 无业务逻辑 | `test_r35c_ai_candidate_http.py` |
+
+前端 AI 面板的 inline handler 必须挂到 `window`（`frontend/src/bridge.js`）——
+`test_frontend_module_contract.BridgeCoverageTests` 在完整套件里抓到过一次
+`wbAiGenerateCandidates` 未 bridged：那种按钮在浏览器里会**静默失效**。
+
+### R35-C semantic mutation results
+
+`work/r35c_ai_candidate_mutation_check.py`：M-AIG1…M-AIG10（含 M-AIG5b）全部
+**DETECTED**；`survived=0`、`fake=0`、`timeout=0`、`restore SHA256=PASS`、
+恢复后基线 GREEN。
+
+ID 前缀 **M-AIG** 刻意避开 R34-B allocation 的 `M-B1`…`M-B20`、R35-A 的 `M-G`、
+R35-B 的 `M-X`。
+
+| ID | Semantic mutation | Detector |
+|---|---|---|
+| M-AIG1 | exact research run id 退化成 recent run | C1 |
+| M-AIG2 | 移除 supported gate（坏输入也触发付费调用） | C2 |
+| M-AIG3 | confidence 被升级成资格阈值 | C3 |
+| M-AIG4 | candidate asof 不再与 research run 钉死 | C4 |
+| M-AIG5 | provider 可声明 risk / universe / regime / asof | C6 |
+| M-AIG5b | provider 可选择 parent strategy | C5 |
+| M-AIG6 | 未知 provider 字段被静默忽略 | C7b / C7 |
+| M-AIG7 | 超 AI cap 时截断而非拒绝 | C10 |
+| M-AIG8 | provenance 不再绑定 exact research `record_hash` | C13 |
+| M-AIG9 | 接受 no-op proposal | C11 |
+| M-AIG10 | proposal model identity 被替换成 research model | ProviderProtocolTests |
+
+**M-AIG5/M-AIG5b 曾经 SURVIVED，暴露一个真实缺陷**：`FORBIDDEN_PROVIDER_FIELDS`
+当时是**装饰性**的 —— 其中每个字段同时也不在 `_ALLOWED_TOP_LEVEL` 里，因此
+"AI 试图声明越权字段"与"协议漂移"都落到同一个 `unknown_proposal_field`。现在两者
+给出不同 reason（`invalid_proposal_field` / `unknown_proposal_field`），C7c 逐个遍历
+禁止集合把它钉住，使该集合成为**承载语义**的边界。
+
