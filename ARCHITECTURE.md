@@ -3726,8 +3726,14 @@ model）都属于 proposal 事件与 generation batch，**不**属于 candidate 
 同一份 canonical specification 由 `factor_variant` 与 `bounded_combination` 分别
 提出、或由 GPT model A 与 model B 分别提出时，必须得到**同一个** `candidate_id`
 （候选行 1 条、proposal 事件 2 条）。只移走前者、后者仍留在内容里，等于把身份分裂的
-成因换成另一种，因此这是**形状级**的 ownership 转移：v2 candidate 的投影与内容身份
-都不携带这些键，读路径看到就 fail closed，v1 历史行按自己的旧材料自证。
+成因换成另一种，因此这是**形状级**的 ownership 转移，并且贯穿到持久化：v2 candidate 的
+投影与内容身份都不携带这些键，读路径看到就 fail closed，v1 历史行按自己的旧材料自证。
+
+候选表也必须是**纯内容持久化**：v2 `strategy_candidates` 不含任何 generation
+provenance 列（`hypothesis_id` / `random_seed` 已移除），`append_candidate()` 同样不写。
+留着会形成"`candidate_json` 里没有、独立列里有"的两套互相矛盾事实，而读路径只读
+`candidate_json` —— 那些隐藏值写进去就再也读不出来，也清不掉（`INSERT OR IGNORE` 加
+幂等只比 json / fingerprint）。候选行必须与候选内容是**同一份**事实表示。
 
 `generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
 契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可

@@ -732,8 +732,10 @@ The append-only `*_no_update` / `*_no_delete` triggers are unchanged.
 
 HTTP 契约：`test_strategy_api_contract.test_r35b_search_space_generation_over_http`。
 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。
-Schema 升级：`CandidateContractUpgradeTests`（v1 行仍自证、v34 重建幂等且不回填、
-重建在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe、v2 载荷拒绝携带 provenance）。
+Schema 升级：`CandidateContractUpgradeTests`（v1 行仍自证且 `candidate_json` 逐字不变、
+v34 重建幂等且不回填、重建在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe、
+v2 载荷与**对象**都拒绝携带 provenance、v2 候选表无任何 provenance 列、
+早期 v34 的中间形态也会被重建）。
 
 ### R35-B semantic mutation results
 
@@ -753,7 +755,7 @@ ID 前缀是 **M-X**（eXpansion），刻意避开 R34-B allocation 已有的 M-
 | M-X6 | the generation input fingerprint stops binding the frozen input | B10 / B10b |
 | M-X7 | an arbitrary AST is accepted as a slot alternative | B8 |
 | M-X8 | the candidate table rebuild is no longer foreign-key safe | CandidateContractUpgradeTests |
-| M-X9 | provenance is popped from the fingerprint but kept in the payload (半完成的 ownership 转移) | CandidateContractUpgradeTests |
+| M-X9 | provenance is popped from the fingerprint but kept in the payload / object / DB columns (半完成的 ownership 转移) | CandidateContractUpgradeTests |
 | M-X10 | the read model projects the proposal history as an implicit latest | B10d |
 
 ### R35-B identity layers (candidate / proposal / batch)
@@ -769,7 +771,24 @@ R35-B 把**提案 provenance 整体**移出 candidate identity 与 payload。移
 1. generator 能力身份（`generator_type` / `generator_version` / `generator_contract_version`）——同一份 canonical specification 由 `factor_variant` 与 `bounded_combination` 分别提出时必须得到同一个 `candidate_id`；
 2. 提案 provenance（`hypothesis_id` / `research_provenance` / `random_seed` / `model_identity`）——R35-C 接入 AI generator 后，GPT model A 与 model B 提出同一份策略时必须得到同一个 `candidate_id`。
 
-只把 `generator_type` 移出、其余仍留在内容里，等于把身份分裂的成因从一种换成另一种。因此这次是**形状级**的 ownership 转移：v2 candidate 的**投影与内容身份**都不含这七项，`candidate_from_projection` 读到它们直接拒绝（fail closed），`build_strategy_candidate` 也不再接受这些参数。v1 历史行继续按自己的旧材料自证，不改历史（migration v34 forward-only、不回填）。B9b 证明 provenance 变化不会分裂语义身份。
+只把 `generator_type` 移出、其余仍留在内容里，等于把身份分裂的成因从一种换成另一种。因此这次是**形状级**的 ownership 转移，且贯穿到 persistence：v2 candidate 的**投影与内容身份**都不含这七项，`candidate_from_projection` 读到它们直接拒绝（fail closed），`build_strategy_candidate` 也不再接受这些参数。v1 历史行继续按自己的旧材料自证，不改历史（migration v34 forward-only、不回填）。
+
+**候选表同样是纯内容持久化**：v2 `strategy_candidates` 不含 `hypothesis_id` /
+`random_seed` 这类顶层 provenance 列，`append_candidate()` 也不写它们。留着会形成
+"``candidate_json`` 里没有、独立列里有"的两套互相矛盾事实，而 `get_candidate()` 只读
+`candidate_json` —— 那些隐藏值写进去就再也读不出来、也清不掉（`INSERT OR IGNORE` 加
+幂等只比 json / fingerprint）。`StrategyCandidate` 因此带 **v2 shape invariant**：
+`candidate_schema_version == v2` 时携带任何 generation provenance 都 fail closed，
+让构造器、读回、直接构造 / `replace()` 三条入口守同一条契约。
+
+`StrategyCandidate` 的 v1 兼容字段（generator 三件套 + 四项提案 provenance）只服务
+**历史行的往返重建与自证**，v2 行为空；由 `LEGACY_GENERATOR_IDENTITY_KEYS` +
+`PROPOSAL_PROVENANCE_KEYS` 显式圈定。
+
+migration v34 的重建条件是"存在任何 **v1 遗留列**"（`STRATEGY_CANDIDATE_COLUMNS_V1`
+减去 v2 目标集），因此本开发分支上跑过早期 v34 的本地库所处的**中间形态**
+（generator 列已去、`hypothesis_id` / `random_seed` 还在）也会走同一条重建路径，
+不会永久卡在双表示。
 
 `generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
 契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可回答。

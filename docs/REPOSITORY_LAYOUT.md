@@ -130,7 +130,8 @@ capability registry（`parameter_variant` / `factor_variant` / `entry_variant` /
 proposal 事件；无 current/latest 指针）。candidate 升级为内容身份
 （`strategy-candidate-v2`：generator 能力身份与提案 provenance（hypothesis / research
 source / seed / model）全部移到 proposal 事件与 batch 上、**不**参与 candidate fingerprint ——
-同一 specification 由不同 generator 或不同 model 提出必须是同一个 candidate；
+同一 specification 由不同 generator 或不同 model 提出必须是同一个 candidate；候选表
+同样是**纯内容持久化**，不含任何 generation provenance 列，`append_candidate()` 也不写；
 migration **v34** 重建候选表，forward-only、不回填、历史 v1 行仍自证）。新增路由
 `GET /api/strategies/{id}/candidate-generations/{batch_id}`；候选列表发布**全部**提案
 证据引用，不投影成隐含 latest。R35-B **不**拥有

@@ -43,6 +43,14 @@ BASELINE = (
     "test_v34_rebuild_is_foreign_key_safe_with_populated_proposals",
     "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
     "test_v2_candidate_payload_carries_no_provenance_and_rejects_smuggling",
+    "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+    "test_v2_candidate_object_cannot_carry_provenance",
+    "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+    "test_candidate_row_has_no_generation_provenance_column",
+    "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+    "test_v1_provenance_survives_only_in_candidate_json",
+    "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+    "test_v34_also_rebuilds_the_intermediate_v2_shape",
     "test_r35b_candidate_expansion.GenerationBatchTests."
     "test_b10d_read_model_publishes_evidence_not_an_implicit_latest",
 )
@@ -184,26 +192,37 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
          "test_v34_rebuild_is_foreign_key_safe_with_populated_proposals",
      ]},
-    # M-X9 —— v2 候选**只**把 provenance 从 fingerprint 里 pop 掉、却仍留在
-    # candidate payload 中：身份不再分裂，但 candidate_id 相同而 candidate_json
-    # 不同 → append_candidate idempotency conflict。这是"半完成的 ownership 转移"。
+    # M-X9 —— provenance 的"半完成 ownership 转移"：只从 fingerprint 里 pop 掉、却仍
+    # 留在 candidate payload / DB 独立列 / 对象字段里。第一条 edit 让 payload 重新带上
+    # provenance（触发"载荷 vs 列"双表示与 idempotency 语义），第二条 edit 让对象
+    # 不变量失效（可构造"id 正确却挂 provenance"的 v2 候选）。两层分别对应
+    # append_candidate 的隐藏事实与 dataclass 形状失守。
     {"id": "M-X9",
-     "semantic": "provenance is popped from the fingerprint but kept in the payload",
+     "semantic": "provenance is kept in the payload, object and DB columns",
      "edits": [(CANDIDATE,
-                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:\n'
-                '            # v1 行的 provenance 仍然属于它的材料，否则旧行无法自证。\n'
-                '            material.update({\n',
-                '        material.update({\n'
-                '            "generator_type": self.generator_type,\n'
-                '            "hypothesis_id": self.hypothesis_id,\n'
-                '            "random_seed": self.random_seed,\n'
-                '        })\n'
-                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:\n'
-                '            # v1 行的 provenance 仍然属于它的材料，否则旧行无法自证。\n'
-                '            material.update({\n')],
+                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:\n',
+                '        material.update({"hypothesis_id": self.hypothesis_id,\n'
+                '                         "random_seed": self.random_seed})\n'
+                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:\n'),
+               (CANDIDATE,
+                '        if self.candidate_schema_version != CANDIDATE_SCHEMA_VERSION:\n'
+                '            return\n',
+                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V999:\n'
+                '            return\n'),
+               (MIGRATIONS,
+                '        parent_strategy_checksum TEXT,\n'
+                '        asof TEXT NOT NULL,\n'
+                '        candidate_json TEXT NOT NULL,\n',
+                '        parent_strategy_checksum TEXT,\n'
+                '        hypothesis_id TEXT,\n'
+                '        asof TEXT NOT NULL,\n'
+                '        random_seed INTEGER,\n'
+                '        candidate_json TEXT NOT NULL,\n')],
      "detectors": [
          "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
          "test_v2_candidate_payload_carries_no_provenance_and_rejects_smuggling",
+         "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+         "test_v2_candidate_object_cannot_carry_provenance",
      ]},
     # M-X10 —— 读模型又把 append-only 的提案历史压成"最近一条 proposal"：
     # proposal id 是随机 opaque id，同 timestamp 下不存在可靠先后，压成 latest

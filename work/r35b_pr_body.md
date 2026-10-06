@@ -79,19 +79,33 @@ identity 的是两族事实：
 
 只搬走第一族、第二族留在内容里，等于把身份分裂的成因从一种换成另一种。
 
-**这是形状级的 ownership 转移，不是 `fingerprint_material.pop()`**：
+**这是形状级的 ownership 转移，不是 `fingerprint_material.pop()`**，并且贯穿到
+persistence：
 
 - v2 candidate 的**投影**与**内容身份**都不含这七项；
 - `candidate_from_projection` 在 v2 形状里读到它们直接 `fail closed`（防止有人手工塞回 `candidate_json`）；
 - `build_strategy_candidate` **不接受**这些参数（接受再丢弃同样会误导调用方）；
+- v2 `strategy_candidates` **不含任何 generation provenance 列**（`hypothesis_id` /
+  `random_seed` 已移除），`append_candidate()` 也不再写它们；
+- `StrategyCandidate` 带 **v2 shape invariant**：`candidate_schema_version == v2` 时携带
+  任何 generation provenance 都 fail closed，让构造器、读回、直接构造 / `replace()`
+  三条入口守同一条契约；
 - v1 历史行继续按自己的旧材料自证，不改历史。
 
-否则会出现 `candidate_id` 相同而 `candidate_json` 不同 → `append_candidate` idempotency
-conflict。proposal 写入时直接从 `CandidateSearchSpace` / batch 的显式事实取这七项，
-不再从 candidate 反推。
+为什么必须删到列这一层：留着会形成"``candidate_json`` 里没有、独立列里有"的两套互相
+矛盾事实，而 `get_candidate()` 只读 `candidate_json` —— 那些隐藏值写进去就再也读不出来，
+也清不掉（`INSERT OR IGNORE` 加幂等只比 json / fingerprint）。已实测：写入
+`hypothesis_id="hidden-hyp", random_seed=123` 后，再用**干净** candidate 追加，这两列
+依旧是隐藏值。
+
+`StrategyCandidate` 的 v1 兼容字段（generator 三件套 + 四项提案 provenance）只服务
+**历史行的往返重建与自证**，v2 行为空。
 
 candidate schema 因此升级为 `strategy-candidate-v2`；migration **v34** 重建候选表
-（forward-only、幂等、**不回填**），历史 v1 行的 `candidate_json` 逐字保留。
+（forward-only、幂等、**不回填**），历史 v1 行的 `candidate_json` 逐字保留。重建条件是
+"存在任何 v1 遗留列"，因此本开发分支上跑过早期 v34 的本地库所处的**中间形态**
+（generator 列已去、`hypothesis_id` / `random_seed` 还在）也会走同一条路径，不会永久
+卡在双表示。
 
 ## 4b. 读模型不制造隐式 latest
 
@@ -239,14 +253,15 @@ allocation / execution **全部未改**；所有优化都只能表现为 **new S
 | B11 | `test_b11_batch_identity_is_not_candidate_identity` |
 | B12 | `test_b12_generator_path_has_no_evaluation_promotion_or_execution_dependency`; `test_b12b_no_scoring_ranking_or_winner_selection_in_the_generator_path`; `test_b12c_search_space_module_is_a_pure_contract`; `test_b12d_no_runtime_create_or_alter_table_in_the_generator_path`; `test_b12e_no_implicit_current_state_lookup`; `test_b12e2_repository_clock_is_confined_to_persistence_metadata`; `test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain` |
 
-额外：`CandidateContractUpgradeTests` 证明 v1 行仍自证、v34 重建幂等且不回填历史
-provenance、在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe，且 v2 载荷拒绝
-携带 provenance（`CandidateContractUpgradeTests`）。
+额外：`CandidateContractUpgradeTests` 证明 v1 行仍自证且 `candidate_json` 逐字不变、
+v34 重建幂等且不回填历史 provenance、在**已有 proposal 行且 FK 开启**的 v33 账本上
+FK-safe、v2 载荷与**对象**都拒绝携带 provenance、v2 候选表无任何 provenance 列、
+早期 v34 的中间形态也会被重建。
 
 ## 18. Focused tests
 
 ```text
-backend/test_r35b_candidate_expansion.py        38 tests  OK   (B1–B12)
+backend/test_r35b_candidate_expansion.py        41 tests  OK   (B1–B12)
 backend/test_r35a_strategy_candidate.py         51 tests  OK   (C1–C10, v2 契约同步)
 backend/test_strategy_api_contract.py           19 tests  OK   (+ R35-B HTTP journey)
 backend/test_db_migrate / test_paper_schema_migrations / test_strategy_dsl
@@ -272,7 +287,7 @@ M-X5 DETECTED (different generators produce two candidate ids for one specificat
 M-X6 DETECTED (the generation input fingerprint stops binding the frozen input)
 M-X7 DETECTED (an arbitrary AST is accepted as a slot alternative)
 M-X8 DETECTED (the candidate table rebuild is no longer foreign-key safe)
-M-X9 DETECTED (provenance is popped from the fingerprint but kept in the payload)
+M-X9 DETECTED (provenance is popped from the fingerprint but kept in the payload / object / DB columns)
 M-X10 DETECTED (the read model projects the proposal history as an implicit latest)
 M-X detected = 10/10
 survived = 0; fake = 0; timeout = 0
@@ -293,7 +308,7 @@ baseline after restore = GREEN
 ## 20. Full verification
 
 ```text
-backend full suite (local, Python 3.14.5)      Ran 5390 tests   OK (skipped=5)
+backend full suite (local, Python 3.14.5)      Ran 5393 tests   OK (skipped=5)
 backend full suite (Docker, --network none)    [exact-head CI]
 frontend unit tests (node --test)              168 tests  pass 0 fail
 Chromium E2E (npx playwright test)             [exact-head CI]

@@ -1562,13 +1562,14 @@ def ensure_strategy_retirement_workflow(conn):
 STRATEGY_CANDIDATE_COLUMNS = (
     "candidate_id", "candidate_fingerprint", "candidate_contract_version",
     "candidate_schema_version", "parent_strategy_id", "parent_strategy_version",
-    "parent_strategy_checksum", "hypothesis_id", "asof", "random_seed",
-    "candidate_json", "created_at",
+    "parent_strategy_checksum", "asof", "candidate_json", "created_at",
 )
 
-#: R35-A（v1）的候选列。v34 重建时**只**用于逐列点名搬运：generator 三件套刻意不在
-#: v2 目标列里，因此不会被搬进新表（历史行仍可自证，因为 generator 身份保留在
-#: ``candidate_json`` 里，而 v1 指纹材料本来就包含它）。
+#: R35-A（v1）的候选列。v34 重建时**只**用于逐列点名搬运：generator 三件套、
+#: ``hypothesis_id``、``random_seed`` 刻意不在 v2 目标列里，因此不会被搬进新表 ——
+#: 历史行的 provenance 只保存在**原始** ``candidate_json`` 里，而 v1 指纹材料本来
+#: 就包含它们，所以 v1 行照旧自证；顶层 provenance 列被移除后，候选行与候选内容
+#: 不再是两套互相矛盾的事实表示。
 STRATEGY_CANDIDATE_COLUMNS_V1 = (
     "candidate_id", "candidate_fingerprint", "candidate_contract_version",
     "candidate_schema_version", "parent_strategy_id", "parent_strategy_version",
@@ -1593,10 +1594,15 @@ STRATEGY_CANDIDATE_GENERATION_BATCH_COLUMNS = (
 def strategy_candidate_ddl(table="strategy_candidates"):
     """``strategy_candidates`` 的规范 DDL（migration 与 ``init_db`` 共用）。
 
-    R35-B（v2）：候选是**内容**身份，因此表里**没有** generator 能力列。同一份
-    canonical specification 由 ``factor_variant`` 或 ``bounded_combination`` 提出，
-    都是同一个 candidate 行；"哪个能力、哪一次请求提出的"属于
-    ``strategy_candidate_proposals`` / ``strategy_candidate_generation_batches``。
+    R35-B（v2）：候选是**内容**身份，因此表里**没有**任何 generation provenance 列 ——
+    既没有 generator 能力三件套，也没有 ``hypothesis_id`` / ``random_seed``。同一份
+    canonical specification 由 ``factor_variant`` 或 ``bounded_combination``、由 model A
+    或 model B 提出，都是同一个 candidate 行；"哪个能力、哪一次请求、什么 provenance"
+    属于 ``strategy_candidate_proposals`` / ``strategy_candidate_generation_batches``。
+
+    顶层 provenance 列必须一起删：留着它们就会出现"``candidate_json`` 里没有、
+    独立列里有"的两套互相矛盾事实，而且 ``get_candidate`` 只读 ``candidate_json``，
+    那些隐藏值写进去就再也读不出来、也清不掉。
     """
     return f"""
     CREATE TABLE IF NOT EXISTS {table}(
@@ -1607,9 +1613,7 @@ def strategy_candidate_ddl(table="strategy_candidates"):
         parent_strategy_id TEXT,
         parent_strategy_version INTEGER,
         parent_strategy_checksum TEXT,
-        hypothesis_id TEXT,
         asof TEXT NOT NULL,
-        random_seed INTEGER,
         candidate_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         CHECK(candidate_id = candidate_fingerprint),
@@ -1725,16 +1729,26 @@ def _rebuild_strategy_candidates_v2(conn):
     最后把 staged 父表 RENAME 回真名（SQLite 的 legacy_alter_table 语义会把子表里
     记录的父表名一起改回 ``strategy_candidates``）。
 
-    历史行怎么处理：``candidate_json`` 逐字保留，因此 v1 行的 generator 三件套仍在
-    候选材料里，``candidate_from_projection`` 按 ``candidate_schema_version`` 走 v1
-    材料路径，指纹照旧自证。**绝不**把历史行"升级"成 v2，也绝不回填任何 provenance。
+    历史行怎么处理：``candidate_json`` 逐字保留，因此 v1 行的 generator 三件套与提案
+    provenance 仍在候选材料里，``candidate_from_projection`` 按
+    ``candidate_schema_version`` 走 v1 材料路径，指纹照旧自证。**绝不**把历史行
+    "升级"成 v2，也绝不回填任何 provenance。顶层 ``hypothesis_id`` / ``random_seed``
+    列被移除后，候选行与候选内容不再是两套互相矛盾的事实表示。
+
+    重建条件是"存在任何 v1 遗留列"，而不是"存在 generator_type"：本开发分支上跑过
+    早期 v34 的本地库会停在**中间形态**（generator 列已去、``hypothesis_id`` /
+    ``random_seed`` 还在），那正是本轮要消灭的双表示，所以它必须走同一条重建路径，
+    否则那些库会永久卡在中间形态。
     """
     changes = {}
     old_columns = table_columns(conn, "strategy_candidates")
+    # 只看"v1 有、v2 目标没有"的列：共享列（candidate_json / asof / parent pin …）
+    # 重建后依然存在，用它们判定会把已经完成的表误判成待重建，破坏幂等。
+    legacy_only = set(STRATEGY_CANDIDATE_COLUMNS_V1) - set(STRATEGY_CANDIDATE_COLUMNS)
     if not old_columns:
         conn.execute(strategy_candidate_ddl("strategy_candidates"))
         changes["strategy_candidates"] = "created"
-    elif "generator_type" in old_columns:
+    elif old_columns & legacy_only:
         staged = "strategy_candidates__r35b_rebuild"
         conn.execute(f"DROP TABLE IF EXISTS {staged}")
         conn.execute(strategy_candidate_ddl(staged))

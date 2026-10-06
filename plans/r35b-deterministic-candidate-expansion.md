@@ -59,12 +59,26 @@ batch row      → opaque request identity                       → append ever
 读到就 fail closed；`build_strategy_candidate` 不再接受这些参数；`record_proposal` 的
 provenance 来自 search space / batch 的显式事实。v1 历史行按自己的旧材料自证，不改历史。
 
+**贯穿到 persistence**：v2 `strategy_candidates` 不含任何 generation provenance 列
+（`hypothesis_id` / `random_seed` 已移除），`append_candidate()` 不写它们。留着会形成
+"`candidate_json` 里没有、独立列里有"的两套互相矛盾事实，而 `get_candidate()` 只读
+`candidate_json` —— 那些隐藏值写进去就再也读不出来、也清不掉（`INSERT OR IGNORE` 加
+幂等只比 json / fingerprint）。
+
+`StrategyCandidate` 带 **v2 shape invariant**：v2 时携带任何 generation provenance 都
+fail closed，让构造器、读回、直接构造 / `replace()` 三条入口守同一条契约。v1 兼容字段只
+服务历史行的往返重建与自证，由 `LEGACY_GENERATOR_IDENTITY_KEYS` +
+`PROPOSAL_PROVENANCE_KEYS` 显式圈定。
+
 candidate schema 因此升级为 `strategy-candidate-v2`：
 
 - 候选表去掉 v1 的 `NOT NULL` generator 列（留着会逼每个新行编一个能力身份，那正是
   要消除的第二套 identity authority）；
 - migration **v34** 重建候选表：forward-only、幂等、**不回填**；历史 v1 行的
-  `candidate_json` 逐字保留，仍按 v1 材料自证（**绝不**"升级"历史行）；
+  `candidate_json` 逐字保留，仍按 v1 材料自证（**绝不**"升级"历史行）；v1 的 provenance
+  只留在原始 `candidate_json` 里，顶层重复的一份被删掉。重建条件是"存在任何 v1 遗留列"，
+  因此本分支上跑过早期 v34 的库所处的**中间形态**（generator 列已去、
+  `hypothesis_id` / `random_seed` 还在）也走同一条路径，不会永久卡在双表示；
 - 新增 `strategy_candidate_generation_batches`（append-only，无 `current/latest` 指针）。
 
 读模型**不制造隐含指针**：候选列表发布全部提案证据引用
@@ -104,8 +118,9 @@ proposal"——`proposal_id` 是随机 opaque id，同 timestamp 下不存在可
 
 ## 六、测试与变异
 
-- B1–B12 contract 回归：`backend/test_r35b_candidate_expansion.py`（38 tests，含
-  B9b「provenance 变化不分裂语义身份」与 B10d「读模型发布证据而非 latest」）。
+- B1–B12 contract 回归：`backend/test_r35b_candidate_expansion.py`（41 tests，含
+  B9b「provenance 变化不分裂语义身份」与 B10d「读模型发布证据而非 latest」，
+  以及 `CandidateContractUpgradeTests` 的 persistence / 对象不变量 / 中间形态重建）。
 - HTTP 契约：`backend/test_strategy_api_contract.py` 的
   `test_r35b_search_space_generation_over_http`。
 - 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。

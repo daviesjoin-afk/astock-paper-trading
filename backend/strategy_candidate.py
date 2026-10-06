@@ -357,6 +357,26 @@ class StrategyCandidate:
     random_seed: int | None = None
     model_identity: Mapping = field(default_factory=dict)
 
+    def __post_init__(self):
+        """v2 shape invariant：一个 v2 候选**不能**承载任何 generation provenance。
+
+        放在 dataclass 上（而不是只靠 ``build_strategy_candidate`` / 投影形状），
+        是为了让三条入口 —— 构造器、``candidate_from_projection``、直接
+        ``replace()``/手工构造 —— 守住同一条契约。否则"v2 指纹不看 provenance"会
+        变成一个静默的口子：能造出一个 ``candidate_id`` 正确、却挂着
+        ``hypothesis_id`` / ``random_seed`` 的候选，被写进独立列后读不出来也清不掉。
+
+        v1 历史行**不受影响**：它们的 provenance 属于各自的指纹材料。
+        """
+        if self.candidate_schema_version != CANDIDATE_SCHEMA_VERSION:
+            return
+        carried = [key for key in (*LEGACY_GENERATOR_IDENTITY_KEYS,
+                                   *PROPOSAL_PROVENANCE_KEYS)
+                   if getattr(self, key) not in (None, {}, (), [])]
+        if carried:
+            raise CandidateValidationError(
+                f"candidate_provenance_belongs_to_proposal_not_content:{carried[0]}")
+
     def projection(self) -> dict:
         """candidate 的完整可持久化材料（不含持久化元数据 ``created_at``）。
 

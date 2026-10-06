@@ -663,10 +663,23 @@ class GenerationBatchTests(_LedgerFixture):
 class CandidateContractUpgradeTests(_LedgerFixture):
     """R35-B schema v2 —— 候选行是内容身份，generator 能力降到事件 provenance。"""
 
-    def test_candidate_row_has_no_generator_capability_column(self):
+    def test_candidate_row_has_no_generation_provenance_column(self):
+        """v2 候选表**不含任何** generation provenance 列。
+
+        不只是 generator 三件套：``hypothesis_id`` / ``random_seed`` 如果留在表里，
+        就会形成"``candidate_json`` 里没有、独立列里有"的两套互相矛盾事实，而
+        ``get_candidate`` 只读 ``candidate_json`` —— 那些隐藏值写进去就再也读不出来，
+        也清不掉（``INSERT OR IGNORE`` + 幂等只比 json/fingerprint）。
+        """
         columns = {row[1] for row in self.conn.execute(
             "PRAGMA table_info(strategy_candidates)")}
         self.assertEqual(set(), columns & set(SC.LEGACY_GENERATOR_IDENTITY_KEYS))
+        self.assertEqual(set(), columns & set(SC.PROPOSAL_PROVENANCE_KEYS))
+        # 候选内容 + 台账元数据仍然在。
+        self.assertTrue({"candidate_id", "candidate_fingerprint", "candidate_json",
+                         "asof", "parent_strategy_id", "parent_strategy_version",
+                         "parent_strategy_checksum", "candidate_schema_version",
+                         "candidate_contract_version", "created_at"} <= columns)
         candidate = SC.build_strategy_candidate(
             parent_identity={"strategy_id": PARENT, "strategy_version": 1,
                              "strategy_checksum": CHECKSUM_A},
@@ -777,6 +790,77 @@ class CandidateContractUpgradeTests(_LedgerFixture):
         self.assertEqual("ok", PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
         self.assertEqual([], conn.execute("PRAGMA foreign_key_check").fetchall())
 
+    def test_v1_provenance_survives_only_in_candidate_json(self):
+        """v1 迁移后：``candidate_json`` 逐字不变、v1 仍自证、顶层 provenance 列被移除。
+
+        v1 的 generator 能力与提案 provenance 继续存在于**原始** ``candidate_json``
+        里（v1 指纹材料本来就包含它们），因此历史行照旧自证；而顶层重复的一份
+        必须被删掉，否则候选行与候选内容会变成两套互相矛盾的事实。
+        """
+        import paper_schema_migrations as PSM
+        conn = sqlite3.connect(os.path.join(self._dir.name, "v1cols.sqlite3"))
+        self.addCleanup(conn.close)
+        conn.execute(_V1_CANDIDATE_DDL)
+        v1 = _v1_candidate()
+        payload = json.dumps(v1.projection(), sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "INSERT INTO strategy_candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (v1.candidate_id, v1.candidate_fingerprint, SC.CANDIDATE_CONTRACT_VERSION,
+             v1.candidate_schema_version, PARENT, 1, CHECKSUM_A, v1.generator_type,
+             v1.generator_version, v1.generator_contract_version, v1.hypothesis_id,
+             "2026-10-05", v1.random_seed, payload, "2026-10-05T01:00:00+00:00"))
+        conn.commit()
+
+        self.assertEqual("rebuilt", PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(strategy_candidates)")}
+        self.assertEqual(set(), columns & set(SC.LEGACY_GENERATOR_IDENTITY_KEYS))
+        self.assertEqual(set(), columns & set(SC.PROPOSAL_PROVENANCE_KEYS))
+        stored = conn.execute("SELECT candidate_json FROM strategy_candidates"
+                              " WHERE candidate_id=?", (v1.candidate_id,)).fetchone()[0]
+        # candidate_json 逐字不变。
+        self.assertEqual(payload, stored)
+        # v1 指纹仍自证。
+        self.assertTrue(SC.verify_candidate_fingerprint(
+            SC.candidate_from_projection(json.loads(stored))))
+        self.assertEqual("ok", PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
+
+    def test_v34_also_rebuilds_the_intermediate_v2_shape(self):
+        """本开发分支上跑过早期 v34 的库会停在**中间形态**（generator 列已去、
+        ``hypothesis_id`` / ``random_seed`` 还在）—— 正是本轮要消灭的双表示，
+        必须走同一条重建路径，否则那些库会永久卡在中间形态。"""
+        import paper_schema_migrations as PSM
+        conn = sqlite3.connect(os.path.join(self._dir.name, "intermediate.sqlite3"))
+        self.addCleanup(conn.close)
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("""CREATE TABLE strategy_candidates(
+             candidate_id TEXT PRIMARY KEY, candidate_fingerprint TEXT NOT NULL,
+             candidate_contract_version TEXT NOT NULL, candidate_schema_version TEXT NOT NULL,
+             parent_strategy_id TEXT, parent_strategy_version INTEGER,
+             parent_strategy_checksum TEXT, hypothesis_id TEXT, asof TEXT NOT NULL,
+             random_seed INTEGER, candidate_json TEXT NOT NULL, created_at TEXT NOT NULL,
+             CHECK(candidate_id = candidate_fingerprint), CHECK(length(candidate_id)=64))""")
+        conn.execute(PSM.strategy_candidate_proposal_ddl("strategy_candidate_proposals"))
+        conn.execute("INSERT INTO strategy_candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                     ("a" * 64, "a" * 64, "strategy-candidate-contract-v2",
+                      "strategy-candidate-v2", None, None, None, "leftover-hyp",
+                      "2026-10-05", 7, "{}", "2026-10-05T01:00:00+00:00"))
+        conn.execute("INSERT INTO strategy_candidate_proposals VALUES(?,?,?,?,?,?)",
+                     ("p" * 64, "a" * 64, None, "f" * 64, "{}",
+                      "2026-10-05T01:00:00+00:00"))
+        conn.commit()
+
+        self.assertEqual("rebuilt",
+                         PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(strategy_candidates)")}
+        self.assertEqual(set(), columns & set(SC.PROPOSAL_PROVENANCE_KEYS))
+        self.assertEqual(set(), columns & set(SC.LEGACY_GENERATOR_IDENTITY_KEYS))
+        self.assertEqual([], conn.execute("PRAGMA foreign_key_check").fetchall())
+        self.assertEqual(1, conn.execute(
+            "SELECT COUNT(*) FROM strategy_candidates").fetchone()[0])
+        self.assertEqual("ok", PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
+
     def test_v2_candidate_payload_carries_no_provenance_and_rejects_smuggling(self):
         """v2 候选的投影与内容里都没有 provenance，且 v2 形状**拒绝**携带它们。
 
@@ -804,6 +888,37 @@ class CandidateContractUpgradeTests(_LedgerFixture):
                 universe_spec={"scope_kind": "a_share_all"},
                 intended_market_regime="momentum",
                 hypothesis_id="hyp_x")
+
+    def test_v2_candidate_object_cannot_carry_provenance(self):
+        """v2 候选**对象本身**不能承载 generation provenance。
+
+        这条刻意不只测 ``candidate_from_projection()``：要测的是
+        ``StrategyCandidate`` 这条形状契约。v2 指纹不看 provenance，所以一个"id 正确
+        却挂着 hypothesis / seed"的候选是**可构造**的 —— 而它一旦被写进独立列，就成了
+        读不出来、清不掉的隐藏事实。因此不变量放在 dataclass 上，让构造器、
+        读回、直接构造 / ``replace()`` 三条入口守同一条。
+        """
+        import dataclasses
+        clean = self._candidates_v2()[0]
+        self.assertIsNone(clean.hypothesis_id)
+        self.assertIsNone(clean.random_seed)
+        self.assertEqual({}, clean.research_provenance)
+        self.assertEqual({}, clean.model_identity)
+        for key in (*SC.LEGACY_GENERATOR_IDENTITY_KEYS, *SC.PROPOSAL_PROVENANCE_KEYS):
+            for value in ("hidden", 123, {"provider": "openai", "model": "gpt-x",
+                                          "version": "v1"},
+                           {"source_kind": "human"}):
+                with self.assertRaises(SC.CandidateValidationError):
+                    dataclasses.replace(clean, **{key: value})
+        # 直接构造同样拒绝。
+        fields = {f.name: getattr(clean, f.name) for f in
+                  dataclasses.fields(clean)}
+        fields["hypothesis_id"] = "hidden-hyp"
+        fields["random_seed"] = 123
+        with self.assertRaises(SC.CandidateValidationError):
+            SC.StrategyCandidate(**fields)
+        # v1 历史行不受影响：它的 provenance 属于自己的指纹材料。
+        self.assertTrue(SC.verify_candidate_fingerprint(_v1_candidate()))
 
     def _candidates_v2(self):
         return SG.generate_candidates(_space(variants={"ma_period": [19]}))

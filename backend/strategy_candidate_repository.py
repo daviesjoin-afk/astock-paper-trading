@@ -125,18 +125,22 @@ def append_candidate(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, 
     if not SC.verify_candidate_fingerprint(candidate):
         raise StrategyCandidateRepositoryError("candidate_fingerprint_mismatch")
     payload = _payload(candidate)
+    # 候选行是**纯内容**持久化：这里**不写**任何 generation provenance。
+    # 写进去会造成"candidate_json 里没有、独立列里有"的两套互相矛盾事实，而
+    # get_candidate 只读 candidate_json —— 那些隐藏值写进去就再也读不出来、也清不掉
+    # （INSERT OR IGNORE + 幂等只比 json/fingerprint）。provenance 只属于
+    # proposal 事件与 generation batch。
     conn.execute(
         """INSERT OR IGNORE INTO strategy_candidates
            (candidate_id,candidate_fingerprint,candidate_contract_version,
             candidate_schema_version,parent_strategy_id,parent_strategy_version,
-            parent_strategy_checksum,hypothesis_id,asof,random_seed,
-            candidate_json,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            parent_strategy_checksum,asof,candidate_json,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (candidate.candidate_id, candidate.candidate_fingerprint,
          SC.CANDIDATE_CONTRACT_VERSION, candidate.candidate_schema_version,
          candidate.parent_strategy_id, candidate.parent_strategy_version,
          candidate.parent_strategy_checksum,
-         candidate.hypothesis_id, candidate.asof, candidate.random_seed, payload,
+         candidate.asof, payload,
          created_at or dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()),
     )
     row = conn.execute(
