@@ -732,11 +732,12 @@ The append-only `*_no_update` / `*_no_delete` triggers are unchanged.
 
 HTTP 契约：`test_strategy_api_contract.test_r35b_search_space_generation_over_http`。
 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。
-Schema 升级：`CandidateContractUpgradeTests`（v1 行仍自证、v34 重建幂等且不回填）。
+Schema 升级：`CandidateContractUpgradeTests`（v1 行仍自证、v34 重建幂等且不回填、
+重建在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe）。
 
 ### R35-B semantic mutation results
 
-`work/r35b_candidate_expansion_mutation_check.py` result: M-B1-M-B7 all **DETECTED**;
+`work/r35b_candidate_expansion_mutation_check.py` result: M-B1-M-B8 all **DETECTED**;
 `survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and the focused
 baseline after restore is green.
 
@@ -749,6 +750,7 @@ baseline after restore is green.
 | M-B5 | different generators produce two candidate ids for one specification | B9 |
 | M-B6 | the generation input fingerprint stops binding the frozen input | B10 / B10b |
 | M-B7 | an arbitrary AST is accepted as a slot alternative | B8 |
+| M-B8 | the candidate table rebuild is no longer foreign-key safe | CandidateContractUpgradeTests |
 
 ### R35-B identity layers (candidate / proposal / batch)
 

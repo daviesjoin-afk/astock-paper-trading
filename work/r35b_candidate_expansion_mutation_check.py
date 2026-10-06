@@ -39,12 +39,15 @@ BASELINE = (
     "test_r35b_candidate_expansion.CrossGeneratorDedupTests.test_b11_batch_identity_is_not_candidate_identity",
     "test_r35b_candidate_expansion.AuthorityBoundaryTests.test_b12_generator_path_has_no_evaluation_promotion_or_execution_dependency",
     "test_r35b_candidate_expansion.AuthorityBoundaryTests.test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain",
+    "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+    "test_v34_rebuild_is_foreign_key_safe_with_populated_proposals",
 )
 
 CANDIDATE = "backend/strategy_candidate.py"
 GENERATOR = "backend/strategy_generator.py"
 SEARCH_SPACE = "backend/strategy_candidate_search_space.py"
 SERVICE = "backend/strategy_candidate_service.py"
+MIGRATIONS = "backend/paper_schema_migrations.py"
 
 MUTATIONS = [
     # M-B1 —— 静默截断：组合空间超限时只生成前 N 个；能力不展开的维度只取第一个
@@ -164,6 +167,18 @@ MUTATIONS = [
      "detectors": [
          "test_r35b_candidate_expansion.UnsafeMutationTests."
          "test_b8_arbitrary_executable_payload_is_rejected",
+     ]},
+    # M-B8 —— v34 重建不再做 FK 引用重写：在有 proposal 行且 FK 开启的 v33 账本上，
+    # DROP 被引用的父表直接报 FOREIGN KEY constraint failed（升级即不可用）。
+    {"id": "M-B8",
+     "semantic": "the candidate table rebuild is no longer foreign-key safe",
+     "edits": [(MIGRATIONS,
+                '        if table_columns(conn, "strategy_candidate_proposals"):\n'
+                '            _repoint_proposal_foreign_key(conn, staged)\n',
+                '')],
+     "detectors": [
+         "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+         "test_v34_rebuild_is_foreign_key_safe_with_populated_proposals",
      ]},
 ]
 

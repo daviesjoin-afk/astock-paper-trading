@@ -83,6 +83,12 @@ batch row      → opaque request identity                       → append ever
 - migration **v34** 重建候选表：forward-only、幂等、**不回填**；历史 v1 行的
   `candidate_json` 逐字保留，`candidate_from_projection` 按
   `candidate_schema_version` 走 v1 材料路径，**v1 行仍然自证**（绝不"升级"历史行）。
+- **重建必须 FK-safe**：`strategy_candidate_proposals.candidate_id` 引用候选表，而
+  生产连接开着 `PRAGMA foreign_keys=ON`；直接 DROP 被引用的父表会让升级一个已有
+  proposal 行的 v33 账本报 `FOREIGN KEY constraint failed`（初始化直接失败）。事务内
+  `PRAGMA foreign_keys=OFF` 是 no-op，因此重建走**引用重写**：先建 staged 父表 →
+  把子表重建为指向 staged 父表 → DROP 旧父表 → staged 父表 RENAME 回真名（SQLite 会把
+  子表里记录的父表名一起改写回 `strategy_candidates`）。外键在重建后仍然强制。
 
 ## 5. Generator 能力：显式 registry，不是 if/elif 链
 
@@ -221,12 +227,13 @@ allocation / execution **全部未改**；所有优化都只能表现为 **new S
 | B11 | `test_b11_batch_identity_is_not_candidate_identity` |
 | B12 | `test_b12_generator_path_has_no_evaluation_promotion_or_execution_dependency`; `test_b12b_no_scoring_ranking_or_winner_selection_in_the_generator_path`; `test_b12c_search_space_module_is_a_pure_contract`; `test_b12d_no_runtime_create_or_alter_table_in_the_generator_path`; `test_b12e_no_implicit_current_state_lookup`; `test_b12e2_repository_clock_is_confined_to_persistence_metadata`; `test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain` |
 
-额外：`CandidateContractUpgradeTests` 证明 v1 行仍自证、v34 重建幂等且不回填历史 provenance。
+额外：`CandidateContractUpgradeTests` 证明 v1 行仍自证、v34 重建幂等且不回填历史
+provenance，并在**已有 proposal 行且 FK 开启**的 v33 账本上验证重建 FK-safe。
 
 ## 18. Focused tests
 
 ```text
-backend/test_r35b_candidate_expansion.py        34 tests  OK   (B1–B12)
+backend/test_r35b_candidate_expansion.py        35 tests  OK   (B1–B12)
 backend/test_r35a_strategy_candidate.py         51 tests  OK   (C1–C10, v2 契约同步)
 backend/test_strategy_api_contract.py           19 tests  OK   (+ R35-B HTTP journey)
 backend/test_db_migrate / test_paper_schema_migrations / test_strategy_dsl
@@ -250,7 +257,8 @@ M-B4 DETECTED (an inherited slot no longer resolves to the pinned parent's seman
 M-B5 DETECTED (different generators produce two candidate ids for one specification)
 M-B6 DETECTED (the generation input fingerprint stops binding the frozen input)
 M-B7 DETECTED (an arbitrary AST is accepted as a slot alternative)
-M-B detected = 7/7
+M-B8 DETECTED (the candidate table rebuild is no longer foreign-key safe)
+M-B detected = 8/8
 survived = 0; fake = 0; timeout = 0
 restore SHA256 = PASS
 baseline after restore = GREEN
@@ -269,7 +277,7 @@ baseline after restore = GREEN
 ## 20. Full verification
 
 ```text
-backend full suite (local, Python 3.14.5)      Ran 5386 tests   OK (skipped=5)
+backend full suite (local, Python 3.14.5)      Ran 5387 tests   OK (skipped=5)
 backend full suite (Docker, --network none)    [exact-head CI]
 frontend unit tests (node --test)              168 tests  pass 0 fail
 Chromium E2E (npx playwright test)             [exact-head CI]

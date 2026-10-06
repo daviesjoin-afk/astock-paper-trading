@@ -1626,12 +1626,18 @@ def strategy_candidate_ddl(table="strategy_candidates"):
     """
 
 
-def strategy_candidate_proposal_ddl(table="strategy_candidate_proposals"):
+def strategy_candidate_proposal_ddl(table="strategy_candidate_proposals",
+                                    candidate_table="strategy_candidates"):
     """``strategy_candidate_proposals`` 的规范 DDL（去重的证据侧，append-only）。
 
     R35-B：proposal 是**事件**，因此每条事件都携带提出它的 generator 能力身份与
     所属 generation batch。同一候选被不同能力提出时，候选行仍然只有一条，而
     proposal 行有两条 —— 事件历史绝不覆盖。
+
+    ``candidate_table`` 参数化的唯一目的是让 v34 的候选表重建能做到 **FK-safe**：
+    重建必须先把 proposal 表指向 staged 父表，否则 DROP 旧父表时子表的外键立刻
+    悬空（``PRAGMA foreign_keys`` 在生产连接上是 ON），迁移会直接报
+    ``FOREIGN KEY constraint failed``。
     """
     return f"""
     CREATE TABLE IF NOT EXISTS {table}(
@@ -1641,7 +1647,7 @@ def strategy_candidate_proposal_ddl(table="strategy_candidate_proposals"):
         input_fingerprint TEXT NOT NULL,
         proposal_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        FOREIGN KEY(candidate_id) REFERENCES strategy_candidates(candidate_id)
+        FOREIGN KEY(candidate_id) REFERENCES {candidate_table}(candidate_id)
     )
     """
 
@@ -1676,6 +1682,32 @@ def strategy_candidate_generation_batch_ddl(table="strategy_candidate_generation
     """
 
 
+def _repoint_proposal_foreign_key(conn, staged_candidate_table):
+    """Rebuild ``strategy_candidate_proposals`` so its FK points at a staged parent.
+
+    ``PRAGMA foreign_keys=OFF`` 在事务内是 no-op（迁移必须在调用方事务里跑），因此
+    "先关外键再 DROP 父表"不是可用方案。可行且可证明安全的顺序是：把子表也重建一次，
+    让它的 FK 先指向 staged 父表；旧父表随即可以被 DROP（不再被引用）；最后 staged
+    父表 RENAME 成真名时，SQLite 会把子表里记录的父表名一起改写回
+    ``strategy_candidates``。
+
+    逐列点名搬运 + 保留原有数据；**不新增、不改写**任何事件事实。
+    """
+    table = "strategy_candidate_proposals"
+    columns = table_columns(conn, table)
+    staged = "strategy_candidate_proposals__r35b_rebuild"
+    conn.execute(f"DROP TABLE IF EXISTS {staged}")
+    conn.execute(strategy_candidate_proposal_ddl(staged, staged_candidate_table))
+    target = ", ".join(f'"{column}"' for column in STRATEGY_CANDIDATE_PROPOSAL_COLUMNS)
+    source = ", ".join(
+        f'"{column}"' if column in columns else "NULL"
+        for column in STRATEGY_CANDIDATE_PROPOSAL_COLUMNS
+    )
+    conn.execute(f'INSERT INTO "{staged}" ({target}) SELECT {source} FROM "{table}"')
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "{staged}" RENAME TO "{table}"')
+
+
 def _rebuild_strategy_candidates_v2(conn):
     """v34：把候选表从 v1 形状重建为 v2 形状（幂等、forward-only、不回填）。
 
@@ -1683,6 +1715,15 @@ def _rebuild_strategy_candidates_v2(conn):
     ``NOT NULL``，而 v2 语义下"候选行的 generator 能力"根本不存在 —— 留着一个
     ``NOT NULL`` 列会逼着每个新行编一个能力身份，那正是 R35-B 要消除的第二套
     identity authority。重建 = 建新表 → **逐列点名**搬运 → DROP → RENAME。
+
+    **FK-safe 是硬要求**：``strategy_candidate_proposals.candidate_id`` 引用本表，
+    而生产连接（``paper_storage`` / ``paper_trading``）开着
+    ``PRAGMA foreign_keys=ON``。直接 DROP 被引用的父表会让子表外键悬空，迁移在
+    升级一个**已有 proposal 行**的 v33 账本时直接报 ``FOREIGN KEY constraint failed``。
+    在事务内 ``PRAGMA foreign_keys=OFF`` 是**无效**的（SQLite 明确 no-op），所以这里
+    用引用重写：先建 staged 父表 → 把子表也重建为指向 staged 父表 → 再 DROP 旧父表 →
+    最后把 staged 父表 RENAME 回真名（SQLite 的 legacy_alter_table 语义会把子表里
+    记录的父表名一起改回 ``strategy_candidates``）。
 
     历史行怎么处理：``candidate_json`` 逐字保留，因此 v1 行的 generator 三件套仍在
     候选材料里，``candidate_from_projection`` 按 ``candidate_schema_version`` 走 v1
@@ -1704,6 +1745,9 @@ def _rebuild_strategy_candidates_v2(conn):
         )
         conn.execute(f'INSERT INTO "{staged}" ({target}) SELECT {source}'
                      f' FROM "strategy_candidates"')
+        # 子表必须先改指向 staged 父表，旧父表才能被安全 DROP。
+        if table_columns(conn, "strategy_candidate_proposals"):
+            _repoint_proposal_foreign_key(conn, staged)
         conn.execute('DROP TABLE "strategy_candidates"')
         conn.execute(f'ALTER TABLE "{staged}" RENAME TO "strategy_candidates"')
         changes["strategy_candidates"] = "rebuilt"

@@ -637,6 +637,59 @@ class CandidateContractUpgradeTests(_LedgerFixture):
         # 幂等：再跑一次是 no-op。
         self.assertEqual("ok", PSM.ensure_strategy_candidates(legacy)["strategy_candidates"])
 
+    def test_v34_rebuild_is_foreign_key_safe_with_populated_proposals(self):
+        """v34 重建必须在**已有 proposal 行且 FK 开启**的 v33 账本上成功。
+
+        ``strategy_candidate_proposals.candidate_id`` 引用候选表，而生产连接
+        （``paper_storage`` / ``paper_trading``）开着 ``PRAGMA foreign_keys=ON``：
+        直接 DROP 被引用的父表会报 ``FOREIGN KEY constraint failed``，升级后根本
+        初始化不了。事务内 ``PRAGMA foreign_keys=OFF`` 是 no-op，所以重建必须走
+        引用重写（子表先指向 staged 父表，最后一起 RENAME 回来）。
+        """
+        import paper_schema_migrations as PSM
+        conn = sqlite3.connect(os.path.join(self._dir.name, "fk.sqlite3"))
+        self.addCleanup(conn.close)
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(_V1_CANDIDATE_DDL)
+        # v33 形状的 proposal 表：带 FK、还没有 generation_batch_id 列。
+        conn.execute(PSM.strategy_candidate_proposal_ddl(
+            "strategy_candidate_proposals").replace("generation_batch_id TEXT,", ""))
+        v1 = _v1_candidate()
+        conn.execute(
+            "INSERT INTO strategy_candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (v1.candidate_id, v1.candidate_fingerprint, SC.CANDIDATE_CONTRACT_VERSION,
+             v1.candidate_schema_version, PARENT, 1, CHECKSUM_A, v1.generator_type,
+             v1.generator_version, v1.generator_contract_version, None, "2026-10-05",
+             None, json.dumps(v1.projection(), sort_keys=True, separators=(",", ":")),
+             "2026-10-05T01:00:00+00:00"))
+        conn.execute(
+            "INSERT INTO strategy_candidate_proposals VALUES(?,?,?,?,?)",
+            ("p" * 64, v1.candidate_id, "f" * 64, "{}", "2026-10-05T01:00:00+00:00"))
+        conn.commit()
+
+        changes = PSM.ensure_strategy_candidates(conn)
+        self.assertEqual("rebuilt", changes["strategy_candidates"])
+        self.assertEqual([], conn.execute("PRAGMA foreign_key_check").fetchall())
+        # 子表的外键必须重新指回**真名**父表（RENAME 会把记录的父表名一起改写）。
+        sql = conn.execute("SELECT sql FROM sqlite_master"
+                           " WHERE name='strategy_candidate_proposals'").fetchone()[0]
+        self.assertIn('REFERENCES "strategy_candidates"', sql)
+        # 事件行与候选行逐字保留；legacy proposal 的 batch 归属保持 NULL。
+        self.assertEqual([("p" * 64, v1.candidate_id, None)], conn.execute(
+            "SELECT proposal_id,candidate_id,generation_batch_id"
+            " FROM strategy_candidate_proposals").fetchall())
+        self.assertEqual([(v1.candidate_id,)], conn.execute(
+            "SELECT candidate_id FROM strategy_candidates").fetchall())
+        # 外键仍然强制（重建没有把它降级成装饰）。
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO strategy_candidate_proposals"
+                "(proposal_id,candidate_id,input_fingerprint,proposal_json,created_at)"
+                " VALUES(?,?,?,?,?)", ("q" * 64, "z" * 64, "f" * 64, "{}", "x"))
+        # 幂等。
+        self.assertEqual("ok", PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
+        self.assertEqual([], conn.execute("PRAGMA foreign_key_check").fetchall())
+
     def _candidates_v2(self):
         return SG.generate_candidates(_space(variants={"ma_period": [19]}))
 

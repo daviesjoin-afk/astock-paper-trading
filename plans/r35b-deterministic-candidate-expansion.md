@@ -97,8 +97,17 @@ candidate schema 因此升级为 `strategy-candidate-v2`：
   `test_r35b_search_space_generation_over_http`。
 - 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。
 - R35-A 回归按 v2 契约同步更新：`backend/test_r35a_strategy_candidate.py`（51 tests）。
-- 变异：`work/r35b_candidate_expansion_mutation_check.py`（M-B1…M-B7，7/7 DETECTED）；
+- 变异：`work/r35b_candidate_expansion_mutation_check.py`（M-B1…M-B8，8/8 DETECTED）；
   R35-A 的 `work/r35a_candidate_mutation_check.py` 保持 M-G1…M-G8 8/8 DETECTED。
+
+## 六之二、v34 重建必须 FK-safe
+
+`strategy_candidate_proposals.candidate_id` 引用候选表，生产连接开着
+`PRAGMA foreign_keys=ON`。直接 DROP 被引用的父表会让升级一个已有 proposal 行的 v33
+账本报 `FOREIGN KEY constraint failed`（初始化直接失败）；事务内
+`PRAGMA foreign_keys=OFF` 是 no-op。因此重建走引用重写：staged 父表 → 子表改指向
+staged 父表 → DROP 旧父表 → staged 父表 RENAME 回真名。外键重建后仍然强制，由
+`CandidateContractUpgradeTests` 与 M-B8 覆盖。
 
 ## 七、明确不属于 R35-B
 
