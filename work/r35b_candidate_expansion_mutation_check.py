@@ -41,6 +41,10 @@ BASELINE = (
     "test_r35b_candidate_expansion.AuthorityBoundaryTests.test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain",
     "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
     "test_v34_rebuild_is_foreign_key_safe_with_populated_proposals",
+    "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+    "test_v2_candidate_payload_carries_no_provenance_and_rejects_smuggling",
+    "test_r35b_candidate_expansion.GenerationBatchTests."
+    "test_b10d_read_model_publishes_evidence_not_an_implicit_latest",
 )
 
 CANDIDATE = "backend/strategy_candidate.py"
@@ -50,9 +54,9 @@ SERVICE = "backend/strategy_candidate_service.py"
 MIGRATIONS = "backend/paper_schema_migrations.py"
 
 MUTATIONS = [
-    # M-B1 —— 静默截断：组合空间超限时只生成前 N 个；能力不展开的维度只取第一个
+    # M-X1 —— 静默截断：组合空间超限时只生成前 N 个；能力不展开的维度只取第一个
     # 取值。两者是同一类错误 —— candidate universe 会依赖遍历顺序。
-    {"id": "M-B1",
+    {"id": "M-X1",
      "semantic": "an oversized or partially-declared space is silently truncated",
      "edits": [(GENERATOR,
                 '    if cardinality > search_space.max_candidates:\n'
@@ -78,8 +82,8 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.BoundedSpaceTests."
          "test_b3d_a_dimension_the_capability_does_not_expand_must_be_singular",
      ]},
-    # M-B2 —— candidate fingerprint 忽略 factor（结构变体不再改变身份）。
-    {"id": "M-B2",
+    # M-X2 —— candidate fingerprint 忽略 factor（结构变体不再改变身份）。
+    {"id": "M-X2",
      "semantic": "the canonical fingerprint ignores the factor slot",
      "edits": [(CANDIDATE,
                 '        "factor_spec": factor,\n',
@@ -88,8 +92,8 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.VariantIdentityTests."
          "test_b4_factor_variation_changes_identity",
      ]},
-    # M-B3 —— candidate fingerprint 忽略 exit。
-    {"id": "M-B3",
+    # M-X3 —— candidate fingerprint 忽略 exit。
+    {"id": "M-X3",
      "semantic": "the canonical fingerprint ignores the exit slot",
      "edits": [(CANDIDATE,
                 '        "exit_spec": exit_rule,\n',
@@ -98,10 +102,10 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.VariantIdentityTests."
          "test_b6_exit_variation_changes_identity",
      ]},
-    # M-B4 —— inherit 时不再使用 pin 上冻结的 slot 语义（继承退化）。
+    # M-X4 —— inherit 时不再使用 pin 上冻结的 slot 语义（继承退化）。
     # 纯生成域**没有** registry 连接，所以真实的"回读 current"不可能发生；这里
     # 制造的是同一类越界：继承语义不再来自 exact pinned parent 的冻结事实。
-    {"id": "M-B4",
+    {"id": "M-X4",
      "semantic": "an inherited slot no longer resolves to the pinned parent's semantics",
      "edits": [(SEARCH_SPACE,
                 '            slot, inherited = self.exit_slot, (\n'
@@ -112,8 +116,8 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.InheritanceSemanticsTests."
          "test_b7b_inherited_factor_and_exit_come_from_the_frozen_pin",
      ]},
-    # M-B5 —— 不同 generator 的相同语义制造两个 candidate id（去重权威分裂）。
-    {"id": "M-B5",
+    # M-X5 —— 不同 generator 的相同语义制造两个 candidate id（去重权威分裂）。
+    {"id": "M-X5",
      "semantic": "different generators produce two candidate ids for one specification",
      "edits": [(CANDIDATE,
                 '        "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,\n'
@@ -126,10 +130,10 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.CrossGeneratorDedupTests."
          "test_b9_same_semantics_across_generators_dedup_to_one_candidate",
      ]},
-    # M-B6 —— generation input fingerprint 不再绑定 frozen input（parent pin +
+    # M-X6 —— generation input fingerprint 不再绑定 frozen input（parent pin +
     # search-space 指纹）。§20 要求 batch 能回答"这一批候选是从什么输入生成的"，
     # 丢掉这两项之后不同输入会得到同一个 input fingerprint。
-    {"id": "M-B6",
+    {"id": "M-X6",
      "semantic": "the generation input fingerprint stops binding the frozen input",
      "edits": [(SERVICE,
                 '        "search_space_contract_version": '
@@ -144,8 +148,8 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.GenerationBatchTests."
          "test_b10_batch_binds_the_frozen_generation_input",
      ]},
-    # M-B7 —— 允许 arbitrary AST mutation 通过 slot 校验。
-    {"id": "M-B7",
+    # M-X7 —— 允许 arbitrary AST mutation 通过 slot 校验。
+    {"id": "M-X7",
      "semantic": "an arbitrary AST is accepted as a slot alternative",
      "edits": [(SEARCH_SPACE,
                 '        try:\n'
@@ -168,9 +172,9 @@ MUTATIONS = [
          "test_r35b_candidate_expansion.UnsafeMutationTests."
          "test_b8_arbitrary_executable_payload_is_rejected",
      ]},
-    # M-B8 —— v34 重建不再做 FK 引用重写：在有 proposal 行且 FK 开启的 v33 账本上，
+    # M-X8 —— v34 重建不再做 FK 引用重写：在有 proposal 行且 FK 开启的 v33 账本上，
     # DROP 被引用的父表直接报 FOREIGN KEY constraint failed（升级即不可用）。
-    {"id": "M-B8",
+    {"id": "M-X8",
      "semantic": "the candidate table rebuild is no longer foreign-key safe",
      "edits": [(MIGRATIONS,
                 '        if table_columns(conn, "strategy_candidate_proposals"):\n'
@@ -179,6 +183,50 @@ MUTATIONS = [
      "detectors": [
          "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
          "test_v34_rebuild_is_foreign_key_safe_with_populated_proposals",
+     ]},
+    # M-X9 —— v2 候选**只**把 provenance 从 fingerprint 里 pop 掉、却仍留在
+    # candidate payload 中：身份不再分裂，但 candidate_id 相同而 candidate_json
+    # 不同 → append_candidate idempotency conflict。这是"半完成的 ownership 转移"。
+    {"id": "M-X9",
+     "semantic": "provenance is popped from the fingerprint but kept in the payload",
+     "edits": [(CANDIDATE,
+                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:\n'
+                '            # v1 行的 provenance 仍然属于它的材料，否则旧行无法自证。\n'
+                '            material.update({\n',
+                '        material.update({\n'
+                '            "generator_type": self.generator_type,\n'
+                '            "hypothesis_id": self.hypothesis_id,\n'
+                '            "random_seed": self.random_seed,\n'
+                '        })\n'
+                '        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:\n'
+                '            # v1 行的 provenance 仍然属于它的材料，否则旧行无法自证。\n'
+                '            material.update({\n')],
+     "detectors": [
+         "test_r35b_candidate_expansion.CandidateContractUpgradeTests."
+         "test_v2_candidate_payload_carries_no_provenance_and_rejects_smuggling",
+     ]},
+    # M-X10 —— 读模型又把 append-only 的提案历史压成"最近一条 proposal"：
+    # proposal id 是随机 opaque id，同 timestamp 下不存在可靠先后，压成 latest
+    # 就是在历史里重新造一个隐含的 current 指针。
+    {"id": "M-X10",
+     "semantic": "the read model projects the proposal history as an implicit latest",
+     "edits": [(SERVICE,
+                '        evidence = _proposal_evidence_refs(read["proposals"])\n',
+                '        evidence = (_latest_proposal_summary(read["proposals"])\n'
+                '                    if read["proposals"] else {})\n'),
+               (SERVICE,
+                'def _proposal_evidence_refs(proposals) -> dict:\n',
+                'def _latest_proposal_summary(proposals) -> dict:\n'
+                '    return {"proposal_count": len(proposals),\n'
+                '            "proposals": [proposals[-1]] if proposals else [],\n'
+                '            "generation_batch_ids": ([proposals[-1]["generation_batch_id"]]\n'
+                '                                      if proposals else [])}\n'
+                '\n'
+                '\n'
+                'def _proposal_evidence_refs(proposals) -> dict:\n')],
+     "detectors": [
+         "test_r35b_candidate_expansion.GenerationBatchTests."
+         "test_b10d_read_model_publishes_evidence_not_an_implicit_latest",
      ]},
 ]
 
@@ -244,7 +292,7 @@ def main() -> int:
     restored = all(hashlib.sha256(path.read_bytes()).hexdigest() == hashes[path]
                    for path in paths)
     final = run(*BASELINE)
-    print(f"M-B detected = {detected}/{len(MUTATIONS)}")
+    print(f"M-X detected = {detected}/{len(MUTATIONS)}")
     print(f"survived = {survived}; fake = {fake}; timeout = {timeout}")
     print(f"restore SHA256 = {'PASS' if restored else 'FAIL'}")
     print(f"baseline after restore = {'GREEN' if final.returncode == 0 else 'RED'}")

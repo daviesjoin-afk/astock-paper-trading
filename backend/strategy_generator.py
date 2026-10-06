@@ -205,14 +205,6 @@ def generate_candidates(
             factor_spec=chosen["factor"],
             exit_spec=chosen["exit"],
             constraints=SS._thaw(search_space.constraints),
-            hypothesis_id=search_space.hypothesis_id,
-            research_provenance=(SS._thaw(search_space.research_provenance)
-                                 if search_space.research_provenance is not None
-                                 else (SS._thaw(pin.research_provenance)
-                                       if pin.research_provenance is not None else None)),
-            random_seed=search_space.random_seed,
-            model_identity=(SS._thaw(search_space.model_identity)
-                            if search_space.model_identity is not None else None),
         )
         # 去重的唯一权威是 canonical candidate identity；同一个候选被重复提出时
         # 只保留一个身份，绝不制造"语义相同但 ID 不同"的两个策略。

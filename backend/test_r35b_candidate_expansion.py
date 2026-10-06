@@ -492,6 +492,64 @@ class CrossGeneratorDedupTests(_LedgerFixture):
         read = SCV.get_candidate(self.conn, first["candidate_ids"][0])
         self.assertNotIn("generation_batch_id", read["candidate"])
 
+    def test_b9b_provenance_variation_does_not_split_candidate_identity(self):
+        """B9b —— provenance 变化不得分裂语义相同的 candidate identity。
+
+        candidate 是**内容**身份。"哪个 AI model / 哪条 hypothesis / 哪次研究
+        来源 / 哪个 seed 提出了它"是**事件** provenance：它们属于 proposal 事件与
+        generation batch。R35-C 接入 AI generator 后，GPT model A 与 model B 提出
+        同一份策略时，必须得到**同一个** ``candidate_id``（候选行 1 条、proposal
+        事件 2 条），否则同一策略会被重复送进实验 / PIT / robustness，候选数量虚高。
+
+        注意：``generation_input_fingerprint`` **必须**不同 —— 两次请求确实是不同的
+        输入事件；变的只是它们落到同一条候选行上。
+        """
+        created = self._seed()
+        shared = {
+            "parameter_variants": {"ma_period": [19]},
+            "universe_spec": {"scope_kind": "a_share_all"},
+            "intended_market_regime": "momentum", "evidence_count": 10,
+        }
+        batch_a = self._generate(
+            created, hypothesis_id="hyp_a", random_seed=1,
+            research_provenance={"source_kind": "human", "source_identity": "analyst-a"},
+            model_identity={"provider": "openai", "model": "gpt-a", "version": "v1"},
+            **shared)
+        batch_b = self._generate(
+            created, hypothesis_id="hyp_b", random_seed=2,
+            research_provenance={"source_kind": "human", "source_identity": "analyst-b"},
+            model_identity={"provider": "openai", "model": "gpt-b", "version": "v1"},
+            **shared)
+
+        # 语义完全相同 → 同一个 candidate。
+        self.assertEqual(batch_a["candidate_ids"], batch_b["candidate_ids"])
+        self.assertEqual(1, self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_candidates").fetchone()[0])
+        # 但每次提案都是独立事件，且各自保留自己的 provenance。
+        self.assertEqual(2, self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_candidate_proposals").fetchone()[0])
+        self.assertEqual(2, self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_candidate_generation_batches").fetchone()[0])
+        self.assertNotEqual(batch_a["generation_input_fingerprint"],
+                            batch_b["generation_input_fingerprint"])
+
+        history = SCRepo.list_proposals(self.conn, batch_a["candidate_ids"][0])
+        self.assertEqual(2, len(history))
+        self.assertEqual({"hyp_a", "hyp_b"},
+                         {item["hypothesis_id"] for item in history})
+        self.assertEqual({1, 2}, {item["random_seed"] for item in history})
+        self.assertEqual(
+            {("analyst-a", "gpt-a"), ("analyst-b", "gpt-b")},
+            {(item["research_provenance"]["source_identity"],
+              item["model_identity"]["model"]) for item in history})
+        self.assertEqual({batch_a["generation_batch_id"], batch_b["generation_batch_id"]},
+                         {item["generation_batch_id"] for item in history})
+
+        # v2 candidate 的内容与投影都不再携带这些 provenance。
+        read = SCV.get_candidate(self.conn, batch_a["candidate_ids"][0])["candidate"]
+        for key in ("hypothesis_id", "research_provenance", "random_seed", "model_identity"):
+            self.assertNotIn(key, read, f"v2 candidate 投影不得携带 {key}")
+
 
 class GenerationBatchTests(_LedgerFixture):
     """B10 —— 同一 batch 的所有 proposal 都能追溯到同一个 generation input。"""
@@ -571,6 +629,35 @@ class GenerationBatchTests(_LedgerFixture):
                                  if name.startswith(("current", "latest"))})
         with self.assertRaises(SCRepo.StrategyCandidateRepositoryError):
             SCRepo.get_generation_batch(self.conn, "short")
+
+    def test_b10d_read_model_publishes_evidence_not_an_implicit_latest(self):
+        """列表读模型不得把 append-only 历史压成"最近一条 proposal"。
+
+        ``proposal_id`` 是随机 opaque id，两条事件可以合法拥有完全相同的
+        ``created_at``，因此 ``proposals[-1]`` 只是"随机 id 排序靠后"，不是可靠的
+        latest。列表要么给全部证据引用，要么用显式 batch id 单独取。
+        """
+        import inspect
+        source = inspect.getsource(SCV)
+        # 服务层不得存在任何"取最近一条 proposal"的投影。
+        self.assertNotIn("_latest_proposal_summary", source)
+        self.assertNotIn("latest_proposal", source)
+        created = self._seed()
+        # 同一个候选被两个 batch 提出：列表必须给出两条证据，而不是一条"最新"。
+        self._generate(created, parameter_variants={"ma_period": [19]},
+                       hypothesis_id="hyp_a")
+        self._generate(created, parameter_variants={"ma_period": [19]},
+                       hypothesis_id="hyp_b")
+        listed = SCV.list_candidates_for_parent(
+            self.conn, strategy_id=PARENT, strategy_version=1,
+            strategy_checksum=created.current_checksum)
+        item = listed["items"][0]
+        self.assertEqual(2, item["proposal_evidence"]["proposal_count"])
+        self.assertEqual(2, len(item["proposal_evidence"]["proposals"]))
+        self.assertEqual(2, len(set(item["proposal_evidence"]["generation_batch_ids"])))
+        self.assertNotIn("proposal", item)
+        # batch 摘要按显式 id 列出，条数与证据一致。
+        self.assertEqual(2, len(listed["generation_batches"]))
 
 
 class CandidateContractUpgradeTests(_LedgerFixture):
@@ -689,6 +776,34 @@ class CandidateContractUpgradeTests(_LedgerFixture):
         # 幂等。
         self.assertEqual("ok", PSM.ensure_strategy_candidates(conn)["strategy_candidates"])
         self.assertEqual([], conn.execute("PRAGMA foreign_key_check").fetchall())
+
+    def test_v2_candidate_payload_carries_no_provenance_and_rejects_smuggling(self):
+        """v2 候选的投影与内容里都没有 provenance，且 v2 形状**拒绝**携带它们。
+
+        仅仅"不进指纹"是不够的：如果这些键还留在 ``candidate_json`` 里，就会出现
+        ``candidate_id 相同但 candidate_json 不同`` → ``append_candidate`` idempotency
+        conflict，所以 ownership 转移必须是形状级的。
+        """
+        candidate = self._candidates_v2()[0]
+        projection = candidate.projection()
+        self.assertEqual(set(SC.candidate_projection_keys()), set(projection))
+        for key in (*SC.LEGACY_GENERATOR_IDENTITY_KEYS, *SC.PROPOSAL_PROVENANCE_KEYS):
+            self.assertNotIn(key, projection)
+            self.assertNotIn(key, candidate.fingerprint_material())
+        # 有人手工把 provenance 塞回 v2 持久化投影 → 读路径直接拒绝，不静默接受。
+        smuggled = dict(projection)
+        smuggled["model_identity"] = {"provider": "openai", "model": "gpt-x", "version": "v1"}
+        with self.assertRaises(SC.CandidateValidationError):
+            SC.candidate_from_projection(smuggled)
+        # candidate 契约不接受 provenance 参数：传了必须炸，而不是被静默丢弃。
+        with self.assertRaises(TypeError):
+            SC.build_strategy_candidate(
+                parent_identity={"strategy_id": PARENT, "strategy_version": 1,
+                                 "strategy_checksum": CHECKSUM_A},
+                asof="2026-10-05", entry_spec=_parent_rule(),
+                universe_spec={"scope_kind": "a_share_all"},
+                intended_market_regime="momentum",
+                hypothesis_id="hyp_x")
 
     def _candidates_v2(self):
         return SG.generate_candidates(_space(variants={"ma_period": [19]}))

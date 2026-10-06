@@ -34,12 +34,11 @@ function candidate(overrides = {}) {
     parent_strategy_id: "r35a_parent",
     parent_strategy_version: 1,
     parent_strategy_checksum: PARENT_CHECKSUM,
-    // R35-B：候选行不再携带 generator 能力身份（它是提案事件的 provenance）。
-    generator_type: null,
-    generator_version: null,
-    generator_contract_version: null,
-    hypothesis_id: null,
-    research_provenance: { source_kind: "human" },
+    // R35-B：候选行是**纯内容身份**——既不携带 generator 能力，也不携带
+    // hypothesis / research source / seed / model 等提案 provenance。
+    hypothesis_id: undefined,
+    research_provenance: undefined,
+    model_identity: undefined,
     strategy_schema_version: "strategy-dsl-schema-v1",
     factor_spec: null,
     entry_spec: { op: "gt", left: { op: "field", name: "close" }, right: { op: "const", value: 10 } },
@@ -52,8 +51,6 @@ function candidate(overrides = {}) {
     intended_market_regime: "momentum",
     constraints: {},
     asof: "2026-10-05",
-    random_seed: null,
-    model_identity: {},
     candidate_schema_version: "strategy-candidate-v2",
     created_at: "2026-10-05T01:00:00+00:00",
     status: "CANDIDATE",
@@ -73,16 +70,26 @@ function proposal(overrides = {}) {
   };
 }
 
+function evidence(overrides = {}) {
+  const refs = overrides.proposals || [proposal()];
+  return {
+    proposal_count: refs.length,
+    generation_batch_ids: refs.map((item) => item.generation_batch_id),
+    ...overrides,
+    proposals: refs,
+  };
+}
+
 function view(overrides = {}) {
   return {
     authority: "read_only_exact_parent_candidates",
     parent_strategy_pin: { strategy_id: "r35a_parent", strategy_version: 1,
       strategy_checksum: PARENT_CHECKSUM },
-    // 列表项形状：{candidate, persistence, proposal}——created_at 属于台账，候选
-    // 能力身份属于提案事件，两者都不属于候选身份。
+    // 列表项形状：{candidate, persistence, proposal_evidence}——created_at 属于台账，
+    // 提案证据属于事件，两者都不属于候选身份。证据**无序**：不投影成 latest。
     items: [{ candidate: candidate(),
               persistence: { created_at: "2026-10-05T01:00:00+00:00" },
-              proposal: proposal() }],
+              proposal_evidence: evidence() }],
     ...overrides,
   };
 }
@@ -119,16 +126,27 @@ test("R35A-C1：candidate identity 与 parent pin 原样渲染", () => {
   assert.ok(html.includes("2026-10-05T01:00:00+00:00"));
 });
 
-test("R35B-C1：generator 能力来自提案事件，缺记录时明说而不是留空", () => {
-  const html = wb.wbCandidatesHtml("r35a_parent", view());
-  const proposalBlock = html.slice(html.indexOf('data-testid="candidate-proposal"'));
-  assert.ok(proposalBlock.includes("bounded_combination"),
-    "能力身份必须来自 proposal 事件（候选行不再携带它）");
-  assert.ok(proposalBlock.includes("b".repeat(64)), "batch identity 必须可见");
-  // legacy 行没有提案归属：必须明说，不能渲染成空串或"通过"。
+test("R35B-C1：提案证据全部渲染，且不投影成 latest proposal", () => {
+  const html = wb.wbCandidatesHtml("r35a_parent", view({
+    items: [{ candidate: candidate(),
+              persistence: { created_at: "2026-10-05T01:00:00+00:00" },
+              proposal_evidence: evidence({ proposals: [
+                proposal({ proposal_id: "1".repeat(64), generation_batch_id: "1".repeat(64) }),
+                proposal({ proposal_id: "2".repeat(64), generation_batch_id: "2".repeat(64) }),
+              ] }) }] }));
+  const block = html.slice(html.indexOf('data-testid="candidate-proposals"'));
+  assert.ok(block.includes("2 条"), "提案证据条数必须来自 backend 事实");
+  assert.ok(block.includes("1".repeat(64)), "两个 batch 引用都必须可见");
+  assert.ok(block.includes("2".repeat(64)));
+  // 缺记录时明说，不能渲染成空串或"通过"。
   const legacy = wb.wbCandidatesHtml("r35a_parent", view({
-    items: [{ candidate: candidate(), persistence: {}, proposal: {} }] }));
-  assert.ok(legacy.includes("未记录"), "缺失提案归属必须明说");
+    items: [{ candidate: candidate(), persistence: {}, proposal_evidence: {} }] }));
+  assert.ok(legacy.includes("未记录"));
+  // v2 候选渲染不得出现任何 provenance 字段。
+  for (const forbidden of ["generator_type", "hypothesis_id", "model_identity",
+                           "research_provenance", "random_seed"]) {
+    assert.ok(!html.includes(forbidden), `候选渲染不得出现 ${forbidden}`);
+  }
 });
 
 test("R35B-C2：generation batch 只渲染后端发布的输入事实", () => {
@@ -212,7 +230,7 @@ test("R35A-C4：缺失值渲染成明确状态，不折算成 0 或通过", () =
     items: [{ candidate: candidate({ parameter_spec: { version: "v1", parameters: [] },
                                       universe_spec: { scope_kind: "a_share_all" },
                                       factor_spec: null, exit_spec: null }),
-              persistence: {}, proposal: {} }] }));
+              persistence: {}, proposal_evidence: {} }] }));
   assert.ok(html.includes("无声明参数"));
   assert.ok(html.includes("未记录"), "缺失 created_at 必须明说，不折算成 0");
   assert.ok(!html.includes("0 个参数"));

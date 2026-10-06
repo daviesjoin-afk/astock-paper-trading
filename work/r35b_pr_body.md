@@ -71,24 +71,36 @@ proposal row   → opaque event identity (secrets.token_hex(32)) → append ever
 batch row      → opaque request identity                       → append every request
 ```
 
-**为什么 candidate schema 升到 v2**：§16 要求 generator 语义版本变化能被观察到，而
-§18/B9 要求不同 generator 产生同一份 specification 时必须 dedup 成同一个
-`candidate_id`。这两条只有在"generator 能力身份属于**事件**而不是**内容**"时才同时
-成立 —— 与 R35-A 的 candidate vs proposal 是同一个原则的延续。因此：
+**generator 能力身份与提案 provenance 整体属于事件，不属于内容。** 移出 candidate
+identity 的是两族事实：
 
-- candidate fingerprint **不再**包含 `generator_type` / `generator_version` /
-  `generator_contract_version`；它们记在 proposal 事件与 generation batch 上，仍然
-  显式、可审计、绝不是自由文本（`generic` 被拒绝）。
-- 候选表去掉三个 `NOT NULL` 的 generator 列（留着会逼每个新行编一个能力身份）。
-- migration **v34** 重建候选表：forward-only、幂等、**不回填**；历史 v1 行的
-  `candidate_json` 逐字保留，`candidate_from_projection` 按
-  `candidate_schema_version` 走 v1 材料路径，**v1 行仍然自证**（绝不"升级"历史行）。
-- **重建必须 FK-safe**：`strategy_candidate_proposals.candidate_id` 引用候选表，而
-  生产连接开着 `PRAGMA foreign_keys=ON`；直接 DROP 被引用的父表会让升级一个已有
-  proposal 行的 v33 账本报 `FOREIGN KEY constraint failed`（初始化直接失败）。事务内
-  `PRAGMA foreign_keys=OFF` 是 no-op，因此重建走**引用重写**：先建 staged 父表 →
-  把子表重建为指向 staged 父表 → DROP 旧父表 → staged 父表 RENAME 回真名（SQLite 会把
-  子表里记录的父表名一起改写回 `strategy_candidates`）。外键在重建后仍然强制。
+1. generator 能力身份（`generator_type` / `generator_version` / `generator_contract_version`）——§16 要求 generator 语义版本可被观察，§18/B9 要求不同能力提出同一份 specification 必须 dedup；
+2. 提案 provenance（`hypothesis_id` / `research_provenance` / `random_seed` / `model_identity`）——R35-C 接入 AI generator 后，GPT model A 与 model B 提出同一份策略必须得到同一个 `candidate_id`。
+
+只搬走第一族、第二族留在内容里，等于把身份分裂的成因从一种换成另一种。
+
+**这是形状级的 ownership 转移，不是 `fingerprint_material.pop()`**：
+
+- v2 candidate 的**投影**与**内容身份**都不含这七项；
+- `candidate_from_projection` 在 v2 形状里读到它们直接 `fail closed`（防止有人手工塞回 `candidate_json`）；
+- `build_strategy_candidate` **不接受**这些参数（接受再丢弃同样会误导调用方）；
+- v1 历史行继续按自己的旧材料自证，不改历史。
+
+否则会出现 `candidate_id` 相同而 `candidate_json` 不同 → `append_candidate` idempotency
+conflict。proposal 写入时直接从 `CandidateSearchSpace` / batch 的显式事实取这七项，
+不再从 candidate 反推。
+
+candidate schema 因此升级为 `strategy-candidate-v2`；migration **v34** 重建候选表
+（forward-only、幂等、**不回填**），历史 v1 行的 `candidate_json` 逐字保留。
+
+## 4b. 读模型不制造隐式 latest
+
+`list_candidates_for_parent()` 发布的是**全部**提案证据引用
+（`proposal_evidence.proposals` / `proposal_count` / `generation_batch_ids`），
+**不是**"最近一条 proposal"。原因：`proposal_id` 是随机 opaque id，两条事件可以合法
+拥有完全相同的 `created_at`，`proposals[-1]` 只是一个稳定但语义错误的"latest"。要看某个
+batch 的完整输入，用显式的 `GET .../candidate-generations/{batch_id}`。append-only
+历史要么完整给出，要么按显式 id 单独取；不重新投影成隐含的 current 指针。
 
 ## 5. Generator 能力：显式 registry，不是 if/elif 链
 
@@ -222,18 +234,19 @@ allocation / execution **全部未改**；所有优化都只能表现为 **new S
 | B6 | `test_b6_exit_variation_changes_identity` |
 | B7 | `test_b7_inherited_parent_semantics_are_materialized_in_the_candidate`; `test_b7b_inherited_factor_and_exit_come_from_the_frozen_pin`; `test_b7c_absent_and_inherit_are_not_the_same_declaration` |
 | B8 | `test_b8_arbitrary_executable_payload_is_rejected`; `test_b8b_dynamic_field_lookup_and_unknown_ops_are_rejected`; `test_b8c_structural_mutation_cannot_smuggle_a_second_parameter_authority`; `test_b8d_generator_never_rewrites_parent_structure_implicitly` |
-| B9 | `test_b9_same_semantics_across_generators_dedup_to_one_candidate` |
-| B10 | `test_b10_batch_binds_the_frozen_generation_input`; `test_b10b_generation_input_fingerprint_is_content_bound`; `test_b10c_batch_rows_are_append_only_and_have_no_latest_pointer` |
+| B9 | `test_b9_same_semantics_across_generators_dedup_to_one_candidate`; `test_b9b_provenance_variation_does_not_split_candidate_identity` |
+| B10 | `test_b10_batch_binds_the_frozen_generation_input`; `test_b10b_generation_input_fingerprint_is_content_bound`; `test_b10c_batch_rows_are_append_only_and_have_no_latest_pointer`; `test_b10d_read_model_publishes_evidence_not_an_implicit_latest` |
 | B11 | `test_b11_batch_identity_is_not_candidate_identity` |
 | B12 | `test_b12_generator_path_has_no_evaluation_promotion_or_execution_dependency`; `test_b12b_no_scoring_ranking_or_winner_selection_in_the_generator_path`; `test_b12c_search_space_module_is_a_pure_contract`; `test_b12d_no_runtime_create_or_alter_table_in_the_generator_path`; `test_b12e_no_implicit_current_state_lookup`; `test_b12e2_repository_clock_is_confined_to_persistence_metadata`; `test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain` |
 
 额外：`CandidateContractUpgradeTests` 证明 v1 行仍自证、v34 重建幂等且不回填历史
-provenance，并在**已有 proposal 行且 FK 开启**的 v33 账本上验证重建 FK-safe。
+provenance、在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe，且 v2 载荷拒绝
+携带 provenance（`CandidateContractUpgradeTests`）。
 
 ## 18. Focused tests
 
 ```text
-backend/test_r35b_candidate_expansion.py        35 tests  OK   (B1–B12)
+backend/test_r35b_candidate_expansion.py        38 tests  OK   (B1–B12)
 backend/test_r35a_strategy_candidate.py         51 tests  OK   (C1–C10, v2 契约同步)
 backend/test_strategy_api_contract.py           19 tests  OK   (+ R35-B HTTP journey)
 backend/test_db_migrate / test_paper_schema_migrations / test_strategy_dsl
@@ -247,18 +260,21 @@ ruff check backend / compileall -q backend / git diff --check   all clean
 
 ## 19. Mutation result
 
-`work/r35b_candidate_expansion_mutation_check.py`:
+`work/r35b_candidate_expansion_mutation_check.py`（ID 前缀 **M-X** = eXpansion，刻意
+避开 R34-B allocation 已有的 M-B1…M-B20 命名空间）:
 
 ```text
-M-B1 DETECTED (an oversized or partially-declared space is silently truncated)
-M-B2 DETECTED (the canonical fingerprint ignores the factor slot)
-M-B3 DETECTED (the canonical fingerprint ignores the exit slot)
-M-B4 DETECTED (an inherited slot no longer resolves to the pinned parent's semantics)
-M-B5 DETECTED (different generators produce two candidate ids for one specification)
-M-B6 DETECTED (the generation input fingerprint stops binding the frozen input)
-M-B7 DETECTED (an arbitrary AST is accepted as a slot alternative)
-M-B8 DETECTED (the candidate table rebuild is no longer foreign-key safe)
-M-B detected = 8/8
+M-X1 DETECTED (an oversized or partially-declared space is silently truncated)
+M-X2 DETECTED (the canonical fingerprint ignores the factor slot)
+M-X3 DETECTED (the canonical fingerprint ignores the exit slot)
+M-X4 DETECTED (an inherited slot no longer resolves to the pinned parent's semantics)
+M-X5 DETECTED (different generators produce two candidate ids for one specification)
+M-X6 DETECTED (the generation input fingerprint stops binding the frozen input)
+M-X7 DETECTED (an arbitrary AST is accepted as a slot alternative)
+M-X8 DETECTED (the candidate table rebuild is no longer foreign-key safe)
+M-X9 DETECTED (provenance is popped from the fingerprint but kept in the payload)
+M-X10 DETECTED (the read model projects the proposal history as an implicit latest)
+M-X detected = 10/10
 survived = 0; fake = 0; timeout = 0
 restore SHA256 = PASS
 baseline after restore = GREEN
@@ -277,7 +293,7 @@ baseline after restore = GREEN
 ## 20. Full verification
 
 ```text
-backend full suite (local, Python 3.14.5)      Ran 5387 tests   OK (skipped=5)
+backend full suite (local, Python 3.14.5)      Ran 5390 tests   OK (skipped=5)
 backend full suite (Docker, --network none)    [exact-head CI]
 frontend unit tests (node --test)              168 tests  pass 0 fail
 Chromium E2E (npx playwright test)             [exact-head CI]

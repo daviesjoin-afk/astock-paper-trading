@@ -247,17 +247,23 @@ class FrontendPayloadContractTests(_ApiFixture):
         self.assertEqual(2, len(listed["items"]))
         self.assertIn("created_at", listed["items"][0]["persistence"])
         self.assertEqual(candidate_id, listed["items"][0]["candidate"]["candidate_id"])
-        # R35-B：列表项额外发布**提案事件**摘要（generator 能力 / batch），
-        # 因为候选行本身不再携带能力身份。
-        self.assertEqual("parameter_variant",
-                         listed["items"][0]["proposal"]["generator_type"])
-        self.assertEqual(64, len(listed["items"][0]["proposal"]["generation_batch_id"]))
+        # R35-B：列表项发布**全部**提案事件证据引用（不是"最近一条"）。
+        # proposal id 是随机 opaque id，同 timestamp 下无法表达可靠顺序，因此读模型
+        # 不得压成一个隐含的 latest 指针。
+        evidence = listed["items"][0]["proposal_evidence"]
+        self.assertEqual(1, evidence["proposal_count"])
+        self.assertEqual(1, len(evidence["proposals"]))
+        self.assertEqual(64, len(evidence["generation_batch_ids"][0]))
         # 列表按显式 batch id 发布 batch 摘要（绝不查"最新一批"）。
         self.assertEqual(1, len(listed["generation_batches"]))
-        self.assertEqual(listed["items"][0]["proposal"]["generation_batch_id"],
+        self.assertEqual(evidence["generation_batch_ids"][0],
                          listed["generation_batches"][0]["batch_id"])
         self.assertEqual(lifecycle["checksum"],
                          listed["generation_batches"][0]["parent_strategy_checksum"])
+        # v2 candidate 投影不再携带任何 provenance（内容身份只有 specification）。
+        for key in ("generator_type", "hypothesis_id", "research_provenance",
+                    "random_seed", "model_identity"):
+            self.assertNotIn(key, listed["items"][0]["candidate"])
         status, other = self._call(API.list_strategy_candidates, "fe_cand",
                                    strategy_version=lifecycle["version"],
                                    strategy_checksum="b" * 64)

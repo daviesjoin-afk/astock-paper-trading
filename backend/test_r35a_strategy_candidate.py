@@ -140,17 +140,21 @@ def _seed_registry(conn, *, rule=None, strategy_id=PARENT, name="R35A Parent"):
 
 
 def _propose(conn, candidate, *, input_fingerprint, created_at=None,
-             generation_batch_id=None):
-    """Record one proposal event with the capability identity it belongs to.
+             generation_batch_id=None, hypothesis_id=None, research_provenance=None,
+             random_seed=None, model_identity=None):
+    """Record one proposal event with the capability + provenance it belongs to.
 
-    R35-B：proposal 是事件，事件必须说清"是哪个 generator 能力、哪一次请求提出的"。
-    因此能力身份是**必填**参数，而不是从 candidate 上猜（候选已经不带它了）。
+    R35-B：proposal 是事件，事件必须说清"是哪个 generator 能力、哪次请求、由谁以
+    什么 model / hypothesis 提出的"。这些全是**必填**参数，而不是从 candidate 上
+    猜——candidate 已经是纯内容身份，不携带任何 provenance。
     """
     return SCRepo.record_proposal(
         conn, candidate, input_fingerprint=input_fingerprint,
         generator_type=SG.PARAMETER_VARIANT_GENERATOR,
         generator_version=SG.PARAMETER_VARIANT_VERSION,
         generator_contract_version=SG.GENERATOR_CONTRACT_VERSION,
+        hypothesis_id=hypothesis_id, research_provenance=research_provenance,
+        random_seed=random_seed, model_identity=model_identity,
         generation_batch_id=generation_batch_id, created_at=created_at)
 
 
@@ -226,7 +230,6 @@ class CandidateIdentityTests(_LedgerFixture):
                 intended_market_regime="momentum",
                 factor_spec=factor,
                 exit_spec=exit_spec,
-                research_provenance={"source_kind": "human"},
             )
             return candidate.candidate_id
 
@@ -243,8 +246,13 @@ class CandidateIdentityTests(_LedgerFixture):
                        "right": {"op": "const", "value": 9}}))
         self.assertNotEqual(baseline, reference)
 
-    def test_c2c_identity_material_carries_no_evaluation_result(self):
-        """Sharpe / 收益 / 回撤 / 胜率 / promotion 结果不属于 candidate identity。"""
+    def test_c2c_identity_material_carries_no_evaluation_or_provenance_fact(self):
+        """候选内容里既没有评估事实，也没有提案 provenance。
+
+        评估事实（Sharpe / 收益 / 回撤 / 胜率 / promotion）由 candidate 契约直接
+        拒绝；提案 provenance（generator 能力 / hypothesis / research source / seed /
+        model）则由 schema 形状排除——它们不属于 candidate，所以**无法**被塞进内容。
+        """
         for forbidden in ("sharpe", "max_drawdown", "win_rate", "promotion_result"):
             with self.assertRaises(SC.CandidateValidationError):
                 SC.build_strategy_candidate(
@@ -254,9 +262,21 @@ class CandidateIdentityTests(_LedgerFixture):
                     entry_spec=_parent_rule(),
                     universe_spec={"scope_kind": "a_share_all"},
                     intended_market_regime="momentum",
-                    research_provenance={"source_kind": "human"},
                     constraints={forbidden: 1},
                 )
+        candidate = self._candidates()[0]
+        for key in (*SC.LEGACY_GENERATOR_IDENTITY_KEYS, *SC.PROPOSAL_PROVENANCE_KEYS):
+            self.assertNotIn(key, candidate.fingerprint_material())
+            self.assertNotIn(key, candidate.projection())
+        # candidate 契约不接受 provenance 参数：传了就必须炸，而不是被静默丢弃。
+        with self.assertRaises(TypeError):
+            SC.build_strategy_candidate(
+                parent_identity={"strategy_id": PARENT, "strategy_version": 1,
+                                 "strategy_checksum": CHECKSUM_A},
+                asof="2026-10-05", entry_spec=_parent_rule(),
+                universe_spec={"scope_kind": "a_share_all"},
+                intended_market_regime="momentum",
+                research_provenance={"source_kind": "human"})
 
     def test_c2d_dsl_schema_version_is_part_of_the_fingerprint(self):
         self.assertTrue(hasattr(DSL, "DSL_SCHEMA_VERSION"))
@@ -323,8 +343,7 @@ class ParentPinningTests(_LedgerFixture):
             asof="2026-10-05",
             entry_spec=_thaw(pin.dsl_ast),
             universe_spec={"scope_kind": "a_share_all"},
-            intended_market_regime="momentum",
-            research_provenance={"source_kind": "human"})
+            intended_market_regime="momentum")
         SCRepo.append_candidate(self.conn, candidate)
         SR.save_definition(self.conn, PARENT,
                            {"dsl_ast": _parent_rule(ma_value=45)}, expected_version=1)
@@ -447,8 +466,7 @@ class ExecutablePayloadTests(_LedgerFixture):
                                  "strategy_checksum": CHECKSUM_A},
                 asof="2026-10-05",
                 entry_spec=spec, universe_spec={"scope_kind": "a_share_all"},
-                intended_market_regime="momentum",
-                research_provenance={"source_kind": "human"})
+                intended_market_regime="momentum")
 
     def test_c4_python_source_eval_exec_and_shell_payloads_are_rejected(self):
         # 这些不是"子串过滤"挡下来的：DSL schema 里**没有**这些 op，任何自由
@@ -478,8 +496,7 @@ class ExecutablePayloadTests(_LedgerFixture):
                 entry_spec=_parent_rule(),
                 exit_spec=_parent_rule(),  # 第二个 parameter authority
                 universe_spec={"scope_kind": "a_share_all"},
-                intended_market_regime="momentum",
-                research_provenance={"source_kind": "human"})
+                intended_market_regime="momentum")
 
     def test_c4d_unknown_ops_and_oversized_asts_are_rejected(self):
         self._rejected({"op": "gt", "left": {"op": "field", "name": "close"},
@@ -501,7 +518,6 @@ class MissingProvenanceTests(_LedgerFixture):
             "entry_spec": _parent_rule(),
             "universe_spec": {"scope_kind": "a_share_all"},
             "intended_market_regime": "momentum",
-            "research_provenance": {"source_kind": "human"},
         }
         values.update(overrides)
         return SC.build_strategy_candidate(**values)

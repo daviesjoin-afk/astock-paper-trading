@@ -114,6 +114,38 @@ def _closed_mapping(value, allowed: frozenset[str], label: str) -> dict:
     return {str(key): item for key, item in value.items()}
 
 
+def _research_provenance(value) -> dict:
+    """封闭词表：provenance 是**声明**，不是自由文本，也不是可执行内容。
+
+    R35-B 起这份词表的 owner 在这里（provenance 属于 proposal 事件 / batch 的输入
+    侧，不再是 candidate 的内容），但"封闭词表 + 逐项归一"这一步不能丢：否则
+    research/model provenance 会退化成自由文本。
+    """
+    declared = _closed_mapping(value, SC.RESEARCH_PROVENANCE_KEYS, "research_provenance")
+    result = {}
+    if "source_kind" in declared:
+        kind = _text(declared["source_kind"], "research_source_kind")
+        if kind not in SC.RESEARCH_SOURCE_KINDS:
+            raise SearchSpaceError("research_source_kind_is_not_allowlisted")
+        result["source_kind"] = kind
+    for key in ("source_identity", "source_fingerprint", "hypothesis_id"):
+        if key in declared:
+            text = _text(declared[key], f"research_{key}", required=False)
+            if text is not None:
+                result[key] = text
+    return result
+
+
+def _model_identity(value) -> dict:
+    """封闭词表：AI model 身份只允许 provider / model / version。"""
+    declared = _closed_mapping(value, SC.MODEL_IDENTITY_KEYS, "model_identity")
+    result = {}
+    for key in sorted(SC.MODEL_IDENTITY_KEYS):
+        if key in declared:
+            result[key] = _text(declared[key], f"model_{key}")
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class ParentStrategyPin:
     """A parent strategy pinned to an **immutable** exact version.
@@ -350,12 +382,14 @@ class CandidateSearchSpace:
             raise SearchSpaceError("random_seed_must_be_an_integer_or_null")
         object.__setattr__(self, "hypothesis_id",
                            _text(self.hypothesis_id, "hypothesis_id", required=False))
+        # provenance 在**输入侧**就按封闭词表归一：它们是 proposal 事件 / batch 的
+        # provenance，不是 candidate 的内容，但仍然必须是封闭声明而非自由文本。
         object.__setattr__(self, "research_provenance",
                            None if self.research_provenance is None
-                           else _freeze(dict(self.research_provenance)))
+                           else _freeze(_research_provenance(self.research_provenance)))
         object.__setattr__(self, "model_identity",
                            None if self.model_identity is None
-                           else _freeze(dict(self.model_identity)))
+                           else _freeze(_model_identity(self.model_identity)))
         # constraints 在这里就解析成**最终值**：继承 exact pinned parent，或只能收紧。
         # 候选因此永远不携带 "inherit-current-parent" 这种需要未来回读 registry 的语义。
         resolved = _tightened_constraints(pin.constraints, self.constraints)

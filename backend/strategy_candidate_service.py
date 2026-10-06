@@ -231,6 +231,14 @@ def generate_and_record_candidates(
     batch = generation_batch_identity(search_space=search_space,
                                       candidate_count=len(candidates))
     SCRepo.record_generation_batch(conn, batch=batch, created_at=created_at)
+    # proposal 事件的 provenance 全部取自 **search space / batch 的显式事实**，
+    # 绝不再从 candidate 反推：candidate 是内容身份，不携带 provenance。
+    provenance = {
+        "hypothesis_id": search_space.hypothesis_id,
+        "research_provenance": SS._thaw(search_space.research_provenance or {}),
+        "random_seed": search_space.random_seed,
+        "model_identity": SS._thaw(search_space.model_identity or {}),
+    }
     recorded = []
     for candidate in candidates:
         SCRepo.append_candidate(conn, candidate, created_at=created_at)
@@ -240,7 +248,8 @@ def generate_and_record_candidates(
             generator_type=search_space.generator_type,
             generator_version=search_space.generator_version,
             generator_contract_version=SG.GENERATOR_CONTRACT_VERSION,
-            generation_batch_id=batch["batch_id"], created_at=created_at)
+            generation_batch_id=batch["batch_id"], **provenance,
+            created_at=created_at)
         recorded.append(candidate.projection())
     return {
         "authority": "strategy_candidate_generation",
@@ -322,15 +331,17 @@ def list_candidates_for_parent(conn: sqlite3.Connection, *, strategy_id: str,
     for row in rows:
         candidate_id = str(row[0])
         read = get_candidate(conn, candidate_id)
-        summary = _latest_proposal_summary(read["proposals"])
+        evidence = _proposal_evidence_refs(read["proposals"])
         items.append({"candidate": read["candidate"], "persistence": read["persistence"],
                       # R35-B：generator 能力 / batch 是**提案事件**的 provenance，
-                      # 不是候选行的事实。这里只发布最近一条提案作为展示材料
-                      # （append-only 历史仍通过 get_candidate 的 proposals 完整可读）。
-                      "proposal": summary})
-        batch_id = summary.get("generation_batch_id")
-        if batch_id and batch_id not in batch_ids:
-            batch_ids.append(batch_id)
+                      # 不是候选行的事实。这里发布**全部**证据引用而不是"最近一条"：
+                      # proposal id 是随机 opaque id，同 timestamp 下 `proposals[-1]`
+                      # 只是"随机 id 排序靠后"，不是可靠的 latest，压成 latest 就是
+                      # 在 append-only 历史上重新投影出一个隐含的 current 指针。
+                      "proposal_evidence": evidence})
+        for batch_id in evidence["generation_batch_ids"]:
+            if batch_id and batch_id not in batch_ids:
+                batch_ids.append(batch_id)
     return {
         "authority": "read_only_exact_parent_candidates",
         "parent_strategy_pin": {"strategy_id": str(strategy_id),
@@ -338,23 +349,29 @@ def list_candidates_for_parent(conn: sqlite3.Connection, *, strategy_id: str,
                                 "strategy_checksum": str(strategy_checksum)},
         "items": items,
         # 只按**显式 batch id**读取（绝不查"最新一批"）；每个 batch 只出现一次。
+        # 要看某个 batch 的完整输入，调用方直接用
+        # GET /api/strategies/{id}/candidate-generations/{batch_id}。
         "generation_batches": [get_generation_batch(conn, batch_id)["generation_batch"]
                                for batch_id in batch_ids],
     }
 
 
-def _latest_proposal_summary(proposals) -> dict:
-    """The display-only summary of the most recent proposal event (never a verdict)."""
-    if not proposals:
-        return {}
-    last = proposals[-1]
+def _proposal_evidence_refs(proposals) -> dict:
+    """Every proposal event of one candidate, as unordered explicit references.
+
+    这里**不**做"最近一条"投影：``proposal_id`` 是随机 opaque id，两条事件可以合法
+    拥有完全相同的 ``created_at``，因此 ``proposals[-1]`` 只是一个稳定但语义错误的
+    "latest"。append-only 历史要么完整给出，要么用显式 id 单独取；重新投影出一个
+    隐含 current/latest 指针会与本层"没有 latest/current 读路径"的契约冲突。
+    """
+    refs = [{"proposal_id": item.get("proposal_id"),
+             "generation_batch_id": item.get("generation_batch_id"),
+             "created_at": item.get("created_at")}
+            for item in proposals]
     return {
-        "proposal_id": last.get("proposal_id"),
-        "generator_type": last.get("generator_type"),
-        "generator_version": last.get("generator_version"),
-        "generator_contract_version": last.get("generator_contract_version"),
-        "generation_batch_id": last.get("generation_batch_id"),
-        "created_at": last.get("created_at"),
+        "proposal_count": len(refs),
+        "proposals": refs,
+        "generation_batch_ids": [item["generation_batch_id"] for item in refs],
     }
 
 

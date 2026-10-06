@@ -665,7 +665,7 @@ the focused baseline after restore is green.
 | ID | Regression coverage |
 |---|---|
 | C1 | `test_c1_same_canonical_specification_yields_the_same_fingerprint`; `test_c1b_key_order_and_presentation_never_change_the_fingerprint` |
-| C2 | `test_c2_parameter_mutation_changes_the_fingerprint`; `test_c2b_entry_factor_exit_and_parent_checksum_mutations_all_move_identity`; `test_c2c_identity_material_carries_no_evaluation_result`; `test_c2d_dsl_schema_version_is_part_of_the_fingerprint`; `test_c2e_declared_parameter_contract_is_part_of_the_fingerprint` |
+| C2 | `test_c2_parameter_mutation_changes_the_fingerprint`; `test_c2b_entry_factor_exit_and_parent_checksum_mutations_all_move_identity`; `test_c2c_identity_material_carries_no_evaluation_or_provenance_fact`; `test_c2d_dsl_schema_version_is_part_of_the_fingerprint`; `test_c2e_declared_parameter_contract_is_part_of_the_fingerprint` |
 | C3 | `test_c3_parent_upgrade_does_not_change_recorded_candidate_provenance`; `test_c3b_pin_requires_the_exact_version_and_checksum`; `test_c3c_parent_without_declarative_dsl_cannot_be_a_generator_basis`; `test_c3d_pinning_never_falls_back_to_the_registry_head`; `test_c3e_parent_metadata_constraints_are_inherited_not_dropped` |
 | C4 | `test_c4_python_source_eval_exec_and_shell_payloads_are_rejected`; `test_c4b_dynamic_field_and_attribute_access_is_rejected`; `test_c4c_parameter_spec_cannot_be_smuggled_into_a_non_entry_rule`; `test_c4d_unknown_ops_and_oversized_asts_are_rejected` |
 | C5 | `test_c5_missing_parent_version_or_checksum_is_rejected`; `test_c5b_missing_generator_version_asof_and_entry_are_rejected`; `test_c5c_generator_input_requires_explicit_asof_universe_and_regime`; `test_c5d_service_requires_explicit_universe_and_regime`; `test_c5e_undeclared_or_out_of_contract_parameters_are_rejected`; `test_c5f_locked_parameters_cannot_be_varied`; `test_c5g_variant_space_is_bounded_by_the_input_contract` |
@@ -725,32 +725,36 @@ The append-only `*_no_update` / `*_no_delete` triggers are unchanged.
 | B6 | `test_b6_exit_variation_changes_identity` |
 | B7 | `test_b7_inherited_parent_semantics_are_materialized_in_the_candidate`; `test_b7b_inherited_factor_and_exit_come_from_the_frozen_pin`; `test_b7c_absent_and_inherit_are_not_the_same_declaration` |
 | B8 | `test_b8_arbitrary_executable_payload_is_rejected`; `test_b8b_dynamic_field_lookup_and_unknown_ops_are_rejected`; `test_b8c_structural_mutation_cannot_smuggle_a_second_parameter_authority`; `test_b8d_generator_never_rewrites_parent_structure_implicitly` |
-| B9 | `test_b9_same_semantics_across_generators_dedup_to_one_candidate` |
-| B10 | `test_b10_batch_binds_the_frozen_generation_input`; `test_b10b_generation_input_fingerprint_is_content_bound`; `test_b10c_batch_rows_are_append_only_and_have_no_latest_pointer` |
+| B9 | `test_b9_same_semantics_across_generators_dedup_to_one_candidate`; `test_b9b_provenance_variation_does_not_split_candidate_identity` |
+| B10 | `test_b10_batch_binds_the_frozen_generation_input`; `test_b10b_generation_input_fingerprint_is_content_bound`; `test_b10c_batch_rows_are_append_only_and_have_no_latest_pointer`; `test_b10d_read_model_publishes_evidence_not_an_implicit_latest` |
 | B11 | `test_b11_batch_identity_is_not_candidate_identity` |
 | B12 | `test_b12_generator_path_has_no_evaluation_promotion_or_execution_dependency`; `test_b12b_no_scoring_ranking_or_winner_selection_in_the_generator_path`; `test_b12c_search_space_module_is_a_pure_contract`; `test_b12d_no_runtime_create_or_alter_table_in_the_generator_path`; `test_b12e_no_implicit_current_state_lookup`; `test_b12e2_repository_clock_is_confined_to_persistence_metadata`; `test_b12f_generator_dispatch_is_a_registry_not_a_branching_chain` |
 
 HTTP 契约：`test_strategy_api_contract.test_r35b_search_space_generation_over_http`。
 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。
 Schema 升级：`CandidateContractUpgradeTests`（v1 行仍自证、v34 重建幂等且不回填、
-重建在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe）。
+重建在**已有 proposal 行且 FK 开启**的 v33 账本上 FK-safe、v2 载荷拒绝携带 provenance）。
 
 ### R35-B semantic mutation results
 
-`work/r35b_candidate_expansion_mutation_check.py` result: M-B1-M-B8 all **DETECTED**;
+`work/r35b_candidate_expansion_mutation_check.py` result: M-X1-M-X10 all **DETECTED**;
 `survived=0`, `fake=0`, `timeout=0`, `restore SHA256=PASS`, and the focused
 baseline after restore is green.
 
+ID 前缀是 **M-X**（eXpansion），刻意避开 R34-B allocation 已有的 M-B1…M-B20 命名空间。
+
 | ID | Semantic mutation | Detector |
 |---|---|---|
-| M-B1 | an oversized or partially-declared space is silently truncated | B3 |
-| M-B2 | the canonical fingerprint ignores the factor slot | B4 |
-| M-B3 | the canonical fingerprint ignores the exit slot | B6 |
-| M-B4 | an inherited slot no longer resolves to the pinned parent's semantics | B7b |
-| M-B5 | different generators produce two candidate ids for one specification | B9 |
-| M-B6 | the generation input fingerprint stops binding the frozen input | B10 / B10b |
-| M-B7 | an arbitrary AST is accepted as a slot alternative | B8 |
-| M-B8 | the candidate table rebuild is no longer foreign-key safe | CandidateContractUpgradeTests |
+| M-X1 | an oversized or partially-declared space is silently truncated | B3 |
+| M-X2 | the canonical fingerprint ignores the factor slot | B4 |
+| M-X3 | the canonical fingerprint ignores the exit slot | B6 |
+| M-X4 | an inherited slot no longer resolves to the pinned parent's semantics | B7b |
+| M-X5 | different generators produce two candidate ids for one specification | B9 |
+| M-X6 | the generation input fingerprint stops binding the frozen input | B10 / B10b |
+| M-X7 | an arbitrary AST is accepted as a slot alternative | B8 |
+| M-X8 | the candidate table rebuild is no longer foreign-key safe | CandidateContractUpgradeTests |
+| M-X9 | provenance is popped from the fingerprint but kept in the payload (半完成的 ownership 转移) | CandidateContractUpgradeTests |
+| M-X10 | the read model projects the proposal history as an implicit latest | B10d |
 
 ### R35-B identity layers (candidate / proposal / batch)
 
@@ -760,12 +764,19 @@ proposal row   → opaque event identity (secrets.token_hex(32)) → append ever
 batch row      → opaque request identity                       → append every request
 ```
 
-R35-B 把 **generator 能力身份**从 candidate fingerprint 移出：candidate 是内容身份，
-"哪个能力、哪一次请求提出了它"是 proposal 事件与 generation batch 的 provenance。
-因此同一份 canonical specification 由 `factor_variant` 与 `bounded_combination`
-分别提出时，候选行 1 条、proposal 事件 2 条（B9）。candidate schema 因此升级为
-`strategy-candidate-v2`（migration v34 重建候选表并去掉三个 `NOT NULL` 的 generator
-列，forward-only、不回填；历史 v1 行的 `candidate_json` 逐字保留，仍按 v1 材料自证）。
+R35-B 把**提案 provenance 整体**移出 candidate identity 与 payload。移出的是两族事实：
+
+1. generator 能力身份（`generator_type` / `generator_version` / `generator_contract_version`）——同一份 canonical specification 由 `factor_variant` 与 `bounded_combination` 分别提出时必须得到同一个 `candidate_id`；
+2. 提案 provenance（`hypothesis_id` / `research_provenance` / `random_seed` / `model_identity`）——R35-C 接入 AI generator 后，GPT model A 与 model B 提出同一份策略时必须得到同一个 `candidate_id`。
+
+只把 `generator_type` 移出、其余仍留在内容里，等于把身份分裂的成因从一种换成另一种。因此这次是**形状级**的 ownership 转移：v2 candidate 的**投影与内容身份**都不含这七项，`candidate_from_projection` 读到它们直接拒绝（fail closed），`build_strategy_candidate` 也不再接受这些参数。v1 历史行继续按自己的旧材料自证，不改历史（migration v34 forward-only、不回填）。B9b 证明 provenance 变化不会分裂语义身份。
+
 `generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
 契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可回答。
+
+读模型（`list_candidates_for_parent`）发布的是**全部**提案证据引用
+（`proposal_evidence.proposals` / `proposal_count` / `generation_batch_ids`），**不是**
+"最近一条 proposal"：`proposal_id` 是随机 opaque id，两条事件可以合法拥有完全相同的
+`created_at`，`proposals[-1]` 只是一个稳定但语义错误的"latest"。要看某个 batch 的完整
+输入，用显式的 `GET .../candidate-generations/{batch_id}`。B10d 覆盖。
 

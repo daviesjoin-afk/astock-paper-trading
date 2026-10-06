@@ -209,6 +209,8 @@ def get_generation_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None
 def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *,
                     input_fingerprint: str, generator_type: str,
                     generator_version: str, generator_contract_version: str,
+                    hypothesis_id: str | None, research_provenance,
+                    random_seed: int | None, model_identity,
                     generation_batch_id: str | None = None,
                     created_at: str | None = None) -> str:
     """Record one proposal event for an already-persisted candidate.
@@ -216,6 +218,10 @@ def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *
     This is how dedup keeps its evidence: the candidate row is written once, but
     every proposal (generator capability, batch, as-of, hypothesis, model, input
     fingerprint) is appended. Returns the proposal id.
+
+    provenance 由调用方**显式**传入（来自 search space / batch 的显式事实），绝不再
+    从 candidate 反推：candidate 已经是内容身份，不携带 provenance（见
+    ``strategy_candidate.CANDIDATE_SCHEMA_VERSION``）。
 
     ``proposal_id`` is an opaque event identity: it is **not** a fingerprint of the
     proposal content, so two occurrences with an identical candidate, identical
@@ -234,10 +240,10 @@ def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *
     payload = _proposal_payload(
         generator_type=generator_type, generator_version=generator_version,
         generator_contract_version=generator_contract_version,
-        asof=candidate.asof, hypothesis_id=candidate.hypothesis_id,
-        research_provenance=candidate.research_provenance,
-        input_fingerprint=input_fingerprint, random_seed=candidate.random_seed,
-        model_identity=candidate.model_identity, generation_batch_id=generation_batch_id)
+        asof=candidate.asof, hypothesis_id=hypothesis_id,
+        research_provenance=research_provenance,
+        input_fingerprint=input_fingerprint, random_seed=random_seed,
+        model_identity=model_identity, generation_batch_id=generation_batch_id)
     stamp, proposal_id = _proposal_event_identity(created_at)
     conn.execute(
         """INSERT INTO strategy_candidate_proposals

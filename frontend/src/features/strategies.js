@@ -756,12 +756,16 @@ export function wbCandidateHtml(candidate){
     +'<dt>Parent pin</dt><dd data-testid="candidate-parent">'+adaptiveEsc(String(candidate.parent_strategy_id||'—'))
     +' @ v'+adaptiveEsc(String(candidate.parent_strategy_version))
     +' · <code>'+adaptiveEsc(String(candidate.parent_strategy_checksum||''))+'</code></dd>'
-    // R35-B：generator 能力属于**提案事件**的 provenance，不再挂在候选行上；
-    // 因此这里显示的是"这个候选由哪次生成请求提出"，缺记录时明说而不是留空。
-    +'<dt>Proposal</dt><dd data-testid="candidate-proposal">'
-    +adaptiveEsc(String(candidate.proposal_generator_type||'未记录'))
-    +' / '+adaptiveEsc(String(candidate.proposal_generator_version||'—'))
-    +' · batch '+adaptiveEsc(String(candidate.proposal_generation_batch_id||'未记录'))+'</dd>'
+    // R35-B：generator 能力与提案 provenance 属于**提案事件**，不在候选行上；
+    // 这里显示的是全部提案事件证据（无序），缺记录时明说而不是留空。前端**不得**
+    // 从中挑一条当成"当前 generator / 当前 batch"——proposal id 是随机 opaque id，
+    // 同 timestamp 下不存在可靠的先后顺序。
+    +'<dt>Proposals</dt><dd data-testid="candidate-proposals">'
+    +adaptiveEsc(String(candidate.proposal_count===undefined?'未记录':candidate.proposal_count))
+    +' 条'
+    +(candidate.generation_batch_ids&&candidate.generation_batch_ids.length
+      ?' · batch '+candidate.generation_batch_ids.map(adaptiveEsc).join(' · '):' · 未记录')
+    +'</dd>'
     // created_at 是持久化事实（不属于 candidate 指纹），由台账单独发布。
     +'<dt>Created / asof</dt><dd>'+adaptiveEsc(String(candidate.created_at||'未记录'))+' / '+adaptiveEsc(candidate.asof||'')+'</dd>'
     +'<dt>Fingerprint</dt><dd data-testid="candidate-fingerprint"><code>'+adaptiveEsc(candidate.candidate_fingerprint||'')+'</code></dd>'
@@ -802,14 +806,13 @@ export function wbGenerationBatchHtml(batch){
 }
 export function wbCandidatesHtml(strategyId,view){
   var rows=((view&&view.items)||[]).map(function(item){
-    // 每一项是 {candidate, persistence, proposal}：created_at 属于台账，不属于候选身份；
-    // generator 能力 / batch 属于**提案事件**，同样不属于候选身份。
-    var proposal=item.proposal||{};
-    return wbCandidateHtml(Object.assign({},item.candidate||{},
-      {created_at:(item.persistence||{}).created_at,
-       proposal_generator_type:proposal.generator_type,
-       proposal_generator_version:proposal.generator_version,
-       proposal_generation_batch_id:proposal.generation_batch_id}));
+    // 每一项是 {candidate, persistence, proposal_evidence}：created_at 属于台账，
+    // proposal 证据属于事件，两者都不属于候选身份。
+    var evidence=item.proposal_evidence||{};
+    return wbCandidateHtml(Object.assign({},item.candidate||{},{
+      created_at:(item.persistence||{}).created_at,
+      proposal_count:evidence.proposal_count,
+      generation_batch_ids:evidence.generation_batch_ids}));
   }).join('');
   var pin=(view&&view.parent_strategy_pin)||{};
   // R35-B：batch 摘要按显式 batch id 读取，绝不请求"最新一批"。
