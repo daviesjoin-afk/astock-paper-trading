@@ -98,16 +98,30 @@ def _load_exact_batch(conn: sqlite3.Connection, generation_batch_id: str) -> dic
     ``get_generation_batch`` 只按显式 id 取，且自身校验 id 形状。这里刻意**没有**
     "最近一批"兜底：``ORDER BY created_at DESC LIMIT 1`` 之类的隐式输入会让一次 search
     悄悄换掉它的输入集合，而 fingerprint 却看不出来。
+
+    但"按 id 找到了行"还不够：``get_generation_batch`` 返回的是 ``batch_json`` 解析结果，
+    它**不**校验 payload 自述的身份是否等于查找键。若某行损坏（或错误地存了另一个 batch
+    的 JSON），请求 A 会静默拿到 B 的候选集合，并把这些事实当成 A 记录下来。因此这里必须
+    把 payload 身份与查找键**双向**核对，不一致就 fail closed。
     """
     if not isinstance(generation_batch_id, str) or not generation_batch_id.strip():
         raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, "generation_batch_id required")
+    requested = generation_batch_id.strip()
     try:
-        batch = SCRepo.get_generation_batch(conn, generation_batch_id.strip())
+        batch = SCRepo.get_generation_batch(conn, requested)
     except (SCRepo.StrategyCandidateRepositoryError, sqlite3.Error) as exc:
         raise ExperimentSearchError(REASON_BATCH_NOT_FOUND,
                                     type(exc).__name__) from None
     if batch is None:
-        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, generation_batch_id)
+        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, requested)
+    if not isinstance(batch, dict):
+        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, "batch payload is not a mapping")
+    # payload 自述身份必须与查找键一致：请求 A 绝不能拿到 B 的候选。
+    if str(batch.get("batch_id") or "") != requested:
+        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, "batch identity mismatch")
+    if not ESC.is_search_identity(str(batch.get("generation_input_fingerprint") or "")):
+        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND,
+                                    "batch payload lacks a canonical input fingerprint")
     return batch
 
 

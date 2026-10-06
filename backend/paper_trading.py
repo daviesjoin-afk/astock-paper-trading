@@ -1902,6 +1902,11 @@ def init_db():
                 # R35-A（v33）：策略候选台账（DDL 同样只在 paper_schema_migrations）。
                 # R35-B（v34）：候选表按内容身份重建 + generation batch 追加表。
                 PSM.ensure_strategy_candidates(conn)
+                # R36-A（v35）：实验搜索控制面三张追加表（DDL 同样只在
+                # paper_schema_migrations）。**必须**在这里也建：v35 migration 只是
+                # 升级路径，正常 bootstrap 若缺少它，第一次 search 写入会直接
+                # `no such table`。
+                PSM.ensure_experiment_search(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2225,6 +2230,9 @@ def init_db():
         PSM.ensure_portfolio_allocation_plans(conn)
         # R35-A v33：策略候选台账（DDL 同样只在 paper_schema_migrations）。
         PSM.ensure_strategy_candidates(conn)
+        # R36-A v35：实验搜索控制面三张追加表。与上面同样必须在这里幂等建表，
+        # 否则正常 bootstrap 出来的库缺少 search 表，第一次写入即 `no such table`。
+        PSM.ensure_experiment_search(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

@@ -28,6 +28,10 @@ BASELINE = (
     "test_s1_known_batch_is_accepted_and_unknown_or_malformed_is_rejected",
     "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
     "test_s1b_source_has_no_latest_or_recent_batch_lookup",
+    "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
+    "test_s1c_batch_payload_identity_must_match_the_lookup_key",
+    "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
+    "test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected",
     "test_r36a_experiment_search_controller.CandidatePoolTests."
     "test_s2_a_candidate_from_another_batch_is_rejected",
     "test_r36a_experiment_search_controller.CandidatePoolTests."
@@ -98,6 +102,8 @@ BASELINE = (
     "test_foreign_keys_are_enforced",
     "test_r36a_experiment_search_controller.SchemaTests."
     "test_migration_is_idempotent_and_needs_no_backfill",
+    "test_r36a_experiment_search_controller.SchemaTests."
+    "test_normal_bootstrap_creates_the_search_tables",
 )
 
 CONTRACT = "backend/experiment_search_contract.py"
@@ -105,6 +111,7 @@ REPOSITORY = "backend/experiment_search_repository.py"
 SERVICE = "backend/experiment_search_service.py"
 MIGRATIONS = "backend/paper_schema_migrations.py"
 CANDIDATE = "backend/strategy_candidate.py"
+PAPER = "backend/paper_trading.py"
 
 MUTATIONS = [
     # M-SC1 —— exact generation batch 退化成"最近一批"：一次 search 的输入集合会在
@@ -113,15 +120,16 @@ MUTATIONS = [
      "semantic": "an exact generation batch falls back to the most recent batch",
      "edits": [(SERVICE,
                 '    if batch is None:\n'
-                '        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, generation_batch_id)\n',
+                '        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, requested)\n',
                 '    if batch is None:\n'
                 '        row = conn.execute(\n'
                 '            "SELECT batch_json FROM strategy_candidate_generation_batches"\n'
                 '            " ORDER BY created_at DESC LIMIT 1").fetchone()\n'
                 '        if row is None:\n'
-                '            raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, generation_batch_id)\n'
+                '            raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, requested)\n'
                 '        import json as _json\n'
-                '        batch = _json.loads(str(row[0]))\n')],
+                '        batch = _json.loads(str(row[0]))\n'
+                '        requested = str(batch.get("batch_id") or requested)\n')],
      "detectors": [
          "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
          "test_s1_known_batch_is_accepted_and_unknown_or_malformed_is_rejected",
@@ -268,6 +276,44 @@ MUTATIONS = [
          "test_s15_completed_is_terminal",
          "test_r36a_experiment_search_controller.StateMachineTests."
          "test_s16_cancelled_is_terminal",
+     ]},
+    # M-SC11 —— 正常 bootstrap 不建 search 表：v35 migration 只是升级路径，应用自己
+    # open/create 的库缺少三张表，第一次 search 写入直接 `no such table`。
+    # 这是 code review 抓到的真实缺陷（两条 init_db 路径都必须建表）。
+    {"id": "M-SC11",
+     "semantic": "normal bootstrap stops creating the search tables",
+     "edits": [(PAPER,
+                '                # R36-A（v35）：实验搜索控制面三张追加表（DDL 同样只在\n'
+                '                # paper_schema_migrations）。**必须**在这里也建：v35 migration 只是\n'
+                '                # 升级路径，正常 bootstrap 若缺少它，第一次 search 写入会直接\n'
+                '                # `no such table`。\n'
+                '                PSM.ensure_experiment_search(conn)\n',
+                '                pass  # bootstrap no longer initialises search tables\n'),
+               (PAPER,
+                '        # R36-A v35：实验搜索控制面三张追加表。与上面同样必须在这里幂等建表，\n'
+                '        # 否则正常 bootstrap 出来的库缺少 search 表，第一次写入即 `no such table`。\n'
+                '        PSM.ensure_experiment_search(conn)\n',
+                '        pass  # bootstrap no longer initialises search tables\n')],
+     "detectors": [
+         "test_r36a_experiment_search_controller.SchemaTests."
+         "test_normal_bootstrap_creates_the_search_tables",
+     ]},
+    # M-SC12 —— 不校验 batch payload 自述身份：请求 A 可以静默拿到 B 的候选集合，
+    # 并把 B 的事实记为 A。这是 code review 抓到的第二个真实缺陷。
+    {"id": "M-SC12",
+     "semantic": "the batch payload identity is not checked against the lookup key",
+     "edits": [(SERVICE,
+                '    if str(batch.get("batch_id") or "") != requested:\n'
+                '        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, "batch identity mismatch")\n'
+                '    if not ESC.is_search_identity(str(batch.get("generation_input_fingerprint") or "")):\n'
+                '        raise ExperimentSearchError(REASON_BATCH_NOT_FOUND,\n'
+                '                                    "batch payload lacks a canonical input fingerprint")\n',
+                '    pass  # payload identity is trusted as-is\n')],
+     "detectors": [
+         "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
+         "test_s1c_batch_payload_identity_must_match_the_lookup_key",
+         "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
+         "test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected",
      ]},
 ]
 

@@ -215,12 +215,25 @@ NO 读 current/latest strategy 或 research
 NO 把 R35 generator 能力搬到 R36
 ```
 
-## 11. 验证
+## 11. Code review 抓到的两个真实缺陷（已修）
+
+1. **正常 bootstrap 不建 search 表**（P2）：v35 migration 只是**升级**路径，而
+   `paper_trading.init_db()` 的两条路径都只建到 `ensure_strategy_candidates`。于是应用
+   自己 open / create 的库没有 `experiment_search_*`，第一次 search 写入直接
+   `no such table`。现在两条 init_db 路径都幂等建表，并有测试直接跑真实 `init_db()` 后
+   **真的写一次 search**；M-SC11 钉住。
+2. **batch payload 身份未与查找键核对**（P2）：`get_generation_batch()` 按 id 取行后直接
+   返回 `batch_json` 解析结果，**不**校验 payload 自述身份。若某行损坏、或存了另一个
+   batch 的 JSON，请求 A 会静默拿到 B 的候选集合，并把 B 的事实记成 A —— 一次"精确
+   batch"请求却调度了另一个 batch。现在 service 双向核对 `batch_id` 与 canonical
+   `generation_input_fingerprint`，不一致 fail closed；S1c / S1d 覆盖，M-SC12 钉住。
+
+## 12. 验证
 
 ```text
-R36-A focused tests                 43 tests OK（S1–S22）
+R36-A focused tests                 46 tests OK（S1–S22）
 candidate schema hardening          v1 PASS / v2 PASS / unknown REJECT
-mutation M-SC1…M-SC10               detected = 10/10
+mutation M-SC1…M-SC12               detected = 12/12
                                     survived = 0; fake = 0; timeout = 0
                                     restore SHA256 = PASS; baseline GREEN
 ```
@@ -231,7 +244,7 @@ mutation M-SC1…M-SC10               detected = 10/10
 （stub `list_batch_proposals` 造幽灵 id，要求稳定 reason 且零行写入），M-SC3 同时打破
 两半后 DETECTED。
 
-## 12. 固定维护性报告
+## 13. 固定维护性报告
 
 ```text
 Business authority added:

@@ -201,6 +201,58 @@ class ExactGenerationBatchTests(_Base):
             code = self._code_without_comments(module.__file__)
             self.assertNotIn("ORDER BY created_at DESC", code)
 
+    def test_s1c_batch_payload_identity_must_match_the_lookup_key(self):
+        """S1c — 行内 payload 自述的 batch 身份必须等于查找键。
+
+        ``get_generation_batch`` 只按 id 取行并返回 ``batch_json``，它**不**校验 payload
+        自述身份。若某行损坏、或错误地存了另一个 batch 的 JSON，请求 A 会静默拿到 B 的
+        候选集合，并把 B 的事实当成 A 记录下来。因此 service 必须双向核对并 fail closed。
+        """
+        batch_a = self.batch(values=_LEGAL_VALUES[:2], campaign="a")
+        batch_b = self.batch(values=[22], campaign="b")
+        with self._open() as conn:
+            row = conn.execute(
+                "SELECT batch_json FROM strategy_candidate_generation_batches"
+                " WHERE batch_id=?", (batch_a["generation_batch_id"],)).fetchone()
+        payload = json.loads(row[0])
+        # 请求 A，但行里自述的是 B。
+        payload["batch_id"] = batch_b["generation_batch_id"]
+        with self._open(immediate=True) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS strategy_candidate_generation_batches_no_update")
+            conn.execute(
+                "UPDATE strategy_candidate_generation_batches SET batch_json=?"
+                " WHERE batch_id=?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                 batch_a["generation_batch_id"]))
+        before = self.counts()
+        with self.assertRaises(ESS.ExperimentSearchError) as ctx:
+            self.create(batch_a)
+        self.assertEqual(ESS.REASON_BATCH_NOT_FOUND, ctx.exception.reason)
+        self.assertIn("identity mismatch", ctx.exception.detail)
+        self.assertEqual(before, self.counts(), "身份不符不得创建任何控制面行")
+
+    def test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected(self):
+        """payload 缺 canonical input fingerprint ⇒ fail closed，不带着空身份建 run。"""
+        batch = self.batch()
+        with self._open() as conn:
+            row = conn.execute(
+                "SELECT batch_json FROM strategy_candidate_generation_batches"
+                " WHERE batch_id=?", (batch["generation_batch_id"],)).fetchone()
+        payload = json.loads(row[0])
+        payload["generation_input_fingerprint"] = ""
+        with self._open(immediate=True) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS strategy_candidate_generation_batches_no_update")
+            conn.execute(
+                "UPDATE strategy_candidate_generation_batches SET batch_json=?"
+                " WHERE batch_id=?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                 batch["generation_batch_id"]))
+        before = self.counts()
+        with self.assertRaises(ESS.ExperimentSearchError) as ctx:
+            self.create(batch)
+        self.assertEqual(ESS.REASON_BATCH_NOT_FOUND, ctx.exception.reason)
+        self.assertEqual(before, self.counts())
+
 
 class CandidatePoolTests(_Base):
     """S2/S3/S4 — pool 属于 batch、自证、schema allowlist。"""
@@ -917,6 +969,51 @@ class SchemaTests(_Base):
         for table in ("experiment_search_runs", "experiment_search_jobs",
                       "experiment_search_job_events"):
             self.assertIn(table, created)
+
+    def test_normal_bootstrap_creates_the_search_tables(self):
+        """正常 bootstrap（``paper_trading.init_db()``）必须建出 search 三张表。
+
+        v35 migration 只是**升级**路径。若正常 bootstrap 不建表，应用打开/新建的库就没有
+        ``experiment_search_*``，第一次 search 写入会直接 ``no such table`` —— 而这条路径
+        不经过 ``db_migrate``。这里直接调用真实 ``init_db()``，并真的写一次 search。
+        """
+        import paper_trading as PT
+        fresh = os.path.join(self._dir.name, "bootstrap.sqlite3")
+        original = PT.DB_PATH
+        PT.DB_PATH = fresh
+        self.addCleanup(setattr, PT, "DB_PATH", original)
+        PT.init_db()
+
+        conn = sqlite3.connect(fresh, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("experiment_search_runs", "experiment_search_jobs",
+                          "experiment_search_job_events"):
+                self.assertIn(table, tables,
+                              f"正常 bootstrap 缺少 {table}（首次写入会 no such table）")
+            # 真的写一次：证明不是"表存在但写不进去"。parent 必须在这个新库里建。
+            spec = SR.create_user_definition(
+                conn, "boot_parent", "Boot Parent", dsl_ast=_RULE,
+                metadata={"constraints": {"max_positions": 5}}, actor="test")
+            conn.execute("BEGIN IMMEDIATE")
+            result = SCV.generate_and_record_candidates(
+                conn, strategy_id="boot_parent", strategy_version=spec.current_version,
+                strategy_checksum=spec.current_checksum, asof=DAY,
+                generator_type=SG.PARAMETER_VARIANT_GENERATOR,
+                generator_version=SG.PARAMETER_VARIANT_VERSION,
+                parameter_variants={"ma_period": _LEGAL_VALUES[:2]},
+                universe_spec=UNIVERSE, intended_market_regime=REGIME,
+                evidence_count=1, hypothesis_id="h_boot", max_candidates=32)
+            run = ESS.create_search_run(
+                conn, generation_batch_id=result["generation_batch_id"],
+                budget=ESC.SearchBudget(max_candidates=4))
+            conn.execute("COMMIT")
+            self.assertEqual(2, run["jobs_created"])
+        finally:
+            conn.close()
 
     def test_run_id_collision_with_different_content_is_a_conflict(self):
         batch = self.batch(values=_LEGAL_VALUES[:3])

@@ -918,13 +918,15 @@ R35-B 的 `M-X`。
 
 ## R36-A Experiment Search Controller Foundation
 
-`backend/test_r36a_experiment_search_controller.py`（S1–S22，43 tests）。
+`backend/test_r36a_experiment_search_controller.py`（S1–S22，46 tests）。
 四句边界见 `plans/r36a-experiment-search-controller-foundation.md`。
 
 | 不变量 | 测试 |
 | --- | --- |
 | S1 exact generation batch only（已知 OK；未知 / 畸形 / 空 → reject，零行写入） | `ExactGenerationBatchTests` |
 | S1b 源码级无 latest / recent / current batch 读取，代码里无 `ORDER BY created_at DESC` | `test_s1b_source_has_no_latest_or_recent_batch_lookup` |
+| S1c **batch payload 自述身份必须等于查找键**（否则请求 A 静默拿到 B 的候选） | `test_s1c_batch_payload_identity_must_match_the_lookup_key` |
+| S1d batch payload 缺 canonical input fingerprint → reject | `test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected` |
 | S2 batch 外 candidate 混入 → reject（不静默过滤） | `CandidatePoolTests`（2 tests） |
 | S3 篡改候选内容 → ledger 自证失败，零行写入 | `test_s3_tampered_candidate_row_fails_closed` |
 | S3b 候选与指纹不自洽 → reject | `test_s3b_proposal_json_alone_cannot_vouch_for_a_candidate` |
@@ -949,6 +951,7 @@ R35-B 的 `M-X`。
 | S21 controller 不 import / 不执行 evaluation、promotion、lifecycle、execution | `test_s21_no_evaluation_or_promotion_dependency`、`test_s21b_controller_does_not_execute_runners` |
 | S22 无 AI provider / transport 依赖；无 priority / ranking 权威 | `test_s22_no_ai_provider_dependency`、`test_s22b_no_selection_ranking_or_priority_authority` |
 | migration v35：append-only trigger、FK、幂等、无 backfill、run id 冲突 | `SchemaTests`（4 tests） |
+| **正常 bootstrap（`init_db()`）也必须建出 search 三张表**并真的能写一次 search | `test_normal_bootstrap_creates_the_search_tables` |
 
 ### R36-A semantic mutation results
 
@@ -964,6 +967,8 @@ R35-B 的 `M-X`。
 | M-SC8 | current state 用 created_at 而不是 event_seq | S17 / S17b |
 | M-SC9 | retry 预算被绕过 | S14 |
 | M-SC10 | completed / cancelled 不再是终态 | S15 / S16 |
+| M-SC11 | 正常 bootstrap 不再建 search 表（首次写入 `no such table`） | `test_normal_bootstrap_creates_the_search_tables` |
+| M-SC12 | 不校验 batch payload 自述身份（请求 A 拿到 B 的候选） | S1c / S1d |
 
 **M-SC3 第一版 SURVIVED，暴露真实缺口**：`get_candidate()` 自身已重算指纹自证，所以单删
 service 那行显式 `verify` 无测试可发现；但同段代码 `candidate is None → continue` 会让
