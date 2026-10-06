@@ -120,6 +120,22 @@ R35-A 加入受约束的**策略候选**链（事实层，无 promotion/executio
 `POST /api/strategies/{id}/candidates`、`GET /api/strategies/{id}/candidates`
 （按 exact version+checksum）与 `GET /api/strategies/{id}/candidates/{candidate_id}`。
 DDL 由 `paper_schema_migrations.ensure_strategy_candidates` 唯一持有（migration v33）。
+
+R35-B 把它扩展成 **Deterministic Candidate Expansion**：新增
+`strategy_candidate_search_space`（纯契约：显式、有限、可 fingerprint 的搜索空间声明 +
+组合基数 + slot 继承语义；无 DB / registry / 时钟），`strategy_generator` 改为显式
+capability registry（`parameter_variant` / `factor_variant` / `entry_variant` /
+`exit_variant` / `bounded_combination`），并新增 generation batch 追加表
+`strategy_candidate_generation_batches`（一次生成请求 → 一个 batch identity → N 条
+proposal 事件；无 current/latest 指针）。candidate 升级为内容身份
+（`strategy-candidate-v2`：generator 能力身份与提案 provenance（hypothesis / research
+source / seed / model）全部移到 proposal 事件与 batch 上、**不**参与 candidate fingerprint ——
+同一 specification 由不同 generator 或不同 model 提出必须是同一个 candidate；候选表
+同样是**纯内容持久化**，不含任何 generation provenance 列，`append_candidate()` 也不写；
+migration **v34** 重建候选表，forward-only、不回填、历史 v1 行仍自证）。新增路由
+`GET /api/strategies/{id}/candidate-generations/{batch_id}`；候选列表发布**全部**提案
+证据引用，不投影成隐含 latest。R35-B **不**拥有
+evaluation / promotion / execution / allocation 权限（见 `plans/r35b-deterministic-candidate-expansion.md`）。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

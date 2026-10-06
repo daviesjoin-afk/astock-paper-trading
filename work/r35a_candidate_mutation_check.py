@@ -23,12 +23,12 @@ BASELINE = (
     "test_r35a_strategy_candidate.CandidateIdentityTests.test_c1_same_canonical_specification_yields_the_same_fingerprint",
     "test_r35a_strategy_candidate.CandidateIdentityTests.test_c2_parameter_mutation_changes_the_fingerprint",
     "test_r35a_strategy_candidate.CandidateIdentityTests.test_c2b_entry_factor_exit_and_parent_checksum_mutations_all_move_identity",
-    "test_r35a_strategy_candidate.CandidateIdentityTests.test_c2c_identity_material_carries_no_evaluation_result",
+    "test_r35a_strategy_candidate.CandidateIdentityTests.test_c2c_identity_material_carries_no_evaluation_or_provenance_fact",
     "test_r35a_strategy_candidate.ExecutablePayloadTests.test_c4_python_source_eval_exec_and_shell_payloads_are_rejected",
     "test_r35a_strategy_candidate.ExecutablePayloadTests.test_c4b_dynamic_field_and_attribute_access_is_rejected",
     "test_r35a_strategy_candidate.ExecutablePayloadTests.test_c4d_unknown_ops_and_oversized_asts_are_rejected",
     "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5_missing_parent_version_or_checksum_is_rejected",
-    "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5b_missing_generator_version_asof_and_entry_are_rejected",
+    "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5b_missing_asof_and_entry_are_rejected",
     "test_r35a_strategy_candidate.MissingProvenanceTests.test_c5e_undeclared_or_out_of_contract_parameters_are_rejected",
     "test_r35a_strategy_candidate.LedgerTests.test_c6_same_candidate_is_not_duplicated",
     "test_r35a_strategy_candidate.LedgerTests.test_c6b_dedup_keeps_the_proposal_source_evidence",
@@ -80,9 +80,11 @@ MUTATIONS = [
      "semantic": "the canonical fingerprint ignores parameter values entirely",
      "edits": [
          (CANDIDATE,
+          '        material = self.projection()\n'
           '        material.pop("candidate_id")\n'
           '        material.pop("candidate_fingerprint")\n'
-          '        return material',
+          '        return material\n',
+          '        material = self.projection()\n'
           '        material.pop("candidate_id")\n'
           '        material.pop("candidate_fingerprint")\n'
           '        material.pop("parameter_spec", None)\n'
@@ -94,9 +96,10 @@ MUTATIONS = [
           '                return [_strip(item) for item in value]\n'
           '            return value\n'
           '        material["entry_spec"] = _strip(material["entry_spec"])\n'
-          '        return material'),
+          '        return material\n'),
          (CANDIDATE,
-          '    fingerprint = _sha(material)\n',
+          '    fingerprint = _sha(material)\n'
+          '    return StrategyCandidate(',
           '    material.pop("parameter_spec", None)\n'
           '    def _strip_material(value):\n'
           '        if isinstance(value, dict):\n'
@@ -106,7 +109,8 @@ MUTATIONS = [
           '            return [_strip_material(item) for item in value]\n'
           '        return value\n'
           '    material["entry_spec"] = _strip_material(material["entry_spec"])\n'
-          '    fingerprint = _sha(material)\n'),
+          '    fingerprint = _sha(material)\n'
+          '    return StrategyCandidate('),
      ],
      "detectors": [
          "test_r35a_strategy_candidate.CandidateIdentityTests."

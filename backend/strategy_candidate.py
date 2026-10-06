@@ -43,15 +43,54 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 import strategy_dsl_schema as DSL
 import strategy_parameter_schema as SPS
 
 #: candidate 契约版本。字段语义或指纹材料变化时必须递增。
-CANDIDATE_CONTRACT_VERSION = "strategy-candidate-contract-v1"
-CANDIDATE_SCHEMA_VERSION = "strategy-candidate-v1"
+CANDIDATE_CONTRACT_VERSION = "strategy-candidate-contract-v2"
+
+#: 当前 candidate schema 版本。
+#:
+#: v2（R35-B）把**提案 provenance 整体**移出 candidate identity 与 payload。原因不是
+#: 审美：candidate 是**内容**身份，而"谁在什么时候、以什么 model / hypothesis /
+#: 研究来源 / seed 提出了它"是**事件** provenance。
+#:
+#: 移出的是两族事实：
+#:
+#: 1. generator 能力身份（``generator_type`` / ``generator_version`` /
+#:    ``generator_contract_version``）——同一份 canonical specification 由
+#:    ``factor_variant`` 与 ``bounded_combination`` 分别提出时必须得到同一个
+#:    ``candidate_id``；
+#: 2. 提案 provenance（``hypothesis_id`` / ``research_provenance`` /
+#:    ``random_seed`` / ``model_identity``）——R35-C 接入 AI generator 后，GPT model A
+#:    与 model B 提出同一份策略时必须得到同一个 ``candidate_id``。
+#:
+#: 否则只是把"generator_type 分裂身份"修掉，model / hypothesis / source / seed
+#: 仍然能造成同样的分裂，同一策略会被重复送进实验 / PIT / robustness。
+#:
+#: 这些事实记在 **proposal 事件**与 **generation batch** 上（见
+#: ``strategy_candidate_repository`` / ``strategy_candidate_search_space``），
+#: 仍然显式、可审计、绝不是自由文本。
+CANDIDATE_SCHEMA_VERSION = "strategy-candidate-v2"
+
+#: R35-A 的历史 schema 版本。v1 行**必须继续可验证**：它们的 fingerprint 材料里
+#: 含 generator 三件套与四项提案 provenance，因此材料是按
+#: ``candidate_schema_version`` 版本化的，历史行一律不改写。
+CANDIDATE_SCHEMA_VERSION_V1 = "strategy-candidate-v1"
+
+#: 只有 v1 材料才携带的 generator 身份键（R35-A）。
+LEGACY_GENERATOR_IDENTITY_KEYS = (
+    "generator_type", "generator_version", "generator_contract_version",
+)
+
+#: 只有 v1 材料才携带的提案 provenance 键（R35-A）。v2 起它们属于 proposal 事件与
+#: generation batch，不再是 candidate 的内容。
+PROPOSAL_PROVENANCE_KEYS = (
+    "hypothesis_id", "research_provenance", "random_seed", "model_identity",
+)
 
 #: 允许的 scope 词汇。这是**输入声明**的词汇，不是行情事实的 authority：
 #: 某只票在某个 as-of 是否真的属于某个板块，由 universe / tradability owner 判定。
@@ -62,12 +101,14 @@ UNIVERSE_KEYS = frozenset({"scope_kind", "boards", "symbols", "asof_universe_ide
 #: 允许的 constraint 词汇：只有数值边界，没有自由文本（自由文本无法被校验）。
 CONSTRAINT_KEYS = frozenset({"max_positions", "max_exposure_pct", "max_weight_pct"})
 
-#: research provenance 的允许键。来源是**声明**，不是从其它表推出来的。
+#: research provenance 的允许键。R35-B 起这份词表由
+#: ``strategy_candidate_search_space`` 使用（provenance 是 proposal 事件 / batch 的
+#: 输入侧事实），这里保留常量以维持单一词表来源。
 RESEARCH_SOURCE_KINDS = ("human", "ai_research", "experiment", "external")
 RESEARCH_PROVENANCE_KEYS = frozenset(
     {"source_kind", "source_identity", "source_fingerprint", "hypothesis_id"})
 
-#: AI 生成时适用的 model 身份键。
+#: AI 生成时适用的 model 身份键（owner 同上：search space 侧）。
 MODEL_IDENTITY_KEYS = frozenset({"provider", "model", "version"})
 
 #: candidate identity 明确**不得**携带的评估事实。出现即拒绝（fail closed）：
@@ -280,31 +321,6 @@ def _constraints(value) -> dict:
     return result
 
 
-def _research_provenance(value) -> dict:
-    declared = _closed_mapping(value, RESEARCH_PROVENANCE_KEYS, "research_provenance")
-    result = {}
-    if "source_kind" in declared:
-        kind = _declared_text(declared["source_kind"], "research_source_kind")
-        if kind not in RESEARCH_SOURCE_KINDS:
-            raise CandidateValidationError("research_source_kind_is_not_allowlisted")
-        result["source_kind"] = kind
-    for key in ("source_identity", "source_fingerprint", "hypothesis_id"):
-        if key in declared:
-            text = _declared_text(declared[key], f"research_{key}", required=False)
-            if text is not None:
-                result[key] = text
-    return result
-
-
-def _model_identity(value) -> dict:
-    declared = _closed_mapping(value, MODEL_IDENTITY_KEYS, "model_identity")
-    result = {}
-    for key in sorted(MODEL_IDENTITY_KEYS):
-        if key in declared:
-            result[key] = _declared_text(declared[key], f"model_{key}")
-    return result
-
-
 @dataclass(frozen=True, slots=True)
 class StrategyCandidate:
     """One immutable, canonically fingerprinted strategy candidate.
@@ -319,11 +335,6 @@ class StrategyCandidate:
     parent_strategy_id: str | None
     parent_strategy_version: int | None
     parent_strategy_checksum: str | None
-    generator_type: str
-    generator_version: str
-    generator_contract_version: str
-    hypothesis_id: str | None
-    research_provenance: Mapping
     strategy_schema_version: str
     factor_spec: Mapping | None
     entry_spec: Mapping
@@ -333,24 +344,56 @@ class StrategyCandidate:
     intended_market_regime: str
     constraints: Mapping
     asof: str
-    random_seed: int | None
-    model_identity: Mapping
     candidate_schema_version: str = CANDIDATE_SCHEMA_VERSION
+    #: 以下**只**为 v1 历史行存在。v2 行上它们全是 None / 空，因为 generator 能力与
+    #: 提案 provenance 都不是候选内容（见 :data:`PROPOSAL_PROVENANCE_KEYS` 与
+    #: :data:`LEGACY_GENERATOR_IDENTITY_KEYS`）。保留字段是为了让历史行的持久化投影
+    #: 仍能逐字往返重建与自证，而不是给新行留后门。
+    generator_type: str | None = None
+    generator_version: str | None = None
+    generator_contract_version: str | None = None
+    hypothesis_id: str | None = None
+    research_provenance: Mapping = field(default_factory=dict)
+    random_seed: int | None = None
+    model_identity: Mapping = field(default_factory=dict)
+
+    def __post_init__(self):
+        """v2 shape invariant：一个 v2 候选**不能**承载任何 generation provenance。
+
+        放在 dataclass 上（而不是只靠 ``build_strategy_candidate`` / 投影形状），
+        是为了让三条入口 —— 构造器、``candidate_from_projection``、直接
+        ``replace()``/手工构造 —— 守住同一条契约。否则"v2 指纹不看 provenance"会
+        变成一个静默的口子：能造出一个 ``candidate_id`` 正确、却挂着
+        ``hypothesis_id`` / ``random_seed`` 的候选，被写进独立列后读不出来也清不掉。
+
+        v1 历史行**不受影响**：它们的 provenance 属于各自的指纹材料。
+        """
+        if self.candidate_schema_version != CANDIDATE_SCHEMA_VERSION:
+            return
+        carried = [key for key in (*LEGACY_GENERATOR_IDENTITY_KEYS,
+                                   *PROPOSAL_PROVENANCE_KEYS)
+                   if getattr(self, key) not in (None, {}, (), [])]
+        if carried:
+            raise CandidateValidationError(
+                f"candidate_provenance_belongs_to_proposal_not_content:{carried[0]}")
 
     def projection(self) -> dict:
-        """candidate 的完整可持久化材料（不含持久化元数据 ``created_at``）。"""
-        return {
+        """candidate 的完整可持久化材料（不含持久化元数据 ``created_at``）。
+
+        v2 的投影**只**包含候选内容：schema version、exact parent pin、DSL schema
+        version、factor / entry / exit / parameter spec、universe、regime、
+        constraints、asof。generator 能力身份与提案 provenance（hypothesis /
+        research source / seed / model）**不在这里**——它们是 proposal 事件与
+        generation batch 的 provenance。v1 行按历史形状继续携带这些键，保证
+        ``candidate_json`` 逐字往返仍可自证。
+        """
+        material = {
             "candidate_schema_version": self.candidate_schema_version,
             "candidate_id": self.candidate_id,
             "candidate_fingerprint": self.candidate_fingerprint,
             "parent_strategy_id": self.parent_strategy_id,
             "parent_strategy_version": self.parent_strategy_version,
             "parent_strategy_checksum": self.parent_strategy_checksum,
-            "generator_type": self.generator_type,
-            "generator_version": self.generator_version,
-            "generator_contract_version": self.generator_contract_version,
-            "hypothesis_id": self.hypothesis_id,
-            "research_provenance": _thaw(self.research_provenance),
             "strategy_schema_version": self.strategy_schema_version,
             "factor_spec": _thaw(self.factor_spec) if self.factor_spec is not None else None,
             "entry_spec": _thaw(self.entry_spec),
@@ -360,12 +403,27 @@ class StrategyCandidate:
             "intended_market_regime": self.intended_market_regime,
             "constraints": _thaw(self.constraints),
             "asof": self.asof,
-            "random_seed": self.random_seed,
-            "model_identity": _thaw(self.model_identity),
         }
+        if self.candidate_schema_version == CANDIDATE_SCHEMA_VERSION_V1:
+            # v1 行的 provenance 仍然属于它的材料，否则旧行无法自证。
+            material.update({
+                "generator_type": self.generator_type,
+                "generator_version": self.generator_version,
+                "generator_contract_version": self.generator_contract_version,
+                "hypothesis_id": self.hypothesis_id,
+                "research_provenance": _thaw(self.research_provenance),
+                "random_seed": self.random_seed,
+                "model_identity": _thaw(self.model_identity),
+            })
+        return material
 
     def fingerprint_material(self) -> dict:
-        """指纹材料 = 全部语义事实，减去 identity 自身与展示/持久化材料。"""
+        """指纹材料 = candidate 投影，减去 identity 自身。
+
+        v2 的材料里既没有 generator 能力身份、也没有提案 provenance —— candidate 是
+        **内容**身份。v1 材料按历史形状包含它们，因此 R35-A 已落库的行仍按自己的规则
+        自证（绝不"升级"历史行）。
+        """
         material = self.projection()
         material.pop("candidate_id")
         material.pop("candidate_fingerprint")
@@ -383,9 +441,6 @@ class StrategyCandidate:
 def build_strategy_candidate(
     *,
     parent_identity: Mapping | None,
-    generator_type: str,
-    generator_version: str,
-    generator_contract_version: str = "strategy-generator-contract-v1",
     asof: str,
     entry_spec,
     universe_spec,
@@ -393,16 +448,18 @@ def build_strategy_candidate(
     factor_spec=None,
     exit_spec=None,
     constraints=None,
-    hypothesis_id: str | None = None,
-    research_provenance=None,
-    random_seed: int | None = None,
-    model_identity=None,
 ) -> StrategyCandidate:
     """Assemble one immutable candidate from already-captured explicit facts.
 
     Pure：没有 DB、没有 registry、没有机器时钟、没有 current/latest 查询。缺任何一个
-    必需事实（parent version/checksum、generator version、asof）都在这里 fail closed，
-    绝不"偷偷读 latest 补齐"。
+    必需事实（parent version/checksum、asof）都在这里 fail closed，绝不"偷偷读
+    latest 补齐"。
+
+    R35-B 起本函数**不接受**任何 provenance：generator 能力身份（type / version /
+    contract version）与提案 provenance（hypothesis / research source / seed / model）
+    都不属于候选内容。同一份 canonical specification 无论由哪个能力、哪个 model、
+    哪条 hypothesis 提出，都是同一个 candidate；这些事实记在 **proposal 事件**与
+    **generation batch** 上。接受它们再丢弃同样会误导调用方，因此这里直接不提供。
     """
     parent_id = parent_version = parent_checksum = None
     if parent_identity is not None:
@@ -431,22 +488,11 @@ def build_strategy_candidate(
     # 没有声明可调参数的候选仍然合法（结构变体），此时 editable/immutable 都是空集。
     parameter_spec = SPS.StrategyParameterSchema.from_dsl(entry).to_dict()
 
-    seed = random_seed
-    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-        raise CandidateValidationError("random_seed_must_be_an_integer_or_null")
-
     material = {
         "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
         "parent_strategy_id": parent_id,
         "parent_strategy_version": parent_version,
         "parent_strategy_checksum": parent_checksum,
-        "generator_type": _declared_text(generator_type, "generator_type", _IDENT),
-        "generator_version": _declared_text(generator_version, "generator_version",
-                                            _VERSION_IDENT),
-        "generator_contract_version": _declared_text(
-            generator_contract_version, "generator_contract_version", _VERSION_IDENT),
-        "hypothesis_id": _declared_text(hypothesis_id, "hypothesis_id", required=False),
-        "research_provenance": _research_provenance(research_provenance),
         "strategy_schema_version": DSL.DSL_SCHEMA_VERSION,
         "factor_spec": factor,
         "entry_spec": entry,
@@ -457,19 +503,12 @@ def build_strategy_candidate(
             intended_market_regime, "intended_market_regime", _IDENT),
         "constraints": _constraints(constraints),
         "asof": _asof_day(asof),
-        "random_seed": seed,
-        "model_identity": _model_identity(model_identity),
     }
     fingerprint = _sha(material)
     return StrategyCandidate(
         candidate_id=fingerprint, candidate_fingerprint=fingerprint,
         parent_strategy_id=parent_id, parent_strategy_version=parent_version,
         parent_strategy_checksum=parent_checksum,
-        generator_type=material["generator_type"],
-        generator_version=material["generator_version"],
-        generator_contract_version=material["generator_contract_version"],
-        hypothesis_id=material["hypothesis_id"],
-        research_provenance=_freeze(material["research_provenance"]),
         strategy_schema_version=material["strategy_schema_version"],
         factor_spec=None if factor is None else _freeze(factor),
         entry_spec=_freeze(entry),
@@ -479,8 +518,6 @@ def build_strategy_candidate(
         intended_market_regime=material["intended_market_regime"],
         constraints=_freeze(material["constraints"]),
         asof=material["asof"],
-        random_seed=seed,
-        model_identity=_freeze(material["model_identity"]),
         candidate_schema_version=CANDIDATE_SCHEMA_VERSION,
     )
 
@@ -498,11 +535,36 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
     重建是**结构化**的：每个事实按存储形态读回，再由
     :func:`verify_candidate_fingerprint` 重新推导指纹。因此任何被篡改的持久化
     组件都会失败，而不是被悄悄接受成一个"新的候选"。
+
+    R35-A 的 v1 行按 v1 材料重建（含 generator 三件套 + 四项提案 provenance），
+    R35-B 的 v2 行按 v2 材料重建 —— v2 形状里**不存在**这些键，v1 形状里**必须**都有。
+    两者都必须在**自己的** schema 版本下自证，绝不把 v1 行"升级"成 v2。
     """
     if not isinstance(value, Mapping):
         raise CandidateValidationError("candidate_projection_invalid")
     try:
         parent_id = value.get("parent_strategy_id")
+        schema_version = str(
+            value.get("candidate_schema_version", CANDIDATE_SCHEMA_VERSION))
+        legacy = {}
+        if schema_version == CANDIDATE_SCHEMA_VERSION_V1:
+            for key in LEGACY_GENERATOR_IDENTITY_KEYS:
+                raw = value.get(key)
+                if raw is None:
+                    raise CandidateValidationError("candidate_projection_invalid")
+                legacy[key] = str(raw)
+            for key in PROPOSAL_PROVENANCE_KEYS:
+                if key not in value:
+                    raise CandidateValidationError("candidate_projection_invalid")
+        else:
+            # v2 形状**不允许**携带 provenance：出现了就说明有人把它塞回了内容。
+            smuggled = sorted(
+                key for key in (*LEGACY_GENERATOR_IDENTITY_KEYS, *PROPOSAL_PROVENANCE_KEYS)
+                if key in value)
+            if smuggled:
+                raise CandidateValidationError(
+                    f"candidate_projection_carries_provenance:{smuggled[0]}")
+        seed = None if value.get("random_seed") is None else int(value["random_seed"])
         candidate = StrategyCandidate(
             candidate_id=str(value["candidate_id"]),
             candidate_fingerprint=str(value["candidate_fingerprint"]),
@@ -511,12 +573,6 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
                                      else int(value["parent_strategy_version"])),
             parent_strategy_checksum=(None if value.get("parent_strategy_checksum") is None
                                       else str(value["parent_strategy_checksum"])),
-            generator_type=str(value["generator_type"]),
-            generator_version=str(value["generator_version"]),
-            generator_contract_version=str(value["generator_contract_version"]),
-            hypothesis_id=(None if value.get("hypothesis_id") is None
-                           else str(value["hypothesis_id"])),
-            research_provenance=_freeze(value.get("research_provenance") or {}),
             strategy_schema_version=str(value["strategy_schema_version"]),
             factor_spec=(None if value.get("factor_spec") is None
                          else _freeze(value["factor_spec"])),
@@ -527,11 +583,15 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
             intended_market_regime=str(value["intended_market_regime"]),
             constraints=_freeze(value.get("constraints") or {}),
             asof=str(value["asof"]),
-            random_seed=(None if value.get("random_seed") is None
-                         else int(value["random_seed"])),
+            candidate_schema_version=schema_version,
+            generator_type=legacy.get("generator_type"),
+            generator_version=legacy.get("generator_version"),
+            generator_contract_version=legacy.get("generator_contract_version"),
+            hypothesis_id=(None if value.get("hypothesis_id") is None
+                           else str(value["hypothesis_id"])),
+            research_provenance=_freeze(value.get("research_provenance") or {}),
+            random_seed=seed,
             model_identity=_freeze(value.get("model_identity") or {}),
-            candidate_schema_version=str(
-                value.get("candidate_schema_version", CANDIDATE_SCHEMA_VERSION)),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise CandidateValidationError("candidate_projection_invalid") from exc
@@ -539,22 +599,28 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
 
 
 def candidate_projection_keys() -> tuple[str, ...]:
-    """candidate 投影的封闭键集（供前端/测试断言没有评估事实混入）。"""
+    """v2 candidate 投影的封闭键集（只有**内容**，没有 provenance）。
+
+    前端/测试用它断言"没有评估事实、没有 generator 能力、没有提案 provenance 混入"。
+    v1 的历史键集见 :data:`LEGACY_GENERATOR_IDENTITY_KEYS` + :data:`PROPOSAL_PROVENANCE_KEYS`
+    —— 它们只在 v1 行里合法。
+    """
     return tuple(sorted({
         "candidate_schema_version", "candidate_id", "candidate_fingerprint",
         "parent_strategy_id", "parent_strategy_version", "parent_strategy_checksum",
-        "generator_type", "generator_version", "generator_contract_version",
-        "hypothesis_id", "research_provenance", "strategy_schema_version",
+        "strategy_schema_version",
         "factor_spec", "entry_spec", "exit_spec", "parameter_spec", "universe_spec",
-        "intended_market_regime", "constraints", "asof", "random_seed",
-        "model_identity",
+        "intended_market_regime", "constraints", "asof",
     }))
 
 
 __all__ = [
-    "CANDIDATE_CONTRACT_VERSION", "CANDIDATE_SCHEMA_VERSION", "CONSTRAINT_KEYS",
-    "CandidateValidationError", "FORBIDDEN_EVALUATION_KEYS", "MODEL_IDENTITY_KEYS",
-    "RESEARCH_PROVENANCE_KEYS", "RESEARCH_SOURCE_KINDS", "RULE_ROLES",
+    "CANDIDATE_CONTRACT_VERSION", "CANDIDATE_SCHEMA_VERSION",
+    "CANDIDATE_SCHEMA_VERSION_V1", "CONSTRAINT_KEYS",
+    "CandidateValidationError", "FORBIDDEN_EVALUATION_KEYS",
+    "LEGACY_GENERATOR_IDENTITY_KEYS", "MODEL_IDENTITY_KEYS",
+    "PROPOSAL_PROVENANCE_KEYS", "RESEARCH_PROVENANCE_KEYS", "RESEARCH_SOURCE_KINDS",
+    "RULE_ROLES",
     "StrategyCandidate", "UNIVERSE_BOARDS", "UNIVERSE_SCOPE_KINDS",
     "build_strategy_candidate", "candidate_from_projection",
     "candidate_projection_keys", "verify_candidate_fingerprint",

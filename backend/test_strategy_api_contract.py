@@ -247,6 +247,23 @@ class FrontendPayloadContractTests(_ApiFixture):
         self.assertEqual(2, len(listed["items"]))
         self.assertIn("created_at", listed["items"][0]["persistence"])
         self.assertEqual(candidate_id, listed["items"][0]["candidate"]["candidate_id"])
+        # R35-B：列表项发布**全部**提案事件证据引用（不是"最近一条"）。
+        # proposal id 是随机 opaque id，同 timestamp 下无法表达可靠顺序，因此读模型
+        # 不得压成一个隐含的 latest 指针。
+        evidence = listed["items"][0]["proposal_evidence"]
+        self.assertEqual(1, evidence["proposal_count"])
+        self.assertEqual(1, len(evidence["proposals"]))
+        self.assertEqual(64, len(evidence["generation_batch_ids"][0]))
+        # 列表按显式 batch id 发布 batch 摘要（绝不查"最新一批"）。
+        self.assertEqual(1, len(listed["generation_batches"]))
+        self.assertEqual(evidence["generation_batch_ids"][0],
+                         listed["generation_batches"][0]["batch_id"])
+        self.assertEqual(lifecycle["checksum"],
+                         listed["generation_batches"][0]["parent_strategy_checksum"])
+        # v2 candidate 投影不再携带任何 provenance（内容身份只有 specification）。
+        for key in ("generator_type", "hypothesis_id", "research_provenance",
+                    "random_seed", "model_identity"):
+            self.assertNotIn(key, listed["items"][0]["candidate"])
         status, other = self._call(API.list_strategy_candidates, "fe_cand",
                                    strategy_version=lifecycle["version"],
                                    strategy_checksum="b" * 64)
@@ -267,6 +284,75 @@ class FrontendPayloadContractTests(_ApiFixture):
             status, rejected = self._call(API.generate_strategy_candidates, "fe_cand", broken)
             self.assertIn(status, (400, 409, 422), rejected)
         status, still = self._call(API.list_strategy_candidates, "fe_cand",
+                                   strategy_version=lifecycle["version"],
+                                   strategy_checksum=lifecycle["checksum"])
+        self.assertEqual(2, len(still["items"]), "被拒绝的请求不得留下候选")
+
+    def test_r35b_search_space_generation_over_http(self):
+        """R35-B：显式 search space 走真实 HTTP 契约；batch 只发布台账事实。"""
+        factor_a = {"op": "gt", "left": {"op": "field", "name": "pe"},
+                    "right": {"op": "const", "value": 30}}
+        factor_b = {"op": "lt", "left": {"op": "field", "name": "pb"},
+                    "right": {"op": "const", "value": 3}}
+        status, created = self._call(API.create_strategy, {
+            "id": "fe_expand", "name": "fe_expand", "dsl_ast": RULE,
+            "metadata": {"constraints": {"max_positions": 5, "max_exposure_pct": 0.6}},
+        }, default_status=201)
+        self.assertEqual(status, 201, created)
+        lifecycle = SVC.lifecycle_read_model("fe_expand")
+        base = {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "asof": "2026-10-05",
+            "universe_spec": {"scope_kind": "a_share_all"},
+            "intended_market_regime": "momentum",
+            "evidence_count": 0,
+            "research_provenance": {"source_kind": "human"},
+        }
+
+        # factor_variant：显式有限备选集 → 每个备选一个候选。
+        status, expanded = self._call(API.generate_strategy_candidates, "fe_expand", {
+            **base, "generator_type": "factor_variant", "generator_version": "v1",
+            "factor_slot": {"kind": "explicit_variant", "alternatives": [factor_a, factor_b]},
+        }, default_status=201)
+        self.assertEqual(status, 201, expanded)
+        self.assertEqual(2, expanded["candidate_count"])
+        self.assertEqual("factor_variant", expanded["generator_type"])
+        self.assertEqual(64, len(expanded["generation_batch_id"]))
+        self.assertEqual(64, len(expanded["search_space_fingerprint"]))
+
+        # batch 只发布台账事实：exact pin + search-space + 每条 proposal 事件。
+        status, batch = self._call(API.get_candidate_generation_batch, "fe_expand",
+                                   expanded["generation_batch_id"])
+        self.assertEqual(status, 200, batch)
+        record = batch["generation_batch"]
+        self.assertEqual(lifecycle["checksum"], record["parent_strategy_checksum"])
+        self.assertEqual(expanded["search_space_fingerprint"],
+                         record["search_space_fingerprint"])
+        self.assertEqual(2, record["candidate_count"])
+        self.assertEqual(2, len(batch["proposals"]))
+        self.assertEqual({expanded["generation_batch_id"]},
+                         {item["generation_batch_id"] for item in batch["proposals"]})
+        # 页面身份与 batch 身份必须一致。
+        status, mismatch = self._call(API.get_candidate_generation_batch, "fe_cand",
+                                      expanded["generation_batch_id"])
+        self.assertEqual(409, status, mismatch)
+
+        # 组合超限必须 fail closed，且不留下任何候选/批次行。
+        factors = [{"op": "gt", "left": {"op": "field", "name": "pe"},
+                    "right": {"op": "const", "value": value}}
+                   for value in range(1, 201)]
+        status, rejected = self._call(API.generate_strategy_candidates, "fe_expand", {
+            **base, "generator_type": "bounded_combination",
+            "generator_version": "v1", "factor_slot": {
+                "kind": "explicit_variant", "alternatives": factors},
+        })
+        self.assertIn(status, (400, 409, 422), rejected)
+        # 放宽 constraints 是风险放大动作，不属于生成域权限（父策略声明了边界）。
+        status, widened = self._call(API.generate_strategy_candidates, "fe_expand", {
+            **base, "constraints": {"max_positions": 99, "max_exposure_pct": 0.6}})
+        self.assertIn(status, (400, 409, 422), widened)
+        status, still = self._call(API.list_strategy_candidates, "fe_expand",
                                    strategy_version=lifecycle["version"],
                                    strategy_checksum=lifecycle["checksum"])
         self.assertEqual(2, len(still["items"]), "被拒绝的请求不得留下候选")

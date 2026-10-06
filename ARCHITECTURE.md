@@ -3688,11 +3688,77 @@ R35-A **不**做 promotion、**不**做 execution、**不**修改任何正式策
 `main_force_top10` 等只作为 pinned baseline / parent / reference 存在。验收标准是
 **可信的生成基础设施**，不是"证明某个新策略赚钱"——因此本阶段没有任何以收益 /
 Sharpe / 胜率作为验收条件的断言。DDL 由 `paper_schema_migrations.ensure_strategy_candidates`
-唯一持有（migration v33），业务代码不在运行时 `CREATE TABLE` / `ALTER TABLE`。
+唯一持有（migration v33/v34），业务代码不在运行时 `CREATE TABLE` / `ALTER TABLE`。
+
+R35-B（**Deterministic Candidate Expansion**）把链路扩展成：
+
+```text
+Pinned Parent Strategy
+        ↓
+Explicit Candidate Search Space   （strategy_candidate_search_space）
+        ↓
+Bounded Deterministic Generators  （strategy_generator capability registry）
+        ↓
+StrategyCandidate[]               （同一个 strategy_candidate authority）
+        ↓
+Candidate Ledger + Proposal / Batch provenance
+```
+
+三条硬性质：
+
+1. **search space 是显式、有限、可 fingerprint 的。** `CandidateSearchSpace` 只接受
+   调用方传入的事实：parent pin、generator 能力/版本、as-of、research provenance、
+   参数变体、factor/entry/exit 备选、组合策略与候选上限。它没有 DB、没有 registry、
+   没有机器时钟，因此不存在"generator 自己去查 current strategy / 今天 / 当前组合"。
+2. **基数在生成前算得出来，超限 fail closed。** `cardinality` 是显式声明的一部分，
+   超过 `MAX_CANDIDATES_PER_GENERATION_REQUEST`（128，契约上限，调用方只能收紧）
+   一律拒绝。**绝不静默截断** —— 截断会让 candidate universe 依赖遍历顺序。
+3. **三种身份，三套契约。**
+
+```text
+candidate row  → content identity (canonical fingerprint)      → semantic dedup
+proposal row   → opaque event identity (secrets.token_hex(32)) → append every occurrence
+batch row      → opaque request identity                       → append every request
+```
+
+generator **能力身份**与**提案 provenance**（hypothesis / research source / seed /
+model）都属于 proposal 事件与 generation batch，**不**属于 candidate fingerprint：
+同一份 canonical specification 由 `factor_variant` 与 `bounded_combination` 分别
+提出、或由 GPT model A 与 model B 分别提出时，必须得到**同一个** `candidate_id`
+（候选行 1 条、proposal 事件 2 条）。只移走前者、后者仍留在内容里，等于把身份分裂的
+成因换成另一种，因此这是**形状级**的 ownership 转移，并且贯穿到持久化：v2 candidate 的
+投影与内容身份都不携带这些键，读路径看到就 fail closed，v1 历史行按自己的旧材料自证。
+
+候选表也必须是**纯内容持久化**：v2 `strategy_candidates` 不含任何 generation
+provenance 列（`hypothesis_id` / `random_seed` 已移除），`append_candidate()` 同样不写。
+留着会形成"`candidate_json` 里没有、独立列里有"的两套互相矛盾事实，而读路径只读
+`candidate_json` —— 那些隐藏值写进去就再也读不出来，也清不掉（`INSERT OR IGNORE` 加
+幂等只比 json / fingerprint）。候选行必须与候选内容是**同一份**事实表示。
+
+`generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
+契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可
+回答，而 batch identity 本身绝不进候选指纹。
+
+读模型同样不制造隐含指针：候选列表发布**全部**提案证据引用
+（`proposal_count` / `proposals` / `generation_batch_ids`），而不是"最近一条
+proposal" —— `proposal_id` 是随机 opaque id，两条事件可以合法拥有完全相同的
+`created_at`，`proposals[-1]` 只是一个稳定但语义错误的"latest"。要看某个 batch 的完整
+输入，用显式的 `GET .../candidate-generations/{batch_id}`。
+
+slot 语义必须**唯一**：`inherit_parent`（继承 exact pinned parent 那一版的最终语义，
+生成阶段就解析成明确值）/ `explicit_variant`（显式备选）/ `absent`（本候选没有该
+角色）三者互斥，不允许用 `None` 同时表示三件事。constraints 的规则是 **inherit, or
+only tighten**：放宽仓位 / 敞口 / 权重上限属于风险放大动作，必须走正式 risk
+evidence gate，不属于 candidate generator 的权限。
+
+R35-B 明确**不**拥有 evaluation（backtest / PIT / robustness / scoring / ranking /
+winner selection）、promotion、lifecycle transition、execution、allocation、risk
+override；这些留给 R36 / R37。它只回答"给定明确、有限的搜索空间，确定性地产生哪些
+受约束候选"，不回答"哪个候选赚钱 / 哪个最好 / 哪个该晋级"。
 
 ```text
 candidate identity != candidate evaluation result
-generator authority = produce candidate (no promotion, no execution)
+generator authority = produce candidate (no promotion, no execution, no scoring)
 ```
 
 

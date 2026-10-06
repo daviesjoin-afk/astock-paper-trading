@@ -1562,18 +1562,48 @@ def ensure_strategy_retirement_workflow(conn):
 STRATEGY_CANDIDATE_COLUMNS = (
     "candidate_id", "candidate_fingerprint", "candidate_contract_version",
     "candidate_schema_version", "parent_strategy_id", "parent_strategy_version",
+    "parent_strategy_checksum", "asof", "candidate_json", "created_at",
+)
+
+#: R35-A（v1）的候选列。v34 重建时**只**用于逐列点名搬运：generator 三件套、
+#: ``hypothesis_id``、``random_seed`` 刻意不在 v2 目标列里，因此不会被搬进新表 ——
+#: 历史行的 provenance 只保存在**原始** ``candidate_json`` 里，而 v1 指纹材料本来
+#: 就包含它们，所以 v1 行照旧自证；顶层 provenance 列被移除后，候选行与候选内容
+#: 不再是两套互相矛盾的事实表示。
+STRATEGY_CANDIDATE_COLUMNS_V1 = (
+    "candidate_id", "candidate_fingerprint", "candidate_contract_version",
+    "candidate_schema_version", "parent_strategy_id", "parent_strategy_version",
     "parent_strategy_checksum", "generator_type", "generator_version",
     "generator_contract_version", "hypothesis_id", "asof", "random_seed",
     "candidate_json", "created_at",
 )
 
 STRATEGY_CANDIDATE_PROPOSAL_COLUMNS = (
-    "proposal_id", "candidate_id", "input_fingerprint", "proposal_json", "created_at",
+    "proposal_id", "candidate_id", "generation_batch_id", "input_fingerprint",
+    "proposal_json", "created_at",
+)
+
+STRATEGY_CANDIDATE_GENERATION_BATCH_COLUMNS = (
+    "batch_id", "generation_input_fingerprint", "search_space_fingerprint",
+    "search_space_contract_version", "generator_type", "generator_version",
+    "generator_contract_version", "parent_strategy_id", "parent_strategy_version",
+    "parent_strategy_checksum", "asof", "candidate_count", "batch_json", "created_at",
 )
 
 
 def strategy_candidate_ddl(table="strategy_candidates"):
-    """``strategy_candidates`` 的规范 DDL（migration 与 ``init_db`` 共用）。"""
+    """``strategy_candidates`` 的规范 DDL（migration 与 ``init_db`` 共用）。
+
+    R35-B（v2）：候选是**内容**身份，因此表里**没有**任何 generation provenance 列 ——
+    既没有 generator 能力三件套，也没有 ``hypothesis_id`` / ``random_seed``。同一份
+    canonical specification 由 ``factor_variant`` 或 ``bounded_combination``、由 model A
+    或 model B 提出，都是同一个 candidate 行；"哪个能力、哪一次请求、什么 provenance"
+    属于 ``strategy_candidate_proposals`` / ``strategy_candidate_generation_batches``。
+
+    顶层 provenance 列必须一起删：留着它们就会出现"``candidate_json`` 里没有、
+    独立列里有"的两套互相矛盾事实，而且 ``get_candidate`` 只读 ``candidate_json``，
+    那些隐藏值写进去就再也读不出来、也清不掉。
+    """
     return f"""
     CREATE TABLE IF NOT EXISTS {table}(
         candidate_id TEXT PRIMARY KEY,
@@ -1583,12 +1613,7 @@ def strategy_candidate_ddl(table="strategy_candidates"):
         parent_strategy_id TEXT,
         parent_strategy_version INTEGER,
         parent_strategy_checksum TEXT,
-        generator_type TEXT NOT NULL,
-        generator_version TEXT NOT NULL,
-        generator_contract_version TEXT NOT NULL,
-        hypothesis_id TEXT,
         asof TEXT NOT NULL,
-        random_seed INTEGER,
         candidate_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         CHECK(candidate_id = candidate_fingerprint),
@@ -1605,51 +1630,194 @@ def strategy_candidate_ddl(table="strategy_candidates"):
     """
 
 
-def strategy_candidate_proposal_ddl(table="strategy_candidate_proposals"):
-    """``strategy_candidate_proposals`` 的规范 DDL（去重的证据侧，append-only）。"""
+def strategy_candidate_proposal_ddl(table="strategy_candidate_proposals",
+                                    candidate_table="strategy_candidates"):
+    """``strategy_candidate_proposals`` 的规范 DDL（去重的证据侧，append-only）。
+
+    R35-B：proposal 是**事件**，因此每条事件都携带提出它的 generator 能力身份与
+    所属 generation batch。同一候选被不同能力提出时，候选行仍然只有一条，而
+    proposal 行有两条 —— 事件历史绝不覆盖。
+
+    ``candidate_table`` 参数化的唯一目的是让 v34 的候选表重建能做到 **FK-safe**：
+    重建必须先把 proposal 表指向 staged 父表，否则 DROP 旧父表时子表的外键立刻
+    悬空（``PRAGMA foreign_keys`` 在生产连接上是 ON），迁移会直接报
+    ``FOREIGN KEY constraint failed``。
+    """
     return f"""
     CREATE TABLE IF NOT EXISTS {table}(
         proposal_id TEXT PRIMARY KEY,
         candidate_id TEXT NOT NULL,
+        generation_batch_id TEXT,
         input_fingerprint TEXT NOT NULL,
         proposal_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        FOREIGN KEY(candidate_id) REFERENCES strategy_candidates(candidate_id)
+        FOREIGN KEY(candidate_id) REFERENCES {candidate_table}(candidate_id)
     )
     """
 
 
-def ensure_strategy_candidates(conn):
-    """v33: create the append-only strategy candidate ledger (idempotent, no backfill).
+def strategy_candidate_generation_batch_ddl(table="strategy_candidate_generation_batches"):
+    """``strategy_candidate_generation_batches`` 的规范 DDL（append-only）。
 
-    只创建自己的两张表；不 INSERT/UPDATE 任何正式账本，不写 lifecycle，不写订单，
-    也不发布任何评估结论。升级前的历史里没有候选概念，因此这里**没有回填** ——
-    从既有策略反推"当时提出过哪些候选"是凭空捏造 provenance。
+    R35-B §19/§20：一次生成请求 → 一个 batch identity → N 条 proposal 事件。
+    没有 ``current_generation_batch`` 这种可变指针：读路径只能按显式 batch id 取。
+    """
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        batch_id TEXT PRIMARY KEY,
+        generation_input_fingerprint TEXT NOT NULL,
+        search_space_fingerprint TEXT NOT NULL,
+        search_space_contract_version TEXT NOT NULL,
+        generator_type TEXT NOT NULL,
+        generator_version TEXT NOT NULL,
+        generator_contract_version TEXT NOT NULL,
+        parent_strategy_id TEXT,
+        parent_strategy_version INTEGER,
+        parent_strategy_checksum TEXT,
+        asof TEXT NOT NULL,
+        candidate_count INTEGER NOT NULL,
+        batch_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK(length(batch_id)=64),
+        CHECK(length(generation_input_fingerprint)=64),
+        CHECK(length(search_space_fingerprint)=64),
+        CHECK(candidate_count >= 0)
+    )
+    """
+
+
+def _repoint_proposal_foreign_key(conn, staged_candidate_table):
+    """Rebuild ``strategy_candidate_proposals`` so its FK points at a staged parent.
+
+    ``PRAGMA foreign_keys=OFF`` 在事务内是 no-op（迁移必须在调用方事务里跑），因此
+    "先关外键再 DROP 父表"不是可用方案。可行且可证明安全的顺序是：把子表也重建一次，
+    让它的 FK 先指向 staged 父表；旧父表随即可以被 DROP（不再被引用）；最后 staged
+    父表 RENAME 成真名时，SQLite 会把子表里记录的父表名一起改写回
+    ``strategy_candidates``。
+
+    逐列点名搬运 + 保留原有数据；**不新增、不改写**任何事件事实。
+    """
+    table = "strategy_candidate_proposals"
+    columns = table_columns(conn, table)
+    staged = "strategy_candidate_proposals__r35b_rebuild"
+    conn.execute(f"DROP TABLE IF EXISTS {staged}")
+    conn.execute(strategy_candidate_proposal_ddl(staged, staged_candidate_table))
+    target = ", ".join(f'"{column}"' for column in STRATEGY_CANDIDATE_PROPOSAL_COLUMNS)
+    source = ", ".join(
+        f'"{column}"' if column in columns else "NULL"
+        for column in STRATEGY_CANDIDATE_PROPOSAL_COLUMNS
+    )
+    conn.execute(f'INSERT INTO "{staged}" ({target}) SELECT {source} FROM "{table}"')
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "{staged}" RENAME TO "{table}"')
+
+
+def _rebuild_strategy_candidates_v2(conn):
+    """v34：把候选表从 v1 形状重建为 v2 形状（幂等、forward-only、不回填）。
+
+    为什么必须重建而不是 ``ALTER TABLE DROP COLUMN``：v1 的三个 generator 列是
+    ``NOT NULL``，而 v2 语义下"候选行的 generator 能力"根本不存在 —— 留着一个
+    ``NOT NULL`` 列会逼着每个新行编一个能力身份，那正是 R35-B 要消除的第二套
+    identity authority。重建 = 建新表 → **逐列点名**搬运 → DROP → RENAME。
+
+    **FK-safe 是硬要求**：``strategy_candidate_proposals.candidate_id`` 引用本表，
+    而生产连接（``paper_storage`` / ``paper_trading``）开着
+    ``PRAGMA foreign_keys=ON``。直接 DROP 被引用的父表会让子表外键悬空，迁移在
+    升级一个**已有 proposal 行**的 v33 账本时直接报 ``FOREIGN KEY constraint failed``。
+    在事务内 ``PRAGMA foreign_keys=OFF`` 是**无效**的（SQLite 明确 no-op），所以这里
+    用引用重写：先建 staged 父表 → 把子表也重建为指向 staged 父表 → 再 DROP 旧父表 →
+    最后把 staged 父表 RENAME 回真名（SQLite 的 legacy_alter_table 语义会把子表里
+    记录的父表名一起改回 ``strategy_candidates``）。
+
+    历史行怎么处理：``candidate_json`` 逐字保留，因此 v1 行的 generator 三件套与提案
+    provenance 仍在候选材料里，``candidate_from_projection`` 按
+    ``candidate_schema_version`` 走 v1 材料路径，指纹照旧自证。**绝不**把历史行
+    "升级"成 v2，也绝不回填任何 provenance。顶层 ``hypothesis_id`` / ``random_seed``
+    列被移除后，候选行与候选内容不再是两套互相矛盾的事实表示。
+
+    重建条件是"存在任何 v1 遗留列"，而不是"存在 generator_type"：本开发分支上跑过
+    早期 v34 的本地库会停在**中间形态**（generator 列已去、``hypothesis_id`` /
+    ``random_seed`` 还在），那正是本轮要消灭的双表示，所以它必须走同一条重建路径，
+    否则那些库会永久卡在中间形态。
     """
     changes = {}
-    if not table_columns(conn, "strategy_candidates"):
+    old_columns = table_columns(conn, "strategy_candidates")
+    # 只看"v1 有、v2 目标没有"的列：共享列（candidate_json / asof / parent pin …）
+    # 重建后依然存在，用它们判定会把已经完成的表误判成待重建，破坏幂等。
+    legacy_only = set(STRATEGY_CANDIDATE_COLUMNS_V1) - set(STRATEGY_CANDIDATE_COLUMNS)
+    if not old_columns:
         conn.execute(strategy_candidate_ddl("strategy_candidates"))
         changes["strategy_candidates"] = "created"
+    elif old_columns & legacy_only:
+        staged = "strategy_candidates__r35b_rebuild"
+        conn.execute(f"DROP TABLE IF EXISTS {staged}")
+        conn.execute(strategy_candidate_ddl(staged))
+        target = ", ".join(f'"{column}"' for column in STRATEGY_CANDIDATE_COLUMNS)
+        source = ", ".join(
+            f'"{column}"' if column in old_columns else "NULL"
+            for column in STRATEGY_CANDIDATE_COLUMNS
+        )
+        conn.execute(f'INSERT INTO "{staged}" ({target}) SELECT {source}'
+                     f' FROM "strategy_candidates"')
+        # 子表必须先改指向 staged 父表，旧父表才能被安全 DROP。
+        if table_columns(conn, "strategy_candidate_proposals"):
+            _repoint_proposal_foreign_key(conn, staged)
+        conn.execute('DROP TABLE "strategy_candidates"')
+        conn.execute(f'ALTER TABLE "{staged}" RENAME TO "strategy_candidates"')
+        changes["strategy_candidates"] = "rebuilt"
     else:
         changes["strategy_candidates"] = "ok"
-    if not table_columns(conn, "strategy_candidate_proposals"):
+
+    proposal_columns = table_columns(conn, "strategy_candidate_proposals")
+    if not proposal_columns:
         conn.execute(strategy_candidate_proposal_ddl("strategy_candidate_proposals"))
         changes["strategy_candidate_proposals"] = "created"
+    elif "generation_batch_id" not in proposal_columns:
+        # 纯加列：历史 proposal 事件**没有** batch 归属，NULL 就是诚实的 legacy 状态。
+        conn.execute('ALTER TABLE "strategy_candidate_proposals"'
+                     ' ADD COLUMN generation_batch_id TEXT')
+        changes["strategy_candidate_proposals"] = "altered"
     else:
         changes["strategy_candidate_proposals"] = "ok"
+
+    if not table_columns(conn, "strategy_candidate_generation_batches"):
+        conn.execute(strategy_candidate_generation_batch_ddl(
+            "strategy_candidate_generation_batches"))
+        changes["strategy_candidate_generation_batches"] = "created"
+    else:
+        changes["strategy_candidate_generation_batches"] = "ok"
+    return changes
+
+
+def ensure_strategy_candidates(conn):
+    """v33 + v34: the append-only strategy candidate ledger (idempotent, no backfill).
+
+    只创建/重建自己的三张表；不 INSERT/UPDATE 任何正式账本，不写 lifecycle，不写
+    订单，也不发布任何评估结论。升级前的历史里没有候选概念，因此这里**没有回填** ——
+    从既有策略反推"当时提出过哪些候选"是凭空捏造 provenance。
+    """
+    changes = _rebuild_strategy_candidates_v2(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_strategy_candidates_parent"
         " ON strategy_candidates(parent_strategy_id,parent_strategy_version)"
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_strategy_candidates_generator"
-        " ON strategy_candidates(generator_type,generator_version)"
-    )
+    # v1 的 generator 索引随列一起消失：候选行不再有 generator 能力身份。
+    conn.execute("DROP INDEX IF EXISTS idx_strategy_candidates_generator")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_strategy_candidate_proposals_candidate"
         " ON strategy_candidate_proposals(candidate_id,created_at)"
     )
-    for table in ("strategy_candidates", "strategy_candidate_proposals"):
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_candidate_proposals_batch"
+        " ON strategy_candidate_proposals(generation_batch_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_candidate_batches_parent"
+        " ON strategy_candidate_generation_batches("
+        "parent_strategy_id,parent_strategy_version)"
+    )
+    for table in ("strategy_candidates", "strategy_candidate_proposals",
+                  "strategy_candidate_generation_batches"):
         conn.execute(
             f"""CREATE TRIGGER IF NOT EXISTS {table}_no_update
                 BEFORE UPDATE ON {table}
