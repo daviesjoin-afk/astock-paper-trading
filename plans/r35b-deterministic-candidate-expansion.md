@@ -46,18 +46,30 @@ proposal row   → opaque event identity (secrets.token_hex(32)) → append ever
 batch row      → opaque request identity                       → append every request
 ```
 
-generator **能力身份**（type / version / contract version）是 proposal 事件与 batch 的
-provenance，**不**是 candidate fingerprint 的一部分。因此同一份 canonical
-specification 由 `factor_variant` 与 `bounded_combination` 分别提出时：候选行 1 条、
-proposal 事件 2 条。这一条与 R35-A 的"candidate vs proposal"是同一个原则的延续。
+**能力身份与提案 provenance 都属于事件，不属于内容。** 移出 candidate identity 的是两族
+事实：
+
+1. generator 能力身份（type / version / contract version）——§16 要求语义版本可观察，
+   §18/B9 要求不同能力提出同一份 specification 必须 dedup；
+2. 提案 provenance（hypothesis / research source / seed / model）——R35-C 接入 AI
+   generator 后，model A 与 model B 提出同一份策略必须 dedup。
+
+只移走第 1 族、第 2 族仍留在内容里，等于把身份分裂的成因换成另一种，因此是**形状级**
+的 ownership 转移：v2 candidate 的投影与内容身份都不含这七项；`candidate_from_projection`
+读到就 fail closed；`build_strategy_candidate` 不再接受这些参数；`record_proposal` 的
+provenance 来自 search space / batch 的显式事实。v1 历史行按自己的旧材料自证，不改历史。
 
 candidate schema 因此升级为 `strategy-candidate-v2`：
 
-- 候选表去掉三个 `NOT NULL` 的 generator 列（留着会逼每个新行编一个能力身份，
-  那正是要消除的第二套 identity authority）；
+- 候选表去掉 v1 的 `NOT NULL` generator 列（留着会逼每个新行编一个能力身份，那正是
+  要消除的第二套 identity authority）；
 - migration **v34** 重建候选表：forward-only、幂等、**不回填**；历史 v1 行的
-  `candidate_json` 逐字保留，仍按 v1 材料自证（`LEGACY_GENERATOR_IDENTITY_KEYS`）；
+  `candidate_json` 逐字保留，仍按 v1 材料自证（**绝不**"升级"历史行）；
 - 新增 `strategy_candidate_generation_batches`（append-only，无 `current/latest` 指针）。
+
+读模型**不制造隐含指针**：候选列表发布全部提案证据引用
+（`proposal_count` / `proposals` / `generation_batch_ids`），不投影成"最近一条
+proposal"——`proposal_id` 是随机 opaque id，同 timestamp 下不存在可靠先后。
 
 ## 四、Generator 能力（显式 registry，不是 if/elif 链）
 
@@ -92,12 +104,14 @@ candidate schema 因此升级为 `strategy-candidate-v2`：
 
 ## 六、测试与变异
 
-- B1–B12 contract 回归：`backend/test_r35b_candidate_expansion.py`（33 tests）。
+- B1–B12 contract 回归：`backend/test_r35b_candidate_expansion.py`（38 tests，含
+  B9b「provenance 变化不分裂语义身份」与 B10d「读模型发布证据而非 latest」）。
 - HTTP 契约：`backend/test_strategy_api_contract.py` 的
   `test_r35b_search_space_generation_over_http`。
 - 前端只读事实：`frontend/tests/strategy-candidates.test.mjs`（R35B-C1…C3）。
 - R35-A 回归按 v2 契约同步更新：`backend/test_r35a_strategy_candidate.py`（51 tests）。
-- 变异：`work/r35b_candidate_expansion_mutation_check.py`（M-B1…M-B8，8/8 DETECTED）；
+- 变异：`work/r35b_candidate_expansion_mutation_check.py`（M-X1…M-X10，10/10 DETECTED；
+  ID 前缀用 **M-X** 避开 R34-B allocation 已有的 M-B1…M-B20 命名空间）；
   R35-A 的 `work/r35a_candidate_mutation_check.py` 保持 M-G1…M-G8 8/8 DETECTED。
 
 ## 六之二、v34 重建必须 FK-safe

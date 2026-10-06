@@ -3721,12 +3721,23 @@ proposal row   → opaque event identity (secrets.token_hex(32)) → append ever
 batch row      → opaque request identity                       → append every request
 ```
 
-generator **能力身份**属于 proposal 事件与 generation batch，**不**属于 candidate
-fingerprint：同一份 canonical specification 由 `factor_variant` 与
-`bounded_combination` 分别提出时，候选行 1 条、proposal 事件 2 条。
+generator **能力身份**与**提案 provenance**（hypothesis / research source / seed /
+model）都属于 proposal 事件与 generation batch，**不**属于 candidate fingerprint：
+同一份 canonical specification 由 `factor_variant` 与 `bounded_combination` 分别
+提出、或由 GPT model A 与 model B 分别提出时，必须得到**同一个** `candidate_id`
+（候选行 1 条、proposal 事件 2 条）。只移走前者、后者仍留在内容里，等于把身份分裂的
+成因换成另一种，因此这是**形状级**的 ownership 转移：v2 candidate 的投影与内容身份
+都不携带这些键，读路径看到就 fail closed，v1 历史行按自己的旧材料自证。
+
 `generation_input_fingerprint` 绑定 exact parent pin + search-space 指纹 + generator
 契约版本 + as-of + research provenance，因此"这一批候选是从什么输入生成的"永远可
 回答，而 batch identity 本身绝不进候选指纹。
+
+读模型同样不制造隐含指针：候选列表发布**全部**提案证据引用
+（`proposal_count` / `proposals` / `generation_batch_ids`），而不是"最近一条
+proposal" —— `proposal_id` 是随机 opaque id，两条事件可以合法拥有完全相同的
+`created_at`，`proposals[-1]` 只是一个稳定但语义错误的"latest"。要看某个 batch 的完整
+输入，用显式的 `GET .../candidate-generations/{batch_id}`。
 
 slot 语义必须**唯一**：`inherit_parent`（继承 exact pinned parent 那一版的最终语义，
 生成阶段就解析成明确值）/ `explicit_variant`（显式备选）/ `absent`（本候选没有该

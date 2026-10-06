@@ -128,9 +128,12 @@ capability registry（`parameter_variant` / `factor_variant` / `entry_variant` /
 `exit_variant` / `bounded_combination`），并新增 generation batch 追加表
 `strategy_candidate_generation_batches`（一次生成请求 → 一个 batch identity → N 条
 proposal 事件；无 current/latest 指针）。candidate 升级为内容身份
-（`strategy-candidate-v2`：generator 能力身份移到 proposal 事件与 batch 上，
+（`strategy-candidate-v2`：generator 能力身份与提案 provenance（hypothesis / research
+source / seed / model）全部移到 proposal 事件与 batch 上、**不**参与 candidate fingerprint ——
+同一 specification 由不同 generator 或不同 model 提出必须是同一个 candidate；
 migration **v34** 重建候选表，forward-only、不回填、历史 v1 行仍自证）。新增路由
-`GET /api/strategies/{id}/candidate-generations/{batch_id}`。R35-B **不**拥有
+`GET /api/strategies/{id}/candidate-generations/{batch_id}`；候选列表发布**全部**提案
+证据引用，不投影成隐含 latest。R35-B **不**拥有
 evaluation / promotion / execution / allocation 权限（见 `plans/r35b-deterministic-candidate-expansion.md`）。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
