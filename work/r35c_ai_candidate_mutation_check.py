@@ -26,7 +26,23 @@ BASELINE = (
     "test_r35c_ai_candidate_generation.ExactResearchRunTests."
     "test_c1b_non_numeric_or_negative_run_id_fails_closed",
     "test_r35c_ai_candidate_generation.ExactResearchRunTests."
+    "test_c1b2_canonical_run_id_and_ints_are_accepted",
+    "test_r35c_ai_candidate_generation.ExactResearchRunTests."
+    "test_c1b3_strict_identity_is_checked_before_reading_the_ledger",
+    "test_r35c_ai_candidate_generation.ExactResearchRunTests."
     "test_c1c_no_latest_fallback_in_the_source",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_disabled_slot_is_blocked_by_the_service_itself",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_unready_slots_are_blocked_with_canonical_reasons",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_readiness_reuses_the_canonical_authority_not_a_second_copy",
+    "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+    "test_readiness_precedes_the_provider_call_but_follows_the_audit_gates",
+    "test_r35c_ai_candidate_generation.CrossModelDedupTests."
+    "test_c12c_provider_slot_is_recorded_and_bound_into_the_input_fingerprint",
+    "test_r35c_ai_candidate_generation.CrossModelDedupTests."
+    "test_c12d_provider_identity_is_absent_when_the_slot_is_unknown",
     "test_r35c_ai_candidate_generation.ResearchGateTests."
     "test_c2_unsupported_research_is_rejected_before_the_provider",
     "test_r35c_ai_candidate_generation.ResearchGateTests."
@@ -87,7 +103,7 @@ BASELINE = (
     "test_r35c_ai_candidate_generation.EvidenceCountTests."
     "test_evidence_count_comes_from_the_canonical_hypothesis",
     "test_r35c_ai_candidate_generation.ProviderProtocolTests."
-    "test_model_identity_is_omitted_when_unknown",
+    "test_model_identity_records_no_fabricated_model",
     "test_r35c_ai_candidate_generation.ProviderProtocolTests."
     "test_research_model_and_proposal_model_stay_distinct",
     "test_r35c_ai_candidate_generation.ProviderProtocolTests."
@@ -255,22 +271,28 @@ MUTATIONS = [
                 '    model = str(provider_config.get("model") or "research-model").strip()\n')],
      "detectors": [
          "test_r35c_ai_candidate_generation.ProviderProtocolTests."
-         "test_model_identity_is_omitted_when_unknown",
+         "test_model_identity_records_no_fabricated_model",
      ]},
-    # M-AIG11 —— 跳过 provider 槽位 readiness：被禁用的槽位照样发起真实付费调用
-    # （这正是 R27-B2B 修过的缺陷形状）。
+    # M-AIG11 —— 跳过 provider 槽位 readiness：被禁用的槽位照样发起真实付费调用。
+    # 强化版：gate 现在长在 **orchestration service** 上（route 只映射 reason），
+    # 因此这条 mutation 直接打破 service 的强制 gate —— 无论调用方是 HTTP、CLI、
+    # R36 还是 scheduler 都会重新出现"禁用形同不存在"。
     {"id": "M-AIG11",
-     "semantic": "a disabled provider slot is invoked anyway",
-     "edits": [(API,
-                '        readiness = AIReview.slot_readiness(provider_config)\n'
-                '        if not readiness["ready"]:\n'
-                '            raise HTTPException(status_code=409, detail=str(readiness["reason"]))\n',
-                '        readiness = AIReview.slot_readiness(provider_config)\n'
-                '        if False:\n'
-                '            raise HTTPException(status_code=409, detail=str(readiness["reason"]))\n')],
+     "semantic": "the orchestration service stops enforcing provider readiness",
+     "edits": [(SERVICE,
+                '    readiness = AIReview.slot_readiness(config)\n'
+                '    if not readiness["ready"]:\n'
+                '        raise AICandidateGenerationError(REASON_PROVIDER_NOT_READY,\n'
+                '                                         str(readiness["reason"]))\n',
+                '    readiness = AIReview.slot_readiness(config)\n'
+                '    if False:\n'
+                '        raise AICandidateGenerationError(REASON_PROVIDER_NOT_READY,\n'
+                '                                         str(readiness["reason"]))\n')],
      "detectors": [
-         "test_r35c_ai_candidate_http.AIEndpointTests."
-         "test_disabled_provider_slot_is_rejected_before_the_provider",
+         "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+         "test_disabled_slot_is_blocked_by_the_service_itself",
+         "test_r35c_ai_candidate_generation.ProviderReadinessTests."
+         "test_unready_slots_are_blocked_with_canonical_reasons",
      ]},
     # M-AIG12 —— 未知槽位不再映射成客户端错误：裸 ValueError 穿透成 5xx。
     {"id": "M-AIG12",
@@ -316,6 +338,36 @@ MUTATIONS = [
      "detectors": [
          "test_r35c_ai_candidate_generation.ProviderProtocolTests."
          "test_corrupt_research_record_is_translated_at_the_service_boundary",
+     ]},
+    # M-AIG15 —— run id 解析退回"先 strip 再 isdigit"：形状非法的输入被悄悄解析成合法
+    # id，于是"形状拒绝"与"查无此行"混为一谈（回归会变成假绿）。
+    {"id": "M-AIG15",
+     "semantic": "a non-canonical run id is silently normalised",
+     "edits": [(SERVICE,
+                '    if isinstance(research_run_id, str) and _CANONICAL_RUN_ID.fullmatch(research_run_id):\n'
+                '        return int(research_run_id)\n',
+                '    if isinstance(research_run_id, str) and research_run_id.strip().isdigit():\n'
+                '        return int(research_run_id.strip())\n')],
+     "detectors": [
+         "test_r35c_ai_candidate_generation.ExactResearchRunTests."
+         "test_c1b_non_numeric_or_negative_run_id_fails_closed",
+         "test_r35c_ai_candidate_generation.ExactResearchRunTests."
+         "test_c1b3_strict_identity_is_checked_before_reading_the_ledger",
+     ]},
+    # M-AIG16 —— model_identity 不再记录 provider 槽位：只记 model 时，两个槽位配同一
+    # model 且提出相同 proposal 就无法区分"谁提出的"，input fingerprint 也被抹平。
+    {"id": "M-AIG16",
+     "semantic": "the proposal provenance stops recording the provider slot",
+     "edits": [(SERVICE,
+                '    provider = str(provider_config.get("slot") or "").strip()\n'
+                '    if provider:\n'
+                '        identity["provider"] = provider\n',
+                '    provider = str(provider_config.get("slot") or "").strip()\n')],
+     "detectors": [
+         "test_r35c_ai_candidate_generation.CrossModelDedupTests."
+         "test_c12c_provider_slot_is_recorded_and_bound_into_the_input_fingerprint",
+         "test_r35c_ai_candidate_generation.CrossModelDedupTests."
+         "test_c12d_provider_identity_is_absent_when_the_slot_is_unknown",
      ]},
 ]
 

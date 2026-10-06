@@ -839,7 +839,11 @@ StrategyCandidate[]（既有 candidate / proposal / batch 三张表，零新表�
 | evidence_count 由 R27 派生、AI 不得自述、进 input fingerprint | `EvidenceCountTests` |
 | model identity 是 candidate-proposal provider，与 research run model 不混用 | `ProviderProtocolTests` |
 | HTTP 契约：请求更窄、凭据不落库、拒绝映射稳定、route 无业务逻辑 | `test_r35c_ai_candidate_http.py` |
-| provider 槽位 readiness（**禁用槽位拦在网络之前**；未知槽位映射 400） | `test_disabled_provider_slot_is_rejected_before_the_provider`、`test_unknown_provider_slot_is_a_client_error` |
+| **provider readiness 由 service 强制**（禁用 / 缺凭据 / 地址 / model → `provider_slot_not_ready`） | `ProviderReadinessTests`（4 tests） |
+| 未就绪槽位的稳定 reason 复用 canonical `slot_readiness`，不复制第二套规则 | `test_readiness_reuses_the_canonical_authority_not_a_second_copy` |
+| run id 必须是**规范十进制**（`" 7"` / `"7 "` / `"007"` / `"+7"` 一律拒绝，且形状拒绝发生在读账本之前） | `test_c1b_non_numeric_or_negative_run_id_fails_closed`、`test_c1b3_strict_identity_is_checked_before_reading_the_ledger` |
+| `model_identity` 记录 canonical provider 槽位 + model，且进 input fingerprint | `test_c12c_provider_slot_is_recorded_and_bound_into_the_input_fingerprint` |
+| provider 槽位 readiness（**禁用槽位拦在网络之前**；未知槽位映射 400） | `test_disabled_provider_slot_is_rejected_before_the_provider`、`test_unknown_provider_slot_is_a_client_error`、`test_route_does_not_duplicate_the_readiness_rule` |
 | 畸形 proposal 形状是**稳定的拒绝**，不泄漏 `TypeError` / `AttributeError` | `test_malformed_parameter_variants_fail_closed_not_typeerror`、`test_malformed_provider_shape_is_a_provider_error_not_a_crash` |
 | 损坏 research 行在服务边界被翻译成稳定 reason（不是裸 ValueError → 5xx） | `test_corrupt_research_record_is_translated_at_the_service_boundary` |
 | AI 批次绑定自己的策略，不跨策略显示 | `strategy-candidates.test.mjs` R35C-C6 |
@@ -848,21 +852,30 @@ StrategyCandidate[]（既有 candidate / proposal / batch 三张表，零新表�
 `test_frontend_module_contract.BridgeCoverageTests` 在完整套件里抓到过一次
 `wbAiGenerateCandidates` 未 bridged：那种按钮在浏览器里会**静默失效**。
 
-**接入 review 修复的三个真实缺陷**（都由外部 review / 完整套件发现，不是猜测）：
+**接入 review 修复的真实缺陷**（都由外部 review / 完整套件发现，不是猜测）：
 
-1. **禁用槽位可被调用**（P1）：`ai_provider_transport.call_json` 只检查 api_key /
-   base_url / model，**不看** `enabled`；route 直接转发配置，于是"操作员禁用了该槽位"
-   只挡住 UI，挡不住真实付费调用。这与 R27-B2B 修过的缺陷是**同一个形状**，修法也相同：
-   在交给 service 之前用 `AIReview.slot_readiness()` 拦下。M-AIG11 钉住。
-2. **畸形形状泄漏未分类异常**：`parameter_variants` 是数字 / 字符串时，`len()` /
+1. **禁用槽位可被调用（P1）**：`ai_provider_transport.call_json` 只检查 api_key /
+   base_url / model，**不看** `enabled`。第一版只把 gate 放在 HTTP route，于是
+   `generate_candidates_from_research()` **直接调用**时禁用形同不存在 —— 而那个 service
+   的 authority 正是"完整编排边界"，可以被 CLI / R36 / scheduler 复用。现在 gate 长在
+   **service** 上（route 只映射 reason），规则仍复用 `ai_review_service.slot_readiness`。
+   M-AIG11 直接打破 service 的 gate。
+2. **run id 形状被悄悄归一（P2）**：`" 7"` 曾先 `strip()` 再 `isdigit()`，于是被解析成 7；
+   若 7 恰好不存在，回归会以"查无此行"通过 —— 典型的**假绿**。现在只接受
+   `[1-9][0-9]*`，形状拒绝发生在读账本之前。M-AIG15 钉住。
+3. **proposal provenance 缺 provider 槽位（P2）**：只记 `model` 时，`ai1` 与 `ai2` 配
+   同一 model 且提出相同 proposal 就无法回答"谁提出的"，`generation_input_fingerprint`
+   也被抹平。现在记录 `{"provider": <canonical slot>, "model": <model>}`（`MODEL_IDENTITY_KEYS`
+   本来就允许 `provider`）。M-AIG16 钉住。
+4. **畸形形状泄漏未分类异常**：`parameter_variants` 是数字 / 字符串时，`len()` /
    `.items()` 抛裸 `TypeError` / `AttributeError`，穿透 proposal 契约变成 5xx。
    现在形状**先于**度量验证。M-AIG13 钉住。
-3. **AI 批次跨策略串台**：切换策略后 `WB_STATE.aiCandidateView` 未清空，B 的详情页会
+5. **AI 批次跨策略串台**：切换策略后 `WB_STATE.aiCandidateView` 未清空，B 的详情页会
    显示 A 的 batch / parent pin / research run。现在按 strategy id 记账。
 
 ### R35-C semantic mutation results
 
-`work/r35c_ai_candidate_mutation_check.py`：M-AIG1…M-AIG14（含 M-AIG5b）全部
+`work/r35c_ai_candidate_mutation_check.py`：M-AIG1…M-AIG16（含 M-AIG5b）全部
 **DETECTED**；`survived=0`、`fake=0`、`timeout=0`、`restore SHA256=PASS`、
 恢复后基线 GREEN。
 
@@ -882,10 +895,12 @@ R35-B 的 `M-X`。
 | M-AIG8 | provenance 不再绑定 exact research `record_hash` | C13 |
 | M-AIG9 | 接受 no-op proposal | C11 |
 | M-AIG10 | proposal model identity 被替换成 research model | ProviderProtocolTests |
-| M-AIG11 | 跳过槽位 readiness，被禁用的槽位照样调用 | HTTP readiness 回归 |
+| M-AIG11 | orchestration service 不再强制 provider readiness | `ProviderReadinessTests` |
 | M-AIG12 | 未知槽位不映射成客户端错误（裸 ValueError → 5xx） | HTTP slot 回归 |
 | M-AIG13 | 畸形 proposal 形状抛未分类异常 | ProviderProtocolTests |
 | M-AIG14 | 损坏 research 行不被翻译（裸 ValueError → 5xx） | ProviderProtocolTests |
+| M-AIG15 | 非规范 run id 被悄悄归一（假绿回归） | `ExactResearchRunTests` |
+| M-AIG16 | proposal provenance 不再记录 provider 槽位 | `CrossModelDedupTests` |
 
 **M-AIG5/M-AIG5b 曾经 SURVIVED，暴露一个真实缺陷**：`FORBIDDEN_PROVIDER_FIELDS`
 当时是**装饰性**的 —— 其中每个字段同时也不在 `_ALLOWED_TOP_LEVEL` 里，因此

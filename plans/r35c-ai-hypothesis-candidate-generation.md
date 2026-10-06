@@ -85,9 +85,13 @@ return。
 请求必须带 `research_run_id`；读取只经 `ai_research_repository.get_run(conn, id)`。
 
 **不存在** `recent_runs(...)[0]`、`latest research`、`current hypothesis` 作为隐式输入。
-run id 只接受规范十进制整数（`int` 或纯数字字符串）：`"7"` → 7；
-`" 7"` / `"7.0"` / `"latest"` / `"*"` / `""` / 负数一律 fail closed —— 任何"帮调用方
-猜一个 run"的行为都是隐式 latest 的入口。C1/C1b 覆盖。
+run id 只接受**规范十进制整数**：`int > 0`，或匹配 `[1-9][0-9]*` 的字符串。
+`"7"` → 7；`" 7"` / `"7 "` / `"007"` / `"+7"` / `"-1"` / `"7.0"` / `"latest"` / `"*"` /
+`""` / `bool` 一律 fail closed —— 任何"帮调用方猜一个 run"的行为都是隐式 latest 的入口。
+
+刻意**不做** `strip()` 后再解析：那会让 `" 7"` 悄悄变成 7，于是"形状不合法"被伪装成
+"查无此行"，两种完全不同的拒绝在审计上无法区分，回归也会变成**假绿**（只要那个 id 恰好
+不存在就"通过"）。形状拒绝因此发生在**读账本之前**。C1b/C1b2/C1b3 覆盖。
 
 不存在该 run → `research_run_not_found`（HTTP 404）。
 
@@ -101,11 +105,22 @@ run not found / authority != research / is_authoritative
 unsupported / insufficient_evidence / corrupt record
 as-of 与 research run 不一致
         ↓ 全部在这里拒绝
+provider readiness（凭据 / enabled / 地址 / model）
+        ↓ 未就绪同样在这里拒绝
         ↓ 之后才允许 provider 调用
 ```
 
 C2 断言 unsupported research 的 `provider call count = 0` 且 `candidate writes = 0`。
 顺序不是风格问题：反过来的话，一次坏输入会先花掉一次 provider 调用。
+
+**provider readiness 必须是本 service 的强制 gate，不能只放 HTTP route**：本模块的
+authority 就是"一次 AI 候选生成的完整编排边界"，它可以被 CLI / R36 / scheduler /
+其他内部调用**直接**调用；而 `ai_provider_transport.call_json` 刻意只检查
+api_key / base_url / model、**不认识** `enabled`。gate 只放 route 等于"绕过 route 时
+禁用形同不存在"。规则**复用** `ai_review_service.slot_readiness`（R27-B2B 建立的
+canonical 定义），因此禁用槽位在 AI 路径与 R27 research runtime 上判定一致，
+不会出现第二套 readiness 语义。route 只负责把 service 的稳定 reason 映射成 HTTP
+状态码，不重复判定。`ProviderReadinessTests` + M-AIG11 覆盖。
 
 ## 七、业务日期钉死
 
@@ -225,9 +240,23 @@ research_provenance.hypothesis_id      = exact hypothesis_id
 `record_hash`（R27 是 integrity authority），不重新 hash 一份替代品。C13 覆盖。
 
 **model identity 是两个概念**：R27 research run 自己已有"最初由哪个 model 产生
-hypothesis"的审计；R35-C 的 `model_identity` 表示"**哪个 model 把 hypothesis 转成
-candidate proposal**"。两者不混用，provider 没给可靠 version 就留空、不编造
-（C12b / ProviderProtocolTests）。
+hypothesis"的审计；R35-C 的 `model_identity` 表示"**哪个 provider / model 把
+hypothesis 转成 candidate proposal**"。两者不混用，provider 没给可靠 version 就留空、
+不编造（C12b / ProviderProtocolTests）。
+
+它记录**两件事**，且只记录仓库已经解耦过的规范槽位身份：
+
+```text
+model_identity.provider = canonical slot identity（ai1 / ai2）
+model_identity.model    = provider 自报的 model
+```
+
+`provider` 必须记：`ai1` 与 `ai2` 可能配**同一个** model。若只记 model，两个槽位提出
+完全相同 proposal 时"哪个 provider 提出的"在台账上无法回答，且 `model_identity` 是
+search-space provenance 的一部分，`generation_input_fingerprint` 也会相同 —— 输入事实的
+差异被抹平。这里保存 canonical slot（`ai1` / `ai2`）而**不是**厂商名：厂商耦合已在
+R27 由 `resolve_slot` 消除。`MODEL_IDENTITY_KEYS` 本来就允许 `provider`，因此不需要
+新 schema。C12c/C12d + M-AIG16 覆盖。
 
 ## 十八、Evidence count 不允许 AI 自述
 

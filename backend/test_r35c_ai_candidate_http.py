@@ -288,8 +288,9 @@ class AIEndpointTests(_Fixture):
         """被禁用的槽位必须拦在**网络之前**。
 
         ``ai_provider_transport.call_json`` 只检查 api_key / base_url / model，**不看**
-        ``enabled``；因此"操作员禁用了该槽位"必须由本层拦下，否则禁用只挡住 UI，挡不住
-        真实付费调用。这与 R27-B2B 修过的缺陷是同一个形状。
+        ``enabled``。现在 readiness gate 长在 orchestration service 上（route 只负责把
+        它的稳定 reason 映射成 HTTP 状态码），所以这条同时验证：HTTP 路径被拒、且
+        service 才是那个强制点。
         """
         import ai_review_service as AIReview
         lifecycle = self._parent("ai_disabled")
@@ -306,8 +307,22 @@ class AIEndpointTests(_Fixture):
             "provider_slot": "ai1",
         })
         self.assertEqual(409, status, body)
+        self.assertIn("disabled", json.dumps(body))
         self.assertEqual([], self.calls, "被禁用的槽位不得发起任何 provider 调用")
         self.assertEqual(before, self._counts())
+
+    def test_route_does_not_duplicate_the_readiness_rule(self):
+        """readiness 必须由 service 强制执行，route 不再自己判定一遍。"""
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(API.generate_ai_strategy_candidates))
+        calls = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        calls |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        self.assertNotIn("slot_readiness", calls,
+                         "readiness 属于 orchestration service，route 只映射 reason")
+        # 但 route 仍必须解析槽位并把未知槽位映射成客户端错误。
+        self.assertIn("resolve_slot", calls)
+        self.assertIn("get_slot_config", calls)
         """route 里不得出现 research gate / parent 查找 / prompt / AST / DB 写入。"""
         import ast
         import inspect

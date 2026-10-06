@@ -253,6 +253,23 @@ api_key / base_url / model，**不看** `enabled`；因此"操作员禁用了该
 `AIReview.slot_readiness()` 拦下（沿用 R27-B2B 的既有定义），否则禁用只挡住 UI、挡不住
 真实付费调用。未知槽位映射成 400，而不是让裸 `ValueError` 变成 5xx。
 
+**槽位 readiness 由 orchestration service 强制**：`ai_provider_transport.call_json`
+只检查 api_key / base_url / model，**不看** `enabled`。gate 必须长在
+`strategy_ai_candidate_service` 上（它可以被 CLI / R36 / scheduler 直接调用），规则复用
+`ai_review_service.slot_readiness`（不复制第二套语义）；route 只解析槽位、读取配置并把
+service 的稳定 reason 映射成 HTTP 状态码（未就绪 409，未知槽位 400）。
+
+provider / model provenance 记录 **canonical 槽位身份 + model**：
+
+```text
+model_identity.provider = ai1 / ai2      （canonical slot，不是厂商名）
+model_identity.model    = <provider 自报 model>
+```
+
+`ai1` 与 `ai2` 可能配同一个 model：只记 model 时"哪个 provider 提出的"在台账上无法
+回答，`generation_input_fingerprint` 也会被抹平。`MODEL_IDENTITY_KEYS` 本来就允许
+`provider`，所以不需要新 schema。
+
 前端 `wbAiCandidateHtml()` 只做最小能力：输入 exact research run、显式点击生成、渲染
 `research_run_id` / `hypothesis_id` / research record hash / provider model / parent pin /
 search-space fingerprint / generation batch id / candidate count / candidate ids。
@@ -268,10 +285,10 @@ inline handler 必须挂到 `window`（`frontend/src/bridge.js` 的 `window.wbAi
 ## 19. 测试
 
 ```text
-backend/test_r35c_ai_candidate_generation.py    C1–C18 契约（54 tests）
+backend/test_r35c_ai_candidate_generation.py    C1–C18 契约（63 tests）
 backend/test_r35c_ai_candidate_http.py          HTTP 契约（11 tests）
-                                                R35-C 合计 65 tests
-backend full suite (local, Python 3.14.5)       Ran 5458 tests  OK (skipped=5)
+                                                R35-C 合计 74 tests
+backend full suite (local, Python 3.14.5)       Ran 5467 tests  OK (skipped=5)
 frontend (node --test)                          174 tests  pass 0 fail
 ruff check backend / compileall -q backend / git diff --check   all clean
 ```
@@ -307,7 +324,9 @@ M-AIG11 DETECTED (a disabled provider slot is invoked anyway)
 M-AIG12 DETECTED (an unknown provider slot is not mapped to a client error)
 M-AIG13 DETECTED (a malformed proposal shape raises an unclassified exception)
 M-AIG14 DETECTED (a corrupt research record is not translated at the boundary)
-M-AIG detected = 15/15
+M-AIG15 DETECTED (a non-canonical run id is silently normalised)
+M-AIG16 DETECTED (the proposal provenance stops recording the provider slot)
+M-AIG detected = 17/17
 survived = 0; fake = 0; timeout = 0
 restore SHA256 = PASS
 baseline after restore = GREEN
@@ -324,14 +343,18 @@ reason，并由 C7c 逐个遍历禁止集合钉住。
 
 | 级别 | 缺陷 | 修法 | 回归 / mutation |
 |---|---|---|---|
-| P1 | 槽位 `enabled=false` 时仍会被调用：`call_json` 只看 api_key / base_url / model，不看 `enabled`，于是禁用只挡住 UI | route 在调 service 前用 `AIReview.slot_readiness()` 拦下（沿用 R27-B2B 既有定义） | `test_disabled_provider_slot_is_rejected_before_the_provider` / M-AIG11 |
-| P2 | 未知 `provider_slot` 抛裸 `ValueError` → 5xx | 映射成 400 `unknown_provider_slot` | `test_unknown_provider_slot_is_a_client_error` / M-AIG12 |
+| **P1** | readiness gate **只在 route**：`generate_candidates_from_research()` 被直接调用（CLI / R36 / scheduler）时，`enabled=false` 的槽位照样发起真实付费调用 | gate 移到 **service**（route 只映射 reason） | `ProviderReadinessTests`（4）/ M-AIG11 |
+| P2 | 未知 `provider_slot` 抛裸 `ValueError` → 5xx | 映射 400 `unknown_provider_slot`，不回落别的槽位 | `test_unknown_provider_slot_is_a_client_error` / M-AIG12 |
 | P2 | 畸形 `parameter_variants`（数字 / 字符串）让 `len()` / `.items()` 抛裸 `TypeError` / `AttributeError`，穿透契约变成 5xx | 形状**先于**度量验证 | `test_malformed_parameter_variants_fail_closed_not_typeerror` / M-AIG13 |
 | P2 | 损坏 research 行抛 `ResearchPersistenceError`（`ValueError` 子类）穿透成 5xx | 在服务边界翻译成 `research_not_supported` | `test_corrupt_research_record_is_translated_at_the_service_boundary` / M-AIG14 |
 | P2 | 切换策略后仍显示上一条策略的 AI 批次（把 A 的台账冒充成 B 的） | 批次按 strategy id 记账 | `strategy-candidates.test.mjs` R35C-C6 |
+| **P2** | run id **不是**规范十进制：`" 7"` / `"7 "` / `"007"` 被 `strip()` 后悄悄解析成 7；若 7 恰好不存在，回归会以"查无此行"**假绿**通过 | 只接受 `[1-9][0-9]*`（或 `int > 0`），形状拒绝发生在读账本之前 | `test_c1b…` / `test_c1b3…` / M-AIG15 |
+| **P2** | `model_identity` 只记 `model`：`ai1` 与 `ai2` 配同一 model、提出相同 proposal 时无法回答"哪个 provider 提出的"，`generation_input_fingerprint` 被抹平 | 记录 `{"provider": <canonical slot>, "model": …}` | `test_c12c…` / `test_c12d…` / M-AIG16 |
 
 第一条与本仓库 R27-B2B 修过的缺陷是**同一个形状**（`deepseek_advisor` 的注释里明确写了
-"被禁用的槽位必须在交给 transport 之前拦下"），本轮在新增的 AI 路径上重复了它。
+"被禁用的槽位必须在交给 transport 之前拦下"）。第一版我把 gate 放在 route，等于只在
+HTTP 路径上修好、service 直调仍然敞开 —— 而那个 service 的 authority 正是"完整编排
+边界"，所以现在 gate 长在 service 上。
 
 R35-A / R35-B mutation 在本轮契约下复验：
 

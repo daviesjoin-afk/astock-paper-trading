@@ -124,6 +124,13 @@ def _raise_ai_candidate_http(exc: ValueError) -> None:
     这条路径**不**返回 5xx：它要么给出一个可验证的候选批次，要么明确拒绝。
     """
     reason = str(getattr(exc, "reason", "") or exc)
+    detail = str(getattr(exc, "detail", "") or "")
+    if reason == SAICS.REASON_PROVIDER_NOT_READY:
+        # 槽位未就绪（被禁用 / 缺凭据 / 地址不可用 / 缺 model）：配置状态冲突，不是请求
+        # 形状错误。**区分"被操作员禁用"与"凭据没配"**对排障是必要的，因此把 canonical
+        # readiness reason 一并下发给调用方 —— 它只描述槽位配置状态，不含任何凭据内容。
+        raise HTTPException(status_code=409,
+                            detail=f"{reason}:{detail}" if detail else reason) from exc
     if reason == SAICS.REASON_RESEARCH_NOT_FOUND or "not_found" in reason:
         status = 404
     elif reason in (SAICS.REASON_AI_CANDIDATE_CAP, SAIP.Reason.SEARCH_SPACE_REJECTED,
@@ -576,11 +583,13 @@ def generate_ai_strategy_candidates(
         # provider 配置复用既有槽位 authority（``ai_review_service``）：不新增
         # STRATEGY_AI_API_KEY 之类的第二套配置系统，客户端也无法提交任何凭据。
         #
-        # 槽位解析与 readiness 判定都在**网络之前**做完，理由与 R27-B2B 修过的那个缺陷
-        # 完全相同：``ai_provider_transport.call_json`` 只检查 api_key / base_url /
-        # model，**不看** ``enabled`` —— 因此"操作员禁用了该槽位"必须在交给它之前拦下，
-        # 否则禁用只挡住 UI，挡不住真实付费调用。未知槽位同样在这里映射成客户端错误，
-        # 而不是让裸 ValueError 变成 5xx。
+        # route 只**解析**槽位与读取配置（那是 HTTP 层职责），并把未知槽位映射成客户端
+        # 错误而不是让裸 ValueError 变成 5xx。
+        #
+        # readiness **不在这里判定**：它是"这个已解析配置是否允许发请求"，属于
+        # orchestration service 的强制 gate（那个 service 也能被 CLI / R36 / scheduler
+        # 直接调用）。route 只负责把 service 的稳定 reason 映射成 HTTP 状态码，避免同一
+        # 条规则有两个执行点、也避免重复调用。
         try:
             slot = AIReview.resolve_slot(request.provider_slot or AIReview.AI_SLOTS[0])
         except ValueError:
@@ -588,9 +597,6 @@ def generate_ai_strategy_candidates(
                                 detail="unknown_provider_slot") from None
         with SCV.paper_connection() as conn:
             provider_config = AIReview.get_slot_config(conn, slot)
-        readiness = AIReview.slot_readiness(provider_config)
-        if not readiness["ready"]:
-            raise HTTPException(status_code=409, detail=str(readiness["reason"]))
         return SAICS.generate_candidates_from_research(
             research_reader=SCV.paper_connection,
             writer=lambda: SCV.paper_connection(immediate=True),

@@ -33,6 +33,7 @@ canonical R27 research run、pin exact parent、调用 provider、把 proposal �
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Mapping
 from typing import Any
@@ -53,6 +54,7 @@ __all__ = [
     "REASON_RESEARCH_AUTHORITY",
     "REASON_ASOF_MISMATCH",
     "REASON_AI_CANDIDATE_CAP",
+    "REASON_PROVIDER_NOT_READY",
     "generate_candidates_from_research",
     "plan_research_candidate_generation",
 ]
@@ -72,6 +74,33 @@ REASON_RESEARCH_UNSUPPORTED = "research_not_supported"
 REASON_RESEARCH_AUTHORITY = "research_is_not_authoritative"
 REASON_ASOF_MISMATCH = "research_as_of_mismatch"
 REASON_AI_CANDIDATE_CAP = "ai_candidate_cap_exceeded"
+REASON_PROVIDER_NOT_READY = "provider_slot_not_ready"
+
+#: 规范十进制 run id：**没有**前导零、没有正负号、没有空白。``"007"`` 被刻意拒绝 ——
+#: 同一个 run 只应有一个可接受的文本形态，否则"7" 与 "007" 会指向同一行却看起来像两个。
+_CANONICAL_RUN_ID = re.compile(r"[1-9][0-9]*")
+
+
+def _require_provider_ready(provider_config: Any) -> None:
+    """强制 provider 槽位 readiness —— **在网络调用之前**，且由本 service 自己拥有。
+
+    为什么必须在 service、而不是只靠 HTTP route：本模块的 authority 就是"一次 AI 候选
+    生成的完整 orchestration boundary"。它可以直接被调用（CLI / R36 / scheduler / 内部
+    复用），而 :func:`ai_provider_transport.call_json` **刻意**只检查
+    ``api_key`` / ``base_url`` / ``model``，**不认识** ``enabled`` —— 所以只把 readiness
+    放在 route，等于"H有人绕过 route 时禁用形同不存在"。把 gate 放在这里，无论调用方是谁
+    都成立。
+
+    规则**不复制**：直接复用 ``ai_review_service.slot_readiness``（R27-B2B 建立的
+    canonical 定义，"凭据 → 启用 → 地址 → 模型"），因此禁用槽位在这里得到与 R27 research
+    runtime 完全一致的判定，不会出现第二套 readiness 语义。
+    """
+    import ai_review_service as AIReview
+    config = provider_config if isinstance(provider_config, Mapping) else {}
+    readiness = AIReview.slot_readiness(config)
+    if not readiness["ready"]:
+        raise AICandidateGenerationError(REASON_PROVIDER_NOT_READY,
+                                         str(readiness["reason"]))
 
 
 def _research_provenance(run: Mapping[str, Any]) -> dict:
@@ -105,18 +134,23 @@ def _require_supported(run: Mapping[str, Any]) -> None:
 def _research_run_identity(research_run_id: Any) -> int:
     """Normalise the caller-supplied run identity to the ledger's integer key.
 
-    只接受规范十进制整数（``int`` 或纯数字字符串）—— 这是 HTTP 与 CLI 的形态差异，
-    不是模糊匹配。``"7"`` → ``7``；``" 7"`` / ``"7.0"`` / ``"latest"`` / ``"*"``
-    一律拒绝：任何"帮调用方猜一个 run"的行为都会重新引入隐式 latest。
+    契约是**规范十进制整数**（canonical decimal）：``int > 0``，或匹配
+    ``[1-9][0-9]*`` 的字符串。刻意**不做** ``strip()`` 后再解析 —— 那会让 ``" 7"`` /
+    ``"7 "`` 悄悄变成 7，于是"形状不合法"被伪装成"查无此行"，两种完全不同的拒绝在
+    审计上无法区分（也让回归变成假绿：只要那个 id 恰好不存在就"通过"）。
+
+    因此一律拒绝：``" 7"`` / ``"7 "`` / ``"007"``（非规范前导零）/ ``"+7"`` / ``"-1"`` /
+    ``"7.0"`` / ``"latest"`` / ``"*"`` / ``""`` / ``bool``。
     """
     if isinstance(research_run_id, bool):
+        # bool 是 int 的子类：``True`` 绝不能当成 run 1。
         raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, "invalid run id")
-    if isinstance(research_run_id, int) and research_run_id > 0:
+    if isinstance(research_run_id, int):
+        if research_run_id > 0:
+            return int(research_run_id)
+        raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, "invalid run id")
+    if isinstance(research_run_id, str) and _CANONICAL_RUN_ID.fullmatch(research_run_id):
         return int(research_run_id)
-    if isinstance(research_run_id, str) and research_run_id.strip().isdigit():
-        value = int(research_run_id.strip())
-        if value > 0:
-            return value
     raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, "invalid run id")
 
 
@@ -252,6 +286,12 @@ def generate_candidates_from_research(
     # 而不是复用调用方那个可能为 None 的入参。
     pinned_asof: str = plan["asof"]
 
+    # ── readiness gate：必须发生在**任何** provider 调用之前 ──
+    #
+    # 放在 research / parent gate 之后、网络调用之前：坏审计输入不先花钱，而未就绪的
+    # 槽位也绝不会被真正调用。二者都满足"拒绝排在付费之前"。
+    _require_provider_ready(provider_config)
+
     # ── 2/3. 网络调用在写事务之外 ──
     result = SAIPR.propose_candidate_space(
         provider_config=provider_config,
@@ -314,10 +354,28 @@ def generate_candidates_from_research(
 
 
 def _provider_model_identity(provider_config: Any) -> dict:
-    """The **candidate-proposal** provider identity, never the research run's model."""
+    """The **candidate-proposal** provider identity, never the research run's model。
+
+    记录两件事，且只记录仓库已经解耦过的**规范槽位身份**（``ai1`` / ``ai2``）与 model：
+
+    * ``provider`` —— canonical slot identity。不硬编码厂商名（``mimo`` / ``deepseek``
+      这类历史别名由 ``resolve_slot`` 归一成槽位，厂商耦合已在 R27 消除）。
+    * ``model`` —— provider 自报的 model。
+
+    为什么 ``provider`` 必须记：``ai1`` 与 ``ai2`` 可能配同一个 model。若只记 model，
+    "哪一次请求由哪个 provider 槽位提出"这个问题在台账上就**无法回答**，而 R35-C 的
+    审计链明确承诺能回答"哪个 provider/model"。且 ``model_identity`` 是 search-space
+    provenance 的一部分，缺了它，两个不同槽位、相同 model、相同 proposal 的请求会得到
+    相同的 ``generation_input_fingerprint`` —— 输入事实的差异被抹平。
+
+    provider 没给可靠 model 就留空，不编造（R27 的既有原则）。
+    """
     if not isinstance(provider_config, Mapping):
         return {}
     identity = {}
+    provider = str(provider_config.get("slot") or "").strip()
+    if provider:
+        identity["provider"] = provider
     model = str(provider_config.get("model") or "").strip()
     if model:
         identity["model"] = model
