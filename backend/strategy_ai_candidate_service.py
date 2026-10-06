@@ -148,7 +148,14 @@ def plan_research_candidate_generation(
     # ``ai_review_service.get_slot_config``）；否则全新库上"查一条 run"会直接
     # ``no such table`` 崩成 5xx —— 那既不是"查无此行"，也不是 fail closed。
     ARR.ensure_schema(conn)
-    run = ARR.get_run(conn, run_key)
+    try:
+        run = ARR.get_run(conn, run_key)
+    except ARR.ResearchPersistenceError as exc:
+        # 损坏 / 不自洽 / ``record_hash`` 不符的行：``get_run`` 读取时 fail closed。
+        # 必须在这里翻译成本层的稳定 reason —— 否则一个裸 ValueError 会以未分类异常
+        # 穿透到 API 变成 5xx，而它本该是"这条研究不可用"的明确拒绝。
+        raise AICandidateGenerationError(
+            REASON_RESEARCH_UNSUPPORTED, "corrupt_research_record") from exc
     if run is None:
         # 绝不回退到 recent_runs(...)[0]：那是把"最新一次研究"变成隐式输入。
         raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, str(run_key))

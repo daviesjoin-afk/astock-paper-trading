@@ -903,7 +903,8 @@ export async function wbAiGenerateCandidates(){
     if(proposals.length&&proposals[0].research_provenance){
       provenance=proposals[0].research_provenance;
     }
-    WB_STATE.aiCandidateView=Object.assign({},result,{research_provenance:provenance});
+    WB_STATE.aiCandidateView=Object.assign({},result,{research_provenance:provenance,
+      strategy_id:strategyId});
   }catch(e){
     toast(String((e&&e.message)||'AI 候选生成被拒绝'), true);
     return;
@@ -923,6 +924,11 @@ export async function wbOpenDetail(strategyId){
     challengerView=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/challenger'
       +(WB_STATE.challengerReportId?'?comparison_report_id='+encodeURIComponent(WB_STATE.challengerReportId):''));
   }catch(e){}
+  // R35-C：AI 面板渲染的是**上一次为这个策略**生成的批次。切换策略时若不清空，B 的
+  // 详情页会显示 A 的 batch / parent pin / research run —— 那是把 A 的台账事实
+  // 冒充成 B 的。因此这里按当前 strategy id 记账，只在**同一条策略**下复用。
+  var aiView=WB_STATE.aiCandidateView;
+  if(aiView&&aiView.strategy_id!==strategyId) aiView=null;
   // R35-A：候选台账只按 **exact** version + checksum 读，绝不查 head / latest。
   var pinnedVersion=lifecycle.version||item.version||item.current_version||1;
   var pinnedChecksum=lifecycle.checksum||item.current_checksum||'';
@@ -1004,7 +1010,7 @@ export async function wbOpenDetail(strategyId){
     +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有 promotion transition 可用。</small>')+'</div>'
     +'<h4>Promotion proposals</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无 proposal。</p>')+'</div></section>'
     +'<section class="strategy-challenger-workspace" data-testid="challenger-workspace">'+wbChallengerHtml(strategyId,challengerView)+'</section>'
-    +'<section class="strategy-ai-candidate-workspace" data-testid="ai-candidate-workspace">'+wbAiCandidateHtml(strategyId,WB_STATE.aiCandidateView)+'</section>'
+    +'<section class="strategy-ai-candidate-workspace" data-testid="ai-candidate-workspace">'+wbAiCandidateHtml(strategyId,aiView)+'</section>'
     +'<section class="strategy-candidate-workspace" data-testid="candidate-workspace">'+wbCandidatesHtml(strategyId,candidatesView)+'</section>'
     +'<div class="strategy-detail-columns"><section><h4>运行时摘要</h4><dl class="strategy-preview-grid">'
     +'<dt>ID</dt><dd>'+adaptiveEsc(item.id)+'</dd><dt>来源</dt><dd>'+(item.origin==='user'?'自定义':'内置')+'</dd>'

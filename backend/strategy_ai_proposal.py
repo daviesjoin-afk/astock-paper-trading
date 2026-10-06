@@ -142,8 +142,22 @@ def _required_int(value: Any, *, what: str) -> int:
 
 
 def _check_resources(payload: Mapping[str, Any]) -> None:
-    """资源上界检查 —— 刻意在**任何** AST 校验之前跑。"""
-    parameters = payload.get("parameter_variants") or {}
+    """资源上界检查 —— 刻意在**任何** AST 校验之前跑。
+
+    形状**先于**度量：``parameter_variants`` 必须是一个 object、每个值必须是 list、
+    每个 slot 必须是 object。否则 ``len()`` / ``.items()`` 会抛 ``TypeError`` /
+    ``AttributeError`` —— 那既不是 ``AIProposalError`` 也不 fail closed：provider 的
+    畸形 JSON 会以未分类异常穿透本契约，在 API 层变成 5xx。协议畸形必须是一个
+    **稳定的拒绝**。
+    """
+    raw_parameters = payload.get("parameter_variants")
+    if raw_parameters is None:
+        parameters: Mapping[str, Any] = {}
+    elif isinstance(raw_parameters, Mapping):
+        parameters = raw_parameters
+    else:
+        raise AIProposalError(Reason.INVALID_PROPOSAL_SHAPE,
+                              "parameter_variants must be an object")
     if len(parameters) > MAX_AI_PARAMETERS:
         raise AIProposalError(Reason.RESOURCE_LIMIT, "too many parameters")
     for name, values in parameters.items():
@@ -154,7 +168,12 @@ def _check_resources(payload: Mapping[str, Any]) -> None:
             raise AIProposalError(Reason.RESOURCE_LIMIT, f"too many values for {name}")
     for role in SLOT_ROLES:
         slot = payload.get(role)
-        if not isinstance(slot, Mapping) or slot.get("kind") != SS.EXPLICIT_VARIANT:
+        if slot is None:
+            continue
+        if not isinstance(slot, Mapping):
+            raise AIProposalError(Reason.INVALID_PROPOSAL_SHAPE,
+                                  f"{role} must be an object")
+        if slot.get("kind") != SS.EXPLICIT_VARIANT:
             continue
         alternatives = slot.get("alternatives")
         if not isinstance(alternatives, Sequence) or isinstance(alternatives, (str, bytes)):

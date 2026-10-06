@@ -70,6 +70,13 @@ class _Fixture(unittest.TestCase):
 
     def setUp(self):
         SRT.clear_cache()
+        # 配置一个**就绪**的槽位：provider 配置复用既有 ai_review_service authority，
+        # 且 readiness（凭据 / enabled / 地址 / 模型）必须在网络之前成立。
+        import ai_review_service as AIReview
+        with SCV.paper_connection() as conn:
+            AIReview.update_slot(conn, "ai1", api_key="sk-test-slot",
+                                 enabled=True, base_url="https://ai1.example.com/v1",
+                                 model="test-model")
         self.calls = []
         self._original = SAIPR.transport.call_json
         self.addCleanup(lambda: setattr(SAIPR.transport, "call_json", self._original))
@@ -262,7 +269,45 @@ class AIEndpointTests(_Fixture):
         self.assertEqual([], self.calls)
         self.assertEqual(before, self._counts())
 
-    def test_route_does_no_business_logic(self):
+    def test_unknown_provider_slot_is_a_client_error(self):
+        """未知槽位是客户端错误，不是 5xx，也不能静默回落到别的槽位。"""
+        lifecycle = self._parent("ai_slot")
+        run_id = self._research_run()
+        before = self._counts()
+        status, body = self._call(API.generate_ai_strategy_candidates, "ai_slot", {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "research_run_id": str(run_id),
+            "provider_slot": "evil-slot",
+        })
+        self.assertEqual(400, status, body)
+        self.assertEqual([], self.calls)
+        self.assertEqual(before, self._counts())
+
+    def test_disabled_provider_slot_is_rejected_before_the_provider(self):
+        """被禁用的槽位必须拦在**网络之前**。
+
+        ``ai_provider_transport.call_json`` 只检查 api_key / base_url / model，**不看**
+        ``enabled``；因此"操作员禁用了该槽位"必须由本层拦下，否则禁用只挡住 UI，挡不住
+        真实付费调用。这与 R27-B2B 修过的缺陷是同一个形状。
+        """
+        import ai_review_service as AIReview
+        lifecycle = self._parent("ai_disabled")
+        run_id = self._research_run()
+        with SCV.paper_connection() as conn:
+            AIReview.update_slot(conn, "ai1", api_key="sk-present", enabled=False,
+                                 base_url="https://ai1.example.com/v1", model="m")
+        before = self._counts()
+        self.calls.clear()
+        status, body = self._call(API.generate_ai_strategy_candidates, "ai_disabled", {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "research_run_id": str(run_id),
+            "provider_slot": "ai1",
+        })
+        self.assertEqual(409, status, body)
+        self.assertEqual([], self.calls, "被禁用的槽位不得发起任何 provider 调用")
+        self.assertEqual(before, self._counts())
         """route 里不得出现 research gate / parent 查找 / prompt / AST / DB 写入。"""
         import ast
         import inspect

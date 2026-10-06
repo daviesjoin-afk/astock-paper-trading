@@ -575,9 +575,22 @@ def generate_ai_strategy_candidates(
     try:
         # provider 配置复用既有槽位 authority（``ai_review_service``）：不新增
         # STRATEGY_AI_API_KEY 之类的第二套配置系统，客户端也无法提交任何凭据。
+        #
+        # 槽位解析与 readiness 判定都在**网络之前**做完，理由与 R27-B2B 修过的那个缺陷
+        # 完全相同：``ai_provider_transport.call_json`` 只检查 api_key / base_url /
+        # model，**不看** ``enabled`` —— 因此"操作员禁用了该槽位"必须在交给它之前拦下，
+        # 否则禁用只挡住 UI，挡不住真实付费调用。未知槽位同样在这里映射成客户端错误，
+        # 而不是让裸 ValueError 变成 5xx。
+        try:
+            slot = AIReview.resolve_slot(request.provider_slot or AIReview.AI_SLOTS[0])
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="unknown_provider_slot") from None
         with SCV.paper_connection() as conn:
-            provider_config = AIReview.get_slot_config(
-                conn, request.provider_slot or AIReview.AI_SLOTS[0])
+            provider_config = AIReview.get_slot_config(conn, slot)
+        readiness = AIReview.slot_readiness(provider_config)
+        if not readiness["ready"]:
+            raise HTTPException(status_code=409, detail=str(readiness["reason"]))
         return SAICS.generate_candidates_from_research(
             research_reader=SCV.paper_connection,
             writer=lambda: SCV.paper_connection(immediate=True),

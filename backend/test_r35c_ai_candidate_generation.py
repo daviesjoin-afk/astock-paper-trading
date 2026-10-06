@@ -813,6 +813,51 @@ class AuthorityBoundaryTests(_Base):
 class ProviderProtocolTests(_Base):
     """provider 边界：非 object、transport 失败、模型 identity 不编造。"""
 
+    def test_malformed_parameter_variants_fail_closed_not_typeerror(self):
+        """畸形形状必须是**稳定的拒绝**，不能泄漏 TypeError / AttributeError。
+
+        ``len()`` / ``.items()`` 作用在非 object 上会抛裸 TypeError / AttributeError，
+        那不是 ``AIProposalError`` 也不 fail closed —— provider 的畸形 JSON 会以未分类
+        异常穿透契约，在 API 层变成 5xx。形状必须**先于**度量被验证。
+        """
+        for payload in (
+            {"parameter_variants": 5},
+            {"parameter_variants": "x"},
+            {"parameter_variants": [1, 2]},
+            {"parameter_variants": {"ma_period": 5}},
+            {"factor_slot": "inherit_parent"},
+            {"entry_slot": 3},
+            {"exit_slot": ["x"]},
+            {"parameter_variants": {"ma_period": [18]}, "factor_slot": 7},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SAIP.AIProposalError) as ctx:
+                    SAIP.build_proposal(payload)
+                self.assertEqual(SAIP.Reason.INVALID_PROPOSAL_SHAPE, ctx.exception.reason)
+
+    def test_malformed_provider_shape_is_a_provider_error_not_a_crash(self):
+        """同一件事走完整路径：provider 畸形 → AIProviderError（可映射 502），不是 500。"""
+        run_id = self.record_run(_supported_hypothesis())
+        for payload in ({"parameter_variants": 5}, {"factor_slot": "nope"}):
+            self._transport.payload = payload
+            with self.assertRaises(SAIPR.AIProviderError) as ctx:
+                self.generate(research_run_id=str(run_id))
+            self.assertEqual(SAIPR.REASON_INVALID_PROVIDER_RESPONSE, ctx.exception.reason)
+
+    def test_corrupt_research_record_is_translated_at_the_service_boundary(self):
+        """损坏行必须变成稳定 reason，而不是裸 ValueError 穿透成 5xx。"""
+        run_id = self.record_run(_supported_hypothesis())
+        # 直接篡改持久化内容：record_hash 将不再匹配，get_run 读取时 fail closed。
+        with self._connection() as conn:
+            conn.execute(f'UPDATE {ARR.TABLE} SET hypothesis = ?  WHERE id = ?',
+                         ('{"hypothesis_id":"tampered"}', run_id))
+        self.calls.clear()
+        with self.assertRaises(SAICS.AICandidateGenerationError) as ctx:
+            self.generate(research_run_id=str(run_id))
+        self.assertEqual(SAICS.REASON_RESEARCH_UNSUPPORTED, ctx.exception.reason)
+        # 而且仍然没有付费调用。
+        self.assertEqual([], self.calls)
+
     def test_non_object_response_is_rejected(self):
         run_id = self.record_run(_supported_hypothesis())
         for payload in ([], "x", 3, None):

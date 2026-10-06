@@ -328,6 +328,22 @@ test("R35C-C4：AI 生成请求只带 exact pin 与 run，不替后端制造 aso
     "上限判定归后端，前端不得复制业务规则");
 });
 
+test("R35C-C6：AI 批次必须绑定到它自己的策略，绝不跨策略显示", () => {
+  // A 生成的 batch 不得在 B 的详情页出现：那是把 A 的台账事实冒充成 B 的。
+  const start = source.indexOf("export async function wbOpenDetail");
+  const section = source.slice(start, source.indexOf("wbShowView('detail')", start));
+  assert.ok(section.includes("aiView.strategy_id!==strategyId"),
+    "打开别的策略时必须丢弃不属于它的 AI 批次");
+  // 生成时必须记录归属策略。
+  const genStart = source.indexOf("export async function wbAiGenerateCandidates");
+  const gen = source.slice(genStart, source.indexOf("export async function wbOpenDetail", genStart));
+  assert.ok(gen.includes("strategy_id:strategyId"), "必须记录该批次属于哪条策略");
+  // 渲染调用必须用过滤后的 view，而不是全局状态。
+  assert.ok(section.includes("wbAiCandidateHtml(strategyId,aiView)"),
+    "必须渲染过滤后的 view");
+  assert.ok(!section.includes("wbAiCandidateHtml(strategyId,WB_STATE.aiCandidateView)"),
+    "不得直接渲染全局 AI 状态");
+});
 test("R35C-C5：AI 面板不自动触发（无 scheduler / cron / 自动批量）", () => {
   const start = source.indexOf("/* R35-C：AI candidate generation 面板");
   const end = source.indexOf("export function wbCandidatesHtml", start);

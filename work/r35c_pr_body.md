@@ -248,12 +248,18 @@ parent 查找 / prompt 组装 / AST 校验 / 候选展开 / DB INSERT。拒绝�
 research 不自洽 409、请求越界与 search space 被拒 400、provider 协议/transport 失败 502，
 **不**返回 5xx。
 
+**槽位 readiness 必须在网络之前**：`ai_provider_transport.call_json` 只检查
+api_key / base_url / model，**不看** `enabled`；因此"操作员禁用了该槽位"必须由本层用
+`AIReview.slot_readiness()` 拦下（沿用 R27-B2B 的既有定义），否则禁用只挡住 UI、挡不住
+真实付费调用。未知槽位映射成 400，而不是让裸 `ValueError` 变成 5xx。
+
 前端 `wbAiCandidateHtml()` 只做最小能力：输入 exact research run、显式点击生成、渲染
 `research_run_id` / `hypothesis_id` / research record hash / provider model / parent pin /
 search-space fingerprint / generation batch id / candidate count / candidate ids。
 **禁止** AI 推荐策略 / 最佳策略 / 最优参数 / 预计收益 / AI Score / 一键上线 / Promote /
 Deploy；不自动触发（无 scheduler / cron）；不替后端制造 as-of / universe / regime。
-未发起生成时明说"尚未发起生成"，不编造结果。
+未发起生成时明说"尚未发起生成"，不编造结果。批次按 strategy id 记账：切换策略后不显示
+别的策略的 batch。
 
 inline handler 必须挂到 `window`（`frontend/src/bridge.js` 的 `window.wbAiGenerateCandidates`）：
 完整套件里的 `test_frontend_module_contract.BridgeCoverageTests` 抓到过一次漏挂 ——
@@ -262,11 +268,11 @@ inline handler 必须挂到 `window`（`frontend/src/bridge.js` 的 `window.wbAi
 ## 19. 测试
 
 ```text
-backend/test_r35c_ai_candidate_generation.py    C1–C18 契约（53 tests）
-backend/test_r35c_ai_candidate_http.py          HTTP 契约（8 tests）
-                                                R35-C 合计 61 tests
-backend full suite (local, Python 3.14.5)       Ran 5454 tests  OK (skipped=5)
-frontend (node --test)                          173 tests  pass 0 fail
+backend/test_r35c_ai_candidate_generation.py    C1–C18 契约（54 tests）
+backend/test_r35c_ai_candidate_http.py          HTTP 契约（11 tests）
+                                                R35-C 合计 65 tests
+backend full suite (local, Python 3.14.5)       Ran 5458 tests  OK (skipped=5)
+frontend (node --test)                          174 tests  pass 0 fail
 ruff check backend / compileall -q backend / git diff --check   all clean
 ```
 backend/test_r35a_strategy_candidate.py         R35-A 回归
@@ -297,7 +303,11 @@ M-AIG7  DETECTED (an over-cap proposal is truncated instead of rejected)
 M-AIG8  DETECTED (the generation provenance stops binding the exact research record hash)
 M-AIG9  DETECTED (a no-op proposal is accepted)
 M-AIG10 DETECTED (the proposal model identity is replaced by the research run model)
-M-AIG detected = 11/11
+M-AIG11 DETECTED (a disabled provider slot is invoked anyway)
+M-AIG12 DETECTED (an unknown provider slot is not mapped to a client error)
+M-AIG13 DETECTED (a malformed proposal shape raises an unclassified exception)
+M-AIG14 DETECTED (a corrupt research record is not translated at the boundary)
+M-AIG detected = 15/15
 survived = 0; fake = 0; timeout = 0
 restore SHA256 = PASS
 baseline after restore = GREEN
@@ -307,6 +317,21 @@ baseline after restore = GREEN
 **装饰性**的 —— 其中每个字段同时也不在允许集合里，于是"AI 试图声明越权字段"与"协议
 漂移"落到同一个 `unknown_proposal_field`，越权事件在审计里消失。现在两者给出不同
 reason，并由 C7c 逐个遍历禁止集合钉住。
+
+### 外部 review 修复（本轮内）
+
+三条都是**真实缺陷**，已各自补回归与 mutation：
+
+| 级别 | 缺陷 | 修法 | 回归 / mutation |
+|---|---|---|---|
+| P1 | 槽位 `enabled=false` 时仍会被调用：`call_json` 只看 api_key / base_url / model，不看 `enabled`，于是禁用只挡住 UI | route 在调 service 前用 `AIReview.slot_readiness()` 拦下（沿用 R27-B2B 既有定义） | `test_disabled_provider_slot_is_rejected_before_the_provider` / M-AIG11 |
+| P2 | 未知 `provider_slot` 抛裸 `ValueError` → 5xx | 映射成 400 `unknown_provider_slot` | `test_unknown_provider_slot_is_a_client_error` / M-AIG12 |
+| P2 | 畸形 `parameter_variants`（数字 / 字符串）让 `len()` / `.items()` 抛裸 `TypeError` / `AttributeError`，穿透契约变成 5xx | 形状**先于**度量验证 | `test_malformed_parameter_variants_fail_closed_not_typeerror` / M-AIG13 |
+| P2 | 损坏 research 行抛 `ResearchPersistenceError`（`ValueError` 子类）穿透成 5xx | 在服务边界翻译成 `research_not_supported` | `test_corrupt_research_record_is_translated_at_the_service_boundary` / M-AIG14 |
+| P2 | 切换策略后仍显示上一条策略的 AI 批次（把 A 的台账冒充成 B 的） | 批次按 strategy id 记账 | `strategy-candidates.test.mjs` R35C-C6 |
+
+第一条与本仓库 R27-B2B 修过的缺陷是**同一个形状**（`deepseek_advisor` 的注释里明确写了
+"被禁用的槽位必须在交给 transport 之前拦下"），本轮在新增的 AI 路径上重复了它。
 
 R35-A / R35-B mutation 在本轮契约下复验：
 

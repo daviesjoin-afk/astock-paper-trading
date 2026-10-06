@@ -90,11 +90,18 @@ BASELINE = (
     "test_model_identity_is_omitted_when_unknown",
     "test_r35c_ai_candidate_generation.ProviderProtocolTests."
     "test_research_model_and_proposal_model_stay_distinct",
+    "test_r35c_ai_candidate_generation.ProviderProtocolTests."
+    "test_malformed_parameter_variants_fail_closed_not_typeerror",
+    "test_r35c_ai_candidate_generation.ProviderProtocolTests."
+    "test_malformed_provider_shape_is_a_provider_error_not_a_crash",
+    "test_r35c_ai_candidate_generation.ProviderProtocolTests."
+    "test_corrupt_research_record_is_translated_at_the_service_boundary",
 )
 
 PROPOSAL = "backend/strategy_ai_proposal.py"
 PROVIDER = "backend/strategy_ai_provider.py"
 SERVICE = "backend/strategy_ai_candidate_service.py"
+API = "backend/api_strategies.py"
 
 MUTATIONS = [
     # M-AIG1 —— exact research_run_id 退化成"最近一次研究"：坏输入不再被拒，
@@ -102,13 +109,14 @@ MUTATIONS = [
     {"id": "M-AIG1",
      "semantic": "an exact research run id falls back to the recent run",
      "edits": [(SERVICE,
-                '    run = ARR.get_run(conn, run_key)\n'
-                '    if run is None:\n',
-                '    run = ARR.get_run(conn, run_key)\n'
+                '    if run is None:\n'
+                '        # 绝不回退到 recent_runs(...)[0]：那是把"最新一次研究"变成隐式输入。\n'
+                '        raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, str(run_key))\n',
                 '    if run is None:\n'
                 '        recent = ARR.recent_runs(conn, limit=1)\n'
                 '        run = recent[0] if recent else None\n'
-                '    if run is None:\n')],
+                '    if run is None:\n'
+                '        raise AICandidateGenerationError(REASON_RESEARCH_NOT_FOUND, str(run_key))\n')],
      "detectors": [
          "test_r35c_ai_candidate_generation.ExactResearchRunTests."
          "test_c1_exact_run_id_is_read_and_unknown_id_fails_closed",
@@ -248,6 +256,66 @@ MUTATIONS = [
      "detectors": [
          "test_r35c_ai_candidate_generation.ProviderProtocolTests."
          "test_model_identity_is_omitted_when_unknown",
+     ]},
+    # M-AIG11 —— 跳过 provider 槽位 readiness：被禁用的槽位照样发起真实付费调用
+    # （这正是 R27-B2B 修过的缺陷形状）。
+    {"id": "M-AIG11",
+     "semantic": "a disabled provider slot is invoked anyway",
+     "edits": [(API,
+                '        readiness = AIReview.slot_readiness(provider_config)\n'
+                '        if not readiness["ready"]:\n'
+                '            raise HTTPException(status_code=409, detail=str(readiness["reason"]))\n',
+                '        readiness = AIReview.slot_readiness(provider_config)\n'
+                '        if False:\n'
+                '            raise HTTPException(status_code=409, detail=str(readiness["reason"]))\n')],
+     "detectors": [
+         "test_r35c_ai_candidate_http.AIEndpointTests."
+         "test_disabled_provider_slot_is_rejected_before_the_provider",
+     ]},
+    # M-AIG12 —— 未知槽位不再映射成客户端错误：裸 ValueError 穿透成 5xx。
+    {"id": "M-AIG12",
+     "semantic": "an unknown provider slot is not mapped to a client error",
+     "edits": [(API,
+                '        except ValueError:\n'
+                '            raise HTTPException(status_code=400,\n'
+                '                                detail="unknown_provider_slot") from None\n',
+                '        except ValueError:\n'
+                '            slot = AIReview.AI_SLOTS[0]\n')],
+     "detectors": [
+         "test_r35c_ai_candidate_http.AIEndpointTests."
+         "test_unknown_provider_slot_is_a_client_error",
+     ]},
+    # M-AIG13 —— 先在畸形形状上度量：TypeError / AttributeError 穿透 proposal 契约，
+    # 变成 5xx 而不是稳定的 fail closed。
+    {"id": "M-AIG13",
+     "semantic": "a malformed proposal shape raises an unclassified exception",
+     "edits": [(PROPOSAL,
+                '    raw_parameters = payload.get("parameter_variants")\n'
+                '    if raw_parameters is None:\n'
+                '        parameters: Mapping[str, Any] = {}\n'
+                '    elif isinstance(raw_parameters, Mapping):\n'
+                '        parameters = raw_parameters\n'
+                '    else:\n'
+                '        raise AIProposalError(Reason.INVALID_PROPOSAL_SHAPE,\n'
+                '                              "parameter_variants must be an object")\n',
+                '    parameters: Mapping[str, Any] = payload.get("parameter_variants") or {}\n')],
+     "detectors": [
+         "test_r35c_ai_candidate_generation.ProviderProtocolTests."
+         "test_malformed_parameter_variants_fail_closed_not_typeerror",
+         "test_r35c_ai_candidate_generation.ProviderProtocolTests."
+         "test_malformed_provider_shape_is_a_provider_error_not_a_crash",
+     ]},
+    # M-AIG14 —— 损坏 research 行不再被翻译：裸 ValueError 穿透成 5xx。
+    {"id": "M-AIG14",
+     "semantic": "a corrupt research record is not translated at the boundary",
+     "edits": [(SERVICE,
+                '    except ARR.ResearchPersistenceError as exc:\n',
+                '    except ARR.ResearchPersistenceError:\n'
+                '        pass\n'
+                '    except ARR.ResearchPersistenceError as exc:\n')],
+     "detectors": [
+         "test_r35c_ai_candidate_generation.ProviderProtocolTests."
+         "test_corrupt_research_record_is_translated_at_the_service_boundary",
      ]},
 ]
 
