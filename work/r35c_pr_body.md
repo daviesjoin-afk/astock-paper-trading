@@ -15,13 +15,11 @@ R36: NOT STARTED
 ```
 
 ```text
-exact base SHA: f6f1b98622af87b24bd8256cac951e723397689f
-                （PR #229 合并后的 master）
-exact head SHA: 见 GitHub 的 commit 列表（历史重写后 SHA 已变化）
-```
-
-```text
-branch: codex/r35c-ai-hypothesis-candidate-generation
+exact base SHA:    f6f1b98622af87b24bd8256cac951e723397689f
+                   （PR #229 合并后的 master）
+feature commit:    见 GitHub 的 commit 列表
+exact head SHA:    见 GitHub 的 headRefOid（其后的提交仅改文档，不改代码）
+branch:            codex/r35c-ai-hypothesis-candidate-generation
 ```
 
 ## 0. 这一轮回答什么
