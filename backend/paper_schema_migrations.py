@@ -1829,3 +1829,178 @@ def ensure_strategy_candidates(conn):
                 BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
         )
     return changes
+
+
+# ---------------------------------------------------------------------------
+# R36-A：Experiment Search Controller 的 control plane（migration v35）
+# ---------------------------------------------------------------------------
+
+#: 三张控制面表的规范列。列清单是**单一事实来源**：repository 逐列点名写入，
+#: 测试用 ``PRAGMA table_info`` 对照，因此"忘了写一列"会是显式失败而不是静默 NULL。
+EXPERIMENT_SEARCH_RUN_COLUMNS = (
+    "search_run_id", "search_input_fingerprint", "search_contract_version",
+    "generation_batch_id", "generation_input_fingerprint",
+    "candidate_count", "budget_json", "search_spec_json",
+    "created_at", "payload_fingerprint",
+)
+
+EXPERIMENT_SEARCH_JOB_COLUMNS = (
+    "job_id", "job_fingerprint", "search_run_id", "candidate_id",
+    "stage", "job_contract_version", "job_json", "created_at",
+)
+
+EXPERIMENT_SEARCH_JOB_EVENT_COLUMNS = (
+    "event_seq", "event_id", "job_id", "search_run_id",
+    "event_kind", "attempt_number", "actor", "reason",
+    "evidence_owner", "evidence_id", "created_at", "event_json",
+    "payload_fingerprint",
+)
+
+
+def experiment_search_run_ddl(table="experiment_search_runs"):
+    """``experiment_search_runs`` 的规范 DDL。
+
+    一次 search run = 一次 **请求事件**：``search_run_id`` 是 opaque CSPRNG 身份，
+    ``search_input_fingerprint`` 是内容身份。表里**没有** status / result / score / rank：
+    这些要么由 job events 推导，要么根本属于 R36-C / R31。
+    """
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        search_run_id TEXT PRIMARY KEY,
+        search_input_fingerprint TEXT NOT NULL,
+        search_contract_version TEXT NOT NULL,
+        generation_batch_id TEXT NOT NULL,
+        generation_input_fingerprint TEXT NOT NULL,
+        candidate_count INTEGER NOT NULL,
+        budget_json TEXT NOT NULL,
+        search_spec_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        payload_fingerprint TEXT NOT NULL,
+        CHECK(length(search_run_id)=64),
+        CHECK(length(search_input_fingerprint)=64),
+        CHECK(length(generation_batch_id)=64),
+        CHECK(length(generation_input_fingerprint)=64),
+        CHECK(candidate_count >= 1),
+        CHECK(length(payload_fingerprint)=64)
+    )"""
+
+
+def experiment_search_job_ddl(table="experiment_search_jobs"):
+    """``experiment_search_jobs`` 的规范 DDL。
+
+    job 是 **declared unit of work**（一个 search run + 一个 exact candidate + 一个
+    stage），因此 ``job_id`` 就是 deterministic content fingerprint。
+
+    **刻意没有** ``status`` / ``attempts`` / ``claimed_at`` / ``finished_at``：
+    那些是运营状态，唯一权威是 append-only job events。留一个可变快照列会立刻产生
+    "append-only 证据 + 可变快照"两套 authority。
+    """
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        job_id TEXT PRIMARY KEY,
+        job_fingerprint TEXT NOT NULL,
+        search_run_id TEXT NOT NULL,
+        candidate_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        job_contract_version TEXT NOT NULL,
+        job_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK(job_id = job_fingerprint),
+        CHECK(length(job_id)=64),
+        CHECK(length(candidate_id)=64),
+        UNIQUE(search_run_id, candidate_id, stage),
+        FOREIGN KEY(search_run_id) REFERENCES experiment_search_runs(search_run_id)
+    )"""
+
+
+def experiment_search_job_event_ddl(table="experiment_search_job_events"):
+    """``experiment_search_job_events`` 的规范 DDL。
+
+    同时有 ``event_id`` 与 ``event_seq``，因为它们是**两种不同的权威**：
+
+    * ``event_id`` —— 事件身份（opaque，调用方可见）；
+    * ``event_seq`` —— SQLite ledger 内显式、持久、单调的 **operational ordering
+      authority**。
+
+    R35 的 proposal history 刻意没有 latest，因为它是业务历史、没有 ordering authority。
+    R36 的 job queue **需要** current operational state，因此这里必须有一个真实的
+    sequence authority：``INTEGER PRIMARY KEY AUTOINCREMENT``。绝不能用
+    ``created_at`` 或 ``event_id`` 字典序冒充顺序 —— 两条事件可以有完全相同的
+    timestamp，随机 id 的字典序也不代表先后。
+    """
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        job_id TEXT NOT NULL,
+        search_run_id TEXT NOT NULL,
+        event_kind TEXT NOT NULL,
+        attempt_number INTEGER,
+        actor TEXT,
+        reason TEXT,
+        evidence_owner TEXT,
+        evidence_id TEXT,
+        created_at TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        payload_fingerprint TEXT NOT NULL,
+        CHECK(length(event_id)=64),
+        CHECK(length(job_id)=64),
+        CHECK(length(search_run_id)=64),
+        CHECK(length(payload_fingerprint)=64),
+        FOREIGN KEY(job_id) REFERENCES experiment_search_jobs(job_id)
+    )"""
+
+
+def ensure_experiment_search(conn):
+    """v35：创建 R36-A search control plane 三张 append-only 表（幂等，不回填）。
+
+    **绝不回填**：升级前的历史里不存在"某次 search 调度了哪些实验"这个事实。从既有
+    candidates 或历史 experiment_validation_runs 反推"它们以前属于某次 search"是凭空
+    捏造 provenance。历史没有 search rows 就是正确状态。
+
+    外键在**两边都开启**的连接上必须成立（``jobs.search_run_id`` → runs、
+    ``events.job_id`` → jobs），因此建表顺序是 runs → jobs → events，且不使用
+    "事务内 ``PRAGMA foreign_keys=OFF``" 这种在 SQLite 里根本不生效的做法。
+    """
+    changes = {}
+    for table, ddl in (
+        ("experiment_search_runs", experiment_search_run_ddl),
+        ("experiment_search_jobs", experiment_search_job_ddl),
+        ("experiment_search_job_events", experiment_search_job_event_ddl),
+    ):
+        existed = bool(table_columns(conn, table))
+        conn.execute(ddl(table))
+        changes[table] = "ok" if existed else "created"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_search_runs_batch"
+        " ON experiment_search_runs(generation_batch_id,created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_search_runs_input"
+        " ON experiment_search_runs(search_input_fingerprint)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_search_jobs_run"
+        " ON experiment_search_jobs(search_run_id,candidate_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_search_job_events_job"
+        " ON experiment_search_job_events(job_id,event_seq)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_search_job_events_run"
+        " ON experiment_search_job_events(search_run_id,event_seq)"
+    )
+    for table in ("experiment_search_runs", "experiment_search_jobs",
+                  "experiment_search_job_events"):
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_no_update
+                BEFORE UPDATE ON {table}
+                BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
+        )
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+                BEFORE DELETE ON {table}
+                BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
+        )
+    return changes
