@@ -260,3 +260,100 @@ test("R35A-C6：候选读取必须带 exact version + checksum，绝不查 head/
   assert.ok(!section.includes("/candidates?latest"));
   assert.ok(!/candidates[^"']*latest/.test(section), "不得请求 latest 候选");
 });
+
+// ─────────────── R35-C：AI research → 受约束候选（最小能力） ───────────────
+
+function aiBatch(overrides = {}) {
+  return {
+    generation_batch_id: "d".repeat(64),
+    candidate_count: 2,
+    candidate_ids: ["e".repeat(64), "f".repeat(64)],
+    search_space_fingerprint: "1".repeat(64),
+    generation_input_fingerprint: "2".repeat(64),
+    parent_strategy_pin: { strategy_id: "ai_parent", strategy_version: 1,
+                           strategy_checksum: PARENT_CHECKSUM },
+    research_provenance: { source_kind: "ai_research",
+                           source_identity: "ai_research_run:7",
+                           source_fingerprint: "3".repeat(64),
+                           hypothesis_id: "hyp_1" },
+    ...overrides,
+  };
+}
+
+test("R35C-C1：AI 面板渲染台账事实（batch / parent pin / search space / research run）", () => {
+  const html = wb.wbAiCandidateHtml("ai_parent", { batch: aiBatch() });
+  assert.ok(html.includes("d".repeat(64)), "必须显示 generation batch id");
+  assert.ok(html.includes(PARENT_CHECKSUM), "必须显示 exact parent pin");
+  assert.ok(html.includes("1".repeat(64)), "必须显示 search-space fingerprint");
+  assert.ok(html.includes("2".repeat(64)), "必须显示 generation input fingerprint");
+  assert.ok(html.includes("ai_research_run:7"), "必须显示 exact research run");
+  assert.ok(html.includes("hyp_1"), "必须显示 hypothesis id");
+  assert.ok(html.includes("3".repeat(64)), "必须显示 exact research record hash");
+  assert.ok(html.includes("e".repeat(64)) && html.includes("f".repeat(64)),
+    "必须显示全部 candidate id");
+});
+
+test("R35C-C2：AI 面板不得出现推荐 / 评分 / 上线语言", () => {
+  const html = wb.wbAiCandidateHtml("ai_parent", { batch: aiBatch() });
+  for (const forbidden of ["推荐策略", "最佳策略", "最优参数", "预计收益", "AI Score",
+                           "score", "Sharpe", "sharpe", "一键上线", "Promote",
+                           "promote", "Deploy", "deploy", "winner", "排名"]) {
+    assert.ok(!html.includes(forbidden), `AI 面板不得渲染 ${forbidden}`);
+  }
+  assert.ok(html.includes("本页不评估候选、不排序、不推荐"),
+    "必须明确说明结论不在前端产生");
+});
+
+test("R35C-C3：未发起生成时面板明说，不编造结果", () => {
+  const html = wb.wbAiCandidateHtml("ai_parent", null);
+  assert.ok(html.includes("尚未发起生成"));
+  assert.ok(!html.includes("candidate_count"));
+});
+
+test("R35C-C4：AI 生成请求只带 exact pin 与 run，不替后端制造 asof/universe/regime", () => {
+  const start = source.indexOf("export async function wbAiGenerateCandidates");
+  const end = source.indexOf("export async function wbOpenDetail", start);
+  assert.ok(start > 0 && end > start, "AI 生成入口必须存在");
+  const section = source.slice(start, end);
+  // 必须显式传 exact version + checksum + exact run id。
+  assert.ok(section.includes("strategy_version:pinned.strategy_version"));
+  assert.ok(section.includes("strategy_checksum:pinned.strategy_checksum"));
+  assert.ok(section.includes("research_run_id:researchRunId"));
+  // 不得由前端填 as-of / universe / regime：那些来自 research run 与 exact parent。
+  assert.ok(!section.includes("asof:"), "前端不得制造业务日事实");
+  assert.ok(!section.includes("universe_spec:"), "universe 不归前端");
+  assert.ok(!section.includes("intended_market_regime:"), "regime 不归前端");
+  // business 逻辑不得出现在前端：AI cap 由后端裁决，前端只提交。
+  assert.ok(!/max_candidates\s*>\s*32/.test(section),
+    "上限判定归后端，前端不得复制业务规则");
+});
+
+test("R35C-C6：AI 批次必须绑定到它自己的策略，绝不跨策略显示", () => {
+  // A 生成的 batch 不得在 B 的详情页出现：那是把 A 的台账事实冒充成 B 的。
+  const start = source.indexOf("export async function wbOpenDetail");
+  const section = source.slice(start, source.indexOf("wbShowView('detail')", start));
+  assert.ok(section.includes("aiView.strategy_id!==strategyId"),
+    "打开别的策略时必须丢弃不属于它的 AI 批次");
+  // 生成时必须记录归属策略。
+  const genStart = source.indexOf("export async function wbAiGenerateCandidates");
+  const gen = source.slice(genStart, source.indexOf("export async function wbOpenDetail", genStart));
+  assert.ok(gen.includes("strategy_id:strategyId"), "必须记录该批次属于哪条策略");
+  // 渲染调用必须用过滤后的 view，而不是全局状态。
+  assert.ok(section.includes("wbAiCandidateHtml(strategyId,aiView)"),
+    "必须渲染过滤后的 view");
+  assert.ok(!section.includes("wbAiCandidateHtml(strategyId,WB_STATE.aiCandidateView)"),
+    "不得直接渲染全局 AI 状态");
+});
+test("R35C-C5：AI 面板不自动触发（无 scheduler / cron / 自动批量）", () => {
+  const start = source.indexOf("/* R35-C：AI candidate generation 面板");
+  const end = source.indexOf("export function wbCandidatesHtml", start);
+  const section = source.slice(start, end);
+  // 去掉开头那段块注释后只在**代码**里找自动触发机制；注释里说明"没有 cron"是允许的。
+  const close = section.indexOf("*/");
+  const code = close >= 0 ? section.slice(close + 2) : section;
+  for (const forbidden of ["setInterval", "setTimeout", "cron", "scheduler",
+                           "autoGenerate"]) {
+    assert.ok(!code.includes(forbidden), `AI 面板不得自动触发：${forbidden}`);
+  }
+  assert.ok(section.includes("onclick"), "必须由人显式点击触发");
+});

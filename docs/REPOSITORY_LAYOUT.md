@@ -136,6 +136,17 @@ migration **v34** 重建候选表，forward-only、不回填、历史 v1 行仍�
 `GET /api/strategies/{id}/candidate-generations/{batch_id}`；候选列表发布**全部**提案
 证据引用，不投影成隐含 latest。R35-B **不**拥有
 evaluation / promotion / execution / allocation 权限（见 `plans/r35b-deterministic-candidate-expansion.md`）。
+
+R35-C 再把 **AI research** 接进这条链路：`strategy_ai_proposal`（AI 可以提出什么的纯契约：
+形状 / 资源上界 / 禁止字段 / no-op；无 DB / 网络 / registry / 时钟）、
+`strategy_ai_provider`（prompt → `ai_provider_transport.call_json` → 严格 proposal）、
+`strategy_ai_candidate_service`（exact R27 research run + exact parent pin → AI bounded
+proposal → R35-B batch 的编排与失败语义）。新增
+`POST /api/strategies/{id}/candidate-generations/ai`。AI 路径**零新 DB 表**：产物继续写
+既有 candidate / proposal / batch 三张表；generation batch 的 `batch_json` 额外持久化
+可自验的 canonical search-space material。AI 不拥有 candidate identity / parent /
+universe / regime / constraints / evaluation / promotion（见
+`plans/r35c-ai-hypothesis-candidate-generation.md`）。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

@@ -3761,6 +3761,72 @@ candidate identity != candidate evaluation result
 generator authority = produce candidate (no promotion, no execution, no scoring)
 ```
 
+### R35-C：AI research hypothesis 只提出 search space
+
+**ResearchHypothesis ≠ StrategyCandidate**，**AI Proposal ≠ StrategyCandidate**，
+**supported research ≠ validated strategy**，**candidate ≠ promoted strategy**。
+
+```text
+R27 canonical research run（exact id，无 latest fallback）
+        ↓ strict gate：authority=research / is_authoritative=false / status=supported
+AI bounded proposal（只是 search-space declaration）
+        ↓ R35-B CandidateSearchSpace → R35-B deterministic generator
+StrategyCandidate[]（既有 candidate / proposal / batch 三张表，零新表）
+```
+
+三层 authority 都是新增的，且都不含任何交易权力：
+
+* `strategy_ai_proposal` —— 拥有 **AI candidate proposal schema**（形状 / 资源上界 /
+  禁止字段 / no-op），纯契约，不访问 DB / 网络 / registry / 时钟；
+* `strategy_ai_provider` —— 拥有 **provider response → strict proposal**，网络唯一出口
+  仍是既有的 `ai_provider_transport`，不新增第二套 transport 或 provider 配置系统；
+* `strategy_ai_candidate_service` —— 拥有 **exact research → proposal → R35-B batch 的
+  编排与失败语义**（含"网络调用绝不在 SQLite 写事务里"与 all-or-nothing 写入）。
+
+**AI 研究不是交易 authority**：`ResearchHypothesis.authority` 恒为 `research`、
+`is_authoritative` 恒为 `False`。即使 `status == supported` 且 `confidence == 1.0`，
+也只意味着"允许产生**研究候选**"，绝不意味着 signal approved / strategy validated /
+promotable / risk approved / order allowed。资格 gate **只看 status**：不设任何
+confidence 阈值，因为 confidence 是 AI 自评而非证据，让它参与资格判定就是把
+"AI 越自信结论越强"这条环路重新装上。
+
+**AI 不拥有** candidate identity / fingerprint / parent / as-of / universe / regime /
+constraints / generator 选择 / evaluation / ranking / winner selection / promotion /
+risk relaxation / execution / allocation。provider 试图声明这些字段一律
+`invalid_proposal_field` fail closed（与"协议漂移"的 `unknown_proposal_field` **区分**：
+前者是越权尝试，后者是没人认识的字段）。AI 也不能提出 no-op（全部 inherit = 什么都没
+提出，生成它等于把父策略自己当成 AI 候选）。
+
+**拒绝必须排在付费调用之前**：`insufficient_evidence` / `unsupported` / corrupt record /
+run not found / as-of 不一致都在任何一个 provider 调用**之前**失败，否则坏输入先花掉
+一次付费调用。业务日**钉死**在 research run 的 `as_of` 上（省略即采纳该日；显式给值
+必须一致）—— 不允许拿旧 hypothesis 自动生成新日期的候选；要在新业务日使用同一思想，
+必须重新产生 canonical research run。
+
+**零新 DB authority**：不建 `strategy_ai_candidates` / `ai_generated_strategies` /
+`llm_candidate_table` / `strategy_ai_proposal_runs` 之类第四套候选台账。持久审计链
+已经完整：`ai_research_runs`（exact run + `record_hash`）→ research provenance →
+generation batch（canonical search space + model identity + input fingerprint）→
+proposal events → candidate rows。R35-C 因此可以完整回答"哪个 research run / 哪个
+hypothesis / 哪个 provider-model / 生成了什么 search space / 用的是哪版 parent /
+最终产生哪些 candidates"，且 `hash(canonical(search space)) == search_space_fingerprint`
+可重算校验。
+
+一句话边界：
+
+```text
+AI may propose.
+Deterministic contracts decide what is legal.
+Evaluation decides what works.
+Promotion authority decides what advances.
+Execution authority decides what trades.
+```
+
+R35-C 明确**不**实现 candidate backtest、Sharpe ranking、best candidate、walk-forward
+search controller、Bayesian optimisation、evolutionary search、automatic parameter
+search loop、winner selection、promotion、closed-loop regeneration —— 那些属于
+**R36 Experiment Search Controller** 与 **R37 Closed-loop Learning**。
+
 
 ## 架构演进记录（历史批次：模块化与边界固化）
 

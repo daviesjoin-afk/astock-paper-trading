@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import strategy_ai_proposal as SAIP
 import strategy_candidate_search_space as SS
 import strategy_generator as SG
 
@@ -227,6 +228,40 @@ class StrategyCandidateGenerateRequest(_Request):
     random_seed: int | None = None
     model_identity: dict[str, Any] | None = None
     constraints: dict[str, Any] | None = None
+
+
+class StrategyAICandidateGenerateRequest(_Request):
+    """``POST /api/strategies/{id}/candidate-generations/ai``（R35-C）。
+
+    刻意比 R35-A/B 的请求**更窄**，因为 AI candidate path 的多数事实不是调用方的
+    权力：
+
+    * **没有** ``generator_type`` / ``generator_version``：AI 路径固定使用 R35-B
+      registry 当前的 ``bounded_combination``。AI 只负责"提出有限备选"，如何展开是
+      R35-B 的职责；搜索控制器属于 R36。
+    * **没有** ``constraints``：AI candidate path 的 constraints 一律继承 exact
+      pinned parent（R35-B 的 inherit-or-only-tighten）。开放 AI risk tuning 需要
+      独立 risk authority，不属于本轮。
+    * **没有** ``research_provenance`` / ``model_identity`` / ``hypothesis_id`` /
+      ``evidence_count``：这些由服务端从 exact canonical research run 派生。让调用方
+      提交它们，等于允许把任意 provenance 贴到候选上。
+    * **没有** ``api_key`` / ``base_url`` / ``Authorization``：provider 配置复用既有
+      ``ai_review_service`` 槽位 authority。
+
+    ``universe_spec`` 与 ``intended_market_regime`` 是**显式事实**（可空，为空即从
+    exact pinned parent 继承）—— 它们不属于 AI response。
+    """
+
+    strategy_version: int
+    strategy_checksum: str
+    research_run_id: str
+    #: 可省略：省略即采纳 exact research run 自己的业务日（唯一诚实的取值），
+    #: 显式给值则必须与它完全一致。两种形态都不允许"拿旧研究生成新日期候选"。
+    asof: str | None = None
+    universe_spec: dict[str, Any] | None = None
+    intended_market_regime: str | None = None
+    provider_slot: str | None = None
+    max_candidates: int = SAIP.MAX_AI_CANDIDATES_PER_REQUEST
 
 
 class StrategyCloneRequest(_Request):
