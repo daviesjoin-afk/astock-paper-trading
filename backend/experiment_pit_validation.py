@@ -15,6 +15,7 @@ from typing import Any
 
 try:
     import experiment_contract as EC
+    import candidate_experiment as CE
     import historical_market_archive as HMA
     import historical_session_calendar as HSC
     import historical_universe_archive as HUA
@@ -26,6 +27,7 @@ try:
     import walk_forward_validation as WFV
 except ImportError:  # pragma: no cover - package-style import
     from . import experiment_contract as EC
+    from . import candidate_experiment as CE
     from . import historical_market_archive as HMA
     from . import historical_session_calendar as HSC
     from . import historical_universe_archive as HUA
@@ -43,6 +45,9 @@ _DIMENSIONS = (
     "cost_model", "walk_forward",
 )
 _REASON_CODES = frozenset({
+    "candidate_identity_mismatch", "candidate_asof_leakage",
+    "candidate_universe_identity_mismatch", "candidate_universe_board_scope_not_supported",
+    "candidate_universe_scope_not_supported",
     "dataset_identity_mismatch", "evaluation_asof_invalid",
     "execution_assumptions_unproven", "fundamental_publication_unproven",
     "historical_market_data_unavailable", "historical_universe_unproven",
@@ -136,11 +141,13 @@ class PITValidationEvidence:
             raise ValueError("ready evidence cannot contain blocking reason codes")
         if self.status == "blocked" and not reasons:
             raise ValueError("blocked evidence requires a stable reason code")
-        if tuple(self.dimensions) != _DIMENSIONS:
+        dimension_names = tuple("experiment_subject" if name == "strategy_version" else name
+                                for name in _DIMENSIONS) if "experiment_subject" in self.dimensions else _DIMENSIONS
+        if tuple(self.dimensions) != dimension_names:
             raise ValueError("dimensions must contain the canonical ordered dimension set")
         if self.status == "ready" and any(
             self.dimensions[name]["status"] not in {"proven", "not_applicable"}
-            for name in _DIMENSIONS
+            for name in dimension_names
         ):
             raise ValueError("ready evidence requires every required dimension to be proven")
         if self.status == "ready" and int(self.walk_forward.get("ready_folds", 0)) < 1:
@@ -216,6 +223,13 @@ def _strategy_identity(spec: EC.ExperimentSpec, version: Any) -> dict:
     return _dimension("proven" if matches else "blocked",
                       None if matches else "strategy_identity_mismatch",
                       identity, "owner_version_match" if matches else "owner_version_mismatch")
+
+
+def replay_dsl_dependencies(replay: CE.CandidateReplayDefinition) -> dict:
+    dependencies = [strategy_dsl_dependencies(ast) for name, ast in replay.projection().items()
+                    if name in ("entry_ast", "factor_ast", "exit_ast") and ast is not None]
+    return {key: sorted({field for dep in dependencies for field in dep[key]})
+            for key in ("price_fields", "financial_fields", "fund_flow_fields", "other_fields")}
 
 
 def _manifest_dimension(spec: EC.ExperimentSpec, manifest: Any) -> dict:
@@ -769,6 +783,7 @@ def build_pit_validation_evidence(
     spec: EC.ExperimentSpec,
     *,
     strategy_version: Any = None,
+    candidate_replay: CE.CandidateReplayDefinition | None = None,
     dataset_manifest: Any = None,
     universe_rows: Any = None,
     universe_source: Any = None,
@@ -794,7 +809,7 @@ def build_pit_validation_evidence(
     `market_snapshot` is accepted only for diagnostics and never proves arbitrary
     historical coverage. This function performs no persistence or network I/O.
     """
-    if not isinstance(spec, EC.ExperimentSpec):
+    if not isinstance(spec, (EC.ExperimentSpec, EC.CandidateExperimentSpec)):
         raise ValueError("spec must be an ExperimentSpec")
     cutoff = spec.asof_policy.get("cutoff")
     asof_valid = PIT.parse_asof(cutoff) is not None
@@ -805,6 +820,9 @@ def build_pit_validation_evidence(
     dimensions: dict[str, dict] = {}
     reasons: list[str] = []
     warnings: list[str] = []
+    candidate_path = isinstance(spec, EC.CandidateExperimentSpec)
+    dimension_names = tuple("experiment_subject" if name == "strategy_version" else name
+                            for name in _DIMENSIONS) if candidate_path else _DIMENSIONS
 
     if session_calendar is not None:
         bounded_sessions, session_calendar_complete, session_calendar_coverage = _owner_calendar(
@@ -834,6 +852,10 @@ def build_pit_validation_evidence(
             universe_rows, universe_source = (), None
         else:
             universe_rows = universe_archive_repository.membership_records(universe_archive_fingerprint)
+            if candidate_path:
+                # Translate the archive's raw date columns for the existing PIT membership owner.
+                universe_rows = [{**row, "list_date": row["listed_from"], "delist_date": row["delisted_at"]}
+                                 for row in universe_rows]
             universe_source = universe_archive_repository.source_projection(universe_archive_fingerprint)
     universe_dim, members, _universe_report = _universe(
         spec, universe_rows, universe_source, bounded_sessions,
@@ -844,6 +866,20 @@ def build_pit_validation_evidence(
     if universe_dim["status"] == "blocked":
         reasons.append(universe_dim["reason_code"])
         warnings.append("historical_universe_unproven")
+
+    if candidate_path:
+        try:
+            if (strategy_version is not None or not isinstance(candidate_replay, CE.CandidateReplayDefinition)
+                    or candidate_replay.subject != spec.subject):
+                raise ValueError("candidate_identity_mismatch")
+            CE.validate_candidate_asof(candidate_replay.candidate, spec.end_date, spec.asof_policy["cutoff"])
+            members = CE.filter_candidate_members(candidate_replay, members, spec.universe_fingerprint)
+        except ValueError as exc:
+            code = str(exc)
+            if code not in _REASON_CODES:
+                code = "candidate_identity_mismatch"
+            reasons.append(code)
+            members = {}
 
     replay_capture = tradability_replay_projection(
         members, bounded_sessions, tradability_repository,
@@ -879,7 +915,10 @@ def build_pit_validation_evidence(
                     if isinstance(strategy_version, SR.StrategyVersion)
                     and isinstance(strategy_version.definition, Mapping) else None)
     dependencies = None
-    if strategy_ast is not None:
+    if candidate_path and isinstance(candidate_replay, CE.CandidateReplayDefinition):
+        dependencies = replay_dsl_dependencies(candidate_replay)
+        strategy_ast = candidate_replay.candidate.entry_spec
+    elif strategy_ast is not None:
         try:
             dependencies = strategy_dsl_dependencies(strategy_ast)
         except (TypeError, ValueError):
@@ -908,9 +947,17 @@ def build_pit_validation_evidence(
         reasons.append(fundamental_dim["reason_code"])
         warnings.append(fundamental_dim["reason_code"] or "fundamental_publication_unproven")
 
-    dimensions["strategy_version"] = _strategy_identity(spec, strategy_version)
-    if dimensions["strategy_version"]["status"] == "blocked":
-        reasons.append(dimensions["strategy_version"]["reason_code"])
+    if candidate_path:
+        matched = isinstance(candidate_replay, CE.CandidateReplayDefinition) and candidate_replay.subject == spec.subject
+        dimensions["experiment_subject"] = _dimension(
+            "proven" if matched else "blocked", None if matched else "candidate_identity_mismatch",
+            spec.subject.projection(), "canonical_candidate_replay_match" if matched else "candidate_identity_mismatch")
+        if not matched:
+            reasons.append("candidate_identity_mismatch")
+    else:
+        dimensions["strategy_version"] = _strategy_identity(spec, strategy_version)
+        if dimensions["strategy_version"]["status"] == "blocked":
+            reasons.append(dimensions["strategy_version"]["reason_code"])
 
     dimensions["dataset"] = _manifest_dimension(spec, dataset_manifest)
     if dimensions["dataset"]["status"] == "blocked":
@@ -1014,7 +1061,7 @@ def build_pit_validation_evidence(
             warnings.append(reason)
 
     # Preserve stable dimension order and stable reason order.
-    dimensions = {name: dimensions[name] for name in _DIMENSIONS}
+    dimensions = {name: dimensions[name] for name in dimension_names}
     reasons = sorted(set(reasons))
     windows = tuple(walk.get("windows") or ())
     first = next((window for window in windows if window.get("status") == WFV.STATUS_READY), None)
@@ -1030,7 +1077,7 @@ def build_pit_validation_evidence(
         "labels": walk.get("label_coverage"),
     }
     all_proven = all(dimensions[name]["status"] in {"proven", "not_applicable"}
-                     for name in _DIMENSIONS)
+                     for name in dimension_names)
     ready = all_proven and walk.get("ready_folds", 0) >= 1 and not reasons
     return PITValidationEvidence(
         experiment_fingerprint=spec.fingerprint,

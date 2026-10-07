@@ -174,6 +174,32 @@ def record_job_event(conn: sqlite3.Connection, *, job_id: str, search_run_id: st
                      actor: str | None = None, reason: str | None = None,
                      evidence_owner: str | None = None, evidence_id: str | None = None,
                      created_at: str | None = None) -> str:
+    """General event entry: completion requires the specialized verified service path."""
+    if event_kind == "completed":
+        raise ExperimentSearchRepositoryError("completion_evidence_binding_unavailable")
+    return _append_job_event(conn, job_id=job_id, search_run_id=search_run_id, event_kind=event_kind,
+                             attempt_number=attempt_number, actor=actor, reason=reason,
+                             evidence_owner=evidence_owner, evidence_id=evidence_id, created_at=created_at)
+
+
+def record_verified_completion_event(conn, *, job_id, search_run_id, run_key, created_at=None, actor=None):
+    """Trusted persistence primitive; only candidate_experiment_service may call it.
+
+    The service independently re-reads and binds canonical R29 evidence before this write.
+    This primitive never accepts an arbitrary evidence owner or metrics.
+    """
+    if not ESC.is_search_identity(run_key):
+        raise ExperimentSearchRepositoryError("invalid_validation_run_key")
+    return _append_job_event(conn, job_id=job_id, search_run_id=search_run_id, event_kind="completed",
+                             evidence_owner="experiment_validation_run", evidence_id=run_key,
+                             created_at=created_at, actor=actor)
+
+
+def _append_job_event(conn: sqlite3.Connection, *, job_id: str, search_run_id: str,
+                     event_kind: str, attempt_number: int | None = None,
+                     actor: str | None = None, reason: str | None = None,
+                     evidence_owner: str | None = None, evidence_id: str | None = None,
+                     created_at: str | None = None) -> str:
     """Append one job event and return its ``event_id``.
 
     ``event_seq`` 由 SQLite 分配（AUTOINCREMENT），是唯一定序权威。``reason`` 必须是稳定
@@ -182,9 +208,6 @@ def record_job_event(conn: sqlite3.Connection, *, job_id: str, search_run_id: st
     """
     if event_kind not in ESC.EVENT_KINDS:
         raise ExperimentSearchRepositoryError(f"unknown_job_event_kind:{event_kind}")
-    # 即使绕过 service，任意 evidence 字符串也不能制造完成事实。
-    if event_kind == "completed":
-        raise ExperimentSearchRepositoryError("completion_evidence_binding_unavailable")
     if reason is not None:
         reason = str(reason)
         if not reason or reason != reason.strip().lower().replace("-", "_"):
@@ -232,6 +255,19 @@ def get_search_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
         " FROM experiment_search_runs WHERE search_run_id=?", (str(run_id or ""),)).fetchone()
     if row is None:
         return None
+    try:
+        spec = ESC.search_spec_from_projection(json.loads(row[7]))
+        if (spec.search_input_fingerprint != row[1] or spec.search_contract_version != row[2]
+                or spec.generation_batch_id != row[3] or spec.generation_input_fingerprint != row[4]
+                or spec.candidate_count != row[5] or spec.budget.projection() != json.loads(row[6])):
+            raise ValueError("search projection mismatch")
+        payload = dict(zip(("search_run_id", "search_input_fingerprint", "search_contract_version",
+                            "generation_batch_id", "generation_input_fingerprint", "candidate_count",
+                            "budget_json", "search_spec_json", "created_at"), row[:9], strict=True))
+        if _fingerprint(payload) != row[9]:
+            raise ValueError("search payload mismatch")
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ExperimentSearchRepositoryError("corrupt_search_run") from exc
     return {
         "search_run_id": row[0],
         "search_input_fingerprint": row[1],

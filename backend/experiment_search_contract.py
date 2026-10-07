@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import strategy_candidate_search_space as SS
+import experiment_contract as EC
+import walk_forward_validation as WFV
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -62,6 +64,8 @@ __all__ = [
 
 #: search request contract 版本（进 SearchSpec fingerprint）。
 SEARCH_CONTRACT_VERSION = "experiment-search-contract-v1"
+SEARCH_CONTRACT_VERSION_V2 = "experiment-search-contract-v2"
+EXPERIMENT_PLAN_CONTRACT_VERSION = "candidate-experiment-plan-v1"
 
 #: job declaration contract 版本（进 job fingerprint）。
 SEARCH_JOB_CONTRACT_VERSION = "experiment-search-job-contract-v1"
@@ -247,6 +251,91 @@ class SearchJobSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ExperimentSearchPlan:
+    code_revision: str
+    dataset_fingerprint: str
+    market_archive_fingerprint: str
+    universe_archive_fingerprint: str
+    session_calendar_fingerprint: str
+    start_date: str
+    end_date: str
+    asof_policy: dict
+    execution_assumptions: dict
+    cost_model: dict
+    validation_portfolio: dict
+    walk_forward_config: WFV.WalkForwardConfig
+    random_seed: int
+    financial_archive_fingerprint: str | None = None
+    plan_contract_version: str = EXPERIMENT_PLAN_CONTRACT_VERSION
+
+    def __post_init__(self):
+        if self.plan_contract_version != EXPERIMENT_PLAN_CONTRACT_VERSION:
+            raise SearchContractError("unsupported_experiment_plan_contract")
+        if not isinstance(self.walk_forward_config, WFV.WalkForwardConfig):
+            raise SearchContractError("canonical_walk_forward_config_required")
+        object.__setattr__(self, "session_calendar_fingerprint",
+                           EC._stable_fingerprint(self.session_calendar_fingerprint, name="session_calendar_fingerprint"))
+        if self.financial_archive_fingerprint is not None:
+            object.__setattr__(self, "financial_archive_fingerprint",
+                               EC._stable_fingerprint(self.financial_archive_fingerprint, name="financial_archive_fingerprint"))
+        normalized = EC._normalize_experiment_environment({
+            **self.experiment_environment(), "tradability_fingerprint": "0" * 64,
+            "contract_version": EC.CANDIDATE_EXPERIMENT_CONTRACT_VERSION})
+        for name in ("code_revision", "dataset_fingerprint", "start_date", "end_date",
+                     "asof_policy", "execution_assumptions", "cost_model", "random_seed"):
+            object.__setattr__(self, name, normalized[name])
+        object.__setattr__(self, "market_archive_fingerprint", normalized["market_data_fingerprint"])
+        object.__setattr__(self, "universe_archive_fingerprint", normalized["universe_fingerprint"])
+        object.__setattr__(self, "validation_portfolio", EC._freeze_json(self.validation_portfolio))
+
+    def experiment_environment(self):
+        return {"code_revision": self.code_revision, "dataset_fingerprint": self.dataset_fingerprint,
+                "universe_fingerprint": self.universe_archive_fingerprint,
+                "market_data_fingerprint": self.market_archive_fingerprint,
+                "parameter_set": {"validation_portfolio": self.validation_portfolio,
+                                  "validation_calendar_fingerprint": self.session_calendar_fingerprint,
+                                  "financial_archive_fingerprint": self.financial_archive_fingerprint,
+                                  "walk_forward_config_fingerprint": self.walk_forward_config.fingerprint},
+                "start_date": self.start_date, "end_date": self.end_date, "asof_policy": self.asof_policy,
+                "execution_assumptions": self.execution_assumptions, "cost_model": self.cost_model,
+                "random_seed": self.random_seed}
+
+    def projection(self):
+        return {"plan_contract_version": self.plan_contract_version,
+                "code_revision": self.code_revision, "dataset_fingerprint": self.dataset_fingerprint,
+                "market_archive_fingerprint": self.market_archive_fingerprint,
+                "universe_archive_fingerprint": self.universe_archive_fingerprint,
+                "financial_archive_fingerprint": self.financial_archive_fingerprint,
+                "session_calendar_fingerprint": self.session_calendar_fingerprint,
+                "date_range": {"start": self.start_date, "end": self.end_date},
+                "asof_policy": EC._thaw_json(self.asof_policy),
+                "execution_assumptions": EC._thaw_json(self.execution_assumptions),
+                "cost_model": EC._thaw_json(self.cost_model),
+                "validation_portfolio": EC._thaw_json(self.validation_portfolio),
+                "walk_forward_config": self.walk_forward_config.projection(), "random_seed": self.random_seed}
+
+    @property
+    def fingerprint(self):
+        return EC._digest(self.projection())
+
+
+def experiment_plan_from_projection(value):
+    if not isinstance(value, dict):
+        raise SearchContractError("corrupt_search_run")
+    try:
+        args = dict(value)
+        dates = args.pop("date_range")
+        args.update(start_date=dates["start"], end_date=dates["end"])
+        args["walk_forward_config"] = WFV.WalkForwardConfig.from_projection(args["walk_forward_config"])
+        plan = ExperimentSearchPlan(**args)
+        if plan.projection() != value:
+            raise ValueError("noncanonical plan")
+        return plan
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SearchContractError("corrupt_search_run") from exc
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentSearchSpec:
     """一次 bounded experiment search request 的 **content identity**。
 
@@ -264,8 +353,16 @@ class ExperimentSearchSpec:
     budget: SearchBudget
     search_contract_version: str = SEARCH_CONTRACT_VERSION
     queue_policy_version: str = QUEUE_POLICY_VERSION
+    experiment_plan: ExperimentSearchPlan | None = None
 
     def __post_init__(self):
+        if self.search_contract_version not in (SEARCH_CONTRACT_VERSION, SEARCH_CONTRACT_VERSION_V2):
+            raise SearchContractError("unsupported_search_contract_version")
+        if self.search_contract_version == SEARCH_CONTRACT_VERSION_V2:
+            if not isinstance(self.experiment_plan, ExperimentSearchPlan):
+                raise SearchContractError("search_run_experiment_plan_unavailable")
+        elif self.experiment_plan is not None:
+            raise SearchContractError("legacy_search_must_not_have_experiment_plan")
         object.__setattr__(self, "generation_batch_id", _required_id(
             self.generation_batch_id, what="generation_batch_id"))
         object.__setattr__(self, "generation_input_fingerprint", _required_id(
@@ -292,7 +389,7 @@ class ExperimentSearchSpec:
         return hashlib.sha256(_canonical(self._identity_material()).encode("utf-8")).hexdigest()
 
     def _identity_material(self) -> dict:
-        return {
+        material = {
             "search_contract_version": self.search_contract_version,
             "generation_batch_id": self.generation_batch_id,
             "generation_input_fingerprint": self.generation_input_fingerprint,
@@ -301,6 +398,10 @@ class ExperimentSearchSpec:
             # 未来修改 claim 顺序会改变一次 search 的运行语义，因此 policy 必须进身份。
             "queue_policy_version": self.queue_policy_version,
         }
+        if self.search_contract_version == SEARCH_CONTRACT_VERSION_V2:
+            material.update(experiment_plan=self.experiment_plan.projection(),
+                            experiment_plan_fingerprint=self.experiment_plan.fingerprint)
+        return material
 
     def projection(self) -> dict:
         return {**self._identity_material(),
@@ -322,6 +423,25 @@ def search_run_id() -> str:
     """
     import secrets
     return secrets.token_hex(32)
+
+
+def search_spec_from_projection(value):
+    try:
+        args = dict(value)
+        fingerprint = args.pop("search_input_fingerprint")
+        count = args.pop("candidate_count")
+        args["budget"] = SearchBudget(**args["budget"])
+        if "experiment_plan" in args:
+            plan_fingerprint = args.pop("experiment_plan_fingerprint")
+            args["experiment_plan"] = experiment_plan_from_projection(args["experiment_plan"])
+            if args["experiment_plan"].fingerprint != plan_fingerprint:
+                raise ValueError("plan mismatch")
+        spec = ExperimentSearchSpec(**args)
+        if spec.search_input_fingerprint != fingerprint or spec.candidate_count != count or spec.projection() != value:
+            raise ValueError("search mismatch")
+        return spec
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SearchContractError("corrupt_search_run") from exc
 
 
 def next_state_allowed(current, target: str) -> bool:

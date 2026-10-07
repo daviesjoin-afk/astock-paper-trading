@@ -1,0 +1,69 @@
+{
+  "base": "bc1e25d4e84440c635586efa8974c13486d90c64",
+  "projection": {
+    "contract_version": "r28-a.v1",
+    "strategy": {
+      "strategy_id": "trend_pullback",
+      "version": 2,
+      "checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "code_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dataset_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "universe_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "tradability_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "market_data_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "parameter_set": {
+      "lookback": 20,
+      "validation_portfolio": {
+        "initial_cash": 100000,
+        "max_positions": 1,
+        "position_sizing": "equal_weight"
+      }
+    },
+    "date_range": {
+      "start": "2026-01-01",
+      "end": "2026-03-31"
+    },
+    "asof_policy": {
+      "policy_id": "pit-close-v1",
+      "cutoff": "2026-03-31T07:00:00+00:00"
+    },
+    "execution_assumptions": {
+      "execution_profile_version": "r29-close-next-open-v1",
+      "fill_assumptions": {
+        "signal": "session_close",
+        "execution": "next_session_open"
+      },
+      "capacity_assumptions": {
+        "participation_rate": 0.05
+      },
+      "t_plus_one_semantics": "sell_after_next_session",
+      "price_limit_semantics": "historical_tradability_archive_v1",
+      "partial_fill_semantics": "volume_participation_cap"
+    },
+    "cost_model": {
+      "commission_rate": 0.0001,
+      "minimum_commission": 5,
+      "stamp_duty_rate": 0.0005,
+      "slippage_model": "fixed-rate-v1",
+      "slippage_parameters": {
+        "rate": 0.001
+      },
+      "version": "cost-v1"
+    },
+    "random_seed": 17
+  },
+  "fingerprint": "eceab43d72907ccf88bd5ea24f175e608b2b8bcc084b7522f4afd5280faa9d1e",
+  "metrics": {
+    "total_return": -5.500000000002725e-05,
+    "max_drawdown": -5.500000000002725e-05,
+    "volatility": 0.0,
+    "turnover": 0.005004999999999999,
+    "trade_count": 1,
+    "total_cost": 5.0,
+    "exposure": 0.002500137507562916,
+    "capacity_proxy": 0.05,
+    "data_coverage": 1.0,
+    "regime_breakdown": {}
+  }
+}

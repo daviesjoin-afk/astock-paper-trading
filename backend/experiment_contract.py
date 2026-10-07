@@ -150,6 +150,73 @@ def _required_mapping(value: Any, *, name: str, fields: tuple[str, ...]) -> Mapp
     return frozen
 
 
+_ENVIRONMENT_FIELDS = ('code_revision', 'dataset_fingerprint', 'universe_fingerprint', 'tradability_fingerprint', 'market_data_fingerprint', 'parameter_set', 'start_date', 'end_date', 'asof_policy', 'execution_assumptions', 'cost_model', 'random_seed', 'contract_version')
+
+
+def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Shared canonicalization; legacy projections remain unchanged."""
+    normalized = dict(values)
+    code_revision = _text(normalized["code_revision"], name="code_revision")
+    if not _REVISION_PATTERN.fullmatch(code_revision):
+        raise ValueError("code_revision must be an explicit 40 or 64 character lowercase git SHA")
+    normalized["code_revision"] = code_revision
+    for name in (
+        "dataset_fingerprint", "universe_fingerprint", "tradability_fingerprint",
+        "market_data_fingerprint",
+    ):
+        normalized[name] = _stable_fingerprint(normalized[name], name=name)
+    normalized["contract_version"] = _explicit_label(normalized["contract_version"], name="contract_version")
+    if not isinstance(normalized["random_seed"], int) or isinstance(normalized["random_seed"], bool):
+        raise ValueError("random_seed must be an explicit integer")
+    start = _date(normalized["start_date"], name="start_date")
+    end = _date(normalized["end_date"], name="end_date")
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    normalized["start_date"] = start
+    normalized["end_date"] = end
+
+    parameter_set = _freeze_json(normalized["parameter_set"], path="parameter_set")
+    if not isinstance(parameter_set, Mapping):
+        raise ValueError("parameter_set must be an explicit JSON-like object")
+    normalized["parameter_set"] = parameter_set
+    asof = _required_mapping(normalized["asof_policy"], name="asof_policy", fields=("policy_id", "cutoff"))
+    normalized_asof = dict(asof)
+    normalized_asof["policy_id"] = _explicit_label(
+        asof["policy_id"], name="asof_policy.policy_id",
+    )
+    normalized_asof["cutoff"] = _asof_cutoff(asof["cutoff"])
+    asof = _freeze_json(normalized_asof, path="asof_policy")
+    normalized["asof_policy"] = asof
+    execution = _required_mapping(
+        normalized["execution_assumptions"], name="execution_assumptions", fields=_EXECUTION_FIELDS,
+    )
+    normalized_execution = dict(execution)
+    for field in ("execution_profile_version", "t_plus_one_semantics",
+                  "price_limit_semantics", "partial_fill_semantics"):
+        normalized_execution[field] = _explicit_label(
+            execution[field], name=f"execution_assumptions.{field}",
+        )
+    for field in ("fill_assumptions", "capacity_assumptions"):
+        if not isinstance(execution[field], Mapping) or not execution[field]:
+            raise ValueError(f"execution_assumptions.{field} must be a non-empty object")
+    execution = _freeze_json(normalized_execution, path="execution_assumptions")
+    normalized["execution_assumptions"] = execution
+    cost = _required_mapping(normalized["cost_model"], name="cost_model", fields=_COST_FIELDS)
+    normalized_cost = dict(cost)
+    for field in ("commission_rate", "minimum_commission", "stamp_duty_rate"):
+        amount = _finite_number(cost[field], name=f"cost_model.{field}")
+        if amount < 0:
+            raise ValueError(f"cost_model.{field} must be >= 0")
+        normalized_cost[field] = amount
+    for field in ("slippage_model", "version"):
+        normalized_cost[field] = _explicit_label(cost[field], name=f"cost_model.{field}")
+    if not isinstance(cost["slippage_parameters"], Mapping) or not cost["slippage_parameters"]:
+        raise ValueError("cost_model.slippage_parameters must be a non-empty explicit object")
+    cost = _freeze_json(normalized_cost, path="cost_model")
+    normalized["cost_model"] = cost
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyIdentity:
     """An explicit pinned strategy version compatible with StrategyVersion."""
@@ -193,70 +260,32 @@ class ExperimentSpec:
     def __post_init__(self) -> None:
         if not isinstance(self.strategy, StrategyIdentity):
             raise ValueError("strategy must be a pinned StrategyIdentity")
-        code_revision = _text(self.code_revision, name="code_revision")
-        if not _REVISION_PATTERN.fullmatch(code_revision):
-            raise ValueError("code_revision must be an explicit 40 or 64 character lowercase git SHA")
-        object.__setattr__(self, "code_revision", code_revision)
-        for name in (
-            "dataset_fingerprint", "universe_fingerprint", "tradability_fingerprint",
-            "market_data_fingerprint",
-        ):
-            object.__setattr__(self, name, _stable_fingerprint(getattr(self, name), name=name))
-        object.__setattr__(self, "contract_version", _explicit_label(self.contract_version, name="contract_version"))
-        if not isinstance(self.random_seed, int) or isinstance(self.random_seed, bool):
-            raise ValueError("random_seed must be an explicit integer")
-        start = _date(self.start_date, name="start_date")
-        end = _date(self.end_date, name="end_date")
-        if start > end:
-            raise ValueError("start_date must not be after end_date")
-        object.__setattr__(self, "start_date", start)
-        object.__setattr__(self, "end_date", end)
-
-        parameter_set = _freeze_json(self.parameter_set, path="parameter_set")
-        if not isinstance(parameter_set, Mapping):
-            raise ValueError("parameter_set must be an explicit JSON-like object")
-        object.__setattr__(self, "parameter_set", parameter_set)
-        asof = _required_mapping(self.asof_policy, name="asof_policy", fields=("policy_id", "cutoff"))
-        normalized_asof = dict(asof)
-        normalized_asof["policy_id"] = _explicit_label(
-            asof["policy_id"], name="asof_policy.policy_id",
-        )
-        normalized_asof["cutoff"] = _asof_cutoff(asof["cutoff"])
-        asof = _freeze_json(normalized_asof, path="asof_policy")
-        object.__setattr__(self, "asof_policy", asof)
-        execution = _required_mapping(
-            self.execution_assumptions, name="execution_assumptions", fields=_EXECUTION_FIELDS,
-        )
-        normalized_execution = dict(execution)
-        for field in ("execution_profile_version", "t_plus_one_semantics",
-                      "price_limit_semantics", "partial_fill_semantics"):
-            normalized_execution[field] = _explicit_label(
-                execution[field], name=f"execution_assumptions.{field}",
-            )
-        for field in ("fill_assumptions", "capacity_assumptions"):
-            if not isinstance(execution[field], Mapping) or not execution[field]:
-                raise ValueError(f"execution_assumptions.{field} must be a non-empty object")
-        execution = _freeze_json(normalized_execution, path="execution_assumptions")
-        object.__setattr__(self, "execution_assumptions", execution)
-        cost = _required_mapping(self.cost_model, name="cost_model", fields=_COST_FIELDS)
-        normalized_cost = dict(cost)
-        for field in ("commission_rate", "minimum_commission", "stamp_duty_rate"):
-            amount = _finite_number(cost[field], name=f"cost_model.{field}")
-            if amount < 0:
-                raise ValueError(f"cost_model.{field} must be >= 0")
-            normalized_cost[field] = amount
-        for field in ("slippage_model", "version"):
-            normalized_cost[field] = _explicit_label(cost[field], name=f"cost_model.{field}")
-        if not isinstance(cost["slippage_parameters"], Mapping) or not cost["slippage_parameters"]:
-            raise ValueError("cost_model.slippage_parameters must be a non-empty explicit object")
-        cost = _freeze_json(normalized_cost, path="cost_model")
-        object.__setattr__(self, "cost_model", cost)
+        normalized = _normalize_experiment_environment({
+            name: getattr(self, name) for name in _ENVIRONMENT_FIELDS
+        })
+        for name, value in normalized.items():
+            object.__setattr__(self, name, value)
 
     def projection(self) -> dict[str, Any]:
         """Return the full canonicalizable experiment identity."""
         return {
             "contract_version": self.contract_version,
             "strategy": self.strategy.projection(),
+            **_projection_environment(self),
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return _digest(self.projection())
+
+    @property
+    def experiment_id(self) -> str:
+        """The experiment id is its sole canonical identity."""
+        return self.fingerprint
+
+
+def _projection_environment(self):
+    return {
             "code_revision": self.code_revision,
             "dataset_fingerprint": self.dataset_fingerprint,
             "universe_fingerprint": self.universe_fingerprint,
@@ -268,15 +297,79 @@ class ExperimentSpec:
             "execution_assumptions": _thaw_json(self.execution_assumptions),
             "cost_model": _thaw_json(self.cost_model),
             "random_seed": self.random_seed,
-        }
+    }
+
+
+CANDIDATE_EXPERIMENT_CONTRACT_VERSION = "candidate-experiment-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateExperimentSubject:
+    """Candidate content plus versioned executable semantics; parent proves lineage."""
+
+    candidate_id: str
+    candidate_fingerprint: str
+    candidate_schema_version: str
+    parent_strategy: StrategyIdentity
+    replay_contract_version: str
+    replay_fingerprint: str
+
+    def __post_init__(self):
+        for name in ("candidate_id", "candidate_fingerprint", "replay_fingerprint"):
+            object.__setattr__(self, name, _stable_fingerprint(getattr(self, name), name=name))
+        if self.candidate_id != self.candidate_fingerprint:
+            raise ValueError("candidate_identity_mismatch")
+        if not isinstance(self.parent_strategy, StrategyIdentity):
+            raise ValueError("candidate_parent_pin_required")
+        for name in ("candidate_schema_version", "replay_contract_version"):
+            object.__setattr__(self, name, _explicit_label(getattr(self, name), name=name))
+
+    def projection(self):
+        return {"kind": "strategy_candidate", "candidate_id": self.candidate_id,
+                "candidate_fingerprint": self.candidate_fingerprint,
+                "candidate_schema_version": self.candidate_schema_version,
+                "parent_strategy": self.parent_strategy.projection(),
+                "replay_contract_version": self.replay_contract_version,
+                "replay_fingerprint": self.replay_fingerprint}
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateExperimentSpec:
+    subject: CandidateExperimentSubject
+    code_revision: str
+    dataset_fingerprint: str
+    universe_fingerprint: str
+    tradability_fingerprint: str
+    market_data_fingerprint: str
+    parameter_set: Mapping[str, Any]
+    start_date: str
+    end_date: str
+    asof_policy: Mapping[str, Any]
+    execution_assumptions: Mapping[str, Any]
+    cost_model: Mapping[str, Any]
+    random_seed: int
+    contract_version: str = CANDIDATE_EXPERIMENT_CONTRACT_VERSION
+
+    def __post_init__(self):
+        if not isinstance(self.subject, CandidateExperimentSubject):
+            raise ValueError("canonical_candidate_subject_required")
+        if self.contract_version != CANDIDATE_EXPERIMENT_CONTRACT_VERSION:
+            raise ValueError("unsupported_candidate_experiment_contract")
+        for name, value in _normalize_experiment_environment({
+                name: getattr(self, name) for name in _ENVIRONMENT_FIELDS}).items():
+            object.__setattr__(self, name, value)
+
+    def projection(self):
+        # Share the legacy environment projection without introducing a strategy identity.
+        return {"contract_version": self.contract_version, "subject": self.subject.projection(),
+                **_projection_environment(self)}
 
     @property
-    def fingerprint(self) -> str:
+    def fingerprint(self):
         return _digest(self.projection())
 
     @property
-    def experiment_id(self) -> str:
-        """The experiment id is its sole canonical identity."""
+    def experiment_id(self):
         return self.fingerprint
 
 
@@ -387,7 +480,7 @@ class ExperimentResult:
 
     def assert_for(self, spec: ExperimentSpec) -> None:
         """Fail closed when a caller pairs this result with a different spec."""
-        if not isinstance(spec, ExperimentSpec):
+        if not isinstance(spec, (ExperimentSpec, CandidateExperimentSpec)):
             raise ValueError("result validation requires an ExperimentSpec")
         if self.experiment_fingerprint != spec.fingerprint:
             raise ValueError("experiment result is bound to a different ExperimentSpec")

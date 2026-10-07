@@ -188,6 +188,7 @@ def _resolve_subset(pool: tuple[str, ...], candidate_ids) -> tuple[str, ...]:
 
 def create_search_run(conn: sqlite3.Connection, *, generation_batch_id: str,
                       budget: ESC.SearchBudget, candidate_ids=None,
+                      experiment_plan: ESC.ExperimentSearchPlan | None = None,
                       created_at: str | None = None) -> dict:
     """Atomically create one search run + N job declarations + N queued events.
 
@@ -211,6 +212,9 @@ def create_search_run(conn: sqlite3.Connection, *, generation_batch_id: str,
             generation_input_fingerprint=str(batch["generation_input_fingerprint"]),
             candidate_ids=selected,
             budget=budget,
+            search_contract_version=(ESC.SEARCH_CONTRACT_VERSION_V2 if experiment_plan is not None
+                                     else ESC.SEARCH_CONTRACT_VERSION),
+            experiment_plan=experiment_plan,
         )
     except ESC.SearchContractError as exc:
         # 契约拒绝统一映射成本层的稳定 reason，绝不泄漏裸 SearchContractError。

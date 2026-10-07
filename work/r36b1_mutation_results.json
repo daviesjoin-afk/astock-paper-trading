@@ -1,0 +1,47 @@
+{
+  "r36b1_candidate_experiment_mutation_check.py": {
+    "exit_code": 0,
+    "summary": [
+      "M-CEX detected = 15/15",
+      "survived = 0; fake = 0; timeout = 0",
+      "restore SHA256 = PASS",
+      "baseline after restore = GREEN"
+    ]
+  },
+  "r36a_search_mutation_check.py": {
+    "exit_code": 0,
+    "summary": [
+      "M-SC detected = 15/15",
+      "survived = 0; fake = 0; timeout = 0",
+      "restore SHA256 = PASS",
+      "baseline after restore = GREEN"
+    ]
+  },
+  "r35a_candidate_mutation_check.py": {
+    "exit_code": 0,
+    "summary": [
+      "M-G detected = 8/8",
+      "survived = 0; fake = 0; timeout = 0",
+      "restore SHA256 = PASS",
+      "baseline after restore = GREEN"
+    ]
+  },
+  "r35b_candidate_expansion_mutation_check.py": {
+    "exit_code": 0,
+    "summary": [
+      "M-X detected = 10/10",
+      "survived = 0; fake = 0; timeout = 0",
+      "restore SHA256 = PASS",
+      "baseline after restore = GREEN"
+    ]
+  },
+  "r35c_ai_candidate_mutation_check.py": {
+    "exit_code": 0,
+    "summary": [
+      "M-AIG detected = 17/17",
+      "survived = 0; fake = 0; timeout = 0",
+      "restore SHA256 = PASS",
+      "baseline after restore = GREEN"
+    ]
+  }
+}

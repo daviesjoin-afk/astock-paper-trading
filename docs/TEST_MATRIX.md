@@ -981,3 +981,31 @@ R35-B 的 `M-X`。
 **M-SC3 第一版 SURVIVED，暴露真实缺口**：`get_candidate()` 自身已重算指纹自证，所以单删
 service 那行显式 `verify` 无测试可发现；但同段代码 `candidate is None → continue` 会让
 **账本里不存在的幽灵 candidate** 进入队列。补 S3c 后 M-SC3 同时打破两半即 DETECTED。
+
+
+## R36-B1 Candidate Experiment Execution
+
+永久测试：`backend/test_r36b1_candidate_experiment_execution.py`。成功路径使用真实 archive、calendar、
+tradability、WFV、R29 ledger；mock 仅用于故障、崩溃与事务边界探测。
+冻结 fixture 来自 exact base `bc1e25d4e84440c635586efa8974c13486d90c64`。
+
+| ID | 检查 |
+| --- | --- |
+| CEX-01 | legacy projection/fingerprint 固定为 `eceab43d72907ccf88bd5ea24f175e608b2b8bcc084b7522f4afd5280faa9d1e` |
+| CEX-02–04 | 候选与父来源、factor/exit/constraints/universe 绑定身份；篡改候选或外部 AST 拒绝 |
+| CEX-05–08 | factor gate entry、不强制退出；显式 exit 独占；缺省 inverse-entry；实际执行交易数 |
+| CEX-09 | entry/factor/exit 依赖并集；缺 factor/exit 金融字段阻止 PIT |
+| CEX-10–12 | 历史显式股票池、identity 匹配、board 明确 unavailable、时区边界及 future-asof 拒绝 |
+| CEX-13 | max_positions/weight/exposure 真正限制入场规模 |
+| CEX-14–16 | canonical 不可变 plan；所有设计字段改变 search identity；重新计算 storage hash 也不能掩盖 plan 损坏 |
+| CEX-17 | v1 search 可读不可执行，无默认 plan |
+| CEX-18–20 | 候选/正式列互斥、正式 view 隔离、旧台账原样幂等迁移、旧 replay metrics 固定 |
+| CEX-21–23 | candidate/plan mismatch 无 run；真实 R29 subject 及交易；直接或伪造 completed 拒绝 |
+| CEX-24–26 | canonical blocked/failed 仍运营完成；崩溃恢复不重算；同 key 幂等、不同 key 冲突 |
+| CEX-27–28 | 无队列指标、计算期间另一连接可获取写锁、唯一完成调用点、无 R30/AI/网络依赖 |
+| 补充 | 台账 payload 损坏拒绝、另一个候选证据不能绑定、基础设施异常写 failed |
+
+M-CEX1–15 分别破坏 legacy identity、候选内容身份、factor、exit、依赖并集、股票池过滤、asof、
+风险约束、plan identity、自证、subject 列、真实完成证据、blocked 运营语义、普通 completed 防线、
+跨候选绑定。每例编译真实 mutant、运行对应 detector、恢复原始字节并核对 SHA256，最后重跑基线。
+要求 detected=15/15，survived=fake=timeout=0。M-SC 继续独立运行，守住 R36-A 的批次自证和并发领取。
