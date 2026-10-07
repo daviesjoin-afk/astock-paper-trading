@@ -4058,3 +4058,152 @@ PIT validator。**队列 job completed 绝不等于 passed / good / promotable**
 canonical R30 report 已存在。R36-C / R36-D / R37 尚未开始。
 
 阶段状态：R36-B2 **IN REVIEW**；R36-C/R36-D/R37 **NOT STARTED**。
+
+
+## R36-C Candidate Selection & Iteration Policy
+
+R36-B1/B2 让候选拥有 canonical 的 R29 PIT 与 R30 robustness 证据，但**证据不是选择**。
+R36-C 是第一个允许把 exact R29/R30 证据转成**搜索局部**选择决策的阶段。链路：
+
+```text
+exact candidate set + exact R29 evidence + exact R30 evidence
++ selection policy（在观察实验结果之前 pin 定）
+    ↓ eligibility gates
+deterministic Pareto fronts
+    ↓
+eliminate / retain / advance
+```
+
+八句边界：
+
+```text
+Selection consumes canonical evidence; it does not manufacture
+or reinterpret R29/R30 facts.
+
+Operational failure or missing execution evidence is not candidate
+underperformance and must not become elimination.
+
+Selection policy is pinned in the search request before experiment
+results are observed.
+
+Selection policy is not part of experiment identity; changing a
+selection policy must not change the R29/R30 experiment fingerprints.
+
+Pareto front membership is a search-local selection fact, not
+promotion, lifecycle state, or a global strategy ranking.
+
+Candidate-id ordering is serialization order only and has no
+selection meaning.
+
+An "advance" disposition means only that R36-D may consume the
+candidate as a next-generation parent input.
+
+Only R31 owns strategy promotion.
+```
+
+**三个新生产模块，各是一个真实 authority：**
+
+- `backend/candidate_selection.py`：纯领域。`CandidateSelectionPolicy`、
+  `CandidateSelectionEvidence`、`CandidateSelectionReport`、`evaluate_selection(...)`。
+  **无** DB、无网络、无文件系统、无 `datetime.now()`、无策略注册表、无 current/latest
+  查找、无 lifecycle/promotion/AI。
+- `backend/candidate_selection_repository.py`：append-only canonical selection-report
+  持久化，唯一新表 `experiment_search_selection_reports`。
+- `backend/candidate_selection_service.py`：exact R29/R30 证据闭包与编排，
+  `select_search_candidates(...)`。
+
+**选择策略 pin 在 search request 身份里，不在 experiment plan 里。**
+`candidate-experiment-plan-v2` 逐字节不变；新 `experiment-search-contract-v3` = v2 +
+`selection_policy` + `selection_policy_fingerprint`。v1/v2 的 projection/fingerprint 冻结。
+v2 search 仍 PIT/R30 可执行，但 selection 不可用，稳定 reason 为
+`search_run_selection_policy_unavailable`。只改 selection policy **必须**改变
+`search_input_fingerprint`，但**必须不**改变 `CandidateExperimentSpec` fingerprint、R29
+experiment fingerprint 与 R30 `RobustnessPlan` fingerprint。
+
+**策略字段**：`policy_version`；`objectives`（闭集 allowlist、canonical 排序、拒绝重复、
+至少一个）；`min_baseline_return`；`max_baseline_drawdown_abs`；`min_trade_count`；
+`min_data_coverage`；`require_no_robustness_unavailable`；
+`require_no_robustness_failed`；`require_no_threshold_breaches`；
+`max_observed_fragilities`；`advance_through_front`；`retain_through_front`。业务字段全部
+显式（service 里**没有**隐藏默认），`None` 表示"该 gate 被显式关闭"。目标词汇闭集且
+**方向固定**（调用方不能声明方向）：`baseline_return` MAXIMIZE；`baseline_drawdown_abs`
+MINIMIZE；`baseline_turnover` MINIMIZE；`robustness_worst_return` MAXIMIZE；
+`robustness_worst_drawdown_abs` MINIMIZE；`robustness_max_return_degradation` MINIMIZE；
+`robustness_fragility_count` MINIMIZE。**没有** weighted score / composite score /
+utility function / AI ranking / epsilon dominance。
+
+**固定 robustness 聚合**（只有 completed case 参与）：
+`robustness_worst_return = MIN(case.metrics.return)`；
+`robustness_worst_drawdown_abs = MAX(abs(case.metrics.drawdown))`；
+`robustness_max_return_degradation = MAX(max(0, -case.baseline_delta.return))`。
+unavailable/failed case 计入 gate，但**绝不**进入 worst metrics，**绝不**用 0 或 baseline
+填充。缺 metric → `selection_metric_unavailable` / `selection_objective_unavailable`，
+**绝不**当 0。
+
+**证据闭包（whole-search gate）**：candidate pool 只来自 exact
+`search_spec.candidate_ids`，每个候选再经 `strategy_candidate_repository.get_candidate`
+自证。每个候选需要 exact `pit_validation` job（canonical `get_search_job`）；PIT job
+failed/queued/claimed/cancelled → **整次选择拒绝**，reason
+`selection_operational_evidence_incomplete`（运营失败绝不等于淘汰；cancelled 也
+fail-closed，避免运营性审查）。completed PIT job 且 `evidence_owner=experiment_validation_run`、
+`evidence_id=exact run_key` 时经 `ExperimentValidationRepository.get_run(run_key=...)`
+重读；canonical R29 blocked / `result != completed` 是**真实证据** → 候选可
+`eligible=false`、`disposition=eliminate`，reasons `pit_validation_not_ready` /
+`pit_result_not_completed`，**不**需要 R30。READY R29 候选
+（`validation_status=ready` AND `result.status=completed`）**必须**有 exact robustness job，
+缺失 → 整次选择拒绝 `selection_robustness_stage_incomplete`；其 robustness job
+queued/claimed/failed/cancelled → 同样整次拒绝（缺执行事实，不是候选表现）。completed
+robustness job 必须携带 `evidence_owner=robustness_report`、`evidence_id=exact report_key`，
+经 `RobustnessRepository.get_report_by_key` 重读。选择还重新核验 R29↔R30 绑定：candidate_id
+精确；R30 `baseline_run_key == R29 run_key`；R30
+`baseline_experiment_fingerprint == R29 experiment_fingerprint`；R30
+`baseline_result_fingerprint == R29 result.result_fingerprint`；R30 内嵌
+`experiment_subject == R29 subject`；R30 plan fingerprint == 该 exact baseline 的
+search-pinned robustness plan。复用既有 canonical helper，不复制 B2 逻辑。**任何地方都没有**
+recent_runs / recent_reports / `ORDER BY DESC LIMIT 1` / `MAX(created_at)` / latest /
+current 结果查找。
+
+**Disposition 语义**：`eligible=false` → eliminate。`eligible=true` 且
+`pareto_front <= advance_through_front` → advance。`eligible=true` 且
+`advance_through_front < pareto_front <= retain_through_front` → retain。`eligible=true` 且
+`pareto_front > retain_through_front` → eliminate。`next_generation_eligible =
+(disposition == advance)`。`advance_through_front >= 1` 且
+`retain_through_front >= advance_through_front`。ineligible 候选 `pareto_front = null`、
+`next_generation_eligible = false`。
+
+**Report** 含：`report_version`；`search_run_id`；`search_input_fingerprint`；
+`selection_policy`；`selection_policy_fingerprint`；`evidence_set_fingerprint`；
+`candidate_count`；`eligible_count`；`advance_count`；`retain_count`；`eliminate_count`；
+`candidates[]`（`candidate_id`、`pit_run_key`、`pit_result_fingerprint`、
+`robustness_report_key`、`robustness_report_fingerprint`、`eligibility`、
+`blocking_reasons`、`selection_features`、`pareto_front`、`disposition`、
+`next_generation_eligible`）。`selection_report_key = sha256({report_version,
+search_run_id, search_input_fingerprint, selection_policy_fingerprint,
+evidence_set_fingerprint})`；`created_at` 在身份之外。全员 blocked 是合法 report
+（`eligible_count=0`、`eliminate_count=N`）；但 operational evidence incomplete **不得**产生
+report。Pareto 非支配排序只用 strict deterministic comparison；`candidate_id ASC` 只是
+序列化顺序，**不是** ranking；同一 front 同一 disposition（front 是原子选择单位，**没有**
+top-N hash 截断）。
+
+**持久化**：一张新永久表 `experiment_search_selection_reports`（`report_key` PRIMARY KEY、
+`search_run_id` UNIQUE、`search_input_fingerprint`、`selection_policy_fingerprint`、
+`evidence_set_fingerprint`、`report_version`、`candidate_count`、`eligible_count`、
+`advance_count`、`retain_count`、`eliminate_count`、`report_json`、`created_at`、
+`payload_fingerprint`；FK `search_run_id → experiment_search_runs`）。**没有** scalar
+score / weighted_score / utility / winner / best_candidate / promotion / promotable 列。
+append-only（**无** UPDATE、**无** DELETE trigger）。每次 search 恰好一份 canonical
+report；相同 retry 幂等；同 search 不同 report → `selection_report_conflict`；并发相同写入
+幂等（INSERT、catch unique conflict、重读 winner、比较 exact payload）。selection-report DB
+写入权威 = `candidate_selection_repository`，写入点 = 1。migration 为 **v36**（#233 合并后
+max 为 v35），**绝不**回填历史 selection 行（0 行才是正确历史）；正常 `init_db()` /
+fresh bootstrap 也创建该表。
+
+边界：本阶段**没有**前端、**没有**新 HTTP API、**没有** weighted score、**没有** winner、
+**没有** top-N 截断、**没有** candidate/lifecycle/promotion/AI 写入。R36-C **不** import
+`strategy_promotion` / `promotion_science` / `strategy_lifecycle`，也**不** import
+`adaptive_selection` / `adaptive_selection_compat` / `selection_runner` / `paper_selection` /
+`strategy_selection_resolver` / `strategy_selection_provenance` / `selection_tracking` /
+`learning_evaluation`（那些是其它权威：runtime 选股、paper account 选择、runtime 策略
+provenance、legacy/adaptive 参数选择、shadow learning evaluation）。
+
+阶段状态：R36-C **IN REVIEW**；R36-D/R37 **NOT STARTED**。
