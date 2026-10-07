@@ -3828,6 +3828,76 @@ search loop、winner selection、promotion、closed-loop regeneration —— 那
 **R36 Experiment Search Controller** 与 **R37 Closed-loop Learning**。
 
 
+## R36-A Experiment Search Controller Foundation
+
+R35 结束时已经有了"一批候选"，但缺中间这层控制面：**谁应该被实验？预算是多少？当前排了
+哪些实验工作？哪个工作已领取？失败能否重试？还剩多少预算？** R36-A 只建立这个
+**control plane**。
+
+链路：
+
+```text
+exact R35 generation_batch_id
+    ↓ verify exact generation batch（禁止 latest / recent / current batch）
+exact candidate pool（每个候选再从 canonical ledger 自证）
+    ↓ explicit SearchBudget（候选数 + 单 job 尝试数）
+ExperimentSearchRun（search_run_id 是 opaque 事件身份）
+    ↓ immutable PIT-validation job declarations（job_id 是确定性内容身份）
+append-only job events（event_seq 是唯一 ordering authority）
+    ↓
+deterministic queue state projection
+```
+
+身份分工与 R35 同构，但**新增了一个 ordering authority**：
+
+```text
+SearchSpec fingerprint   → content identity（这次请求要验证什么）
+search_run_id            → request event identity（secrets.token_hex(32)）
+job_id                   → declared unit of work 的确定性身份
+event_seq                → queue 运营状态的唯一 ordering authority
+```
+
+R35 的 proposal history 刻意**没有** latest（业务历史没有 ordering authority）。
+R36 的 job queue **需要** current operational state，因此显式建立
+`event_seq INTEGER PRIMARY KEY AUTOINCREMENT`；`created_at` 与 `event_id` 字典序
+**绝不**用来推断先后 —— 两条事件可以共享同一个 timestamp。
+
+四句边界：
+
+```text
+A queued experiment is not an evaluation result.
+A completed queue job does not mean a candidate passed.
+Search order is not candidate ranking.
+The search controller may schedule evidence production;
+it may not manufacture evidence or promotion authority.
+```
+
+authority 分工**不允许合并**：
+
+```text
+R36-A   只调度“需要验证什么”
+R29/R30 决定“验证事实是什么”
+R36-C   才决定“根据事实选谁”
+R31     决定“谁可以晋级”
+```
+
+因此 R36-A **不执行** `run_validation()` / `run_robustness()`，也**不**新增结果表。原因是
+当前 `ExperimentSpec` 的 canonical strategy identity 是正式 `StrategyVersion`，而 R35
+candidate 可以改变 entry / exit / factor / parameter —— 拿 parent checksum + candidate
+parameters 冒充 candidate experiment identity，会让"不同 entry/exit/factor 但同 parent +
+parameters"的两个候选得到同一 experiment identity。**R36-B** 专门解决这条桥接。
+
+预算不是截断许可：R36-A 没有 selection authority，因此"40 个候选 + max_candidates=20 +
+未显式给 candidate_ids"必须 **fail closed**，绝不偷偷取前 20 个。claim 顺序同理只能是
+中性的 `candidate_id ASC`（版本化为 `QUEUE_POLICY_VERSION`），因为
+"预期收益高 / AI confidence 高 / Sharpe 高的先跑"已经是 selection policy。
+
+三张新表都**没有** `status` / `attempts` / `claimed_at` 这类可变快照列，也没有任何实验
+指标列：`completed` 要求 executor 产生可核验的外部 evidence，绝不表示 candidate
+passed / good / promotable。R36-A 尚无 candidate 与实验 evidence 的绑定，当前禁止写入
+`completed`；只提供调度、领取、执行失败重试与取消。
+
+
 ## 架构演进记录（历史批次：模块化与边界固化）
 
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。

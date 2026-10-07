@@ -81,6 +81,14 @@ CANDIDATE_SCHEMA_VERSION = "strategy-candidate-v2"
 #: ``candidate_schema_version`` 版本化的，历史行一律不改写。
 CANDIDATE_SCHEMA_VERSION_V1 = "strategy-candidate-v1"
 
+#: ``candidate_from_projection`` 接受的**全部** schema 版本（显式 allowlist）。
+#:
+#: 反序列化绝不"不是 v2 就按 legacy v1 解释"：未知版本会被追认为旧材料，从而在错误
+#: 语义下"自证通过"。新增版本时必须同时在这里登记并写明其材料形状。
+CANDIDATE_SCHEMA_VERSIONS = frozenset({
+    CANDIDATE_SCHEMA_VERSION_V1, CANDIDATE_SCHEMA_VERSION,
+})
+
 #: 只有 v1 材料才携带的 generator 身份键（R35-A）。
 LEGACY_GENERATOR_IDENTITY_KEYS = (
     "generator_type", "generator_version", "generator_contract_version",
@@ -539,13 +547,23 @@ def candidate_from_projection(value: Mapping) -> StrategyCandidate:
     R35-A 的 v1 行按 v1 材料重建（含 generator 三件套 + 四项提案 provenance），
     R35-B 的 v2 行按 v2 材料重建 —— v2 形状里**不存在**这些键，v1 形状里**必须**都有。
     两者都必须在**自己的** schema 版本下自证，绝不把 v1 行"升级"成 v2。
+
+    **schema version 是显式 allowlist**：只接受 v1 / v2。未知版本（``candidate-v999``、
+    ``future-v3``、空串、任意拼写）一律 fail closed —— 绝不"不是 v2 就按 legacy v1
+    解释"。那条兜底分支正是本轮要根除的形状：它会让一个未来版本的行被按旧材料解读，
+    从而在**错误语义**下"自证通过"。R36-A 起候选台账是 search controller 的输入，
+    因此这个反序列化边界必须在下游消费候选之前关闭。
     """
     if not isinstance(value, Mapping):
         raise CandidateValidationError("candidate_projection_invalid")
+    raw_version = value.get("candidate_schema_version")
+    schema_version = str(raw_version if raw_version is not None else "")
+    if schema_version not in CANDIDATE_SCHEMA_VERSIONS:
+        # 缺失 / 未知 / 拼写漂移都拒绝：不猜、不回落 legacy。
+        raise CandidateValidationError(
+            f"unsupported_candidate_schema_version:{schema_version or '<missing>'}")
     try:
         parent_id = value.get("parent_strategy_id")
-        schema_version = str(
-            value.get("candidate_schema_version", CANDIDATE_SCHEMA_VERSION))
         legacy = {}
         if schema_version == CANDIDATE_SCHEMA_VERSION_V1:
             for key in LEGACY_GENERATOR_IDENTITY_KEYS:
@@ -616,7 +634,7 @@ def candidate_projection_keys() -> tuple[str, ...]:
 
 __all__ = [
     "CANDIDATE_CONTRACT_VERSION", "CANDIDATE_SCHEMA_VERSION",
-    "CANDIDATE_SCHEMA_VERSION_V1", "CONSTRAINT_KEYS",
+    "CANDIDATE_SCHEMA_VERSION_V1", "CANDIDATE_SCHEMA_VERSIONS", "CONSTRAINT_KEYS",
     "CandidateValidationError", "FORBIDDEN_EVALUATION_KEYS",
     "LEGACY_GENERATOR_IDENTITY_KEYS", "MODEL_IDENTITY_KEYS",
     "PROPOSAL_PROVENANCE_KEYS", "RESEARCH_PROVENANCE_KEYS", "RESEARCH_SOURCE_KINDS",

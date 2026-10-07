@@ -41,6 +41,7 @@ the same candidate may appear in several batches.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -195,18 +196,51 @@ def record_generation_batch(conn: sqlite3.Connection, *, batch: Mapping,
     return batch_id
 
 
-def get_generation_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
-    """Read exactly one generation batch by id; never "the latest one"."""
+def get_generation_batch(conn: sqlite3.Connection, batch_id: str, *,
+                         verify_input: bool = False) -> dict | None:
+    """Read one exact batch; search callers require verified original input material.
+
+    历史展示仍可读取 legacy batch；verify_input=True 才能作为搜索输入，缺材料时拒绝。
+    """
     if not isinstance(batch_id, str) or not SC._SHA256.fullmatch(batch_id):
         raise StrategyCandidateRepositoryError("explicit_generation_batch_id_required")
+    columns = ("batch_id", "generation_input_fingerprint", "search_space_fingerprint",
+               "search_space_contract_version", "generator_type", "generator_version",
+               "generator_contract_version", "parent_strategy_id", "parent_strategy_version",
+               "parent_strategy_checksum", "asof", "candidate_count")
     row = conn.execute(
-        "SELECT batch_json FROM strategy_candidate_generation_batches"
+        f"SELECT batch_json,{','.join(columns)} FROM strategy_candidate_generation_batches"
         " WHERE batch_id=?", (batch_id,)).fetchone()
     if row is None:
         return None
     try:
-        return json.loads(str(row[0]))
-    except ValueError as exc:
+        batch = json.loads(str(row[0]))
+        if not verify_input:
+            return batch
+        if not isinstance(batch, dict) or any(
+                batch.get(column) != value for column, value in zip(columns, row[1:], strict=True)):
+            raise ValueError("batch row identity mismatch")
+        material = batch.get("material")
+        if not isinstance(material, dict):
+            raise ValueError("batch input material missing")
+        canonical = json.dumps(material, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False)
+        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != batch["generation_input_fingerprint"]:
+            raise ValueError("batch input fingerprint mismatch")
+        # JSON 内重复发布的事实也必须等于指纹覆盖的原始材料。
+        expected = {key: batch[key] for key in (
+            "generator_type", "generator_version", "search_space_contract_version",
+            "search_space_fingerprint", "search_space_material", "asof", "candidate_count")}
+        expected["generation_contract_version"] = batch["generator_contract_version"]
+        expected["parent_pin"] = {
+            "strategy_id": batch["parent_strategy_id"],
+            "strategy_version": batch["parent_strategy_version"],
+            "strategy_checksum": batch["parent_strategy_checksum"],
+        }
+        if any(material.get(key) != value for key, value in expected.items()):
+            raise ValueError("batch material identity mismatch")
+        return batch
+    except (KeyError, TypeError, ValueError) as exc:
         raise StrategyCandidateRepositoryError("generation_batch_evidence_invalid") from exc
 
 

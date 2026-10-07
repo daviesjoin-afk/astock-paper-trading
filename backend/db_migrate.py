@@ -354,6 +354,14 @@ MIGRATIONS = {
         # 状态；历史候选行原样保留（candidate_json 逐字搬运，v1 材料仍自证）。
         (34, "候选表升级为内容身份并新增 generation batch 追加表（幂等，不回填）",
          paper_schema.ensure_strategy_candidates),
+        # R36-A：Experiment Search Controller 的 control plane。三张 append-only 表
+        # （search run / job declaration / job event）。**绝不回填**：升级前的历史里不存在
+        # "某次 search 调度了哪些实验"这个事实，从既有 candidates 或历史
+        # experiment_validation_runs 反推属于捏造 provenance。
+        # 三张表都只记录"要验证什么"与"队列运营状态"，**不**记录任何实验结论：
+        # 结果 authority 仍是 R28/R29/R30，selection/promotion 属于 R36-C / R31。
+        (35, "新增实验搜索控制面三张追加表（幂等，不回填，append-only）",
+         paper_schema.ensure_experiment_search),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

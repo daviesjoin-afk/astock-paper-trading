@@ -915,3 +915,69 @@ R35-B 的 `M-X`。
 给出不同 reason（`invalid_proposal_field` / `unknown_proposal_field`），C7c 逐个遍历
 禁止集合把它钉住，使该集合成为**承载语义**的边界。
 
+
+## R36-A Experiment Search Controller Foundation
+
+`backend/test_r36a_experiment_search_controller.py`（S1–S22，49 tests）。
+四句边界见 `plans/r36a-experiment-search-controller-foundation.md`。
+
+| 不变量 | 测试 |
+| --- | --- |
+| S1 exact generation batch only（已知 OK；未知 / 畸形 / 空 → reject，零行写入） | `ExactGenerationBatchTests` |
+| S1b 源码级无 latest / recent / current batch 读取，代码里无 `ORDER BY created_at DESC` | `test_s1b_source_has_no_latest_or_recent_batch_lookup` |
+| S1c **batch payload 自述身份必须等于查找键**（否则请求 A 静默拿到 B 的候选） | `test_s1c_batch_payload_identity_must_match_the_lookup_key` |
+| S1d batch payload 缺 canonical input fingerprint → reject | `test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected` |
+| S1e 合法形状的错误指纹、原始材料损坏或缺失、台账列/重复字段不一致 → reject，零写入 | `test_s1e_batch_fingerprint_must_match_original_material_and_row` |
+| S1f legacy batch 仍可历史查看，但无原始材料不能创建 search | `test_s1f_legacy_batch_remains_readable_but_cannot_schedule_search` |
+| S2 batch 外 candidate 混入 → reject（不静默过滤） | `CandidatePoolTests`（2 tests） |
+| S3 篡改候选内容 → ledger 自证失败，零行写入 | `test_s3_tampered_candidate_row_fails_closed` |
+| S3b 候选与指纹不自洽 → reject | `test_s3b_proposal_json_alone_cannot_vouch_for_a_candidate` |
+| S3c **幽灵候选**（proposal 有、ledger 无）不得被 `continue` 跳过 | `test_s3c_a_candidate_row_missing_from_the_ledger_is_not_skipped` |
+| S4 unknown candidate schema fail closed（v1/v2 继续自证） | `CandidatePoolTests`（2 tests） |
+| S5 输入顺序不承载语义（fingerprint 相同、候选顺序相同） | `test_s5_subset_order_does_not_change_identity_or_jobs` |
+| S6 重复 candidate id → reject，不静默去重 | `test_s6_duplicate_candidate_ids_are_rejected_not_deduped` |
+| S7 budget 溢出 → fail closed，**绝不截断** | `test_s7_budget_overflow_without_explicit_subset_is_rejected` |
+| S8 显式子集在预算内 → OK（N jobs + N queued events） | `CandidateSubsetTests`（2 tests） |
+| S9 同 Spec 两次：input fingerprint 相同、search_run_id 不同 | `RunIdentityTests`（2 tests） |
+| S10 注入第 N 个 job 失败 → 三张表 delta 全 0（原子） | `test_s10_creation_is_atomic` |
+| S11 job id deterministic；换 run / candidate / stage 即不同 | `test_s11_job_identity_is_deterministic` |
+| S12 初始态：每 job 恰好一条 queued 事件，`attempt_count = 0` | `test_s12_initial_state_is_queued_with_zero_attempts` |
+| S13 queued→claimed 后重复 claim → reject；非法边逐项拒绝 | `StateMachineTests`（2 tests） |
+| S14 attempt 预算（2 次后第三次 reject，且不再被 claim） | `test_s14_attempt_budget_is_enforced` |
+| S15 completed 终态 | `test_s15_completed_is_terminal` |
+| S15b R36-A 拒绝无可核验绑定的 completed；空/伪造引用、直接 repository 写入均拒绝，仍可失败重试 | `test_s15b_completion_is_rejected_without_a_verifiable_binding` |
+| S16 cancelled 终态 | `test_s16_cancelled_is_terminal` |
+| S17 current state 只由 `event_seq` 决定（同 created_at 仍正确） | `EventOrderingTests`（2 tests） |
+| S18 claim 顺序 = canonical candidate order，且与插入顺序无关 | `QueuePolicyTests`（2 tests） |
+| S19 两线程各用独立连接，同时争抢真实写锁；单任务恰好一次领取，多任务分别领取；同 job 二次 claim 被转换表拒绝 | `QueuePolicyTests`（2 tests） |
+| S20 三张表无指标列 / 无可变状态列；queue 状态无业务含义 | `TerminalSemanticsTests`（3 tests） |
+| S21 controller 不 import / 不执行 evaluation、promotion、lifecycle、execution | `test_s21_no_evaluation_or_promotion_dependency`、`test_s21b_controller_does_not_execute_runners` |
+| S22 无 AI provider / transport 依赖；无 priority / ranking 权威 | `test_s22_no_ai_provider_dependency`、`test_s22b_no_selection_ranking_or_priority_authority` |
+| migration v35：append-only trigger、FK、幂等、无 backfill、run id 冲突 | `SchemaTests`（4 tests） |
+| **正常 bootstrap（`init_db()`）也必须建出 search 三张表**并真的能写一次 search | `test_normal_bootstrap_creates_the_search_tables` |
+
+### R36-A semantic mutation results
+
+| ID | 语义 | detector |
+| --- | --- | --- |
+| M-SC1 | exact generation batch 退化成 latest batch | S1 / S1b |
+| M-SC2 | batch 外 candidate 混入 | S2 / S2b |
+| M-SC3 | 绕过 candidate ledger 自证（含幽灵 candidate 被跳过） | S3 / S3b / S3c |
+| M-SC4 | unknown candidate schema 当 legacy 读 | S4 + R35-A |
+| M-SC5 | budget 溢出自动截断 | S7 |
+| M-SC6 | search_run_id 变成 content fingerprint | S9 / S9b |
+| M-SC7 | jobs 表出现可变 status 列 | S20 |
+| M-SC8 | current state 用 created_at 而不是 event_seq | S17 / S17b |
+| M-SC9 | retry 预算被绕过 | S14 |
+| M-SC10 | completed / cancelled 不再是终态 | S15 / S16 |
+| M-SC11 | 正常 bootstrap 不再建 search 表（首次写入 `no such table`） | `test_normal_bootstrap_creates_the_search_tables` |
+| M-SC12 | 不校验 batch payload 自述身份（请求 A 拿到 B 的候选） | S1c / S1d |
+| M-SC13 | 不从原始 material 重算 generation input fingerprint | S1e |
+| M-SC14 | repository 允许直接写入未验证的 completed | S15b |
+| M-SC15 | 第二个 worker 可以再次 claim 已领取的任务 | S19 真并发 |
+
+2026-10-07：M-SC1–M-SC15 **15/15 DETECTED**；survived/fake/timeout 均为 0，源码 SHA256 恢复 PASS，恢复后 baseline GREEN。
+
+**M-SC3 第一版 SURVIVED，暴露真实缺口**：`get_candidate()` 自身已重算指纹自证，所以单删
+service 那行显式 `verify` 无测试可发现；但同段代码 `candidate is None → continue` 会让
+**账本里不存在的幽灵 candidate** 进入队列。补 S3c 后 M-SC3 同时打破两半即 DETECTED。

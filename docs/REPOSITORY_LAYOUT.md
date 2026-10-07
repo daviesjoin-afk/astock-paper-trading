@@ -147,6 +147,19 @@ proposal → R35-B batch 的编排与失败语义）。新增
 可自验的 canonical search-space material。AI 不拥有 candidate identity / parent /
 universe / regime / constraints / evaluation / promotion（见
 `plans/r35c-ai-hypothesis-candidate-generation.md`）。
+
+R36-A 补上**中间这层控制面**：`experiment_search_contract`（一次 bounded search request
+是**什么**的纯契约：`SearchBudget` / `ExperimentSearchSpec` / `SearchJobSpec` / 状态转换
+表 / queue policy；无 DB / 网络 / registry / current state / 时钟）、
+`experiment_search_repository`（search run / job declaration / job event 三张 append-only
+台账的唯一 owner）、`experiment_search_service`（exact R35 generation batch →
+verified candidate pool → bounded search run + queued jobs；以及 claim 下一件运营工作）。
+migration **v35** 新增 `experiment_search_runs` / `experiment_search_jobs` /
+`experiment_search_job_events`。R36-A **零**前端、**零**公开 API、**零**实验指标列，
+也**不执行** R29/R30 runner：它只调度"需要验证什么"，不制造证据、不做 selection、
+不做 promotion（见 `plans/r36a-experiment-search-controller-foundation.md`）。
+`strategy_candidate.candidate_from_projection()` 同时收紧为**显式 v1/v2 allowlist**：
+未知 schema 版本 fail closed，不再"不是 v2 就按 legacy 读"。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）
