@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -46,6 +47,14 @@ class ParameterApplication:
     structure_checksum: str
 
 
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
 def _walk_parameter_nodes(value: Any):
     if isinstance(value, Mapping):
         if value.get("op") == "parameter":
@@ -78,6 +87,48 @@ def _structure_checksum(ast: Mapping[str, Any]) -> str:
         separators=(",", ":"), allow_nan=False,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def apply_parameter_stress(dsl_ast: Mapping[str, Any],
+                           parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply one declared parameter perturbation to a DSL AST.
+
+    The single parameter-mutation authority for formal R30 and candidate R30.
+    It resolves the allowlisted path, applies ``delta`` / ``multiplier``, enforces
+    the declared min/max and integer rules, and re-normalises the derived AST.
+    It never constructs or mutates a strategy candidate.
+    """
+    path = parameters["path"]
+    parameter_id = str(path).removeprefix("strategy_parameters.")
+    # Resolve the declared path on the raw AST first (so an unknown path fails as
+    # ``strategy_parameter_path_unavailable`` rather than a DSL validation error),
+    # then normalise the derived AST. Thaw frozen mappings before copying.
+    result = deepcopy(_thaw_json(dsl_ast))
+    matches = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            if node.get("op") == "parameter" and node.get("parameter_id") == parameter_id:
+                matches.append(node)
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(result)
+    if len(matches) != 1:
+        raise ValueError("strategy_parameter_path_unavailable")
+    node = matches[0]
+    value = node["value"]
+    delta = parameters["value"]
+    stressed = value + delta if parameters["operation"] == "delta" else value * delta
+    if (isinstance(stressed, bool) or not isinstance(stressed, (int, float))
+            or not math.isfinite(float(stressed)) or not node["min"] <= stressed <= node["max"]
+            or node["type"] == "integer" and int(stressed) != stressed):
+        raise ValueError("strategy_parameter_stress_out_of_bounds")
+    node["value"] = int(stressed) if node["type"] == "integer" else stressed
+    return DSL.normalize(result)
 
 
 @dataclass(frozen=True)

@@ -40,43 +40,52 @@ from typing import Any
 
 import strategy_candidate_search_space as SS
 import experiment_contract as EC
+import robustness_contract as RC
 import walk_forward_validation as WFV
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "EVENT_KINDS",
     "JOB_STAGE_PIT_VALIDATION",
+    "JOB_STAGE_ROBUSTNESS",
     "JOB_STAGES",
     "QUEUE_POLICY_CANDIDATE_ID_ASC",
     "QUEUE_POLICY_VERSION",
+    "ROBUSTNESS_JOB_CONTRACT_VERSION",
     "SEARCH_CONTRACT_VERSION",
     "SEARCH_JOB_CONTRACT_VERSION",
     "SearchContractError",
     "SearchBudget",
     "SearchJobSpec",
+    "RobustnessSearchJobSpec",
     "ExperimentSearchSpec",
+    "ExperimentSearchPlan",
+    "ExperimentSearchPlanV2",
     "canonical_candidate_ids",
+    "experiment_plan_from_projection",
     "is_search_identity",
     "is_terminal_state",
     "next_state_allowed",
+    "search_job_from_projection",
     "search_run_id",
+    "search_spec_from_projection",
 ]
 
 #: search request contract 版本（进 SearchSpec fingerprint）。
 SEARCH_CONTRACT_VERSION = "experiment-search-contract-v1"
 SEARCH_CONTRACT_VERSION_V2 = "experiment-search-contract-v2"
 EXPERIMENT_PLAN_CONTRACT_VERSION = "candidate-experiment-plan-v1"
+EXPERIMENT_PLAN_CONTRACT_VERSION_V2 = "candidate-experiment-plan-v2"
 
 #: job declaration contract 版本（进 job fingerprint）。
 SEARCH_JOB_CONTRACT_VERSION = "experiment-search-job-contract-v1"
+#: R36-B2 robustness job declaration contract 版本（进 robustness job fingerprint）。
+ROBUSTNESS_JOB_CONTRACT_VERSION = "experiment-search-robustness-job-contract-v1"
 
-#: R36-A 只有 pit_validation 一个 stage。
-#:
-#: 刻意**不**提前加 robustness / walk_forward / backtest / selection：它们之间会有明确的
-#: 先后依赖与研究设计，那属于后续阶段（R36-B 起）。现在加上只会得到一个
-#: "声明得比实现早"的 stage 词表。
+#: 两个 stage 各有独立的 job contract；PIT identity 保持 v1 不变。
 JOB_STAGE_PIT_VALIDATION = "pit_validation"
-JOB_STAGES = (JOB_STAGE_PIT_VALIDATION,)
+JOB_STAGE_ROBUSTNESS = "robustness"
+JOB_STAGES = (JOB_STAGE_PIT_VALIDATION, JOB_STAGE_ROBUSTNESS)
 
 #: queue policy：claim 顺序的**唯一**权威。
 #:
@@ -251,6 +260,72 @@ class SearchJobSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RobustnessSearchJobSpec:
+    """R36-B2 第二条 job contract：``search + candidate + robustness``。
+
+    身份必须绑定 **exact** baseline run、baseline experiment fingerprint 与
+    ``RobustnessPlan`` fingerprint —— 因为不同 baseline / plan 是不同的 work unit。
+    因此 job id 不能只由 ``(search_run_id, candidate_id, stage)`` 派生。
+    """
+
+    search_run_id: str
+    candidate_id: str
+    baseline_run_key: str
+    baseline_experiment_fingerprint: str
+    robustness_policy_fingerprint: str
+    robustness_plan_fingerprint: str
+    stage: str = JOB_STAGE_ROBUSTNESS
+    job_contract_version: str = ROBUSTNESS_JOB_CONTRACT_VERSION
+
+    def __post_init__(self):
+        object.__setattr__(self, "search_run_id",
+                           _required_id(self.search_run_id, what="search_run_id"))
+        object.__setattr__(self, "candidate_id",
+                           _required_id(self.candidate_id, what="candidate_id"))
+        for name in ("baseline_run_key", "baseline_experiment_fingerprint",
+                     "robustness_policy_fingerprint", "robustness_plan_fingerprint"):
+            object.__setattr__(self, name, _required_id(getattr(self, name), what=name))
+        if str(self.stage or "") != JOB_STAGE_ROBUSTNESS:
+            raise SearchContractError("unsupported_job_stage", str(self.stage or "<empty>"))
+        object.__setattr__(self, "stage", JOB_STAGE_ROBUSTNESS)
+        if str(self.job_contract_version or "") != ROBUSTNESS_JOB_CONTRACT_VERSION:
+            raise SearchContractError("unsupported_robustness_job_contract",
+                                      str(self.job_contract_version or "<empty>"))
+
+    @property
+    def job_fingerprint(self) -> str:
+        material = {
+            "search_run_id": self.search_run_id,
+            "candidate_id": self.candidate_id,
+            "stage": self.stage,
+            "baseline_run_key": self.baseline_run_key,
+            "baseline_experiment_fingerprint": self.baseline_experiment_fingerprint,
+            "robustness_policy_fingerprint": self.robustness_policy_fingerprint,
+            "robustness_plan_fingerprint": self.robustness_plan_fingerprint,
+            "job_contract_version": self.job_contract_version,
+        }
+        return hashlib.sha256(_canonical(material).encode("utf-8")).hexdigest()
+
+    @property
+    def job_id(self) -> str:
+        return self.job_fingerprint
+
+    def projection(self) -> dict:
+        return {
+            "job_id": self.job_id,
+            "job_fingerprint": self.job_fingerprint,
+            "search_run_id": self.search_run_id,
+            "candidate_id": self.candidate_id,
+            "stage": self.stage,
+            "baseline_run_key": self.baseline_run_key,
+            "baseline_experiment_fingerprint": self.baseline_experiment_fingerprint,
+            "robustness_policy_fingerprint": self.robustness_policy_fingerprint,
+            "robustness_plan_fingerprint": self.robustness_plan_fingerprint,
+            "job_contract_version": self.job_contract_version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentSearchPlan:
     code_revision: str
     dataset_fingerprint: str
@@ -319,20 +394,136 @@ class ExperimentSearchPlan:
         return EC._digest(self.projection())
 
 
+@dataclass(frozen=True, slots=True)
+class ExperimentSearchPlanV2:
+    """``candidate-experiment-plan-v2`` = v1 全部内容 + pinned robustness policy。
+
+    v1 的 projection/fingerprint 逐字不变；v2 只是在同一 environment 上追加
+    ``robustness_policy`` 与其 fingerprint。策略必须先 pin 再执行，且同一次 search
+    内所有候选共享同一套 stress policy，因此 policy 进入 search identity。
+    """
+
+    plan: ExperimentSearchPlan
+    robustness_policy: RC.RobustnessPolicy
+    plan_contract_version: str = EXPERIMENT_PLAN_CONTRACT_VERSION_V2
+
+    def __post_init__(self):
+        if self.plan_contract_version != EXPERIMENT_PLAN_CONTRACT_VERSION_V2:
+            raise SearchContractError("unsupported_experiment_plan_contract")
+        if not isinstance(self.plan, ExperimentSearchPlan):
+            raise SearchContractError("canonical_experiment_plan_required")
+        if not isinstance(self.robustness_policy, RC.RobustnessPolicy):
+            raise SearchContractError("canonical_robustness_policy_required")
+        if self.plan.plan_contract_version != EXPERIMENT_PLAN_CONTRACT_VERSION:
+            raise SearchContractError("canonical_experiment_plan_required")
+
+    @classmethod
+    def from_v1(cls, plan: ExperimentSearchPlan,
+                robustness_policy: RC.RobustnessPolicy) -> "ExperimentSearchPlanV2":
+        return cls(plan=plan, robustness_policy=robustness_policy)
+
+    # ── v1-compatible surface (so existing consumers keep working) ──
+    def __getattr__(self, name):
+        # Only reached for attributes not defined on the dataclass itself.
+        return getattr(object.__getattribute__(self, "plan"), name)
+
+    @property
+    def robustness_policy_fingerprint(self) -> str:
+        return self.robustness_policy.fingerprint
+
+    def experiment_environment(self):
+        return self.plan.experiment_environment()
+
+    def projection(self) -> dict:
+        value = self.plan.projection()
+        value["plan_contract_version"] = EXPERIMENT_PLAN_CONTRACT_VERSION_V2
+        value["robustness_policy"] = self.robustness_policy.projection()
+        value["robustness_policy_fingerprint"] = self.robustness_policy.fingerprint
+        return value
+
+    @property
+    def fingerprint(self) -> str:
+        return EC._digest(self.projection())
+
+
+def _experiment_plan_v2_from_projection(value: dict) -> ExperimentSearchPlanV2:
+    args = dict(value)
+    args.pop("plan_contract_version")
+    policy_projection = args.pop("robustness_policy")
+    policy_fingerprint = args.pop("robustness_policy_fingerprint")
+    policy_args = dict(policy_projection)
+    policy_args.pop("policy_version")
+    policy = RC.RobustnessPolicy(
+        policy_version=policy_projection.get("policy_version",
+                                             RC.ROBUSTNESS_POLICY_VERSION),
+        **policy_args)
+    if policy.fingerprint != policy_fingerprint:
+        raise ValueError("robustness policy fingerprint mismatch")
+    plan = experiment_plan_from_projection(
+        {**args, "plan_contract_version": EXPERIMENT_PLAN_CONTRACT_VERSION})
+    plan_v2 = ExperimentSearchPlanV2(plan=plan, robustness_policy=policy)
+    if plan_v2.projection() != value:
+        raise ValueError("noncanonical plan v2")
+    return plan_v2
+
+
+
 def experiment_plan_from_projection(value):
     if not isinstance(value, dict):
         raise SearchContractError("corrupt_search_run")
     try:
+        version = value.get("plan_contract_version")
+        if version == EXPERIMENT_PLAN_CONTRACT_VERSION_V2:
+            return _experiment_plan_v2_from_projection(value)
+        if version != EXPERIMENT_PLAN_CONTRACT_VERSION:
+            raise ValueError("unsupported_experiment_plan_contract")
         args = dict(value)
+        args.pop("plan_contract_version")
         dates = args.pop("date_range")
         args.update(start_date=dates["start"], end_date=dates["end"])
         args["walk_forward_config"] = WFV.WalkForwardConfig.from_projection(args["walk_forward_config"])
-        plan = ExperimentSearchPlan(**args)
+        plan = ExperimentSearchPlan(plan_contract_version=EXPERIMENT_PLAN_CONTRACT_VERSION, **args)
         if plan.projection() != value:
             raise ValueError("noncanonical plan")
         return plan
     except (TypeError, ValueError, KeyError) as exc:
         raise SearchContractError("corrupt_search_run") from exc
+
+
+def search_job_from_projection(value):
+    """Unified, fail-closed job decoder dispatching on ``stage`` + contract version."""
+    if not isinstance(value, dict):
+        raise SearchContractError("corrupt_search_job")
+    try:
+        projection = dict(value)
+        job_id = projection.pop("job_id")
+        job_fingerprint = projection.pop("job_fingerprint")
+        stage = projection.get("stage")
+        contract = projection.get("job_contract_version")
+        if stage == JOB_STAGE_PIT_VALIDATION and contract == SEARCH_JOB_CONTRACT_VERSION:
+            job = SearchJobSpec(
+                search_run_id=projection.get("search_run_id"),
+                candidate_id=projection.get("candidate_id"),
+                stage=JOB_STAGE_PIT_VALIDATION,
+                job_contract_version=SEARCH_JOB_CONTRACT_VERSION)
+        elif stage == JOB_STAGE_ROBUSTNESS and contract == ROBUSTNESS_JOB_CONTRACT_VERSION:
+            job = RobustnessSearchJobSpec(
+                search_run_id=projection.get("search_run_id"),
+                candidate_id=projection.get("candidate_id"),
+                baseline_run_key=projection.get("baseline_run_key"),
+                baseline_experiment_fingerprint=projection.get("baseline_experiment_fingerprint"),
+                robustness_policy_fingerprint=projection.get("robustness_policy_fingerprint"),
+                robustness_plan_fingerprint=projection.get("robustness_plan_fingerprint"))
+        else:
+            raise SearchContractError("unknown_search_job_contract",
+                                      f"{stage or '<empty>'}:{contract or '<empty>'}")
+        if job.job_id != job_id or job.job_fingerprint != job_fingerprint or job.projection() != value:
+            raise ValueError("job identity mismatch")
+        return job
+    except SearchContractError:
+        raise
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SearchContractError("corrupt_search_job") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,13 +544,14 @@ class ExperimentSearchSpec:
     budget: SearchBudget
     search_contract_version: str = SEARCH_CONTRACT_VERSION
     queue_policy_version: str = QUEUE_POLICY_VERSION
-    experiment_plan: ExperimentSearchPlan | None = None
+    experiment_plan: ExperimentSearchPlan | ExperimentSearchPlanV2 | None = None
 
     def __post_init__(self):
         if self.search_contract_version not in (SEARCH_CONTRACT_VERSION, SEARCH_CONTRACT_VERSION_V2):
             raise SearchContractError("unsupported_search_contract_version")
         if self.search_contract_version == SEARCH_CONTRACT_VERSION_V2:
-            if not isinstance(self.experiment_plan, ExperimentSearchPlan):
+            if not isinstance(self.experiment_plan, (ExperimentSearchPlan,
+                                                     ExperimentSearchPlanV2)):
                 raise SearchContractError("search_run_experiment_plan_unavailable")
         elif self.experiment_plan is not None:
             raise SearchContractError("legacy_search_must_not_have_experiment_plan")

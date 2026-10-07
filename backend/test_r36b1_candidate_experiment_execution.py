@@ -245,6 +245,19 @@ class CandidateContractTests(unittest.TestCase):
                     "robustness" in ast.unparse(n) for n in ast.walk(tree)))
         self.assertEqual(["candidate_experiment_service.py"], callsites)
 
+    def test_cex29_r30_completion_is_a_separate_specialized_path(self):
+        # R30 completion has its own verified adapter; the R29 adapter is untouched.
+        callsites = []
+        for path in BACKEND.glob("*.py"):
+            if path.name.startswith("test_"):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and (
+                        node.func.attr == "record_verified_robustness_completion_event"):
+                    callsites.append(path.name)
+        self.assertEqual(["candidate_robustness_service.py"], callsites)
+
 
 class CandidateExecutionTests(SF._Base):
     def setUp(self):

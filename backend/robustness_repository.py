@@ -42,6 +42,10 @@ def _validate_canonical_identity(record: Mapping[str, Any]) -> None:
     try:
         plan = RC.RobustnessPlan(**record["plan"])
         report = record["report"]
+        # The embedded baseline spec must hash to the declared baseline experiment
+        # fingerprint: a forged nested ``baseline_spec`` cannot be appended.
+        if _sha(report["baseline_spec"]) != report["baseline_experiment_fingerprint"]:
+            raise RobustnessPersistenceError("corrupt_robustness_report")
         expected_report = RC.report_fingerprint(
             baseline_identity={**report["baseline_identity"], "spec": report["baseline_spec"]},
             plan_fingerprint=record["plan_fingerprint"], cases=report["cases"],

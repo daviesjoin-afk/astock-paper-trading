@@ -62,6 +62,7 @@ __all__ = [
     "REASON_ATTEMPT_BUDGET_EXHAUSTED",
     "claim_next_job",
     "create_search_run",
+    "fail_claimed_job",
     "get_search_run",
     "list_search_jobs",
     "record_job_event",
@@ -308,6 +309,30 @@ def record_job_event(conn: sqlite3.Connection, *, job_id: str, event_kind: str,
         evidence_owner=evidence_owner, evidence_id=evidence_id, created_at=created_at)
     return {"job_id": job_id, "search_run_id": run_id, "event_kind": event_kind,
             "attempt_number": attempt_number}
+
+
+def fail_claimed_job(conn: sqlite3.Connection, *, job_id: str, reason: str,
+                     created_at: str | None = None, actor: str | None = None) -> dict:
+    """Operationally fail one currently-claimed job, in its own short transaction.
+
+    This is the single generic queue-failure authority shared by R36-B1 and R36-B2.
+    It only appends a ``failed`` event when the job's latest event is ``claimed``, so
+    a crash-safe retry cannot fail a job that already reached a terminal state. It
+    carries no evidence owner: evidence completion has two explicit verified adapters.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        events = ESR.list_job_events(conn, job_id)
+        if events and events[-1]["event_kind"] == "claimed":
+            result = record_job_event(conn, job_id=job_id, event_kind="failed",
+                                      actor=actor, reason=reason, created_at=created_at)
+        else:
+            result = {"job_id": job_id, "event_kind": None, "attempt_number": None}
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return result
 
 
 def claim_next_job(conn: sqlite3.Connection, search_run_id: str,

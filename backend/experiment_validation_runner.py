@@ -78,6 +78,47 @@ def _serialize_result(result: EC.ExperimentResult) -> dict[str, Any]:
     return result.projection()
 
 
+def build_replay_financial_features(
+    *, spec: EC.ExperimentSpec, samples: Sequence[Any], financial_fields: Sequence[str],
+    financial_feature_repository: FFE.FinancialFeatureEvidenceRepository | None,
+    financial_archive_fingerprint: str | None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Build the canonical per-(code, session) financial feature map for a replay.
+
+    Shared by the R29 baseline replay and the R30 candidate robustness replay so the
+    required fields come from the same owner-issued evidence authority. Callers may
+    not inject financial values: only ``resolve_for_dataset_sample`` projections that
+    are ``proven`` enter the map, and conflicting values fail closed.
+    """
+    financial_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    if not financial_fields:
+        return financial_by_pair
+    for sample in samples:
+        sample_key = getattr(sample, "sample_key", None)
+        code = getattr(sample, "code", None)
+        session = (getattr(sample, "feature_asof", None)
+                   or getattr(sample, "decision_session", None))
+        if not sample_key or not code or not session:
+            continue
+        for name in financial_fields:
+            item = financial_feature_repository.resolve_for_dataset_sample(
+                dataset_fingerprint=spec.dataset_fingerprint,
+                sample_key=str(sample_key), feature_name=name,
+                financial_archive_fingerprint=financial_archive_fingerprint,
+            ).projection()
+            if item.get("verification") != "proven":
+                continue
+            pair = (str(code), str(session))
+            entry = financial_by_pair.setdefault(pair, {"decision_at": item.get("decision_at")})
+            if entry.get("decision_at") != item.get("decision_at"):
+                raise EM.ExperimentExecutionUnavailable("financial_feature_decision_mismatch")
+            prior = entry.get(name)
+            if prior is not None and prior != item.get("feature_value"):
+                raise EM.ExperimentExecutionUnavailable("financial_feature_value_mismatch")
+            entry[name] = item.get("feature_value")
+    return financial_by_pair
+
+
 def run_validation(
     spec: EC.ExperimentSpec, *, runner_code_revision: str,
     strategy_version: SR.StrategyVersion | None = None,
@@ -197,31 +238,10 @@ def run_validation(
                 symbols=sorted({row["code"] for values in members.values() for row in values}),
             )
             execution_facts = tradability_capture["execution_facts"]
-            financial_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
-            if dependencies["financial_fields"]:
-                for sample in samples:
-                    sample_key = getattr(sample, "sample_key", None)
-                    code = getattr(sample, "code", None)
-                    session = (getattr(sample, "feature_asof", None)
-                               or getattr(sample, "decision_session", None))
-                    if not sample_key or not code or not session:
-                        continue
-                    for name in dependencies["financial_fields"]:
-                        item = financial_feature_repository.resolve_for_dataset_sample(
-                            dataset_fingerprint=spec.dataset_fingerprint,
-                            sample_key=str(sample_key), feature_name=name,
-                            financial_archive_fingerprint=financial_archive_fingerprint,
-                        ).projection()
-                        if item.get("verification") != "proven":
-                            continue
-                        pair = (str(code), str(session))
-                        entry = financial_by_pair.setdefault(pair, {"decision_at": item.get("decision_at")})
-                        if entry.get("decision_at") != item.get("decision_at"):
-                            raise EM.ExperimentExecutionUnavailable("financial_feature_decision_mismatch")
-                        prior = entry.get(name)
-                        if prior is not None and prior != item.get("feature_value"):
-                            raise EM.ExperimentExecutionUnavailable("financial_feature_value_mismatch")
-                        entry[name] = item.get("feature_value")
+            financial_by_pair = build_replay_financial_features(
+                spec=spec, samples=samples, financial_fields=dependencies["financial_fields"],
+                financial_feature_repository=financial_feature_repository,
+                financial_archive_fingerprint=financial_archive_fingerprint)
             replay_args = {"candidate_replay": candidate_replay} if candidate_path else {"ast": normalized_ast}
             metrics = EM.simulate(spec, **replay_args, sessions=session_calendar.sessions,
                                   members_by_session=members, bars=bars,

@@ -1009,3 +1009,45 @@ M-CEX1–21 分别破坏 legacy identity、候选内容身份、factor、exit、
 风险约束、plan identity、自证、subject 列、真实完成证据、blocked 运营语义、普通 completed 防线、
 跨候选绑定、候选规格拒绝外部普通 AST、股票池排除不能制造策略 exit、基础设施错误不得制造 canonical failed evidence、不支持板块的真实 blocked 落库、无 run_key 拒绝释放领取、准备阶段异常释放领取。每例编译真实 mutant、运行对应 detector、恢复原始字节并核对 SHA256，最后重跑基线。
 要求 detected=21/21，survived=fake=timeout=0。M-SC 继续独立运行，守住 R36-A 的批次自证和并发领取。
+
+## R36-B2 Candidate Robustness Execution
+
+永久测试：`backend/test_r36b2_candidate_robustness_execution.py`。成功路径使用真实 archive、
+calendar、tradability、R29 ledger、R30 runner 与 robustness ledger；mock 仅用于故障、崩溃、
+并发与事务边界探测。R36-B2 exact base 为 `5ed22af508abd6fce44fb29890eca2ae1f948d15`。
+
+| ID | 检查 |
+| --- | --- |
+| CRB-01 | 正式 R30 identity 固定：plan `cb433096…`、report `4794ec33…`、report_key `f163b650…`、runner `r30-robustness-runner-v1` |
+| CRB-02 | policy identity：相同 policy 同 fingerprint；seed/regime/cost/slippage/delay/liquidity/missingness/parameter/date/universe/threshold 任一改变即改变 |
+| CRB-03 | 同 policy bind 不同 baseline 得到不同 plan fingerprint，policy fingerprint 不变；bind 逐字段保留 stress 事实 |
+| CRB-04 | plan-v1 projection/fingerprint 不变；PIT 可执行、robustness 不可用 |
+| CRB-05 | 加入 policy 后 plan-v2 与 search_input_fingerprint 改变；改 policy 任一事实即改变 search identity |
+| CRB-06 | 无 policy 不能创建 plan-v2；旧 v1 不受影响、不自动补默认 policy |
+| CRB-07 | 任一 PIT 非终态时 declare 拒绝 `pit_stage_not_terminal` |
+| CRB-08–09 | canonical blocked PIT 与 cancelled PIT 都得不到 robustness job |
+| CRB-10 | robustness job 绑定 exact baseline_run_key / baseline experiment fingerprint / robustness plan fingerprint |
+| CRB-11 | N 个合格候选声明原子：中途 insert 失败 delta jobs=0、delta queued events=0 |
+| CRB-12 | 同 exact declaration 重跑幂等：同 job id、无重复 job/queued event |
+| CRB-13 | 同 (search, candidate, stage) 不同 baseline/plan 是硬冲突 |
+| CRB-14–15 | 候选 R30 baseline identity 带 experiment_subject、无 strategy_id/version/checksum；baseline replay 与 R29 bit-identical |
+| CRB-16 | universe stress 从 candidate-filtered 集合 drop（先 filter 后 drop），显式股票池候选只跑自身符号 |
+| CRB-17–18 | factor gate entry、显式 exit 独占；max_positions/weight/exposure 在场景中继续生效 |
+| CRB-19–20 | entry/factor/exit 金融字段并集；caller 不能注入 financial_features，只取 canonical repository 证据 |
+| CRB-21–25 | parameter stress 经唯一 `apply_parameter_stress`；delta/multiplier 真实进入 replay；factor/exit 保留；越界/整数/未知路径 → scenario unavailable，不 clamp、不创建新候选 |
+| CRB-26–28 | date stress 重跑 R29 PIT（传 candidate subject 而非父 StrategyVersion）；asof 不可越过；派生 spec 带 robustness_scenario_fingerprint、保留 experiment_plan_fingerprint |
+| CRB-29–33 | 复用 `robustness_reports`（无候选新表）；unavailable/failed case 仍 canonical report 且 job completed |
+| CRB-34–36 | 基础设施异常写 failed 可有限重试；报告已落库后崩溃用 exact report_key 补写不重跑 R30；同 key 幂等、不同 key 冲突 |
+| CRB-37–38 | 三张 search 控制表无 robustness 指标列；候选编排模块无 selection/promotion/AI 依赖 |
+| 补充 2 | 并发 declare 幂等（先取写锁再读 existing）；嵌入 candidate subject 必须等于重读 R29 baseline subject |
+| 补充 | 伪造嵌套 baseline_identity / baseline_spec、另一候选报告、另一 policy 报告、损坏 payload 都不能完成 job；`_validate_canonical_identity` 拒绝 baseline_spec 与 baseline experiment fingerprint 不一致的记录 |
+
+M-CRB1–24 分别破坏候选 baseline 冒充正式策略、blocked baseline 拿到 job、policy 移出 search
+identity、运行时替换 pinned policy、移除 stage barrier、job 丢弃 baseline_run_key、移除候选
+universe filter、先全市场 drop 再 filter、忽略 factor/exit、忽略 constraints、caller 注入
+financial、parameter stress 创建候选、date stress 跳过 R29 PIT、date stress 越过 asof、伪造
+report 完成 job、其它候选 report 完成 job、scenario unavailable 映射 queue failed、基础设施
+失败映射 completed、正式 R30 fingerprint 漂移、旧 plan-v1 收到默认 policy、伪造嵌套 baseline
+provenance、嵌套 baseline identity 与顶层不一致。每例编译真实 mutant、运行对应 detector、
+恢复原始字节并核对 SHA256，最后重跑基线。
+要求 detected=24/24，survived=fake=timeout=0。M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。

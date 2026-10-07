@@ -196,6 +196,12 @@ migration **v35** 新增 `experiment_search_runs` / `experiment_search_jobs` /
 
 回放仍由现有 R29 runner/PIT/execution model 执行；没有新 facade、重复 runner 或永久结果表。
 
+## R36-B2 候选鲁棒性执行
+
+- `backend/candidate_robustness_service.py`：exact PIT 证据 → 既有 R30 robustness runner 的候选编排与独立完成核验（本阶段唯一新增生产模块）。
+
+鲁棒性仍由既有 R30 robustness runner、execution loop 与 PIT validator 执行；没有新 facade、重复 runner 或永久结果表。
+
 ## frontend/ 结构
 
 ```

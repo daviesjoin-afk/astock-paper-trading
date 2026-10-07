@@ -94,3 +94,10 @@ value:edc6cd9433d7555bc86f936894d7c19dc9a93888d83d9ab1a7f5d4be82b6b7c6
 value:ee2a64b4e9354b68b19b51628389349edd7de9b9bd43bdaccac1e3cfa7500799
 value:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 value:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+
+# R36-B2: formal R30 identity frozen at exact base
+# 5ed22af508abd6fce44fb29890eca2ae1f948d15. CRB-01 pins these immutable public
+# digests (plan/report/report_key/runner version); none are credentials.
+value:cb4330962fed0b4742811f80b72f1436f8a12c0c9b662b73bcc48e576280abe5
+value:4794ec33f241b76ca023e1b62c35fe4fd88e11d756106c75945b90a097589a32
+value:f163b650680101f654c4e502deb51b9faf223a67218c760f8b614c6703e3c52b

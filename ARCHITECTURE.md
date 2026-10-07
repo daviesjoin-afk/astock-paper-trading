@@ -3949,3 +3949,112 @@ experiment、runner、owner identities、PIT/result identity 和重建 run key�
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。
 
 本次先同步服务器工作区并修复三个可验证边界：前端缓存版本/运行时镜像一致性、活动页风控审计请求上限，以及风险 outbox 在纸盘已提交后的 adaptive 侧重放收敛。随后新增 `decision_context.py` 集中证据读取、`decision_rules.py` 承载纯规则、`marketdata_transport.py` 承载 HTTP 传输、`marketdata_cache.py` 承载缓存与快照锁、`marketdata_providers.py` 承载东财分页与概念成员适配及腾讯/新浪实时与 K 线响应解析、`marketdata_normalizers.py` 承载行情标准化、`paper_trading_rules.py` 承载交易日/费用/证券权限规则、`paper_quote_policy.py` 承载行情新鲜度/活跃度/成交核验门禁、`paper_allocation.py` 承载共享池席位与策略预算纯计算、`paper_sizing.py` 承载下单股数纯计算、`paper_storage.py` 隔离 SQLite 连接生命周期、`paper_portfolio.py` 承载持仓 lot 聚合、`paper_archive_projection.py` 承载历史归档订单只读投影、`paper_performance.py` 承载今日盈亏纯计算、`adaptive_genetics.py` 承载 adaptive alpha 纯遗传计算、`adaptive_shadow_risk.py` 承载影子组合风控纯计算、`paper_ledger_reader.py` 为 adaptive 提供只读 paper ledger 端口、`strategy_registry.py` 集中策略身份口径，并以 `paper_repository.py` 建立 ledger 通用仓储薄接口和 dashboard 账户批量投影；本阶段再以 `paper_schema_migrations.py` 集中增量 schema 变更，`db_migrate.py` 提供事务化、可回滚的 v1-v4 迁移入口。兼容导出和回归测试守住现有行为。更大范围的对象级仓储、provider 分层和模块拆分仍按 `docs/PRD-architecture-hardening.md` 分阶段推进。
+
+
+## R36-B2 Candidate Robustness Execution
+
+R36-B1 让候选拥有 canonical 实验主体与真实 R29 PIT 证据；R36-B2 把这些证据接到**既有**
+R30 robustness runner。它不新增 runner、不新增执行循环、不新增 PIT validator，只新增一个
+可复用 policy 与一层候选编排。
+
+```text
+exact R29 READY baseline (candidate subject)
+    ↓
+RobustnessPolicy（执行前 pin 定，同一 search 内所有候选共享）
+    ↓ bind(exact baseline_run_key, baseline_experiment_fingerprint)
+RobustnessPlan
+    ↓ existing R30 robustness_runner（候选路径 candidate-replay-v1）
+canonical R30 report
+    ↓ exact report_key
+robustness queue job completed
+```
+
+五句边界：
+
+```text
+Robustness starts from an exact canonical READY R29 baseline;
+it never reconstructs or guesses a baseline.
+
+A robustness policy is pinned before candidate execution and is
+shared across candidates in the same search.
+
+A candidate robustness report remains evidence about the same
+StrategyCandidate; perturbations do not create or mutate candidates.
+
+A completed robustness job means a canonical R30 report exists.
+It does not mean the candidate passed robustness.
+
+R36-B2 may produce robustness facts.
+Only R36-C may interpret those facts for selection.
+```
+
+**`robustness_contract`** 新增 immutable `RobustnessPolicy`
+（`ROBUSTNESS_POLICY_VERSION = "r30-robustness-policy-v1"`）：字段恰好是既有
+`RobustnessPlan` 的 stress policy 减去 `baseline_run_key` /
+`baseline_experiment_fingerprint` / `created_at`，并提供 canonical `projection()`、
+`fingerprint` 与 `bind(baseline_run_key, baseline_experiment_fingerprint) -> RobustnessPlan`。
+既有 `RobustnessPlan` 的 projection/fingerprint/scenarios **逐字节不变**；policy 只复用
+同一套校验规则，不复制第二套 stress 语义。
+
+**`experiment_search_contract`** 新增 `ExperimentSearchPlanV2`
+（`candidate-experiment-plan-v2`）= v1 全部内容 + `robustness_policy` + 派生的
+`robustness_policy_fingerprint`；v1 `ExperimentSearchPlan` 的 projection/fingerprint 不变。
+新增 `RobustnessSearchJobSpec`（`experiment-search-robustness-job-contract-v1`，stage
+`robustness`），其 job id 对 search_run_id、candidate_id、stage、baseline_run_key、
+baseline_experiment_fingerprint、robustness_plan_fingerprint、job_contract_version 取 hash。
+统一 decoder `search_job_from_projection()` 按 `(stage, job_contract_version)` 分派：
+`pit_validation` v1 → `SearchJobSpec`，`robustness` v1 → `RobustnessSearchJobSpec`，
+其余一律 fail closed。`JOB_STAGES` 现在列出两个 stage，但 `SearchJobSpec` 仍只接受
+`pit_validation`。
+
+**`experiment_search_repository`** 新增 `get_search_job(conn, job_id)` 自证精确读取
+（核对 job_json / job_id / job_fingerprint / search_run_id / candidate_id / stage /
+job_contract_version，任一不符即 `corrupt_search_job`），以及
+`record_verified_robustness_completion_event(...)`，evidence_owner 固定
+`robustness_report`、evidence_id 固定 exact report_key。通用
+`record_job_event(completed)` 继续拒绝。**没有新表、没有 migration。**
+**`experiment_search_service`** 新增通用 `fail_claimed_job(...)`，B1 与 B2 的队列运营
+失败都走它。
+
+**`robustness_runner`** 现在同时支持正式 `StrategyVersion` 与 `StrategyCandidate`。
+正式路径与身份不变（runner/report version `r30-robustness-runner-v1`）；候选路径使用
+`r30-candidate-robustness-runner-v1`，候选 baseline identity 携带 `experiment_subject` +
+`experiment_plan_fingerprint`，**绝不**携带父策略的 strategy_id/version/checksum。
+baseline verifier 拆成 common + formal + candidate 三部分，共享 run-key / experiment /
+result / owner / revision 校验；候选 baseline 必须 READY + result completed、candidate
+subject 精确匹配、run_key 经 `ExperimentValidationRepository.build_run_key` 重建。
+候选 universe = owner 历史 universe 再 `candidate_replay.filter_candidate_members()`，
+universe stress 从**已过滤集合**中 drop（绝不先全市场 drop 再 filter）。候选回放始终走
+`candidate-replay-v1`；baseline replay 必须与 R29 metrics bit-identical，否则
+`baseline_replay_not_bit_identical`。cost/slippage/delay/liquidity 复用既有 execution
+stress loop。parameter stress 只经**唯一** mutation authority
+`strategy_parameter_schema.apply_parameter_stress(...)`（正式与候选同一条），绝不创建或
+修改 candidate。date-range stress 在携带 `robustness_scenario_fingerprint`、保留
+`experiment_plan_fingerprint` lineage 的派生 spec 上重跑 R29 PIT（`R29.run_validation`）；
+candidate as-of 不可被越过（`candidate_asof_leakage` → scenario unavailable、无 metrics）。
+scenario `unavailable` / case `failed` 仍产生 canonical report，因此对应队列 job 运营上
+仍 `completed`。
+
+**`candidate_robustness_service`** 是本阶段**唯一**新增生产模块，只有四个函数：
+`declare_candidate_robustness_jobs`、`prepare_candidate_robustness`、
+`run_candidate_robustness`、`complete_candidate_robustness_job`。declare 要求：search run
+自证、plan-v2、policy fingerprint 自证、所有 PIT job 终态（completed/cancelled，否则
+`pit_stage_not_terminal`）、对每个 completed PIT job 用
+`ExperimentValidationRepository.get_run(run_key=...)` 重读 exact `evidence_id` run_key；
+只有 `subject_kind=strategy_candidate`、candidate_id 精确匹配、`validation_status=ready`、
+`result.status=completed` 才得到 job；`policy.bind` 精确 baseline 得到 `RobustnessPlan`；
+N jobs + N queued events 原子追加（all-or-nothing）；同身份幂等，同
+(search, candidate, stage) 但不同 baseline/plan 硬冲突。**任何地方都没有 latest/recent
+查找。** completion 重读 exact report key、重读 exact R29 baseline key，从 search plan-v2
+policy 重建 expected `RobustnessPlan`，要求 expected == job == report plan fingerprints，
+并在追加 completed 事件前重读 R29 subject/experiment/result 身份。落库后崩溃用 exact
+report_key 再次调用 completion 即可补写，**不重跑 R30**；幂等，不同证据 →
+`completion_evidence_conflict`。fake / 其它候选 / 其它 search / 其它 baseline / 其它
+policy 的 report 都不能完成 job。
+
+边界：本阶段**没有**前端、**没有**新 HTTP API、**没有** selection/ranking/promotion/AI；
+**没有**新永久表、**没有** migration、**没有**重复 runner / 重复 execution loop / 重复
+PIT validator。**队列 job completed 绝不等于 passed / good / promotable** —— 它只说明一份
+canonical R30 report 已存在。R36-C / R36-D / R37 尚未开始。
+
+阶段状态：R36-B2 **IN REVIEW**；R36-C/R36-D/R37 **NOT STARTED**。
