@@ -3,15 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from bisect import bisect_left, bisect_right
 from dataclasses import replace
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 try:
+    import candidate_experiment as CE
     import experiment_contract as EC
     import experiment_execution_model as EM
+    import experiment_pit_validation as PV
     import experiment_validation_runner as R29
     import historical_market_archive as HMA
     import historical_session_calendar as HSC
@@ -19,11 +20,14 @@ try:
     import robustness_contract as RC
     import robustness_regimes as RR
     import strategy_dsl_schema as DSL
+    import strategy_parameter_schema as SPS
     import strategy_registry as SR
     import tradability_archive as TA
 except ImportError:  # pragma: no cover
+    from . import candidate_experiment as CE
     from . import experiment_contract as EC
     from . import experiment_execution_model as EM
+    from . import experiment_pit_validation as PV
     from . import experiment_validation_runner as R29
     from . import historical_market_archive as HMA
     from . import historical_session_calendar as HSC
@@ -31,11 +35,14 @@ except ImportError:  # pragma: no cover
     from . import robustness_contract as RC
     from . import robustness_regimes as RR
     from . import strategy_dsl_schema as DSL
+    from . import strategy_parameter_schema as SPS
     from . import strategy_registry as SR
     from . import tradability_archive as TA
 
 RUNNER_VERSION = RC.REPORT_VERSION
+CANDIDATE_RUNNER_VERSION = "r30-candidate-robustness-runner-v1"
 R29_RUNNER_VERSION = R29.RUNNER_VERSION
+R29_CANDIDATE_RUNNER_VERSION = R29.CANDIDATE_RUNNER_VERSION
 TRANSFORM_VERSION = "r30-deterministic-derived-view-v1"
 _METRIC_KEYS = ("return", "drawdown", "volatility", "turnover", "trade_count",
                 "cost", "exposure", "capacity_proxy", "data_coverage")
@@ -54,15 +61,15 @@ def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
-def _verify_baseline(run: Mapping[str, Any], spec: EC.ExperimentSpec,
-                     plan: RC.RobustnessPlan, strategy: SR.StrategyVersion) -> dict[str, Any]:
+def _verify_common_baseline(run: Mapping[str, Any], spec, plan: RC.RobustnessPlan):
+    """Subject-independent baseline proof shared by formal and candidate paths."""
     if not isinstance(run, Mapping) or not run:
         raise RobustnessBaselineError("canonical_baseline_run_not_found")
     if run.get("run_key") != plan.baseline_run_key:
         raise RobustnessBaselineError("baseline_run_identity_mismatch")
     if run.get("validation_status") != "ready":
         raise RobustnessBaselineError("baseline_validation_not_ready")
-    if run.get("runner_version") != R29_RUNNER_VERSION:
+    if run.get("runner_version") not in (R29_RUNNER_VERSION, R29_CANDIDATE_RUNNER_VERSION):
         raise RobustnessBaselineError("baseline_runner_version_unknown")
     if run.get("runner_code_revision") != spec.code_revision:
         raise RobustnessBaselineError("baseline_code_revision_mismatch")
@@ -70,13 +77,6 @@ def _verify_baseline(run: Mapping[str, Any], spec: EC.ExperimentSpec,
         raise RobustnessBaselineError("baseline_experiment_fingerprint_mismatch")
     if plan.baseline_experiment_fingerprint != spec.fingerprint:
         raise RobustnessBaselineError("plan_baseline_experiment_mismatch")
-    if (run.get("strategy_id") != strategy.strategy_id
-            or run.get("strategy_version") != strategy.version
-            or run.get("strategy_checksum") != strategy.checksum
-            or spec.strategy.strategy_id != strategy.strategy_id
-            or spec.strategy.version != strategy.version
-            or spec.strategy.checksum != strategy.checksum):
-        raise RobustnessBaselineError("baseline_strategy_identity_mismatch")
     result = run.get("result")
     if not isinstance(result, Mapping) or result.get("status") != "completed":
         raise RobustnessBaselineError("baseline_result_not_completed")
@@ -123,6 +123,23 @@ def _verify_baseline(run: Mapping[str, Any], spec: EC.ExperimentSpec,
             or validation_evidence.get("status") != "ready"
             or validation_evidence.get("experiment_fingerprint") != spec.fingerprint):
         raise RobustnessBaselineError("baseline_validation_evidence_missing")
+    return canonical_result, validation_evidence
+
+
+def _verify_formal_baseline(run: Mapping[str, Any], spec: EC.ExperimentSpec,
+                            plan: RC.RobustnessPlan,
+                            strategy: SR.StrategyVersion) -> dict[str, Any]:
+    """Formal StrategyVersion path. Returned baseline_identity shape is frozen."""
+    canonical_result, validation_evidence = _verify_common_baseline(run, spec, plan)
+    if run.get("runner_version") != R29_RUNNER_VERSION:
+        raise RobustnessBaselineError("baseline_runner_version_unknown")
+    if (run.get("strategy_id") != strategy.strategy_id
+            or run.get("strategy_version") != strategy.version
+            or run.get("strategy_checksum") != strategy.checksum
+            or spec.strategy.strategy_id != strategy.strategy_id
+            or spec.strategy.version != strategy.version
+            or spec.strategy.checksum != strategy.checksum):
+        raise RobustnessBaselineError("baseline_strategy_identity_mismatch")
     owner_projection = {
         "calendar_fingerprint": run["calendar_fingerprint"],
         "universe_archive_fingerprint": run["universe_archive_fingerprint"],
@@ -149,6 +166,65 @@ def _verify_baseline(run: Mapping[str, Any], spec: EC.ExperimentSpec,
             "financial_archive_fingerprint", "tradability_evidence_fingerprint",
             "market_archive_fingerprint", "dataset_fingerprint")},
     }
+
+
+def _verify_candidate_baseline(run: Mapping[str, Any], spec: EC.CandidateExperimentSpec,
+                               plan: RC.RobustnessPlan,
+                               candidate_replay: CE.CandidateReplayDefinition) -> dict[str, Any]:
+    """Candidate StrategyCandidate path: the parent StrategyVersion must not masquerade."""
+    canonical_result, validation_evidence = _verify_common_baseline(run, spec, plan)
+    if run.get("runner_version") != R29_CANDIDATE_RUNNER_VERSION:
+        raise RobustnessBaselineError("baseline_runner_version_unknown")
+    if run.get("subject_kind") != "strategy_candidate":
+        raise RobustnessBaselineError("baseline_subject_kind_mismatch")
+    subject = candidate_replay.subject
+    if run.get("candidate_id") != subject.candidate_id:
+        raise RobustnessBaselineError("baseline_candidate_identity_mismatch")
+    if run.get("subject") != subject.projection():
+        raise RobustnessBaselineError("baseline_candidate_identity_mismatch")
+    if any(run.get(name) is not None for name in
+           ("strategy_id", "strategy_version", "strategy_checksum")):
+        raise RobustnessBaselineError("baseline_candidate_masquerades_as_strategy_version")
+    parent = subject.parent_strategy
+    if (run.get("parent_strategy_id") != parent.strategy_id
+            or run.get("parent_strategy_version") != parent.version
+            or run.get("parent_strategy_checksum") != parent.checksum):
+        raise RobustnessBaselineError("baseline_parent_identity_mismatch")
+    if run.get("experiment_plan_fingerprint") != spec.parameter_set.get("experiment_plan_fingerprint"):
+        raise RobustnessBaselineError("baseline_experiment_plan_mismatch")
+    owner_projection = {
+        "calendar_fingerprint": run["calendar_fingerprint"],
+        "universe_archive_fingerprint": run["universe_archive_fingerprint"],
+        "tradability_evidence_fingerprint": run["tradability_evidence_fingerprint"],
+        "market_archive_fingerprint": run["market_archive_fingerprint"],
+        "financial_archive_fingerprint": run.get("financial_archive_fingerprint"),
+        "dataset_fingerprint": run["dataset_fingerprint"],
+        "experiment_subject": run["subject"],
+        "experiment_plan_fingerprint": run["experiment_plan_fingerprint"],
+        "validation_evidence_fingerprint": _sha(validation_evidence),
+    }
+    expected_run_key = R29.EVR.ExperimentValidationRepository.build_run_key(
+        spec.fingerprint, owner_projection, R29_CANDIDATE_RUNNER_VERSION)
+    if expected_run_key != run.get("run_key"):
+        raise RobustnessBaselineError("baseline_run_key_mismatch")
+    return {
+        "run_key": run["run_key"], "experiment_fingerprint": spec.fingerprint,
+        "result_fingerprint": canonical_result.result_fingerprint,
+        "runner_version": run["runner_version"],
+        "code_revision": run["runner_code_revision"],
+        "experiment_subject": run["subject"],
+        "experiment_plan_fingerprint": run["experiment_plan_fingerprint"],
+        **{name: run.get(name) for name in (
+            "calendar_fingerprint", "universe_archive_fingerprint",
+            "financial_archive_fingerprint", "tradability_evidence_fingerprint",
+            "market_archive_fingerprint", "dataset_fingerprint")},
+    }
+
+
+def _verify_baseline(run: Mapping[str, Any], spec: EC.ExperimentSpec,
+                     plan: RC.RobustnessPlan, strategy: SR.StrategyVersion) -> dict[str, Any]:
+    """Backward-compatible formal entry point used by the existing R30 callers."""
+    return _verify_formal_baseline(run, spec, plan, strategy)
 
 
 def _deterministic_fraction(seed: int, *parts: str) -> float:
@@ -181,32 +257,8 @@ def _metric_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _apply_parameter_stress(ast: Mapping[str, Any], parameters: Mapping[str, Any]) -> dict[str, Any]:
-    result = json.loads(_canonical(ast))
-    path = parameters["path"]
-    parameter_id = path.removeprefix("strategy_parameters.")
-    matches = []
-    def walk(node):
-        if isinstance(node, dict):
-            if node.get("op") == "parameter" and node.get("parameter_id") == parameter_id:
-                matches.append(node)
-            for child in node.values():
-                walk(child)
-        elif isinstance(node, list):
-            for child in node:
-                walk(child)
-    walk(result)
-    if len(matches) != 1:
-        raise ValueError("strategy_parameter_path_unavailable")
-    node = matches[0]
-    value = node["value"]
-    delta = parameters["value"]
-    stressed = value + delta if parameters["operation"] == "delta" else value * delta
-    if (isinstance(stressed, bool) or not isinstance(stressed, (int, float))
-            or not math.isfinite(float(stressed)) or not node["min"] <= stressed <= node["max"]
-            or node["type"] == "integer" and int(stressed) != stressed):
-        raise ValueError("strategy_parameter_stress_out_of_bounds")
-    node["value"] = int(stressed) if node["type"] == "integer" else stressed
-    return DSL.normalize(result)
+    """Delegate to the single shared parameter-mutation authority."""
+    return SPS.apply_parameter_stress(ast, parameters)
 
 
 def _scenario_sessions(scenario: Mapping[str, Any], spec: EC.ExperimentSpec,
@@ -234,16 +286,25 @@ def _baseline_session_bounds(spec: EC.ExperimentSpec,
     return start, end
 
 
-def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.ExperimentSpec,
+def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec,
                                baseline_identity: Mapping[str, Any],
                                market_archive_repository: HMA.HistoricalMarketArchiveRepository,
                                universe_archive_repository: HUA.HistoricalUniverseArchiveRepository,
                                tradability_repository: TA.TradabilityArchiveRepository,
-                               strategy_version: SR.StrategyVersion,
+                               strategy_version: SR.StrategyVersion | None = None,
+                               candidate_replay: CE.CandidateReplayDefinition | None = None,
                                validation_context: Mapping[str, Any] | None,
-                               replay_capture: Mapping[str, Any]) -> dict[str, Any]:
+                               replay_capture: Mapping[str, Any],
+                               scenario_fingerprint: str | None = None) -> dict[str, Any]:
+    """Re-run R29 PIT validation for a date-stressed range.
+
+    Date stress may introduce future data, a different universe, tradability or WFV
+    maturity, so it must never skip PIT revalidation. Candidate path calls R29 with
+    the exact candidate subject (never the parent StrategyVersion).
+    """
+    candidate_path = candidate_replay is not None
     if not isinstance(validation_context, Mapping):
-                raise ValueError("date_range_pit_context_missing")
+        raise ValueError("date_range_pit_context_missing")
     config = validation_context.get("walk_forward_config")
     manifest = validation_context.get("dataset_manifest")
     samples = validation_context.get("samples")
@@ -255,28 +316,58 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
         start=sessions[0], end=sessions[-1])
     ranged_members = R29._universe_rows(
         universe_archive_repository, spec.universe_fingerprint, sessions)
+    if candidate_path:
+        try:
+            ranged_members = CE.filter_candidate_members(
+                candidate_replay, ranged_members, spec.universe_fingerprint)
+        except CE.CandidateUniverseUnavailable as exc:
+            raise ValueError(str(exc)) from exc
     ranged_capture = R29.PV.tradability_replay_projection(
         ranged_members, sessions, tradability_repository, captured=replay_capture)
     if not ranged_capture["capture_complete"]:
         raise ValueError("date_range_tradability_snapshot_unavailable")
     ranged_tradability_fingerprint = ranged_capture["fingerprint"]
-    ranged_spec = replace(spec, start_date=sessions[0], end_date=sessions[-1],
+    common = dict(
+        start_date=sessions[0], end_date=sessions[-1],
         tradability_fingerprint=ranged_tradability_fingerprint,
         parameter_set={**spec.parameter_set,
                        "validation_calendar_fingerprint": exact_calendar.calendar_fingerprint})
-    proof = R29.run_validation(
-        ranged_spec, runner_code_revision=ranged_spec.code_revision,
-        strategy_version=strategy_version, dataset_manifest=manifest, samples=samples,
-        walk_forward_config=config, session_calendar=exact_calendar,
-        market_archive_repository=market_archive_repository,
-        market_archive_fingerprint=ranged_spec.market_data_fingerprint,
-        universe_archive_repository=universe_archive_repository,
-        universe_archive_fingerprint=ranged_spec.universe_fingerprint,
-        tradability_repository=tradability_repository,
-        tradability_replay_capture=replay_capture,
-        financial_feature_repository=validation_context.get("financial_feature_repository"),
-        financial_archive_fingerprint=baseline_identity.get("financial_archive_fingerprint"),
-    )
+    if candidate_path:
+        derived_spec = replace(spec, robustness_scenario_fingerprint=scenario_fingerprint,
+                               **{key: value for key, value in common.items()
+                                  if key != "parameter_set"},
+                               parameter_set={**common["parameter_set"],
+                                              "robustness_scenario_fingerprint": scenario_fingerprint})
+        proof = R29.run_validation(
+            derived_spec, runner_code_revision=derived_spec.code_revision,
+            strategy_candidate=candidate_replay.candidate, dataset_manifest=manifest,
+            samples=samples, walk_forward_config=config, session_calendar=exact_calendar,
+            market_archive_repository=market_archive_repository,
+            market_archive_fingerprint=derived_spec.market_data_fingerprint,
+            universe_archive_repository=universe_archive_repository,
+            universe_archive_fingerprint=derived_spec.universe_fingerprint,
+            tradability_repository=tradability_repository,
+            tradability_replay_capture=ranged_capture,
+            financial_feature_repository=validation_context.get("financial_feature_repository"),
+            financial_archive_fingerprint=baseline_identity.get("financial_archive_fingerprint"),
+        )
+        expected_experiment_fingerprint = derived_spec.fingerprint
+    else:
+        ranged_spec = replace(spec, **common)
+        proof = R29.run_validation(
+            ranged_spec, runner_code_revision=ranged_spec.code_revision,
+            strategy_version=strategy_version, dataset_manifest=manifest, samples=samples,
+            walk_forward_config=config, session_calendar=exact_calendar,
+            market_archive_repository=market_archive_repository,
+            market_archive_fingerprint=ranged_spec.market_data_fingerprint,
+            universe_archive_repository=universe_archive_repository,
+            universe_archive_fingerprint=ranged_spec.universe_fingerprint,
+            tradability_repository=tradability_repository,
+            tradability_replay_capture=replay_capture,
+            financial_feature_repository=validation_context.get("financial_feature_repository"),
+            financial_archive_fingerprint=baseline_identity.get("financial_archive_fingerprint"),
+        )
+        expected_experiment_fingerprint = ranged_spec.fingerprint
     owner_identities = proof.get("owner_identities") or {}
     if (proof.get("status") != "ready"
             or not isinstance(proof.get("result"), Mapping)
@@ -293,11 +384,11 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
         raise ValueError("date_range_pit_revalidation_unavailable")
     if owner_identities["tradability_evidence_fingerprint"] != ranged_tradability_fingerprint:
         raise ValueError("date_range_tradability_identity_mismatch")
-    return {"experiment_fingerprint": ranged_spec.fingerprint,
+    return {"experiment_fingerprint": expected_experiment_fingerprint,
             "calendar_fingerprint": exact_calendar.calendar_fingerprint,
             "tradability_evidence_fingerprint": ranged_tradability_fingerprint,
             "validation_evidence_fingerprint": proof.get("validation_evidence_fingerprint"),
-            "run_key": proof.get("run_key"), "runner_version": R29_RUNNER_VERSION}
+            "run_key": proof.get("run_key"), "runner_version": proof.get("runner_version")}
 
 
 def _execution_stress(category: str, parameters: Mapping[str, Any], spec: EC.ExperimentSpec):
@@ -339,8 +430,28 @@ def _execution_stress(category: str, parameters: Mapping[str, Any], spec: EC.Exp
     return stress, evidence
 
 
-def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
-                   plan: RC.RobustnessPlan, strategy_version: SR.StrategyVersion,
+def _resolve_subject(*, spec, plan, baseline_run, strategy_version, candidate_replay):
+    """Return (subject_kind, baseline_identity, ast, deps, candidate_path, replay)."""
+    candidate_path = isinstance(spec, EC.CandidateExperimentSpec)
+    if candidate_path:
+        if not isinstance(candidate_replay, CE.CandidateReplayDefinition):
+            raise RobustnessBaselineError("candidate_replay_definition_required")
+        if candidate_replay.subject != spec.subject:
+            raise RobustnessBaselineError("candidate_identity_mismatch")
+        baseline_identity = _verify_candidate_baseline(baseline_run, spec, plan, candidate_replay)
+        dependencies = PV.replay_dsl_dependencies(candidate_replay)
+        return ("strategy_candidate", baseline_identity, None, dependencies, True, candidate_replay)
+    if not isinstance(strategy_version, SR.StrategyVersion):
+        raise RobustnessBaselineError("strategy_identity_mismatch")
+    baseline_identity = _verify_formal_baseline(baseline_run, spec, plan, strategy_version)
+    dependencies = PV.strategy_dsl_dependencies(strategy_version.definition.get("dsl_ast"))
+    return ("strategy_version", baseline_identity, strategy_version, dependencies, False, None)
+
+
+def run_robustness(*, baseline_run: Mapping[str, Any], spec,
+                   plan: RC.RobustnessPlan,
+                   strategy_version: SR.StrategyVersion | None = None,
+                   candidate_replay: CE.CandidateReplayDefinition | None = None,
                    session_calendar: HSC.HistoricalSessionCalendar,
                    market_archive_repository: HMA.HistoricalMarketArchiveRepository,
                    universe_archive_repository: HUA.HistoricalUniverseArchiveRepository,
@@ -350,8 +461,16 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
                    extended_session_calendar: HSC.HistoricalSessionCalendar | None = None,
                    date_range_validation_context: Mapping[str, Any] | None = None,
                    created_at: str | None = None) -> dict[str, Any]:
-    """Run bounded deterministic stress cases against exact canonical R29 inputs."""
-    baseline_identity = _verify_baseline(baseline_run, spec, plan, strategy_version)
+    """Run bounded deterministic stress cases against exact canonical R29 inputs.
+
+    Formal ``StrategyVersion`` and ``StrategyCandidate`` share the same execution loop
+    and evidence contract; only the subject verifier, replay source, universe scope and
+    runner/report version differ.
+    """
+    subject_kind, baseline_identity, strategy_version, dependencies, candidate_path, candidate_replay = (
+        _resolve_subject(spec=spec, plan=plan, baseline_run=baseline_run,
+                         strategy_version=strategy_version, candidate_replay=candidate_replay))
+    runner_version = CANDIDATE_RUNNER_VERSION if candidate_path else RUNNER_VERSION
     if (not isinstance(session_calendar, HSC.HistoricalSessionCalendar)
             or session_calendar.calendar_fingerprint != baseline_identity["calendar_fingerprint"]):
         raise RobustnessBaselineError("baseline_calendar_unavailable")
@@ -374,6 +493,9 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
         raise RobustnessBaselineError("extended_calendar_not_owner_issued")
     sessions = list(coverage_calendar.sessions)
     members = R29._universe_rows(universe_archive_repository, spec.universe_fingerprint, sessions)
+    if candidate_path:
+        # Candidate scope FIRST, then every perturbation (incl. universe stress).
+        members = CE.filter_candidate_members(candidate_replay, members, spec.universe_fingerprint)
     replay_capture = R29.PV.tradability_replay_projection(
         members, sessions, tradability_repository)
     baseline_members = {session: members[session] for session in baseline_sessions}
@@ -394,7 +516,9 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
         symbols=[regime_policy["benchmark_symbol"]])
     regime_labels = RR.classify_sessions(benchmark_bars, sessions, regime_policy)
     execution_facts = replay_capture["execution_facts"]
-    ast = DSL.normalize(strategy_version.definition["dsl_ast"])
+    ast = (None if candidate_path
+           else DSL.normalize(strategy_version.definition["dsl_ast"]))
+    canonical_replay = candidate_replay
     baseline_result = baseline_run["result"]["metrics"]
     baseline_metrics = {key: baseline_result.get(key) for key in _METRIC_KEYS}
     cases = []
@@ -413,6 +537,9 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
             "affected_sessions": [], "affected_symbols": [],
             "masked_observations": 0, "execution_changes": {},
         }
+        if candidate_path:
+            case_evidence["candidate_id"] = spec.subject.candidate_id
+            case_evidence["candidate_replay_fingerprint"] = canonical_replay.replay_fingerprint
         result = None
         try:
             scenario_sessions = _scenario_sessions(scenario, spec, sessions)
@@ -431,19 +558,33 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
                     universe_archive_repository=universe_archive_repository,
                     tradability_repository=tradability_repository,
                     strategy_version=strategy_version,
+                    candidate_replay=canonical_replay if candidate_path else None,
                     validation_context=date_range_validation_context,
-                    replay_capture=replay_capture)
+                    replay_capture=replay_capture,
+                    scenario_fingerprint=scenario["scenario_fingerprint"])
             scenario_members = {session: list(members.get(session, ())) for session in scenario_sessions}
             scenario_bars = [row for row in bars if row["session"] in scenario_sessions]
             expected_bar_count = len(scenario_bars)
             scenario_ast = ast
+            scenario_replay = canonical_replay
             stress, execution_changes = _execution_stress(category, parameters, spec)
             case_evidence["execution_changes"] = execution_changes
             if category == "parameter":
-                scenario_ast = _apply_parameter_stress(ast, parameters)
-                case_evidence["execution_changes"] = {
-                    "path": parameters["path"], "operation": parameters["operation"],
-                    "value": parameters["value"], "derived_ast": scenario_ast}
+                derived_entry = SPS.apply_parameter_stress(
+                    canonical_replay.candidate.entry_spec if candidate_path else ast, parameters)
+                if candidate_path:
+                    scenario_replay = canonical_replay.derive_entry_ast(derived_entry)
+                    case_evidence["execution_changes"] = {
+                        "path": parameters["path"], "operation": parameters["operation"],
+                        "value": parameters["value"], "derived_ast": derived_entry,
+                        "derived_entry_fingerprint": scenario_replay.derived_entry_fingerprint,
+                        "derived_replay_fingerprint": scenario_replay.scenario_replay_fingerprint,
+                        "candidate_replay_fingerprint": canonical_replay.replay_fingerprint}
+                else:
+                    scenario_ast = derived_entry
+                    case_evidence["execution_changes"] = {
+                        "path": parameters["path"], "operation": parameters["operation"],
+                        "value": parameters["value"], "derived_ast": scenario_ast}
             elif category == "data_missingness":
                 fraction = parameters["missing_fraction"]
                 kept = []
@@ -470,8 +611,10 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
                                  for session in scenario_sessions
                                  for row in scenario_members.get(session, ())}
             scenario_facts = {key: execution_facts.get(key) for key in scenario_requests}
+            replay_kwargs = ({"candidate_replay": scenario_replay} if candidate_path
+                             else {"ast": scenario_ast})
             metrics_raw = EM.simulate_with_trace(
-                spec=spec, ast=scenario_ast, sessions=scenario_sessions,
+                spec=spec, **replay_kwargs, sessions=scenario_sessions,
                 members_by_session=scenario_members, bars=scenario_bars,
                 tradability_repository=tradability_repository,
                 tradability_evidence=scenario_facts,
@@ -502,8 +645,7 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
             if (category == "liquidity" and delta.get("capacity_proxy") is not None
                     and delta["capacity_proxy"] < 0):
                 fragilities.add("liquidity_sensitive")
-            case_evidence["regime_breakdown"] = RR.summarize_trace(
-                trace, regime_labels)
+            case_evidence["regime_breakdown"] = RR.summarize_trace(trace, regime_labels)
         except (ValueError, KeyError, TypeError, EM.ExperimentExecutionUnavailable) as exc:
             reason = getattr(exc, "reason", None) or (str(exc) if str(exc).isidentifier()
                                                          else "scenario_inputs_unavailable")
@@ -523,14 +665,15 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
         case_evidence["affected_sessions"] = sorted(set(case_evidence["affected_sessions"]))
         case_evidence["affected_symbols"] = sorted(set(case_evidence["affected_symbols"]))
         cases.append({"scenario": scenario, "evidence": case_evidence, "result": result})
-
     baseline_sessions = list(session_calendar.sessions)
     baseline_members = {session: members[session] for session in baseline_sessions}
     baseline_bars = [row for row in bars if row["session"] in baseline_sessions]
     baseline_facts = {key: fact for key, fact in execution_facts.items()
                        if key[1] in baseline_sessions}
+    baseline_replay_kwargs = ({"candidate_replay": canonical_replay} if candidate_path
+                              else {"ast": ast})
     baseline_trace_result = EM.simulate_with_trace(
-        spec=spec, ast=ast, sessions=baseline_sessions,
+        spec=spec, **baseline_replay_kwargs, sessions=baseline_sessions,
         members_by_session=baseline_members, bars=baseline_bars,
         tradability_repository=tradability_repository,
         tradability_evidence=baseline_facts, financial_features=financial_features,
@@ -570,7 +713,7 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
            for case in cases):
         fragilities.add("parameter_sensitive")
     report_core = {
-        "runner_version": RUNNER_VERSION, "baseline_identity": baseline_identity,
+        "runner_version": runner_version, "baseline_identity": baseline_identity,
         "baseline_spec": spec.projection(), "baseline_run_key": baseline_identity["run_key"],
         "baseline_experiment_fingerprint": spec.fingerprint,
         "baseline_result_fingerprint": baseline_identity["result_fingerprint"],
@@ -587,10 +730,11 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
                           "result": case["result"]} for case in cases]
     fingerprint = RC.report_fingerprint(
         baseline_identity={**baseline_identity, "spec": spec.projection()},
-        plan_fingerprint=plan.fingerprint, cases=fingerprint_cases)
+        plan_fingerprint=plan.fingerprint, cases=fingerprint_cases,
+        report_version=runner_version)
     return {"report_fingerprint": fingerprint,
             "report_key": _sha({"baseline_run_key": baseline_identity["run_key"],
                 "baseline_result_fingerprint": baseline_identity["result_fingerprint"],
-                "plan_fingerprint": plan.fingerprint, "runner_version": RUNNER_VERSION}),
-            "report_version": RC.REPORT_VERSION, **report_core,
+                "plan_fingerprint": plan.fingerprint, "runner_version": runner_version}),
+            "report_version": runner_version, **report_core,
             "created_at": created_at}

@@ -5,7 +5,8 @@ absent exit falls back to inverse entry. Changing these rules requires v2.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field, replace
 from typing import Mapping, Any
 
 import experiment_contract as EC
@@ -20,11 +21,28 @@ class CandidateUniverseUnavailable(ValueError):
     """A declared candidate universe cannot be applied to this historical owner."""
 
 
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _freeze(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateReplayDefinition:
     # Only a verified candidate is accepted. There is no caller-supplied AST field.
     candidate: SC.StrategyCandidate
     replay_contract_version: str = CANDIDATE_REPLAY_CONTRACT_VERSION
+    #: Robustness-only derived entry override. ``None`` keeps the canonical candidate
+    #: replay identity byte-for-byte; a derived override never changes the candidate
+    #: or the candidate's canonical replay fingerprint.
+    entry_ast_override: Mapping | None = field(default=None, compare=False)
 
     def __post_init__(self):
         if self.replay_contract_version != CANDIDATE_REPLAY_CONTRACT_VERSION:
@@ -39,6 +57,10 @@ class CandidateReplayDefinition:
         object.__setattr__(self, "candidate", candidate)
 
     def projection(self):
+        """Canonical replay projection. A robustness-derived entry override is NOT
+        part of the candidate replay identity: it is recorded separately in the
+        scenario evidence as ``derived_entry_fingerprint`` / ``scenario_replay_fingerprint``.
+        """
         candidate = self.candidate.projection()
         return {"candidate_id": candidate["candidate_id"],
                 "candidate_schema_version": candidate["candidate_schema_version"],
@@ -59,9 +81,28 @@ class CandidateReplayDefinition:
             EC.StrategyIdentity(c.parent_strategy_id, c.parent_strategy_version, c.parent_strategy_checksum),
             self.replay_contract_version, self.replay_fingerprint)
 
+    @property
+    def effective_entry_ast(self) -> Mapping:
+        """The entry AST actually evaluated: the canonical one unless derived."""
+        return self.entry_ast_override if self.entry_ast_override is not None else self.candidate.entry_spec
+
+    @property
+    def derived_entry_fingerprint(self) -> str:
+        return EC._digest(self.effective_entry_ast)
+
+    @property
+    def scenario_replay_fingerprint(self) -> str:
+        """Fingerprint of the exact replay a robustness scenario actually runs."""
+        return EC._digest({"candidate_replay_fingerprint": self.replay_fingerprint,
+                           "entry_ast": self.effective_entry_ast})
+
+    def derive_entry_ast(self, entry_ast: Mapping) -> "CandidateReplayDefinition":
+        """Return a derived replay that keeps the same candidate and factor/exit."""
+        return replace(self, entry_ast_override=_freeze(entry_ast))
+
     def signals(self, snapshot: Mapping[str, Any]) -> tuple[bool, bool]:
         p = self.projection()
-        entry = EVAL.evaluate(p["entry_ast"], snapshot)
+        entry = EVAL.evaluate(self.effective_entry_ast, snapshot)
         factor = p["factor_ast"] is None or EVAL.evaluate(p["factor_ast"], snapshot)
         exit_signal = (EVAL.evaluate(p["exit_ast"], snapshot)
                        if p["exit_ast"] is not None else not entry)

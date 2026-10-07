@@ -45,6 +45,7 @@ import experiment_search_contract as ESC
 __all__ = [
     "ExperimentSearchRepositoryError",
     "FORBIDDEN_CONTROLLER_FIELDS",
+    "get_search_job",
     "get_search_run",
     "list_job_events",
     "list_run_events",
@@ -53,6 +54,7 @@ __all__ = [
     "record_job",
     "record_job_event",
     "record_search_run",
+    "record_verified_robustness_completion_event",
 ]
 
 #: 三张表都不允许出现的实验指标 / 结论字段。写入前逐层检查，出现即拒绝：
@@ -147,10 +149,11 @@ def record_search_run(conn: sqlite3.Connection, *, spec: ESC.ExperimentSearchSpe
     return run_id
 
 
-def record_job(conn: sqlite3.Connection, *, job: ESC.SearchJobSpec,
+def record_job(conn: sqlite3.Connection, *,
+               job: "ESC.SearchJobSpec | ESC.RobustnessSearchJobSpec",
                created_at: str | None = None) -> str:
-    """Append one immutable job declaration."""
-    if not isinstance(job, ESC.SearchJobSpec):
+    """Append one immutable job declaration (PIT v1 or robustness v1)."""
+    if not isinstance(job, (ESC.SearchJobSpec, ESC.RobustnessSearchJobSpec)):
         raise ExperimentSearchRepositoryError("canonical_search_job_spec_required")
     projection = job.projection()
     _reject_metric_fields(projection, where="search_job")
@@ -193,6 +196,21 @@ def record_verified_completion_event(conn, *, job_id, search_run_id, run_key, cr
     return _append_job_event(conn, job_id=job_id, search_run_id=search_run_id, event_kind="completed",
                              evidence_owner="experiment_validation_run", evidence_id=run_key,
                              created_at=created_at, actor=actor)
+
+
+def record_verified_robustness_completion_event(conn, *, job_id, search_run_id, report_key,
+                                                created_at=None, actor=None):
+    """Trusted R30 persistence primitive; only candidate_robustness_service may call it.
+
+    The service independently re-reads the exact robustness report and the exact R29
+    baseline before this write. The evidence owner is fixed to ``robustness_report`` and
+    the evidence id is the exact ``report_key``; no arbitrary owner can be passed.
+    """
+    if not ESC.is_search_identity(report_key):
+        raise ExperimentSearchRepositoryError("invalid_robustness_report_key")
+    return _append_job_event(conn, job_id=job_id, search_run_id=search_run_id,
+                             event_kind="completed", evidence_owner="robustness_report",
+                             evidence_id=report_key, created_at=created_at, actor=actor)
 
 
 def _append_job_event(conn: sqlite3.Connection, *, job_id: str, search_run_id: str,
@@ -282,6 +300,44 @@ def get_search_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
     }
 
 
+def _decode_job_row(row) -> dict:
+    """Decode one persisted job row through the single canonical job decoder."""
+    try:
+        job = ESC.search_job_from_projection(json.loads(row[6]))
+    except (TypeError, ValueError) as exc:
+        raise ExperimentSearchRepositoryError("corrupt_search_job") from exc
+    if (job.job_id != row[0] or job.job_fingerprint != row[1]
+            or job.search_run_id != row[2] or job.candidate_id != row[3]
+            or job.stage != row[4] or job.job_contract_version != row[5]):
+        raise ExperimentSearchRepositoryError("corrupt_search_job")
+    return {
+        "job_id": row[0],
+        "job_fingerprint": row[1],
+        "search_run_id": row[2],
+        "candidate_id": row[3],
+        "stage": row[4],
+        "job_contract_version": row[5],
+        "job": job.projection(),
+        "created_at": row[7],
+    }
+
+
+def get_search_job(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    """Read exactly one job by id and self-verify every persisted identity column.
+
+    Never selects "the latest job". Any mismatch between the stored JSON, the job id,
+    the job fingerprint, the search run, candidate, stage or contract version is a
+    ``corrupt_search_job`` rejection.
+    """
+    row = conn.execute(
+        "SELECT job_id,job_fingerprint,search_run_id,candidate_id,stage,"
+        "job_contract_version,job_json,created_at"
+        " FROM experiment_search_jobs WHERE job_id=?", (str(job_id or ""),)).fetchone()
+    if row is None:
+        return None
+    return _decode_job_row(row)
+
+
 def list_search_jobs(conn: sqlite3.Connection, run_id: str) -> tuple[dict, ...]:
     """List the immutable job declarations of one search run, in canonical order."""
     rows = conn.execute(
@@ -289,16 +345,7 @@ def list_search_jobs(conn: sqlite3.Connection, run_id: str) -> tuple[dict, ...]:
         "job_contract_version,job_json,created_at"
         " FROM experiment_search_jobs WHERE search_run_id=?"
         " ORDER BY candidate_id ASC, stage ASC", (str(run_id or ""),)).fetchall()
-    return tuple({
-        "job_id": row[0],
-        "job_fingerprint": row[1],
-        "search_run_id": row[2],
-        "candidate_id": row[3],
-        "stage": row[4],
-        "job_contract_version": row[5],
-        "job": json.loads(row[6]),
-        "created_at": row[7],
-    } for row in rows)
+    return tuple(_decode_job_row(row) for row in rows)
 
 
 def list_job_events(conn: sqlite3.Connection, job_id: str) -> tuple[dict, ...]:

@@ -191,6 +191,87 @@ class RobustnessPlan:
         return result
 
 
+
+ROBUSTNESS_POLICY_VERSION = "r30-robustness-policy-v1"
+_POLICY_FIELDS = ("random_seed", "regime_policy", "allowed_parameter_paths",
+                  "max_drawdown_limit", "max_return_degradation", *_PLAN_LISTS)
+
+
+class RobustnessPolicy:
+    """Reusable immutable stress policy; ``bind`` pins one exact R29 baseline.
+
+    It holds exactly the stress policy of :class:`RobustnessPlan` minus the baseline
+    identity and creation metadata, so one search can share a single policy across
+    candidates while every candidate still binds its own exact baseline.
+    """
+
+    __slots__ = ("policy_version", *_POLICY_FIELDS)
+
+    def __setattr__(self, _name, _value):
+        raise AttributeError("RobustnessPolicy is immutable")
+
+    def __init__(self, *, random_seed: int, regime_policy: Mapping[str, Any],
+                 cost_stresses=(), slippage_stresses=(), execution_delay_stresses=(),
+                 signal_delay_stresses=(), liquidity_stresses=(), missing_data_stresses=(),
+                 parameter_stresses=(), start_date_stresses=(), end_date_stresses=(),
+                 universe_stresses=(), policy_version: str = ROBUSTNESS_POLICY_VERSION,
+                 allowed_parameter_paths=(), max_drawdown_limit=None,
+                 max_return_degradation=None):
+        if policy_version != ROBUSTNESS_POLICY_VERSION:
+            raise ValueError("unsupported_robustness_policy_version")
+        # Reuse the existing canonical plan validation instead of a second rule set.
+        probe = RobustnessPlan(
+            baseline_run_key="0" * 64, baseline_experiment_fingerprint="0" * 64,
+            random_seed=random_seed, regime_policy=regime_policy,
+            cost_stresses=cost_stresses, slippage_stresses=slippage_stresses,
+            execution_delay_stresses=execution_delay_stresses,
+            signal_delay_stresses=signal_delay_stresses, liquidity_stresses=liquidity_stresses,
+            missing_data_stresses=missing_data_stresses, parameter_stresses=parameter_stresses,
+            start_date_stresses=start_date_stresses, end_date_stresses=end_date_stresses,
+            universe_stresses=universe_stresses, allowed_parameter_paths=allowed_parameter_paths,
+            max_drawdown_limit=max_drawdown_limit,
+            max_return_degradation=max_return_degradation)
+        object.__setattr__(self, "policy_version", policy_version)
+        for name in _POLICY_FIELDS:
+            object.__setattr__(self, name, getattr(probe, name))
+
+    def projection(self) -> dict[str, Any]:
+        value = {"policy_version": self.policy_version,
+                 "random_seed": self.random_seed,
+                 "regime_policy": _thaw(self.regime_policy),
+                 "allowed_parameter_paths": list(self.allowed_parameter_paths),
+                 "max_drawdown_limit": self.max_drawdown_limit,
+                 "max_return_degradation": self.max_return_degradation}
+        value.update({name: _thaw(getattr(self, name)) for name in _PLAN_LISTS})
+        return value
+
+    @property
+    def fingerprint(self) -> str:
+        return _sha(self.projection())
+
+    def bind(self, baseline_run_key: str,
+             baseline_experiment_fingerprint: str) -> RobustnessPlan:
+        """Bind one exact baseline identity; the plan keeps the existing authority."""
+        return RobustnessPlan(
+            baseline_run_key=baseline_run_key,
+            baseline_experiment_fingerprint=baseline_experiment_fingerprint,
+            random_seed=self.random_seed,
+            regime_policy=_thaw(self.regime_policy),
+            cost_stresses=[_thaw(item) for item in self.cost_stresses],
+            slippage_stresses=[_thaw(item) for item in self.slippage_stresses],
+            execution_delay_stresses=[_thaw(item) for item in self.execution_delay_stresses],
+            signal_delay_stresses=[_thaw(item) for item in self.signal_delay_stresses],
+            liquidity_stresses=[_thaw(item) for item in self.liquidity_stresses],
+            missing_data_stresses=[_thaw(item) for item in self.missing_data_stresses],
+            parameter_stresses=[_thaw(item) for item in self.parameter_stresses],
+            start_date_stresses=[_thaw(item) for item in self.start_date_stresses],
+            end_date_stresses=[_thaw(item) for item in self.end_date_stresses],
+            universe_stresses=[_thaw(item) for item in self.universe_stresses],
+            allowed_parameter_paths=self.allowed_parameter_paths,
+            max_drawdown_limit=self.max_drawdown_limit,
+            max_return_degradation=self.max_return_degradation)
+
+
 def getattr_value(values: Mapping[str, Any], name: str) -> Any:
     return values[name]
 

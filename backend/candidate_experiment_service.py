@@ -1,8 +1,6 @@
 """Exact candidate PIT orchestration; R29 remains the sole evaluation authority."""
 from __future__ import annotations
 
-import json
-
 import candidate_experiment as CE
 import experiment_contract as EC
 import experiment_search_contract as ESC
@@ -22,15 +20,17 @@ class CandidateExperimentUnavailable(ValueError):
 
 
 def _job_inputs(conn, job_id):
-    row = conn.execute("SELECT search_run_id,candidate_id,stage,job_contract_version,job_fingerprint,job_json"
-                       " FROM experiment_search_jobs WHERE job_id=?", (job_id,)).fetchone()
-    if row is None:
+    try:
+        job = ESR.get_search_job(conn, job_id)
+    except ESR.ExperimentSearchRepositoryError as exc:
+        raise CandidateExperimentUnavailable("corrupt_search_job") from exc
+    if job is None:
         raise CandidateExperimentUnavailable("search_job_not_found")
-    job = ESC.SearchJobSpec(row[0], row[1], row[2], row[3])
-    if (job.job_id != job_id or row[4] != job.job_fingerprint
-            or json.loads(row[5]) != job.projection() or job.stage != ESC.JOB_STAGE_PIT_VALIDATION
-            or job.job_contract_version != ESC.SEARCH_JOB_CONTRACT_VERSION):
+    if (not isinstance(job["job"], dict) or job["stage"] != ESC.JOB_STAGE_PIT_VALIDATION
+            or job["job_contract_version"] != ESC.SEARCH_JOB_CONTRACT_VERSION):
         raise CandidateExperimentUnavailable("corrupt_search_job")
+    job = ESC.SearchJobSpec(job["search_run_id"], job["candidate_id"],
+                            job["stage"], job["job_contract_version"])
     run = ESR.get_search_run(conn, job.search_run_id)
     if run is None:
         raise CandidateExperimentUnavailable("search_run_not_found")
@@ -129,16 +129,9 @@ def complete_candidate_pit_job(conn, *, job_id, run_key, validation_repository,
 
 
 def _fail_job(conn, *, job_id, reason, created_at, actor):
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        events = ESR.list_job_events(conn, job_id)
-        if events and events[-1]["event_kind"] == "claimed":
-            ESS.record_job_event(conn, job_id=job_id, event_kind="failed", actor=actor,
-                                 reason=reason, created_at=created_at)
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
+    # B1 and B2 share one generic queue-failure authority in experiment_search_service.
+    ESS.fail_claimed_job(conn, job_id=job_id, reason=reason,
+                         created_at=created_at, actor=actor)
 
 
 def run_candidate_pit_validation(conn, *, job_id, validation_repository, session_calendar,

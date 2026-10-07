@@ -1,0 +1,7 @@
+{
+  "note": "R36-B2 formal R30 identity frozen at exact base 5ed22af508abd6fce44fb29890eca2ae1f948d15. These are public synthetic regression digests, not credentials.",
+  "plan_fingerprint": "cb4330962fed0b4742811f80b72f1436f8a12c0c9b662b73bcc48e576280abe5",
+  "report_fingerprint": "4794ec33f241b76ca023e1b62c35fe4fd88e11d756106c75945b90a097589a32",
+  "report_key": "f163b650680101f654c4e502deb51b9faf223a67218c760f8b614c6703e3c52b",
+  "report_version": "r30-robustness-runner-v1"
+}

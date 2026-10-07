@@ -49,7 +49,9 @@ class StrategyLifecyclePromotionRegressions(unittest.TestCase):
         import experiment_validation_repository as EVR
         import experiment_validation_runner as R29
 
-        experiment_fp = "f" * 64
+        # A canonical R30 baseline spec must hash to the declared experiment fingerprint.
+        baseline_spec = {"experiment_fingerprint": "f" * 64, "canonical": "r31-fixture"}
+        experiment_fp = EC._digest(baseline_spec)
         result_fields = {"experiment_fingerprint": experiment_fp, "status": result_status}
         if result_status == "completed":
             result_fields.update(total_return=0.1, max_drawdown=0.02, volatility=0.03,
@@ -120,7 +122,7 @@ class StrategyLifecyclePromotionRegressions(unittest.TestCase):
             "strategy_id": identity["strategy_id"],
             "strategy_version": report_strategy_version or identity["strategy_version"],
             "strategy_checksum": identity["strategy_checksum"]}
-        baseline_spec = {"experiment_fingerprint": experiment_fp}
+        baseline_spec = {"experiment_fingerprint": "f" * 64, "canonical": "r31-fixture"}
         report_fp = RC.report_fingerprint(baseline_identity={**baseline, "spec": baseline_spec},
             plan_fingerprint=plan.fingerprint, cases=[case])
         report_key = RREP._sha({"baseline_run_key": run_key,

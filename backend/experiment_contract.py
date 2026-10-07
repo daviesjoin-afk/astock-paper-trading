@@ -349,20 +349,30 @@ class CandidateExperimentSpec:
     cost_model: Mapping[str, Any]
     random_seed: int
     contract_version: str = CANDIDATE_EXPERIMENT_CONTRACT_VERSION
+    #: Robustness-only: identifies a date-range-stressed derived validation view. It is
+    #: ``None`` for the exact baseline experiment and never replaces experiment plan lineage.
+    robustness_scenario_fingerprint: str | None = None
 
     def __post_init__(self):
         if not isinstance(self.subject, CandidateExperimentSubject):
             raise ValueError("canonical_candidate_subject_required")
         if self.contract_version != CANDIDATE_EXPERIMENT_CONTRACT_VERSION:
             raise ValueError("unsupported_candidate_experiment_contract")
+        if self.robustness_scenario_fingerprint is not None:
+            object.__setattr__(self, "robustness_scenario_fingerprint",
+                               _stable_fingerprint(self.robustness_scenario_fingerprint,
+                                                   name="robustness_scenario_fingerprint"))
         for name, value in _normalize_experiment_environment({
                 name: getattr(self, name) for name in _ENVIRONMENT_FIELDS}).items():
             object.__setattr__(self, name, value)
 
     def projection(self):
         # Share the legacy environment projection without introducing a strategy identity.
-        return {"contract_version": self.contract_version, "subject": self.subject.projection(),
-                **_projection_environment(self)}
+        value = {"contract_version": self.contract_version, "subject": self.subject.projection(),
+                 **_projection_environment(self)}
+        if self.robustness_scenario_fingerprint is not None:
+            value["robustness_scenario_fingerprint"] = self.robustness_scenario_fingerprint
+        return value
 
     @property
     def fingerprint(self):
