@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -240,7 +241,9 @@ def run_validation(
         except EM.ExperimentExecutionUnavailable as exc:
             result = _unavailable(spec, exc.reason)
             run_status = "blocked"
-        except Exception:
+        except Exception as exc:
+            if candidate_path and isinstance(exc, (OSError, sqlite3.Error)):
+                raise  # Infrastructure failure is retryable queue work, not canonical evaluation evidence.
             result = EC.ExperimentResult(status="failed", experiment_fingerprint=spec.fingerprint,
                                          failure_reason="validation_execution_failed")
             run_status = "failed"

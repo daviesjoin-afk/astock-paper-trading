@@ -1005,7 +1005,7 @@ tradability、WFV、R29 ledger；mock 仅用于故障、崩溃与事务边界探
 | CEX-27–28 | 无队列指标、计算期间另一连接可获取写锁、唯一完成调用点、无 R30/AI/网络依赖 |
 | 补充 | 台账 payload 损坏拒绝、另一个候选证据不能绑定、基础设施异常写 failed |
 
-M-CEX1–17 分别破坏 legacy identity、候选内容身份、factor、exit、依赖并集、股票池过滤、asof、
+M-CEX1–18 分别破坏 legacy identity、候选内容身份、factor、exit、依赖并集、股票池过滤、asof、
 风险约束、plan identity、自证、subject 列、真实完成证据、blocked 运营语义、普通 completed 防线、
-跨候选绑定、候选规格拒绝外部普通 AST、股票池排除不能制造策略 exit。每例编译真实 mutant、运行对应 detector、恢复原始字节并核对 SHA256，最后重跑基线。
-要求 detected=17/17，survived=fake=timeout=0。M-SC 继续独立运行，守住 R36-A 的批次自证和并发领取。
+跨候选绑定、候选规格拒绝外部普通 AST、股票池排除不能制造策略 exit、基础设施错误不得制造 canonical failed evidence。每例编译真实 mutant、运行对应 detector、恢复原始字节并核对 SHA256，最后重跑基线。
+要求 detected=18/18，survived=fake=timeout=0。M-SC 继续独立运行，守住 R36-A 的批次自证和并发领取。

@@ -470,6 +470,13 @@ class CandidateExecutionTests(SF._Base):
         self.assertEqual("failed", output["result"]["status"])
         self.assertEqual("completed", ESR.list_job_events(self.queue, self.job_id)[-1]["event_kind"])
 
+    def test_infrastructure_failure_inside_executor_is_not_canonical_completion(self):
+        with mock.patch.object(EM, "simulate", side_effect=OSError("executor storage failure")):
+            with self.assertRaises(OSError):
+                self.execute()
+        self.assertEqual("failed", ESR.list_job_events(self.queue, self.job_id)[-1]["event_kind"])
+        self.assertEqual([], self.validation.recent_runs())
+
     def test_infrastructure_exception_marks_failed(self):
         with mock.patch.object(RUNNER, "run_validation", side_effect=sqlite3.OperationalError("disk failure")):
             with self.assertRaises(sqlite3.OperationalError):
