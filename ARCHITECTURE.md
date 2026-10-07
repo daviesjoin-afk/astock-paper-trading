@@ -3908,6 +3908,7 @@ R36-B1 建立候选到实验的显式桥接。`strategy_candidate` 仍拥有候�
 
 `candidate-replay-v1`：entry 与 factor 同时成立才入场；factor 只限制入场。
 有 exit 时只由显式 exit 决定退出；没有 exit 才采用 inverse-entry。
+成员资格排除只限制新入场，不制造策略退出信号；缺少持仓行情明确阻止回放。
 三个 AST 的依赖在既有 PIT owner 中取并集，缺任何金融字段证据都阻止验证。
 `a_share_all` 使用历史成员；`explicit_symbols` 仅过滤已证明的历史成员，不制造成员。
 `asof_universe_identity` 必须等于 archive identity。没有历史板块分类 owner，

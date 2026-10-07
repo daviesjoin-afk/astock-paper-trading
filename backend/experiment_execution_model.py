@@ -83,8 +83,11 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any] | None = None,
     """Run one deterministic long-only replay; missing facts fail closed."""
     if (ast is None) == (candidate_replay is None):
         raise ExperimentExecutionUnavailable("ambiguous_replay_definition")
+    if isinstance(spec, EC.CandidateExperimentSpec) and candidate_replay is None:
+        raise ExperimentExecutionUnavailable("candidate_replay_definition_required")
     if candidate_replay is not None:
-        if not isinstance(spec, EC.CandidateExperimentSpec) or candidate_replay.subject != spec.subject:
+        if (not isinstance(candidate_replay, CE.CandidateReplayDefinition)
+                or not isinstance(spec, EC.CandidateExperimentSpec) or candidate_replay.subject != spec.subject):
             raise ExperimentExecutionUnavailable("candidate_identity_mismatch")
         members_by_session = CE.filter_candidate_members(candidate_replay, members_by_session, spec.universe_fingerprint)
     stress = stress or {}
@@ -249,10 +252,11 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any] | None = None,
                 }
             if candidate_replay is None:
                 signals[code] = EVAL.evaluate(ast, snapshot) if rows and code in next_members else False
-            elif rows and code in next_members:
+            elif rows:
                 signals[code], exits[code] = candidate_replay.signals(snapshot)
+                signals[code] = signals[code] and code in next_members
             else:
-                signals[code], exits[code] = False, True
+                signals[code], exits[code] = False, False
         for code in sorted(set(positions) | set(signals)):
             sell_signal = exits.get(code, False) if candidate_replay is not None else not signals.get(code, False)
             action = ("sell" if code in positions and sell_signal else

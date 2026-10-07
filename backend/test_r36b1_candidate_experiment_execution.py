@@ -67,7 +67,7 @@ def spec(c=None, p=None):
     return CE.build_candidate_experiment_spec(c, CE.compile_candidate_replay(c), p or plan(), "e" * 64)
 
 
-def simulate(c, *, closes=(10, 10, 10, 10), names=("000001.SH",), portfolio=None):
+def simulate(c, *, closes=(10, 10, 10, 10), names=("000001.SH",), portfolio=None, members=None):
     days = tuple(f"2026-01-0{i + 1}" for i in range(len(closes)))
     p = plan(start_date=days[0], end_date=days[-1],
              cost_model={**XF._spec().cost_model, "slippage_parameters": {"rate": 0}},
@@ -78,7 +78,7 @@ def simulate(c, *, closes=(10, 10, 10, 10), names=("000001.SH",), portfolio=None
              observed_at=day + "T09:00:00+08:00", effective_at=day + "T09:00:00+08:00")
              for day in days for name in names}
     return EM.simulate(spec(c, p), candidate_replay=CE.compile_candidate_replay(c), sessions=days,
-                       members_by_session={day: [{"code": n} for n in names] for day in days},
+                       members_by_session=members if members is not None else {day: [{"code": n} for n in names] for day in days},
                        bars=bars, tradability_repository=None, tradability_evidence=facts, include_trace=True)
 
 
@@ -108,6 +108,9 @@ class CandidateContractTests(unittest.TestCase):
                 CE.compile_candidate_replay(replace(c, **{key: value}))
         with self.assertRaises(TypeError):
             CE.CandidateReplayDefinition(c, ast=rule())
+        with self.assertRaisesRegex(EM.ExperimentExecutionUnavailable, "candidate_replay_definition_required"):
+            EM.simulate(spec(c), ast=rule(threshold=999), sessions=XF.SESSIONS,
+                        members_by_session={}, bars=[], tradability_repository=None)
         with self.assertRaises(ValueError):
             CE.CandidateReplayDefinition(c, replay_contract_version="future")
 
@@ -126,6 +129,12 @@ class CandidateContractTests(unittest.TestCase):
         # Entry remains true, and explicit exit turns true: sell at the next open.
         self.assertEqual(2, simulate(candidate(exit_spec=rule(threshold=15)),
                                      closes=(10, 20, 20))["trade_count"])
+
+    def test_explicit_exit_is_not_replaced_by_universe_exclusion(self):
+        members = {"2026-01-01": [{"code": "000001.SH"}], "2026-01-02": [{"code": "000001.SH"}], "2026-01-03": []}
+        # Missing membership cannot manufacture an exit order; missing held-position marks block replay.
+        with self.assertRaisesRegex(EM.ExperimentExecutionUnavailable, "market_bar_missing_for_open_position"):
+            simulate(candidate(exit_spec=rule(threshold=99)), closes=(10, 10, 10), members=members)
 
     def test_cex08_absent_exit_inverse_entry(self):
         self.assertEqual(2, simulate(candidate(entry_spec=rule(threshold=5)), closes=(10, 1, 1))["trade_count"])
