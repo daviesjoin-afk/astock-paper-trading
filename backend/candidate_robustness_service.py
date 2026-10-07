@@ -100,44 +100,47 @@ def declare_candidate_robustness_jobs(conn, *, search_run_id, validation_reposit
     if not isinstance(validation_repository, EVR.ExperimentValidationRepository):
         raise CandidateRobustnessUnavailable("canonical_validation_repository_required")
     run, spec, plan = _exact_search_plan_v2(conn, search_run_id)
-    # Stage barrier: every PIT job must be terminal (completed/cancelled) first.
-    for job in ESR.list_search_jobs(conn, run["search_run_id"]):
-        if job["stage"] != ESC.JOB_STAGE_PIT_VALIDATION:
-            continue
-        events = ESR.list_job_events(conn, job["job_id"])
-        state = events[-1]["event_kind"] if events else None
-        if not ESC.is_terminal_state(state):
-            raise CandidateRobustnessUnavailable("pit_stage_not_terminal")
-    existing = {}
-    for job in ESR.list_search_jobs(conn, run["search_run_id"]):
-        if job["stage"] == ESC.JOB_STAGE_ROBUSTNESS:
-            existing[job["candidate_id"]] = job
-    completed = _completed_pit_baseline_run_keys(conn, run["search_run_id"])
-    declarations = []
-    for candidate_id in spec.candidate_ids:
-        run_key = completed.get(candidate_id)
-        if run_key is None:
-            continue  # cancelled PIT or no completed evidence: no robustness job.
-        baseline = _exact_ready_candidate_baseline(
-            validation_repository, run_key=run_key, candidate_id=candidate_id, plan=plan)
-        if baseline is None:
-            continue  # R30 prerequisite unavailable (blocked/unavailable/failed): no job.
-        robustness_plan = plan.robustness_policy.bind(
-            baseline["run_key"], baseline["experiment_fingerprint"])
-        job = ESC.RobustnessSearchJobSpec(
-            search_run_id=run["search_run_id"], candidate_id=candidate_id,
-            baseline_run_key=baseline["run_key"],
-            baseline_experiment_fingerprint=baseline["experiment_fingerprint"],
-            robustness_policy_fingerprint=plan.robustness_policy.fingerprint,
-            robustness_plan_fingerprint=robustness_plan.fingerprint)
-        prior = existing.get(candidate_id)
-        if prior is not None:
-            if prior["job_id"] != job.job_id:
-                raise CandidateRobustnessUnavailable("robustness_job_identity_conflict")
-            continue
-        declarations.append(job)
+    # Acquire the write lock BEFORE reading existing jobs so two concurrent
+    # declarations for the same search cannot both observe an empty set and then
+    # collide on the unique (search_run_id, candidate_id, stage) constraint.
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Stage barrier: every PIT job must be terminal (completed/cancelled) first.
+        for job in ESR.list_search_jobs(conn, run["search_run_id"]):
+            if job["stage"] != ESC.JOB_STAGE_PIT_VALIDATION:
+                continue
+            events = ESR.list_job_events(conn, job["job_id"])
+            state = events[-1]["event_kind"] if events else None
+            if not ESC.is_terminal_state(state):
+                raise CandidateRobustnessUnavailable("pit_stage_not_terminal")
+        existing = {}
+        for job in ESR.list_search_jobs(conn, run["search_run_id"]):
+            if job["stage"] == ESC.JOB_STAGE_ROBUSTNESS:
+                existing[job["candidate_id"]] = job
+        completed = _completed_pit_baseline_run_keys(conn, run["search_run_id"])
+        declarations = []
+        for candidate_id in spec.candidate_ids:
+            run_key = completed.get(candidate_id)
+            if run_key is None:
+                continue  # cancelled PIT or no completed evidence: no robustness job.
+            baseline = _exact_ready_candidate_baseline(
+                validation_repository, run_key=run_key, candidate_id=candidate_id, plan=plan)
+            if baseline is None:
+                continue  # R30 prerequisite unavailable (blocked/unavailable/failed): no job.
+            robustness_plan = plan.robustness_policy.bind(
+                baseline["run_key"], baseline["experiment_fingerprint"])
+            job = ESC.RobustnessSearchJobSpec(
+                search_run_id=run["search_run_id"], candidate_id=candidate_id,
+                baseline_run_key=baseline["run_key"],
+                baseline_experiment_fingerprint=baseline["experiment_fingerprint"],
+                robustness_policy_fingerprint=plan.robustness_policy.fingerprint,
+                robustness_plan_fingerprint=robustness_plan.fingerprint)
+            prior = existing.get(candidate_id)
+            if prior is not None:
+                if prior["job_id"] != job.job_id:
+                    raise CandidateRobustnessUnavailable("robustness_job_identity_conflict")
+                continue
+            declarations.append(job)
         for job in declarations:
             ESR.record_job(conn, job=job, created_at=created_at)
             ESR.record_job_event(conn, job_id=job.job_id,
@@ -297,7 +300,7 @@ def complete_candidate_robustness_job(conn, *, job_id, report_key, validation_re
             or baseline_identity.get("result_fingerprint")
                 != report["baseline_result_fingerprint"]):
         raise CandidateRobustnessUnavailable("robustness_report_identity_mismatch")
-    # Re-read exact R29 baseline independently.
+    # Re-read the exact R29 baseline independently.
     baseline = _exact_ready_candidate_baseline(
         validation_repository, run_key=report["baseline_run_key"],
         candidate_id=job.candidate_id, plan=plan)
@@ -308,6 +311,15 @@ def complete_candidate_robustness_job(conn, *, job_id, report_key, validation_re
                 != report["baseline_result_fingerprint"]
             or baseline["run_key"] != report["baseline_run_key"]):
         raise CandidateRobustnessUnavailable("baseline_evidence_identity_mismatch")
+    # The full embedded subject must equal the exact re-read R29 baseline subject;
+    # a producer cannot swap the candidate fingerprint / parent pin / schema / replay
+    # fingerprint and still complete this job.
+    if subject != baseline.get("subject"):
+        raise CandidateRobustnessUnavailable("robustness_report_identity_mismatch")
+    baseline_spec = report["report"].get("baseline_spec")
+    if (not isinstance(baseline_spec, dict)
+            or baseline_spec.get("subject") != baseline.get("subject")):
+        raise CandidateRobustnessUnavailable("robustness_report_identity_mismatch")
     # Re-bind the pinned policy and require all three plan fingerprints to agree.
     expected_plan = plan.robustness_policy.bind(
         baseline["run_key"], baseline["experiment_fingerprint"])

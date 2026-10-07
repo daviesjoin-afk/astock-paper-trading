@@ -1039,9 +1039,10 @@ calendar、tradability、R29 ledger、R30 runner 与 robustness ledger；mock �
 | CRB-29–33 | 复用 `robustness_reports`（无候选新表）；unavailable/failed case 仍 canonical report 且 job completed |
 | CRB-34–36 | 基础设施异常写 failed 可有限重试；报告已落库后崩溃用 exact report_key 补写不重跑 R30；同 key 幂等、不同 key 冲突 |
 | CRB-37–38 | 三张 search 控制表无 robustness 指标列；候选编排模块无 selection/promotion/AI 依赖 |
+| 补充 2 | 并发 declare 幂等（先取写锁再读 existing）；嵌入 candidate subject 必须等于重读 R29 baseline subject |
 | 补充 | 伪造嵌套 baseline_identity / baseline_spec、另一候选报告、另一 policy 报告、损坏 payload 都不能完成 job；`_validate_canonical_identity` 拒绝 baseline_spec 与 baseline experiment fingerprint 不一致的记录 |
 
-M-CRB1–22 分别破坏候选 baseline 冒充正式策略、blocked baseline 拿到 job、policy 移出 search
+M-CRB1–24 分别破坏候选 baseline 冒充正式策略、blocked baseline 拿到 job、policy 移出 search
 identity、运行时替换 pinned policy、移除 stage barrier、job 丢弃 baseline_run_key、移除候选
 universe filter、先全市场 drop 再 filter、忽略 factor/exit、忽略 constraints、caller 注入
 financial、parameter stress 创建候选、date stress 跳过 R29 PIT、date stress 越过 asof、伪造
@@ -1049,4 +1050,4 @@ report 完成 job、其它候选 report 完成 job、scenario unavailable 映射
 失败映射 completed、正式 R30 fingerprint 漂移、旧 plan-v1 收到默认 policy、伪造嵌套 baseline
 provenance、嵌套 baseline identity 与顶层不一致。每例编译真实 mutant、运行对应 detector、
 恢复原始字节并核对 SHA256，最后重跑基线。
-要求 detected=22/22，survived=fake=timeout=0。M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。
+要求 detected=24/24，survived=fake=timeout=0。M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。

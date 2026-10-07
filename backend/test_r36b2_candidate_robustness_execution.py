@@ -170,7 +170,7 @@ class CandidateRobustnessFixture(SF._Base):
         self.queue = sqlite3.connect(self.path, isolation_level=None)
         self.queue.row_factory = sqlite3.Row
         self.addCleanup(self.queue.close)
-        self.owners = sqlite3.connect(":memory:")
+        self.owners = sqlite3.connect(":memory:", check_same_thread=False)
         self.owners.row_factory = sqlite3.Row
         self.addCleanup(self.owners.close)
         self.market = HMA.HistoricalMarketArchiveRepository(self.owners)
@@ -571,6 +571,67 @@ class ExecutionTests(CandidateRobustnessFixture):
         record["report_fingerprint"] = recomputed
         with self.assertRaises(RREP.RobustnessPersistenceError):
             RREP._validate_canonical_identity(record)
+
+    def test_crb12b_concurrent_declaration_is_idempotent(self):
+        # Two concurrent declarations for the same search must not collide on the
+        # unique (search_run_id, candidate_id, stage) constraint.
+        import threading
+        created = self.create_v2()
+        self.run_all_pit(created["search_run_id"])
+        results = []
+        errors = []
+
+        def declare_once():
+            conn = sqlite3.connect(self.path, isolation_level=None, timeout=10)
+            conn.row_factory = sqlite3.Row
+            try:
+                results.append(CRS.declare_candidate_robustness_jobs(
+                    conn, search_run_id=created["search_run_id"],
+                    validation_repository=self.validation,
+                    created_at="2026-10-07T00:00:00Z"))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=declare_once) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([], errors)
+        total_created = sum(item["jobs_created"] for item in results)
+        self.assertEqual(2, total_created)
+        jobs = [j for j in ESS.list_search_jobs(self.queue, created["search_run_id"])
+                if j["stage"] == ESC.JOB_STAGE_ROBUSTNESS]
+        self.assertEqual(2, len(jobs))
+        self.assertEqual(2, len({j["job_id"] for j in jobs}))
+
+    def test_crb15f_embedded_subject_must_match_baseline(self):
+        # A producer that swaps the embedded candidate subject (recomputing the
+        # report fingerprint) must not be able to complete the job.
+        created = self.create_v2()
+        self.run_all_pit(created["search_run_id"])
+        self.declare(created["search_run_id"])
+        job_id = self.claim_robustness(created["search_run_id"])
+        output = self.execute_robustness(job_id)
+        stored = self.robustness.get_report_by_key(output["report_key"])
+        forged = dict(stored)
+        forged["report"] = dict(stored["report"])
+        subject = dict(forged["report"]["baseline_identity"]["experiment_subject"])
+        subject["replay_fingerprint"] = "9" * 64
+        forged["report"]["baseline_identity"] = {
+            **forged["report"]["baseline_identity"], "experiment_subject": subject}
+        spec = dict(forged["report"]["baseline_spec"])
+        spec["subject"] = subject
+        forged["report"]["baseline_spec"] = spec
+        self._refingerprint(forged)
+        with mock.patch.object(self.robustness, "get_report_by_key", return_value=forged):
+            with self.assertRaises(CRS.CandidateRobustnessUnavailable):
+                CRS.complete_candidate_robustness_job(
+                    self.queue, job_id=job_id, report_key=forged["report_key"],
+                    validation_repository=self.validation,
+                    robustness_repository=self.robustness)
 
     def test_crb29_no_candidate_robustness_table(self):
         names = {row[0] for row in self.owners.execute(

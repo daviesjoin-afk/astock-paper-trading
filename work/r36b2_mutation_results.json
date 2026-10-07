@@ -23,8 +23,10 @@
       "M-CRB19 DETECTED (formal R30 fingerprint drifts)",
       "M-CRB21 DETECTED (forged nested baseline provenance is accepted)",
       "M-CRB22 DETECTED (nested baseline identity need not match the top level)",
+      "M-CRB23 DETECTED (embedded candidate subject is not compared to the exact baseline)",
+      "M-CRB24 DETECTED (concurrent declaration is not idempotent)",
       "M-CRB20 DETECTED (legacy plan-v1 silently receives default robustness policy)",
-      "M-CRB detected = 22/22",
+      "M-CRB detected = 24/24",
       "survived = 0; fake = 0; timeout = 0",
       "restore SHA256 = PASS",
       "baseline after restore = GREEN"

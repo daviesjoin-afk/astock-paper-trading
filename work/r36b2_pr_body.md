@@ -20,7 +20,7 @@ DEPLOY: NOT DONE
 ```
 
 R36-B2 exact base SHA: 5ed22af508abd6fce44fb29890eca2ae1f948d15
-R36-B2 exact head SHA: see the PR head commit (recorded in the GitHub PR description)
+R36-B2 exact head SHA: 39c3e9690a8dac1eeed4635f8e784b50f69e58ca
 分支：`codex/r36b2-candidate-robustness-execution`
 
 ## 1. 核心链路
@@ -248,13 +248,13 @@ paper_trading.py LOC/defs:
 ## 6. 验证
 
 ```text
-R36-B2 focused tests                 49 tests (test_r36b2_candidate_robustness_execution) PASS
+R36-B2 focused tests                 57 tests (test_r36b2_candidate_robustness_execution) PASS
 R36-B1 regression                    40 tests PASS
 R36-A regression                     49 tests PASS
 R29 regression                       PASS
 R30 regression                       PASS (formal identity frozen)
 
-M-CRB                                22/22 DETECTED; survived=0; fake=0; timeout=0;
+M-CRB                                24/24 DETECTED; survived=0; fake=0; timeout=0;
                                      restore SHA256=PASS; baseline after restore=GREEN
 M-CEX                                21/21 DETECTED; survived=0; fake=0; timeout=0; restore=PASS
 M-SC                                 15/15 DETECTED; survived=0; fake=0; timeout=0; restore=PASS
@@ -266,8 +266,8 @@ backend full suite                   PASS
 ruff check backend                   PASS
 python -m compileall -q backend      PASS
 git diff --check                     PASS
-exact head CI                        (filled by Lead after push)
-unresolved threads                   (filled by Lead after push)
+exact head CI                        (filled by Lead after CI completes)
+unresolved threads                   (filled by Lead after review opens)
 
 new robustness jobs count            2 (focused E2E: 2 eligible READY candidates -> 2 jobs + 2 queued events)
 canonical reports count              2 (focused E2E: 2 canonical R30 reports, both jobs operationally completed)
