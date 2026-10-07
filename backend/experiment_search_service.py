@@ -99,16 +99,15 @@ def _load_exact_batch(conn: sqlite3.Connection, generation_batch_id: str) -> dic
     "最近一批"兜底：``ORDER BY created_at DESC LIMIT 1`` 之类的隐式输入会让一次 search
     悄悄换掉它的输入集合，而 fingerprint 却看不出来。
 
-    但"按 id 找到了行"还不够：``get_generation_batch`` 返回的是 ``batch_json`` 解析结果，
-    它**不**校验 payload 自述的身份是否等于查找键。若某行损坏（或错误地存了另一个 batch
-    的 JSON），请求 A 会静默拿到 B 的候选集合，并把这些事实当成 A 记录下来。因此这里必须
-    把 payload 身份与查找键**双向**核对，不一致就 fail closed。
+    repository 会重算原始 material 的输入指纹，并核对 payload 与台账列。
+    本层仍检查返回的 batch_id 与查找键一致，且输入指纹形状合法；任何校验失败都在
+    读取候选集合、写入 search 台账之前拒绝。
     """
     if not isinstance(generation_batch_id, str) or not generation_batch_id.strip():
         raise ExperimentSearchError(REASON_BATCH_NOT_FOUND, "generation_batch_id required")
     requested = generation_batch_id.strip()
     try:
-        batch = SCRepo.get_generation_batch(conn, requested)
+        batch = SCRepo.get_generation_batch(conn, requested, verify_input=True)
     except (SCRepo.StrategyCandidateRepositoryError, sqlite3.Error) as exc:
         raise ExperimentSearchError(REASON_BATCH_NOT_FOUND,
                                     type(exc).__name__) from None

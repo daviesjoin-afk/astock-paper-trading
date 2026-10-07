@@ -92,7 +92,8 @@ EVENT_KINDS = ("queued", "claimed", "completed", "failed", "cancelled")
 ALLOWED_TRANSITIONS = {
     None: frozenset({"queued"}),
     "queued": frozenset({"claimed", "cancelled"}),
-    "claimed": frozenset({"completed", "failed"}),
+    # R36-A 尚无 candidate → experiment evidence 绑定，不能声明完成。
+    "claimed": frozenset({"failed"}),
     "failed": frozenset({"claimed", "cancelled"}),
     "completed": frozenset(),
     "cancelled": frozenset(),

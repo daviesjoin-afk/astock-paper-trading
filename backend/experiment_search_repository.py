@@ -21,8 +21,8 @@ current state 可以定义为"该 job 的 ``MAX(event_seq)`` 事件"，而不是
 或 ``event_id`` 字典序去猜。
 
 必须始终记住：这是 **operational queue projection**，不是实验业务结果 authority。
-``completed`` 只表示"executor 成功产生了一份外部 evidence"，绝不表示 candidate passed /
-good / promotable。
+``completed`` 的语义要求 executor 产生可核验的外部 evidence，绝不表示 candidate passed /
+good / promotable。R36-A 尚无这种绑定，当前写入接口一律拒绝 completed。
 
 ─────────────── 没有可变状态列，也没有指标列 ───────────────
 
@@ -182,6 +182,9 @@ def record_job_event(conn: sqlite3.Connection, *, job_id: str, search_run_id: st
     """
     if event_kind not in ESC.EVENT_KINDS:
         raise ExperimentSearchRepositoryError(f"unknown_job_event_kind:{event_kind}")
+    # 即使绕过 service，任意 evidence 字符串也不能制造完成事实。
+    if event_kind == "completed":
+        raise ExperimentSearchRepositoryError("completion_evidence_binding_unavailable")
     if reason is not None:
         reason = str(reason)
         if not reason or reason != reason.strip().lower().replace("-", "_"):

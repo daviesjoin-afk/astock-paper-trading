@@ -18,13 +18,16 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import contextlib
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -204,9 +207,7 @@ class ExactGenerationBatchTests(_Base):
     def test_s1c_batch_payload_identity_must_match_the_lookup_key(self):
         """S1c — 行内 payload 自述的 batch 身份必须等于查找键。
 
-        ``get_generation_batch`` 只按 id 取行并返回 ``batch_json``，它**不**校验 payload
-        自述身份。若某行损坏、或错误地存了另一个 batch 的 JSON，请求 A 会静默拿到 B 的
-        候选集合，并把 B 的事实当成 A 记录下来。因此 service 必须双向核对并 fail closed。
+        repository 与 service 均核对身份，损坏行不能让请求 A 领取 B 的候选。
         """
         batch_a = self.batch(values=_LEGAL_VALUES[:2], campaign="a")
         batch_b = self.batch(values=[22], campaign="b")
@@ -228,8 +229,12 @@ class ExactGenerationBatchTests(_Base):
         with self.assertRaises(ESS.ExperimentSearchError) as ctx:
             self.create(batch_a)
         self.assertEqual(ESS.REASON_BATCH_NOT_FOUND, ctx.exception.reason)
-        self.assertIn("identity mismatch", ctx.exception.detail)
         self.assertEqual(before, self.counts(), "身份不符不得创建任何控制面行")
+        with mock.patch.object(SCRepo, "get_generation_batch", return_value=payload):
+            with self.assertRaises(ESS.ExperimentSearchError) as ctx:
+                self.create(batch_a)
+        self.assertEqual(ESS.REASON_BATCH_NOT_FOUND, ctx.exception.reason)
+        self.assertEqual(before, self.counts())
 
     def test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected(self):
         """payload 缺 canonical input fingerprint ⇒ fail closed，不带着空身份建 run。"""
@@ -247,6 +252,58 @@ class ExactGenerationBatchTests(_Base):
                 " WHERE batch_id=?",
                 (json.dumps(payload, sort_keys=True, separators=(",", ":")),
                  batch["generation_batch_id"]))
+        before = self.counts()
+        with self.assertRaises(ESS.ExperimentSearchError) as ctx:
+            self.create(batch)
+        self.assertEqual(ESS.REASON_BATCH_NOT_FOUND, ctx.exception.reason)
+        self.assertEqual(before, self.counts())
+
+    def test_s1e_batch_fingerprint_must_match_original_material_and_row(self):
+        # 分别破坏合法形状指纹、原始材料、台账列及材料与重复字段的一致性。
+        for corruption in ("fingerprint", "material", "row", "missing", "duplicate"):
+            with self.subTest(corruption=corruption):
+                batch = self.batch(campaign=corruption)
+                batch_id = batch["generation_batch_id"]
+                with self._open(immediate=True) as conn:
+                    payload = SCRepo.get_generation_batch(conn, batch_id)
+                    conn.execute("DROP TRIGGER IF EXISTS strategy_candidate_generation_batches_no_update")
+                    if corruption == "fingerprint":
+                        payload["generation_input_fingerprint"] = "0" * 64
+                        conn.execute("UPDATE strategy_candidate_generation_batches"
+                                     " SET generation_input_fingerprint=? WHERE batch_id=?",
+                                     ("0" * 64, batch_id))
+                    elif corruption == "material":
+                        payload["material"]["asof"] = "2000-01-01"
+                    elif corruption == "row":
+                        conn.execute("UPDATE strategy_candidate_generation_batches"
+                                     " SET generation_input_fingerprint=? WHERE batch_id=?",
+                                     ("0" * 64, batch_id))
+                    elif corruption == "missing":
+                        del payload["material"]
+                    else:
+                        payload["asof"] = "2000-01-01"
+                        conn.execute("UPDATE strategy_candidate_generation_batches"
+                                     " SET asof=? WHERE batch_id=?", (payload["asof"], batch_id))
+                    conn.execute("UPDATE strategy_candidate_generation_batches SET batch_json=?"
+                                 " WHERE batch_id=?", (json.dumps(payload), batch_id))
+                before = self.counts()
+                with self.assertRaises(ESS.ExperimentSearchError) as ctx:
+                    self.create(batch)
+                self.assertEqual(ESS.REASON_BATCH_NOT_FOUND, ctx.exception.reason)
+                self.assertEqual(before, self.counts())
+
+    def test_s1f_legacy_batch_remains_readable_but_cannot_schedule_search(self):
+        batch = self.batch()
+        batch_id = batch["generation_batch_id"]
+        with self._open(immediate=True) as conn:
+            payload = SCRepo.get_generation_batch(conn, batch_id)
+            del payload["material"]
+            del payload["search_space_material"]
+            conn.execute("DROP TRIGGER IF EXISTS strategy_candidate_generation_batches_no_update")
+            conn.execute("UPDATE strategy_candidate_generation_batches SET batch_json=? WHERE batch_id=?",
+                         (json.dumps(payload), batch_id))
+        with self._open() as conn:
+            self.assertEqual(payload, SCV.get_generation_batch(conn, batch_id)["generation_batch"])
         before = self.counts()
         with self.assertRaises(ESS.ExperimentSearchError) as ctx:
             self.create(batch)
@@ -578,11 +635,11 @@ class StateMachineTests(_Base):
         self.assertEqual(ESS.REASON_ILLEGAL_TRANSITION, ctx.exception.reason)
 
     def test_s13b_illegal_transitions_are_rejected(self):
-        """claimed 状态下：``failed`` / ``completed`` 合法，其余一律拒绝。"""
+        """R36-A claimed 状态只允许 failed，完成需要后续 evidence 绑定。"""
         _, run = self._run_with_jobs(count=2)
         with self._open(immediate=True) as conn:
             claimed = ESS.claim_next_job(conn, run["search_run_id"])
-        for illegal in ("claimed", "queued"):
+        for illegal in ("claimed", "queued", "completed"):
             with self.subTest(target=illegal):
                 with self.assertRaises(ESS.ExperimentSearchError) as ctx:
                     with self._open(immediate=True) as conn:
@@ -619,19 +676,38 @@ class StateMachineTests(_Base):
         self.assertIsNone(nothing["job_id"])
 
     def test_s15_completed_is_terminal(self):
+        # 保留终态契约，但 R36-A 不制造 completed 事件作 fixture。
+        for target in ("failed", "claimed", "cancelled"):
+            with self.subTest(target=target):
+                self.assertFalse(ESC.next_state_allowed("completed", target))
+
+    def test_s15b_completion_is_rejected_without_a_verifiable_binding(self):
         _, run = self._run_with_jobs(count=1)
         with self._open(immediate=True) as conn:
             claimed = ESS.claim_next_job(conn, run["search_run_id"])
-            ESS.record_job_event(conn, job_id=claimed["job_id"], event_kind="completed",
-                                 evidence_owner="experiment_validation_run",
-                                 evidence_id="future-r29-run-key")
-        for target in ("failed", "claimed", "cancelled"):
-            with self.subTest(target=target):
-                with self.assertRaises(ESS.ExperimentSearchError) as ctx:
-                    with self._open(immediate=True) as conn:
+        before = self.counts()
+        for evidence in ({}, {"evidence_owner": "experiment_validation_run"},
+                         {"evidence_owner": "experiment_validation_run", "evidence_id": "0" * 64},
+                         {"evidence_owner": "unknown", "evidence_id": "fake"}):
+            with self.subTest(evidence=evidence):
+                with self._open(immediate=True) as conn:
+                    with self.assertRaises(ESS.ExperimentSearchError) as ctx:
                         ESS.record_job_event(conn, job_id=claimed["job_id"],
-                                             event_kind=target)
-                self.assertEqual(ESS.REASON_ILLEGAL_TRANSITION, ctx.exception.reason)
+                                             event_kind="completed", **evidence)
+                    self.assertEqual(ESS.REASON_ILLEGAL_TRANSITION, ctx.exception.reason)
+                    with self.assertRaises(ESR.ExperimentSearchRepositoryError) as direct:
+                        ESR.record_job_event(conn, job_id=claimed["job_id"],
+                                             search_run_id=run["search_run_id"],
+                                             event_kind="completed", **evidence)
+                    self.assertEqual("completion_evidence_binding_unavailable", str(direct.exception))
+                self.assertEqual(before, self.counts())
+        # 拒绝后仍可 failed → retry，并未被永久终结。
+        with self._open(immediate=True) as conn:
+            ESS.record_job_event(conn, job_id=claimed["job_id"], event_kind="failed",
+                                 reason="executor_unavailable")
+            retried = ESS.claim_next_job(conn, run["search_run_id"])
+        self.assertEqual(claimed["job_id"], retried["job_id"])
+        self.assertEqual(2, retried["attempt_number"])
 
     def test_s16_cancelled_is_terminal(self):
         _, run = self._run_with_jobs(count=1)
@@ -739,34 +815,50 @@ class QueuePolicyTests(_Base):
                             other.search_input_fingerprint)
 
     def test_s19_two_workers_never_double_claim(self):
-        """S19 — 两条真实 SQLite 连接各自 claim：同一 queued job 绝不被 claim 两次。
+        """两个线程同时等待真实写锁，再各自 BEGIN IMMEDIATE → claim → commit。"""
+        for count in (1, 3):
+            with self.subTest(jobs=count):
+                _, run = self._run_with_jobs(count=count)
+                barrier = threading.Barrier(3)
+                attempted = [threading.Event(), threading.Event()]
 
-        真实 worker 模式是"各自 ``BEGIN IMMEDIATE`` → claim → commit"，而不是同时持有
-        两个写事务（后者在 SQLite 上是锁竞争，不是本层要表达的不变量）。因此这里用两条
-        独立连接**顺序** claim，并断言两个 job 不同、且每条 job 只有一条 claimed 事件。
-        """
-        batch = self.batch(values=_LEGAL_VALUES[:3])
-        run = self.create(batch, budget=ESC.SearchBudget(max_candidates=3))
-        claims = []
-        for actor in ("w1", "w2"):
-            conn = self.connection(immediate=True)
-            try:
-                claims.append(ESS.claim_next_job(conn, run["search_run_id"], actor=actor))
-                conn.execute("COMMIT")
-            finally:
-                conn.close()
-        self.assertIsNotNone(claims[0]["job_id"])
-        self.assertIsNotNone(claims[1]["job_id"])
-        self.assertNotEqual(claims[0]["job_id"], claims[1]["job_id"],
-                            "同一 job 不得被两个 worker 同时 claim")
-        with self._open() as conn:
-            rows = conn.execute(
-                "SELECT job_id, COUNT(*) c FROM experiment_search_job_events"
-                " WHERE search_run_id=? AND event_kind='claimed' GROUP BY job_id",
-                (run["search_run_id"],)).fetchall()
-        self.assertEqual(2, len(rows))
-        for row in rows:
-            self.assertEqual(1, row["c"], "每条 job 恰好一条 claimed 事件")
+                def worker(index, attempted=attempted, barrier=barrier, run=run):
+                    with contextlib.closing(sqlite3.connect(
+                            self.path, isolation_level=None, timeout=10)) as conn:
+                        conn.row_factory = sqlite3.Row
+                        conn.execute("PRAGMA foreign_keys=ON")
+                        conn.set_trace_callback(lambda sql: attempted[index].set()
+                                                if sql == "BEGIN IMMEDIATE" else None)
+                        barrier.wait(timeout=5)
+                        conn.execute("BEGIN IMMEDIATE")
+                        result = ESS.claim_next_job(conn, run["search_run_id"], actor=f"w{index}")
+                        conn.execute("COMMIT")
+                        return result
+
+                # 主线程先持锁，保证两个 worker 的事务尝试都发生在释放锁之前。
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    blocker = self.connection(immediate=True)
+                    try:
+                        futures = [executor.submit(worker, index) for index in range(2)]
+                        barrier.wait(timeout=5)
+                        self.assertTrue(all(event.wait(timeout=5) for event in attempted))
+                        self.assertTrue(all(not future.done() for future in futures))
+                    finally:
+                        blocker.execute("ROLLBACK")
+                        blocker.close()
+                    claims = [future.result(timeout=15) for future in futures]
+                ids = [claim["job_id"] for claim in claims if claim["job_id"] is not None]
+                self.assertEqual(min(count, 2), len(ids))
+                self.assertEqual(len(ids), len(set(ids)))
+                self.assertTrue(all(claim["attempt_number"] == 1 for claim in claims
+                                    if claim["job_id"] is not None))
+                with self._open() as conn:
+                    rows = conn.execute(
+                        "SELECT job_id, COUNT(*) c FROM experiment_search_job_events"
+                        " WHERE search_run_id=? AND event_kind='claimed' GROUP BY job_id",
+                        (run["search_run_id"],)).fetchall()
+                self.assertEqual(min(count, 2), len(rows))
+                self.assertTrue(all(row["c"] == 1 for row in rows))
 
     def test_s19c_a_second_claim_of_the_same_job_is_refused_by_the_transition_table(self):
         """同一 job 的第二次 claim 必须被拒 —— 这是 double-claim 的架构性防线。"""
@@ -840,16 +932,13 @@ class TerminalSemanticsTests(_Base):
         self.assertEqual(before, self.counts())
 
     def test_s20c_queue_state_has_no_business_meaning(self):
-        """current_state == completed 只表示"产生了一份外部 evidence"。"""
+        """队列状态不表达通过、优秀或可晋级；R36-A 不可声明 completed。"""
         _, run = self._run_with_jobs(count=1)
         with self._open(immediate=True) as conn:
-            claimed = ESS.claim_next_job(conn, run["search_run_id"])
-            ESS.record_job_event(conn, job_id=claimed["job_id"], event_kind="completed",
-                                 evidence_owner="experiment_validation_run",
-                                 evidence_id="some-exact-run-key")
+            ESS.claim_next_job(conn, run["search_run_id"])
         with self._open() as conn:
             state = ESS.list_search_jobs(conn, run["search_run_id"])[0]
-        self.assertEqual("completed", state["current_state"])
+        self.assertEqual("claimed", state["current_state"])
         # 投影里只有运营字段，没有任何"通过 / 优秀 / 可晋级"结论。
         self.assertEqual({"job_id", "candidate_id", "stage", "current_state",
                           "attempt_count", "last_event_seq", "last_attempt_number"},

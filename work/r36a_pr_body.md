@@ -14,8 +14,8 @@ R36-A   IN REVIEW
 R36     IN PROGRESS
 R37     NOT STARTED
 
-MERGE: NOT DONE
-DEPLOY: NOT DONE
+MERGE: NO
+DEPLOY: NO
 R36-B: NOT STARTED
 ```
 
@@ -155,7 +155,7 @@ reject（不静默去重）：调用方声称的集合与数量不一致时，�
 ALLOWED_TRANSITIONS = {
     None: {"queued"},
     "queued": {"claimed", "cancelled"},
-    "claimed": {"completed", "failed"},
+    "claimed": {"failed"},
     "failed": {"claimed", "cancelled"},
     "completed": set(),
     "cancelled": set(),
@@ -174,6 +174,9 @@ state，因此显式建立 `event_seq` 作为唯一 ordering authority。`create
 job state = completed → executor 成功产生了一份外部 evidence
 绝不表示 candidate passed / good / promotable
 ```
+
+R36-A 尚无 candidate 与 canonical experiment evidence 绑定，当前禁止产生 `completed`。
+service 转换表与 repository 写入入口均拒绝；任意 owner/id 字符串不能冒充真实实验依据。
 
 三张表都**没有** `status` / `attempts` / `claimed_at` / `finished_at`，也**没有**任何
 实验指标列。`failed` 只表示执行失败（worker error / runner exception / resource
@@ -231,9 +234,9 @@ NO 把 R35 generator 能力搬到 R36
 ## 12. 验证
 
 ```text
-R36-A focused tests                 46 tests OK（S1–S22）
+R36-A focused tests                 49 tests OK（S1–S22）
 candidate schema hardening          v1 PASS / v2 PASS / unknown REJECT
-mutation M-SC1…M-SC12               detected = 12/12
+mutation M-SC1…M-SC15               detected = 15/15
                                     survived = 0; fake = 0; timeout = 0
                                     restore SHA256 = PASS; baseline GREEN
 ```
@@ -328,3 +331,17 @@ Modules needed to understand core R36-A rule:
 paper_trading.py LOC/defs:
   trend only, not blocker
 ```
+
+## PR #231 三项复审修复（2026-10-07）
+
+1. **P1 无依据完成**：R36-A 禁止 claimed → completed，直接 repository 写入也拒绝。
+   空引用、伪造 owner/id 均不能永久终结任务；拒绝后可 failed → retry。
+   未提前实现 R36-B 的实验身份桥接或 runner。
+2. **P2 Batch 指纹**：search 显式要求既有 repository 重算原始 material 的 SHA256，核对
+   输入指纹、JSON 与台账列，以及材料与重复字段；损坏/缺失材料 fail closed、零 search 写入。
+   R35 历史查看保留原行为，legacy batch 可查看但不能用来创建搜索任务。
+3. **P2 真并发测试**：两个线程各用独立 SQLite 连接，通过 barrier 同时开始；主线程持锁
+   并确认两个 worker 都已尝试 BEGIN IMMEDIATE 后释放。单 job 恰好一次领取；多 job 分别领取，
+   每个 job 恰好一条 claimed 事件，worker 异常通过 future.result 回传并使测试失败。
+
+没有新增模块、表、迁移、前端或公开 API。保持 `MERGE: NO / DEPLOY: NO / R36-B: NOT STARTED`。

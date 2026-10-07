@@ -25,6 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 BASELINE = (
     "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
+    "test_s1e_batch_fingerprint_must_match_original_material_and_row",
+    "test_r36a_experiment_search_controller.StateMachineTests."
+    "test_s15b_completion_is_rejected_without_a_verifiable_binding",
+    "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
     "test_s1_known_batch_is_accepted_and_unknown_or_malformed_is_rejected",
     "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
     "test_s1b_source_has_no_latest_or_recent_batch_lookup",
@@ -314,6 +318,35 @@ MUTATIONS = [
          "test_s1c_batch_payload_identity_must_match_the_lookup_key",
          "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
          "test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected",
+     ]},
+    {"id": "M-SC13",
+     "semantic": "generation input fingerprint is not recomputed from original material",
+     "edits": [("backend/strategy_candidate_repository.py",
+                '        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != batch["generation_input_fingerprint"]:\n'
+                '            raise ValueError("batch input fingerprint mismatch")\n',
+                '        pass  # trust a well-shaped fingerprint\n')],
+     "detectors": [
+         "test_r36a_experiment_search_controller.ExactGenerationBatchTests."
+         "test_s1e_batch_fingerprint_must_match_original_material_and_row",
+     ]},
+    {"id": "M-SC14",
+     "semantic": "direct repository writes can manufacture completed events",
+     "edits": [(REPOSITORY,
+                '    if event_kind == "completed":\n'
+                '        raise ExperimentSearchRepositoryError("completion_evidence_binding_unavailable")\n',
+                '    pass  # accept unverified completion\n')],
+     "detectors": [
+         "test_r36a_experiment_search_controller.StateMachineTests."
+         "test_s15b_completion_is_rejected_without_a_verifiable_binding",
+     ]},
+    {"id": "M-SC15",
+     "semantic": "a second worker can claim a job already claimed by the first worker",
+     "edits": [(CONTRACT,
+                '    "claimed": frozenset({"failed"}),\n',
+                '    "claimed": frozenset({"failed", "claimed"}),\n')],
+     "detectors": [
+         "test_r36a_experiment_search_controller.QueuePolicyTests."
+         "test_s19_two_workers_never_double_claim",
      ]},
 ]
 

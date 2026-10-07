@@ -918,7 +918,7 @@ R35-B 的 `M-X`。
 
 ## R36-A Experiment Search Controller Foundation
 
-`backend/test_r36a_experiment_search_controller.py`（S1–S22，46 tests）。
+`backend/test_r36a_experiment_search_controller.py`（S1–S22，49 tests）。
 四句边界见 `plans/r36a-experiment-search-controller-foundation.md`。
 
 | 不变量 | 测试 |
@@ -927,6 +927,8 @@ R35-B 的 `M-X`。
 | S1b 源码级无 latest / recent / current batch 读取，代码里无 `ORDER BY created_at DESC` | `test_s1b_source_has_no_latest_or_recent_batch_lookup` |
 | S1c **batch payload 自述身份必须等于查找键**（否则请求 A 静默拿到 B 的候选） | `test_s1c_batch_payload_identity_must_match_the_lookup_key` |
 | S1d batch payload 缺 canonical input fingerprint → reject | `test_s1d_batch_payload_without_a_canonical_input_fingerprint_is_rejected` |
+| S1e 合法形状的错误指纹、原始材料损坏或缺失、台账列/重复字段不一致 → reject，零写入 | `test_s1e_batch_fingerprint_must_match_original_material_and_row` |
+| S1f legacy batch 仍可历史查看，但无原始材料不能创建 search | `test_s1f_legacy_batch_remains_readable_but_cannot_schedule_search` |
 | S2 batch 外 candidate 混入 → reject（不静默过滤） | `CandidatePoolTests`（2 tests） |
 | S3 篡改候选内容 → ledger 自证失败，零行写入 | `test_s3_tampered_candidate_row_fails_closed` |
 | S3b 候选与指纹不自洽 → reject | `test_s3b_proposal_json_alone_cannot_vouch_for_a_candidate` |
@@ -943,10 +945,11 @@ R35-B 的 `M-X`。
 | S13 queued→claimed 后重复 claim → reject；非法边逐项拒绝 | `StateMachineTests`（2 tests） |
 | S14 attempt 预算（2 次后第三次 reject，且不再被 claim） | `test_s14_attempt_budget_is_enforced` |
 | S15 completed 终态 | `test_s15_completed_is_terminal` |
+| S15b R36-A 拒绝无可核验绑定的 completed；空/伪造引用、直接 repository 写入均拒绝，仍可失败重试 | `test_s15b_completion_is_rejected_without_a_verifiable_binding` |
 | S16 cancelled 终态 | `test_s16_cancelled_is_terminal` |
 | S17 current state 只由 `event_seq` 决定（同 created_at 仍正确） | `EventOrderingTests`（2 tests） |
 | S18 claim 顺序 = canonical candidate order，且与插入顺序无关 | `QueuePolicyTests`（2 tests） |
-| S19 两 worker 不 double-claim；同 job 二次 claim 被转换表拒绝 | `QueuePolicyTests`（2 tests） |
+| S19 两线程各用独立连接，同时争抢真实写锁；单任务恰好一次领取，多任务分别领取；同 job 二次 claim 被转换表拒绝 | `QueuePolicyTests`（2 tests） |
 | S20 三张表无指标列 / 无可变状态列；queue 状态无业务含义 | `TerminalSemanticsTests`（3 tests） |
 | S21 controller 不 import / 不执行 evaluation、promotion、lifecycle、execution | `test_s21_no_evaluation_or_promotion_dependency`、`test_s21b_controller_does_not_execute_runners` |
 | S22 无 AI provider / transport 依赖；无 priority / ranking 权威 | `test_s22_no_ai_provider_dependency`、`test_s22b_no_selection_ranking_or_priority_authority` |
@@ -969,6 +972,11 @@ R35-B 的 `M-X`。
 | M-SC10 | completed / cancelled 不再是终态 | S15 / S16 |
 | M-SC11 | 正常 bootstrap 不再建 search 表（首次写入 `no such table`） | `test_normal_bootstrap_creates_the_search_tables` |
 | M-SC12 | 不校验 batch payload 自述身份（请求 A 拿到 B 的候选） | S1c / S1d |
+| M-SC13 | 不从原始 material 重算 generation input fingerprint | S1e |
+| M-SC14 | repository 允许直接写入未验证的 completed | S15b |
+| M-SC15 | 第二个 worker 可以再次 claim 已领取的任务 | S19 真并发 |
+
+2026-10-07：M-SC1–M-SC15 **15/15 DETECTED**；survived/fake/timeout 均为 0，源码 SHA256 恢复 PASS，恢复后 baseline GREEN。
 
 **M-SC3 第一版 SURVIVED，暴露真实缺口**：`get_candidate()` 自身已重算指纹自证，所以单删
 service 那行显式 `verify` 无测试可发现；但同段代码 `candidate is None → continue` 会让

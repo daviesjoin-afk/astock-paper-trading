@@ -3893,8 +3893,9 @@ parameters"的两个候选得到同一 experiment identity。**R36-B** 专门解
 "预期收益高 / AI confidence 高 / Sharpe 高的先跑"已经是 selection policy。
 
 三张新表都**没有** `status` / `attempts` / `claimed_at` 这类可变快照列，也没有任何实验
-指标列：`completed` 只表示"executor 成功产生了一份外部 evidence"，绝不表示 candidate
-passed / good / promotable。
+指标列：`completed` 要求 executor 产生可核验的外部 evidence，绝不表示 candidate
+passed / good / promotable。R36-A 尚无 candidate 与实验 evidence 的绑定，当前禁止写入
+`completed`；只提供调度、领取、执行失败重试与取消。
 
 
 ## 架构演进记录（历史批次：模块化与边界固化）

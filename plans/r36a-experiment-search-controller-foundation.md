@@ -157,7 +157,7 @@ v2 (strategy-candidate-v2)
 ALLOWED_TRANSITIONS = {
     None:     {"queued"},
     "queued": {"claimed", "cancelled"},
-    "claimed": {"completed", "failed"},
+    "claimed": {"failed"},
     "failed":  {"claimed", "cancelled"},
     "completed": set(),
     "cancelled": set(),
@@ -271,3 +271,16 @@ R36-C  Explicit Selection & Iteration Policy
 R36-D  Bayesian / Evolutionary Search
 R37    Closed-loop Learning
 ```
+
+## 15. PR #231 三项复审修复（2026-10-07）
+
+- P1：R36-A 尚无 candidate → canonical experiment evidence 绑定，禁止 claimed → completed；repository 直接写入同样拒绝。空引用、伪造 owner/id 均不能终结任务，拒绝后仍可 failed → retry。completed 保留为词表中的终态，但当前阶段不能产生。
+- P2：search 显式以 `verify_input=True` 调用现有 generation batch repository，重算 `sha256(canonical(material))`，核对输入指纹、JSON 与台账列，以及材料与重复字段；缺失或损坏拒绝、不回填，在读取 pool 或写入前映射到 `generation_batch_not_found`。R35 历史查看仍使用原读取行为，legacy 可查看但不能用来搜索。
+- P2：S19 使用两个线程、独立 SQLite 连接与 barrier；主线程先持写锁，确认两个 worker 都已尝试 BEGIN IMMEDIATE 后释放。单任务只有一个 worker 领取，多任务领取不同 job，claimed 事件均恰好一次。
+
+验证：Python 3.14.5；R36-A 49 tests PASS；R35-B 41 / R35-C 67 tests PASS；M-SC1–15 detected 15/15，survived/fake/timeout=0，restore SHA256 PASS，baseline GREEN；ruff PASS。
+
+完成标准：三项问题关闭，更新同一个 PR #231 并核对新 head 的 CI 与代码；不重做 R36-A，不新增模块或表。
+本修复提交时完整 backend 回归仍在运行；新 head CI 与最终复审结果记录在 PR #231 正文，以该正文标明的 exact head 为准。
+
+`MERGE: NO / DEPLOY: NO / R36-B: NOT STARTED`
