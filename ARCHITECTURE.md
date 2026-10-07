@@ -3938,7 +3938,7 @@ PIT dimension 为 `experiment_subject`。仍使用同一 `experiment_execution_m
 experiment、runner、owner identities、PIT/result identity 和重建 run key，最后短事务写完成。
 `record_verified_completion_event` 的生产调用点只有这一个，owner 固定为 `experiment_validation_run`。
 普通 service/repository completed 入口继续拒绝。相同证据重复完成幂等；不同证据冲突。
-落库后崩溃用 exact run_key 补写，不需要再计算。基础设施异常写 failed 供有限重试。
+落库后崩溃用 exact run_key 补写，不需要再计算。基础设施异常、准备阶段拒绝以及未产生 run_key 的 R29 拒绝写 failed 供有限重试。不支持的板块通过 R29 留下真实 blocked 证据，再绑定该 run_key 完成队列工作。
 
 **队列 completed 只说明这项证据生产工作结束。** canonical blocked/unavailable/failed 也可完成工作，
 不意味着候选 passed/good/promotable。队列不复制指标；R30、selection、ranking、promotion、AI

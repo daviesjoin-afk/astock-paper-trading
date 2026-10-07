@@ -477,6 +477,41 @@ class CandidateExecutionTests(SF._Base):
         self.assertEqual("failed", ESR.list_job_events(self.queue, self.job_id)[-1]["event_kind"])
         self.assertEqual([], self.validation.recent_runs())
 
+    def test_unsupported_board_job_records_blocked_evidence_and_completes(self):
+        with mock.patch.object(SF, "UNIVERSE", {"scope_kind": "a_share_boards", "boards": ["main_board"]}):
+            board_batch = self.batch(values=[18], campaign="boards")
+        created = self.create(board_batch, experiment_plan=self.plan)
+        self.queue.execute("BEGIN IMMEDIATE")
+        job = ESS.claim_next_job(self.queue, created["search_run_id"])
+        self.queue.commit()
+        self.job_id = job["job_id"]
+        output = self.execute()
+        self.assertEqual("blocked", output["validation_evidence"]["status"])
+        self.assertIn("candidate_universe_board_scope_not_supported", output["validation_evidence"]["reason_codes"])
+        self.assertEqual("unavailable", output["result"]["status"])
+        self.assertEqual("completed", ESR.list_job_events(self.queue, self.job_id)[-1]["event_kind"])
+        self.assertEqual(output["run_key"], self.validation.get_run(run_key=output["run_key"])["run_key"])
+
+    def test_no_run_key_is_failed_and_retryable(self):
+        output = self.execute(dataset_manifest={"dataset_fingerprint": "e" * 64})
+        self.assertIsNone(output["run_key"])
+        self.assertEqual("unavailable", output["result"]["status"])
+        event = ESR.list_job_events(self.queue, self.job_id)[-1]
+        self.assertEqual(("failed", "dataset_identity_mismatch"), (event["event_kind"], event["reason"]))
+        self.assertIsNone(event["evidence_id"])
+        self.assertEqual([], self.validation.recent_runs())
+        self.queue.execute("BEGIN IMMEDIATE")
+        ESS.record_job_event(self.queue, job_id=self.job_id, event_kind="claimed")
+        self.queue.commit()
+        self.assertEqual("completed", self.execute()["completion"]["event_kind"])
+
+    def test_preparation_rejection_releases_claim_as_failed(self):
+        with self.assertRaisesRegex(CES.CandidateExperimentUnavailable, "historical_session_calendar_unavailable"):
+            self.execute(session_calendar=None)
+        self.assertEqual("failed", ESR.list_job_events(self.queue, self.job_id)[-1]["event_kind"])
+        self.assertFalse(self.queue.in_transaction)
+        self.assertEqual([], self.validation.recent_runs())
+
     def test_infrastructure_exception_marks_failed(self):
         with mock.patch.object(RUNNER, "run_validation", side_effect=sqlite3.OperationalError("disk failure")):
             with self.assertRaises(sqlite3.OperationalError):

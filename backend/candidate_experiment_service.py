@@ -10,6 +10,7 @@ import experiment_search_repository as ESR
 import experiment_search_service as ESS
 import experiment_validation_repository as EVR
 import experiment_validation_runner as RUNNER
+import historical_session_calendar as HSC
 import experiment_pit_validation as PV
 import strategy_candidate_repository as SCR
 
@@ -48,13 +49,18 @@ def _job_inputs(conn, job_id):
 def prepare_candidate_experiment(conn, *, job_id, session_calendar, universe_archive_repository,
                                  tradability_repository):
     job, plan, candidate, replay = _job_inputs(conn, job_id)
-    if session_calendar.calendar_fingerprint != plan.session_calendar_fingerprint:
+    if (not isinstance(session_calendar, HSC.HistoricalSessionCalendar)
+            or session_calendar.calendar_fingerprint != plan.session_calendar_fingerprint):
         raise CandidateExperimentUnavailable("historical_session_calendar_unavailable")
     if session_calendar.coverage_start != plan.start_date or session_calendar.coverage_end != plan.end_date:
         raise CandidateExperimentUnavailable("historical_session_calendar_unavailable")
     members = RUNNER._universe_rows(universe_archive_repository, plan.universe_archive_fingerprint,
                                     session_calendar.sessions)
-    members = CE.filter_candidate_members(replay, members, plan.universe_archive_fingerprint)
+    try:
+        members = CE.filter_candidate_members(replay, members, plan.universe_archive_fingerprint)
+    except CE.CandidateUniverseUnavailable:
+        # No requested universe can be proven. R29 independently records the canonical blocked reason.
+        members = {}
     capture = PV.tradability_replay_projection(members, session_calendar.sessions, tradability_repository)
     spec = CE.build_candidate_experiment_spec(candidate, replay, plan, capture["fingerprint"])
     return {"job": job, "plan": plan, "candidate": candidate, "replay": replay,
@@ -122,6 +128,19 @@ def complete_candidate_pit_job(conn, *, job_id, run_key, validation_repository,
             "evidence_id": run_key}
 
 
+def _fail_job(conn, *, job_id, reason, created_at, actor):
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        events = ESR.list_job_events(conn, job_id)
+        if events and events[-1]["event_kind"] == "claimed":
+            ESS.record_job_event(conn, job_id=job_id, event_kind="failed", actor=actor,
+                                 reason=reason, created_at=created_at)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def run_candidate_pit_validation(conn, *, job_id, validation_repository, session_calendar,
                                  market_archive_repository, universe_archive_repository,
                                  tradability_repository, dataset_manifest, samples,
@@ -130,13 +149,13 @@ def run_candidate_pit_validation(conn, *, job_id, validation_repository, session
         raise CandidateExperimentUnavailable("canonical_validation_repository_required")
     if conn.in_transaction or validation_repository.conn.in_transaction:
         raise CandidateExperimentUnavailable("search_write_transaction_must_be_closed")
-    prepared = prepare_candidate_experiment(conn, job_id=job_id, session_calendar=session_calendar,
-        universe_archive_repository=universe_archive_repository, tradability_repository=tradability_repository)
     events = ESR.list_job_events(conn, job_id)
     if not events or events[-1]["event_kind"] != "claimed":
         raise CandidateExperimentUnavailable("search_job_must_be_claimed")
-    plan = prepared["plan"]
     try:
+        prepared = prepare_candidate_experiment(conn, job_id=job_id, session_calendar=session_calendar,
+            universe_archive_repository=universe_archive_repository, tradability_repository=tradability_repository)
+        plan = prepared["plan"]
         output = RUNNER.run_validation(prepared["spec"], runner_code_revision=plan.code_revision,
             strategy_candidate=prepared["candidate"], dataset_manifest=dataset_manifest, samples=samples,
             walk_forward_config=plan.walk_forward_config, session_calendar=session_calendar,
@@ -148,16 +167,11 @@ def run_candidate_pit_validation(conn, *, job_id, validation_repository, session
             tradability_replay_capture=prepared["tradability_replay_capture"],
             validation_repository=validation_repository, created_at=created_at)
     except Exception:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            ESS.record_job_event(conn, job_id=job_id, event_kind="failed", actor=actor,
-                                 reason="candidate_pit_executor_failure", created_at=created_at)
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
+        _fail_job(conn, job_id=job_id, reason="candidate_pit_executor_failure", created_at=created_at, actor=actor)
         raise
     if output.get("run_key") is not None:
         output["completion"] = complete_candidate_pit_job(conn, job_id=job_id, run_key=output["run_key"],
             validation_repository=validation_repository, created_at=created_at, actor=actor)
+    else:
+        _fail_job(conn, job_id=job_id, reason=output["result"]["failure_reason"], created_at=created_at, actor=actor)
     return output

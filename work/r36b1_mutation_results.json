@@ -2,7 +2,7 @@
   "r36b1_candidate_experiment_mutation_check.py": {
     "exit_code": 0,
     "summary": [
-      "M-CEX detected = 18/18",
+      "M-CEX detected = 21/21",
       "survived = 0; fake = 0; timeout = 0",
       "restore SHA256 = PASS",
       "baseline after restore = GREEN"

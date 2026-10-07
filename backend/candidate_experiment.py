@@ -16,6 +16,10 @@ import strategy_dsl_evaluator as EVAL
 CANDIDATE_REPLAY_CONTRACT_VERSION = "candidate-replay-v1"
 
 
+class CandidateUniverseUnavailable(ValueError):
+    """A declared candidate universe cannot be applied to this historical owner."""
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateReplayDefinition:
     # Only a verified candidate is accepted. There is no caller-supplied AST field.
@@ -73,13 +77,13 @@ def filter_candidate_members(replay: CandidateReplayDefinition, members: Mapping
     scope = replay.candidate.universe_spec
     pinned = scope.get("asof_universe_identity")
     if pinned is not None and pinned != universe_identity:
-        raise ValueError("candidate_universe_identity_mismatch")
+        raise CandidateUniverseUnavailable("candidate_universe_identity_mismatch")
     if scope["scope_kind"] == "a_share_boards":
-        raise ValueError("candidate_universe_board_scope_not_supported")
+        raise CandidateUniverseUnavailable("candidate_universe_board_scope_not_supported")
     if scope["scope_kind"] == "a_share_all":
         return {session: list(rows) for session, rows in members.items()}
     if scope["scope_kind"] != "explicit_symbols":
-        raise ValueError("candidate_universe_scope_not_supported")
+        raise CandidateUniverseUnavailable("candidate_universe_scope_not_supported")
     symbols = set(scope["symbols"])
     # Archive codes may include exchange suffixes; canonical candidate symbols are six digits.
     return {session: [row for row in rows if str(row["code"]).split(".")[0] in symbols]
