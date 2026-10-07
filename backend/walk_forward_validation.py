@@ -91,6 +91,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
@@ -432,6 +434,28 @@ class WalkForwardConfig:
         if self.step_sessions is not None:
             return int(self.step_sessions)
         return int(self.validation_sessions) + int(self.test_sessions)
+
+    def projection(self) -> dict:
+        return {"walk_forward_contract_version": WALK_FORWARD_CONTRACT_VERSION,
+                "min_train_sessions": self.min_train_sessions,
+                "validation_sessions": self.validation_sessions, "test_sessions": self.test_sessions,
+                "step_sessions": self.step_sessions, "embargo_sessions": self.embargo_sessions,
+                "max_train_sessions": self.max_train_sessions}
+
+    @classmethod
+    def from_projection(cls, value):
+        args = dict(value)
+        if args.pop("walk_forward_contract_version") != WALK_FORWARD_CONTRACT_VERSION:
+            raise ValueError("unsupported_walk_forward_contract")
+        config = cls(**args)
+        if config.projection() != value:
+            raise ValueError("noncanonical_walk_forward_config")
+        return config
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(json.dumps(self.projection(), sort_keys=True,
+                              separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 # ───────────────────────────── fold ─────────────────────────────

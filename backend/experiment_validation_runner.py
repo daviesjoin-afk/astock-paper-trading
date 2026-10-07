@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 try:
     import experiment_contract as EC
+    import candidate_experiment as CE
     import experiment_execution_model as EM
     import experiment_pit_validation as PV
     import financial_feature_evidence as FFE
@@ -22,6 +24,7 @@ try:
     import experiment_validation_repository as EVR
 except ImportError:  # pragma: no cover
     from . import experiment_contract as EC
+    from . import candidate_experiment as CE
     from . import experiment_execution_model as EM
     from . import experiment_pit_validation as PV
     from . import financial_feature_evidence as FFE
@@ -36,6 +39,7 @@ except ImportError:  # pragma: no cover
     from . import experiment_validation_repository as EVR
 
 RUNNER_VERSION = "r29-pit-validation-runner-v1"
+CANDIDATE_RUNNER_VERSION = "r29-candidate-pit-validation-runner-v1"
 
 
 def _unavailable(spec: EC.ExperimentSpec, code: str) -> EC.ExperimentResult:
@@ -76,7 +80,8 @@ def _serialize_result(result: EC.ExperimentResult) -> dict[str, Any]:
 
 def run_validation(
     spec: EC.ExperimentSpec, *, runner_code_revision: str,
-    strategy_version: SR.StrategyVersion | None,
+    strategy_version: SR.StrategyVersion | None = None,
+    strategy_candidate: Any = None,
     dataset_manifest: Mapping[str, Any] | None,
     samples: Sequence[Any], walk_forward_config: WFV.WalkForwardConfig,
     session_calendar: HSC.HistoricalSessionCalendar | None,
@@ -97,31 +102,51 @@ def run_validation(
     Build identity and every owner identity are explicit arguments. No current/latest
     selection, provider calls, filesystem discovery, or git subprocesses occur here.
     """
-    if not isinstance(spec, EC.ExperimentSpec):
+    if not isinstance(spec, (EC.ExperimentSpec, EC.CandidateExperimentSpec)):
         raise ValueError("spec must be an ExperimentSpec")
     if (runner_code_revision != spec.code_revision
             or not isinstance(runner_code_revision, str)):
         result = _unavailable(spec, "code_revision_mismatch")
         return {"status": "unavailable", "result": result.projection(),
                 "validation_evidence": None, "folds": [], "run_key": None}
-    if not isinstance(strategy_version, SR.StrategyVersion):
+    candidate_path = isinstance(spec, EC.CandidateExperimentSpec)
+    candidate_replay = None
+    if candidate_path:
+        if (not isinstance(walk_forward_config, WFV.WalkForwardConfig)
+                or walk_forward_config.fingerprint != spec.parameter_set.get("walk_forward_config_fingerprint")
+                or not isinstance(spec.parameter_set.get("experiment_plan_fingerprint"), str)
+                or len(spec.parameter_set["experiment_plan_fingerprint"]) != 64):
+            return {"status": "unavailable", "result": _unavailable(spec, "candidate_experiment_plan_mismatch").projection(),
+                    "validation_evidence": None, "folds": [], "run_key": None}
+        try:
+            candidate_replay = CE.compile_candidate_replay(strategy_candidate)
+            if strategy_version is not None or candidate_replay.subject != spec.subject:
+                raise ValueError("candidate_identity_mismatch")
+            CE.validate_candidate_asof(strategy_candidate, spec.end_date, spec.asof_policy["cutoff"])
+        except (TypeError, ValueError) as exc:
+            code = "candidate_asof_leakage" if str(exc) == "candidate_asof_leakage" else "candidate_identity_mismatch"
+            return {"status": "unavailable", "result": _unavailable(spec, code).projection(),
+                    "validation_evidence": None, "folds": [], "run_key": None}
+    if not candidate_path and (not isinstance(strategy_version, SR.StrategyVersion) or strategy_candidate is not None):
         result = _unavailable(spec, "strategy_identity_mismatch")
         return {"status": "unavailable", "result": result.projection(),
                 "validation_evidence": None, "folds": [], "run_key": None}
-    if not (strategy_version.strategy_id == spec.strategy.strategy_id
+    if not candidate_path and not (strategy_version.strategy_id == spec.strategy.strategy_id
             and strategy_version.version == spec.strategy.version
             and strategy_version.checksum == spec.strategy.checksum):
         result = _unavailable(spec, "strategy_identity_mismatch")
         return {"status": "unavailable", "result": result.projection(),
                 "validation_evidence": None, "folds": [], "run_key": None}
-    ast = strategy_version.definition.get("dsl_ast") if isinstance(strategy_version.definition, Mapping) else None
-    if ast is None:
+    ast = (strategy_version.definition.get("dsl_ast") if not candidate_path
+           and isinstance(strategy_version.definition, Mapping) else None)
+    if ast is None and not candidate_path:
         result = _unavailable(spec, "strategy_replay_definition_unavailable")
         return {"status": "unavailable", "result": result.projection(),
                 "validation_evidence": None, "folds": [], "run_key": None}
     try:
-        normalized_ast = DSL.normalize(ast)
-        dependencies = PV.strategy_dsl_dependencies(normalized_ast)
+        normalized_ast = DSL.normalize(ast) if not candidate_path else None
+        dependencies = (PV.replay_dsl_dependencies(candidate_replay) if candidate_path
+                        else PV.strategy_dsl_dependencies(normalized_ast))
     except (TypeError, ValueError):
         result = _unavailable(spec, "strategy_replay_definition_unavailable")
         return {"status": "unavailable", "result": result.projection(),
@@ -130,7 +155,7 @@ def run_validation(
         result = _unavailable(spec, "strategy_input_owner_unavailable")
         return {"status": "unavailable", "result": result.projection(),
                 "validation_evidence": None, "folds": [], "run_key": None}
-    if dependencies["financial_fields"] and (
+    if not candidate_path and dependencies["financial_fields"] and (
             financial_feature_repository is None or not financial_archive_fingerprint
             or spec.parameter_set.get("financial_archive_fingerprint") != financial_archive_fingerprint):
         result = _unavailable(spec, "financial_feature_evidence_missing")
@@ -148,7 +173,7 @@ def run_validation(
 
     tradability_capture: dict[str, Any] = {}
     evidence = PV.build_pit_validation_evidence(
-        spec, strategy_version=strategy_version, dataset_manifest=dataset_manifest,
+        spec, strategy_version=strategy_version, candidate_replay=candidate_replay, dataset_manifest=dataset_manifest,
         tradability_repository=tradability_repository, fundamental_records=fundamental_records,
         financial_feature_repository=financial_feature_repository,
         financial_archive_fingerprint=financial_archive_fingerprint,
@@ -160,7 +185,7 @@ def run_validation(
         tradability_replay_capture=tradability_replay_capture,
         tradability_capture_out=tradability_capture,
     )
-    folds = list(evidence.walk_forward.get("windows") or ())
+    folds = list(EC._thaw_json(evidence.walk_forward.get("windows") or ()))
     members = tradability_capture.get("members_by_session", {})
     if evidence.status != "ready":
         result = _unavailable(spec, evidence.reason_codes[0])
@@ -197,7 +222,8 @@ def run_validation(
                         if prior is not None and prior != item.get("feature_value"):
                             raise EM.ExperimentExecutionUnavailable("financial_feature_value_mismatch")
                         entry[name] = item.get("feature_value")
-            metrics = EM.simulate(spec, ast=normalized_ast, sessions=session_calendar.sessions,
+            replay_args = {"candidate_replay": candidate_replay} if candidate_path else {"ast": normalized_ast}
+            metrics = EM.simulate(spec, **replay_args, sessions=session_calendar.sessions,
                                   members_by_session=members, bars=bars,
                                   tradability_repository=tradability_repository,
                                   tradability_evidence=execution_facts,
@@ -215,11 +241,14 @@ def run_validation(
         except EM.ExperimentExecutionUnavailable as exc:
             result = _unavailable(spec, exc.reason)
             run_status = "blocked"
-        except Exception:
+        except Exception as exc:
+            if candidate_path and isinstance(exc, (OSError, sqlite3.Error)):
+                raise  # Infrastructure failure is retryable queue work, not canonical evaluation evidence.
             result = EC.ExperimentResult(status="failed", experiment_fingerprint=spec.fingerprint,
                                          failure_reason="validation_execution_failed")
             run_status = "failed"
 
+    runner_version = CANDIDATE_RUNNER_VERSION if candidate_path else RUNNER_VERSION
     owner_identities = {
         "calendar_fingerprint": session_calendar.calendar_fingerprint if session_calendar else None,
         "universe_archive_fingerprint": universe_archive_fingerprint,
@@ -227,11 +256,14 @@ def run_validation(
         "market_archive_fingerprint": market_archive_fingerprint,
         "financial_archive_fingerprint": financial_archive_fingerprint,
         "dataset_fingerprint": spec.dataset_fingerprint,
-        "strategy_version": spec.strategy.projection(),
+        ("experiment_subject" if candidate_path else "strategy_version"):
+            spec.subject.projection() if candidate_path else spec.strategy.projection(),
         "validation_evidence_fingerprint": evidence.validation_evidence_fingerprint,
     }
+    if candidate_path:
+        owner_identities["experiment_plan_fingerprint"] = spec.parameter_set["experiment_plan_fingerprint"]
     run_key = EVR.ExperimentValidationRepository.build_run_key(
-        spec.fingerprint, owner_identities, RUNNER_VERSION,
+        spec.fingerprint, owner_identities, runner_version,
     )
     output = {"status": run_status, "run_key": run_key,
               "owner_identities": owner_identities,
@@ -241,10 +273,13 @@ def run_validation(
     if validation_repository is not None:
         if not created_at:
             raise ValueError("created_at must be injected by the application boundary")
+        subject_args = {"subject": spec.subject.projection(),
+                        "experiment_plan_fingerprint": spec.parameter_set["experiment_plan_fingerprint"]} if candidate_path else {
+            "strategy_id": spec.strategy.strategy_id, "strategy_version": spec.strategy.version,
+            "strategy_checksum": spec.strategy.checksum}
         output["run"] = validation_repository.append_run(
             run_key=run_key, experiment_fingerprint=spec.fingerprint,
-            strategy_id=spec.strategy.strategy_id, strategy_version=spec.strategy.version,
-            strategy_checksum=spec.strategy.checksum,
+            **subject_args,
             calendar_fingerprint=owner_identities["calendar_fingerprint"],
             universe_archive_fingerprint=universe_archive_fingerprint,
             financial_archive_fingerprint=financial_archive_fingerprint,
@@ -252,7 +287,7 @@ def run_validation(
             market_archive_fingerprint=market_archive_fingerprint,
             dataset_fingerprint=spec.dataset_fingerprint,
             validation_evidence=evidence.projection(), result=result.projection(), folds=folds,
-            runner_version=RUNNER_VERSION, runner_code_revision=runner_code_revision,
+            runner_version=runner_version, runner_code_revision=runner_code_revision,
             created_at=created_at,
         )
     return output

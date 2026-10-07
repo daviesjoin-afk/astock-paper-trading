@@ -184,6 +184,18 @@ migration **v35** 新增 `experiment_search_runs` / `experiment_search_jobs` /
 `data_fetcher`（兼容入口）+ `marketdata_*`（transport / cache / providers / normalizers）、
 `universe`、`factors`、`decision_*`、`adaptive_*`、`asymmetric_risk`、`build_info`。
 
+## R36-B1 候选实验桥接
+
+- `backend/candidate_experiment.py`：纯候选回放契约，版本化 entry/factor/exit、历史成员过滤和 as-of 检查。
+- `backend/candidate_experiment_service.py`：exact job/plan/candidate 到 R29 证据的编排及独立完成核验。
+- `backend/experiment_contract.py`：既有实验权威内增加候选 subject/spec，共享环境归一和投影。
+- `backend/experiment_search_contract.py`：v2 canonical plan；v1 仍可读，不补默认计划。
+- `backend/experiment_validation_repository.py`：升级同一 ledger，v1 历史 hash 原样保留，v2 候选不冒充正式策略。
+- `backend/test_r36b1_candidate_experiment_execution.py`、`backend/fixtures/r36b1_legacy_*.json`：CEX 行为测试与 exact base 冻结证据。
+- `work/r36b1_candidate_experiment_mutation_check.py`：M-CEX 可逆真实故障注入。
+
+回放仍由现有 R29 runner/PIT/execution model 执行；没有新 facade、重复 runner 或永久结果表。
+
 ## frontend/ 结构
 
 ```

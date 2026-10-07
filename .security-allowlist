@@ -77,3 +77,20 @@ value:1.7.7.3
 value:d:\d\d
 # 历史提交中同一份部署文档的占位路径
 value:/root/astock-data-backup.tgz
+
+# R36-B1: publishable synthetic regression values and canonical SHA256 fingerprints.
+# Exact-base fixtures from bc1e25d4e84440c635586efa8974c13486d90c64.
+# CEX-01/19/20 verify these immutable public digests; none are credentials.
+# Keep value-level exceptions only; no path or general scanning exemption.
+value:21dcce1faaeaf7a92db1ee1337ae3461c4c1c10c2f99aa82dc257c1cee33f07f
+value:3b8e6da844792a6e276fb7555e6111940ff5750c045fcbe624d71d7cd6f8509e
+value:986800bd38e19e3e06602b691cd3eb2fec1b2919723a7670d437a607c1af2ba7
+value:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+value:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+value:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+value:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+value:eceab43d72907ccf88bd5ea24f175e608b2b8bcc084b7522f4afd5280faa9d1e
+value:edc6cd9433d7555bc86f936894d7c19dc9a93888d83d9ab1a7f5d4be82b6b7c6
+value:ee2a64b4e9354b68b19b51628389349edd7de9b9bd43bdaccac1e3cfa7500799
+value:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+value:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff

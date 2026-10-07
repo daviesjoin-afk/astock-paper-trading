@@ -10,11 +10,13 @@ from typing import Any, Mapping, Sequence
 
 try:
     import experiment_contract as EC
+    import candidate_experiment as CE
     import point_in_time as PIT
     import strategy_dsl_evaluator as EVAL
     import tradability_archive as TA
 except ImportError:  # pragma: no cover
     from . import experiment_contract as EC
+    from . import candidate_experiment as CE
     from . import point_in_time as PIT
     from . import strategy_dsl_evaluator as EVAL
     from . import tradability_archive as TA
@@ -69,7 +71,8 @@ def _assumptions(spec: EC.ExperimentSpec, stress: Mapping[str, Any] | None = Non
             float(slippage), float(commission), float(minimum), float(stamp))
 
 
-def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
+def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any] | None = None,
+             candidate_replay: CE.CandidateReplayDefinition | None = None,
              sessions: Sequence[str], members_by_session: Mapping[str, Sequence[Any]],
              bars: Sequence[Mapping[str, Any]], tradability_repository: Any,
              tradability_evidence: Mapping[tuple[str, str], Any] | None = None,
@@ -78,6 +81,15 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
              stress: Mapping[str, Any] | None = None,
              include_trace: bool = False) -> dict[str, Any]:
     """Run one deterministic long-only replay; missing facts fail closed."""
+    if (ast is None) == (candidate_replay is None):
+        raise ExperimentExecutionUnavailable("ambiguous_replay_definition")
+    if isinstance(spec, EC.CandidateExperimentSpec) and candidate_replay is None:
+        raise ExperimentExecutionUnavailable("candidate_replay_definition_required")
+    if candidate_replay is not None:
+        if (not isinstance(candidate_replay, CE.CandidateReplayDefinition)
+                or not isinstance(spec, EC.CandidateExperimentSpec) or candidate_replay.subject != spec.subject):
+            raise ExperimentExecutionUnavailable("candidate_identity_mismatch")
+        members_by_session = CE.filter_candidate_members(candidate_replay, members_by_session, spec.universe_fingerprint)
     stress = stress or {}
     execution_delay = stress.get("execution_delay_sessions", 0)
     signal_delay = stress.get("signal_delay_sessions", 0)
@@ -85,6 +97,8 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
            for value in (execution_delay, signal_delay)):
         raise ExperimentExecutionUnavailable("session_delay_invalid")
     initial_cash, participation, max_positions, _unused, slippage, commission_rate, minimum_commission, stamp_rate = _assumptions(spec, stress)
+    constraints = candidate_replay.candidate.constraints if candidate_replay is not None else {}
+    max_positions = min(max_positions, constraints.get("max_positions", max_positions))
     if len(sessions) < 2:
         raise ExperimentExecutionUnavailable("execution_sessions_insufficient")
     bar_by_pair = {(row["code"], row["session"]): row for row in bars}
@@ -152,6 +166,12 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
                 continue
             if action == "buy" and code not in positions and len(positions) < max_positions:
                 budget = min(cash, initial_cash / max_positions)
+                if "max_weight_pct" in constraints:
+                    budget = min(budget, initial_cash * constraints["max_weight_pct"])
+                if "max_exposure_pct" in constraints:
+                    gross = sum(position["shares"] * float(current_bars[name]["open"])
+                                for name, position in positions.items() if name in current_bars)
+                    budget = min(budget, max(0, initial_cash * constraints["max_exposure_pct"] - gross))
                 price = open_price * (1 + slippage)
                 shares = min(max_shares, math.floor(budget / price))
                 if shares > 0:
@@ -208,6 +228,7 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
         next_members = {str(item.get("code")) for item in members_by_session.get(next_session, ())
                         if isinstance(item, Mapping) and item.get("code")}
         signals = {}
+        exits = {}
         for code in sorted(set(day_members) | set(positions)):
             rows = history.get(code, ())
             snapshot = {field: [row.get(field) for row in rows]
@@ -229,9 +250,16 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
                     name: [entry.get(name) for entry in field_values]
                     for name in required_financial_fields
                 }
-            signals[code] = EVAL.evaluate(ast, snapshot) if rows and code in next_members else False
+            if candidate_replay is None:
+                signals[code] = EVAL.evaluate(ast, snapshot) if rows and code in next_members else False
+            elif rows:
+                signals[code], exits[code] = candidate_replay.signals(snapshot)
+                signals[code] = signals[code] and code in next_members
+            else:
+                signals[code], exits[code] = False, False
         for code in sorted(set(positions) | set(signals)):
-            action = ("sell" if code in positions and not signals.get(code, False) else
+            sell_signal = exits.get(code, False) if candidate_replay is not None else not signals.get(code, False)
+            action = ("sell" if code in positions and sell_signal else
                       "buy" if code not in positions and signals.get(code, False) else None)
             if action is not None and (not execution_delay and not signal_delay or code not in pending):
                 due_index = index + 1 + signal_delay + execution_delay

@@ -3898,6 +3898,52 @@ passed / good / promotable。R36-A 尚无 candidate 与实验 evidence 的绑定
 `completed`；只提供调度、领取、执行失败重试与取消。
 
 
+## R36-B1 Candidate Experiment Subject + R29 PIT Execution
+
+R36-B1 建立候选到实验的显式桥接。`strategy_candidate` 仍拥有候选内容身份；
+`candidate_experiment` 只把自证的候选编译为 `candidate-replay-v1`。
+`CandidateExperimentSubject` 与 `CandidateExperimentSpec` 放在既有 `experiment_contract`；
+父策略的完整三元组只记录来源，不能冒充正式 `StrategyVersion`，也不从父策略读取回放规则。
+旧 `ExperimentSpec` 的 r28-a.v1 projection/fingerprint 保持原样。
+
+`candidate-replay-v1`：entry 与 factor 同时成立才入场；factor 只限制入场。
+有 exit 时只由显式 exit 决定退出；没有 exit 才采用 inverse-entry。
+成员资格排除只限制新入场，不制造策略退出信号；缺少持仓行情明确阻止回放。
+三个 AST 的依赖在既有 PIT owner 中取并集，缺任何金融字段证据都阻止验证。
+`a_share_all` 使用历史成员；`explicit_symbols` 仅过滤已证明的历史成员，不制造成员。
+`asof_universe_identity` 必须等于 archive identity。没有历史板块分类 owner，
+`a_share_boards` 明确返回 `candidate_universe_board_scope_not_supported`，不用实时或代码前缀替代。
+结束日期与上海时区的 cutoff 日期不得晚于 candidate.asof。
+候选 max_positions、单名称 max_weight_pct 与总 max_exposure_pct 在现有执行循环入场时生效。
+
+`experiment_search_contract.ExperimentSearchPlan` 固定代码、数据与各 archive/calendar、日期、
+as-of、费用、执行、组合、WFV 和 seed。其 canonical projection/fingerprint 进入
+`experiment-search-contract-v2` identity；WFV projection/fingerprint 由既有 owner 提供。
+v1 search 保留旧 identity、可以读取，执行时明确拒绝，不自动补实验计划。
+Search repository 读取时重建 spec 并核对列、预算、数量和 payload hash，损坏记录拒绝读取。
+
+R29 的 `run_validation` 在正式策略与候选之间要求互斥输入，候选路径使用独立 runner version，
+PIT dimension 为 `experiment_subject`。仍使用同一 `experiment_execution_model` 循环，未新增 runner。
+候选对 raw security-master 日期列的适配仅用于候选 PIT 路径；正式路径保持旧投影与 run key。
+验证 fold 的冻结结构在写 JSON 前展开，内容身份不变。
+
+既有 `experiment_validation_runs` 升级为 subject-aware ledger v2，没有新永久表。
+正式三列对候选为 NULL，候选与 parent pins 独立存储；SQL CHECK 禁止二者混淆。
+迁移原样复制旧 id/run_key/JSON/payload hash，以 record v1 decoder 继续自证；
+新候选用 record v2，正式新写入仍保持 v1 payload 与幂等。
+`recent_runs(strategy_id=...)` 只包含正式 subject，父策略历史不会混入候选。
+
+`candidate_experiment_service` 是唯一候选 PIT 编排入口：prepare exact job/plan/candidate，
+在没有 search 写事务时运行 R29，落库后独立 `get_run(exact run_key)` 并核验 subject、plan、
+experiment、runner、owner identities、PIT/result identity 和重建 run key，最后短事务写完成。
+`record_verified_completion_event` 的生产调用点只有这一个，owner 固定为 `experiment_validation_run`。
+普通 service/repository completed 入口继续拒绝。相同证据重复完成幂等；不同证据冲突。
+落库后崩溃用 exact run_key 补写，不需要再计算。基础设施异常、准备阶段拒绝以及未产生 run_key 的 R29 拒绝写 failed 供有限重试。不支持的板块通过 R29 留下真实 blocked 证据，再绑定该 run_key 完成队列工作。
+
+**队列 completed 只说明这项证据生产工作结束。** canonical blocked/unavailable/failed 也可完成工作，
+不意味着候选 passed/good/promotable。队列不复制指标；R30、selection、ranking、promotion、AI
+以及 R36-B2/R36-C/R36-D/R37 均未进入本阶段。
+
 ## 架构演进记录（历史批次：模块化与边界固化）
 
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。
