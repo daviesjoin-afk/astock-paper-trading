@@ -430,6 +430,38 @@ def _execution_stress(category: str, parameters: Mapping[str, Any], spec: EC.Exp
     return stress, evidence
 
 
+def verify_candidate_robustness_report(*, report: Mapping[str, Any],
+                                       baseline_run: Mapping[str, Any],
+                                       spec: EC.CandidateExperimentSpec,
+                                       plan: RC.RobustnessPlan,
+                                       candidate_replay: CE.CandidateReplayDefinition) -> dict[str, Any]:
+    """Public exact R29<->R30 binding check for one canonical candidate report.
+
+    Reuses the single candidate baseline verifier (so R36-C does not copy it) and then
+    proves the report's identity fields and embedded subject agree with that exact
+    baseline and with the pinned robustness plan.
+    """
+    baseline_identity = _verify_candidate_baseline(baseline_run, spec, plan, candidate_replay)
+    if not isinstance(report, Mapping) or not report:
+        raise RobustnessBaselineError("canonical_robustness_report_not_found")
+    if (report.get("baseline_run_key") != baseline_identity["run_key"]
+            or report.get("baseline_experiment_fingerprint") != spec.fingerprint
+            or report.get("baseline_result_fingerprint")
+                != baseline_identity["result_fingerprint"]
+            or report.get("plan_fingerprint") != plan.fingerprint
+            or report.get("runner_version") != CANDIDATE_RUNNER_VERSION):
+        raise RobustnessBaselineError("robustness_report_binding_mismatch")
+    embedded = report.get("baseline_identity")
+    if not isinstance(embedded, Mapping):
+        raise RobustnessBaselineError("robustness_report_binding_mismatch")
+    if (embedded.get("run_key") != baseline_identity["run_key"]
+            or embedded.get("experiment_fingerprint") != spec.fingerprint
+            or embedded.get("result_fingerprint") != baseline_identity["result_fingerprint"]
+            or embedded.get("experiment_subject") != baseline_run.get("subject")):
+        raise RobustnessBaselineError("robustness_report_binding_mismatch")
+    return baseline_identity
+
+
 def _resolve_subject(*, spec, plan, baseline_run, strategy_version, candidate_replay):
     """Return (subject_kind, baseline_identity, ast, deps, candidate_path, replay)."""
     candidate_path = isinstance(spec, EC.CandidateExperimentSpec)

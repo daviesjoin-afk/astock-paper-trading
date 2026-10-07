@@ -252,3 +252,13 @@ CI 会重建并校验一致性；服务端 `/app.js`、`/app.css` 直接下发 `
   `*_runner.py`、`deploy/`、`.github/`、`Dockerfile*`、`docker-compose*`、`*.sh|bat|ps1`、
   `docs/`、`README*`、`pyproject.toml`、`requirements.txt`）。
   注意接口路径常被**动态拼接**（`'/api/x/'+id`），只搜字面量会漏调用方。
+
+
+## R36-C 候选选择与迭代策略
+
+- `backend/candidate_selection.py`：纯搜索选择 contract、gates、Pareto fronts 与 report identity。
+- `backend/candidate_selection_repository.py`：append-only canonical selection-report owner。
+- `backend/candidate_selection_service.py`：exact R29/R30 evidence binding 与 search-level orchestration。
+
+选择策略 pin 在 search request 身份（`experiment-search-contract-v3`）而非 experiment plan；
+R36-C 只消费既有 R29/R30 证据，不复制 evaluator、不写 candidate/lifecycle/promotion，也没有前端或 HTTP API。
