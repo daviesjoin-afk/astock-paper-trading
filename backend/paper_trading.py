@@ -6744,6 +6744,8 @@ def _quotes(codes, asof_date=None):
         row["quote_validation"] = validation
         row["quote_cross_check"] = {
             "source": cross_row.get("source") or "tencent_public_quote+sina_public_quote",
+            "code": cross_row.get("code"), "price": cross_price, "pct": cross_pct,
+            "name": cross_row.get("name"),
             "quote_at": cross_row.get("quote_at"),
             "price_gap_pct": round(price_gap * 100, 3) if price_gap is not None else None,
             "pct_gap": round(pct_gap, 3) if pct_gap is not None else None,

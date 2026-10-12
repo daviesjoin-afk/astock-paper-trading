@@ -786,7 +786,7 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
     for rows in (all_buys, all_sells):
         for row in rows:
             key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
-            if not _identity_ok(row) or not EV.is_verified_row(row):
+            if not _identity_ok(row) or not EV.is_positive_execution_row(row):
                 incomplete.add(key)
     # A filled order with no verified fill row is not evidence of zero cash;
     # it blocks the per-symbol projection for that key.  An order only counts as
@@ -797,15 +797,18 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
         (_all_filled_buy_orders(conn, context, account_id)[0], all_buys),
         (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),
     ):
+        zero_orders = _confirmed_zero_orders(conn, orders)
         rows_by_order: dict[int, list[dict]] = {}
         for row in all_rows:
             if row.get("order_id") is not None:
                 rows_by_order.setdefault(int(row["order_id"]), []).append(row)
         for order in orders:
+            if int(order["id"]) in zero_orders:
+                continue
             key = (str(order.get("account_id") or ""), str(order.get("code") or ""))
             rows = rows_by_order.get(int(order["id"]), [])
-            if not EV.is_verified_row(order) or not rows or any(
-                not _identity_ok(row) or not EV.is_verified_row(row) for row in rows
+            if not EV.is_positive_execution_row(order) or not rows or any(
+                not _identity_ok(row) or not EV.is_positive_execution_row(row) for row in rows
             ):
                 incomplete.add(key)
     for side, rows in (("buy", buys), ("sell", sells)):
@@ -1060,7 +1063,7 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         for order in buy_orders:
             if int(order["id"]) in zero_orders:
                 continue
-            if not EV.is_verified_row(order):
+            if not EV.is_positive_execution_row(order):
                 return None, STATUS_UNKNOWN
             if int(order["id"]) not in verified_buy_order_ids:
                 return None, STATUS_UNKNOWN
@@ -1079,7 +1082,7 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         return 0.0, STATUS_VERIFIED
     if _unproven_sell_exists(conn, context, account_id):
         return None, STATUS_UNKNOWN
-    if any(not _identity_ok(row) or not EV.is_verified_row(row) for row in buy_rows):
+    if any(not _identity_ok(row) or not EV.is_positive_execution_row(row) for row in buy_rows):
         return None, STATUS_UNKNOWN
     total = 0.0
     for row in buys:

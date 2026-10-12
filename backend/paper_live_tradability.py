@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import market_data_contract as MDC
+import market_data_service as MDSvc
 from marketdata_transport import http_get
 import tradability_archive as TA
 import tradability_ingestion as TI
@@ -21,6 +22,8 @@ TZ = dt.timezone(dt.timedelta(hours=8))
 STATUS_MAX_AGE_SECONDS = 120
 _CACHE = {}
 _LOCK = threading.Lock()
+PROFILE_SOURCE = "eastmoney_stock_profile+complete_suspension_report+verified_quote"
+MARKET_SOURCE = "current_full_market_membership+complete_suspension_report+verified_quote_range"
 
 
 def _get(key, url, params):
@@ -60,7 +63,8 @@ def _suspensions(day):
         rows.extend(result["data"])
         observed = max(observed or stamp, stamp)
     if (len(rows) != expected or len({json.dumps(r, sort_keys=True) for r in rows}) != len(rows)
-            or any(not str(r.get("SECURITY_CODE") or "").isdigit() for r in rows)):
+            or any(len(str(r.get("SECURITY_CODE") or "")) != 6
+                   or not str(r.get("SECURITY_CODE") or "").isdigit() for r in rows)):
         raise ValueError("suspension coverage incomplete")
     return rows, observed
 
@@ -68,7 +72,9 @@ def _suspensions(day):
 def _time(value):
     if not value:
         return None
-    result = dt.datetime.fromisoformat(str(value))
+    text = str(value)
+    result = (dt.datetime.strptime(text, "%Y%m%d%H%M%S") if text.isdigit() and len(text) == 14
+              else dt.datetime.fromisoformat(text))
     return result.replace(tzinfo=TZ) if result.tzinfo is None else result.astimezone(TZ)
 
 
@@ -99,22 +105,65 @@ def prefetch(quotes, *, asof_day):
         suspensions, suspension_at = _suspensions(day)
     except Exception:
         return {}
+    try:
+        reading = MDSvc.read_snapshot(MDC.LIVE_MARKET_POLICY, now=dt.datetime.now(TZ), asof_day=day)
+        market = ({str(r.get("code")): dict(r) for r in reading.rows()}
+                  if reading.status == MDC.STATUS_FRESH and reading.snapshot is not None
+                  and reading.snapshot.kind == MDSvc.KIND_FULL_MARKET_SNAPSHOT
+                  and reading.snapshot.complete and reading.snapshot.as_of == day
+                  and reading.snapshot.verification == MDC.VERIFICATION_VERIFIED else {})
+        market_fingerprint = MDC.snapshot_fingerprint(reading.snapshot) if market else None
+    except Exception:
+        market, market_fingerprint = {}, None
 
     def one(item):
         code, quote = item
         try:
             if len(code) != 6 or not code.isdigit() or not code.startswith(("0", "3", "6")):
                 return code, None
-            payload, profile_at = _get(("profile", day, code),
-                "https://push2.eastmoney.com/api/qt/stock/get",
-                {"fltt": 2, "invt": 2, "secid": f"{1 if code.startswith('6') else 0}.{code}",
-                 "fields": "f57,f58,f189,f51,f52,f43,f86"})
-            profile = payload.get("data") or {}
-            if payload.get("rc") != 0 or profile.get("f57") != code or not profile.get("f58"):
-                return code, None
-            listing = dt.datetime.strptime(str(profile.get("f189")), "%Y%m%d").date()
-            lower, upper, price = float(profile["f52"]), float(profile["f51"]), float(profile["f43"])
-            price_at = dt.datetime.fromtimestamp(float(profile["f86"]), TZ)
+            primary_quote = quote
+            cross = quote.get("quote_cross_check") or {}
+            if (cross.get("passed") is True and cross.get("code") == code
+                    and cross.get("source") in ("tencent_public_quote", "sina_public_quote")
+                    and float(cross.get("price") or 0) > 0):
+                current_at = _time(cross.get("quote_at"))
+                if current_at is not None and current_at > _time(quote["quote_at"]):
+                    # This is a status reference only. Never retimestamp the
+                    # older primary price or its fund-flow fields.
+                    quote = {**quote, "price": float(cross["price"]),
+                             "quote_at": current_at.isoformat(),
+                             "name": cross.get("name") or quote.get("name")}
+            row = market.get(code) or {}
+            price = float(quote["price"])
+            low, high = row.get("low"), row.get("high")
+            row_at = _time(row.get("quote_at"))
+            interior = (isinstance(low, (int, float)) and isinstance(high, (int, float))
+                        and math.isfinite(low) and math.isfinite(high) and 0 < low < price < high
+                        and row_at is not None and row_at.date().isoformat() == day
+                        and row_at <= dt.datetime.now(TZ))
+            if interior and row.get("name"):
+                # A complete current-market observation proves current membership,
+                # not an IPO date or historical membership. An interior price is
+                # strictly inside any fixed daily limit: observed low/high already
+                # lie inside that limit. No order-book lock is inferred at extrema.
+                listing, lower, upper = None, float(low), float(high)
+                profile = {"f57": code, "f58": quote.get("name") or row["name"]}
+                profile_at = reading.snapshot.saved_at or reading.snapshot.observed_at
+                price_at = _time(quote["quote_at"])
+                source = MARKET_SOURCE
+                market_identity = market_fingerprint
+            else:
+                payload, profile_at = _get(("profile", day, code),
+                    "https://push2.eastmoney.com/api/qt/stock/get",
+                    {"fltt": 2, "invt": 2, "secid": f"{1 if code.startswith('6') else 0}.{code}",
+                     "fields": "f57,f58,f189,f51,f52,f43,f86"})
+                profile = payload.get("data") or {}
+                if payload.get("rc") != 0 or profile.get("f57") != code or not profile.get("f58"):
+                    return code, None
+                listing = dt.datetime.strptime(str(profile.get("f189")), "%Y%m%d").date()
+                lower, upper, price = float(profile["f52"]), float(profile["f51"]), float(profile["f43"])
+                price_at = dt.datetime.fromtimestamp(float(profile["f86"]), TZ)
+                source, market_identity = PROFILE_SOURCE, None
             price_age = (dt.datetime.now(TZ) - price_at).total_seconds()
             if (not all(math.isfinite(v) for v in (lower, upper, price)) or not 0 < lower < price < upper
                     or price_at.date().isoformat() != day or not -120 <= price_age <= STATUS_MAX_AGE_SECONDS
@@ -123,10 +172,10 @@ def prefetch(quotes, *, asof_day):
                 return code, None
             observed = max(_time(profile_at), _time(suspension_at), _time(quote.get("quote_at")))
             suspended = _suspended(suspensions, code, observed)
-            if listing > observed.date() or suspended is None:
+            if (listing is not None and listing > observed.date()) or suspended is None:
                 return code, None
             volume = quote.get("volume")
-            fields = {"is_listed": True, "listing_date": listing.isoformat(),
+            fields = {"is_listed": True, "listing_date": listing.isoformat() if listing is not None else None,
                       "is_st": "ST" in profile["f58"].upper() or "退" in profile["f58"],
                       "is_suspended": suspended, "has_market_quote": True,
                       "has_trade_volume": (volume > 0 if isinstance(volume, (int, float))
@@ -137,11 +186,15 @@ def prefetch(quotes, *, asof_day):
                           "source_observations": {"profile": profile_at, "suspension": suspension_at,
                                                   "quote": quote.get("quote_at"), "latest": observed.isoformat()},
                           "source_evidence": {"profile": profile, "suspension_count": len(suspensions),
+                                              "status_price_reference": {"price": quote["price"], "quote_at": quote["quote_at"]},
+                                              "primary_price_reference": {"price": primary_quote["price"], "quote_at": primary_quote["quote_at"]},
+                                              "market_snapshot_fingerprint": market_identity,
+                                              "observed_range": {"low": lower, "high": upper},
                                               "suspension_rows": [r for r in suspensions if r["SECURITY_CODE"] == code],
                                               "suspension_digest": hashlib.sha256(json.dumps(
                                                   suspensions, sort_keys=True).encode()).hexdigest()},
-                          "source": "eastmoney_stock_profile+complete_suspension_report+verified_quote"}
-        except (ValueError, TypeError, KeyError, requests.RequestException):
+                          "source": source}
+        except (ValueError, TypeError, KeyError, OverflowError, requests.RequestException):
             return code, None
     with ThreadPoolExecutor(max_workers=min(8, len(selected))) as executor:
         return {code: fact for code, fact in executor.map(one, selected.items()) if fact is not None}
@@ -174,7 +227,7 @@ def persist(conn, quote, *, code, asof_day):
             or not instant or not observed or not effective or max(observed, effective) > instant
             or (instant - observed).total_seconds() > STATUS_MAX_AGE_SECONDS
             or observed.date().isoformat() != str(asof_day)[:10]
-            or item.get("source") != "eastmoney_stock_profile+complete_suspension_report+verified_quote"
+            or item.get("source") not in (PROFILE_SOURCE, MARKET_SOURCE)
             or quote.get("quote_validation") != "cross_source_checked"):
         raise ValueError("current tradability identity/time evidence invalid")
     fingerprint = hashlib.sha256(json.dumps(item, sort_keys=True, allow_nan=False).encode()).hexdigest()

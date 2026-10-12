@@ -22,12 +22,60 @@ class LiveTradabilityTests(unittest.TestCase):
                         "f43": 10.0, "f86": self.now.timestamp()}}
         self.report = {"success": True, "result": {"pages": 1, "count": 0, "data": []}}
 
-    def prefetch(self, quote=None, profile=None, report=None):
+    def prefetch(self, quote=None, profile=None, report=None, reading=None):
         def get(key, url, params):
             value = (report or self.report) if key[0] == "suspend" else (profile or self.profile)
             return value, self.now.isoformat()
-        with patch.object(L, "_get", side_effect=get):
+        with patch.object(L, "_get", side_effect=get), patch.object(L.MDSvc, "read_snapshot", return_value=(
+                reading or L.MDC.unavailable_reading(L.MDC.LIVE_MARKET_POLICY, L.MDC.REASON_MISSING))):
             return L.prefetch({"600001": quote or self.quote}, asof_day=self.day)
+
+    def market_reading(self, *, row_day=None, complete=True):
+        row = {**self.quote, "name": "当前股票", "low": 9.0, "high": 11.0,
+               "quote_at": row_day + "T09:00:00+08:00" if row_day else self.now.isoformat()}
+        snapshot = L.MDC.MarketDataSnapshot(kind="full_market_snapshot", rows=(row,),
+                    as_of=self.day, observed_at=self.now.isoformat(), saved_at=self.now.isoformat(),
+                    complete=complete, expected_rows=1, verification="verified",
+                    verification_method="coverage_integrity")
+        return L.MDC.MarketDataReading(availability="available", freshness="fresh", status="fresh",
+                                       policy_name="test", snapshot=snapshot)
+
+    def test_complete_current_membership_and_interior_range_need_no_profile_endpoint(self):
+        reading = self.market_reading()
+        def get(key, *args):
+            self.assertEqual(key[0], "suspend", "interior quote should not need the blocked profile endpoint")
+            return self.report, self.now.isoformat()
+        with patch.object(L, "_get", side_effect=get), patch.object(L.MDSvc, "read_snapshot", return_value=reading):
+            item = L.prefetch({"600001": self.quote}, asof_day=self.day)["600001"]
+        self.assertEqual(item["source"], L.MARKET_SOURCE)
+        self.assertIsNone(item["fields"]["listing_date"], "current membership must not invent an IPO date")
+        self.assertTrue(item["fields"]["is_listed"])
+        self.assertFalse(item["fields"]["is_price_limit_locked"])
+        self.assertTrue(item["source_evidence"]["market_snapshot_fingerprint"])
+
+    def test_incomplete_or_previous_day_range_cannot_prove_current_unlocked_state(self):
+        for reading in (self.market_reading(complete=False), self.market_reading(row_day="2000-01-01")):
+            profile = copy.deepcopy(self.profile)
+            profile["data"]["f86"] = (self.now - dt.timedelta(hours=1)).timestamp()
+            self.assertEqual(self.prefetch(profile=profile, reading=reading), {})
+
+    def test_range_extrema_do_not_bypass_missing_profile_evidence(self):
+        profile = copy.deepcopy(self.profile)
+        profile["data"]["f86"] = (self.now - dt.timedelta(hours=1)).timestamp()
+        self.assertEqual(self.prefetch(quote={**self.quote, "price": 11.0}, profile=profile,
+                                      reading=self.market_reading()), {})
+
+    def test_fresh_independent_status_reference_does_not_retimestamp_primary_quote(self):
+        old = (self.now - dt.timedelta(minutes=3)).isoformat()
+        quote = {**self.quote, "quote_at": old, "quote_cross_check": {
+            "code": "600001", "price": 10.01, "name": "当前股票", "pct": 1.1,
+            "quote_at": self.now.strftime("%Y%m%d%H%M%S"), "passed": True,
+            "source": "tencent_public_quote"}}
+        item = self.prefetch(quote=quote, reading=self.market_reading())["600001"]
+        self.assertEqual(quote["quote_at"], old)
+        self.assertEqual(quote["price"], 10.0)
+        self.assertEqual(item["source_evidence"]["status_price_reference"]["price"], 10.01)
+        self.assertEqual(item["source_evidence"]["primary_price_reference"]["quote_at"], old)
 
     def test_profile_and_complete_report_produce_current_evidence(self):
         item = self.prefetch()["600001"]
