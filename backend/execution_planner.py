@@ -566,10 +566,13 @@ def execution_context_from_facts(
             MDC.EXECUTION_QUOTE_POLICY, MDC.REASON_ASOF_UNPROVABLE,
             access_mode=MDC.ACCESS_READ,
         )
-    tradability = TA.tradability_at(
-        row.get("code"), day, decision_time=execution_asof,
-        repository=TA.TradabilityArchiveRepository(conn),
-    )
+    if quote.get("tradability_observation_status") == "unavailable":
+        tradability = TA.unknown_decision(row.get("code"), day, decision_time=execution_asof)
+    else:
+        tradability = TA.tradability_at(
+            row.get("code"), day, decision_time=execution_asof,
+            repository=TA.TradabilityArchiveRepository(conn),
+        )
     cycle_id = row.get("cycle_id")
     sellable = None
     if row.get("side") == "sell" and cycle_id is not None and day:
@@ -1876,6 +1879,9 @@ def commit_fill(
     )
 
     quote = plan.get("execution_quote") or plan.get("quote") or {}
+    if execution_context is None and quote.get("tradability_observation"):
+        import paper_live_tradability as PLTrad
+        PLTrad.persist(conn, quote, code=code, asof_day=asof_day)
     context = execution_context or execution_context_from_facts(
         conn=conn, order=order, quote=quote, asof_day=asof_day, reserved=reserved,
     )

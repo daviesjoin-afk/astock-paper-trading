@@ -41,6 +41,7 @@ if BACKEND_DIR not in sys.path:
 import paper_trading as PT  # noqa: E402
 import tradability_archive as TA  # noqa: E402
 import universe as U  # noqa: E402
+import tradability_ingestion as TI  # noqa: E402
 
 
 class PaperRiskExitProductionPathTestCase(unittest.TestCase):
@@ -520,6 +521,43 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             orders = conn.execute("SELECT status FROM paper_orders WHERE account_id=? AND side='sell'", (account_id,)).fetchall()
             self.assertEqual(len(orders), 1, "Only 1 order created in DB during cooldown")
             self.assertEqual(orders[0]["status"], "unfilled_limit_down")
+
+    def test_pending_risk_sell_is_reused_when_tradability_evidence_is_missing(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM historical_tradability_archive")
+        first = PT.monitor_risk(self.day)
+        self.assertEqual(first["orders"][0]["status"], "pending_execution")
+        self._clear_scan_run_state()
+        second = PT.monitor_risk(self.day)
+        self.assertEqual(second["orders"][0]["status"], "pending_execution_wait")
+        with PT._db_readonly() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_orders WHERE side='sell'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills WHERE side='sell'").fetchone()[0], 0)
+
+    def test_prefetched_current_status_closes_empty_archive_execution_path(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM historical_tradability_archive")
+            TI.ensure_ingestion_schema(conn)
+        quote = self.quotes_map[self.code]
+        quote["tradability_observation_status"] = "available"
+        quote["tradability_observation"] = {
+            "code": self.code, "session_date": self.day.isoformat(),
+            "observed_at": self.day.isoformat() + "T14:49:59+08:00",
+            "effective_at": self.day.isoformat() + "T14:49:59+08:00",
+            "source": "eastmoney_stock_profile+complete_suspension_report+verified_quote",
+            "fields": {"is_listed": True, "listing_date": "2000-01-01", "is_st": False,
+                       "is_suspended": False, "has_market_quote": True,
+                       "has_trade_volume": True, "is_price_limit_locked": False},
+        }
+        result = PT.monitor_risk(self.day)
+        self.assertEqual(result["orders"][0]["status"], "filled")
+        with PT._db_readonly() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM historical_tradability_archive").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills WHERE side='sell'").fetchone()[0], 1)
 
     # -------------------------------------------------------------------------
     # Scenario J: 冻结语义与容量限制互不干扰（PAPER_ENTRY_FREEZE 不阻断风控退出）

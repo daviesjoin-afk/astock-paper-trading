@@ -71,6 +71,7 @@ import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
 import paper_dynamic_allocation as PDAlloc
+import paper_live_tradability as PLTrad
 import paper_position_review as PReview
 import paper_replacement_decision as PRep
 import adaptive_selection_compat as ASC
@@ -6750,6 +6751,15 @@ def _quotes(codes, asof_date=None):
             "failure_reason": failure_reason,
         }
         out[code] = row
+    if not is_historical_asof:
+        observations = PLTrad.prefetch(out, asof_day=expected_day.isoformat())
+        completed_at = dt.datetime.now().isoformat(timespec="microseconds")
+        for row in out.values():
+            row["tradability_observation_status"] = "unavailable"
+        for code, item in observations.items():
+            out[code]["tradability_observation"] = item
+            out[code]["tradability_observation_status"] = "available"
+            out[code]["execution_asof"] = completed_at
     return out
 
 

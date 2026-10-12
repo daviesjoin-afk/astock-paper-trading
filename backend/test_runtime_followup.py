@@ -6,6 +6,7 @@ from unittest.mock import patch
 import market_data_contract as MDC
 import paper_risk_scan_state as SC
 import paper_trading as PT
+import paper_risk_evidence as RE
 
 
 class QuoteFallbackTests(unittest.TestCase):
@@ -71,3 +72,30 @@ class ScanSummaryTests(unittest.TestCase):
         latest = SC.latest_scan(conn, cycle_id=1, asof_date="2026-09-03")
         self.assertEqual((latest["scan_minute"], latest["status"]), ("14:24", "failed"))
         self.assertIsNone(SC.latest_scan(conn, cycle_id=3, asof_date="2026-09-03"))
+
+
+class PendingRiskQuantityTests(unittest.TestCase):
+    def test_partial_remaining_is_reserved_once_and_manual_other_cycles_are_excluded(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        conn.executescript("""
+            CREATE TABLE paper_orders(id INTEGER,cycle_id INTEGER,account_id TEXT,code TEXT,
+                side TEXT,status TEXT,qty INTEGER,filled_qty INTEGER,remaining_qty INTEGER);
+            CREATE TABLE paper_risk_decisions(order_id INTEGER,payload TEXT);
+        """)
+        conn.executemany("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?)", [
+            (1, 13, "a", "600001", "sell", "pending_execution", 300, 0, 300),
+            (2, 13, "a", "600001", "sell", "partially_filled", 200, 100, 100),
+            (3, 14, "a", "600001", "sell", "pending_execution", 1000, 0, 1000),
+            (4, 13, "a", "600001", "sell", "pending_execution", 1000, 0, 1000)])
+        risk = '{"decision_provenance":{"authority":"RISK"}}'
+        conn.executemany("INSERT INTO paper_risk_decisions VALUES(?,?)", [
+            (1, risk), (1, risk), (2, risk), (3, risk),
+            (4, '{"decision_provenance":{"authority":"EXECUTION"}}')])
+        conn.commit()
+        conn.execute("PRAGMA query_only=ON")
+        self.assertEqual(RE.unreserved_risk_sell_quantity(conn, cycle_id=13,
+                         account_id="a", code="600001", requested_qty=700), (300, 1))
+        self.assertEqual(RE.unreserved_risk_sell_quantity(conn, cycle_id=13,
+                         account_id="a", code="600001", requested_qty=300), (0, 1))

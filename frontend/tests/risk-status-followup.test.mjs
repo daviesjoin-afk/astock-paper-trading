@@ -18,3 +18,11 @@ test("没有告警也显示最新扫描失败和完成时间", () => {
   assert.ok(html.includes("provider &lt;failure&gt;"));
   assert.ok(renderPaperAudit(null).includes("暂无记录"));
 });
+
+test("主行情字段缺失不会显示成独立来源未返回", () => {
+  const html = renderPaperAudit({ alerts: [{ quote_validation: "incomplete",
+    action: "rejected_stale_quote", reason: "主行情价格或涨跌幅无效" }] });
+  assert.ok(html.includes("主源缺失"));
+  assert.ok(html.includes("行情核验未通过"));
+  assert.ok(!html.includes("rejected_"));
+});
