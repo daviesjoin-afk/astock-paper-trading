@@ -13666,12 +13666,7 @@ def _run_slot_impl(slot, day, force=False):
             # 租约时同步等待多轮重试；但 cron runner 是一次性进程，退出前
             # 必须有界等待刷新落地（daemon 线程会随进程死亡）。
             try:
-                kick = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
-                detail["risk_snapshot_refresh"] = kick.get("status")
-                if kick.get("status") == "scheduled":
-                    detail["risk_snapshot_refresh"] = wait_risk_snapshot_refresh(
-                        timeout=20.0
-                    ).get("status")
+                detail.update(_refresh_slot_risk_snapshot(slot))
             except Exception as exc:
                 detail["risk_snapshot_refresh"] = f"error:{type(exc).__name__}"
             try:
@@ -13679,23 +13674,27 @@ def _run_slot_impl(slot, day, force=False):
                 detail["risk_snapshot_at"] = (prior or {}).get("asof")
             except Exception:
                 pass
+        completion_status = _slot_completion_status(detail)
+        if completion_status != "completed":
+            detail["scan_completed"] = True
+            detail["error"] = "risk_snapshot_refresh_incomplete"
         with _db(immediate=True, hot_path=hot_path) as conn:
             _assert_active_lease(conn, "job completion")
             if intraday_key:
                 cursor = conn.execute(
-                    "UPDATE paper_job_runs SET status='completed',detail=?,finished_at=? "
+                    "UPDATE paper_job_runs SET status=?,detail=?,finished_at=? "
                     "WHERE run_key=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json(detail), _now(), intraday_key, owner, fencing_token),
+                    (completion_status, _json(detail), _now(), intraday_key, owner, fencing_token),
                 )
             else:
                 cursor = conn.execute(
-                    "UPDATE paper_jobs SET status='completed',detail=?,finished_at=? "
+                    "UPDATE paper_jobs SET status=?,detail=?,finished_at=? "
                     "WHERE slot=? AND market_date=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json(detail), _now(), slot, day.isoformat(), owner, fencing_token),
+                    (completion_status, _json(detail), _now(), slot, day.isoformat(), owner, fencing_token),
                 )
             if cursor.rowcount != 1:
                 raise RuntimeError("paper lease lost: completion CAS")
-        return {"status": "completed", **detail}
+        return {**detail, "status": completion_status}
     except Exception as exc:
         with _db(immediate=True, hot_path=hot_path) as conn:
             if _lease_lost(exc) or lease_lost_event.is_set():
@@ -14396,6 +14395,25 @@ _RISK_SNAPSHOT_REFRESH = {"running": False, "started_at": None, "last_error": No
                           "trigger": None, "thread": None}
 
 
+def _refresh_slot_risk_snapshot(slot):
+    kick = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
+    result = (
+        wait_risk_snapshot_refresh(timeout=240.0)
+        if kick.get("status") in {"scheduled", "already_running"} else kick
+    )
+    detail = {"risk_snapshot_refresh": result.get("status")}
+    if result.get("error"):
+        detail["risk_snapshot_refresh_error"] = str(result["error"])[:200]
+    return detail
+
+
+def _slot_completion_status(detail):
+    status = detail.get("risk_snapshot_refresh")
+    if "risk_snapshot_refresh" in detail and status not in {"completed", "finished", "idle", "skipped"}:
+        return "failed"
+    return "completed"
+
+
 def request_risk_snapshot_refresh(trigger="background", on_complete=None):
     """后台异步刷新风控快照；去重，立即返回，不阻塞调用方。
 
@@ -14454,17 +14472,15 @@ def wait_risk_snapshot_refresh(timeout=240.0):
     """
     with _RISK_SNAPSHOT_REFRESH_LOCK:
         thread = _RISK_SNAPSHOT_REFRESH.get("thread")
-        running = _RISK_SNAPSHOT_REFRESH.get("running")
-    if not running or thread is None:
+    if thread is None:
         return {"status": "idle"}
-    if not thread.is_alive():
-        return {"status": "finished"}
     thread.join(timeout=timeout)
     with _RISK_SNAPSHOT_REFRESH_LOCK:
         err = _RISK_SNAPSHOT_REFRESH.get("last_error")
     if thread.is_alive():
         return {"status": f"timeout_after_{int(timeout)}s"}
-    return {"status": "failed" if err else "completed", "error": err}
+    failed = bool(err) and not str(err).startswith("cache_invalidation:")
+    return {"status": "failed" if failed else "completed", "error": err}
 
 
 def risk_snapshot_refresh_status():

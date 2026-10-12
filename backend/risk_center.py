@@ -239,6 +239,33 @@ def snapshot_age_seconds(snapshot, now=None):
     return max(0.0, ((_now() if now is None else now) - observed).total_seconds())
 
 
+def project_snapshot_freshness(dashboard, now=None):
+    """Re-evaluate display freshness without mutating a cached snapshot."""
+    now = now or _now()
+    result = dict(dashboard)
+    age = snapshot_age_seconds(result, now=now)
+    result["snapshot_age_seconds"] = round(age, 1) if age is not None else None
+    result["snapshot_stale"] = (
+        not result.get("initializing") if age is None
+        else age > float(result.get("snapshot_ttl_seconds") or 300)
+    )
+    quality = []
+    for item in result.get("data_quality") or []:
+        row = dict(item)
+        if row.get("status") not in {"refreshing", "failed", "unknown"}:
+            current = source_health(
+                row.get("name"), row.get("source"), row.get("observed_at"),
+                row.get("ttl_seconds", 300), now, error=row.get("error"),
+                coverage_pct=row.get("coverage_pct"), verification=row.get("verification"),
+            )
+            for key in ("age_seconds", "status", "degraded"):
+                row[key] = current[key]
+            row["status_checked_at"] = _iso(now)
+        quality.append(row)
+    result["data_quality"] = quality
+    return result
+
+
 def _load_history():
     try:
         with open(HISTORY_PATH, encoding="utf-8") as handle:

@@ -758,6 +758,25 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
                 self.assertEqual(lots[0]["remaining_qty"], 0)
 
 
+    def test_snapshot_timeout_is_durable_failed_and_retry_does_not_duplicate_fill(self):
+        self._insert_lot("tq_breakout", self.code, 1000, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        with mock.patch.object(PT, "request_risk_snapshot_refresh", return_value={"status": "scheduled"}), \
+                mock.patch.object(PT, "wait_risk_snapshot_refresh", side_effect=[
+                    {"status": "timeout_after_240s"}, {"status": "completed"}]):
+            failed = PT.run_slot("risk", self.day, force=True)
+            self.assertEqual(failed["status"], "failed")
+            self.assertTrue(failed["scan_completed"])
+            with PT._db() as conn:
+                self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "failed")
+                fill_count = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+            retried = PT.run_slot("risk", self.day, force=True)
+            self.assertEqual(retried["status"], "completed")
+            with PT._db() as conn:
+                self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0], fill_count)
+
+
 class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):
     """R16 生产回归：风险扫描身份必须是 cycle-owned 的 durable 事实。
 

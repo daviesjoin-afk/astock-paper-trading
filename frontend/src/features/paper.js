@@ -16,6 +16,13 @@ function paperNotice(message){
   toast(text, { tone: /失败|错误|异常|拒绝|不可/.test(text) ? 'danger' : 'warn' });
 }
 
+export function paperEntryGateText(shared={}){
+  var gate=shared.entry_freeze;
+  if(!gate || typeof gate.enabled!=='boolean') return '行情门禁：状态待核验';
+  if(gate.enabled) return '行情门禁：冻结 · '+zhRiskText(gate.reason||'待核验');
+  return '行情门禁：通过 · 新增买入仍需资金分配和委托核验';
+}
+
 export function renderPaperCompareChart(curve){
   var target=$('paperCompareChart');
   if(!target||!curve||!(curve.dates||[]).length) return;
@@ -776,10 +783,7 @@ export async function renderPaperDashboard(d,auditRequest){
     $('paperOrderAccount').innerHTML=accounts.map(function(a){return '<option value="'+a.id+'">'+paperAccountDisplayName(a)+' · 共享可用 '+cny((d.shared||{}).cash)+'</option>';}).join('');
     if(previousAccount&&accountName[previousAccount]) $('paperOrderAccount').value=previousAccount;
     var shared=d.shared||{};
-    var entryFreeze=shared.entry_freeze||{};
-    var entryFreezeText=entryFreeze.enabled
-      ? '新增买入：自动冻结 · '+adaptiveEsc(entryFreeze.reason||'数据门禁未通过')
-      : '新增买入：自动开放 · 行情、覆盖和因子门禁通过';
+    var entryFreezeText=paperEntryGateText(shared);
     var slotText='分配额度请在“组合计划”页输入明确的周期和计划 ID 后查看。';
     var borrowText='';
     var sharedDayText=shared.today_pnl===null||shared.today_pnl===undefined
