@@ -279,7 +279,7 @@ export function paperOrderStatusView(status,reason){
     pending_execution_guard:['pending','等待执行证据'],
     risk_rejected:['rejected','风控拒绝'],manual_rejected:['rejected','手动委托拒绝'],deferred_capacity:['pending','容量等待重排'],
     unfilled_limit_down:['rejected','跌停未成交'],cancelled:['cancelled','已撤销'],
-    expired:['cancelled','已过期'],ready_to_fill:['pending','待执行'],superseded:['cancelled','已被新委托替代']
+    expired:['cancelled','已过期'],ready_to_fill:['pending','待执行'],superseded:['cancelled','已失效或回收']
   };
   return map[status]||['cancelled',status||'-'];
 }

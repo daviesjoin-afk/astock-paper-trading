@@ -9,7 +9,7 @@ import { loadPaperRisk } from "./features/risk.js";
 import { loadDataValidity, loadMarketGate, loadStrategies } from "./features/selection.js";
 import { normalizeActiveStrategyCopy } from "./features/strategies.js";
 
-window.__ASTOCK_ADAPTIVE_UI_BUILD__='20261012-runtime-data-fixes';
+window.__ASTOCK_ADAPTIVE_UI_BUILD__='20261012-runtime-followup';
 
 window._paperWorkspace=sessionStorage.getItem(PAPER_VIEW_KEY)||'portfolio';
 

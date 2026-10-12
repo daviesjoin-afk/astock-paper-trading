@@ -70,6 +70,7 @@ import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
+import paper_dynamic_allocation as PDAlloc
 import paper_position_review as PReview
 import paper_replacement_decision as PRep
 import adaptive_selection_compat as ASC
@@ -6565,6 +6566,7 @@ def _quotes(codes, asof_date=None):
     codes = [str(code) for code in (codes or []) if str(code)]
     if not codes:
         return {}
+    expected_day = _date(asof_date or dt.date.today())
     source_errors = {}
     try:
         live_rows = dfc.fetch_realtime_for_codes(list(codes)) or []
@@ -6575,6 +6577,38 @@ def _quotes(codes, asof_date=None):
         live_rows = []
         source_errors["live"] = f"{type(exc).__name__}: {exc}"
     live = {str(r.get("code")): r for r in live_rows if r.get("code")}
+    fallback_identity = None
+    fallback_codes = set()
+    incomplete = {
+        code for code in codes
+        if not (_num((live.get(code) or {}).get("price"), 0) > 0
+                and _num((live.get(code) or {}).get("pct"), None) is not None
+                and abs(_num((live.get(code) or {}).get("pct"), 999)) <= 30
+                and _quote_is_fresh({**(live.get(code) or {}), "quote_source": "live"}, expected_day))
+    }
+    if incomplete:
+        # Use the market owner's complete, fresh current snapshot, never the
+        # historical universe file. Independent price reconciliation still runs.
+        try:
+            reading = MDSvc.read_snapshot(
+                MDC.LIVE_MARKET_POLICY, now=dt.datetime.now().astimezone(),
+                asof_day=expected_day.isoformat())
+            if reading.status == MDC.STATUS_FRESH:
+                for candidate in reading.rows():
+                    candidate = dict(candidate)
+                    code = str(candidate.get("code") or "")
+                    if (code in incomplete
+                            and _num(candidate.get("price"), 0) > 0
+                            and _num(candidate.get("pct"), None) is not None
+                            and abs(_num(candidate.get("pct"), 999)) <= 30
+                            and _quote_is_fresh({**candidate, "quote_source": "live"}, expected_day)):
+                        live[code] = candidate
+                        fallback_codes.add(code)
+                if fallback_codes:
+                    fallback_identity = MDC.snapshot_fingerprint(reading.snapshot)
+        except Exception as exc:
+            source_errors["snapshot"] = f"{type(exc).__name__}: {exc}"
+    live_rows = list(live.values())
     # 单票行情核验以价格为核心，但东财 ulist 偶尔返回价格而遗漏资金字段。
     # 补齐动作独立于双源价格校验：资金流失败不能把可执行的风险卖出误写成
     # “实时行情失败”，也不能令整批持仓都失去主力意图解释。
@@ -6600,7 +6634,6 @@ def _quotes(codes, asof_date=None):
     local = _latest_price_map(codes)
     local_snapshot_at = _universe_snapshot_time()
     out = {}
-    expected_day = _date(asof_date or dt.date.today())
     quote_execution_asof = dt.datetime.now().isoformat(timespec="seconds")
     is_historical_asof = expected_day != dt.date.today()
     for code in codes:
@@ -6616,7 +6649,8 @@ def _quotes(codes, asof_date=None):
             # 用昨天或上一轮缓存价格制造一笔看似通过的成交。
             row = {
                 key: value for key, value in dict(local.get(code) or {}).items()
-                if key not in {"price", "pct", "open", "high", "low", "pre_close", "quote_at"}
+                if key not in {"price", "pct", "open", "high", "low", "pre_close", "quote_at",
+                               "super_net", "main_net", "big_net", "mid_net", "small_net", "main_pct"}
             }
             row.update({key: value for key, value in live_row.items() if value is not None})
             row["price"] = live_row.get("price")
@@ -6631,6 +6665,9 @@ def _quotes(codes, asof_date=None):
             row.get("quote_at") if is_historical_asof else quote_execution_asof
         )
         row["quote_source"] = "live" if is_live else "local_cache"
+        if code in fallback_codes:
+            row["primary_quote_origin"] = "verified_full_market_snapshot"
+            row["primary_owner_fingerprint"] = fallback_identity
         flow_at = flow_row.get("quote_at") or flow_row.get("flow_fetched_at") or live_row.get("quote_at")
         flow_time = _parse_quote_timestamp(flow_at)
         flow_day_ok = bool(flow_time and flow_time.date() == expected_day)
@@ -6639,7 +6676,9 @@ def _quotes(codes, asof_date=None):
             now_for_flow = dt.datetime.now(flow_time.tzinfo) if flow_time.tzinfo else dt.datetime.now()
             flow_age_seconds = round((now_for_flow - flow_time).total_seconds(), 1)
         has_flow = isinstance(live_row.get("super_net"), (int, float)) and isinstance(live_row.get("main_pct"), (int, float))
-        row["flow_source"] = flow_row.get("flow_source") or ("eastmoney_ulist" if has_flow else None)
+        row["flow_source"] = flow_row.get("flow_source") or (
+            "eastmoney_market_snapshot" if has_flow and code in fallback_codes
+            else "eastmoney_ulist" if has_flow else None)
         row["flow_quote_at"] = flow_at
         row["flow_age_seconds"] = flow_age_seconds
         row["flow_validation"] = (
@@ -8112,8 +8151,14 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
     if instant.tzinfo is None:
         raise PAPolicy.PortfolioAllocationPolicyError(
             "explicit_decision_at_must_include_timezone")
+    reconciled = EV.stamp_terminal_zero_orders(conn, cycle_id=cycle_id)
+    if reconciled["confirmed_zero"]:
+        _audit(conn, None, "terminal_execution_reconciled",
+               _json({"cycle_id": int(cycle_id), **reconciled}))
     reading = MDSvc.read_snapshot(
         MDC.LIVE_MARKET_POLICY, now=instant, asof_day=asof_day)
+    if reading.status == MDC.STATUS_FRESH and asof_day == instant.astimezone(PDAlloc.E.TZ).date().isoformat():
+        PDAlloc.rebalance(conn, cycle_id=cycle_id, decision_at=decision_at)
     snapshot = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=cycle_id, asof_day=asof_day,
         decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,
@@ -14715,6 +14760,10 @@ def risk_audit(limit=160):
     try:
         with _db_readonly() as conn:
             accounts = _rows(conn, "SELECT id,name FROM paper_accounts ORDER BY id")
+            cycle_id = _active_cycle_id_readonly(conn)
+            scan_status = (PRSS.latest_scan(conn, cycle_id=cycle_id,
+                                             asof_date=dt.date.today().isoformat())
+                           if cycle_id is not None else None)
             names = {row["id"]: row["name"] for row in accounts}
             decisions = _rows(
                 conn,
@@ -14871,7 +14920,8 @@ def risk_audit(limit=160):
                 "label": "待执行委托（等待开盘审批/执行批次）",
             } if linked else None),
         })
-    return {"accounts": accounts, "alerts": alerts, "asof": _now(), "lightweight": True}
+    return {"accounts": accounts, "alerts": alerts, "scan_status": scan_status,
+            "asof": _now(), "lightweight": True}
 
 
 def _validate_capital(capital):

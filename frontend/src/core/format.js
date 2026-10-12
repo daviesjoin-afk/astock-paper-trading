@@ -127,7 +127,7 @@ export function zhRiskText(value){
     'not_attempted':'未核验',
     'filled':'已成交', 'pending':'待处理', 'local_cache':'本地缓存', 'unverified':'未核验', 'invalid':'无效'
   };
-  Object.keys(replacements).forEach(function(key){ text=text.split(key).join(replacements[key]); });
+  Object.keys(replacements).sort(function(a,b){return b.length-a.length;}).forEach(function(key){ text=text.split(key).join(replacements[key]); });
   return text;
 }
 
