@@ -4222,6 +4222,8 @@ def _rebuild_selection_factor_cache(asof_date=None):
                 DBM.DB_PATHS["adaptive_learning"], asof=cutoff.isoformat())
             # 昨日及更早的回放不继承当前快照里的名称/风险标记，避免把后来的状态
             # 带回历史；当日运行才可补充实时显示字段。
+            # refresh_archive 已把归档身份投影成 6 位市场代码，因此这里可以直接
+            # 与行情快照、K 线缓存共用的 code 口径对齐。
             current_by_code = ({str(row.get("code") or ""): row for row in universe}
                                if cutoff == dt.date.today() else {})
             pit_rows = []

@@ -46,8 +46,10 @@ class PublicHistoricalUniverseTests(unittest.TestCase):
             with patch.object(HUPS, "fetch_public_security_master", return_value=fixture):
                 result = HUPS.refresh_archive(db_path, asof="2022-12-31")
             self.assertTrue(result["source"]["historical_membership_complete"])
+            # Members are projected onto the bare 6-digit market code that the
+            # kline cache, market snapshot and factor file all key on.
             self.assertEqual({row["code"] for row in result["members"]},
-                             {"600000.SH", "000001.SZ"})
+                             {"600000", "000001"})
             with patch.object(HUPS, "fetch_public_security_master",
                               side_effect=AssertionError("same-day archive should be reused")):
                 reused = HUPS.refresh_archive(db_path, asof="2022-12-31")
@@ -55,7 +57,18 @@ class PublicHistoricalUniverseTests(unittest.TestCase):
                              reused["manifest"]["universe_archive_fingerprint"])
             with patch.object(HUPS, "fetch_public_security_master", return_value=fixture):
                 future = HUPS.refresh_archive(db_path, asof="2024-01-01")
-            self.assertEqual({row["code"] for row in future["members"]}, {"600000.SH"})
+            self.assertEqual({row["code"] for row in future["members"]}, {"600000"})
+
+    def test_market_code_projection_rejects_inconsistent_identity(self):
+        self.assertEqual(HUPS._market_code("000001.SZ", "SZSE"), "000001")
+        self.assertEqual(HUPS._market_code("600000.SH", "SSE"), "600000")
+        self.assertEqual(HUPS._market_code("920000.BJ", "BSE"), "920000")
+        # The suffix must agree with the archived exchange: the old BSE code
+        # ranges overlap SSE main-board codes, so a mismatch is not cosmetic.
+        for code, exchange in (("000001.SZ", "SSE"), ("000001", "SZSE"),
+                               ("00001.SZ", "SZSE"), ("", "BSE")):
+            with self.assertRaises(HUPS.PublicUniverseSourceError):
+                HUPS._market_code(code, exchange)
 
 
 if __name__ == "__main__":

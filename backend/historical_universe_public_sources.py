@@ -31,6 +31,7 @@ BSE_CODE_MAPPING = "https://www.bse.cn/service/code_mapping.html"
 BSE_LISTING_START = "2021-11-15"
 BSE_CODE_SWITCH = "2025-05-06"
 SOURCE_NAME = "official-free-exchange-stock-master-v1"
+_EXCHANGE_CODE_SUFFIX = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ"}
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "Chrome/131.0 Safari/537.36")
 _DATE8 = re.compile(r"^\d{8}$")
@@ -48,6 +49,28 @@ _BSE_DELISTS = {
 
 class PublicUniverseSourceError(RuntimeError):
     """A source was unavailable, incomplete, or internally inconsistent."""
+
+
+def _market_code(archived_code: str, exchange: str) -> str:
+    """Project an archived ``CODE.EXCHANGE`` symbol onto the 6-digit market code.
+
+    Every downstream consumer (kline cache, market snapshot, factors) keys
+    securities by the bare 6-digit code, so the archive identity has to be
+    projected once here instead of being stripped ad hoc at each call site.
+
+    ``exchange`` is kept authoritative for the board decision: the bare code
+    ranges of the old BSE segment (``430xxx``/``830xxx``/``87xxxx``) overlap
+    with SSE main-board codes, so a collision must fail the source rather
+    than silently re-point one exchange's history at the other's.
+    """
+    raw = str(archived_code or "").strip()
+    code, sep, suffix = raw.partition(".")
+    if not _CODE6.match(code):
+        raise PublicUniverseSourceError("public_stock_master_code_not_six_digits")
+    expected = _EXCHANGE_CODE_SUFFIX.get(str(exchange or "").strip().upper())
+    if not expected or not sep or suffix.upper() != expected:
+        raise PublicUniverseSourceError("public_stock_master_code_exchange_mismatch")
+    return code
 
 
 def _as_day(value: Any) -> str:
@@ -404,8 +427,20 @@ def refresh_archive(db_path: str, *, asof: str) -> dict[str, Any]:
                    (not row.get("delist_date") or row["delist_date"] > cutoff)]
         if not projection or not projection.get("historical_membership_complete") or not members:
             raise PublicUniverseSourceError("public_stock_master_archive_unproven")
+        projected = {}
+        for row in members:
+            code = _market_code(row["code"], row.get("exchange"))
+            prior = projected.get(code)
+            # One market code must not be claimed by two archived symbols;
+            # otherwise the kline cache would silently read the wrong history.
+            if prior is not None:
+                raise PublicUniverseSourceError("public_stock_master_market_code_collision")
+            projected[code] = {**row, "code": code}
         return {"manifest": manifest.projection(), "source": projection,
-                "members": members, "counts": fetch_public_security_master_counts_from_members(members)}
+                "members": [projected[code] for code in sorted(projected)],
+                "counts": fetch_public_security_master_counts_from_members(
+                    [projected[code] for code in sorted(projected)])}
+
     finally:
         conn.close()
 
