@@ -8,7 +8,11 @@ slot="${1:?slot is required}"
 lock_dir="/opt/astock-codex/.locks"
 mkdir -p "$lock_dir"
 
-# A short bounded wait allows the 30-second fast pass to finish before a
-# three-minute scan starts, without allowing either job to pile up forever.
-exec flock -w 20 "$lock_dir/paper-scan.lock" \
+# Fast passes must not queue ahead of the three-minute risk/market scan.
+# The next 30-second pass can retry; full scans retain their bounded wait.
+lock_options=(-w 20)
+if [[ "$slot" == "fast-entry" ]]; then
+  lock_options=(-n)
+fi
+exec flock "${lock_options[@]}" "$lock_dir/paper-scan.lock" \
   docker exec astock-paper-worker python backend/paper_runner.py --slot "$slot"
