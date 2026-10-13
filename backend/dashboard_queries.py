@@ -77,7 +77,8 @@ def dashboard(include_activity=False, include_history_symbols=False):
             row = _snapshot_by_code.get(str(_code))
             if row is not None:
                 quotes[str(_code)] = dict(row)
-        for _code, row in (_latest_price_map(codes) if codes else {}).items():
+        missing_codes = [code for code in codes if code not in quotes]
+        for _code, row in (_latest_price_map(missing_codes) if missing_codes else {}).items():
             existing = quotes.get(_code)
             if not isinstance(existing, dict) or not isinstance(existing.get("price"), (int, float)):
                 quotes[_code] = row
@@ -110,7 +111,8 @@ def dashboard(include_activity=False, include_history_symbols=False):
         # ``_account_metrics`` normally backfills today's sold symbols with a
         # live quote.  The compact risk read model is intentionally
         # network-free, so provide its cache-only marks up front instead.
-        for code, row in (_latest_price_map(sold_codes) if sold_codes else {}).items():
+        missing_sold_codes = [code for code in sold_codes if code not in quotes]
+        for code, row in (_latest_price_map(missing_sold_codes) if missing_sold_codes else {}).items():
             quotes.setdefault(code, row)
         accounts = [
             _account_metrics(
