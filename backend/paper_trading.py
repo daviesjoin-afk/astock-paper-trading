@@ -70,6 +70,7 @@ import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
+import paper_candidate_live_fields as PCLF
 import paper_dynamic_allocation as PDAlloc
 import paper_live_tradability as PLTrad
 import paper_position_review as PReview
@@ -6012,13 +6013,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             "turnover": "turnover", "main_pct": "main_pct",
             "super_net_raw": "super_net", "main_net": "main_net",
         }
-        for code, row in live_map.items():
-            if code not in table.index:
-                continue
-            for target, source in live_field_map.items():
-                value = row.get(source)
-                if value is not None and str(value).strip() not in {"", "--", "-"}:
-                    table.loc[code, target] = value
+        PCLF.overlay(table, live_map, live_field_map)
         table["quote_at"] = pd.Series(
             {code: (live_map.get(str(code)) or {}).get("quote_at") for code in table.index}
         )
