@@ -342,7 +342,7 @@ class TencentRealtimeFeed:
     parser: Callable[..., list[QuoteRow]]
     reset_data_source: Callable[..., Any]
     sleep: Callable[[float], Any] = time.sleep
-    batch_size: int = 30
+    batch_size: int = 100
     attempts: int = 3
     name: str = "tencent_public_quote"
     reliability: FeedReliabilityPolicy = DEFAULT_RELIABILITY_POLICY
