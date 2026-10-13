@@ -1835,6 +1835,8 @@ def _ensure_performance_indexes(conn):
             ON paper_orders(account_id, code, status, side, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_paper_fills_order_account_side
             ON paper_fills(order_id, account_id, side, code);
+        CREATE INDEX IF NOT EXISTS idx_paper_signals_replacement
+            ON paper_signals(account_id, intended_date, status, signal_date);
         CREATE INDEX IF NOT EXISTS idx_paper_audit_event_recent
             ON paper_audit(event, created_at DESC, id DESC);
         CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_latest
