@@ -355,7 +355,7 @@ def historical_universe(rows, asof, *, source=None, drop_unproven=True):
                                    drop_unproven=drop_unproven)
 
 
-def _history_is_fresh(last_date, asof_day=None):
+def _history_is_fresh(last_date, asof_day=None, *, reference_day=None):
     """Accept today's or the prior weekday's complete daily bar."""
     import datetime
 
@@ -366,7 +366,8 @@ def _history_is_fresh(last_date, asof_day=None):
     except (TypeError, ValueError):
         return False
     today = asof_day or datetime.date.today()
-    return value in {today, _previous_trade_weekday(today)}
+    reference = reference_day if reference_day is not None else _previous_trade_weekday(today)
+    return value in {today, reference}
 
 
 def _download_one(code, beg, tries=3, required_date=None):
@@ -1001,11 +1002,13 @@ def coverage_report(cache_ttl=0):
     usable_backtest = {
         code for code in covered if int((manifest.get(code) or {}).get("rows") or 0) >= 120
     }
+    asof_day = dt.date.today()
+    reference = _previous_trade_weekday(asof_day)
     stale = set()
     for code in covered:
         last = (manifest.get(code) or {}).get("last_date")
         try:
-            if not _history_is_fresh(last):
+            if not _history_is_fresh(last, asof_day, reference_day=reference):
                 stale.add(code)
         except ValueError:
             stale.add(code)
@@ -1015,7 +1018,6 @@ def coverage_report(cache_ttl=0):
     # 常规停牌（数日内复牌）仍计入覆盖要求，保持对恢复任务的约束；
     # 数据源故障造成的大面积滞后不会被此规则掩盖（那种情况滞后天数相近
     # 且远小于 14 天）。
-    reference = _previous_trade_weekday()
     long_suspended = set()
     for code in stale:
         last = str((manifest.get(code) or {}).get("last_date") or "")[:10]
@@ -1105,7 +1107,7 @@ def coverage_report(cache_ttl=0):
         "fresh_pct": fresh_pct,
         "fresh_selection": len(fresh_selection),
         "fresh_selection_pct": fresh_selection_pct,
-        "expected_reference_date": _previous_trade_weekday().isoformat(),
+        "expected_reference_date": reference.isoformat(),
         "stale": len(stale),
         "fallback_unadjusted": len(fallback_unadjusted),
         "ready": ready,

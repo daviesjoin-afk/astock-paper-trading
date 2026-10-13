@@ -59,6 +59,35 @@ class BenchmarkHistoryTests(unittest.TestCase):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_coverage_reuses_one_reference_date_and_recalculates_next_day(self):
+        class Clock(dt.date):
+            current = dt.date(2026, 10, 12)
+
+            @classmethod
+            def today(cls):
+                return cls.current
+
+        manifest = {"000001": {"rows": 150, "last_date": "2026-10-09"},
+                    "000002": {"rows": 150, "last_date": "2026-10-12"},
+                    "000003": {"rows": 150, "last_date": "invalid"}}
+        rows = [{"code": code, "snapshot_tradable": True} for code in manifest]
+        with patch.object(U, "load_universe", return_value=rows), \
+                patch.object(U.dfc, "get_kline_manifest", return_value=manifest), \
+                patch.object(U.os, "listdir", return_value=[code + ".csv" for code in manifest]), \
+                patch.object(U.dt, "date", Clock), \
+                patch.object(U, "_previous_trade_weekday", side_effect=[
+                    dt.date(2026, 10, 9), dt.date(2026, 10, 12)]) as previous:
+            first = U.coverage_report()
+            self.assertEqual(previous.call_count, 1)
+            Clock.current = dt.date(2026, 10, 13)
+            second = U.coverage_report()
+            self.assertEqual(previous.call_count, 2)
+        self.assertEqual(first["fresh"], 2)
+        self.assertEqual(second["fresh"], 1)
+        self.assertEqual(first["expected_reference_date"], "2026-10-09")
+        self.assertEqual(second["expected_reference_date"], "2026-10-12")
+        self.assertEqual(first["missing_codes"], second["missing_codes"])
+
     def test_suspended_and_orphan_files_do_not_inflate_required_coverage(self):
         rows = [{"code": code, "snapshot_tradable": True} for code in ("000001", "000002")]
         manifest = {"000001": {"rows": 150, "last_date": "2026-10-09"},
@@ -67,7 +96,7 @@ class CoverageTests(unittest.TestCase):
                 patch.object(U.dfc, "get_kline_manifest", return_value=manifest), \
                 patch.object(U.os, "listdir", return_value=["000001.csv", "000002.csv", "000003.csv"]), \
                 patch.object(U, "_previous_trade_weekday", return_value=dt.date(2026, 10, 9)), \
-                patch.object(U, "_history_is_fresh", side_effect=lambda last: last == "2026-10-09"):
+                patch.object(U, "_history_is_fresh", side_effect=lambda last, *args, **kwargs: last == "2026-10-09"):
             result = U.coverage_report()
         self.assertEqual(result["history_required"], 1)
         self.assertEqual(result["covered"], 1)
