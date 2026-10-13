@@ -18,6 +18,31 @@ def scalar_overlay(table, rows, fields):
 
 
 class LiveFieldOverlayTests(unittest.TestCase):
+    def test_factor_inputs_preserve_numeric_price_gate_and_column_types(self):
+        table = pd.DataFrame({"price": [9.0] * 5}, index=["a", "b", "c", "d", "e"])
+        rows = {"a": {"price": 10.0, "amount": 100, "turnover": 0.0},
+                "b": {"price": "11", "amount": 999},
+                "c": {"price": 12.0, "amount": "--", "turnover": None},
+                "d": {"price": float("nan"), "amount": 200},
+                "e": {"price": 13.0, "turnover": 2.5},
+                "orphan": {"price": 999, "amount": 999}}
+        expected = table.copy()
+        for code, row in rows.items():
+            if code in expected.index and isinstance(row.get("price"), (int, float)):
+                for field in ("price", "amount", "turnover"):
+                    if isinstance(row.get(field), (int, float)):
+                        expected.loc[code, field] = row[field]
+        L.overlay_factor_inputs(table, rows)
+        assert_frame_equal(table, expected)
+
+    def test_new_column_keeps_original_boolean_first_dtype(self):
+        table = pd.DataFrame({"price": [1.0, 2.0]}, index=["a", "b"])
+        rows = {"a": {"price": 2.0, "amount": True}, "b": {"price": 3.0, "amount": 10}}
+        expected = table.copy()
+        scalar_overlay(expected, rows, {"price": "price", "amount": "amount"})
+        L.overlay_factor_inputs(table, rows)
+        assert_frame_equal(table, expected)
+
     def test_matches_scalar_prices_missing_markers_nan_and_new_columns(self):
         table = pd.DataFrame({"price": [9.0] * 5, "pct": [2.0] * 5},
                              index=["000005", "000001", "000003", "000002", "000004"])
@@ -59,3 +84,20 @@ class LiveFieldOverlayTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(table["price"].eq(2.0).all())
         self.assertTrue(table["pct"].eq(1.0).all())
+
+    def test_factor_input_assignments_are_bounded_for_a_full_market(self):
+        codes = [f"{i:06d}" for i in range(5589)]
+        table = pd.DataFrame({"price": 1.0}, index=codes)
+        rows = {code: {"price": 2.0, "amount": 100.0, "turnover": 1.0} for code in codes}
+        indexer = type(table.loc)
+        original = indexer.__setitem__
+        calls = []
+
+        def record(self, key, value):
+            calls.append(key)
+            return original(self, key, value)
+
+        with patch.object(indexer, "__setitem__", record):
+            L.overlay_factor_inputs(table, rows)
+        self.assertLessEqual(len(calls), 5)
+        self.assertTrue(table["amount"].eq(100.0).all())

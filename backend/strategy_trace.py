@@ -266,17 +266,21 @@ def _validate_table(table: pd.DataFrame) -> None:
 
 def _persist_table(root: Path, table: pd.DataFrame) -> dict[str, Any]:
     _validate_table(table)
+    prepared_columns = []
+    # Normalize and validate once, before writing any replay artifact.
+    for column in table.columns:
+        name = str(column)
+        values = [_json_safe(value) for value in table[column].tolist()]
+        for row_no, value in enumerate(values):
+            _assert_no_prohibited_keys(value, path=f"table.{name}[{row_no}]")
+        prepared_columns.append((name, values))
     index_payload = {
         "schema": _INDEX_SCHEMA,
         "values": [str(value) for value in table.index.tolist()],
     }
     index_id = _write_blob(root, "indexes", index_payload)
     columns = []
-    for column in table.columns:
-        name = str(column)
-        values = [_json_safe(value) for value in table[column].tolist()]
-        for row_no, value in enumerate(values):
-            _assert_no_prohibited_keys(value, path=f"table.{name}[{row_no}]")
+    for name, values in prepared_columns:
         column_payload = {
             "schema": _COLUMN_SCHEMA,
             "name": name,
@@ -440,10 +444,6 @@ def persist_snapshot(
     resolved_date = data_date(table, explicit=explicit_data_date)
     resolved_version = code_version(explicit_code_version)
     safe_inputs = _safe_selection_inputs(selection_kwargs)
-    for column in table.columns:
-        for row_no, value in enumerate(table[column].tolist()):
-            safe = _json_safe(value)
-            _assert_no_prohibited_keys(safe, path=f"table.{column}[{row_no}]")
     root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
     table_manifest = _persist_table(root, table)
     snapshot = {

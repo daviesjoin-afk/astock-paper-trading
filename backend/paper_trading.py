@@ -5924,18 +5924,9 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         universe.append(base)
     if live_map:
         # 技术因子仍来自已收盘日线；实时价格/涨跌幅/资金字段用于当日排序和容量。
-        for code, row in live_map.items():
-            if code in price_f.index and isinstance(row.get("price"), (int, float)):
-                price_f.loc[code, "price"] = row["price"]
-                # amount/turnover 是实时-only 字段：CSV 因子缓存从不持久化它们，
-                # build_factor_table 直接从 price 读取。若不在此处注入，函数内的
-                # factor_columns_missing 检查会在每次扫描时误报（策略实际消费
-                # 的是注入后的 table，候选并不为空）。与公开选股路径
-                # (main.py live_field_map) 保持同一注入时机。
-                for _fld in ("amount", "turnover"):
-                    _v = row.get(_fld)
-                    if isinstance(_v, (int, float)):
-                        price_f.loc[code, _fld] = _v
+        # amount/turnover must still enter before build_factor_table; assign
+        # by column so this pre-build step does not repeat scalar writes.
+        PCLF.overlay_factor_inputs(price_f, live_map)
     # Use the same financial feed as public selection.  The report-period
     # values remain compatible with the running strategies; publication-time
     # proof is attached below to the concrete candidate records instead of

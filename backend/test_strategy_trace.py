@@ -184,6 +184,23 @@ class StrategyReplayTraceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prohibited field"):
             self._traced(topn=1, gate={"light": "green", "api_token": "secret"})
 
+    def test_nested_table_secret_fails_before_any_blob_is_written(self):
+        table = self._table()
+        table["evidence"] = [{"source": "public"}, {"api_token": "fixture"}, {}]
+        with self.assertRaisesRegex(ValueError, "prohibited field"):
+            self._traced(table=table, topn=1)
+        self.assertFalse(self._root().exists())
+
+    def test_table_cells_are_validated_once_and_keep_replay_identity(self):
+        with mock.patch.object(trace, "_assert_no_prohibited_keys",
+                               wraps=trace._assert_no_prohibited_keys) as validate:
+            first = self._traced(topn=1)
+        table_calls = [call for call in validate.call_args_list
+                       if call.kwargs.get("path", "").startswith("table.")]
+        self.assertEqual(len(table_calls), self._table().size)
+        second = self._traced(topn=1)
+        self.assertEqual(first["replay_trace"]["snapshot_id"], second["replay_trace"]["snapshot_id"])
+
     def test_mixed_factor_dates_fail_closed(self):
         table = self._table()
         table.attrs.clear()
