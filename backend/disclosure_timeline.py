@@ -236,7 +236,9 @@ def _save_cache(payload: Mapping[str, Any]) -> None:
     temporary = f"{CACHE_PATH}.{os.getpid()}.tmp"
     try:
         with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            # dumps uses the standard library's accelerated encoder rather
+            # than millions of Python-level streaming writes for this cache.
+            handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=False))
         os.replace(temporary, CACHE_PATH)
         _read_cache_file.cache_clear()
     except OSError:
