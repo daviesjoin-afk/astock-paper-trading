@@ -814,6 +814,35 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
                 self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0], fill_count)
 
+    def test_blocked_auction_is_retryable_and_preserves_failure_reason(self):
+        blocked = {"slot": "auction", "status": "blocked", "reason": "current quotes unavailable"}
+        with mock.patch.object(PT, "run_auction_preselection", side_effect=[
+                blocked, {"slot": "auction", "status": "completed", "snapshot_count": 4500}]) as run:
+            result = PT.run_slot("auction", self.day)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], blocked["reason"])
+            self.assertEqual(result["error"], "slot_work_incomplete")
+            with PT._db() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT status FROM paper_jobs WHERE slot='auction'").fetchone()[0], "failed")
+                fills = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+            retried = PT.run_slot("auction", self.day)
+            self.assertEqual(retried["status"], "completed")
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(PT.run_slot("auction", self.day)["status"], "already_done")
+            with PT._db() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0], fills)
+
+    def test_blocked_slot_preserves_bounded_automatic_retry_count(self):
+        with mock.patch.object(PT, "run_auction_preselection", return_value={
+                "slot": "auction", "status": "blocked", "reason": "quotes unavailable"}) as run:
+            for count in range(3):
+                result = PT.run_slot("auction", self.day)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["retry_count"], count)
+            self.assertEqual(PT.run_slot("auction", self.day)["status"], "already_done")
+            self.assertEqual(run.call_count, 3)
+
 
 class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):
     """R16 生产回归：风险扫描身份必须是 cycle-owned 的 durable 事实。

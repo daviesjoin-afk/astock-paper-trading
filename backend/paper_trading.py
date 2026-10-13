@@ -13734,7 +13734,12 @@ def _run_slot_impl(slot, day, force=False):
         completion_status = _slot_completion_status(detail)
         if completion_status != "completed":
             detail["scan_completed"] = True
-            detail["error"] = "risk_snapshot_refresh_incomplete"
+            detail["retry_count"] = retry_count
+            detail.setdefault("error", (
+                "risk_snapshot_refresh_incomplete" if "risk_snapshot_refresh" in detail
+                and detail["risk_snapshot_refresh"] not in {"completed", "finished", "idle", "skipped"}
+                else "slot_work_incomplete"
+            ))
         with _db(immediate=True, hot_path=hot_path) as conn:
             _assert_active_lease(conn, "job completion")
             if intraday_key:
@@ -14465,6 +14470,8 @@ def _refresh_slot_risk_snapshot(slot):
 
 
 def _slot_completion_status(detail):
+    if detail.get("status") in {"blocked", "failed", "partial", "deferred", "in_progress"}:
+        return "failed"
     status = detail.get("risk_snapshot_refresh")
     if "risk_snapshot_refresh" in detail and status not in {"completed", "finished", "idle", "skipped"}:
         return "failed"
