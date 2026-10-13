@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+from functools import lru_cache
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -204,11 +205,26 @@ def _request_json(params: Mapping[str, Any], timeout: float = DEFAULT_TIMEOUT_SE
     return decoded if isinstance(decoded, Mapping) else {}
 
 
+@lru_cache(maxsize=1)
+def _read_cache_file(path, signature) -> dict:
+    """Reuse only the parsed bytes of the same on-disk file revision."""
+    with open(path, encoding="utf-8") as handle:
+        value = json.load(handle)
+    return value if isinstance(value, dict) else {}
+
+
 def _load_cache() -> dict:
     try:
-        with open(CACHE_PATH, encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, dict) else {}
+        stat = os.stat(CACHE_PATH)
+        signature = (stat.st_dev, stat.st_ino, stat.st_size,
+                     stat.st_mtime_ns, stat.st_ctime_ns)
+        value = _read_cache_file(os.fspath(CACHE_PATH), signature)
+        # Refresh replaces row entries; do not mutate the memoized mapping
+        # before a successful atomic save (including a read-only mount).
+        result = dict(value)
+        if isinstance(value.get("rows"), Mapping):
+            result["rows"] = dict(value["rows"])
+        return result
     except (OSError, ValueError, TypeError):
         return {}
 
@@ -222,6 +238,7 @@ def _save_cache(payload: Mapping[str, Any]) -> None:
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
         os.replace(temporary, CACHE_PATH)
+        _read_cache_file.cache_clear()
     except OSError:
         try:
             os.unlink(temporary)
@@ -392,6 +409,7 @@ def fetch_disclosure_timeline(
 
     # Persist raw parsed-source rows, not the asof-filtered result, so a later
     # historical replay can reuse the same evidence without a network call.
+    cache_changed = False
     for code in fresh_codes:
         rows = rows_by_code.get(code, [])
         if batch_ok_by_code.get(code, True):
@@ -401,9 +419,11 @@ def fetch_disclosure_timeline(
                 "items": rows,
                 "ok": True,
             }
-    cache_payload = {"version": 1, "updated_at": fetched_at, "rows": cached_rows}
-    with _CACHE_LOCK:
-        _save_cache(cache_payload)
+            cache_changed = True
+    if cache_changed:
+        cache_payload = {"version": 1, "updated_at": fetched_at, "rows": cached_rows}
+        with _CACHE_LOCK:
+            _save_cache(cache_payload)
 
     for code in requested:
         if code not in output:
