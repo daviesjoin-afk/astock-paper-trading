@@ -20,6 +20,7 @@ import portfolio_runtime_service as PRS
 import portfolio_workspace_service as PWS
 import market_data_contract as MDC
 import market_data_service as MDSvc
+import risk_center as RC
 
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -352,7 +353,7 @@ def risk_overview():
             lambda: _call_with_retry(P.risk_dashboard, allow_stale=True, allow_network=False),
             ttl=60,
         )
-        return result
+        return RC.project_snapshot_freshness(result)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Risk overview failed: {type(exc).__name__}: {str(exc)[:200]}") from exc
 

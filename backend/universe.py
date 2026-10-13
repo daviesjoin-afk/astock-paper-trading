@@ -526,6 +526,41 @@ def _failure_reasons_snapshot():
         return dict(_FAILURE_REASONS)
 
 
+def refresh_benchmark_history(target, beg=None):
+    """Keep enough benchmark history for MA20; merge incremental responses."""
+    import pandas as pd
+
+    target = dt.date.fromisoformat(str(target)[:10])
+    cached = dfc.load_cached_kline("BENCH_000300")
+    if cached is not None:
+        cached = cached[cached.index.date <= target]
+    enough = cached is not None and len(cached.dropna(subset=["close"])) >= 21
+    if beg is None and enough and cached.index[-1].date() >= target:
+        return {"status": "up_to_date", "rows": len(cached)}
+    start = (
+        dt.datetime.strptime(str(beg), "%Y%m%d").date() if beg is not None
+        else cached.index[-1].date() - dt.timedelta(days=7) if enough
+        else target - dt.timedelta(days=120)
+    )
+    frame = dfc.fetch_kline(
+        None, beg=start.strftime("%Y%m%d"), end=target.strftime("%Y%m%d"),
+        secid="1.000300",
+    )
+    if frame is None or frame.empty:
+        return {"status": "failed", "reason": "benchmark_history_unavailable"}
+    frame = frame[frame.index.date <= target]
+    if frame.empty or frame.index[-1].date() < target:
+        return {"status": "failed", "reason": "benchmark_history_stale"}
+    merged = pd.concat([cached, frame]) if cached is not None else frame.copy()
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.attrs.update(frame.attrs)
+    if len(merged.dropna(subset=["close"])) < 21:
+        # A short provider response must not replace the last usable history.
+        return {"status": "failed", "reason": "benchmark_history_insufficient"}
+    dfc.save_kline("BENCH_000300", merged)
+    return {"status": "updated", "rows": len(merged)}
+
+
 def refresh_history(asof_day=None, workers=8, max_seconds=240):
     """Synchronously bring daily K-lines up to a completed market date.
 
@@ -774,13 +809,9 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
     except OSError:
         pass
     try:
-        bench = dfc.load_cached_kline("BENCH_000300")
-        if bench is None or bench.empty or bench.index[-1].date() < target:
-            frame = dfc.fetch_kline(None, beg=target.strftime("%Y%m%d"), secid="1.000300")
-            if frame is not None and not frame.empty:
-                dfc.save_kline("BENCH_000300", frame)
+        benchmark_refresh = refresh_benchmark_history(target)
     except Exception:
-        pass
+        benchmark_refresh = {"status": "failed", "reason": "benchmark_refresh_error"}
     dfc.flush_kline_manifest()
     invalidate_coverage_cache()
     # 失败原因聚合：{原因: 股票数}，供恢复报告与监控直接消费。
@@ -789,7 +820,8 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
         reason = failure_reasons.get(code) or "未记录（历史遗留失败，本轮未重试）"
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
     return {
-        "status": "ok" if not failed and not unprocessed else "partial",
+        "status": "ok" if not failed and not unprocessed and benchmark_refresh["status"] != "failed" else "partial",
+        "benchmark_refresh": benchmark_refresh,
         "requested_date": requested_date.isoformat() if requested_date else None,
         "target_date": target.isoformat(),
         "total": len(codes),
@@ -885,9 +917,7 @@ def init_history(beg="20230101", size=0, workers=6):
             with _state_lock:
                 INIT_STATE["phase"] = "finalizing"
             try:
-                bench = dfc.fetch_kline(None, beg=beg, secid="1.000300")
-                if bench is not None and not bench.empty:
-                    dfc.save_kline("BENCH_000300", bench)
+                refresh_benchmark_history(latest_complete_trade_date(), beg=beg)
             except Exception:
                 pass
             # 海外免费源偶发长时间不可达，不应让 A 股全市场下载卡在“收尾”。
@@ -997,7 +1027,7 @@ def coverage_report(cache_ttl=0):
             long_suspended.add(code)
     denominator_set = required - long_suspended
     denominator = len(denominator_set)
-    selection_pct = round(len(usable_selection) / denominator * 100, 1) if denominator else 0.0
+    selection_pct = round(len(usable_selection & denominator_set) / denominator * 100, 1) if denominator else 0.0
     fresh = covered - stale
     fresh_selection = usable_selection - stale
     fresh_pct = round(len(fresh) / denominator * 100, 1) if denominator else 0.0
@@ -1062,14 +1092,14 @@ def coverage_report(cache_ttl=0):
         "required_total": len(required),
         "long_suspended": len(long_suspended),
         "pending_listing": len(pending),
-        "covered": len(covered),
+        "covered": len(covered & denominator_set),
         "missing": len(missing),
-        "coverage_pct": round(len(covered) / denominator * 100, 1) if denominator else 0.0,
-        "usable_selection": len(usable_selection),
+        "coverage_pct": round(len(covered & denominator_set) / denominator * 100, 1) if denominator else 0.0,
+        "usable_selection": len(usable_selection & denominator_set),
         "usable_selection_pct": selection_pct,
-        "usable_backtest": len(usable_backtest),
+        "usable_backtest": len(usable_backtest & denominator_set),
         "usable_backtest_pct": (
-            round(len(usable_backtest) / denominator * 100, 1) if denominator else 0.0
+            round(len(usable_backtest & denominator_set) / denominator * 100, 1) if denominator else 0.0
         ),
         "fresh": len(fresh),
         "fresh_pct": fresh_pct,

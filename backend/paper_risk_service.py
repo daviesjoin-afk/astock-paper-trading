@@ -665,6 +665,13 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     continue
                 planned_qty = partial_qty
             planned_qty = min(planned_qty, sellable)
+            # Reserve approved unfilled exits; the execution runner owns their continuation.
+            planned_qty, working_id = PREv.unreserved_risk_sell_quantity(
+                conn, cycle_id=cycle_id, account_id=position["account_id"], code=position["code"], requested_qty=planned_qty)
+            if working_id and planned_qty < ports.evidence.lot_size:
+                orders.append({"code": position["code"], "status": "pending_execution_wait",
+                               "order_id": working_id, "reason": "已有风险卖出委托等待执行，本轮不重复下单"})
+                continue
             pct = _num(quote.get("pct"))
             if price <= 0 or pct <= -_limit_pct(
                 position["code"], position.get("name"), position.get("risk_flag")

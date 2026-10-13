@@ -16,6 +16,7 @@ test("委托生命周期状态只展示后端状态", () => {
     ["risk_rejected", "风控拒绝"],
     ["filled", "已成交"],
     ["cancelled", "已撤销"],
+    ["superseded", "已失效或回收"],
   ];
   for (const [status, label] of cases) {
     assert.equal(paper.paperOrderStatusView(status)[1], label);

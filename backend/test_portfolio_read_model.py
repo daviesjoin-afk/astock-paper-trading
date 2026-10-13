@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paper_portfolio_read_model as P  # noqa: E402
 import paper_position_read_model as PPRM  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import execution_verification as EV  # noqa: E402
 
 ACCOUNT = next(iter(PT.ACCOUNT_SPECS))
 CODE = "600519"
@@ -1190,6 +1191,59 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         future = self._portfolio(self.cycle100, NEXT, valuations={CODE: 20.0})
         self.assertEqual(future["cash"], 99990.0)
         self.assertEqual(future["nav"], 100990.0)
+
+    def test_terminal_zero_orders_do_not_poison_verified_cash(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        for side in ("buy", "sell"):
+            order = self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                         price=10.0, fill_date=DAY.isoformat())
+            self.conn.execute("DELETE FROM paper_fills WHERE order_id=?", (order,))
+            self.conn.execute(
+                "UPDATE paper_orders SET status='superseded',execution_status=NULL,"
+                "execution_verified=NULL,filled_price=NULL,amount=NULL,fees=NULL,"
+                "executed_at=NULL,realized_pnl=NULL WHERE id=?", (order,))
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        before = [tuple(r) for r in self.conn.execute("SELECT * FROM paper_fills")]
+        result = EV.stamp_terminal_zero_orders(self.conn, cycle_id=self.cycle100)
+        self.assertEqual(result["confirmed_zero"], 2)
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+        self.assertEqual(before, [tuple(r) for r in self.conn.execute("SELECT * FROM paper_fills")])
+        self.assertEqual(P.verified_cash_flows(self.conn, context)[(ACCOUNT, CODE)],
+                         {"buy_cash": 1005.0, "sell_cash": 0.0})
+        self.assertEqual(EV.stamp_terminal_zero_orders(
+            self.conn, cycle_id=self.cycle100)["confirmed_zero"], 0)
+        self.conn.commit()
+        self.conn.execute("PRAGMA query_only=ON")
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+
+    def test_terminal_fill_conflict_is_never_assumed_zero(self):
+        order = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                     price=10.0, fill_date=DAY.isoformat())
+        self.conn.execute("UPDATE paper_orders SET status='cancelled',"
+                          "execution_status=NULL,execution_verified=NULL WHERE id=?", (order,))
+        self.assertEqual(EV.stamp_terminal_zero_orders(
+            self.conn, cycle_id=self.cycle100)["confirmed_zero"], 0)
+        self.conn.execute("UPDATE paper_orders SET execution_status='not_executed',"
+                          "execution_verified=0 WHERE id=?", (order,))
+        self.assertEqual(P.cash(self.conn, P.PortfolioReadContext(self.cycle100, DAY)),
+                         (None, "unknown"))
+
+    def test_proven_partial_buy_cash_survives_cancellation(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.execute("UPDATE paper_orders SET qty=200,filled_qty=100,remaining_qty=100,"
+                          "status='partially_filled',execution_status='partial',execution_verified=0 WHERE id=?", (buy,))
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+        self.conn.execute("UPDATE paper_orders SET status='cancelled' WHERE id=?", (buy,))
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+        self.assertEqual(P.verified_cash_flows(self.conn, context)[(ACCOUNT, CODE)]["buy_cash"], 1005.0)
+        self.conn.execute("UPDATE paper_orders SET execution_status='unknown' WHERE id=?", (buy,))
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
 
     def test_port12_current_read_behavior_remains_compatible(self):
         self.conn.execute(

@@ -70,6 +70,9 @@ import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
+import paper_candidate_live_fields as PCLF
+import paper_dynamic_allocation as PDAlloc
+import paper_live_tradability as PLTrad
 import paper_position_review as PReview
 import paper_replacement_decision as PRep
 import adaptive_selection_compat as ASC
@@ -6010,13 +6013,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             "turnover": "turnover", "main_pct": "main_pct",
             "super_net_raw": "super_net", "main_net": "main_net",
         }
-        for code, row in live_map.items():
-            if code not in table.index:
-                continue
-            for target, source in live_field_map.items():
-                value = row.get(source)
-                if value is not None and str(value).strip() not in {"", "--", "-"}:
-                    table.loc[code, target] = value
+        PCLF.overlay(table, live_map, live_field_map)
         table["quote_at"] = pd.Series(
             {code: (live_map.get(str(code)) or {}).get("quote_at") for code in table.index}
         )
@@ -6565,6 +6562,7 @@ def _quotes(codes, asof_date=None):
     codes = [str(code) for code in (codes or []) if str(code)]
     if not codes:
         return {}
+    expected_day = _date(asof_date or dt.date.today())
     source_errors = {}
     try:
         live_rows = dfc.fetch_realtime_for_codes(list(codes)) or []
@@ -6575,6 +6573,38 @@ def _quotes(codes, asof_date=None):
         live_rows = []
         source_errors["live"] = f"{type(exc).__name__}: {exc}"
     live = {str(r.get("code")): r for r in live_rows if r.get("code")}
+    fallback_identity = None
+    fallback_codes = set()
+    incomplete = {
+        code for code in codes
+        if not (_num((live.get(code) or {}).get("price"), 0) > 0
+                and _num((live.get(code) or {}).get("pct"), None) is not None
+                and abs(_num((live.get(code) or {}).get("pct"), 999)) <= 30
+                and _quote_is_fresh({**(live.get(code) or {}), "quote_source": "live"}, expected_day))
+    }
+    if incomplete:
+        # Use the market owner's complete, fresh current snapshot, never the
+        # historical universe file. Independent price reconciliation still runs.
+        try:
+            reading = MDSvc.read_snapshot(
+                MDC.LIVE_MARKET_POLICY, now=dt.datetime.now().astimezone(),
+                asof_day=expected_day.isoformat())
+            if reading.status == MDC.STATUS_FRESH:
+                for candidate in reading.rows():
+                    candidate = dict(candidate)
+                    code = str(candidate.get("code") or "")
+                    if (code in incomplete
+                            and _num(candidate.get("price"), 0) > 0
+                            and _num(candidate.get("pct"), None) is not None
+                            and abs(_num(candidate.get("pct"), 999)) <= 30
+                            and _quote_is_fresh({**candidate, "quote_source": "live"}, expected_day)):
+                        live[code] = candidate
+                        fallback_codes.add(code)
+                if fallback_codes:
+                    fallback_identity = MDC.snapshot_fingerprint(reading.snapshot)
+        except Exception as exc:
+            source_errors["snapshot"] = f"{type(exc).__name__}: {exc}"
+    live_rows = list(live.values())
     # 单票行情核验以价格为核心，但东财 ulist 偶尔返回价格而遗漏资金字段。
     # 补齐动作独立于双源价格校验：资金流失败不能把可执行的风险卖出误写成
     # “实时行情失败”，也不能令整批持仓都失去主力意图解释。
@@ -6600,7 +6630,6 @@ def _quotes(codes, asof_date=None):
     local = _latest_price_map(codes)
     local_snapshot_at = _universe_snapshot_time()
     out = {}
-    expected_day = _date(asof_date or dt.date.today())
     quote_execution_asof = dt.datetime.now().isoformat(timespec="seconds")
     is_historical_asof = expected_day != dt.date.today()
     for code in codes:
@@ -6616,7 +6645,8 @@ def _quotes(codes, asof_date=None):
             # 用昨天或上一轮缓存价格制造一笔看似通过的成交。
             row = {
                 key: value for key, value in dict(local.get(code) or {}).items()
-                if key not in {"price", "pct", "open", "high", "low", "pre_close", "quote_at"}
+                if key not in {"price", "pct", "open", "high", "low", "pre_close", "quote_at",
+                               "super_net", "main_net", "big_net", "mid_net", "small_net", "main_pct"}
             }
             row.update({key: value for key, value in live_row.items() if value is not None})
             row["price"] = live_row.get("price")
@@ -6631,6 +6661,9 @@ def _quotes(codes, asof_date=None):
             row.get("quote_at") if is_historical_asof else quote_execution_asof
         )
         row["quote_source"] = "live" if is_live else "local_cache"
+        if code in fallback_codes:
+            row["primary_quote_origin"] = "verified_full_market_snapshot"
+            row["primary_owner_fingerprint"] = fallback_identity
         flow_at = flow_row.get("quote_at") or flow_row.get("flow_fetched_at") or live_row.get("quote_at")
         flow_time = _parse_quote_timestamp(flow_at)
         flow_day_ok = bool(flow_time and flow_time.date() == expected_day)
@@ -6639,7 +6672,9 @@ def _quotes(codes, asof_date=None):
             now_for_flow = dt.datetime.now(flow_time.tzinfo) if flow_time.tzinfo else dt.datetime.now()
             flow_age_seconds = round((now_for_flow - flow_time).total_seconds(), 1)
         has_flow = isinstance(live_row.get("super_net"), (int, float)) and isinstance(live_row.get("main_pct"), (int, float))
-        row["flow_source"] = flow_row.get("flow_source") or ("eastmoney_ulist" if has_flow else None)
+        row["flow_source"] = flow_row.get("flow_source") or (
+            "eastmoney_market_snapshot" if has_flow and code in fallback_codes
+            else "eastmoney_ulist" if has_flow else None)
         row["flow_quote_at"] = flow_at
         row["flow_age_seconds"] = flow_age_seconds
         row["flow_validation"] = (
@@ -6704,6 +6739,8 @@ def _quotes(codes, asof_date=None):
         row["quote_validation"] = validation
         row["quote_cross_check"] = {
             "source": cross_row.get("source") or "tencent_public_quote+sina_public_quote",
+            "code": cross_row.get("code"), "price": cross_price, "pct": cross_pct,
+            "name": cross_row.get("name"),
             "quote_at": cross_row.get("quote_at"),
             "price_gap_pct": round(price_gap * 100, 3) if price_gap is not None else None,
             "pct_gap": round(pct_gap, 3) if pct_gap is not None else None,
@@ -6711,6 +6748,15 @@ def _quotes(codes, asof_date=None):
             "failure_reason": failure_reason,
         }
         out[code] = row
+    if not is_historical_asof:
+        observations = PLTrad.prefetch(out, asof_day=expected_day.isoformat())
+        completed_at = dt.datetime.now().isoformat(timespec="microseconds")
+        for row in out.values():
+            row["tradability_observation_status"] = "unavailable"
+        for code, item in observations.items():
+            out[code]["tradability_observation"] = item
+            out[code]["tradability_observation_status"] = "available"
+            out[code]["execution_asof"] = completed_at
     return out
 
 
@@ -8112,8 +8158,14 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
     if instant.tzinfo is None:
         raise PAPolicy.PortfolioAllocationPolicyError(
             "explicit_decision_at_must_include_timezone")
+    reconciled = EV.stamp_terminal_zero_orders(conn, cycle_id=cycle_id)
+    if reconciled["confirmed_zero"]:
+        _audit(conn, None, "terminal_execution_reconciled",
+               _json({"cycle_id": int(cycle_id), **reconciled}))
     reading = MDSvc.read_snapshot(
         MDC.LIVE_MARKET_POLICY, now=instant, asof_day=asof_day)
+    if reading.status == MDC.STATUS_FRESH and asof_day == instant.astimezone(PDAlloc.E.TZ).date().isoformat():
+        PDAlloc.rebalance(conn, cycle_id=cycle_id, decision_at=decision_at)
     snapshot = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=cycle_id, asof_day=asof_day,
         decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,
@@ -13666,12 +13718,7 @@ def _run_slot_impl(slot, day, force=False):
             # 租约时同步等待多轮重试；但 cron runner 是一次性进程，退出前
             # 必须有界等待刷新落地（daemon 线程会随进程死亡）。
             try:
-                kick = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
-                detail["risk_snapshot_refresh"] = kick.get("status")
-                if kick.get("status") == "scheduled":
-                    detail["risk_snapshot_refresh"] = wait_risk_snapshot_refresh(
-                        timeout=20.0
-                    ).get("status")
+                detail.update(_refresh_slot_risk_snapshot(slot))
             except Exception as exc:
                 detail["risk_snapshot_refresh"] = f"error:{type(exc).__name__}"
             try:
@@ -13679,23 +13726,32 @@ def _run_slot_impl(slot, day, force=False):
                 detail["risk_snapshot_at"] = (prior or {}).get("asof")
             except Exception:
                 pass
+        completion_status = _slot_completion_status(detail)
+        if completion_status != "completed":
+            detail["scan_completed"] = True
+            detail["retry_count"] = retry_count
+            detail.setdefault("error", (
+                "risk_snapshot_refresh_incomplete" if "risk_snapshot_refresh" in detail
+                and detail["risk_snapshot_refresh"] not in {"completed", "finished", "idle", "skipped"}
+                else "slot_work_incomplete"
+            ))
         with _db(immediate=True, hot_path=hot_path) as conn:
             _assert_active_lease(conn, "job completion")
             if intraday_key:
                 cursor = conn.execute(
-                    "UPDATE paper_job_runs SET status='completed',detail=?,finished_at=? "
+                    "UPDATE paper_job_runs SET status=?,detail=?,finished_at=? "
                     "WHERE run_key=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json(detail), _now(), intraday_key, owner, fencing_token),
+                    (completion_status, _json(detail), _now(), intraday_key, owner, fencing_token),
                 )
             else:
                 cursor = conn.execute(
-                    "UPDATE paper_jobs SET status='completed',detail=?,finished_at=? "
+                    "UPDATE paper_jobs SET status=?,detail=?,finished_at=? "
                     "WHERE slot=? AND market_date=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json(detail), _now(), slot, day.isoformat(), owner, fencing_token),
+                    (completion_status, _json(detail), _now(), slot, day.isoformat(), owner, fencing_token),
                 )
             if cursor.rowcount != 1:
                 raise RuntimeError("paper lease lost: completion CAS")
-        return {"status": "completed", **detail}
+        return {**detail, "status": completion_status}
     except Exception as exc:
         with _db(immediate=True, hot_path=hot_path) as conn:
             if _lease_lost(exc) or lease_lost_event.is_set():
@@ -14396,6 +14452,27 @@ _RISK_SNAPSHOT_REFRESH = {"running": False, "started_at": None, "last_error": No
                           "trigger": None, "thread": None}
 
 
+def _refresh_slot_risk_snapshot(slot):
+    kick = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
+    result = (
+        wait_risk_snapshot_refresh(timeout=240.0)
+        if kick.get("status") in {"scheduled", "already_running"} else kick
+    )
+    detail = {"risk_snapshot_refresh": result.get("status")}
+    if result.get("error"):
+        detail["risk_snapshot_refresh_error"] = str(result["error"])[:200]
+    return detail
+
+
+def _slot_completion_status(detail):
+    if detail.get("status") in {"blocked", "failed", "partial", "deferred", "in_progress"}:
+        return "failed"
+    status = detail.get("risk_snapshot_refresh")
+    if "risk_snapshot_refresh" in detail and status not in {"completed", "finished", "idle", "skipped"}:
+        return "failed"
+    return "completed"
+
+
 def request_risk_snapshot_refresh(trigger="background", on_complete=None):
     """后台异步刷新风控快照；去重，立即返回，不阻塞调用方。
 
@@ -14454,17 +14531,15 @@ def wait_risk_snapshot_refresh(timeout=240.0):
     """
     with _RISK_SNAPSHOT_REFRESH_LOCK:
         thread = _RISK_SNAPSHOT_REFRESH.get("thread")
-        running = _RISK_SNAPSHOT_REFRESH.get("running")
-    if not running or thread is None:
+    if thread is None:
         return {"status": "idle"}
-    if not thread.is_alive():
-        return {"status": "finished"}
     thread.join(timeout=timeout)
     with _RISK_SNAPSHOT_REFRESH_LOCK:
         err = _RISK_SNAPSHOT_REFRESH.get("last_error")
     if thread.is_alive():
         return {"status": f"timeout_after_{int(timeout)}s"}
-    return {"status": "failed" if err else "completed", "error": err}
+    failed = bool(err) and not str(err).startswith("cache_invalidation:")
+    return {"status": "failed" if failed else "completed", "error": err}
 
 
 def risk_snapshot_refresh_status():
@@ -14699,6 +14774,10 @@ def risk_audit(limit=160):
     try:
         with _db_readonly() as conn:
             accounts = _rows(conn, "SELECT id,name FROM paper_accounts ORDER BY id")
+            cycle_id = _active_cycle_id_readonly(conn)
+            scan_status = (PRSS.latest_scan(conn, cycle_id=cycle_id,
+                                             asof_date=dt.date.today().isoformat())
+                           if cycle_id is not None else None)
             names = {row["id"]: row["name"] for row in accounts}
             decisions = _rows(
                 conn,
@@ -14855,7 +14934,8 @@ def risk_audit(limit=160):
                 "label": "待执行委托（等待开盘审批/执行批次）",
             } if linked else None),
         })
-    return {"accounts": accounts, "alerts": alerts, "asof": _now(), "lightweight": True}
+    return {"accounts": accounts, "alerts": alerts, "scan_status": scan_status,
+            "asof": _now(), "lightweight": True}
 
 
 def _validate_capital(capital):
