@@ -1,4 +1,5 @@
 import json
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -101,3 +102,35 @@ class DisclosureCacheTests(unittest.TestCase):
             result = D.fetch_disclosure_timeline(["000001"])[0]
             self.assertEqual(result["report_period"], "2026-06-30")
             self.assertEqual(result["status"], "cached")
+
+    def test_save_matches_streaming_json_bytes_and_preserves_nested_evidence(self):
+        payload = self._seed()
+        payload["rows"]["000001"]["items"][0].update({
+            "nested": [None, True, False, 1.25, {"text": '中文\n"公告"\\链接 😀'}],
+        })
+        original = io.StringIO()
+        json.dump(payload, original, ensure_ascii=False, allow_nan=False)
+        D._save_cache(payload)
+        self.assertEqual(self.path.read_bytes(), original.getvalue().encode("utf8"))
+        self.assertEqual(D._load_cache(), payload)
+
+    def test_encoding_failure_never_replaces_valid_cache_or_parsed_evidence(self):
+        payload = self._seed()
+        D._load_cache()
+        original = self.path.read_bytes()
+        for bad in (float("nan"), float("inf"), object()):
+            with self.subTest(value=type(bad).__name__):
+                with self.assertRaises((ValueError, TypeError)):
+                    D._save_cache({"bad": bad})
+                self.assertEqual(self.path.read_bytes(), original)
+                self.assertEqual(D._load_cache(), payload)
+
+    def test_failed_atomic_replace_preserves_file_and_parsed_revision(self):
+        payload = self._seed()
+        D._load_cache()
+        original = self.path.read_bytes()
+        with patch.object(D.os, "replace", side_effect=OSError("read-only")):
+            D._save_cache({"rows": {}})
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(D._load_cache(), payload)
+        self.assertFalse(Path(f"{self.path}.{os.getpid()}.tmp").exists())
