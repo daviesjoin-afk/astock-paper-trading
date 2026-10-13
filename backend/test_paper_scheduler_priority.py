@@ -24,8 +24,15 @@ class SchedulerPriorityTests(unittest.TestCase):
             docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shlex.quote(str(calls)) + "\n")
             docker.chmod(0o755)
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            cron = source.with_name("astock-codex.cron").read_text()
+            command = next(line for line in cron.splitlines() if ".locks/intraday.lock" in line)
+            command = command.split(" root ", 1)[1].split(" >>", 1)[0]
+            command = command.replace("/opt/astock-codex/.locks", str(locks))
+            command = command.replace("/opt/astock-codex/deploy/run_paper_slot.sh",
+                                      "bash " + shlex.quote(str(runner)))
             holder = subprocess.Popen(
-                ["flock", str(locks / "paper-scan.lock"), "sh", "-c", "echo ready; read release"],
+                ["flock", str(locks / "intraday.lock"), "flock", str(locks / "paper-scan.lock"),
+                 "sh", "-c", "echo ready; read release"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             )
             full = None
@@ -34,7 +41,7 @@ class SchedulerPriorityTests(unittest.TestCase):
                 fast = subprocess.run(["bash", str(runner), "fast-entry"], env=env, timeout=2)
                 self.assertEqual(fast.returncode, 1)
                 self.assertFalse(calls.exists())
-                full = subprocess.Popen(["bash", str(runner), "intraday"], env=env)
+                full = subprocess.Popen(["bash", "-c", command], env=env)
                 time.sleep(0.1)
                 self.assertIsNone(full.poll())
                 holder.communicate("release\n", timeout=2)
