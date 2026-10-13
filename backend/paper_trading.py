@@ -4212,27 +4212,47 @@ def _rebuild_selection_factor_cache(asof_date=None):
     universe = U.load_universe()
     universe_membership = None
     if cutoff is not None:
-        # strict historical 需要**两件**事同时成立：
-        #   1) 逐行成员资格已证明（drop_unproven=True，缺 list/delist 的一律不留）；
-        #   2) **源级**完整性已证明——逐行日期只能证明"这条现存 row 在 asof 属于
-        #      市场"，不能证明 `current universe == historical universe at T`：
-        #      已退市且今天不在快照里的证券根本不在输入里。
-        # 今天的 universe.json 是当前快照，无权自称历史完整，所以生产历史重建
-        # 会 fail closed，直到有真正持有上市/退市史的归档方显式声明完整性。
-        pit_gate = U.historical_universe(universe, cutoff, drop_unproven=True)
+        # 从沪深北官方免费证券主表刷新不可变归档；PIT 名单以归档为准，
+        # 不从当前行情快照推断历史成分（否则已退市证券会被漏掉）。
+        try:
+            import db_migrate as DBM
+            import historical_universe_public_sources as HUPS
+
+            archived = HUPS.refresh_archive(
+                DBM.DB_PATHS["adaptive_learning"], asof=cutoff.isoformat())
+            # 昨日及更早的回放不继承当前快照里的名称/风险标记，避免把后来的状态
+            # 带回历史；当日运行才可补充实时显示字段。
+            current_by_code = ({str(row.get("code") or ""): row for row in universe}
+                               if cutoff == dt.date.today() else {})
+            pit_rows = []
+            for member in archived["members"]:
+                row = dict(current_by_code.get(member["code"], {}))
+                row.update({"code": member["code"], "list_date": member["list_date"],
+                            "delist_date": member["delist_date"]})
+                pit_rows.append(row)
+            pit_gate = U.historical_universe(
+                pit_rows, cutoff, source=archived["source"], drop_unproven=True)
+        except Exception:
+            return {
+                "status": "blocked",
+                "reason": "免费交易所历史股票池不可用或不完整，保留上一有效因子版本",
+                "pit_unavailable": True,
+                "universe_membership": {
+                    "historical_membership_complete": False,
+                    "source": "official-free-exchange-stock-master-v1",
+                },
+            }
         universe = pit_gate["members"]
         universe_membership = pit_gate["report"]
         if not pit_gate["passed"]:
             missing_source = not universe_membership["historical_membership_complete"]
             return {
                 "status": "blocked",
-                "reason": ("历史 universe 源未证明完整性（PIT unavailable），"
-                           "拒绝回退到当前 universe" if missing_source else
-                           "历史 universe 无任何已证明成员资格（PIT unavailable），"
-                           "拒绝回退到当前 universe"),
+                "reason": ("免费交易所历史股票池未证明完整性，保留上一有效因子版本"
+                           if missing_source else
+                           "目标日期没有已证明的历史成员，保留上一有效因子版本"),
                 "pit_unavailable": True,
-                "required": ("需要显式声明 historical_archive 完整性的历史成员源"
-                             "（含上市/退市史）；当前快照不构成证据"),
+                "required": "沪深北官方在市/退市主表和完整上市退市日期",
                 "universe_membership": universe_membership,
             }
         gate = _selection_factor_history_gate(universe, cutoff)
