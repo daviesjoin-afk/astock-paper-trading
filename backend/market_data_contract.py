@@ -73,8 +73,8 @@ __all__ = [
     # reasons
     "REASON_MISSING", "REASON_STALE", "REASON_INCOMPLETE",
     "REASON_PROVIDER_UNAVAILABLE", "REASON_REFRESH_FAILED",
-    "REASON_CROSS_SOURCE_FAILED", "REASON_ASOF_UNPROVABLE",
-    "REASON_ASOF_MISMATCH", "REASONS",
+    "REASON_CROSS_SOURCE_FAILED", "REASON_PRICE_ONLY_COVERAGE",
+    "REASON_ASOF_UNPROVABLE", "REASON_ASOF_MISMATCH", "REASONS",
     # status label
     "STATUS_FRESH", "STATUS_STALE", "STATUS_DEGRADED", "STATUS_UNAVAILABLE",
     "STATUS_UNVERIFIED", "STATUSES",
@@ -203,6 +203,9 @@ REASON_PROVIDER_UNAVAILABLE = "provider_unavailable"
 REASON_REFRESH_FAILED = "refresh_failed"
 #: 多源核验失败（超容差或核验源不可用）。
 REASON_CROSS_SOURCE_FAILED = "cross_source_failed"
+#: 只有价格覆盖（例如腾讯价格回退），没有全市场横截面字段。它**不是**
+#: "结构不完整"，也**不是**"过期"：可用，但必须显式降级展示与消费。
+REASON_PRICE_ONLY_COVERAGE = "price_only_coverage"
 #: 无法证明该 as-of 的事实（**禁止**回落到 current）。
 REASON_ASOF_UNPROVABLE = "asof_unprovable"
 #: snapshot 的业务日与请求的 as-of 不符。
@@ -210,7 +213,8 @@ REASON_ASOF_MISMATCH = "asof_mismatch"
 REASONS = (
     REASON_MISSING, REASON_STALE, REASON_INCOMPLETE,
     REASON_PROVIDER_UNAVAILABLE, REASON_REFRESH_FAILED,
-    REASON_CROSS_SOURCE_FAILED, REASON_ASOF_UNPROVABLE, REASON_ASOF_MISMATCH,
+    REASON_CROSS_SOURCE_FAILED, REASON_PRICE_ONLY_COVERAGE,
+    REASON_ASOF_UNPROVABLE, REASON_ASOF_MISMATCH,
 )
 
 # ---------------------------------------------------------------------------
@@ -673,7 +677,7 @@ def reading_for_refresh_failure(
                     refresh_failed=True)
 
 
-def fresh_ratio(rows: Any, now: Any, max_age: float) -> float | None:
+def fresh_ratio(rows: Any, now: Any, max_age: float, *, max_future_seconds=None) -> float | None:
     """窗口内的行数占**可解析总行数**的比例；无可解析行时 ``None``。
 
     横截面新鲜度必须看比例，而不是"最新那一行够不够新"。
@@ -683,18 +687,26 @@ def fresh_ratio(rows: Any, now: Any, max_age: float) -> float | None:
         return None
     parsed = 0
     fresh = 0
+    count = 0
     for row in rows or ():
+        count += 1
         if not isinstance(row, Mapping):
             continue
-        age = _age_seconds(row.get("quote_at") or row.get("observed_at"), current)
+        value = row.get("quote_at") or row.get("observed_at")
+        age = _age_seconds(value, current)
         if age is None:
             continue
         parsed += 1
-        if age <= max_age:
-            fresh += 1
+        if max_future_seconds is None:
+            fresh += age <= max_age
+        else:
+            observed = _parse_instant(value)
+            signed_age = (current - observed).total_seconds()
+            fresh += -max_future_seconds <= signed_age <= max_age
     if not parsed:
         return None
-    return fresh / parsed
+    # Price-only artifacts count missing timestamps against their coverage.
+    return fresh / (count if max_future_seconds is not None else parsed)
 
 
 def _cross_section_freshness(
@@ -793,7 +805,13 @@ def classify(
         base.update(overrides)
         return MarketDataReading(**base)
 
-    if not snapshot.complete:
+    price_only = snapshot.degraded_reason == REASON_PRICE_ONLY_COVERAGE
+    if price_only:
+        ratio = fresh_ratio(snapshot.rows, now, policy.max_age_seconds, max_future_seconds=120)
+        satisfied = ratio is not None and ratio >= max(0.90, policy.min_fresh_ratio)
+        detail["fresh_ratio"] = round(ratio, 4) if ratio is not None else None
+        detail["min_fresh_ratio"] = max(0.90, policy.min_fresh_ratio)
+    if not snapshot.complete and not price_only:
         return _reading(
             availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_STALE,
             status=STATUS_STALE,
@@ -825,6 +843,10 @@ def classify(
             freshness=FRESHNESS_UNKNOWN if age is None else FRESHNESS_STALE,
             status=STATUS_STALE, reason=REASON_STALE,
         )
+
+    if price_only:
+        return _reading(availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_FRESH,
+                        status=STATUS_DEGRADED, reason=REASON_PRICE_ONLY_COVERAGE)
 
     single_source = snapshot.verification in (
         VERIFICATION_SINGLE_SOURCE, VERIFICATION_NOT_ATTEMPTED,

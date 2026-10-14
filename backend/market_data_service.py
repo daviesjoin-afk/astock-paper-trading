@@ -74,6 +74,10 @@ __all__ = [
 KIND_FULL_MARKET_SNAPSHOT = "full_market_snapshot"
 KINDS = (KIND_FULL_MARKET_SNAPSHOT,)
 
+#: 腾讯价格快照的 payload 标记。它只证明"当前名单的价格覆盖"，
+#: 不证明东财全市场横截面的资金流/估值/行业字段，也不能算逐票双源核验。
+TENCENT_SNAPSHOT_SOURCE = "tencent_public_quote_full_snapshot"
+
 
 class MarketDataAccessError(RuntimeError):
     """调用方以不允许的方式访问 Market Data（例如只读模式要求联网）。"""
@@ -144,8 +148,8 @@ def snapshot_from_cached_payload(
         complete=complete,
         expected_rows=expected,
         kind=kind,
+        source=str(payload.get("source") or "eastmoney_clist_full_snapshot"),
     )
-
 
 def _full_market_snapshot(
     *,
@@ -155,6 +159,7 @@ def _full_market_snapshot(
     complete: bool,
     expected_rows: int,
     kind: str,
+    source: str = "eastmoney_clist_full_snapshot",
 ) -> MDC.MarketDataSnapshot:
     """全市场横截面快照的唯一构造点（R24 复审修正后的核验语义）。
 
@@ -172,13 +177,20 @@ def _full_market_snapshot(
     需要双源保证的消费者必须用 :func:`market_data_contract.is_cross_source_verified`。
     """
     row_list = [row for row in rows if isinstance(row, Mapping)]
+    # A Tencent price-only slice proves coverage of the current code list, not
+    # the Eastmoney cross-section fields (flow / valuation / industry).  It is
+    # therefore degraded evidence that must never read as a fresh verified
+    # cross-section, and never as cross-source verified.
+    single_source = source == TENCENT_SNAPSHOT_SOURCE
+    price_only = single_source and complete
+    complete = complete and not single_source
     return MDC.MarketDataSnapshot(
         kind=kind,
         rows=tuple(row_list),
         as_of=MDC.canonical_day(observed_at),
         observed_at=observed_at,
         saved_at=saved_at,
-        source="eastmoney_clist_full_snapshot",
+        source=source,
         complete=complete,
         expected_rows=expected_rows,
         verification=(
@@ -197,10 +209,15 @@ def _full_market_snapshot(
                     str(row.get("code")) for row in row_list if row.get("code")
                 }),
                 "expected_rows": expected_rows,
+                "source": source,
             }
-            if complete else {"policy": "coverage_integrity", "passed": False}
+            if complete else {"policy": "coverage_integrity", "passed": False,
+                              "source": source}
         ),
-        degraded_reason=None if complete else MDC.REASON_INCOMPLETE,
+        degraded_reason=(
+            MDC.REASON_PRICE_ONLY_COVERAGE if price_only
+            else None if complete else MDC.REASON_INCOMPLETE
+        ),
     )
 
 
@@ -316,6 +333,24 @@ def refresh_snapshot(
     except Exception:
         rows = None
     if not isinstance(rows, list) or not rows:
+        # The primary source is down (Eastmoney returned 0 rows).  Tencent
+        # prices are an independent fallback for the price cross-section, not a
+        # replacement for the missing flow / valuation / sector fields, so the
+        # persisted artifact is explicitly labelled price-only.
+        try:
+            import universe as universe_module
+        except ImportError:
+            from . import universe as universe_module
+        try:
+            codes = [
+                str(row.get("code") or "") for row in universe_module.load_universe()
+            ]
+            rows = dfc_module.fetch_tencent_market_snapshot(
+                codes, max_age=policy.max_age_seconds, now=deadline, force=force,
+            )
+        except Exception:
+            rows = []
+    if not isinstance(rows, list) or not rows:
         return MDC.reading_for_refresh_failure(
             policy, last_known=last_known, now=deadline,
             reason=MDC.REASON_REFRESH_FAILED,
@@ -324,17 +359,21 @@ def refresh_snapshot(
     # 刷新已把结果写入持久化层；优先用那份**经同一完整性判据**的 payload 作
     # metadata 来源（能拿到 saved_at / expected_rows / 真实覆盖），与只读路径
     # 完全同口径。拿不到时才退回"只凭本次 rows"的保守判定。
-    persisted, _payload = _load_cached_snapshot_with_meta(kind)
-    if persisted is not None and persisted.observed_at is not None:
+    persisted, payload = _load_cached_snapshot_with_meta(kind)
+    source = (TENCENT_SNAPSHOT_SOURCE
+              if all(row.get("source") == "tencent_public_quote" for row in rows)
+              else "eastmoney_clist_full_snapshot")
+    # Another writer can publish after this provider returns. Only a matching
+    # payload may supply metadata; code identity alone does not bind prices/time.
+    matches = bool(payload.get("rows") == rows
+                   and str(payload.get("source") or "eastmoney_clist_full_snapshot") == source)
+    if matches and persisted is not None and persisted.observed_at is not None:
         refreshed = persisted
     else:
         refreshed = _full_market_snapshot(
-            rows=rows,
-            observed_at=newest,
-            saved_at=None,
+            rows=rows, observed_at=newest, saved_at=None,
             complete=len(rows) >= dfc_module.FULL_MARKET_MIN_ROWS,
-            expected_rows=0,
-            kind=kind,
+            expected_rows=len(rows), kind=kind, source=source,
         )
     return MDC.classify(
         refreshed, policy, now=deadline, access_mode=MDC.ACCESS_REFRESH,
