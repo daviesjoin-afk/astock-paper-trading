@@ -307,6 +307,7 @@ class TencentRealtimeFeedTests(unittest.TestCase):
             parser=parser,
             reset_data_source=reset,
             sleep=sleep,
+            health=feeds.FeedHealthRegistry(),
         )
         rows = feed.fetch_realtime(["000001", "600000"])
         self.assertEqual([row["code"] for row in rows], ["000001", "600000"])
@@ -323,6 +324,7 @@ class TencentRealtimeFeedTests(unittest.TestCase):
             parser=lambda *_args, **_kwargs: [],
             reset_data_source=reset,
             sleep=sleep,
+            health=feeds.FeedHealthRegistry(),
         )
         self.assertEqual(feed.fetch_realtime(["000001"]), [])
         self.assertEqual(reset.call_count, 2)

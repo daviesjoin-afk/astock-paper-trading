@@ -55,6 +55,9 @@ def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
 
 
+_full_snapshot_lock_context = threading.local()
+
+
 @contextmanager
 def _full_snapshot_singleflight_lock():
     """Serialize full-market refreshes across threads and worker processes.
@@ -65,10 +68,19 @@ def _full_snapshot_singleflight_lock():
     development has no ``fcntl``; the process-local lock still protects its
     threads and the lock file remains harmless.
     """
+    # Nested publishers reuse this thread's existing file-lock ownership.
+    if getattr(_full_snapshot_lock_context, "held", False):
+        yield
+        return
     with MDC.full_snapshot_singleflight_lock(
         _full_snapshot_thread_lock, MARKET_SNAPSHOT_FULL_LOCK_PATH
     ):
-        yield
+        _full_snapshot_lock_context.held = True
+        try:
+            yield
+        finally:
+            _full_snapshot_lock_context.held = False
+
 
 def _get_json(url, params=None, timeout=15, retries=2):
     txt = http_get(url, params=params, timeout=timeout, retries=retries)
@@ -592,21 +604,18 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
         complete_enough = pages is not None or full_coverage
         if rows and complete_enough:
             try:
-                temp_path = f"{cache_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-                with open(temp_path, "w", encoding="utf-8") as handle:
-                    payload = {
-                        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "rows": rows,
-                    }
-                    if pages is None:
-                        payload.update({
-                            "complete": bool(pagination_complete),
-                            "expected_rows": int(raw_meta.get("total") or len(rows)),
-                            "pages_expected": int(raw_meta.get("pages_expected") or 0),
-                            "pages_ok": int(raw_meta.get("pages_ok") or 0),
-                        })
-                    json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
-                os.replace(temp_path, cache_path)
+                payload = {"saved_at": dt.datetime.now(dt.timezone.utc).isoformat(), "rows": rows}
+                if pages is None:
+                    payload.update({"complete": bool(pagination_complete),
+                                    "expected_rows": int(raw_meta.get("total") or len(rows)),
+                                    "pages_expected": int(raw_meta.get("pages_expected") or 0),
+                                    "pages_ok": int(raw_meta.get("pages_ok") or 0)})
+                    _publish_full_snapshot(payload)
+                else:
+                    temp_path = f"{cache_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                    with open(temp_path, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+                    os.replace(temp_path, cache_path)
             except OSError:
                 pass
             return rows
@@ -616,6 +625,126 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
         # scan.  The caller opts into that legacy fallback explicitly.
         return _disk_fallback() if allow_disk_fallback else []
     return _cached(f"snapshot_{pages}", 120, _do)
+
+
+def fetch_tencent_market_snapshot(codes, *, max_age, now, force=False):
+    """Serialize fallback requests and publication with the primary writer."""
+    normalized = MDF.normalize_codes(codes)
+    if len(normalized) < _full_market_min_rows():
+        return []
+    with _full_snapshot_singleflight_lock():
+        if not force:
+            cached = _fresh_full_snapshot_from_disk(max_age)
+            wanted = set(normalized)
+            usable = [row for row in cached or [] if row.get("code") in wanted]
+            if len(usable) >= max(_full_market_min_rows(), len(wanted) * 0.90):
+                return usable
+        return _fetch_tencent_market_snapshot_locked(normalized, max_age=max_age, now=now)
+
+
+def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
+    """Build a price-only full-market slice from the formal current code list."""
+    normalized = MDF.normalize_codes(codes)
+    if len(normalized) < _full_market_min_rows():
+        return []
+    rows = fetch_tencent_realtime_for_codes(normalized)
+    allowed = set(normalized)
+    by_code = {
+        str(row.get("code")): row for row in rows
+        if isinstance(row, dict) and str(row.get("code")) in allowed
+        and MDF.usable_quote(row)
+        and MN.finite_number(row.get("pct")) is not None
+    }
+    if (len(by_code) < _full_market_min_rows()
+            or len(by_code) / len(normalized) < 0.90):
+        return []
+    try:
+        from market_data_contract import _parse_instant
+    except ImportError:
+        from .market_data_contract import _parse_instant
+    current = _parse_instant(now)
+    if current is None:
+        return []
+
+    def _tencent_instant(value):
+        try:
+            return dt.datetime.strptime(value, "%Y%m%d%H%M%S").replace(
+                tzinfo=dt.timezone(dt.timedelta(hours=8))
+            )
+        except (TypeError, ValueError):
+            return None
+
+    fresh = 0
+    for row in by_code.values():
+        observed = _tencent_instant(row["quote_at"])
+        if observed is not None:
+            age = (current - observed).total_seconds()
+            if -120 <= age <= max_age:
+                fresh += 1
+    if fresh / len(normalized) < 0.90:
+        return []
+    snapshot = []
+    for code in normalized:
+        row = by_code.get(code)
+        if row is None:
+            continue
+        observed = _tencent_instant(row["quote_at"])
+        if observed is None or not -120 <= (current - observed).total_seconds() <= max_age:
+            continue
+        snapshot.append({
+            "code": code, "name": row.get("name"), "price": MN.finite_number(row["price"]),
+            "pct": MN.finite_number(row["pct"]), "prev_close": MN.finite_number(row.get("prev_close")),
+            "quote_at": observed.isoformat(timespec="seconds"),
+            "observed_at": observed.isoformat(timespec="seconds"),
+            "source": "tencent_public_quote",
+            "open_price": None, "high": None, "low": None,
+            "volume": None, "amount": None, "turnover": None,
+            "pe": None, "vol_ratio": None, "mktcap": None,
+            "float_cap": None, "pb": None, "industry": None,
+            "main_net": None, "super_net": None, "big_net": None,
+            "mid_net": None, "small_net": None, "main_pct": None,
+        })
+    return snapshot if _persist_tencent_snapshot(snapshot, normalized) else []
+
+
+def _publish_full_snapshot(payload):
+    """Atomically publish a full-market payload under the shared singleflight lock.
+
+    The full-market cache is shared by every writer (Eastmoney refresh, Tencent
+    fallback, close task, data worker).  Publishing outside the lock lets two
+    refreshes interleave so a partial Eastmoney page set can overwrite a
+    complete Tencent snapshot, and vice versa.
+    """
+    with _full_snapshot_singleflight_lock():
+        temp_path = f"{MARKET_SNAPSHOT_FULL_CACHE_PATH}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            os.replace(temp_path, MARKET_SNAPSHOT_FULL_CACHE_PATH)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        with _cache_lock:
+            _mem_cache.pop("snapshot_None", None)
+
+
+def _persist_tencent_snapshot(snapshot, normalized):
+    """Persist a Tencent price-only snapshot as an explicitly labelled artifact.
+
+    ``source`` is part of the payload so readers can tell a price-only slice
+    from an Eastmoney cross-section: it must never be mistaken for evidence
+    that flow, valuation or sector fields were verified too.
+    """
+    if len(snapshot) < _full_market_min_rows():
+        return False
+    payload = {
+        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": "tencent_public_quote_full_snapshot",
+        "rows": snapshot, "complete": True, "expected_rows": len(normalized),
+        "pages_expected": 0, "pages_ok": 0,
+    }
+    _publish_full_snapshot(payload)
+    return True
 
 
 def _full_snapshot_payload_is_complete(payload):
@@ -693,6 +822,14 @@ def _fresh_full_snapshot_from_disk(max_age):
             except (TypeError, ValueError):
                 # Preserve the previous mtime fallback for malformed quote_at.
                 pass
+        if payload.get("source") == "tencent_public_quote_full_snapshot":
+            try:
+                from market_data_contract import fresh_ratio
+            except ImportError:
+                from .market_data_contract import fresh_ratio
+            ratio = fresh_ratio(rows, dt.datetime.now(dt.timezone.utc), max_age, max_future_seconds=120)
+            if ratio is None or ratio < 0.90:
+                return None
         return rows
     except (OSError, ValueError, TypeError):
         return None

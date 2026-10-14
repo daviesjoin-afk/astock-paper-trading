@@ -6589,6 +6589,7 @@ def _quotes(codes, asof_date=None):
         source_errors["live"] = f"{type(exc).__name__}: {exc}"
     live = {str(r.get("code")): r for r in live_rows if r.get("code")}
     fallback_identity = None
+    fallback_origin = "verified_full_market_snapshot"
     fallback_codes = set()
     incomplete = {
         code for code in codes
@@ -6604,7 +6605,9 @@ def _quotes(codes, asof_date=None):
             reading = MDSvc.read_snapshot(
                 MDC.LIVE_MARKET_POLICY, now=dt.datetime.now().astimezone(),
                 asof_day=expected_day.isoformat())
-            if reading.status == MDC.STATUS_FRESH:
+            if (reading.status == MDC.STATUS_FRESH
+                    or (reading.available and reading.freshness == MDC.FRESHNESS_FRESH
+                        and reading.reason == MDC.REASON_PRICE_ONLY_COVERAGE)):
                 for candidate in reading.rows():
                     candidate = dict(candidate)
                     code = str(candidate.get("code") or "")
@@ -6617,6 +6620,8 @@ def _quotes(codes, asof_date=None):
                         fallback_codes.add(code)
                 if fallback_codes:
                     fallback_identity = MDC.snapshot_fingerprint(reading.snapshot)
+                    if reading.reason == MDC.REASON_PRICE_ONLY_COVERAGE:
+                        fallback_origin = "price_only_full_market_snapshot"
         except Exception as exc:
             source_errors["snapshot"] = f"{type(exc).__name__}: {exc}"
     live_rows = list(live.values())
@@ -6636,12 +6641,31 @@ def _quotes(codes, asof_date=None):
             source_errors["flow"] = f"{type(exc).__name__}: {exc}"
     # 独立核验源采用腾讯优先、缺失代码自动切换新浪；不能因为腾讯一次空响应
     # 把整轮策略都误判成“独立行情源未返回”。来源仍写入审计 payload，便于追溯。
+    # 主报价若来自腾讯（价格-only 快照回退），必须改用新浪核验：同一来源
+    # 与自己比较不构成双源证据，只会把"自己核验自己"写成 cross_source_checked。
     try:
         cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
     except Exception as exc:
         cross_rows = []
         source_errors["cross"] = f"{type(exc).__name__}: {exc}"
     cross = {str(r.get("code")): r for r in cross_rows if r.get("code")}
+    same_source_codes = [
+        code for code, row in live.items()
+        if str(row.get("source") or "") == "tencent_public_quote"
+        and str(cross.get(code, {}).get("source") or "") == "tencent_public_quote"
+    ]
+    if same_source_codes:
+        for code in same_source_codes:
+            cross.pop(code, None)  # A failed independent request must not retain self-verification.
+        try:
+            sina_rows = dfc._fetch_sina_realtime_for_codes(same_source_codes) or []
+        except Exception as exc:
+            sina_rows = []
+            source_errors["sina"] = f"{type(exc).__name__}: {exc}"
+        for row in sina_rows:
+            code = str(row.get("code") or "")
+            if code in same_source_codes and row.get("source") == "sina_public_quote":
+                cross[code] = row
     local = _latest_price_map(codes)
     local_snapshot_at = _universe_snapshot_time()
     out = {}
@@ -6663,7 +6687,11 @@ def _quotes(codes, asof_date=None):
                 if key not in {"price", "pct", "open", "high", "low", "pre_close", "quote_at",
                                "super_net", "main_net", "big_net", "mid_net", "small_net", "main_pct"}
             }
-            row.update({key: value for key, value in live_row.items() if value is not None})
+            if code in fallback_codes and fallback_origin == "price_only_full_market_snapshot":
+                # Explicit unknowns must not inherit old universe fields.
+                row.update(live_row)
+            else:
+                row.update({key: value for key, value in live_row.items() if value is not None})
             row["price"] = live_row.get("price")
             row["pct"] = live_row.get("pct")
         else:
@@ -6677,7 +6705,7 @@ def _quotes(codes, asof_date=None):
         )
         row["quote_source"] = "live" if is_live else "local_cache"
         if code in fallback_codes:
-            row["primary_quote_origin"] = "verified_full_market_snapshot"
+            row["primary_quote_origin"] = fallback_origin
             row["primary_owner_fingerprint"] = fallback_identity
         flow_at = flow_row.get("quote_at") or flow_row.get("flow_fetched_at") or live_row.get("quote_at")
         flow_time = _parse_quote_timestamp(flow_at)
