@@ -172,6 +172,9 @@ class FactorReadinessTests(unittest.TestCase):
             def astimezone(self, tz=None):
                 # Model the production UTC+8 timezone even on a UTC CI host.
                 return super().astimezone(tz or ZONE)
+        class Calendar(dt.date):
+            @classmethod
+            def today(cls): return NOW.date()
         data = rows()
         for i, row in enumerate(data):
             row["code"] = f"{('600','601','603','605')[i // 1000]}{i % 1000:03d}"
@@ -193,6 +196,7 @@ class FactorReadinessTests(unittest.TestCase):
             table["pct"] = fund["pct_today"]
             return table
         with mock.patch.object(M.datetime, "datetime", Clock), \
+                mock.patch.object(M.datetime, "date", Calendar), \
                 mock.patch.object(M.U, "is_trade_day", return_value=True), \
                 mock.patch.object(M.U, "latest_complete_trade_date", return_value=NOW.date()), \
                 mock.patch.object(M.U, "load_universe", return_value=universe+universe[:15]), \
