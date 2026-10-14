@@ -1,5 +1,7 @@
 # Architecture notes
 
+当前服务器核对、数据路径与待收敛边界见 [运行架构审计（2026-10-14）](docs/RUNTIME_ARCHITECTURE_AUDIT.md)。
+
 本项目是 A 股模拟交易系统（paper-only），核心路径应保持为：
 
 ```text
