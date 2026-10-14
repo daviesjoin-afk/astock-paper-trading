@@ -165,6 +165,38 @@ class ClosingRefreshTests(unittest.TestCase):
 
 
 class FactorReadinessTests(unittest.TestCase):
+    def test_after_close_selection_does_not_expand_duplicate_roster_codes(self):
+        class Clock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None): return cls.fromtimestamp(NOW.timestamp(), tz or ZONE)
+        data = rows()
+        for i, row in enumerate(data):
+            row["code"] = f"{('600','601','603','605')[i // 1000]}{i % 1000:03d}"
+        universe = [dict(r, name="ordinary") for r in data]
+        frame = pd.DataFrame({"last_date": NOW.date().isoformat()}, index=[r["code"] for r in data])
+        reading = C.classify(snapshot(data, True), C.CLOSE_SNAPSHOT_POLICY, now=NOW)
+        def build(price, fund, *args, **kwargs):
+            self.assertTrue(fund.index.is_unique)
+            table = pd.DataFrame(index=price.index)
+            table["pct"] = fund["pct_today"]
+            return table
+        with mock.patch.object(M.datetime, "datetime", Clock), \
+                mock.patch.object(M.U, "is_trade_day", return_value=True), \
+                mock.patch.object(M.U, "latest_complete_trade_date", return_value=NOW.date()), \
+                mock.patch.object(M.U, "load_universe", return_value=universe+universe[:15]), \
+                mock.patch.object(M.U, "coverage_report", return_value={"fresh_selection":4000,"fresh_selection_pct":100,"expected_reference_date":NOW.date().isoformat()}), \
+                mock.patch.object(M, "_load_selection_base", return_value=(frame,set(),{"state":"ready"})), \
+                mock.patch.object(M.MDSvc, "read_snapshot", return_value=reading), \
+                mock.patch.object(M.MDSvc, "refresh_rows", side_effect=AssertionError("valid close should be read only")), \
+                mock.patch.object(M, "_load_super_flow", return_value=data), \
+                mock.patch.dict(M._LIVE_CACHE, finance={"data":{"known":{}},"report_dates":[]}, sentiment={"known":1}), \
+                mock.patch.object(M.S, "build_factor_table", side_effect=build), \
+                mock.patch.object(M.S, "run_strategy", return_value={"picks":[]}):
+            result = M._select_uncached(strategy="three_day", topn=10)
+        self.assertFalse(result.get("need_init"), result.get("message"))
+        self.assertEqual("close_snapshot", result["data_quality"]["quote_policy"])
+        self.assertEqual(4000, result["data_quality"]["live_quote_coverage"])
+
     def test_universe_publication_invalidates_the_factor_readiness_signature(self):
         with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 1)):
             first = M._selection_signature()

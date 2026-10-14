@@ -1378,7 +1378,7 @@ def _select_uncached(
         }
     snap_f = [
         {**row, **live_map[row["code"]]}
-        for row in uni
+        for row in universe_by_code.values()
         if row["code"] in covered_codes and row["code"] in live_map
     ]
     if len(snap_f) < required_live:
