@@ -293,12 +293,18 @@ class SameSourceCrossCheckTests(unittest.TestCase):
     def test_price_only_owner_can_supply_primary_but_requires_sina(self):
         stamp=dt.datetime.now(TZ).isoformat(timespec="seconds")
         row={"code":"600001","price":10.,"pct":1.,"quote_at":stamp,"source":"tencent_public_quote"}
+        missing_fields = ("industry", "pe", "vol_ratio", "amount", "volume", "turnover")
+        row.update(dict.fromkeys(missing_fields))
+        old = {field: "old industry" if field == "industry" else 123.0
+               for field in missing_fields}
         snapshot=MDSvc._full_market_snapshot(rows=[row],observed_at=stamp,saved_at=stamp,
                                             complete=True,expected_rows=1,kind=MDSvc.KIND_FULL_MARKET_SNAPSHOT,
                                             source=MDSvc.TENCENT_SNAPSHOT_SOURCE)
         reading=MDC.classify(snapshot,MDC.LIVE_MARKET_POLICY,now=dt.datetime.now(TZ))
         with mock.patch.object(PT.dfc,"fetch_realtime_for_codes",return_value=[]), \
                 mock.patch.object(PT.MDSvc,"read_snapshot",return_value=reading), \
+                mock.patch.object(PT,"_latest_price_map",return_value={"600001":old}), \
+                mock.patch.object(PT.dfc,"enrich_live_flow_details",return_value={}), \
                 mock.patch.object(PT.dfc,"fetch_independent_realtime_for_codes",return_value=[row]), \
                 mock.patch.object(PT.dfc,"_fetch_sina_realtime_for_codes",return_value=[{**row,"source":"sina_public_quote"}]), \
                 mock.patch.object(PT.dfc,"enrich_live_flow_details",return_value={}), \
@@ -306,6 +312,8 @@ class SameSourceCrossCheckTests(unittest.TestCase):
             actual=PT._quotes(["600001"],asof_date=dt.date.today())["600001"]
         self.assertEqual("cross_source_checked",actual["quote_validation"])
         self.assertEqual("price_only_full_market_snapshot",actual["primary_quote_origin"])
+        for field in missing_fields:
+            self.assertIsNone(actual.get(field), field)
 
 
 

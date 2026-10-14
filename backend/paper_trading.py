@@ -6687,7 +6687,11 @@ def _quotes(codes, asof_date=None):
                 if key not in {"price", "pct", "open", "high", "low", "pre_close", "quote_at",
                                "super_net", "main_net", "big_net", "mid_net", "small_net", "main_pct"}
             }
-            row.update({key: value for key, value in live_row.items() if value is not None})
+            if code in fallback_codes and fallback_origin == "price_only_full_market_snapshot":
+                # Explicit unknowns must not inherit old universe fields.
+                row.update(live_row)
+            else:
+                row.update({key: value for key, value in live_row.items() if value is not None})
             row["price"] = live_row.get("price")
             row["pct"] = live_row.get("pct")
         else:
