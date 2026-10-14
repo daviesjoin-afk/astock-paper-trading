@@ -100,6 +100,24 @@ class ClosingWindowTests(unittest.TestCase):
 
 
 class ClosingRefreshTests(unittest.TestCase):
+    def test_historical_close_cannot_request_today_from_realtime_providers(self):
+        morning = NOW.replace(hour=8) + dt.timedelta(days=1)
+        with mock.patch.object(S, "_load_cached_snapshot", return_value=snapshot(rows())), \
+                mock.patch.object(S.dfc_module, "fetch_market_snapshot_full", side_effect=AssertionError("future facts")), \
+                mock.patch.object(S.dfc_module, "fetch_tencent_market_snapshot", side_effect=AssertionError("future fallback")):
+            reading = S.refresh_snapshot(C.CLOSE_SNAPSHOT_POLICY, now=morning, asof_day=NOW.date())
+            self.assertEqual("fresh", reading.freshness)
+            forced = S.refresh_rows(policy=C.CLOSE_SNAPSHOT_POLICY, now=morning,
+                                    asof_day=NOW.date(), force=True)
+            self.assertEqual([], forced)
+
+    def test_historical_close_rejects_a_cached_current_day(self):
+        tomorrow = NOW + dt.timedelta(days=1)
+        with mock.patch.object(S, "_load_cached_snapshot", return_value=snapshot(rows(tomorrow))), \
+                mock.patch.object(S.dfc_module, "fetch_market_snapshot_full", side_effect=AssertionError("future facts")):
+            actual = S.refresh_rows(policy=C.CLOSE_SNAPSHOT_POLICY, now=tomorrow, asof_day=NOW.date())
+        self.assertEqual([], actual)
+
     def test_force_fetch_has_a_real_observation_window(self):
         data=rows()
         with mock.patch.object(S.dfc_module,"load_market_snapshot_full_payload",return_value={}), \
@@ -147,6 +165,13 @@ class ClosingRefreshTests(unittest.TestCase):
 
 
 class FactorReadinessTests(unittest.TestCase):
+    def test_universe_publication_invalidates_the_factor_readiness_signature(self):
+        with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 1)):
+            first = M._selection_signature()
+        with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 2 if p == M.U.UNIVERSE_PATH else 1)):
+            second = M._selection_signature()
+        self.assertNotEqual(first, second)
+
     def context(self):
         stack=__import__("contextlib").ExitStack()
         self.addCleanup(stack.close)

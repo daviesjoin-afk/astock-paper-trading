@@ -112,7 +112,6 @@ def _health_cache_signature():
     return (
         _health_file_signature(getattr(U, "UNIVERSE_PATH", "")),
         _health_file_signature(dfc.KLINE_MANIFEST_PATH),
-        _health_file_signature(U.UNIVERSE_PATH),
         _health_file_signature(dfc.KLINE_DIR),
         _health_file_signature(dfc.MARKET_SNAPSHOT_FULL_CACHE_PATH),
     )
@@ -147,6 +146,7 @@ def _store_health_response(payload):
 def _selection_signature():
     return (
         _health_file_signature(dfc.KLINE_MANIFEST_PATH),
+        _health_file_signature(U.UNIVERSE_PATH),
         dfc.SHARED_KLINE_SOURCE_VERSION,
         _health_file_signature(_SELECTION_FACTORS_PATH),
         _health_file_signature(_SELECTION_META_PATH),

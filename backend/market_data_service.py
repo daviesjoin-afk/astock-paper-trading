@@ -326,6 +326,15 @@ def refresh_snapshot(
         raise ValueError(f"unknown market data kind: {kind!r}")
     deadline = _resolve_now(policy, now)
     last_known = _load_cached_snapshot(kind)
+    reference_day = MDC.canonical_day(asof_day)
+    current_day = deadline.astimezone(dt.timezone(dt.timedelta(hours=8))).date().isoformat()
+    if (policy.name == MDC.CLOSE_SNAPSHOT_POLICY.name
+            and reference_day and reference_day < current_day):
+        # A realtime provider cannot refresh a historical closing fact.
+        # Keep the requested date attached even when the cache is unavailable.
+        return MDC.classify(last_known, policy, now=deadline,
+                            access_mode=MDC.ACCESS_REFRESH, asof_day=reference_day,
+                            refresh_failed=bool(force))
     max_age = MDC.provider_max_age(policy, deadline, asof_day)
     if max_age is None:
         return MDC.classify(last_known, policy, now=deadline,
