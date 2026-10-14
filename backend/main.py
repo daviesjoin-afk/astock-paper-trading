@@ -72,6 +72,7 @@ _SELECTION_CACHE = {
     "signature": None,
     "price_factors": None,
     "first_board_codes": None,
+    "status": None,
 }
 _SELECTION_REQUIRED_COLUMNS = {
     "three_up",
@@ -111,6 +112,7 @@ def _health_cache_signature():
     return (
         _health_file_signature(getattr(U, "UNIVERSE_PATH", "")),
         _health_file_signature(dfc.KLINE_MANIFEST_PATH),
+        _health_file_signature(U.UNIVERSE_PATH),
         _health_file_signature(dfc.KLINE_DIR),
         _health_file_signature(dfc.MARKET_SNAPSHOT_FULL_CACHE_PATH),
     )
@@ -307,30 +309,41 @@ def _load_super_flow(topn):
     return cached or []
 
 
-def _load_selection_base():
-    """Read the shared validated snapshot; heavy rebuilding belongs to workers."""
+def _load_selection_base(*, with_status=False):
+    """Read one validated factor snapshot, retaining its readiness diagnosis."""
     signature = (_selection_signature(), _complete_daily_cutoff(),
                  int(time.monotonic() // 60))
     with _SELECTION_LOCK:
         if (_SELECTION_CACHE["price_factors"] is not None
                 and _SELECTION_CACHE["signature"] == signature):
-            return _SELECTION_CACHE["price_factors"], _SELECTION_CACHE["first_board_codes"]
+            result = (_SELECTION_CACHE["price_factors"], _SELECTION_CACHE["first_board_codes"])
+            return (*result, dict(_SELECTION_CACHE.get("status") or {})) if with_status else result
+        status = {"stage": "factors", "state": "blocked", "target_date": str(signature[1])}
+        price_factors, first_board_codes = pd.DataFrame(), set()
         try:
-            price_factors, meta = SFS.read(_SELECTION_FACTORS_PATH, _SELECTION_META_PATH)
-            if not _SELECTION_REQUIRED_COLUMNS.issubset(price_factors.columns):
-                raise ValueError("选股因子缓存版本过旧")
-            freshness = P._selection_factor_freshness(
-                price_factors, U.load_universe(), datetime.date.today(), meta=meta)
-            if not freshness["passed"]:
-                raise ValueError(freshness.get("reason"))
-            first_board_codes = set(meta.get("first_board_codes", []))
+            candidate, meta = SFS.read(_SELECTION_FACTORS_PATH, _SELECTION_META_PATH)
+            if not _SELECTION_REQUIRED_COLUMNS.issubset(candidate.columns):
+                status.update(reason="选股因子缓存版本过旧，等待后台重建", reason_code="factor_schema_outdated")
+            else:
+                freshness = P._selection_factor_freshness(
+                    candidate, U.load_universe(), datetime.date.today(), meta=meta)
+                status.update(freshness)
+                if freshness["passed"]:
+                    price_factors = candidate
+                    first_board_codes = set(meta.get("first_board_codes", []))
+                    status.update(state="ready", reason_code=None)
+                else:
+                    status["reason_code"] = "factor_snapshot_not_ready"
+        except FileNotFoundError:
+            status.update(reason="共享选股因子尚未生成，等待后台更新", reason_code="factor_cache_missing")
         except (OSError, ValueError, TypeError, KeyError):
-            # No full-market I/O or network fallback on a request path.
-            # Existing factor/history worker endpoints can rebuild the cache.
-            return pd.DataFrame(), set()
-        _SELECTION_CACHE.update({"signature": signature, "price_factors": price_factors,
-                                 "first_board_codes": first_board_codes})
-        return price_factors, first_board_codes
+            status.update(reason="共享选股因子缓存不可用，等待后台重建", reason_code="factor_cache_invalid")
+        # Cache negative readiness too; new manifest/universe/factor files
+        # invalidate the signature immediately. Requests never rebuild history.
+        _SELECTION_CACHE.update(signature=signature, price_factors=price_factors,
+                                first_board_codes=first_board_codes, status=status)
+        result = (price_factors, first_board_codes)
+        return (*result, dict(status)) if with_status else result
 
 
 def _warm_finance():
@@ -1202,9 +1215,13 @@ def _select_uncached(
             "coverage": coverage,
         }
     uni = U.load_universe() or U.build_universe()
-    price_f, first_board_codes = _load_selection_base()
+    price_f, first_board_codes, factor_status = _load_selection_base(with_status=True)
     if price_f.empty:
-        return {"need_init": True, "message": "历史K线尚未就绪，请稍候"}
+        message = factor_status.get("reason") or "共享选股因子未就绪，等待后台更新"
+        cached_day, target_day = factor_status.get("factor_date"), factor_status.get("target_date")
+        if cached_day and target_day and cached_day != target_day:
+            message = f"选股因子仍为 {cached_day}，目标 {target_day}；等待后台重建"
+        return {"need_init": True, "message": message, "data_status": factor_status}
     reference_date = str(coverage["expected_reference_date"])
     complete_cutoff = U.latest_complete_trade_date(datetime.date.today()).isoformat()
     factor_dates = price_f["last_date"].astype(str).str[:10]
@@ -1267,8 +1284,9 @@ def _select_uncached(
     # 必须来自盘中实时快照，不能把初始化时写入 universe.json 的旧值标为“今日”。
     # 保留基础库的风险/板块字段，再由实时字段覆盖可变行情字段。
     today = datetime.date.today()
-    now_clock = datetime.datetime.now().time()
-    is_open_session = datetime.time(9, 15) <= now_clock <= datetime.time(15, 10)
+    quote_now = datetime.datetime.now().astimezone()
+    now_clock = quote_now.time()
+    is_open_session = U.is_trade_day(today) and datetime.time(9, 15) <= now_clock < datetime.time(15)
     if U.is_trade_day(today) and now_clock >= datetime.time(9, 15):
         expected_live_date = today.isoformat()
     else:
@@ -1312,7 +1330,18 @@ def _select_uncached(
         R24：selection 是决策路径（显式允许联网），取数与 freshness 都归
         Market Data Authority；它已经把 provider 异常收敛成"返回空"。
         """
-        return MDSvc.refresh_rows(force=force)
+        if is_open_session:
+            return MDSvc.refresh_rows(force=force)
+        # Off-session selection consumes a dated closing fact. A historical
+        # closing request must never refresh today's prices into that date.
+        reading = MDSvc.read_snapshot(
+            MDC.CLOSE_SNAPSHOT_POLICY, now=quote_now, asof_day=expected_live_date)
+        if reading.available and reading.freshness == MDC.FRESHNESS_FRESH and not force:
+            return [dict(row) for row in MDC.close_snapshot_rows(reading.rows(), quote_now, expected_live_date)]
+        if expected_live_date != today.isoformat():
+            return []
+        return MDSvc.refresh_rows(force=force, now=quote_now,
+                                 policy=MDC.CLOSE_SNAPSHOT_POLICY, asof_day=expected_live_date)
 
     live_rows = _safe_live_snapshot()
     # A disk fallback can be complete in row count but several days old.  Do
@@ -1456,7 +1485,7 @@ def _select_uncached(
         if live_row:
             pick["quote_at"] = live_row.get("quote_at")
             pick["quote_source"] = live_row.get("source") or "live_snapshot"
-            pick["quote_data_scope"] = "当日实时行情；技术指标使用前一完整交易日下载K线"
+            pick["quote_data_scope"] = ("当日实时行情" if is_open_session else "最近完整交易日收盘价格") + "；技术指标使用最近完整交易日下载K线"
             pick["historical_factor_date"] = complete_cutoff
     result["universe_size"] = len(price_f)
     result["total_universe"] = len(uni)
@@ -1466,14 +1495,15 @@ def _select_uncached(
         "eligible_factor_rows": len(price_f),
         "excluded_stale_rows": max(0, len(uni) - len(price_f)),
         "coverage_pct": coverage["fresh_selection_pct"],
-        "live_quote_source": "东方财富全市场实时行情",
+        "live_quote_source": " / ".join(sorted({str(row.get("source") or "全市场快照（未逐行声明来源）") for row in snap_f})),
+        "quote_policy": MDC.LIVE_MARKET_POLICY.name if is_open_session else MDC.CLOSE_SNAPSHOT_POLICY.name,
         "live_quote_at": max((str(row.get("quote_at") or "") for row in snap_f), default=None),
         "live_quote_coverage": len(snap_f),
         "live_eligible_coverage_pct": round(live_coverage * 100, 2),
         "kline_source": "与模拟盘共享：data_cache/klines（前复权日线）",
         "kline_source_version": dfc.SHARED_KLINE_SOURCE_VERSION,
         "kline_cache_path": dfc.KLINE_DIR,
-        "note": "历史因子仅使用最近完整交易日；价格、涨跌幅、量比和资金流均由本次实时行情覆盖。未更新或停牌导致的旧因子不参与选股。选股与模拟盘读取同一份前复权日线缓存，不再维护独立K线库。",
+        "note": "历史因子使用最近完整交易日；价格按盘中实时或指定交易日收盘口径读取，缺失字段保持未知。选股与模拟盘读取同一份前复权日线缓存。",
     }
     result["finance_report_dates"] = finance.get("report_dates")
     result["latest_finance_report_date"] = (

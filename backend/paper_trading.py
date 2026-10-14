@@ -7752,7 +7752,8 @@ def generate_signals(asof_date=None):
         # with today's live timestamp.  Scheduled today's close is the only
         # path that needs the real-time cross-sectional gate.
         close_universe = (
-            _validated_live_universe(close_raw, day, max_quote_age_minutes=30)
+            _validated_live_universe(
+                MDC.close_snapshot_rows(close_raw, dt.datetime.now().astimezone(), day), day)
             if day == dt.date.today() else list(close_raw or [])
         )
         close_snapshot_at = max(

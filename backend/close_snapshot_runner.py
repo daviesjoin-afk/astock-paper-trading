@@ -28,50 +28,31 @@ def main():
             }
             print(json.dumps(payload, ensure_ascii=False))
             return 0
-        # R24：显式强制刷新（freshness 窗口归 CLOSE_SNAPSHOT_POLICY）。
-        rows = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY)
-        unique_rows = {
-            str(row.get("code")): row for row in rows
-            if isinstance(row, dict) and str(row.get("code") or "")
-        }
-        source_at = max((str(row.get("quote_at")) for row in unique_rows.values()
-                         if row.get("quote_at")), default=None)
-        # 完整性校验：行数必须达到全市场门槛，且行情时间必须不早于当日
-        # 15:00 收盘（Asia/Shanghai）。此前只检查 >=1000 行，一份 14:57 的
-        # 残缺快照也会被标记 completed 并被下游当作有效收盘数据。
-        rows_ok = len(rows) >= dfc.FULL_MARKET_MIN_ROWS
-        freshness_ok = False
-        freshness_detail = "missing"
-        fresh_rows = 0
-        close_cutoff = None
-        if source_at:
-            try:
-                tz = dt.timezone(dt.timedelta(hours=8))
-                close_cutoff = dt.datetime.combine(today_cn, dt.time(15, 0), tzinfo=tz)
-                for row in unique_rows.values():
-                    try:
-                        parsed = dt.datetime.fromisoformat(str(row.get("quote_at")).replace("Z", "+00:00"))
-                        if parsed.tzinfo is None:
-                            parsed = parsed.replace(tzinfo=tz)
-                        if parsed.astimezone(tz) >= close_cutoff - dt.timedelta(minutes=1):
-                            fresh_rows += 1
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                required_fresh = max(dfc.FULL_MARKET_MIN_ROWS,
-                                     int(len(unique_rows) * 0.90 + 0.9999))
-                freshness_ok = fresh_rows >= required_fresh
-                freshness_detail = (
-                    f"fresh_rows={fresh_rows}/{len(unique_rows)} required={required_fresh}; "
-                    f"source_at_max={source_at} vs cutoff={close_cutoff.isoformat()}"
-                )
-            except ValueError:
-                freshness_detail = f"unparseable:{source_at}"
+        reading = MDSvc.refresh_snapshot(
+            MDC.CLOSE_SNAPSHOT_POLICY, now=started, asof_day=today_cn, force=True,
+        )
+        rows = [dict(row) for row in reading.rows()]
+        unique_rows = {str(row.get("code")): row for row in rows if row.get("code")}
+        source_at = reading.snapshot.observed_at if reading.snapshot else None
+        detail = dict(reading.snapshot.verification_detail) if reading.snapshot else {}
+        fresh_rows = int(detail.get("close_fresh_rows") or 0)
+        rows_ok = len(unique_rows) >= dfc.FULL_MARKET_MIN_ROWS
+        freshness_ok = (reading.available and reading.freshness == MDC.FRESHNESS_FRESH
+                        and fresh_rows >= dfc.FULL_MARKET_MIN_ROWS)
+        window = MDC.close_snapshot_window(started, today_cn)
+        close_cutoff = (window[0] + dt.timedelta(seconds=MDC.CLOSE_SNAPSHOT_POLICY.max_age_seconds)
+                        if window else None)
+        freshness_detail = (
+            f"fresh_rows={fresh_rows}/{len(rows)}; reason={reading.reason}; "
+            f"minimum_quote_at={detail.get('close_min_quote_at')}"
+        )
         status = "completed" if (rows_ok and freshness_ok) else (
             "failed" if not rows_ok else "stale_rejected"
         )
         payload = {
             "status": status,
             "slot": "close-snapshot",
+            "market_data": reading.projection(),
             "rows": len(rows),
             "unique_rows": len(unique_rows),
             "required_rows": dfc.FULL_MARKET_MIN_ROWS,
