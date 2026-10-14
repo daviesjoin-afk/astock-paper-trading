@@ -14,6 +14,31 @@ import historical_universe_public_sources as HUPS
 
 
 class PublicHistoricalUniverseTests(unittest.TestCase):
+    def test_xlsx_preserves_empty_columns_shared_strings_and_chinese_names(self):
+        from io import BytesIO
+        import zipfile
+        book = BytesIO()
+        ns = HUPS._XLSX_NS["m"]
+        with zipfile.ZipFile(book, "w") as archive:
+            archive.writestr("xl/workbook.xml", '<workbook xmlns="%s" xmlns:r="%s"><sheets><sheet r:id="r1"/></sheets></workbook>' % (ns, HUPS._XLSX_NS["r"]))
+            archive.writestr("xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/></Relationships>')
+            archive.writestr("xl/sharedStrings.xml", '<sst xmlns="%s"><si><t>中文证券</t></si></sst>' % ns)
+            archive.writestr("xl/worksheets/sheet1.xml", '<worksheet xmlns="%s"><sheetData><row r="1"><c r="A1"><v>000001</v></c><c r="C1" t="s"><v>0</v></c><c r="D1" t="inlineStr"><is><t>2024-01-02</t></is></c></row></sheetData></worksheet>' % ns)
+        self.assertEqual([["000001", "", "中文证券", "2024-01-02"]],
+                         HUPS._xlsx_first_sheet_rows(book.getvalue()))
+
+    def test_free_http_retry_uses_existing_adapter_for_query_pages(self):
+        from unittest.mock import Mock
+        session = Mock()
+        with patch.object(HUPS.requests, "Session", return_value=session), \
+                patch.object(HUPS, "_sse_rows", side_effect=HUPS.PublicUniverseSourceError("offline")):
+            with self.assertRaises(HUPS.PublicUniverseSourceError):
+                HUPS.fetch_public_security_master()
+        adapter = session.mount.call_args.args[1]
+        self.assertEqual(2, adapter.max_retries.total)
+        self.assertIn("POST", adapter.max_retries.allowed_methods)
+        session.close.assert_called_once()
+
     def test_normalizes_exchange_date_formats_and_rejects_invalid_dates(self):
         self.assertEqual(HUPS._as_day("20240102"), "2024-01-02")
         self.assertEqual(HUPS._as_day("2024/4/8"), "2024-04-08")

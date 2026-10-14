@@ -147,6 +147,7 @@ IGNITION_BUY_ENABLED = os.environ.get("PAPER_IGNITION_BUY", "").strip().lower() 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
+import selection_factor_store as SFS
 DB_PATH = data_paths.data_path("paper_trading.sqlite3")
 REPORT_DIR = data_paths.report_dir()
 SELECTION_FACTORS_PATH = data_paths.data_path("selection_factors.csv")
@@ -3985,12 +3986,7 @@ def _selection_inputs():
         return _SELECTION_INPUTS_CACHE["value"]
     if not os.path.exists(SELECTION_FACTORS_PATH):
         raise RuntimeError("未找到已持久化的选股因子，请先完成全市场数据初始化")
-    price_f = pd.read_csv(SELECTION_FACTORS_PATH, dtype={"code": str}, index_col="code")
-    if os.path.exists(SELECTION_META_PATH):
-        with open(SELECTION_META_PATH, encoding="utf-8") as handle:
-            meta = _loads(handle.read(), {})
-    else:
-        meta = {}
+    price_f, meta = SFS.read(SELECTION_FACTORS_PATH, SELECTION_META_PATH)
     value = (price_f, set(meta.get("first_board_codes", [])))
     if sig is not None:
         _SELECTION_INPUTS_CACHE.update({"sig": sig, "value": value})
@@ -4207,6 +4203,14 @@ def _selection_factor_history_gate(universe, cutoff):
     }
 
 def _rebuild_selection_factor_cache(asof_date=None):
+    """One nonblocking builder across API, data and paper workers."""
+    with SFS.file_lock(SELECTION_META_PATH + ".build.lock", blocking=False) as acquired:
+        if not acquired:
+            return {"status": "deferred", "reason": "选股因子重建正在进行，保留上一有效版本"}
+        return _rebuild_selection_factor_cache_locked(asof_date)
+
+
+def _rebuild_selection_factor_cache_locked(asof_date=None):
     """在收盘历史库更新成功后重建盘中读取的紧凑因子文件。"""
     cutoff = _date(asof_date) if asof_date is not None else None
     universe = U.load_universe()
@@ -4265,18 +4269,27 @@ def _rebuild_selection_factor_cache(asof_date=None):
                 "refresh_gate": gate,
                 "universe_membership": universe_membership,
             }
-    klines = {}
-    for row in universe:
-        code = str(row.get("code") or "")
-        frame = dfc.load_shared_kline(code)
-        if frame is not None and cutoff is not None:
-            # 数据源可能提前暴露未收盘日线；因子只允许使用完整交易日。
-            frame = frame.loc[frame.index.date <= cutoff]
-        if frame is not None and len(frame) > 65:
-            klines[code] = frame
-    # cutoff 同时作为 strict PIT 的 decision_asof：因子内部再按"bar 可用时点"
-    # 复核一遍（日线在当日收盘才可用），而不是只靠上面的日期预裁剪。
-    price_f = F.compute_price_factors(klines, asof=cutoff)
+    input_signature = _selection_factor_manifest_signature()
+    first_board_codes = set()
+    reference_day = dt.date.today()
+
+    def histories():
+        for row in universe:
+            code = str(row.get("code") or "")
+            frame = dfc.load_shared_kline(code)
+            if frame is not None and cutoff is not None:
+                # Completed bars only; keep the full recursive indicator history.
+                frame = frame.loc[frame.index.date <= cutoff]
+            if frame is not None and len(frame) > 65:
+                first_board_codes.update(F.find_first_board_candidates(
+                    {code: frame}, today_date=reference_day))
+                yield code, frame
+            # Do not retain the previous frame while the next CSV is loaded.
+            frame = None
+
+    price_f = F.compute_price_factors(histories(), asof=cutoff)
+    if _selection_factor_manifest_signature() != input_signature:
+        return {"status": "blocked", "reason": "重建期间日线清单已变化，保留上一有效版本并等待重试"}
     eligible_codes = {
         str(row.get("code") or "")
         for row in (universe or [])
@@ -4318,30 +4331,17 @@ def _rebuild_selection_factor_cache(asof_date=None):
     # cache itself; a later selector cannot silently fall back to them.
     if cutoff is not None:
         price_f = price_f.loc[price_f.index.astype(str).isin(exact_codes)].copy()
-    first_board_codes = set(F.find_first_board_candidates(klines))
-    factors_tmp = SELECTION_FACTORS_PATH + ".tmp"
-    price_f.to_csv(factors_tmp, encoding="utf-8")
-    os.replace(factors_tmp, SELECTION_FACTORS_PATH)
-    meta_tmp = SELECTION_META_PATH + ".tmp"
-    with open(meta_tmp, "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "signature": signature,
-                # Aware UTC timestamp: readers normalize naive values to UTC,
-                # which made a Shanghai-local built_at appear 8h fresher than
-                # reality and permanently defeated the cache-age gates.
-                "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                "factor_rows": len(price_f),
-                "eligible_universe_rows": len(eligible_codes),
-                "eligible_factor_rows": len(exact_codes & eligible_codes),
-                "eligible_factor_coverage_pct": round(factor_coverage * 100, 2),
-                "factor_date": cutoff.isoformat() if cutoff is not None else None,
-                "first_board_codes": sorted(first_board_codes),
-            },
-            handle,
-            ensure_ascii=False,
-        )
-    os.replace(meta_tmp, SELECTION_META_PATH)
+    SFS.publish(price_f, {
+        "signature": signature,
+        "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "factor_rows": len(price_f),
+        "eligible_universe_rows": len(eligible_codes),
+        "eligible_factor_rows": len(exact_codes & eligible_codes),
+        "eligible_factor_coverage_pct": round(factor_coverage * 100, 2),
+        "factor_date": cutoff.isoformat() if cutoff is not None else None,
+        "first_board_codes": sorted(first_board_codes & set(price_f.index.astype(str))),
+        "universe_membership": universe_membership,
+    }, SELECTION_FACTORS_PATH, SELECTION_META_PATH)
     latest = None
     if "last_date" in price_f and not price_f.empty:
         latest = str(price_f["last_date"].dropna().max())[:10]

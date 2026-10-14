@@ -17,6 +17,8 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     import historical_universe_archive as HUA
@@ -41,9 +43,9 @@ _CODE6 = re.compile(r"^\d{6}$")
 # An unrecognized missing BSE code blocks ingestion instead of being guessed.
 _BSE_DELISTS = {
     "920680": {"name": "广道退", "listed_from": "2021-11-15", "delisted_at": "2026-01-05",
-               "notice": "https://www.bse.cn/disclosure/2025/2025-12-31/8690dbac1d5c42db98e9c7388e562129.pdf"},
+               "notice": "https://www.bse.cn/disclosure/2025/2025-12-31/8690dbac1d5c42db98e9c7388e562129.pdf"},  # Public document hash.
     "920305": {"name": "云创退", "listed_from": "2021-11-15", "delisted_at": "2026-07-30",
-               "notice": "https://www.bse.cn/disclosure/2026/2026-07-29/8a64d7d9e97f4678af04313cdb66069e.pdf"},
+               "notice": "https://www.bse.cn/disclosure/2026/2026-07-29/8a64d7d9e97f4678af04313cdb66069e.pdf"},  # Public document hash.
 }
 
 
@@ -173,8 +175,17 @@ def _xlsx_first_sheet_rows(payload: bytes) -> list[list[str]]:
             raise ValueError("missing_sheet")
         target = "xl/" + targets[sheet.attrib[f"{{{_XLSX_NS['r']}}}id"]]
         target = target.replace("xl/xl/", "xl/")
-        xml = book.read(target).decode("gb18030", errors="replace")
-        root = ET.fromstring(xml)
+        raw = book.read(target)
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            # Some exchange exports contain GB18030 despite a UTF-8 header.
+            # Decode strictly; replacement characters must not hide bad input.
+            root = ET.fromstring(raw.decode("gb18030"))
+        shared = []
+        if "xl/sharedStrings.xml" in book.namelist():
+            shared_root = ET.fromstring(book.read("xl/sharedStrings.xml"))
+            shared = ["".join(node.itertext()) for node in shared_root.findall("m:si", _XLSX_NS)]
     except (KeyError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
         raise PublicUniverseSourceError("szse_stock_master_workbook_invalid") from exc
     output = []
@@ -183,8 +194,24 @@ def _xlsx_first_sheet_rows(payload: bytes) -> list[list[str]]:
         for cell in row.findall("m:c", _XLSX_NS):
             value = cell.find("m:v", _XLSX_NS)
             inline = cell.find("m:is/m:t", _XLSX_NS)
-            values.append((value.text if value is not None else
-                           inline.text if inline is not None else "") or "")
+            text = (value.text if value is not None else
+                    inline.text if inline is not None else "") or ""
+            if cell.get("t") == "s":
+                try:
+                    text = shared[int(text)]
+                except (ValueError, IndexError) as exc:
+                    raise PublicUniverseSourceError("szse_stock_master_shared_string_invalid") from exc
+            position = cell.get("r", "")
+            letters = re.match(r"^([A-Z]+)[1-9][0-9]*$", position)
+            if not letters:
+                raise PublicUniverseSourceError("szse_stock_master_cell_position_invalid")
+            column = 0
+            for char in letters[1]:
+                column = column * 26 + ord(char) - ord("A") + 1
+            if column <= len(values) or column > 256:
+                raise PublicUniverseSourceError("szse_stock_master_cell_position_invalid")
+            values.extend([""] * (column - len(values) - 1))
+            values.append(text)
         output.append(values)
     return output
 
@@ -309,6 +336,12 @@ def fetch_public_security_master(*, session: requests.Session | None = None) -> 
     """Fetch current+delisted A shares from official free exchange interfaces."""
     own_session = session is None
     session = session or requests.Session()
+    if own_session:
+        # These GET/POST endpoints only query public lists.  Retry the failed
+        # page, rather than fetching every successful exchange/page again.
+        session.mount("https://", HTTPAdapter(max_retries=Retry(
+            total=2, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}))))
     session.headers.update({"User-Agent": _UA})
     raw_parts: list[bytes] = []
     try:
@@ -452,4 +485,3 @@ def fetch_public_security_master_counts_from_members(members: list[dict[str, Any
         if exchange in counts:
             counts[exchange] += 1
     return counts
-

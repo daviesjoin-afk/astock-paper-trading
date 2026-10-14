@@ -15,6 +15,11 @@ suffix:baidu.com
 suffix:csrc.gov.cn
 suffix:sse.com.cn
 suffix:szse.cn
+host:www.bse.cn
+host:schemas.openxmlformats.org
+# Public BSE disclosure document identifiers, present in the exact notice URLs.
+value:8690dbac1d5c42db98e9c7388e562129
+value:8a64d7d9e97f4678af04313cdb66069e
 suffix:deepseek.com
 suffix:openai.com
 suffix:openrouter.ai

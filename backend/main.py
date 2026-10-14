@@ -26,6 +26,7 @@ import optimizer as O
 import decision_engine as DE
 import linkage as L
 import paper_trading as P
+import selection_factor_store as SFS
 import selection_tracking as ST
 import metrics as MET
 import operator_auth
@@ -142,14 +143,12 @@ def _store_health_response(payload):
 
 
 def _selection_signature():
-    try:
-        return (
-            os.path.getmtime(dfc.KLINE_MANIFEST_PATH),
-            os.path.getsize(dfc.KLINE_MANIFEST_PATH),
-            dfc.SHARED_KLINE_SOURCE_VERSION,
-        )
-    except OSError:
-        return (0, 0)
+    return (
+        _health_file_signature(dfc.KLINE_MANIFEST_PATH),
+        dfc.SHARED_KLINE_SOURCE_VERSION,
+        _health_file_signature(_SELECTION_FACTORS_PATH),
+        _health_file_signature(_SELECTION_META_PATH),
+    )
 
 
 def _selection_result_path(strategy: str, topn: int) -> str:
@@ -308,145 +307,29 @@ def _load_super_flow(topn):
     return cached or []
 
 
-def _selection_signature_matches(cached_signature, current_signature) -> bool:
-    """缓存 manifest 的 signature 是否与当前签名语义一致。
-
-    历史缓存里 ``signature`` 可能是**旧 list 格式**（``[..., size, version, ...]``），
-    也可能是**新 dict 格式**（``{"size": ..., "version": ...}``）。只按 tuple 比较会让
-    旧格式缓存永远不命中，于是每个周期都重算一遍选股因子（而且每次写回时把格式来回
-    翻转）。这里两种格式都接受，判据是 size 与 version 一致。
-    """
-    if isinstance(cached_signature, (list, tuple)):
-        if len(cached_signature) < 3:
-            return False
-        return (
-            cached_signature[1] == current_signature[1]
-            and str(cached_signature[2]) == str(current_signature[2])
-        )
-    if isinstance(cached_signature, dict):
-        return (
-            cached_signature.get("size") == current_signature[1]
-            and str(cached_signature.get("version")) == str(current_signature[2])
-        )
-    return False
-
-
 def _load_selection_base():
-    """Load compact persisted factors; rebuild only after the K-line manifest changes."""
-    signature = _selection_signature()
-    if (
-        _SELECTION_CACHE["price_factors"] is not None
-        and _SELECTION_CACHE["signature"] == signature
-    ):
-        return (
-            _SELECTION_CACHE["price_factors"],
-            _SELECTION_CACHE["first_board_codes"],
-        )
+    """Read the shared validated snapshot; heavy rebuilding belongs to workers."""
+    signature = (_selection_signature(), _complete_daily_cutoff(),
+                 int(time.monotonic() // 60))
     with _SELECTION_LOCK:
-        if (
-            _SELECTION_CACHE["price_factors"] is not None
-            and _SELECTION_CACHE["signature"] == signature
-        ):
-            return (
-                _SELECTION_CACHE["price_factors"],
-                _SELECTION_CACHE["first_board_codes"],
-            )
+        if (_SELECTION_CACHE["price_factors"] is not None
+                and _SELECTION_CACHE["signature"] == signature):
+            return _SELECTION_CACHE["price_factors"], _SELECTION_CACHE["first_board_codes"]
         try:
-            with open(_SELECTION_META_PATH, "r", encoding="utf-8") as handle:
-                meta = json.load(handle)
-            if str(meta.get("factor_date") or "")[:10] != _complete_daily_cutoff().isoformat():
-                raise ValueError("选股因子缓存不是最近完整交易日")
-            if float(meta.get("eligible_factor_coverage_pct") or 0.0) < 90.0:
-                raise ValueError("选股因子缓存覆盖率不足90%")
-            if (
-                _selection_signature_matches(meta.get("signature"), signature)
-                and os.path.exists(_SELECTION_FACTORS_PATH)
-            ):
-                price_factors = pd.read_csv(
-                    _SELECTION_FACTORS_PATH,
-                    dtype={"code": str},
-                    index_col="code",
-                )
-                if not _SELECTION_REQUIRED_COLUMNS.issubset(price_factors.columns):
-                    raise ValueError("选股因子缓存版本过旧")
-                first_board_codes = set(meta.get("first_board_codes", []))
-                _SELECTION_CACHE.update(
-                    {
-                        "signature": signature,
-                        "price_factors": price_factors,
-                        "first_board_codes": first_board_codes,
-                    }
-                )
-                return price_factors, first_board_codes
-        except (OSError, ValueError, TypeError):
-            pass
-
-        universe = U.load_universe()
-        cutoff = _complete_daily_cutoff()
-        klines = {}
-        for row in universe:
-            frame = dfc.load_shared_kline(row["code"])
-            if frame is not None:
-                frame = frame.loc[frame.index.date <= cutoff]
-            if frame is not None and len(frame) > 65:
-                klines[row["code"]] = frame
-        price_factors = F.compute_price_factors(klines)
-        # Never persist a mixed-date/partial factor cache.  A failed rebuild
-        # remains an explicit blocked state; it cannot replace the last
-        # validated snapshot with a few hundred rows.
-        if "last_date" in price_factors:
-            price_factors = price_factors.loc[
-                price_factors["last_date"].astype(str).str[:10].eq(cutoff.isoformat())
-            ].copy()
-        eligible_codes = {
-            str(row.get("code") or "")
-            for row in universe
-            if row.get("code") and _buy_scope(
-                row.get("code"), row.get("name"), row.get("risk_flag"),
-                row.get("instrument_type") or row.get("security_type"),
-            )["allowed"]
-        }
-        eligible_factor_rows = len(set(price_factors.index.astype(str)) & eligible_codes)
-        required_factor_rows = max(4000, int(len(eligible_codes) * 0.90 + 0.9999))
-        if eligible_factor_rows < required_factor_rows:
-            _SELECTION_CACHE.update({"signature": signature, "price_factors": price_factors,
-                                     "first_board_codes": set()})
-            return price_factors, set()
-        first_board_codes = set(F.find_first_board_candidates(klines))
-        factors_tmp = _SELECTION_FACTORS_PATH + ".tmp"
-        price_factors.to_csv(factors_tmp, encoding="utf-8")
-        os.replace(factors_tmp, _SELECTION_FACTORS_PATH)
-        meta_tmp = _SELECTION_META_PATH + ".tmp"
-        # 统一写成 paper_trading 认可的权威格式，避免新旧格式反复翻转。
-        try:
-            import paper_trading as PT
-
-            canonical_signature = PT._selection_factor_manifest_signature()
-        except Exception:
-            canonical_signature = None
-        with open(meta_tmp, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "signature": canonical_signature or list(signature),
-                    "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "factor_rows": len(price_factors),
-                    "eligible_universe_rows": len(eligible_codes),
-                    "eligible_factor_rows": eligible_factor_rows,
-                    "eligible_factor_coverage_pct": round(eligible_factor_rows / max(len(eligible_codes), 1) * 100, 2),
-                    "factor_date": cutoff.isoformat(),
-                    "first_board_codes": sorted(first_board_codes),
-                },
-                handle,
-                ensure_ascii=False,
-            )
-        os.replace(meta_tmp, _SELECTION_META_PATH)
-        _SELECTION_CACHE.update(
-            {
-                "signature": signature,
-                "price_factors": price_factors,
-                "first_board_codes": first_board_codes,
-            }
-        )
+            price_factors, meta = SFS.read(_SELECTION_FACTORS_PATH, _SELECTION_META_PATH)
+            if not _SELECTION_REQUIRED_COLUMNS.issubset(price_factors.columns):
+                raise ValueError("选股因子缓存版本过旧")
+            freshness = P._selection_factor_freshness(
+                price_factors, U.load_universe(), datetime.date.today(), meta=meta)
+            if not freshness["passed"]:
+                raise ValueError(freshness.get("reason"))
+            first_board_codes = set(meta.get("first_board_codes", []))
+        except (OSError, ValueError, TypeError, KeyError):
+            # No full-market I/O or network fallback on a request path.
+            # Existing factor/history worker endpoints can rebuild the cache.
+            return pd.DataFrame(), set()
+        _SELECTION_CACHE.update({"signature": signature, "price_factors": price_factors,
+                                 "first_board_codes": first_board_codes})
         return price_factors, first_board_codes
 
 

@@ -1217,7 +1217,7 @@ class ReplayWiringTests(PointInTimeBase):
 
         import paper_trading as PT
 
-        source = inspect.getsource(PT._rebuild_selection_factor_cache)
+        source = inspect.getsource(PT._rebuild_selection_factor_cache_locked)
         # 断言**调用本身**（而不是松散子串——注释里也出现过这个词）
         self.assertIn("HUPS.refresh_archive(", source)
         self.assertIn("U.historical_universe(", source)
@@ -1319,6 +1319,7 @@ class ReplayWiringTests(PointInTimeBase):
 
         def price_spy(*args, **kwargs):
             seen["price_asof"].append(kwargs.get("asof"))
+            list(args[0])  # Consume the one-pass price-history input as production does.
             return pd.DataFrame()
 
         snapshot = {"source": self.HISTORICAL_SOURCE,
