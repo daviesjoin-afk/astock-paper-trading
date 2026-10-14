@@ -173,10 +173,19 @@ class FactorReadinessTests(unittest.TestCase):
         for i, row in enumerate(data):
             row["code"] = f"{('600','601','603','605')[i // 1000]}{i % 1000:03d}"
         universe = [dict(r, name="ordinary") for r in data]
-        frame = pd.DataFrame({"last_date": NOW.date().isoformat()}, index=[r["code"] for r in data])
+        # Zero is a usable quote; None/placeholders retain the existing factor,
+        # while an explicit NaN clears it, as in the former scalar assignments.
+        for i, value in enumerate((0, None, "--", "-", "", float("nan"))):
+            data[i]["amount"] = value
+        frame = pd.DataFrame({"last_date": NOW.date().isoformat(), "amount": 123.}, index=[r["code"] for r in data])
         reading = C.classify(snapshot(data, True), C.CLOSE_SNAPSHOT_POLICY, now=NOW)
         def build(price, fund, *args, **kwargs):
             self.assertTrue(fund.index.is_unique)
+            self.assertEqual(0., price.iloc[0]["amount"])
+            self.assertTrue(price.iloc[1:5]["amount"].eq(123.).all())
+            self.assertTrue(pd.isna(price.iloc[5]["amount"]))
+            self.assertTrue(price["price"].eq(10.).all())
+            self.assertTrue(price["pct"].eq(1.).all())
             table = pd.DataFrame(index=price.index)
             table["pct"] = fund["pct_today"]
             return table

@@ -1406,13 +1406,16 @@ def _select_uncached(
         "turnover": "turnover", "main_pct": "main_pct",
         "super_net_raw": "super_net", "main_net": "main_net",
     }
-    for code, row in live_map.items():
-        if code not in price_f.index:
-            continue
-        for target, source in live_field_map.items():
-            value = row.get(source)
-            if value is not None and str(value).strip() not in {"", "--", "-"}:
-                price_f.loc[code, target] = value
+    factor_codes = set(price_f.index)
+    for target, source in live_field_map.items():
+        updates = {
+            code: row[source] for code, row in live_map.items()
+            if code in factor_codes and row.get(source) is not None
+            and str(row[source]).strip() not in {"", "--", "-"}
+        }
+        if updates:
+            values = pd.Series(updates)
+            price_f.loc[values.index, target] = values.to_numpy()
     sentiment = _LIVE_CACHE["sentiment"]
     if not sentiment:
         try:
