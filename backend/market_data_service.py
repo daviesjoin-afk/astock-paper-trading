@@ -326,9 +326,22 @@ def refresh_snapshot(
         raise ValueError(f"unknown market data kind: {kind!r}")
     deadline = _resolve_now(policy, now)
     last_known = _load_cached_snapshot(kind)
+    reference_day = MDC.canonical_day(asof_day)
+    current_day = deadline.astimezone(dt.timezone(dt.timedelta(hours=8))).date().isoformat()
+    if (policy.name == MDC.CLOSE_SNAPSHOT_POLICY.name
+            and reference_day and reference_day < current_day):
+        # A realtime provider cannot refresh a historical closing fact.
+        # Keep the requested date attached even when the cache is unavailable.
+        return MDC.classify(last_known, policy, now=deadline,
+                            access_mode=MDC.ACCESS_REFRESH, asof_day=reference_day,
+                            refresh_failed=bool(force))
+    max_age = MDC.provider_max_age(policy, deadline, asof_day)
+    if max_age is None:
+        return MDC.classify(last_known, policy, now=deadline,
+                            access_mode=MDC.ACCESS_REFRESH, asof_day=asof_day)
     try:
         rows = dfc_module.fetch_market_snapshot_full(
-            max_age=policy.max_age_seconds, force=bool(force),
+            max_age=max_age, force=bool(force),
         )
     except Exception:
         rows = None
@@ -346,7 +359,7 @@ def refresh_snapshot(
                 str(row.get("code") or "") for row in universe_module.load_universe()
             ]
             rows = dfc_module.fetch_tencent_market_snapshot(
-                codes, max_age=policy.max_age_seconds, now=deadline, force=force,
+                codes, max_age=max_age, now=deadline, force=force,
             )
         except Exception:
             rows = []
@@ -426,6 +439,7 @@ def refresh_rows(
     force: bool = False,
     now: Any = None,
     policy: MDC.MarketDataPolicy = MDC.LIVE_MARKET_POLICY,
+    asof_day: Any = None,
 ) -> list[dict[str, Any]]:
     """决策路径的刷新入口（**显式允许联网**），返回既有 ``list[dict]`` 形状。
 
@@ -437,14 +451,18 @@ def refresh_rows(
     旧快照做横截面扫描」。只读路径请改用 :func:`read_snapshot`，它会保留
     最后一份可信事实并如实标记 stale。
     """
+    deadline = now if now is not None else now_utc()
     try:
         reading = refresh_snapshot(
-            policy, now=now if now is not None else now_utc(), force=force,
+            policy, now=deadline, force=force,
+            asof_day=asof_day,
         )
     except Exception:
         return []
     if not reading.available or reading.freshness != MDC.FRESHNESS_FRESH:
         return []
+    if policy.name == MDC.CLOSE_SNAPSHOT_POLICY.name:
+        return [dict(row) for row in MDC.close_snapshot_rows(reading.rows(), deadline, asof_day)]
     return [dict(row) for row in reading.rows() if isinstance(row, Mapping)]
 
 

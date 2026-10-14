@@ -7747,12 +7747,13 @@ def generate_signals(asof_date=None):
         }
     # 收盘任务必须绕过 240 秒缓存强制刷新一次全市场快照，确保收盘口径不滞留在 14:55 的盘中缓存。
     try:
-        close_raw = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY)
+        close_raw = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY, asof_day=day)
         # A historical/research invocation must not compare an old as-of day
         # with today's live timestamp.  Scheduled today's close is the only
         # path that needs the real-time cross-sectional gate.
         close_universe = (
-            _validated_live_universe(close_raw, day, max_quote_age_minutes=30)
+            _validated_live_universe(
+                MDC.close_snapshot_rows(close_raw, dt.datetime.now().astimezone(), day), day)
             if day == dt.date.today() else list(close_raw or [])
         )
         close_snapshot_at = max(
@@ -7999,7 +8000,7 @@ def backfill_research_shadow(asof_date=None):
     if not _is_trade_weekday(day):
         return {"status": "skipped", "reason": "非交易工作日", "date": day.isoformat()}
     try:
-        close_universe = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY)
+        close_universe = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY, asof_day=day)
         close_snapshot_at = max(
             (str(row.get("quote_at")) for row in close_universe if row.get("quote_at")),
             default=None,
