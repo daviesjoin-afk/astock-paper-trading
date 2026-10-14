@@ -169,6 +169,9 @@ class FactorReadinessTests(unittest.TestCase):
         class Clock(dt.datetime):
             @classmethod
             def now(cls, tz=None): return cls.fromtimestamp(NOW.timestamp(), tz or ZONE)
+            def astimezone(self, tz=None):
+                # Model the production UTC+8 timezone even on a UTC CI host.
+                return super().astimezone(tz or ZONE)
         data = rows()
         for i, row in enumerate(data):
             row["code"] = f"{('600','601','603','605')[i // 1000]}{i % 1000:03d}"
