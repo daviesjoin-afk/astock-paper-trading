@@ -106,6 +106,8 @@ _SELECTION_CONTEXT_STATE = {
 }
 _SELECTION_CONTEXT_VERSION = 0
 _SELECTION_CONTEXT_RETRY_SECONDS = 30
+_SELECTION_CONTEXT_TTL = {"finance": 6 * 3600, "sentiment": 300}
+_SELECTION_CONTEXT_PROVIDER_KEY = {"finance": "finance", "sentiment": "hot_100"}
 
 
 def _health_file_signature(path):
@@ -373,10 +375,30 @@ def _context_has_data(key, value):
     return isinstance(rows, dict) and bool(rows) and all(isinstance(row, dict) for row in rows.values())
 
 
-def _publish_selection_context(key, value):
+def _selection_context_fresh(key, now):
+    state = _SELECTION_CONTEXT_STATE[key]
+    return (state.get("value_id") == id(_LIVE_CACHE[key])
+            and state.get("day") == datetime.date.today().isoformat()
+            and now < state.get("expires_at", 0.0))
+
+
+def _selection_context_signature():
+    with _SELECTION_CONTEXT_LOCK:
+        now = time.monotonic()
+        return (datetime.date.today().isoformat(),
+                *(_selection_context_fresh(key, now) for key in _SELECTION_CONTEXT_TTL))
+
+
+def _publish_selection_context(key, value, *, started_at=None):
     global _SELECTION_CONTEXT_VERSION
+    now = time.monotonic()
+    provider_age = dfc.cached_age_seconds(_SELECTION_CONTEXT_PROVIDER_KEY[key])
+    age = provider_age if provider_age is not None else now - (started_at if started_at is not None else now)
     with _SELECTION_CONTEXT_LOCK:
         _LIVE_CACHE[key] = value
+        _SELECTION_CONTEXT_STATE[key].update(
+            expires_at=now + max(0.0, _SELECTION_CONTEXT_TTL[key] - age),
+            day=datetime.date.today().isoformat(), value_id=id(value))
         _SELECTION_CONTEXT_VERSION += 1
     # The generation also protects a result still being computed while
     # this worker is waiting for the result lock.
@@ -385,11 +407,12 @@ def _publish_selection_context(key, value):
 
 
 def _refresh_selection_context(key, loader):
+    started_at = time.monotonic()
     try:
         value = loader()
         if not _context_has_data(key, value):
             return
-        _publish_selection_context(key, value)
+        _publish_selection_context(key, value, started_at=started_at)
     except Exception:
         return
     finally:
@@ -403,19 +426,22 @@ def _load_selection_context(key, loader, *, background=True):
     should_refresh = False
     with _SELECTION_CONTEXT_LOCK:
         value = _LIVE_CACHE[key]
-        if _context_has_data(key, value):
-            return value
         state = _SELECTION_CONTEXT_STATE[key]
         now = time.monotonic()
+        if _selection_context_fresh(key, now):
+            return value
         if background and not state["refreshing"] and now >= state["retry_at"]:
             state.update(refreshing=True, retry_at=now + _SELECTION_CONTEXT_RETRY_SECONDS)
             should_refresh = True
     if not background:
+        started_at = time.monotonic()
         try:
             value = loader()
             if _context_has_data(key, value):
-                _publish_selection_context(key, value)
-                return value
+                _publish_selection_context(key, value, started_at=started_at)
+                with _SELECTION_CONTEXT_LOCK:
+                    if _selection_context_fresh(key, time.monotonic()):
+                        return value
         except Exception:
             pass
     if should_refresh:
@@ -1611,7 +1637,7 @@ def select(
 ):
     """Coalesce identical selection requests on small servers."""
     key = (strategy, topn, _selection_signature(), _health_file_signature(_SUPER_FLOW_PATH),
-           _SELECTION_CONTEXT_VERSION)
+           _SELECTION_CONTEXT_VERSION, _selection_context_signature())
     now = time.time()
     cached = _SELECT_RESULT_CACHE.get(key)
     if cached and now - cached["ts"] < _SELECT_RESULT_TTL_SECONDS:

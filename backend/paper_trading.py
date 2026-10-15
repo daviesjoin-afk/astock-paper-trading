@@ -14807,9 +14807,94 @@ def _audit_symbol_name(payload, account_id, code, position_names=None, order_nam
     return ""
 
 
-def risk_audit(limit=160):
-    """轻量风控审计流：只读取账本，不请求行情或重建风控快照。"""
+def risk_audit(limit=160, *, page_size=None, account_id=None,
+               level=None, date=None, cursor=None):
+    """轻量风控审计流：只读取账本，不请求行情或重建风控快照。
+
+    过滤与分页全部下推到 SQL。``account_id`` / ``level`` / ``date`` 在查询层生效，
+    翻页用稳定游标：``cursor`` 为账本 ID（兼容旧 ``<created_at>|<id>``），
+    按 ``id DESC`` 严格递减推进，因此页与页之间不会重复或漏项。
+
+    ``limit`` 保持旧语义 —— 未显式传 ``page_size`` 时的行数上限，兼容
+    ``risk_audit(limit=N)`` 的老调用方。
+
+    ``level`` 只接受投影真正会产出的取值（``watch`` / ``tightened``），未知值抛
+    ``ValueError``：UI 提供了 ``blocked`` 选项但投影从不产出它，静默返回空列表会
+    把这个不匹配藏起来。
+    """
     limit = max(20, min(int(limit), 300))
+    # ``limit`` keeps its old meaning — the row cap for callers that do not ask
+    # for an explicit page size.  Only an explicit ``page_size`` overrides it,
+    # and it is honoured as given: clamping it here would silently return more
+    # rows than requested.  HTTP bounds belong to the route, not the read model.
+    if page_size is None:
+        fetch_limit = limit
+    else:
+        fetch_limit = max(1, min(int(page_size), 300))
+    account_id = str(account_id).strip() if account_id else ""
+    date = str(date).strip() if date else ""
+    if level is not None:
+        level = str(level).strip()
+    if cursor is not None:
+        cursor = str(cursor).strip()
+        if not cursor:
+            cursor = None
+    if date:
+        try:
+            if len(date) != 10:
+                raise ValueError
+            day = dt.date.fromisoformat(date)
+            if day == dt.date.max:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("date_must_be_iso_day") from exc
+    if cursor is not None:
+        parts = cursor.split("|")
+        if len(parts) == 1:
+            if not parts[0].isdecimal():
+                raise ValueError("invalid_cursor")
+            cursor_id = int(parts[0])
+        elif len(parts) == 2:
+            legacy_time, raw_id = parts
+            if not raw_id.isdecimal() or not legacy_time:
+                raise ValueError("invalid_cursor")
+            cursor_id = int(raw_id)
+        else:
+            raise ValueError("invalid_cursor")
+        if not 0 < cursor_id <= 2**63 - 1:
+            raise ValueError("invalid_cursor")
+    else:
+        cursor_id = None
+    tightened = None
+    tightened_outcomes = ("filled", "exit_pending_data")
+    if level:
+        if level == "watch":
+            tightened = 0
+        elif level == "tightened":
+            tightened = 1
+        else:
+            raise ValueError("unsupported_level_filter")
+    where = ["1=1"]
+    params: list = []
+    if account_id:
+        where.append("account_id=?")
+        params.append(account_id)
+    if date:
+        where.append("created_at>=? AND created_at<?")
+        params.extend((date, (day + dt.timedelta(days=1)).isoformat()))
+    if tightened is not None:
+        # level 是投影派生值：filled / exit_pending_data → tightened，其余 → watch。
+        if tightened:
+            marks = ",".join("?" for _ in tightened_outcomes)
+            where.append(f"decision IN ({marks})")
+            params.extend(tightened_outcomes)
+        else:
+            marks = ",".join("?" for _ in tightened_outcomes)
+            where.append(f"(decision IS NULL OR decision NOT IN ({marks}))")
+            params.extend(tightened_outcomes)
+    where_sql = " AND ".join(where)
+    page_where = where_sql + (" AND id < ?" if cursor_id is not None else "")
+    page_params = (*params, cursor_id) if cursor_id is not None else tuple(params)
     # This endpoint is a pure read model.  Calling init_db() here used to run
     # migrations, stale-task recovery, lock deletion and shared-cash repair in
     # the middle of a browser request.  It could therefore mutate the ledger
@@ -14823,12 +14908,34 @@ def risk_audit(limit=160):
                                              asof_date=dt.date.today().isoformat())
                            if cycle_id is not None else None)
             names = {row["id"]: row["name"] for row in accounts}
-            decisions = _rows(
-                conn,
-                """SELECT id,account_id,code,side,decision,reason,payload,created_at
-                   FROM paper_risk_decisions ORDER BY id DESC LIMIT ?""",
-                (limit,),
-            )
+            total = 0
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM paper_risk_decisions WHERE {where_sql}",
+                params,
+            ).fetchone()
+            if row is not None:
+                total = int(row[0])
+            columns = "id,account_id,code,side,decision,reason,payload,created_at"
+            if account_id or date or level:
+                # Filter narrow IDs via existing covering indexes first. A
+                # rowid-ordered full scan otherwise reads large payload rows
+                # even for an empty date (49s on the real read-only ledger).
+                # MATERIALIZED prevents flattening this back into that plan;
+                # the optimizer remains free to choose any suitable index.
+                # Apply the ID cursor after materialization: pushing it down
+                # can select the same wide rowid-range scan on later pages.
+                query = f"""WITH selected AS MATERIALIZED (
+                    SELECT id FROM paper_risk_decisions WHERE {where_sql}
+                ) SELECT {columns} FROM paper_risk_decisions WHERE id IN (
+                    SELECT id FROM selected {"WHERE id < ?" if cursor_id is not None else ""}
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id DESC"""
+            else:
+                query = f"""SELECT {columns} FROM paper_risk_decisions
+                    WHERE {page_where} ORDER BY id DESC LIMIT ?"""
+            decisions = _rows(conn, query, (*page_params, fetch_limit + 1))
+            has_next = len(decisions) > fetch_limit
+            decisions = decisions[:fetch_limit]
             decision_keys = {
                 (str(row.get("account_id") or ""), str(row.get("code") or ""))
                 for row in decisions if row.get("code")
@@ -14955,6 +15062,7 @@ def risk_audit(limit=160):
             display_reason = display_reason.strip("； ") or "剩余风险预算不足以买入一手"
         linked = linked_signals.get((str(decision.get("account_id") or ""), str(decision.get("code") or "")))
         alerts.append({
+            "id": decision.get("id"),
             "time": decision.get("created_at"),
             "account_id": decision.get("account_id"),
             "account_name": names.get(decision.get("account_id"), decision.get("account_id")),
@@ -14978,8 +15086,20 @@ def risk_audit(limit=160):
                 "label": "待执行委托（等待开盘审批/执行批次）",
             } if linked else None),
         })
+    next_cursor = None
+    if has_next:
+        # 与 ORDER BY id DESC 使用同一排序键；补写时间不能改变游标推进顺序。
+        last = decisions[-1]
+        next_cursor = str(last["id"])
+    pagination = {
+        "page_size": fetch_limit, "total": total,
+        "total_pages": (total + fetch_limit - 1) // fetch_limit,
+        "has_next": bool(next_cursor), "has_prev": bool(cursor_id is not None),
+    }
+    if next_cursor:
+        pagination["next_cursor"] = next_cursor
     return {"accounts": accounts, "alerts": alerts, "scan_status": scan_status,
-            "asof": _now(), "lightweight": True}
+            "asof": _now(), "lightweight": True, "pagination": pagination}
 
 
 def _validate_capital(capital):

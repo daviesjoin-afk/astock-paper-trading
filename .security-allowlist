@@ -37,6 +37,13 @@ host:files.pythonhosted.org
 host:img.shields.io
 host:www.python.org
 host:docs.python.org
+# Public primary sources cited by the system audit; exact hosts only.
+host:www.sqlite.org
+host:tracker.debian.org
+host:www.davidhbailey.com
+host:www.quantconnect.com
+host:opentelemetry.io
+host:trivy.dev
 host:github.com
 host:raw.githubusercontent.com
 host:api.github.com
