@@ -43,6 +43,8 @@ os.makedirs(KLINE_DIR, exist_ok=True)
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
 _cache_lock = threading.Lock()
 _mem_cache = {}
+_finance_fetch_lock = threading.Lock()
+_finance_fetch_state = {"retry_at": 0.0}
 _full_snapshot_thread_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _manifest = None
@@ -1209,12 +1211,33 @@ def fetch_finance_latest():
                 merged[code]["annual_net_profit"] = row.get("net_profit")
                 merged[code]["annual_report_date"] = annual_date
             break
+        if not merged:
+            # A truthy metadata envelope must not cache an empty provider
+            # response as a successful six-hour financial snapshot.
+            return None
         return {
             "data": merged,
             "report_dates": used_dates,
             "annual_report_date": annual_used,
         }
-    return _cached("finance", 3600 * 6, _do)
+    def _attempt():
+        if time.monotonic() < _finance_fetch_state["retry_at"]:
+            return None
+        try:
+            value = _do()
+        except Exception:
+            _finance_fetch_state["retry_at"] = time.monotonic() + 30
+            raise
+        if not value:
+            _finance_fetch_state["retry_at"] = time.monotonic() + 30
+        return value
+    # Serializing the existing cache check also coalesces concurrent misses.
+    # Empty attempts wait briefly, rather than either retrying per strategy
+    # or becoming a successful six-hour cache entry.
+    with _finance_fetch_lock:
+        return _cached("finance", 3600 * 6, _attempt) or {
+            "data": {}, "report_dates": [], "annual_report_date": None,
+        }
 
 def _fetch_finance_report(report_date):
     rows = []

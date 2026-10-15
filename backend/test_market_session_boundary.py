@@ -209,15 +209,34 @@ class FactorReadinessTests(unittest.TestCase):
                 mock.patch.object(M, "_load_super_flow", return_value=stale_flows), \
                 mock.patch.object(M, "_schedule_super_flow_refresh") as queue, \
                 mock.patch.object(M, "_refresh_super_flow") as refresh, \
-                mock.patch.dict(M._LIVE_CACHE, finance={"data":{"known":{}},"report_dates":[]}, sentiment={"known":1}), \
+                mock.patch.dict(M._LIVE_CACHE, finance={"data":{},"report_dates":[]}, sentiment={}), \
+                mock.patch.dict(M._SELECTION_CONTEXT_STATE, {key:{"refreshing":False,"retry_at":0.} for key in ("finance","sentiment")}), \
+                mock.patch.object(M, "_SELECTION_CONTEXT_VERSION", 0), \
+                mock.patch.dict(M._SELECT_RESULT_CACHE, {}, clear=True), \
+                mock.patch.object(M.threading, "Thread") as workers, \
+                mock.patch.object(M.dfc, "fetch_finance_latest") as finance, \
+                mock.patch.object(M.F, "compute_sentiment_factors") as sentiment, \
                 mock.patch.object(M.S, "build_factor_table", side_effect=build), \
-                mock.patch.object(M.S, "run_strategy", return_value={"picks":[]}):
-            result = M._select_uncached(strategy="three_day", topn=10)
+                mock.patch.object(M.S, "run_strategy", side_effect=[{"picks":[]},{"picks":[]}]):
+            result = M._select_uncached(strategy="three_day", topn=10, background_context=True)
+            finance.assert_not_called()
+            sentiment.assert_not_called()
+            self.assertEqual(2, workers.call_count)
+            finance.return_value = {"data":{"known":{}},"report_dates":[]}
+            sentiment.return_value = {"known":{}}
+            # Scheduled jobs use this default mode and must consume the data
+            # before their short-lived process exits, without starting threads.
+            scheduled = M._select_uncached(strategy="three_day", topn=10)
+            finance.assert_called_once_with()
+            sentiment.assert_called_once()
+            self.assertNotIn("context_pending", scheduled)
+            self.assertEqual(2, workers.call_count)
         self.assertFalse(result.get("need_init"), result.get("message"))
         self.assertEqual("close_snapshot", result["data_quality"]["quote_policy"])
         self.assertEqual(4000, result["data_quality"]["live_quote_coverage"])
-        queue.assert_called_once_with(topn=4000)
+        self.assertEqual([mock.call(topn=4000)]*2, queue.call_args_list)
         refresh.assert_not_called()
+        self.assertEqual(["finance", "sentiment"], result["context_pending"])
 
     def test_universe_publication_invalidates_the_factor_readiness_signature(self):
         with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 1)):
