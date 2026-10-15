@@ -170,7 +170,8 @@ def _selection_result_path(strategy: str, topn: int) -> str:
 
 def _save_selection_result(strategy: str, topn: int, result: dict) -> None:
     """Persist only completed selection results; failed/partial runs are never shown as latest."""
-    if not isinstance(result, dict) or result.get("need_init") or result.get("error"):
+    if (not isinstance(result, dict) or result.get("need_init") or result.get("error")
+            or result.get("context_pending")):
         return
     try:
         os.makedirs(_SELECTION_RESULT_DIR, exist_ok=True)
@@ -1557,6 +1558,8 @@ def _select_uncached(
         "kline_cache_path": dfc.KLINE_DIR,
         "note": "历史因子使用最近完整交易日；价格按盘中实时或指定交易日收盘口径读取，缺失字段保持未知。选股与模拟盘读取同一份前复权日线缓存。",
     }
+    result["context_pending"] = [key for key, value in (("finance", finance), ("sentiment", sentiment))
+                                 if not _context_has_data(key, value)]
     result["finance_report_dates"] = finance.get("report_dates")
     result["latest_finance_report_date"] = (
         (finance.get("report_dates") or [None])[0]

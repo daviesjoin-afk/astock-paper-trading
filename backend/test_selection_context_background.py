@@ -128,6 +128,13 @@ class BackgroundContextTests(unittest.TestCase):
         self.assertEqual(FINANCE, M._LIVE_CACHE["finance"])
         self.assertEqual(1, M._SELECTION_CONTEXT_VERSION)
 
+    def test_incomplete_context_is_not_saved_as_a_completed_selection(self):
+        with mock.patch.object(M.os, "makedirs") as mkdir:
+            M._save_selection_result("three_day", 10, {
+                "picks": [{"code": "600000"}], "context_pending": ["finance"],
+            })
+            mkdir.assert_not_called()
+
     def test_publication_during_selection_cannot_cache_unknown_context_for_60s(self):
         attempted, allow_clear = threading.Event(), threading.Event()
         self.addCleanup(allow_clear.set)

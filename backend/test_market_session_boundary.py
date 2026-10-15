@@ -225,6 +225,7 @@ class FactorReadinessTests(unittest.TestCase):
         finance.assert_not_called()
         sentiment.assert_not_called()
         self.assertEqual(2, workers.call_count)
+        self.assertEqual(["finance", "sentiment"], result["context_pending"])
 
     def test_universe_publication_invalidates_the_factor_readiness_signature(self):
         with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 1)):
