@@ -361,26 +361,34 @@ def risk_overview():
 @router.get("/risk-audit")
 def risk_audit(
     limit: int = Query(160, ge=20, le=300),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=10, le=200),
+    page_size: int | None = Query(None, ge=10, le=200),
+    account_id: str | None = Query(None, max_length=80),
+    level: str | None = Query(None, max_length=20),
+    date: str | None = Query(None, max_length=10),
+    cursor: str | None = Query(None, max_length=64),
 ):
-    cache_key = f"risk_audit:{limit}:{page}:{page_size}"
+    """风控审计历史：过滤、翻页与总数都在数据库查询层完成。
+
+    投影返回的是含 ``accounts/alerts/scan_status/pagination`` 的字典，不是列表，
+    因此旧版“仅当结果是 list 才切片”的分支对字典永远不生效 —— 翻页请求会拿到
+    和第一页完全相同的整包。现在过滤条件下推，翻页走稳定游标：带上
+    ``pagination.next_cursor`` 取下一页，页间不会重复或漏项。
+
+    刻意不提供 ``page`` 偏移量：``id DESC`` 下的 offset 翻页会在两次请求之间
+    插入新风险决策时重复或跳过行，而游标以本页最后一行定位，不受新写入影响。
+    """
+    cache_key = (f"risk_audit:{limit}:{page_size}:{account_id}:"
+                 f"{level}:{date}:{cursor}")
     try:
         def load_audit():
-            full = _call_with_retry(P.risk_audit, limit)
-            if isinstance(full, list) and len(full) > page_size:
-                total = len(full)
-                start = (page - 1) * page_size
-                end = start + page_size
-                return {
-                    "items": full[start:end],
-                    "pagination": {"page": page, "page_size": page_size, "total": total,
-                                   "total_pages": (total + page_size - 1) // page_size,
-                                   "has_next": end < total, "has_prev": page > 1}
-                }
-            return full
+            return _call_with_retry(
+                P.risk_audit, limit, page_size=page_size,
+                account_id=account_id, level=level, date=date, cursor=cursor,
+            )
 
         return _cache_load(cache_key, load_audit, ttl=30)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc) or "invalid_risk_audit_filter") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Risk audit failed: {type(exc).__name__}") from exc
 
