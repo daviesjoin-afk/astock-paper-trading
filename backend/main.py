@@ -373,19 +373,23 @@ def _context_has_data(key, value):
     return isinstance(rows, dict) and bool(rows) and all(isinstance(row, dict) for row in rows.values())
 
 
-def _refresh_selection_context(key, loader):
+def _publish_selection_context(key, value):
     global _SELECTION_CONTEXT_VERSION
+    with _SELECTION_CONTEXT_LOCK:
+        _LIVE_CACHE[key] = value
+        _SELECTION_CONTEXT_VERSION += 1
+    # The generation also protects a result still being computed while
+    # this worker is waiting for the result lock.
+    with _SELECT_RESULT_LOCK:
+        _SELECT_RESULT_CACHE.clear()
+
+
+def _refresh_selection_context(key, loader):
     try:
         value = loader()
         if not _context_has_data(key, value):
             return
-        with _SELECTION_CONTEXT_LOCK:
-            _LIVE_CACHE[key] = value
-            _SELECTION_CONTEXT_VERSION += 1
-        # The generation also protects a result still being computed while
-        # this worker is waiting for the result lock.
-        with _SELECT_RESULT_LOCK:
-            _SELECT_RESULT_CACHE.clear()
+        _publish_selection_context(key, value)
     except Exception:
         return
     finally:
@@ -394,8 +398,8 @@ def _refresh_selection_context(key, loader):
                 refreshing=False, retry_at=time.monotonic() + _SELECTION_CONTEXT_RETRY_SECONDS)
 
 
-def _load_selection_context(key, loader):
-    """Return known context; cold reads never wait for a provider."""
+def _load_selection_context(key, loader, *, background=True):
+    """Only HTTP cold reads skip waiting; short-lived jobs retain sync reads."""
     should_refresh = False
     with _SELECTION_CONTEXT_LOCK:
         value = _LIVE_CACHE[key]
@@ -403,9 +407,17 @@ def _load_selection_context(key, loader):
             return value
         state = _SELECTION_CONTEXT_STATE[key]
         now = time.monotonic()
-        if not state["refreshing"] and now >= state["retry_at"]:
+        if background and not state["refreshing"] and now >= state["retry_at"]:
             state.update(refreshing=True, retry_at=now + _SELECTION_CONTEXT_RETRY_SECONDS)
             should_refresh = True
+    if not background:
+        try:
+            value = loader()
+            if _context_has_data(key, value):
+                _publish_selection_context(key, value)
+                return value
+        except Exception:
+            pass
     if should_refresh:
         try:
             threading.Thread(target=_refresh_selection_context, args=(key, loader),
@@ -1262,6 +1274,7 @@ def init_data(
 def _select_uncached(
     strategy: str = "three_day",
     topn: int = Query(10, ge=1, le=100),
+    *, background_context: bool = False,
 ):
     # 「策略选股」页复用本流水线跑模拟盘模型族（paper_selection.STRATEGY_MODEL
     # → strategies.PAPER_WEIGHTS），run_strategy 会把这些 id 分派给
@@ -1453,7 +1466,8 @@ def _select_uncached(
             "need_init": True,
             "message": f"实时行情覆盖不足 {len(snap_f)}/{required_live}，已停止使用旧快照进行今日选股",
         }
-    finance = _load_selection_context("finance", dfc.fetch_finance_latest)
+    finance = _load_selection_context("finance", dfc.fetch_finance_latest,
+                                      background=background_context)
     # 两套 cutoff 必须分开：``complete_cutoff`` 是"最近完整交易日"（盘中即昨天），
     # 只用于已收盘日线与财务披露；当日实时截面（PE/PB/换手/资金/行业）的决策时点
     # 是**现在**。混用会把盘中每一行都判成 future 并清空这些列。
@@ -1478,7 +1492,8 @@ def _select_uncached(
             values = pd.Series(updates)
             price_f.loc[values.index, target] = values.to_numpy()
     sentiment = _load_selection_context(
-        "sentiment", lambda: F.compute_sentiment_factors(frozenset(eligible_codes)))
+        "sentiment", lambda: F.compute_sentiment_factors(frozenset(eligible_codes)),
+        background=background_context)
     # 实时资金流直接从同一份行情取（含 f62/f184），省去一次全市场排行抓取
     realtime_flow = {
         s["code"]: (
@@ -1558,8 +1573,9 @@ def _select_uncached(
         "kline_cache_path": dfc.KLINE_DIR,
         "note": "历史因子使用最近完整交易日；价格按盘中实时或指定交易日收盘口径读取，缺失字段保持未知。选股与模拟盘读取同一份前复权日线缓存。",
     }
-    result["context_pending"] = [key for key, value in (("finance", finance), ("sentiment", sentiment))
-                                 if not _context_has_data(key, value)]
+    if background_context:
+        result["context_pending"] = [key for key, value in (("finance", finance), ("sentiment", sentiment))
+                                     if not _context_has_data(key, value)]
     result["finance_report_dates"] = finance.get("report_dates")
     result["latest_finance_report_date"] = (
         (finance.get("report_dates") or [None])[0]
@@ -1605,7 +1621,7 @@ def select(
         cached = _SELECT_RESULT_CACHE.get(key)
         if cached and now - cached["ts"] < _SELECT_RESULT_TTL_SECONDS:
             return cached["data"]
-        result = _select_uncached(strategy=strategy, topn=topn)
+        result = _select_uncached(strategy=strategy, topn=topn, background_context=True)
         _SELECT_RESULT_CACHE.clear()
         _SELECT_RESULT_CACHE[key] = {"ts": time.time(), "data": result}
         _save_selection_result(strategy, topn, result)

@@ -109,6 +109,23 @@ class BackgroundContextTests(unittest.TestCase):
         self.assertEqual([], self.threads)
         self.assertEqual("2026-08-01", FINANCE["data"]["600000"]["notice_date"])
 
+    def test_short_lived_job_reads_data_synchronously_without_a_daemon(self):
+        thread = threading.current_thread()
+        def fetch():
+            self.assertIs(thread, threading.current_thread())
+            return FINANCE
+        self.assertIs(FINANCE, M._load_selection_context("finance", fetch, background=False))
+        self.assertIs(FINANCE, M._LIVE_CACHE["finance"])
+        self.assertEqual([], self.threads)
+
+    def test_public_selection_explicitly_requests_background_context(self):
+        with mock.patch.object(M, "_selection_signature", return_value=("factors",)), \
+                mock.patch.object(M, "_health_file_signature", return_value=None), \
+                mock.patch.object(M, "_select_uncached", return_value={"picks": []}) as select, \
+                mock.patch.object(M, "_save_selection_result"):
+            M.select("three_day", 10)
+            select.assert_called_once_with(strategy="three_day", topn=10, background_context=True)
+
     def test_bad_or_failed_refresh_retains_previous_facts(self):
         for key, value in (("finance", FINANCE), ("sentiment", SENTIMENT)):
             M._LIVE_CACHE[key] = value
