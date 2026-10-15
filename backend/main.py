@@ -49,9 +49,11 @@ _SELECT_RESULT_CACHE = {}
 _SELECT_RESULT_LOCK = threading.RLock()
 _SELECT_RESULT_TTL_SECONDS = 60
 _SUPER_FLOW_PATH = os.path.join(dfc.CACHE_DIR, "super_flow_cache.json")
-_SUPER_FLOW_CACHE = {"data": None, "ts": 0.0, "refreshing": False}
+_SUPER_FLOW_CACHE = {"data": None, "ts": 0.0, "refreshing": False, "retry_at": 0.0,
+                     "file_signature": None}
 _SUPER_FLOW_LOCK = threading.Lock()
 _SUPER_FLOW_TTL_SECONDS = 300
+_SUPER_FLOW_RETRY_SECONDS = 30
 _SUPER_FLOW_FILE_LOCK_PATH = _SUPER_FLOW_PATH + ".lock"
 _DATA_UPDATE_LOCK = threading.RLock()
 _DATA_UPDATE_STATE = {
@@ -235,7 +237,7 @@ def _complete_daily_cutoff():
 def _refresh_super_flow(topn):
     try:
         rows = dfc.fetch_fund_flow_rank(topn=topn)
-        if not rows:
+        if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
             return
         payload = {"updated_at": time.time(), "data": rows}
         with _super_flow_file_lock():
@@ -243,13 +245,19 @@ def _refresh_super_flow(topn):
             with open(tmp_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False)
             os.replace(tmp_path, _SUPER_FLOW_PATH)
-        with _SUPER_FLOW_LOCK:
-            _SUPER_FLOW_CACHE.update(data=rows, ts=payload["updated_at"])
+            signature = _health_file_signature(_SUPER_FLOW_PATH)
+            with _SUPER_FLOW_LOCK:
+                _SUPER_FLOW_CACHE.update(data=rows, ts=payload["updated_at"], file_signature=signature)
         with _SELECT_RESULT_LOCK:
             _SELECT_RESULT_CACHE.clear()
+    except Exception:
+        # A failed background attempt must retain the last known facts/time.
+        # The loader's retry deadline limits failures without blocking callers.
+        return
     finally:
         with _SUPER_FLOW_LOCK:
-            _SUPER_FLOW_CACHE["refreshing"] = False
+            _SUPER_FLOW_CACHE.update(refreshing=False,
+                                     retry_at=time.monotonic() + _SUPER_FLOW_RETRY_SECONDS)
 
 
 @contextmanager
@@ -271,41 +279,47 @@ def _super_flow_file_lock():
             handle.close()
 
 
-def _load_super_flow(topn):
-    """Return cached fund flow and refresh stale data without blocking requests."""
-    should_block = False
-    should_refresh = False
+def _schedule_super_flow_refresh(topn):
+    """Coalesce refresh attempts in this process, including cold-cache failures."""
+    now = time.monotonic()
     with _SUPER_FLOW_LOCK:
-        if _SUPER_FLOW_CACHE["data"] is None:
+        if _SUPER_FLOW_CACHE["refreshing"] or now < _SUPER_FLOW_CACHE.get("retry_at", 0.0):
+            return
+        _SUPER_FLOW_CACHE.update(refreshing=True, retry_at=now + _SUPER_FLOW_RETRY_SECONDS)
+    try:
+        threading.Thread(
+            target=_refresh_super_flow, args=(topn,),
+            name="super-flow-refresh", daemon=True,
+        ).start()
+    except RuntimeError:
+        with _SUPER_FLOW_LOCK:
+            _SUPER_FLOW_CACHE["refreshing"] = False
+
+
+def _load_super_flow(topn):
+    """Read known facts immediately; a cache miss also refreshes in the background."""
+    signature = _health_file_signature(_SUPER_FLOW_PATH)
+    with _SUPER_FLOW_LOCK:
+        if (_SUPER_FLOW_CACHE["data"] is None
+                or _SUPER_FLOW_CACHE.get("file_signature") != signature):
+            _SUPER_FLOW_CACHE["file_signature"] = signature
             try:
                 with open(_SUPER_FLOW_PATH, "r", encoding="utf-8") as handle:
                     payload = json.load(handle)
+                if (not isinstance(payload, dict) or not isinstance(payload.get("data"), list)
+                        or any(not isinstance(row, dict) for row in payload["data"])):
+                    raise ValueError("invalid fund flow cache")
                 _SUPER_FLOW_CACHE.update(
                     data=payload.get("data") or [],
                     ts=float(payload.get("updated_at") or 0),
                 )
             except (OSError, ValueError, TypeError):
-                pass
+                if _SUPER_FLOW_CACHE["data"] is None:
+                    _SUPER_FLOW_CACHE["data"] = []
         age = time.time() - _SUPER_FLOW_CACHE["ts"]
-        if not _SUPER_FLOW_CACHE["refreshing"]:
-            if _SUPER_FLOW_CACHE["data"] is None:
-                _SUPER_FLOW_CACHE["refreshing"] = True
-                should_block = True
-            elif age >= _SUPER_FLOW_TTL_SECONDS:
-                _SUPER_FLOW_CACHE["refreshing"] = True
-                should_refresh = True
         cached = _SUPER_FLOW_CACHE["data"]
-    if should_block:
-        _refresh_super_flow(topn)
-        with _SUPER_FLOW_LOCK:
-            return _SUPER_FLOW_CACHE["data"] or []
-    if should_refresh:
-        threading.Thread(
-            target=_refresh_super_flow,
-            args=(topn,),
-            name="super-flow-refresh",
-            daemon=True,
-        ).start()
+    if not cached or age >= _SUPER_FLOW_TTL_SECONDS:
+        _schedule_super_flow_refresh(topn)
     return cached or []
 
 
@@ -1443,12 +1457,7 @@ def _select_uncached(
         for r in (super_rows or [])
     )
     if not has_expected_super:
-        try:
-            _refresh_super_flow(topn=max(len(snap_f), 100))
-            with _SUPER_FLOW_LOCK:
-                super_rows = _SUPER_FLOW_CACHE.get("data") or []
-        except Exception:
-            pass
+        _schedule_super_flow_refresh(topn=max(len(snap_f), 100))
     # The flow rank endpoint is cached independently from the quote snapshot.
     # Never inject a row with an absent/old timestamp into today's cross-section;
     # such rows silently turn stale capital-flow data into a live factor.
@@ -1542,7 +1551,7 @@ def select(
     topn: int = Query(10, ge=1, le=100),
 ):
     """Coalesce identical selection requests on small servers."""
-    key = (strategy, topn, _selection_signature())
+    key = (strategy, topn, _selection_signature(), _health_file_signature(_SUPER_FLOW_PATH))
     now = time.time()
     cached = _SELECT_RESULT_CACHE.get(key)
     if cached and now - cached["ts"] < _SELECT_RESULT_TTL_SECONDS:
