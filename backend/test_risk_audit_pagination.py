@@ -15,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
@@ -171,6 +172,52 @@ class RiskAuditPaginationTests(unittest.TestCase):
         for cursor in ("0", str(2**63), "9" * 60):
             with self.subTest(cursor=cursor), self.assertRaises(ValueError):
                 PT.risk_audit(cursor=cursor)
+
+    def test_filtered_query_uses_covering_index_before_reading_payloads(self):
+        self._seed([("sector_rotation", f"6001{i:02d}", "filled", "2026-10-15")
+                    for i in range(20)])
+        statements = []
+        reader = PT._db_readonly
+        @contextmanager
+        def traced_reader():
+            with reader() as conn:
+                conn.set_trace_callback(statements.append)
+                yield conn
+        with mock.patch.object(PT, "_db_readonly", traced_reader):
+            result = PT.risk_audit(date="2026-09-01", page_size=10)
+            first = PT.risk_audit(date="2026-10-15", page_size=3)
+            second = PT.risk_audit(date="2026-10-15", page_size=3,
+                                   cursor=first["pagination"]["next_cursor"])
+        self.assertEqual([], result["alerts"])
+        self.assertEqual(3, len(second["alerts"]))
+        queries = [sql for sql in statements
+                   if "payload" in sql and "FROM paper_risk_decisions" in sql]
+        self.assertEqual(3, len(queries))
+        with reader() as conn:
+            for query in queries:
+                plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + query)]
+                self.assertTrue(any("USING COVERING INDEX" in step for step in plan), plan)
+                self.assertTrue(any("USING INTEGER PRIMARY KEY" in step for step in plan), plan)
+                # Only the outer page fetch may touch the rowid b-tree.
+                materialized = plan.index("MATERIALIZE selected")
+                self.assertIn("USING COVERING INDEX", plan[materialized + 1], plan)
+
+    def test_filtered_query_remains_correct_without_optional_indexes(self):
+        self._seed([("sector_rotation", "600001", "filled", "2026-10-15")])
+        with PT._db() as conn:
+            definitions = [row[0] for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name LIKE 'idx_paper_risk_decisions%' AND sql IS NOT NULL")]
+            for row in conn.execute("PRAGMA index_list(paper_risk_decisions)").fetchall():
+                if row[1].startswith("idx_paper_risk_decisions"):
+                    conn.execute('DROP INDEX "' + row[1] + '"')
+        try:
+            self.assertEqual(["600001"], [row["code"] for row in
+                             PT.risk_audit(date="2026-10-15")["alerts"]])
+        finally:
+            with PT._db() as conn:
+                for definition in definitions:
+                    conn.execute(definition)
 
     def test_level_filter_matches_the_projected_value(self):
         self._seed([

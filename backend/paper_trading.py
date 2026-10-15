@@ -14915,13 +14915,25 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
             ).fetchone()
             if row is not None:
                 total = int(row[0])
-            decisions = _rows(
-                conn,
-                f"""SELECT id,account_id,code,side,decision,reason,payload,created_at
-                    FROM paper_risk_decisions WHERE {page_where}
-                    ORDER BY id DESC LIMIT ?""",
-                (*page_params, fetch_limit + 1),
-            )
+            columns = "id,account_id,code,side,decision,reason,payload,created_at"
+            if account_id or date or level:
+                # Filter narrow IDs via existing covering indexes first. A
+                # rowid-ordered full scan otherwise reads large payload rows
+                # even for an empty date (49s on the real read-only ledger).
+                # MATERIALIZED prevents flattening this back into that plan;
+                # the optimizer remains free to choose any suitable index.
+                # Apply the ID cursor after materialization: pushing it down
+                # can select the same wide rowid-range scan on later pages.
+                query = f"""WITH selected AS MATERIALIZED (
+                    SELECT id FROM paper_risk_decisions WHERE {where_sql}
+                ) SELECT {columns} FROM paper_risk_decisions WHERE id IN (
+                    SELECT id FROM selected {"WHERE id < ?" if cursor_id is not None else ""}
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id DESC"""
+            else:
+                query = f"""SELECT {columns} FROM paper_risk_decisions
+                    WHERE {page_where} ORDER BY id DESC LIMIT ?"""
+            decisions = _rows(conn, query, (*page_params, fetch_limit + 1))
             has_next = len(decisions) > fetch_limit
             decisions = decisions[:fetch_limit]
             decision_keys = {
