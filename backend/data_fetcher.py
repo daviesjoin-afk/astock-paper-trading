@@ -57,6 +57,19 @@ def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
 
 
+def cached_age_seconds(key):
+    """Read provider-cache age without extending its lifetime or fetching data."""
+    with _cache_lock:
+        entry = _mem_cache.get(key)
+    if entry is None:
+        return None
+    try:
+        age = time.time() - float(entry[0])
+    except (TypeError, ValueError, IndexError):
+        return float("inf")
+    return age if 0 <= age < float("inf") else float("inf")
+
+
 _full_snapshot_lock_context = threading.local()
 
 
