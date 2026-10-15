@@ -121,6 +121,57 @@ class RiskAuditPaginationTests(unittest.TestCase):
         self.assertEqual(outside["alerts"], [])
         self.assertEqual(outside["pagination"]["total"], 0)
 
+    def test_backdated_insert_does_not_break_id_ordered_cursor(self):
+        self._seed([
+            ("sector_rotation", "600001", "entry_approved", "2026-10-15"),
+            ("sector_rotation", "600002", "entry_approved", "2026-10-13"),
+            ("sector_rotation", "600003", "entry_approved", "2026-10-14"),
+        ])
+        seen, cursor = [], None
+        for _ in range(4):
+            result = PT.risk_audit(page_size=1, cursor=cursor)
+            seen.extend(row["code"] for row in result["alerts"])
+            cursor = result["pagination"].get("next_cursor")
+            if not cursor:
+                break
+        self.assertEqual(["600003", "600002", "600001"], seen)
+
+    def test_filtered_total_is_stable_across_cursor_pages(self):
+        self._seed([("sector_rotation", f"6001{i:02d}", "filled", "2026-10-15")
+                    for i in range(5)])
+        first = PT.risk_audit(page_size=2, level="tightened")
+        second = PT.risk_audit(page_size=2, level="tightened",
+                               cursor=first["pagination"]["next_cursor"])
+        self.assertEqual(5, second["pagination"]["total"])
+        self.assertEqual(3, second["pagination"]["total_pages"])
+
+    def test_exactly_full_last_page_has_no_next_cursor(self):
+        self._seed([("sector_rotation", f"6001{i:02d}", "filled", "2026-10-15")
+                    for i in range(4)])
+        first = PT.risk_audit(page_size=2)
+        second = PT.risk_audit(page_size=2, cursor=first["pagination"]["next_cursor"])
+        self.assertEqual(2, len(second["alerts"]))
+        self.assertFalse(second["pagination"]["has_next"])
+        self.assertIsNone(second["pagination"].get("next_cursor"))
+
+    def test_concurrent_new_row_does_not_repeat_on_next_page(self):
+        self._seed([("sector_rotation", f"6001{i:02d}", "filled", "2026-10-15")
+                    for i in range(4)])
+        first = PT.risk_audit(page_size=2)
+        self._seed([("sector_rotation", "600999", "filled", "2026-10-12")])
+        second = PT.risk_audit(page_size=2, cursor=first["pagination"]["next_cursor"])
+        ids = [a["id"] for page in (first, second) for a in page["alerts"]]
+        self.assertEqual(4, len(set(ids)))
+        self.assertNotIn("600999", [a["code"] for a in second["alerts"]])
+
+    def test_invalid_date_and_out_of_range_cursor_are_rejected(self):
+        for day in ("2026-02-30", "2026-13-01", "not-a-date"):
+            with self.subTest(date=day), self.assertRaises(ValueError):
+                PT.risk_audit(date=day)
+        for cursor in ("0", str(2**63), "9" * 60):
+            with self.subTest(cursor=cursor), self.assertRaises(ValueError):
+                PT.risk_audit(cursor=cursor)
+
     def test_level_filter_matches_the_projected_value(self):
         self._seed([
             ("sector_rotation", "600001", "filled", "2026-10-15"),

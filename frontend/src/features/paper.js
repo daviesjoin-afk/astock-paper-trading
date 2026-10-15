@@ -5,7 +5,7 @@ import { $, chart, tableScroll } from "../core/dom.js";
 import { adaptiveEsc, cny, fmt, paperStatusTag, pctCls, pctTxt, riskText, zhRiskText } from "../core/format.js";
 import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
-import { renderPaperAudit } from "./risk.js";
+import { loadPaperAudit } from "./risk.js";
 import { renderSignalAuditTable } from "./signal-audit-table.js";
 import { openInStrategyWorkbench, wbStatusBadge } from "./strategies.js";
 import { toast, inlineError, confirmDialog } from "../ui/dialog.js";
@@ -729,7 +729,7 @@ export async function loadPaper(options){
     // immediately so it can read in parallel with the larger dashboard DOM
     // render instead of extending every browser refresh serially.
     var auditRequest = variant==='activity'
-      ? api('/api/paper/risk-audit?limit=160')
+      ? api('/api/paper/risk-audit?page_size=50').then(function(data){return {data:data};},function(error){return {error:error};})
       : null;
     var overviewQuery=[];
     if(options.refresh) overviewQuery.push('refresh=1');
@@ -859,16 +859,12 @@ export async function renderPaperDashboard(d,auditRequest){
         // The shared overview request may have started while another tab was
         // active, in which case auditRequest is null.  Fetch it now instead of
         // awaiting null and passing that value into renderPaperAudit().
-        var auditDashboard=auditRequest||window._paperAuditCache;
-        if(!auditDashboard){
-          auditDashboard=await api('/api/paper/risk-audit?limit=160');
-          window._paperAuditCache=auditDashboard;
-        }
         var auditBoard=$('paperActivityBoard');
         if(auditBoard){
           // loadPaper() may overlap after a fast refresh/navigation. Keep one audit section.
-          auditBoard.querySelectorAll('.paper-risk-audit-section').forEach(function(node){node.remove();});
-          auditBoard.insertAdjacentHTML('beforeend',renderPaperAudit(auditDashboard));
+          auditBoard.querySelectorAll('#paperRiskAuditHost,.paper-risk-audit-section').forEach(function(node){node.remove();});
+          auditBoard.insertAdjacentHTML('beforeend','<div id="paperRiskAuditHost"></div>');
+          await loadPaperAudit('current',auditRequest);
         }
       }catch(e){
         if($('paperActivityBoard')) $('paperActivityBoard').insertAdjacentHTML('beforeend','<div class="paper-terminal-section"><div class="banner">风控审计记录读取失败：'+riskText(e.message||e)+'</div></div>');

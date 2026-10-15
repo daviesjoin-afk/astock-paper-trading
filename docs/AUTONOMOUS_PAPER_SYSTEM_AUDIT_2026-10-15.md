@@ -81,6 +81,8 @@
 - 后续样本表已累积到 110,812 行，最新记录为 10-13；本轮没有重新构建这批样本，因此不能把旧清单的 0 外推为“今天仍然没有任何可用样本”。同样不能把新增行数直接视为合格训练数据。
 - 学习评估清单为 0 行；实验验证权威表尚未创建；策略候选、生成批次、实验搜索、标准影子运行及影子比较表均为 0 行。
 
+补充说明：`experiment_validation_runs` 的建表定义及读写执行器已经存在，写入端点会创建它。现有库没有该表，只能证明本次未找到已持久化的验证运行；不能据此认定模块缺失，也不能单凭它尚未进入启动迁移就认定初始化必然有缺陷。本轮不为使空表出现而迁移数据库。
+
 主要代码：[历史成员](../backend/historical_universe_archive.py)、[学习数据契约](../backend/learning_dataset.py)、[学习评价](../backend/learning_evaluation.py)、[候选历史验证执行器](../backend/candidate_experiment_service.py)、[候选稳健性执行器](../backend/candidate_robustness_service.py)。这些执行器已经存在，应首先接通和验证，而非另建一套。
 
 ### E06：AI 与进化“功能存在”尚未转化成近期有效结果

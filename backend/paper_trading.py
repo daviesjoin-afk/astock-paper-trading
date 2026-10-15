@@ -14812,7 +14812,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
     """轻量风控审计流：只读取账本，不请求行情或重建风控快照。
 
     过滤与分页全部下推到 SQL。``account_id`` / ``level`` / ``date`` 在查询层生效，
-    翻页用稳定游标：``cursor`` 形如 ``<created_at>|<id>``（或仅 ``<id>``），
+    翻页用稳定游标：``cursor`` 为账本 ID（兼容旧 ``<created_at>|<id>``），
     按 ``id DESC`` 严格递减推进，因此页与页之间不会重复或漏项。
 
     ``limit`` 保持旧语义 —— 未显式传 ``page_size`` 时的行数上限，兼容
@@ -14839,23 +14839,32 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
         cursor = str(cursor).strip()
         if not cursor:
             cursor = None
-    if date and len(date) != 10:
-        raise ValueError("date_must_be_iso_day")
+    if date:
+        try:
+            if len(date) != 10:
+                raise ValueError
+            day = dt.date.fromisoformat(date)
+            if day == dt.date.max:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("date_must_be_iso_day") from exc
     if cursor is not None:
         parts = cursor.split("|")
         if len(parts) == 1:
             if not parts[0].isdecimal():
                 raise ValueError("invalid_cursor")
-            cursor_id, cursor_created_at = int(parts[0]), None
+            cursor_id = int(parts[0])
         elif len(parts) == 2:
-            cursor_created_at, raw_id = parts
-            if not raw_id.isdecimal() or not cursor_created_at:
+            legacy_time, raw_id = parts
+            if not raw_id.isdecimal() or not legacy_time:
                 raise ValueError("invalid_cursor")
             cursor_id = int(raw_id)
         else:
             raise ValueError("invalid_cursor")
+        if not 0 < cursor_id <= 2**63 - 1:
+            raise ValueError("invalid_cursor")
     else:
-        cursor_id, cursor_created_at = None, None
+        cursor_id = None
     tightened = None
     tightened_outcomes = ("filled", "exit_pending_data")
     if level:
@@ -14871,8 +14880,8 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
         where.append("account_id=?")
         params.append(account_id)
     if date:
-        where.append("substr(created_at,1,10)=?")
-        params.append(date)
+        where.append("created_at>=? AND created_at<?")
+        params.extend((date, (day + dt.timedelta(days=1)).isoformat()))
     if tightened is not None:
         # level 是投影派生值：filled / exit_pending_data → tightened，其余 → watch。
         if tightened:
@@ -14883,14 +14892,9 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
             marks = ",".join("?" for _ in tightened_outcomes)
             where.append(f"(decision IS NULL OR decision NOT IN ({marks}))")
             params.extend(tightened_outcomes)
-    if cursor_id is not None:
-        if cursor_created_at is not None:
-            where.append("(created_at < ? OR (created_at = ? AND id < ?))")
-            params.extend((cursor_created_at, cursor_created_at, cursor_id))
-        else:
-            where.append("id < ?")
-            params.append(cursor_id)
     where_sql = " AND ".join(where)
+    page_where = where_sql + (" AND id < ?" if cursor_id is not None else "")
+    page_params = (*params, cursor_id) if cursor_id is not None else tuple(params)
     # This endpoint is a pure read model.  Calling init_db() here used to run
     # migrations, stale-task recovery, lock deletion and shared-cash repair in
     # the middle of a browser request.  It could therefore mutate the ledger
@@ -14914,10 +14918,12 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
             decisions = _rows(
                 conn,
                 f"""SELECT id,account_id,code,side,decision,reason,payload,created_at
-                    FROM paper_risk_decisions WHERE {where_sql}
+                    FROM paper_risk_decisions WHERE {page_where}
                     ORDER BY id DESC LIMIT ?""",
-                (*params, fetch_limit),
+                (*page_params, fetch_limit + 1),
             )
+            has_next = len(decisions) > fetch_limit
+            decisions = decisions[:fetch_limit]
             decision_keys = {
                 (str(row.get("account_id") or ""), str(row.get("code") or ""))
                 for row in decisions if row.get("code")
@@ -15069,10 +15075,10 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
             } if linked else None),
         })
     next_cursor = None
-    if len(decisions) == fetch_limit:
-        # 只有取满一页才可能存在下一页；用本页最后一行作游标，交由调用方带回。
+    if has_next:
+        # 与 ORDER BY id DESC 使用同一排序键；补写时间不能改变游标推进顺序。
         last = decisions[-1]
-        next_cursor = f"{last.get('created_at')}|{last.get('id')}"
+        next_cursor = str(last["id"])
     pagination = {
         "page_size": fetch_limit, "total": total,
         "total_pages": (total + fetch_limit - 1) // fetch_limit,
