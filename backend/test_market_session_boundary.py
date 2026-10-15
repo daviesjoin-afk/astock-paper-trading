@@ -185,8 +185,10 @@ class FactorReadinessTests(unittest.TestCase):
             data[i]["amount"] = value
         frame = pd.DataFrame({"last_date": NOW.date().isoformat(), "amount": 123.}, index=[r["code"] for r in data])
         reading = C.classify(snapshot(data, True), C.CLOSE_SNAPSHOT_POLICY, now=NOW)
+        stale_flows = [dict(data[0], quote_at=(CLOSE-dt.timedelta(days=1)).isoformat(), super_net=999.)]
         def build(price, fund, *args, **kwargs):
             self.assertTrue(fund.index.is_unique)
+            self.assertEqual({}, kwargs["realtime_super_flow"])
             self.assertEqual(0., price.iloc[0]["amount"])
             self.assertTrue(price.iloc[1:5]["amount"].eq(123.).all())
             self.assertTrue(pd.isna(price.iloc[5]["amount"]))
@@ -204,7 +206,9 @@ class FactorReadinessTests(unittest.TestCase):
                 mock.patch.object(M, "_load_selection_base", return_value=(frame,set(),{"state":"ready"})), \
                 mock.patch.object(M.MDSvc, "read_snapshot", return_value=reading), \
                 mock.patch.object(M.MDSvc, "refresh_rows", side_effect=AssertionError("valid close should be read only")), \
-                mock.patch.object(M, "_load_super_flow", return_value=data), \
+                mock.patch.object(M, "_load_super_flow", return_value=stale_flows), \
+                mock.patch.object(M, "_schedule_super_flow_refresh") as queue, \
+                mock.patch.object(M, "_refresh_super_flow") as refresh, \
                 mock.patch.dict(M._LIVE_CACHE, finance={"data":{"known":{}},"report_dates":[]}, sentiment={"known":1}), \
                 mock.patch.object(M.S, "build_factor_table", side_effect=build), \
                 mock.patch.object(M.S, "run_strategy", return_value={"picks":[]}):
@@ -212,6 +216,8 @@ class FactorReadinessTests(unittest.TestCase):
         self.assertFalse(result.get("need_init"), result.get("message"))
         self.assertEqual("close_snapshot", result["data_quality"]["quote_policy"])
         self.assertEqual(4000, result["data_quality"]["live_quote_coverage"])
+        queue.assert_called_once_with(topn=4000)
+        refresh.assert_not_called()
 
     def test_universe_publication_invalidates_the_factor_readiness_signature(self):
         with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 1)):
