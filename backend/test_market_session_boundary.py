@@ -209,7 +209,11 @@ class FactorReadinessTests(unittest.TestCase):
                 mock.patch.object(M, "_load_super_flow", return_value=stale_flows), \
                 mock.patch.object(M, "_schedule_super_flow_refresh") as queue, \
                 mock.patch.object(M, "_refresh_super_flow") as refresh, \
-                mock.patch.dict(M._LIVE_CACHE, finance={"data":{"known":{}},"report_dates":[]}, sentiment={"known":1}), \
+                mock.patch.dict(M._LIVE_CACHE, finance={"data":{},"report_dates":[]}, sentiment={}), \
+                mock.patch.dict(M._SELECTION_CONTEXT_STATE, {key:{"refreshing":False,"retry_at":0.} for key in ("finance","sentiment")}), \
+                mock.patch.object(M.threading, "Thread") as workers, \
+                mock.patch.object(M.dfc, "fetch_finance_latest") as finance, \
+                mock.patch.object(M.F, "compute_sentiment_factors") as sentiment, \
                 mock.patch.object(M.S, "build_factor_table", side_effect=build), \
                 mock.patch.object(M.S, "run_strategy", return_value={"picks":[]}):
             result = M._select_uncached(strategy="three_day", topn=10)
@@ -218,6 +222,9 @@ class FactorReadinessTests(unittest.TestCase):
         self.assertEqual(4000, result["data_quality"]["live_quote_coverage"])
         queue.assert_called_once_with(topn=4000)
         refresh.assert_not_called()
+        finance.assert_not_called()
+        sentiment.assert_not_called()
+        self.assertEqual(2, workers.call_count)
 
     def test_universe_publication_invalidates_the_factor_readiness_signature(self):
         with mock.patch.object(M, "_health_file_signature", side_effect=lambda p: (str(p), 1)):

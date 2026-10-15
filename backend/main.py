@@ -99,6 +99,13 @@ _LIVE_CACHE = {
     "news_hits": [],
     "indices": [],
 }
+_SELECTION_CONTEXT_LOCK = threading.Lock()
+_SELECTION_CONTEXT_STATE = {
+    key: {"refreshing": False, "retry_at": 0.0}
+    for key in ("finance", "sentiment")
+}
+_SELECTION_CONTEXT_VERSION = 0
+_SELECTION_CONTEXT_RETRY_SECONDS = 30
 
 
 def _health_file_signature(path):
@@ -360,11 +367,56 @@ def _load_selection_base(*, with_status=False):
         return (*result, dict(status)) if with_status else result
 
 
-def _warm_finance():
+def _context_has_data(key, value):
+    rows = value.get("data") if key == "finance" and isinstance(value, dict) else value
+    return isinstance(rows, dict) and bool(rows) and all(isinstance(row, dict) for row in rows.values())
+
+
+def _refresh_selection_context(key, loader):
+    global _SELECTION_CONTEXT_VERSION
     try:
-        _LIVE_CACHE["finance"] = dfc.fetch_finance_latest()
+        value = loader()
+        if not _context_has_data(key, value):
+            return
+        with _SELECTION_CONTEXT_LOCK:
+            _LIVE_CACHE[key] = value
+            _SELECTION_CONTEXT_VERSION += 1
+        # The generation also protects a result still being computed while
+        # this worker is waiting for the result lock.
+        with _SELECT_RESULT_LOCK:
+            _SELECT_RESULT_CACHE.clear()
     except Exception:
-        pass
+        return
+    finally:
+        with _SELECTION_CONTEXT_LOCK:
+            _SELECTION_CONTEXT_STATE[key].update(
+                refreshing=False, retry_at=time.monotonic() + _SELECTION_CONTEXT_RETRY_SECONDS)
+
+
+def _load_selection_context(key, loader):
+    """Return known context; cold reads never wait for a provider."""
+    should_refresh = False
+    with _SELECTION_CONTEXT_LOCK:
+        value = _LIVE_CACHE[key]
+        if _context_has_data(key, value):
+            return value
+        state = _SELECTION_CONTEXT_STATE[key]
+        now = time.monotonic()
+        if not state["refreshing"] and now >= state["retry_at"]:
+            state.update(refreshing=True, retry_at=now + _SELECTION_CONTEXT_RETRY_SECONDS)
+            should_refresh = True
+    if should_refresh:
+        try:
+            threading.Thread(target=_refresh_selection_context, args=(key, loader),
+                             name=f"selection-{key}-refresh", daemon=True).start()
+        except RuntimeError:
+            with _SELECTION_CONTEXT_LOCK:
+                _SELECTION_CONTEXT_STATE[key]["refreshing"] = False
+    return {"data": {}, "report_dates": []} if key == "finance" else {}
+
+
+def _warm_finance():
+    _load_selection_context("finance", dfc.fetch_finance_latest)
 
 
 def _update_live(key, fn):
@@ -378,8 +430,8 @@ def _warm_market_context():
     universe = U.load_universe()
     codes = {row["code"] for row in universe}
     names = {row["code"]: row["name"] for row in universe}
+    _load_selection_context("sentiment", lambda: F.compute_sentiment_factors(codes))
     jobs = [
-        ("sentiment", lambda: F.compute_sentiment_factors(codes)),
         ("gate", F.overseas_risk_gate),
         ("sector_flow", lambda: dfc.fetch_sector_flow("industry")),
         ("news_hits", lambda: F.news_keyword_scan(names)),
@@ -1400,13 +1452,7 @@ def _select_uncached(
             "need_init": True,
             "message": f"实时行情覆盖不足 {len(snap_f)}/{required_live}，已停止使用旧快照进行今日选股",
         }
-    finance = _LIVE_CACHE["finance"]
-    if not finance.get("data"):
-        try:
-            finance = dfc.fetch_finance_latest()
-        except Exception:
-            finance = {"data": {}, "report_dates": []}
-        _LIVE_CACHE["finance"] = finance
+    finance = _load_selection_context("finance", dfc.fetch_finance_latest)
     # 两套 cutoff 必须分开：``complete_cutoff`` 是"最近完整交易日"（盘中即昨天），
     # 只用于已收盘日线与财务披露；当日实时截面（PE/PB/换手/资金/行业）的决策时点
     # 是**现在**。混用会把盘中每一行都判成 future 并清空这些列。
@@ -1430,14 +1476,8 @@ def _select_uncached(
         if updates:
             values = pd.Series(updates)
             price_f.loc[values.index, target] = values.to_numpy()
-    sentiment = _LIVE_CACHE["sentiment"]
-    if not sentiment:
-        try:
-            sentiment = F.compute_sentiment_factors(eligible_codes)
-            if sentiment:
-                _LIVE_CACHE["sentiment"] = sentiment
-        except Exception:
-            sentiment = {}
+    sentiment = _load_selection_context(
+        "sentiment", lambda: F.compute_sentiment_factors(frozenset(eligible_codes)))
     # 实时资金流直接从同一份行情取（含 f62/f184），省去一次全市场排行抓取
     realtime_flow = {
         s["code"]: (
@@ -1551,7 +1591,8 @@ def select(
     topn: int = Query(10, ge=1, le=100),
 ):
     """Coalesce identical selection requests on small servers."""
-    key = (strategy, topn, _selection_signature(), _health_file_signature(_SUPER_FLOW_PATH))
+    key = (strategy, topn, _selection_signature(), _health_file_signature(_SUPER_FLOW_PATH),
+           _SELECTION_CONTEXT_VERSION)
     now = time.time()
     cached = _SELECT_RESULT_CACHE.get(key)
     if cached and now - cached["ts"] < _SELECT_RESULT_TTL_SECONDS:
