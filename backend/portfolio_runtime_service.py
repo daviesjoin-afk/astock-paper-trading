@@ -228,6 +228,7 @@ def _lifecycle_at(conn, strategy_id, version, checksum, decision_at):
     return str(event["to_state"]), str(event["created_at"]), event
 
 
+@PPRM.snapshot_read
 def _capture(conn, *, cycle_id: int, asof_day: str, decision_at: str,
              market_evidence_identity: str | None, market_reading=None,
              builtin_scope):

@@ -6049,15 +6049,24 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         )
         table["historical_factor_date"] = factor_date
     star_sector_impulse = _star_sector_impulse(universe, asof_date)
+    # Pull a column once rather than dispatching thousands of scalar pandas
+    # indexers. Preserve the existing path for non-unique axes.
+    unique_axes = table.index.is_unique and table.columns.is_unique
+    names = dict(table["name"].items()) if unique_axes and "name" in table else None
     eligible_codes = [
         code for code in table.index
         if _security_scope(
             code,
-            table.loc[code, "name"] if "name" in table else (base_universe.get(str(code)) or {}).get("name"),
+            (names[code] if names is not None else table.loc[code, "name"]) if "name" in table else (base_universe.get(str(code)) or {}).get("name"),
             (base_universe.get(str(code)) or {}).get("risk_flag"),
         )["allowed"]
     ]
     table = table.loc[eligible_codes].copy()
+    industries = dict(table["industry"].items()) if unique_axes and not table.empty else None
+    sector_keys = {
+        code: _sector_key(industries[code] if industries is not None else table.loc[code, "industry"])
+        for code in table.index
+    }
     # The paper execution path currently has no authoritative disclosure
     # timestamp for financial reports.  Keep profit values visible in the
     # candidate snapshot, but never pretend they are point-in-time proven.
@@ -6066,7 +6075,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     if "profit_source" in table:
         table["profit_source"] = table["profit_source"].fillna("unknown")
     table["star_sector_bonus"] = pd.Series({
-        code: _num((star_sector_impulse.get(_sector_key(table.loc[code, "industry"])) or {}).get("bonus"), 0.0)
+        code: _num((star_sector_impulse.get(sector_keys[code]) or {}).get("bonus"), 0.0)
         for code in table.index
     }).reindex(table.index).fillna(0.0)
     # 外部快照中的停牌/缺失值可能以 ``--`` 等字符串进入表格。策略比较前
@@ -6086,7 +6095,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         table["sector_heat_score"] = pd.Series(
             {
                 code: _num(
-                    (sector_heat.get(_sector_key(table.loc[code, "industry"])) or {}).get("score"),
+                    (sector_heat.get(sector_keys[code]) or {}).get("score"),
                     0.0,
                 )
                 for code in table.index
@@ -6095,7 +6104,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         table["sector_early_rotation"] = pd.Series(
             {
                 code: bool(
-                    (sector_heat.get(_sector_key(table.loc[code, "industry"])) or {}).get("early_rotation")
+                    (sector_heat.get(sector_keys[code]) or {}).get("early_rotation")
                 )
                 for code in table.index
             }
@@ -6103,7 +6112,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         table["sector_early_rotation_score"] = pd.Series(
             {
                 code: _num(
-                    (sector_heat.get(_sector_key(table.loc[code, "industry"])) or {}).get("early_rotation_score"),
+                    (sector_heat.get(sector_keys[code]) or {}).get("early_rotation_score"),
                     0.0,
                 )
                 for code in table.index
@@ -6116,7 +6125,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     if style == "sector":
         heat_values = pd.Series(
             {
-                code: _num((sector_heat.get(_sector_key(table.loc[code, "industry"])) or {}).get("score"), -1.5)
+                code: _num((sector_heat.get(sector_keys[code]) or {}).get("score"), -1.5)
                 for code in table.index
             }
         )
