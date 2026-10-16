@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -30,6 +31,7 @@ import market_data_contract as MDC
 import market_data_service as MDSvc
 import decision_engine as DE
 import factors as F
+import paper_candidate_inputs as PCI
 import strategies as S
 import universe as U
 import risk_center as RC
@@ -5823,7 +5825,8 @@ def ignition_shadow_report(asof_day=None, limit=200):
     }
 
 
-def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=None, live_asof_date=None):
+def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=None, live_asof_date=None,
+                    *, shared_inputs=None):
     """用完整历史因子排序，并用当日实时快照覆盖可变字段。
 
     ``asof_date`` 是历史因子截止日；``live_asof_date`` 允许盘中用当天
@@ -5981,8 +5984,11 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # ``universe`` 由当前 universe.json 与当日 live_map 组成，即**当前实时截面**：
     # 它的决策时点是现在，不是已收盘日线 cutoff。用 cutoff 判它会清空 PE/PB/
     # 换手/资金/行业（``build_factor_table`` 的 pct 正取自这里），直接打掉盘中扫描。
-    fund = F.compute_fundamental_factors(
-        universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
+    if shared_inputs is None:
+        fund = F.compute_fundamental_factors(
+            universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
+    else:
+        fund = shared_inputs.fundamentals(universe, finance, asof=finance_asof)
     live_flow = {
         str(code): row.get("main_pct")
         for code, row in live_map.items()
@@ -11269,6 +11275,53 @@ def _bootstrap_cooled_candidates(conn, account_id, candidates, day):
     }
 
 
+def _bootstrap_candidate_evidence(accounts, precomputed_candidates, day):
+    """Collect per-account news and one shared quote batch outside the writer."""
+    bootstrap_evidence = {}
+    for account in accounts:
+        precomputed = precomputed_candidates.get(account["id"], ([], {}))
+        if precomputed[1].get("blocked"):
+            continue
+        # 冷却过滤会决定最终候选集合，而冷却查询需要账本 —— 但它只读，因此用
+        # 只读连接在写事务之前完成，使「为哪些候选取证」与后面「实际审批哪些
+        # 候选」使用同一个集合。
+        with _db_readonly() as evidence_conn:
+            cooled = _bootstrap_cooled_candidates(
+                evidence_conn, account["id"], precomputed[0], day,
+            )
+        names = {pick["code"]: pick.get("name") or pick["code"]
+                 for pick in cooled["candidates"]}
+        try:
+            news = _news_for(names) if names else []
+        except Exception:
+            news = []
+        bootstrap_evidence[account["id"]] = {
+            "cooled": cooled, "names": names, "news": news,
+        }
+    # Collect the union before touching the writer. Quote envelopes still pass
+    # the existing independent-source and freshness checks; missing rows remain
+    # missing. Fetch quotes last so per-account news work cannot age them first.
+    quote_codes = list(dict.fromkeys(
+        code for evidence in bootstrap_evidence.values() for code in evidence["names"]
+    ))
+    try:
+        sector_flow = dfc.fetch_sector_flow("industry") if bootstrap_evidence else []
+    except Exception:
+        sector_flow = []
+    try:
+        quotes = (_quotes(quote_codes) or {}) if quote_codes else {}
+    except Exception:
+        quotes = {}
+    if not isinstance(quotes, dict):
+        quotes = {}
+    for evidence in bootstrap_evidence.values():
+        evidence["quotes"] = {
+            code: deepcopy(quotes[code]) for code in evidence["names"] if code in quotes
+        }
+        evidence["sector_flow"] = deepcopy(sector_flow)
+    return bootstrap_evidence
+
+
 @PTM.timed("candidate_bootstrap")
 def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intraday"):
     """用上一交易日的完整因子扫描当日候选；仓位数量不作为扫描门槛。
@@ -11332,11 +11385,13 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
         accounts = _active_account_rows(account_conn, status="running")
     precomputed_candidates = {}
     micro_codes = []
+    shared_inputs = PCI.CandidateScanInputs(F.live_snapshot_asof())
     for account in accounts:
         try:
             rows, meta = _candidate_rows(
                 account, factor_day, market, sector_rows=sector_rows,
                 live_universe=live_universe, live_asof_date=day,
+                shared_inputs=shared_inputs,
             )
         except Exception as exc:
             rows, meta = [], {"blocked": True, "reason": f"候选生成失败：{type(exc).__name__}: {exc}"}
@@ -11355,36 +11410,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # ``fetch_sector_flow`` 在 ``_db()`` 内被逐账户调用：那不仅让每个账户各付一次
     # 网络延迟（写锁被持有），而且一次慢源就能阻塞成交、风控退出与页面读取数分钟。
     # 证据按账户预取一次，写事务内只读这份快照。
-    bootstrap_evidence = {}
-    for account in accounts:
-        precomputed = precomputed_candidates.get(account["id"], ([], {}))
-        if precomputed[1].get("blocked"):
-            continue
-        # 冷却过滤会决定最终候选集合，而冷却查询需要账本 —— 但它只读，因此用
-        # 只读连接在写事务之前完成，使「为哪些候选取证」与后面「实际审批哪些
-        # 候选」使用同一个集合。
-        with _db_readonly() as evidence_conn:
-            cooled = _bootstrap_cooled_candidates(
-                evidence_conn, account["id"], precomputed[0], day,
-            )
-        names = {pick["code"]: pick.get("name") or pick["code"]
-                 for pick in cooled["candidates"]}
-        try:
-            quotes = _quotes(list(names)) if names else {}
-        except Exception:
-            quotes = {}
-        try:
-            news = _news_for(names) if names else []
-        except Exception:
-            news = []
-        try:
-            sector_flow = dfc.fetch_sector_flow("industry")
-        except Exception:
-            sector_flow = []
-        bootstrap_evidence[account["id"]] = {
-            "cooled": cooled, "names": names, "quotes": quotes,
-            "news": news, "sector_flow": sector_flow,
-        }
+    bootstrap_evidence = _bootstrap_candidate_evidence(accounts, precomputed_candidates, day)
     with _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
         for account in accounts:
