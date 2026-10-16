@@ -38,6 +38,7 @@ host:img.shields.io
 host:www.python.org
 host:docs.python.org
 # Public primary sources cited by the system audit; exact hosts only.
+host:pandas.pydata.org
 host:www.sqlite.org
 host:tracker.debian.org
 host:www.davidhbailey.com
