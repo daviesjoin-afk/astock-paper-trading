@@ -11,6 +11,7 @@ import marketdata_cache as MDC
 import marketdata_feeds as MDF
 import marketdata_normalizers as MN
 import marketdata_providers as MP
+import data_paths
 from marketdata_transport import (
     HEADERS,
     _session,
@@ -38,6 +39,7 @@ MARKET_SNAPSHOT_FULL_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_full.
 MARKET_SNAPSHOT_SAMPLE_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_sample_20.json")
 MARKET_SNAPSHOT_FULL_LOCK_PATH = MARKET_SNAPSHOT_FULL_CACHE_PATH + ".lock"
 DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
+FINANCE_CACHE_PATH = data_paths.data_path("finance_latest.json")
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
@@ -1247,10 +1249,12 @@ def fetch_finance_latest():
     # Serializing the existing cache check also coalesces concurrent misses.
     # Empty attempts wait briefly, rather than either retrying per strategy
     # or becoming a successful six-hour cache entry.
-    with _finance_fetch_lock:
-        return _cached("finance", 3600 * 6, _attempt) or {
-            "data": {}, "report_dates": [], "annual_report_date": None,
-        }
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, _finance_fetch_lock, "finance", FINANCE_CACHE_PATH,
+        3600 * 6, _attempt,
+        lambda value: isinstance(value, dict) and isinstance(value.get("data"), dict)
+        and any(isinstance(row, dict) and row for row in value["data"].values()),
+    ) or {"data": {}, "report_dates": [], "annual_report_date": None}
 
 def _fetch_finance_report(report_date):
     rows = []
