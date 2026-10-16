@@ -47,6 +47,7 @@ def phase(name):
         yield
         return
     started = time.perf_counter()
+    cpu_started = time.thread_time()
     failed = False
     try:
         yield
@@ -55,8 +56,12 @@ def phase(name):
         raise
     finally:
         elapsed = max(0.0, time.perf_counter() - started)
-        item = record.stages.setdefault(name, {"seconds": 0.0, "calls": 0, "errors": 0})
+        cpu_elapsed = max(0.0, time.thread_time() - cpu_started)
+        item = record.stages.setdefault(name, {
+            "seconds": 0.0, "thread_cpu_seconds": 0.0, "calls": 0, "errors": 0,
+        })
         item["seconds"] += elapsed
+        item["thread_cpu_seconds"] += cpu_elapsed
         item["calls"] += 1
         item["errors"] += int(failed)
 
@@ -81,7 +86,8 @@ def snapshot(scope):
         "scope": scope, "identity": dict(record.identity),
         "elapsed_seconds": round(max(0.0, time.perf_counter() - record.started), 6),
         "stages": {
-            name: {**value, "seconds": round(value["seconds"], 6)}
+            name: {**value, "seconds": round(value["seconds"], 6),
+                   "thread_cpu_seconds": round(value["thread_cpu_seconds"], 6)}
             for name, value in record.stages.items()
         },
     }
