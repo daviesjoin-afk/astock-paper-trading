@@ -51,7 +51,10 @@ from __future__ import annotations
 import datetime as dt
 import math
 import sqlite3
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
+from functools import cache, wraps
 from typing import Any, Mapping
 
 try:  # ``backend`` on sys.path (production and direct unittest runs)
@@ -112,6 +115,47 @@ _ORDER_COLUMNS = {
     "execution_status", "execution_verified", "realized_pnl", "executed_at",
     "amount", "fees",
 }
+
+# Only the synchronous, read-only runtime capture opens this scope. Never keep
+# it around allocation, order writes, commits, or another decision. SQLite's
+# explicit transaction pins the database view; no process-wide/TTL cache exists.
+_snapshot_reads = ContextVar("portfolio_snapshot_reads", default=None)
+
+
+def snapshot_read(func):
+    """Reuse bounded evidence during one pure capture in an explicit transaction."""
+    @wraps(func)
+    def capture(conn, *args, **kwargs):
+        if not conn.in_transaction:
+            return func(conn, *args, **kwargs)
+        token = _snapshot_reads.set((conn, conn.total_changes, {}))
+        try:
+            return func(conn, *args, **kwargs)
+        finally:
+            _snapshot_reads.reset(token)
+    return capture
+
+
+def _snapshot_evidence(func):
+    @wraps(func)
+    def read(conn, *args, **kwargs):
+        scope = _snapshot_reads.get()
+        if scope is None or scope[0] is not conn or not conn.in_transaction:
+            return func(conn, *args, **kwargs)
+        if scope[1] != conn.total_changes:
+            # Defensive invalidation if a caller unexpectedly writes locally.
+            scope = (conn, conn.total_changes, {})
+            _snapshot_reads.set(scope)
+        try:
+            hash((args, tuple(kwargs.items())))
+        except TypeError:
+            return func(conn, *args, **kwargs)
+        if func not in scope[2]:
+            scope[2][func] = cache(func)
+        # FIFO and consumers may mutate dictionaries/lists. Cache-owned evidence
+        # must never be handed out, including on the first lookup.
+        return deepcopy(scope[2][func](conn, *args, **kwargs))
+    return read
 
 
 def _num(value: Any, default: float | None = 0.0) -> float | None:
@@ -198,6 +242,7 @@ def _identity_ok(row: Mapping) -> bool:
     )
 
 
+@_snapshot_evidence
 def _columns(conn, table: str) -> set[str]:
     try:
         return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -214,6 +259,7 @@ class PortfolioReadUnavailable(RuntimeError):
     """Raised when a bounded portfolio read cannot prove a required fact."""
 
 
+@_snapshot_evidence
 def _cycle_is_archived(conn, context: PortfolioReadContext) -> bool:
     """Return whether the requested cycle's live ledger has been archived."""
     if _has_columns(conn, "paper_archives", {"cycle_id"}):
@@ -256,6 +302,7 @@ class PortfolioReadContext:
         object.__setattr__(self, "asof_day", _asof(self.asof_day))
 
 
+@_snapshot_evidence
 def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Return (proven rows, all rows, proof_available).
 
@@ -305,6 +352,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
     return proven, rows, True
 
 
+@_snapshot_evidence
 def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str | None = None):
     if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
         return [], False
@@ -331,6 +379,7 @@ def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str
     return bounded, proof
 
 
+@_snapshot_evidence
 def _all_filled_buy_orders(conn, context: PortfolioReadContext,
                            account_id: str | None = None):
     if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
@@ -358,6 +407,7 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
     return bounded, proof
 
 
+@_snapshot_evidence
 def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Return (verified rows, all rows, proof_available).
 
@@ -399,6 +449,7 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
     return proven, rows, True
 
 
+@_snapshot_evidence
 def _has_any_fill_rows(conn, context: PortfolioReadContext,
                        account_id: str | None = None) -> bool | None:
     """Return whether any fill exists up to as-of; ``None`` means unreadable."""
@@ -431,6 +482,7 @@ def _has_any_fill_rows(conn, context: PortfolioReadContext,
     return bool(row and row[0])
 
 
+@_snapshot_evidence
 def _unproven_sell_exists(conn, context: PortfolioReadContext,
                           account_id: str | None = None) -> bool:
     _proven, rows, proof_available = _sell_fills(conn, context, account_id)
@@ -684,6 +736,7 @@ def bounded_lots(conn, context: PortfolioReadContext, *, account_id: str | None 
     return [dict(row) for row in lots if int(row.get("remaining_qty") or 0) > 0]
 
 
+@_snapshot_evidence
 def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
                              account_id: str | None = None) -> tuple[list[dict], str]:
     """Return ``(lots, quantity_status)`` for an explicit context."""
@@ -767,6 +820,7 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
     return rebuilt, status
 
 
+@_snapshot_evidence
 def verified_cash_flows(conn, context: PortfolioReadContext, *,
                         account_id: str | None = None) -> dict:
     """Bounded cash-flow projection for display cost.
@@ -851,6 +905,7 @@ def positions_for_context(conn, context: PortfolioReadContext, *,
     )[0]
 
 
+@_snapshot_evidence
 def realized_pnl(conn, context: PortfolioReadContext, *,
                  account_id: str | None = None) -> tuple[float | None, str]:
     """Sum verified committed SELL realized PnL up to ``context.asof_day``."""
@@ -1000,6 +1055,7 @@ def account_attached_by_asof(conn, *, cycle_id: int, asof_day, account_id) -> bo
     return _account_attached_by(conn, context, account_id)
 
 
+@_snapshot_evidence
 def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Resolve cycle/account initial capital without reading current cash."""
     if account_id:
@@ -1106,6 +1162,7 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
     return total, STATUS_VERIFIED
 
 
+@_snapshot_evidence
 def cash(conn, context: PortfolioReadContext, *,
          account_id: str | None = None) -> tuple[float | None, str]:
     """Reconstruct bounded cash from the cycle declaration and verified fills."""

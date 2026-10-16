@@ -106,6 +106,102 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(context.cycle_id, self.cycle100)
         self.assertEqual(context.asof_day, DAY)
 
+    def test_snapshot_reuses_proof_without_changing_facts_or_mutable_results(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        self.conn.execute("BEGIN")
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+
+        def capture(conn):
+            first = P.portfolio_for_context(conn, context)
+            lots, status = P.bounded_lots_with_status(conn, context)
+            lots[0]["remaining_qty"] = -999
+            second, second_status = P.bounded_lots_with_status(conn, context)
+            self.assertEqual(second[0]["remaining_qty"], 100)
+            self.assertEqual(status, second_status)
+            return first, P.portfolio_for_context(conn, context)
+
+        statements = []
+        self.conn.set_trace_callback(statements.append)
+        expected = capture(self.conn)
+        uncached_count = len(statements)
+        statements.clear()
+        actual = P.snapshot_read(capture)(self.conn)
+        self.conn.set_trace_callback(None)
+        self.assertEqual(actual, expected)
+        self.assertLess(len(statements), uncached_count // 2)
+        self.assertIsNone(P._snapshot_reads.get())
+
+    def test_snapshot_next_capture_observes_new_fills_and_keeps_unknown_proof(self):
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+
+        @P.snapshot_read
+        def capture(conn):
+            return P.bounded_lots_with_status(conn, context)
+
+        self.conn.execute("BEGIN")
+        self.assertEqual(capture(self.conn), ([], P.STATUS_VERIFIED))
+        self._lot(self.cycle100, 100, 10.0)  # missing verified source
+        self.conn.commit()
+        self.conn.execute("BEGIN")
+        lots, status = capture(self.conn)
+        self.assertEqual(status, P.STATUS_UNKNOWN)
+        self.assertEqual(lots[0]["qty"], 100)
+        self.assertEqual(capture(self.conn),
+                         P.bounded_lots_with_status(self.conn, context))
+
+    def test_snapshot_bypasses_implicit_reads_and_cleans_up_after_failure(self):
+        calls = []
+
+        @P._snapshot_evidence
+        def evidence(conn):
+            calls.append(1)
+            return [len(calls)]
+
+        @P.snapshot_read
+        def capture(conn):
+            return evidence(conn), evidence(conn)
+
+        self.assertEqual(capture(self.conn), ([1], [2]))
+        self.conn.execute("BEGIN")
+        self.assertEqual(capture(self.conn), ([3], [3]))
+        self.assertEqual(capture(self.conn), ([4], [4]))
+
+        @P.snapshot_read
+        def broken(conn):
+            evidence(conn)
+            raise ValueError("capture failed")
+
+        with self.assertRaisesRegex(ValueError, "capture failed"):
+            broken(self.conn)
+        self.assertIsNone(P._snapshot_reads.get())
+        self.assertEqual(capture(self.conn), ([6], [6]))
+
+    def test_snapshot_invalidates_on_write_and_separates_connection_and_context(self):
+        other = sqlite3.connect(":memory:")
+        self.addCleanup(other.close)
+        calls = []
+
+        @P._snapshot_evidence
+        def evidence(conn, cycle, day):
+            calls.append(1)
+            return len(calls)
+
+        @P.snapshot_read
+        def capture(conn):
+            self.assertEqual(evidence(conn, 1, DAY), evidence(conn, 1, DAY))
+            self.assertNotEqual(evidence(conn, 1, DAY), evidence(conn, 2, DAY))
+            self.assertNotEqual(evidence(conn, 1, DAY), evidence(conn, 1, NEXT))
+            self.assertNotEqual(evidence(other, 1, DAY), evidence(other, 1, DAY))
+            before = evidence(conn, 1, DAY)
+            conn.execute("UPDATE paper_accounts SET name=name WHERE id=?", (ACCOUNT,))
+            self.assertNotEqual(before, evidence(conn, 1, DAY))
+
+        self.conn.execute("BEGIN")
+        capture(self.conn)
+
     def test_port1_explicit_cycle_owns_quantity(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())
