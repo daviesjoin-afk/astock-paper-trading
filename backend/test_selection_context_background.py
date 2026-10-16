@@ -1,4 +1,6 @@
 """Cold financial/sentiment context must not wait inside selection requests."""
+import os
+import tempfile
 import threading
 import unittest
 from contextlib import ExitStack
@@ -283,6 +285,9 @@ class FinancialProviderCacheTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.stack.enter_context(mock.patch.object(M.dfc, "FINANCE_CACHE_PATH",
+                                                  os.path.join(directory, "finance.json")))
         self.stack.enter_context(mock.patch.dict(M.dfc._mem_cache, {}, clear=True))
         self.stack.enter_context(mock.patch.dict(M.dfc._finance_fetch_state, {"retry_at": 0.}, clear=True))
         self.clock = self.stack.enter_context(mock.patch.object(M.dfc.time, "monotonic", return_value=100.))

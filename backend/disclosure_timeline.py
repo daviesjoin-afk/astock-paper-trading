@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+import disclosure_cache as DC
 from functools import lru_cache
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
@@ -335,7 +336,8 @@ def fetch_disclosure_timeline(
     fetched_at = _format_dt(_now())
     transport = request_json or _request_json
     with _CACHE_LOCK:
-        cache = _load_cache()
+        indexed = DC.load(CACHE_PATH, requested)
+        cache = indexed if indexed is not None else _load_cache()
     cached_rows = cache.get("rows") if isinstance(cache.get("rows"), Mapping) else {}
     output: dict[str, dict] = {}
     fresh_codes: list[str] = []
@@ -412,6 +414,7 @@ def fetch_disclosure_timeline(
     # Persist raw parsed-source rows, not the asof-filtered result, so a later
     # historical replay can reuse the same evidence without a network call.
     cache_changed = False
+    changed_rows = {}
     for code in fresh_codes:
         rows = rows_by_code.get(code, [])
         if batch_ok_by_code.get(code, True):
@@ -421,11 +424,15 @@ def fetch_disclosure_timeline(
                 "items": rows,
                 "ok": True,
             }
+            changed_rows[code] = cached_rows[code]
             cache_changed = True
     if cache_changed:
         cache_payload = {"version": 1, "updated_at": fetched_at, "rows": cached_rows}
         with _CACHE_LOCK:
-            _save_cache(cache_payload)
+            if indexed is not None:
+                DC.save(CACHE_PATH, changed_rows)
+            else:
+                _save_cache(cache_payload)
 
     for code in requested:
         if code not in output:

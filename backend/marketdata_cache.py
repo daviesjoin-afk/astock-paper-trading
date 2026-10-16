@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -60,6 +61,66 @@ def full_snapshot_singleflight_lock(thread_lock, lock_path):
                     _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_UN)
             finally:
                 lock_handle.close()
+
+
+def persistent_cached(cache, cache_lock, fetch_lock, key, path, ttl, fn, valid):
+    """Share a valid provider value across processes without restarting its TTL.
+
+    Use the existing thread/flock boundary, recheck after waiting, and publish
+    atomically. Read-only storage can still consume a fresh snapshot or fetch;
+    an empty/failed refresh neither renews nor overwrites old evidence.
+    """
+    def usable(stamp, value):
+        age = time.time() - float(stamp)
+        return math.isfinite(age) and 0 <= age < ttl and valid(value)
+
+    def remember(stamp, value):
+        with cache_lock:
+            if key not in cache and len(cache) >= MAX_CACHE_ENTRIES:
+                cache.pop(min(cache, key=lambda item: cache[item][0]), None)
+            cache[key] = (stamp, value)
+        return value
+
+    def memory():
+        with cache_lock:
+            entry = cache.get(key)
+            if entry is not None and usable(*entry):
+                return entry[1]
+        return None
+
+    value = memory()
+    if value is not None:
+        return value
+    with full_snapshot_singleflight_lock(fetch_lock, os.fspath(path) + ".lock"):
+        value = memory()
+        if value is not None:
+            return value
+        try:
+            with open(path, encoding="utf-8") as handle:
+                snapshot = json.load(handle)
+            stamp, value = snapshot["fetched_epoch"], snapshot["value"]
+            if snapshot.get("version") == 1 and usable(stamp, value):
+                return remember(stamp, value)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        stamp = time.time()  # Keep the original query-start age, not publication time.
+        value = fn()
+        if value and valid(value):
+            temporary = os.fspath(path) + "." + uuid.uuid4().hex + ".tmp"
+            try:
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"version": 1, "fetched_epoch": stamp, "value": value},
+                                            ensure_ascii=False, allow_nan=False))
+                os.replace(temporary, path)
+            except (OSError, TypeError, ValueError):
+                pass
+            finally:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            return remember(stamp, value)
+        return value
 
 
 def save_source_health(path, payload):
