@@ -170,3 +170,20 @@ flowchart LR
 风控历史按账本 ID 严格递减推进，过滤与总数在数据库查询层处理，日期采用范围条件；读取额外一行判断是否还有下一页。保留旧 `时间|ID` 游标的读取兼容，但不再让事件时间与 ID 两套排序混用，补写历史时间也不会漏行或重复。前端按日期、策略、实际可展示等级请求全历史，并使用上一页/下一页按钮；首次加载等待预取结果，查询竞态只允许最后一次请求更新当前容器。此项只改读取和展示，不改变风险决策、委托与账本事实。
 
 真实账本只读验收又发现：无匹配日期的查询约 49 秒，查询计划为按主键顺序扫描整张宽表。复用 SQLite 的物化公用表表达式，仅从现有覆盖索引筛选 ID、排序并限制页大小，再按主键读取本页大字段；不指定索引名、不新增索引、不迁移数据库。无过滤的最近记录保持原主键快路径。参考 [SQLite 覆盖索引](https://www.sqlite.org/queryplanner.html#covering_indexes) 与 [物化查询说明](https://www.sqlite.org/lang_with.html#materialization_hints)；回归验证查询计划以及缺少可选索引时的正确性。
+
+## 全轮任务分段计时（2026-10-16）
+
+复用标准库 `perf_counter`、`ContextVar` 和原有任务详情，不引入额外服务、数据库表或监控框架。`paper_runner` 在导入引擎前开始计时；直接调用 `run_slot` 则从该入口开始。每次调用生成诊断用 `attempt_id`，与现有业务日期、任务表和盘中 `run_key` 关联；这个标识不参与租约、幂等键或交易判断。
+
+- `initialization` / `preflight`：初始化、过期清理与分发准备；`engine_import` 仅 runner 路径可见。
+- `source_health` / `market_snapshot` 及各自的 `recovery`：主探活与主行情取数、失败后的第二次尝试。
+- `candidate_bootstrap` / `open_execution` / `risk_pass` / `market_context` / `position_quotes`：各业务边界的耗时及调用次数。
+- `risk_snapshot`：请求后台快照并有界等待落地的耗时；包含后台工作与等待，不能据此细分后台 SQL 或网络。
+- `db_acquire`：连接、PRAGMA 准备及 `BEGIN IMMEDIATE` 等待，不等于纯锁等待；`db_transaction_body` 包含连接块内的 Python 与 SQL，不等于 SQL 执行耗时；`db_commit` 包含原有提交重试及退避。计时不改变连接、提交、回滚和重试规则。
+- 主机脚本沿用相同的 `paper-scan.lock` 和原有 20 秒/不等待政策，记录其等待秒数（Bash 一秒精度）。未取得锁仍返回原退出码，并输出 `paper_host_lock` 诊断；成功后的锁一直保留到 Docker 命令结束。外层 cron 的时段锁等待、Docker 启动耗时不包含在这个数值内；手工调用缺此信息时保持未知。
+
+成功或失败任务的原有 `detail.timing` 保存完成状态写入**之前**的快照，明确标记 `scope=before_job_finalize` 或 `before_failure_finalize`。最终的提交、释放租约及 runner 重试成本由调度日志中的一条 `event=paper_slot_timing / scope=finished` 记录，不为补写计时再开一个写事务。正常结果也附带计时；已完成任务再次调用生成新的诊断标识，同时保留原任务详情，仍不会重复执行。
+
+所有阶段均为包含子阶段的累计耗时，**不能相加作为总耗时**；`calls` 是该函数边界的调用次数，不是假定的 HTTP 请求数量。未出现的阶段是未观测，不能自动解释为零耗时。后台线程不隐式继承调用者上下文，本轮不宣称已覆盖线程池中的逐次 HTTP/SQL。计时只收集固定阶段名、次数、耗时与任务标识，不增加 SQL、地址、行情正文或异常正文日志。输出故障不改变交易异常或调度退出码。
+
+本步用于定位全轮瓶颈，不预先声称扫描已经提速。验收包括临时真实 SQLite 的提交/回滚、写锁等待、正常与失败任务的详情关联、重复任务不重跑，以及 Linux 下主机锁的并发与命令退出码。
