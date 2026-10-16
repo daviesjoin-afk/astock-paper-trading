@@ -14,5 +14,18 @@ lock_options=(-w 20)
 if [[ "$slot" == "fast-entry" ]]; then
   lock_options=(-n)
 fi
-exec flock "${lock_options[@]}" "$lock_dir/paper-scan.lock" \
-  docker exec astock-paper-worker python backend/paper_runner.py --slot "$slot"
+# Keep the same lock for the complete Docker invocation. SECONDS is Bash's
+# elapsed timer (one-second resolution); do not confuse this inner lock with
+# the outer cron slot lock or Docker/Python startup time.
+exec 9>"$lock_dir/paper-scan.lock"
+SECONDS=0
+if flock "${lock_options[@]}" 9; then
+  host_wait="$SECONDS"
+else
+  result=$?
+  printf '{"event":"paper_host_lock","status":"not_acquired","wait_seconds":%s,"exit_code":%s}\n' \
+    "$SECONDS" "$result" >&2
+  exit "$result"
+fi
+exec docker exec --env "ASTOCK_PAPER_HOST_LOCK_WAIT_SECONDS=$host_wait" \
+  astock-paper-worker python backend/paper_runner.py --slot "$slot"

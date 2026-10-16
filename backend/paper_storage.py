@@ -12,6 +12,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+import paper_timing as PTM
+
 
 def is_sqlite_busy_error(exc: Exception) -> bool:
     """Check whether an exception represents an SQLite busy / locked condition.
@@ -54,19 +56,21 @@ def db(db_path, immediate=False, hot_path=False):
     """获取数据库连接并保证事务在关闭前明确提交或回滚。"""
     timeout = 1.0 if hot_path else 120.0
     busy_timeout_ms = 800 if hot_path else 60000
-    conn = sqlite3.connect(db_path, timeout=timeout)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-32000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
-    if immediate:
-        conn.execute("BEGIN IMMEDIATE")
+    with PTM.phase("db_acquire"):
+        conn = sqlite3.connect(db_path, timeout=timeout)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-32000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
+        if immediate:
+            conn.execute("BEGIN IMMEDIATE")
     try:
-        yield conn
+        with PTM.phase("db_transaction_body"):
+            yield conn
     except Exception:
         # 异常退出：回滚本事务块内尚未提交的写入，避免脏数据残留。
         try:
@@ -76,25 +80,26 @@ def db(db_path, immediate=False, hot_path=False):
         raise
     else:
         # 正常退出：提交本事务块内的全部写入。
-        try:
-            conn.commit()
-        except sqlite3.OperationalError as exc:
-            if is_sqlite_busy_error(exc):
-                # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
-                # 不能让 close() 对半提交状态做隐式处理。
-                time.sleep(sqlite_busy_backoff(0, hot_path=hot_path))
-                try:
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
+        with PTM.phase("db_commit"):
+            try:
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                if is_sqlite_busy_error(exc):
+                    # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
+                    # 不能让 close() 对半提交状态做隐式处理。
+                    time.sleep(sqlite_busy_backoff(0, hot_path=hot_path))
+                    try:
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                else:
+                    # 非锁类提交失败：显式回滚，保证连接关闭前状态确定。
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     raise
-            else:
-                # 非锁类提交失败：显式回滚，保证连接关闭前状态确定。
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                raise
     finally:
         conn.close()
 

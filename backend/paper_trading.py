@@ -47,6 +47,7 @@ def _get_se():
 
 
 import paper_storage as PST
+import paper_timing as PTM
 import paper_position_read_model as PPRM
 import paper_portfolio_read_model as PPort
 import paper_position_risk_state as PPRS
@@ -1857,6 +1858,7 @@ def _ensure_ignition_shadow_table(conn):
     return PSM.ensure_ignition_shadow_table(conn)
 
 
+@PTM.timed("initialization")
 def init_db():
     global _RUNNER_BOOT_RECOVERED
     """创建独立账本。不会启动任务、不会请求行情。"""
@@ -3856,6 +3858,9 @@ def _execution_quote_status(quote, asof_date, purpose="entry", *, reference_at=N
         quote, asof_date, purpose=purpose, quote_fresh=_quote_is_fresh,
         reference_at=reference_at,
     )
+
+
+@PTM.timed("market_context")
 def _market_state(asof_date, live_universe=None, *, allow_network=True):
     """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。"""
     # 盘中市场宽度必须使用同一轮全市场实时快照，不能读取可能滞后数日的
@@ -5706,6 +5711,7 @@ def _ignition_shadow_store(rows):
         pass  # 影子记录绝不影响主链路
 
 
+@PTM.timed("shadow_backfill")
 def _ignition_shadow_backfill(asof_day=None, quote_fetch=None):
     """回填影子记录的 +30/+60 分钟表现，供两规则命中后对比。
 
@@ -6572,6 +6578,7 @@ def _parse_quote_timestamp(value):
     return None
 
 
+@PTM.timed("position_quotes")
 def _quotes(codes, asof_date=None):
     """小批量实时查询失败时回退至本地快照，调用方仍会标记数据时效限制。"""
     codes = [str(code) for code in (codes or []) if str(code)]
@@ -7721,6 +7728,7 @@ def _signal_approval(
     return (not flags), "；".join(flags), decision, market_policy, evidence
 
 
+@PTM.timed("signal_generation")
 def generate_signals(asof_date=None):
     """15:05 盘后任务：生成次交易日有效的待审批信号。"""
     init_db()
@@ -10434,6 +10442,7 @@ def process_pending_manual_orders(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+@PTM.timed("pending_execution")
 def process_pending_execution_orders(asof_date=None):
     """Resume persisted non-manual working orders using a newly fetched quote.
 
@@ -10545,6 +10554,7 @@ def process_pending_execution_orders(asof_date=None):
     return output
 
 
+@PTM.timed("open_execution")
 def execute_open(asof_date=None):
     """09:31 开盘审批：先复核共享开盘事件，再查询待执行候选。"""
     init_db()
@@ -10977,6 +10987,7 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
 
 
 
+@PTM.timed("risk_pass")
 def monitor_risk(asof_date=None):
     """Run risk monitoring with a durable, cycle-owned scan identity.
 
@@ -11249,6 +11260,7 @@ def _bootstrap_cooled_candidates(conn, account_id, candidates, day):
     }
 
 
+@PTM.timed("candidate_bootstrap")
 def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intraday"):
     """用上一交易日的完整因子扫描当日候选；仓位数量不作为扫描门槛。
 
@@ -12596,6 +12608,7 @@ def _live_scan_gate(live_universe, expected_day):
     }
 
 
+@PTM.timed("fast_entry_scan")
 def monitor_fast_entries(asof_datetime=None, force=False):
     """每 30 秒复核少量候选；只确认并排队，不直接创建委托。"""
     init_db()
@@ -12776,6 +12789,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
             _clear_lease_context()
 
 
+@PTM.timed("intraday_scan")
 def monitor_intraday(asof_datetime=None, force=False):
     """每三分钟观察库存；09:30/09:31/13:00 先执行共享开盘事件扫描。"""
     init_db()
@@ -12798,31 +12812,35 @@ def monitor_intraday(asof_datetime=None, force=False):
     # 每轮 3 分钟扫描先做轻量数据源探活；失败时 data_fetcher 会关闭连接池、
     # 清空熔断状态并轮换东方财富/腾讯重试，随后本轮仍使用可用源继续执行。
     try:
-        data_source_health = dfc.check_data_source_health(force=True)
+        with PTM.phase("source_health"):
+            data_source_health = dfc.check_data_source_health(force=True)
     except Exception as exc:
         data_source_health = {
             "healthy": False, "reconnected": False, "attempts": 0,
             "action": f"健康检查异常：{type(exc).__name__}: {exc}",
         }
     # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
-    live_universe = _validated_live_universe(
-        MDSvc.refresh_rows(), day, max_quote_age_minutes=20,
-    )
+    with PTM.phase("market_snapshot"):
+        live_universe = _validated_live_universe(
+            MDSvc.refresh_rows(), day, max_quote_age_minutes=20,
+        )
     # A non-empty but partial response is a dangerous failure mode: it looks
     # normal in a UI but silently narrows the market scan.  Force one source
     # recovery/refresh before refusing only the candidate scan for this round.
     if len(live_universe) < 1000:
         try:
-            data_source_health = dfc.check_data_source_health(force=True)
+            with PTM.phase("source_health_recovery"):
+                data_source_health = dfc.check_data_source_health(force=True)
         except Exception as exc:
             data_source_health = {
                 "healthy": False, "reconnected": False, "attempts": 0,
                 "action": f"二次重连异常：{type(exc).__name__}: {exc}",
             }
         try:
-            live_universe = _validated_live_universe(
-                MDSvc.refresh_rows(force=True), day, max_quote_age_minutes=20,
-            )
+            with PTM.phase("market_snapshot_recovery"):
+                live_universe = _validated_live_universe(
+                    MDSvc.refresh_rows(force=True), day, max_quote_age_minutes=20,
+                )
         except Exception:
             live_universe = []
     live_gate = _live_scan_gate(live_universe, day)
@@ -13319,6 +13337,7 @@ def _release_runtime_lease(conn, lock_key, owner_key, fencing_token=None):
 
 
 
+@PTM.timed("daily_cleanup")
 def _cleanup_stale_data():
     """归档过期数据（供自进化学习），并清理活跃表。
 
@@ -13478,16 +13497,18 @@ def _hot_path_slot_context(func):
     return wrapper
 
 
+@PTM.traced_slot
 @_hot_path_slot_context
 def run_slot(slot, asof_date=None, force=False):
     """统一幂等入口；计划任务和页面的“立即检查”都使用同一事务键。"""
     PSS.validate_slot(slot)
     init_db()
-    PSS.run_preflight(
-        db_factory=_db,
-        audit=_audit,
-        resolve_asof_day=lambda: _date(asof_date),
-    )
+    with PTM.phase("preflight"):
+        PSS.run_preflight(
+            db_factory=_db,
+            audit=_audit,
+            resolve_asof_day=lambda: _date(asof_date),
+        )
     day = _date(asof_date)
     return _run_slot_impl(slot, day=day, force=force)
 
@@ -13515,6 +13536,8 @@ def _run_slot_impl(slot, day, force=False):
         return {"status": "skipped", "slot": slot, "reason": "非交易工作日"}
     run_asof = dt.datetime.now()
     intraday_key = _intraday_business_key(run_asof) if slot == "intraday" else None
+    PTM.bind_job(market_date=day.isoformat(), run_key=intraday_key,
+                 job_table="paper_job_runs" if intraday_key else "paper_jobs")
     hot_path = _is_hot_path_slot(slot)
     max_auto_retries = 2
     retry_count = 0
@@ -13607,9 +13630,10 @@ def _run_slot_impl(slot, day, force=False):
                 "retry_started_at": _now(),
             }
             new_run = False
-        acquired, owner, expires_at = _claim_runtime_lease(
-            conn, runtime_lock_key, runtime_owner, slot, ttl_seconds=runtime_lock_ttl,
-        )
+        with PTM.phase("runtime_lease_claim"):
+            acquired, owner, expires_at = _claim_runtime_lease(
+                conn, runtime_lock_key, runtime_owner, slot, ttl_seconds=runtime_lock_ttl,
+            )
         if not acquired:
             return {
                 "status": "in_progress", "slot": slot, "date": day.isoformat(),
@@ -13779,6 +13803,7 @@ def _run_slot_impl(slot, day, force=False):
                 and detail["risk_snapshot_refresh"] not in {"completed", "finished", "idle", "skipped"}
                 else "slot_work_incomplete"
             ))
+        detail["timing"] = PTM.snapshot("before_job_finalize")
         with _db(immediate=True, hot_path=hot_path) as conn:
             _assert_active_lease(conn, "job completion")
             if intraday_key:
@@ -13804,13 +13829,15 @@ def _run_slot_impl(slot, day, force=False):
                 conn.execute(
                     "UPDATE paper_job_runs SET status='failed',detail=?,finished_at=? "
                     "WHERE run_key=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json({"error": str(exc), "retry_count": retry_count}), _now(), intraday_key, owner, fencing_token),
+                    (_json({"error": str(exc), "retry_count": retry_count,
+                            "timing": PTM.snapshot("before_failure_finalize")}), _now(), intraday_key, owner, fencing_token),
                 )
             else:
                 conn.execute(
                     "UPDATE paper_jobs SET status='failed',detail=?,finished_at=? "
                     "WHERE slot=? AND market_date=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json({"error": str(exc), "retry_count": retry_count}), _now(), slot, day.isoformat(), owner, fencing_token),
+                    (_json({"error": str(exc), "retry_count": retry_count,
+                            "timing": PTM.snapshot("before_failure_finalize")}), _now(), slot, day.isoformat(), owner, fencing_token),
                 )
         raise
     finally:
@@ -14496,6 +14523,7 @@ _RISK_SNAPSHOT_REFRESH = {"running": False, "started_at": None, "last_error": No
                           "trigger": None, "thread": None}
 
 
+@PTM.timed("risk_snapshot")
 def _refresh_slot_risk_snapshot(slot):
     kick = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
     result = (
