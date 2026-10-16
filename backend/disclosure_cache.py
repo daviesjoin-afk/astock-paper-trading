@@ -81,7 +81,7 @@ def save(path, rows):
                 return False
             conn.executemany(_UPSERT, (_entry(code, value) for code, value in rows.items()))
         return True
-    except (OSError, sqlite3.Error, ValueError, TypeError):
+    except (OSError, sqlite3.Error):
         return False
     finally:
         if conn is not None:

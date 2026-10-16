@@ -91,7 +91,8 @@ class IndexedDisclosureTests(unittest.TestCase):
     def test_bad_second_entry_rolls_back_first_entry_and_does_not_pollute_reads(self):
         C.migrate(self.path)
         newer = {**self.payload["rows"]["000001"], "fetched_epoch": time.time() + 1, "items": []}
-        self.assertFalse(C.save(self.path, {"000001": newer, "000002": {"items": [float("nan")]}}))
+        with self.assertRaises(ValueError):
+            C.save(self.path, {"000001": newer, "000002": {"items": [float("nan")]}})
         self.assertEqual(C.load(self.path, ["000001", "000002"])["rows"], self.payload["rows"])
 
     def test_old_writer_atomic_replacement_invalidates_sidecar_even_same_mtime_size(self):
