@@ -5832,11 +5832,14 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     ``asof_date`` 是历史因子截止日；``live_asof_date`` 允许盘中用当天
     实时行情而不误要求当天尚未收盘的日线因子。
     """
-    price_f, first_board_codes = _selection_inputs()
+    with PTM.phase("candidate.factor_inputs"):
+        price_f, first_board_codes = _selection_inputs()
     account_id = account["id"] if isinstance(account, dict) else str(account)
     spec = _spec_for(account_id)
-    base_universe = {str(row.get("code")): row for row in (U.load_universe() or [])}
-    factor_freshness = _selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
+    with PTM.phase("candidate.universe_read"):
+        base_universe = {str(row.get("code")): row for row in (U.load_universe() or [])}
+    with PTM.phase("candidate.factor_gate"):
+        factor_freshness = _selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
     if not factor_freshness.get("passed"):
         return [], {
             "blocked": True,
@@ -5965,7 +5968,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # proof is attached below to the concrete candidate records instead of
     # pretending a report period is a disclosure timestamp.
     try:
-        finance = dfc.fetch_finance_latest()
+        with PTM.phase("candidate.finance_source"):
+            finance = dfc.fetch_finance_latest()
     except Exception:
         finance = {"data": {}}
     # Keep the paper selector point-in-time consistent with the public
@@ -5985,10 +5989,12 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # 它的决策时点是现在，不是已收盘日线 cutoff。用 cutoff 判它会清空 PE/PB/
     # 换手/资金/行业（``build_factor_table`` 的 pct 正取自这里），直接打掉盘中扫描。
     if shared_inputs is None:
-        fund = F.compute_fundamental_factors(
-            universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
+        with PTM.phase("candidate.fundamentals"):
+            fund = F.compute_fundamental_factors(
+                universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
     else:
-        fund = shared_inputs.fundamentals(universe, finance, asof=finance_asof)
+        with PTM.phase("candidate.fundamentals"):
+            fund = shared_inputs.fundamentals(universe, finance, asof=finance_asof)
     live_flow = {
         str(code): row.get("main_pct")
         for code, row in live_map.items()
@@ -6012,7 +6018,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     }
     if _missing_super_codes:
         try:
-            _supplemented = dfc.enrich_live_flow_details(live_universe, _missing_super_codes)
+            with PTM.phase("candidate.flow_source"):
+                _supplemented = dfc.enrich_live_flow_details(live_universe, _missing_super_codes)
             for _code, _detail in _supplemented.items():
                 if _code in live_map:
                     for _flow_field in ("super_net", "main_net", "big_net", "mid_net", "small_net", "main_pct"):
@@ -6027,11 +6034,12 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                     live_flow[_code] = _detail["main_pct"]
         except Exception:
             pass
-    table = S.build_factor_table(
-        price_f, fund, sentiment=None,
-        realtime_flow=live_flow,
-        realtime_super_flow=live_super_flow,
-    )
+    with PTM.phase("candidate.factor_table"):
+        table = S.build_factor_table(
+            price_f, fund, sentiment=None,
+            realtime_flow=live_flow,
+            realtime_super_flow=live_super_flow,
+        )
     if live_universe is not None:
         # 日线技术指标/财务仍来自已下载的完整历史；当天可变字段必须由
         # 同一轮实时快照覆盖，不能继续沿用上一交易日的收盘价或涨跌幅。
@@ -6136,7 +6144,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             }
         )
         table["sentiment"] = F.zscore(heat_values).reindex(table.index).fillna(-1.5)
-    selection_overlay = _adaptive_selection(account)
+    with PTM.phase("candidate.evolution_read"):
+        selection_overlay = _adaptive_selection(account)
     selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
     if spec.get("selection_mode") == "dsl":
         # PR-35：声明式策略通道——同一份共享因子表，选股由编译后的 DSL
@@ -6152,9 +6161,10 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                 "reason": "声明式策略缺少可用的注册表运行时上下文；本轮不生成候选",
                 "strategy_id": account_id, "model_family": selection_model,
             }
-        raw = USP.dsl_strategy_raw(
-            context, spec, table, asof_date=asof_date, kline_loader=_completed_kline,
-        )
+        with PTM.phase("candidate.strategy"):
+            raw = USP.dsl_strategy_raw(
+                context, spec, table, asof_date=asof_date, kline_loader=_completed_kline,
+            )
         candidate_topn = int(spec.get("candidate_topn") or 10)
         raw.setdefault("metadata", {})["factor_meta"] = {
             "factor_date": factor_date, "style": style,
@@ -6178,10 +6188,11 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             if account_id == MAIN_FORCE_STRATEGY_ID
             else (120 if style == "pullback" else 48)
         )
-        raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
-                             gate={"light": market["light"]}, first_board_codes=first_board_codes,
-                             weight_overrides=selection_overlay.get("weights"),
-                             condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)
+        with PTM.phase("candidate.strategy"):
+            raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
+                                 gate={"light": market["light"]}, first_board_codes=first_board_codes,
+                                 weight_overrides=selection_overlay.get("weights"),
+                                 condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)
     disclosure_prime = {"status": "not_required", "requested": 0, "reported": 0}
     if account_id == NEW_STRATEGY_ID and not (raw.get("picks") or []):
         # First pass deliberately produces a bounded shadow set.  Resolve its
@@ -6195,7 +6206,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         }
         if DT is not None and shadow_codes:
             try:
-                records = DT.fetch_disclosure_timeline(shadow_codes, asof=asof_date)
+                with PTM.phase("candidate.disclosure_prime"):
+                    records = DT.fetch_disclosure_timeline(shadow_codes, asof=asof_date)
                 evidence = {str(item.get("code")): item for item in (records or []) if item.get("code")}
                 for code, evidence_row in evidence.items():
                     published_at = evidence_row.get("published_at")
@@ -6211,10 +6223,11 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                     disclosure_prime["reported"] += 1
                 disclosure_prime["status"] = "ready" if disclosure_prime["reported"] else "partial"
                 if disclosure_prime["reported"]:
-                    raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
-                                         gate={"light": market["light"]}, first_board_codes=first_board_codes,
-                                         weight_overrides=selection_overlay.get("weights"),
-                                         condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)
+                    with PTM.phase("candidate.strategy"):
+                        raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
+                                             gate={"light": market["light"]}, first_board_codes=first_board_codes,
+                                             weight_overrides=selection_overlay.get("weights"),
+                                             condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)
             except Exception as exc:
                 disclosure_prime.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
     raw.setdefault("metadata", {})["disclosure_prime"] = disclosure_prime
@@ -6265,9 +6278,10 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     if account_id == MAIN_FORCE_STRATEGY_ID:
         # 每日10只观察池冻结：早盘/首次有效扫描定池，盘中最多替换2只，
         # 避免三分钟重算导致候选并集漂移（2026-08-31 复核 P1）。
-        picks, watch_pool_meta = _main_force_watch_pool(
-            picks, asof_day=live_asof_date or asof_date, live_map=live_map,
-        )
+        with PTM.phase("candidate.watch_pool"):
+            picks, watch_pool_meta = _main_force_watch_pool(
+                picks, asof_day=live_asof_date or asof_date, live_map=live_map,
+            )
     raw_candidate_count = len(picks)
     entry_screened = []
     entry_screened_reasons = []
@@ -6324,9 +6338,11 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             except Exception:
                 pass  # 影子记录 fail-open
     if shadow_rows:
-        _ignition_shadow_store(shadow_rows)
+        with PTM.phase("candidate.shadow_write"):
+            _ignition_shadow_store(shadow_rows)
     picks = entry_screened
-    picks, financial_evidence = _attach_candidate_financial_disclosure(picks, asof_date)
+    with PTM.phase("candidate.disclosures"):
+        picks, financial_evidence = _attach_candidate_financial_disclosure(picks, asof_date)
     if style == "pullback" and spec.get("selection_mode") != "dsl":
         # PR-35：声明式策略的候选不经内置风格池（其字段语义来自内置
         # 模型的 pick 负载）；DSL 门在选股层已判定，直接进入执行审批。
@@ -6347,7 +6363,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         # slots of a *pullback* strategy.
         trend_ranked = []
         for pick in picks:
-            kline = _completed_kline(pick.get("code"), factor_date)
+            with PTM.phase("candidate.kline_read"):
+                kline = _completed_kline(pick.get("code"), factor_date)
             try:
                 closes = pd.to_numeric(kline["close"], errors="coerce").dropna()
             except (KeyError, TypeError, ValueError):
@@ -6416,7 +6433,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         # 真实概念资金榜 -> 完整成分 -> 当日全市场实时行情。概念接口
         # 只负责发现，不能替代全市场实时价格与资金门禁。
         try:
-            concepts = dfc.fetch_hot_concept_snapshot(topn=6)
+            with PTM.phase("candidate.concept_source"):
+                concepts = dfc.fetch_hot_concept_snapshot(topn=6)
         except Exception as exc:
             concepts = []
             concept_meta = {"version": CONCEPT_EXPANSION_LANE_VERSION,
@@ -6429,7 +6447,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         reverse_error = None
         if reverse_leaders:
             try:
-                reverse_concepts = dfc.fetch_leader_concept_snapshot(reverse_leaders)
+                with PTM.phase("candidate.reverse_concept_source"):
+                    reverse_concepts = dfc.fetch_leader_concept_snapshot(reverse_leaders)
             except Exception as exc:
                 reverse_error = f"{type(exc).__name__}: {exc}"
         # Preserve reverse-discovery evidence even when the board is already
@@ -6449,11 +6468,12 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             else:
                 merged_concepts.append(concept)
         concepts = merged_concepts + list(reverse_by_code.values())
-        concept_lane, lane_meta = _concept_expansion_lane_candidates(
-            concepts, universe, live_map,
-            seen_codes={str(p.get("code") or "") for p in enriched},
-            market=market, asof_date=asof_date,
-        )
+        with PTM.phase("candidate.concept_lane"):
+            concept_lane, lane_meta = _concept_expansion_lane_candidates(
+                concepts, universe, live_map,
+                seen_codes={str(p.get("code") or "") for p in enriched},
+                market=market, asof_date=asof_date,
+            )
         if concept_meta:
             concept_meta = {**lane_meta, **concept_meta}
         else:
@@ -6474,21 +6494,23 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             enriched.extend(concept_lane)
         # 盘中板块异动直通车道：主题日内引爆时不再等隔夜因子排名追认。
         # 注入候选与常规候选一样经过入场筛选/追高闸门/Q级/资金全部校验。
-        surge_lane, surge_meta = _sector_surge_lane_candidates(
-            sector_heat, universe, live_map,
-            seen_codes={str(p.get("code") or "") for p in enriched},
-            market=market,
-        )
+        with PTM.phase("candidate.sector_lane"):
+            surge_lane, surge_meta = _sector_surge_lane_candidates(
+                sector_heat, universe, live_map,
+                seen_codes={str(p.get("code") or "") for p in enriched},
+                market=market,
+            )
         if surge_lane:
             enriched.extend(surge_lane)
         # 同花顺热点题材车道（P0）：人工运营的当日强势股+题材归因标签，
         # 比板块涨幅排名更早更快。命中当日热点榜的成员直接注入候选，
         # 题材标签随 payload 入审计；追高上限与全部执行闸门照常生效。
-        ths_lane, ths_meta = _ths_hot_lane_candidates(
-            universe, live_map,
-            seen_codes={str(p.get("code") or "") for p in enriched},
-            asof_date=asof_date,
-        )
+        with PTM.phase("candidate.ths_lane"):
+            ths_lane, ths_meta = _ths_hot_lane_candidates(
+                universe, live_map,
+                seen_codes={str(p.get("code") or "") for p in enriched},
+                asof_date=asof_date,
+            )
         if ths_lane:
             enriched.extend(ths_lane)
         picks = enriched
@@ -11286,13 +11308,15 @@ def _bootstrap_candidate_evidence(accounts, precomputed_candidates, day):
         # 只读连接在写事务之前完成，使「为哪些候选取证」与后面「实际审批哪些
         # 候选」使用同一个集合。
         with _db_readonly() as evidence_conn:
-            cooled = _bootstrap_cooled_candidates(
-                evidence_conn, account["id"], precomputed[0], day,
-            )
+            with PTM.phase("candidate.cooldown_read"):
+                cooled = _bootstrap_cooled_candidates(
+                    evidence_conn, account["id"], precomputed[0], day,
+                )
         names = {pick["code"]: pick.get("name") or pick["code"]
                  for pick in cooled["candidates"]}
         try:
-            news = _news_for(names) if names else []
+            with PTM.phase("candidate.news_source"):
+                news = _news_for(names) if names else []
         except Exception:
             news = []
         bootstrap_evidence[account["id"]] = {
@@ -11305,11 +11329,13 @@ def _bootstrap_candidate_evidence(accounts, precomputed_candidates, day):
         code for evidence in bootstrap_evidence.values() for code in evidence["names"]
     ))
     try:
-        sector_flow = dfc.fetch_sector_flow("industry") if bootstrap_evidence else []
+        with PTM.phase("candidate.sector_source"):
+            sector_flow = dfc.fetch_sector_flow("industry") if bootstrap_evidence else []
     except Exception:
         sector_flow = []
     try:
-        quotes = (_quotes(quote_codes) or {}) if quote_codes else {}
+        with PTM.phase("candidate.quote_source"):
+            quotes = (_quotes(quote_codes) or {}) if quote_codes else {}
     except Exception:
         quotes = {}
     if not isinstance(quotes, dict):
@@ -11338,7 +11364,8 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
         "accounts": [],
     }
     try:
-        factor_table, _ = _selection_inputs()
+        with PTM.phase("candidate.factor_inputs"):
+            factor_table, _ = _selection_inputs()
         factor_date = str(factor_table["last_date"].dropna().max()) if "last_date" in factor_table else None
     except Exception as exc:
         result.update({"status": "blocked", "reason": f"候选因子不可用：{exc}"})
@@ -11371,11 +11398,14 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
         result["factor_fallback_reason"] = "上一完整交易日因子快照，等待当日重建"
 
     factor_day = _date(factor_date)
-    history = _history_manifest()
+    with PTM.phase("candidate.history_read"):
+        history = _history_manifest()
     try:
-        sector_rows = dfc.fetch_hot_sector_snapshot()
+        with PTM.phase("candidate.sector_source"):
+            sector_rows = dfc.fetch_hot_sector_snapshot()
         if not sector_rows:
-            sector_rows = dfc.fetch_sector_flow("industry")
+            with PTM.phase("candidate.sector_source"):
+                sector_rows = dfc.fetch_sector_flow("industry")
     except Exception:
         sector_rows = []
     # Build the broad candidate sets and fetch bounded microstructure evidence
@@ -11388,21 +11418,23 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     shared_inputs = PCI.CandidateScanInputs(F.live_snapshot_asof())
     for account in accounts:
         try:
-            rows, meta = _candidate_rows(
-                account, factor_day, market, sector_rows=sector_rows,
-                live_universe=live_universe, live_asof_date=day,
-                shared_inputs=shared_inputs,
-            )
+            with PTM.phase("candidate.rows"):
+                rows, meta = _candidate_rows(
+                    account, factor_day, market, sector_rows=sector_rows,
+                    live_universe=live_universe, live_asof_date=day,
+                    shared_inputs=shared_inputs,
+                )
         except Exception as exc:
             rows, meta = [], {"blocked": True, "reason": f"候选生成失败：{type(exc).__name__}: {exc}"}
         precomputed_candidates[account["id"]] = (rows, meta)
         preliminary = _prioritize_live_candidate_budget(rows, account["id"], limit=6)
         micro_codes.extend(str(item.get("code") or "") for item in preliminary if item.get("code"))
     try:
-        global_microstructure_map = (
-            AD.market_microstructures(micro_codes, asof_day=day)
-            if AD is not None else {}
-        )
+        with PTM.phase("candidate.microstructure_source"):
+            global_microstructure_map = (
+                AD.market_microstructures(micro_codes, asof_day=day)
+                if AD is not None else {}
+            )
     except Exception:
         global_microstructure_map = {}
     # R25：bootstrap 与 close 路径必须同形 —— provider/网络证据在**写事务之外**
@@ -11410,8 +11442,9 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # ``fetch_sector_flow`` 在 ``_db()`` 内被逐账户调用：那不仅让每个账户各付一次
     # 网络延迟（写锁被持有），而且一次慢源就能阻塞成交、风控退出与页面读取数分钟。
     # 证据按账户预取一次，写事务内只读这份快照。
-    bootstrap_evidence = _bootstrap_candidate_evidence(accounts, precomputed_candidates, day)
-    with _db(immediate=True) as conn:
+    with PTM.phase("candidate.evidence"):
+        bootstrap_evidence = _bootstrap_candidate_evidence(accounts, precomputed_candidates, day)
+    with PTM.phase("candidate.writer"), _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
         for account in accounts:
             try:
@@ -11548,7 +11581,8 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 news = evidence.get("news") or []
                 sector_flow = evidence.get("sector_flow") or []
                 try:
-                    NL.capture_candidate_snapshot(account["id"], candidates, factor_day, slot=source_slot)
+                    with PTM.phase("candidate.learning_snapshot"):
+                        NL.capture_candidate_snapshot(account["id"], candidates, factor_day, slot=source_slot)
                 except Exception as exc:
                     _audit(conn, account["id"], "candidate_snapshot_failed", f"{type(exc).__name__}: {exc}")
                 for candidate in candidates:
@@ -11562,9 +11596,10 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 skipped_existing = 0
                 # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
                 # 周期取本函数已解析的 `cycle` 与候选构建前的捕获归属。
-                bootstrap_context, bootstrap_error = SRES.signal_write_context_or_error(
-                    conn, account["id"], cycle_id=cycle["id"],
-                    account_cycle_id=account["cycle_id"], asof_day=day.isoformat())
+                with PTM.phase("candidate.provenance"):
+                    bootstrap_context, bootstrap_error = SRES.signal_write_context_or_error(
+                        conn, account["id"], cycle_id=cycle["id"],
+                        account_cycle_id=account["cycle_id"], asof_day=day.isoformat())
                 if bootstrap_error is not None:
                     _audit(conn, account["id"], bootstrap_error.event, bootstrap_error.detail)
                     _observe_intraday(conn, cycle["id"], account["id"], None, None, "scan",
@@ -11593,12 +11628,14 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     quote = quotes.get(code, {})
                     # 同一只候选在同一轮循环里会被 _signal_approval 和
                     # _with_decision_snapshot 各用一次 K 线；只读一次文件。
-                    kline = _completed_kline(code, factor_day)
-                    passed, reason, decision, market_policy, approval_evidence = _signal_approval(
-                        account, pick, quote, kline,
-                        sector_flow, market, news, history.get(code), day,
-                        factor_asof_date=factor_day, conn=conn,
-                    )
+                    with PTM.phase("candidate.kline_read"):
+                        kline = _completed_kline(code, factor_day)
+                    with PTM.phase("candidate.approval"):
+                        passed, reason, decision, market_policy, approval_evidence = _signal_approval(
+                            account, pick, quote, kline,
+                            sector_flow, market, news, history.get(code), day,
+                            factor_asof_date=factor_day, conn=conn,
+                        )
                     recovery_observation = None
                     if is_recovery:
                         recovery_ok, recovery_reason, recovery_observation = _recovery_observation(
@@ -11632,15 +11669,16 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                             "passed": bool(passed), "probe_ratio": 0.25,
                             "policy": _recovery_policy(account["id"]),
                         }
-                    payload = _with_decision_snapshot(
-                        payload, account_id=account["id"], code=code, side="buy",
-                        decision=("approved_bootstrap" if passed else "rejected_bootstrap"),
-                        reason=reason, asof_date=day, quote=quote,
-                        kline=kline,
-                        news=payload.get("news"),
-                        final_score=(decision.get("entry_model") or {}).get("score"),
-                        runtime_context_unavailability_reason="missing_entry_state",
-                    )
+                    with PTM.phase("candidate.decision_snapshot"):
+                        payload = _with_decision_snapshot(
+                            payload, account_id=account["id"], code=code, side="buy",
+                            decision=("approved_bootstrap" if passed else "rejected_bootstrap"),
+                            reason=reason, asof_date=day, quote=quote,
+                            kline=kline,
+                            news=payload.get("news"),
+                            final_score=(decision.get("entry_model") or {}).get("score"),
+                            runtime_context_unavailability_reason="missing_entry_state",
+                        )
                     # R25：入场冻结是**候选级**事实，先判定一次；随后 SignalDecision
                     # 用同一个事实同时产出 status 与 reason。此前这里和下方各算了一套
                     # 条件（落库用前一套、decision 用后一套），两套一旦漂移，写进账本
@@ -11688,33 +11726,35 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         ),
                     )
                     status = bootstrap_decision.status
-                    committed_payload = SIG.commit_signal(
-                        conn,
-                        context=bootstrap_context,
-                        decision=bootstrap_decision,
-                        row={
-                            "signal_date": factor_day.isoformat(),
-                            "intended_date": day.isoformat(),
-                            "code": code,
-                            "name": pick.get("name"),
-                            "industry": pick.get("industry"),
-                            "close_price": _num(quote.get("price"), _num(pick.get("price"))),
-                            "rank_score": _num(pick.get("score")),
-                            "t_tier": decision.get("tier"),
-                            "t_score": _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
-                            "payload": payload,
-                            "created_at": _now(),
-                        },
-                        conflict=SIG.CONFLICT_REFRESH,
-                    )
-                    _risk_log(
-                        conn, account["id"], code, "buy",
-                        ENTRY_FROZEN_WAITLIST_STATUS
-                        if status == ENTRY_FROZEN_WAITLIST_STATUS
-                        else "approved_bootstrap" if passed else "rejected_bootstrap",
-                        reason or "盘中候选通过", committed_payload,
-                        strategy_stamp=bootstrap_stamp,
-                    )
+                    with PTM.phase("candidate.signal_write"):
+                        committed_payload = SIG.commit_signal(
+                            conn,
+                            context=bootstrap_context,
+                            decision=bootstrap_decision,
+                            row={
+                                "signal_date": factor_day.isoformat(),
+                                "intended_date": day.isoformat(),
+                                "code": code,
+                                "name": pick.get("name"),
+                                "industry": pick.get("industry"),
+                                "close_price": _num(quote.get("price"), _num(pick.get("price"))),
+                                "rank_score": _num(pick.get("score")),
+                                "t_tier": decision.get("tier"),
+                                "t_score": _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
+                                "payload": payload,
+                                "created_at": _now(),
+                            },
+                            conflict=SIG.CONFLICT_REFRESH,
+                        )
+                    with PTM.phase("candidate.risk_write"):
+                        _risk_log(
+                            conn, account["id"], code, "buy",
+                            ENTRY_FROZEN_WAITLIST_STATUS
+                            if status == ENTRY_FROZEN_WAITLIST_STATUS
+                            else "approved_bootstrap" if passed else "rejected_bootstrap",
+                            reason or "盘中候选通过", committed_payload,
+                            strategy_stamp=bootstrap_stamp,
+                        )
                     if is_reentry and passed:
                         _observe_intraday(
                             conn, cycle["id"], account["id"], code, _num(quote.get("price")),

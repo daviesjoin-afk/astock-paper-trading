@@ -218,3 +218,20 @@ flowchart LR
 固定五策略输入的服务器只读、禁网、半核/384 MiB 对照中，基础财务计算从每轮五次减少到两次；五张各 4,383 行的表及其类型、属性逐值一致。预处理热读从 8.140 秒到 7.136–7.137 秒，CPU 从 3.633 秒到 3.095–3.116 秒；冷读原版 10.284 秒另计。此对照沿用同一财报不可用输入，截在策略执行前，不代表完整候选或真实 HTTP 耗时。报价和板块由五次高层调用合并为一次，实际 HTTP 请求数仍取决于原提供方的分批、重试及回退规则。
 
 回归验证严格财务截止与 live 口径分离、未来截面仍不可用、变更输入失效、下一轮不复用、非 JSON 绕过、表格隔离，以及报价并集、账户分区、部分缺失、取数失败、新闻先于报价、写事务外取证和跨账户嵌套对象隔离。整轮收益必须继续以部署后的自然调度任务验证，少量样本不视为 p95。
+
+## 候选内部耗时定位（2026-10-16）
+
+继续 A02 的实际瓶颈诊断，复用 `paper_timing` 和原有任务日志，不调整策略、资金、缓存期限或调度。新增固定的 `candidate.*` 阶段：
+
+| 范围 | 阶段 |
+| --- | --- |
+| 候选生成 | `rows`，其中拆出 `factor_inputs`、`universe_read`、`factor_gate`、`fundamentals`、`factor_table`、`strategy`、`evolution_read` |
+| 提供方调用 | `finance_source`、`flow_source`、`disclosures`、`disclosure_prime`、`concept_source`、`reverse_concept_source`、`ths_lane`、`microstructure_source`、`news_source`、`quote_source`、`sector_source` |
+| 本地读取与写入 | `history_read`、`kline_read`、`cooldown_read`、`watch_pool`、`shadow_write`、`learning_snapshot` |
+| 写事务及审批 | `writer`，其中拆出 `provenance`、`approval`、`decision_snapshot`、`signal_write`、`risk_write` |
+
+所有阶段新增 `thread_cpu_seconds`，使用标准库 [thread_time](https://docs.python.org/3.14/library/time.html#time.thread_time) 测量当前线程实际占用的 CPU；原 `seconds` 仍为经过的时间。二者差值可能包含网络、磁盘、锁、线程池等待和容器 CPU 配额等待，不能自动归为网络时间。线程 CPU 不包含其他工作线程的计算，短阶段也受系统时钟分辨率影响，不能据此强制 CPU 小于墙钟时间。
+
+提供方阶段包括缓存检查、读取、解析及内部线程池等待，不等于纯 HTTP。共享行情传输层的 `http_get_attempt` / `http_post_attempt` 记录本线程实际请求尝试及 HTTP 状态检查，`http_retry_backoff` 单独记录既有重试退避；保持请求参数、连接池、重试次数、超时和返回值不变。错误计数表示该边界抛出过异常，外层既有回退仍可能使整个任务成功。线程池不隐式继承诊断上下文，这些 HTTP 次数不是所有源、所有线程的总请求数；没有观测到不能当作未请求。
+
+父子阶段包含重叠，同名阶段跨五策略或多次调用累计，不能把它们全数相加。`rows` 扣除其直接子阶段后仍可能留下筛选、排序、表格覆盖及局部读写成本；未计时的余量保留为未细分，不用等待时间倒推出不存在的 SQL 或网络结论。此次只增加观测，是否提速及后续该优化哪一段，以服务器自然任务为准。

@@ -20,6 +20,7 @@ import paper_timing as timing
 class TimingTests(unittest.TestCase):
     def test_inactive_has_no_clock_reads_or_output(self):
         with mock.patch.object(timing.time, "perf_counter", side_effect=AssertionError), \
+                mock.patch.object(timing.time, "thread_time", side_effect=AssertionError), \
                 mock.patch("builtins.print") as output:
             with timing.phase("unused"):
                 pass
@@ -30,6 +31,7 @@ class TimingTests(unittest.TestCase):
         clock = [10.0]
         output = io.StringIO()
         with mock.patch.object(timing.time, "perf_counter", side_effect=lambda: clock[0]), \
+                mock.patch.object(timing.time, "thread_time", side_effect=lambda: clock[0] / 2), \
                 contextlib.redirect_stderr(output), timing.capture("intraday"):
             with timing.phase("scan"):
                 clock[0] += 1
@@ -39,8 +41,60 @@ class TimingTests(unittest.TestCase):
             value = timing.snapshot("test")
         self.assertEqual(value["elapsed_seconds"], 5)
         self.assertEqual(value["stages"]["scan"]["seconds"], 5)
-        self.assertEqual(value["stages"]["quote_batch"], {"seconds": 4, "calls": 2, "errors": 0})
+        self.assertEqual(value["stages"]["quote_batch"], {
+            "seconds": 4, "thread_cpu_seconds": 2, "calls": 2, "errors": 0,
+        })
+        self.assertEqual(value["stages"]["scan"]["thread_cpu_seconds"], 2.5)
         self.assertEqual(json.loads(output.getvalue())["timing"]["scope"], "finished")
+
+    def test_wait_and_cpu_are_distinct_and_decorated_result_is_unchanged(self):
+        wall, cpu = [0.0], [0.0]
+        result = {"status": "unknown", "evidence": None}
+
+        @timing.timed("candidate.strategy")
+        def compute():
+            wall[0] += 2
+            cpu[0] += 0.5
+            return result
+
+        with mock.patch.object(timing.time, "perf_counter", side_effect=lambda: wall[0]), \
+                mock.patch.object(timing.time, "thread_time", side_effect=lambda: cpu[0]), \
+                contextlib.redirect_stderr(io.StringIO()), timing.capture("intraday"):
+            self.assertIs(compute(), result)
+            with timing.phase("candidate.quote_source"):
+                wall[0] += 8
+            stages = timing.snapshot("test")["stages"]
+        self.assertEqual(stages["candidate.strategy"]["thread_cpu_seconds"], 0.5)
+        self.assertEqual(stages["candidate.quote_source"]["seconds"], 8)
+        self.assertEqual(stages["candidate.quote_source"]["thread_cpu_seconds"], 0)
+
+    def test_http_attempts_keep_retry_and_failure_semantics_without_private_logs(self):
+        import marketdata_transport as transport
+        import requests
+        session = mock.Mock()
+        response = mock.Mock(text="payload")
+        session.get.side_effect = [requests.Timeout("private-marker"), response]
+        response.raise_for_status.return_value = None
+        output = io.StringIO()
+        with mock.patch.object(transport, "_session", return_value=session), \
+                mock.patch.object(transport.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(output), timing.capture("intraday"):
+            self.assertEqual(transport.http_get("private-marker", params={"private": "marker"},
+                                              timeout=3, retries=1), "payload")
+            stages = timing.snapshot("test")["stages"]
+        self.assertEqual(session.get.call_args_list, [
+            mock.call("private-marker", params={"private": "marker"}, timeout=3),
+        ] * 2)
+        sleep.assert_called_once_with(0.5)
+        self.assertEqual(stages["http_get_attempt"]["calls"], 2)
+        self.assertEqual(stages["http_get_attempt"]["errors"], 1)
+        self.assertEqual(stages["http_retry_backoff"]["calls"], 1)
+        self.assertNotIn("private-marker", output.getvalue())
+        session.post.side_effect = requests.Timeout("private-marker")
+        with mock.patch.object(transport, "_session", return_value=session), \
+                contextlib.redirect_stderr(io.StringIO()), timing.capture("intraday"):
+            self.assertEqual(transport.http_post_json("private-marker", {}), {})
+            self.assertEqual(timing.snapshot("test")["stages"]["http_post_attempt"]["errors"], 1)
 
     def test_failure_records_stage_and_does_not_log_exception_contents(self):
         output = io.StringIO()
