@@ -10981,6 +10981,9 @@ def _risk_load_market_inputs(*, day, positions, candidate_codes):
         }
     codes = sorted({str(item["code"]) for item in positions} | set(candidate_codes or ()))
     quote_map = _quotes(codes, asof_date=day)
+    # 同轮复用：本轮超集（持仓 ∪ 候选）已取到的报价交给后续阶段直接吃掉，
+    # 不再为「持仓」子集各取一次 _quotes。跨轮/跨决策仍然不复用。
+    _round_quote_offer(day, quote_map)
     news = _news_for({item["code"]: item.get("name") or item["code"] for item in positions})
     news_meta = dict(_NEWS_SCAN_META)
     try:
@@ -12580,7 +12583,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
     if not positions:
         return {"status": "completed", "slot": "opening_event", "date": day.isoformat(),
                 "clock": clock, "observed": 0, "orders": []}
-    quotes = _quotes(sorted({str(p["code"]) for p in positions}), asof_date=day)
+    quotes = _quotes_with_round_cache(sorted({str(p["code"]) for p in positions}), asof_date=day)
     # P2-1 审计修复（2026-09-02）：开盘事件 NAV 同样用本地快照兜底。
     nav_quotes = _nav_quotes_with_snapshot_fallback(quotes)
     with _db(immediate=True, hot_path=True) as conn:
@@ -12782,7 +12785,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
 
         candidate_codes = {str(row.get("code") or "") for row in candidates}
         all_codes = sorted(candidate_codes | {str(row.get("code") or "") for row in positions})
-        quote_map = _quotes(all_codes, asof_date=day)
+        quote_map = _quotes_with_round_cache(all_codes, asof_date=day)
         confirmed = []
         observations = []
         checked = 0
@@ -13057,7 +13060,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             "data_source_health": data_source_health,
             "live_universe_coverage": len(live_universe),
         }
-    quotes = _quotes(sorted({p["code"] for p in positions}), asof_date=day)
+    quotes = _quotes_with_round_cache(sorted({p["code"] for p in positions}), asof_date=day)
     # P2-1 审计修复（2026-09-02）：NAV 估值副本用本地快照最近价补齐
     # _quotes 因防陈旧而置 None 的持仓价格（估值非成交，动作循环仍用
     # 未污染的 quotes）。必须在写事务外生成——内部读取本地快照文件。
@@ -13174,6 +13177,97 @@ def monitor_intraday(asof_datetime=None, force=False):
                 "data_source_health": data_source_health,
                 "live_universe_coverage": len(live_universe),
                 "note": "3分钟监控仅观察；未满足阈值时不生成订单"}
+
+
+# 同一轮 slot 内的报价复用。路线图 6.2「同轮先合并代码集合再批量查价」在
+# 现有调用里实际是分散的：monitor_risk 先取「持仓 ∪ 候选」的超集，
+# monitor_intraday / monitor_opening_events / execute_open 隔几十秒又对
+# 「持仓」子集各自取一次 _quotes——子集是超集的真子集，重复取价纯属浪费。
+#
+# 这里只在**同一个 run_slot 调用**内复用：跨轮/跨决策绝不复用，与
+# 「不复用价格」的原意一致（不把上一轮的价格用于下一轮决策）。复用仅对
+# 同一 asof_day、且在超集中已完整取到的代码生效；缺价、缺 pct、超龄的行
+# 不进复用，保持 _quotes 的 fail-closed 语义。
+_ROUND_QUOTE_CACHE = threading.local()
+
+
+def _round_quote_bucket():
+    return getattr(_ROUND_QUOTE_CACHE, "value", None)
+
+
+def _begin_round_quote_cache(asof_day):
+    _ROUND_QUOTE_CACHE.value = {"asof_day": _date(asof_day).isoformat(), "rows": {}}
+    return _ROUND_QUOTE_CACHE.value
+
+
+def _end_round_quote_cache():
+    try:
+        del _ROUND_QUOTE_CACHE.value
+    except AttributeError:
+        pass
+
+
+def _round_quote_offer(asof_day, rows):
+    """把一次完整取到的报价并入轮内复用池；只接受新鲜、有价、有 pct 的行。"""
+    bucket = _round_quote_bucket()
+    if bucket is None:
+        return 0
+    if bucket["asof_day"] != _date(asof_day).isoformat():
+        return 0
+    accepted = 0
+    for code, row in (rows or {}).items():
+        code = str(code)
+        if not code or code in bucket["rows"]:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if _num(row.get("price"), 0) <= 0 or _num(row.get("pct"), None) is None:
+            continue
+        if not _quote_is_fresh({**row, "quote_source": row.get("quote_source") or "live"},
+                               _date(asof_day)):
+            continue
+        bucket["rows"][code] = row
+        accepted += 1
+    return accepted
+
+
+def _round_quote_take(codes, asof_day):
+    """返回轮内已可用的子集；缺失或不新鲜的代码留给调用方重新取。"""
+    bucket = _round_quote_bucket()
+    if bucket is None or bucket["asof_day"] != _date(asof_day).isoformat():
+        return {}
+    out = {}
+    for code in codes or ():
+        code = str(code)
+        row = bucket["rows"].get(code)
+        if not isinstance(row, dict):
+            continue
+        if _num(row.get("price"), 0) <= 0 or _num(row.get("pct"), None) is None:
+            continue
+        if not _quote_is_fresh({**row, "quote_source": row.get("quote_source") or "live"},
+                               _date(asof_day)):
+            continue
+        out[code] = row
+    return out
+
+
+def _quotes_with_round_cache(codes, asof_date=None):
+    """先吃轮内复用，未命中部分照常走 _quotes；命中部分不重复联网。
+
+    不改变 _quotes 的返回形状（dict[code -> row]），也不改变缺价/缺 pct/超龄
+    行的 fail-closed 处理；只是把同一轮内已被超集取到的代码直接交出去。
+    """
+    codes = [str(code) for code in (codes or []) if str(code)]
+    if not codes:
+        return {}
+    expected_day = _date(asof_date or dt.date.today())
+    cached = _round_quote_take(codes, expected_day)
+    missing = [code for code in codes if code not in cached]
+    if not missing:
+        return {code: cached[code] for code in codes if code in cached}
+    fresh = _quotes(missing, asof_date=expected_day) if missing else {}
+    merged = {**cached, **{code: row for code, row in fresh.items() if code}}
+    return {code: merged.get(code, {}) for code in codes}
 
 
 def _nav_quotes_with_snapshot_fallback(quotes):
@@ -13843,6 +13937,9 @@ def _run_slot_impl(slot, day, force=False):
             target=_renew_runtime_lease, name=f"lease-renew-{slot}", daemon=True
         )
         lease_renewal_thread.start()
+    # 同轮报价复用：close/intraday 风险扫描先取超集，后续阶段吃同一份。
+    # 只在这两个 slot 内生效——auction/open/fast-entry 各自独立、不互相复用。
+    _begin_round_quote_cache(day) if slot in {"close", "intraday"} else None
     try:
         if slot == "open":
             detail = execute_open(day)
@@ -13854,7 +13951,7 @@ def _run_slot_impl(slot, day, force=False):
             # _record_nav is intentionally a pure ledger projection primitive.
             with _db() as snapshot_conn:
                 nav_positions = _position_rows(snapshot_conn, asof_day=day, readonly=True)
-            nav_quotes = _quotes(
+            nav_quotes = _quotes_with_round_cache(
                 sorted({str(row["code"]) for row in nav_positions}),
                 asof_date=day,
             ) if nav_positions else {}
@@ -13957,6 +14054,7 @@ def _run_slot_impl(slot, day, force=False):
                     "note": "幽灵租约将在 TTL 过期后由 _claim_runtime_lease 自动回收",
                 }, ensure_ascii=False), flush=True)
         _clear_lease_context()
+        _end_round_quote_cache()
 
 
 def _account_metric_inputs(conn, account_ids, today):
