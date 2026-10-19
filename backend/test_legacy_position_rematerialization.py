@@ -467,7 +467,8 @@ class PaperPositionsIsNotAuthority(unittest.TestCase):
         """
         import ast
 
-        tree = ast.parse(self._source("backend/paper_trading.py"))
+        tree = ast.parse(self._source("backend/paper_trading.py") + "\n" +
+                         self._source("backend/paper_lot_ledger.py"))
         referenced = sorted({
             node.id for node in ast.walk(tree)
             if isinstance(node, ast.Name) and node.id == "_migrate_legacy_positions"
@@ -484,8 +485,10 @@ class PaperPositionsIsNotAuthority(unittest.TestCase):
         """§5: 读模型函数体内不得出现任何迁移调用。"""
         import ast
 
-        tree = ast.parse(self._source("backend/paper_trading.py"))
-        targets = {"_position_rows", "_sync_positions", "_shared_account_exposure"}
+        tree = ast.parse(self._source("backend/paper_trading.py") + "\n" +
+                         self._source("backend/paper_lot_ledger.py"))
+        targets = {"_position_rows", "_sync_positions", "_shared_account_exposure",
+                   "position_rows", "sync_positions"}
         banned = {"_migrate_legacy_positions", "_ensure_cycle"}
         offenders = []
         for node in ast.walk(tree):
@@ -509,7 +512,7 @@ class PaperPositionsIsNotAuthority(unittest.TestCase):
         这是 §30「paper_positions 不能成为 lot creator」的可执行形式：逐个看
         每个 lot 写入语句所在函数体，函数体内不得同时出现 paper_positions 读取。
         """
-        src = self._source("backend/paper_trading.py")
+        src = self._source("backend/paper_trading.py") + "\n" + self._source("backend/paper_lot_ledger.py")
         lines = src.splitlines()
         offenders = []
         for idx, line in enumerate(lines):

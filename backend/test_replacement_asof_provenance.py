@@ -115,6 +115,47 @@ class _EvidenceCase(unittest.TestCase):
 class CandidateEvidenceTests(_EvidenceCase):
     """RP2-01 … RP2-07 —— 候选读取的 as-of / status / account 边界。"""
 
+    def test_index_bounds_history_without_changing_asof_results(self):
+        self.conn.executescript("""
+            CREATE TABLE paper_position_lots(cycle_id, account_id, code, remaining_qty, available_date);
+            CREATE TABLE paper_orders(account_id, code, status, side, created_at);
+            CREATE TABLE paper_fills(order_id, account_id, side, code);
+            CREATE TABLE paper_audit(id, event, created_at);
+            CREATE TABLE paper_risk_decisions(id, account_id, code, created_at);
+            CREATE INDEX old_signal_lookup ON paper_signals(account_id, signal_date, code);
+        """)
+        self.add_signal(1, intended_date=DAY.isoformat(), t_score=70)
+        self.add_signal(2, intended_date=DAY.isoformat(), signal_date=DAY_PREV.isoformat(), t_score=80)
+        self.add_signal(3, intended_date=DAY_NEXT.isoformat(), t_score=99)
+        self.add_signal(4, intended_date=DAY.isoformat(), signal_date=DAY_NEXT.isoformat(), t_score=99)
+        self.add_signal(5, intended_date=DAY.isoformat(), status="expired", t_score=99)
+        self.add_signal(6, intended_date=DAY.isoformat(), account_id=OTHER, t_score=99)
+        self.conn.executemany(
+            "INSERT INTO paper_signals(id,account_id,signal_date,intended_date,code,"
+            "payload,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            [(i, ACCOUNT, DAY_PREV.isoformat(), DAY_PREV.isoformat(), f"{i:06d}",
+              '{"historical":true}', "pending", DAY_PREV.isoformat())
+             for i in range(100, 2100)],
+        )
+        before = self.load()
+        queries = []
+        with mock.patch.object(PT, "_PERFORMANCE_INDEXES_READY", False):
+            PT._ensure_performance_indexes(self.conn)
+            PT._PERFORMANCE_INDEXES_READY = False
+            PT._ensure_performance_indexes(self.conn)
+        self.conn.set_trace_callback(queries.append)
+        try:
+            after = self.load()
+        finally:
+            self.conn.set_trace_callback(None)
+        self.assertEqual(after, before)
+        self.assertEqual([row["id"] for row in after], [2, 1])
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM paper_signals").fetchone()[0], 2006)
+        select = next(sql for sql in queries if "FROM paper_signals" in sql)
+        plan = " ".join(row[3] for row in self.conn.execute("EXPLAIN QUERY PLAN " + select))
+        self.assertIn("idx_paper_signals_replacement", plan)
+        self.assertIn("intended_date=?", plan)
+
     def test_rp2_01_same_day_candidate_is_loaded(self):
         self.add_signal(1, intended_date=DAY.isoformat())
         rows = self.load()

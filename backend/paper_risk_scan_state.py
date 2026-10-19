@@ -63,6 +63,7 @@ __all__ = [
     "complete_scan",
     "fail_scan",
     "scan_run",
+    "latest_scan",
     "assert_cycle_active",
 ]
 
@@ -127,6 +128,21 @@ def scan_run(conn, *, cycle_id, asof_date, scan_minute):
         " WHERE cycle_id=? AND asof_date=? AND scan_minute=?",
         identity,
     ).fetchone()
+    return _row_dict(row)
+
+
+def latest_scan(conn, *, cycle_id, asof_date):
+    """Read the latest attempt for the explicit cycle/day, without network or writes."""
+    cycle, day, _ = _identity(cycle_id, asof_date, "latest")
+    try:
+        row = conn.execute(
+            f"SELECT * FROM {SCAN_RUN_TABLE} WHERE cycle_id=? AND asof_date=?"
+            " ORDER BY scan_minute DESC LIMIT 1", (cycle, day),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
     return _row_dict(row)
 
 

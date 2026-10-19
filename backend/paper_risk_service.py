@@ -26,6 +26,7 @@ import paper_repository as PRP
 import paper_risk_decision as PRD
 import paper_risk_evidence as PREv
 import paper_risk_scan_state as PRSS
+import paper_risk_writes as PRW
 import paper_schema_migrations as PSM
 import strategy_policies as SPOL
 import strategy_registry as SR
@@ -196,13 +197,22 @@ def _rotation_buy_candidate(conn, account, replacement, quote, market, news, aso
 
 def _bounded_risk_scope(conn, context: PPort.PortfolioReadContext, *,
                         ports: RiskServicePorts):
-    """Return bounded positions plus current-or-historical risk account IDs."""
-    positions = PPort.risk_positions_for_context(conn, context)
-    risk_ids = set(ports.risk_exit_account_ids(conn))
-    risk_ids.update(
-        str(row["account_id"]) for row in positions if row.get("account_id")
-    )
-    return positions, risk_ids
+    """Return bounded positions plus current-or-historical risk account IDs.
+
+    快照读取须在事务内跑（``_snapshot_evidence`` 只在 ``conn.in_transaction``
+    为真时缓存）。
+    """
+    owns = not conn.in_transaction
+    if owns:
+        conn.execute("BEGIN")
+    try:
+        positions = PPort.risk_positions_for_context(conn, context)
+        risk_ids = set(ports.risk_exit_account_ids(conn))
+        risk_ids.update(str(r["account_id"]) for r in positions if r.get("account_id"))
+        return positions, risk_ids
+    finally:
+        if owns:
+            conn.rollback()
 
 
 def run(context: RiskRunContext, *, ports: RiskServicePorts):
@@ -261,15 +271,11 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         if authority is not None:
             payload["decision_provenance"] = PSM.risk_decision_provenance(
                 authority, decision_kind or decision)
-        strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id, cycle_id=cycle_id)
-        conn.execute(
-            """INSERT INTO paper_risk_decisions(
-                   account_id,code,side,decision,reason,payload,created_at,
-                   strategy_id,strategy_version,strategy_checksum,order_id)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (account_id, code, side, decision, reason, _json(payload), _now(),
-             strategy_id, strategy_version, strategy_checksum,
-             int(order_id) if order_id is not None else None),
+        strategy_stamp = _strategy_stamp(conn, account_id, cycle_id=cycle_id)
+        PRW.insert_risk_decision(
+            conn, account_id, code, side, decision, reason, payload,
+            strategy_stamp=strategy_stamp, cycle_id=cycle_id, now=_now(),
+            order_id=order_id,
         )
 
     if not positions:
@@ -665,6 +671,13 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     continue
                 planned_qty = partial_qty
             planned_qty = min(planned_qty, sellable)
+            # Reserve approved unfilled exits; the execution runner owns their continuation.
+            planned_qty, working_id = PREv.unreserved_risk_sell_quantity(
+                conn, cycle_id=cycle_id, account_id=position["account_id"], code=position["code"], requested_qty=planned_qty)
+            if working_id and planned_qty < ports.evidence.lot_size:
+                orders.append({"code": position["code"], "status": "pending_execution_wait",
+                               "order_id": working_id, "reason": "已有风险卖出委托等待执行，本轮不重复下单"})
+                continue
             pct = _num(quote.get("pct"))
             if price <= 0 or pct <= -_limit_pct(
                 position["code"], position.get("name"), position.get("risk_flag")
@@ -699,14 +712,10 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     kline=ports.evidence.load_kline(position["code"], day, inclusive=False),
                 )
                 strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
-                cursor = conn.execute(
-                    """INSERT INTO paper_orders(
-                           account_id,side,code,name,qty,planned_price,status,reason,
-                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (position["account_id"], "sell", position["code"], position.get("name"),
-                     planned_qty, price or None, status, order_reason, _json(detail), _now(),
-                     *strategy_stamp, cycle_id),
+                cursor = PRW.insert_sell_order(
+                    conn, position, qty=planned_qty, price=price, status=status,
+                    reason=order_reason, detail=detail, strategy_stamp=strategy_stamp,
+                    cycle_id=cycle_id, now=_now(),
                 )
                 # The Risk Authority's own decision about the sell order it just
                 # created: the same decision result, bound to that exact order at
@@ -734,14 +743,10 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 ports.assert_active_lease(conn, "risk sell order")
                 sell_cycle_id = cycle_id
                 strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
-                cursor = conn.execute(
-                    """INSERT INTO paper_orders(
-                           account_id,side,code,name,qty,planned_price,status,reason,
-                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-                       VALUES(?,?,?,?,?,?,'pending_execution',?,?,?,?,?,?,?)""",
-                    (position["account_id"], "sell", position["code"], position.get("name"),
-                     qty, price, reason, _json(detail), _now(),
-                     *strategy_stamp, sell_cycle_id),
+                cursor = PRW.insert_sell_order(
+                    conn, position, qty=qty, price=price, status="pending_execution",
+                    reason=reason, detail=detail, strategy_stamp=strategy_stamp,
+                    cycle_id=sell_cycle_id, now=_now(),
                 )
                 order_id = int(cursor.lastrowid)
                 # R32-E1：这条卖出委托由 Risk Authority 的退出决策产生，因此在写入

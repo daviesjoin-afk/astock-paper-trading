@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paper_portfolio_read_model as P  # noqa: E402
 import paper_position_read_model as PPRM  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import execution_verification as EV  # noqa: E402
 
 ACCOUNT = next(iter(PT.ACCOUNT_SPECS))
 CODE = "600519"
@@ -104,6 +105,102 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         context = P.PortfolioReadContext(cycle_id=str(self.cycle100), asof_day=DAY.isoformat())
         self.assertEqual(context.cycle_id, self.cycle100)
         self.assertEqual(context.asof_day, DAY)
+
+    def test_snapshot_reuses_proof_without_changing_facts_or_mutable_results(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        self.conn.execute("BEGIN")
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+
+        def capture(conn):
+            first = P.portfolio_for_context(conn, context)
+            lots, status = P.bounded_lots_with_status(conn, context)
+            lots[0]["remaining_qty"] = -999
+            second, second_status = P.bounded_lots_with_status(conn, context)
+            self.assertEqual(second[0]["remaining_qty"], 100)
+            self.assertEqual(status, second_status)
+            return first, P.portfolio_for_context(conn, context)
+
+        statements = []
+        self.conn.set_trace_callback(statements.append)
+        expected = capture(self.conn)
+        uncached_count = len(statements)
+        statements.clear()
+        actual = P.snapshot_read(capture)(self.conn)
+        self.conn.set_trace_callback(None)
+        self.assertEqual(actual, expected)
+        self.assertLess(len(statements), uncached_count // 2)
+        self.assertIsNone(P._snapshot_reads.get())
+
+    def test_snapshot_next_capture_observes_new_fills_and_keeps_unknown_proof(self):
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+
+        @P.snapshot_read
+        def capture(conn):
+            return P.bounded_lots_with_status(conn, context)
+
+        self.conn.execute("BEGIN")
+        self.assertEqual(capture(self.conn), ([], P.STATUS_VERIFIED))
+        self._lot(self.cycle100, 100, 10.0)  # missing verified source
+        self.conn.commit()
+        self.conn.execute("BEGIN")
+        lots, status = capture(self.conn)
+        self.assertEqual(status, P.STATUS_UNKNOWN)
+        self.assertEqual(lots[0]["qty"], 100)
+        self.assertEqual(capture(self.conn),
+                         P.bounded_lots_with_status(self.conn, context))
+
+    def test_snapshot_bypasses_implicit_reads_and_cleans_up_after_failure(self):
+        calls = []
+
+        @P._snapshot_evidence
+        def evidence(conn):
+            calls.append(1)
+            return [len(calls)]
+
+        @P.snapshot_read
+        def capture(conn):
+            return evidence(conn), evidence(conn)
+
+        self.assertEqual(capture(self.conn), ([1], [2]))
+        self.conn.execute("BEGIN")
+        self.assertEqual(capture(self.conn), ([3], [3]))
+        self.assertEqual(capture(self.conn), ([4], [4]))
+
+        @P.snapshot_read
+        def broken(conn):
+            evidence(conn)
+            raise ValueError("capture failed")
+
+        with self.assertRaisesRegex(ValueError, "capture failed"):
+            broken(self.conn)
+        self.assertIsNone(P._snapshot_reads.get())
+        self.assertEqual(capture(self.conn), ([6], [6]))
+
+    def test_snapshot_invalidates_on_write_and_separates_connection_and_context(self):
+        other = sqlite3.connect(":memory:")
+        self.addCleanup(other.close)
+        calls = []
+
+        @P._snapshot_evidence
+        def evidence(conn, cycle, day):
+            calls.append(1)
+            return len(calls)
+
+        @P.snapshot_read
+        def capture(conn):
+            self.assertEqual(evidence(conn, 1, DAY), evidence(conn, 1, DAY))
+            self.assertNotEqual(evidence(conn, 1, DAY), evidence(conn, 2, DAY))
+            self.assertNotEqual(evidence(conn, 1, DAY), evidence(conn, 1, NEXT))
+            self.assertNotEqual(evidence(other, 1, DAY), evidence(other, 1, DAY))
+            before = evidence(conn, 1, DAY)
+            conn.execute("UPDATE paper_accounts SET name=name WHERE id=?", (ACCOUNT,))
+            self.assertNotEqual(before, evidence(conn, 1, DAY))
+
+        self.conn.execute("BEGIN")
+        capture(self.conn)
 
     def test_port1_explicit_cycle_owns_quantity(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
@@ -1190,6 +1287,59 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         future = self._portfolio(self.cycle100, NEXT, valuations={CODE: 20.0})
         self.assertEqual(future["cash"], 99990.0)
         self.assertEqual(future["nav"], 100990.0)
+
+    def test_terminal_zero_orders_do_not_poison_verified_cash(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        for side in ("buy", "sell"):
+            order = self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                         price=10.0, fill_date=DAY.isoformat())
+            self.conn.execute("DELETE FROM paper_fills WHERE order_id=?", (order,))
+            self.conn.execute(
+                "UPDATE paper_orders SET status='superseded',execution_status=NULL,"
+                "execution_verified=NULL,filled_price=NULL,amount=NULL,fees=NULL,"
+                "executed_at=NULL,realized_pnl=NULL WHERE id=?", (order,))
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        before = [tuple(r) for r in self.conn.execute("SELECT * FROM paper_fills")]
+        result = EV.stamp_terminal_zero_orders(self.conn, cycle_id=self.cycle100)
+        self.assertEqual(result["confirmed_zero"], 2)
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+        self.assertEqual(before, [tuple(r) for r in self.conn.execute("SELECT * FROM paper_fills")])
+        self.assertEqual(P.verified_cash_flows(self.conn, context)[(ACCOUNT, CODE)],
+                         {"buy_cash": 1005.0, "sell_cash": 0.0})
+        self.assertEqual(EV.stamp_terminal_zero_orders(
+            self.conn, cycle_id=self.cycle100)["confirmed_zero"], 0)
+        self.conn.commit()
+        self.conn.execute("PRAGMA query_only=ON")
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+
+    def test_terminal_fill_conflict_is_never_assumed_zero(self):
+        order = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                     price=10.0, fill_date=DAY.isoformat())
+        self.conn.execute("UPDATE paper_orders SET status='cancelled',"
+                          "execution_status=NULL,execution_verified=NULL WHERE id=?", (order,))
+        self.assertEqual(EV.stamp_terminal_zero_orders(
+            self.conn, cycle_id=self.cycle100)["confirmed_zero"], 0)
+        self.conn.execute("UPDATE paper_orders SET execution_status='not_executed',"
+                          "execution_verified=0 WHERE id=?", (order,))
+        self.assertEqual(P.cash(self.conn, P.PortfolioReadContext(self.cycle100, DAY)),
+                         (None, "unknown"))
+
+    def test_proven_partial_buy_cash_survives_cancellation(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.execute("UPDATE paper_orders SET qty=200,filled_qty=100,remaining_qty=100,"
+                          "status='partially_filled',execution_status='partial',execution_verified=0 WHERE id=?", (buy,))
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+        self.conn.execute("UPDATE paper_orders SET status='cancelled' WHERE id=?", (buy,))
+        self.assertEqual(P.cash(self.conn, context), (98995.0, "verified"))
+        self.assertEqual(P.verified_cash_flows(self.conn, context)[(ACCOUNT, CODE)]["buy_cash"], 1005.0)
+        self.conn.execute("UPDATE paper_orders SET execution_status='unknown' WHERE id=?", (buy,))
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
 
     def test_port12_current_read_behavior_remains_compatible(self):
         self.conn.execute(

@@ -23,7 +23,7 @@
   同一套计划逻辑，避免“提交时一套口径、触发时另一套口径”；
 - :func:`commit_fill`：统一成交落库原语（预留 → 扣款 → 记 lot → 写 fill → 风险日志）。
 
-本模块不在导入期依赖 ``paper_trading``（惰性取用，避免循环导入），且不改任何
+本模块由应用组装层注入具名能力，不反向导入 ``paper_trading``，且不改任何
 既有门禁的判定口径——只改“谁来编排”。``evaluate_entry_state`` 与 ``market_gate``
 新增可选 ``execution_policy`` / ``policy`` 入参：缺省时行为与既有一致（走
 ``policy_for(account_id)``），显式传入已冻结快照时只消费该对象，不再解析当前策略表。
@@ -46,6 +46,7 @@ from typing import Any
 import paper_position_risk_state as PPRS
 import market_data_contract as MDC
 import paper_trading_rules as PTR
+import strategy_policies as SPOL
 
 __all__ = [
     "EXECUTION_PLANNER_VERSION",
@@ -544,6 +545,7 @@ def execution_context_from_facts(
     quote: Mapping[str, Any],
     asof_day,
     reserved: bool = False,
+    dependencies: ExecutionDependencies | None = None,
 ) -> ExecutionContext:
     """Freeze supplied quote + PIT archive facts for the execution decision.
 
@@ -566,10 +568,13 @@ def execution_context_from_facts(
             MDC.EXECUTION_QUOTE_POLICY, MDC.REASON_ASOF_UNPROVABLE,
             access_mode=MDC.ACCESS_READ,
         )
-    tradability = TA.tradability_at(
-        row.get("code"), day, decision_time=execution_asof,
-        repository=TA.TradabilityArchiveRepository(conn),
-    )
+    if quote.get("tradability_observation_status") == "unavailable":
+        tradability = TA.unknown_decision(row.get("code"), day, decision_time=execution_asof)
+    else:
+        tradability = TA.tradability_at(
+            row.get("code"), day, decision_time=execution_asof,
+            repository=TA.TradabilityArchiveRepository(conn),
+        )
     cycle_id = row.get("cycle_id")
     sellable = None
     if row.get("side") == "sell" and cycle_id is not None and day:
@@ -586,7 +591,7 @@ def execution_context_from_facts(
             sellable = None
     buying_power = None
     if row.get("side") == "buy":
-        PT = _pt()
+        PT = dependencies if dependencies is not None else _pt()
         if reserved:
             reservation = conn.execute(
                 "SELECT amount,fees,status FROM paper_capital_reservations WHERE order_key=?",
@@ -999,10 +1004,46 @@ class ExecutionPolicy:
         return bool(owner) and not self.holds_reserved_seat and pool_limit > 1 and len(pool_open_positions) >= pool_limit - 1
 
 
+@dataclass(frozen=True)
+class ExecutionDependencies:
+    """Ledger and policy capabilities, never a reference to the engine module."""
+    ENTRY_RETRY_SIGNAL_STATUSES: Any
+    OrderCycleProvenanceUnknown: Any
+    _assert_active_lease: Any
+    _assert_order_execution_cycle: Any
+    _audit: Any
+    _consume_available_lots: Any
+    _consume_capital_reservation: Any
+    _credit_shared_cash: Any
+    _date: Any
+    _debit_shared_cash: Any
+    _execution_quote_status: Any
+    _finish_capital_reservation: Any
+    _json: Any
+    _now: Any
+    _order_cycle_provenance_for_order: Any
+    _pending_buy_reservations: Any
+    _record_lot: Any
+    _reserve_shared_capital: Any
+    _risk_log: Any
+    _security_scope: Any
+    _shared_cash: Any
+    _sync_positions: Any
+
+
+_dependencies_factory = None
+
+
+def bind_dependencies(factory):
+    global _dependencies_factory
+    _dependencies_factory = factory
+
+
 def _pt():
-    """惰性取用 paper_trading（避免导入期循环依赖）。"""
-    import paper_trading as PT
-    return PT
+    """Compatibility accessor for explicitly bound execution dependencies."""
+    if _dependencies_factory is None:
+        raise RuntimeError("execution dependencies have not been configured")
+    return _dependencies_factory()
 
 
 def _ev():
@@ -1012,14 +1053,13 @@ def _ev():
 
 
 def _default_policies() -> dict[str, ExecutionPolicy]:
-    """按 paper_trading 的账户常量构造默认策略表。
+    """按声明层的账户常量构造默认策略表，不加载交易引擎。
 
     身份到能力的映射只在这里出现一次：执行路径里不再有
     “比较账户 ID”之类的判断。
     """
-    PT = _pt()
-    main_force = str(getattr(PT, "MAIN_FORCE_STRATEGY_ID", "") or "")
-    quality_breakout = str(getattr(PT, "NEW_STRATEGY_ID", "") or "")
+    main_force = SPOL.MAIN_FORCE_STRATEGY_ID
+    quality_breakout = SPOL.NEW_STRATEGY_ID
     policies: dict[str, ExecutionPolicy] = {}
 
     def put(account_id: str, **kwargs) -> None:
@@ -1821,13 +1861,14 @@ def commit_fill(
     is_t_base: bool = True,
     sell_next_take_stage: int | None = None,
     execution_context: ExecutionContext | None = None,
+    dependencies: ExecutionDependencies | None = None,
 ):
     """唯一模拟执行与账务提交权威：评估 → 有证据成交 → 原子写入。
 
     ``plan`` 只携带调用方预先取到的行情事实；最终数量、价格、费用和状态都由
     Execution Simulation Authority 重算。provider 读取绝不能发生在本事务中。
     """
-    PT = _pt()
+    PT = dependencies if dependencies is not None else _pt()
     order_cursor = conn.execute("SELECT * FROM paper_orders WHERE id=?", (int(order_id),))
     order = _row_mapping(order_cursor, order_cursor.fetchone())
     if order is None:
@@ -1876,8 +1917,12 @@ def commit_fill(
     )
 
     quote = plan.get("execution_quote") or plan.get("quote") or {}
+    if execution_context is None and quote.get("tradability_observation"):
+        import paper_live_tradability as PLTrad
+        PLTrad.persist(conn, quote, code=code, asof_day=asof_day)
     context = execution_context or execution_context_from_facts(
         conn=conn, order=order, quote=quote, asof_day=asof_day, reserved=reserved,
+        dependencies=PT,
     )
     intent = PersistedOrderIntent(
         order_id=int(order_id), account_id=account_id,

@@ -332,6 +332,12 @@ export async function cancelManualDataUpdate(){
   finally{ if(btn){btn.disabled=false;btn.textContent='取消增量';} }
 }
 
+export function selectionContextNotice(d){
+  var labels={finance:'财报',sentiment:'情绪'};
+  var pending=(Array.isArray(d.context_pending)?d.context_pending:[]).filter(function(key){return Object.prototype.hasOwnProperty.call(labels,key);}).map(function(key){return labels[key];});
+  return pending.length ? '<div class="banner">'+pending.join('、')+'数据待补充，本次仅展示已有数据下的结果；请稍后再次选股，不能据此判断没有合格股票。</div>' : '';
+}
+
 export function renderSelectionResult(d, fromCache){
     if(d.need_init){ $('selectResult').innerHTML = '<div class="banner">'+d.message+'。请运行 start.bat 完成数据初始化后重试。</div>'; return; }
     if(!d.picks){ $('selectResult').innerHTML = '<div class="banner">暂无已完成的选股结果，请点击“开始选股”。</div>'; return; }
@@ -355,8 +361,9 @@ export function renderSelectionResult(d, fromCache){
       return '<span class="tag '+cls+'">'+(b.tier||'-')+' '+(b.action||'')+'</span>';
     }
     var gateHtml = d.gate? ('<span class="tag '+(d.gate.light==='red'?'tag-warn':(d.gate.light==='yellow'?'tag-warn':'tag-ok'))+'">'+d.gate.advice+'</span>') : '';
-    $('selectResult').innerHTML =
-      '<div class="result-toolbar">'+(fromCache?'<span class="tag tag-info">最近已完成结果（未重新计算）</span>':'<span class="tag tag-ok">刚刚完成</span>')+gateHtml
+    var contextNotice=selectionContextNotice(d);
+    $('selectResult').innerHTML = contextNotice
+      +'<div class="result-toolbar">'+(contextNotice?'<span class="tag tag-warn">数据未齐</span>':(fromCache?'<span class="tag tag-info">最近已完成结果（未重新计算）</span>':'<span class="tag tag-ok">刚刚完成</span>'))+gateHtml
       +' <span class="tag tag-info">当前计算覆盖 '+d.universe_size+'/'+d.total_universe+'只</span>'
       +' <span class="tag tag-info">硬规则命中 '+(d.candidate_count||0)+'只</span>'
       +' <span class="tag tag-info">'+(d.flow_source||'超大单净流入排序')+'</span>'
@@ -428,8 +435,8 @@ export async function compareStrategies(){
       });
       rows += '</tr>';
     }
-    $('selectResult').innerHTML =
-      '<div style="margin-bottom:8px"><span class="tag tag-info">Top '+adaptiveEsc(topn)+' 三策略对比</span></div>'
+    $('selectResult').innerHTML = selectionContextNotice({context_pending:[...new Set(results.flatMap(function(r){return r.context_pending||[];}))]})
+      +'<div style="margin-bottom:8px"><span class="tag tag-info">Top '+adaptiveEsc(topn)+' 三策略对比</span></div>'
       +tableScroll('<table><tr><th>#</th><th>三日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th>'
       +'<th>五日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th>'
       +'<th>十日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th></tr>'+rows+'</table>',1180)

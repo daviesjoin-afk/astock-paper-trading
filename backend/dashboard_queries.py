@@ -2,8 +2,8 @@
 """纸盘只读查询（read-model）模块。
 
 从 ``paper_trading.py`` 拆出的 dashboard 工作区只读投影。模块刻意不依赖
-``paper_trading`` 的顶层导入顺序：对仍驻留在主编排文件中的共享辅助采用
-函数体延迟导入，避免与主模块产生循环依赖。当前阶段仅承载 ``dashboard()``，
+``paper_trading`` 的顶层导入顺序：共享辅助由组装入口显式注入，
+模块不反向导入主编排文件。当前阶段仅承载 ``dashboard()``，
 后续按同一模式继续迁出其它只读查询（risk/audit/read-model helpers）。
 """
 
@@ -11,7 +11,68 @@ import datetime as dt
 import sqlite3
 import time
 
-def dashboard(include_activity=False, include_history_symbols=False):
+from dataclasses import dataclass
+from typing import Any, Callable
+
+
+class DashboardUnavailable(RuntimeError):
+    """The initialized ledger has no readable current cycle."""
+
+
+def active_cycle_readonly(conn):
+    cursor = conn.execute(
+        "SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise DashboardUnavailable("当前模拟周期不可用，请先初始化模拟盘")
+    return dict(zip((column[0] for column in cursor.description), row, strict=True))
+
+
+@dataclass(frozen=True)
+class DashboardDependencies:
+    """Explicit capabilities supplied by the application composition root."""
+    ACCOUNT_SPECS: Any
+    ENTRY_FROZEN_WAITLIST_STATUS: Any
+    _account_metric_inputs: Any
+    _account_metrics: Any
+    _account_reference_capital: Any
+    _active_account_rows: Any
+    _db_readonly: Any
+    _economic_pool_nav_history: Any
+    _entry_freeze_status: Any
+    _execution_verified_predicate: Any
+    _hold_days: Any
+    _latest_price_map: Any
+    _loads: Any
+    _market_session: Any
+    _num: Any
+    _position_rows: Any
+    _recent_orders_with_archives: Any
+    _rows: Any
+    _schedule_cache: Any
+    _shared_initial_cash: Any
+    _shared_metrics: Any
+    _today_position_performance: Any
+    dfc: Any
+    schedule_status: Any
+
+
+_dependencies_factory: Callable[[], DashboardDependencies] | None = None
+
+
+def bind_dependencies(factory: Callable[[], DashboardDependencies]):
+    global _dependencies_factory
+    _dependencies_factory = factory
+
+
+def _dependencies() -> DashboardDependencies:
+    if _dependencies_factory is None:
+        raise RuntimeError("dashboard_queries dependencies have not been configured")
+    return _dependencies_factory()
+
+
+def dashboard(include_activity=False, include_history_symbols=False, *, dependencies=None):
     """Return the paper workspace read model without hidden-page ledger scans.
 
     The browser requests cross-cycle orders and the history selector only in
@@ -20,16 +81,31 @@ def dashboard(include_activity=False, include_history_symbols=False):
     report on every click.
     """
 
-    from paper_trading import (  # deferred: dashboard_queries stays import-order independent of the monolith
-        ACCOUNT_SPECS, ENTRY_FROZEN_WAITLIST_STATUS, _account_metric_inputs, _account_metrics,
-        _account_reference_capital, _active_account_rows, _active_cycle, _db,
-        _economic_pool_nav_history, _entry_freeze_status,
-        _hold_days, _latest_price_map, _loads, _market_session, _num,
-        _position_rows, _recent_orders_with_archives, _rows,
-        _schedule_cache, _shared_initial_cash, _shared_metrics,
-        _today_position_performance, dfc, schedule_status,
-        _execution_verified_predicate,
-    )
+    deps = dependencies if dependencies is not None else _dependencies()
+    ACCOUNT_SPECS = deps.ACCOUNT_SPECS
+    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
+    _account_metric_inputs = deps._account_metric_inputs
+    _account_metrics = deps._account_metrics
+    _account_reference_capital = deps._account_reference_capital
+    _active_account_rows = deps._active_account_rows
+    _db_readonly = deps._db_readonly
+    _economic_pool_nav_history = deps._economic_pool_nav_history
+    _entry_freeze_status = deps._entry_freeze_status
+    _hold_days = deps._hold_days
+    _latest_price_map = deps._latest_price_map
+    _loads = deps._loads
+    _market_session = deps._market_session
+    _num = deps._num
+    _position_rows = deps._position_rows
+    _recent_orders_with_archives = deps._recent_orders_with_archives
+    _rows = deps._rows
+    _schedule_cache = deps._schedule_cache
+    _shared_initial_cash = deps._shared_initial_cash
+    _shared_metrics = deps._shared_metrics
+    _today_position_performance = deps._today_position_performance
+    dfc = deps.dfc
+    schedule_status = deps.schedule_status
+    _execution_verified_predicate = deps._execution_verified_predicate
     import market_data_service as MDSvc
 
     # Cache schedule_status to avoid repeated init_db() calls
@@ -41,8 +117,8 @@ def dashboard(include_activity=False, include_history_symbols=False):
         _schedule_cache["data"] = schedule
         _schedule_cache["ts"] = now_ts
     market_session = _market_session()
-    with _db() as conn:
-        cycle = _active_cycle(conn)
+    with _db_readonly() as conn:
+        cycle = active_cycle_readonly(conn)
         account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=dt.date.today())
         today = dt.date.today().isoformat()
@@ -77,7 +153,8 @@ def dashboard(include_activity=False, include_history_symbols=False):
             row = _snapshot_by_code.get(str(_code))
             if row is not None:
                 quotes[str(_code)] = dict(row)
-        for _code, row in (_latest_price_map(codes) if codes else {}).items():
+        missing_codes = [code for code in codes if code not in quotes]
+        for _code, row in (_latest_price_map(missing_codes) if missing_codes else {}).items():
             existing = quotes.get(_code)
             if not isinstance(existing, dict) or not isinstance(existing.get("price"), (int, float)):
                 quotes[_code] = row
@@ -110,7 +187,8 @@ def dashboard(include_activity=False, include_history_symbols=False):
         # ``_account_metrics`` normally backfills today's sold symbols with a
         # live quote.  The compact risk read model is intentionally
         # network-free, so provide its cache-only marks up front instead.
-        for code, row in (_latest_price_map(sold_codes) if sold_codes else {}).items():
+        missing_sold_codes = [code for code in sold_codes if code not in quotes]
+        for code, row in (_latest_price_map(missing_sold_codes) if missing_sold_codes else {}).items():
             quotes.setdefault(code, row)
         accounts = [
             _account_metrics(
@@ -119,6 +197,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
                 quotes=quotes,
                 positions=[p for p in positions if p["account_id"] == row["id"]],
                 metric_cache=metric_cache,
+                allow_network=False,
             )
             for row in account_rows
         ]

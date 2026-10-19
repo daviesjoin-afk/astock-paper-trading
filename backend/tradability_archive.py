@@ -1085,6 +1085,17 @@ class TradabilityProvider:
 # ─────────────────────────────── 顶层入口 ───────────────────────────────
 
 
+def unknown_decision(code, session, *, decision_time):
+    """Owner-issued unknown when current status evidence is unavailable."""
+    return TradabilityDecision(
+        code=_text(code) or "", session_date=_session(session) or str(session or ""),
+        decision_time=_canonical_instant(decision_time), can_buy=False, can_sell=False,
+        buy_block_reason=TradabilityReason.UNKNOWN_STATE,
+        sell_block_reason=TradabilityReason.UNKNOWN_STATE, source=None,
+        effective_at=None, observed_at=None, fingerprint=None, evidence_present=False,
+    )
+
+
 def tradability_at(
     code: Any,
     session: Any,
@@ -1096,25 +1107,9 @@ def tradability_at(
 
     没有可见事实记录时返回 ``UNKNOWN_STATE``（买卖都阻断），并保持审计字段存在。
     """
-    code_text = _text(code) or ""
-    session_text = _session(session) or str(session or "")
-    reference = _canonical_instant(decision_time)
     evidence = repository.evidence_at(code, session, decision_time)
     if evidence is None:
-        return TradabilityDecision(
-            code=code_text,
-            session_date=session_text,
-            decision_time=reference,
-            can_buy=False,
-            can_sell=False,
-            buy_block_reason=TradabilityReason.UNKNOWN_STATE,
-            sell_block_reason=TradabilityReason.UNKNOWN_STATE,
-            source=None,
-            effective_at=None,
-            observed_at=None,
-            fingerprint=None,
-            evidence_present=False,
-        )
+        return unknown_decision(code, session, decision_time=decision_time)
     return TradabilityEvaluator.evaluate(
         evidence,
         decision_time=decision_time,

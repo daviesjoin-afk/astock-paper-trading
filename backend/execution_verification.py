@@ -544,6 +544,35 @@ def has_verified_positive_execution(
     return row is not None
 
 
+def is_confirmed_zero_row(row: Any) -> bool:
+    """A coherent owner-issued zero execution, distinct from unknown."""
+    flag = _row_field(row, "execution_verified")
+    return (type(flag) in (int, float, bool) and flag == 0
+            and _row_field(row, "execution_status") == EXECUTION_STATUS_NOT_EXECUTED)
+
+
+def stamp_terminal_zero_orders(conn, *, cycle_id: int) -> dict:
+    """Reconcile unclassified terminal zero orders at a live write boundary."""
+    orders = _dict_rows(conn.execute(
+        "SELECT * FROM paper_orders WHERE cycle_id=? "
+        "AND status IN ('cancelled','expired','superseded','risk_rejected') "
+        "AND (execution_status IS NULL OR execution_status='unknown') "
+        "AND (execution_verified IS NULL OR execution_verified=0)", (int(cycle_id),)))
+    fills = _fills_for_orders(conn, [row["id"] for row in orders])
+    updates = []
+    for row in orders:
+        if fills.get(int(row["id"])):
+            continue
+        verdict = verification_for_order(row, ())
+        if verdict["execution_status"] == EXECUTION_STATUS_NOT_EXECUTED:
+            updates.append((verdict["execution_status"], 0,
+                            verdict["execution_evidence_source"], row["id"]))
+    conn.executemany(
+        "UPDATE paper_orders SET execution_status=?,execution_verified=?,"
+        "execution_evidence_source=? WHERE id=?", updates)
+    return {"scanned": len(orders), "confirmed_zero": len(updates)}
+
+
 def stamp_order(conn, order_id: Any) -> dict:
     """把验证结论写回 ``paper_orders`` 的三列。返回写入的结论。
 

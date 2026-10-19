@@ -7,16 +7,30 @@ import tempfile
 import threading
 import time
 import datetime as dt
+import importlib
+import data_paths
 from contextlib import contextmanager
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
-import adaptive_engine as adaptive
-import adaptive_learning_dispatch as learning_dispatch
 import paper_position_read_model as PPRM
 import paper_storage as PST
-import self_evolution as SE
+
+
+def _implementation(name):
+    """Load a route implementation on use, preserving legacy module aliases."""
+    override = globals().get(name)
+    if override is not None:
+        return override
+    modules = {"adaptive": "adaptive_engine", "learning_dispatch": "adaptive_learning_dispatch", "SE": "self_evolution"}
+    if name not in modules:
+        raise AttributeError(name)
+    return importlib.import_module(modules[name])
+
+
+def __getattr__(name):
+    return _implementation(name)
 
 
 router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
@@ -50,6 +64,7 @@ class RobustnessRequest(BaseModel):
 @contextmanager
 def _experiment_validation_connection(*, query_only: bool):
     """Open only the adaptive DB and the additive validation ledger schema."""
+    adaptive = _implementation("adaptive")
     db_path = adaptive.DB_PATH
     if query_only:
         if not os.path.exists(db_path):
@@ -118,6 +133,7 @@ def _paper_rebalance_db():
     连接归属（Round-11）与周期归属（Round-12）是两件事，必须同时成立：
     调仓状态既属于 paper ledger，也属于**某一个** paper cycle。
     """
+    adaptive = _implementation("adaptive")
     with PST.db(adaptive.PAPER_DB_PATH) as conn:
         yield conn
 
@@ -195,7 +211,7 @@ def _fetch_rebalance_quotes():
 _MANUAL_ACTOR = "human-ui"
 _OVERVIEW_TTL_SECONDS = 60.0
 _OVERVIEW_SNAPSHOT_PATH = os.path.join(
-    getattr(adaptive, "CACHE_DIR", os.path.join(os.path.dirname(__file__), "data_cache")),
+    data_paths.data_dir(),
     "adaptive_overview_ui_snapshot.json",
 )
 
@@ -249,6 +265,7 @@ def _schedule_overview_refresh() -> None:
 
     def worker() -> None:
         try:
+            adaptive = _implementation("adaptive")
             # The engine keeps its own coherent short cache.  Forcing a full
             # SQLite/attribution rebuild here defeated the non-blocking API
             # cache and made ordinary tab switches contend with research work.
@@ -299,6 +316,7 @@ def overview():
 @router.get("/ai/settings")
 def ai_settings():
     """Return safe AI controls, explanations, and provider capabilities."""
+    adaptive = _implementation("adaptive")
     return adaptive.ai_settings_schema()
 
 
@@ -314,6 +332,7 @@ def update_ai_settings(
     llm_realtime_mode: str | None = Query(None),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "保存AI调参设置")
     updates = {k: v for k, v in {
         "llm_advisor_enabled": llm_advisor_enabled,
@@ -334,6 +353,7 @@ def update_ai_settings(
 @router.get("/ai/overview")
 def ai_overview():
     """Fast AI tab payload; full evidence aggregation always runs in background."""
+    adaptive = _implementation("adaptive")
     with _overview_lock:
         data = _overview_cache.get("data")
         refreshing = bool(_overview_cache.get("running"))
@@ -356,6 +376,7 @@ def ai_timeline(
     trade_date: str | None = Query(None, max_length=10),
 ):
     """Expose the persisted AI-analysis timeline used by the adaptive page."""
+    adaptive = _implementation("adaptive")
     try:
         return adaptive.ai_analysis_timeline(limit=limit, trade_date=trade_date)
     except Exception as exc:
@@ -371,6 +392,7 @@ def _canonical_research_connection():
     permitted setup is the idempotent canonical ledger schema, followed by SQLite's
     query-only mode for the actual repository read.
     """
+    adaptive = _implementation("adaptive")
     db_path = adaptive.DB_PATH
     db_directory = os.path.dirname(os.path.abspath(db_path))
     if db_directory:
@@ -833,6 +855,7 @@ def run_ai_analysis(
     confirmed: bool = Query(False),
 ):
     """Run research at the caller-declared business day and market instant."""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "重试分时段AI分析")
     try:
         return adaptive.run_scheduled_ai_analysis(
@@ -851,6 +874,7 @@ def trade_attributions(
     trade_date: str | None = Query(None, min_length=10, max_length=10),
 ):
     """逐笔收盘归因：个股走势、大盘/板块贡献、公告事件和 AI 摘要。"""
+    adaptive = _implementation("adaptive")
     return adaptive.trade_attributions(limit=limit, account_id=account_id, trade_date=trade_date)
 
 
@@ -859,6 +883,7 @@ def run(
     trigger: str = Query("manual", max_length=40),
     confirmed: bool = Query(False),
 ):
+    learning_dispatch = _implementation("learning_dispatch")
     _require_confirmation(confirmed, "运行模拟盘学习")
     accepted, state = learning_dispatch.enqueue(trigger)
     return {
@@ -870,6 +895,7 @@ def run(
 
 @router.get("/run/status")
 def run_status():
+    learning_dispatch = _implementation("learning_dispatch")
     return learning_dispatch.read_status()
 
 
@@ -883,6 +909,7 @@ def run_advisor(
     cycle_id: int | None = Query(None, gt=0),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "运行数据质量审阅")
     try:
         return adaptive.run_advisor_review(
@@ -916,6 +943,7 @@ def run_advisor_suite(
     cycle_id: int | None = Query(None, gt=0),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "运行研究套件")
     try:
         return adaptive.run_advisor_suite(
@@ -937,6 +965,7 @@ def run_ai_tuning(
     confirmed: bool = Query(False),
 ):
     """Run the bounded DeepSeek tuner for the five paper accounts only."""
+    adaptive = _implementation("adaptive")
     if mode not in {"intraday", "close", "shadow"}:
         raise HTTPException(status_code=422, detail="调参模式只支持 intraday、close 或 shadow")
     _require_confirmation(confirmed, "运行 AI 有界调参")
@@ -958,6 +987,7 @@ def run_news_learning(
     trigger: str = Query("manual-ui", max_length=40),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "运行新闻学习")
     try:
         return adaptive.run_news_learning(trigger=trigger)
@@ -973,6 +1003,7 @@ def feedback(
     note: str = Query("", max_length=500),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "写入人工反馈")
     try:
         return adaptive.record_feedback(decision_id, account_id, verdict, note)
@@ -986,6 +1017,7 @@ def apply_risk_candidate(
     approved_by: str = Query("human", max_length=80),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "批准风控版本")
     try:
         # Keep the legacy query parameter for client compatibility, but never
@@ -1001,6 +1033,7 @@ def rollback_risk(
     reason: str = Query("人工回滚", max_length=300),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "回滚风控版本")
     try:
         return adaptive.rollback_risk(account_id, reason)
@@ -1014,6 +1047,7 @@ def rollback_selection(
     reason: str = Query("人工回滚", max_length=300),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "回滚选股版本")
     try:
         return adaptive.rollback_selection(account_id, reason)
@@ -1028,6 +1062,7 @@ def apply_selection(
     confirmed: bool = Query(False),
 ):
     """人工确认结构化选股进化候选；参数级候选仍可由周期自动应用。"""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "批准选股版本")
     try:
         # Keep the legacy query parameter for client compatibility, but never
@@ -1048,6 +1083,7 @@ def apply_allocation(
     confirmed: bool = Query(False),
 ):
     """人工批准把 Bandit 策略权重写入共享资金池分摊。"""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "批准资金分摊版本")
     import evolution_apply
     try:
@@ -1065,6 +1101,7 @@ def rollback_allocation(
     reason: str = Query("人工回滚", max_length=300),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "回滚资金分摊版本")
     import evolution_apply
     try:
@@ -1083,6 +1120,7 @@ def apply_tuner_proposals(
     confirmed: bool = Query(False),
 ):
     """人工批准把双AI共识提案写入选股因子权重覆盖。"""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "批准AI调参提案")
     import evolution_apply
     try:
@@ -1100,6 +1138,7 @@ def rollback_tuner_overlay(
     reason: str = Query("人工回滚", max_length=300),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "回滚AI调参覆盖")
     import evolution_apply
     try:
@@ -1116,6 +1155,7 @@ def approve_neural_network(
     confirmed: bool = Query(False),
 ):
     """人工确认神经网络进入有界影子排序；不允许绕过任何交易硬门禁。"""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "批准神经网络影子评分")
     try:
         return adaptive.approve_neural_network(confirmed=True, approved_by=_MANUAL_ACTOR)
@@ -1130,6 +1170,7 @@ def rollback_rebalance(
     confirmed: bool = Query(False),
 ):
     """Semantic alias used by the paper-rebalance workspace."""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "回滚调仓版本")
     try:
         return adaptive.rollback_selection(account_id, reason)
@@ -1307,6 +1348,7 @@ def get_rebalance_plans(status: str = Query("all")):
 
 @router.get("/dual-ai/status")
 def dual_ai_status():
+    adaptive = _implementation("adaptive")
     cached = _cache_get("dual_ai_status", ttl=30)
     if cached is not None:
         return cached
@@ -1326,6 +1368,7 @@ def ai_review_status():
 
 @router.get("/dual-ai/keys")
 def dual_ai_api_keys():
+    adaptive = _implementation("adaptive")
     try:
         return {"keys": adaptive.get_dual_ai_api_keys_fn()}
     except Exception as exc:
@@ -1342,6 +1385,7 @@ def update_dual_ai_api_key(
     confirmed: bool = Query(False),
 ):
     """历史入口：``provider`` 作为槽位别名（mimo→ai1、deepseek→ai2）。"""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, f"保存 {provider} API配置")
     try:
         adaptive.update_ai_slot_fn(
@@ -1357,6 +1401,7 @@ def run_dual_ai_tuning(
     mode: str = Query("intraday", max_length=30),
     confirmed: bool = Query(False),
 ):
+    adaptive = _implementation("adaptive")
     if mode not in {"intraday", "close", "shadow"}:
         raise HTTPException(status_code=422, detail="调参模式只支持 intraday、close 或 shadow")
     _require_confirmation(confirmed, "运行双AI共识调参")
@@ -1368,6 +1413,7 @@ def run_dual_ai_tuning(
 
 @router.get("/dual-ai/runs")
 def dual_ai_runs(limit: int = Query(20, ge=1, le=100)):
+    adaptive = _implementation("adaptive")
     try:
         import dual_ai_tuner
         with adaptive._connect() as conn:
@@ -1381,6 +1427,7 @@ def dual_ai_runs(limit: int = Query(20, ge=1, le=100)):
 
 @router.get("/evolution/status")
 def evolution_status():
+    adaptive = _implementation("adaptive")
     cached = _cache_get("evolution_status", ttl=30)
     if cached is not None:
         return cached
@@ -1399,6 +1446,8 @@ def evolution_params(strategy_id: str = Query(None, max_length=100)):
     旧接口只回一行"当前参数"，无法分辨它到底是**生效版本**还是
     **刚插入的候选**。这里把三者分开返回。
     """
+    SE = _implementation("SE")
+    adaptive = _implementation("adaptive")
     try:
         return adaptive.get_evolution_params_fn(strategy_id)
     except SE.EvolutionLifecycleError as exc:
@@ -1411,6 +1460,7 @@ def evolution_params(strategy_id: str = Query(None, max_length=100)):
 @router.post("/evolution/evolve")
 def trigger_evolution(confirmed: bool = Query(False)):
     """触发一次进化 —— 只**生成候选**，不激活。"""
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, "执行自进化")
     try:
         return adaptive.trigger_evolution_fn()
@@ -1429,6 +1479,8 @@ def activate_evolution_candidate(
     激活前仍要过 stale CAS —— 若候选创建时的基线已不是当前生效版本，
     返回 409，绝不静默 rebase 或覆盖。
     """
+    SE = _implementation("SE")
+    adaptive = _implementation("adaptive")
     _require_confirmation(confirmed, f"激活候选参数 #{params_id}")
     try:
         return adaptive.activate_evolution_candidate_fn(
@@ -1446,6 +1498,7 @@ def activate_evolution_candidate(
 
 @router.get("/evolution/metrics")
 def evolution_metrics(window: int = Query(20, ge=5, le=100)):
+    adaptive = _implementation("adaptive")
     try:
         return adaptive.evolution_metrics_fn(window)
     except Exception as exc:
@@ -1454,6 +1507,7 @@ def evolution_metrics(window: int = Query(20, ge=5, le=100)):
 
 @router.get("/evolution/log")
 def evolution_log(limit: int = Query(50, ge=1, le=200)):
+    adaptive = _implementation("adaptive")
     try:
         return {"log": adaptive.evolution_log_fn(limit)}
     except Exception as exc:
@@ -1464,6 +1518,7 @@ def evolution_log(limit: int = Query(50, ge=1, le=200)):
 
 @router.get("/modlens/status")
 def modlens_status():
+    adaptive = _implementation("adaptive")
     try:
         return adaptive.modlens_status_fn()
     except Exception as exc:
@@ -1475,6 +1530,7 @@ def modlens_read_image(
     path: str = Query(..., max_length=1000),
     prompt: str = Query(None, max_length=500),
 ):
+    adaptive = _implementation("adaptive")
     try:
         return adaptive.modlens_read_image_fn(path, prompt)
     except Exception as exc:

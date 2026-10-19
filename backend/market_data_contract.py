@@ -73,8 +73,8 @@ __all__ = [
     # reasons
     "REASON_MISSING", "REASON_STALE", "REASON_INCOMPLETE",
     "REASON_PROVIDER_UNAVAILABLE", "REASON_REFRESH_FAILED",
-    "REASON_CROSS_SOURCE_FAILED", "REASON_ASOF_UNPROVABLE",
-    "REASON_ASOF_MISMATCH", "REASONS",
+    "REASON_CROSS_SOURCE_FAILED", "REASON_PRICE_ONLY_COVERAGE",
+    "REASON_ASOF_UNPROVABLE", "REASON_ASOF_MISMATCH", "REASONS",
     # status label
     "STATUS_FRESH", "STATUS_STALE", "STATUS_DEGRADED", "STATUS_UNAVAILABLE",
     "STATUS_UNVERIFIED", "STATUSES",
@@ -84,6 +84,7 @@ __all__ = [
     "CLOSE_SNAPSHOT_POLICY", "MARKET_HEALTH_POLICY", "EXECUTION_QUOTE_POLICY",
     "POLICIES", "policy_named",
     "CROSS_SECTION_MIN_FRESH_RATIO", "fresh_ratio",
+    "close_snapshot_window", "close_snapshot_rows", "provider_max_age",
     # snapshot / reading
     "MarketDataSnapshot", "MarketDataReading", "snapshot_fingerprint",
     # helpers
@@ -203,6 +204,9 @@ REASON_PROVIDER_UNAVAILABLE = "provider_unavailable"
 REASON_REFRESH_FAILED = "refresh_failed"
 #: 多源核验失败（超容差或核验源不可用）。
 REASON_CROSS_SOURCE_FAILED = "cross_source_failed"
+#: 只有价格覆盖（例如腾讯价格回退），没有全市场横截面字段。它**不是**
+#: "结构不完整"，也**不是**"过期"：可用，但必须显式降级展示与消费。
+REASON_PRICE_ONLY_COVERAGE = "price_only_coverage"
 #: 无法证明该 as-of 的事实（**禁止**回落到 current）。
 REASON_ASOF_UNPROVABLE = "asof_unprovable"
 #: snapshot 的业务日与请求的 as-of 不符。
@@ -210,7 +214,8 @@ REASON_ASOF_MISMATCH = "asof_mismatch"
 REASONS = (
     REASON_MISSING, REASON_STALE, REASON_INCOMPLETE,
     REASON_PROVIDER_UNAVAILABLE, REASON_REFRESH_FAILED,
-    REASON_CROSS_SOURCE_FAILED, REASON_ASOF_UNPROVABLE, REASON_ASOF_MISMATCH,
+    REASON_CROSS_SOURCE_FAILED, REASON_PRICE_ONLY_COVERAGE,
+    REASON_ASOF_UNPROVABLE, REASON_ASOF_MISMATCH,
 )
 
 # ---------------------------------------------------------------------------
@@ -250,7 +255,7 @@ class MarketDataPolicy:
     刚更新的数据"会因为是完整 payload、且最新一条够新而被判 fresh，
     而这显然不是一个可信的实时横截面。
 
-    刻意不是配置框架：只有名字、一个窗口、一个比例。
+    收盘政策把窗口锚定到指定交易日的 15:00；max_age_seconds 是收盘前的容忍秒数。
     """
 
     name: str
@@ -301,9 +306,11 @@ UNIVERSE_BUILD_POLICY = MarketDataPolicy("universe_build", 300.0)
 #: 成交归因报告：盘后离线使用，窗口最宽。
 ATTRIBUTION_POLICY = MarketDataPolicy("trade_attribution", 900.0)
 
-#: 收盘/强制刷新：窗口为零，即"必须真的去取一次源"。
-#: 既有的 ``max_age=0, force=True`` 语义由它统一表达，调用方不再各写一遍 0。
-CLOSE_SNAPSHOT_POLICY = MarketDataPolicy("close_snapshot", 0.0)
+#: 收盘事实：指定交易日 14:59 起的报价；force 是独立的联网参数。
+#: 一分钟容忍沿用原收盘任务规则，缺时间和跨日行计入未覆盖。
+CLOSE_SNAPSHOT_POLICY = MarketDataPolicy(
+    "close_snapshot", 60.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
+)
 
 #: ``/api/health`` 的 data-validity 展示：既有口径是盘中 1800s / 非盘中更宽。
 #: 它**不**并入 ``LIVE_MARKET_POLICY`` 的 240s —— 两者业务问题不同：
@@ -515,8 +522,9 @@ def snapshot_fingerprint(snapshot: MarketDataSnapshot) -> str:
     ) for row in snapshot.rows]
     details = _fact_value(snapshot.verification_detail)
     if isinstance(details, dict):
-        details.pop("fresh_ratio", None)
-        details.pop("min_fresh_ratio", None)
+        for key in ("fresh_ratio", "min_fresh_ratio", "close_fresh_rows",
+                    "close_min_quote_at", "close_reference_day"):
+            details.pop(key, None)
     payload = {
         "schema": "market-evidence-fingerprint-v1",
         "kind": snapshot.kind,
@@ -673,7 +681,53 @@ def reading_for_refresh_failure(
                     refresh_failed=True)
 
 
-def fresh_ratio(rows: Any, now: Any, max_age: float) -> float | None:
+def close_snapshot_window(now: Any, asof_day: Any = None):
+    """Pure source-time bounds for one completed session; never infer a calendar."""
+    current = _parse_instant(now)
+    if current is None:
+        return None
+    zone = dt.timezone(dt.timedelta(hours=8))
+    current = current.astimezone(zone)
+    day_text = canonical_day(asof_day) if asof_day is not None else current.date().isoformat()
+    if day_text is None:
+        return None
+    day = dt.date.fromisoformat(day_text)
+    close = dt.datetime(day.year, day.month, day.day, 15, tzinfo=zone)
+    if current < close:
+        return None
+    lower = close - dt.timedelta(seconds=CLOSE_SNAPSHOT_POLICY.max_age_seconds)
+    midnight = dt.datetime(day.year, day.month, day.day, tzinfo=zone) + dt.timedelta(days=1)
+    upper = min(current + dt.timedelta(seconds=120), midnight - dt.timedelta(microseconds=1))
+    return lower, upper
+
+
+def close_snapshot_rows(rows: Any, now: Any, asof_day: Any = None):
+    """One closing-time rule shared by the authority and its consumers."""
+    window = close_snapshot_window(now, asof_day)
+    if window is None:
+        return []
+    lower, upper = window
+    valid = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        observed = _parse_instant(row.get("quote_at") or row.get("observed_at"))
+        if observed is not None and lower <= observed <= upper:
+            valid.append(row)
+    return valid
+
+
+def provider_max_age(policy: MarketDataPolicy, now: Any, asof_day: Any = None):
+    """Translate observation policy to provider cache age; force stays independent."""
+    if policy.name != CLOSE_SNAPSHOT_POLICY.name:
+        return policy.max_age_seconds
+    window = close_snapshot_window(now, asof_day)
+    if window is None:
+        return None
+    return (_parse_instant(now) - window[0]).total_seconds()
+
+
+def fresh_ratio(rows: Any, now: Any, max_age: float, *, max_future_seconds=None) -> float | None:
     """窗口内的行数占**可解析总行数**的比例；无可解析行时 ``None``。
 
     横截面新鲜度必须看比例，而不是"最新那一行够不够新"。
@@ -683,18 +737,26 @@ def fresh_ratio(rows: Any, now: Any, max_age: float) -> float | None:
         return None
     parsed = 0
     fresh = 0
+    count = 0
     for row in rows or ():
+        count += 1
         if not isinstance(row, Mapping):
             continue
-        age = _age_seconds(row.get("quote_at") or row.get("observed_at"), current)
+        value = row.get("quote_at") or row.get("observed_at")
+        age = _age_seconds(value, current)
         if age is None:
             continue
         parsed += 1
-        if age <= max_age:
-            fresh += 1
+        if max_future_seconds is None:
+            fresh += age <= max_age
+        else:
+            observed = _parse_instant(value)
+            signed_age = (current - observed).total_seconds()
+            fresh += -max_future_seconds <= signed_age <= max_age
     if not parsed:
         return None
-    return fresh / parsed
+    # Price-only artifacts count missing timestamps against their coverage.
+    return fresh / (count if max_future_seconds is not None else parsed)
 
 
 def _cross_section_freshness(
@@ -775,13 +837,29 @@ def classify(
 
     age = _age_seconds(snapshot.observed_at, now)
     deadline = _parse_instant(now)
-    satisfied, ratio = _cross_section_freshness(
-        snapshot.rows, deadline, policy, age,
-    )
     detail = dict(snapshot.verification_detail)
+    price_only = snapshot.degraded_reason == REASON_PRICE_ONLY_COVERAGE
+    min_ratio = policy.min_fresh_ratio
+    if policy.name == CLOSE_SNAPSHOT_POLICY.name:
+        valid_rows = close_snapshot_rows(snapshot.rows, now, asof_day)
+        ratio = len(valid_rows) / len(snapshot.rows) if snapshot.rows else None
+        min_ratio = max(CROSS_SECTION_MIN_FRESH_RATIO, min_ratio)
+        satisfied = ratio is not None and ratio >= min_ratio
+        window = close_snapshot_window(now, asof_day)
+        detail.update({
+            "close_fresh_rows": len(valid_rows),
+            "close_min_quote_at": window[0].isoformat() if window else None,
+            "close_reference_day": window[0].date().isoformat() if window else None,
+        })
+    elif price_only:
+        ratio = fresh_ratio(snapshot.rows, now, policy.max_age_seconds, max_future_seconds=120)
+        min_ratio = max(CROSS_SECTION_MIN_FRESH_RATIO, min_ratio)
+        satisfied = ratio is not None and ratio >= min_ratio
+    else:
+        satisfied, ratio = _cross_section_freshness(snapshot.rows, deadline, policy, age)
     if ratio is not None:
         detail["fresh_ratio"] = round(ratio, 4)
-        detail["min_fresh_ratio"] = policy.min_fresh_ratio
+        detail["min_fresh_ratio"] = min_ratio
 
     def _reading(**overrides) -> MarketDataReading:
         base = {
@@ -793,7 +871,7 @@ def classify(
         base.update(overrides)
         return MarketDataReading(**base)
 
-    if not snapshot.complete:
+    if not snapshot.complete and not price_only:
         return _reading(
             availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_STALE,
             status=STATUS_STALE,
@@ -825,6 +903,10 @@ def classify(
             freshness=FRESHNESS_UNKNOWN if age is None else FRESHNESS_STALE,
             status=STATUS_STALE, reason=REASON_STALE,
         )
+
+    if price_only:
+        return _reading(availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_FRESH,
+                        status=STATUS_DEGRADED, reason=REASON_PRICE_ONLY_COVERAGE)
 
     single_source = snapshot.verification in (
         VERIFICATION_SINGLE_SOURCE, VERIFICATION_NOT_ATTEMPTED,

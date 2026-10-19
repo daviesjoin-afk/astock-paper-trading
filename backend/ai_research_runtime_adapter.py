@@ -118,7 +118,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-import adaptive_engine as AE
+import adaptive_runtime_facts as AE
 import ai_research_contract as ARC
 import paper_trading as PT
 

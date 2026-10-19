@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import marketdata_cache as cache
 
@@ -55,14 +56,16 @@ class MarketDataCacheTests(unittest.TestCase):
             self.assertFalse(thread_lock.locked())
 
     def test_source_health_round_trip(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with mock.patch("marketdata_feeds.feed_health_snapshot", return_value={}), \
+                tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "health.json")
             payload = {"healthy": True, "rows": 3}
             cache.save_source_health(path, payload)
             self.assertEqual(cache.load_source_health(path), payload)
 
     def test_missing_source_health_is_empty(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with mock.patch("marketdata_feeds.feed_health_snapshot", return_value={}), \
+                tempfile.TemporaryDirectory() as directory:
             self.assertEqual(cache.load_source_health(os.path.join(directory, "missing.json")), {})
 
 

@@ -9,10 +9,23 @@ import datetime as dt
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-import adaptive_engine as adaptive
 import paper_sizing as sizing
 import paper_trading as P
 import runtime_settings as RSET
+
+
+def _get_adaptive():
+    override = globals().get("adaptive")
+    if override is not None:
+        return override
+    import adaptive_engine
+    return adaptive_engine
+
+
+def __getattr__(name):
+    if name == "adaptive":
+        return _get_adaptive()
+    raise AttributeError(name)
 
 
 router = APIRouter(prefix="/api/settings", tags=["runtime-settings"])
@@ -44,6 +57,7 @@ def _planned_end(started_at: str | None, duration_days: int | None) -> str | Non
 
 
 def _snapshot() -> dict:
+    adaptive = _get_adaptive()
     P.init_db()
     with P._db() as conn:  # the paper module owns the storage boundary
         settings = RSET.read(conn)
@@ -135,6 +149,7 @@ def settings_snapshot():
 
 @router.post("/")
 async def update_settings(request: Request, confirmed: bool = Query(False)):
+    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "保存运行设置")
     try:
         body = await request.json()
@@ -179,6 +194,7 @@ async def update_ai_key(request: Request, confirmed: bool = Query(False)):
     新代码请用 ``PUT /api/settings/ai-review/slots/{slot}``；本路由的返回结构与
     ``/ai-review`` 完全一致，不再返回厂商专属视图。
     """
+    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "保存AI接口配置")
     try:
         body = await request.json()
@@ -223,6 +239,7 @@ async def _read_json_object(request: Request, message: str) -> dict:
 
 @router.get("/ai-review")
 def ai_review_snapshot():
+    adaptive = _get_adaptive()
     try:
         return adaptive.ai_review_settings_fn()
     except Exception as exc:
@@ -231,6 +248,7 @@ def ai_review_snapshot():
 
 @router.put("/ai-review")
 async def update_ai_review(request: Request, confirmed: bool = Query(False)):
+    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "切换AI审核模式")
     body = await _read_json_object(request, "AI审核设置必须是JSON对象")
     unknown = set(body) - _AI_REVIEW_KEYS
@@ -251,6 +269,7 @@ async def update_ai_review(request: Request, confirmed: bool = Query(False)):
 
 @router.put("/ai-review/slots/{slot}")
 async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Query(False)):
+    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "保存AI槽位配置")
     body = await _read_json_object(request, "AI槽位配置必须是JSON对象")
     unknown = set(body) - _AI_SLOT_KEYS
@@ -283,6 +302,7 @@ async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Q
 @router.post("/ai-review/slots/{slot}/test")
 def test_ai_review_slot(slot: str, confirmed: bool = Query(False)):
     """对指定槽位做一次真实连通性探测；返回结构绝不含明文 Key。"""
+    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "测试AI槽位连通性")
     try:
         return adaptive.test_ai_slot_fn(slot)

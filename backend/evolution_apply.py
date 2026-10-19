@@ -24,10 +24,34 @@ import copy
 import datetime as dt
 import sqlite3
 import zoneinfo
+from dataclasses import dataclass
+from typing import Any, Callable
 import paper_repository as PRP
+import adaptive_configuration as AConfig
+import strategy_registry as SR
 
 import evolution_adversarial as adversarial
 from adaptive_common import _json, _loads, _now
+
+
+@dataclass(frozen=True)
+class AllocationDependencies:
+    config: Callable[..., Any]
+    account_labels: Any
+
+
+_allocation_dependencies_factory = None
+
+
+def bind_allocation_dependencies(factory):
+    global _allocation_dependencies_factory
+    _allocation_dependencies_factory = factory
+
+
+def _allocation_dependencies():
+    if _allocation_dependencies_factory is not None:
+        return _allocation_dependencies_factory()
+    return AllocationDependencies(AConfig.read_config, SR.labels())
 
 TZ = zoneinfo.ZoneInfo("Asia/Shanghai")
 _APPLY_MAX_AGE_SECONDS = 30 * 60
@@ -176,12 +200,12 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
         if updated is None or (now - updated).total_seconds() > _APPLY_MAX_AGE_SECONDS:
             raise ValueError("决策快照已超过30分钟有效期，请重新运行学习生成")
 
-        import adaptive_engine as engine
-        cfg = engine._config(conn)
+        deps = _allocation_dependencies()
+        cfg = deps.config(conn)
         min_pct = float(cfg["min_strategy_weight_pct"])
         max_pct = float(cfg["max_strategy_weight_pct"])
         weights = _validate_allocation_weights(
-            _loads(row["weights"], {}) or {}, sorted(engine.ACCOUNT_LABELS), min_pct, max_pct,
+            _loads(row["weights"], {}) or {}, sorted(deps.account_labels), min_pct, max_pct,
         )
         decision_date = str(row["decision_date"] or "")
 

@@ -102,10 +102,6 @@ def _date(value=None):
     return _now().date()
 
 
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str)
-
-
 def _num(value, default=0.0):
     try:
         return float(value) if value is not None else default

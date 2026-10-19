@@ -2,6 +2,8 @@
 """数据层：东方财富 + 腾讯免费公开接口，全部实测验证于 2026-07-28
 传输层：requests + Session 连接复用，大幅降低进程开销"""
 import datetime as dt
+import contextvars
+import copy
 import os, json, time, threading, uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +13,7 @@ import marketdata_cache as MDC
 import marketdata_feeds as MDF
 import marketdata_normalizers as MN
 import marketdata_providers as MP
+import data_paths
 from marketdata_transport import (
     HEADERS,
     _session,
@@ -38,11 +41,14 @@ MARKET_SNAPSHOT_FULL_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_full.
 MARKET_SNAPSHOT_SAMPLE_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_sample_20.json")
 MARKET_SNAPSHOT_FULL_LOCK_PATH = MARKET_SNAPSHOT_FULL_CACHE_PATH + ".lock"
 DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
+FINANCE_CACHE_PATH = data_paths.data_path("finance_latest.json")
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
 _cache_lock = threading.Lock()
 _mem_cache = {}
+_finance_fetch_lock = threading.Lock()
+_finance_fetch_state = {"retry_at": 0.0}
 _full_snapshot_thread_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _manifest = None
@@ -50,9 +56,37 @@ _manifest_mtime = None
 _manifest_dirty = 0
 _manifest_pending = {}
 
+_health_probe_scope = contextvars.ContextVar("health_probe_scope", default=None)
+
+
+@contextmanager
+def health_probe_scope():
+    """Reuse only a recent successful forced probe inside one caller workflow."""
+    token = _health_probe_scope.set({})
+    try:
+        yield
+    finally:
+        _health_probe_scope.reset(token)
+
 
 def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
+
+
+def cached_age_seconds(key):
+    """Read provider-cache age without extending its lifetime or fetching data."""
+    with _cache_lock:
+        entry = _mem_cache.get(key)
+    if entry is None:
+        return None
+    try:
+        age = time.time() - float(entry[0])
+    except (TypeError, ValueError, IndexError):
+        return float("inf")
+    return age if 0 <= age < float("inf") else float("inf")
+
+
+_full_snapshot_lock_context = threading.local()
 
 
 @contextmanager
@@ -65,10 +99,19 @@ def _full_snapshot_singleflight_lock():
     development has no ``fcntl``; the process-local lock still protects its
     threads and the lock file remains harmless.
     """
+    # Nested publishers reuse this thread's existing file-lock ownership.
+    if getattr(_full_snapshot_lock_context, "held", False):
+        yield
+        return
     with MDC.full_snapshot_singleflight_lock(
         _full_snapshot_thread_lock, MARKET_SNAPSHOT_FULL_LOCK_PATH
     ):
-        yield
+        _full_snapshot_lock_context.held = True
+        try:
+            yield
+        finally:
+            _full_snapshot_lock_context.held = False
+
 
 def _get_json(url, params=None, timeout=15, retries=2):
     txt = http_get(url, params=params, timeout=timeout, retries=retries)
@@ -93,7 +136,14 @@ def check_data_source_health(force=False):
     can run before every five-minute paper scan.  An empty/invalid response
     never enters the cache; the session is closed and both source families are
     retried once with host rotation before the caller proceeds.
+    A forced success can be reused for at most 30 seconds within an explicit
+    workflow scope; failures are never reused and scope exit clears the window.
     """
+    scope = _health_probe_scope.get()
+    if force and scope is not None:
+        cached = scope.get("successful_probe")
+        if cached is not None and time.monotonic() - cached[0] < 30:
+            return copy.deepcopy(cached[1])
     previous = load_source_health()
     checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
     if not force and previous.get("checked_at"):
@@ -198,6 +248,10 @@ def check_data_source_health(force=False):
         "action": "正常使用" if healthy else ("已重连并降级使用可用源" if reconnected else "等待下一轮自动重连"),
     }
     _save_source_health(payload)
+    if force and scope is not None and healthy:
+        scope["successful_probe"] = (time.monotonic(), copy.deepcopy(payload))
+    elif scope is not None:
+        scope.pop("successful_probe", None)
     return payload
 
 # ---------- 1. 大盘指数 + 海外市场实时（腾讯接口） ----------
@@ -592,21 +646,18 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
         complete_enough = pages is not None or full_coverage
         if rows and complete_enough:
             try:
-                temp_path = f"{cache_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-                with open(temp_path, "w", encoding="utf-8") as handle:
-                    payload = {
-                        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "rows": rows,
-                    }
-                    if pages is None:
-                        payload.update({
-                            "complete": bool(pagination_complete),
-                            "expected_rows": int(raw_meta.get("total") or len(rows)),
-                            "pages_expected": int(raw_meta.get("pages_expected") or 0),
-                            "pages_ok": int(raw_meta.get("pages_ok") or 0),
-                        })
-                    json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
-                os.replace(temp_path, cache_path)
+                payload = {"saved_at": dt.datetime.now(dt.timezone.utc).isoformat(), "rows": rows}
+                if pages is None:
+                    payload.update({"complete": bool(pagination_complete),
+                                    "expected_rows": int(raw_meta.get("total") or len(rows)),
+                                    "pages_expected": int(raw_meta.get("pages_expected") or 0),
+                                    "pages_ok": int(raw_meta.get("pages_ok") or 0)})
+                    _publish_full_snapshot(payload)
+                else:
+                    temp_path = f"{cache_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                    with open(temp_path, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+                    os.replace(temp_path, cache_path)
             except OSError:
                 pass
             return rows
@@ -616,6 +667,126 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
         # scan.  The caller opts into that legacy fallback explicitly.
         return _disk_fallback() if allow_disk_fallback else []
     return _cached(f"snapshot_{pages}", 120, _do)
+
+
+def fetch_tencent_market_snapshot(codes, *, max_age, now, force=False):
+    """Serialize fallback requests and publication with the primary writer."""
+    normalized = MDF.normalize_codes(codes)
+    if len(normalized) < _full_market_min_rows():
+        return []
+    with _full_snapshot_singleflight_lock():
+        if not force:
+            cached = _fresh_full_snapshot_from_disk(max_age)
+            wanted = set(normalized)
+            usable = [row for row in cached or [] if row.get("code") in wanted]
+            if len(usable) >= max(_full_market_min_rows(), len(wanted) * 0.90):
+                return usable
+        return _fetch_tencent_market_snapshot_locked(normalized, max_age=max_age, now=now)
+
+
+def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
+    """Build a price-only full-market slice from the formal current code list."""
+    normalized = MDF.normalize_codes(codes)
+    if len(normalized) < _full_market_min_rows():
+        return []
+    rows = fetch_tencent_realtime_for_codes(normalized)
+    allowed = set(normalized)
+    by_code = {
+        str(row.get("code")): row for row in rows
+        if isinstance(row, dict) and str(row.get("code")) in allowed
+        and MDF.usable_quote(row)
+        and MN.finite_number(row.get("pct")) is not None
+    }
+    if (len(by_code) < _full_market_min_rows()
+            or len(by_code) / len(normalized) < 0.90):
+        return []
+    try:
+        from market_data_contract import _parse_instant
+    except ImportError:
+        from .market_data_contract import _parse_instant
+    current = _parse_instant(now)
+    if current is None:
+        return []
+
+    def _tencent_instant(value):
+        try:
+            return dt.datetime.strptime(value, "%Y%m%d%H%M%S").replace(
+                tzinfo=dt.timezone(dt.timedelta(hours=8))
+            )
+        except (TypeError, ValueError):
+            return None
+
+    fresh = 0
+    for row in by_code.values():
+        observed = _tencent_instant(row["quote_at"])
+        if observed is not None:
+            age = (current - observed).total_seconds()
+            if -120 <= age <= max_age:
+                fresh += 1
+    if fresh / len(normalized) < 0.90:
+        return []
+    snapshot = []
+    for code in normalized:
+        row = by_code.get(code)
+        if row is None:
+            continue
+        observed = _tencent_instant(row["quote_at"])
+        if observed is None or not -120 <= (current - observed).total_seconds() <= max_age:
+            continue
+        snapshot.append({
+            "code": code, "name": row.get("name"), "price": MN.finite_number(row["price"]),
+            "pct": MN.finite_number(row["pct"]), "prev_close": MN.finite_number(row.get("prev_close")),
+            "quote_at": observed.isoformat(timespec="seconds"),
+            "observed_at": observed.isoformat(timespec="seconds"),
+            "source": "tencent_public_quote",
+            "open_price": None, "high": None, "low": None,
+            "volume": None, "amount": None, "turnover": None,
+            "pe": None, "vol_ratio": None, "mktcap": None,
+            "float_cap": None, "pb": None, "industry": None,
+            "main_net": None, "super_net": None, "big_net": None,
+            "mid_net": None, "small_net": None, "main_pct": None,
+        })
+    return snapshot if _persist_tencent_snapshot(snapshot, normalized) else []
+
+
+def _publish_full_snapshot(payload):
+    """Atomically publish a full-market payload under the shared singleflight lock.
+
+    The full-market cache is shared by every writer (Eastmoney refresh, Tencent
+    fallback, close task, data worker).  Publishing outside the lock lets two
+    refreshes interleave so a partial Eastmoney page set can overwrite a
+    complete Tencent snapshot, and vice versa.
+    """
+    with _full_snapshot_singleflight_lock():
+        temp_path = f"{MARKET_SNAPSHOT_FULL_CACHE_PATH}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            os.replace(temp_path, MARKET_SNAPSHOT_FULL_CACHE_PATH)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        with _cache_lock:
+            _mem_cache.pop("snapshot_None", None)
+
+
+def _persist_tencent_snapshot(snapshot, normalized):
+    """Persist a Tencent price-only snapshot as an explicitly labelled artifact.
+
+    ``source`` is part of the payload so readers can tell a price-only slice
+    from an Eastmoney cross-section: it must never be mistaken for evidence
+    that flow, valuation or sector fields were verified too.
+    """
+    if len(snapshot) < _full_market_min_rows():
+        return False
+    payload = {
+        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": "tencent_public_quote_full_snapshot",
+        "rows": snapshot, "complete": True, "expected_rows": len(normalized),
+        "pages_expected": 0, "pages_ok": 0,
+    }
+    _publish_full_snapshot(payload)
+    return True
 
 
 def _full_snapshot_payload_is_complete(payload):
@@ -693,6 +864,14 @@ def _fresh_full_snapshot_from_disk(max_age):
             except (TypeError, ValueError):
                 # Preserve the previous mtime fallback for malformed quote_at.
                 pass
+        if payload.get("source") == "tencent_public_quote_full_snapshot":
+            try:
+                from market_data_contract import fresh_ratio
+            except ImportError:
+                from .market_data_contract import fresh_ratio
+            ratio = fresh_ratio(rows, dt.datetime.now(dt.timezone.utc), max_age, max_future_seconds=120)
+            if ratio is None or ratio < 0.90:
+                return None
         return rows
     except (OSError, ValueError, TypeError):
         return None
@@ -1072,12 +1251,35 @@ def fetch_finance_latest():
                 merged[code]["annual_net_profit"] = row.get("net_profit")
                 merged[code]["annual_report_date"] = annual_date
             break
+        if not merged:
+            # A truthy metadata envelope must not cache an empty provider
+            # response as a successful six-hour financial snapshot.
+            return None
         return {
             "data": merged,
             "report_dates": used_dates,
             "annual_report_date": annual_used,
         }
-    return _cached("finance", 3600 * 6, _do)
+    def _attempt():
+        if time.monotonic() < _finance_fetch_state["retry_at"]:
+            return None
+        try:
+            value = _do()
+        except Exception:
+            _finance_fetch_state["retry_at"] = time.monotonic() + 30
+            raise
+        if not value:
+            _finance_fetch_state["retry_at"] = time.monotonic() + 30
+        return value
+    # Serializing the existing cache check also coalesces concurrent misses.
+    # Empty attempts wait briefly, rather than either retrying per strategy
+    # or becoming a successful six-hour cache entry.
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, _finance_fetch_lock, "finance", FINANCE_CACHE_PATH,
+        3600 * 6, _attempt,
+        lambda value: isinstance(value, dict) and isinstance(value.get("data"), dict)
+        and any(isinstance(row, dict) and row for row in value["data"].values()),
+    ) or {"data": {}, "report_dates": [], "annual_report_date": None}
 
 def _fetch_finance_report(report_date):
     rows = []
@@ -1529,7 +1731,7 @@ def get_kline_manifest():
 
 
 def rebuild_kline_manifest():
-    """Reconcile metadata with existing CSV files after upgrading old caches."""
+    """Reconcile CSV metadata, reading only new or changed files."""
     global _manifest, _manifest_mtime, _manifest_dirty, _manifest_pending
     existing = get_kline_manifest()
     rebuilt = {}
@@ -1537,11 +1739,33 @@ def rebuild_kline_manifest():
         if not filename.endswith(".csv"):
             continue
         code = filename[:-4]
+        path = kline_cache_path(code)
+        try:
+            file_stat = os.stat(path)
+        except OSError:
+            continue
+        prior = existing.get(code, {})
+        # Legacy entries have no file signature and must be read once.  Do not
+        # trust an incomplete entry merely because its file signature matches.
+        if (
+            isinstance(prior, dict)
+            and {"rows", "first_date", "last_date", "source", "adjustment"}.issubset(prior)
+            and prior.get("file_mtime_ns") == file_stat.st_mtime_ns
+            and prior.get("file_size") == file_stat.st_size
+        ):
+            continue
         frame = load_cached_kline(code)
         if frame is None:
             continue
+        try:
+            after_stat = os.stat(path)
+        except OSError:
+            continue
+        # A concurrent atomic replacement must not certify metadata read from
+        # a different file version.  Retry it on the next reconciliation.
+        if (file_stat.st_mtime_ns, file_stat.st_size) != (after_stat.st_mtime_ns, after_stat.st_size):
+            continue
         valid = frame.dropna(subset=["close"])
-        prior = existing.get(code, {})
         rebuilt[code] = {
             "rows": int(len(valid)),
             "first_date": str(valid.index[0].date()) if len(valid) else None,
@@ -1549,14 +1773,19 @@ def rebuild_kline_manifest():
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "source": prior.get("source", "unknown"),
             "adjustment": prior.get("adjustment", "unknown"),
+            "file_mtime_ns": after_stat.st_mtime_ns,
+            "file_size": after_stat.st_size,
         }
     with _manifest_lock:
         manifest = _load_kline_manifest_unlocked()
+        # Prefer metadata published by another writer during the CSV scan.
+        rebuilt = {code: meta for code, meta in rebuilt.items() if manifest.get(code) == existing.get(code)}
         manifest.update(rebuilt)
         _manifest = manifest
         _manifest_pending.update(rebuilt)
-        _manifest_dirty += len(rebuilt) or 1
-        _flush_kline_manifest_unlocked()
+        _manifest_dirty += len(rebuilt)
+        if _manifest_pending:
+            _flush_kline_manifest_unlocked()
     return manifest
 
 # ---------- 6. 海外市场历史（用于风险门控与回测择时） ----------
@@ -1569,14 +1798,24 @@ OVERSEAS_SECIDS = {
 def fetch_overseas_history(beg="20230101"):
     def _do():
         out = {}
-        for key, (secid, name) in OVERSEAS_SECIDS.items():
+        def _one(item):
+            key, (secid, name) = item
             try:
                 df = fetch_kline(None, beg=beg, secid=secid)
-                if df is not None and not df.empty:
-                    out[key] = {"name": name, "df": df}
+                return key, {"name": name, "df": df} if (df is not None and not df.empty) else None
             except Exception:
-                continue
-            time.sleep(0.15)
+                return key, None
+
+        # 5 个境外指数各自独立抓取，没有依赖顺序。串行 + 150 毫秒限速在
+        # 单线程下把 5 次 K 线抓取排成一串，整段累积到 6+ 秒。改成线程池
+        # 后只付一次 TCP/TLS 握手的最慢者，限速 sleep 也不再需要：不同
+        # 主机/不同 secid 互不争用同一个令牌桶。
+        items = list(OVERSEAS_SECIDS.items())
+        with ThreadPoolExecutor(max_workers=min(5, len(items) or 1)) as pool:
+            results = pool.map(_one, items)
+        for key, value in results:
+            if value is not None:
+                out[key] = value
         return out
     return _cached("overseas", 1800, _do)
 

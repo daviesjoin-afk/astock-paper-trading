@@ -1,0 +1,92 @@
+{
+  "audit_target": "三端调度契约统一性",
+  "date": "2026-10-13",
+  "baseline": "当前工作区 codex/r36c-selection-iteration-policy @ 23ef095 + 迁移的架构改动",
+  "端定义": {
+    "后端": "backend/（paper_slot_service / paper_runner / paper_trading / dashboard_queries）",
+    "前端": "frontend/src/（ESM 模块，esbuild 打包到 frontend/dist/）",
+    "部署": "deploy/（cron / sync-cron.sh / run_paper_slot.sh / install-centos9.sh）"
+  },
+  "已通过的统一": [
+    {
+      "契约": "HTTP API 路径",
+      "状态": "干净",
+      "证据": "前端 32 个 /api 路径全部能在 OpenAPI 中找到；4 处疑似漂移均为路径参数模板拼接（experiments/runs/{id}、research/runs/{id}、settings/ai-review/slots/{slot}、strategies/{id}）",
+      "守门": "CI browser-e2e + frontend/tests/api-request-contract.test.mjs + backend/test_operator_boundary.py"
+    },
+    {
+      "契约": "operator 凭据方法白名单",
+      "状态": "已统一",
+      "证据": "frontend/src/core/api.js 的 MUTATION_METHODS 与 backend/operator_auth.py 的 WRITE_METHODS 逐字对齐；测试双侧行为断言"
+    },
+    {
+      "契约": "Windows 任务名 vs schedule_status 探测名",
+      "状态": "一致",
+      "证据": "install_windows_schedule 的 6 个任务名与 schedule_status 的 names 完全相同"
+    }
+  ],
+  "发现的缺口": [
+    {
+      "编号": "G1",
+      "契约": "slot 词表无单一事实来源",
+      "严重度": "中",
+      "现状": {
+        "paper_slot_service.SUPPORTED_SLOTS": [
+          "auction",
+          "open",
+          "risk",
+          "close",
+          "weekly-review",
+          "intraday"
+        ],
+        "paper_runner choices": [
+          "auction",
+          "open",
+          "risk",
+          "close",
+          "weekly-review",
+          "intraday",
+          "fast-entry"
+        ],
+        "install_windows_schedule definitions": [
+          "auction",
+          "intraday",
+          "open",
+          "close",
+          "weekly-review"
+        ],
+        "deploy/astock-codex.cron": [
+          "auction",
+          "intraday",
+          "open",
+          "close",
+          "weekly-review"
+        ],
+        "paper_trading.HOT_PATH_SLOTS": [
+          "auction",
+          "open",
+          "risk",
+          "intraday",
+          "fast-entry"
+        ]
+      },
+      "实际影响": "fast-entry 是 runner 专有分支（不走 run_slot），SUPPORTED_SLOTS 不含它属正确；risk 在三端都是合法 slot 但 cron 与 Windows 都无独立入口，靠 cron 注释说明由 intraday 统一执行——这个约定只存在于注释里，无任何测试或代码守护",
+      "验证": "work/_gap.py, work/_gap2.py 输出；validate_slot('fast-entry') 实测抛 ValueError"
+    },
+    {
+      "编号": "G2",
+      "契约": "cron 与 install_windows_schedule 的时间表无共同来源",
+      "严重度": "中",
+      "现状": "cron 用 33-59/3、*/3、0-25/3 等表达式表达每3分钟；Windows 用 /RI 3 /DU 01:55 表达同样语义；两套写法无共享定义，改一处另一处不会跟着变",
+      "实际影响": "调整盘中扫描频率需要同时改 cron 表达式和 Windows 任务定义，漏一处就造成平台间行为不一致"
+    },
+    {
+      "编号": "G3",
+      "契约": "schedule_status 只探测 Windows schtasks，Linux 只查文件存在",
+      "严重度": "低",
+      "现状": "os.name == 'nt' 逐个 schtasks /Query；否则只检查 /etc/cron.d/astock-quant 是否存在",
+      "实际影响": "Linux 上页面显示「已安装」只代表 cron 文件在，不代表任务真的在跑；用户无法从界面区分"
+    }
+  ],
+  "结论": "HTTP 与凭据契约已被 CI 守住；调度契约是三端真正未统一的部分，且缺口集中在「slot 词表」和「时间表」两份各自为政的定义上。"
+}

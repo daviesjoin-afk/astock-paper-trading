@@ -17,14 +17,14 @@ class FrontendRiskAuditRaceTests(unittest.TestCase):
     def test_activity_tab_late_switch_fetches_audit_payload(self):
         """Activity 工作区渲染时必须保证能拿到审计数据。
 
-        2026-09-08 起 audit 请求在并行启动之外多了一层 stale-while-revalidate
-        缓存：优先用并行请求 / 上次缓存，两者皆无时仍会现场拉取，保证延迟
-        切换到 activity 页时审计记录一定出现（而不是静默缺失）。
+        Activity 渲染委托给等待预取结果的分页加载器；完整交互由
+        risk-audit-paging 的 Node 与浏览器回归覆盖，不能要求保留旧的
+        “把 Promise 当数据”代码片段。
         """
         source = SOURCE()
-        self.assertIn("auditDashboard=auditRequest||window._paperAuditCache", source)
-        self.assertIn("auditDashboard=await api('/api/paper/risk-audit?limit=160')", source)
-        self.assertIn("window._paperAuditCache=auditDashboard", source)
+        self.assertIn("await loadPaperAudit('current',auditRequest)", source)
+        self.assertIn("var initial=prefetched?await prefetched:null", source)
+        self.assertNotIn("renderPaperAudit(auditRequest)", source)
 
     def test_frontend_cache_key_includes_risk_audit_fix(self):
         # PR-49：cache-bust 值统一引用规范 build id，不再逐次硬编码日期串。

@@ -810,3 +810,23 @@ def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, sp
         "protective_exit": exit_class in deps.protective_exit_classes,
         "volatility_shadow": _volatility_shadow(position["code"], asof_day, price, deps.load_kline),
     }
+
+
+def pending_risk_sell_orders(conn, *, cycle_id, account_id, code):
+    """Read unfilled quantities of explicitly Risk-owned orders in one cycle."""
+    return conn.execute(
+        """SELECT o.id,COALESCE(o.remaining_qty,o.qty-COALESCE(o.filled_qty,0)) remaining
+           FROM paper_orders o WHERE o.cycle_id=? AND o.account_id=?
+             AND o.code=? AND o.side='sell'
+             AND o.status IN ('pending_execution','partially_filled')
+             AND EXISTS (SELECT 1 FROM paper_risk_decisions d WHERE d.order_id=o.id
+               AND json_extract(d.payload,'$.decision_provenance.authority')='RISK')
+           ORDER BY o.id""", (int(cycle_id), str(account_id), str(code)),
+    ).fetchall()
+
+
+def unreserved_risk_sell_quantity(conn, *, cycle_id, account_id, code, requested_qty):
+    """Subtract only same-cycle unfilled Risk-owned commitments."""
+    working = pending_risk_sell_orders(conn, cycle_id=cycle_id, account_id=account_id, code=code)
+    committed = sum(max(0, int(row["remaining"] or 0)) for row in working)
+    return max(0, int(requested_qty) - committed), int(working[0]["id"]) if committed else None

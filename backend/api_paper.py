@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 import paper_trading as P
+import dashboard_queries as DQ
 import portfolio_allocation_policy as PAP
 import portfolio_allocation_repository as PAPRepo
 import portfolio_allocation_service as PAS
@@ -20,6 +21,7 @@ import portfolio_runtime_service as PRS
 import portfolio_workspace_service as PWS
 import market_data_contract as MDC
 import market_data_service as MDSvc
+import risk_center as RC
 
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -160,6 +162,7 @@ _cache_ts = {}
 _cache_generation = {}
 _cache_inflight = {}
 MAX_CACHE_ENTRIES = 128
+READ_MODEL_WAIT_SECONDS = 25.0
 
 
 def _current_cache_generation():
@@ -236,13 +239,14 @@ def _cache_load(key, loader, *, ttl=30):
     if not owner:
         # A slow provider/database read should not leave a waiter blocked
         # forever.  The owner publishes the exception before signalling.
-        flight["event"].wait(timeout=180)
+        flight["event"].wait(timeout=READ_MODEL_WAIT_SECONDS)
         if flight.get("error") is not None:
             raise flight["error"]
         if flight.get("result") is not _CACHE_MISS:
             return flight["result"]
-        # The owner timed out or disappeared; retry once as a new owner.
-        return _cache_load(key, loader, ttl=ttl)
+        # Keep the original owner registered: replacing it would permit a
+        # second loader and let the old owner publish over the new result.
+        raise HTTPException(status_code=503, detail="查询仍在处理中，请稍后重试")
     try:
         result = loader()
         _cset(key, result, generation=generation)
@@ -321,6 +325,10 @@ def overview(
         # Returning a Response avoids FastAPI recursively re-walking every
         # archived order on every browser refresh.
         return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except DQ.DashboardUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Dashboard failed: {type(exc).__name__}: {str(exc)[:200]}") from exc
 
@@ -352,7 +360,9 @@ def risk_overview():
             lambda: _call_with_retry(P.risk_dashboard, allow_stale=True, allow_network=False),
             ttl=60,
         )
-        return result
+        return RC.project_snapshot_freshness(result)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Risk overview failed: {type(exc).__name__}: {str(exc)[:200]}") from exc
 
@@ -360,26 +370,36 @@ def risk_overview():
 @router.get("/risk-audit")
 def risk_audit(
     limit: int = Query(160, ge=20, le=300),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=10, le=200),
+    page_size: int | None = Query(None, ge=10, le=200),
+    account_id: str | None = Query(None, max_length=80),
+    level: str | None = Query(None, max_length=20),
+    date: str | None = Query(None, max_length=10),
+    cursor: str | None = Query(None, max_length=64),
 ):
-    cache_key = f"risk_audit:{limit}:{page}:{page_size}"
+    """风控审计历史：过滤、翻页与总数都在数据库查询层完成。
+
+    投影返回的是含 ``accounts/alerts/scan_status/pagination`` 的字典，不是列表，
+    因此旧版“仅当结果是 list 才切片”的分支对字典永远不生效 —— 翻页请求会拿到
+    和第一页完全相同的整包。现在过滤条件下推，翻页走稳定游标：带上
+    ``pagination.next_cursor`` 取下一页，页间不会重复或漏项。
+
+    刻意不提供 ``page`` 偏移量：``id DESC`` 下的 offset 翻页会在两次请求之间
+    插入新风险决策时重复或跳过行，而游标以本页最后一行定位，不受新写入影响。
+    """
+    cache_key = (f"risk_audit:{limit}:{page_size}:{account_id}:"
+                 f"{level}:{date}:{cursor}")
     try:
         def load_audit():
-            full = _call_with_retry(P.risk_audit, limit)
-            if isinstance(full, list) and len(full) > page_size:
-                total = len(full)
-                start = (page - 1) * page_size
-                end = start + page_size
-                return {
-                    "items": full[start:end],
-                    "pagination": {"page": page, "page_size": page_size, "total": total,
-                                   "total_pages": (total + page_size - 1) // page_size,
-                                   "has_next": end < total, "has_prev": page > 1}
-                }
-            return full
+            return _call_with_retry(
+                P.risk_audit, limit, page_size=page_size,
+                account_id=account_id, level=level, date=date, cursor=cursor,
+            )
 
         return _cache_load(cache_key, load_audit, ttl=30)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc) or "invalid_risk_audit_filter") from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Risk audit failed: {type(exc).__name__}") from exc
 
@@ -388,6 +408,8 @@ def risk_audit(
 def strategy_center():
     try:
         return _cache_load("strategy_center", lambda: _call_with_retry(P.strategy_center), ttl=120)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Strategy center failed: {type(exc).__name__}") from exc
 
@@ -518,6 +540,8 @@ def reviews():
         # 前端高频轮询的只读视图；与 overview 同代（ledger-generation 感知），
         # 订单/风控变化会立即失效缓存，TTL 只限制无变化时的重复 DB 重建。
         return _cache_load("reviews", lambda: _call_with_retry(P.latest_reviews), ttl=30)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Reviews failed: {type(exc).__name__}") from exc
 

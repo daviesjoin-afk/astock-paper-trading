@@ -38,6 +38,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import candidate_selection as CS
 import strategy_candidate_search_space as SS
 import experiment_contract as EC
 import robustness_contract as RC
@@ -53,6 +54,7 @@ __all__ = [
     "QUEUE_POLICY_VERSION",
     "ROBUSTNESS_JOB_CONTRACT_VERSION",
     "SEARCH_CONTRACT_VERSION",
+    "SEARCH_CONTRACT_VERSION_V3",
     "SEARCH_JOB_CONTRACT_VERSION",
     "SearchContractError",
     "SearchBudget",
@@ -74,6 +76,12 @@ __all__ = [
 #: search request contract 版本（进 SearchSpec fingerprint）。
 SEARCH_CONTRACT_VERSION = "experiment-search-contract-v1"
 SEARCH_CONTRACT_VERSION_V2 = "experiment-search-contract-v2"
+#: R36-C：v3 = v2 + pinned selection policy。selection policy 只进 **search** identity，
+#: 绝不进 candidate-experiment-plan / R29 / R30 identity。
+SEARCH_CONTRACT_VERSION_V3 = "experiment-search-contract-v3"
+#: v2 / v3 都要求 canonical experiment plan（含 robustness policy）。
+_EXPERIMENT_PLAN_SEARCH_CONTRACT_VERSIONS = (SEARCH_CONTRACT_VERSION_V2,
+                                             SEARCH_CONTRACT_VERSION_V3)
 EXPERIMENT_PLAN_CONTRACT_VERSION = "candidate-experiment-plan-v1"
 EXPERIMENT_PLAN_CONTRACT_VERSION_V2 = "candidate-experiment-plan-v2"
 
@@ -545,16 +553,29 @@ class ExperimentSearchSpec:
     search_contract_version: str = SEARCH_CONTRACT_VERSION
     queue_policy_version: str = QUEUE_POLICY_VERSION
     experiment_plan: ExperimentSearchPlan | ExperimentSearchPlanV2 | None = None
+    selection_policy: CS.CandidateSelectionPolicy | None = None
 
     def __post_init__(self):
-        if self.search_contract_version not in (SEARCH_CONTRACT_VERSION, SEARCH_CONTRACT_VERSION_V2):
+        if self.search_contract_version not in (SEARCH_CONTRACT_VERSION,
+                                                SEARCH_CONTRACT_VERSION_V2,
+                                                SEARCH_CONTRACT_VERSION_V3):
             raise SearchContractError("unsupported_search_contract_version")
-        if self.search_contract_version == SEARCH_CONTRACT_VERSION_V2:
+        if self.search_contract_version in _EXPERIMENT_PLAN_SEARCH_CONTRACT_VERSIONS:
             if not isinstance(self.experiment_plan, (ExperimentSearchPlan,
                                                      ExperimentSearchPlanV2)):
                 raise SearchContractError("search_run_experiment_plan_unavailable")
         elif self.experiment_plan is not None:
             raise SearchContractError("legacy_search_must_not_have_experiment_plan")
+        if self.search_contract_version == SEARCH_CONTRACT_VERSION_V3:
+            if not isinstance(self.selection_policy, CS.CandidateSelectionPolicy):
+                raise SearchContractError("search_run_selection_policy_unavailable")
+            # v3 pins a selection policy on top of the *robustness* plan: without a
+            # canonical candidate-experiment-plan-v2 the R30 stage could never run, so a
+            # v3 search over a bare v1 plan would be a dead-end declaration.
+            if not isinstance(self.experiment_plan, ExperimentSearchPlanV2):
+                raise SearchContractError("search_run_robustness_policy_unavailable")
+        elif self.selection_policy is not None:
+            raise SearchContractError("selection_policy_requires_v3_search_contract")
         object.__setattr__(self, "generation_batch_id", _required_id(
             self.generation_batch_id, what="generation_batch_id"))
         object.__setattr__(self, "generation_input_fingerprint", _required_id(
@@ -576,6 +597,10 @@ class ExperimentSearchSpec:
         return len(self.candidate_ids)
 
     @property
+    def selection_policy_fingerprint(self) -> str | None:
+        return None if self.selection_policy is None else self.selection_policy.fingerprint
+
+    @property
     def search_input_fingerprint(self) -> str:
         """``"这次 search 请求的内容是什么"`` —— 与执行时刻、run id 无关。"""
         return hashlib.sha256(_canonical(self._identity_material()).encode("utf-8")).hexdigest()
@@ -590,15 +615,22 @@ class ExperimentSearchSpec:
             # 未来修改 claim 顺序会改变一次 search 的运行语义，因此 policy 必须进身份。
             "queue_policy_version": self.queue_policy_version,
         }
-        if self.search_contract_version == SEARCH_CONTRACT_VERSION_V2:
+        if self.search_contract_version in _EXPERIMENT_PLAN_SEARCH_CONTRACT_VERSIONS:
             material.update(experiment_plan=self.experiment_plan.projection(),
                             experiment_plan_fingerprint=self.experiment_plan.fingerprint)
+        if self.search_contract_version == SEARCH_CONTRACT_VERSION_V3:
+            material.update(selection_policy=self.selection_policy.projection(),
+                            selection_policy_fingerprint=self.selection_policy.fingerprint)
         return material
 
     def projection(self) -> dict:
         return {**self._identity_material(),
                 "search_input_fingerprint": self.search_input_fingerprint,
                 "candidate_count": self.candidate_count}
+
+    @property
+    def has_selection_policy(self) -> bool:
+        return self.search_contract_version == SEARCH_CONTRACT_VERSION_V3
 
     def job_specs(self, search_run: str) -> tuple[SearchJobSpec, ...]:
         """Declare one job per candidate, in canonical candidate order."""
@@ -628,6 +660,12 @@ def search_spec_from_projection(value):
             args["experiment_plan"] = experiment_plan_from_projection(args["experiment_plan"])
             if args["experiment_plan"].fingerprint != plan_fingerprint:
                 raise ValueError("plan mismatch")
+        if "selection_policy" in args:
+            policy_fingerprint = args.pop("selection_policy_fingerprint")
+            args["selection_policy"] = CS.CandidateSelectionPolicy.from_projection(
+                args["selection_policy"])
+            if args["selection_policy"].fingerprint != policy_fingerprint:
+                raise ValueError("selection policy mismatch")
         spec = ExperimentSearchSpec(**args)
         if spec.search_input_fingerprint != fingerprint or spec.candidate_count != count or spec.projection() != value:
             raise ValueError("search mismatch")

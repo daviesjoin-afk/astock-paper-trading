@@ -362,6 +362,11 @@ MIGRATIONS = {
         # 结果 authority 仍是 R28/R29/R30，selection/promotion 属于 R36-C / R31。
         (35, "新增实验搜索控制面三张追加表（幂等，不回填，append-only）",
          paper_schema.ensure_experiment_search),
+        # R36-C：search-level selection report 追加表。selection policy 已 pin 到 search
+        # identity，一个 search 只允许一份 canonical report。**绝不回填**：历史 v1/v2 search
+        # 没有 selection policy，从既有 R29/R30 反推"当时应该选谁"是伪造历史决策。
+        (36, "新增候选选择报告追加表（幂等，不回填，append-only）",
+         paper_schema.ensure_candidate_selection),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

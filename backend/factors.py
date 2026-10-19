@@ -76,7 +76,7 @@ def zscore(series, fill_missing=True):
     z = z.clip(-3, 3)
     return z.fillna(0.0) if fill_missing else z
 
-def compute_price_factors(klines: dict, asof=None):
+def compute_price_factors(klines, asof=None):
     """基于历史K线的因子：动量/反转/波动/量能。klines: {code: df}
 
     ``asof`` 是决策时点，两种模式必须严格分层：
@@ -107,7 +107,10 @@ def compute_price_factors(klines: dict, asof=None):
     codes_unreadable_index = 0
     adjustments_unproven = 0
     rows = []
-    for code, df in klines.items():
+    # An iterable of pairs lets the caller release each full price history
+    # before reading the next security.  Mapping callers keep the same API.
+    items = klines.items() if hasattr(klines, "items") else klines
+    for code, df in items:
         if df is None or df.empty:
             continue
         if strict:

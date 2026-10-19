@@ -30,12 +30,19 @@ class CandidateRobustnessUnavailable(ValueError):
         super().__init__(reason)
 
 
-def _exact_search_plan_v2(conn, search_run_id):
+#: Search contracts that carry a canonical candidate-experiment-plan-v2 (with robustness
+#: policy). v3 adds only the pinned selection policy, so R30 stays executable unchanged.
+_ROBUSTNESS_EXECUTABLE_SEARCH_CONTRACTS = (ESC.SEARCH_CONTRACT_VERSION_V2,
+                                           ESC.SEARCH_CONTRACT_VERSION_V3)
+
+
+def _exact_search_with_robustness_plan(conn, search_run_id):
+    """Read one exact search run that carries a canonical robustness plan."""
     run = ESR.get_search_run(conn, search_run_id)
     if run is None:
         raise CandidateRobustnessUnavailable("search_run_not_found")
     spec = ESC.search_spec_from_projection(run["search_spec"])
-    if spec.search_contract_version != ESC.SEARCH_CONTRACT_VERSION_V2:
+    if spec.search_contract_version not in _ROBUSTNESS_EXECUTABLE_SEARCH_CONTRACTS:
         raise CandidateRobustnessUnavailable("search_run_robustness_policy_unavailable")
     if not isinstance(spec.experiment_plan, ESC.ExperimentSearchPlanV2):
         raise CandidateRobustnessUnavailable("search_run_robustness_policy_unavailable")
@@ -99,7 +106,7 @@ def declare_candidate_robustness_jobs(conn, *, search_run_id, validation_reposit
         raise CandidateRobustnessUnavailable("search_write_transaction_must_be_closed")
     if not isinstance(validation_repository, EVR.ExperimentValidationRepository):
         raise CandidateRobustnessUnavailable("canonical_validation_repository_required")
-    run, spec, plan = _exact_search_plan_v2(conn, search_run_id)
+    run, spec, plan = _exact_search_with_robustness_plan(conn, search_run_id)
     # Acquire the write lock BEFORE reading existing jobs so two concurrent
     # declarations for the same search cannot both observe an empty set and then
     # collide on the unique (search_run_id, candidate_id, stage) constraint.
@@ -171,7 +178,7 @@ def _robustness_job_inputs(conn, job_id):
         robustness_plan_fingerprint=row["job"]["robustness_plan_fingerprint"])
     if job.job_id != job_id or job.projection() != row["job"]:
         raise CandidateRobustnessUnavailable("corrupt_search_job")
-    run, spec, plan = _exact_search_plan_v2(conn, job.search_run_id)
+    run, spec, plan = _exact_search_with_robustness_plan(conn, job.search_run_id)
     if job.candidate_id not in spec.candidate_ids:
         raise CandidateRobustnessUnavailable("corrupt_search_job")
     return job, plan, run

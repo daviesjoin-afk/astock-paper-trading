@@ -15,6 +15,11 @@ suffix:baidu.com
 suffix:csrc.gov.cn
 suffix:sse.com.cn
 suffix:szse.cn
+host:www.bse.cn
+host:schemas.openxmlformats.org
+# Public BSE disclosure document identifiers, present in the exact notice URLs.
+value:8690dbac1d5c42db98e9c7388e562129
+value:8a64d7d9e97f4678af04313cdb66069e
 suffix:deepseek.com
 suffix:openai.com
 suffix:openrouter.ai
@@ -32,6 +37,16 @@ host:files.pythonhosted.org
 host:img.shields.io
 host:www.python.org
 host:docs.python.org
+# Public primary sources cited by the system audit; exact hosts only.
+host:pandas.pydata.org
+host:www.sqlite.org
+# Public AWS Builders' Library documentation cited for the retry design.
+host:aws.amazon.com
+host:tracker.debian.org
+host:www.davidhbailey.com
+host:www.quantconnect.com
+host:opentelemetry.io
+host:trivy.dev
 host:github.com
 host:raw.githubusercontent.com
 host:api.github.com
@@ -101,3 +116,10 @@ value:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 value:cb4330962fed0b4742811f80b72f1436f8a12c0c9b662b73bcc48e576280abe5
 value:4794ec33f241b76ca023e1b62c35fe4fd88e11d756106c75945b90a097589a32
 value:f163b650680101f654c4e502deb51b9faf223a67218c760f8b614c6703e3c52b
+
+# Public Git commit references retained by the consolidated release. These
+# identify PR #246's audit baseline and PR #234's reviewed selection head;
+# neither is a credential. Their commits remain available on GitHub even
+# though this release imports the sanitized final tree without that ancestry.
+value:697f565e4b2e8a553957d73b231cd9e784127dfa
+value:23ef095dddca45e29331000436c2426fd4c7ec9d

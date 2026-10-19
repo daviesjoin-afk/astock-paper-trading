@@ -388,7 +388,7 @@ class RuntimeAdapterIoBoundaryTests(unittest.TestCase):
                          f"{ADAPTER_FILE} import 了禁止的能力：{sorted(roots & set(_FORBIDDEN_IMPORTS))}")
         # 依赖方向单向且最小：本层只认识两个 owner、research 契约与 stdlib 的 typing。
         self.assertEqual(
-            {"adaptive_engine", "ai_research_contract", "paper_trading", "typing"},
+            {"adaptive_runtime_facts", "ai_research_contract", "paper_trading", "typing"},
             roots,
             f"{ADAPTER_FILE} 的 import 集合发生变化：{sorted(roots)}",
         )
