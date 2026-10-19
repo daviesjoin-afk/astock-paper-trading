@@ -1746,14 +1746,24 @@ OVERSEAS_SECIDS = {
 def fetch_overseas_history(beg="20230101"):
     def _do():
         out = {}
-        for key, (secid, name) in OVERSEAS_SECIDS.items():
+        def _one(item):
+            key, (secid, name) = item
             try:
                 df = fetch_kline(None, beg=beg, secid=secid)
-                if df is not None and not df.empty:
-                    out[key] = {"name": name, "df": df}
+                return key, {"name": name, "df": df} if (df is not None and not df.empty) else None
             except Exception:
-                continue
-            time.sleep(0.15)
+                return key, None
+
+        # 5 个境外指数各自独立抓取，没有依赖顺序。串行 + 150 毫秒限速在
+        # 单线程下把 5 次 K 线抓取排成一串，整段累积到 6+ 秒。改成线程池
+        # 后只付一次 TCP/TLS 握手的最慢者，限速 sleep 也不再需要：不同
+        # 主机/不同 secid 互不争用同一个令牌桶。
+        items = list(OVERSEAS_SECIDS.items())
+        with ThreadPoolExecutor(max_workers=min(5, len(items) or 1)) as pool:
+            results = pool.map(_one, items)
+        for key, value in results:
+            if value is not None:
+                out[key] = value
         return out
     return _cached("overseas", 1800, _do)
 
