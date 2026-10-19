@@ -54,7 +54,7 @@ import sqlite3
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import cache, wraps
+from functools import wraps
 from typing import Any, Mapping
 
 try:  # ``backend`` on sys.path (production and direct unittest runs)
@@ -146,15 +146,23 @@ def _snapshot_evidence(func):
             # Defensive invalidation if a caller unexpectedly writes locally.
             scope = (conn, conn.total_changes, {})
             _snapshot_reads.set(scope)
+        # ``functools.cache`` 要求全部参数可 hash；``conn`` 不可 hash，所以
+        # 那条路径每次都重算，缓存从未生效。这里改用 dict 手写缓存：key 用
+        # ``(func, args, kwargs)``（不含 conn），scope 内按 key 存。
+        # **func 必须参与 key**：不同函数的相同 args/kwargs 会共享同一 entry，
+        # 导致返回值串型（曾让 ``verified_cash_flows`` 拿到
+        # ``bounded_lots_with_status`` 的元组）。
         try:
-            hash((args, tuple(kwargs.items())))
+            key = (func, args, tuple(sorted(kwargs.items())))
+            hash(key)
         except TypeError:
             return func(conn, *args, **kwargs)
-        if func not in scope[2]:
-            scope[2][func] = cache(func)
+        bucket = scope[2]
+        if key not in bucket:
+            bucket[key] = func(conn, *args, **kwargs)
         # FIFO and consumers may mutate dictionaries/lists. Cache-owned evidence
         # must never be handed out, including on the first lookup.
-        return deepcopy(scope[2][func](conn, *args, **kwargs))
+        return deepcopy(bucket[key])
     return read
 
 
@@ -881,6 +889,7 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
     return {key: value for key, value in flows.items() if key not in incomplete}
 
 
+@snapshot_read
 def positions_for_context_with_status(
     conn, context: PortfolioReadContext, *, account_id: str | None = None,
     risk_state_rows: list[dict] | None = None,
@@ -1300,6 +1309,7 @@ def _risk_state_rows_for_context(conn, context: PortfolioReadContext) -> list[di
     ))
 
 
+@snapshot_read
 def risk_positions_for_context(conn, context: PortfolioReadContext, *,
                               account_id: str | None = None) -> list[dict]:
     """Bounded position read with cycle-owned runtime risk state for risk scans."""
