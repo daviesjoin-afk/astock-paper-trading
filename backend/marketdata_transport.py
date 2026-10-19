@@ -58,9 +58,34 @@ def reset_data_source(reason=None, reset_circuit=False):
             )
 
 
+# 对端在链路层直接断开（RemoteDisconnected、拒绝连接）时，一次尝试通常
+# 200~400 毫秒就返回。这个阈值用来把「立刻被断开」与「真的等到超时」区分开。
+_CONNECTION_DROP_GRACE_SECONDS = 0.5
+
+
+def _connection_dropped(exc, attempt_seconds):
+    """判断失败是否属于对端立刻断开连接（而不是超时或 HTTP 状态错误）。
+
+    ``requests.ConnectTimeout`` 同时继承 ``ConnectionError`` 与 ``Timeout``，
+    必须先排除 ``Timeout``，否则连接超时会被误当成「立刻断开」而丢掉退避。
+    """
+    return (
+        isinstance(exc, requests.ConnectionError)
+        and not isinstance(exc, requests.Timeout)
+        and attempt_seconds < _CONNECTION_DROP_GRACE_SECONDS
+    )
+
+
 def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
-    """执行带连接复用和空响应重试的 GET 请求。"""
+    """执行带连接复用和空响应重试的 GET 请求。
+
+    对端立刻断开连接时不再插入退避等待：等待既改变不了对端状态，又会在
+    一个扫描轮次里累计十几秒空转（实测每轮 18~19 秒纯 sleep）。重试次数、
+    超时、请求参数与返回值都不变；超时、HTTP 状态错误和空响应仍按原退避
+    等待，外层仍拥有主机轮换与分批补查。
+    """
     for index in range(retries + 1):
+        attempt_started = time.perf_counter()
         try:
             with PTM.phase("http_get_attempt"):
                 response = _session().get(url, params=params, timeout=timeout)
@@ -74,9 +99,11 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
                 with PTM.phase("http_retry_backoff"):
                     time.sleep(0.4 * (index + 1))
                 continue
-        except requests.RequestException:
+        except requests.RequestException as exc:
             if index == retries:
                 raise
+            if _connection_dropped(exc, time.perf_counter() - attempt_started):
+                continue
         with PTM.phase("http_retry_backoff"):
             time.sleep(0.5 * (index + 1))
     return ""
