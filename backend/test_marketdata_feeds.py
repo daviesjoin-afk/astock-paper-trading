@@ -238,6 +238,53 @@ class DataFetcherFacadeTests(unittest.TestCase):
 
 
 class TencentRealtimeFeedTests(unittest.TestCase):
+    def test_large_universe_partial_batch_keeps_coverage_order_and_source_time(self):
+        codes = [f"{i:06d}" for i in range(1, 202)]
+        requested = []
+        source_time = "2026-09-12T10:00:00+08:00"
+
+        def http_get(url, **_kwargs):
+            batch = [symbol[2:] for symbol in url.split("q=", 1)[1].split(",")]
+            requested.append(batch)
+            return "quote"
+
+        def parser(_text, *, attempt, allowed_codes):
+            # A truncated successful response must retry only its missing tail.
+            selected = allowed_codes[:70] if attempt == 1 else allowed_codes
+            return [{"code": code, "price": 10.0, "quote_at": source_time}
+                    for code in reversed(selected)]
+
+        feed = feeds.TencentRealtimeFeed(
+            http_get=http_get, parser=parser, reset_data_source=mock.Mock(),
+            sleep=mock.Mock(), health=feeds.FeedHealthRegistry(),
+        )
+        rows = feed.fetch_realtime(codes + codes[:2])
+        self.assertEqual([row["code"] for row in rows], codes)
+        self.assertTrue(all(row["quote_at"] == source_time for row in rows))
+        self.assertEqual(requested, [codes[:100], codes[70:100],
+                                     codes[100:200], codes[170:200], codes[200:]])
+
+    def test_large_universe_missing_quote_still_uses_independent_fallback(self):
+        codes = [f"{i:06d}" for i in range(1, 102)]
+        missing = codes[70]
+        source_time = "2026-09-12T10:00:00+08:00"
+        fallback_calls = []
+        feed = feeds.TencentRealtimeFeed(
+            http_get=lambda *_args, **_kwargs: "quote",
+            parser=lambda _text, *, attempt, allowed_codes: [
+                {"code": code, "price": 10.0, "quote_at": source_time}
+                for code in allowed_codes if code != missing],
+            reset_data_source=mock.Mock(), sleep=mock.Mock(),
+            health=feeds.FeedHealthRegistry(),
+        )
+        fallback = _FakeFeed("fallback", {
+            missing: {"code": missing, "price": 11.0, "quote_at": source_time},
+        }, fallback_calls)
+        rows = feeds.DataFeedChain((feed, fallback), retry_last_feed=False).fetch_realtime(codes)
+        self.assertEqual([row["code"] for row in rows], codes)
+        self.assertEqual(fallback_calls, [("fallback", [missing])])
+        self.assertEqual(rows[70]["price"], 11.0)
+
     def test_retries_only_missing_codes_and_preserves_order(self):
         requested = []
         reset = mock.Mock()
@@ -260,6 +307,7 @@ class TencentRealtimeFeedTests(unittest.TestCase):
             parser=parser,
             reset_data_source=reset,
             sleep=sleep,
+            health=feeds.FeedHealthRegistry(),
         )
         rows = feed.fetch_realtime(["000001", "600000"])
         self.assertEqual([row["code"] for row in rows], ["000001", "600000"])
@@ -276,6 +324,7 @@ class TencentRealtimeFeedTests(unittest.TestCase):
             parser=lambda *_args, **_kwargs: [],
             reset_data_source=reset,
             sleep=sleep,
+            health=feeds.FeedHealthRegistry(),
         )
         self.assertEqual(feed.fetch_realtime(["000001"]), [])
         self.assertEqual(reset.call_count, 2)

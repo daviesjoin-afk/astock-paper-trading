@@ -285,6 +285,12 @@ class PortfolioRuntimeContractTests(unittest.TestCase):
             conn.close()
             reading = self._fresh_market_reading([], asof="2026-10-03")
             with PT._db(immediate=True) as conn:
+                inputs = dict(cycle_id=cycle_id, asof_day="2026-09-30",
+                              decision_at="2026-10-01T09:30:00+08:00",
+                              builtin_scope=PT.ACTIVE_ACCOUNT_IDS,
+                              market_evidence_identity="f" * 64)
+                uncached = PRS._capture.__wrapped__(conn, **inputs).projection()
+                self.assertEqual(uncached, PRS._capture(conn, **inputs).projection())
                 result = PRS.capture_portfolio_runtime_snapshot(
                     conn, cycle_id=cycle_id, asof_day="2026-10-03",
                     decision_at="2026-10-03T09:31:00+08:00",

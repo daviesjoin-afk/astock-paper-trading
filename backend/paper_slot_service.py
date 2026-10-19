@@ -13,17 +13,14 @@ import entry_lifecycle as ELC
 import execution_dispatch as EPD
 
 
-SUPPORTED_SLOTS = frozenset({
-    "auction", "open", "risk", "close", "weekly-review", "intraday",
-})
-_SLOT_ERROR = "slot 必须是 auction、open、risk、close、weekly-review 或 intraday"
+import paper_schedule_contract as PSch
+
+SUPPORTED_SLOTS = frozenset(PSch.RUN_SLOTS)
 
 
 def validate_slot(slot: str) -> str:
     """Return a supported slot or preserve the legacy validation error."""
-    if slot not in SUPPORTED_SLOTS:
-        raise ValueError(_SLOT_ERROR)
-    return slot
+    return PSch.validate_slot(slot)
 
 
 def _best_effort_audit(db_factory, audit: Callable, event: str, detail: str) -> None:

@@ -1,0 +1,27 @@
+{
+  "method": "All literal ast.Import/ImportFrom edges, including function-local imports. Dynamic callbacks are excluded.",
+  "baseline": {
+    "paper_trading": [
+      "dashboard_queries",
+      "execution_planner",
+      "manual_orders",
+      "paper_risk_service",
+      "paper_trading"
+    ],
+    "adaptive_engine": [
+      "adaptive_engine",
+      "ai_analysis",
+      "ai_research_runtime_adapter",
+      "deepseek_research",
+      "evolution_apply"
+    ]
+  },
+  "optimized": {
+    "paper_trading": [
+      "paper_trading"
+    ],
+    "adaptive_engine": [
+      "adaptive_engine"
+    ]
+  }
+}

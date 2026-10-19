@@ -2,6 +2,7 @@
 import gzip
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -28,6 +29,7 @@ class StrategyReplayTraceTests(unittest.TestCase):
         )
         self.env.start()
         self.addCleanup(self.env.stop)
+        trace._COLUMN_BLOB_MEMO.clear()
 
     @staticmethod
     def _table():
@@ -139,6 +141,39 @@ class StrategyReplayTraceTests(unittest.TestCase):
         column_dir = self._root() / "columns"
         self.assertEqual(len(list(column_dir.glob("*.json.gz"))), 3)
 
+    def test_repeated_table_persist_reuses_serialized_columns(self):
+        table = self._table()
+        root = self._root()
+        with mock.patch.object(trace, "_write_blob", wraps=trace._write_blob) as write_blob:
+            first = trace._persist_table(root, table)
+            writes_after_first = write_blob.call_count
+            second = trace._persist_table(root, table)
+        self.assertEqual(first, second)
+        # 第二轮只有索引写入；三列的 json 序列化与 gzip 全部命中复用。
+        self.assertEqual(write_blob.call_count - writes_after_first, 1)
+
+    def test_changed_column_rewrites_blob_and_updates_cache(self):
+        table = self._table()
+        root = self._root()
+        first = trace._persist_table(root, table)
+        table = table.copy()
+        table.loc[table.index[0], "factor_a"] = 0.123
+        second = trace._persist_table(root, table)
+        first_ids = {item["name"]: item["blob_id"] for item in first["columns"]}
+        second_ids = {item["name"]: item["blob_id"] for item in second["columns"]}
+        self.assertNotEqual(first_ids["factor_a"], second_ids["factor_a"])
+        self.assertEqual(first_ids["factor_b"], second_ids["factor_b"])
+
+    def test_missing_column_blob_is_rewritten_instead_of_reused(self):
+        table = self._table()
+        root = self._root()
+        first = trace._persist_table(root, table)
+        factor_b = next(item["blob_id"] for item in first["columns"] if item["name"] == "factor_b")
+        (root / "columns" / f"{factor_b}.json.gz").unlink()
+        second = trace._persist_table(root, table)
+        self.assertTrue((root / "columns" / f"{factor_b}.json.gz").is_file())
+        self.assertEqual(first, second)
+
     def test_retention_prunes_expired_runs_without_deleting_live_shared_blobs(self):
         plugin = self._plugin()
         first = self._traced(plugin=plugin, topn=1)
@@ -183,6 +218,27 @@ class StrategyReplayTraceTests(unittest.TestCase):
     def test_prohibited_nested_whitelisted_input_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "prohibited field"):
             self._traced(topn=1, gate={"light": "green", "api_token": "secret"})
+
+    def test_nested_table_secret_fails_before_any_blob_is_written(self):
+        table = self._table()
+        table["evidence"] = [{"source": "public"}, {"api_token": "fixture"}, {}]
+        with self.assertRaisesRegex(ValueError, "prohibited field"):
+            self._traced(table=table, topn=1)
+        self.assertFalse(self._root().exists())
+
+    def test_table_cells_are_validated_once_and_keep_replay_identity(self):
+        table = self._table()
+        table["evidence"] = [{"source": "public"}, {}, {"source": "public"}]
+        with mock.patch.object(trace, "_assert_no_prohibited_keys",
+                               wraps=trace._assert_no_prohibited_keys) as validate:
+            first = self._traced(table=table, topn=1)
+        table_calls = [call for call in validate.call_args_list
+                       if re.fullmatch(r"table\.[^.\[\]]+\[\d+\]", call.kwargs.get("path", ""))]
+        # 标量单元格不可能携带字段名，只有容器单元格需要递归检查；
+        # 每个容器单元格仍恰好校验一次。
+        self.assertEqual(len(table_calls), 3)
+        second = self._traced(table=table, topn=1)
+        self.assertEqual(first["replay_trace"]["snapshot_id"], second["replay_trace"]["snapshot_id"])
 
     def test_mixed_factor_dates_fail_closed(self):
         table = self._table()

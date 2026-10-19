@@ -93,7 +93,7 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
         "backend/adaptive_risk.py": ("risk_candidate_facts", "risk_candidate_fact"),
         "backend/adaptive_selection.py": ("selection_candidate_facts", "selection_candidate_fact"),
         "backend/learning_evaluation.py": ("experiment_evaluation_facts", "experiment_evaluation_fact"),
-        "backend/adaptive_engine.py": ("adaptive_run_facts", "adaptive_run_fact"),
+        "backend/adaptive_runtime_facts.py": ("adaptive_run_facts", "reader"),
         "backend/paper_trading.py": ("paper_job_run_facts", "paper_job_run_fact"),
     }
     for filename, (function_name, fact_name) in list_specs.items():
@@ -102,6 +102,14 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
         has_offset_query = any("OFFSET ?" in value.upper() for value in _string_constants(node or tree))
         if not has_offset_query or fact_name not in _calls(node or tree):
             issues.append(f"FINAL-G21: {function_name} no longer pages through owner facts")
+        if filename == "backend/adaptive_runtime_facts.py":
+            body = ast.unparse(node) if node else ""
+            if "reader = adaptive_run_fact if read_fact is None else read_fact" not in body:
+                issues.append("FINAL-G21: adaptive pagination loses its canonical fact reader")
+    adaptive_facade = _function(ae, "adaptive_run_facts")
+    facade_body = ast.unparse(adaptive_facade) if adaptive_facade else ""
+    if "ARF.adaptive_run_facts" not in facade_body or "read_fact=adaptive_run_fact" not in facade_body:
+        issues.append("FINAL-G21: adaptive facade loses its canonical fact reader")
 
     manual = _function(ae, "run_advisor_review")
     suite = _function(ae, "run_advisor_suite")
@@ -235,6 +243,7 @@ def _load_sources() -> dict[str, str]:
     sources = {}
     names = (
         "deepseek_research.py", "ai_analysis.py", "adaptive_engine.py", "adaptive_runner.py",
+        "adaptive_runtime_facts.py",
         "adaptive_risk.py", "adaptive_selection.py", "learning_evaluation.py",
         "paper_trading.py", "api_adaptive.py",
     )
@@ -248,6 +257,18 @@ def _load_sources() -> dict[str, str]:
 
 
 class FinalResearchConvergenceGuardTests(unittest.TestCase):
+    def test_adaptive_runtime_pagination_guard_checks_the_extracted_owner(self):
+        sources = _load_sources()
+        name = "backend/adaptive_runtime_facts.py"
+        sources[name] = sources[name].replace("OFFSET ?", "")
+        self.assertTrue(any("FINAL-G21" in issue for issue in architecture_violations(sources)))
+
+    def test_adaptive_runtime_facade_cannot_replace_its_canonical_reader(self):
+        sources = _load_sources()
+        name = "backend/adaptive_engine.py"
+        sources[name] = sources[name].replace("read_fact=adaptive_run_fact", "read_fact=None")
+        self.assertTrue(any("FINAL-G21" in issue for issue in architecture_violations(sources)))
+
     def test_FINAL_G01_through_G11_baseline_is_green(self):
         self.assertEqual([], architecture_violations(_load_sources()))
 

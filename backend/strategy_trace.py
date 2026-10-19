@@ -95,9 +95,15 @@ def code_version(explicit: Any = None) -> str:
     return _canonical_git_hash(proc.stdout) or "unavailable"
 
 
+_NON_FINITE_FLOATS = frozenset({float("inf"), float("-inf")})
+
+
 def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        if isinstance(value, float) and (value != value or value in {float("inf"), float("-inf")}):
+    # 逐格调用：常量集合提到模块级，避免每个标量都新建 {inf, -inf} 集合。
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        if isinstance(value, float) and (value != value or value in _NON_FINITE_FLOATS):
             return None
         return value
     if isinstance(value, Mapping):
@@ -245,6 +251,37 @@ def _write_blob(root: Path, kind: str, payload: Mapping[str, Any]) -> str:
     return blob_id
 
 
+#: 同一进程内最近一次序列化的列内容 → blob id。五套策略在同一轮里会各自持久化
+#: 同一张因子表（静态因子列逐值相同），没有它就要重复做 json 序列化、SHA-256 与
+#: gzip；命中即复用已存在的 blob。判等用的是**逐值相等**而不是哈希摘要，因此
+#: 不存在摘要碰撞导致复用错列的可能；NaN 与自身不相等，含 NaN 的列只是不复用。
+#: 上限按「一张宽表」压：单列数千个值，缓存整表已足够覆盖五策略背靠背的持久化，
+#: 超限整体清空，避免把多张表留在内存里。
+_COLUMN_BLOB_MEMO: dict[tuple[str, str], tuple[list[Any], str]] = {}
+_COLUMN_BLOB_MEMO_LIMIT = 96
+
+
+def _cached_column_blob(root: Path, name: str, values: list[Any]) -> str:
+    memo_key = (str(root), name)
+    cached = _COLUMN_BLOB_MEMO.get(memo_key)
+    if cached is not None and cached[0] == values:
+        blob_id = cached[1]
+        path = _blob_path(root, "columns", blob_id)
+        if path.exists():
+            # 复用即最后一次使用：刷新保留期时钟，与 _write_blob 的复用分支一致。
+            os.utime(path, None)
+            return blob_id
+    blob_id = _write_blob(root, "columns", {
+        "schema": _COLUMN_SCHEMA,
+        "name": name,
+        "values": values,
+    })
+    if len(_COLUMN_BLOB_MEMO) >= _COLUMN_BLOB_MEMO_LIMIT:
+        _COLUMN_BLOB_MEMO.clear()
+    _COLUMN_BLOB_MEMO[memo_key] = (values, blob_id)
+    return blob_id
+
+
 def _read_blob(root: Path, kind: str, blob_id: str) -> dict[str, Any]:
     path = _blob_path(root, kind, blob_id)
     with gzip.open(path, "rt", encoding="utf-8") as handle:
@@ -266,23 +303,27 @@ def _validate_table(table: pd.DataFrame) -> None:
 
 def _persist_table(root: Path, table: pd.DataFrame) -> dict[str, Any]:
     _validate_table(table)
+    prepared_columns = []
+    # Normalize and validate once, before writing any replay artifact.
+    for column in table.columns:
+        name = str(column)
+        values = [_json_safe(value) for value in table[column].tolist()]
+        for row_no, value in enumerate(values):
+            # 标量单元格不可能携带字段名；只有容器（dict / list，set 与 tuple 已被
+            # _json_safe 归一成 list）才需要递归检查。此前对每个单元格都走一次
+            # isinstance(value, Mapping) 与占位 path 格式化，一张 4383x72 的表要
+            # 做 31 万次无意义检查——这是候选生成里最贵的一段纯 CPU。
+            if isinstance(value, (dict, list)):
+                _assert_no_prohibited_keys(value, path=f"table.{name}[{row_no}]")
+        prepared_columns.append((name, values))
     index_payload = {
         "schema": _INDEX_SCHEMA,
         "values": [str(value) for value in table.index.tolist()],
     }
     index_id = _write_blob(root, "indexes", index_payload)
     columns = []
-    for column in table.columns:
-        name = str(column)
-        values = [_json_safe(value) for value in table[column].tolist()]
-        for row_no, value in enumerate(values):
-            _assert_no_prohibited_keys(value, path=f"table.{name}[{row_no}]")
-        column_payload = {
-            "schema": _COLUMN_SCHEMA,
-            "name": name,
-            "values": values,
-        }
-        columns.append({"name": name, "blob_id": _write_blob(root, "columns", column_payload)})
+    for name, values in prepared_columns:
+        columns.append({"name": name, "blob_id": _cached_column_blob(root, name, values)})
     return {
         "schema": _TABLE_SCHEMA,
         "row_count": len(table),
@@ -440,10 +481,6 @@ def persist_snapshot(
     resolved_date = data_date(table, explicit=explicit_data_date)
     resolved_version = code_version(explicit_code_version)
     safe_inputs = _safe_selection_inputs(selection_kwargs)
-    for column in table.columns:
-        for row_no, value in enumerate(table[column].tolist()):
-            safe = _json_safe(value)
-            _assert_no_prohibited_keys(safe, path=f"table.{column}[{row_no}]")
     root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
     table_manifest = _persist_table(root, table)
     snapshot = {

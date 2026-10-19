@@ -57,13 +57,6 @@ def _parse_date(value):
         return None
 
 
-def _loads(value):
-    try:
-        return json.loads(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def clean_orphan_klines(dry_run=True):
     """清理 klines 目录中不在 manifest 内的临时/孤儿文件。"""
     manifest_path = os.path.join(CACHE_DIR, "kline_manifest.json")

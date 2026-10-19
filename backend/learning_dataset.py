@@ -59,8 +59,10 @@ import json
 import math
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, Optional, Sequence
+from itertools import islice
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import financial_point_in_time as PIT
 import walk_forward_validation as WFV
@@ -888,6 +890,17 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
     # explicitly unproven instead of defaulting to "trusted".
     report["legacy_marked"] = _mark_legacy_rows(conn, ALPHA_SAMPLE_TABLE)
     _mark_legacy_rows(conn, ALPHA_RETURN_TABLE)
+    # The storage PK orders end_date before code, so the full-market evidence
+    # join otherwise scans every label on a date for each stock. This index
+    # matches both join keys and the existing deterministic label order.
+    label_columns = _table_columns(conn, ALPHA_RETURN_TABLE)
+    indexed_columns = ("start_date", "code", "horizon", "end_date",
+                       "label_available_at", "forward_return_pct")
+    if set(indexed_columns).issubset(label_columns):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_alpha_returns_evidence "
+            f"ON {ALPHA_RETURN_TABLE}({','.join(indexed_columns)})"
+        )
     return report
 
 
@@ -971,15 +984,14 @@ def _evidence_order_clause(sample_columns: set, return_columns: set) -> str:
     return ", ".join(fields) if fields else "1"
 
 
-def _read_alpha_evidence_page(
+def _iter_alpha_evidence(
     conn: sqlite3.Connection, max_rows: Optional[int] = None
-) -> tuple:
-    """Read evidence with an explicit truncation verdict.
+) -> Iterable[dict]:
+    """Read the stable evidence window from a cursor without retaining raw rows.
 
     Persistence only -- never a provider call.  Reads ``max_rows + 1`` rows so a
     dataset that is *exactly* ``max_rows`` long is not mistaken for a truncated
-    one; the returned list still never exceeds ``max_rows``.  Returns
-    ``(evidence, truncated)``.
+    one. The caller consumes the extra row only to determine truncation.
 
     ``LEFT JOIN`` on purpose: a sample whose forward label has not been
     recorded yet must still be *audited* as excluded (``missing_label``).
@@ -988,7 +1000,7 @@ def _read_alpha_evidence_page(
     sample_columns = _table_columns(conn, ALPHA_SAMPLE_TABLE)
     return_columns = _table_columns(conn, ALPHA_RETURN_TABLE)
     if not sample_columns or not return_columns:
-        return [], False
+        return
 
     sample_select = ", ".join(
         [_select(sample_columns, name, name, "s") for name in _SAMPLE_FIELDS]
@@ -1011,23 +1023,33 @@ def _read_alpha_evidence_page(
             ON r.start_date = s.profile_date AND r.code = s.code
          ORDER BY {order_clause}{limit_clause}
     """
-    raw_rows = _rows_as_dicts(conn, sql, args)
-    if not raw_rows:
-        return [], False
+    try:
+        cursor = conn.execute(sql, args)
+    except sqlite3.Error:
+        return
+    names = [str(description[0]) for description in cursor.description or ()]
+    feature_fields = DEFAULT_ALPHA_FEATURES + FINANCIAL_FEATURE_FIELDS
+    try:
+        for raw in cursor:
+            record = dict(zip(names, raw, strict=False))
+            sample = {name: record.get(name) for name in _SAMPLE_FIELDS if name not in feature_fields}
+            sample["sample_features"] = {name: record.get(name) for name in feature_fields}
+            label = {name: record.get(f"r_{name}") for name in _RETURN_FIELDS}
+            yield {"sample": sample, "label": label}
+    finally:
+        cursor.close()
 
-    evidence = []
-    for record in raw_rows:
-        feature_fields = DEFAULT_ALPHA_FEATURES + FINANCIAL_FEATURE_FIELDS
-        sample = {name: record.get(name) for name in _SAMPLE_FIELDS if name not in feature_fields}
-        sample["sample_features"] = {
-            name: record.get(name) for name in DEFAULT_ALPHA_FEATURES + FINANCIAL_FEATURE_FIELDS
-        }
-        label = {name: record.get(f"r_{name}") for name in _RETURN_FIELDS}
-        evidence.append({"sample": sample, "label": label})
 
-    truncated = fetch_limit is not None and len(evidence) > int(max_rows)
+def _read_alpha_evidence_page(
+    conn: sqlite3.Connection, max_rows: Optional[int] = None
+) -> tuple:
+    """Compatibility list read; the production builder uses the cursor directly."""
+    evidence = list(_iter_alpha_evidence(conn, max_rows=max_rows))
+    fetch_limit = int(max_rows) if max_rows is not None and int(max_rows) > 0 else None
+
+    truncated = fetch_limit is not None and len(evidence) > fetch_limit
     if truncated:
-        evidence = evidence[: int(max_rows)]
+        evidence = evidence[:fetch_limit]
     return evidence, truncated
 
 
@@ -1060,7 +1082,7 @@ def _label_identity(evidence: Mapping[str, Any]) -> Optional[tuple]:
     )
 
 
-def _ambiguous_identities(evidence: Sequence[Mapping[str, Any]]) -> frozenset:
+def _ambiguous_identities(evidence: Iterable[Mapping[str, Any]]) -> frozenset:
     """Identities whose candidates disagree about the forward-label endpoint.
 
     Conflict is *not* resolved by picking one -- not first, not last, not
@@ -1068,16 +1090,20 @@ def _ambiguous_identities(evidence: Sequence[Mapping[str, Any]]) -> frozenset:
     refused, so the verdict can never depend on SQLite row order.
     """
     endpoints: dict = {}
+    ambiguous = set()
     for item in evidence:
         identity = _label_identity(item)
-        if identity is None:
+        if identity is None or identity in ambiguous:
             continue
         label = dict(item.get("label") or {})
         endpoint = _date_text(label.get("end_date"))
         if endpoint is None:
             continue
-        endpoints.setdefault(identity, set()).add(endpoint)
-    return frozenset(identity for identity, seen in endpoints.items() if len(seen) > 1)
+        prior = endpoints.setdefault(identity, endpoint)
+        if prior != endpoint:
+            ambiguous.add(identity)
+            del endpoints[identity]
+    return frozenset(ambiguous)
 
 
 def _canonical_provenance(sample: Mapping[str, Any], label: Mapping[str, Any]) -> dict:
@@ -1378,7 +1404,12 @@ def source_digest(samples: Sequence[CanonicalSample]) -> str:
         f"{s.source}|{s.source_version}|{s.feature_asof}|{s.code}|{s.horizon}|{s.sample_key}"
         for s in samples
     )
-    return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    for index, key in enumerate(keys):
+        if index:
+            digest.update(b"\n")
+        digest.update(key.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def dataset_fingerprint(
@@ -1399,11 +1430,11 @@ def dataset_fingerprint(
     feature list, cutoff, split spec, contract version or provenance -- changes
     it.
     """
-    rows = []
-    for name in PARTITIONS:
-        for sample in partitions.get(name) or []:
-            rows.append(sample.canonical(feature_names))
-    rows.sort(key=_canonical_sort_key)
+    # Sort references, then let the standard encoder canonicalize one sample
+    # at a time. The byte stream is identical to the v1 materialized JSON;
+    # neither a full second set of row dictionaries nor a giant string is kept.
+    rows = sorted((sample for name in PARTITIONS
+                   for sample in partitions.get(name) or []), key=_sample_sort_key)
     payload = {
         "fingerprint_version": FINGERPRINT_VERSION,
         "contract_version": contract_version,
@@ -1415,10 +1446,14 @@ def dataset_fingerprint(
         "source_digest": source_digest_value,
         "rows": rows,
     }
-    serialized = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    encoder = json.JSONEncoder(
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        default=lambda sample: sample.canonical(feature_names),
     )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    for chunk in encoder.iterencode(payload):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
 
 
 @dataclass(slots=True)
@@ -1562,6 +1597,20 @@ def read_manifest(conn: sqlite3.Connection, fingerprint: str) -> Optional[dict]:
 # ─────────────────────────────── build entry ───────────────────────────────
 
 
+@contextmanager
+def _evidence_read_snapshot(conn: sqlite3.Connection):
+    """Keep both cursor passes on one SQLite snapshot without committing a caller."""
+    conn.execute("SAVEPOINT learning_dataset_evidence")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK TO learning_dataset_evidence")
+        conn.execute("RELEASE learning_dataset_evidence")
+        raise
+    else:
+        conn.execute("RELEASE learning_dataset_evidence")
+
+
 def build_dataset(
     conn: sqlite3.Connection,
     *,
@@ -1594,28 +1643,40 @@ def build_dataset(
     spec = _normalize_split_spec(split_spec)
     features = tuple(str(name) for name in feature_names)
 
-    evidence, truncated = _read_alpha_evidence_page(conn, max_rows=max_evidence_rows)
-    ambiguous = _ambiguous_identities(evidence)
     exclusions = {reason: 0 for reason in EXCLUSION_REASONS}
     accepted = []
     seen = set()
-    for item in evidence:
-        if _label_identity(item) in ambiguous:
-            # Two candidates claim the same logical sample but disagree about
-            # the label endpoint.  Picking one -- first, last, MIN or MAX --
-            # would make the dataset depend on SQLite row order, so all of
-            # them are refused instead.
-            exclusions["ambiguous_label"] = exclusions.get("ambiguous_label", 0) + 1
-            continue
-        sample, reason = _classify(item, cutoff=canonical_cutoff, feature_names=features)
-        if reason is not None:
-            exclusions[reason] = exclusions.get(reason, 0) + 1
-            continue
-        if sample.sample_key in seen:
-            exclusions["duplicate_sample"] = exclusions.get("duplicate_sample", 0) + 1
-            continue
-        seen.add(sample.sample_key)
-        accepted.append(sample)
+    source_row_count = 0
+    truncated = False
+    cap = int(max_evidence_rows) if max_evidence_rows is not None and int(max_evidence_rows) > 0 else None
+
+    def counted_evidence():
+        nonlocal source_row_count, truncated
+        for item in _iter_alpha_evidence(conn, max_rows=max_evidence_rows):
+            if cap is not None and source_row_count == cap:
+                truncated = True
+                break
+            source_row_count += 1
+            yield item
+
+    # Detect conflicts first, then classify from a fresh cursor in the same
+    # read snapshot. Raw evidence is never accumulated in a Python list.
+    with _evidence_read_snapshot(conn):
+        ambiguous = _ambiguous_identities(counted_evidence())
+        for item in islice(_iter_alpha_evidence(conn, max_rows=max_evidence_rows), source_row_count):
+            if _label_identity(item) in ambiguous:
+                exclusions["ambiguous_label"] = exclusions.get("ambiguous_label", 0) + 1
+                continue
+            sample, reason = _classify(item, cutoff=canonical_cutoff, feature_names=features)
+            if reason is not None:
+                exclusions[reason] = exclusions.get(reason, 0) + 1
+                continue
+            if sample.sample_key in seen:
+                exclusions["duplicate_sample"] = exclusions.get("duplicate_sample", 0) + 1
+                continue
+            seen.add(sample.sample_key)
+            accepted.append(sample)
+    del ambiguous, seen
 
     financial_fields = sorted(set(features) & set(FINANCIAL_FEATURE_FIELDS))
     if financial_fields and financial_feature_repository is not None:
@@ -1634,6 +1695,7 @@ def build_dataset(
         accepted = owner_samples
 
     partitions, purge_counts = chronological_split(accepted, split_spec=spec)
+    del accepted
     exclusions["overlapping_label_purged"] = int(purge_counts["train"] + purge_counts["validation"])
 
     manifest = build_manifest(
@@ -1643,7 +1705,7 @@ def build_dataset(
         feature_names=features,
         horizon_semantics=horizon_semantics,
         split_spec=spec,
-        source_row_count=len(evidence),
+        source_row_count=source_row_count,
         contract_version=contract_version,
         code_build_identity=code_build_identity,
     )

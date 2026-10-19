@@ -431,6 +431,10 @@ class OfflinePaperEnv:
         MDSvc.read_snapshot = _fresh_replay_market_reading
         cls._patches.append((U, "refresh_history", U.refresh_history))
         U.refresh_history = lambda **kwargs: {"status": "up_to_date"}
+        # PIT 历史成分来自官方证券主表归档，归档库与行情/K 线一样属于外部数据：
+        # 离线环境必须把它隔离到临时目录并预置合成归档，否则真实库的 5000+ 成员
+        # 会让小样本 fixture 的覆盖门禁永远不成立。
+        cls._seed_universe_archive()
         cls._patches.append((dfc, "fetch_market_snapshot_full", dfc.fetch_market_snapshot_full))
         dfc.fetch_market_snapshot_full = lambda *a, **k: []
         # 开盘执行通道的全市场探活/快照验证：注入合成实时宇宙（含当日时间戳）。
@@ -497,6 +501,43 @@ class OfflinePaperEnv:
         _seed_market(cls._tmp)
         PT.init_db()
         cls._seed_tradability_archive()
+
+    @classmethod
+    def _seed_universe_archive(cls):
+        """Isolate the PIT security-master archive and seed a synthetic roster.
+
+        The archive is the membership authority for historical replays, so an
+        offline replay cannot read the developer machine's real archive: its
+        thousands of members would dwarf the injected kline cache.  Seeding a
+        roster that mirrors ``ALL_CODES`` keeps the production PIT gate (strict
+        membership, as-of filtering, source completeness) running unchanged.
+        """
+        import db_migrate as DBM
+        import historical_universe_archive as HUA
+        import historical_universe_public_sources as HUPS
+
+        cls._patches.append((DBM, "DB_PATHS", DBM.DB_PATHS))
+        archive_db = os.path.join(cls._tmp, "adaptive_learning.sqlite3")
+        DBM.DB_PATHS = {**DBM.DB_PATHS, "adaptive_learning": archive_db}
+        with contextlib.closing(sqlite3.connect(archive_db)) as conn, conn:
+            repository = HUA.HistoricalUniverseArchiveRepository(conn)
+            exchange_by_prefix = lambda code: "SSE" if code.startswith("6") else "SZSE"  # noqa: E731
+            records = []
+            for code in ALL_CODES:
+                exchange = exchange_by_prefix(code)
+                records.append({
+                    "code": f"{code}.{HUPS._EXCHANGE_CODE_SUFFIX[exchange]}",
+                    "listed_from": SYNTHETIC_LIST_DATE, "delisted_at": None,
+                    "security_type": "ordinary_share", "exchange": exchange,
+                    "name": NAMES.get(code, code),
+                })
+            repository.import_historical_security_master(
+                HUPS._archive_rows(records, "unit_test_injection"),
+                coverage_start=SYNTHETIC_LIST_DATE,
+                coverage_end=D6.isoformat(),
+                source=HUPS.SOURCE_NAME,
+                source_revision="unit_test_injection",
+            )
 
     @classmethod
     def _seed_tradability_archive(cls):

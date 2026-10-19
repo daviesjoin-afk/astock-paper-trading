@@ -1,0 +1,10 @@
+{
+  "scope": "full",
+  "tests": 5676,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 5,
+  "elapsed_seconds": 565.174,
+  "successful": true,
+  "log": "<PROJECT_ROOT>/work/architecture_boundary_tests_full.log"
+}

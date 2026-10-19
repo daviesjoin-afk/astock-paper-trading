@@ -1050,4 +1050,106 @@ report 完成 job、其它候选 report 完成 job、scenario unavailable 映射
 失败映射 completed、正式 R30 fingerprint 漂移、旧 plan-v1 收到默认 policy、伪造嵌套 baseline
 provenance、嵌套 baseline identity 与顶层不一致。每例编译真实 mutant、运行对应 detector、
 恢复原始字节并核对 SHA256，最后重跑基线。
-要求 detected=24/24，survived=fake=timeout=0。M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。
+要求 detected=27/27，survived=fake=timeout=0。M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。
+
+
+## R36-C Candidate Selection
+
+永久测试：`backend/test_r36c_candidate_selection.py`（SEL-01..SEL-41）。成功路径使用真实
+archive、calendar、tradability、R29 ledger、R30 runner 与 robustness ledger；mock 仅用于
+故障、崩溃、并发与事务边界探测。
+
+**边界声明：R36-C selection ≠ runtime stock selection ≠ promotion selection。**
+R36-C 只把 exact R29/R30 证据转成搜索局部 Pareto/disposition；runtime 选股、paper account
+选择与 R31 promotion 都是其它权威，R36-C 既不调用也不 import。
+
+| ID | 检查 |
+| --- | --- |
+| SEL-01 | v1 search projection/fingerprint 冻结（无 `experiment_plan`、无 `selection_policy`），roundtrip 自证 |
+| SEL-02 | v2 search projection/fingerprint 冻结（无 `selection_policy`），roundtrip 自证 |
+| SEL-03 | objectives 闭集 allowlist、canonical 排序；空 / 重复 / 未知 objective 一律拒绝 |
+| SEL-03b | policy projection roundtrip；带 `selection_policy` 必须 v3，v2/v3 缺 policy 拒绝 |
+| SEL-04 | policy 任一业务事实改变即改变 policy fingerprint |
+| SEL-05 | v3 绑定 selection policy：policy 变化改变 `search_input_fingerprint` |
+| SEL-06 | policy 不污染 experiment identity：plan fingerprint 与 robustness policy fingerprint 不变 |
+| SEL-07 | v2 search 仍 PIT/R30 可执行，但 selection 不可用，稳定 reason `search_run_selection_policy_unavailable` |
+| SEL-08 | v3 走通 B1 PIT、B2 robustness 并成功产生 selection report |
+| SEL-09 | candidate pool 只来自 exact `search_spec.candidate_ids`，顺序一致 |
+| SEL-10 | 每个候选经 `get_candidate` 重自证；ledger 损坏 → `candidate_identity_mismatch` |
+| SEL-11 | PIT job queued/claimed/failed → 整次拒绝 `selection_operational_evidence_incomplete` |
+| SEL-11b | PIT job cancelled 同样整次拒绝（fail-closed，避免运营性审查） |
+| SEL-12 | canonical R29 blocked / result 非 completed 是真实证据 → ineligible、eliminate、无 R30 |
+| SEL-13 | READY 候选缺 robustness job → 整次拒绝 `selection_robustness_stage_incomplete` |
+| SEL-14 | robustness job queued/claimed/failed → 整次拒绝（缺执行事实，非候选表现） |
+| SEL-15 | 其它候选 / 其它 baseline 的 R30 report 不能完成绑定（重核 R29↔R30） |
+| SEL-16 | 缺 metric → `selection_metric_unavailable` / `selection_objective_unavailable`，绝不当 0 |
+| SEL-17 | baseline gates：return floor / drawdown limit / trade_count / data_coverage 逐项 reason |
+| SEL-18 | robustness gates：unavailable / failed / threshold breach / fragility 逐项 reason |
+| SEL-19 | objective 方向固定（caller 不能声明）：return MAXIMIZE、drawdown_abs MINIMIZE |
+| SEL-20 | Pareto 简单支配：被支配候选进后一 front |
+| SEL-21 | trade-off（高 return 高 drawdown vs 低 return 低 drawdown）同 front |
+| SEL-22 | 完全相同的证据同 front |
+| SEL-23 | 输入顺序不影响 `report_fingerprint` 与 front 分配 |
+| SEL-24 | advance / retain / eliminate 由 `advance_through_front` / `retain_through_front` 决定 |
+| SEL-25 | ineligible 候选 `pareto_front=null`、`next_generation_eligible=false`、disposition=eliminate |
+| SEL-26 | 表无 scalar score / weighted_score / utility / winner / best_candidate / promotion / promotable 列 |
+| SEL-26b | `candidate_selection.py` 源码无 winner/best_candidate/champion/top_candidate/weighted_score 字段 |
+| SEL-27 | `evidence_set_fingerprint` 精确：pit_run_key / pit_result_fingerprint / report key 变化即变化 |
+| SEL-28 | `created_at` 在 report identity 之外；同 report 不同 created_at 同 `selection_report_key` |
+| SEL-29 | append-only：UPDATE / DELETE 均被 trigger 拒绝 |
+| SEL-30 | repository 读取自证：篡改 report_json / counts / fingerprints 即 `SelectionPersistenceError` |
+| SEL-31 | 同 report 重复 append 幂等，表内恰好 1 行 |
+| SEL-32 | 同 search 不同 report → `selection_report_conflict` |
+| SEL-33 | 全员 ineligible 是合法 report（eligible_count=0、eliminate_count=N、无 front）；重复 / 并发选择幂等 |
+| SEL-34 | 128 候选规模 Pareto 正确且顺序无关 |
+| SEL-34b | 正常 bootstrap（`ensure_candidate_selection`）也建出 selection 表，列集精确 |
+| SEL-35 | `selection_report_key = sha256({report_version, search_run_id, search_input_fingerprint, selection_policy_fingerprint, evidence_set_fingerprint})` |
+| SEL-36 | 选择不写 candidate ledger / lifecycle / promotion 表 |
+| SEL-36b | 三个 selection 模块不 import promotion / lifecycle / runtime selection / AI 权威 |
+| SEL-37 | `candidate_selection.py` 纯领域：无 sqlite3 / os / pathlib / datetime / 网络 / strategy_registry |
+| SEL-38 | service 源码无 latest / recent / `ORDER BY DESC LIMIT 1` / `MAX(created_at)` / current 结果查找 |
+| SEL-39 | operational evidence incomplete 不产生 report（拒绝路径零 selection 行） |
+| SEL-40 | migration v36 append-only、幂等、**无 backfill**（历史 selection 行数 0） |
+| SEL-41 | selection 权威边界：不 import `strategy_promotion` / `promotion_science` / `strategy_lifecycle` / `adaptive_selection` / `selection_runner` / `paper_selection` / `strategy_selection_resolver` / `strategy_selection_provenance` / `selection_tracking` / `learning_evaluation` |
+
+R36-C focused test count：(filled by Lead)。
+
+### R36-C semantic mutation results
+
+`work/r36c_selection_mutation_check.py` 结果：M-SEL1–M-SEL27 all **DETECTED**；
+survived=fake=timeout=0；restore SHA256=PASS；baseline after restore=GREEN。
+
+| ID | 语义 | detector |
+| --- | --- | --- |
+| M-SEL1 | selection policy 移出 search identity | SEL-05 |
+| M-SEL2 | selection policy 泄漏进 candidate-experiment-plan-v2 projection | SEL-06b |
+| M-SEL3 | v3 search 被 B2 robustness 拒绝（版本检查只认 v2） | SEL-08 |
+| M-SEL4 | R29 证据读取退化成 recent run 列表 | SEL-04 |
+| M-SEL5 | R30 证据读取退化成 recent report 列表 | SEL-05 |
+| M-SEL6 | operational PIT 非完成状态变成淘汰 | SEL-11 |
+| M-SEL7 | operational R30 非完成状态变成淘汰 | SEL-14 |
+| M-SEL8 | canonical R29 blocked 候选被要求必须有 R30 | SEL-12 |
+| M-SEL9 | READY R29 候选缺 robustness job 仍被选中 | SEL-13 |
+| M-SEL10 | 不重核 R29↔R30 绑定，接受其它候选 report | SEL-15 |
+| M-SEL11 | 缺 metric 用 0 填充 | SEL-16 |
+| M-SEL12 | objective direction 反转（return 变小越好） | SEL-19 |
+| M-SEL13 | Pareto 要求每个 objective 都严格更优 | SEL-20 |
+| M-SEL14 | candidate_id 顺序变成语义 ranking（front 内加 rank） | SEL-22 |
+| M-SEL15 | ineligible 候选进入 Pareto 集合 | SEL-25 |
+| M-SEL16 | advance/retain front 阈值被忽略 | SEL-24 |
+| M-SEL17 | 引入 weighted scalar score 作为选择权威 | SEL-26b |
+| M-SEL18 | report identity 丢弃 evidence set fingerprint | SEL-27 |
+| M-SEL19 | 同 search 接受冲突的第二份 report | SEL-32 |
+| M-SEL20 | selection repository 变成可 UPDATE | SEL-29 |
+| M-SEL21 | selection 写 candidate ledger | SEL-36 |
+| M-SEL22 | selection import promotion/lifecycle | SEL-36b |
+| M-SEL23 | 并发相同 selection 产生冲突而非幂等 | SEL-23b |
+| M-SEL24 | fresh bootstrap 不建 selection 表 | SEL-34b |
+| M-SEL25 | 已启用的 robustness gate 在 count 缺失时 fail-open（None 当 0） | FailClosedGateTests |
+| M-SEL26 | ledger 不交叉核对 report candidates 与 bound evidence | LedgerCrossCheckTests |
+| M-SEL27 | v3 search 接受裸 v1 plan（R30 永远无法执行） | SEL-03c |
+
+M-SEL1–M-SEL27 分别破坏 exact 证据读取、policy 身份、operational fail-closed、R29↔R30 绑定、
+objective 方向、metric 语义、Pareto 语义与 report 持久化。每例编译真实 mutant、运行对应
+detector、恢复原始字节并核对 SHA256，最后重跑基线。
+要求 detected=27/27，survived=fake=timeout=0。M-CRB / M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。

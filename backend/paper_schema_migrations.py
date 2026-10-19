@@ -1951,6 +1951,75 @@ def experiment_search_job_event_ddl(table="experiment_search_job_events"):
     )"""
 
 
+#: R36-C：selection report ledger 的规范列集（测试用 PRAGMA table_info 对照）。
+SELECTION_REPORT_COLUMNS = (
+    "selection_report_key", "search_run_id", "search_input_fingerprint",
+    "selection_policy_fingerprint", "evidence_set_fingerprint", "report_version",
+    "candidate_count", "eligible_count", "advance_count", "retain_count",
+    "eliminate_count", "report_json", "evidence_binding_json", "created_at",
+    "payload_fingerprint",
+)
+
+
+def experiment_search_selection_report_ddl(table="experiment_search_selection_reports"):
+    """``experiment_search_selection_reports`` 的规范 DDL（R36-C）。
+
+    一个 search run 只允许一份 canonical selection report：selection policy 已 pin 到
+    search identity，exact evidence set 完成后不可变。表里**没有** score / weighted_score /
+    utility / winner / best_candidate / promotion / promotable 列：那些属于 R31 promotion，
+    或会变成第二套 metrics authority。
+    """
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        selection_report_key TEXT PRIMARY KEY,
+        search_run_id TEXT NOT NULL UNIQUE,
+        search_input_fingerprint TEXT NOT NULL,
+        selection_policy_fingerprint TEXT NOT NULL,
+        evidence_set_fingerprint TEXT NOT NULL,
+        report_version TEXT NOT NULL,
+        candidate_count INTEGER NOT NULL,
+        eligible_count INTEGER NOT NULL,
+        advance_count INTEGER NOT NULL,
+        retain_count INTEGER NOT NULL,
+        eliminate_count INTEGER NOT NULL,
+        report_json TEXT NOT NULL,
+        evidence_binding_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        payload_fingerprint TEXT NOT NULL,
+        CHECK(length(selection_report_key)=64),
+        CHECK(length(search_run_id)=64),
+        CHECK(length(search_input_fingerprint)=64),
+        CHECK(length(selection_policy_fingerprint)=64),
+        CHECK(length(evidence_set_fingerprint)=64),
+        CHECK(candidate_count >= 0),
+        CHECK(length(payload_fingerprint)=64),
+        FOREIGN KEY(search_run_id) REFERENCES experiment_search_runs(search_run_id)
+    )"""
+
+
+def ensure_candidate_selection(conn):
+    """v36：创建 R36-C selection report 追加表（幂等，**不回填**）。
+
+    历史 v1/v2 search 从来没有 selection policy，也不存在"当时应该选谁"这个事实。从既有
+    R29/R30 结果反推历史选择属于伪造历史决策，因此历史 selection rows = 0 才是正确状态。
+
+    DDL 单一事实来源在本函数；migration v36 与正常 ``init_db()`` bootstrap 都调用它。
+    """
+    existed = bool(table_columns(conn, "experiment_search_selection_reports"))
+    conn.execute(experiment_search_selection_report_ddl())
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_selection_reports_search"
+        " ON experiment_search_selection_reports(search_run_id)"
+    )
+    for action in ("UPDATE", "DELETE"):
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS experiment_search_selection_reports_no_{action.lower()}
+                BEFORE {action} ON experiment_search_selection_reports
+                BEGIN SELECT RAISE(ABORT,'experiment_search_selection_reports are append-only'); END"""
+        )
+    return {"experiment_search_selection_reports": "ok" if existed else "created"}
+
+
 def ensure_experiment_search(conn):
     """v35：创建 R36-A search control plane 三张 append-only 表（幂等，不回填）。
 

@@ -41,6 +41,7 @@ if BACKEND_DIR not in sys.path:
 import paper_trading as PT  # noqa: E402
 import tradability_archive as TA  # noqa: E402
 import universe as U  # noqa: E402
+import tradability_ingestion as TI  # noqa: E402
 
 
 class PaperRiskExitProductionPathTestCase(unittest.TestCase):
@@ -521,6 +522,43 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             self.assertEqual(len(orders), 1, "Only 1 order created in DB during cooldown")
             self.assertEqual(orders[0]["status"], "unfilled_limit_down")
 
+    def test_pending_risk_sell_is_reused_when_tradability_evidence_is_missing(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM historical_tradability_archive")
+        first = PT.monitor_risk(self.day)
+        self.assertEqual(first["orders"][0]["status"], "pending_execution")
+        self._clear_scan_run_state()
+        second = PT.monitor_risk(self.day)
+        self.assertEqual(second["orders"][0]["status"], "pending_execution_wait")
+        with PT._db_readonly() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_orders WHERE side='sell'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills WHERE side='sell'").fetchone()[0], 0)
+
+    def test_prefetched_current_status_closes_empty_archive_execution_path(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM historical_tradability_archive")
+            TI.ensure_ingestion_schema(conn)
+        quote = self.quotes_map[self.code]
+        quote["tradability_observation_status"] = "available"
+        quote["tradability_observation"] = {
+            "code": self.code, "session_date": self.day.isoformat(),
+            "observed_at": self.day.isoformat() + "T14:49:59+08:00",
+            "effective_at": self.day.isoformat() + "T14:49:59+08:00",
+            "source": "eastmoney_stock_profile+complete_suspension_report+verified_quote",
+            "fields": {"is_listed": True, "listing_date": "2000-01-01", "is_st": False,
+                       "is_suspended": False, "has_market_quote": True,
+                       "has_trade_volume": True, "is_price_limit_locked": False},
+        }
+        result = PT.monitor_risk(self.day)
+        self.assertEqual(result["orders"][0]["status"], "filled")
+        with PT._db_readonly() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM historical_tradability_archive").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills WHERE side='sell'").fetchone()[0], 1)
+
     # -------------------------------------------------------------------------
     # Scenario J: 冻结语义与容量限制互不干扰（PAPER_ENTRY_FREEZE 不阻断风控退出）
     # -------------------------------------------------------------------------
@@ -756,6 +794,60 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
 
                 lots = conn.execute("SELECT remaining_qty FROM paper_position_lots WHERE account_id=?", (account_id,)).fetchall()
                 self.assertEqual(lots[0]["remaining_qty"], 0)
+
+
+    def test_snapshot_failure_retries_without_replaying_completed_trading(self):
+        import paper_runner
+
+        self._insert_lot("tq_breakout", self.code, 1000, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        with mock.patch.object(PT, "request_risk_snapshot_refresh", side_effect=[
+                {"status": "failed", "error": "timeout_after_240s"}, {"status": "completed"}]) as refresh, \
+                mock.patch.object(PT, "monitor_risk", wraps=PT.monitor_risk) as trading:
+            failed = PT.run_slot("risk", self.day, force=True, risk_snapshot_background=False)
+            self.assertEqual(failed["status"], "completed")
+            self.assertEqual(failed["risk_snapshot_refresh"], "failed")
+            self.assertEqual(paper_runner._result_exit_code(failed), 1)
+            with PT._db() as conn:
+                self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
+                fill_count = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+            retried = PT.run_slot("risk", self.day, force=True, risk_snapshot_background=False)
+            self.assertEqual(retried["status"], "already_done")
+            self.assertEqual(paper_runner._result_exit_code(retried), 0)
+            self.assertEqual(trading.call_count, 1)
+            self.assertEqual(refresh.call_count, 2)
+            with PT._db() as conn:
+                self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0], fill_count)
+
+    def test_blocked_auction_is_retryable_and_preserves_failure_reason(self):
+        blocked = {"slot": "auction", "status": "blocked", "reason": "current quotes unavailable"}
+        with mock.patch.object(PT, "run_auction_preselection", side_effect=[
+                blocked, {"slot": "auction", "status": "completed", "snapshot_count": 4500}]) as run:
+            result = PT.run_slot("auction", self.day)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], blocked["reason"])
+            self.assertEqual(result["error"], "slot_work_incomplete")
+            with PT._db() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT status FROM paper_jobs WHERE slot='auction'").fetchone()[0], "failed")
+                fills = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+            retried = PT.run_slot("auction", self.day)
+            self.assertEqual(retried["status"], "completed")
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(PT.run_slot("auction", self.day)["status"], "already_done")
+            with PT._db() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0], fills)
+
+    def test_blocked_slot_preserves_bounded_automatic_retry_count(self):
+        with mock.patch.object(PT, "run_auction_preselection", return_value={
+                "slot": "auction", "status": "blocked", "reason": "quotes unavailable"}) as run:
+            for count in range(3):
+                result = PT.run_slot("auction", self.day)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["retry_count"], count)
+            self.assertEqual(PT.run_slot("auction", self.day)["status"], "already_done")
+            self.assertEqual(run.call_count, 3)
 
 
 class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):

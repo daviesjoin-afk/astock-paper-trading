@@ -3,9 +3,9 @@
 
 Owns the full manual-trade path: risk state -> order plan -> preview ->
 execute/commit -> submit (two-phase confirm) -> cancel -> pending-order
-sweep.  Function bodies are byte-for-byte moves from paper_trading.py;
-each function resolves its shared-engine dependencies lazily at call time
-(`from paper_trading import ...`) so importing either module first is safe.
+sweep. Trading rules and write ordering follow the original paper_trading path;
+each function resolves declared dependencies supplied by the composition root
+at call time. This module never imports the trading engine.
 paper_trading.py keeps thin *args/**kwargs facades under the original
 names, so `import paper_trading as P; P.submit_manual_order(...)` and the
 api_paper.py call sites are unchanged.
@@ -18,48 +18,125 @@ import market_data_contract as MDC
 import market_data_service as MDSvc
 
 
+from dataclasses import dataclass
+from typing import Any, Callable
+
+
+@dataclass(frozen=True)
+class ManualOrderDependencies:
+    """Explicit capabilities supplied by the application composition root."""
+    ACTIVE_ACCOUNT_IDS: Any
+    DE: Any
+    ENTRY_FREEZE_ENV: Any
+    ENTRY_FROZEN_WAITLIST_STATUS: Any
+    ENTRY_RETRY_ORDER_STATUSES: Any
+    LOT_SIZE: Any
+    MANUAL_EXECUTION_RETRY_STATUS: Any
+    PAPolicy: Any
+    PAW: Any
+    PRS: Any
+    PRuntime: Any
+    RSET: Any
+    ReservationCycleMismatch: Any
+    SHARED_POOL_MAX_EXPOSURE: Any
+    STRATEGY_EXECUTION_RETRY_STATUS: Any
+    _assert_active_lease: Any
+    _assert_order_execution_cycle: Any
+    _asset_type: Any
+    _audit: Any
+    _build_portfolio_entry_plan: Any
+    _completed_kline: Any
+    _date: Any
+    _db: Any
+    _entry_freeze_enabled: Any
+    _entry_frozen_reason: Any
+    _existing_position_addition_gate: Any
+    _finish_capital_reservation: Any
+    _hold_days: Any
+    _json: Any
+    _lease_lost: Any
+    _limit_pct: Any
+    _loads: Any
+    _market_state: Any
+    _now: Any
+    _num: Any
+    _order_cycle_id: Any
+    _pending_position_slots: Any
+    _position_rows: Any
+    _price_aware_qty: Any
+    _quotes: Any
+    _record_nav: Any
+    _reserve_shared_capital: Any
+    _risk_log: Any
+    _risk_profile: Any
+    _rollback_slot_borrow: Any
+    _rows: Any
+    _shared_account_exposure: Any
+    _shared_cash: Any
+    _shared_risk_state: Any
+    _spec_for: Any
+    _strategy_entry_assessment: Any
+    _strategy_stamp: Any
+    _universe_snapshot_time: Any
+    _with_decision_snapshot: Any
+    init_db: Any
+
+
+_dependencies_factory: Callable[[], ManualOrderDependencies] | None = None
+
+
+def bind_dependencies(factory: Callable[[], ManualOrderDependencies]):
+    global _dependencies_factory
+    _dependencies_factory = factory
+
+
+def _dependencies() -> ManualOrderDependencies:
+    if _dependencies_factory is None:
+        raise RuntimeError("manual_orders dependencies have not been configured")
+    return _dependencies_factory()
+
+
 def _manual_order_plan(
     conn, account_id, code, side, qty=0, order_type="market",
     limit_price=None, asof_day=None, quote=None, exclude_reservation_key=None,
     all_quotes=None, live_universe=None, market_context=None,
 ):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        ACTIVE_ACCOUNT_IDS,
-        DE,
-        ENTRY_FREEZE_ENV,
-        ENTRY_FROZEN_WAITLIST_STATUS,
-        LOT_SIZE,
-        RSET,
-        SHARED_POOL_MAX_EXPOSURE,
-        _spec_for,
-        _asset_type,
-        _completed_kline,
-        _date,
-        _build_portfolio_entry_plan,
-        _entry_freeze_enabled,
-        _entry_frozen_reason,
-        _existing_position_addition_gate,
-        _hold_days,
-        _limit_pct,
-        _market_state,
-        _num,
-        _pending_position_slots,
-        _position_rows,
-        _price_aware_qty,
-        _quotes,
-        _risk_profile,
-        _shared_account_exposure,
-        _shared_cash,
-        _shared_risk_state,
-        _strategy_entry_assessment,
-        PAPolicy,
-        PAW,
-        PRuntime,
-        PRS,
-        _universe_snapshot_time,
-        _with_decision_snapshot,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    ACTIVE_ACCOUNT_IDS = deps.ACTIVE_ACCOUNT_IDS
+    DE = deps.DE
+    ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
+    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
+    LOT_SIZE = deps.LOT_SIZE
+    RSET = deps.RSET
+    SHARED_POOL_MAX_EXPOSURE = deps.SHARED_POOL_MAX_EXPOSURE
+    _spec_for = deps._spec_for
+    _asset_type = deps._asset_type
+    _completed_kline = deps._completed_kline
+    _date = deps._date
+    _build_portfolio_entry_plan = deps._build_portfolio_entry_plan
+    _entry_freeze_enabled = deps._entry_freeze_enabled
+    _entry_frozen_reason = deps._entry_frozen_reason
+    _existing_position_addition_gate = deps._existing_position_addition_gate
+    _hold_days = deps._hold_days
+    _limit_pct = deps._limit_pct
+    _market_state = deps._market_state
+    _num = deps._num
+    _pending_position_slots = deps._pending_position_slots
+    _position_rows = deps._position_rows
+    _price_aware_qty = deps._price_aware_qty
+    _quotes = deps._quotes
+    _risk_profile = deps._risk_profile
+    _shared_account_exposure = deps._shared_account_exposure
+    _shared_cash = deps._shared_cash
+    _shared_risk_state = deps._shared_risk_state
+    _strategy_entry_assessment = deps._strategy_entry_assessment
+    PAPolicy = deps.PAPolicy
+    PAW = deps.PAW
+    PRuntime = deps.PRuntime
+    PRS = deps.PRS
+    _universe_snapshot_time = deps._universe_snapshot_time
+    _with_decision_snapshot = deps._with_decision_snapshot
     import execution_planner as EP
     day = _date(asof_day)
     code = str(code or "").strip()
@@ -483,11 +560,10 @@ def _manual_order_plan(
 def preview_manual_order(
     account_id, code, side, qty=0, order_type="market", limit_price=None, asof_date=None,
 ):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        _db,
-        init_db,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    _db = deps._db
+    init_db = deps.init_db
     init_db()
     with _db() as conn:
         return _manual_order_plan(
@@ -496,12 +572,11 @@ def preview_manual_order(
 
 
 def _execute_manual_plan(conn, account, plan, order_id, asof_day):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        _assert_active_lease,
-        _entry_freeze_enabled,
-        _entry_frozen_reason,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    _assert_active_lease = deps._assert_active_lease
+    _entry_freeze_enabled = deps._entry_freeze_enabled
+    _entry_frozen_reason = deps._entry_frozen_reason
     import execution_planner as EP
     _assert_active_lease(conn, "manual fill")
     if plan.get("side") == "buy" and _entry_freeze_enabled():
@@ -538,19 +613,18 @@ def _commit_strategy_buy(
     manual buys, while a savepoint prevents a malformed lot/fill write from
     leaving a cash debit behind.
     """
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        STRATEGY_EXECUTION_RETRY_STATUS,
-        _assert_active_lease,
-        _finish_capital_reservation,
-        _json,
-        _lease_lost,
-        _now,
-        _num,
-        _order_cycle_id,
-        _risk_log,
-        _strategy_stamp,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
+    _assert_active_lease = deps._assert_active_lease
+    _finish_capital_reservation = deps._finish_capital_reservation
+    _json = deps._json
+    _lease_lost = deps._lease_lost
+    _now = deps._now
+    _num = deps._num
+    _order_cycle_id = deps._order_cycle_id
+    _risk_log = deps._risk_log
+    _strategy_stamp = deps._strategy_stamp
     import execution_planner as EP
     _assert_active_lease(conn, "strategy auxiliary buy")
     account_id = account["id"]
@@ -627,14 +701,13 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
     * 其余异常是可重试的执行失败：释放本订单预占、回滚 slot borrow、订单与
       信号退回重试态（§53：borrow 属于本次 attempt，必须回滚）。
     """
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        ReservationCycleMismatch,
-        STRATEGY_EXECUTION_RETRY_STATUS,
-        _finish_capital_reservation,
-        _risk_log,
-        _rollback_slot_borrow,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    ReservationCycleMismatch = deps.ReservationCycleMismatch
+    STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
+    _finish_capital_reservation = deps._finish_capital_reservation
+    _risk_log = deps._risk_log
+    _rollback_slot_borrow = deps._rollback_slot_borrow
     borrow = risk.get("slot_borrow") or {}
     if borrow.get("allowed"):
         risk["slot_borrow_rollback"] = _rollback_slot_borrow(
@@ -690,8 +763,11 @@ def commit_strategy_entry_fill(
     ``execution_planner.commit_fill`` 拥有** —— reserve / cash / lot / fill /
     执行验证 / risk log / audit 一律不在此重写（§65）。
     """
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import _assert_active_lease, _json, _lease_lost
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    _assert_active_lease = deps._assert_active_lease
+    _json = deps._json
+    _lease_lost = deps._lease_lost
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
@@ -787,29 +863,29 @@ def commit_strategy_entry_fill(
 def submit_manual_order(
     account_id, code, side, qty=0, order_type="market", limit_price=None, asof_date=None,
 ):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        ENTRY_FROZEN_WAITLIST_STATUS,
-        MANUAL_EXECUTION_RETRY_STATUS,
-        _audit,
-        _date,
-        _db,
-        _entry_frozen_reason,
-        _finish_capital_reservation,
-        _json,
-        _market_state,
-        _now,
-        _num,
-        _order_cycle_id,
-        _quotes,
-        _record_nav,
-        _reserve_shared_capital,
-        _risk_log,
-        _rows,
-        _strategy_stamp,
-        init_db,
-    )
-    from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
+    MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
+    _audit = deps._audit
+    _date = deps._date
+    _db = deps._db
+    _entry_frozen_reason = deps._entry_frozen_reason
+    _finish_capital_reservation = deps._finish_capital_reservation
+    _json = deps._json
+    _market_state = deps._market_state
+    _now = deps._now
+    _num = deps._num
+    _order_cycle_id = deps._order_cycle_id
+    _quotes = deps._quotes
+    _record_nav = deps._record_nav
+    _reserve_shared_capital = deps._reserve_shared_capital
+    _risk_log = deps._risk_log
+    _rows = deps._rows
+    _strategy_stamp = deps._strategy_stamp
+    init_db = deps.init_db
+    deps = _dependencies()
+    _ReservationCycleMismatch = deps.ReservationCycleMismatch
     import execution_planner as EP
     init_db()
     day = _date(asof_date)
@@ -945,15 +1021,14 @@ def submit_manual_order(
 
 
 def cancel_manual_order(order_id):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        ENTRY_RETRY_ORDER_STATUSES,
-        _audit,
-        _db,
-        _finish_capital_reservation,
-        _now,
-        init_db,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    ENTRY_RETRY_ORDER_STATUSES = deps.ENTRY_RETRY_ORDER_STATUSES
+    _audit = deps._audit
+    _db = deps._db
+    _finish_capital_reservation = deps._finish_capital_reservation
+    _now = deps._now
+    init_db = deps.init_db
     init_db()
     with _db() as conn:
         row = conn.execute(
@@ -979,8 +1054,9 @@ def cancel_manual_order(order_id):
 
 
 def _order_execution_cycle_guard():
-    """解析 ``paper_trading._assert_order_execution_cycle``（Phase 2 惰性导入）。"""
-    from paper_trading import _assert_order_execution_cycle
+    """通过已注入能力解析订单执行周期校验器。"""
+    deps = _dependencies()
+    _assert_order_execution_cycle = deps._assert_order_execution_cycle
     return _assert_order_execution_cycle
 
 
@@ -1043,16 +1119,15 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     ``reserved``，那笔资金会被永久占用且没有任何订单再引用它 —— 比直接失败更糟。
     因此释放异常向上抛，让调用方的事务回滚（订单保持原状，下轮可诊断）。
     """
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        ReservationCycleMismatch,
-        _audit,
-        _finish_capital_reservation,
-        _json,
-        _loads,
-        _now,
-        _risk_log,
-    )
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    ReservationCycleMismatch = deps.ReservationCycleMismatch
+    _audit = deps._audit
+    _finish_capital_reservation = deps._finish_capital_reservation
+    _json = deps._json
+    _loads = deps._loads
+    _now = deps._now
+    _risk_log = deps._risk_log
     order_id = int(order["id"])
     marker = getattr(exc, "marker", None) or "order_execution_cycle_changed"
     detail = {
@@ -1100,32 +1175,32 @@ def _terminalize_cycle_stale_order(conn, order, exc):
 
 
 def process_pending_manual_orders(asof_date=None):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        ENTRY_FREEZE_ENV,
-        ENTRY_FROZEN_WAITLIST_STATUS,
-        ENTRY_RETRY_ORDER_STATUSES,
-        MANUAL_EXECUTION_RETRY_STATUS,
-        _assert_active_lease,
-        _audit,
-        _date,
-        _db,
-        _entry_freeze_enabled,
-        _entry_frozen_reason,
-        _finish_capital_reservation,
-        _json,
-        _lease_lost,
-        _loads,
-        _market_state,
-        _num,
-        _quotes,
-        _record_nav,
-        _reserve_shared_capital,
-        _risk_log,
-        _rows,
-        init_db,
-    )
-    from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
+    # Resolve the declared capabilities at call time.
+    deps = _dependencies()
+    ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
+    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
+    ENTRY_RETRY_ORDER_STATUSES = deps.ENTRY_RETRY_ORDER_STATUSES
+    MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
+    _assert_active_lease = deps._assert_active_lease
+    _audit = deps._audit
+    _date = deps._date
+    _db = deps._db
+    _entry_freeze_enabled = deps._entry_freeze_enabled
+    _entry_frozen_reason = deps._entry_frozen_reason
+    _finish_capital_reservation = deps._finish_capital_reservation
+    _json = deps._json
+    _lease_lost = deps._lease_lost
+    _loads = deps._loads
+    _market_state = deps._market_state
+    _num = deps._num
+    _quotes = deps._quotes
+    _record_nav = deps._record_nav
+    _reserve_shared_capital = deps._reserve_shared_capital
+    _risk_log = deps._risk_log
+    _rows = deps._rows
+    init_db = deps.init_db
+    deps = _dependencies()
+    _ReservationCycleMismatch = deps.ReservationCycleMismatch
     import execution_planner as EP
     init_db()
     day = _date(asof_date)

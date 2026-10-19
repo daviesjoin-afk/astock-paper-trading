@@ -5,6 +5,16 @@ HOME=/opt/astock-codex
 # One-shot paper/news/adaptive processes run in astock-task-worker.  Keep the
 # API container for HTTP/read paths; do not docker-exec heavy Python modules
 # into astock-codex, otherwise concurrent imports can exhaust its cgroup.
+#
+# ─── 调度契约的单一事实来源 ───────────────────────────────────────────
+# 本文件与 backend/paper_schedule_contract.py 是同一份契约的两种渲染：
+#   · slot 词表        -> PSch.RUN_SLOTS / RUNNER_ONLY_SLOTS / RUNNER_SLOTS
+#   · Windows 任务表   -> PSch.SCHEDULE_TASKS（paper_trading.install_windows_schedule）
+#   · 本文件的 cron 行  -> PSch.render_cron_lines()
+#   · 热路径判定        -> PSch.HOT_PATH_SLOTS（paper_trading._is_hot_path_slot）
+# 改调度只改契约模块；本文件必须同步，否则
+# backend/test_paper_schedule_contract.py 的 CronRenderingFidelityGuard 会失败
+# （它把两边展开成具体触发时刻做语义比较，不比对字符串）。
 
 # A股集合竞价预选：只采集09:25快照；不使用09:15-09:20可撤单阶段数据。
 25 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
@@ -13,11 +23,26 @@ HOME=/opt/astock-codex
 29 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 
 # A股交易日内监控：09:30-11:25、13:00-14:55，每3分钟一次；开市首分钟只扫描。
-33-59/3 9 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-*/3 10 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-0-25/3 11 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-0-55/3 13 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-*/3 14 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+#
+# 本文件的 slot 词表、任务名、时间表与分钟字段由 backend/paper_schedule_contract.py
+# 单一拥有；下面每一条都应与 ``PSch.render_cron_lines()`` 的渲染逐字段一致。
+# 改调度请改契约模块，再同步本文件，并由
+# backend/test_paper_schedule_contract.py 的 CronRenderingFidelityGuard 校验
+# （它把两边展开成具体 (hour, minute) 触发集合做语义比较，不做字符串比对）。
+#
+# 分钟字段是逐字记录的、不可从窗口+步长推导：09:33 起点用于把开盘首分钟让给
+# 09:31 的 open 任务（共用 paper-scan.lock），13:55 终点用于避免 13:57 与
+# 14:00 重复扫描。契约模块 INTRADAY_CRON_MINUTES 的注释说明了这一点。
+#
+# 14:50 风控已由同一分钟的日内监控统一执行，避免重复确认和重复卖出。
+# risk 因此没有独立条目——这是契约里 SCHEDULED_SLOTS 明确记录的决定，
+# 不再只靠这条注释存在。
+# Wait through a small overrun without overlapping runners or queuing indefinitely.
+33-59/3 9 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/3 10 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-25/3 11 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-55/3 13 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/3 14 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
 
 31 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 开盘审批与盘后因子失败时的单次兜底；已完成的日任务不会重复执行。

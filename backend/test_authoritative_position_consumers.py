@@ -562,7 +562,7 @@ class ProjectionContractGuard(unittest.TestCase):
     #: 每个条目都是「为什么这个读取不是 current-position authority」。
     ALLOWED_FUNCTIONS = {
         # 投影的唯一写者：由 lot 聚合后重建镜像（DELETE 旧行再写）。
-        "backend/paper_trading.py::_sync_positions": "projection writer",
+        "backend/paper_lot_ledger.py::sync_positions": "projection writer",
         # 展示兜底：只取 name 用于风险审计展示，不参与任何持仓判定。
         "backend/paper_trading.py::risk_audit": "display-only name fallback",
         # 一致性自检：把投影与 lot 对账（发现不一致，不产生持仓）。

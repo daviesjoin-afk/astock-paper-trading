@@ -5,7 +5,7 @@ import { $, chart, tableScroll } from "../core/dom.js";
 import { adaptiveEsc, cny, fmt, paperStatusTag, pctCls, pctTxt, riskText, zhRiskText } from "../core/format.js";
 import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
-import { renderPaperAudit } from "./risk.js";
+import { loadPaperAudit } from "./risk.js";
 import { renderSignalAuditTable } from "./signal-audit-table.js";
 import { openInStrategyWorkbench, wbStatusBadge } from "./strategies.js";
 import { toast, inlineError, confirmDialog } from "../ui/dialog.js";
@@ -14,6 +14,13 @@ import { toast, inlineError, confirmDialog } from "../ui/dialog.js";
 function paperNotice(message){
   var text=String(message==null?'':message);
   toast(text, { tone: /失败|错误|异常|拒绝|不可/.test(text) ? 'danger' : 'warn' });
+}
+
+export function paperEntryGateText(shared={}){
+  var gate=shared.entry_freeze;
+  if(!gate || typeof gate.enabled!=='boolean') return '行情门禁：状态待核验';
+  if(gate.enabled) return '行情门禁：冻结 · '+zhRiskText(gate.reason||'待核验');
+  return '行情门禁：通过 · 新增买入仍需资金分配和委托核验';
 }
 
 export function renderPaperCompareChart(curve){
@@ -272,7 +279,7 @@ export function paperOrderStatusView(status,reason){
     pending_execution_guard:['pending','等待执行证据'],
     risk_rejected:['rejected','风控拒绝'],manual_rejected:['rejected','手动委托拒绝'],deferred_capacity:['pending','容量等待重排'],
     unfilled_limit_down:['rejected','跌停未成交'],cancelled:['cancelled','已撤销'],
-    expired:['cancelled','已过期'],ready_to_fill:['pending','待执行'],superseded:['cancelled','已被新委托替代']
+    expired:['cancelled','已过期'],ready_to_fill:['pending','待执行'],superseded:['cancelled','已失效或回收']
   };
   return map[status]||['cancelled',status||'-'];
 }
@@ -722,7 +729,7 @@ export async function loadPaper(options){
     // immediately so it can read in parallel with the larger dashboard DOM
     // render instead of extending every browser refresh serially.
     var auditRequest = variant==='activity'
-      ? api('/api/paper/risk-audit?limit=160')
+      ? api('/api/paper/risk-audit?page_size=50').then(function(data){return {data:data};},function(error){return {error:error};})
       : null;
     var overviewQuery=[];
     if(options.refresh) overviewQuery.push('refresh=1');
@@ -776,10 +783,7 @@ export async function renderPaperDashboard(d,auditRequest){
     $('paperOrderAccount').innerHTML=accounts.map(function(a){return '<option value="'+a.id+'">'+paperAccountDisplayName(a)+' · 共享可用 '+cny((d.shared||{}).cash)+'</option>';}).join('');
     if(previousAccount&&accountName[previousAccount]) $('paperOrderAccount').value=previousAccount;
     var shared=d.shared||{};
-    var entryFreeze=shared.entry_freeze||{};
-    var entryFreezeText=entryFreeze.enabled
-      ? '新增买入：自动冻结 · '+adaptiveEsc(entryFreeze.reason||'数据门禁未通过')
-      : '新增买入：自动开放 · 行情、覆盖和因子门禁通过';
+    var entryFreezeText=paperEntryGateText(shared);
     var slotText='分配额度请在“组合计划”页输入明确的周期和计划 ID 后查看。';
     var borrowText='';
     var sharedDayText=shared.today_pnl===null||shared.today_pnl===undefined
@@ -855,16 +859,12 @@ export async function renderPaperDashboard(d,auditRequest){
         // The shared overview request may have started while another tab was
         // active, in which case auditRequest is null.  Fetch it now instead of
         // awaiting null and passing that value into renderPaperAudit().
-        var auditDashboard=auditRequest||window._paperAuditCache;
-        if(!auditDashboard){
-          auditDashboard=await api('/api/paper/risk-audit?limit=160');
-          window._paperAuditCache=auditDashboard;
-        }
         var auditBoard=$('paperActivityBoard');
         if(auditBoard){
           // loadPaper() may overlap after a fast refresh/navigation. Keep one audit section.
-          auditBoard.querySelectorAll('.paper-risk-audit-section').forEach(function(node){node.remove();});
-          auditBoard.insertAdjacentHTML('beforeend',renderPaperAudit(auditDashboard));
+          auditBoard.querySelectorAll('#paperRiskAuditHost,.paper-risk-audit-section').forEach(function(node){node.remove();});
+          auditBoard.insertAdjacentHTML('beforeend','<div id="paperRiskAuditHost"></div>');
+          await loadPaperAudit('current',auditRequest);
         }
       }catch(e){
         if($('paperActivityBoard')) $('paperActivityBoard').insertAdjacentHTML('beforeend','<div class="paper-terminal-section"><div class="banner">风控审计记录读取失败：'+riskText(e.message||e)+'</div></div>');

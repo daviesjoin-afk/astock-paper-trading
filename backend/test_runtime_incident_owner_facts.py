@@ -1063,6 +1063,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
 
         for module, function in (
             ("adaptive_engine.py", "adaptive_run_fact"),
+            ("adaptive_runtime_facts.py", "adaptive_run_fact"),
             ("paper_trading.py", "paper_job_run_fact"),
         ):
             identifiers, constants = _function_facts(module, function)

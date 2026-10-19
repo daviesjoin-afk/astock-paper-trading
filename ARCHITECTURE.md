@@ -1,5 +1,7 @@
 # Architecture notes
 
+当前服务器核对、数据路径与待收敛边界见 [运行架构审计（2026-10-14）](docs/RUNTIME_ARCHITECTURE_AUDIT.md)。
+
 本项目是 A 股模拟交易系统（paper-only），核心路径应保持为：
 
 ```text
@@ -292,8 +294,10 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 | 策略与决策 | `strategies.py`, `strategy_registry.py`, `strategy_service.py`, `strategy_api_models.py`, `strategy_dsl_schema.py`, `strategy_dsl_evaluator.py`, `strategy_runtime.py`, `strategy_risk_fingerprint.py`, `strategy_risk_profiles.py`, `strategy_risk_enforcement.py`, `strategy_parameter_schema.py`, `strategy_policies.py`, `strategy_clusters.py`, `strategy_champion.py`, `user_strategy_participation.py`, `decision_engine.py`, `decision_context.py`, `decision_rules.py` | 策略身份与不可变版本、DSL 编译、运行时就绪与 RuntimeContext、风险/执行画像、生命周期与治理、候选车道与纯规则评分 | 不读取真实券商账户，不写订单/成交 |
 | 订单意图与执行计划 | `order_intent.py`, `execution_planner.py`, `execution_dispatch.py`, `entry_lifecycle.py` | 策略→执行器的意图契约（拒绝数量越权）、计划/复核/落库统一口径、分批与 TTL | 不决定买什么，不计算资金池分配 |
 | 执行真实性证据 | `backend/execution_evidence.py`, `backend/execution_lifecycle.py`, `backend/execution_outcome.py` | 执行证据三态契约（`known`/`unknown`/`not_applicable`）、成交六分类、委托成交状态机与非法跳转拒绝、`selection_executable` × `execution_verified` 连接、`market`/`selection`/`execution` 三层收益 | 不撮合、不写订单/成交/资金、不重建仓库没有的历史数据、不改写 PR149 selection outcome、不用市场标签顶替执行收益；不 import `paper_trading` |
-| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价；不判断业务 freshness policy（归 `market_data_contract`） |
+| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py`, `marketdata_feeds.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据；逐票 feed 适配器与健康/补缺链 | 不在缓存陈旧时伪造实时价；不判断业务 freshness policy（归 `market_data_contract`） |
 | 行情业务权威 | `backend/market_data_contract.py`（纯契约：状态语义 + freshness policy）、`backend/market_data_service.py`（唯一 authority：只读 / 显式刷新两个入口） | 回答"在指定 as-of / freshness policy 下，系统目前拥有什么经过验证的市场事实"；区分 fresh / stale / degraded / unverified / unavailable；显式 network policy；点时可证明性 | contract 零 I/O / 零时钟 / 零项目依赖；service 不拥有事务、不 import `paper_trading`、不在只读模式联网；不重写 provider 实现、不负责 provider 健康（归 `data_fetcher.load_source_health`） |
+| 行情源降级链 | `data_fetcher.fetch_tencent_market_snapshot`（价格-only 全市场回退）、`market_data_service.TENCENT_SNAPSHOT_SOURCE`、`market_data_contract.REASON_PRICE_ONLY_COVERAGE` | 东财 `clist` 返回 0 行时，用腾讯批量报价按**正式名单**重建价格横截面；持久化 artifact 带 `source` 标记，契约据此判 degraded | 价格-only 快照**不是**东财全市场横截面（无资金流/估值/行业字段），绝不标记为 `cross_source` 核验；覆盖率、新鲜度、名单规模任一不达标即不发布；同源自证（腾讯主报价 + 腾讯核验）一律改走新浪 |
+| 收盘数据生命周期 | `market_data_contract.close_snapshot_window/close_snapshot_rows/provider_max_age`、`close_snapshot_runner`、`main._load_selection_base` | 强制请求与源时间窗口分开；收盘消费者共享指定交易日的时间规则；因子读投影保存等待原因并按文件签名失效 | 收盘事实不获得实时成交权限；不拿今日行情补过去的收盘，不在网页请求中重建全市场因子；价格-only 与缺失字段边界不变 |
 | 交易门禁 | `paper_trading_rules.py`, `paper_quote_policy.py`, `entry_timing.py` | 交易日、费用、证券权限、T+1、整手、涨跌停、行情新鲜度和入场时机 | 不负责持久化订单 |
 | 持仓运行时风险状态 | `backend/paper_position_risk_state.py` | `paper_position_risk_state` 的唯一 runtime 状态所有权：episode 初始化（verified BUY `0 -> >0`）、peak 只升不降吸收、take_stage 推进、full-exit 收尾、以及所有生产 SELL 路径共用的 `finalize_sell`（自行按 cycle 读权威 `paper_position_lots` 判定 episode 是否结束） | 不拥有 schema/DDL（归 `paper_schema_migrations`），不拥有事务（不 commit/rollback/BEGIN），不解析 active cycle（cycle_id 由调用方显式传入），不决定成交；不 import `paper_trading`，零项目级依赖 |
 | 卖出风险决策引擎 | `backend/paper_risk_decision.py` | 纯确定性卖出风险状态机：同日新仓识别与峰值口径、硬止损（首段减仓 vs 全清）、移动止损、最长持有、阶梯止盈，并由固定严重度序仲裁；`paper_trading._sell_plan` 仅保留薄 adapter | 不读数据库/网络/文件系统、不读机器时钟（`asof_day` 必须由调用方显式传入，缺失即 fail fast）、无全局缓存、不 import `paper_trading` / `strategy_policies` / `paper_account_specs`（policy 由调用方解析后注入）；不决定成交、不写账本 |
@@ -328,6 +332,13 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 
 ## 当前边界
 
+- 2026-10-13 审计问题修复：dashboard 使用只读账本连接及不补建周期的读取器，缺周期为 unavailable，账户指标显式禁止补取行情；schedule_status 同样只读。API 缓存等待者只等待一次 25 秒，超时保留原计算者并返回 503，不能递归重等或并发替换。run_slot 的展示快照刷新移到交易完成、租约释放之后；网页默认后台刷新，paper_runner 显式同步刷新，实际刷新返回后才退出。刷新失败独立于已完成交易并产生非零 runner 退出码；已完成交易的重试只刷新快照。行情质量、唯一成交权威与原事务顺序保持。这不新增跨进程快照任务台账；完整资金/决策/任务职责迁移仍待后续。
+
+- 2026-10-13 业务解耦续跑：`paper_order_execution_authority` 独占已存在订单的四态周期归属读取、只读成交周期授权及异常类型；只依赖 stdlib，既不创建周期，也不重绑账户。`paper_lot_ledger` 拥有买入 lot 创建、同周期 FIFO 已结算 lot 消耗、兼容持仓投影重建与旧参数形式的权威持仓读取适配；只依赖下层读取/风险状态/规则/仓储模块，不导入主编排、不拥有连接或事务。执行层直接绑定这些 owner 的实现，手动订单直接绑定周期授权与持仓读取，查询直接绑定持仓读取；`paper_trading` 仅保留旧入口适配，异常类型身份保持。新 lot owner 的无来源订单入口要求显式周期；兼容创建入口仍在调用方原事务解析周期，再传给 owner。租约、现金编排和策略决策仍是后续边界，不能宣称全部业务耦合已经消失。
+- 2026-10-13 整体优化：`execution_planner`、`manual_orders`、`dashboard_queries` 通过声明字段固定的依赖对象消费应用能力；`paper_trading` 在定义完成后绑定工厂，每次调用解析当前能力，不再由垂直模块反向导入主编排。`commit_fill` 与 `execution_context_from_facts` 可显式接收执行依赖，周期来源、租约、成交校验与原子写入顺序保持；兼容入口继续由主编排提供。该改动消除了字面导入闭环，部分能力实现仍位于主编排，不能把导入无环等同于运行时完全独立。
+- `paper_candidate_projection` 承载实时报价覆盖和候选通道排序；`paper_entry_decision` 承载追高门禁与切片数量准备。二者只消费显式输入，不导入项目模块、不取证、不写账本。`paper_risk_market_inputs` 承载按原顺序获取风控证据，通过五个具名能力取数；主编排仍负责数据库、事务和决策应用。
+- `adaptive_runtime_facts` 是 adaptive 运行事实的只读发布实现，保留类型、显式 `as_of`、终态可用性与分页校验；`adaptive_engine` 保留同名兼容导出和包装，仍独占运行状态写入。研究读取该下层模块，不为读事实加载训练引擎。`adaptive_configuration` 集中只读配置归一化，继续强制无人值守开关关闭和 `shadow_only`；`evolution_apply` 通过具名能力读取配置与账户标识，不反向导入训练引擎。
+- `api_adaptive` 与 `api_settings` 完整注册路由后按首次使用加载研究/学习实现。K 线清单使用实际读取后确认的文件签名跳过未变化 CSV；成功强制探活仅在一个 `run_slot` 调用范围内复用最多 30 秒，失败不进入窗口，调用结束清理。详细测量与限制见 `docs/SIMULATED_TRADING_ARCHITECTURE_REVIEW.md`。
 - `backend/main.py` 负责 FastAPI 组装、只读查询和生命周期。
 - `backend/api_paper.py`、`backend/api_adaptive.py` 负责 HTTP 契约；`confirmed=true` 是防误触确认，不是身份认证。
 - `backend/paper_trading.py` 仍是主要交易编排与账本实现，后续按小步拆出 Execution、Portfolio、Risk 和 Scheduler；dashboard 工作区只读投影已迁至 `backend/dashboard_queries.py`，手动下单垂直链已迁至 `backend/manual_orders.py`（两者在 `paper_trading` 内保留兼容 facade，公开导入路径不变）。
@@ -362,6 +373,14 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 - `backend/adaptive_shadow_risk.py` 承载 adaptive 组合影子风控的历史归一化、波动率、集中度和压力测试纯计算；不读账本、不联网、不提交订单。
 - `.github/workflows/ci.yml` 覆盖后端测试、编译/前端语法与镜像一致性，并新增独立 Docker 构建和健康端点冒烟检查。
 - 前端运行时的 canonical source 是 `frontend/src/`（入口 `src/app.js`：build id + `bridge.js` 全局兼容桥 + `boot.js` 顶层语句），样式是 `frontend/styles/`（`styles/index.css` 按原顺序 `@import`）；模块地图与依赖概览见 `frontend/src/README.md`。
+
+- `backend/paper_schedule_contract.py` 是调度契约的**单一事实来源**：slot 词表按入口方式分为 `RUN_SLOTS`（经 `run_slot`，由 `validate_slot` 接受）与 `RUNNER_ONLY_SLOTS`（只作为 `paper_runner` 分支，`fast-entry` 走 `monitor_fast_entries()` 因此**不得**被 `validate_slot` 接受）；`HOT_PATH_SLOTS` 决定租约 TTL 与锁重试；`SCHEDULE_TASKS` 是任务名/时刻/slot/重试的规范表。四类消费者全部从它派生，不得再各自维护字面清单：`paper_slot_service.SUPPORTED_SLOTS`、`paper_runner` 的 argparse `choices` 与热路径判定、`paper_trading.install_windows_schedule` 的 `definitions`、`schedule_status` 探测的任务名，以及 `deploy/astock-codex.cron` 的 cron 字段。模块零项目导入、零数据库、零子进程、零文件系统。
+- **cron 分钟字段逐字记录而非推导**：`INTRADAY_CRON_MINUTES` 直接保存 `deploy/astock-codex.cron` 的字段，因为 09:33 起点（把开盘首分钟让给共用 `paper-scan.lock` 的 `open` 任务）与 13:55 终点（避免 13:57 与 14:00 重复）没有能同时复现两者的单一规则。`INTRADAY_WINDOWS` 记录**意图**（且末值是 cron 实际触发的最后一分钟：11:24 / 14:57，不是散文里的 11:25 / 14:55），分钟字段记录**渲染**；`backend/test_paper_schedule_contract.py` 的 `IntradayIntentGuard` 断言二者一致——每个触发点落在声明窗口内、每小时步长正确、没有窗口内的小时漏扫。窗口声明与分钟字段脱钩时必须同步改，否则守卫报错而不是静默漂移。
+- **`risk` 与 `fast-entry` 无独立调度条目是记录在案的决定，不是遗漏**：`risk` 由同一分钟的日内监控统一执行（避免重复确认与重复卖出），`fast-entry` 是 runner 专有分支。契约用 `SCHEDULED_SLOTS` 显式表达这个缺席，并有守卫断言它保持缺席；此前这一约定只以 cron 文件里的一条注释存在。`weekly-review` 在 cron 中经 `docker exec` 直调 `paper_runner.py`（跑在 task worker 而非 paper worker），因此不走 `run_paper_slot.sh`——渲染比较显式排除它，并有单独测试守住这个差异不被抹平。
+- 依赖方向单向：`paper_trading` / `paper_slot_service` / `paper_runner` / `deploy/*` → `paper_schedule_contract` → stdlib，反向禁止。回归门禁见 `backend/test_paper_schedule_contract.py`（`SlotVocabularyGuard` / `CronRenderingFidelityGuard` / `IntradayIntentGuard`）。
+
+- 数值归一化的**严格契约**只有一份实现（`backend/paper_numeric.py`，stdlib-only）。`paper_trading._num` 是它的**直接引用**（`_num = PNum.num`），不是 `def` 包装——代码库约 860 个下划线调用点直接解析到同一份实现，不增加调用帧，也不留下第二处可 patch 的地方。`paper_position_read_model._num` 是**不同的契约**（接受 `"3.5"` 并放行 `NaN`），刻意不合并：lot 成本路径上不可读的价格必须变成安全默认值，而不是一个数字。"两个实现不同"证明不了被改的那一个仍保持严格，因此 `backend/test_paper_numeric_contract.py` 直接断言 `paper_numeric.num("3.5") == 0.0` 且 `paper_trading._num is paper_numeric.num`。
+- 已删除的孤儿 helper 有守卫：`rebalance_scanner._json` 与 `retention_maintenance._loads` 全仓库零引用（含跨模块 import），已删且禁止复活。注意 `adaptive_common._json` / `._loads` 本模块虽零引用，却被 9 个模块 import，是事实共享入口，**不是**孤儿——同名不同契约（`allow_nan=False`、无 `default=str`），保留原样。
 
 ## 不变量
 
@@ -409,7 +428,15 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
     - **生产行为边界**：R18 只保证"能触发当天卖出的候选属于当天"，**不保证**候选一定成交 —— 最终 replacement BUY 仍走唯一的 `_buy_order` gate（quote / gap / news / cash / sizing / market policy / execution verification），本层不复制、不削弱任何执行门禁。
     - 依赖方向单向：`paper_trading` → {`paper_replacement_decision`, `paper_replacement_evidence`} → stdlib，反向禁止。回归门禁见 `backend/test_paper_replacement_decision.py`（RD-1 ~ RD-15 + 阈值边界 + 纯模块硬边界）、`backend/test_replacement_asof_provenance.py`（RP2-01 ~ RP2-11 + RPL-P1 ~ RPL-P7 + RPL-P5e/P5f + RPL-P5g/P5h/P5i 驱动真实 `_buy_order`）、`backend/test_paper_trading_architecture_guard.py`（Guard 9a ~ Guard 9o）。
 
-20. Entry Capital Planning 必须是 **cycle / as-of 有界**的，且普通策略 BUY 只能有一个成交提交原语：
+22. 调度契约（slot 词表、热路径、任务表、cron 渲染）只有一份实现（`backend/paper_schedule_contract.py`）：零项目导入、零数据库、零子进程、零文件系统。slot 按入口方式分为 `RUN_SLOTS`（经 `run_slot`，由 `validate_slot` 接受）与 `RUNNER_ONLY_SLOTS`（只作为 `paper_runner` 分支；`fast-entry` 直接调 `monitor_fast_entries()`，因此**不得**被 `validate_slot` 接受——接受它就等于声称存在一条并不存在的分派路径）。四类消费者全部从契约派生，不得再各自维护字面清单：`paper_slot_service.SUPPORTED_SLOTS`、`paper_runner` 的 argparse `choices` 与热路径判定、`paper_trading.install_windows_schedule` 的 `definitions`、`schedule_status` 探测的任务名，以及 `deploy/astock-codex.cron` 的 cron 字段。
+
+23. cron 分钟字段**逐字记录而非推导**：`INTRADAY_CRON_MINUTES` 直接保存 `deploy/astock-codex.cron` 的字段，因为 09:33 起点（把开盘首分钟让给共用 `paper-scan.lock` 的 `open` 任务）与 13:55 终点（避免 13:57 与 14:00 重复）没有能同时复现两者的单一规则。`INTRADAY_WINDOWS` 记录**意图**（末值是 cron 实际触发的最后一分钟：11:24 / 14:57，不是散文里的 11:25 / 14:55），分钟字段记录**渲染**；`IntradayIntentGuard` 断言二者一致——每个触发点落在声明窗口内、每小时步长正确、没有窗口内的小时漏扫。窗口声明与分钟字段脱钩时必须同步改，否则守卫报错而不是静默漂移。
+
+24. `risk` 与 `fast-entry` 无独立调度条目是**记录在案的决定，不是遗漏**：`risk` 由同一分钟的日内监控统一执行（避免重复确认与重复卖出），`fast-entry` 是 runner 专有分支。契约用 `SCHEDULED_SLOTS` 显式表达这个缺席，并有守卫断言它保持缺席；此前这一约定只以 cron 文件里的一条注释存在。`weekly-review` 在 cron 中经 `docker exec` 直调 `paper_runner.py`（跑在 task worker 而非 paper worker），因此不走 `run_paper_slot.sh`——渲染比较显式排除它，并有单独测试守住这个差异不被抹平。
+
+25. 调度契约依赖方向单向：`paper_trading` / `paper_slot_service` / `paper_runner` / `deploy/*` → `paper_schedule_contract` → stdlib，反向禁止。回归门禁见 `backend/test_paper_schedule_contract.py`（`SlotVocabularyGuard` / `CronRenderingFidelityGuard` / `IntradayIntentGuard`）。
+
+26. Entry Capital Planning 必须是 **cycle / as-of 有界**的，且普通策略 BUY 只能有一个成交提交原语：
     - **两组概念不可混为一谈**：
       - **cycle/as-of bounded evidence**：participant ledgers（周期账本参与者）、adaptive risk overlay、adaptive allocation overlay、cluster 的 positions / signals / returns；
       - **global economic obligations**：当前仍为 `reserved` 的共享现金 —— 旧周期尚未释放的真实购买力占用仍属于**同一个**经济共享资金池。
@@ -431,7 +458,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
     - **无迁移**：现有 schema 已有 `reservation.cycle_id` / `order.cycle_id` / `created_at` / `status`，本层不新增 migration。
     - 依赖方向单向：`paper_trading` → {`manual_orders`, `execution_planner`, `paper_capital_reservations`, `strategy_risk_enforcement`} → stdlib，反向禁止。回归门禁见 `backend/test_entry_capital_asof.py`（EC-1 ~ EC-20c）、`backend/test_strategy_buy_commit_convergence.py`（SB-1 ~ SB-16 + EC-21）、`backend/test_paper_trading_architecture_guard.py`（Guard 10a ~ Guard 10v）、`backend/test_deferred_fill_cycle_binding.py`（预占归属冲突终态化 + 漂移释放失败浮现）、`work/r19_mutation_check.py`（M-ENT1 ~ M-ENT28）。
 
-21. SELL Fill Commit Convergence 必须把**决策路径**与**成交提交 authority**分开（R20）：
+27. SELL Fill Commit Convergence 必须把**决策路径**与**成交提交 authority**分开（R20）：
     - **成交提交只有一个原语**：`execution_planner.commit_fill` 是 order-backed fill commit authority；`_monitor_risk_impl` 与 `_intraday_sell` 只负责卖出决策、数量、价格、pending order 与失败/重试处理。R20 之前两条路径各自维护 `lot consumption → cash credit → order filled → paper_fills → execution stamp → episode finalize → risk/audit` 的第二套写路径；现在统一为 `decision → create pending order → EP.commit_fill`。
     - **SELL invariants**：`commit_fill` SELL 分支必须保持 `lease → order-cycle provenance → order identity → execution-cycle invariant → ledger mutation` 的顺序；lot 消耗必须显式绑定订单的 durable `cycle_id`，未知 / legacy NULL / 跨周期一律 fail closed。`PPRS.finalize_sell` 只由 `commit_fill` 调用，partial take-profit 通过显式 `sell_next_take_stage` 推进档位，full exit 由 finalizer 从权威 lots 判定。
     - **事务不变量**：一次成交只能是“全部提交成功”或“全部没有发生”；应用层必须在 SAVEPOINT 内创建 pending order 并调用 `commit_fill`，失败时 `ROLLBACK TO` + `RELEASE`，不得留下 lot/cash/fill/order/verification/episode 的部分状态。
@@ -4058,3 +4085,152 @@ PIT validator。**队列 job completed 绝不等于 passed / good / promotable**
 canonical R30 report 已存在。R36-C / R36-D / R37 尚未开始。
 
 阶段状态：R36-B2 **IN REVIEW**；R36-C/R36-D/R37 **NOT STARTED**。
+
+
+## R36-C Candidate Selection & Iteration Policy
+
+R36-B1/B2 让候选拥有 canonical 的 R29 PIT 与 R30 robustness 证据，但**证据不是选择**。
+R36-C 是第一个允许把 exact R29/R30 证据转成**搜索局部**选择决策的阶段。链路：
+
+```text
+exact candidate set + exact R29 evidence + exact R30 evidence
++ selection policy（在观察实验结果之前 pin 定）
+    ↓ eligibility gates
+deterministic Pareto fronts
+    ↓
+eliminate / retain / advance
+```
+
+八句边界：
+
+```text
+Selection consumes canonical evidence; it does not manufacture
+or reinterpret R29/R30 facts.
+
+Operational failure or missing execution evidence is not candidate
+underperformance and must not become elimination.
+
+Selection policy is pinned in the search request before experiment
+results are observed.
+
+Selection policy is not part of experiment identity; changing a
+selection policy must not change the R29/R30 experiment fingerprints.
+
+Pareto front membership is a search-local selection fact, not
+promotion, lifecycle state, or a global strategy ranking.
+
+Candidate-id ordering is serialization order only and has no
+selection meaning.
+
+An "advance" disposition means only that R36-D may consume the
+candidate as a next-generation parent input.
+
+Only R31 owns strategy promotion.
+```
+
+**三个新生产模块，各是一个真实 authority：**
+
+- `backend/candidate_selection.py`：纯领域。`CandidateSelectionPolicy`、
+  `CandidateSelectionEvidence`、`CandidateSelectionReport`、`evaluate_selection(...)`。
+  **无** DB、无网络、无文件系统、无 `datetime.now()`、无策略注册表、无 current/latest
+  查找、无 lifecycle/promotion/AI。
+- `backend/candidate_selection_repository.py`：append-only canonical selection-report
+  持久化，唯一新表 `experiment_search_selection_reports`。
+- `backend/candidate_selection_service.py`：exact R29/R30 证据闭包与编排，
+  `select_search_candidates(...)`。
+
+**选择策略 pin 在 search request 身份里，不在 experiment plan 里。**
+`candidate-experiment-plan-v2` 逐字节不变；新 `experiment-search-contract-v3` = v2 +
+`selection_policy` + `selection_policy_fingerprint`。v1/v2 的 projection/fingerprint 冻结。
+v2 search 仍 PIT/R30 可执行，但 selection 不可用，稳定 reason 为
+`search_run_selection_policy_unavailable`。只改 selection policy **必须**改变
+`search_input_fingerprint`，但**必须不**改变 `CandidateExperimentSpec` fingerprint、R29
+experiment fingerprint 与 R30 `RobustnessPlan` fingerprint。
+
+**策略字段**：`policy_version`；`objectives`（闭集 allowlist、canonical 排序、拒绝重复、
+至少一个）；`min_baseline_return`；`max_baseline_drawdown_abs`；`min_trade_count`；
+`min_data_coverage`；`require_no_robustness_unavailable`；
+`require_no_robustness_failed`；`require_no_threshold_breaches`；
+`max_observed_fragilities`；`advance_through_front`；`retain_through_front`。业务字段全部
+显式（service 里**没有**隐藏默认），`None` 表示"该 gate 被显式关闭"。目标词汇闭集且
+**方向固定**（调用方不能声明方向）：`baseline_return` MAXIMIZE；`baseline_drawdown_abs`
+MINIMIZE；`baseline_turnover` MINIMIZE；`robustness_worst_return` MAXIMIZE；
+`robustness_worst_drawdown_abs` MINIMIZE；`robustness_max_return_degradation` MINIMIZE；
+`robustness_fragility_count` MINIMIZE。**没有** weighted score / composite score /
+utility function / AI ranking / epsilon dominance。
+
+**固定 robustness 聚合**（只有 completed case 参与）：
+`robustness_worst_return = MIN(case.metrics.return)`；
+`robustness_worst_drawdown_abs = MAX(abs(case.metrics.drawdown))`；
+`robustness_max_return_degradation = MAX(max(0, -case.baseline_delta.return))`。
+unavailable/failed case 计入 gate，但**绝不**进入 worst metrics，**绝不**用 0 或 baseline
+填充。缺 metric → `selection_metric_unavailable` / `selection_objective_unavailable`，
+**绝不**当 0。
+
+**证据闭包（whole-search gate）**：candidate pool 只来自 exact
+`search_spec.candidate_ids`，每个候选再经 `strategy_candidate_repository.get_candidate`
+自证。每个候选需要 exact `pit_validation` job（canonical `get_search_job`）；PIT job
+failed/queued/claimed/cancelled → **整次选择拒绝**，reason
+`selection_operational_evidence_incomplete`（运营失败绝不等于淘汰；cancelled 也
+fail-closed，避免运营性审查）。completed PIT job 且 `evidence_owner=experiment_validation_run`、
+`evidence_id=exact run_key` 时经 `ExperimentValidationRepository.get_run(run_key=...)`
+重读；canonical R29 blocked / `result != completed` 是**真实证据** → 候选可
+`eligible=false`、`disposition=eliminate`，reasons `pit_validation_not_ready` /
+`pit_result_not_completed`，**不**需要 R30。READY R29 候选
+（`validation_status=ready` AND `result.status=completed`）**必须**有 exact robustness job，
+缺失 → 整次选择拒绝 `selection_robustness_stage_incomplete`；其 robustness job
+queued/claimed/failed/cancelled → 同样整次拒绝（缺执行事实，不是候选表现）。completed
+robustness job 必须携带 `evidence_owner=robustness_report`、`evidence_id=exact report_key`，
+经 `RobustnessRepository.get_report_by_key` 重读。选择还重新核验 R29↔R30 绑定：candidate_id
+精确；R30 `baseline_run_key == R29 run_key`；R30
+`baseline_experiment_fingerprint == R29 experiment_fingerprint`；R30
+`baseline_result_fingerprint == R29 result.result_fingerprint`；R30 内嵌
+`experiment_subject == R29 subject`；R30 plan fingerprint == 该 exact baseline 的
+search-pinned robustness plan。复用既有 canonical helper，不复制 B2 逻辑。**任何地方都没有**
+recent_runs / recent_reports / `ORDER BY DESC LIMIT 1` / `MAX(created_at)` / latest /
+current 结果查找。
+
+**Disposition 语义**：`eligible=false` → eliminate。`eligible=true` 且
+`pareto_front <= advance_through_front` → advance。`eligible=true` 且
+`advance_through_front < pareto_front <= retain_through_front` → retain。`eligible=true` 且
+`pareto_front > retain_through_front` → eliminate。`next_generation_eligible =
+(disposition == advance)`。`advance_through_front >= 1` 且
+`retain_through_front >= advance_through_front`。ineligible 候选 `pareto_front = null`、
+`next_generation_eligible = false`。
+
+**Report** 含：`report_version`；`search_run_id`；`search_input_fingerprint`；
+`selection_policy`；`selection_policy_fingerprint`；`evidence_set_fingerprint`；
+`candidate_count`；`eligible_count`；`advance_count`；`retain_count`；`eliminate_count`；
+`candidates[]`（`candidate_id`、`pit_run_key`、`pit_result_fingerprint`、
+`robustness_report_key`、`robustness_report_fingerprint`、`eligibility`、
+`blocking_reasons`、`selection_features`、`pareto_front`、`disposition`、
+`next_generation_eligible`）。`selection_report_key = sha256({report_version,
+search_run_id, search_input_fingerprint, selection_policy_fingerprint,
+evidence_set_fingerprint})`；`created_at` 在身份之外。全员 blocked 是合法 report
+（`eligible_count=0`、`eliminate_count=N`）；但 operational evidence incomplete **不得**产生
+report。Pareto 非支配排序只用 strict deterministic comparison；`candidate_id ASC` 只是
+序列化顺序，**不是** ranking；同一 front 同一 disposition（front 是原子选择单位，**没有**
+top-N hash 截断）。
+
+**持久化**：一张新永久表 `experiment_search_selection_reports`（`report_key` PRIMARY KEY、
+`search_run_id` UNIQUE、`search_input_fingerprint`、`selection_policy_fingerprint`、
+`evidence_set_fingerprint`、`report_version`、`candidate_count`、`eligible_count`、
+`advance_count`、`retain_count`、`eliminate_count`、`report_json`、`created_at`、
+`payload_fingerprint`；FK `search_run_id → experiment_search_runs`）。**没有** scalar
+score / weighted_score / utility / winner / best_candidate / promotion / promotable 列。
+append-only（**无** UPDATE、**无** DELETE trigger）。每次 search 恰好一份 canonical
+report；相同 retry 幂等；同 search 不同 report → `selection_report_conflict`；并发相同写入
+幂等（INSERT、catch unique conflict、重读 winner、比较 exact payload）。selection-report DB
+写入权威 = `candidate_selection_repository`，写入点 = 1。migration 为 **v36**（#233 合并后
+max 为 v35），**绝不**回填历史 selection 行（0 行才是正确历史）；正常 `init_db()` /
+fresh bootstrap 也创建该表。
+
+边界：本阶段**没有**前端、**没有**新 HTTP API、**没有** weighted score、**没有** winner、
+**没有** top-N 截断、**没有** candidate/lifecycle/promotion/AI 写入。R36-C **不** import
+`strategy_promotion` / `promotion_science` / `strategy_lifecycle`，也**不** import
+`adaptive_selection` / `adaptive_selection_compat` / `selection_runner` / `paper_selection` /
+`strategy_selection_resolver` / `strategy_selection_provenance` / `selection_tracking` /
+`learning_evaluation`（那些是其它权威：runtime 选股、paper account 选择、runtime 策略
+provenance、legacy/adaptive 参数选择、shadow learning evaluation）。
+
+阶段状态：R36-C **IN REVIEW**；R36-D/R37 **NOT STARTED**。

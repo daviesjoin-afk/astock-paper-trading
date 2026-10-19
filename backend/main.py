@@ -26,6 +26,7 @@ import optimizer as O
 import decision_engine as DE
 import linkage as L
 import paper_trading as P
+import selection_factor_store as SFS
 import selection_tracking as ST
 import metrics as MET
 import operator_auth
@@ -48,9 +49,11 @@ _SELECT_RESULT_CACHE = {}
 _SELECT_RESULT_LOCK = threading.RLock()
 _SELECT_RESULT_TTL_SECONDS = 60
 _SUPER_FLOW_PATH = os.path.join(dfc.CACHE_DIR, "super_flow_cache.json")
-_SUPER_FLOW_CACHE = {"data": None, "ts": 0.0, "refreshing": False}
+_SUPER_FLOW_CACHE = {"data": None, "ts": 0.0, "refreshing": False, "retry_at": 0.0,
+                     "file_signature": None}
 _SUPER_FLOW_LOCK = threading.Lock()
 _SUPER_FLOW_TTL_SECONDS = 300
+_SUPER_FLOW_RETRY_SECONDS = 30
 _SUPER_FLOW_FILE_LOCK_PATH = _SUPER_FLOW_PATH + ".lock"
 _DATA_UPDATE_LOCK = threading.RLock()
 _DATA_UPDATE_STATE = {
@@ -71,6 +74,7 @@ _SELECTION_CACHE = {
     "signature": None,
     "price_factors": None,
     "first_board_codes": None,
+    "status": None,
 }
 _SELECTION_REQUIRED_COLUMNS = {
     "three_up",
@@ -95,6 +99,15 @@ _LIVE_CACHE = {
     "news_hits": [],
     "indices": [],
 }
+_SELECTION_CONTEXT_LOCK = threading.Lock()
+_SELECTION_CONTEXT_STATE = {
+    key: {"refreshing": False, "retry_at": 0.0}
+    for key in ("finance", "sentiment")
+}
+_SELECTION_CONTEXT_VERSION = 0
+_SELECTION_CONTEXT_RETRY_SECONDS = 30
+_SELECTION_CONTEXT_TTL = {"finance": 6 * 3600, "sentiment": 300}
+_SELECTION_CONTEXT_PROVIDER_KEY = {"finance": "finance", "sentiment": "hot_100"}
 
 
 def _health_file_signature(path):
@@ -142,14 +155,13 @@ def _store_health_response(payload):
 
 
 def _selection_signature():
-    try:
-        return (
-            os.path.getmtime(dfc.KLINE_MANIFEST_PATH),
-            os.path.getsize(dfc.KLINE_MANIFEST_PATH),
-            dfc.SHARED_KLINE_SOURCE_VERSION,
-        )
-    except OSError:
-        return (0, 0)
+    return (
+        _health_file_signature(dfc.KLINE_MANIFEST_PATH),
+        _health_file_signature(U.UNIVERSE_PATH),
+        dfc.SHARED_KLINE_SOURCE_VERSION,
+        _health_file_signature(_SELECTION_FACTORS_PATH),
+        _health_file_signature(_SELECTION_META_PATH),
+    )
 
 
 def _selection_result_path(strategy: str, topn: int) -> str:
@@ -160,7 +172,8 @@ def _selection_result_path(strategy: str, topn: int) -> str:
 
 def _save_selection_result(strategy: str, topn: int, result: dict) -> None:
     """Persist only completed selection results; failed/partial runs are never shown as latest."""
-    if not isinstance(result, dict) or result.get("need_init") or result.get("error"):
+    if (not isinstance(result, dict) or result.get("need_init") or result.get("error")
+            or result.get("context_pending")):
         return
     try:
         os.makedirs(_SELECTION_RESULT_DIR, exist_ok=True)
@@ -234,7 +247,7 @@ def _complete_daily_cutoff():
 def _refresh_super_flow(topn):
     try:
         rows = dfc.fetch_fund_flow_rank(topn=topn)
-        if not rows:
+        if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
             return
         payload = {"updated_at": time.time(), "data": rows}
         with _super_flow_file_lock():
@@ -242,13 +255,19 @@ def _refresh_super_flow(topn):
             with open(tmp_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False)
             os.replace(tmp_path, _SUPER_FLOW_PATH)
-        with _SUPER_FLOW_LOCK:
-            _SUPER_FLOW_CACHE.update(data=rows, ts=payload["updated_at"])
+            signature = _health_file_signature(_SUPER_FLOW_PATH)
+            with _SUPER_FLOW_LOCK:
+                _SUPER_FLOW_CACHE.update(data=rows, ts=payload["updated_at"], file_signature=signature)
         with _SELECT_RESULT_LOCK:
             _SELECT_RESULT_CACHE.clear()
+    except Exception:
+        # A failed background attempt must retain the last known facts/time.
+        # The loader's retry deadline limits failures without blocking callers.
+        return
     finally:
         with _SUPER_FLOW_LOCK:
-            _SUPER_FLOW_CACHE["refreshing"] = False
+            _SUPER_FLOW_CACHE.update(refreshing=False,
+                                     retry_at=time.monotonic() + _SUPER_FLOW_RETRY_SECONDS)
 
 
 @contextmanager
@@ -270,191 +289,173 @@ def _super_flow_file_lock():
             handle.close()
 
 
-def _load_super_flow(topn):
-    """Return cached fund flow and refresh stale data without blocking requests."""
-    should_block = False
-    should_refresh = False
+def _schedule_super_flow_refresh(topn):
+    """Coalesce refresh attempts in this process, including cold-cache failures."""
+    now = time.monotonic()
     with _SUPER_FLOW_LOCK:
-        if _SUPER_FLOW_CACHE["data"] is None:
+        if _SUPER_FLOW_CACHE["refreshing"] or now < _SUPER_FLOW_CACHE.get("retry_at", 0.0):
+            return
+        _SUPER_FLOW_CACHE.update(refreshing=True, retry_at=now + _SUPER_FLOW_RETRY_SECONDS)
+    try:
+        threading.Thread(
+            target=_refresh_super_flow, args=(topn,),
+            name="super-flow-refresh", daemon=True,
+        ).start()
+    except RuntimeError:
+        with _SUPER_FLOW_LOCK:
+            _SUPER_FLOW_CACHE["refreshing"] = False
+
+
+def _load_super_flow(topn):
+    """Read known facts immediately; a cache miss also refreshes in the background."""
+    signature = _health_file_signature(_SUPER_FLOW_PATH)
+    with _SUPER_FLOW_LOCK:
+        if (_SUPER_FLOW_CACHE["data"] is None
+                or _SUPER_FLOW_CACHE.get("file_signature") != signature):
+            _SUPER_FLOW_CACHE["file_signature"] = signature
             try:
                 with open(_SUPER_FLOW_PATH, "r", encoding="utf-8") as handle:
                     payload = json.load(handle)
+                if (not isinstance(payload, dict) or not isinstance(payload.get("data"), list)
+                        or any(not isinstance(row, dict) for row in payload["data"])):
+                    raise ValueError("invalid fund flow cache")
                 _SUPER_FLOW_CACHE.update(
                     data=payload.get("data") or [],
                     ts=float(payload.get("updated_at") or 0),
                 )
             except (OSError, ValueError, TypeError):
-                pass
+                if _SUPER_FLOW_CACHE["data"] is None:
+                    _SUPER_FLOW_CACHE["data"] = []
         age = time.time() - _SUPER_FLOW_CACHE["ts"]
-        if not _SUPER_FLOW_CACHE["refreshing"]:
-            if _SUPER_FLOW_CACHE["data"] is None:
-                _SUPER_FLOW_CACHE["refreshing"] = True
-                should_block = True
-            elif age >= _SUPER_FLOW_TTL_SECONDS:
-                _SUPER_FLOW_CACHE["refreshing"] = True
-                should_refresh = True
         cached = _SUPER_FLOW_CACHE["data"]
-    if should_block:
-        _refresh_super_flow(topn)
-        with _SUPER_FLOW_LOCK:
-            return _SUPER_FLOW_CACHE["data"] or []
-    if should_refresh:
-        threading.Thread(
-            target=_refresh_super_flow,
-            args=(topn,),
-            name="super-flow-refresh",
-            daemon=True,
-        ).start()
+    if not cached or age >= _SUPER_FLOW_TTL_SECONDS:
+        _schedule_super_flow_refresh(topn)
     return cached or []
 
 
-def _selection_signature_matches(cached_signature, current_signature) -> bool:
-    """缓存 manifest 的 signature 是否与当前签名语义一致。
-
-    历史缓存里 ``signature`` 可能是**旧 list 格式**（``[..., size, version, ...]``），
-    也可能是**新 dict 格式**（``{"size": ..., "version": ...}``）。只按 tuple 比较会让
-    旧格式缓存永远不命中，于是每个周期都重算一遍选股因子（而且每次写回时把格式来回
-    翻转）。这里两种格式都接受，判据是 size 与 version 一致。
-    """
-    if isinstance(cached_signature, (list, tuple)):
-        if len(cached_signature) < 3:
-            return False
-        return (
-            cached_signature[1] == current_signature[1]
-            and str(cached_signature[2]) == str(current_signature[2])
-        )
-    if isinstance(cached_signature, dict):
-        return (
-            cached_signature.get("size") == current_signature[1]
-            and str(cached_signature.get("version")) == str(current_signature[2])
-        )
-    return False
-
-
-def _load_selection_base():
-    """Load compact persisted factors; rebuild only after the K-line manifest changes."""
-    signature = _selection_signature()
-    if (
-        _SELECTION_CACHE["price_factors"] is not None
-        and _SELECTION_CACHE["signature"] == signature
-    ):
-        return (
-            _SELECTION_CACHE["price_factors"],
-            _SELECTION_CACHE["first_board_codes"],
-        )
+def _load_selection_base(*, with_status=False):
+    """Read one validated factor snapshot, retaining its readiness diagnosis."""
+    signature = (_selection_signature(), _complete_daily_cutoff(),
+                 int(time.monotonic() // 60))
     with _SELECTION_LOCK:
-        if (
-            _SELECTION_CACHE["price_factors"] is not None
-            and _SELECTION_CACHE["signature"] == signature
-        ):
-            return (
-                _SELECTION_CACHE["price_factors"],
-                _SELECTION_CACHE["first_board_codes"],
-            )
+        if (_SELECTION_CACHE["price_factors"] is not None
+                and _SELECTION_CACHE["signature"] == signature):
+            result = (_SELECTION_CACHE["price_factors"], _SELECTION_CACHE["first_board_codes"])
+            return (*result, dict(_SELECTION_CACHE.get("status") or {})) if with_status else result
+        status = {"stage": "factors", "state": "blocked", "target_date": str(signature[1])}
+        price_factors, first_board_codes = pd.DataFrame(), set()
         try:
-            with open(_SELECTION_META_PATH, "r", encoding="utf-8") as handle:
-                meta = json.load(handle)
-            if str(meta.get("factor_date") or "")[:10] != _complete_daily_cutoff().isoformat():
-                raise ValueError("选股因子缓存不是最近完整交易日")
-            if float(meta.get("eligible_factor_coverage_pct") or 0.0) < 90.0:
-                raise ValueError("选股因子缓存覆盖率不足90%")
-            if (
-                _selection_signature_matches(meta.get("signature"), signature)
-                and os.path.exists(_SELECTION_FACTORS_PATH)
-            ):
-                price_factors = pd.read_csv(
-                    _SELECTION_FACTORS_PATH,
-                    dtype={"code": str},
-                    index_col="code",
-                )
-                if not _SELECTION_REQUIRED_COLUMNS.issubset(price_factors.columns):
-                    raise ValueError("选股因子缓存版本过旧")
-                first_board_codes = set(meta.get("first_board_codes", []))
-                _SELECTION_CACHE.update(
-                    {
-                        "signature": signature,
-                        "price_factors": price_factors,
-                        "first_board_codes": first_board_codes,
-                    }
-                )
-                return price_factors, first_board_codes
-        except (OSError, ValueError, TypeError):
-            pass
+            candidate, meta = SFS.read(_SELECTION_FACTORS_PATH, _SELECTION_META_PATH)
+            if not _SELECTION_REQUIRED_COLUMNS.issubset(candidate.columns):
+                status.update(reason="选股因子缓存版本过旧，等待后台重建", reason_code="factor_schema_outdated")
+            else:
+                freshness = P._selection_factor_freshness(
+                    candidate, U.load_universe(), datetime.date.today(), meta=meta)
+                status.update(freshness)
+                if freshness["passed"]:
+                    price_factors = candidate
+                    first_board_codes = set(meta.get("first_board_codes", []))
+                    status.update(state="ready", reason_code=None)
+                else:
+                    status["reason_code"] = "factor_snapshot_not_ready"
+        except FileNotFoundError:
+            status.update(reason="共享选股因子尚未生成，等待后台更新", reason_code="factor_cache_missing")
+        except (OSError, ValueError, TypeError, KeyError):
+            status.update(reason="共享选股因子缓存不可用，等待后台重建", reason_code="factor_cache_invalid")
+        # Cache negative readiness too; new manifest/universe/factor files
+        # invalidate the signature immediately. Requests never rebuild history.
+        _SELECTION_CACHE.update(signature=signature, price_factors=price_factors,
+                                first_board_codes=first_board_codes, status=status)
+        result = (price_factors, first_board_codes)
+        return (*result, dict(status)) if with_status else result
 
-        universe = U.load_universe()
-        cutoff = _complete_daily_cutoff()
-        klines = {}
-        for row in universe:
-            frame = dfc.load_shared_kline(row["code"])
-            if frame is not None:
-                frame = frame.loc[frame.index.date <= cutoff]
-            if frame is not None and len(frame) > 65:
-                klines[row["code"]] = frame
-        price_factors = F.compute_price_factors(klines)
-        # Never persist a mixed-date/partial factor cache.  A failed rebuild
-        # remains an explicit blocked state; it cannot replace the last
-        # validated snapshot with a few hundred rows.
-        if "last_date" in price_factors:
-            price_factors = price_factors.loc[
-                price_factors["last_date"].astype(str).str[:10].eq(cutoff.isoformat())
-            ].copy()
-        eligible_codes = {
-            str(row.get("code") or "")
-            for row in universe
-            if row.get("code") and _buy_scope(
-                row.get("code"), row.get("name"), row.get("risk_flag"),
-                row.get("instrument_type") or row.get("security_type"),
-            )["allowed"]
-        }
-        eligible_factor_rows = len(set(price_factors.index.astype(str)) & eligible_codes)
-        required_factor_rows = max(4000, int(len(eligible_codes) * 0.90 + 0.9999))
-        if eligible_factor_rows < required_factor_rows:
-            _SELECTION_CACHE.update({"signature": signature, "price_factors": price_factors,
-                                     "first_board_codes": set()})
-            return price_factors, set()
-        first_board_codes = set(F.find_first_board_candidates(klines))
-        factors_tmp = _SELECTION_FACTORS_PATH + ".tmp"
-        price_factors.to_csv(factors_tmp, encoding="utf-8")
-        os.replace(factors_tmp, _SELECTION_FACTORS_PATH)
-        meta_tmp = _SELECTION_META_PATH + ".tmp"
-        # 统一写成 paper_trading 认可的权威格式，避免新旧格式反复翻转。
+
+def _context_has_data(key, value):
+    rows = value.get("data") if key == "finance" and isinstance(value, dict) else value
+    return isinstance(rows, dict) and bool(rows) and all(isinstance(row, dict) for row in rows.values())
+
+
+def _selection_context_fresh(key, now):
+    state = _SELECTION_CONTEXT_STATE[key]
+    return (state.get("value_id") == id(_LIVE_CACHE[key])
+            and state.get("day") == datetime.date.today().isoformat()
+            and now < state.get("expires_at", 0.0))
+
+
+def _selection_context_signature():
+    with _SELECTION_CONTEXT_LOCK:
+        now = time.monotonic()
+        return (datetime.date.today().isoformat(),
+                *(_selection_context_fresh(key, now) for key in _SELECTION_CONTEXT_TTL))
+
+
+def _publish_selection_context(key, value, *, started_at=None):
+    global _SELECTION_CONTEXT_VERSION
+    now = time.monotonic()
+    provider_age = dfc.cached_age_seconds(_SELECTION_CONTEXT_PROVIDER_KEY[key])
+    age = provider_age if provider_age is not None else now - (started_at if started_at is not None else now)
+    with _SELECTION_CONTEXT_LOCK:
+        _LIVE_CACHE[key] = value
+        _SELECTION_CONTEXT_STATE[key].update(
+            expires_at=now + max(0.0, _SELECTION_CONTEXT_TTL[key] - age),
+            day=datetime.date.today().isoformat(), value_id=id(value))
+        _SELECTION_CONTEXT_VERSION += 1
+    # The generation also protects a result still being computed while
+    # this worker is waiting for the result lock.
+    with _SELECT_RESULT_LOCK:
+        _SELECT_RESULT_CACHE.clear()
+
+
+def _refresh_selection_context(key, loader):
+    started_at = time.monotonic()
+    try:
+        value = loader()
+        if not _context_has_data(key, value):
+            return
+        _publish_selection_context(key, value, started_at=started_at)
+    except Exception:
+        return
+    finally:
+        with _SELECTION_CONTEXT_LOCK:
+            _SELECTION_CONTEXT_STATE[key].update(
+                refreshing=False, retry_at=time.monotonic() + _SELECTION_CONTEXT_RETRY_SECONDS)
+
+
+def _load_selection_context(key, loader, *, background=True):
+    """Only HTTP cold reads skip waiting; short-lived jobs retain sync reads."""
+    should_refresh = False
+    with _SELECTION_CONTEXT_LOCK:
+        value = _LIVE_CACHE[key]
+        state = _SELECTION_CONTEXT_STATE[key]
+        now = time.monotonic()
+        if _selection_context_fresh(key, now):
+            return value
+        if background and not state["refreshing"] and now >= state["retry_at"]:
+            state.update(refreshing=True, retry_at=now + _SELECTION_CONTEXT_RETRY_SECONDS)
+            should_refresh = True
+    if not background:
+        started_at = time.monotonic()
         try:
-            import paper_trading as PT
-
-            canonical_signature = PT._selection_factor_manifest_signature()
+            value = loader()
+            if _context_has_data(key, value):
+                _publish_selection_context(key, value, started_at=started_at)
+                with _SELECTION_CONTEXT_LOCK:
+                    if _selection_context_fresh(key, time.monotonic()):
+                        return value
         except Exception:
-            canonical_signature = None
-        with open(meta_tmp, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "signature": canonical_signature or list(signature),
-                    "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "factor_rows": len(price_factors),
-                    "eligible_universe_rows": len(eligible_codes),
-                    "eligible_factor_rows": eligible_factor_rows,
-                    "eligible_factor_coverage_pct": round(eligible_factor_rows / max(len(eligible_codes), 1) * 100, 2),
-                    "factor_date": cutoff.isoformat(),
-                    "first_board_codes": sorted(first_board_codes),
-                },
-                handle,
-                ensure_ascii=False,
-            )
-        os.replace(meta_tmp, _SELECTION_META_PATH)
-        _SELECTION_CACHE.update(
-            {
-                "signature": signature,
-                "price_factors": price_factors,
-                "first_board_codes": first_board_codes,
-            }
-        )
-        return price_factors, first_board_codes
+            pass
+    if should_refresh:
+        try:
+            threading.Thread(target=_refresh_selection_context, args=(key, loader),
+                             name=f"selection-{key}-refresh", daemon=True).start()
+        except RuntimeError:
+            with _SELECTION_CONTEXT_LOCK:
+                _SELECTION_CONTEXT_STATE[key]["refreshing"] = False
+    return {"data": {}, "report_dates": []} if key == "finance" else {}
 
 
 def _warm_finance():
-    try:
-        _LIVE_CACHE["finance"] = dfc.fetch_finance_latest()
-    except Exception:
-        pass
+    _load_selection_context("finance", dfc.fetch_finance_latest)
 
 
 def _update_live(key, fn):
@@ -468,8 +469,8 @@ def _warm_market_context():
     universe = U.load_universe()
     codes = {row["code"] for row in universe}
     names = {row["code"]: row["name"] for row in universe}
+    _load_selection_context("sentiment", lambda: F.compute_sentiment_factors(codes))
     jobs = [
-        ("sentiment", lambda: F.compute_sentiment_factors(codes)),
         ("gate", F.overseas_risk_gate),
         ("sector_flow", lambda: dfc.fetch_sector_flow("industry")),
         ("news_hits", lambda: F.news_keyword_scan(names)),
@@ -1299,6 +1300,7 @@ def init_data(
 def _select_uncached(
     strategy: str = "three_day",
     topn: int = Query(10, ge=1, le=100),
+    *, background_context: bool = False,
 ):
     # 「策略选股」页复用本流水线跑模拟盘模型族（paper_selection.STRATEGY_MODEL
     # → strategies.PAPER_WEIGHTS），run_strategy 会把这些 id 分派给
@@ -1319,9 +1321,13 @@ def _select_uncached(
             "coverage": coverage,
         }
     uni = U.load_universe() or U.build_universe()
-    price_f, first_board_codes = _load_selection_base()
+    price_f, first_board_codes, factor_status = _load_selection_base(with_status=True)
     if price_f.empty:
-        return {"need_init": True, "message": "历史K线尚未就绪，请稍候"}
+        message = factor_status.get("reason") or "共享选股因子未就绪，等待后台更新"
+        cached_day, target_day = factor_status.get("factor_date"), factor_status.get("target_date")
+        if cached_day and target_day and cached_day != target_day:
+            message = f"选股因子仍为 {cached_day}，目标 {target_day}；等待后台重建"
+        return {"need_init": True, "message": message, "data_status": factor_status}
     reference_date = str(coverage["expected_reference_date"])
     complete_cutoff = U.latest_complete_trade_date(datetime.date.today()).isoformat()
     factor_dates = price_f["last_date"].astype(str).str[:10]
@@ -1384,8 +1390,9 @@ def _select_uncached(
     # 必须来自盘中实时快照，不能把初始化时写入 universe.json 的旧值标为“今日”。
     # 保留基础库的风险/板块字段，再由实时字段覆盖可变行情字段。
     today = datetime.date.today()
-    now_clock = datetime.datetime.now().time()
-    is_open_session = datetime.time(9, 15) <= now_clock <= datetime.time(15, 10)
+    quote_now = datetime.datetime.now().astimezone()
+    now_clock = quote_now.time()
+    is_open_session = U.is_trade_day(today) and datetime.time(9, 15) <= now_clock < datetime.time(15)
     if U.is_trade_day(today) and now_clock >= datetime.time(9, 15):
         expected_live_date = today.isoformat()
     else:
@@ -1429,7 +1436,18 @@ def _select_uncached(
         R24：selection 是决策路径（显式允许联网），取数与 freshness 都归
         Market Data Authority；它已经把 provider 异常收敛成"返回空"。
         """
-        return MDSvc.refresh_rows(force=force)
+        if is_open_session:
+            return MDSvc.refresh_rows(force=force)
+        # Off-session selection consumes a dated closing fact. A historical
+        # closing request must never refresh today's prices into that date.
+        reading = MDSvc.read_snapshot(
+            MDC.CLOSE_SNAPSHOT_POLICY, now=quote_now, asof_day=expected_live_date)
+        if reading.available and reading.freshness == MDC.FRESHNESS_FRESH and not force:
+            return [dict(row) for row in MDC.close_snapshot_rows(reading.rows(), quote_now, expected_live_date)]
+        if expected_live_date != today.isoformat():
+            return []
+        return MDSvc.refresh_rows(force=force, now=quote_now,
+                                 policy=MDC.CLOSE_SNAPSHOT_POLICY, asof_day=expected_live_date)
 
     live_rows = _safe_live_snapshot()
     # A disk fallback can be complete in row count but several days old.  Do
@@ -1466,7 +1484,7 @@ def _select_uncached(
         }
     snap_f = [
         {**row, **live_map[row["code"]]}
-        for row in uni
+        for row in universe_by_code.values()
         if row["code"] in covered_codes and row["code"] in live_map
     ]
     if len(snap_f) < required_live:
@@ -1474,13 +1492,8 @@ def _select_uncached(
             "need_init": True,
             "message": f"实时行情覆盖不足 {len(snap_f)}/{required_live}，已停止使用旧快照进行今日选股",
         }
-    finance = _LIVE_CACHE["finance"]
-    if not finance.get("data"):
-        try:
-            finance = dfc.fetch_finance_latest()
-        except Exception:
-            finance = {"data": {}, "report_dates": []}
-        _LIVE_CACHE["finance"] = finance
+    finance = _load_selection_context("finance", dfc.fetch_finance_latest,
+                                      background=background_context)
     # 两套 cutoff 必须分开：``complete_cutoff`` 是"最近完整交易日"（盘中即昨天），
     # 只用于已收盘日线与财务披露；当日实时截面（PE/PB/换手/资金/行业）的决策时点
     # 是**现在**。混用会把盘中每一行都判成 future 并清空这些列。
@@ -1494,21 +1507,19 @@ def _select_uncached(
         "turnover": "turnover", "main_pct": "main_pct",
         "super_net_raw": "super_net", "main_net": "main_net",
     }
-    for code, row in live_map.items():
-        if code not in price_f.index:
-            continue
-        for target, source in live_field_map.items():
-            value = row.get(source)
-            if value is not None and str(value).strip() not in {"", "--", "-"}:
-                price_f.loc[code, target] = value
-    sentiment = _LIVE_CACHE["sentiment"]
-    if not sentiment:
-        try:
-            sentiment = F.compute_sentiment_factors(eligible_codes)
-            if sentiment:
-                _LIVE_CACHE["sentiment"] = sentiment
-        except Exception:
-            sentiment = {}
+    factor_codes = set(price_f.index)
+    for target, source in live_field_map.items():
+        updates = {
+            code: row[source] for code, row in live_map.items()
+            if code in factor_codes and row.get(source) is not None
+            and str(row[source]).strip() not in {"", "--", "-"}
+        }
+        if updates:
+            values = pd.Series(updates)
+            price_f.loc[values.index, target] = values.to_numpy()
+    sentiment = _load_selection_context(
+        "sentiment", lambda: F.compute_sentiment_factors(frozenset(eligible_codes)),
+        background=background_context)
     # 实时资金流直接从同一份行情取（含 f62/f184），省去一次全市场排行抓取
     realtime_flow = {
         s["code"]: (
@@ -1528,12 +1539,7 @@ def _select_uncached(
         for r in (super_rows or [])
     )
     if not has_expected_super:
-        try:
-            _refresh_super_flow(topn=max(len(snap_f), 100))
-            with _SUPER_FLOW_LOCK:
-                super_rows = _SUPER_FLOW_CACHE.get("data") or []
-        except Exception:
-            pass
+        _schedule_super_flow_refresh(topn=max(len(snap_f), 100))
     # The flow rank endpoint is cached independently from the quote snapshot.
     # Never inject a row with an absent/old timestamp into today's cross-section;
     # such rows silently turn stale capital-flow data into a live factor.
@@ -1573,7 +1579,7 @@ def _select_uncached(
         if live_row:
             pick["quote_at"] = live_row.get("quote_at")
             pick["quote_source"] = live_row.get("source") or "live_snapshot"
-            pick["quote_data_scope"] = "当日实时行情；技术指标使用前一完整交易日下载K线"
+            pick["quote_data_scope"] = ("当日实时行情" if is_open_session else "最近完整交易日收盘价格") + "；技术指标使用最近完整交易日下载K线"
             pick["historical_factor_date"] = complete_cutoff
     result["universe_size"] = len(price_f)
     result["total_universe"] = len(uni)
@@ -1583,15 +1589,19 @@ def _select_uncached(
         "eligible_factor_rows": len(price_f),
         "excluded_stale_rows": max(0, len(uni) - len(price_f)),
         "coverage_pct": coverage["fresh_selection_pct"],
-        "live_quote_source": "东方财富全市场实时行情",
+        "live_quote_source": " / ".join(sorted({str(row.get("source") or "全市场快照（未逐行声明来源）") for row in snap_f})),
+        "quote_policy": MDC.LIVE_MARKET_POLICY.name if is_open_session else MDC.CLOSE_SNAPSHOT_POLICY.name,
         "live_quote_at": max((str(row.get("quote_at") or "") for row in snap_f), default=None),
         "live_quote_coverage": len(snap_f),
         "live_eligible_coverage_pct": round(live_coverage * 100, 2),
         "kline_source": "与模拟盘共享：data_cache/klines（前复权日线）",
         "kline_source_version": dfc.SHARED_KLINE_SOURCE_VERSION,
         "kline_cache_path": dfc.KLINE_DIR,
-        "note": "历史因子仅使用最近完整交易日；价格、涨跌幅、量比和资金流均由本次实时行情覆盖。未更新或停牌导致的旧因子不参与选股。选股与模拟盘读取同一份前复权日线缓存，不再维护独立K线库。",
+        "note": "历史因子使用最近完整交易日；价格按盘中实时或指定交易日收盘口径读取，缺失字段保持未知。选股与模拟盘读取同一份前复权日线缓存。",
     }
+    if background_context:
+        result["context_pending"] = [key for key, value in (("finance", finance), ("sentiment", sentiment))
+                                     if not _context_has_data(key, value)]
     result["finance_report_dates"] = finance.get("report_dates")
     result["latest_finance_report_date"] = (
         (finance.get("report_dates") or [None])[0]
@@ -1626,7 +1636,8 @@ def select(
     topn: int = Query(10, ge=1, le=100),
 ):
     """Coalesce identical selection requests on small servers."""
-    key = (strategy, topn, _selection_signature())
+    key = (strategy, topn, _selection_signature(), _health_file_signature(_SUPER_FLOW_PATH),
+           _SELECTION_CONTEXT_VERSION, _selection_context_signature())
     now = time.time()
     cached = _SELECT_RESULT_CACHE.get(key)
     if cached and now - cached["ts"] < _SELECT_RESULT_TTL_SECONDS:
@@ -1636,7 +1647,7 @@ def select(
         cached = _SELECT_RESULT_CACHE.get(key)
         if cached and now - cached["ts"] < _SELECT_RESULT_TTL_SECONDS:
             return cached["data"]
-        result = _select_uncached(strategy=strategy, topn=topn)
+        result = _select_uncached(strategy=strategy, topn=topn, background_context=True)
         _SELECT_RESULT_CACHE.clear()
         _SELECT_RESULT_CACHE[key] = {"ts": time.time(), "data": result}
         _save_selection_result(strategy, topn, result)

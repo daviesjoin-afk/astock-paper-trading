@@ -263,19 +263,30 @@ class SlotOccupancyFacadeContractTests(unittest.TestCase):
             encoding="utf-8")
         tree = ast.parse(manual)
         self.assertTrue(any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "paper_trading"
-            and any(alias.name == "_pending_position_slots" for alias in node.names)
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_pending_position_slots"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "deps"
+            and node.value.attr == "_pending_position_slots"
             for node in ast.walk(tree)
-        ), "manual_orders must import the canonical slot helper")
+        ), "manual_orders must consume the injected canonical slot helper")
+        import manual_orders as MO
+        with mock.patch.object(PT, "_pending_position_slots") as canonical:
+            self.assertIs(MO._dependencies()._pending_position_slots, canonical)
+        self.assertTrue(any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_pending_position_slots"
+            for node in ast.walk(tree)
+        ), "manual execution must still call the canonical slot helper")
 
         dashboard = pathlib.Path(__file__).with_name("dashboard_queries.py").read_text(
             encoding="utf-8")
         dashboard_tree = ast.parse(dashboard)
         self.assertFalse(any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "paper_trading"
-            and any(alias.name == "_pending_position_slots" for alias in node.names)
+            (isinstance(node, ast.Name) and node.id == "_pending_position_slots")
+            or (isinstance(node, ast.Attribute) and node.attr == "_pending_position_slots")
             for node in ast.walk(dashboard_tree)
         ), "dashboard_queries must not compute unnamed allocation facts")
 
