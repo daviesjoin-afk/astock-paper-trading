@@ -78,8 +78,15 @@ def _snapshot_first(mapping, *keys):
     return None
 
 
+def _snapshot_bar_date(index):
+    try:
+        return _date(index).isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return str(index)[:10] or None
+
+
 def _snapshot_kline(kline, asof_date=None):
-    """Serialise every completed daily bar and explicitly count future bars."""
+    """Serialise retained daily bars with full history and future-bar counts."""
     if kline is None or not hasattr(kline, "iterrows"):
         return {
             "source": "unknown",
@@ -94,11 +101,32 @@ def _snapshot_kline(kline, asof_date=None):
     rows, future_rows = [], 0
     raw_columns = getattr(kline, "columns", None)
     columns = list(raw_columns) if raw_columns is not None else []
+    max_stored_bars = 120
+    omitted_rows = 0
+    dates = []
+    # Only the retained bars need cell conversion. Keep iterrows on that window
+    # to preserve its existing numeric coercion and custom-column behaviour.
+    # A column named date can overwrite the index date in the legacy serializer;
+    # leave that case (and non-DataFrame adapters) on the original path.
+    if (
+        isinstance(kline, pd.DataFrame)
+        and len(kline) > max_stored_bars
+        and kline.columns.is_unique
+        and "date" not in {str(column) for column in columns}
+    ):
+        positions = []
+        for position, index in enumerate(kline.index):
+            bar_date = _snapshot_bar_date(index)
+            if cutoff and bar_date and bar_date > cutoff:
+                future_rows += 1
+                continue
+            positions.append(position)
+            if bar_date:
+                dates.append(bar_date)
+        omitted_rows = max(0, len(positions) - max_stored_bars)
+        kline = kline.iloc[positions[-max_stored_bars:]]
     for index, row in kline.iterrows():
-        try:
-            bar_date = _date(index).isoformat()
-        except (TypeError, ValueError, OverflowError):
-            bar_date = str(index)[:10] or None
+        bar_date = _snapshot_bar_date(index)
         if cutoff and bar_date and bar_date > cutoff:
             future_rows += 1
             continue
@@ -109,10 +137,10 @@ def _snapshot_kline(kline, asof_date=None):
             except (KeyError, TypeError, IndexError):
                 item[str(column)] = None
         rows.append(item)
-    dates = [item.get("date") for item in rows if item.get("date")]
-    max_stored_bars = 120
-    omitted_rows = max(0, len(rows) - max_stored_bars)
-    if omitted_rows:
+    if not dates:
+        dates = [item.get("date") for item in rows if item.get("date")]
+    omitted_rows += max(0, len(rows) - max_stored_bars)
+    if len(rows) > max_stored_bars:
         rows = rows[-max_stored_bars:]
     source = snapshot_safe(getattr(kline, "attrs", {}).get("source")) or "unknown"
     return {
