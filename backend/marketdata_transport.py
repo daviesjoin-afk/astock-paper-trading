@@ -68,6 +68,8 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
             response.encoding = encoding
             if response.text:
                 return response.text
+            if index == retries:
+                return ""
             if index < retries:
                 with PTM.phase("http_retry_backoff"):
                     time.sleep(0.4 * (index + 1))

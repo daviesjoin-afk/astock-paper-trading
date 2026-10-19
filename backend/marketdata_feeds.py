@@ -254,7 +254,9 @@ class EastmoneyRealtimeFeed:
                         try:
                             payload = self.get_json(
                                 f"https://{host}/api/qt/ulist.np/get", params,
-                                timeout=self.reliability.timeout_seconds, retries=1,
+                                # This adapter owns retries and host rotation.
+                                # A second retry loop multiplies outage latency.
+                                timeout=self.reliability.timeout_seconds, retries=0,
                             )
                             transport_succeeded = True
                             diff = (payload or {}).get("data", {}).get("diff") or []
@@ -285,7 +287,7 @@ class EastmoneyRealtimeFeed:
                             try:
                                 payload = self.get_json(
                                     f"https://{host}/api/qt/ulist.np/get", small_params,
-                                    timeout=self.reliability.timeout_seconds, retries=1,
+                                    timeout=self.reliability.timeout_seconds, retries=0,
                                 )
                                 transport_succeeded = True
                                 diff = (payload or {}).get("data", {}).get("diff") or []

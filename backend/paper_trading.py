@@ -6624,7 +6624,8 @@ def _quotes(codes, asof_date=None):
     expected_day = _date(asof_date or dt.date.today())
     source_errors = {}
     try:
-        live_rows = dfc.fetch_realtime_for_codes(list(codes)) or []
+        with PTM.phase("quote.primary"):
+            live_rows = dfc.fetch_realtime_for_codes(list(codes)) or []
     except Exception as exc:
         # One provider must never abort a risk pass for every holding.  Keep
         # the exception in the quote envelope so entry remains fail-closed and
@@ -6646,9 +6647,10 @@ def _quotes(codes, asof_date=None):
         # Use the market owner's complete, fresh current snapshot, never the
         # historical universe file. Independent price reconciliation still runs.
         try:
-            reading = MDSvc.read_snapshot(
-                MDC.LIVE_MARKET_POLICY, now=dt.datetime.now().astimezone(),
-                asof_day=expected_day.isoformat())
+            with PTM.phase("quote.snapshot_read"):
+                reading = MDSvc.read_snapshot(
+                    MDC.LIVE_MARKET_POLICY, now=dt.datetime.now().astimezone(),
+                    asof_day=expected_day.isoformat())
             if (reading.status == MDC.STATUS_FRESH
                     or (reading.available and reading.freshness == MDC.FRESHNESS_FRESH
                         and reading.reason == MDC.REASON_PRICE_ONLY_COVERAGE)):
@@ -6680,7 +6682,8 @@ def _quotes(codes, asof_date=None):
     }
     if missing_flow_codes:
         try:
-            flow_details = dfc.enrich_live_flow_details(live_rows, missing_flow_codes) or {}
+            with PTM.phase("quote.flow"):
+                flow_details = dfc.enrich_live_flow_details(live_rows, missing_flow_codes) or {}
         except Exception as exc:
             source_errors["flow"] = f"{type(exc).__name__}: {exc}"
     # 独立核验源采用腾讯优先、缺失代码自动切换新浪；不能因为腾讯一次空响应
@@ -6688,7 +6691,8 @@ def _quotes(codes, asof_date=None):
     # 主报价若来自腾讯（价格-only 快照回退），必须改用新浪核验：同一来源
     # 与自己比较不构成双源证据，只会把"自己核验自己"写成 cross_source_checked。
     try:
-        cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
+        with PTM.phase("quote.independent"):
+            cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
     except Exception as exc:
         cross_rows = []
         source_errors["cross"] = f"{type(exc).__name__}: {exc}"
@@ -6702,7 +6706,8 @@ def _quotes(codes, asof_date=None):
         for code in same_source_codes:
             cross.pop(code, None)  # A failed independent request must not retain self-verification.
         try:
-            sina_rows = dfc._fetch_sina_realtime_for_codes(same_source_codes) or []
+            with PTM.phase("quote.same_source_fallback"):
+                sina_rows = dfc._fetch_sina_realtime_for_codes(same_source_codes) or []
         except Exception as exc:
             sina_rows = []
             source_errors["sina"] = f"{type(exc).__name__}: {exc}"
@@ -6710,8 +6715,9 @@ def _quotes(codes, asof_date=None):
             code = str(row.get("code") or "")
             if code in same_source_codes and row.get("source") == "sina_public_quote":
                 cross[code] = row
-    local = _latest_price_map(codes)
-    local_snapshot_at = _universe_snapshot_time()
+    with PTM.phase("quote.local_metadata"):
+        local = _latest_price_map(codes)
+        local_snapshot_at = _universe_snapshot_time()
     out = {}
     quote_execution_asof = dt.datetime.now().isoformat(timespec="seconds")
     is_historical_asof = expected_day != dt.date.today()
@@ -6836,7 +6842,8 @@ def _quotes(codes, asof_date=None):
         }
         out[code] = row
     if not is_historical_asof:
-        observations = PLTrad.prefetch(out, asof_day=expected_day.isoformat())
+        with PTM.phase("quote.tradability"):
+            observations = PLTrad.prefetch(out, asof_day=expected_day.isoformat())
         completed_at = dt.datetime.now().isoformat(timespec="microseconds")
         for row in out.values():
             row["tradability_observation_status"] = "unavailable"
@@ -9271,6 +9278,7 @@ def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_
     """
     return False, "总资金池82%硬上限不可突破；需先卖出低质量持仓释放额度"
 
+@PTM.timed("execution.buy_approval")
 def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quotes=None):
     # PR-06：席位预留、追高/加速门限、首仓纪律等差异统一由中央执行计划器的
     # 声明式策略表提供，本函数不再按账户 ID 分支。
@@ -10473,6 +10481,7 @@ def cancel_manual_order(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+@PTM.timed("execution.manual_pending")
 def process_pending_manual_orders(*args, **kwargs):
     """Facade (Phase 2): moved to manual_orders. Original signature: process_pending_manual_orders(asof_date=None)"""
     from manual_orders import process_pending_manual_orders as _impl
@@ -10610,7 +10619,8 @@ def execute_open(asof_date=None):
     # 轮换东财/腾讯重试，让随后的全市场快照拉取更可靠。
     # 探活失败不放宽任何门禁：门禁仍按旧快照冻结（fail-closed 语义不变）。
     try:
-        open_source_health = dfc.check_data_source_health(force=True)
+        with PTM.phase("execution.source_health"):
+            open_source_health = dfc.check_data_source_health(force=True)
     except Exception as exc:
         open_source_health = {
             "healthy": False, "reconnected": False, "attempts": 0,
@@ -10626,12 +10636,14 @@ def execute_open(asof_date=None):
     # partial market snapshot.  Re-check the same full-market gate here so the
     # standalone 09:31 scheduler cannot bypass a blocked 3-minute scan.
     try:
-        open_rows = _validated_live_universe(
-            MDSvc.refresh_rows(policy=MDC.OPENING_EVENT_POLICY), day, max_quote_age_minutes=20,
-        )
+        with PTM.phase("execution.market_snapshot"):
+            open_rows = _validated_live_universe(
+                MDSvc.refresh_rows(policy=MDC.OPENING_EVENT_POLICY), day, max_quote_age_minutes=20,
+            )
     except Exception:
         open_rows = []
-    open_gate = _live_scan_gate(open_rows, day)
+    with PTM.phase("execution.coverage_gate"):
+        open_gate = _live_scan_gate(open_rows, day)
     if not open_gate["ready"]:
         reason = (
             f"开盘实时行情覆盖 {open_gate['covered_codes']}/{open_gate['eligible_codes']}"
@@ -10665,7 +10677,7 @@ def execute_open(asof_date=None):
     # Snapshot the pending queue and fetch all external data before acquiring
     # the write lock below.  A slow quote/news provider must not block risk,
     # manual cancellation, or another scheduler process on SQLite.
-    with _db() as prefetch_conn:
+    with PTM.phase("execution.waitlist_read"), _db() as prefetch_conn:
         # 冻结等待池只预取 5 天内的信号；更老的会在下方统一按过期处理，
         # 不值得为它们消耗行情/新闻配额。
         _waitlist_cutoff = (day - dt.timedelta(days=5)).isoformat()
@@ -10682,10 +10694,13 @@ def execute_open(asof_date=None):
         str(row.get("code")): row.get("name") or str(row.get("code"))
         for row in prefetch_pending if row.get("code")
     }
-    prefetch_market = _market_state(day) if prefetch_codes else None
-    prefetch_news = _news_for(prefetch_names) if prefetch_codes else []
-    prefetch_quotes = _quotes(prefetch_codes, asof_date=day) if prefetch_codes else {}
-    with _db(immediate=True, hot_path=True) as conn:
+    with PTM.phase("execution.waitlist_market"):
+        prefetch_market = _market_state(day) if prefetch_codes else None
+    with PTM.phase("execution.waitlist_news"):
+        prefetch_news = _news_for(prefetch_names) if prefetch_codes else []
+    with PTM.phase("execution.waitlist_quotes"):
+        prefetch_quotes = _quotes(prefetch_codes, asof_date=day) if prefetch_codes else {}
+    with PTM.phase("execution.writer"), _db(immediate=True, hot_path=True) as conn:
         accounts = _active_account_rows(conn, status="running")
         # Limited slots must be won by the strongest live candidate, not by
         # whichever signal happened to be inserted first.
@@ -10815,6 +10830,7 @@ def _score100(value, default=50.0):
     return max(0.0, min(100.0, value))
 
 
+@PTM.timed("execution.waitlist_rank")
 def _waitlist_realtime_assessment(signal, account, quote, asof_day):
     """Re-score a waiting candidate with the quote used for this execution.
 
@@ -13200,6 +13216,7 @@ def _nav_quotes_with_snapshot_fallback(quotes):
     return merged
 
 
+@PTM.timed("execution.nav_write")
 def _record_nav(conn, asof_day, quotes=None):
     _assert_active_lease(conn, "NAV write")
     accounts = _rows(conn, "SELECT * FROM paper_accounts")

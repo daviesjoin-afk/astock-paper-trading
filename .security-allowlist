@@ -40,6 +40,8 @@ host:docs.python.org
 # Public primary sources cited by the system audit; exact hosts only.
 host:pandas.pydata.org
 host:www.sqlite.org
+# Public AWS Builders' Library documentation cited for the retry design.
+host:aws.amazon.com
 host:tracker.debian.org
 host:www.davidhbailey.com
 host:www.quantconnect.com

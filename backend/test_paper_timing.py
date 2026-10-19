@@ -18,6 +18,55 @@ import paper_timing as timing
 
 
 class TimingTests(unittest.TestCase):
+    def test_quote_phases_keep_same_source_guard_and_failure_evidence(self):
+        import datetime as dt
+        import paper_trading as paper
+        stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        quote = {"code": "600001", "price": 10.0, "pct": 1.0,
+                 "quote_at": stamp, "source": "tencent_public_quote"}
+        output = io.StringIO()
+        with mock.patch.object(paper.dfc, "fetch_realtime_for_codes", return_value=[quote]), \
+                mock.patch.object(paper.dfc, "enrich_live_flow_details", return_value={}), \
+                mock.patch.object(paper.dfc, "fetch_independent_realtime_for_codes", return_value=[quote]), \
+                mock.patch.object(paper.dfc, "_fetch_sina_realtime_for_codes",
+                                  side_effect=RuntimeError("private-marker")), \
+                mock.patch.object(paper, "_latest_price_map", return_value={}), \
+                mock.patch.object(paper, "_universe_snapshot_time", return_value=None), \
+                mock.patch.object(paper.PLTrad, "prefetch", return_value={}), \
+                contextlib.redirect_stderr(output), timing.capture("intraday"):
+            row = paper._quotes(["600001"], asof_date=dt.date.today())["600001"]
+            stages = timing.snapshot("test")["stages"]
+        self.assertNotEqual(row["quote_validation"], "cross_source_checked")
+        self.assertFalse(row["quote_cross_check"]["passed"])
+        self.assertIn("private-marker", row["quote_source_errors"]["sina"])
+        for name in ("primary", "flow", "independent", "same_source_fallback", "local_metadata", "tradability"):
+            self.assertEqual(stages["quote." + name]["calls"], 1)
+        self.assertEqual(stages["quote.same_source_fallback"]["errors"], 1)
+        self.assertNotIn("private-marker", output.getvalue())
+
+    def test_open_failure_keeps_risk_first_and_records_guard_boundaries(self):
+        import paper_trading as paper
+        order = []
+        gate = {"ready": False, "covered_codes": 0, "eligible_codes": 5000,
+                "coverage_pct": 0.0, "required_codes": 4500}
+        with mock.patch.object(paper, "init_db"), \
+                mock.patch.object(paper, "monitor_risk", side_effect=lambda *_: order.append("risk") or {}), \
+                mock.patch.object(paper, "process_pending_execution_orders", return_value=[]), \
+                mock.patch.object(paper.dfc, "check_data_source_health",
+                                  side_effect=lambda **_: order.append("health") or {}), \
+                mock.patch.object(paper, "_entry_freeze_status"), \
+                mock.patch.object(paper.MDSvc, "refresh_rows", return_value=[]), \
+                mock.patch.object(paper, "_live_scan_gate", return_value=gate), \
+                mock.patch.object(paper, "process_pending_manual_orders") as manual, \
+                contextlib.redirect_stderr(io.StringIO()), timing.capture("open"):
+            result = paper.execute_open("2026-10-19")
+            stages = timing.snapshot("test")["stages"]
+        self.assertEqual(order, ["risk", "health"])
+        self.assertEqual(result["status"], "blocked")
+        manual.assert_not_called()
+        for name in ("source_health", "market_snapshot", "coverage_gate"):
+            self.assertEqual(stages["execution." + name]["calls"], 1)
+
     def test_inactive_has_no_clock_reads_or_output(self):
         with mock.patch.object(timing.time, "perf_counter", side_effect=AssertionError), \
                 mock.patch.object(timing.time, "thread_time", side_effect=AssertionError), \

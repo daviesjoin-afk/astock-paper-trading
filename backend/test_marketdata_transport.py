@@ -49,6 +49,16 @@ class MarketdataTransportTests(unittest.TestCase):
             self.assertEqual(transport.http_get("https://example.invalid", retries=1), "ok")
         self.assertEqual(sleep.call_count, 1)
 
+    def test_empty_final_response_has_no_backoff_without_another_attempt(self):
+        for retries in (0, 1, 2):
+            with self.subTest(retries=retries):
+                session = _Session([_Response("") for _ in range(retries + 1)])
+                with mock.patch.object(transport, "_session", return_value=session), \
+                        mock.patch.object(transport.time, "sleep") as sleep:
+                    self.assertEqual(transport.http_get("https://example.invalid", retries=retries), "")
+                self.assertEqual(sleep.call_args_list,
+                                 [mock.call(0.4 * (i + 1)) for i in range(retries)])
+
     def test_http_post_json_preserves_empty_failure_contract(self):
         session = _Session([_Response('{"ok": true}', {"ok": True})])
         with mock.patch.object(transport, "_session", return_value=session):
