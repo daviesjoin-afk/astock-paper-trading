@@ -329,7 +329,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 news=news, replacement=replacement, nav=pool_nav,
                 market=market_context,
                 flow_trajectory=flow_trajectory_map.get(position["code"]),
-                deps=ports.evidence,
+                deps=ports.evidence, alt_evidence=market_inputs.get("position_alt_data") or {},
             )
             review["review_date"] = day
             review["dynamic_position_limit"] = count_budget["limits"].get(position["account_id"], 5)

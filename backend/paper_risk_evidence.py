@@ -24,6 +24,7 @@ from paper_trading_rules import limit_pct as _limit_pct, security_scope as _secu
 
 __all__ = [
     "RiskEvidenceDeps",
+    "prefetch_position_alt_data",
     "best_replacement_candidate",
     "intraday_downside_guard",
     "downside_confirmed",
@@ -115,6 +116,43 @@ def _hold_days(position, asof_day, load_kline):
 
 def _replacement_min_hold_days(account_id):
     return int(SPOL.position_review_min_hold_days(account_id))
+
+
+_POSITION_ALT_SIGNALS = (
+    "lockup_penalty", "lhb_position_signal", "margin_signal",
+    "block_trade_signal", "holder_signal",
+)
+
+
+def _position_alt_signals(code, asof_day, alt_data):
+    """Keep each optional source's existing independent failure fallback."""
+    if alt_data is None:
+        return {}
+    signals = {}
+    for name in _POSITION_ALT_SIGNALS:
+        try:
+            value, description = getattr(alt_data, name)(code, asof_day=asof_day)
+            signals[name] = (value, description)
+        except Exception:
+            signals[name] = (0.0, None)
+    return signals
+
+
+def prefetch_position_alt_data(positions, asof_day, *, alt_data):
+    """Collect date-bound shadow inputs once per code, before a writer opens.
+
+    The returned map belongs to this risk invocation only. Missing entries do
+    not authorize a provider call at the later ledger-write boundary.
+    """
+    if alt_data is None:
+        return {}
+    day = _date(asof_day)
+    return {
+        (day, str(position["code"])): _position_alt_signals(
+            str(position["code"]), asof_day, alt_data,
+        )
+        for position in {str(row["code"]): row for row in positions}.values()
+    }
 
 
 def _volatility_shadow(code, asof_day, price, load_kline):
@@ -424,7 +462,7 @@ def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvi
 
 
 def position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None, replacement=None, nav=None, market=None,
-                           flow_trajectory=None, deps: RiskEvidenceDeps):
+                           flow_trajectory=None, deps: RiskEvidenceDeps, alt_evidence=None):
     """Score an existing holding for concentration decisions (0..100).
 
     The score is intentionally independent from the entry gate: it combines
@@ -501,36 +539,19 @@ def position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=No
     news_penalty = min(24.0, len(negative) * 12.0)
     # 限售解禁预警（P0）：未来30天大额解禁（≥3%流通）重扣，60天≥5%中扣。
     # 解禁是确定性的供给冲击，等价格反应再退出就晚了；数据源失败时扣0。
-    lockup_penalty, lockup_desc = 0.0, None
-    if deps.alt_data is not None:
-        try:
-            lockup_penalty, lockup_desc = deps.alt_data.lockup_penalty(code, asof_day=asof_day)
-        except Exception:
-            lockup_penalty, lockup_desc = 0.0, None
+    # Direct compatibility calls retain live lookup. The risk service always
+    # supplies a map (even when empty), so its write transaction cannot fetch.
+    signals = (_position_alt_signals(code, asof_day, deps.alt_data)
+               if alt_evidence is None else alt_evidence.get((_date(asof_day), code), {}))
+    lockup_penalty, lockup_desc = signals.get("lockup_penalty", (0.0, None))
     # 龙虎榜信号（P1）：近7天上榜净买 +6（抢筹确认），净卖 -6（出货警示）。
-    lhb_bonus, lhb_desc = 0.0, None
-    if deps.alt_data is not None:
-        try:
-            lhb_bonus, lhb_desc = deps.alt_data.lhb_position_signal(code, asof_day=asof_day)
-        except Exception:
-            lhb_bonus, lhb_desc = 0.0, None
+    lhb_bonus, lhb_desc = signals.get("lhb_position_signal", (0.0, None))
     # 筹码/杠杆信号（P2）：两融 ±4、大宗 -5/+3、股东户数 ±5。
     # 各自独立小幅度，合计最坏 -14，与 lockup/lhb 共同构成替代数据
     # 评分层；任一数据源失败该项为 0，不影响其余。
-    margin_bonus, margin_desc, block_bonus, block_desc, holder_bonus, holder_desc = 0.0, None, 0.0, None, 0.0, None
-    if deps.alt_data is not None:
-        try:
-            margin_bonus, margin_desc = deps.alt_data.margin_signal(code, asof_day=asof_day)
-        except Exception:
-            margin_bonus, margin_desc = 0.0, None
-        try:
-            block_bonus, block_desc = deps.alt_data.block_trade_signal(code, asof_day=asof_day)
-        except Exception:
-            block_bonus, block_desc = 0.0, None
-        try:
-            holder_bonus, holder_desc = deps.alt_data.holder_signal(code, asof_day=asof_day)
-        except Exception:
-            holder_bonus, holder_desc = 0.0, None
+    margin_bonus, margin_desc = signals.get("margin_signal", (0.0, None))
+    block_bonus, block_desc = signals.get("block_trade_signal", (0.0, None))
+    holder_bonus, holder_desc = signals.get("holder_signal", (0.0, None))
     alt_bonus = lhb_bonus + margin_bonus + block_bonus + holder_bonus
     alt_shadow_delta = alt_bonus - lockup_penalty
     weights = deps.holding_quality_weights.get(account_id, deps.holding_quality_weights["trend_pullback"])

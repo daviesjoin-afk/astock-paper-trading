@@ -10532,7 +10532,7 @@ def _risk_load_market_inputs(*, day, positions, candidate_codes):
         _round_quote_offer(day, quote_map)
         return quote_map
 
-    return PRMI.load(
+    inputs = PRMI.load(
         day=day, positions=positions, candidate_codes=candidate_codes,
         ports=PRMI.RiskMarketInputs(
             market_context=market_context, quotes=quotes, news=_news_for,
@@ -10540,6 +10540,9 @@ def _risk_load_market_inputs(*, day, positions, candidate_codes):
             trajectories=lambda codes, **kwargs: AD.fund_flow_trajectories(codes, **kwargs) if AD is not None else {},
         ),
     )
+    with PTM.phase("risk.alt_evidence"):
+        inputs["position_alt_data"] = PREv.prefetch_position_alt_data(positions, day, alt_data=AD)
+    return inputs
 
 
 def _risk_service_ports():
