@@ -42,6 +42,8 @@ MARKET_SNAPSHOT_SAMPLE_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_sam
 MARKET_SNAPSHOT_FULL_LOCK_PATH = MARKET_SNAPSHOT_FULL_CACHE_PATH + ".lock"
 DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
 FINANCE_CACHE_PATH = data_paths.data_path("finance_latest.json")
+CONCEPT_MEMBERS_CACHE_DIR = data_paths.data_path("concept_members")
+CONCEPT_MEMBERS_CACHE_TTL_SECONDS = 300
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
@@ -49,6 +51,8 @@ _cache_lock = threading.Lock()
 _mem_cache = {}
 _finance_fetch_lock = threading.Lock()
 _finance_fetch_state = {"retry_at": 0.0}
+_concept_member_locks = {}
+_concept_member_locks_guard = threading.Lock()
 _full_snapshot_thread_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _manifest = None
@@ -338,16 +342,45 @@ def _finite_number(value):
     return MN.finite_number(value)
 
 
+def _concept_member_fetch_lock(board_code):
+    """Per-board lock so one board never serializes the whole parallel batch."""
+    with _concept_member_locks_guard:
+        return _concept_member_locks.setdefault(str(board_code), threading.Lock())
+
+
 def _fetch_concept_members(board_code, max_pages=8):
-    """Fetch all currently reported members, with explicit completeness data."""
-    return MP.fetch_eastmoney_concept_members(
-        get_json=_get_json,
-        hosts=CLIST_HOSTS,
-        board_code=board_code,
-        ut=UT_FLOW,
-        quote_at=_quote_at,
-        finite_number=_finite_number,
-        max_pages=max_pages,
+    """Fetch all currently reported members, with explicit completeness data.
+
+    Board membership is stable over minutes while the endpoint is throughput
+    bound, so a complete payload is shared across the three-minute scans and
+    across worker processes.  Incomplete or empty answers are never cached:
+    a failed page set must be retried, not promoted to discovery evidence.
+    Only the coarse positive-ratio/active-peer pre-filter reads the member
+    quotes here; candidate scoring and every execution gate keep using the
+    round's own live snapshot.
+    """
+    def _fetch():
+        return MP.fetch_eastmoney_concept_members(
+            get_json=_get_json,
+            hosts=CLIST_HOSTS,
+            board_code=board_code,
+            ut=UT_FLOW,
+            quote_at=_quote_at,
+            finite_number=_finite_number,
+            max_pages=max_pages,
+        )
+
+    name = str(board_code)
+    if max_pages != 8 or not name.isalnum():
+        return _fetch()
+    os.makedirs(CONCEPT_MEMBERS_CACHE_DIR, exist_ok=True)
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, _concept_member_fetch_lock(name),
+        f"concept_members:{name}",
+        os.path.join(CONCEPT_MEMBERS_CACHE_DIR, f"{name}.json"),
+        CONCEPT_MEMBERS_CACHE_TTL_SECONDS, _fetch,
+        lambda value: (isinstance(value, dict) and bool(value.get("complete"))
+                       and bool(value.get("members"))),
     )
 
 
