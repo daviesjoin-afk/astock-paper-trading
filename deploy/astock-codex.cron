@@ -118,3 +118,7 @@ HOME=/opt/astock-codex
 # 每日自动备份（2026-09-04 排查确认此前从未有备份任务；sqlite 在线备份不锁库）。
 # backup.sh 自带路径探测（/opt/astock-codex 或 /root/codex）与清单自校验。
 10 20 * * * root flock -n /opt/astock-codex/.locks/backup.lock /opt/astock-codex/deploy/backup.sh --keep 7 >>/opt/astock-codex/reports/backup.log 2>&1
+
+# 磁盘水位守护（2026-10-20 操作员要求）：根分区超过 85% 就清理构建缓存、旧镜像与过期备份。
+# 低于阈值时只写一行日志，不做任何删除；永不触碰账本、当日迁移前备份或正在使用的镜像。
+17,47 * * * * root /opt/astock-codex/deploy/disk-guard.sh >>/opt/astock-codex/reports/disk-guard.log 2>&1
