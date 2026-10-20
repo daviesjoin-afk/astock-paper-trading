@@ -43,7 +43,13 @@ MARKET_SNAPSHOT_FULL_LOCK_PATH = MARKET_SNAPSHOT_FULL_CACHE_PATH + ".lock"
 DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
 FINANCE_CACHE_PATH = data_paths.data_path("finance_latest.json")
 CONCEPT_MEMBERS_CACHE_DIR = data_paths.data_path("concept_members")
-CONCEPT_MEMBERS_CACHE_TTL_SECONDS = 300
+CONCEPT_REFS_CACHE_DIR = data_paths.data_path("concept_refs")
+# Board membership and stock-to-concept tags are reference data: they change
+# when a board is rebalanced or a stock is re-tagged, not between two scans.
+# The quote fields that ride along in the same payload are NOT reference data
+# and are therefore dropped before caching; callers overlay the round's own
+# live snapshot instead.
+CONCEPT_REFERENCE_CACHE_TTL_SECONDS = 86400
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
@@ -348,16 +354,27 @@ def _concept_member_fetch_lock(board_code):
         return _concept_member_locks.setdefault(str(board_code), threading.Lock())
 
 
+def _membership_only(payload):
+    """Drop the quote fields that ride along with the constituent list."""
+    return {
+        **{key: value for key, value in payload.items() if key != "members"},
+        "members": [
+            {key: member.get(key) for key in ("code", "name", "industry")}
+            for member in payload.get("members") or []
+        ],
+    }
+
+
 def _fetch_concept_members(board_code, max_pages=8):
     """Fetch all currently reported members, with explicit completeness data.
 
-    Board membership is stable over minutes while the endpoint is throughput
-    bound, so a complete payload is shared across the three-minute scans and
-    across worker processes.  Incomplete or empty answers are never cached:
-    a failed page set must be retried, not promoted to discovery evidence.
-    Only the coarse positive-ratio/active-peer pre-filter reads the member
-    quotes here; candidate scoring and every execution gate keep using the
-    round's own live snapshot.
+    Board membership is reference data: it changes on a rebalance, not between
+    two three-minute scans, so the membership list is shared across rounds and
+    across worker processes for a day.  The member quotes that arrive in the
+    same payload are deliberately stripped before caching, because caching them
+    for a day would freeze the positive-ratio and active-peer pre-filter.
+    Incomplete or empty answers are never cached: a failed page set must be
+    retried, not promoted to discovery evidence.
     """
     def _fetch():
         return MP.fetch_eastmoney_concept_members(
@@ -370,6 +387,9 @@ def _fetch_concept_members(board_code, max_pages=8):
             max_pages=max_pages,
         )
 
+    def _membership():
+        return _membership_only(_fetch())
+
     name = str(board_code)
     if max_pages != 8 or not name.isalnum():
         return _fetch()
@@ -378,14 +398,35 @@ def _fetch_concept_members(board_code, max_pages=8):
         _mem_cache, _cache_lock, _concept_member_fetch_lock(name),
         f"concept_members:{name}",
         os.path.join(CONCEPT_MEMBERS_CACHE_DIR, f"{name}.json"),
-        CONCEPT_MEMBERS_CACHE_TTL_SECONDS, _fetch,
+        CONCEPT_REFERENCE_CACHE_TTL_SECONDS, _membership,
         lambda value: (isinstance(value, dict) and bool(value.get("complete"))
                        and bool(value.get("members"))),
     )
 
 
-def fetch_hot_concept_snapshot(topn=6):
-    """Funded concepts and complete constituents; incomplete boards stay out."""
+def _overlay_member_quotes(members, quotes):
+    """Replace cached member quotes with the round's own live snapshot."""
+    if not quotes:
+        return members
+    overlaid = []
+    for member in members:
+        live = quotes.get(str(member.get("code") or ""))
+        if not isinstance(live, dict):
+            overlaid.append(member)
+            continue
+        overlaid.append({**member,
+                         **{key: live[key] for key in ("price", "pct")
+                            if live.get(key) is not None}})
+    return overlaid
+
+
+def fetch_hot_concept_snapshot(topn=6, quotes=None):
+    """Funded concepts and complete constituents; incomplete boards stay out.
+
+    ``quotes`` is the caller's live full-market snapshot.  Constituents come
+    from the daily membership cache and carry no quotes of their own, so the
+    positive ratio is computed from that snapshot.
+    """
     def _do():
         boards = []
         for row in fetch_sector_flow("concept") or []:
@@ -409,10 +450,11 @@ def fetch_hot_concept_snapshot(topn=6):
         output = []
         for rank, board in enumerate(boards, 1):
             result = fetched.get(board["code"]) or {}
-            members = result.get("members") or []
+            members = _overlay_member_quotes(result.get("members") or [], quotes)
             if not result.get("complete") or not members:
                 continue
-            positive = sum(1 for member in members if member["pct"] > 0)
+            positive = sum(1 for member in members
+                           if (_finite_number(member.get("pct")) or 0) > 0)
             output.append({**board, **{k: v for k, v in result.items() if k != "members"},
                            "rank": rank, "members": members, "member_count": len(members),
                            "positive_ratio": round(positive / len(members), 4),
@@ -425,43 +467,67 @@ def _stock_secid(code):
     return MN.stock_secid(code)
 
 
+def _concept_ref_fetch_lock(code):
+    with _concept_member_locks_guard:
+        return _concept_member_locks.setdefault("refs:" + str(code), threading.Lock())
+
+
 def _fetch_stock_concept_refs(code):
     """Fetch concept-board references for one stock, without inferring tags.
 
     ``slist`` is the inverse of the usual board->constituent endpoint.  It is
     deliberately used only for a very small set of strong leaders; doing this
     for the whole market would be both slow and prone to provider throttling.
+    A stock's board tags are reference data, so they are reused for a day
+    across rounds and processes; an empty answer is never cached.
     """
-    secid = _stock_secid(code)
-    if not secid:
+    def _fetch():
+        secid = _stock_secid(code)
+        if not secid:
+            return []
+        params = {
+            "forcect": "1", "spt": "3", "pi": "0", "pz": "200", "po": "1",
+            "fid": "f3", "fid0": "f4003", "fltt": "2", "invt": "2",
+            "secid": secid, "fields": "f12,f14,f3,f128", "ut": UT_FLOW,
+        }
+        for host in CLIST_HOSTS:
+            try:
+                payload = _get_json(f"https://{host}/api/qt/slist/get", params,
+                                    timeout=5, retries=0)
+                rows = ((payload or {}).get("data") or {}).get("diff") or []
+                refs = MP.parse_eastmoney_concept_refs(
+                    rows, excluded_tokens=_NON_THEME_CONCEPT_TOKENS,
+                )
+                if refs:
+                    return refs
+            except Exception:
+                continue
         return []
-    params = {
-        "forcect": "1", "spt": "3", "pi": "0", "pz": "200", "po": "1",
-        "fid": "f3", "fid0": "f4003", "fltt": "2", "invt": "2",
-        "secid": secid, "fields": "f12,f14,f3,f128", "ut": UT_FLOW,
-    }
-    for host in CLIST_HOSTS:
-        try:
-            payload = _get_json(f"https://{host}/api/qt/slist/get", params,
-                                timeout=5, retries=0)
-            rows = ((payload or {}).get("data") or {}).get("diff") or []
-            refs = MP.parse_eastmoney_concept_refs(
-                rows, excluded_tokens=_NON_THEME_CONCEPT_TOKENS,
-            )
-            if refs:
-                return refs
-        except Exception:
-            continue
-    return []
+
+    name = str(code)
+    if not name.isalnum():
+        return _fetch()
+    os.makedirs(CONCEPT_REFS_CACHE_DIR, exist_ok=True)
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, _concept_ref_fetch_lock(name),
+        f"concept_refs:{name}",
+        os.path.join(CONCEPT_REFS_CACHE_DIR, f"{name}.json"),
+        CONCEPT_REFERENCE_CACHE_TTL_SECONDS, _fetch,
+        lambda value: isinstance(value, list) and bool(value),
+    )
 
 
-def fetch_leader_concept_snapshot(leaders, max_leaders=3):
+def fetch_leader_concept_snapshot(leaders, max_leaders=3, quotes=None):
     """Map a few genuine intraday leaders back to complete concept boards.
 
     This closes the missing ``leader -> concept -> peer`` link.  A leader
     never becomes an automatically tradable candidate: the returned board is
     only discovery evidence for *other* constituents, which still require a
     fresh full-market quote, positive flow, volume and all execution gates.
+
+    ``quotes`` is the caller's live full-market snapshot.  Constituents come
+    from the daily membership cache and carry no quotes of their own, so the
+    positive ratio and active-peer count are computed from that snapshot.
     """
     leaders = [dict(row) for row in (leaders or []) if str(row.get("code") or "")]
     leaders = leaders[:max(1, min(int(max_leaders), 4))]
@@ -503,7 +569,7 @@ def fetch_leader_concept_snapshot(leaders, max_leaders=3):
         output = []
         for board_code, ref in refs_by_board.items():
             result = fetched.get(board_code) or {}
-            members = result.get("members") or []
+            members = _overlay_member_quotes(result.get("members") or [], quotes)
             member_codes = {str(member.get("code") or "") for member in members}
             linked_leaders = [leader_by_code[code] for code in ref["leader_codes"] if code in member_codes]
             if not result.get("complete") or len(members) < 5 or not linked_leaders:

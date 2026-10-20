@@ -6109,7 +6109,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         # 只负责发现，不能替代全市场实时价格与资金门禁。
         try:
             with PTM.phase("candidate.concept_source"):
-                concepts = dfc.fetch_hot_concept_snapshot(topn=6)
+                concepts = dfc.fetch_hot_concept_snapshot(topn=6, quotes=live_map)
         except Exception as exc:
             concepts = []
             concept_meta = {"version": CONCEPT_EXPANSION_LANE_VERSION,
@@ -6123,7 +6123,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         if reverse_leaders:
             try:
                 with PTM.phase("candidate.reverse_concept_source"):
-                    reverse_concepts = dfc.fetch_leader_concept_snapshot(reverse_leaders)
+                    reverse_concepts = dfc.fetch_leader_concept_snapshot(reverse_leaders, quotes=live_map)
             except Exception as exc:
                 reverse_error = f"{type(exc).__name__}: {exc}"
         # Preserve reverse-discovery evidence even when the board is already
