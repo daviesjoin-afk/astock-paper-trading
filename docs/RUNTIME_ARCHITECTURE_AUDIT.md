@@ -310,6 +310,22 @@ flowchart LR
 
 同日还暴露一个更值得记录的现场：东财分页全市场抓取被提供方拒绝，而健康检查使用的小请求仍成功，于是扫描静默回退到腾讯纯价格快照，全市场 `main_net` 与 `vol_ratio` 全为 `None`，领涨股门禁选不出任何标的，反向概念通道停摆约两小时。这段时间 `/api/health` 仍是 `status=fresh`、`provider_healthy=true`，唯一痕迹是一条"已重连并降级使用可用源"。现在每轮 `live_scan_gate` 审计并列记录已发布快照的服务方、是否为纯价格回退、以及携带资金流字段的行占比；两项都直接读已落盘载荷，不产生请求。纯价格回退是合法降级，但必须可见，否则依赖资金流的通道停摆后只能靠事后推断发现。此改动只增加观测，不改变任何取数、门禁或交易判断。
 
+## 快照溯源投影、SQLite 重建与指标补齐（2026-10-20）
+
+按路线图 S0 顺序继续 A03 / A04 / A13。先更正前一条记录里的一处判断：契约层其实**已经**把腾讯纯价格快照判为 `STATUS_DEGRADED` + `reason=price_only_coverage`（`market_data_service.py:184-220`），当时读到的 `status=fresh` 是东财恢复之后的读数，不能作为"健康页全程绿色"的证据。真实缺口窄得多：`snapshot_meta` 没有 `source`，也没有任何字段说明这些行是否带资金流。
+
+现在 `snapshot_meta` 增加 `source`、`price_only` 与 `flow_field_coverage`；`flow_field_coverage` 落在契约模块（`market_data_contract.flow_field_coverage`）作为唯一实现，扫描审计与健康投影共用。部署后实测：`source=eastmoney_clist_full_snapshot`、`price_only=false`、`flow_field_coverage=1.0`。15:20 东财再次被拒时，`/metrics` 立刻显示 `market_snapshot_price_only 1`、`flow_field_coverage 0.0`、`data_source_healthy 0`，正是本轮想要的可见性。
+
+A05 经复核已在主分支完成：`risk_audit` 的账号/等级/日期过滤与稳定游标全部下推到 SQL（`paper_trading.py:14597`），`test_risk_audit_pagination` 21 项覆盖页间不重不漏、窗口外日期可查与游标遍历，未做改动。
+
+A04 的真实关切不是 CVE-2025-6965（Debian 的 `3.40.1-2+deb12u2` 已回补，见 security-tracker），而是 E08 记录的 WAL-reset 缺陷：官方说明旧版本在特定并发写入与归并条件下可能损坏数据，修复进入 3.51.3 及后续版本，该 Debian 修订并未包含。因此镜像改为多阶段构建，从上游钉死的 amalgamation（3.54.1，SHA3-256 固定）重建运行时库，置于 `/usr/local/lib` 并让 `_sqlite3` 实际加载它；构建期断言运行时版本 ≥ 3.51，版本回退会在构建期失败。验证：加载路径为 `/usr/local/lib/libsqlite3.so.0`；8 写入者 × 200 事务的 WAL 并发冒烟 1600 行、`integrity ok`、零错误；95 项数据库相关测试在新引擎下通过；2.8 GiB 正式账本 `quick_check ok`（120.5 秒）。
+
+同时把备份的读取引擎也换成容器内版本：宿主 `sqlite3` CLI 是 3.34.1，比运行时库更旧，而备份读的正是正在写入的 WAL 库。`deploy/backup.sh` 优先用容器内 Python 的在线备份，容器不可用时才回退宿主 CLI 并写明引擎。实现时踩到一个坑：以 `mode=ro` 打开 WAL 库且挂载只读时，SQLite 无法创建 `-shm`，四项备份全部报 `unable to open database file`；改为可写挂载后四项均成功、`integrity ok`。
+
+A13 补齐指标：`/metrics` 增加最近一轮任务的年龄、墙钟耗时与失败标记，快照行数、纯价格标记与资金流覆盖率，以及运行时 SQLite 版本号。采集成本是一条索引查询加一条最新审计行，不做全表扫描、不解析大载荷、不触网。顺带修掉一个既有缺陷：`_safe_float` 的 NaN 判断写反（`return num if num != num else default`），导致每个有限读数都退回默认值——线上 `astock_process_rss_kb` 长期报 0，修复后为 174208。此条只改观测，不改任何交易判断。
+
+A02 的整轮 p95 仍未确认：缓存收益只在检测到领涨股的轮次可见，且东财在收盘前后再次降级，样本不足以给出 p95，需在下一个完整交易时段继续累积。
+
 ## 新版自然扫描首轮与稳态观测（2026-10-20）
 
 部署 `7af1b6a` 后四个角色容器重建（`created 2026-10-20T02:52:47Z`，即 10:52:47 +08:00），重启次数 0、无 OOM、健康检查 `ok`。以下全部取 `reports/scheduler.log` 中 `paper_slot_timing` 的自然 `intraday` 轮次，不包含任何合成任务。
