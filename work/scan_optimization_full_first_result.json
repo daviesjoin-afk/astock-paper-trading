@@ -1,0 +1,8 @@
+{
+  "tests": 6078,
+  "failures": 1,
+  "errors": 0,
+  "skipped": 11,
+  "elapsed_seconds": 706.067,
+  "python": "3.14.3"
+}
