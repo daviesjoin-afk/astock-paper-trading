@@ -1,0 +1,48 @@
+{
+  "status": "verified",
+  "runtime_commit": "8893f4c6fe336f3d65b169f709e4ac5c8654f8e8",
+  "previous_commit": "865e061a0368793febfbbf666602de3ed789eb34",
+  "backup_databases_verified": 4,
+  "schema_migration": false,
+  "ledger_counts": {
+    "paper_accounts": 5,
+    "paper_cycles": 11,
+    "paper_orders": 2795,
+    "paper_fills": 128,
+    "paper_position_lots": 46
+  },
+  "account_cycle_state_unchanged": true,
+  "endpoints": {
+    "/api/health": 200,
+    "/api/adaptive/ai/settings": 200,
+    "/metrics": 200
+  },
+  "verified_at": "2026-10-20T17:35:50",
+  "containers": [
+    {
+      "name": "astock-codex",
+      "running": true,
+      "restarts": 0,
+      "oom": false
+    },
+    {
+      "name": "astock-data-worker",
+      "running": true,
+      "restarts": 0,
+      "oom": false
+    },
+    {
+      "name": "astock-task-worker",
+      "running": true,
+      "restarts": 0,
+      "oom": false
+    },
+    {
+      "name": "astock-paper-worker",
+      "running": true,
+      "restarts": 0,
+      "oom": false
+    }
+  ],
+  "schedule_restored": true
+}
