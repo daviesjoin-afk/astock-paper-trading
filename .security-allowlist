@@ -123,3 +123,10 @@ value:f163b650680101f654c4e502deb51b9faf223a67218c760f8b614c6703e3c52b
 # though this release imports the sanitized final tree without that ancestry.
 value:697f565e4b2e8a553957d73b231cd9e784127dfa
 value:23ef095dddca45e29331000436c2426fd4c7ec9d
+
+# Public upstream SQLite archive checksum pinned in Dockerfile, not a credential.
+value:92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
+# Generic Git-for-Windows installation prefix in this branch's regression history.
+# The scanner stops at the space in the standard Program Files directory name;
+# this exact synthetic prefix contains no user, machine or project identity.
+value:C:/Program

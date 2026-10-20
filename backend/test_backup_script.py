@@ -17,7 +17,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASH = (str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe")
+BASH = ((str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+         if os.environ.get("ProgramFiles") else None)
         if os.name == "nt" else shutil.which("bash"))
 
 
