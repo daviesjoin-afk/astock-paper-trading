@@ -16,6 +16,9 @@ SCOPED = [
     "test_paper_candidate_scan.py", "test_microstructure_budget.py",
     "test_minute_trend_reuse.py", "test_alt_data_point_in_time.py",
     "test_provenance_inflight_change.py", "test_production_path_golden_replay.py",
+    "test_strategy_factor_requirements.py", "test_factor_calibration_v2.py",
+    "test_strategy_plugins.py", "test_strategy_invariant_matrix.py",
+    "test_api_strategies.py", "test_authoritative_position_consumers.py",
 ]
 RUNNER = """
 import contextlib, json, os, sys, time, unittest
@@ -46,6 +49,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="astock-scan-reuse-") as temporary:
         isolated = Path(temporary) / "source"
         isolated.mkdir()
+        (Path(temporary) / "data").mkdir()
+        (Path(temporary) / "reports").mkdir()
         for name in set(files) - {""}:
             source = ROOT / name
             if source.is_file():

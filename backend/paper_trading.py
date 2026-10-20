@@ -5731,11 +5731,17 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                     live_flow[_code] = _detail["main_pct"]
         except Exception:
             pass
+    with PTM.phase("candidate.evolution_read"):
+        selection_overlay = _adaptive_selection(account)
+    selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
+    scoring_factors = (None if spec.get("selection_mode") == "dsl"
+                       else S.scoring_factor_inputs(selection_model))
     with PTM.phase("candidate.factor_table"):
         table = S.build_factor_table(
             price_f, fund, sentiment=None,
             realtime_flow=live_flow,
             realtime_super_flow=live_super_flow,
+            scoring_factors=scoring_factors,
         )
     if live_universe is not None:
         # 日线技术指标/财务仍来自已下载的完整历史；当天可变字段必须由
@@ -5823,9 +5829,6 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             }
         )
         table["sentiment"] = F.zscore(heat_values).reindex(table.index).fillna(-1.5)
-    with PTM.phase("candidate.evolution_read"):
-        selection_overlay = _adaptive_selection(account)
-    selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
     if spec.get("selection_mode") == "dsl":
         # PR-35：声明式策略通道——同一份共享因子表，选股由编译后的 DSL
         # 完成（纯离线求值器），不再要求模型在 strategies.STRATEGIES 注册。
@@ -6237,6 +6240,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         "star_sector_impulse": list(star_sector_impulse.values())[:12],
         "security_scope": "仅沪深主板和创业板；科创板仅作同业映射信号",
         "selection_evolution": selection_overlay,
+        "scoring_factor_inputs": sorted(scoring_factors) if scoring_factors is not None else None,
         "raw_candidate_count": raw_candidate_count,
         "watch_pool": watch_pool_meta,
         "ignition_shadow_recorded": sum(

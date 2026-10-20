@@ -414,14 +414,32 @@ def _bottom_reversal_profile(table):
     }
 
 
+def scoring_factor_inputs(strategy_id):
+    """Known selectors declare scoring dependencies; extensions keep full input.
+
+    These are calibrated score factors, not raw facts, hard entry conditions or
+    the shared ranking/audit context. Adaptive weights retain the same key set.
+    """
+    if strategy_id in PAPER_WEIGHTS:
+        return frozenset(PAPER_WEIGHTS[strategy_id])
+    if strategy_id in {"reported_profit_breakout", "main_force_top10"}:
+        return frozenset()
+    return None
+
+
 def build_factor_table(
     price_f: pd.DataFrame,
     fund_f: pd.DataFrame,
     sentiment: dict = None,
     realtime_flow: dict = None,
     realtime_super_flow: dict = None,
+    *,
+    scoring_factors=None,
 ):
     """Merge factor sources while keeping alpha and evidence quality separate."""
+    requested = set(FC.FACTOR_GROUPS) if scoring_factors is None else set(scoring_factors)
+    if requested - set(FC.FACTOR_GROUPS):
+        raise ValueError("unknown calibrated scoring factor")
     idx = price_f.index.intersection(fund_f.index)
     table = pd.DataFrame(index=idx)
     price = price_f.loc[idx]
@@ -465,35 +483,38 @@ def build_factor_table(
 
     # Missing factor observations stay missing. Composite alpha renormalises
     # over observed components instead of silently replacing unknown with zero.
-    pe_z = F.zscore(pd.to_numeric(fund["pe"], errors="coerce") * -1, fill_missing=False)
-    pb_z = F.zscore(pd.to_numeric(fund["pb"], errors="coerce") * -1, fill_missing=False)
-    roe_z = F.zscore(fund["roe"], fill_missing=False)
-    profit_z = F.zscore(fund["profit_yoy"], fill_missing=False)
-    revenue_z = F.zscore(fund["rev_yoy"], fill_missing=False)
-    mom5_z = F.zscore(price["mom5"], fill_missing=False)
-    mom20_z = F.zscore(price["mom20"], fill_missing=False)
-    mom60_z = F.zscore(price["mom60"], fill_missing=False)
-
-    table["value"] = FC.weighted_available(
-        {"pe": pe_z, "pb": pb_z}, {"pe": 0.5, "pb": 0.5}, index=idx
-    )
-    table["quality"] = FC.weighted_available(
-        {"roe": roe_z, "profit": profit_z, "revenue": revenue_z},
-        {"roe": 0.5, "profit": 0.25, "revenue": 0.25},
-        index=idx,
-    )
+    if "value" in requested:
+        pe_z = F.zscore(pd.to_numeric(fund["pe"], errors="coerce") * -1, fill_missing=False)
+        pb_z = F.zscore(pd.to_numeric(fund["pb"], errors="coerce") * -1, fill_missing=False)
+        table["value"] = FC.weighted_available(
+            {"pe": pe_z, "pb": pb_z}, {"pe": 0.5, "pb": 0.5}, index=idx
+        )
+    if "quality" in requested:
+        roe_z = F.zscore(fund["roe"], fill_missing=False)
+        profit_z = F.zscore(fund["profit_yoy"], fill_missing=False)
+        revenue_z = F.zscore(fund["rev_yoy"], fill_missing=False)
+        table["quality"] = FC.weighted_available(
+            {"roe": roe_z, "profit": profit_z, "revenue": revenue_z},
+            {"roe": 0.5, "profit": 0.25, "revenue": 0.25},
+            index=idx,
+        )
     # Short and medium momentum are intentionally disjoint factor families.
-    table["mom_short"] = mom5_z
-    table["mom"] = FC.weighted_available(
-        {"mom20": mom20_z, "mom60": mom60_z},
-        {"mom20": 0.6, "mom60": 0.4},
-        index=idx,
-    )
-    table["volsurge"] = F.zscore(price["vol_surge"], fill_missing=False)
-    table["rsi"] = F.zscore(
-        pd.to_numeric(price["rsi14"], errors="coerce") * -1,
-        fill_missing=False,
-    )
+    if "mom_short" in requested:
+        mom5_z = F.zscore(price["mom5"], fill_missing=False)
+        table["mom_short"] = mom5_z
+    if "mom" in requested:
+        mom20_z = F.zscore(price["mom20"], fill_missing=False)
+        mom60_z = F.zscore(price["mom60"], fill_missing=False)
+        table["mom"] = FC.weighted_available(
+            {"mom20": mom20_z, "mom60": mom60_z},
+            {"mom20": 0.6, "mom60": 0.4}, index=idx,
+        )
+    if "volsurge" in requested:
+        table["volsurge"] = F.zscore(price["vol_surge"], fill_missing=False)
+    if "rsi" in requested:
+        table["rsi"] = F.zscore(
+            pd.to_numeric(price["rsi14"], errors="coerce") * -1, fill_missing=False,
+        )
 
     price_quality = pd.to_numeric(
         price.get("price_evidence_quality", pd.Series(FC.FULL_QUALITY, index=idx)),
@@ -502,22 +523,26 @@ def build_factor_table(
     table["adjustment_warning"] = price.get(
         "adjustment_warning", pd.Series(False, index=idx)
     ).reindex(idx).fillna(False).astype(bool)
-    table["mom_short_evidence_quality"] = price_quality.where(mom5_z.notna(), 0.0)
-    table["mom_evidence_quality"] = price_quality * (
-        mom20_z.notna().astype(float) * 0.6 + mom60_z.notna().astype(float) * 0.4
-    )
-    table["volsurge_evidence_quality"] = price_quality.where(
-        table["volsurge"].notna(), 0.0
-    )
-    table["rsi_evidence_quality"] = price_quality.where(table["rsi"].notna(), 0.0)
-    table["value_evidence_quality"] = (
-        pe_z.notna().astype(float) * 0.5 + pb_z.notna().astype(float) * 0.5
-    )
-    table["quality_evidence_quality"] = (
-        roe_z.notna().astype(float) * 0.5
-        + profit_z.notna().astype(float) * 0.25
-        + revenue_z.notna().astype(float) * 0.25
-    )
+    if "mom_short" in requested:
+        table["mom_short_evidence_quality"] = price_quality.where(mom5_z.notna(), 0.0)
+    if "mom" in requested:
+        table["mom_evidence_quality"] = price_quality * (
+            mom20_z.notna().astype(float) * 0.6 + mom60_z.notna().astype(float) * 0.4
+        )
+    if "volsurge" in requested:
+        table["volsurge_evidence_quality"] = price_quality.where(table["volsurge"].notna(), 0.0)
+    if "rsi" in requested:
+        table["rsi_evidence_quality"] = price_quality.where(table["rsi"].notna(), 0.0)
+    if "value" in requested:
+        table["value_evidence_quality"] = (
+            pe_z.notna().astype(float) * 0.5 + pb_z.notna().astype(float) * 0.5
+        )
+    if "quality" in requested:
+        table["quality_evidence_quality"] = (
+            roe_z.notna().astype(float) * 0.5
+            + profit_z.notna().astype(float) * 0.25
+            + revenue_z.notna().astype(float) * 0.25
+        )
 
     proxy_flow = F.zscore(price["flow_proxy"], fill_missing=False)
     if realtime_flow:
@@ -573,7 +598,8 @@ def build_factor_table(
         sentiment_raw = pd.Series({
             code: (sentiment.get(code) or {}).get("sentiment", np.nan) for code in idx
         })
-        table["sentiment"] = F.zscore(sentiment_raw, fill_missing=False)
+        table["sentiment"] = (F.zscore(sentiment_raw, fill_missing=False)
+                              if "sentiment" in requested else np.nan)
         table["sentiment_evidence_quality"] = table["sentiment"].notna().astype(float)
         table["sentiment_source"] = np.where(
             table["sentiment"].notna(), "实时人气榜", "unavailable"
