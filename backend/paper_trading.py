@@ -1925,6 +1925,7 @@ def init_db():
                 # v36 migration 只是升级路径，正常 bootstrap 若缺少它，第一次 selection
                 # 写入会直接 `no such table`。
                 PSM.ensure_candidate_selection(conn)
+                PSM.ensure_paper_metrics_indexes(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2254,6 +2255,7 @@ def init_db():
         # R36-C v36：selection report 追加表。与上面同样必须在这里幂等建表，否则正常
         # bootstrap 出来的库缺少 selection 表，第一次写入即 `no such table`。
         PSM.ensure_candidate_selection(conn)
+        PSM.ensure_paper_metrics_indexes(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

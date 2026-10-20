@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import time
+from pathlib import Path
 
 import data_fetcher as dfc
 
@@ -113,14 +114,14 @@ def _collect_paper_metrics():
     if not os.path.exists(path):
         return metrics
     try:
-        con = sqlite3.connect(path, timeout=2.0)
+        con = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error:
         return metrics
     try:
         con.row_factory = sqlite3.Row
         run = con.execute(
             "SELECT status, started_at, finished_at FROM paper_job_runs "
-            "ORDER BY started_at DESC LIMIT 1"
+            "ORDER BY started_at DESC, run_key DESC LIMIT 1"
         ).fetchone()
         if run is not None:
             started = _parse_stamp(run["started_at"])

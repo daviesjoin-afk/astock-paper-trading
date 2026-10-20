@@ -16,6 +16,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import metrics as MET  # noqa: E402
+import paper_schema_migrations as PSM  # noqa: E402
 
 
 def _stamp(moment):
@@ -53,6 +54,36 @@ class PaperMetricTests(unittest.TestCase):
             "strategy_version TEXT, strategy_checksum TEXT)"
         )
         con.commit()
+        con.close()
+
+    def test_latest_queries_use_indexes_without_sorting_and_migration_preserves_rows(self):
+        self._create()
+        con = sqlite3.connect(self._db)
+        con.executemany(
+            "INSERT INTO paper_job_runs(run_key,status,started_at) VALUES (?,?,?)",
+            [(f"intraday:{index:05}", "completed", "2026-10-20 10:00:00") for index in range(2000)],
+        )
+        con.executemany(
+            "INSERT INTO paper_audit(event,detail,created_at) VALUES (?,?,?)",
+            [("live_scan_gate", "{}", f"2026-10-{20-index % 10:02} 10:00:00") for index in range(2000)],
+        )
+        before = list(con.iterdump())
+        PSM.ensure_paper_metrics_indexes(con)
+        PSM.ensure_paper_metrics_indexes(con)
+        for sql, index in (
+            ("SELECT status,started_at,finished_at FROM paper_job_runs "
+             "ORDER BY started_at DESC,run_key DESC LIMIT 1", "idx_paper_job_runs_recent"),
+            ("SELECT detail FROM paper_audit WHERE event='live_scan_gate' "
+             "ORDER BY id DESC LIMIT 1", "idx_paper_audit_event_id"),
+        ):
+            plan = " ".join(str(tuple(row)) for row in con.execute("EXPLAIN QUERY PLAN " + sql))
+            self.assertIn(index, plan)
+            self.assertNotIn("TEMP B-TREE", plan)
+        self.assertEqual(con.execute(
+            "SELECT run_key FROM paper_job_runs ORDER BY started_at DESC,run_key DESC LIMIT 1"
+        ).fetchone()[0], "intraday:01999")
+        self.assertEqual([row for row in before if row.startswith("INSERT")],
+                         [row for row in con.iterdump() if row.startswith("INSERT")])
         con.close()
 
     def test_missing_database_reports_nothing(self):

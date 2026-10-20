@@ -1997,6 +1997,24 @@ def experiment_search_selection_report_ddl(table="experiment_search_selection_re
     )"""
 
 
+def ensure_paper_metrics_indexes(conn):
+    """v37: latest-row metric reads must not sort or scan growing task history."""
+    result = {}
+    for table, columns, name, expression in (
+        ("paper_job_runs", {"started_at", "run_key", "status", "finished_at"},
+         "idx_paper_job_runs_recent", "started_at DESC,run_key DESC,status,finished_at"),
+        ("paper_audit", {"event", "id"}, "idx_paper_audit_event_id", "event,id DESC"),
+    ):
+        # Minimal legacy databases may not contain the task/audit feature yet;
+        # bootstrap installs the index once its existing schema owner adds it.
+        if columns.issubset(table_columns(conn, table)):
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({expression})")
+            result[name] = "ok"
+        else:
+            result[name] = "schema_unavailable"
+    return result
+
+
 def ensure_candidate_selection(conn):
     """v36：创建 R36-C selection report 追加表（幂等，**不回填**）。
 
