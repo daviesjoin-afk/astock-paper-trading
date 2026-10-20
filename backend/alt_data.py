@@ -12,10 +12,12 @@ import json
 import os
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 
 import requests
+import paper_timing as PTM
 
 try:
     import pandas as pd
@@ -204,19 +206,29 @@ def fund_flow_trajectories(codes, asof_day=None, max_workers=6):
 
 
 def _micro_get(url, params, timeout=4):
-    """Fetch micro data with host rotation and curl TLS fallback."""
+    """Rotate hosts/transports within one shared retry budget.
+
+    requests' timeout measures socket inactivity, so this is an attempt budget,
+    not a promise to interrupt an already-running request at an exact deadline.
+    """
     urls = list(dict.fromkeys((
         url,
         url.replace("push2.eastmoney.com", "push2delay.eastmoney.com"),
         url.replace("push2.eastmoney.com", "push2his.eastmoney.com"),
     )))
+    # Preserve one existing requests host-rotation allowance (3 x 4s by default).
+    # curl can spend its remainder, rather than start a second full allowance.
+    deadline = time.monotonic() + len(urls) * timeout
     errors = []
     for endpoint in urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             response = requests.get(
                 endpoint, params=params,
                 headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"},
-                timeout=timeout,
+                timeout=min(timeout, remaining),
             )
             response.raise_for_status()
             data = (response.json() or {}).get("data") or {}
@@ -225,15 +237,19 @@ def _micro_get(url, params, timeout=4):
         except Exception as exc:
             errors.append(type(exc).__name__)
     for endpoint in urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
+            attempt_timeout = min(timeout + 1, remaining)
             completed = subprocess.run(
                 ["curl", "--http2", "--fail", "--silent", "--show-error",
-                 "--max-time", str(timeout + 1),
+                 "--max-time", str(attempt_timeout),
                  "--header", "Referer: https://quote.eastmoney.com/",
                  "--header", f"User-Agent: {UA}",
                  f"{endpoint}?{urlencode(params)}"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=timeout + 3, check=True,
+                timeout=attempt_timeout + 0.5, check=True,
             )
             data = (json.loads(completed.stdout) or {}).get("data") or {}
             if data:
@@ -243,6 +259,26 @@ def _micro_get(url, params, timeout=4):
     raise RuntimeError(f"micro data unavailable: {'/'.join(errors[-6:])}")
 
 
+@PTM.timed("microstructure.ticks")
+def _micro_ticks(code):
+    return _micro_get(TICK_DETAIL_URL, {
+        "secid": _eastmoney_secid(code), "pos": "-100", "iscca": "1",
+        "fields1": "f1,f2,f3,f4,f5", "fields2": "f51,f52,f53,f54,f55",
+        "ut": "fa5fd1943c7b386f172d6893dbbd1d0c",
+    })
+
+
+@PTM.timed("microstructure.trend")
+def _micro_trend(code):
+    return _micro_get(MINUTE_TREND_URL, {
+        "secid": _eastmoney_secid(code), "ndays": "1", "iscr": "0",
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "ut": "fa5fd1943c7b386f172d6893dbbd1d0c",
+    })
+
+
+@PTM.timed("microstructure.depth")
 def _tencent_depth(code):
     prefix = "sh" if str(code).startswith(("5", "6", "9")) else "sz"
     response = requests.get(
@@ -339,11 +375,7 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
         imbalance = None
         depth = {}
     try:
-        ticks = _micro_get(TICK_DETAIL_URL, {
-            "secid": _eastmoney_secid(code), "pos": "-100", "iscca": "1",
-            "fields1": "f1,f2,f3,f4,f5", "fields2": "f51,f52,f53,f54,f55",
-            "ut": "fa5fd1943c7b386f172d6893dbbd1d0c",
-        }).get("details") or []
+        ticks = _micro_ticks(code).get("details") or []
         active_buy = active_sell = neutral = 0.0
         for raw in ticks:
             values = raw.split(",") if isinstance(raw, str) else list(raw or [])
@@ -365,12 +397,7 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
         active_buy = active_sell = neutral = 0.0
         active_ratio = None
     try:
-        trend_data = _micro_get(MINUTE_TREND_URL, {
-            "secid": _eastmoney_secid(code), "ndays": "1", "iscr": "0",
-            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-            "ut": "fa5fd1943c7b386f172d6893dbbd1d0c",
-        })
+        trend_data = _micro_trend(code)
         trends = trend_data.get("trends") or []
         last = trends[-1].split(",") if trends and isinstance(trends[-1], str) else []
         last_price = float(last[1]) if len(last) > 1 else None
@@ -409,7 +436,7 @@ def market_microstructures(codes, asof_day=None, max_workers=5):
     unique = list(dict.fromkeys(str(code or "").zfill(6) for code in (codes or []) if code))
     output = {}
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique) or 1))) as pool:
-        futures = {pool.submit(market_microstructure, code, asof_day): code for code in unique}
+        futures = {pool.submit(PTM.bind_worker(market_microstructure), code, asof_day): code for code in unique}
         for future in as_completed(futures):
             code = futures[future]
             try:
