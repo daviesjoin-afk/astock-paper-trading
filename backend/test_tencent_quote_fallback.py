@@ -392,5 +392,59 @@ class RefreshFallbackTests(unittest.TestCase):
 
 
 
+class PublishedSnapshotProvenanceTests(unittest.TestCase):
+    """降级必须可见：审计里要能看出实际服务方与资金流字段是否缺失。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._path = os.path.join(self._tmp.name, "market_snapshot_full.json")
+        self._patch = mock.patch.object(dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH", self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, payload):
+        with open(self._path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_price_only_fallback_is_reported_as_such(self):
+        self._write({"source": MDSvc.TENCENT_SNAPSHOT_SOURCE, "saved_at": NOW.isoformat(),
+                     "complete": True, "rows": _codes(4100), "expected_rows": 4100})
+        provenance = dfc.full_market_snapshot_source()
+        self.assertEqual(provenance["source"], MDSvc.TENCENT_SNAPSHOT_SOURCE)
+        self.assertTrue(provenance["price_only"])
+        self.assertEqual(provenance["rows"], 4100)
+
+    def test_eastmoney_snapshot_is_not_reported_as_price_only(self):
+        self._write({"source": "eastmoney-clist", "saved_at": NOW.isoformat(),
+                     "complete": True, "rows": _codes(10), "expected_rows": 10})
+        provenance = dfc.full_market_snapshot_source()
+        self.assertEqual(provenance["source"], "eastmoney-clist")
+        self.assertFalse(provenance["price_only"])
+
+    def test_missing_or_unreadable_payload_reports_nothing(self):
+        self.assertIsNone(dfc.full_market_snapshot_source())
+        with open(self._path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        self.assertIsNone(dfc.full_market_snapshot_source())
+
+    def test_flow_field_coverage_separates_price_only_rows(self):
+        price_only = [{**_TencentRow.build(code)} for code in _codes(20)]
+        for row in price_only:
+            row.pop("main_net", None)
+            row.pop("vol_ratio", None)
+        self.assertEqual(0.0, PT._flow_field_coverage(price_only))
+
+        with_flow = [dict(row, main_net=1.0, vol_ratio=1.5) for row in price_only]
+        self.assertEqual(1.0, PT._flow_field_coverage(with_flow))
+
+        mixed = with_flow[:10] + price_only[:10]
+        self.assertEqual(0.5, PT._flow_field_coverage(mixed))
+        self.assertEqual(0.0, PT._flow_field_coverage([]))
+        self.assertEqual(0.0, PT._flow_field_coverage(None))
+
+
 if __name__ == "__main__":
     unittest.main()

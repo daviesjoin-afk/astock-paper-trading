@@ -911,6 +911,30 @@ def _full_snapshot_payload_is_complete(payload):
     return len(codes) >= max(_full_market_min_rows(), int(expected * 0.90))
 
 
+def full_market_snapshot_source():
+    """Report which provider actually served the published full snapshot.
+
+    The intraday health probe issues one small ``clist`` request, so it can
+    report a healthy Eastmoney source while the paged full-market fetch is
+    being refused and the scan silently falls back to a price-only slice.
+    Reading the published payload is the only way to see which one the scan
+    really got, and it costs no request.
+    """
+    try:
+        with open(MARKET_SNAPSHOT_FULL_CACHE_PATH, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "source": payload.get("source"),
+        "saved_at": payload.get("saved_at"),
+        "rows": len(payload.get("rows") or []),
+        "price_only": payload.get("source") == "tencent_public_quote_full_snapshot",
+    }
+
+
 def load_market_snapshot_full_cached():
     """Return the last persisted full-market snapshot rows.  Read-only, no network."""
     payload = load_market_snapshot_full_payload()
