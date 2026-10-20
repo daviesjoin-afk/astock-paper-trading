@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -185,10 +186,31 @@ class ConceptMemberCacheTests(unittest.TestCase):
             result = DF._fetch_concept_members("BK1138")
 
         self.assertEqual(result["members"], [{"code": "000001", "name": "甲", "industry": "设备"}])
-        with open(os.path.join(self._dir, "BK1138.json"), encoding="utf-8") as handle:
+        path = os.path.join(self._dir, "v%d-BK1138.json" % DF.CONCEPT_MEMBERS_CACHE_VERSION)
+        with open(path, encoding="utf-8") as handle:
             stored = json.load(handle)["value"]
         self.assertNotIn("pct", stored["members"][0])
         self.assertNotIn("price", stored["members"][0])
+
+    def test_previous_cache_shape_is_never_served(self):
+        os.makedirs(self._dir, exist_ok=True)
+        stale = {"version": 1, "fetched_epoch": time.time(),
+                 "value": {"members": [{"code": "000001", "name": "旧", "pct": 99.0}],
+                           "complete": True}}
+        with open(os.path.join(self._dir, "BK1138.json"), "w", encoding="utf-8") as handle:
+            json.dump(stale, handle)
+
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["board_code"])
+            return self._payload()
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            result = DF._fetch_concept_members("BK1138")
+
+        self.assertEqual(calls, ["BK1138"])
+        self.assertNotIn("pct", result["members"][0])
 
     def test_hot_concept_positive_ratio_uses_the_supplied_quotes(self):
         boards = [{"code": "BK1138", "name": "液冷服务器", "pct": 2.0, "main_net": 1000}]

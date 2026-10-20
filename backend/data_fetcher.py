@@ -50,6 +50,10 @@ CONCEPT_REFS_CACHE_DIR = data_paths.data_path("concept_refs")
 # and are therefore dropped before caching; callers overlay the round's own
 # live snapshot instead.
 CONCEPT_REFERENCE_CACHE_TTL_SECONDS = 86400
+# Bump when the stored shape changes. Earlier builds cached the whole provider
+# payload, quotes included; without a version boundary those files would be
+# served for a day as if they were membership-only entries.
+CONCEPT_MEMBERS_CACHE_VERSION = 2
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
@@ -396,8 +400,9 @@ def _fetch_concept_members(board_code, max_pages=8):
     os.makedirs(CONCEPT_MEMBERS_CACHE_DIR, exist_ok=True)
     return MDC.persistent_cached(
         _mem_cache, _cache_lock, _concept_member_fetch_lock(name),
-        f"concept_members:{name}",
-        os.path.join(CONCEPT_MEMBERS_CACHE_DIR, f"{name}.json"),
+        f"concept_members:v{CONCEPT_MEMBERS_CACHE_VERSION}:{name}",
+        os.path.join(CONCEPT_MEMBERS_CACHE_DIR,
+                     f"v{CONCEPT_MEMBERS_CACHE_VERSION}-{name}.json"),
         CONCEPT_REFERENCE_CACHE_TTL_SECONDS, _membership,
         lambda value: (isinstance(value, dict) and bool(value.get("complete"))
                        and bool(value.get("members"))),
