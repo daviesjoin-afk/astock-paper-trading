@@ -1,7 +1,7 @@
 #!/bin/bash
 # A股模拟盘每日自动备份：SQLite 在线备份 + 关键配置，保留 N 天
 # 用法：backup.sh [--keep 7]
-# 在宿主机执行（不需要容器权限），SQLite .backup 保证一致性且不锁主库。
+# 在宿主机执行；优先使用容器内 SQLite 的在线备份，保持一致性。
 # 项目目录自动探测：优先 /opt/astock-codex（开源部署），回退 /root/codex（腾讯云单机）。
 set -euo pipefail
 
@@ -38,10 +38,11 @@ backup_one_db() {
   local src="$1" dst="$2"
   if command -v docker >/dev/null 2>&1 && docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1; then
     if docker run --rm --user root \
-        -v "$(dirname "$src"):/backup-src:ro" \
+        -v "$(dirname "$src"):/backup-src" \
         -v "$(dirname "$dst"):/backup-dst" \
         --entrypoint python "$BACKUP_IMAGE" -c \
         'import sqlite3, sys
+# WAL 读取可能需要创建/维护 -shm，因此目录必须可写；连接本身仍只读。
 src = "file:/backup-src/" + sys.argv[1] + "?mode=ro"
 live = sqlite3.connect(src, uri=True)
 copy = sqlite3.connect("/backup-dst/" + sys.argv[2])
