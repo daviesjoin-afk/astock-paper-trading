@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import contextvars
+import datetime as dt
 import functools
 import json
 import os
 import sys
 import time
+import threading
 import uuid
 from contextlib import contextmanager
 
@@ -21,6 +23,9 @@ _CURRENT = contextvars.ContextVar("paper_timing", default=None)
 class _Record:
     def __init__(self, slot):
         self.started = time.perf_counter()
+        self.started_at = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
+        self.runtime_commit = os.environ.get("ASTOCK_GIT_COMMIT", "unknown")
+        self.lock = threading.Lock()
         self.attempt_id = uuid.uuid4().hex
         self.slot = str(slot)
         self.identity = {}
@@ -57,13 +62,30 @@ def phase(name):
     finally:
         elapsed = max(0.0, time.perf_counter() - started)
         cpu_elapsed = max(0.0, time.thread_time() - cpu_started)
-        item = record.stages.setdefault(name, {
-            "seconds": 0.0, "thread_cpu_seconds": 0.0, "calls": 0, "errors": 0,
-        })
-        item["seconds"] += elapsed
-        item["thread_cpu_seconds"] += cpu_elapsed
-        item["calls"] += 1
-        item["errors"] += int(failed)
+        with record.lock:
+            item = record.stages.setdefault(name, {
+                "seconds": 0.0, "thread_cpu_seconds": 0.0, "calls": 0, "errors": 0,
+            })
+            item["seconds"] += elapsed
+            item["thread_cpu_seconds"] += cpu_elapsed
+            item["calls"] += 1
+            item["errors"] += int(failed)
+
+
+def bind_worker(func):
+    """Share timing only with a worker; never inherit leases or DB contexts."""
+    record = _CURRENT.get()
+    if record is None:
+        return func
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        token = _CURRENT.set(record)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _CURRENT.reset(token)
+    return wrapped
 
 
 def timed(name):
@@ -81,15 +103,18 @@ def snapshot(scope):
     record = _CURRENT.get()
     if record is None:
         return {}
-    result = {
-        "version": 1, "attempt_id": record.attempt_id, "slot": record.slot,
-        "scope": scope, "identity": dict(record.identity),
-        "elapsed_seconds": round(max(0.0, time.perf_counter() - record.started), 6),
-        "stages": {
+    with record.lock:
+        stages = {
             name: {**value, "seconds": round(value["seconds"], 6),
                    "thread_cpu_seconds": round(value["thread_cpu_seconds"], 6)}
             for name, value in record.stages.items()
-        },
+        }
+    result = {
+        "version": 1, "attempt_id": record.attempt_id, "slot": record.slot,
+        "scope": scope, "identity": dict(record.identity),
+        "started_at": record.started_at, "runtime_commit": record.runtime_commit,
+        "elapsed_seconds": round(max(0.0, time.perf_counter() - record.started), 6),
+        "stages": stages,
     }
     # 只代表主机 paper-scan.lock 的等待；外层 cron 锁、Docker 启动不在此内。
     try:

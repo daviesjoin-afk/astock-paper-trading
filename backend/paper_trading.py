@@ -12493,6 +12493,10 @@ def monitor_intraday(asof_datetime=None, force=False):
     # 快照溯源与资金流字段覆盖率一并记录：纯价格回退是合法降级，但必须可见，
     # 否则健康检查仍然全绿，而概念扩散等依赖资金流的通道已经静默停摆。
     flow_coverage = MDC.flow_field_coverage(live_universe)
+    snapshot_source = dfc.full_market_snapshot_source() or {}
+    PTM.bind_job(snapshot_source=snapshot_source.get("source", "unknown"),
+                 snapshot_price_only=snapshot_source.get("price_only"),
+                 snapshot_flow_coverage=flow_coverage, scan_ready=live_gate["ready"])
     try:
         with _db() as gate_conn:
             _audit(gate_conn, None, "live_scan_gate", _json({

@@ -18,6 +18,26 @@ import paper_timing as timing
 
 
 class TimingTests(unittest.TestCase):
+    def test_explicit_worker_binding_collects_timing_without_other_contexts(self):
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+        private = contextvars.ContextVar("private_lease", default=None)
+        token = private.set("must-stay-in-owner")
+        def worker():
+            with timing.phase("microstructure.depth"):
+                return private.get()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), timing.capture("intraday"):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(timing.bind_worker(worker)) for _ in range(40)]
+                    self.assertEqual([future.result() for future in futures], [None] * 40)
+                snap = timing.snapshot("test")
+                self.assertEqual(snap["stages"]["microstructure.depth"]["calls"], 40)
+                self.assertIn("+08:00", snap["started_at"])
+                self.assertIn("runtime_commit", snap)
+        finally:
+            private.reset(token)
+
     def test_quote_phases_keep_same_source_guard_and_failure_evidence(self):
         import datetime as dt
         import paper_trading as paper
