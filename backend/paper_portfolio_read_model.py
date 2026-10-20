@@ -128,6 +128,11 @@ def snapshot_read(func):
     def capture(conn, *args, **kwargs):
         if not conn.in_transaction:
             return func(conn, *args, **kwargs)
+        scope = _snapshot_reads.get()
+        if scope is not None and scope[0] is conn:
+            # Nested pure reads belong to the same capture, not a new decision.
+            # Evidence reads still invalidate the bucket after local writes.
+            return func(conn, *args, **kwargs)
         token = _snapshot_reads.set((conn, conn.total_changes, {}))
         try:
             return func(conn, *args, **kwargs)
@@ -655,6 +660,24 @@ def _reused_source_orders(lots) -> set[int]:
     return {order_id for order_id, count in counts.items() if count > 1}
 
 
+@_snapshot_evidence
+def _source_buy_fill_rows(conn, order_id: int, source_fill_id: int | None):
+    # Cache only raw rows for exact immutable IDs within this capture. Each
+    # consumer must still validate its own lot identity, quantity and lineage.
+    suffix = " AND f.id=?" if source_fill_id is not None else " ORDER BY f.id"
+    params = ((order_id, source_fill_id) if source_fill_id is not None else (order_id,))
+    return _row_dicts(conn.execute(
+        "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
+        "       f.account_id AS fill_account_id, f.side AS fill_side,"
+        "       f.code AS fill_code, f.fill_date,"
+        "       o.account_id AS order_account_id, o.side AS order_side,"
+        "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
+        "       o.execution_status, o.execution_verified, o.executed_at"
+        "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+        " WHERE f.order_id=?" + suffix, params,
+    ))
+
+
 def _verified_source_buy_fill(conn, lot: Mapping, *,
                               reused_sources: set[int] | None = None) -> dict | None:
     """Return a fully matching verified BUY fill for one durable lot.
@@ -679,34 +702,9 @@ def _verified_source_buy_fill(conn, lot: Mapping, *,
     if reused_sources and order_id in reused_sources:
         return None
     source_fill_id = _known_int(lot.get("source_fill_id"))
-    if source_fill_id is not None:
-        # 有逐笔血缘：直接定位那一笔流水，不再要求"订单只有一笔"。
-        row = conn.execute(
-            "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
-            "       f.account_id AS fill_account_id, f.side AS fill_side,"
-            "       f.code AS fill_code, f.fill_date,"
-            "       o.account_id AS order_account_id, o.side AS order_side,"
-            "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
-            "       o.execution_status, o.execution_verified, o.executed_at"
-            "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-            " WHERE f.order_id=? AND f.id=?",
-            (order_id, source_fill_id),
-        ).fetchall()
-    else:
-        row = conn.execute(
-            "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
-            "       f.account_id AS fill_account_id, f.side AS fill_side,"
-            "       f.code AS fill_code, f.fill_date,"
-            "       o.account_id AS order_account_id, o.side AS order_side,"
-            "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
-            "       o.execution_status, o.execution_verified, o.executed_at"
-            "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-            " WHERE f.order_id=? ORDER BY f.id",
-            (order_id,),
-        ).fetchall()
-        # 没有逐笔血缘的 legacy lot：多笔成交的订单无法证明出资关系。
-        if len(row) != 1:
-            return None
+    # Exact lineage reads that fill only. Legacy order lineage still requires
+    # exactly one fill; sharing raw rows must never share the lot's verdict.
+    row = _source_buy_fill_rows(conn, order_id, source_fill_id)
     if len(row) != 1:
         return None
     row = dict(row[0])
