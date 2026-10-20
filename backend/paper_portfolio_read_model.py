@@ -336,6 +336,9 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
     if account_id:
         account_sql = " AND o.account_id=?"
         params.append(str(account_id))
+    # Bound the join's work to actual fills. SQLite CROSS JOIN preserves the
+    # left-to-right loop order; ON and every evidence predicate stay intact.
+    # Starting with terminal orders otherwise reads wide, fill-less intents.
     rows = _row_dicts(conn.execute(
         "SELECT f.id AS fill_id, f.order_id, f.account_id AS fill_account_id,"
         "       f.side AS fill_side, f.code AS fill_code, f.qty AS fill_qty,"
@@ -345,7 +348,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
         "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
         "       o.execution_status, o.execution_verified, o.realized_pnl,"
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
-        "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+        "  FROM paper_fills f CROSS JOIN paper_orders o ON o.id=f.order_id"
         " WHERE o.cycle_id=? AND o.side='sell' AND " + EV.FILL_CARRYING_PREDICATE +
         "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
@@ -442,7 +445,7 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
         "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
         "       o.execution_status, o.execution_verified, o.realized_pnl,"
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
-        "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+        "  FROM paper_fills f CROSS JOIN paper_orders o ON o.id=f.order_id"
         " WHERE o.cycle_id=? AND o.side='buy' AND " + EV.FILL_CARRYING_PREDICATE +
         "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"

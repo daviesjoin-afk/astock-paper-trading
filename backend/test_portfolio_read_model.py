@@ -24,6 +24,21 @@ DAY = dt.date(2026, 9, 20)
 NEXT = DAY + dt.timedelta(days=1)
 
 
+class _FillQueryCapture:
+    def __init__(self, conn):
+        self.conn = conn
+        self.sql = None
+        self.params = None
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+    def execute(self, sql, params=()):
+        if "SELECT f.id AS fill_id" in sql and "JOIN paper_orders o" in sql:
+            self.sql, self.params = sql, params
+        return self.conn.execute(sql, params)
+
+
 class PortfolioReadModelContractTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -105,6 +120,73 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         context = P.PortfolioReadContext(cycle_id=str(self.cycle100), asof_day=DAY.isoformat())
         self.assertEqual(context.cycle_id, self.cycle100)
         self.assertEqual(context.asof_day, DAY)
+
+    def test_fill_join_keeps_contradictory_rows_and_cycle_date_bounds(self):
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        for side, reader in (("buy", P._buy_fills), ("sell", P._sell_fills)):
+            with self.subTest(side=side):
+                valid = self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                             price=10.0, fill_date=DAY.isoformat())
+                conflicting = self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                                   price=10.0, fill_date=DAY.isoformat())
+                self.conn.execute("UPDATE paper_fills SET side=? WHERE order_id=?",
+                                  ("sell" if side == "buy" else "buy", conflicting))
+                self._order_and_fill(cycle_id=self.cycle101, side=side, qty=100,
+                                     price=10.0, fill_date=DAY.isoformat())
+                self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                     price=10.0, fill_date=NEXT.isoformat())
+                capture = _FillQueryCapture(self.conn)
+                changes = self.conn.total_changes
+                proven, raw, available = reader(capture, context, account_id=ACCOUNT)
+                reference = [dict(row) for row in self.conn.execute(
+                    capture.sql.replace("CROSS JOIN paper_orders o", "JOIN paper_orders o"),
+                    capture.params,
+                )]
+                self.assertEqual(raw, reference)
+                self.assertEqual({r["order_id"] for r in raw}, {valid, conflicting})
+                self.assertEqual([r["order_id"] for r in proven], [valid])
+                self.assertTrue(available)
+                self.assertEqual(self.conn.total_changes, changes)
+
+    def test_sparse_fill_read_work_does_not_grow_with_unfilled_orders(self):
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        for side in ("buy", "sell"):
+            self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                 price=10.0, fill_date=DAY.isoformat())
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        self.conn.executemany(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,cycle_id,strategy_id,strategy_version,"
+            "strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(ACCOUNT, side, CODE, "fixture", 100, 10.0, "risk_rejected", "fixture",
+              "x" * 1024, DAY.isoformat(), self.cycle100, *stamp)
+             for side in ("buy", "sell") for _ in range(1000)],
+        )
+        self.conn.commit()
+        for side, reader in (("buy", P._buy_fills), ("sell", P._sell_fills)):
+            with self.subTest(side=side):
+                capture = _FillQueryCapture(self.conn)
+                reader(capture, context)
+                steps = [0]
+
+                def tick(steps=steps):
+                    steps[0] += 1
+                    return 0
+
+                self.conn.set_progress_handler(tick, 1)
+                try:
+                    actual = [dict(r) for r in self.conn.execute(capture.sql, capture.params)]
+                finally:
+                    self.conn.set_progress_handler(None, 0)
+                reference = [dict(row) for row in self.conn.execute(
+                    capture.sql.replace("CROSS JOIN paper_orders o", "JOIN paper_orders o"),
+                    capture.params,
+                )]
+                self.assertEqual(actual, reference)
+                self.assertEqual(len(actual), 1)
+                # SQLite VM work, not a fragile wall-clock assertion. The two
+                # fills must drive the read even with 2,000 fill-less intents.
+                self.assertLess(steps[0], 1000)
 
     def test_snapshot_reuses_proof_without_changing_facts_or_mutable_results(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
