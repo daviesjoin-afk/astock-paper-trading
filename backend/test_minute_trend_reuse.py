@@ -54,11 +54,12 @@ class MinuteTrendReuseTests(unittest.TestCase):
             fetch.assert_called_once_with(self.code)
 
     def test_failure_and_empty_response_do_not_hide_a_later_recovery(self):
-        with mock.patch.object(AD, "_micro_trend", side_effect=[TimeoutError, {}, self.raw]) as fetch:
+        with mock.patch.object(AD, "_micro_trend", side_effect=[TimeoutError, {}, {"trends": ["malformed"]}, self.raw]) as fetch:
+            self.assertEqual(AD.minute_trend_series(self.code, self.day), [])
             self.assertEqual(AD.minute_trend_series(self.code, self.day), [])
             self.assertEqual(AD.minute_trend_series(self.code, self.day), [])
             self.assertEqual(len(AD.minute_trend_series(self.code, self.day)), 2)
-            self.assertEqual(fetch.call_count, 3)
+            self.assertEqual(fetch.call_count, 4)
 
     def test_historical_requests_never_consume_live_cache_and_raw_copies_are_isolated(self):
         with mock.patch.object(AD, "_micro_trend", return_value=self.raw) as fetch:

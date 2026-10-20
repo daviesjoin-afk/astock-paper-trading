@@ -287,7 +287,14 @@ def _minute_trend_payload(code, asof_iso, ttl_seconds):
         return deepcopy(hit[1]), hit[0]
     started_at = dt.datetime.now()
     value = _micro_trend(code)
-    if value.get("trends"):
+    trends = value.get("trends")
+    try:
+        last = trends[-1].split(",") if isinstance(trends, list) and trends else []
+        reusable = (len(last) >= 5 and float(last[1]) > 0 and float(last[2]) > 0
+                    and float(last[3]) >= 0 and float(last[4]) >= 0)
+    except (AttributeError, TypeError, ValueError):
+        reusable = False
+    if reusable:
         _store(key, deepcopy(value), stored_at=started_at)
     return value, started_at
 
