@@ -534,6 +534,15 @@ def market_health_projection(*, now: Any) -> dict[str, Any]:
             "complete": bool(
                 reading.snapshot.complete if reading.snapshot is not None else False
             ),
+            # 行覆盖完整只说明代码齐全。服务方与资金流字段覆盖率一并投影，
+            # 让"纯价格回退"这种合法降级在数据有效性明细里直接可读，
+            # 而不必让操作员从 reason 反推是哪一类单源。
+            "source": reading.snapshot.source if reading.snapshot is not None else None,
+            "price_only": bool(
+                reading.snapshot is not None
+                and reading.snapshot.degraded_reason == MDC.REASON_PRICE_ONLY_COVERAGE
+            ),
+            "flow_field_coverage": MDC.flow_field_coverage(rows),
         },
         # provider/系统健康：诊断语义，普通运行页面默认不展示细节。
         "provider_health": {

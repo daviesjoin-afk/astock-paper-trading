@@ -12246,26 +12246,6 @@ def _live_scan_gate(live_universe, expected_day):
     }
 
 
-def _flow_field_coverage(rows):
-    """Share of live rows carrying the flow fields the candidates need.
-
-    A price-only fallback snapshot is a legitimate degraded mode, but it is
-    indistinguishable from a healthy cross-section once the rows are in hand.
-    Recording this ratio next to the coverage gate is what makes that
-    degradation visible instead of leaving it to be inferred later from a
-    discovery lane that silently found nothing.
-    """
-    total = 0
-    with_flow = 0
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        total += 1
-        if row.get("main_net") is not None and row.get("vol_ratio") is not None:
-            with_flow += 1
-    return round(with_flow / total, 4) if total else 0.0
-
-
 @PTM.timed("fast_entry_scan")
 def monitor_fast_entries(asof_datetime=None, force=False):
     """每 30 秒复核少量候选；只确认并排队，不直接创建委托。"""
@@ -12510,7 +12490,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     # 门禁决策每轮落审计：杜绝“静默全停”，正是候选冻结能潜伏 27 小时未被发现的根因。
     # 快照溯源与资金流字段覆盖率一并记录：纯价格回退是合法降级，但必须可见，
     # 否则健康检查仍然全绿，而概念扩散等依赖资金流的通道已经静默停摆。
-    flow_coverage = _flow_field_coverage(live_universe)
+    flow_coverage = MDC.flow_field_coverage(live_universe)
     try:
         with _db() as gate_conn:
             _audit(gate_conn, None, "live_scan_gate", _json({
