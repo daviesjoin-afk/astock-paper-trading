@@ -20,7 +20,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from copy import deepcopy
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -31,7 +30,7 @@ import market_data_contract as MDC
 import market_data_service as MDSvc
 import decision_engine as DE
 import factors as F
-import paper_candidate_inputs as PCI
+import paper_candidate_scan as PCScan
 import strategies as S
 import universe as U
 import risk_center as RC
@@ -10863,54 +10862,11 @@ def _bootstrap_cooled_candidates(conn, account_id, candidates, day):
 
 
 def _bootstrap_candidate_evidence(accounts, precomputed_candidates, day):
-    """Collect per-account news and one shared quote batch outside the writer."""
-    bootstrap_evidence = {}
-    for account in accounts:
-        precomputed = precomputed_candidates.get(account["id"], ([], {}))
-        if precomputed[1].get("blocked"):
-            continue
-        # 冷却过滤会决定最终候选集合，而冷却查询需要账本 —— 但它只读，因此用
-        # 只读连接在写事务之前完成，使「为哪些候选取证」与后面「实际审批哪些
-        # 候选」使用同一个集合。
-        with _db_readonly() as evidence_conn:
-            with PTM.phase("candidate.cooldown_read"):
-                cooled = _bootstrap_cooled_candidates(
-                    evidence_conn, account["id"], precomputed[0], day,
-                )
-        names = {pick["code"]: pick.get("name") or pick["code"]
-                 for pick in cooled["candidates"]}
-        try:
-            with PTM.phase("candidate.news_source"):
-                news = _news_for(names) if names else []
-        except Exception:
-            news = []
-        bootstrap_evidence[account["id"]] = {
-            "cooled": cooled, "names": names, "news": news,
-        }
-    # Collect the union before touching the writer. Quote envelopes still pass
-    # the existing independent-source and freshness checks; missing rows remain
-    # missing. Fetch quotes last so per-account news work cannot age them first.
-    quote_codes = list(dict.fromkeys(
-        code for evidence in bootstrap_evidence.values() for code in evidence["names"]
+    """Compatibility entry; collection order belongs to the candidate scan service."""
+    return PCScan.collect_evidence(accounts, precomputed_candidates, day, ports=PCScan.EvidencePorts(
+        open_readonly=_db_readonly, cooled_candidates=_bootstrap_cooled_candidates,
+        news=_news_for, sector_flow=dfc.fetch_sector_flow, quotes=_quotes,
     ))
-    try:
-        with PTM.phase("candidate.sector_source"):
-            sector_flow = dfc.fetch_sector_flow("industry") if bootstrap_evidence else []
-    except Exception:
-        sector_flow = []
-    try:
-        with PTM.phase("candidate.quote_source"):
-            quotes = (_quotes(quote_codes) or {}) if quote_codes else {}
-    except Exception:
-        quotes = {}
-    if not isinstance(quotes, dict):
-        quotes = {}
-    for evidence in bootstrap_evidence.values():
-        evidence["quotes"] = {
-            code: deepcopy(quotes[code]) for code in evidence["names"] if code in quotes
-        }
-        evidence["sector_flow"] = deepcopy(sector_flow)
-    return bootstrap_evidence
 
 
 @PTM.timed("candidate_bootstrap")
@@ -10978,37 +10934,23 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # never hold the SQLite writer or delay risk exits/API reads.
     with _db() as account_conn:
         accounts = _active_account_rows(account_conn, status="running")
-    precomputed_candidates = {}
-    micro_codes = []
-    shared_inputs = PCI.CandidateScanInputs(F.live_snapshot_asof())
-    for account in accounts:
-        try:
-            with PTM.phase("candidate.rows"):
-                rows, meta = _candidate_rows(
-                    account, factor_day, market, sector_rows=sector_rows,
-                    live_universe=live_universe, live_asof_date=day,
-                    shared_inputs=shared_inputs,
-                )
-        except Exception as exc:
-            rows, meta = [], {"blocked": True, "reason": f"候选生成失败：{type(exc).__name__}: {exc}"}
-        precomputed_candidates[account["id"]] = (rows, meta)
-        preliminary = _prioritize_live_candidate_budget(rows, account["id"], limit=6)
-        micro_codes.extend(str(item.get("code") or "") for item in preliminary if item.get("code"))
-    try:
-        with PTM.phase("candidate.microstructure_source"):
-            global_microstructure_map = (
-                AD.market_microstructures(micro_codes, asof_day=day)
-                if AD is not None else {}
-            )
-    except Exception:
-        global_microstructure_map = {}
+    prepared = PCScan.prepare(
+        accounts, factor_day=factor_day, day=day, market=market, sector_rows=sector_rows,
+        live_universe=live_universe, snapshot_asof=F.live_snapshot_asof(),
+        ports=PCScan.PreparationPorts(
+            candidate_rows=_candidate_rows, prioritize=_prioritize_live_candidate_budget,
+            microstructures=lambda codes, **kwargs: AD.market_microstructures(codes, **kwargs) if AD is not None else {},
+            collect_evidence=_bootstrap_candidate_evidence,
+        ),
+    )
+    precomputed_candidates = prepared.rows_by_account
+    global_microstructure_map = prepared.microstructures
     # R25：bootstrap 与 close 路径必须同形 —— provider/网络证据在**写事务之外**
     # 收集完成，写锁内只做校验、决策与落库。此前 ``_quotes`` / ``_news_for`` /
     # ``fetch_sector_flow`` 在 ``_db()`` 内被逐账户调用：那不仅让每个账户各付一次
     # 网络延迟（写锁被持有），而且一次慢源就能阻塞成交、风控退出与页面读取数分钟。
     # 证据按账户预取一次，写事务内只读这份快照。
-    with PTM.phase("candidate.evidence"):
-        bootstrap_evidence = _bootstrap_candidate_evidence(accounts, precomputed_candidates, day)
+    bootstrap_evidence = prepared.evidence_by_account
     with PTM.phase("candidate.writer"), _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
         for account in accounts:
@@ -12507,7 +12449,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 "required_codes": live_gate["required_codes"],
                 "reason": scan_block,
                 "snapshot": {
-                    **(dfc.full_market_snapshot_source() or {}),
+                    **snapshot_source,
                     "flow_field_coverage": flow_coverage,
                     "flow_fields_missing": flow_coverage <= 0.0,
                 },
