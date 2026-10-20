@@ -72,6 +72,38 @@ class SharedFundamentalTests(unittest.TestCase):
             self.assertEqual(compute.call_count, 2)
 
 
+class SourceSnapshotTests(unittest.TestCase):
+    def test_usable_sources_read_once_and_copies_do_not_leak_between_strategies(self):
+        universe = [{"code": "600001", "facts": {"risk": 0}}]
+        finance = {"data": {"600001": {"profit_yoy": 20.}}}
+        load_universe, load_finance = mock.Mock(return_value=universe), mock.Mock(return_value=finance)
+        shared = PCI.CandidateScanInputs("2026-10-20T10:00:00+08:00")
+        first_u, first_f = shared.universe(load_universe), shared.finance(load_finance)
+        first_u[0]["facts"]["risk"] = 1
+        first_f["data"]["600001"]["profit_yoy"] = -100
+        self.assertEqual(shared.universe(load_universe), universe)
+        self.assertEqual(shared.finance(load_finance), finance)
+        self.assertEqual(load_universe.call_count, 1)
+        self.assertEqual(load_finance.call_count, 1)
+        next_round = PCI.CandidateScanInputs("2026-10-20T10:03:00+08:00")
+        next_round.universe(load_universe)
+        next_round.finance(load_finance)
+        self.assertEqual(load_universe.call_count, 2)
+        self.assertEqual(load_finance.call_count, 2)
+
+    def test_failures_and_empty_sources_can_recover_within_round(self):
+        shared = PCI.CandidateScanInputs("now")
+        for method, empty, usable in ((shared.universe, [], [{"code": "600001"}]),
+                                      (shared.finance, {"data": {}}, {"data": {"600001": {"pe": 8}}})):
+            loader = mock.Mock(side_effect=[TimeoutError, empty, usable])
+            with self.assertRaises(TimeoutError):
+                method(loader)
+            self.assertEqual(method(loader), empty)
+            self.assertEqual(method(loader), usable)
+            self.assertEqual(method(loader), usable)
+            self.assertEqual(loader.call_count, 3)
+
+
 class BatchedCandidateEvidenceTests(unittest.TestCase):
     def collect(self, *, fail=False):
         accounts = [{"id": key} for key in ("a", "b", "blocked")]

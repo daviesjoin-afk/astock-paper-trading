@@ -8,6 +8,7 @@
 - 仅 HTTP requests，无新依赖。
 """
 import datetime as dt
+from copy import deepcopy
 import json
 import os
 import subprocess
@@ -278,6 +279,19 @@ def _micro_trend(code):
     })
 
 
+def _minute_trend_payload(code, asof_iso, ttl_seconds):
+    """Share successful raw data without renewing its original cache age."""
+    key = f"minute_trend_raw:{asof_iso}:{code}"
+    hit = _cached_entry(key, ttl_seconds)
+    if hit is not None:
+        return deepcopy(hit[1]), hit[0]
+    started_at = dt.datetime.now()
+    value = _micro_trend(code)
+    if value.get("trends"):
+        _store(key, deepcopy(value), stored_at=started_at)
+    return value, started_at
+
+
 @PTM.timed("microstructure.depth")
 def _tencent_depth(code):
     prefix = "sh" if str(code).startswith(("5", "6", "9")) else "sz"
@@ -315,12 +329,7 @@ def minute_trend_series(code, asof_day=None, ttl_seconds=90):
     if hit is not None:
         return hit
     try:
-        trend_data = _micro_get(MINUTE_TREND_URL, {
-            "secid": _eastmoney_secid(code), "ndays": "1", "iscr": "0",
-            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-            "ut": "fa5fd1943c7b386f172d6893dbbd1d0c",
-        })
+        trend_data, fetched_at = _minute_trend_payload(code, asof_iso, ttl_seconds)
         rows = []
         for raw in (trend_data.get("trends") or []):
             values = raw.split(",") if isinstance(raw, str) else list(raw or [])
@@ -338,7 +347,7 @@ def minute_trend_series(code, asof_day=None, ttl_seconds=90):
                 continue
         rows = [row for row in rows if row["price"] > 0 and row["volume"] >= 0]
         if rows:
-            _store(key, rows)
+            _store(key, rows, stored_at=fetched_at)
         return rows
     except Exception:
         return []
@@ -362,6 +371,7 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
         return hit
     result = {"status": "source_unavailable", "code": code,
               "score_applied": False, "grade": "public_quote_shadow"}
+    evidence_started_at = dt.datetime.now()
     errors = []
     try:
         depth = _tencent_depth(code)
@@ -397,7 +407,8 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
         active_buy = active_sell = neutral = 0.0
         active_ratio = None
     try:
-        trend_data = _micro_trend(code)
+        trend_data, trend_fetched_at = _minute_trend_payload(code, asof_iso, ttl_seconds)
+        evidence_started_at = min(evidence_started_at, trend_fetched_at)
         trends = trend_data.get("trends") or []
         last = trends[-1].split(",") if trends and isinstance(trends[-1], str) else []
         last_price = float(last[1]) if len(last) > 1 else None
@@ -425,7 +436,7 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
             "vwap_deviation_pct": round(vwap_deviation * 100, 4) if vwap_deviation is not None else None,
             "errors": errors, "score_applied": False,
         })
-        _store(key, result)
+        _store(key, result, stored_at=evidence_started_at)
     else:
         result["errors"] = errors
     return result
@@ -471,19 +482,24 @@ def _age_days(data_date, asof_day=None):
 
 
 def _cached(key, ttl_seconds):
+    hit = _cached_entry(key, ttl_seconds)
+    return hit[1] if hit is not None else None
+
+
+def _cached_entry(key, ttl_seconds):
     with _cache_lock:
         hit = _mem_cache.get(key)
-        if hit and (dt.datetime.now() - hit[0]).total_seconds() < ttl_seconds:
-            return hit[1]
+        if hit and 0 <= (dt.datetime.now() - hit[0]).total_seconds() < ttl_seconds:
+            return hit
     return None
 
 
-def _store(key, value):
+def _store(key, value, *, stored_at=None):
     with _cache_lock:
         if key not in _mem_cache and len(_mem_cache) >= MAX_MEM_CACHE_ENTRIES:
             oldest_key = min(_mem_cache, key=lambda item: _mem_cache[item][0])
             _mem_cache.pop(oldest_key, None)
-        _mem_cache[key] = (dt.datetime.now(), value)
+        _mem_cache[key] = (stored_at if stored_at is not None else dt.datetime.now(), value)
 
 
 def eastmoney_datacenter(report_name, columns="ALL", filter_str="",

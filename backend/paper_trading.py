@@ -5531,7 +5531,9 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     account_id = account["id"] if isinstance(account, dict) else str(account)
     spec = _spec_for(account_id)
     with PTM.phase("candidate.universe_read"):
-        base_universe = {str(row.get("code")): row for row in (U.load_universe() or [])}
+        source_universe = (U.load_universe() if shared_inputs is None
+                           else shared_inputs.universe(U.load_universe))
+        base_universe = {str(row.get("code")): row for row in (source_universe or [])}
     with PTM.phase("candidate.factor_gate"):
         factor_freshness = _selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
     if not factor_freshness.get("passed"):
@@ -5663,7 +5665,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # pretending a report period is a disclosure timestamp.
     try:
         with PTM.phase("candidate.finance_source"):
-            finance = dfc.fetch_finance_latest()
+            finance = (dfc.fetch_finance_latest() if shared_inputs is None
+                       else shared_inputs.finance(dfc.fetch_finance_latest))
     except Exception:
         finance = {"data": {}}
     # Keep the paper selector point-in-time consistent with the public

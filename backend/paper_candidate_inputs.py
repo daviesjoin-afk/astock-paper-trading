@@ -1,21 +1,45 @@
-"""Bounded reuse of identical fundamental inputs in one candidate scan."""
+"""Round-local source snapshots and identical fundamental calculations."""
+from copy import deepcopy
 import hashlib
 import json
 
 import factors as F
+import paper_timing as PTM
 
 
 class CandidateScanInputs:
     """One scan's explicit snapshot cutoff; never shared across decisions.
 
-    Providers still run through their existing freshness/expiry checks on each
-    read. Full input content and financial cutoff identify reusable calculations;
+    The first usable universe/finance read passes the provider's normal checks.
+    Later strategies see independent copies of that round's facts. Empty reads
+    and failures are not retained, so another strategy can recover the source.
+    Full input content and financial cutoff identify reusable calculations;
     strict financial history and the report strategy's live lane cannot collide.
     """
 
     def __init__(self, snapshot_asof):
         self.snapshot_asof = snapshot_asof
         self._fundamentals = {}
+        self._universe = None
+        self._finance = None
+
+    def universe(self, loader):
+        if self._universe is None:
+            with PTM.phase("candidate.universe_snapshot_load"):
+                value = loader()
+            if not value:
+                return value
+            self._universe = deepcopy(value)
+        return deepcopy(self._universe)
+
+    def finance(self, loader):
+        if self._finance is None:
+            with PTM.phase("candidate.finance_snapshot_load"):
+                value = loader()
+            if not isinstance(value, dict) or not value.get("data"):
+                return value
+            self._finance = deepcopy(value)
+        return deepcopy(self._finance)
 
     def fundamentals(self, universe, finance, *, asof):
         def cutoff(value):

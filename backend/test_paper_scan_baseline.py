@@ -45,6 +45,8 @@ class BaselineTests(unittest.TestCase):
         group = B.summarize([json.dumps(old)])["groups"][0]
         self.assertEqual(group["runtime_commit"], "unknown")
         self.assertEqual(group["observed_start_minutes"], [])
+        self.assertIsNone(group["missing_scheduled_minutes"])
+        self.assertEqual(group["coverage_status"], "unknown")
         self.assertEqual(len(B.summarize([line("bad", float("nan"))])["groups"]), 0)
 
     def test_early_return_does_not_count_as_a_fast_full_scan(self):
@@ -68,3 +70,44 @@ class BaselineTests(unittest.TestCase):
         utc = json.loads(line("utc"))
         utc["timing"]["started_at"] = "2026-10-20T01:33:00+00:00"
         self.assertEqual(B.summarize([json.dumps(utc)])["groups"][0]["observed_start_minutes"], ["09:33"])
+
+    def test_session_coverage_combines_outcomes_but_not_versions_or_durations(self):
+        rows = []
+        for index, minute in enumerate(sorted(B.expected_minutes())):
+            value = json.loads(line(minute, 10 if index % 2 else 100,
+                                    status="completed" if index % 2 else "failed"))
+            value["timing"]["started_at"] = "2026-10-20T" + minute + ":05+08:00"
+            rows.append(json.dumps(value))
+        other = json.loads(line("other"))
+        other["timing"]["runtime_commit"] = "other-version"
+        rows.append(json.dumps(other))
+        report = B.summarize(rows)
+        sessions = {row["runtime_commit"]: row for row in report["session_coverage"]}
+        self.assertTrue(sessions["abc123"]["covers_scheduled_minutes"])
+        self.assertFalse(sessions["other-version"]["covers_scheduled_minutes"])
+        self.assertEqual(sum(sessions["abc123"]["outcomes"].values()), len(B.expected_minutes()))
+        self.assertEqual(sessions["abc123"]["finished_outcomes"], len(B.expected_minutes()))
+        self.assertEqual(sessions["abc123"]["observed_failure_fraction"], 0.5)
+        self.assertEqual(len(report["groups"]), 3)
+        self.assertTrue(all(not row["covers_scheduled_minutes"] for row in report["groups"]))
+
+    def test_phase_counters_preserve_missing_and_partial_timestamps(self):
+        first, second = (json.loads(line(key)) for key in ("first", "second"))
+        first["timing"]["stages"]["outer"].update(calls=3, errors=1)
+        second["timing"]["started_at"] = "2026-10-20T09:36:00"  # timezone unknown
+        report = B.summarize([json.dumps(first), json.dumps(second)])
+        group = report["groups"][0]
+        self.assertEqual(group["coverage_status"], "partial_timestamps")
+        self.assertEqual(group["untimestamped_attempts"], 1)
+        self.assertEqual(group["stage_counters"]["outer"]["calls"], {"reported_attempts": 1, "total": 3})
+        self.assertEqual(group["stage_counters"]["outer"]["errors"]["total"], 1)
+        self.assertIsNone(group["stage_counters"]["inner"]["errors"]["total"])
+
+    def test_in_progress_and_missing_end_logs_are_not_counted_as_completed_or_failed(self):
+        report = B.summarize([line("busy", status="in_progress"), line("failed", status="failed")])
+        session = report["session_coverage"][0]
+        self.assertEqual(session["attempts"], 2)
+        self.assertEqual(session["finished_outcomes"], 1)
+        self.assertEqual(session["observed_failure_fraction"], 1.0)
+        unknown = B.summarize([line("busy", status="in_progress")])["session_coverage"][0]
+        self.assertIsNone(unknown["observed_failure_fraction"])
