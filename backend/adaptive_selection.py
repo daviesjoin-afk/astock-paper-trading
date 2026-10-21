@@ -226,13 +226,28 @@ def _conditions(model_id, override=None):
     return base
 
 
-def _structure_target(account_id, current_model, tier):
-    """返回可审计的结构变异；结构变异只在标准/成熟证据阶段申请。"""
+# 结构变更（换模型 / 加入场路径）必须人工确认，因此它一旦被无条件生成，
+# 就会永久占住候选位置，把唯一能走有界自动通道的纯权重候选挤掉。只有混合
+# 奖励明显为负——当前结构确实在损耗净值——才申请结构变更。
+STRUCTURE_CHANGE_MAX_REWARD = -0.10
+# 条件与入场门槛的改动同样需要人工确认。奖励没有明显偏离时保持现值，让候选
+# 保持为纯权重微调。
+CONDITION_TUNE_MIN_ABS_REWARD = 0.10
+
+
+def _structure_target(account_id, current_model, tier, mean_reward=None):
+    """返回可审计的结构变异；只在证据显示当前结构确实失效时申请。"""
     paths = {"normal": True}
     target_model = current_model
     mutation = "none"
     reason = ""
-    if account_id == "trend_pullback" and tier in {"standard", "mature"}:
+    if mean_reward is None or mean_reward >= STRUCTURE_CHANGE_MAX_REWARD:
+        # 没有亏损证据就不动结构，让权重微调进入有界自动通道。
+        return target_model, paths, mutation, reason
+    if tier not in {"standard", "mature"}:
+        # 结构变更要求 standard/mature 证据；早期阶段只积累样本。
+        return target_model, paths, mutation, reason
+    if account_id == "trend_pullback":
         target_model = "trend_continuation"
         mutation = "model_family_switch"
         paths = {"trend_continuation": True, "bottom_fishing": False}
@@ -360,7 +375,8 @@ def _tier(evidence, profile, config):
 
 
 def _proposal(account_id, model_id, current_weights, current_delta, current_conditions, regime, mean_reward, tier, current_structure=None):
-    target_model, entry_paths, mutation, structure_reason = _structure_target(account_id, model_id, tier)
+    target_model, entry_paths, mutation, structure_reason = _structure_target(account_id, model_id, tier, mean_reward)
+    structural = mutation not in {None, "none"}
     proposal_model = target_model if target_model in BASE_WEIGHTS else model_id
     multipliers = REGIME_MULTIPLIERS.get(regime, {})
     target = _normalize({key: value * multipliers.get(key, 1.0) for key, value in BASE_WEIGHTS[proposal_model].items()})
@@ -370,16 +386,23 @@ def _proposal(account_id, model_id, current_weights, current_delta, current_cond
     else:
         # 模型族切换先生成完整基线，执行仍由结构门禁控制。
         weights = target
-    target_delta = 0.0
-    if mean_reward is not None and mean_reward < -0.10:
-        target_delta = 0.020
-    elif mean_reward is not None and mean_reward > 0.10:
-        target_delta = -0.015
-    step = {"waiting": 0.004, "fast_shadow": 0.008, "micro": 0.018, "standard": 0.030, "mature": 0.045}.get(tier, 0.004)
-    delta = current_delta + max(-step, min(step, target_delta - current_delta))
-    delta = round(max(-0.03, min(0.05, delta)), 4)
-    target_conditions = _condition_target(proposal_model, regime)
-    conditions = _blend_conditions(proposal_model, current_conditions, target_conditions, tier)
+    # 条件与入场门槛的改动必须人工确认。奖励没有明显偏离时保持现值，候选
+    # 因此成为纯权重微调，才有资格进入有界自动通道。
+    tuning = mean_reward is not None and abs(mean_reward) > CONDITION_TUNE_MIN_ABS_REWARD
+    if structural or tuning:
+        target_delta = 0.0
+        if mean_reward is not None and mean_reward < -0.10:
+            target_delta = 0.020
+        elif mean_reward is not None and mean_reward > 0.10:
+            target_delta = -0.015
+        step = {"waiting": 0.004, "fast_shadow": 0.008, "micro": 0.018, "standard": 0.030, "mature": 0.045}.get(tier, 0.004)
+        delta = current_delta + max(-step, min(step, target_delta - current_delta))
+        delta = round(max(-0.03, min(0.05, delta)), 4)
+        target_conditions = _condition_target(proposal_model, regime)
+        conditions = _blend_conditions(proposal_model, current_conditions, target_conditions, tier)
+    else:
+        delta = current_delta
+        conditions = current_conditions
     result = {"model_family": proposal_model, "weights": weights, "entry_score_delta": delta, "conditions": conditions,
               "entry_paths": entry_paths, "mutation_type": mutation,
               "structure_reason": structure_reason,

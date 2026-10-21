@@ -588,7 +588,9 @@ def _ensure_config_defaults(conn):
         "llm_realtime_min_valid_rows": 1000,
         "llm_realtime_require_cross_source": True,
         "llm_realtime_max_accounts": 3,
-        "selection_auto_apply_bounded": False,
+        # 有界自动通道：只接受纯因子权重小步调整（单因子 ±3pp、键集固定、
+        # 组合上限校验）。条件、门槛与结构变更仍必须人工确认。
+        "selection_auto_apply_bounded": True,
         "selection_shadow_nav_days": 1,
         "selection_shadow_trade_events": 1,
         "selection_shadow_reward_samples": 2,
