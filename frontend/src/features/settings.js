@@ -207,7 +207,7 @@ export function renderSettings(data){
         +'<div class="setting-control"><span data-testid="ai-slot-'+slot+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
         +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_displayName"><b>显示名称</b></label><small>自定义名称，与稳定 id 解耦。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-display-name" id="aiSlot_'+slot+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="例如 DeepSeek 主槽"></div></div>'
         +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_baseUrl"><b>接口地址</b></label><small>OpenAI 兼容的 Base URL。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="留空表示未配置，例如 https://api.deepseek.com/v1"></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_model"><b>模型名称</b></label><small>后端不做任何厂商假设，按实际模型名填写。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" value="'+adaptiveEsc(s.model||'')+'" placeholder="例如 deepseek-v4-flash"></div></div>'
+        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_model"><b>模型名称</b></label><small>可手动填写，也可从上游可用模型里选。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" list="aiSlot_'+slot+'_modelList" value="'+adaptiveEsc(s.model||'')+'" placeholder="例如 deepseek-v4-flash"><datalist id="aiSlot_'+slot+'_modelList"></datalist><button type="button" class="ghost" data-testid="ai-slot-'+slot+'-models" onclick="fetchAiSlotModels(\''+slot+'\')">获取模型</button></div></div>'
         +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_apiKey"><b>API Key</b></label><small>留空表示保持现有 Key；清除请点下方「清除 Key」。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-api-key" id="aiSlot_'+slot+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div></div>'
         +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_timeout"><b>超时（秒）</b></label><small>单次调用等待上限，5–300 秒。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-timeout" id="aiSlot_'+slot+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div></div>'
         +'<div class="setting-row"><div class="setting-label"><b>启用该槽位</b><small>停用后不参与审阅与调参。</small></div><div class="setting-control"><label class="settings-exec-toggle"><input data-testid="ai-slot-'+slot+'-enabled" id="aiSlot_'+slot+'_enabled" type="checkbox"'+settingsChecked(enabled)+'><span>'+(enabled?'启用':'停用')+'</span></label></div></div>'
@@ -375,6 +375,31 @@ export async function clearWxpusherToken(){
     var data=await apiPostJson('/api/settings/?confirmed=true',{notification:{clear_app_token:true}});
     renderSettings(data); toast('已清除 WxPusher 凭据。');
   }catch(e){ toast('清除失败：'+((e&&e.message)||e), { tone:'danger' }); }
+}
+
+// ---------- AI 槽位：从上游拉取可用模型 ----------
+export async function fetchAiSlotModels(slot){
+  var feedback=document.querySelector('[data-testid="ai-slot-'+slot+'-feedback"]');
+  var list=document.getElementById('aiSlot_'+slot+'_modelList');
+  var input=document.getElementById('aiSlot_'+slot+'_model');
+  if(feedback) feedback.textContent='正在从上游读取可用模型…';
+  try{
+    var data=await api('/api/settings/ai-review/slots/'+encodeURIComponent(slot)+'/models');
+    if(data&&data.ok===false){
+      if(feedback) feedback.textContent='读取模型失败：'+(data.error||'未知原因')+'（请先保存接口地址与 API Key）';
+      return;
+    }
+    var models=(data&&data.models)||[];
+    if(list) list.innerHTML=models.map(function(id){return '<option value="'+adaptiveEsc(id)+'"></option>';}).join('');
+    if(feedback){
+      feedback.textContent=models.length
+        ? ('已读取 '+models.length+' 个可用模型；点「模型名称」输入框即可选择。')
+        : '上游没有返回可用模型，可继续手动填写。';
+    }
+    if(models.length&&input) input.focus();
+  }catch(e){
+    if(feedback) feedback.textContent='读取模型失败：'+((e&&e.message)||e);
+  }
 }
 
 // ---------- 通用 AI 槽位（ai1 / ai2）----------

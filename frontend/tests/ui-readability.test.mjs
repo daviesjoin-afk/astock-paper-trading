@@ -71,3 +71,12 @@ test('槽位表单的输入框统一放宽', () => {
   assert.ok(css.includes('.ai-slot-form .setting-control input'), '缺少槽位输入框样式');
   assert.ok(css.includes('max-width:420px'), '输入框未放宽到统一宽度');
 });
+
+test('模型名称支持从上游列表选择', () => {
+  const text = source('../src/features/settings.js');
+  assert.ok(text.includes('list="aiSlot_'), '模型输入框未关联 datalist');
+  assert.ok(text.includes('fetchAiSlotModels'), '缺少获取模型的处理函数');
+  assert.ok(text.includes('/models'), '未调用上游模型列表接口');
+  const bridge = source('../src/bridge.js');
+  assert.ok(bridge.includes('window.fetchAiSlotModels'), '获取模型函数未挂到全局');
+});

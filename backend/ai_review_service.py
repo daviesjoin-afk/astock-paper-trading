@@ -824,6 +824,39 @@ def test_slot(conn, slot):
     return result
 
 
+def list_slot_models(conn, slot):
+    """列出该槽位上游的可用模型。只读：不写配置、不回显 Key、不发 chat 请求。
+
+    用**已保存**的凭据去问上游，而不是界面上的未保存值——否则一次误填的
+    地址就会把 Key 送到任意主机。
+    """
+    slot = resolve_slot(slot)
+    cfg = get_slot_config(conn, slot)
+    result = {
+        "slot": slot, "ok": False, "models": [], "count": 0,
+        "error": None, "latency_ms": None,
+    }
+    if not str(cfg["api_key"]).strip():
+        result["error"] = "api_key_missing"
+        return result
+    if not is_usable_base_url(cfg["base_url"]):
+        result["error"] = "invalid_base_url"
+        return result
+    try:
+        payload = transport.list_models(cfg)
+    except transport.ProviderTransportError as exc:
+        result["error"] = str(exc)[:200]
+        return result
+    except Exception as exc:  # noqa: BLE001 - 探测结果必须结构化返回
+        result["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        return result
+    result["ok"] = True
+    result["models"] = payload["models"]
+    result["count"] = payload["count"]
+    result["latency_ms"] = payload["latency_ms"]
+    return result
+
+
 def _build_tuning_system_prompt():
     """构建调参系统提示词。"""
     return (

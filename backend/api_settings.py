@@ -333,6 +333,22 @@ def test_ai_review_slot(slot: str, confirmed: bool = Query(False)):
         raise HTTPException(status_code=500, detail=f"测试AI槽位失败：{type(exc).__name__}") from exc
 
 
+@router.get("/ai-review/slots/{slot}/models")
+def list_ai_review_slot_models(slot: str):
+    """列出该槽位上游的可用模型。只读：不发 chat 请求、不消耗 token。
+
+    用已保存的凭据去问上游，界面上的未保存改动不参与，避免把 Key 送到
+    一个还没保存的地址。
+    """
+    adaptive = _get_adaptive()
+    try:
+        return adaptive.list_ai_slot_models_fn(slot)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取模型列表失败：{type(exc).__name__}") from exc
+
+
 @router.post("/notification/test")
 def test_notification(kind: str = Query("daily"), confirmed: bool = Query(False)):
     """发送一条真实测试推送；因为会真的发到微信，必须显式确认。"""

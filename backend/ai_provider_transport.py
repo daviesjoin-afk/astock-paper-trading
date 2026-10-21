@@ -150,6 +150,14 @@ def chat_completions_url(base_url) -> str:
     return base + _CHAT_COMPLETIONS_SUFFIX
 
 
+def models_url(base_url) -> str:
+    """由 base_url 拼出模型列表地址。``/v1`` 与 ``/v1/`` 等价。"""
+    base = normalize_base_url(base_url)
+    if not base:
+        raise ProviderTransportError(REASON_BASE_URL_INVALID)
+    return base + "/models"
+
+
 def is_usable_base_url(value) -> bool:
     """base_url 是否是**真能发请求**的地址：scheme ∈ {http, https} 且 hostname 非空。
 
@@ -310,3 +318,59 @@ def call_json(provider_config, system_prompt, user_prompt, max_tokens=1800):
         int(usage.get("completion_tokens") or 0),
         latency_ms,
     )
+
+
+def list_models(provider_config):
+    """拉取上游可用模型列表。``GET /models``，不发送 chat 请求、不消耗 token。
+
+    校验顺序与 :func:`call_json` 一致：缺 Key 或地址非法在任何请求发出前就
+    fail closed，绝不为了发现"配置不全"而先打一次网络。
+    """
+    api_key = str(provider_config.get("api_key") or "")
+    if not api_key.strip():
+        raise ProviderTransportError(
+            REASON_API_KEY_MISSING, detail="%s_api_key_missing" % provider_config.get("slot"),
+        )
+    base_url = provider_config.get("base_url")
+    if not is_usable_base_url(base_url):
+        raise ProviderTransportError(REASON_BASE_URL_INVALID)
+    url = models_url(base_url)
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": "Bearer " + api_key, "Accept": "application/json"},
+        method="GET",
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=_timeout_seconds(provider_config)) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raise ProviderTransportError(REASON_HTTP_ERROR, status=exc.code) from None
+    except _NETWORK_FAILURES:
+        raise ProviderTransportError(REASON_NETWORK_ERROR) from None
+    latency_ms = round((time.monotonic() - started) * 1000)
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ProviderTransportError(REASON_RESPONSE_NOT_JSON) from None
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise ProviderTransportError(REASON_RESPONSE_NOT_JSON)
+    seen = set()
+    models = []
+    for item in items:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("model") or item.get("name")
+        elif isinstance(item, str):
+            model_id = item
+        else:
+            model_id = None
+        if not model_id:
+            continue
+        model_id = str(model_id).strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            models.append(model_id)
+    models.sort()
+    return {"models": models, "count": len(models), "latency_ms": latency_ms}

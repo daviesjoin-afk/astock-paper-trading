@@ -4500,6 +4500,13 @@ def test_ai_slot_fn(slot):
         return ai_review_service.test_slot(conn, slot)
 
 
+def list_ai_slot_models_fn(slot):
+    """列出该槽位上游的可用模型（只读；不发 chat 请求、不消耗 token）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.list_slot_models(conn, slot)
+
+
 def _current_profile_snapshot():
     """读取当前市场画像快照，供双AI调参使用。"""
     try:
