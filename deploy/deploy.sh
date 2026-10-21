@@ -1,7 +1,11 @@
 #!/bin/bash
 # A股模拟盘一键部署脚本
-# 用法：bash deploy/deploy.sh [--no-backup] [--no-migrate]
-# 流程：备份 → 构建镜像 → 重启容器 → schema迁移 → cron同步 → 健康检查
+# 用法：bash deploy/deploy.sh [--backup] [--no-migrate]
+# 流程：备份(可选) → 构建镜像 → 重启容器 → schema迁移 → cron同步 → 健康检查
+#
+# 数据库备份默认**关闭**：部署只替换代码，不改账本数据，而每次全量复制
+# paper_trading(2.9G)+adaptive_learning(1G) 会拖慢部署并挤占磁盘。数据保护
+# 由每日 20:10 的 cron 备份负责。确实要在迁移前留档时显式加 --backup。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -12,12 +16,12 @@ echo "════════════════════════�
 echo " A股模拟盘一键部署 $(date '+%Y-%m-%d %H:%M:%S')"
 echo "════════════════════════════════════════"
 
-# 1. 备份（默认开启）
-if [[ "${1:-}" != "--no-backup" ]]; then
+# 1. 备份（默认关闭，显式 --backup 才执行）
+if [[ "${1:-}" == "--backup" ]]; then
   echo "▶ [1/6] 备份当前数据..."
   bash deploy/backup.sh
 else
-  echo "▶ [1/6] 跳过备份（--no-backup）"
+  echo "▶ [1/6] 跳过数据库备份（部署不改数据；每日 cron 备份仍在运行）"
 fi
 
 # 2. 构建镜像。镜像上下文明确排除了 .git，因此把完整 commit SHA
