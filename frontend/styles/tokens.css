@@ -28,6 +28,17 @@
 .setting-label small,.setting-help { color:var(--text-muted); font-size:11px; line-height:1.55; }
 .setting-control { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 .setting-control input,.setting-control select { width:100%; max-width:260px; }
+/* AI 槽位表单对齐供应商配置的排法：标签独占左列、输入框统一宽度、行距更宽。
+   此前 label 与 input 挤在同一个 flex 里，输入框宽度会随标签长短参差。 */
+.ai-slot-form { padding:20px 22px; margin-top:16px; }
+.ai-slot-form h4 { margin:0 0 4px; font-size:15px; }
+.ai-slot-form .setting-row { grid-template-columns:150px minmax(0,1fr); gap:18px; padding:15px 0; align-items:center; }
+.ai-slot-form .setting-label label { cursor:pointer; }
+.ai-slot-form .setting-label b { font-size:13px; font-weight:500; }
+.ai-slot-form .setting-label small { display:block; margin-top:2px; }
+.ai-slot-form .setting-control input:not([type=checkbox]) { max-width:420px; }
+.ai-slot-form .settings-actions { margin-top:18px; display:flex; gap:10px; flex-wrap:wrap; }
+.ai-slot-form .settings-exec-toggle { display:inline-flex; align-items:center; gap:8px; }
 .setting-control input[type=checkbox] { width:18px; height:18px; accent-color:#238b68; }
 .setting-value-preview { color:var(--text-secondary); font-size:12px; }
 .settings-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }

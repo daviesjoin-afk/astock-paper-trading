@@ -57,3 +57,17 @@ test('时间线卡片字段网格允许长文本换行', () => {
   assert.ok(text.includes('word-break:break-word'), '字段网格缺少换行保护');
   assert.ok(text.includes('minmax(170px'), '字段网格列宽仍过窄');
 });
+
+test('AI 槽位表单用两列结构，标签不再挤在输入行里', () => {
+  const text = source('../src/features/settings.js');
+  assert.ok(text.includes('ai-slot-form'), '缺少槽位表单类');
+  assert.ok(!text.includes('<div class="setting-control"><label for="aiSlot_'),
+    '标签仍与输入框挤在同一 flex 行，宽度会随标签长短参差');
+  assert.ok(text.includes('setting-label"><label for="aiSlot_'), '标签未独占左列');
+});
+
+test('槽位表单的输入框统一放宽', () => {
+  const css = source('../styles/tokens.css');
+  assert.ok(css.includes('.ai-slot-form .setting-control input'), '缺少槽位输入框样式');
+  assert.ok(css.includes('max-width:420px'), '输入框未放宽到统一宽度');
+});
