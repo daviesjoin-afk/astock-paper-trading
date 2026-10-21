@@ -746,6 +746,26 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
     }
 
 
+def _baseline_weights(account_id, overlay):
+    """账户当前生效的因子权重基线。
+
+    没有 ``adaptive_selection`` overlay 时，运行时用的是模型默认权重
+    （``strategies.PAPER_WEIGHTS``）。基线必须与运行时一致：给模型空权重会让
+    它在 prompt 里看到空因子列表、无从提案，共识层也会因为 ``base_weights``
+    为空直接判 ``weight_format_invalid`` —— AI 于是永远只能 hold，而 apply
+    侧比的又是 ``PAPER_WEIGHTS``，两边基线不一致。
+    """
+    try:
+        import paper_account_specs as specs
+        import strategies as S
+
+        source = specs.ACCOUNT_SPECS.get(account_id, {}).get("source_strategy")
+        family = S.selection_model_family(account_id, overlay, source)
+        return dict(S.PAPER_WEIGHTS.get(family) or {})
+    except Exception:
+        return {}
+
+
 def _tuning_accounts(paper_db_path):
     """Read only the small, auditable account state sent to the model."""
     try:
@@ -763,11 +783,20 @@ def _tuning_accounts(paper_db_path):
     for row in rows:
         params = _loads(row["params"], {}) or {}
         overlay = params.get("adaptive_selection") or {}
+        account_id = str(row["id"])
+        weights = overlay.get("weights") or {}
+        if not weights:
+            weights = _baseline_weights(account_id, overlay)
+        if not weights:
+            # 硬规则策略（三日策略、主力股）不走加权评分，没有因子可调。
+            # 把它们放进 prompt 只会让模型对无因子账户提案，而共识层又会因
+            # base_weights 为空判 weight_format_invalid，拖累其它账户的共识。
+            continue
         accounts.append({
-            "account_id": str(row["id"]),
+            "account_id": account_id,
             "version": str(row["version"] or ""),
             "style": str(row["style"] or ""),
-            "weights": overlay.get("weights") or {},
+            "weights": weights,
             "entry_score_delta": overlay.get("entry_score_delta", params.get("entry_score_delta", params.get("min_t_score_delta", 0.0))),
             "conditions": overlay.get("conditions") or {},
             # Thresholds and conditions are intentionally not exposed as
