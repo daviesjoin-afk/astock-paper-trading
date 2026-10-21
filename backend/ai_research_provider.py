@@ -306,8 +306,45 @@ def _evidence_projection(event: ARC.InformationEvent) -> dict[str, Any]:
         "verification": event.verification,
         "verification_method": event.verification_method,
         "cross_source_verified": ref.cross_source_verified,
-        "payload": _jsonable(event.payload),
+        "payload": _compact_payload(event.payload),
     }
+
+
+# 单条事实的 payload 上限。全市场行情快照原始 payload 实测 3.1MB，加上
+# evidence_id 会让请求体到 3.2MB，上游直接 400 拒绝（"request parameters
+# were rejected by the model provider"）——分析因此在任何模型上都不可能成功。
+# 保留结构与样本，丢掉逐只股票的明细。
+_MAX_PAYLOAD_BYTES = 24000
+_MAX_SAMPLE_ITEMS = 6
+
+
+def _compact_payload(payload: Any, limit: int = _MAX_PAYLOAD_BYTES) -> Any:
+    """把超大 payload 压成「结构 + 样本」，保证请求体能被模型接受。"""
+    data = _jsonable(payload)
+    try:
+        if len(_dump(data)) <= limit:
+            return data
+    except (TypeError, ValueError):
+        return data
+    if isinstance(data, dict):
+        compacted: dict[str, Any] = {"_truncated": True}
+        for key, value in data.items():
+            if isinstance(value, list) and len(value) > _MAX_SAMPLE_ITEMS:
+                compacted[key] = {
+                    "_total": len(value),
+                    "_sample": value[:_MAX_SAMPLE_ITEMS],
+                }
+            elif isinstance(value, dict) and len(_dump(value)) > 2000:
+                compacted[key] = {
+                    "_keys": len(value),
+                    "_sample_keys": list(value)[:_MAX_SAMPLE_ITEMS * 2],
+                }
+            else:
+                compacted[key] = value
+        return compacted
+    if isinstance(data, list):
+        return {"_truncated": True, "_total": len(data), "_sample": data[:_MAX_SAMPLE_ITEMS]}
+    return data
 
 
 def _build_user_prompt(*, as_of: str, subject: str, question: str, indexed) -> str:
