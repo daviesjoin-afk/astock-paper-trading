@@ -1641,6 +1641,8 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                 "score_components": {
                     "version": "paper-score-evidence-v2",
                     "factor_calibration_version": FC.CALIBRATION_VERSION,
+                    **({"factor_input_version": table.attrs["factor_input_version"]}
+                       if "factor_input_version" in table.attrs else {}),
                     "evidence_quality": _number(row.get("score_evidence_quality"), 6),
                     "observed_weight": _number(row.get("score_observed_weight"), 6),
                     "required_factors_ok": bool(row.get("score_required_ok", False)),

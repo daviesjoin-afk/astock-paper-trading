@@ -49,11 +49,13 @@ class FactorEffectivenessTests(unittest.TestCase):
                     writer.writerow([day, 100 * (1 + strength * 0.001) ** index])
 
     def add(self, day, strength, *, version=1, checksum="checksum-v1", table="paper_signals",
-            factors=None, weights=None, created_at=None, row_id=None):
+            factors=None, weights=None, created_at=None, row_id=None, input_version=None):
         snapshot = {"mom_short": strength, "flow": 1} if factors is None else factors
         payload = {"pick": {"factor_snapshot": snapshot, "historical_factor_date": day,
                             "score_components": {"weights": weights or {"mom_short": 0.5, "flow": 0.5},
                                                  "factor_calibration_version": "factor-calibration-v2"}}}
+        if input_version is not None:
+            payload["pick"]["score_components"]["factor_input_version"] = input_version
         if row_id is None:
             row_id = self.conn.execute("SELECT COUNT(*) FROM paper_signals").fetchone()[0] + 1
         self.conn.execute(f"INSERT INTO {table} VALUES(?,?,?,?,?,?,?,?,?)", (
@@ -134,6 +136,27 @@ class FactorEffectivenessTests(unittest.TestCase):
         metric = self.metric(self.build())
         self.assertEqual(metric["status"], "incomplete_identity")
         self.assertIsNone(metric["mean_rank_ic"])
+
+    def test_input_revision_separates_same_strategy_and_weights_without_relabelling_history(self):
+        for strength in range(1, 7):
+            self.add(self.sessions[0], strength)
+        old_group = self.build()["groups"][0]
+        for strength in range(1, 7):
+            self.add(self.sessions[1], strength, input_version="paper-tq-sentiment-v1")
+        report = self.build()
+        self.assertEqual(len(report["groups"]), 2)
+        legacy = next(g for g in report["groups"] if "factor_input_version" not in g)
+        current = next(g for g in report["groups"] if "factor_input_version" in g)
+        self.assertEqual(legacy["group_id"], old_group["group_id"])
+        self.assertEqual(legacy["strategy_version"], current["strategy_version"])
+        self.assertEqual(legacy["weights"], current["weights"])
+        self.assertNotEqual(legacy["group_id"], current["group_id"])
+        self.assertTrue(all(g["decision_dates"] == 1 for g in report["groups"]))
+        summary = FE.evidence_summary(report)
+        self.assertEqual(len(summary["groups"]), 1)
+        self.assertEqual(summary["groups"][0]["factor_input_version"], "paper-tq-sentiment-v1")
+        self.assertEqual(summary["omitted_historical_groups"], 1)
+        self.assertIn("评分输入版本：`paper-tq-sentiment-v1`", FE.render_markdown(report))
 
     def test_archive_copies_do_not_inflate_and_conflicts_are_excluded(self):
         for strength in range(1, 7):
@@ -234,13 +257,16 @@ class FactorEffectivenessTests(unittest.TestCase):
         payload = json.loads(self.conn.execute("SELECT payload FROM paper_signals").fetchone()[0])
         payload["decision_snapshot"] = {"decision_at": self.sessions[0] + "T16:00:00+08:00",
             "asof": self.sessions[0], "factors": {"raw": {"mom_short": 42, "flow": 1},
-                "score_components": payload["pick"]["score_components"]}}
+                "score_components": dict(payload["pick"]["score_components"],
+                                         factor_input_version="paper-tq-sentiment-v1")}}
+        payload["pick"]["score_components"]["factor_input_version"] = "mutable-future-version"
         self.conn.execute("UPDATE paper_signals SET payload=?", (json.dumps(payload),))
         self.conn.commit()
         sample = self.build(include_samples=True)["samples"][0]
         self.assertEqual(sample["factors"]["mom_short"], 42)
         self.assertEqual(sample["labels"]["1"]["entry_date"], self.sessions[1])
         self.assertEqual(sample["factor_source"], "decision_snapshot.factors.raw")
+        self.assertEqual(sample["identity"]["factor_input_version"], "paper-tq-sentiment-v1")
 
     def test_summary_keeps_simultaneous_configurations_including_unknown_identity(self):
         self.add(self.sessions[0], 1)

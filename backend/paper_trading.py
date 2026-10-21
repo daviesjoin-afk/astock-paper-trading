@@ -5736,13 +5736,30 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
     scoring_factors = (None if spec.get("selection_mode") == "dsl"
                        else S.scoring_factor_inputs(selection_model))
+    sentiment = None
+    sentiment_input_enabled = (account_id == "tq_breakout" and style != "sector"
+                               and scoring_factors is not None and "sentiment" in scoring_factors)
+    # The daily factor cutoff may be yesterday during a live scan. Popularity
+    # belongs to today's decision snapshot, never to a historical replay.
+    if (sentiment_input_enabled and live_universe is not None
+            and expected_live_day == _date(F.live_snapshot_asof()).isoformat()):
+        try:
+            with PTM.phase("candidate.sentiment_source"):
+                sentiment = F.compute_sentiment_factors(set(price_f.index.astype(str)))
+        except Exception:
+            # A failed source is unknown evidence, not a neutral numeric score.
+            sentiment = None
     with PTM.phase("candidate.factor_table"):
         table = S.build_factor_table(
-            price_f, fund, sentiment=None,
+            price_f, fund, sentiment=sentiment,
             realtime_flow=live_flow,
             realtime_super_flow=live_super_flow,
             scoring_factors=scoring_factors,
         )
+    if sentiment_input_enabled:
+        # Cycles pin immutable strategy definitions. Version the changed input
+        # policy separately so attribution never pools it with older snapshots.
+        table.attrs["factor_input_version"] = "paper-tq-sentiment-v1"
     if live_universe is not None:
         # 日线技术指标/财务仍来自已下载的完整历史；当天可变字段必须由
         # 同一轮实时快照覆盖，不能继续沿用上一交易日的收盘价或涨跌幅。

@@ -145,6 +145,8 @@ def _read_samples(path, cutoff, asof):
                             "strategy_version": row["strategy_version"], "strategy_checksum": row["strategy_checksum"],
                             "calibration_version": components.get("factor_calibration_version"),
                             "weights": clean_weights if valid_weights else {}}
+                if components.get("factor_input_version"):
+                    identity["factor_input_version"] = components["factor_input_version"]
                 complete = (bool(identity["strategy_id"]) and isinstance(identity["strategy_version"], int)
                             and identity["strategy_version"] > 0 and bool(identity["strategy_checksum"])
                             and bool(identity["calibration_version"]) and valid_weights)
@@ -335,6 +337,8 @@ def evidence_summary(report):
         compact = {k: group[k] for k in ("account_id", "strategy_id", "strategy_version", "strategy_checksum",
                    "group_id", "identity_status", "weights", "calibration_version", "candidate_rows",
                    "decision_dates", "last_decision_at", "label_counts")}
+        if "factor_input_version" in group:
+            compact["factor_input_version"] = group["factor_input_version"]
         fields = ("factor", "horizon", "status", "factor_coverage_pct", "missing_rows", "invalid_rows",
                   "paired_rows", "valid_ic_dates", "mean_rank_ic", "high_return_pct", "low_return_pct",
                   "high_minus_low_pp", "skipped")
@@ -366,6 +370,8 @@ def render_markdown(report):
                   f"决策日期 {group['decision_dates']} 个。", "",
                   "保存权重：`" + json.dumps(group["weights"], ensure_ascii=False) + "`", "",
                   "收益窗口状态：`" + json.dumps(group["label_counts"], ensure_ascii=False) + "`", ""]
+        if "factor_input_version" in group:
+            lines += [f"评分输入版本：`{group['factor_input_version']}`", ""]
         if group["identity_status"] != "complete":
             lines += ["策略身份、因子计算版本或权重字段不全，本组不计算 IC 和分组收益。", ""]
             continue
