@@ -497,6 +497,8 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
     rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
     if findings:
         max_severity = max((item["severity"] for item in findings), key=lambda value: rank[value])
+    import factor_effectiveness_report as factor_report
+    factor_effectiveness = factor_report.evidence_summary(factor_report.build_report(paper_db_path, asof=now))
     evidence = {
         "scope": "paper_trading_only",
         "generated_at": _now(),
@@ -518,8 +520,10 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         },
         "paper_ledger": ledger,
         "account_performance": account_performance,
+        "factor_effectiveness": factor_effectiveness,
         "adaptive_learning": adaptive_stats,
         "deterministic_findings": findings,
+        "deterministic_findings_meaning": "仅列出已执行检查发现的异常；空列表表示这些检查未发现异常，不代表因子有效性证据充分。",
         "deterministic_max_severity": max_severity,
     }
     canonical = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

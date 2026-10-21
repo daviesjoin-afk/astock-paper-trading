@@ -1027,7 +1027,12 @@ def _build_tuning_system_prompt():
         "只有在证据充分且置信度>=70时提出很小的模拟盘内部补丁；证据不足就hold。\n"
         "weights必须是该账户已有因子并且总和约等于1，conditions只能使用已有条件名。\n"
         "本次是盘中小步调参，单个权重最多移动3个百分点，入场阈值最多移动0.005，\n"
-        "不得切换条件enabled。不要把行情推测写成事实。"
+        "不得切换条件enabled。不要把行情推测写成事实。\n"
+        "deterministic_findings为空仅表示已执行检查未发现异常，不表示缺少交易信号或因子已有效。\n"
+        "factor_effectiveness只评估已保存候选；必须引用相同策略版本和配置分组的统计。"
+        "最新已观测配置不一定是当前配置，快照权重与账户状态不一致时不得外推。"
+        "insufficient_dates、incomplete_identity或unavailable表示证据不足。"
+        "Rank IC和高低分组收益不是账户盈亏归因，不能据此估算调整权重后的净值改善。"
     )
 
 
