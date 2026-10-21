@@ -67,7 +67,7 @@ OPENING_EVENT_POLICIES: dict[str, dict] = {
         "rebuy_min_current_pct": -0.5,
     },
     NEW_STRATEGY_ID: {
-        "name": "财报突破质量",
+        "name": "三日策略",
         "enabled": True,
         "min_peak_pct": 3.5,
         "min_retrace_pct": 2.4,

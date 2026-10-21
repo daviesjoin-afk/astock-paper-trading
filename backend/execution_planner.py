@@ -1077,7 +1077,7 @@ def _default_policies() -> dict[str, ExecutionPolicy]:
         first_tranche_nav_pct=0.12,
         holds_reserved_seat=True,
     )
-    # 财报突破质量的手动委托必须走独立入场复核，不能在运营界面绕过策略模型。
+    # 三日策略的手动委托必须走独立入场复核，不能在运营界面绕过策略模型。
     put(
         quality_breakout,
         entry_label="三日策略",
