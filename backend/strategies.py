@@ -71,6 +71,37 @@ PAPER_WEIGHTS = {
     "sentiment_pioneer": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
 }
 
+# 自适应 overlay 允许切换到的模型族。只有这些组合经过审计；不在表内的账户
+# 只允许它自己的 source_strategy。
+SELECTION_MODEL_FAMILIES = {
+    "tq_breakout": {"one_to_two"},
+    "trend_pullback": {"bottom_reversal", "trend_continuation"},
+    "sector_rotation": {"sentiment_pioneer"},
+    "reported_profit_breakout": {"reported_profit_breakout"},
+}
+
+
+def selection_model_family(account_id, overlay, source_strategy):
+    """运行时实际采用的模型族；越界时回落到 source_strategy。"""
+    allowed = SELECTION_MODEL_FAMILIES.get(account_id, {source_strategy})
+    model_family = str((overlay or {}).get("model_family") or source_strategy)
+    if model_family not in allowed:
+        model_family = source_strategy
+    return model_family
+
+
+def selection_overlay_weights(account_id, overlay, source_strategy):
+    """运行时实际会采用的 overlay 权重；被拒绝时返回空 dict。
+
+    库里有 weights 但运行时已清空时，把该参数记为「已部署」会让 A/B 把
+    业绩归因到一个实际未生效的参数上。``_adaptive_selection`` 与部署记录
+    必须共用本函数，不能各自实现一遍键集判定。
+    """
+    weights = (overlay or {}).get("weights") or {}
+    expected = set(PAPER_WEIGHTS.get(
+        selection_model_family(account_id, overlay, source_strategy), {}))
+    return dict(weights) if set(weights) == expected else {}
+
 # ===== 2026-08-28 选股负 alpha 修复 =====
 # 实证（08-20~08-27 全部成交信号 K 线回放，reports/selection_alpha_report.md）：
 # 四策略买入次日均值 -0.7%~-1.7%，同期随机基准 +0.05%；排序分与次日收益
@@ -1480,7 +1511,6 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         onset = numeric_column("sector_early_rotation_score")
         onset_bonus = onset.rank(method="average", pct=True, na_option="bottom") * 0.30
         score = score + onset_bonus
-        score = score.mask(climax, -990.0)
 
     pct = numeric_column("pct")
     vol_surge = numeric_column("vol_surge_raw")
@@ -1544,6 +1574,12 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                 & numeric_column("mom5_raw").ge(conditions["individual_mom5_min"])
             )
             score += individual.astype(float) * conditions["individual_bonus"]
+
+    # 板块情绪高潮禁入必须在全部策略加分之后施加。哨兵 -990 正是 picks 的
+    # 过滤线，若在 individual_bonus 之前 mask，+0.28 会把该行抬到 -989.72
+    # 而重新通过 ``score > -990``，禁入静默失效。
+    if strategy_id == "sentiment_pioneer":
+        score = score.mask(climax, -990.0)
 
     # Evidence quality is an audit/gate dimension, never an alpha multiplier.
     score = score.mask(~evidence_ok, -999.0)

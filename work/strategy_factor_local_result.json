@@ -1,8 +1,8 @@
 {
-  "tests": 395,
+  "tests": 397,
   "failures": 0,
   "errors": 0,
   "skipped": 1,
-  "elapsed_seconds": 49.622,
+  "elapsed_seconds": 48.674,
   "python": "3.14.3"
 }

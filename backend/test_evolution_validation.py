@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import evolution_validation as EV
+import strategies as S
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -207,6 +208,58 @@ class PreApplyGateTests(ValidationBase):
 
     def test_gate_allows_without_deployment(self):
         EV.pre_apply_gate(self._adaptive_ctx, self.paper_path, "tq_breakout", "allocation")
+
+
+class ActiveDeploymentSelectionTests(ValidationBase):
+    """库里有 weights 但运行时会被清空的参数，不能记为已部署。
+
+    否则 A/B 会把业绩归因到一个实际未生效的参数上。
+    """
+
+    def _set_overlay(self, account_id, weights, model_family=None):
+        overlay = {"weights": weights}
+        if model_family:
+            overlay["model_family"] = model_family
+        params = {
+            "adaptive_selection": overlay,
+            "adaptive_selection_meta": {
+                "status": "active",
+                "effective_date": (datetime.now(TZ) - timedelta(days=1)).date().isoformat(),
+                "version": "v1", "candidate_id": 5,
+            },
+        }
+        with self._paper_ctx() as conn:
+            conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                         (json.dumps(params), account_id))
+
+    def _deployments(self):
+        paper, adaptive = self._paper(), self._adaptive()
+        try:
+            return EV._active_deployments(paper, adaptive)
+        finally:
+            paper.close()
+            adaptive.close()
+
+    def test_matching_key_set_is_recorded_as_deployed(self):
+        self._set_overlay("tq_breakout", dict(S.PAPER_WEIGHTS["one_to_two"]))
+        kinds = [d["kind"] for d in self._deployments()]
+        self.assertIn("selection", kinds)
+
+    def test_key_set_mismatch_is_not_recorded_because_runtime_clears_it(self):
+        weights = dict(S.PAPER_WEIGHTS["one_to_two"])
+        weights.pop("sentiment")   # 运行时 set(weights) != expected → weights={}
+        self._set_overlay("tq_breakout", weights)
+        self.assertEqual([], self._deployments())
+
+    def test_disallowed_model_family_falls_back_and_is_not_recorded(self):
+        # sector_rotation 只允许 sentiment_pioneer；声明 trend_continuation 会
+        # 回落到 source，键集随之不符，运行时权重被清空。
+        with self._paper_ctx() as conn:
+            conn.execute("INSERT INTO paper_accounts(id,params,updated_at) VALUES(?,?,?)",
+                         ("sector_rotation", "{}", self._iso(0)))
+        self._set_overlay("sector_rotation", dict(S.PAPER_WEIGHTS["trend_continuation"]),
+                          model_family="trend_continuation")
+        self.assertEqual([], self._deployments())
 
 
 if __name__ == "__main__":

@@ -8505,20 +8505,9 @@ def _adaptive_selection(account, asof_day=None):
         meta.get("effective_date"), asof_day=asof_day, status=meta.get("status")
     ):
         return {}
-    weights = overlay.get("weights") or {}
     source = ACCOUNT_SPECS.get(account.get("id"), {}).get("source_strategy")
-    model_family = str(overlay.get("model_family") or source)
-    allowed = {
-        "tq_breakout": {"one_to_two"},
-        "trend_pullback": {"bottom_reversal", "trend_continuation"},
-        "sector_rotation": {"sentiment_pioneer"},
-        NEW_STRATEGY_ID: {NEW_STRATEGY_ID},
-    }.get(account.get("id"), {source})
-    if model_family not in allowed:
-        model_family = source
-    expected = set(S.PAPER_WEIGHTS.get(model_family, {}))
-    if set(weights) != expected:
-        weights = {}
+    model_family = S.selection_model_family(account.get("id"), overlay, source)
+    weights = S.selection_overlay_weights(account.get("id"), overlay, source)
     # Layer C：读路径内存级归一化（不写库），确保 stale overlay 不会继续生效。
     conditions = _normalize_selection_conditions(
         overlay.get("conditions") or {}, model_family, account.get("id"),
