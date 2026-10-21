@@ -670,8 +670,10 @@ def _ai_batches(items, config, trigger, conn_factory):
         return {"status": "deterministic_fallback", "analyzed": 0, "deterministic": len(items), "error": reason}
     analyzed = 0
     errors = []
-    for start in range(0, len(items), 20):
-        batch = items[start:start + 20]
+    # Bounded batches keep per-request generation within the selected slot's
+    # existing timeout, including models that spend output tokens on reasoning.
+    for start in range(0, len(items), 5):
+        batch = items[start:start + 5]
         evidence = [{
             "order_id": item["order_id"], "strategy": item.get("account_id"), "code": item.get("code"),
             "name": item.get("name"), "side": item.get("side"), "qty": item.get("qty"),
@@ -685,14 +687,15 @@ def _ai_batches(items, config, trigger, conn_factory):
         system = (
             "你是A股模拟盘盘后归因助手。只能根据输入中的确定性证据解释可能原因，"
             "不能把相关性写成已证实因果，不能补造公告、资金或行情；大盘拖累、板块拖累、"
-            "公告影响、个股超额都必须引用对应字段。只输出严格JSON："
+            "公告影响、个股超额都必须引用对应字段。每条摘要不超过60字，主要原因最多3项；"
+            "不要复述整笔交易或输出思考过程、Markdown。只输出一个严格JSON对象："
             '{"analyses":[{"order_id":1,"summary":"中文摘要","primary_causes":["大盘拖累"],"confidence":0}]}。'
         )
         user = "请逐笔返回分析，不要遗漏order_id。置信度0-100，证据不足就写‘证据不足’。\n" + _json(evidence)
         try:
             import ai_provider_transport
             response, _, _, _ = ai_provider_transport.call_json(
-                provider_config, system, user, max_tokens=2600)
+                provider_config, system, user, max_tokens=4000)
             rows = response.get("analyses") if isinstance(response, dict) else []
             mapping = {int(row.get("order_id")): row for row in rows if isinstance(row, dict) and str(row.get("order_id") or "").isdigit()}
             with conn_factory() as conn:

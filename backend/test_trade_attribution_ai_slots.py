@@ -88,6 +88,7 @@ class AttributionSlotTests(unittest.TestCase):
         self.assertEqual(request.get_header('Authorization'), 'Bearer canonical-test-key')
         self.assertEqual(timeout, 17)
         self.assertEqual(body['model'], 'slot-model')
+        self.assertEqual(body['max_tokens'], 4000)
         row = self.rows()[0]
         self.assertEqual((row['ai_status'], row['ai_provider']), ('completed', 'ai2'))
         self.assertEqual(row['ai_summary'], '市场共振，因果证据仍不足')
@@ -158,7 +159,7 @@ class AttributionSlotTests(unittest.TestCase):
         items = self.pending(21)
         result = self.run_ai(items)
         self.assertEqual(result['analyzed'], 21)
-        self.assertEqual([len(call[3]) for call in self.calls], [20, 1])
+        self.assertEqual([len(call[3]) for call in self.calls], [5, 5, 5, 5, 1])
         with mock.patch.object(transport, 'call_json', return_value=(
                 {'analyses': [{'order_id': items[0]['order_id'], 'summary': '部分返回', 'confidence': 20}]}, 1, 1, 1)):
             result = attribution._ai_batches(items[:2], {}, 'partial', self.connect)
