@@ -2,7 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, chart, tableScroll } from "../core/dom.js";
-import { adaptiveEsc, cny, fmt, fmtPct, paperStatusTag, pctCls, pctTxt, riskText, zhRiskText } from "../core/format.js";
+import { adaptiveEsc, adaptiveJsArg, cny, fmt, fmtPct, paperStatusTag, pctCls, pctTxt, riskText, shortStamp, zhRiskText } from "../core/format.js";
 import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 import { loadPaperAudit } from "./risk.js";
@@ -855,7 +855,7 @@ export async function renderPaperDashboard(d,auditRequest){
     }).join('');
     var recentOrders=(d.orders||[]).map(function(o){
       var view=paperOrderStatusView(o.status,o.reason), cancel=(!o.archived_cycle&&o.origin==='manual'&&['pending_limit','pending_execution','partially_filled'].indexOf(o.status)>=0)?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤销剩余</button>':'';
-      return '<div class="paper-order-row" data-account="'+o.account_id+'" data-date="'+String(o.created_at||'').slice(0,10)+'" data-side="'+o.side+'" data-status="'+o.status+'"><span>'+String(o.created_at||'').slice(5,16)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+o.code+'\')">'+o.name+'</button><br><small>'+o.code+' · '+(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
+      return '<div class="paper-order-row" data-account="'+adaptiveEsc(o.account_id)+'" data-date="'+adaptiveEsc(String(o.created_at||'').slice(0,10))+'" data-side="'+adaptiveEsc(o.side)+'" data-status="'+adaptiveEsc(o.status)+'"><span>'+shortStamp(o.created_at)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+adaptiveJsArg(o.code)+'\')">'+adaptiveEsc(o.name)+'</button><br><small>'+adaptiveEsc(o.code)+' · '+adaptiveEsc(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
         +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+' '+o.qty+paperExecutionFactsHtml(o)+'</span><span>'+fmt(o.filled_price||o.planned_price)+'</span>'
         +'<span class="paper-order-status '+view[0]+'">'+view[1]+'</span><span>'+cancel+'</span></div>';
     }).join('');
@@ -870,7 +870,7 @@ export async function renderPaperDashboard(d,auditRequest){
     var monitorState=latestMonitor&&latestMonitor.status;
     var monitorLabel=monitorState==='completed'?'已完成':(monitorState==='running'?'检查中':'异常');
     var monitorText=latestMonitor
-      ? '最近监控 '+String(latestMonitor.started_at||'').slice(5,16)+' · '+monitorLabel+' · '+(monitorReason||('检查 '+(monitorDetail.observed||0)+' 个底仓'))
+      ? '最近监控 '+shortStamp(latestMonitor.started_at)+' · '+monitorLabel+' · '+(monitorReason||('检查 '+(monitorDetail.observed||0)+' 个底仓'))
       : '尚未收到3分钟监控心跳';
     $('paperTerminalBoard').innerHTML='<div class="paper-terminal-head"><h3>\u5f53\u524d\u6301\u4ed3</h3><span style="color:var(--text-secondary);font-size:12px">'+running+' / '+(accounts.length||4)+' \u8d26\u6237\u8fd0\u884c \u00b7 '+monitorText+'</span></div>'
       +'<div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>\u53ef\u64cd\u4f5c\u5e95\u4ed3</span><div class="paper-filter-bar"><label>\u7b56\u7565</label><select id="paperPositionFilter" onchange="setPaperTerminalFilter(\'position\',this.value)">'+accountFilterOptions+'</select><label>\u72b6\u6001</label><select id="paperPositionStateFilter" onchange="setPaperTerminalFilter(\'positionState\',this.value)"><option value="all">\u5168\u90e8</option><option value="profit">\u6d6e\u76c8</option><option value="loss">\u6d6e\u4e8f</option><option value="sellable">\u53ef\u5356</option><option value="locked">T+1\u9501\u5b9a</option></select><span id="paperPositionVisible" class="paper-filter-count"></span></div></div><div class="paper-position-list">'+quickPositions+'<div id="paperPositionEmpty" class="paper-empty" hidden>\u8be5\u7b56\u7565\u5f53\u524d\u6ca1\u6709\u6301\u4ed3\u3002</div></div></div>';

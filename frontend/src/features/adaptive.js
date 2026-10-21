@@ -310,7 +310,27 @@ export function adaptiveTimelineRows(payload){
 
 export function adaptiveTimelineStatus(value){
   var key=String(value||'unknown').toLowerCase();
-  return ({completed:'已完成',success:'已完成',ok:'已完成',running:'运行中',in_progress:'运行中',processing:'处理中',queued:'排队中',pending:'待运行',retrying:'重试中',failed:'失败',error:'失败',blocked:'已阻断',skipped:'已跳过',unknown:'待记录'})[key]||adaptiveText(value,'待记录');
+  return ({completed:'已完成',success:'已完成',ok:'已完成',running:'运行中',in_progress:'运行中',processing:'处理中',queued:'排队中',pending:'待运行',retrying:'重试中',failed:'失败',error:'失败',blocked:'已阻断',skipped:'已跳过',killed:'已中断',cancelled:'已取消',timeout:'超时',intraday_observation:'午间观测',advisor_batch:'AI 审阅完成',advisor_skipped:'AI 审阅跳过',unknown:'待记录'})[key]||adaptiveText(value,'待记录');
+}
+
+/* 后端把失败原因存在 error_code 里，值可能是英文短语或异常类名。
+   直接把原文抛给操作员等于没解释，这里做一次已知原因的翻译。 */
+export function adaptiveTimelineError(code){
+  var text=adaptiveText(code,'');
+  if(!text) return '';
+  var key=text.toLowerCase();
+  var known={
+    'process killed (oom/restart) before completion; no finished_at':'进程未完成即被中断（内存不足或服务重启），没有结束时间',
+    'advisor_disabled':'AI 审阅未启用',
+    'api_key_missing':'缺少 API Key',
+    'research_asof_context_required':'缺少业务日与行情时点',
+    'provider_error':'模型服务返回错误',
+    'timeout':'调用超时',
+    'oom':'内存不足被终止',
+  };
+  if(known[key]) return known[key];
+  if(/^[a-z][a-z0-9_]*$/.test(text)) return '错误码：'+text;
+  return '错误：'+text;
 }
 
 export function adaptiveTimelineQuality(value){
@@ -341,12 +361,13 @@ export function adaptiveTimelineHtml(payload){
   var root=payload||{}, items=adaptiveTimelineRows(root), status=adaptiveTimelineStatus(root.status||'ok');
   if(!items.length) return '<div class="adaptive-ai-timeline-empty" style="padding:14px;border:1px dashed var(--border);border-radius:10px;color:var(--text-muted)">'+(root.message||'当前交易日尚无分时段 AI 分析记录；完成时段任务后会在这里显示。')+'</div>';
   var windowNames={premarket:'盘前',auction:'集合竞价',open:'开盘确认','open-confirm':'开盘确认',morning:'上午',noon:'午间',afternoon:'午后','risk-review':'风险复核','close-risk':'收盘风控',close:'收盘',adversarial:'对抗复核',manual:'手动运行'};
-  var cards=items.slice(0,40).map(function(item){
+  var shown=items.slice(0,10);
+  var cards=shown.map(function(item){
     var row=item.row,detail=item.detail,nested=item.nested;
-    var rawStatus=row.status||detail.status||nested.status||'unknown', label=windowNames[row.window||row.slot||row.phase]||adaptiveText(row.label||row.window||row.slot,'分时段分析');
-    var quality=row.data_quality||row.quality||detail.data_quality||detail.quality||nested.data_quality||{};
+    var rawStatus=row.status||detail.status||nested.status||'unknown', label=windowNames[row.analysis_window||row.window||row.slot||row.phase]||adaptiveText(row.analysis_window||row.label||row.window||row.slot,'分时段分析');
+    var quality=row.data_quality||row.quality||detail.data_quality||detail.quality||nested.data_quality||(row.deterministic_status?{status:row.deterministic_status}:{});
     var route=row.model_route||row.modelRoute||row.route||detail.model_route||detail.model_route_info||nested.model_route||{};
-    var routeText=typeof route==='string'?route:([route.provider||route.vendor,route.model||route.model_id,route.route||route.reason].filter(Boolean).join(' · ')||'规则快照 / AI路由未记录');
+    var routeText=typeof route==='string'?route:([row.provider,row.model,route.provider||route.vendor,route.model||route.model_id,route.route||route.reason].filter(Boolean).join(' · ')||'规则快照（未调用 AI）');
     var evidence=row.evidence_hash||row.evidenceHash||detail.evidence_hash||nested.evidence_hash||adaptiveJsonObject(row.evidence).evidence_hash||adaptiveJsonObject(detail.evidence).evidence_hash||'未记录';
     var shadow=row.shadow_recommendation||row.shadow||detail.shadow_recommendation||detail.shadow||nested.shadow_recommendation||{};
     var tune=adaptiveTimelineTune(row.auto_tuning||row.ai_tuning||row.tuning||detail.auto_tuning||detail.ai_tuning||nested.auto_tuning||{});
@@ -354,16 +375,19 @@ export function adaptiveTimelineHtml(payload){
     var retries=Number(row.retry_count==null?(row.retries==null?(detail.retry_count==null?0:detail.retry_count):row.retries):row.retry_count)||0;
     var attempts=Number(row.attempts==null?(detail.attempts==null?0:detail.attempts):row.attempts)||0;
     var time=String(row.finished_at||row.updated_at||row.started_at||row.created_at||'').replace('T',' ').replace(/[+]\d\d:\d\d$/,'').slice(0,19)||'时间未记录';
-    var retryable=['failed','error','retrying'].indexOf(String(rawStatus).toLowerCase())>=0||row.retryable===true;
-    var retry=retryable?'<button class="ghost" style="padding:5px 9px;font-size:11px" onclick="retryAdaptiveAiWindow(\''+encodeURIComponent(String(row.window||row.slot||'manual'))+'\')">重试</button>':'';
+    var retryable=['failed','error','retrying','killed'].indexOf(String(rawStatus).toLowerCase())>=0||row.retryable===true;
+    var retry=retryable?'<button class="ghost" style="padding:5px 9px;font-size:11px" onclick="retryAdaptiveAiWindow(\''+encodeURIComponent(String(row.analysis_window||row.window||row.slot||'manual'))+'\')">重试</button>':'';
+    var errorText=adaptiveTimelineError(row.error_code||row.error||detail.error);
     return '<article class="adaptive-ai-timeline-card" style="padding:13px;border:1px solid var(--border);border-radius:11px;background:var(--surface);display:grid;gap:8px">'
       +'<header style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><b>'+adaptiveEsc(label)+'</b><small style="display:block;color:var(--text-muted)">'+adaptiveEsc(time)+'</small></div><span class="tag '+(String(rawStatus).toLowerCase()==='completed'?'tag-ok':(retryable?'tag-warn':'tag-info'))+'">'+adaptiveEsc(adaptiveTimelineStatus(rawStatus))+'</span></header>'
-      +'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;font-size:12px"><span><small>重试</small><b>'+retries+' 次'+(attempts?' · '+attempts+' 次尝试':'')+'</b></span><span><small>数据质量</small><b>'+adaptiveEsc(adaptiveTimelineQuality(quality))+'</b></span><span><small>模型路由</small><b>'+adaptiveEsc(routeText)+'</b></span><span><small>证据哈希</small><b title="'+adaptiveEsc(String(evidence))+'">'+adaptiveEsc(String(evidence).length>20?String(evidence).slice(0,10)+'…'+String(evidence).slice(-8):String(evidence))+'</b></span><span><small>影子建议</small><b>'+adaptiveEsc(typeof shadow==='string'?shadow:(shadow.status||shadow.summary||shadow.recommendation||'未生成'))+'</b></span><span><small>自动微调</small><b>'+adaptiveEsc(tune.label)+'</b>'+(tune.proposal?'<small style="display:block;color:var(--text-muted)">'+adaptiveEsc(tune.proposal)+'</small>':'')+'</span><span><small>人工确认</small><b>'+adaptiveEsc(human)+'</b></span></div>'
-      +(row.error||detail.error?'<p style="margin:0;color:#a33;font-size:12px">'+adaptiveEsc(row.error||detail.error)+'</p>':'')
+      +'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px 14px;font-size:12px;line-height:1.5;word-break:break-word"><span><small>重试</small><b>'+retries+' 次'+(attempts?' · '+attempts+' 次尝试':'')+'</b></span><span><small>数据质量</small><b>'+adaptiveEsc(adaptiveTimelineQuality(quality))+'</b></span><span><small>模型路由</small><b>'+adaptiveEsc(routeText)+'</b></span><span><small>证据哈希</small><b title="'+adaptiveEsc(String(evidence))+'">'+adaptiveEsc(String(evidence).length>20?String(evidence).slice(0,10)+'…'+String(evidence).slice(-8):String(evidence))+'</b></span><span><small>影子建议</small><b>'+adaptiveEsc(typeof shadow==='string'?shadow:(shadow.status||shadow.summary||shadow.recommendation||'未生成'))+'</b></span><span><small>自动微调</small><b>'+adaptiveEsc(tune.label)+'</b>'+(tune.proposal?'<small style="display:block;color:var(--text-muted)">'+adaptiveEsc(tune.proposal)+'</small>':'')+'</span><span><small>人工确认</small><b>'+adaptiveEsc(human)+'</b></span></div>'
+      +(errorText?'<p style="margin:0;color:#a33;font-size:12px">'+adaptiveEsc(errorText)+'</p>':'')
       +(retry?'<footer style="display:flex;justify-content:flex-end">'+retry+'</footer>':'')
       +'</article>';
   }).join('');
-  return '<div style="display:grid;gap:10px"><div style="font-size:12px;color:var(--text-muted)">'+adaptiveEsc(root.trade_date||root.date||adaptiveLocalDate())+' · '+adaptiveEsc(status)+' · '+items.length+' 个时段</div>'+cards+'</div>';
+  var hiddenCount=Math.max(0,items.length-shown.length);
+  return '<div><div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">'+adaptiveEsc(root.trade_date||root.date||adaptiveLocalDate())+' · '+adaptiveEsc(status)+' · 共 '+items.length+' 个时段'+(hiddenCount?'，仅显示最近 '+shown.length+' 条':'')+'</div>'
+    +'<div class="adaptive-ai-timeline-scroll" style="display:grid;gap:10px;max-height:520px;overflow-y:auto;padding-right:6px">'+cards+'</div></div>';
 }
 
 export function renderAdaptiveTimeline(payload){
@@ -372,7 +396,9 @@ export function renderAdaptiveTimeline(payload){
 }
 
 export async function refreshAdaptiveTimeline(base){
-  var fallback=(base&& (base.ai_analysis_timeline||base.ai_timeline||base.timeline))||((base&&base.runs)?{runs:base.runs,trade_date:base.trade_date||base.date}:{});
+  // 不能拿 overview 的 learning runs 充当时间线：那是自进化运行记录，
+  // 日期与 trade_date 无关，混进来会让「今日时间线」显示历史条目。
+  var fallback=(base&&(base.ai_analysis_timeline||base.ai_timeline||base.timeline))||{};
   if(fallback&&typeof fallback==='object') renderAdaptiveTimeline(fallback);
   try{
     var day=adaptiveLocalDate(),timeline=await api('/api/adaptive/ai/timeline?trade_date='+encodeURIComponent(day)+'&limit=40&_='+Date.now());
@@ -468,7 +494,7 @@ export function renderAdaptive(d){
   var dynamicRisk=d.dynamic_risk||{},dynamicNews=dynamicRisk.news||{},dynamicMode=dynamicRisk.mode||'normal';
   var dynamicCodes=Object.keys(dynamicNews.codes||{}).slice(0,8).map(function(code){var item=dynamicNews.codes[code]||{};return code+' '+(item.verified_negative?'公告否决':'舆情收紧');}).join('、')||'暂无受影响个股';
   var dynamicRiskNotice='<div class="adaptive-dynamic-risk '+adaptiveEsc(dynamicMode)+'"><b>统一动态风控 · '+adaptiveEsc(dynamicRisk.label||'正常')+'</b><span>'+adaptiveEsc(dynamicRisk.reason||'风控中心尚未生成动态状态')+'</span><small>新增风险额度 '+adaptiveValue(dynamicRisk.risk_scale_pct,'%',1)+' · 负面事件 '+Number(dynamicNews.negative_count||0)+' 条 · 核验负面 '+Number(dynamicNews.verified_negative_count||0)+' 条 · 影响标的 '+adaptiveEsc(dynamicCodes)+'</small></div>';
-  var adaptiveTimelineFallback=d.ai_analysis_timeline||d.ai_timeline||((d.runs||[]).length?{runs:d.runs,trade_date:d.trade_date||d.date}:{});
+  var adaptiveTimelineFallback=d.ai_analysis_timeline||d.ai_timeline||{};
   var adaptiveTimelinePanel='<section class="adaptive-panel adaptive-ai-timeline-panel"><header><div><span>TODAY · AI ANALYSIS TIMELINE</span><h3>今日分时段 AI 分析时间线</h3></div><div class="adaptive-advisor-actions"><em id="adaptiveAiTimelineStatus">读取中</em><button class="ghost" onclick="refreshAdaptiveTimelineNow()">刷新时间线</button></div></header><p class="adaptive-copy">每个时段先固化确定性快照，再记录模型路由、数据质量、证据哈希与影子建议。AI 调参在运行中或待人工确认时不会显示为已生效。</p><div id="adaptiveAiTimelineContent"><div class="loading">正在读取今日 AI 分析记录…</div></div></section>';
   window._adaptiveDecisionId=decision.id||null;
   $('adaptiveModeBadge').textContent=engine.mode_label||'影子学习';
@@ -550,7 +576,6 @@ export function renderAdaptive(d){
   var neuralPanel='<section class="adaptive-panel neural-control-panel"><header><div><span>NEURAL SHADOW · HUMAN GATE</span><h3>神经网络候选评分</h3></div><em class="'+(neuralApproved?'tag-ok':'tag-warn')+'">'+adaptiveEsc(({shadow_only:'影子运行',approval_waiting_data:'已申请 · 等待数据',approval_waiting_evaluation:'已申请 · 等待样本外评估',approved_bounded_shadow:'人工确认 · 有界影子',disabled:'已停用'})[neural.status]||'影子运行')+'</em></header><p class="adaptive-copy">当前对已启用策略集合做候选排序对照，最多影响排序分 '+fmt(neural.max_rank_adjustment||0,3)+'；不直接下单、不绕过行情双源、板块权限、仓位、T+1或风控卖出。</p><div class="neural-gate-kpis"><div><small>特征样本</small><b>'+Number((neural.readiness||{}).feature_rows||0)+'</b></div><div><small>标签样本</small><b>'+Number((neural.readiness||{}).label_rows||0)+'</b></div><div><small>独立盘面日</small><b>'+Number((neural.readiness||{}).profile_days||0)+' / '+Number((neural.readiness||{}).requirements&&neural.readiness.requirements.min_profile_days||60)+'</b></div><div><small>可用周期</small><b>'+adaptiveEsc(((neural.readiness||{}).available_horizons||[]).join('/')||'—')+'</b></div></div><ul class="adaptive-guardrails neural-blockers">'+neuralBlockers+'</ul>'+(neuralReady&&!neuralApproved?'<button class="ghost" onclick="approveAdaptiveNeural()">人工确认，启用有界影子评分</button>':'')+(neuralApproved?'<div class="adaptive-notice">已确认：仅作为排序副分，硬门禁仍由原策略和风控最终决定。</div>':'<div class="adaptive-notice">未满足样本外门槛前，按钮不会放权；当前结果只记录在自进化证据中。</div>')+'</section>';
   $('adaptiveResult').innerHTML='<div class="adaptive-shell">'
     +closedLoopPanel
-    +adaptiveTimelinePanel
     +dataInputPanel
     +neuralPanel
     +portfolioPanel
@@ -567,6 +592,7 @@ export function renderAdaptive(d){
     +'<section class="adaptive-panel"><header><div><span>EVOLUTION A/B · VERSION ATTRIBUTION</span><h3>进化版本对照归因</h3></div><em>部署后 5 净值日 vs 部署前等长基线</em></header>'+abValidationPanel(d)+'</section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>GENETIC ALGORITHM</span><h3>GA Alpha 实验室</h3></div><em>非神经网络</em></header><p class="adaptive-copy">'+alpha.architecture+'</p><div class="adaptive-progress-copy"><span>画像日 '+Number(alpha.profile_days||0)+' / '+Number(alpha.required_profile_days||10)+'</span><span>成熟标签 '+Number(alpha.mature_rows||0)+' / '+Number(alpha.required_mature_rows||5000)+'</span></div>'+adaptiveBar(alphaProgress,'ga')+'<ul class="adaptive-alpha-list">'+candidateRows+'</ul></section><section class="adaptive-panel"><header><div><span>MULTI-HORIZON REWARD</span><h3>策略周期兑现</h3></div><em>1日 20% · 3日 35% · 5日 45%</em></header><div class="table-scroll"><table class="adaptive-horizon-table"><thead><tr><th>策略</th><th>1日超额</th><th>3日超额</th><th>5日超额</th></tr></thead><tbody>'+horizonRows+'</tbody></table></div></section></div>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>RISK GATE</span><h3>放权门槛</h3></div><em>默认全部锁定</em></header><ul class="adaptive-guardrails">'+guardrails+'</ul></section><section class="adaptive-panel"><header><div><span>AUDIT LOG</span><h3>真实学习日志</h3></div><em>不展示虚构迭代数</em></header><ul class="adaptive-run-log">'+runRows+'</ul></section></div>'
+    +adaptiveTimelinePanel
     +'</div>';
   var newsPanel=document.querySelector('#adaptiveResult .news-learning-panel');
   if(newsPanel){newsPanel.insertAdjacentHTML('beforebegin',tradeAttrPanel);}

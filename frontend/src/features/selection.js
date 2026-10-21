@@ -285,7 +285,7 @@ export function renderDataValidity(d){
   var source=d.source_health||{};
   $('dataValidityDetails').innerHTML='<b>数据源：</b>'+adaptiveEsc(source.healthy?'主源与独立源正常':'存在降级或未返回')+' · <b>最新交易日：</b>'+adaptiveEsc((d.reference||{}).latest_trade_date||'—')+' · <b>不复权兜底：</b>'+Number(c.fallback_unadjusted||0)+' 只 · <b>源快照年龄：</b>'+ (live.age_seconds==null?'—':fmt(live.age_seconds,0)+' 秒')
     +'<div style="margin-top:5px"><b>告警：</b><ul style="margin:3px 0 0 18px">'+warnings+'</ul></div>'
-    +'<div style="margin-top:6px;color:#7b8d84">人工更新：'+adaptiveEsc(u.status||'idle')+(u.job_id?' · '+adaptiveEsc(u.job_id):'')+(u.error?' · '+adaptiveEsc(u.error):'')+'</div>';
+    +'<div style="margin-top:6px;color:#7b8d84">人工更新：'+adaptiveEsc({idle:'空闲',running:'运行中',queued:'排队中',cancelling:'取消中',cancelled:'已取消',completed:'已完成',failed:'失败',error:'失败',timeout:'超时'}[String(u.status||'idle').toLowerCase()]||u.status||'空闲')+(u.job_id?' · '+adaptiveEsc(u.job_id):'')+(u.error?' · '+adaptiveEsc(u.error):'')+'</div>';
 }
 
 export async function loadDataValidity(){

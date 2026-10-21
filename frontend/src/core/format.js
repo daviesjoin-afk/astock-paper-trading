@@ -9,6 +9,14 @@ export function pctCls(v){ return v>0?'up':(v<0?'down':''); }
 
 export function pctTxt(v){ if(v===null||v===undefined||v===''||isNaN(v)) return '-'; return (v>0?'+':'')+fmt(v)+'%'; }
 
+/* 后端统一返回带 T 的 ISO 时间戳。直接 slice 会把 T 一起显示成
+   "01-02T09:30"，所以时间展示统一走这里。 */
+export function shortStamp(v){
+  var text=String(v||'').replace('T',' ');
+  if(!text) return '—';
+  return text.length>16?text.slice(5,16):text.slice(5);
+}
+
 export function yi(v){ if(v===null||v===undefined) return '-'; return fmt(v/1e8,1)+'亿'; }
 
 export function adaptiveEsc(value){

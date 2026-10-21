@@ -6,6 +6,10 @@ import { adaptiveEsc, riskText } from "../core/format.js";
 import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
+import { PAPER_STAGE_LABELS } from "./paper.js";
+
+// 周期状态直接印英文会让「当前周期：running」这种行看起来像没做完的界面。
+var CYCLE_STATUS_LABELS={running:'运行中',paused:'已暂停',pending:'待执行',completed:'已完成',archived:'已归档',idle:'空闲',starting:'启动中',stopping:'停止中'};
 import { settingsConfirm, toast, inlineError, confirmDialog } from "../ui/dialog.js";
 
 // ---------- 操作员授权（PR-2）----------
@@ -76,7 +80,7 @@ export function settingsAuditHtml(items){
   return '<div class="settings-audit-list">'+items.slice(0,20).map(function(item){
     var oldValue=typeof item.old_value==='object'?JSON.stringify(item.old_value):String(item.old_value==null?'—':item.old_value);
     var newValue=typeof item.new_value==='object'?JSON.stringify(item.new_value):String(item.new_value==null?'—':item.new_value);
-    return '<div class="settings-audit-item"><b>'+adaptiveEsc(item.key)+'</b>：'+adaptiveEsc(oldValue)+' → '+adaptiveEsc(newValue)+'<small>'+adaptiveEsc(item.updated_by||'human-ui')+' · '+adaptiveEsc(item.created_at||'')+'</small></div>';
+    return '<div class="settings-audit-item" style="overflow-wrap:anywhere"><b>'+adaptiveEsc(item.key)+'</b>：'+adaptiveEsc(oldValue)+' → '+adaptiveEsc(newValue)+'<small>'+adaptiveEsc(item.updated_by||'human-ui')+' · '+adaptiveEsc(item.created_at||'')+'</small></div>';
   }).join('')+'</div>';
 }
 
@@ -84,7 +88,7 @@ export function settingsPreviewHtml(data,section){
   var risk=(data.settings||{}).risk||{}, effective=(data.effective||{}), current=effective.current_cycle||{}, next=effective.next_cycle||{};
   var minimum=effective.dynamic_minimum_order_amount;
   return '<aside class="settings-panel settings-preview"><h3>本次修改影响</h3><p>保存后这里会同步显示运行时读取到的边界；带“下一周期”的项目不会改写当前账本。</p>'
-    +'<div class="settings-kpi"><small>当前周期</small><b>'+adaptiveEsc(current.status||'—')+' · '+settingsCurrency(current.capital)+'</b><span class="setting-help">'+adaptiveEsc(current.duration_label||'长期')+'</span></div>'
+    +'<div class="settings-kpi"><small>当前周期</small><b>'+adaptiveEsc(CYCLE_STATUS_LABELS[current.status]||current.status||'—')+' · '+settingsCurrency(current.capital)+'</b><span class="setting-help">'+adaptiveEsc(current.duration_label||'长期')+'</span></div>'
     +'<div class="settings-kpi"><small>下一周期</small><b>'+settingsCurrency(next.capital)+' · '+adaptiveEsc(next.duration_label||'长期')+'</b><span class="setting-help">启用 '+(next.enabled_strategies||[]).length+' 套策略</span></div>'
     +'<div class="settings-kpi"><small>动态最小建仓金额</small><b id="settingsMinimumPreview">'+settingsCurrency(minimum)+'</b><span class="setting-help">按周期金额 × 敞口 ÷ 席位 × 利用率向下取整</span></div>'
     +'<div class="settings-note"><strong>生效边界：</strong>共享池敞口、席位上限、单票绝对上限和建仓利用率在下一次扫描读取；资金、启用策略和策略参数在创建新周期时采用。</div>'
@@ -145,7 +149,7 @@ export function renderSettings(data){
     };
     var userCard=function(item){
       var runtime=item.runtime||{};
-      var stage=runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—';
+      var stage=runtime.runtime_ready?adaptiveEsc(PAPER_STAGE_LABELS[runtime.lifecycle_stage]||runtime.lifecycle_stage||'—'):'—';
       var scale=(runtime.runtime_ready&&runtime.capital_scale!=null)?Math.round(runtime.capital_scale*100)+'%':'—';
       return '<article class="strategy-user-card" data-strategy-user-id="'+adaptiveEsc(item.id)+'"><header><div><b>'+adaptiveEsc(item.name||item.id)+'</b><small>'+adaptiveEsc(item.id)+' · v'+(item.current_version||1)+'</small></div>'+wbStatusBadge(item.status)+'</header>'
         +'<div class="strategy-preview-grid"><dt>生命周期阶段</dt><dd>'+stage+'</dd><dt>资金系数</dt><dd>'+scale+'</dd></div>'
@@ -202,7 +206,7 @@ export function renderSettings(data){
         +'<div class="setting-row"><div class="setting-label"><b>配置状态</b><small>页面永不回显明文 Key；Key 留空表示保持现有值。</small></div>'
         +'<div class="setting-control"><span data-testid="ai-slot-'+slot+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
         +'<div class="setting-control"><label for="aiSlot_'+slot+'_displayName">显示名称</label><input data-testid="ai-slot-'+slot+'-display-name" id="aiSlot_'+slot+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="自定义名称，与稳定 id 解耦"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_baseUrl">Base URL</label><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="https://example.com/v1"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slot+'_baseUrl">Base URL</label><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="留空表示未配置；示例 https://api.deepseek.com/v1"></div>'
         +'<div class="setting-control"><label for="aiSlot_'+slot+'_model">模型名称</label><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" value="'+adaptiveEsc(s.model||'')+'" placeholder="由你填写，后端不做任何厂商假设"></div>'
         +'<div class="setting-control"><label for="aiSlot_'+slot+'_apiKey">API Key</label><input data-testid="ai-slot-'+slot+'-api-key" id="aiSlot_'+slot+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div>'
         +'<div class="setting-control"><label for="aiSlot_'+slot+'_timeout">超时（秒）</label><input data-testid="ai-slot-'+slot+'-timeout" id="aiSlot_'+slot+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div>'
