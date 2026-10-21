@@ -7830,6 +7830,7 @@ def _portfolio_allocation_service_config(conn=None):
     )
 
 
+@PTM.timed("execution.plan_build")
 def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
                                 account_id, symbol, intent_kind):
     """Capture exact facts and one explicit candidate plan on the caller transaction."""
@@ -7849,8 +7850,6 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
     snapshot = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=cycle_id, asof_day=asof_day,
         decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,
-        market_evidence_identity=MDC.snapshot_fingerprint(reading.snapshot)
-        if reading.snapshot is not None else None,
         market_reading=reading)
     eligible_ids = {str(value) for value in snapshot["execution_participant_ids"]}
     history_rows = PAW.read_canonical_allocation_weight_owner_rows(
@@ -7910,6 +7909,7 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
             "candidate_denied": bool(candidate_row.get("denial_reason"))}
 
 
+@PTM.timed("execution.plan_revalidate")
 def _revalidate_portfolio_entry_plan(conn, entry):
     """Revalidate the exact decision snapshot; never substitute a newer plan."""
     plan = entry["plan"]
@@ -7919,8 +7919,6 @@ def _revalidate_portfolio_entry_plan(conn, entry):
     current = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=plan["cycle_id"], asof_day=plan["asof_day"],
         decision_at=plan["decision_at"], builtin_scope=ACTIVE_ACCOUNT_IDS,
-        market_evidence_identity=(MDC.snapshot_fingerprint(reading.snapshot)
-                                  if reading.snapshot is not None else None),
         market_reading=reading)
     return (current["snapshot_id"] == plan["portfolio_snapshot_id"]
             and current["snapshot_fingerprint"]
@@ -9714,26 +9712,24 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # changed reservation, valuation, participant pin, or cycle invalidates this
     # attempt; it never selects a newer plan implicitly.
     try:
-        decision_instant = dt.datetime.fromisoformat(
-            str(exact_plan["decision_at"]).replace("Z", "+00:00"))
-        revalidation_reading = MDSvc.read_snapshot(
-            MDC.LIVE_MARKET_POLICY, now=decision_instant,
-            asof_day=exact_plan["asof_day"])
-        revalidated_snapshot = PRS.capture_portfolio_runtime_snapshot(
-            conn, cycle_id=exact_plan["cycle_id"],
-            asof_day=exact_plan["asof_day"],
-            decision_at=exact_plan["decision_at"],
-            builtin_scope=ACTIVE_ACCOUNT_IDS,
-            market_evidence_identity=(
-                MDC.snapshot_fingerprint(revalidation_reading.snapshot)
-                if revalidation_reading.snapshot is not None else None),
-            market_reading=revalidation_reading)
-        revalidation_matches = (
-            revalidated_snapshot["snapshot_id"]
-            == exact_plan["portfolio_snapshot_id"]
-            and revalidated_snapshot["snapshot_fingerprint"]
-            == exact_plan["portfolio_snapshot_fingerprint"]
-        )
+        with PTM.phase("execution.plan_revalidate"):
+            decision_instant = dt.datetime.fromisoformat(
+                str(exact_plan["decision_at"]).replace("Z", "+00:00"))
+            revalidation_reading = MDSvc.read_snapshot(
+                MDC.LIVE_MARKET_POLICY, now=decision_instant,
+                asof_day=exact_plan["asof_day"])
+            revalidated_snapshot = PRS.capture_portfolio_runtime_snapshot(
+                conn, cycle_id=exact_plan["cycle_id"],
+                asof_day=exact_plan["asof_day"],
+                decision_at=exact_plan["decision_at"],
+                builtin_scope=ACTIVE_ACCOUNT_IDS,
+                market_reading=revalidation_reading)
+            revalidation_matches = (
+                revalidated_snapshot["snapshot_id"]
+                == exact_plan["portfolio_snapshot_id"]
+                and revalidated_snapshot["snapshot_fingerprint"]
+                == exact_plan["portfolio_snapshot_fingerprint"]
+            )
     except Exception as exc:
         revalidation_matches = False
         risk["allocation_revalidation_error"] = type(exc).__name__
