@@ -81,3 +81,10 @@ test('模型名称支持从上游列表选择', () => {
   const bridge = source('../src/bridge.js');
   assert.ok(bridge.includes('window.refreshAiProviderModels'), '获取模型函数未挂到全局');
 });
+
+test('授权页提供关闭写操作凭据的开关', () => {
+  const text = source('../src/features/settings.js');
+  assert.ok(text.includes('settingOperatorAuth'), '缺少凭据开关');
+  assert.ok(text.includes('payload.security={operator_auth_required'), '保存时未提交该设置');
+  assert.ok(text.includes('任何能访问本站的人都能修改配置'), '关闭前缺少风险提示');
+});

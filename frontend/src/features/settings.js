@@ -192,10 +192,13 @@ export function renderSettings(data){
       +'</div><div class="settings-actions"><button data-testid="settings-save-notification" onclick="saveSettingsSection(\'notification\')">保存推送设置</button><button class="ghost" data-testid="settings-test-notification" onclick="testWxpusher()">发送测试推送</button><button class="ghost" onclick="resetSettingsSection(\'notification\')">恢复默认</button></div>'
       +'<div class="settings-note">appToken 保存在服务端，接口只回显掩码；保存时留空表示保持原值。测试推送会真的发到微信，需要二次确认。发送时间由后台调度任务读取，修改后下一轮调度生效。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='operator'){
+    var security=settings.security||{}, authRequired=security.operator_auth_required!==false;
     html='<div class="settings-grid"><section class="settings-panel"><h3>操作员授权</h3>'
       +'<p>本页只管理<strong>本标签页</strong>的写操作凭据，不涉及账户体系。凭据保存在 sessionStorage：本标签页刷新后保留，关闭标签页即消失。'
       +'只读接口（看板、行情、健康检查）不需要授权；写接口在未授权时会返回 401，前端不会自动重放，请解锁后重新点击原操作。</p>'
       +renderOperatorUnlockPanel()
+      +'<div class="setting-row"><div class="setting-label"><b>写操作要求操作员凭据</b><small>关闭后任何能访问本站的人都能改配置、触发扫描和下模拟单。仅建议在受信网络的单机部署里关闭。</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingOperatorAuth" data-testid="setting-operator-auth" type="checkbox"'+settingsChecked(authRequired)+'><span>'+(authRequired?'要求凭据':'已关闭')+'</span></label></div></div>'
+      +'<div class="settings-actions"><button data-testid="settings-save-operator" onclick="saveSettingsSection(\'operator\')">保存授权设置</button></div>'
       +'<div class="settings-note"><strong>边界说明：</strong>这是一道单操作员共享密钥边界，不是 RBAC；它不替代既有的风险与人工确认门禁，也不会把凭据写入日志或页面。</div>'
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
@@ -303,8 +306,10 @@ export function collectStrategyOverrides(){
 export async function saveSettingsSection(section){
   var saveAnswer=await confirmDialog({
     kicker:'设置 · 写入审计',
-    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器',notification:'日报与周报推送'}[section]||section)+'”设置？',
-    bullets:['后端会校验取值范围，越界会被拒绝。','本次修改只影响下一周期，不改写当前账本。','保存会写入审计记录。'],
+    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器',notification:'日报与周报推送',operator:'操作员授权'}[section]||section)+'”设置？',
+    bullets:section==='operator'
+      ? ['关闭凭据后，任何能访问本站的人都能修改配置、触发扫描和下模拟单。','只影响写接口；只读看板与行情不受影响。','保存会写入审计记录。']
+      : ['后端会校验取值范围，越界会被拒绝。','本次修改只影响下一周期，不改写当前账本。','保存会写入审计记录。'],
     confirmText:'保存',
   });
   if(!saveAnswer.approved) return;
@@ -315,6 +320,7 @@ export async function saveSettingsSection(section){
   if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)};
   if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
   if(section==='notification') payload.notification={wxpusher_enabled:!!($('settingWxEnabled')||{}).checked,wxpusher_app_token:(($('settingWxToken')||{}).value||''),wxpusher_topic_id:(($('settingWxTopic')||{}).value||'').trim(),wxpusher_daily_enabled:!!($('settingWxDaily')||{}).checked,wxpusher_daily_time:(($('settingWxDailyTime')||{}).value||'15:40'),wxpusher_weekly_enabled:!!($('settingWxWeekly')||{}).checked,wxpusher_weekly_weekday:Number((($('settingWxWeekday')||{}).value)||5),wxpusher_weekly_time:(($('settingWxWeeklyTime')||{}).value||'15:45')};
+  if(section==='operator') payload.security={operator_auth_required:!!($('settingOperatorAuth')||{}).checked};
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
 }
 

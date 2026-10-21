@@ -61,6 +61,8 @@ DEFAULTS = {
     "wxpusher_weekly_enabled": False,
     "wxpusher_weekly_time": "15:45",
     "wxpusher_weekly_weekday": 5,
+    # 写接口是否要求操作员凭据。默认开启；单机模拟盘可显式关闭。
+    "operator_auth_required": True,
 }
 
 SETTING_GROUPS = {
@@ -78,6 +80,7 @@ SETTING_GROUPS = {
         "wxpusher_daily_enabled", "wxpusher_daily_time",
         "wxpusher_weekly_enabled", "wxpusher_weekly_time", "wxpusher_weekly_weekday",
     ),
+    "security": ("operator_auth_required",),
 }
 
 METADATA = {
@@ -103,6 +106,7 @@ METADATA = {
     "wxpusher_weekly_enabled": {"label": "启用周报", "apply_mode": "immediate", "recommended": False, "description": "每周指定星期推送一次本周净值、超额与选股 alpha 摘要。"},
     "wxpusher_weekly_time": {"label": "周报发送时间", "unit": "HH:MM", "apply_mode": "immediate", "recommended": "15:45", "description": "本地时区的发送时刻。"},
     "wxpusher_weekly_weekday": {"label": "周报星期", "unit": "1-7", "apply_mode": "immediate", "recommended": 5, "description": "1 = 周一，7 = 周日；默认周五收盘后。"},
+    "operator_auth_required": {"label": "写操作要求操作员凭据", "apply_mode": "immediate", "recommended": True, "description": "关闭后任何能访问该端口的人都能改配置、触发扫描与下模拟单；仅建议在受信网络的单机部署中关闭。"},
 }
 
 
@@ -376,6 +380,8 @@ def validate(updates: dict[str, Any], *, conn: sqlite3.Connection | None = None)
     for key in ("wxpusher_enabled", "wxpusher_daily_enabled", "wxpusher_weekly_enabled"):
         if key in updates:
             checked[key] = _boolean(updates[key], key)
+    if "operator_auth_required" in updates:
+        checked["operator_auth_required"] = _boolean(updates["operator_auth_required"], "operator_auth_required")
     if "wxpusher_app_token" in updates:
         token = str(updates["wxpusher_app_token"] or "").strip()
         if token and not (token.startswith("AT_") and 8 <= len(token) <= 128):

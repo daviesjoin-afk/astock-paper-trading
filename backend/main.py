@@ -492,6 +492,21 @@ def _warmup_caches():
 
 
 @asynccontextmanager
+def _sync_operator_bypass_from_settings() -> None:
+    """按运行时设置决定是否旁路操作员凭据。
+
+    读不到设置就保持校验开启（fail-safe）：宁可多要一次解锁，也不因为
+    一次读取失败把写接口敞开。
+    """
+    try:
+        import runtime_settings as _RSET
+        with P._db() as conn:
+            security = _RSET.read(conn).get("security") or {}
+        operator_auth.set_bypass(not bool(security.get("operator_auth_required", True)))
+    except Exception:
+        operator_auth.set_bypass(False)
+
+
 async def _lifespan(_app):
     # 启动阶段只加载应用代码：不扫描全市场 CSV、不拉财报/海外/全市场快照。
     # 这些工作改为用户触发功能时按需执行，避免双击启动占满 CPU、内存和网络。
@@ -499,6 +514,7 @@ async def _lifespan(_app):
     # 请求中调用 init_db()，因此必须在服务启动阶段为全新克隆创建基础表；
     # 否则空数据卷会出现首页/风险页因 paper_jobs/paper_cycles 缺表而 500。
     P.init_db()
+    _sync_operator_bypass_from_settings()
     # Deterministic demo mode: ASTOCK_DEMO=1 seeds a fully synthetic universe
     # and a narrated paper ledger (T+1 reject, stale-quote reject, hard-stop
     # sell, limit-up buy, NAV curve) so a fresh clone shows the whole
@@ -591,6 +607,13 @@ def _operator_request_context(request):
 
 @app.middleware("http")
 async def _operator_boundary(request, call_next):
+    if operator_auth.bypass_disabled():
+        # 操作员在设置中心显式关闭了凭据校验。安全响应头仍然添加，
+        # 只有 Bearer token 这一道门被拿掉。
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
     context = _operator_request_context(request)
     decision = operator_auth.evaluate_request(
         request.method,

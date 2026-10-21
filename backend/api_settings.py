@@ -10,6 +10,7 @@ import datetime as dt
 from fastapi import APIRouter, HTTPException, Query, Request
 
 import notify_wxpusher as NOTIFY
+import operator_auth
 import paper_sizing as sizing
 import paper_trading as P
 import runtime_settings as RSET
@@ -119,6 +120,7 @@ def _snapshot() -> dict:
             "evolution": {"evolution_interval_hours": defaults["evolution_interval_hours"]},
             "execution": {key: defaults[key] for key in RSET.SETTING_GROUPS["execution"]},
             "notification": {key: defaults[key] for key in RSET.SETTING_GROUPS["notification"]},
+            "security": {key: defaults[key] for key in RSET.SETTING_GROUPS["security"]},
         },
         "metadata": metadata,
         "effective": {
@@ -199,6 +201,9 @@ async def update_settings(request: Request, confirmed: bool = Query(False)):
             if runtime_updates:
                 RSET.update(conn, runtime_updates, actor="human-ui")
                 P._audit(conn, None, "settings_changed", "统一设置中心更新运行参数（详见设置审计）")
+                # 保存后立即生效，不必等重启；关闭时该状态会写进设置审计。
+                if "operator_auth_required" in runtime_updates:
+                    operator_auth.set_bypass(not bool(runtime_updates["operator_auth_required"]))
         if ai_updates:
             adaptive.update_ai_settings(ai_updates)
     except ValueError as exc:
