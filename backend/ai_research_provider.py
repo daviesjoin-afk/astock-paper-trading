@@ -58,6 +58,7 @@ hypothesis 时才发现 look-ahead。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -291,15 +292,20 @@ def _reject_future_evidence(events, as_of: str) -> None:
         )
 
 
-def _evidence_projection(event: ARC.InformationEvent) -> dict[str, Any]:
+def _evidence_projection(event: ARC.InformationEvent, display_id: str | None = None) -> dict[str, Any]:
     """给 LLM 看的一条事实：稳定 JSON，全部字段来自 typed event/ref。
 
     ``cross_source_verified`` 委托给 R27-A（它再委托 R24 的
     ``is_cross_source_verified``），**不**由本层比较 ``verification == "verified"``。
+
+    ``display_id`` 是给模型看的短 id。全市场横截面的 ``evidence_id`` 由
+    ``policy|kind|全部代码`` 拼成，实测 39KB；模型只要在 evidence_relations 里
+    复述一次就会耗尽输出预算（finish_reason=length、content 截断）。审计侧仍用
+    完整 id，映射只发生在 prompt 边界内。
     """
     ref = event.evidence_ref
     return {
-        "evidence_id": event.evidence_id,
+        "evidence_id": display_id or event.evidence_id,
         "kind": event.kind,
         "as_of": event.as_of,
         "source": event.source,
@@ -310,12 +316,46 @@ def _evidence_projection(event: ARC.InformationEvent) -> dict[str, Any]:
     }
 
 
+def _short_evidence_id(evidence_id: str) -> str:
+    """把可能极长的 evidence_id 压成可被模型复述的短 id。"""
+    text = str(evidence_id)
+    if len(text) <= _MAX_DISPLAY_ID_CHARS:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    head = text.split("|")[0][:24]
+    return "%s#%s" % (head, digest)
+
+
+def _restore_display_ids(payload: Mapping[str, Any], display_ids: dict[str, str]) -> Mapping[str, Any]:
+    """把模型复述的短 id 还原成完整 evidence_id，供后续严格校验。"""
+    short_to_full = {short: full for full, short in display_ids.items() if short != full}
+    if not short_to_full:
+        return payload
+    relations = payload.get("evidence_relations")
+    if not isinstance(relations, list):
+        return payload
+    restored = []
+    for item in relations:
+        if isinstance(item, Mapping):
+            evidence_id = item.get("evidence_id")
+            if isinstance(evidence_id, str) and evidence_id in short_to_full:
+                item = {**item, "evidence_id": short_to_full[evidence_id]}
+        restored.append(item)
+    return {**payload, "evidence_relations": restored}
+
+
 # 单条事实的 payload 上限。全市场行情快照原始 payload 实测 3.1MB，加上
 # evidence_id 会让请求体到 3.2MB，上游直接 400 拒绝（"request parameters
 # were rejected by the model provider"）——分析因此在任何模型上都不可能成功。
 # 保留结构与样本，丢掉逐只股票的明细。
 _MAX_PAYLOAD_BYTES = 24000
 _MAX_SAMPLE_ITEMS = 6
+# 给模型看的 evidence_id 上限。超过就走短 id + 映射，审计侧不受影响。
+_MAX_DISPLAY_ID_CHARS = 64
+# 研究输出的预算。推理型模型（如 step-5-preview）会先花掉一大截 reasoning
+# tokens：实测 1800 的预算里 1071 用于思考，答案被截断成 finish_reason=length
+# 且 content 为空。这里留出推理 + 正文的余量。
+RESEARCH_MAX_OUTPUT_TOKENS = 4000
 
 
 def _compact_payload(payload: Any, limit: int = _MAX_PAYLOAD_BYTES) -> Any:
@@ -347,8 +387,13 @@ def _compact_payload(payload: Any, limit: int = _MAX_PAYLOAD_BYTES) -> Any:
     return data
 
 
-def _build_user_prompt(*, as_of: str, subject: str, question: str, indexed) -> str:
-    evidence = [_evidence_projection(event) for event in indexed.values()]
+def _build_user_prompt(*, as_of: str, subject: str, question: str, indexed,
+                       display_ids: dict[str, str] | None = None) -> str:
+    display_ids = display_ids or {}
+    evidence = [
+        _evidence_projection(event, display_ids.get(event.evidence_id))
+        for event in indexed.values()
+    ]
     schema = {
         "thesis": "中文一句话结论",
         "confidence": 0.0,
@@ -511,7 +556,7 @@ def run_research(
     subject,
     question,
     events,
-    max_tokens=1800,
+    max_tokens=RESEARCH_MAX_OUTPUT_TOKENS,
 ):
     """把一组 typed facts 投给 provider，返回 :class:`ResearchProviderResult`。
 
@@ -533,10 +578,13 @@ def run_research(
     typed_events = _typed_events(events)
     _reject_future_evidence(typed_events, canonical_as_of)
     indexed = _index_events(typed_events)
+    # 全市场横截面的 evidence_id 有 39KB，直接给模型会让它在 evidence_relations
+    # 里复述时耗尽输出预算；prompt 边界内换成短 id，解析后立即还原。
+    display_ids = {eid: _short_evidence_id(eid) for eid in indexed}
 
     user_prompt = _build_user_prompt(
         as_of=canonical_as_of, subject=canonical_subject, question=question,
-        indexed=indexed,
+        indexed=indexed, display_ids=display_ids,
     )
     payload, input_tokens, output_tokens, latency_ms = transport.call_json(
         provider_config, _SYSTEM_PROMPT, user_prompt, max_tokens=max_tokens,
@@ -544,6 +592,7 @@ def run_research(
     if not isinstance(payload, Mapping):
         raise ResearchProviderProtocolError(REASON_INVALID_PROVIDER_RESPONSE)
 
+    payload = _restore_display_ids(payload, display_ids)
     _reject_authority_fields(payload)
     thesis = _required_text(payload.get("thesis"), what="thesis", limit=MAX_THESIS_CHARS)
     confidence = _confidence(payload.get("confidence"))

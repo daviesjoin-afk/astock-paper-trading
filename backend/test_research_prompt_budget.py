@@ -34,5 +34,35 @@ class PayloadCompactionTests(unittest.TestCase):
         self.assertLess(P._MAX_PAYLOAD_BYTES, 100_000)
 
 
+class DisplayIdTests(unittest.TestCase):
+    """全市场横截面的 evidence_id 有 39KB，模型复述它会耗尽输出预算。"""
+
+    def test_long_id_is_shortened_below_the_display_limit(self):
+        long_id = "live_market|full_market_snapshot|" + "|".join(
+            "%06d" % i for i in range(2000))
+        short = P._short_evidence_id(long_id)
+        self.assertLess(len(short), P._MAX_DISPLAY_ID_CHARS)
+        self.assertLess(len(short), 64)
+
+    def test_short_id_passes_through_unchanged(self):
+        self.assertEqual("abc123", P._short_evidence_id("abc123"))
+
+    def test_shortened_id_restores_to_the_full_one(self):
+        long_id = "live_market|snapshot|" + "|".join("%06d" % i for i in range(1500))
+        short = P._short_evidence_id(long_id)
+        payload = {"evidence_relations": [{"evidence_id": short, "relation": "supports"}]}
+        restored = P._restore_display_ids(payload, {long_id: short})
+        self.assertEqual(long_id, restored["evidence_relations"][0]["evidence_id"])
+
+    def test_unknown_ids_are_left_alone_so_validation_still_rejects_them(self):
+        payload = {"evidence_relations": [{"evidence_id": "made-up", "relation": "supports"}]}
+        out = P._restore_display_ids(payload, {"full": "short"})
+        self.assertEqual("made-up", out["evidence_relations"][0]["evidence_id"])
+
+    def test_output_budget_leaves_room_for_reasoning(self):
+        # 实测 1800 里 1071 被 reasoning 吃掉，正文被截断。
+        self.assertGreaterEqual(P.RESEARCH_MAX_OUTPUT_TOKENS, 3000)
+
+
 if __name__ == "__main__":
     unittest.main()

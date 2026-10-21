@@ -1096,7 +1096,7 @@ NETWORK_FREE_SEAMS = (
 )
 
 ALLOWED_RESEARCH_IMPORTS = {
-    "__future__", "collections", "dataclasses", "typing", "json",
+    "__future__", "collections", "dataclasses", "typing", "json", "hashlib",
     "ai_research_contract", "ai_provider_transport",
 }
 
