@@ -94,6 +94,12 @@
 .adaptive-alpha-list li { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 0; border-bottom:1px solid var(--adaptive-line); }
 .adaptive-alpha-list b { color:#dfe9f3; font:600 10px var(--font-data); }.adaptive-alpha-list p { margin:4px 0 0; color:var(--adaptive-muted); font-size:9px; }
 .adaptive-shell .table-scroll { border-color:var(--adaptive-line); background:transparent; }
+/* 自进化页的三张表此前没有样式定义：既没有横向滚动，也没有固定表头，
+   列一多就整页横向撑开或把右侧列裁掉。 */
+.adaptive-table { width:100%; border-collapse:collapse; font-size:12px; }
+.adaptive-table th { position:sticky; top:0; z-index:1; background:var(--surface,#fff); text-align:left; font-weight:500; color:var(--text-muted,#6b7280); padding:8px 10px; border-bottom:1px solid var(--border,#e5e7eb); white-space:nowrap; }
+.adaptive-table td { padding:8px 10px; border-bottom:1px solid var(--border-light,#eef1f3); vertical-align:top; word-break:break-word; }
+.adaptive-table tr:last-child td { border-bottom:0; }
 .adaptive-horizon-table th { background:#172233; color:#8195ae; border-color:var(--adaptive-line); }
 .adaptive-horizon-table td { color:#dbe6f1; border-color:var(--adaptive-line); }
 .adaptive-sample-chip { color:#8297b0; font:600 9px var(--font-data); }

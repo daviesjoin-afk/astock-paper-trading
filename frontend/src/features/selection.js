@@ -271,10 +271,12 @@ export function renderDataValidity(d){
   var c=d.coverage||{}, live=d.live_snapshot||{}, f=d.factor_cache||{}, u=d.incremental_update||{};
   var status=d.status==='ok'?'正常':(d.status==='degraded'?'需补数据':'不可用');
   var statusClass=d.status==='ok'?'tag-ok':(d.status==='degraded'?'tag-warn':'tag-warn');
+  // 没有盘中快照时覆盖率是"未知"，不能算成 0 再标红。
+  var liveCoverage=live.valid_today_rows==null?null:(Number(live.valid_today_rows)/Math.max(Number(c.universe)||1,1)*100);
   var cards=[
-    ['全市场K线覆盖',fmtPct(c.coverage_pct,1),dataValidityTone(c.coverage_pct,98,90),c.kline_files+'/'+c.universe+' 只'],
+    ['全市场K线覆盖',fmtPct(c.coverage_pct,1),dataValidityTone(c.coverage_pct,98,90),(c.kline_files==null||c.universe==null)?'—':(c.kline_files+'/'+c.universe+' 只')],
     ['完整日线新鲜度',fmtPct(c.fresh_pct,1),dataValidityTone(c.fresh_pct,98,90), '最近完整交易日 '+(d.reference&&d.reference.expected_reference_date||'—')],
-    ['盘中行情有效覆盖',fmtPct(live.valid_today_rows?live.valid_today_rows/Math.max(c.universe,1)*100:0,1),dataValidityTone(live.valid_today_rows?live.valid_today_rows/Math.max(c.universe,1)*100:0,98,90),live.valid_today_rows+' / '+(live.rows||0)+' 行'],
+    ['盘中行情有效覆盖',liveCoverage===null?'—':fmtPct(liveCoverage,1),dataValidityTone(liveCoverage,98,90),live.valid_today_rows==null?'无盘中快照':(live.valid_today_rows+' / '+(live.rows||0)+' 行')],
     ['选股因子缓存',fmtPct(f.eligible_factor_coverage_pct,1),dataValidityTone(f.eligible_factor_coverage_pct,98,90), '因子日 '+(f.factor_date||'—')]
   ];
   $('dataValidityStatus').className='tag '+statusClass; $('dataValidityStatus').textContent=status;

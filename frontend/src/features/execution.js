@@ -37,6 +37,16 @@ export async function loadPaperExecution(forceRefresh){
 
 export function execText(v){ return (v===null||v===undefined||v==='')?'—':riskText(String(v)); }
 
+// 执行画像的族、紧急度与委托状态在后端都是英文枚举。直接印出来等于把
+// 内部标识摆给操作员看，这里统一译成中文，未收录的值显式标注来源。
+export var EXEC_FAMILY_LABELS={breakout:'突破快速',trend:'趋势中速',mean_reversion:'均值回归',rotation:'轮动批量',event_driven:'事件核验',flow_momentum:'资金流严格时限',composite:'保守组合'};
+export var EXEC_URGENCY_LABELS={fast:'快速',medium:'中速',passive:'被动',batch:'批量',verified:'人工核验',strict_ttl:'严格时限',conservative:'保守'};
+export var EXEC_STATUS_LABELS={pending_verification:'待人工核验',pending_limit:'待成交',filled:'已成交',cancelled:'已撤销',rejected:'已拒绝',blocked:'已拦截',expired:'已过期',running:'运行中',active:'启用中',paused:'已暂停'};
+
+export function execFamilyLabel(v){ return v?adaptiveEsc(EXEC_FAMILY_LABELS[v]||('未知画像（'+v+'）')):'—'; }
+export function execUrgencyLabel(v){ return v?adaptiveEsc(EXEC_URGENCY_LABELS[v]||('未知紧急度（'+v+'）')):'—'; }
+export function execStatusLabel(v){ return v?adaptiveEsc(EXEC_STATUS_LABELS[v]||('未知状态（'+v+'）')):'—'; }
+
 export function execOrderTypeLabel(v){ return v==='market'?'市价':(v==='limit'?'限价':execText(v)); }
 
 export function execQueueRow(row,actions){
@@ -47,7 +57,7 @@ export function execQueueRow(row,actions){
     +'<td>'+fmt(row.qty,0)+'</td>'
     +'<td>'+execText(row.planned_price)+'</td>'
     +'<td>'+execText(row.profile_label)+'</td>'
-    +'<td><span class="tag '+(row.status==='pending_verification'?'tag-warn':'tag-info')+'">'+execText(row.status)+'</span></td>'
+    +'<td><span class="tag '+(row.status==='pending_verification'?'tag-warn':'tag-info')+'">'+execStatusLabel(row.status)+'</span></td>'
     +'<td class="exec-queue-reason">'+execText(row.reason)+'</td>'
     +'<td>'+(actions?'<div class="exec-queue-actions">'
         +'<button onclick="verifyExecutionOrder('+Number(row.order_id)+',1)">放行</button>'
@@ -71,9 +81,9 @@ export function renderPaperExecution(d){
     if(p.verification_required) flags.push('人工核验');
     if(p.strict_ttl) flags.push('严格时限');
     if(!flags.length) flags.push('—');
-    return '<tr><td><b>'+execText(p.family)+'</b></td>'
+    return '<tr><td><b>'+execFamilyLabel(p.family)+'</b></td>'
       +'<td>'+execText(p.label)+'</td>'
-      +'<td>'+execText(p.urgency)+'</td>'
+      +'<td>'+execUrgencyLabel(p.urgency)+'</td>'
       +'<td>'+execOrderTypeLabel(p.order_type)+'</td>'
       +'<td>'+(p.limit_offset_pct===null||p.limit_offset_pct===undefined?'—':fmt(p.limit_offset_pct,1)+'%')+'</td>'
       +'<td>'+(p.ttl_minutes===null||p.ttl_minutes===undefined?'不限':fmt(p.ttl_minutes,0)+' 分钟')+'</td>'
@@ -84,7 +94,7 @@ export function renderPaperExecution(d){
     var note=a.fallback_from?('未知画像 '+execText(a.fallback_from)+' 保守回落'):'';
     return '<tr'+(a.active?'':' class="exec-inactive"')+'><td><b>'+execText(a.name)+'</b></td>'
       +'<td>'+execText(a.id)+'</td>'
-      +'<td>'+execText(a.risk_profile)+'</td>'
+      +'<td>'+execFamilyLabel(a.risk_profile)+'</td>'
       +'<td>'+execText(a.label)+(note?'<small>（'+note+'）</small>':'')+'</td>'
       +'<td>'+execOrderTypeLabel(a.order_type)+'</td>'
       +'<td>'+(a.ttl_minutes===null||a.ttl_minutes===undefined?'不限':fmt(a.ttl_minutes,0)+' 分钟')+'</td>'

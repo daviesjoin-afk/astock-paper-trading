@@ -68,7 +68,9 @@ export function renderPaperAudit(d,filters,page){
   var options='<option value="">全部策略</option>'+(d.accounts||[]).map(function(a){return '<option value="'+riskText(a.id)+'"'+(a.id===filters.account_id?' selected':'')+'>'+riskText(a.name)+'</option>';}).join('');
   var audit=(d.alerts||[]).map(function(a){
     var validation=a.quote_validation||'';
-    var validationLabel=({cross_source_checked:'通过',cross_source_failed:'未通过',cross_source_unavailable:'未返回',not_applicable:'不适用',range_timestamp_checked:'主源通过',degraded_cross_source:'降级核验',stale:'主源过期',invalid:'主源无效',incomplete:'主源缺失',source_error:'主源异常',missing:'缺失',local_cache:'缓存行情'})[validation]||'未核验';
+    // 词表只在 format.js 的 zhRiskText 维护一份：这里原本另有一套映射，
+    // 同一个 cross_source_checked 在两处显示成不同文案。
+    var validationLabel=validation?zhRiskText(validation):'未核验';
     var validationClass=validation==='cross_source_checked'?'ok':(['cross_source_failed','cross_source_unavailable','invalid','incomplete','source_error','missing'].includes(validation)?'bad':(validation==='not_applicable'?'info':'warn'));
     var validationText=(a.quote_validation_detail||(validation==='not_applicable'?'账户级风险状态，不涉及个股行情':'未提供独立行情源校验结果'))+(a.cross_price_gap_pct!=null?'；价格差 '+fmt(a.cross_price_gap_pct,3)+'%':'')+(a.cross_pct_gap!=null?'；涨跌幅差 '+fmt(a.cross_pct_gap,3)+'%':'');
     var linked=a.linked_signal, actionText=a.action||'—';

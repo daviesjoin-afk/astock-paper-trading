@@ -373,11 +373,11 @@ export var PAPER_MARKET_REASON_LABELS={
 export function paperMarketDataHtml(md){
   md=md||{};
   var status=String(md.status||'unavailable');
-  var label=PAPER_MARKET_STATUS_LABELS[status]||status;
+  var label=PAPER_MARKET_STATUS_LABELS[status]||('未知状态（'+status+'）');
   var tone=(status==='fresh')?'tag-ok':(status==='unavailable'?'tag-warn':'tag-warn');
   var parts=[];
   if(md.as_of||md.observed_at) parts.push('最后可信时间 '+riskText(md.observed_at||md.as_of));
-  var reason=md.reason?(PAPER_MARKET_REASON_LABELS[md.reason]||md.reason):'';
+  var reason=md.reason?(PAPER_MARKET_REASON_LABELS[md.reason]||('未知原因（'+md.reason+'）')):'';
   if(reason) parts.push('原因：'+reason);
   if(md.verification&&md.verification!=='verified') parts.push('核验 '+riskText(md.verification));
   return '<div data-testid="paper-market-data-status" data-market-status="'+adaptiveEsc(status)+'">'

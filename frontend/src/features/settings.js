@@ -271,23 +271,28 @@ export function updateSettingsPreview(){
 export async function loadSettings(force){
   if(window._settingsLoading&&!force) return window._settingsLoading;
   window._settingsLoading=(async function(){
+    // 策略注册表与版本号是补充信息。冷启动后首次调用注册表可能耗时数十秒，
+    // 若与设置一起 Promise.all，整页会卡在「正在读取统一设置…」。
+    // 所以设置自己先渲染，注册表到货后再补一次渲染。
+    api('/api/strategies?include_archived=true&_='+Date.now(),{timeout:8000})
+      .then(function(registry){
+        if(registry&&Array.isArray(registry.items)){
+          window._registryItems=registry.items;
+          window._registrySummary=registry.summary||{};
+          window._registryError=null;
+        }else{
+          window._registryItems=null;
+          window._registryError='策略注册表读取失败，已回退到内置策略展示。';
+        }
+      })
+      .catch(function(){
+        window._registryItems=null;
+        window._registryError='策略注册表读取超时，已回退到内置策略展示。';
+      })
+      .finally(function(){ if(window._settingsPayload) renderSettings(window._settingsPayload); });
+    api('/api/version?_='+Date.now()).then(function(v){ window._appBuild=(v&&v.build)||''; }).catch(function(){});
     try{
-      // PR-47：策略集合与设置并行读取（Registry 是策略集合唯一权威）。
-      // PR-49：并行取后端发布标识，用于界面版本核验。
-      var results=await Promise.all([
-        api('/api/settings/?_='+Date.now()),
-        api('/api/strategies?include_archived=true&_='+Date.now()).catch(function(){ return null; }),
-        api('/api/version?_='+Date.now()).catch(function(){ return null; }),
-      ]);
-      window._appBuild=(results[2]&&results[2].build)||'';
-      var data=results[0];
-      if(results[1]&&Array.isArray(results[1].items)){
-        window._registryItems=results[1].items;
-        window._registrySummary=results[1].summary||{};
-        window._registryError=null;
-      }else{
-        window._registryItems=null; window._registryError='策略注册表读取失败，已回退到内置策略展示。';
-      }
+      var data=await api('/api/settings/?_='+Date.now());
       renderSettings(data);
       return data;
     }catch(e){

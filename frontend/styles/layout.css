@@ -74,7 +74,7 @@ tr:hover td { background:var(--surface-hover); }
 .paper-challenge-head { margin:4px 0 24px; }
 .paper-challenge-head h2 { font-size:22px; line-height:1.3; color:var(--text); letter-spacing:.2px; }
 .paper-challenge-head p { margin-top:18px; color:var(--text-secondary); font-size:16px; line-height:1.65; }
-.paper-challenge-table { overflow:hidden; border:1px solid #dfe5e8; border-radius:18px; background:var(--surface); box-shadow:0 10px 26px rgba(32,72,66,.05); }
+.paper-challenge-table { overflow:auto; border:1px solid #dfe5e8; border-radius:18px; background:var(--surface); box-shadow:0 10px 26px rgba(32,72,66,.05); }
 .paper-challenge-table table { font-size:16px; }
 .paper-challenge-table th { background:#f3f6f8; color:#8a94a6; padding:14px 12px; border:0; border-right:1px solid #dde3e7; font-size:16px; font-weight:500; letter-spacing:0; text-transform:none; }
 .paper-challenge-table th:last-child { border-right:0; }

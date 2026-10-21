@@ -56,12 +56,19 @@ function adaptiveResearchResultNotice(payload){
   var target=$('adaptiveResearchSuiteResults');
   if(!target||!Array.isArray(results)||!results.length) return;
   target.innerHTML='<b>本次研究执行结果</b><ul>'+results.map(function(item){
-    return '<li>'+adaptiveEsc(item.purpose||'unknown')+'：'+adaptiveEsc(item.status||'unknown')+(item.error_code?'（'+adaptiveEsc(item.error_code)+'）':'')+'</li>';
+    return '<li>'+adaptiveEsc(item.purpose||'未记录')+'：'+adaptiveEsc(item.status?adaptiveTimelineStatus(item.status):'未记录')+(item.error_code?'（'+adaptiveEsc(item.error_code)+'）':'')+'</li>';
   }).join('')+'</ul>';
 }
 
 export function adaptiveResearchStatusLabel(value){
   return ({supported:'支持（研究假设）',unsupported:'不支持（研究假设）',insufficient_evidence:'证据不足（研究假设）'})[String(value||'').toLowerCase()]||'未知研究状态';
+}
+
+/* 验证/鲁棒性视图的运行状态同样是英文枚举，直接印出来等于把内部标识
+   摆给操作员看。未收录的值显式标注，而不是裸英文。 */
+export function adaptiveRunStatusLabel(value){
+  var key=String(value||'unavailable').toLowerCase();
+  return ({ok:'正常',completed:'已完成',failed:'失败',error:'失败',blocked:'已阻断',unavailable:'不可用',pending:'待处理',running:'运行中',pass:'通过',fail:'未通过',observing:'观察中',insufficient:'样本不足'})[key]||('未知（'+value+'）');
 }
 
 export function adaptiveResearchConfidencePercent(value){
@@ -175,7 +182,7 @@ export function adaptiveValidationDetailHtml(run){
     +' · OOS '+adaptiveEsc((item.oos_period||{}).start||'—')+'–'+adaptiveEsc((item.oos_period||{}).end||'—')+'</li>';}).join('')+'</ol>':'<p>不可用：没有 walk-forward window。</p>';
   var reasons=Array.isArray(evidence.reason_codes)?evidence.reason_codes:[];
   var warnings=Array.isArray(evidence.pit_warnings)?evidence.pit_warnings:[];
-  return '<article class="adaptive-canonical-detail"><header><div><span>Canonical validation · '+adaptiveEsc(result.status||'unavailable')+'</span><h4>PIT '+adaptiveEsc(evidence.status||'BLOCKED')+'</h4></div><code>'+adaptiveEsc(run.run_key||'')+'</code></header>'
+  return '<article class="adaptive-canonical-detail"><header><div><span>Canonical validation · '+adaptiveEsc(adaptiveRunStatusLabel(result.status))+'</span><h4>PIT '+adaptiveEsc(adaptiveRunStatusLabel(evidence.status||'BLOCKED'))+'</h4></div><code>'+adaptiveEsc(run.run_key||'')+'</code></header>'
     +'<dl><div><dt>Experiment fingerprint</dt><dd>'+adaptiveEsc(run.experiment_fingerprint||'')+'</dd></div>'
     +'<div><dt>Strategy</dt><dd>'+adaptiveEsc(run.strategy_id||'')+' / v'+adaptiveEsc(run.strategy_version)+' / '+adaptiveEsc(run.strategy_checksum||'')+'</dd></div>'
     +'<div><dt>Code revision</dt><dd>'+adaptiveEsc(run.runner_code_revision||'不可用')+'</dd></div>'
@@ -194,7 +201,7 @@ export function adaptiveValidationDetailHtml(run){
 export function adaptiveValidationRunsHtml(payload){
   if(!payload||payload.status!=='ok'||!Array.isArray(payload.runs)) return '<p class="adaptive-research-error">Validation runs 暂时无法读取。</p>';
   if(!payload.runs.length) return '<p class="adaptive-research-empty">尚无 canonical validation run。</p>';
-  return '<div class="adaptive-canonical-run-list">'+payload.runs.map(function(run){return '<article class="adaptive-canonical-run"><div><b>'+adaptiveEsc(run.strategy_id)+' v'+adaptiveEsc(run.strategy_version)+'</b><span>'+adaptiveEsc(run.validation_status||'blocked')+'</span></div><p>'+adaptiveEsc(run.experiment_fingerprint||'')+'</p><small>'+adaptiveEsc(run.created_at||'')+' · '+adaptiveEsc((run.result||{}).status||'unavailable')+'</small><button class="ghost" onclick="openAdaptiveValidationRun(\''+adaptiveEsc(run.run_key)+'\')">查看 Experiment / Evidence / Result</button><button class="ghost" onclick="compareAdaptiveValidationRun(\''+adaptiveEsc(run.run_key)+'\')">加入比较</button>'+(run.id?'<button class="ghost" onclick="selectAdaptiveRobustnessRun('+Number(run.id)+')">R30 robustness</button>':'')+'</article>';}).join('')+'</div><div id="adaptiveValidationDetail" class="adaptive-canonical-research-detail"><p class="adaptive-research-empty">选择一条 run 查看详情。</p></div><div id="adaptiveValidationComparison" class="adaptive-canonical-research-detail"></div>';
+  return '<div class="adaptive-canonical-run-list">'+payload.runs.map(function(run){return '<article class="adaptive-canonical-run"><div><b>'+adaptiveEsc(run.strategy_id)+' v'+adaptiveEsc(run.strategy_version)+'</b><span>'+adaptiveEsc(adaptiveRunStatusLabel(run.validation_status||'blocked'))+'</span></div><p>'+adaptiveEsc(run.experiment_fingerprint||'')+'</p><small>'+adaptiveEsc(run.created_at||'')+' · '+adaptiveEsc(adaptiveRunStatusLabel((run.result||{}).status))+'</small><button class="ghost" onclick="openAdaptiveValidationRun(\''+adaptiveEsc(run.run_key)+'\')">查看 Experiment / Evidence / Result</button><button class="ghost" onclick="compareAdaptiveValidationRun(\''+adaptiveEsc(run.run_key)+'\')">加入比较</button>'+(run.id?'<button class="ghost" onclick="selectAdaptiveRobustnessRun('+Number(run.id)+')">R30 robustness</button>':'')+'</article>';}).join('')+'</div><div id="adaptiveValidationDetail" class="adaptive-canonical-research-detail"><p class="adaptive-research-empty">选择一条 run 查看详情。</p></div><div id="adaptiveValidationComparison" class="adaptive-canonical-research-detail"></div>';
 }
 
 export async function refreshAdaptiveValidationRuns(){
@@ -248,7 +255,7 @@ export function adaptiveRobustnessReportHtml(report){
     var regimeHtml=['trend','volatility'].map(function(axis){var labels=regimes[axis]||{};
       return '<div><b>'+adaptiveEsc(axis==='trend'?'趋势':'波动')+'</b><ul>'+Object.keys(labels).sort().map(function(label){return '<li>'+adaptiveEsc(label)+' · 收益 '+r29Metric(labels[label]&&labels[label].return)+' · 回撤 '+r29Metric(labels[label]&&labels[label].drawdown)+'</li>';}).join('')+'</ul></div>';
     }).join('');
-    return '<article class="adaptive-r30-case"><header><b>'+adaptiveEsc(scenario.category||evidence.category||'scenario')+'</b><span>'+adaptiveEsc(result.status||evidence.status||'unavailable')+'</span></header>'
+    return '<article class="adaptive-r30-case"><header><b>'+adaptiveEsc(scenario.category||evidence.category||'场景')+'</b><span>'+adaptiveEsc(adaptiveRunStatusLabel(result.status||evidence.status))+'</span></header>'
       +'<p>'+adaptiveEsc(JSON.stringify(scenario.parameters||evidence.parameters||{}))+'</p>'
       +(result.reason_code||evidence.reason_code?'<p class="adaptive-research-error">原因：'+adaptiveEsc(result.reason_code||evidence.reason_code)+'</p>':'')
       +'<dl>'+r30MetricRows(metrics)+'</dl><h5>相对 baseline</h5><dl>'+r30MetricRows(delta)+'</dl>'
@@ -826,14 +833,14 @@ export function renderEvolutionParams(params){
     max_proposals_per_run:'单次最大提案数',require_dual_confidence:'要求双AI置信度',
     min_dual_confidence:'双AI最低置信度'
   };
-  var h='<table class="adaptive-table"><thead><tr><th>参数</th><th>当前值</th></tr></thead><tbody>';
+  var h='<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>参数</th><th>当前值</th></tr></thead><tbody>';
   keys.forEach(function(k){
     var v=params[k];
     if(v==null)return;
     var display=typeof v==='boolean'?(v?'是':'否'):Number(v).toFixed(4);
     h+='<tr><td>'+adaptiveEsc(labels[k]||k)+'</td><td>'+display+'</td></tr>';
   });
-  h+='</tbody></table>';
+  h+='</tbody></table></div>';
   setEl('aiParamsTable',h);
 }
 
@@ -852,7 +859,7 @@ export function renderEvolutionMetrics(m){
 
 export function renderDualAiRuns(runs){
   if(!runs.length){setEl('aiRunsTable','<p>暂无调参记录</p>');return;}
-  var h='<table class="adaptive-table"><thead><tr><th>ID</th><th>触发</th><th>模式</th><th>状态</th><th>AI 1</th><th>AI 2</th><th>共识</th><th>时间</th><th>落地</th></tr></thead><tbody>';
+  var h='<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>ID</th><th>触发</th><th>模式</th><th>状态</th><th>AI 1</th><th>AI 2</th><th>共识</th><th>时间</th><th>落地</th></tr></thead><tbody>';
   runs.forEach(function(r){
     var statusClass=r.status==='consensus'?'up':(r.status==='failed'?'down':'');
     var reviewers=r.reviewers||{};
@@ -879,13 +886,13 @@ export function renderDualAiRuns(runs){
       +'<td>'+action+'</td>'
       +'</tr>';
   });
-  h+='</tbody></table>';
+  h+='</tbody></table></div>';
   setEl('aiRunsTable',h);
 }
 
 export function renderEvolutionLog(log){
   if(!log.length){setEl('aiLogTable','<p>暂无进化日志</p>');return;}
-  var h='<table class="adaptive-table"><thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>';
+  var h='<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>';
   log.forEach(function(e){
     var detail=e.detail||{};
     var desc='';
@@ -898,7 +905,7 @@ export function renderEvolutionLog(log){
       +'<td>'+adaptiveEsc(desc)+'</td>'
       +'</tr>';
   });
-  h+='</tbody></table>';
+  h+='</tbody></table></div>';
   setEl('aiLogTable',h);
 }
 
