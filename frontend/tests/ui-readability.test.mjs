@@ -59,7 +59,7 @@ test('时间线卡片字段网格允许长文本换行', () => {
 });
 
 test('AI 槽位表单用两列结构，标签不再挤在输入行里', () => {
-  const text = source('../src/features/settings.js');
+  const text = source('../src/features/ai-provider-settings.js');
   assert.ok(text.includes('ai-slot-form'), '缺少槽位表单类');
   assert.ok(!text.includes('<div class="setting-control"><label for="aiSlot_'),
     '标签仍与输入框挤在同一 flex 行，宽度会随标签长短参差');
@@ -73,10 +73,11 @@ test('槽位表单的输入框统一放宽', () => {
 });
 
 test('模型名称支持从上游列表选择', () => {
-  const text = source('../src/features/settings.js');
-  assert.ok(text.includes('list="aiSlot_'), '模型输入框未关联 datalist');
-  assert.ok(text.includes('fetchAiSlotModels'), '缺少获取模型的处理函数');
+  const text = source('../src/features/ai-provider-settings.js');
+  assert.ok(text.includes('<select id="aiSlot_'), '槽位未使用下拉框');
+  assert.ok(!text.includes('datalist'), '槽位仍使用输入框补全而不是下拉选择');
+  assert.ok(text.includes('refreshAiProviderModels'), '缺少获取模型的处理函数');
   assert.ok(text.includes('/models'), '未调用上游模型列表接口');
   const bridge = source('../src/bridge.js');
-  assert.ok(bridge.includes('window.fetchAiSlotModels'), '获取模型函数未挂到全局');
+  assert.ok(bridge.includes('window.refreshAiProviderModels'), '获取模型函数未挂到全局');
 });

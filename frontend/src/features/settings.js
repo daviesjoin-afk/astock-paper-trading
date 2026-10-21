@@ -7,6 +7,7 @@ import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
 import { PAPER_STAGE_LABELS } from "./paper.js";
+import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings } from "./ai-provider-settings.js";
 
 // 周期状态直接印英文会让「当前周期：running」这种行看起来像没做完的界面。
 var CYCLE_STATUS_LABELS={running:'运行中',paused:'已暂停',pending:'待执行',completed:'已完成',archived:'已归档',idle:'空闲',starting:'启动中',stopping:'停止中'};
@@ -199,32 +200,14 @@ export function renderSettings(data){
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
     var ais=ai.settings||{}, review=ai.review||{}, reviewSlots=review.slots||{}, slotOrder=review.slot_order||['ai1','ai2'], reviewMode=review.review_mode==='single'?'single':'dual';
-    var aiSlotCards=slotOrder.map(function(slot){
-      var s=reviewSlots[slot]||{}, enabled=!!s.enabled;
-      return '<div class="settings-panel ai-slot-form" data-testid="ai-slot-'+slot+'">'
-        +'<h4>'+adaptiveEsc(s.display_name||slot)+' <small class="setting-help">'+adaptiveEsc(slot)+'</small></h4>'
-        +'<div class="setting-row"><div class="setting-label"><b>配置状态</b><small>页面永不回显明文 Key；Key 留空表示保持现有值。</small></div>'
-        +'<div class="setting-control"><span data-testid="ai-slot-'+slot+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_displayName"><b>显示名称</b></label><small>自定义名称，与稳定 id 解耦。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-display-name" id="aiSlot_'+slot+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="例如 DeepSeek 主槽"></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_baseUrl"><b>接口地址</b></label><small>OpenAI 兼容的 Base URL。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="留空表示未配置，例如 https://api.deepseek.com/v1"></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_model"><b>模型名称</b></label><small>可手动填写，也可从上游可用模型里选。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" list="aiSlot_'+slot+'_modelList" value="'+adaptiveEsc(s.model||'')+'" placeholder="例如 deepseek-v4-flash"><datalist id="aiSlot_'+slot+'_modelList"></datalist><button type="button" class="ghost" data-testid="ai-slot-'+slot+'-models" onclick="fetchAiSlotModels(\''+slot+'\')">获取模型</button></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_apiKey"><b>API Key</b></label><small>留空表示保持现有 Key；清除请点下方「清除 Key」。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-api-key" id="aiSlot_'+slot+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><label for="aiSlot_'+slot+'_timeout"><b>超时（秒）</b></label><small>单次调用等待上限，5–300 秒。</small></div><div class="setting-control"><input data-testid="ai-slot-'+slot+'-timeout" id="aiSlot_'+slot+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div></div>'
-        +'<div class="setting-row"><div class="setting-label"><b>启用该槽位</b><small>停用后不参与审阅与调参。</small></div><div class="setting-control"><label class="settings-exec-toggle"><input data-testid="ai-slot-'+slot+'-enabled" id="aiSlot_'+slot+'_enabled" type="checkbox"'+settingsChecked(enabled)+'><span>'+(enabled?'启用':'停用')+'</span></label></div></div>'
-        +'<div class="settings-actions">'
-        +'<button data-testid="ai-slot-'+slot+'-save" onclick="saveAiSlot(\''+slot+'\')">保存该槽位</button>'
-        +'<button class="ghost" data-testid="ai-slot-'+slot+'-test" onclick="testAiSlot(\''+slot+'\')">测试连接</button>'
-        +'<button class="ghost" data-testid="ai-slot-'+slot+'-clear" onclick="clearAiSlotKey(\''+slot+'\')">清除 Key</button>'
-        +'</div>'
-        +'<div class="setting-help" data-testid="ai-slot-'+slot+'-feedback"></div>'
-        +'</div>';
-    }).join('');
+    var aiSlotCards=renderAiSlotCards(review);
     var singleSlotOptions=slotOrder.map(function(slot){
       var s=reviewSlots[slot]||{};
-      return '<option value="'+slot+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc((s.display_name||slot)+' · '+slot)+'</option>';
+      return '<option value="'+slot+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc(slot.toUpperCase()+(s.provider_name?' · '+s.provider_name:''))+'</option>';
     }).join('');
     html='<div class="settings-grid"><section class="settings-panel"><h3>AI 审核</h3>'
-      +'<p>这里管理<strong>两个完全独立</strong>的 AI 槽位与审核模式。名称、地址、模型全部由你填写；后端不认识任何厂商身份，请求体是最小公共的 OpenAI 兼容格式。</p>'
+      +'<p>先保存不同的提供商，再为 AI1、AI2 下拉选择提供商和模型。</p>'
+      +renderProviderLibrary(review)+aiSlotCards+'<h4 class="ai-review-heading">3. 审核模式与运行开关</h4>'
       +'<div class="settings-form">'
       +settingsInputRow('evolution_interval_hours','自进化周期','收盘学习任务之间的最短间隔，范围 1–168 小时。','<input id="settingEvolutionInterval" type="number" min="1" max="168" step="1" value="'+Number(evo.evolution_interval_hours||24)+'"> <span class="setting-value-preview">小时</span>')
       +'<div class="setting-row"><div class="setting-label"><b>审核模式</b><small>单AI：只用选定槽位，结果仅供参考、永不构成共识。双AI：两个槽位独立分析后过共识门禁，缺一个即整体拦截，绝不降级成单AI。</small></div>'
@@ -237,7 +220,6 @@ export function renderSettings(data){
       +'<div class="setting-row"><div class="setting-label"><b>调参模式</b><small>shadow 最稳，intraday 更及时，close 只在收盘运行。</small></div><div class="setting-control"><select id="settingAiMode"><option value="shadow"'+(ais.llm_realtime_mode==='shadow'?' selected':'')+'>shadow · 只观察</option><option value="intraday"'+(ais.llm_realtime_mode==='intraday'?' selected':'')+'>intraday · 盘中候选</option><option value="close"'+(ais.llm_realtime_mode==='close'?' selected':'')+'>close · 收盘候选</option></select></div></div>'
       +'</div><div class="settings-actions"><button data-testid="settings-save-ai-review" onclick="saveAiReviewMode()">保存审核模式</button><button class="ghost" data-testid="settings-save-ai-switches" onclick="saveSettingsSection(\'evolution\')">保存 AI 开关</button><button class="ghost" onclick="resetSettingsSection(\'evolution\')">恢复默认</button></div>'
       +'<div class="settings-note"><strong>安全边界：</strong>单AI审阅的运行状态是 <code>single_review</code>，不是 <code>consensus</code>，因此永远无法穿过人工应用门禁；双AI的共识提案仍需人工确认后才生效。自进化周期只控制后台学习频率，不改变已启用策略的交易硬规则。</div>'
-      + aiSlotCards
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }
   target.innerHTML=html;
@@ -289,7 +271,9 @@ export async function loadSettings(force){
         window._registryItems=null;
         window._registryError='策略注册表读取超时，已回退到内置策略展示。';
       })
-      .finally(function(){ if(window._settingsPayload) renderSettings(window._settingsPayload); });
+      .finally(function(){
+        if(window._settingsPayload&&['simulation','strategy'].indexOf(window._settingsSection||'simulation')>=0) renderSettings(window._settingsPayload);
+      });
     api('/api/version?_='+Date.now()).then(function(v){ window._appBuild=(v&&v.build)||''; }).catch(function(){});
     try{
       var data=await api('/api/settings/?_='+Date.now());
@@ -377,34 +361,7 @@ export async function clearWxpusherToken(){
   }catch(e){ toast('清除失败：'+((e&&e.message)||e), { tone:'danger' }); }
 }
 
-// ---------- AI 槽位：从上游拉取可用模型 ----------
-export async function fetchAiSlotModels(slot){
-  var feedback=document.querySelector('[data-testid="ai-slot-'+slot+'-feedback"]');
-  var list=document.getElementById('aiSlot_'+slot+'_modelList');
-  var input=document.getElementById('aiSlot_'+slot+'_model');
-  if(feedback) feedback.textContent='正在从上游读取可用模型…';
-  try{
-    var data=await api('/api/settings/ai-review/slots/'+encodeURIComponent(slot)+'/models');
-    if(data&&data.ok===false){
-      if(feedback) feedback.textContent='读取模型失败：'+(data.error||'未知原因')+'（请先保存接口地址与 API Key）';
-      return;
-    }
-    var models=(data&&data.models)||[];
-    if(list) list.innerHTML=models.map(function(id){return '<option value="'+adaptiveEsc(id)+'"></option>';}).join('');
-    if(feedback){
-      feedback.textContent=models.length
-        ? ('已读取 '+models.length+' 个可用模型；点「模型名称」输入框即可选择。')
-        : '上游没有返回可用模型，可继续手动填写。';
-    }
-    if(models.length&&input) input.focus();
-  }catch(e){
-    if(feedback) feedback.textContent='读取模型失败：'+((e&&e.message)||e);
-  }
-}
-
-// ---------- 通用 AI 槽位（ai1 / ai2）----------
-// 全部走 /api/settings/ai-review*：GET 永不回显明文 Key，保存时空 Key = 保持旧 Key，
-// 清空必须显式走“清除 Key”按钮（后端 clear_api_key=true）。
+// ---------- AI1 / AI2 选择与审核模式 ----------
 export function aiSlotFeedback(slot,message,tone){
   var node=document.querySelector('[data-testid="ai-slot-'+slot+'-feedback"]');
   if(!node) return;
@@ -436,48 +393,21 @@ export async function saveAiReviewMode(){
 }
 
 export async function saveAiSlot(slot){
-  var read=function(suffix){var node=$('aiSlot_'+slot+'_'+suffix);return node?String(node.value||'').trim():'';};
+  var providerNode=$('aiSlot_'+slot+'_provider'), modelNode=$('aiSlot_'+slot+'_model');
   var enabledNode=$('aiSlot_'+slot+'_enabled');
-  var body={
-    display_name:read('displayName'),
-    base_url:read('baseUrl'),
-    model:read('model'),
-    enabled:!!(enabledNode&&enabledNode.checked),
-  };
-  var timeoutRaw=read('timeout');
-  if(timeoutRaw) body.timeout_seconds=Number(timeoutRaw);
-  var apiKey=read('apiKey');
-  if(apiKey) body.api_key=apiKey;
-  var answer=await confirmDialog({
-    kicker:'设置 · AI 槽位 '+slot,
-    title:'保存槽位 '+slot+' 的接口配置？',
-    bullets:['API Key 只写入后端安全存储，页面和日志不回显明文。','留空 Key 表示保持现有 Key；要清空请用“清除 Key”。','两个槽位完全独立，保存本槽位不会改动另一个。'],
-    confirmText:'保存槽位',
-  });
+  var body={provider_id:providerNode?providerNode.value:'',model:modelNode?modelNode.value:'',enabled:!!(enabledNode&&enabledNode.checked)};
+  if(!body.provider_id||!body.model){ aiSlotFeedback(slot,'请先选择已保存的提供商和模型。','danger'); return; }
+  var answer=await confirmDialog({title:'保存 '+slot.toUpperCase()+' 设置？',detail:'该 AI 将使用所选提供商的接口配置与模型。',confirmText:'保存设置'});
   if(!answer.approved) return;
+  var button=document.querySelector('[data-testid="ai-slot-'+slot+'-save"]');
+  if(button) button.disabled=true;
+  aiSlotFeedback(slot,'正在保存…');
   try{
-    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
-    await loadSettings(true);
-    toast('槽位 '+slot+' 已保存（页面仅显示掩码状态）。');
-  }catch(e){
-    aiSlotFeedback(slot,'保存失败：'+((e&&e.message)||e),'danger');
-    toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });
-  }
-}
-
-export async function clearAiSlotKey(slot){
-  var answer=await confirmDialog({
-    kicker:'设置 · 清除 Key',
-    title:'清除槽位 '+slot+' 的 API Key？',
-    bullets:['清除后该槽位变为未配置：单AI模式 fail-closed，双AI模式整体阻断。','地址、模型、开关与超时保持不变。','清除立即生效，无需重启扫描。'],
-    confirmText:'清除 Key',
-  });
-  if(!answer.approved) return;
-  try{
-    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',{clear_api_key:true});
-    await loadSettings(true);
-    toast('已清除槽位 '+slot+' 的 API Key。');
-  }catch(e){toast('清除失败：'+((e&&e.message)||e), { tone: 'danger' });}
+    var review=await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
+    applyAiReviewSettings(review,slot);
+    aiSlotFeedback(slot,slot.toUpperCase()+' 设置已保存。','ok');
+  }catch(e){ aiSlotFeedback(slot,'保存失败：'+e.message,'danger'); }
+  finally{ if(button&&button.isConnected) button.disabled=false; }
 }
 
 export async function testAiSlot(slot){

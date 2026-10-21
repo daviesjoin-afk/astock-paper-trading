@@ -244,7 +244,7 @@ async def update_ai_key(request: Request, confirmed: bool = Query(False)):
 _AI_REVIEW_KEYS = {"review_mode", "single_reviewer_slot"}
 _AI_SLOT_KEYS = {
     "api_key", "base_url", "model", "enabled",
-    "display_name", "timeout_seconds", "clear_api_key",
+    "display_name", "timeout_seconds", "clear_api_key", "provider_id",
 }
 
 
@@ -303,6 +303,8 @@ async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Q
         raise HTTPException(status_code=422, detail="enabled必须是布尔值")
     if "clear_api_key" in body and not isinstance(body["clear_api_key"], bool):
         raise HTTPException(status_code=422, detail="clear_api_key必须是布尔值")
+    if "provider_id" in body and not isinstance(body["provider_id"], str):
+        raise HTTPException(status_code=422, detail="provider_id必须是字符串")
     try:
         return adaptive.update_ai_slot_fn(
             slot,
@@ -313,11 +315,44 @@ async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Q
             display_name=body.get("display_name"),
             timeout_seconds=body.get("timeout_seconds"),
             clear_api_key=bool(body.get("clear_api_key")),
+            **({"provider_id": body["provider_id"]} if "provider_id" in body else {}),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"保存AI槽位失败：{type(exc).__name__}") from exc
+
+
+@router.post("/ai-review/providers")
+async def create_ai_provider(request: Request, confirmed: bool = Query(False)):
+    return await _save_ai_provider(request, confirmed)
+
+
+@router.put("/ai-review/providers/{provider_id}")
+async def update_ai_provider(provider_id: str, request: Request, confirmed: bool = Query(False)):
+    return await _save_ai_provider(request, confirmed, provider_id)
+
+
+async def _save_ai_provider(request, confirmed, provider_id=None):
+    _require_confirmation(confirmed, "保存AI提供商")
+    body = await _read_json_object(request, "提供商配置必须是JSON对象")
+    try:
+        return _get_adaptive().save_ai_provider_fn(provider_id, **body)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存提供商失败：{type(exc).__name__}") from exc
+
+
+@router.post("/ai-review/providers/{provider_id}/models/refresh")
+def refresh_ai_provider_models(provider_id: str, confirmed: bool = Query(False)):
+    _require_confirmation(confirmed, "读取提供商模型")
+    try:
+        return _get_adaptive().refresh_ai_provider_models_fn(provider_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取模型失败：{type(exc).__name__}") from exc
 
 
 @router.post("/ai-review/slots/{slot}/test")

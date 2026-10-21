@@ -64,9 +64,10 @@ test('设置中心状态不再直接印英文枚举', () => {
 });
 
 test('Base URL 的 placeholder 不再像一个真实地址', () => {
-  const text = source('../src/features/settings.js');
-  assert.ok(!text.includes('placeholder="https://example.com/v1"'), '示例地址仍会被误读为已配置');
-  assert.ok(text.includes('留空表示未配置'), 'placeholder 未说明留空语义');
+  const text = source('../src/features/ai-provider-settings.js');
+  assert.ok(!/placeholder="https?:/.test(text), '示例地址仍会被误读为已配置');
+  assert.ok(text.includes('填写提供商的完整接口地址'), 'placeholder 未引导填写自有地址');
+  assert.ok(!/deepseek|mimo/i.test(text), '界面仍绑定特定厂商');
 });
 
 test('选股页人工更新状态已翻译', () => {

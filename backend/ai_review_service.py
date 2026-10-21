@@ -5,8 +5,8 @@
 
 - 稳定 id 只有 ``ai1`` / ``ai2``；厂商名字降级为用户可改的 ``display_name``，
   只用于展示与审计文案，**永不参与任何分支判断**。
-- 两个槽位的 ``api_key`` / ``base_url`` / ``model`` / ``enabled`` / ``timeout``
-  完全独立；任一槽位的写入、禁用或调用失败都不得改写另一个槽位。
+- 槽位可引用用户保存的任意提供商，运行时从提供商读取地址、密钥和超时。
+  ``model`` / ``enabled`` 仍独立；槽位的写入、禁用或调用失败不得改写另一个槽位。
 - 请求体是**最小公共 OpenAI 兼容负载**（model / messages / response_format /
   max_tokens / stream），不按槽位身份增删字段，也没有 ``if slot == "ai1"`` 式分支。
 - ``review_mode`` 只有两种取值：
@@ -77,6 +77,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ai_provider_transport as transport
@@ -295,6 +296,22 @@ _SLOT_TABLES_DDL = """
                 CHECK(single_reviewer_slot IN ('ai1','ai2')),
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ai_saved_providers(
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            api_key TEXT NOT NULL DEFAULT '',
+            base_url TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL DEFAULT 40,
+            models TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_slot_provider_bindings(
+            slot TEXT PRIMARY KEY CHECK(slot IN ('ai1','ai2')),
+            provider_id TEXT NOT NULL REFERENCES ai_saved_providers(id)
+        );
+        CREATE TABLE IF NOT EXISTS ai_provider_library_migrations(
+            version INTEGER PRIMARY KEY
+        );
 """
 
 
@@ -358,6 +375,7 @@ def ensure_schema(conn):
     # 数据库里没有可迁移的历史配置时，再看一次性环境变量 bootstrap：
     # 只配了厂商 API Key 的老部署需要在这里补齐默认端点/模型并落库。
     migrate_legacy_env_providers(conn)
+    _migrate_saved_providers(conn)
 
 
 def _table_exists(conn, name):
@@ -476,6 +494,138 @@ def _slot_row(conn, slot):
     ).fetchone()
 
 
+def _provider_row(conn, provider_id):
+    row = conn.execute(
+        "SELECT id,display_name,api_key,base_url,timeout_seconds,models,updated_at "
+        "FROM ai_saved_providers WHERE id=?", (provider_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("提供商不存在，请重新选择")
+    cfg = dict(zip(("id", "display_name", "api_key", "base_url", "timeout_seconds",
+                    "models", "updated_at"), row, strict=True))
+    cfg["models"] = json.loads(cfg["models"])
+    return cfg
+
+
+def _provider_public_view(cfg):
+    return {key: value for key, value in cfg.items() if key != "api_key"} | {
+        "configured": bool(cfg["api_key"]), "key_preview": _key_preview(cfg["api_key"]),
+    }
+
+
+def _migrate_saved_providers(conn):
+    """仅在首次升级时导入已有槽位；不覆盖用户后续修改或恢复已清除的凭据。"""
+    if conn.execute("SELECT 1 FROM ai_provider_library_migrations WHERE version=1").fetchone():
+        return
+    if not conn.execute("INSERT OR IGNORE INTO ai_provider_library_migrations VALUES(1)").rowcount:
+        return
+    for slot in AI_SLOTS:
+        row = _slot_row(conn, slot)
+        if row is None:
+            continue  # 通用环境变量仍由环境管理，不在读配置时将其持久化。
+        if not (row[1] or row[2] or row[3]):
+            continue
+        provider_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO ai_saved_providers VALUES(?,?,?,?,?,?,?)",
+            (provider_id, row[0] or DEFAULT_DISPLAY_NAMES[slot], row[1], row[2], row[5],
+             _json([row[3]] if row[3] else []), _now()),
+        )
+        conn.execute("INSERT INTO ai_slot_provider_bindings VALUES(?,?)", (slot, provider_id))
+
+
+def saved_providers(conn):
+    ensure_schema(conn)
+    return [_provider_public_view(_provider_row(conn, row[0])) for row in conn.execute(
+        "SELECT id FROM ai_saved_providers ORDER BY rowid")]
+
+
+def _clean_models(value):
+    if not isinstance(value, list) or len(value) > 1000:
+        raise ValueError("模型列表必须是数组，最多1000项")
+    models = []
+    for item in value:
+        model = _clean_text(item, MAX_MODEL_LENGTH, "model")
+        if not model:
+            raise ValueError("模型名称不能为空")
+        if model not in models:
+            models.append(model)
+    return models
+
+
+def save_provider(conn, provider_id=None, **updates):
+    ensure_schema(conn)
+    allowed = {"display_name", "api_key", "base_url", "timeout_seconds", "models", "clear_api_key"}
+    if set(updates) - allowed:
+        raise ValueError("未知提供商设置项")
+    cfg = _provider_row(conn, provider_id) if provider_id else {
+        "id": uuid.uuid4().hex, "display_name": "", "api_key": "", "base_url": "",
+        "timeout_seconds": DEFAULT_TIMEOUT_SECONDS, "models": [],
+    }
+    for field, limit in (("display_name", MAX_DISPLAY_NAME_LENGTH),
+                         ("api_key", MAX_API_KEY_LENGTH), ("base_url", MAX_BASE_URL_LENGTH)):
+        if field in updates:
+            value = _clean_text(updates[field], limit, field)
+            if field != "api_key" or value:
+                cfg[field] = value
+    if not cfg["display_name"]:
+        raise ValueError("请填写提供商名称")
+    cfg["base_url"] = validate_base_url(cfg["base_url"])
+    if not cfg["base_url"]:
+        raise ValueError("请填写提供商接口地址")
+    if "timeout_seconds" in updates:
+        value = updates["timeout_seconds"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not MIN_TIMEOUT_SECONDS <= value <= MAX_TIMEOUT_SECONDS:
+            raise ValueError("超时必须在5–300秒之间")
+        cfg["timeout_seconds"] = int(value)
+    if "models" in updates:
+        cfg["models"] = _clean_models(updates["models"])
+    if "clear_api_key" in updates and not isinstance(updates["clear_api_key"], bool):
+        raise ValueError("clear_api_key必须是布尔值")
+    if updates.get("clear_api_key"):
+        cfg["api_key"] = ""
+    cfg["updated_at"] = _now()
+    conn.execute(
+        "INSERT INTO ai_saved_providers VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "display_name=excluded.display_name,api_key=excluded.api_key,base_url=excluded.base_url,"
+        "timeout_seconds=excluded.timeout_seconds,models=excluded.models,updated_at=excluded.updated_at",
+        (cfg["id"], cfg["display_name"], cfg["api_key"], cfg["base_url"], cfg["timeout_seconds"],
+         _json(cfg["models"]), cfg["updated_at"]),
+    )
+    return _provider_public_view(cfg)
+
+
+def refresh_provider_models(conn, provider_id):
+    ensure_schema(conn)
+    cfg = _provider_row(conn, provider_id)
+    try:
+        result = transport.list_models(cfg)
+    except transport.ProviderTransportError as exc:
+        return {"ok": False, "models": cfg["models"], "error": str(exc)[:200]}
+    models = _clean_models(result["models"])
+    current = _provider_row(conn, provider_id)
+    if any(current[key] != cfg[key] for key in ("base_url", "api_key")):
+        return {"ok": False, "models": current["models"], "error": "提供商配置已改变，请重新获取模型"}
+    # 保留已有手动模型：部分上游的列表不包含所有可用模型。
+    models = list(dict.fromkeys(current["models"] + models))[:1000]
+    conn.execute("UPDATE ai_saved_providers SET models=?,updated_at=? WHERE id=?",
+                 (_json(models), _now(), provider_id))
+    return {"ok": True, "models": models, "count": len(models)}
+
+
+def _with_saved_provider(conn, cfg):
+    binding = conn.execute("SELECT provider_id FROM ai_slot_provider_bindings WHERE slot=?",
+                           (cfg["slot"],)).fetchone()
+    cfg["provider_id"] = binding[0] if binding else ""
+    cfg["provider_name"] = ""
+    if binding:
+        provider = _provider_row(conn, binding[0])
+        cfg.update({key: provider[key] for key in ("api_key", "base_url", "timeout_seconds")})
+        cfg["provider_name"] = provider["display_name"]
+        cfg["updated_at"] = max(cfg.get("updated_at") or "", provider["updated_at"])
+    return cfg
+
+
 def get_slot_config(conn, slot):
     """返回单个槽位的完整调用配置。
 
@@ -489,7 +639,7 @@ def get_slot_config(conn, slot):
     ensure_schema(conn)
     row = _slot_row(conn, slot)
     if row is not None:
-        return {
+        return _with_saved_provider(conn, {
             "slot": slot,
             "display_name": str(row[0] or "") or DEFAULT_DISPLAY_NAMES[slot],
             "api_key": str(row[1] or ""),
@@ -499,9 +649,9 @@ def get_slot_config(conn, slot):
             "timeout_seconds": _clamp_timeout(row[5]),
             "updated_at": row[6],
             "source": "database",
-        }
+        })
     env = env_slot_defaults(slot)
-    return {
+    return _with_saved_provider(conn, {
         "slot": slot,
         "display_name": DEFAULT_DISPLAY_NAMES[slot],
         "api_key": env["api_key"],
@@ -511,7 +661,7 @@ def get_slot_config(conn, slot):
         "timeout_seconds": env["timeout_seconds"],
         "updated_at": None,
         "source": "environment" if env["api_key"] else "default",
-    }
+    })
 
 
 def _key_preview(value):
@@ -573,6 +723,8 @@ def slot_public_view(cfg):
     return {
         "slot": cfg["slot"],
         "display_name": cfg["display_name"],
+        "provider_id": cfg.get("provider_id", ""),
+        "provider_name": cfg.get("provider_name", ""),
         "configured": bool(api_key.strip()),
         "key_preview": _key_preview(api_key),
         "base_url": cfg.get("base_url") or "",
@@ -605,7 +757,7 @@ def _clean_text(value, limit, field):
 
 
 def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=None,
-                display_name=None, timeout_seconds=None, clear_api_key=False):
+                display_name=None, timeout_seconds=None, clear_api_key=False, provider_id=None):
     """写入单个槽位配置。只动这一个槽位，另一个槽位零影响。
 
     语义：
@@ -614,26 +766,19 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
     """
     slot = resolve_slot(slot)
     ensure_schema(conn)
-    row = _slot_row(conn, slot)
-    if row is not None:
-        state = {
-            "display_name": str(row[0] or ""),
-            "api_key": str(row[1] or ""),
-            "base_url": normalize_base_url(row[2]),
-            "model": str(row[3] or ""),
-            "enabled": bool(row[4]),
-            "timeout_seconds": _clamp_timeout(row[5]),
-        }
-    else:
-        env = env_slot_defaults(slot)
-        state = {
-            "display_name": DEFAULT_DISPLAY_NAMES[slot],
-            "api_key": env["api_key"],
-            "base_url": env["base_url"],
-            "model": env["model"],
-            "enabled": bool(env["api_key"]),
-            "timeout_seconds": env["timeout_seconds"],
-        }
+    state = get_slot_config(conn, slot)
+    if provider_id is not None:
+        if any(value is not None for value in (api_key, base_url, timeout_seconds)) or clear_api_key:
+            raise ValueError("选择提供商时不能同时修改接口凭据")
+        provider_id = _clean_text(provider_id, 100, "provider_id")
+        provider = _provider_row(conn, provider_id)
+        selected_model = _clean_text(model, MAX_MODEL_LENGTH, "model")
+        if selected_model not in provider["models"] and not (
+            state["provider_id"] == provider_id and selected_model == state["model"] and selected_model
+        ):
+            raise ValueError("请先在提供商中保存该模型，再选择")
+        # 只保存引用，运行时读取提供商当前地址与密钥。
+        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
 
     if display_name is not None:
         state["display_name"] = _clean_text(display_name, MAX_DISPLAY_NAME_LENGTH, "display_name")
@@ -657,6 +802,11 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
     if clear_api_key:
         state["api_key"] = ""
 
+    if state.get("provider_id") and provider_id is None and not (
+        api_key or base_url is not None or timeout_seconds is not None or clear_api_key
+    ):
+        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
+
     now = _now()
     conn.execute(
         "INSERT INTO ai_provider_slots(slot,display_name,api_key,base_url,model,enabled,"
@@ -668,6 +818,13 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
         (slot, state["display_name"], state["api_key"], state["base_url"], state["model"],
          int(state["enabled"]), state["timeout_seconds"], now),
     )
+    if provider_id is not None:
+        conn.execute(
+            "INSERT INTO ai_slot_provider_bindings VALUES(?,?) "
+            "ON CONFLICT(slot) DO UPDATE SET provider_id=excluded.provider_id", (slot, provider_id))
+    elif api_key or base_url is not None or timeout_seconds is not None or clear_api_key:
+        # 历史接口的直接配置只影响本槽位，不能修改共享提供商。
+        conn.execute("DELETE FROM ai_slot_provider_bindings WHERE slot=?", (slot,))
     return get_slots(conn)
 
 
@@ -726,6 +883,7 @@ def review_settings_view(conn):
         "updated_at": settings["updated_at"],
         "slots": slots,
         "slot_order": list(AI_SLOTS),
+        "providers": saved_providers(conn),
         # 单/双就绪直接取自槽位视图的 ready（含 base_url + model 校验），
         # 保证调度预检与页面展示的口径完全一致。
         "single_ready": bool(slots[active]["ready"]),

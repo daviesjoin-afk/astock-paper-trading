@@ -4475,15 +4475,28 @@ def update_ai_review_settings_fn(review_mode=None, single_reviewer_slot=None):
 
 
 def update_ai_slot_fn(slot, api_key=None, base_url=None, model=None, enabled=None,
-                      display_name=None, timeout_seconds=None, clear_api_key=False):
+                      display_name=None, timeout_seconds=None, clear_api_key=False, provider_id=None):
     """更新单个 AI 槽位配置；只影响该槽位。"""
     import ai_review_service
     with _connect() as conn:
         ai_review_service.update_slot(
             conn, slot, api_key=api_key, base_url=base_url, model=model, enabled=enabled,
             display_name=display_name, timeout_seconds=timeout_seconds,
-            clear_api_key=clear_api_key)
+            clear_api_key=clear_api_key, provider_id=provider_id)
         return ai_review_service.review_settings_view(conn)
+
+
+def save_ai_provider_fn(provider_id=None, **updates):
+    import ai_review_service
+    with _connect() as conn:
+        provider = ai_review_service.save_provider(conn, provider_id, **updates)
+        return {"provider": provider, "review": ai_review_service.review_settings_view(conn)}
+
+
+def refresh_ai_provider_models_fn(provider_id):
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.refresh_provider_models(conn, provider_id)
 
 
 def ai_review_status_fn():
