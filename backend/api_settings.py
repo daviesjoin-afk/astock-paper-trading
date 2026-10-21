@@ -9,6 +9,7 @@ import datetime as dt
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+import notify_wxpusher as NOTIFY
 import paper_sizing as sizing
 import paper_trading as P
 import runtime_settings as RSET
@@ -61,6 +62,12 @@ def _snapshot() -> dict:
     P.init_db()
     with P._db() as conn:  # the paper module owns the storage boundary
         settings = RSET.read(conn)
+        # appToken 只回显掩码：明文不得出现在任何 GET 响应里。
+        notification = dict(settings.get("notification") or {})
+        raw_token = str(notification.get("wxpusher_app_token") or "")
+        notification["wxpusher_app_token"] = NOTIFY.mask_token(raw_token)
+        notification["wxpusher_token_configured"] = bool(raw_token)
+        settings["notification"] = notification
         cycle = P._active_cycle(conn)
         audit = RSET.audit(conn, 40)
         capital = float(cycle.get("capital") or settings["simulation"]["default_starting_capital"])
@@ -111,6 +118,7 @@ def _snapshot() -> dict:
             "strategy": {"strategy_overrides": defaults["strategy_overrides"]},
             "evolution": {"evolution_interval_hours": defaults["evolution_interval_hours"]},
             "execution": {key: defaults[key] for key in RSET.SETTING_GROUPS["execution"]},
+            "notification": {key: defaults[key] for key in RSET.SETTING_GROUPS["notification"]},
         },
         "metadata": metadata,
         "effective": {
@@ -157,6 +165,17 @@ async def update_settings(request: Request, confirmed: bool = Query(False)):
         raise HTTPException(status_code=422, detail="设置内容必须是JSON对象") from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="设置内容必须是JSON对象")
+    body = dict(body)
+    # appToken 语义与 AI Key 一致：留空表示保持原值，清除必须显式声明，
+    # 否则一次只改发送时间的前端提交会把凭据抹掉。
+    clear_token = False
+    notification_body = body.get("notification")
+    if isinstance(notification_body, dict):
+        notification_body = dict(notification_body)
+        clear_token = bool(notification_body.pop("clear_app_token", False))
+        if not str(notification_body.get("wxpusher_app_token") or "").strip():
+            notification_body.pop("wxpusher_app_token", None)
+        body["notification"] = notification_body
     allowed_groups = set(RSET.SETTING_GROUPS) | {"ai"}
     unknown_groups = set(body) - allowed_groups
     if unknown_groups:
@@ -175,6 +194,8 @@ async def update_settings(request: Request, confirmed: bool = Query(False)):
     try:
         P.init_db()
         with P._db(immediate=True) as conn:
+            if clear_token:
+                runtime_updates["wxpusher_app_token"] = ""
             if runtime_updates:
                 RSET.update(conn, runtime_updates, actor="human-ui")
                 P._audit(conn, None, "settings_changed", "统一设置中心更新运行参数（详见设置审计）")
@@ -310,6 +331,22 @@ def test_ai_review_slot(slot: str, confirmed: bool = Query(False)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"测试AI槽位失败：{type(exc).__name__}") from exc
+
+
+@router.post("/notification/test")
+def test_notification(kind: str = Query("daily"), confirmed: bool = Query(False)):
+    """发送一条真实测试推送；因为会真的发到微信，必须显式确认。"""
+    _require_confirmation(confirmed, "发送测试推送")
+    P.init_db()
+    with P._db() as conn:
+        settings = RSET.read(conn)["notification"]
+        try:
+            result = NOTIFY.dispatch(conn, kind, settings)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not result["sent"]:
+        raise HTTPException(status_code=422, detail=result["reason"])
+    return result
 
 
 @router.get("/audit")

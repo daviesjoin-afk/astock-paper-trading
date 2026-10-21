@@ -122,3 +122,7 @@ HOME=/opt/astock-codex
 # 磁盘水位守护（2026-10-20 操作员要求）：根分区超过 85% 就清理构建缓存、旧镜像与过期备份。
 # 低于阈值时只写一行日志，不做任何删除；永不触碰账本、当日迁移前备份或正在使用的镜像。
 17,47 * * * * root /opt/astock-codex/deploy/disk-guard.sh >>/opt/astock-codex/reports/disk-guard.log 2>&1
+
+# 日报/周报 WxPusher 推送：调度器每 10 分钟唤醒一次，由 push_report.py 读取设置中心里的
+# 发送时间自行判断是否落在窗口内，并用当天标记文件去重。未启用时只写一行日志。
+3,13,23,33,43,53 * * * * root flock -n /opt/astock-codex/.locks/push-report.lock docker exec astock-task-worker python backend/push_report.py all >>/opt/astock-codex/reports/push-report.log 2>&1

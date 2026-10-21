@@ -167,6 +167,25 @@ export function renderSettings(data){
       +execSwitch('execution_ttl_sweep','执行时限清扫','清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。')
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'execution\')">保存执行开关</button><button class="ghost" onclick="resetSettingsSection(\'execution\')">恢复默认</button></div>'
       +'<div class="settings-note">挂起委托不占用资金与席位；所有放行/驳回都写入审计。开关立即生效，无需重启扫描。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
+  }else if(section==='notification'){
+    var note=settings.notification||{}, noteDefaults=(data.defaults||{}).notification||{};
+    var noteVal=function(key){ return note[key]===undefined?noteDefaults[key]:note[key]; };
+    var tokenConfigured=!!note.wxpusher_token_configured;
+    var weekdayNames={1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
+    var weekdayOptions=[1,2,3,4,5,6,7].map(function(day){return '<option value="'+day+'"'+(Number(noteVal('wxpusher_weekly_weekday')||5)===day?' selected':'')+'>'+weekdayNames[day]+'</option>';}).join('');
+    var noteSwitch=function(id,value){ return '<label class="settings-exec-toggle"><input id="'+id+'" type="checkbox"'+settingsChecked(!!value)+'><span>'+(value?'开启':'关闭')+'</span></label>'; };
+    html='<div class="settings-grid"><section class="settings-panel"><h3>日报与周报推送</h3>'
+      +'<p>通过 WxPusher 把模拟盘摘要推到微信。推送内容只有净值、超额与成交统计，不包含操作凭据，也不改变任何交易状态或账本。</p><div class="settings-form">'
+      +settingsInputRow('wxpusher_enabled','推送总开关','关闭后日报与周报都不发送，无论分项开关如何设置。',noteSwitch('settingWxEnabled',noteVal('wxpusher_enabled')))
+      +settingsInputRow('wxpusher_app_token','appToken','在 WxPusher 后台创建应用后获得，以 AT_ 开头。留空表示保持现有凭据；读取接口只回显掩码。','<input id="settingWxToken" type="password" autocomplete="off" placeholder="'+(tokenConfigured?adaptiveEsc(note.wxpusher_app_token||'已配置'):'未配置，请输入 AT_...')+'">'+(tokenConfigured?'<button type="button" class="ghost" data-testid="settings-clear-wxpusher" onclick="clearWxpusherToken()">清除凭据</button>':''))
+      +settingsInputRow('wxpusher_topic_id','推送主题 ID','主题 ID 表示群发到该主题的订阅者；留空只发给应用自己的订阅用户。','<input id="settingWxTopic" type="text" inputmode="numeric" value="'+adaptiveEsc(noteVal('wxpusher_topic_id')||'')+'" placeholder="可选">')
+      +settingsInputRow('wxpusher_daily_enabled','启用日报','每个交易日收盘后推送一次当日净值与成交摘要。',noteSwitch('settingWxDaily',noteVal('wxpusher_daily_enabled')))
+      +settingsInputRow('wxpusher_daily_time','日报发送时间','本地时区（Asia/Shanghai）。','<input id="settingWxDailyTime" type="time" value="'+adaptiveEsc(noteVal('wxpusher_daily_time')||'15:40')+'">')
+      +settingsInputRow('wxpusher_weekly_enabled','启用周报','每周指定星期推送一次周度净值与超额。',noteSwitch('settingWxWeekly',noteVal('wxpusher_weekly_enabled')))
+      +settingsInputRow('wxpusher_weekly_weekday','周报星期','默认周五收盘后。','<select id="settingWxWeekday">'+weekdayOptions+'</select>')
+      +settingsInputRow('wxpusher_weekly_time','周报发送时间','本地时区（Asia/Shanghai）。','<input id="settingWxWeeklyTime" type="time" value="'+adaptiveEsc(noteVal('wxpusher_weekly_time')||'15:45')+'">')
+      +'</div><div class="settings-actions"><button data-testid="settings-save-notification" onclick="saveSettingsSection(\'notification\')">保存推送设置</button><button class="ghost" data-testid="settings-test-notification" onclick="testWxpusher()">发送测试推送</button><button class="ghost" onclick="resetSettingsSection(\'notification\')">恢复默认</button></div>'
+      +'<div class="settings-note">appToken 保存在服务端，接口只回显掩码；保存时留空表示保持原值。测试推送会真的发到微信，需要二次确认。发送时间由后台调度任务读取，修改后下一轮调度生效。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='operator'){
     html='<div class="settings-grid"><section class="settings-panel"><h3>操作员授权</h3>'
       +'<p>本页只管理<strong>本标签页</strong>的写操作凭据，不涉及账户体系。凭据保存在 sessionStorage：本标签页刷新后保留，关闭标签页即消失。'
@@ -227,7 +246,7 @@ export function renderSettings(data){
 }
 
 export function setSettingsSection(section,button){
-  if(['simulation','risk','strategy','evolution','execution','operator'].indexOf(section)<0) section='simulation';
+  if(['simulation','risk','strategy','evolution','execution','notification','operator'].indexOf(section)<0) section='simulation';
   window._settingsSection=section; sessionStorage.setItem(SETTINGS_SECTION_KEY,section);
   document.querySelectorAll('#p-settings .settings-section-tab').forEach(function(item){var active=item.dataset.settingsSection===section;item.classList.toggle('active',active);item.setAttribute('aria-selected',active?'true':'false');});
   if(window._settingsPayload) renderSettings(window._settingsPayload);
@@ -291,7 +310,7 @@ export function collectStrategyOverrides(){
 export async function saveSettingsSection(section){
   var saveAnswer=await confirmDialog({
     kicker:'设置 · 写入审计',
-    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器'}[section]||section)+'”设置？',
+    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器',notification:'日报与周报推送'}[section]||section)+'”设置？',
     bullets:['后端会校验取值范围，越界会被拒绝。','本次修改只影响下一周期，不改写当前账本。','保存会写入审计记录。'],
     confirmText:'保存',
   });
@@ -302,6 +321,7 @@ export async function saveSettingsSection(section){
   if(section==='strategy') payload.strategy={strategy_overrides:collectStrategyOverrides()};
   if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)};
   if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
+  if(section==='notification') payload.notification={wxpusher_enabled:!!($('settingWxEnabled')||{}).checked,wxpusher_app_token:(($('settingWxToken')||{}).value||''),wxpusher_topic_id:(($('settingWxTopic')||{}).value||'').trim(),wxpusher_daily_enabled:!!($('settingWxDaily')||{}).checked,wxpusher_daily_time:(($('settingWxDailyTime')||{}).value||'15:40'),wxpusher_weekly_enabled:!!($('settingWxWeekly')||{}).checked,wxpusher_weekly_weekday:Number((($('settingWxWeekday')||{}).value)||5),wxpusher_weekly_time:(($('settingWxWeeklyTime')||{}).value||'15:45')};
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
 }
 
@@ -317,6 +337,35 @@ export async function resetSettingsSection(section){
   var value=defaults[section]; if(!value) return;
   var payload={}; if(section==='strategy') payload.strategy={strategy_overrides:value.strategy_overrides}; else payload[section]=value;
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('已恢复该分组默认值。');}catch(e){inlineError($('settingsResult'), e, { title:'恢复默认失败', retryLabel:'重试', onRetry:function(){ resetSettingsSection(section); } });}
+}
+
+// ---------- 日报/周报推送（WxPusher）----------
+export async function testWxpusher(){
+  var answer=await confirmDialog({
+    kicker:'推送 · 真实发送',
+    title:'发送一条测试推送到微信？',
+    bullets:['会用已保存的 appToken 真实调用 WxPusher。','内容为当前账本的日报摘要，不含任何凭据。','界面上的未保存改动不会生效，请先保存再测试。'],
+    confirmText:'发送测试',
+  });
+  if(!answer.approved) return;
+  try{
+    var data=await apiPostJson('/api/settings/notification/test?kind=daily&confirmed=true',{});
+    toast('测试推送已发送：'+(data.summary||''));
+  }catch(e){ toast('测试推送失败：'+((e&&e.message)||e), { tone:'danger' }); }
+}
+
+export async function clearWxpusherToken(){
+  var answer=await confirmDialog({
+    kicker:'推送 · 清除凭据',
+    title:'清除已保存的 WxPusher appToken？',
+    bullets:['清除后日报与周报都无法发送，直到重新填写。','该操作会写入设置审计。'],
+    confirmText:'清除凭据',
+  });
+  if(!answer.approved) return;
+  try{
+    var data=await apiPostJson('/api/settings/?confirmed=true',{notification:{clear_app_token:true}});
+    renderSettings(data); toast('已清除 WxPusher 凭据。');
+  }catch(e){ toast('清除失败：'+((e&&e.message)||e), { tone:'danger' }); }
 }
 
 // ---------- 通用 AI 槽位（ai1 / ai2）----------

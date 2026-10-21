@@ -2,9 +2,13 @@
 
 The paper ledger is deliberately the source of truth for operator-facing
 settings.  Values are JSON encoded so the store remains easy to migrate, while
-the validation layer keeps risk controls inside conservative bounds.  Secrets
-are intentionally out of scope; AI credentials stay in the adaptive database
-and are only exposed through its masked API.
+the validation layer keeps risk controls inside conservative bounds.
+
+Secrets are out of scope **except** the WxPusher app token, which has no
+alternative home: it is an outbound notification credential, not a trading
+credential, and the snapshot API only ever returns a mask for it.  AI
+credentials stay in the adaptive database and are only exposed through its
+masked API.
 """
 from __future__ import annotations
 
@@ -48,6 +52,15 @@ DEFAULTS = {
     "symbol_aggregate_cap_pct": 0.0,
     # PR-30 组合级主题（theme）聚合上限（占共享池净值百分比）；0 = 关闭。
     "theme_aggregate_cap_pct": 0.0,
+    # WxPusher 日报/周报推送。app_token 是出站通知凭据，快照接口只回显掩码。
+    "wxpusher_enabled": False,
+    "wxpusher_app_token": "",
+    "wxpusher_topic_id": "",
+    "wxpusher_daily_enabled": False,
+    "wxpusher_daily_time": "15:40",
+    "wxpusher_weekly_enabled": False,
+    "wxpusher_weekly_time": "15:45",
+    "wxpusher_weekly_weekday": 5,
 }
 
 SETTING_GROUPS = {
@@ -60,6 +73,11 @@ SETTING_GROUPS = {
     "strategy": ("strategy_overrides",),
     "evolution": ("evolution_interval_hours",),
     "execution": ("execution_batch_gate", "execution_verification_gate", "execution_ttl_sweep"),
+    "notification": (
+        "wxpusher_enabled", "wxpusher_app_token", "wxpusher_topic_id",
+        "wxpusher_daily_enabled", "wxpusher_daily_time",
+        "wxpusher_weekly_enabled", "wxpusher_weekly_time", "wxpusher_weekly_weekday",
+    ),
 }
 
 METADATA = {
@@ -77,6 +95,14 @@ METADATA = {
     "execution_ttl_sweep": {"label": "执行时限清扫", "apply_mode": "immediate", "recommended": True, "description": "清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。"},
     "symbol_aggregate_cap_pct": {"label": "组合级单票上限", "unit": "%", "apply_mode": "immediate", "recommended": 0, "description": "所有策略对同一标的的持仓+在途合计占共享池净值上限；0 表示关闭（仅按各策略权重约束）。"},
     "theme_aggregate_cap_pct": {"label": "组合级主题上限", "unit": "%", "apply_mode": "immediate", "recommended": 0, "description": "所有策略对同一主题（行业聚合组）的持仓+在途合计占共享池净值上限；0 表示关闭。"},
+    "wxpusher_enabled": {"label": "WxPusher 推送总开关", "apply_mode": "immediate", "recommended": False, "description": "关闭后日报与周报都不会发送，无论分项开关如何设置。"},
+    "wxpusher_app_token": {"label": "WxPusher appToken", "apply_mode": "immediate", "recommended": "", "description": "在 WxPusher 后台创建应用后获得，以 AT_ 开头。保存后接口只回显掩码；留空表示保持原值。"},
+    "wxpusher_topic_id": {"label": "推送主题 ID", "apply_mode": "immediate", "recommended": "", "description": "主题 ID 表示群发到该主题的订阅者；留空则只发送到应用自己的订阅用户。"},
+    "wxpusher_daily_enabled": {"label": "启用日报", "apply_mode": "immediate", "recommended": False, "description": "每个交易日收盘后推送一次当日账户净值与成交摘要。"},
+    "wxpusher_daily_time": {"label": "日报发送时间", "unit": "HH:MM", "apply_mode": "immediate", "recommended": "15:40", "description": "本地时区（Asia/Shanghai）的发送时刻；由调度任务按此时间触发。"},
+    "wxpusher_weekly_enabled": {"label": "启用周报", "apply_mode": "immediate", "recommended": False, "description": "每周指定星期推送一次本周净值、超额与选股 alpha 摘要。"},
+    "wxpusher_weekly_time": {"label": "周报发送时间", "unit": "HH:MM", "apply_mode": "immediate", "recommended": "15:45", "description": "本地时区的发送时刻。"},
+    "wxpusher_weekly_weekday": {"label": "周报星期", "unit": "1-7", "apply_mode": "immediate", "recommended": 5, "description": "1 = 周一，7 = 周日；默认周五收盘后。"},
 }
 
 
@@ -89,6 +115,26 @@ def _decode(value: str, fallback: Any = None) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return fallback
+
+
+# 这些键的值只能留在运行时，写进审计时必须掩码：设置审计会随快照一起返回给
+# 前端，存明文等于把凭据写进一个会被展示和导出的表。
+SECRET_SETTING_KEYS = frozenset({"wxpusher_app_token"})
+
+
+def _mask_secret(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "*" * len(text)
+    return text[:4] + "*" * (len(text) - 8) + text[-4:]
+
+
+def _audit_json(key: str, value: Any) -> str:
+    if key in SECRET_SETTING_KEYS:
+        return _json(_mask_secret(value))
+    return _json(value)
 
 
 def eligible_strategy_ids(conn: sqlite3.Connection) -> list[str]:
@@ -327,6 +373,30 @@ def validate(updates: dict[str, Any], *, conn: sqlite3.Connection | None = None)
     for key in ("execution_batch_gate", "execution_verification_gate", "execution_ttl_sweep"):
         if key in updates:
             checked[key] = _boolean(updates[key], key)
+    for key in ("wxpusher_enabled", "wxpusher_daily_enabled", "wxpusher_weekly_enabled"):
+        if key in updates:
+            checked[key] = _boolean(updates[key], key)
+    if "wxpusher_app_token" in updates:
+        token = str(updates["wxpusher_app_token"] or "").strip()
+        if token and not (token.startswith("AT_") and 8 <= len(token) <= 128):
+            raise ValueError("WxPusher appToken 无效：应以 AT_ 开头且长度合理")
+        checked["wxpusher_app_token"] = token
+    if "wxpusher_topic_id" in updates:
+        topic = str(updates["wxpusher_topic_id"] or "").strip()
+        if topic and not topic.isdigit():
+            raise ValueError("WxPusher 主题 ID 必须是数字或留空")
+        checked["wxpusher_topic_id"] = topic
+    for key in ("wxpusher_daily_time", "wxpusher_weekly_time"):
+        if key in updates:
+            text = str(updates[key] or "").strip()
+            try:
+                dt.datetime.strptime(text, "%H:%M")
+            except ValueError as exc:
+                raise ValueError(f"{key} 必须是 HH:MM 格式") from exc
+            checked[key] = text
+    if "wxpusher_weekly_weekday" in updates:
+        checked["wxpusher_weekly_weekday"] = _number(
+            updates["wxpusher_weekly_weekday"], "周报星期", 1, 7, integer=True)
     return checked
 
 
@@ -388,7 +458,7 @@ def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "huma
         )
         conn.execute(
             "INSERT INTO paper_runtime_settings_audit(key,old_value,new_value,updated_by,created_at) VALUES(?,?,?,?,?)",
-            (key, _json(old), _json(value), actor, now),
+            (key, _audit_json(key, old), _audit_json(key, value), actor, now),
         )
     return read(conn)
 
