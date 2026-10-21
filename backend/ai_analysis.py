@@ -15,6 +15,23 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
 LEASE_SECONDS = 20 * 60
+
+
+def _lease_expired(row) -> bool:
+    """上一次同键运行是否已经超过租约。
+
+    没有这道检查时，两次手动触发会同时打同一个 business_key，后一次把前一次
+    的 running 行覆盖成 superseded，两边的结论互相踩踏。
+    """
+    stamp = str(row.get("updated_at") or row.get("created_at") or "")
+    try:
+        started = dt.datetime.fromisoformat(stamp)
+    except ValueError:
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=TZ)
+    return (dt.datetime.now(TZ) - started).total_seconds() >= LEASE_SECONDS
+
 WINDOWS = {
     "premarket", "auction", "open-confirm", "morning", "noon", "afternoon",
     "risk-review", "close-risk", "close", "adversarial", "manual",
@@ -224,11 +241,13 @@ def run_analysis(connect_factory, paper_db_path, snapshot_paths, provider_module
                 report = _canonical_report(connect_factory, stored["canonical_run_id"])
                 if report is not None:
                     return {"status": "idempotent", "run": row, "result": report}
+            if row.get("status") == "running" and not _lease_expired(row):
+                raise ValueError("analysis_in_progress")
             retries = int(row.get("retries") or 0) + 1
+            # 只标记 superseded，**保留原来的 error_code**：失败原因是留给诊断的，
+            # 不能被下一次重试抹成 legacy_projection_only。
             conn.execute(
-                "UPDATE adaptive_ai_analysis_runs SET status='superseded',"
-                "error_code='legacy_projection_only',result=NULL,secondary_result=NULL,"
-                "updated_at=? WHERE id=?",
+                "UPDATE adaptive_ai_analysis_runs SET status='superseded', updated_at=? WHERE id=?",
                 (_now(), row["id"]),
             )
         created = _now()

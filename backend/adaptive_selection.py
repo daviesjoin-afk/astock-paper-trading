@@ -536,10 +536,17 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
         _mark_outbox_applied(conn, candidate_id, now_fn())
         conn.commit()
         return candidate_id
-    if item["status"] not in {"eligible_auto_adjust", "eligible_manual_review", "eligible_structural_review"}:
+    if item["status"] not in {
+        "eligible_auto_adjust", "eligible_manual_review", "eligible_structural_review",
+        SHADOW_PROPOSAL_STATUS,
+    }:
         raise ValueError("选股候选尚未通过进化门槛")
     candidate_preview = _loads(item.get("candidate_params"), {})
     is_structural = candidate_preview.get("mutation_type") not in {None, "none"}
+    if approved in _AUTO_APPROVERS and item["status"] == SHADOW_PROPOSAL_STATUS:
+        # 单 AI 的影子建议没有共识支撑，只能由人确认后落地；否则它就等于
+        # 一条永远无法生效、也永远没人看得到的死记录。
+        raise ValueError("影子建议必须人工确认后才能生效")
     if approved in _AUTO_APPROVERS:
         if is_structural:
             raise ValueError("结构变更必须人工确认后才能生效")

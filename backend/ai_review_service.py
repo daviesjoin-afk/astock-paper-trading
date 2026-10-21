@@ -1187,6 +1187,10 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
             account_evolution.get("max_weight_delta"), CONSENSUS_MAX_WEIGHT_STEP)))
         entry_step = max(0.001, min(0.01, _num(
             account_evolution.get("max_delta_threshold"), CONSENSUS_MAX_DELTA_STEP)))
+        # confidence_threshold 是登记过的可进化参数（self_evolution 里 50–90、
+        # 步长 3）。此前共识用的是硬编码 70，自进化调它完全不生效。
+        min_confidence = max(50.0, min(90.0, _num(
+            account_evolution.get("confidence_threshold"), CONSENSUS_MIN_CONFIDENCE)))
 
         def _norm_confidence(value):
             v = _num(value, 0.0)
@@ -1196,20 +1200,19 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
 
         l_conf = _norm_confidence(lp.get("confidence"))
         r_conf = _norm_confidence(rp.get("confidence"))
-        confidence_ok = (l_conf >= CONSENSUS_MIN_CONFIDENCE
-                         and r_conf >= CONSENSUS_MIN_CONFIDENCE)
+        confidence_ok = (l_conf >= min_confidence and r_conf >= min_confidence)
         if not confidence_ok:
             # 置信度不足只否决**合并**，不截断**证据**：这个账户的权重/入场/条件
             # 分歧仍要继续采集，否则机器读到的 issues 会被人为裁短。
             disagreements.append(
                 "[%s] 置信度不足：%s=%.0f，%s=%.0f（要求均≥%.0f）" % (
-                    account_id, left_label, l_conf, right_label, r_conf, CONSENSUS_MIN_CONFIDENCE))
+                    account_id, left_label, l_conf, right_label, r_conf, min_confidence))
             issues.append({
                 "code": DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD,
                 "account_id": account_id,
                 "ai1_confidence": l_conf,
                 "ai2_confidence": r_conf,
-                "threshold": CONSENSUS_MIN_CONFIDENCE,
+                "threshold": min_confidence,
             })
 
         # 仅在"未提供"（None）时回退为空字典；``weights: []`` 之类的畸形载荷必须
@@ -1404,7 +1407,10 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                 "ai2_confidence": r_conf,
             })
 
-    if disagreements:
+    # 分歧按账户隔离：有分歧的账户不落地，已达成共识的账户仍然有效。
+    # 只有在一个共识都没达成时才整体失败——否则一个无关账户的分歧会把
+    # 其它账户已经谈成的补丁一起丢掉。
+    if disagreements and not merged:
         return False, "分歧：" + "; ".join(disagreements[:5]), [], issues
 
     if not merged:
@@ -1413,6 +1419,11 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
         return False, "无有效共识提案", [], issues
 
     merged = merged[:max_proposals]
+    if disagreements:
+        return (True,
+                "双AI对 %d 个账户达成共识；%d 个账户有分歧未纳入" % (
+                    len(merged), len(disagreements)),
+                merged, issues)
     return True, "双AI对 %d 个账户达成共识" % len(merged), merged, []
 
 
@@ -1674,6 +1685,22 @@ def _base_outcome(result_mode, review_mode, status, reviewers, consensus, reason
     }
 
 
+def _reviewer_response(reviewer: dict) -> dict:
+    """审计用的 AI 决策快照。
+
+    ``*_response`` 列历史上存的是 proposals，与紧邻的 ``*_proposals`` 列完全
+    重复，等于没留下「模型到底判了什么」。这里改存决策本身，便于事后复盘
+    为什么 hold、为什么提这个补丁。仍然不落 raw prompt 与 raw 文本。
+    """
+    return {
+        "decision": reviewer.get("decision"),
+        "confidence": reviewer.get("confidence"),
+        "market_regime": reviewer.get("market_regime"),
+        "summary": str(reviewer.get("summary") or "")[:500],
+        "proposals_count": len(reviewer.get("proposals") or []),
+    }
+
+
 def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mode,
                  profile, evidence, evidence_hash, config_snapshot, reviewers,
                  consensus, reason, audit_merged, started_at, started,
@@ -1699,11 +1726,11 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                 str(trigger)[:80], mode, status,
                 profile.get("profile_date"), profile.get("regime"),
                 left.get("status"), (config_snapshot.get("ai1") or {}).get("model"),
-                _json(left.get("proposals")) if left.get("status") == "completed" else None,
+                _json(_reviewer_response(left)) if left.get("status") == "completed" else None,
                 _json(left.get("proposals")) if left.get("proposals") else None,
                 left.get("latency_ms"), left.get("error"),
                 right.get("status"), (config_snapshot.get("ai2") or {}).get("model"),
-                _json(right.get("proposals")) if right.get("status") == "completed" else None,
+                _json(_reviewer_response(right)) if right.get("status") == "completed" else None,
                 _json(right.get("proposals")) if right.get("proposals") else None,
                 right.get("latency_ms"), right.get("error"),
                 # consensus_result 是历史二值兼容列（旧消费者按它读），刻意**不**跟着
