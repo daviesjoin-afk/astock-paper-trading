@@ -1,9 +1,13 @@
 /* PR-55：由 frontend/app.js 拆分（纯搬运，逻辑/文案未改） */
-export function fmt(v, d){ if(v===null||v===undefined||isNaN(v)) return '-'; return Number(v).toFixed(d===undefined?2:d); }
+export function fmt(v, d){ if(v===null||v===undefined||v===''||isNaN(v)) return '-'; return Number(v).toFixed(d===undefined?2:d); }
+
+/* 百分比专用：缺值渲染成「—」。直接写 fmt(v)+'%' 会把占位符拼成 '-%'，
+   让「没有数据」看起来像一个真实的百分比读数。 */
+export function fmtPct(v, d){ if(v===null||v===undefined||v===''||isNaN(v)) return '—'; return Number(v).toFixed(d===undefined?2:d)+'%'; }
 
 export function pctCls(v){ return v>0?'up':(v<0?'down':''); }
 
-export function pctTxt(v){ if(v===null||v===undefined) return '-'; return (v>0?'+':'')+fmt(v)+'%'; }
+export function pctTxt(v){ if(v===null||v===undefined||v===''||isNaN(v)) return '-'; return (v>0?'+':'')+fmt(v)+'%'; }
 
 export function yi(v){ if(v===null||v===undefined) return '-'; return fmt(v/1e8,1)+'亿'; }
 
@@ -28,17 +32,19 @@ export function adaptiveSafeUrl(value){
 }
 
 export function dataValidityTone(value, good, warn){
+  // 缺值不是「坏数据」：返回空串让样式保持中性，避免把未知渲染成红色告警。
+  if(value===null||value===undefined||value===''||isNaN(Number(value))) return '';
   var n=Number(value); return n>=good?'good':(n>=warn?'warn':'bad');
 }
 
 export function sigTag(s){
   var cls = s.level==='sell' ? 'tag-warn' : 'tag-info';
-  return '<span class="tag '+cls+'" title="'+s.msg+'">'+s.type+'</span>';
+  return '<span class="tag '+cls+'" title="'+adaptiveEsc(s.msg)+'">'+adaptiveEsc(s.type)+'</span>';
 }
 
 export function sellTag(sd){
   var cls = (sd.action==='卖出'||sd.auction_matrix.level==='sell') ? 'tag-warn' : (sd.action==='止盈减仓' ? 'tag-ok' : 'tag-info');
-  return '<span class="tag '+cls+'">'+sd.action+'｜'+sd.auction_matrix.tier+'</span>';
+  return '<span class="tag '+cls+'">'+adaptiveEsc(sd.action)+'｜'+adaptiveEsc(sd.auction_matrix.tier)+'</span>';
 }
 
 // ---------- 策略模拟：独立账本，不与自选跟踪混用 ----------

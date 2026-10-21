@@ -2,7 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, tableScroll } from "../core/dom.js";
-import { cny, fmt, pctCls, pctTxt, riskLevelView, riskMetric, riskText, zhRiskText } from "../core/format.js";
+import { cny, fmt, fmtPct, pctCls, pctTxt, riskLevelView, riskMetric, riskText, zhRiskText } from "../core/format.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 
 export function paperAuditBlock(title, count, body){
@@ -115,7 +115,7 @@ export function renderPaperRisk(d){
   var qualityRows=(d.data_quality||[]).map(function(q){
     var verification=q.verification||{}, verify=verification.status||'not_independently_verified';
     var note=verification.note||'\u672a\u63d0\u4f9b\u72ec\u7acb\u4ea4\u53c9\u6838\u9a8c';
-    return '<tr><td><b>'+riskText(q.name)+'</b><br><small>'+zhRiskText(q.source)+'</small></td><td class="paper-risk-source '+riskText(q.status)+'">'+zhRiskText(q.status)+'</td><td>'+riskText(q.observed_at)+'</td><td>'+(q.age_seconds===null?'\u2014':fmt(q.age_seconds,0)+'\u79d2')+'</td><td>'+(q.coverage_pct===null?'\u2014':fmt(q.coverage_pct,1)+'%')+'</td><td title="'+zhRiskText(note)+'">'+zhRiskText(verify)+'</td><td>'+(d.snapshot_stale?'快照已过期，仅供参考':(q.status==='fresh'?'\u53ef\u6309\u65e2\u6709\u89c4\u5219\u4f7f\u7528':'\u4ec5\u5c55\u793a\u6216\u7981\u6b62\u589e\u52a0\u98ce\u9669'))+'</td></tr>';
+    return '<tr><td><b>'+riskText(q.name)+'</b><br><small>'+zhRiskText(q.source)+'</small></td><td class="paper-risk-source '+riskText(q.status)+'">'+zhRiskText(q.status)+'</td><td>'+riskText(q.observed_at)+'</td><td>'+(q.age_seconds===null?'\u2014':fmt(q.age_seconds,0)+'\u79d2')+'</td><td>'+fmtPct(q.coverage_pct,1)+'</td><td title="'+zhRiskText(note)+'">'+zhRiskText(verify)+'</td><td>'+(d.snapshot_stale?'快照已过期，仅供参考':(q.status==='fresh'?'\u53ef\u6309\u65e2\u6709\u89c4\u5219\u4f7f\u7528':'\u4ec5\u5c55\u793a\u6216\u7981\u6b62\u589e\u52a0\u98ce\u9669'))+'</td></tr>';
   }).join('');
   html+='<section class="panel"><h3>数据质量与降级状态</h3>'+tableScroll('<table><tr><th>数据源</th><th>新鲜度</th><th>源时间</th><th>延迟</th><th>覆盖率</th><th>真实性核验</th><th>交易影响</th></tr>'+qualityRows+'</table>',820)+'</section>';
   html+='<div class="disclaimer">'+riskText(d.disclaimer)+'</div>';
