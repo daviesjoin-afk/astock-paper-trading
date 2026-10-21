@@ -178,6 +178,10 @@ CONSENSUS_WEIGHT_MAGNITUDE_RATIO = 0.60       # 幅度比：较小/较大 >= 此
 CONSENSUS_DELTA_DIRECTION_THRESHOLD = 0.001   # 入场阈值方向一致性
 CONSENSUS_CONDITION_MAGNITUDE_RATIO = 0.50    # 条件参数幅度一致性
 CONSENSUS_MIN_CONFIDENCE = 70.0
+# 槽位调用的输出预算。推理型模型会先花掉一截 reasoning tokens：实测 1800 的
+# 预算在 step-5-preview 上被思考全部吃掉，content 为空、finish_reason=length，
+# 上层只能看到一个笼统的 content_not_object。这里留出推理 + 正文的余量。
+SLOT_MAX_OUTPUT_TOKENS = 4000
 CONSENSUS_MAX_WEIGHT_STEP = 0.03
 CONSENSUS_MAX_DELTA_STEP = 0.005
 
@@ -899,7 +903,7 @@ def review_settings_view(conn):
 # 通用调用层（无厂商身份分支）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=1800):
+def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=SLOT_MAX_OUTPUT_TOKENS):
     """兼容别名 —— 请求体构造已收敛到 :mod:`ai_provider_transport`。
 
     保留本入口是因为调用方与回归测试依赖它（``test_t12`` / ``test_t13``）；
@@ -909,7 +913,7 @@ def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=1800)
         slot_config, system_prompt, user_prompt, max_tokens=max_tokens)
 
 
-def _call_slot(slot_config, system_prompt, user_prompt, max_tokens=1800):
+def _call_slot(slot_config, system_prompt, user_prompt, max_tokens=SLOT_MAX_OUTPUT_TOKENS):
     """兼容别名 —— 真实网络调用已收敛到 :mod:`ai_provider_transport`。
 
     返回结构保持 ``(parsed_json, input_tokens, output_tokens, latency_ms)`` 不变，
