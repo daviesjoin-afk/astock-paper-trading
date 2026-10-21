@@ -1563,6 +1563,7 @@ def _select_uncached(
         sentiment,
         realtime_flow,
         realtime_super_flow=realtime_super_flow,
+        scoring_factors=S.scoring_factor_inputs(strategy),
     )
     result = S.run_strategy(
         strategy,

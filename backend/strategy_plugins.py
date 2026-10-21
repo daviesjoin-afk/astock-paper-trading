@@ -270,6 +270,16 @@ def plugin_for_selector(selector_id: str) -> StrategyPlugin | None:
     return _PLUGINS_BY_SELECTOR.get(str(selector_id or "").strip())
 
 
+def is_original_builtin_plugin(plugin: StrategyPlugin) -> bool:
+    """Whether the registered selector still uses its original native object."""
+    return (
+        type(plugin) is StrategyPlugin
+        and plugin.candidate_runner is None
+        and plugin_for_selector(plugin.selector_id) is plugin
+        and any(plugin is builtin for builtin in _BUILTIN_PLUGINS)
+    )
+
+
 def plugin_ids() -> tuple[str, ...]:
     return tuple(_PLUGINS)
 

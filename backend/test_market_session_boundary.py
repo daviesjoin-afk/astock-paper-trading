@@ -184,9 +184,21 @@ class FactorReadinessTests(unittest.TestCase):
         for i, value in enumerate((0, None, "--", "-", "", float("nan"))):
             data[i]["amount"] = value
         frame = pd.DataFrame({"last_date": NOW.date().isoformat(), "amount": 123.}, index=[r["code"] for r in data])
+        from test_factor_calibration_v2 import FactorTableTests
+        historical, _ = FactorTableTests._frames()
+        for name, value in historical.iloc[0].items():
+            if name not in frame:
+                frame[name] = value
         reading = C.classify(snapshot(data, True), C.CLOSE_SNAPSHOT_POLICY, now=NOW)
         stale_flows = [dict(data[0], quote_at=(CLOSE-dt.timedelta(days=1)).isoformat(), super_net=999.)]
+        real_build = M.S.build_factor_table
+        requested_plans = []
         def build(price, fund, *args, **kwargs):
+            self.assertEqual(4000, len(price))
+            expected_plan = (frozenset() if not requested_plans else
+                             frozenset({"flow", "mom_short", "sentiment", "volsurge"}))
+            self.assertEqual(expected_plan, kwargs["scoring_factors"])
+            requested_plans.append(kwargs["scoring_factors"])
             self.assertTrue(fund.index.is_unique)
             self.assertEqual({}, kwargs["realtime_super_flow"])
             self.assertEqual(0., price.iloc[0]["amount"])
@@ -194,8 +206,9 @@ class FactorReadinessTests(unittest.TestCase):
             self.assertTrue(pd.isna(price.iloc[5]["amount"]))
             self.assertTrue(price["price"].eq(10.).all())
             self.assertTrue(price["pct"].eq(1.).all())
-            table = pd.DataFrame(index=price.index)
-            table["pct"] = fund["pct_today"]
+            table = real_build(price, fund, *args, **kwargs)
+            optional = {"value", "quality", "mom", "mom_short", "volsurge", "rsi"}
+            self.assertEqual(set(table) & optional, expected_plan & optional)
             return table
         with mock.patch.object(M.datetime, "datetime", Clock), \
                 mock.patch.object(M.datetime, "date", Calendar), \
@@ -226,12 +239,13 @@ class FactorReadinessTests(unittest.TestCase):
             sentiment.return_value = {"known":{}}
             # Scheduled jobs use this default mode and must consume the data
             # before their short-lived process exits, without starting threads.
-            scheduled = M._select_uncached(strategy="three_day", topn=10)
+            scheduled = M._select_uncached(strategy="one_to_two", topn=10)
             finance.assert_called_once_with()
             sentiment.assert_called_once()
             self.assertNotIn("context_pending", scheduled)
             self.assertEqual(2, workers.call_count)
         self.assertFalse(result.get("need_init"), result.get("message"))
+        self.assertEqual(2, len(requested_plans))
         self.assertEqual("close_snapshot", result["data_quality"]["quote_policy"])
         self.assertEqual(4000, result["data_quality"]["live_quote_coverage"])
         self.assertEqual([mock.call(topn=4000)]*2, queue.call_args_list)

@@ -420,11 +420,20 @@ def scoring_factor_inputs(strategy_id):
     These are calibrated score factors, not raw facts, hard entry conditions or
     the shared ranking/audit context. Adaptive weights retain the same key set.
     """
+    import strategy_plugins as SP
+
+    plugin = SP.plugin_for_selector(strategy_id)
+    if plugin is not None and not SP.is_original_builtin_plugin(plugin):
+        # Replacements can extend execution or replay dependencies. Only the
+        # original native bindings have an audited static preparation plan.
+        return None
     if strategy_id in PAPER_WEIGHTS:
-        return frozenset(PAPER_WEIGHTS[strategy_id])
-    if strategy_id in {"reported_profit_breakout", "main_force_top10"}:
-        return frozenset()
-    return None
+        planned = frozenset(PAPER_WEIGHTS[strategy_id])
+    elif strategy_id in {"three_day", "five_day", "ten_day", "reported_profit_breakout", "main_force_top10"}:
+        planned = frozenset()
+    else:
+        return None
+    return planned
 
 
 def build_factor_table(
