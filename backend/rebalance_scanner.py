@@ -202,14 +202,17 @@ def _is_risk_handled(conn, account_id, code, today, cycle_id):
 
     # 检查当日是否已成功卖出。"今日已卖出"是**成交声称**：只有被证据证明卖出的
     # 委托才能抑制今日的换仓动作，否则一个"没发生过的卖出"会挡住真实换仓。
+    # 区间取半开 [今日, 次日)：只写下界的话，时钟超前产生的"未来行"也会被算成
+    # 今日已卖出，从而在真正需要换仓时静默抑制掉。
     filled_sell = conn.execute(
         """SELECT id, status FROM paper_orders
            WHERE account_id=? AND code=? AND side='sell' AND cycle_id=?
              AND status='filled'
              AND """ + EV.VERIFIED_PREDICATE + """
-             AND created_at >= ?
+             AND created_at >= ? AND created_at < ?
            ORDER BY id DESC LIMIT 1""",
-        (account_id, code, cycle_id, today.isoformat())
+        (account_id, code, cycle_id, today.isoformat(),
+         (today + dt.timedelta(days=1)).isoformat())
     ).fetchone()
     if filled_sell:
         return {

@@ -55,12 +55,13 @@ HARD_STOP_FULL_CLEAR_CONFIRM_MINUTES = 15.0
 HARD_STOP_FULL_CLEAR_DEEPEN_PCT = 0.005
 
 
+#: 严格数值契约：只接受 int/float，NaN 视为缺失。
+#:
+#: 本模块**必须是零项目依赖**的叶子（``test_paper_trading_architecture_guard``
+#: 的 guard6a 钉着这条：它是纯决策引擎，不能因为 import 而卷进任何环）。
+#: 所以这里保留一份与 ``paper_numeric.num`` 逐字相同的实现——**刻意不去 import**。
+#: 改动一处必须同步另一处，``test_paper_numeric_contract`` 会对两者的行为做比对。
 def _num(value, default=0.0):
-    """纯 stdlib 数值规整：只接受 int/float，NaN 视为缺失。
-
-    与 ``paper_trading._num`` 语义一致（那里靠 ``pd.notna`` 过滤 NaN），但不引入
-    pandas——本模块不得依赖项目第三方栈。
-    """
     if isinstance(value, (int, float)) and value == value:
         return float(value)
     return default

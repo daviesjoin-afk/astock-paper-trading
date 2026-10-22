@@ -1,5 +1,5 @@
 /* PR-55：由 frontend/app.css 拆分（纯搬运）。
-   原始行区间 1026–1273；自进化/模拟盘统一工作台与可访问性。
+   原始行区间 1000–1443；自进化/模拟盘统一工作台与可访问性。
    本文件必须保持它在 styles/index.css 中的位置：
    @import 顺序 = 原文件顺序 = 层叠顺序。 */
 
@@ -10,7 +10,6 @@
   border-color:#d5e1dc; background:linear-gradient(145deg,#f7faf8,#eef4f1); color:#19352b;
   box-shadow:var(--shadow);
 }
-.adaptive-section-nav { display:none; }
 .adaptive-hero { background:linear-gradient(125deg,#ffffff,#f3f8f5); }
 .adaptive-hero h3,.adaptive-panel h3,.adaptive-flow-step b,.adaptive-strategy-card h3,
 .adaptive-risk-card h4,.adaptive-advisor-card h4,.adaptive-active-risk h4,
@@ -36,7 +35,6 @@
 .adaptive-shell .adaptive-downside-evidence small { color:#6d7e77; }
 .adaptive-shell .adaptive-downside-evidence b { color:#9a5b12; }
 .adaptive-advisor-actions button,.adaptive-research-suite > header button { border-color:#b9d6c8; background:#f5faf7; color:#216b52; }
-.adaptive-advisor-report > div,.adaptive-research-finding { background:#f5faf7; }
 .adaptive-advisor-report li p,.adaptive-research-card > p,.adaptive-research-finding p { color:#6d7e77; }
 .adaptive-horizon-table th { background:#eef4f1; color:#61736b; border-color:#dbe5e0; }
 .adaptive-horizon-table td { color:#29483d; border-color:#dbe5e0; }
@@ -105,20 +103,6 @@
 .adaptive-advisor-summary > div { min-width:0; padding:11px; border:1px solid var(--adaptive-line); border-radius:9px; background:#101c2b; }
 .adaptive-advisor-summary small { display:block; color:#7489a2; font-size:8px; }
 .adaptive-advisor-summary b { display:block; margin-top:6px; overflow:hidden; color:#e3ecf4; font:700 11px var(--font-data); text-overflow:ellipsis; white-space:nowrap; }
-.adaptive-advisor-report { display:grid; grid-template-columns:minmax(220px,.72fr) minmax(0,1.28fr); gap:14px; align-items:start; }
-.adaptive-advisor-report > div { padding:15px; border-left:2px solid #51cba0; background:#101b29; }
-.adaptive-advisor-report h4 { margin:0 0 8px; color:#edf5fb; font-size:12px; }
-.adaptive-advisor-report > div p { margin:0 0 10px; color:#9eb0c3; font-size:10px; line-height:1.7; }
-.adaptive-advisor-report > div small { color:#71869e; font:600 8px var(--font-data); }
-.adaptive-advisor-report ul { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
-.adaptive-advisor-report li { padding:11px; border:1px solid var(--adaptive-line); border-radius:9px; background:#172436; }
-.adaptive-advisor-report li > div { display:flex; align-items:center; gap:7px; }
-.adaptive-advisor-report li span { padding:3px 6px; border-radius:999px; background:rgba(109,145,239,.12); color:#83a7ff; font:700 8px var(--font-data); }
-.adaptive-advisor-report li.high span,.adaptive-advisor-report li.critical span { background:rgba(255,124,116,.13); color:#ff8e87; }
-.adaptive-advisor-report li.medium span { background:rgba(229,169,56,.13); color:#edb64f; }
-.adaptive-advisor-report li b { min-width:0; color:#e1ebf4; font-size:10px; }
-.adaptive-advisor-report li p { margin:8px 0 5px; color:#91a5ba; font-size:9px; line-height:1.5; }
-.adaptive-advisor-report li small { color:#70859d; font-size:8px; line-height:1.45; }
 .adaptive-research-suite { overflow:hidden; }
 .adaptive-research-suite > header { align-items:center; }
 .adaptive-research-suite > header button { min-height:34px; border-color:#3b526c; background:#152336; color:#c8d7e6; font-size:9px; }
@@ -140,9 +124,6 @@
 .adaptive-research-card h4 { margin:4px 0 0; color:#edf4fa; font-size:12px; }
 .adaptive-research-card header em { padding:4px 6px; border-radius:999px; background:rgba(67,201,154,.1); color:#55d2a5; font:700 8px var(--font-data); white-space:nowrap; }
 .adaptive-research-card > p { min-height:44px; margin:12px 0; color:#91a5bb; font-size:9px; line-height:1.6; }
-.adaptive-research-meta { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; }
-.adaptive-research-meta span { padding:7px 5px; border:1px solid rgba(133,162,195,.11); border-radius:7px; color:#7288a1; font-size:8px; text-align:center; }
-.adaptive-research-meta b { display:block; margin-top:3px; color:#dce7f1; font:700 9px var(--font-data); }
 .adaptive-research-card > button { min-height:32px; margin-top:auto; padding:6px 10px; border-color:#3b526c; background:transparent; color:#b9cad9; font-size:9px; }
 
 .adaptive-canonical-research { display:grid; gap:12px; }
@@ -164,15 +145,6 @@
 .adaptive-canonical-evidence > header span { color:var(--text-muted); font-size:12px; }
 .adaptive-research-empty,.adaptive-research-error { padding:10px 12px; color:var(--text-muted); }
 .adaptive-research-error { color:var(--danger); }
-.adaptive-research-finding { margin:9px 0; padding:9px; border-left:2px solid #e5a938; background:#101b29; }
-.adaptive-research-finding span { color:#e9b44f; font:700 8px var(--font-data); text-transform:uppercase; }
-.adaptive-research-finding b { display:block; margin-top:4px; color:#dce7f1; font-size:9px; }
-.adaptive-research-finding p { margin:5px 0 0; color:#788ea6; font-size:8px; line-height:1.5; }
-.adaptive-event-links { display:grid; gap:5px; margin:10px 0; }
-.adaptive-event-links a { display:grid; grid-template-columns:22px minmax(0,1fr); align-items:center; gap:7px; padding:7px; border:1px solid rgba(133,162,195,.12); border-radius:7px; background:#101b29; text-decoration:none; }
-.adaptive-event-links a:hover { border-color:#416483; }
-.adaptive-event-links span { display:grid; place-items:center; width:20px; height:20px; border-radius:5px; background:rgba(67,201,154,.12); color:#58d0a3; font:800 8px var(--font-data); }
-.adaptive-event-links b { overflow:hidden; color:#9eb1c4; font-size:8px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
 .adaptive-active-risk ul { margin-top:10px; }
 .adaptive-active-risk li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:9px 0; border-top:1px solid var(--adaptive-line); }
 .adaptive-active-risk li b { color:#dce7f1; font-size:9px; }.adaptive-active-risk li p { margin:3px 0 0; color:#7890ab; font-size:8px; }
@@ -251,8 +223,6 @@
   .adaptive-advisor-actions { width:100%; justify-content:space-between; }
   .adaptive-advisor-summary { grid-template-columns:1fr 1fr; }
   .adaptive-advisor-summary > div:last-child { grid-column:1/-1; }
-  .adaptive-advisor-report { grid-template-columns:1fr; }
-  .adaptive-advisor-report ul { grid-template-columns:1fr; }
   .adaptive-research-suite > header { align-items:flex-start; }
   .adaptive-research-suite > header button { width:100%; }
   .adaptive-research-grid { grid-template-columns:1fr; }

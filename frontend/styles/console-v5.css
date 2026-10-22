@@ -1,5 +1,5 @@
 /* PR-55：由 frontend/app.css 拆分（纯搬运）。
-   原始行区间 565–764；Quant Console v5 主题层（令牌/组件/暗色）。
+   原始行区间 564–757；Quant Console v5 主题层（令牌/组件/暗色）。
    本文件必须保持它在 styles/index.css 中的位置：
    @import 顺序 = 原文件顺序 = 层叠顺序。 */
 
@@ -154,7 +154,6 @@ body.dark .loading:after { background:linear-gradient(100deg,transparent 20%,rgb
 .paper-position-row:hover { background:var(--surface-hover); }
 .paper-order-row { background:var(--surface-hover); border:1px solid transparent; }
 .paper-order-row:hover { border-color:var(--border); }
-.paper-candidate-card { background:var(--surface-hover); border-color:var(--border); }
 .paper-filter-bar select,.paper-filter-bar input,.paper-filter-clear { background:var(--surface); color:var(--text); border-color:var(--border); font-family:var(--font-ui); }
 .paper-risk-header { border-radius:14px; border-left:4px solid var(--warning); box-shadow:var(--shadow); }
 .paper-risk-icon { font-family:var(--font-data); }
@@ -170,15 +169,6 @@ body.dark .loading:after { background:linear-gradient(100deg,transparent 20%,rgb
 body.dark .paper-risk-notice { background:#2c2618; color:#ddc183; }
 .paper-challenge-table,.paper-challenge-note { border-radius:14px; }
 .paper-challenge-table th { font-family:var(--font-ui); }
-.stock-research-title { color:var(--text); }
-.stock-research-subtitle { color:var(--text-secondary); }
-.stock-signal-card,.stock-chart-tools button,.stock-chart-wrap { background:var(--surface); border-color:var(--border); }
-.stock-signal-label { color:var(--text-muted); }.stock-signal-value { color:var(--text); font-family:var(--font-data); }
-.stock-research-tabs { border-color:var(--border); }
-.stock-research-tab.active,.stock-research-tab:hover { color:var(--primary); }
-.stock-research-tab.active:after { background:var(--primary); }
-.stock-chart-tools button { color:var(--text); }
-.stock-chart-tools button:hover { background:var(--surface-hover); border-color:var(--primary); color:var(--primary); }
 @media (max-width:900px) {
   .strategy-console-layout { grid-template-columns:1fr; }
   .strategy-module-tabs { position:static; display:flex; overflow-x:auto; }

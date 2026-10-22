@@ -4,34 +4,32 @@ Uses the caller's connection and transaction. Never creates a cycle, opens a
 connection, commits, reads quotes or imports the trading engine.
 """
 from __future__ import annotations
-import datetime as dt
 import math
 import paper_order_execution_authority as POEA
 import paper_position_read_model as PPRM
 import paper_position_risk_state as PPRS
 import paper_repository as PRP
 import paper_trading_rules as PTR
+from paper_common import now_text as _now, as_date as _date
 
 OrderCycleProvenanceUnknown = POEA.OrderCycleProvenanceUnknown
 ORDER_CYCLE_ORDER_MISSING = POEA.ORDER_CYCLE_ORDER_MISSING
 
 
 def _num(value, default=0.0):
-    return float(value) if isinstance(value, (int, float)) and not math.isnan(float(value)) else default
+    """严格数值契约：只接受 int/float，NaN 视为缺失。
 
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    与 ``paper_numeric.num`` 同口径，但多一层 ``OverflowError`` 保护：整数大到
+    超出 float 范围时 ``float(value)`` 会抛异常，而这里必须回落成默认值——
+    在记账路径上"抛异常"比"读不出价格"严重得多。
+    """
+    if not isinstance(value, (int, float)):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return default if math.isnan(number) else number
 
 
 def position_rows(conn, account_id=None, asof_day=None, readonly=False):

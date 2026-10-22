@@ -9,7 +9,6 @@ pending-manual bookkeeping.  It never imports :mod:`paper_trading`.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager
@@ -19,6 +18,7 @@ import execution_verification as EV
 import paper_account_specs as ACS
 import paper_decision_audit as PDA
 import paper_portfolio_read_model as PPort
+import paper_numeric as PNum
 import paper_position_review as PReview
 import paper_position_risk_state as PPRS
 import paper_quote_policy as PQP
@@ -35,6 +35,7 @@ import strategy_risk_enforcement as SRE
 import strategy_runtime as SRT
 import user_strategy_participation as USP
 from paper_trading_rules import limit_pct as _limit_pct
+from paper_common import now_text as _now, as_date as _date, dump_json as _json
 
 __all__ = ["RiskRunContext", "RiskServicePorts", "run"]
 
@@ -84,26 +85,8 @@ class RiskServicePorts:
     assert_active_lease: Callable[..., Any]
 
 
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _num(value, default=0.0):
-    return float(value) if isinstance(value, (int, float)) and value == value else default
+#: 与 `paper_numeric.num` 同一实现（严格契约），不再保留本地副本。
+_num = PNum.num
 
 
 def _lease_lost(exc):

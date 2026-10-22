@@ -8,7 +8,6 @@ all runtime/infrastructure dependencies through :class:`RiskEvidenceDeps`.
 from __future__ import annotations
 
 import datetime as dt
-import json
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -21,6 +20,7 @@ import paper_replacement_evidence as PREPL
 import paper_risk_decision as PRD
 import strategy_policies as SPOL
 from paper_trading_rules import limit_pct as _limit_pct, security_scope as _security_scope
+from paper_common import now_text as _now, as_date as _date, dump_json as _json, load_json as _loads
 
 __all__ = [
     "RiskEvidenceDeps",
@@ -57,31 +57,6 @@ class RiskEvidenceDeps:
     risk_version: str
     alt_data: Any | None
     load_kline: Callable[..., Any]
-
-
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _loads(value, default=None):
-    try:
-        return json.loads(value) if value else (default if default is not None else {})
-    except (TypeError, ValueError):
-        return default if default is not None else {}
 
 
 def _num(value, default=0.0):

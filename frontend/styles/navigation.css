@@ -1,5 +1,5 @@
 /* PR-55：由 frontend/app.css 拆分（纯搬运）。
-   原始行区间 915–1025；固定三级导航与滚动轨道。
+   原始行区间 917–999；固定三级导航与滚动轨道。
    本文件必须保持它在 styles/index.css 中的位置：
    @import 顺序 = 原文件顺序 = 层叠顺序。 */
 
@@ -38,35 +38,6 @@
   min-width:190px !important;
   max-width:none !important;
 }
-.workspace-tab-rail {
-  display:none !important;
-  grid-template-columns:44px minmax(112px,1fr) 44px;
-  align-items:center;
-  gap:8px;
-  min-height:44px;
-  padding:5px 7px 0;
-  border:1px solid var(--border);
-  border-top:0;
-  border-radius:0 0 var(--radius-md) var(--radius-md);
-  background:var(--surface);
-  box-shadow:var(--shadow);
-}
-.workspace-tab-rail[hidden] { display:none !important; }
-.workspace-tab-rail-button {
-  display:grid;
-  place-items:center;
-  width:44px;
-  min-width:44px;
-  min-height:34px;
-  padding:0;
-  border:1px solid var(--border);
-  border-radius:9px;
-  background:var(--surface-hover);
-  color:var(--primary);
-  box-shadow:none;
-}
-.workspace-tab-rail-button:hover { background:var(--primary-soft); border-color:#a7cdbd; box-shadow:none; }
-.workspace-tab-rail-button svg { width:18px; height:18px; }
 .workspace-tab-track {
   position:relative;
   height:16px;
@@ -91,9 +62,7 @@
   will-change:transform;
 }
 body.dark .workspace-tabs-dock { background:linear-gradient(180deg,var(--bg) 0%,var(--bg) 84%,transparent 100%); }
-body.dark .workspace-tab-rail { background:var(--surface); border-color:var(--border); }
 body.dark .workspace-tab-track { border-color:#3c5b4c; background:#1c3228; }
-body.dark .workspace-tab-rail-button { background:var(--surface-hover); border-color:var(--border); }
 
 .paper-research-schedule {
   max-width:250px;
@@ -108,7 +77,6 @@ body.dark .workspace-tab-rail-button { background:var(--surface-hover); border-c
 .paper-research-action-status.ready { color:#1d7655; }.paper-research-action-status.caution { color:#9b6418; }
 @media (max-width:780px) {
   .workspace-tabs-dock { top:148px; margin-left:-2px; margin-right:-2px; }
-  .workspace-tab-rail { grid-template-columns:44px minmax(80px,1fr) 44px; }
   .workspace-tabs-dock .workspace-tab-strip .module-tab { flex-basis:178px !important; width:178px !important; min-width:178px !important; }
   .paper-research-schedule,.paper-research-action-status { width:100%; max-width:none; text-align:left; }
 }

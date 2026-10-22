@@ -157,6 +157,7 @@ IGNITION_BUY_ENABLED = os.environ.get("PAPER_IGNITION_BUY", "").strip().lower() 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
 import selection_factor_store as SFS
+from paper_common import now_text as _now, as_date as _date, dump_json as _json, load_json as _loads
 DB_PATH = data_paths.data_path("paper_trading.sqlite3")
 REPORT_DIR = data_paths.report_dir()
 SELECTION_FACTORS_PATH = data_paths.data_path("selection_factors.csv")
@@ -922,10 +923,6 @@ def strategy_center():
     }
 
 
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _market_session(now=None):
     """返回当前 A 股交易时段，并决定是否允许展示“今日盈亏”。
 
@@ -948,27 +945,6 @@ def _market_session(now=None):
     if current <= dt.time(15, 0):
         return {"code": "afternoon", "label": "交易中", "today_pnl_available": True}
     return {"code": "closed", "label": "已收盘", "today_pnl_available": True}
-
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _loads(value, default=None):
-    try:
-        return json.loads(value) if value else (default if default is not None else {})
-    except (TypeError, ValueError):
-        return default if default is not None else {}
 
 
 #: Direct reference, not a wrapper: the ~860 underscore call sites across the

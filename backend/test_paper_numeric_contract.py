@@ -76,6 +76,77 @@ class StrictNumericContractGuard(unittest.TestCase):
         )
 
 
+class NumericVariantContractGuard(unittest.TestCase):
+    """每一个仍在用的 ``_num`` 变体，把它的口径钉死。
+
+    ``_num`` 在仓库里曾有多份副本。逐字相同的已经收拢成对 ``paper_numeric.num``
+    的引用（下面用 ``is`` 断言，避免"今天行为一样、明天分叉"）；语义确实不同的
+    保留在原处，但必须在此固定，否则一次顺手"统一"就会静默改掉读价口径。
+    """
+
+    def test_strict_variants_share_one_function_object(self):
+        import paper_numeric as PNum
+        import paper_risk_service as PRS
+
+        self.assertIs(
+            PRS._num, PNum.num,
+            "paper_risk_service._num 必须是 paper_numeric.num 本身，"
+            "而不是一份行为恰好相同的副本",
+        )
+
+    def test_leaf_engine_keeps_an_identical_copy_on_purpose(self):
+        """``paper_risk_decision`` 必须零项目依赖，所以它的副本是**刻意**的。
+
+        guard6a 要求该模块不能 import 任何项目内模块（纯决策引擎，不能卷入环），
+        因此它自带一份 ``_num``。这里锁住"行为与 paper_numeric 完全一致"——
+        哪天有人只改一边，这条会红。
+        """
+        import paper_numeric as PNum
+        import paper_risk_decision as PRD
+
+        for value in (None, float("nan"), float("inf"), 3.5, 7, 0, -1.5, "3.5",
+                      "abc", "", True, False):
+            self.assertEqual(
+                PRD._num(value), PNum.num(value),
+                f"paper_risk_decision._num({value!r}) 与 paper_numeric.num 分叉了",
+            )
+
+    def test_lot_ledger_is_strict_and_never_raises(self):
+        import paper_lot_ledger as PLOT
+
+        self.assertEqual(PLOT._num(float("nan")), 0.0)
+        self.assertEqual(PLOT._num(float("nan"), 5.0), 5.0)
+        self.assertEqual(PLOT._num("3.5"), 0.0, "记账路径不接受字符串数字")
+        self.assertEqual(PLOT._num(None), 0.0)
+        self.assertEqual(PLOT._num(3.5), 3.5)
+        self.assertEqual(PLOT._num(7), 7.0)
+        # 超出 float 范围的整数：回落默认值，而不是抛 OverflowError
+        self.assertEqual(PLOT._num(10 ** 400), 0.0)
+
+    def test_risk_evidence_treats_nan_as_absent(self):
+        import paper_risk_evidence as PREv
+
+        self.assertEqual(PREv._num(float("nan")), 0.0)
+        self.assertEqual(PREv._num("3.5"), 0.0)
+        self.assertEqual(PREv._num(3.5), 3.5)
+
+    def test_replacement_decision_rejects_bool(self):
+        import paper_replacement_decision as PRep
+
+        self.assertEqual(PRep._num(True), 0.0, "bool 不是价格")
+        self.assertEqual(PRep._num(True, 9.0), 9.0)
+        self.assertEqual(PRep._num(3.5), 3.5)
+
+    def test_read_side_variants_stay_lenient(self):
+        import paper_position_read_model as PPRM
+        import rebalance_scanner as RBS
+
+        for module in (PPRM, RBS):
+            self.assertEqual(module._num("3.5"), 3.5, f"{module.__name__} 应宽松解析")
+            self.assertEqual(module._num(None, 7.0), 7.0)
+            self.assertEqual(module._num("abc", 7.0), 7.0)
+
+
 class RemovedHelperGuard(unittest.TestCase):
     """The unreferenced JSON helpers must not grow back."""
 
