@@ -544,6 +544,77 @@ def has_verified_positive_execution(
     return row is not None
 
 
+def first_verified_positive_execution(
+    conn,
+    *,
+    marker: str,
+    account_id: Any,
+    code: Any,
+    asof_day: Any,
+    legacy_reason_like: str | None = None,
+    column: str = "risk_payload",
+    marker_key: str = "exit_marker",
+    now: Any = None,
+) -> dict | None:
+    """当日该 marker 最早一笔**经过验证的正成交**的证据（时间、成交价、距今分钟）。
+
+    判据与 :func:`has_verified_positive_execution` 完全相同，只是补上"什么时候、
+    什么价"——首段减仓之后的追加卖出需要据此判断"是否继续恶化"和"等了多久"，
+    仅有布尔真值无法区分"3 分钟前的首段"与"一小时前已经确认过的首段"。
+
+    三态语义（调用方都必须能区分）：
+
+    * ``None`` —— 当日没有该 marker 的成交，动作尚未发生；
+    * 字典 —— 已执行；``created_at``/``filled_price``/``age_minutes`` 可能为 ``None``
+      （证据不可解析），调用方须回到旧行为，而不是当作"没发生过"；
+    * 账本读不出结论时返回**空证据字典**（视为已执行但不可解析），既不重复发
+      首段减仓单，也不静默改判。
+    """
+    if column not in _MARKER_COLUMNS:
+        raise ValueError(f"unsupported marker column: {column!r}")
+    if marker_key not in _MARKER_KEYS:
+        raise ValueError(f"unsupported marker key: {marker_key!r}")
+    if not marker:
+        return None
+    day = str(asof_day or "")[:10]
+    if not day:
+        return None
+    matcher = f"json_extract({column},'$.{marker_key}')=?"
+    params: list = [str(account_id), str(code), day, str(marker)]
+    if legacy_reason_like:
+        matcher = f"({matcher} OR reason LIKE ?)"
+        params.append(str(legacy_reason_like))
+    sql = (
+        "SELECT created_at, filled_price, executed_at FROM paper_orders "
+        "WHERE account_id=? AND code=? AND side='sell' "
+        f"  AND {POSITIVE_EXECUTION_PREDICATE} "
+        "  AND substr(created_at,1,10)=? "
+        f"  AND {matcher} "
+        "ORDER BY id ASC LIMIT 1"
+    )
+    unknown = {"created_at": None, "executed_at": None, "filled_price": None,
+               "age_minutes": None}
+    try:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    except sqlite3.Error:
+        return unknown
+    if row is None:
+        return None
+    stamp = row["executed_at"] or row["created_at"]
+    age_minutes = None
+    if stamp:
+        try:
+            reference = now if isinstance(now, dt.datetime) else dt.datetime.now()
+            age_minutes = max(
+                0.0,
+                (reference - dt.datetime.fromisoformat(str(stamp))).total_seconds() / 60,
+            )
+        except (TypeError, ValueError):
+            age_minutes = None
+    return {"created_at": row["created_at"], "executed_at": row["executed_at"],
+            "filled_price": row["filled_price"], "age_minutes": age_minutes}
+
+
 def is_confirmed_zero_row(row: Any) -> bool:
     """A coherent owner-issued zero execution, distinct from unknown."""
     flag = _row_field(row, "execution_verified")

@@ -469,20 +469,21 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             # （status='filled' + VERIFIED_PREDICATE），部分成交会被读成"没发生过"，
             # 于是每轮扫描再发一张同样的减仓单 —— 300+300+300… 突破配置比例。
             # 中文 reason LIKE 仅作标记上线前旧订单的兜底。
-            hard_stop_touched_today = EV.has_verified_positive_execution(
+            # 首段减仓执行证据（成交价 + 距今分钟），全清据此要求独立确认。
+            hard_stop_trim = EV.first_verified_positive_execution(
                 conn, marker="hard_stop_first_trim",
                 account_id=position["account_id"], code=position["code"],
-                asof_day=day, legacy_reason_like="%硬止损首段减仓%",
-            )
+                asof_day=day, legacy_reason_like="%硬止损首段减仓%")
             base_spec = _spec_for(position["account_id"], conn, cycle_id=cycle_id)
             ratio, reason, next_stage, detail = PREv.sell_plan(
-                position, quote, day, news, hard_stop_touched_today=hard_stop_touched_today,
+                position, quote, day, news,
                 # PR-30：卖出状态机的止损/移动止损/时间止损用 cycle-pinned 编译画像。
                 spec_override=SRE.effective_spec_for_cycle(
                     conn, position["account_id"], base_spec, cycle_id=cycle_id,
                 ),
                 base_spec=base_spec,
                 deps=ports.evidence,
+                hard_stop_trim=hard_stop_trim,
             )
             quality_action, quality_reason = PReview.decide_action(
                 quality_review, position, quote_status, concentration_sells_used,

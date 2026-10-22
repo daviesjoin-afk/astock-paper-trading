@@ -26,6 +26,7 @@ R15 correctness defect
     RD-14  档位未知跳过阶梯止盈；档位已知时跳空越档单轮连续消费
     RD-15  真实 ``_sell_plan`` 委托纯 engine，且不随机器当前日期漂移
     RD-16  真实 ``_intraday_downside_guard`` 同样只认显式 as-of（第二条生产链）
+    RD-17  首段减仓后的全清必须有独立确认（继续跌破 / 等足时间）
 
 全部纯 fixture：不打开数据库、不访问网络 / K 线（``_completed_kline`` 打桩）、
 不 sleep、不动真实系统时钟（机器"今天"用假 ``PT.dt`` 显式模拟）。
@@ -233,6 +234,39 @@ class HardStopTests(unittest.TestCase):
         self.assertEqual(decision["exit_class"], "hard_stop")
         self.assertEqual(decision["sell_ratio"], 1.0)
         self.assertIn("跌破确认", decision["reason"])
+
+    def test_rd17_first_trim_needs_fresh_confirmation_before_clearing(self):
+        """首段减仓后，"仍在成本线下"本身不足以全清。
+
+        3 分钟一轮的扫描下，只要求"还在线下"就会把仓位砍在震荡低点：首段成交价
+        附近的来回波动不允许追加卖出，必须**继续跌破**或**等足确认时间**。
+        证据缺失时沿用旧行为——宁可照旧卖，也不静默不卖。
+        """
+        def decide(price, pct, **kwargs):
+            return PRD.evaluate_sell(
+                _position(cost=COST), self._quote(price=price, pct=pct),
+                asof_day=ASOF, spec=dict(SPEC), hold_days=0, limit_pct=10.0,
+                hard_stop_touched_today=True, **kwargs)
+
+        waiting = decide(9.40, -3.0, hard_stop_trim_age_minutes=5.0,
+                         hard_stop_trim_price=9.40)
+        self.assertEqual(waiting["sell_ratio"], 0.0)
+        self.assertEqual(waiting["exit_class"], "hard_stop")
+        self.assertIn("等待继续跌破", waiting["reason"])
+
+        deepened = decide(9.35, -3.5, hard_stop_trim_age_minutes=5.0,
+                          hard_stop_trim_price=9.40)
+        self.assertEqual(deepened["sell_ratio"], 1.0)
+        self.assertIn("跌破确认", deepened["reason"])
+
+        waited = decide(9.40, -3.0, hard_stop_trim_age_minutes=16.0,
+                        hard_stop_trim_price=9.40)
+        self.assertEqual(waited["sell_ratio"], 1.0)
+        self.assertIn("跌破确认", waited["reason"])
+
+        legacy = decide(9.40, -3.0)
+        self.assertEqual(legacy["sell_ratio"], 1.0)
+        self.assertIn("跌破确认", legacy["reason"])
 
 
 class TrailingStopTests(unittest.TestCase):

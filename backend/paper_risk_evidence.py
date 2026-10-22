@@ -326,7 +326,10 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
             (deps.strategy_risk_behaviors.get(account_id) or {}).get(
                 "washout_loss_override_pct"
             ),
-            -4.0,
+            # 默认取 -5.0 而不是 -4.0：硬止损线是 -4%，两者相等时"洗盘豁免"恰好在
+            # 它唯一该起作用的时刻失效——刚刚触发首段减仓的位置会被守卫再叠一层
+            # 减仓。豁免线必须严格落在止损线之外，才谈得上"风险尚可承受时延迟减仓"。
+            -5.0,
         )
         loss_beyond_override = (
             ret_pct is not None and ret_pct <= washout_override
@@ -766,7 +769,7 @@ def save_position_review(conn, cycle_id, review, action, reason):
 
 
 def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, spec_override=None,
-              *, base_spec, deps: RiskEvidenceDeps):
+              *, base_spec, deps: RiskEvidenceDeps, hard_stop_trim=None):
     """卖出决策的 orchestration adapter：解析输入 → 交给纯 engine → 组装旧 schema。
 
     真正的硬止损/移动止损/最长持有/阶梯止盈/严重度仲裁都在
@@ -781,6 +784,13 @@ def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, sp
         spec.update(spec_override)
     days = _hold_days(position, asof_day, deps.load_kline)
     price = _num(quote.get("price"), 0)
+    # 首段减仓的执行证据（成交价/距今分钟）：全清需要"继续跌破或等足时间"这一层
+    # 独立确认。证据字典为 None 表示当日没有可验证的首段成交；字典存在但字段为
+    # None 表示已执行而证据不可解析——两者都不能被当成"没卖过"。
+    if hard_stop_trim is not None:
+        hard_stop_touched_today = True
+    trim_age = (hard_stop_trim or {}).get("age_minutes")
+    trim_price = (hard_stop_trim or {}).get("filled_price")
     decision = PRD.evaluate_sell(
         position, quote, asof_day=asof_day, spec=spec, hold_days=days, news=news,
         hard_stop_touched_today=hard_stop_touched_today,
@@ -789,6 +799,9 @@ def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, sp
         hard_stop_first_trim_ratio=SPOL.intraday_downside_policy(
             position["account_id"]
         ).get("partial_ratio", 0.35),
+        # engine 用它判断"是否继续恶化"与"等了多久"；拿不到时保持旧行为。
+        hard_stop_trim_age_minutes=trim_age,
+        hard_stop_trim_price=trim_price,
         risk_version=deps.risk_version,
     )
     if decision["status"] == "no_quote":
