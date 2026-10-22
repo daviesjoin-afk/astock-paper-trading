@@ -109,6 +109,53 @@ export function riskText(value){
 export function zhRiskText(value){
   var text=riskText(value);
   var replacements={
+    'exact_cycle_asof_nav_unavailable':'本周期当前净值无法核验',
+    'exact_cycle_asof_pending_capacity_unavailable':'当前待执行委托的资金占用无法核验',
+    'exact_headroom_unavailable':'剩余可分配资金无法核验',
+    'exact_market_quote_evidence_unavailable':'缺少通过核验的市场行情',
+    'exact_market_quote_identity_unavailable':'行情来源凭据无法核验',
+    'exact_market_value_by_account_unavailable':'各策略持仓市值无法核验',
+    'exact_market_valued_classification_unavailable':'持仓分类及集中度无法核验',
+    'exact_nav_unavailable':'账户净值无法核验',
+    'exact_pending_by_account_unavailable':'各策略待执行委托占用资金无法核验',
+    'exact_pending_total_unavailable':'待执行委托占用资金总额无法核验',
+    'exact_pending_unavailable':'待执行委托占用资金无法核验',
+    'exact_strategy_version_return_series_unavailable':'对应策略版本的历史收益数据无法核验',
+    'exact_used_unavailable':'已使用资金无法核验',
+    'exact_position_quote_missing_or_invalid':'持仓行情缺失或无效',
+    'exact_market_valuations_not_supplied':'未提供通过核验的持仓估值',
+    'exact_asof_risk_consumption_owner_unavailable':'当前风险额度占用无法核验',
+    'exact_strategy_lifecycle_state_unavailable':'策略运行状态无法核验',
+    'exact_cycle_strategy_pin_unavailable':'本周期策略版本无法核验',
+    'exact_cycle_strategy_pin_mismatch':'策略版本与本周期记录不一致',
+    'bounded_accounting_facts_incomplete':'账务核验资料不完整',
+    'bounded_lot_cost_evidence_incomplete':'持仓批次成本资料不完整',
+    'bounded_position_quantity_evidence_incomplete':'持仓数量资料不完整',
+    'asof_risk_exit_lot_evidence_unavailable':'当前退出持仓批次无法核验',
+    'explicit_verified_turnover_window_unavailable':'缺少已核验的成交额统计区间',
+    'pending_order_intent_evidence_incomplete':'待执行委托资料不完整',
+    'pending_order_intent_evidence_unavailable':'待执行委托无法核验',
+    'pending_reservation_evidence_unavailable':'预留资金无法核验',
+    'reservation_order_identity_mismatch':'预留资金与委托记录不一致',
+    'market_evidence_identity_mismatch':'行情核验凭据不一致',
+    'explicit_shared_pool_exposure_cap_unavailable':'未提供资金池仓位上限',
+    'explicit_strategy_pool_floor_ratio_unavailable':'未提供策略保底资金比例',
+    'concentration_not_available':'集中度资料不可用',
+    'no_owner_issued_concentration_adjustment_rule':'尚无可用的集中度调整规则',
+    'no_execution_participant_has_new_resource_eligibility':'暂无策略符合新增资金分配条件',
+    'unscoped_unknown_pending_order':'存在归属不明的待执行委托',
+    'portfolio_allocation_deferred':'资金分配暂缓，等待证据补齐',
+    'portfolio_allocation_unavailable':'资金分配核验未完成，暂缓新增委托',
+    'entry_frozen_waitlist':'新增买入已冻结，保留候选等待重试',
+    'rejected_bootstrap':'候选入场核验未通过',
+    'deferred_capacity':'等待可用资金核验',
+    'shared_risk_state_blocked':'共享风控状态未通过，暂停新增委托',
+    'order_intent_rejected':'委托核验未通过',
+    'execution_event_error':'委托执行异常，等待核查',
+    'execution_retry':'等待重试执行',
+    'signal_expired':'候选信号已过期',
+    'paper-risk-v4':'风控规则第4版',
+    '精确 allocation plan':'精确资金分配方案',
     'real-time quote lacks passing independent cross-source check':'实时行情未通过独立交叉核验',
     'real-time quote failed price/range validation':'实时行情未通过价格或范围核验',
     '未获得通过的独立行情源校验结果':'未获得通过的独立行情源校验结果',
@@ -144,8 +191,13 @@ export function zhRiskText(value){
     'not_attempted':'未核验',
     'filled':'已成交', 'pending':'待处理', 'local_cache':'本地缓存', 'unverified':'未核验', 'invalid':'无效'
   };
-  Object.keys(replacements).sort(function(a,b){return b.length-a.length;}).forEach(function(key){ text=text.split(key).join(replacements[key]); });
-  return text;
+  // 按完整代码翻译，避免把 pending/unavailable 等片段嵌入中文。
+  Object.keys(replacements).sort(function(a,b){return b.length-a.length;}).forEach(function(key){
+    var escaped=key.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    text=text.replace(new RegExp('(^|[^A-Za-z0-9_])'+escaped+'(?=$|[^A-Za-z0-9_])','g'),function(_,prefix){return prefix+replacements[key];});
+  });
+  // 新增但尚未登记的内部代码不直接暴露到页面，原值仍保留在审计接口和日志。
+  return text.replace(/\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b/g,'其他风控信息（待核查）');
 }
 
 export function riskLevelView(level){

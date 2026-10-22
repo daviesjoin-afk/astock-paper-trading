@@ -449,7 +449,7 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
   var waiting=(runtime.deployment&&runtime.deployment.waiting_capital!==null&&runtime.deployment.waiting_capital!==undefined)
     ?cny(runtime.deployment.waiting_capital):'—';
   var blocked=(runtime.allocation_status==='UNAVAILABLE'
-    ?'分配额度与席位未知；请在 Portfolio Workspace 指定 cycle ID 与 plan ID 查询'
+    ?'分配额度与席位未知；请在组合计划工作台指定周期编号与计划编号查询'
     :(runtime.deployment&&runtime.deployment.blocked_reason))
     ||(runtime.waiting_reason&&runtime.waiting_reason.reason)
     ||(runtime.running?'正常运行，无阻塞':'未参与当前周期');
@@ -501,7 +501,7 @@ export function renderPaperStrategyCenter(d){
   if(plan.total_deployable_amount!==null&&plan.total_deployable_amount!==undefined) headline.push('本轮可部署 '+cny(plan.total_deployable_amount));
   var guards=(((d.boundaries||{}).shared_guards)||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
   target.innerHTML='<section class="paper-strategy-intro"><div><h3>运行策略</h3>'
-    +'<p>本页只读展示当前周期参与状态与风险 / 执行边界。分配额度和席位只在指定 cycle ID 与 plan ID 后可验证，请到“组合计划”查看；本页不会挑选最新计划或推导风险许可。</p>'
+    +'<p>本页只读展示当前周期参与状态与风险 / 执行边界。分配额度和席位只在指定周期编号与计划编号后可验证，请到“组合计划”查看；本页不会挑选最新计划或推导风险许可。</p>'
     +paperMarketDataHtml(allocation.market_data)
     +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench()">打开策略工坊</button>'
     +'<span class="strategy-builder-hint">'+(headline.join(' · ')||'—')+'</span></div></div></section>'
@@ -684,7 +684,7 @@ export async function loadPortfolioWorkspace(){
   if(!cycleInput||!planInput||!target) return;
   var cycle=String(cycleInput.value||'').trim(),plan=String(planInput.value||'').trim();
   if(!cycle||!plan){
-    target.innerHTML='<div class="paper-empty">输入明确的 cycle ID 和 plan ID 后读取；页面不会替你选择 latest 或 current。</div>';
+    target.innerHTML='<div class="paper-empty">输入明确的周期编号和计划编号后读取；页面不会替你选择最新或当前计划。</div>';
     return;
   }
   target.innerHTML='<div class="loading">正在读取指定的周期与计划…</div>';

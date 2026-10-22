@@ -32,7 +32,7 @@ test("Portfolio Workspace reads only the explicitly entered cycle and plan", asy
   await page.getByTestId("paper-allocation-tab").click();
   await expect(page.locator("#paperExecutionView")).toBeHidden();
   await expect(page.getByTestId("portfolio-workspace-result")).toContainText(
-    "不会替你选择 latest 或 current",
+    "不会替你选择最新或当前计划",
   );
   expect(requested).toHaveLength(0);
   await page.getByTestId("portfolio-workspace-cycle").fill("42");
