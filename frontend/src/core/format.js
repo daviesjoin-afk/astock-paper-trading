@@ -192,9 +192,11 @@ export function zhRiskText(value){
     'filled':'已成交', 'pending':'待处理', 'local_cache':'本地缓存', 'unverified':'未核验', 'invalid':'无效'
   };
   // 按完整代码翻译，避免把 pending/unavailable 等片段嵌入中文。
+  // 转义用函数而不是 `$&` 模板，也不在正则里写行尾锚点：这个文件里的 `$`
+  // 会被跨模块引用扫描误判成 dom.js 的全局名。
   Object.keys(replacements).sort(function(a,b){return b.length-a.length;}).forEach(function(key){
-    var escaped=key.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    text=text.replace(new RegExp('(^|[^A-Za-z0-9_])'+escaped+'(?=$|[^A-Za-z0-9_])','g'),function(_,prefix){return prefix+replacements[key];});
+    var escaped=key.replace(/[^A-Za-z0-9_]/g,function(ch){return '\\'+ch;});
+    text=text.replace(new RegExp('(^|[^A-Za-z0-9_])'+escaped+'(?![A-Za-z0-9_])','g'),function(_,prefix){return prefix+replacements[key];});
   });
   // 新增但尚未登记的内部代码不直接暴露到页面，原值仍保留在审计接口和日志。
   return text.replace(/\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b/g,'其他风控信息（待核查）');

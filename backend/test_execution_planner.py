@@ -487,6 +487,34 @@ class SimulationExecutionContractTests(unittest.TestCase):
         result = EP.evaluate_simulated_execution(self._intent(), context)
         self.assertIn(EP.ExecutionReason.MARKET_UNVERIFIED.value, result.reasons)
 
+    def test_protective_exit_does_not_require_a_second_source(self):
+        """卖出只看"能不能用来定价"，双源背书是买入的门槛。
+
+        独立源分歧或整族不可用时止损仍必须成交：把止损停在源分歧上，等于让行情
+        抖动代替风控做决定（``paper_quote_policy`` 已按 exit 用途降级放行）。
+        """
+        for verification in ("range_timestamp_checked", "cross_source_failed"):
+            with self.subTest(verification=verification):
+                _, context = self._facts(verification=verification, liquidity=200_000)
+                result = EP.evaluate_simulated_execution(
+                    self._intent(side="sell"), context,
+                )
+                self.assertTrue(result.executable_now)
+                self.assertEqual("filled", result.status)
+                self.assertEqual(1000, result.fill_quantity)
+
+    def test_protective_exit_still_needs_a_usable_quote(self):
+        """降级不等于不校验：过期报价仍然不能用来定价。"""
+        _, context = self._facts(
+            verification="cross_source_failed",
+            quote_at=f"{self.DAY} 10:00:00",
+            execution_asof=f"{self.DAY} 10:25:00",
+        )
+        result = EP.evaluate_simulated_execution(self._intent(side="sell"), context)
+        self.assertFalse(result.executable_now)
+        self.assertEqual(0, result.fill_quantity)
+        self.assertIn(EP.ExecutionReason.MARKET_STALE.value, result.reasons)
+
     def test_midday_break_and_closed_session_block_fill(self):
         _, lunch = self._facts(
             quote_at=f"{self.DAY} 12:00:00", execution_asof=f"{self.DAY} 12:00:00",

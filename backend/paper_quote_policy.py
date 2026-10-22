@@ -97,6 +97,15 @@ def execution_quote_status(
         }
     if validation == "cross_source_failed":
         detail = cross.get("failure_reason") or "独立行情源返回结果与主行情不一致"
+        if purpose == "exit":
+            # 两个源分歧只说明"哪一份报价更准"没有定论，不说明"该不该卖"没有定论。
+            # 风控退出按主行情定价并保留分歧证据；把止损停在源分歧上等于让行情
+            # 抖动代替风控做决定。
+            return {
+                "fresh": True, "status": "degraded_cross_source",
+                "reason": detail + "；风控退出按主行情定价并记录源分歧", "degraded": True,
+                **diagnostics,
+            }
         return {"fresh": False, "status": "cross_source_failed", "reason": detail, **diagnostics}
     if validation == "cross_source_unavailable":
         detail = cross.get("failure_reason") or "本次未获得独立行情源的有效返回"

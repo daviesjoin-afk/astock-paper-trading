@@ -750,12 +750,24 @@ def evaluate_simulated_execution(
         reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
     else:
         snapshot = reading.snapshot
-        if reading.freshness != MDC.FRESHNESS_FRESH:
-            reasons.append(ExecutionReason.MARKET_STALE.value)
-        elif snapshot is None or snapshot.verification == MDC.VERIFICATION_DISAGREEMENT:
-            reasons.append(ExecutionReason.MARKET_DISAGREEMENT.value)
-        elif not MDC.is_cross_source_verified(snapshot):
-            reasons.append(ExecutionReason.MARKET_UNVERIFIED.value)
+        if side == "sell":
+            # 风控退出只需要"能用来定价的当日报价"，不需要第二源背书。双源核验是
+            # 买入的兜底机制，不是止损失效的理由：独立源分歧或不可用时，
+            # ``paper_quote_policy`` 已按 exit 用途降级放行，成交价按主行情计算并
+            # 保留分歧证据。真正过期的报价仍然阻断——那已经无法用来定价。
+            age = reading.age_seconds
+            within_exit_window = (
+                age is not None and age <= MDC.EXECUTION_QUOTE_POLICY.max_age_seconds
+            )
+            if reading.freshness != MDC.FRESHNESS_FRESH and not within_exit_window:
+                reasons.append(ExecutionReason.MARKET_STALE.value)
+        else:
+            if reading.freshness != MDC.FRESHNESS_FRESH:
+                reasons.append(ExecutionReason.MARKET_STALE.value)
+            elif snapshot is None or snapshot.verification == MDC.VERIFICATION_DISAGREEMENT:
+                reasons.append(ExecutionReason.MARKET_DISAGREEMENT.value)
+            elif not MDC.is_cross_source_verified(snapshot):
+                reasons.append(ExecutionReason.MARKET_UNVERIFIED.value)
         if snapshot is not None and str(snapshot.as_of or "") != str(context.session_date or ""):
             reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
 

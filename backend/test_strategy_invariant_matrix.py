@@ -438,6 +438,7 @@ class SystemRiskNonOverrideTests(unittest.TestCase):
         matrix = {
             "cross_source_checked": {"entry": True, "exit": True},
             "cross_source_unavailable": {"entry": False, "exit": True},
+            "cross_source_failed": {"entry": False, "exit": True},
             "range_timestamp_checked": {"entry": False, "exit": True},
             "incomplete": {"entry": False, "exit": False},
             None: {"entry": False, "exit": False},

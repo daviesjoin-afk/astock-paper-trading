@@ -4,7 +4,7 @@
    新增 inline handler 时，把被调用的函数加到对应 import 与赋值列表。
    由 backend/test_frontend_module_contract.py 校验覆盖率。 */
 
-import { adaptiveEsc } from "./core/format.js";
+import { adaptiveEsc, adaptiveJsArg } from "./core/format.js";
 import { compareAdaptiveValidationRun, openAdaptiveValidationRun, refreshAdaptiveRobustness, refreshAdaptiveValidationRuns, selectAdaptiveRobustnessRun, submitAdaptiveRobustness, submitAdaptiveValidation } from "./features/adaptive.js";
 import { activatePage, refreshApp, showPaperWorkspace, toggleDark } from "./core/navigation.js";
 import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, triggerEvolution } from "./features/adaptive.js";
@@ -17,6 +17,7 @@ import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbAiGen
 
 window.activatePage = activatePage;
 window.adaptiveEsc = adaptiveEsc;
+window.adaptiveJsArg = adaptiveJsArg;
 window.applyAdaptiveRiskCandidate = applyAdaptiveRiskCandidate;
 window.applyAdaptiveSelectionCandidate = applyAdaptiveSelectionCandidate;
 window.applyPaperRiskAuditFilter = applyPaperRiskAuditFilter;
