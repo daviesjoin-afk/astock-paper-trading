@@ -23,8 +23,6 @@ EVALUATION_GATE_MAX_PREDICTION_ROWS = 40_000
 EVALUATION_GATE_MAX_PROVENANCE_ROWS = 2_000
 
 # 加速模式配置键
-ACCELERATED_MODE_KEY = "neural_accelerated_mode"
-
 
 def approval_state(conn):
     """Return the persisted neural gate without changing trading state.

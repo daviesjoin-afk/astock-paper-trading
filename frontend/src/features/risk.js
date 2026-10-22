@@ -5,10 +5,6 @@ import { $, tableScroll } from "../core/dom.js";
 import { cny, fmt, fmtPct, pctCls, pctTxt, riskLevelView, riskMetric, riskText, zhRiskText } from "../core/format.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 
-export function paperAuditBlock(title, count, body){
-  return '<details class="paper-audit"><summary><span>'+title+'<span class="paper-audit-count">'+count+'</span></span><span class="paper-status-note">点击查看完整记录</span></summary><div class="paper-audit-body">'+body+'</div></details>';
-}
-
 var auditState={filters:{account_id:'',level:'',date:''},cursors:[null],page:0,data:null,sequence:0};
 
 export function applyPaperRiskAuditFilter(){

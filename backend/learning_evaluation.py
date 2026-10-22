@@ -122,36 +122,6 @@ PREDICTION_EXCLUSION_REASONS = (
 # Every blocker this module can emit, documented in one place.  A blocker is a
 # *refusal*, never a warning: any single one of them keeps ``contract_ok``
 # false and therefore keeps the neural shadow at ``shadow_only``.
-EVALUATION_BLOCKERS = (
-    "evaluation_prediction_table_missing",
-    "evaluation_contract_error",
-    "evaluation_dataset_contract_failed",
-    "evaluation_dataset_cutoff_unprovable",
-    "evaluation_dataset_fingerprint_unavailable",
-    "evaluation_holdout_partition_unsupported",
-    "evaluation_model_ambiguous",
-    "evaluation_model_unresolved",
-    "evaluation_model_provenance_truncated",
-    "evaluation_training_boundary_unproven",
-    "evaluation_training_overlaps_test",
-    "evaluation_selection_partition_unproven",
-    "evaluation_test_used_for_selection",
-    "evaluation_prediction_conflict",
-    "evaluation_no_held_out_predictions",
-    "evaluation_missing_predictions",
-    "evaluation_unexpected_predictions",
-    "evaluation_insufficient_dates",
-    "evaluation_mean_rank_ic_below_floor",
-    "evaluation_confidence_bound_unavailable",
-    "evaluation_confidence_bound_not_positive",
-    "evaluation_holdout_insufficient",
-    "evaluation_holdout_mean_not_positive",
-    "evaluation_holdout_deterioration",
-    "evaluation_undefined_ic_dates",
-    "evaluation_holdout_incomplete",
-    "evaluation_predictions_read_truncated",
-)
-
 # Stable, fully deterministic prediction read order: two databases holding the
 # same rows in a different insertion order must read them identically.
 STABLE_PREDICTION_ORDER = (
@@ -168,22 +138,6 @@ STABLE_PROVENANCE_ORDER = ("model_id", "provenance_fingerprint")
 # Material prediction evidence.  Every field here participates in the content
 # address, so two rows that disagree about any one of them can never collapse
 # into a single ``prediction_id`` and hide the disagreement.
-_PREDICTION_MATERIAL_FIELDS = (
-    "evaluation_schema_version",
-    "contract_version",
-    "dataset_fingerprint",
-    "model_id",
-    "model_version",
-    "model_artifact_fingerprint",
-    "sample_key",
-    "code",
-    "partition",
-    "label_start_date",
-    "score",
-    "prediction_asof",
-    "source",
-)
-
 _PREDICTION_FIELDS = (
     "dataset_fingerprint",
     "model_id",

@@ -1,8 +1,0 @@
-{
-  "exit_code": 0,
-  "tests": 207,
-  "network": "none",
-  "production_data_mounted": false,
-  "image": "astock-codex:scan-reuse-8893f4c",
-  "elapsed_seconds": 44.46
-}

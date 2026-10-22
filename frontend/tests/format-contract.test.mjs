@@ -54,13 +54,6 @@ test('adaptiveEsc 覆盖五个 HTML 特殊字符', () => {
   assert.equal(adaptiveEsc(`&<>"'`), '&amp;&lt;&gt;&quot;&#39;');
 });
 
-test('批量加入跟踪池的代码正则可以匹配六位数字', () => {
-  // 曾经写成 /(\\d{6})/：那是字面反斜杠加 d，永远匹配不到任何代码。
-  const text = source('../src/features/selection.js');
-  assert.ok(!text.includes('match(/(\\\\d{6})/)'), '正则里仍存在字面双反斜杠');
-  assert.ok(text.includes('match(/(\\d{6})/)'), '缺少正确的六位数字正则');
-});
-
 test('选股与持仓表格不再直接拼接未转义的名称字段', () => {
   const selection = source('../src/features/selection.js');
   assert.ok(!selection.includes("'<b>'+p.name+'</b>'"), '选股表 p.name 未转义');

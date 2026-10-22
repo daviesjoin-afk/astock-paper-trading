@@ -28,13 +28,7 @@ import paper_schema_migrations as PSM
 REBALANCE_VERSION = "daily-rebalance-v2"
 
 # 晚间扫描触发时间（22:00，可结合当日公告分析）
-CLOSE_SCAN_HOUR = 22
-CLOSE_SCAN_MINUTE = 0
-
 # 次日开盘验证窗口
-OPEN_VERIFY_START = (9, 25)  # 集合竞价结束
-OPEN_VERIFY_END = (9, 40)    # 开盘后10分钟
-
 # 调仓阈值（按策略类型差异化）
 REBALANCE_THRESHOLDS = {
     # 质量分下降超过此值触发调仓评估

@@ -16,8 +16,6 @@ from typing import Any, Iterable, Mapping
 
 SCHEMA_VERSION = "historical-market-archive-v2"
 _CODE = re.compile(r"^[0-9]{6}\.(SH|SZ|BJ)$")
-_TABLES = ("historical_market_manifests", "historical_market_bars")
-
 
 class HistoricalMarketArchiveError(ValueError):
     """Input or persisted historical market evidence is invalid."""

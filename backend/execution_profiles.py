@@ -34,8 +34,6 @@ __all__ = [
 EXECUTION_PROFILE_VERSION = "execution-profiles-v1"
 
 # 各画像族允许的订单类型只有两种（PR-10 第一版边界）。
-_ALLOWED_ORDER_TYPES = frozenset({"market", "limit"})
-
 EXECUTION_PROFILES: dict[str, dict[str, Any]] = {
     "breakout": {
         "label": "突破快速",

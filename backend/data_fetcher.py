@@ -36,7 +36,6 @@ KLINE_MANIFEST_PATH = os.path.join(CACHE_DIR, "kline_manifest.json")
 # Full-market and risk-proxy snapshots must never overwrite each other.  The
 # risk page intentionally samples 20 pages for a fast read; that sample is not
 # a valid fallback for the full-market selector or the 5-minute scanner.
-MARKET_SNAPSHOT_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot.json")
 MARKET_SNAPSHOT_FULL_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_full.json")
 MARKET_SNAPSHOT_SAMPLE_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_sample_20.json")
 MARKET_SNAPSHOT_FULL_LOCK_PATH = MARKET_SNAPSHOT_FULL_CACHE_PATH + ".lock"
@@ -1122,10 +1121,6 @@ def fetch_hot_sector_snapshot(pages=4):
     return _cached(f"hot_sector_snapshot_{pages}", 75, _do)
 
 
-def get_hot_sector_fetch_state():
-    """Return sector pagination quality without triggering a network request."""
-    return dict(_hot_sector_fetch_state)
-
 
 def _realtime_row_from_ulist(raw):
     return MN.realtime_row_from_ulist(raw, quote_at_fn=_quote_at)
@@ -1314,19 +1309,6 @@ def fetch_stock_flow_batch(codes):
     except Exception:
         return {}
 
-
-def enrich_live_flow(live_universe, missing_codes):
-    """对缺失超大单资金的个股进行补齐。
-
-    Args:
-        live_universe: 市场快照行列表
-        missing_codes: 缺失 super_net 的股票代码集合
-
-    Returns:
-        dict: {code: super_net_value}
-    """
-    flow_data = enrich_live_flow_details(live_universe, missing_codes)
-    return {code: data.get("super_net") for code, data in flow_data.items() if data.get("super_net") is not None}
 
 
 def enrich_live_flow_details(live_universe, missing_codes):

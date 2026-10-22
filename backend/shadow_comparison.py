@@ -40,20 +40,8 @@ EXECUTION_AUTHORITY_LABEL = "EXECUTION"
 #: Dimensions that must be complete for a report to be AVAILABLE.
 REQUIRED_COMPARISON_DIMENSIONS = ("signal", "decision", "execution", "risk_rejection")
 #: Dimensions reported on a best-effort basis; incomplete here never blocks AVAILABLE.
-BEST_EFFORT_COMPARISON_DIMENSIONS = ("turnover", "performance")
-
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SIDES = frozenset({"buy", "sell"})
-_SHARED_ENVIRONMENT_DIMENSIONS = (
-    "session_date",
-    "decision_at",
-    "market_policy_name",
-    "market_snapshot_fingerprint",
-    "symbol_quote_fingerprints",
-    "tradability_evidence_fingerprints",
-    "execution_ruleset_identity",
-)
-
 
 class ShadowComparisonError(ValueError):
     """Stable fail-closed rejection of an explicit comparison input."""

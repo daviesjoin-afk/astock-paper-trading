@@ -51,8 +51,6 @@ import paper_account_specs as PAS
 import user_strategy_participation as USP
 import strategy_lifecycle as SL
 
-OWNERSHIP_MODULE_VERSION = "paper-cycle-ownership-v1"
-
 # PR-38：执行层参与者解析的权威口径（single-owner）。
 #
 # Registry（``strategy_definitions``）只回答"下一周期能否启用某策略"；

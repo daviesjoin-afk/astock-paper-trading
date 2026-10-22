@@ -308,7 +308,6 @@ _ENTRY_FREEZE_CACHE = {"at": 0.0, "status": None}
 # A container restart kills in-memory workers but leaves SQLite job rows.  Do
 # one explicit boot recovery before the new scheduler starts; later init_db
 # calls in the same process must never steal an active scan.
-_RUNNER_BOOT_ID = f"{os.getpid()}-{time.time_ns()}"
 _RUNNER_BOOT_RECOVERED = False
 _PERFORMANCE_INDEXES_READY = False
 # A scheduled slot keeps the lease context on the worker thread.  The context
@@ -1488,21 +1487,7 @@ def _wal_checkpoint():
     PST.wal_checkpoint(DB_PATH)
 
 
-def _execute_with_retry(conn, sql, params=(), max_retries=3, hot_path=True):
-    """执行 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries, hot_path=hot_path)
 
-
-def _executemany_with_retry(conn, sql, params_list, max_retries=3, hot_path=True):
-    """执行批量 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.executemany_with_retry(
-        conn, sql, params_list, max_retries=max_retries, hot_path=hot_path
-    )
-
-
-def _commit_with_retry(conn, max_retries=3, hot_path=True):
-    """提交事务并在数据库锁定时重试（兼容包装）。"""
-    return PST.commit_with_retry(conn, max_retries=max_retries, hot_path=hot_path)
 
 @contextmanager
 def _db_readonly():
@@ -3352,8 +3337,6 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
 # 全市场快照缓存（盘中每 3 分钟由 intraday 扫描刷新）打的标签，quote_at
 # 与 live 同源同鲜度；只排除 local_cache（universe.json 陈旧价）。
 # 此前硬编码 == "live" 导致仪表盘路径今日盈亏永远显示"交易中"占位。
-_TODAY_PNL_QUOTE_SOURCES = PPerf.TODAY_PNL_QUOTE_SOURCES
-
 
 def _today_quote_is_usable(quote, asof_day):
     """Require a same-day, bounded-age mark before publishing daily P&L."""
@@ -7744,19 +7727,6 @@ def manual_research_backfill():
     return result
 
 
-def _account_exposure(conn, account_id, quotes):
-    positions = _position_rows(conn, account_id)
-    value = 0.0
-    industries = {}
-    for pos in positions:
-        price = _num((quotes.get(pos["code"]) or {}).get("price"), _num(pos["cost"]))
-        item_value = _num(pos["qty"]) * price
-        value += item_value
-        industries[pos.get("industry") or "未知"] = industries.get(pos.get("industry") or "未知", 0.0) + item_value
-    account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-    nav = _num(account["cash"]) + value
-    return positions, value, nav, industries
-
 
 def _runtime_parameter_active(effective_date=None, asof_day=None, status=None):
     """Whether a live parameter may affect a decision made now.
@@ -8554,32 +8524,6 @@ def _entry_score_delta(account, asof_day=None):
         return 0.0
     return _num(params.get("entry_score_delta"), _num(params.get("min_t_score_delta")))
 
-
-def _account_risk_state(conn, account, nav, asof_day):
-    """账户级熔断：达到阈值只禁止新开仓，卖出风控仍会继续。"""
-    profile = _risk_profile(account, conn=conn)
-    day = _date(asof_day).isoformat()
-    start_nav = _num(account.get("daily_start_nav"), 0)
-    if account.get("daily_nav_date") != day or start_nav <= 0:
-        start_nav = nav
-        conn.execute("UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?", (nav, day, account["id"]))
-        account["daily_start_nav"], account["daily_nav_date"] = nav, day
-    navs = [r[0] for r in conn.execute("SELECT nav FROM paper_nav WHERE account_id=? ORDER BY nav_date", (account["id"],)).fetchall()]
-    peak = max(navs + [nav, _account_reference_capital(account) or nav])
-    drawdown = 1 - nav / peak if peak else 0.0
-    daily_loss = 1 - nav / start_nav if start_nav else 0.0
-    reasons = []
-    cooldown = account.get("cooldown_until")
-    if cooldown and str(cooldown) >= day:
-        reasons.append(f"冷静期至 {cooldown}")
-    if daily_loss >= profile["daily_loss"]:
-        reasons.append(f"单日亏损 {daily_loss*100:.2f}% 触发熔断")
-    if drawdown >= profile["drawdown"]:
-        until = _next_weekday(_date(asof_day) + dt.timedelta(days=profile["cooldown_days"] - 1)).isoformat()
-        conn.execute("UPDATE paper_accounts SET cooldown_until=? WHERE id=?", (until, account["id"]))
-        account["cooldown_until"] = until
-        reasons.append(f"滚动回撤 {drawdown*100:.2f}% 触发冷静期")
-    return {"blocked": bool(reasons), "reasons": reasons, "daily_loss_pct": round(daily_loss * 100, 2), "drawdown_pct": round(drawdown * 100, 2)}
 
 
 def _price_aware_qty(
@@ -14909,8 +14853,14 @@ def _validate_capital(capital):
     return PCS.validate_capital(capital)
 
 
+
 def _cycle_snapshot(conn):
-    """PR-58：快照（``compact-ledger-v2``）实现已移至 ``paper_cycle_service``。"""
+    """PR-58：快照（``compact-ledger-v2``）实现已移至 ``paper_cycle_service``。
+
+    这个委托本身就是架构契约：``test_paper_cycle_service`` 要求
+    ``paper_trading`` 必须把这三处 cycle 操作显式转交给 ``PCS``，所以它即
+    使当前没有调用方也**不可删除**（删掉等于悄悄取消一个已声明的边界）。
+    """
     return PCS.cycle_snapshot(conn, _active_cycle(conn))
 
 

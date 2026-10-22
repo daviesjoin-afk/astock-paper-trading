@@ -50,10 +50,6 @@ def source_text() -> str:
     return _concat(source_files())
 
 
-def style_text() -> str:
-    """拼接后的前端 CSS 源码。"""
-    return _concat(style_files())
-
 
 def index_html() -> str:
     with open(os.path.join(FRONTEND, "index.html"), encoding="utf-8") as handle:

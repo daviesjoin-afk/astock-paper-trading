@@ -111,13 +111,6 @@ export async function resetPaper(){
   catch(e){ paperNotice('重置失败：'+e.message); }
 }
 
-export async function setPaperStyle(accountId, style){
-  try{
-    await apiPost('/api/paper/style?account_id='+encodeURIComponent(accountId)+'&style='+encodeURIComponent(style));
-    await loadPaper({force:true});
-  }catch(e){ paperNotice('风格切换失败：'+e.message); }
-}
-
 export async function runPaperNow(slot){
   try{
     $('paperStatus').textContent = '正在执行 '+slot+' 检查…';

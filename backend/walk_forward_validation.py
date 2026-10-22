@@ -114,8 +114,6 @@ WALK_FORWARD_CONTRACT_VERSION = "walk-forward-validation-v1"
 PARTITION_TRAIN = "train"
 PARTITION_VALIDATION = "validation"
 PARTITION_TEST = "test"
-VALIDATION_PARTITIONS = (PARTITION_TRAIN, PARTITION_VALIDATION, PARTITION_TEST)
-
 #: 只有 ``verified`` 能进任何 split。#147 的 authoritative gate 产出这个值。
 PIT_VERIFIED = "verified"
 
@@ -127,15 +125,6 @@ STATUS_INSUFFICIENT_TRAIN_HISTORY = "insufficient_train_history"
 STATUS_INSUFFICIENT_VALIDATION_HISTORY = "insufficient_validation_history"
 STATUS_INSUFFICIENT_TEST_HISTORY = "insufficient_test_history"
 STATUS_INSUFFICIENT_VERIFIED_LABELS = "insufficient_verified_labels"
-FOLD_STATUSES = (
-    STATUS_READY,
-    STATUS_NOT_READY,
-    STATUS_INSUFFICIENT_TRAIN_HISTORY,
-    STATUS_INSUFFICIENT_VALIDATION_HISTORY,
-    STATUS_INSUFFICIENT_TEST_HISTORY,
-    STATUS_INSUFFICIENT_VERIFIED_LABELS,
-)
-
 REASON_OK = "ok"
 REASON_WINDOW_NOT_MATURED = "window_not_matured"
 REASON_INSUFFICIENT_HISTORY = "insufficient_history"
@@ -150,14 +139,6 @@ FOLD_EXCLUSION_REASONS = (
     "outside_fold_window",
     "insufficient_history",
     REASON_WINDOW_NOT_MATURED,
-    "unverified_label",
-    "invalid_sample_identity",
-    "invalid_target",
-    "duplicate_sample",
-    "label_version_mismatch",
-)
-
-RUN_SCOPED_REASONS = (
     "unverified_label",
     "invalid_sample_identity",
     "invalid_target",

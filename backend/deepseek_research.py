@@ -78,7 +78,6 @@ PNL_MARKET_SOURCE = "market_owner"
 #: 不可用原因码。刻意保留字段的语义位置（而不是删掉字段）：把"拿不到"写清楚，
 #: 和用 legacy fallback 填一个数字，是同一类错误的两个方向。
 PNL_UNAVAILABLE_NO_CONTEXT = "attribution_context_required"
-PNL_UNAVAILABLE_NO_MARKET = "market_evidence_unavailable"
 PNL_UNAVAILABLE_HISTORICAL_MARKET = "historical_market_evidence_unavailable"
 PNL_UNAVAILABLE_OWNER_FACT = "owner_fact_unknown"
 

@@ -15,7 +15,6 @@ import re
 from collections.abc import Mapping, Sequence
 
 
-SHADOW_ONLY = "shadow_only"
 MAX_EVIDENCE_AGE_SECONDS = 24 * 60 * 60
 MAX_FUTURE_SKEW_SECONDS = 5 * 60
 MAX_MODEL_ITEMS = 12
@@ -82,11 +81,6 @@ def fingerprint(value) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def make_idempotency_key(action: str, candidate_id, actor: str = "") -> str:
-    """Return a stable key for a human action/candidate pair."""
-    raw = f"{str(action).strip().lower()}:{int(candidate_id)}:{str(actor).strip().lower()}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
 
 def require_human_confirmation(approved_by=None, *, confirmed: bool = True) -> str:
     """Validate an explicit human actor; automated identities are rejected."""
@@ -151,9 +145,6 @@ def validate_evidence(evidence, *, reference_at=None, max_age_seconds=MAX_EVIDEN
         "timestamps": {key: stamp.isoformat() for key, stamp in stamps},
     }
 
-
-def is_fresh_evidence(evidence, *, reference_at=None, max_age_seconds=MAX_EVIDENCE_AGE_SECONDS) -> bool:
-    return bool(validate_evidence(evidence, reference_at=reference_at, max_age_seconds=max_age_seconds)["ok"])
 
 
 def validate_model_output(output, *, allowed_accounts=None, max_items=3, max_abs=MAX_NUMBER_ABS):

@@ -91,7 +91,6 @@ except ImportError:  # pragma: no cover - package-style import
 
 # ───────────────────────────── versioning ─────────────────────────────
 
-LABEL_CONTRACT_VERSION = "selection-label-contract-v1"
 LABEL_VERSION = "selection-label-v1"
 
 BASIS_RAW = "raw-return"
@@ -259,8 +258,6 @@ class LabelThresholds:
 CLASS_POSITIVE = "positive"
 CLASS_NEUTRAL = "neutral"
 CLASS_NEGATIVE = "negative"
-LABEL_CLASSES = (CLASS_POSITIVE, CLASS_NEUTRAL, CLASS_NEGATIVE)
-
 #: 最中性的契约：无中性带，``score > 0`` 正、``score < 0`` 负、``score == 0``
 #: 中性（**不是**负）。这不是策略优化，只是把“没有阈值”写成一个明确值。
 DEFAULT_THRESHOLDS = LabelThresholds(positive=0.0, negative=0.0)

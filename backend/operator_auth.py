@@ -233,22 +233,6 @@ def read_token_config(env=None):
     return TokenConfig(TokenConfigState.VALID, token, "ok")
 
 
-def validate_token(token):
-    """校验 token 强度，返回 ``(ok, reason)``。
-
-    保留此函数作为细粒度校验入口；不做任何"自动修正"。
-    """
-    if token is None:
-        return False, "missing"
-    value = str(token).strip()
-    if not value:
-        return False, "empty"
-    if len(value) < MIN_TOKEN_LENGTH:
-        return False, "too_short"
-    if not _TOKEN_PATTERN.match(value):
-        return False, "invalid_characters"
-    return True, "ok"
-
 
 # ─── Bearer 解析 ───
 

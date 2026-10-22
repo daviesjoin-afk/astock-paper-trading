@@ -3048,20 +3048,8 @@ def _closed_loop_state(conn, evidence=None):
     return state
 
 
-def _shadow_history_rows(history):
-    return ASR.shadow_history_rows(history, num=_num)
 
 
-def _shadow_volatility(history, window):
-    return ASR.shadow_volatility(history, window, num=_num)
-
-
-def _shadow_atr_pct(history, window=20):
-    return ASR.shadow_atr_pct(history, window, num=_num)
-
-
-def _shadow_hhi(values):
-    return ASR.shadow_hhi(values, num=_num)
 
 
 def _portfolio_shadow_risk(positions, histories=None, asof=None, industry_shock_pct=-8.0,
@@ -3947,12 +3935,6 @@ def activate_evolution_candidate_fn(params_id, actor, reason=None):
             conn, params_id, actor=actor, reason=reason)
 
 
-def update_evolution_params_fn(adjustments, reason="manual"):
-    """手动调整进化参数。"""
-    with _connect() as conn:
-        self_evolution.ensure_schema(conn)
-        return self_evolution.manual_adjust(conn, adjustments, reason=reason)
-
 
 def trigger_evolution_fn():
     """手动触发一次进化。"""
@@ -3961,15 +3943,6 @@ def trigger_evolution_fn():
         return self_evolution.evolve(conn, reason="manual_trigger")
 
 
-def auto_evolution_fn():
-    """自动检查并执行进化。"""
-    with _connect() as conn:
-        self_evolution.ensure_schema(conn)
-        result = self_evolution.auto_evolve_if_needed(conn)
-        if result is None:
-            return {"evolved": False, "reason": "当前无需进化"}
-        return result
-
 
 def evolution_metrics_fn(window=20):
     """获取调参性能指标。"""
@@ -3977,12 +3950,6 @@ def evolution_metrics_fn(window=20):
         self_evolution.ensure_schema(conn)
         return self_evolution.get_performance_metrics(conn, window)
 
-
-def evolution_history_fn(limit=20):
-    """获取进化参数历史。"""
-    with _connect() as conn:
-        self_evolution.ensure_schema(conn)
-        return self_evolution.get_evolution_history(conn, limit)
 
 
 def evolution_log_fn(limit=50):
@@ -4385,12 +4352,6 @@ def evaluate_tuning_fn(tracking_id, eval_score, eval_detail=None):
 
 
 
-def dual_ai_status_fn():
-    """返回双AI共识调参系统的状态。"""
-    with _connect() as conn:
-        dual_ai_tuner.ensure_schema(conn)
-        return dual_ai_tuner.dual_ai_status(conn)
-
 
 def get_dual_ai_api_keys_fn():
     """返回双AI API Key配置状态（不泄露明文）。"""
@@ -4398,12 +4359,6 @@ def get_dual_ai_api_keys_fn():
         dual_ai_tuner.ensure_schema(conn)
         return dual_ai_tuner.get_api_keys(conn)
 
-
-def update_dual_ai_api_key_fn(provider, api_key=None, base_url=None, model=None, enabled=None):
-    """更新某个AI供应商的API配置。"""
-    with _connect() as conn:
-        dual_ai_tuner.ensure_schema(conn)
-        return dual_ai_tuner.update_api_key(conn, provider, api_key=api_key, base_url=base_url, model=model, enabled=enabled)
 
 
 def run_dual_ai_tuning_fn(trigger="manual", mode="intraday"):

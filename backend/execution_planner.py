@@ -975,7 +975,6 @@ def _session_phase(value) -> str:
 
 # 席位预留与手动入场复核的“所有者”仍然来自 paper_trading 的单一常量定义，
 # 但只在构造策略表时读取一次；执行代码里不再出现身份比较。
-_CHASE_LANES = frozenset({"none", "momentum", "sector_hot"})
 _SEAT_RESERVE_DEADLINE = "14:30"
 
 

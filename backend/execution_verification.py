@@ -119,15 +119,10 @@ VERIFIED_PREDICATE = (
     "(COALESCE(execution_verified, 0) = 1 AND execution_status = 'verified')"
 )
 #: 未验证谓词（统计"被闸门拦下多少"用，不是用来放行的）。
-UNVERIFIED_PREDICATE = "NOT " + VERIFIED_PREDICATE
-
 #: 谓词里要求的两列。**任何**模块都不得自己拼这两列的字面量条件 ——
 #: 需要 SQL 就用 :data:`VERIFIED_PREDICATE`，需要判断一行用
 #: :func:`is_verified_row`。架构测试会拒绝重复实现。
-VERIFIED_PREDICATE_COLUMNS = ("execution_verified", "execution_status")
 #: 架构测试据此识别"有人在 SQL 里手写了一份谓词"。
-VERIFIED_PREDICATE_SIGNATURE = "execution_status = 'verified'"
-
 
 # ────────────────── 正成交谓词：部分成交也算"发生过" ──────────────────
 #

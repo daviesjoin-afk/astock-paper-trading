@@ -43,7 +43,6 @@ OBJECTIVE_DIRECTIONS = MappingProxyType({
 })
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_REASON = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 _METRIC_KEYS = ("return", "drawdown", "volatility", "turnover", "trade_count", "cost",
                 "exposure", "capacity_proxy", "data_coverage")
 

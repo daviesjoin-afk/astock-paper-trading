@@ -111,14 +111,6 @@ SOURCE_UNREADABLE = "archive_unreadable"
 SOURCE_NOT_HISTORICAL = "not_a_historical_archive"
 SOURCE_INCOMPLETE = "archive_incomplete"
 
-SOURCE_STATUSES = (
-    SOURCE_OK,
-    SOURCE_MISSING,
-    SOURCE_UNREADABLE,
-    SOURCE_NOT_HISTORICAL,
-    SOURCE_INCOMPLETE,
-)
-
 
 def _is_missing(value: Any) -> bool:
     if value is None:

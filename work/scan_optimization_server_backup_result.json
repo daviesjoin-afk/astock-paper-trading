@@ -1,9 +1,0 @@
-{
-  "backup_exit": 0,
-  "backup_used_container": true,
-  "restored": {
-    "engine": "3.54.1",
-    "integrity": "ok",
-    "rows": 50
-  }
-}

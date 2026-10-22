@@ -79,28 +79,16 @@ STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_COMPLETED_WITH_GAPS = "completed_with_gaps"
 STATUS_FAILED = "failed"
-RUN_STATUSES = (STATUS_RUNNING, STATUS_COMPLETED, STATUS_COMPLETED_WITH_GAPS, STATUS_FAILED)
-
 #: Provider 结果状态词表（三态：evidence / unknown / error，**绝不**混成 bool）。
 OUTCOME_EVIDENCE = "evidence"
 OUTCOME_UNKNOWN = "unknown"
 OUTCOME_ERROR = "error"
-OUTCOME_STATUSES = (OUTCOME_EVIDENCE, OUTCOME_UNKNOWN, OUTCOME_ERROR)
-
 #: observed_at 的来源类型（建议至少区分这些）。
 OBSERVED_SOURCE_TIMESTAMP = "source_timestamp"
 OBSERVED_PUBLICATION_TIMESTAMP = "publication_timestamp"
 OBSERVED_SNAPSHOT_TIMESTAMP = "snapshot_timestamp"
 OBSERVED_RETRIEVED_AT = "retrieved_at"
 OBSERVED_UNPROVABLE = "unprovable"
-OBSERVED_KINDS = (
-    OBSERVED_SOURCE_TIMESTAMP,
-    OBSERVED_PUBLICATION_TIMESTAMP,
-    OBSERVED_SNAPSHOT_TIMESTAMP,
-    OBSERVED_RETRIEVED_AT,
-    OBSERVED_UNPROVABLE,
-)
-
 #: 可**证明历史可见性**的 observed 类型：只有这些类型能作为"当年已经可知"的证据。
 #: ``retrieved_at``（今天才抓到）与 ``unprovable`` 一律不构成历史可见性证明。
 PIT_PROVABLE_OBSERVED_KINDS = {
@@ -680,47 +668,6 @@ def _compose_times(results: Sequence[ProviderResult], cutoff: Any, session: str)
 
 # ───────────────────────────── Coverage / Audit ─────────────────────────────
 
-
-@dataclass(frozen=True, slots=True)
-class TradabilityCoverageReport:
-    """一次 ingestion 的覆盖率报告。只测量，不设阈值、不 gate execution。"""
-
-    session: str
-    requested_symbols: int
-    archive_records: int
-    evidence_present: int
-    fully_proven: int
-    unknown_listing: int
-    unknown_st: int
-    unknown_suspension: int
-    unknown_quote: int
-    unknown_volume: int
-    unknown_limit_state: int
-    conflicts: int
-    unprovable_observed_at: int
-    source_counts: Mapping[str, int]
-    coverage_ratio: float
-    fingerprint: str
-
-    def to_dict(self) -> dict:
-        return {
-            "session": self.session,
-            "requested_symbols": self.requested_symbols,
-            "archive_records": self.archive_records,
-            "evidence_present": self.evidence_present,
-            "fully_proven": self.fully_proven,
-            "unknown_listing": self.unknown_listing,
-            "unknown_st": self.unknown_st,
-            "unknown_suspension": self.unknown_suspension,
-            "unknown_quote": self.unknown_quote,
-            "unknown_volume": self.unknown_volume,
-            "unknown_limit_state": self.unknown_limit_state,
-            "conflicts": self.conflicts,
-            "unprovable_observed_at": self.unprovable_observed_at,
-            "source_counts": dict(self.source_counts),
-            "coverage_ratio": self.coverage_ratio,
-            "fingerprint": self.fingerprint,
-        }
 
 
 def _coverage_fingerprint(report: Mapping[str, Any]) -> str:

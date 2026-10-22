@@ -116,12 +116,6 @@ MAX_SINGLE_ROUND_STEP: dict[str, float] = {
     "entry_slices": 1,
 }
 
-DIRECTION_LABELS = {
-    "tighten": "风险收紧",
-    "expand": "风险放大",
-    "none": "无方向变化",
-}
-
 # 提案生命周期：pending（观察中）→ promoted / rejected / superseded。
 PROPOSAL_STATUSES = ("pending", "promoted", "rejected", "superseded")
 

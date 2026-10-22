@@ -55,19 +55,6 @@ def update_api_key(conn, provider, api_key=None, base_url=None, model=None, enab
     )
 
 
-def _get_provider_config(conn, provider):
-    """历史入口：单槽位完整配置（含明文 Key），仅服务端内部使用。"""
-    cfg = _S.get_slot_config(conn, _S.resolve_slot(provider))
-    return {
-        "provider": provider,
-        "slot": cfg["slot"],
-        "api_key": cfg["api_key"],
-        "base_url": cfg["base_url"],
-        "model": cfg["model"],
-        "enabled": cfg["enabled"],
-        "timeout": cfg["timeout_seconds"],
-    }
-
 
 def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution=None,
                      evolution_by_account=None, labels=None):

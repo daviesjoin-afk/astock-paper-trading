@@ -253,16 +253,6 @@ _REBALANCE_SCANS_COLUMNS = (
     "scan_version", "created_at",
 )
 
-_REBALANCE_PLANS_COLUMNS = (
-    "id", "cycle_id", "plan_date", "execute_date", "account_id", "code", "name",
-    "action", "sell_qty", "sell_ratio", "sell_reason",
-    "replacement_code", "replacement_name", "replacement_score",
-    "status", "open_price", "open_pct", "open_volume_ratio", "open_fund_flow",
-    "open_verified", "open_verify_reason",
-    "executed_at", "executed_price", "executed_qty", "realized_pnl",
-    "plan_version", "created_at", "updated_at",
-)
-
 _REBALANCE_COOLDOWN_COLUMNS = (
     "cycle_id", "code", "account_id", "sold_date", "cooldown_until",
 )
@@ -1259,13 +1249,6 @@ def risk_decision_provenance(authority, decision_kind):
 # DDL 单一事实来源在本模块：migration 与 init_db 快路径调用同一个函数，
 # 否则升级后的线上库永远没有这张表（健康采集只能 fail closed）。
 
-STRATEGY_HEALTH_SNAPSHOT_COLUMNS = (
-    "snapshot_id", "snapshot_fingerprint", "health_contract_version",
-    "strategy_id", "strategy_version", "strategy_checksum",
-    "observation_start", "observation_end", "window_identity",
-    "lifecycle_state", "coverage_ratio", "evidence_json", "created_at",
-)
-
 
 def strategy_health_snapshot_ddl(table="strategy_health_snapshots"):
     """``strategy_health_snapshots`` 的规范 DDL（migration 与 ``init_db`` 共用）。"""
@@ -1583,13 +1566,6 @@ STRATEGY_CANDIDATE_PROPOSAL_COLUMNS = (
     "proposal_json", "created_at",
 )
 
-STRATEGY_CANDIDATE_GENERATION_BATCH_COLUMNS = (
-    "batch_id", "generation_input_fingerprint", "search_space_fingerprint",
-    "search_space_contract_version", "generator_type", "generator_version",
-    "generator_contract_version", "parent_strategy_id", "parent_strategy_version",
-    "parent_strategy_checksum", "asof", "candidate_count", "batch_json", "created_at",
-)
-
 
 def strategy_candidate_ddl(table="strategy_candidates"):
     """``strategy_candidates`` 的规范 DDL（migration 与 ``init_db`` 共用）。
@@ -1837,25 +1813,6 @@ def ensure_strategy_candidates(conn):
 
 #: 三张控制面表的规范列。列清单是**单一事实来源**：repository 逐列点名写入，
 #: 测试用 ``PRAGMA table_info`` 对照，因此"忘了写一列"会是显式失败而不是静默 NULL。
-EXPERIMENT_SEARCH_RUN_COLUMNS = (
-    "search_run_id", "search_input_fingerprint", "search_contract_version",
-    "generation_batch_id", "generation_input_fingerprint",
-    "candidate_count", "budget_json", "search_spec_json",
-    "created_at", "payload_fingerprint",
-)
-
-EXPERIMENT_SEARCH_JOB_COLUMNS = (
-    "job_id", "job_fingerprint", "search_run_id", "candidate_id",
-    "stage", "job_contract_version", "job_json", "created_at",
-)
-
-EXPERIMENT_SEARCH_JOB_EVENT_COLUMNS = (
-    "event_seq", "event_id", "job_id", "search_run_id",
-    "event_kind", "attempt_number", "actor", "reason",
-    "evidence_owner", "evidence_id", "created_at", "event_json",
-    "payload_fingerprint",
-)
-
 
 def experiment_search_run_ddl(table="experiment_search_runs"):
     """``experiment_search_runs`` 的规范 DDL。
