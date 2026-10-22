@@ -16,7 +16,9 @@ HOME=/opt/astock-codex
 # backend/test_paper_schedule_contract.py 的 CronRenderingFidelityGuard 会失败
 # （它把两边展开成具体触发时刻做语义比较，不比对字符串）。
 
-# A股集合竞价预选：只采集09:25快照；不使用09:15-09:20可撤单阶段数据。
+# 09:15 起每3分钟保存个股竞价观测；早期可撤单，仅跟踪、不生成委托。
+15-24/3 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction-track >>/opt/astock-codex/reports/scheduler.log 2>&1
+# 09:25 的最终竞价预选仍与早期观测分离，开盘再按原门禁审批。
 25 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 竞价任务失败才自动重试；成功任务会被 run_slot 幂等跳过。
 27 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1

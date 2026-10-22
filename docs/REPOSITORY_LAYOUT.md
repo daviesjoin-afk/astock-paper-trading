@@ -25,7 +25,7 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 | 文件 | 职责 |
 | --- | --- |
 | `api_paper.py` | 模拟盘只读看板/审计/风控视图，以及手动下单与周期控制 |
-| `api_adaptive.py` | 自进化与 AI 研究（含 modlens 状态/读图路由） |
+| `api_adaptive.py` | 自进化与 AI 研究 |
 | `api_settings.py` | 统一设置读写与审计 |
 | `api_strategies.py` | **Strategy Admin**（`/api/strategies`）：只做请求解析、调用用例、异常→状态码、响应 |
 | `main.py` | FastAPI 应用装配、静态页下发（`/`、`/app.js`、`/app.css`）、若干历史只读端点 |

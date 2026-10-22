@@ -130,3 +130,10 @@ value:92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
 # The scanner stops at the space in the standard Program Files directory name;
 # this exact synthetic prefix contains no user, machine or project identity.
 value:C:/Program
+
+# Public notification API and reserved example domains used by offline tests.
+host:wxpusher.zjiecode.com
+host:slot.example
+host:library.example
+host:ai1.example
+host:other.example

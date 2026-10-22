@@ -44,7 +44,8 @@ ZERO_BYTE_ALLOWLIST: frozenset[str] = frozenset()
 
 # 一律不得回流的废弃产物（本 PR 删除；回来说明有人又把它加回来了）。
 REMOVED_ARTIFACTS = (
-    "backend/modlens.py",                      # 0 字节占位，真实实现在 modlens_bridge.py
+    "backend/modlens.py",                      # 已移除的视觉模块占位
+    "backend/modlens_bridge.py",
     "backend/demo_strategy_replay.py",         # 手工 replay，被生产路径 golden replay 取代
     "backend/test_demo_strategy_replay.py",
     "backend/paper_trading_compat.py",         # 死包装器，docstring 与真实架构不符
@@ -197,7 +198,7 @@ class RemovedArtifactTests(unittest.TestCase):
     """被删除的废弃产物不得回流，也不得再被引用。"""
 
     def test_removed_files_stay_removed(self):
-        for rel in ("backend/modlens.py", "backend/demo_strategy_replay.py",
+        for rel in ("backend/modlens.py", "backend/modlens_bridge.py", "backend/demo_strategy_replay.py",
                     "backend/test_demo_strategy_replay.py",
                     "backend/paper_trading_compat.py",
                     "backend/paper_trading_wrapper.py"):
@@ -223,10 +224,6 @@ class RemovedArtifactTests(unittest.TestCase):
                     hits.append("%s -> %s" % (rel, needle))
         self.assertEqual([], hits, "废弃产物仍被引用")
 
-    def test_real_modlens_implementation_is_present(self):
-        # 删的是 0 字节占位，真实实现必须还在（否则就是真删了功能）。
-        self.assertTrue(os.path.isfile(os.path.join(BACKEND, "modlens_bridge.py")))
-        self.assertGreater(os.path.getsize(os.path.join(BACKEND, "modlens_bridge.py")), 0)
 
 
 @requires_requirements

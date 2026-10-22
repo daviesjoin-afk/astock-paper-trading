@@ -446,19 +446,15 @@ export function setAdaptiveSection(section,button){
       +'<div class="ai-status-cards" id="aiStatusCards">'
       +'<div class="ai-card"><small id="aiSlotAi1Label">AI 1</small><b id="aiSlotAi1Status">检测中…</b></div>'
       +'<div class="ai-card"><small id="aiSlotAi2Label">AI 2</small><b id="aiSlotAi2Status">检测中…</b></div>'
-      +'<div class="ai-card"><small>modlens</small><b id="aiModlensStatus">检测中…</b></div>'
       +'<div class="ai-card"><small>共识率</small><b id="aiConsensusRate">—</b></div>'
       +'<div class="ai-card"><small>进化状态</small><b id="aiEvolutionState">检测中…</b></div>'
       +'<div class="ai-card"><small>参数版本</small><b id="aiParamsVersion">—</b></div>'
       +'</div>'
+      +auctionReviewPanel()
       +'<div class="ai-params-panel"><h4>当前进化参数</h4><div id="aiParamsTable">加载中…</div></div>'
       +'<div class="ai-runs-panel"><h4>最近双AI调参记录</h4><div id="aiRunsTable">加载中…</div></div>'
       +'<div class="ai-metrics-panel"><h4>调参性能指标</h4><div id="aiMetricsGrid">加载中…</div></div>'
       +'<div class="ai-log-panel"><h4>进化事件日志</h4><div id="aiLogTable">加载中…</div></div>'
-      +'<div class="ai-modlens-panel"><h4>modlens 视觉测试</h4>'
-      +'<div class="controls"><input id="aiImageUrl" type="text" placeholder="输入图片URL" style="width:400px">'
-      +'<button class="ghost" onclick="testModlensRead()">读取</button></div>'
-      +'<div id="aiModlensResult"></div></div>'
       +'<div class="adaptive-notice">双AI共识：两个独立 AI 槽位分别分析，方向一致且幅度接近才执行。自进化系统自动优化调参策略。</div>'
       +'</section>';
     shell.insertAdjacentHTML('beforeend',aiHtml);
@@ -632,12 +628,12 @@ export function renderAdaptive(d){
       +'<div class="ai-status-cards" id="aiStatusCards">'
       +'<div class="ai-card"><small id="aiSlotAi1Label">AI 1</small><b id="aiSlotAi1Status">检测中…</b></div>'
       +'<div class="ai-card"><small id="aiSlotAi2Label">AI 2</small><b id="aiSlotAi2Status">检测中…</b></div>'
-      +'<div class="ai-card"><small>modlens 视觉</small><b id="aiModlensStatus">检测中…</b></div>'
       +'<div class="ai-card"><small>共识率</small><b id="aiConsensusRate">—</b></div>'
       +'<div class="ai-card"><small>进化状态</small><b id="aiEvolutionState">检测中…</b></div>'
       +'<div class="ai-card"><small>参数版本</small><b id="aiParamsVersion">—</b></div>'
       +'</div>'
       /* 进化参数面板 */
+      +auctionReviewPanel()
       +'<div class="ai-params-panel">'
       +'<h4>当前进化参数</h4>'
       +'<div id="aiParamsTable" class="ai-params-grid">加载中…</div>'
@@ -657,14 +653,7 @@ export function renderAdaptive(d){
       +'<h4>进化事件日志</h4>'
       +'<div id="aiLogTable"><div class="loading">加载中…</div></div>'
       +'</div>'
-      /* modlens 图片测试 */
-      +'<div class="ai-modlens-panel">'
-      +'<h4>modlens 视觉测试</h4>'
-      +'<div class="controls"><input id="aiImageUrl" type="text" placeholder="输入图片URL或本地路径" style="width:400px">'
-      +'<button class="ghost" onclick="testModlensRead()">读取图片</button></div>'
-      +'<div id="aiModlensResult" style="margin-top:10px"></div>'
-      +'</div>'
-      +'<div class="adaptive-notice">双AI共识：两个独立 AI 槽位分析同一份市场证据，方向一致且幅度接近时才合并执行；单AI审阅仅供参考，永不构成共识。自进化系统根据历史表现自动调整调参策略参数。modlens 为纯文本模型提供视觉能力。</div>'
+      +'<div class="adaptive-notice">双AI共识：两个独立 AI 槽位分析同一份市场证据，方向一致且幅度接近时才合并执行；单AI审阅仅供参考，永不构成共识。自进化系统根据历史表现自动调整调参策略参数。</div>'
       +'</section>';
     shell.insertAdjacentHTML('beforeend', aiSectionHtml);
 
@@ -756,10 +745,35 @@ export async function approveAdaptiveNeural(){
 }
 
 /* ─── AI审阅与调参 JavaScript 函数 ─── */
+export function auctionReviewPanel(){
+  return '<div class="ai-auction-panel"><h4>竞价意图与后续复核</h4><div id="aiAuctionReview">加载中…</div></div>';
+}
+
+export function renderAuctionReview(data){
+  var tracking=data.tracking||{}, reviews=Array.isArray(data.reviews)?data.reviews:[];
+  var intentLabels={accumulation:'可能吸筹',distribution:'可能派发',support:'可能护盘',withdrawal:'可能撤单诱导',unclear:'意图不明'};
+  var directionLabels={up:'向上',down:'向下',flat:'横盘',unclear:'不确定'};
+  var verdictLabels={supported:'后续价格方向支持',contradicted:'后续价格方向不符',pending:'等待后续有效报价'};
+  var html='<p>'+(tracking.captured_at?'竞价最近采集：'+adaptiveEsc(String(tracking.captured_at).replace('T',' ').substring(0,19))+' · '+Number(tracking.observations||0)+' 轮 · '+Number(tracking.tracked_stocks||0)+' 只':'尚无竞价采集记录；09:15 起每3分钟采集。')+'</p>'
+    +'<p>AI 会优先检阅候选及持仓，每次最多20只、每个槽位最多判断8只；证据不足可维持不变。主力意图属于推断，价格方向复核不能证明真实意图或盈利。</p>';
+  if(!reviews.length){
+    setEl('aiAuctionReview',html+'<p>暂无竞价意图判断。采集后，现有 AI 审阅与调参会读取轨迹并留档。</p>');return;
+  }
+  html+='<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>记录 / AI</th><th>个股 / 推断</th><th>方向 / 置信度</th><th>后续复核</th><th>依据与反证</th></tr></thead><tbody>';
+  reviews.forEach(function(r){
+    html+='<tr><td>#'+Number(r.run_id)+' · '+adaptiveEsc(r.slot)+'</td><td>'+adaptiveEsc(r.code)+'<br>'+adaptiveEsc(intentLabels[r.intent]||'意图不明')+'</td>'
+      +'<td>'+adaptiveEsc(directionLabels[r.expected_direction]||'不确定')+' · '+adaptiveEsc(r.confidence==null?'未知':r.confidence+'%')+(r.evidence_grade==='price_only'?'<br>仅价格证据':'')+'</td>'
+      +'<td>'+adaptiveEsc(verdictLabels[r.direction_verdict]||'待核验')+(r.change_pct==null?'':' · '+Number(r.change_pct).toFixed(3)+'%')+'<br>'+adaptiveEsc(String(r.observed_at||'').replace('T',' ').substring(0,19))+'</td>'
+      +'<td>'+adaptiveEsc(r.rationale||'未给出依据')+'<br>反证：'+adaptiveEsc(r.counter_evidence||'未给出')+'</td></tr>';
+  });
+  setEl('aiAuctionReview',html+'</tbody></table></div>');
+}
+
 export async function loadEvolutionStatus(){
   try{
     /* 加载双AI状态 */
     var dualAi=await api('/api/adaptive/dual-ai/status');
+    renderAuctionReview(dualAi.auction_review||{});
     /* 通用槽位视图：显示名来自用户配置，前端不再硬编码任何厂商名。 */
     var slots=dualAi.slots||{};
     [['ai1','Ai1'],['ai2','Ai2']].forEach(function(pair){
@@ -768,11 +782,6 @@ export async function loadEvolutionStatus(){
       setEl('aiSlot'+pair[1]+'Status', info.configured?(info.enabled?'已配置 '+adaptiveEsc(info.model||''):'已停用'):'未配置');
     });
     setEl('aiConsensusRate', dualAi.consensus_rules?adaptiveValue(dualAi.consensus_rules.weight_magnitude_ratio*100,'%'): '—');
-    /* 加载modlens状态 */
-    try{
-      var modlens=await api('/api/adaptive/modlens/status');
-      setEl('aiModlensStatus', modlens.modlens_available?'可用':'不可用');
-    }catch(e){setEl('aiModlensStatus','检测失败');}
     /* 加载进化状态 */
     try{
       var evo=await api('/api/adaptive/evolution/status');
@@ -857,7 +866,20 @@ export function renderEvolutionMetrics(m){
   setEl('aiMetricsGrid',h);
 }
 
+export function appliedTuningIds(value){
+  if(value==null) return [];
+  if(typeof value==='string'){
+    try{value=JSON.parse(value);}catch(e){return null;}
+  }
+  // Older responses used an empty object for SQL NULL.
+  if(value&&typeof value==='object'&&!Array.isArray(value)&&!Object.keys(value).length) return [];
+  if(!Array.isArray(value)) return null;
+  if(!value.every(function(id){return (typeof id==='string'||typeof id==='number')&&/^[A-Za-z0-9_-]{1,64}$/.test(String(id));})) return null;
+  return value.map(String);
+}
+
 export function renderDualAiRuns(runs){
+  runs=Array.isArray(runs)?runs:[];
   if(!runs.length){setEl('aiRunsTable','<p>暂无调参记录</p>');return;}
   var h='<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>ID</th><th>触发</th><th>模式</th><th>状态</th><th>AI 1</th><th>AI 2</th><th>共识</th><th>时间</th><th>落地</th></tr></thead><tbody>';
   runs.forEach(function(r){
@@ -865,22 +887,22 @@ export function renderDualAiRuns(runs){
     var reviewers=r.reviewers||{};
     var ai1=reviewers.ai1||{};
     var ai2=reviewers.ai2||{};
-    var applied=Array.isArray(r.applied_ids)?r.applied_ids:(r.applied_ids?String(r.applied_ids):null);
+    var applied=appliedTuningIds(r.applied_ids);
     var proposalCount=Array.isArray(r.merged_proposals)?r.merged_proposals.length:0;
     var action='';
-    if(r.status==='consensus'&&proposalCount>0&&!applied){
+    if(r.status==='consensus'&&proposalCount>0&&applied&&applied.length===0){
       var fresh=(Date.now()-new Date(String(r.created_at||'').replace(' ','T')).getTime())<30*60*1000;
       action=fresh?'<button class="ghost" onclick="applyAdaptiveTunerProposal('+Number(r.id)+')">应用共识</button>':'<span style="color:#9aa5b1;font-size:11px">已过期</span>';
     }else if(applied&&applied.length){
       action=applied.map(function(a){return '<button class="ghost" onclick="rollbackAdaptiveTunerOverlay(\''+adaptiveEsc(a)+'\')">回滚'+adaptiveEsc(a)+'</button>';}).join(' ');
-    }
+    }else if(applied===null){action='落地记录格式异常';}
     h+='<tr>'
       +'<td>#'+r.id+'</td>'
-      +'<td>'+adaptiveEsc(r.trigger)+'</td>'
-      +'<td>'+adaptiveEsc(r.mode)+'</td>'
-      +'<td class="'+statusClass+'">'+adaptiveEsc(r.status)+'</td>'
-      +'<td>'+adaptiveEsc(ai1.status)+(ai1.latency_ms?' ('+ai1.latency_ms+'ms)':'')+'</td>'
-      +'<td>'+adaptiveEsc(ai2.status)+(ai2.latency_ms?' ('+ai2.latency_ms+'ms)':'')+'</td>'
+      +'<td>'+adaptiveEsc(({manual:'手动',scheduled:'定时'})[r.trigger]||r.trigger)+'</td>'
+      +'<td>'+adaptiveEsc(({intraday:'盘中',daily:'盘后'})[r.mode]||r.mode)+'</td>'
+      +'<td class="'+statusClass+'">'+adaptiveEsc(({both_hold:'双方维持',consensus:'达成共识',no_consensus:'未达成共识',single_review:'单AI审阅',failed:'失败'})[r.status]||r.status)+'</td>'
+      +'<td>'+adaptiveEsc(({ok:'正常',completed:'已完成',failed:'失败'})[ai1.status]||ai1.status)+(ai1.latency_ms?' ('+ai1.latency_ms+'ms)':'')+'</td>'
+      +'<td>'+adaptiveEsc(({ok:'正常',completed:'已完成',failed:'失败'})[ai2.status]||ai2.status)+(ai2.latency_ms?' ('+ai2.latency_ms+'ms)':'')+'</td>'
       +'<td>'+adaptiveEsc(r.consensus_reason||'').substring(0,40)+'</td>'
       +'<td>'+adaptiveEsc(r.created_at||'').replace('T',' ').substring(0,19)+'</td>'
       +'<td>'+action+'</td>'
@@ -890,19 +912,32 @@ export function renderDualAiRuns(runs){
   setEl('aiRunsTable',h);
 }
 
+export function evolutionEventDetail(value){
+  var detail=value;
+  if(typeof detail==='string'){
+    try{detail=JSON.parse(detail);}catch(e){return detail;}
+  }
+  if(!detail||typeof detail!=='object') return '暂无详情';
+  if(Array.isArray(detail.adjustments)) return detail.adjustments.map(function(x){return typeof x==='string'?x:JSON.stringify(x);}).join('；');
+  if(detail.reason) return String(detail.reason);
+  var parts=[];
+  if(detail.scope_key) parts.push(detail.scope_key==='__global__'?'全局参数':'范围：'+detail.scope_key);
+  if(detail.validation_state) parts.push(({validated:'校验通过',invalid:'校验未通过',pending:'待校验'})[detail.validation_state]||detail.validation_state);
+  if(Array.isArray(detail.violations)) parts.push(detail.violations.length?'违规：'+detail.violations.join('；'):'无违规项');
+  return parts.length?parts.join(' · '):JSON.stringify(detail,null,2);
+}
+
 export function renderEvolutionLog(log){
+  log=Array.isArray(log)?log:[];
   if(!log.length){setEl('aiLogTable','<p>暂无进化日志</p>');return;}
   var h='<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>';
   log.forEach(function(e){
-    var detail=e.detail||{};
-    var desc='';
-    if(detail.adjustments) desc=detail.adjustments.join('; ');
-    else if(detail.reason) desc=detail.reason;
-    else desc=JSON.stringify(detail).substring(0,80);
+    var desc=evolutionEventDetail(e.detail);
+    var eventLabel=({legacy_bootstrap:'历史参数初始化',evolve:'生成进化候选',rollback:'参数回滚',manual_adjust:'人工调整',anomaly_detected:'发现异常',activate:'激活参数',candidate_created:'生成候选'})[e.event_type]||e.event_type;
     h+='<tr>'
       +'<td>'+adaptiveEsc(e.created_at||'').replace('T',' ').substring(0,19)+'</td>'
-      +'<td>'+adaptiveEsc(e.event_type)+'</td>'
-      +'<td>'+adaptiveEsc(desc)+'</td>'
+      +'<td>'+adaptiveEsc(eventLabel)+'</td>'
+      +'<td style="white-space:pre-wrap;overflow-wrap:anywhere">'+adaptiveEsc(desc)+'</td>'
       +'</tr>';
   });
   h+='</tbody></table></div>';
@@ -939,25 +974,6 @@ export async function runDualAiTuning(){
   }
 }
 
-export async function testModlensRead(){
-  var url=($('aiImageUrl')||{}).value||'';
-  if(!url){alert('请输入图片URL或路径');return;}
-  setEl('aiModlensResult','<div class="loading">正在读取图片…</div>');
-  try{
-    var r=await apiPost('/api/adaptive/modlens/read-image?path='+encodeURIComponent(url));
-    var h='<div class="ai-modlens-output">'
-      +'<p><b>状态：</b>'+(r.success?'成功':'失败')+'</p>'
-      +'<p><b>耗时：</b>'+(r.latency_ms||0)+'ms</p>';
-    if(r.success){
-      h+='<p><b>OCR文字：</b></p><pre style="max-height:200px;overflow:auto;background:rgba(0,0,0,.2);padding:8px;border-radius:6px;font-size:12px">'
-        +adaptiveEsc(r.formatted_text||r.ocr_text||'（无文字）')+'</pre>';
-    }else{
-      h+='<p style="color:var(--state-error)">'+adaptiveEsc(r.error)+'</p>';
-    }
-    h+='</div>';
-    setEl('aiModlensResult',h);
-  }catch(e){setEl('aiModlensResult','<div class="banner">请求失败：'+adaptiveEsc(e.message)+'</div>');}
-}
 
 export function switchToAdaptiveAI(){
   /* 切换到自进化页面并打开AI tab */

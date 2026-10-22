@@ -4382,21 +4382,7 @@ def evaluate_tuning_fn(tracking_id, eval_score, eval_detail=None):
         return {"success": True, "tracking_id": tracking_id, "eval_score": eval_score}
 
 
-def modlens_status_fn():
-    """返回 modlens 视觉桥接模块的状态。"""
-    try:
-        import modlens_bridge
-        return modlens_bridge.self_check()
-    except ImportError:
-        return {"modlens_available": False, "error": "modlens_bridge 未安装"}
 
-
-def modlens_read_image_fn(path, prompt=None):
-    """使用 modlens 读取图片。"""
-    import modlens_bridge
-    result = modlens_bridge.read_image(path, prompt)
-    result["formatted_text"] = modlens_bridge.format_for_prompt(result)
-    return result
 
 
 def dual_ai_status_fn():

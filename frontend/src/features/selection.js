@@ -86,16 +86,17 @@ export function renderPaperSelection(d){
     target.innerHTML='<div class="banner">尚无策略选股结果。盘后 17:25 会自动运行，也可点击「立即重跑选股」。</div>';
     return;
   }
-  var statusTag=function(s){
-    if(s.status==='ok') return '<span class="tag tag-ok">已入选 '+arguments[1]+' 只</span>';
-    if(s.status==='empty') return '<span class="tag tag-warn">候选不足 · 0 只</span>';
-    if(s.status==='blocked') return '<span class="tag tag-warn">数据门禁未通过</span>';
-    if(s.status==='error') return '<span class="tag tag-warn">运行异常</span>';
+  var statusTag=function(status,count){
+    if(status==='ok') return '<span class="tag tag-ok">已入选 '+count+' 只</span>';
+    if(status==='empty') return '<span class="tag tag-warn">候选不足 · 0 只</span>';
+    if(status==='blocked') return '<span class="tag tag-warn">数据门禁未通过</span>';
+    if(status==='error') return '<span class="tag tag-warn">运行异常</span>';
     return '<span class="tag">未运行</span>';
   };
   var html='<div class="result-toolbar"><span class="tag tag-info">交易日 '+adaptiveEsc(d.trade_date||'—')+'</span>'
     +'<span class="tag tag-info">去重规则：同一只股票被多策略选中时分别归属各策略，不合并</span>'
-    +'<span class="tag tag-info">重跑按「交易日 + 策略编号」覆盖当天结果</span></div>';
+    +'<span class="tag tag-info">重跑按「交易日 + 策略编号」覆盖当天结果</span>'
+    +'<span class="tag">定时选股：08:50、17:25、17:55；开盘不会自动重跑此表</span></div>';
   groups.forEach(function(g){
     var picks=g.picks||[];
     var rows=picks.map(function(p){
@@ -115,11 +116,11 @@ export function renderPaperSelection(d){
     html+='<section class="paper-selection-group"><header><div><span>'+adaptiveEsc(g.label||'')+' · '+adaptiveEsc(g.strategy_name||g.strategy_id)+'</span>'
       +'<h4>'+adaptiveEsc(g.label||'')+' '+adaptiveEsc(g.strategy_name||'')+'<small style="margin-left:8px;font-weight:400;color:#9aa5b1">'+adaptiveEsc(g.strategy_id)+'</small></h4></div>'
       +'<div class="group-tags">'+statusTag(g.status, picks.length)
-      +(g.updated_at?'<span class="tag">'+adaptiveEsc(String(g.updated_at).replace("T"," ").substring(0,19))+'</span>':'')+'</div></header>'
+      +(g.updated_at?'<span class="tag">选出时间：'+adaptiveEsc(String(g.updated_at).replace("T"," ").substring(0,19))+'</span>':'')+'</div></header>'
       +tableScroll('<table><tr><th>#</th><th>股票</th><th>现价</th><th>涨跌</th><th>评分</th><th>超大单净流入</th><th>入选理由</th></tr>'+body+'</table>',1180)
       +'</section>';
   });
-  html+='<div class="disclaimer">选股结果来自各策略模型族的评分排序，仅供研究参考，不构成投资建议；结果不会生成订单或改动模拟盘账本。</div>';
+  html+='<div class="disclaimer">此表为定时研究选股；模拟交易另有 09:25 竞价预选及开盘后的盘中候选扫描，不以此表刷新判断是否重扫。选股结果仅供研究参考，不构成投资建议；结果不会生成订单或改动模拟盘账本。</div>';
   target.innerHTML=html;
 }
 
@@ -267,10 +268,21 @@ export async function checkInit(){
 
 export async function startInit(){ await apiPost('/api/init?years=3&size=0'); checkInit(); }
 
+export function dataValidityBadge(d){
+  var c=d.coverage||{}, f=d.factor_cache||{}, live=d.live_snapshot||{};
+  var below=function(value){return value!=null&&Number.isFinite(Number(value))&&Number(value)<90;};
+  if(d.status==='unavailable') return '不可用';
+  if(below(c.coverage_pct)||below(c.fresh_pct)) return '需补历史数据';
+  if(below(f.eligible_factor_coverage_pct)) return '选股因子待补';
+  if((d.source_health||{}).healthy===false||live.status==='degraded') return '行情降级';
+  if(d.status==='ok') return '正常';
+  return '状态待核验';
+}
+
 export function renderDataValidity(d){
   var c=d.coverage||{}, live=d.live_snapshot||{}, f=d.factor_cache||{}, u=d.incremental_update||{};
-  var status=d.status==='ok'?'正常':(d.status==='degraded'?'需补数据':'不可用');
-  var statusClass=d.status==='ok'?'tag-ok':(d.status==='degraded'?'tag-warn':'tag-warn');
+  var status=dataValidityBadge(d);
+  var statusClass=status==='正常'?'tag-ok':'tag-warn';
   // 没有盘中快照时覆盖率是"未知"，不能算成 0 再标红。
   var liveCoverage=live.valid_today_rows==null?null:(Number(live.valid_today_rows)/Math.max(Number(c.universe)||1,1)*100);
   var cards=[
@@ -285,9 +297,14 @@ export function renderDataValidity(d){
   $('dataValidityCards').innerHTML=cards.map(function(x){return '<div class="data-validity-card '+x[2]+'"><small>'+x[0]+'</small><b>'+x[1]+'</b><em>'+x[3]+'</em></div>';}).join('');
   var warnings=(d.warnings||[]).slice(0,5).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li>当前没有数据质量告警。</li>';
   var source=d.source_health||{};
-  $('dataValidityDetails').innerHTML='<b>数据源：</b>'+adaptiveEsc(source.healthy?'主源与独立源正常':'存在降级或未返回')+' · <b>最新交易日：</b>'+adaptiveEsc((d.reference||{}).latest_trade_date||'—')+' · <b>不复权兜底：</b>'+Number(c.fallback_unadjusted||0)+' 只 · <b>源快照年龄：</b>'+ (live.age_seconds==null?'—':fmt(live.age_seconds,0)+' 秒')
+  var tracking=d.auction_tracking||{};
+  var trackingText=tracking.captured_at
+    ?String(tracking.captured_at).replace('T',' ').substring(0,19)+' · '+Number(tracking.tracked_stocks||0)+' 只 · '+Number(tracking.observations||0)+' 轮'+(tracking.status==='blocked'?' · 本轮无有效竞价报价':'')
+    :'尚无采集记录';
+  $('dataValidityDetails').innerHTML='<b>数据源：</b>'+adaptiveEsc(source.healthy===true?(live.status==='degraded'?'探活正常，当前快照字段仍降级':'主源与独立源正常'):(source.healthy===false?'行情源降级，历史补齐不能修复此问题':'尚无健康检查结果'))+' · <b>最新交易日：</b>'+adaptiveEsc((d.reference||{}).latest_trade_date||'—')+' · <b>不复权兜底：</b>'+Number(c.fallback_unadjusted||0)+' 只 · <b>源快照年龄：</b>'+ (live.age_seconds==null?'—':fmt(live.age_seconds,0)+' 秒')
     +'<div style="margin-top:5px"><b>告警：</b><ul style="margin:3px 0 0 18px">'+warnings+'</ul></div>'
     +'<div style="margin-top:6px;color:#7b8d84">人工更新：'+adaptiveEsc({idle:'空闲',running:'运行中',queued:'排队中',cancelling:'取消中',cancelled:'已取消',completed:'已完成',failed:'失败',error:'失败',timeout:'超时'}[String(u.status||'idle').toLowerCase()]||u.status||'空闲')+(u.job_id?' · '+adaptiveEsc(u.job_id):'')+(u.error?' · '+adaptiveEsc(u.error):'')+'</div>';
+  $('dataValidityDetails').innerHTML+='<div style="margin-top:6px">竞价跟踪：09:15 起每3分钟，仅观测；'+adaptiveEsc(trackingText)+'</div>';
 }
 
 export async function loadDataValidity(){

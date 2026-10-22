@@ -1250,6 +1250,7 @@ def _paper_intraday_loop():
 @app.get("/api/data-validity")
 def data_validity():
     """Fast, read-only data validity dashboard payload."""
+    import auction_tracking
     h = health()
     meta = {}
     try:
@@ -1275,6 +1276,7 @@ def data_validity():
         "coverage": coverage,
         "reference": {"latest_trade_date": h.get("latest_trade_date"), "expected_reference_date": h.get("expected_reference_date"), "stale_calendar_days": h.get("stale_calendar_days")},
         "live_snapshot": h.get("live_snapshot", {}),
+        "auction_tracking": auction_tracking.status(),
         "source_health": h.get("data_source_health", {}),
         "factor_cache": {"factor_date": meta.get("factor_date"), "built_at": meta.get("built_at"), "factor_rows": meta.get("factor_rows", 0), "eligible_factor_coverage_pct": meta.get("eligible_factor_coverage_pct", 0)},
         "warnings": h.get("warnings", []),

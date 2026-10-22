@@ -348,7 +348,10 @@ class ProviderTransportTests(TransportTestBase):
         import ai_review_service as S
 
         body = S.build_request_body(dict(CONFIG, slot="ai1"), "sys", "user")
-        self.assertEqual(T.build_request_body(dict(CONFIG, slot="ai1"), "sys", "user"), body)
+        self.assertEqual(4000, body["max_tokens"])
+        self.assertEqual(T.build_request_body(
+            dict(CONFIG, slot="ai1"), "sys", "user", max_tokens=S.SLOT_MAX_OUTPUT_TOKENS,
+        ), body)
         self.assertEqual(
             {"model", "messages", "response_format", "max_tokens", "stream"}, set(body),
         )

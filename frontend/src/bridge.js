@@ -7,7 +7,7 @@
 import { adaptiveEsc } from "./core/format.js";
 import { compareAdaptiveValidationRun, openAdaptiveValidationRun, refreshAdaptiveRobustness, refreshAdaptiveValidationRuns, selectAdaptiveRobustnessRun, submitAdaptiveRobustness, submitAdaptiveValidation } from "./features/adaptive.js";
 import { activatePage, refreshApp, showPaperWorkspace, toggleDark } from "./core/navigation.js";
-import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, testModlensRead, triggerEvolution } from "./features/adaptive.js";
+import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, triggerEvolution } from "./features/adaptive.js";
 import { loadPaperExecution, verifyExecutionOrder } from "./features/execution.js";
 import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPaperOrderPreview, filterPaperHistoryRows, loadPaperStockHistory, loadPortfolioWorkspace, pausePaper, preparePaperSell, previewPaperOrder, refreshPaperResearchValidation, resetPaper, resumePaper, runPaperNow, selectPaperHistoryQuick, setPaperOrderSide, setPaperTerminalFilter, showPaperStockHistory, startPaper, submitPaperOrder, syncPaperCapitalHint, togglePaperLimitPrice } from "./features/paper.js";
 import { applyPaperRiskAuditFilter, loadPaperAudit, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
@@ -99,7 +99,6 @@ window.switchToAdaptiveAI = switchToAdaptiveAI;
 window.syncPaperCapitalHint = syncPaperCapitalHint;
 window.testAiSlot = testAiSlot;
 window.testWxpusher = testWxpusher;
-window.testModlensRead = testModlensRead;
 window.toggleDark = toggleDark;
 window.togglePaperLimitPrice = togglePaperLimitPrice;
 window.trackRemove = trackRemove;

@@ -1032,7 +1032,13 @@ def _build_tuning_system_prompt():
         "factor_effectiveness只评估已保存候选；必须引用相同策略版本和配置分组的统计。"
         "最新已观测配置不一定是当前配置，快照权重与账户状态不一致时不得外推。"
         "insufficient_dates、incomplete_identity或unavailable表示证据不足。"
-        "Rank IC和高低分组收益不是账户盈亏归因，不能据此估算调整权重后的净值改善。"
+        "Rank IC和高低分组收益不是账户盈亏归因，不能据此估算调整权重后的净值改善。\n"
+        "检阅auction_tracking的逐股竞价轨迹及review_feedback，判断可能的吸筹、派发、护盘或撤单诱导。"
+        "意图只是待验证推断；仅有价格、缺匹配量/委托队列或资金流时必须写出证据局限，不能声称识别真实主力。"
+        "同时检阅此前AI判断的后续价格方向是否获得支持或被否定，说明对本次判断和调参的影响。"
+        "方向复核只比较截至观察时点的价格，不证明真实意图或交易盈利；数据不足应hold。"
+        "最多输出8条auction_intents，只用stocks已有代码；少于两个竞价样本时意图填unclear。"
+        "expected_direction表示后续可用报价相对本次reference_quote的方向，不能把已经发生的涨跌当预测。"
     )
 
 
@@ -1043,6 +1049,9 @@ def _build_tuning_user_prompt(evidence, accounts, mode):
         "confidence": 0,
         "market_regime": "momentum|rotation|risk_off|high_volatility|balanced|unclassified",
         "summary": "中文说明",
+        "auction_intents": [{"code":"仅使用竞价stocks已有代码", "intent":"accumulation|distribution|support|withdrawal|unclear",
+                             "confidence":0, "expected_direction":"up|down|flat|unclear",
+                             "rationale":"中文依据及样本时间", "counter_evidence":"反证与缺失数据；无竞价数据时返回空数组"}],
         "proposals": [{
             "account_id": "tq_breakout|trend_pullback|sector_rotation",
             "reason": "只说明证据和预期改善",
@@ -1646,6 +1655,7 @@ def _call_reviewer(slot, cfg, system_prompt, user_prompt):
             "error": None,
             "input_tokens": in_tok,
             "output_tokens": out_tok,
+            **({"auction_intents": parsed["auction_intents"]} if "auction_intents" in parsed else {}),
         }
     except Exception as exc:  # noqa: BLE001 - 上游必须拿到结构化失败而不是异常
         return _empty_reviewer(
@@ -1707,6 +1717,7 @@ def _reviewer_response(reviewer: dict) -> dict:
         "market_regime": reviewer.get("market_regime"),
         "summary": str(reviewer.get("summary") or "")[:500],
         "proposals_count": len(reviewer.get("proposals") or []),
+        **({"auction_intents": reviewer["auction_intents"]} if "auction_intents" in reviewer else {}),
     }
 
 
@@ -1716,6 +1727,11 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                  total_latency_ms=None, track_evolution=False, outcome_detail=None):
     """写入审计行（沿用历史表与列语义），必要时接线进化追踪。"""
     finished_at = _now()
+    import auction_analysis
+    for reviewer in reviewers.values():
+        if "auction_intents" in reviewer:
+            reviewer["auction_intents"] = auction_analysis.normalize_intents(
+                reviewer["auction_intents"], evidence.get("auction_tracking"))
     total_latency = (total_latency_ms if total_latency_ms is not None
                      else round((time.monotonic() - started) * 1000))
     left = reviewers.get("ai1") or {}
@@ -2043,7 +2059,7 @@ def recent_runs(conn, limit=20):
             "consensus_result": row[14], "consensus_reason": row[15],
             "merged_proposals": merged, "proposals": merged,
             "total_latency_ms": row[17], "created_at": row[18], "finished_at": row[19],
-            "applied_ids": _loads(row[20], None),
+            "applied_ids": _loads(row[20], []),
             "outcome_detail": outcome_detail,
         })
     return result
@@ -2051,6 +2067,7 @@ def recent_runs(conn, limit=20):
 
 def review_status(conn):
     """整体状态：审核模式 + 两个槽位的就绪度 + 最近记录。"""
+    import auction_analysis
     view = review_settings_view(conn)
     recent = recent_runs(conn, 5)
     last_consensus = next((r for r in recent if r.get("consensus_result") == "consensus"), None)
@@ -2068,6 +2085,7 @@ def review_status(conn):
         "deepseek_ready": view["slots"]["ai2"]["ready"],
         "recent_runs": recent,
         "last_consensus": last_consensus,
+        "auction_review": auction_analysis.status(conn),
         "consensus_rules": {
             "weight_direction_threshold": CONSENSUS_WEIGHT_DIRECTION_THRESHOLD,
             "weight_magnitude_ratio": CONSENSUS_WEIGHT_MAGNITUDE_RATIO,

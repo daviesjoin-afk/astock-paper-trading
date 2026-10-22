@@ -11351,7 +11351,7 @@ def _auction_quote_time(value):
 def run_auction_preselection(asof_date=None, force=False):
     """只在 09:25 读取一次集合竞价快照，生成待 09:31 开盘确认的预选信号。
 
-    09:15–09:20 的委托可撤，波动和虚假撮合较大，因此不采集也不下单；
+    09:15 起由 auction-track 保存观测；可撤单阶段只跟踪，不生成委托；
     09:25 的快照只用于筛选与排序，真正成交仍须在 09:31 用最新双源行情复核。
     """
     init_db()
@@ -11359,6 +11359,8 @@ def run_auction_preselection(asof_date=None, force=False):
     day = _date(asof_date)
     if not force and (now.weekday() >= 5 or now.time() < dt.time(9, 24) or now.time() > dt.time(9, 27)):
         return {"slot": "auction", "status": "skipped", "date": day.isoformat(), "reason": "仅在 09:25 采集集合竞价快照"}
+    # 每日首批候选也必须拿到本轮探活结果，而非沿用昨收或过期记录。
+    auction_source_health = dfc.check_data_source_health(force=True)
     try:
         live_universe = MDSvc.refresh_rows(force=True, policy=MDC.AUCTION_PRESELECTION_POLICY)
     except Exception as exc:
@@ -11380,6 +11382,11 @@ def run_auction_preselection(asof_date=None, force=False):
             "live_scan_gate": auction_gate,
         }
     auction_at = max((_auction_quote_time(row.get("quote_at")) for row in current_rows), default=None)
+    try:
+        import auction_tracking
+        auction_tracking.record_final(current_rows, now, auction_source_health)
+    except Exception:
+        pass  # 观测落盘异常不改变原有预选、风控与下单门禁。
     # The full snapshot may contain rows captured before/after the auction
     # window.  Ranking must consume only the validated 09:24–09:27 rows.
     result = _bootstrap_signals_for_today(day, live_universe=current_rows, source_slot="auction_0925")
@@ -15111,7 +15118,7 @@ def schedule_status():
         "latest_intraday_runs": intraday,
         "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
-        "note": "09:25采集集合竞价快照做预选；09:30、09:31、13:00先执行共享开盘事件扫描（冲高回落可减仓，回补需后续反弹确认），09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试，页面显示数据库中的实际运行记录。"
+        "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
     }
 
 
