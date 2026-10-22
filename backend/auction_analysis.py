@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import closing
 import math
 from pathlib import Path
 import re
@@ -41,7 +42,7 @@ def _selection_codes(now):
     if not path.is_file():
         return set()
     try:
-        with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2) as conn:
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2)) as conn:
             conn.execute('PRAGMA query_only=ON')
             rows = conn.execute('SELECT p.code,r.created_at FROM paper_selection_picks p JOIN paper_selection_runs r ON r.id=p.run_id WHERE r.trade_date=? ORDER BY p.rank_no LIMIT 100', (now.date().isoformat(),)).fetchall()
         return {str(code) for code, stamp in rows if _time(stamp) is not None and _time(stamp) <= now}
@@ -109,6 +110,44 @@ def feedback(conn, quotes, now):
     return result[:40]
 
 
+def _archive(now):
+    saved = tracking._read(Path(data_paths.data_path('auction_tracking','feedback.json')))
+    return [r for r in saved.get('reviews',[]) if isinstance(r,dict)
+            and _time(r.get('observed_at')) is not None and _time(r['observed_at']) <= now]
+
+
+def _merge_feedback(archived, current, limit=40):
+    combined = {}
+    for row in archived + current:
+        key = (row.get('run_id'),row.get('slot'),row.get('code'))
+        old = combined.get(key)
+        if old and row.get('direction_verdict') == 'pending' and old.get('direction_verdict') != 'pending':
+            continue
+        combined[key] = row
+    return sorted(combined.values(),key=lambda r:r.get('observed_at') or r.get('issued_at') or '',reverse=True)[:limit]
+
+
+def record_outcomes(market_rows, now):
+    """复用三分钟扫描已有报价，保存最近100条复核；失败不进入交易决策。"""
+    now = now.replace(tzinfo=tracking.CN) if now.tzinfo is None else now.astimezone(tracking.CN)
+    path = Path(data_paths.data_path('adaptive_learning.sqlite3'))
+    if not path.is_file():
+        return 0
+    try:
+        with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=1)) as conn:
+            conn.execute('PRAGMA query_only=ON')
+            if not feedback(conn,{},now):
+                return 0
+            rows = feedback(conn,_current_quotes(market_rows,now),now)
+        valid = [row for row in rows if row['direction_verdict'] != 'pending']
+        if valid:
+            merged = _merge_feedback(_archive(now),valid,limit=100)
+            tracking._write(Path(data_paths.data_path('auction_tracking','feedback.json')),{'reviews':merged})
+        return len(valid)
+    except (OSError,sqlite3.Error,ValueError):
+        return 0
+
+
 def evidence(now, market_rows, conn, focus_codes=()):
     now = now.astimezone(tracking.CN)
     saved = tracking._read(Path(data_paths.data_path('auction_tracking', 'current.json')))
@@ -143,7 +182,7 @@ def evidence(now, market_rows, conn, focus_codes=()):
     return {'status': 'observed' if selected else 'not_collected', 'as_of': now.isoformat(),
             'observed_stocks': len(stocks), 'included_stocks': len(selected), 'stocks': selected,
             'sampling': 'current_candidates_and_positions_then_largest_price_change',
-            'review_feedback': feedback(conn,current,now),
+            'review_feedback': _merge_feedback(_archive(now),feedback(conn,current,now)),
             'assessment_boundary': '意图是AI推断；后续方向复核只比较截至观察时点的价格，不证明真实主力意图。0.2%以内按横盘记录，不等于交易收益。'}
 
 
@@ -174,13 +213,14 @@ def normalize_intents(raw, context):
 def status(conn):
     import market_data_service as market
     now = dt.datetime.now(tracking.CN)
+    archived = _archive(now)
     reviews = feedback(conn, {}, now)
     if not reviews:
-        return {'tracking':tracking.status(), 'reviews':[], 'boundary':'尚无AI竞价意图判断，不生成准确率。'}
+        return {'tracking':tracking.status(), 'reviews':_merge_feedback(archived,[]), 'boundary':'仅显示已有判断和复核，不生成准确率。'}
     try:
         rows = market.read_snapshot(now=now).rows()
         reviews = feedback(conn, _current_quotes(rows, now), now)
     except Exception:
         reviews = []
-    return {'tracking':tracking.status(), 'reviews':reviews,
+    return {'tracking':tracking.status(), 'reviews':_merge_feedback(archived,reviews),
             'boundary':'复核后续价格方向，不等于证明真实主力意图；等待有时点的新数据，不补造准确率。'}

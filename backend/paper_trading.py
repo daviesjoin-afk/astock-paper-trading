@@ -12442,6 +12442,11 @@ def monitor_intraday(asof_datetime=None, force=False):
         except Exception:
             live_universe = []
     live_gate = _live_scan_gate(live_universe, day)
+    try:
+        import auction_analysis
+        auction_analysis.record_outcomes(live_universe, now)
+    except Exception:
+        pass  # 独立研究复核异常不得影响风控、出场与原有候选门禁。
     scan_ready = bool(live_gate["ready"])
     scan_block = (
         None if scan_ready else

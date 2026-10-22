@@ -1,5 +1,5 @@
 """AI 竞价证据、推断留档和复核不得使用未来或不存在的事实。"""
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 import datetime as dt
 import json
 from pathlib import Path
@@ -118,3 +118,24 @@ class AuctionAnalysisTests(unittest.TestCase):
         prompt=review._build_tuning_user_prompt({'auction_tracking':context},[], 'intraday')
         self.assertIn('review_feedback',prompt)
         self.assertIn('auction_intents',prompt)
+
+    def test_followup_is_retained_across_days_without_writing_the_audit_database(self):
+        self.write_judgment()
+        path=self.root/'adaptive_learning.sqlite3'
+        # Backup requires the in-memory source transaction to be committed.
+        self.conn.commit()
+        with closing(sqlite3.connect(path)) as destination:
+            self.conn.backup(destination)
+        before=path.read_bytes()
+        result=A.record_outcomes([{'code':'000001','price':11,'quote_at':self.at(30).isoformat()}],self.at(30))
+        self.assertEqual(1,result)
+        self.assertEqual(before,path.read_bytes())
+        tomorrow=self.at(30)+dt.timedelta(days=1)
+        evidence=A.evidence(tomorrow,[],self.conn)
+        self.assertEqual('supported',evidence['review_feedback'][0]['direction_verdict'])
+        self.assertEqual([],A.evidence(self.at(25),[],self.conn)['review_feedback'])
+
+    def test_pending_current_quote_does_not_erase_an_observed_historical_verdict(self):
+        old={'run_id':1,'slot':'ai1','code':'000001','observed_at':self.at(30).isoformat(),'direction_verdict':'supported'}
+        pending={**old,'observed_at':None,'direction_verdict':'pending'}
+        self.assertEqual('supported',A._merge_feedback([old],[pending])[0]['direction_verdict'])
