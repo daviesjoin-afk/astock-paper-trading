@@ -9,22 +9,23 @@
 | 模块 | 行数 | 依赖（同仓库） |
 | --- | --- | --- |
 | `app.js` | 6 | — |
-| `boot.js` | 120 | `core/api.js`, `core/dom.js`, `core/navigation.js`, `features/adaptive.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/strategies.js` |
-| `bridge.js` | 111 | `core/format.js`, `core/navigation.js`, `features/adaptive.js`, `features/execution.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/settings.js`, `features/strategies.js` |
-| `core/api.js` | 46 | — |
+| `boot.js` | 155 | `core/api.js`, `core/dom.js`, `core/navigation.js`, `features/adaptive.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/strategies.js`, `ui/dialog.js` |
+| `bridge.js` | 130 | `core/format.js`, `core/navigation.js`, `features/adaptive.js`, `features/execution.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/settings.js`, `features/strategies.js` |
+| `core/api.js` | 384 | — |
 | `core/dom.js` | 30 | — |
-| `core/format.js` | 101 | — |
-| `core/navigation.js` | 202 | `core/dom.js`, `features/*.js`（各页面装载入口 + hash 路由意图） |
+| `core/format.js` | 175 | — |
+| `core/navigation.js` | 203 | `core/dom.js`, `features/*.js`（各页面装载入口 + hash 路由意图） |
 | `core/state.js` | 8 | — |
-| `core/strategy_labels.js` | 77 | — （PR-57：状态/技术标签的唯一口径） |
-| `features/adaptive.js` | 749 | `core/api.js`, `core/dom.js`, `core/format.js`, `features/execution.js`, `ui/dialog.js` |
-| `features/execution.js` | 144 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js`, `features/adaptive.js` |
-| `features/paper.js` | 869 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js`, `features/risk.js`, `features/strategies.js`, `ui/dialog.js` |
-| `features/risk.js` | 107 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js` |
-| `features/selection.js` | 547 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js` |
-| `features/settings.js` | 252 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `features/paper.js`, `features/strategies.js`, `ui/dialog.js` |
-| `features/strategies.js` | 712 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/strategy_labels.js`, `ui/dialog.js` |
-| `ui/dialog.js` | 174 | `core/format.js` |
+| `core/strategy_labels.js` | 100 | — （PR-57：状态/技术标签的唯一口径） |
+| `features/adaptive.js` | 1102 | `core/api.js`, `core/dom.js`, `core/format.js`, `features/execution.js`, `ui/dialog.js` |
+| `features/execution.js` | 180 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js`, `features/adaptive.js`, `ui/dialog.js` |
+| `features/paper.js` | 978 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js`, `features/risk.js`, `features/signal-audit-table.js`, `features/strategies.js`, `ui/dialog.js` |
+| `features/risk.js` | 162 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js` |
+| `features/selection.js` | 587 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js`, `ui/dialog.js` |
+| `features/settings.js` | 418 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `features/paper.js`, `features/strategies.js`, `ui/dialog.js` |
+| `features/signal-audit-table.js` | 47 | `core/format.js` |
+| `features/strategies.js` | 1039 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/strategy_labels.js`, `ui/dialog.js` |
+| `ui/dialog.js` | 219 | `core/format.js`, `core/api.js` |
 
 ## 功能归属（feature ownership）
 
@@ -63,6 +64,8 @@
 ## 约束（由 `backend/test_frontend_module_contract.py` 强制）
 
 - inline handler 调用的每个本仓库函数都必须挂到 `window`（`bridge.js`），且 `bridge.js` 不能挂不存在的名字、不能赋值未 import 的名字；
+- inline handler 的**字符串参数**必须用 `core/format.js` 的 `adaptiveJsArg` 预计算成 JS 字面量再拼（`var xArg=adaptiveJsArg(x)` → `onclick="fn('+xArg+')"`）。`adaptiveEsc` 只做 HTML 实体转义，浏览器会先解码属性值再解析 JS，`&#39;` 会变回 `'` 闭合字符串。参数必须在 handler 文本外预计算，否则契约测试会把 `adaptiveJsArg` 当成需要挂 `window` 的函数。由 `frontend/tests/inline-handler-args.test.mjs` 强制；
+- 后端/外部数据进 `innerHTML` 前必须转义（`adaptiveEsc`，或各模块的统一出口如 `paperText`）；进 `class`/`id` 的标识符必须走白名单（如 `adaptiveCssToken`）；
 - 跨模块引用必须有 import（漏了不报构建错，只在运行时 `ReferenceError`）；
 - 入口必须声明 `__ASTOCK_ADAPTIVE_UI_BUILD__` 且与 `backend/build_info.py` 一致；
 - `frontend/app.js` / `frontend/app.css` 不再存在；产物仍是 `dist/app.js` / `dist/app.css`，且 dist 必须包含与源一致的 build id 与全部桥接全局；

@@ -34,6 +34,7 @@ if BACKEND not in sys.path:
 
 import adaptive_engine as AE  # noqa: E402
 import ai_research_contract as ARC  # noqa: E402
+import paper_job_run_facts as PJF  # noqa: E402
 import paper_trading as PT  # noqa: E402
 
 ADAPTIVE_RUNS = "adaptive_runs"
@@ -1064,7 +1065,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         for module, function in (
             ("adaptive_engine.py", "adaptive_run_fact"),
             ("adaptive_runtime_facts.py", "adaptive_run_fact"),
-            ("paper_trading.py", "paper_job_run_fact"),
+            ("paper_job_run_facts.py", "paper_job_run_fact"),
         ):
             identifiers, constants = _function_facts(module, function)
             with self.subTest(module=module, function=function):
@@ -1131,6 +1132,29 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
             "canonical_research_ledger",
             DR._latest_data_quality(_adaptive_conn()).get("source", "canonical_research_ledger"),
         )
+
+    def test_INC_23c_paper_job_run_fact_module_stays_a_read_only_owner_boundary(self):
+        """INC-23c：typed fact 读侧现在住在 ``paper_job_run_facts.py``，边界仍然可执行。
+
+        * 它**不得**反向 import ``paper_trading`` / ``main`` / ``adaptive_engine``
+          （composition 层）—— 依赖方向单向；
+        * 它**只读**：``paper_job_runs`` 的 lifecycle writer 仍然只有 ``paper_trading``
+          （``OWNER_BY_TABLE`` 不动，见 INC-03），读侧模块不得进任一 writer 扫描闭集；
+        * paper_trading 的 re-export facade 保持同一类型对象（精确类型判定 ``type(x) is``
+          依赖它）。
+        """
+        roots = _imported_roots("paper_job_run_facts.py")
+        for forbidden in ("paper_trading", "main", "adaptive_engine"):
+            self.assertNotIn(
+                forbidden, roots,
+                f"paper_job_run_facts.py import 了 {forbidden} —— 依赖方向被反转，"
+                "typed 读侧必须只依赖 stdlib",
+            )
+        self.assertNotIn("paper_job_run_facts.py", _literal_write_modules(PAPER_JOB_RUNS))
+        self.assertEqual([], _templated_write_statements("paper_job_run_facts.py"))
+        # 非空性 + facade 同一性：旧入口可达，且拿到的是同一个 owner 类型。
+        self.assertIs(PJF.PaperJobRunFactProjection, PT.PaperJobRunFactProjection)
+        self.assertTrue(callable(PT.paper_job_run_fact) and callable(PT.paper_job_run_facts))
 
     def test_INC_23b_adaptive_execution_evidence_status_is_not_typed_evidence(self):
         """INC-23b：``adaptive_execution_evidence.status`` 是**自由字符串** ⇒ OPEN PREREQUISITE。

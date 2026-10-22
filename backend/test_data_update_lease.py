@@ -49,13 +49,14 @@ class DataUpdateLeaseTests(unittest.TestCase):
                 self.assertIn("status", source)
                 self.assertIn("failed", source)
 
-    def test_installer_removes_conflicting_cron_profiles_before_install(self):
+    def test_native_installer_is_retired(self):
+        """native-centos9 profile 已退役：安装器不得再改动系统。"""
         script = MAIN.parents[1] / "deploy" / "install-centos9.sh"
         text = script.read_text(encoding="utf-8")
-        self.assertIn("/etc/cron.d/astock-codex", text)
-        self.assertIn("/etc/cron.d/astock-quant", text)
-        self.assertIn("rm -f --", text)
-        self.assertIn('"${APP_DIR}/deploy/astock-quant.cron" /etc/cron.d/astock-quant', text)
+        self.assertIn("已退役", text)
+        self.assertIn("exit 3", text)
+        for mutation in ("dnf install", "rm -f --", "astock-quant.cron"):
+            self.assertNotIn(mutation, text)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { adaptiveRobustnessReportHtml } from '../src/features/adaptive.js';
+import {
+  adaptiveRobustnessReportHtml,
+  refreshAdaptiveRobustness,
+  submitAdaptiveRobustness,
+} from '../src/features/adaptive.js';
 
 const report = {
   report_fingerprint: 'report-fingerprint',
@@ -83,4 +87,86 @@ test('R30-85 frontend renders backend metrics without performance arithmetic', a
   const renderer = source.slice(start, end);
   assert.doesNotMatch(renderer, /Math\.|Number\(|parseFloat\(|\.reduce\(|baseline_delta\s*\[/);
   assert.match(renderer, /result\.baseline_delta/);
+});
+
+/* R30 入口的 run id 守卫此前被写成 /^\\d+$/（匹配字面反斜杠 + d），任何数字
+   id 都进不来：刷新/提交按钮静默无请求。行为断言锁住“合法 id 必须发出请求”。 */
+function installNodes(nodes) {
+  const previous = globalThis.document;
+  globalThis.document = { getElementById: (id) => nodes.get(id) || null };
+  return () => { globalThis.document = previous; };
+}
+
+test('R30-86 numeric run id reaches the canonical robustness read endpoint', async () => {
+  const calls = [];
+  const target = { innerHTML: '' };
+  const nodes = new Map([
+    ['r30BaselineRunId', { value: '12' }],
+    ['r30RobustnessReports', target],
+  ]);
+  const restoreDocument = installNodes(nodes);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (path) => {
+    calls.push(String(path));
+    return { ok: true, status: 200, json: async () => ({ status: 'ok', reports: [] }) };
+  };
+  try {
+    await refreshAdaptiveRobustness();
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreDocument();
+  }
+  assert.deepEqual(calls, ['/api/adaptive/experiments/runs/12/robustness?limit=50']);
+  assert.match(target.innerHTML, /尚无 robustness report/);
+});
+
+test('R30-87 numeric run id posts the robustness request to the run-scoped endpoint', async () => {
+  const calls = [];
+  const target = { innerHTML: '' };
+  const nodes = new Map([
+    ['r30BaselineRunId', { value: '7' }],
+    ['r30RobustnessRequest', { value: '{"spec":{}}' }],
+    ['r30RobustnessReports', target],
+  ]);
+  const restoreDocument = installNodes(nodes);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (path, init) => {
+    calls.push({ path: String(path), method: init && init.method });
+    return { ok: true, status: 200, json: async () => ({ report: { cases: [], sensitivity_analysis: {} } }) };
+  };
+  try {
+    await submitAdaptiveRobustness();
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreDocument();
+  }
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'POST');
+  assert.equal(calls[0].path, '/api/adaptive/experiments/runs/7/robustness');
+  assert.match(target.innerHTML, /Robustness report/);
+});
+
+test('R30-88 non-numeric run id never sends a request', async () => {
+  const calls = [];
+  const target = { innerHTML: '' };
+  const nodes = new Map([
+    ['r30BaselineRunId', { value: '12abc' }],
+    ['r30RobustnessRequest', { value: '{"spec":{}}' }],
+    ['r30RobustnessReports', target],
+  ]);
+  const restoreDocument = installNodes(nodes);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (path) => {
+    calls.push(String(path));
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    await refreshAdaptiveRobustness();
+    await submitAdaptiveRobustness();
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreDocument();
+  }
+  assert.equal(calls.length, 0);
+  assert.match(target.innerHTML, /请先填写 canonical R29 run ID/);
 });

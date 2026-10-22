@@ -33,9 +33,11 @@ if ! docker inspect --format '{{.State.Health.Status}}' astock-codex 2>/dev/null
 fi
 
 # 4. API 可用性
-HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 http://127.0.0.1:18600/api/health 2>/dev/null)
+# 生产 API 端口是 8600；这里此前写死 18600（CI 冒烟端口），生产上必然误报 CRIT。
+HEALTH_URL="${ASTOCK_HEALTH_URL:-http://127.0.0.1:8600/api/health}"
+HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "$HEALTH_URL" 2>/dev/null)
 if [[ "$HTTP_CODE" != "200" ]]; then
-  log "[CRIT] api health http=$HTTP_CODE"
+  log "[CRIT] api health http=$HTTP_CODE url=$HEALTH_URL"
   ALERT=1
 fi
 

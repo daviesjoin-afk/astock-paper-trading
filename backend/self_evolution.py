@@ -119,6 +119,7 @@ def ensure_schema(conn):
             parent_id INTEGER,             -- 上一版参数的ID
             performance_snapshot TEXT,     -- JSON: 触发进化时的性能快照
             strategy_id TEXT,              -- NULL=全局默认行；非 NULL=策略专属版本链
+            loop_generation INTEGER,       -- evolution_loop 代（崩溃窗口幂等键；NULL=非 loop 路径）
             created_at TEXT NOT NULL,
             FOREIGN KEY (parent_id) REFERENCES evolution_params(id)
         );
@@ -665,7 +666,7 @@ def should_evolve(conn) -> tuple[bool, str]:
     return False, "当前状态稳定，无需进化"
 
 
-def evolve(conn, reason: str = "auto") -> dict:
+def evolve(conn, reason: str = "auto", generation: Optional[int] = None) -> dict:
     """执行一次进化：基于历史数据调整参数。
 
     进化策略：
@@ -763,6 +764,7 @@ def evolve(conn, reason: str = "auto") -> dict:
         conn, new_params, strategy_id=None, source="evolve",
         reason=f"{reason}: " + "; ".join(adjustments),
         parent_id=current["id"], performance_snapshot=metrics, validate=True,
+        loop_generation=generation,
     )
     new_id = created["params_id"]
 
@@ -1247,14 +1249,16 @@ def evolution_status(conn) -> dict:
     }
 
 
-def auto_evolve_if_needed(conn) -> Optional[dict]:
+def auto_evolve_if_needed(conn, generation: Optional[int] = None) -> Optional[dict]:
     """自动检查并执行进化（如果需要）。
 
     注意：自动进化只**生成候选**，绝不激活。runtime 参数的变更必须由
     ``activate_params_candidate`` 显式批准 —— 否则"自动"就成了一条
     绕过激活门的路径。
+
+    ``generation`` 由 evolution_loop 传入，作为候选的幂等键（同一代最多一条候选）。
     """
     should, reason = should_evolve(conn)
     if not should:
         return None
-    return evolve(conn, reason=reason)
+    return evolve(conn, reason=reason, generation=generation)

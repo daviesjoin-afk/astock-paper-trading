@@ -66,7 +66,10 @@ SCAN_ROOT_FILES = (
 )
 SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".workbuddy", "dist"}
 SCAN_SUFFIXES = (".py", ".js", ".html", ".css", ".md", ".sh", ".bat", ".ps1",
-                 ".yml", ".yaml", ".toml", ".txt", ".cfg", ".ini")
+                 ".yml", ".yaml", ".toml", ".txt", ".cfg", ".ini",
+                 # deploy/astock-codex.cron 是调度契约的渲染产物，也是引用
+                 # run_paper_slot.sh / run_evolution_loop.sh 的真实位置。
+                 ".cron")
 
 # 本机专用、**不进 git 也不进镜像**的本地记录。它们本来就该记录"删了什么"，
 # 因此不能拿"引用了已删模块"去判它们不合格；CI 检出与运行时镜像里都没有这些文件。
@@ -191,6 +194,103 @@ class CronBackupHygieneTests(unittest.TestCase):
             with open(os.path.join(ROOT, "deploy", "astock-codex.cron"), encoding="utf-8") as handle:
                 expected = handle.read().replace("/opt/astock-codex", ROOT)
             self.assertEqual(expected, synced)
+
+
+class NativeProfileRetirementTests(unittest.TestCase):
+    """native-centos9 原生部署 profile 已退役（2026-10-20）。
+
+    退役依据（见 docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md）：
+    生产实际运行 4 个容器（Docker profile）；native 依赖的
+    ``deploy/astock-quant.{service,nginx.conf,cron}`` 从未进入 git；``backup.sh``
+    的路径探测也从不包含 ``/opt/astock-quant``；且它的 5 分钟时间表与
+    ``paper_schedule_contract`` 的 3 分钟契约冲突。
+
+    这个测试锁住退役状态，防止有人把半成品安装器又接回来：
+    安装器必须只做 fail-fast 说明，不得再出现任何改动系统的步骤。
+    """
+
+    INSTALLER = os.path.join(ROOT, "deploy", "install-centos9.sh")
+    ARCHIVE_DOC = os.path.join(
+        ROOT, "docs", "archive", "NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md")
+
+    def _installer_text(self):
+        with open(self.INSTALLER, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_installer_is_a_retirement_stub(self):
+        text = self._installer_text()
+        self.assertIn("已退役", text)
+        self.assertIn("exit 3", text)
+        for mutation in ("dnf install", "useradd", "rsync -a", "systemctl enable",
+                         "astock-quant.service", "astock-quant.cron"):
+            self.assertNotIn(
+                mutation, text,
+                f"退役安装器不得再包含系统改动步骤：{mutation}",
+            )
+
+    def test_retirement_record_exists_and_names_the_evidence(self):
+        self.assertTrue(os.path.isfile(self.ARCHIVE_DOC), "缺少退役记录")
+        with open(self.ARCHIVE_DOC, encoding="utf-8") as handle:
+            text = handle.read()
+        for needle in ("四个运行容器", "从未进入仓库", "3 分钟", "恢复路径"):
+            self.assertIn(needle, text, f"退役记录缺少关键证据：{needle}")
+
+    def test_docs_no_longer_advertise_the_native_profile_as_supported(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = handle.read()
+        with open(os.path.join(ROOT, "CONTRIBUTING.md"), encoding="utf-8") as handle:
+            contributing = handle.read()
+        with open(os.path.join(ROOT, "deploy", "README.md"), encoding="utf-8") as handle:
+            deploy_readme = handle.read()
+        self.assertNotIn("该 profile 仍使用 Python 3.11", readme)
+        self.assertNotIn("唯一例外是 `native-centos9`", contributing)
+        self.assertIn("已退役", deploy_readme)
+
+
+class DeployArtifactReferenceTests(unittest.TestCase):
+    """``deploy/`` 下不允许出现"没人引用"的孤儿文件。
+
+    真实问题：``deploy/cron/astock-fast-entry`` 没有任何安装脚本引用
+    （``fast-entry`` 是 ``RUNNER_ONLY_SLOTS``，契约明确不调度它），
+    ``health-alert.sh`` 也没被任何文档或脚本提到。孤儿部署文件会被误装、
+    误用，或者悄悄腐烂。每个文件必须至少被一个脚本/文档/配置引用，
+    或登记进 ``DEPLOY_ORPHAN_ALLOWLIST`` 并写明原因。
+    """
+
+    DEPLOY_ORPHAN_ALLOWLIST: frozenset[str] = frozenset()
+
+    def _deploy_files(self):
+        base = os.path.join(ROOT, "deploy")
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for filename in sorted(filenames):
+                yield os.path.join(dirpath, filename)
+
+    def _reference_corpus(self, skip_path):
+        for path in _walk_scan_scope():
+            if os.path.abspath(path) == os.path.abspath(skip_path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as handle:
+                    yield os.path.relpath(path, ROOT).replace(os.sep, "/"), handle.read()
+            except OSError:  # pragma: no cover
+                continue
+
+    def test_every_deploy_file_is_referenced(self):
+        corpus = list(self._reference_corpus(
+            os.path.join(ROOT, "backend", "test_repository_hygiene.py")))
+        orphans = []
+        for path in self._deploy_files():
+            rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
+            if rel in self.DEPLOY_ORPHAN_ALLOWLIST:
+                continue
+            basename = os.path.basename(path)
+            if not any(basename in text for _name, text in corpus):
+                orphans.append(rel)
+        self.assertEqual(
+            [], orphans,
+            "deploy/ 下存在无人引用的孤儿文件；删除它，或在 DEPLOY_ORPHAN_ALLOWLIST 里登记原因",
+        )
 
 
 class RemovedArtifactTests(unittest.TestCase):

@@ -193,7 +193,7 @@ docker-compose.yml      本地/单机容器运行
 
 要求：**Python 3.14**（canonical development / CI / container runtime）。Docker 可选。
 
-唯一例外是 `native-centos9` 原生部署 profile：CentOS Stream 9 的默认仓库不提供 3.14，该 profile 仍使用 Python 3.11，属于**明确保留的 legacy 部署例外**，其升级或退役另开独立 PR 处理（见 [`deploy/README.md`](deploy/README.md)）。该例外不得被用来把 3.11 重新引入开发环境、CI、Docker 或测试矩阵。
+唯一例外已消失：原 `native-centos9` 原生部署 profile（曾使用 Python 3.11）已于 **2026-10-20 退役**——生产实际运行的是 4 个容器（Docker profile），该 profile 的 systemd/nginx/cron 制品从未进入仓库，且其 5 分钟时间表与调度契约的 3 分钟冲突。`deploy/install-centos9.sh` 现在只做 fail-fast 说明；服务器部署统一使用 `docker-compose.server.yml` + `deploy/sync-cron.sh`。退役证据与恢复路径见 [`docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md`](docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md)。
 
 ### Windows
 

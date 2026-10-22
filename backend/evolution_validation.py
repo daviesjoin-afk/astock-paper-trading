@@ -175,8 +175,38 @@ def record_ab_snapshots(adaptive_connect, paper_db_path) -> dict:
     return {"deployments": len(deployments), "recorded": recorded}
 
 
+def _active_overlay_deployed_date(params: dict, kind: str) -> str:
+    """账户 params 中"当前生效覆盖"的部署日期（YYYY-MM-DD）。
+
+    ``adaptive_ab_tests`` 只在每日收盘学习时才写入快照，因此同一交易日内
+    刚 apply 的覆盖在快照表里查不到。门禁必须能从 params 直接看到它，
+    否则第二次覆盖会在快照落库前绕过观察期（fail-open）。
+    """
+    if not isinstance(params, dict):
+        return ""
+    if kind == "allocation":
+        overlay = params.get("adaptive_allocation") or {}
+        if isinstance(overlay, dict) and str(overlay.get("status") or "") == "active":
+            return str(overlay.get("applied_at") or overlay.get("effective_date") or "")[:10]
+        return ""
+    meta = params.get("adaptive_selection_meta") or {}
+    if (params.get("adaptive_selection") and isinstance(meta, dict)
+            and str(meta.get("status") or "") == "active"):
+        return str(meta.get("applied_at") or meta.get("effective_date") or "")[:10]
+    return ""
+
+
 def pre_apply_gate(adaptive_connect, paper_db_path, account_id: str, kind: str) -> None:
-    """A 批新通道 apply 前置门禁：上一覆盖仍在观察期则拒绝。"""
+    """A 批新通道 apply 前置门禁：上一覆盖仍在观察期则拒绝。
+
+    观察期证据有两条，都必须看：
+
+    - ``adaptive_ab_tests`` 的 A/B 快照（每日收盘后写入，口径含基线对比）；
+    - 账户 params 里当前生效覆盖的 ``applied_at``（快照尚未落库时的兜底）。
+
+    只看快照会 fail-open：同一天内先 apply 一条覆盖、收盘快照还没写入时，
+    第二次覆盖就能绕过观察期门禁，效果再也无法归因。
+    """
     paper = _paper_connect(paper_db_path)
     try:
         try:
@@ -185,8 +215,27 @@ def pre_apply_gate(adaptive_connect, paper_db_path, account_id: str, kind: str) 
             # NAV 表不可用（极早期账本）：无法计算观察期，放行但学习周期的
             # A/B 快照仍会在数据可用后自动接管验证。
             return
+        live_deployed = ""
+        try:
+            row = paper.execute(
+                "SELECT params FROM paper_accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            if row is not None:
+                live_deployed = _active_overlay_deployed_date(
+                    _loads(row["params"], {}) or {}, kind)
+        except sqlite3.OperationalError:
+            live_deployed = ""
     finally:
         paper.close()
+
+    if live_deployed:
+        live_obs_days = len([d for d, _ in series if d > live_deployed])
+        if live_obs_days < MIN_OBSERVATION_DAYS:
+            raise ValueError(
+                f"账户 {account_id} 当前 {kind} 覆盖部署于 {live_deployed}，仅观察 "
+                f"{live_obs_days}/{MIN_OBSERVATION_DAYS} 个净值日，"
+                "观察期内拒绝新覆盖（否则效果无法归因）")
+
     with adaptive_connect() as conn:
         ensure_schema(conn)
         row = conn.execute(

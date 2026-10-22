@@ -4,7 +4,7 @@
 依赖方向（单向，不可反转）：
 
     adaptive_engine.AdaptiveRunFactProjection      （owner：identity / 可用性 / 核验的 authority）
-    paper_trading.PaperJobRunFactProjection         （owner：同上）
+    paper_job_run_facts.PaperJobRunFactProjection   （owner：同上；模块已自 paper_trading 搬出）
               ↓
     ai_research_runtime_adapter        （本模块：唯一把两个 runtime owner 投影翻译成 typed evidence 的地方）
               ↓
@@ -38,8 +38,8 @@ strategy_research   "策略实验事实" —— runtime 运行失败不是实验
 每个 owner **自己**发布极小核验闭集，本模块只把 owner 的状态词归到 owner-neutral 三态：
 
 ```python
-adaptive_engine   ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES
-paper_trading     PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES
+adaptive_engine      ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES
+paper_job_run_facts  PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES
 ```
 
 归口是一张**完整表**，不是 ``if/else`` 链。每次签发前都做**双向**一致性检查（表必须恰好
@@ -120,6 +120,10 @@ from typing import Any, Mapping
 
 import adaptive_runtime_facts as AE
 import ai_research_contract as ARC
+# typed paper fact 名字（`PaperJobRunFactProjection` / `PAPER_JOB_RUN_*`）的 canonical
+# owner 已是 `paper_job_run_facts`；这里继续经 paper_trading 的 re-export facade 取得 ——
+# INC-29 把本模块的 import 闭集钉死为 {adaptive_runtime_facts, ai_research_contract,
+# paper_trading, typing}，本模块不得再引入第四个根。
 import paper_trading as PT
 
 __all__ = (
@@ -153,7 +157,7 @@ _RUNTIME_OUTCOME_BY_STATUS = {
 #: ``(owner 名, 该 owner 发布的核验闭集)``。用于把归口表的漂移**逐 owner** 归因。
 _OWNER_VERIFICATION_VOCABULARIES = (
     ("adaptive_engine", AE.ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES),
-    ("paper_trading", PT.PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES),
+    ("paper_job_run_facts", PT.PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES),
 )
 
 

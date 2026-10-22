@@ -71,3 +71,7 @@ credentials.json
 security-cleanup/
 replacements.txt
 mailmap.txt
+
+# --- 三端审计的一次性产物（可由 work/_three_end_api_check.py 重新生成）------
+work/_openapi.json
+work/_api_check_out.txt

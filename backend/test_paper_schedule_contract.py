@@ -31,6 +31,8 @@ import ast
 import re
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 BACKEND = Path(__file__).resolve().parent
 ROOT = BACKEND.parent
@@ -263,6 +265,119 @@ class IntradayIntentGuard(unittest.TestCase):
         for start, end in PSch.INTRADAY_WINDOWS:
             expected.update(range(int(start.split(":")[0]), int(end.split(":")[0]) + 1))
         self.assertEqual(set(PSch.INTRADAY_CRON_MINUTES), expected)
+
+
+class WindowsRegistrationFidelityGuard(unittest.TestCase):
+    """Windows 注册器渲染契约的方式必须和 cron 渲染器一致（三端同步）。
+
+    契约给 ``auction`` / ``open`` / ``close`` 声明了 ``retry_clocks``，cron 侧由
+    ``render_cron_lines()`` 逐条渲染。Windows 侧此前只取 ``task.clock``，于是
+    "失败兜底"只存在于 Linux 端 —— 平台间行为不一致，而当时的守卫只断言任务名，
+    抓不到这个缺口。这个测试直接捕获 ``schtasks`` 调用参数，断言每条 retry 都被
+    注册成**独立任务名**（``/TN`` 是主键，同名 + ``/F`` 会覆盖主任务）。
+    """
+
+    def _capture_creates(self):
+        import paper_trading as PT
+
+        captured = []
+
+        def fake_run(args, **_kwargs):
+            captured.append(list(args))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(PT.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(PT.os, "name", "nt"), \
+             mock.patch.object(PT, "schedule_status",
+                               return_value={"installed": True, "tasks": []}):
+            result = PT.install_windows_schedule()
+        self.assertTrue(result["ok"], result.get("errors"))
+        return [args for args in captured if "/Create" in args]
+
+    def test_every_retry_clock_is_registered_as_a_distinct_task(self):
+        creates = self._capture_creates()
+        names = [args[args.index("/TN") + 1] for args in creates]
+        clocks = [args[args.index("/ST") + 1] for args in creates]
+        self.assertEqual(
+            len(names), len(set(names)),
+            "schtasks 任务名必须唯一：同名 + /F 会覆盖主任务而不是追加一条重试",
+        )
+        for task in PSch.SCHEDULE_TASKS:
+            for clock in task.retry_clocks:
+                self.assertIn(
+                    clock, clocks,
+                    f"{task.name} 的重试 {clock} 没有注册到 Windows —— "
+                    "cron 渲染器会渲染它，两端会因此行为不一致",
+                )
+        # 主任务仍然全部注册，retry 只是追加而不是替换。
+        self.assertEqual(set(PSch.SCHEDULE_TASK_NAMES) - set(names), set())
+
+    def test_repeat_window_is_only_applied_to_the_primary_intraday_task(self):
+        creates = self._capture_creates()
+        by_name = {args[args.index("/TN") + 1]: args for args in creates}
+        for task in PSch.SCHEDULE_TASKS:
+            primary = by_name[task.name]
+            self.assertEqual("/RI" in primary, bool(task.repeat),
+                             f"{task.name} 的重复窗口标记与契约不一致")
+            for index, _clock in enumerate(task.retry_clocks, start=1):
+                retry = by_name[f"{task.name}-重试{index}"]
+                self.assertNotIn("/RI", retry, "一次性重试任务不能带重复窗口")
+                self.assertNotIn("/DU", retry, "一次性重试任务不能带重复窗口")
+
+
+class ScheduleStatusProbeTests(unittest.TestCase):
+    """schedule_status 的探测口径必须可证明，且 Docker profile 下探测正确的文件。
+
+    历史缺陷：Linux 端默认探测 ``/etc/cron.d/astock-quant``（native profile），
+    而生产是 Docker profile（``deploy/sync-cron.sh`` 安装 ``/etc/cron.d/astock-codex``），
+    于是生产上 ``installed`` 永远 False，提示还指向已退役的 install-centos9.sh。
+
+    测试直接打纯逻辑 ``_schedule_probe``（依赖全部注入），不 patch 模块级
+    ``schedule_status``——全量套件里 ``test_operator_boundary`` 会在 import 时把它
+    换成静态桩（Windows 沙箱禁用 schtasks），依赖全局状态会让测试与导入顺序耦合。
+    """
+
+    @staticmethod
+    def _probe(*, os_name, schedule_file, file_exists):
+        import paper_trading as PT
+        return PT._schedule_probe(
+            list(PSch.SCHEDULE_TASK_NAMES),
+            os_name=os_name,
+            schedule_file=schedule_file,
+            run=lambda *args, **kwargs: SimpleNamespace(
+                returncode=0, stdout="", stderr=""),
+            isfile=lambda path: file_exists,
+        )
+
+    def test_linux_probes_the_docker_profile_cron_file(self):
+        found, probe_mode, used = self._probe(
+            os_name="posix", schedule_file="/etc/cron.d/astock-codex", file_exists=True)
+        self.assertEqual(probe_mode, "file_exists")
+        self.assertEqual(used, "/etc/cron.d/astock-codex")
+        self.assertEqual(found, list(PSch.SCHEDULE_TASK_NAMES))
+
+    def test_linux_missing_file_is_reported_as_not_installed(self):
+        found, probe_mode, _used = self._probe(
+            os_name="posix", schedule_file="/etc/cron.d/astock-codex", file_exists=False)
+        self.assertEqual(probe_mode, "file_exists")
+        self.assertEqual(found, [])
+
+    def test_windows_probe_mode_is_schtasks(self):
+        found, probe_mode, _used = self._probe(
+            os_name="nt", schedule_file="ignored", file_exists=False)
+        self.assertEqual(probe_mode, "schtasks")
+        self.assertEqual(found, list(PSch.SCHEDULE_TASK_NAMES))
+
+    def test_linux_install_message_points_at_the_docker_profile(self):
+        import paper_trading as PT
+
+        with mock.patch.object(PT.os, "name", "posix"), \
+             mock.patch.object(PT, "schedule_status", return_value={
+                 "installed": False, "schedule_file": "/etc/cron.d/astock-codex"}):
+            result = PT.install_platform_schedule()
+        self.assertFalse(result["ok"])
+        self.assertIn("deploy/sync-cron.sh", result["message"])
+        self.assertNotIn("install-centos9.sh", result["message"])
 
 
 if __name__ == "__main__":

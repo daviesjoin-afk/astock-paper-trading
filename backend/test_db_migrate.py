@@ -281,3 +281,93 @@ class DbMigrateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GbkConsoleMigrationTests(unittest.TestCase):
+    """Windows 默认控制台（GBK/cp936）不能编码 ✓/✗ —— 迁移结果不能因此改变。
+
+    真实故障：``migrate`` 在 ``commit`` 之后打印 ✓，在 ``except`` 里打印 ✗ 再 raise。
+    GBK 控制台上这两个 print 都抛 UnicodeEncodeError，于是"已提交成功"被报成失败，
+    真实异常还被编码异常替换掉。CI 跑 UTF-8 Linux，永远抓不到。
+    """
+
+    class _GbkConsole:
+        encoding = "gbk"
+
+        def __init__(self):
+            self.written = []
+
+        def write(self, text):
+            text.encode("gbk")  # 与真实 GBK 控制台一样：不可编码即抛 UnicodeEncodeError
+            self.written.append(text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+    def _legacy_schema(self, directory):
+        path = os.path.join(directory, "paper.sqlite3")
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, status TEXT);
+            CREATE TABLE paper_position_lots(id INTEGER PRIMARY KEY, cost REAL, qty INTEGER);
+            CREATE TABLE paper_positions(account_id TEXT, code TEXT, qty INTEGER);
+            CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, initial_cash REAL, cash REAL);
+            CREATE TABLE paper_jobs(slot TEXT, market_date TEXT, started_at TEXT);
+            CREATE TABLE paper_job_runs(run_key TEXT PRIMARY KEY, started_at TEXT);
+            CREATE TABLE paper_runtime_locks(lock_key TEXT PRIMARY KEY, acquired_at TEXT, expires_at TEXT);
+            CREATE TABLE paper_nav(account_id TEXT, nav_date TEXT);
+            """
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_migration_completes_on_a_console_that_cannot_encode_checkmarks(self):
+        latest_version = max(item[0] for item in db_migrate.MIGRATIONS["paper_trading"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._legacy_schema(directory)
+            console = self._GbkConsole()
+            with redirect_stdout(console):
+                db_migrate.migrate("paper_trading", path=path)
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT version FROM schema_version WHERE db_name='paper_trading'"
+                    ).fetchone()[0],
+                    latest_version,
+                )
+            finally:
+                conn.close()
+            output = "".join(console.written)
+            self.assertIn("[paper_trading]", output)
+            # ✓ 在 GBK 控制台上退化成 \\u2713 文本，而不是让迁移失败。
+            self.assertIn("u2713", output)
+
+    def test_failure_print_does_not_mask_the_real_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._legacy_schema(directory)
+            original = db_migrate.MIGRATIONS["paper_trading"]
+            latest_version = max(item[0] for item in original)
+
+            def fail(conn):
+                raise RuntimeError("migration failed")
+
+            db_migrate.MIGRATIONS["paper_trading"] = [
+                *original, (latest_version + 1, "故意失败", fail),
+            ]
+            try:
+                console = self._GbkConsole()
+                with self.assertRaisesRegex(RuntimeError, "migration failed"), \
+                        redirect_stdout(console):
+                    db_migrate.migrate("paper_trading", path=path)
+            finally:
+                db_migrate.MIGRATIONS["paper_trading"] = original
+            output = "".join(console.written)
+            self.assertIn("u2717", output)  # ✗ 退化为转义文本
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -146,3 +146,22 @@ body.dark .section-note { background:var(--surface-hover); }
   .paper-position-row,.paper-order-row{grid-template-columns:1fr}.paper-position-symbol,.paper-position-row .paper-mini-btn{grid-column:auto}.paper-filter-bar select,.paper-filter-bar input{max-width:none;flex:1}.page-header{display:block}
   .module-tabs{overflow-x:auto;flex-wrap:nowrap}.module-tab{min-height:44px;white-space:nowrap}.paper-risk-metrics,.paper-risk-factor-list,.paper-risk-position{grid-template-columns:1fr}.paper-risk-position > div{grid-column:auto}
 }
+
+/* 调度状态条：只展示后端已发布的事实。
+   Windows = 逐个计划任务真实探测；Linux = 只能证明调度文件存在。
+   文案由 features/paper.js 的 paperScheduleStatusLine 生成。 */
+.paper-schedule-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-light, rgba(127, 127, 127, .25));
+  border-radius: 12px;
+  background: rgba(127, 127, 127, .06);
+}
+.paper-schedule-status small {
+  color: var(--text-secondary, #6b7280);
+  font-size: 12px;
+}

@@ -582,14 +582,14 @@ def _collect_typed_events(purpose, adaptive_conn, paper_db_path, context):
     # Local imports avoid an adaptive_engine ↔ deepseek_research import cycle.
     if purpose == "incident_triage":
         import adaptive_runtime_facts as AE
-        import paper_trading as PT
+        import paper_job_run_facts as PJF
         import ai_research_runtime_adapter as RTA
         adaptive_facts = AE.adaptive_run_facts(
             adaptive_conn, as_of=context.asof_day, limit=12,
         )
         paper = _paper(paper_db_path)
         try:
-            paper_facts = PT.paper_job_run_facts(
+            paper_facts = PJF.paper_job_run_facts(
                 paper, as_of=context.asof_day, limit=12,
             )
         finally:

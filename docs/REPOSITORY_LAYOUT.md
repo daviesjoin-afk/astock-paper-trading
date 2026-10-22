@@ -13,7 +13,7 @@ frontend/dist/      **构建产物（提交物）**：由 esbuild 打包，服�
 frontend/e2e/       Playwright 浏览器 E2E（合成数据 server.py + specs/ 关键旅程）
 docs/               运行手册、设置 PRD、策略平台、自进化、测试矩阵、发布说明、本文件
 docs/archive/       已完成的历史计划与快照（只作追溯）
-deploy/             服务器脚本（备份/恢复/健康检查/cron）；`native-centos9` 原生 profile 是 Python 3.14 canonical runtime 的唯一 legacy 例外（仍用 3.11）
+deploy/             服务器脚本（备份/恢复/健康检查/cron）；唯一受支持 profile 是 `docker-compose-server`（`native-centos9` 已于 2026-10-20 退役，见 docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md）
 .github/workflows/  CI（语法、ruff、锁文件、pip-audit、前端、后端测试 Python 3.14、浏览器 E2E、Docker 冒烟）
 Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 ```
@@ -176,7 +176,11 @@ migration **v35** 新增 `experiment_search_runs` / `experiment_search_jobs` /
 - **纯计算**：`paper_allocation`（共享池席位/预算）、`paper_sizing`（股数）、
   `paper_performance`（盈亏）、`paper_portfolio`（lot 聚合）、`paper_trading_rules`
   （交易日/费用/证券权限）、`paper_quote_policy`（行情新鲜度与成交核验门禁）
-- **只读投影**：`paper_archive_projection`、`paper_ledger_reader`
+- **只读投影**：`paper_archive_projection`、`paper_ledger_reader`、
+  `paper_job_run_facts`（`paper_job_runs` attempt 级 typed owner fact 的**只读**读侧；
+  lifecycle writer 仍是 `paper_trading`，后者保留 re-export facade）
+- **调度契约**：`paper_schedule_contract`（slot 词表 / 热路径 / 任务表 / cron 渲染的单一事实来源，
+  零项目导入、零 DB、零子进程、零文件系统；四类消费者从它派生）
 - **研究/选股**：`paper_selection`、`paper_research`、`paper_replay_regression`
 
 ### 5. 数据层与其他

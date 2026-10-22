@@ -8,6 +8,7 @@ import { loadPaper } from "./features/paper.js";
 import { loadPaperRisk } from "./features/risk.js";
 import { loadDataValidity, loadMarketGate, loadStrategies } from "./features/selection.js";
 import { normalizeActiveStrategyCopy } from "./features/strategies.js";
+import { confirmDialog, toast } from "./ui/dialog.js";
 
 window.__ASTOCK_ADAPTIVE_UI_BUILD__='20261012-runtime-followup';
 
@@ -24,28 +25,62 @@ window.addEventListener('popstate',restoreAppNavigation);
 
 window.addEventListener('resize',syncWorkspaceTabRails,{passive:true});
 
+/* 这四个人工批准/回滚入口此前用浏览器原生 window.confirm + alert：
+   原生弹窗会阻塞 JS 线程（图表/轮询一起卡住）、无法样式化、在部分嵌入式
+   WebView 里会被静默抑制，而且与 ui/dialog.js「应用内唯一对话框层」的既有
+   设计冲突。这里改为同一套 confirmDialog / toast，错误文案仍原样展示后端 detail。 */
 window.applyAdaptiveAllocation=async function(decisionId){
-  if(!window.confirm('确认把 Bandit 决策 #'+decisionId+' 的策略权重应用为共享资金池分摊？'))return;
-  try{renderAdaptive(await apiPost('/api/adaptive/allocation/apply?decision_id='+decisionId+'&approved_by=human-ui&confirmed=true'));}
-  catch(e){alert('应用失败：'+(e.message||e));}
+  var approved=await confirmDialog({
+    kicker:'人工确认 · 资金分摊',
+    title:'应用 Bandit 决策 #'+decisionId+' 的策略权重？',
+    detail:'把该决策的策略权重应用为共享资金池分摊覆盖。仅作用于模拟盘。',
+    bullets:['不会连接券商、不会发送真实订单。'],
+    confirmText:'应用分摊',
+  });
+  if(!approved.approved) return;
+  try{renderAdaptive(await apiPost('/api/adaptive/allocation/apply?decision_id='+encodeURIComponent(decisionId)+'&approved_by=human-ui&confirmed=true'));}
+  catch(e){toast('应用失败：'+(e.message||e),{tone:'danger'});}
 };
 
 window.rollbackAdaptiveAllocation=async function(accountId){
-  if(!window.confirm('确认回滚 '+accountId+' 的资金分摊覆盖到上一版？'))return;
+  var approved=await confirmDialog({
+    kicker:'人工确认 · 资金分摊',
+    title:'回滚 '+accountId+' 的资金分摊覆盖？',
+    detail:'把该账户的资金分摊恢复到上一版覆盖。仅作用于模拟盘。',
+    bullets:['不会连接券商、不会发送真实订单。'],
+    confirmText:'回滚分摊',
+    danger:true,
+  });
+  if(!approved.approved) return;
   try{renderAdaptive(await apiPost('/api/adaptive/allocation/rollback?account_id='+encodeURIComponent(accountId)+'&confirmed=true'));}
-  catch(e){alert('回滚失败：'+(e.message||e));}
+  catch(e){toast('回滚失败：'+(e.message||e),{tone:'danger'});}
 };
 
 window.applyAdaptiveTunerProposal=async function(runId){
-  if(!window.confirm('确认把双AI共识运行 #'+runId+' 的提案应用为选股因子覆盖？'))return;
-  try{await apiPost('/api/adaptive/tuner/apply?run_id='+runId+'&approved_by=human-ui&confirmed=true');await loadEvolutionStatus();}
-  catch(e){alert('应用失败：'+(e.message||e));}
+  var approved=await confirmDialog({
+    kicker:'人工确认 · AI 调参',
+    title:'应用双AI共识运行 #'+runId+' 的提案？',
+    detail:'把该运行的提案应用为选股因子覆盖。仅作用于模拟盘。',
+    bullets:['不会连接券商、不会发送真实订单。'],
+    confirmText:'应用提案',
+  });
+  if(!approved.approved) return;
+  try{await apiPost('/api/adaptive/tuner/apply?run_id='+encodeURIComponent(runId)+'&approved_by=human-ui&confirmed=true');await loadEvolutionStatus();}
+  catch(e){toast('应用失败：'+(e.message||e),{tone:'danger'});}
 };
 
 window.rollbackAdaptiveTunerOverlay=async function(accountId){
-  if(!window.confirm('确认回滚 '+accountId+' 的 AI 调参覆盖到 apply 前状态？'))return;
+  var approved=await confirmDialog({
+    kicker:'人工确认 · AI 调参',
+    title:'回滚 '+accountId+' 的 AI 调参覆盖？',
+    detail:'把该账户的 AI 调参覆盖恢复到 apply 前状态。仅作用于模拟盘。',
+    bullets:['不会连接券商、不会发送真实订单。'],
+    confirmText:'回滚覆盖',
+    danger:true,
+  });
+  if(!approved.approved) return;
   try{await apiPost('/api/adaptive/tuner/rollback?account_id='+encodeURIComponent(accountId)+'&confirmed=true');await loadEvolutionStatus();}
-  catch(e){alert('回滚失败：'+(e.message||e));}
+  catch(e){toast('回滚失败：'+(e.message||e),{tone:'danger'});}
 };
 
 /* 页面加载时自动执行 */

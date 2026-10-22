@@ -1,136 +1,99 @@
-# CentOS Stream 9 部署说明
+# 服务器部署说明（Docker profile）
 
-本项目有两个互斥的部署 profile。先选定 profile，再使用对应的服务、数据目录
-和调度文件；不要在同一台机器上同时运行两套调度器。
+本仓库的服务器部署只有**一个受支持的 profile**：`docker-compose-server`。
+`native-centos9` 原生 profile 已于 **2026-10-20 退役**，`install-centos9.sh` 只保留
+fail-fast 说明（`exit 3`），不再安装任何东西。退役证据与恢复路径见
+[`docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md`](../docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md)。
 
 | Profile | 服务/数据目录 | 调度文件 | 日内频率 | 入口 |
 | --- | --- | --- | --- | --- |
-| `native-centos9` | `/opt/astock-quant`，systemd `astock-quant` | `/etc/cron.d/astock-quant` | 5 分钟 | 本文的 `install-centos9.sh` |
-| `docker-compose-server` | `/opt/astock-codex`，`astock-codex`/worker 容器 | `/etc/cron.d/astock-codex` | 3 分钟 | `docker-compose.server.yml` + `astock-codex.cron` |
-
-`install-centos9.sh` 只安装 `native-centos9`。它不会把原生 profile 变成 Docker
-profile，也不会改变 8600 端口的访问或鉴权方式。Docker profile 的 3 分钟调度必须
-沿用 `deploy/astock-codex.cron`，不要用本文脚本代替。
-
-目标规格：2 核 CPU、2GB 内存、50GB 系统盘。该文档只适用于 native CentOS profile；
-Docker 生产 profile 请使用 `docker-compose.server.yml` 与 `astock-codex.cron`，不要混装两套 cron。
-该规格适合单人使用，但应保持
-一个 Uvicorn worker；Pandas 数据与进程内缓存会在多 worker 间重复占用内存。
-
-## Python 运行时
-
-本 profile 是项目 canonical Python 3.14 runtime 的**唯一明确例外**。CentOS Stream 9
-的默认仓库不提供 3.14，因此 `install-centos9.sh` 仍然安装 `python3.11` 并用它建立 venv。
-
-它的状态是 **isolated legacy deployment exception**：既不是第二个 canonical runtime
-baseline，也不是 PR 兼容 lane。该 profile 的升级或退役将在后续独立的部署 profile 变更
-中处理。不要因为本 profile 仍在使用 3.11，就把 Python 3.11 重新引入开发环境、
-GitHub CI、Docker 镜像或测试矩阵。
+| `docker-compose-server`（唯一受支持） | `/opt/astock-codex`，容器 `astock-codex` / `astock-data-worker` / `astock-task-worker` / `astock-paper-worker` | `/etc/cron.d/astock-codex` | 3 分钟 | `docker-compose.server.yml` + `deploy/sync-cron.sh` |
+| `native-centos9`（**已退役**） | ~~`/opt/astock-quant`，systemd `astock-quant`~~ | ~~`/etc/cron.d/astock-quant`~~ | ~~5 分钟~~ | ~~`install-centos9.sh`~~（现在只 fail-fast） |
 
 ## 架构
 
-- Nginx 对外监听 80，提供 Basic Auth、限流、压缩和静态首页。
-- Uvicorn 仅监听 `127.0.0.1:8600`，不直接暴露到公网。
-- systemd 负责开机启动、异常重启与内存上限。
-- cron 按上海时区执行模拟盘日内监控、开盘、风控、收盘和周复盘。
-- 数值计算线程固定为 1，避免 2 核机器上 BLAS 线程争抢。
+- Nginx（宿主机或容器侧）对外提供 Basic Auth、限流、压缩与静态首页；
+- Uvicorn 只监听回环/容器网络，不直接暴露公网；
+- 容器由 compose 管理：API、数据 worker、任务 worker、paper worker 各自独立 cgroup；
+- cron 按上海时区执行模拟盘日内监控、开盘、风控、收盘、周复盘与自进化闭环；
+- 数值计算线程固定为 1，避免小机器上 BLAS 线程争抢。
 
-## Profile 检查与迁移
-
-原生安装脚本默认使用 `native-centos9`，也可以显式指定：
+## 首次上线 / 更新
 
 ```bash
-ASTOCK_DEPLOY_PROFILE=native-centos9 \
-  sudo -E bash deploy/install-centos9.sh
-```
+# 1) 上传源码到服务器（保留 .git 可选；构建身份用 ASTOCK_GIT_COMMIT 显式传入）
+rsync -av --exclude-from=deploy/rsync-exclude.txt ./ root@服务器IP:/opt/astock-codex/
 
-脚本会在安装包和覆盖文件前检查 Docker profile。若发现运行中的
-`astock-codex`、`astock-task-worker` 或 `astock-data-worker`，会直接停止并要求先
-停止 Docker 服务；若发现 `/etc/cron.d/astock-codex`，也会要求显式确认迁移，不会
-静默删除 Docker 调度。
-
-确认从 Docker 迁移到原生 profile 时，先停止 Docker 服务并确认数据备份，再执行：
-
-```bash
+# 2) 构建并启动
 cd /opt/astock-codex
-docker compose -f docker-compose.server.yml down
-ASTOCK_DEPLOY_PROFILE=native-centos9 \
-ASTOCK_MIGRATE_DOCKER_TO_NATIVE=1 \
-  sudo -E bash deploy/install-centos9.sh
+docker compose -f docker-compose.server.yml up -d --build
+
+# 3) 同步 cron（模板里的路径跟随实际部署根目录；备份不会留在 /etc/cron.d）
+sudo bash deploy/sync-cron.sh
 ```
 
-迁移完成后应只存在 `/etc/cron.d/astock-quant`。反向迁移时不要运行
-`install-centos9.sh`，应使用 Docker compose 部署流程，并只安装
-`/etc/cron.d/astock-codex`。可用下面的检查确认没有双调度：
+更新时重复第 2、3 步即可；`deploy/deploy.sh` 把「备份 → 构建 → 重启 → schema 迁移 →
+cron 同步 → 健康检查」串成一条流程。备份/恢复/健康检查脚本：
 
 ```bash
-sudo ls -l /etc/cron.d/astock-codex /etc/cron.d/astock-quant 2>/dev/null || true
-docker ps --format '{{.Names}}'
+sudo bash deploy/backup.sh --keep 7     # SQLite 在线备份 + 压缩 + 清单校验
+sudo bash deploy/restore.sh <backup>    # 还原前完整性检查，失败恢复
+sudo bash deploy/healthcheck.sh         # curl 127.0.0.1:8600/api/health
 ```
 
-## 首次上线
+## 调度契约（三端单一事实来源）
 
-先将项目上传到服务器临时目录：
+`backend/paper_schedule_contract.py` 是 slot 词表、热路径、任务表与 cron 渲染的唯一来源：
 
-```bash
-rsync -av --exclude-from=deploy/rsync-exclude.txt ./ root@服务器IP:/tmp/astock-quant/
-```
+- `deploy/astock-codex.cron` 是契约的渲染结果，`deploy/sync-cron.sh` 负责安装；
+- 盘后自进化闭环由 `deploy/run_evolution_loop.sh` 串行化（内置 `flock -w 180`，
+  cron 在 16:45 / 17:05 / 17:35 三个窗口重试；runner 自带交易日与"当天已完成"守卫）；
+- Windows 本地模式由 `paper_trading.install_windows_schedule` 从同一张表注册
+  （含 `retry_clocks` 的独立重试任务）；
+- 改调度**只改契约模块**，然后同步 cron 文件；`backend/test_paper_schedule_contract.py`
+  会把两边展开成具体触发时刻做语义比对，并断言 Windows 侧渲染了同样的重试。
 
-在服务器执行：
+`/api/paper/overview` 下发的 `schedule_status` 同时给出 `probe_mode`：
+Windows 是逐任务真实探测（`schtasks`），Linux 只能证明调度文件存在（`file_exists`）。
+界面按这个口径措辞，不把"文件存在"说成"已安装运行"。
 
-```bash
-cd /tmp/astock-quant
-# 在上传源码前，从本地源码仓库运行 git rev-parse HEAD，使用其完整 40 位输出。
-ASTOCK_GIT_COMMIT='<本地 git rev-parse HEAD 的完整输出>' \
-ASTOCK_ADMIN_USER=admin ASTOCK_ADMIN_PASSWORD='替换为强密码' \
-  sudo -E bash deploy/install-centos9.sh
-```
+## 2GB 内存机器的运行原则
 
-安装器会把该 SHA 写入 systemd 服务配置，使 native API 进程使用与上传源码对应的
-完整构建身份。缺少或格式不正确时安装会停止，不会使用短 SHA 或 `unknown`。
+- 不增加 Uvicorn worker；选股重计算由应用锁合并。
+- 若确认没有 swap，可额外配置 1–2GB swap 作为 OOM 保险；swap 不是性能优化。
+- 仓库提供可选的 swap 单元 [`astock-codex-swap.service`](astock-codex-swap.service)：
+  它 `swapon /opt/astock-codex/.swapfile`（需先自行 `fallocate` 创建该文件），
+  在 `docker.service` 之前生效。启用方式：
 
-默认不会修改防火墙。请先在云安全组把 TCP 80 的来源限制为你自己的固定出口
-IP，再执行：
+  ```bash
+  sudo install -m 0644 deploy/astock-codex-swap.service /etc/systemd/system/
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now astock-codex-swap
+  ```
 
-```bash
-sudo firewall-cmd --permanent --add-service=http
-sudo firewall-cmd --reload
-```
-
-不要将 8600 端口加入云安全组或 firewalld。没有域名时，HTTP Basic Auth 的登录
-信息不会被 TLS 加密，因此必须使用来源 IP 白名单；准备域名后应升级为 HTTPS。
+- 首次导入全市场历史数据应在非交易时段进行，避免与模拟盘监控争抢资源。
+- `MemoryHigh=900M` / `MemoryMax=1200M` 的容器内存上限见 `docker-compose.server.yml`。
 
 ## 验证
 
 ```bash
-sudo bash /opt/astock-quant/deploy/healthcheck.sh
-sudo systemctl status astock-quant nginx crond
-sudo journalctl -u astock-quant -n 100 --no-pager
-sudo tail -n 100 /var/log/astock-quant-scheduler.log
-curl -u "$ASTOCK_ADMIN_USER:$ASTOCK_ADMIN_PASSWORD" -I http://<SERVER_HOST>/
+docker compose -f docker-compose.server.yml ps
+curl -fsS http://127.0.0.1:8600/api/health
+sudo ls -l /etc/cron.d/astock-codex
+sudo tail -n 100 /opt/astock-codex/reports/scheduler.log
 ```
 
-持续观察资源：
+可选健康告警（磁盘 / 内存 / 容器健康 / API / 数据库膨胀 / scheduler 错误）：
 
 ```bash
-systemd-cgtop
-sudo journalctl -u astock-quant -f
+sudo bash deploy/health-alert.sh      # 0=健康，1=有告警；告警写入 reports/health-alert.log
+# 探测地址可用 ASTOCK_HEALTH_URL 覆盖（默认 http://127.0.0.1:8600/api/health）
 ```
 
-## 2GB 内存机器的运行原则
+可以把它挂到 cron，例如每 10 分钟一次：`*/10 * * * * root /opt/astock-codex/deploy/health-alert.sh`。
 
-- 不增加 Uvicorn worker；当前同步接口由线程池承载，选股重计算会被应用锁合并。
-- 先使用现有 2GB 内存。若确认没有 swap，可额外配置 1–2GB swap 作为 OOM
-  保险，但 swap 不是性能优化，不能代替内存监控。
-- 首次导入全市场历史数据应在非交易时段进行，避免和模拟盘监控争抢资源。
-- `MemoryHigh=900M` 会先触发回收压力，`MemoryMax=1200M` 防止单服务拖垮整机。
+## 安全边界
 
-## 更新
-
-上传新版本后重新运行安装脚本即可更新代码和依赖；脚本不会删除现有
-`data_cache`、模拟盘数据库或报告目录。更新前仍建议备份：
-
-```bash
-sudo tar -C /opt/astock-quant -czf /var/backups/astock-data-backup.tgz data_cache reports
-```
-
+- 服务器模式必须配置 `ASTOCK_OPERATOR_TOKEN`（>= 8 字符）；未配置时只有本机环回 +
+  本地 Host 可写。反向代理必须保留 `host:port`（nginx 用 `$http_host`）。
+- 云安全组只放行你自己的固定出口 IP 访问对外端口；没有 TLS 时 Basic Auth 凭据不会加密。

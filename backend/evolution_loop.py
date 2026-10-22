@@ -164,6 +164,51 @@ class Backend:
         raise NotImplementedError
 
 
+def _generation_candidate(conn, generation):
+    """本代已经落库的候选行（``id``, ``validation_state``），没有则 ``None``。
+
+    ``loop_generation`` 是崩溃窗口的幂等键：``SE.evolve()`` 内部先 commit 候选行，
+    若进程在引擎把 ``candidate_params_id`` 写回 state 之前死掉，续跑会再次进入
+    mutate。按代号复用既有候选，而不是生成第二条。
+    """
+    try:
+        return conn.execute(
+            "SELECT id, validation_state FROM evolution_params "
+            "WHERE loop_generation=? ORDER BY id DESC LIMIT 1",
+            (int(generation),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # 旧库尚未补齐 loop_generation 列：交给 SE.create_candidate 的迁移路径。
+        return None
+
+
+def _candidate_by_id(conn, params_id):
+    try:
+        return conn.execute(
+            "SELECT id, validation_state FROM evolution_params WHERE id=?",
+            (int(params_id),),
+        ).fetchone()
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return None
+
+
+def _checkpoint_candidate(conn, generation, params_id, validation_state):
+    """候选一落库就把 id 写回 loop state（而不是等阶段返回后再写）。
+
+    ``SE.evolve()`` 返回前已经 commit 了候选行；这段检查点把"候选已存在"这个
+    事实也持久化。崩溃后续跑时 mutate 直接复用，不依赖 should_evolve 的冷却窗口
+    碰巧把重跑挡掉。部分唯一索引 ``idx_evolution_params_loop_generation`` 是并发
+    重入的最后一道闸。
+    """
+    conn.execute(
+        "UPDATE evolution_loop_state SET candidate_params_id=?, "
+        "candidate_validation_state=?, candidate_pending_activation=1, updated_at=? "
+        "WHERE generation=?",
+        (int(params_id), validation_state, _now(), int(generation)),
+    )
+    conn.commit()
+
+
 class ProductionBackend(Backend):
     """纯 SQLite 生产适配器：直接复用 self_evolution，不触发 AI / 网络。
 
@@ -194,9 +239,43 @@ class ProductionBackend(Backend):
 
     def mutate(self, conn, generation, ctx=None):
         import self_evolution as SE
+        ctx = ctx or {}
         cur = SE.get_current_params(conn)
         active_id = cur["id"]
-        result = SE.auto_evolve_if_needed(conn)
+
+        def _reused(row):
+            """复用本代已落库的候选：返回与"刚生成"同形状的结果，但不产新行。"""
+            _checkpoint_candidate(conn, generation, row[0], row[1])
+            return {
+                "mutated": True,
+                "reused": True,
+                "params_id": active_id,
+                "active_params_id": active_id,
+                "candidate_params_id": int(row[0]),
+                "candidate_created": True,
+                "candidate_validation_state": row[1],
+                "candidate_pending_activation": True,
+                "adjustments": [],
+                "changed_keys": [],
+            }
+
+        # 崩溃窗口幂等：上一轮候选已经 commit，但 id 没来得及写回 state 时，
+        # 续跑会重进 mutate。先按 loop_generation 找，再按 state 里已记录的 id 复核。
+        existing = _generation_candidate(conn, generation)
+        if existing is None and ctx.get("candidate_params_id") is not None:
+            existing = _candidate_by_id(conn, ctx.get("candidate_params_id"))
+        if existing is not None:
+            return _reused(existing)
+
+        try:
+            result = SE.auto_evolve_if_needed(conn, generation=generation)
+        except sqlite3.IntegrityError:
+            # 并发/重入被部分唯一索引拦下：读取已存在的那一条并复用。
+            existing = _generation_candidate(conn, generation)
+            if existing is None:
+                raise
+            return _reused(existing)
+
         # 自动进化只生成候选，绝不激活。这里回填的必须是"仍然生效的"参数 id：
         # 把候选 id 写进 params_id_end 会让代际快照看起来像是已经生效了，
         # 那正是 latest row == active 的老毛病。
@@ -210,6 +289,9 @@ class ProductionBackend(Backend):
                 "candidate_pending_activation": False,
             }
         cand_id = result.get("new_params_id")
+        if cand_id is not None:
+            # 候选已 commit：立刻落检查点，缩小"已产候选但 state 未记录"的窗口。
+            _checkpoint_candidate(conn, generation, cand_id, result.get("validation_state"))
         return {
             "mutated": True,
             "params_id": active_id,
@@ -407,6 +489,13 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
         (generation,),
     ).fetchone()
     done_stages = _loads(row[0], []) if row else []
+    if not isinstance(done_stages, list):
+        done_stages = []
+    # 崩溃窗口自愈：阶段产物已提交、但终态 UPDATE 尚未提交时，done_stages 里
+    # 可能已经含全部阶段（旧版本还可能把同一阶段重复追加）。这里统一按 STAGES
+    # 顺序去重，否则 len(done_stages) 虚高会让"已完成的代"被误判成 interrupted
+    # 并从头重跑 observe/mutate/apply。
+    done_stages = [stage for stage in STAGES if stage in done_stages]
     attempts = row[1] if row else 1
     params_id_start = row[2] if row else None
     # 中断续跑时重建 observe 世界态，避免 evaluate 等后续阶段误判"样本不足"。
@@ -440,7 +529,13 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
     stages_failed = 0
     stages_skipped = 0
 
-    ordered = STAGES[(STAGES.index(resume_from) if resume_from in STAGES else 0):]
+    if resume_from in STAGES:
+        ordered = STAGES[STAGES.index(resume_from):]
+    else:
+        # 没有显式续跑起点时，只补跑"尚未完成"的阶段。全部阶段都已完成时
+        # ordered 为空，本次调用只补写终态（completed）—— 绝不重跑
+        # observe/mutate/apply 这类一次性或有副作用的阶段。
+        ordered = [stage for stage in STAGES if stage not in done_stages]
     upstream_failed = False
     upstream_failure_stage = None
 
@@ -571,37 +666,55 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
 
     # 写逐代快照（intelligence + 改进）。
     intel = _num(ctx.get("intelligence_score"))
-    prev = conn.execute(
-        "SELECT intelligence_score FROM evolution_generation ORDER BY generation DESC LIMIT 1"
-    ).fetchone()
-    prev_score = _num(prev[0]) if prev and prev[0] is not None else None
-    improvement = (intel - prev_score) if (intel is not None and prev_score is not None) else None
-    conn.execute(
-        """INSERT OR REPLACE INTO evolution_generation(
-            generation, params_id_start, params_id_end, mutation_summary,
-            eval_before, eval_after, intelligence_score, improvement, created_at)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (generation, params_id_start, ctx.get("params_id_end") or params_id_start,
-         _json({
-             "stages_done": done_stages,
-             "stages_skipped": stages_skipped,
-             "stages_failed": stages_failed,
-             "candidate_params_id": ctx.get("candidate_params_id"),
-             "candidate_validation_state": ctx.get("candidate_validation_state"),
-             "candidate_created": ctx.get("candidate_created", False),
-             "candidate_pending_activation": ctx.get("candidate_pending_activation", False),
-         }),
-         _json({"prev_intelligence": prev_score}),
-         _json({"intelligence": intel}),
-         intel, improvement, finished),
-    )
+    improvement = None
+    prev_score = None
+    # 纯终态补写（ordered 为空：没有任何阶段被重跑）时保留既有逐代快照，
+    # 否则会把上一轮已记录好的 intelligence_score / improvement 覆盖成空值。
+    existing_snapshot = None
+    if not ordered:
+        existing_snapshot = conn.execute(
+            "SELECT intelligence_score, improvement FROM evolution_generation WHERE generation=?",
+            (generation,),
+        ).fetchone()
+    if existing_snapshot is not None:
+        if intel is None:
+            intel = _num(existing_snapshot[0])
+        improvement = _num(existing_snapshot[1])
+    else:
+        prev = conn.execute(
+            "SELECT intelligence_score FROM evolution_generation WHERE generation<? "
+            "ORDER BY generation DESC LIMIT 1",
+            (generation,),
+        ).fetchone()
+        prev_score = _num(prev[0]) if prev and prev[0] is not None else None
+        improvement = (intel - prev_score) if (intel is not None and prev_score is not None) else None
+        conn.execute(
+            """INSERT OR REPLACE INTO evolution_generation(
+                generation, params_id_start, params_id_end, mutation_summary,
+                eval_before, eval_after, intelligence_score, improvement, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (generation, params_id_start, ctx.get("params_id_end") or params_id_start,
+             _json({
+                 "stages_done": done_stages,
+                 "stages_skipped": stages_skipped,
+                 "stages_failed": stages_failed,
+                 "candidate_params_id": ctx.get("candidate_params_id"),
+                 "candidate_validation_state": ctx.get("candidate_validation_state"),
+                 "candidate_created": ctx.get("candidate_created", False),
+                 "candidate_pending_activation": ctx.get("candidate_pending_activation", False),
+             }),
+             _json({"prev_intelligence": prev_score}),
+             _json({"intelligence": intel}),
+             intel, improvement, finished),
+        )
 
     conn.execute(
         """UPDATE evolution_loop_state SET status=?, finished_at=?, updated_at=?,
-           metrics_json=?, health_json=?, params_id_end=?,
+           done_stages=?, metrics_json=?, health_json=?, params_id_end=?,
            candidate_params_id=?, candidate_validation_state=?, candidate_pending_activation=?
            WHERE generation=?""",
         (status, finished if status == "completed" else None, finished,
+         _json(done_stages),
          _json({"intelligence_score": intel, "improvement": improvement,
                 "stages_done": done_stages, "stages_skipped": stages_skipped,
                 "stages_failed": stages_failed,
@@ -652,14 +765,19 @@ def _find_pending(conn) -> list:
     ).fetchall()
     pending = []
     for gen, ds, attempts in rows:
-        if attempts >= MAX_GEN_ATTEMPTS:
+        done = _loads(ds, [])
+        if not isinstance(done, list):
+            done = []
+        # 阶段已全部落盘、只差终态写入的代不消耗重试预算：续跑它不会重跑任何
+        # 阶段，只补写 completed，因此不该被 MAX_GEN_ATTEMPTS 判成永久失败。
+        complete = all(stage in done for stage in STAGES)
+        if attempts >= MAX_GEN_ATTEMPTS and not complete:
             # 放弃续跑，标记永久失败。
             conn.execute("UPDATE evolution_loop_state SET status='failed', finished_at=? WHERE generation=?",
                          (_now(), gen))
             conn.commit()
             continue
-        done = _loads(ds, [])
-        resume_from = STAGES[len(done)] if len(done) < len(STAGES) else None
+        resume_from = next((stage for stage in STAGES if stage not in done), None)
         pending.append((gen, resume_from, attempts))
     return pending
 

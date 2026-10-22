@@ -11,8 +11,33 @@ export function adaptiveEsc(value){
   return String(value===null||value===undefined?'':value).replace(/[&<>"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];});
 }
 
+/* inline handler 的**JS 字符串字面量**参数（例如 ``onclick="openRun(<字面量>)"``，
+   字面量由本函数生成）。
+ *
+ * 为什么不能用 adaptiveEsc / encodeURIComponent：
+ *   - adaptiveEsc 产出 HTML 实体，而浏览器会**先解码属性值再当 JS 执行**，
+ *     `&#39;` 解码回 `'` 后可以直接闭合字符串 → 注入；
+ *   - encodeURIComponent 不编码 `'`、`!`、`(`、`)`、`*`，同样能闭合字符串。
+ *
+ * 这里产出一个双引号属性内安全的单引号 JS 字面量：反斜杠、单双引号、控制符、
+ * U+2028/2029、`<`/`>`/`&` 全部转成 `\uXXXX` 或转义序列，输出只含
+ * `'`、`\`、字母数字与 `\uXXXX`，因此既不会被 HTML 解码破坏，也不会逃出字符串。
+ */
 export function adaptiveJsArg(value){
-  return encodeURIComponent(String(value===null||value===undefined?'':value));
+  var text=String(value===null||value===undefined?'':value);
+  var literal="'"+text
+    .replace(/\\/g,'\\\\')
+    .replace(/'/g,'\\u0027')
+    .replace(/"/g,'\\u0022')
+    .replace(/&/g,'\\u0026')
+    .replace(/</g,'\\u003c')
+    .replace(/>/g,'\\u003e')
+    .replace(/\r/g,'\\r')
+    .replace(/\n/g,'\\n')
+    .replace(/\t/g,'\\t')
+    .replace(/\u2028/g,'\\u2028')
+    .replace(/\u2029/g,'\\u2029')+"'";
+  return literal;
 }
 
 /* Optional snapshot fields can be absent while a backend is warming up.
@@ -31,14 +56,21 @@ export function dataValidityTone(value, good, warn){
   var n=Number(value); return n>=good?'good':(n>=warn?'warn':'bad');
 }
 
+/* 这两个标签函数把后端字段拼进 innerHTML，因此必须自己转义：
+   `msg`/`type`/`action`/`tier` 都来自信号与卖出决策投影，不是前端常量。
+   另外卖出决策的 `auction_matrix` 是可选投影：历史行或裁剪过的载荷可能没有它，
+   旧实现直接读 `.level` 会在整行渲染时抛 TypeError，让一张表整页空白。 */
 export function sigTag(s){
+  s=s||{};
   var cls = s.level==='sell' ? 'tag-warn' : 'tag-info';
-  return '<span class="tag '+cls+'" title="'+s.msg+'">'+s.type+'</span>';
+  return '<span class="tag '+cls+'" title="'+adaptiveEsc(s.msg)+'">'+adaptiveEsc(s.type)+'</span>';
 }
 
 export function sellTag(sd){
-  var cls = (sd.action==='卖出'||sd.auction_matrix.level==='sell') ? 'tag-warn' : (sd.action==='止盈减仓' ? 'tag-ok' : 'tag-info');
-  return '<span class="tag '+cls+'">'+sd.action+'｜'+sd.auction_matrix.tier+'</span>';
+  sd=sd||{};
+  var am=sd.auction_matrix||{};
+  var cls = (sd.action==='卖出'||am.level==='sell') ? 'tag-warn' : (sd.action==='止盈减仓' ? 'tag-ok' : 'tag-info');
+  return '<span class="tag '+cls+'">'+adaptiveEsc(sd.action)+'｜'+adaptiveEsc(am.tier)+'</span>';
 }
 
 // ---------- 策略模拟：独立账本，不与自选跟踪混用 ----------
@@ -63,9 +95,10 @@ export function paperStatusTag(status){
     expired:['tag-info','已过期'],
     risk_rejected:['tag-warn','风控拒绝']
   };
+  // 未知状态原样打印是诊断信息，不是前端常量：仍然要转义后再进 innerHTML。
   var view=map[status]||['tag-info',status||'未知'];
   var cls=view[0], text=view[1];
-  return '<span class="tag '+cls+'">'+text+'</span>';
+  return '<span class="tag '+cls+'">'+adaptiveEsc(text)+'</span>';
 }
 
 // R25：signal decision 的展示投影。后端下发 outcome / reason / evidence 状态，
@@ -76,7 +109,7 @@ export function signalDecisionView(decision){
   var labels={approved:'已通过',blocked:'未通过'};
   var outcome=d.outcome||'';
   var evidenceText=ev.cross_source_verified?'证据：双源可信'
-    :(ev.verification_method?('证据：'+riskText(zhRiskText(ev.verification||'未核验')))
+    :(ev.verification_method?('证据：'+zhRiskText(ev.verification||'未核验'))
       :'证据：未知');
   return {
     outcome: outcome,

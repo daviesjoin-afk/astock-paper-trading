@@ -2,7 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiJson, apiPostJson } from "../core/api.js";
 import { $ } from "../core/dom.js";
-import { adaptiveEsc } from "../core/format.js";
+import { adaptiveEsc, adaptiveJsArg } from "../core/format.js";
 import { activatePage } from "../core/navigation.js";
 import { STRATEGY_STATUS_LABELS, strategyStatusBadge, strategyStatusLabel, strategyStatusLabelTech } from "../core/strategy_labels.js";
 import { toast, inlineError, confirmDialog, promptDialog } from "../ui/dialog.js";
@@ -118,15 +118,17 @@ export function wbCard(item){
   var style=adaptiveEsc(meta.style||'—');
   var hold=meta.hold?meta.hold+' 日':'—';
   var actions='';
+  // inline handler 的 JS 字符串参数必须用 adaptiveJsArg 预计算（HTML 实体先解码再当 JS 解析，
+  // adaptiveEsc 的 &#39; 会闭合字符串）；变量在模板外算好，handler 文本里不出现函数调用。
+  var itemArg=adaptiveJsArg(item.id);
   if(userCard){
-    var sid='\''+adaptiveEsc(item.id)+'\'';
-    actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+sid+')">编辑并生成新版本</button>';
-    actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">复制为新草稿</button>';
-    if(item.status==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除未使用草稿</button>';
+    actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+itemArg+')">编辑并生成新版本</button>';
+    actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+itemArg+')">复制为新草稿</button>';
+    if(item.status==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+itemArg+')">删除未使用草稿</button>';
   }else{
-    actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
+    actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+itemArg+')">复制并编辑</button>';
   }
-  actions+='<button type="button" data-testid="strategy-open-detail" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
+  actions+='<button type="button" data-testid="strategy-open-detail" onclick="wbOpenDetail('+itemArg+')">版本与详情</button>';
   // PR-57：卡片分两层。主视觉 = 用户判断"这是什么、现在什么状态、能不能参与"所需的信息；
   // 技术标识（id/校验和/实现键/原始指纹）收进 <details> 披露区，降低默认认知负荷。
   var runtime=item.runtime||{};
@@ -693,6 +695,8 @@ function wbLegHtml(leg){
 }
 export function wbChallengerHtml(strategyId,view){
   if(!view) return '<p>Challenger 视图暂不可用。</p>';
+  // strategyId 进 inline handler 前必须转成 JS 字面量（见 core/format.js adaptiveJsArg）。
+  var strategyArg=adaptiveJsArg(strategyId);
   var comparison=view.comparison||{};
   var coverage=comparison.coverage||null;
   var active=view.active||{}, challenger=view.challenger||{};
@@ -705,7 +709,7 @@ export function wbChallengerHtml(strategyId,view){
     return '<li>'+adaptiveEsc(item.role||'')+' · '+adaptiveEsc(item.status||'')+' · v'+adaptiveEsc(String(item.id))+'</li>';}).join('');
   return '<h4>Active vs Challenger（生命周期晋级与参数头晋升互相独立）</h4>'
     +'<label>Exact ShadowComparisonReport id<input id="wbChallengerReport" maxlength="64" autocomplete="off" value="'+adaptiveEsc(WB_STATE.challengerReportId||'')+'"></label>'
-    +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" onclick="wbLoadChallengerReport(\''+adaptiveEsc(strategyId)+'\')">按 exact id 读取比对证据</button></div>'
+    +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" onclick="wbLoadChallengerReport('+strategyArg+')">按 exact id 读取比对证据</button></div>'
     +'<dl class="strategy-preview-grid">'
     +'<dt>Active</dt><dd data-testid="challenger-active">'+wbLegHtml(active)+'</dd>'
     +'<dt>Challenger</dt><dd data-testid="challenger-challenger">'+wbLegHtml(challenger)+'</dd>'
@@ -945,6 +949,8 @@ export async function wbOpenDetail(strategyId){
   WB_STATE.editingId=strategyId; WB_STATE.editingVersion=item.version||item.current_version;
   var currentVersion=lifecycle.version||item.version||item.current_version||1;
   var runtime=item.runtime||{};
+  // 生命周期/晋级按钮的 inline handler 参数：在模板外预计算成安全 JS 字面量。
+  var strategyArg=adaptiveJsArg(strategyId);
   var historyRows=(lifecycle.state_history||[]).slice().reverse().map(function(ev){
     var evidence=ev.evidence_json||'';
     var evidenceValue={};
@@ -971,23 +977,26 @@ export async function wbOpenDetail(strategyId){
   }).join('');
   var eligible=(lifecycle.eligible_transitions||[]);
   var safetyButtons=(lifecycle.safety_transitions||[]).map(function(target){
-    return '<button type="button" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" onclick="wbTransition(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">提交 '+adaptiveEsc(strategyStatusLabel(target))+'安全意图</button>';
+    var targetArg=adaptiveJsArg(target);
+    return '<button type="button" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" onclick="wbTransition('+strategyArg+','+targetArg+')">提交 '+adaptiveEsc(strategyStatusLabel(target))+'安全意图</button>';
   }).join('');
   var promotionButtons=(lifecycle.promotion_transitions||[]).map(function(target){
+    var targetArg=adaptiveJsArg(target);
     var allowed=eligible.indexOf(target)>=0;
     var decision=(lifecycle.evidence||{})[target]||{};
     var reasons=(decision.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
     return '<article class="strategy-promotion-target" data-testid="promotion-target-'+adaptiveEsc(target)+'"><b>'+adaptiveEsc(lifecycle.state)+' → '+adaptiveEsc(target)+'</b>'
       +'<p>当前后端判断：'+(allowed?'eligible':'blocked')+'</p>'+(reasons?'<ul>'+reasons+'</ul>':'')
-      +'<button type="button" onclick="wbCreatePromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">为该目标创建 proposal</button></article>';
+      +'<button type="button" onclick="wbCreatePromotionProposal('+strategyArg+','+targetArg+')">为该目标创建 proposal</button></article>';
   }).join('');
   var proposals=(lifecycle.proposals||[]).map(function(proposal){
     var decision=proposal.decision||{};
     var bundle=proposal.evidence_bundle||{};
     var reasons=(decision.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
     var evidence='<small>R29 '+adaptiveEsc(bundle.r29_run_key||'未指定')+' · R30 '+adaptiveEsc(bundle.r30_report_key||'未指定')+'</small>';
+    var fpArg=adaptiveJsArg(proposal.proposal_fingerprint);
     var apply=proposal.proposer_type!=='ai'&&decision.eligible
-      ?'<button type="button" data-testid="promotion-apply" onclick="wbApplyPromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(proposal.proposal_fingerprint)+'\')">重新验证并提交 transition</button>':'';
+      ?'<button type="button" data-testid="promotion-apply" onclick="wbApplyPromotionProposal('+strategyArg+','+fpArg+')">重新验证并提交 transition</button>':'';
     return '<article class="strategy-proposal" data-testid="strategy-promotion-proposal"><b>PROPOSAL · '+adaptiveEsc(proposal.proposer_type)+' / '+adaptiveEsc(proposal.proposer_id)+'</b>'
       +'<p>'+adaptiveEsc(proposal.from_state)+' → '+adaptiveEsc(proposal.target_state)+' · '+(decision.eligible?'后端当前 eligible':'blocked')+'</p>'
       +evidence+(proposal.rationale?'<p>'+adaptiveEsc(proposal.rationale)+'</p>':'')+(reasons?'<ul>'+reasons+'</ul>':'')+apply+'</article>';
