@@ -296,6 +296,9 @@ ENTRY_SLOT_OCCUPYING_ORDER_STATUSES = (
 )
 ENTRY_AUTO_SOURCE_MAX_AGE_SECONDS = 15 * 60
 ENTRY_AUTO_FACTOR_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
+#: 限价委托的锚点冻结窗口：自首次限价延期起超过该时长仍未按冻结价成交，
+#: 说明价格已经跑开，当日不再追这一单（锚点既不抬高，也不无限期等待）。
+ENTRY_LIMIT_CHASE_WINDOW_MINUTES = 15.0
 # The trading-day stamped factor date is the primary freshness gate.  This
 # wider wall-clock allowance only covers a weekend/holiday between a valid
 # close rebuild and the next session; it must never make an old factor date
@@ -8866,6 +8869,35 @@ def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_
     """
     return False, "总资金池82%硬上限不可突破；需先卖出低质量持仓释放额度"
 
+def _frozen_entry_limit(conn, account_id, code, signal_id, asof_day):
+    """该信号当日**首次**限价延期单的冻结限价与已等待分钟数。
+
+    限价画像的参考价每轮都跟着实时价刷新，若每轮重新算 ``参考价 × (1 + 让价)``，
+    限价就会随价格上移（当轮买不到、下轮锚点更高）。首次延期单的
+    ``planned_price`` 就是当时的限价，冻结它即可让限价**只降不升**。
+    返回 ``(None, None)`` 表示今天还没有限价延期记录。
+    """
+    if signal_id is None:
+        return None, None
+    day = asof_day.isoformat() if hasattr(asof_day, "isoformat") else str(asof_day)[:10]
+    row = conn.execute(
+        """SELECT planned_price, created_at FROM paper_orders
+            WHERE account_id=? AND code=? AND side='buy' AND signal_id=?
+              AND order_type='limit' AND substr(created_at,1,10)=?
+            ORDER BY id ASC LIMIT 1""",
+        (account_id, code, signal_id, day),
+    ).fetchone()
+    if row is None:
+        return None, None
+    limit_price = _num(row["planned_price"], 0.0) or None
+    try:
+        waited = (dt.datetime.now() - dt.datetime.fromisoformat(
+            str(row["created_at"]))).total_seconds() / 60
+    except (TypeError, ValueError):
+        waited = None
+    return limit_price, waited
+
+
 @PTM.timed("execution.buy_approval")
 def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quotes=None):
     # PR-06：席位预留、追高/加速门限、首仓纪律等差异统一由中央执行计划器的
@@ -9506,8 +9538,21 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # PR-10 执行画像：按账户 risk_profile 自动选择 market/limit 与让价。
     # 限价画像要求现价不高于让价上限，未到价则延期（execution_retry）。
     exec_profile = _execution_profile_for_account(account["id"], conn=conn)
+    # 限价锚点冻结：沿用该信号当日首次延期单的限价，价格反弹不再抬价追高。
+    frozen_limit, limit_waited = _frozen_entry_limit(
+        conn, account["id"], code, signal.get("id"), asof_day)
+    limit_window_expired = bool(
+        frozen_limit is not None and limit_waited is not None
+        and limit_waited > ENTRY_LIMIT_CHASE_WINDOW_MINUTES)
+    if limit_window_expired:
+        # 窗口过期不是风控否决：这个标的没有变坏，只是价格跑开、当日不再追。
+        reasons.append(
+            f"限价追价窗口已过：等待 {limit_waited:.0f} 分钟仍未回到冻结限价 "
+            f"{frozen_limit:.2f}，当日不再追价")
+        frozen_limit = None
     entry_limit = EPF.enforce_entry_limit(
         exec_profile, fill_price, reference_price=signal_close or price,
+        frozen_limit_price=frozen_limit,
     )
     limit_deferred = not entry_limit["allowed"] and not reasons
     if entry_limit["limit_price"] is not None:
@@ -9771,7 +9816,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     order_status = "pending_execution" if allowed else (
         "shadow_q3" if q3_shadow_ready else (
             STRATEGY_EXECUTION_RETRY_STATUS if limit_deferred else
-            ("deferred_capacity" if capacity_deferred else "risk_rejected"))
+            ("expired" if limit_window_expired else
+             ("deferred_capacity" if capacity_deferred else "risk_rejected")))
     )
     reason = (
         "Q3 三重强度影子候选：个股强度、实时资金和板块确认均通过；仅记录验证，不模拟买入"
