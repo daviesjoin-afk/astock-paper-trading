@@ -426,8 +426,12 @@ def allocation_explain():
 
 
 @router.post("/strategy-preview")
-async def strategy_preview(payload: dict | None = None):
-    """PR-18 创建预览：Risk Fingerprint、推荐画像、执行方式、边界与高风险 override。"""
+def strategy_preview(payload: dict | None = None):
+    """PR-18 创建预览：Risk Fingerprint、推荐画像、执行方式、边界与高风险 override。
+
+    同步路由（不是 ``async def``）：``strategy_creation_preview`` 会同步读写
+    SQLite，放在事件循环里等待数据库就等于阻塞同一进程的其它请求。
+    """
     try:
         return _call_with_retry(P.strategy_creation_preview, payload or {})
     except Exception as exc:

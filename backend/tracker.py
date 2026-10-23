@@ -18,10 +18,10 @@ from datetime import datetime
 import pandas as pd
 
 import data_fetcher as dfc
+import data_paths
 import strategies as S
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TRACK_PATH = os.path.join(BASE, "data_cache", "tracking.json")
+TRACK_PATH = data_paths.data_path("tracking.json")
 _LOCK = threading.Lock()
 
 DEFAULT_RULES = {

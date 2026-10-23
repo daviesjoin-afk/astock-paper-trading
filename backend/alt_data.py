@@ -17,13 +17,14 @@ from urllib.parse import urlencode
 
 import requests
 
+import data_paths
+
 try:
     import pandas as pd
 except ImportError:  # pragma: no cover
     pd = None
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE_DIR, "data_cache", "alt_data")
+CACHE_DIR = data_paths.data_path("alt_data")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
