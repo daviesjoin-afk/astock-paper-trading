@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 
 
 def quote_is_fresh(
@@ -13,7 +14,9 @@ def quote_is_fresh(
     if not quote or quote.get("quote_source") != "live":
         return False
     try:
-        quote_time = dt.datetime.fromisoformat(str(quote.get("quote_at") or ""))
+        text = str(quote.get("quote_at") or "")
+        quote_time = (dt.datetime.strptime(text, "%Y%m%d%H%M%S")
+                      if text.isdigit() and len(text) == 14 else dt.datetime.fromisoformat(text))
     except (TypeError, ValueError):
         return False
     day = date_fn(asof_date)
@@ -118,10 +121,15 @@ def execution_quote_status(
             "fresh": False, "status": "cross_source_unavailable",
             "reason": detail + "；自动买入等待双源恢复", **diagnostics,
         }
-    if validation == "range_timestamp_checked" and purpose == "exit":
+    if validation == "range_timestamp_checked":
+        price, pct = quote.get("price"), quote.get("pct")
+        if (isinstance(price, bool) or isinstance(pct, bool)
+                or not isinstance(price, (int, float)) or not isinstance(pct, (int, float))
+                or not math.isfinite(price) or not math.isfinite(pct) or price <= 0 or abs(pct) > 30):
+            return {"fresh": False, "status": "invalid", "reason": "单源报价价格或涨跌幅无效", **diagnostics}
         return {
-            "fresh": True, "status": "degraded_cross_source",
-            "reason": "主行情新鲜有效，但未完成独立行情源校验；仅允许风控退出",
+            "fresh": True, "status": "range_timestamp_checked",
+            "reason": "单个行情源的价格、涨跌幅和源时间有效，保留单源标记",
             "degraded": True, **diagnostics,
         }
     return {"fresh": False, "status": "unverified", "reason": "未获得通过的独立行情源校验结果", **diagnostics}

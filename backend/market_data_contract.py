@@ -67,7 +67,7 @@ __all__ = [
     # verification method
     "VERIFICATION_METHOD_CROSS_SOURCE", "VERIFICATION_METHOD_COVERAGE_INTEGRITY",
     "VERIFICATION_METHOD_NONE", "VERIFICATION_METHODS",
-    "is_cross_source_verified",
+    "is_cross_source_verified", "is_execution_quote_usable",
     # access mode
     "ACCESS_READ", "ACCESS_REFRESH", "ACCESS_MODES",
     # reasons
@@ -994,6 +994,20 @@ def is_cross_source_verified(snapshot: MarketDataSnapshot | None) -> bool:
     return (
         snapshot.verification == VERIFICATION_VERIFIED
         and snapshot.verification_method == VERIFICATION_METHOD_CROSS_SOURCE
+    )
+
+
+def is_execution_quote_usable(reading: MarketDataReading | None) -> bool:
+    """A fresh validated single source can price a paper order; conflicts cannot."""
+    if reading is None or not reading.available or reading.freshness != FRESHNESS_FRESH:
+        return False
+    snapshot = reading.snapshot
+    if snapshot is None or snapshot.kind != "symbol_quote" or not snapshot.complete:
+        return False
+    return is_cross_source_verified(snapshot) or (
+        snapshot.verification == VERIFICATION_SINGLE_SOURCE
+        and len(snapshot.rows) == 1
+        and snapshot.rows[0].get("quote_validation") == "range_timestamp_checked"
     )
 
 

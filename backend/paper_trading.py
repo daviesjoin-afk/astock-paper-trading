@@ -454,7 +454,7 @@ STRATEGY_RISK_BEHAVIORS = {
         "entry_style": "实时动量确认，可小仓追高",
         "downside_style": "快响应：当日弱势、相对大盘走弱或收益回吐优先保护",
         "washout_loss_override_pct": -3.0,
-        "overheat_action": "不使用板块过热硬否决，但追高必须双源/Q1/资金量能确认",
+        "overheat_action": "不使用板块过热硬否决，但追高必须有效行情/Q1/资金量能确认",
     },
     "trend_pullback": {
         "entry_style": "回踩结构确认，不追高",
@@ -838,7 +838,7 @@ def strategy_center():
     narratives = {
         "tq_breakout": {
             "candidate": "强势日内候选：昨日首板只作加分，同时筛选当日量价、资金和动量领先的股票。",
-            "entry": "优选涨幅 +0.2% 至 +3.5%；接近涨停时必须通过双源实时行情、Q1 后市评分、主力净流入≥2%及量比≥1.5确认，仅按35%仓位追买；未满足条件只观察。",
+            "entry": "优选涨幅 +0.2% 至 +3.5%；接近涨停时必须通过有效实时行情、Q1 后市评分、主力净流入≥2%及量比≥1.5确认，仅按35%仓位追买；未满足条件只观察。",
             "exit": "-5%硬止损（非崩盘形态首触先减35%，跌破确认后全清）；盈利+4%后5%移动止盈；+8%先止盈50%。",
         },
         "trend_pullback": {
@@ -853,7 +853,7 @@ def strategy_center():
         },
         NEW_STRATEGY_ID: {
             "candidate": "三日策略：三连阳/BOLL突破与已披露利润证据、主要均线、量价和超大单资金同步确认。",
-            "entry": "仅在当期财报披露证据、突破结构、实时双源行情、Q1/Q2、板块权限、T+1 与共享资金槽位全部通过时开仓；接近涨停或末端加速只观察。",
+            "entry": "仅在当期财报披露证据、突破结构、实时有效行情、Q1/Q2、板块权限、T+1 与共享资金槽位全部通过时开仓；接近涨停或末端加速只观察。",
             "exit": "-5.5%硬止损；峰值回撤6%触发独立移动风控；+8.5%、+15%分段止盈；持有超过12个交易日退出。",
         },
         MAIN_FORCE_STRATEGY_ID: {
@@ -912,9 +912,9 @@ def strategy_center():
             f"已启用策略集合（当前 {len(ACTIVE_ACCOUNT_IDS)} 套）共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
             "策略额度按风险画像分配目标和保护底线；某策略未用额度只会在其他策略底线满足后转入，不再各自重复计算总池上限。",
             f"股票持仓按策略席位计数：已启用策略集合（当前 {len(ACTIVE_ACCOUNT_IDS)} 套）共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
-            "换仓必须通过实时双源行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
+            "换仓必须通过实时有效行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
             "待成交买单会预占现金和总池额度；成交后核销，撤单、过期或风控拒绝后释放。",
-            "自动开仓须使用当日实时行情，并通过东方财富与腾讯行情交叉核验。",
+            "自动开仓须有至少一个来源提供新鲜有效的当日报价；备用源失败不单独阻断，来源冲突仍需复核。",
             "09:30/09:31/13:00 共享开盘事件引擎可识别冲高回落；各策略都能用，但各自阈值、减仓比例和回补确认线不同。",
             "开盘事件卖出只使用已结算底仓；回补必须看到卖出后的低点和反弹确认，不把快速下跌当成低吸。",
             "市场红灯暂停新开仓；黄灯按各策略对应仓位缩放执行。",
@@ -1889,6 +1889,7 @@ def init_db():
                 # 写入会直接 `no such table`。
                 PSM.ensure_candidate_selection(conn)
                 PSM.ensure_paper_metrics_indexes(conn)
+                PSM.ensure_portfolio_order_read_index(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2219,6 +2220,7 @@ def init_db():
         # bootstrap 出来的库缺少 selection 表，第一次写入即 `no such table`。
         PSM.ensure_candidate_selection(conn)
         PSM.ensure_paper_metrics_indexes(conn)
+        PSM.ensure_portfolio_order_read_index(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
@@ -6279,6 +6281,11 @@ def _quotes(codes, asof_date=None):
     if not codes:
         return {}
     expected_day = _date(asof_date or dt.date.today())
+    def usable(row):
+        return (_num(row.get("price"), 0) > 0
+                and _num(row.get("pct"), None) is not None
+                and abs(_num(row.get("pct"), 999)) <= 30
+                and _quote_is_fresh({**row, "quote_source": "live"}, expected_day))
     source_errors = {}
     try:
         with PTM.phase("quote.primary"):
@@ -6289,7 +6296,8 @@ def _quotes(codes, asof_date=None):
         # exits can surface a structured degraded/unavailable reason.
         live_rows = []
         source_errors["live"] = f"{type(exc).__name__}: {exc}"
-    live = {str(r.get("code")): r for r in live_rows if r.get("code")}
+    live = {str(r.get("code")): {**r, "source": r.get("source") or "eastmoney_ulist"}
+            for r in live_rows if r.get("code")}
     fallback_identity = None
     fallback_origin = "verified_full_market_snapshot"
     fallback_codes = set()
@@ -6327,6 +6335,29 @@ def _quotes(codes, asof_date=None):
                         fallback_origin = "price_only_full_market_snapshot"
         except Exception as exc:
             source_errors["snapshot"] = f"{type(exc).__name__}: {exc}"
+    # A failed primary must not hide a usable provider from the fallback chain.
+    try:
+        with PTM.phase("quote.independent"):
+            cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
+    except Exception as exc:
+        cross_rows = []
+        source_errors["cross"] = f"{type(exc).__name__}: {exc}"
+    cross = {str(r.get("code")): r for r in cross_rows if r.get("code")}
+    for code in codes:
+        primary = live.get(code) or {}
+        alternate = cross.get(code) or {}
+        if not usable(primary) and usable(alternate):
+            promoted = dict(alternate)
+            stamp = _parse_quote_timestamp(promoted.get("quote_at"))
+            promoted["quote_at"] = stamp.isoformat() if stamp else promoted.get("quote_at")
+            live[code] = promoted
+            fallback_codes.discard(code)
+    for row in live.values():
+        stamp = _parse_quote_timestamp(row.get("quote_at"))
+        if stamp is not None:
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+            row["quote_at"] = stamp.isoformat()
     live_rows = list(live.values())
     # 单票行情核验以价格为核心，但东财 ulist 偶尔返回价格而遗漏资金字段。
     # 补齐动作独立于双源价格校验：资金流失败不能把可执行的风险卖出误写成
@@ -6347,13 +6378,6 @@ def _quotes(codes, asof_date=None):
     # 把整轮策略都误判成“独立行情源未返回”。来源仍写入审计 payload，便于追溯。
     # 主报价若来自腾讯（价格-only 快照回退），必须改用新浪核验：同一来源
     # 与自己比较不构成双源证据，只会把"自己核验自己"写成 cross_source_checked。
-    try:
-        with PTM.phase("quote.independent"):
-            cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
-    except Exception as exc:
-        cross_rows = []
-        source_errors["cross"] = f"{type(exc).__name__}: {exc}"
-    cross = {str(r.get("code")): r for r in cross_rows if r.get("code")}
     same_source_codes = [
         code for code, row in live.items()
         if str(row.get("source") or "") == "tencent_public_quote"
@@ -6372,6 +6396,10 @@ def _quotes(codes, asof_date=None):
             code = str(row.get("code") or "")
             if code in same_source_codes and row.get("source") == "sina_public_quote":
                 cross[code] = row
+    for code, row in live.items():
+        source = str(row.get("source") or "")
+        if source and source == str(cross.get(code, {}).get("source") or ""):
+            cross.pop(code, None)
     with PTM.phase("quote.local_metadata"):
         local = _latest_price_map(codes)
         local_snapshot_at = _universe_snapshot_time()
@@ -6469,16 +6497,16 @@ def _quotes(codes, asof_date=None):
             validation = "incomplete"
             failure_reason = "主行情价格或涨跌幅无效"
         elif source_errors.get("cross"):
-            validation = "cross_source_unavailable"
+            validation = "range_timestamp_checked"
             failure_reason = f"独立行情源异常：{source_errors['cross']}"
         elif not cross_available:
-            validation = "cross_source_unavailable"
+            validation = "range_timestamp_checked"
             failure_reason = "独立行情源未返回有效价格或时间"
         elif not cross_day_ok:
-            validation = "cross_source_failed"
+            validation = "range_timestamp_checked"
             failure_reason = f"独立行情源时间不是交易日（{cross_at or '未知'}）"
         elif not cross_time_ok:
-            validation = "cross_source_unavailable"
+            validation = "range_timestamp_checked"
             failure_reason = "独立行情源更新时间过期，已等待其重连/切换"
         elif price_gap > 0.005 * gap_tolerance_scale or pct_gap > 0.20 * gap_tolerance_scale:
             validation = "cross_source_failed"
@@ -7254,8 +7282,8 @@ def _signal_approval(
         flags.append("缺少有效报价")
     if not _quote_is_fresh(quote, asof_date or dt.date.today()):
         flags.append("未取得带当日源时间戳的实时行情")
-    elif not evidence.cross_source_verified:
-        flags.append("\u5b9e\u65f6\u884c\u60c5\u672a\u901a\u8fc7\u72ec\u7acb\u4ea4\u53c9\u6838\u9a8c")
+    elif not _execution_quote_status(quote, asof_date or dt.date.today()).get("fresh"):
+        flags.append("实时行情无有效来源或存在价格冲突")
     listing = _new_listing_profile(account["id"], code, kline, history_meta, asof_date or dt.date.today())
     is_new_listing = bool(listing.get("eligible"))
     if kline is None or len(kline) < 120:
@@ -9132,14 +9160,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             and _num(quote.get("pct"), -999.0) >= _exec_policy.acceleration_pct:
         timing_gate = {"allowed": False, "mode": "突破加速确认", "reason": None}
         _label = _exec_policy.entry_label or "策略"
-        if execution_quote.get("status") != "cross_source_checked":
-            timing_gate["reason"] = f"{_label}加速段必须通过双源实时行情核验"
+        if not execution_quote.get("fresh"):
+            timing_gate["reason"] = f"{_label}加速段需要有效实时行情"
         elif q.get("tier") != "Q1":
             timing_gate["reason"] = f"{_label}加速段仅允许 Q1，当前为 {q.get('tier')}"
         elif _num(quote.get("main_pct"), -999.0) < 1.0 or _num(quote.get("vol_ratio"), 0.0) < 1.2:
             timing_gate["reason"] = f"{_label}加速段需主力净流入≥1%且量比≥1.2"
         else:
-            timing_gate.update({"allowed": True, "reason": "财报突破在加速段获得双源、Q1、资金与量能确认"})
+            timing_gate.update({"allowed": True, "reason": "财报突破在加速段获得有效行情、Q1、资金与量能确认"})
     risk["three_day_timing_gate"] = timing_gate
     if not timing_gate["allowed"]:
         reasons.append(f"{timing_gate['mode']}未通过：{timing_gate['reason']}")
@@ -9191,6 +9219,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             fast=bool(quote.get("_fast_entry_monitor")),
             evidence={
                 "cross_source_checked": execution_quote.get("status") == "cross_source_checked",
+                "quote_usable": bool(execution_quote.get("fresh")),
                 "main_pct": _num(quote.get("main_pct"), _num(quote.get("main_net_pct"))),
                 "vol_ratio": _num(quote.get("vol_ratio")),
                 "active_buy_sell_imbalance": micro.get("active_buy_sell_imbalance"),
@@ -11318,7 +11347,7 @@ def run_auction_preselection(asof_date=None, force=False):
     """只在 09:25 读取一次集合竞价快照，生成待 09:31 开盘确认的预选信号。
 
     09:15 起由 auction-track 保存观测；可撤单阶段只跟踪，不生成委托；
-    09:25 的快照只用于筛选与排序，真正成交仍须在 09:31 用最新双源行情复核。
+    09:25 的快照只用于筛选与排序，真正成交仍须在 09:31 用最新有效行情复核。
     """
     init_db()
     now = dt.datetime.now()
@@ -11361,7 +11390,7 @@ def run_auction_preselection(asof_date=None, force=False):
         "auction_at": auction_at.isoformat() if auction_at else None,
         "snapshot_count": len(live_universe or []), "auction_count": len(current_rows),
         "live_scan_gate": auction_gate,
-        "execution_note": "仅预选；09:31 开盘审批仍需最新双源实时行情通过后才可成交",
+        "execution_note": "仅预选；09:31 开盘审批仍需最新有效实时行情通过后才可成交",
     })
     with _db() as conn:
         cycle = _active_cycle(conn)
@@ -11848,7 +11877,7 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
         reason=("确认后回补：新买份额次日可卖"
                 if payload.get("opening_event") else "日内做T回补：新买份额次日可卖"),
         detail=detail, action=action_name, is_t_base=False,
-        assumption="实时双源快照回补 + 滑点模拟；股票份额次日可卖",
+        assumption="实时有效报价回补 + 滑点模拟；股票份额次日可卖",
     )
     if failure:
         return None, failure
@@ -12031,7 +12060,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         },
         asof_day, reason=label, detail=detail, action="swing_scale_in",
         is_t_base=True,
-        assumption=f"{label}；实时双源行情含滑点和佣金",
+        assumption=f"{label}；实时有效行情含滑点和佣金",
     )
     if failure:
         return None, failure
@@ -12274,6 +12303,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                 execution_quote = _execution_quote_status(quote, day, purpose="entry")
                 evidence = {
                     "cross_source_checked": execution_quote.get("status") == "cross_source_checked",
+                    "quote_usable": bool(execution_quote.get("fresh")),
                     "main_pct": _num(quote.get("main_pct"), _num(quote.get("main_net_pct"))),
                     "vol_ratio": _num(quote.get("vol_ratio")),
                     "active_buy_sell_imbalance": micro.get("active_buy_sell_imbalance"),
@@ -14768,7 +14798,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
         elif validation in {"stale", "invalid", "missing"}:
             validation_detail = quote_status.get("reason") or "主行情不可用"
         elif validation == "range_timestamp_checked":
-            validation_detail = "主行情时间与数值范围校验通过，未完成独立源核对"
+            validation_detail = "单源行情有效，价格、范围和源时间校验通过"
         elif validation == "degraded_cross_source":
             validation_detail = quote_status.get("reason") or "主行情有效，独立源不可用，已降级核验"
         else:
@@ -15095,7 +15125,7 @@ def schedule_status():
         "latest_intraday_runs": intraday,
         "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
-        "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
+        "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新有效行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
     }
 
 

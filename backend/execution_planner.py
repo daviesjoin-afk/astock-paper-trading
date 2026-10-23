@@ -766,7 +766,7 @@ def evaluate_simulated_execution(
                 reasons.append(ExecutionReason.MARKET_STALE.value)
             elif snapshot is None or snapshot.verification == MDC.VERIFICATION_DISAGREEMENT:
                 reasons.append(ExecutionReason.MARKET_DISAGREEMENT.value)
-            elif not MDC.is_cross_source_verified(snapshot):
+            elif not MDC.is_execution_quote_usable(reading):
                 reasons.append(ExecutionReason.MARKET_UNVERIFIED.value)
         if snapshot is not None and str(snapshot.as_of or "") != str(context.session_date or ""):
             reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)

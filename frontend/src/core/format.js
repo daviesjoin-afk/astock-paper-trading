@@ -165,7 +165,7 @@ export function zhRiskText(value){
     '历史记录未保存备用源细节；已进入独立行情校验门但未通过':'历史记录未保存备用源细节；已进入独立行情校验门但未通过',
     'cross_source_checked':'双源核验通过',
     'cross_source_failed':'双源核验未通过', 'cross_source_unavailable':'独立行情源未返回',
-    'range_timestamp_checked':'主行情有效，待交叉核验',
+    'range_timestamp_checked':'单源行情有效',
     'degraded_cross_source':'降级核验退出',
     'not_independently_verified':'未进行独立交叉核验',
     'reference_only':'仅供参考',

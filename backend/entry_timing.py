@@ -343,6 +343,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             active = evidence.get("active_buy_sell_imbalance")
             depth = evidence.get("depth_imbalance")
             cross_source = bool(evidence.get("cross_source_checked"))
+            quote_usable = bool(evidence.get("quote_usable", cross_source))
             mode_now = str(record.get("mode") or mode)
             # 点火模式下快速确认间隔放宽到 30 秒（ignition_confirm_min_seconds），
             # 且必须携带 ignition_ok=True——八项点火条件已在调用方预先判定，
@@ -369,7 +370,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             ) and (depth_value is None or depth_value >= -0.20)
             strong = (
                 (not ignition_required or ignition_ok)
-                and cross_source
+                and quote_usable
                 and main_pct >= (3.0 if mode_now in ("momentum", "ignition") else 2.0)
                 and vol_ratio >= (1.5 if mode_now in ("momentum", "ignition") else 1.2)
                 and price >= trigger_price
@@ -387,6 +388,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                 record["fast_evidence"] = {
                     "main_pct": round(main_pct, 3), "vol_ratio": round(vol_ratio, 3),
                     "cross_source_checked": cross_source,
+                    "quote_usable": quote_usable,
                     "ignition_ok": ignition_ok if ignition_required else None,
                 }
             elif not strong:
@@ -394,6 +396,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                 record["fast_evidence"] = {
                     "main_pct": round(main_pct, 3), "vol_ratio": round(vol_ratio, 3),
                     "cross_source_checked": cross_source, "reset": True,
+                    "quote_usable": quote_usable,
                 }
             fast_count = int(record.get("fast_confirm_count") or 0)
             first_ts = dt.datetime.fromisoformat(str(record["first_trigger_at"])[:19])
@@ -414,7 +417,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                     f"快速观察确认 {fast_count}/2"
                     + ("（点火模式）" if ignition_required else "")
                     + f"：主力 {main_pct:+.2f}%，"
-                    f"量比 {vol_ratio:.2f}，双源={'通过' if cross_source else '未通过'}，"
+                    f"量比 {vol_ratio:.2f}，行情={'双源核验通过' if cross_source else '单源有效' if quote_usable else '不可用'}，"
                     f"逐笔={active_value if active_value is not None else '缺失'}，"
                     f"五档={depth_value if depth_value is not None else '缺失'}"
                     + ("" if not ignition_required else (

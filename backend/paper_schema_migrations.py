@@ -1954,6 +1954,18 @@ def experiment_search_selection_report_ddl(table="experiment_search_selection_re
     )"""
 
 
+def ensure_portfolio_order_read_index(conn):
+    """v38: read execution facts without visiting large order audit payloads."""
+    columns = ("cycle_id", "side", "status", "account_id", "id", "code",
+               "execution_status", "execution_verified", "realized_pnl", "executed_at",
+               "amount", "fees")
+    if not set(columns).issubset(table_columns(conn, "paper_orders")):
+        return {"idx_paper_orders_portfolio_facts": "schema_unavailable"}
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_orders_portfolio_facts"
+                 " ON paper_orders(" + ",".join(columns) + ")")
+    return {"idx_paper_orders_portfolio_facts": "ok"}
+
+
 def ensure_paper_metrics_indexes(conn):
     """v37: latest-row metric reads must not sort or scan growing task history."""
     result = {}

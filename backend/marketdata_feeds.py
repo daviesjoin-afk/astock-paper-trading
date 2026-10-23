@@ -470,11 +470,12 @@ class DataFeedChain:
     sleep: Callable[[float], Any] = time.sleep
     retry_last_feed: bool = True
     name: str = "independent_public_quote_chain"
+    accept_quote: Callable[[Mapping[str, Any]], bool] = usable_quote
 
     def _merge(self, by_code: dict[str, QuoteRow], rows: Sequence[QuoteRow], allowed: set[str]) -> None:
         for row in rows or []:
             code = str(row.get("code") or "") if isinstance(row, Mapping) else ""
-            if code in allowed and usable_quote(row):
+            if code in allowed and self.accept_quote(row):
                 by_code[code] = dict(row)
 
     @staticmethod

@@ -143,12 +143,12 @@ def load_source_health():
 
 
 def check_data_source_health(force=False):
-    """Probe primary/independent quote sources and reconnect on failure.
+    """Probe availability; either fresh stock-quote family can keep scans open.
 
     This is intentionally small (one market page + two index quotes), so it
     can run before every five-minute paper scan.  An empty/invalid response
-    never enters the cache; the session is closed and both source families are
-    retried once with host rotation before the caller proceeds.
+    never enters the cache. If neither stock-quote family works, reconnect and
+    retry once. Provider status stays separate from single-stock validation.
     A forced success can be reused for at most 30 seconds within an explicit
     workflow scope; failures are never reused and scope exit clears the window.
     """
@@ -171,10 +171,12 @@ def check_data_source_health(force=False):
         try:
             fields = "f2,f3,f12,f14,f124"
             rows = _fetch_clist(fields, fid="f20", pages=1, pz=100)
-            valid = [row for row in rows if str(row.get("f12") or "").isdigit()
-                     and isinstance(row.get("f2"), (int, float)) and row.get("f2") > 0]
+            valid = [row for row in rows if len(str(row.get("f12") or "")) == 6
+                     and str(row.get("f12") or "").isdigit()
+                     and MN.source_quote_is_fresh({"price": row.get("f2"), "pct": row.get("f3"),
+                                                  "quote_at": MN.quote_at(row.get("f124"))})]
             return {
-                "status": "fresh" if len(valid) >= 20 else "degraded",
+                "status": "fresh" if valid else "degraded",
                 "rows": len(rows), "valid_rows": len(valid),
                 "coverage_pct": round(len(valid) / max(len(rows), 1) * 100, 1),
                 "source": "eastmoney-clist",
@@ -201,7 +203,7 @@ def check_data_source_health(force=False):
                         price = float(parts[3] or 0)
                     except (TypeError, ValueError):
                         price = 0
-                    if price > 0:
+                    if MN.source_quote_is_fresh({"price": price, "pct": parts[32], "quote_at": parts[30]}):
                         valid += 1
                         latest = parts[30] or latest
             return {"status": "fresh" if valid >= 2 else "degraded",
@@ -217,10 +219,13 @@ def check_data_source_health(force=False):
         # 指数接口正常不代表个股接口正常；策略成交门禁真正依赖的是个股报价。
         # 这里固定抽查沪深/北交各一只，并允许新浪作为腾讯个股接口的独立备用源。
         try:
-            rows = fetch_independent_realtime_for_codes(["300214", "688129", "920006"])
+            codes = {"300214", "688129", "920006"}
+            rows = fetch_independent_realtime_for_codes(sorted(codes))
+            rows = list({row["code"]: row for row in rows
+                         if row.get("code") in codes and MN.source_quote_is_fresh(row)}.values())
             sources = sorted({str(row.get("source") or "") for row in rows if row.get("source")})
             return {
-                "status": "fresh" if len(rows) >= 2 else "degraded",
+                "status": "fresh" if rows else "degraded",
                 "rows": len(rows), "valid_rows": len(rows),
                 "coverage_pct": round(len(rows) / 3 * 100, 1),
                 "source": "+".join(sources) or "tencent_public_quote+sina_public_quote",
@@ -235,7 +240,7 @@ def check_data_source_health(force=False):
     reconnected = False
     for attempt in range(2):
         if attempt:
-            reset_data_source("5次连续数据源探测失败，主动重连并切换数据源", reset_circuit=True)
+            reset_data_source("行情源探测失败，重连并切换备用源", reset_circuit=True)
             reconnected = True
             time.sleep(0.35)
         eastmoney = _probe_eastmoney()
@@ -243,12 +248,12 @@ def check_data_source_health(force=False):
         independent_stock = _probe_independent_stock()
         attempts.append({"attempt": attempt + 1, "eastmoney": eastmoney, "tencent": tencent,
                           "independent_stock": independent_stock})
-        if eastmoney["status"] == "fresh" and independent_stock["status"] == "fresh":
+        if eastmoney["status"] == "fresh" or independent_stock["status"] == "fresh":
             break
     eastmoney = attempts[-1]["eastmoney"] if attempts else {"status": "failed"}
     tencent = attempts[-1]["tencent"] if attempts else {"status": "failed"}
     independent_stock = attempts[-1].get("independent_stock", {"status": "failed"}) if attempts else {"status": "failed"}
-    healthy = eastmoney.get("status") == "fresh" and independent_stock.get("status") == "fresh"
+    healthy = eastmoney.get("status") == "fresh" or independent_stock.get("status") == "fresh"
     payload = {
         "checked_at": checked_at,
         "healthy": healthy,
@@ -258,7 +263,9 @@ def check_data_source_health(force=False):
         "tencent": tencent,
         "independent_stock": independent_stock,
         "host_rotation": "东方财富主机轮换 + 腾讯个股源重试 + 新浪个股备用",
-        "action": "正常使用" if healthy else ("已重连并降级使用可用源" if reconnected else "等待下一轮自动重连"),
+        "action": ("正常使用" if eastmoney.get("status") == independent_stock.get("status") == "fresh"
+                   else "单源可用，继续运行" if healthy
+                   else "暂无有效行情源，等待下一轮重连"),
     }
     _save_source_health(payload)
     if force and scope is not None and healthy:
@@ -1176,6 +1183,7 @@ def _independent_realtime_feed():
         reset_data_source=reset_data_source,
         sleep=time.sleep,
         retry_last_feed=True,
+        accept_quote=MN.source_quote_is_fresh,
     )
 
 

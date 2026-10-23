@@ -57,8 +57,8 @@ def chase_entry_gate(pick, quote, market, entry_model, q, execution_quote, *, po
         if market.get("light") != "green":
             result["reason"] = "热点加速试仓仅在市场绿灯开放"
             return result
-        if execution_quote.get("status") != "cross_source_checked":
-            result["reason"] = "热点加速试仓必须通过双源实时行情核验"
+        if not execution_quote.get("fresh"):
+            result["reason"] = "热点加速试仓需要有效实时行情"
             return result
         if pct > limit_pct - 0.15:
             result["reason"] = "热点加速已接近涨停，不模拟封板排队成交"
@@ -90,14 +90,14 @@ def chase_entry_gate(pick, quote, market, entry_model, q, execution_quote, *, po
             # sector budget keeps the first hot-leader expression meaningful
             # while preserving headroom for confirmation or rotation.
             "allowed": True, "risk_scale": 0.50, "mode": "板块热点加速试仓",
-            "reason": "绿灯、前五热点、双源、Q1、主力与量能同步，允许未触板的50%试仓",
+            "reason": "绿灯、前五热点、有效行情、Q1、主力与量能同步，允许未触板的50%试仓",
         })
         return result
     if market.get("light") not in ("green", "yellow"):
         result["reason"] = "大盘非绿/黄灯，禁止追买"
         return result
-    if execution_quote.get("status") != "cross_source_checked":
-        result["reason"] = "追买必须通过双源实时行情核验"
+    if not execution_quote.get("fresh"):
+        result["reason"] = "追买需要有效实时行情"
         return result
     # limit_up_threshold 是交易所涨停前的保守触发线（9.5/19.5/29.5），
     # 实时行情通常会显示到 10/20/30%，允许小幅上浮用于行情取整。

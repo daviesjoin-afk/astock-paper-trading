@@ -369,6 +369,8 @@ MIGRATIONS = {
          paper_schema.ensure_candidate_selection),
         (37, "为最近任务与扫描审计指标增加排序匹配索引（不改业务数据）",
          paper_schema.ensure_paper_metrics_indexes),
+        (38, "为组合执行事实增加覆盖索引，避免读取委托审计大字段",
+         paper_schema.ensure_portfolio_order_read_index),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

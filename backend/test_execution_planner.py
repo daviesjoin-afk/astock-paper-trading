@@ -482,10 +482,10 @@ class SimulationExecutionContractTests(unittest.TestCase):
         self.assertNotEqual("fresh", reading.status)
         self.assertIn(reading.reason, {"asof_mismatch", "asof_unprovable", "stale"})
 
-    def test_single_source_evidence_blocks_fill(self):
+    def test_validated_single_source_is_not_blocked_as_unverified(self):
         _, context = self._facts(verification="range_timestamp_checked")
         result = EP.evaluate_simulated_execution(self._intent(), context)
-        self.assertIn(EP.ExecutionReason.MARKET_UNVERIFIED.value, result.reasons)
+        self.assertNotIn(EP.ExecutionReason.MARKET_UNVERIFIED.value, result.reasons)
 
     def test_protective_exit_does_not_require_a_second_source(self):
         """卖出只看"能不能用来定价"，双源背书是买入的门槛。
