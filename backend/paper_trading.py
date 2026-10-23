@@ -145,6 +145,10 @@ try:
     import ignition_entry as IGN
 except ImportError:  # 点火通道缺失时主力候选退回常规承接，不中断交易。
     IGN = None
+try:
+    import recovery_entry_decision as RECEV
+except ImportError:  # 恢复入场证据缺失时按"不启用"处理（fail-closed）。
+    RECEV = None
 
 # 点火买入总开关（2026-08-31 复核结论）：影子对比期默认关闭——点火区间
 # 候选照常被 30 秒通道确认并记录影子对比（原规则 vs 点火规则，命中后
@@ -3064,6 +3068,37 @@ def _volatility_shadow(code, asof_day, price=None):
 
 def _recovery_policy(account_id):
     return SPOL.recovery_policy(account_id)
+
+
+def _recovery_entry_assessment(account_id, code, quote, market, news, asof_day):
+    """跌后恢复入场的证据判定；不启用或没有上午证据时返回 ``None``。
+
+    与 ``_recovery_observation``（保护性卖出后的回补观察）是两条不同的路径：
+    那一条管已卖出的仓位怎么回来，这一条管"上午有依据、却没买成"的候选怎么在
+    午后重新获得资格。返回 ``None`` 表示这次决策与恢复路径无关，调用方的原有
+    行为完全不变。
+    """
+    if ET is None or RECEV is None:
+        return None
+    policy = SPOL.recovery_entry_policy(account_id)
+    if not policy:
+        return None
+    morning = ET.recovery_watch_evidence(account_id, code)
+    if not morning:
+        return None
+    try:
+        assessment = RECEV.assess(
+            morning=morning, quote=quote, market=market,
+            negative_news=bool(_negative_hits(news, code)), policy=policy,
+        )
+    except Exception as exc:  # 判定异常既不能冻结交易，也绝不能放行
+        return {
+            "allowed": False, "classification": "assessment_error",
+            "reason": f"恢复入场判定异常：{type(exc).__name__}: {exc}",
+        }
+    assessment["asof_day"] = _date(asof_day).isoformat()
+    assessment["policy"] = policy
+    return assessment
 
 
 def _recovery_watches(conn, account_id, day):
@@ -9404,6 +9439,15 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 复试。硬拒绝会让轮换回补（卖了买不回）和确认期候选被永久
         # 终结——2026-08 审计确认的 P1 缺陷。
         micro = entry_model.get("microstructure") or {}
+        # 跌后恢复入场：只对"上午有依据、随后被跌破"的候选，按当日可证明的
+        # 证据重新给出入场资格。证据不成立时原样传 False——状态机不会因为
+        # 调用了这个模块就放行；Q级、追高上限、席位、资金、14:30 释位窗口与
+        # 硬止损仍在这一层之外独立生效。
+        recovery = _recovery_entry_assessment(
+            account["id"], code, quote, market, news, asof_day,
+        )
+        if recovery is not None:
+            risk["recovery_entry"] = recovery
         timing_allowed, timing_info = ET.evaluate(
             account["id"], code, price, _num(quote.get("pct")),
             fast=bool(quote.get("_fast_entry_monitor")),
@@ -9414,6 +9458,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 "vol_ratio": _num(quote.get("vol_ratio")),
                 "active_buy_sell_imbalance": micro.get("active_buy_sell_imbalance"),
                 "depth_imbalance": micro.get("depth_imbalance"),
+                "recovery_ok": bool((recovery or {}).get("allowed")),
+                "recovery_reason": (recovery or {}).get("reason"),
             },
         )
         risk["entry_timing"] = timing_info

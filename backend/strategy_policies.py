@@ -239,6 +239,41 @@ def recovery_policy(account_id) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# RecoveryEntryPolicy：普跌后"有上午依据的候选"恢复入场的阈值。
+#
+# 与 RecoveryPolicy（保护性卖出后的回补观察）区分：那一套管**已卖出**的仓位
+# 怎么回来，这一套管**从没买成**的候选怎么在午后重新获得入场资格。
+#
+# 三个上限都只回答一个问题："个股的下跌能不能被大盘解释"：
+#   market_recovery_floor_pct  指数回到多少才算市场本身已经恢复；
+#   relative_floor_pct         个股相对沪深300 弱到多少就按个股问题处理；
+#   outflow_main_pct           主力净流入低于多少按持续流出处理。
+# 未声明的账户**不启用**该路径（返回空 dict → 决策模块直接不放行）。
+# ---------------------------------------------------------------------------
+RECOVERY_ENTRY_POLICIES: dict[str, dict] = {
+    # 只有趋势回踩需要它：它是唯一"午后不接受首次触发"的波段策略，
+    # 也因此最容易把"上午已确认、午后才恢复"的机会判定成全新追涨。
+    "trend_pullback": {
+        "market_recovery_floor_pct": -0.2,
+        "relative_floor_pct": -2.0,
+        "outflow_main_pct": -1.0,
+    },
+}
+
+
+def recovery_entry_policy(account_id) -> dict:
+    """RecoveryEntryPolicy 访问器：含 reclaim_pct/min_scans 的统一阈值表。
+
+    未声明的账户返回空 dict——调用方必须据此判定"该策略不启用恢复入场"，
+    不能拿 trend_pullback 的模板套到别的策略上。
+    """
+    specific = RECOVERY_ENTRY_POLICIES.get(str(account_id or ""))
+    if not specific:
+        return {}
+    return {**recovery_policy(account_id), **specific}
+
+
+# ---------------------------------------------------------------------------
 # EntryEconomicsPolicy：碎单经济性门槛（PR-41 迁入）。
 # 短线日内做T的低额委托经常被最低佣金、卖出印花税和双向滑点吞掉。
 # 这不是提高仓位上限，而是拒绝"理论有收益、成本后没有意义"的碎单。
