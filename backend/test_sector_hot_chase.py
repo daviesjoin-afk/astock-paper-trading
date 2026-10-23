@@ -21,7 +21,7 @@ class SectorHotChaseTests(unittest.TestCase):
         self.quote = {"pct": 8.2, "price": 10.82, "open_price": 10.0, "main_pct": 3.5, "vol_ratio": 2.4}
         self.model = {"passed": True, "score": 0.84, "overheat_guard": {"level": "caution"}}
         self.quality = {"tier": "Q1"}
-        self.execution_quote = {"status": "cross_source_checked"}
+        self.execution_quote = {"status": "cross_source_checked", "fresh": True}
 
     def test_hot_sector_candidate_can_use_bounded_chase_lane(self):
         price_ok, _ = P._new_entry_price_gate(self.account, self.pick, self.quote)

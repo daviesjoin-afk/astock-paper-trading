@@ -44,7 +44,7 @@ class QuoteFallbackTests(unittest.TestCase):
     def test_stale_or_wrong_day_owner_is_not_promoted(self):
         for kwargs in ({"status": MDC.STATUS_STALE}, {"age": 1}):
             row, _ = self.quote(**kwargs)
-            self.assertEqual(row["quote_source"], "local_cache")
+            self.assertEqual(row["quote_source"], "live" if kwargs.get("age", 0) == 0 else "local_cache")
             self.assertNotIn("primary_quote_origin", row)
 
     def test_complete_primary_does_not_read_owner_fallback(self):

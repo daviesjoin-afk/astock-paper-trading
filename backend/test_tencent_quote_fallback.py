@@ -56,6 +56,9 @@ class TencentSnapshotGateTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self._patch_min_rows()
+        fallback = mock.patch.object(dfc, "_fetch_sina_realtime_for_codes", return_value=[])
+        fallback.start()
+        self.addCleanup(fallback.stop)
 
     def _cleanup(self):
         for name in os.listdir(self._dir):
@@ -83,6 +86,22 @@ class TencentSnapshotGateTests(unittest.TestCase):
         self.assertEqual(first["quote_at"], "2026-10-14T10:30:00+08:00")
         self.assertIsNone(first["super_net"])
         self.assertIsNone(first["industry"])
+
+    def test_sina_can_supply_the_full_price_slice_when_tencent_is_down(self):
+        codes = _codes(4100)
+        rows = [{**_TencentRow.build(code), "source": "sina_public_quote",
+                 "quote_at": NOW.isoformat()} for code in codes]
+        with mock.patch.object(dfc, "fetch_tencent_realtime_for_codes", side_effect=RuntimeError("offline")), \
+                mock.patch.object(dfc, "_fetch_sina_realtime_for_codes", return_value=rows) as fallback:
+            snapshot = dfc.fetch_tencent_market_snapshot(codes, max_age=240, now=NOW)
+        fallback.assert_called_once_with(codes)
+        self.assertEqual(len(snapshot), len(codes))
+        self.assertEqual(snapshot[0]["source"], "sina_public_quote")
+        self.assertEqual(dfc.full_market_snapshot_source()["source"], "public_quote_full_snapshot")
+        reading = MDSvc.read_snapshot(now=NOW)
+        self.assertEqual(reading.reason, MDC.REASON_PRICE_ONLY_COVERAGE)
+        self.assertEqual(reading.freshness, MDC.FRESHNESS_FRESH)
+        self.assertFalse(MDC.is_cross_source_verified(reading.snapshot))
 
     def test_incomplete_coverage_publishes_nothing(self):
         codes = _codes(5000)

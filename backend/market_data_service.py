@@ -77,6 +77,7 @@ KINDS = (KIND_FULL_MARKET_SNAPSHOT,)
 #: 腾讯价格快照的 payload 标记。它只证明"当前名单的价格覆盖"，
 #: 不证明东财全市场横截面的资金流/估值/行业字段，也不能算逐票双源核验。
 TENCENT_SNAPSHOT_SOURCE = "tencent_public_quote_full_snapshot"
+PUBLIC_SNAPSHOT_SOURCE = "public_quote_full_snapshot"
 
 
 class MarketDataAccessError(RuntimeError):
@@ -181,7 +182,7 @@ def _full_market_snapshot(
     # the Eastmoney cross-section fields (flow / valuation / industry).  It is
     # therefore degraded evidence that must never read as a fresh verified
     # cross-section, and never as cross-source verified.
-    single_source = source == TENCENT_SNAPSHOT_SOURCE
+    single_source = source in {TENCENT_SNAPSHOT_SOURCE, PUBLIC_SNAPSHOT_SOURCE}
     price_only = single_source and complete
     complete = complete and not single_source
     return MDC.MarketDataSnapshot(
@@ -375,6 +376,8 @@ def refresh_snapshot(
     persisted, payload = _load_cached_snapshot_with_meta(kind)
     source = (TENCENT_SNAPSHOT_SOURCE
               if all(row.get("source") == "tencent_public_quote" for row in rows)
+              else PUBLIC_SNAPSHOT_SOURCE if all(row.get("source") in {
+                  "tencent_public_quote", "sina_public_quote"} for row in rows)
               else "eastmoney_clist_full_snapshot")
     # Another writer can publish after this provider returns. Only a matching
     # payload may supply metadata; code identity alone does not bind prices/time.

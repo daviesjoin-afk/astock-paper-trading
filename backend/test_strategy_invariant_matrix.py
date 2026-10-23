@@ -431,15 +431,15 @@ class SystemRiskNonOverrideTests(unittest.TestCase):
 
     def test_quote_verification_matrix_blocks_entry_but_allows_risk_exit(self):
         # 同一份"新鲜"行情，按核验等级 × 用途形成矩阵：
-        # 买入必须双源核验通过，风控退出允许降级（否则池子一坏就卖不掉）。
+        # 有效单源也允许买入；缺少校验或新鲜来源冲突仍然阻断买入。
         today = dt.date.today().isoformat()
-        base = {"price": 10.0, "quote_source": "live",
+        base = {"price": 10.0, "pct": 1.0, "quote_source": "live",
                 "quote_at": dt.datetime.now().isoformat(timespec="seconds")}
         matrix = {
             "cross_source_checked": {"entry": True, "exit": True},
             "cross_source_unavailable": {"entry": False, "exit": True},
             "cross_source_failed": {"entry": False, "exit": True},
-            "range_timestamp_checked": {"entry": False, "exit": True},
+            "range_timestamp_checked": {"entry": True, "exit": True},
             "incomplete": {"entry": False, "exit": False},
             None: {"entry": False, "exit": False},
         }

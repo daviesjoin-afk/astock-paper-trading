@@ -6348,13 +6348,14 @@ def _quotes(codes, asof_date=None):
         alternate = cross.get(code) or {}
         if not usable(primary) and usable(alternate):
             promoted = dict(alternate)
-            stamp = _parse_quote_timestamp(promoted.get("quote_at"))
-            promoted["quote_at"] = stamp.isoformat() if stamp else promoted.get("quote_at")
             live[code] = promoted
             fallback_codes.discard(code)
     for row in live.values():
-        stamp = _parse_quote_timestamp(row.get("quote_at"))
-        if stamp is not None:
+        text = str(row.get("quote_at") or "")
+        if text.isdigit() and len(text) == 14:
+            stamp = _parse_quote_timestamp(text)
+            if stamp is None:
+                continue
             if stamp.tzinfo is None:
                 stamp = stamp.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
             row["quote_at"] = stamp.isoformat()

@@ -799,7 +799,10 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
     normalized = MDF.normalize_codes(codes)
     if len(normalized) < _full_market_min_rows():
         return []
-    rows = fetch_tencent_realtime_for_codes(normalized)
+    try:
+        rows = fetch_tencent_realtime_for_codes(normalized) or []
+    except Exception:
+        rows = []
     allowed = set(normalized)
     by_code = {
         str(row.get("code")): row for row in rows
@@ -807,9 +810,6 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
         and MDF.usable_quote(row)
         and MN.finite_number(row.get("pct")) is not None
     }
-    if (len(by_code) < _full_market_min_rows()
-            or len(by_code) / len(normalized) < 0.90):
-        return []
     try:
         from market_data_contract import _parse_instant
     except ImportError:
@@ -824,7 +824,24 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
                 tzinfo=dt.timezone(dt.timedelta(hours=8))
             )
         except (TypeError, ValueError):
-            return None
+            return _parse_instant(value)
+
+    def current_row(row):
+        stamp = _tencent_instant(row.get("quote_at"))
+        return (MDF.usable_quote(row) and MN.finite_number(row.get("pct")) is not None
+                and stamp is not None and -120 <= (current - stamp).total_seconds() <= max_age)
+
+    missing = [code for code in normalized if not current_row(by_code.get(code) or {})]
+    if missing:
+        missing_codes = set(missing)
+        try:
+            alternate = _fetch_sina_realtime_for_codes(missing)
+        except Exception:
+            alternate = []
+        for row in alternate:
+            code = str(row.get("code") or "")
+            if code in missing_codes and row.get("source") == "sina_public_quote" and current_row(row):
+                by_code[code] = row
 
     fresh = 0
     for row in by_code.values():
@@ -848,7 +865,7 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
             "pct": MN.finite_number(row["pct"]), "prev_close": MN.finite_number(row.get("prev_close")),
             "quote_at": observed.isoformat(timespec="seconds"),
             "observed_at": observed.isoformat(timespec="seconds"),
-            "source": "tencent_public_quote",
+            "source": row.get("source") or "tencent_public_quote",
             "open_price": None, "high": None, "low": None,
             "volume": None, "amount": None, "turnover": None,
             "pe": None, "vol_ratio": None, "mktcap": None,
@@ -891,7 +908,9 @@ def _persist_tencent_snapshot(snapshot, normalized):
         return False
     payload = {
         "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source": "tencent_public_quote_full_snapshot",
+        "source": ("tencent_public_quote_full_snapshot"
+                   if all(row.get("source") == "tencent_public_quote" for row in snapshot)
+                   else "public_quote_full_snapshot"),
         "rows": snapshot, "complete": True, "expected_rows": len(normalized),
         "pages_expected": 0, "pages_ok": 0,
     }
@@ -937,7 +956,7 @@ def full_market_snapshot_source():
         "source": payload.get("source"),
         "saved_at": payload.get("saved_at"),
         "rows": len(payload.get("rows") or []),
-        "price_only": payload.get("source") == "tencent_public_quote_full_snapshot",
+        "price_only": payload.get("source") in {"tencent_public_quote_full_snapshot", "public_quote_full_snapshot"},
     }
 
 
@@ -998,7 +1017,7 @@ def _fresh_full_snapshot_from_disk(max_age):
             except (TypeError, ValueError):
                 # Preserve the previous mtime fallback for malformed quote_at.
                 pass
-        if payload.get("source") == "tencent_public_quote_full_snapshot":
+        if payload.get("source") in {"tencent_public_quote_full_snapshot", "public_quote_full_snapshot"}:
             try:
                 from market_data_contract import fresh_ratio
             except ImportError:

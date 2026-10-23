@@ -7,8 +7,11 @@ from unittest import mock
 import data_fetcher as D
 import execution_planner as E
 import market_data_contract as M
+import market_data_service as MS
 import marketdata_normalizers as N
 import paper_trading as P
+import portfolio_runtime as PR
+import portfolio_runtime_service as PRS
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 
@@ -106,6 +109,22 @@ class SingleSourceExecutionTests(unittest.TestCase):
     def test_source_freshness_rejects_future_and_bad_time(self):
         for stamp in ("bad", "", (self.now + dt.timedelta(hours=1)).isoformat()):
             self.assertFalse(N.source_quote_is_fresh({**self.quote, "quote_at": stamp}, now=self.now))
+
+    def test_price_only_source_can_value_positions_without_forging_complete_fields(self):
+        snapshot = MS._full_market_snapshot(rows=[self.quote], observed_at=self.now.isoformat(),
+            saved_at=self.now.isoformat(), complete=True, expected_rows=1,
+            kind=MS.KIND_FULL_MARKET_SNAPSHOT, source=MS.TENCENT_SNAPSHOT_SOURCE)
+        for seconds, expected in ((0, PR.AVAILABLE), (M.LIVE_MARKET_POLICY.max_age_seconds + 1, PR.UNAVAILABLE)):
+            reading = M.classify(snapshot, M.LIVE_MARKET_POLICY,
+                                 now=self.now + dt.timedelta(seconds=seconds), asof_day=self.day)
+            fact = PRS._market_valuation_dimension(owners=("test",), asof_day=self.day, reading=reading,
+                expected_identity=M.snapshot_fingerprint(snapshot),
+                positions=({"account_id": "test", "code": "600001", "qty": 100, "cost": 9999.},))
+            self.assertEqual(fact.status, expected)
+            if expected == PR.AVAILABLE:
+                self.assertEqual(fact.facts["market_value_by_account"]["test"], 1000.)
+                self.assertEqual(fact.facts["market_verification"], M.VERIFICATION_NOT_ATTEMPTED)
+        self.assertFalse(M.is_cross_source_verified(snapshot))
 
 
 if __name__ == "__main__":
