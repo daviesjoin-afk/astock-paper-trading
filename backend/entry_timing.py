@@ -39,6 +39,11 @@ PROFILES = {
         "afternoon_first_trigger": True,
     },
     # 趋势波段优选：只在开盘价附近/回踩位入场；>5% 视为动量禁区。
+    # 2026-10-23 操作员决定：午后首次触发放开。理由是"恐慌后确认恢复、择机
+    # 买入"被"午后不接受首次触发"整条挡住（晋西车轴 13:07 模型 0.756 高于
+    # 门槛 0.580 仍被拒）。放开的是时段，不是约束：追高帽（1.5%）、连续确认
+    # （2 次 / ≥300 秒）、Q级、双源、13:05-14:30 释位窗口与 14:30 截止全部
+    # 照旧；"突破加速后不许追"仍由动量禁区（>5%）表达。
     "trend_pullback": {
         "confirm_scans": 2,
         "confirm_min_seconds": 300,
@@ -47,12 +52,7 @@ PROFILES = {
         "max_chase_from_trigger": 0.015,
         "momentum_mode_from": 0.05,
         "momentum_confirm_scans": 99,   # 实际禁止动量追
-        "afternoon_first_trigger": False,
-        # 午后恢复入场：只有上午触发过、跌破后又满足恢复证据的候选，才能
-        # 在午后重新获得入场资格。``afternoon_first_trigger=False`` 仍然
-        # 挡住"全天全新"的午后追涨候选——两者不能互相替代。
-        "recovery_entry": True,
-        "recovery_confirm_scans": 2,
+        "afternoon_first_trigger": True,
     },
     # 板块轮动先锋：板块启动两次确认 + 触发后真实回踩结构
     #（冲高≥1% → 回踩不破触发价 → 才允许入场），不再把"离MA20不远"当回踩。
@@ -67,8 +67,9 @@ PROFILES = {
         "afternoon_first_trigger": True,
         "pullback_structure_required": True,
     },
-    # 三日策略：收盘级筛选 + 早盘执行确认；10:30 后不接受首次触发，
-    # 禁止盘中后段把已加速股票再当首发突破。
+    # 三日策略：收盘级筛选 + 早盘执行确认。``morning_window_only`` 现在只
+    # 约束**上午**的首发窗口（10:30 后不再把加速股当首发突破）；2026-10-23
+    # 操作员决定午后首次触发放开，因此 13:00 之后不再受这条限制。
     "reported_profit_breakout": {
         "confirm_scans": 2,
         "confirm_min_seconds": 300,
@@ -77,7 +78,7 @@ PROFILES = {
         "max_chase_from_trigger": 0.015,
         "momentum_mode_from": 0.05,
         "momentum_confirm_scans": 3,
-        "afternoon_first_trigger": False,
+        "afternoon_first_trigger": True,
         "morning_window_only": "10:30",
     },
     # 超强主力股：常规承接 2 次确认（比普通波段快）；涨幅进入点火区间
@@ -159,12 +160,19 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
         t = now.time()
 
         # ---- 时段窗口 ----
+        # ``morning_window_only`` 只约束**上午**：窗口关闭后到 13:00 之间不再
+        # 接受首发突破（"别把上午后段已加速的股票当首发"），午后是否允许由
+        # ``afternoon_first_trigger`` 单独表达。两条规则不能互相覆盖——否则
+        # 一个上午窗口就会顺带把整个下午挡死。
+        afternoon_start = dt.time(13, 0)
         cutoff = profile.get("morning_window_only")
-        if record is None and cutoff and t >= dt.time.fromisoformat(cutoff + ":00"):
-            return False, {"state": "observing",
-                           "reason": f"已过首发窗口 {cutoff}，当日不把加速股当首发突破"}
+        if record is None and cutoff:
+            cutoff_at = dt.time.fromisoformat(cutoff + ":00")
+            if cutoff_at <= t < afternoon_start:
+                return False, {"state": "observing",
+                               "reason": f"已过首发窗口 {cutoff}，当日不把加速股当首发突破"}
         if (record is None and not profile.get("afternoon_first_trigger", True)
-                and t >= dt.time(13, 0)):
+                and t >= afternoon_start):
             return False, {"state": "observing",
                            "reason": "午后不接受首次触发，等待次日早盘结构"}
 

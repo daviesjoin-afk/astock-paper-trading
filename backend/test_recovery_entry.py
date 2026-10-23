@@ -50,7 +50,17 @@ import strategy_policies as SPOL  # noqa: E402
 ACCOUNT = "trend_pullback"
 CODE = "600495"
 DAY = dt.date(2026, 10, 23)
-POLICY = SPOL.recovery_entry_policy(ACCOUNT)
+#: 生产表当前为空（2026-10-23 操作员改为直接放开午后首次触发），所以这里的
+#: 策略阈值用显式 fixture：既测机制，也把"声明该策略时阈值长什么样"钉下来。
+POLICY = {
+    "min_scans": 2,
+    "cooldown_minutes": 60,
+    "reclaim_pct": 0.008,
+    "max_days": 3,
+    "market_recovery_floor_pct": -0.2,
+    "relative_floor_pct": -2.0,
+    "outflow_main_pct": -1.0,
+}
 
 MORNING = {
     "morning_evidence": {
@@ -92,7 +102,10 @@ class EvidenceDecisionTests(unittest.TestCase):
         self.assertEqual(RECEV.CLASSIFICATION_NO_EVIDENCE, verdict["classification"])
 
     def test_re01_undeclared_strategy_is_disabled(self):
-        verdict = _assess(policy=SPOL.recovery_entry_policy("tq_breakout"))
+        # 生产表目前为空：任何账户拿到的都是空策略 → 直接判未启用。
+        for account_id in (ACCOUNT, "tq_breakout", "reported_profit_breakout"):
+            self.assertEqual({}, SPOL.recovery_entry_policy(account_id), account_id)
+        verdict = _assess(policy={})
         self.assertFalse(verdict["allowed"])
         self.assertEqual(RECEV.CLASSIFICATION_DISABLED, verdict["classification"])
 
@@ -168,14 +181,27 @@ class _FakeDateTimeModule:
 
 
 class _StateCase(unittest.TestCase):
+    #: 机制测试需要"声明了恢复通道"的 profile；生产表按操作员决定已经关掉，
+    #: 所以这里显式打桩声明，而不是依赖生产配置。
+    PATCH_RECOVERY_PROFILE = True
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self._patches = (
+        self._patches = [
             mock.patch.object(ET, "STATE_PATH",
                               str(pathlib.Path(self.tmp.name) / "state.json")),
             mock.patch.object(ET, "_state", None),
             mock.patch.object(ET, "dt", _FakeDateTimeModule()),
-        )
+        ]
+        if self.PATCH_RECOVERY_PROFILE:
+            self._patches.append(mock.patch.dict(ET.PROFILES, {
+                ACCOUNT: dict(
+                    ET.PROFILES[ACCOUNT],
+                    recovery_entry=True,
+                    recovery_confirm_scans=2,
+                    afternoon_first_trigger=False,
+                ),
+            }))
         for patcher in self._patches:
             patcher.start()
 
@@ -256,12 +282,13 @@ class RecoveryWatchStateTests(_StateCase):
         self.assertEqual("observing", info["state"])
         self.assertIn("午后不接受首次触发", info["reason"])
 
-    def test_re08_other_profiles_do_not_get_the_recovery_path(self):
+    def test_re08_fixture_declares_the_recovery_path(self):
+        """本类依赖打桩声明：生产表已按操作员决定关掉恢复通道。"""
+        self.assertTrue(ET.PROFILES[ACCOUNT].get("recovery_entry"))
+        self.assertFalse(ET.PROFILES[ACCOUNT].get("afternoon_first_trigger"),
+                         "机制测试沿用「午后禁区 + 恢复通道」的旧组合，避免两套规则互相掩盖")
         self.assertFalse(ET.PROFILES["tq_breakout"].get("recovery_entry"),
-                         "日内做T本来就允许午后首次触发，不需要恢复通道")
-        self.assertFalse(ET.PROFILES["reported_profit_breakout"].get("recovery_entry"),
-                         "三日策略的 10:30 首发窗口是策略特征，不因恢复通道放宽")
-        self.assertTrue(ET.PROFILES["trend_pullback"].get("recovery_entry"))
+                         "日内做T不需要恢复通道")
 
     def test_re05_evidence_accessor_is_read_only(self):
         self.confirm_morning()
@@ -283,6 +310,52 @@ class RecoveryWatchStateTests(_StateCase):
         allowed, info = ET.evaluate(other, CODE, 10.05, 1.0, now=self.at(10, 33))
         self.assertIn(info["state"], {"triggered", "confirmed"},
                       "删记录后应当可以按全新触发重新观察")
+
+
+class AfternoonTriggerPolicyTests(_StateCase):
+    """RE-11 —— 午后首次触发放开（trend_pullback + 三日策略）。
+
+    2026-10-23 操作员决定：两套策略都允许午后首次触发。放开的是**时段**，
+    不是约束——追高帽、确认轮数与间隔、Q级、双源、13:05-14:30 释位窗口和
+    14:30 截止都在策略表之外单独生效。三日策略上午的 10:30 首发窗口保留，
+    但它现在只约束上午，不再顺带挡死整个下午。
+    """
+
+    PATCH_RECOVERY_PROFILE = False
+
+    def test_re11_production_profiles_allow_afternoon_first_trigger(self):
+        for account_id in ("trend_pullback", "reported_profit_breakout"):
+            with self.subTest(account=account_id):
+                profile = ET.PROFILES[account_id]
+                self.assertTrue(profile.get("afternoon_first_trigger"), account_id)
+                self.assertFalse(profile.get("recovery_entry"), account_id)
+
+    def test_re11_trend_pullback_can_trigger_in_the_afternoon(self):
+        allowed, info = ET.evaluate(ACCOUNT, CODE, 9.52, -0.8, now=self.at(13, 30))
+        self.assertFalse(allowed, "首次触发仍要连续确认，不能一轮就买")
+        self.assertEqual("triggered", info["state"])
+        self.assertIn("首次触发", info["reason"])
+        allowed, info = ET.evaluate(ACCOUNT, CODE, 9.52, -0.8, now=self.at(13, 36))
+        self.assertTrue(allowed, f"午后连续确认后应当允许：{info}")
+
+    def test_re11_three_day_strategy_keeps_the_morning_cutoff_only(self):
+        strategy = "reported_profit_breakout"
+        allowed, info = ET.evaluate(strategy, CODE, 10.0, 1.2, now=self.at(9, 50))
+        self.assertEqual("triggered", info["state"], f"早盘窗口内应当可以首发：{info}")
+        ET.reset(strategy)
+        allowed, info = ET.evaluate(strategy, CODE, 10.0, 1.2, now=self.at(10, 45))
+        self.assertFalse(allowed)
+        self.assertEqual("observing", info["state"])
+        self.assertIn("已过首发窗口 10:30", info["reason"])
+        ET.reset(strategy)
+        allowed, info = ET.evaluate(strategy, CODE, 10.0, 1.2, now=self.at(13, 30))
+        self.assertEqual("triggered", info["state"],
+                         f"午后不受上午首发窗口限制：{info}")
+
+    def test_re11_recovery_entry_policy_table_is_empty(self):
+        self.assertEqual({}, SPOL.RECOVERY_ENTRY_POLICIES,
+                         "午后放开后恢复通道不再是前置条件，表必须为空以免留死门")
+        self.assertEqual({}, SPOL.recovery_entry_policy("trend_pullback"))
 
 
 class ThreeScenarioReplayTests(_StateCase):

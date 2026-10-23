@@ -249,16 +249,13 @@ def recovery_policy(account_id) -> dict:
 #   relative_floor_pct         个股相对沪深300 弱到多少就按个股问题处理；
 #   outflow_main_pct           主力净流入低于多少按持续流出处理。
 # 未声明的账户**不启用**该路径（返回空 dict → 决策模块直接不放行）。
+#
+# 当前为空：2026-10-23 操作员决定直接放开午后首次触发，恢复通道因此不再
+# 是"午后能不能买"的前置条件（它本来是替被时段规则挡住的候选开一条窄门）。
+# 机制、状态机分支与测试全部保留；要重新启用，在此声明账户阈值、并给对应
+# entry_timing profile 加上 ``recovery_entry``/``recovery_confirm_scans``。
 # ---------------------------------------------------------------------------
-RECOVERY_ENTRY_POLICIES: dict[str, dict] = {
-    # 只有趋势回踩需要它：它是唯一"午后不接受首次触发"的波段策略，
-    # 也因此最容易把"上午已确认、午后才恢复"的机会判定成全新追涨。
-    "trend_pullback": {
-        "market_recovery_floor_pct": -0.2,
-        "relative_floor_pct": -2.0,
-        "outflow_main_pct": -1.0,
-    },
-}
+RECOVERY_ENTRY_POLICIES: dict[str, dict] = {}
 
 
 def recovery_entry_policy(account_id) -> dict:
