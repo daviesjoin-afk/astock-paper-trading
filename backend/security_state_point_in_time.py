@@ -82,8 +82,10 @@ import os
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 try:  # ``backend`` on sys.path（生产与 ``cd backend`` 测试）
+    import data_paths
     import point_in_time as PIT
 except ImportError:  # pragma: no cover - package-style import
+    from . import data_paths
     from . import point_in_time as PIT
 
 
@@ -149,9 +151,7 @@ def default_archive_path() -> str:
     override = os.environ.get(ARCHIVE_ENV_VAR)
     if override and override.strip():
         return override.strip()
-    backend_dir = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(backend_dir)
-    return os.path.join(base, "data_cache", DEFAULT_ARCHIVE_NAME)
+    return data_paths.data_path(DEFAULT_ARCHIVE_NAME)
 
 
 def load_archive(path: Optional[str] = None) -> Optional[dict]:

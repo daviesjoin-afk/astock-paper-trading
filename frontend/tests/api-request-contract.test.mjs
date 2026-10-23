@@ -1103,3 +1103,101 @@ test("源码保留只读短路与固定存储 key（后端存在性守卫的锚�
   assert.ok(text.includes("astock.operatorToken.v1"));
   assert.ok(!text.includes("X-Operator-Token"));
 });
+
+// ─────────────────────────────────────────────
+// 10. 超时必须覆盖正文读取（B4 回归）
+//
+// 缺陷：计时器在响应头到达时就清掉了，而正文是之后由 `_settle` 读的。服务端或
+// 代理只要先回响应头、再让正文停滞，这次请求就再也不受设定超时约束；依赖
+// “请求完成” 才释放的界面加载状态会一直挂着。同时“读不到正文”不能被 JSON 解析
+// 兜底吞成成功的 `{}`。
+// ─────────────────────────────────────────────
+
+test("正文停滞也受超时约束（读取正文在计时器内）", async () => {
+  reset();
+  const aborts = [];
+  const calls = await withFetch(
+    (n, url, init) => ({
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            aborts.push(url);
+            reject(new Error("aborted while reading body"));
+          });
+        }),
+    }),
+    () =>
+      withFastBackoff(() =>
+        rejectionOf(() => API.api("/api/version", { timeout: 30 })),
+      ),
+  );
+  assert.ok(calls.length >= 1);
+  assert.ok(aborts.length >= 1, "正文读取必须被同一个超时计时器中止");
+});
+
+test("正文读取失败不会被兜底成成功 {}", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const err = await captureError(
+    () => ({
+      ok: true,
+      status: 200,
+      text: async () => {
+        throw new Error("body read failed");
+      },
+    }),
+    () => API.apiPostJson("/api/strategies", { a: 1 }, { timeout: 5000 }),
+  );
+  assert.equal(err.message, "body read failed", "读取正文的异常必须传播");
+  assert.ok(!(err instanceof API.ApiError), "它不是 HTTP 错误，不该被包装成 ApiError");
+});
+
+test("text() 正文被解析成 JSON（新的读取路径）", async () => {
+  reset();
+  let value;
+  await withFetch(
+    () => ({ ok: true, status: 200, text: async () => JSON.stringify({ app: "astock" }) }),
+    async () => {
+      value = await API.api("/api/version");
+    },
+  );
+  assert.deepEqual(value, { app: "astock" });
+});
+
+test("空正文（204 / HEAD）仍产出 {}", async () => {
+  reset();
+  let value;
+  await withFetch(
+    () => ({ ok: true, status: 204, text: async () => "" }),
+    async () => {
+      value = await API.api("/api/version", { method: "HEAD" });
+    },
+  );
+  assert.deepEqual(value, {});
+});
+
+test("非 JSON 正文的成功响应回退到 {}（不抛解析错）", async () => {
+  reset();
+  let value;
+  await withFetch(
+    () => ({ ok: true, status: 200, text: async () => "<html>ok</html>" }),
+    async () => {
+      value = await API.api("/api/version");
+    },
+  );
+  assert.deepEqual(value, {});
+});
+
+test("非 JSON 正文的失败响应回退到状态码文案", async () => {
+  reset();
+  const err = await captureError(
+    () => ({ ok: false, status: 502, text: async () => "<html>bad gateway</html>" }),
+    () => withFastBackoff(() => API.api("/api/version")),
+  );
+  assert.ok(err instanceof API.ApiError);
+  assert.equal(err.status, 502);
+  assert.deepEqual(err.payload, {});
+  assert.match(err.message, /^请求失败 HTTP 502/);
+});

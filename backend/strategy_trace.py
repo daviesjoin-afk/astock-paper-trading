@@ -59,7 +59,10 @@ def _repo_root() -> Path:
 
 def _cache_root() -> Path:
     cache = os.environ.get("ASTOCK_CACHE_DIR")
-    return Path(cache).expanduser() if cache else _repo_root() / "data_cache"
+    if cache:
+        return Path(cache).expanduser()
+    import data_paths
+    return Path(data_paths.data_dir())
 
 
 def _default_trace_dir() -> Path:
