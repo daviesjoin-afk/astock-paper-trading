@@ -12,12 +12,12 @@ import math
 import os
 import statistics
 
+import data_paths
 from market_policy import market_light_scale
 
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SNAPSHOT_PATH = os.path.join(BASE, "data_cache", "paper_risk_snapshot.json")
-HISTORY_PATH = os.path.join(BASE, "data_cache", "paper_risk_factor_history.json")
+SNAPSHOT_PATH = data_paths.data_path("paper_risk_snapshot.json")
+HISTORY_PATH = data_paths.data_path("paper_risk_factor_history.json")
 RULE_VERSION = "paper-risk-v4-dynamic-v3-budgeted"
 EFFECTIVE_AT = "2026-07-29"
 

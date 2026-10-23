@@ -17,6 +17,7 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
+import data_paths
 import strategy_dsl_schema as DSL
 import strategy_lifecycle as SL
 
@@ -24,8 +25,7 @@ import strategy_lifecycle as SL
 ORIGINS = ("builtin", "user")
 LIFECYCLE_STATUSES = SL.STATES  # compatibility export; transition ownership is SL.
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
-_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_DB_PATH = os.path.join(_BASE, "data_cache", "paper_trading.sqlite3")
+DEFAULT_DB_PATH = data_paths.data_path("paper_trading.sqlite3")
 _VERSIONED_FIELDS = ("name", "implementation_key", "description", "metadata", "dsl_ast")
 
 

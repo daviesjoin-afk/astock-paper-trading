@@ -30,7 +30,13 @@ except ImportError:  # pragma: no cover - exercised only on Windows.
     _fcntl = None
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
+# ``ASTOCK_DATA_DIR`` must move *every* runtime artifact, not just the ledgers:
+# the K-line cache, snapshots, manifest and health file are the inputs that
+# selection / selection_tracking derive their own paths from.  Resolving the
+# cache root through ``data_paths`` keeps one directory owner for the whole
+# runtime state instead of splitting it between the source tree and an
+# isolated directory.
+CACHE_DIR = data_paths.data_dir()
 KLINE_DIR = os.path.join(CACHE_DIR, "klines")
 KLINE_MANIFEST_PATH = os.path.join(CACHE_DIR, "kline_manifest.json")
 # Full-market and risk-proxy snapshots must never overwrite each other.  The

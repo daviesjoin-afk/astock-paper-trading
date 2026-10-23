@@ -17,6 +17,7 @@ import os
 import sqlite3
 from collections import Counter, defaultdict
 
+import data_paths
 import execution_verification as EV
 try:
     from zoneinfo import ZoneInfo
@@ -25,8 +26,7 @@ except Exception:  # Windows minimal Python images may not ship tzdata.
     TZ = dt.timezone(dt.timedelta(hours=8))
 
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE, "data_cache")
+CACHE_DIR = data_paths.data_dir()
 DB_PATH = os.path.join(CACHE_DIR, "adaptive_learning.sqlite3")
 BENCHMARK_CACHE_KEY = "BENCH_000300"
 ENGINE_VERSION = "trade-attribution-v2-pit"

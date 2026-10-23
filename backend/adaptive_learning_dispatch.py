@@ -15,8 +15,9 @@ try:
 except ImportError:  # pragma: no cover - Windows source tests
     fcntl = None
 
-BASE = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CACHE_DIR = Path(os.getenv("ASTOCK_CACHE_DIR") or (BASE / "data_cache"))
+import data_paths
+
+CACHE_DIR = Path(os.getenv("ASTOCK_CACHE_DIR") or data_paths.data_dir())
 JOB_DIR = CACHE_DIR / "adaptive_learning_jobs"
 PENDING_DIR = JOB_DIR / "pending"
 RUNNING_DIR = JOB_DIR / "running"

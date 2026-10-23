@@ -122,7 +122,8 @@ def main(argv=None) -> int:
             import adaptive_engine as AE
             db_path = AE.DB_PATH
         except Exception:
-            db_path = "data_cache/adaptive_learning.sqlite3"
+            import data_paths
+            db_path = data_paths.data_path("adaptive_learning.sqlite3")
 
     try:
         conn = _connect(db_path)

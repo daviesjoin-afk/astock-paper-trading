@@ -1841,30 +1841,100 @@ def track_rules(trail_stop_pct: float = None, hard_stop_pct: float = None,
 def sector_linkage(window: int = 60, min_corr: float = 0.7):
     return L.sector_linkage(window=window, min_corr=min_corr)
 
+#: ``factors.compute_price_factors`` 的语义版本：算法一变，历史缓存必须失效。
+SCANNER_PRICE_FACTOR_VERSION = "scanner-price-factors-v1"
+_SCANNER_HISTORY_LOCK = threading.Lock()
+_SCANNER_HISTORY_CACHE = {"signature": None, "price": None, "codes": ()}
+
+
+def _scanner_history_signature():
+    """历史因子的输入指纹：完整交易日 + 历史清单版本 + 因子算法版本。"""
+    return (
+        _health_file_signature(dfc.KLINE_MANIFEST_PATH),
+        _health_file_signature(dfc.KLINE_DIR),
+        _health_file_signature(getattr(U, "UNIVERSE_PATH", "")),
+        getattr(dfc, "SHARED_KLINE_SOURCE_VERSION", "unknown"),
+        SCANNER_PRICE_FACTOR_VERSION,
+        U.latest_complete_trade_date(datetime.date.today()).isoformat(),
+    )
+
+
+def _scanner_history_factors():
+    """复用未变化的历史因子表：只改一个过滤条件不该重做整段历史。
+
+    每次扫描都读几千个 CSV、解析日期、去重排序再算整张价格因子表，其中
+    "完整交易日 + 历史清单 + 因子算法"三者不变时结果也完全相同。这里按这三项
+    复用已验证的因子表；**实时行情仍独立检查覆盖率与新鲜度**，历史数据有效性
+    检查也照旧执行（不是把整个响应缓存起来）。
+    """
+    signature = _scanner_history_signature()
+    with _SCANNER_HISTORY_LOCK:
+        cached = dict(_SCANNER_HISTORY_CACHE)
+    if cached["signature"] == signature and cached["price"] is not None:
+        return cached["price"], cached["codes"]
+    uni = U.load_universe() or U.build_universe()
+    klines = {}
+    for item in uni:
+        code = item["code"]
+        frame = _completed_daily_kline(dfc.load_shared_kline(code))
+        if frame is not None and len(frame) > 65:
+            klines[code] = frame
+    if not klines:
+        return None, ()
+    price_f = F.compute_price_factors(klines)
+    codes = tuple(klines.keys())
+    del klines
+    with _SCANNER_HISTORY_LOCK:
+        _SCANNER_HISTORY_CACHE.update(signature=signature, price=price_f, codes=codes)
+    return price_f, codes
+
+
+#: 证券范围判断需要读取的列（与 `selection_service._buy_scope` 的入参对应）。
+_SCOPE_COLUMNS = ("code", "name", "risk_flag", "instrument_type", "security_type")
+
+
+def _permitted_scope_mask(table):
+    """证券范围掩码：逐行调用**同一个** ``_buy_scope``，但不重建行对象。
+
+    ``DataFrame.apply(axis=1)`` 会为每一行构造一个 Series：5000 行 × 64 列时
+    实测 46ms，同样规则的 ``itertuples`` 约 9.5ms（见
+    ``scripts/source-audit-20261023/scope-probe.py``），掩码逐行一致。规则本身仍然
+    只在 ``selection_service._buy_scope`` 一处，这里不做任何复制。
+    """
+    present = [column for column in _SCOPE_COLUMNS if column in table.columns]
+    if "code" not in present:
+        return pd.Series(False, index=table.index, dtype=bool)
+    positions = {column: position for position, column in enumerate(present)}
+
+    def field(record, column):
+        position = positions.get(column)
+        return record[position] if position is not None else None
+
+    allowed = []
+    for record in table[present].itertuples(index=False, name=None):
+        allowed.append(_buy_scope(
+            field(record, "code"), field(record, "name"), field(record, "risk_flag"),
+            field(record, "instrument_type") or field(record, "security_type"),
+        )["allowed"])
+    return pd.Series(allowed, index=table.index, dtype=bool)
+
+
 @app.get("/api/scanner")
 def scanner(pe_max: float = None, pb_max: float = None, roe_min: float = None,
             mom20_min: float = None, pct_min: float = None, topn: int = 30):
     """全市场扫描器：按因子条件过滤股票池"""
     if not U.data_ready():
         return {"need_init": True, "message": "请先初始化历史数据"}
-    uni = U.load_universe() or U.build_universe()
-    codes = [u["code"] for u in uni]
-    klines = {}
-    for c in codes:
-        df = dfc.load_shared_kline(c)
-        df = _completed_daily_kline(df)
-        if df is not None and len(df) > 65:
-            klines[c] = df
-    if not klines:
+    price_f, requested_codes = _scanner_history_factors()
+    if price_f is None:
         return {"need_init": True, "message": "历史K线尚未就绪"}
-    price_f = F.compute_price_factors(klines)
-    requested_codes = list(klines.keys())
+    history_codes = set(requested_codes)
     try:
-        snapshot_result = dfc.fetch_realtime_for_codes(requested_codes, return_meta=True)
+        snapshot_result = dfc.fetch_realtime_for_codes(list(requested_codes), return_meta=True)
     except TypeError:
         # Keep compatibility with a test double/older worker, but still apply
         # the same fail-closed coverage gate to the returned list.
-        snapshot_result = {"rows": dfc.fetch_realtime_for_codes(requested_codes)}
+        snapshot_result = {"rows": dfc.fetch_realtime_for_codes(list(requested_codes))}
     except Exception as exc:
         snapshot_result = {"rows": [], "error": f"{type(exc).__name__}: {exc}"}
     if isinstance(snapshot_result, dict):
@@ -1890,7 +1960,7 @@ def scanner(pe_max: float = None, pb_max: float = None, roe_min: float = None,
         snap = snapshot_result or []
         if len({str(row.get("code")) for row in snap if isinstance(row, dict) and row.get("code")}) < max(4000, int(len(requested_codes) * 0.90 + 0.9999)):
             return {"need_init": True, "status": "degraded", "message": "实时行情覆盖不足，已停止正式扫描"}
-    snap_f = [s for s in snap if s["code"] in klines]
+    snap_f = [s for s in snap if s["code"] in history_codes]
     try:
         finance = dfc.fetch_finance_latest()
     except Exception:
@@ -1903,19 +1973,12 @@ def scanner(pe_max: float = None, pb_max: float = None, roe_min: float = None,
         asof=U.latest_complete_trade_date(datetime.date.today()).isoformat(),
         snapshot_asof=F.live_snapshot_asof(),
     )
-    sentiment = F.compute_sentiment_factors(set(klines.keys()))
+    sentiment = F.compute_sentiment_factors(history_codes)
     realtime_flow = {s["code"]: s.get("main_pct") for s in snap_f}
     table = S.build_factor_table(price_f, fund_f, sentiment, realtime_flow)
     df = table.reset_index().rename(columns={"index": "code"})
     # 全市场扫描与执行层共用同一证券范围，避免页面推荐无权限标的。
-    permitted = df.apply(
-        lambda row: _buy_scope(
-            row.get("code"), row.get("name"), row.get("risk_flag"),
-            row.get("instrument_type") or row.get("security_type"),
-        )["allowed"],
-        axis=1,
-    )
-    df = df.loc[permitted].copy()
+    df = df.loc[_permitted_scope_mask(df)].copy()
     # 按条件过滤
     if pe_max is not None:
         df = df[df["pe"].notna() & (df["pe"] <= pe_max)]
