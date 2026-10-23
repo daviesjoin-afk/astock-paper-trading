@@ -9,6 +9,7 @@ from unittest import mock
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paper_candidate_assembly as PCA  # noqa: E402
 import paper_trading as PT  # noqa: E402
 
 
@@ -47,8 +48,9 @@ class CandidateColumnReadTests(unittest.TestCase):
                 (PT.dfc, "fetch_finance_latest", {"data": {}}),
                 (PT.F, "compute_fundamental_factors", pd.DataFrame()),
                 (PT.S, "build_factor_table", table),
-                (PT, "_star_sector_impulse", {"银行": {"bonus": 2.5}}),
-                (PT, "_sector_heat_map", {"银行": {
+                # 板块证据已迁入装配模块，补丁跟随真正持有实现的模块。
+                (PCA, "_star_sector_impulse", {"银行": {"bonus": 2.5}}),
+                (PCA, "_sector_heat_map", {"银行": {
                     "score": 3.0, "early_rotation": True, "early_rotation_score": 1.5,
                 }}),
             ]

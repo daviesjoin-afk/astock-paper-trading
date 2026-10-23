@@ -3,8 +3,8 @@
 
 依赖方向（单向，不可反转）：
 
-    adaptive_engine.AdaptiveRunFactProjection      （owner：identity / 可用性 / 核验的 authority）
-    paper_trading.PaperJobRunFactProjection         （owner：同上）
+    adaptive_runtime_facts.AdaptiveRunFactProjection （owner：identity / 可用性 / 核验的 authority）
+    paper_runtime_facts.PaperJobRunFactProjection     （owner：同上）
               ↓
     ai_research_runtime_adapter        （本模块：唯一把两个 runtime owner 投影翻译成 typed evidence 的地方）
               ↓
@@ -38,8 +38,8 @@ strategy_research   "策略实验事实" —— runtime 运行失败不是实验
 每个 owner **自己**发布极小核验闭集，本模块只把 owner 的状态词归到 owner-neutral 三态：
 
 ```python
-adaptive_engine   ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES
-paper_trading     PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES
+adaptive_runtime_facts   ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES
+paper_runtime_facts      PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES
 ```
 
 归口是一张**完整表**，不是 ``if/else`` 链。每次签发前都做**双向**一致性检查（表必须恰好
@@ -101,18 +101,11 @@ physical database origin / trusted provenance:          OPEN / REQUIRED
 调用方仍可自造 SQLite fixture 并调用 owner 的 public read 拿到投影。那一步属于"可信数据库
 provenance"，是 R27 完成的前置条件，本 PR 不把它写成已解决。
 
-────────────── 本轮没有 production consumer（刻意） ──────────────
+────────────── 当前生产接入 ──────────────
 
-``deepseek_research._incident_evidence()`` 的 runtime 迁移**不在**本 PR 里：
-
-```text
-OPEN / REQUIRED:
-deepseek_research._incident_evidence 仍直读 adaptive_runs / paper_jobs / paper_orders。
-
-incident_triage runtime migration = DEFERRED（不是 REMOVED）── 留给 R27-B2C-8
-```
-
-于是 :func:`evidence_ref_from_runtime_projection` 在 production 里的调用点今天是 **0**。
+``deepseek_research._collect_typed_events`` 在 ``incident_triage`` 路径直接读取两个独立
+任务事实模块，并经本适配器转换成研究证据。它无需导入交易或自适应主模块。
+核验归口中的历史 owner 名称保持不变，事实类型和读取实现由独立模块提供。
 """
 from __future__ import annotations
 
@@ -120,7 +113,7 @@ from typing import Any, Mapping
 
 import adaptive_runtime_facts as AE
 import ai_research_contract as ARC
-import paper_trading as PT
+import paper_runtime_facts as PT
 
 __all__ = (
     "evidence_ref_from_runtime_projection",

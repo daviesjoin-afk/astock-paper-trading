@@ -127,3 +127,118 @@ def chase_entry_gate(pick, quote, market, entry_model, q, execution_quote, *, po
     result.update({"allowed": True, "risk_scale": 0.35, "mode": "短线确认追高",
                    "reason": "短线日内做T：主力、量能、Q1 后市和候选质量确认通过"})
     return result
+
+
+#: 一手金额不足一手时，可等待预算释放的绑定约束（其余属结构性不可满足）。
+WAITABLE_BINDING_CONSTRAINTS = ("cash", "weight", "exposure", "industry")
+
+
+def assess_order_economics(*, reasons, qty, fill_price, price, pending_cash,
+                           shared_cash, minimum_order_amount, lot_size,
+                           economics_policy, min_cost_edge, sizing,
+                           fee_estimator, sell_price_estimator, num):
+    """把最终数量换算成金额与费用，并判定金额/成本侧能否下单。
+
+    ``reasons`` 与 ``sizing`` 只读：本函数返回它自己新增的拒绝原因（硬拒绝与
+    软约束分开）以及需要写回的 sizing 字段。软约束进替补队列、硬拒绝终态
+    拒绝的口径由调用方按返回的分组决定；这里不读时钟、不访问市场、不写库。
+    """
+    _num = num
+    amount = qty * fill_price
+    fees = fee_estimator(amount, "buy")
+    updates = {
+        "one_lot_amount": round(lot_size * fill_price, 2),
+        "one_lot_fee": round(fee_estimator(lot_size * fill_price, "buy"), 2),
+        "cash_available": round(shared_cash, 2),
+        "qty_final": int(qty),
+    }
+    rejected = []
+    soft = []
+    if qty < lot_size and not reasons:
+        limits = sizing.get("constraint_shares") or {}
+        binding = [name for name, value in limits.items() if _num(value) < lot_size]
+        if not binding:
+            binding = list(sizing.get("binding_constraints") or [])
+        labels = {
+            "risk": "单笔止损预算", "weight": "单票仓位上限",
+            "exposure": "策略总仓位上限", "industry": "行业仓位上限",
+            "cash": "可用现金",
+        }
+        root = labels.get(binding[0], "风险约束") if binding else "风险约束"
+        root_limit = _num(limits.get(binding[0]), 0) if binding else 0
+        # binding 为 risk 时是结构性不可满足：高价股 × 紧止损使 by_risk 永远
+        # 不足一手，转等待池只会每天空转占位到 24h 归档。预算侧约束才可等待。
+        if set(binding) == {"risk"}:
+            rejected.append(
+                f"单笔止损预算结构性不足：一手约 ¥{lot_size * fill_price:,.2f}，"
+                f"风险预算最多 {root_limit:.0f} 股，转终态拒绝"
+            )
+        else:
+            rejected.append(
+                f"一手约 ¥{lot_size * fill_price:,.2f}，模型可买 {int(qty)} 股；金额约束仅影响下单规模，"
+                f"当前转入等待池（参考限制：{root}，最多 {root_limit:.0f} 股）"
+            )
+            soft.append(rejected[-1])
+    # 尘埃单：金额低于当前周期单席可表达金额且其余闸门全过时，若放行就会用
+    # 小仓占用稀缺席位；归为软拦截，预算释放后按全尺寸复核。
+    if qty >= lot_size and amount < minimum_order_amount and not reasons:
+        dust_reason = (
+            f"低于动态最小建仓金额 ¥{minimum_order_amount:,.0f}（当前 ¥{amount:,.0f}）；"
+            "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
+        )
+        rejected.append(dust_reason)
+        soft.append(dust_reason)
+    cash_after_pending = shared_cash - pending_cash
+    # 现金为零是真实安全否决；余额只是小于本单则属软性不足，仍可重试——
+    # 2026-08 审计发现这条曾被硬分类，导致只差排队的候选被永久拒绝。
+    if cash_after_pending <= 1e-6:
+        rejected.append(
+            f"共享资金池暂无可用现金（已有待成交买单预占 ¥{pending_cash:,.2f}）"
+            if pending_cash > 0 else "共享资金池暂无可用现金"
+        )
+    elif amount + fees > cash_after_pending + 1e-6:
+        cash_reason = (
+            f"共享资金池可用现金不足（已有待成交买单预占 ¥{pending_cash:,.2f}）"
+            if pending_cash > 0 else "共享资金池可用现金不足"
+        )
+        rejected.append(cash_reason)
+        soft.append(cash_reason)
+    if amount and fees / amount > 0.003:
+        cost_reason = "单笔最低佣金占比过高，暂不下单，候选保留在等待池复核"
+        rejected.append(cost_reason)
+        soft.append(cost_reason)
+    if economics_policy and amount > 0:
+        min_effective_amount = _num(economics_policy.get("min_effective_order_amount"), 0.0)
+        expected_edge = max(
+            _num(economics_policy.get("min_expected_edge_pct"), 0.0),
+            _num(min_cost_edge, 0.0),
+        )
+        # 用实际买入佣金 + 预估卖出佣金/印花税 + 双向滑点做保守成本门槛；
+        # 不把未实现收益当现金，只判断该委托是否值得发生。
+        expected_profit = amount * expected_edge
+        sell_fees = fee_estimator(amount, "sell")
+        slippage_cost = qty * (
+            abs(fill_price - price)
+            + abs(sell_price_estimator(price, "sell") - price)
+        )
+        estimated_round_trip_cost = fees + sell_fees + slippage_cost
+        updates["minimum_effective_order_amount"] = min_effective_amount
+        updates["expected_edge_pct"] = round(expected_edge * 100, 2)
+        updates["expected_profit_amount"] = round(expected_profit, 2)
+        updates["estimated_round_trip_cost"] = round(estimated_round_trip_cost, 2)
+        if min_effective_amount and amount < min_effective_amount:
+            min_amount_reason = (
+                f"短线有效委托至少 ¥{min_effective_amount:,.0f}，当前 ¥{amount:,.0f}；"
+                "金额约束仅用于委托 sizing，候选保留在等待池复核"
+            )
+            rejected.append(min_amount_reason)
+            soft.append(min_amount_reason)
+        elif expected_profit < estimated_round_trip_cost * 1.25:
+            edge_reason = (
+                f"短线预期毛收益 ¥{expected_profit:,.2f} 未覆盖估算往返成本 "
+                f"¥{estimated_round_trip_cost:,.2f}，候选保留在等待池复核"
+            )
+            rejected.append(edge_reason)
+            soft.append(edge_reason)
+    return {"amount": amount, "fees": fees, "sizing": updates,
+            "reasons": rejected, "soft_reasons": soft}

@@ -62,7 +62,7 @@ BACKEND = os.path.join(ROOT, "backend")
 
 #: 本 matrix 会改写的 production 文件。
 ADAPTIVE_FILE = "backend/adaptive_engine.py"
-PAPER_FILE = "backend/paper_trading.py"
+PAPER_FILE = "backend/paper_runtime_facts.py"
 ADAPTER_FILE = "backend/ai_research_runtime_adapter.py"
 CONTRACT_FILE = "backend/ai_research_contract.py"
 
@@ -181,7 +181,7 @@ T_INC_30D = _adapter("RuntimeSourceRegistryTests."
 T_INC_31 = _adapter("RuntimeMigrationDeferralTests."
                     "test_INC_31_the_runtime_adapter_has_no_production_callers")
 T_INC_32 = _adapter("RuntimeMigrationDeferralTests."
-                    "test_INC_32_incident_evidence_remains_deferred_legacy_runtime")
+                    "test_INC_32_incident_research_consumes_runtime_owner_facts")
 
 #: 点名的永久回归目标：不在本 matrix 的 mutation 里，但必须与 mutation target 一起先证明
 #: 在**干净源码**上 GREEN。否则"这些目标也验过"只是句话。

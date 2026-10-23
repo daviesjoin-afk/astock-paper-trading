@@ -11,7 +11,6 @@
 夹具全部是内存 SQLite + 注入的 fake provider / fake reader，无网络、不触碰执行路径。
 """
 
-import ast
 import os
 import sqlite3
 import sys
@@ -872,63 +871,7 @@ class EODIntradayVisibility(IngestionTestCase):
         self.assertFalse(decision.evidence_present)
 
 
-# ───────────────────────────── TTI12：Provider 不得写 archive ─────────────────────────────
-
-
-INGESTION_MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tradability_ingestion.py")
-
-
-def _ingestion_tree():
-    with open(INGESTION_MODULE_PATH, encoding="utf-8") as handle:
-        return ast.parse(handle.read())
-
-
-def _provider_classes(tree):
-    """摄取模块里，基类名含 ``Provider`` 或类名以 ``Provider`` 结尾（事实源 adapter）。"""
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
-            continue
-        bases = [ast.unparse(base) for base in node.bases]
-        if any("Provider" in base for base in bases) or node.name.endswith("Provider"):
-            yield node
-
-
-def _writes_archive(node):
-    """返回 Provider 类方法体里"写 archive"的违规表达式列表。"""
-    offenders = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            func = child.func
-            if isinstance(func, ast.Attribute) and func.attr == "save":
-                offenders.append(ast.unparse(child))
-        if isinstance(child, ast.Constant) and isinstance(child.value, str):
-            if "historical_tradability_archive" in child.value:
-                offenders.append(repr(child.value))
-    return offenders
-
-
-class ProvidersNeverWriteTheArchive(IngestionTestCase):
-    def test_provider_classes_do_not_write_archive(self):
-        tree = _ingestion_tree()
-        offenders = []
-        for cls in _provider_classes(tree):
-            hits = _writes_archive(cls)
-            if hits:
-                offenders.append(f"{cls.name}: {hits}")
-        self.assertEqual([], offenders, "Provider 不得写 archive，写 authority 只在 ingestion 编排层")
-
-    def test_guard_detects_a_provider_writing_archive(self):
-        """护栏必须真的能失败：合成一个写 archive 的 Provider，应被抓到。"""
-        source = (
-            "class FooProvider:\n"
-            "    def fetch(self):\n"
-            "        x = 'historical_tradability_archive'\n"
-            "        return x\n"
-        )
-        tree = ast.parse(source)
-        cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
-        self.assertTrue(_writes_archive(cls))
-
+# TTI12 的 Provider 禁写护栏集中在 test_tradability_architecture_guard.py。
 
 # ───────────────────────────── 23. Backfill commit / rollback（fix #1/#2） ─────────────────
 

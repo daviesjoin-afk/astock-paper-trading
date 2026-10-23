@@ -35,7 +35,6 @@ NOT_LEARNING_AUTHORITY = {
         # 这些函数里的比例是数据完整性门槛，不是 train/validation 切分。
         "_market_profile",
         "_alpha_dataset",
-        "_alpha_bounded_sample",
         # OHLC 字段覆盖率门槛（95%），与 partition 无关。
         "_data_input_state",
     },

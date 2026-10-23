@@ -48,7 +48,9 @@ class ArchitectureGuardTests(unittest.TestCase):
     def test_paper_trading_exposes_facade_delegation(self):
         with open(os.path.join(BACKEND, "paper_trading.py"), encoding="utf-8") as fh:
             facade = fh.read()
-        for call in ("PCS.validate_capital", "PCS.cycle_snapshot", "PCS.archive_cycle"):
+        # 快照由 PCS.archive_cycle 内部生成，CycleSnapshotTests 直接验证其行为；
+        # 主文件无需为它保留无调用的转发函数。
+        for call in ("PCS.validate_capital", "PCS.archive_cycle"):
             self.assertIn(call, facade, "façade 未委托 %s" % call)
 
 

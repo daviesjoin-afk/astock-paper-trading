@@ -19,8 +19,8 @@ import paper_selection as PS
 
 def _is_trade_day(day) -> bool:
     """复用统一交易日历（与 selection_runner 同一判定源）。"""
-    import main as M
-    return bool(M.U.is_trade_day(day))
+    import universe as U
+    return bool(U.is_trade_day(day))
 
 
 def main() -> int:

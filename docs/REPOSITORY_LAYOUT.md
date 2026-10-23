@@ -29,6 +29,9 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 | `api_settings.py` | 统一设置读写与审计 |
 | `api_strategies.py` | **Strategy Admin**（`/api/strategies`）：只做请求解析、调用用例、异常→状态码、响应 |
 | `main.py` | FastAPI 应用装配、静态页下发（`/`、`/app.js`、`/app.css`）、若干历史只读端点 |
+| `selection_service.py` | 网页与定时任务共享的选股流程、因子读取、结果缓存与后台上下文刷新；不创建 HTTP 应用 |
+| `paper_candidate_assembly.py` | 候选截面装配：时效行过滤、覆盖门禁、实时快照覆盖、因子表构建、证券权限与板块热度；只返回普通数据，不写库、不交易 |
+| `paper_entry_assessment.py` | 入场评分模型：均线结构、资金量能、微结构、DSL 声明式评估与 Q 分级确认；纯计算，账户 spec 由主编排绑定解析口 |
 
 约定：`api_*.py` **不**打开数据库、**不**复制业务规则、**不**按错误字符串猜状态码；
 策略相关一律走 `strategy_service`。
@@ -177,6 +180,7 @@ migration **v35** 新增 `experiment_search_runs` / `experiment_search_jobs` /
   `paper_performance`（盈亏）、`paper_portfolio`（lot 聚合）、`paper_trading_rules`
   （交易日/费用/证券权限）、`paper_quote_policy`（行情新鲜度与成交核验门禁）
 - **只读投影**：`paper_archive_projection`、`paper_ledger_reader`
+- **任务运行事实**：`paper_runtime_facts` 独立持有任务尝试的状态词表、不可变事实、时间/内容校验与按明确历史时点分页读取；调用方提供连接，模块不建库、不写入、不加载交易编排。`paper_trading` 仅再导出相同的公开对象以兼容旧入口；研究适配器及事故采集直接依赖事实模块。任务写入仍由原调度负责人完成。
 - **研究/选股**：`paper_selection`、`paper_research`、`paper_replay_regression`
 
 ### 5. 数据层与其他

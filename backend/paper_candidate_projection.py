@@ -5,6 +5,8 @@ No market access, ledger access, registry lookup or clock reads belong here.
 import pandas as pd
 
 import paper_candidate_live_fields as PCLF
+from paper_numeric import num
+from paper_trading_rules import asset_type
 
 
 def overlay_live_fields(table, live_map, factor_date):
@@ -38,3 +40,28 @@ def select_candidate_lanes(picks, *, reserved_limit=6, total_limit=30):
     hot_watch = [pick for pick in picks if pick.get("candidate_status") in reserved_statuses][:reserved_limit]
     regular = [pick for pick in picks if pick.get("candidate_status") not in reserved_statuses]
     return regular[:max(0, total_limit - len(hot_watch))] + hot_watch
+
+
+def risk_flag_codes(universe_rows):
+    """Codes the trading rules refuse regardless of strategy score or rank."""
+    return {
+        str(row.get("code")) for row in (universe_rows or [])
+        if row.get("risk_flag")
+        or "ST" in str(row.get("name") or "").upper()
+        or "退" in str(row.get("name") or "")
+    }
+
+
+def filter_executable_candidates(picks, *, mode=None, excluded_codes=()):
+    """Drop what the runtime cannot execute, keeping the original order.
+
+    Only three runtime predicates belong here: the intraday-T asset
+    restriction, the security-scope exclusion set and a non-positive price.
+    Sizing, cash and slot decisions stay with execution -- a candidate is
+    never deleted because one lot looks expensive.
+    """
+    excluded = set(excluded_codes or ())
+    if mode == "intraday_t":
+        picks = [pick for pick in picks if asset_type(pick.get("code"), pick.get("name")) == "stock_t1"]
+    picks = [pick for pick in picks if pick["code"] not in excluded]
+    return [pick for pick in picks if num(pick.get("price")) > 0]

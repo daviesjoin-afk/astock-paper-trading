@@ -6,7 +6,7 @@ import unittest
 from contextlib import ExitStack
 from unittest import mock
 
-import main as M
+import selection_service as M
 
 Thread = threading.Thread
 FINANCE = {"data": {"600000": {"net_profit": 123., "report_date": "2026-06-30",
@@ -54,6 +54,9 @@ class BackgroundContextTests(unittest.TestCase):
         self.assertEqual({}, M._load_selection_context("sentiment", sentiment))
         self.assertTrue(all(event.wait(1) for event in entered.values()))
         self.assertFalse(release.is_set())
+        # A slow provider can outlive the retry window; its active attempt
+        # must still prevent duplicate workers until it finishes.
+        self.clock.return_value = 200.
         for _ in range(10):
             M._load_selection_context("finance", finance)
             M._load_selection_context("sentiment", sentiment)

@@ -29,7 +29,7 @@ def _picks(prefix, count):
 
 
 def _payload(picks, date="2026-09-07"):
-    """构造与真实 main._select_uncached 同构的返回。
+    """构造与真实 selection_service._select_uncached 同构的返回。
 
     真实响应不会在顶层放日期：``historical_factor_date`` 在每只 pick 上，
     ``reference_date`` / ``complete_cutoff`` 在 ``data_quality`` 里。这里刻意
@@ -219,7 +219,7 @@ class PaperSelectionTests(unittest.TestCase):
 
     # -- 选股链路兼容（2026-09-08 生产事故回归）---------------------------
     def test_model_ids_within_select_whitelist(self):
-        # main._select_uncached 只放行 S.STRATEGIES ∪ S.PAPER_WEIGHTS；
+        # selection_service._select_uncached 只放行 S.STRATEGIES ∪ S.PAPER_WEIGHTS；
         # STRATEGY_MODEL 的模型 id 漂移出白名单会静默 error(0)。
         import strategies as S
         allowed = set(S.STRATEGIES) | set(S.PAPER_WEIGHTS)
@@ -248,7 +248,7 @@ class PaperSelectionTests(unittest.TestCase):
 
 
 class SelectUncachedWhitelistTests(unittest.TestCase):
-    """直接验证 main._select_uncached 对模拟盘模型 id 的白名单行为。
+    """直接验证 selection_service._select_uncached 对模拟盘模型 id 的白名单行为。
 
     2026-09-08 生产首跑：one_to_two/bottom_reversal/sentiment_pioneer 不在
     白名单内，_select_uncached 返回 JSONResponse，run_daily 逐策略炸出
@@ -257,7 +257,7 @@ class SelectUncachedWhitelistTests(unittest.TestCase):
     """
 
     def test_paper_model_ids_return_dict_not_jsonresponse(self):
-        import main as M
+        import selection_service as M
         original = M.U.coverage_report
 
         def low_coverage():

@@ -1322,27 +1322,6 @@ def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
     return rows
 
 
-def _alpha_bounded_sample(rows, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
-    """Deterministically cap each date/horizon cross-section for the GA lab."""
-    grouped = defaultdict(list)
-    for row in rows:
-        grouped[(row["profile_date"], row["horizon"])].append(row)
-    bounded = []
-    cap = max(100, int(max_rows_per_window))
-    for key in sorted(grouped):
-        items = grouped[key]
-        if len(items) > cap:
-            salt = f"{key[0]}:{key[1]}:"
-            items = sorted(
-                items,
-                key=lambda row: hashlib.sha256(
-                    f"{salt}{row.get('code') or ''}".encode("utf-8")
-                ).digest(),
-            )[:cap]
-        bounded.extend(items)
-    return bounded
-
-
 def _alpha_fitness(genome, rows):
     return AG.alpha_fitness(genome, rows, ALPHA_FEATURES, HORIZON_WEIGHTS)
 
@@ -3044,22 +3023,6 @@ def _closed_loop_state(conn, evidence=None):
         ],
     })
     return state
-
-
-def _shadow_history_rows(history):
-    return ASR.shadow_history_rows(history, num=_num)
-
-
-def _shadow_volatility(history, window):
-    return ASR.shadow_volatility(history, window, num=_num)
-
-
-def _shadow_atr_pct(history, window=20):
-    return ASR.shadow_atr_pct(history, window, num=_num)
-
-
-def _shadow_hhi(values):
-    return ASR.shadow_hhi(values, num=_num)
 
 
 def _portfolio_shadow_risk(positions, histories=None, asof=None, industry_shock_pct=-8.0,

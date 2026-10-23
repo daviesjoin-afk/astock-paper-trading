@@ -94,7 +94,7 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
         "backend/adaptive_selection.py": ("selection_candidate_facts", "selection_candidate_fact"),
         "backend/learning_evaluation.py": ("experiment_evaluation_facts", "experiment_evaluation_fact"),
         "backend/adaptive_runtime_facts.py": ("adaptive_run_facts", "reader"),
-        "backend/paper_trading.py": ("paper_job_run_facts", "paper_job_run_fact"),
+        "backend/paper_runtime_facts.py": ("paper_job_run_facts", "paper_job_run_fact"),
     }
     for filename, (function_name, fact_name) in list_specs.items():
         tree = ast.parse(sources.get(filename, ""))
@@ -243,7 +243,7 @@ def _load_sources() -> dict[str, str]:
     sources = {}
     names = (
         "deepseek_research.py", "ai_analysis.py", "adaptive_engine.py", "adaptive_runner.py",
-        "adaptive_runtime_facts.py",
+        "adaptive_runtime_facts.py", "paper_runtime_facts.py",
         "adaptive_risk.py", "adaptive_selection.py", "learning_evaluation.py",
         "paper_trading.py", "api_adaptive.py",
     )
@@ -257,6 +257,13 @@ def _load_sources() -> dict[str, str]:
 
 
 class FinalResearchConvergenceGuardTests(unittest.TestCase):
+    def test_paper_runtime_pagination_guard_checks_the_extracted_owner(self):
+        sources = _load_sources()
+        name = "backend/paper_runtime_facts.py"
+        self.assertIn("OFFSET ?", sources[name])
+        sources[name] = sources[name].replace("OFFSET ?", "")
+        self.assertTrue(any("paper_job_run_facts" in issue for issue in architecture_violations(sources)))
+
     def test_adaptive_runtime_pagination_guard_checks_the_extracted_owner(self):
         sources = _load_sources()
         name = "backend/adaptive_runtime_facts.py"

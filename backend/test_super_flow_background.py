@@ -7,7 +7,7 @@ import unittest
 from contextlib import ExitStack
 from unittest import mock
 
-import main as M
+import selection_service as M
 
 Thread = threading.Thread
 ROWS = [{"code": "600000", "super_net": 123., "quote_at": "2026-10-14T15:00:00+08:00"}]

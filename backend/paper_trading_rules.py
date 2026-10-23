@@ -6,6 +6,8 @@
 旧的内部调用和回放脚本不需要一次性迁移。
 """
 
+import datetime as dt
+
 COMMISSION = 0.0001
 MIN_COMMISSION = 0.0
 STAMP_SELL = 0.0005
@@ -25,6 +27,37 @@ def next_weekday(value):
 def is_trade_weekday(value):
     import universe as U
     return U.is_trade_day(value)
+
+
+def _date(value=None):
+    """Normalize a date-like value without touching the trading module."""
+    if value is None:
+        return dt.date.today()
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    return dt.date.fromisoformat(str(value)[:10])
+
+
+def trading_weekday_lag(reference_date, asof_date):
+    """返回参考日相对信号日落后的工作日数；未来日期或无效日期返回 None。"""
+    if not reference_date:
+        return None
+    try:
+        reference = _date(str(reference_date)[:10])
+    except (TypeError, ValueError):
+        return None
+    day = _date(asof_date)
+    if reference > day:
+        return None
+    lag = 0
+    cursor = reference
+    while cursor < day:
+        cursor += dt.timedelta(days=1)
+        if cursor.weekday() < 5:
+            lag += 1
+    return lag
 
 
 def commission(amount):

@@ -21,8 +21,6 @@ import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -49,6 +47,24 @@ def _get_se():
 
 
 import paper_storage as PST
+from paper_runtime_facts import (  # noqa: F401 - public compatibility exports
+    PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
+    PAPER_JOB_RUN_RECORD_KIND,
+    PAPER_JOB_RUN_LIFECYCLE_STATUSES,
+    PAPER_JOB_RUN_LEGACY_READONLY_STATUSES,
+    PAPER_JOB_RUN_TERMINAL_STATUSES,
+    PAPER_JOB_RUN_IN_PROGRESS_STATUSES,
+    PAPER_JOB_RUN_FACT_RECORDED,
+    PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
+    PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES,
+    PAPER_JOB_RUN_AVAILABILITY_TERMINAL,
+    PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS,
+    PAPER_JOB_RUN_AVAILABILITY_KINDS,
+    PaperJobRuntimeFactError,
+    PaperJobRunFactProjection,
+    paper_job_run_fact,
+    paper_job_run_facts,
+)
 import paper_timing as PTM
 import paper_order_execution_authority as POEA
 import paper_lot_ledger as PLL
@@ -76,7 +92,6 @@ import paper_slot_occupancy as PSO
 import paper_schedule_contract as PSch
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
-import paper_candidate_live_fields as PCLF
 import paper_dynamic_allocation as PDAlloc
 import paper_live_tradability as PLTrad
 import paper_position_review as PReview
@@ -96,6 +111,20 @@ import execution_planner as EP
 import execution_verification as EV
 import paper_entry_decision as PED
 import paper_candidate_projection as PCP
+import paper_candidate_assembly as PCA
+import paper_entry_assessment as PEA
+from paper_entry_assessment import (  # noqa: F401 - compatibility exports
+    _clip01,
+    _strategy_entry_assessment,
+)
+from paper_candidate_assembly import (  # noqa: F401 - compatibility exports
+    _sector_entry_threshold_context,
+    _sector_heat_map,
+    _sector_key,
+    _sector_overheat_guard,
+    _star_sector_impulse,
+    _trend_entry_threshold_context,
+)
 import paper_risk_market_inputs as PRMI
 import paper_sizing as PSZ
 import order_intent as OI
@@ -129,6 +158,7 @@ from paper_trading_rules import (
     limit_pct as _limit_pct,
     next_weekday as _next_weekday,
     security_scope as _security_scope,
+    trading_weekday_lag as _trading_weekday_lag,
 )
 try:
     import disclosure_timeline as DT
@@ -661,6 +691,11 @@ def _spec_for(account_id, conn=None):
     except (ValueError, sqlite3.Error):
         return ACS.fallback_spec()
     return USP.user_spec_for(context, risk_profiles=RISK_PROFILES)
+
+
+# 入场评分模型必须使用同一个账户声明解析口（含注册表运行时账户），
+# 否则用户策略会退回保守回退声明。
+PEA.bind_spec_resolver(_spec_for)
 
 
 def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=None):
@@ -1485,22 +1520,6 @@ def _wal_checkpoint():
     """显式收缩 WAL 日志（兼容包装）。"""
     PST.wal_checkpoint(DB_PATH)
 
-
-def _execute_with_retry(conn, sql, params=(), max_retries=3, hot_path=True):
-    """执行 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries, hot_path=hot_path)
-
-
-def _executemany_with_retry(conn, sql, params_list, max_retries=3, hot_path=True):
-    """执行批量 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.executemany_with_retry(
-        conn, sql, params_list, max_retries=max_retries, hot_path=hot_path
-    )
-
-
-def _commit_with_retry(conn, max_retries=3, hot_path=True):
-    """提交事务并在数据库锁定时重试（兼容包装）。"""
-    return PST.commit_with_retry(conn, max_retries=max_retries, hot_path=hot_path)
 
 @contextmanager
 def _db_readonly():
@@ -3501,26 +3520,6 @@ def _reference_date_is_fresh(reference_date, asof_date):
     return reference in {day, _previous_trade_weekday(day)}
 
 
-def _trading_weekday_lag(reference_date, asof_date):
-    """返回参考日相对信号日落后的工作日数；未来日期或无效日期返回 None。"""
-    if not reference_date:
-        return None
-    try:
-        reference = _date(str(reference_date)[:10])
-    except (TypeError, ValueError):
-        return None
-    day = _date(asof_date)
-    if reference > day:
-        return None
-    lag = 0
-    cursor = reference
-    while cursor < day:
-        cursor += dt.timedelta(days=1)
-        if cursor.weekday() < 5:
-            lag += 1
-    return lag
-
-
 def _strategy_reference_is_usable(account_id, reference_date, asof_date):
     spec = _spec_for(account_id)
     lag = _trading_weekday_lag(reference_date, asof_date)
@@ -4255,13 +4254,6 @@ def _new_listing_entry_assessment(account, pick, quote, kline, listing, market=N
     }
 
 
-def _sector_key(value):
-    text = str(value or "").strip()
-    for suffix in ("行业", "Ⅱ", "Ⅲ", "II", "III", "概念"):
-        text = text.replace(suffix, "")
-    return text
-
-
 SECTOR_SURGE_LANE_VERSION = "sector-surge-lane-v1"
 
 
@@ -4600,431 +4592,6 @@ def _ths_hot_lane_candidates(universe, live_map, seen_codes=None,
             "note": "注入候选仍走全部执行闸门；追高上限照常生效",
         }
     return lane, meta
-
-
-def _sector_heat_map(universe, sector_rows=None):
-    """Build a live breadth-aware sector map.
-
-    The old map was based only on the leading pages of the gainers list.  That
-    identifies a sector after several names have already accelerated, but it
-    misses the earlier, more useful rotation phase.  We retain that source as
-    corroboration, while calculating breadth and median strength from the
-    full live universe.  This is a ranking context only: it cannot bypass any
-    security, quote, Q-level, capital or risk gate.
-    """
-    rows = list(sector_rows or [])
-    source = "盘中热点板块"
-
-    # First build same-snapshot industry statistics from the full universe.
-    # A valid onset needs breadth and positive median strength, not one
-    # limit-up stock.  Missing main-flow data is neutral rather than positive.
-    grouped = {}
-    for item in universe or []:
-        key = _sector_key(item.get("industry"))
-        pct = item.get("pct")
-        if not key or not isinstance(pct, (int, float)) or abs(float(pct)) > 20:
-            continue
-        bucket = grouped.setdefault(key, {"pct": [], "main_pct": [], "codes": set()})
-        bucket["pct"].append(float(pct))
-        main_pct = item.get("main_pct")
-        if isinstance(main_pct, (int, float)) and abs(float(main_pct)) <= 100:
-            bucket["main_pct"].append(float(main_pct))
-        code = str(item.get("code") or "")
-        if code:
-            bucket["codes"].add(code)
-
-    def _median(values):
-        values = sorted(values)
-        if not values:
-            return 0.0
-        middle = len(values) // 2
-        return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2.0
-
-    live_metrics = {}
-    for key, bucket in grouped.items():
-        values = bucket["pct"]
-        count = len(bucket["codes"]) or len(values)
-        if count < 5:
-            continue
-        median_pct = _median(values)
-        positive_ratio = sum(value > 0 for value in values) / len(values)
-        median_main_pct = _median(bucket["main_pct"]) if bucket["main_pct"] else None
-        # Early rotation: broad participation, modest positive median and no
-        # single-name inference.  The flow clause is only required when flow
-        # coverage exists for the group; unknown flow never grants a bonus.
-        flow_confirmed = median_main_pct is not None and median_main_pct >= 0.0
-        onset = (
-            median_pct >= 0.35
-            and positive_ratio >= 0.58
-            and flow_confirmed
-        )
-        onset_score = 0.0
-        if onset:
-            onset_score = min(
-                1.0,
-                0.34
-                + min(0.26, median_pct * 0.18)
-                + min(0.24, max(0.0, positive_ratio - 0.50) * 1.2)
-                + (0.10 if flow_confirmed else 0.0),
-            )
-        live_metrics[key] = {
-            "member_count": count,
-            "median_pct": round(median_pct, 3),
-            "positive_ratio": round(positive_ratio, 3),
-            "median_main_pct": round(median_main_pct, 3) if median_main_pct is not None else None,
-            "early_rotation": bool(onset),
-            "early_rotation_score": round(onset_score, 3),
-        }
-
-    if not rows:
-        rows = [
-            {
-                "name": key,
-                "pct": metrics["median_pct"],
-                "leader_count": metrics["member_count"],
-                "positive_ratio": metrics["positive_ratio"],
-                "source": "全市场实时行业聚合",
-            }
-            for key, metrics in live_metrics.items()
-        ]
-        rows.sort(key=lambda row: (_num(row.get("pct"), -999), _num(row.get("positive_ratio"), 0)), reverse=True)
-        source = "全市场实时行业聚合"
-
-    # Keep the external top-sector rows, then add broad early-rotation groups
-    # that are not yet in the top-gainer pages.
-    by_key = {_sector_key(row.get("name")): dict(row) for row in rows if _sector_key(row.get("name"))}
-    for key, metrics in live_metrics.items():
-        if metrics["early_rotation"] and key not in by_key:
-            by_key[key] = {
-                "name": key, "pct": metrics["median_pct"],
-                "leader_count": metrics["member_count"],
-                "positive_ratio": metrics["positive_ratio"],
-                "source": "全市场实时行业聚合",
-            }
-    ordered = sorted(
-        by_key.values(),
-        key=lambda row: (
-            bool(live_metrics.get(_sector_key(row.get("name")), {}).get("early_rotation")),
-            _num(row.get("pct"), -999), _num(row.get("positive_ratio"), 0),
-        ),
-        reverse=True,
-    )
-    output = {}
-    for rank, row in enumerate(ordered[:35], 1):
-        key = _sector_key(row.get("name"))
-        if not key:
-            continue
-        raw_pct = _num(row.get("pct"), 0)
-        if abs(raw_pct) > 30:
-            continue
-        pct = max(-20.0, min(20.0, raw_pct))
-        metrics = live_metrics.get(key, {})
-        onset_score = _num(metrics.get("early_rotation_score"), 0.0)
-        strength = max(0.0, 2.5 - (rank - 1) * 0.10) + max(0.0, pct) * 0.18 + onset_score * 0.35
-        output[key] = {
-            "rank": rank,
-            "name": row.get("name") or key,
-            "pct": round(pct, 2),
-            "score": round(strength, 3),
-            "top_stock": row.get("top_stock"),
-            "top_stock_code": row.get("top_stock_code"),
-            "source": row.get("source") or source,
-            **metrics,
-        }
-    return output
-
-
-def _sector_entry_threshold_context(sector_heat, market, candidate_heat=None):
-    """Derive a same-day sector-entry threshold from market and heat dispersion.
-
-    A static 0.68 threshold makes a broad momentum day and a weak rotation day
-    indistinguishable.  The context is persisted on each candidate so an order
-    audit can show the exact daily threshold and why it moved.
-    """
-    heats = list((sector_heat or {}).values())
-    top = heats[:10]
-    positive_top = sum(1 for item in top if _num(item.get("pct"), 0) > 0)
-    light = str((market or {}).get("light") or "unknown")
-    breadth = _num((market or {}).get("breadth_up_pct"), None)
-    threshold = {"green": 0.59, "yellow": 0.63, "red": 0.68}.get(light, 0.67)
-    reasons = [f"市场{ {'green':'绿灯','yellow':'黄灯','red':'红灯'}.get(light, '数据未知') }"]
-    if breadth is not None:
-        if breadth >= 65:
-            threshold -= 0.03
-            reasons.append(f"上涨家数占比 {breadth:.1f}% 较高")
-        elif breadth >= 55:
-            threshold -= 0.01
-            reasons.append(f"上涨家数占比 {breadth:.1f}% 偏强")
-        elif breadth < 45:
-            threshold += 0.03
-            reasons.append(f"上涨家数占比 {breadth:.1f}% 偏弱")
-        elif breadth < 50:
-            threshold += 0.015
-            reasons.append(f"上涨家数占比 {breadth:.1f}% 偏谨慎")
-    else:
-        threshold += 0.015
-        reasons.append("市场宽度缺失，额外保守")
-    if top:
-        if positive_top >= 7:
-            threshold -= 0.02
-            reasons.append(f"前{len(top)}热点中 {positive_top} 个上涨，热点扩散充分")
-        elif positive_top <= 2:
-            threshold += 0.025
-            reasons.append(f"前{len(top)}热点中仅 {positive_top} 个上涨，热点集中")
-    else:
-        threshold += 0.02
-        reasons.append("热点板块样本不足")
-    candidate_heat = candidate_heat or {}
-    rank = int(_num(candidate_heat.get("rank"), 999))
-    pct = _num(candidate_heat.get("pct"), 0)
-    if rank <= 3 and pct >= 1.5:
-        threshold -= 0.015
-        reasons.append(f"所属板块第{rank}名且涨幅 {pct:+.2f}%")
-    elif rank > 8 or pct < 0.5:
-        threshold += 0.02
-        reasons.append(f"所属板块第{rank}名、涨幅 {pct:+.2f}%")
-    threshold = round(max(0.54, min(0.72, threshold)), 3)
-    return {
-        "threshold": threshold,
-        "market_light": light,
-        "breadth_up_pct": breadth,
-        "positive_top_count": positive_top,
-        "top_sample_count": len(top),
-        "sector_rank": rank,
-        "sector_pct": round(pct, 2),
-        "reason": "；".join(reasons),
-    }
-
-
-def _trend_entry_threshold_context(market, trend_structure, distance_ma20,
-                                   main_pct, pct):
-    """按当日环境动态计算趋势回踩确认门槛。
-
-    趋势回踩不是固定分数闸门：强趋势、宽度健康且回踩位置合理时，
-    可以降低确认线；弱市、波动放大或均线结构不完整时提高确认线。
-    结构性否决仍由 ``_strategy_entry_assessment`` 的 blockers 负责，
-    本函数只负责可解释的分数门槛，并把所有输入写入审计快照。
-    """
-    market = market or {}
-    light = str(market.get("light") or "unknown").lower()
-    # v3: 只放松趋势回踩的确认分软门槛；红灯/未知市场、双源行情、
-    # 权限、流动性和均线破坏等硬门禁保持不变。
-    threshold = {"green": 0.53, "yellow": 0.57, "red": 0.68}.get(light, 0.63)
-    reasons = [f"市场{ {'green':'绿灯','yellow':'黄灯','red':'红灯'}.get(light, '数据未知') }"]
-
-    breadth = _num(market.get("breadth_up_pct"), None)
-    if breadth is None:
-        threshold += 0.015
-        reasons.append("市场宽度缺失，额外保守")
-    elif breadth >= 65:
-        threshold -= 0.03
-        reasons.append(f"上涨家数占比 {breadth:.1f}% 较强")
-    elif breadth >= 55:
-        threshold -= 0.015
-        reasons.append(f"上涨家数占比 {breadth:.1f}% 偏强")
-    elif breadth < 45:
-        threshold += 0.035
-        reasons.append(f"上涨家数占比 {breadth:.1f}% 偏弱")
-    else:
-        threshold += 0.015
-        reasons.append(f"上涨家数占比 {breadth:.1f}% 偏谨慎")
-
-    # 不同调用方字段名不完全一致，优先使用明确的百分比字段。
-    volatility = None
-    for key in ("index_volatility_pct", "market_volatility_pct", "volatility_pct"):
-        if market.get(key) is not None:
-            volatility = _num(market.get(key), None)
-            break
-    if volatility is not None:
-        if volatility >= 2.5:
-            threshold += 0.025
-            reasons.append(f"指数波动 {volatility:.2f}% 偏高")
-        elif volatility <= 1.0:
-            threshold -= 0.01
-            reasons.append(f"指数波动 {volatility:.2f}% 温和")
-
-    if trend_structure >= 0.90 and distance_ma20 is not None and -0.03 <= distance_ma20 <= 0.05:
-        threshold -= 0.025
-        reasons.append("MA20/MA60多头且回踩位置合理")
-    elif trend_structure >= 0.70:
-        threshold -= 0.01
-        reasons.append("均线结构基本修复")
-    elif trend_structure < 0.50:
-        threshold += 0.045
-        reasons.append("均线结构偏弱")
-
-    if distance_ma20 is None:
-        threshold += 0.025
-        reasons.append("MA20偏离度缺失")
-    elif distance_ma20 < -0.06 or distance_ma20 > 0.09:
-        threshold += 0.03
-        reasons.append(f"偏离MA20 {distance_ma20 * 100:+.2f}%，位置不理想")
-    elif -0.03 <= distance_ma20 <= 0.05:
-        threshold -= 0.015
-        reasons.append(f"偏离MA20 {distance_ma20 * 100:+.2f}%，处于回踩区")
-
-    if main_pct <= -8:
-        threshold += 0.025
-        reasons.append(f"主力净流出 {main_pct:+.2f}%")
-    if pct <= -2.5:
-        threshold += 0.015
-        reasons.append(f"实时涨跌幅 {pct:+.2f}% 偏弱")
-
-    threshold = round(max(0.50, min(0.74, threshold)), 3)
-    return {
-        "version": "trend-pullback-threshold-v3",
-        "threshold": threshold,
-        "market_light": light,
-        "breadth_up_pct": breadth,
-        "volatility_pct": volatility,
-        "trend_structure": round(_num(trend_structure), 3),
-        "distance_ma20_pct": round(distance_ma20 * 100, 3) if distance_ma20 is not None else None,
-        "main_pct": round(_num(main_pct), 3),
-        "intraday_pct": round(_num(pct), 3),
-        "relaxation": {
-            "scope": "trend_pullback_soft_score_only",
-            "baseline_delta": -0.02 if light == "green" else -0.03 if light == "yellow" else 0.0,
-            "floor": 0.50,
-            "hard_gates_unchanged": True,
-        },
-        "execution_zone": {"ma20_distance_min_pct": -10.0, "ma20_distance_max_pct": 14.0},
-        "reason": "；".join(reasons),
-    }
-
-
-def _sector_overheat_guard(kline, quote=None, candidate_heat=None):
-    """识别板块轮动中的个股追高/末端加速风险。
-
-    板块强势只说明资金在流入，不代表当前价位仍有安全边际。这里使用
-    同一只股票的已完成日线与实时价，动态组合 5/20 日涨幅、均线乖离、
-    布林上轨位置和连续上涨天数。缺少足够历史时返回 ``unknown``，由上层
-    保守降权而不是编造结论。
-    """
-    quote = quote or {}
-    heat = candidate_heat or {}
-    result = {
-        "level": "unknown", "score": None, "ret5_pct": None, "ret20_pct": None,
-        "ma20_distance_pct": None, "boll_position": None, "up_streak": None,
-        "sector_pct": _num(heat.get("pct"), None), "sector_rank": int(_num(heat.get("rank"), 999)),
-        "pullback_confirmed": False, "reason": "历史日线不足，暂不判定过热",
-    }
-    if kline is None or len(kline) < 25:
-        return result
-    try:
-        closes = pd.to_numeric(kline["close"], errors="coerce").dropna()
-    except (KeyError, TypeError, ValueError):
-        return result
-    if len(closes) < 25:
-        return result
-    close = _num(quote.get("price"), _num(closes.iloc[-1], 0))
-    if close <= 0:
-        return result
-    ma20 = _num(closes.tail(20).mean(), None)
-    std20 = _num(closes.tail(20).std(ddof=0), 0.0)
-    if not ma20 or ma20 <= 0:
-        return result
-    ret5 = (float(closes.iloc[-1]) / float(closes.iloc[-6]) - 1.0) * 100
-    ret20 = (float(closes.iloc[-1]) / float(closes.iloc[-21]) - 1.0) * 100
-    distance = (close / ma20 - 1.0) * 100
-    upper = ma20 + 2.0 * std20
-    boll_position = (close - (ma20 - 2.0 * std20)) / max(upper - (ma20 - 2.0 * std20), 1e-9)
-    streak = 0
-    for idx in range(len(closes) - 1, 0, -1):
-        if float(closes.iloc[idx]) > float(closes.iloc[idx - 1]):
-            streak += 1
-        else:
-            break
-    intraday_high = _num(quote.get("high"), 0.0)
-    open_price = _num(quote.get("open_price"), 0.0)
-    intraday_pullback_pct = (
-        (close / intraday_high - 1.0) * 100
-        if intraday_high > 0 and close > 0 else None
-    )
-    # "距离 MA20 不超过 6%" 是位置描述，不是日内回踩。此前它让不少
-    # 正在加速的热点被误标为已经回踩。只有先从当日高点回撤至少 0.8%，
-    # 再守住开盘价附近，才算可执行的回踩承接；缺少高/开盘价则不伪造确认。
-    pullback = bool(
-        intraday_pullback_pct is not None
-        and intraday_pullback_pct <= -0.8
-        and (open_price <= 0 or close >= open_price * 0.995)
-    )
-    score = 0.0
-    score += 0.30 if ret5 >= 12 else 0.18 if ret5 >= 8 else 0.0
-    score += 0.25 if ret20 >= 28 else 0.15 if ret20 >= 20 else 0.0
-    score += 0.25 if distance >= 18 else 0.15 if distance >= 12 else 0.0
-    score += 0.20 if boll_position >= 1.02 else 0.12 if boll_position >= 0.92 else 0.0
-    score += 0.10 if streak >= 6 else 0.05 if streak >= 4 else 0.0
-    if _num(heat.get("pct"), 0) >= 3.5 and int(_num(heat.get("rank"), 999)) <= 5:
-        score += 0.08
-    score = min(1.0, score)
-    level = "extreme" if score >= 0.72 else "hot" if score >= 0.50 else "caution" if score >= 0.28 else "normal"
-    reason = {
-        "extreme": "个股处于连续加速、均线乖离或布林上轨末端，禁止板块轮动追入",
-        "hot": "个股短线过热，等待回踩均线/布林中轨并重新放量确认",
-        "caution": "个股已有明显短线加速，降低仓位并要求回踩确认",
-        "normal": "个股位置未显示明显过热",
-    }[level]
-    result.update({
-        "level": level, "score": round(score, 3), "ret5_pct": round(ret5, 2),
-        "ret20_pct": round(ret20, 2), "ma20_distance_pct": round(distance, 2),
-        "boll_position": round(boll_position, 3), "up_streak": streak,
-        "intraday_high": round(intraday_high, 3) if intraday_high > 0 else None,
-        "intraday_pullback_pct": round(intraday_pullback_pct, 2) if intraday_pullback_pct is not None else None,
-        "pullback_confirmed": pullback, "reason": reason,
-    })
-    return result
-
-
-def _star_sector_impulse(universe, asof_date=None):
-    """Map broad STAR-board strength into a small same-industry bonus.
-
-    STAR stocks remain untradable.  Their aggregate move is context only: at
-    least five same-day valid peers, a positive majority and a positive median
-    are required.  The bounded bonus cannot override any entry or risk gate.
-    """
-    grouped = {}
-    latest = None
-    dated_rows = []
-    for item in universe or []:
-        stamp = str(item.get("quote_at") or item.get("time") or "")
-        source_day = stamp[:10]
-        if len(source_day) == 10 and source_day[4:5] == "-" and source_day[7:8] == "-":
-            dated_rows.append(source_day)
-    target_day = _date(asof_date or dt.date.today()).isoformat()
-    eligible_days = [value for value in dated_rows if value <= target_day]
-    day = max(eligible_days, default=target_day)
-    for row in universe or []:
-        scope = _security_scope(row.get("code"), row.get("name"), row.get("risk_flag"))
-        if scope["board"] != "科创板":
-            continue
-        quote_at = str(row.get("quote_at") or row.get("time") or "")
-        if not quote_at or quote_at[:10] != day:
-            continue
-        pct = _num(row.get("pct"), None)
-        sector = _sector_key(row.get("industry"))
-        if not sector or pct is None or abs(pct) > 20:
-            continue
-        grouped.setdefault(sector, []).append(float(pct))
-        latest = max(latest or quote_at, quote_at) if quote_at else latest
-    output = {}
-    for sector, values in grouped.items():
-        if len(values) < 5:
-            continue
-        series = pd.Series(values, dtype="float64")
-        median_pct = float(series.median())
-        positive_ratio = float((series > 0).mean())
-        if median_pct < 0.8 or positive_ratio < 0.60:
-            continue
-        bonus = min(0.12, max(0.0, median_pct - 0.5) * 0.018 + max(0.0, positive_ratio - 0.5) * 0.08)
-        output[sector] = {
-            "sample_count": len(values),
-            "median_pct": round(median_pct, 2),
-            "positive_ratio_pct": round(positive_ratio * 100, 1),
-            "bonus": round(bonus, 3),
-            "source": "科创板同业实时表现（仅作映射加分）",
-            "asof": latest,
-        }
-    return output
 
 
 def _new_entry_price_gate(account, pick, quote=None):
@@ -5539,57 +5106,34 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             "reason": factor_freshness.get("reason") or "历史因子新鲜度门禁未通过",
             "factor_freshness": factor_freshness,
         }
-    eligible_factor_universe = {
-        code for code, row in base_universe.items()
-        if code and _security_scope(code, row.get("name"), row.get("risk_flag"))["allowed"]
-    }
-    if "last_date" not in price_f:
-        return [], {"blocked": True, "reason": "选股因子缺少数据日期"}
-    factor_dates = price_f["last_date"].astype(str).str[:10]
-    # 盘中/周一不应把自然日直接当因子滞后日；以最近完整收盘日
-    # 计算，避免周末后把周四因子误判为超过策略时效。
-    try:
-        lag_reference_day = U.latest_complete_trade_date(_date(asof_date))
-    except Exception:
-        lag_reference_day = _date(asof_date)
-    lags = factor_dates.map(lambda value: _trading_weekday_lag(value, lag_reference_day))
-    usable = lags.notna() & (lags <= spec["max_factor_lag"])
-    total_factor_rows = len(price_f)
-    dropped_stale = int((~usable).sum())
-    price_f = price_f[usable].copy()
-    if price_f.empty:
-        latest = factor_dates.max() if len(factor_dates) else None
-        return [], {
-            "blocked": True,
-            "reason": f"{spec['entry_model_name']}没有满足 {spec['max_factor_lag']} 个工作日时效要求的因子；最新 {latest or '未知'}",
-        }
-    usable_coverage = len(price_f) / max(total_factor_rows, 1)
-    eligible_usable_codes = set(price_f.index.astype(str)) & eligible_factor_universe
-    eligible_factor_coverage = len(eligible_usable_codes) / max(len(eligible_factor_universe), 1)
-    if (
-        len(price_f) < CANDIDATE_FACTOR_MIN_ROWS
-        or usable_coverage < CANDIDATE_FACTOR_MIN_COVERAGE
-        or eligible_factor_coverage < CANDIDATE_FACTOR_MIN_COVERAGE
-    ):
-        return [], {
-            "blocked": True,
-            "reason": (
-                f"{spec['entry_model_name']}全市场因子覆盖不足：有效 {len(price_f)} / {total_factor_rows} "
-                f"（{usable_coverage * 100:.1f}%），可交易范围 {len(eligible_usable_codes)} / "
-                f"{len(eligible_factor_universe)}（{eligible_factor_coverage * 100:.1f}%），需至少 "
-                f"{CANDIDATE_FACTOR_MIN_COVERAGE * 100:.0f}%；本轮不使用残缺样本选股"
-            ),
-            "usable_factor_rows": len(price_f), "total_factor_rows": total_factor_rows,
-            "factor_coverage_pct": round(usable_coverage * 100, 2),
-            "eligible_factor_rows": len(eligible_usable_codes),
-            "eligible_universe_rows": len(eligible_factor_universe),
-            "eligible_factor_coverage_pct": round(eligible_factor_coverage * 100, 2),
-            "dropped_stale_rows": dropped_stale,
-        }
-    factor_date = str(price_f["last_date"].dropna().max())
-    factor_oldest_date = str(price_f["last_date"].dropna().min())
-    style = (account.get("style") if isinstance(account, dict) else None) or spec["default_style"]
-    profile = ACS.style_profile(style, default_style=spec["default_style"])
+    blocked, assembly = PCA.assemble_candidate_inputs(
+        account_id, account, spec, asof_date, price_f, base_universe, factor_freshness,
+        sector_rows=sector_rows, live_universe=live_universe,
+        live_asof_date=live_asof_date, shared_inputs=shared_inputs,
+        min_factor_rows=CANDIDATE_FACTOR_MIN_ROWS,
+        min_factor_coverage=CANDIDATE_FACTOR_MIN_COVERAGE,
+    )
+    if blocked:
+        return blocked, assembly
+    style = assembly["style"]
+    profile = assembly["profile"]
+    price_f = assembly["price_f"]
+    universe = assembly["universe"]
+    live_map = assembly["live_map"]
+    live_scan = assembly["live_scan"]
+    table = assembly["table"]
+    sector_heat = assembly["sector_heat"]
+    star_sector_impulse = assembly["star_sector_impulse"]
+    factor_date = assembly["factor_date"]
+    factor_oldest_date = assembly["factor_oldest_date"]
+    factor_freshness = assembly["factor_freshness"]
+    eligible_factor_universe = assembly["eligible_factor_universe"]
+    eligible_usable_codes = assembly["eligible_usable_codes"]
+    eligible_factor_coverage = assembly["eligible_factor_coverage"]
+    usable_coverage = assembly["usable_coverage"]
+    total_factor_rows = assembly["total_factor_rows"]
+    dropped_stale = assembly["dropped_stale"]
+    flow_supplemented_codes = assembly["flow_supplemented_codes"]
     # These metadata objects are populated only by the sector strategy, but
     # the common return payload is shared by all four strategies.  Always
     # initialise them so a non-sector scan cannot abort after completing the
@@ -5597,228 +5141,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     surge_meta = None
     ths_meta = None
     concept_meta = None
-    expected_live_day = _date(live_asof_date if live_asof_date is not None else asof_date).isoformat()
-    live_map = {}
-    live_scan = {
-        "status": "historical_only" if live_universe is None else "blocked",
-        "expected_quote_day": expected_live_day,
-        "eligible_rows": len(eligible_factor_universe),
-        "covered_rows": 0,
-        "coverage_pct": 0.0,
-        "required_rows": None,
-        "scope": "eligible_a_share_universe",
-    }
-    for row in (live_universe or []):
-        code = str(row.get("code") or "")
-        if not code or str(row.get("quote_at") or "")[:10] != expected_live_day:
-            continue
-        try:
-            if pd.isna(row.get("price")) or pd.isna(row.get("pct")) or float(row.get("price")) <= 0:
-                continue
-        except (TypeError, ValueError):
-            continue
-        live_map[code] = row
-    if live_universe is not None:
-        # A live cross-sectional scan must never rank a code using persisted
-        # price/pct/flow fields.  Metadata may come from the universe file,
-        # but missing live quotes are excluded from this run entirely.
-        covered_live_codes = set(live_map) & eligible_factor_universe
-        required_live_rows = max(CANDIDATE_FACTOR_MIN_ROWS,
-                                 int(len(eligible_factor_universe) * CANDIDATE_FACTOR_MIN_COVERAGE + 0.999999))
-        live_scan.update({
-            "required_rows": required_live_rows,
-            "covered_rows": len(covered_live_codes),
-            "coverage_pct": round(len(covered_live_codes) / max(len(eligible_factor_universe), 1) * 100, 2),
-            "status": "fresh_day_coverage" if len(covered_live_codes) >= required_live_rows else "blocked",
-        })
-        if len(covered_live_codes) < required_live_rows:
-            return [], {
-                "blocked": True,
-                "reason": f"当日实时行情覆盖不足：{len(covered_live_codes)} / {len(eligible_factor_universe)}，需至少 {required_live_rows} 只",
-                "live_quote_day": expected_live_day,
-                "live_quote_rows": len(covered_live_codes),
-                "live_eligible_rows": len(eligible_factor_universe),
-                "live_coverage_pct": round(len(covered_live_codes) / max(len(eligible_factor_universe), 1) * 100, 2),
-                "full_market_scan": live_scan,
-            }
-        live_codes = set(live_map)
-        price_f = price_f.loc[price_f.index.astype(str).isin(live_codes)].copy()
-        if price_f.empty:
-            return [], {"blocked": True, "reason": "当日实时行情未覆盖任何有效因子股票"}
-    universe = []
-    for code in price_f.index:
-        base = dict(base_universe.get(str(code)) or {"code": str(code)})
-        if str(code) in live_map:
-            base.update(live_map[str(code)])
-        universe.append(base)
-    if live_map:
-        # 技术因子仍来自已收盘日线；实时价格/涨跌幅/资金字段用于当日排序和容量。
-        # amount/turnover must still enter before build_factor_table; assign
-        # by column so this pre-build step does not repeat scalar writes.
-        PCLF.overlay_factor_inputs(price_f, live_map)
-    # Use the same financial feed as public selection.  The report-period
-    # values remain compatible with the running strategies; publication-time
-    # proof is attached below to the concrete candidate records instead of
-    # pretending a report period is a disclosure timestamp.
-    try:
-        with PTM.phase("candidate.finance_source"):
-            finance = dfc.fetch_finance_latest()
-    except Exception:
-        finance = {"data": {}}
-    # Keep the paper selector point-in-time consistent with the public
-    # selector: a report/period that was not visible at the completed
-    # signal date must not satisfy a profit gate.  The factor layer retains
-    # unknown disclosures as shadow evidence, while strategies require the
-    # explicit ``reported`` source for executable profit thresholds.
-    # The new three-day strategy needs the raw reported profit values in order
-    # to build its shadow lane.  An unknown publication timestamp must never be
-    # treated as reported, but hiding the value before the strategy runs makes
-    # it impossible to ask the disclosure source for confirmation and leaves
-    # the account permanently at zero candidates.  Keep those values as
-    # ``shadow`` for this one model; the strategy still requires an explicit
-    # publication record before a formal pick is returned.
-    finance_asof = None if account_id == NEW_STRATEGY_ID else asof_date
-    # ``universe`` 由当前 universe.json 与当日 live_map 组成，即**当前实时截面**：
-    # 它的决策时点是现在，不是已收盘日线 cutoff。用 cutoff 判它会清空 PE/PB/
-    # 换手/资金/行业（``build_factor_table`` 的 pct 正取自这里），直接打掉盘中扫描。
-    if shared_inputs is None:
-        with PTM.phase("candidate.fundamentals"):
-            fund = F.compute_fundamental_factors(
-                universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
-    else:
-        with PTM.phase("candidate.fundamentals"):
-            fund = shared_inputs.fundamentals(universe, finance, asof=finance_asof)
-    live_flow = {
-        str(code): row.get("main_pct")
-        for code, row in live_map.items()
-        if isinstance(row.get("main_pct"), (int, float))
-    }
-    live_super_flow = {
-        str(code): row.get("super_net")
-        for code, row in live_map.items()
-        if isinstance(row.get("super_net"), (int, float))
-    }
-    # 补齐缺失的超大单/主力资金数据。底层是 60 秒全市场共享快照，
-    # 必须覆盖所有有效候选而非旧版的前 100 只，否则后排股票会长期
-    # 以“无超大单资金”反复被审计拒绝。
-    _flow_supplemented_codes = set()
-    _missing_super_codes = {
-        str(code) for code in eligible_factor_universe
-        if code in live_map and (
-            not isinstance(live_map[code].get("super_net"), (int, float))
-            or not isinstance(live_map[code].get("main_pct"), (int, float))
-        )
-    }
-    if _missing_super_codes:
-        try:
-            with PTM.phase("candidate.flow_source"):
-                _supplemented = dfc.enrich_live_flow_details(live_universe, _missing_super_codes)
-            for _code, _detail in _supplemented.items():
-                if _code in live_map:
-                    for _flow_field in ("super_net", "main_net", "big_net", "mid_net", "small_net", "main_pct"):
-                        if not isinstance(live_map[_code].get(_flow_field), (int, float)) and isinstance(_detail.get(_flow_field), (int, float)):
-                            live_map[_code][_flow_field] = _detail[_flow_field]
-                    live_map[_code]["flow_source"] = _detail.get("flow_source")
-                    live_map[_code]["flow_quote_at"] = _detail.get("quote_at") or _detail.get("flow_fetched_at")
-                    _flow_supplemented_codes.add(_code)
-                if isinstance(_detail.get("super_net"), (int, float)):
-                    live_super_flow[_code] = _detail["super_net"]
-                if isinstance(_detail.get("main_pct"), (int, float)):
-                    live_flow[_code] = _detail["main_pct"]
-        except Exception:
-            pass
-    with PTM.phase("candidate.factor_table"):
-        table = S.build_factor_table(
-            price_f, fund, sentiment=None,
-            realtime_flow=live_flow,
-            realtime_super_flow=live_super_flow,
-        )
-    if live_universe is not None:
-        # 日线技术指标/财务仍来自已下载的完整历史；当天可变字段必须由
-        # 同一轮实时快照覆盖，不能继续沿用上一交易日的收盘价或涨跌幅。
-        table = PCP.overlay_live_fields(table, live_map, factor_date)
-    star_sector_impulse = _star_sector_impulse(universe, asof_date)
-    # Pull a column once rather than dispatching thousands of scalar pandas
-    # indexers. Preserve the existing path for non-unique axes.
-    unique_axes = table.index.is_unique and table.columns.is_unique
-    names = dict(table["name"].items()) if unique_axes and "name" in table else None
-    eligible_codes = [
-        code for code in table.index
-        if _security_scope(
-            code,
-            (names[code] if names is not None else table.loc[code, "name"]) if "name" in table else (base_universe.get(str(code)) or {}).get("name"),
-            (base_universe.get(str(code)) or {}).get("risk_flag"),
-        )["allowed"]
-    ]
-    table = table.loc[eligible_codes].copy()
-    industries = dict(table["industry"].items()) if unique_axes and not table.empty else None
-    sector_keys = {
-        code: _sector_key(industries[code] if industries is not None else table.loc[code, "industry"])
-        for code in table.index
-    }
-    # The paper execution path currently has no authoritative disclosure
-    # timestamp for financial reports.  Keep profit values visible in the
-    # candidate snapshot, but never pretend they are point-in-time proven.
-    # This makes the limitation explicit in audit/research without silently
-    # changing the three strategy rule set to an empty universe.
-    if "profit_source" in table:
-        table["profit_source"] = table["profit_source"].fillna("unknown")
-    table["star_sector_bonus"] = pd.Series({
-        code: _num((star_sector_impulse.get(sector_keys[code]) or {}).get("bonus"), 0.0)
-        for code in table.index
-    }).reindex(table.index).fillna(0.0)
-    # 外部快照中的停牌/缺失值可能以 ``--`` 等字符串进入表格。策略比较前
-    # 统一清洗所有数值列，防止一次脏值中断整轮 5 分钟全市场扫描。
-    numeric_columns = (
-        "price", "pct", "amount", "turnover", "main_pct", "super_net",
-        "flow", "mom5_raw", "mom20_raw", "mom60_raw", "vol_surge_raw",
-        "rsi14_raw", "pe", "pb", "roe", "profit_yoy",
-    )
-    for column in numeric_columns:
-        if column in table:
-            table[column] = pd.to_numeric(table[column], errors="coerce")
-    # 板块热度不仅服务于板块轮动策略，也作为三个模拟策略的同日
-    # “热门启动段”上下文。它只进入排序/审计，不改变证券权限和下单硬门禁。
-    sector_heat = _sector_heat_map(universe, sector_rows)
-    if sector_heat:
-        table["sector_heat_score"] = pd.Series(
-            {
-                code: _num(
-                    (sector_heat.get(sector_keys[code]) or {}).get("score"),
-                    0.0,
-                )
-                for code in table.index
-            }
-        ).reindex(table.index).fillna(0.0)
-        table["sector_early_rotation"] = pd.Series(
-            {
-                code: bool(
-                    (sector_heat.get(sector_keys[code]) or {}).get("early_rotation")
-                )
-                for code in table.index
-            }
-        ).reindex(table.index).fillna(False)
-        table["sector_early_rotation_score"] = pd.Series(
-            {
-                code: _num(
-                    (sector_heat.get(sector_keys[code]) or {}).get("early_rotation_score"),
-                    0.0,
-                )
-                for code in table.index
-            }
-        ).reindex(table.index).fillna(0.0)
-    else:
-        table["sector_heat_score"] = 0.0
-        table["sector_early_rotation"] = False
-        table["sector_early_rotation_score"] = 0.0
-    if style == "sector":
-        heat_values = pd.Series(
-            {
-                code: _num((sector_heat.get(sector_keys[code]) or {}).get("score"), -1.5)
-                for code in table.index
-            }
-        )
-        table["sentiment"] = F.zscore(heat_values).reindex(table.index).fillna(-1.5)
+
     with PTM.phase("candidate.evolution_read"):
         selection_overlay = _adaptive_selection(account)
     selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
@@ -6189,17 +5512,12 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         if ths_lane:
             enriched.extend(ths_lane)
         picks = enriched
-    if spec["mode"] == "intraday_t":
-        picks = [p for p in picks if _asset_type(p.get("code"), p.get("name")) == "stock_t1"]
-    risk_codes = {
-        str(row.get("code")) for row in universe
-        if row.get("risk_flag") or "ST" in str(row.get("name") or "").upper() or "退" in str(row.get("name") or "")
-    }
-    picks = [pick for pick in picks if pick["code"] not in risk_codes]
     # 容量以策略/共享池席位为主。一手金额过高不得在候选阶段静默删票；
     # _price_aware_qty 会在执行时按真实现金、风险预算和整手规则决定数量，
     # 不足一手则进入可重排等待池。
-    picks = [pick for pick in picks if _num(pick.get("price")) > 0]
+    picks = PCP.filter_executable_candidates(
+        picks, mode=spec["mode"], excluded_codes=PCP.risk_flag_codes(universe),
+    )
     # Reserve a few places for the early-hot lane so a normal top-N block
     # cannot erase the very candidates this lane was introduced to surface.
     picks = PCP.select_candidate_lanes(picks)
@@ -6216,7 +5534,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             "eligible_rows": len(eligible_factor_universe),
             "super_net_rows": sum(1 for code in eligible_factor_universe if isinstance((live_map.get(str(code)) or {}).get("super_net"), (int, float))),
             "main_pct_rows": sum(1 for code in eligible_factor_universe if isinstance((live_map.get(str(code)) or {}).get("main_pct"), (int, float))),
-            "supplemented_rows": len(_flow_supplemented_codes),
+            "supplemented_rows": len(flow_supplemented_codes),
             "source": "eastmoney_snapshot+eastmoney_full_market_flow",
         },
         "max_factor_lag": spec["max_factor_lag"],
@@ -6659,572 +5977,6 @@ def _strategy_market_policy(account, pick, quote, market):
     return {
         "allowed": False, "risk_scale": 0.0, "state": "观察",
         "reason": policy.red_light_reason,
-    }
-
-
-def _clip01(value):
-    return max(0.0, min(1.0, _num(value)))
-
-
-def _microstructure_soft_factor(account_id, evidence):
-    """Build a small, fail-open score from public microstructure evidence."""
-    evidence = dict(evidence or {})
-    values = {
-        "五档失衡": evidence.get("depth_imbalance"),
-        "逐笔主动买卖": evidence.get("active_buy_sell_imbalance"),
-        "分钟VWAP": evidence.get("vwap_deviation_pct"),
-    }
-    available = [name for name, value in values.items() if value is not None]
-    weights = {
-        "tq_breakout": 0.08,
-        "sector_rotation": 0.07,
-        "trend_pullback": 0.04,
-        NEW_STRATEGY_ID: 0.05,
-        MAIN_FORCE_STRATEGY_ID: 0.15,
-    }
-    weight = weights.get(account_id, 0.0)
-    # One isolated public-quote field is too brittle to affect ranking. Keep it
-    # as shadow evidence until at least two independent micro views agree.
-    if evidence.get("status") not in {"ok", "partial"} or len(available) < 2 or weight <= 0:
-        evidence.update({"score_applied": False, "available_components": available})
-        return evidence, None, 0.0, "微观结构证据不足，仅影子记录"
-    components = []
-    if values["五档失衡"] is not None:
-        components.append(_clip01((float(values["五档失衡"]) + 1.0) / 2.0))
-    if values["逐笔主动买卖"] is not None:
-        components.append(_clip01((float(values["逐笔主动买卖"]) + 1.0) / 2.0))
-    if values["分钟VWAP"] is not None:
-        # +/-1.5% around session VWAP spans the useful soft-score range.
-        components.append(_clip01(0.5 + float(values["分钟VWAP"]) / 3.0))
-    score = sum(components) / len(components)
-    evidence.update({
-        "score_applied": True, "soft_score": round(score, 4),
-        "soft_weight": weight, "available_components": available,
-        "policy": "soft_score_only_no_gate_override",
-    })
-    detail = (
-        f"五档 {float(values['五档失衡'] or 0):+.2f}；"
-        f"主动买卖 {float(values['逐笔主动买卖'] or 0):+.2f}；"
-        f"现价/VWAP {float(values['分钟VWAP'] or 0):+.2f}%"
-    )
-    return evidence, score, weight, detail
-
-
-def _dsl_entry_assessment(account_id, spec, pick, quote, decision, threshold_delta=0.0, market=None):
-    """声明式（DSL）策略的入场复核（PR-35）。
-
-    选股层已经用编译后的 DSL 在完整历史因子上做了布尔判定；这里不复述
-    规则，只复核执行域事实：通用六维护栏的硬否决、实时量价与资金方向。
-    全部字段来自注入的实时快照，缺失按中性/保守处理，绝不虚构证据。
-    """
-    pct = _num(quote.get("pct"), -999)
-    vol_ratio = _num(quote.get("vol_ratio"))
-    main_pct = _num(quote.get("main_pct"))
-    checks = []
-    blockers = [
-        reason for reason in (decision.get("hard_vetoes") or [])
-        if reason != "海外风险红灯"
-    ]
-    overheat = {"level": "normal", "score": 0.0, "pullback_confirmed": False}
-
-    def add(name, value, weight, detail):
-        checks.append({
-            "name": name, "score": round(_clip01(value), 3),
-            "weight": weight, "detail": detail,
-        })
-
-    add("声明式规则通过", 1.0, 0.55, "编译 DSL 规则在最新完整收盘因子上成立")
-    add("实时涨幅区间", 1.0 if -2.0 <= pct <= _num(spec.get("entry_pct_high"), 7.0) else 0.3,
-        0.20, f"实时涨幅 {pct:+.2f}%")
-    if vol_ratio is None:
-        add("实时量能", 1.0, 0.15, "量比缺失，按中性处理")
-    else:
-        add("实时量能", min(max(vol_ratio, 0.0) / 1.2, 1.5), 0.15, f"量比 {vol_ratio:.2f}")
-    if main_pct is None:
-        add("资金方向", 1.0, 0.10, "主力净流入缺失，按中性处理")
-    else:
-        add("资金方向", 1.0 if main_pct >= 0 else 0.2, 0.10, f"主力净流入占比 {main_pct:+.2f}%")
-    if pct <= -4.0:
-        blockers.append(f"实时跌幅 {pct:+.2f}% 触发声明式入场否决")
-    weight_total = sum(item["weight"] for item in checks) or 1.0
-    score = sum(item["score"] * item["weight"] for item in checks) / weight_total
-    threshold = max(0.45, min(0.85, 0.55 + threshold_delta))
-    passed = not blockers and score >= threshold
-    reasons = list(blockers)
-    if score < threshold:
-        reasons.append(f"{spec['entry_model_name']}评分 {score:.2f} 未达 {threshold:.2f}")
-    return {
-        "name": spec["entry_model_name"],
-        "risk_profile": spec["risk_profile"],
-        "risk_profile_name": RISK_PROFILES[spec["risk_profile"]]["name"],
-        "score": round(score, 3),
-        "threshold": round(threshold, 3),
-        "threshold_context": {"version": "dsl-entry-v1",
-                              "reason": "声明式规则门在选股层判定；执行层只复核量价/资金/硬否决"},
-        "passed": passed,
-        "checks": checks,
-        "blockers": blockers,
-        "reasons": reasons,
-        "overheat_guard": overheat,
-        "microstructure": None,
-        "timing_mode": "声明式规则确认",
-        "position_scale": 1.0,
-        "entry_tranche_scale": 1.0,
-        "execution_mode": "声明式 DSL 入场",
-    }
-
-
-def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_delta=0.0, market=None):
-    """按各模拟盘账户各自的独立模型复核入场。"""
-    account_id = account["id"]
-    spec = _spec_for(account_id)
-    pct = _num(quote.get("pct"), -999)
-    vol_ratio = _num(quote.get("vol_ratio"))
-    main_pct = _num(quote.get("main_pct"))
-    rank_score = _num(pick.get("score"))
-    checks = []
-    overheat = {"level": "normal", "score": 0.0, "pullback_confirmed": False}
-    threshold_context = {}
-    breakout_probe = False
-    timing_mode = "常规确认"
-    blockers = [
-        reason for reason in (decision.get("hard_vetoes") or [])
-        if reason != "海外风险红灯"
-    ]
-
-    def add(name, value, weight, detail):
-        checks.append({
-            "name": name,
-            "score": round(_clip01(value), 3),
-            "weight": weight,
-            "detail": detail,
-        })
-
-    microstructure, micro_score, micro_weight, micro_detail = _microstructure_soft_factor(
-        account_id, pick.get("microstructure")
-    )
-
-    if spec.get("selection_mode") == "dsl":
-        # PR-35：声明式策略走专属入场复核，不再落入板块热度通用分支。
-        return _dsl_entry_assessment(
-            account_id, spec, pick, quote, decision,
-            threshold_delta=threshold_delta, market=market,
-        )
-
-    if account_id == "tq_breakout":
-        limit_pct = _limit_pct(pick.get("code"))
-        # Leaving the preferred band is already a momentum entry.  Treat the
-        # entire +3.5%~limit interval consistently instead of leaving 5%~7%
-        # in a weaker Q2-capable gap between ordinary and chase logic.
-        breakout_probe = 3.5 < pct <= 7.0
-        # 追求可成交的盘中强度，而非把高开/加速本身当作买点。
-        entry_zone = (
-            1.0 if 0.2 <= pct <= 3.5 else
-            0.55 if -1.0 <= pct <= 5.0 else 0.0
-        )
-        add("可成交强度", entry_zone, 0.28, f"涨跌幅 {pct:+.2f}%（优选 +0.2% 至 +3.5%）")
-        add("量能确认", vol_ratio / 1.5, 0.22, f"量比 {vol_ratio:.2f}")
-        add("主力方向", (main_pct + 5) / 10, 0.20, f"主力净流入占比 {main_pct:+.2f}%")
-        add("强势候选质量", (rank_score + 0.8) / 1.6, 0.18, f"候选分 {rank_score:.3f}；昨日首板仅作加分")
-        add("六维护栏", _num(decision.get("avg_score")) / 0.75, 0.12,
-            f"通用六维 {_num(decision.get('avg_score')):.2f}")
-        if pct <= -2:
-            blockers.append(f"短线候选实时涨幅 {pct:+.2f}% 低于 -2%")
-        # 近期短线策略的亏损尾部主要来自量价动量尚在、但实时资金已经
-        # 转弱的标的。做T可以追随强度，不能在主力已转为净流出时逆势开仓。
-        if main_pct < 0:
-            blockers.append(f"短线候选主力净流入 {main_pct:+.2f}% 未转正")
-        chase_probe = (
-            pct >= limit_pct - 0.30
-            and pct <= limit_pct + 0.60
-            and main_pct >= 2.0
-            and vol_ratio >= 1.5
-            and rank_score >= 0.20
-            and _num(decision.get("avg_score")) >= 0.65
-        )
-        if breakout_probe:
-            add("加速突破确认", min(vol_ratio / 2.0, (main_pct + 2) / 6.0), 0.10,
-                f"涨幅 {pct:+.2f}%：只允许热点加速的小仓试错")
-            if vol_ratio < 1.5:
-                blockers.append(f"加速突破量比 {vol_ratio:.2f} 未达 1.50")
-            if main_pct < 2.0:
-                blockers.append(f"加速突破主力净流入 {main_pct:+.2f}% 未达 +2.00%")
-            if rank_score < 0.20 or _num(decision.get("avg_score")) < 0.65:
-                blockers.append("加速突破缺少候选质量或六维确认")
-        else:
-            if pct > 7.0 and not chase_probe:
-                blockers.append(f"盘中已上涨 {pct:+.2f}%：只记录观察，不模拟追入")
-        if pct >= limit_pct - 0.3 and not chase_probe:
-            blockers.append("接近涨停，无法验证真实排队成交")
-        if vol_ratio < 0.9:
-            blockers.append(f"量比 {vol_ratio:.2f} 低于接力最低要求")
-        threshold = 0.64
-    elif account_id == MAIN_FORCE_STRATEGY_ID:
-        amount = _num(quote.get("amount"), _num(pick.get("amount"), 0.0))
-        super_net = _num(quote.get("super_net"), _num(pick.get("super_net"), 0.0))
-        flow_intensity = _num(quote.get("main_net"), _num(pick.get("main_net"), 0.0)) / max(amount, 1.0)
-        depth = _num((microstructure or {}).get("depth_imbalance"), None)
-        active = _num((microstructure or {}).get("active_buy_sell_imbalance"), None)
-        vwap = _num((microstructure or {}).get("vwap_deviation_pct"), None)
-        add("每日主力观察排名", rank_score, 0.22, f"每日10只复合排名分 {rank_score:.3f}")
-        add("主力净流入占比", main_pct / 6.0, 0.23, f"主力净流入 {main_pct:+.2f}%")
-        add("资金成交强度", flow_intensity / 0.04, 0.18, f"主力净额/成交额 {flow_intensity*100:+.2f}%")
-        add("实时量能", vol_ratio / 1.8, 0.12, f"量比 {vol_ratio:.2f}")
-        add("安全涨幅区间", 1.0 if 0.3 <= pct <= 5.5 else 0.55 if -0.5 <= pct <= 7.5 else 0.0,
-            0.10, f"实时涨幅 {pct:+.2f}%")
-        if main_pct < 3.0:
-            blockers.append(f"主力净流入 {main_pct:+.2f}% 未达 +3.00%")
-        if super_net <= 0:
-            blockers.append("超大单未保持净流入")
-        if flow_intensity < 0.02:
-            blockers.append(f"主力净额/成交额 {flow_intensity*100:+.2f}% 未达 +2.00%")
-        if vol_ratio < 1.0:
-            blockers.append(f"量比 {vol_ratio:.2f} 未达 1.00")
-        if pct < -1.0 or pct > 7.5:
-            blockers.append(f"涨幅 {pct:+.2f}% 不在主力确认执行区间 -1.00% 至 +7.50%")
-        ignition_result = None
-        if -1.0 < pct <= 3.5:
-            ignition_result = {"passed": None, "lane": "常规承接（≤+3.5%）"}
-        elif pct <= 7.5:
-            # 点火分支（2026-08-31 P1）：+3.5%~+7.5% 不再被通用追高帽直接
-            # 拒绝，改为强制八项点火条件（分钟量能结构、VWAP 承接、低点
-            # 抬高、5分钟主力增量、10分钟持续率、逐笔/五档）。任何一项
-            # 数据缺失或不满足都记为 blocker——点火是放宽追高的交换条件。
-            if IGN is not None:
-                try:
-                    ignition_code = str(pick.get("code") or "")
-                    ignition_result = IGN.evaluate_ignition(
-                        ignition_code, pct=pct, limit_pct=_limit_pct(ignition_code),
-                    )
-                except Exception as exc:
-                    ignition_result = {
-                        "passed": False,
-                        "reasons": [f"点火判定异常: {type(exc).__name__}"],
-                        "evidence": {},
-                    }
-            else:
-                ignition_result = {"passed": False, "reasons": ["ignition_entry 模块不可用"], "evidence": {}}
-            ignition_ok = bool(ignition_result.get("passed"))
-            if not IGNITION_BUY_ENABLED:
-                # 影子对比期：点火判定照常运行并记录，但买入不放开。
-                blockers.append(
-                    f"点火通道影子运行中，买入未放开（点火判定："
-                    f"{'成立' if ignition_ok else '未成立'}）"
-                )
-            elif not ignition_ok:
-                for ignition_reason in (ignition_result.get("reasons") or [])[:4]:
-                    blockers.append(f"点火确认未通过：{ignition_reason}")
-            else:
-                add("点火八项确认", 1.0, 0.0, "分钟量能/VWAP/低点抬高/资金增量与持续率/微观盘口全部成立")
-        else:
-            ignition_result = {"passed": False, "lane": "超出点火区间上限 +7.5%"}
-        if active is not None and active < -0.15:
-            blockers.append(f"逐笔主动成交偏卖 {active:+.2f}，疑似诱多/派发")
-        if depth is not None and depth < -0.35:
-            blockers.append(f"五档盘口卖压 {depth:+.2f} 过强")
-        if vwap is not None and not (-0.5 <= vwap <= 2.0):
-            blockers.append(f"现价偏离分钟VWAP {vwap:+.2f}% 超出承接区间")
-        threshold_context = {
-            "version": MAIN_FORCE_STRATEGY_VERSION, "daily_candidate_limit": 10,
-            "position_limit": 3, "main_pct": main_pct,
-            "flow_intensity": round(flow_intensity, 6),
-            "ignition": (
-                {
-                    "passed": ignition_result.get("passed"),
-                    "reasons": list(ignition_result.get("reasons") or [])[:6],
-                    "version": ignition_result.get("version"),
-                }
-                if ignition_result is not None else None
-            ),
-            "reason": "主力强度、成交占比、量能与微观结构确认；>3.5% 走点火八项确认",
-        }
-        threshold = 0.72
-    elif account_id == NEW_STRATEGY_ID:
-        # The reported-profit model supplies point-in-time financial and
-        # technical path metadata.  Missing metadata is a hard blocker: a
-        # paper fill must never be fabricated from a partial candidate row.
-        metadata = {}
-        for key in ("metadata", "reported_profit_breakout", "strategy_context", "entry_context"):
-            if isinstance(pick.get(key), dict):
-                metadata.update(pick.get(key) or {})
-        values = {**metadata, **pick}
-
-        def flag(value):
-            return value is True or str(value).strip().lower() in {"1", "true", "yes", "y", "通过", "reported"}
-
-        profit_source = str(
-            values.get("profit_source") or values.get("financial_source")
-            or values.get("fundamental_source") or ""
-        ).strip().lower()
-        reported = bool(
-            flag(values.get("reported_profit"))
-            or flag(values.get("profit_reported"))
-            or "reported" in profit_source
-            or "披露" in profit_source
-            or "point_in_time" in profit_source
-        )
-        entry_path = str(values.get("entry_path") or "").strip().lower()
-        three_up = flag(values.get("three_up")) or entry_path == "three_day_profit"
-        ma5_path = flag(values.get("above_ma5_5d")) or flag(values.get("ma5_path")) or entry_path == "five_day_profit"
-        above_all_ma = flag(values.get("above_all_ma"))
-        above_boll = (
-            flag(values.get("above_boll_mid")) or flag(values.get("above_boll"))
-            or flag(values.get("boll_mid_breakout"))
-            or (entry_path == "five_day_profit" and above_all_ma)
-        )
-        above_ma60 = flag(values.get("above_ma60")) or flag(values.get("above_main_ma")) or above_all_ma
-        breakout_path = bool((three_up or ma5_path) and reported)
-        breakout_probe = bool(breakout_path and pct >= 3.5)
-        flow_raw = _num(values.get("super_net_raw"), _num(values.get("super_net"), None))
-        quality_score = _num(values.get("quality"), _num(values.get("roe"), 0.0))
-        add("财报披露证据", 1.0 if reported else 0.0, 0.25,
-            f"利润来源 {profit_source or '未知'}；点时披露 {'通过' if reported else '缺失'}")
-        add("突破路径", 1.0 if breakout_path else 0.0, 0.28,
-            f"三连阳={'是' if three_up else '否'}，MA5路径={'是' if ma5_path else '否'}")
-        add("主要均线位置", (int(above_boll) + int(above_ma60)) / 2.0, 0.20,
-            f"BOLL中轨={'上方' if above_boll else '未知/下方'}；MA60={'上方' if above_ma60 else '未知/下方'}")
-        add("超大单资金", (flow_raw + 1.0) / 3.0 if flow_raw is not None else 0.0, 0.17,
-            f"超大单净流入 {flow_raw:+.2f}" if flow_raw is not None else "超大单资金缺失")
-        add("实时量价", min((vol_ratio or 0.0) / 1.2, 1.0), 0.10,
-            f"涨跌幅 {pct:+.2f}%；量比 {vol_ratio:.2f}")
-        if not reported:
-            blockers.append("缺少已披露财报利润证据，禁止质量突破建仓")
-        if not breakout_path:
-            blockers.append("未满足三连阳或 MA5+财报突破路径")
-        if not above_boll or not above_ma60:
-            blockers.append("现价未同时站上主要均线/BOLL中轨")
-        if flow_raw is None or flow_raw <= 0:
-            blockers.append("超大单资金缺失或未净流入")
-        if main_pct < 0:
-            blockers.append(f"实时主力净流入 {main_pct:+.2f}% 不足")
-        if vol_ratio < 0.9:
-            blockers.append(f"实时量比 {vol_ratio:.2f} 低于质量突破最低要求")
-        if pct <= -4.0:
-            blockers.append(f"实时跌幅 {pct:+.2f}% 触发质量突破入场否决")
-        threshold_context = {
-            "version": "reported-profit-breakout-entry-v1",
-            "profit_source": profit_source or None,
-            "reported_profit": reported,
-            "breakout_path": breakout_path,
-            "three_up": three_up,
-            "ma5_path": ma5_path,
-            "above_boll_mid": above_boll,
-            "above_ma60": above_ma60,
-            "super_net_raw": flow_raw,
-            "quality_score": quality_score,
-            "reason": "已披露利润与突破结构双确认",
-        }
-        threshold = 0.70
-    elif account_id == "trend_pullback":
-        close = ma20 = ma60 = None
-        if kline is not None and len(kline) >= 60:
-            closes = pd.to_numeric(kline["close"], errors="coerce").dropna()
-            if len(closes) >= 60:
-                close = _num(closes.iloc[-1], None)
-                ma20 = _num(closes.tail(20).mean(), None)
-                ma60 = _num(closes.tail(60).mean(), None)
-        price = _num(quote.get("price"), 0)
-        distance_ma20 = price / ma20 - 1 if price > 0 and ma20 else None
-        open_price = _num(quote.get("open_price"), 0)
-        bottom_context = pick.get("bottom_reversal_context") if isinstance(pick.get("bottom_reversal_context"), dict) else {}
-        bottom_structure = str(bottom_context.get("structure") or "")
-        bottom_start = bottom_structure in {"base_rebound", "reversal_watch"}
-        trend_structure = (
-            1.0 if ma20 and ma60 and ma20 >= ma60
-            else 0.72 if ma20 and ma60 and ma20 >= ma60 * 0.95 and close and close >= ma20 * 0.98
-            else 0.50 if close and ma20 and close >= ma20
-            else 0.0
-        )
-        pullback_fit = (
-            1.0 if distance_ma20 is not None and -0.03 <= distance_ma20 <= 0.05
-            else 0.55 if distance_ma20 is not None and -0.06 <= distance_ma20 <= 0.09
-            else 0.0
-        )
-        mom20 = _num(pick.get("mom20"))
-        add("趋势结构", trend_structure, 0.30,
-            f"MA20 {ma20:.2f} / MA60 {ma60:.2f}" if ma20 and ma60 else "均线不足")
-        add("回踩位置", pullback_fit, 0.28,
-            f"现价偏离 MA20 {(distance_ma20 or 0)*100:+.2f}%")
-        add("中期动量", 1 - abs(mom20 - 12) / 18, 0.18, f"20日动量 {mom20:+.2f}%")
-        add("资金稳定", (main_pct + 8) / 12, 0.14, f"主力净流入占比 {main_pct:+.2f}%")
-        add("实时波动", (pct + 4) / 8, 0.10, f"涨跌幅 {pct:+.2f}%")
-        if close is None or ma20 is None or ma60 is None:
-            blockers.append("趋势均线数据不足")
-        elif ma20 < ma60 * 0.98:
-            blockers.append("MA20 未接近 MA60，趋势结构仍未修复")
-        if distance_ma20 is None or distance_ma20 < -0.10 or distance_ma20 > 0.14:
-            blockers.append("现价偏离 MA20 超出趋势回踩执行区间")
-        if pct <= -4:
-            blockers.append(f"实时跌幅 {pct:+.2f}% 触发趋势入场否决")
-        if main_pct < -2.0:
-            blockers.append(f"实时主力净流入 {main_pct:+.2f}% 偏弱，不做趋势回踩")
-        if bottom_start:
-            # 底部启动不能只因日线形态入场；要看到当天承接，避免把仍在
-            # 下跌的反转候选当成趋势回踩。真正的多头回踩路径不受此限制。
-            timing_mode = "底部启动承接确认"
-            reclaim_ok = bool(
-                pct >= -0.5
-                and (open_price <= 0 or price >= open_price * 0.995)
-                and main_pct >= 0
-                and vol_ratio >= 0.9
-            )
-            if not reclaim_ok:
-                blockers.append("底部启动尚未出现日内承接：需守住开盘附近、主力不净流出且量比≥0.9")
-        else:
-            timing_mode = "多头趋势回踩"
-        threshold_context = _trend_entry_threshold_context(
-            market or {}, trend_structure, distance_ma20, main_pct, pct
-        )
-        threshold = _num(threshold_context.get("threshold"), 0.60)
-    else:
-        heat = pick.get("sector_heat") or {}
-        overheat = _sector_overheat_guard(kline, quote, heat)
-        threshold_context = dict(
-            pick.get("sector_threshold_context")
-            or _sector_entry_threshold_context({}, market or {}, heat)
-        )
-        heat_rank = int(_num(heat.get("rank"), 999))
-        heat_pct = _num(heat.get("pct"), -99)
-        member_count = int(_num(heat.get("member_count"), 0))
-        positive_ratio = _num(heat.get("positive_ratio"), None)
-        sector_main_pct = _num(heat.get("median_main_pct"), None)
-        early_rotation = bool(heat.get("early_rotation"))
-        individual_path = pick.get("entry_path") == "individual_strong"
-        hot_lane = pick.get("entry_path") in {"sector_surge", "concept_expansion", "ths_hot"}
-        add("板块排名", (16 - heat_rank) / 15, 0.30, f"热点板块第 {heat_rank} 名")
-        add("板块强度", heat_pct / 3.0, 0.22, f"板块涨幅 {heat_pct:+.2f}%")
-        add("个股相对强度", (pct + 1) / 5, 0.20, f"个股涨幅 {pct:+.2f}%")
-        add("资金共振", (main_pct + 6) / 12, 0.18, f"主力净流入占比 {main_pct:+.2f}%")
-        add("成交活跃", vol_ratio / 1.5, 0.10, f"量比 {vol_ratio:.2f}")
-        add("个股位置安全边际", 1.0 - _num(overheat.get("score"), 0.5), 0.10,
-            overheat.get("reason") or "位置数据不足")
-        if overheat.get("level") == "extreme":
-            blockers.append(overheat.get("reason") or "个股位置过热")
-        elif overheat.get("level") == "hot" and not overheat.get("pullback_confirmed"):
-            blockers.append(overheat.get("reason") or "个股过热，等待回踩确认")
-        elif overheat.get("level") == "hot":
-            threshold_context.setdefault("reasons", []).append("过热后出现回踩，仅允许提高门槛后的确认入场")
-        elif overheat.get("level") == "caution":
-            threshold_context.setdefault("reasons", []).append("个股短线过热，动态提高入场门槛")
-        if individual_path:
-            # 个股强势例外：板块热度降为排序项，不作为硬否决；
-            # 但个股门槛更高，避免把“孤立拉升”误当成机会。
-            add("个股妖股路径", min((pct - 3.5) / 5.0, (main_pct - 2.5) / 4.0, (vol_ratio - 1.5) / 2.0), 0.20,
-                f"板块第 {heat_rank} 名、个股 {pct:+.2f}%、主力 {main_pct:+.2f}%、量比 {vol_ratio:.2f}")
-            if pct < 3.5 or pct > 8.5:
-                blockers.append(f"个股强势路径涨幅 {pct:+.2f}% 不在 +3.5% 至 +8.5% 区间")
-            if main_pct < 2.5:
-                blockers.append(f"个股强势路径主力净流入 {main_pct:+.2f}% 未达 +2.50%")
-            if vol_ratio < 1.5:
-                blockers.append(f"个股强势路径量比 {vol_ratio:.2f} 未达 1.50")
-            if heat_rank > 15 or heat_pct <= 0:
-                checks[-5]["detail"] += "；板块热度不足，仅降权不否决"
-        else:
-            # "热点"不能只由一只涨停股定义。板块轮动历史亏损集中在
-            # 广度、板块资金或个股资金未共振时仍被放行的候选；因此普通
-            # 路径要求至少有同快照的成员广度和资金确认。个股强势路径
-            # 保留其更高的独立门槛，避免错过真正的龙头。
-            if hot_lane:
-                # Live hot-lane discovery is intentionally earlier than the
-                # lagging breadth model.  Require current board strength and
-                # member-level flow, but do not wait for a full 60% breadth
-                # confirmation that arrives after the first impulse.
-                if heat_rank > 10 or heat_pct < 1.2:
-                    blockers.append("实时热点车道板块未达到前10且涨幅至少 +1.2%")
-                if main_pct < 0.3:
-                    blockers.append(f"热点车道个股主力净流入 {main_pct:+.2f}% 未达 +0.30%")
-                if vol_ratio < 0.9:
-                    blockers.append(f"热点车道个股量比 {vol_ratio:.2f} 未达 0.90")
-            elif heat_rank > 8 or heat_pct < 0.8:
-                blockers.append("所属板块未进入前8强且涨幅至少 +0.8% 的热点区")
-            if not hot_lane and (member_count < 5 or positive_ratio is None or positive_ratio < 0.60):
-                blockers.append("热点板块广度不足：至少5只成分、60%上涨才可轮动")
-            if not hot_lane and (sector_main_pct is None or sector_main_pct < 0):
-                blockers.append("热点板块资金未确认净流入")
-            if not hot_lane and not early_rotation and not (heat_rank <= 3 and heat_pct >= 1.5):
-                blockers.append("热点尚未形成早期扩散或前三强加速共振")
-            if not hot_lane and main_pct < 0.5:
-                blockers.append(f"个股主力净流入 {main_pct:+.2f}% 未达 +0.50%")
-            if not hot_lane and vol_ratio < 1.1:
-                blockers.append(f"个股量比 {vol_ratio:.2f} 未达 1.10")
-        if pct <= -1.0:
-            blockers.append(f"个股实时涨幅 {pct:+.2f}% 与板块热点背离")
-        # 当日门槛由市场灯、全市场宽度、热点扩散和所属板块强度共同决定，
-        # 不再锁死 0.68。个股强势例外仍额外提高要求，不能借弱板块放松。
-        dynamic_base = _num(threshold_context.get("threshold"), 0.61)
-        threshold = max(0.60 if hot_lane else 0.65, dynamic_base + (0.04 if individual_path else 0.0))
-        if overheat.get("level") == "caution":
-            threshold += 0.04
-        if overheat.get("level") == "hot" and overheat.get("pullback_confirmed"):
-            threshold += 0.06
-        threshold_context.update({
-            "base_threshold": round(dynamic_base, 3),
-            "individual_path_extra": 0.04 if individual_path else 0.0,
-            "hot_lane": hot_lane,
-            "overheat_threshold_extra": 0.04 if overheat.get("level") == "caution" else 0.0,
-            "overheat_pullback_extra": 0.06 if overheat.get("level") == "hot" and overheat.get("pullback_confirmed") else 0.0,
-            "selection_news_delta": round(_num(threshold_delta), 3),
-            "overheat_guard": overheat,
-        })
-
-    if micro_score is not None:
-        add("微观结构影子确认", micro_score, micro_weight, micro_detail)
-
-    weight_total = sum(item["weight"] for item in checks) or 1.0
-    score = sum(item["score"] * item["weight"] for item in checks) / weight_total
-    threshold = max(0.45, min(0.85, threshold + threshold_delta))
-    if threshold_context:
-        threshold_context["base_threshold"] = round(
-            _num(threshold_context.get("threshold"), threshold), 3
-        )
-        threshold_context["threshold_delta"] = round(_num(threshold_delta), 3)
-        threshold_context["effective_threshold"] = round(threshold, 3)
-    passed = not blockers and score >= threshold
-    reasons = list(blockers)
-    if score < threshold:
-        if account_id in {"sector_rotation", "trend_pullback", MAIN_FORCE_STRATEGY_ID}:
-            reasons.append(
-                f"{spec['entry_model_name']}评分 {score:.2f} 未达当日动态门槛 {threshold:.2f}"
-                f"（{threshold_context.get('reason') or '市场条件'}）"
-            )
-        else:
-            reasons.append(f"{spec['entry_model_name']}评分 {score:.2f} 未达 {threshold:.2f}")
-    return {
-        "name": spec["entry_model_name"],
-        "risk_profile": spec["risk_profile"],
-        "risk_profile_name": RISK_PROFILES[spec["risk_profile"]]["name"],
-        "score": round(score, 3),
-        "threshold": round(threshold, 3),
-        "threshold_context": threshold_context if account_id in {"sector_rotation", "trend_pullback", NEW_STRATEGY_ID, MAIN_FORCE_STRATEGY_ID} else None,
-        "passed": passed,
-        "checks": checks,
-        "blockers": blockers,
-        "reasons": reasons,
-        "overheat_guard": overheat,
-        "microstructure": microstructure,
-        "timing_mode": timing_mode,
-        # 热点加速段的赔率尚可但回撤显著增加；通过也只使用常规单笔规模的三分之一。
-        "position_scale": (
-            0.20 if account_id == "sector_rotation" and overheat.get("level") == "hot" and overheat.get("pullback_confirmed")
-            else 0.25 if account_id == "sector_rotation" and overheat.get("level") == "caution"
-            else 0.35 if account_id == "tq_breakout" and breakout_probe
-            else 0.50 if account_id == "sector_rotation" and (individual_path or hot_lane)
-            else 0.60 if account_id == NEW_STRATEGY_ID and breakout_probe
-            else 0.70 if account_id == MAIN_FORCE_STRATEGY_ID
-            else 1.0
-        ),
-        # 趋势回踩的首笔只建立半仓观察仓；确认加仓由 _swing_scale_in
-        # 单独执行，避免一次把“回踩”误当作趋势已经恢复。
-        "entry_tranche_scale": 0.50 if account_id == "trend_pullback" else 0.60 if account_id == NEW_STRATEGY_ID else 1.0,
-        "execution_mode": (
-            "趋势回踩试仓，确认后补齐" if account_id == "trend_pullback"
-            else "三日策略试仓，确认后管理" if account_id == NEW_STRATEGY_ID
-            else "超强主力前三确认建仓" if account_id == MAIN_FORCE_STRATEGY_ID
-            else "热点实时车道试仓" if account_id == "sector_rotation" and hot_lane
-            else "个股强势例外试仓" if account_id == "sector_rotation" and individual_path
-            else "热点加速试仓" if account_id == "tq_breakout" and breakout_probe
-            else "常规入场"
-        ),
     }
 
 
@@ -7716,20 +6468,6 @@ def manual_research_backfill():
     return result
 
 
-def _account_exposure(conn, account_id, quotes):
-    positions = _position_rows(conn, account_id)
-    value = 0.0
-    industries = {}
-    for pos in positions:
-        price = _num((quotes.get(pos["code"]) or {}).get("price"), _num(pos["cost"]))
-        item_value = _num(pos["qty"]) * price
-        value += item_value
-        industries[pos.get("industry") or "未知"] = industries.get(pos.get("industry") or "未知", 0.0) + item_value
-    account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-    nav = _num(account["cash"]) + value
-    return positions, value, nav, industries
-
-
 def _runtime_parameter_active(effective_date=None, asof_day=None, status=None):
     """Whether a live parameter may affect a decision made now.
 
@@ -8073,8 +6811,6 @@ def _cycle_first_trade_day(cycle):
     return started_day
 
 
-
-
 def _entry_deployment_gate(conn, account_id, code, positions, pending_slots,
                            slot_plan, asof_day, now=None):
     """Gate *new* automatic positions by intraday deployment phase.
@@ -8404,25 +7140,6 @@ def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _entry_execution_scale(market_policy, entry_model, chase_entry, dynamic_news, strategy_budget):
     """Return the one-time sizing multiplier for a new entry.
 
@@ -8538,33 +7255,6 @@ def _entry_score_delta(account, asof_day=None):
     if effective and not _runtime_parameter_active(effective, asof_day=asof_day):
         return 0.0
     return _num(params.get("entry_score_delta"), _num(params.get("min_t_score_delta")))
-
-
-def _account_risk_state(conn, account, nav, asof_day):
-    """账户级熔断：达到阈值只禁止新开仓，卖出风控仍会继续。"""
-    profile = _risk_profile(account, conn=conn)
-    day = _date(asof_day).isoformat()
-    start_nav = _num(account.get("daily_start_nav"), 0)
-    if account.get("daily_nav_date") != day or start_nav <= 0:
-        start_nav = nav
-        conn.execute("UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?", (nav, day, account["id"]))
-        account["daily_start_nav"], account["daily_nav_date"] = nav, day
-    navs = [r[0] for r in conn.execute("SELECT nav FROM paper_nav WHERE account_id=? ORDER BY nav_date", (account["id"],)).fetchall()]
-    peak = max(navs + [nav, _account_reference_capital(account) or nav])
-    drawdown = 1 - nav / peak if peak else 0.0
-    daily_loss = 1 - nav / start_nav if start_nav else 0.0
-    reasons = []
-    cooldown = account.get("cooldown_until")
-    if cooldown and str(cooldown) >= day:
-        reasons.append(f"冷静期至 {cooldown}")
-    if daily_loss >= profile["daily_loss"]:
-        reasons.append(f"单日亏损 {daily_loss*100:.2f}% 触发熔断")
-    if drawdown >= profile["drawdown"]:
-        until = _next_weekday(_date(asof_day) + dt.timedelta(days=profile["cooldown_days"] - 1)).isoformat()
-        conn.execute("UPDATE paper_accounts SET cooldown_until=? WHERE id=?", (until, account["id"]))
-        account["cooldown_until"] = until
-        reasons.append(f"滚动回撤 {drawdown*100:.2f}% 触发冷静期")
-    return {"blocked": bool(reasons), "reasons": reasons, "daily_loss_pct": round(daily_loss * 100, 2), "drawdown_pct": round(drawdown * 100, 2)}
 
 
 def _price_aware_qty(
@@ -9562,107 +8252,23 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             sizing["lifecycle_deployment_clamped_qty"] = int(max_qty)
             sizing["lifecycle_deployment_amount"] = _num(deployment.get("deployable_amount"))
             qty = max(0, max_qty)
-    amount = qty * fill_price
-    fees = EP.estimate_execution_fees(amount, "buy")
-    sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
-    sizing["one_lot_fee"] = round(
-        EP.estimate_execution_fees(LOT_SIZE * fill_price, "buy"), 2,
-    )
-    sizing["cash_available"] = round(shared_cash, 2)
-    sizing["qty_final"] = int(qty)
-    if qty < LOT_SIZE and not reasons:
-        limits = sizing.get("constraint_shares") or {}
-        binding = [name for name, value in limits.items() if _num(value) < LOT_SIZE]
-        if not binding:
-            binding = list(sizing.get("binding_constraints") or [])
-        labels = {
-            "risk": "单笔止损预算", "weight": "单票仓位上限",
-            "exposure": "策略总仓位上限", "industry": "行业仓位上限",
-            "cash": "可用现金",
-        }
-        root = labels.get(binding[0], "风险约束") if binding else "风险约束"
-        root_limit = _num(limits.get(binding[0]), 0) if binding else 0
-        # P3 审计修复（P2）：binding 为 risk 时是结构性不可满足——高价股
-        # ×紧止损使 by_risk 永远不足一手，转等待池只会每天空转占位到
-        # 24h 归档。预算侧约束（cash/weight/exposure/industry）才可等待。
-        if set(binding) == {"risk"}:
-            reasons.append(
-                f"单笔止损预算结构性不足：一手约 ¥{LOT_SIZE * fill_price:,.2f}，"
-                f"风险预算最多 {root_limit:.0f} 股，转终态拒绝"
-            )
-        else:
-            reasons.append(
-                f"一手约 ¥{LOT_SIZE * fill_price:,.2f}，模型可买 {int(qty)} 股；金额约束仅影响下单规模，"
-                f"当前转入等待池（参考限制：{root}，最多 {root_limit:.0f} 股）"
-            )
-            soft_amount_reasons.append(reasons[-1])
-    # 2026-09-03 修复：尘埃单此前仅用于"已拦截订单"的分类，金额低于
-    # 动态阈值且其余闸门全过时 allowed=True 照样成交。现按当前周期单席
-    # 可表达金额作为软性拦截：候选转入 deferred 队列，预算释放后按全尺寸
-    # 复核，不再用小仓占用稀缺席位。
-    if qty >= LOT_SIZE and amount < minimum_order_amount and not reasons:
-        dust_reason = (
-            f"低于动态最小建仓金额 \u00a5{minimum_order_amount:,.0f}（当前 \u00a5{amount:,.0f}）；"
-            "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
-        )
-        reasons.append(dust_reason)
-        soft_amount_reasons.append(dust_reason)
+    # 金额/费用/一手金额与金额侧、成本侧拒绝原因由纯决策模块产出；本函数只
+    # 负责把结果合并进 sizing 与原因列表。待成交预占是这里唯一需要读取的事实。
     _, pending_cash = _pending_buy_reservations(conn)
-    cash_after_pending = shared_cash - pending_cash
-    # Zero cash is a real safety veto.  A positive balance that is merely
-    # smaller than the order stays a soft sizing shortfall and remains
-    # retryable: the audit (2026-08) found this reason was hard-classified,
-    # permanently rejecting candidates that only needed the queue to drain.
-    if cash_after_pending <= 1e-6:
-        reasons.append(
-            f"共享资金池暂无可用现金（已有待成交买单预占 ¥{pending_cash:,.2f}）"
-            if pending_cash > 0 else "共享资金池暂无可用现金"
-        )
-    elif amount + fees > cash_after_pending + 1e-6:
-        cash_reason = (
-            f"共享资金池可用现金不足（已有待成交买单预占 ¥{pending_cash:,.2f}）"
-            if pending_cash > 0 else "共享资金池可用现金不足"
-        )
-        reasons.append(cash_reason)
-        soft_amount_reasons.append(cash_reason)
-    if amount and fees / amount > 0.003:
-        cost_reason = "单笔最低佣金占比过高，暂不下单，候选保留在等待池复核"
-        reasons.append(cost_reason)
-        soft_amount_reasons.append(cost_reason)
-    econ = SPOL.entry_economics_policy(account["id"])
-    if econ and amount > 0:
-        min_effective_amount = _num(econ.get("min_effective_order_amount"), 0.0)
-        expected_edge = max(
-            _num(econ.get("min_expected_edge_pct"), 0.0),
-            _num(profile.get("min_cost_edge"), 0.0),
-        )
-        # 用实际买入佣金 + 预估卖出佣金/印花税 + 双向滑点做保守成本门槛；
-        # 不把未实现收益当现金，只判断该委托是否值得发生。
-        expected_profit = amount * expected_edge
-        sell_fees = EP.estimate_execution_fees(amount, "sell")
-        slippage_cost = qty * (
-            abs(fill_price - price)
-            + abs(EP.estimated_fill_price(price, "sell") - price)
-        )
-        estimated_round_trip_cost = fees + sell_fees + slippage_cost
-        sizing["minimum_effective_order_amount"] = min_effective_amount
-        sizing["expected_edge_pct"] = round(expected_edge * 100, 2)
-        sizing["expected_profit_amount"] = round(expected_profit, 2)
-        sizing["estimated_round_trip_cost"] = round(estimated_round_trip_cost, 2)
-        if min_effective_amount and amount < min_effective_amount:
-            min_amount_reason = (
-                f"短线有效委托至少 ¥{min_effective_amount:,.0f}，当前 ¥{amount:,.0f}；"
-                "金额约束仅用于委托 sizing，候选保留在等待池复核"
-            )
-            reasons.append(min_amount_reason)
-            soft_amount_reasons.append(min_amount_reason)
-        elif expected_profit < estimated_round_trip_cost * 1.25:
-            edge_reason = (
-                f"短线预期毛收益 ¥{expected_profit:,.2f} 未覆盖估算往返成本 "
-                f"¥{estimated_round_trip_cost:,.2f}，候选保留在等待池复核"
-            )
-            reasons.append(edge_reason)
-            soft_amount_reasons.append(edge_reason)
+    economics = PED.assess_order_economics(
+        reasons=reasons, qty=qty, fill_price=fill_price, price=price,
+        pending_cash=pending_cash, shared_cash=shared_cash,
+        minimum_order_amount=minimum_order_amount, lot_size=LOT_SIZE,
+        economics_policy=SPOL.entry_economics_policy(account["id"]),
+        min_cost_edge=profile.get("min_cost_edge"), sizing=sizing,
+        fee_estimator=EP.estimate_execution_fees,
+        sell_price_estimator=EP.estimated_fill_price, num=_num,
+    )
+    amount = economics["amount"]
+    fees = economics["fees"]
+    sizing.update(economics["sizing"])
+    reasons.extend(economics["reasons"])
+    soft_amount_reasons.extend(economics["soft_reasons"])
     # Amount/cost constraints are intentionally soft.  A real cash shortage,
     # stale/invalid quote, T+1, limit-down, hard risk, or policy rejection is
     # still a hard veto and must remain risk_rejected rather than waitlisted.
@@ -10427,10 +9033,6 @@ def _best_replacement_candidate(conn, account_id, day, held_codes):
     )
 
 
-
-
-
-
 def _rollback_slot_borrow(conn, borrow, *, cycle_id):
     """Undo a provisional seat transfer when the order does not fill.
 
@@ -10476,8 +9078,6 @@ def _intraday_downside_guard(position, quote, market=None, news=None, policy_ove
     )
 
 
-
-
 def _position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None,
                             replacement=None, nav=None, market=None, flow_trajectory=None):
     return PREv.position_quality_score(
@@ -10487,14 +9087,8 @@ def _position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=N
     )
 
 
-
-
-
-
 def _save_position_review(conn, cycle_id, review, action, reason):
     return PREv.save_position_review(conn, cycle_id, review, action, reason)
-
-
 
 
 def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False,
@@ -10581,7 +9175,6 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
     """Thin compatibility adapter for the cycle-owned risk service."""
     context = PRSVC.RiskRunContext(cycle_id=cycle_id, asof_day=_date(asof_date))
     return PRSVC.run(context, ports=_risk_service_ports())
-
 
 
 @PTM.timed("risk_pass")
@@ -13062,8 +11655,6 @@ def _release_runtime_lease(conn, lock_key, owner_key, fencing_token=None):
         )
 
 
-
-
 @PTM.timed("daily_cleanup")
 def _cleanup_stale_data():
     """归档过期数据（供自进化学习），并清理活跃表。
@@ -14883,11 +13474,6 @@ def _validate_capital(capital):
     return PCS.validate_capital(capital)
 
 
-def _cycle_snapshot(conn):
-    """PR-58：快照（``compact-ledger-v2``）实现已移至 ``paper_cycle_service``。"""
-    return PCS.cycle_snapshot(conn, _active_cycle(conn))
-
-
 def _archive_current_cycle(conn, reason):
     """PR-58：归档实现已移至 ``paper_cycle_service``（存档 + 翻状态 + 清表 + 审计）。"""
     return PCS.archive_cycle(conn, _active_cycle(conn), reason)
@@ -15192,614 +13778,6 @@ def install_platform_schedule():
         ),
         "schedule": status,
     }
-
-
-# ---------------------------------------------------------------------------
-# R27-B2C-7 —— paper runtime attempt（`paper_job_runs`）的 typed owner fact
-# ---------------------------------------------------------------------------
-#
-# 契约之前，research 侧在 incident_triage 里读的是 **裸行**：
-#
-#     SELECT slot,market_date,status,detail,started_at,finished_at
-#       FROM paper_jobs WHERE status NOT IN ('completed','success')
-#
-# 于是 `deepseek_research` 必须自己解释"这一行是 current slot state 还是某次 attempt"、
-# "market_date 能不能当失败被知悉的时刻"。本段把这两个问题还给 owner。
-#
-# ────────────── 为什么是 `paper_job_runs`（attempt 级）而不是 `paper_jobs` ──────────────
-#
-# `paper_jobs` 的 PK 是 `(slot, market_date)` —— **每天每 slot 只有一行**，retry 会把
-# `failed` 物理覆盖成 `running`（`:13613`），旧失败**不复存在**。它是 current slot state，
-# **不是** attempt ledger。用当前行解释历史时点就是倒填。
-#
-# `paper_job_runs` 的 PK 是 `run_key = intraday:YYYYMMDDHHMM`（`_intraday_business_key:358`，
-# 三分钟窗口），identity 属于**attempt 窗口**而不是"今天这个 slot"。本段因此只发布
-# attempt 级事实。
-#
-# ────────────── writer 审计（闭集来自真实写路径） ──────────────
-#
-# `paper_job_runs` 的生产 writer 只有本模块一个：
-#
-#     INSERT running          :13587
-#     UPDATE → failed         :13534（stale row 回收）/ :1521（_recover_stale_runtime_state）
-#                             / :13751（异常路径）
-#     UPDATE → running        :13593（retry；输入 `status IN ('failed','interrupted')`）
-#     UPDATE → completed      :13732
-#     UPDATE heartbeat        :13656（只动 heartbeat_at / expires_at / fencing_token）
-#
-# 写侧字面量 = `running` / `completed` / `failed`。
-#
-# ────────────── 三条分离 ──────────────
-#
-#     runtime lifecycle status（running / completed / failed）  ≠ owner fact verification
-#     incident severity（critical / high / …）                  ≠ owner fact verification
-#     业务拒绝 / 风控拒单                                        ≠ 系统事故（见 paper_orders）
-#
-# `completed` **不是** `verified`，`failed` 也**不是** `unverified`：一个 `failed` 事实
-# 只要 owner 能证明记录，就是 owner-verified 的**事实**。`verified` 的意思是
-# "这个事实可信"，不是"任务成功"。
-
-PAPER_JOB_RUN_FACT_CONTRACT_VERSION = "paper-job-run-runtime-fact-v1"
-
-PAPER_JOB_RUN_RECORD_KIND = "paper_job_run"
-
-#: owner 自己能签发的 runtime lifecycle status 闭集。**不是**核验词表。
-PAPER_JOB_RUN_LIFECYCLE_STATUSES = ("running", "completed", "failed")
-
-#: retry CAS 接受的**输入**词汇（`:13548` / `:13597`），但**当前没有任何 production
-#: writer 会写出它**（旧版本留下的行可能存在）。因为它没有对应的写路径，owner 无法定义
-#: 它的时间戳形状，所以它**不在**可签发闭集里：读到这样一行时 `paper_job_run_fact`
-#: 返回 ``None``（UNAVAILABLE），而不是猜一个可用瞬间。
-PAPER_JOB_RUN_LEGACY_READONLY_STATUSES = ("interrupted",)
-
-#: 终态 status：owner 的终态写入（`:13732` / `:13751` / `:13534` / `:1521`）把
-#: `finished_at` 写成**写入瞬间**，因此终态可用性可证。
-PAPER_JOB_RUN_TERMINAL_STATUSES = ("completed", "failed")
-
-#: 非终态：行只声明"这一轮正在跑"，其**可用瞬间**是 `started_at`。
-PAPER_JOB_RUN_IN_PROGRESS_STATUSES = ("running",)
-
-#: owner 签发的**极小** factual verification 闭集。两态，与 lifecycle status 词表
-#: **零交集**，与 adaptive runtime 的闭集也**零交集**。
-#:
-#: * ``paper_job_run_recorded``：owner 能证明这条 attempt 记录是**它自己签发**的、
-#:   status 属于它的闭集、且终态/进行中的时间戳形状自洽。含义**仅**是"这是一条可靠的
-#:   owner runtime 事实"，**不是**"这个 job 成功"、**不是**"这是系统事故"。
-#: * ``paper_job_run_unproven``：记录可读，但 owner **无法自证**它的时间戳形状。
-#:   它仍然是一条事实，但 owner 不为它背书。
-PAPER_JOB_RUN_FACT_RECORDED = "paper_job_run_recorded"
-PAPER_JOB_RUN_FACT_OWNER_UNPROVEN = "paper_job_run_unproven"
-PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES = (
-    PAPER_JOB_RUN_FACT_RECORDED, PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
-)
-
-#: 这条事实的可用瞬间是**哪一类**。进指纹，因此"把 `market_date` 或 `started_at` 当成
-#: 终态可用性"不可能只靠读侧疏忽发生。
-PAPER_JOB_RUN_AVAILABILITY_TERMINAL = "terminal"
-PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS = "in_progress"
-PAPER_JOB_RUN_AVAILABILITY_KINDS = (
-    PAPER_JOB_RUN_AVAILABILITY_TERMINAL, PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS,
-)
-
-#: 调度器时间戳的**owner 声明的**历史格式：服务器本地时间的裸
-#: ``%Y-%m-%d %H:%M:%S``（`_now:905`），而生产容器的时区由
-#: ``TZ=Asia/Shanghai``（`Dockerfile` / `docker-compose.yml`）与
-#: ``deploy/install-centos9.sh`` 的 ``timedatectl set-timezone Asia/Shanghai`` 固定，
-#: `_market_session:914` 也逐字声明"生产环境为 Asia/Shanghai"。
-#:
-#: 因此这是一个**owner 明确拥有并一致使用**的 legacy 契约，而不是"naive 就当本地时间"
-#: 的默认猜测。`_PAPER_JOB_INSTANT_FORMAT` 之外的一切（含带 offset 的 ISO、date-only、
-#: 其它分隔符）都 fail closed —— 见 :func:`_paper_runtime_owner_instant`。
-_PAPER_JOB_INSTANT_FORMAT = "%Y-%m-%d %H:%M:%S"
-_PAPER_RUNTIME_OWNER_TZ_NAME = "Asia/Shanghai"
-
-try:  # pragma: no cover - 只在 tzdata 缺失时
-    _PAPER_RUNTIME_OWNER_TZ = ZoneInfo(_PAPER_RUNTIME_OWNER_TZ_NAME)
-except Exception:
-    _PAPER_RUNTIME_OWNER_TZ = None
-
-#: typed 读侧要求的**必需归一列**。
-_PAPER_JOB_RUN_REQUIRED_COLUMNS = (
-    "run_key", "slot", "market_date", "status", "detail",
-    "started_at", "finished_at", "owner_key", "fencing_token",
-)
-
-
-class PaperJobRuntimeFactError(ValueError):
-    """typed paper job attempt fact 读侧的 **fail closed** 拒绝（坏 JSON / 缺列 / 非法时间戳）。"""
-
-
-def _paper_runtime_owner_tz(*, what: str):
-    if _PAPER_RUNTIME_OWNER_TZ is None:  # pragma: no cover - 只在 tzdata 缺失时
-        raise PaperJobRuntimeFactError(
-            f"{what}: owner timezone ({_PAPER_RUNTIME_OWNER_TZ_NAME}) unavailable — "
-            "拒绝派生业务日（naive 时间戳的归属只能由 owner 的时区证明）"
-        )
-    return _PAPER_RUNTIME_OWNER_TZ
-
-
-def _paper_runtime_owner_instant(value: Any, *, what: str) -> dt.datetime:
-    """调度器时间戳 → Asia/Shanghai 的 aware 瞬间；其它形状一律 fail closed。
-
-    **不接受**带 offset 的 ISO：那意味着这行不是本 owner 的正常写路径产物。也**不接受**
-    date-only —— 它会被静默当成"当天 00:00 可用"，正是本层要杜绝的猜测。naive 时间戳
-    之所以可接受，仅仅因为 `_PAPER_JOB_INSTANT_FORMAT` 是 owner 自己声明并一致使用的
-    容器本地（Asia/Shanghai）格式。
-    """
-    text = str(value or "").strip()
-    if not text:
-        raise PaperJobRuntimeFactError(f"{what} is required for a typed paper job attempt fact")
-    try:
-        parsed = dt.datetime.strptime(text, _PAPER_JOB_INSTANT_FORMAT)
-    except ValueError as exc:
-        raise PaperJobRuntimeFactError(
-            f"{what} must be the owner runner's naive "
-            f"'{_PAPER_JOB_INSTANT_FORMAT}' timestamp; got {text!r} — "
-            "其它形状（带 offset / date-only / 其它分隔符）无法证明可用瞬间"
-        ) from exc
-    return parsed.replace(tzinfo=_paper_runtime_owner_tz(what=what))
-
-
-def _paper_runtime_owner_day(instant: dt.datetime, *, what: str) -> str:
-    """owner 时区（Asia/Shanghai）归一后的业务日。"""
-    return instant.astimezone(_paper_runtime_owner_tz(what=what)).date().isoformat()
-
-
-def _paper_runtime_business_day(value: Any, *, what: str) -> str:
-    text = str(value or "").strip()
-    try:
-        parsed = dt.date.fromisoformat(text)
-    except ValueError as exc:
-        raise PaperJobRuntimeFactError(
-            f"{what} requires an explicit canonical YYYY-MM-DD business day; got {value!r}"
-        ) from exc
-    if parsed.isoformat() != text:
-        raise PaperJobRuntimeFactError(f"{what} is not canonical: {value!r}")
-    return text
-
-
-def _paper_runtime_strict_mapping(value: Any, *, what: str) -> dict:
-    """严格 JSON parse + 顶层必须是 object。坏 JSON → fail closed（绝不 ``{}``）。
-
-    `paper_jobs` / `paper_job_runs` 的 `detail` 由 `_json:943` 写入，而它在遇到
-    不可序列化对象时会 ``default=str`` —— 因此"能被读回"并不等于"内容完好"。
-    把 malformed JSON 变成空对象，等于把"这条记录损坏了"伪装成"这条记录没有 detail"。
-
-    SQL ``NULL`` **不**走这里：owner 的 `running` INSERT（`:13587`）刻意不写 `detail`
-    列，因此 NULL 是合法形状，由 :func:`_paper_runtime_canonical_detail` 单独处理。
-    """
-    if value is None or (isinstance(value, str) and not value.strip()):
-        raise PaperJobRuntimeFactError(f"{what} is empty — 缺内容不是空对象")
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except (TypeError, ValueError) as exc:
-        raise PaperJobRuntimeFactError(f"{what} is not parsable JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise PaperJobRuntimeFactError(
-            f"{what} must parse to a JSON object; got {type(parsed).__name__}"
-        )
-    return parsed
-
-
-def _paper_runtime_canonical_json(value: Any, *, what: str) -> str:
-    try:
-        return json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise PaperJobRuntimeFactError(f"{what} is not canonically serializable: {exc}") from exc
-
-
-def _paper_runtime_canonical_detail(value: Any, *, what: str) -> str:
-    """`detail` 列 → canonical JSON 文本。
-
-    SQL ``NULL`` / 全空白是 owner 的**合法** in-progress 形状（`running` 的 INSERT 不写该
-    列），归一成 JSON 字面量 ``null`` —— 刻意**不是** ``{}``：``null`` 表示"owner 还没有写
-    detail"，``{}`` 表示"owner 写了空对象"，两者不是同一件事。其余坏 JSON 一律 fail closed。
-    """
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return "null"
-    if isinstance(value, str) and value.strip() == "null":
-        return "null"
-    return _paper_runtime_canonical_json(_paper_runtime_strict_mapping(value, what=what), what=what)
-
-
-def _paper_runtime_row_dict(cursor, row) -> dict:
-    """把一行转成 dict，**对行形状自适应**（与 ``execution_verification._row_as_dict`` 同手法）。
-
-    生产读路径是 ``sqlite3.Row``（有 ``keys()``），迁移 / 运维入口是裸 tuple
-    （只能借 ``cursor.description`` 配列名）。行形状是**调用方**的事实。
-    """
-    if hasattr(row, "keys"):
-        return dict(row)
-    columns = [item[0] for item in (getattr(cursor, "description", None) or ())]
-    return dict(zip(columns, row, strict=True))
-
-
-def _paper_job_run_availability_kind(runtime_status: str) -> str | None:
-    """owner 能否为这个 status **证明**一个可用瞬间；不能则 ``None``（不可签发）。
-
-    * `completed` / `failed` → ``terminal``；
-    * `running` → ``in_progress``（可用瞬间 = `started_at`）；
-    * 其余（含 legacy 只读的 `interrupted` 与**任何**不在闭集里的 status）→ ``None``。
-
-    未知 status 一并走这里，因此"新增一个 status 却没人决定它的可用性语义"不会静默
-    落进某个默认分支被当成已记录事实 —— 它直接不可签发。
-    """
-    if runtime_status in PAPER_JOB_RUN_TERMINAL_STATUSES:
-        return PAPER_JOB_RUN_AVAILABILITY_TERMINAL
-    if runtime_status in PAPER_JOB_RUN_IN_PROGRESS_STATUSES:
-        return PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS
-    return None
-
-
-def _paper_job_run_fact_verification_status(
-    *, runtime_status: str, availability_kind: str,
-    started_at: dt.datetime, finished_at: dt.datetime | None,
-) -> str:
-    """owner 自洽性 → 极小 factual verification 闭集。
-
-    * status 必须落在 owner 的 lifecycle 闭集内；
-    * **终态**行必须有 `finished_at` 且 `finished_at >= started_at`；
-    * **进行中**行必须**没有** `finished_at` —— 这是 owner 的形状（INSERT 不写该列、
-      retry 显式置 NULL）；一个 `running` 行若带着终态瞬间，owner 无法自证它。
-
-    刻意**不看** status 的"好坏"：`failed` 与 `completed` 都可以是
-    ``paper_job_run_recorded`` —— 见本段开头的三条分离。
-    """
-    if runtime_status not in PAPER_JOB_RUN_LIFECYCLE_STATUSES:
-        return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-    if availability_kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL:
-        if finished_at is None or finished_at < started_at:
-            return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-        return PAPER_JOB_RUN_FACT_RECORDED
-    if availability_kind == PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS:
-        if finished_at is not None:
-            return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-        return PAPER_JOB_RUN_FACT_RECORDED
-    return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-
-
-@dataclasses.dataclass(frozen=True)
-class PaperJobRunFactProjection:
-    """**paper runtime scheduler 自己签发**的一次 attempt 事实 —— 不可变快照。
-
-    identity 由 ``<run_key>@<started_at>|<finished_at>`` 构成。`run_key` 只是**窗口**
-    身份（同一窗口的 retry 会改写同一行），因此 revision identity 必须带上两个时间戳：
-    每一次**改变事实内容**的改写都会推进 `started_at`（retry）或 `finished_at`（终态写入）
-    中的至少一个，而租约心跳两个都不动。于是"内容一变 identity 就变"，同时心跳不会把
-    同一条事实变成多条。
-
-    ``availability_kind`` / ``availability_day`` 是 owner 的显式声明：业务日只从
-    **可用瞬间**按 owner 时区（Asia/Shanghai）派生，**不**从 `market_date`
-    （那是"这次任务属于哪个交易日"的业务标签，D 日失败可能要 D 15:30 甚至 D+1 的回收
-    扫描才被系统知道），也**不**从 `started_at`（当它是终态时）。
-
-    ``heartbeat_at`` / ``expires_at`` **不在**本投影里：它们是租约上下文，**不是**事实。
-    "租约过期"本身**不**等于失败 —— 本层不做这个转换。
-
-    本投影**不复制执行 authority**：订单是否成交、是否被风控拒绝、not_executed / partial
-    全部继续归 ``execution_owner``（`ExecutionFactProjection`）。本层只说
-    "某次 runtime attempt 的当前记录是什么"。
-
-    **本投影不回答事故问题。** 它可以说"job close/D 的这一次尝试终态是 failed"，
-    **不能**说"根因是数据源故障"、"严重级别 high"、"需要重跑"、"数据已损坏"。
-
-    已知限制：contract-issued ≠ physical database origin；
-    physical provenance 仍是 OPEN / REQUIRED（与 B2C-3~B2C-6 一致）。
-    """
-
-    version: str
-    record_kind: str
-    run_key: str
-    slot: str
-    market_date: str
-    runtime_status: str
-    detail_canonical: str
-    started_at: str
-    finished_at: str | None
-    owner_key: str | None
-    fencing_token: int
-    availability_kind: str
-    availability_day: str
-    fact_verification_status: str
-    content_fingerprint: str = ""
-
-    def __post_init__(self) -> None:
-        record_kind = str(self.record_kind or "").strip()
-        if record_kind != PAPER_JOB_RUN_RECORD_KIND:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job attempt record_kind: {record_kind!r}; "
-                f"allowed: {PAPER_JOB_RUN_RECORD_KIND!r}"
-            )
-        object.__setattr__(self, "record_kind", record_kind)
-        object.__setattr__(
-            self, "version", str(self.version or "").strip() or PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
-        )
-        for name in ("run_key", "slot"):
-            text = str(getattr(self, name) or "").strip()
-            if not text:
-                raise PaperJobRuntimeFactError(f"paper job attempt fact requires {name}")
-            object.__setattr__(self, name, text)
-        object.__setattr__(
-            self, "market_date",
-            _paper_runtime_business_day(self.market_date, what="paper job attempt market_date"),
-        )
-
-        runtime_status = str(self.runtime_status or "").strip()
-        if runtime_status not in PAPER_JOB_RUN_LIFECYCLE_STATUSES:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job runtime lifecycle status: {runtime_status!r}; "
-                f"allowed: {PAPER_JOB_RUN_LIFECYCLE_STATUSES}"
-            )
-        object.__setattr__(self, "runtime_status", runtime_status)
-
-        detail_canonical = str(self.detail_canonical or "")
-        canonical = _paper_runtime_canonical_detail(detail_canonical, what="paper job attempt detail")
-        if canonical != detail_canonical:
-            raise PaperJobRuntimeFactError(
-                "paper job attempt detail is not canonical — 事实内容必须能确定性重算指纹"
-            )
-
-        started_at = _paper_runtime_owner_instant(
-            self.started_at, what="paper job attempt started_at",
-        )
-        object.__setattr__(self, "started_at", started_at.strftime(_PAPER_JOB_INSTANT_FORMAT))
-        finished_at = None
-        if self.finished_at is not None:
-            finished_at = _paper_runtime_owner_instant(
-                self.finished_at, what="paper job attempt finished_at",
-            )
-            object.__setattr__(
-                self, "finished_at", finished_at.strftime(_PAPER_JOB_INSTANT_FORMAT),
-            )
-        else:
-            object.__setattr__(self, "finished_at", None)
-
-        owner_key = self.owner_key
-        if owner_key is not None:
-            owner_key = str(owner_key).strip() or None
-        object.__setattr__(self, "owner_key", owner_key)
-        if isinstance(self.fencing_token, bool) or not isinstance(self.fencing_token, int):
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt fencing_token must be an int, got {self.fencing_token!r}"
-            )
-        if self.fencing_token < 0:
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt fencing_token must not be negative, got {self.fencing_token}"
-            )
-
-        kind = str(self.availability_kind or "").strip()
-        if kind not in PAPER_JOB_RUN_AVAILABILITY_KINDS:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job attempt availability_kind: {kind!r}; "
-                f"allowed: {PAPER_JOB_RUN_AVAILABILITY_KINDS}"
-            )
-        if kind != _paper_job_run_availability_kind(runtime_status):
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt availability_kind {kind!r} disagrees with the status "
-                f"{runtime_status!r} — 可用瞬间的种类只能由 owner 从 status 派生"
-            )
-        if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL and finished_at is None:
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt claims terminal status {runtime_status!r} but carries no "
-                "finished_at — 终态记录没有终态瞬间，owner 无法证明它何时可用"
-            )
-        object.__setattr__(self, "availability_kind", kind)
-
-        day = _paper_runtime_business_day(
-            self.availability_day, what="paper job attempt availability_day",
-        )
-        instant = finished_at if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL else started_at
-        expected = _paper_runtime_owner_day(instant, what="paper job attempt availability instant")
-        if day != expected:
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt availability_day {day} disagrees with the owner-timezone "
-                f"day derived from the {kind} instant ({expected}) — 业务日只能由 owner 派生"
-            )
-
-        status = str(self.fact_verification_status or "").strip()
-        if status not in PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job attempt fact verification status: {status!r}; "
-                f"allowed: {PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES}"
-            )
-        expected_status = _paper_job_run_fact_verification_status(
-            runtime_status=runtime_status, availability_kind=kind,
-            started_at=started_at, finished_at=finished_at,
-        )
-        if status != expected_status:
-            raise PaperJobRuntimeFactError(
-                "paper job attempt fact_verification_status disagrees with owner-derived "
-                "verification from factual fields"
-            )
-        object.__setattr__(self, "fact_verification_status", expected_status)
-        object.__setattr__(self, "content_fingerprint", self._fingerprint())
-
-    @property
-    def revision_identity(self) -> str:
-        return f"{self.run_key}@{self.started_at}|{self.finished_at or 'unfinished'}"
-
-    @property
-    def identity(self) -> tuple[str, str, str]:
-        return (self.record_kind, self.revision_identity, self.availability_day)
-
-    @property
-    def runtime_status_is_verification(self) -> bool:
-        """**恒为** ``False``：lifecycle status 与 fact verification 是两个维度。"""
-        return False
-
-    @property
-    def detail(self) -> dict | None:
-        """owner 写的 detail；``None`` 表示 owner 尚未写 detail（不是"空对象"）。"""
-        return json.loads(self.detail_canonical)
-
-    def _fingerprint(self) -> str:
-        payload = {
-            "version": self.version,
-            "record_kind": self.record_kind,
-            "run_key": self.run_key,
-            "slot": self.slot,
-            "market_date": self.market_date,
-            "runtime_status": self.runtime_status,
-            "detail": self.detail_canonical,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "owner_key": self.owner_key,
-            "fencing_token": self.fencing_token,
-            "availability_kind": self.availability_kind,
-            "availability_day": self.availability_day,
-            "fact_verification_status": self.fact_verification_status,
-        }
-        encoded = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-        )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    def projection(self) -> dict:
-        return {
-            "version": self.version,
-            "record_kind": self.record_kind,
-            "identity": self.revision_identity,
-            "run_key": self.run_key,
-            "slot": self.slot,
-            "market_date": self.market_date,
-            "runtime_status": self.runtime_status,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "owner_key": self.owner_key,
-            "fencing_token": self.fencing_token,
-            "availability_kind": self.availability_kind,
-            "availability_day": self.availability_day,
-            "fact_verification_status": self.fact_verification_status,
-            "content_fingerprint": self.content_fingerprint,
-            "authority": "owner_fact",
-            "runtime_status_is_verification": False,
-        }
-
-
-def paper_job_run_fact(conn, run_key, *, as_of):
-    """把一条 attempt 行读成 typed owner fact。``as_of`` **必须显式**。
-
-    **fail-closed 的可用性语义**（返回 ``None`` = UNAVAILABLE，绝不用别的值代替）：
-
-    * 行不存在；
-    * status 不在 owner 闭集内（含 legacy 只读的 `interrupted`）—— 没有人为它的可用性
-      语义做过决定；
-    * 当前 revision 的可用日**晚于** ``as_of`` —— 旧 revision 已被覆盖后不复存在，
-      **不**倒填历史，也**不**按 `market_date` / `started_at` 回退。
-
-    刻意**没有** ``as_of=None → latest`` / 取墙钟 / 取"今天这个 slot 的当前行"。
-
-    行存在、status 可签发但时间戳形状自洽性不成立 → 返回投影且
-    ``fact_verification_status == paper_job_run_unproven``（"owner fact unproven"），
-    而不是抛错 —— 记录确实存在，只是 owner 不为它背书。终态行**没有** ``finished_at``
-    属于记录损坏，抛 :class:`PaperJobRuntimeFactError`。
-
-    **retry 覆盖语义（必须显式知道）**：同一 `run_key` 的 `failed` 会被 retry 改写成
-    `running`（`finished_at=NULL`）再成 `completed`，旧失败**物理消失**。因此本函数
-    **不可能**从当前行重建那次失败；对早已被覆盖的 as_of 它只能返回 ``None``。
-    非 intraday slot 的同类缺口见 `OPEN PREREQUISITE: append-only attempt identity for
-    non-intraday paper job failures`。
-    """
-    day = _paper_runtime_business_day(as_of, what="paper job attempt fact as_of")
-    cursor = conn.execute("SELECT * FROM paper_job_runs WHERE run_key=?", (str(run_key),))
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    item = _paper_runtime_row_dict(cursor, row)
-    missing = [name for name in _PAPER_JOB_RUN_REQUIRED_COLUMNS if name not in item]
-    if missing:
-        raise PaperJobRuntimeFactError(
-            f"paper job run {run_key} is missing required normalized columns: {missing}"
-        )
-
-    runtime_status = str(item.get("status") or "").strip()
-    kind = _paper_job_run_availability_kind(runtime_status)
-    if kind is None:
-        return None
-
-    started_at = _paper_runtime_owner_instant(
-        item.get("started_at"), what=f"paper job run {run_key} started_at",
-    )
-    finished_raw = item.get("finished_at")
-    finished_at = None
-    if finished_raw is not None and str(finished_raw).strip():
-        finished_at = _paper_runtime_owner_instant(
-            finished_raw, what=f"paper job run {run_key} finished_at",
-        )
-    if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL and finished_at is None:
-        raise PaperJobRuntimeFactError(
-            f"paper job run {run_key} claims terminal status {runtime_status!r} but carries no "
-            "finished_at — 终态记录没有终态瞬间，owner 无法证明它何时可用"
-        )
-
-    instant = finished_at if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL else started_at
-    available_day = _paper_runtime_owner_day(
-        instant, what=f"paper job run {run_key} availability instant",
-    )
-    if available_day > day:
-        return None
-
-    fencing_token = item.get("fencing_token")
-    if isinstance(fencing_token, bool) or not isinstance(fencing_token, int):
-        raise PaperJobRuntimeFactError(
-            f"paper job run {run_key} fencing_token must be an int, got {fencing_token!r}"
-        )
-    owner_key = item.get("owner_key")
-
-    return PaperJobRunFactProjection(
-        version=PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
-        record_kind=PAPER_JOB_RUN_RECORD_KIND,
-        run_key=str(item["run_key"]),
-        slot=str(item.get("slot") or ""),
-        market_date=str(item.get("market_date") or ""),
-        runtime_status=runtime_status,
-        detail_canonical=_paper_runtime_canonical_detail(
-            item.get("detail"), what=f"paper job run {run_key} detail",
-        ),
-        started_at=started_at.strftime(_PAPER_JOB_INSTANT_FORMAT),
-        finished_at=None if finished_at is None else finished_at.strftime(_PAPER_JOB_INSTANT_FORMAT),
-        owner_key=None if owner_key is None else str(owner_key),
-        fencing_token=fencing_token,
-        availability_kind=kind,
-        availability_day=available_day,
-        fact_verification_status=_paper_job_run_fact_verification_status(
-            runtime_status=runtime_status, availability_kind=kind,
-            started_at=started_at, finished_at=finished_at,
-        ),
-    )
-
-
-def paper_job_run_facts(conn, *, as_of, limit=100):
-    """按显式 ``as_of`` 发布可证明的 job attempt typed facts。
-
-    run key 的枚举与 row → projection 的转换都属于 paper runtime owner。非 intraday
-    attempt、被 retry 覆盖的失败 revision 与其他不可证明记录继续由单条读取器返回为
-    unavailable；本 API 不创建历史 ledger。
-    """
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError("paper_job_run_facts limit must be a positive int")
-    size = min(limit, 500)
-    facts = []
-    offset = 0
-    while len(facts) < size:
-        rows = conn.execute(
-            "SELECT run_key FROM paper_job_runs ORDER BY started_at DESC,run_key DESC LIMIT ? OFFSET ?",
-            (min(size, 100), offset),
-        ).fetchall()
-        if not rows:
-            break
-        for row in rows:
-            run_key = row[0] if not hasattr(row, "keys") else row["run_key"]
-            projection = paper_job_run_fact(conn, run_key, as_of=as_of)
-            if projection is not None:
-                facts.append(projection)
-                if len(facts) == size:
-                    break
-        offset += len(rows)
-    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
-    return tuple(facts[:size])
 
 
 # Bind explicit vertical capabilities after all compatibility functions exist.

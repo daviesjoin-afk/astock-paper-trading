@@ -12,7 +12,9 @@ from unittest import mock
 import pandas as pd
 
 import paper_candidate_projection as PCP
+import execution_planner as EP
 import paper_entry_decision as PED
+import paper_numeric as PNum
 import paper_risk_market_inputs as PRMI
 
 
@@ -20,23 +22,63 @@ BACKEND = Path(__file__).resolve().parent
 
 
 class ImportBoundaryTests(unittest.TestCase):
+    # 候选投影只允许纯依赖：实时字段覆盖、严格数值规约（仅标准库）以及交易
+    # 规则里的纯谓语。``limit_pct`` 之类会懒加载因子模块的入口不在允许范围，
+    # 因此这里同时校验导入的函数名，而不只是模块名。
+    PURE_PROJECTION_DEPENDENCIES = {
+        "paper_candidate_live_fields", "paper_numeric", "paper_trading_rules",
+    }
+    PURE_RULE_NAMES = {"asset_type", "is_st_or_delisting", "security_scope"}
+
     def test_extracted_decisions_cannot_acquire_data_or_import_project_modules(self):
         project_modules = {path.stem for path in BACKEND.glob("*.py")}
         for name in ("paper_candidate_projection", "paper_entry_decision", "paper_candidate_live_fields"):
-            allowed = {"paper_candidate_live_fields"} if name == "paper_candidate_projection" else set()
+            allowed = (self.PURE_PROJECTION_DEPENDENCIES
+                       if name == "paper_candidate_projection" else set())
             tree = ast.parse((BACKEND / f"{name}.py").read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     roots = {alias.name.split(".")[0] for alias in node.names}
                     self.assertFalse((roots & project_modules) - allowed, name)
                 elif isinstance(node, ast.ImportFrom) and node.module:
-                    self.assertNotIn(node.module.split(".")[0], project_modules - allowed, name)
+                    root = node.module.split(".")[0]
+                    self.assertNotIn(root, project_modules - allowed, name)
+                    if name == "paper_candidate_projection" and root == "paper_trading_rules":
+                        self.assertLessEqual(
+                            {alias.name for alias in node.names}, self.PURE_RULE_NAMES,
+                        )
                 if isinstance(node, ast.Call):
                     called = ast.unparse(node.func)
                     self.assertNotIn(called.split(".")[-1], {
                         "open", "read_csv", "read_sql", "connect", "execute",
                         "urlopen", "request", "now", "today", "time",
                     }, f"{name}: {called}")
+
+    def test_entry_assessment_model_stays_pure_and_keeps_one_spec_owner(self):
+        """入场评分模型不读库、不读时钟，账户声明仍只有主编排一个解析口。"""
+        import paper_entry_assessment as PEA
+        import paper_trading as PT
+
+        self.assertIs(PT._strategy_entry_assessment, PEA._strategy_entry_assessment)
+        self.assertIs(PT._clip01, PEA._clip01)
+        self.assertIs(PEA._SPEC_RESOLVER, PT._spec_for)
+        for account_id in ("trend_pullback", "tq_breakout", "unknown_account"):
+            self.assertEqual(PEA._spec_for(account_id), PT._spec_for(account_id))
+
+        tree = ast.parse((BACKEND / "paper_entry_assessment.py").read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots = {alias.name.split(".")[0] for alias in node.names}
+                self.assertFalse(roots & {"sqlite3", "paper_trading", "data_fetcher"}, roots)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                self.assertNotIn(node.module.split(".")[0],
+                                 {"sqlite3", "paper_trading", "data_fetcher"})
+            if isinstance(node, ast.Call):
+                self.assertNotIn(
+                    ast.unparse(node.func).split(".")[-1],
+                    {"open", "read_csv", "read_sql", "connect", "execute",
+                     "urlopen", "request", "now", "today", "time"},
+                )
 
     def test_runtime_fact_owner_only_executes_reads(self):
         tree = ast.parse((BACKEND / "adaptive_runtime_facts.py").read_text(encoding="utf-8"))
@@ -160,6 +202,44 @@ class ExtractedDecisionTests(unittest.TestCase):
         self.assertEqual(result, regular[:24] + hot[:6])
         self.assertEqual(len(original), 49)
 
+    def test_risk_flag_codes_mirror_the_trading_rule_reasons(self):
+        universe = [
+            {"code": "600001", "name": "普通甲"},
+            {"code": "600002", "name": "普通乙", "risk_flag": 1},
+            {"code": "600003", "name": "ST测试"},
+            {"code": "600004", "name": "退市风险"},
+            {"code": "600005"},
+        ]
+        self.assertEqual(PCP.risk_flag_codes(universe), {"600002", "600003", "600004"})
+        self.assertEqual(PCP.risk_flag_codes(None), set())
+
+    def test_runtime_filter_keeps_order_and_only_drops_unexecutable_rows(self):
+        picks = [
+            {"code": "600001", "price": 10.0},
+            {"code": "600002", "price": 0.0},
+            {"code": "600003", "price": "--"},
+            {"code": "600004"},
+            {"code": "600005", "price": 5.0},
+        ]
+        kept = PCP.filter_executable_candidates(picks, mode="swing", excluded_codes={"600005"})
+        self.assertEqual([pick["code"] for pick in kept], ["600001"])
+        # An expensive one-lot candidate is never deleted at selection time.
+        expensive = [{"code": "600009", "price": 1200.0}]
+        self.assertEqual(
+            PCP.filter_executable_candidates(expensive, mode="swing"),
+            expensive,
+        )
+
+    def test_intraday_t_filter_keeps_only_t_plus_one_assets(self):
+        picks = [
+            {"code": "600001", "name": "主板股", "price": 10.0},
+            {"code": "510300", "name": "沪深300ETF", "price": 4.0},
+            {"code": "159915", "name": "创业板ETF", "price": 2.0},
+        ]
+        kept = PCP.filter_executable_candidates(picks, mode="intraday_t")
+        self.assertEqual([pick["code"] for pick in kept], ["600001"])
+        self.assertEqual(len(PCP.filter_executable_candidates(picks, mode="swing")), 3)
+
     def test_live_overlay_preserves_factors_and_missing_value_behavior(self):
         table = pd.DataFrame({"price": [1., 2.], "pct": [3., 4.], "ma20": [5., 6.]}, index=["a", "b"])
         live = {"a": {"price": 10., "pct": "--", "quote_at": "2026-09-01 10:00:00"},
@@ -171,6 +251,60 @@ class ExtractedDecisionTests(unittest.TestCase):
         self.assertEqual(list(result.index), ["a", "b"])
         self.assertEqual(result.loc["a", "quote_source"], "live_snapshot")
         self.assertEqual(result.loc["a", "historical_factor_date"], "2026-08-31")
+
+    def economics(self, **overrides):
+        kwargs = dict(
+            reasons=[], qty=100, fill_price=10.0, price=10.0, pending_cash=0.0,
+            shared_cash=900000.0, minimum_order_amount=0.0, lot_size=100,
+            economics_policy=None, min_cost_edge=None, sizing={},
+            fee_estimator=EP.estimate_execution_fees,
+            sell_price_estimator=EP.estimated_fill_price, num=PNum.num,
+        )
+        kwargs.update(overrides)
+        return PED.assess_order_economics(**kwargs)
+
+    def test_zero_cash_is_a_hard_veto_while_a_short_balance_stays_soft(self):
+        empty = self.economics(shared_cash=0.0)
+        self.assertEqual(empty["soft_reasons"], [])
+        self.assertEqual(empty["reasons"], ["共享资金池暂无可用现金"])
+        short = self.economics(shared_cash=500.0)
+        self.assertEqual(len(short["reasons"]), 1)
+        self.assertEqual(short["soft_reasons"], short["reasons"])
+
+    def test_risk_only_binding_is_terminal_but_budget_bindings_are_waitable(self):
+        terminal = self.economics(qty=50, sizing={"constraint_shares": {"risk": 0.0}})
+        self.assertEqual(terminal["soft_reasons"], [])
+        self.assertIn("结构性不足", terminal["reasons"][0])
+        waitable = self.economics(qty=50, sizing={"constraint_shares": {"cash": 50.0}})
+        self.assertEqual(waitable["soft_reasons"], waitable["reasons"])
+        self.assertIn("可用现金", waitable["reasons"][0])
+
+    def test_dust_order_floor_uses_the_dynamic_minimum_amount(self):
+        result = self.economics(minimum_order_amount=6000.0)
+        self.assertEqual(result["soft_reasons"], result["reasons"])
+        self.assertIn("低于动态最小建仓金额", result["reasons"][0])
+
+    def test_economics_policy_requires_edge_to_cover_the_round_trip_cost(self):
+        policy = {"min_effective_order_amount": 2000.0, "min_expected_edge_pct": 0.003}
+        too_small = self.economics(economics_policy=policy)
+        self.assertIn("短线有效委托至少", too_small["reasons"][0])
+        expensive = self.economics(
+            economics_policy={"min_effective_order_amount": 0.0, "min_expected_edge_pct": 0.003},
+            price=9.0,
+        )
+        self.assertIn("未覆盖估算往返成本", expensive["reasons"][0])
+        self.assertGreater(expensive["sizing"]["estimated_round_trip_cost"], 0.0)
+
+    def test_one_lot_arithmetic_is_reported_without_touching_the_input_sizing(self):
+        sizing = {"binding_constraints": ["cash"]}
+        result = self.economics(qty=300, sizing=sizing)
+        self.assertEqual(result["amount"], 3000.0)
+        self.assertEqual(result["fees"], 0.3)
+        self.assertEqual(result["sizing"]["one_lot_amount"], 1000.0)
+        self.assertEqual(result["sizing"]["qty_final"], 300)
+        self.assertEqual(result["sizing"]["cash_available"], 900000.0)
+        self.assertEqual(result["reasons"], [])
+        self.assertEqual(sizing, {"binding_constraints": ["cash"]})
 
     def test_slice_continuation_preserves_plan_and_current_count(self):
         payload = {"entry_slice_policy": 2, "entry_slices": {"plan": [100, 200, 300], "filled": 1, "slices": 2}}

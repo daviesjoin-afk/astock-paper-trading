@@ -5,7 +5,9 @@ import datetime as dt
 import json
 import sys
 
-import main as M
+import selection_service as SEL
+import universe as U
+import data_fetcher as dfc
 import paper_trading as P
 import selection_tracking as ST
 import strategies as S
@@ -19,7 +21,7 @@ def run_daily():
     # calendar is the single source of truth; if it cannot classify the date,
     # fail closed and let the next scheduled run retry.
     try:
-        if not M.U.is_trade_day(now.date()):
+        if not U.is_trade_day(now.date()):
             return {"status": "skipped", "reason": "non-trading-day"}
     except Exception as exc:
         return {"status": "skipped", "reason": "calendar-unavailable",
@@ -43,11 +45,11 @@ def _run_daily(admission=None, now=None):
     # 盘后因子更新必须在选股前补齐。目标日期使用共享数据层的完整日线
     # 截止点：若行情源尚未发布当天收盘，就使用上一完整交易日，而不是
     # 把“昨天的有效响应”误判成过期数据。
-    target_date = M._complete_daily_cutoff()
+    target_date = SEL._complete_daily_cutoff()
     refresh = None
     factor_refresh = None
     try:
-        refresh = M.U.refresh_history(asof_day=target_date, workers=2, max_seconds=420)
+        refresh = U.refresh_history(asof_day=target_date, workers=2, max_seconds=420)
         # A partial history refresh is not permission to publish a partial factor cache.
         if refresh.get("status") in {"ok", "up_to_date"}:
             factor_refresh = P._rebuild_selection_factor_cache(target_date)
@@ -61,12 +63,12 @@ def _run_daily(admission=None, now=None):
     # pass its normal "previous trading day is fresh" check and silently
     # save yesterday's candidates under today's run date.
     if target_date == now.date():
-        universe = M.U.load_universe() or []
+        universe = U.load_universe() or []
         required_codes = {
             str(row.get("code")) for row in universe
             if row.get("code") and not row.get("listing_status") == "pending"
         }
-        manifest = M.dfc.get_kline_manifest()
+        manifest = dfc.get_kline_manifest()
         target_count = sum(
             1 for code in required_codes
             if str((manifest.get(code) or {}).get("last_date") or "")[:10] >= target_date.isoformat()
@@ -103,7 +105,7 @@ def _run_daily(admission=None, now=None):
     # research sample without turning the job into a second paper-trading engine.
     for strategy in S.STRATEGIES:
         try:
-            result = M._select_uncached(strategy=strategy, topn=10)
+            result = SEL._select_uncached(strategy=strategy, topn=10)
             if not isinstance(result, dict) or result.get("need_init") or result.get("error"):
                 failures.append({"strategy": strategy, "error": result})
                 continue

@@ -5,7 +5,7 @@
 --------------------------
 1. **策略来源**：完全取自模拟盘账户注册表 ``strategy_registry``（5 套），
    与「策略模拟」页同源；每个策略带编号（策略1…策略5）与名称。
-2. **评分选股**：复用既有选股因子链 ``main._select_uncached``（同一套
+2. **评分选股**：复用既有选股因子链 ``selection_service._select_uncached``（同一套
    覆盖率/行情新鲜度/买卖范围门禁），每个策略按其模型族评分取 Top N
    （默认 5，候选不足则少于 5 只并给出空状态）。
 3. **分组归属**：结果按策略分组存储，run 的唯一键为
@@ -412,8 +412,8 @@ def _registry_active_ids() -> tuple[str, ...]:
 
 def _run_one(model_id: str, topn: int):
     """调用既有选股流水线（含覆盖率与行情新鲜度门禁）。"""
-    import main as M
-    return M._select_uncached(strategy=model_id, topn=topn)
+    import selection_service as SEL
+    return SEL._select_uncached(strategy=model_id, topn=topn)
 
 
 _DATE_KEYS = ("historical_factor_date", "trade_date", "reference_date", "complete_cutoff")
@@ -422,7 +422,7 @@ _DATE_KEYS = ("historical_factor_date", "trade_date", "reference_date", "complet
 def _trade_date_of(result):
     """从选股返回里解析一个**展示用**的因子基准日。
 
-    真实的 ``main._select_uncached`` 并不会在顶层放日期：它把
+    真实的 ``selection_service._select_uncached`` 并不会在顶层放日期：它把
     ``historical_factor_date`` 写到每只 pick 上，把 ``reference_date`` /
     ``complete_cutoff`` 放在 ``data_quality`` 里。因此按
     顶层 → data_quality → pick 逐级回退，保证落库时不会丢数据来源。
@@ -489,9 +489,8 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
             try:
                 result = _run_one(item["model_id"], topn)
                 if not isinstance(result, dict):
-                    # 选股链路（main._select_uncached）在拒绝场景会返回
-                    # FastAPI JSONResponse 而不是 dict；显式报错而不是让后续
-                    # .get 抛出难以定位的 AttributeError。
+                    # 共享选股链路应只返回普通字典；异常类型显式报错，
+                    # 避免后续 .get 抛出难以定位的 AttributeError。
                     raise TypeError(
                         f"选股链路返回类型异常: {type(result).__name__}")
                 if result.get("need_init"):

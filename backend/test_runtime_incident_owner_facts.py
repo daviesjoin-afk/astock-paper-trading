@@ -34,6 +34,7 @@ if BACKEND not in sys.path:
 
 import adaptive_engine as AE  # noqa: E402
 import ai_research_contract as ARC  # noqa: E402
+import paper_runtime_facts as PRF
 import paper_trading as PT  # noqa: E402
 
 ADAPTIVE_RUNS = "adaptive_runs"
@@ -503,7 +504,7 @@ class RuntimeLifecycleVsVerificationTests(_DbTestCase):
         源文本。
         """
         for name in (
-            "adaptive_engine.py", "paper_trading.py", "ai_research_runtime_adapter.py",
+            "adaptive_engine.py", "paper_trading.py", "paper_runtime_facts.py", "ai_research_runtime_adapter.py",
         ):
             identifiers = _code_identifiers(name)
             hits = sorted(
@@ -710,10 +711,10 @@ class RuntimePitAvailabilityTests(_DbTestCase):
                 self.assertEqual("2026-09-20", fact.availability_day)
 
         # paper：裸时间戳按 Asia/Shanghai 解释，而不是 UTC。
-        self.assertEqual("2026-09-20", PT._paper_runtime_owner_day(
-            PT._paper_runtime_owner_instant("2026-09-20 23:30:00", what="t"), what="t",
+        self.assertEqual("2026-09-20", PRF._paper_runtime_owner_day(
+            PRF._paper_runtime_owner_instant("2026-09-20 23:30:00", what="t"), what="t",
         ))
-        offset = PT._paper_runtime_owner_instant("2026-09-20 09:30:00", what="t").utcoffset()
+        offset = PRF._paper_runtime_owner_instant("2026-09-20 09:30:00", what="t").utcoffset()
         self.assertEqual(8 * 3600, int(offset.total_seconds()))
         # 非空性对照：同一堵墙钟若按 UTC 解释会落到**前一天** —— 说明这个断言有内容。
         conn = _paper_conn()
@@ -1064,7 +1065,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         for module, function in (
             ("adaptive_engine.py", "adaptive_run_fact"),
             ("adaptive_runtime_facts.py", "adaptive_run_fact"),
-            ("paper_trading.py", "paper_job_run_fact"),
+            ("paper_runtime_facts.py", "paper_job_run_fact"),
         ):
             identifiers, constants = _function_facts(module, function)
             with self.subTest(module=module, function=function):
@@ -1115,7 +1116,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         若让它变成 runtime owner fact，研究就能给自己签 factual verification（自引用回路）。
         可执行形式：两个 owner 与 adapter 都不得触达 canonical research ledger。
         """
-        for name in ("adaptive_engine.py", "paper_trading.py", "ai_research_runtime_adapter.py"):
+        for name in ("adaptive_engine.py", "paper_trading.py", "paper_runtime_facts.py", "ai_research_runtime_adapter.py"):
             roots = _imported_roots(name)
             for forbidden in ("ai_research_repository", "ai_research_provider",
                               "ai_research_service"):

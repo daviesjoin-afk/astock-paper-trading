@@ -132,14 +132,22 @@ class AttributionCacheTests(unittest.TestCase):
 @unittest.skipIf(AE is None, "adaptive engine dependencies are not installed")
 class AlphaLabBoundTests(unittest.TestCase):
     def test_window_sampling_is_bounded_and_deterministic(self):
-        rows = [
-            {"profile_date": "2026-08-31", "horizon": 1, "code": f"{i:06d}"}
+        samples = [
+            types.SimpleNamespace(
+                feature_asof="2026-08-31", horizon=1, code=f"{i:06d}",
+                features={"price_momentum": 0.2}, target=float(i),
+            )
             for i in range(250)
         ]
-        first = AE._alpha_bounded_sample(rows, max_rows_per_window=100)
-        second = AE._alpha_bounded_sample(list(reversed(rows)), max_rows_per_window=100)
-        self.assertEqual(len(first), 100)
-        self.assertEqual([row["code"] for row in first], [row["code"] for row in second])
+        first = AE._canonical_alpha_frame(types.SimpleNamespace(
+            partitions={name: samples for name in AE.learning_dataset.PARTITIONS},
+        ), max_rows_per_window=100)
+        second = AE._canonical_alpha_frame(types.SimpleNamespace(
+            partitions={name: list(reversed(samples)) for name in AE.learning_dataset.PARTITIONS},
+        ), max_rows_per_window=100)
+        for name in AE.learning_dataset.PARTITIONS:
+            self.assertEqual(len(first[name]), 100)
+            self.assertEqual(first[name], second[name])
 
 
 class ResearchSuiteSnapshotTests(unittest.TestCase):

@@ -991,10 +991,12 @@ class LiveSnapshotCutoffTests(PointInTimeBase):
         import inspect
 
         import main as M
-        import paper_trading as PT
+        import paper_candidate_assembly as PCA
+        import selection_service as SEL
 
-        for module, name in ((M, "_select_uncached"), (M, "scanner"),
-                             (PT, "_candidate_rows")):
+        # 纸盘候选的实时截面取数已迁入装配模块，检查跟随真正持有实现的模块。
+        for module, name in ((SEL, "_select_uncached"), (M, "scanner"),
+                             (PCA, "assemble_candidate_inputs")):
             source = inspect.getsource(getattr(module, name))
             self.assertIn("snapshot_asof=F.live_snapshot_asof()", source,
                           "%s.%s 未声明实时截面决策时点" % (module.__name__, name))
