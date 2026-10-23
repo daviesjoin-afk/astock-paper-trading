@@ -146,6 +146,25 @@ def _collect_paper_metrics():
             metrics["market_snapshot_flow_field_coverage"] = _safe_float(
                 snapshot.get("flow_field_coverage")
             )
+        # 收盘任务（slot='close'）此前没有任何耗时/失败指标：它写在
+        # ``paper_jobs`` 而不是 ``paper_job_runs``，上面的"最近一轮"看不见它。
+        # 连续失败时既分不清"进程超时"还是"日线覆盖不足"，也看不到单次耗时。
+        close = con.execute(
+            "SELECT status, started_at, finished_at FROM paper_jobs "
+            "WHERE slot='close' ORDER BY market_date DESC LIMIT 1"
+        ).fetchone()
+        if close is not None:
+            metrics["paper_close_job_failed"] = 1 if close["status"] == "failed" else 0
+            started = _parse_stamp(close["started_at"])
+            finished = _parse_stamp(close["finished_at"])
+            if started is not None:
+                metrics["paper_close_job_age_seconds"] = round(
+                    (dt.datetime.now() - started).total_seconds(), 1
+                )
+            if started is not None and finished is not None:
+                metrics["paper_close_job_duration_seconds"] = round(
+                    (finished - started).total_seconds(), 1
+                )
     except (sqlite3.Error, ValueError, TypeError):
         pass
     finally:

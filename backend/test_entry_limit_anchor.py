@@ -1,35 +1,43 @@
 # -*- coding: utf-8 -*-
-"""限价锚点冻结（``paper_trading._frozen_entry_limit``）。
+"""价格等待锚点与窗口（``paper_trading._entry_price_wait`` / ``_price_wait_outcome``）。
 
 限价画像的参考价每轮取当轮实时价，重算出的限价会跟着价格上移：当轮买不到，
-下一轮锚点更高，形成结构性追价。冻结口径是"该信号当日**首次**限价延期单的
-``planned_price``"，只降不升。这里钉死三件事：
+下一轮锚点更高，形成结构性追价。冻结口径仍然是"同一入场机会里第一次**因价格
+挂起**的限价"，只降不升。2026-10-23 诊断修复后，这里钉死五件事：
 
-    1. 取最早那张限价单，而不是最新一张（否则每轮都会重新锚定）；
-    2. 直接返回冻结限价与已等待分钟，供调用方判断追价窗口是否已过；
-    3. 当天没有限价单时返回 ``(None, None)``，调用方按未冻结处理。
+    1. 锚点只由"其他条件都已满足、仅价格未到"的尝试建立——入场确认中、容量
+       不足等非价格拒绝不得启动价格等待计时；
+    2. 同一入场机会的多轮等待共享最早那张锚，取最早而不是最新（否则每轮重新
+       锚定、追价棘轮复活）；
+    3. 现价回到（或低于）冻结限价即为"等待兑现"，不能因为等得久就报"未回到
+       限价"；
+    4. 窗口到期是**本机会**的价格等待失效：留下终态标记，理由必须说清"当日
+       不再追价、需新机会重新确认"；
+    5. 入场状态机重触发（``retrigger_seq`` 递增）产生新机会，锚点独立，不得
+       继续复用上一机会的冻结限价。
 
 纯 fixture：内存 sqlite，不联网、不读写真实账本。
 """
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sqlite3
 import sys
 import unittest
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
-sys.modules.setdefault("requests", mock.MagicMock())
+sys.modules.setdefault("requests", __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock())
 import paper_trading as PT  # noqa: E402
 
 ACCOUNT = "tq_breakout"
 CODE = "600901"
 SIGNAL_ID = 9
+WINDOW = PT.ENTRY_LIMIT_CHASE_WINDOW_MINUTES
 
 
-class FrozenEntryLimitTests(unittest.TestCase):
+class PriceWaitAnchorTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
@@ -37,43 +45,156 @@ class FrozenEntryLimitTests(unittest.TestCase):
             """CREATE TABLE paper_orders(
                    id INTEGER PRIMARY KEY, account_id TEXT, code TEXT, side TEXT,
                    signal_id INTEGER, order_type TEXT, planned_price REAL,
-                   status TEXT, created_at TEXT)"""
+                   status TEXT, created_at TEXT, risk_payload TEXT)"""
         )
         self.today = dt.date.today()
+        self.opportunity = PT._entry_opportunity(SIGNAL_ID, None)
+        self.other_opportunity = PT._entry_opportunity(
+            SIGNAL_ID, {"record": {"retrigger_seq": 1,
+                                   "first_trigger_at": "2026-10-23T13:04:40"}},
+        )
 
-    def _order(self, *, minutes_ago, price, order_type="limit", status="execution_retry",
-               signal_id=SIGNAL_ID):
+    def _order(self, *, minutes_ago, price, opportunity=None, wait_status=None,
+               signal_id=SIGNAL_ID, order_type="limit", status="execution_retry"):
         stamp = (dt.datetime.now() - dt.timedelta(minutes=minutes_ago)).strftime(
             "%Y-%m-%d %H:%M:%S")
+        payload = {}
+        if wait_status is not None:
+            payload["entry_price_wait"] = {
+                "opportunity_id": (opportunity or self.opportunity)["id"],
+                "anchor_price": price,
+                "status": wait_status,
+                "started_at": stamp,
+                "window_minutes": WINDOW,
+            }
         cursor = self.conn.execute(
             """INSERT INTO paper_orders(
-                   account_id,code,side,signal_id,order_type,planned_price,status,created_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (ACCOUNT, CODE, "buy", signal_id, order_type, price, status, stamp))
+                   account_id,code,side,signal_id,order_type,planned_price,status,
+                   created_at,risk_payload)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (ACCOUNT, CODE, "buy", signal_id, order_type, price, status, stamp,
+             json.dumps(payload)),
+        )
         return int(cursor.lastrowid)
 
-    def _resolve(self):
-        return PT._frozen_entry_limit(self.conn, ACCOUNT, CODE, SIGNAL_ID, self.today)
+    def _resolve(self, opportunity=None):
+        opportunity = opportunity or self.opportunity
+        return PT._entry_price_wait(
+            self.conn, ACCOUNT, CODE, SIGNAL_ID, self.today, opportunity["id"])
 
-    def test_returns_the_earliest_limit_and_its_age(self):
-        """取最早那张限价单：晚些的延期单不得把锚点重新抬高。"""
-        self._order(minutes_ago=8, price=20.04)   # 首次延期：冻结在 20.04
-        self._order(minutes_ago=2, price=20.44)   # 后续延期：若取最新就会追到 20.44
-        limit_price, waited = self._resolve()
-        self.assertEqual(20.04, limit_price)
-        self.assertIsNotNone(waited)
-        self.assertGreaterEqual(waited, 7.5)
+    # ---------- 第 1 条：只有价格等待才起锚 ----------
 
-    def test_market_order_is_not_a_frozen_limit(self):
-        self._order(minutes_ago=5, price=20.04, order_type="market")
-        self.assertEqual((None, None), self._resolve())
+    def test_non_price_rejection_does_not_start_the_price_clock(self):
+        """入场确认中/容量不足的限价单没有价格等待标记 → 不产生锚点。"""
+        self._order(minutes_ago=248, price=72.77, wait_status=None)
+        self.assertIsNone(self._resolve())
 
-    def test_no_limit_order_means_not_frozen(self):
-        self.assertEqual((None, None), self._resolve())
+    def test_market_order_carries_no_price_wait(self):
+        self._order(minutes_ago=5, price=20.04, order_type="market",
+                    wait_status="waiting")
+        self.assertIsNone(self._resolve())
+
+    def test_no_price_wait_means_not_frozen(self):
+        self.assertIsNone(self._resolve())
+
+    # ---------- 第 2 条：同一机会取最早的锚 ----------
+
+    def test_earliest_anchor_wins_within_one_opportunity(self):
+        self._order(minutes_ago=8, price=20.04, wait_status="waiting")
+        self._order(minutes_ago=2, price=20.44, wait_status="waiting")
+        wait = self._resolve()
+        self.assertEqual(20.04, wait["anchor_price"])
+        self.assertGreaterEqual(wait["waited_minutes"], 7.5)
+        self.assertFalse(wait["expired"])
+
+    # ---------- 第 3 条：回到限价 = 等待兑现 ----------
+
+    def test_returning_to_the_frozen_limit_is_not_an_expiry(self):
+        self._order(minutes_ago=279, price=7.71, wait_status="waiting")
+        wait = self._resolve()
+        outcome = PT._price_wait_outcome(wait, 7.6677)
+        self.assertEqual("price_returned", outcome["status"])
+
+    def test_price_still_above_the_frozen_limit_fails_after_the_window(self):
+        self._order(minutes_ago=279, price=7.71, wait_status="waiting")
+        outcome = PT._price_wait_outcome(self._resolve(), 7.86)
+        self.assertEqual("failed", outcome["status"])
+        self.assertEqual(7.71, outcome["anchor_price"])
+
+    def test_price_above_the_limit_inside_the_window_keeps_waiting(self):
+        self._order(minutes_ago=3, price=7.71, wait_status="waiting")
+        outcome = PT._price_wait_outcome(self._resolve(), 7.86)
+        self.assertEqual("waiting", outcome["status"])
+
+    # ---------- 第 4 条：到期留下终态标记 ----------
+
+    def test_expired_marker_keeps_the_opportunity_closed(self):
+        self._order(minutes_ago=20, price=7.71, wait_status="waiting")
+        self._order(minutes_ago=1, price=7.71, wait_status="expired")
+        wait = self._resolve()
+        self.assertTrue(wait["expired"])
+        # 已失效的机会即使价格回到锚点以下，也不再是"仍在等待"。
+        self.assertEqual("price_returned",
+                         PT._price_wait_outcome(wait, 7.60)["status"])
+        self.assertEqual("failed",
+                         PT._price_wait_outcome(wait, 7.90)["status"])
+
+    def test_marker_is_only_written_for_price_waits(self):
+        marker = PT._next_price_wait_marker(
+            opportunity=self.opportunity,
+            outcome=PT._price_wait_outcome(None, 20.5),
+            limit_price=20.04, deferred=False, now="2026-10-23 10:32:29",
+        )
+        self.assertIsNone(marker, "非价格拒绝不能建立限价锚点")
+
+    def test_marker_records_the_anchor_and_the_opportunity(self):
+        marker = PT._next_price_wait_marker(
+            opportunity=self.other_opportunity,
+            outcome=PT._price_wait_outcome(None, 20.5),
+            limit_price=20.04, deferred=True, now="2026-10-23 13:04:40",
+        )
+        self.assertEqual("waiting", marker["status"])
+        self.assertEqual(20.04, marker["anchor_price"])
+        self.assertEqual(f"{SIGNAL_ID}#1", marker["opportunity_id"])
+        self.assertEqual(1, marker["retrigger_seq"])
+
+    def test_expiry_marker_is_terminal_and_keeps_the_anchor(self):
+        anchor = self._order(minutes_ago=30, price=20.04, wait_status="waiting")
+        wait = self._resolve()
+        marker = PT._next_price_wait_marker(
+            opportunity=self.opportunity,
+            outcome={**PT._price_wait_outcome(wait, 21.0),
+                     "started_at": wait["started_at"]},
+            limit_price=21.04, deferred=False, now="2026-10-23 11:02:00",
+        )
+        self.assertEqual("expired", marker["status"])
+        self.assertEqual(20.04, marker["anchor_price"])
+        self.assertEqual(wait["started_at"], marker["started_at"])
+        self.assertIsNotNone(anchor)
+        self.assertGreaterEqual(marker["waited_minutes"], 29)
+
+    # ---------- 第 5 条：重触发 = 新机会，独立锚点 ----------
+
+    def test_new_opportunity_does_not_reuse_the_previous_anchor(self):
+        self._order(minutes_ago=60, price=72.77, wait_status="waiting")
+        self.assertEqual(72.77, self._resolve()["anchor_price"])
+        self.assertIsNone(
+            self._resolve(self.other_opportunity),
+            "状态机重触发后的新机会不得沿用上一机会的冻结限价",
+        )
 
     def test_other_signal_is_isolated(self):
-        self._order(minutes_ago=5, price=20.04, signal_id=SIGNAL_ID + 1)
-        self.assertEqual((None, None), self._resolve())
+        self._order(minutes_ago=5, price=20.04, wait_status="waiting",
+                    signal_id=SIGNAL_ID + 1)
+        self.assertIsNone(self._resolve())
+
+    def test_opportunity_id_is_signal_scoped(self):
+        base = PT._entry_opportunity(9, None)
+        retriggered = PT._entry_opportunity(9, {"record": {"retrigger_seq": 2}})
+        other_signal = PT._entry_opportunity(10, {"record": {"retrigger_seq": 2}})
+        self.assertEqual("9#0", base["id"])
+        self.assertEqual("9#2", retriggered["id"])
+        self.assertEqual("10#2", other_signal["id"])
 
 
 if __name__ == "__main__":

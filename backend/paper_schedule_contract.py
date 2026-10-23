@@ -91,6 +91,15 @@ class ScheduleTask:
     ``retry_clocks`` lists additional one-shot times at which the same slot is
     retried; ``run_slot`` is idempotent for a completed run, so a retry that
     arrives after success is a cheap no-op rather than a duplicate scan.
+
+    ``close`` carries five retries because its failures are not all alike: an
+    interrupted process needs one early retry (15:10/15:12), while "完整日线覆盖
+    不足" is a *data-not-ready* verdict that only a later window can clear.
+    ``universe.refresh_history`` is bounded to 420 seconds and resumes from a
+    persisted cursor, so the 15:25/15:40/16:00 entries are the incremental
+    continuation those later windows exist for.  Each attempt still runs the same
+    fail-closed coverage gate — a late window never marks partial history as
+    success.
     """
 
     name: str
@@ -128,7 +137,7 @@ SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
     ScheduleTask("A股模拟盘-开盘审批", "09:31", "open", _WEEKDAY_DAYS,
                  retry_clocks=("09:33", "09:35")),
     ScheduleTask("A股模拟盘-盘后评分", "15:05", "close", _WEEKDAY_DAYS,
-                 retry_clocks=("15:10", "15:12")),
+                 retry_clocks=("15:10", "15:12", "15:25", "15:40", "16:00")),
     ScheduleTask("A股模拟盘-周度复盘", "15:20", "weekly-review", "FRI"),
 )
 

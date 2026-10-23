@@ -225,6 +225,17 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     ret_pct = (price / cost - 1) * 100 if price and cost else None
     market_pct = _num((market or {}).get("live_index_pct"), None)
     relative = pct - market_pct if pct is not None and market_pct is not None else None
+    # 相对强弱的参照必须能追溯：指数不可用/不属于当日时 relative 为 None，
+    # 记录里要说明"为什么未知"，而不是让人误读成"没有跑输大盘"。
+    market_reference = {
+        "index_pct": market_pct,
+        "index_time": (market or {}).get("live_index_time"),
+        "status": (
+            ((market or {}).get("index_reference") or {}).get("status")
+            or ("same_session" if market_pct is not None else "unavailable")
+        ),
+        "relative_available": relative is not None,
+    }
     peak = PRD.position_peak(position, quote, price, asof_day=asof_day)
     peak_retrace = (1 - price / peak) * 100 if price and peak else None
     peak_return = (peak / cost - 1) * 100 if peak and cost else None
@@ -346,6 +357,7 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
         "intraday_pct": round(pct, 2) if pct is not None else None,
         "cost_return_pct": round(ret_pct, 2) if ret_pct is not None else None,
         "relative_to_market_pct": round(relative, 2) if relative is not None else None,
+        "market_reference": market_reference,
         "peak_retrace_pct": round(peak_retrace, 2) if peak_retrace is not None else None,
         "peak_return_pct": round(peak_return, 2) if peak_return is not None else None,
         "giveback_pct": round(giveback, 2) if giveback is not None else None,

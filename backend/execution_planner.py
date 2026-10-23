@@ -1970,13 +1970,18 @@ def commit_fill(
             payload = _plain_evidence(detail if detail is not None else plan)
             payload = payload if isinstance(payload, dict) else {"detail": payload}
             payload["execution"] = execution_evidence
+            # ``reason`` 是**策略/风控为什么下这张委托**，执行阻塞是另一件事：
+            # 写进 ``execution_reasons``/``execution_evidence``。旧实现把阻塞码
+            # 覆盖到 ``reason``，恢复成交时调用方又把这条被覆盖的 reason 传回来，
+            # 四笔真实成交的卖单最后都写着 "TRADABILITY_UNKNOWN"——策略原因被
+            # 执行插曲吃掉，复盘无法回答"当时为什么卖"。
             conn.execute(
                 """UPDATE paper_orders
-                      SET status=?,reason=?,execution_asof=?,execution_reasons=?,
+                      SET status=?,execution_asof=?,execution_reasons=?,
                           execution_evidence=?,ruleset_version=?,execution_version=execution_version+1,
                           remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
                     WHERE id=? AND execution_version=?""",
-                (next_status, reason_codes or reason, decision.execution_asof,
+                (next_status, decision.execution_asof,
                  PT._json(list(decision.reasons)), PT._json(execution_evidence),
                  decision.ruleset_version, order_id, current_version),
             )

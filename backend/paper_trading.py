@@ -1441,6 +1441,17 @@ def _rebuild_realized_pnl(conn):
 
 HOT_PATH_SLOTS = PSch.HOT_PATH_SLOTS
 
+# 租约心跳上限（秒）与"丢失几次心跳即判定放弃"。见 `_lease_renew_interval`：
+# 长任务（close/risk，TTL 40 分钟）不能等 40 分钟才被认出来，否则当天最后一次
+# 兜底触发会把它当成"仍在运行"而跳过重试。
+LEASE_HEARTBEAT_MAX_SECONDS = 120.0
+LEASE_HEARTBEAT_MISSES = 3
+
+#: 各 slot 当日自动重试预算。``close`` 需要覆盖调度契约里的 5 个兜底窗口
+#: （见 ``SLOT_MAX_AUTO_RETRIES`` 的使用处与 ``paper_schedule_contract``）。
+DEFAULT_MAX_AUTO_RETRIES = 2
+SLOT_MAX_AUTO_RETRIES = {"close": 6}
+
 
 def _is_hot_path_slot(slot: str | None) -> bool:
     """判断给定 slot 是否属于对延迟和锁等待敏感的交易热路径。"""
@@ -1507,22 +1518,33 @@ def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     # callers but is intentionally ignored.
     intraday_cutoff = (dt.datetime.now() - dt.timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
     job_cutoff = (dt.datetime.now() - dt.timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:%S")
-    detail = _json({"error": "任务进程中断或超时，系统已自动回收", "recovered_at": now})
-    conn.execute(
-        """UPDATE paper_job_runs
-           SET status='failed',detail=?,finished_at=?
-           WHERE status='running'
-             AND ((expires_at IS NOT NULL AND expires_at<?)
-                  OR (expires_at IS NULL AND started_at<?))""",
-        (detail, now, now, intraday_cutoff),
+    # 回收必须**合并**而不是覆盖 detail：旧实现写成 ``{error, recovered_at}``，
+    # 把 retry_count / history_refresh / factor_refresh / timing 一并抹掉，
+    # 于是"进程超时"这一类失败事后无法和"日线覆盖不足"区分。``elapsed_seconds``
+    # 同时给出这次运行到被回收为止的时长（超时类的唯一可观测口径）。
+    recovered_detail = (
+        "json_patch(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END,"
+        " json_object('error','任务进程中断或超时，系统已自动回收',"
+        " 'recovered_at',?,"
+        " 'recovered_from_running',1,"
+        " 'failure_kind','interrupted',"
+        " 'elapsed_seconds',CAST(ROUND((julianday(?) - julianday(started_at)) * 86400) AS INTEGER)))"
     )
     conn.execute(
-        """UPDATE paper_jobs
-           SET status='failed',detail=?,finished_at=?
+        f"""UPDATE paper_job_runs
+           SET status='failed',detail={recovered_detail},finished_at=?
            WHERE status='running'
              AND ((expires_at IS NOT NULL AND expires_at<?)
                   OR (expires_at IS NULL AND started_at<?))""",
-        (detail, now, now, job_cutoff),
+        (now, now, now, now, intraday_cutoff),
+    )
+    conn.execute(
+        f"""UPDATE paper_jobs
+           SET status='failed',detail={recovered_detail},finished_at=?
+           WHERE status='running'
+             AND ((expires_at IS NOT NULL AND expires_at<?)
+                  OR (expires_at IS NULL AND started_at<?))""",
+        (now, now, now, now, job_cutoff),
     )
     # Never delete a live lease merely because a new process started.
     conn.execute("DELETE FROM paper_runtime_locks WHERE expires_at<?", (now,))
@@ -3520,9 +3542,59 @@ def _execution_quote_status(quote, asof_date, purpose="entry", *, reference_at=N
     )
 
 
+_INDEX_REFERENCE_UNSET = object()
+
+
+def _index_session_day(value):
+    """把指数时间戳（``20261023151100`` / ISO）归一成 ``YYYYMMDD``。"""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[:8] or None
+
+
+def _same_session_index(asof_date, *, allow_network):
+    """沪深300 当日实时报价；只有时间戳属于 ``asof_date`` 才算当日参照。
+
+    返回 ``(row, reference)``。``row is None`` 时 ``reference['status']`` 说明
+    是抓不到（unavailable）还是抓到别的交易日（stale）——两种情况都必须让
+    相对强弱回到未知，不能拿别的交易日的涨跌幅去减今天的个股跌幅。
+    """
+    day = _date(asof_date)
+    wanted = day.strftime("%Y%m%d")
+    rows = []
+    if allow_network:
+        try:
+            rows = dfc.fetch_indices() or []
+        except Exception:
+            rows = []
+    row = next((item for item in rows if str(item.get("code")) == "sh000300"), None)
+    observed = str((row or {}).get("time") or "") or None
+    reference = {"asof_day": day.isoformat(), "observed_at": observed}
+    if row is None:
+        reference.update({
+            "status": "unavailable",
+            "reason": "未取得沪深300实时报价，相对强弱按未知处理",
+        })
+        return None, reference
+    if _index_session_day(observed) != wanted:
+        reference.update({
+            "status": "stale",
+            "reason": (f"最近一次沪深300报价时间 {observed or '未知'} 不属于 "
+                       f"{day.isoformat()}，不作为当日相对强弱参照"),
+        })
+        return None, reference
+    reference.update({"status": "same_session", "reason": "沪深300实时报价属于当日"})
+    return row, reference
+
+
 @PTM.timed("market_context")
-def _market_state(asof_date, live_universe=None, *, allow_network=True):
-    """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。"""
+def _market_state(asof_date, live_universe=None, *, allow_network=True,
+                  live_index=_INDEX_REFERENCE_UNSET):
+    """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。
+
+    ``live_index`` 允许调用方传入**已经取到并校验过**的当日指数（风控扫描
+    用它避免整轮全市场快照刷新）；默认 ``_INDEX_REFERENCE_UNSET`` 表示自行
+    按 ``allow_network`` 决定是否抓取。
+    """
     # 盘中市场宽度必须使用同一轮全市场实时快照，不能读取可能滞后数日的
     # universe.json。外部源暂时不可用时保守地返回未知，而不伪装成实时数据。
     if live_universe is None and allow_network:
@@ -3553,25 +3625,29 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
         close = _num(bench["close"].iloc[-1], 0)
         above_ma20 = close > _num(bench["close"].tail(20).mean(), close)
         bench_5d = (close / _num(bench["close"].iloc[-6], close) - 1) * 100 if len(bench) >= 6 else None
-    live_index = None
+    if live_index is _INDEX_REFERENCE_UNSET:
+        resolved_index = None
+        if allow_network:
+            try:
+                resolved_index = next(
+                    (
+                        row for row in dfc.fetch_indices()
+                        if row.get("code") == "sh000300"
+                        and str(row.get("time") or "")[:8] == _date(asof_date).strftime("%Y%m%d")
+                    ),
+                    None,
+                )
+            except Exception:
+                resolved_index = None
+    else:
+        resolved_index = live_index
+    live_index = resolved_index
     if allow_network:
-        try:
-            live_index = next(
-                (
-                    row for row in dfc.fetch_indices()
-                    if row.get("code") == "sh000300"
-                    and str(row.get("time") or "")[:8] == _date(asof_date).strftime("%Y%m%d")
-                ),
-                None,
-            )
-        except Exception:
-            live_index = None
         try:
             overseas = F.overseas_risk_gate()
         except Exception:
             overseas = {"light": "unknown", "advice": "海外数据不可用"}
     else:
-        live_index = None
         overseas = {"light": "unknown", "advice": "外部数据在账本事务中不可用"}
     live_pct = _num((live_index or {}).get("pct"), None)
     if stale and not benchmark_history_ready and live_pct is not None:
@@ -3622,6 +3698,16 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
         "live_index_pct": round(live_pct, 2) if live_pct is not None else None,
         "live_index_price": _num((live_index or {}).get("price"), None),
         "live_index_time": (live_index or {}).get("time"),
+        "index_reference": {
+            "asof_day": _date(asof_date).isoformat(),
+            "observed_at": (live_index or {}).get("time"),
+            "status": (
+                "same_session"
+                if _index_session_day((live_index or {}).get("time"))
+                == _date(asof_date).strftime("%Y%m%d")
+                else "unavailable"
+            ),
+        },
         "market_data_source": "腾讯实时指数+本地前复权趋势",
         "breadth_source": f"全市场实时快照 {breadth_snapshot_at or '未知'}（有效样本 {len(priced)}）",
         "market_snapshot_count": len(latest),
@@ -8818,33 +8904,136 @@ def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_
     """
     return False, "总资金池82%硬上限不可突破；需先卖出低质量持仓释放额度"
 
-def _frozen_entry_limit(conn, account_id, code, signal_id, asof_day):
-    """该信号当日**首次**限价延期单的冻结限价与已等待分钟数。
+def _entry_opportunity(signal_id, timing_info):
+    """一次入场机会的稳定标识：信号 × 入场状态机的重触发序号。
 
-    限价画像的参考价每轮都跟着实时价刷新，若每轮重新算 ``参考价 × (1 + 让价)``，
-    限价就会随价格上移（当轮买不到、下轮锚点更高）。首次延期单的
-    ``planned_price`` 就是当时的限价，冻结它即可让限价**只降不升**。
-    返回 ``(None, None)`` 表示今天还没有限价延期记录。
+    ``retrigger_seq`` 由状态机在失效回踩/超时重触发时递增，所以"同一信号
+    重新开始确认"会拿到新编号；没有状态机记录时退化为信号本身（seq=0）。
+    价格等待与冻结限价都挂在这个编号上，两个模块不再各自理解"这次机会
+    是否已经重新开始"。
     """
-    if signal_id is None:
-        return None, None
-    day = asof_day.isoformat() if hasattr(asof_day, "isoformat") else str(asof_day)[:10]
-    row = conn.execute(
-        """SELECT planned_price, created_at FROM paper_orders
+    record = (timing_info or {}).get("record") or {}
+    seq = int(_num(record.get("retrigger_seq"), 0))
+    return {
+        "id": None if signal_id is None else f"{signal_id}#{seq}",
+        "signal_id": None if signal_id is None else int(signal_id),
+        "retrigger_seq": seq,
+        "started_at": str(record.get("first_trigger_at") or "")[:19] or None,
+    }
+
+
+def _price_wait_outcome(price_wait, fill_price, *, window_minutes=None):
+    """价格等待的三种结局：``none``/``waiting``/``price_returned``/``failed``。
+
+    ``price_returned`` 只在**现价已回到（或低于）冻结限价**时成立——等待
+    窗口约束的是"仍在等价格"，不能因为等得久就把一个已经可以成交的价格
+    判成"未回到限价"（航天信息 7.6677 低于冻结限价 7.71 仍被报"未回到"）。
+    """
+    window = (ENTRY_LIMIT_CHASE_WINDOW_MINUTES if window_minutes is None
+              else float(window_minutes))
+    if not price_wait:
+        return {"status": "none", "anchor_price": None, "waited_minutes": None,
+                "price": _num(fill_price, 0.0) or 0.0, "window_minutes": window}
+    anchor = _num(price_wait.get("anchor_price"), 0.0) or None
+    price = _num(fill_price, 0.0) or 0.0
+    waited = price_wait.get("waited_minutes")
+    at_or_below = bool(anchor is not None and price > 0 and price <= anchor + 1e-9)
+    if at_or_below:
+        status = "price_returned"
+    elif price_wait.get("expired") or (waited is not None and waited > window):
+        status = "failed"
+    else:
+        status = "waiting"
+    return {"status": status, "anchor_price": anchor, "waited_minutes": waited,
+            "price": price, "window_minutes": window}
+
+
+def _next_price_wait_marker(*, opportunity, outcome, limit_price, deferred, now):
+    """本次尝试要落的价格等待标记；``None`` 表示不建立/不改写锚点。
+
+    只有两种尝试落锚点：**仅价格未到**（起锚或续锚，``deferred``）和
+    **价格等待已失效**（终态标记）。入场确认中、容量不足、时机未到等非
+    价格拒绝既不能起锚，也不能让别人的价格等待继续计时。
+    """
+    if limit_price is None:
+        return None
+    anchor = outcome.get("anchor_price") or _num(limit_price, 0.0)
+    if not anchor:
+        return None
+    base = {
+        "opportunity_id": opportunity["id"],
+        "signal_id": opportunity["signal_id"],
+        "retrigger_seq": opportunity["retrigger_seq"],
+        "opportunity_started_at": opportunity["started_at"],
+        "anchor_price": float(anchor),
+        "window_minutes": ENTRY_LIMIT_CHASE_WINDOW_MINUTES,
+    }
+    if outcome.get("status") == "failed":
+        return {
+            **base,
+            "status": "expired",
+            "started_at": (outcome.get("started_at") or now),
+            "expired_at": now,
+            "waited_minutes": outcome.get("waited_minutes"),
+        }
+    if not deferred:
+        return None
+    return {
+        **base,
+        "status": "waiting",
+        "started_at": (outcome.get("started_at") or now),
+    }
+
+
+def _entry_price_wait(conn, account_id, code, signal_id, asof_day, opportunity_id):
+    """该入场机会的**价格等待**锚点；``None`` 表示当前没有生效的价格等待。
+
+    锚点、等待时长和失效状态只来自真正"其他条件均已满足、仅因价格未到"
+    的尝试（下单时写入 ``risk_payload.entry_price_wait``）。旧实现按
+    「同策略 + 代码 + 信号 + 交易日的第一张限价单」取锚，把入场确认中、
+    容量不足等非价格拒绝也当成价格等待：五粮液 10:32 因为"连续确认中 1/2"
+    建的限价单，被 14:40 的模型通过轮次当成"等待 248 分钟仍未回到限价"。
+
+    返回字段：
+        ``anchor_price`` 冻结限价（只降不升）、``waited_minutes`` 从该机会
+        第一次价格等待起算的等待时长、``expired`` 该机会是否已经到期失效、
+        ``started_at``/``expired_at`` 供审计回溯。
+    """
+    if signal_id is None or opportunity_id is None:
+        return None
+    day = _date(asof_day).isoformat()
+    rows = conn.execute(
+        """SELECT id, created_at,
+                  json_extract(risk_payload,'$.entry_price_wait.anchor_price') AS anchor_price,
+                  json_extract(risk_payload,'$.entry_price_wait.status') AS wait_status
+             FROM paper_orders
             WHERE account_id=? AND code=? AND side='buy' AND signal_id=?
-              AND order_type='limit' AND substr(created_at,1,10)=?
-            ORDER BY id ASC LIMIT 1""",
-        (account_id, code, signal_id, day),
-    ).fetchone()
-    if row is None:
-        return None, None
-    limit_price = _num(row["planned_price"], 0.0) or None
+              AND order_type='limit'
+              AND substr(created_at,1,10)=?
+              AND json_valid(risk_payload)
+              AND json_extract(risk_payload,'$.entry_price_wait.opportunity_id')=?
+            ORDER BY id ASC""",
+        (account_id, code, signal_id, day, str(opportunity_id)),
+    ).fetchall()
+    anchor = next((_num(row["anchor_price"], 0.0) for row in rows
+                   if _num(row["anchor_price"], 0.0) > 0), 0.0)
+    if anchor <= 0:
+        return None
+    first = rows[0]
     try:
         waited = (dt.datetime.now() - dt.datetime.fromisoformat(
-            str(row["created_at"]))).total_seconds() / 60
+            str(first["created_at"]))).total_seconds() / 60
     except (TypeError, ValueError):
         waited = None
-    return limit_price, waited
+    expired = next((row for row in rows if str(row["wait_status"]) == "expired"), None)
+    return {
+        "anchor_price": anchor,
+        "waited_minutes": waited,
+        "started_at": str(first["created_at"]),
+        "order_id": int(first["id"]),
+        "expired": expired is not None,
+        "expired_at": str(expired["created_at"]) if expired is not None else None,
+    }
 
 
 @PTM.timed("execution.buy_approval")
@@ -9488,18 +9677,31 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # PR-10 执行画像：按账户 risk_profile 自动选择 market/limit 与让价。
     # 限价画像要求现价不高于让价上限，未到价则延期（execution_retry）。
     exec_profile = _execution_profile_for_account(account["id"], conn=conn)
-    # 限价锚点冻结：沿用该信号当日首次延期单的限价，价格反弹不再抬价追高。
-    frozen_limit, limit_waited = _frozen_entry_limit(
-        conn, account["id"], code, signal.get("id"), asof_day)
-    limit_window_expired = bool(
-        frozen_limit is not None and limit_waited is not None
-        and limit_waited > ENTRY_LIMIT_CHASE_WINDOW_MINUTES)
-    if limit_window_expired:
-        # 窗口过期不是风控否决：这个标的没有变坏，只是价格跑开、当日不再追。
+    # 限价锚点冻结：沿用**同一入场机会**里第一次因价格挂起的限价，价格反弹
+    # 不再抬价追高。锚点只由"其他条件都已满足、仅价格未到"的尝试建立——
+    # 入场确认中、容量不足等非价格原因不能启动价格等待计时。
+    entry_opportunity = _entry_opportunity(signal.get("id"), risk.get("entry_timing"))
+    price_wait = _entry_price_wait(
+        conn, account["id"], code, signal.get("id"), asof_day,
+        entry_opportunity["id"],
+    )
+    frozen_limit = price_wait["anchor_price"] if price_wait else None
+    wait = _price_wait_outcome(price_wait, fill_price)
+    price_wait_failed = wait["status"] == "failed"
+    if price_wait_failed:
+        # 窗口过期不是风控否决：这个标的没有变坏，只是价格跑开。旧委托就此
+        # 失效，同一机会不得再用同一个锚点要求"回到限价"。
+        waited = wait["waited_minutes"]
         reasons.append(
-            f"限价追价窗口已过：等待 {limit_waited:.0f} 分钟仍未回到冻结限价 "
-            f"{frozen_limit:.2f}，当日不再追价")
-        frozen_limit = None
+            (f"价格等待窗口到期：等待 {waited:.0f} 分钟现价 {fill_price:.2f} 仍未回到"
+             if waited is not None else
+             f"价格等待已到期：现价 {fill_price:.2f} 仍未回到")
+            + f"冻结限价 {frozen_limit:.2f}，本机会当日失效；"
+              "需新机会重新确认后再评估")
+    elif wait["status"] == "price_returned":
+        # 现价已回到冻结限价：价格等待兑现，理由必须写"已回到"，不能再报
+        # "仍未回到冻结限价"。
+        sizing["entry_price_returned_to_limit"] = round(frozen_limit, 2)
     entry_limit = EPF.enforce_entry_limit(
         exec_profile, fill_price, reference_price=signal_close or price,
         frozen_limit_price=frozen_limit,
@@ -9507,6 +9709,18 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     limit_deferred = not entry_limit["allowed"] and not reasons
     if entry_limit["limit_price"] is not None:
         sizing["execution_limit_price"] = entry_limit["limit_price"]
+    # 只有真正的价格等待才落锚点：起锚价冻结在本机会的开仓限价上，后续轮次
+    # 只降不升；到期失效的机会留下终态标记，后续轮次据此说明"为什么不再追"。
+    price_wait_marker = _next_price_wait_marker(
+        opportunity=entry_opportunity,
+        outcome={**wait, "started_at": (price_wait or {}).get("started_at")},
+        limit_price=entry_limit["limit_price"],
+        deferred=limit_deferred,
+        now=_now(),
+    )
+    if price_wait_marker is not None:
+        risk["entry_price_wait"] = price_wait_marker
+    risk["entry_opportunity"] = entry_opportunity
     risk["execution_profile"] = exec_profile
     # PR-11 执行器：批量窗口 / 人工核验只挂起"本可立即成交"的委托。挂起
     # 发生在资金预占之前，因此不占额度也不占席位。驳回结论按
@@ -9766,7 +9980,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     order_status = "pending_execution" if allowed else (
         "shadow_q3" if q3_shadow_ready else (
             STRATEGY_EXECUTION_RETRY_STATUS if limit_deferred else
-            ("expired" if limit_window_expired else
+            ("expired" if price_wait_failed else
              ("deferred_capacity" if capacity_deferred else "risk_rejected")))
     )
     reason = (
@@ -10128,9 +10342,14 @@ def process_pending_execution_orders(asof_date=None):
                     raise
                 reason = f"执行事件异常，可在后续窗口重试：{type(exc).__name__}: {exc}"
                 retry_status = "partially_filled" if int(order.get("filled_qty") or 0) else "pending_execution"
+                # 执行失败原因写进 ``execution_reasons``，不覆盖 ``reason``：
+                # 后者是这张委托"为什么下"的策略/风控事实，恢复成交时必须
+                # 原样留着，不能被一次执行插曲替换掉。
                 conn.execute(
-                    "UPDATE paper_orders SET status=?,reason=? WHERE id=? AND execution_version=?",
-                    (retry_status, reason, order_id, int(order.get("execution_version") or 0)),
+                    """UPDATE paper_orders
+                          SET status=?,execution_reasons=? WHERE id=? AND execution_version=?""",
+                    (retry_status, _json([reason]), order_id,
+                     int(order.get("execution_version") or 0)),
                 )
                 _risk_log(
                     conn, order["account_id"], order["code"], order["side"],
@@ -10530,8 +10749,10 @@ _RISK_PROJECTION = _RiskProjectionAdapter()
 def _risk_load_market_inputs(*, day, positions, candidate_codes):
     """Supply the acquisition service with narrow, late-bound capabilities."""
     def market_context(day):
+        # 当日收盘记录之外只读一次沪深300（provider TTL 缓存/熔断），
+        # 既不刷新全市场快照，也不会因为当日没有收盘任务而回落到别日数据。
         with _db() as conn:
-            return _cached_close_market(conn, day, allow_network=False)
+            return _cached_close_market(conn, day)
 
     def quotes(codes, **kwargs):
         quote_map = _quotes(codes, **kwargs)
@@ -10649,13 +10870,82 @@ def monitor_risk(asof_date=None):
         raise
 
 
-def _cached_close_market(conn, day, *, allow_network=True):
+def _same_day_close_market(conn, day):
+    """同一交易日的收盘任务市场状态；``None`` 表示当日没有可用记录。
+
+    旧实现取 ``market_date<=day`` 的最近一条 completed 记录，于是 10-23 的
+    盘中卖出风控拿到的是 **10-16** 的收盘市场（指数 +0.11%），把当日 -4.50%
+    的个股算成"相对沪深300 弱 4.61 个百分点"。盘中决策只能使用属于当日的
+    指数参照，别日的收盘记录不得代理当日行情。
+    """
+    day_iso = _date(day).isoformat()
     row = conn.execute(
-        "SELECT detail FROM paper_jobs WHERE slot='close' AND market_date<=? AND status='completed' ORDER BY market_date DESC LIMIT 1",
-        (_date(day).isoformat(),),
+        """SELECT detail FROM paper_jobs
+            WHERE slot='close' AND market_date=? AND status='completed'
+            LIMIT 1""",
+        (day_iso,),
     ).fetchone()
-    detail = _loads(row["detail"]) if row else {}
-    return detail.get("market") or _market_state(day, allow_network=allow_network)
+    market = (_loads(row["detail"]) if row else {}).get("market") or {}
+    if not market:
+        return None
+    observed = market.get("live_index_time")
+    if _index_session_day(observed) != _date(day).strftime("%Y%m%d"):
+        # 当日任务写下的指数时间戳不属于当日：记录本身不可信，按没有处理。
+        return None
+    return market
+
+
+def _close_market_history(conn, day):
+    """最近一条早于 ``day`` 的收盘市场：只作历史背景，标注为不可用于当日参照。"""
+    day_iso = _date(day).isoformat()
+    row = conn.execute(
+        """SELECT market_date, detail FROM paper_jobs
+            WHERE slot='close' AND market_date<? AND status='completed'
+            ORDER BY market_date DESC LIMIT 1""",
+        (day_iso,),
+    ).fetchone()
+    if row is None:
+        return None
+    market = (_loads(row["detail"]) or {}).get("market") or {}
+    return {
+        "market_date": str(row["market_date"]),
+        "live_index_pct": market.get("live_index_pct"),
+        "live_index_time": market.get("live_index_time"),
+        "light": market.get("light"),
+        "status": "history_only",
+        "reason": "早于当日的收盘记录，仅作历史背景，不参与当日相对强弱计算",
+    }
+
+
+def _cached_close_market(conn, day):
+    """当日市场状态：只有当日收盘记录可复用，否则现取当日指数。
+
+    旧实现取 ``market_date<=day`` 的最近一条 completed 记录，于是 10-23 的
+    盘中卖出风控拿到的是 10-16 的收盘市场（指数 +0.11%），把当日 -4.50% 的
+    个股算成"相对沪深300 弱 4.61 个百分点"。别日的收盘记录只能作历史背景。
+    """
+    cached = _same_day_close_market(conn, day)
+    if cached is not None:
+        return cached
+    return _intraday_market_context(day, history=_close_market_history(conn, day))
+
+
+def _intraday_market_context(day, *, history=None):
+    """盘中（风控扫描）用的当日市场状态。
+
+    只做一次沪深300读取（provider 侧自带 TTL 缓存与熔断），不触发全市场
+    快照刷新；没有当日指数时把相对强弱留在未知，绝不拿旧的收盘值代算。
+    """
+    live_index, reference = _same_session_index(day, allow_network=True)
+    market = _market_state(
+        day, live_universe=[], allow_network=False, live_index=live_index,
+    )
+    market["index_reference"] = reference
+    if history is not None:
+        market["market_history"] = history
+    if live_index is None:
+        market["reason"] = f"{market.get('reason')}；{reference['reason']}"
+    return market
 
 
 def _observe_intraday(conn, cycle_id, account_id, code, price, action, reason, payload):
@@ -12279,7 +12569,6 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     candidates.append(row)
                     seen_fast.add(key)
             positions = _position_rows(snapshot_conn, asof_day=day, readonly=True)
-            _cached_close_market(snapshot_conn, day, allow_network=False)
         if not candidates:
             return {"status": "completed", "slot": "fast-entry", "checked": 0, "confirmed": []}
 
@@ -12521,7 +12810,11 @@ def monitor_intraday(asof_datetime=None, force=False):
         )
         with _db() as conn:
             accounts = _active_account_rows(conn, status="running")
-            market = _cached_close_market(conn, day)
+            market = _same_day_close_market(conn, day)
+        if market is None:
+            # 复用本轮已经校验过的全市场快照；当日收盘任务尚未完成时，
+            # 这里必须现取指数，不能沿用上一交易日的收盘市场。
+            market = _market_state(day, live_universe=live_universe)
         return {
             "slot": "intraday", "date": day.isoformat(),
             "observed": opening_event.get("observed", 0),
@@ -12970,6 +13263,63 @@ def _weekly_review(conn, day):
     return output
 
 
+def _lease_renew_interval(ttl_seconds):
+    """租约心跳续期间隔（秒）：长任务也要能在几分钟内暴露"进程已死"。
+
+    旧口径是 ``max(60, ttl/4)``：close/risk 的 TTL 是 40 分钟，于是续期间隔
+    10 分钟、判定放弃要 30 分钟以上，而当天最后的收盘触发点是 15:12——
+    15:05 的进程被 SIGKILL 后，租约看起来仍然"活着"，15:10/15:12 两次兜底
+    全部返回 ``already_done``（10-19、10-21 的收盘任务就是这样整天没有重跑，
+    只在下一个碰库的进程里被记成 failed）。压到 120 秒后，4~6 分钟没有心跳
+    即可判定放弃；活进程的续期成本只是一次小事务。
+    """
+    ttl = float(ttl_seconds or 0) or 600.0
+    return max(60.0, min(LEASE_HEARTBEAT_MAX_SECONDS, ttl / 4.0))
+
+
+def _lease_abandoned(expires_at, heartbeat_at, started_at, *, lease_ttl_seconds,
+                     now=None):
+    """判断一个 ``running`` 认领是否已被放弃（进程死亡 / 租约过期）。
+
+    三种证据，任一成立即放弃：
+
+    * 租约已过期（``expires_at <= now``）——原有口径；
+    * 心跳超过 ``LEASE_HEARTBEAT_MISSES`` 个续期间隔没有更新——进程被
+      SIGKILL/OOM 时 ``expires_at`` 还留在未来，只有心跳能证明它停了；
+    * 两者都缺失的 legacy 行按 ``started_at`` 超过 TTL 处理。
+
+    真正的长时间任务不会被误抢：心跳线程每 `_lease_renew_interval` 续期
+    一次，且 fencing token + 完成 CAS 保证即使被误抢也不会双写。
+    """
+    now = now or dt.datetime.now()
+    expires = _parse_stamp_value(expires_at)
+    heartbeat = _parse_stamp_value(heartbeat_at)
+    started = _parse_stamp_value(started_at)
+    if expires is not None and expires <= now:
+        return True
+    limit = _lease_renew_interval(lease_ttl_seconds) * LEASE_HEARTBEAT_MISSES
+    if heartbeat is not None:
+        return (now - heartbeat).total_seconds() > limit
+    if started is not None:
+        return (now - started).total_seconds() > max(float(lease_ttl_seconds or 0), 60.0)
+    return True
+
+
+def _parse_stamp_value(value):
+    try:
+        return dt.datetime.fromisoformat(str(value or "")[:19])
+    except (TypeError, ValueError):
+        return None
+
+
+def _stamp_elapsed_seconds(started_at, *, now=None):
+    """从 ``started_at`` 到现在的秒数；时间戳不可解析时返回 ``None``。"""
+    started = _parse_stamp_value(started_at)
+    if started is None:
+        return None
+    return int(((now or dt.datetime.now()) - started).total_seconds())
+
+
 def _claim_runtime_lease(conn, lock_key, owner_key, slot, ttl_seconds=720):
     """Atomically claim the one process-wide paper runner lease."""
     now = dt.datetime.now()
@@ -13268,7 +13618,12 @@ def _run_slot_impl(slot, day, force=False):
     PTM.bind_job(market_date=day.isoformat(), run_key=intraday_key,
                  job_table="paper_job_runs" if intraday_key else "paper_jobs")
     hot_path = _is_hot_path_slot(slot)
-    max_auto_retries = 2
+    # 失败任务的自动重试预算按 slot 给：close 的失败有一半是"完整日线/因子
+    # 还没补齐"，而 refresh_history 自带 420 秒上限 + 持久化游标，靠后续窗口
+    # 增量续传才能收敛。调度契约里 close 有 15:10/15:12/15:25/15:40/16:00 五个
+    # 兜底窗口，预算不够就会把后三个窗口全部挡成 already_done。其它 slot 的
+    # 失败不会因为"等数据"自愈，保持 2 次，避免变成重试风暴。
+    max_auto_retries = SLOT_MAX_AUTO_RETRIES.get(slot, DEFAULT_MAX_AUTO_RETRIES)
     retry_count = 0
     # One lease spans every scheduled slot: a 15:05 full-market factor rebuild
     # must not race a manual retry, and an intraday scan that takes longer than
@@ -13305,30 +13660,25 @@ def _run_slot_impl(slot, day, force=False):
         if exists:
             prior_detail = _loads(exists["detail"], {}) or {}
             if exists["status"] == "running":
-                # H6: 与租约 TTL 对齐——intraday 租约 300s（TTL 主要决定
-                # 挂死扫描的回收时延，活进程由心跳每 TTL/4 续期），job
-                # stale 兜底判定用 5 分钟；其它 slot 租约 40 分钟，
-                # stale 判定 45 分钟。
-                stale_minutes = 5 if intraday_key else 45
-                try:
-                    expires_raw = str(exists["expires_at"] or "")[:19] if "expires_at" in exists.keys() else ""
-                    if expires_raw:
-                        # A live heartbeat can legitimately keep a long close
-                        # task running beyond its nominal wall-clock budget.
-                        # Only an expired lease is stale; never steal a live
-                        # worker based on started_at alone.
-                        stale_running = dt.datetime.fromisoformat(expires_raw) <= dt.datetime.now()
-                    else:
-                        started = dt.datetime.fromisoformat(str(exists["started_at"] or "")[:19])
-                        stale_running = (dt.datetime.now() - started).total_seconds() > stale_minutes * 60
-                except (TypeError, ValueError):
-                    stale_running = True
+                # H6: 租约 TTL 决定"挂死多久才被回收"，活进程由心跳线程按
+                # `_lease_renew_interval` 续期。``expires_at`` 只能证明"租约没
+                # 到期"，不能证明"进程还活着"：进程被 SIGKILL/OOM 后 expires_at
+                # 仍留在未来，只靠它会把当天的兜底触发全部挡成 already_done。
+                # 心跳停止才是进程死亡的证据，见 `_lease_abandoned`。
+                stale_running = _lease_abandoned(
+                    exists["expires_at"] if "expires_at" in exists.keys() else None,
+                    exists["heartbeat_at"] if "heartbeat_at" in exists.keys() else None,
+                    exists["started_at"] if "started_at" in exists.keys() else None,
+                    lease_ttl_seconds=runtime_lock_ttl,
+                )
                 if stale_running:
                     prior_detail = {
                         **prior_detail,
                         "error": "任务记录过期，按租约超时自动回收",
                         "recovered_from_running": True,
                         "recovered_at": _now(),
+                        "failure_kind": "interrupted",
+                        "elapsed_seconds": _stamp_elapsed_seconds(exists["started_at"]),
                         "retry_count": int(prior_detail.get("retry_count") or 0),
                     }
                     if intraday_key:
@@ -13440,7 +13790,7 @@ def _run_slot_impl(slot, day, force=False):
     _set_lease_context(runtime_lock_key, owner, fencing_token, lease_lost_event)
 
     def _renew_runtime_lease():
-        renew_interval = max(60.0, runtime_lock_ttl / 4.0)
+        renew_interval = _lease_renew_interval(runtime_lock_ttl)
         while not lease_renewal_stop.wait(renew_interval):
             try:
                 with _db(immediate=True, hot_path=hot_path) as renew_conn:
