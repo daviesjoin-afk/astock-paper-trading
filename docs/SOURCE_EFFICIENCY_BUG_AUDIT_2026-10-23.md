@@ -108,10 +108,10 @@ P1 表示应优先处理的数据正确性或隔离问题；P2 表示有条件�
 在仓库根目录运行（依赖项目已有 Python/Node 环境）：
 
 ```bash
-python -X utf8 work/source_audit_20261023/backend-probe.py
-python -X utf8 work/source_audit_20261023/performance-probe.py
-python -X utf8 work/source_audit_20261023/scope-probe.py
-node work/source_audit_20261023/frontend-probe.mjs
+python -X utf8 scripts/source-audit-20261023/backend-probe.py
+python -X utf8 scripts/source-audit-20261023/performance-probe.py
+python -X utf8 scripts/source-audit-20261023/scope-probe.py
+node scripts/source-audit-20261023/frontend-probe.mjs
 ```
 
 脚本使用临时 SQLite 和合成行情，显式重绑定已发现不遵守环境变量的路径。结果保存在同目录的 `*-result.json`；基线源码库存清单位于 `.codex/source-audit/inventory.json`。这些是本轮诊断脚本，不是新加入的业务测试体系。`scope-probe.py` 是修复阶段新增的微基准（证券范围掩码两种写法），与上面三个缺陷复现探针分开计数。
@@ -157,7 +157,7 @@ node work/source_audit_20261023/frontend-probe.mjs
 
 ### E2：证券范围逐行判断（先测量，后替换）
 
-`main.scanner` 用 `DataFrame.apply(axis=1)` 为每一行判断可买入范围。新增微基准 `work/source_audit_20261023/scope-probe.py`，合成 5000 行 × 64 列（与真实因子表同宽）、覆盖主板/创业板/科创板/北交所/ST/ETF/坏代码，两段都调用**同一份** `selection_service._buy_scope`：
+`main.scanner` 用 `DataFrame.apply(axis=1)` 为每一行判断可买入范围。新增微基准 `scripts/source-audit-20261023/scope-probe.py`，合成 5000 行 × 64 列（与真实因子表同宽）、覆盖主板/创业板/科创板/北交所/ST/ETF/坏代码，两段都调用**同一份** `selection_service._buy_scope`：
 
 | 写法 | 三次耗时 (ms) | 中位数 |
 |---|---|---|
@@ -182,18 +182,18 @@ B2 只阻止新的盘中写入。已落库的行需要证据才能修正，因�
 
 ### 修复后复跑证据
 
-- `python -X utf8 work/source_audit_20261023/backend-probe.py`
+- `python -X utf8 scripts/source-audit-20261023/backend-probe.py`
   - `data_directory`: `isolated=true`，K 线目录由 import 直接建在隔离目录内（不再需要手工重绑定）。
   - `close_policy`: 收盘政策取回 4000 行（原先跟踪调用 0 行）。
   - `intraday_as_close`: 盘中刷新 `skipped / market has not closed yet`；收盘刷新写入收盘价 10.0，不再是盘中 11.0。
   - `dashboard_schema`: `schema_version` 8 → 8；另一连接持有写事务时 dashboard 不再报 `database is locked`（2ms）。
   - `settings_async_blocking`: 并发心跳 32ms（原先 344ms）。
   - `async_blocking`: 旧预览路由 `route_is_coroutine_function=false`，心跳 30ms。
-- `python -X utf8 work/source_audit_20261023/performance-probe.py`：3 次扫描（无条件 / `pe_max` / `pb_max`）共 **250 次 CSV 读取、1 次因子计算**（原先 2 次扫描就是 500 次读取、2 次计算）。
-- `node work/source_audit_20261023/frontend-probe.mjs`：100ms 超时在 **116ms** 处 `AbortError`（原先 326ms 后成功返回）。
+- `python -X utf8 scripts/source-audit-20261023/performance-probe.py`：3 次扫描（无条件 / `pe_max` / `pb_max`）共 **250 次 CSV 读取、1 次因子计算**（原先 2 次扫描就是 500 次读取、2 次计算）。
+- `node scripts/source-audit-20261023/frontend-probe.mjs`：100ms 超时在 **116ms** 处 `AbortError`（原先 326ms 后成功返回）。
 - `stale_linkage`：10 月 22 日快照在 10 月 23 日不再产出 `resonance=true`，三个当日字段均为 `null`。
 - 回归：`python -m ruff check backend` 通过；后端主回归 **6092 项通过 / 9 项跳过 / 0 失败**（含 4281 项子测试，修复期间全量跑过一次）；追加 E2/B2b 后，涉及改动面的定向回归 **434 项 + 37 项新测试** 全部通过；前端 **245 项通过**；`frontend/dist` 已重建。
-- `python -X utf8 work/source_audit_20261023/scope-probe.py`：5000 行 × 64 列掩码，`apply(axis=1)` 46.1ms → `itertuples` 9.5ms，掩码逐行一致。
+- `python -X utf8 scripts/source-audit-20261023/scope-probe.py`：5000 行 × 64 列掩码，`apply(axis=1)` 46.1ms → `itertuples` 9.5ms，掩码逐行一致。
 
 ### 仍然存在的限制
 

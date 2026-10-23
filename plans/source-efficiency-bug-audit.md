@@ -33,7 +33,7 @@
 ## 证据
 
 - 审查阶段：原始清单、探针和日志保存在 `.codex/source-audit/`；结论以当时源码及实际复现为准。
-- 修复阶段：三个探针在修复后重跑，结果覆盖写入 `work/source_audit_20261023/*-result.json`；回归测试为
+- 修复阶段：三个探针在修复后重跑，结果覆盖写入 `scripts/source-audit-20261023/*-result.json`；回归测试为
   `backend/test_data_dir_isolation.py`、`backend/test_selection_tracking_close_rules.py`、
   `backend/test_settings_async_isolation.py`、`backend/test_linkage_freshness.py`、
   `backend/test_scanner_history_reuse.py`，以及 `frontend/tests/api-request-contract.test.mjs` 新增 6 项。
@@ -41,11 +41,11 @@
 ## 交付
 
 - 报告（含修复记录）：`docs/SOURCE_EFFICIENCY_BUG_AUDIT_2026-10-23.md`。
-- 可重跑探针及结果：`work/source_audit_20261023/`。
+- 可重跑探针及结果：`scripts/source-audit-20261023/`。
 - 审查结论：6 类功能缺陷、1 项实测性能问题；修复前后端 146 项、前端 239 项现有测试通过。
 - 修复结果：6 类缺陷 + E1/E2 两项性能问题全部关闭；`ruff` 通过，后端 6092 项 / 前端 245 项通过，
   `frontend/dist` 已重建，探针对应指标逐项复现为已修复。
-- E2：新增微基准 `work/source_audit_20261023/scope-probe.py`（46.1ms → 9.5ms，掩码逐行一致），
+- E2：新增微基准 `scripts/source-audit-20261023/scope-probe.py`（46.1ms → 9.5ms，掩码逐行一致），
   回归 `backend/test_scanner_scope_mask.py`。
 - B2b：历史污染修正工具 `backend/selection_tracking_repair.py`（默认 dry-run、按旧值比对写入、
   只接受收盘政策验证过的原始报价），回归 `backend/test_selection_tracking_repair.py`；

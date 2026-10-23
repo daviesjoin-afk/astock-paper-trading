@@ -1898,7 +1898,7 @@ def _permitted_scope_mask(table):
 
     ``DataFrame.apply(axis=1)`` 会为每一行构造一个 Series：5000 行 × 64 列时
     实测 46ms，同样规则的 ``itertuples`` 约 9.5ms（见
-    ``work/source_audit_20261023/scope-probe.py``），掩码逐行一致。规则本身仍然
+    ``scripts/source-audit-20261023/scope-probe.py``），掩码逐行一致。规则本身仍然
     只在 ``selection_service._buy_scope`` 一处，这里不做任何复制。
     """
     present = [column for column in _SCOPE_COLUMNS if column in table.columns]
