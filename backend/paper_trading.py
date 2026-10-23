@@ -47,24 +47,6 @@ def _get_se():
 
 
 import paper_storage as PST
-from paper_runtime_facts import (  # noqa: F401 - public compatibility exports
-    PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
-    PAPER_JOB_RUN_RECORD_KIND,
-    PAPER_JOB_RUN_LIFECYCLE_STATUSES,
-    PAPER_JOB_RUN_LEGACY_READONLY_STATUSES,
-    PAPER_JOB_RUN_TERMINAL_STATUSES,
-    PAPER_JOB_RUN_IN_PROGRESS_STATUSES,
-    PAPER_JOB_RUN_FACT_RECORDED,
-    PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
-    PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES,
-    PAPER_JOB_RUN_AVAILABILITY_TERMINAL,
-    PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS,
-    PAPER_JOB_RUN_AVAILABILITY_KINDS,
-    PaperJobRuntimeFactError,
-    PaperJobRunFactProjection,
-    paper_job_run_fact,
-    paper_job_run_facts,
-)
 import paper_timing as PTM
 import paper_order_execution_authority as POEA
 import paper_lot_ledger as PLL
@@ -13687,23 +13669,44 @@ def latest_reviews():
         return _rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id")
 
 
-def schedule_status():
-    names = list(PSch.SCHEDULE_TASK_NAMES)
+def _schedule_probe(names, *, os_name=None, schedule_file=None, run=None, isfile=None):
+    """调度探测的**纯逻辑**：返回 ``(found, probe_mode, schedule_file)``。
+
+    单独抽出来是为了可测试：全量测试套件里 ``test_operator_boundary`` 会在 import
+    时把 ``paper_trading.schedule_status`` 换成静态桩（Windows 沙箱禁用 schtasks），
+    所以探测行为不能只通过模块级全局函数来断言。依赖全部可注入，测试不需要
+    monkeypatch 模块全局状态，也不需要重新 import 整个 ``paper_trading``。
+    """
+    os_name = os.name if os_name is None else os_name
+    if schedule_file is None:
+        # 三端同步（D4/G3）：生产 profile 是 Docker（`deploy/sync-cron.sh` 把模板装到
+        # /etc/cron.d/astock-codex），而这里此前探测的是 native 的 astock-quant →
+        # Docker 生产上 installed 永远 False。native profile 已退役，默认值随之收敛。
+        schedule_file = os.environ.get("ASTOCK_SCHEDULE_FILE", "/etc/cron.d/astock-codex")
+    run = subprocess.run if run is None else run
+    isfile = os.path.isfile if isfile is None else isfile
     found = []
-    if os.name == "nt":
+    if os_name == "nt":
+        probe_mode = "schtasks"
         for name in names:
             try:
-                result = subprocess.run(["schtasks", "/Query", "/TN", name], capture_output=True, text=True, errors="replace", timeout=4)
+                result = run(["schtasks", "/Query", "/TN", name], capture_output=True, text=True, errors="replace", timeout=4)
                 if result.returncode == 0:
                     found.append(name)
             except Exception:
                 break
     else:
-        schedule_file = os.environ.get(
-            "ASTOCK_SCHEDULE_FILE", "/etc/cron.d/astock-quant"
-        )
-        if os.path.isfile(schedule_file):
+        # Linux 上只能证明"调度文件存在"，不能证明 cron 真的在触发。
+        # 把口径显式发布给前端，别让界面把 file_exists 说成"已安装并运行"。
+        probe_mode = "file_exists"
+        if isfile(schedule_file):
             found.extend(names)
+    return found, probe_mode, schedule_file
+
+
+def schedule_status():
+    names = list(PSch.SCHEDULE_TASK_NAMES)
+    found, probe_mode, schedule_file = _schedule_probe(names)
     today = dt.date.today().isoformat()
     with _db_readonly() as conn:
         latest = _rows(conn, """
@@ -13724,6 +13727,10 @@ def schedule_status():
     return {
         "installed": len(found) == len(names),
         "tasks": found,
+        # 探测口径必须随状态一起发布：Windows 是逐任务真实探测（schtasks），
+        # Linux 只能证明调度文件存在（file_exists）。前端不得把后者说成"已安装运行"。
+        "probe_mode": probe_mode,
+        "schedule_file": schedule_file,
         "runtime_date": today,
         "latest_runs": latest,
         "latest_intraday_runs": intraday,
@@ -13744,10 +13751,17 @@ def install_windows_schedule():
     # Python installations.
     python = pythonw if os.path.exists(pythonw) else sys.executable
     runner = os.path.join(os.path.dirname(__file__), "paper_runner.py")
-    definitions = [
-        (task.name, task.clock, task.slot, task.days, task.repeat)
-        for task in PSch.SCHEDULE_TASKS
-    ]
+    # 三端同步（D1）：契约给 auction/open/close 声明了 retry_clocks，cron 侧由
+    # PSch.render_cron_lines() 逐条渲染，Windows 侧此前只取 task.clock，等于
+    # 平台间少了失败兜底。retry 必须是**独立任务名**：schtasks 以 /TN 为主键，
+    # 同名 + /F 会覆盖主任务而不是追加一条重试。
+    definitions = []
+    for task in PSch.SCHEDULE_TASKS:
+        definitions.append((task.name, task.clock, task.slot, task.days, task.repeat))
+        for index, retry_clock in enumerate(task.retry_clocks, start=1):
+            definitions.append(
+                (f"{task.name}-重试{index}", retry_clock, task.slot, task.days, None)
+            )
     errors = []
     for name, clock, slot, days, duration in definitions:
         command = f'"{python}" "{runner}" --slot {slot}'
@@ -13772,12 +13786,89 @@ def install_platform_schedule():
     return {
         "ok": status["installed"],
         "message": (
-            "Linux 定时任务由 /etc/cron.d/astock-quant 管理"
+            f"Linux 定时任务由 {status['schedule_file']} 管理（deploy/sync-cron.sh 安装；"
+            "文件存在不等于 cron 已触发，运行证据见下方最近运行记录）"
             if status["installed"]
-            else "尚未检测到 Linux 定时任务，请执行 deploy/install-centos9.sh"
+            else "尚未检测到 Linux 定时任务文件，请执行 deploy/sync-cron.sh（Docker profile）"
         ),
         "schedule": status,
     }
+
+
+# ---------------------------------------------------------------------------
+# R27-B2C-7 —— paper runtime attempt（`paper_job_runs`）的 typed owner fact
+# ---------------------------------------------------------------------------
+#
+# typed 读侧已整块搬进 ``paper_job_run_facts.py``（常量闭集 / `_paper_runtime_*`
+# 归一化 / `PaperJobRunFactProjection` / `paper_job_run_fact` /
+# `paper_job_run_facts`）。那是**只读** owner 读侧，且不得反向 import 本模块
+# （依赖方向单向，由 test_runtime_incident_owner_facts 的 import 边界守卫钉住）。
+# 本文件保留 re-export facade：全部旧名字继续从 `paper_trading` 可达。
+#
+# ────────────── writer 审计（闭集来自真实写路径） ──────────────
+#
+# `paper_job_runs` 的生产 writer 只有本模块一个：
+#
+#     INSERT running          :13587
+#     UPDATE → failed         :13534（stale row 回收）/ :1521（_recover_stale_runtime_state）
+#                             / :13751（异常路径）
+#     UPDATE → running        :13593（retry；输入 `status IN ('failed','interrupted')`）
+#     UPDATE → completed      :13732
+#     UPDATE heartbeat        :13656（只动 heartbeat_at / expires_at / fencing_token）
+#
+# 写侧字面量 = `running` / `completed` / `failed`。
+
+from paper_job_run_facts import (
+    PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS as PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS,
+    PAPER_JOB_RUN_AVAILABILITY_KINDS as PAPER_JOB_RUN_AVAILABILITY_KINDS,
+    PAPER_JOB_RUN_AVAILABILITY_TERMINAL as PAPER_JOB_RUN_AVAILABILITY_TERMINAL,
+    PAPER_JOB_RUN_FACT_CONTRACT_VERSION as PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
+    PAPER_JOB_RUN_FACT_OWNER_UNPROVEN as PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
+    PAPER_JOB_RUN_FACT_RECORDED as PAPER_JOB_RUN_FACT_RECORDED,
+    PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES as PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES,
+    PAPER_JOB_RUN_IN_PROGRESS_STATUSES as PAPER_JOB_RUN_IN_PROGRESS_STATUSES,
+    PAPER_JOB_RUN_LEGACY_READONLY_STATUSES as PAPER_JOB_RUN_LEGACY_READONLY_STATUSES,
+    PAPER_JOB_RUN_LIFECYCLE_STATUSES as PAPER_JOB_RUN_LIFECYCLE_STATUSES,
+    PAPER_JOB_RUN_RECORD_KIND as PAPER_JOB_RUN_RECORD_KIND,
+    PAPER_JOB_RUN_TERMINAL_STATUSES as PAPER_JOB_RUN_TERMINAL_STATUSES,
+    PaperJobRunFactProjection as PaperJobRunFactProjection,
+    PaperJobRuntimeFactError as PaperJobRuntimeFactError,
+    _PAPER_JOB_INSTANT_FORMAT as _PAPER_JOB_INSTANT_FORMAT,
+    _PAPER_JOB_RUN_REQUIRED_COLUMNS as _PAPER_JOB_RUN_REQUIRED_COLUMNS,
+    _PAPER_RUNTIME_OWNER_TZ as _PAPER_RUNTIME_OWNER_TZ,
+    _PAPER_RUNTIME_OWNER_TZ_NAME as _PAPER_RUNTIME_OWNER_TZ_NAME,
+    _paper_job_run_availability_kind as _paper_job_run_availability_kind,
+    _paper_job_run_fact_verification_status as _paper_job_run_fact_verification_status,
+    _paper_runtime_business_day as _paper_runtime_business_day,
+    _paper_runtime_canonical_detail as _paper_runtime_canonical_detail,
+    _paper_runtime_canonical_json as _paper_runtime_canonical_json,
+    _paper_runtime_owner_day as _paper_runtime_owner_day,
+    _paper_runtime_owner_instant as _paper_runtime_owner_instant,
+    _paper_runtime_owner_tz as _paper_runtime_owner_tz,
+    _paper_runtime_row_dict as _paper_runtime_row_dict,
+    _paper_runtime_strict_mapping as _paper_runtime_strict_mapping,
+    paper_job_run_fact as _paper_job_run_fact_impl,
+    paper_job_run_facts as _paper_job_run_facts_impl,
+)
+
+
+def paper_job_run_fact(conn, run_key, *, as_of):
+    """兼容 facade —— canonical 单条读取器在 :mod:`paper_job_run_facts`。"""
+    return _paper_job_run_fact_impl(conn, run_key, as_of=as_of)
+
+
+def paper_job_run_facts(conn, *, as_of, limit=100):
+    """兼容 facade —— canonical owner 列表读取器在 :mod:`paper_job_run_facts`。
+
+    run key 的枚举由 owner 分页扫描（``SELECT run_key FROM paper_job_runs ORDER BY
+    started_at DESC,run_key DESC LIMIT ? OFFSET ?``），row → projection 只经
+    :func:`paper_job_run_fact` 这一条 canonical 路径；本 facade 显式注入该单条 reader，
+    绝不复制第二条读取路径。
+    """
+    def read(cursor, run_key, *, as_of):
+        return paper_job_run_fact(cursor, run_key, as_of=as_of)
+
+    return _paper_job_run_facts_impl(conn, as_of=as_of, limit=limit, read_fact=read)
 
 
 # Bind explicit vertical capabilities after all compatibility functions exist.

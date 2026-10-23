@@ -15,7 +15,7 @@
 
 **Python 3.14 是本项目的 canonical development / CI / container runtime。** `Dockerfile` 的基础镜像、`.python-version`、Ruff `target-version`、依赖锁的编译目标与 GitHub Actions 的全部 Python 作业都以 3.14 为唯一版本。项目**不维护 per-PR 的多 Python 兼容矩阵**：不为每个 PR 重复在多个 Python minor 上跑同一套测试。
 
-**唯一例外是 `native-centos9` 原生部署 profile**：CentOS Stream 9 的默认仓库不提供 3.14，该 profile 仍使用 Python 3.11（见 `deploy/install-centos9.sh` 与 `deploy/README.md`）。这是明确保留的 legacy 部署例外 —— 既不是第二个 canonical runtime baseline，也不是 PR 兼容 lane；它的升级或退役将在独立的、经过评审的变更中处理。该例外不构成把 Python 3.11 重新引入开发环境、GitHub CI、Docker 镜像或测试矩阵的许可。
+原 `native-centos9` 原生部署 profile（曾使用 Python 3.11）已于 **2026-10-20 退役**，因此现在**没有**第二个 runtime 例外：开发、CI、Docker 与测试矩阵统一使用 3.14。退役证据与恢复路径见 [`docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md`](docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md)。
 
 因此本地与 agent 的默认验证流程是：
 

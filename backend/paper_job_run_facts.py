@@ -1,8 +1,36 @@
 # -*- coding: utf-8 -*-
-"""Paper 任务事实契约与只读读取器。
+"""R27-B2C-7 —— paper runtime attempt（`paper_job_runs`）的 typed owner fact。
 
-调用方提供连接和明确的历史时点；本模块不打开数据库、不迁移、不写入，
-也不依赖交易编排。任务写入仍由 paper_trading 负责。
+（本模块自 :mod:`paper_trading` 整块搬出；``paper_job_runs`` 的 lifecycle writer 仍是
+``paper_trading``，writer 审计注释随 writer 留在那里。本模块是**只读** owner 读侧。）
+
+契约之前，research 侧在 incident_triage 里读的是 **裸行**：
+
+    SELECT slot,market_date,status,detail,started_at,finished_at
+      FROM paper_jobs WHERE status NOT IN ('completed','success')
+
+于是 `deepseek_research` 必须自己解释"这一行是 current slot state 还是某次 attempt"、
+"market_date 能不能当失败被知悉的时刻"。本段把这两个问题还给 owner。
+
+────────────── 为什么是 `paper_job_runs`（attempt 级）而不是 `paper_jobs` ──────────────
+
+`paper_jobs` 的 PK 是 `(slot, market_date)` —— **每天每 slot 只有一行**，retry 会把
+`failed` 物理覆盖成 `running`（`:13613`），旧失败**不复存在**。它是 current slot state，
+**不是** attempt ledger。用当前行解释历史时点就是倒填。
+
+`paper_job_runs` 的 PK 是 `run_key = intraday:YYYYMMDDHHMM`（`_intraday_business_key:358`，
+三分钟窗口），identity 属于**attempt 窗口**而不是"今天这个 slot"。本段因此只发布
+attempt 级事实。
+
+────────────── 三条分离 ──────────────
+
+    runtime lifecycle status（running / completed / failed）  ≠ owner fact verification
+    incident severity（critical / high / …）                  ≠ owner fact verification
+    业务拒绝 / 风控拒单                                        ≠ 系统事故（见 paper_orders）
+
+`completed` **不是** `verified`，`failed` 也**不是** `unverified`：一个 `failed` 事实
+只要 owner 能证明记录，就是 owner-verified 的**事实**。`verified` 的意思是
+"这个事实可信"，不是"任务成功"。
 """
 from __future__ import annotations
 
@@ -12,52 +40,6 @@ import hashlib
 import json
 from typing import Any
 from zoneinfo import ZoneInfo
-
-
-# ---------------------------------------------------------------------------
-# R27-B2C-7 —— paper runtime attempt（`paper_job_runs`）的 typed owner fact
-# ---------------------------------------------------------------------------
-#
-# 契约之前，research 侧在 incident_triage 里读的是 **裸行**：
-#
-#     SELECT slot,market_date,status,detail,started_at,finished_at
-#       FROM paper_jobs WHERE status NOT IN ('completed','success')
-#
-# 于是 `deepseek_research` 必须自己解释"这一行是 current slot state 还是某次 attempt"、
-# "market_date 能不能当失败被知悉的时刻"。本段把这两个问题还给 owner。
-#
-# ────────────── 为什么是 `paper_job_runs`（attempt 级）而不是 `paper_jobs` ──────────────
-#
-# `paper_jobs` 的 PK 是 `(slot, market_date)` —— **每天每 slot 只有一行**，retry 会把
-# `failed` 物理覆盖成 `running`（`:13613`），旧失败**不复存在**。它是 current slot state，
-# **不是** attempt ledger。用当前行解释历史时点就是倒填。
-#
-# `paper_job_runs` 的 PK 是 `run_key = intraday:YYYYMMDDHHMM`（`_intraday_business_key:358`，
-# 三分钟窗口），identity 属于**attempt 窗口**而不是"今天这个 slot"。本段因此只发布
-# attempt 级事实。
-#
-# ────────────── writer 审计（闭集来自真实写路径） ──────────────
-#
-# `paper_job_runs` 的生产 writer 仍是 paper_trading；以下历史行号用于追溯：
-#
-#     INSERT running          :13587
-#     UPDATE → failed         :13534（stale row 回收）/ :1521（_recover_stale_runtime_state）
-#                             / :13751（异常路径）
-#     UPDATE → running        :13593（retry；输入 `status IN ('failed','interrupted')`）
-#     UPDATE → completed      :13732
-#     UPDATE heartbeat        :13656（只动 heartbeat_at / expires_at / fencing_token）
-#
-# 写侧字面量 = `running` / `completed` / `failed`。
-#
-# ────────────── 三条分离 ──────────────
-#
-#     runtime lifecycle status（running / completed / failed）  ≠ owner fact verification
-#     incident severity（critical / high / …）                  ≠ owner fact verification
-#     业务拒绝 / 风控拒单                                        ≠ 系统事故（见 paper_orders）
-#
-# `completed` **不是** `verified`，`failed` 也**不是** `unverified`：一个 `failed` 事实
-# 只要 owner 能证明记录，就是 owner-verified 的**事实**。`verified` 的意思是
-# "这个事实可信"，不是"任务成功"。
 
 PAPER_JOB_RUN_FACT_CONTRACT_VERSION = "paper-job-run-runtime-fact-v1"
 
@@ -103,8 +85,7 @@ PAPER_JOB_RUN_AVAILABILITY_KINDS = (
 
 #: 调度器时间戳的**owner 声明的**历史格式：服务器本地时间的裸
 #: ``%Y-%m-%d %H:%M:%S``（`_now:905`），而生产容器的时区由
-#: ``TZ=Asia/Shanghai``（`Dockerfile` / `docker-compose.yml`）与
-#: ``deploy/install-centos9.sh`` 的 ``timedatectl set-timezone Asia/Shanghai`` 固定，
+#: ``TZ=Asia/Shanghai``（`Dockerfile` / `docker-compose.yml`）固定，
 #: `_market_session:914` 也逐字声明"生产环境为 Asia/Shanghai"。
 #:
 #: 因此这是一个**owner 明确拥有并一致使用**的 legacy 契约，而不是"naive 就当本地时间"
@@ -591,15 +572,20 @@ def paper_job_run_fact(conn, run_key, *, as_of):
     )
 
 
-def paper_job_run_facts(conn, *, as_of, limit=100):
+def paper_job_run_facts(conn, *, as_of, limit=100, read_fact=None):
     """按显式 ``as_of`` 发布可证明的 job attempt typed facts。
 
     run key 的枚举与 row → projection 的转换都属于 paper runtime owner。非 intraday
     attempt、被 retry 覆盖的失败 revision 与其他不可证明记录继续由单条读取器返回为
     unavailable；本 API 不创建历史 ledger。
+
+    ``read_fact`` 与 ``adaptive_runtime_facts.adaptive_run_facts`` 的 ``read_fact`` 同一
+    手法：缺省即 canonical 单条读取器 :func:`paper_job_run_fact`，facade 显式注入同一条
+    路径而不是复制第二条。
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("paper_job_run_facts limit must be a positive int")
+    reader = paper_job_run_fact if read_fact is None else read_fact
     size = min(limit, 500)
     facts = []
     offset = 0
@@ -612,7 +598,7 @@ def paper_job_run_facts(conn, *, as_of, limit=100):
             break
         for row in rows:
             run_key = row[0] if not hasattr(row, "keys") else row["run_key"]
-            projection = paper_job_run_fact(conn, run_key, as_of=as_of)
+            projection = reader(conn, run_key, as_of=as_of)
             if projection is not None:
                 facts.append(projection)
                 if len(facts) == size:
@@ -620,5 +606,3 @@ def paper_job_run_facts(conn, *, as_of, limit=100):
         offset += len(rows)
     facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
     return tuple(facts[:size])
-
-

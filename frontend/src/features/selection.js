@@ -2,8 +2,8 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, tableScroll } from "../core/dom.js";
-import { handleOperatorError } from "../ui/dialog.js";
-import { adaptiveEsc, dataValidityTone, fmt, pctCls, pctTxt, sellTag, sigTag, yi } from "../core/format.js";
+import { confirmDialog, handleOperatorError, toast } from "../ui/dialog.js";
+import { adaptiveEsc, adaptiveJsArg, dataValidityTone, fmt, pctCls, pctTxt, sellTag, sigTag, yi } from "../core/format.js";
 import { APP_PAGE_KEY } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 
@@ -163,11 +163,11 @@ export async function loadSelectionEvaluation(){
     var sid=$('selectionEvalStrategy').value, d=await api('/api/selection-evaluation?strategy='+encodeURIComponent(sid));
     window._selectionEvaluationPicks=d.latest_picks||[];
     var cards=(d.strategies||[]).map(function(s){ var m=(s.metrics||[]).filter(function(x){return x.horizon===10;})[0] || (s.metrics||[])[0] || {}, a=s.assessment||{}, copy=selectionAssessmentCopy(a.state);
-      return '<article class="selection-validation-card '+selectionAssessmentClass(a.state)+'"><h3>'+s.strategy_name+'</h3><p><span class="tag '+(a.state==='review'?'tag-warn':(a.state==='validated'?'tag-ok':'tag-info'))+'">'+copy.label+'</span> '+copy.advice+'</p><div class="selection-validation-stats"><div class="selection-validation-stat">10\u65e5\u6837\u672c<b>'+((m.sample_count===undefined)?'-':m.sample_count)+'</b></div><div class="selection-validation-stat">\u5e73\u5747\u6536\u76ca<b class="'+pctCls(m.avg_return_pct)+'">'+pctTxt(m.avg_return_pct)+'</b></div><div class="selection-validation-stat">\u5e73\u5747\u8d85\u989d<b class="'+pctCls(m.avg_excess_pct)+'">'+pctTxt(m.avg_excess_pct)+'</b></div><div class="selection-validation-stat">\u80dc\u7387<b>'+((m.win_rate_pct===null||m.win_rate_pct===undefined)?'-':fmt(m.win_rate_pct)+'%')+'</b></div></div><div class="selection-validation-timeline">'+(s.metrics||[]).map(function(x){return '<span>'+x.horizon+'\u65e5 '+x.sample_count+'\u6837\u672c \u00b7 '+pctTxt(x.avg_excess_pct)+'</span>';}).join('')+'</div></article>'; }).join('') || '<div class="banner">\u5c1a\u65e0\u81ea\u52a8\u9009\u80a1\u5feb\u7167\u3002\u7cfb\u7edf\u5c06\u5728\u4e0b\u4e00\u4e2a\u4ea4\u6613\u65e5 15:25 \u540e\u5199\u5165\u9996\u6279\u7ed3\u679c\u3002</div>';
+      return '<article class="selection-validation-card '+selectionAssessmentClass(a.state)+'"><h3>'+adaptiveEsc(s.strategy_name||'')+'</h3><p><span class="tag '+(a.state==='review'?'tag-warn':(a.state==='validated'?'tag-ok':'tag-info'))+'">'+copy.label+'</span> '+copy.advice+'</p><div class="selection-validation-stats"><div class="selection-validation-stat">10\u65e5\u6837\u672c<b>'+((m.sample_count===undefined)?'-':m.sample_count)+'</b></div><div class="selection-validation-stat">\u5e73\u5747\u6536\u76ca<b class="'+pctCls(m.avg_return_pct)+'">'+pctTxt(m.avg_return_pct)+'</b></div><div class="selection-validation-stat">\u5e73\u5747\u8d85\u989d<b class="'+pctCls(m.avg_excess_pct)+'">'+pctTxt(m.avg_excess_pct)+'</b></div><div class="selection-validation-stat">\u80dc\u7387<b>'+((m.win_rate_pct===null||m.win_rate_pct===undefined)?'-':fmt(m.win_rate_pct)+'%')+'</b></div></div><div class="selection-validation-timeline">'+(s.metrics||[]).map(function(x){return '<span>'+x.horizon+'\u65e5 '+x.sample_count+'\u6837\u672c \u00b7 '+pctTxt(x.avg_excess_pct)+'</span>';}).join('')+'</div></article>'; }).join('') || '<div class="banner">\u5c1a\u65e0\u81ea\u52a8\u9009\u80a1\u5feb\u7167\u3002\u7cfb\u7edf\u5c06\u5728\u4e0b\u4e00\u4e2a\u4ea4\u6613\u65e5 15:25 \u540e\u5199\u5165\u9996\u6279\u7ed3\u679c\u3002</div>';
     var latestDate=(d.runs&&d.runs[0]) ? d.runs[0].run_date : '-', signalDate=(d.runs&&d.runs[0]) ? (d.runs[0].data_asof_date||'\u672a\u77e5') : '-';
-    var pickRows=(d.latest_picks||[]).map(function(p){return '<tr class="selection-evaluation-pick" data-run-date="'+(p.run_date||'')+'" data-strategy="'+(p.strategy||'')+'" data-keyword="'+((p.code||'')+' '+(p.name||'')).toLowerCase()+'" data-return="'+(p.return_pct===null||p.return_pct===undefined?'pending':(p.return_pct>=0?'positive':'negative'))+'" data-holding="'+(p.holding_days||0)+'"><td>'+p.run_date+'</td><td>'+p.strategy_name+'</td><td>'+p.rank+'</td><td><b>'+p.name+'</b><br><span style="color:var(--text-muted);font-size:11px">'+p.code+' \u00b7 '+(p.industry||'-')+'</span></td><td>'+fmt(p.entry_price)+'</td><td>'+p.holding_days+'\u65e5</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.return_pct)+'">'+pctTxt(p.return_pct)+'</td><td class="'+pctCls(p.excess_return_pct)+'">'+pctTxt(p.excess_return_pct)+'</td></tr>';}).join('');
-    target.innerHTML='<div class="result-toolbar"><span class="tag tag-info">\u6700\u65b0\u5feb\u7167 '+latestDate+'</span><span class="tag tag-info">\u4fe1\u53f7K\u7ebf\u622a\u81f3 '+signalDate+'</span><span class="tag tag-info">\u57fa\u51c6 '+(d.benchmark||'\u6caa\u6df1300')+'</span><span class="tag tag-info">\u8ddf\u8e2a\u4e0a\u9650 '+d.tracking_days+' \u4e2a\u4ea4\u6613\u65e5</span>'+(d.kline_source?'<span class="tag tag-ok">'+d.kline_source+' · 完整日 '+(d.kline_latest_complete_date||'-')+'</span>':'')+'</div><section class="selection-validation-grid">'+cards+'</section>'+(pickRows?'<h3 style="margin-top:20px">\u6700\u8fd1\u5165\u9009\u4e0e\u540e\u7eed\u8868\u73b0</h3>'+tableScroll('<table><tr><th>\u4fe1\u53f7\u65e5</th><th>\u7b56\u7565</th><th>#</th><th>\u80a1\u7968</th><th>\u4fe1\u53f7\u4ef7</th><th>\u5df2\u8ddf\u8e2a</th><th>\u6700\u65b0\u6536\u76d8</th><th>\u6301\u6709\u6536\u76ca</th><th>\u76f8\u5bf9\u6caa\u6df1300</th></tr>'+pickRows+'</table>',920):'')+'<div class="disclaimer">'+(d.note||'')+'</div>'; filterSelectionEvaluationRows();
-  }catch(e){ target.innerHTML='<div class="banner">\u8bfb\u53d6\u9a8c\u8bc1\u7ed3\u679c\u5931\u8d25\uff1a'+e.message+'</div>'; }
+    var pickRows=(d.latest_picks||[]).map(function(p){return '<tr class="selection-evaluation-pick" data-run-date="'+adaptiveEsc(p.run_date||'')+'" data-strategy="'+adaptiveEsc(p.strategy||'')+'" data-keyword="'+adaptiveEsc(((p.code||'')+' '+(p.name||'')).toLowerCase())+'" data-return="'+(p.return_pct===null||p.return_pct===undefined?'pending':(p.return_pct>=0?'positive':'negative'))+'" data-holding="'+(p.holding_days||0)+'"><td>'+adaptiveEsc(p.run_date||'—')+'</td><td>'+adaptiveEsc(p.strategy_name||'')+'</td><td>'+adaptiveEsc(p.rank==null?'—':p.rank)+'</td><td><b>'+adaptiveEsc(p.name||p.code)+'</b><br><span style="color:var(--text-muted);font-size:11px">'+adaptiveEsc(p.code)+' \u00b7 '+adaptiveEsc(p.industry||'-')+'</span></td><td>'+fmt(p.entry_price)+'</td><td>'+adaptiveEsc(p.holding_days==null?'—':p.holding_days)+'\u65e5</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.return_pct)+'">'+pctTxt(p.return_pct)+'</td><td class="'+pctCls(p.excess_return_pct)+'">'+pctTxt(p.excess_return_pct)+'</td></tr>';}).join('');
+    target.innerHTML='<div class="result-toolbar"><span class="tag tag-info">\u6700\u65b0\u5feb\u7167 '+adaptiveEsc(latestDate)+'</span><span class="tag tag-info">\u4fe1\u53f7K\u7ebf\u622a\u81f3 '+adaptiveEsc(signalDate)+'</span><span class="tag tag-info">\u57fa\u51c6 '+adaptiveEsc(d.benchmark||'\u6caa\u6df1300')+'</span><span class="tag tag-info">\u8ddf\u8e2a\u4e0a\u9650 '+adaptiveEsc(d.tracking_days==null?'—':d.tracking_days)+' \u4e2a\u4ea4\u6613\u65e5</span>'+(d.kline_source?'<span class="tag tag-ok">'+adaptiveEsc(d.kline_source)+' · 完整日 '+adaptiveEsc(d.kline_latest_complete_date||'-')+'</span>':'')+'</div><section class="selection-validation-grid">'+cards+'</section>'+(pickRows?'<h3 style="margin-top:20px">\u6700\u8fd1\u5165\u9009\u4e0e\u540e\u7eed\u8868\u73b0</h3>'+tableScroll('<table><tr><th>\u4fe1\u53f7\u65e5</th><th>\u7b56\u7565</th><th>#</th><th>\u80a1\u7968</th><th>\u4fe1\u53f7\u4ef7</th><th>\u5df2\u8ddf\u8e2a</th><th>\u6700\u65b0\u6536\u76d8</th><th>\u6301\u6709\u6536\u76ca</th><th>\u76f8\u5bf9\u6caa\u6df1300</th></tr>'+pickRows+'</table>',920):'')+'<div class="disclaimer">'+adaptiveEsc(d.note||'')+'</div>'; filterSelectionEvaluationRows();
+  }catch(e){ target.innerHTML='<div class="banner">\u8bfb\u53d6\u9a8c\u8bc1\u7ed3\u679c\u5931\u8d25\uff1a'+adaptiveEsc(e.message||e)+'</div>'; }
 }
 
 export function filterSelectionEvaluationRows(){
@@ -306,7 +306,7 @@ export async function startManualDataUpdate(){
         if(btn){btn.disabled=false;btn.textContent='人工增量更新';}
       }
     },4000);
-  }catch(e){ if(btn){btn.disabled=false;btn.textContent='人工增量更新';} alert('增量更新未启动：'+(e.message||e)); }
+  }catch(e){ if(btn){btn.disabled=false;btn.textContent='人工增量更新';} toast('增量更新未启动：'+(e.message||e),{tone:'danger'}); }
 }
 
 export async function startFactorIncrementalUpdate(){
@@ -322,13 +322,13 @@ export async function startFactorIncrementalUpdate(){
         if(btn){btn.disabled=false;btn.textContent='重建选股因子';}
       }
     },4000);
-  }catch(e){ if(btn){btn.disabled=false;btn.textContent='重建选股因子';} alert('因子重建未启动：'+(e.message||e)); }
+  }catch(e){ if(btn){btn.disabled=false;btn.textContent='重建选股因子';} toast('因子重建未启动：'+(e.message||e),{tone:'danger'}); }
 }
 
 export async function cancelManualDataUpdate(){
   var btn=$('dataValidityCancel'); if(btn){btn.disabled=true;btn.textContent='取消中…';}
   try{ await apiPost('/api/data-validity/incremental/cancel'); await loadDataValidity(); }
-  catch(e){ alert('取消增量失败：'+(e.message||e)); }
+  catch(e){ toast('取消增量失败：'+(e.message||e),{tone:'danger'}); }
   finally{ if(btn){btn.disabled=false;btn.textContent='取消增量';} }
 }
 
@@ -339,42 +339,46 @@ export function selectionContextNotice(d){
 }
 
 export function renderSelectionResult(d, fromCache){
-    if(d.need_init){ $('selectResult').innerHTML = '<div class="banner">'+d.message+'。请运行 start.bat 完成数据初始化后重试。</div>'; return; }
+    if(d.need_init){ $('selectResult').innerHTML = '<div class="banner">'+adaptiveEsc(d.message||'数据尚未初始化')+'。请运行 start.bat 完成数据初始化后重试。</div>'; return; }
     if(!d.picks){ $('selectResult').innerHTML = '<div class="banner">暂无已完成的选股结果，请点击“开始选股”。</div>'; return; }
     var rows = d.picks.map(function(p, i){
-      var reasons = (p.reasons||[]).map(function(r){ return '<li>'+r+'</li>'; }).join('');
-      return '<tr><td>'+(i+1)+'</td><td><b>'+p.name+'</b><br/><span style="color:#9aa5b1;font-size:12px">'+p.code+' · '+(p.industry||'-')+'</span></td>'
+      // 股票名/行业/入选理由/买入摘要都是后端或行情源下发的自由文本，
+      // 直接拼进 innerHTML 会形成存储型 XSS（股票名本身来自外部行情源）。
+      var reasons = (p.reasons||[]).map(function(r){ return '<li>'+adaptiveEsc(r)+'</li>'; }).join('');
+      var decision=p.buy_decision||{};
+      return '<tr><td>'+(i+1)+'</td><td><b>'+adaptiveEsc(p.name||p.code)+'</b><br/><span style="color:#9aa5b1;font-size:12px">'+adaptiveEsc(p.code)+' · '+adaptiveEsc(p.industry||'-')+'</span></td>'
         +'<td>'+fmt(p.price)+'</td>'
-        +'<td>'+(p.net_profit!==null?yi(p.net_profit):(p.annual_net_profit!==null?yi(p.annual_net_profit):'-'))+'<br/><span style="font-size:11px;color:#9aa5b1">'+(p.report_date||p.annual_report_date||'')+(p.net_profit===null?' · 年报兜底':'')+'</span></td>'
+        +'<td>'+(p.net_profit!==null?yi(p.net_profit):(p.annual_net_profit!==null?yi(p.annual_net_profit):'-'))+'<br/><span style="font-size:11px;color:#9aa5b1">'+adaptiveEsc(p.report_date||p.annual_report_date||'')+(p.net_profit===null?' · 年报兜底':'')+'</span></td>'
         +'<td class="'+pctCls(p.super_net)+'">'+yi(p.super_net)+'</td>'
         +'<td class="'+pctCls(p.mom5)+'">'+pctTxt(p.mom5)+'</td>'
         +'<td class="'+pctCls(p.mom20)+'">'+pctTxt(p.mom20)+'</td>'
         +'<td class="'+pctCls(p.mom60)+'">'+pctTxt(p.mom60)+'</td>'
         +'<td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td>'
         +'<td><ul class="reasons">'+reasons+'</ul></td>'
-        +'<td>'+buyTag(p.buy_decision)+'<br/><span style="font-size:11px;color:#9aa5b1">'+p.buy_decision.summary+'</span>'
-        +(p.news_check && p.news_check.status!=='clean'?'<br/><span class="tag '+(p.news_check.status==='positive'?'tag-ok':'tag-info')+'" style="font-size:10px;padding:1px 4px">'+(p.news_check.status==='positive'?'利好':'提及')+'('+p.news_check.hits+')</span>':'')+'</td></tr>';
+        +'<td>'+buyTag(p.buy_decision)+'<br/><span style="font-size:11px;color:#9aa5b1">'+adaptiveEsc(decision.summary||'')+'</span>'
+        +(p.news_check && p.news_check.status!=='clean'?'<br/><span class="tag '+(p.news_check.status==='positive'?'tag-ok':'tag-info')+'" style="font-size:10px;padding:1px 4px">'+(p.news_check.status==='positive'?'利好':'提及')+'('+adaptiveEsc(p.news_check.hits)+')</span>':'')+'</td></tr>';
     }).join('');
     function buyTag(b){
       b=b||{};
       var cls = b.executable ? 'tag-ok' : (b.watchlist ? 'tag-info' : 'tag-warn');
-      return '<span class="tag '+cls+'">'+(b.tier||'-')+' '+(b.action||'')+'</span>';
+      return '<span class="tag '+cls+'">'+adaptiveEsc(b.tier||'-')+' '+adaptiveEsc(b.action||'')+'</span>';
     }
-    var gateHtml = d.gate? ('<span class="tag '+(d.gate.light==='red'?'tag-warn':(d.gate.light==='yellow'?'tag-warn':'tag-ok'))+'">'+d.gate.advice+'</span>') : '';
+    var gateHtml = d.gate? ('<span class="tag '+(d.gate.light==='red'?'tag-warn':(d.gate.light==='yellow'?'tag-warn':'tag-ok'))+'">'+adaptiveEsc(d.gate.advice||'')+'</span>') : '';
     var contextNotice=selectionContextNotice(d);
     $('selectResult').innerHTML = contextNotice
       +'<div class="result-toolbar">'+(contextNotice?'<span class="tag tag-warn">数据未齐</span>':(fromCache?'<span class="tag tag-info">最近已完成结果（未重新计算）</span>':'<span class="tag tag-ok">刚刚完成</span>'))+gateHtml
-      +' <span class="tag tag-info">当前计算覆盖 '+d.universe_size+'/'+d.total_universe+'只</span>'
+      +' <span class="tag tag-info">当前计算覆盖 '+adaptiveEsc(d.universe_size==null?'—':d.universe_size)+'/'+adaptiveEsc(d.total_universe==null?'—':d.total_universe)+'只</span>'
       +' <span class="tag tag-info">硬规则命中 '+(d.candidate_count||0)+'只</span>'
-      +' <span class="tag tag-info">'+(d.flow_source||'超大单净流入排序')+'</span>'
-      +' <span class="tag tag-info">最新财报：'+(d.latest_finance_report_date||d.annual_report_date||'-')+'</span></div>'
+      +' <span class="tag tag-info">'+adaptiveEsc(d.flow_source||'超大单净流入排序')+'</span>'
+      +' <span class="tag tag-info">最新财报：'+adaptiveEsc(d.latest_finance_report_date||d.annual_report_date||'-')+'</span></div>'
       +tableScroll('<table><tr><th>#</th><th>股票</th><th>现价</th><th>最新报告期净利润</th><th>超大单净流入</th><th>5日动量</th><th>20日动量</th><th>60日动量</th><th>今日涨跌</th><th>规则命中</th><th>买入决策</th></tr>'+rows+'</table>',1220)
-      +'<div style="margin:8px 0"><span class="tag tag-ok">T1/T2 可执行 '+d.executable_count+'</span> <span class="tag tag-info">T3 观察 '+d.watchlist_count+'</span> <span class="tag tag-warn">T4/T5 放弃 '+(d.count-d.executable_count-d.watchlist_count)+'</span>'
+      +'<div style="margin:8px 0"><span class="tag tag-ok">T1/T2 可执行 '+(d.executable_count||0)+'</span> <span class="tag tag-info">T3 观察 '+(d.watchlist_count||0)+'</span>'
+      +(Number.isFinite(Number(d.count))&&d.count!=null?'<span class="tag tag-warn">T4/T5 放弃 '+(d.count-(d.executable_count||0)-(d.watchlist_count||0))+'</span>':'')
       +' <span class="tag tag-info">舆情否决 '+((d.news_scan||{}).vetoed||0)+'</span>'
       +(d.first_board_candidates!==null && d.first_board_candidates!==undefined ? ' <span class="tag tag-ok">昨日首板 '+d.first_board_candidates+'只</span>' : '')
       +'</div>'
-      +(d.news_vetoed&&d.news_vetoed.length?'<div style="margin:4px 0;padding:8px;background:#fff3cd;border:1px solid #ffc107;border-radius:4px"><b>舆情否决</b>：以下个股因负面舆情被一票否决，不进入选股结果<ul>'+d.news_vetoed.map(function(v){ return '<li>'+v.name+'('+v.code+') — '+v.reason+'</li>'; }).join('')+'</ul></div>':'')
-      +'<div class="disclaimer">'+(d.disclaimer||'')+'</div>';
+      +(d.news_vetoed&&d.news_vetoed.length?'<div style="margin:4px 0;padding:8px;background:#fff3cd;border:1px solid #ffc107;border-radius:4px"><b>舆情否决</b>：以下个股因负面舆情被一票否决，不进入选股结果<ul>'+d.news_vetoed.map(function(v){ return '<li>'+adaptiveEsc(v.name||v.code)+'('+adaptiveEsc(v.code)+') — '+adaptiveEsc(v.reason||'')+'</li>'; }).join('')+'</ul></div>':'')
+      +'<div class="disclaimer">'+adaptiveEsc(d.disclaimer||'')+'</div>';
 }
 
 export async function loadLatestSelection(){
@@ -450,11 +454,19 @@ export async function trackAdd(code, name, price, strategy, btn){
   try{
     var d = await apiPost('/api/track/add?code='+code+'&name='+encodeURIComponent(name)+(price?'&cost='+price:'')+'&strategy='+encodeURIComponent(strategy||''));
     if(btn){ btn.textContent = d.ok ? '已跟踪' : '已在池'; }
-  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='＋跟踪'; } alert('加入失败: '+e); }
+  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='＋跟踪'; } toast('加入失败：'+((e&&e.message)||e),{tone:'danger'}); }
 }
 
 export async function trackAddAll(strategy){
-  if(!confirm('确定将本次全部选股结果加入跟踪池？')) return;
+  // 应用内唯一对话框层（ui/dialog.js）：批量写操作必须走可聚焦、可 Escape 的模态，
+  // 不用浏览器原生 confirm（它会阻塞主线程且无法保持视觉/无障碍一致）。
+  var answer=await confirmDialog({
+    kicker:'策略选股 · 批量跟踪',
+    title:'将本次全部选股结果加入跟踪池？',
+    bullets:['按当前选股表逐只加入跟踪池，已在池的会提示“已在池”。','不会生成委托，也不会改动模拟盘账本。'],
+    confirmText:'加入跟踪池',
+  });
+  if(!answer.approved) return;
   var rows = document.querySelectorAll('#selectResult table tr');
   var count = 0;
   for(var i=1;i<rows.length;i++){
@@ -470,13 +482,21 @@ export async function trackAddAll(strategy){
     }catch(e){}
     await new Promise(function(r){ setTimeout(r, 100); });
   }
-  alert('已加入 '+count+' 只到跟踪池');
+  toast('已加入 '+count+' 只到跟踪池');
 }
 
 export async function trackRemove(code){
-  if(!confirm('移出跟踪池：'+code+'？')) return;
-  await apiPost('/api/track/remove?code='+code);
-  loadTrack();
+  var answer=await confirmDialog({
+    kicker:'持仓跟踪 · 移出',
+    title:'移出跟踪池？',
+    detail:'证券代码 '+code,
+    danger:true,
+    bullets:['只影响跟踪池观察列表，不影响模拟盘持仓与账本。'],
+    confirmText:'移出',
+  });
+  if(!answer.approved) return;
+  try{ await apiPost('/api/track/remove?code='+code); loadTrack(); }
+  catch(e){ toast('移出失败：'+((e&&e.message)||e),{tone:'danger'}); }
 }
 
 export async function loadTrack(){
@@ -524,33 +544,44 @@ export function renderTrack(d){
     $('trackTable').innerHTML = '<div class="loading">无符合筛选条件的持仓</div>';
     return;
   }
-  var p = d.portfolio;
-  var brCls = p.breaker.indexOf('熔断')===0 ? 'tag-warn' : (p.breaker.indexOf('警戒')===0 ? 'tag-warn' : 'tag-ok');
+  var p = d.portfolio||{};
+  // 后端的自由文本（门控说明/集中度告警/来源策略）来自外部行情与规则输出，
+  // 拼进 innerHTML 前必须转义；同时缺失值不得显示成 "null"/"undefined"/"--%"。
+  var breakerText=String(p.breaker==null?'':p.breaker);
+  var brCls = breakerText.indexOf('熔断')===0 ? 'tag-warn' : (breakerText.indexOf('警戒')===0 ? 'tag-warn' : 'tag-ok');
   $('trackSummary').innerHTML = '<div class="metrics">'
-    +'<div class="metric"><div class="v">'+p.count+'</div><div class="k">跟踪只数</div></div>'
+    +'<div class="metric"><div class="v">'+(p.count==null?'—':adaptiveEsc(p.count))+'</div><div class="k">跟踪只数</div></div>'
     +'<div class="metric"><div class="v '+pctCls(p.avg_ret_pct)+'">'+pctTxt(p.avg_ret_pct)+'</div><div class="k">平均收益</div></div>'
-    +'<div class="metric"><div class="v down">-'+fmt(p.avg_peak_drawdown)+'%</div><div class="k">平均峰值回撤</div></div>'
-    +'<div class="metric"><div class="v" style="color:#e74c3c">'+p.sell_signals+'</div><div class="k">卖出提示</div></div>'
-    +'<div class="metric"><div class="v" style="color:#d48806">'+p.warn_signals+'</div><div class="k">关注</div></div></div>'
-    +'<div style="margin:8px 0"><span class="tag '+brCls+'">'+p.breaker+'</span> '
-    +(p.concentration_warnings||[]).map(function(w){return '<span class="tag tag-warn">'+w+'</span>';}).join(' ')+'</div>'
-    +(p.suggested_weights_pct? '<div style="font-size:12px;color:#9ca3af;margin-bottom:8px">波动率倒数仓位建议：'+Object.keys(p.suggested_weights_pct).map(function(c){return c+':'+p.suggested_weights_pct[c]+'%';}).join('，')+'</div>':'');
+    +'<div class="metric"><div class="v down">'+(p.avg_peak_drawdown==null?'—':'-'+fmt(p.avg_peak_drawdown)+'%')+'</div><div class="k">平均峰值回撤</div></div>'
+    +'<div class="metric"><div class="v" style="color:#e74c3c">'+(p.sell_signals==null?'—':adaptiveEsc(p.sell_signals))+'</div><div class="k">卖出提示</div></div>'
+    +'<div class="metric"><div class="v" style="color:#d48806">'+(p.warn_signals==null?'—':adaptiveEsc(p.warn_signals))+'</div><div class="k">关注</div></div></div>'
+    +'<div style="margin:8px 0"><span class="tag '+brCls+'">'+adaptiveEsc(breakerText||'—')+'</span> '
+    +(p.concentration_warnings||[]).map(function(w){return '<span class="tag tag-warn">'+adaptiveEsc(w)+'</span>';}).join(' ')+'</div>'
+    +(p.suggested_weights_pct? '<div style="font-size:12px;color:#9ca3af;margin-bottom:8px">波动率倒数仓位建议：'+Object.keys(p.suggested_weights_pct).map(function(c){return adaptiveEsc(c)+':'+adaptiveEsc(p.suggested_weights_pct[c])+'%';}).join('，')+'</div>':'');
   var rows = filtered.map(function(x){
     var actCls = x.action==='卖出提示' ? 'style="color:#e74c3c;font-weight:600"' : (x.action==='关注' ? 'style="color:#d48806;font-weight:600"' : '');
-    var retTag = x.ret_pct!==null ? ('<span class="tag '+(x.ret_pct>=0?'tag-ok':'tag-warn')+'" style="font-size:13px;font-weight:700">'+(x.ret_pct>=0?'+':'')+fmt(x.ret_pct,2)+'%</span>') : '-';
-    return '<tr><td><b>'+x.name+'</b><br/><span style="color:#9ca3af;font-size:11px">'+x.code+' · '+(x.industry||'-')+'</span></td>'
-      +'<td>'+fmt(x.cost)+'<br/><span style="font-size:11px;color:#9ca3af">'+(x.added_at||'')+'</span></td>'
+    // 缺失值判定必须用 ==null：字段缺失是 undefined，旧写法 x.ret_pct!==null 为真，
+    // 于是缺行情时渲染出 "-%"、"--%"、"undefined日"，并把未知收益染成亏损色。
+    var retTag = x.ret_pct==null ? '-' : ('<span class="tag '+(x.ret_pct>=0?'tag-ok':'tag-warn')+'" style="font-size:13px;font-weight:700">'+(x.ret_pct>=0?'+':'')+fmt(x.ret_pct,2)+'%</span>');
+    var sell=x.sell_decision||{};
+    // sellTag 需要 action 与 auction_matrix 两个字段；缺任一字段时不要调用，
+    // 否则核心格式化函数会把 undefined 直接印成 "undefined｜undefined"。
+    var sellHtml=(sell.action&&sell.auction_matrix)?sellTag(sell):'—';
+    // inline handler 的 JS 字符串参数：adaptiveJsArg 在模板外预计算（HTML 实体先解码再当 JS 解析）。
+    var codeArg=adaptiveJsArg(x.code);
+    return '<tr><td><b>'+adaptiveEsc(x.name||x.code)+'</b><br/><span style="color:#9ca3af;font-size:11px">'+adaptiveEsc(x.code)+' · '+adaptiveEsc(x.industry||'-')+'</span></td>'
+      +'<td>'+fmt(x.cost)+'<br/><span style="font-size:11px;color:#9ca3af">'+adaptiveEsc(x.added_at||'')+'</span></td>'
       +'<td>'+fmt(x.price)+'</td>'
       +'<td class="'+pctCls(x.pct_today)+'">'+pctTxt(x.pct_today)+'</td>'
       +'<td>'+retTag+'</td>'
-      +'<td class="down">'+(x.drawdown_from_peak!==null? '-'+fmt(x.drawdown_from_peak)+'%':'-')+'</td>'
-      +'<td>'+(x.strategy_name||x.strategy||'-')+'</td>'
-      +'<td>'+(x.hold_days!==null? x.hold_days+'日':'-')+'</td>'
-      +'<td '+actCls+'>'+x.action+'</td>'
-      +'<td>'+((x.signals||[]).map(sigTag).join(' ')||'-')+(x.signals&&x.signals.length? '<div style="font-size:11px;color:#9ca3af;margin-top:2px">'+x.signals.map(function(s){return s.msg;}).join('；')+'</div>':'')+'</td>'
-      +'<td>'+sellTag(x.sell_decision)+'<br/><span style="font-size:11px;color:#9ca3af">'+x.sell_decision.summary+'</span></td>'
-      +'<td><button class="danger" style="font-size:11px;padding:3px 8px;min-height:30px" onclick="trackRemove(\''+x.code+'\')">移出</button></td></tr>';
+      +'<td class="down">'+(x.drawdown_from_peak==null? '-':'-'+fmt(x.drawdown_from_peak)+'%')+'</td>'
+      +'<td>'+adaptiveEsc(x.strategy_name||x.strategy||'-')+'</td>'
+      +'<td>'+(x.hold_days==null? '-':adaptiveEsc(x.hold_days)+'日')+'</td>'
+      +'<td '+actCls+'>'+adaptiveEsc(x.action||'-')+'</td>'
+      +'<td>'+((x.signals||[]).map(sigTag).join(' ')||'-')+(x.signals&&x.signals.length? '<div style="font-size:11px;color:#9ca3af;margin-top:2px">'+x.signals.map(function(s){return adaptiveEsc(s.msg);}).join('；')+'</div>':'')+'</td>'
+      +'<td>'+sellTag(sell)+'<br/><span style="font-size:11px;color:#9ca3af">'+adaptiveEsc(sell.summary||'')+'</span></td>'
+      +'<td><button class="danger" style="font-size:11px;padding:3px 8px;min-height:30px" onclick="trackRemove('+codeArg+')">移出</button></td></tr>';
     }).join('');
     $('trackTable').innerHTML = tableScroll('<table><tr><th>股票</th><th>成本/加入日</th><th>现价</th><th>今日</th><th>收益</th><th>峰值回撤</th><th>来源策略</th><th>持有</th><th>状态</th><th>信号</th><th>卖出决策</th><th>操作</th></tr>'+rows+'</table>',1180)
-      +'<div class="disclaimer">'+d.disclaimer+'（检查时间 '+d.checked_at+'）</div>';
+      +'<div class="disclaimer">'+adaptiveEsc(d.disclaimer||'')+'（检查时间 '+adaptiveEsc(d.checked_at||'—')+'）</div>';
 }

@@ -2,13 +2,14 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $ } from "../core/dom.js";
-import { adaptiveEsc, fmt, riskText } from "../core/format.js";
+import { adaptiveEsc, adaptiveJsArg, fmt, riskText } from "../core/format.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 import { adaptiveValue } from "./adaptive.js";
+import { confirmDialog, inlineError, promptDialog } from "../ui/dialog.js";
 
 export function allocationActionPanel(d){
   var alloc=(d&&d.allocation)||{},latest=alloc.latest_decision||{},active=alloc.active||{};
-  var rows=Object.keys(active).map(function(id){var a=active[id]||{};return '<li><div><b>'+adaptiveEsc(id)+'</b><small>当前分摊 '+adaptiveValue(a.weight_pct,'%',1)+' · 决策 #'+adaptiveEsc(String(a.decision_id||'—'))+' · 生效 '+adaptiveEsc(String(a.effective_date||'—'))+'</small></div><button class="ghost" onclick="rollbackAdaptiveAllocation(\''+adaptiveEsc(id)+'\')">回滚分摊</button></li>';}).join('');
+  var rows=Object.keys(active).map(function(id){var a=active[id]||{},idArg=adaptiveJsArg(id);return '<li><div><b>'+adaptiveEsc(id)+'</b><small>当前分摊 '+adaptiveValue(a.weight_pct,'%',1)+' · 决策 #'+adaptiveEsc(String(a.decision_id||'—'))+' · 生效 '+adaptiveEsc(String(a.effective_date||'—'))+'</small></div><button class="ghost" onclick="rollbackAdaptiveAllocation('+idArg+')">回滚分摊</button></li>';}).join('');
   var canApply=latest&&latest.can_apply;
   var applyBar=canApply?'<div class="adaptive-human-actions"><span>最新决策 #'+Number(latest.id)+' · 阶段 '+adaptiveEsc(latest.stage||'')+'</span><button class="ghost" onclick="applyAdaptiveAllocation('+Number(latest.id)+')">人工批准权重分摊</button></div>':(latest&&latest.status==='applied'?'<div class="adaptive-notice">最新决策已应用为资金分摊覆盖。</div>':'');
   if(!canApply&&!rows){return '<div class="adaptive-notice">资金分摊覆盖未启用：继续使用各策略 max_exposure 基准权重。需要决策进入 advisory/eligible 阶段且人工批准后才生效。</div>';}
@@ -126,19 +127,54 @@ export function renderPaperExecution(d){
 }
 
 export async function verifyExecutionOrder(orderId,approved){
+  /* 同一时刻只允许一个人工核验流程：双击/重复点击不能产生第二次写请求。 */
+  if(window._executionVerifyInFlight) return;
+  window._executionVerifyInFlight=true;
+  try{
+    await runExecutionVerification(orderId,approved);
+  }finally{window._executionVerifyInFlight=false;}
+}
+
+async function runExecutionVerification(orderId,approved){
   var verb=approved?'放行':'驳回';
   var note='';
   if(!approved){
-    note=window.prompt('驳回原因（可选）：')||'';
-    if(note===null) return;
+    /* 驳回原因走应用内模态（dialog.js 是唯一对话框层）。用户取消 → approved=false，
+       必须直接放弃：绝不能把取消当成“空原因”继续提交驳回。 */
+    var reason=await promptDialog({
+      kicker:'人工核验 · 模拟盘',
+      title:'驳回委托 #'+Number(orderId),
+      detail:'驳回后该委托终态作废，不再进入重试管道。',
+      label:'驳回原因（必填，写入审计）',
+      placeholder:'例如：事件与持仓不符',
+      confirmText:'提交驳回',
+    });
+    if(!reason.approved) return;
+    note=reason.value;
   }
-  if(!window.confirm('确认'+verb+'委托 #'+orderId+'？')) return;
+  var confirmation=await confirmDialog({
+    kicker:'人工核验 · 模拟盘',
+    title:'确认'+verb+'委托 #'+Number(orderId)+'？',
+    detail:approved?'放行后该委托进入重试管道，仍受行情双源、T+1 与风控门禁约束。':'驳回后该委托终态作废，不可撤销。',
+    confirmText:'确认'+verb,
+    danger:!approved,
+  });
+  if(!confirmation.approved) return;
+  await submitExecutionVerification(orderId,approved,note);
+}
+
+/** 人工核验的唯一写入口：对话框确认后只提交一次，错误原样展示后端 detail。 */
+export async function submitExecutionVerification(orderId,approved,note){
   try{
-    var query='?order_id='+Number(orderId)+'&approved='+(approved?1:0)+'&operator='+encodeURIComponent('运营台')+'&note='+encodeURIComponent(note);
+    var query='?order_id='+Number(orderId)+'&approved='+(approved?1:0)+'&operator='+encodeURIComponent('运营台')+'&note='+encodeURIComponent(note||'');
     await apiPost('/api/paper/execution-dispatch/verify'+query);
     window._paperExecutionCenterCache=null;
     await loadPaperExecution();
   }catch(err){
-    window.alert('核验失败：'+(err.message||err));
+    /* 后端 detail 已是人话（ApiError.message 取自 detail），只转义不改写。 */
+    inlineError('paperExecutionView','核验失败：'+((err&&err.message)||err),{
+      title:'人工核验未提交',retryLabel:'重试',
+      onRetry:function(){return submitExecutionVerification(orderId,approved,note);},
+    });
   }
 }

@@ -34,7 +34,7 @@ if BACKEND not in sys.path:
 
 import adaptive_engine as AE  # noqa: E402
 import ai_research_contract as ARC  # noqa: E402
-import paper_runtime_facts as PRF
+import paper_job_run_facts as PJF  # noqa: E402
 import paper_trading as PT  # noqa: E402
 
 ADAPTIVE_RUNS = "adaptive_runs"
@@ -504,7 +504,7 @@ class RuntimeLifecycleVsVerificationTests(_DbTestCase):
         源文本。
         """
         for name in (
-            "adaptive_engine.py", "paper_trading.py", "paper_runtime_facts.py", "ai_research_runtime_adapter.py",
+            "adaptive_engine.py", "paper_trading.py", "ai_research_runtime_adapter.py",
         ):
             identifiers = _code_identifiers(name)
             hits = sorted(
@@ -711,10 +711,10 @@ class RuntimePitAvailabilityTests(_DbTestCase):
                 self.assertEqual("2026-09-20", fact.availability_day)
 
         # paper：裸时间戳按 Asia/Shanghai 解释，而不是 UTC。
-        self.assertEqual("2026-09-20", PRF._paper_runtime_owner_day(
-            PRF._paper_runtime_owner_instant("2026-09-20 23:30:00", what="t"), what="t",
+        self.assertEqual("2026-09-20", PT._paper_runtime_owner_day(
+            PT._paper_runtime_owner_instant("2026-09-20 23:30:00", what="t"), what="t",
         ))
-        offset = PRF._paper_runtime_owner_instant("2026-09-20 09:30:00", what="t").utcoffset()
+        offset = PT._paper_runtime_owner_instant("2026-09-20 09:30:00", what="t").utcoffset()
         self.assertEqual(8 * 3600, int(offset.total_seconds()))
         # 非空性对照：同一堵墙钟若按 UTC 解释会落到**前一天** —— 说明这个断言有内容。
         conn = _paper_conn()
@@ -1065,7 +1065,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         for module, function in (
             ("adaptive_engine.py", "adaptive_run_fact"),
             ("adaptive_runtime_facts.py", "adaptive_run_fact"),
-            ("paper_runtime_facts.py", "paper_job_run_fact"),
+            ("paper_job_run_facts.py", "paper_job_run_fact"),
         ):
             identifiers, constants = _function_facts(module, function)
             with self.subTest(module=module, function=function):
@@ -1116,7 +1116,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         若让它变成 runtime owner fact，研究就能给自己签 factual verification（自引用回路）。
         可执行形式：两个 owner 与 adapter 都不得触达 canonical research ledger。
         """
-        for name in ("adaptive_engine.py", "paper_trading.py", "paper_runtime_facts.py", "ai_research_runtime_adapter.py"):
+        for name in ("adaptive_engine.py", "paper_trading.py", "ai_research_runtime_adapter.py"):
             roots = _imported_roots(name)
             for forbidden in ("ai_research_repository", "ai_research_provider",
                               "ai_research_service"):
@@ -1132,6 +1132,29 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
             "canonical_research_ledger",
             DR._latest_data_quality(_adaptive_conn()).get("source", "canonical_research_ledger"),
         )
+
+    def test_INC_23c_paper_job_run_fact_module_stays_a_read_only_owner_boundary(self):
+        """INC-23c：typed fact 读侧现在住在 ``paper_job_run_facts.py``，边界仍然可执行。
+
+        * 它**不得**反向 import ``paper_trading`` / ``main`` / ``adaptive_engine``
+          （composition 层）—— 依赖方向单向；
+        * 它**只读**：``paper_job_runs`` 的 lifecycle writer 仍然只有 ``paper_trading``
+          （``OWNER_BY_TABLE`` 不动，见 INC-03），读侧模块不得进任一 writer 扫描闭集；
+        * paper_trading 的 re-export facade 保持同一类型对象（精确类型判定 ``type(x) is``
+          依赖它）。
+        """
+        roots = _imported_roots("paper_job_run_facts.py")
+        for forbidden in ("paper_trading", "main", "adaptive_engine"):
+            self.assertNotIn(
+                forbidden, roots,
+                f"paper_job_run_facts.py import 了 {forbidden} —— 依赖方向被反转，"
+                "typed 读侧必须只依赖 stdlib",
+            )
+        self.assertNotIn("paper_job_run_facts.py", _literal_write_modules(PAPER_JOB_RUNS))
+        self.assertEqual([], _templated_write_statements("paper_job_run_facts.py"))
+        # 非空性 + facade 同一性：旧入口可达，且拿到的是同一个 owner 类型。
+        self.assertIs(PJF.PaperJobRunFactProjection, PT.PaperJobRunFactProjection)
+        self.assertTrue(callable(PT.paper_job_run_fact) and callable(PT.paper_job_run_facts))
 
     def test_INC_23b_adaptive_execution_evidence_status_is_not_typed_evidence(self):
         """INC-23b：``adaptive_execution_evidence.status`` 是**自由字符串** ⇒ OPEN PREREQUISITE。

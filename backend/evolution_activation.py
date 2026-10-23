@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from typing import Any, Optional
 
@@ -89,6 +90,11 @@ _LIFECYCLE_COLUMNS = (
     # 候选在**校验通过瞬间**封存的不可变指纹。激活前必须重新计算并比对，
     # 不一致即拒绝激活 —— "候选快照不可变"是 runtime invariant，不是约定。
     ("candidate_fingerprint", "TEXT"),
+    # 产出这条候选的 evolution_loop 代（NULL = 非 loop 路径，如人工/AI/策略调参）。
+    # 崩溃窗口的幂等键：``evolve()`` 内部会先 commit 候选行，若进程在把
+    # ``candidate_params_id`` 写回 ``evolution_loop_state`` 之前死掉，续跑会再跑一次
+    # mutate。以代号为唯一身份复用既有候选，才不会重复产候选。
+    ("loop_generation", "INTEGER"),
 )
 
 #: 读生命周期行时统一 SELECT 的列。
@@ -339,6 +345,12 @@ def _ensure_params_columns(conn) -> None:
     for name, sql_type in _LIFECYCLE_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE evolution_params ADD COLUMN {name} {sql_type}")
+    # 一个代最多产出一条候选。部分唯一索引是最后一道闸：即使两个进程同时
+    # 跑到 mutate，第二个 INSERT 也会被数据库拒绝，而不是悄悄多出一条候选。
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evolution_params_loop_generation "
+        "ON evolution_params(loop_generation) WHERE loop_generation IS NOT NULL"
+    )
 
 
 # ─── legacy bootstrap ───
@@ -580,6 +592,24 @@ def has_any_params(conn) -> bool:
 # ─── 确定性校验（不改变任何指针）───
 
 
+def _finite_number(value):
+    """把候选值收敛成有限 float；不可表示（NaN/Inf/超大整数）返回 ``None``。
+
+    为什么不用裸 ``float(value)``：Python 对 ``10**400`` 这类 int 会抛
+    ``OverflowError``。校验器的职责是**给出拒绝理由**（violation），不是把调用方
+    炸掉；否则一条畸形候选会让整轮自进化以异常收场，而不是被明确拒绝。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int) and value.bit_length() > 1024:
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _validate_params_payload(conn, params_id: int, scope: str) -> dict:
     """对一行参数做纯结构校验，返回 ``{valid, violations, detail}``。
 
@@ -617,10 +647,11 @@ def _validate_params_payload(conn, params_id: int, scope: str) -> dict:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             violations.append(f"{key} 必须是数值，实际 {type(value).__name__}")
             continue
-        if value != value or value in (float("inf"), float("-inf")):
+        finite = _finite_number(value)
+        if finite is None:
             violations.append(f"{key} 必须是有限数值")
             continue
-        if not (bounds["min"] - 1e-12 <= float(value) <= bounds["max"] + 1e-12):
+        if not (bounds["min"] - 1e-12 <= finite <= bounds["max"] + 1e-12):
             violations.append(
                 f"{key}={value} 超出全局边界 [{bounds['min']}, {bounds['max']}]"
             )
@@ -768,10 +799,14 @@ def create_candidate(conn, params: dict, *, strategy_id: Optional[str] = None,
                      source: str, reason: str, parent_id: Optional[int] = None,
                      performance_snapshot: Optional[dict] = None,
                      evidence_count: Optional[int] = None,
-                     validate: bool = True) -> dict:
+                     validate: bool = True,
+                     loop_generation: Optional[int] = None) -> dict:
     """持久化一个候选快照（不可变），可选立刻做确定性校验。
 
     绝不触碰 active 指针，也绝不触发任何与"生效"绑定的副作用。
+
+    ``loop_generation`` 是 evolution_loop 崩溃窗口的幂等键：非 loop 路径
+    （人工 / AI / 策略调参）保持 ``None``；同一代最多一条候选，由部分唯一索引兜底。
     """
     ensure_schema(conn)
     scope = scope_key(strategy_id)
@@ -783,12 +818,13 @@ def create_candidate(conn, params: dict, *, strategy_id: Optional[str] = None,
         """INSERT INTO evolution_params(
                version, params, source, reason, parent_id, performance_snapshot,
                created_at, strategy_id, validation_state, base_params_id,
-               evidence_count)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+               evidence_count, loop_generation)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
         (version, _json(params), source, reason, parent_id,
          _json(performance_snapshot) if performance_snapshot is not None else None,
          now, str(strategy_id) if strategy_id else None, STATE_CANDIDATE, base_id,
-         None if evidence_count is None else int(evidence_count)),
+         None if evidence_count is None else int(evidence_count),
+         None if loop_generation is None else int(loop_generation)),
     )
     params_id = int(cursor.lastrowid)
     _log_event(conn, LOG_CANDIDATE_CREATED, params_id, {

@@ -2,7 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPostJson, apiJson, getOperatorToken, setOperatorToken, clearOperatorToken } from "../core/api.js";
 import { $ } from "../core/dom.js";
-import { adaptiveEsc, riskText } from "../core/format.js";
+import { adaptiveEsc, adaptiveJsArg, riskText } from "../core/format.js";
 import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
@@ -178,27 +178,34 @@ export function renderSettings(data){
     var ais=ai.settings||{}, review=ai.review||{}, reviewSlots=review.slots||{}, slotOrder=review.slot_order||['ai1','ai2'], reviewMode=review.review_mode==='single'?'single':'dual';
     var aiSlotCards=slotOrder.map(function(slot){
       var s=reviewSlots[slot]||{}, enabled=!!s.enabled;
-      return '<div class="settings-panel" data-testid="ai-slot-'+slot+'" style="margin-top:14px;padding:14px">'
+      // slot 名义上是稳定 id（兜底前端常量 ai1/ai2），但实际来自后端 slot_order，
+      // 统一按不可信输入处理：inline handler 参数用 adaptiveJsArg 预计算。
+      var slotArg=adaptiveJsArg(slot);
+      // slot 来自后端 slot_order，进 data-testid / id / for / option value 前必须转义：
+      // 属性值里的引号可以另开属性，adaptiveJsArg 只保护 inline handler 的 JS 参数。
+      var slotAttr=adaptiveEsc(slot);
+      return '<div class="settings-panel" data-testid="ai-slot-'+slotAttr+'" style="margin-top:14px;padding:14px">'
         +'<h4>'+adaptiveEsc(s.display_name||slot)+' <small class="setting-help">'+adaptiveEsc(slot)+'</small></h4>'
         +'<div class="setting-row"><div class="setting-label"><b>配置状态</b><small>页面永不回显明文 Key；Key 留空表示保持现有值。</small></div>'
-        +'<div class="setting-control"><span data-testid="ai-slot-'+slot+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_displayName">显示名称</label><input data-testid="ai-slot-'+slot+'-display-name" id="aiSlot_'+slot+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="自定义名称，与稳定 id 解耦"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_baseUrl">Base URL</label><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="https://example.com/v1"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_model">模型名称</label><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" value="'+adaptiveEsc(s.model||'')+'" placeholder="由你填写，后端不做任何厂商假设"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_apiKey">API Key</label><input data-testid="ai-slot-'+slot+'-api-key" id="aiSlot_'+slot+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_timeout">超时（秒）</label><input data-testid="ai-slot-'+slot+'-timeout" id="aiSlot_'+slot+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div>'
-        +'<div class="setting-control"><label class="settings-exec-toggle"><input data-testid="ai-slot-'+slot+'-enabled" id="aiSlot_'+slot+'_enabled" type="checkbox"'+settingsChecked(enabled)+'><span>'+(enabled?'启用':'停用')+'</span></label></div>'
+        +'<div class="setting-control"><span data-testid="ai-slot-'+slotAttr+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slotAttr+'_displayName">显示名称</label><input data-testid="ai-slot-'+slotAttr+'-display-name" id="aiSlot_'+slotAttr+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="自定义名称，与稳定 id 解耦"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slotAttr+'_baseUrl">Base URL</label><input data-testid="ai-slot-'+slotAttr+'-base-url" id="aiSlot_'+slotAttr+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="https://example.com/v1"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slotAttr+'_model">模型名称</label><input data-testid="ai-slot-'+slotAttr+'-model" id="aiSlot_'+slotAttr+'_model" type="text" maxlength="100" value="'+adaptiveEsc(s.model||'')+'" placeholder="由你填写，后端不做任何厂商假设"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slotAttr+'_apiKey">API Key</label><input data-testid="ai-slot-'+slotAttr+'-api-key" id="aiSlot_'+slotAttr+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slotAttr+'_timeout">超时（秒）</label><input data-testid="ai-slot-'+slotAttr+'-timeout" id="aiSlot_'+slotAttr+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div>'
+        +'<div class="setting-control"><label class="settings-exec-toggle"><input data-testid="ai-slot-'+slotAttr+'-enabled" id="aiSlot_'+slotAttr+'_enabled" type="checkbox"'+settingsChecked(enabled)+'><span>'+(enabled?'启用':'停用')+'</span></label></div>'
         +'<div class="settings-actions">'
-        +'<button data-testid="ai-slot-'+slot+'-save" onclick="saveAiSlot(\''+slot+'\')">保存该槽位</button>'
-        +'<button class="ghost" data-testid="ai-slot-'+slot+'-test" onclick="testAiSlot(\''+slot+'\')">测试连接</button>'
-        +'<button class="ghost" data-testid="ai-slot-'+slot+'-clear" onclick="clearAiSlotKey(\''+slot+'\')">清除 Key</button>'
+        +'<button data-testid="ai-slot-'+slotAttr+'-save" onclick="saveAiSlot('+slotArg+')">保存该槽位</button>'
+        +'<button class="ghost" data-testid="ai-slot-'+slotAttr+'-test" onclick="testAiSlot('+slotArg+')">测试连接</button>'
+        +'<button class="ghost" data-testid="ai-slot-'+slotAttr+'-clear" onclick="clearAiSlotKey('+slotArg+')">清除 Key</button>'
         +'</div>'
-        +'<div class="setting-help" data-testid="ai-slot-'+slot+'-feedback"></div>'
+        +'<div class="setting-help" data-testid="ai-slot-'+slotAttr+'-feedback"></div>'
         +'</div>';
     }).join('');
     var singleSlotOptions=slotOrder.map(function(slot){
       var s=reviewSlots[slot]||{};
-      return '<option value="'+slot+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc((s.display_name||slot)+' · '+slot)+'</option>';
+      var slotAttr=adaptiveEsc(slot);
+      return '<option value="'+slotAttr+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc((s.display_name||slot)+' · '+slot)+'</option>';
     }).join('');
     html='<div class="settings-grid"><section class="settings-panel"><h3>AI 审核</h3>'
       +'<p>这里管理<strong>两个完全独立</strong>的 AI 槽位与审核模式。名称、地址、模型全部由你填写；后端不认识任何厂商身份，请求体是最小公共的 OpenAI 兼容格式。</p>'
@@ -323,7 +330,10 @@ export async function resetSettingsSection(section){
 // 全部走 /api/settings/ai-review*：GET 永不回显明文 Key，保存时空 Key = 保持旧 Key，
 // 清空必须显式走“清除 Key”按钮（后端 clear_api_key=true）。
 export function aiSlotFeedback(slot,message,tone){
-  var node=document.querySelector('[data-testid="ai-slot-'+slot+'-feedback"]');
+  // slot 来自后端 slot_order：拼进 CSS 属性选择器前去掉会破坏选择器的字符
+  // （引号/反斜杠/右方括号），否则 querySelector 会抛 SyntaxError。
+  var token=String(slot===null||slot===undefined?'':slot).replace(/["\\\]]/g,'');
+  var node=document.querySelector('[data-testid="ai-slot-'+token+'-feedback"]');
   if(!node) return;
   node.textContent=message||'';
   node.style.color=tone==='danger'?'var(--danger)':(tone==='ok'?'var(--up,#c0392b)':'');
@@ -373,7 +383,7 @@ export async function saveAiSlot(slot){
   });
   if(!answer.approved) return;
   try{
-    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
+    await apiJson('/api/settings/ai-review/slots/'+encodeURIComponent(slot)+'?confirmed=true','PUT',body);
     await loadSettings(true);
     toast('槽位 '+slot+' 已保存（页面仅显示掩码状态）。');
   }catch(e){
@@ -391,7 +401,7 @@ export async function clearAiSlotKey(slot){
   });
   if(!answer.approved) return;
   try{
-    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',{clear_api_key:true});
+    await apiJson('/api/settings/ai-review/slots/'+encodeURIComponent(slot)+'?confirmed=true','PUT',{clear_api_key:true});
     await loadSettings(true);
     toast('已清除槽位 '+slot+' 的 API Key。');
   }catch(e){toast('清除失败：'+((e&&e.message)||e), { tone: 'danger' });}
@@ -400,7 +410,7 @@ export async function clearAiSlotKey(slot){
 export async function testAiSlot(slot){
   aiSlotFeedback(slot,'正在测试连接…');
   try{
-    var result=await apiJson('/api/settings/ai-review/slots/'+slot+'/test?confirmed=true','POST');
+    var result=await apiJson('/api/settings/ai-review/slots/'+encodeURIComponent(slot)+'/test?confirmed=true','POST');
     if(result&&result.ok){
       aiSlotFeedback(slot,'连接正常 · '+Number(result.latency_ms||0)+' ms（模型 '+(result.model||'—')+'）','ok');
       toast('槽位 '+slot+' 连接正常。');

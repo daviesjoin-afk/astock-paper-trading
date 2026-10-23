@@ -423,27 +423,43 @@ def _backup_database(conn, path, current_version):
     return backup_path
 
 
+def _console(message):
+    """迁移日志输出：控制台编码失败时降级，**绝不因为打印而改变迁移结果**。
+
+    为什么不是普通 ``print``：Windows 默认控制台是 GBK/cp936，而本模块的日志含
+    ``✓`` / ``✗``。第 456 行的打印发生在 ``conn.commit()`` **之后** —— 编码异常会把
+    "已经提交成功"报成失败；第 459 行在 ``except`` 里、``raise`` 之前打印 —— 编码异常
+    会**替换掉真实异常**，运维看到的就只剩 UnicodeEncodeError。CI 跑在 UTF-8 的
+    Linux 上永远发现不了，而仓库明确支持 Windows（start.ps1 / schtasks 安装）。
+    """
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(message.encode(encoding, "backslashreplace").decode(encoding, "replace"))
+
+
 def migrate(db_name, apply=True, path=None, backup=True):
     if db_name not in DB_PATHS:
-        print(f"未知数据库: {db_name}")
+        _console(f"未知数据库: {db_name}")
         return
     path = path or DB_PATHS[db_name]
     if not os.path.exists(path):
-        print(f"数据库不存在（跳过）: {path}")
+        _console(f"数据库不存在（跳过）: {path}")
         return
     conn = sqlite3.connect(path, timeout=30)
     try:
         current = _current_version(conn, db_name)
         pending = [m for m in MIGRATIONS.get(db_name, []) if m[0] > current]
         if not pending:
-            print(f"[{db_name}] schema 已是最新 (v{current})")
+            _console(f"[{db_name}] schema 已是最新 (v{current})")
             return
         if apply and backup:
             backup_path = _backup_database(conn, path, current)
-            print(f"[{db_name}] ✓ 已创建迁移前备份: {backup_path}")
+            _console(f"[{db_name}] ✓ 已创建迁移前备份: {backup_path}")
         for version, desc, sql in sorted(pending, key=lambda x: x[0]):
             if not apply:
-                print(f"[{db_name}] 待应用 v{version}: {desc}")
+                _console(f"[{db_name}] 待应用 v{version}: {desc}")
                 continue
             try:
                 conn.execute("BEGIN")
@@ -453,10 +469,10 @@ def migrate(db_name, apply=True, path=None, backup=True):
                     (db_name, version, desc),
                 )
                 conn.commit()
-                print(f"[{db_name}] ✓ 已应用 v{version}: {desc}")
+                _console(f"[{db_name}] ✓ 已应用 v{version}: {desc}")
             except Exception as exc:
                 conn.rollback()
-                print(f"[{db_name}] ✗ v{version} 失败: {exc}（事务回滚）")
+                _console(f"[{db_name}] ✗ v{version} 失败: {exc}（事务回滚）")
                 raise
     finally:
         conn.close()

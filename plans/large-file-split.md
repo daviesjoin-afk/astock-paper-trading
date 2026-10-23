@@ -6,7 +6,7 @@
 
 ## 第一批范围
 
-- `paper_trading.py` → `paper_runtime_facts.py`：状态词表、不可变任务事实、时间/内容校验、按明确时点读取与分页。
+- `paper_trading.py` → `paper_job_run_facts.py`：状态词表、不可变任务事实、时间/内容校验、按明确时点读取与分页。
 - `ai_research_runtime_adapter.py`、`deepseek_research.py`：直接读取新模块，避免研究事实读取加载交易主文件。
 - 现有运行事实、分页、研究汇聚检查与故障注入：跟踪实际实现位置，保留所有拒绝条件。
 - 原有瘦身改动继续保留；本批不同时拆选股流程或成交编排。

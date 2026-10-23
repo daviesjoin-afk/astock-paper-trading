@@ -54,9 +54,13 @@ process.env.ASTOCK_E2E_STRIP_PROXY_PORT = String(STRIP_PROXY_PORT);
 
 export default defineConfig({
   testDir: "./e2e/specs",
-  // 每个 spec 文件串行，避免多个 worker 抢同一份临时账本；文件之间可并行。
+  // 全部 spec 串行：整个 run 共享**同一个** e2e 服务进程和同一份临时账本，
+  // 文件之间并行会互相污染（本地实测 22 个用例红，串行 38/38 绿）。
+  // 之前写的是 `workers: isCI ? 1 : undefined` —— 本地 undefined 等于"按 CPU 并行"，
+  // 与注释里的"每个 spec 文件串行"相反，本地跑出假红。要并行请显式设
+  // ASTOCK_E2E_WORKERS，并接受共享状态带来的不确定性。
   fullyParallel: false,
-  workers: isCI ? 1 : undefined,
+  workers: isCI ? 1 : Number(process.env.ASTOCK_E2E_WORKERS || 1),
   forbidOnly: isCI,
   retries: isCI ? 1 : 0,
   timeout: 60_000,

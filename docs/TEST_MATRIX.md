@@ -1153,3 +1153,18 @@ M-SEL1–M-SEL27 分别破坏 exact 证据读取、policy 身份、operational f
 objective 方向、metric 语义、Pareto 语义与 report 持久化。每例编译真实 mutant、运行对应
 detector、恢复原始字节并核对 SHA256，最后重跑基线。
 要求 detected=27/27，survived=fake=timeout=0。M-CRB / M-CEX / M-SC / M-G / M-X / M-AIG 继续独立运行。
+
+## 2026-10-20 对抗性审查新增门禁（自进化 / 三端同步 / 前端注入面）
+
+| 契约 | 实现位置 | 回归测试 | 状态 |
+| --- | --- | --- | --- |
+| paper runtime attempt typed fact 读侧仍是只读 owner 边界（INC-23c） | `backend/paper_job_run_facts.py`（writer 仍是 `paper_trading`，保留 re-export facade） | `test_runtime_incident_owner_facts`（INC-23c） | ✅ |
+| 崩溃窗口（阶段全落盘、终态 UPDATE 未提交）续跑只补终态，绝不重跑 observe/mutate/apply | `backend/evolution_loop.py`（`_run_generation` / `_find_pending`） | `test_evolution_loop_crash_recovery`（4 项） | ✅ |
+| 观察期门禁双证据：AB 快照 + 账户 params 中生效覆盖的 `applied_at`（当日第二次覆盖不得绕过） | `backend/evolution_validation.py::pre_apply_gate` | `test_evolution_validation_gate`（5 项） | ✅ |
+| Windows 注册器渲染契约 `retry_clocks`（独立任务名，不覆盖主任务） | `backend/paper_trading.py::install_windows_schedule` | `test_paper_schedule_contract.WindowsRegistrationFidelityGuard` | ✅ |
+| 调度状态发布探测口径：Windows=`schtasks`，Linux=`file_exists`（前端不把"文件存在"说成"已安装运行"） | `backend/paper_trading.py::schedule_status` + `frontend/src/features/paper.js::paperScheduleStatusLine` | `test_paper_schedule_contract.ScheduleStatusProbeTests`、`frontend/tests/paper-schedule-status.test.mjs` | ✅ |
+| mutate 崩溃窗口幂等：同一代最多一条候选（`loop_generation` 幂等键 + 部分唯一索引） | `backend/evolution_loop.py::ProductionBackend.mutate` + `backend/evolution_activation.py::create_candidate` | `test_evolution_loop_crash_recovery.MutateCrashWindowIdempotencyTests`（3 项） | ✅ |
+| 畸形数值（超大整数）是 violation 而不是 `OverflowError` | `backend/evolution_activation.py::_finite_number` | `test_evolution_activation_bounds`（2 项） | ✅ |
+| native-centos9 原生 profile 已退役（安装器只 fail-fast，文档不再宣称受支持） | `deploy/install-centos9.sh` + `docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_2026-10-20.md` | `test_repository_hygiene.NativeProfileRetirementTests`、`test_data_update_lease.test_native_installer_is_retired` | ✅ |
+| `deploy/` 不允许无人引用的孤儿文件 | `deploy/**`（fast-entry cron 已删除；swap/health-alert 已文档化） | `test_repository_hygiene.DeployArtifactReferenceTests` | ✅ |
+| innerHTML 转义 / inline handler JS 参数（`adaptiveJsArg`） | `frontend/src/core/format.js` + 各 feature 统一出口 | `frontend/tests/format-escaping.test.mjs`、`inline-handler-args.test.mjs`、`*-safety.test.mjs` | ✅ |

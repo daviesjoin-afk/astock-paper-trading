@@ -2849,7 +2849,9 @@ adapter 的源码里不出现 `paper_orders` / 非成交分布，且两个 typed
 
 ```text
 adaptive_engine   AdaptiveRunFactProjection    adaptive_run|<run_id>@<status>@<finished_at>
-paper_trading     PaperJobRunFactProjection    paper_job_run|<run_key>@<started_at>|<finished_at>
+paper_job_run_facts PaperJobRunFactProjection  paper_job_run|<run_key>@<started_at>|<finished_at>
+                   （typed 读侧 owner；writer 仍是 paper_trading，后者保留 re-export facade，
+                     INC-23c 钉住"读侧模块不得反向 import paper_trading/main/adaptive_engine"）
 ```
 
 核验闭集每家两态、两家**互不重叠**，且与 lifecycle 词表零交集：
@@ -2951,7 +2953,10 @@ dynamic  retention_maintenance（adaptive_runs 的 180 天裁剪，DELETE）
 #### 回归门禁（B2C-7）
 
 ```text
-backend/test_runtime_incident_owner_facts.py             INC-01 ~ INC-23（owner 侧）
+backend/test_runtime_incident_owner_facts.py             INC-01 ~ INC-23c（owner 侧）
+    （INC-23c：typed 读侧已搬到 ``paper_job_run_facts.py``，仍是只读边界——
+      不得反向 import paper_trading / main / adaptive_engine，不得进 writer 扫描闭集，
+      paper_trading 的 re-export facade 必须返回同一类型对象）
     字面 + 动态 writer 闭集与写入范围（含列占位符绑定词表）；
     lifecycle 词表与核验闭集零交集（两家各自、彼此、与 research 三态都查）；
     failed 与 completed 都是 owner-verified 的事实；completed 不是通用 verified 状态；
