@@ -6484,7 +6484,7 @@ def _quotes(codes, asof_date=None):
                 else:
                     now = dt.datetime.now(cross_time.tzinfo) if cross_time.tzinfo else dt.datetime.now()
                     cross_time_ok = -120 <= (now - cross_time).total_seconds() <= 20 * 60
-        cross_available = cross_price > 0 and bool(cross_at)
+        cross_available = cross_price > 0 and abs(cross_pct) <= 30 and bool(cross_at)
         # 2026-08-28：急涨急跌时两个行情源的固有滞后差会被放大，|pct|>=3%
         # 时容差放宽一倍，避免 V 型反转时刻系统性拒绝回补/开仓
         # （601212 回补因 0.27pp 被拒）。

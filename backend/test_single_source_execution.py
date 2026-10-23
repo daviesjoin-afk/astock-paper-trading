@@ -53,7 +53,8 @@ class SingleSourceExecutionTests(unittest.TestCase):
         self.assertTrue(decision.executable_now, decision.reasons)
 
     def test_valid_primary_survives_missing_or_stale_secondary(self):
-        for cross in ([], [{**self.quote, "quote_at": "2000-01-01T10:00:00+08:00"}]):
+        for cross in ([], [{**self.quote, "quote_at": "2000-01-01T10:00:00+08:00"}],
+                      [{**self.quote, "pct": float("nan")}], [{**self.quote, "pct": None}]):
             with self.subTest(cross=cross):
                 row = self.quotes([{**self.quote, "source": "eastmoney_ulist"}], cross)
                 self.assertEqual(row["quote_validation"], "range_timestamp_checked")
