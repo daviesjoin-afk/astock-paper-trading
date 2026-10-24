@@ -226,6 +226,22 @@ WPS_EXPRESS = """
   基本每股收益（元/股）              3.98              3.56              11.80
 """
 
+# 真实公告（泛亚微透 2026 前三季度业绩预告，截断）：区间里的千分位是**全角逗号**，
+# 同比写的是"下降"，且正文后段有「上年同期业绩情况」——三处都是取错数字的入口。
+FORECAST_FULLWIDTH_AND_DECLINE = """
+（1）经财务部门初步测算，预计 2026 年前三季度实现归属于母公司所有者的净利润为
+4，081.97 万元到 4,989.08 万元，与上年同期相比（法定披露数据），
+将减少 4,989.08 万元到 4,081.97 万元，同比下降 45.00%到 55.00%。
+
+（2）预计 2026 年前三季度实现归属于母公司所有者的扣除非经常性损益后净利润为
+3,861.97 万元至 4,769.08 万元，同比下降 46.36%到 56.56%。
+
+二、上年同期业绩情况
+
+归属于母公司所有者的净利润：9,071.05 万元。
+归属于母公司所有者的扣除非经常性损益的净利润：8,890.44 万元。
+"""
+
 # 表格式业绩预告：区间用 en dash（–）分隔，同比用"88.80% - 98.97%"这种带空格连字符。
 WULIANGYE_FORECAST = """
     一、本期业绩预计情况
@@ -392,6 +408,34 @@ class ForecastParsingTest(unittest.TestCase):
         self.assertEqual(figures.unit, "万元")
         # 上一期亏损 1,194,657.37 万元紧跟在区间后面，不得被当成区间上界。
         self.assertNotEqual(figures.high_wan, Decimal("1194657.37"))
+
+    def test_full_width_thousands_separator_is_a_number(self):
+        # "4，081.97 万元"（全角逗号）必须被当成数字。只认半角时第一个锚点匹配失败，
+        # 解析器会继续往后找，最终取到「上年同期业绩情况」里的 9,071.05 万元。
+        figures = EDF.parse_reported_figures(
+            EDF.ANNOUNCEMENT_KIND_FORECAST, FORECAST_FULLWIDTH_AND_DECLINE)
+        self.assertEqual(figures.low_wan, Decimal("4081.97"))
+        self.assertEqual(figures.high_wan, Decimal("4989.08"))
+        self.assertNotEqual(figures.low_wan, Decimal("9071.05"))
+
+    def test_decline_wording_becomes_a_signed_ascending_interval(self):
+        # "同比下降 45.00%到 55.00%" 的真实区间是 [-55%, -45%]。
+        # 按字面取正数会让一个声称"同比 +45%"的错误 claim 通过核验。
+        figures = EDF.parse_reported_figures(
+            EDF.ANNOUNCEMENT_KIND_FORECAST, FORECAST_FULLWIDTH_AND_DECLINE)
+        self.assertEqual(figures.yoy_low_pct, Decimal("-55.00"))
+        self.assertEqual(figures.yoy_high_pct, Decimal("-45.00"))
+        self.assertLessEqual(figures.yoy_low_pct, figures.yoy_high_pct)
+
+    def test_number_after_anchor_with_unknown_shape_fails_closed(self):
+        # 第一个锚点后面确实是数字，只是单位写法没被认出。此时继续往后找，
+        # 下一个"归母净利润"会落在上年同期那一段 —— 必须拒绝，不能静默换期间。
+        body = ("归属于母公司所有者的净利润 4,000 到 5,000\n"
+                "二、上年同期业绩情况\n"
+                "归属于母公司所有者的净利润：9,071.05 万元。\n")
+        with self.assertRaises(EDF.EarningsFactError) as ctx:
+            EDF.parse_reported_figures(EDF.ANNOUNCEMENT_KIND_FORECAST, body)
+        self.assertEqual(ctx.exception.reason, "unparsable_forecast")
 
     def test_en_dash_range_is_not_collapsed_to_a_single_value(self):
         figures = EDF.parse_reported_figures(EDF.ANNOUNCEMENT_KIND_FORECAST, WULIANGYE_FORECAST)

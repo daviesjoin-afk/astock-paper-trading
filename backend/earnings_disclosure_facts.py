@@ -315,7 +315,10 @@ _UNIT_FACTORS = (
 )
 
 _UNIT_PATTERN = "|".join(unit for unit, _ in _UNIT_FACTORS)
-_NUMBER_PATTERN = r"-?\d[\d,]*(?:\.\d+)?"
+#: 数字：千分位允许**半角与全角**逗号。真实公告里两种都出现
+#: （"4,081.97 万元" 与 "4，081.97 万元" 同时存在），只认半角会让第一个锚点匹配失败，
+#: 于是解析"跳过它继续找"——最终取到的是后面「上年同期业绩情况」那一段的数字。
+_NUMBER_PATTERN = r"-?\d[\d,\uFF0C]*(?:\.\d+)?"
 
 #: 归母净利润标签的**锚点**（只到"归属于X"为止），而不是完整标签。
 #:
@@ -386,11 +389,22 @@ def _looks_like_a_collapsed_range(tail: str) -> bool:
     if next_digit is None:
         return False
     return not re.search(r"[\u4e00-\u9fff]", tail[:next_digit.start()])
+
+
+#: 锚点之后**紧跟一个数**（可带"约/为/达到/亏损："前缀）。用于把"形状没认出来"
+#: 与"这里根本不是数值句"分开：前者必须 fail closed，后者才允许继续往后找。
+_ANCHOR_FOLLOWED_BY_NUMBER_RE = re.compile(
+    rf"^(?:约|为|达到)?(?:亏损|盈利)?[：:]?\s*{_NUMBER_PATTERN}"
+)
 _YOY_RE = re.compile(
-    rf"(?:比上年同期|同比|较上年同期)(?:增长|下降|减少|增加)?[：:]?\s*"
+    rf"(?:比上年同期|同比|较上年同期)(?P<direction>增长|下降|减少|增加)?[：:]?\s*"
     rf"(?P<low>-?\d+(?:\.\d+)?)\s*%"
     rf"(?:\s*{_RANGE_SEPARATOR_PATTERN}\s*(?P<high>-?\d+(?:\.\d+)?)\s*%)?"
 )
+#: 声明"负向"的措辞。公告写"同比下降 45%到 55%"时，公告正文里的 45/55 是**降幅**，
+#: 真实的同比区间是 ``[-55%, -45%]``。按字面取值会把方向搞反 —— 那会让一个声称
+#: "同比 +45%" 的错误 claim 通过核验。
+_YOY_NEGATIVE_DIRECTIONS = ("下降", "减少")
 _EXPRESS_UNIT_RE = re.compile(
     rf"单位\s*[：:]?\s*(?:人民币)?\s*(?P<unit>{_UNIT_PATTERN})"
 )
@@ -415,9 +429,32 @@ def _unit_factor(unit: str) -> Decimal:
 
 def _to_decimal(text: str) -> Decimal:
     try:
-        return Decimal(str(text).replace(",", ""))
+        return Decimal(str(text).replace(",", "").replace("\uFF0C", ""))
     except (InvalidOperation, ValueError) as exc:
         raise EarningsFactError("unparsable_amount", repr(text)) from exc
+
+
+def _yoy_interval(match: Any) -> tuple[Decimal, Decimal]:
+    """同比 → **带符号且升序**的区间 ``(low, high)``。
+
+    "同比下降 45%到 55%" 的降幅要变成 ``(-55, -45)``：不取符号会让方向反掉，
+    而且降幅区间的书写顺序天生是"先小后大"，取符号后必须重新排序才是区间。
+
+    正文里已经写成负数的（"下降：-85%～-65%"）不再二次取负 —— 那类写法本身
+    已经把符号写进去了，再乘一次就变成正增长。
+    """
+    direction = match.group("direction") or ""
+    sign = Decimal("-1") if direction in _YOY_NEGATIVE_DIRECTIONS else Decimal("1")
+    values: list[Decimal] = []
+    for group in ("low", "high"):
+        text = match.group(group)
+        if text is None:
+            continue
+        number = _to_decimal(text)
+        values.append(number * sign if number > 0 else number)
+    if len(values) == 1:
+        values.append(values[0])
+    return min(values), max(values)
 
 
 def _wan(amount: str, unit: str) -> Decimal:
@@ -512,6 +549,16 @@ def _parse_forecast(body: str) -> tuple[Decimal, Decimal, Decimal | None, Decima
         window = rest[:160]
         range_match = _FORECAST_RANGE_RE.match(window)
         if not range_match:
+            if _ANCHOR_FOLLOWED_BY_NUMBER_RE.match(window):
+                # 锚点后面**确实是一个数**，只是整体形状没被认出（少见的单位写法、
+                # 未登记的措辞…）。此时若继续往后找，下一个"归母净利润"多半已经落在
+                # 「上年同期业绩情况」那一段 —— 于是把上一个报告期的数字当本期。
+                # 真实案例：区间里的千分位是全角逗号（4，081.97 万元）时，第一个锚点
+                # 匹配失败，解析器悄悄取到了后面的 9,071.05 万元（上年同期值）。
+                raise EarningsFactError(
+                    "unparsable_forecast",
+                    f"锚点后出现数字但形状未识别：{window[:40]!r}",
+                )
             # "与上年同期相比，将增加 X 万元到 Y 万元"在语法上紧跟标签，但那说的是
             # **增加额**而不是净利润额。它匹配不上上面的"值在首位"形状，因此被跳过。
             continue
@@ -536,8 +583,7 @@ def _parse_forecast(body: str) -> tuple[Decimal, Decimal, Decimal | None, Decima
         yoy = _YOY_RE.search(window)
         yoy_low = yoy_high = None
         if yoy:
-            yoy_low = _to_decimal(yoy.group("low"))
-            yoy_high = _to_decimal(yoy.group("high")) if yoy.group("high") else yoy_low
+            yoy_low, yoy_high = _yoy_interval(yoy)
         return low, high, yoy_low, yoy_high, low_unit
     raise EarningsFactError(
         "unparsable_forecast", "正文中找不到『归母净利润 + 区间值』的形状",
