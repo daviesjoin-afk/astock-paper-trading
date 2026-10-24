@@ -51,6 +51,7 @@ market_data   evidence_ref_from_market_reading      （本模块；typed R24 rea
 execution     evidence_ref_from_execution_projection（ai_research_execution_adapter）
 portfolio     evidence_ref_from_portfolio_projection（ai_research_portfolio_adapter）
 news          evidence_ref_from_news_projection      （ai_research_news_adapter）
+disclosure    evidence_ref_from_earnings_projection  （ai_research_earnings_adapter）
 strategy_research evidence_ref_from_strategy_projection（ai_research_strategy_adapter）
 runtime_incident  evidence_ref_from_runtime_projection（ai_research_runtime_adapter）
 ```
@@ -88,12 +89,14 @@ __all__ = [
     # evidence source —— 事实来自哪一类 owner
     "EVIDENCE_SOURCE_MARKET_DATA", "EVIDENCE_SOURCE_SIGNAL", "EVIDENCE_SOURCE_EXECUTION",
     "EVIDENCE_SOURCE_STRATEGY_RESEARCH", "EVIDENCE_SOURCE_PORTFOLIO_RESEARCH",
-    "EVIDENCE_SOURCE_NEWS", "EVIDENCE_SOURCE_RUNTIME_INCIDENT",
+    "EVIDENCE_SOURCE_NEWS", "EVIDENCE_SOURCE_DISCLOSURE",
+    "EVIDENCE_SOURCE_RUNTIME_INCIDENT",
     "EVIDENCE_SOURCE_TYPES", "SUPPORTED_OWNER_ADAPTERS",
     # information event kind
     "EVENT_MARKET_OBSERVED", "EVENT_SIGNAL_OBSERVED", "EVENT_EXECUTION_OBSERVED",
     "EVENT_STRATEGY_RESEARCH_OBSERVED", "EVENT_PORTFOLIO_RESEARCH_OBSERVED",
-    "EVENT_NEWS_OBSERVED", "EVENT_RUNTIME_INCIDENT_OBSERVED", "EVENT_KINDS",
+    "EVENT_NEWS_OBSERVED", "EVENT_DISCLOSURE_OBSERVED",
+    "EVENT_RUNTIME_INCIDENT_OBSERVED", "EVENT_KINDS",
     # hypothesis relation —— 事实对 thesis 的关系（由 research 层显式声明）
     "RELATION_SUPPORTS", "RELATION_CONTRADICTS", "RELATION_CONTEXT", "RELATIONS",
     # hypothesis status —— research 专用，与 signal 生命周期无交集
@@ -133,13 +136,24 @@ EVIDENCE_SOURCE_NEWS = "news"
 #: close/D 的当前记录是 failed"）。它**不**承载事故严重级别、根因、处置建议 ——
 #: 那些是 research 结论（见各 owner 的 typed projection docstring）。
 EVIDENCE_SOURCE_RUNTIME_INCIDENT = "runtime_incident"
+#: 定期披露 / 业绩公告 owner 的事实（**R27-B2C-8 新增**）。
+#:
+#: 刻意**不复用** ``news``：两者是不同 authority，混用会让一份 adapter 同时为两种
+#: 核验语义负责 —— news 的 identity 是"抓到的一条报道"、核验问题只有"能不能追溯到
+#: 来源"；业绩公告的 identity 是「代码 + 报告期 + 公告类型 + 公告编号」、核验问题是
+#: "这几个数字是不是公告原文写的"。用 ``news`` 承载后者，等于让"有一条链接"冒充
+#: "数字已复算"，也让前者的三态闭集被第二种语义污染。
+#:
+#: 它**只**承载 owner 能自证的事实：这份公告在何时被系统首次观测到、按原文复算出的
+#: 数字是多少、是否已被修正公告取代。它**不**承载"会不会涨"、目标价、评级。
+EVIDENCE_SOURCE_DISCLOSURE = "disclosure"
 
 #: **刻意**是一个闭集：AI 的 hypothesis / narrative / LLM 输出不在其中。
 #: 于是"把 AI 自己生成的文本当成市场事实"在类型层面就无法表达。
 EVIDENCE_SOURCE_TYPES = (
     EVIDENCE_SOURCE_MARKET_DATA, EVIDENCE_SOURCE_SIGNAL, EVIDENCE_SOURCE_EXECUTION,
     EVIDENCE_SOURCE_STRATEGY_RESEARCH, EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
-    EVIDENCE_SOURCE_NEWS, EVIDENCE_SOURCE_RUNTIME_INCIDENT,
+    EVIDENCE_SOURCE_NEWS, EVIDENCE_SOURCE_DISCLOSURE, EVIDENCE_SOURCE_RUNTIME_INCIDENT,
 )
 
 #: 当前**真的**接好 typed projection 的 owner。其余是已声明的未来来源，
@@ -147,13 +161,14 @@ EVIDENCE_SOURCE_TYPES = (
 #:
 #: R27-B2C-3 起 ``execution`` 也在其中，R27-B2C-4B 起 ``portfolio_research`` 也在，
 #: R27-B2C-5 起 ``news`` 也在，R27-B2C-6 起 ``strategy_research`` 也在，
-#: R27-B2C-7 起 ``runtime_incident`` 也在。
+#: R27-B2C-7 起 ``runtime_incident`` 也在，R27-B2C-8 起 ``disclosure`` 也在。
 #: 这张表表示的是"研究层已经存在**批准的 owner adapter**"，**不是**"所有 public factory
 #: 都定义在本文件里"：execution 的 factory 住在 ``ai_research_execution_adapter``、
 #: portfolio/accounting 的住在 ``ai_research_portfolio_adapter``、news 的住在
 #: ``ai_research_news_adapter``、adaptive/experiment 的住在
 #: ``ai_research_strategy_adapter``、runtime/incident 的住在
-#: ``ai_research_runtime_adapter``（它们必须同时认识各自 owner 与 research 两套词表，而本契约
+#: ``ai_research_runtime_adapter``、disclosure 的住在
+#: ``ai_research_earnings_adapter``（它们必须同时认识各自 owner 与 research 两套词表，而本契约
 #: 刻意不 import 任何 owner 模块）。
 #: 本契约不需要、也不得 import 那些 adapter —— registry 是声明式的，一致性由
 #: ``test_ai_research_evidence_ownership_guard`` 双向强制。
@@ -162,6 +177,7 @@ SUPPORTED_OWNER_ADAPTERS = frozenset({
     EVIDENCE_SOURCE_EXECUTION,
     EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
     EVIDENCE_SOURCE_NEWS,
+    EVIDENCE_SOURCE_DISCLOSURE,
     EVIDENCE_SOURCE_STRATEGY_RESEARCH,
     EVIDENCE_SOURCE_RUNTIME_INCIDENT,
 })
@@ -176,11 +192,12 @@ EVENT_EXECUTION_OBSERVED = "execution_observed"
 EVENT_STRATEGY_RESEARCH_OBSERVED = "strategy_research_observed"
 EVENT_PORTFOLIO_RESEARCH_OBSERVED = "portfolio_research_observed"
 EVENT_NEWS_OBSERVED = "news_observed"
+EVENT_DISCLOSURE_OBSERVED = "disclosure_observed"
 EVENT_RUNTIME_INCIDENT_OBSERVED = "runtime_incident_observed"
 EVENT_KINDS = (
     EVENT_MARKET_OBSERVED, EVENT_SIGNAL_OBSERVED, EVENT_EXECUTION_OBSERVED,
     EVENT_STRATEGY_RESEARCH_OBSERVED, EVENT_PORTFOLIO_RESEARCH_OBSERVED,
-    EVENT_NEWS_OBSERVED, EVENT_RUNTIME_INCIDENT_OBSERVED,
+    EVENT_NEWS_OBSERVED, EVENT_DISCLOSURE_OBSERVED, EVENT_RUNTIME_INCIDENT_OBSERVED,
 )
 
 #: 唯一的 kind ↔ source_type 映射。``InformationEvent.kind`` 是派生只读属性，
@@ -193,6 +210,7 @@ _KIND_BY_SOURCE_TYPE = {
     EVIDENCE_SOURCE_STRATEGY_RESEARCH: EVENT_STRATEGY_RESEARCH_OBSERVED,
     EVIDENCE_SOURCE_PORTFOLIO_RESEARCH: EVENT_PORTFOLIO_RESEARCH_OBSERVED,
     EVIDENCE_SOURCE_NEWS: EVENT_NEWS_OBSERVED,
+    EVIDENCE_SOURCE_DISCLOSURE: EVENT_DISCLOSURE_OBSERVED,
     EVIDENCE_SOURCE_RUNTIME_INCIDENT: EVENT_RUNTIME_INCIDENT_OBSERVED,
 }
 
