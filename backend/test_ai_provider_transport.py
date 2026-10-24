@@ -1068,6 +1068,10 @@ PORTFOLIO_ADAPTER_MODULE = "ai_research_portfolio_adapter.py"
 #: 注意 news owner（``news_learning``）**本身**是 ingestion writer，允许在写路径联网，
 #: 因此它刻意**不**在这个网络闭集里 —— 被登记的是它的 typed 读接缝。
 NEWS_ADAPTER_MODULE = "ai_research_news_adapter.py"
+#: R27-B2C-8 的业绩公告 owner 接缝（**不是** authority；与另几份同构：只做词表归口）。
+#: 注意公告 owner（``earnings_disclosure_ledger``）是 DB-backed，且它的上游
+#: ``earnings_disclosure_facts`` 只做纯解析、不联网，因此被登记的是 typed 读接缝本身。
+EARNINGS_ADAPTER_MODULE = "ai_research_earnings_adapter.py"
 #: R27-B2C-6 的 adaptive / experiment owner 接缝（**不是** authority；与前三份同构：只做词表
 #: 归口，不联网、不碰 DB）。注意三个 owner（``adaptive_risk`` / ``adaptive_selection`` /
 #: ``learning_evaluation``）本身都是 DB-backed，因此它们**不**在这个网络闭集里 —— 被登记的
@@ -1094,6 +1098,7 @@ NETWORK_FREE_SEAMS = (
     EXECUTION_ADAPTER_MODULE,
     PORTFOLIO_ADAPTER_MODULE,
     NEWS_ADAPTER_MODULE,
+    EARNINGS_ADAPTER_MODULE,
     STRATEGY_ADAPTER_MODULE,
     RUNTIME_ADAPTER_MODULE,
 )
@@ -1202,6 +1207,7 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         """
         self.assertIn(PORTFOLIO_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
         self.assertIn(NEWS_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
+        self.assertIn(EARNINGS_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
         self.assertIn(STRATEGY_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
         self.assertIn(RUNTIME_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
 
@@ -1241,6 +1247,7 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                                               "ai_research_execution_adapter",
                                               "ai_research_portfolio_adapter",
                                               "ai_research_news_adapter",
+                                              "ai_research_earnings_adapter",
                                               "ai_research_strategy_adapter",
                                               "ai_research_runtime_adapter"):
                     offenders.append(f"{name}: import {imported}")
@@ -1283,7 +1290,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                     offenders.append(name)
         self.assertEqual(
             sorted(set(offenders)),
-            ["ai_analysis.py", "ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
+            ["ai_analysis.py", EARNINGS_ADAPTER_MODULE,
+             "ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
              "ai_research_portfolio_adapter.py", RESEARCH_MODULE, REPOSITORY_MODULE,
              RUNTIME_ADAPTER_MODULE, STRATEGY_ADAPTER_MODULE,
              "deepseek_advisor.py", "deepseek_research.py",
