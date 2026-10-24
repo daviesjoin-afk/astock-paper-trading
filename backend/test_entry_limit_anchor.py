@@ -38,6 +38,12 @@ WINDOW = PT.ENTRY_LIMIT_CHASE_WINDOW_MINUTES
 
 
 class PriceWaitAnchorTests(unittest.TestCase):
+    #: 固定参考时刻（周五下午，交易时段内）。所有单子时间戳与"等待了多久"都从它推导，
+    #: 因此用例与真实墙钟无关 —— 以前用 ``now - minutes_ago`` 造时间戳，本地时间在
+    #: 04:39 之前运行时会跨日，``substr(created_at,1,10)=当日`` 一条都查不到（CI 在
+    #: 2026-10-24 的本地 00:16 就是这样红的）。
+    REFERENCE = dt.datetime(2026, 10, 23, 14, 30, 0)
+
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
@@ -47,7 +53,7 @@ class PriceWaitAnchorTests(unittest.TestCase):
                    signal_id INTEGER, order_type TEXT, planned_price REAL,
                    status TEXT, created_at TEXT, risk_payload TEXT)"""
         )
-        self.today = dt.date.today()
+        self.today = self.REFERENCE.date()
         self.opportunity = PT._entry_opportunity(SIGNAL_ID, None)
         self.other_opportunity = PT._entry_opportunity(
             SIGNAL_ID, {"record": {"retrigger_seq": 1,
@@ -56,7 +62,7 @@ class PriceWaitAnchorTests(unittest.TestCase):
 
     def _order(self, *, minutes_ago, price, opportunity=None, wait_status=None,
                signal_id=SIGNAL_ID, order_type="limit", status="execution_retry"):
-        stamp = (dt.datetime.now() - dt.timedelta(minutes=minutes_ago)).strftime(
+        stamp = (self.REFERENCE - dt.timedelta(minutes=minutes_ago)).strftime(
             "%Y-%m-%d %H:%M:%S")
         payload = {}
         if wait_status is not None:
@@ -80,7 +86,8 @@ class PriceWaitAnchorTests(unittest.TestCase):
     def _resolve(self, opportunity=None):
         opportunity = opportunity or self.opportunity
         return PT._entry_price_wait(
-            self.conn, ACCOUNT, CODE, SIGNAL_ID, self.today, opportunity["id"])
+            self.conn, ACCOUNT, CODE, SIGNAL_ID, self.today, opportunity["id"],
+            reference_at=self.REFERENCE)
 
     # ---------- 第 1 条：只有价格等待才起锚 ----------
 
@@ -182,6 +189,25 @@ class PriceWaitAnchorTests(unittest.TestCase):
             self._resolve(self.other_opportunity),
             "状态机重触发后的新机会不得沿用上一机会的冻结限价",
         )
+
+    def test_wait_duration_follows_the_injected_reference_instant(self):
+        """``reference_at`` 必须真的决定等待时长（它是这段逻辑唯一的墙钟入口）。
+
+        这条同时是非空性证明：若 ``_entry_price_wait`` 忽略注入值改回读墙钟，两条断言
+        会同时失败，而不会因为"恰好今天也在交易时段"而假装通过。
+        """
+        self._order(minutes_ago=30, price=20.04, wait_status="waiting")
+        early = PT._entry_price_wait(
+            self.conn, ACCOUNT, CODE, SIGNAL_ID, self.today,
+            self.opportunity["id"],
+            reference_at=self.REFERENCE.isoformat(timespec="seconds"))
+        later = PT._entry_price_wait(
+            self.conn, ACCOUNT, CODE, SIGNAL_ID, self.today,
+            self.opportunity["id"],
+            reference_at=(self.REFERENCE + dt.timedelta(minutes=45)).isoformat(
+                timespec="seconds"))
+        self.assertAlmostEqual(30.0, early["waited_minutes"], places=6)
+        self.assertAlmostEqual(75.0, later["waited_minutes"], places=6)
 
     def test_other_signal_is_isolated(self):
         self._order(minutes_ago=5, price=20.04, wait_status="waiting",
