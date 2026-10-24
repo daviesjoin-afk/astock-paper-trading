@@ -3,4 +3,8 @@ uvicorn[standard]>=0.30,<1
 pandas>=2.2,<4
 numpy>=1.26,<3
 requests>=2.32,<3
+# certifi 是 requests 的传递依赖；
+# 显式给出安全下限：PYSEC-2026-4320 影响 2026.10.19 之前的版本（pip-audit --strict 在 CI 里是门禁）。
+# 抬高它只换 CA 证书包，不改变任何调用面。
+certifi>=2026.10.19
 chinese-calendar>=1.10,<2
