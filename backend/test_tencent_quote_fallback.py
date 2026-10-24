@@ -269,12 +269,21 @@ class SameSourceCrossCheckTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    @staticmethod
+    def _owner_now():
+        """报价时刻与业务日必须来自**同一套时钟**。
+
+        这里曾经用 ``dt.date.today()``（runner 的本地日期）配合 ``+08:00`` 的报价时刻：
+        CI 跑在 UTC，16:00 UTC 之后两者会跨日，报价被判成不新鲜，用例在**特定时段**必红
+        （2026-10-24 的 CI 就发生在 16:01 UTC）。业务日改成与报价同一时钟推导。
+        """
+        return dt.datetime.now(TZ)
+
     def test_tencent_primary_never_uses_tencent_as_cross_source(self):
         # The cross-source time gate accepts a live source instant; a fixed
         # stamp would fail on wall-clock freshness, not on source identity.
-        quote_at = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).isoformat(
-            timespec="seconds"
-        )
+        owner_now = self._owner_now()
+        quote_at = owner_now.isoformat(timespec="seconds")
         tencent_row = {
             "code": "600001", "price": 10.0, "pct": 1.0, "quote_at": quote_at,
             "source": "tencent_public_quote",
@@ -289,13 +298,14 @@ class SameSourceCrossCheckTests(unittest.TestCase):
                                   return_value=[tencent_row]), \
                 mock.patch.object(PT.dfc, "_fetch_sina_realtime_for_codes",
                                   return_value=[sina_row]) as sina:
-            row = PT._quotes(["600001"], asof_date=dt.date.today())["600001"]
+            row = PT._quotes(["600001"], asof_date=owner_now.date())["600001"]
         sina.assert_called_once_with(["600001"])
         self.assertEqual("sina_public_quote", row["quote_cross_check"]["source"])
         self.assertEqual("cross_source_checked", row["quote_validation"])
 
     def test_sina_failure_cannot_leave_a_tencent_self_check(self):
-        stamp = dt.datetime.now(TZ).isoformat(timespec="seconds")
+        owner_now = self._owner_now()
+        stamp = owner_now.isoformat(timespec="seconds")
         row = {"code":"600001", "price":10., "pct":1., "quote_at":stamp, "source":"tencent_public_quote"}
         for failure in ([], RuntimeError("offline"), [row]):
             with self.subTest(failure=type(failure).__name__), \
@@ -305,12 +315,13 @@ class SameSourceCrossCheckTests(unittest.TestCase):
                     mock.patch.object(PT.PLTrad,"prefetch",return_value={}), \
                     mock.patch.object(PT.dfc,"_fetch_sina_realtime_for_codes",
                                       **({"side_effect":failure} if isinstance(failure,Exception) else {"return_value":failure})):
-                actual=PT._quotes(["600001"],asof_date=dt.date.today())["600001"]
+                actual=PT._quotes(["600001"],asof_date=owner_now.date())["600001"]
             self.assertNotEqual("cross_source_checked",actual["quote_validation"])
             self.assertFalse(actual["quote_cross_check"]["passed"])
 
     def test_price_only_owner_can_supply_primary_but_requires_sina(self):
-        stamp=dt.datetime.now(TZ).isoformat(timespec="seconds")
+        owner_now = self._owner_now()
+        stamp=owner_now.isoformat(timespec="seconds")
         row={"code":"600001","price":10.,"pct":1.,"quote_at":stamp,"source":"tencent_public_quote"}
         missing_fields = ("industry", "pe", "vol_ratio", "amount", "volume", "turnover")
         row.update(dict.fromkeys(missing_fields))
@@ -328,7 +339,7 @@ class SameSourceCrossCheckTests(unittest.TestCase):
                 mock.patch.object(PT.dfc,"_fetch_sina_realtime_for_codes",return_value=[{**row,"source":"sina_public_quote"}]), \
                 mock.patch.object(PT.dfc,"enrich_live_flow_details",return_value={}), \
                 mock.patch.object(PT.PLTrad,"prefetch",return_value={}):
-            actual=PT._quotes(["600001"],asof_date=dt.date.today())["600001"]
+            actual=PT._quotes(["600001"],asof_date=owner_now.date())["600001"]
         self.assertEqual("cross_source_checked",actual["quote_validation"])
         self.assertEqual("price_only_full_market_snapshot",actual["primary_quote_origin"])
         for field in missing_fields:
