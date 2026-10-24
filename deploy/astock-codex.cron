@@ -118,3 +118,13 @@ HOME=/opt/astock-codex
 # 每日自动备份（2026-09-04 排查确认此前从未有备份任务；sqlite 在线备份不锁库）。
 # backup.sh 自带路径探测（/opt/astock-codex 或 /root/codex）与清单自校验。
 10 20 * * * root flock -n /opt/astock-codex/.locks/backup.lock /opt/astock-codex/deploy/backup.sh --keep 7 >>/opt/astock-codex/reports/backup.log 2>&1
+
+
+# ─── 业绩公告摄取（2026-10-24 起）────────────────────────────────────────────
+# 业绩预告 / 业绩快报 / 修正公告：抓原文 → owner 按原文复算归母净利润 → 落
+# data_cache/earnings_disclosure.sqlite。落库前必须拿到原文，拿不到就只计数、下一轮补。
+# 08:40–22:40 每 2 小时一轮，刻意**不跳过非交易日**（周末与节假日同样有业绩公告披露）。
+# 刻意错开 20:10 的备份与 17:25/17:55/08:50 的选股任务；轻量任务（秒级到两分钟、无重计算），
+# 因此用 -n 独立锁而不是 resource-heavy.lock：撞上就跳过这一轮，下一轮幂等补齐
+# （同一 art_code 只落一行，first_seen_at 不会被刷新）。
+40 8-22/2 * * * root flock -n /opt/astock-codex/.locks/earnings.lock docker exec astock-data-worker python backend/earnings_disclosure_runner.py --days 2 >>/opt/astock-codex/reports/earnings-disclosure.log 2>&1

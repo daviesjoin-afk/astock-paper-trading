@@ -28,7 +28,7 @@ mkdir -p "$DEST"
 # 1. SQLite 在线备份（宿主机直连 data_cache 文件，.backup 保证一致性）。
 #    账本体积大（paper_trading 2G+、adaptive 700M+），gzip 压缩后落盘，
 #    否则 keep 7 的日备份会在一周内占满整块磁盘。
-for DB in paper_trading.sqlite3 adaptive_learning.sqlite3 paper_research.sqlite3 selection_tracking.db; do
+for DB in paper_trading.sqlite3 adaptive_learning.sqlite3 paper_research.sqlite3 selection_tracking.db earnings_disclosure.sqlite; do
   if [[ -f "$PROJECT_DIR/data_cache/$DB" ]]; then
     sqlite3 "$PROJECT_DIR/data_cache/$DB" ".backup '$DEST/$DB'"
     gzip -f "$DEST/$DB"
