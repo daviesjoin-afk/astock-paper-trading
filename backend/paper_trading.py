@@ -9020,7 +9020,8 @@ def _next_price_wait_marker(*, opportunity, outcome, limit_price, deferred, now)
     }
 
 
-def _entry_price_wait(conn, account_id, code, signal_id, asof_day, opportunity_id):
+def _entry_price_wait(conn, account_id, code, signal_id, asof_day, opportunity_id,
+                      *, reference_at=None):
     """该入场机会的**价格等待**锚点；``None`` 表示当前没有生效的价格等待。
 
     锚点、等待时长和失效状态只来自真正"其他条件均已满足、仅因价格未到"
@@ -9033,6 +9034,11 @@ def _entry_price_wait(conn, account_id, code, signal_id, asof_day, opportunity_i
         ``anchor_price`` 冻结限价（只降不升）、``waited_minutes`` 从该机会
         第一次价格等待起算的等待时长、``expired`` 该机会是否已经到期失效、
         ``started_at``/``expired_at`` 供审计回溯。
+
+    ``reference_at`` 是"当前时刻"的**显式注入点**（默认 ``None`` = 用墙钟），
+    与 ``_quote_is_fresh(..., reference_at=...)`` 同一手法。生产调用不传它；
+    测试必须传，否则「等待了多久」会随运行时刻漂移 —— 例如 ``now - 279 分钟``
+    在本地午夜之后会跨日，于是 ``substr(created_at,1,10)=当日`` 一条都查不到。
     """
     if signal_id is None or opportunity_id is None:
         return None
@@ -9056,7 +9062,9 @@ def _entry_price_wait(conn, account_id, code, signal_id, asof_day, opportunity_i
         return None
     first = rows[0]
     try:
-        waited = (dt.datetime.now() - dt.datetime.fromisoformat(
+        reference = (dt.datetime.now() if reference_at is None
+                     else dt.datetime.fromisoformat(str(reference_at)))
+        waited = (reference - dt.datetime.fromisoformat(
             str(first["created_at"]))).total_seconds() / 60
     except (TypeError, ValueError):
         waited = None
