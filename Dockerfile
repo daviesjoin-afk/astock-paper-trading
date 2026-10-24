@@ -36,6 +36,13 @@ COPY --chown=app:app frontend ./frontend
 # assets/ mirrors and app.min.* duplicates are gone — no byte-alignment step
 # needed here anymore.
 COPY --chown=app:app deploy ./deploy
+# docker-smoke 在镜像里跑整套后端回归，其中有仓库级文档守卫
+# （``test_repository_hygiene`` 要读 README.md / CONTRIBUTING.md /
+# ``docs/archive/NATIVE_CENTOS9_PROFILE_RETIREMENT_*.md`` / ``docs/archive/README.md``）。
+# 只拷 backend/frontend/deploy 时这些守卫在容器内必然 FileNotFoundError，
+# 于是"镜像自带的测试套件"与实际内容不一致。文档总共不到 1MB，直接带上。
+COPY --chown=app:app *.md LICENSE ./
+COPY --chown=app:app docs ./docs
 
 USER app
 EXPOSE 8600
