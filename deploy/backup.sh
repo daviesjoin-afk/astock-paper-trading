@@ -60,7 +60,7 @@ print("engine=container sqlite=" + sqlite3.sqlite_version)' \
   echo "engine=host sqlite=$(sqlite3 --version 2>/dev/null | cut -d' ' -f1)"
 }
 
-for DB in paper_trading.sqlite3 adaptive_learning.sqlite3 paper_research.sqlite3 selection_tracking.db; do
+for DB in paper_trading.sqlite3 adaptive_learning.sqlite3 paper_research.sqlite3 selection_tracking.db earnings_disclosure.sqlite; do
   if [[ -f "$PROJECT_DIR/data_cache/$DB" ]]; then
     backup_one_db "$PROJECT_DIR/data_cache/$DB" "$DEST/$DB"
     gzip -f "$DEST/$DB"

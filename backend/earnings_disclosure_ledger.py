@@ -79,6 +79,7 @@ __all__ = (
     "ClaimCheckRecord",
     "EarningsEventProjection",
     "ensure_schema",
+    "owner_instant",
     "record_announcement",
     "record_claim_check",
     "earnings_event_projections",
@@ -172,6 +173,16 @@ def _parse_observed_at(value: Any) -> dt.datetime:
 
 def _format_instant(value: dt.datetime) -> str:
     return value.astimezone(TZ).isoformat(timespec="seconds")
+
+
+def owner_instant(value: Any) -> dt.datetime:
+    """公开的时区归一边界：把**调用方给的观测时刻**归到 owner 日历。
+
+    摄取侧必须与 owner 用**同一套**归一，否则 ``first_seen_at`` 会带两种日历语义 ——
+    一个是 ``+08:00`` 的日末边界，一个是随手写的本地时刻。刻意只暴露一个函数，
+    不暴露"格式化"：格式由 owner 自己写库时决定（``+08:00`` + 秒精度）。
+    """
+    return _parse_observed_at(value)
 
 
 def _as_of_boundary(value: Any) -> dt.datetime:

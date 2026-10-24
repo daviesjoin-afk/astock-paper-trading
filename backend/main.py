@@ -36,6 +36,7 @@ from api_paper import (portfolio_allocation_router, portfolio_runtime_router,
                        portfolio_workspace_router, risk_refresh_status,
                        router as paper_router)
 from api_adaptive import router as adaptive_router
+from api_earnings import router as earnings_router
 from api_settings import router as settings_router
 import api_strategies as strategies_api
 from api_strategies import router as strategies_router
@@ -558,6 +559,7 @@ app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)
 app.include_router(retirement_workflow_router)
+app.include_router(earnings_router)
 
 
 # ─── PR-2：HTTP 操作员安全边界（Operator Security Boundary）───────────────
