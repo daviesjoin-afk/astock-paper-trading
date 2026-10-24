@@ -130,17 +130,31 @@ def daily_report(conn: sqlite3.Connection, asof: str | None = None) -> tuple[str
 
 
 def weekly_report(conn: sqlite3.Connection, asof: str | None = None) -> tuple[str, str]:
-    """本周（截至 asof）各账户净值变化与超额。"""
+    """本周（截至 asof）各账户净值变化与超额。
+
+    基准取"**窗口开始前最后一个净值日**"，而不是窗口内的第一天。窗口是 ``asof - 6 天 ~ asof``，
+    默认周五出报时它就落在周六~周五，窗口内第一个净值日是**周一收盘** —— 拿它当分母会把周一
+    的涨跌整体漏掉（周五 100 → 周一 110 → 周五仍是 110，会被报成 +0% 而不是 +10%）。
+
+    窗口上界同样必须卡在 ``asof``：净值表里可能已经有更晚的日期，报告标题写的是"截至 asof"，
+    就不能拿 asof 之后的净值当收盘。
+    """
     today = dt.date.fromisoformat(asof) if asof else dt.datetime.now(TZ).date()
     start = (today - dt.timedelta(days=6)).isoformat()
     end = today.isoformat()
-    rows = _nav_rows(conn, since=start)
+    rows = _nav_rows(conn)
     by_account: dict[str, list] = {}
     for row in rows:
         by_account.setdefault(row["account_id"], []).append(row)
     stats = []
     for account_id, series in by_account.items():
-        first, last = series[0], series[-1]
+        window = [row for row in series if start <= row["nav_date"] <= end]
+        if not window:
+            continue
+        baseline = next(
+            (row for row in reversed(series) if row["nav_date"] < start), None,
+        )
+        first, last = baseline or window[0], window[-1]
         first_nav = float(first["nav"] or 0.0)
         last_nav = float(last["nav"] or 0.0)
         change = (last_nav / first_nav - 1.0) * 100.0 if first_nav else None
