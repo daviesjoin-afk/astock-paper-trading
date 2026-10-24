@@ -120,6 +120,46 @@ class ReportContentTests(unittest.TestCase):
         self.assertIn("+5.00%", content)
         self.assertIn("本周成交合计 1 笔", content)
 
+    def test_weekly_report_measures_from_the_close_before_the_window(self):
+        # 周五出报：窗口是上周六~本周五，窗口内第一个净值日是周一。
+        # 若拿周一收盘当分母，周一的 +10% 会被整段漏掉（报成 +0.00%）。
+        conn = _paper_db()
+        conn.executescript(
+            """
+            INSERT INTO paper_nav VALUES('acct','2026-10-09',100.0,4000.0);
+            INSERT INTO paper_nav VALUES('acct','2026-10-12',110.0,4040.0);
+            INSERT INTO paper_nav VALUES('acct','2026-10-16',110.0,4080.0);
+            """
+        )
+        _, content = NOTIFY.weekly_report(conn, "2026-10-16")
+        self.assertIn("+10.00%", content)
+        self.assertNotIn("+0.00%", content)
+
+    def test_weekly_report_does_not_use_nav_rows_after_the_as_of_day(self):
+        # 净值表里可能已经有 asof 之后的行：报告写的是"截至 asof"，不能拿它当收盘。
+        conn = _paper_db()
+        conn.executescript(
+            """
+            INSERT INTO paper_nav VALUES('acct','2026-10-09',100.0,4000.0);
+            INSERT INTO paper_nav VALUES('acct','2026-10-16',120.0,4400.0);
+            INSERT INTO paper_nav VALUES('acct','2026-10-19',200.0,4800.0);
+            """
+        )
+        _, content = NOTIFY.weekly_report(conn, "2026-10-16")
+        self.assertIn("+20.00%", content)
+
+    def test_weekly_report_without_a_prior_close_starts_from_the_window(self):
+        # 账户本周才有第一条净值：没有窗口前基准，退回窗口内第一天且不报错。
+        conn = _paper_db()
+        conn.executescript(
+            """
+            INSERT INTO paper_nav VALUES('acct','2026-10-12',100.0,4000.0);
+            INSERT INTO paper_nav VALUES('acct','2026-10-16',105.0,4040.0);
+            """
+        )
+        _, content = NOTIFY.weekly_report(conn, "2026-10-16")
+        self.assertIn("+5.00%", content)
+
 
 class DispatchTests(unittest.TestCase):
     def _settings(self, **overrides):
