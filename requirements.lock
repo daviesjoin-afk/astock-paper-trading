@@ -8,8 +8,10 @@ anyio==4.15.1
     # via
     #   starlette
     #   watchfiles
-certifi==2026.10.19
-    # via requests
+certifi==2026.10.23
+    # via
+    #   -r requirements.txt
+    #   requests
 charset-normalizer==3.5.1
     # via requests
 chinese-calendar==1.11.0
