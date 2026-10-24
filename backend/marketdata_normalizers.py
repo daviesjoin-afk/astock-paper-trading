@@ -46,6 +46,26 @@ def quote_at(value):
     return dt.datetime.fromtimestamp(value, china_tz).isoformat(timespec="seconds")
 
 
+def source_quote_is_fresh(row, *, now=None, max_age_seconds=1200):
+    """Reject invalid or stale provider rows before choosing a fallback source."""
+    price, pct = finite_number(row.get("price")), finite_number(row.get("pct"))
+    if (isinstance(row.get("price"), bool) or isinstance(row.get("pct"), bool)
+            or price is None or price <= 0 or pct is None or abs(pct) > 30):
+        return False
+    zone = dt.timezone(dt.timedelta(hours=8))
+    instant = now or dt.datetime.now(zone)
+    instant = instant.replace(tzinfo=zone) if instant.tzinfo is None else instant.astimezone(zone)
+    text = str(row.get("quote_at") or "").strip()
+    try:
+        stamp = (dt.datetime.strptime(text, "%Y%m%d%H%M%S")
+                 if text.isdigit() and len(text) == 14 else
+                 dt.datetime.fromisoformat(text.replace("Z", "+00:00")))
+        stamp = stamp.replace(tzinfo=zone) if stamp.tzinfo is None else stamp.astimezone(zone)
+        return stamp.date() == instant.date() and -120 <= (instant - stamp).total_seconds() <= max_age_seconds
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
 _CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
 
 

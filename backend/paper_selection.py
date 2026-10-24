@@ -760,4 +760,10 @@ def latest(trade_date: str | None = None, strategy_id: str = "") -> dict:
         })
     strategies.sort(key=lambda item: (item.get("strategy_no") or 0,
                                       item.get("run_id") or 0))
-    return {"found": True, "trade_date": day, "strategies": strategies}
+    # 已核验的业绩公告事实只作**参考依据**附在结果旁边：不筛选、不排序、不否决。
+    # 局部 import 是为了让选股写入路径不依赖公告库（读路径才需要它）。
+    import selection_disclosure_reference as SDR
+    codes = [pick.get("code") for item in strategies
+             for pick in (item.get("picks") or [])]
+    return {"found": True, "trade_date": day, "strategies": strategies,
+            "disclosure_references": SDR.references_for_codes(codes, as_of=day)}

@@ -275,6 +275,47 @@ class SentimentPioneerIndividualMomentumTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# D2. 板块情绪高潮禁入不得被 individual_bonus 复活
+# --------------------------------------------------------------------------
+class SectorClimaxExclusionTests(unittest.TestCase):
+    """``SECTOR_CLIMAX_MOM5`` 的排除必须发生在全部策略加分之后。
+
+    ``-990`` 哨兵恰好等于 picks 的过滤线，而 ``individual_bonus`` 是 +0.28。
+    若 mask 施加在加分之前，高潮板块的个股会得到 ``-989.72`` 并重新通过
+    ``score > -990``，让「高潮板块整体排除」这条规则静默失效。
+    """
+
+    def _row(self, industry, mom5_raw):
+        return _base_row(
+            industry=industry,
+            pct=5.0,                 # individual_pct_min/max = 3.5~8.5
+            flow=1.0,                # >= individual_flow_min = 0.65
+            vol_surge_raw=2.0,       # >= individual_vol_surge_min = 1.20
+            sentiment=0.0,           # >= sentiment_min = -0.5
+            mom5_raw=mom5_raw,
+            mom20_raw=0.0,
+        )
+
+    def _run(self, industry, mom5_raw):
+        table = _table([self._row(industry, mom5_raw)])
+        return S.run_strategy("sentiment_pioneer", table, topn=5, gate=None,
+                              first_board_codes=None)
+
+    def test_climax_sector_candidate_cannot_return_through_individual_bonus(self):
+        # 板块均值 +10% 越过 SECTOR_CLIMAX_MOM5(0.08)，且该行同时满足
+        # individual_strong 的全部条件——这是唯一能把它加回过滤线以上的路径。
+        result = self._run("高潮板块", 0.10)
+        self.assertEqual(0, result["count"])
+        self.assertEqual([], result["picks"])
+
+    def test_below_climax_sector_still_produces_candidate(self):
+        # 对照：同样满足 individual_strong，但板块均值 +3% 未越线，必须保留。
+        result = self._run("正常板块", 0.03)
+        self.assertEqual(1, result["count"])
+        self.assertEqual("individual_strong", result["picks"][0]["entry_path"])
+
+
+# --------------------------------------------------------------------------
 # E. 既有正确的 fraction 阈值必须保持不变
 # --------------------------------------------------------------------------
 class ExistingFractionThresholdTests(unittest.TestCase):

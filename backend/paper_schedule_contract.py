@@ -49,7 +49,9 @@ RUN_SLOTS: tuple[str, ...] = (
 #: ``monitor_fast_entries()`` directly and never reaches ``run_slot``, so it is
 #: intentionally **absent** from :data:`RUN_SLOTS`: accepting it in
 #: ``validate_slot`` would imply a dispatch path that does not exist.
-RUNNER_ONLY_SLOTS: tuple[str, ...] = ("fast-entry",)
+#: ``auction-track`` is a scheduled observation-only branch with its own
+#: bounded JSON artifacts; it never enters ledger preflight or run_slot.
+RUNNER_ONLY_SLOTS: tuple[str, ...] = ("fast-entry", "auction-track")
 
 #: Everything a runner may be asked to execute.
 RUNNER_SLOTS: tuple[str, ...] = RUN_SLOTS + RUNNER_ONLY_SLOTS
@@ -57,7 +59,7 @@ RUNNER_SLOTS: tuple[str, ...] = RUN_SLOTS + RUNNER_ONLY_SLOTS
 #: Slots whose lease TTL and lock retry policy assume a short, latency-sensitive
 #: pass.  Mirrors ``paper_trading.HOT_PATH_SLOTS``.
 HOT_PATH_SLOTS: frozenset[str] = frozenset(
-    {"auction", "open", "risk", "intraday", "fast-entry"}
+    {"auction", "open", "risk", "intraday", "fast-entry", "auction-track"}
 )
 
 #: Legacy validation message.  Preserved verbatim: callers and tests assert on
@@ -89,6 +91,15 @@ class ScheduleTask:
     ``retry_clocks`` lists additional one-shot times at which the same slot is
     retried; ``run_slot`` is idempotent for a completed run, so a retry that
     arrives after success is a cheap no-op rather than a duplicate scan.
+
+    ``close`` carries five retries because its failures are not all alike: an
+    interrupted process needs one early retry (15:10/15:12), while "完整日线覆盖
+    不足" is a *data-not-ready* verdict that only a later window can clear.
+    ``universe.refresh_history`` is bounded to 420 seconds and resumes from a
+    persisted cursor, so the 15:25/15:40/16:00 entries are the incremental
+    continuation those later windows exist for.  Each attempt still runs the same
+    fail-closed coverage gate — a late window never marks partial history as
+    success.
     """
 
     name: str
@@ -115,6 +126,8 @@ class ScheduleTask:
 #: used to exist only as a comment in the cron file; recording the absence here
 #: makes it an explicit, testable property of the contract.
 SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
+    ScheduleTask("A股模拟盘-竞价跟踪", "09:15", "auction-track", _WEEKDAY_DAYS,
+                 repeat="00:12"),
     ScheduleTask("A股模拟盘-竞价预选", "09:25", "auction", _WEEKDAY_DAYS,
                  retry_clocks=("09:27", "09:29")),
     ScheduleTask("A股模拟盘-日内监控-上午", "09:30", "intraday", _WEEKDAY_DAYS,
@@ -124,7 +137,7 @@ SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
     ScheduleTask("A股模拟盘-开盘审批", "09:31", "open", _WEEKDAY_DAYS,
                  retry_clocks=("09:33", "09:35")),
     ScheduleTask("A股模拟盘-盘后评分", "15:05", "close", _WEEKDAY_DAYS,
-                 retry_clocks=("15:10", "15:12")),
+                 retry_clocks=("15:10", "15:12", "15:25", "15:40", "16:00")),
     ScheduleTask("A股模拟盘-周度复盘", "15:20", "weekly-review", "FRI"),
 )
 
@@ -152,6 +165,9 @@ INTRADAY_WINDOWS: tuple[tuple[str, str], ...] = (
 #: Intraday scan cadence in minutes.  Both platforms repeat the intraday task at
 #: this interval; the cron renderer turns it into ``*/N`` minute expressions.
 INTRADAY_INTERVAL_MINUTES = 3
+
+# 09:15、09:18、09:21、09:24 只观测；09:25 仍由原竞价预选负责。
+AUCTION_TRACKING_CRON_MINUTES = "15-24/3"
 
 #: Per-hour cron minute fields for the intraday scan, keyed by hour.
 #:
@@ -189,6 +205,9 @@ def render_cron_lines() -> list[str]:
     emitted_intraday = False
     for task in SCHEDULE_TASKS:
         dow = "1-5" if task.days == _WEEKDAY_DAYS else "5"
+        if task.slot == "auction-track":
+            lines.append(f"{AUCTION_TRACKING_CRON_MINUTES} 9 * * {dow} run_paper_slot.sh auction-track")
+            continue
         for _, clock in task.entries():
             if task.repeat:
                 continue

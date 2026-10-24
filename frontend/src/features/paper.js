@@ -2,7 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, chart, tableScroll } from "../core/dom.js";
-import { adaptiveEsc, cny, fmt, paperStatusTag, pctCls, pctTxt, riskText, zhRiskText } from "../core/format.js";
+import { adaptiveEsc, adaptiveJsArg, cny, fmt, fmtPct, paperStatusTag, pctCls, pctTxt, riskText, shortStamp, zhRiskText } from "../core/format.js";
 import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 import { loadPaperAudit } from "./risk.js";
@@ -109,13 +109,6 @@ export async function resetPaper(){
   if(!resetAnswer.approved) return;
   try{ await apiPost('/api/paper/reset?capital='+encodeURIComponent(capital)); await loadPaper({force:true}); }
   catch(e){ paperNotice('重置失败：'+e.message); }
-}
-
-export async function setPaperStyle(accountId, style){
-  try{
-    await apiPost('/api/paper/style?account_id='+encodeURIComponent(accountId)+'&style='+encodeURIComponent(style));
-    await loadPaper({force:true});
-  }catch(e){ paperNotice('风格切换失败：'+e.message); }
 }
 
 export async function runPaperNow(slot){
@@ -373,11 +366,11 @@ export var PAPER_MARKET_REASON_LABELS={
 export function paperMarketDataHtml(md){
   md=md||{};
   var status=String(md.status||'unavailable');
-  var label=PAPER_MARKET_STATUS_LABELS[status]||status;
+  var label=PAPER_MARKET_STATUS_LABELS[status]||('未知状态（'+status+'）');
   var tone=(status==='fresh')?'tag-ok':(status==='unavailable'?'tag-warn':'tag-warn');
   var parts=[];
   if(md.as_of||md.observed_at) parts.push('最后可信时间 '+riskText(md.observed_at||md.as_of));
-  var reason=md.reason?(PAPER_MARKET_REASON_LABELS[md.reason]||md.reason):'';
+  var reason=md.reason?(PAPER_MARKET_REASON_LABELS[md.reason]||('未知原因（'+md.reason+'）')):'';
   if(reason) parts.push('原因：'+reason);
   if(md.verification&&md.verification!=='verified') parts.push('核验 '+riskText(md.verification));
   return '<div data-testid="paper-market-data-status" data-market-status="'+adaptiveEsc(status)+'">'
@@ -407,7 +400,23 @@ export async function loadPaperStrategyCenter(){
     var d={allocation:results[0]||{},registry:results[1]||{},boundaries:results[2]||{}};
     window._paperStrategyCenterCache={data:d,at:Date.now()};
     renderPaperStrategyCenter(d);
-  }catch(e){ if(!cached) target.innerHTML='<div class="banner">运行策略读取失败：'+riskText(e.message||e)+'</div>'; }
+  }catch(e){
+    var message=riskText(e.message||e);
+    if(!cached){
+      target.innerHTML='<div class="banner">运行策略读取失败：'+message+'</div>';
+    }else{
+      // 有缓存时保留旧数据，但必须让操作员知道这份数据这次没刷新成功，
+      // 否则过期数据会被当成最新状态读取。
+      var stale=document.getElementById('paperStrategyCenterStale');
+      if(!stale){
+        stale=document.createElement('div');
+        stale.id='paperStrategyCenterStale';
+        stale.className='banner';
+        target.insertBefore(stale,target.firstChild);
+      }
+      stale.textContent='运行策略刷新失败，以下为上次读取的数据：'+message;
+    }
+  }
 }
 
 export function paperRunningStageLabel(row){
@@ -433,7 +442,7 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
   var waiting=(runtime.deployment&&runtime.deployment.waiting_capital!==null&&runtime.deployment.waiting_capital!==undefined)
     ?cny(runtime.deployment.waiting_capital):'—';
   var blocked=(runtime.allocation_status==='UNAVAILABLE'
-    ?'分配额度与席位未知；请在 Portfolio Workspace 指定 cycle ID 与 plan ID 查询'
+    ?'分配额度与席位未知；请在组合计划工作台指定周期编号与计划编号查询'
     :(runtime.deployment&&runtime.deployment.blocked_reason))
     ||(runtime.waiting_reason&&runtime.waiting_reason.reason)
     ||(runtime.running?'正常运行，无阻塞':'未参与当前周期');
@@ -485,7 +494,7 @@ export function renderPaperStrategyCenter(d){
   if(plan.total_deployable_amount!==null&&plan.total_deployable_amount!==undefined) headline.push('本轮可部署 '+cny(plan.total_deployable_amount));
   var guards=(((d.boundaries||{}).shared_guards)||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
   target.innerHTML='<section class="paper-strategy-intro"><div><h3>运行策略</h3>'
-    +'<p>本页只读展示当前周期参与状态与风险 / 执行边界。分配额度和席位只在指定 cycle ID 与 plan ID 后可验证，请到“组合计划”查看；本页不会挑选最新计划或推导风险许可。</p>'
+    +'<p>本页只读展示当前周期参与状态与风险 / 执行边界。分配额度和席位只在指定周期编号与计划编号后可验证，请到“组合计划”查看；本页不会挑选最新计划或推导风险许可。</p>'
     +paperMarketDataHtml(allocation.market_data)
     +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench()">打开策略工坊</button>'
     +'<span class="strategy-builder-hint">'+(headline.join(' · ')||'—')+'</span></div></div></section>'
@@ -668,7 +677,7 @@ export async function loadPortfolioWorkspace(){
   if(!cycleInput||!planInput||!target) return;
   var cycle=String(cycleInput.value||'').trim(),plan=String(planInput.value||'').trim();
   if(!cycle||!plan){
-    target.innerHTML='<div class="paper-empty">输入明确的 cycle ID 和 plan ID 后读取；页面不会替你选择 latest 或 current。</div>';
+    target.innerHTML='<div class="paper-empty">输入明确的周期编号和计划编号后读取；页面不会替你选择最新或当前计划。</div>';
     return;
   }
   target.innerHTML='<div class="loading">正在读取指定的周期与计划…</div>';
@@ -722,7 +731,11 @@ export async function loadPaper(options){
   // Navigation, the one-minute refresh, and manual actions may all request an
   // overview at the same time.  Let every caller share one in-flight request
   // instead of rendering the large dashboard repeatedly in parallel.
-  if(window._paperLoadRequest) return window._paperLoadRequest;
+  // 只有同一 variant 才能共享：不同 variant 的查询参数不同（activity /
+  // history_symbols），复用会把缺字段的旧响应交给新视图，而这次切换又不会
+  // 补发请求，页面会停在缺字段状态直到再次导航。
+  if(window._paperLoadRequest && window._paperLoadVariant===variant) return window._paperLoadRequest;
+  window._paperLoadVariant=variant;
   window._paperLoadRequest=(async function(){
   try{
     // The activity audit is independent from the account overview.  Start it
@@ -749,6 +762,7 @@ export async function loadPaper(options){
     if($('paperStatus')) $('paperStatus').innerHTML='<span class="tag tag-warn">读取异常</span> '+message;
   } finally {
     window._paperLoadRequest=null;
+    window._paperLoadVariant=null;
   }
   })();
   return window._paperLoadRequest;
@@ -834,7 +848,7 @@ export async function renderPaperDashboard(d,auditRequest){
     }).join('');
     var recentOrders=(d.orders||[]).map(function(o){
       var view=paperOrderStatusView(o.status,o.reason), cancel=(!o.archived_cycle&&o.origin==='manual'&&['pending_limit','pending_execution','partially_filled'].indexOf(o.status)>=0)?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤销剩余</button>':'';
-      return '<div class="paper-order-row" data-account="'+o.account_id+'" data-date="'+String(o.created_at||'').slice(0,10)+'" data-side="'+o.side+'" data-status="'+o.status+'"><span>'+String(o.created_at||'').slice(5,16)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+o.code+'\')">'+o.name+'</button><br><small>'+o.code+' · '+(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
+      return '<div class="paper-order-row" data-account="'+adaptiveEsc(o.account_id)+'" data-date="'+adaptiveEsc(String(o.created_at||'').slice(0,10))+'" data-side="'+adaptiveEsc(o.side)+'" data-status="'+adaptiveEsc(o.status)+'"><span>'+shortStamp(o.created_at)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+adaptiveJsArg(o.code)+'\')">'+adaptiveEsc(o.name)+'</button><br><small>'+adaptiveEsc(o.code)+' · '+adaptiveEsc(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
         +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+' '+o.qty+paperExecutionFactsHtml(o)+'</span><span>'+fmt(o.filled_price||o.planned_price)+'</span>'
         +'<span class="paper-order-status '+view[0]+'">'+view[1]+'</span><span>'+cancel+'</span></div>';
     }).join('');
@@ -849,7 +863,7 @@ export async function renderPaperDashboard(d,auditRequest){
     var monitorState=latestMonitor&&latestMonitor.status;
     var monitorLabel=monitorState==='completed'?'已完成':(monitorState==='running'?'检查中':'异常');
     var monitorText=latestMonitor
-      ? '最近监控 '+String(latestMonitor.started_at||'').slice(5,16)+' · '+monitorLabel+' · '+(monitorReason||('检查 '+(monitorDetail.observed||0)+' 个底仓'))
+      ? '最近监控 '+shortStamp(latestMonitor.started_at)+' · '+monitorLabel+' · '+(monitorReason||('检查 '+(monitorDetail.observed||0)+' 个底仓'))
       : '尚未收到3分钟监控心跳';
     $('paperTerminalBoard').innerHTML='<div class="paper-terminal-head"><h3>\u5f53\u524d\u6301\u4ed3</h3><span style="color:var(--text-secondary);font-size:12px">'+running+' / '+(accounts.length||4)+' \u8d26\u6237\u8fd0\u884c \u00b7 '+monitorText+'</span></div>'
       +'<div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>\u53ef\u64cd\u4f5c\u5e95\u4ed3</span><div class="paper-filter-bar"><label>\u7b56\u7565</label><select id="paperPositionFilter" onchange="setPaperTerminalFilter(\'position\',this.value)">'+accountFilterOptions+'</select><label>\u72b6\u6001</label><select id="paperPositionStateFilter" onchange="setPaperTerminalFilter(\'positionState\',this.value)"><option value="all">\u5168\u90e8</option><option value="profit">\u6d6e\u76c8</option><option value="loss">\u6d6e\u4e8f</option><option value="sellable">\u53ef\u5356</option><option value="locked">T+1\u9501\u5b9a</option></select><span id="paperPositionVisible" class="paper-filter-count"></span></div></div><div class="paper-position-list">'+quickPositions+'<div id="paperPositionEmpty" class="paper-empty" hidden>\u8be5\u7b56\u7565\u5f53\u524d\u6ca1\u6709\u6301\u4ed3\u3002</div></div></div>';
@@ -898,10 +912,10 @@ export async function renderPaperDashboard(d,auditRequest){
       var markClass = a.id==='trend_pullback' ? 'swing' : (a.id==='sector_rotation' ? 'rotation' : '');
       var batch = cycle.started_at ? String(cycle.started_at).slice(0,10).replace(/-/g,'年').replace(/年(\d\d)$/,'月$1日')+' 起' : '等待资金确认';
       var todayHoldingPnl=a.today_pnl===null||a.today_pnl===undefined?'—':cny(a.today_pnl,true)+'<br/><small>'+pctTxt(a.today_return_pct)+'</small>';
-      return '<tr><td><div class="paper-strategy-name"><span class="paper-strategy-mark '+markClass+'"></span>'+a.name+'</div></td>'
+      return '<tr><td><div class="paper-strategy-name"><span class="paper-strategy-mark '+markClass+'"></span>'+adaptiveEsc(a.name)+'</div></td>'
         +'<td>'+batch+'</td><td class="'+pctCls(a.holding_return_pct)+'">'+pctTxt(a.holding_return_pct)+'</td><td class="'+pctCls(a.today_return_pct)+'">'+todayHoldingPnl+'</td>'
-        +'<td>'+pctTxt(a.max_drawdown_pct)+'</td><td>'+(a.win_rate_pct===null?'—':fmt(a.win_rate_pct,1)+'%')+'</td><td>'+(a.profit_loss_ratio===null?'—':fmt(a.profit_loss_ratio,2))+'</td>'
-        +'<td>'+a.trade_count+'</td><td>'+fmt(a.strategy_position_pct_pool===undefined?a.fund_utilization_pct:a.strategy_position_pct_pool,1)+'%</td></tr>';
+        +'<td>'+pctTxt(a.max_drawdown_pct)+'</td><td>'+fmtPct(a.win_rate_pct,1)+'</td><td>'+(a.profit_loss_ratio===null||a.profit_loss_ratio===undefined?'—':fmt(a.profit_loss_ratio,2))+'</td>'
+        +'<td>'+a.trade_count+'</td><td>'+fmtPct(a.strategy_position_pct_pool===undefined?a.fund_utilization_pct:a.strategy_position_pct_pool,1)+'</td></tr>';
     }).join('');
     var positions = (d.positions||[]).map(function(p){
       var qualityScore=p.quality_score===null||p.quality_score===undefined?'—':fmt(p.quality_score,1);
@@ -909,7 +923,7 @@ export async function renderPaperDashboard(d,auditRequest){
       var qualityAction=qualityActionMap[p.quality_action]||p.quality_action||'待复评';
       var replacement=p.quality_replacement_code?'后备 '+riskText(p.quality_replacement_code):'暂无后备候选';
       var qualityPhase=p.quality_review_phase||'持仓复核';
-      return '<tr><td>'+(accountName[p.account_id]||p.account_id)+'</td><td><b>'+p.name+'</b><br/><span style="font-size:11px;color:var(--text-muted)">'+p.code+' · '+(p.industry||'-')+'</span></td>'
+      return '<tr><td>'+adaptiveEsc(accountName[p.account_id]||p.account_id)+'</td><td><b>'+adaptiveEsc(p.name)+'</b><br/><span style="font-size:11px;color:var(--text-muted)">'+adaptiveEsc(p.code)+' · '+adaptiveEsc(p.industry||'-')+'</span></td>'
         +'<td>'+p.qty+' 股</td><td>'+cny(p.market_value)+'<br/><small>'+fmt(p.account_weight_pct,2)+'%</small></td><td>'+fmt(p.cost)+'</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.ret_pct)+'">'+cny(p.unrealized_pnl,true)+'<br/><small>'+pctTxt(p.ret_pct)+'</small></td>'
         +'<td><b>'+qualityPhase+' · '+qualityScore+' · '+qualityGrade+'</b><br/><small>入场 '+(p.quality_model_score===null||p.quality_model_score===undefined?'—':fmt(p.quality_model_score,1))+' · 资金 '+(p.quality_flow_score===null||p.quality_flow_score===undefined?'—':fmt(p.quality_flow_score,1))+' · 动量 '+(p.quality_momentum_score===null||p.quality_momentum_score===undefined?'—':fmt(p.quality_momentum_score,1))+'</small><br/><small>'+qualityAction+' · '+replacement+'</small></td>'
         +'<td>'+p.hold_days+'日</td><td>'+p.available_qty+' 可卖 / '+p.locked_qty+' 锁定<br/><span style="font-size:11px;color:var(--text-muted)" title="'+(p.t1_reason||'')+'">'+(p.t1_status||'-')+'</span></td><td><span class="tag '+(p.asset_type==='etf_t0'?'tag-ok':'tag-info')+'">'+(p.asset_type==='etf_t0'?'ETF T+0':'股票 T+1')+'</span><br/><span style="font-size:11px;color:var(--text-muted)">风控价 '+fmt(p.risk_price)+' · '+(p.price_state||'-')+'</span></td><td>'+p.available_date+'<br/><span style="font-size:11px;color:var(--text-muted)">'+(p.quote_at||'')+'</span></td></tr>';
@@ -918,16 +932,16 @@ export async function renderPaperDashboard(d,auditRequest){
     var orders = (d.orders||[]).map(function(o){
       var view=paperOrderStatusView(o.status), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
       return '<tr><td>'+o.created_at+'</td><td>'+(o.account_name||accountName[o.account_id]||o.account_id)+'</td><td>'+(o.origin==='manual'?'手动模拟':'策略自动')+'<br><small>'+(o.order_type==='limit'?'限价':'市价')+'</small></td>'
-        +'<td class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+'</td><td><b>'+o.name+'</b> '+o.code+'</td>'
-        +'<td>'+o.qty+'</td><td>'+fmt(o.filled_price||o.planned_price)+'</td><td>'+cny(o.realized_pnl,true)+'</td><td><span class="paper-order-status '+view[0]+'">'+view[1]+'</span></td><td style="font-size:12px">'+(o.reason||'-')+cancel+'</td></tr>';
+        +'<td class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+'</td><td><b>'+adaptiveEsc(o.name)+'</b> '+adaptiveEsc(o.code)+'</td>'
+        +'<td>'+o.qty+'</td><td>'+fmt(o.filled_price||o.planned_price)+'</td><td>'+cny(o.realized_pnl,true)+'</td><td><span class="paper-order-status '+view[0]+'">'+view[1]+'</span></td><td style="font-size:12px">'+adaptiveEsc(o.reason||'-')+cancel+'</td></tr>';
     }).join('');
     var fills = (d.fills||[]).map(function(f){
-      return '<tr><td>'+f.fill_date+'</td><td>'+(f.account_name||accountName[f.account_id]||f.account_id)+'</td><td class="'+(f.side==='buy'?'up':'down')+'">'+(f.side==='buy'?'买入':'卖出')+'</td><td>'+f.code+'</td><td>'+f.qty+'</td><td>'+fmt(f.price)+'</td><td>'+cny(f.amount)+'</td><td>'+cny(f.fees)+'</td><td style="font-size:12px">'+f.assumption+'</td></tr>';
+      return '<tr><td>'+f.fill_date+'</td><td>'+adaptiveEsc(f.account_name||accountName[f.account_id]||f.account_id)+'</td><td class="'+(f.side==='buy'?'up':'down')+'">'+(f.side==='buy'?'买入':'卖出')+'</td><td>'+adaptiveEsc(f.code)+'</td><td>'+f.qty+'</td><td>'+fmt(f.price)+'</td><td>'+cny(f.amount)+'</td><td>'+cny(f.fees)+'</td><td style="font-size:12px">'+adaptiveEsc(f.assumption)+'</td></tr>';
     }).join('');
-    var reviews = (d.reviews||[]).map(function(r){ return '<details style="margin:6px 0"><summary><b>'+r.account_id+'</b> · '+r.week_key+' · '+r.recommendation+'</summary><pre style="white-space:pre-wrap;font:12px Microsoft YaHei;color:var(--text-secondary);padding:8px">'+r.report+'</pre></details>'; }).join('');
+    var reviews = (d.reviews||[]).map(function(r){ return '<details style="margin:6px 0"><summary><b>'+adaptiveEsc(r.account_id)+'</b> · '+adaptiveEsc(r.week_key)+' · '+adaptiveEsc(r.recommendation)+'</summary><pre style="white-space:pre-wrap;font:12px Microsoft YaHei;color:var(--text-secondary);padding:8px">'+adaptiveEsc(r.report)+'</pre></details>'; }).join('');
     var observationNames={scan:'候选扫描',observe:'观察',t_sell:'日内高抛',t_rebuy:'日内回补'};
     var observations = (d.observations||[]).map(function(o){ return '<tr><td>'+o.observed_at+'</td><td>'+(accountName[o.account_id]||o.account_id)+'</td><td>'+(o.code||'候选池')+'</td><td>'+(o.price===null?'—':fmt(o.price))+'</td><td><span class="tag '+(['observe','scan'].indexOf(o.action)>=0?'tag-info':'tag-ok')+'">'+(observationNames[o.action]||o.action)+'</span></td><td>'+o.reason+'</td></tr>'; }).join('');
-    var params = (d.parameter_versions||[]).map(function(v){ return '<tr><td>'+v.created_at+'</td><td>'+v.account_id+'</td><td>'+v.version+'</td><td>'+v.style+'</td><td>'+v.effective_date+'</td><td>'+v.reason+'</td></tr>'; }).join('');
+    var params = (d.parameter_versions||[]).map(function(v){ return '<tr><td>'+adaptiveEsc(v.created_at)+'</td><td>'+adaptiveEsc(v.account_id)+'</td><td>'+adaptiveEsc(v.version)+'</td><td>'+adaptiveEsc(v.style)+'</td><td>'+adaptiveEsc(v.effective_date)+'</td><td>'+adaptiveEsc(v.reason)+'</td></tr>'; }).join('');
     var archives = (d.archives||[]).map(function(a){ return '<li>'+a.created_at+' · '+a.cycle_key+' · '+a.reason+'</li>'; }).join('');
     var exposure = Object.keys(d.industry_exposure||{}).map(function(k){return '<span class="tag tag-info">'+k+' '+cny(d.industry_exposure[k])+'</span>';}).join(' ') || '暂无行业暴露';
     var schedule = d.schedule||{};
@@ -954,7 +968,7 @@ export async function renderPaperDashboard(d,auditRequest){
     var paramsAudit = params
       ? tableScroll('<table><tr><th>记录时间</th><th>策略</th><th>版本</th><th>风格</th><th>生效日</th><th>原因</th></tr>'+params+'</table>',820)
       : '<div class="paper-empty">尚无参数版本记录。</div>';
-    $('paperResult').innerHTML = todayBand+'<section class="paper-challenge"><div class="paper-challenge-head"><h2>'+strategyCount+'策略归一化收益对比</h2><p>折线为策略累计收益（按绩效参考本金），持仓浮盈率按实际持仓成本计算；两种口径不混用。委托和个股历史已移至上方专页。</p></div><div id="paperCompareChart" class="paper-compare-chart" role="img" aria-label="'+strategyCount+'套策略与沪深300的归一化收益对比曲线"></div><div class="paper-challenge-table"><table><tr><th>策略名称</th><th>挑战批次</th><th>当前持仓浮盈率</th><th>今日持仓盈亏</th><th>最大回撤</th><th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>占总资金池</th></tr>'+compareRows+'</table></div><div class="paper-challenge-note">'+challengeMsg+'</div></section><div class="panel"><h3>当前行业风险暴露</h3><div class="result-toolbar">'+exposure+'</div></div><div class="disclaimer">'+d.disclaimer+'</div>';
+    $('paperResult').innerHTML = todayBand+'<section class="paper-challenge"><div class="paper-challenge-head"><h2>'+strategyCount+'策略归一化收益对比</h2><p>折线为策略累计收益（按绩效参考本金），持仓浮盈率按实际持仓成本计算；两种口径不混用。委托和个股历史已移至上方专页。</p></div><div id="paperCompareChart" class="paper-compare-chart" role="img" aria-label="'+strategyCount+'套策略与沪深300的归一化收益对比曲线"></div><div class="paper-challenge-table"><table><tr><th>策略名称</th><th>挑战批次</th><th>当前持仓浮盈率</th><th>今日持仓盈亏</th><th>最大回撤</th><th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>占总资金池</th></tr>'+compareRows+'</table></div><div class="paper-challenge-note">'+challengeMsg+'</div></section><div class="panel"><h3>当前行业风险暴露</h3><div class="result-toolbar">'+exposure+'</div></div><div class="disclaimer">'+adaptiveEsc(d.disclaimer)+'</div>';
     renderPaperCompareChart(curve);
     }
 }

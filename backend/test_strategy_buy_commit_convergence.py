@@ -24,8 +24,10 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime as dt
 import hashlib
+import io
 import os
 import shutil
 import sys
@@ -305,6 +307,52 @@ class FinalSizingUsesCyclePinnedVersion(_BuyCase):
 
 class NormalBuyConvergence(_BuyCase):
     """SB-1 / SB-2 / SB-6 / SB-7 / SB-8 / SB-9 / SB-16。"""
+
+    def test_final_revalidation_uses_owner_identity_and_records_timing(self):
+        self.quotes[CODE] = _quote(CODE)
+        signal_id = self.add_signal(signal_date=DAY_PREV.isoformat())
+        snapshot = PT.MDC.MarketDataSnapshot(
+            kind="full_market_snapshot", rows=(self.quotes[CODE],),
+            as_of=DAY.isoformat(), observed_at=self.quotes[CODE]["quote_at"],
+            source="fixture", complete=True, expected_rows=1,
+            verification=PT.MDC.VERIFICATION_VERIFIED,
+            verification_method=PT.MDC.VERIFICATION_METHOD_CROSS_SOURCE)
+        reading = PT.MDC.MarketDataReading(
+            availability=PT.MDC.AVAILABILITY_AVAILABLE,
+            freshness=PT.MDC.FRESHNESS_FRESH, status=PT.MDC.STATUS_FRESH,
+            policy_name=PT.MDC.LIVE_MARKET_POLICY.name, snapshot=snapshot)
+        with mock.patch.object(PT.MDSvc, "read_snapshot", return_value=reading), \
+                contextlib.redirect_stderr(io.StringIO()), PT.PTM.capture("test"):
+            result, _ = self.run_buy(signal_id=signal_id)
+            stages = PT.PTM.snapshot("test")["stages"]
+        self.assertTrue(result.get("filled"), result)
+        capture = PT.PRS.capture_portfolio_runtime_snapshot
+        self.assertIs(capture.call_args.kwargs["market_reading"], reading)
+        self.assertNotIn("market_evidence_identity", capture.call_args.kwargs)
+        self.assertEqual(stages["execution.plan_revalidate"]["calls"], 1)
+        self.assertEqual(stages["execution.plan_revalidate"]["errors"], 0)
+
+    def test_final_revalidation_rejects_changed_identity_and_capture_failure(self):
+        for changed, code in zip(("snapshot_id", "snapshot_fingerprint", "error"),
+                                 ("600911", "600912", "600913"), strict=True):
+            with self.subTest(changed=changed):
+                self.quotes[code] = _quote(code)
+                signal_id = self.add_signal(code=code, signal_date=DAY_PREV.isoformat())
+                before = self.counters()
+                def changed_snapshot(*args, changed=changed, **kwargs):
+                    if changed == "error":
+                        raise ValueError("capture unavailable")
+                    return {**self._entry_snapshot, changed: "f" * 64}
+                with mock.patch.object(PT.PRS, "capture_portfolio_runtime_snapshot",
+                                       side_effect=changed_snapshot), \
+                        contextlib.redirect_stderr(io.StringIO()), PT.PTM.capture("test"):
+                    result, _ = self.run_buy(signal_id=signal_id, code=code)
+                    stage = PT.PTM.snapshot("test")["stages"]["execution.plan_revalidate"]
+                self.assertFalse(result.get("filled"), result)
+                self.assertEqual(self.counters()["fills"], before["fills"])
+                self.assertEqual(self.counters()["cash"], before["cash"])
+                self.assertEqual(stage["calls"], 1)
+                self.assertEqual(stage["errors"], int(changed == "error"))
 
     def test_normal_buy_goes_through_the_planner_and_keeps_parity(self):
         self.quotes[CODE] = _quote(CODE)

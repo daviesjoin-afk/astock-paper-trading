@@ -571,11 +571,6 @@ def assert_global_pointer_present(conn) -> None:
     )
 
 
-def has_any_params(conn) -> bool:
-    if not _table_exists(conn, "evolution_params"):
-        return False
-    return conn.execute("SELECT 1 FROM evolution_params LIMIT 1").fetchone() is not None
-
 
 # ─── 确定性校验（不改变任何指针）───
 

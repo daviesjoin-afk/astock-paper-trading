@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Offline regression tests for AI permissions, PIT attribution and ModLens input."""
+"""Offline regression tests for AI permissions and PIT attribution."""
 from __future__ import annotations
 
 import datetime as dt
 import os
 import sys
-import tempfile
 import types
 import unittest
 from contextlib import contextmanager
-from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -21,7 +19,6 @@ sys.modules.setdefault("requests", mock.MagicMock())
 import adaptive_selection as AS  # noqa: E402
 import deepseek_advisor as DA  # noqa: E402
 import dual_ai_tuner as DT  # noqa: E402
-import modlens_bridge as MB  # noqa: E402
 import trade_attribution as TA  # noqa: E402
 
 
@@ -186,25 +183,6 @@ class PointInTimeTests(unittest.TestCase):
             "news", 1, 1, "",))
         rows = TA._event_rows(conn, "000001", dt.date(2026, 8, 25), fill_at="2026-08-25T09:30:00+08:00")
         self.assertEqual(rows, [])
-
-
-class ModLensInputTests(unittest.TestCase):
-    def test_modlens_rejects_outside_path_and_remote_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            allowed = Path(tmp) / "uploads"
-            allowed.mkdir()
-            image = allowed / "ok.png"
-            image.write_bytes(b"png")
-            with mock.patch.object(MB, "_allowed_dirs", return_value=[allowed]):
-                resolved, error = MB._validate_image_reference(str(Path(tmp) / "secret.png"))
-                self.assertIsNone(resolved)
-                self.assertIn("允许", error)
-                resolved, error = MB._validate_image_reference("https://example.com/a.png")
-                self.assertIsNone(resolved)
-                self.assertIn("禁用", error)
-                resolved, error = MB._validate_image_reference("ok.png")
-                self.assertEqual(Path(resolved), image.resolve())
-                self.assertIsNone(error)
 
 
 if __name__ == "__main__":

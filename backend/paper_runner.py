@@ -41,6 +41,12 @@ def main():
 
 def _run(slot):
     from paper_schedule_contract import is_hot_path
+    if slot == "auction-track":
+        import auction_tracking
+        result = auction_tracking.run()
+        PTM.outcome(result.get("status", "unknown"))
+        print(json.dumps(result, ensure_ascii=False))
+        return _result_exit_code(result)
     # 重试导入和执行（应对数据库锁）
     from paper_storage import is_sqlite_busy_error, sqlite_busy_backoff
     is_hot = is_hot_path(slot)

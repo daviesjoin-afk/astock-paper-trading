@@ -39,6 +39,11 @@ PROFILES = {
         "afternoon_first_trigger": True,
     },
     # 趋势波段优选：只在开盘价附近/回踩位入场；>5% 视为动量禁区。
+    # 2026-10-23 操作员决定：午后首次触发放开。理由是"恐慌后确认恢复、择机
+    # 买入"被"午后不接受首次触发"整条挡住（晋西车轴 13:07 模型 0.756 高于
+    # 门槛 0.580 仍被拒）。放开的是时段，不是约束：追高帽（1.5%）、连续确认
+    # （2 次 / ≥300 秒）、Q级、双源、13:05-14:30 释位窗口与 14:30 截止全部
+    # 照旧；"突破加速后不许追"仍由动量禁区（>5%）表达。
     "trend_pullback": {
         "confirm_scans": 2,
         "confirm_min_seconds": 300,
@@ -47,7 +52,7 @@ PROFILES = {
         "max_chase_from_trigger": 0.015,
         "momentum_mode_from": 0.05,
         "momentum_confirm_scans": 99,   # 实际禁止动量追
-        "afternoon_first_trigger": False,
+        "afternoon_first_trigger": True,
     },
     # 板块轮动先锋：板块启动两次确认 + 触发后真实回踩结构
     #（冲高≥1% → 回踩不破触发价 → 才允许入场），不再把"离MA20不远"当回踩。
@@ -62,8 +67,9 @@ PROFILES = {
         "afternoon_first_trigger": True,
         "pullback_structure_required": True,
     },
-    # 三日策略：收盘级筛选 + 早盘执行确认；10:30 后不接受首次触发，
-    # 禁止盘中后段把已加速股票再当首发突破。
+    # 三日策略：收盘级筛选 + 早盘执行确认。``morning_window_only`` 现在只
+    # 约束**上午**的首发窗口（10:30 后不再把加速股当首发突破）；2026-10-23
+    # 操作员决定午后首次触发放开，因此 13:00 之后不再受这条限制。
     "reported_profit_breakout": {
         "confirm_scans": 2,
         "confirm_min_seconds": 300,
@@ -72,7 +78,7 @@ PROFILES = {
         "max_chase_from_trigger": 0.015,
         "momentum_mode_from": 0.05,
         "momentum_confirm_scans": 3,
-        "afternoon_first_trigger": False,
+        "afternoon_first_trigger": True,
         "morning_window_only": "10:30",
     },
     # 超强主力股：常规承接 2 次确认（比普通波段快）；涨幅进入点火区间
@@ -154,12 +160,19 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
         t = now.time()
 
         # ---- 时段窗口 ----
+        # ``morning_window_only`` 只约束**上午**：窗口关闭后到 13:00 之间不再
+        # 接受首发突破（"别把上午后段已加速的股票当首发"），午后是否允许由
+        # ``afternoon_first_trigger`` 单独表达。两条规则不能互相覆盖——否则
+        # 一个上午窗口就会顺带把整个下午挡死。
+        afternoon_start = dt.time(13, 0)
         cutoff = profile.get("morning_window_only")
-        if record is None and cutoff and t >= dt.time.fromisoformat(cutoff + ":00"):
-            return False, {"state": "observing",
-                           "reason": f"已过首发窗口 {cutoff}，当日不把加速股当首发突破"}
+        if record is None and cutoff:
+            cutoff_at = dt.time.fromisoformat(cutoff + ":00")
+            if cutoff_at <= t < afternoon_start:
+                return False, {"state": "observing",
+                               "reason": f"已过首发窗口 {cutoff}，当日不把加速股当首发突破"}
         if (record is None and not profile.get("afternoon_first_trigger", True)
-                and t >= dt.time(13, 0)):
+                and t >= afternoon_start):
             return False, {"state": "observing",
                            "reason": "午后不接受首次触发，等待次日早盘结构"}
 
@@ -185,14 +198,31 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                         "reason": f"快速确认后较触发价已涨超 {max_chase*100:.1f}%，等待回踩",
                     }
                 if price < trigger_price * 0.995:
+                    if profile.get("recovery_entry"):
+                        _enter_recovery_watch(bucket, code, record, price, now,
+                                              "确认后跌破触发价 0.5%")
+                        return False, {
+                            "state": "recovery_watch",
+                            "reason": "确认后跌破触发价；上午证据已保留，等待恢复确认",
+                        }
                     bucket.pop(code, None)
                     _save()
-                    return False, {"state": "expired", "reason": "快速确认后跌破触发价，重新观察"}
+                    return False, {"state": "expired",
+                                   "reason": "快速确认后跌破触发价，重新观察"}
                 return True, {
                     "state": "confirmed", "record": record,
                     "reason": "快速观察已确认，交由三分钟正式任务完整复核",
                     "fast_path": record.get("confirmation_path") == "fast_watch",
                 }
+            # 跌后恢复观察：记录的是"上午有过依据、随后被跌破/普跌打掉"的候选。
+            # 不能把它当全新首次触发（那会让午后恢复永远进不来），也不能无条件
+            # 放行（那会变成午后追涨）——恢复资格由调用方按当日指数、相对强弱、
+            # 个股事件与资金证据判定后，通过 evidence["recovery_ok"] 传入。
+            if record.get("state") == "recovery_watch":
+                return _evaluate_recovery_watch(
+                    profile, code, record, price, pct, now,
+                    evidence=evidence, fast=fast,
+                )
             # 过期失效记录：必须回踩到失效高点的 -2% 以下才重新触发。
             # 旧实现直接 pop——持续上涨的股票每轮以更高锚点重触，
             # 追涨帽自我棘轮形同虚设（2026-08 精读审计确认）。
@@ -280,6 +310,8 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             }
             _save()
             if required <= 1:
+                record["confirmed_at"] = now.isoformat(timespec="seconds")
+                _save()
                 return True, {"state": "confirmed", "record": record}
             _retrig_label = "第%d次重触发" % _carry_retrig if _carry_retrig else "首次触发"
             return False, {"state": "triggered",
@@ -315,9 +347,19 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
 
         # ---- 跌破触发价：结构失效 ----
         if price < trigger_price * 0.995:
+            if profile.get("recovery_entry"):
+                # 启用恢复通道的策略保留上午证据，等恢复证据重新确认
+                _enter_recovery_watch(bucket, code, record, price, now,
+                                      "跌破触发价 0.5%，结构失效")
+                return False, {
+                    "state": "recovery_watch",
+                    "reason": "跌破触发价，结构失效；上午证据已保留，等待恢复确认",
+                }
+            # 未启用恢复通道的策略保持原行为：删记录，按全新触发重新观察
             bucket.pop(code, None)
             _save()
-            return False, {"state": "expired", "reason": "跌破触发价，结构失效重新观察"}
+            return False, {"state": "expired",
+                           "reason": "跌破触发价，结构失效重新观察"}
 
         # ---- 板块轮动：真实回踩结构 ----
         if profile.get("pullback_structure_required") and record.get("pullback_done") is not True:
@@ -343,6 +385,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             active = evidence.get("active_buy_sell_imbalance")
             depth = evidence.get("depth_imbalance")
             cross_source = bool(evidence.get("cross_source_checked"))
+            quote_usable = bool(evidence.get("quote_usable", cross_source))
             mode_now = str(record.get("mode") or mode)
             # 点火模式下快速确认间隔放宽到 30 秒（ignition_confirm_min_seconds），
             # 且必须携带 ignition_ok=True——八项点火条件已在调用方预先判定，
@@ -369,7 +412,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             ) and (depth_value is None or depth_value >= -0.20)
             strong = (
                 (not ignition_required or ignition_ok)
-                and cross_source
+                and quote_usable
                 and main_pct >= (3.0 if mode_now in ("momentum", "ignition") else 2.0)
                 and vol_ratio >= (1.5 if mode_now in ("momentum", "ignition") else 1.2)
                 and price >= trigger_price
@@ -387,6 +430,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                 record["fast_evidence"] = {
                     "main_pct": round(main_pct, 3), "vol_ratio": round(vol_ratio, 3),
                     "cross_source_checked": cross_source,
+                    "quote_usable": quote_usable,
                     "ignition_ok": ignition_ok if ignition_required else None,
                 }
             elif not strong:
@@ -394,6 +438,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                 record["fast_evidence"] = {
                     "main_pct": round(main_pct, 3), "vol_ratio": round(vol_ratio, 3),
                     "cross_source_checked": cross_source, "reset": True,
+                    "quote_usable": quote_usable,
                 }
             fast_count = int(record.get("fast_confirm_count") or 0)
             first_ts = dt.datetime.fromisoformat(str(record["first_trigger_at"])[:19])
@@ -402,6 +447,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             if strong and fast_count >= 2 and elapsed >= 20:
                 record["state"] = "confirmed"
                 record["confirmation_path"] = "fast_watch"
+                record["confirmed_at"] = now.isoformat(timespec="seconds")
                 _save()
                 return True, {
                     "state": "confirmed", "record": record,
@@ -414,7 +460,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                     f"快速观察确认 {fast_count}/2"
                     + ("（点火模式）" if ignition_required else "")
                     + f"：主力 {main_pct:+.2f}%，"
-                    f"量比 {vol_ratio:.2f}，双源={'通过' if cross_source else '未通过'}，"
+                    f"量比 {vol_ratio:.2f}，行情={'双源核验通过' if cross_source else '单源有效' if quote_usable else '不可用'}，"
                     f"逐笔={active_value if active_value is not None else '缺失'}，"
                     f"五档={depth_value if depth_value is not None else '缺失'}"
                     + ("" if not ignition_required else (
@@ -431,12 +477,135 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
         _save()
         if confirm_count >= required and elapsed >= float(profile["confirm_min_seconds"]):
             record["state"] = "confirmed"
+            record["confirmed_at"] = now.isoformat(timespec="seconds")
             _save()
             return True, {"state": "confirmed", "record": record}
         _retrig_seq = int(record.get("retrigger_seq") or 0)
         return False, {"state": "confirming",
                        "reason": (("第%d次重触发后" % _retrig_seq) if _retrig_seq else "")
                                  + f"连续确认中 {confirm_count}/{required}（{mode}模式，已等 {int(elapsed)}秒）"}
+
+
+def _morning_evidence(record):
+    """把一条记录里的"上午依据"压成可追溯的小包，供恢复入场判定使用。"""
+    existing = record.get("morning_evidence")
+    if isinstance(existing, dict) and existing:
+        return dict(existing)
+    return {
+        "first_trigger_at": record.get("first_trigger_at"),
+        "trigger_price": record.get("trigger_price"),
+        "trigger_pct": record.get("trigger_pct"),
+        "confirmed_at": record.get("confirmed_at"),
+        "confirmation_path": record.get("confirmation_path"),
+        "mode": record.get("mode"),
+        "evidence": record.get("evidence") or record.get("fast_evidence"),
+    }
+
+
+def _enter_recovery_watch(bucket, code, record, price, now, reason):
+    """失效记录转成恢复观察，**保留**上午证据而不是删掉。
+
+    旧实现在跌破触发价时 ``bucket.pop``：午后恢复再来时 record 为 None，
+    被"午后不接受首次触发"判成全新追涨候选，永远进不来。保留证据后，
+    恢复资格改由调用方按当日指数/相对强弱/个股事件/资金证据判定。
+    """
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        price = 0.0
+    low = record.get("low_since_breakdown")
+    low = price if low is None else min(float(low), price)
+    bucket[code] = {
+        "state": "recovery_watch",
+        "morning_evidence": _morning_evidence(record),
+        "low_since_breakdown": low,
+        "breakdown_at": now.isoformat(timespec="seconds"),
+        "breakdown_reason": reason,
+        "recovery_scans": int(record.get("recovery_scans") or 0),
+        "recovery_last_at": record.get("recovery_last_at"),
+        "retrigger_seq": int(record.get("retrigger_seq") or 0),
+        "high_since_trigger": record.get("high_since_trigger"),
+        "last_price": price,
+        "scans_since_trigger": int(record.get("scans_since_trigger") or 0),
+    }
+    _save()
+
+
+def _evaluate_recovery_watch(profile, code, record, price, pct, now, *, evidence, fast):
+    """恢复观察：调用方证明"这次恢复成立"若干次后，才重新给出入场资格。
+
+    只做计数与时序，不自行判断市场/个股证据——那些判断需要当日指数、新闻和
+    资金，属于 ``recovery_entry_decision``。缺失证据一律按"不成立"处理。
+    """
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return False, {"state": "recovery_watch", "reason": "价格无效"}
+    low = record.get("low_since_breakdown")
+    record["low_since_breakdown"] = price if low is None else min(float(low), price)
+    record["last_price"] = price
+    if not profile.get("recovery_entry"):
+        _save()
+        return False, {"state": "recovery_watch",
+                       "reason": "该策略不启用跌后恢复入场", "record": record}
+    evidence = dict(evidence or {})
+    if not evidence.get("recovery_ok"):
+        if record.get("recovery_scans"):
+            record["recovery_scans"] = 0
+        record.pop("recovery_last_at", None)
+        _save()
+        return False, {
+            "state": "recovery_watch",
+            "reason": (evidence.get("recovery_reason")
+                       or "恢复条件未满足（需当日指数、相对强弱、资金与收复证据）"),
+            "record": record,
+        }
+    # 30 秒快速通道只观察、不累计恢复确认次数：否则同一分钟内两次采样
+    # 就能凑满"多次确认"。
+    if not fast:
+        record["recovery_scans"] = int(record.get("recovery_scans") or 0) + 1
+        record["recovery_last_at"] = now.isoformat(timespec="seconds")
+    count = int(record.get("recovery_scans") or 0)
+    required = max(1, int(profile.get("recovery_confirm_scans", 2)))
+    if count < required:
+        _save()
+        return False, {"state": "recovery_watch",
+                       "reason": f"跌后恢复确认中 {count}/{required}", "record": record}
+    seq = int(record.get("retrigger_seq") or 0) + 1
+    record.update({
+        "state": "confirmed",
+        "confirmed_at": now.isoformat(timespec="seconds"),
+        "confirmation_path": "selloff_recovery",
+        "recovery_confirmed": True,
+        "trigger_price": price,
+        "trigger_pct": pct,
+        "retrigger_seq": seq,
+    })
+    _save()
+    return True, {
+        "state": "confirmed", "record": record, "recovery": True,
+        "reason": f"第{seq}次重触发：普跌后恢复确认（{count} 次观察）",
+    }
+
+
+def recovery_watch_evidence(strategy_id, code):
+    """读取某标的的跌后恢复观察记录（只读、不读时钟）；没有则 ``None``。"""
+    try:
+        with _lock:
+            state = _load()
+            record = state.get(strategy_id, {}).get(code)
+            if not record or record.get("state") != "recovery_watch":
+                return None
+            return {
+                "morning_evidence": _morning_evidence(record),
+                "low_since_breakdown": record.get("low_since_breakdown"),
+                "breakdown_at": record.get("breakdown_at"),
+                "breakdown_reason": record.get("breakdown_reason"),
+                "recovery_scans": int(record.get("recovery_scans") or 0),
+                "retrigger_seq": int(record.get("retrigger_seq") or 0),
+            }
+    except Exception:
+        return None
 
 
 def mark_entered(strategy_id, code, price=None):

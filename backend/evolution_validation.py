@@ -21,6 +21,8 @@ import sqlite3
 from zoneinfo import ZoneInfo
 
 from adaptive_common import _json, _loads, _now
+import paper_account_specs as A
+import strategies as S
 
 TZ = ZoneInfo("Asia/Shanghai")
 MIN_OBSERVATION_DAYS = 5
@@ -92,7 +94,11 @@ def _active_deployments(paper, adaptive_conn):
             })
         meta = params.get("adaptive_selection_meta") or {}
         overlay = params.get("adaptive_selection") or {}
-        if (overlay.get("weights") and str(meta.get("status") or "") == "active"
+        # 运行时可能因模型族/键集不符而清空权重。库里有 weights 不代表
+        # 参数真的生效，把被清空的参数记为已部署会污染 A/B 归因。
+        source = A.ACCOUNT_SPECS.get(row["id"], {}).get("source_strategy")
+        if (S.selection_overlay_weights(row["id"], overlay, source)
+                and str(meta.get("status") or "") == "active"
                 and str(meta.get("effective_date") or "") <= today):
             deployments.append({
                 "account_id": row["id"],

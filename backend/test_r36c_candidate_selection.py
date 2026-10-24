@@ -904,11 +904,12 @@ class MigrationTests(unittest.TestCase):
         import db_migrate
         self.db_migrate = db_migrate
 
-    def test_v36_is_the_next_free_version(self):
+    def test_v36_keeps_its_owner_and_versions_remain_ordered(self):
         versions = [item[0] for item in self.db_migrate.MIGRATIONS["paper_trading"]]
         self.assertEqual(sorted(versions), versions)
-        self.assertEqual(36, max(versions))
-        self.assertEqual(36, versions[-1])
+        self.assertEqual(len(versions), len(set(versions)))
+        migration = next(item for item in self.db_migrate.MIGRATIONS["paper_trading"] if item[0] == 36)
+        self.assertIs(migration[2], self.db_migrate.paper_schema.ensure_candidate_selection)
 
     def test_sel35_migration_creates_table_without_backfill(self):
         import os, tempfile

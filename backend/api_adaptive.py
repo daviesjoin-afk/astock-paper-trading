@@ -1512,26 +1512,3 @@ def evolution_log(limit: int = Query(50, ge=1, le=200)):
         return {"log": adaptive.evolution_log_fn(limit)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取进化日志失败：{type(exc).__name__}") from exc
-
-
-# ─── modlens 路由 ───
-
-@router.get("/modlens/status")
-def modlens_status():
-    adaptive = _implementation("adaptive")
-    try:
-        return adaptive.modlens_status_fn()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"modlens状态失败：{type(exc).__name__}") from exc
-
-
-@router.post("/modlens/read-image")
-def modlens_read_image(
-    path: str = Query(..., max_length=1000),
-    prompt: str = Query(None, max_length=500),
-):
-    adaptive = _implementation("adaptive")
-    try:
-        return adaptive.modlens_read_image_fn(path, prompt)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"图片读取失败：{type(exc).__name__}") from exc

@@ -31,14 +31,14 @@ import random
 import sqlite3
 import statistics
 
+import data_paths
 import selection_labels as SL
 import selection_tradability as ST
 import security_state_point_in_time as SS
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE, "data_cache")
+DATA_DIR = data_paths.data_dir()
 KLINE_DIR = os.path.join(DATA_DIR, "klines")
-REPORT_PATH = os.path.join(BASE, "reports", "selection_alpha_report.md")
+REPORT_PATH = os.path.join(data_paths.report_dir(), "selection_alpha_report.md")
 WINDOW_DAYS = 30
 BENCH_N = 300
 

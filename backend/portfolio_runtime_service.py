@@ -58,15 +58,18 @@ def _market_valuation_dimension(*, owners, positions, asof_day, reading,
     partial, so capital planning remains gated.
     """
     snapshot = getattr(reading, "snapshot", None)
+    price_only = (isinstance(reading, MDC.MarketDataReading)
+                  and reading.available and reading.freshness == MDC.FRESHNESS_FRESH
+                  and reading.reason == MDC.REASON_PRICE_ONLY_COVERAGE)
     if (not isinstance(reading, MDC.MarketDataReading) or snapshot is None
             or snapshot.kind != "full_market_snapshot"
             or snapshot.as_of != str(asof_day)
-            or reading.status != MDC.STATUS_FRESH
-            or snapshot.verification != MDC.VERIFICATION_VERIFIED
-            or snapshot.verification_method not in {
+            or not (price_only or (reading.status == MDC.STATUS_FRESH
+                and snapshot.verification == MDC.VERIFICATION_VERIFIED
+                and snapshot.verification_method in {
                 MDC.VERIFICATION_METHOD_CROSS_SOURCE,
                 MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY,
-            }
+            }))
             or not str(snapshot.source or "").strip()):
         return _unavailable(
             "strategy_exposure", "exact_market_quote_evidence_unavailable",

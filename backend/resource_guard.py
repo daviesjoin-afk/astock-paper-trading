@@ -21,9 +21,10 @@ try:  # Linux production image; keep imports harmless for Windows tests.
 except ImportError:  # pragma: no cover
     fcntl = None
 
+import data_paths
 
-BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CACHE_DIR = Path(os.getenv("ASTOCK_CACHE_DIR") or (BASE_DIR / "data_cache"))
+
+CACHE_DIR = Path(os.getenv("ASTOCK_CACHE_DIR") or data_paths.data_dir())
 LOCK_PATH = CACHE_DIR / ".resource-heavy.lock"
 STATE_PATH = CACHE_DIR / "resource_heavy_status.json"
 STATE_LOCK_PATH = CACHE_DIR / ".resource-heavy-state.lock"

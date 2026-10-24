@@ -67,7 +67,7 @@ OPENING_EVENT_POLICIES: dict[str, dict] = {
         "rebuy_min_current_pct": -0.5,
     },
     NEW_STRATEGY_ID: {
-        "name": "财报突破质量",
+        "name": "三日策略",
         "enabled": True,
         "min_peak_pct": 3.5,
         "min_retrace_pct": 2.4,
@@ -236,6 +236,38 @@ def recovery_policy(account_id) -> dict:
     """RecoveryPolicy 访问器。未声明账户回退到 trend_pullback 模板（历史行为）。"""
     table = RECOVERY_POLICIES
     return dict(table.get(str(account_id or ""), table["trend_pullback"]))
+
+
+# ---------------------------------------------------------------------------
+# RecoveryEntryPolicy：普跌后"有上午依据的候选"恢复入场的阈值。
+#
+# 与 RecoveryPolicy（保护性卖出后的回补观察）区分：那一套管**已卖出**的仓位
+# 怎么回来，这一套管**从没买成**的候选怎么在午后重新获得入场资格。
+#
+# 三个上限都只回答一个问题："个股的下跌能不能被大盘解释"：
+#   market_recovery_floor_pct  指数回到多少才算市场本身已经恢复；
+#   relative_floor_pct         个股相对沪深300 弱到多少就按个股问题处理；
+#   outflow_main_pct           主力净流入低于多少按持续流出处理。
+# 未声明的账户**不启用**该路径（返回空 dict → 决策模块直接不放行）。
+#
+# 当前为空：2026-10-23 操作员决定直接放开午后首次触发，恢复通道因此不再
+# 是"午后能不能买"的前置条件（它本来是替被时段规则挡住的候选开一条窄门）。
+# 机制、状态机分支与测试全部保留；要重新启用，在此声明账户阈值、并给对应
+# entry_timing profile 加上 ``recovery_entry``/``recovery_confirm_scans``。
+# ---------------------------------------------------------------------------
+RECOVERY_ENTRY_POLICIES: dict[str, dict] = {}
+
+
+def recovery_entry_policy(account_id) -> dict:
+    """RecoveryEntryPolicy 访问器：含 reclaim_pct/min_scans 的统一阈值表。
+
+    未声明的账户返回空 dict——调用方必须据此判定"该策略不启用恢复入场"，
+    不能拿 trend_pullback 的模板套到别的策略上。
+    """
+    specific = RECOVERY_ENTRY_POLICIES.get(str(account_id or ""))
+    if not specific:
+        return {}
+    return {**recovery_policy(account_id), **specific}
 
 
 # ---------------------------------------------------------------------------

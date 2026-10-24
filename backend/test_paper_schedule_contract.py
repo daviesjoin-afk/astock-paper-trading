@@ -152,11 +152,12 @@ class SlotVocabularyGuard(unittest.TestCase):
                 "task names must come from the contract, not be re-declared",
             )
 
-    def test_scheduled_slots_are_a_subset_of_run_slots(self):
+    def test_scheduled_slots_have_an_explicit_runner_dispatch(self):
         self.assertTrue(
-            set(PSch.SCHEDULED_SLOTS) <= set(PSch.RUN_SLOTS),
-            "a scheduled entry must name a slot run_slot can actually execute",
+            set(PSch.SCHEDULED_SLOTS) <= set(PSch.RUNNER_SLOTS),
+            "a scheduled entry must name an executable runner slot",
         )
+        self.assertEqual(set(PSch.SCHEDULED_SLOTS) - set(PSch.RUN_SLOTS), {"auction-track"})
 
     def test_risk_and_fast_entry_are_deliberately_unscheduled(self):
         """The two unscheduled slots are a recorded decision, not an oversight.

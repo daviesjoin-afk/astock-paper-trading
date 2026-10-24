@@ -157,6 +157,12 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     #: 同时认识两套词表的接缝，并且只能是**一条**。它今天是**零 production 调用点**的
     #: 能力交付（event_evidence runtime 迁移属于后续 convergence）。
     "ai_research_news_adapter.py",
+    #: R27-B2C-8 新增**第十一个**：``ai_research_earnings_adapter`` —— 业绩公告事实的
+    #: owner adapter。它与 execution / portfolio / news 那几份同构：owner
+    #: （``earnings_disclosure_ledger``）不得 import research，research 契约也不得 import
+    #: DB-backed owner，因此必须有一条同时认识两套词表的接缝，并且只能是**一条**。
+    #: 它同样是**零 production 调用点**的能力交付（公告采集与候选编排属于后续步骤）。
+    "ai_research_earnings_adapter.py",
     #: R27-B2C-6 新增**第八个**：``ai_research_strategy_adapter`` —— adaptive /
     #: experiment 事实的 owner adapter。它与 execution / portfolio / news 那三份同构：
     #: 三个 owner（``adaptive_risk`` / ``adaptive_selection`` / ``learning_evaluation``）
@@ -1313,11 +1319,12 @@ class OwnerNativeVerificationTests(unittest.TestCase):
                 ARC.EVIDENCE_SOURCE_EXECUTION,
                 ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
                 ARC.EVIDENCE_SOURCE_NEWS,
+                ARC.EVIDENCE_SOURCE_DISCLOSURE,
                 ARC.EVIDENCE_SOURCE_STRATEGY_RESEARCH,
                 ARC.EVIDENCE_SOURCE_RUNTIME_INCIDENT,
             }),
             ARC.SUPPORTED_OWNER_ADAPTERS,
-            "已批准的 owner adapter registry 与 B2C-3 ~ B2C-7 的范围不一致",
+            "已批准的 owner adapter registry 与 B2C-3 ~ B2C-8 的范围不一致",
         )
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")

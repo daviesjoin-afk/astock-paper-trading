@@ -48,7 +48,6 @@ export var WB_FIELD_LABELS={close:'收盘价',open:'开盘价',high:'最高价',
 
 export var WB_INDICATOR_LABELS={ma:'均线 MA',ema:'指数均线 EMA',rsi:'RSI',atr:'ATR',volume_mean:'均量'};
 
-export var WB_STATUS_BADGES={draft:['DRAFT','strategy-status-draft'],candidate:['CANDIDATE','strategy-status-validated'],research:['RESEARCH','strategy-status-validated'],validated:['VALIDATED','strategy-status-validated'],shadow:['SHADOW','strategy-status-draft'],paper:['PAPER','strategy-status-active'],production_sim:['PRODUCTION_SIM','strategy-status-active'],degraded:['DEGRADED','strategy-status-paused'],paused:['PAUSED','strategy-status-paused'],retiring:['RETIRING','strategy-status-paused'],archived:['ARCHIVED','strategy-status-archived'],rejected:['REJECTED','strategy-status-archived'],validation_failed:['VALIDATION_FAILED','strategy-status-archived'],quarantined:['QUARANTINED','strategy-status-paused']};
 
 export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder',challengerReportId:'',pinnedCandidatePin:null,aiCandidateView:null};
 

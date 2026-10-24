@@ -588,7 +588,9 @@ def _ensure_config_defaults(conn):
         "llm_realtime_min_valid_rows": 1000,
         "llm_realtime_require_cross_source": True,
         "llm_realtime_max_accounts": 3,
-        "selection_auto_apply_bounded": False,
+        # 有界自动通道：只接受纯因子权重小步调整（单因子 ±3pp、键集固定、
+        # 组合上限校验）。条件、门槛与结构变更仍必须人工确认。
+        "selection_auto_apply_bounded": True,
         "selection_shadow_nav_days": 1,
         "selection_shadow_trade_events": 1,
         "selection_shadow_reward_samples": 2,
@@ -3046,20 +3048,8 @@ def _closed_loop_state(conn, evidence=None):
     return state
 
 
-def _shadow_history_rows(history):
-    return ASR.shadow_history_rows(history, num=_num)
 
 
-def _shadow_volatility(history, window):
-    return ASR.shadow_volatility(history, window, num=_num)
-
-
-def _shadow_atr_pct(history, window=20):
-    return ASR.shadow_atr_pct(history, window, num=_num)
-
-
-def _shadow_hhi(values):
-    return ASR.shadow_hhi(values, num=_num)
 
 
 def _portfolio_shadow_risk(positions, histories=None, asof=None, industry_shock_pct=-8.0,
@@ -3945,12 +3935,6 @@ def activate_evolution_candidate_fn(params_id, actor, reason=None):
             conn, params_id, actor=actor, reason=reason)
 
 
-def update_evolution_params_fn(adjustments, reason="manual"):
-    """手动调整进化参数。"""
-    with _connect() as conn:
-        self_evolution.ensure_schema(conn)
-        return self_evolution.manual_adjust(conn, adjustments, reason=reason)
-
 
 def trigger_evolution_fn():
     """手动触发一次进化。"""
@@ -3959,15 +3943,6 @@ def trigger_evolution_fn():
         return self_evolution.evolve(conn, reason="manual_trigger")
 
 
-def auto_evolution_fn():
-    """自动检查并执行进化。"""
-    with _connect() as conn:
-        self_evolution.ensure_schema(conn)
-        result = self_evolution.auto_evolve_if_needed(conn)
-        if result is None:
-            return {"evolved": False, "reason": "当前无需进化"}
-        return result
-
 
 def evolution_metrics_fn(window=20):
     """获取调参性能指标。"""
@@ -3975,12 +3950,6 @@ def evolution_metrics_fn(window=20):
         self_evolution.ensure_schema(conn)
         return self_evolution.get_performance_metrics(conn, window)
 
-
-def evolution_history_fn(limit=20):
-    """获取进化参数历史。"""
-    with _connect() as conn:
-        self_evolution.ensure_schema(conn)
-        return self_evolution.get_evolution_history(conn, limit)
 
 
 def evolution_log_fn(limit=50):
@@ -4380,28 +4349,8 @@ def evaluate_tuning_fn(tracking_id, eval_score, eval_detail=None):
         return {"success": True, "tracking_id": tracking_id, "eval_score": eval_score}
 
 
-def modlens_status_fn():
-    """返回 modlens 视觉桥接模块的状态。"""
-    try:
-        import modlens_bridge
-        return modlens_bridge.self_check()
-    except ImportError:
-        return {"modlens_available": False, "error": "modlens_bridge 未安装"}
 
 
-def modlens_read_image_fn(path, prompt=None):
-    """使用 modlens 读取图片。"""
-    import modlens_bridge
-    result = modlens_bridge.read_image(path, prompt)
-    result["formatted_text"] = modlens_bridge.format_for_prompt(result)
-    return result
-
-
-def dual_ai_status_fn():
-    """返回双AI共识调参系统的状态。"""
-    with _connect() as conn:
-        dual_ai_tuner.ensure_schema(conn)
-        return dual_ai_tuner.dual_ai_status(conn)
 
 
 def get_dual_ai_api_keys_fn():
@@ -4410,12 +4359,6 @@ def get_dual_ai_api_keys_fn():
         dual_ai_tuner.ensure_schema(conn)
         return dual_ai_tuner.get_api_keys(conn)
 
-
-def update_dual_ai_api_key_fn(provider, api_key=None, base_url=None, model=None, enabled=None):
-    """更新某个AI供应商的API配置。"""
-    with _connect() as conn:
-        dual_ai_tuner.ensure_schema(conn)
-        return dual_ai_tuner.update_api_key(conn, provider, api_key=api_key, base_url=base_url, model=model, enabled=enabled)
 
 
 def run_dual_ai_tuning_fn(trigger="manual", mode="intraday"):
@@ -4473,15 +4416,28 @@ def update_ai_review_settings_fn(review_mode=None, single_reviewer_slot=None):
 
 
 def update_ai_slot_fn(slot, api_key=None, base_url=None, model=None, enabled=None,
-                      display_name=None, timeout_seconds=None, clear_api_key=False):
+                      display_name=None, timeout_seconds=None, clear_api_key=False, provider_id=None):
     """更新单个 AI 槽位配置；只影响该槽位。"""
     import ai_review_service
     with _connect() as conn:
         ai_review_service.update_slot(
             conn, slot, api_key=api_key, base_url=base_url, model=model, enabled=enabled,
             display_name=display_name, timeout_seconds=timeout_seconds,
-            clear_api_key=clear_api_key)
+            clear_api_key=clear_api_key, provider_id=provider_id)
         return ai_review_service.review_settings_view(conn)
+
+
+def save_ai_provider_fn(provider_id=None, **updates):
+    import ai_review_service
+    with _connect() as conn:
+        provider = ai_review_service.save_provider(conn, provider_id, **updates)
+        return {"provider": provider, "review": ai_review_service.review_settings_view(conn)}
+
+
+def refresh_ai_provider_models_fn(provider_id):
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.refresh_provider_models(conn, provider_id)
 
 
 def ai_review_status_fn():
@@ -4496,6 +4452,13 @@ def test_ai_slot_fn(slot):
     import ai_review_service
     with _connect() as conn:
         return ai_review_service.test_slot(conn, slot)
+
+
+def list_ai_slot_models_fn(slot):
+    """列出该槽位上游的可用模型（只读；不发 chat 请求、不消耗 token）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.list_slot_models(conn, slot)
 
 
 def _current_profile_snapshot():

@@ -8,7 +8,6 @@ all runtime/infrastructure dependencies through :class:`RiskEvidenceDeps`.
 from __future__ import annotations
 
 import datetime as dt
-import json
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -21,9 +20,11 @@ import paper_replacement_evidence as PREPL
 import paper_risk_decision as PRD
 import strategy_policies as SPOL
 from paper_trading_rules import limit_pct as _limit_pct, security_scope as _security_scope
+from paper_common import now_text as _now, as_date as _date, dump_json as _json, load_json as _loads
 
 __all__ = [
     "RiskEvidenceDeps",
+    "prefetch_position_alt_data",
     "best_replacement_candidate",
     "intraday_downside_guard",
     "downside_confirmed",
@@ -58,31 +59,6 @@ class RiskEvidenceDeps:
     load_kline: Callable[..., Any]
 
 
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _loads(value, default=None):
-    try:
-        return json.loads(value) if value else (default if default is not None else {})
-    except (TypeError, ValueError):
-        return default if default is not None else {}
-
-
 def _num(value, default=0.0):
     return float(value) if isinstance(value, (int, float)) and pd.notna(value) else default
 
@@ -115,6 +91,43 @@ def _hold_days(position, asof_day, load_kline):
 
 def _replacement_min_hold_days(account_id):
     return int(SPOL.position_review_min_hold_days(account_id))
+
+
+_POSITION_ALT_SIGNALS = (
+    "lockup_penalty", "lhb_position_signal", "margin_signal",
+    "block_trade_signal", "holder_signal",
+)
+
+
+def _position_alt_signals(code, asof_day, alt_data):
+    """Keep each optional source's existing independent failure fallback."""
+    if alt_data is None:
+        return {}
+    signals = {}
+    for name in _POSITION_ALT_SIGNALS:
+        try:
+            value, description = getattr(alt_data, name)(code, asof_day=asof_day)
+            signals[name] = (value, description)
+        except Exception:
+            signals[name] = (0.0, None)
+    return signals
+
+
+def prefetch_position_alt_data(positions, asof_day, *, alt_data):
+    """Collect date-bound shadow inputs once per code, before a writer opens.
+
+    The returned map belongs to this risk invocation only. Missing entries do
+    not authorize a provider call at the later ledger-write boundary.
+    """
+    if alt_data is None:
+        return {}
+    day = _date(asof_day)
+    return {
+        (day, str(position["code"])): _position_alt_signals(
+            str(position["code"]), asof_day, alt_data,
+        )
+        for position in {str(row["code"]): row for row in positions}.values()
+    }
 
 
 def _volatility_shadow(code, asof_day, price, load_kline):
@@ -212,6 +225,17 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     ret_pct = (price / cost - 1) * 100 if price and cost else None
     market_pct = _num((market or {}).get("live_index_pct"), None)
     relative = pct - market_pct if pct is not None and market_pct is not None else None
+    # 相对强弱的参照必须能追溯：指数不可用/不属于当日时 relative 为 None，
+    # 记录里要说明"为什么未知"，而不是让人误读成"没有跑输大盘"。
+    market_reference = {
+        "index_pct": market_pct,
+        "index_time": (market or {}).get("live_index_time"),
+        "status": (
+            ((market or {}).get("index_reference") or {}).get("status")
+            or ("same_session" if market_pct is not None else "unavailable")
+        ),
+        "relative_available": relative is not None,
+    }
     peak = PRD.position_peak(position, quote, price, asof_day=asof_day)
     peak_retrace = (1 - price / peak) * 100 if price and peak else None
     peak_return = (peak / cost - 1) * 100 if peak and cost else None
@@ -288,7 +312,10 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
             (deps.strategy_risk_behaviors.get(account_id) or {}).get(
                 "washout_loss_override_pct"
             ),
-            -4.0,
+            # 默认取 -5.0 而不是 -4.0：硬止损线是 -4%，两者相等时"洗盘豁免"恰好在
+            # 它唯一该起作用的时刻失效——刚刚触发首段减仓的位置会被守卫再叠一层
+            # 减仓。豁免线必须严格落在止损线之外，才谈得上"风险尚可承受时延迟减仓"。
+            -5.0,
         )
         loss_beyond_override = (
             ret_pct is not None and ret_pct <= washout_override
@@ -330,6 +357,7 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
         "intraday_pct": round(pct, 2) if pct is not None else None,
         "cost_return_pct": round(ret_pct, 2) if ret_pct is not None else None,
         "relative_to_market_pct": round(relative, 2) if relative is not None else None,
+        "market_reference": market_reference,
         "peak_retrace_pct": round(peak_retrace, 2) if peak_retrace is not None else None,
         "peak_return_pct": round(peak_return, 2) if peak_return is not None else None,
         "giveback_pct": round(giveback, 2) if giveback is not None else None,
@@ -424,7 +452,7 @@ def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvi
 
 
 def position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None, replacement=None, nav=None, market=None,
-                           flow_trajectory=None, deps: RiskEvidenceDeps):
+                           flow_trajectory=None, deps: RiskEvidenceDeps, alt_evidence=None):
     """Score an existing holding for concentration decisions (0..100).
 
     The score is intentionally independent from the entry gate: it combines
@@ -501,36 +529,19 @@ def position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=No
     news_penalty = min(24.0, len(negative) * 12.0)
     # 限售解禁预警（P0）：未来30天大额解禁（≥3%流通）重扣，60天≥5%中扣。
     # 解禁是确定性的供给冲击，等价格反应再退出就晚了；数据源失败时扣0。
-    lockup_penalty, lockup_desc = 0.0, None
-    if deps.alt_data is not None:
-        try:
-            lockup_penalty, lockup_desc = deps.alt_data.lockup_penalty(code, asof_day=asof_day)
-        except Exception:
-            lockup_penalty, lockup_desc = 0.0, None
+    # Direct compatibility calls retain live lookup. The risk service always
+    # supplies a map (even when empty), so its write transaction cannot fetch.
+    signals = (_position_alt_signals(code, asof_day, deps.alt_data)
+               if alt_evidence is None else alt_evidence.get((_date(asof_day), code), {}))
+    lockup_penalty, lockup_desc = signals.get("lockup_penalty", (0.0, None))
     # 龙虎榜信号（P1）：近7天上榜净买 +6（抢筹确认），净卖 -6（出货警示）。
-    lhb_bonus, lhb_desc = 0.0, None
-    if deps.alt_data is not None:
-        try:
-            lhb_bonus, lhb_desc = deps.alt_data.lhb_position_signal(code, asof_day=asof_day)
-        except Exception:
-            lhb_bonus, lhb_desc = 0.0, None
+    lhb_bonus, lhb_desc = signals.get("lhb_position_signal", (0.0, None))
     # 筹码/杠杆信号（P2）：两融 ±4、大宗 -5/+3、股东户数 ±5。
     # 各自独立小幅度，合计最坏 -14，与 lockup/lhb 共同构成替代数据
     # 评分层；任一数据源失败该项为 0，不影响其余。
-    margin_bonus, margin_desc, block_bonus, block_desc, holder_bonus, holder_desc = 0.0, None, 0.0, None, 0.0, None
-    if deps.alt_data is not None:
-        try:
-            margin_bonus, margin_desc = deps.alt_data.margin_signal(code, asof_day=asof_day)
-        except Exception:
-            margin_bonus, margin_desc = 0.0, None
-        try:
-            block_bonus, block_desc = deps.alt_data.block_trade_signal(code, asof_day=asof_day)
-        except Exception:
-            block_bonus, block_desc = 0.0, None
-        try:
-            holder_bonus, holder_desc = deps.alt_data.holder_signal(code, asof_day=asof_day)
-        except Exception:
-            holder_bonus, holder_desc = 0.0, None
+    margin_bonus, margin_desc = signals.get("margin_signal", (0.0, None))
+    block_bonus, block_desc = signals.get("block_trade_signal", (0.0, None))
+    holder_bonus, holder_desc = signals.get("holder_signal", (0.0, None))
     alt_bonus = lhb_bonus + margin_bonus + block_bonus + holder_bonus
     alt_shadow_delta = alt_bonus - lockup_penalty
     weights = deps.holding_quality_weights.get(account_id, deps.holding_quality_weights["trend_pullback"])
@@ -745,7 +756,7 @@ def save_position_review(conn, cycle_id, review, action, reason):
 
 
 def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, spec_override=None,
-              *, base_spec, deps: RiskEvidenceDeps):
+              *, base_spec, deps: RiskEvidenceDeps, hard_stop_trim=None):
     """卖出决策的 orchestration adapter：解析输入 → 交给纯 engine → 组装旧 schema。
 
     真正的硬止损/移动止损/最长持有/阶梯止盈/严重度仲裁都在
@@ -760,6 +771,13 @@ def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, sp
         spec.update(spec_override)
     days = _hold_days(position, asof_day, deps.load_kline)
     price = _num(quote.get("price"), 0)
+    # 首段减仓的执行证据（成交价/距今分钟）：全清需要"继续跌破或等足时间"这一层
+    # 独立确认。证据字典为 None 表示当日没有可验证的首段成交；字典存在但字段为
+    # None 表示已执行而证据不可解析——两者都不能被当成"没卖过"。
+    if hard_stop_trim is not None:
+        hard_stop_touched_today = True
+    trim_age = (hard_stop_trim or {}).get("age_minutes")
+    trim_price = (hard_stop_trim or {}).get("filled_price")
     decision = PRD.evaluate_sell(
         position, quote, asof_day=asof_day, spec=spec, hold_days=days, news=news,
         hard_stop_touched_today=hard_stop_touched_today,
@@ -768,6 +786,9 @@ def sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, sp
         hard_stop_first_trim_ratio=SPOL.intraday_downside_policy(
             position["account_id"]
         ).get("partial_ratio", 0.35),
+        # engine 用它判断"是否继续恶化"与"等了多久"；拿不到时保持旧行为。
+        hard_stop_trim_age_minutes=trim_age,
+        hard_stop_trim_price=trim_price,
         risk_version=deps.risk_version,
     )
     if decision["status"] == "no_quote":

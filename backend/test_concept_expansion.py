@@ -1,5 +1,8 @@
+import json
 import os
 import sys
+import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -79,6 +82,172 @@ class ConceptExpansionTests(unittest.TestCase):
         lane, _ = PT._concept_expansion_lane_candidates(concepts, universe, live, asof_date="2026-09-02")
         self.assertEqual([row["code"] for row in lane], ["002536"])
         self.assertEqual(lane[0]["concept_context"]["discovery_path"], "leader_reverse_map")
+
+
+class ConceptMemberCacheTests(unittest.TestCase):
+    """Board membership is shared across scans; failures must still retry."""
+
+    def setUp(self):
+        with DF._cache_lock:
+            DF._mem_cache.clear()
+        DF._concept_member_locks.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._dir = os.path.join(self._tmp.name, "concept_members")
+        self._refs_dir = os.path.join(self._tmp.name, "concept_refs")
+        self._patch = mock.patch.object(DF, "CONCEPT_MEMBERS_CACHE_DIR", self._dir)
+        self._patch.start()
+        self._refs_patch = mock.patch.object(DF, "CONCEPT_REFS_CACHE_DIR", self._refs_dir)
+        self._refs_patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._refs_patch.stop()
+        self._tmp.cleanup()
+        with DF._cache_lock:
+            DF._mem_cache.clear()
+
+    @staticmethod
+    def _payload(count=2, complete=True):
+        return {
+            "members": [{"code": "00000%d" % index, "name": "成员", "price": 10.0, "pct": 1.0}
+                        for index in range(count)],
+            "expected_count": count, "fetched_count": count if complete else 0,
+            "pages_ok": 1 if complete else 0, "pages_expected": 1,
+            "malformed_rows": 0, "complete": complete,
+        }
+
+    def test_complete_members_are_reused_after_the_process_restarts(self):
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["board_code"])
+            return self._payload()
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            first = DF._fetch_concept_members("BK1138")
+            with DF._cache_lock:
+                DF._mem_cache.clear()  # a new cron process starts with an empty memory cache
+            second = DF._fetch_concept_members("BK1138")
+
+        self.assertEqual(calls, ["BK1138"])
+        self.assertEqual(first, second)
+
+    def test_incomplete_members_are_retried_instead_of_cached(self):
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["board_code"])
+            return self._payload(count=0, complete=False)
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            DF._fetch_concept_members("BK1138")
+            DF._fetch_concept_members("BK1138")
+
+        self.assertEqual(calls, ["BK1138", "BK1138"])
+
+    def test_each_board_keeps_its_own_entry(self):
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["board_code"])
+            return self._payload()
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            DF._fetch_concept_members("BK1138")
+            DF._fetch_concept_members("BK1139")
+            DF._fetch_concept_members("BK1138")
+
+        self.assertEqual(calls, ["BK1138", "BK1139"])
+
+    def test_unexpected_board_codes_never_reach_the_cache_path(self):
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["board_code"])
+            return self._payload()
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            DF._fetch_concept_members("../escape")
+            DF._fetch_concept_members("../escape")
+
+        self.assertEqual(calls, ["../escape", "../escape"])
+        self.assertFalse(os.path.exists(self._dir))
+
+    def test_cached_membership_never_keeps_the_riding_quotes(self):
+        def fake(**kwargs):
+            return {
+                "members": [{"code": "000001", "name": "甲", "industry": "设备",
+                             "price": 10.0, "pct": 3.0, "main_net": 500.0}],
+                "expected_count": 1, "fetched_count": 1, "pages_ok": 1,
+                "pages_expected": 1, "malformed_rows": 0, "complete": True,
+            }
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            result = DF._fetch_concept_members("BK1138")
+
+        self.assertEqual(result["members"], [{"code": "000001", "name": "甲", "industry": "设备"}])
+        path = os.path.join(self._dir, "v%d-BK1138.json" % DF.CONCEPT_MEMBERS_CACHE_VERSION)
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle)["value"]
+        self.assertNotIn("pct", stored["members"][0])
+        self.assertNotIn("price", stored["members"][0])
+
+    def test_previous_cache_shape_is_never_served(self):
+        os.makedirs(self._dir, exist_ok=True)
+        stale = {"version": 1, "fetched_epoch": time.time(),
+                 "value": {"members": [{"code": "000001", "name": "旧", "pct": 99.0}],
+                           "complete": True}}
+        with open(os.path.join(self._dir, "BK1138.json"), "w", encoding="utf-8") as handle:
+            json.dump(stale, handle)
+
+        calls = []
+
+        def fake(**kwargs):
+            calls.append(kwargs["board_code"])
+            return self._payload()
+
+        with mock.patch.object(DF.MP, "fetch_eastmoney_concept_members", side_effect=fake):
+            result = DF._fetch_concept_members("BK1138")
+
+        self.assertEqual(calls, ["BK1138"])
+        self.assertNotIn("pct", result["members"][0])
+
+    def test_hot_concept_positive_ratio_uses_the_supplied_quotes(self):
+        boards = [{"code": "BK1138", "name": "液冷服务器", "pct": 2.0, "main_net": 1000}]
+        slim = {
+            "members": [{"code": "000001", "name": "甲", "industry": "设备"},
+                        {"code": "000002", "name": "乙", "industry": "设备"}],
+            "expected_count": 2, "fetched_count": 2, "pages_ok": 1,
+            "pages_expected": 1, "malformed_rows": 0, "complete": True,
+        }
+        quotes = {"000001": {"price": 10.0, "pct": 3.0}, "000002": {"price": 5.0, "pct": -1.0}}
+
+        with mock.patch.object(DF, "fetch_sector_flow", return_value=boards), \
+             mock.patch.object(DF, "_fetch_concept_members", return_value=slim):
+            with_quotes = DF.fetch_hot_concept_snapshot(6, quotes=quotes)
+            with DF._cache_lock:
+                DF._mem_cache.clear()
+            without_quotes = DF.fetch_hot_concept_snapshot(6)
+
+        self.assertEqual(with_quotes[0]["positive_ratio"], 0.5)
+        self.assertEqual(without_quotes[0]["positive_ratio"], 0.0)
+
+    def test_stock_concept_refs_are_reused_across_processes(self):
+        calls = []
+
+        def fake_get_json(url, params=None, timeout=15, retries=2):
+            calls.append(params["secid"])
+            return {"data": {"diff": [{"f12": "BK1138", "f14": "液冷服务器"}]}}
+
+        with mock.patch.object(DF, "_get_json", side_effect=fake_get_json):
+            first = DF._fetch_stock_concept_refs("600519")
+            with DF._cache_lock:
+                DF._mem_cache.clear()
+            second = DF._fetch_stock_concept_refs("600519")
+
+        self.assertEqual(calls, ["1.600519"])
+        self.assertEqual(first, second)
+        self.assertTrue(first)
 
 
 if __name__ == "__main__":

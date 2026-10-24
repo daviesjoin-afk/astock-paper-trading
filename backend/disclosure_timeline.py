@@ -41,7 +41,6 @@ DEFAULT_PAGE_SIZE = 100
 DEFAULT_MAX_PAGES = 3
 MIN_REQUEST_INTERVAL_SECONDS = 0.35
 
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
 CACHE_PATH = data_paths.data_path("disclosure_timeline.json")
 _CACHE_LOCK = threading.RLock()

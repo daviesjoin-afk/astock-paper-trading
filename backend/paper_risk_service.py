@@ -9,7 +9,6 @@ pending-manual bookkeeping.  It never imports :mod:`paper_trading`.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager
@@ -19,6 +18,7 @@ import execution_verification as EV
 import paper_account_specs as ACS
 import paper_decision_audit as PDA
 import paper_portfolio_read_model as PPort
+import paper_numeric as PNum
 import paper_position_review as PReview
 import paper_position_risk_state as PPRS
 import paper_quote_policy as PQP
@@ -35,6 +35,7 @@ import strategy_risk_enforcement as SRE
 import strategy_runtime as SRT
 import user_strategy_participation as USP
 from paper_trading_rules import limit_pct as _limit_pct
+from paper_common import now_text as _now, as_date as _date, dump_json as _json
 
 __all__ = ["RiskRunContext", "RiskServicePorts", "run"]
 
@@ -84,26 +85,8 @@ class RiskServicePorts:
     assert_active_lease: Callable[..., Any]
 
 
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _num(value, default=0.0):
-    return float(value) if isinstance(value, (int, float)) and value == value else default
+#: 与 `paper_numeric.num` 同一实现（严格契约），不再保留本地副本。
+_num = PNum.num
 
 
 def _lease_lost(exc):
@@ -329,7 +312,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 news=news, replacement=replacement, nav=pool_nav,
                 market=market_context,
                 flow_trajectory=flow_trajectory_map.get(position["code"]),
-                deps=ports.evidence,
+                deps=ports.evidence, alt_evidence=market_inputs.get("position_alt_data") or {},
             )
             review["review_date"] = day
             review["dynamic_position_limit"] = count_budget["limits"].get(position["account_id"], 5)
@@ -469,20 +452,21 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             # （status='filled' + VERIFIED_PREDICATE），部分成交会被读成"没发生过"，
             # 于是每轮扫描再发一张同样的减仓单 —— 300+300+300… 突破配置比例。
             # 中文 reason LIKE 仅作标记上线前旧订单的兜底。
-            hard_stop_touched_today = EV.has_verified_positive_execution(
+            # 首段减仓执行证据（成交价 + 距今分钟），全清据此要求独立确认。
+            hard_stop_trim = EV.first_verified_positive_execution(
                 conn, marker="hard_stop_first_trim",
                 account_id=position["account_id"], code=position["code"],
-                asof_day=day, legacy_reason_like="%硬止损首段减仓%",
-            )
+                asof_day=day, legacy_reason_like="%硬止损首段减仓%")
             base_spec = _spec_for(position["account_id"], conn, cycle_id=cycle_id)
             ratio, reason, next_stage, detail = PREv.sell_plan(
-                position, quote, day, news, hard_stop_touched_today=hard_stop_touched_today,
+                position, quote, day, news,
                 # PR-30：卖出状态机的止损/移动止损/时间止损用 cycle-pinned 编译画像。
                 spec_override=SRE.effective_spec_for_cycle(
                     conn, position["account_id"], base_spec, cycle_id=cycle_id,
                 ),
                 base_spec=base_spec,
                 deps=ports.evidence,
+                hard_stop_trim=hard_stop_trim,
             )
             quality_action, quality_reason = PReview.decide_action(
                 quality_review, position, quote_status, concentration_sells_used,

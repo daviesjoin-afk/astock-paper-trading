@@ -56,6 +56,9 @@ class TencentSnapshotGateTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self._patch_min_rows()
+        fallback = mock.patch.object(dfc, "_fetch_sina_realtime_for_codes", return_value=[])
+        fallback.start()
+        self.addCleanup(fallback.stop)
 
     def _cleanup(self):
         for name in os.listdir(self._dir):
@@ -83,6 +86,22 @@ class TencentSnapshotGateTests(unittest.TestCase):
         self.assertEqual(first["quote_at"], "2026-10-14T10:30:00+08:00")
         self.assertIsNone(first["super_net"])
         self.assertIsNone(first["industry"])
+
+    def test_sina_can_supply_the_full_price_slice_when_tencent_is_down(self):
+        codes = _codes(4100)
+        rows = [{**_TencentRow.build(code), "source": "sina_public_quote",
+                 "quote_at": NOW.isoformat()} for code in codes]
+        with mock.patch.object(dfc, "fetch_tencent_realtime_for_codes", side_effect=RuntimeError("offline")), \
+                mock.patch.object(dfc, "_fetch_sina_realtime_for_codes", return_value=rows) as fallback:
+            snapshot = dfc.fetch_tencent_market_snapshot(codes, max_age=240, now=NOW)
+        fallback.assert_called_once_with(codes)
+        self.assertEqual(len(snapshot), len(codes))
+        self.assertEqual(snapshot[0]["source"], "sina_public_quote")
+        self.assertEqual(dfc.full_market_snapshot_source()["source"], "public_quote_full_snapshot")
+        reading = MDSvc.read_snapshot(now=NOW)
+        self.assertEqual(reading.reason, MDC.REASON_PRICE_ONLY_COVERAGE)
+        self.assertEqual(reading.freshness, MDC.FRESHNESS_FRESH)
+        self.assertFalse(MDC.is_cross_source_verified(reading.snapshot))
 
     def test_incomplete_coverage_publishes_nothing(self):
         codes = _codes(5000)
@@ -390,6 +409,99 @@ class RefreshFallbackTests(unittest.TestCase):
         self.assertEqual(MDC.STATUS_DEGRADED,reading.status)
         self.assertFalse(MDC.is_cross_source_verified(reading.snapshot))
 
+
+
+class PublishedSnapshotProvenanceTests(unittest.TestCase):
+    """降级必须可见：审计里要能看出实际服务方与资金流字段是否缺失。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._path = os.path.join(self._tmp.name, "market_snapshot_full.json")
+        self._patch = mock.patch.object(dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH", self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, payload):
+        with open(self._path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_price_only_fallback_is_reported_as_such(self):
+        self._write({"source": MDSvc.TENCENT_SNAPSHOT_SOURCE, "saved_at": NOW.isoformat(),
+                     "complete": True, "rows": _codes(4100), "expected_rows": 4100})
+        provenance = dfc.full_market_snapshot_source()
+        self.assertEqual(provenance["source"], MDSvc.TENCENT_SNAPSHOT_SOURCE)
+        self.assertTrue(provenance["price_only"])
+        self.assertEqual(provenance["rows"], 4100)
+
+    def test_eastmoney_snapshot_is_not_reported_as_price_only(self):
+        self._write({"source": "eastmoney-clist", "saved_at": NOW.isoformat(),
+                     "complete": True, "rows": _codes(10), "expected_rows": 10})
+        provenance = dfc.full_market_snapshot_source()
+        self.assertEqual(provenance["source"], "eastmoney-clist")
+        self.assertFalse(provenance["price_only"])
+
+    def test_missing_or_unreadable_payload_reports_nothing(self):
+        self.assertIsNone(dfc.full_market_snapshot_source())
+        with open(self._path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        self.assertIsNone(dfc.full_market_snapshot_source())
+
+    def test_flow_field_coverage_separates_price_only_rows(self):
+        price_only = [{**_TencentRow.build(code)} for code in _codes(20)]
+        for row in price_only:
+            row.pop("main_net", None)
+            row.pop("vol_ratio", None)
+        self.assertEqual(0.0, MDC.flow_field_coverage(price_only))
+
+        with_flow = [dict(row, main_net=1.0, vol_ratio=1.5) for row in price_only]
+        self.assertEqual(1.0, MDC.flow_field_coverage(with_flow))
+
+        mixed = with_flow[:10] + price_only[:10]
+        self.assertEqual(0.5, MDC.flow_field_coverage(mixed))
+        self.assertEqual(0.0, MDC.flow_field_coverage([]))
+        self.assertEqual(0.0, MDC.flow_field_coverage(None))
+
+
+class HealthProjectionProvenanceTests(unittest.TestCase):
+    """健康响应必须能直接读出服务方、是否纯价格、以及资金流字段覆盖率。"""
+
+    @staticmethod
+    def _rows(count, *, with_flow):
+        rows = []
+        for code in _codes(count):
+            row = {"code": code, "name": f"股票{code}", "price": 10.0,
+                   "prev_close": 9.9, "pct": 1.0, "quote_at": NOW.isoformat()}
+            if with_flow:
+                row["main_net"] = 1.0
+                row["vol_ratio"] = 1.2
+            rows.append(row)
+        return rows
+
+    def _project(self, source, rows):
+        payload = {"source": source, "saved_at": NOW.isoformat(), "complete": True,
+                   "expected_rows": len(rows), "rows": rows}
+        with mock.patch.object(dfc, "load_market_snapshot_full_payload", return_value=payload), \
+                mock.patch.object(dfc, "load_source_health", return_value={"healthy": True}):
+            return MDSvc.market_health_projection(now=NOW)
+
+    def test_price_only_fallback_is_projected_with_its_source_and_no_flow(self):
+        projection = self._project(MDSvc.TENCENT_SNAPSHOT_SOURCE, self._rows(4100, with_flow=False))
+        meta = projection["snapshot_meta"]
+        self.assertEqual(MDSvc.TENCENT_SNAPSHOT_SOURCE, meta["source"])
+        self.assertTrue(meta["price_only"])
+        self.assertEqual(0.0, meta["flow_field_coverage"])
+        self.assertEqual(MDC.STATUS_DEGRADED, projection["data_fact"]["status"])
+        self.assertEqual(MDC.REASON_PRICE_ONLY_COVERAGE, projection["data_fact"]["reason"])
+
+    def test_cross_section_reports_source_and_full_flow_coverage(self):
+        projection = self._project("eastmoney-clist", self._rows(4100, with_flow=True))
+        meta = projection["snapshot_meta"]
+        self.assertEqual("eastmoney-clist", meta["source"])
+        self.assertFalse(meta["price_only"])
+        self.assertEqual(1.0, meta["flow_field_coverage"])
 
 
 if __name__ == "__main__":

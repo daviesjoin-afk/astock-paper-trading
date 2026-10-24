@@ -13,15 +13,13 @@
 .ai-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:10px 12px;text-align:center}
 .ai-card small{display:block;color:var(--text-muted);font-size:11px;margin-bottom:4px}
 .ai-card b{font-size:14px}
-.ai-params-panel,.ai-runs-panel,.ai-metrics-panel,.ai-log-panel,.ai-modlens-panel{margin:16px 0}
-.ai-params-panel h4,.ai-runs-panel h4,.ai-metrics-panel h4,.ai-log-panel h4,.ai-modlens-panel h4{margin-bottom:8px;color:var(--text-secondary);font-size:13px}
+.ai-auction-panel,.ai-params-panel,.ai-runs-panel,.ai-metrics-panel,.ai-log-panel{margin:16px 0}
+.ai-auction-panel h4,.ai-params-panel h4,.ai-runs-panel h4,.ai-metrics-panel h4,.ai-log-panel h4{margin-bottom:8px;color:var(--text-secondary);font-size:13px}
 .ai-params-grid table{width:100%}
 .ai-metrics-kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
 .ai-metrics-kpis div{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:8px;text-align:center}
 .ai-metrics-kpis small{display:block;color:var(--text-muted);font-size:11px}
 .ai-metrics-kpis b{font-size:13px}
-.ai-modlens-output pre{white-space:pre-wrap;word-break:break-all}
-.adaptive-ai-section .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 </style>
 
 </head>
@@ -53,20 +51,20 @@
       <button class="strategy-workbench-filter" type="button" data-wb-origin="builtin" onclick="wbSetOriginFilter('builtin',this)">内置</button>
       <button class="strategy-workbench-filter" type="button" data-wb-origin="user" onclick="wbSetOriginFilter('user',this)">我的策略</button>
       <button class="strategy-workbench-filter" type="button" data-wb-status="all" onclick="wbSetStatusFilter('all',this)">全部状态</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="draft" onclick="wbSetStatusFilter('draft',this)">Draft</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="candidate" onclick="wbSetStatusFilter('candidate',this)">Candidate</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="research" onclick="wbSetStatusFilter('research',this)">Research</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="validated" onclick="wbSetStatusFilter('validated',this)">Validated</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="shadow" onclick="wbSetStatusFilter('shadow',this)">Shadow</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="paper" onclick="wbSetStatusFilter('paper',this)">Paper</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="production_sim" onclick="wbSetStatusFilter('production_sim',this)">Production Sim</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="paused" onclick="wbSetStatusFilter('paused',this)">Paused</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="degraded" onclick="wbSetStatusFilter('degraded',this)">Degraded</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="retiring" onclick="wbSetStatusFilter('retiring',this)">Retiring</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="archived" onclick="wbSetStatusFilter('archived',this)">Archived</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="rejected" onclick="wbSetStatusFilter('rejected',this)">Rejected</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="validation_failed" onclick="wbSetStatusFilter('validation_failed',this)">Validation Failed</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="quarantined" onclick="wbSetStatusFilter('quarantined',this)">Quarantined</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="draft" onclick="wbSetStatusFilter('draft',this)">草稿</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="candidate" onclick="wbSetStatusFilter('candidate',this)">候选</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="research" onclick="wbSetStatusFilter('research',this)">研究中</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="validated" onclick="wbSetStatusFilter('validated',this)">已验证</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="shadow" onclick="wbSetStatusFilter('shadow',this)">影子阶段</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="paper" onclick="wbSetStatusFilter('paper',this)">模拟运行中</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="production_sim" onclick="wbSetStatusFilter('production_sim',this)">生产模拟</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="paused" onclick="wbSetStatusFilter('paused',this)">已暂停</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="degraded" onclick="wbSetStatusFilter('degraded',this)">已降级</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="retiring" onclick="wbSetStatusFilter('retiring',this)">退役中</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="archived" onclick="wbSetStatusFilter('archived',this)">已归档</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="rejected" onclick="wbSetStatusFilter('rejected',this)">已拒绝</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="validation_failed" onclick="wbSetStatusFilter('validation_failed',this)">验证失败</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="quarantined" onclick="wbSetStatusFilter('quarantined',this)">安全隔离</button>
     </div>
     <input id="wbSearch" class="strategy-workbench-search" type="search" placeholder="搜索策略名称或 ID…" aria-label="搜索策略" oninput="wbRenderList()">
   </div>
@@ -83,6 +81,7 @@
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略运行参数</b><small>内置与自定义策略 · 风格 · 席位</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" data-testid="settings-section-evolution" onclick="setSettingsSection('evolution',this)"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="execution" onclick="setSettingsSection('execution',this)"><span class="module-code">执行画像</span><span class="module-copy"><b>执行画像执行器</b><small>批量窗口 · 人工核验 · 时限</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="notification" data-testid="settings-section-notification" onclick="setSettingsSection('notification',this)"><span class="module-code">推送</span><span class="module-copy"><b>日报与周报推送</b><small>WxPusher · 发送时间 · 测试</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="operator" data-testid="settings-section-operator" onclick="setSettingsSection('operator',this)"><span class="module-code">授权</span><span class="module-copy"><b>操作员授权</b><small>本标签页解锁 · 写操作凭据</small></span></button>
     </nav>
     <div id="settingsResult" aria-live="polite" data-testid="settings-result"><div class="loading">正在读取统一设置…</div></div>
@@ -99,7 +98,7 @@
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="history" onclick="showPaperWorkspace('history',this)"><span class="module-code">历史档案</span><span class="module-copy"><b>&#x4e2a;&#x80a1;&#x6863;&#x6848;</b><small>&#x5386;&#x53f2;&#x4e70;&#x5356;&#x4e0e;&#x635f;&#x76ca;&#x5f52;&#x56e0;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="risk" onclick="showPaperWorkspace('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>&#x98ce;&#x63a7;&#x4e2d;&#x5fc3;</b><small>&#x95e8;&#x7981;&#x3001;&#x98ce;&#x9669;&#x961f;&#x5217;&#x3001;&#x5ba1;&#x8ba1;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="execution" onclick="showPaperWorkspace('execution',this)"><span class="module-code">执行</span><span class="module-copy"><b>执行画像</b><small>七档执行参数 · 批量窗口 · 人工核验</small></span></button>
-    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="allocation" data-testid="paper-allocation-tab" onclick="showPaperWorkspace('allocation',this)"><span class="module-code">组合计划</span><span class="module-copy"><b>Portfolio Workspace</b><small>按明确周期与计划查看只读证据</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="allocation" data-testid="paper-allocation-tab" onclick="showPaperWorkspace('allocation',this)"><span class="module-code">组合计划</span><span class="module-copy"><b>组合计划工作台</b><small>按明确周期与计划查看只读证据</small></span></button>
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" data-testid="paper-runtime-strategies" hidden><div class="loading">正在读取运行策略状态…</div></div>
@@ -154,13 +153,13 @@
   <div id="paperExecutionView" class="paper-execution-view" hidden><div class="loading">正在读取执行画像与执行队列…</div></div>
   <div id="paperAllocationView" class="paper-allocation-view" hidden>
     <section class="panel paper-allocation-panel">
-      <header><div><span class="page-kicker">READ ONLY · EXACT PLAN</span><h3>Portfolio Workspace</h3><p>必须输入明确的 cycle ID 与 plan ID。此页面只展示该计划绑定的快照和订单来源，不会自动选择最新计划，也不会授予交易权限。</p></div></header>
+      <header><div><span class="page-kicker">只读证据 · 指定计划</span><h3>组合计划工作台</h3><p>必须输入明确的周期编号与计划编号。此页面只展示该计划绑定的快照和订单来源，不会自动选择最新计划，也不会授予交易权限。</p></div></header>
       <form id="portfolioWorkspaceForm" class="paper-allocation-form" onsubmit="event.preventDefault();loadPortfolioWorkspace()">
-        <label>Cycle ID<input id="portfolioWorkspaceCycle" data-testid="portfolio-workspace-cycle" type="number" min="1" step="1" required></label>
-        <label>Plan ID<input id="portfolioWorkspacePlan" data-testid="portfolio-workspace-plan" type="text" minlength="64" maxlength="64" required autocomplete="off"></label>
+        <label>周期编号<input id="portfolioWorkspaceCycle" data-testid="portfolio-workspace-cycle" type="number" min="1" step="1" required></label>
+        <label>计划编号<input id="portfolioWorkspacePlan" data-testid="portfolio-workspace-plan" type="text" minlength="64" maxlength="64" required autocomplete="off"></label>
         <button type="submit">读取指定计划</button>
       </form>
-      <div id="portfolioWorkspaceResult" data-testid="portfolio-workspace-result" aria-live="polite"><div class="paper-empty">输入明确的 cycle ID 和 plan ID 后读取。</div></div>
+      <div id="portfolioWorkspaceResult" data-testid="portfolio-workspace-result" aria-live="polite"><div class="paper-empty">输入明确的周期编号和计划编号后读取。</div></div>
     </section>
   </div>
 </div>

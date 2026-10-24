@@ -67,7 +67,7 @@ __all__ = [
     # verification method
     "VERIFICATION_METHOD_CROSS_SOURCE", "VERIFICATION_METHOD_COVERAGE_INTEGRITY",
     "VERIFICATION_METHOD_NONE", "VERIFICATION_METHODS",
-    "is_cross_source_verified",
+    "is_cross_source_verified", "is_execution_quote_usable",
     # access mode
     "ACCESS_READ", "ACCESS_REFRESH", "ACCESS_MODES",
     # reasons
@@ -79,11 +79,11 @@ __all__ = [
     "STATUS_FRESH", "STATUS_STALE", "STATUS_DEGRADED", "STATUS_UNAVAILABLE",
     "STATUS_UNVERIFIED", "STATUSES",
     # policy
-    "MarketDataPolicy", "LIVE_MARKET_POLICY", "AUCTION_PRESELECTION_POLICY",
+    "MarketDataPolicy", "LIVE_MARKET_POLICY", "AUCTION_PRESELECTION_POLICY", "AUCTION_TRACKING_POLICY",
     "OPENING_EVENT_POLICY", "UNIVERSE_BUILD_POLICY", "ATTRIBUTION_POLICY",
     "CLOSE_SNAPSHOT_POLICY", "MARKET_HEALTH_POLICY", "EXECUTION_QUOTE_POLICY",
     "POLICIES", "policy_named",
-    "CROSS_SECTION_MIN_FRESH_RATIO", "fresh_ratio",
+    "CROSS_SECTION_MIN_FRESH_RATIO", "fresh_ratio", "flow_field_coverage",
     "close_snapshot_window", "close_snapshot_rows", "provider_max_age",
     # snapshot / reading
     "MarketDataSnapshot", "MarketDataReading", "snapshot_fingerprint",
@@ -294,6 +294,11 @@ AUCTION_PRESELECTION_POLICY = MarketDataPolicy(
     "auction_preselection", 90.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
 )
 
+# 09:15 起的竞价观测只保存当时可见的个股行情，不签发交易许可。
+AUCTION_TRACKING_POLICY = MarketDataPolicy(
+    "auction_tracking", 90.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
+)
+
 #: 开盘事件监测：容忍窗口更短。
 OPENING_EVENT_POLICY = MarketDataPolicy(
     "opening_event", 120.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
@@ -324,7 +329,7 @@ MARKET_HEALTH_POLICY = MarketDataPolicy("market_health_display", 1800.0)
 EXECUTION_QUOTE_POLICY = MarketDataPolicy("execution_quote", 1200.0)
 
 POLICIES = (
-    LIVE_MARKET_POLICY, AUCTION_PRESELECTION_POLICY, OPENING_EVENT_POLICY,
+    LIVE_MARKET_POLICY, AUCTION_PRESELECTION_POLICY, AUCTION_TRACKING_POLICY, OPENING_EVENT_POLICY,
     UNIVERSE_BUILD_POLICY, ATTRIBUTION_POLICY, CLOSE_SNAPSHOT_POLICY,
     MARKET_HEALTH_POLICY, EXECUTION_QUOTE_POLICY,
 )
@@ -957,6 +962,25 @@ def verification_from_cross_status(status: Any) -> str:
     }.get(text, VERIFICATION_NOT_ATTEMPTED)
 
 
+def flow_field_coverage(rows: Any) -> float:
+    """携带资金流字段的行占比。
+
+    行覆盖完整只证明"这只股票在快照里"，不证明它的资金流字段被取到。
+    腾讯纯价格回退是合法降级，但它的 ``main_net`` / ``vol_ratio`` 全为空，
+    依赖资金流的选择通道会静默选不出任何标的；把这一项和行覆盖并列记录，
+    降级就不必再靠"某条通道没产出"去反推。
+    """
+    total = 0
+    with_flow = 0
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        total += 1
+        if row.get("main_net") is not None and row.get("vol_ratio") is not None:
+            with_flow += 1
+    return round(with_flow / total, 4) if total else 0.0
+
+
 def is_cross_source_verified(snapshot: MarketDataSnapshot | None) -> bool:
     """该快照是否**真的**通过了多源交叉核验。
 
@@ -970,6 +994,20 @@ def is_cross_source_verified(snapshot: MarketDataSnapshot | None) -> bool:
     return (
         snapshot.verification == VERIFICATION_VERIFIED
         and snapshot.verification_method == VERIFICATION_METHOD_CROSS_SOURCE
+    )
+
+
+def is_execution_quote_usable(reading: MarketDataReading | None) -> bool:
+    """A fresh validated single source can price a paper order; conflicts cannot."""
+    if reading is None or not reading.available or reading.freshness != FRESHNESS_FRESH:
+        return False
+    snapshot = reading.snapshot
+    if snapshot is None or snapshot.kind != "symbol_quote" or not snapshot.complete:
+        return False
+    return is_cross_source_verified(snapshot) or (
+        snapshot.verification == VERIFICATION_SINGLE_SOURCE
+        and len(snapshot.rows) == 1
+        and snapshot.rows[0].get("quote_validation") == "range_timestamp_checked"
     )
 
 

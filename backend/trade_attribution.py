@@ -17,6 +17,7 @@ import os
 import sqlite3
 from collections import Counter, defaultdict
 
+import data_paths
 import execution_verification as EV
 try:
     from zoneinfo import ZoneInfo
@@ -25,8 +26,7 @@ except Exception:  # Windows minimal Python images may not ship tzdata.
     TZ = dt.timezone(dt.timedelta(hours=8))
 
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE, "data_cache")
+CACHE_DIR = data_paths.data_dir()
 DB_PATH = os.path.join(CACHE_DIR, "adaptive_learning.sqlite3")
 BENCHMARK_CACHE_KEY = "BENCH_000300"
 ENGINE_VERSION = "trade-attribution-v2-pit"
@@ -656,11 +656,13 @@ def _ai_batches(items, config, trigger, conn_factory):
     try:
         import deepseek_advisor
         if not bool((config or {}).get("trade_attribution_ai_enabled", True)):
-            raise RuntimeError("ai_disabled")
-        if not deepseek_advisor.configured():
-            raise RuntimeError("api_key_missing")
+            raise deepseek_advisor.ResearchReadinessError("ai_disabled")
+        # Use the same canonical slot resolver as post-close research. It
+        # respects saved-provider bindings, cleared keys, enablement and model
+        # settings; legacy environment credentials are not a second authority.
+        provider_config = deepseek_advisor._research_provider_config(conn_factory)
     except Exception as exc:
-        reason = str(exc) or type(exc).__name__
+        reason = str(getattr(exc, "reason", type(exc).__name__))
         with conn_factory() as conn:
             for item in items:
                 conn.execute("UPDATE adaptive_trade_attributions SET ai_status='deterministic_fallback',ai_provider=NULL,ai_reason=?,ai_summary=?,updated_at=? WHERE order_id=?",
@@ -668,8 +670,10 @@ def _ai_batches(items, config, trigger, conn_factory):
         return {"status": "deterministic_fallback", "analyzed": 0, "deterministic": len(items), "error": reason}
     analyzed = 0
     errors = []
-    for start in range(0, len(items), 20):
-        batch = items[start:start + 20]
+    # Bounded batches keep per-request generation within the selected slot's
+    # existing timeout, including models that spend output tokens on reasoning.
+    for start in range(0, len(items), 5):
+        batch = items[start:start + 5]
         evidence = [{
             "order_id": item["order_id"], "strategy": item.get("account_id"), "code": item.get("code"),
             "name": item.get("name"), "side": item.get("side"), "qty": item.get("qty"),
@@ -683,13 +687,15 @@ def _ai_batches(items, config, trigger, conn_factory):
         system = (
             "你是A股模拟盘盘后归因助手。只能根据输入中的确定性证据解释可能原因，"
             "不能把相关性写成已证实因果，不能补造公告、资金或行情；大盘拖累、板块拖累、"
-            "公告影响、个股超额都必须引用对应字段。只输出严格JSON："
+            "公告影响、个股超额都必须引用对应字段。每条摘要不超过60字，主要原因最多3项；"
+            "不要复述整笔交易或输出思考过程、Markdown。只输出一个严格JSON对象："
             '{"analyses":[{"order_id":1,"summary":"中文摘要","primary_causes":["大盘拖累"],"confidence":0}]}。'
         )
         user = "请逐笔返回分析，不要遗漏order_id。置信度0-100，证据不足就写‘证据不足’。\n" + _json(evidence)
         try:
-            import deepseek_advisor
-            response, _, _ = deepseek_advisor.call_json(system, user, max_tokens=2600)
+            import ai_provider_transport
+            response, _, _, _ = ai_provider_transport.call_json(
+                provider_config, system, user, max_tokens=4000)
             rows = response.get("analyses") if isinstance(response, dict) else []
             mapping = {int(row.get("order_id")): row for row in rows if isinstance(row, dict) and str(row.get("order_id") or "").isdigit()}
             with conn_factory() as conn:
@@ -702,18 +708,19 @@ def _ai_batches(items, config, trigger, conn_factory):
                     causes = row.get("primary_causes") if isinstance(row.get("primary_causes"), list) else []
                     summary = str(row.get("summary") or "").strip()[:800]
                     confidence = _num(row.get("confidence"), 0.0)
-                    conn.execute("UPDATE adaptive_trade_attributions SET ai_status='completed',ai_provider='DeepSeek',ai_summary=?,ai_reason=?,ai_confidence=?,updated_at=? WHERE order_id=?",
-                                 (summary or _fallback_summary(item), _json([str(c)[:80] for c in causes[:6]]), confidence,
+                    conn.execute("UPDATE adaptive_trade_attributions SET ai_status='completed',ai_provider=?,ai_summary=?,ai_reason=?,ai_confidence=?,updated_at=? WHERE order_id=?",
+                                 (provider_config["slot"], summary or _fallback_summary(item), _json([str(c)[:80] for c in causes[:6]]), confidence,
                                   _now(), item["order_id"]))
                     analyzed += 1
         except Exception as exc:
-            errors.append(f"{type(exc).__name__}:{exc}")
+            errors.append(str(getattr(exc, "reason", type(exc).__name__)))
             with conn_factory() as conn:
                 for item in batch:
                     conn.execute("UPDATE adaptive_trade_attributions SET ai_status='failed_fallback',ai_reason=?,ai_summary=?,updated_at=? WHERE order_id=?",
                                  (type(exc).__name__, _fallback_summary(item), _now(), item["order_id"]))
     return {"status": "completed" if analyzed else "deterministic_fallback", "analyzed": analyzed,
-            "deterministic": len(items) - analyzed, "error": ";".join(errors)[:500] if errors else None}
+            "deterministic": len(items) - analyzed, "error": ";".join(errors)[:500] if errors else None,
+            "provider": provider_config["slot"], "model": provider_config["model"]}
 
 
 def _pending_items(conn, target_date):
@@ -803,7 +810,7 @@ def run_close_attribution(connect_factory, paper_db_path, trade_date=None, confi
                deterministic_count,updated_horizons,evidence_hash,detail,error_code,started_at,finished_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (target_date.isoformat(), str(trigger or "scheduled-close")[:80], status,
-             "DeepSeek" if ai.get("analyzed") else None, None, len(today_items), filled,
+             ai.get("provider"), ai.get("model"), len(today_items), filled,
              int(ai.get("analyzed") or 0), int(ai.get("deterministic") or 0), horizon_updates,
              evidence_hash, _json(detail), ai.get("error"), started, _now()),
         )

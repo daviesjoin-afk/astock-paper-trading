@@ -92,6 +92,9 @@ EXPECTED_OWNER_FACTORIES = {
     "news": (
         "ai_research_news_adapter", "evidence_ref_from_news_projection",
     ),
+    "disclosure": (
+        "ai_research_earnings_adapter", "evidence_ref_from_earnings_projection",
+    ),
     "strategy_research": (
         "ai_research_strategy_adapter", "evidence_ref_from_strategy_projection",
     ),
@@ -119,11 +122,15 @@ OWNER_FACTORY_ORIGINS = frozenset(EXPECTED_OWNER_FACTORIES.values())
 #: 三个 owner 各自发布 typed 事实与核验闭集，唯一 adapter 归口）。
 #: R27-B2C-7 引入 runtime_incident 的第六个（runtime / incident owner readiness：
 #: 两个 owner 各自发布 typed attempt / run 事实与核验闭集，唯一 adapter 归口）。
+#: R27-B2C-8 引入 disclosure 的第七个（业绩公告 owner readiness：
+#: ``earnings_disclosure_ledger`` 发布带 PIT 可用性与修正链的 typed 投影，
+#: 唯一 adapter ``ai_research_earnings_adapter`` 归口）。
 APPROVED_ISSUER_CALLERS = frozenset({
     (CONTRACT_MODULE_FILE, "evidence_ref_from_market_reading"),
     ("ai_research_execution_adapter.py", "evidence_ref_from_execution_projection"),
     ("ai_research_portfolio_adapter.py", "evidence_ref_from_portfolio_projection"),
     ("ai_research_news_adapter.py", "evidence_ref_from_news_projection"),
+    ("ai_research_earnings_adapter.py", "evidence_ref_from_earnings_projection"),
     ("ai_research_strategy_adapter.py", "evidence_ref_from_strategy_projection"),
     ("ai_research_runtime_adapter.py", "evidence_ref_from_runtime_projection"),
 })

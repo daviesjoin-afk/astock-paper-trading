@@ -750,12 +750,24 @@ def evaluate_simulated_execution(
         reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
     else:
         snapshot = reading.snapshot
-        if reading.freshness != MDC.FRESHNESS_FRESH:
-            reasons.append(ExecutionReason.MARKET_STALE.value)
-        elif snapshot is None or snapshot.verification == MDC.VERIFICATION_DISAGREEMENT:
-            reasons.append(ExecutionReason.MARKET_DISAGREEMENT.value)
-        elif not MDC.is_cross_source_verified(snapshot):
-            reasons.append(ExecutionReason.MARKET_UNVERIFIED.value)
+        if side == "sell":
+            # 风控退出只需要"能用来定价的当日报价"，不需要第二源背书。双源核验是
+            # 买入的兜底机制，不是止损失效的理由：独立源分歧或不可用时，
+            # ``paper_quote_policy`` 已按 exit 用途降级放行，成交价按主行情计算并
+            # 保留分歧证据。真正过期的报价仍然阻断——那已经无法用来定价。
+            age = reading.age_seconds
+            within_exit_window = (
+                age is not None and age <= MDC.EXECUTION_QUOTE_POLICY.max_age_seconds
+            )
+            if reading.freshness != MDC.FRESHNESS_FRESH and not within_exit_window:
+                reasons.append(ExecutionReason.MARKET_STALE.value)
+        else:
+            if reading.freshness != MDC.FRESHNESS_FRESH:
+                reasons.append(ExecutionReason.MARKET_STALE.value)
+            elif snapshot is None or snapshot.verification == MDC.VERIFICATION_DISAGREEMENT:
+                reasons.append(ExecutionReason.MARKET_DISAGREEMENT.value)
+            elif not MDC.is_execution_quote_usable(reading):
+                reasons.append(ExecutionReason.MARKET_UNVERIFIED.value)
         if snapshot is not None and str(snapshot.as_of or "") != str(context.session_date or ""):
             reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
 
@@ -963,7 +975,6 @@ def _session_phase(value) -> str:
 
 # 席位预留与手动入场复核的“所有者”仍然来自 paper_trading 的单一常量定义，
 # 但只在构造策略表时读取一次；执行代码里不再出现身份比较。
-_CHASE_LANES = frozenset({"none", "momentum", "sector_hot"})
 _SEAT_RESERVE_DEADLINE = "14:30"
 
 
@@ -1077,7 +1088,7 @@ def _default_policies() -> dict[str, ExecutionPolicy]:
         first_tranche_nav_pct=0.12,
         holds_reserved_seat=True,
     )
-    # 财报突破质量的手动委托必须走独立入场复核，不能在运营界面绕过策略模型。
+    # 三日策略的手动委托必须走独立入场复核，不能在运营界面绕过策略模型。
     put(
         quality_breakout,
         entry_label="三日策略",
@@ -1959,13 +1970,18 @@ def commit_fill(
             payload = _plain_evidence(detail if detail is not None else plan)
             payload = payload if isinstance(payload, dict) else {"detail": payload}
             payload["execution"] = execution_evidence
+            # ``reason`` 是**策略/风控为什么下这张委托**，执行阻塞是另一件事：
+            # 写进 ``execution_reasons``/``execution_evidence``。旧实现把阻塞码
+            # 覆盖到 ``reason``，恢复成交时调用方又把这条被覆盖的 reason 传回来，
+            # 四笔真实成交的卖单最后都写着 "TRADABILITY_UNKNOWN"——策略原因被
+            # 执行插曲吃掉，复盘无法回答"当时为什么卖"。
             conn.execute(
                 """UPDATE paper_orders
-                      SET status=?,reason=?,execution_asof=?,execution_reasons=?,
+                      SET status=?,execution_asof=?,execution_reasons=?,
                           execution_evidence=?,ruleset_version=?,execution_version=execution_version+1,
                           remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
                     WHERE id=? AND execution_version=?""",
-                (next_status, reason_codes or reason, decision.execution_asof,
+                (next_status, decision.execution_asof,
                  PT._json(list(decision.reasons)), PT._json(execution_evidence),
                  decision.ruleset_version, order_id, current_version),
             )

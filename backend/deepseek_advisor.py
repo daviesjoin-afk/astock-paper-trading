@@ -244,6 +244,68 @@ def _finding(code, severity, title, evidence, action):
     }
 
 
+def _window_return(points, latest, days):
+    """净值序列相对 ``days`` 个净值日前的百分比变化。"""
+    if len(points) <= days:
+        return None
+    base = points[-1 - days]
+    return round((latest / base - 1.0) * 100.0, 2) if base else None
+
+
+def _account_performance(paper, window_days=20):
+    """每个模拟账户的近期绩效：净值、收益、回撤、已实现盈亏、成交笔数。
+
+    AI 此前只能看到「有多少笔成交」这类计数，没有任何收益或回撤证据，于是
+    每次都以「缺少绩效恶化证据」为由 hold。这里给出可复核的数字，让调参有
+    依据而不是靠猜。
+    """
+    performance = {}
+    try:
+        rows = paper.execute(
+            "SELECT account_id, nav_date, nav FROM paper_nav ORDER BY account_id, nav_date"
+        ).fetchall()
+        realized = {
+            str(account_id): round(float(total or 0.0), 2)
+            for account_id, total in paper.execute(
+                "SELECT account_id, SUM(realized_pnl) FROM paper_orders "
+                "WHERE realized_pnl IS NOT NULL GROUP BY account_id"
+            )
+        }
+        fills = {
+            str(account_id): int(count)
+            for account_id, count in paper.execute(
+                "SELECT account_id, COUNT(*) FROM paper_fills GROUP BY account_id"
+            )
+        }
+    except sqlite3.Error:
+        return performance
+
+    series = {}
+    for account_id, _nav_date, nav in rows:
+        series.setdefault(str(account_id), []).append(float(nav or 0.0))
+    for account_id, points in series.items():
+        points = [value for value in points if value > 0]
+        if len(points) < 2:
+            continue
+        latest = points[-1]
+        peak = points[-window_days:][0]
+        drawdown = 0.0
+        for value in points[-window_days:]:
+            peak = max(peak, value)
+            if peak > 0:
+                drawdown = min(drawdown, (value / peak - 1.0) * 100.0)
+        performance[account_id] = {
+            "nav": round(latest, 2),
+            "return_1d_pct": _window_return(points, latest, 1),
+            "return_5d_pct": _window_return(points, latest, 5),
+            "return_10d_pct": _window_return(points, latest, 10),
+            "max_drawdown_pct": round(drawdown, 2),
+            "realized_pnl": realized.get(account_id),
+            "fills": fills.get(account_id, 0),
+        }
+    return performance
+
+
 def _secondary_quote_check(rows, important_codes):
     """Reconcile a deterministic sample against Tencent public quotes."""
     if not _truthy(os.getenv("SECONDARY_QUOTE_ENABLED")):
@@ -313,7 +375,7 @@ def _secondary_quote_check(rows, important_codes):
 
 
 def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
-    """Return aggregate evidence only; no raw records or free-form user text."""
+    """Return aggregates and bounded auction observations; no secrets or raw logs."""
     now = dt.datetime.now(TZ)
     payload, source_file = _read_snapshot(snapshot_paths)
     rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
@@ -367,6 +429,7 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         "fill_order_mismatches": 0,
     }
     important_codes = set()
+    account_performance = {}
     if not ledger["database_present"]:
         findings.append(_finding("ledger_missing", "critical", "模拟盘账本不存在", "未找到 paper_trading.sqlite3", "恢复账本后再运行学习与审查"))
     else:
@@ -390,6 +453,7 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
             important_codes.update(str(row[0]) for row in paper.execute(
                 "SELECT DISTINCT code FROM paper_fills ORDER BY id DESC LIMIT 80"
             ))
+            account_performance = _account_performance(paper)
         finally:
             paper.close()
         for key, title in (
@@ -433,6 +497,10 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
     rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
     if findings:
         max_severity = max((item["severity"] for item in findings), key=lambda value: rank[value])
+    import factor_effectiveness_report as factor_report
+    factor_effectiveness = factor_report.evidence_summary(factor_report.build_report(paper_db_path, asof=now))
+    import auction_analysis
+    auction_evidence = auction_analysis.evidence(now, rows, adaptive_conn, important_codes)
     evidence = {
         "scope": "paper_trading_only",
         "generated_at": _now(),
@@ -453,8 +521,12 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
             "cross_source": cross_source,
         },
         "paper_ledger": ledger,
+        "account_performance": account_performance,
+        "factor_effectiveness": factor_effectiveness,
+        "auction_tracking": auction_evidence,
         "adaptive_learning": adaptive_stats,
         "deterministic_findings": findings,
+        "deterministic_findings_meaning": "仅列出已执行检查发现的异常；空列表表示这些检查未发现异常，不代表因子有效性证据充分。",
         "deterministic_max_severity": max_severity,
     }
     canonical = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -746,6 +818,26 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
     }
 
 
+def _baseline_weights(account_id, overlay):
+    """账户当前生效的因子权重基线。
+
+    没有 ``adaptive_selection`` overlay 时，运行时用的是模型默认权重
+    （``strategies.PAPER_WEIGHTS``）。基线必须与运行时一致：给模型空权重会让
+    它在 prompt 里看到空因子列表、无从提案，共识层也会因为 ``base_weights``
+    为空直接判 ``weight_format_invalid`` —— AI 于是永远只能 hold，而 apply
+    侧比的又是 ``PAPER_WEIGHTS``，两边基线不一致。
+    """
+    try:
+        import paper_account_specs as specs
+        import strategies as S
+
+        source = specs.ACCOUNT_SPECS.get(account_id, {}).get("source_strategy")
+        family = S.selection_model_family(account_id, overlay, source)
+        return dict(S.PAPER_WEIGHTS.get(family) or {})
+    except Exception:
+        return {}
+
+
 def _tuning_accounts(paper_db_path):
     """Read only the small, auditable account state sent to the model."""
     try:
@@ -763,11 +855,20 @@ def _tuning_accounts(paper_db_path):
     for row in rows:
         params = _loads(row["params"], {}) or {}
         overlay = params.get("adaptive_selection") or {}
+        account_id = str(row["id"])
+        weights = overlay.get("weights") or {}
+        if not weights:
+            weights = _baseline_weights(account_id, overlay)
+        if not weights:
+            # 硬规则策略（三日策略、主力股）不走加权评分，没有因子可调。
+            # 把它们放进 prompt 只会让模型对无因子账户提案，而共识层又会因
+            # base_weights 为空判 weight_format_invalid，拖累其它账户的共识。
+            continue
         accounts.append({
-            "account_id": str(row["id"]),
+            "account_id": account_id,
             "version": str(row["version"] or ""),
             "style": str(row["style"] or ""),
-            "weights": overlay.get("weights") or {},
+            "weights": weights,
             "entry_score_delta": overlay.get("entry_score_delta", params.get("entry_score_delta", params.get("min_t_score_delta", 0.0))),
             "conditions": overlay.get("conditions") or {},
             # Thresholds and conditions are intentionally not exposed as

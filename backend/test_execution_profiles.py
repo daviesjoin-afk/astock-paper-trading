@@ -97,6 +97,43 @@ class EntryLimitTests(unittest.TestCase):
         self.assertEqual(20.04, result["limit_price"])
         self.assertTrue(result["reason"])
 
+    def test_frozen_limit_never_rises_with_the_reference(self):
+        """锚点冻结：参考价被刷新抬高，也不能把限价一起抬起来。
+
+        这是"当轮买不到、下轮锚点更高"的结构性追价来源：限价画像的参考价
+        每轮取当轮实时价，重算就会跟着涨。冻结在首次限价后只降不升。
+        """
+        deferred = profiles.enforce_entry_limit(
+            profiles.EXECUTION_PROFILES["trend"], 20.10, reference_price=20.0)
+        self.assertFalse(deferred["allowed"])
+        self.assertEqual(20.04, deferred["limit_price"])
+
+        # 参考价涨到 20.50：若无冻结限价，限价会变成 20.54 并放行这笔追高。
+        recomputed = profiles.enforce_entry_limit(
+            profiles.EXECUTION_PROFILES["trend"], 20.30, reference_price=20.50)
+        self.assertTrue(recomputed["allowed"])
+
+        frozen = profiles.enforce_entry_limit(
+            profiles.EXECUTION_PROFILES["trend"], 20.30,
+            reference_price=20.50, frozen_limit_price=20.04)
+        self.assertFalse(frozen["allowed"])
+        self.assertEqual(20.04, frozen["limit_price"])
+
+        # 价格回落到冻结价以内 → 允许，限价仍是冻结价（不随之抬高）
+        filled = profiles.enforce_entry_limit(
+            profiles.EXECUTION_PROFILES["trend"], 20.03,
+            reference_price=20.50, frozen_limit_price=20.04)
+        self.assertTrue(filled["allowed"])
+        self.assertEqual(20.04, filled["limit_price"])
+
+    def test_frozen_limit_only_tightens(self):
+        """冻结价高于重算值时取更紧的那个，绝不放宽。"""
+        result = profiles.enforce_entry_limit(
+            profiles.EXECUTION_PROFILES["trend"], 20.02,
+            reference_price=20.0, frozen_limit_price=25.0)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(20.04, result["limit_price"])
+
     def test_passive_limit_defers_on_any_gap_up(self):
         # mean_reversion 让价 0%：现价高于参考价即延期，只在参考价内被动成交。
         within = profiles.enforce_entry_limit(

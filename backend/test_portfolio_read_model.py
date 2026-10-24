@@ -24,6 +24,21 @@ DAY = dt.date(2026, 9, 20)
 NEXT = DAY + dt.timedelta(days=1)
 
 
+class _FillQueryCapture:
+    def __init__(self, conn):
+        self.conn = conn
+        self.sql = None
+        self.params = None
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+    def execute(self, sql, params=()):
+        if "SELECT f.id AS fill_id" in sql and "JOIN paper_orders o" in sql:
+            self.sql, self.params = sql, params
+        return self.conn.execute(sql, params)
+
+
 class PortfolioReadModelContractTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -106,6 +121,73 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(context.cycle_id, self.cycle100)
         self.assertEqual(context.asof_day, DAY)
 
+    def test_fill_join_keeps_contradictory_rows_and_cycle_date_bounds(self):
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        for side, reader in (("buy", P._buy_fills), ("sell", P._sell_fills)):
+            with self.subTest(side=side):
+                valid = self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                             price=10.0, fill_date=DAY.isoformat())
+                conflicting = self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                                   price=10.0, fill_date=DAY.isoformat())
+                self.conn.execute("UPDATE paper_fills SET side=? WHERE order_id=?",
+                                  ("sell" if side == "buy" else "buy", conflicting))
+                self._order_and_fill(cycle_id=self.cycle101, side=side, qty=100,
+                                     price=10.0, fill_date=DAY.isoformat())
+                self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                     price=10.0, fill_date=NEXT.isoformat())
+                capture = _FillQueryCapture(self.conn)
+                changes = self.conn.total_changes
+                proven, raw, available = reader(capture, context, account_id=ACCOUNT)
+                reference = [dict(row) for row in self.conn.execute(
+                    capture.sql.replace("CROSS JOIN paper_orders o", "JOIN paper_orders o"),
+                    capture.params,
+                )]
+                self.assertEqual(raw, reference)
+                self.assertEqual({r["order_id"] for r in raw}, {valid, conflicting})
+                self.assertEqual([r["order_id"] for r in proven], [valid])
+                self.assertTrue(available)
+                self.assertEqual(self.conn.total_changes, changes)
+
+    def test_sparse_fill_read_work_does_not_grow_with_unfilled_orders(self):
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        for side in ("buy", "sell"):
+            self._order_and_fill(cycle_id=self.cycle100, side=side, qty=100,
+                                 price=10.0, fill_date=DAY.isoformat())
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        self.conn.executemany(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,cycle_id,strategy_id,strategy_version,"
+            "strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(ACCOUNT, side, CODE, "fixture", 100, 10.0, "risk_rejected", "fixture",
+              "x" * 1024, DAY.isoformat(), self.cycle100, *stamp)
+             for side in ("buy", "sell") for _ in range(1000)],
+        )
+        self.conn.commit()
+        for side, reader in (("buy", P._buy_fills), ("sell", P._sell_fills)):
+            with self.subTest(side=side):
+                capture = _FillQueryCapture(self.conn)
+                reader(capture, context)
+                steps = [0]
+
+                def tick(steps=steps):
+                    steps[0] += 1
+                    return 0
+
+                self.conn.set_progress_handler(tick, 1)
+                try:
+                    actual = [dict(r) for r in self.conn.execute(capture.sql, capture.params)]
+                finally:
+                    self.conn.set_progress_handler(None, 0)
+                reference = [dict(row) for row in self.conn.execute(
+                    capture.sql.replace("CROSS JOIN paper_orders o", "JOIN paper_orders o"),
+                    capture.params,
+                )]
+                self.assertEqual(actual, reference)
+                self.assertEqual(len(actual), 1)
+                # SQLite VM work, not a fragile wall-clock assertion. The two
+                # fills must drive the read even with 2,000 fill-less intents.
+                self.assertLess(steps[0], 1000)
+
     def test_snapshot_reuses_proof_without_changing_facts_or_mutable_results(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())
@@ -133,6 +215,154 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertLess(len(statements), uncached_count // 2)
         self.assertIsNone(P._snapshot_reads.get())
+
+    def test_nested_position_capture_reuses_outer_execution_evidence(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        self.conn.execute("BEGIN")
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+
+        @P.snapshot_read
+        def capture(conn):
+            lots = P.bounded_lots_with_status(conn, context, account_id=ACCOUNT)
+            positions = P.positions_for_context_with_status(conn, context, account_id=ACCOUNT)
+            return lots, positions, P.verified_cash_flows(conn, context, account_id=ACCOUNT)
+
+        expected = capture.__wrapped__(self.conn)
+        statements = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            self.assertEqual(capture(self.conn), expected)
+        finally:
+            self.conn.set_trace_callback(None)
+        fills = [sql for sql in statements if "SELECT f.id AS fill_id" in sql]
+        self.assertEqual(sum("o.side='sell'" in sql for sql in fills), 1)
+        self.assertEqual(sum("o.side='buy'" in sql for sql in fills), 1)
+        self.assertIsNone(P._snapshot_reads.get())
+
+    def test_nested_capture_preserves_scope_after_error_and_invalidates_after_write(self):
+        calls = []
+
+        @P._snapshot_evidence
+        def evidence(conn):
+            calls.append(1)
+            return [len(calls)]
+
+        @P.snapshot_read
+        def nested(conn):
+            value = evidence(conn)
+            value.append("consumer mutation")
+            raise ValueError("nested failed")
+
+        @P.snapshot_read
+        def capture(conn):
+            first = evidence(conn)
+            with self.assertRaisesRegex(ValueError, "nested failed"):
+                nested(conn)
+            self.assertEqual(evidence(conn), first)
+            self.assertEqual(len(calls), 1)
+            conn.execute("UPDATE paper_accounts SET name=name WHERE id=?", (ACCOUNT,))
+            self.assertNotEqual(evidence(conn), first)
+            with self.assertRaisesRegex(ValueError, "nested failed"):
+                nested(conn)
+            self.assertEqual(evidence(conn), [2])
+            self.assertEqual(len(calls), 2)
+
+        self.conn.execute("BEGIN")
+        capture(self.conn)
+        self.assertIsNone(P._snapshot_reads.get())
+        self.assertEqual(evidence(self.conn), [3])
+
+    def test_nested_capture_on_other_connection_restores_outer_scope(self):
+        other = sqlite3.connect(":memory:")
+        self.addCleanup(other.close)
+        other.execute("BEGIN")
+        self.conn.execute("BEGIN")
+        calls = []
+
+        @P._snapshot_evidence
+        def evidence(conn):
+            calls.append(conn)
+            return len(calls)
+
+        @P.snapshot_read
+        def nested(conn):
+            first = evidence(conn)
+            self.assertEqual(first, evidence(conn))
+            return first
+
+        @P.snapshot_read
+        def capture(conn):
+            first = evidence(conn)
+            self.assertNotEqual(first, nested(other))
+            self.assertEqual(evidence(conn), first)
+
+        capture(self.conn)
+        self.assertEqual(calls, [self.conn, other])
+        self.assertIsNone(P._snapshot_reads.get())
+        capture(self.conn)
+        self.assertEqual(calls, [self.conn, other, self.conn, other])
+
+    def test_shared_source_rows_recheck_each_lot_and_invalidate_on_write(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        lot_id = self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        lot = dict(self.conn.execute(
+            "SELECT * FROM paper_position_lots WHERE id=?", (lot_id,)).fetchone())
+        self.conn.execute("BEGIN")
+        statements = []
+
+        @P.snapshot_read
+        def capture(conn):
+            first = P._verified_source_buy_fill(conn, lot)
+            self.assertIsNotNone(first)
+            first["fill_qty"] = -1
+            self.assertEqual(P._verified_source_buy_fill(conn, lot)["fill_qty"], 100)
+            for field, value in (("qty", 200), ("code", "000001"),
+                                 ("cycle_id", self.cycle101), ("account_id", "other")):
+                self.assertIsNone(P._verified_source_buy_fill(conn, {**lot, field: value}))
+            self.assertIsNone(P._verified_source_buy_fill(conn, lot, reused_sources={buy}))
+            conn.execute("UPDATE paper_fills SET qty=50 WHERE order_id=?", (buy,))
+            self.assertIsNone(P._verified_source_buy_fill(conn, lot))
+            self.assertEqual(P._verified_source_buy_fill(conn, {**lot, "qty": 50})["fill_qty"], 50)
+
+        self.conn.set_trace_callback(statements.append)
+        try:
+            capture(self.conn)
+        finally:
+            self.conn.set_trace_callback(None)
+        source_reads = [sql for sql in statements
+                        if "SELECT f.id AS fill_id" in sql and "WHERE f.order_id=" in sql]
+        self.assertEqual(len(source_reads), 2)
+        self.assertIsNone(P._snapshot_reads.get())
+
+    def test_shared_source_rows_do_not_mix_exact_fill_with_legacy_order_proof(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        lot_id = self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        fill = self.conn.execute("SELECT id FROM paper_fills WHERE order_id=?", (buy,)).fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,assumption)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (buy, ACCOUNT, "buy", CODE, 50, 10.0, 500, 5, DAY.isoformat(), "shared-read-test"))
+        self.conn.commit()
+        lot = dict(self.conn.execute(
+            "SELECT * FROM paper_position_lots WHERE id=?", (lot_id,)).fetchone())
+        self.conn.execute("BEGIN")
+
+        @P.snapshot_read
+        def capture(conn):
+            for _ in range(2):
+                self.assertEqual(P._verified_source_buy_fill(
+                    conn, {**lot, "source_fill_id": fill})["fill_id"], fill)
+                self.assertIsNone(P._verified_source_buy_fill(conn, lot))
+                self.assertIsNone(P._verified_source_buy_fill(
+                    conn, {**lot, "source_fill_id": fill + 1000}))
+
+        capture(self.conn)
 
     def test_snapshot_next_capture_observes_new_fills_and_keeps_unknown_proof(self):
         context = P.PortfolioReadContext(self.cycle100, DAY)

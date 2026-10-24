@@ -14,11 +14,10 @@ import datetime as dt
 import pandas as pd
 
 
-DECISION_SNAPSHOT_VERSION = "decision-snapshot-v3"
-DEFAULT_RISK_VERSION = "paper-risk-v4"
-_DEFAULT_NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
-
-
+#: 本模块刻意只依赖 stdlib + pandas：它是叶子模块，任何项目内 import 都可能
+#: 引入环（``test_paper_decision_audit_facade`` 钉着这条）。因此下面的
+#: ``_now``/``_date`` 与 ``paper_common`` 中的实现保持逐字一致，但**不从那里
+#: import** —— 这是有意保留的副本，不是漏掉的去重。
 def _date(value=None):
     if value is None:
         return dt.date.today()
@@ -31,6 +30,11 @@ def _date(value=None):
 
 def _now():
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+DECISION_SNAPSHOT_VERSION = "decision-snapshot-v3"
+DEFAULT_RISK_VERSION = "paper-risk-v4"
+_DEFAULT_NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
 
 
 def snapshot_safe(value):

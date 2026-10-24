@@ -260,10 +260,34 @@ function _backoff(attempt){
 }
 
 /**
+ * 读取响应正文。
+ *
+ * 优先用 `text()` 再自己解析：`Response.json()` 依赖同一个已被消耗的正文流，
+ * 但只有 `text()` 能让我们把"读完正文"这一步放进超时窗口（见 `_sendOnce`）。
+ * 正文读取失败（含 abort）必须向上抛 —— 它不能被下面的 JSON 解析兜底吞成
+ * `{}`，那会把"读不到正文"伪装成"成功返回空对象"。
+ * 只有 `json()` 的响应替身（Node 测试桩 / 旧 worker）保持既有兼容路径。
+ */
+async function _readPayload(response){
+  if(!response) return undefined;
+  if(typeof response.text==='function'){
+    var text=await response.text();
+    if(!text) return undefined;
+    try { return JSON.parse(text); } catch(err){ return undefined; }
+  }
+  if(typeof response.json==='function'){
+    try { return await response.json(); } catch(err){ return undefined; }
+  }
+  return undefined;
+}
+
+/**
  * 唯一的 HTTP 原语：**全模块只有这里调用 fetch**。
  *
- * 每次尝试都用一个新的 AbortController 做超时；timer 在 fetch 结算时立刻
- * 清掉（不能留到退避期间——那时 controller 变量已经被下一轮覆盖）。
+ * 每次尝试都用一个新的 AbortController 做超时。计时器必须覆盖**到正文读完**：
+ * 服务端或代理完全可以先回响应头、再让正文停滞，若在响应头到达时就清掉计时器，
+ * 这次请求就再也不受设定的超时约束，而依赖请求完成才释放的加载状态会一直挂着。
+ * 正文在返回前必然被读完（或失败），因此重试时不存在遗留的未消费响应体。
  */
 async function _sendOnce(verb, path, headers, body, timeoutMs){
   var controller=typeof AbortController==='undefined'?null:new AbortController();
@@ -272,7 +296,8 @@ async function _sendOnce(verb, path, headers, body, timeoutMs){
   if(body!==undefined && body!==null) init.body=body;
   var timer=controller?setTimeout(function(){controller.abort();},timeoutMs):null;
   try {
-    return await fetch(path, init);
+    var response=await fetch(path, init);
+    return {response:response, payload:await _readPayload(response)};
   } finally {
     if(timer) clearTimeout(timer);
   }
@@ -282,11 +307,9 @@ async function _sendOnce(verb, path, headers, body, timeoutMs){
  * 解析响应并产出结果或抛出 ApiError。
  * JSON 解析失败不算错误本身：成功路径回退到 `{}`，失败路径回退到状态码文案。
  */
-async function _settle(response, verb, path){
-  var payload;
-  try {
-    payload = (response && typeof response.json==='function') ? await response.json() : undefined;
-  } catch(err){ payload=undefined; }
+async function _settle(sent, verb, path){
+  var response=sent?sent.response:null;
+  var payload=sent?sent.payload:undefined;
   if(!response || !response.ok){
     var status=response?Number(response.status)||0:0;
     var body=(payload && typeof payload==='object') ? payload : {};
@@ -317,19 +340,19 @@ async function request(method, path, options){
   }
   var timeoutMs=Number(options.timeout)>0?Number(options.timeout):DEFAULT_TIMEOUT_MS;
 
-  var response;
+  var sent;
   for(var attempt=0; attempt<attempts; attempt++){
     try {
-      response=await _sendOnce(verb, path, headers, options.body, timeoutMs);
+      sent=await _sendOnce(verb, path, headers, options.body, timeoutMs);
     } catch(err){
       if(attempt===attempts-1) throw err;
       await _backoff(attempt);
       continue;
     }
-    if(!isRead || RETRYABLE_STATUS.indexOf(response.status)<0) break;
+    if(!isRead || RETRYABLE_STATUS.indexOf(sent.response.status)<0) break;
     if(attempt<attempts-1) await _backoff(attempt);
   }
-  return _settle(response, verb, path);
+  return _settle(sent, verb, path);
 }
 
 /**

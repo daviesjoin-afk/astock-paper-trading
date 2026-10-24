@@ -30,18 +30,35 @@ except ImportError:  # pragma: no cover - exercised only on Windows.
     _fcntl = None
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
+# ``ASTOCK_DATA_DIR`` must move *every* runtime artifact, not just the ledgers:
+# the K-line cache, snapshots, manifest and health file are the inputs that
+# selection / selection_tracking derive their own paths from.  Resolving the
+# cache root through ``data_paths`` keeps one directory owner for the whole
+# runtime state instead of splitting it between the source tree and an
+# isolated directory.
+CACHE_DIR = data_paths.data_dir()
 KLINE_DIR = os.path.join(CACHE_DIR, "klines")
 KLINE_MANIFEST_PATH = os.path.join(CACHE_DIR, "kline_manifest.json")
 # Full-market and risk-proxy snapshots must never overwrite each other.  The
 # risk page intentionally samples 20 pages for a fast read; that sample is not
 # a valid fallback for the full-market selector or the 5-minute scanner.
-MARKET_SNAPSHOT_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot.json")
 MARKET_SNAPSHOT_FULL_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_full.json")
 MARKET_SNAPSHOT_SAMPLE_CACHE_PATH = os.path.join(CACHE_DIR, "market_snapshot_sample_20.json")
 MARKET_SNAPSHOT_FULL_LOCK_PATH = MARKET_SNAPSHOT_FULL_CACHE_PATH + ".lock"
 DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
 FINANCE_CACHE_PATH = data_paths.data_path("finance_latest.json")
+CONCEPT_MEMBERS_CACHE_DIR = data_paths.data_path("concept_members")
+CONCEPT_REFS_CACHE_DIR = data_paths.data_path("concept_refs")
+# Board membership and stock-to-concept tags are reference data: they change
+# when a board is rebalanced or a stock is re-tagged, not between two scans.
+# The quote fields that ride along in the same payload are NOT reference data
+# and are therefore dropped before caching; callers overlay the round's own
+# live snapshot instead.
+CONCEPT_REFERENCE_CACHE_TTL_SECONDS = 86400
+# Bump when the stored shape changes. Earlier builds cached the whole provider
+# payload, quotes included; without a version boundary those files would be
+# served for a day as if they were membership-only entries.
+CONCEPT_MEMBERS_CACHE_VERSION = 2
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
@@ -49,6 +66,8 @@ _cache_lock = threading.Lock()
 _mem_cache = {}
 _finance_fetch_lock = threading.Lock()
 _finance_fetch_state = {"retry_at": 0.0}
+_concept_member_locks = {}
+_concept_member_locks_guard = threading.Lock()
 _full_snapshot_thread_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _manifest = None
@@ -130,12 +149,12 @@ def load_source_health():
 
 
 def check_data_source_health(force=False):
-    """Probe primary/independent quote sources and reconnect on failure.
+    """Probe availability; either fresh stock-quote family can keep scans open.
 
     This is intentionally small (one market page + two index quotes), so it
     can run before every five-minute paper scan.  An empty/invalid response
-    never enters the cache; the session is closed and both source families are
-    retried once with host rotation before the caller proceeds.
+    never enters the cache. If neither stock-quote family works, reconnect and
+    retry once. Provider status stays separate from single-stock validation.
     A forced success can be reused for at most 30 seconds within an explicit
     workflow scope; failures are never reused and scope exit clears the window.
     """
@@ -158,10 +177,12 @@ def check_data_source_health(force=False):
         try:
             fields = "f2,f3,f12,f14,f124"
             rows = _fetch_clist(fields, fid="f20", pages=1, pz=100)
-            valid = [row for row in rows if str(row.get("f12") or "").isdigit()
-                     and isinstance(row.get("f2"), (int, float)) and row.get("f2") > 0]
+            valid = [row for row in rows if len(str(row.get("f12") or "")) == 6
+                     and str(row.get("f12") or "").isdigit()
+                     and MN.source_quote_is_fresh({"price": row.get("f2"), "pct": row.get("f3"),
+                                                  "quote_at": MN.quote_at(row.get("f124"))})]
             return {
-                "status": "fresh" if len(valid) >= 20 else "degraded",
+                "status": "fresh" if valid else "degraded",
                 "rows": len(rows), "valid_rows": len(valid),
                 "coverage_pct": round(len(valid) / max(len(rows), 1) * 100, 1),
                 "source": "eastmoney-clist",
@@ -188,7 +209,7 @@ def check_data_source_health(force=False):
                         price = float(parts[3] or 0)
                     except (TypeError, ValueError):
                         price = 0
-                    if price > 0:
+                    if MN.source_quote_is_fresh({"price": price, "pct": parts[32], "quote_at": parts[30]}):
                         valid += 1
                         latest = parts[30] or latest
             return {"status": "fresh" if valid >= 2 else "degraded",
@@ -204,10 +225,13 @@ def check_data_source_health(force=False):
         # 指数接口正常不代表个股接口正常；策略成交门禁真正依赖的是个股报价。
         # 这里固定抽查沪深/北交各一只，并允许新浪作为腾讯个股接口的独立备用源。
         try:
-            rows = fetch_independent_realtime_for_codes(["300214", "688129", "920006"])
+            codes = {"300214", "688129", "920006"}
+            rows = fetch_independent_realtime_for_codes(sorted(codes))
+            rows = list({row["code"]: row for row in rows
+                         if row.get("code") in codes and MN.source_quote_is_fresh(row)}.values())
             sources = sorted({str(row.get("source") or "") for row in rows if row.get("source")})
             return {
-                "status": "fresh" if len(rows) >= 2 else "degraded",
+                "status": "fresh" if rows else "degraded",
                 "rows": len(rows), "valid_rows": len(rows),
                 "coverage_pct": round(len(rows) / 3 * 100, 1),
                 "source": "+".join(sources) or "tencent_public_quote+sina_public_quote",
@@ -222,7 +246,7 @@ def check_data_source_health(force=False):
     reconnected = False
     for attempt in range(2):
         if attempt:
-            reset_data_source("5次连续数据源探测失败，主动重连并切换数据源", reset_circuit=True)
+            reset_data_source("行情源探测失败，重连并切换备用源", reset_circuit=True)
             reconnected = True
             time.sleep(0.35)
         eastmoney = _probe_eastmoney()
@@ -230,12 +254,12 @@ def check_data_source_health(force=False):
         independent_stock = _probe_independent_stock()
         attempts.append({"attempt": attempt + 1, "eastmoney": eastmoney, "tencent": tencent,
                           "independent_stock": independent_stock})
-        if eastmoney["status"] == "fresh" and independent_stock["status"] == "fresh":
+        if eastmoney["status"] == "fresh" or independent_stock["status"] == "fresh":
             break
     eastmoney = attempts[-1]["eastmoney"] if attempts else {"status": "failed"}
     tencent = attempts[-1]["tencent"] if attempts else {"status": "failed"}
     independent_stock = attempts[-1].get("independent_stock", {"status": "failed"}) if attempts else {"status": "failed"}
-    healthy = eastmoney.get("status") == "fresh" and independent_stock.get("status") == "fresh"
+    healthy = eastmoney.get("status") == "fresh" or independent_stock.get("status") == "fresh"
     payload = {
         "checked_at": checked_at,
         "healthy": healthy,
@@ -245,7 +269,9 @@ def check_data_source_health(force=False):
         "tencent": tencent,
         "independent_stock": independent_stock,
         "host_rotation": "东方财富主机轮换 + 腾讯个股源重试 + 新浪个股备用",
-        "action": "正常使用" if healthy else ("已重连并降级使用可用源" if reconnected else "等待下一轮自动重连"),
+        "action": ("正常使用" if eastmoney.get("status") == independent_stock.get("status") == "fresh"
+                   else "单源可用，继续运行" if healthy
+                   else "暂无有效行情源，等待下一轮重连"),
     }
     _save_source_health(payload)
     if force and scope is not None and healthy:
@@ -338,21 +364,86 @@ def _finite_number(value):
     return MN.finite_number(value)
 
 
+def _concept_member_fetch_lock(board_code):
+    """Per-board lock so one board never serializes the whole parallel batch."""
+    with _concept_member_locks_guard:
+        return _concept_member_locks.setdefault(str(board_code), threading.Lock())
+
+
+def _membership_only(payload):
+    """Drop the quote fields that ride along with the constituent list."""
+    return {
+        **{key: value for key, value in payload.items() if key != "members"},
+        "members": [
+            {key: member.get(key) for key in ("code", "name", "industry")}
+            for member in payload.get("members") or []
+        ],
+    }
+
+
 def _fetch_concept_members(board_code, max_pages=8):
-    """Fetch all currently reported members, with explicit completeness data."""
-    return MP.fetch_eastmoney_concept_members(
-        get_json=_get_json,
-        hosts=CLIST_HOSTS,
-        board_code=board_code,
-        ut=UT_FLOW,
-        quote_at=_quote_at,
-        finite_number=_finite_number,
-        max_pages=max_pages,
+    """Fetch all currently reported members, with explicit completeness data.
+
+    Board membership is reference data: it changes on a rebalance, not between
+    two three-minute scans, so the membership list is shared across rounds and
+    across worker processes for a day.  The member quotes that arrive in the
+    same payload are deliberately stripped before caching, because caching them
+    for a day would freeze the positive-ratio and active-peer pre-filter.
+    Incomplete or empty answers are never cached: a failed page set must be
+    retried, not promoted to discovery evidence.
+    """
+    def _fetch():
+        return MP.fetch_eastmoney_concept_members(
+            get_json=_get_json,
+            hosts=CLIST_HOSTS,
+            board_code=board_code,
+            ut=UT_FLOW,
+            quote_at=_quote_at,
+            finite_number=_finite_number,
+            max_pages=max_pages,
+        )
+
+    def _membership():
+        return _membership_only(_fetch())
+
+    name = str(board_code)
+    if max_pages != 8 or not name.isalnum():
+        return _fetch()
+    os.makedirs(CONCEPT_MEMBERS_CACHE_DIR, exist_ok=True)
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, _concept_member_fetch_lock(name),
+        f"concept_members:v{CONCEPT_MEMBERS_CACHE_VERSION}:{name}",
+        os.path.join(CONCEPT_MEMBERS_CACHE_DIR,
+                     f"v{CONCEPT_MEMBERS_CACHE_VERSION}-{name}.json"),
+        CONCEPT_REFERENCE_CACHE_TTL_SECONDS, _membership,
+        lambda value: (isinstance(value, dict) and bool(value.get("complete"))
+                       and bool(value.get("members"))),
     )
 
 
-def fetch_hot_concept_snapshot(topn=6):
-    """Funded concepts and complete constituents; incomplete boards stay out."""
+def _overlay_member_quotes(members, quotes):
+    """Replace cached member quotes with the round's own live snapshot."""
+    if not quotes:
+        return members
+    overlaid = []
+    for member in members:
+        live = quotes.get(str(member.get("code") or ""))
+        if not isinstance(live, dict):
+            overlaid.append(member)
+            continue
+        overlaid.append({**member,
+                         **{key: live[key] for key in ("price", "pct")
+                            if live.get(key) is not None}})
+    return overlaid
+
+
+def fetch_hot_concept_snapshot(topn=6, quotes=None):
+    """Funded concepts and complete constituents; incomplete boards stay out.
+
+    ``quotes`` is the caller's live full-market snapshot.  Constituents come
+    from the daily membership cache and carry no quotes of their own, so the
+    positive ratio is computed from that snapshot.
+    """
     def _do():
         boards = []
         for row in fetch_sector_flow("concept") or []:
@@ -376,10 +467,11 @@ def fetch_hot_concept_snapshot(topn=6):
         output = []
         for rank, board in enumerate(boards, 1):
             result = fetched.get(board["code"]) or {}
-            members = result.get("members") or []
+            members = _overlay_member_quotes(result.get("members") or [], quotes)
             if not result.get("complete") or not members:
                 continue
-            positive = sum(1 for member in members if member["pct"] > 0)
+            positive = sum(1 for member in members
+                           if (_finite_number(member.get("pct")) or 0) > 0)
             output.append({**board, **{k: v for k, v in result.items() if k != "members"},
                            "rank": rank, "members": members, "member_count": len(members),
                            "positive_ratio": round(positive / len(members), 4),
@@ -392,43 +484,67 @@ def _stock_secid(code):
     return MN.stock_secid(code)
 
 
+def _concept_ref_fetch_lock(code):
+    with _concept_member_locks_guard:
+        return _concept_member_locks.setdefault("refs:" + str(code), threading.Lock())
+
+
 def _fetch_stock_concept_refs(code):
     """Fetch concept-board references for one stock, without inferring tags.
 
     ``slist`` is the inverse of the usual board->constituent endpoint.  It is
     deliberately used only for a very small set of strong leaders; doing this
     for the whole market would be both slow and prone to provider throttling.
+    A stock's board tags are reference data, so they are reused for a day
+    across rounds and processes; an empty answer is never cached.
     """
-    secid = _stock_secid(code)
-    if not secid:
+    def _fetch():
+        secid = _stock_secid(code)
+        if not secid:
+            return []
+        params = {
+            "forcect": "1", "spt": "3", "pi": "0", "pz": "200", "po": "1",
+            "fid": "f3", "fid0": "f4003", "fltt": "2", "invt": "2",
+            "secid": secid, "fields": "f12,f14,f3,f128", "ut": UT_FLOW,
+        }
+        for host in CLIST_HOSTS:
+            try:
+                payload = _get_json(f"https://{host}/api/qt/slist/get", params,
+                                    timeout=5, retries=0)
+                rows = ((payload or {}).get("data") or {}).get("diff") or []
+                refs = MP.parse_eastmoney_concept_refs(
+                    rows, excluded_tokens=_NON_THEME_CONCEPT_TOKENS,
+                )
+                if refs:
+                    return refs
+            except Exception:
+                continue
         return []
-    params = {
-        "forcect": "1", "spt": "3", "pi": "0", "pz": "200", "po": "1",
-        "fid": "f3", "fid0": "f4003", "fltt": "2", "invt": "2",
-        "secid": secid, "fields": "f12,f14,f3,f128", "ut": UT_FLOW,
-    }
-    for host in CLIST_HOSTS:
-        try:
-            payload = _get_json(f"https://{host}/api/qt/slist/get", params,
-                                timeout=5, retries=0)
-            rows = ((payload or {}).get("data") or {}).get("diff") or []
-            refs = MP.parse_eastmoney_concept_refs(
-                rows, excluded_tokens=_NON_THEME_CONCEPT_TOKENS,
-            )
-            if refs:
-                return refs
-        except Exception:
-            continue
-    return []
+
+    name = str(code)
+    if not name.isalnum():
+        return _fetch()
+    os.makedirs(CONCEPT_REFS_CACHE_DIR, exist_ok=True)
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, _concept_ref_fetch_lock(name),
+        f"concept_refs:{name}",
+        os.path.join(CONCEPT_REFS_CACHE_DIR, f"{name}.json"),
+        CONCEPT_REFERENCE_CACHE_TTL_SECONDS, _fetch,
+        lambda value: isinstance(value, list) and bool(value),
+    )
 
 
-def fetch_leader_concept_snapshot(leaders, max_leaders=3):
+def fetch_leader_concept_snapshot(leaders, max_leaders=3, quotes=None):
     """Map a few genuine intraday leaders back to complete concept boards.
 
     This closes the missing ``leader -> concept -> peer`` link.  A leader
     never becomes an automatically tradable candidate: the returned board is
     only discovery evidence for *other* constituents, which still require a
     fresh full-market quote, positive flow, volume and all execution gates.
+
+    ``quotes`` is the caller's live full-market snapshot.  Constituents come
+    from the daily membership cache and carry no quotes of their own, so the
+    positive ratio and active-peer count are computed from that snapshot.
     """
     leaders = [dict(row) for row in (leaders or []) if str(row.get("code") or "")]
     leaders = leaders[:max(1, min(int(max_leaders), 4))]
@@ -470,7 +586,7 @@ def fetch_leader_concept_snapshot(leaders, max_leaders=3):
         output = []
         for board_code, ref in refs_by_board.items():
             result = fetched.get(board_code) or {}
-            members = result.get("members") or []
+            members = _overlay_member_quotes(result.get("members") or [], quotes)
             member_codes = {str(member.get("code") or "") for member in members}
             linked_leaders = [leader_by_code[code] for code in ref["leader_codes"] if code in member_codes]
             if not result.get("complete") or len(members) < 5 or not linked_leaders:
@@ -689,7 +805,10 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
     normalized = MDF.normalize_codes(codes)
     if len(normalized) < _full_market_min_rows():
         return []
-    rows = fetch_tencent_realtime_for_codes(normalized)
+    try:
+        rows = fetch_tencent_realtime_for_codes(normalized) or []
+    except Exception:
+        rows = []
     allowed = set(normalized)
     by_code = {
         str(row.get("code")): row for row in rows
@@ -697,9 +816,6 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
         and MDF.usable_quote(row)
         and MN.finite_number(row.get("pct")) is not None
     }
-    if (len(by_code) < _full_market_min_rows()
-            or len(by_code) / len(normalized) < 0.90):
-        return []
     try:
         from market_data_contract import _parse_instant
     except ImportError:
@@ -714,7 +830,24 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
                 tzinfo=dt.timezone(dt.timedelta(hours=8))
             )
         except (TypeError, ValueError):
-            return None
+            return _parse_instant(value)
+
+    def current_row(row):
+        stamp = _tencent_instant(row.get("quote_at"))
+        return (MDF.usable_quote(row) and MN.finite_number(row.get("pct")) is not None
+                and stamp is not None and -120 <= (current - stamp).total_seconds() <= max_age)
+
+    missing = [code for code in normalized if not current_row(by_code.get(code) or {})]
+    if missing:
+        missing_codes = set(missing)
+        try:
+            alternate = _fetch_sina_realtime_for_codes(missing)
+        except Exception:
+            alternate = []
+        for row in alternate:
+            code = str(row.get("code") or "")
+            if code in missing_codes and row.get("source") == "sina_public_quote" and current_row(row):
+                by_code[code] = row
 
     fresh = 0
     for row in by_code.values():
@@ -738,7 +871,7 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
             "pct": MN.finite_number(row["pct"]), "prev_close": MN.finite_number(row.get("prev_close")),
             "quote_at": observed.isoformat(timespec="seconds"),
             "observed_at": observed.isoformat(timespec="seconds"),
-            "source": "tencent_public_quote",
+            "source": row.get("source") or "tencent_public_quote",
             "open_price": None, "high": None, "low": None,
             "volume": None, "amount": None, "turnover": None,
             "pe": None, "vol_ratio": None, "mktcap": None,
@@ -781,7 +914,9 @@ def _persist_tencent_snapshot(snapshot, normalized):
         return False
     payload = {
         "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source": "tencent_public_quote_full_snapshot",
+        "source": ("tencent_public_quote_full_snapshot"
+                   if all(row.get("source") == "tencent_public_quote" for row in snapshot)
+                   else "public_quote_full_snapshot"),
         "rows": snapshot, "complete": True, "expected_rows": len(normalized),
         "pages_expected": 0, "pages_ok": 0,
     }
@@ -805,6 +940,30 @@ def _full_snapshot_payload_is_complete(payload):
     codes = {str(row.get("code") or "") for row in rows if isinstance(row, dict)}
     codes.discard("")
     return len(codes) >= max(_full_market_min_rows(), int(expected * 0.90))
+
+
+def full_market_snapshot_source():
+    """Report which provider actually served the published full snapshot.
+
+    The intraday health probe issues one small ``clist`` request, so it can
+    report a healthy Eastmoney source while the paged full-market fetch is
+    being refused and the scan silently falls back to a price-only slice.
+    Reading the published payload is the only way to see which one the scan
+    really got, and it costs no request.
+    """
+    try:
+        with open(MARKET_SNAPSHOT_FULL_CACHE_PATH, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "source": payload.get("source"),
+        "saved_at": payload.get("saved_at"),
+        "rows": len(payload.get("rows") or []),
+        "price_only": payload.get("source") in {"tencent_public_quote_full_snapshot", "public_quote_full_snapshot"},
+    }
 
 
 def load_market_snapshot_full_cached():
@@ -864,7 +1023,7 @@ def _fresh_full_snapshot_from_disk(max_age):
             except (TypeError, ValueError):
                 # Preserve the previous mtime fallback for malformed quote_at.
                 pass
-        if payload.get("source") == "tencent_public_quote_full_snapshot":
+        if payload.get("source") in {"tencent_public_quote_full_snapshot", "public_quote_full_snapshot"}:
             try:
                 from market_data_contract import fresh_ratio
             except ImportError:
@@ -994,10 +1153,6 @@ def fetch_hot_sector_snapshot(pages=4):
     return _cached(f"hot_sector_snapshot_{pages}", 75, _do)
 
 
-def get_hot_sector_fetch_state():
-    """Return sector pagination quality without triggering a network request."""
-    return dict(_hot_sector_fetch_state)
-
 
 def _realtime_row_from_ulist(raw):
     return MN.realtime_row_from_ulist(raw, quote_at_fn=_quote_at)
@@ -1053,6 +1208,7 @@ def _independent_realtime_feed():
         reset_data_source=reset_data_source,
         sleep=time.sleep,
         retry_last_feed=True,
+        accept_quote=MN.source_quote_is_fresh,
     )
 
 
@@ -1186,19 +1342,6 @@ def fetch_stock_flow_batch(codes):
     except Exception:
         return {}
 
-
-def enrich_live_flow(live_universe, missing_codes):
-    """对缺失超大单资金的个股进行补齐。
-
-    Args:
-        live_universe: 市场快照行列表
-        missing_codes: 缺失 super_net 的股票代码集合
-
-    Returns:
-        dict: {code: super_net_value}
-    """
-    flow_data = enrich_live_flow_details(live_universe, missing_codes)
-    return {code: data.get("super_net") for code, data in flow_data.items() if data.get("super_net") is not None}
 
 
 def enrich_live_flow_details(live_universe, missing_codes):

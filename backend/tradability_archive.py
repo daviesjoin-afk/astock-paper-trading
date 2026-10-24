@@ -104,8 +104,6 @@ ARCHIVE_COLUMNS = (
 # 涨跌停方向。沿用 selection_tradability 的方向性语义：涨停只拦买、跌停只拦卖。
 PRICE_LIMIT_UP = "up"
 PRICE_LIMIT_DOWN = "down"
-_PRICE_LIMIT_DIRECTIONS = (PRICE_LIMIT_UP, PRICE_LIMIT_DOWN)
-
 # 上游可能给出的方向写法（中英文 / 大小写 / 简写）统一收敛到两个方向常量。
 _PRICE_LIMIT_ALIASES = {
     "up": PRICE_LIMIT_UP,

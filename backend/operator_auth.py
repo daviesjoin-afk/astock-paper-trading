@@ -114,6 +114,24 @@ MODE_LOCAL_ONLY = "local-only"
 MODE_AUTHENTICATED = "authenticated"
 MODE_MISCONFIGURED = "misconfigured"
 
+# ─── 可关闭的操作员凭据 ───
+# 单机模拟盘上每次保存设置都要解锁一次，代价高于收益。操作员可以在设置中心
+# 显式关闭凭据校验；默认保持开启，未显式关闭时行为与以往完全一致。
+#
+# 关闭意味着**任何能访问该端口的人**都能改配置、触发扫描、下模拟单。因此
+# 这只应由操作员在受信网络里主动选择，且状态写进设置审计。
+_BYPASS_STATE = {"disabled": False}
+
+
+def set_bypass(disabled) -> None:
+    """设置凭据校验是否旁路。只改进程内状态，由设置接口/启动同步调用。"""
+    _BYPASS_STATE["disabled"] = bool(disabled)
+
+
+def bypass_disabled() -> bool:
+    """当前是否已显式关闭凭据校验。"""
+    return bool(_BYPASS_STATE["disabled"])
+
 
 class TokenConfigState(Enum):
     """token 配置的三种状态（显式建模，不允许散落猜测）。"""
@@ -214,22 +232,6 @@ def read_token_config(env=None):
         return TokenConfig(TokenConfigState.INVALID, None, "invalid_characters")
     return TokenConfig(TokenConfigState.VALID, token, "ok")
 
-
-def validate_token(token):
-    """校验 token 强度，返回 ``(ok, reason)``。
-
-    保留此函数作为细粒度校验入口；不做任何"自动修正"。
-    """
-    if token is None:
-        return False, "missing"
-    value = str(token).strip()
-    if not value:
-        return False, "empty"
-    if len(value) < MIN_TOKEN_LENGTH:
-        return False, "too_short"
-    if not _TOKEN_PATTERN.match(value):
-        return False, "invalid_characters"
-    return True, "ok"
 
 
 # ─── Bearer 解析 ───

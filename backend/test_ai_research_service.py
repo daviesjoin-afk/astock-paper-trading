@@ -68,6 +68,9 @@ LOWER_LAYER_MODULES = (
     "ai_research_execution_adapter.py",
     "ai_research_portfolio_adapter.py",
     "ai_research_news_adapter.py",
+    #: R27-B2C-8 的业绩公告 owner 接缝：与上面几份同构，必须**同时**登记 —— 只登记其中
+    #: 一份会让"下层不得反向 import orchestration"这条不变量对另一份静默失效。
+    "ai_research_earnings_adapter.py",
 )
 
 #: 固定业务日 / 固定运维时刻 —— 与本机时钟无关，测试因此完全确定。

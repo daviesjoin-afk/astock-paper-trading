@@ -506,8 +506,15 @@ def apply_tuner_proposals(adaptive_connect, paper_db_path, run_id: int,
                     raise ValueError(
                         f"账户 {account_id} 因子 {factor} 变化超过 ±{proposal_max_weight:.3f}，拒绝应用"
                     )
+            # 提案里的 entry_score_delta 是**目标值**，不是增量；拿绝对值去比
+            # 幅度上限，基线非 0 时会把合法的小步移动判成越界。
+            base_overlay = params.get("adaptive_selection") or {}
+            base_entry = float(base_overlay.get(
+                "entry_score_delta",
+                params.get("entry_score_delta", params.get("min_t_score_delta", 0.0)),
+            ) or 0.0)
             entry_delta = float(proposal.get("entry_score_delta") or 0.0)
-            if abs(entry_delta) > proposal_max_entry + 1e-9:
+            if abs(entry_delta - base_entry) > proposal_max_entry + 1e-9:
                 raise ValueError(
                     f"账户 {account_id} 入场阈值变化超过 ±{proposal_max_entry:.4f}，拒绝应用"
                 )

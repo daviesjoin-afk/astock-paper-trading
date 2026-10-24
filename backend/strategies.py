@@ -71,6 +71,37 @@ PAPER_WEIGHTS = {
     "sentiment_pioneer": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
 }
 
+# 自适应 overlay 允许切换到的模型族。只有这些组合经过审计；不在表内的账户
+# 只允许它自己的 source_strategy。
+SELECTION_MODEL_FAMILIES = {
+    "tq_breakout": {"one_to_two"},
+    "trend_pullback": {"bottom_reversal", "trend_continuation"},
+    "sector_rotation": {"sentiment_pioneer"},
+    "reported_profit_breakout": {"reported_profit_breakout"},
+}
+
+
+def selection_model_family(account_id, overlay, source_strategy):
+    """运行时实际采用的模型族；越界时回落到 source_strategy。"""
+    allowed = SELECTION_MODEL_FAMILIES.get(account_id, {source_strategy})
+    model_family = str((overlay or {}).get("model_family") or source_strategy)
+    if model_family not in allowed:
+        model_family = source_strategy
+    return model_family
+
+
+def selection_overlay_weights(account_id, overlay, source_strategy):
+    """运行时实际会采用的 overlay 权重；被拒绝时返回空 dict。
+
+    库里有 weights 但运行时已清空时，把该参数记为「已部署」会让 A/B 把
+    业绩归因到一个实际未生效的参数上。``_adaptive_selection`` 与部署记录
+    必须共用本函数，不能各自实现一遍键集判定。
+    """
+    weights = (overlay or {}).get("weights") or {}
+    expected = set(PAPER_WEIGHTS.get(
+        selection_model_family(account_id, overlay, source_strategy), {}))
+    return dict(weights) if set(weights) == expected else {}
+
 # ===== 2026-08-28 选股负 alpha 修复 =====
 # 实证（08-20~08-27 全部成交信号 K 线回放，reports/selection_alpha_report.md）：
 # 四策略买入次日均值 -0.7%~-1.7%，同期随机基准 +0.05%；排序分与次日收益
@@ -414,14 +445,41 @@ def _bottom_reversal_profile(table):
     }
 
 
+def scoring_factor_inputs(strategy_id):
+    """Known selectors declare scoring dependencies; extensions keep full input.
+
+    These are calibrated score factors, not raw facts, hard entry conditions or
+    the shared ranking/audit context. Adaptive weights retain the same key set.
+    """
+    import strategy_plugins as SP
+
+    plugin = SP.plugin_for_selector(strategy_id)
+    if plugin is not None and not SP.is_original_builtin_plugin(plugin):
+        # Replacements can extend execution or replay dependencies. Only the
+        # original native bindings have an audited static preparation plan.
+        return None
+    if strategy_id in PAPER_WEIGHTS:
+        planned = frozenset(PAPER_WEIGHTS[strategy_id])
+    elif strategy_id in {"three_day", "five_day", "ten_day", "reported_profit_breakout", "main_force_top10"}:
+        planned = frozenset()
+    else:
+        return None
+    return planned
+
+
 def build_factor_table(
     price_f: pd.DataFrame,
     fund_f: pd.DataFrame,
     sentiment: dict = None,
     realtime_flow: dict = None,
     realtime_super_flow: dict = None,
+    *,
+    scoring_factors=None,
 ):
     """Merge factor sources while keeping alpha and evidence quality separate."""
+    requested = set(FC.FACTOR_GROUPS) if scoring_factors is None else set(scoring_factors)
+    if requested - set(FC.FACTOR_GROUPS):
+        raise ValueError("unknown calibrated scoring factor")
     idx = price_f.index.intersection(fund_f.index)
     table = pd.DataFrame(index=idx)
     price = price_f.loc[idx]
@@ -465,35 +523,38 @@ def build_factor_table(
 
     # Missing factor observations stay missing. Composite alpha renormalises
     # over observed components instead of silently replacing unknown with zero.
-    pe_z = F.zscore(pd.to_numeric(fund["pe"], errors="coerce") * -1, fill_missing=False)
-    pb_z = F.zscore(pd.to_numeric(fund["pb"], errors="coerce") * -1, fill_missing=False)
-    roe_z = F.zscore(fund["roe"], fill_missing=False)
-    profit_z = F.zscore(fund["profit_yoy"], fill_missing=False)
-    revenue_z = F.zscore(fund["rev_yoy"], fill_missing=False)
-    mom5_z = F.zscore(price["mom5"], fill_missing=False)
-    mom20_z = F.zscore(price["mom20"], fill_missing=False)
-    mom60_z = F.zscore(price["mom60"], fill_missing=False)
-
-    table["value"] = FC.weighted_available(
-        {"pe": pe_z, "pb": pb_z}, {"pe": 0.5, "pb": 0.5}, index=idx
-    )
-    table["quality"] = FC.weighted_available(
-        {"roe": roe_z, "profit": profit_z, "revenue": revenue_z},
-        {"roe": 0.5, "profit": 0.25, "revenue": 0.25},
-        index=idx,
-    )
+    if "value" in requested:
+        pe_z = F.zscore(pd.to_numeric(fund["pe"], errors="coerce") * -1, fill_missing=False)
+        pb_z = F.zscore(pd.to_numeric(fund["pb"], errors="coerce") * -1, fill_missing=False)
+        table["value"] = FC.weighted_available(
+            {"pe": pe_z, "pb": pb_z}, {"pe": 0.5, "pb": 0.5}, index=idx
+        )
+    if "quality" in requested:
+        roe_z = F.zscore(fund["roe"], fill_missing=False)
+        profit_z = F.zscore(fund["profit_yoy"], fill_missing=False)
+        revenue_z = F.zscore(fund["rev_yoy"], fill_missing=False)
+        table["quality"] = FC.weighted_available(
+            {"roe": roe_z, "profit": profit_z, "revenue": revenue_z},
+            {"roe": 0.5, "profit": 0.25, "revenue": 0.25},
+            index=idx,
+        )
     # Short and medium momentum are intentionally disjoint factor families.
-    table["mom_short"] = mom5_z
-    table["mom"] = FC.weighted_available(
-        {"mom20": mom20_z, "mom60": mom60_z},
-        {"mom20": 0.6, "mom60": 0.4},
-        index=idx,
-    )
-    table["volsurge"] = F.zscore(price["vol_surge"], fill_missing=False)
-    table["rsi"] = F.zscore(
-        pd.to_numeric(price["rsi14"], errors="coerce") * -1,
-        fill_missing=False,
-    )
+    if "mom_short" in requested:
+        mom5_z = F.zscore(price["mom5"], fill_missing=False)
+        table["mom_short"] = mom5_z
+    if "mom" in requested:
+        mom20_z = F.zscore(price["mom20"], fill_missing=False)
+        mom60_z = F.zscore(price["mom60"], fill_missing=False)
+        table["mom"] = FC.weighted_available(
+            {"mom20": mom20_z, "mom60": mom60_z},
+            {"mom20": 0.6, "mom60": 0.4}, index=idx,
+        )
+    if "volsurge" in requested:
+        table["volsurge"] = F.zscore(price["vol_surge"], fill_missing=False)
+    if "rsi" in requested:
+        table["rsi"] = F.zscore(
+            pd.to_numeric(price["rsi14"], errors="coerce") * -1, fill_missing=False,
+        )
 
     price_quality = pd.to_numeric(
         price.get("price_evidence_quality", pd.Series(FC.FULL_QUALITY, index=idx)),
@@ -502,22 +563,26 @@ def build_factor_table(
     table["adjustment_warning"] = price.get(
         "adjustment_warning", pd.Series(False, index=idx)
     ).reindex(idx).fillna(False).astype(bool)
-    table["mom_short_evidence_quality"] = price_quality.where(mom5_z.notna(), 0.0)
-    table["mom_evidence_quality"] = price_quality * (
-        mom20_z.notna().astype(float) * 0.6 + mom60_z.notna().astype(float) * 0.4
-    )
-    table["volsurge_evidence_quality"] = price_quality.where(
-        table["volsurge"].notna(), 0.0
-    )
-    table["rsi_evidence_quality"] = price_quality.where(table["rsi"].notna(), 0.0)
-    table["value_evidence_quality"] = (
-        pe_z.notna().astype(float) * 0.5 + pb_z.notna().astype(float) * 0.5
-    )
-    table["quality_evidence_quality"] = (
-        roe_z.notna().astype(float) * 0.5
-        + profit_z.notna().astype(float) * 0.25
-        + revenue_z.notna().astype(float) * 0.25
-    )
+    if "mom_short" in requested:
+        table["mom_short_evidence_quality"] = price_quality.where(mom5_z.notna(), 0.0)
+    if "mom" in requested:
+        table["mom_evidence_quality"] = price_quality * (
+            mom20_z.notna().astype(float) * 0.6 + mom60_z.notna().astype(float) * 0.4
+        )
+    if "volsurge" in requested:
+        table["volsurge_evidence_quality"] = price_quality.where(table["volsurge"].notna(), 0.0)
+    if "rsi" in requested:
+        table["rsi_evidence_quality"] = price_quality.where(table["rsi"].notna(), 0.0)
+    if "value" in requested:
+        table["value_evidence_quality"] = (
+            pe_z.notna().astype(float) * 0.5 + pb_z.notna().astype(float) * 0.5
+        )
+    if "quality" in requested:
+        table["quality_evidence_quality"] = (
+            roe_z.notna().astype(float) * 0.5
+            + profit_z.notna().astype(float) * 0.25
+            + revenue_z.notna().astype(float) * 0.25
+        )
 
     proxy_flow = F.zscore(price["flow_proxy"], fill_missing=False)
     if realtime_flow:
@@ -573,7 +638,8 @@ def build_factor_table(
         sentiment_raw = pd.Series({
             code: (sentiment.get(code) or {}).get("sentiment", np.nan) for code in idx
         })
-        table["sentiment"] = F.zscore(sentiment_raw, fill_missing=False)
+        table["sentiment"] = (F.zscore(sentiment_raw, fill_missing=False)
+                              if "sentiment" in requested else np.nan)
         table["sentiment_evidence_quality"] = table["sentiment"].notna().astype(float)
         table["sentiment_source"] = np.where(
             table["sentiment"].notna(), "实时人气榜", "unavailable"
@@ -1445,7 +1511,6 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         onset = numeric_column("sector_early_rotation_score")
         onset_bonus = onset.rank(method="average", pct=True, na_option="bottom") * 0.30
         score = score + onset_bonus
-        score = score.mask(climax, -990.0)
 
     pct = numeric_column("pct")
     vol_surge = numeric_column("vol_surge_raw")
@@ -1510,6 +1575,12 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
             )
             score += individual.astype(float) * conditions["individual_bonus"]
 
+    # 板块情绪高潮禁入必须在全部策略加分之后施加。哨兵 -990 正是 picks 的
+    # 过滤线，若在 individual_bonus 之前 mask，+0.28 会把该行抬到 -989.72
+    # 而重新通过 ``score > -990``，禁入静默失效。
+    if strategy_id == "sentiment_pioneer":
+        score = score.mask(climax, -990.0)
+
     # Evidence quality is an audit/gate dimension, never an alpha multiplier.
     score = score.mask(~evidence_ok, -999.0)
 
@@ -1570,6 +1641,8 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                 "score_components": {
                     "version": "paper-score-evidence-v2",
                     "factor_calibration_version": FC.CALIBRATION_VERSION,
+                    **({"factor_input_version": table.attrs["factor_input_version"]}
+                       if "factor_input_version" in table.attrs else {}),
                     "evidence_quality": _number(row.get("score_evidence_quality"), 6),
                     "observed_weight": _number(row.get("score_observed_weight"), 6),
                     "required_factors_ok": bool(row.get("score_required_ok", False)),

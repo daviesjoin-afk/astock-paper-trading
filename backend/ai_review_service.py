@@ -5,8 +5,8 @@
 
 - 稳定 id 只有 ``ai1`` / ``ai2``；厂商名字降级为用户可改的 ``display_name``，
   只用于展示与审计文案，**永不参与任何分支判断**。
-- 两个槽位的 ``api_key`` / ``base_url`` / ``model`` / ``enabled`` / ``timeout``
-  完全独立；任一槽位的写入、禁用或调用失败都不得改写另一个槽位。
+- 槽位可引用用户保存的任意提供商，运行时从提供商读取地址、密钥和超时。
+  ``model`` / ``enabled`` 仍独立；槽位的写入、禁用或调用失败不得改写另一个槽位。
 - 请求体是**最小公共 OpenAI 兼容负载**（model / messages / response_format /
   max_tokens / stream），不按槽位身份增删字段，也没有 ``if slot == "ai1"`` 式分支。
 - ``review_mode`` 只有两种取值：
@@ -77,6 +77,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ai_provider_transport as transport
@@ -98,10 +99,6 @@ OUTCOME_CONSENSUS = "consensus"
 OUTCOME_BOTH_HOLD = "both_hold"
 OUTCOME_NO_CONSENSUS = "no_consensus"
 OUTCOME_FAILED = "failed"
-DUAL_REVIEW_OUTCOMES = (
-    OUTCOME_CONSENSUS, OUTCOME_BOTH_HOLD, OUTCOME_NO_CONSENSUS, OUTCOME_FAILED,
-)
-
 #: reviewer 只有给出这两个 decision 才算"系统可理解的合法结论"。
 VALID_REVIEWER_DECISIONS = ("hold", "propose")
 
@@ -123,22 +120,6 @@ DISAGREEMENT_CONDITION_DIRECTION_MISMATCH = "condition_direction_mismatch"
 DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH = "condition_magnitude_mismatch"
 DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED = "normalized_weight_step_exceeded"
 DISAGREEMENT_NO_MERGEABLE_PROPOSAL = "no_mergeable_proposal"
-
-DISAGREEMENT_CODES = (
-    DISAGREEMENT_DECISION_MISMATCH,
-    DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING,
-    DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH,
-    DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD,
-    DISAGREEMENT_WEIGHT_FORMAT_INVALID,
-    DISAGREEMENT_UNKNOWN_FACTOR,
-    DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH,
-    DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH,
-    DISAGREEMENT_ENTRY_DIRECTION_MISMATCH,
-    DISAGREEMENT_CONDITION_DIRECTION_MISMATCH,
-    DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH,
-    DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED,
-    DISAGREEMENT_NO_MERGEABLE_PROPOSAL,
-)
 
 # ─── 字段边界（槽位配置的**保存**校验；协议层边界见 ai_provider_transport）───
 MAX_API_KEY_LENGTH = 200
@@ -177,6 +158,10 @@ CONSENSUS_WEIGHT_MAGNITUDE_RATIO = 0.60       # 幅度比：较小/较大 >= 此
 CONSENSUS_DELTA_DIRECTION_THRESHOLD = 0.001   # 入场阈值方向一致性
 CONSENSUS_CONDITION_MAGNITUDE_RATIO = 0.50    # 条件参数幅度一致性
 CONSENSUS_MIN_CONFIDENCE = 70.0
+# 槽位调用的输出预算。推理型模型会先花掉一截 reasoning tokens：实测 1800 的
+# 预算在 step-5-preview 上被思考全部吃掉，content 为空、finish_reason=length，
+# 上层只能看到一个笼统的 content_not_object。这里留出推理 + 正文的余量。
+SLOT_MAX_OUTPUT_TOKENS = 4000
 CONSENSUS_MAX_WEIGHT_STEP = 0.03
 CONSENSUS_MAX_DELTA_STEP = 0.005
 
@@ -295,6 +280,22 @@ _SLOT_TABLES_DDL = """
                 CHECK(single_reviewer_slot IN ('ai1','ai2')),
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ai_saved_providers(
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            api_key TEXT NOT NULL DEFAULT '',
+            base_url TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL DEFAULT 40,
+            models TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_slot_provider_bindings(
+            slot TEXT PRIMARY KEY CHECK(slot IN ('ai1','ai2')),
+            provider_id TEXT NOT NULL REFERENCES ai_saved_providers(id)
+        );
+        CREATE TABLE IF NOT EXISTS ai_provider_library_migrations(
+            version INTEGER PRIMARY KEY
+        );
 """
 
 
@@ -358,6 +359,7 @@ def ensure_schema(conn):
     # 数据库里没有可迁移的历史配置时，再看一次性环境变量 bootstrap：
     # 只配了厂商 API Key 的老部署需要在这里补齐默认端点/模型并落库。
     migrate_legacy_env_providers(conn)
+    _migrate_saved_providers(conn)
 
 
 def _table_exists(conn, name):
@@ -476,6 +478,138 @@ def _slot_row(conn, slot):
     ).fetchone()
 
 
+def _provider_row(conn, provider_id):
+    row = conn.execute(
+        "SELECT id,display_name,api_key,base_url,timeout_seconds,models,updated_at "
+        "FROM ai_saved_providers WHERE id=?", (provider_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("提供商不存在，请重新选择")
+    cfg = dict(zip(("id", "display_name", "api_key", "base_url", "timeout_seconds",
+                    "models", "updated_at"), row, strict=True))
+    cfg["models"] = json.loads(cfg["models"])
+    return cfg
+
+
+def _provider_public_view(cfg):
+    return {key: value for key, value in cfg.items() if key != "api_key"} | {
+        "configured": bool(cfg["api_key"]), "key_preview": _key_preview(cfg["api_key"]),
+    }
+
+
+def _migrate_saved_providers(conn):
+    """仅在首次升级时导入已有槽位；不覆盖用户后续修改或恢复已清除的凭据。"""
+    if conn.execute("SELECT 1 FROM ai_provider_library_migrations WHERE version=1").fetchone():
+        return
+    if not conn.execute("INSERT OR IGNORE INTO ai_provider_library_migrations VALUES(1)").rowcount:
+        return
+    for slot in AI_SLOTS:
+        row = _slot_row(conn, slot)
+        if row is None:
+            continue  # 通用环境变量仍由环境管理，不在读配置时将其持久化。
+        if not (row[1] or row[2] or row[3]):
+            continue
+        provider_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO ai_saved_providers VALUES(?,?,?,?,?,?,?)",
+            (provider_id, row[0] or DEFAULT_DISPLAY_NAMES[slot], row[1], row[2], row[5],
+             _json([row[3]] if row[3] else []), _now()),
+        )
+        conn.execute("INSERT INTO ai_slot_provider_bindings VALUES(?,?)", (slot, provider_id))
+
+
+def saved_providers(conn):
+    ensure_schema(conn)
+    return [_provider_public_view(_provider_row(conn, row[0])) for row in conn.execute(
+        "SELECT id FROM ai_saved_providers ORDER BY rowid")]
+
+
+def _clean_models(value):
+    if not isinstance(value, list) or len(value) > 1000:
+        raise ValueError("模型列表必须是数组，最多1000项")
+    models = []
+    for item in value:
+        model = _clean_text(item, MAX_MODEL_LENGTH, "model")
+        if not model:
+            raise ValueError("模型名称不能为空")
+        if model not in models:
+            models.append(model)
+    return models
+
+
+def save_provider(conn, provider_id=None, **updates):
+    ensure_schema(conn)
+    allowed = {"display_name", "api_key", "base_url", "timeout_seconds", "models", "clear_api_key"}
+    if set(updates) - allowed:
+        raise ValueError("未知提供商设置项")
+    cfg = _provider_row(conn, provider_id) if provider_id else {
+        "id": uuid.uuid4().hex, "display_name": "", "api_key": "", "base_url": "",
+        "timeout_seconds": DEFAULT_TIMEOUT_SECONDS, "models": [],
+    }
+    for field, limit in (("display_name", MAX_DISPLAY_NAME_LENGTH),
+                         ("api_key", MAX_API_KEY_LENGTH), ("base_url", MAX_BASE_URL_LENGTH)):
+        if field in updates:
+            value = _clean_text(updates[field], limit, field)
+            if field != "api_key" or value:
+                cfg[field] = value
+    if not cfg["display_name"]:
+        raise ValueError("请填写提供商名称")
+    cfg["base_url"] = validate_base_url(cfg["base_url"])
+    if not cfg["base_url"]:
+        raise ValueError("请填写提供商接口地址")
+    if "timeout_seconds" in updates:
+        value = updates["timeout_seconds"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not MIN_TIMEOUT_SECONDS <= value <= MAX_TIMEOUT_SECONDS:
+            raise ValueError("超时必须在5–300秒之间")
+        cfg["timeout_seconds"] = int(value)
+    if "models" in updates:
+        cfg["models"] = _clean_models(updates["models"])
+    if "clear_api_key" in updates and not isinstance(updates["clear_api_key"], bool):
+        raise ValueError("clear_api_key必须是布尔值")
+    if updates.get("clear_api_key"):
+        cfg["api_key"] = ""
+    cfg["updated_at"] = _now()
+    conn.execute(
+        "INSERT INTO ai_saved_providers VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "display_name=excluded.display_name,api_key=excluded.api_key,base_url=excluded.base_url,"
+        "timeout_seconds=excluded.timeout_seconds,models=excluded.models,updated_at=excluded.updated_at",
+        (cfg["id"], cfg["display_name"], cfg["api_key"], cfg["base_url"], cfg["timeout_seconds"],
+         _json(cfg["models"]), cfg["updated_at"]),
+    )
+    return _provider_public_view(cfg)
+
+
+def refresh_provider_models(conn, provider_id):
+    ensure_schema(conn)
+    cfg = _provider_row(conn, provider_id)
+    try:
+        result = transport.list_models(cfg)
+    except transport.ProviderTransportError as exc:
+        return {"ok": False, "models": cfg["models"], "error": str(exc)[:200]}
+    models = _clean_models(result["models"])
+    current = _provider_row(conn, provider_id)
+    if any(current[key] != cfg[key] for key in ("base_url", "api_key")):
+        return {"ok": False, "models": current["models"], "error": "提供商配置已改变，请重新获取模型"}
+    # 保留已有手动模型：部分上游的列表不包含所有可用模型。
+    models = list(dict.fromkeys(current["models"] + models))[:1000]
+    conn.execute("UPDATE ai_saved_providers SET models=?,updated_at=? WHERE id=?",
+                 (_json(models), _now(), provider_id))
+    return {"ok": True, "models": models, "count": len(models)}
+
+
+def _with_saved_provider(conn, cfg):
+    binding = conn.execute("SELECT provider_id FROM ai_slot_provider_bindings WHERE slot=?",
+                           (cfg["slot"],)).fetchone()
+    cfg["provider_id"] = binding[0] if binding else ""
+    cfg["provider_name"] = ""
+    if binding:
+        provider = _provider_row(conn, binding[0])
+        cfg.update({key: provider[key] for key in ("api_key", "base_url", "timeout_seconds")})
+        cfg["provider_name"] = provider["display_name"]
+        cfg["updated_at"] = max(cfg.get("updated_at") or "", provider["updated_at"])
+    return cfg
+
+
 def get_slot_config(conn, slot):
     """返回单个槽位的完整调用配置。
 
@@ -489,7 +623,7 @@ def get_slot_config(conn, slot):
     ensure_schema(conn)
     row = _slot_row(conn, slot)
     if row is not None:
-        return {
+        return _with_saved_provider(conn, {
             "slot": slot,
             "display_name": str(row[0] or "") or DEFAULT_DISPLAY_NAMES[slot],
             "api_key": str(row[1] or ""),
@@ -499,9 +633,9 @@ def get_slot_config(conn, slot):
             "timeout_seconds": _clamp_timeout(row[5]),
             "updated_at": row[6],
             "source": "database",
-        }
+        })
     env = env_slot_defaults(slot)
-    return {
+    return _with_saved_provider(conn, {
         "slot": slot,
         "display_name": DEFAULT_DISPLAY_NAMES[slot],
         "api_key": env["api_key"],
@@ -511,7 +645,7 @@ def get_slot_config(conn, slot):
         "timeout_seconds": env["timeout_seconds"],
         "updated_at": None,
         "source": "environment" if env["api_key"] else "default",
-    }
+    })
 
 
 def _key_preview(value):
@@ -573,6 +707,8 @@ def slot_public_view(cfg):
     return {
         "slot": cfg["slot"],
         "display_name": cfg["display_name"],
+        "provider_id": cfg.get("provider_id", ""),
+        "provider_name": cfg.get("provider_name", ""),
         "configured": bool(api_key.strip()),
         "key_preview": _key_preview(api_key),
         "base_url": cfg.get("base_url") or "",
@@ -605,7 +741,7 @@ def _clean_text(value, limit, field):
 
 
 def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=None,
-                display_name=None, timeout_seconds=None, clear_api_key=False):
+                display_name=None, timeout_seconds=None, clear_api_key=False, provider_id=None):
     """写入单个槽位配置。只动这一个槽位，另一个槽位零影响。
 
     语义：
@@ -614,26 +750,19 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
     """
     slot = resolve_slot(slot)
     ensure_schema(conn)
-    row = _slot_row(conn, slot)
-    if row is not None:
-        state = {
-            "display_name": str(row[0] or ""),
-            "api_key": str(row[1] or ""),
-            "base_url": normalize_base_url(row[2]),
-            "model": str(row[3] or ""),
-            "enabled": bool(row[4]),
-            "timeout_seconds": _clamp_timeout(row[5]),
-        }
-    else:
-        env = env_slot_defaults(slot)
-        state = {
-            "display_name": DEFAULT_DISPLAY_NAMES[slot],
-            "api_key": env["api_key"],
-            "base_url": env["base_url"],
-            "model": env["model"],
-            "enabled": bool(env["api_key"]),
-            "timeout_seconds": env["timeout_seconds"],
-        }
+    state = get_slot_config(conn, slot)
+    if provider_id is not None:
+        if any(value is not None for value in (api_key, base_url, timeout_seconds)) or clear_api_key:
+            raise ValueError("选择提供商时不能同时修改接口凭据")
+        provider_id = _clean_text(provider_id, 100, "provider_id")
+        provider = _provider_row(conn, provider_id)
+        selected_model = _clean_text(model, MAX_MODEL_LENGTH, "model")
+        if selected_model not in provider["models"] and not (
+            state["provider_id"] == provider_id and selected_model == state["model"] and selected_model
+        ):
+            raise ValueError("请先在提供商中保存该模型，再选择")
+        # 只保存引用，运行时读取提供商当前地址与密钥。
+        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
 
     if display_name is not None:
         state["display_name"] = _clean_text(display_name, MAX_DISPLAY_NAME_LENGTH, "display_name")
@@ -657,6 +786,11 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
     if clear_api_key:
         state["api_key"] = ""
 
+    if state.get("provider_id") and provider_id is None and not (
+        api_key or base_url is not None or timeout_seconds is not None or clear_api_key
+    ):
+        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
+
     now = _now()
     conn.execute(
         "INSERT INTO ai_provider_slots(slot,display_name,api_key,base_url,model,enabled,"
@@ -668,6 +802,13 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
         (slot, state["display_name"], state["api_key"], state["base_url"], state["model"],
          int(state["enabled"]), state["timeout_seconds"], now),
     )
+    if provider_id is not None:
+        conn.execute(
+            "INSERT INTO ai_slot_provider_bindings VALUES(?,?) "
+            "ON CONFLICT(slot) DO UPDATE SET provider_id=excluded.provider_id", (slot, provider_id))
+    elif api_key or base_url is not None or timeout_seconds is not None or clear_api_key:
+        # 历史接口的直接配置只影响本槽位，不能修改共享提供商。
+        conn.execute("DELETE FROM ai_slot_provider_bindings WHERE slot=?", (slot,))
     return get_slots(conn)
 
 
@@ -726,6 +867,7 @@ def review_settings_view(conn):
         "updated_at": settings["updated_at"],
         "slots": slots,
         "slot_order": list(AI_SLOTS),
+        "providers": saved_providers(conn),
         # 单/双就绪直接取自槽位视图的 ready（含 base_url + model 校验），
         # 保证调度预检与页面展示的口径完全一致。
         "single_ready": bool(slots[active]["ready"]),
@@ -741,7 +883,7 @@ def review_settings_view(conn):
 # 通用调用层（无厂商身份分支）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=1800):
+def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=SLOT_MAX_OUTPUT_TOKENS):
     """兼容别名 —— 请求体构造已收敛到 :mod:`ai_provider_transport`。
 
     保留本入口是因为调用方与回归测试依赖它（``test_t12`` / ``test_t13``）；
@@ -751,7 +893,7 @@ def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=1800)
         slot_config, system_prompt, user_prompt, max_tokens=max_tokens)
 
 
-def _call_slot(slot_config, system_prompt, user_prompt, max_tokens=1800):
+def _call_slot(slot_config, system_prompt, user_prompt, max_tokens=SLOT_MAX_OUTPUT_TOKENS):
     """兼容别名 —— 真实网络调用已收敛到 :mod:`ai_provider_transport`。
 
     返回结构保持 ``(parsed_json, input_tokens, output_tokens, latency_ms)`` 不变，
@@ -824,6 +966,39 @@ def test_slot(conn, slot):
     return result
 
 
+def list_slot_models(conn, slot):
+    """列出该槽位上游的可用模型。只读：不写配置、不回显 Key、不发 chat 请求。
+
+    用**已保存**的凭据去问上游，而不是界面上的未保存值——否则一次误填的
+    地址就会把 Key 送到任意主机。
+    """
+    slot = resolve_slot(slot)
+    cfg = get_slot_config(conn, slot)
+    result = {
+        "slot": slot, "ok": False, "models": [], "count": 0,
+        "error": None, "latency_ms": None,
+    }
+    if not str(cfg["api_key"]).strip():
+        result["error"] = "api_key_missing"
+        return result
+    if not is_usable_base_url(cfg["base_url"]):
+        result["error"] = "invalid_base_url"
+        return result
+    try:
+        payload = transport.list_models(cfg)
+    except transport.ProviderTransportError as exc:
+        result["error"] = str(exc)[:200]
+        return result
+    except Exception as exc:  # noqa: BLE001 - 探测结果必须结构化返回
+        result["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        return result
+    result["ok"] = True
+    result["models"] = payload["models"]
+    result["count"] = payload["count"]
+    result["latency_ms"] = payload["latency_ms"]
+    return result
+
+
 def _build_tuning_system_prompt():
     """构建调参系统提示词。"""
     return (
@@ -832,7 +1007,18 @@ def _build_tuning_system_prompt():
         "只有在证据充分且置信度>=70时提出很小的模拟盘内部补丁；证据不足就hold。\n"
         "weights必须是该账户已有因子并且总和约等于1，conditions只能使用已有条件名。\n"
         "本次是盘中小步调参，单个权重最多移动3个百分点，入场阈值最多移动0.005，\n"
-        "不得切换条件enabled。不要把行情推测写成事实。"
+        "不得切换条件enabled。不要把行情推测写成事实。\n"
+        "deterministic_findings为空仅表示已执行检查未发现异常，不表示缺少交易信号或因子已有效。\n"
+        "factor_effectiveness只评估已保存候选；必须引用相同策略版本和配置分组的统计。"
+        "最新已观测配置不一定是当前配置，快照权重与账户状态不一致时不得外推。"
+        "insufficient_dates、incomplete_identity或unavailable表示证据不足。"
+        "Rank IC和高低分组收益不是账户盈亏归因，不能据此估算调整权重后的净值改善。\n"
+        "检阅auction_tracking的逐股竞价轨迹及review_feedback，判断可能的吸筹、派发、护盘或撤单诱导。"
+        "意图只是待验证推断；仅有价格、缺匹配量/委托队列或资金流时必须写出证据局限，不能声称识别真实主力。"
+        "同时检阅此前AI判断的后续价格方向是否获得支持或被否定，说明对本次判断和调参的影响。"
+        "方向复核只比较截至观察时点的价格，不证明真实意图或交易盈利；数据不足应hold。"
+        "最多输出8条auction_intents，只用stocks已有代码；少于两个竞价样本时意图填unclear。"
+        "expected_direction表示后续可用报价相对本次reference_quote的方向，不能把已经发生的涨跌当预测。"
     )
 
 
@@ -843,6 +1029,9 @@ def _build_tuning_user_prompt(evidence, accounts, mode):
         "confidence": 0,
         "market_regime": "momentum|rotation|risk_off|high_volatility|balanced|unclassified",
         "summary": "中文说明",
+        "auction_intents": [{"code":"仅使用竞价stocks已有代码", "intent":"accumulation|distribution|support|withdrawal|unclear",
+                             "confidence":0, "expected_direction":"up|down|flat|unclear",
+                             "rationale":"中文依据及样本时间", "counter_evidence":"反证与缺失数据；无竞价数据时返回空数组"}],
         "proposals": [{
             "account_id": "tq_breakout|trend_pullback|sector_rotation",
             "reason": "只说明证据和预期改善",
@@ -996,6 +1185,10 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
             account_evolution.get("max_weight_delta"), CONSENSUS_MAX_WEIGHT_STEP)))
         entry_step = max(0.001, min(0.01, _num(
             account_evolution.get("max_delta_threshold"), CONSENSUS_MAX_DELTA_STEP)))
+        # confidence_threshold 是登记过的可进化参数（self_evolution 里 50–90、
+        # 步长 3）。此前共识用的是硬编码 70，自进化调它完全不生效。
+        min_confidence = max(50.0, min(90.0, _num(
+            account_evolution.get("confidence_threshold"), CONSENSUS_MIN_CONFIDENCE)))
 
         def _norm_confidence(value):
             v = _num(value, 0.0)
@@ -1005,20 +1198,19 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
 
         l_conf = _norm_confidence(lp.get("confidence"))
         r_conf = _norm_confidence(rp.get("confidence"))
-        confidence_ok = (l_conf >= CONSENSUS_MIN_CONFIDENCE
-                         and r_conf >= CONSENSUS_MIN_CONFIDENCE)
+        confidence_ok = (l_conf >= min_confidence and r_conf >= min_confidence)
         if not confidence_ok:
             # 置信度不足只否决**合并**，不截断**证据**：这个账户的权重/入场/条件
             # 分歧仍要继续采集，否则机器读到的 issues 会被人为裁短。
             disagreements.append(
                 "[%s] 置信度不足：%s=%.0f，%s=%.0f（要求均≥%.0f）" % (
-                    account_id, left_label, l_conf, right_label, r_conf, CONSENSUS_MIN_CONFIDENCE))
+                    account_id, left_label, l_conf, right_label, r_conf, min_confidence))
             issues.append({
                 "code": DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD,
                 "account_id": account_id,
                 "ai1_confidence": l_conf,
                 "ai2_confidence": r_conf,
-                "threshold": CONSENSUS_MIN_CONFIDENCE,
+                "threshold": min_confidence,
             })
 
         # 仅在"未提供"（None）时回退为空字典；``weights: []`` 之类的畸形载荷必须
@@ -1213,7 +1405,10 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                 "ai2_confidence": r_conf,
             })
 
-    if disagreements:
+    # 分歧按账户隔离：有分歧的账户不落地，已达成共识的账户仍然有效。
+    # 只有在一个共识都没达成时才整体失败——否则一个无关账户的分歧会把
+    # 其它账户已经谈成的补丁一起丢掉。
+    if disagreements and not merged:
         return False, "分歧：" + "; ".join(disagreements[:5]), [], issues
 
     if not merged:
@@ -1222,6 +1417,11 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
         return False, "无有效共识提案", [], issues
 
     merged = merged[:max_proposals]
+    if disagreements:
+        return (True,
+                "双AI对 %d 个账户达成共识；%d 个账户有分歧未纳入" % (
+                    len(merged), len(disagreements)),
+                merged, issues)
     return True, "双AI对 %d 个账户达成共识" % len(merged), merged, []
 
 
@@ -1435,6 +1635,7 @@ def _call_reviewer(slot, cfg, system_prompt, user_prompt):
             "error": None,
             "input_tokens": in_tok,
             "output_tokens": out_tok,
+            **({"auction_intents": parsed["auction_intents"]} if "auction_intents" in parsed else {}),
         }
     except Exception as exc:  # noqa: BLE001 - 上游必须拿到结构化失败而不是异常
         return _empty_reviewer(
@@ -1483,12 +1684,34 @@ def _base_outcome(result_mode, review_mode, status, reviewers, consensus, reason
     }
 
 
+def _reviewer_response(reviewer: dict) -> dict:
+    """审计用的 AI 决策快照。
+
+    ``*_response`` 列历史上存的是 proposals，与紧邻的 ``*_proposals`` 列完全
+    重复，等于没留下「模型到底判了什么」。这里改存决策本身，便于事后复盘
+    为什么 hold、为什么提这个补丁。仍然不落 raw prompt 与 raw 文本。
+    """
+    return {
+        "decision": reviewer.get("decision"),
+        "confidence": reviewer.get("confidence"),
+        "market_regime": reviewer.get("market_regime"),
+        "summary": str(reviewer.get("summary") or "")[:500],
+        "proposals_count": len(reviewer.get("proposals") or []),
+        **({"auction_intents": reviewer["auction_intents"]} if "auction_intents" in reviewer else {}),
+    }
+
+
 def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mode,
                  profile, evidence, evidence_hash, config_snapshot, reviewers,
                  consensus, reason, audit_merged, started_at, started,
                  total_latency_ms=None, track_evolution=False, outcome_detail=None):
     """写入审计行（沿用历史表与列语义），必要时接线进化追踪。"""
     finished_at = _now()
+    import auction_analysis
+    for reviewer in reviewers.values():
+        if "auction_intents" in reviewer:
+            reviewer["auction_intents"] = auction_analysis.normalize_intents(
+                reviewer["auction_intents"], evidence.get("auction_tracking"))
     total_latency = (total_latency_ms if total_latency_ms is not None
                      else round((time.monotonic() - started) * 1000))
     left = reviewers.get("ai1") or {}
@@ -1508,11 +1731,11 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                 str(trigger)[:80], mode, status,
                 profile.get("profile_date"), profile.get("regime"),
                 left.get("status"), (config_snapshot.get("ai1") or {}).get("model"),
-                _json(left.get("proposals")) if left.get("status") == "completed" else None,
+                _json(_reviewer_response(left)) if left.get("status") == "completed" else None,
                 _json(left.get("proposals")) if left.get("proposals") else None,
                 left.get("latency_ms"), left.get("error"),
                 right.get("status"), (config_snapshot.get("ai2") or {}).get("model"),
-                _json(right.get("proposals")) if right.get("status") == "completed" else None,
+                _json(_reviewer_response(right)) if right.get("status") == "completed" else None,
                 _json(right.get("proposals")) if right.get("proposals") else None,
                 right.get("latency_ms"), right.get("error"),
                 # consensus_result 是历史二值兼容列（旧消费者按它读），刻意**不**跟着
@@ -1816,7 +2039,7 @@ def recent_runs(conn, limit=20):
             "consensus_result": row[14], "consensus_reason": row[15],
             "merged_proposals": merged, "proposals": merged,
             "total_latency_ms": row[17], "created_at": row[18], "finished_at": row[19],
-            "applied_ids": _loads(row[20], None),
+            "applied_ids": _loads(row[20], []),
             "outcome_detail": outcome_detail,
         })
     return result
@@ -1824,6 +2047,7 @@ def recent_runs(conn, limit=20):
 
 def review_status(conn):
     """整体状态：审核模式 + 两个槽位的就绪度 + 最近记录。"""
+    import auction_analysis
     view = review_settings_view(conn)
     recent = recent_runs(conn, 5)
     last_consensus = next((r for r in recent if r.get("consensus_result") == "consensus"), None)
@@ -1841,6 +2065,7 @@ def review_status(conn):
         "deepseek_ready": view["slots"]["ai2"]["ready"],
         "recent_runs": recent,
         "last_consensus": last_consensus,
+        "auction_review": auction_analysis.status(conn),
         "consensus_rules": {
             "weight_direction_threshold": CONSENSUS_WEIGHT_DIRECTION_THRESHOLD,
             "weight_magnitude_ratio": CONSENSUS_WEIGHT_MAGNITUDE_RATIO,

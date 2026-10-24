@@ -74,7 +74,7 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
         """HOT_PATH_SLOTS must contain the SLA-critical trading slots."""
         import paper_trading as PT
 
-        expected_hot = {"auction", "open", "risk", "intraday", "fast-entry"}
+        expected_hot = {"auction", "open", "risk", "intraday", "fast-entry", "auction-track"}
         self.assertEqual(PT.HOT_PATH_SLOTS, expected_hot)
 
         for slot in expected_hot:

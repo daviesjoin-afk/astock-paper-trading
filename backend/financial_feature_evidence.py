@@ -73,9 +73,6 @@ def _instant(value: Any) -> datetime | None:
     return result.astimezone(timezone.utc)
 
 
-def _record_projection(record: HFA.FinancialRecordRef) -> dict[str, Any]:
-    return record.projection()
-
 
 def _visible(record: HFA.FinancialRecordRef, decision_at: str) -> tuple[bool, str]:
     row = record.projection()

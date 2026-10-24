@@ -910,8 +910,8 @@ class SignalLedgerTests(OfflinePaperEnv, unittest.TestCase):
         self.assertTrue(all(row["intended_date"] == D1.isoformat()
                             for row in bootstrap_rows))
 
-    def test_SIG13_live_signal_path_rejects_a_quote_that_is_not_cross_source_verified(self):
-        """逐票双源是 close signal 的硬门禁；单源/未核验一律拒绝（§18）。"""
+    def test_SIG13_live_signal_accepts_valid_single_source_without_forging_cross_verification(self):
+        """Single-source acceptance must retain the actual non-cross-verified evidence."""
         self._boot_account()
         # 把注入行情降级成"只通过区间/时间戳校验"（单源），并保留当日时间戳，
         # 使 freshness 仍然通过 —— 于是唯一能拦住它的就是双源要求本身。
@@ -932,14 +932,9 @@ class SignalLedgerTests(OfflinePaperEnv, unittest.TestCase):
         rows = [row for row in result["accounts"] if row["id"] == STRATEGY_ID]
         self.assertTrue(rows, result["accounts"])
         signals = self._signals(account_id=STRATEGY_ID, signal_date=D0.isoformat())
-        self.assertTrue(signals, "单源行情下仍应留下被拒绝的 signal 记录")
+        self.assertTrue(signals, "有效单源行情下应留下真实 signal 记录")
+        self.assertTrue(any(signal["status"] == "pending" for signal in signals))
         for signal in signals:
-            self.assertNotEqual(
-                signal["status"], "pending",
-                f"{signal['code']} 在单源行情下仍被放行成可执行信号",
-            )
-            self.assertIn("交叉核验", signal["reason"] or "",
-                          f"{signal['code']} 被拒的原因没有指向双源核验：{signal['reason']!r}")
             payload = json.loads(signal["payload"])
             evidence = payload.get("signal_evidence") or {}
             self.assertIs(evidence.get("cross_source_verified"), False)

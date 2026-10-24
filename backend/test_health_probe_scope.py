@@ -1,5 +1,6 @@
 """Successful probes may be reused briefly; failures never establish a window."""
 import unittest
+import datetime as dt
 from unittest import mock
 
 import data_fetcher as dfc
@@ -7,18 +8,20 @@ import data_fetcher as dfc
 
 class HealthProbeScopeTests(unittest.TestCase):
     def setUp(self):
+        self.valid_rows = [{"f12": str(i).zfill(6), "f2": 10., "f3": 0.,
+                            "f124": dt.datetime.now().timestamp()} for i in range(20)]
         patches = [
             mock.patch.object(dfc, "load_source_health", return_value={}),
             mock.patch.object(dfc, "_save_source_health"),
             mock.patch.object(dfc, "reset_data_source"),
             mock.patch.object(dfc.time, "sleep"),
             mock.patch.object(dfc, "http_get", return_value=""),
-            mock.patch.object(dfc, "fetch_independent_realtime_for_codes", return_value=[{"code": "1"}, {"code": "2"}]),
+            mock.patch.object(dfc, "fetch_independent_realtime_for_codes", return_value=[]),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        patch = mock.patch.object(dfc, "_fetch_clist", return_value=[{"f12": str(i), "f2": 10.} for i in range(20)])
+        patch = mock.patch.object(dfc, "_fetch_clist", return_value=self.valid_rows)
         self.probe = patch.start()
         self.addCleanup(patch.stop)
 
@@ -61,7 +64,7 @@ class HealthProbeScopeTests(unittest.TestCase):
                 clock.return_value = 131.
                 self.probe.return_value = []
                 self.assertFalse(dfc.check_data_source_health(force=True)["healthy"])
-                self.probe.return_value = [{"f12": str(i), "f2": 10.} for i in range(20)]
+                self.probe.return_value = self.valid_rows
                 self.assertTrue(dfc.check_data_source_health(force=True)["healthy"])
         self.assertEqual(self.probe.call_count, 4)
 

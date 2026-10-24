@@ -48,13 +48,20 @@ EXIT_SEVERITY = {
     "hard_stop": 4,
 }
 
+#: 首段减仓之后，全清还需要**独立确认**：要么继续跌破，要么等足时间。
+#: 3 分钟一轮的扫描下，仅凭"仍在成本线下"就清仓，会把仓位反复砍在震荡低点。
+#: 15 分钟 ≈ 5 轮扫描；0.5% 是相对首段成交价的恶化幅度。
+HARD_STOP_FULL_CLEAR_CONFIRM_MINUTES = 15.0
+HARD_STOP_FULL_CLEAR_DEEPEN_PCT = 0.005
 
+
+#: 严格数值契约：只接受 int/float，NaN 视为缺失。
+#:
+#: 本模块**必须是零项目依赖**的叶子（``test_paper_trading_architecture_guard``
+#: 的 guard6a 钉着这条：它是纯决策引擎，不能因为 import 而卷进任何环）。
+#: 所以这里保留一份与 ``paper_numeric.num`` 逐字相同的实现——**刻意不去 import**。
+#: 改动一处必须同步另一处，``test_paper_numeric_contract`` 会对两者的行为做比对。
 def _num(value, default=0.0):
-    """纯 stdlib 数值规整：只接受 int/float，NaN 视为缺失。
-
-    与 ``paper_trading._num`` 语义一致（那里靠 ``pd.notna`` 过滤 NaN），但不引入
-    pandas——本模块不得依赖项目第三方栈。
-    """
     if isinstance(value, (int, float)) and value == value:
         return float(value)
     return default
@@ -226,7 +233,8 @@ def main_force_intent(position, quote, market=None, news=None):
 
 def evaluate_sell(position, quote, *, asof_day, spec, hold_days, news=(),
                   hard_stop_touched_today=False, limit_pct=None,
-                  hard_stop_first_trim_ratio=0.35, risk_version=""):
+                  hard_stop_first_trim_ratio=0.35, risk_version="",
+                  hard_stop_trim_age_minutes=None, hard_stop_trim_price=None):
     """纯退出决策：硬止损 / 移动止损 / 最长持有 / 阶梯止盈 / 严重度仲裁。
 
     所有执行判断只依赖显式输入——策略 spec、hold_days、limit_pct、首段减仓比例
@@ -298,11 +306,38 @@ def evaluate_sell(position, quote, *, asof_day, spec, hold_days, news=(),
         # （2026-08-28 601212 案例：7.013 清仓后反弹 +7.6%）。
         pct_now = _num(quote.get("pct"), 0.0)
         crash_tape = pct_now <= -(_num(limit_pct, 0.0) * 0.8)
-        if crash_tape or hard_stop_touched_today:
-            suffix = "崩盘形态" if crash_tape else "跌破确认"
-            reasons.append(f"硬止损 {ret*100:.1f}%（{suffix}，全清）")
+        if crash_tape:
+            reasons.append(f"硬止损 {ret*100:.1f}%（崩盘形态，全清）")
             sell_ratio = 1.0
             _set_exit("hard_stop", "hard_stop")
+        elif hard_stop_touched_today:
+            # 首段减仓之后不得仅凭"还在线下"就全清：3 分钟一轮的扫描会把仓位
+            # 反复砍在震荡低点（601212 式单针探底的翻版）。只有**继续恶化**
+            # （较首段成交价再跌 0.5%）或**等足确认时间**（15 分钟 ≈ 5 轮扫描）
+            # 才清仓。trim 的时间/成交价拿不到时沿用旧行为，绝不静默不卖。
+            trim_price = _num(hard_stop_trim_price, 0.0)
+            deepened = (
+                trim_price > 0 and price > 0
+                and price <= trim_price * (1 - HARD_STOP_FULL_CLEAR_DEEPEN_PCT)
+            )
+            waited = (
+                hard_stop_trim_age_minutes is not None
+                and _num(hard_stop_trim_age_minutes, 0.0) >= HARD_STOP_FULL_CLEAR_CONFIRM_MINUTES
+            )
+            evidence_missing = (
+                hard_stop_trim_age_minutes is None and hard_stop_trim_price is None
+            )
+            if deepened or waited or evidence_missing:
+                reasons.append(f"硬止损 {ret*100:.1f}%（跌破确认，全清）")
+                sell_ratio = 1.0
+                _set_exit("hard_stop", "hard_stop")
+            else:
+                reasons.append(
+                    f"硬止损首段减仓已执行（现距成本 {ret*100:.1f}%）：等待继续跌破 "
+                    f"{HARD_STOP_FULL_CLEAR_DEEPEN_PCT*100:.1f}% 或 "
+                    f"{HARD_STOP_FULL_CLEAR_CONFIRM_MINUTES:.0f} 分钟确认，本轮不再追加卖出"
+                )
+                _set_exit("hard_stop", "hard_stop")
         else:
             guard_ratio = _num(hard_stop_first_trim_ratio, 0.35)
             reasons.append(

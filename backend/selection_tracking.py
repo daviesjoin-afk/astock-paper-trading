@@ -15,6 +15,7 @@ from collections import defaultdict
 from contextlib import closing
 
 import data_fetcher as dfc
+import market_data_contract as MDC
 import strategy_registry as SR
 import strategy_selection_provenance as SP
 import strategy_selection_resolver as SRES
@@ -43,6 +44,18 @@ def _connect():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def _connect_read_only():
+    """只读连接：验证页面**不得**建库、改结构或等待写锁。
+
+    ``sqlite3.connect()`` 在文件缺失时会创建一个空库，``with conn`` 也只提交
+    事务、不关闭连接；两者都不能表达"我只读"。``mode=ro`` 把这个意图交给
+    SQLite 本身执行（文件缺失时它是明确的``unable to open database file``）。
+    """
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -308,8 +321,23 @@ def _ensure_provenance_guards(conn) -> None:
         """,
     }
     for name, ddl in guards.items():
+        # 幂等 ≠ 每次重建：DROP + CREATE 会推进 schema_version、并使本事务
+        # 需要写锁。定义没变就不碰数据库（结构升级仍然是显式 ensure_schema 的事）。
+        if _trigger_definition(conn, name) == _normalized_sql(ddl):
+            continue
         conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         conn.execute(ddl)
+
+
+def _normalized_sql(sql) -> str:
+    return " ".join(str(sql or "").split())
+
+
+def _trigger_definition(conn, name: str) -> str | None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+    ).fetchone()
+    return _normalized_sql(row[0]) if row is not None else None
 
 
 def _number(value):
@@ -404,7 +432,7 @@ def record_run(result, run_date=None, source="scheduled", *, asof_day=None):
     safe_result = _json_safe(result)
     provenance = _run_provenance(result, strategy, asof_day=asof_day,
                                  data_asof=data_asof)
-    with _connect() as conn:
+    with closing(_connect()) as conn, conn:
         existing = conn.execute(
             "SELECT id FROM selection_runs WHERE run_date=? AND strategy=?",
             (day, strategy),
@@ -567,52 +595,63 @@ def _registry_conn() -> sqlite3.Connection:
     return conn
 
 
-def _authority_snapshot_rows():
-    """经 Market Data Authority 取全市场事实。
+def _close_snapshot_rows(now, asof_day):
+    """收盘事实：目标交易日 14:59 起、且已收盘的报价行。
 
-    这是一个**收盘后的 tracking job**（非浏览器只读路径），原有实现就是
-    ``fetch_market_snapshot()``（缓存未命中时联网），因此这里保留显式刷新
-    语义以维持行为 parity；只是把取数、完整性校验与新鲜度判定统一交给
-    authority，而不是自己直连 provider。
+    这是**收盘后的 tracking job**（非浏览器只读路径），保留显式刷新语义；
+    但取数规则必须与政策一致：``refresh_rows()`` 默认走 ``LIVE_MARKET_POLICY``
+    （报价距当前 ≤240 秒），而本任务在 15:45 / 16:15 / 16:45 / 17:15 运行 ——
+    正常的 15:00 收盘报价早已超出该窗口，于是"正常收盘被跳过、盘中报价反而
+    能入库"。这里显式使用 ``CLOSE_SNAPSHOT_POLICY`` 并校验目标交易日。
     """
     try:
         import market_data_service as MDSvc
-        return MDSvc.refresh_rows()
+        return MDSvc.refresh_rows(
+            policy=MDC.CLOSE_SNAPSHOT_POLICY, now=now, asof_day=asof_day,
+        )
     except Exception:
         return []
 
 
-def _latest_snapshot_prices():
-    # R24：只读路径经 Market Data Authority（此前直接调 fetch_market_snapshot，
-    # 在缓存过期时会同步穿透 provider，并绕过 authority 的新鲜度判定）。
-    rows = _authority_snapshot_rows()
+def _latest_snapshot_prices(now, asof_day):
+    """收盘价快照：逐行校验业务日，返回 ``(quote_day, {code: price})``。"""
     by_code = {}
-    dates = []
-    for row in rows:
+    for row in _close_snapshot_rows(now, asof_day):
         price = _number(row.get("price"))
-        quote_at = row.get("quote_at") or ""
-        quote_day = str(quote_at)[:10]
-        if price is not None and price > 0 and len(quote_day) == 10:
-            by_code[str(row.get("code") or "")] = price
-            dates.append(quote_day)
-    if not dates:
-        return None, {}
-    # A verified quote date prevents holiday/after-hours stale snapshots being
-    # recorded as a fictitious trading day.
-    return max(dates), by_code
+        quote_day = str(row.get("quote_at") or "")[:10]
+        # 逐行验证：目标交易日之外的报价即使落在取数结果里也不入库。
+        if price is None or price <= 0 or quote_day != asof_day:
+            continue
+        by_code[str(row.get("code") or "")] = price
+    return (asof_day if by_code else None), by_code
 
 
 def update_observations():
-    """Append one end-of-day market observation for active candidate snapshots."""
+    """Append one end-of-day market observation for active candidate snapshots.
+
+    只有**已收盘且属于目标交易日**的报价才能入库。页面按钮
+    （``POST /api/selection-evaluation/refresh``）直接进入本函数，所以这里是
+    收盘规则的唯一闸门：盘中刷新以前也能写一条"收盘收益"，而
+    ``UNIQUE(pick_id, observed_date)`` + ``INSERT OR IGNORE`` 会让这条错误记录
+    永久无法纠正。已污染的历史行需要原始报价证据才能修正，绝不能靠无条件覆盖。
+    """
+    now = dt.datetime.now(CHINA_TZ)
+    today = now.date().isoformat()
+    if MDC.close_snapshot_window(now, today) is None:
+        return {"status": "skipped", "reason": "market has not closed yet", "date": today}
     ensure_schema()
-    today = _today().isoformat()
-    quote_day, prices = _latest_snapshot_prices()
+    quote_day, prices = _latest_snapshot_prices(now, today)
     if quote_day != today:
-        return {"status": "skipped", "reason": "market quote is not a same-day close", "quote_date": quote_day}
+        return {
+            "status": "skipped",
+            "reason": "no verified close quote for the target day",
+            "quote_date": quote_day,
+            "date": today,
+        }
     refresh_benchmark()
     benchmark = _benchmark_price_on_or_before(dt.date.fromisoformat(today))
     inserted = 0
-    with _connect() as conn:
+    with closing(_connect()) as conn, conn:
         active = conn.execute(
             """
             SELECT p.id, p.code, p.entry_price, r.run_date, r.benchmark_entry_price
@@ -621,15 +660,29 @@ def update_observations():
             """,
             (today, (dt.date.fromisoformat(today) - dt.timedelta(days=45)).isoformat()),
         ).fetchall()
+        # 一次批量统计，而不是为每个候选追加一次 COUNT（N+1）。
+        prior_counts = {
+            int(row["pick_id"]): int(row["c"])
+            for row in conn.execute(
+                """
+                SELECT o.pick_id AS pick_id, COUNT(*) AS c
+                FROM selection_observations o
+                WHERE o.pick_id IN (
+                    SELECT p.id FROM selection_picks p
+                    JOIN selection_runs r ON r.id=p.run_id
+                    WHERE r.run_date < ? AND r.run_date >= ?
+                )
+                GROUP BY o.pick_id
+                """,
+                (today, (dt.date.fromisoformat(today) - dt.timedelta(days=45)).isoformat()),
+            ).fetchall()
+        }
         for row in active:
             price = prices.get(row["code"])
             entry = _number(row["entry_price"])
             if price is None or entry is None or entry <= 0:
                 continue
-            prior_days = conn.execute(
-                "SELECT COUNT(*) AS c FROM selection_observations WHERE pick_id=?",
-                (row["id"],),
-            ).fetchone()["c"]
+            prior_days = prior_counts.get(int(row["id"]), 0)
             if prior_days >= MAX_TRACKING_DAYS:
                 continue
             ret = (price / entry - 1) * 100
@@ -709,11 +762,19 @@ def _duplicate_picks(conn, max_days=60):
         item = dict(row)
         if item.get("code"):
             groups[(item["run_date"], item["code"])].append(item)
-    # 读取最新跟踪点，避免重复项只有静态排名没有后续表现。
+    # 读取最新跟踪点，避免重复项只有静态排名没有后续表现。只取本次候选
+    # 窗口内的观测，并在 SQL 里定好并列规则（holding_days → observed_date → id），
+    # 而不是读全表排序后逐条丢弃。
     latest = {}
     for row in conn.execute(
-        """SELECT pick_id, observed_date, price, holding_days, return_pct, excess_return_pct
-           FROM selection_observations ORDER BY pick_id, holding_days DESC"""
+        """SELECT o.pick_id, o.observed_date, o.price, o.holding_days,
+                  o.return_pct, o.excess_return_pct
+           FROM selection_observations o
+           JOIN selection_picks p ON p.id=o.pick_id
+           JOIN selection_runs r ON r.id=p.run_id
+           WHERE r.run_date >= date('now', ?)
+           ORDER BY o.pick_id, o.holding_days DESC, o.observed_date DESC, o.id DESC""",
+        (f"-{max(1, int(max_days))} day",),
     ).fetchall():
         latest.setdefault(row["pick_id"], dict(row))
     duplicates = []
@@ -754,21 +815,46 @@ def _duplicate_picks(conn, max_days=60):
     return duplicates
 
 
+def _is_missing_schema(exc: Exception) -> bool:
+    return "no such table" in str(exc).lower()
+
+
+def _dashboard_rows(strategy, limit):
+    """只读取数。
+
+    验证页面是**只读**的：它不能顺手建库、升级结构、重建触发器或取得写锁。
+    结构升级属于显式初始化/迁移入口（``ensure_schema``）。
+
+    降级只覆盖两种"确实没有证据"的情形：库文件不存在、库存在但结构未初始化。
+    其它错误（包括 ``database is locked``）必须照常抛出 —— 把锁竞争伪装成
+    "暂无证据"正好会掩盖本次要修的缺陷。
+    """
+    if not os.path.exists(DB_PATH):
+        return [], {}, {}, []
+    conn = _connect_read_only()
+    try:
+        with closing(conn), conn:
+            run_where = "" if not strategy else "WHERE strategy=?"
+            run_args = () if not strategy else (strategy,)
+            runs = [dict(row) for row in conn.execute(
+                f"""SELECT run_date, generated_at, strategy, strategy_name, data_asof_date,
+                           selected_count, candidate_count, executable_count, source
+                    FROM selection_runs {run_where}
+                    ORDER BY run_date DESC, strategy LIMIT ?""",
+                (*run_args, max(1, min(int(limit), 180))),
+            ).fetchall()]
+            pick_meta, grouped = _metric_rows(conn, strategy)
+            duplicate_picks = _duplicate_picks(conn)
+            return runs, pick_meta, grouped, duplicate_picks
+    except sqlite3.OperationalError as exc:
+        if _is_missing_schema(exc):
+            return [], {}, {}, []
+        raise
+
+
 def dashboard(strategy="", limit=30):
     """Return compact, auditable forward-performance evidence for the UI."""
-    ensure_schema()
-    with _connect() as conn:
-        run_where = "" if not strategy else "WHERE strategy=?"
-        run_args = () if not strategy else (strategy,)
-        runs = [dict(row) for row in conn.execute(
-            f"""SELECT run_date, generated_at, strategy, strategy_name, data_asof_date,
-                       selected_count, candidate_count, executable_count, source
-                FROM selection_runs {run_where}
-                ORDER BY run_date DESC, strategy LIMIT ?""",
-            (*run_args, max(1, min(int(limit), 180))),
-        ).fetchall()]
-        pick_meta, grouped = _metric_rows(conn, strategy)
-        duplicate_picks = _duplicate_picks(conn)
+    runs, pick_meta, grouped, duplicate_picks = _dashboard_rows(strategy, limit)
     strategy_ids = sorted({item["strategy"] for item in pick_meta.values()} | {r["strategy"] for r in runs})
     strategies = []
     for sid in strategy_ids:

@@ -4,19 +4,20 @@
    新增 inline handler 时，把被调用的函数加到对应 import 与赋值列表。
    由 backend/test_frontend_module_contract.py 校验覆盖率。 */
 
-import { adaptiveEsc } from "./core/format.js";
+import { adaptiveEsc, adaptiveJsArg } from "./core/format.js";
 import { compareAdaptiveValidationRun, openAdaptiveValidationRun, refreshAdaptiveRobustness, refreshAdaptiveValidationRuns, selectAdaptiveRobustnessRun, submitAdaptiveRobustness, submitAdaptiveValidation } from "./features/adaptive.js";
 import { activatePage, refreshApp, showPaperWorkspace, toggleDark } from "./core/navigation.js";
-import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, testModlensRead, triggerEvolution } from "./features/adaptive.js";
+import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, triggerEvolution } from "./features/adaptive.js";
 import { loadPaperExecution, verifyExecutionOrder } from "./features/execution.js";
 import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPaperOrderPreview, filterPaperHistoryRows, loadPaperStockHistory, loadPortfolioWorkspace, pausePaper, preparePaperSell, previewPaperOrder, refreshPaperResearchValidation, resetPaper, resumePaper, runPaperNow, selectPaperHistoryQuick, setPaperOrderSide, setPaperTerminalFilter, showPaperStockHistory, startPaper, submitPaperOrder, syncPaperCapitalHint, togglePaperLimitPrice } from "./features/paper.js";
 import { applyPaperRiskAuditFilter, loadPaperAudit, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
-import { cancelManualDataUpdate, choosePaperStrategy, chooseStrategy, filterSelectionEvaluationRows, loadDataValidity, loadPaperSelection, loadSelectionEvaluation, refreshSelectionEvaluation, runPaperSelection, showSelectionValidation, startFactorIncrementalUpdate, startInit, startManualDataUpdate, trackRemove } from "./features/selection.js";
-import { clearAiSlotKey, clearOperatorTab, resetSettingsSection, saveAiReviewMode, saveAiSlot, saveSettingsSection, setSettingsSection, testAiSlot, unlockOperatorTab } from "./features/settings.js";
+import { cancelManualDataUpdate, choosePaperStrategy, chooseStrategy, filterSelectionEvaluationRows, loadDataValidity, loadPaperSelection, loadSelectionEvaluation, refreshSelectionEvaluation, runPaperSelection, showSelectionValidation, startFactorIncrementalUpdate, startInit, startManualDataUpdate } from "./features/selection.js";
+import { clearOperatorTab, clearWxpusherToken, resetSettingsSection, saveAiReviewMode, saveAiSlot, saveSettingsSection, setSettingsSection, testAiSlot, testWxpusher, unlockOperatorTab } from "./features/settings.js";
 import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbAiGenerateCandidates, wbApplyPromotionProposal, wbBackToList, wbCloneFirstBuiltin, wbCloneStrategy, wbCreatePromotionProposal, wbDeleteDraft, wbLoadChallengerReport, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateDraft } from "./features/strategies.js";
 
 window.activatePage = activatePage;
 window.adaptiveEsc = adaptiveEsc;
+window.adaptiveJsArg = adaptiveJsArg;
 window.applyAdaptiveRiskCandidate = applyAdaptiveRiskCandidate;
 window.applyAdaptiveSelectionCandidate = applyAdaptiveSelectionCandidate;
 window.applyPaperRiskAuditFilter = applyPaperRiskAuditFilter;
@@ -29,8 +30,8 @@ window.choosePaperStrategy = choosePaperStrategy;
 window.chooseStrategy = chooseStrategy;
 window.clearPaperOrderDate = clearPaperOrderDate;
 window.clearPaperOrderPreview = clearPaperOrderPreview;
-window.clearAiSlotKey = clearAiSlotKey;
 window.clearOperatorTab = clearOperatorTab;
+window.clearWxpusherToken = clearWxpusherToken;
 window.filterPaperHistoryRows = filterPaperHistoryRows;
 window.filterSelectionEvaluationRows = filterSelectionEvaluationRows;
 window.loadAdaptive = loadAdaptive;
@@ -98,10 +99,9 @@ window.submitPaperOrder = submitPaperOrder;
 window.switchToAdaptiveAI = switchToAdaptiveAI;
 window.syncPaperCapitalHint = syncPaperCapitalHint;
 window.testAiSlot = testAiSlot;
-window.testModlensRead = testModlensRead;
+window.testWxpusher = testWxpusher;
 window.toggleDark = toggleDark;
 window.togglePaperLimitPrice = togglePaperLimitPrice;
-window.trackRemove = trackRemove;
 window.triggerEvolution = triggerEvolution;
 window.verifyExecutionOrder = verifyExecutionOrder;
 window.wbAddCondition = wbAddCondition;
@@ -128,3 +128,10 @@ window.wbSetOriginFilter = wbSetOriginFilter;
 window.wbSetStatusFilter = wbSetStatusFilter;
 window.wbTransition = wbTransition;
 window.wbValidateDraft = wbValidateDraft;
+
+import { editAiProvider, changeAiSlotProvider, saveAiProvider, refreshAiProviderModels, clearAiProviderKey } from "./features/ai-provider-settings.js";
+window.editAiProvider = editAiProvider;
+window.changeAiSlotProvider = changeAiSlotProvider;
+window.saveAiProvider = saveAiProvider;
+window.refreshAiProviderModels = refreshAiProviderModels;
+window.clearAiProviderKey = clearAiProviderKey;

@@ -16,7 +16,9 @@ HOME=/opt/astock-codex
 # backend/test_paper_schedule_contract.py 的 CronRenderingFidelityGuard 会失败
 # （它把两边展开成具体触发时刻做语义比较，不比对字符串）。
 
-# A股集合竞价预选：只采集09:25快照；不使用09:15-09:20可撤单阶段数据。
+# 09:15 起每3分钟保存个股竞价观测；早期可撤单，仅跟踪、不生成委托。
+15-24/3 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction-track >>/opt/astock-codex/reports/scheduler.log 2>&1
+# 09:25 的最终竞价预选仍与早期观测分离，开盘再按原门禁审批。
 25 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 竞价任务失败才自动重试；成功任务会被 run_slot 幂等跳过。
 27 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
@@ -52,6 +54,12 @@ HOME=/opt/astock-codex
 5 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
 10 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
 12 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
+# 收盘任务的两类失败需要不同的兜底窗口：进程被杀/超时由 15:10/15:12 立刻重跑；
+# 「完整日线覆盖不足」只能在数据补齐后再试，因此 15:25/15:40/16:00 继续按游标
+# 做增量刷新。每次尝试都跑同一套 fail-closed 覆盖门禁，晚窗口不会放行不完整数据。
+25 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
+40 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
+0 16 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
 20 15 * * 5 root flock -n /opt/astock-codex/.locks/review.lock docker exec astock-task-worker python backend/paper_runner.py --slot weekly-review >>/opt/astock-codex/reports/scheduler.log 2>&1
 
 # 每日收盘后固化三套策略候选并跟踪前期快照。
@@ -118,3 +126,21 @@ HOME=/opt/astock-codex
 # 每日自动备份（2026-09-04 排查确认此前从未有备份任务；sqlite 在线备份不锁库）。
 # backup.sh 自带路径探测（/opt/astock-codex 或 /root/codex）与清单自校验。
 10 20 * * * root flock -n /opt/astock-codex/.locks/backup.lock /opt/astock-codex/deploy/backup.sh --keep 7 >>/opt/astock-codex/reports/backup.log 2>&1
+
+# 磁盘水位守护（2026-10-20 操作员要求）：根分区超过 85% 就清理构建缓存、旧镜像与过期备份。
+# 低于阈值时只写一行日志，不做任何删除；永不触碰账本、当日迁移前备份或正在使用的镜像。
+17,47 * * * * root /opt/astock-codex/deploy/disk-guard.sh >>/opt/astock-codex/reports/disk-guard.log 2>&1
+
+# 日报/周报 WxPusher 推送：调度器每 10 分钟唤醒一次，由 push_report.py 读取设置中心里的
+# 发送时间自行判断是否落在窗口内，并用当天标记文件去重。未启用时只写一行日志。
+3,13,23,33,43,53 * * * * root flock -n /opt/astock-codex/.locks/push-report.lock docker exec astock-task-worker python backend/push_report.py all >>/opt/astock-codex/reports/push-report.log 2>&1
+
+
+# ─── 业绩公告摄取（2026-10-24 起）────────────────────────────────────────────
+# 业绩预告 / 业绩快报 / 修正公告：抓原文 → owner 按原文复算归母净利润 → 落
+# data_cache/earnings_disclosure.sqlite。落库前必须拿到原文，拿不到就只计数、下一轮补。
+# 08:40–22:40 每 2 小时一轮，刻意**不跳过非交易日**（周末与节假日同样有业绩公告披露）。
+# 刻意错开 20:10 的备份与 17:25/17:55/08:50 的选股任务；轻量任务（秒级到两分钟、无重计算），
+# 因此用 -n 独立锁而不是 resource-heavy.lock：撞上就跳过这一轮，下一轮幂等补齐
+# （同一 art_code 只落一行，first_seen_at 不会被刷新）。
+40 8-22/2 * * * root flock -n /opt/astock-codex/.locks/earnings.lock docker exec astock-data-worker python backend/earnings_disclosure_runner.py --days 2 >>/opt/astock-codex/reports/earnings-disclosure.log 2>&1

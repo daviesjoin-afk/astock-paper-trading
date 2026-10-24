@@ -1,0 +1,58 @@
+{
+  "data_directory": {
+    "configured_directory": "<isolated-dir>",
+    "effective_market_cache": "<isolated-dir>",
+    "effective_kline_dir": "<isolated-dir>\\klines",
+    "effective_manifest": "<isolated-dir>\\kline_manifest.json",
+    "kline_dir_created_by_import": true,
+    "isolated": true
+  },
+  "close_policy": {
+    "provider_rows": 4000,
+    "tracking_rows": 4000,
+    "close_policy_rows": 4000,
+    "update": {
+      "status": "ok",
+      "date": "2026-10-23",
+      "observed": 0,
+      "benchmark": 4105.33
+    }
+  },
+  "intraday_as_close": {
+    "midday_result": {
+      "status": "skipped",
+      "reason": "market has not closed yet",
+      "date": "2026-10-23"
+    },
+    "close_result": {
+      "status": "ok",
+      "date": "2026-10-23",
+      "observed": 1,
+      "benchmark": null
+    },
+    "stored": {
+      "price": 10.0,
+      "return_pct": 0.0
+    }
+  },
+  "dashboard_schema": {
+    "version_before": 8,
+    "version_after": 8,
+    "read_during_writer_count": 1,
+    "dashboard_during_writer_error": null,
+    "probe_busy_timeout_ms": 50,
+    "elapsed_ms": 1
+  },
+  "async_blocking": {
+    "heartbeat_expected_ms": 20,
+    "heartbeat_actual_ms": 33,
+    "sqlite_wait_seconds": 0.25,
+    "route_is_coroutine_function": false
+  },
+  "settings_async_blocking": {
+    "heartbeat_expected_ms": 20,
+    "heartbeat_actual_ms": 22,
+    "probe_busy_timeout_ms": 250,
+    "note": "Real settings handler and storage BEGIN IMMEDIATE; init_db bypassed; shortened SQLite timeout."
+  }
+}

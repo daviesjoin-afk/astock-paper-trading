@@ -90,15 +90,15 @@ def _suspended(rows, code, observed):
 
 
 def prefetch(quotes, *, asof_day):
-    """Current-day only, bounded to 200 passing independent-checked quotes."""
+    """Current-day only, bounded to 200 fresh validated provider quotes."""
     day = str(asof_day)[:10]
     if day != dt.datetime.now(TZ).date().isoformat():
         return {}
     selected = {str(k): v for k, v in quotes.items()
-                if v.get("quote_source") == "live" and v.get("quote_validation") == "cross_source_checked"
-                and MDC.classify(MDC.symbol_quote_snapshot(v, asof_day=day),
-                                 MDC.EXECUTION_QUOTE_POLICY, now=dt.datetime.now(TZ),
-                                 asof_day=day).status == MDC.STATUS_FRESH}
+                if v.get("quote_source") == "live"
+                and MDC.is_execution_quote_usable(MDC.classify(
+                    MDC.symbol_quote_snapshot(v, asof_day=day), MDC.EXECUTION_QUOTE_POLICY,
+                    now=dt.datetime.now(TZ), asof_day=day))}
     if not selected or len(selected) > 200:
         return {}
     try:
@@ -228,7 +228,7 @@ def persist(conn, quote, *, code, asof_day):
             or (instant - observed).total_seconds() > STATUS_MAX_AGE_SECONDS
             or observed.date().isoformat() != str(asof_day)[:10]
             or item.get("source") not in (PROFILE_SOURCE, MARKET_SOURCE)
-            or quote.get("quote_validation") != "cross_source_checked"):
+            or quote.get("quote_validation") not in {"cross_source_checked", "range_timestamp_checked"}):
         raise ValueError("current tradability identity/time evidence invalid")
     fingerprint = hashlib.sha256(json.dumps(item, sort_keys=True, allow_nan=False).encode()).hexdigest()
     TI.IngestionService([_PrefetchedProvider(item)], TA.TradabilityArchiveRepository(conn),

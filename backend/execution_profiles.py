@@ -34,8 +34,6 @@ __all__ = [
 EXECUTION_PROFILE_VERSION = "execution-profiles-v1"
 
 # 各画像族允许的订单类型只有两种（PR-10 第一版边界）。
-_ALLOWED_ORDER_TYPES = frozenset({"market", "limit"})
-
 EXECUTION_PROFILES: dict[str, dict[str, Any]] = {
     "breakout": {
         "label": "突破快速",
@@ -178,12 +176,19 @@ def enforce_entry_limit(
     *,
     reference_price,
     side: str = "buy",
+    frozen_limit_price=None,
 ) -> dict[str, Any]:
     """入场限价门禁：限价锚定参考价（如信号收盘价），现价越界则延期。
 
     市价画像恒通过。限价画像：`limit = reference × (1 ± offset)`，
     若 `fill_price` 不优于限价（买入时更高），调用方应把订单延期
     （`execution_retry`），而不是按更差的价格成交。
+
+    ``frozen_limit_price`` 是该信号**首次**算出的限价（存在订单的
+    ``planned_price`` 上）。参考价每轮都会跟着实时价刷新，若每次都重新取
+    ``reference × (1 + offset)``，限价就会随价格上移——当轮买不到、下一轮
+    锚点更高，形成结构性追价。传入冻结价后限价只降不升：价格反弹不会把
+    限价一起抬起来，宁可这一单不做，也不追。
     """
     try:
         price = float(fill_price or 0.0)
@@ -194,6 +199,12 @@ def enforce_entry_limit(
         return {"allowed": True, "limit_price": None, "reason": None,
                 "order_type": str(profile.get("order_type") or "market"),
                 "version": EXECUTION_PROFILE_VERSION}
+    try:
+        frozen = float(frozen_limit_price) if frozen_limit_price is not None else None
+    except (TypeError, ValueError):
+        frozen = None
+    if frozen is not None and frozen > 0:
+        limit_price = min(limit_price, frozen)
     allowed = 0.0 < price <= limit_price + 1e-9
     return {
         "allowed": allowed,

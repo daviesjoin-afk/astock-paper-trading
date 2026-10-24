@@ -8,7 +8,10 @@ from __future__ import annotations
 import datetime as dt
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 
+import notify_wxpusher as NOTIFY
+import operator_auth
 import paper_sizing as sizing
 import paper_trading as P
 import runtime_settings as RSET
@@ -61,6 +64,12 @@ def _snapshot() -> dict:
     P.init_db()
     with P._db() as conn:  # the paper module owns the storage boundary
         settings = RSET.read(conn)
+        # appToken 只回显掩码：明文不得出现在任何 GET 响应里。
+        notification = dict(settings.get("notification") or {})
+        raw_token = str(notification.get("wxpusher_app_token") or "")
+        notification["wxpusher_app_token"] = NOTIFY.mask_token(raw_token)
+        notification["wxpusher_token_configured"] = bool(raw_token)
+        settings["notification"] = notification
         cycle = P._active_cycle(conn)
         audit = RSET.audit(conn, 40)
         capital = float(cycle.get("capital") or settings["simulation"]["default_starting_capital"])
@@ -111,6 +120,8 @@ def _snapshot() -> dict:
             "strategy": {"strategy_overrides": defaults["strategy_overrides"]},
             "evolution": {"evolution_interval_hours": defaults["evolution_interval_hours"]},
             "execution": {key: defaults[key] for key in RSET.SETTING_GROUPS["execution"]},
+            "notification": {key: defaults[key] for key in RSET.SETTING_GROUPS["notification"]},
+            "security": {key: defaults[key] for key in RSET.SETTING_GROUPS["security"]},
         },
         "metadata": metadata,
         "effective": {
@@ -147,9 +158,33 @@ def settings_snapshot():
         raise HTTPException(status_code=500, detail=f"读取设置失败：{type(exc).__name__}") from exc
 
 
+def _apply_runtime_settings(runtime_updates: dict, ai_updates: dict,
+                            clear_token: bool = False) -> dict:
+    """一次完整的同步业务单元：连接与事务都在**线程内**创建和关闭。
+
+    ``P.init_db()`` / ``P._db(immediate=True)`` 是同步 SQLite 调用，且可能要等
+    写锁（普通数据库锁等待可达 60 秒）。在 ``async def`` 里直接执行它们会阻塞
+    事件循环本身 —— 同一进程调度其它请求也正是这条循环，于是一个保存设置的
+    请求会把并发心跳一起拖住。所以整块搬进线程池，而不是只搬某一行。
+    """
+    adaptive = _get_adaptive()
+    P.init_db()
+    with P._db(immediate=True) as conn:
+        if clear_token:
+            runtime_updates["wxpusher_app_token"] = ""
+        if runtime_updates:
+            RSET.update(conn, runtime_updates, actor="human-ui")
+            P._audit(conn, None, "settings_changed", "统一设置中心更新运行参数（详见设置审计）")
+            # 保存后立即生效，不必等重启；关闭时该状态会写进设置审计。
+            if "operator_auth_required" in runtime_updates:
+                operator_auth.set_bypass(not bool(runtime_updates["operator_auth_required"]))
+    if ai_updates:
+        adaptive.update_ai_settings(ai_updates)
+    return _snapshot()
+
+
 @router.post("/")
 async def update_settings(request: Request, confirmed: bool = Query(False)):
-    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "保存运行设置")
     try:
         body = await request.json()
@@ -157,6 +192,17 @@ async def update_settings(request: Request, confirmed: bool = Query(False)):
         raise HTTPException(status_code=422, detail="设置内容必须是JSON对象") from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="设置内容必须是JSON对象")
+    body = dict(body)
+    # appToken 语义与 AI Key 一致：留空表示保持原值，清除必须显式声明，
+    # 否则一次只改发送时间的前端提交会把凭据抹掉。
+    clear_token = False
+    notification_body = body.get("notification")
+    if isinstance(notification_body, dict):
+        notification_body = dict(notification_body)
+        clear_token = bool(notification_body.pop("clear_app_token", False))
+        if not str(notification_body.get("wxpusher_app_token") or "").strip():
+            notification_body.pop("wxpusher_app_token", None)
+        body["notification"] = notification_body
     allowed_groups = set(RSET.SETTING_GROUPS) | {"ai"}
     unknown_groups = set(body) - allowed_groups
     if unknown_groups:
@@ -173,18 +219,13 @@ async def update_settings(request: Request, confirmed: bool = Query(False)):
     if ai_updates and not isinstance(ai_updates, dict):
         raise HTTPException(status_code=422, detail="AI设置必须是对象")
     try:
-        P.init_db()
-        with P._db(immediate=True) as conn:
-            if runtime_updates:
-                RSET.update(conn, runtime_updates, actor="human-ui")
-                P._audit(conn, None, "settings_changed", "统一设置中心更新运行参数（详见设置审计）")
-        if ai_updates:
-            adaptive.update_ai_settings(ai_updates)
+        return await run_in_threadpool(
+            _apply_runtime_settings, runtime_updates, ai_updates, clear_token,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"保存设置失败：{type(exc).__name__}") from exc
-    return _snapshot()
 
 
 @router.post("/ai-key")
@@ -205,15 +246,19 @@ async def update_ai_key(request: Request, confirmed: bool = Query(False)):
     api_key = body.get("api_key")
     if api_key is not None and (not isinstance(api_key, str) or len(api_key) > 200):
         raise HTTPException(status_code=422, detail="API Key格式无效")
-    try:
+
+    def _write() -> dict:
         adaptive.update_ai_slot_fn(
             body["provider"],
             api_key=api_key, base_url=body.get("base_url"), model=body.get("model"),
             enabled=body.get("enabled"),
         )
+        return _snapshot()
+
+    try:
+        return await run_in_threadpool(_write)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return _snapshot()
 
 
 # ─── 通用 AI 槽位设置（ai1 / ai2）───
@@ -223,7 +268,7 @@ async def update_ai_key(request: Request, confirmed: bool = Query(False)):
 _AI_REVIEW_KEYS = {"review_mode", "single_reviewer_slot"}
 _AI_SLOT_KEYS = {
     "api_key", "base_url", "model", "enabled",
-    "display_name", "timeout_seconds", "clear_api_key",
+    "display_name", "timeout_seconds", "clear_api_key", "provider_id",
 }
 
 
@@ -248,7 +293,6 @@ def ai_review_snapshot():
 
 @router.put("/ai-review")
 async def update_ai_review(request: Request, confirmed: bool = Query(False)):
-    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "切换AI审核模式")
     body = await _read_json_object(request, "AI审核设置必须是JSON对象")
     unknown = set(body) - _AI_REVIEW_KEYS
@@ -256,11 +300,15 @@ async def update_ai_review(request: Request, confirmed: bool = Query(False)):
         raise HTTPException(status_code=422, detail="未知设置项: " + ",".join(sorted(unknown)))
     if not body:
         raise HTTPException(status_code=422, detail="至少需要提供 review_mode 或 single_reviewer_slot")
-    try:
-        return adaptive.update_ai_review_settings_fn(
+
+    def _write() -> dict:
+        return _get_adaptive().update_ai_review_settings_fn(
             review_mode=body.get("review_mode"),
             single_reviewer_slot=body.get("single_reviewer_slot"),
         )
+
+    try:
+        return await run_in_threadpool(_write)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -269,7 +317,6 @@ async def update_ai_review(request: Request, confirmed: bool = Query(False)):
 
 @router.put("/ai-review/slots/{slot}")
 async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Query(False)):
-    adaptive = _get_adaptive()
     _require_confirmation(confirmed, "保存AI槽位配置")
     body = await _read_json_object(request, "AI槽位配置必须是JSON对象")
     unknown = set(body) - _AI_SLOT_KEYS
@@ -282,8 +329,11 @@ async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Q
         raise HTTPException(status_code=422, detail="enabled必须是布尔值")
     if "clear_api_key" in body and not isinstance(body["clear_api_key"], bool):
         raise HTTPException(status_code=422, detail="clear_api_key必须是布尔值")
-    try:
-        return adaptive.update_ai_slot_fn(
+    if "provider_id" in body and not isinstance(body["provider_id"], str):
+        raise HTTPException(status_code=422, detail="provider_id必须是字符串")
+
+    def _write() -> dict:
+        return _get_adaptive().update_ai_slot_fn(
             slot,
             api_key=api_key,
             base_url=body.get("base_url"),
@@ -292,11 +342,47 @@ async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Q
             display_name=body.get("display_name"),
             timeout_seconds=body.get("timeout_seconds"),
             clear_api_key=bool(body.get("clear_api_key")),
+            **({"provider_id": body["provider_id"]} if "provider_id" in body else {}),
         )
+
+    try:
+        return await run_in_threadpool(_write)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"保存AI槽位失败：{type(exc).__name__}") from exc
+
+
+@router.post("/ai-review/providers")
+async def create_ai_provider(request: Request, confirmed: bool = Query(False)):
+    return await _save_ai_provider(request, confirmed)
+
+
+@router.put("/ai-review/providers/{provider_id}")
+async def update_ai_provider(provider_id: str, request: Request, confirmed: bool = Query(False)):
+    return await _save_ai_provider(request, confirmed, provider_id)
+
+
+async def _save_ai_provider(request, confirmed, provider_id=None):
+    _require_confirmation(confirmed, "保存AI提供商")
+    body = await _read_json_object(request, "提供商配置必须是JSON对象")
+    try:
+        return _get_adaptive().save_ai_provider_fn(provider_id, **body)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存提供商失败：{type(exc).__name__}") from exc
+
+
+@router.post("/ai-review/providers/{provider_id}/models/refresh")
+def refresh_ai_provider_models(provider_id: str, confirmed: bool = Query(False)):
+    _require_confirmation(confirmed, "读取提供商模型")
+    try:
+        return _get_adaptive().refresh_ai_provider_models_fn(provider_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取模型失败：{type(exc).__name__}") from exc
 
 
 @router.post("/ai-review/slots/{slot}/test")
@@ -310,6 +396,38 @@ def test_ai_review_slot(slot: str, confirmed: bool = Query(False)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"测试AI槽位失败：{type(exc).__name__}") from exc
+
+
+@router.get("/ai-review/slots/{slot}/models")
+def list_ai_review_slot_models(slot: str):
+    """列出该槽位上游的可用模型。只读：不发 chat 请求、不消耗 token。
+
+    用已保存的凭据去问上游，界面上的未保存改动不参与，避免把 Key 送到
+    一个还没保存的地址。
+    """
+    adaptive = _get_adaptive()
+    try:
+        return adaptive.list_ai_slot_models_fn(slot)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取模型列表失败：{type(exc).__name__}") from exc
+
+
+@router.post("/notification/test")
+def test_notification(kind: str = Query("daily"), confirmed: bool = Query(False)):
+    """发送一条真实测试推送；因为会真的发到微信，必须显式确认。"""
+    _require_confirmation(confirmed, "发送测试推送")
+    P.init_db()
+    with P._db() as conn:
+        settings = RSET.read(conn)["notification"]
+        try:
+            result = NOTIFY.dispatch(conn, kind, settings)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not result["sent"]:
+        raise HTTPException(status_code=422, detail=result["reason"])
+    return result
 
 
 @router.get("/audit")

@@ -2,12 +2,8 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, tableScroll } from "../core/dom.js";
-import { cny, fmt, pctCls, pctTxt, riskLevelView, riskMetric, riskText, zhRiskText } from "../core/format.js";
+import { cny, fmt, fmtPct, pctCls, pctTxt, riskLevelView, riskMetric, riskText, zhRiskText } from "../core/format.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
-
-export function paperAuditBlock(title, count, body){
-  return '<details class="paper-audit"><summary><span>'+title+'<span class="paper-audit-count">'+count+'</span></span><span class="paper-status-note">点击查看完整记录</span></summary><div class="paper-audit-body">'+body+'</div></details>';
-}
 
 var auditState={filters:{account_id:'',level:'',date:''},cursors:[null],page:0,data:null,sequence:0};
 
@@ -68,13 +64,15 @@ export function renderPaperAudit(d,filters,page){
   var options='<option value="">全部策略</option>'+(d.accounts||[]).map(function(a){return '<option value="'+riskText(a.id)+'"'+(a.id===filters.account_id?' selected':'')+'>'+riskText(a.name)+'</option>';}).join('');
   var audit=(d.alerts||[]).map(function(a){
     var validation=a.quote_validation||'';
-    var validationLabel=({cross_source_checked:'通过',cross_source_failed:'未通过',cross_source_unavailable:'未返回',not_applicable:'不适用',range_timestamp_checked:'主源通过',degraded_cross_source:'降级核验',stale:'主源过期',invalid:'主源无效',incomplete:'主源缺失',source_error:'主源异常',missing:'缺失',local_cache:'缓存行情'})[validation]||'未核验';
+    // 词表只在 format.js 的 zhRiskText 维护一份：这里原本另有一套映射，
+    // 同一个 cross_source_checked 在两处显示成不同文案。
+    var validationLabel=validation?zhRiskText(validation):'未核验';
     var validationClass=validation==='cross_source_checked'?'ok':(['cross_source_failed','cross_source_unavailable','invalid','incomplete','source_error','missing'].includes(validation)?'bad':(validation==='not_applicable'?'info':'warn'));
     var validationText=(a.quote_validation_detail||(validation==='not_applicable'?'账户级风险状态，不涉及个股行情':'未提供独立行情源校验结果'))+(a.cross_price_gap_pct!=null?'；价格差 '+fmt(a.cross_price_gap_pct,3)+'%':'')+(a.cross_pct_gap!=null?'；涨跌幅差 '+fmt(a.cross_pct_gap,3)+'%':'');
     var linked=a.linked_signal, actionText=a.action||'—';
     if(linked) actionText+=' · '+(linked.label||'待执行委托')+' #'+riskText(linked.id)+'（'+riskText(linked.intended_date||'待定')+'）';
     var symbol=[a.name,a.code].filter(function(value){return value!==null&&value!==undefined&&value!=='';}).map(riskText).join(' ')||'—';
-    return '<tr data-account="'+riskText(a.account_id)+'" data-level="'+riskText(a.level)+'" data-date="'+riskText(String(a.time||'').slice(0,10))+'"><td>'+riskText(a.time)+'</td><td>'+riskText(a.account_name)+'</td><td>'+symbol+'</td><td><span class="risk-pill '+riskText(a.level)+'">'+riskText(riskLevelView(a.level)[1])+'</span></td><td>'+zhRiskText(a.reason)+'</td><td><span class="quote-check '+validationClass+'" title="'+riskText(validationText)+'">'+validationLabel+'</span><small class="quote-check-detail">'+riskText(validationText)+'</small></td><td>'+zhRiskText(actionText)+'</td><td>'+zhRiskText(a.execution_mode)+'</td><td>'+zhRiskText(a.rule_version)+'</td></tr>';
+    return '<tr data-account="'+riskText(a.account_id)+'" data-level="'+riskText(a.level)+'" data-date="'+riskText(String(a.time||'').slice(0,10))+'"><td>'+riskText(a.time)+'</td><td>'+riskText(a.account_name)+'</td><td>'+symbol+'</td><td><span class="risk-pill '+riskText(a.level)+'">'+riskText(riskLevelView(a.level)[1])+'</span></td><td>'+zhRiskText(a.reason)+'</td><td><span class="quote-check '+validationClass+'" title="'+zhRiskText(validationText)+'">'+validationLabel+'</span><small class="quote-check-detail">'+zhRiskText(validationText)+'</small></td><td>'+zhRiskText(actionText)+'</td><td>'+zhRiskText(a.execution_mode)+'</td><td>'+zhRiskText(a.rule_version)+'</td></tr>';
   }).join('');
   var pagination=d.pagination||{};
   var navigation='<div class="paper-filter-bar"><span id="paperRiskAuditStatus" role="status">共 '+riskText(pagination.total==null?(d.alerts||[]).length:pagination.total)+' 条 · 第 '+(page+1)+' 页</span><button id="paperRiskAuditPrev" onclick="loadPaperAudit(\'prev\')"'+(page===0?' disabled':'')+'>上一页</button><button id="paperRiskAuditNext" onclick="loadPaperAudit(\'next\')"'+(!pagination.has_next?' disabled':'')+'>下一页</button></div>';
@@ -115,7 +113,7 @@ export function renderPaperRisk(d){
   var qualityRows=(d.data_quality||[]).map(function(q){
     var verification=q.verification||{}, verify=verification.status||'not_independently_verified';
     var note=verification.note||'\u672a\u63d0\u4f9b\u72ec\u7acb\u4ea4\u53c9\u6838\u9a8c';
-    return '<tr><td><b>'+riskText(q.name)+'</b><br><small>'+zhRiskText(q.source)+'</small></td><td class="paper-risk-source '+riskText(q.status)+'">'+zhRiskText(q.status)+'</td><td>'+riskText(q.observed_at)+'</td><td>'+(q.age_seconds===null?'\u2014':fmt(q.age_seconds,0)+'\u79d2')+'</td><td>'+(q.coverage_pct===null?'\u2014':fmt(q.coverage_pct,1)+'%')+'</td><td title="'+zhRiskText(note)+'">'+zhRiskText(verify)+'</td><td>'+(d.snapshot_stale?'快照已过期，仅供参考':(q.status==='fresh'?'\u53ef\u6309\u65e2\u6709\u89c4\u5219\u4f7f\u7528':'\u4ec5\u5c55\u793a\u6216\u7981\u6b62\u589e\u52a0\u98ce\u9669'))+'</td></tr>';
+    return '<tr><td><b>'+riskText(q.name)+'</b><br><small>'+zhRiskText(q.source)+'</small></td><td class="paper-risk-source '+riskText(q.status)+'">'+zhRiskText(q.status)+'</td><td>'+riskText(q.observed_at)+'</td><td>'+(q.age_seconds===null?'\u2014':fmt(q.age_seconds,0)+'\u79d2')+'</td><td>'+fmtPct(q.coverage_pct,1)+'</td><td title="'+zhRiskText(note)+'">'+zhRiskText(verify)+'</td><td>'+(d.snapshot_stale?'快照已过期，仅供参考':(q.status==='fresh'?'\u53ef\u6309\u65e2\u6709\u89c4\u5219\u4f7f\u7528':'\u4ec5\u5c55\u793a\u6216\u7981\u6b62\u589e\u52a0\u98ce\u9669'))+'</td></tr>';
   }).join('');
   html+='<section class="panel"><h3>数据质量与降级状态</h3>'+tableScroll('<table><tr><th>数据源</th><th>新鲜度</th><th>源时间</th><th>延迟</th><th>覆盖率</th><th>真实性核验</th><th>交易影响</th></tr>'+qualityRows+'</table>',820)+'</section>';
   html+='<div class="disclaimer">'+riskText(d.disclaimer)+'</div>';

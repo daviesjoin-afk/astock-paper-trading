@@ -1,0 +1,42 @@
+{
+  "scanner_repeat": {
+    "symbols": 250,
+    "bars_per_symbol": 260,
+    "requests": 3,
+    "filters": [
+      "none",
+      "pe_max",
+      "pb_max"
+    ],
+    "csv_load_calls": 250,
+    "factor_compute_calls": 1,
+    "request_ms": [
+      2862,
+      0,
+      0
+    ],
+    "factor_rows": 250,
+    "identical_factor_frames": true,
+    "note": "Real CSV loading and factor calculation; provider mocked empty; exits at coverage gate."
+  },
+  "stale_linkage": {
+    "reading_freshness": "stale",
+    "observed_at": "2026-10-22T15:00:00+08:00",
+    "today": "2026-10-23",
+    "pairs": [
+      {
+        "a": "A",
+        "b": "B",
+        "corr": 1.0,
+        "a_pct": null,
+        "b_pct": null,
+        "a_main_yi": null,
+        "b_main_yi": null,
+        "co_move_today": null,
+        "co_fund_today": null,
+        "resonance": null
+      }
+    ],
+    "resonating_count": null
+  }
+}

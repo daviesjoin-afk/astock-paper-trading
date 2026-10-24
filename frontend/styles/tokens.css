@@ -1,5 +1,5 @@
 /* PR-55：由 frontend/app.css 拆分（纯搬运）。
-   原始行区间 1–53；设计令牌：:root 变量、暗色变量、首个媒体查询。
+   原始行区间 1–80；设计令牌：:root 变量、暗色变量、首个媒体查询。
    本文件必须保持它在 styles/index.css 中的位置：
    @import 顺序 = 原文件顺序 = 层叠顺序。 */
 
@@ -28,6 +28,29 @@
 .setting-label small,.setting-help { color:var(--text-muted); font-size:11px; line-height:1.55; }
 .setting-control { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 .setting-control input,.setting-control select { width:100%; max-width:260px; }
+/* AI 槽位表单对齐供应商配置的排法：标签独占左列、输入框统一宽度、行距更宽。
+   此前 label 与 input 挤在同一个 flex 里，输入框宽度会随标签长短参差。 */
+.ai-slot-form { padding:20px 22px; margin-top:16px; }
+.ai-slot-form h4 { margin:0 0 4px; font-size:15px; }
+.ai-slot-form .setting-row { grid-template-columns:150px minmax(0,1fr); gap:18px; padding:15px 0; align-items:center; }
+.ai-slot-form .setting-label label { cursor:pointer; }
+.ai-slot-form .setting-label b { font-size:13px; font-weight:500; }
+.ai-slot-form .setting-label small { display:block; margin-top:2px; }
+.ai-slot-form .setting-control input:not([type=checkbox]),.ai-slot-form .setting-control select,.ai-slot-form .setting-control textarea { max-width:420px; min-width:0; }
+.ai-slot-form .setting-control textarea { width:100%; box-sizing:border-box; resize:vertical; }
+.ai-provider-library .setting-control input,.ai-provider-library .setting-control textarea { padding:10px 12px; min-height:44px; border:1px solid var(--border); border-radius:9px; background:var(--surface); color:var(--text); font:inherit; font-size:14px; }
+.ai-provider-library .setting-control input:focus,.ai-provider-library .setting-control textarea:focus { outline:2px solid var(--primary); outline-offset:2px; }
+.ai-provider-library,.ai-slot-selection { margin-top:24px; }
+.ai-provider-library > h4,.ai-slot-selection > h4,.ai-review-heading { margin:24px 0 6px; font-size:15px; }
+.ai-provider-library > .ai-slot-form { padding:0; margin:0; }
+.ai-provider-library .setting-help,.ai-slot-selection .setting-help { color:var(--text-secondary); font-size:12px; }
+.ai-provider-library h4,.ai-slot-selection h4,.ai-provider-library .setting-label b,.ai-slot-selection .setting-label b { color:var(--text); }
+.ai-provider-library .setting-label small,.ai-slot-selection .setting-label small { color:var(--text-secondary); }
+.ai-provider-library button.ghost,.ai-slot-selection button.ghost { background:var(--surface); color:var(--primary); border-color:var(--border); }
+.ai-slot-form [role=status] { margin-top:10px; overflow-wrap:anywhere; }
+.ai-slot-form button:disabled { opacity:.55; cursor:not-allowed; }
+.ai-slot-form .settings-actions { margin-top:18px; display:flex; gap:10px; flex-wrap:wrap; }
+.ai-slot-form .settings-exec-toggle { display:inline-flex; align-items:center; gap:8px; }
 .setting-control input[type=checkbox] { width:18px; height:18px; accent-color:#238b68; }
 .setting-value-preview { color:var(--text-secondary); font-size:12px; }
 .settings-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
@@ -51,6 +74,7 @@
 @media (max-width:768px) {
   .settings-grid { grid-template-columns:1fr; }
   .setting-row { grid-template-columns:1fr; gap:7px; }
+  .ai-slot-form .setting-row { grid-template-columns:minmax(0,1fr); gap:7px; }
   .settings-section-tab { min-width:165px; }
   .settings-panel { padding:16px 14px; }
 }

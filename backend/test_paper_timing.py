@@ -18,6 +18,49 @@ import paper_timing as timing
 
 
 class TimingTests(unittest.TestCase):
+    def test_snapshot_diagnostic_failure_cannot_skip_the_risk_pass(self):
+        import datetime as dt
+        from contextlib import ExitStack
+        import paper_trading as paper
+        gate = {"ready": False, "covered_codes": 0, "eligible_codes": 5000,
+                "coverage_pct": 0.0, "required_codes": 4500}
+        with ExitStack() as stack:
+            for name, value in (("init_db", None), ("_cleanup_stale_data", None),
+                                ("_validated_live_universe", []), ("_live_scan_gate", gate),
+                                ("_ignition_shadow_backfill", None), ("_active_account_rows", []),
+                                ("_market_state", {}), ("_active_cycle", {"id": 1}),
+                                ("_cached_close_market", {}), ("process_pending_execution_orders", [])):
+                stack.enter_context(mock.patch.object(paper, name, return_value=value))
+            stack.enter_context(mock.patch.object(paper, "_db"))
+            stack.enter_context(mock.patch.object(paper.dfc, "check_data_source_health", return_value={}))
+            stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", return_value=[]))
+            stack.enter_context(mock.patch.object(paper.MDSvc, "read_snapshot", side_effect=ValueError))
+            stack.enter_context(mock.patch.object(paper.dfc, "full_market_snapshot_source", side_effect=ValueError))
+            risk = stack.enter_context(mock.patch.object(paper, "monitor_risk", return_value={"orders": []}))
+            result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10, 0), force=True)
+        risk.assert_called_once()
+        self.assertEqual(result["bootstrap"]["status"], "blocked")
+
+    def test_explicit_worker_binding_collects_timing_without_other_contexts(self):
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+        private = contextvars.ContextVar("private_lease", default=None)
+        token = private.set("must-stay-in-owner")
+        def worker():
+            with timing.phase("microstructure.depth"):
+                return private.get()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), timing.capture("intraday"):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(timing.bind_worker(worker)) for _ in range(40)]
+                    self.assertEqual([future.result() for future in futures], [None] * 40)
+                snap = timing.snapshot("test")
+                self.assertEqual(snap["stages"]["microstructure.depth"]["calls"], 40)
+                self.assertIn("+08:00", snap["started_at"])
+                self.assertIn("runtime_commit", snap)
+        finally:
+            private.reset(token)
+
     def test_quote_phases_keep_same_source_guard_and_failure_evidence(self):
         import datetime as dt
         import paper_trading as paper

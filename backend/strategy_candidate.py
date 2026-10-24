@@ -136,7 +136,6 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENT = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 #: 版本/契约标识允许连字符与点（``strategy-generator-contract-v1``），
 #: 但仍然是**封闭字符集**：版本字符串永远来自代码常量，不来自自由文本。
-_VERSION_IDENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _SYMBOL = re.compile(r"^[0-9]{6}$")
 
 

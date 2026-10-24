@@ -20,7 +20,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from copy import deepcopy
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -31,7 +30,7 @@ import market_data_contract as MDC
 import market_data_service as MDSvc
 import decision_engine as DE
 import factors as F
-import paper_candidate_inputs as PCI
+import paper_candidate_scan as PCScan
 import strategies as S
 import universe as U
 import risk_center as RC
@@ -146,6 +145,10 @@ try:
     import ignition_entry as IGN
 except ImportError:  # 点火通道缺失时主力候选退回常规承接，不中断交易。
     IGN = None
+try:
+    import recovery_entry_decision as RECEV
+except ImportError:  # 恢复入场证据缺失时按"不启用"处理（fail-closed）。
+    RECEV = None
 
 # 点火买入总开关（2026-08-31 复核结论）：影子对比期默认关闭——点火区间
 # 候选照常被 30 秒通道确认并记录影子对比（原规则 vs 点火规则，命中后
@@ -158,6 +161,7 @@ IGNITION_BUY_ENABLED = os.environ.get("PAPER_IGNITION_BUY", "").strip().lower() 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
 import selection_factor_store as SFS
+from paper_common import now_text as _now, as_date as _date, dump_json as _json, load_json as _loads
 DB_PATH = data_paths.data_path("paper_trading.sqlite3")
 REPORT_DIR = data_paths.report_dir()
 SELECTION_FACTORS_PATH = data_paths.data_path("selection_factors.csv")
@@ -297,6 +301,9 @@ ENTRY_SLOT_OCCUPYING_ORDER_STATUSES = (
 )
 ENTRY_AUTO_SOURCE_MAX_AGE_SECONDS = 15 * 60
 ENTRY_AUTO_FACTOR_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
+#: 限价委托的锚点冻结窗口：自首次限价延期起超过该时长仍未按冻结价成交，
+#: 说明价格已经跑开，当日不再追这一单（锚点既不抬高，也不无限期等待）。
+ENTRY_LIMIT_CHASE_WINDOW_MINUTES = 15.0
 # The trading-day stamped factor date is the primary freshness gate.  This
 # wider wall-clock allowance only covers a weekend/holiday between a valid
 # close rebuild and the next session; it must never make an old factor date
@@ -306,7 +313,6 @@ _ENTRY_FREEZE_CACHE = {"at": 0.0, "status": None}
 # A container restart kills in-memory workers but leaves SQLite job rows.  Do
 # one explicit boot recovery before the new scheduler starts; later init_db
 # calls in the same process must never steal an active scan.
-_RUNNER_BOOT_ID = f"{os.getpid()}-{time.time_ns()}"
 _RUNNER_BOOT_RECOVERED = False
 _PERFORMANCE_INDEXES_READY = False
 # A scheduled slot keeps the lease context on the worker thread.  The context
@@ -452,7 +458,7 @@ STRATEGY_RISK_BEHAVIORS = {
         "entry_style": "实时动量确认，可小仓追高",
         "downside_style": "快响应：当日弱势、相对大盘走弱或收益回吐优先保护",
         "washout_loss_override_pct": -3.0,
-        "overheat_action": "不使用板块过热硬否决，但追高必须双源/Q1/资金量能确认",
+        "overheat_action": "不使用板块过热硬否决，但追高必须有效行情/Q1/资金量能确认",
     },
     "trend_pullback": {
         "entry_style": "回踩结构确认，不追高",
@@ -836,7 +842,7 @@ def strategy_center():
     narratives = {
         "tq_breakout": {
             "candidate": "强势日内候选：昨日首板只作加分，同时筛选当日量价、资金和动量领先的股票。",
-            "entry": "优选涨幅 +0.2% 至 +3.5%；接近涨停时必须通过双源实时行情、Q1 后市评分、主力净流入≥2%及量比≥1.5确认，仅按35%仓位追买；未满足条件只观察。",
+            "entry": "优选涨幅 +0.2% 至 +3.5%；接近涨停时必须通过有效实时行情、Q1 后市评分、主力净流入≥2%及量比≥1.5确认，仅按35%仓位追买；未满足条件只观察。",
             "exit": "-5%硬止损（非崩盘形态首触先减35%，跌破确认后全清）；盈利+4%后5%移动止盈；+8%先止盈50%。",
         },
         "trend_pullback": {
@@ -851,7 +857,7 @@ def strategy_center():
         },
         NEW_STRATEGY_ID: {
             "candidate": "三日策略：三连阳/BOLL突破与已披露利润证据、主要均线、量价和超大单资金同步确认。",
-            "entry": "仅在当期财报披露证据、突破结构、实时双源行情、Q1/Q2、板块权限、T+1 与共享资金槽位全部通过时开仓；接近涨停或末端加速只观察。",
+            "entry": "仅在当期财报披露证据、突破结构、实时有效行情、Q1/Q2、板块权限、T+1 与共享资金槽位全部通过时开仓；接近涨停或末端加速只观察。",
             "exit": "-5.5%硬止损；峰值回撤6%触发独立移动风控；+8.5%、+15%分段止盈；持有超过12个交易日退出。",
         },
         MAIN_FORCE_STRATEGY_ID: {
@@ -910,19 +916,15 @@ def strategy_center():
             f"已启用策略集合（当前 {len(ACTIVE_ACCOUNT_IDS)} 套）共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
             "策略额度按风险画像分配目标和保护底线；某策略未用额度只会在其他策略底线满足后转入，不再各自重复计算总池上限。",
             f"股票持仓按策略席位计数：已启用策略集合（当前 {len(ACTIVE_ACCOUNT_IDS)} 套）共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
-            "换仓必须通过实时双源行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
+            "换仓必须通过实时有效行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
             "待成交买单会预占现金和总池额度；成交后核销，撤单、过期或风控拒绝后释放。",
-            "自动开仓须使用当日实时行情，并通过东方财富与腾讯行情交叉核验。",
+            "自动开仓须有至少一个来源提供新鲜有效的当日报价；备用源失败不单独阻断，来源冲突仍需复核。",
             "09:30/09:31/13:00 共享开盘事件引擎可识别冲高回落；各策略都能用，但各自阈值、减仓比例和回补确认线不同。",
             "开盘事件卖出只使用已结算底仓；回补必须看到卖出后的低点和反弹确认，不把快速下跌当成低吸。",
             "市场红灯暂停新开仓；黄灯按各策略对应仓位缩放执行。",
             "普通A股遵守T+1：当天买入的股份当天不可卖出。",
         ],
     }
-
-
-def _now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _market_session(now=None):
@@ -947,27 +949,6 @@ def _market_session(now=None):
     if current <= dt.time(15, 0):
         return {"code": "afternoon", "label": "交易中", "today_pnl_available": True}
     return {"code": "closed", "label": "已收盘", "today_pnl_available": True}
-
-
-def _date(value=None):
-    if value is None:
-        return dt.date.today()
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _json(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _loads(value, default=None):
-    try:
-        return json.loads(value) if value else (default if default is not None else {})
-    except (TypeError, ValueError):
-        return default if default is not None else {}
 
 
 #: Direct reference, not a wrapper: the ~860 underscore call sites across the
@@ -1464,6 +1445,17 @@ def _rebuild_realized_pnl(conn):
 
 HOT_PATH_SLOTS = PSch.HOT_PATH_SLOTS
 
+# 租约心跳上限（秒）与"丢失几次心跳即判定放弃"。见 `_lease_renew_interval`：
+# 长任务（close/risk，TTL 40 分钟）不能等 40 分钟才被认出来，否则当天最后一次
+# 兜底触发会把它当成"仍在运行"而跳过重试。
+LEASE_HEARTBEAT_MAX_SECONDS = 120.0
+LEASE_HEARTBEAT_MISSES = 3
+
+#: 各 slot 当日自动重试预算。``close`` 需要覆盖调度契约里的 5 个兜底窗口
+#: （见 ``SLOT_MAX_AUTO_RETRIES`` 的使用处与 ``paper_schedule_contract``）。
+DEFAULT_MAX_AUTO_RETRIES = 2
+SLOT_MAX_AUTO_RETRIES = {"close": 6}
+
 
 def _is_hot_path_slot(slot: str | None) -> bool:
     """判断给定 slot 是否属于对延迟和锁等待敏感的交易热路径。"""
@@ -1486,21 +1478,7 @@ def _wal_checkpoint():
     PST.wal_checkpoint(DB_PATH)
 
 
-def _execute_with_retry(conn, sql, params=(), max_retries=3, hot_path=True):
-    """执行 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries, hot_path=hot_path)
 
-
-def _executemany_with_retry(conn, sql, params_list, max_retries=3, hot_path=True):
-    """执行批量 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.executemany_with_retry(
-        conn, sql, params_list, max_retries=max_retries, hot_path=hot_path
-    )
-
-
-def _commit_with_retry(conn, max_retries=3, hot_path=True):
-    """提交事务并在数据库锁定时重试（兼容包装）。"""
-    return PST.commit_with_retry(conn, max_retries=max_retries, hot_path=hot_path)
 
 @contextmanager
 def _db_readonly():
@@ -1544,22 +1522,33 @@ def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     # callers but is intentionally ignored.
     intraday_cutoff = (dt.datetime.now() - dt.timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
     job_cutoff = (dt.datetime.now() - dt.timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:%S")
-    detail = _json({"error": "任务进程中断或超时，系统已自动回收", "recovered_at": now})
-    conn.execute(
-        """UPDATE paper_job_runs
-           SET status='failed',detail=?,finished_at=?
-           WHERE status='running'
-             AND ((expires_at IS NOT NULL AND expires_at<?)
-                  OR (expires_at IS NULL AND started_at<?))""",
-        (detail, now, now, intraday_cutoff),
+    # 回收必须**合并**而不是覆盖 detail：旧实现写成 ``{error, recovered_at}``，
+    # 把 retry_count / history_refresh / factor_refresh / timing 一并抹掉，
+    # 于是"进程超时"这一类失败事后无法和"日线覆盖不足"区分。``elapsed_seconds``
+    # 同时给出这次运行到被回收为止的时长（超时类的唯一可观测口径）。
+    recovered_detail = (
+        "json_patch(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END,"
+        " json_object('error','任务进程中断或超时，系统已自动回收',"
+        " 'recovered_at',?,"
+        " 'recovered_from_running',1,"
+        " 'failure_kind','interrupted',"
+        " 'elapsed_seconds',CAST(ROUND((julianday(?) - julianday(started_at)) * 86400) AS INTEGER)))"
     )
     conn.execute(
-        """UPDATE paper_jobs
-           SET status='failed',detail=?,finished_at=?
+        f"""UPDATE paper_job_runs
+           SET status='failed',detail={recovered_detail},finished_at=?
            WHERE status='running'
              AND ((expires_at IS NOT NULL AND expires_at<?)
                   OR (expires_at IS NULL AND started_at<?))""",
-        (detail, now, now, job_cutoff),
+        (now, now, now, now, intraday_cutoff),
+    )
+    conn.execute(
+        f"""UPDATE paper_jobs
+           SET status='failed',detail={recovered_detail},finished_at=?
+           WHERE status='running'
+             AND ((expires_at IS NOT NULL AND expires_at<?)
+                  OR (expires_at IS NULL AND started_at<?))""",
+        (now, now, now, now, job_cutoff),
     )
     # Never delete a live lease merely because a new process started.
     conn.execute("DELETE FROM paper_runtime_locks WHERE expires_at<?", (now,))
@@ -1925,6 +1914,8 @@ def init_db():
                 # v36 migration 只是升级路径，正常 bootstrap 若缺少它，第一次 selection
                 # 写入会直接 `no such table`。
                 PSM.ensure_candidate_selection(conn)
+                PSM.ensure_paper_metrics_indexes(conn)
+                PSM.ensure_portfolio_order_read_index(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2254,6 +2245,8 @@ def init_db():
         # R36-C v36：selection report 追加表。与上面同样必须在这里幂等建表，否则正常
         # bootstrap 出来的库缺少 selection 表，第一次写入即 `no such table`。
         PSM.ensure_candidate_selection(conn)
+        PSM.ensure_paper_metrics_indexes(conn)
+        PSM.ensure_portfolio_order_read_index(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
@@ -3077,6 +3070,37 @@ def _recovery_policy(account_id):
     return SPOL.recovery_policy(account_id)
 
 
+def _recovery_entry_assessment(account_id, code, quote, market, news, asof_day):
+    """跌后恢复入场的证据判定；不启用或没有上午证据时返回 ``None``。
+
+    与 ``_recovery_observation``（保护性卖出后的回补观察）是两条不同的路径：
+    那一条管已卖出的仓位怎么回来，这一条管"上午有依据、却没买成"的候选怎么在
+    午后重新获得资格。返回 ``None`` 表示这次决策与恢复路径无关，调用方的原有
+    行为完全不变。
+    """
+    if ET is None or RECEV is None:
+        return None
+    policy = SPOL.recovery_entry_policy(account_id)
+    if not policy:
+        return None
+    morning = ET.recovery_watch_evidence(account_id, code)
+    if not morning:
+        return None
+    try:
+        assessment = RECEV.assess(
+            morning=morning, quote=quote, market=market,
+            negative_news=bool(_negative_hits(news, code)), policy=policy,
+        )
+    except Exception as exc:  # 判定异常既不能冻结交易，也绝不能放行
+        return {
+            "allowed": False, "classification": "assessment_error",
+            "reason": f"恢复入场判定异常：{type(exc).__name__}: {exc}",
+        }
+    assessment["asof_day"] = _date(asof_day).isoformat()
+    assessment["policy"] = policy
+    return assessment
+
+
 def _recovery_watches(conn, account_id, day):
     """Latest protective watches, bounded to avoid stale audit rows."""
     cutoff = (_date(day) - dt.timedelta(days=5)).isoformat()
@@ -3348,8 +3372,6 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
 # 全市场快照缓存（盘中每 3 分钟由 intraday 扫描刷新）打的标签，quote_at
 # 与 live 同源同鲜度；只排除 local_cache（universe.json 陈旧价）。
 # 此前硬编码 == "live" 导致仪表盘路径今日盈亏永远显示"交易中"占位。
-_TODAY_PNL_QUOTE_SOURCES = PPerf.TODAY_PNL_QUOTE_SOURCES
-
 
 def _today_quote_is_usable(quote, asof_day):
     """Require a same-day, bounded-age mark before publishing daily P&L."""
@@ -3555,9 +3577,59 @@ def _execution_quote_status(quote, asof_date, purpose="entry", *, reference_at=N
     )
 
 
+_INDEX_REFERENCE_UNSET = object()
+
+
+def _index_session_day(value):
+    """把指数时间戳（``20261023151100`` / ISO）归一成 ``YYYYMMDD``。"""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[:8] or None
+
+
+def _same_session_index(asof_date, *, allow_network):
+    """沪深300 当日实时报价；只有时间戳属于 ``asof_date`` 才算当日参照。
+
+    返回 ``(row, reference)``。``row is None`` 时 ``reference['status']`` 说明
+    是抓不到（unavailable）还是抓到别的交易日（stale）——两种情况都必须让
+    相对强弱回到未知，不能拿别的交易日的涨跌幅去减今天的个股跌幅。
+    """
+    day = _date(asof_date)
+    wanted = day.strftime("%Y%m%d")
+    rows = []
+    if allow_network:
+        try:
+            rows = dfc.fetch_indices() or []
+        except Exception:
+            rows = []
+    row = next((item for item in rows if str(item.get("code")) == "sh000300"), None)
+    observed = str((row or {}).get("time") or "") or None
+    reference = {"asof_day": day.isoformat(), "observed_at": observed}
+    if row is None:
+        reference.update({
+            "status": "unavailable",
+            "reason": "未取得沪深300实时报价，相对强弱按未知处理",
+        })
+        return None, reference
+    if _index_session_day(observed) != wanted:
+        reference.update({
+            "status": "stale",
+            "reason": (f"最近一次沪深300报价时间 {observed or '未知'} 不属于 "
+                       f"{day.isoformat()}，不作为当日相对强弱参照"),
+        })
+        return None, reference
+    reference.update({"status": "same_session", "reason": "沪深300实时报价属于当日"})
+    return row, reference
+
+
 @PTM.timed("market_context")
-def _market_state(asof_date, live_universe=None, *, allow_network=True):
-    """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。"""
+def _market_state(asof_date, live_universe=None, *, allow_network=True,
+                  live_index=_INDEX_REFERENCE_UNSET):
+    """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。
+
+    ``live_index`` 允许调用方传入**已经取到并校验过**的当日指数（风控扫描
+    用它避免整轮全市场快照刷新）；默认 ``_INDEX_REFERENCE_UNSET`` 表示自行
+    按 ``allow_network`` 决定是否抓取。
+    """
     # 盘中市场宽度必须使用同一轮全市场实时快照，不能读取可能滞后数日的
     # universe.json。外部源暂时不可用时保守地返回未知，而不伪装成实时数据。
     if live_universe is None and allow_network:
@@ -3588,25 +3660,29 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
         close = _num(bench["close"].iloc[-1], 0)
         above_ma20 = close > _num(bench["close"].tail(20).mean(), close)
         bench_5d = (close / _num(bench["close"].iloc[-6], close) - 1) * 100 if len(bench) >= 6 else None
-    live_index = None
+    if live_index is _INDEX_REFERENCE_UNSET:
+        resolved_index = None
+        if allow_network:
+            try:
+                resolved_index = next(
+                    (
+                        row for row in dfc.fetch_indices()
+                        if row.get("code") == "sh000300"
+                        and str(row.get("time") or "")[:8] == _date(asof_date).strftime("%Y%m%d")
+                    ),
+                    None,
+                )
+            except Exception:
+                resolved_index = None
+    else:
+        resolved_index = live_index
+    live_index = resolved_index
     if allow_network:
-        try:
-            live_index = next(
-                (
-                    row for row in dfc.fetch_indices()
-                    if row.get("code") == "sh000300"
-                    and str(row.get("time") or "")[:8] == _date(asof_date).strftime("%Y%m%d")
-                ),
-                None,
-            )
-        except Exception:
-            live_index = None
         try:
             overseas = F.overseas_risk_gate()
         except Exception:
             overseas = {"light": "unknown", "advice": "海外数据不可用"}
     else:
-        live_index = None
         overseas = {"light": "unknown", "advice": "外部数据在账本事务中不可用"}
     live_pct = _num((live_index or {}).get("pct"), None)
     if stale and not benchmark_history_ready and live_pct is not None:
@@ -3657,6 +3733,16 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
         "live_index_pct": round(live_pct, 2) if live_pct is not None else None,
         "live_index_price": _num((live_index or {}).get("price"), None),
         "live_index_time": (live_index or {}).get("time"),
+        "index_reference": {
+            "asof_day": _date(asof_date).isoformat(),
+            "observed_at": (live_index or {}).get("time"),
+            "status": (
+                "same_session"
+                if _index_session_day((live_index or {}).get("time"))
+                == _date(asof_date).strftime("%Y%m%d")
+                else "unavailable"
+            ),
+        },
         "market_data_source": "腾讯实时指数+本地前复权趋势",
         "breadth_source": f"全市场实时快照 {breadth_snapshot_at or '未知'}（有效样本 {len(priced)}）",
         "market_snapshot_count": len(latest),
@@ -5530,7 +5616,9 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     account_id = account["id"] if isinstance(account, dict) else str(account)
     spec = _spec_for(account_id)
     with PTM.phase("candidate.universe_read"):
-        base_universe = {str(row.get("code")): row for row in (U.load_universe() or [])}
+        source_universe = (U.load_universe() if shared_inputs is None
+                           else shared_inputs.universe(U.load_universe))
+        base_universe = {str(row.get("code")): row for row in (source_universe or [])}
     with PTM.phase("candidate.factor_gate"):
         factor_freshness = _selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
     if not factor_freshness.get("passed"):
@@ -5662,7 +5750,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # pretending a report period is a disclosure timestamp.
     try:
         with PTM.phase("candidate.finance_source"):
-            finance = dfc.fetch_finance_latest()
+            finance = (dfc.fetch_finance_latest() if shared_inputs is None
+                       else shared_inputs.finance(dfc.fetch_finance_latest))
     except Exception:
         finance = {"data": {}}
     # Keep the paper selector point-in-time consistent with the public
@@ -5727,12 +5816,35 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                     live_flow[_code] = _detail["main_pct"]
         except Exception:
             pass
+    with PTM.phase("candidate.evolution_read"):
+        selection_overlay = _adaptive_selection(account)
+    selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
+    scoring_factors = (None if spec.get("selection_mode") == "dsl"
+                       else S.scoring_factor_inputs(selection_model))
+    sentiment = None
+    sentiment_input_enabled = (account_id == "tq_breakout" and style != "sector"
+                               and scoring_factors is not None and "sentiment" in scoring_factors)
+    # The daily factor cutoff may be yesterday during a live scan. Popularity
+    # belongs to today's decision snapshot, never to a historical replay.
+    if (sentiment_input_enabled and live_universe is not None
+            and expected_live_day == _date(F.live_snapshot_asof()).isoformat()):
+        try:
+            with PTM.phase("candidate.sentiment_source"):
+                sentiment = F.compute_sentiment_factors(set(price_f.index.astype(str)))
+        except Exception:
+            # A failed source is unknown evidence, not a neutral numeric score.
+            sentiment = None
     with PTM.phase("candidate.factor_table"):
         table = S.build_factor_table(
-            price_f, fund, sentiment=None,
+            price_f, fund, sentiment=sentiment,
             realtime_flow=live_flow,
             realtime_super_flow=live_super_flow,
+            scoring_factors=scoring_factors,
         )
+    if sentiment_input_enabled:
+        # Cycles pin immutable strategy definitions. Version the changed input
+        # policy separately so attribution never pools it with older snapshots.
+        table.attrs["factor_input_version"] = "paper-tq-sentiment-v1"
     if live_universe is not None:
         # 日线技术指标/财务仍来自已下载的完整历史；当天可变字段必须由
         # 同一轮实时快照覆盖，不能继续沿用上一交易日的收盘价或涨跌幅。
@@ -5819,9 +5931,6 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             }
         )
         table["sentiment"] = F.zscore(heat_values).reindex(table.index).fillna(-1.5)
-    with PTM.phase("candidate.evolution_read"):
-        selection_overlay = _adaptive_selection(account)
-    selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
     if spec.get("selection_mode") == "dsl":
         # PR-35：声明式策略通道——同一份共享因子表，选股由编译后的 DSL
         # 完成（纯离线求值器），不再要求模型在 strategies.STRATEGIES 注册。
@@ -6109,7 +6218,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         # 只负责发现，不能替代全市场实时价格与资金门禁。
         try:
             with PTM.phase("candidate.concept_source"):
-                concepts = dfc.fetch_hot_concept_snapshot(topn=6)
+                concepts = dfc.fetch_hot_concept_snapshot(topn=6, quotes=live_map)
         except Exception as exc:
             concepts = []
             concept_meta = {"version": CONCEPT_EXPANSION_LANE_VERSION,
@@ -6123,7 +6232,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         if reverse_leaders:
             try:
                 with PTM.phase("candidate.reverse_concept_source"):
-                    reverse_concepts = dfc.fetch_leader_concept_snapshot(reverse_leaders)
+                    reverse_concepts = dfc.fetch_leader_concept_snapshot(reverse_leaders, quotes=live_map)
             except Exception as exc:
                 reverse_error = f"{type(exc).__name__}: {exc}"
         # Preserve reverse-discovery evidence even when the board is already
@@ -6233,6 +6342,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         "star_sector_impulse": list(star_sector_impulse.values())[:12],
         "security_scope": "仅沪深主板和创业板；科创板仅作同业映射信号",
         "selection_evolution": selection_overlay,
+        "scoring_factor_inputs": sorted(scoring_factors) if scoring_factors is not None else None,
         "raw_candidate_count": raw_candidate_count,
         "watch_pool": watch_pool_meta,
         "ignition_shadow_recorded": sum(
@@ -6292,6 +6402,11 @@ def _quotes(codes, asof_date=None):
     if not codes:
         return {}
     expected_day = _date(asof_date or dt.date.today())
+    def usable(row):
+        return (_num(row.get("price"), 0) > 0
+                and _num(row.get("pct"), None) is not None
+                and abs(_num(row.get("pct"), 999)) <= 30
+                and _quote_is_fresh({**row, "quote_source": "live"}, expected_day))
     source_errors = {}
     try:
         with PTM.phase("quote.primary"):
@@ -6302,7 +6417,8 @@ def _quotes(codes, asof_date=None):
         # exits can surface a structured degraded/unavailable reason.
         live_rows = []
         source_errors["live"] = f"{type(exc).__name__}: {exc}"
-    live = {str(r.get("code")): r for r in live_rows if r.get("code")}
+    live = {str(r.get("code")): {**r, "source": r.get("source") or "eastmoney_ulist"}
+            for r in live_rows if r.get("code")}
     fallback_identity = None
     fallback_origin = "verified_full_market_snapshot"
     fallback_codes = set()
@@ -6340,6 +6456,30 @@ def _quotes(codes, asof_date=None):
                         fallback_origin = "price_only_full_market_snapshot"
         except Exception as exc:
             source_errors["snapshot"] = f"{type(exc).__name__}: {exc}"
+    # A failed primary must not hide a usable provider from the fallback chain.
+    try:
+        with PTM.phase("quote.independent"):
+            cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
+    except Exception as exc:
+        cross_rows = []
+        source_errors["cross"] = f"{type(exc).__name__}: {exc}"
+    cross = {str(r.get("code")): r for r in cross_rows if r.get("code")}
+    for code in codes:
+        primary = live.get(code) or {}
+        alternate = cross.get(code) or {}
+        if not usable(primary) and usable(alternate):
+            promoted = dict(alternate)
+            live[code] = promoted
+            fallback_codes.discard(code)
+    for row in live.values():
+        text = str(row.get("quote_at") or "")
+        if text.isdigit() and len(text) == 14:
+            stamp = _parse_quote_timestamp(text)
+            if stamp is None:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+            row["quote_at"] = stamp.isoformat()
     live_rows = list(live.values())
     # 单票行情核验以价格为核心，但东财 ulist 偶尔返回价格而遗漏资金字段。
     # 补齐动作独立于双源价格校验：资金流失败不能把可执行的风险卖出误写成
@@ -6360,13 +6500,6 @@ def _quotes(codes, asof_date=None):
     # 把整轮策略都误判成“独立行情源未返回”。来源仍写入审计 payload，便于追溯。
     # 主报价若来自腾讯（价格-only 快照回退），必须改用新浪核验：同一来源
     # 与自己比较不构成双源证据，只会把"自己核验自己"写成 cross_source_checked。
-    try:
-        with PTM.phase("quote.independent"):
-            cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
-    except Exception as exc:
-        cross_rows = []
-        source_errors["cross"] = f"{type(exc).__name__}: {exc}"
-    cross = {str(r.get("code")): r for r in cross_rows if r.get("code")}
     same_source_codes = [
         code for code, row in live.items()
         if str(row.get("source") or "") == "tencent_public_quote"
@@ -6385,6 +6518,10 @@ def _quotes(codes, asof_date=None):
             code = str(row.get("code") or "")
             if code in same_source_codes and row.get("source") == "sina_public_quote":
                 cross[code] = row
+    for code, row in live.items():
+        source = str(row.get("source") or "")
+        if source and source == str(cross.get(code, {}).get("source") or ""):
+            cross.pop(code, None)
     with PTM.phase("quote.local_metadata"):
         local = _latest_price_map(codes)
         local_snapshot_at = _universe_snapshot_time()
@@ -6469,7 +6606,7 @@ def _quotes(codes, asof_date=None):
                 else:
                     now = dt.datetime.now(cross_time.tzinfo) if cross_time.tzinfo else dt.datetime.now()
                     cross_time_ok = -120 <= (now - cross_time).total_seconds() <= 20 * 60
-        cross_available = cross_price > 0 and bool(cross_at)
+        cross_available = cross_price > 0 and abs(cross_pct) <= 30 and bool(cross_at)
         # 2026-08-28：急涨急跌时两个行情源的固有滞后差会被放大，|pct|>=3%
         # 时容差放宽一倍，避免 V 型反转时刻系统性拒绝回补/开仓
         # （601212 回补因 0.27pp 被拒）。
@@ -6482,16 +6619,16 @@ def _quotes(codes, asof_date=None):
             validation = "incomplete"
             failure_reason = "主行情价格或涨跌幅无效"
         elif source_errors.get("cross"):
-            validation = "cross_source_unavailable"
+            validation = "range_timestamp_checked"
             failure_reason = f"独立行情源异常：{source_errors['cross']}"
         elif not cross_available:
-            validation = "cross_source_unavailable"
+            validation = "range_timestamp_checked"
             failure_reason = "独立行情源未返回有效价格或时间"
         elif not cross_day_ok:
-            validation = "cross_source_failed"
+            validation = "range_timestamp_checked"
             failure_reason = f"独立行情源时间不是交易日（{cross_at or '未知'}）"
         elif not cross_time_ok:
-            validation = "cross_source_unavailable"
+            validation = "range_timestamp_checked"
             failure_reason = "独立行情源更新时间过期，已等待其重连/切换"
         elif price_gap > 0.005 * gap_tolerance_scale or pct_gap > 0.20 * gap_tolerance_scale:
             validation = "cross_source_failed"
@@ -7267,8 +7404,8 @@ def _signal_approval(
         flags.append("缺少有效报价")
     if not _quote_is_fresh(quote, asof_date or dt.date.today()):
         flags.append("未取得带当日源时间戳的实时行情")
-    elif not evidence.cross_source_verified:
-        flags.append("\u5b9e\u65f6\u884c\u60c5\u672a\u901a\u8fc7\u72ec\u7acb\u4ea4\u53c9\u6838\u9a8c")
+    elif not _execution_quote_status(quote, asof_date or dt.date.today()).get("fresh"):
+        flags.append("实时行情无有效来源或存在价格冲突")
     listing = _new_listing_profile(account["id"], code, kline, history_meta, asof_date or dt.date.today())
     is_new_listing = bool(listing.get("eligible"))
     if kline is None or len(kline) < 120:
@@ -7716,19 +7853,6 @@ def manual_research_backfill():
     return result
 
 
-def _account_exposure(conn, account_id, quotes):
-    positions = _position_rows(conn, account_id)
-    value = 0.0
-    industries = {}
-    for pos in positions:
-        price = _num((quotes.get(pos["code"]) or {}).get("price"), _num(pos["cost"]))
-        item_value = _num(pos["qty"]) * price
-        value += item_value
-        industries[pos.get("industry") or "未知"] = industries.get(pos.get("industry") or "未知", 0.0) + item_value
-    account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-    nav = _num(account["cash"]) + value
-    return positions, value, nav, industries
-
 
 def _runtime_parameter_active(effective_date=None, asof_day=None, status=None):
     """Whether a live parameter may affect a decision made now.
@@ -7822,6 +7946,7 @@ def _portfolio_allocation_service_config(conn=None):
     )
 
 
+@PTM.timed("execution.plan_build")
 def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
                                 account_id, symbol, intent_kind):
     """Capture exact facts and one explicit candidate plan on the caller transaction."""
@@ -7841,8 +7966,6 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
     snapshot = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=cycle_id, asof_day=asof_day,
         decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,
-        market_evidence_identity=MDC.snapshot_fingerprint(reading.snapshot)
-        if reading.snapshot is not None else None,
         market_reading=reading)
     eligible_ids = {str(value) for value in snapshot["execution_participant_ids"]}
     history_rows = PAW.read_canonical_allocation_weight_owner_rows(
@@ -7902,6 +8025,7 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
             "candidate_denied": bool(candidate_row.get("denial_reason"))}
 
 
+@PTM.timed("execution.plan_revalidate")
 def _revalidate_portfolio_entry_plan(conn, entry):
     """Revalidate the exact decision snapshot; never substitute a newer plan."""
     plan = entry["plan"]
@@ -7911,8 +8035,6 @@ def _revalidate_portfolio_entry_plan(conn, entry):
     current = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=plan["cycle_id"], asof_day=plan["asof_day"],
         decision_at=plan["decision_at"], builtin_scope=ACTIVE_ACCOUNT_IDS,
-        market_evidence_identity=(MDC.snapshot_fingerprint(reading.snapshot)
-                                  if reading.snapshot is not None else None),
         market_reading=reading)
     return (current["snapshot_id"] == plan["portfolio_snapshot_id"]
             and current["snapshot_fingerprint"]
@@ -8499,20 +8621,9 @@ def _adaptive_selection(account, asof_day=None):
         meta.get("effective_date"), asof_day=asof_day, status=meta.get("status")
     ):
         return {}
-    weights = overlay.get("weights") or {}
     source = ACCOUNT_SPECS.get(account.get("id"), {}).get("source_strategy")
-    model_family = str(overlay.get("model_family") or source)
-    allowed = {
-        "tq_breakout": {"one_to_two"},
-        "trend_pullback": {"bottom_reversal", "trend_continuation"},
-        "sector_rotation": {"sentiment_pioneer"},
-        NEW_STRATEGY_ID: {NEW_STRATEGY_ID},
-    }.get(account.get("id"), {source})
-    if model_family not in allowed:
-        model_family = source
-    expected = set(S.PAPER_WEIGHTS.get(model_family, {}))
-    if set(weights) != expected:
-        weights = {}
+    model_family = S.selection_model_family(account.get("id"), overlay, source)
+    weights = S.selection_overlay_weights(account.get("id"), overlay, source)
     # Layer C：读路径内存级归一化（不写库），确保 stale overlay 不会继续生效。
     conditions = _normalize_selection_conditions(
         overlay.get("conditions") or {}, model_family, account.get("id"),
@@ -8539,32 +8650,6 @@ def _entry_score_delta(account, asof_day=None):
         return 0.0
     return _num(params.get("entry_score_delta"), _num(params.get("min_t_score_delta")))
 
-
-def _account_risk_state(conn, account, nav, asof_day):
-    """账户级熔断：达到阈值只禁止新开仓，卖出风控仍会继续。"""
-    profile = _risk_profile(account, conn=conn)
-    day = _date(asof_day).isoformat()
-    start_nav = _num(account.get("daily_start_nav"), 0)
-    if account.get("daily_nav_date") != day or start_nav <= 0:
-        start_nav = nav
-        conn.execute("UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?", (nav, day, account["id"]))
-        account["daily_start_nav"], account["daily_nav_date"] = nav, day
-    navs = [r[0] for r in conn.execute("SELECT nav FROM paper_nav WHERE account_id=? ORDER BY nav_date", (account["id"],)).fetchall()]
-    peak = max(navs + [nav, _account_reference_capital(account) or nav])
-    drawdown = 1 - nav / peak if peak else 0.0
-    daily_loss = 1 - nav / start_nav if start_nav else 0.0
-    reasons = []
-    cooldown = account.get("cooldown_until")
-    if cooldown and str(cooldown) >= day:
-        reasons.append(f"冷静期至 {cooldown}")
-    if daily_loss >= profile["daily_loss"]:
-        reasons.append(f"单日亏损 {daily_loss*100:.2f}% 触发熔断")
-    if drawdown >= profile["drawdown"]:
-        until = _next_weekday(_date(asof_day) + dt.timedelta(days=profile["cooldown_days"] - 1)).isoformat()
-        conn.execute("UPDATE paper_accounts SET cooldown_until=? WHERE id=?", (until, account["id"]))
-        account["cooldown_until"] = until
-        reasons.append(f"滚动回撤 {drawdown*100:.2f}% 触发冷静期")
-    return {"blocked": bool(reasons), "reasons": reasons, "daily_loss_pct": round(daily_loss * 100, 2), "drawdown_pct": round(drawdown * 100, 2)}
 
 
 def _price_aware_qty(
@@ -8853,6 +8938,138 @@ def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_
     只能通过卖出低质量持仓释放额度，不能把总池上限从82%抬高。
     """
     return False, "总资金池82%硬上限不可突破；需先卖出低质量持仓释放额度"
+
+def _entry_opportunity(signal_id, timing_info):
+    """一次入场机会的稳定标识：信号 × 入场状态机的重触发序号。
+
+    ``retrigger_seq`` 由状态机在失效回踩/超时重触发时递增，所以"同一信号
+    重新开始确认"会拿到新编号；没有状态机记录时退化为信号本身（seq=0）。
+    价格等待与冻结限价都挂在这个编号上，两个模块不再各自理解"这次机会
+    是否已经重新开始"。
+    """
+    record = (timing_info or {}).get("record") or {}
+    seq = int(_num(record.get("retrigger_seq"), 0))
+    return {
+        "id": None if signal_id is None else f"{signal_id}#{seq}",
+        "signal_id": None if signal_id is None else int(signal_id),
+        "retrigger_seq": seq,
+        "started_at": str(record.get("first_trigger_at") or "")[:19] or None,
+    }
+
+
+def _price_wait_outcome(price_wait, fill_price, *, window_minutes=None):
+    """价格等待的三种结局：``none``/``waiting``/``price_returned``/``failed``。
+
+    ``price_returned`` 只在**现价已回到（或低于）冻结限价**时成立——等待
+    窗口约束的是"仍在等价格"，不能因为等得久就把一个已经可以成交的价格
+    判成"未回到限价"（航天信息 7.6677 低于冻结限价 7.71 仍被报"未回到"）。
+    """
+    window = (ENTRY_LIMIT_CHASE_WINDOW_MINUTES if window_minutes is None
+              else float(window_minutes))
+    if not price_wait:
+        return {"status": "none", "anchor_price": None, "waited_minutes": None,
+                "price": _num(fill_price, 0.0) or 0.0, "window_minutes": window}
+    anchor = _num(price_wait.get("anchor_price"), 0.0) or None
+    price = _num(fill_price, 0.0) or 0.0
+    waited = price_wait.get("waited_minutes")
+    at_or_below = bool(anchor is not None and price > 0 and price <= anchor + 1e-9)
+    if at_or_below:
+        status = "price_returned"
+    elif price_wait.get("expired") or (waited is not None and waited > window):
+        status = "failed"
+    else:
+        status = "waiting"
+    return {"status": status, "anchor_price": anchor, "waited_minutes": waited,
+            "price": price, "window_minutes": window}
+
+
+def _next_price_wait_marker(*, opportunity, outcome, limit_price, deferred, now):
+    """本次尝试要落的价格等待标记；``None`` 表示不建立/不改写锚点。
+
+    只有两种尝试落锚点：**仅价格未到**（起锚或续锚，``deferred``）和
+    **价格等待已失效**（终态标记）。入场确认中、容量不足、时机未到等非
+    价格拒绝既不能起锚，也不能让别人的价格等待继续计时。
+    """
+    if limit_price is None:
+        return None
+    anchor = outcome.get("anchor_price") or _num(limit_price, 0.0)
+    if not anchor:
+        return None
+    base = {
+        "opportunity_id": opportunity["id"],
+        "signal_id": opportunity["signal_id"],
+        "retrigger_seq": opportunity["retrigger_seq"],
+        "opportunity_started_at": opportunity["started_at"],
+        "anchor_price": float(anchor),
+        "window_minutes": ENTRY_LIMIT_CHASE_WINDOW_MINUTES,
+    }
+    if outcome.get("status") == "failed":
+        return {
+            **base,
+            "status": "expired",
+            "started_at": (outcome.get("started_at") or now),
+            "expired_at": now,
+            "waited_minutes": outcome.get("waited_minutes"),
+        }
+    if not deferred:
+        return None
+    return {
+        **base,
+        "status": "waiting",
+        "started_at": (outcome.get("started_at") or now),
+    }
+
+
+def _entry_price_wait(conn, account_id, code, signal_id, asof_day, opportunity_id):
+    """该入场机会的**价格等待**锚点；``None`` 表示当前没有生效的价格等待。
+
+    锚点、等待时长和失效状态只来自真正"其他条件均已满足、仅因价格未到"
+    的尝试（下单时写入 ``risk_payload.entry_price_wait``）。旧实现按
+    「同策略 + 代码 + 信号 + 交易日的第一张限价单」取锚，把入场确认中、
+    容量不足等非价格拒绝也当成价格等待：五粮液 10:32 因为"连续确认中 1/2"
+    建的限价单，被 14:40 的模型通过轮次当成"等待 248 分钟仍未回到限价"。
+
+    返回字段：
+        ``anchor_price`` 冻结限价（只降不升）、``waited_minutes`` 从该机会
+        第一次价格等待起算的等待时长、``expired`` 该机会是否已经到期失效、
+        ``started_at``/``expired_at`` 供审计回溯。
+    """
+    if signal_id is None or opportunity_id is None:
+        return None
+    day = _date(asof_day).isoformat()
+    rows = conn.execute(
+        """SELECT id, created_at,
+                  json_extract(risk_payload,'$.entry_price_wait.anchor_price') AS anchor_price,
+                  json_extract(risk_payload,'$.entry_price_wait.status') AS wait_status
+             FROM paper_orders
+            WHERE account_id=? AND code=? AND side='buy' AND signal_id=?
+              AND order_type='limit'
+              AND substr(created_at,1,10)=?
+              AND json_valid(risk_payload)
+              AND json_extract(risk_payload,'$.entry_price_wait.opportunity_id')=?
+            ORDER BY id ASC""",
+        (account_id, code, signal_id, day, str(opportunity_id)),
+    ).fetchall()
+    anchor = next((_num(row["anchor_price"], 0.0) for row in rows
+                   if _num(row["anchor_price"], 0.0) > 0), 0.0)
+    if anchor <= 0:
+        return None
+    first = rows[0]
+    try:
+        waited = (dt.datetime.now() - dt.datetime.fromisoformat(
+            str(first["created_at"]))).total_seconds() / 60
+    except (TypeError, ValueError):
+        waited = None
+    expired = next((row for row in rows if str(row["wait_status"]) == "expired"), None)
+    return {
+        "anchor_price": anchor,
+        "waited_minutes": waited,
+        "started_at": str(first["created_at"]),
+        "order_id": int(first["id"]),
+        "expired": expired is not None,
+        "expired_at": str(expired["created_at"]) if expired is not None else None,
+    }
+
 
 @PTM.timed("execution.buy_approval")
 def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quotes=None):
@@ -9168,14 +9385,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             and _num(quote.get("pct"), -999.0) >= _exec_policy.acceleration_pct:
         timing_gate = {"allowed": False, "mode": "突破加速确认", "reason": None}
         _label = _exec_policy.entry_label or "策略"
-        if execution_quote.get("status") != "cross_source_checked":
-            timing_gate["reason"] = f"{_label}加速段必须通过双源实时行情核验"
+        if not execution_quote.get("fresh"):
+            timing_gate["reason"] = f"{_label}加速段需要有效实时行情"
         elif q.get("tier") != "Q1":
             timing_gate["reason"] = f"{_label}加速段仅允许 Q1，当前为 {q.get('tier')}"
         elif _num(quote.get("main_pct"), -999.0) < 1.0 or _num(quote.get("vol_ratio"), 0.0) < 1.2:
             timing_gate["reason"] = f"{_label}加速段需主力净流入≥1%且量比≥1.2"
         else:
-            timing_gate.update({"allowed": True, "reason": "财报突破在加速段获得双源、Q1、资金与量能确认"})
+            timing_gate.update({"allowed": True, "reason": "财报突破在加速段获得有效行情、Q1、资金与量能确认"})
     risk["three_day_timing_gate"] = timing_gate
     if not timing_gate["allowed"]:
         reasons.append(f"{timing_gate['mode']}未通过：{timing_gate['reason']}")
@@ -9222,15 +9439,27 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 复试。硬拒绝会让轮换回补（卖了买不回）和确认期候选被永久
         # 终结——2026-08 审计确认的 P1 缺陷。
         micro = entry_model.get("microstructure") or {}
+        # 跌后恢复入场：只对"上午有依据、随后被跌破"的候选，按当日可证明的
+        # 证据重新给出入场资格。证据不成立时原样传 False——状态机不会因为
+        # 调用了这个模块就放行；Q级、追高上限、席位、资金、14:30 释位窗口与
+        # 硬止损仍在这一层之外独立生效。
+        recovery = _recovery_entry_assessment(
+            account["id"], code, quote, market, news, asof_day,
+        )
+        if recovery is not None:
+            risk["recovery_entry"] = recovery
         timing_allowed, timing_info = ET.evaluate(
             account["id"], code, price, _num(quote.get("pct")),
             fast=bool(quote.get("_fast_entry_monitor")),
             evidence={
                 "cross_source_checked": execution_quote.get("status") == "cross_source_checked",
+                "quote_usable": bool(execution_quote.get("fresh")),
                 "main_pct": _num(quote.get("main_pct"), _num(quote.get("main_net_pct"))),
                 "vol_ratio": _num(quote.get("vol_ratio")),
                 "active_buy_sell_imbalance": micro.get("active_buy_sell_imbalance"),
                 "depth_imbalance": micro.get("depth_imbalance"),
+                "recovery_ok": bool((recovery or {}).get("allowed")),
+                "recovery_reason": (recovery or {}).get("reason"),
             },
         )
         risk["entry_timing"] = timing_info
@@ -9494,12 +9723,50 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # PR-10 执行画像：按账户 risk_profile 自动选择 market/limit 与让价。
     # 限价画像要求现价不高于让价上限，未到价则延期（execution_retry）。
     exec_profile = _execution_profile_for_account(account["id"], conn=conn)
+    # 限价锚点冻结：沿用**同一入场机会**里第一次因价格挂起的限价，价格反弹
+    # 不再抬价追高。锚点只由"其他条件都已满足、仅价格未到"的尝试建立——
+    # 入场确认中、容量不足等非价格原因不能启动价格等待计时。
+    entry_opportunity = _entry_opportunity(signal.get("id"), risk.get("entry_timing"))
+    price_wait = _entry_price_wait(
+        conn, account["id"], code, signal.get("id"), asof_day,
+        entry_opportunity["id"],
+    )
+    frozen_limit = price_wait["anchor_price"] if price_wait else None
+    wait = _price_wait_outcome(price_wait, fill_price)
+    price_wait_failed = wait["status"] == "failed"
+    if price_wait_failed:
+        # 窗口过期不是风控否决：这个标的没有变坏，只是价格跑开。旧委托就此
+        # 失效，同一机会不得再用同一个锚点要求"回到限价"。
+        waited = wait["waited_minutes"]
+        reasons.append(
+            (f"价格等待窗口到期：等待 {waited:.0f} 分钟现价 {fill_price:.2f} 仍未回到"
+             if waited is not None else
+             f"价格等待已到期：现价 {fill_price:.2f} 仍未回到")
+            + f"冻结限价 {frozen_limit:.2f}，本机会当日失效；"
+              "需新机会重新确认后再评估")
+    elif wait["status"] == "price_returned":
+        # 现价已回到冻结限价：价格等待兑现，理由必须写"已回到"，不能再报
+        # "仍未回到冻结限价"。
+        sizing["entry_price_returned_to_limit"] = round(frozen_limit, 2)
     entry_limit = EPF.enforce_entry_limit(
         exec_profile, fill_price, reference_price=signal_close or price,
+        frozen_limit_price=frozen_limit,
     )
     limit_deferred = not entry_limit["allowed"] and not reasons
     if entry_limit["limit_price"] is not None:
         sizing["execution_limit_price"] = entry_limit["limit_price"]
+    # 只有真正的价格等待才落锚点：起锚价冻结在本机会的开仓限价上，后续轮次
+    # 只降不升；到期失效的机会留下终态标记，后续轮次据此说明"为什么不再追"。
+    price_wait_marker = _next_price_wait_marker(
+        opportunity=entry_opportunity,
+        outcome={**wait, "started_at": (price_wait or {}).get("started_at")},
+        limit_price=entry_limit["limit_price"],
+        deferred=limit_deferred,
+        now=_now(),
+    )
+    if price_wait_marker is not None:
+        risk["entry_price_wait"] = price_wait_marker
+    risk["entry_opportunity"] = entry_opportunity
     risk["execution_profile"] = exec_profile
     # PR-11 执行器：批量窗口 / 人工核验只挂起"本可立即成交"的委托。挂起
     # 发生在资金预占之前，因此不占额度也不占席位。驳回结论按
@@ -9706,26 +9973,24 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # changed reservation, valuation, participant pin, or cycle invalidates this
     # attempt; it never selects a newer plan implicitly.
     try:
-        decision_instant = dt.datetime.fromisoformat(
-            str(exact_plan["decision_at"]).replace("Z", "+00:00"))
-        revalidation_reading = MDSvc.read_snapshot(
-            MDC.LIVE_MARKET_POLICY, now=decision_instant,
-            asof_day=exact_plan["asof_day"])
-        revalidated_snapshot = PRS.capture_portfolio_runtime_snapshot(
-            conn, cycle_id=exact_plan["cycle_id"],
-            asof_day=exact_plan["asof_day"],
-            decision_at=exact_plan["decision_at"],
-            builtin_scope=ACTIVE_ACCOUNT_IDS,
-            market_evidence_identity=(
-                MDC.snapshot_fingerprint(revalidation_reading.snapshot)
-                if revalidation_reading.snapshot is not None else None),
-            market_reading=revalidation_reading)
-        revalidation_matches = (
-            revalidated_snapshot["snapshot_id"]
-            == exact_plan["portfolio_snapshot_id"]
-            and revalidated_snapshot["snapshot_fingerprint"]
-            == exact_plan["portfolio_snapshot_fingerprint"]
-        )
+        with PTM.phase("execution.plan_revalidate"):
+            decision_instant = dt.datetime.fromisoformat(
+                str(exact_plan["decision_at"]).replace("Z", "+00:00"))
+            revalidation_reading = MDSvc.read_snapshot(
+                MDC.LIVE_MARKET_POLICY, now=decision_instant,
+                asof_day=exact_plan["asof_day"])
+            revalidated_snapshot = PRS.capture_portfolio_runtime_snapshot(
+                conn, cycle_id=exact_plan["cycle_id"],
+                asof_day=exact_plan["asof_day"],
+                decision_at=exact_plan["decision_at"],
+                builtin_scope=ACTIVE_ACCOUNT_IDS,
+                market_reading=revalidation_reading)
+            revalidation_matches = (
+                revalidated_snapshot["snapshot_id"]
+                == exact_plan["portfolio_snapshot_id"]
+                and revalidated_snapshot["snapshot_fingerprint"]
+                == exact_plan["portfolio_snapshot_fingerprint"]
+            )
     except Exception as exc:
         revalidation_matches = False
         risk["allocation_revalidation_error"] = type(exc).__name__
@@ -9761,7 +10026,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     order_status = "pending_execution" if allowed else (
         "shadow_q3" if q3_shadow_ready else (
             STRATEGY_EXECUTION_RETRY_STATUS if limit_deferred else
-            ("deferred_capacity" if capacity_deferred else "risk_rejected"))
+            ("expired" if price_wait_failed else
+             ("deferred_capacity" if capacity_deferred else "risk_rejected")))
     )
     reason = (
         "Q3 三重强度影子候选：个股强度、实时资金和板块确认均通过；仅记录验证，不模拟买入"
@@ -10122,9 +10388,14 @@ def process_pending_execution_orders(asof_date=None):
                     raise
                 reason = f"执行事件异常，可在后续窗口重试：{type(exc).__name__}: {exc}"
                 retry_status = "partially_filled" if int(order.get("filled_qty") or 0) else "pending_execution"
+                # 执行失败原因写进 ``execution_reasons``，不覆盖 ``reason``：
+                # 后者是这张委托"为什么下"的策略/风控事实，恢复成交时必须
+                # 原样留着，不能被一次执行插曲替换掉。
                 conn.execute(
-                    "UPDATE paper_orders SET status=?,reason=? WHERE id=? AND execution_version=?",
-                    (retry_status, reason, order_id, int(order.get("execution_version") or 0)),
+                    """UPDATE paper_orders
+                          SET status=?,execution_reasons=? WHERE id=? AND execution_version=?""",
+                    (retry_status, _json([reason]), order_id,
+                     int(order.get("execution_version") or 0)),
                 )
                 _risk_log(
                     conn, order["account_id"], order["code"], order["side"],
@@ -10524,15 +10795,17 @@ _RISK_PROJECTION = _RiskProjectionAdapter()
 def _risk_load_market_inputs(*, day, positions, candidate_codes):
     """Supply the acquisition service with narrow, late-bound capabilities."""
     def market_context(day):
+        # 当日收盘记录之外只读一次沪深300（provider TTL 缓存/熔断），
+        # 既不刷新全市场快照，也不会因为当日没有收盘任务而回落到别日数据。
         with _db() as conn:
-            return _cached_close_market(conn, day, allow_network=False)
+            return _cached_close_market(conn, day)
 
     def quotes(codes, **kwargs):
         quote_map = _quotes(codes, **kwargs)
         _round_quote_offer(day, quote_map)
         return quote_map
 
-    return PRMI.load(
+    inputs = PRMI.load(
         day=day, positions=positions, candidate_codes=candidate_codes,
         ports=PRMI.RiskMarketInputs(
             market_context=market_context, quotes=quotes, news=_news_for,
@@ -10540,6 +10813,9 @@ def _risk_load_market_inputs(*, day, positions, candidate_codes):
             trajectories=lambda codes, **kwargs: AD.fund_flow_trajectories(codes, **kwargs) if AD is not None else {},
         ),
     )
+    with PTM.phase("risk.alt_evidence"):
+        inputs["position_alt_data"] = PREv.prefetch_position_alt_data(positions, day, alt_data=AD)
+    return inputs
 
 
 def _risk_service_ports():
@@ -10640,13 +10916,82 @@ def monitor_risk(asof_date=None):
         raise
 
 
-def _cached_close_market(conn, day, *, allow_network=True):
+def _same_day_close_market(conn, day):
+    """同一交易日的收盘任务市场状态；``None`` 表示当日没有可用记录。
+
+    旧实现取 ``market_date<=day`` 的最近一条 completed 记录，于是 10-23 的
+    盘中卖出风控拿到的是 **10-16** 的收盘市场（指数 +0.11%），把当日 -4.50%
+    的个股算成"相对沪深300 弱 4.61 个百分点"。盘中决策只能使用属于当日的
+    指数参照，别日的收盘记录不得代理当日行情。
+    """
+    day_iso = _date(day).isoformat()
     row = conn.execute(
-        "SELECT detail FROM paper_jobs WHERE slot='close' AND market_date<=? AND status='completed' ORDER BY market_date DESC LIMIT 1",
-        (_date(day).isoformat(),),
+        """SELECT detail FROM paper_jobs
+            WHERE slot='close' AND market_date=? AND status='completed'
+            LIMIT 1""",
+        (day_iso,),
     ).fetchone()
-    detail = _loads(row["detail"]) if row else {}
-    return detail.get("market") or _market_state(day, allow_network=allow_network)
+    market = (_loads(row["detail"]) if row else {}).get("market") or {}
+    if not market:
+        return None
+    observed = market.get("live_index_time")
+    if _index_session_day(observed) != _date(day).strftime("%Y%m%d"):
+        # 当日任务写下的指数时间戳不属于当日：记录本身不可信，按没有处理。
+        return None
+    return market
+
+
+def _close_market_history(conn, day):
+    """最近一条早于 ``day`` 的收盘市场：只作历史背景，标注为不可用于当日参照。"""
+    day_iso = _date(day).isoformat()
+    row = conn.execute(
+        """SELECT market_date, detail FROM paper_jobs
+            WHERE slot='close' AND market_date<? AND status='completed'
+            ORDER BY market_date DESC LIMIT 1""",
+        (day_iso,),
+    ).fetchone()
+    if row is None:
+        return None
+    market = (_loads(row["detail"]) or {}).get("market") or {}
+    return {
+        "market_date": str(row["market_date"]),
+        "live_index_pct": market.get("live_index_pct"),
+        "live_index_time": market.get("live_index_time"),
+        "light": market.get("light"),
+        "status": "history_only",
+        "reason": "早于当日的收盘记录，仅作历史背景，不参与当日相对强弱计算",
+    }
+
+
+def _cached_close_market(conn, day):
+    """当日市场状态：只有当日收盘记录可复用，否则现取当日指数。
+
+    旧实现取 ``market_date<=day`` 的最近一条 completed 记录，于是 10-23 的
+    盘中卖出风控拿到的是 10-16 的收盘市场（指数 +0.11%），把当日 -4.50% 的
+    个股算成"相对沪深300 弱 4.61 个百分点"。别日的收盘记录只能作历史背景。
+    """
+    cached = _same_day_close_market(conn, day)
+    if cached is not None:
+        return cached
+    return _intraday_market_context(day, history=_close_market_history(conn, day))
+
+
+def _intraday_market_context(day, *, history=None):
+    """盘中（风控扫描）用的当日市场状态。
+
+    只做一次沪深300读取（provider 侧自带 TTL 缓存与熔断），不触发全市场
+    快照刷新；没有当日指数时把相对强弱留在未知，绝不拿旧的收盘值代算。
+    """
+    live_index, reference = _same_session_index(day, allow_network=True)
+    market = _market_state(
+        day, live_universe=[], allow_network=False, live_index=live_index,
+    )
+    market["index_reference"] = reference
+    if history is not None:
+        market["market_history"] = history
+    if live_index is None:
+        market["reason"] = f"{market.get('reason')}；{reference['reason']}"
+    return market
 
 
 def _observe_intraday(conn, cycle_id, account_id, code, price, action, reason, payload):
@@ -10858,54 +11203,11 @@ def _bootstrap_cooled_candidates(conn, account_id, candidates, day):
 
 
 def _bootstrap_candidate_evidence(accounts, precomputed_candidates, day):
-    """Collect per-account news and one shared quote batch outside the writer."""
-    bootstrap_evidence = {}
-    for account in accounts:
-        precomputed = precomputed_candidates.get(account["id"], ([], {}))
-        if precomputed[1].get("blocked"):
-            continue
-        # 冷却过滤会决定最终候选集合，而冷却查询需要账本 —— 但它只读，因此用
-        # 只读连接在写事务之前完成，使「为哪些候选取证」与后面「实际审批哪些
-        # 候选」使用同一个集合。
-        with _db_readonly() as evidence_conn:
-            with PTM.phase("candidate.cooldown_read"):
-                cooled = _bootstrap_cooled_candidates(
-                    evidence_conn, account["id"], precomputed[0], day,
-                )
-        names = {pick["code"]: pick.get("name") or pick["code"]
-                 for pick in cooled["candidates"]}
-        try:
-            with PTM.phase("candidate.news_source"):
-                news = _news_for(names) if names else []
-        except Exception:
-            news = []
-        bootstrap_evidence[account["id"]] = {
-            "cooled": cooled, "names": names, "news": news,
-        }
-    # Collect the union before touching the writer. Quote envelopes still pass
-    # the existing independent-source and freshness checks; missing rows remain
-    # missing. Fetch quotes last so per-account news work cannot age them first.
-    quote_codes = list(dict.fromkeys(
-        code for evidence in bootstrap_evidence.values() for code in evidence["names"]
+    """Compatibility entry; collection order belongs to the candidate scan service."""
+    return PCScan.collect_evidence(accounts, precomputed_candidates, day, ports=PCScan.EvidencePorts(
+        open_readonly=_db_readonly, cooled_candidates=_bootstrap_cooled_candidates,
+        news=_news_for, sector_flow=dfc.fetch_sector_flow, quotes=_quotes,
     ))
-    try:
-        with PTM.phase("candidate.sector_source"):
-            sector_flow = dfc.fetch_sector_flow("industry") if bootstrap_evidence else []
-    except Exception:
-        sector_flow = []
-    try:
-        with PTM.phase("candidate.quote_source"):
-            quotes = (_quotes(quote_codes) or {}) if quote_codes else {}
-    except Exception:
-        quotes = {}
-    if not isinstance(quotes, dict):
-        quotes = {}
-    for evidence in bootstrap_evidence.values():
-        evidence["quotes"] = {
-            code: deepcopy(quotes[code]) for code in evidence["names"] if code in quotes
-        }
-        evidence["sector_flow"] = deepcopy(sector_flow)
-    return bootstrap_evidence
 
 
 @PTM.timed("candidate_bootstrap")
@@ -10973,37 +11275,23 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # never hold the SQLite writer or delay risk exits/API reads.
     with _db() as account_conn:
         accounts = _active_account_rows(account_conn, status="running")
-    precomputed_candidates = {}
-    micro_codes = []
-    shared_inputs = PCI.CandidateScanInputs(F.live_snapshot_asof())
-    for account in accounts:
-        try:
-            with PTM.phase("candidate.rows"):
-                rows, meta = _candidate_rows(
-                    account, factor_day, market, sector_rows=sector_rows,
-                    live_universe=live_universe, live_asof_date=day,
-                    shared_inputs=shared_inputs,
-                )
-        except Exception as exc:
-            rows, meta = [], {"blocked": True, "reason": f"候选生成失败：{type(exc).__name__}: {exc}"}
-        precomputed_candidates[account["id"]] = (rows, meta)
-        preliminary = _prioritize_live_candidate_budget(rows, account["id"], limit=6)
-        micro_codes.extend(str(item.get("code") or "") for item in preliminary if item.get("code"))
-    try:
-        with PTM.phase("candidate.microstructure_source"):
-            global_microstructure_map = (
-                AD.market_microstructures(micro_codes, asof_day=day)
-                if AD is not None else {}
-            )
-    except Exception:
-        global_microstructure_map = {}
+    prepared = PCScan.prepare(
+        accounts, factor_day=factor_day, day=day, market=market, sector_rows=sector_rows,
+        live_universe=live_universe, snapshot_asof=F.live_snapshot_asof(),
+        ports=PCScan.PreparationPorts(
+            candidate_rows=_candidate_rows, prioritize=_prioritize_live_candidate_budget,
+            microstructures=lambda codes, **kwargs: AD.market_microstructures(codes, **kwargs) if AD is not None else {},
+            collect_evidence=_bootstrap_candidate_evidence,
+        ),
+    )
+    precomputed_candidates = prepared.rows_by_account
+    global_microstructure_map = prepared.microstructures
     # R25：bootstrap 与 close 路径必须同形 —— provider/网络证据在**写事务之外**
     # 收集完成，写锁内只做校验、决策与落库。此前 ``_quotes`` / ``_news_for`` /
     # ``fetch_sector_flow`` 在 ``_db()`` 内被逐账户调用：那不仅让每个账户各付一次
     # 网络延迟（写锁被持有），而且一次慢源就能阻塞成交、风控退出与页面读取数分钟。
     # 证据按账户预取一次，写事务内只读这份快照。
-    with PTM.phase("candidate.evidence"):
-        bootstrap_evidence = _bootstrap_candidate_evidence(accounts, precomputed_candidates, day)
+    bootstrap_evidence = prepared.evidence_by_account
     with PTM.phase("candidate.writer"), _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
         for account in accounts:
@@ -11395,14 +11683,16 @@ def _auction_quote_time(value):
 def run_auction_preselection(asof_date=None, force=False):
     """只在 09:25 读取一次集合竞价快照，生成待 09:31 开盘确认的预选信号。
 
-    09:15–09:20 的委托可撤，波动和虚假撮合较大，因此不采集也不下单；
-    09:25 的快照只用于筛选与排序，真正成交仍须在 09:31 用最新双源行情复核。
+    09:15 起由 auction-track 保存观测；可撤单阶段只跟踪，不生成委托；
+    09:25 的快照只用于筛选与排序，真正成交仍须在 09:31 用最新有效行情复核。
     """
     init_db()
     now = dt.datetime.now()
     day = _date(asof_date)
     if not force and (now.weekday() >= 5 or now.time() < dt.time(9, 24) or now.time() > dt.time(9, 27)):
         return {"slot": "auction", "status": "skipped", "date": day.isoformat(), "reason": "仅在 09:25 采集集合竞价快照"}
+    # 每日首批候选也必须拿到本轮探活结果，而非沿用昨收或过期记录。
+    auction_source_health = dfc.check_data_source_health(force=True)
     try:
         live_universe = MDSvc.refresh_rows(force=True, policy=MDC.AUCTION_PRESELECTION_POLICY)
     except Exception as exc:
@@ -11424,6 +11714,11 @@ def run_auction_preselection(asof_date=None, force=False):
             "live_scan_gate": auction_gate,
         }
     auction_at = max((_auction_quote_time(row.get("quote_at")) for row in current_rows), default=None)
+    try:
+        import auction_tracking
+        auction_tracking.record_final(current_rows, now, auction_source_health)
+    except Exception:
+        pass  # 观测落盘异常不改变原有预选、风控与下单门禁。
     # The full snapshot may contain rows captured before/after the auction
     # window.  Ranking must consume only the validated 09:24–09:27 rows.
     result = _bootstrap_signals_for_today(day, live_universe=current_rows, source_slot="auction_0925")
@@ -11432,7 +11727,7 @@ def run_auction_preselection(asof_date=None, force=False):
         "auction_at": auction_at.isoformat() if auction_at else None,
         "snapshot_count": len(live_universe or []), "auction_count": len(current_rows),
         "live_scan_gate": auction_gate,
-        "execution_note": "仅预选；09:31 开盘审批仍需最新双源实时行情通过后才可成交",
+        "execution_note": "仅预选；09:31 开盘审批仍需最新有效实时行情通过后才可成交",
     })
     with _db() as conn:
         cycle = _active_cycle(conn)
@@ -11919,7 +12214,7 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
         reason=("确认后回补：新买份额次日可卖"
                 if payload.get("opening_event") else "日内做T回补：新买份额次日可卖"),
         detail=detail, action=action_name, is_t_base=False,
-        assumption="实时双源快照回补 + 滑点模拟；股票份额次日可卖",
+        assumption="实时有效报价回补 + 滑点模拟；股票份额次日可卖",
     )
     if failure:
         return None, failure
@@ -12102,7 +12397,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         },
         asof_day, reason=label, detail=detail, action="swing_scale_in",
         is_t_base=True,
-        assumption=f"{label}；实时双源行情含滑点和佣金",
+        assumption=f"{label}；实时有效行情含滑点和佣金",
     )
     if failure:
         return None, failure
@@ -12320,7 +12615,6 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     candidates.append(row)
                     seen_fast.add(key)
             positions = _position_rows(snapshot_conn, asof_day=day, readonly=True)
-            _cached_close_market(snapshot_conn, day, allow_network=False)
         if not candidates:
             return {"status": "completed", "slot": "fast-entry", "checked": 0, "confirmed": []}
 
@@ -12345,6 +12639,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                 execution_quote = _execution_quote_status(quote, day, purpose="entry")
                 evidence = {
                     "cross_source_checked": execution_quote.get("status") == "cross_source_checked",
+                    "quote_usable": bool(execution_quote.get("fresh")),
                     "main_pct": _num(quote.get("main_pct"), _num(quote.get("main_net_pct"))),
                     "vol_ratio": _num(quote.get("vol_ratio")),
                     "active_buy_sell_imbalance": micro.get("active_buy_sell_imbalance"),
@@ -12479,13 +12774,25 @@ def monitor_intraday(asof_datetime=None, force=False):
         except Exception:
             live_universe = []
     live_gate = _live_scan_gate(live_universe, day)
+    try:
+        import auction_analysis
+        auction_analysis.record_outcomes(live_universe, now)
+    except Exception:
+        pass  # 独立研究复核异常不得影响风控、出场与原有候选门禁。
     scan_ready = bool(live_gate["ready"])
     scan_block = (
         None if scan_ready else
         f"全市场实时行情覆盖 {live_gate['covered_codes']}/{live_gate['eligible_codes']}（{live_gate['coverage_pct']:.1f}%），需至少 {live_gate['required_codes']} 只；本轮停止候选扫描，不使用旧快照"
     )
     # 门禁决策每轮落审计：杜绝“静默全停”，正是候选冻结能潜伏 27 小时未被发现的根因。
+    # 快照溯源与资金流字段覆盖率一并记录：纯价格回退是合法降级，但必须可见，
+    # 否则健康检查仍然全绿，而概念扩散等依赖资金流的通道已经静默停摆。
+    flow_coverage = MDC.flow_field_coverage(live_universe)
     try:
+        snapshot_source = dfc.full_market_snapshot_source() or {}
+        PTM.bind_job(snapshot_source=snapshot_source.get("source", "unknown"),
+                     snapshot_price_only=snapshot_source.get("price_only"),
+                     snapshot_flow_coverage=flow_coverage, scan_ready=live_gate["ready"])
         with _db() as gate_conn:
             _audit(gate_conn, None, "live_scan_gate", _json({
                 "ready": scan_ready,
@@ -12494,6 +12801,11 @@ def monitor_intraday(asof_datetime=None, force=False):
                 "coverage_pct": live_gate["coverage_pct"],
                 "required_codes": live_gate["required_codes"],
                 "reason": scan_block,
+                "snapshot": {
+                    **snapshot_source,
+                    "flow_field_coverage": flow_coverage,
+                    "flow_fields_missing": flow_coverage <= 0.0,
+                },
             }))
     except Exception:
         pass
@@ -12544,7 +12856,11 @@ def monitor_intraday(asof_datetime=None, force=False):
         )
         with _db() as conn:
             accounts = _active_account_rows(conn, status="running")
-            market = _cached_close_market(conn, day)
+            market = _same_day_close_market(conn, day)
+        if market is None:
+            # 复用本轮已经校验过的全市场快照；当日收盘任务尚未完成时，
+            # 这里必须现取指数，不能沿用上一交易日的收盘市场。
+            market = _market_state(day, live_universe=live_universe)
         return {
             "slot": "intraday", "date": day.isoformat(),
             "observed": opening_event.get("observed", 0),
@@ -12993,6 +13309,63 @@ def _weekly_review(conn, day):
     return output
 
 
+def _lease_renew_interval(ttl_seconds):
+    """租约心跳续期间隔（秒）：长任务也要能在几分钟内暴露"进程已死"。
+
+    旧口径是 ``max(60, ttl/4)``：close/risk 的 TTL 是 40 分钟，于是续期间隔
+    10 分钟、判定放弃要 30 分钟以上，而当天最后的收盘触发点是 15:12——
+    15:05 的进程被 SIGKILL 后，租约看起来仍然"活着"，15:10/15:12 两次兜底
+    全部返回 ``already_done``（10-19、10-21 的收盘任务就是这样整天没有重跑，
+    只在下一个碰库的进程里被记成 failed）。压到 120 秒后，4~6 分钟没有心跳
+    即可判定放弃；活进程的续期成本只是一次小事务。
+    """
+    ttl = float(ttl_seconds or 0) or 600.0
+    return max(60.0, min(LEASE_HEARTBEAT_MAX_SECONDS, ttl / 4.0))
+
+
+def _lease_abandoned(expires_at, heartbeat_at, started_at, *, lease_ttl_seconds,
+                     now=None):
+    """判断一个 ``running`` 认领是否已被放弃（进程死亡 / 租约过期）。
+
+    三种证据，任一成立即放弃：
+
+    * 租约已过期（``expires_at <= now``）——原有口径；
+    * 心跳超过 ``LEASE_HEARTBEAT_MISSES`` 个续期间隔没有更新——进程被
+      SIGKILL/OOM 时 ``expires_at`` 还留在未来，只有心跳能证明它停了；
+    * 两者都缺失的 legacy 行按 ``started_at`` 超过 TTL 处理。
+
+    真正的长时间任务不会被误抢：心跳线程每 `_lease_renew_interval` 续期
+    一次，且 fencing token + 完成 CAS 保证即使被误抢也不会双写。
+    """
+    now = now or dt.datetime.now()
+    expires = _parse_stamp_value(expires_at)
+    heartbeat = _parse_stamp_value(heartbeat_at)
+    started = _parse_stamp_value(started_at)
+    if expires is not None and expires <= now:
+        return True
+    limit = _lease_renew_interval(lease_ttl_seconds) * LEASE_HEARTBEAT_MISSES
+    if heartbeat is not None:
+        return (now - heartbeat).total_seconds() > limit
+    if started is not None:
+        return (now - started).total_seconds() > max(float(lease_ttl_seconds or 0), 60.0)
+    return True
+
+
+def _parse_stamp_value(value):
+    try:
+        return dt.datetime.fromisoformat(str(value or "")[:19])
+    except (TypeError, ValueError):
+        return None
+
+
+def _stamp_elapsed_seconds(started_at, *, now=None):
+    """从 ``started_at`` 到现在的秒数；时间戳不可解析时返回 ``None``。"""
+    started = _parse_stamp_value(started_at)
+    if started is None:
+        return None
+    return int(((now or dt.datetime.now()) - started).total_seconds())
+
+
 def _claim_runtime_lease(conn, lock_key, owner_key, slot, ttl_seconds=720):
     """Atomically claim the one process-wide paper runner lease."""
     now = dt.datetime.now()
@@ -13291,7 +13664,12 @@ def _run_slot_impl(slot, day, force=False):
     PTM.bind_job(market_date=day.isoformat(), run_key=intraday_key,
                  job_table="paper_job_runs" if intraday_key else "paper_jobs")
     hot_path = _is_hot_path_slot(slot)
-    max_auto_retries = 2
+    # 失败任务的自动重试预算按 slot 给：close 的失败有一半是"完整日线/因子
+    # 还没补齐"，而 refresh_history 自带 420 秒上限 + 持久化游标，靠后续窗口
+    # 增量续传才能收敛。调度契约里 close 有 15:10/15:12/15:25/15:40/16:00 五个
+    # 兜底窗口，预算不够就会把后三个窗口全部挡成 already_done。其它 slot 的
+    # 失败不会因为"等数据"自愈，保持 2 次，避免变成重试风暴。
+    max_auto_retries = SLOT_MAX_AUTO_RETRIES.get(slot, DEFAULT_MAX_AUTO_RETRIES)
     retry_count = 0
     # One lease spans every scheduled slot: a 15:05 full-market factor rebuild
     # must not race a manual retry, and an intraday scan that takes longer than
@@ -13328,30 +13706,25 @@ def _run_slot_impl(slot, day, force=False):
         if exists:
             prior_detail = _loads(exists["detail"], {}) or {}
             if exists["status"] == "running":
-                # H6: 与租约 TTL 对齐——intraday 租约 300s（TTL 主要决定
-                # 挂死扫描的回收时延，活进程由心跳每 TTL/4 续期），job
-                # stale 兜底判定用 5 分钟；其它 slot 租约 40 分钟，
-                # stale 判定 45 分钟。
-                stale_minutes = 5 if intraday_key else 45
-                try:
-                    expires_raw = str(exists["expires_at"] or "")[:19] if "expires_at" in exists.keys() else ""
-                    if expires_raw:
-                        # A live heartbeat can legitimately keep a long close
-                        # task running beyond its nominal wall-clock budget.
-                        # Only an expired lease is stale; never steal a live
-                        # worker based on started_at alone.
-                        stale_running = dt.datetime.fromisoformat(expires_raw) <= dt.datetime.now()
-                    else:
-                        started = dt.datetime.fromisoformat(str(exists["started_at"] or "")[:19])
-                        stale_running = (dt.datetime.now() - started).total_seconds() > stale_minutes * 60
-                except (TypeError, ValueError):
-                    stale_running = True
+                # H6: 租约 TTL 决定"挂死多久才被回收"，活进程由心跳线程按
+                # `_lease_renew_interval` 续期。``expires_at`` 只能证明"租约没
+                # 到期"，不能证明"进程还活着"：进程被 SIGKILL/OOM 后 expires_at
+                # 仍留在未来，只靠它会把当天的兜底触发全部挡成 already_done。
+                # 心跳停止才是进程死亡的证据，见 `_lease_abandoned`。
+                stale_running = _lease_abandoned(
+                    exists["expires_at"] if "expires_at" in exists.keys() else None,
+                    exists["heartbeat_at"] if "heartbeat_at" in exists.keys() else None,
+                    exists["started_at"] if "started_at" in exists.keys() else None,
+                    lease_ttl_seconds=runtime_lock_ttl,
+                )
                 if stale_running:
                     prior_detail = {
                         **prior_detail,
                         "error": "任务记录过期，按租约超时自动回收",
                         "recovered_from_running": True,
                         "recovered_at": _now(),
+                        "failure_kind": "interrupted",
+                        "elapsed_seconds": _stamp_elapsed_seconds(exists["started_at"]),
                         "retry_count": int(prior_detail.get("retry_count") or 0),
                     }
                     if intraday_key:
@@ -13463,7 +13836,7 @@ def _run_slot_impl(slot, day, force=False):
     _set_lease_context(runtime_lock_key, owner, fencing_token, lease_lost_event)
 
     def _renew_runtime_lease():
-        renew_interval = max(60.0, runtime_lock_ttl / 4.0)
+        renew_interval = _lease_renew_interval(runtime_lock_ttl)
         while not lease_renewal_stop.wait(renew_interval):
             try:
                 with _db(immediate=True, hot_path=hot_path) as renew_conn:
@@ -14822,7 +15195,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
         elif validation in {"stale", "invalid", "missing"}:
             validation_detail = quote_status.get("reason") or "主行情不可用"
         elif validation == "range_timestamp_checked":
-            validation_detail = "主行情时间与数值范围校验通过，未完成独立源核对"
+            validation_detail = "单源行情有效，价格、范围和源时间校验通过"
         elif validation == "degraded_cross_source":
             validation_detail = quote_status.get("reason") or "主行情有效，独立源不可用，已降级核验"
         else:
@@ -14883,8 +15256,14 @@ def _validate_capital(capital):
     return PCS.validate_capital(capital)
 
 
+
 def _cycle_snapshot(conn):
-    """PR-58：快照（``compact-ledger-v2``）实现已移至 ``paper_cycle_service``。"""
+    """PR-58：快照（``compact-ledger-v2``）实现已移至 ``paper_cycle_service``。
+
+    这个委托本身就是架构契约：``test_paper_cycle_service`` 要求
+    ``paper_trading`` 必须把这三处 cycle 操作显式转交给 ``PCS``，所以它即
+    使当前没有调用方也**不可删除**（删掉等于悄悄取消一个已声明的边界）。
+    """
     return PCS.cycle_snapshot(conn, _active_cycle(conn))
 
 
@@ -15143,7 +15522,7 @@ def schedule_status():
         "latest_intraday_runs": intraday,
         "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
-        "note": "09:25采集集合竞价快照做预选；09:30、09:31、13:00先执行共享开盘事件扫描（冲高回落可减仓，回补需后续反弹确认），09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试，页面显示数据库中的实际运行记录。"
+        "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新有效行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
     }
 
 

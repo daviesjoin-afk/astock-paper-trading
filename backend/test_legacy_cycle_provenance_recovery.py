@@ -510,6 +510,8 @@ class PreviousVersionCompatibilityTests(unittest.TestCase):
             if "cycle_id" in str(row["sql"] or ""):
                 conn.execute(f'DROP TRIGGER IF EXISTS "{row["name"]}"')
         for table in ("paper_orders", "paper_orders_archive"):
+            if table == "paper_orders":
+                conn.execute("DROP INDEX IF EXISTS idx_paper_orders_portfolio_facts")
             if "cycle_id" in {
                 str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")')
             }:

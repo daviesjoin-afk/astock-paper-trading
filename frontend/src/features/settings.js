@@ -6,6 +6,11 @@ import { adaptiveEsc, riskText } from "../core/format.js";
 import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
+import { PAPER_STAGE_LABELS } from "./paper.js";
+import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings } from "./ai-provider-settings.js";
+
+// 周期状态直接印英文会让「当前周期：running」这种行看起来像没做完的界面。
+var CYCLE_STATUS_LABELS={running:'运行中',paused:'已暂停',pending:'待执行',completed:'已完成',archived:'已归档',idle:'空闲',starting:'启动中',stopping:'停止中'};
 import { settingsConfirm, toast, inlineError, confirmDialog } from "../ui/dialog.js";
 
 // ---------- 操作员授权（PR-2）----------
@@ -55,9 +60,7 @@ export function refreshOperatorUnlockState(){
 }
 
 // ---------- 统一设置中心 ----------
-export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'财报突破质量',main_force_top10:'超强主力股'};
-
-export var SETTINGS_STYLE_NAMES={strong:'强势接力',pullback:'趋势回踩',sector:'板块轮动',quality:'质量突破',main_force:'主力跟随'};
+export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'};
 
 export var SETTINGS_DURATION_OPTIONS=[15,30,60,90,180,0];
 
@@ -76,7 +79,7 @@ export function settingsAuditHtml(items){
   return '<div class="settings-audit-list">'+items.slice(0,20).map(function(item){
     var oldValue=typeof item.old_value==='object'?JSON.stringify(item.old_value):String(item.old_value==null?'—':item.old_value);
     var newValue=typeof item.new_value==='object'?JSON.stringify(item.new_value):String(item.new_value==null?'—':item.new_value);
-    return '<div class="settings-audit-item"><b>'+adaptiveEsc(item.key)+'</b>：'+adaptiveEsc(oldValue)+' → '+adaptiveEsc(newValue)+'<small>'+adaptiveEsc(item.updated_by||'human-ui')+' · '+adaptiveEsc(item.created_at||'')+'</small></div>';
+    return '<div class="settings-audit-item" style="overflow-wrap:anywhere"><b>'+adaptiveEsc(item.key)+'</b>：'+adaptiveEsc(oldValue)+' → '+adaptiveEsc(newValue)+'<small>'+adaptiveEsc(item.updated_by||'human-ui')+' · '+adaptiveEsc(item.created_at||'')+'</small></div>';
   }).join('')+'</div>';
 }
 
@@ -84,7 +87,7 @@ export function settingsPreviewHtml(data,section){
   var risk=(data.settings||{}).risk||{}, effective=(data.effective||{}), current=effective.current_cycle||{}, next=effective.next_cycle||{};
   var minimum=effective.dynamic_minimum_order_amount;
   return '<aside class="settings-panel settings-preview"><h3>本次修改影响</h3><p>保存后这里会同步显示运行时读取到的边界；带“下一周期”的项目不会改写当前账本。</p>'
-    +'<div class="settings-kpi"><small>当前周期</small><b>'+adaptiveEsc(current.status||'—')+' · '+settingsCurrency(current.capital)+'</b><span class="setting-help">'+adaptiveEsc(current.duration_label||'长期')+'</span></div>'
+    +'<div class="settings-kpi"><small>当前周期</small><b>'+adaptiveEsc(CYCLE_STATUS_LABELS[current.status]||current.status||'—')+' · '+settingsCurrency(current.capital)+'</b><span class="setting-help">'+adaptiveEsc(current.duration_label||'长期')+'</span></div>'
     +'<div class="settings-kpi"><small>下一周期</small><b>'+settingsCurrency(next.capital)+' · '+adaptiveEsc(next.duration_label||'长期')+'</b><span class="setting-help">启用 '+(next.enabled_strategies||[]).length+' 套策略</span></div>'
     +'<div class="settings-kpi"><small>动态最小建仓金额</small><b id="settingsMinimumPreview">'+settingsCurrency(minimum)+'</b><span class="setting-help">按周期金额 × 敞口 ÷ 席位 × 利用率向下取整</span></div>'
     +'<div class="settings-note"><strong>生效边界：</strong>共享池敞口、席位上限、单票绝对上限和建仓利用率在下一次扫描读取；资金、启用策略和策略参数在创建新周期时采用。</div>'
@@ -145,7 +148,7 @@ export function renderSettings(data){
     };
     var userCard=function(item){
       var runtime=item.runtime||{};
-      var stage=runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—';
+      var stage=runtime.runtime_ready?adaptiveEsc(PAPER_STAGE_LABELS[runtime.lifecycle_stage]||runtime.lifecycle_stage||'—'):'—';
       var scale=(runtime.runtime_ready&&runtime.capital_scale!=null)?Math.round(runtime.capital_scale*100)+'%':'—';
       return '<article class="strategy-user-card" data-strategy-user-id="'+adaptiveEsc(item.id)+'"><header><div><b>'+adaptiveEsc(item.name||item.id)+'</b><small>'+adaptiveEsc(item.id)+' · v'+(item.current_version||1)+'</small></div>'+wbStatusBadge(item.status)+'</header>'
         +'<div class="strategy-preview-grid"><dt>生命周期阶段</dt><dd>'+stage+'</dd><dt>资金系数</dt><dd>'+scale+'</dd></div>'
@@ -167,41 +170,45 @@ export function renderSettings(data){
       +execSwitch('execution_ttl_sweep','执行时限清扫','清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。')
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'execution\')">保存执行开关</button><button class="ghost" onclick="resetSettingsSection(\'execution\')">恢复默认</button></div>'
       +'<div class="settings-note">挂起委托不占用资金与席位；所有放行/驳回都写入审计。开关立即生效，无需重启扫描。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
+  }else if(section==='notification'){
+    var note=settings.notification||{}, noteDefaults=(data.defaults||{}).notification||{};
+    var noteVal=function(key){ return note[key]===undefined?noteDefaults[key]:note[key]; };
+    var tokenConfigured=!!note.wxpusher_token_configured;
+    var weekdayNames={1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
+    var weekdayOptions=[1,2,3,4,5,6,7].map(function(day){return '<option value="'+day+'"'+(Number(noteVal('wxpusher_weekly_weekday')||5)===day?' selected':'')+'>'+weekdayNames[day]+'</option>';}).join('');
+    var noteSwitch=function(id,value){ return '<label class="settings-exec-toggle"><input id="'+id+'" type="checkbox"'+settingsChecked(!!value)+'><span>'+(value?'开启':'关闭')+'</span></label>'; };
+    html='<div class="settings-grid"><section class="settings-panel"><h3>日报与周报推送</h3>'
+      +'<p>通过 WxPusher 把模拟盘摘要推到微信。推送内容只有净值、超额与成交统计，不包含操作凭据，也不改变任何交易状态或账本。</p><div class="settings-form">'
+      +settingsInputRow('wxpusher_enabled','推送总开关','关闭后日报与周报都不发送，无论分项开关如何设置。',noteSwitch('settingWxEnabled',noteVal('wxpusher_enabled')))
+      +settingsInputRow('wxpusher_app_token','appToken','在 WxPusher 后台创建应用后获得，以 AT_ 开头。留空表示保持现有凭据；读取接口只回显掩码。','<input id="settingWxToken" type="password" autocomplete="off" placeholder="'+(tokenConfigured?adaptiveEsc(note.wxpusher_app_token||'已配置'):'未配置，请输入 AT_...')+'">'+(tokenConfigured?'<button type="button" class="ghost" data-testid="settings-clear-wxpusher" onclick="clearWxpusherToken()">清除凭据</button>':''))
+      +settingsInputRow('wxpusher_topic_id','推送主题 ID','主题 ID 表示群发到该主题的订阅者；留空只发给应用自己的订阅用户。','<input id="settingWxTopic" type="text" inputmode="numeric" value="'+adaptiveEsc(noteVal('wxpusher_topic_id')||'')+'" placeholder="可选">')
+      +settingsInputRow('wxpusher_daily_enabled','启用日报','每个交易日收盘后推送一次当日净值与成交摘要。',noteSwitch('settingWxDaily',noteVal('wxpusher_daily_enabled')))
+      +settingsInputRow('wxpusher_daily_time','日报发送时间','本地时区（Asia/Shanghai）。','<input id="settingWxDailyTime" type="time" value="'+adaptiveEsc(noteVal('wxpusher_daily_time')||'15:40')+'">')
+      +settingsInputRow('wxpusher_weekly_enabled','启用周报','每周指定星期推送一次周度净值与超额。',noteSwitch('settingWxWeekly',noteVal('wxpusher_weekly_enabled')))
+      +settingsInputRow('wxpusher_weekly_weekday','周报星期','默认周五收盘后。','<select id="settingWxWeekday">'+weekdayOptions+'</select>')
+      +settingsInputRow('wxpusher_weekly_time','周报发送时间','本地时区（Asia/Shanghai）。','<input id="settingWxWeeklyTime" type="time" value="'+adaptiveEsc(noteVal('wxpusher_weekly_time')||'15:45')+'">')
+      +'</div><div class="settings-actions"><button data-testid="settings-save-notification" onclick="saveSettingsSection(\'notification\')">保存推送设置</button><button class="ghost" data-testid="settings-test-notification" onclick="testWxpusher()">发送测试推送</button><button class="ghost" onclick="resetSettingsSection(\'notification\')">恢复默认</button></div>'
+      +'<div class="settings-note">appToken 保存在服务端，接口只回显掩码；保存时留空表示保持原值。测试推送会真的发到微信，需要二次确认。发送时间由后台调度任务读取，修改后下一轮调度生效。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='operator'){
+    var security=settings.security||{}, authRequired=security.operator_auth_required!==false;
     html='<div class="settings-grid"><section class="settings-panel"><h3>操作员授权</h3>'
       +'<p>本页只管理<strong>本标签页</strong>的写操作凭据，不涉及账户体系。凭据保存在 sessionStorage：本标签页刷新后保留，关闭标签页即消失。'
       +'只读接口（看板、行情、健康检查）不需要授权；写接口在未授权时会返回 401，前端不会自动重放，请解锁后重新点击原操作。</p>'
       +renderOperatorUnlockPanel()
+      +'<div class="setting-row"><div class="setting-label"><b>写操作要求操作员凭据</b><small>关闭后任何能访问本站的人都能改配置、触发扫描和下模拟单。仅建议在受信网络的单机部署里关闭。</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingOperatorAuth" data-testid="setting-operator-auth" type="checkbox"'+settingsChecked(authRequired)+'><span>'+(authRequired?'要求凭据':'已关闭')+'</span></label></div></div>'
+      +'<div class="settings-actions"><button data-testid="settings-save-operator" onclick="saveSettingsSection(\'operator\')">保存授权设置</button></div>'
       +'<div class="settings-note"><strong>边界说明：</strong>这是一道单操作员共享密钥边界，不是 RBAC；它不替代既有的风险与人工确认门禁，也不会把凭据写入日志或页面。</div>'
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
     var ais=ai.settings||{}, review=ai.review||{}, reviewSlots=review.slots||{}, slotOrder=review.slot_order||['ai1','ai2'], reviewMode=review.review_mode==='single'?'single':'dual';
-    var aiSlotCards=slotOrder.map(function(slot){
-      var s=reviewSlots[slot]||{}, enabled=!!s.enabled;
-      return '<div class="settings-panel" data-testid="ai-slot-'+slot+'" style="margin-top:14px;padding:14px">'
-        +'<h4>'+adaptiveEsc(s.display_name||slot)+' <small class="setting-help">'+adaptiveEsc(slot)+'</small></h4>'
-        +'<div class="setting-row"><div class="setting-label"><b>配置状态</b><small>页面永不回显明文 Key；Key 留空表示保持现有值。</small></div>'
-        +'<div class="setting-control"><span data-testid="ai-slot-'+slot+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_displayName">显示名称</label><input data-testid="ai-slot-'+slot+'-display-name" id="aiSlot_'+slot+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="自定义名称，与稳定 id 解耦"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_baseUrl">Base URL</label><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="https://example.com/v1"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_model">模型名称</label><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" value="'+adaptiveEsc(s.model||'')+'" placeholder="由你填写，后端不做任何厂商假设"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_apiKey">API Key</label><input data-testid="ai-slot-'+slot+'-api-key" id="aiSlot_'+slot+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div>'
-        +'<div class="setting-control"><label for="aiSlot_'+slot+'_timeout">超时（秒）</label><input data-testid="ai-slot-'+slot+'-timeout" id="aiSlot_'+slot+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div>'
-        +'<div class="setting-control"><label class="settings-exec-toggle"><input data-testid="ai-slot-'+slot+'-enabled" id="aiSlot_'+slot+'_enabled" type="checkbox"'+settingsChecked(enabled)+'><span>'+(enabled?'启用':'停用')+'</span></label></div>'
-        +'<div class="settings-actions">'
-        +'<button data-testid="ai-slot-'+slot+'-save" onclick="saveAiSlot(\''+slot+'\')">保存该槽位</button>'
-        +'<button class="ghost" data-testid="ai-slot-'+slot+'-test" onclick="testAiSlot(\''+slot+'\')">测试连接</button>'
-        +'<button class="ghost" data-testid="ai-slot-'+slot+'-clear" onclick="clearAiSlotKey(\''+slot+'\')">清除 Key</button>'
-        +'</div>'
-        +'<div class="setting-help" data-testid="ai-slot-'+slot+'-feedback"></div>'
-        +'</div>';
-    }).join('');
+    var aiSlotCards=renderAiSlotCards(review);
     var singleSlotOptions=slotOrder.map(function(slot){
       var s=reviewSlots[slot]||{};
-      return '<option value="'+slot+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc((s.display_name||slot)+' · '+slot)+'</option>';
+      return '<option value="'+slot+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc(slot.toUpperCase()+(s.provider_name?' · '+s.provider_name:''))+'</option>';
     }).join('');
     html='<div class="settings-grid"><section class="settings-panel"><h3>AI 审核</h3>'
-      +'<p>这里管理<strong>两个完全独立</strong>的 AI 槽位与审核模式。名称、地址、模型全部由你填写；后端不认识任何厂商身份，请求体是最小公共的 OpenAI 兼容格式。</p>'
+      +'<p>先保存不同的提供商，再为 AI1、AI2 下拉选择提供商和模型。</p>'
+      +renderProviderLibrary(review)+aiSlotCards+'<h4 class="ai-review-heading">3. 审核模式与运行开关</h4>'
       +'<div class="settings-form">'
       +settingsInputRow('evolution_interval_hours','自进化周期','收盘学习任务之间的最短间隔，范围 1–168 小时。','<input id="settingEvolutionInterval" type="number" min="1" max="168" step="1" value="'+Number(evo.evolution_interval_hours||24)+'"> <span class="setting-value-preview">小时</span>')
       +'<div class="setting-row"><div class="setting-label"><b>审核模式</b><small>单AI：只用选定槽位，结果仅供参考、永不构成共识。双AI：两个槽位独立分析后过共识门禁，缺一个即整体拦截，绝不降级成单AI。</small></div>'
@@ -214,7 +221,6 @@ export function renderSettings(data){
       +'<div class="setting-row"><div class="setting-label"><b>调参模式</b><small>shadow 最稳，intraday 更及时，close 只在收盘运行。</small></div><div class="setting-control"><select id="settingAiMode"><option value="shadow"'+(ais.llm_realtime_mode==='shadow'?' selected':'')+'>shadow · 只观察</option><option value="intraday"'+(ais.llm_realtime_mode==='intraday'?' selected':'')+'>intraday · 盘中候选</option><option value="close"'+(ais.llm_realtime_mode==='close'?' selected':'')+'>close · 收盘候选</option></select></div></div>'
       +'</div><div class="settings-actions"><button data-testid="settings-save-ai-review" onclick="saveAiReviewMode()">保存审核模式</button><button class="ghost" data-testid="settings-save-ai-switches" onclick="saveSettingsSection(\'evolution\')">保存 AI 开关</button><button class="ghost" onclick="resetSettingsSection(\'evolution\')">恢复默认</button></div>'
       +'<div class="settings-note"><strong>安全边界：</strong>单AI审阅的运行状态是 <code>single_review</code>，不是 <code>consensus</code>，因此永远无法穿过人工应用门禁；双AI的共识提案仍需人工确认后才生效。自进化周期只控制后台学习频率，不改变已启用策略的交易硬规则。</div>'
-      + aiSlotCards
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }
   target.innerHTML=html;
@@ -227,7 +233,7 @@ export function renderSettings(data){
 }
 
 export function setSettingsSection(section,button){
-  if(['simulation','risk','strategy','evolution','execution','operator'].indexOf(section)<0) section='simulation';
+  if(['simulation','risk','strategy','evolution','execution','notification','operator'].indexOf(section)<0) section='simulation';
   window._settingsSection=section; sessionStorage.setItem(SETTINGS_SECTION_KEY,section);
   document.querySelectorAll('#p-settings .settings-section-tab').forEach(function(item){var active=item.dataset.settingsSection===section;item.classList.toggle('active',active);item.setAttribute('aria-selected',active?'true':'false');});
   if(window._settingsPayload) renderSettings(window._settingsPayload);
@@ -248,23 +254,30 @@ export function updateSettingsPreview(){
 export async function loadSettings(force){
   if(window._settingsLoading&&!force) return window._settingsLoading;
   window._settingsLoading=(async function(){
+    // 策略注册表与版本号是补充信息。冷启动后首次调用注册表可能耗时数十秒，
+    // 若与设置一起 Promise.all，整页会卡在「正在读取统一设置…」。
+    // 所以设置自己先渲染，注册表到货后再补一次渲染。
+    api('/api/strategies?include_archived=true&_='+Date.now(),{timeout:8000})
+      .then(function(registry){
+        if(registry&&Array.isArray(registry.items)){
+          window._registryItems=registry.items;
+          window._registrySummary=registry.summary||{};
+          window._registryError=null;
+        }else{
+          window._registryItems=null;
+          window._registryError='策略注册表读取失败，已回退到内置策略展示。';
+        }
+      })
+      .catch(function(){
+        window._registryItems=null;
+        window._registryError='策略注册表读取超时，已回退到内置策略展示。';
+      })
+      .finally(function(){
+        if(window._settingsPayload&&['simulation','strategy'].indexOf(window._settingsSection||'simulation')>=0) renderSettings(window._settingsPayload);
+      });
+    api('/api/version?_='+Date.now()).then(function(v){ window._appBuild=(v&&v.build)||''; }).catch(function(){});
     try{
-      // PR-47：策略集合与设置并行读取（Registry 是策略集合唯一权威）。
-      // PR-49：并行取后端发布标识，用于界面版本核验。
-      var results=await Promise.all([
-        api('/api/settings/?_='+Date.now()),
-        api('/api/strategies?include_archived=true&_='+Date.now()).catch(function(){ return null; }),
-        api('/api/version?_='+Date.now()).catch(function(){ return null; }),
-      ]);
-      window._appBuild=(results[2]&&results[2].build)||'';
-      var data=results[0];
-      if(results[1]&&Array.isArray(results[1].items)){
-        window._registryItems=results[1].items;
-        window._registrySummary=results[1].summary||{};
-        window._registryError=null;
-      }else{
-        window._registryItems=null; window._registryError='策略注册表读取失败，已回退到内置策略展示。';
-      }
+      var data=await api('/api/settings/?_='+Date.now());
       renderSettings(data);
       return data;
     }catch(e){
@@ -291,8 +304,10 @@ export function collectStrategyOverrides(){
 export async function saveSettingsSection(section){
   var saveAnswer=await confirmDialog({
     kicker:'设置 · 写入审计',
-    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器'}[section]||section)+'”设置？',
-    bullets:['后端会校验取值范围，越界会被拒绝。','本次修改只影响下一周期，不改写当前账本。','保存会写入审计记录。'],
+    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器',notification:'日报与周报推送',operator:'操作员授权'}[section]||section)+'”设置？',
+    bullets:section==='operator'
+      ? ['关闭凭据后，任何能访问本站的人都能修改配置、触发扫描和下模拟单。','只影响写接口；只读看板与行情不受影响。','保存会写入审计记录。']
+      : ['后端会校验取值范围，越界会被拒绝。','本次修改只影响下一周期，不改写当前账本。','保存会写入审计记录。'],
     confirmText:'保存',
   });
   if(!saveAnswer.approved) return;
@@ -302,6 +317,8 @@ export async function saveSettingsSection(section){
   if(section==='strategy') payload.strategy={strategy_overrides:collectStrategyOverrides()};
   if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)};
   if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
+  if(section==='notification') payload.notification={wxpusher_enabled:!!($('settingWxEnabled')||{}).checked,wxpusher_app_token:(($('settingWxToken')||{}).value||''),wxpusher_topic_id:(($('settingWxTopic')||{}).value||'').trim(),wxpusher_daily_enabled:!!($('settingWxDaily')||{}).checked,wxpusher_daily_time:(($('settingWxDailyTime')||{}).value||'15:40'),wxpusher_weekly_enabled:!!($('settingWxWeekly')||{}).checked,wxpusher_weekly_weekday:Number((($('settingWxWeekday')||{}).value)||5),wxpusher_weekly_time:(($('settingWxWeeklyTime')||{}).value||'15:45')};
+  if(section==='operator') payload.security={operator_auth_required:!!($('settingOperatorAuth')||{}).checked};
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
 }
 
@@ -319,9 +336,36 @@ export async function resetSettingsSection(section){
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('已恢复该分组默认值。');}catch(e){inlineError($('settingsResult'), e, { title:'恢复默认失败', retryLabel:'重试', onRetry:function(){ resetSettingsSection(section); } });}
 }
 
-// ---------- 通用 AI 槽位（ai1 / ai2）----------
-// 全部走 /api/settings/ai-review*：GET 永不回显明文 Key，保存时空 Key = 保持旧 Key，
-// 清空必须显式走“清除 Key”按钮（后端 clear_api_key=true）。
+// ---------- 日报/周报推送（WxPusher）----------
+export async function testWxpusher(){
+  var answer=await confirmDialog({
+    kicker:'推送 · 真实发送',
+    title:'发送一条测试推送到微信？',
+    bullets:['会用已保存的 appToken 真实调用 WxPusher。','内容为当前账本的日报摘要，不含任何凭据。','界面上的未保存改动不会生效，请先保存再测试。'],
+    confirmText:'发送测试',
+  });
+  if(!answer.approved) return;
+  try{
+    var data=await apiPostJson('/api/settings/notification/test?kind=daily&confirmed=true',{});
+    toast('测试推送已发送：'+(data.summary||''));
+  }catch(e){ toast('测试推送失败：'+((e&&e.message)||e), { tone:'danger' }); }
+}
+
+export async function clearWxpusherToken(){
+  var answer=await confirmDialog({
+    kicker:'推送 · 清除凭据',
+    title:'清除已保存的 WxPusher appToken？',
+    bullets:['清除后日报与周报都无法发送，直到重新填写。','该操作会写入设置审计。'],
+    confirmText:'清除凭据',
+  });
+  if(!answer.approved) return;
+  try{
+    var data=await apiPostJson('/api/settings/?confirmed=true',{notification:{clear_app_token:true}});
+    renderSettings(data); toast('已清除 WxPusher 凭据。');
+  }catch(e){ toast('清除失败：'+((e&&e.message)||e), { tone:'danger' }); }
+}
+
+// ---------- AI1 / AI2 选择与审核模式 ----------
 export function aiSlotFeedback(slot,message,tone){
   var node=document.querySelector('[data-testid="ai-slot-'+slot+'-feedback"]');
   if(!node) return;
@@ -353,48 +397,21 @@ export async function saveAiReviewMode(){
 }
 
 export async function saveAiSlot(slot){
-  var read=function(suffix){var node=$('aiSlot_'+slot+'_'+suffix);return node?String(node.value||'').trim():'';};
+  var providerNode=$('aiSlot_'+slot+'_provider'), modelNode=$('aiSlot_'+slot+'_model');
   var enabledNode=$('aiSlot_'+slot+'_enabled');
-  var body={
-    display_name:read('displayName'),
-    base_url:read('baseUrl'),
-    model:read('model'),
-    enabled:!!(enabledNode&&enabledNode.checked),
-  };
-  var timeoutRaw=read('timeout');
-  if(timeoutRaw) body.timeout_seconds=Number(timeoutRaw);
-  var apiKey=read('apiKey');
-  if(apiKey) body.api_key=apiKey;
-  var answer=await confirmDialog({
-    kicker:'设置 · AI 槽位 '+slot,
-    title:'保存槽位 '+slot+' 的接口配置？',
-    bullets:['API Key 只写入后端安全存储，页面和日志不回显明文。','留空 Key 表示保持现有 Key；要清空请用“清除 Key”。','两个槽位完全独立，保存本槽位不会改动另一个。'],
-    confirmText:'保存槽位',
-  });
+  var body={provider_id:providerNode?providerNode.value:'',model:modelNode?modelNode.value:'',enabled:!!(enabledNode&&enabledNode.checked)};
+  if(!body.provider_id||!body.model){ aiSlotFeedback(slot,'请先选择已保存的提供商和模型。','danger'); return; }
+  var answer=await confirmDialog({title:'保存 '+slot.toUpperCase()+' 设置？',detail:'该 AI 将使用所选提供商的接口配置与模型。',confirmText:'保存设置'});
   if(!answer.approved) return;
+  var button=document.querySelector('[data-testid="ai-slot-'+slot+'-save"]');
+  if(button) button.disabled=true;
+  aiSlotFeedback(slot,'正在保存…');
   try{
-    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
-    await loadSettings(true);
-    toast('槽位 '+slot+' 已保存（页面仅显示掩码状态）。');
-  }catch(e){
-    aiSlotFeedback(slot,'保存失败：'+((e&&e.message)||e),'danger');
-    toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });
-  }
-}
-
-export async function clearAiSlotKey(slot){
-  var answer=await confirmDialog({
-    kicker:'设置 · 清除 Key',
-    title:'清除槽位 '+slot+' 的 API Key？',
-    bullets:['清除后该槽位变为未配置：单AI模式 fail-closed，双AI模式整体阻断。','地址、模型、开关与超时保持不变。','清除立即生效，无需重启扫描。'],
-    confirmText:'清除 Key',
-  });
-  if(!answer.approved) return;
-  try{
-    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',{clear_api_key:true});
-    await loadSettings(true);
-    toast('已清除槽位 '+slot+' 的 API Key。');
-  }catch(e){toast('清除失败：'+((e&&e.message)||e), { tone: 'danger' });}
+    var review=await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
+    applyAiReviewSettings(review,slot);
+    aiSlotFeedback(slot,slot.toUpperCase()+' 设置已保存。','ok');
+  }catch(e){ aiSlotFeedback(slot,'保存失败：'+e.message,'danger'); }
+  finally{ if(button&&button.isConnected) button.disabled=false; }
 }
 
 export async function testAiSlot(slot){
