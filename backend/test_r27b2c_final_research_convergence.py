@@ -188,11 +188,13 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
     if not all(name in ast.unparse(_function(dr, "_collect_typed_events") or dr)
                for name in ("adaptive_run_facts", "paper_job_run_facts",
                             "risk_candidate_facts", "selection_candidate_facts",
-                            "experiment_evaluation_facts", "news_fact_projections")):
+                            "experiment_evaluation_facts", "news_fact_projections",
+                            "earnings_event_projections")):
         issues.append("FINAL-G05/G06/G07: a migrated owner reader is no longer wired")
     if not all(name in ast.unparse(_function(dr, "_collect_typed_events") or dr)
                for name in ("ai_research_news_adapter", "ai_research_strategy_adapter",
-                            "ai_research_runtime_adapter")):
+                            "ai_research_runtime_adapter",
+                            "ai_research_earnings_adapter")):
         issues.append("FINAL-G05/G06/G07: a required owner adapter is no longer used")
 
     if _function(dr, "_save_run") is not None or "_save_run" in _calls(dr):
@@ -272,9 +274,10 @@ class FinalResearchConvergenceGuardTests(unittest.TestCase):
     def test_FINAL_G01_through_G11_baseline_is_green(self):
         self.assertEqual([], architecture_violations(_load_sources()))
 
-    def test_news_strategy_runtime_adapters_have_real_production_callers(self):
+    def test_news_disclosure_strategy_runtime_adapters_have_real_production_callers(self):
         source = _load_sources()["backend/deepseek_research.py"]
         self.assertIn("ai_research_news_adapter", source)
+        self.assertIn("ai_research_earnings_adapter", source)
         self.assertIn("ai_research_strategy_adapter", source)
         self.assertIn("ai_research_runtime_adapter", source)
 

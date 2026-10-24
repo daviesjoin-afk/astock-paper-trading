@@ -531,14 +531,44 @@ def _fact_payload(projection):
     }
 
 
-def _event_from_owner(projection, adapter, context, source):
+def _event_from_owner(projection, adapter, context, source, payload=None):
     ref = adapter(projection)
     if ref.as_of > context.asof_day:
         raise ValueError("owner fact is later than the shared research as-of day")
     return ARC.InformationEvent(
         as_of=context.asof_day, source=source, evidence_ref=ref,
-        payload=_fact_payload(projection),
+        payload=_fact_payload(projection) if payload is None else payload,
     )
+
+
+def _disclosure_payload(projection):
+    """公告事实喂给模型的字段集（核验结论仍只留在 evidence ref 里）。
+
+    刻意**不**用通用的 ``_fact_payload``：``EarningsEventProjection.as_dict()`` 里的
+    ``verification_status`` 不在通用排除表里，直接透传会把核验结论混进"事实"，
+    而那正是这个模块一直在防的事。这里逐字段列出"公告说了什么"。
+    """
+    return {
+        "kind": projection.kind,
+        "code": projection.code,
+        "title": projection.title,
+        "report_period": projection.report_period,
+        "is_correction": projection.is_correction,
+        "source_name": projection.source_name,
+        "published_at": projection.published_at,
+        "availability_day": projection.availability_day,
+        "net_profit_wan": {
+            "low": None if projection.low_wan is None else str(projection.low_wan),
+            "high": None if projection.high_wan is None else str(projection.high_wan),
+            "unit": projection.unit,
+        },
+        "yoy_pct": {
+            "low": None if projection.yoy_low_pct is None else str(projection.yoy_low_pct),
+            "high": None if projection.yoy_high_pct is None else str(projection.yoy_high_pct),
+        },
+        "superseded_by": projection.superseded_by,
+        "body_sha256": projection.body_sha256,
+    }
 
 
 def _pnl_events(paper, context):
@@ -628,15 +658,34 @@ def _collect_typed_events(purpose, adaptive_conn, paper_db_path, context):
         )
 
     if purpose == "event_evidence":
+        import ai_research_earnings_adapter as EAA
         import ai_research_news_adapter as NEA
+        import earnings_disclosure_ledger as EDL
+        import earnings_disclosure_store as EDS
         projections = news_learning.news_fact_projections(
             adaptive_conn, as_of=context.asof_day, limit=50,
         )
-        return tuple(
+        events = [
             _event_from_owner(fact, NEA.evidence_ref_from_news_projection,
                               context, "news_owner.typed_fact")
             for fact in projections
+        ]
+        # 业绩公告事实住在自己的库里。库还没建（从未采集过）**不是错误** ——
+        # 研究必须在采集上线之前也能跑，缺事实就是"当时没有证据"，不是"核验失败"。
+        try:
+            with EDS.connect_readonly() as disclosure_conn:
+                disclosures = EDL.earnings_event_projections(
+                    disclosure_conn, as_of=context.asof_day, limit=50,
+                )
+        except EDL.EarningsLedgerError:
+            disclosures = ()
+        events.extend(
+            _event_from_owner(fact, EAA.evidence_ref_from_earnings_projection,
+                              context, "disclosure_owner.typed_fact",
+                              payload=_disclosure_payload(fact))
+            for fact in disclosures
         )
+        return tuple(events)
     raise ValueError("unsupported_advisor_purpose")
 
 
@@ -656,7 +705,11 @@ def _compatibility_evidence(purpose, events, context):
             "incident_triage": ["killed adaptive runs and unidentifiable job attempts unavailable",
                                 "business order rejections are not incident evidence"],
             "overfit_watch": ["adaptive rewards, alpha candidates, parameter versions, and NAV unavailable"],
-            "event_evidence": ["news owner facts only; no position-code fallback or live fetch"],
+            "event_evidence": [
+                "news and earnings-disclosure owner facts only",
+                "disclosure facts carry attributable net profit and its year-on-year range only",
+                "no position-code fallback or live fetch",
+            ],
             "pnl_attribution": ["historical cycle membership and historical market gaps remain open"],
         }.get(purpose, []),
     }
@@ -701,7 +754,7 @@ _QUESTIONS = {
     "candidate_challenge": "基于 strategy owner facts 做反方审查；不得重算资格、晋升、生命周期或应用门禁。",
     "incident_triage": "基于 runtime owner facts 研究可能事故；不得把业务拒单当事故，也不得推断严重度为 owner 事实。",
     "overfit_watch": "基于 experiment owner evaluation facts 做反方审查；缺失回报或 NAV 不得补零。",
-    "event_evidence": "基于 news owner facts 审阅已知事件；published_at 只作描述，不得用于 PIT。",
+    "event_evidence": "基于 news 与业绩公告 owner facts 审阅已知事件；published_at 只作描述，不得用于 PIT。",
 }
 
 
