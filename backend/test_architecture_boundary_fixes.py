@@ -79,6 +79,11 @@ class DashboardBoundaryTests(unittest.TestCase):
             self.assertIn("runtime_status", namespace["schedule_status"]())
 
     def test_real_slot_releases_lease_and_retry_does_not_rerun_trading(self):
+        # 业务日必须**固定**：`run_slot` 在非交易日会返回 skipped，而这条用例断言的是
+        # 租约与重复执行的幂等语义。用"今天"会让它在周末/法定假日必红（2026-10-24 是周六，
+        # 之前就是这样被误报成回归的）。2026-10-22 是已完成的交易日。
+        trading_day = "2026-10-22"
+
         def refresh(**kwargs):
             self.assertIsNone(P._active_lease_context())
             with P._db_readonly() as conn:
@@ -88,8 +93,10 @@ class DashboardBoundaryTests(unittest.TestCase):
         with mock.patch.object(P, "monitor_risk", return_value={"slot": "risk"}) as trade, \
                 mock.patch.object(P, "request_risk_snapshot_refresh", side_effect=refresh) as snapshot, \
                 mock.patch.object(P.RC, "load_snapshot", return_value=None):
-            first = P.run_slot("risk", force=True, risk_snapshot_background=False)
-            retry = P.run_slot("risk", risk_snapshot_background=False)
+            first = P.run_slot("risk", asof_date=trading_day, force=True,
+                               risk_snapshot_background=False)
+            retry = P.run_slot("risk", asof_date=trading_day,
+                               risk_snapshot_background=False)
         self.assertEqual(first["status"], "completed")
         self.assertEqual(retry["status"], "already_done")
         self.assertEqual(Runner._result_exit_code(first), 1)
