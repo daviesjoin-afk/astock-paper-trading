@@ -227,9 +227,12 @@ class IngestionTest(unittest.TestCase):
         bodies = {"AN-1": FORECAST_BODY}
         self._ingest(FakeSource(rows=rows, bodies=bodies))
         later = OBSERVED + dt.timedelta(hours=6)
-        summary = self._ingest(FakeSource(rows=rows, bodies=bodies), observed_at=later)
-        self.assertEqual(1, summary["counters"]["duplicates"])
+        second = FakeSource(rows=rows, bodies=bodies)
+        summary = self._ingest(second, observed_at=later)
+        # 已知公告在**花正文预算之前**就被跳过：既不重复抓正文，也不推进 first_seen_at。
+        self.assertEqual(1, summary["counters"]["already_recorded"])
         self.assertEqual(0, summary["counters"]["recorded"])
+        self.assertEqual([], second.body_calls)
         (projection,) = LEDGER.earnings_event_projections(self.conn, as_of="2026-07-16")
         self.assertEqual("2026-07-16T10:00:00+08:00", projection.first_seen_at)
 
@@ -241,6 +244,46 @@ class IngestionTest(unittest.TestCase):
         self.assertTrue(summary["truncated_bodies"])
         self.assertEqual(2, summary["bodies_fetched"])
         self.assertEqual(2, summary["counters"]["recorded"])
+
+    def test_budget_makes_progress_across_runs_instead_of_refetching(self):
+        # 评审发现 P2 的复现：候选数超过单轮正文预算时，每轮都必须向前推进，
+        # 而不是把预算重新花在最新那几条已落库的公告上。
+        rows = [_row("AN-%d" % index, "某公司:2026年半年度业绩预告")
+                for index in range(5)]
+        bodies = {row["art_code"]: FORECAST_BODY for row in rows}
+
+        first = FakeSource(rows=rows, bodies=bodies)
+        self._ingest(first, max_bodies=2)
+        self.assertEqual(["AN-0", "AN-1"], first.body_calls)
+
+        second = FakeSource(rows=rows, bodies=bodies)
+        summary = self._ingest(second, max_bodies=2)
+        # 第二轮不再重复抓已经落库的那两条，而是继续抓 AN-2 / AN-3。
+        self.assertEqual(["AN-2", "AN-3"], second.body_calls)
+        self.assertEqual(2, summary["counters"]["already_recorded"])
+        self.assertEqual(2, summary["counters"]["recorded"])
+
+        third = FakeSource(rows=rows, bodies=bodies)
+        summary = self._ingest(third, max_bodies=2)
+        self.assertEqual(["AN-4"], third.body_calls)
+        self.assertEqual(4, summary["counters"]["already_recorded"])
+        self.assertEqual(1, summary["counters"]["recorded"])
+        self.assertEqual(5, len(LEDGER.earnings_event_projections(
+            self.conn, as_of="2026-07-16")))
+
+    def test_already_recorded_announcements_do_not_consume_the_budget(self):
+        rows = [_row("AN-OLD-%d" % index, "某公司:2026年半年度业绩预告")
+                for index in range(3)]
+        bodies = {row["art_code"]: FORECAST_BODY for row in rows}
+        self._ingest(FakeSource(rows=rows, bodies=bodies))
+
+        fresh = [_row("AN-NEW", "某公司:2026年半年度业绩预告")] + rows
+        source = FakeSource(rows=fresh, bodies={**bodies, "AN-NEW": FORECAST_BODY})
+        summary = self._ingest(source, max_bodies=1)
+        # 预算 1 条，但 3 条已知不占预算，所以新公告这一轮就能落库。
+        self.assertEqual(1, summary["counters"]["recorded"])
+        self.assertEqual(3, summary["counters"]["already_recorded"])
+        self.assertEqual(["AN-NEW"], source.body_calls)
 
     def test_list_outage_raises_instead_of_looking_like_an_empty_day(self):
         with self.assertRaises(ING.IngestionError):

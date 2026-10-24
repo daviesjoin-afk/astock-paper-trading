@@ -79,6 +79,7 @@ __all__ = (
     "ClaimCheckRecord",
     "EarningsEventProjection",
     "ensure_schema",
+    "known_announcement_ids",
     "owner_instant",
     "record_announcement",
     "record_claim_check",
@@ -317,6 +318,31 @@ def _claim_fingerprint(claim: EDF.EarningsClaim) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def known_announcement_ids(conn: sqlite3.Connection, announcement_ids: Any) -> frozenset[str]:
+    """这些公告编号里，哪些**已经落过库**。
+
+    给摄取侧做"先跳过已知、再用正文预算"的排序判断：否则窗口内候选数超过单轮正文预算时，
+    每一轮都会把预算花在最新那几条已落库的公告上（重复抓同一批正文），更旧的公告直到滚出
+    窗口都轮不到。
+
+    只回答"有没有这一行"，不回答"内容有没有变" —— 内容变更的检测仍然由
+    :func:`record_announcement` 的 ``announcement_content_conflict`` 负责（它只在真的
+    重新抓取时才会被触发，见摄取侧对该取舍的说明）。
+    """
+    wanted = [str(item).strip() for item in (announcement_ids or ())]
+    wanted = [item for item in wanted if item]
+    if not wanted:
+        return frozenset()
+    placeholders = ",".join("?" for _ in wanted)
+    rows = _select_dicts(
+        conn,
+        f"SELECT announcement_id FROM {EARNINGS_EVENTS_TABLE}"
+        f" WHERE announcement_id IN ({placeholders})",
+        tuple(wanted),
+    )
+    return frozenset(str(row["announcement_id"]) for row in rows)
 
 
 def record_announcement(

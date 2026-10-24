@@ -10,7 +10,7 @@
     → owner ledger 复算 + 落库（含 first_seen_at = 本轮观测时刻）
 ```
 
-──────────────────────── 三条刻意的边界 ────────────────────────
+──────────────────────── 四条刻意的边界 ────────────────────────
 
 1. **拿不到原文就不落库。** 原文取失败（超时 / 正文为空）时**不写行**，只计数，
    下一轮会自动重试。理由：ledger 对同一 ``announcement_id`` 的内容冲突是 fail closed
@@ -20,6 +20,13 @@
 3. **观测时刻由本模块给出，且只有一次。** 一行的 ``first_seen_at`` 是本轮**开始抓取**
    的时刻 —— 它不是来源说的发布时间，也不是逐行的本地时间。PIT 只要有一点含糊，
    历史可见性就会漂移。
+4. **已知公告先跳过，再花正文预算。** 顺序反了就会出事：窗口内候选数超过单轮正文预算时，
+   每一轮都会把预算重新花在最新那几条**已落库**的公告上（重复抓同一批正文），更旧的公告
+   直到滚出窗口都轮不到。因此先用 ``known_announcement_ids`` 剔除已知，再把预算给新的。
+   代价：已经落库的公告不会被每轮重新抓取，因此"来源事后悄悄改了同一条公告"不会被发现
+   （内容冲突检测只在真的重新抓取时才有机会触发）。这是一次**有意的取舍**——用这一点
+   换"整个窗口都能被覆盖"；若之后需要重校验，应当做成单独的周期性任务，而不是让每轮
+   摄取原地打转。
 
 本模块不 import 任何 research / 研究层模块：它是 owner 侧的摄取 writer，方向单向。
 """
@@ -237,6 +244,7 @@ def ingest_window(
         "candidates": 0,
         "recorded": 0,
         "duplicates": 0,
+        "already_recorded": 0,
         "unparsable": 0,
         "conflicts": 0,
         "ambiguous_code": 0,
@@ -244,8 +252,11 @@ def ingest_window(
         "body_failures": 0,
         "errors": 0,
     }
-    truncated_bodies = False
-    bodies = 0
+
+    # 先只做**不需要正文**的判定，把候选收齐，再一次性问库"哪些已经落过"。
+    # 顺序很重要：如果先按顺序抓正文再判断，窗口内候选数超过单轮正文预算时，每轮都会把
+    # 预算重新花在最新那几条已落库的公告上，更旧的公告直到滚出窗口都轮不到（评审发现 P2）。
+    candidates: list[tuple[dict, Any, str, str]] = []
     for row in rows:
         title = row.get("title") or row.get("title_ch")
         meta = EDF.classify_announcement(title)
@@ -261,6 +272,17 @@ def ingest_window(
         art_code = str(row.get("art_code") or "").strip()
         if not art_code:
             counters["missing_id"] += 1
+            continue
+        candidates.append((row, title, code, art_code))
+
+    known = LEDGER.known_announcement_ids(conn, [item[3] for item in candidates])
+
+    truncated_bodies = False
+    bodies = 0
+    for row, title, code, art_code in candidates:
+        if art_code in known:
+            # 已知且没有理由重新抓：**不消耗正文预算**，让本轮预算花在真正新的公告上。
+            counters["already_recorded"] += 1
             continue
         if bodies >= max(1, int(max_bodies)):
             truncated_bodies = True
