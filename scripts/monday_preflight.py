@@ -41,7 +41,10 @@ def run(now=None):
     PT.init_db()
     with PT._db() as conn:
         cycle = PT._active_cycle(conn)
-        enabled = tuple(cycle.get("enabled_strategies") or ())
+        # _active_cycle 返回账本原始行：enabled_strategies 是 JSON 文本而不是列表。
+        raw_enabled = cycle.get("enabled_strategies")
+        enabled = (tuple(PT._loads(raw_enabled, []) or ())
+                   if isinstance(raw_enabled, str) else tuple(raw_enabled or ()))
         _check(rows, "cycle_window_status", cycle["status"] in ("paused", "running"),
                f"当前周期 {cycle['id']} 状态 {cycle['status']}")
         _check(rows, "cycle_three_sleeves", enabled == ROSTER.formal_strategy_ids(),
