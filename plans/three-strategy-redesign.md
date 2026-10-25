@@ -424,3 +424,23 @@ sqlite3 /root/codex/data_cache/paper_trading.sqlite3 < /root/astock-backups/thre
 - 2026-10-25 23:2x：用户澄清"现金是总现金池 30 万，三策略按比例区分，比例是上限"。
   代码与线上随之修正：`_create_cycle` 按名册比例归属资本（`_cycle_capital_shares`），
   周期 14（三等份、无成交）归档，重建的周期 15 归属为 6 万 / 15 万 / 9 万。
+
+### 12.7 展示名（2026-10-25 23:5x）
+
+按"用激进程度取名、正常一点"的要求，三个正式策略的展示名改为：
+
+| id | 旧展示名 | 新展示名 |
+|---|---|---|
+| `tq_breakout` | 短线日内做T | **激进做T** |
+| `trend_pullback` | 趋势波段优选 | **稳健波段** |
+| `reported_profit_breakout` | 三日策略 | **保守防守** |
+
+两个已退出策略保留原名（历史订单继续显示当时的名字）。
+
+落点（注册表名字属于不可变版本快照，改名要建新版本，所以展示层统一走名册）：
+
+- `strategy_roster.ROLES[*].name` + 新增 `display_name()`；
+- `ACCOUNT_SPECS` / `RISK_PROFILES` / `STYLE_PROFILES` / `OPENING_EVENT_POLICIES` 的 `name`；
+- `strategy_center()` 与 `adaptive_engine` 的奖励/证据展示改用 `ROSTER.display_name()`；
+- 前端 `src/features/paper.js`、`src/features/adaptive.js` 的 id→名字映射，以及 `dist/app.js` 产物；
+- 线上：周期 15 三个账户的 `paper_accounts.name` 已更新并写审计行。

@@ -400,7 +400,7 @@ class SelectionProvenanceTests(_IsolatedStudy):
         self.assertEqual(after["strategy_version"], before["strategy_version"])
         group = next(g for g in PS.latest(trade_date=DAY)["strategies"]
                      if g["strategy_id"] == "tq_breakout")
-        self.assertEqual(group["strategy_name"], "短线日内做T")
+        self.assertEqual(group["strategy_name"], "激进做T")
         self.assertEqual(group["current_strategy_name"], "完全不同的名字")
 
     def test_SP18_pause_archive_does_not_mutate_historical_stamp(self):

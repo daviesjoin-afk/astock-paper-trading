@@ -886,7 +886,10 @@ def strategy_center():
         )
         rows.append({
             "id": account_id,
-            "name": registered.name if registered else spec["name"],
+            # 注册表名字属于不可变版本快照（改名要建新版本），展示名统一从名册取，
+            # 否则仪表盘叫"激进做T"、策略说明页还叫"短线日内做T"。
+            "name": ROSTER.display_name(
+                account_id, fallback=registered.name if registered else spec["name"]),
             "strategy_status": registered.status if registered else "unregistered",
             "supports_new_cycle": bool(registered and registered.supports_new_cycle),
             "roster_role": role.role if role else None,

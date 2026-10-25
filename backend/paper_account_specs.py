@@ -76,7 +76,7 @@ STYLE_PROFILES = {
     "strong": {"name": "强势接力", "source_strategy": "one_to_two"},
     "pullback": {"name": "趋势回踩", "source_strategy": "bottom_reversal"},
     "sector": {"name": "板块轮动", "source_strategy": "sentiment_pioneer"},
-    "quality": {"name": "三日策略", "source_strategy": NEW_STRATEGY_ID},
+    "quality": {"name": "保守防守", "source_strategy": NEW_STRATEGY_ID},
     "main_force": {"name": "超强主力股", "source_strategy": MAIN_FORCE_STRATEGY_ID},
 }
 
@@ -91,13 +91,13 @@ RISK_PROFILES = {
     # 单账户最坏并发止损 = 3 × 1.2% = 3.6% NAV，daily_loss/drawdown 同步
     # 放宽以避免集中仓位在普通波动日频繁触发冷却。
     "breakout": {
-        "name": "接力快进快出", "max_weight": 0.32, "max_exposure": 0.95,
+        "name": "激进日内风控", "max_weight": 0.32, "max_exposure": 0.95,
         "max_industry": 0.42, "single_risk": 0.012,
         "daily_loss": 0.035, "drawdown": 0.11,
         "cooldown_days": 2, "min_cost_edge": 0.006,
     },
     "trend": {
-        "name": "趋势集中持有", "max_weight": 0.34, "max_exposure": 0.95,
+        "name": "稳健波段风控", "max_weight": 0.34, "max_exposure": 0.95,
         "max_industry": 0.45, "single_risk": 0.012,
         "daily_loss": 0.040, "drawdown": 0.13,
         "cooldown_days": 3, "min_cost_edge": 0.004,
@@ -118,7 +118,7 @@ RISK_PROFILES = {
         # max_exposure / daily_loss / drawdown 不动：它们是**全池**口径
         # （drawdown 还会写全池冷却），不是单策略止损，改它们等于给所有策略
         # 加同一个熔断；单策略止损目前没有任何实现。
-        "name": "三日策略独立风控", "max_weight": 0.12, "max_exposure": 0.90,
+        "name": "保守质量风控", "max_weight": 0.12, "max_exposure": 0.90,
         "max_industry": 0.38, "single_risk": 0.006,
         "daily_loss": 0.035, "drawdown": 0.11,
         "cooldown_days": 3, "min_cost_edge": 0.005,
@@ -138,7 +138,7 @@ RISK_PROFILES = {
 # ---------------------------------------------------------------------------
 ACCOUNT_SPECS = {
     "tq_breakout": {
-        "name": "短线日内做T",
+        "name": "激进做T",
         "mode": "intraday_t",
         "source_strategy": "one_to_two",
         "risk_profile": "breakout",
@@ -169,7 +169,7 @@ ACCOUNT_SPECS = {
         "gap_q2": (-0.03, 0.07),
     },
     "trend_pullback": {
-        "name": "趋势波段优选",
+        "name": "稳健波段",
         "mode": "swing",
         "source_strategy": "bottom_reversal",
         "risk_profile": "trend",
@@ -223,7 +223,7 @@ ACCOUNT_SPECS = {
         "gap_q2": (-0.025, 0.06),
     },
     NEW_STRATEGY_ID: {
-        "name": "三日策略",
+        "name": "保守防守",
         "mode": "swing",
         "source_strategy": NEW_STRATEGY_ID,
         "risk_profile": "core_quality",

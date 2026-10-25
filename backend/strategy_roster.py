@@ -68,7 +68,7 @@ ROLES = (
     StrategyRole(
         strategy_id="tq_breakout",
         role=AGGRESSIVE,
-        name="激进 · AI 增强做 T",
+        name="激进做T",
         objective="用已有底仓的日内波动降低持仓成本；底仓涨跌另计",
         budget_share=0.20,
         within_budget_exposure=0.70,
@@ -84,7 +84,7 @@ ROLES = (
     StrategyRole(
         strategy_id="trend_pullback",
         role=BALANCED,
-        name="稳健 · 趋势波段",
+        name="稳健波段",
         objective="吃持续数日至数周的趋势；趋势确认后等回踩，不因单日涨幅第一而换股",
         budget_share=0.50,
         within_budget_exposure=0.65,
@@ -100,7 +100,7 @@ ROLES = (
     StrategyRole(
         strategy_id="reported_profit_breakout",
         role=CONSERVATIVE,
-        name="保守 · 质量防守",
+        name="保守防守",
         objective="少犯错、低换手、多留现金；质量与估值先承担风险过滤职责",
         budget_share=0.30,
         within_budget_exposure=0.35,
@@ -167,6 +167,20 @@ def exit_only_ids():
 def role_for(strategy_id):
     """该 id 的正式职责；不在名册内（含用户策略）返回 ``None``。"""
     return _ROLE_BY_ID.get(str(strategy_id or ""))
+
+
+def display_name(strategy_id, fallback=None):
+    """展示名：正式策略用名册里的名字，其余用调用方给的兜底值。
+
+    注册表里的名字属于不可变版本快照（改名要建新版本），所以展示层统一从名册
+    取名字，避免"仪表盘叫激进做T、自进化页却还叫短线日内做T"。
+    """
+    role = role_for(strategy_id)
+    if role is not None:
+        return role.name
+    if fallback:
+        return str(fallback)
+    return str(strategy_id or "")
 
 
 def exit_decision(strategy_id):
@@ -362,5 +376,5 @@ __all__ = [
     "StrategyRole", "ExitDecision", "ROLES", "EXIT_ONLY", "DELIBERATE_REASONS",
     "formal_roles", "formal_strategy_ids", "exit_only_ids", "role_for", "exit_decision",
     "is_formal", "is_exit_only", "entry_block_reason", "budget_shares", "pool_budget_example",
-    "allocation_declaration", "initial_params", "factor_policy", "spec_drift",
+    "allocation_declaration", "initial_params", "factor_policy", "spec_drift", "display_name",
 ]

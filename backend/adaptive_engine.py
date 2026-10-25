@@ -126,6 +126,20 @@ DISCLOSURE_MAX_CODES = 150
 DISCLOSURE_CACHE_TTL_SECONDS = 6 * 60 * 60
 DISCLOSURE_REFRESH_AFTER = dt.time(15, 15)
 ACCOUNT_LABELS = strategy_labels()
+
+
+def _display_name(account_id):
+    """展示名：三个正式策略用名册里的名字，其余回落到注册表标签。
+
+    注册表名字属于不可变版本快照，改名要建新版本；展示层因此统一走这里，
+    免得同一策略在仪表盘和自进化页显示成两个名字。
+    """
+    import strategy_roster as ROSTER
+
+    return ROSTER.display_name(
+        account_id, fallback=ACCOUNT_LABELS.get(account_id, account_id))
+
+
 REGIME_LABELS = {
     "momentum": "资金共振·动量扩张",
     "rotation": "板块轮动·结构分化",
@@ -1956,7 +1970,7 @@ def _bandit_decision(conn, profile, profile_id):
                 "mean_reward": round(statistics.mean([row["raw_reward"] for row in subset]), 3) if subset else None,
             })
         evidence[account_id] = {
-            "name": ACCOUNT_LABELS[account_id],
+            "name": _display_name(account_id),
             "samples": len(global_arm),
             "regime_samples": len(local_arm),
             "posterior_mean": round(posterior_mean, 4),
@@ -3806,7 +3820,7 @@ def _overview_uncached():
             subset = [row for row in rewards if row["account_id"] == account_id and row["horizon"] == horizon]
             horizon_summary.append({
                 "account_id": account_id,
-                "name": ACCOUNT_LABELS[account_id],
+                "name": _display_name(account_id),
                 "horizon": horizon,
                 "samples": len(subset),
                 "mean_return_pct": round(statistics.mean([row["strategy_return_pct"] for row in subset]), 3) if subset else None,

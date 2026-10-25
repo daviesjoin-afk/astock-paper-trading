@@ -74,13 +74,13 @@ class StrategyVersion:
 
 
 BUILTIN_STRATEGIES = (
-    StrategySpec("tq_breakout", "短线日内做T", "paper", True,
+    StrategySpec("tq_breakout", "激进做T", "paper", True,
                  implementation_key="tq_breakout"),
-    StrategySpec("trend_pullback", "趋势波段优选", "paper", True,
+    StrategySpec("trend_pullback", "稳健波段", "paper", True,
                  implementation_key="trend_pullback"),
     StrategySpec("sector_rotation", "板块轮动先锋", "paper", True,
                  implementation_key="sector_rotation"),
-    StrategySpec("reported_profit_breakout", "三日策略", "paper", True,
+    StrategySpec("reported_profit_breakout", "保守防守", "paper", True,
                  implementation_key="reported_profit_breakout"),
     StrategySpec("main_force_top10", "超强主力股", "paper", True,
                  implementation_key="main_force_top10"),
