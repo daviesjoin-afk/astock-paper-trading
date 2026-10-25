@@ -187,7 +187,21 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
         self.conn.execute(
             """CREATE TABLE paper_audit(
                    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, event TEXT,
-                   detail TEXT, created_at TEXT)""")
+                   detail TEXT, created_at TEXT, strategy_id TEXT,
+                   strategy_version INTEGER, strategy_checksum TEXT)""")
+        # 触发器：审计行的策略版本戳必须精确存在（与生产 schema 同口径）。
+        self.conn.execute(
+            """CREATE TRIGGER trg_paper_audit_strategy_stamp_insert
+               BEFORE INSERT ON paper_audit
+               WHEN NEW.account_id IS NOT NULL
+                AND (NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
+                     OR NEW.strategy_checksum IS NULL
+                     OR NOT EXISTS (
+                        SELECT 1 FROM paper_strategy_versions v
+                        WHERE v.strategy_id=NEW.strategy_id
+                          AND v.version=NEW.strategy_version
+                          AND v.checksum=NEW.strategy_checksum))
+               BEGIN SELECT RAISE(ABORT, 'invalid strategy version stamp'); END""")
         self.conn.execute(
             "INSERT INTO paper_cycles VALUES(?,?,?,?)",
             (1, "running", 300000.0, '["tq_breakout","trend_pullback","sector_rotation",'
@@ -287,8 +301,13 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
             self.assertEqual(len(rows), 3)
             self.assertIn("+08:00", rows[0]["created_at"])
             audits = conn.execute(
-                "SELECT COUNT(*) FROM paper_audit WHERE event='roster_budget_declared'").fetchone()[0]
-            self.assertEqual(audits, 3)
+                "SELECT strategy_id,strategy_version,strategy_checksum FROM paper_audit"
+                " WHERE event='roster_budget_declared'").fetchall()
+            self.assertEqual(len(audits), 3)
+            for row in audits:
+                self.assertEqual(row["strategy_id"], row["strategy_id"])
+                self.assertEqual(row["strategy_version"], 1)
+                self.assertTrue(row["strategy_checksum"])
         finally:
             conn.close()
         again = self.module.write_budget_weights(self.path, effective_date="2026-10-26")

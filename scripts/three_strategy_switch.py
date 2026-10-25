@@ -300,12 +300,38 @@ def write_budget_weights(path, *, effective_date=None):
     conn = sqlite3.connect(str(Path(path).resolve()), timeout=15)
     conn.row_factory = sqlite3.Row
     steps = []
+    def _audit(strategy_id, detail, version, checksum):
+        """``paper_audit`` 有"策略版本戳"触发器：必须写该账户的精确版本与校验和。
+
+        触发器要求 ``strategy_id = account_id`` 且该 (id,version,checksum) 在
+        ``paper_strategy_versions`` 里存在；拿不到精确版本时宁可不写审计行，
+        也不伪造一个 (None,None,None) 戳去撞触发器。
+        """
+        if "strategy_id" not in audit_columns:
+            conn.execute(
+                "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
+                (strategy_id, "roster_budget_declared", detail, stamp))
+            return True
+        if version is None or checksum is None:
+            return False
+        conn.execute(
+            "INSERT INTO paper_audit(account_id,event,detail,created_at,"
+            "strategy_id,strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?,?)",
+            (strategy_id, "roster_budget_declared", detail, stamp,
+             strategy_id, int(version), str(checksum)))
+        return True
+
+    audit_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_audit)")}
     try:
         conn.execute("BEGIN IMMEDIATE")
         for strategy_id in ROSTER.formal_strategy_ids():
             row = conn.execute(
-                "SELECT id,cycle_id,params,version,style FROM paper_accounts WHERE id=?",
-                (strategy_id,)).fetchone()
+                "SELECT a.id,a.cycle_id,a.params,a.version,a.style,"
+                "       d.current_version AS strategy_version,"
+                "       d.current_checksum AS strategy_checksum"
+                "  FROM paper_accounts a"
+                "  LEFT JOIN strategy_definitions d ON d.id=a.id"
+                " WHERE a.id=?", (strategy_id,)).fetchone()
             if row is None:
                 raise SystemExit(f"账本缺少账户 {strategy_id}，已回滚未做修改")
             params = json.loads(row["params"] or "{}")
@@ -325,15 +351,16 @@ def write_budget_weights(path, *, effective_date=None):
                 "reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
                 (row["cycle_id"], strategy_id, row["version"], row["style"], payload,
                  BUDGET_REASON, day, stamp))
-            conn.execute(
-                "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-                (strategy_id, "roster_budget_declared",
-                 json.dumps({"weight_pct": target["weight_pct"], "effective_date": day,
-                             "previous": previous, "roster": ROSTER.ROSTER_VERSION},
-                            ensure_ascii=False), stamp))
+            audited = _audit(
+                strategy_id,
+                json.dumps({"weight_pct": target["weight_pct"], "effective_date": day,
+                            "previous": previous, "roster": ROSTER.ROSTER_VERSION},
+                           ensure_ascii=False),
+                row["strategy_version"], row["strategy_checksum"])
             steps.append({"strategy_id": strategy_id, "result": "declared",
                           "weight_pct": target["weight_pct"],
-                          "previous_weight_pct": (previous or {}).get("weight_pct")})
+                          "previous_weight_pct": (previous or {}).get("weight_pct"),
+                          "audit_row": audited})
         conn.commit()
     except BaseException:
         conn.rollback()
