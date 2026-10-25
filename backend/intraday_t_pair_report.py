@@ -200,7 +200,8 @@ def summarize(sell_orders, observations, rebuy_orders, closes=None):
         rebought_qty = spread["paired_qty"] if spread else 0.0
         unrebought_qty = max(0.0, qty - rebought_qty)
         code = str(observation.get("code") or sell.get("code") or "")
-        close = closes.get(code)
+        sell_day = _day_of(sell.get("executed_at")) or _day_of(observation.get("observed_at"))
+        close = _close_for(closes, code, sell_day)
         close_price = _number((close or {}).get("price"))
         opportunity = None
         if unrebought_qty > 0 and sell_price is not None and close_price is not None:
@@ -256,52 +257,79 @@ def _sum(values):
     return round(sum(numbers), 2)
 
 
-def _kline_close(code, trade_date):
-    """只读日线缓存里该股当天的收盘价；没有当天就用之前最近一天，取不到返回 None。"""
-    path = Path(dfc.kline_cache_path(str(code)))
-    if not path.is_file():
+def _day_of(value):
+    moment = _time(value)
+    return moment.date().isoformat() if moment is not None else None
+
+
+def _close_for(closes, code, day):
+    """按 (代码, 卖出交易日) 取收盘价；只按代码传价的调用方仍兼容。"""
+    if not isinstance(closes, dict):
         return None
+    if day is not None:
+        entry = closes.get((code, day))
+        if entry is not None:
+            return entry
+    return closes.get(code)
+
+
+def _kline_close(code, trade_date):
+    """只读日线缓存里**该交易日**的收盘价。
+
+    不往前找：盘中或当天日线还没落盘时用更早的收盘价冒充"当日收盘"，
+    会把未回补机会成本算成完全不同的数。取不到就返回 None，交给调用方
+    用明确标注来源的观测价回退。
+    """
+    path = Path(dfc.kline_cache_path(str(code)))
+    if not path.is_file() or not trade_date:
+        return None
+    target = str(trade_date)[:10]
     try:
-        rows = list(csv.DictReader(path.read_text(encoding="utf-8-sig", errors="replace").splitlines()))
+        rows = csv.DictReader(path.read_text(encoding="utf-8-sig", errors="replace").splitlines())
     except OSError:
         return None
-    best_date, best_close = None, None
     for row in rows:
         day = str(row.get("date") or row.get("trade_date") or "")[:10]
-        if not day or day > str(trade_date):
+        if day != target:
             continue
         close = _number(row.get("close"))
-        if close is None or close <= 0:
-            continue
-        if best_date is None or day > best_date:
-            best_date, best_close = day, close
-    return best_close
+        return close if close is not None and close > 0 else None
+    return None
 
 
-def _resolve_closes(observations):
-    """给每个出现过收盘价的标的补齐 closes；来源写清楚，缺失就留空。"""
-    closes = {}
-    latest = {}
+def _resolve_closes(observations, sell_orders=()):
+    """按 (代码, 卖出交易日) 解析收盘价：当日收盘缺失才回落到当日最后一条观测价。
+
+    跨日的多笔做 T 必须各用各的当日价，否则今天的收盘会改写过去交易的评价。
+    """
+    days = {}
+    for order in sell_orders or ():
+        code = str(order.get("code") or "")
+        day = _day_of(order.get("executed_at"))
+        if code and day:
+            days.setdefault((code, day), None)
     for row in observations or ():
         code = str(row.get("code") or "")
-        if not code:
-            continue
+        day = _day_of(row.get("observed_at"))
+        if code and day:
+            days.setdefault((code, day), None)
+    last_observation = {}
+    for row in observations or ():
+        code = str(row.get("code") or "")
+        day = _day_of(row.get("observed_at"))
         value = _number(row.get("price"))
-        if value is not None and value > 0:
-            latest[code] = value
-    for code in latest:
-        trade_date = None
-        for row in observations or ():
-            if str(row.get("code") or "") == code:
-                observed = _time(row.get("observed_at"))
-                if observed is not None:
-                    trade_date = max(trade_date, observed.date()) if trade_date else observed.date()
-        close = _kline_close(code, trade_date) if trade_date else None
+        if code and day and value is not None and value > 0:
+            last_observation[(code, day)] = value
+    closes = {}
+    for (code, day) in days:
+        close = _kline_close(code, day)
         if close is not None:
-            closes[code] = {"price": close, "source": "kline_close",
-                            "trade_date": trade_date.isoformat()}
-        else:
-            closes[code] = {"price": latest[code], "source": "last_intraday_observation"}
+            closes[(code, day)] = {"price": close, "source": "kline_close",
+                                   "trade_date": day}
+        elif (code, day) in last_observation:
+            closes[(code, day)] = {"price": last_observation[(code, day)],
+                                   "source": "last_intraday_observation",
+                                   "trade_date": day}
     return closes
 
 
@@ -341,7 +369,7 @@ def build_report(paper_db_path, *, asof=None, closes=None):
         if closes is None:
             # 未回补机会成本原本永远算不出来：唯一的生产调用方从不传 closes。
             # 这里用只读日线缓存补收盘价，取不到才退回落最后一条观测价，并标明来源。
-            closes = _resolve_closes(observations)
+            closes = _resolve_closes(observations, [row for row in orders if row["side"] == "sell"])
         result = summarize([row for row in orders if row["side"] == "sell"],
                            observations,
                            [row for row in orders if row["side"] == "buy"],

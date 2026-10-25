@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 import intraday_t_pair_report as REPORT
 
@@ -132,3 +134,38 @@ class PairReportReadOnlyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PerSellDayCloseTests(unittest.TestCase):
+    """Codex 复审：跨日多笔做 T 必须各用各的当日价，且缺当日收盘不能拿旧价冒充。"""
+
+    def test_two_sell_days_use_their_own_close(self):
+        observations = [
+            {"id": 301, "code": "000001", "observed_at": "2026-10-22 10:05:00", "price": 10.0,
+             "action": "t_sell", "payload": json.dumps({"order_id": 11})},
+            {"id": 302, "code": "000001", "observed_at": "2026-10-23 10:05:00", "price": 11.0,
+             "action": "t_sell", "payload": json.dumps({"order_id": 13})},
+        ]
+        sells = [sell_order(id=11, executed_at="2026-10-22 10:05:00", filled_price=10.0, amount=10000.0),
+                 sell_order(id=13, executed_at="2026-10-23 10:05:00", filled_price=11.0, amount=11000.0,
+                            risk_payload=json.dumps({"cost_amount": 9900.0}))]
+        closes = {("000001", "2026-10-22"): {"price": 10.2, "source": "kline_close"},
+                  ("000001", "2026-10-23"): {"price": 12.5, "source": "kline_close"}}
+        result = REPORT.summarize(sells, observations, [], closes=closes)
+        costs = {row["sell_order_id"]: row["unrebought_opportunity_cost"] for row in result["rows"]}
+        self.assertAlmostEqual(costs[11], 0.2 * 1000, places=6)
+        self.assertAlmostEqual(costs[13], 1.5 * 1000, places=6)
+
+    def test_missing_sell_day_close_does_not_borrow_an_earlier_bar(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        (root / "000001.csv").write_text(
+            "date,open,close\n2026-10-21,9.0,9.5\n", encoding="utf-8")
+        with mock.patch.object(REPORT.dfc, "kline_cache_path",
+                               side_effect=lambda code: str(root / f"{code}.csv")):
+            self.assertIsNone(REPORT._kline_close("000001", "2026-10-23"))
+            self.assertEqual(REPORT._kline_close("000001", "2026-10-21"), 9.5)
+            closes = REPORT._resolve_closes(
+                [{"code": "000001", "observed_at": "2026-10-23 10:05:00", "price": 10.0}], [])
+        self.assertEqual(closes[("000001", "2026-10-23")]["source"], "last_intraday_observation")
+        self.assertAlmostEqual(closes[("000001", "2026-10-23")]["price"], 10.0)
