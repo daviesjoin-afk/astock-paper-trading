@@ -38,7 +38,11 @@ def run(now=None):
 
     current = (now or dt.datetime.now(CN)).astimezone(CN)
     rows = []
-    PT.init_db()
+    # 只读取：不调用 init_db（那会建表/迁移），账本不存在就直接报 FAIL。
+    if not Path(PT.DB_PATH).is_file():
+        _check(rows, 'ledger_present', False, f'账本不存在：{PT.DB_PATH}')
+        return {'as_of': current.isoformat(), 'checks': rows,
+                'summary': {'pass': 0, 'warn': 0, 'fail': 1}, 'ok': False}
     with PT._db() as conn:
         cycle = PT._active_cycle(conn)
         # _active_cycle 返回账本原始行：enabled_strategies 是 JSON 文本而不是列表。
@@ -113,6 +117,17 @@ def run(now=None):
     task = next((item for item in SC.SCHEDULE_TASKS if item.slot == "auction-track"), None)
     _check(rows, "schedule_auction_track", task is not None and getattr(task, "clock", None) == "09:15",
            f"竞价跟踪时钟 {getattr(task, 'clock', None) if task else '缺失'}")
+
+    import universe
+    today = current.date()
+    _check(rows, "trade_calendar", universe.is_trade_day(today),
+           f"{today.isoformat()} 交易日={universe.is_trade_day(today)}")
+    try:
+        nxt = universe.next_trade_day(today)
+        _check(rows, "next_trade_day", nxt is not None and nxt > today,
+               f"下一交易日 {nxt}")
+    except Exception as exc:  # noqa: BLE001 - 交易日历无法解析时必须显式暴露
+        _check(rows, "next_trade_day", False, f"{type(exc).__name__}: {exc}")
 
     import data_fetcher as dfc  # noqa: F401  (确认数据层可导入)
     kline_dir = Path(getattr(dfc, "KLINE_DIR", "")) if getattr(dfc, "KLINE_DIR", None) else None

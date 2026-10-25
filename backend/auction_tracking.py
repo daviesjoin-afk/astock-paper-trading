@@ -167,9 +167,22 @@ def _publish(rows, current, reason, health, *, final=False):
     return report
 
 
+def _valid_day(trade_date):
+    try:
+        return dt.date.fromisoformat(str(trade_date)[:10]).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
 def archive_path(trade_date):
-    """某一天的竞价归档文件路径（不存在也返回路径，调用方自行判存在）。"""
-    return Path(data_paths.data_path("auction_tracking", f"{trade_date}.json"))
+    """某一天的竞价归档文件路径；日期非法时抛 ValueError（不拼接任意字符串）。
+
+    日期会被拼进文件名，任何非 ISO 日期的输入都可能是目录穿越，一律拒绝。
+    """
+    day = _valid_day(trade_date)
+    if day is None:
+        raise ValueError("trade_date must be an ISO date")
+    return Path(data_paths.data_path("auction_tracking", f"{day}.json"))
 
 
 def _archive_day(root, current, rows, summary):
@@ -213,7 +226,11 @@ def archived_days(limit=ARCHIVE_KEEP_DAYS):
 
 
 def load_archived_day(trade_date):
-    return _read(archive_path(trade_date))
+    try:
+        path = archive_path(trade_date)
+    except ValueError:
+        return {}
+    return _read(path)
 
 
 def current_snapshot():

@@ -145,7 +145,9 @@ def _features(row):
 def _day_cross_section(day, rows, bars_by_code):
     """一天的横截面：每股特征 + 两个目标收益；缺数据的个股直接剔除。"""
     samples = []
-    for row in rows[:MAX_CODES_PER_DAY]:
+    # 先按金额取流动性最好的样本：归档行本身没有排序，直接截断会变成"按代码顺序"抽样。
+    ordered = sorted(rows, key=lambda item: -(_number(item.get("amount")) or 0.0))
+    for row in ordered[:MAX_CODES_PER_DAY]:
         code = str(row.get("code") or "")
         if len(code) != 6 or not code.isdigit():
             continue

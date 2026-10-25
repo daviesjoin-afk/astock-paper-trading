@@ -1296,8 +1296,13 @@ def auction_summary(trade_date: str | None = None, limit: int = 30):
     import auction_tracking
 
     size = max(1, min(int(limit or 30), 100))
-    day = str(trade_date or datetime.datetime.now(datetime.timezone(
+    raw_day = str(trade_date or datetime.datetime.now(datetime.timezone(
         datetime.timedelta(hours=8))).date().isoformat())[:10]
+    # 只接受真实的 ISO 日期：日期直接拼进归档路径，不能让 "../" 之类的东西穿透目录。
+    try:
+        day = datetime.date.fromisoformat(raw_day).isoformat()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="trade_date 必须是 YYYY-MM-DD") from None
     archived = auction_tracking.load_archived_day(day)
     if archived:
         rows = archived.get("rows") or []
