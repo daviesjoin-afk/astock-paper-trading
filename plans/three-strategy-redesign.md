@@ -354,3 +354,57 @@ sqlite3 /root/codex/data_cache/paper_trading.sqlite3 < /root/astock-backups/thre
 
 生命周期 ``retiring`` 是**单向**状态：``retiring`` 只能去 ``archived``/``quarantined``。
 正常回滚要建新版本，而不是把状态改回 ``paper``。
+
+## 12. 第四轮：自进化与审批收窄到三策略 + 周期切换（2026-10-25 夜）
+
+### 12.1 缺口：提案/审批还活在"五套"世界里
+
+| 环节 | 旧口径 | 后果 |
+|---|---|---|
+| 提案生成 | `adaptive_engine._bandit_decision` 用 `ACCOUNT_LABELS = strategy_registry.labels()`，**不过滤生命周期** | retiring 的旧策略仍被分配权重；5 套 × 15% 下限 ⇒ 单策略上限 40%，稳健的 50% **不可表示** |
+| 上限投影 | 先限幅再归一化 | 归一化会把策略压到下限以下（例如 12.5%），审批通道再按同一组上下限拒绝——引擎自己产出自己拒绝的提案 |
+| 审批执行 | `evolution_apply.apply_allocation` 要求权重集合 **等于全部注册策略** | 三策略决策永远"缺两套"，五套旧决策在只剩三套时仍可被误批 |
+| 审批展示 | `allocation_overview` 列出全部 `paper_accounts` | 页面把 retire 的旧策略继续当预算对象展示 |
+
+### 12.2 修复：一个入口 + 一个有界投影
+
+`backend/strategy_weight_scope.py`（只读 + 纯计算，不 import `paper_trading`）：
+
+- `participant_ids(conn)` → `paper_cycle_ownership.execution_participant_ids`，读不到就返回**空**而不是回落"全部注册策略"；
+- `project_weights(raw, ids, min_pct, max_pct)` → 水位法投影：**恰好 100%**、每项在 `[min, max]` 内、0.1 个百分点分辨率；上下限对参与者数量不可行时抛错。
+
+接入点：
+
+- `adaptive_engine._bandit_decision`：`strategy_ids = _weight_participants()`（读 paper 账本的执行参与者；账本不存在时退回注册标签，保证纯代码路径可用），并把 `weight_participants / weight_projection / min_weight_pct / max_weight_pct` 写进决策证据；
+- 投影替换原来的"限幅 + 归一化"，不可行时才退回旧算法并标记 `legacy_clamped`；
+- `evolution_apply.apply_allocation`：按执行参与者校验，集合不一致直接给出"决策 vs 参与者"的具体差异；
+- `evolution_apply.allocation_overview`：`active` 只列参与者，新增 `participants` 与 `scope_reason`；集合不一致时 `can_apply=false`。
+
+**审批行为变化（重要）**：库里五套时代的历史决策（例如 id 33–35）现在**不可应用**，会显示 `scope_reason`，必须重新生成学习决策。这是预期行为——它们的权重集合描述的是已经不存在的五策略结构。
+
+### 12.3 周期切换（已在服务器执行）
+
+| 项目 | 结果 |
+|---|---|
+| 周期 13（2026-09-23 起，五套） | `archived`，归档快照 6.4 MB，原因"三策略上线：结束五策略周期（预算 30 万转入新周期）" |
+| 活动账本 | `paper_orders / positions / lots / fills` 清零（历史在 `paper_archives.snapshot`） |
+| 周期 14（新建） | `paused`，资本 300,000，`enabled_strategies` = 三个正式策略，`started_at` 为空 |
+| 周期 14 账户 | 三个账户各 100,000 现金；`adaptive_allocation` = 20 / 50 / 30，`effective_date 2026-10-25` |
+| 两个退役账户 | 保持 `cycle_id=13`、`paused`、现金留在归档周期里，不进入新周期 |
+| 结束前留档 | `/root/astock-backups/three-strategy-20261025T213638/cycle-before-archive.json.gz`（61 MB，含 3,901 条订单、51 个 lot、85 条净值） |
+
+⚠️ **现金仍是三份等额（10 万），20/50/30 是分配目标**（slot/敞口），不是现金切分；
+共享池扣款会跨账户调拨（`paper_shared_cash.debit_shared_cash` 优先扣买单账户、不足再扣其他参与者）。
+要把"预算"落到现金层，需要另改 `_create_cycle` 的 `account_share`，本轮没做。
+
+### 12.4 周一启动
+
+- `/etc/cron.d/astock-three-strategy-start`：`5 9 26 10 *` 执行 `deploy/resume_three_strategy_cycle.sh`；
+- 脚本先检查标记文件 `/root/codex/.start_three_strategy_cycle`，再确认当前周期是 `paused`，才调用
+  `paper_trading.set_accounts_status('running')`；成功后删除标记文件 → 之后即便 cron 行还在也是空转；
+- 失败保留标记与 `reports/start-cycle.log`，等人工重试；`flock` 防止并发。
+
+### 12.5 仍未做
+
+- `evolution_apply` 的**回滚**（`rollback_allocation`）仍按单账户操作，没有参与者范围校验；
+- `adaptive_engine` 的 `horizon_summary` 仍按全部标签展示历史奖励（历史参考，不是审批对象）。

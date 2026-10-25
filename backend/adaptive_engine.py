@@ -1878,13 +1878,43 @@ def _recency_weight(row, profile_date):
     return 0.22 + 0.78 * math.exp(-0.35 * age)
 
 
+def _weight_participants():
+    """提案阶段的权重对象 = 当前周期的**执行参与者**。
+
+    原来用 ``strategy_registry.labels()``（含 retiring/archived）：五套并列时
+    15% 下限把单策略上限压到 40%，稳健的 50% 无法表达；退役两套后还会把已经
+    退出独立资金账户的旧策略重新拉进权重。
+
+    账本不存在或读不到时退回注册标签，保证纯代码路径（测试、首次启动）
+    仍能生成决策；此时 ``evolution_apply`` 会按真实参与者再拒绝一次。
+    """
+    import strategy_weight_scope as SCOPE
+
+    if not os.path.exists(PAPER_DB_PATH):
+        return sorted(ACCOUNT_LABELS)
+    try:
+        paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
+    except Exception:
+        return sorted(ACCOUNT_LABELS)
+    try:
+        ids = SCOPE.participant_ids(paper)
+    except Exception:
+        ids = ()
+    finally:
+        try:
+            paper.close()
+        except Exception:
+            pass
+    return sorted(ids) if ids else sorted(ACCOUNT_LABELS)
+
+
 def _bandit_decision(conn, profile, profile_id):
     cfg = _config(conn)
     rows, global_rows, regime_rows, horizons, regimes = _reward_stats(conn, profile["regime"])
     attribution = trade_attribution.summary_from_conn(conn, limit=240)
     attribution_by_account = attribution.get("by_account") or {}
     total_samples = len(rows)
-    strategy_ids = sorted(ACCOUNT_LABELS)
+    strategy_ids = _weight_participants()
     exploration = float(cfg["exploration_strength"])
     total_effective = sum(HORIZON_WEIGHTS.get(row["horizon"], 0) * _recency_weight(row, profile["profile_date"]) for row in rows)
     scores, evidence = {}, {}
@@ -1950,9 +1980,21 @@ def _bandit_decision(conn, profile, profile_id):
     mixed = {key: equal * (1 - confidence) + raw_weights[key] * confidence for key in strategy_ids}
     min_weight = float(cfg["min_strategy_weight_pct"]) / 100
     max_weight = float(cfg["max_strategy_weight_pct"]) / 100
-    bounded = {key: _clamp(value, min_weight, max_weight) for key, value in mixed.items()}
-    normalizer = sum(bounded.values()) or 1.0
-    weights = {key: round(100 * value / normalizer, 1) for key, value in bounded.items()}
+    # 先限幅再归一化会把策略压到下限以下（例如 5 套时 12.5%），而审批通道按
+    # 同一组上下限严格校验，等于引擎自己产出自己拒绝的提案。这里改成有界投影：
+    # 恰好 100%、每项都在 [min, max] 内、0.1 个百分点分辨率。
+    import strategy_weight_scope as SCOPE
+
+    projection = "bounded"
+    try:
+        weights = SCOPE.project_weights(
+            mixed, strategy_ids,
+            min_pct=min_weight * 100, max_pct=max_weight * 100)
+    except ValueError:
+        bounded = {key: _clamp(value, min_weight, max_weight) for key, value in mixed.items()}
+        normalizer = sum(bounded.values()) or 1.0
+        weights = {key: round(100 * value / normalizer, 1) for key, value in bounded.items()}
+        projection = "legacy_clamped"
 
     if total_samples < int(cfg["min_samples_shadow"]):
         stage = "collecting"
@@ -1975,6 +2017,12 @@ def _bandit_decision(conn, profile, profile_id):
         "guardrail_pass": profile["quality"] == "valid_close",
         "trade_attribution_records": attribution.get("records", 0),
         "trade_attribution_reason_counts": attribution.get("reason_counts", {}),
+        # 权重对象是本周期执行参与者；审批时按同一集合核对，退出独立资金账户的
+        # 旧策略不再出现在提案里。
+        "weight_participants": sorted(strategy_ids),
+        "weight_projection": projection,
+        "min_weight_pct": float(cfg["min_strategy_weight_pct"]),
+        "max_weight_pct": float(cfg["max_strategy_weight_pct"]),
     }
     now = _now()
     conn.execute(

@@ -204,9 +204,29 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
         cfg = deps.config(conn)
         min_pct = float(cfg["min_strategy_weight_pct"])
         max_pct = float(cfg["max_strategy_weight_pct"])
-        weights = _validate_allocation_weights(
-            _loads(row["weights"], {}) or {}, sorted(deps.account_labels), min_pct, max_pct,
-        )
+        # 权重对象 = 当前周期的**执行参与者**，不是"全部注册策略"：退役的旧策略
+        # 仍在注册表里，却已经不再参与分配；用旧口径校验会把 50% 压成 40%，或者
+        # 让一条五套时代的决策在只剩三套时被误批。
+        import strategy_weight_scope as SCOPE
+
+        participants = ()
+        try:
+            paper_probe = _paper_connect(paper_db_path)
+            try:
+                participants = tuple(SCOPE.participant_ids(paper_probe))
+            finally:
+                paper_probe.close()
+        except sqlite3.Error:
+            participants = ()
+        if not participants:
+            raise ValueError("当前周期没有可执行的策略参与者，拒绝应用权重决策")
+        stored = _loads(row["weights"], {}) or {}
+        scope_problem = sorted(set(participants) ^ set(stored))
+        if scope_problem:
+            raise ValueError(
+                "决策的权重集合与当前执行参与者不一致"
+                f"（参与者 {sorted(participants)}，决策 {sorted(stored)}），请重新生成学习决策")
+        weights = _validate_allocation_weights(stored, sorted(participants), min_pct, max_pct)
         decision_date = str(row["decision_date"] or "")
 
     # B 批观察期门禁：任一目标账户的上一 allocation 覆盖仍在观察期即拒绝。
@@ -363,15 +383,30 @@ def rollback_allocation(paper_db_path, account_id: str, reason: str = "人工回
 
 
 def allocation_overview(adaptive_connect, paper_db_path):
-    """供 overview/API 展示：当前生效的分摊覆盖 + 最新可应用决策。"""
+    """供 overview/API 展示：当前生效的分摊覆盖 + 最新可应用决策。
+
+    审批口径只看**当前周期的执行参与者**：退出独立资金账户（retiring）的旧策略
+    不再出现在 ``active`` 里，也不再参与 ``can_apply`` 的覆盖判断；决策的权重集合
+    与参与者不一致时 ``can_apply`` 为假并给出 ``scope_reason``，避免批准一个属于
+    五套时代的提案。
+    """
     active = {}
+    participants = []
+
+    def _participants(paper_conn):
+        import strategy_weight_scope as SCOPE
+        return list(SCOPE.participant_ids(paper_conn))
+
     try:
         paper = _paper_connect(paper_db_path)
         rows = paper.execute(
             "SELECT id,params FROM paper_accounts"
         ).fetchall()
+        participants = _participants(paper)
         paper.close()
         for row in rows:
+            if participants and row["id"] not in participants:
+                continue
             params = _loads(row["params"], {}) or {}
             alloc = params.get("adaptive_allocation") or {}
             if alloc.get("status") == "active":
@@ -387,16 +422,28 @@ def allocation_overview(adaptive_connect, paper_db_path):
         if row:
             updated = _aware(row["updated_at"])
             fresh = bool(updated and (dt.datetime.now(TZ) - updated).total_seconds() <= _APPLY_MAX_AGE_SECONDS)
+            weights = _loads(row["weights"], {}) or {}
+            scope_reason = ""
+            if participants:
+                missing = sorted(set(participants) - set(weights))
+                extra = sorted(set(weights) - set(participants))
+                if missing or extra:
+                    scope_reason = ("决策权重集合与当前执行参与者不一致"
+                                    f"（缺少 {missing}，多出 {extra}），需要重新生成")
+            elif weights:
+                scope_reason = "当前周期没有执行参与者，不能应用权重"
             latest = {
                 "id": row["id"], "decision_date": row["decision_date"],
                 "stage": row["stage"], "status": row["status"],
-                "weights": _loads(row["weights"], {}) or {},
+                "weights": weights,
                 "fresh": fresh,
                 "can_apply": bool(fresh and row["status"] != "applied"
                                   and row["stage"] in _ALLOCATION_APPLY_STAGES
+                                  and not scope_reason
                                   and row["id"] not in {v.get("decision_id") for v in active.values()}),
+                "scope_reason": scope_reason,
             }
-    return {"active": active, "latest_decision": latest}
+    return {"active": active, "participants": participants, "latest_decision": latest}
 
 
 # ---------------------------------------------------------------------------
