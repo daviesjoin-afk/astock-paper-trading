@@ -1295,7 +1295,10 @@ def auction_summary(trade_date: str | None = None, limit: int = 30):
     """
     import auction_tracking
 
-    size = max(1, min(int(limit or 30), 100))
+    try:
+        size = max(1, min(int(limit or 30), 100))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="limit 必须是整数") from None
     raw_day = str(trade_date or datetime.datetime.now(datetime.timezone(
         datetime.timedelta(hours=8))).date().isoformat())[:10]
     # 只接受真实的 ISO 日期：日期直接拼进归档路径，不能让 "../" 之类的东西穿透目录。
@@ -1318,7 +1321,10 @@ def auction_summary(trade_date: str | None = None, limit: int = 30):
             rows = (latest[-1].get("rows") if latest else []) or []
             captured_at = latest[-1].get("captured_at") if latest else None
         summary, source = auction_tracking.summarize(rows), "current"
-    ranked = sorted(rows, key=lambda row: -(float(row.get("amount") or 0)))[:size]
+    # 上游可能把缺失金额给成 "--" 之类的字符串：用跟踪模块的 _number 归一到 None，
+    # 否则一次脏数据就让只读接口 500。
+    ranked = sorted(
+        rows, key=lambda row: -(auction_tracking._number(row.get("amount")) or 0.0))[:size]
     return {
         "trade_date": day,
         "source": source,

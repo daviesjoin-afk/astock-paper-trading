@@ -274,6 +274,8 @@ def initial_params(strategy_id, *, effective_date):
 
     非名册账户（用户策略、已退出策略）返回空表：不得凭空给它们造预算。
     """
+    if role_for(strategy_id) is None:
+        return {}
     declaration = allocation_declaration(strategy_id, effective_date=effective_date)
     return declaration["params"]
 

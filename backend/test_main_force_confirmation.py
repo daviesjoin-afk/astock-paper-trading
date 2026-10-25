@@ -79,6 +79,16 @@ class MainForceConfirmationTests(unittest.TestCase):
         self.assertEqual(blocked["main_force_confirmation"]["entry_effect"]["bonus"], 0)
 
     def test_standalone_main_force_retains_gates_but_does_not_double_vote_flow(self):
+        """只验证入场模型本身；**开仓许可**由周期参与者决定，不看这里的 passed。
+
+        main_force_top10 已退出独立资金账户（retiring）：它不在周期参与者集合里，
+        根本走不到 ``_buy_order``。这里的 ``passed`` 只说明"若被允许，模型怎么算分"，
+        不能被读成"该策略还能开仓"。
+        """
+        import strategy_roster as ROSTER
+
+        self.assertTrue(ROSTER.is_exit_only("main_force_top10"))
+        self.assertIsNotNone(ROSTER.entry_block_reason("main_force_top10"))
         result = P._strategy_entry_assessment(
             {"id": "main_force_top10"}, {"code": "000001", "score": .8},
             quote(), None, {"hard_vetoes": [], "avg_score": .8}, asof=ASOF)

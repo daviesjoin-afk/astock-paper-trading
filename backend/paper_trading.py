@@ -3013,6 +3013,31 @@ def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
     )
 
 
+def _now_aware():
+    """当前决策时刻（上海时区）。
+
+    主力辅助确认的"报价多久算过期"必须相对一个**可注入**的时刻判断：直接用
+    ``datetime.now()`` 会让回放/补算永远判成过期，同一个信号复现不出同一个分数。
+    需要确定性时 monkeypatch 本函数即可。
+    """
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
+
+
+def _audit_once_per_day(conn, event, detail):
+    """同一天、同一事件与同一内容只写一条审计，避免每个入场计划都刷一行。"""
+    today = _date().isoformat()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM paper_audit WHERE event=? AND detail=?"
+            " AND substr(created_at,1,10)=? LIMIT 1",
+            (str(event), str(detail), today)).fetchone()
+    except sqlite3.Error:
+        exists = None
+    if exists is None:
+        return _audit(conn, None, event, detail)
+    return None
+
+
 def _strategy_stamp(conn, account_id, signal_id=None, *, cycle_id=None):
     """Return one complete causal Strategy Definition version stamp.
 
@@ -7337,7 +7362,7 @@ def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_
         threshold_context["effective_threshold"] = round(threshold, 3)
     main_force_confirmation = None
     if account_id in {"tq_breakout", "trend_pullback", NEW_STRATEGY_ID, MAIN_FORCE_STRATEGY_ID}:
-        main_force_confirmation = MFC.assess(quote, asof=asof)
+        main_force_confirmation = MFC.assess(quote, asof=asof or _now_aware())
         effect = MFC.entry_effect(
             account_id, main_force_confirmation,
             base_score=score, threshold=threshold, blockers=blockers,
@@ -7996,8 +8021,16 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
     if reading.status == MDC.STATUS_FRESH and asof_day == instant.astimezone(PDAlloc.E.TZ).date().isoformat():
         # 每日调权只管理本周期**执行参与者**：退出独立资金账户的旧策略仍在同一
         # 周期账本里，但它们的权重已不参与分配，不能让它们把正式策略的权重稀释。
-        PDAlloc.rebalance(conn, cycle_id=cycle_id, decision_at=decision_at,
-                          account_ids=current_cycle_participant_ids(conn, cycle_id))
+        daily = PDAlloc.rebalance(conn, cycle_id=cycle_id, decision_at=decision_at,
+                                  account_ids=current_cycle_participant_ids(conn, cycle_id))
+        if daily.get("status") not in ("evaluated", "already_evaluated", "inactive"):
+            # 调权被拒（未授权/越界/无参与者）必须留痕：以前返回值被丢弃，
+            # 权重停止变化时没有任何地方能看出原因。同一天同一原因只记一次。
+            _audit_once_per_day(
+                conn, "daily_allocation_skipped",
+                _json({"cycle_id": int(cycle_id), "status": daily.get("status"),
+                       "reason": daily.get("reason"),
+                       "current_weights": daily.get("current_weights")}))
     snapshot = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=cycle_id, asof_day=asof_day,
         decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,
@@ -11760,8 +11793,14 @@ def run_auction_preselection(asof_date=None, force=False):
     try:
         import auction_tracking
         auction_tracking.record_final(current_rows, now, auction_source_health)
-    except Exception:
-        pass  # 观测落盘异常不改变原有预选、风控与下单门禁。
+    except Exception as exc:  # noqa: BLE001 - 归档失败必须留痕，不能再静默 pass
+        # 这个槽位没有账本连接（竞价预选是只读观测分支），失败写进 status.json，
+        # 页面与 preflight 都能看到"今天没归档是因为报错"。
+        try:
+            import auction_tracking as _AT
+            _AT.record_archive_error(exc)
+        except Exception:  # noqa: BLE001 - 记账失败不能反过来打断预选
+            pass
     # The full snapshot may contain rows captured before/after the auction
     # window.  Ranking must consume only the validated 09:24–09:27 rows.
     result = _bootstrap_signals_for_today(day, live_universe=current_rows, source_slot="auction_0925")
@@ -15409,9 +15448,18 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         # 三策略名册的初始预算：每个新周期按名册重置一次（20/50/30），之后
         # 只由自进化通道在既有边界内调整。非名册账户（用户策略、已退出策略）
         # 仍写空表——不得凭空给它们造预算。
-        initial_params = _json(
-            ROSTER.initial_params(account_id, effective_date=_date().isoformat())
-        ) if ROSTER.is_formal(account_id) else "{}"
+        previous_row = conn.execute(
+            "SELECT params FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
+        previous_params = _loads(previous_row["params"], {}) if previous_row is not None else {}
+        initial = (ROSTER.initial_params(account_id, effective_date=_date().isoformat())
+                   if ROSTER.is_formal(account_id) else {})
+        # 操作者的"每日调权授权"是跨周期的长期决定，不是本周期预算；换周期时
+        # 只重置权重声明，必须把授权一起带过去，否则 v2 调权会在第二个周期
+        # 静默失效（rebalance 返回 not_authorized，且没人看返回值）。
+        if isinstance(previous_params, dict) and previous_params.get("adaptive_allocation_policy"):
+            initial = {**initial,
+                       "adaptive_allocation_policy": previous_params["adaptive_allocation_policy"]}
+        initial_params = _json(initial)
         # 本策略的资本份额 = 比例（也就是它的上限）；现金仍是同一个总池，
         # ``initial_cash`` 只是"这个策略可以动用多少"的归属口径。
         strategy_capital = round(capital * shares.get(account_id, 0.0), 2) \
@@ -15447,20 +15495,30 @@ def configure_capital(capital):
             raise ValueError("本周期已有模拟成交或持仓，资金已锁定；请使用完全重置新建周期")
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?", (capital, _now(), cycle["id"]))
         configured = _loads(cycle.get("enabled_strategies"), None)
-        enabled_count = len(configured) if isinstance(configured, list) and configured else len(ACTIVE_ACCOUNT_IDS)
-        share = capital / max(enabled_count, 1)
-        active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
-        # PR-48：显式限定当期账本行——active_clause 只含 id 集合，不加
-        # cycle_id 会把绑定在其它周期的同名行也改写。
-        conn.execute(
-            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND {active_clause}",
-            (share, share, share, _now(), cycle["id"], *active_ids),
-        )
-        conn.execute(
-            f"UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE account_id IN ({','.join('?' for _ in active_ids)})",
-            (share, share, *active_ids),
-        )
-        _audit(conn, None, "capital_configured", f"共享模拟资金池草稿设为 {capital:.2f} 元；策略初始展示份额 {share:.2f} 元")
+        enabled_ids = (tuple(configured) if isinstance(configured, list) and configured
+                       else tuple(ACTIVE_ACCOUNT_IDS))
+        # 与 _create_cycle 用同一套份额：三策略周期按 20/50/30 归属，其他组合等额。
+        # 否则"暂停期改资金"会把三策略的参考本金改回各三分之一，而权重声明仍是
+        # 20/50/30，收益率分母与分配权重从此不一致。
+        shares = _cycle_capital_shares(enabled_ids)
+        _unused_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
+        fallback_share = capital / max(len(active_ids), 1)
+        for account_id in active_ids:
+            share = (round(capital * shares.get(account_id, 0.0), 2)
+                     if shares else fallback_share)
+            conn.execute(
+                "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=?"
+                " WHERE cycle_id=? AND id=?",
+                (share, share, share, _now(), cycle["id"], account_id),
+            )
+            conn.execute(
+                # 只改该账户**最近一条**净值行：草稿期改资金不该重写历史净值曲线。
+                "UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE id=("
+                "  SELECT id FROM paper_nav WHERE account_id=? ORDER BY nav_date DESC, id DESC LIMIT 1)",
+                (share, share, account_id),
+            )
+        _audit(conn, None, "capital_configured",
+               f"共享模拟资金池草稿设为 {capital:.2f} 元；策略归属按名册比例（{len(active_ids)} 套）")
     return dashboard()
 
 

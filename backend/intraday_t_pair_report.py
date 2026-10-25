@@ -26,12 +26,14 @@
 """
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import json
 import math
 import sqlite3
 from pathlib import Path
 
+import data_fetcher as dfc
 import execution_verification as EV
 
 VERSION = "intraday-t-pair-v1"
@@ -254,6 +256,55 @@ def _sum(values):
     return round(sum(numbers), 2)
 
 
+def _kline_close(code, trade_date):
+    """只读日线缓存里该股当天的收盘价；没有当天就用之前最近一天，取不到返回 None。"""
+    path = Path(dfc.kline_cache_path(str(code)))
+    if not path.is_file():
+        return None
+    try:
+        rows = list(csv.DictReader(path.read_text(encoding="utf-8-sig", errors="replace").splitlines()))
+    except OSError:
+        return None
+    best_date, best_close = None, None
+    for row in rows:
+        day = str(row.get("date") or row.get("trade_date") or "")[:10]
+        if not day or day > str(trade_date):
+            continue
+        close = _number(row.get("close"))
+        if close is None or close <= 0:
+            continue
+        if best_date is None or day > best_date:
+            best_date, best_close = day, close
+    return best_close
+
+
+def _resolve_closes(observations):
+    """给每个出现过收盘价的标的补齐 closes；来源写清楚，缺失就留空。"""
+    closes = {}
+    latest = {}
+    for row in observations or ():
+        code = str(row.get("code") or "")
+        if not code:
+            continue
+        value = _number(row.get("price"))
+        if value is not None and value > 0:
+            latest[code] = value
+    for code in latest:
+        trade_date = None
+        for row in observations or ():
+            if str(row.get("code") or "") == code:
+                observed = _time(row.get("observed_at"))
+                if observed is not None:
+                    trade_date = max(trade_date, observed.date()) if trade_date else observed.date()
+        close = _kline_close(code, trade_date) if trade_date else None
+        if close is not None:
+            closes[code] = {"price": close, "source": "kline_close",
+                            "trade_date": trade_date.isoformat()}
+        else:
+            closes[code] = {"price": latest[code], "source": "last_intraday_observation"}
+    return closes
+
+
 def build_report(paper_db_path, *, asof=None, closes=None):
     """只读账本读取；缺表或查询失败时返回 ``unavailable``，绝不建表或补数据。"""
     now = _time(asof) if asof is not None else dt.datetime.now(MARKET_TZ)
@@ -287,6 +338,10 @@ def build_report(paper_db_path, *, asof=None, closes=None):
                 WHERE account_id=? AND cycle_id=? AND action IN ('t_sell','t_rebuy')
                   AND datetime(observed_at)<=datetime(?)
                 ORDER BY id""", (ACCOUNT_ID, cycle_id, cutoff))]
+        if closes is None:
+            # 未回补机会成本原本永远算不出来：唯一的生产调用方从不传 closes。
+            # 这里用只读日线缓存补收盘价，取不到才退回落最后一条观测价，并标明来源。
+            closes = _resolve_closes(observations)
         result = summarize([row for row in orders if row["side"] == "sell"],
                            observations,
                            [row for row in orders if row["side"] == "buy"],

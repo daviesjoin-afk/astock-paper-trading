@@ -239,17 +239,31 @@ def current_snapshot():
 
 
 def record_final(rows, now, health):
-    """复用09:25预选已取得的行情；不额外联网，不允许盘后补造竞价。"""
+    """复用09:25预选已取得的行情；不额外联网，不允许盘后补造竞价。
+
+    收尾窗口放宽到 09:25–09:32：竞价预选在 09:25/09:27/09:29 三次尝试，最后一次
+    落在 09:28 之后；窗口太窄会让"最后一次重试"永远归档不了当天竞价。只放宽收尾
+    时刻，行本身仍要求 09:24 之后的时点数据且不超过 90 秒。
+    """
     current = now.replace(tzinfo=CN) if now.tzinfo is None else now.astimezone(CN)
-    if not dt.time(9, 25) <= current.time() < dt.time(9, 28):
+    if not dt.time(9, 25) <= current.time() < dt.time(9, 32):
         return False
     usable = []
     for row in rows:
         stamp = _observed_at(row.get('quote_at'))
-        if (stamp and stamp.date() == current.date() and dt.time(9, 24) <= stamp.time() < dt.time(9, 28)
+        if (stamp and stamp.date() == current.date() and dt.time(9, 24) <= stamp.time() < dt.time(9, 32)
                 and 0 <= (current-stamp).total_seconds() <= 90):
             usable.append({key:row.get(key) for key in FIELDS if key in row})
     if not usable:
         return False
     _publish(usable,current,None,health,final=True)
     return True
+
+
+def record_archive_error(exc):
+    """把归档失败写进 status.json：页面和自检能看出"今天没归档"是因为报错。"""
+    report = dict(status() or {})
+    report["archive_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    report["archive_error_at"] = dt.datetime.now(CN).isoformat()
+    _write(Path(data_paths.data_path("auction_tracking", "status.json")), report)
+    return report

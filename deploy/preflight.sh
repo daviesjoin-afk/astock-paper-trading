@@ -50,17 +50,23 @@ done
 code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18600/api/health 2>/dev/null || echo 000)"
 [ "$code" = "200" ] && pass "API /api/health 200" || fail "API /api/health 返回 $code"
 
-# 3. 调度：竞价跟踪 + 周一启动器
+# 3. 调度：竞价跟踪 + 周期启动器（必须能在 /etc/cron.d 里真的触发，而不只是文件存在）
 if grep -q "auction-track" /etc/cron.d/astock-codex 2>/dev/null; then
   pass "cron 含 auction-track"
 else
   fail "cron 缺少 auction-track"
 fi
+CRON_STARTER=/etc/cron.d/astock-three-strategy-start
+if [ -f "$CRON_STARTER" ] && grep -q "resume_three_strategy_cycle.sh" "$CRON_STARTER"; then
+  pass "周期启动器 cron 已安装（$(grep -vc '^#' "$CRON_STARTER") 行）"
+else
+  fail "缺少 $CRON_STARTER 或其启动器行（周期不会自动启动）"
+fi
 if [ -f "$ROOT/deploy/resume_three_strategy_cycle.sh" ]; then
   if [ -f "$ROOT/.start_three_strategy_cycle" ]; then
-    pass "周一启动器就绪（标记文件存在）"
+    pass "周期启动器就绪（标记文件存在）"
   else
-    warn "周一启动器已安装但标记文件不存在（周期不会自动启动）"
+    warn "启动器已安装但标记文件不存在（周期不会自动启动）"
   fi
 else
   fail "缺少 deploy/resume_three_strategy_cycle.sh"

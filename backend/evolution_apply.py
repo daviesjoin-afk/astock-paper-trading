@@ -24,6 +24,7 @@ import copy
 import datetime as dt
 import sqlite3
 import zoneinfo
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
 import paper_repository as PRP
@@ -397,22 +398,29 @@ def allocation_overview(adaptive_connect, paper_db_path):
         import strategy_weight_scope as SCOPE
         return list(SCOPE.participant_ids(paper_conn))
 
+    ledger_status = "ok"
     try:
-        paper = _paper_connect(paper_db_path)
-        rows = paper.execute(
-            "SELECT id,params FROM paper_accounts"
-        ).fetchall()
-        participants = _participants(paper)
-        paper.close()
+        # 只读打开：这是 GET 路径，绝不能在路径写错时顺手创建一个空账本。
+        paper = sqlite3.connect(
+            Path(paper_db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+        paper.row_factory = sqlite3.Row
+        try:
+            paper.execute("PRAGMA query_only=ON")
+            rows = paper.execute("SELECT id,params FROM paper_accounts").fetchall()
+            participants = _participants(paper)
+        finally:
+            paper.close()
         for row in rows:
-            if participants and row["id"] not in participants:
+            # 参与者为空时也必须过滤干净：空集不能退化成"全部注册策略"。
+            if row["id"] not in participants:
                 continue
             params = _loads(row["params"], {}) or {}
             alloc = params.get("adaptive_allocation") or {}
             if alloc.get("status") == "active":
                 active[row["id"]] = alloc
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError, ValueError):
         active = {}
+        ledger_status = "unreadable"
     latest = None
     with adaptive_connect() as conn:
         row = conn.execute(
@@ -424,7 +432,9 @@ def allocation_overview(adaptive_connect, paper_db_path):
             fresh = bool(updated and (dt.datetime.now(TZ) - updated).total_seconds() <= _APPLY_MAX_AGE_SECONDS)
             weights = _loads(row["weights"], {}) or {}
             scope_reason = ""
-            if participants:
+            if ledger_status != "ok":
+                scope_reason = "账本不可读，无法核对执行参与者，不能应用权重"
+            elif participants:
                 missing = sorted(set(participants) - set(weights))
                 extra = sorted(set(weights) - set(participants))
                 if missing or extra:
@@ -443,7 +453,8 @@ def allocation_overview(adaptive_connect, paper_db_path):
                                   and row["id"] not in {v.get("decision_id") for v in active.values()}),
                 "scope_reason": scope_reason,
             }
-    return {"active": active, "participants": participants, "latest_decision": latest}
+    return {"active": active, "participants": participants,
+            "ledger_status": ledger_status, "latest_decision": latest}
 
 
 # ---------------------------------------------------------------------------

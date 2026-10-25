@@ -33,31 +33,47 @@ def run(now=None):
     import strategy_roster as ROSTER
     import paper_trading as PT
     import runtime_settings as RSET
-    import paper_cycle_ownership as PCY
-    import strategy_registry as SR
 
     current = (now or dt.datetime.now(CN)).astimezone(CN)
     rows = []
-    # 只读取：不调用 init_db（那会建表/迁移），账本不存在就直接报 FAIL。
-    if not Path(PT.DB_PATH).is_file():
-        _check(rows, 'ledger_present', False, f'账本不存在：{PT.DB_PATH}')
+    ledger_path = Path(PT.DB_PATH)
+    _check(rows, "ledger_present", ledger_path.is_file(), f"账本 {ledger_path}")
+    if not ledger_path.is_file():
         return {'as_of': current.isoformat(), 'checks': rows,
                 'summary': {'pass': 0, 'warn': 0, 'fail': 1}, 'ok': False}
-    with PT._db() as conn:
-        cycle = PT._active_cycle(conn)
-        # _active_cycle 返回账本原始行：enabled_strategies 是 JSON 文本而不是列表。
-        raw_enabled = cycle.get("enabled_strategies")
-        enabled = (tuple(PT._loads(raw_enabled, []) or ())
-                   if isinstance(raw_enabled, str) else tuple(raw_enabled or ()))
-        _check(rows, "cycle_window_status", cycle["status"] in ("paused", "running"),
-               f"当前周期 {cycle['id']} 状态 {cycle['status']}")
-        _check(rows, "cycle_three_sleeves", enabled == ROSTER.formal_strategy_ids(),
-               f"启用集合 {enabled}（期望 {ROSTER.formal_strategy_ids()}）")
-        _check(rows, "cycle_capital", abs(float(cycle.get("capital") or 0) - 300000.0) < 0.01,
-               f"资本 {cycle.get('capital')}")
-        accounts = {row["id"]: dict(row) for row in conn.execute(
+    # 真正只读：不经 PT.init_db / PT._db / PT._active_cycle —— 后者在没有活动周期时
+    # 会**补建**周期，等于把被检查对象改了。缺表或缺周期都如实报 FAIL。
+    conn = sqlite3.connect(ledger_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in ("paper_cycles", "paper_accounts", "paper_orders"):
+            _check(rows, f"table:{table}", table in tables, "存在" if table in tables else "缺表")
+        cycle = None
+        if "paper_cycles" in tables:
+            cycle = conn.execute(
+                "SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused')"
+                " ORDER BY id DESC LIMIT 1").fetchone()
+        if cycle is None:
+            _check(rows, "cycle_present", False, "没有 draft/running/paused 周期")
+            cycle = None
+        else:
+            cycle = dict(cycle)
+            raw_enabled = cycle.get("enabled_strategies")
+            enabled = (tuple(PT._loads(raw_enabled, []) or ())
+                       if isinstance(raw_enabled, str) else tuple(raw_enabled or ()))
+            _check(rows, "cycle_window_status", cycle["status"] in ("paused", "running"),
+                   f"当前周期 {cycle['id']} 状态 {cycle['status']}")
+            _check(rows, "cycle_three_sleeves", enabled == ROSTER.formal_strategy_ids(),
+                   f"启用集合 {enabled}（期望 {ROSTER.formal_strategy_ids()}）")
+            _check(rows, "cycle_capital", abs(float(cycle.get("capital") or 0) - 300000.0) < 0.01,
+                   f"资本 {cycle.get('capital')}")
+        accounts = ({row["id"]: dict(row) for row in conn.execute(
             "SELECT id,initial_cash,cash,params,cycle_id FROM paper_accounts WHERE cycle_id=?",
-            (cycle["id"],))}
+            (cycle["id"],))} if cycle and "paper_accounts" in tables else {})
         expected_share = {item.strategy_id: item.budget_share for item in ROSTER.formal_roles()}
         for strategy_id, share in expected_share.items():
             account = accounts.get(strategy_id)
@@ -80,15 +96,18 @@ def run(now=None):
                    and policy.get("min_weight_pct") == 5.0,
                    f"policy={policy.get('id')} bounds={policy.get('min_weight_pct')}-{policy.get('max_weight_pct')}",
                    warn=policy.get("id") != "authorized-daily-performance-v2")
-        participants = PCY.execution_participant_ids(
-            conn, cycle["id"], builtin_scope=tuple(SR.active_ids(conn=conn)))
-        _check(rows, "execution_participants", tuple(participants) == ROSTER.formal_strategy_ids(),
-               f"执行参与者 {participants}")
-        scope = RSET.enabled_strategies(conn)
-        _check(rows, "next_cycle_enabled", tuple(scope) == ROSTER.formal_strategy_ids(),
-               f"下一周期启用 {scope}", warn=tuple(scope) != ROSTER.formal_strategy_ids())
-        orders = conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0]
-        _check(rows, "clean_ledger", orders == 0, f"活动账本订单 {orders} 条", warn=True)
+        if cycle:
+            import strategy_weight_scope as SCOPE
+            participants = tuple(SCOPE.participant_ids(conn))
+            _check(rows, "execution_participants", participants == ROSTER.formal_strategy_ids(),
+                   f"执行参与者 {participants}")
+            scope = RSET.enabled_strategies(conn)
+            _check(rows, "next_cycle_enabled", tuple(scope) == ROSTER.formal_strategy_ids(),
+                   f"下一周期启用 {scope}", warn=tuple(scope) != ROSTER.formal_strategy_ids())
+            orders = conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0]
+            _check(rows, "clean_ledger", orders == 0, f"活动账本订单 {orders} 条", warn=True)
+    finally:
+        conn.close()
 
     ledger = Path(PT.DB_PATH)
     _check(rows, "ledger_readable", ledger.is_file(),

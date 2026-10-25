@@ -126,16 +126,21 @@ class StrategyRosterContractTests(unittest.TestCase):
         self.assertTrue(any("新闻人气" in item for item in policy["not_admitted"]))
 
     def test_spec_drift_classifies_every_difference(self):
-        """目标与声明之间的每一条差异都必须有归属，不允许"待办"悄悄堆着。"""
+        """差异集合必须**精确**等于已论证过的那一组，不能靠"没有 open"蒙过去。"""
         drift = ROSTER.spec_drift(ACS.ACCOUNT_SPECS, ACS.RISK_PROFILES)
-        open_rows = [row for row in drift if row["status"] == "open"]
-        self.assertEqual(open_rows, [])
-        fields = {(row["strategy_id"], row["field"]) for row in drift}
-        self.assertIn(("reported_profit_breakout", "max_exposure"), fields)
-        self.assertIn(("trend_pullback", "risk_profile.drawdown"), fields)
-        self.assertNotIn("sector_rotation", {row["strategy_id"] for row in drift})
-        for row in drift:
-            self.assertTrue(row["reason"], row)
+        expected = {
+            (role.strategy_id, field)
+            for role in ROSTER.formal_roles()
+            for field in ("max_weight", "max_exposure",
+                          "risk_profile.single_risk", "risk_profile.daily_loss",
+                          "risk_profile.drawdown")
+        }
+        self.assertEqual({(row["strategy_id"], row["field"]) for row in drift}, expected)
+        self.assertTrue(all(row["status"] == "deliberate" for row in drift))
+        self.assertTrue(all(row["reason"] for row in drift))
+        # max_positions 一致，所以它不该出现在差异里；一旦有人把席位改错就会被抓到。
+        self.assertNotIn(("tq_breakout", "max_positions"),
+                         {(row["strategy_id"], row["field"]) for row in drift})
         missing = ROSTER.spec_drift({}, {})
         self.assertEqual(len(missing), 3)
         self.assertTrue(all(row["status"] == "open" for row in missing))
@@ -302,11 +307,13 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
             self.assertEqual(len(rows), 3)
             self.assertIn("+08:00", rows[0]["created_at"])
             audits = conn.execute(
-                "SELECT strategy_id,strategy_version,strategy_checksum FROM paper_audit"
+                "SELECT account_id,strategy_id,strategy_version,strategy_checksum FROM paper_audit"
                 " WHERE event='roster_budget_declared'").fetchall()
             self.assertEqual(len(audits), 3)
             for row in audits:
-                self.assertEqual(row["strategy_id"], row["strategy_id"])
+                # 版本戳必须属于**该账户自己的**策略版本（触发器只校验存在性，
+                # 三个账户都盖同一个 strategy_id 也能通过）。
+                self.assertEqual(row["strategy_id"], row["account_id"])
                 self.assertEqual(row["strategy_version"], 1)
                 self.assertTrue(row["strategy_checksum"])
         finally:
@@ -454,3 +461,74 @@ class CycleBudgetSeedingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class ReviewRegressionTests(unittest.TestCase):
+    """针对 Codex/GPT 审核发现的回归用例（每条对应一个已修缺陷）。"""
+
+    def test_initial_params_returns_empty_for_exit_only_ids(self):
+        self.assertEqual(ROSTER.initial_params('sector_rotation', effective_date='2026-10-26'), {})
+        params = ROSTER.initial_params('trend_pullback', effective_date='2026-10-26')
+        self.assertEqual(params['adaptive_allocation']['weight_pct'], 50.0)
+
+    def test_capital_edit_keeps_roster_ratio_and_leaves_history_alone(self):
+        folder = tempfile.TemporaryDirectory(prefix='roster-capital-')
+        self.addCleanup(folder.cleanup)
+        patch = mock.patch.object(PT, 'DB_PATH', os.path.join(folder.name, 'paper.sqlite3'))
+        patch.start()
+        self.addCleanup(patch.stop)
+        PT.init_db()
+        with PT._db() as conn:
+            RSET.update(conn, {'enabled_strategies': list(ROSTER.formal_strategy_ids())},
+                        actor='roster-test')
+        PT.set_accounts_status('paused')
+        _, cycle = PT.start_new_cycle(capital=300_000, include_dashboard=False)
+        with PT._db() as conn:
+            conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at)"
+                         " VALUES('tq_breakout','2026-10-24',1.0,0.0,1.0,NULL,'2026-10-24 10:00:00')")
+        PT.set_accounts_status('paused')
+        # 草稿期改资金：必须仍按 20/50/30 归属，且不能重写历史净值行。
+        with mock.patch.object(PT, 'dashboard', return_value={}):
+            PT.configure_capital(600_000)
+        with PT._db() as conn:
+            values = {row['id']: round(row['initial_cash'], 2) for row in conn.execute(
+                'SELECT id,initial_cash FROM paper_accounts WHERE cycle_id=?', (cycle['id'],))}
+            history = conn.execute(
+                "SELECT cash FROM paper_nav WHERE account_id='tq_breakout' AND nav_date='2026-10-24'"
+            ).fetchone()[0]
+        self.assertEqual(values, {'tq_breakout': 120000.0, 'trend_pullback': 300000.0,
+                                  'reported_profit_breakout': 180000.0})
+        self.assertEqual(history, 1.0, '草稿期改资金重写了历史净值行')
+
+    def test_new_cycle_keeps_the_daily_policy_authorisation(self):
+        folder = tempfile.TemporaryDirectory(prefix='roster-policy-')
+        self.addCleanup(folder.cleanup)
+        patch = mock.patch.object(PT, 'DB_PATH', os.path.join(folder.name, 'paper.sqlite3'))
+        patch.start()
+        self.addCleanup(patch.stop)
+        PT.init_db()
+        with PT._db() as conn:
+            RSET.update(conn, {'enabled_strategies': list(ROSTER.formal_strategy_ids())},
+                        actor='roster-test')
+        PT.set_accounts_status('paused')
+        _, cycle = PT.start_new_cycle(capital=300_000, include_dashboard=False)
+        policy = {'id': 'authorized-daily-performance-v2', 'status': 'active',
+                  'approved_by': 'user_delegated_design', 'approved_at': '2026-10-26T09:00:00+08:00',
+                  'effective_date': '2026-10-26', 'min_sell_samples': 3, 'min_weight_pct': 5.0,
+                  'max_weight_pct': 60.0, 'max_daily_step_pct': 2.0}
+        with PT._db() as conn:
+            for strategy_id in ROSTER.formal_strategy_ids():
+                params = json.loads(conn.execute(
+                    'SELECT params FROM paper_accounts WHERE id=?', (strategy_id,)).fetchone()[0])
+                params['adaptive_allocation_policy'] = policy
+                conn.execute('UPDATE paper_accounts SET params=? WHERE id=?',
+                             (json.dumps(params), strategy_id))
+        PT.set_accounts_status('paused')
+        _, next_cycle = PT.start_new_cycle(capital=300_000, include_dashboard=False)
+        with PT._db() as conn:
+            for strategy_id in ROSTER.formal_strategy_ids():
+                params = json.loads(conn.execute(
+                    'SELECT params FROM paper_accounts WHERE id=? AND cycle_id=?',
+                    (strategy_id, next_cycle['id'])).fetchone()[0])
+                self.assertEqual(params['adaptive_allocation_policy'], policy,
+                                 '新周期把每日调权授权丢了')
+                self.assertEqual(params['adaptive_allocation']['weight_pct'],
+                                 ROSTER.role_for(strategy_id).budget_share * 100)
