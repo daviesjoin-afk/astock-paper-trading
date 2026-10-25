@@ -111,7 +111,7 @@ def run(now=None):
     _check(rows, "schedule_auction_track", task is not None and getattr(task, "clock", None) == "09:15",
            f"竞价跟踪时钟 {getattr(task, 'clock', None) if task else '缺失'}")
 
-    import dfc  # noqa: F401  (仅为确认数据层可导入)
+    import data_fetcher as dfc  # noqa: F401  (确认数据层可导入)
     kline_dir = Path(getattr(dfc, "KLINE_DIR", "")) if getattr(dfc, "KLINE_DIR", None) else None
     if kline_dir is not None:
         count = len(list(kline_dir.glob("*.csv"))) if kline_dir.is_dir() else 0

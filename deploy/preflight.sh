@@ -56,7 +56,7 @@ if grep -q "auction-track" /etc/cron.d/astock-codex 2>/dev/null; then
 else
   fail "cron 缺少 auction-track"
 fi
-if [ -x "$ROOT/deploy/resume_three_strategy_cycle.sh" ]; then
+if [ -f "$ROOT/deploy/resume_three_strategy_cycle.sh" ]; then
   if [ -f "$ROOT/.start_three_strategy_cycle" ]; then
     pass "周一启动器就绪（标记文件存在）"
   else
@@ -71,11 +71,14 @@ FREE_GB="$(df -Pk / | awk 'NR==2 {printf "%d", $4/1024/1024}')"
 if [ "${FREE_GB:-0}" -ge 2 ]; then pass "根分区可用 ${FREE_GB}GB"; else fail "根分区仅 ${FREE_GB}GB"; fi
 [ -w "$ROOT/.locks" ] && pass "锁目录可写 $ROOT/.locks" || fail "锁目录不可写 $ROOT/.locks"
 
-# 5. 容器内侧自检
-if docker exec astock-codex python /app/scripts/monday_preflight.py 2>&1 | sed 's/^/    /'; then
+# 5. 容器内侧自检（显式取退出码，避免管道把失败吞成成功）
+INNER_OUTPUT="$(docker exec astock-codex python /app/scripts/monday_preflight.py 2>&1)"
+INNER_STATUS=$?
+printf '%s\n' "$INNER_OUTPUT" | sed 's/^/    /'
+if [ "$INNER_STATUS" -eq 0 ]; then
   pass "容器内自检通过"
 else
-  fail "容器内自检未通过（见上面明细）"
+  fail "容器内自检未通过（退出码 $INNER_STATUS）"
 fi
 
 echo "合计 FAIL=$FAIL WARN=$WARN"
