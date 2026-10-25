@@ -16,13 +16,20 @@ fail() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
 
 echo "宿主机自检 $(date '+%Y-%m-%d %H:%M:%S')"
 
-# 1. 三端一致：git HEAD / 镜像构建参数
+# 1. 三端一致：git HEAD / 镜像内构建身份
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-IMAGE_SHA="$(docker image inspect astock-codex:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || echo unknown)"
-if [ "$HEAD_SHA" != "unknown" ] && [ "$HEAD_SHA" = "$IMAGE_SHA" ]; then
-  pass "git HEAD 与镜像标签一致：$HEAD_SHA"
+IMAGE_SHA="$(docker image inspect astock-codex:latest \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+  | sed -n 's/^ASTOCK_GIT_COMMIT=//p' | head -1)"
+IMAGE_SHA="${IMAGE_SHA:-unknown}"
+CONTAINER_SHA="$(docker inspect astock-codex \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+  | sed -n 's/^ASTOCK_GIT_COMMIT=//p' | head -1)"
+CONTAINER_SHA="${CONTAINER_SHA:-unknown}"
+if [ "$HEAD_SHA" != "unknown" ] && [ "$HEAD_SHA" = "$IMAGE_SHA" ] && [ "$HEAD_SHA" = "$CONTAINER_SHA" ]; then
+  pass "三端一致：git HEAD = 镜像 = 运行容器 = $HEAD_SHA"
 else
-  fail "git HEAD=$HEAD_SHA 与镜像构建参数=$IMAGE_SHA 不一致（需要重建镜像）"
+  fail "三端不一致：git=$HEAD_SHA 镜像=$IMAGE_SHA 容器=$CONTAINER_SHA"
 fi
 if [ -z "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
   pass "工作树干净（无未提交改动）"
