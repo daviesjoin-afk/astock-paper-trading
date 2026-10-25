@@ -94,6 +94,7 @@ import execution_profiles as EPF
 import execution_planner as EP
 import execution_verification as EV
 import paper_entry_decision as PED
+import main_force_confirmation as MFC
 import paper_candidate_projection as PCP
 import paper_risk_market_inputs as PRMI
 import paper_sizing as PSZ
@@ -6911,7 +6912,8 @@ def _dsl_entry_assessment(account_id, spec, pick, quote, decision, threshold_del
     }
 
 
-def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_delta=0.0, market=None):
+def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_delta=0.0, market=None,
+                               asof=None):
     """按各模拟盘账户各自的独立模型复核入场。"""
     account_id = account["id"]
     spec = _spec_for(account_id)
@@ -7005,7 +7007,10 @@ def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_
         vwap = _num((microstructure or {}).get("vwap_deviation_pct"), None)
         add("每日主力观察排名", rank_score, 0.22, f"每日10只复合排名分 {rank_score:.3f}")
         add("主力净流入占比", main_pct / 6.0, 0.23, f"主力净流入 {main_pct:+.2f}%")
-        add("资金成交强度", flow_intensity / 0.04, 0.18, f"主力净额/成交额 {flow_intensity*100:+.2f}%")
+        # 净额/成交额与主力占比是同一资金观察的两种表示，不重复投票。
+        # 保留原始比例和最低门槛，供风控及审计核验。
+        add("资金成交强度（口径核验）", flow_intensity / 0.04, 0.0,
+            f"主力净额/成交额 {flow_intensity*100:+.2f}%；不重复计分")
         add("实时量能", vol_ratio / 1.8, 0.12, f"量比 {vol_ratio:.2f}")
         add("安全涨幅区间", 1.0 if 0.3 <= pct <= 5.5 else 0.55 if -0.5 <= pct <= 7.5 else 0.0,
             0.10, f"实时涨幅 {pct:+.2f}%")
@@ -7316,7 +7321,19 @@ def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_
         )
         threshold_context["threshold_delta"] = round(_num(threshold_delta), 3)
         threshold_context["effective_threshold"] = round(threshold, 3)
-    passed = not blockers and score >= threshold
+    main_force_confirmation = None
+    if account_id in {"tq_breakout", "trend_pullback", NEW_STRATEGY_ID, MAIN_FORCE_STRATEGY_ID}:
+        main_force_confirmation = MFC.assess(quote, asof=asof)
+        effect = MFC.entry_effect(
+            account_id, main_force_confirmation,
+            base_score=score, threshold=threshold, blockers=blockers,
+        )
+        main_force_confirmation["entry_effect"] = effect
+        score = effect["score"]
+        # 只在原入场已经通过后提供有限排序加分，不能救活被否决的买入。
+        passed = effect["passed"]
+    else:
+        passed = not blockers and score >= threshold
     reasons = list(blockers)
     if score < threshold:
         if account_id in {"sector_rotation", "trend_pullback", MAIN_FORCE_STRATEGY_ID}:
@@ -7339,6 +7356,7 @@ def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_
         "reasons": reasons,
         "overheat_guard": overheat,
         "microstructure": microstructure,
+        "main_force_confirmation": main_force_confirmation,
         "timing_mode": timing_mode,
         # 热点加速段的赔率尚可但回撤显著增加；通过也只使用常规单笔规模的三分之一。
         "position_scale": (
