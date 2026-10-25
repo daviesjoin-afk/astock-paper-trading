@@ -325,6 +325,31 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
             conn.close()
 
 
+    def test_daily_policy_can_be_reauthorised_for_v2_bounds(self):
+        result = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
+        self.assertTrue(result["verified"]["ok"], result["verified"])
+        self.assertEqual({row["result"] for row in result["steps"]}, {"authorized"})
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            for strategy_id in ROSTER.formal_strategy_ids():
+                params = json.loads(conn.execute(
+                    "SELECT params FROM paper_accounts WHERE id=?", (strategy_id,)).fetchone()[0])
+                policy = params["adaptive_allocation_policy"]
+                self.assertEqual(policy["id"], "authorized-daily-performance-v2")
+                self.assertEqual(policy["min_weight_pct"], 5.0)
+                self.assertEqual(policy["max_weight_pct"], 60.0)
+                self.assertIn("+08:00", policy["approved_at"])
+            for strategy_id in ROSTER.exit_only_ids():
+                params = json.loads(conn.execute(
+                    "SELECT params FROM paper_accounts WHERE id=?", (strategy_id,)).fetchone()[0])
+                self.assertNotIn("adaptive_allocation_policy", params)
+        finally:
+            conn.close()
+        again = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
+        self.assertEqual({row["result"] for row in again["steps"]}, {"already_authorized"})
+
+
 class CycleBudgetSeedingTests(unittest.TestCase):
     """新周期开局按名册写入初始预算 20/50/30，并且真的被分配口径读到。
 

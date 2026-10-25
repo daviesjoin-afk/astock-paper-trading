@@ -135,6 +135,32 @@ class DynamicPolicyTests(unittest.TestCase):
         self.assertEqual(result["status"], "infeasible_current_weights")
         self.assertEqual(self.conn.total_changes, before)
 
+    def test_retired_sleeves_in_the_same_cycle_are_left_untouched(self):
+        """退出策略仍在周期账本里，但每日调权只能动执行参与者。"""
+        retired = {"adaptive_allocation_policy": self.params["adaptive_allocation_policy"],
+                   "adaptive_allocation": {"status": "active", "weight_pct": 15.0}}
+        for retire_id in ("3", "4"):
+            self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                              (json.dumps(retired), retire_id))
+        for participant_id, weight in (("0", 20.0), ("1", 50.0), ("2", 30.0)):
+            params = {**self.params,
+                      "adaptive_allocation": {"status": "active", "weight_pct": weight}}
+            self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                              (json.dumps(params), participant_id))
+        self.conn.commit()
+        with patch.object(D.P, "_cycle_initial", return_value=60000.0), \
+                patch.object(D.P, "realized_pnl", return_value=(1000.0, "verified")), \
+                patch.object(D.P, "_sell_fills", return_value=(
+                    [{"order_id": 1}, {"order_id": 2}, {"order_id": 3}], [], True)):
+            result = D.rebalance(self.conn, cycle_id=13, decision_at="2026-10-13T09:31:00+08:00",
+                                 account_ids=("0", "1", "2", "3", "4")[:3])
+        self.assertEqual(result["status"], "evaluated")
+        self.assertEqual(sorted(result["weights_pct"]), ["0", "1", "2"])
+        for retire_id in ("3", "4"):
+            params = json.loads(self.conn.execute(
+                "SELECT params FROM paper_accounts WHERE id=?", (retire_id,)).fetchone()[0])
+            self.assertEqual(params["adaptive_allocation"]["weight_pct"], 15.0)
+
     def test_invalid_or_infeasible_current_weights_are_rejected(self):
         for bad in ([20, 20, 20, 20, 21], [70, 10, 10, 5, 5], [float('nan')] * 5):
             with self.assertRaises(ValueError):

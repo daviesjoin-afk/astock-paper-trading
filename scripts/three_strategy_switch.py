@@ -373,6 +373,59 @@ def write_budget_weights(path, *, effective_date=None):
             "verified": verify_budget(report, declared)}
 
 
+def authorize_daily_policy(path, *, effective_date=None):
+    """按 v2 规则重新授权"每日小幅调权"通道（只给三个正式策略）。
+
+    v1 的授权内嵌了 15%–30% 的旧边界，代码升到 v2 后会被判为 ``not_authorized``；
+    这里写一份新的、与 ``paper_dynamic_allocation.POLICY_RULES`` 完全一致的授权，
+    让人可以继续用自进化在 5%–60%、每日最多 ±2 个百分点内调整 20/50/30。
+    """
+    import datetime as dt
+
+    sys.path.insert(0, str(BACKEND))
+    import sqlite3
+
+    import paper_dynamic_allocation as PDAlloc
+    import strategy_roster as ROSTER
+
+    day = str(effective_date or dt.date.today().isoformat())[:10]
+    stamp = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
+    policy = {"id": PDAlloc.POLICY_ID, "status": "active",
+              "approved_by": "user_delegated_design", "approved_at": stamp,
+              "effective_date": day, **PDAlloc.POLICY_RULES}
+    conn = sqlite3.connect(str(Path(path).resolve()), timeout=15)
+    conn.row_factory = sqlite3.Row
+    steps = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for strategy_id in ROSTER.formal_strategy_ids():
+            row = conn.execute("SELECT params FROM paper_accounts WHERE id=?",
+                               (strategy_id,)).fetchone()
+            if row is None:
+                raise SystemExit(f"账本缺少账户 {strategy_id}，已回滚未做修改")
+            params = json.loads(row["params"] or "{}")
+            if params.get("adaptive_allocation_policy") == policy:
+                steps.append({"strategy_id": strategy_id, "result": "already_authorized"})
+                continue
+            params["adaptive_allocation_policy"] = policy
+            conn.execute("UPDATE paper_accounts SET params=?, updated_at=? WHERE id=?",
+                         (json.dumps(params, ensure_ascii=False), stamp, strategy_id))
+            steps.append({"strategy_id": strategy_id, "result": "authorized",
+                          "policy_id": PDAlloc.POLICY_ID,
+                          "bounds_pct": [PDAlloc.POLICY_RULES["min_weight_pct"],
+                                         PDAlloc.POLICY_RULES["max_weight_pct"]],
+                          "max_daily_step_pct": PDAlloc.POLICY_RULES["max_daily_step_pct"]})
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"steps": steps,
+            "verified": {"ok": all(row["result"] in ("authorized", "already_authorized")
+                                   for row in steps)}}
+
+
 def verify_budget(report, declared):
     """预算声明后的验收：三个正式策略的权重必须正好是 20 / 50 / 30。"""
     problems = []
@@ -420,6 +473,8 @@ def main(argv=None):
                         help="给三个正式策略追加 20/50/30 预算声明（写账本，需 --apply）")
     parser.add_argument("--effective-date", default="",
                         help="预算声明的生效日，缺省为今天（YYYY-MM-DD）")
+    parser.add_argument("--authorize-daily-policy", action="store_true",
+                        help="按 v2 规则重新授权每日小幅调权（需 --apply）")
     args = parser.parse_args(argv)
 
     if not Path(args.paper_db).exists():
@@ -440,6 +495,11 @@ def main(argv=None):
         print(json.dumps({"budget_verified": budget["verified"]},
                          ensure_ascii=True, indent=2))
         ok = ok and budget["verified"]["ok"]
+    if args.authorize_daily_policy:
+        authorisation = authorize_daily_policy(args.paper_db,
+                                               effective_date=args.effective_date or None)
+        print(json.dumps(authorisation["steps"], ensure_ascii=True, indent=2))
+        ok = ok and authorisation["verified"]["ok"]
     print(json.dumps({"verified": report["verified"],
                       "after": _summary(report["after"])}, ensure_ascii=True, indent=2))
     return 0 if ok else 1

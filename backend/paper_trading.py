@@ -7991,7 +7991,10 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
     reading = MDSvc.read_snapshot(
         MDC.LIVE_MARKET_POLICY, now=instant, asof_day=asof_day)
     if reading.status == MDC.STATUS_FRESH and asof_day == instant.astimezone(PDAlloc.E.TZ).date().isoformat():
-        PDAlloc.rebalance(conn, cycle_id=cycle_id, decision_at=decision_at)
+        # 每日调权只管理本周期**执行参与者**：退出独立资金账户的旧策略仍在同一
+        # 周期账本里，但它们的权重已不参与分配，不能让它们把正式策略的权重稀释。
+        PDAlloc.rebalance(conn, cycle_id=cycle_id, decision_at=decision_at,
+                          account_ids=current_cycle_participant_ids(conn, cycle_id))
     snapshot = PRS.capture_portfolio_runtime_snapshot(
         conn, cycle_id=cycle_id, asof_day=asof_day,
         decision_at=decision_at, builtin_scope=ACTIVE_ACCOUNT_IDS,

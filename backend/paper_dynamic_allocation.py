@@ -75,8 +75,14 @@ def target_weights(current, returns):
     return {k: units[k] / 100 for k in sorted(units)}
 
 
-def rebalance(conn, *, cycle_id, decision_at):
-    """Daily evaluation using only previous-day bounded verified execution."""
+def rebalance(conn, *, cycle_id, decision_at, account_ids=None):
+    """Daily evaluation using only previous-day bounded verified execution.
+
+    ``account_ids`` 是本周期**执行参与者**。给了就只管理这些账户：退出独立资金
+    账户（retiring）的旧策略仍挂在同一周期账本上，它们的权重已经不再参与分配，
+    却会因为"必须覆盖周期内全部账户"的旧口径而把三个正式策略的权重一起稀释。
+    不给时保持旧行为（整周期），兼容既有调用与测试。
+    """
     instant = dt.datetime.fromisoformat(str(decision_at))
     if instant.tzinfo is None:
         raise ValueError("aware decision timestamp required")
@@ -89,6 +95,11 @@ def rebalance(conn, *, cycle_id, decision_at):
         return {"status": "inactive"}
     rows = [dict(r) for r in conn.execute(
         "SELECT * FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))]
+    if account_ids is not None:
+        scope = {str(item) for item in account_ids}
+        rows = [row for row in rows if str(row["id"]) in scope]
+        if not rows:
+            return {"status": "no_participant_in_cycle"}
     if not rows or any(r["status"] != "running" for r in rows):
         return {"status": "inactive"}
     params = {r["id"]: E._account_params(r) for r in rows}
