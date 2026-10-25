@@ -499,8 +499,17 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         max_severity = max((item["severity"] for item in findings), key=lambda value: rank[value])
     import factor_effectiveness_report as factor_report
     factor_effectiveness = factor_report.evidence_summary(factor_report.build_report(paper_db_path, asof=now))
+    import main_force_trade_evidence
+    main_force_cases = main_force_trade_evidence.evidence_summary(
+        main_force_trade_evidence.build_report(paper_db_path, asof=now))
+    import intraday_t_pair_report
+    intraday_t_pairs = intraday_t_pair_report.evidence_summary(
+        intraday_t_pair_report.build_report(paper_db_path, asof=now))
     import auction_analysis
     auction_evidence = auction_analysis.evidence(now, rows, adaptive_conn, important_codes)
+    import auction_factor_shadow
+    auction_factor = auction_factor_shadow.evidence_summary(
+        auction_factor_shadow.build_report(now))
     evidence = {
         "scope": "paper_trading_only",
         "generated_at": _now(),
@@ -523,7 +532,10 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         "paper_ledger": ledger,
         "account_performance": account_performance,
         "factor_effectiveness": factor_effectiveness,
+        "main_force_trade_cases": main_force_cases,
+        "intraday_t_pairs": intraday_t_pairs,
         "auction_tracking": auction_evidence,
+        "auction_factor_shadow": auction_factor,
         "adaptive_learning": adaptive_stats,
         "deterministic_findings": findings,
         "deterministic_findings_meaning": "仅列出已执行检查发现的异常；空列表表示这些检查未发现异常，不代表因子有效性证据充分。",

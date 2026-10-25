@@ -293,8 +293,13 @@ export function renderDataValidity(d){
   var warnings=(d.warnings||[]).slice(0,5).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li>当前没有数据质量告警。</li>';
   var source=d.source_health||{};
   var tracking=d.auction_tracking||{};
+  var auctionSummary=tracking.summary||{};
+  var auctionAmount=Number(auctionSummary.amount_total||0);
+  var auctionAmountText=auctionAmount>0
+    ?'竞价额 ¥'+(auctionAmount/10000).toFixed(2)+' 万（覆盖 '+Number(auctionSummary.with_amount||0)+'/'+Number(auctionSummary.tracked||0)+' 只）'
+    :'竞价额 暂无（上游未返回金额）';
   var trackingText=tracking.captured_at
-    ?String(tracking.captured_at).replace('T',' ').substring(0,19)+' · '+Number(tracking.tracked_stocks||0)+' 只 · '+Number(tracking.observations||0)+' 轮'+(tracking.status==='blocked'?' · 本轮无有效竞价报价':'')
+    ?String(tracking.captured_at).replace('T',' ').substring(0,19)+' · '+Number(tracking.tracked_stocks||0)+' 只 · '+Number(tracking.observations||0)+' 轮 · '+auctionAmountText+(tracking.status==='blocked'?' · 本轮无有效竞价报价':'')
     :'尚无采集记录';
   $('dataValidityDetails').innerHTML='<b>数据源：</b>'+adaptiveEsc(source.healthy===true?(live.status==='degraded'?'探活正常，当前快照字段仍降级':'主源与独立源正常'):(source.healthy===false?'行情源降级，历史补齐不能修复此问题':'尚无健康检查结果'))+' · <b>最新交易日：</b>'+adaptiveEsc((d.reference||{}).latest_trade_date||'—')+' · <b>不复权兜底：</b>'+Number(c.fallback_unadjusted||0)+' 只 · <b>源快照年龄：</b>'+ (live.age_seconds==null?'—':fmt(live.age_seconds,0)+' 秒')
     +'<div style="margin-top:5px"><b>告警：</b><ul style="margin:3px 0 0 18px">'+warnings+'</ul></div>'

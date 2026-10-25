@@ -60,7 +60,7 @@ export function refreshOperatorUnlockState(){
 }
 
 // ---------- 统一设置中心 ----------
-export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'};
+export var SETTINGS_STRATEGY_NAMES={tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守',main_force_top10:'超强主力股'};
 
 export var SETTINGS_DURATION_OPTIONS=[15,30,60,90,180,0];
 

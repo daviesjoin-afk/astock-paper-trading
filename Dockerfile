@@ -84,6 +84,9 @@ COPY --chown=app:app deploy ./deploy
 # 于是"镜像自带的测试套件"与实际内容不一致。文档总共不到 1MB，直接带上。
 COPY --chown=app:app *.md LICENSE ./
 COPY --chown=app:app docs ./docs
+# 运维脚本（三策略切换审计、账本盘点）必须随镜像一起发布：否则线上只能靠
+# ``docker cp`` 临时塞进去，重建后就消失，也无法在容器里复核只读审计结果。
+COPY --chown=app:app scripts ./scripts
 
 USER app
 EXPOSE 8600

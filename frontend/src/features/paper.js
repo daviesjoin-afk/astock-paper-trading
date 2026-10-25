@@ -503,7 +503,7 @@ export function renderPaperStrategyCenter(d){
 }
 
 export function paperResearchStrategyName(id){
-  return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
+  return ({tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守',main_force_top10:'超强主力股'})[id]||id||'未知策略';
 }
 
 export function paperResearchOutcome(metric,horizon){
@@ -659,7 +659,7 @@ export function syncCycleControls(cycle, accounts){
 
 export function paperAccountDisplayName(account){
   var id=account&&account.id;
-  return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
+  return ({tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
 }
 
 export function paperOverviewVariant(){

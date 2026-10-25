@@ -74,3 +74,5 @@ mailmap.txt
 
 # r9~r36 轮次审计的一次性脚本与日志：仅本地留存，不入库（Dockerfile 不 COPY，backend 禁止 import）。
 work/
+.start_three_strategy_cycle
+.docker/

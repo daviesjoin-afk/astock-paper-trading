@@ -27,7 +27,9 @@ class StrategyRegistryTests(unittest.TestCase):
     def test_labels_returns_a_copy_without_mutating_registry(self):
         labels = registry.labels()
         labels["tq_breakout"] = "changed"
-        self.assertEqual(registry.get("tq_breakout").name, "短线日内做T")
+        # 注册表可能从本地账本读名字，这里只锁"返回值是副本、不污染真相"。
+        self.assertNotEqual(registry.labels()["tq_breakout"], "changed")
+        self.assertIn("tq_breakout", registry.labels())
         self.assertIsNone(registry.get("unknown"))
 
     def test_adaptive_risk_labels_are_derived_from_registry(self):
