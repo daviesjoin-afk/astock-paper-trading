@@ -277,6 +277,95 @@ def apply_retirement(path, confirmed_ids):
             "verified": verify_switch(after)}
 
 
+BUDGET_REASON = "三策略名册初始预算 20/50/30"
+
+
+def write_budget_weights(path, *, effective_date=None):
+    """给三个正式策略**追加**一条按周期的预算声明（20 / 50 / 30）。
+
+    只追加、不删除历史：写入 ``paper_accounts.params`` 的当前值，并在
+    ``paper_parameter_versions`` 里留一条带时区的历史行（分配权重解析器会跳过
+    naive 时间戳）。``adaptive_allocation_previous`` 保留被替换的前值，回滚只需
+    再追加一条旧值。退出策略与用户策略一律不碰。
+    """
+    import datetime as dt
+
+    sys.path.insert(0, str(BACKEND))
+    import sqlite3
+
+    import strategy_roster as ROSTER
+
+    day = str(effective_date or dt.date.today().isoformat())[:10]
+    stamp = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
+    conn = sqlite3.connect(str(Path(path).resolve()), timeout=15)
+    conn.row_factory = sqlite3.Row
+    steps = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for strategy_id in ROSTER.formal_strategy_ids():
+            row = conn.execute(
+                "SELECT id,cycle_id,params,version,style FROM paper_accounts WHERE id=?",
+                (strategy_id,)).fetchone()
+            if row is None:
+                raise SystemExit(f"账本缺少账户 {strategy_id}，已回滚未做修改")
+            params = json.loads(row["params"] or "{}")
+            previous = params.get("adaptive_allocation")
+            target = ROSTER.initial_params(strategy_id, effective_date=day)["adaptive_allocation"]
+            if previous == target:
+                steps.append({"strategy_id": strategy_id, "result": "already_declared",
+                              "weight_pct": target["weight_pct"]})
+                continue
+            params["adaptive_allocation_previous"] = previous
+            params["adaptive_allocation"] = target
+            payload = json.dumps(params, ensure_ascii=False)
+            conn.execute("UPDATE paper_accounts SET params=?, updated_at=? WHERE id=?",
+                         (payload, stamp, strategy_id))
+            conn.execute(
+                "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,"
+                "reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (row["cycle_id"], strategy_id, row["version"], row["style"], payload,
+                 BUDGET_REASON, day, stamp))
+            conn.execute(
+                "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
+                (strategy_id, "roster_budget_declared",
+                 json.dumps({"weight_pct": target["weight_pct"], "effective_date": day,
+                             "previous": previous, "roster": ROSTER.ROSTER_VERSION},
+                            ensure_ascii=False), stamp))
+            steps.append({"strategy_id": strategy_id, "result": "declared",
+                          "weight_pct": target["weight_pct"],
+                          "previous_weight_pct": (previous or {}).get("weight_pct")})
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    report = audit(path)
+    declared = {row["strategy_id"]: row["weight_pct"] for row in steps}
+    return {"steps": steps, "after": report,
+            "verified": verify_budget(report, declared)}
+
+
+def verify_budget(report, declared):
+    """预算声明后的验收：三个正式策略的权重必须正好是 20 / 50 / 30。"""
+    problems = []
+    expected = {"tq_breakout": 20.0, "trend_pullback": 50.0, "reported_profit_breakout": 30.0}
+    for strategy_id, weight in expected.items():
+        item = report["strategies"].get(strategy_id) or {}
+        actual = item.get("allocation_weight_pct")
+        if actual is None or abs(float(actual) - weight) > 1e-6:
+            problems.append(f"{strategy_id} 权重为 {actual}，期望 {weight}")
+    for strategy_id in EXIT_ONLY_IDS:
+        item = report["strategies"].get(strategy_id) or {}
+        # 退出策略的历史权重行会保留（旧周期确实按它分过钱），只要它们不再是
+        # 执行参与者就不参与分配；这里只做提示，不算失败。
+        if item.get("allocation_weight_pct") is not None:
+            problems_note = (f"{strategy_id} 保留历史权重 "
+                             f"{item['allocation_weight_pct']}%（已退出执行，不参与分配）")
+            report.setdefault("notes", []).append(problems_note)
+    return {"ok": not problems, "problems": problems, "declared": declared}
+
+
 def verify_switch(report):
     """切换后的验收断言；任何一条不成立都返回 False 与原因。"""
     problems = []
@@ -300,6 +389,10 @@ def main(argv=None):
     parser.add_argument("--confirm-retire", default="",
                         help="必须显式写成 sector_rotation,main_force_top10")
     parser.add_argument("--compact", action="store_true", help="只打印摘要")
+    parser.add_argument("--write-budget-weights", action="store_true",
+                        help="给三个正式策略追加 20/50/30 预算声明（写账本，需 --apply）")
+    parser.add_argument("--effective-date", default="",
+                        help="预算声明的生效日，缺省为今天（YYYY-MM-DD）")
     args = parser.parse_args(argv)
 
     if not Path(args.paper_db).exists():
@@ -312,9 +405,17 @@ def main(argv=None):
     confirmed = [item.strip() for item in args.confirm_retire.split(",") if item.strip()]
     report = apply_retirement(args.paper_db, confirmed)
     print(json.dumps(report["steps"], ensure_ascii=True, indent=2))
+    ok = report["verified"]["ok"]
+    if args.write_budget_weights:
+        budget = write_budget_weights(args.paper_db,
+                                      effective_date=args.effective_date or None)
+        print(json.dumps(budget["steps"], ensure_ascii=True, indent=2))
+        print(json.dumps({"budget_verified": budget["verified"]},
+                         ensure_ascii=True, indent=2))
+        ok = ok and budget["verified"]["ok"]
     print(json.dumps({"verified": report["verified"],
                       "after": _summary(report["after"])}, ensure_ascii=True, indent=2))
-    return 0 if report["verified"]["ok"] else 1
+    return 0 if ok else 1
 
 
 def _summary(report):

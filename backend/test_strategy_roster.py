@@ -174,10 +174,20 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
         self.conn.execute(
             """CREATE TABLE paper_accounts(
                    id TEXT PRIMARY KEY, name TEXT, status TEXT, cycle_id INTEGER,
-                   initial_cash REAL, cash REAL, params TEXT)""")
+                   initial_cash REAL, cash REAL, params TEXT, version TEXT, style TEXT,
+                   updated_at TEXT)""")
         self.conn.execute(
             "CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, status TEXT, capital REAL,"
             " enabled_strategies TEXT)")
+        self.conn.execute(
+            """CREATE TABLE paper_parameter_versions(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER, account_id TEXT,
+                   version TEXT, style TEXT, params TEXT, reason TEXT,
+                   effective_date TEXT, created_at TEXT)""")
+        self.conn.execute(
+            """CREATE TABLE paper_audit(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, event TEXT,
+                   detail TEXT, created_at TEXT)""")
         self.conn.execute(
             "INSERT INTO paper_cycles VALUES(?,?,?,?)",
             (1, "running", 300000.0, '["tq_breakout","trend_pullback","sector_rotation",'
@@ -185,8 +195,9 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
         for strategy_id in ("tq_breakout", "trend_pullback", "sector_rotation",
                             "reported_profit_breakout", "main_force_top10"):
             self.conn.execute(
-                "INSERT INTO paper_accounts VALUES(?,?,?,?,?,?,?)",
-                (strategy_id, strategy_id, "running", 1, 60000.0, 50000.0, "{}"))
+                "INSERT INTO paper_accounts VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (strategy_id, strategy_id, "running", 1, 60000.0, 50000.0, "{}",
+                 "v3.0", "trend", "2026-10-01 09:00:00"))
         self.conn.commit()
         self.module = _load_script()
 
@@ -250,6 +261,49 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
             self.module.apply_retirement(self.path, ["sector_rotation", "main_force_top10"])
         self.assertEqual(self._state("sector_rotation"), "paper")
         self.assertIn("sector_rotation", SR.active_ids(conn=self.conn))
+
+    def test_budget_weights_are_appended_and_verified(self):
+        self.conn.execute(
+            "UPDATE paper_accounts SET params=? WHERE id='trend_pullback'",
+            (json.dumps({"adaptive_allocation": {"status": "active", "weight_pct": 26.07},
+                         "other_cap": 0.5}),))
+        self.conn.commit()
+        result = self.module.write_budget_weights(self.path, effective_date="2026-10-26")
+        self.assertTrue(result["verified"]["ok"], result["verified"])
+        weights = {row["strategy_id"]: row["weight_pct"] for row in result["steps"]}
+        self.assertEqual(weights, {"tq_breakout": 20.0, "trend_pullback": 50.0,
+                                   "reported_profit_breakout": 30.0})
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            params = json.loads(conn.execute(
+                "SELECT params FROM paper_accounts WHERE id='trend_pullback'").fetchone()[0])
+            self.assertEqual(params["other_cap"], 0.5)
+            self.assertEqual(params["adaptive_allocation"]["weight_pct"], 50.0)
+            self.assertEqual(params["adaptive_allocation_previous"]["weight_pct"], 26.07)
+            rows = conn.execute(
+                "SELECT account_id,params,created_at FROM paper_parameter_versions"
+                " ORDER BY id").fetchall()
+            self.assertEqual(len(rows), 3)
+            self.assertIn("+08:00", rows[0]["created_at"])
+            audits = conn.execute(
+                "SELECT COUNT(*) FROM paper_audit WHERE event='roster_budget_declared'").fetchone()[0]
+            self.assertEqual(audits, 3)
+        finally:
+            conn.close()
+        again = self.module.write_budget_weights(self.path, effective_date="2026-10-26")
+        self.assertEqual({row["result"] for row in again["steps"]}, {"already_declared"})
+
+    def test_budget_weights_never_touch_exit_only_accounts(self):
+        self.module.write_budget_weights(self.path, effective_date="2026-10-26")
+        conn = sqlite3.connect(self.path)
+        try:
+            for strategy_id in ("sector_rotation", "main_force_top10"):
+                raw = conn.execute("SELECT params FROM paper_accounts WHERE id=?",
+                                   (strategy_id,)).fetchone()[0]
+                self.assertEqual(json.loads(raw), {})
+        finally:
+            conn.close()
 
 
 class CycleBudgetSeedingTests(unittest.TestCase):
