@@ -444,3 +444,22 @@ sqlite3 /root/codex/data_cache/paper_trading.sqlite3 < /root/astock-backups/thre
 - `strategy_center()` 与 `adaptive_engine` 的奖励/证据展示改用 `ROSTER.display_name()`；
 - 前端 `src/features/paper.js`、`src/features/adaptive.js` 的 id→名字映射，以及 `dist/app.js` 产物；
 - 线上：周期 15 三个账户的 `paper_accounts.name` 已更新并写审计行。
+
+## 13. 审核驱动的修复（2026-10-26 凌晨）
+
+PR #271 经 Codex 与独立 reviewer 两轮复核，发现的缺陷与修复见下表；修复后 Codex 复审结论为"Didn't find any major issues"（commit `2aaee11`）。
+
+| 级别 | 缺陷 | 修复 |
+|---|---|---|
+| P1 | `configure_capital` 把 20/50/30 改回三等份；`paper_nav` 无作用域地重写全部历史行 | 复用 `_cycle_capital_shares`；只改该账户最近一条净值行；回归用例锁定 120k/300k/180k 与历史行不变 |
+| P1 | `_create_cycle` 丢弃操作者的 `adaptive_allocation_policy`，v2 调权第二个周期起静默失效 | 跨周期携带授权；`rebalance` 的非 `evaluated` 结果按天去重写审计 |
+| P2 | preflight 声称只读却调用 `init_db` / `_active_cycle`（会补建周期） | 改为 `mode=ro` + 纯 SQL，缺表/缺周期一律 FAIL；`enabled_strategies` 也不再走会建表的 helper |
+| P2 | `allocation_overview` 可写连接、参与者为空时过滤器整体跳过 | 只读连接、严格过滤、新增 `ledger_status` 与真实 `scope_reason` |
+| P2 | 做T配对报告：一股一价、缺当日 bar 借用旧价 | 收盘价按 `(code, 卖出交易日)` 解析；只接受精确交易日的 bar，缺失回落当日观测价并标注来源 |
+| P2 | `admit()` 只看全局可用日，单日 IC 也能进 qualifying | 每个"因子×目标"自身 `days >= MIN_DAYS` |
+| P2 | 竞价归档窗口 09:25–09:28 够不到 09:29 重试；失败被 `pass` 吞掉 | 窗口放宽到 09:32；失败写 `status.json` 的 `archive_error` |
+| P2 | 启动器 `set -e` 吞诊断、不校验周期身份 | 显式捕获退出码、校验"启用集合 = 三个正式策略"、失败保留标记 |
+| P2 | 启动器 cron 不在仓库，`sync-cron.sh` 会覆盖 | 新增 `deploy/astock-three-strategy-start.cron` + 安装脚本（工作日 09:05，标记守卫）；preflight 检查 `/etc/cron.d` 实体 |
+| P3 | 端点缺日期/limit 校验、脏金额 500；`initial_params` 文档与行为不符 | 日期严格解析、limit 兜底、金额走 `_number`；非名册返回 `{}` |
+
+验证：全量 `pytest backend` 通过；线上 `deploy/preflight.sh` **PASS=27 WARN=0 FAIL=0**。
