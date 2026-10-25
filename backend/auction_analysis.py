@@ -168,7 +168,7 @@ def evidence(now, market_rows, conn, focus_codes=()):
                 stocks.setdefault(code, {'code': code, 'points': []})['points'].append({
                     'quote_at': stamp.isoformat(), 'captured_at': captured.isoformat(), 'price': price,
                     'pct': row.get('pct'), 'volume': row.get('volume'), 'amount': row.get('amount'),
-                    'main_net': row.get('main_net'), 'bid1':row.get('bid1'), 'ask1':row.get('ask1'),
+                    'main_net': row.get('main_net'),
                     'phase': observation.get('phase'), 'source': row.get('source')})
     focus = set(focus_codes) | _selection_codes(now)
     current = _current_quotes(market_rows, now)
