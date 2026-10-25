@@ -250,6 +250,20 @@ def allocation_declaration(strategy_id, *, effective_date, reason=BUDGET_POLICY_
     }
 
 
+def initial_params(strategy_id, *, effective_date):
+    """新周期开局时写进 ``paper_accounts.params`` 的初始预算声明。
+
+    这是"初始 20/50/30"的唯一落地口径：每个新周期开始时按名册重置一次，
+    之后的调整交给自进化通道（``paper_dynamic_allocation`` 的每日小步与
+    ``evolution_apply`` 的显式提案），两条通道都只在既有边界内改
+    ``weight_pct``，本函数不参与后续覆盖。
+
+    非名册账户（用户策略、已退出策略）返回空表：不得凭空给它们造预算。
+    """
+    declaration = allocation_declaration(strategy_id, effective_date=effective_date)
+    return declaration["params"]
+
+
 def factor_policy():
     """因子取舍：优先试验 / 降低依赖 / 不据此调权（依据见方案第 3 节）。"""
     return {
@@ -273,20 +287,43 @@ def factor_policy():
 
 _TARGET_SPEC_FIELDS = ("max_positions", "max_weight", "max_exposure")
 
+#: 名册目标与代码声明之间**故意保留**的差异，逐条写明为什么不动。
+#:
+#: 调研结论（2026-10-25）：账户声明里有一批字段根本没有执行消费者，另有一批
+#: 字段的口径与方案假设不同（方案按"策略参考本金"，代码按"共享池 NAV"），还有
+#: 一批改了会立刻影响现有持仓的退出。把这些差异混进"待办"里，等于假装改一个
+#: 数字就能得到方案里的风险画像——所以单独标注，并在报告里解释。
+DELIBERATE_REASONS = {
+    "max_weight": (
+        "ACCOUNT_SPECS.max_weight 没有任何执行路径读取（只写进审计列/页面展示）；"
+        "真正的单票上限在 RISK_PROFILES.max_weight，按共享池 NAV 计"),
+    "max_exposure": (
+        "ACCOUNT_SPECS.max_exposure 同上；且 RISK_PROFILES.max_exposure 会参与席位权重，"
+        "改动可能触发现有持仓的容量性减仓，需单独一轮验证"),
+    "risk_profile.single_risk": (
+        "方案按“策略参考本金”给百分比，代码按共享池 NAV 换算；直接套用会把仓位砍到"
+        "不足四分之一。本轮只把保守从 1.2% 降到 0.6% 观察"),
+    "risk_profile.daily_loss": (
+        "全池熔断：数值相对共享 NAV，任一策略触发即对所有策略生效；单策略日内止损未实现"),
+    "risk_profile.drawdown": (
+        "全池熔断并写入全池 cooldown_until，改它等于同时冻结三个策略；单策略回撤止损未实现"),
+}
+
 
 def spec_drift(account_specs, risk_profiles):
-    """目标与当前代码声明的差异；返回空列表表示已对齐。
+    """目标与当前代码声明的差异，逐条标注 ``open`` / ``deliberate``。
 
     只读比对，不修改传入的声明表。``max_weight``/``max_exposure`` 在代码里是
     相对本策略参考本金的比例，与名册的"预算内比例"同口径；资金占比
     （``budget_share``）不在账户声明里，由按周期的分配权重声明承载。
+    ``deliberate`` 表示"调研后决定不动"，原因见 :data:`DELIBERATE_REASONS`。
     """
     rows = []
     for role in ROLES:
         spec = dict((account_specs or {}).get(role.strategy_id) or {})
         if not spec:
             rows.append({"strategy_id": role.strategy_id, "field": "spec", "expected": "declared",
-                         "actual": "missing"})
+                         "actual": "missing", "status": "open", "reason": ""})
             continue
         expected = {
             "max_positions": role.max_positions,
@@ -301,7 +338,9 @@ def spec_drift(account_specs, risk_profiles):
             elif actual == expected[field]:
                 continue
             rows.append({"strategy_id": role.strategy_id, "field": field,
-                         "expected": expected[field], "actual": actual})
+                         "expected": expected[field], "actual": actual,
+                         "status": "deliberate" if field in DELIBERATE_REASONS else "open",
+                         "reason": DELIBERATE_REASONS.get(field, "")})
         profile_key = spec.get("risk_profile")
         profile = dict((risk_profiles or {}).get(profile_key) or {})
         for field, value in (("single_risk", role.single_trade_risk),
@@ -310,15 +349,18 @@ def spec_drift(account_specs, risk_profiles):
             actual = profile.get(field)
             if isinstance(actual, (int, float)) and abs(float(actual) - value) <= 1e-9:
                 continue
-            rows.append({"strategy_id": role.strategy_id, "field": f"risk_profile.{field}",
-                         "expected": value, "actual": actual})
+            key = f"risk_profile.{field}"
+            rows.append({"strategy_id": role.strategy_id, "field": key,
+                         "expected": value, "actual": actual,
+                         "status": "deliberate" if key in DELIBERATE_REASONS else "open",
+                         "reason": DELIBERATE_REASONS.get(key, "")})
     return rows
 
 
 __all__ = [
     "ROSTER_VERSION", "BUDGET_POLICY_VERSION", "AGGRESSIVE", "BALANCED", "CONSERVATIVE",
-    "StrategyRole", "ExitDecision", "ROLES", "EXIT_ONLY",
+    "StrategyRole", "ExitDecision", "ROLES", "EXIT_ONLY", "DELIBERATE_REASONS",
     "formal_roles", "formal_strategy_ids", "exit_only_ids", "role_for", "exit_decision",
     "is_formal", "is_exit_only", "entry_block_reason", "budget_shares", "pool_budget_example",
-    "allocation_declaration", "factor_policy", "spec_drift",
+    "allocation_declaration", "initial_params", "factor_policy", "spec_drift",
 ]

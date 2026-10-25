@@ -224,7 +224,64 @@
 
 ### 9.4 仍未做（不得省略的前提）
 
+> 2026-10-25 夜更新：下列前两项已在第 10 节完成（初始预算写账本、声明参数保守化）；第 3、4 项仍然成立。
+
 - **预算权重未写入账本**：现有 ``paper_dynamic_allocation`` 的每日策略权重区间是 15%–30%，与"稳健 50%"直接冲突；``three_strategy_switch.py`` 会在检测到 ``adaptive_allocation_policy`` 时报警。先停用或重新授权该动态分配策略，才谈 20/50/30 真正生效。
 - **账户声明表参数未改**：``ACCOUNT_SPECS``/``RISK_PROFILES`` 仍是旧值（``max_exposure`` 0.95/0.95/0.90 等），``spec_drift()`` 会逐条列出差异。改它等于改线上模拟行为并需要同步冻结 golden 契约测试，属于下一轮独立变更。
 - **服务器未切换**：本轮没有在服务器执行 ``--apply``，线上仍是五个策略。
 - 仍只有 13 个有效日期、5 次高抛 / 1 次回补观测，任何"已验证"的说法都不成立。
+
+## 10. 第三轮：初始预算 20/50/30 落账本 + 自进化可调 + 声明参数保守化（2026-10-25 夜）
+
+用户决定：**初始预算 20/50/30 固定，之后交给自进化调整；账户声明参数按调研结论调整；两项完成后同步服务器。**
+
+### 10.1 初始预算真的写进账本了
+
+原先每个新周期会把所有账户的 ``params`` 重置成 ``{}``，分配权重解析器拿不到任何声明。现在 ``paper_trading._create_cycle`` 在开户时按名册写入：
+
+```json
+{"adaptive_allocation": {"status": "active", "effective_date": "...", "weight_pct": 20.0,
+                         "roster_version": "three-strategy-roster-v1", "role": "aggressive",
+                         "declared_policy": "three-strategy-budget-v1"}}
+```
+
+三个正式策略分别 20 / 50 / 30；两个退出策略与用户策略仍写 ``{}``（不得凭空给它们造预算）。同一个载荷也写进 ``paper_parameter_versions``，并用**带时区**的 ``created_at``——该表唯一的消费者 ``portfolio_allocation_weights`` 会跳过 naive 时间戳的行，而账本其余时间列仍是本地 naive 文本（这一点原来没被注意到）。测试直接跑通 ``resolve_canonical_allocation_weights``，得到 ``{tq_breakout: 0.2, trend_pullback: 0.5, reported_profit_breakout: 0.3}``。
+
+### 10.2 自进化仍然可调，但必须能表示 50%
+
+- ``paper_dynamic_allocation`` 升到 **v2**：目标从"等权 + 收益差"改为**当前权重 + 收益差**，绝对边界 [5%, 60%]（与 ``adaptive_engine.max_strategy_weight_pct`` 默认 60% 对齐），每日仍最多移动 2 个百分点，合计恒为 100%。旧实现会把 50% 每天往等权拽，且 ``lower(48) > upper(30)`` 会直接抛 ``ValueError``——这条异常会顺着 ``_build_portfolio_entry_plan`` 把入场计划一起炸掉。
+- ``POLICY_ID`` 升版本：线上若还留着 v1 授权，会变成 ``not_authorized``（fail closed，不按新数学静默执行），必须由人重新授权。
+- ``rebalance`` 遇到越界/不合法权重时返回 ``infeasible_current_weights`` 状态并按原样回滚，不再抛异常。
+- ``evolution_apply`` 的权重边界来自 ``adaptive_config``（``min 15%`` / ``max 60%``），20/50/30 本来就在范围内，无需放宽。
+
+### 10.3 声明参数：调研结论决定"改什么、不改什么"
+
+调研（逐字段追执行消费者）得到三条硬结论：
+
+1. **口径不是"策略参考本金"，而是共享池 NAV**：sizing 的 ``nav`` 来自整池净值，``code_value``/``industry_value`` 是跨策略合计；``RISK_PROFILES.daily_loss``/``drawdown`` 直接比较**池 NAV**，且 drawdown 触发会无 ``WHERE`` 地写全池 ``cooldown_until``。**单策略止损没有任何实现。**
+2. **一批声明字段根本没有消费者**：``min_t_score``、``gap_q1``、``hold_min``、``cycle_days``、``daily_candidate_limit``、``first_tranche_cap_pct``、``ignition_zone``，以及 ``ACCOUNT_SPECS.max_weight``/``max_exposure``（只被复制进审计列，真正生效的是 ``RISK_PROFILES`` 的版本）。
+3. **改了就立刻影响现有持仓退出**：``hard_stop``、``trail_after``、``trail_stop``、``take_profit``、``hold_max``（spec 每次扫描现读，不受周期冻结保护）；``RISK_PROFILES.max_exposure`` 还会通过席位权重触发**容量性减仓**。
+
+本轮据此只动"只影响新开仓"和"只收紧保守"的字段：
+
+| 位置 | 字段 | 原值 → 新值 | 理由 |
+|---|---|---|---|
+| ``RISK_PROFILES.core_quality`` | ``max_weight`` | 0.32 → **0.12** | 保守单票上限；解析值取 ``min(基表, 编译画像 0.24)``，三者仍互不相同（0.30 / 0.28 / 0.12） |
+| ``RISK_PROFILES.core_quality`` | ``single_risk`` | 0.012 → **0.006** | 单笔风险预算减半；这是仓位**上限**而非目标 |
+| ``ACCOUNT_SPECS.reported_profit_breakout`` | ``max_open_runup_pct`` | 0.02 → **0.012** | 保守不追日内溢价 |
+| 同上 | ``gap_q2`` | (−0.03, 0.055) → **(−0.02, 0.03)** | 跳空承接带收紧，只影响新开仓 |
+| 同上 | ``entry_pct_high`` | 6.5 → **4.0** | 不再追 +6.5% 突破 |
+
+明确**不动**（``strategy_roster.DELIBERATE_REASONS`` 逐条写明原因）：``daily_loss``、``drawdown``（全池熔断/全池冷却）、``single_risk`` 的另外两档（方案的"策略本金百分比"直接换算会把仓位砍到 1/4 以下）、``ACCOUNT_SPECS.max_weight``/``max_exposure``（死字段）、``hard_stop``/``trail_*``/``take_profit``/``hold_max``（影响现有持仓退出，需要单独一轮+证据）。
+
+``spec_drift()`` 现在给每条差异标 ``open`` / ``deliberate``，测试要求 ``open`` 必须为空——不允许"待办"悄悄堆着。
+
+### 10.4 上线顺序（顺序错了会 fail closed）
+
+1. 部署代码（容器重建 + schema 迁移）；
+2. 跑 ``scripts/three_strategy_switch.py --paper-db <服务器账本>`` 只读复核；
+3. ``--apply --confirm-retire sector_rotation,main_force_top10`` 切换生命周期；
+4. 再开新周期：此时启用集合是三个，``_create_cycle`` 写入 20/50/30；
+5. 若仍在使用 ``paper_dynamic_allocation`` 的每日调权，需按 v2 规则**重新授权**（v1 授权已失效）。
+
+⚠️ 反例：先开新周期再切换，两个旧账户会被重置成 ``{}`` 且仍在周期内，分配权重解析会因覆盖不全而 fail closed（不交易，但也不出错账）。

@@ -2,6 +2,19 @@
 
 This does not approve shadow evolution proposals. It writes explicit, versioned
 weights under a separately authorized policy, on the caller's transaction.
+
+v2（2026-10-25）：起点从"等权"改为"当前权重"。三策略名册的初始预算是
+20% / 50% / 30%，等权锚点会把稳健的 50% 每天往下拽，且旧边界 15%–30% 让
+50% 直接不可表示（`lower > upper` 会抛错，进而拖垮入场计划）。现在：
+
+- 目标 = 当前权重 + (该策略收益 − 平均收益)，再投影到"每日最多移动
+  2 个百分点"和 [5%, 60%] 的绝对边界（上限与 `adaptive_engine` 的
+  `max_strategy_weight_pct` 默认值一致）；
+- 边界或权重不合法时 `target_weights` 仍抛 `ValueError`（纯函数契约不变），
+  但 `rebalance` 会把它转成 ``infeasible_current_weights`` 状态返回，
+  绝不因为一个外来声明而炸掉入场计划；
+- `POLICY_ID` 升到 v2：v1 的授权（内嵌旧规则）不再匹配，策略进入
+  ``not_authorized`` 而不是按新数学静默执行，重新授权必须由人显式完成。
 """
 import copy
 import datetime as dt
@@ -13,25 +26,34 @@ import evolution_apply as E
 import paper_portfolio_read_model as P
 import paper_repository as R
 
-POLICY_ID = "authorized-daily-performance-v1"
-POLICY_RULES = {"min_sell_samples": 3, "min_weight_pct": 15.0,
-                "max_weight_pct": 30.0, "max_daily_step_pct": 2.0}
+POLICY_ID = "authorized-daily-performance-v2"
+POLICY_RULES = {"min_sell_samples": 3, "min_weight_pct": 5.0,
+                "max_weight_pct": 60.0, "max_daily_step_pct": 2.0}
 
 
 def target_weights(current, returns):
-    """Project a return-sensitive target onto daily step and absolute limits."""
+    """Project a return-sensitive target onto daily step and absolute limits.
+
+    目标以**当前权重**为锚点（不是等权）：20/50/30 这类非等权基线在收益
+    相同的一天不会被强行拉回等权，只有在收益差超过每日步长时才移动。
+    """
     if set(current) != set(returns) or not current:
         raise ValueError("complete strategy set required")
     if any(not math.isfinite(float(v)) for v in (*current.values(), *returns.values())):
         raise ValueError("finite weights and returns required")
     if abs(sum(current.values()) - 100) > 0.01:
         raise ValueError("current weights must sum to 100")
-    lower = {k: max(15.0, v - 2.0) for k, v in current.items()}
-    upper = {k: min(30.0, v + 2.0) for k, v in current.items()}
+    floor = float(POLICY_RULES["min_weight_pct"])
+    ceiling = float(POLICY_RULES["max_weight_pct"])
+    step = float(POLICY_RULES["max_daily_step_pct"])
+    if any(v < floor - 1e-9 or v > ceiling + 1e-9 for v in current.values()):
+        raise ValueError("current weights outside policy bounds")
+    lower = {k: max(floor, v - step) for k, v in current.items()}
+    upper = {k: min(ceiling, v + step) for k, v in current.items()}
     if any(lower[k] > upper[k] for k in current) or sum(lower.values()) > 100 or sum(upper.values()) < 100:
         raise ValueError("current weights incompatible with policy bounds")
     mean = sum(returns.values()) / len(returns)
-    targets = {k: 100 / len(current) + max(-10.0, min(10.0, returns[k] - mean))
+    targets = {k: current[k] + max(-10.0, min(10.0, returns[k] - mean))
                for k in current}
     left, right = -100.0, 100.0
     for _ in range(60):
@@ -102,7 +124,13 @@ def rebalance(conn, *, cycle_id, decision_at):
         evidence[account] = {"initial_cash": initial, "realized_pnl": pnl,
                              "sell_order_ids": sorted(samples), "return_pct": returns[account]}
     current = {k: float(a["weight_pct"]) for k, a in allocations.items()}
-    weights = target_weights(current, returns)
+    try:
+        weights = target_weights(current, returns)
+    except ValueError as exc:
+        # 外来声明（例如名册初始 20/50/30，或别的通道写入的历史值）不合法时
+        # 只停止本策略，不让入场计划跟着失败。
+        return {"status": "infeasible_current_weights", "reason": str(exc),
+                "current_weights": current}
     fingerprint = hashlib.sha256(json.dumps(
         {"cycle_id": cycle_id, "asof_day": context.asof_day.isoformat(), "evidence": evidence},
         sort_keys=True, allow_nan=False).encode()).hexdigest()

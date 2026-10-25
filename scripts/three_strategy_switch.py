@@ -203,11 +203,13 @@ def _warnings(report):
     for strategy_id in FORMAL_IDS:
         item = report["strategies"].get(strategy_id) or {}
         if item.get("allocation_weight_pct") is None:
-            warnings.append(f"{strategy_id} 没有按周期的分配权重声明，预算比例 20/50/30 尚未生效。")
-        if item.get("dynamic_allocation_policy"):
+            warnings.append(f"{strategy_id} 没有按周期的分配权重声明；下次开新周期会由名册写入 20/50/30。")
+        elif item.get("dynamic_allocation_policy"):
+            # v2 的边界是 5%–60%，50% 可以表示；v1 的旧授权在新代码里会变成
+            # not_authorized（fail closed），必须在部署后按 v2 重新授权。
             warnings.append(
-                f"{strategy_id} 存在 adaptive_allocation_policy 每日动态分配策略；其权重区间为"
-                "15%–30%，与稳健 50% 的目标冲突，切换预算前必须先停用或重新授权。")
+                f"{strategy_id} 存在每日动态分配策略：v2 规则允许 5%–60%，与 20/50/30 兼容；"
+                "但 v1 旧授权在新代码中会被判为 not_authorized，需按 v2 重新授权后才继续调权。")
     if not report["schema_ready"]["strategy_lifecycle_state"]:
         warnings.append("账本缺少 strategy_lifecycle_state 表：无法在这里切换生命周期。")
     return warnings

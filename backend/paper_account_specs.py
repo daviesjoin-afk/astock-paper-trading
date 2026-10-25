@@ -111,8 +111,15 @@ RISK_PROFILES = {
         "cooldown_days": 2, "min_cost_edge": 0.005,
     },
     "core_quality": {
-        "name": "三日策略独立风控", "max_weight": 0.32, "max_exposure": 0.90,
-        "max_industry": 0.38, "single_risk": 0.012,
+        # 2026-10-25 三策略调整（保守 · 质量防守）：单票上限 0.32 → 0.12、
+        # 单笔风险预算 1.2% → 0.6%（都是相对**共享池 NAV**，见 paper_sizing）。
+        # 解析值取 min(这里, 编译画像 0.24)，因此三者仍然互不相同：
+        # breakout 0.32 / trend 0.34 / core_quality 0.12。
+        # max_exposure / daily_loss / drawdown 不动：它们是**全池**口径
+        # （drawdown 还会写全池冷却），不是单策略止损，改它们等于给所有策略
+        # 加同一个熔断；单策略止损目前没有任何实现。
+        "name": "三日策略独立风控", "max_weight": 0.12, "max_exposure": 0.90,
+        "max_industry": 0.38, "single_risk": 0.006,
         "daily_loss": 0.035, "drawdown": 0.11,
         "cooldown_days": 3, "min_cost_edge": 0.005,
     },
@@ -237,9 +244,12 @@ ACCOUNT_SPECS = {
         "take_profit": [(0.085, 0.40), (0.15, 0.35)],
         "min_t_score": 0.74,
         "gap_q1": (-0.02, 0.03),
-        "max_open_runup_pct": 0.02,
-        "gap_q2": (-0.03, 0.055),
-        "entry_pct_high": 6.5,
+        # 2026-10-25 保守化：只影响**新开仓**（max_open_runup_pct / gap_q2 /
+        # entry_pct_high 都不参与现有持仓的退出判断）。清盘日不再追 +6.5% 的
+        # 突破，日内溢价上限收紧到 1.2%，跳空承接带从 +5.5% 收到 +3.0%。
+        "max_open_runup_pct": 0.012,
+        "gap_q2": (-0.02, 0.03),
+        "entry_pct_high": 4.0,
     },
     MAIN_FORCE_STRATEGY_ID: {
         "name": "超强主力股", "mode": "swing",

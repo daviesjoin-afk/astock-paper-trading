@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import pathlib
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 import paper_account_specs as ACS
+import paper_trading as PT
 import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_roster as ROSTER
@@ -121,14 +124,33 @@ class StrategyRosterContractTests(unittest.TestCase):
         self.assertTrue(any("mom_short" in item for item in policy["reduce"]))
         self.assertTrue(any("新闻人气" in item for item in policy["not_admitted"]))
 
-    def test_spec_drift_reports_every_unapplied_target(self):
+    def test_spec_drift_classifies_every_difference(self):
+        """目标与声明之间的每一条差异都必须有归属，不允许"待办"悄悄堆着。"""
         drift = ROSTER.spec_drift(ACS.ACCOUNT_SPECS, ACS.RISK_PROFILES)
+        open_rows = [row for row in drift if row["status"] == "open"]
+        self.assertEqual(open_rows, [])
         fields = {(row["strategy_id"], row["field"]) for row in drift}
         self.assertIn(("reported_profit_breakout", "max_exposure"), fields)
         self.assertIn(("trend_pullback", "risk_profile.drawdown"), fields)
         self.assertNotIn("sector_rotation", {row["strategy_id"] for row in drift})
+        for row in drift:
+            self.assertTrue(row["reason"], row)
         missing = ROSTER.spec_drift({}, {})
         self.assertEqual(len(missing), 3)
+        self.assertTrue(all(row["status"] == "open" for row in missing))
+
+    def test_conservative_declaration_was_actually_tightened(self):
+        """保守化必须落成数字，而不是只改名字。"""
+        spec = ACS.ACCOUNT_SPECS["reported_profit_breakout"]
+        profile = ACS.RISK_PROFILES[spec["risk_profile"]]
+        self.assertEqual(profile["max_weight"], 0.12)
+        self.assertEqual(profile["single_risk"], 0.006)
+        self.assertLessEqual(spec["max_open_runup_pct"], 0.012)
+        self.assertLessEqual(spec["gap_q2"][1], 0.03)
+        self.assertLessEqual(spec["entry_pct_high"], 4.0)
+        # 全池熔断字段必须保持原值：它们不是单策略止损。
+        self.assertEqual(profile["daily_loss"], 0.035)
+        self.assertEqual(profile["drawdown"], 0.11)
 
     def test_roster_module_is_pure_declaration(self):
         tree = ast.parse((BACKEND / "strategy_roster.py").read_text(encoding="utf-8"))
@@ -228,6 +250,73 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
             self.module.apply_retirement(self.path, ["sector_rotation", "main_force_top10"])
         self.assertEqual(self._state("sector_rotation"), "paper")
         self.assertIn("sector_rotation", SR.active_ids(conn=self.conn))
+
+
+class CycleBudgetSeedingTests(unittest.TestCase):
+    """新周期开局按名册写入初始预算 20/50/30，并且真的被分配口径读到。
+
+    这是"初始预算固定、后续由自进化调整"的分界点：开局由名册写死，
+    之后的 ``paper_dynamic_allocation`` / ``evolution_apply`` 才在边界内改动。
+    """
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="roster-budget-")
+        self.addCleanup(folder.cleanup)
+        patch = mock.patch.object(PT, "DB_PATH", os.path.join(folder.name, "paper.sqlite3"))
+        patch.start()
+        self.addCleanup(patch.stop)
+        PT.init_db()
+        self.summary, self.cycle = PT.start_new_cycle(capital=300_000, include_dashboard=False)
+
+    def test_initial_budget_is_written_for_the_three_formal_strategies(self):
+        with PT._db() as conn:
+            params = {row["id"]: json.loads(row["params"] or "{}")
+                      for row in conn.execute("SELECT id,params FROM paper_accounts")}
+        expected = {"tq_breakout": 20.0, "trend_pullback": 50.0,
+                    "reported_profit_breakout": 30.0}
+        for strategy_id, weight in expected.items():
+            allocation = params[strategy_id]["adaptive_allocation"]
+            self.assertEqual(allocation["weight_pct"], weight)
+            self.assertEqual(allocation["status"], "active")
+            self.assertEqual(allocation["roster_version"], ROSTER.ROSTER_VERSION)
+            self.assertEqual(allocation["declared_policy"], ROSTER.BUDGET_POLICY_VERSION)
+        for strategy_id in ROSTER.exit_only_ids():
+            self.assertEqual(params[strategy_id], {})
+
+    def test_parameter_history_carries_an_aware_decision_instant(self):
+        with PT._db() as conn:
+            rows = conn.execute(
+                "SELECT account_id,params,created_at,effective_date"
+                " FROM paper_parameter_versions WHERE cycle_id=?",
+                (self.cycle["id"],)).fetchall()
+        by_account = {row["account_id"]: row for row in rows}
+        seeded = by_account["trend_pullback"]
+        self.assertEqual(json.loads(seeded["params"])["adaptive_allocation"]["weight_pct"], 50.0)
+        self.assertIsNotNone(
+            __import__("datetime").datetime.fromisoformat(seeded["created_at"]).tzinfo)
+        self.assertEqual(json.loads(by_account["sector_rotation"]["params"]), {})
+
+    def test_canonical_resolution_reads_the_seeded_budget(self):
+        import datetime as dt
+
+        import portfolio_allocation_weights as PAW
+        eligible = set(ROSTER.formal_strategy_ids())
+        decision_at = dt.datetime.now().astimezone().replace(microsecond=0) + dt.timedelta(seconds=5)
+        with PT._db() as conn:
+            rows = PAW.read_canonical_allocation_weight_owner_rows(
+                conn, eligible_account_ids=eligible, cycle_id=self.cycle["id"])
+            pins = []
+            for strategy_id in sorted(eligible):
+                version = SR.get_version(strategy_id, conn=conn)
+                pins.append({"account_id": strategy_id, "strategy_id": strategy_id,
+                             "strategy_version": version.version,
+                             "strategy_checksum": version.checksum})
+        resolved = PAW.resolve_canonical_allocation_weights(
+            rows, eligible_account_ids=eligible, cycle_id=self.cycle["id"],
+            asof_day=decision_at.date().isoformat(),
+            decision_at=decision_at.isoformat(), strategy_pins=pins)
+        self.assertEqual(resolved["weights"], {"tq_breakout": 0.2, "trend_pullback": 0.5,
+                                              "reported_profit_breakout": 0.3})
 
 
 if __name__ == "__main__":

@@ -103,6 +103,7 @@ import portfolio_allocation_service as PAS
 import portfolio_allocation_weights as PAW
 import portfolio_runtime_service as PRS
 import strategy_policies as SPOL
+import strategy_roster as ROSTER
 import strategy_registry as SR
 import signal_service as SIG
 import strategy_selection_resolver as SRES
@@ -15314,6 +15315,11 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
     # PR-47：空启用集合合法 = 零策略 idle 周期（无新信号/新开仓，风控与
     # 存量退出照常）。不再强制"至少一套"。
     now = _now()
+    # 参数版本表的 created_at 是"决策时点"证据，唯一消费者
+    # ``portfolio_allocation_weights`` 要求带时区（naive 行会被跳过）。账本其余
+    # 时间列仍是本地 naive 文本，这里只对这一行用上海时区的 aware 时刻。
+    param_stamp = dt.datetime.now(
+        dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     cursor = conn.execute(
         "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,created_at,updated_at,duration_days,enabled_strategies) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -15361,18 +15367,24 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         max_weight = float(override.get("max_weight_pct", spec["max_weight"] * 100)) / 100.0
         max_exposure = float(override.get("max_exposure_pct", spec["max_exposure"] * 100)) / 100.0
         style = override.get("style") if ACS.has_style(override.get("style")) else spec["default_style"]
+        # 三策略名册的初始预算：每个新周期按名册重置一次（20/50/30），之后
+        # 只由自进化通道在既有边界内调整。非名册账户（用户策略、已退出策略）
+        # 仍写空表——不得凭空给它们造预算。
+        initial_params = _json(
+            ROSTER.initial_params(account_id, effective_date=_date().isoformat())
+        ) if ROSTER.is_formal(account_id) else "{}"
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
-               risk_profile=?,params='{}',daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
+               risk_profile=?,params=?,daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
             (spec["name"], spec["source_strategy"], status, account_share, account_share, spec["cycle_days"], max_positions,
              max_weight, max_exposure, spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], style,
-             spec["risk_profile"], account_share, _date().isoformat(), now, account_id),
+             spec["risk_profile"], initial_params, account_share, _date().isoformat(), now, account_id),
         )
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
                      (account_id, _date().isoformat(), account_share, 0.0, account_share, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", style, "{}", reason, _date().isoformat(), now))
+                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", style, initial_params, reason, _date().isoformat(), param_stamp))
     SR.bind_cycle_versions(conn, cycle_id, enabled_strategies)
     _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，启用 {len(enabled_strategies)} 套策略，周期 {RSET.cycle_duration_label(duration_days)}，{reason}")
     return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital, "duration_days": duration_days, "enabled_strategies": enabled_strategies}
