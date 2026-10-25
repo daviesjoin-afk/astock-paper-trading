@@ -388,14 +388,22 @@ sqlite3 /root/codex/data_cache/paper_trading.sqlite3 < /root/astock-backups/thre
 |---|---|
 | 周期 13（2026-09-23 起，五套） | `archived`，归档快照 6.4 MB，原因"三策略上线：结束五策略周期（预算 30 万转入新周期）" |
 | 活动账本 | `paper_orders / positions / lots / fills` 清零（历史在 `paper_archives.snapshot`） |
-| 周期 14（新建） | `paused`，资本 300,000，`enabled_strategies` = 三个正式策略，`started_at` 为空 |
-| 周期 14 账户 | 三个账户各 100,000 现金；`adaptive_allocation` = 20 / 50 / 30，`effective_date 2026-10-25` |
+| 周期 14（新建，已废弃） | 建过一次 `paused` 周期，按三等份归属；发现与"30 万总池 + 20/50/30 上限"的口径不符，当天归档重建 |
+| 周期 15（当前） | `paused`，资本 300,000，`enabled_strategies` = 三个正式策略，`started_at` 为空 |
+| 周期 15 账户 | 归属资本 **60,000 / 150,000 / 90,000**（= 20% / 50% / 30%），合计 300,000；`adaptive_allocation` = 20 / 50 / 30，`effective_date 2026-10-25` |
 | 两个退役账户 | 保持 `cycle_id=13`、`paused`、现金留在归档周期里，不进入新周期 |
 | 结束前留档 | `/root/astock-backups/three-strategy-20261025T213638/cycle-before-archive.json.gz`（61 MB，含 3,901 条订单、51 个 lot、85 条净值） |
 
-⚠️ **现金仍是三份等额（10 万），20/50/30 是分配目标**（slot/敞口），不是现金切分；
-共享池扣款会跨账户调拨（`paper_shared_cash.debit_shared_cash` 优先扣买单账户、不足再扣其他参与者）。
-要把"预算"落到现金层，需要另改 `_create_cycle` 的 `account_share`，本轮没做。
+**现金口径（按用户澄清修正）**：现金是**一个总池 30 万**；`paper_accounts.initial_cash / cash`
+是"这个策略能动用多少"的**归属与上限**，按 20/50/30 切分（6 万 / 15 万 / 9 万），
+合计仍是 30 万。买入时：
+
+1. 分配计划按同一比例给出 `allowance_by_strategy`，`strategy_budget.absolute_cap_amount`
+   是硬上限（`paper_sizing.strategy_cap_amount`）；
+2. 扣款走共享池 `paper_shared_cash.debit_shared_cash`（优先扣买单账户，不足再动其他
+   账户的行），所以"池"是真共享的，但每个策略的**累计动用**不会超过自己的份额；
+3. 份额只在"启用集合恰好是三策略名册"时按比例切分；旧五套/混合用户策略周期仍等额，
+   避免给退役策略分 0 预算。
 
 ### 12.4 周一启动
 
@@ -407,4 +415,12 @@ sqlite3 /root/codex/data_cache/paper_trading.sqlite3 < /root/astock-backups/thre
 ### 12.5 仍未做
 
 - `evolution_apply` 的**回滚**（`rollback_allocation`）仍按单账户操作，没有参与者范围校验；
-- `adaptive_engine` 的 `horizon_summary` 仍按全部标签展示历史奖励（历史参考，不是审批对象）。
+- `adaptive_engine` 的 `horizon_summary` 仍按全部标签展示历史奖励（历史参考，不是审批对象）；
+- 归属资本比例只在"启用集合恰好是三策略名册"时生效；将来若引入第四条策略或用户策略，
+  需要重新定义混合周期的份额规则（现在的兜底是等额）。
+
+### 12.6 修正记录
+
+- 2026-10-25 23:2x：用户澄清"现金是总现金池 30 万，三策略按比例区分，比例是上限"。
+  代码与线上随之修正：`_create_cycle` 按名册比例归属资本（`_cycle_capital_shares`），
+  周期 14（三等份、无成交）归档，重建的周期 15 归属为 6 万 / 15 万 / 9 万。
