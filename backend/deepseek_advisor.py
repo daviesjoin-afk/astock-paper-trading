@@ -507,6 +507,9 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         intraday_t_pair_report.build_report(paper_db_path, asof=now))
     import auction_analysis
     auction_evidence = auction_analysis.evidence(now, rows, adaptive_conn, important_codes)
+    import auction_factor_shadow
+    auction_factor = auction_factor_shadow.evidence_summary(
+        auction_factor_shadow.build_report(now))
     evidence = {
         "scope": "paper_trading_only",
         "generated_at": _now(),
@@ -532,6 +535,7 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         "main_force_trade_cases": main_force_cases,
         "intraday_t_pairs": intraday_t_pairs,
         "auction_tracking": auction_evidence,
+        "auction_factor_shadow": auction_factor,
         "adaptive_learning": adaptive_stats,
         "deterministic_findings": findings,
         "deterministic_findings_meaning": "仅列出已执行检查发现的异常；空列表表示这些检查未发现异常，不代表因子有效性证据充分。",

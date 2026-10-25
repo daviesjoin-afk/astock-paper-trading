@@ -754,7 +754,20 @@ export function renderAuctionReview(data){
   var intentLabels={accumulation:'可能吸筹',distribution:'可能派发',support:'可能护盘',withdrawal:'可能撤单诱导',unclear:'意图不明'};
   var directionLabels={up:'向上',down:'向下',flat:'横盘',unclear:'不确定'};
   var verdictLabels={supported:'后续价格方向支持',contradicted:'后续价格方向不符',pending:'等待后续有效报价'};
+  var summary=tracking.summary||{};
+  var amountTotal=Number(summary.amount_total||0);
+  var amountText=amountTotal>0?('¥'+(amountTotal/10000).toFixed(2)+' 万'):'—（上游未返回金额）';
+  var amountLine='竞价成交额（观测合计）：<b>'+amountText+'</b>'
+    +' · 覆盖 '+Number(summary.with_amount||0)+'/'+Number(summary.tracked||0)+' 只'
+    +(summary.mean_pct==null?'':' · 平均竞价涨跌 '+Number(summary.mean_pct).toFixed(2)+'%')
+    +(summary.up==null?'':' · 上涨 '+Number(summary.up||0)+' / 下跌 '+Number(summary.down||0));
+  var largest=Array.isArray(summary.largest)?summary.largest:[];
+  var largestTable=largest.length?'<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>竞价额排名</th><th>代码 / 名称</th><th>竞价涨跌</th><th>竞价成交额</th></tr></thead><tbody>'
+    +largest.map(function(row,index){return '<tr><td>#'+(index+1)+'</td><td>'+adaptiveEsc(row.code||'')+' / '+adaptiveEsc(row.name||'—')+'</td><td>'+(row.pct==null?'—':Number(row.pct).toFixed(2)+'%')+'</td><td>'+(row.amount==null?'—':'¥'+(Number(row.amount)/10000).toFixed(2)+' 万')+'</td></tr>';}).join('')
+    +'</tbody></table></div>':'';
   var html='<p>'+(tracking.captured_at?'竞价最近采集：'+adaptiveEsc(String(tracking.captured_at).replace('T',' ').substring(0,19))+' · '+Number(tracking.observations||0)+' 轮 · '+Number(tracking.tracked_stocks||0)+' 只':'尚无竞价采集记录；09:15 起每3分钟采集。')+'</p>'
+    +'<p>'+amountLine+'</p>'+largestTable
+    +'<p style="color:#7b8d84">竞价阶段没有连续成交，“竞价成交额”是上游给出的当日累计撮合额；只统计本次观测到的个股，缺失不填零，也不代表全市场竞价额。</p>'
     +'<p>AI 会优先检阅候选及持仓，每次最多20只、每个槽位最多判断8只；证据不足可维持不变。主力意图属于推断，价格方向复核不能证明真实意图或盈利。</p>';
   if(!reviews.length){
     setEl('aiAuctionReview',html+'<p>暂无竞价意图判断。采集后，现有 AI 审阅与调参会读取轨迹并留档。</p>');return;

@@ -1286,6 +1286,46 @@ def data_validity():
     }
 
 
+@app.get("/api/auction/summary")
+def auction_summary(trade_date: str | None = None, limit: int = 30):
+    """Read-only auction snapshot: per-stock rows plus the observed amount summary.
+
+    Defaults to today, falls back to ``current.json`` before the 09:25 archive
+    exists, and never creates or migrates anything.
+    """
+    import auction_tracking
+
+    size = max(1, min(int(limit or 30), 100))
+    day = str(trade_date or datetime.datetime.now(datetime.timezone(
+        datetime.timedelta(hours=8))).date().isoformat())[:10]
+    archived = auction_tracking.load_archived_day(day)
+    if archived:
+        rows = archived.get("rows") or []
+        summary = archived.get("summary") or auction_tracking.summarize(rows)
+        source, captured_at = "archive", archived.get("captured_at")
+    else:
+        current = auction_tracking.current_snapshot()
+        rows, captured_at = [], None
+        if current.get("trade_date") == day:
+            final = [item for item in current.get("observations", [])
+                     if item.get("phase") == "final_snapshot"]
+            latest = final or current.get("observations", [])
+            rows = (latest[-1].get("rows") if latest else []) or []
+            captured_at = latest[-1].get("captured_at") if latest else None
+        summary, source = auction_tracking.summarize(rows), "current"
+    ranked = sorted(rows, key=lambda row: -(float(row.get("amount") or 0)))[:size]
+    return {
+        "trade_date": day,
+        "source": source,
+        "captured_at": captured_at,
+        "summary": summary,
+        "rows": ranked,
+        "rows_returned": len(ranked),
+        "rows_total": len(rows),
+        "boundary": "竞价阶段没有连续成交；amount 是上游给出的当日累计撮合额，缺失即 None，未覆盖部分不计入。",
+    }
+
+
 @app.post("/api/data-validity/incremental")
 def start_manual_incremental_update():
     """Queue one bounded manual incremental update; repeated clicks are idempotent."""
