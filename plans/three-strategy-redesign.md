@@ -285,3 +285,72 @@
 5. 若仍在使用 ``paper_dynamic_allocation`` 的每日调权，需按 v2 规则**重新授权**（v1 授权已失效）。
 
 ⚠️ 反例：先开新周期再切换，两个旧账户会被重置成 ``{}`` 且仍在周期内，分配权重解析会因覆盖不全而 fail closed（不交易，但也不出错账）。
+
+## 11. 上线记录：2026-10-25 21:47–22:0x 已在服务器执行
+
+服务器 ``root@175.24.164.56:37211``，部署根 ``/root/codex``（Docker profile，``docker-compose.server.yml``）。
+
+### 11.1 代码
+
+| 步骤 | 结果 |
+|---|---|
+| 备份账本元数据 | ``/root/astock-backups/three-strategy-20261025T213638``（``ledger-metadata.json`` + ``restore.sql``，96 KB；不是 2.9 GB 全量拷贝，磁盘当时只剩 5.4 GB） |
+| 分支 | 服务器从 ``codex/scan-under120-single-source``(4292700) 切到 ``codex/three-strategy-redesign`` |
+| 构建 | ``ASTOCK_GIT_COMMIT`` 显式传入；容器全部重建，``/api/health`` = 200 |
+| 镜像内容 | ``scripts/`` 现在随镜像发布（原来只在仓库里，容器内没有） |
+
+⚠️ 服务器的 GitHub 拉取过慢（``Operation too slow``），最后三个文件是用 SFTP 直接覆盖
+到 ``/root/codex``，因此服务器 ``git status`` 显示 3 个已修改文件；内容与远端提交一致，
+可用 sha256 核对：``paper_trading.py aa5be823…``、``paper_dynamic_allocation.py 30ca8812…``、
+``three_strategy_switch.py 0d303719…``。网络恢复后 ``git fetch && git checkout`` 即可对齐身份。
+
+### 11.2 账本（周期 13，2026-09-23 起）
+
+```
+tq_breakout                ← 20.0%（原 15.56）  生命周期 paper       策略授权 v2
+trend_pullback             ← 50.0%（原 26.07）  生命周期 paper       策略授权 v2
+reported_profit_breakout   ← 30.0%（原 23.67）  生命周期 paper       策略授权 v2
+sector_rotation            保留 19.7% 历史值     生命周期 retiring    旧 v1 授权（已不参与）
+main_force_top10           保留 15.0% 历史值     生命周期 retiring    旧 v1 授权（已不参与）
+```
+
+- 三条 ``paper_parameter_versions`` 历史行（``created_at`` 带时区，``effective_date=2026-10-25``），
+  ``adaptive_allocation_previous`` 保留旧值 → 回滚只需再追加一条旧值；
+- 三条 ``paper_audit(roster_budget_declared)``，带精确策略版本戳（``paper_audit`` 的触发器
+  要求版本戳必须存在，否则整个事务 ABORT——第一次上线就是撞在这里）；
+- 执行参与者 = 三个正式策略（``source=cycle_snapshot``）；经济所有权仍是五个；
+- ``risk_exit`` 仍包含 ``main_force_top10``（有持仓），``sector_rotation`` 已无持仓；
+- 账户、持仓、订单、成本与资金合计未改动。
+
+### 11.3 自进化通道
+
+- 每日调权授权按 **v2** 重写（5%–60%，每日 ±2 个百分点），只写给三个正式策略；
+- ``rebalance`` 现在只读写**执行参与者**：旧策略仍挂在周期 13 的账本上，若不收窄，
+  它们会把三个正式策略的权重一起稀释（而且旧策略权重会被无意义地改写）。
+- ⚠️ ``evolution_apply`` 的权重覆盖集合仍来自 ``SR.labels()``（含已退役的两个），
+  其 ``min_strategy_weight_pct=15`` 意味着 5 个账户时单策略最多 40%——**50% 在提案空间里
+  不可表示**，人工批准时会被拒或被压回。这一条要等 evolution 侧的参与者收窄后再放开。
+
+### 11.4 上线后的两个观察点
+
+1. **退出策略的持仓仍占用总池敞口**：``sector_rotation``（无持仓）与 ``main_force_top10``
+   （有持仓）在周期 13 里仍按原口径计入总池，直到它们清仓。期间三个正式策略的新开仓
+   可能被 82% 总敞口上限挤住，这是"先退出再放开"的预期过渡态，不是新代码的异常。
+2. **下个周期**：``_create_cycle`` 会重新写入 20/50/30，届时只有三个参与策略，
+   ``rebalance`` 的分母自然干净。
+
+### 11.5 回滚
+
+```bash
+# 代码
+cd /root/codex && git checkout codex/scan-under120-single-source \
+  && ASTOCK_GIT_COMMIT=$(git rev-parse HEAD) \
+     docker compose -f docker-compose.server.yml build --build-arg "ASTOCK_GIT_COMMIT=$ASTOCK_GIT_COMMIT" \
+  && docker compose -f docker-compose.server.yml up -d
+
+# 账本元数据（参数与生命周期；直接 UPDATE，绕过 lifecycle owner，只用于应急）
+sqlite3 /root/codex/data_cache/paper_trading.sqlite3 < /root/astock-backups/three-strategy-20261025T213638/restore.sql
+```
+
+生命周期 ``retiring`` 是**单向**状态：``retiring`` 只能去 ``archived``/``quarantined``。
+正常回滚要建新版本，而不是把状态改回 ``paper``。
