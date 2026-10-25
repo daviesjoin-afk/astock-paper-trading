@@ -32,7 +32,6 @@ def _check(rows, name, ok, detail, *, warn=False):
 def run(now=None):
     import strategy_roster as ROSTER
     import paper_trading as PT
-    import runtime_settings as RSET
 
     current = (now or dt.datetime.now(CN)).astimezone(CN)
     rows = []
@@ -101,9 +100,21 @@ def run(now=None):
             participants = tuple(SCOPE.participant_ids(conn))
             _check(rows, "execution_participants", participants == ROSTER.formal_strategy_ids(),
                    f"执行参与者 {participants}")
-            scope = RSET.enabled_strategies(conn)
-            _check(rows, "next_cycle_enabled", tuple(scope) == ROSTER.formal_strategy_ids(),
-                   f"下一周期启用 {scope}", warn=tuple(scope) != ROSTER.formal_strategy_ids())
+            # 不用 RSET.enabled_strategies：它内部会 SR.ensure_schema（写库），
+            # 在只读连接上直接炸。这里只读原始设置，未配置时下一周期回落到
+            # 注册表 active 集合（执行参与者那一条已经覆盖）。
+            try:
+                setting_row = conn.execute(
+                    "SELECT value FROM paper_runtime_settings WHERE key='enabled_strategies'"
+                ).fetchone()
+                raw_scope = PT._loads(setting_row[0], None) if setting_row else None
+            except sqlite3.Error:
+                raw_scope = None
+            scope = tuple(raw_scope) if isinstance(raw_scope, list) else ()
+            _check(rows, "next_cycle_enabled",
+                   (not scope) or scope == ROSTER.formal_strategy_ids(),
+                   f"下一周期启用 {list(scope) or '（未配置，回落到注册表 active）'}",
+                   warn=bool(scope) and scope != ROSTER.formal_strategy_ids())
             orders = conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0]
             _check(rows, "clean_ledger", orders == 0, f"活动账本订单 {orders} 条", warn=True)
     finally:
