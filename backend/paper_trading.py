@@ -877,12 +877,22 @@ def strategy_center():
         registered = SR.get(account_id)
         risk = RISK_PROFILES[spec["risk_profile"]]
         event_policy = SPOL.opening_event_policy(account_id)
-        pool_budget_pct = SHARED_POOL_MAX_EXPOSURE * risk["max_exposure"] / total_profile_exposure * 100
+        # 三策略名册的正式策略，预算就是声明里的 20/50/30；其余（含已退出）
+        # 仍按风险画像的相对敞口估算，避免让页面把"画像上限份额"当成预算。
+        role = ROSTER.role_for(account_id)
+        pool_budget_pct = (
+            role.budget_share * 100 if role is not None
+            else SHARED_POOL_MAX_EXPOSURE * risk["max_exposure"] / total_profile_exposure * 100
+        )
         rows.append({
             "id": account_id,
             "name": registered.name if registered else spec["name"],
             "strategy_status": registered.status if registered else "unregistered",
             "supports_new_cycle": bool(registered and registered.supports_new_cycle),
+            "roster_role": role.role if role else None,
+            "roster_status": ("formal" if role else
+                              "exit_only" if ROSTER.is_exit_only(account_id) else None),
+            "roster_budget_pct": round(role.budget_share * 100, 2) if role else None,
             "mode": "日内做T" if spec["mode"] == "intraday_t" else "波段交易",
             "entry_model": spec["entry_model_name"],
             "hold_range": f"{spec['hold_min']}–{spec['hold_max']} 个交易日",
