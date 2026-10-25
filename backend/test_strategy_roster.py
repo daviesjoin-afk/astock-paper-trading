@@ -23,6 +23,7 @@ from unittest import mock
 
 import paper_account_specs as ACS
 import paper_trading as PT
+import runtime_settings as RSET
 import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_roster as ROSTER
@@ -393,6 +394,40 @@ class CycleBudgetSeedingTests(unittest.TestCase):
         self.assertIsNotNone(
             __import__("datetime").datetime.fromisoformat(seeded["created_at"]).tzinfo)
         self.assertEqual(json.loads(by_account["sector_rotation"]["params"]), {})
+
+    def test_three_strategy_cycle_splits_capital_by_roster_ratio(self):
+        """总池 30 万，按 20/50/30 归属：6 万 / 15 万 / 9 万，合计仍是 30 万。"""
+        with PT._db() as conn:
+            RSET.update(conn, {"enabled_strategies": list(ROSTER.formal_strategy_ids())},
+                        actor="roster-test")
+        PT.set_accounts_status("paused")
+        _, cycle = PT.start_new_cycle(capital=300_000, include_dashboard=False)
+        self.assertEqual(tuple(cycle["enabled_strategies"]), ROSTER.formal_strategy_ids())
+        with PT._db() as conn:
+            rows = {row["id"]: dict(row) for row in conn.execute(
+                "SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=?",
+                (cycle["id"],))}
+            nav = {row["account_id"]: row["nav"] for row in conn.execute(
+                "SELECT account_id,nav FROM paper_nav WHERE nav_date="
+                "(SELECT MAX(nav_date) FROM paper_nav)")}
+        self.assertEqual({key: round(value["initial_cash"], 2) for key, value in rows.items()},
+                         {"tq_breakout": 60000.0, "trend_pullback": 150000.0,
+                          "reported_profit_breakout": 90000.0})
+        self.assertEqual({key: round(value["cash"], 2) for key, value in rows.items()},
+                         {key: round(value["initial_cash"], 2) for key, value in rows.items()})
+        self.assertAlmostEqual(sum(value["cash"] for value in rows.values()), 300000.0)
+        self.assertAlmostEqual(nav["trend_pullback"], 150000.0)
+
+    def test_mixed_or_legacy_cycle_keeps_equal_split(self):
+        """五套周期（含退役策略）不按名册切分，保持等额，避免给退役策略 0 预算。"""
+        PT.set_accounts_status("paused")
+        _, cycle = PT.start_new_cycle(capital=300_000, include_dashboard=False)
+        self.assertEqual(len(cycle["enabled_strategies"]), 5)
+        with PT._db() as conn:
+            values = [round(row[0], 2) for row in conn.execute(
+                "SELECT initial_cash FROM paper_accounts WHERE cycle_id=? ORDER BY id",
+                (cycle["id"],))]
+        self.assertEqual(values, [60000.0] * 5)
 
     def test_canonical_resolution_reads_the_seeded_budget(self):
         import datetime as dt

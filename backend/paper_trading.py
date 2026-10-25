@@ -15312,6 +15312,28 @@ def _archive_current_cycle(conn, reason):
     return PCS.archive_cycle(conn, _active_cycle(conn), reason)
 
 
+def _cycle_capital_shares(enabled_strategies):
+    """本周期各策略的资本份额 = 该策略可动用的**上限比例**。
+
+    - 启用集合恰好全部来自三策略名册时，按名册的 20/50/30 切分（份额合计 1）；
+    - 其他组合（旧五套周期、含用户策略、空周期）保持等额，避免给退役策略分 0
+      预算、或让用户策略凭空继承正式策略的份额。
+
+    份额只是归属口径：现金仍是一个总池（``_shared_cash`` 求和、扣款可跨账户），
+    买入时由分配计划按同一比例给出 ``allowance`` 并作为硬上限。
+    """
+    ids = tuple(str(item) for item in (enabled_strategies or ()))
+    if not ids:
+        return {}
+    if all(ROSTER.is_formal(item) for item in ids):
+        shares = {item: ROSTER.role_for(item).budget_share for item in ids}
+        total = sum(shares.values())
+        if total > 0:
+            return {key: value / total for key, value in shares.items()}
+    equal = 1.0 / len(ids)
+    return {item: equal for item in ids}
+
+
 def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", duration_days=None, enabled_strategies=None):
     capital = _validate_capital(capital)
     if duration_days is None:
@@ -15340,6 +15362,7 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
     )
     cycle_id = cursor.lastrowid
     benchmark = _benchmark_close()
+    shares = _cycle_capital_shares(enabled_strategies)
     account_share = capital / max(len(enabled_strategies), 1)
     # PR-35：参与主体 = 内置五套 ∪ 启用集合中的用户策略。用户策略缺行时
     # 现场开户（ activating 后未跑 init_db 的进程内路径），避免静默漏扫。
@@ -15386,16 +15409,20 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         initial_params = _json(
             ROSTER.initial_params(account_id, effective_date=_date().isoformat())
         ) if ROSTER.is_formal(account_id) else "{}"
+        # 本策略的资本份额 = 比例（也就是它的上限）；现金仍是同一个总池，
+        # ``initial_cash`` 只是"这个策略可以动用多少"的归属口径。
+        strategy_capital = round(capital * shares.get(account_id, 0.0), 2) \
+            if shares else account_share
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
                risk_profile=?,params=?,daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
-            (spec["name"], spec["source_strategy"], status, account_share, account_share, spec["cycle_days"], max_positions,
+            (spec["name"], spec["source_strategy"], status, strategy_capital, strategy_capital, spec["cycle_days"], max_positions,
              max_weight, max_exposure, spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], style,
-             spec["risk_profile"], initial_params, account_share, _date().isoformat(), now, account_id),
+             spec["risk_profile"], initial_params, strategy_capital, _date().isoformat(), now, account_id),
         )
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
-                     (account_id, _date().isoformat(), account_share, 0.0, account_share, benchmark, now))
+                     (account_id, _date().isoformat(), strategy_capital, 0.0, strategy_capital, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
                      (cycle_id, account_id, spec.get("strategy_version") or "v3.0", style, initial_params, reason, _date().isoformat(), param_stamp))
     SR.bind_cycle_versions(conn, cycle_id, enabled_strategies)
