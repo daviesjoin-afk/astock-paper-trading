@@ -337,14 +337,24 @@ class SlotLedgerTimingTests(unittest.TestCase):
 
     def test_failure_persists_diagnostics_and_preserves_original_exception(self):
         paper = self.paper
-        with mock.patch.object(paper, "monitor_risk", side_effect=RuntimeError("original-failure")):
+        # The full suite shares sys.stderr across modules. Assert the emitted
+        # event at the print boundary instead of depending on global redirection;
+        # TimingTests separately covers the real stderr contract.
+        with mock.patch.object(paper, "monitor_risk", side_effect=RuntimeError("original-failure")), \
+                mock.patch("builtins.print") as emitted:
             with self.assertRaisesRegex(RuntimeError, "original-failure"):
                 paper.run_slot("risk", asof_date="2026-10-16", force=True)
         saved = self._job()
         self.assertEqual(saved["status"], "failed")
         self.assertEqual(saved["detail"]["error"], "original-failure")
         self.assertEqual(saved["detail"]["timing"]["scope"], "before_failure_finalize")
-        self.assertEqual(json.loads(self.output.getvalue())["status"], "failed")
+        events = [
+            json.loads(call.args[0]) for call in emitted.call_args_list
+            if call.args and isinstance(call.args[0], str)
+            and call.args[0].startswith('{"event": "paper_slot_timing"')
+        ]
+        self.assertEqual(len(events), 1, emitted.call_args_list)
+        self.assertEqual(events[0]["status"], "failed")
 
 
 if __name__ == "__main__":
