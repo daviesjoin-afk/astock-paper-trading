@@ -291,7 +291,11 @@ class TimingTests(unittest.TestCase):
 
 class SlotLedgerTimingTests(unittest.TestCase):
     def setUp(self):
+        import paper_timing as timing
         import paper_trading as paper
+        # The unittest process is shared with earlier modules. A stale outer
+        # capture must not suppress this test's own slot timing record.
+        timing._CURRENT.set(None)
         self.paper = paper
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
