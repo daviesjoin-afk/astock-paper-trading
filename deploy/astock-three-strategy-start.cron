@@ -1,0 +1,13 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+HOME=/root
+# 一次性任务：三策略新周期的启动器（当前计划 2026-10-26 09:05）。
+#
+# 为什么单独一个文件、不并进 astock-codex.cron：
+#   ``deploy/sync-cron.sh`` 会用模板**整份覆盖** /etc/cron.d/astock-codex，任何手工
+#   加进去的启动器行都会在下一次部署时被静默删除。这个文件不参与那份同步。
+#
+# 幂等：脚本先看部署目录中的 .start_three_strategy_cycle 标记，再看当前周期是不是
+# paused、启用集合是不是三个正式策略；成功后自删标记，失败保留标记并退出非零，
+# 因此这行即便留着也不会重复启动周期。部署：``deploy/install-three-strategy-cron.sh``。
+5 9 * * 1-5 root test -f /opt/astock-codex/.start_three_strategy_cycle && flock -n /opt/astock-codex/.locks/start-cycle.lock /opt/astock-codex/deploy/resume_three_strategy_cycle.sh >> /opt/astock-codex/reports/start-cycle.log 2>&1

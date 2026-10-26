@@ -94,9 +94,74 @@ class DynamicPolicyTests(unittest.TestCase):
             self.assertAlmostEqual(sum(current.values()), 100.0)
             for k in current:
                 self.assertLessEqual(abs(current[k] - previous[k]), 2.000001)
-                self.assertTrue(15 <= current[k] <= 30)
+                self.assertTrue(5 <= current[k] <= 60)
+
+    def test_roster_baseline_is_not_dragged_back_to_equal_weight(self):
+        """20/50/30 在收益相同的一天必须原地不动（旧实现会拉回等权）。"""
+        baseline = {"tq_breakout": 20.0, "trend_pullback": 50.0,
+                    "reported_profit_breakout": 30.0}
+        equal_returns = dict.fromkeys(baseline, 3.0)
+        self.assertEqual(D.target_weights(baseline, equal_returns), baseline)
+        # 步长仍然生效：单日最多移动 2 个百分点，且合计恒为 100。
+        better = D.target_weights(baseline, {"tq_breakout": 30.0, "trend_pullback": -10.0,
+                                             "reported_profit_breakout": -10.0})
+        self.assertAlmostEqual(sum(better.values()), 100.0)
+        self.assertLessEqual(better["tq_breakout"] - 20.0, 2.000001)
+        self.assertGreaterEqual(better["trend_pullback"], 48.0)
+        self.assertGreaterEqual(better["reported_profit_breakout"], 28.0)
+
+    def test_policy_v2_does_not_match_v1_authorization(self):
+        legacy = {**self.params, "adaptive_allocation_policy": {
+            "id": "authorized-daily-performance-v1", "status": "active",
+            "approved_by": "user_delegated_design",
+            "approved_at": "2026-10-12T14:00:00+08:00", "effective_date": "2026-10-13",
+            "min_sell_samples": 3, "min_weight_pct": 15.0,
+            "max_weight_pct": 30.0, "max_daily_step_pct": 2.0}}
+        for k in range(5):
+            self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                              (json.dumps(legacy), str(k)))
+        self.conn.commit()
+        before = self.conn.total_changes
+        self.assertEqual(self.run_policy()["status"], "not_authorized")
+        self.assertEqual(self.conn.total_changes, before)
+
+    def test_out_of_bounds_declaration_stops_the_policy_instead_of_raising(self):
+        for k in range(5):
+            params = {**self.params, "adaptive_allocation": {"status": "active", "weight_pct": 70.0}}
+            self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?", (json.dumps(params), str(k)))
+        self.conn.commit()
+        before = self.conn.total_changes
+        result = self.run_policy()
+        self.assertEqual(result["status"], "infeasible_current_weights")
+        self.assertEqual(self.conn.total_changes, before)
+
+    def test_retired_sleeves_in_the_same_cycle_are_left_untouched(self):
+        """退出策略仍在周期账本里，但每日调权只能动执行参与者。"""
+        retired = {"adaptive_allocation_policy": self.params["adaptive_allocation_policy"],
+                   "adaptive_allocation": {"status": "active", "weight_pct": 15.0}}
+        for retire_id in ("3", "4"):
+            self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                              (json.dumps(retired), retire_id))
+        for participant_id, weight in (("0", 20.0), ("1", 50.0), ("2", 30.0)):
+            params = {**self.params,
+                      "adaptive_allocation": {"status": "active", "weight_pct": weight}}
+            self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                              (json.dumps(params), participant_id))
+        self.conn.commit()
+        with patch.object(D.P, "_cycle_initial", return_value=60000.0), \
+                patch.object(D.P, "realized_pnl", return_value=(1000.0, "verified")), \
+                patch.object(D.P, "_sell_fills", return_value=(
+                    [{"order_id": 1}, {"order_id": 2}, {"order_id": 3}], [], True)):
+            result = D.rebalance(self.conn, cycle_id=13, decision_at="2026-10-13T09:31:00+08:00",
+                                 account_ids=("0", "1", "2", "3", "4")[:3])
+        self.assertEqual(result["status"], "evaluated")
+        self.assertEqual(sorted(result["weights_pct"]), ["0", "1", "2"])
+        for retire_id in ("3", "4"):
+            params = json.loads(self.conn.execute(
+                "SELECT params FROM paper_accounts WHERE id=?", (retire_id,)).fetchone()[0])
+            self.assertEqual(params["adaptive_allocation"]["weight_pct"], 15.0)
 
     def test_invalid_or_infeasible_current_weights_are_rejected(self):
-        for bad in ([20, 20, 20, 20, 21], [60, 10, 10, 10, 10], [float('nan')] * 5):
+        for bad in ([20, 20, 20, 20, 21], [70, 10, 10, 5, 5], [float('nan')] * 5):
             with self.assertRaises(ValueError):
                 D.target_weights(dict(enumerate(bad)), dict.fromkeys(range(5), 1))

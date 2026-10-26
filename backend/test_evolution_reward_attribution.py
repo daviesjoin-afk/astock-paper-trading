@@ -51,9 +51,9 @@ import self_evolution as SE
 
 TZ = ZoneInfo("Asia/Shanghai")
 
-#: 真实内建策略账户（strategy_registry 的内建定义），模型族 one_to_two。
+#: 真实内建策略账户（strategy_registry 的内建定义），模型族 first_board_relay。
 ACCOUNT_ID = "tq_breakout"
-SOURCE_STRATEGY = "one_to_two"
+SOURCE_STRATEGY = "first_board_relay"
 
 
 class _FrozenDateTime(dt.datetime):
@@ -170,7 +170,9 @@ class RewardAttributionTestBase(unittest.TestCase):
                     id TEXT PRIMARY KEY, name TEXT, source_strategy TEXT,
                     status TEXT, initial_cash REAL, cash REAL, cycle_days INTEGER,
                     max_positions INTEGER, max_weight REAL, max_exposure REAL,
-                    version TEXT, params TEXT, updated_at TEXT);
+                    version TEXT, params TEXT, updated_at TEXT, cycle_id INTEGER DEFAULT 1);
+                CREATE TABLE paper_cycles(id INTEGER, status TEXT, enabled_strategies TEXT);
+                INSERT INTO paper_cycles VALUES(1,'running','["tq_breakout","trend_pullback","reported_profit_breakout"]');
                 CREATE TABLE IF NOT EXISTS paper_audit(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT,
                     event TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL);
@@ -472,7 +474,7 @@ class CrossAccountTests(RewardAttributionTestBase):
         other_id = self._seed_reward(
             (effective_from + dt.timedelta(days=1)).isoformat(),
             (effective_from + dt.timedelta(days=3)).isoformat(),
-            account_id="sector_rotation")
+            account_id="trend_pullback")
 
         with self._adaptive_ctx() as conn:
             SE.record_reward_attribution(
@@ -493,11 +495,11 @@ class CrossAccountTests(RewardAttributionTestBase):
         other_id = self._seed_reward(
             (effective_from + dt.timedelta(days=1)).isoformat(),
             (effective_from + dt.timedelta(days=3)).isoformat(),
-            account_id="sector_rotation")
+            account_id="trend_pullback")
 
         with self._adaptive_ctx() as conn:
             SE.record_reward_attribution(
-                conn, tracking_id, other_id, "sector_rotation", effective_from.isoformat())
+                conn, tracking_id, other_id, "trend_pullback", effective_from.isoformat())
             with self.assertRaises(ValueError) as ctx:
                 AE.evaluate_tuning_from_reward(
                     tracking_id=tracking_id, reward_id=other_id, conn=conn)
@@ -512,7 +514,7 @@ class CrossAccountTests(RewardAttributionTestBase):
         self._seed_reward(
             (effective_from + dt.timedelta(days=1)).isoformat(),
             (effective_from + dt.timedelta(days=3)).isoformat(),
-            account_id="sector_rotation")
+            account_id="trend_pullback")
 
         report = self._reconcile()
         self.assertEqual(report["evaluated"], [])
@@ -799,7 +801,7 @@ class IdempotencyTests(RewardAttributionTestBase):
         with self._adaptive_ctx() as conn:
             with self.assertRaises(ValueError) as ctx:
                 SE.record_reward_attribution(
-                    conn, tracking_id, reward_id, "sector_rotation",
+                    conn, tracking_id, reward_id, "trend_pullback",
                     effective_from.isoformat())
             self.assertIn("冲突", str(ctx.exception))
             with self.assertRaises(ValueError):
@@ -868,14 +870,14 @@ class MultiAccountAttributionTests(RewardAttributionTestBase):
 
     def setUp(self):
         super().setUp()
-        self._seed_account("sector_rotation", "sentiment_pioneer")
+        self._seed_account("trend_pullback", "pullback_reversal")
         proposals = [self._proposal(), self._proposal(
-            account_id="sector_rotation", source_strategy="sentiment_pioneer")]
+            account_id="trend_pullback", source_strategy="pullback_reversal")]
         self.run_id = self._seed_tuner_run(proposals=proposals)
         self.tracking_id = self._track_run(self.run_id)
         applied = self._apply_run(self.run_id)
         self.assertTrue(applied["applied"])
-        self.assertCountEqual(applied["accounts"], [ACCOUNT_ID, "sector_rotation"])
+        self.assertCountEqual(applied["accounts"], [ACCOUNT_ID, "trend_pullback"])
         with self._paper_ctx() as conn:
             for proposal in proposals:
                 row = conn.execute("SELECT params FROM paper_accounts WHERE id=?",
@@ -888,19 +890,19 @@ class MultiAccountAttributionTests(RewardAttributionTestBase):
             self.evidence = AE._tuner_effectiveness(
                 conn, SE.get_tracking(conn, self.tracking_id), self.paper_path)
         self.assertEqual(self.evidence, {
-            ACCOUNT_ID: self.applied_day, "sector_rotation": self.applied_day})
+            ACCOUNT_ID: self.applied_day, "trend_pullback": self.applied_day})
 
     def _seed_pair(self):
         return [self._seed_reward(
             (self.applied_day + dt.timedelta(days=1)).isoformat(),
             (self.applied_day + dt.timedelta(days=6)).isoformat(),
             account_id=account_id, raw_reward=raw, horizon=horizon)
-            for account_id, raw, horizon in ((ACCOUNT_ID, 0.6, 1), ("sector_rotation", -0.2, 5))]
+            for account_id, raw, horizon in ((ACCOUNT_ID, 0.6, 1), ("trend_pullback", -0.2, 5))]
 
     def _evaluated_pair(self):
         reward_ids = self._seed_pair()
         with self._adaptive_ctx() as conn:
-            for account_id, reward_id in zip((ACCOUNT_ID, "sector_rotation"), reward_ids, strict=True):
+            for account_id, reward_id in zip((ACCOUNT_ID, "trend_pullback"), reward_ids, strict=True):
                 SE.record_reward_attribution(
                     conn, self.tracking_id, reward_id, account_id,
                     self.evidence[account_id].isoformat())
@@ -980,7 +982,7 @@ class MultiAccountAttributionTests(RewardAttributionTestBase):
         second_reward = self._seed_reward(
             (self.applied_day + dt.timedelta(days=1)).isoformat(),
             (self.applied_day + dt.timedelta(days=6)).isoformat(),
-            raw_reward=-0.2, account_id="sector_rotation", horizon=5)
+            raw_reward=-0.2, account_id="trend_pullback", horizon=5)
         ready = self._reconcile()
         self.assertEqual(ready["status"], "ok", ready)
         self.assertEqual(ready["failed"], [], ready)
@@ -1031,7 +1033,7 @@ class MultiAccountAttributionTests(RewardAttributionTestBase):
     def test_M2_multi_replay_rejects_same_score_replacement(self):
         reward_ids = self._evaluated_pair()
         before = self._snapshot()
-        for index, (account_id, raw) in enumerate(((ACCOUNT_ID, 0.6), ("sector_rotation", -0.2))):
+        for index, (account_id, raw) in enumerate(((ACCOUNT_ID, 0.6), ("trend_pullback", -0.2))):
             replacement = self._seed_reward(
                 (self.applied_day + dt.timedelta(days=7)).isoformat(),
                 (self.applied_day + dt.timedelta(days=8)).isoformat(),
@@ -1202,7 +1204,7 @@ class AttributionStorageTests(RewardAttributionTestBase):
                 self._insert_link(conn, self.first_tracking, unused_reward)
             # 换账户以排除 account pair 冲突，单独证明 reward 唯一约束有效。
             with self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE constraint failed"):
-                self._insert_link(conn, self.second_tracking, self.first_reward, "sector_rotation")
+                self._insert_link(conn, self.second_tracking, self.first_reward, "trend_pullback")
         self.assertEqual(self._snapshot(), before)
 
     def _assert_legacy_duplicates_preserved(self, conflicting_tracking, conflicting_reward):

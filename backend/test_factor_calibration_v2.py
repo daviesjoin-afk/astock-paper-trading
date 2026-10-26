@@ -259,24 +259,24 @@ class RuntimeCalibrationTests(unittest.TestCase):
         table["star_sector_bonus"] = 0.0
         return table
 
-    def test_one_to_two_can_use_explicit_remaining_evidence_without_sentiment(self):
-        result = S.run_strategy("one_to_two", self._table(False), topn=3, gate={"light": "green"})
+    def test_first_board_relay_can_use_explicit_remaining_evidence_without_sentiment(self):
+        result = S.run_strategy("first_board_relay", self._table(False), topn=3, gate={"light": "green"})
         self.assertGreater(result["factor_calibration"]["eligible_evidence_rows"], 0)
         self.assertEqual(result["factor_calibration"]["version"], FC.CALIBRATION_VERSION)
         self.assertGreater(result["count"], 0)
         self.assertLess(result["picks"][0]["score_components"]["evidence_quality"], 1.0)
 
-    def test_sentiment_pioneer_requires_real_sentiment(self):
+    def test_sector_sentiment_requires_real_sentiment(self):
         result = S.run_strategy(
-            "sentiment_pioneer", self._table(False), topn=3, gate={"light": "green"}
+            "sector_sentiment", self._table(False), topn=3, gate={"light": "green"}
         )
         self.assertEqual(result["factor_calibration"]["required_factors"], ["sentiment"])
         self.assertEqual(result["factor_calibration"]["eligible_evidence_rows"], 0)
         self.assertEqual(result["count"], 0)
 
-    def test_sentiment_pioneer_can_run_when_real_sentiment_exists(self):
+    def test_sector_sentiment_can_run_when_real_sentiment_exists(self):
         result = S.run_strategy(
-            "sentiment_pioneer", self._table(True), topn=3, gate={"light": "green"}
+            "sector_sentiment", self._table(True), topn=3, gate={"light": "green"}
         )
         self.assertGreater(result["factor_calibration"]["eligible_evidence_rows"], 0)
         self.assertGreater(result["count"], 0)
@@ -286,12 +286,12 @@ class RuntimeCalibrationTests(unittest.TestCase):
         for factor in ("mom_short", "flow", "volsurge", "sentiment"):
             table[f"{factor}_evidence_quality"] = 0.0
         table["star_sector_bonus"] = 100.0
-        result = S.run_strategy("one_to_two", table, topn=3, gate={"light": "green"})
+        result = S.run_strategy("first_board_relay", table, topn=3, gate={"light": "green"})
         self.assertEqual(result["factor_calibration"]["eligible_evidence_rows"], 0)
         self.assertEqual(result["count"], 0)
 
     def test_score_audit_contract_is_v2(self):
-        result = S.run_strategy("one_to_two", self._table(False), topn=1, gate={"light": "green"})
+        result = S.run_strategy("first_board_relay", self._table(False), topn=1, gate={"light": "green"})
         components = result["picks"][0]["score_components"]
         self.assertEqual(components["version"], "paper-score-evidence-v2")
         self.assertEqual(components["factor_calibration_version"], FC.CALIBRATION_VERSION)
@@ -316,7 +316,7 @@ class SourceGuardTests(unittest.TestCase):
         self.assertNotIn('mom20.clip(-40, 60)', source)
 
     def test_existing_strategy_weight_tables_are_not_broadly_retuned(self):
-        self.assertEqual(S.PAPER_WEIGHTS["one_to_two"], {
+        self.assertEqual(S.PAPER_WEIGHTS["first_board_relay"], {
             "mom_short": 0.45, "flow": 0.25, "volsurge": 0.20, "sentiment": 0.10,
         })
         self.assertEqual(S.PAPER_WEIGHTS["trend_continuation"], {

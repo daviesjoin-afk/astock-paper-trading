@@ -15,6 +15,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from strategy_registry import labels as strategy_labels
+import strategy_roster as ROSTER
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -303,17 +304,18 @@ def dashboard(limit=40):
     # Keep newly registered strategies visible before their first eligible
     # snapshot.  The UI can then distinguish “no run yet” from “not supported”
     # instead of silently dropping the account from the evidence page.
-    for account_id in STRATEGY_NAMES:
+    current_names = {role.strategy_id: role.name for role in ROSTER.formal_roles()}
+    for account_id in current_names:
         metrics.setdefault(account_id, {})
     return {
         "version": VERSION,
         "mode": "shadow_only",
-        "message": "研究台账记录五套模拟盘策略的候选与后续表现，不参与下单或自动调参。",
+        "message": "研究台账记录三套正式策略的候选与后续表现，不参与下单或自动调参。",
         # PR-8：observation 语义显式对齐，避免把观测次数读成"交易日"。
         "holding_day_semantics": HOLDING_DAY_SEMANTICS,
         "strategies": [
             {"id": account_id, "name": name}
-            for account_id, name in STRATEGY_NAMES.items()
+            for account_id, name in current_names.items()
         ],
         "runs": runs,
         "metrics": {account: dict(values) for account, values in metrics.items()},

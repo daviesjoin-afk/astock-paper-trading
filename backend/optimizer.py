@@ -4,17 +4,17 @@ import backtest as B
 
 GRIDS = {
     # 超短策略必须用短周期，否则只是在抽样日期碰巧捕捉首板。
-    "one_to_two": {
+    "first_board_relay": {
         "topn": [5, 10, 20],
         "rebalance": [1, 2, 3],
         "use_gate": [True, False],
     },
-    "bottom_reversal": {
+    "pullback_reversal": {
         "topn": [5, 10, 20],
         "rebalance": [5, 10, 20],
         "use_gate": [True, False],
     },
-    "sentiment_pioneer": {
+    "sector_sentiment": {
         "topn": [5, 10, 20],
         "rebalance": [1, 3, 5],
         "use_gate": [True, False],

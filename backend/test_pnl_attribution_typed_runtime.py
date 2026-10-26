@@ -1890,7 +1890,7 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
 
     def _three_real_accounts(self):
         """三个**真实**的 seed 账户 id（不新建账户、不改 production 配置）。"""
-        ids = [str(key) for key in PT.ACCOUNT_SPECS]
+        ids = [str(key) for key in PT.ACTIVE_ACCOUNT_SPECS]
         self.assertGreaterEqual(len(ids), 3, "fixture 需要至少 3 个真实账户")
         return ids[0], ids[1], ids[2]
 

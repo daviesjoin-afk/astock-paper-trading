@@ -248,7 +248,7 @@ def _score_on_date(strategy_id, date, matrices, factors, fundamentals, use_funda
     mom20 = factors["mom20"].loc[date]
     volsurge = factors["volsurge"].loc[date]
 
-    if strategy_id == "one_to_two":
+    if strategy_id == "first_board_relay":
         location = close.index.get_loc(date)
         if location < 1:
             return score.iloc[0:0]
@@ -258,12 +258,12 @@ def _score_on_date(strategy_id, date, matrices, factors, fundamentals, use_funda
         # 信号日是首板日，下一交易日开盘参与；前一日接近涨停则视为连板并排除。
         eligible = (ret1 >= limits) & (previous_ret < limits * 0.85)
         score = score.where(eligible)
-    elif strategy_id == "bottom_reversal":
+    elif strategy_id == "pullback_reversal":
         # 与实时策略一致：缩量或仍在快速下跌会降权，资金转正会加分。
         score = score - (volsurge < 1.0).astype(float) * 0.30
         score = score + (zf["flow"] > 0.5).astype(float) * 0.20
         score = score - (mom20 < -0.05).astype(float) * 0.20
-    elif strategy_id == "sentiment_pioneer":
+    elif strategy_id == "sector_sentiment":
         # 历史人气榜不可得；用量价情绪代理，并在返回结果中明确标注。
         score = score - (zf["sentiment"] < -0.5).astype(float) * 0.20
 
@@ -510,7 +510,7 @@ def run_backtest(
             "strategy_filter_reproduced": True,
             "point_in_time_fundamentals": fundamentals_enabled is False,
             "survivorship_bias": "current_listed_universe_without_delisted_history",
-            "sentiment_proxy": strategy_id == "sentiment_pioneer",
+            "sentiment_proxy": strategy_id == "sector_sentiment",
         },
         "disclaimer": (
             "回测默认不使用无法按历史披露时点还原的财务因子；基础库覆盖当前沪深北上市股票，"

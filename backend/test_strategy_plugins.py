@@ -31,7 +31,7 @@ class StrategyPluginContractTests(unittest.TestCase):
         table.attrs["data_date"] = "2026-09-11"
         return table
 
-    def test_builtin_plugins_cover_exactly_the_five_registered_active_strategies(self):
+    def test_builtin_plugins_cover_exactly_the_three_registered_active_strategies(self):
         expected = {spec.id for spec in SR.BUILTIN_STRATEGIES}
         self.assertEqual(set(plugins.plugin_ids()), expected)
         for strategy_id in expected:
@@ -85,8 +85,8 @@ class StrategyPluginContractTests(unittest.TestCase):
             entries["trend_pullback"]["opening_event"],
         )
         self.assertNotEqual(
-            exits["sector_rotation"]["intraday_downside"],
-            exits["main_force_top10"]["intraday_downside"],
+            exits["tq_breakout"]["intraday_downside"],
+            exits["reported_profit_breakout"]["intraday_downside"],
         )
 
     def test_undeclared_exit_policy_does_not_inherit_another_strategy(self):
@@ -94,8 +94,8 @@ class StrategyPluginContractTests(unittest.TestCase):
         self.addCleanup(conn.close)
         SR.ensure_schema(conn)
         plugin = plugins.StrategyPlugin(
-            "main_force_top10",
-            "main_force_top10",
+            "reported_profit_breakout",
+            "reported_profit_breakout",
             ("main_pct",),
             exit_policy_key="not_declared",
         )
@@ -161,7 +161,7 @@ class StrategyPluginContractTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         SR.ensure_schema(conn)
-        plugin = plugins.get_plugin("main_force_top10")
+        plugin = plugins.get_plugin("reported_profit_breakout")
         empty = plugin.validate_parameters(conn, {}, evidence_count=100)
         self.assertEqual(empty["changed"], {})
         with self.assertRaisesRegex(ValueError, "no executable DSL parameter schema"):

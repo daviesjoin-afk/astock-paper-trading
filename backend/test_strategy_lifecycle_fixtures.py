@@ -1,6 +1,8 @@
 """Fixture helpers for legacy consumers that need an already-migrated state."""
 from __future__ import annotations
 
+import sqlite3
+
 import strategy_lifecycle as SL
 import strategy_registry as SR
 
@@ -12,6 +14,23 @@ _LEGACY_STATUS = {
 }
 _LEGACY_COLUMN = {"draft": "draft", "validated": "validated", "paper": "active",
                   "paused": "paused", "retiring": "retiring", "archived": "archived"}
+
+
+def seed_historical_builtin_accounts(conn):
+    """Import historical account rows explicitly; new installations only seed three."""
+    import paper_account_specs as ACS
+    conn.row_factory = sqlite3.Row
+    template = dict(conn.execute('SELECT * FROM paper_accounts LIMIT 1').fetchone())
+    for spec in SR.LEGACY_STRATEGIES:
+        if conn.execute('SELECT 1 FROM paper_accounts WHERE id=?', (spec.id,)).fetchone():
+            continue
+        account = ACS.builtin_spec(spec.id)
+        values = {**template, 'id': spec.id, 'name': spec.name, 'status': 'paused',
+                  'cycle_id': None, 'initial_cash': 0, 'cash': 0,
+                  'source_strategy': account['source_strategy'], 'params': '{}'}
+        conn.execute('INSERT INTO paper_accounts('+','.join(values)+') VALUES('
+                     + ','.join('?' for _ in values)+')', tuple(values.values()))
+    SR.ensure_schema(conn)
 
 
 def seed_legacy_state(conn, strategy_id, target_state, **_legacy_arguments):

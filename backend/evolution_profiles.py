@@ -79,39 +79,15 @@ STRATEGY_EVOLUTION_PROFILES: dict[str, dict[str, Any]] = {
         "monotonic": {"hold_bias": "increase"},
         "min_samples": 8,
     },
-    # 板块轮动：热点节奏变化快，允许阈值微调；方向阈值锁定。
-    "sector_rotation": {
-        "label": "板块轮动先锋",
-        "tunable": ("max_weight_delta", "max_delta_threshold", "hold_bias"),
-        "locked": ("consensus_direction_threshold", "consensus_weight_ratio"),
-        "bounds": {
-            "max_weight_delta": {"min": 0.01, "max": 0.05, "step": 0.0025},
-            "max_delta_threshold": {"min": 0.001, "max": 0.012, "step": 0.0005},
-            "hold_bias": {"min": 0.0, "max": 0.4, "step": 0.02},
-        },
-        "min_samples": 8,
-    },
     # 三日策略（质量）：证据密集型，锁定最多、证据门槛最高。
     "reported_profit_breakout": {
-        "label": "三日策略",
+        "label": "保守防守",
         "tunable": ("max_weight_delta", "hold_bias"),
         "locked": ("max_delta_threshold", "confidence_threshold",
                    "consensus_weight_ratio", "consensus_direction_threshold"),
         "bounds": {
             "max_weight_delta": {"min": 0.01, "max": 0.03, "step": 0.0015},
             "hold_bias": {"min": 0.05, "max": 0.4, "step": 0.02},
-        },
-        "min_samples": 12,
-    },
-    # 超强主力股：资金行为参数敏感，置信度阈值锁死。
-    "main_force_top10": {
-        "label": "超强主力股",
-        "tunable": ("max_weight_delta", "max_delta_threshold", "hold_bias"),
-        "locked": ("confidence_threshold", "consensus_weight_ratio"),
-        "bounds": {
-            "max_weight_delta": {"min": 0.01, "max": 0.05, "step": 0.0025},
-            "max_delta_threshold": {"min": 0.001, "max": 0.012, "step": 0.0005},
-            "hold_bias": {"min": 0.0, "max": 0.35, "step": 0.02},
         },
         "min_samples": 12,
     },

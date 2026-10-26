@@ -108,10 +108,10 @@ class CandidateFactorWiringTests(unittest.TestCase):
 
     def test_all_builtin_accounts_forward_their_own_score_requirements(self):
         cases = (
-            ("tq_breakout", "one_to_two", {"flow", "mom_short", "sentiment", "volsurge"}),
-            ("trend_pullback", "bottom_reversal",
+            ("tq_breakout", "first_board_relay", {"flow", "mom_short", "sentiment", "volsurge"}),
+            ("trend_pullback", "pullback_reversal",
              {"flow", "mom_short", "quality", "rsi", "value", "volsurge"}),
-            ("sector_rotation", "sentiment_pioneer",
+            ("sector_rotation", "sector_sentiment",
              {"flow", "mom_short", "sentiment", "volsurge"}),
             ("reported_profit_breakout", "reported_profit_breakout", set()),
             ("main_force_top10", "main_force_top10", set()),
@@ -149,7 +149,7 @@ class CandidateFactorWiringTests(unittest.TestCase):
         self.assertTrue(table.loc["000001":"000004", "sentiment_evidence_quality"].eq(0).all())
         picks = {p["code"]: p for p in captured["result"]["picks"]}
         self.assertEqual(set(picks), set(table.index))
-        weights = PT.S.PAPER_WEIGHTS["one_to_two"]
+        weights = PT.S.PAPER_WEIGHTS["first_board_relay"]
         for code, pick in picks.items():
             observed = {k: w for k, w in weights.items() if pd.notna(table.loc[code, k])}
             expected = sum(table.loc[code, k] * w for k, w in observed.items()) / sum(observed.values())
@@ -177,7 +177,7 @@ class CandidateFactorWiringTests(unittest.TestCase):
             self.assertEqual(pick["score_components"]["observed_weight"], 0.9)
         legacy_table = baseline["selection_table"].copy(deep=True)
         legacy_table.attrs.pop("factor_input_version")
-        legacy = PT.S.run_strategy("one_to_two", legacy_table, topn=48, gate={"light": "green"})
+        legacy = PT.S.run_strategy("first_board_relay", legacy_table, topn=48, gate={"light": "green"})
         self.assertEqual([p["code"] for p in baseline["result"]["picks"]],
                          [p["code"] for p in legacy["picks"]])
         for current, old in zip(baseline["result"]["picks"], legacy["picks"], strict=True):

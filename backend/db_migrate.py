@@ -12,12 +12,14 @@
 用法：python db_migrate.py [paper_trading|adaptive_learning|all] [--dry-run] [--no-backup]
 """
 import datetime as dt
+import json
 import os
 import sqlite3
 import sys
 
 import adaptive_selection_compat as selection_compat
 import paper_schema_migrations as paper_schema
+import strategy_naming as NAMING
 import strategy_registry
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -200,6 +202,63 @@ def _ensure_rebalance_state_cycle_ownership(conn):
     return paper_schema.ensure_rebalance_state_cycle_ownership(conn)
 
 
+def migrate_legacy_model_family_names(conn):
+    """v39：把持久化的旧模型族名改写成 canonical 名称（幂等，不动归档）。
+
+    只改两个具名字段：
+
+    * ``paper_accounts.source_strategy`` —— 运行时会把它当作模型族回退值；
+    * ``params.adaptive_selection.model_family`` /
+      ``params.adaptive_selection_meta.model_family`` —— 自进化 overlay 的模型族。
+
+    **不改归档快照**：``paper_archives.snapshot`` 是历史事实，改写它等于伪造历史。
+    归档里的旧值由读取层经 :func:`strategy_naming.canonical_model_family` 归一化。
+
+    只替换 value 恰为旧名的字段，其它 JSON 内容原样保留；第二次运行改不动任何行。
+    """
+    pairs = NAMING.migration_pairs()
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_accounts)").fetchall()}
+    if not pairs or not columns:
+        return {"migrated_accounts": 0, "migrated_params": 0}
+    mapping = dict(pairs)
+    migrated_accounts = 0
+    if "source_strategy" in columns:
+        for old, new in pairs:
+            cursor = conn.execute(
+                "UPDATE paper_accounts SET source_strategy=? WHERE source_strategy=?",
+                (new, old))
+            migrated_accounts += max(0, cursor.rowcount or 0)
+    if "params" not in columns:
+        return {"migrated_accounts": migrated_accounts, "migrated_params": 0}
+
+    migrated_params = 0
+    rows = conn.execute(
+        "SELECT id, params FROM paper_accounts WHERE params LIKE '%model_family%'").fetchall()
+    for row in rows:
+        account_id, raw = row[0], row[1]
+        try:
+            params = json.loads(raw or "{}")
+        except ValueError:
+            continue
+        if not isinstance(params, dict):
+            continue
+        changed = False
+        for container in ("adaptive_selection", "adaptive_selection_meta"):
+            block = params.get(container)
+            if not isinstance(block, dict):
+                continue
+            current = block.get("model_family")
+            if isinstance(current, str) and current in mapping:
+                block["model_family"] = mapping[current]
+                changed = True
+        if not changed:
+            continue
+        conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
+                     (json.dumps(params, ensure_ascii=False), account_id))
+        migrated_params += 1
+    return {"migrated_accounts": migrated_accounts, "migrated_params": migrated_params}
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -222,7 +281,7 @@ MIGRATIONS = {
         # PR-1.1：PR #107 修好了代码默认值（individual_mom5_min 2.0 -> 0.02），
         # 但历史自进化 overlay 已把旧的 percentage-point 值持久化进
         # paper_accounts.params，运行时会覆盖代码默认值。这里做一次性数据兼容
-        # 迁移：只修 sentiment_pioneer 且恰为 2.0 的情形，同事务写 audit。
+        # 迁移：只修历史遗留的板块情绪模型族 overlay 且该值恰为 2.0 的情形，同事务写 audit。
         # 幂等由 schema_version 保证；重复启动 migrated=0 且不产生重复 audit。
         (10, "迁移 legacy 选股动量 overlay 单位（2.0 -> 0.02）",
          selection_compat.migrate_legacy_selection_units),
@@ -371,6 +430,17 @@ MIGRATIONS = {
          paper_schema.ensure_paper_metrics_indexes),
         (38, "为组合执行事实增加覆盖索引，避免读取委托审计大字段",
          paper_schema.ensure_portfolio_order_read_index),
+        # 名号统一：模型族改名后，``paper_accounts.source_strategy`` 与历史
+        # ``params.adaptive_selection[_meta].model_family`` 可能仍是旧值。运行时会
+        # 用自己的 ``source_strategy`` 回退成模型族，旧值不迁移就会指向一个已不存在的
+        # 模型族 —— 选股静默停产。**只改这两个具名的持久化字段**，不动归档快照
+        # （归档是历史事实，读取层负责归一化），也不"顺便刷新"其它 JSON 字段。
+        (39, "统一持久化模型族名（旧名 → canonical，幂等，不动归档）",
+         migrate_legacy_model_family_names),
+        # S3：AI 意见消费结果的独立追加式审计行。只新增一张解释表（规则基线 /
+        # AI 意见 / 最终动作 / 效果原因），**不**碰任何决策权威表，也不回填历史。
+        (40, "新增 AI 决策归因追加审计表（幂等，不回填）",
+         paper_schema.ensure_ai_decision_audits),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

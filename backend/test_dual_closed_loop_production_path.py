@@ -290,7 +290,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
         # 账户声明的因子基线：deepseek_advisor._tuning_accounts 只把这个 overlay
         # 当作"当前已有因子"暴露给模型。注意这里**没有** adaptive_selection_meta，
         # 所以它不是生效覆盖 —— 调参前 runtime 仍按策略基准运行。
-        base_weights = dict(AS.BASE_WEIGHTS["one_to_two"])
+        base_weights = dict(AS.BASE_WEIGHTS["first_board_relay"])
         with self._paper_conn() as p_conn:
             p_conn.execute(
                 "UPDATE paper_accounts SET params=? WHERE id=?",

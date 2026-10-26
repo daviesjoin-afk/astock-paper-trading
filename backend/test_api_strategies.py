@@ -181,7 +181,7 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertEqual(summary["user"], sum(1 for i in body["items"] if i["origin"] == "user"))
         self.assertEqual(summary["builtin"], sum(1 for i in body["items"] if i["origin"] == "builtin"))
         self.assertEqual(summary["draft"], sum(1 for i in body["items"] if i["status"] == "draft"))
-        self.assertGreaterEqual(summary["builtin"], 5)
+        self.assertEqual(summary["builtin"], 3)
         self.assertTrue(summary["user"])
 
     def test_list_origin_filter(self):

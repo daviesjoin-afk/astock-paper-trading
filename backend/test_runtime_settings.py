@@ -36,10 +36,10 @@ class RuntimeSettingsTests(unittest.TestCase):
         updated = settings.update(self.conn, {
             "default_starting_capital": 100000,
             "cycle_duration_days": 30,
-            "enabled_strategies": ["tq_breakout", "main_force_top10"],
+            "enabled_strategies": ["tq_breakout", "reported_profit_breakout"],
         }, actor="test")
         self.assertEqual(updated["simulation"]["cycle_duration_days"], 30)
-        self.assertEqual(updated["simulation"]["enabled_strategies"], ["tq_breakout", "main_force_top10"])
+        self.assertEqual(updated["simulation"]["enabled_strategies"], ["tq_breakout", "reported_profit_breakout"])
         rows = settings.audit(self.conn)
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["updated_by"], "test")
@@ -67,6 +67,12 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(value["strategy_overrides"]["tq_breakout"]["max_positions"], 6)
         with self.assertRaises(ValueError):
             settings.validate({"strategy_overrides": {"tq_breakout": {"max_weight_pct": 50}}}, conn=self.conn)
+
+    def test_ineligible_saved_scope_never_enables_other_strategies(self):
+        settings.ensure_schema(self.conn)
+        self.conn.execute("UPDATE paper_runtime_settings SET value=? WHERE key='enabled_strategies'",
+                          ('["sector_rotation","main_force_top10"]',))
+        self.assertEqual(settings.enabled_strategies(self.conn), [])
 
     def test_active_custom_strategy_is_setting_eligible_and_archive_is_not(self):
         created = registry.create_user_definition(

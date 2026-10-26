@@ -53,6 +53,9 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
         self.old_db_path = PT.DB_PATH
         PT.DB_PATH = self.db_path
         PT.init_db()
+        from test_strategy_lifecycle_fixtures import seed_historical_builtin_accounts
+        with PT._db() as conn:
+            seed_historical_builtin_accounts(conn)
 
         self.day = dt.date(2026, 9, 10)
         self.code = "600001"

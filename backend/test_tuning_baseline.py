@@ -6,6 +6,7 @@
 weight_format_invalid，AI 于是永远只能 hold。
 """
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -18,9 +19,12 @@ def _db(rows):
     path = tempfile.mktemp(suffix=".sqlite3")
     conn = sqlite3.connect(path)
     conn.execute(
-        "CREATE TABLE paper_accounts(id TEXT, version TEXT, style TEXT, params TEXT)")
+        "CREATE TABLE paper_accounts(id TEXT, version TEXT, style TEXT, params TEXT, cycle_id INTEGER)")
+    conn.execute("CREATE TABLE paper_cycles(id INTEGER, status TEXT, enabled_strategies TEXT)")
+    conn.execute("INSERT INTO paper_cycles VALUES(1,'running',?)",
+                 (json.dumps([account_id for account_id, _ in rows]),))
     for account_id, params in rows:
-        conn.execute("INSERT INTO paper_accounts VALUES(?,?,?,?)",
+        conn.execute("INSERT INTO paper_accounts VALUES(?,?,?,?,1)",
                      (account_id, "v1", "", params))
     conn.commit()
     conn.close()
@@ -38,7 +42,7 @@ class TuningBaselineTests(unittest.TestCase):
     def test_account_without_overlay_gets_the_model_defaults(self):
         accounts = self._accounts([("tq_breakout", "{}")])
         self.assertEqual(1, len(accounts))
-        self.assertEqual(set(S.PAPER_WEIGHTS["one_to_two"]), set(accounts[0]["weights"]))
+        self.assertEqual(set(S.PAPER_WEIGHTS["first_board_relay"]), set(accounts[0]["weights"]))
         self.assertAlmostEqual(1.0, sum(accounts[0]["weights"].values()), places=9)
 
     def test_existing_overlay_wins_over_the_defaults(self):
@@ -60,7 +64,7 @@ class TuningBaselineTests(unittest.TestCase):
             ("trend_pullback", "{}"),
             ("sector_rotation", "{}"),
         ])
-        self.assertEqual(3, len(accounts))
+        self.assertEqual(2, len(accounts))
         for account in accounts:
             self.assertTrue(account["weights"], account["account_id"])
 

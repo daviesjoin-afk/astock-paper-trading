@@ -34,6 +34,8 @@ import ast
 import unittest
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
 
 EXECUTION_PLANNER = BACKEND / "execution_planner.py"
@@ -51,11 +53,11 @@ EXECUTION_FORBIDDEN_DEPENDENCIES = frozenset({"signal_service"})
 
 
 def _source(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return ast_cache.source(path)
 
 
 def _tree(path: Path) -> ast.Module:
-    return ast.parse(_source(path), filename=str(path))
+    return ast_cache.tree(path)
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -73,7 +75,7 @@ def _imported_modules(path: Path) -> set[str]:
 def _execute_calls(path: Path):
     """产出 (sql 字符串, 所在函数节点源码) 供白名单判定。"""
     source = _source(path)
-    tree = ast.parse(source, filename=str(path))
+    tree = _tree(path)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue

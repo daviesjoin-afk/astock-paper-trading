@@ -9,7 +9,7 @@
 - Layer C 读路径内存级归一化（不写库）
 
 核心不变式：只修**已证实的 legacy sentinel**
-（``sentiment_pioneer.conditions.individual_mom5_min == 2.0``）。
+（板块情绪模型族旧名下 ``conditions.individual_mom5_min == 2.0``）。
 其它任何值（``0.025`` / ``2.1`` / ``"2.0"`` / ``True``）一律保持原样。
 """
 import ast
@@ -26,13 +26,17 @@ import db_migrate
 import factor_units as FU
 import paper_trading as PT
 import strategies as S
+import strategy_naming as NAMING
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 COMPAT_SRC = os.path.join(BACKEND, "adaptive_selection_compat.py")
 
 CANONICAL = 0.02
 LEGACY = 2.0
-SENTIMENT_PIONEER = "sentiment_pioneer"
+# 历史持久化里存的旧模型族名：从隔离表派生，避免在本文件重复旧字面量。
+LEGACY_FAMILY = {new_name: old_name for old_name, new_name in NAMING.migration_pairs()}[NAMING.CANONICAL_SECTOR_SENTIMENT]
+# canonical 名：代码默认表与策略注册表只认这个。
+FAMILY = NAMING.CANONICAL_SECTOR_SENTIMENT
 MOM5_MIN_FIELD = "individual_mom5_min"
 NOW = "2026-09-11 09:30:00"
 
@@ -53,7 +57,7 @@ def _legacy_conditions(mom5=LEGACY):
     }
 
 
-def _legacy_overlay(model_family="sentiment_pioneer", mom5=LEGACY):
+def _legacy_overlay(model_family=LEGACY_FAMILY, mom5=LEGACY):
     return {
         "model_family": model_family,
         "weights": dict(_SENTIMENT_WEIGHTS),
@@ -66,7 +70,7 @@ def _legacy_overlay(model_family="sentiment_pioneer", mom5=LEGACY):
     }
 
 
-def _legacy_params(model_family="sentiment_pioneer", mom5=LEGACY, meta_status="active"):
+def _legacy_params(model_family=LEGACY_FAMILY, mom5=LEGACY, meta_status="active"):
     """一份完整的 ``paper_accounts.params``，带若干"必须原样保留"的兄弟键。"""
     return {
         "foo": "keep-me",
@@ -178,7 +182,7 @@ class _AdaptiveDb:
                    run_date,account_id,regime,model_id,baseline_params,candidate_params,
                    evidence,status,tier,reason,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            ("2026-09-10", account_id, regime, "sentiment_pioneer", "{}",
+            ("2026-09-10", account_id, regime, LEGACY_FAMILY, "{}",
              json.dumps(candidate_params, ensure_ascii=False), "{}", status, tier,
              "test", NOW, NOW),
         )
@@ -301,7 +305,8 @@ class PureNormalizationTests(unittest.TestCase):
         self.assertFalse(C.is_exact_legacy_mom5_min(True))
 
     def test_a8_other_models_are_never_touched(self):
-        for model in ("bottom_reversal", "trend_continuation", "one_to_two"):
+        for model in (NAMING.CANONICAL_PULLBACK_REVERSAL, NAMING.CANONICAL_TREND_CONTINUATION,
+                      NAMING.CANONICAL_FIRST_BOARD_RELAY):
             with self.subTest(model=model):
                 overlay = _legacy_overlay(model_family=model)
                 normalized, details = self._normalize(overlay)
@@ -316,7 +321,7 @@ class PureNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["conditions"]["individual_mom5_min"], LEGACY)
         # 调用方若能证明生效模型（运行时读路径），才允许归一化。
         proven, proven_details = C.normalize_legacy_selection_units(
-            overlay, effective_model="sentiment_pioneer",
+            overlay, effective_model=LEGACY_FAMILY,
         )
         self.assertEqual(len(proven_details), 1)
         self.assertEqual(proven["conditions"]["individual_mom5_min"], CANONICAL)
@@ -349,9 +354,9 @@ class PureNormalizationTests(unittest.TestCase):
 
         迁移锚定固定单位契约；一次无关的默认值调整不得绑架历史数据的迁移结果。
         """
-        default = S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER][MOM5_MIN_FIELD]
+        default = S.PAPER_CONDITION_DEFAULTS[FAMILY][MOM5_MIN_FIELD]
         try:
-            S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER][MOM5_MIN_FIELD] = 0.03
+            S.PAPER_CONDITION_DEFAULTS[FAMILY][MOM5_MIN_FIELD] = 0.03
             normalized, details = self._normalize(_legacy_overlay())
             self.assertEqual(
                 normalized["conditions"][MOM5_MIN_FIELD], CANONICAL,
@@ -360,7 +365,7 @@ class PureNormalizationTests(unittest.TestCase):
             self.assertEqual(len(details), 1)
             self.assertEqual(details[0]["new_value"], CANONICAL)
         finally:
-            S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER][MOM5_MIN_FIELD] = default
+            S.PAPER_CONDITION_DEFAULTS[FAMILY][MOM5_MIN_FIELD] = default
 
     def test_a14_compat_module_does_not_read_live_strategy_defaults(self):
         """窄 AST 守卫：兼容层的迁移目标必须锚定 ``factor_units`` 单位契约。
@@ -412,7 +417,7 @@ class LiveMigrationTests(unittest.TestCase):
         self.assertEqual(conditions["sentiment_min"], -0.5)
         self.assertEqual(conditions["enabled"], {"sentiment_guard": True, "individual_strong": True})
         self.assertEqual(stored["adaptive_selection"]["weights"], _SENTIMENT_WEIGHTS)
-        self.assertEqual(stored["adaptive_selection"]["model_family"], "sentiment_pioneer")
+        self.assertEqual(stored["adaptive_selection"]["model_family"], LEGACY_FAMILY)
         self.assertEqual(stored["adaptive_selection"]["entry_score_delta"], 0.012)
         self.assertEqual(stored["adaptive_selection_meta"]["version"], "select-evo-20260910-4242")
         self.assertEqual(stored["adaptive_selection_meta"]["effective_date"], "2026-09-10")
@@ -485,8 +490,11 @@ class MultiAccountIsolationTests(unittest.TestCase):
 
     def test_d1_only_the_targeted_legacy_overlay_changes(self):
         self.paper.put_account("sector_rotation", _legacy_params())
-        self.paper.put_account("trend_pullback", _legacy_params(model_family="bottom_reversal"))
-        self.paper.put_account("tq_breakout", _legacy_params(model_family="one_to_two", mom5=0.0))
+        self.paper.put_account("trend_pullback",
+                               _legacy_params(model_family=NAMING.CANONICAL_PULLBACK_REVERSAL))
+        self.paper.put_account("tq_breakout",
+                               _legacy_params(model_family=NAMING.CANONICAL_FIRST_BOARD_RELAY,
+                                              mom5=0.0))
         self.paper.put_account("user_custom_01", {
             "adaptive_selection": {"weights": {"value": 1.0}},
             "note": "user strategy params without the field",
@@ -716,7 +724,7 @@ class RuntimeBehaviourTests(unittest.TestCase):
 
     def _run(self, condition_overrides):
         return S.run_strategy(
-            "sentiment_pioneer", _factor_table(), topn=5, gate=None,
+            FAMILY, _factor_table(), topn=5, gate=None,
             first_board_codes=None, condition_overrides=condition_overrides,
         )
 

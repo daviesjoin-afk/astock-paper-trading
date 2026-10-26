@@ -139,7 +139,7 @@ def _adaptive_conn() -> sqlite3.Connection:
     return _track(conn)
 
 
-def _weights_patch(model_id: str = "one_to_two", *, spread: float = 0.02):
+def _weights_patch(model_id: str = "first_board_relay", *, spread: float = 0.02):
     """在有界幅度内造一个纯因子权重补丁（键集与 BASE_WEIGHTS 完全一致）。"""
     baseline = {"weights": dict(ASEL.BASE_WEIGHTS[model_id])}
     keys = sorted(baseline["weights"])
@@ -160,7 +160,7 @@ def _insert_selection(conn, *, owner_written=True, **overrides) -> int:
     """
     row = {
         "run_date": "2026-09-18", "account_id": "tq_breakout", "regime": "momentum",
-        "model_id": "one_to_two", "baseline_params": "{}", "candidate_params": "{}",
+        "model_id": "first_board_relay", "baseline_params": "{}", "candidate_params": "{}",
         "evidence": (
             json.dumps({ASEL.SELECTION_OWNER_ORIGIN_KEY: ASEL.SELECTION_OWNER_ORIGIN_MARKER})
             if owner_written else "{}"
@@ -334,7 +334,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         baseline, candidate = _weights_patch()
         candidate_id = ASEL.record_shadow_proposal(
             conn, run_date="2026-09-18", account_id="tq_breakout",
-            regime="momentum:ai:1030", model_id="one_to_two",
+            regime="momentum:ai:1030", model_id="first_board_relay",
             baseline_params=baseline, candidate_params=candidate,
             evidence={"source": "DeepSeek"}, reason="bounded",
             now="2026-09-21T09:10:00+08:00",
@@ -372,7 +372,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         baseline, candidate = _weights_patch()
         args = dict(
             run_date="2026-09-18", account_id="tq_breakout", regime="momentum:ai:1030",
-            model_id="one_to_two", baseline_params=baseline, candidate_params=candidate,
+            model_id="first_board_relay", baseline_params=baseline, candidate_params=candidate,
             evidence={"source": "DeepSeek"}, reason="bounded",
         )
         first = ASEL.record_shadow_proposal(conn, now="2026-09-21T09:10:00+08:00", **args)
@@ -445,7 +445,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         baseline, candidate = _weights_patch()
         common = dict(
             run_date="2026-09-18", account_id="tq_breakout", regime="momentum:ai:1030",
-            model_id="one_to_two", baseline_params=baseline,
+            model_id="first_board_relay", baseline_params=baseline,
             evidence={"source": "DeepSeek"}, reason="x", now="2026-09-21T09:10:00+08:00",
         )
         too_wide = {"weights": dict(candidate["weights"])}
@@ -484,7 +484,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         baseline, candidate = _weights_patch()
         common = dict(
             run_date="2026-09-18", account_id="tq_breakout", regime="momentum:ai:1030",
-            model_id="one_to_two", baseline_params=baseline,
+            model_id="first_board_relay", baseline_params=baseline,
             evidence={"source": "DeepSeek"}, reason="bounded",
         )
         first = ASEL.record_shadow_proposal(
@@ -573,7 +573,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         blocked_conn = _adaptive_conn()
         ASEL.record_shadow_proposal(
             blocked_conn, run_date="2026-09-18", account_id="tq_breakout",
-            regime="momentum:ai:1030", model_id="one_to_two",
+            regime="momentum:ai:1030", model_id="first_board_relay",
             baseline_params=baseline, candidate_params=candidate,
             evidence={"source": "other"}, reason="occupied",
             now="2026-09-18T10:29:00+08:00",
@@ -614,7 +614,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         base_reason = "R1"
         common = dict(
             run_date="2026-09-18", account_id="tq_breakout", regime="momentum:ai:1030",
-            model_id="one_to_two",
+            model_id="first_board_relay",
         )
         first = ASEL.record_shadow_proposal(
             conn, baseline_params=baseline, candidate_params=candidate,
@@ -936,7 +936,7 @@ class CandidateLifecycleIsNotVerificationTests(_DbTestCase):
             with self.subTest(forge=forge):
                 candidate_id = ASEL.record_shadow_proposal(
                     conn, run_date="2026-09-18", account_id="tq_breakout",
-                    regime=f"momentum:ai:10{len(forge) % 10}", model_id="one_to_two",
+                    regime=f"momentum:ai:10{len(forge) % 10}", model_id="first_board_relay",
                     baseline_params=baseline, candidate_params=candidate,
                     evidence={"source": "x", ASEL.SELECTION_OWNER_ORIGIN_KEY: forge},
                     reason="r", now="2026-09-21T09:10:00+08:00",

@@ -9,6 +9,7 @@ import pandas as pd
 
 import factors as F
 import factor_calibration as FC
+import strategy_naming as NAMING
 
 
 STRATEGIES = {
@@ -63,28 +64,34 @@ WEIGHTS = {
 
 # 模拟盘使用五套独立模型；这些内部策略不会出现在“策略选股”菜单。
 PAPER_WEIGHTS = {
-    "one_to_two": {"mom_short": 0.45, "flow": 0.25, "volsurge": 0.20, "sentiment": 0.10},
-    "bottom_reversal": {"value": 0.28, "quality": 0.18, "volsurge": 0.22, "flow": 0.15, "mom_short": 0.10, "rsi": 0.07},
+    "first_board_relay": {"mom_short": 0.45, "flow": 0.25, "volsurge": 0.20, "sentiment": 0.10},
+    "pullback_reversal": {"value": 0.28, "quality": 0.18, "volsurge": 0.22, "flow": 0.15, "mom_short": 0.10, "rsi": 0.07},
     # 结构进化后的趋势延续模型：不以“超跌/抄底”为买入理由，要求
     # 均线结构、动量和资金同步。初始只作为影子候选，需通过进化门禁后启用。
     "trend_continuation": {"mom_short": 0.28, "mom": 0.22, "flow": 0.20, "volsurge": 0.15, "quality": 0.15},
-    "sentiment_pioneer": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
+    "sector_sentiment": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
 }
 
 # 自适应 overlay 允许切换到的模型族。只有这些组合经过审计；不在表内的账户
 # 只允许它自己的 source_strategy。
 SELECTION_MODEL_FAMILIES = {
-    "tq_breakout": {"one_to_two"},
-    "trend_pullback": {"bottom_reversal", "trend_continuation"},
-    "sector_rotation": {"sentiment_pioneer"},
+    "tq_breakout": {"first_board_relay"},
+    "trend_pullback": {"pullback_reversal", "trend_continuation"},
+    "sector_rotation": {"sector_sentiment"},
     "reported_profit_breakout": {"reported_profit_breakout"},
 }
 
 
 def selection_model_family(account_id, overlay, source_strategy):
-    """运行时实际采用的模型族；越界时回落到 source_strategy。"""
+    """运行时实际采用的模型族；越界时回落到 source_strategy。
+
+    入参先归一化：``paper_accounts.source_strategy`` 与历史 ``params`` 里可能仍是
+    旧名号，直接比较会让已部署的模型被误判成"越界"而回退。
+    """
+    source_strategy = NAMING.canonical_model_family(source_strategy)
     allowed = SELECTION_MODEL_FAMILIES.get(account_id, {source_strategy})
-    model_family = str((overlay or {}).get("model_family") or source_strategy)
+    model_family = NAMING.canonical_model_family(
+        (overlay or {}).get("model_family") or source_strategy)
     if model_family not in allowed:
         model_family = source_strategy
     return model_family
@@ -139,14 +146,14 @@ def _gate_market_light(gate):
 # 模拟盘可进化的选股条件。基础条件保留在代码中，进化层只写入
 # 这些白名单字段，既允许增删条件，又不会把任意代码注入选股流程。
 PAPER_CONDITION_DEFAULTS = {
-    "one_to_two": {
+    "first_board_relay": {
         "enabled": {"first_board_bonus": True, "pct_band": True, "chase_guard": True, "weak_guard": True, "board_acceleration": True},
         "first_board_bonus": 0.22, "pct_low": 1.0, "pct_high": 5.0,
         "chase_low": 5.0, "chase_high": 8.0, "chase_guard_pct": 9.0,
         "weak_guard_pct": -1.5, "chase_penalty": 0.45, "weak_penalty": 0.60,
         "board_acceleration_bonus": 0.16, "board_acceleration_pct": 5.0,
     },
-    "bottom_reversal": {
+    "pullback_reversal": {
         "enabled": {"low_volume_guard": True, "flow_confirm": True, "momentum_guard": True},
         "vol_surge_min": 1.0, "flow_min": 0.5, "mom20_min": -0.05,
         "low_volume_penalty": 0.30, "flow_bonus": 0.20, "momentum_penalty": 0.20,
@@ -156,7 +163,7 @@ PAPER_CONDITION_DEFAULTS = {
         "ma20_ma60_min": 0.0, "close_ma20_min": 0.0, "mom20_min": 0.0,
         "flow_min": 0.0, "breakout_bonus": 0.24, "broken_structure_penalty": 0.55,
     },
-    "sentiment_pioneer": {
+    "sector_sentiment": {
         # 板块热度是优先级，不再是一票否决；个股极强时走独立强势路径。
         # individual_pct_* 比较的是 ``pct``（百分点，3.5 == +3.5%）；
         # individual_mom5_min 比较的是 ``mom5_raw``（**fraction**，0.02 == +2%）。
@@ -371,8 +378,8 @@ def _hot_leader_profile(table):
     }
 
 
-def _bottom_reversal_profile(table):
-    """Score a base-to-rebound structure for ``bottom_reversal``.
+def _pullback_reversal_profile(table):
+    """Score a base-to-rebound structure for ``pullback_reversal``.
 
     A bottom rebound is not the same as a low valuation or a stock that is
     already in a long uptrend.  The profile prefers a prior drawdown, a
@@ -1442,7 +1449,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
             # different economic model silently.
             weight_override_rejected = True
     weight_group_totals = FC.weight_group_totals(weights)
-    required_factors = ("sentiment",) if strategy_id == "sentiment_pioneer" else ()
+    required_factors = ("sentiment",) if strategy_id == "sector_sentiment" else ()
     calibrated = FC.score_factors(
         table,
         weights,
@@ -1477,10 +1484,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     # 共振先进入观察池；连续加速或远离均线的股票会被反向降权。
     hot_profile = _hot_leader_profile(table)
     hot_cap = {
-        "one_to_two": 0.24,
-        "sentiment_pioneer": 0.24,
+        "first_board_relay": 0.24,
+        "sector_sentiment": 0.24,
         "trend_continuation": 0.16,
-        "bottom_reversal": 0.08,
+        "pullback_reversal": 0.08,
     }.get(strategy_id, 0.10)
     hot_bonus = hot_profile["score"] * hot_cap
     hot_bonus = hot_bonus.mask(hot_profile["stage"].eq("late_overheat"), -0.06)
@@ -1491,14 +1498,14 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     if risk_off:
         hot_bonus = hot_bonus * 0.0
     score += hot_bonus.fillna(0.0)
-    bottom_profile = _bottom_reversal_profile(table)
-    bottom_bonus = bottom_profile["score"] * (0.30 if strategy_id == "bottom_reversal" else 0.0)
+    bottom_profile = _pullback_reversal_profile(table)
+    bottom_bonus = bottom_profile["score"] * (0.30 if strategy_id == "pullback_reversal" else 0.0)
     score += bottom_bonus.fillna(0.0)
 
     # 修复1（2026-08-28）：动量过热惩罚——mom5>5% 或 mom20>15% 的候选
     # 排序分直接扣减；黄/红灯下加倍（修复3）。
     score = _apply_overheat_penalty(score, table, OVERHEAT_RANK_PENALTY * (2.0 if risk_off else 1.0))
-    if strategy_id == "sentiment_pioneer":
+    if strategy_id == "sector_sentiment":
         # 修复2（2026-08-28）：板块情绪高潮禁入 + 早期轮动优先。板块热度
         # 用行业内平均 5 日动量度量——高潮板块（>8%）整体排除，不再在
         # 情绪顶点接力；sector_early_rotation_score（早期启动分）升为排序加分。
@@ -1518,7 +1525,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     mom20 = numeric_column("mom20_raw")
     sentiment = numeric_column("sentiment")
 
-    if strategy_id == "one_to_two":
+    if strategy_id == "first_board_relay":
         # 日内短线不能被“昨日首板”锁死：首板只代表已验证的强势基因，
         # 而非当天唯一可交易来源。候选池同时保留量价、资金和动量都靠前的
         # 强势股；最终仍由盘中实时成交区间、量比和资金方向决定是否下单。
@@ -1536,7 +1543,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
             score -= pct.ge(conditions["chase_guard_pct"]).astype(float) * conditions["chase_penalty"]
         if enabled.get("weak_guard", True):
             score -= pct.lt(conditions["weak_guard_pct"]).astype(float) * conditions["weak_penalty"]
-    elif strategy_id == "bottom_reversal":
+    elif strategy_id == "pullback_reversal":
         if enabled.get("low_volume_guard", True):
             score -= vol_surge.lt(conditions["vol_surge_min"]).astype(float) * conditions["low_volume_penalty"]
         if enabled.get("flow_confirm", True):
@@ -1578,7 +1585,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     # 板块情绪高潮禁入必须在全部策略加分之后施加。哨兵 -990 正是 picks 的
     # 过滤线，若在 individual_bonus 之前 mask，+0.28 会把该行抬到 -989.72
     # 而重新通过 ``score > -990``，禁入静默失效。
-    if strategy_id == "sentiment_pioneer":
+    if strategy_id == "sector_sentiment":
         score = score.mask(climax, -990.0)
 
     # Evidence quality is an audit/gate dimension, never an alpha multiplier.
@@ -1592,10 +1599,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     ranked["score_star_sector_bonus"] = star_sector_bonus
     ranked["score_core_stock_bonus"] = core_stock_bonus
     ranked["score_hot_leader_bonus"] = hot_bonus
-    ranked["score_bottom_reversal_bonus"] = bottom_bonus
-    ranked["bottom_reversal_score"] = bottom_profile["score"]
-    ranked["bottom_reversal_structure"] = bottom_profile["structure"]
-    ranked["bottom_reversal_overheat"] = bottom_profile["overheat"]
+    ranked["score_pullback_reversal_bonus"] = bottom_bonus
+    ranked["pullback_reversal_score"] = bottom_profile["score"]
+    ranked["pullback_reversal_structure"] = bottom_profile["structure"]
+    ranked["pullback_reversal_overheat"] = bottom_profile["overheat"]
     ranked["hot_leader_score"] = hot_profile["score"]
     ranked["hot_leader_overheat"] = hot_profile["overheat"]
     ranked["hot_leader_stage"] = hot_profile["stage"]
@@ -1656,16 +1663,16 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                     "hot_leader_stage": row.get("hot_leader_stage") or "normal",
                     "sector_early_rotation": bool(row.get("sector_early_rotation", False)),
                     "sector_early_rotation_score": _number(row.get("hot_leader_sector_onset_score"), 6),
-                    "bottom_reversal_bonus": _number(row.get("score_bottom_reversal_bonus"), 6),
-                    "bottom_reversal_score": _number(row.get("bottom_reversal_score"), 6),
-                    "bottom_reversal_structure": row.get("bottom_reversal_structure") or "unknown",
-                    "bottom_reversal_overheat": _number(row.get("bottom_reversal_overheat"), 6),
+                    "pullback_reversal_bonus": _number(row.get("score_pullback_reversal_bonus"), 6),
+                    "pullback_reversal_score": _number(row.get("pullback_reversal_score"), 6),
+                    "pullback_reversal_structure": row.get("pullback_reversal_structure") or "unknown",
+                    "pullback_reversal_overheat": _number(row.get("pullback_reversal_overheat"), 6),
                     "strategy_adjustment": _number(row.get("score_strategy_adjustment"), 6),
                     "context_score": _number(
                         _number_or(row.get("score_star_sector_bonus"))
                         + _number_or(row.get("score_core_stock_bonus"))
                         + _number_or(row.get("score_hot_leader_bonus"))
-                        + _number_or(row.get("score_bottom_reversal_bonus"))
+                        + _number_or(row.get("score_pullback_reversal_bonus"))
                         + _number_or(row.get("score_strategy_adjustment")),
                         6,
                     ),
@@ -1680,14 +1687,14 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                     "sector_early_rotation_score": _number(row.get("hot_leader_sector_onset_score"), 6),
                     "observation_only": True,
                 },
-                "bottom_reversal": {
-                    "structure": row.get("bottom_reversal_structure") or "unknown",
-                    "score": _number(row.get("bottom_reversal_score"), 6),
-                    "overheat": _number(row.get("bottom_reversal_overheat"), 6),
-                    "observation_only": strategy_id != "bottom_reversal",
+                "pullback_reversal": {
+                    "structure": row.get("pullback_reversal_structure") or "unknown",
+                    "score": _number(row.get("pullback_reversal_score"), 6),
+                    "overheat": _number(row.get("pullback_reversal_overheat"), 6),
+                    "observation_only": strategy_id != "pullback_reversal",
                 },
                 "entry_path": "individual_strong" if (
-                    strategy_id == "sentiment_pioneer" and enabled.get("individual_strong", True)
+                    strategy_id == "sector_sentiment" and enabled.get("individual_strong", True)
                     and _number_or(row.get("pct"), -999.0) >= conditions.get("individual_pct_min", 3.5)
                     and _number_or(row.get("flow"), -999.0) >= conditions.get("individual_flow_min", 0.65)
                     and _number_or(row.get("vol_surge_raw"), -999.0) >= conditions.get("individual_vol_surge_min", 1.2)
@@ -1731,10 +1738,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
             "news_check": {"status": "clean", "hits": 0},
         })
     names = {
-        "one_to_two": "强势日内候选（首板优先）",
-        "bottom_reversal": "底部启动",
+        "first_board_relay": "强势日内候选（首板优先）",
+        "pullback_reversal": "底部启动",
         "trend_continuation": "趋势延续",
-        "sentiment_pioneer": "情绪先锋",
+        "sector_sentiment": "情绪先锋",
     }
     return {
         "strategy": strategy_id,
@@ -1765,8 +1772,8 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         "hot_leader_context": {
             "version": "hot-leader-onset-v1",
             "caps": {key: value for key, value in {
-                "one_to_two": 0.24, "sentiment_pioneer": 0.24,
-                "trend_continuation": 0.16, "bottom_reversal": 0.08,
+                "first_board_relay": 0.24, "sector_sentiment": 0.24,
+                "trend_continuation": 0.16, "pullback_reversal": 0.08,
             }.items()},
             "stage_counts": {
                 str(key): int(value)
@@ -1776,9 +1783,9 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
             "late_overheat_count": int(hot_profile["stage"].eq("late_overheat").sum()),
             "hard_gates_unchanged": True,
         },
-        "bottom_reversal_context": {
+        "pullback_reversal_context": {
             "version": "bottom-reversal-structure-v1",
-            "enabled": strategy_id == "bottom_reversal",
+            "enabled": strategy_id == "pullback_reversal",
             "structure_counts": {
                 str(key): int(value)
                 for key, value in bottom_profile["structure"].value_counts().to_dict().items()
@@ -1840,6 +1847,9 @@ def run_strategy(
     """Production selector facade: plugin first, exact legacy fallback otherwise."""
     import strategy_plugins as SP
 
+    # 持久化与历史调用方可能仍在用旧模型族名：入口处一次性归一化，
+    # 下游（PAPER_WEIGHTS / PAPER_CONDITION_DEFAULTS / 插件表）只认 canonical 名。
+    strategy_id = NAMING.canonical_model_family(strategy_id)
     plugin = SP.plugin_for_selector(strategy_id)
     if plugin is not None:
         return plugin.select_candidates(

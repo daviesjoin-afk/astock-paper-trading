@@ -21,6 +21,8 @@ import ast
 import unittest
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
 ROOT = BACKEND.parent
 
@@ -259,11 +261,11 @@ def _writes_ledger_table(source: str) -> bool:
 
 
 def _ledger_tree():
-    return ast.parse((BACKEND / LEDGER_MODULE).read_text(encoding="utf-8"))
+    return ast_cache.tree(BACKEND / LEDGER_MODULE)
 
 
 def _ledger_source():
-    return (BACKEND / LEDGER_MODULE).read_text(encoding="utf-8")
+    return ast_cache.source(BACKEND / LEDGER_MODULE)
 
 
 def _imported_modules(tree):
@@ -436,7 +438,7 @@ class ExecutionAndLearningDoNotConsumeLedger(unittest.TestCase):
             path = BACKEND / name
             if not path.exists():  # pragma: no cover - 模块清单防御
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast_cache.tree(path)
             for imported in _imported_modules(tree):
                 if "tradability_observation_ledger" in imported:
                     offenders.append(f"{name}: {imported}")

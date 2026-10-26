@@ -8,6 +8,7 @@ import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
 import { PAPER_STAGE_LABELS } from "./paper.js";
 import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings } from "./ai-provider-settings.js";
+import { renderAiCapabilitySection, refreshAiCapabilities } from "./ai-capability.js";
 
 // 周期状态直接印英文会让「当前周期：running」这种行看起来像没做完的界面。
 var CYCLE_STATUS_LABELS={running:'运行中',paused:'已暂停',pending:'待执行',completed:'已完成',archived:'已归档',idle:'空闲',starting:'启动中',stopping:'停止中'};
@@ -60,7 +61,7 @@ export function refreshOperatorUnlockState(){
 }
 
 // ---------- 统一设置中心 ----------
-export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'};
+export var SETTINGS_STRATEGY_NAMES={tq_breakout:'激进做T',trend_pullback:'稳健波段',reported_profit_breakout:'保守防守'};
 
 export var SETTINGS_DURATION_OPTIONS=[15,30,60,90,180,0];
 
@@ -97,6 +98,7 @@ export function settingsPreviewHtml(data,section){
 export function renderSettings(data){
   window._settingsPayload=data||{};
   var target=$('settingsResult'); if(!target) return;
+  if((window._settingsSection||'')==='ai'){ Promise.resolve().then(function(){ return refreshAiCapabilities(); }).catch(function(){}); }
   var section=window._settingsSection||'simulation', settings=(data&&data.settings)||{}, defaults=(data&&data.defaults)||{}, html='';
   var sim=settings.simulation||{}, risk=settings.risk||{}, strat=settings.strategy||{}, evo=settings.evolution||{}, ai=(data&&data.ai)||{}, cur=((data||{}).effective||{}).current_cycle||{};
   if(section==='simulation'){
@@ -208,7 +210,7 @@ export function renderSettings(data){
     }).join('');
     html='<div class="settings-grid"><section class="settings-panel"><h3>AI 审核</h3>'
       +'<p>先保存不同的提供商，再为 AI1、AI2 下拉选择提供商和模型。</p>'
-      +renderProviderLibrary(review)+aiSlotCards+'<h4 class="ai-review-heading">3. 审核模式与运行开关</h4>'
+      +renderProviderLibrary(review)+aiSlotCards+renderAiCapabilitySection({ current: { mode: 'ADVISORY' }, capabilities: [] })+'<h4 class="ai-review-heading">4. 审核模式与运行开关</h4>'
       +'<div class="settings-form">'
       +settingsInputRow('evolution_interval_hours','自进化周期','收盘学习任务之间的最短间隔，范围 1–168 小时。','<input id="settingEvolutionInterval" type="number" min="1" max="168" step="1" value="'+Number(evo.evolution_interval_hours||24)+'"> <span class="setting-value-preview">小时</span>')
       +'<div class="setting-row"><div class="setting-label"><b>审核模式</b><small>单AI：只用选定槽位，结果仅供参考、永不构成共识。双AI：两个槽位独立分析后过共识门禁，缺一个即整体拦截，绝不降级成单AI。</small></div>'

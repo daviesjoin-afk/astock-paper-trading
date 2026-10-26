@@ -51,6 +51,7 @@ import json
 import math
 import os
 import sqlite3
+from pathlib import Path
 import time
 import urllib.error
 import urllib.request
@@ -499,8 +500,17 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         max_severity = max((item["severity"] for item in findings), key=lambda value: rank[value])
     import factor_effectiveness_report as factor_report
     factor_effectiveness = factor_report.evidence_summary(factor_report.build_report(paper_db_path, asof=now))
+    import main_force_trade_evidence
+    main_force_cases = main_force_trade_evidence.evidence_summary(
+        main_force_trade_evidence.build_report(paper_db_path, asof=now))
+    import intraday_t_pair_report
+    intraday_t_pairs = intraday_t_pair_report.evidence_summary(
+        intraday_t_pair_report.build_report(paper_db_path, asof=now))
     import auction_analysis
     auction_evidence = auction_analysis.evidence(now, rows, adaptive_conn, important_codes)
+    import auction_factor_shadow
+    auction_factor = auction_factor_shadow.evidence_summary(
+        auction_factor_shadow.build_report(now))
     evidence = {
         "scope": "paper_trading_only",
         "generated_at": _now(),
@@ -523,7 +533,10 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
         "paper_ledger": ledger,
         "account_performance": account_performance,
         "factor_effectiveness": factor_effectiveness,
+        "main_force_trade_cases": main_force_cases,
+        "intraday_t_pairs": intraday_t_pairs,
         "auction_tracking": auction_evidence,
+        "auction_factor_shadow": auction_factor,
         "adaptive_learning": adaptive_stats,
         "deterministic_findings": findings,
         "deterministic_findings_meaning": "仅列出已执行检查发现的异常；空列表表示这些检查未发现异常，不代表因子有效性证据充分。",
@@ -839,10 +852,13 @@ def _baseline_weights(account_id, overlay):
 
 
 def _tuning_accounts(paper_db_path):
-    """Read only the small, auditable account state sent to the model."""
+    """Only send current execution participants with tunable factors to the model."""
+    import strategy_weight_scope as SCOPE
     try:
-        paper = sqlite3.connect(paper_db_path, timeout=10)
+        paper = sqlite3.connect(Path(paper_db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
         paper.row_factory = sqlite3.Row
+        paper.execute("PRAGMA query_only=ON")
+        participants = set(SCOPE.participant_ids(paper))
         rows = paper.execute("SELECT id,version,style,params FROM paper_accounts ORDER BY id").fetchall()
     except (OSError, sqlite3.Error):
         return []
@@ -853,6 +869,8 @@ def _tuning_accounts(paper_db_path):
             pass
     accounts = []
     for row in rows:
+        if row["id"] not in participants:
+            continue
         params = _loads(row["params"], {}) or {}
         overlay = params.get("adaptive_selection") or {}
         account_id = str(row["id"])
@@ -886,7 +904,7 @@ def _tuning_prompt(evidence, accounts, mode):
         "market_regime": "momentum|rotation|risk_off|high_volatility|balanced|unclassified",
         "summary": "中文说明",
         "proposals": [{
-            "account_id": "tq_breakout|trend_pullback|sector_rotation",
+            "account_id": "|".join(str(account["account_id"]) for account in accounts),
             "reason": "只说明证据和预期改善",
             "weights": {"仅使用当前账户已有因子": 0.25},
         }],

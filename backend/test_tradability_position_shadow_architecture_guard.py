@@ -21,6 +21,8 @@ import re
 import unittest
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
 ROOT = BACKEND.parent
 
@@ -110,11 +112,11 @@ OBSERVER_METHODS = frozenset({"observe", "observe_many", "summarize"})
 
 
 def _tree(name):
-    return ast.parse((BACKEND / name).read_text(encoding="utf-8"))
+    return ast_cache.tree(BACKEND / name)
 
 
 def _source(name):
-    return (BACKEND / name).read_text(encoding="utf-8")
+    return ast_cache.source(BACKEND / name)
 
 
 def _public_names(tree, *, methods_of=None):
@@ -331,7 +333,7 @@ class ExecutionAndLearningDoNotConsumePositionLayer(unittest.TestCase):
             path = BACKEND / name
             if not path.exists():  # pragma: no cover - 模块清单防御
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast_cache.tree(path)
             for imported in _imported_modules(tree):
                 if imported in ("tradability_position_evidence",
                                 "tradability_position_shadow"):

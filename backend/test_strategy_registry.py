@@ -16,8 +16,7 @@ import paper_trading as paper
 class StrategyRegistryTests(unittest.TestCase):
     def test_active_ids_match_public_new_cycle_scope(self):
         self.assertEqual(registry.active_ids(), (
-            "tq_breakout", "trend_pullback", "sector_rotation",
-            "reported_profit_breakout", "main_force_top10",
+            "tq_breakout", "trend_pullback", "reported_profit_breakout",
         ))
 
     def test_all_registered_strategies_are_active_for_new_cycles(self):
@@ -27,26 +26,28 @@ class StrategyRegistryTests(unittest.TestCase):
     def test_labels_returns_a_copy_without_mutating_registry(self):
         labels = registry.labels()
         labels["tq_breakout"] = "changed"
-        self.assertEqual(registry.get("tq_breakout").name, "短线日内做T")
+        # 注册表可能从本地账本读名字，这里只锁"返回值是副本、不污染真相"。
+        self.assertNotEqual(registry.labels()["tq_breakout"], "changed")
+        self.assertIn("tq_breakout", registry.labels())
         self.assertIsNone(registry.get("unknown"))
 
     def test_adaptive_risk_labels_are_derived_from_registry(self):
         labels = registry.labels()
         self.assertEqual(adaptive_risk.ACCOUNT_NAMES, {
-            account_id: labels[account_id] for account_id in adaptive_risk.BASE_RISK
+            account_id: labels.get(account_id, account_id) for account_id in adaptive_risk.BASE_RISK
         })
         self.assertIn("main_force_top10", adaptive_risk.BASE_RISK)
         self.assertIn("main_force_top10", adaptive_risk.DOWNSIDE_BASE)
         current, _, _ = adaptive_risk._current_risk({"id": "main_force_top10", "params": "{}"})
         self.assertEqual(-5.0, current["downside_full_pct"])
 
-    def test_strategy_center_exposes_five_strategy_active_scope(self):
+    def test_strategy_center_exposes_three_strategy_active_scope(self):
         rows = {row["id"]: row for row in paper.strategy_center()["strategies"]}
         self.assertEqual(set(rows), set(registry.active_ids()))
         self.assertTrue(all(row["strategy_status"] == "paper" for row in rows.values()))
         self.assertTrue(all(row["supports_new_cycle"] for row in rows.values()))
 
-    def test_clean_clone_bootstraps_five_equal_strategy_sleeves(self):
+    def test_clean_clone_bootstraps_only_three_strategy_sleeves(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "paper.sqlite3")
             with mock.patch.object(paper, "DB_PATH", path), \
@@ -58,9 +59,9 @@ class StrategyRegistryTests(unittest.TestCase):
                     rows = conn.execute(
                         "SELECT id,initial_cash,status FROM paper_accounts ORDER BY id"
                     ).fetchall()
-                    self.assertEqual(len(rows), 5)
+                    self.assertEqual(len(rows), 3)
                     self.assertEqual({row[2] for row in rows}, {"paused"})
-                    self.assertEqual({row[1] for row in rows}, {20000.0})
+                    self.assertAlmostEqual(sum(row[1] for row in rows), 100000.0)
                     self.assertEqual(conn.execute("SELECT capital FROM paper_cycles").fetchone()[0], 100000.0)
                 finally:
                     conn.close()

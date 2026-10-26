@@ -60,47 +60,47 @@ def _isolated_kline_source(fake_fetcher):
 
 class AIControlTests(unittest.TestCase):
     def test_realtime_patch_is_factor_only_and_three_percent(self):
-        base = dict(AS.BASE_WEIGHTS["one_to_two"])
+        base = dict(AS.BASE_WEIGHTS["first_board_relay"])
         patch = DA._bounded_tuning_patch(
             {"entry_score_delta": 0.0},
             {"weights": {key: 100 for key in base},
              "entry_score_delta": 0.9,
              "conditions": {"pct_high": 0.01}},
-            "one_to_two", base, AS._conditions("one_to_two"),
+            "first_board_relay", base, AS._conditions("first_board_relay"),
         )
         self.assertEqual(set(patch), {"weights"})
         self.assertTrue(all(abs(patch["weights"][key] - base[key]) <= 0.030001 for key in base))
 
     def test_auto_validator_rejects_conditions_and_thresholds(self):
-        base = {"weights": dict(AS.BASE_WEIGHTS["one_to_two"]), "entry_score_delta": 0.0}
+        base = {"weights": dict(AS.BASE_WEIGHTS["first_board_relay"]), "entry_score_delta": 0.0}
         self.assertFalse(AS._factor_only_patch(
-            {"weights": dict(base["weights"]), "conditions": {}}, base, "one_to_two"
+            {"weights": dict(base["weights"]), "conditions": {}}, base, "first_board_relay"
         ))
         self.assertFalse(AS._factor_only_patch(
-            {"weights": dict(base["weights"]), "entry_score_delta": 0.01}, base, "one_to_two"
+            {"weights": dict(base["weights"]), "entry_score_delta": 0.01}, base, "first_board_relay"
         ))
         changed = dict(base["weights"])
         changed["mom_short"] += 0.02
-        self.assertTrue(AS._factor_only_patch({"weights": changed}, base, "one_to_two"))
+        self.assertTrue(AS._factor_only_patch({"weights": changed}, base, "first_board_relay"))
 
     def test_weight_patch_merges_current_overlay(self):
         params = {"adaptive_selection": {
-            "model_family": "one_to_two",
+            "model_family": "first_board_relay",
             "conditions": {"pct_high": 5.0},
             "entry_paths": {"normal": True},
-            "weights": dict(AS.BASE_WEIGHTS["one_to_two"]),
+            "weights": dict(AS.BASE_WEIGHTS["first_board_relay"]),
         }}
         changed = dict(params["adaptive_selection"]["weights"])
         changed["mom_short"] += 0.01
         merged = AS._merge_selection_overlay(
-            params, {"weights": changed}, params["adaptive_selection"]["weights"], "one_to_two"
+            params, {"weights": changed}, params["adaptive_selection"]["weights"], "first_board_relay"
         )
         self.assertEqual(merged["conditions"], {"pct_high": 5.0})
         self.assertEqual(merged["entry_paths"], {"normal": True})
         self.assertEqual(merged["weights"], changed)
 
     def test_dual_ai_unknown_factor_is_rejected(self):
-        base = {"weights": dict(AS.BASE_WEIGHTS["one_to_two"])}
+        base = {"weights": dict(AS.BASE_WEIGHTS["first_board_relay"])}
         unknown = dict(base["weights"])
         unknown["invented_factor"] = 0.05
         proposal = {"account_id": "tq_breakout", "confidence": 90,

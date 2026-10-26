@@ -24,13 +24,13 @@ class StructureTargetGatingTests(unittest.TestCase):
                 self.assertEqual("", reason)
 
     def test_missing_reward_evidence_keeps_structure_unchanged(self):
-        _, _paths, mutation, _ = AS._structure_target("tq_breakout", "one_to_two", "mature", None)
+        _, _paths, mutation, _ = AS._structure_target("tq_breakout", "first_board_relay", "mature", None)
         self.assertEqual("none", mutation)
 
     def test_loss_without_enough_evidence_keeps_structure_unchanged(self):
         for tier in ("waiting", "fast_shadow", "micro"):
             with self.subTest(tier=tier):
-                _, _paths, mutation, _ = AS._structure_target("tq_breakout", "one_to_two", tier, -0.50)
+                _, _paths, mutation, _ = AS._structure_target("tq_breakout", "first_board_relay", tier, -0.50)
                 self.assertEqual("none", mutation)
 
     def test_loss_with_standard_evidence_requests_structural_change(self):
@@ -61,7 +61,7 @@ class ProposalChannelTests(unittest.TestCase):
     BASE_CONDITIONS = {"pct_high": 5.0}
     BASE_DELTA = 0.01
 
-    def _proposal(self, account="tq_breakout", model="one_to_two", reward=0.0, tier="mature"):
+    def _proposal(self, account="tq_breakout", model="first_board_relay", reward=0.0, tier="mature"):
         return AS._proposal(
             account, model, dict(AS.BASE_WEIGHTS[model]), self.BASE_DELTA,
             dict(self.BASE_CONDITIONS), "balanced", reward, tier,
@@ -86,14 +86,14 @@ class ProposalChannelTests(unittest.TestCase):
         # 平衡市乘子全为 1，权重本就不该动（那会落到 no_change）；换一个
         # 乘子有偏离的盘面，纯权重通道必须真的调整权重。
         proposal = AS._proposal(
-            "tq_breakout", "one_to_two", dict(AS.BASE_WEIGHTS["one_to_two"]),
+            "tq_breakout", "first_board_relay", dict(AS.BASE_WEIGHTS["first_board_relay"]),
             self.BASE_DELTA, dict(self.BASE_CONDITIONS), "risk_off", 0.02, "mature",
         )
-        self.assertNotEqual(dict(AS.BASE_WEIGHTS["one_to_two"]), proposal["weights"])
+        self.assertNotEqual(dict(AS.BASE_WEIGHTS["first_board_relay"]), proposal["weights"])
         self.assertEqual("none", proposal["mutation_type"])
 
     def test_structural_change_carries_its_reason(self):
-        proposal = self._proposal(account="trend_pullback", model="bottom_reversal", reward=-0.30)
+        proposal = self._proposal(account="trend_pullback", model="pullback_reversal", reward=-0.30)
         self.assertEqual("model_family_switch", proposal["mutation_type"])
         self.assertTrue(proposal["structure_reason"])
 

@@ -22,8 +22,7 @@ def _db():
 
 class ProfileTests(unittest.TestCase):
     def test_all_five_strategies_have_profiles(self):
-        for strategy_id in ("tq_breakout", "trend_pullback", "sector_rotation",
-                            "reported_profit_breakout", "main_force_top10"):
+        for strategy_id in ("tq_breakout", "trend_pullback", "reported_profit_breakout"):
             profile = EP.evolution_profile_for(strategy_id)
             self.assertFalse(profile["fallback"], strategy_id)
             self.assertTrue(profile["tunable"])
@@ -44,8 +43,7 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("consensus_direction_threshold", day_trading["locked"])
 
     def test_min_evidence_is_at_least_global_threshold(self):
-        for strategy_id in ("tq_breakout", "trend_pullback", "sector_rotation",
-                            "reported_profit_breakout", "main_force_top10"):
+        for strategy_id in ("tq_breakout", "trend_pullback", "reported_profit_breakout"):
             self.assertGreaterEqual(
                 EP.min_evidence_for(strategy_id), SE.MIN_SAMPLES_FOR_EVOLUTION,
                 strategy_id,

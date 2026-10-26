@@ -518,7 +518,9 @@ def enabled_strategies(conn: sqlite3.Connection) -> list[str]:
     if row is not None and _decode(row[0], None) == []:
         return []
     value = get(conn, "enabled_strategies", eligible)
-    return [item for item in value if item in eligible] or eligible
+    # A saved list is an explicit scope. If all saved identities become
+    # ineligible, keep it empty rather than silently enabling other strategies.
+    return [item for item in value if item in eligible] if isinstance(value, list) else []
 
 
 def cycle_duration_label(days: int | None) -> str:

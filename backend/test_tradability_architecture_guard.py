@@ -20,9 +20,16 @@
 
 import ast
 import unittest
+from unittest import mock
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
+
+# The module-level pass is a separate seam from ``_reads_key``'s subtree scans.
+# Tests can count this walker without mistaking detector internals for the guard.
+_MODULE_WALK = ast.walk
 
 # 会产生正式交易/学习判断的模块：它们不得自行读取原始可交易性字段。
 FORMAL_JUDGEMENT_MODULES = (
@@ -88,19 +95,7 @@ KNOWN_ST_NAME_INFERENCE_EXCEPTIONS = {
 
 
 def _load_tree(name):
-    return ast.parse((BACKEND / name).read_text(encoding="utf-8"))
-
-
-def _function_spans(tree):
-    """Yield ``(name, start, end)`` for every top-level/nested function."""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            start = node.lineno
-            end = max(
-                (child.lineno for child in ast.walk(node) if hasattr(child, "lineno")),
-                default=start,
-            )
-            yield node.name, start, end
+    return ast_cache.tree(BACKEND / name)
 
 
 def _string_substring_test_on(node, keys):
@@ -202,26 +197,51 @@ def _reads_key(node, keys):
     return False
 
 
+def _raw_read_offenders(tree, allowed):
+    """Find raw reads in one module walk, preserving per-function exemptions."""
+    offenders = []
+    # One pass over the module. ``_reads_key`` performs its own subtree scans;
+    # this seam is deliberately separate so the guard cannot degrade back to
+    # walking the whole tree once per function.
+    for node in _MODULE_WALK(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name in allowed:
+            continue
+        if _reads_key(node, RAW_TRADABILITY_KEYS):
+            offenders.append((node.lineno, node.name))
+    return offenders
+
+
 class FormalJudgementMustUseTheArchive(unittest.TestCase):
     def test_no_module_reads_raw_tradability_fields_outside_the_archive(self):
         offenders = []
         for name in FORMAL_JUDGEMENT_MODULES:
             tree = _load_tree(name)
             allowed = ALLOWED_FUNCTIONS.get(name, set())
-            for function_name, start, end in _function_spans(tree):
-                if function_name in allowed:
-                    continue
-                for node in ast.walk(tree):
-                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        continue
-                    if node.name != function_name or node.lineno != start:
-                        continue
-                    if _reads_key(node, RAW_TRADABILITY_KEYS):
-                        offenders.append(f"{name}:{start} {function_name}")
+            offenders.extend(
+                f"{name}:{lineno} {function_name}"
+                for lineno, function_name in _raw_read_offenders(tree, allowed)
+            )
         self.assertEqual(
             [], offenders,
             "正式判断模块直接读取了原始可交易性字段；必须经过 TradabilityArchive API",
         )
+
+    def test_raw_read_guard_walks_the_module_once_and_keeps_function_identity(self):
+        tree = ast.parse(
+            "def same(row):\n"
+            "    return row.get('is_suspended')\n"
+            "def same(row):\n"
+            "    return row.get('close_price')\n"
+            "def exempt(row):\n"
+            "    return row.get('has_trade_volume')\n"
+        )
+        with mock.patch("test_tradability_architecture_guard._MODULE_WALK",
+                        wraps=ast.walk) as walk:
+            offenders = _raw_read_offenders(tree, {"exempt"})
+        self.assertEqual(1, walk.call_count)
+        self.assertEqual([(1, "same")], offenders)
 
     def test_no_module_infers_st_from_a_name_substring(self):
         """禁止 ``name.startswith("ST")`` / ``.str.contains("ST")`` / ``"ST" in name``。
@@ -356,7 +376,7 @@ class ArchiveIsTheSingleEntryPoint(unittest.TestCase):
 
     def test_archive_does_not_import_strategy_or_execution_modules(self):
         """事实层必须自足：不得反向依赖交易/策略/学习链路。"""
-        tree = ast.parse(Path(BACKEND / "tradability_archive.py").read_text(encoding="utf-8"))
+        tree = ast_cache.tree(BACKEND / "tradability_archive.py")
         forbidden = {"paper_trading", "strategies", "adaptive_engine",
                      "execution_verification", "learning_dataset", "main"}
         imported = set()
@@ -529,7 +549,7 @@ class BackendTestsMustNotDependOnWorkModules(unittest.TestCase):
     def test_no_backend_test_imports_a_work_only_module(self):
         offenders = []
         for path in _test_module_paths():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast_cache.tree(path)
             hits = _imports_work_module(tree)
             for hit in hits:
                 offenders.append(f"{path.name}: {hit}")
@@ -541,7 +561,7 @@ class BackendTestsMustNotDependOnWorkModules(unittest.TestCase):
     def test_no_backend_test_appends_work_to_sys_path(self):
         offenders = []
         for path in _test_module_paths():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast_cache.tree(path)
             hits = _appends_work_to_sys_path(tree)
             for hit in hits:
                 offenders.append(f"{path.name}: {hit}")

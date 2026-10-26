@@ -42,7 +42,7 @@ class StrategyFactorRequirementsTests(unittest.TestCase):
 
     def test_replacement_plugin_runner_keeps_full_input_and_restores_builtin_plan(self):
         price, fund, sentiment = self.inputs()
-        for selector in ("one_to_two", "main_force_top10"):
+        for selector in ("first_board_relay", "main_force_top10"):
             original = SP.plugin_for_selector(selector)
             original_plan = S.scoring_factor_inputs(selector)
             self.assertIsNotNone(original)
@@ -95,32 +95,32 @@ class StrategyFactorRequirementsTests(unittest.TestCase):
                 return {"strategy": self.selector_id, "count": len(picks), "picks": picks}
 
         price, fund, sentiment = self.inputs()
-        original = SP.plugin_for_selector("one_to_two")
-        original_plan = S.scoring_factor_inputs("one_to_two")
+        original = SP.plugin_for_selector("first_board_relay")
+        original_plan = S.scoring_factor_inputs("first_board_relay")
         replacement = QualityPlugin(original.strategy_id, original.selector_id, ("quality",))
         self.assertIsNone(replacement.candidate_runner)
         SP.register_plugin(replacement, replace=True)
         try:
             full = S.build_factor_table(price, fund, sentiment=sentiment)
-            expected = S.run_strategy("one_to_two", full)
+            expected = S.run_strategy("first_board_relay", full)
             self.assertGreater(expected["count"], 0)
             legacy_subset = S.build_factor_table(
                 price, fund, sentiment=sentiment, scoring_factors=original_plan,
             )
             with self.assertRaises(KeyError):
-                S.run_strategy("one_to_two", legacy_subset)
-            self.assertIsNone(S.scoring_factor_inputs("one_to_two"))
+                S.run_strategy("first_board_relay", legacy_subset)
+            self.assertIsNone(S.scoring_factor_inputs("first_board_relay"))
             actual_table = S.build_factor_table(
                 price, fund, sentiment=sentiment,
-                scoring_factors=S.scoring_factor_inputs("one_to_two"),
+                scoring_factors=S.scoring_factor_inputs("first_board_relay"),
             )
             pd.testing.assert_frame_equal(actual_table, full)
-            self.assertEqual(comparable(S.run_strategy("one_to_two", actual_table)),
+            self.assertEqual(comparable(S.run_strategy("first_board_relay", actual_table)),
                              comparable(expected))
         finally:
             SP.register_plugin(original, replace=True)
-        self.assertIs(SP.plugin_for_selector("one_to_two"), original)
-        self.assertEqual(S.scoring_factor_inputs("one_to_two"), original_plan)
+        self.assertIs(SP.plugin_for_selector("first_board_relay"), original)
+        self.assertEqual(S.scoring_factor_inputs("first_board_relay"), original_plan)
 
     def test_native_plugin_added_replay_factor_retains_real_candidate_evidence(self):
         price, fund, sentiment = self.inputs()
@@ -131,8 +131,8 @@ class StrategyFactorRequirementsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="astock-factor-replay-") as temporary, mock.patch.dict(
             os.environ, {"ASTOCK_CACHE_DIR": temporary, "ASTOCK_GIT_COMMIT": "abcdef123456"},
         ):
-            for selector, evidence in (("one_to_two", "quality"),
-                                       ("one_to_two", "quality_evidence_quality"),
+            for selector, evidence in (("first_board_relay", "quality"),
+                                       ("first_board_relay", "quality_evidence_quality"),
                                        ("main_force_top10", "sentiment_source")):
                 with self.subTest(selector=selector, evidence=evidence):
                     original = SP.plugin_for_selector(selector)
@@ -178,26 +178,26 @@ class StrategyFactorRequirementsTests(unittest.TestCase):
                 self.assertEqual(S.scoring_factor_inputs(selector), original_plan)
 
     def test_equal_copy_of_builtin_binding_conservatively_keeps_full_input(self):
-        original = SP.plugin_for_selector("one_to_two")
-        original_plan = S.scoring_factor_inputs("one_to_two")
+        original = SP.plugin_for_selector("first_board_relay")
+        original_plan = S.scoring_factor_inputs("first_board_relay")
         replacement = replace(original)
         self.assertEqual(replacement, original)
         SP.register_plugin(replacement, replace=True)
         try:
             self.assertFalse(SP.is_original_builtin_plugin(replacement))
-            self.assertIsNone(S.scoring_factor_inputs("one_to_two"))
+            self.assertIsNone(S.scoring_factor_inputs("first_board_relay"))
         finally:
             SP.register_plugin(original, replace=True)
         self.assertTrue(SP.is_original_builtin_plugin(original))
-        self.assertEqual(S.scoring_factor_inputs("one_to_two"), original_plan)
+        self.assertEqual(S.scoring_factor_inputs("first_board_relay"), original_plan)
 
     def test_unregistered_known_legacy_selector_retains_its_static_plan(self):
-        original = SP.plugin_for_selector("one_to_two")
+        original = SP.plugin_for_selector("first_board_relay")
         SP.unregister_plugin(original.strategy_id)
         try:
-            self.assertIsNone(SP.plugin_for_selector("one_to_two"))
+            self.assertIsNone(SP.plugin_for_selector("first_board_relay"))
             self.assertFalse(SP.is_original_builtin_plugin(original))
-            self.assertEqual(S.scoring_factor_inputs("one_to_two"), set(S.PAPER_WEIGHTS["one_to_two"]))
+            self.assertEqual(S.scoring_factor_inputs("first_board_relay"), set(S.PAPER_WEIGHTS["first_board_relay"]))
             self.assertIsNone(S.scoring_factor_inputs("unregistered_extension"))
         finally:
             SP.register_plugin(original, replace=True)
@@ -228,12 +228,12 @@ class StrategyFactorRequirementsTests(unittest.TestCase):
         price, fund, sentiment = self.inputs()
         full = S.build_factor_table(price, fund, sentiment=sentiment)
         nondefault_weights = {
-            "one_to_two": {"mom_short": .40, "flow": .25, "volsurge": .25, "sentiment": .10},
-            "bottom_reversal": {"value": .26, "quality": .20, "volsurge": .24,
+            "first_board_relay": {"mom_short": .40, "flow": .25, "volsurge": .25, "sentiment": .10},
+            "pullback_reversal": {"value": .26, "quality": .20, "volsurge": .24,
                                 "flow": .12, "mom_short": .10, "rsi": .08},
             "trend_continuation": {"mom_short": .24, "mom": .20, "flow": .24,
                                    "volsurge": .17, "quality": .15},
-            "sentiment_pioneer": {"sentiment": .38, "flow": .27, "mom_short": .15, "volsurge": .20},
+            "sector_sentiment": {"sentiment": .38, "flow": .27, "mom_short": .15, "volsurge": .20},
         }
         for model in S.PAPER_WEIGHTS:
             for overrides in (None, dict(S.PAPER_WEIGHTS[model]), nondefault_weights[model]):
@@ -263,13 +263,13 @@ class StrategyFactorRequirementsTests(unittest.TestCase):
         price, fund, _ = self.inputs()
         fund = fund.drop(columns=["pe", "pb", "roe", "rev_yoy", "profit_yoy"])
         original = copy.deepcopy(fund)
-        table = S.build_factor_table(price, fund, scoring_factors=S.scoring_factor_inputs("one_to_two"))
+        table = S.build_factor_table(price, fund, scoring_factors=S.scoring_factor_inputs("first_board_relay"))
         self.assertNotIn("quality", table)
         self.assertNotIn("value", table)
         pd.testing.assert_frame_equal(fund, original)
         # Sentiment is a required gate for this model, even in selective mode.
-        sector = S.build_factor_table(price, fund, scoring_factors=S.scoring_factor_inputs("sentiment_pioneer"))
-        result = S.run_strategy("sentiment_pioneer", sector, gate={"light": "green"})
+        sector = S.build_factor_table(price, fund, scoring_factors=S.scoring_factor_inputs("sector_sentiment"))
+        result = S.run_strategy("sector_sentiment", sector, gate={"light": "green"})
         self.assertEqual(result["count"], 0)
         self.assertEqual(result["factor_calibration"]["eligible_evidence_rows"], 0)
 

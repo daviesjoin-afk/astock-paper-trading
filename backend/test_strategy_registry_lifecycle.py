@@ -48,8 +48,7 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
     def test_builtin_migration_is_idempotent_and_preserves_state(self):
         rows = registry.list_definitions(conn=self.conn)
         self.assertEqual([row.id for row in rows], [
-            "tq_breakout", "trend_pullback", "sector_rotation",
-            "reported_profit_breakout", "main_force_top10",
+            "tq_breakout", "trend_pullback", "reported_profit_breakout",
         ])
         self.assertTrue(all(row.origin == "builtin" for row in rows))
         self._transition("tq_breakout", "paused", kind="safety")
@@ -193,7 +192,7 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
         ids = {row["id"] for row in everything["items"]}
         self.assertIn("trend_pullback", ids)
         self.assertEqual(everything["summary"]["user"], 1)
-        self.assertGreaterEqual(everything["summary"]["builtin"], 5)
+        self.assertEqual(everything["summary"]["builtin"], 3)
 
 
 if __name__ == "__main__":

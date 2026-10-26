@@ -241,18 +241,18 @@ class ActiveDeploymentSelectionTests(ValidationBase):
             adaptive.close()
 
     def test_matching_key_set_is_recorded_as_deployed(self):
-        self._set_overlay("tq_breakout", dict(S.PAPER_WEIGHTS["one_to_two"]))
+        self._set_overlay("tq_breakout", dict(S.PAPER_WEIGHTS["first_board_relay"]))
         kinds = [d["kind"] for d in self._deployments()]
         self.assertIn("selection", kinds)
 
     def test_key_set_mismatch_is_not_recorded_because_runtime_clears_it(self):
-        weights = dict(S.PAPER_WEIGHTS["one_to_two"])
+        weights = dict(S.PAPER_WEIGHTS["first_board_relay"])
         weights.pop("sentiment")   # 运行时 set(weights) != expected → weights={}
         self._set_overlay("tq_breakout", weights)
         self.assertEqual([], self._deployments())
 
     def test_disallowed_model_family_falls_back_and_is_not_recorded(self):
-        # sector_rotation 只允许 sentiment_pioneer；声明 trend_continuation 会
+        # sector_rotation 只允许 sector_sentiment；声明 trend_continuation 会
         # 回落到 source，键集随之不符，运行时权重被清空。
         with self._paper_ctx() as conn:
             conn.execute("INSERT INTO paper_accounts(id,params,updated_at) VALUES(?,?,?)",

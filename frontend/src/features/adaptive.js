@@ -534,7 +534,7 @@ export function renderAdaptive(d){
   };
   var riskParamLabel={max_exposure:'总仓上限',max_weight:'单股上限',max_industry:'行业上限',single_risk:'单笔风险',daily_loss:'单日熔断',drawdown:'回撤熔断',cooldown_days:'冷静期',min_cost_edge:'成本边际'};
   var downsidePolicy=riskOpt.downside_policy||{};
-  var downsideAccountNames={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'};
+  var downsideAccountNames={tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守',main_force_top10:'超强主力股'};
   var downsideDefaults=downsidePolicy.defaults||{};
   var downsidePolicyRows=Object.keys(downsideDefaults).filter(function(id){return downsideAccountNames[id];}).map(function(id){var p=downsideDefaults[id]||{},pick=function(short,long){return Number(p[short]==null?p[long]:p[short])||0;};return '<div><b>'+adaptiveEsc(downsideAccountNames[id]||id)+'</b><span>预警 '+fmt(pick('downside_warning_pct','warning_pct'),1)+'% · 部分 '+fmt(pick('downside_partial_pct','partial_pct'),1)+'% · 强制 '+fmt(pick('downside_full_pct','full_pct'),1)+'%</span><small>相对大盘 '+fmt(pick('downside_relative_pct','relative_pct'),1)+'% · 峰值回撤 '+fmt(pick('downside_peak_retrace_pct','peak_retrace_pct'),1)+'% · 部分比例 '+fmt(pick('downside_partial_ratio','partial_ratio')*100,0)+'%</small></div>';}).join('')||'<div><b>等待风控策略基准</b><span>下一次风险评估后生成三段式阈值</span></div>';
   var downsideNotice='<div class="adaptive-notice adaptive-downside-notice"><b>下跌防线 · '+adaptiveEsc(downsidePolicy.engine||'主力意图 + 三段式下跌防线')+'</b><span>连续 '+Number(downsidePolicy.confirmation_scans||2)+' 次确认后才执行部分/强制减仓；自进化只在事件≥3、确认出货占比≥60%、奖励窗口为负时保守收紧，放宽必须人工批准。</span></div>';
@@ -565,7 +565,7 @@ export function renderAdaptive(d){
     return '<article class="adaptive-research-card '+adaptiveEsc(task.purpose)+'"><header><div><span>'+adaptiveEsc(task.purpose.replace(/_/g,' '))+'</span><h4>'+adaptiveEsc(task.label)+'</h4></div><em>研究任务</em></header><p>'+adaptiveEsc(task.short||'运行一次 typed research task。')+'</p><button class="ghost" onclick="runAdaptiveResearchTask(\''+adaptiveEsc(task.purpose)+'\',this)">单独运行</button></article>';
   }).join('')||'<div class="paper-empty">研究任务尚未加载。</div>';
   var tradeAttrAccountCards=Object.keys(tradeAttrAccounts).filter(function(id){return downsideAccountNames[id];}).map(function(id){var x=tradeAttrAccounts[id]||{};return '<div><small>'+adaptiveEsc(downsideAccountNames[id]||id)+'</small><b>'+Number(x.filled||0)+' 笔</b><span>个股 '+adaptiveValue(x.mean_stock_move_pct,'%',2)+' · 超额 '+adaptiveValue(x.mean_alpha_pct,'%',2)+'</span><em>公告偏空 '+Number(x.negative_news_records||0)+' 笔 · AI '+Number(x.ai_completed||0)+' 笔</em></div>';}).join('')||'<div class="adaptive-empty-row">盘后收盘后生成逐笔归因。</div>';
-  var tradeAttrRows=(tradeAttribution.recent||[]).filter(function(x){return x.order_status==='filled';}).slice(0,8).map(function(x){var reason=adaptiveJsonArray(x.reason_codes).join('、');return '<li><time>'+adaptiveEsc(String(x.fill_date||'').slice(5,10))+'</time><div><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><p>'+adaptiveEsc(({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略'})[x.account_id]||x.account_id)+' · '+adaptiveEsc(x.side==='buy'?'买入':'卖出')+' '+Number(x.qty||0)+'股 · 成交 '+fmt(x.fill_price,2)+' · 收盘 '+fmt(x.close_price,2)+'</p><small>'+adaptiveEsc(reason||'暂无足够证据')+' · 大盘 '+adaptiveValue(x.benchmark_move_pct,'%',2)+' · 个股超额 '+adaptiveValue(x.stock_alpha_pct,'%',2)+'</small></div><em class="tag '+(x.ai_status==='completed'?'tag-ok':'tag-warn')+'">'+adaptiveEsc(x.ai_status==='completed'?'AI已归因':'规则归因')+'</em></li>';}).join('')||'<li class="adaptive-empty-row">当天没有已成交操作。</li>';
+  var tradeAttrRows=(tradeAttribution.recent||[]).filter(function(x){return x.order_status==='filled';}).slice(0,8).map(function(x){var reason=adaptiveJsonArray(x.reason_codes).join('、');return '<li><time>'+adaptiveEsc(String(x.fill_date||'').slice(5,10))+'</time><div><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><p>'+adaptiveEsc(({tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守'})[x.account_id]||x.account_id)+' · '+adaptiveEsc(x.side==='buy'?'买入':'卖出')+' '+Number(x.qty||0)+'股 · 成交 '+fmt(x.fill_price,2)+' · 收盘 '+fmt(x.close_price,2)+'</p><small>'+adaptiveEsc(reason||'暂无足够证据')+' · 大盘 '+adaptiveValue(x.benchmark_move_pct,'%',2)+' · 个股超额 '+adaptiveValue(x.stock_alpha_pct,'%',2)+'</small></div><em class="tag '+(x.ai_status==='completed'?'tag-ok':'tag-warn')+'">'+adaptiveEsc(x.ai_status==='completed'?'AI已归因':'规则归因')+'</em></li>';}).join('')||'<li class="adaptive-empty-row">当天没有已成交操作。</li>';
   var tradeAttrPanel='<section class="adaptive-panel trade-attribution-panel"><header><div><span>TRADE → REASON → LEARNING</span><h3>盘后逐笔涨跌归因</h3></div><em>'+Number(tradeAttribution.records||0)+' 条记录</em></header><p class="adaptive-copy">每个收盘任务先计算个股涨跌、大盘拖累、板块贡献、公告/舆情和行情质量，再批量调用 AI 做可审计解释；AI 结论只进入自进化证据，不直接下单。</p><div class="adaptive-grid trade-attribution-summary">'+tradeAttrAccountCards+'</div><ul class="adaptive-run-log trade-attribution-list">'+tradeAttrRows+'</ul></section>';
   var closedLoopStages=(closedLoop.timeline||[]).map(function(x){var active=String(x.stage)===String(closedLoop.stage);return '<div class="closed-loop-stage '+(active?'active':'')+'"><b>'+adaptiveEsc(x.stage)+'</b><span>'+adaptiveEsc(x.mode)+'</span><em>'+Number(x.nav_pct||0)+'% 资金</em></div>';}).join('');
   var closedLoopBlockers=(closedLoop.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">当前阶段的确定性门禁已通过</li>';
@@ -754,7 +754,20 @@ export function renderAuctionReview(data){
   var intentLabels={accumulation:'可能吸筹',distribution:'可能派发',support:'可能护盘',withdrawal:'可能撤单诱导',unclear:'意图不明'};
   var directionLabels={up:'向上',down:'向下',flat:'横盘',unclear:'不确定'};
   var verdictLabels={supported:'后续价格方向支持',contradicted:'后续价格方向不符',pending:'等待后续有效报价'};
+  var summary=tracking.summary||{};
+  var amountTotal=Number(summary.amount_total||0);
+  var amountText=amountTotal>0?('¥'+(amountTotal/10000).toFixed(2)+' 万'):'—（上游未返回金额）';
+  var amountLine='竞价成交额（观测合计）：<b>'+amountText+'</b>'
+    +' · 覆盖 '+Number(summary.with_amount||0)+'/'+Number(summary.tracked||0)+' 只'
+    +(summary.mean_pct==null?'':' · 平均竞价涨跌 '+Number(summary.mean_pct).toFixed(2)+'%')
+    +(summary.up==null?'':' · 上涨 '+Number(summary.up||0)+' / 下跌 '+Number(summary.down||0));
+  var largest=Array.isArray(summary.largest)?summary.largest:[];
+  var largestTable=largest.length?'<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>竞价额排名</th><th>代码 / 名称</th><th>竞价涨跌</th><th>竞价成交额</th></tr></thead><tbody>'
+    +largest.map(function(row,index){return '<tr><td>#'+(index+1)+'</td><td>'+adaptiveEsc(row.code||'')+' / '+adaptiveEsc(row.name||'—')+'</td><td>'+(row.pct==null?'—':Number(row.pct).toFixed(2)+'%')+'</td><td>'+(row.amount==null?'—':'¥'+(Number(row.amount)/10000).toFixed(2)+' 万')+'</td></tr>';}).join('')
+    +'</tbody></table></div>':'';
   var html='<p>'+(tracking.captured_at?'竞价最近采集：'+adaptiveEsc(String(tracking.captured_at).replace('T',' ').substring(0,19))+' · '+Number(tracking.observations||0)+' 轮 · '+Number(tracking.tracked_stocks||0)+' 只':'尚无竞价采集记录；09:15 起每3分钟采集。')+'</p>'
+    +'<p>'+amountLine+'</p>'+largestTable
+    +'<p style="color:#7b8d84">竞价阶段没有连续成交，“竞价成交额”是上游给出的当日累计撮合额；只统计本次观测到的个股，缺失不填零，也不代表全市场竞价额。</p>'
     +'<p>AI 会优先检阅候选及持仓，每次最多20只、每个槽位最多判断8只；证据不足可维持不变。主力意图属于推断，价格方向复核不能证明真实意图或盈利。</p>';
   if(!reviews.length){
     setEl('aiAuctionReview',html+'<p>暂无竞价意图判断。采集后，现有 AI 审阅与调参会读取轨迹并留档。</p>');return;

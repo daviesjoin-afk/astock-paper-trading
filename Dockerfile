@@ -61,6 +61,10 @@ RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.cloud.tencent.com/deb
 # 因此 Python 的 _sqlite3 会加载这里的新库；下面这条 RUN 断言"实际加载的库
 # 已是修复版本"，让版本回退在构建期就失败，而不是等运行期才发现。
 COPY --from=sqlite-build /build/libsqlite3.so.0.8.6 /usr/local/lib/libsqlite3.so.0.8.6
+# Debian multiarch 的 ldconfig 缓存会先命中 /lib/aarch64-linux-gnu，仅把库
+# 放进 /usr/local/lib 不足以覆盖它；显式固定运行时搜索路径，构建断言才能
+# 证明 Python 实际加载的是上面钉死版本的 SQLite。
+ENV LD_LIBRARY_PATH=/usr/local/lib
 RUN ln -sf libsqlite3.so.0.8.6 /usr/local/lib/libsqlite3.so.0 \
     && ldconfig \
     && python -c "import sqlite3, sys; version = sqlite3.sqlite_version; \
@@ -84,6 +88,9 @@ COPY --chown=app:app deploy ./deploy
 # 于是"镜像自带的测试套件"与实际内容不一致。文档总共不到 1MB，直接带上。
 COPY --chown=app:app *.md LICENSE ./
 COPY --chown=app:app docs ./docs
+# 运维脚本（三策略切换审计、账本盘点）必须随镜像一起发布：否则线上只能靠
+# ``docker cp`` 临时塞进去，重建后就消失，也无法在容器里复核只读审计结果。
+COPY --chown=app:app scripts ./scripts
 
 USER app
 EXPOSE 8600

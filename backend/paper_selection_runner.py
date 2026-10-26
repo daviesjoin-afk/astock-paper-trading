@@ -3,7 +3,7 @@
 
 用法
 ----
-  python paper_selection_runner.py --slot daily              # 5 套策略各取 Top5 并覆盖当天结果
+  python paper_selection_runner.py --slot daily              # 当前正式策略各取 Top5 并覆盖当天结果
   python paper_selection_runner.py --slot daily --topn 3 --strategy 策略1
   python paper_selection_runner.py --status                  # 查看最近一次运行结果
 

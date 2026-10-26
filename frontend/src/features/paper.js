@@ -503,7 +503,7 @@ export function renderPaperStrategyCenter(d){
 }
 
 export function paperResearchStrategyName(id){
-  return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
+  return ({tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守',main_force_top10:'超强主力股'})[id]||id||'未知策略';
 }
 
 export function paperResearchOutcome(metric,horizon){
@@ -540,12 +540,12 @@ export function renderPaperResearchValidation(d){
   var target=$('paperResearchView'); if(!target) return;
   var latestByStrategy={}, policy=d.backfill_policy||{};
     (d.runs||[]).forEach(function(run){ if(!latestByStrategy[run.account_id]) latestByStrategy[run.account_id]=run; });
-    var ids=['tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10'];
+    var ids=(d.strategies||[{id:'tq_breakout'},{id:'trend_pullback'},{id:'reported_profit_breakout'}]).map(function(strategy){return strategy.id;});
     var cards=ids.map(function(id){
       var run=latestByStrategy[id], quality=paperResearchQuality(run), metrics=(d.metrics||{})[id]||{};
       var horizons=[1,3,5].map(function(h){return '<div class="paper-research-outcome"><span>'+h+'日</span>'+paperResearchOutcome(metrics[String(h)],h)+'</div>';}).join('');
       var q=(run&&run.data_quality)||{};
-      var shortCode={tq_breakout:'T',trend_pullback:'趋',sector_rotation:'板',reported_profit_breakout:'盈',main_force_top10:'主'}[id]||'证';
+      var shortCode={tq_breakout:'T',trend_pullback:'趋',reported_profit_breakout:'盈'}[id]||'证';
       return '<article class="paper-research-card '+quality.tone+'"><header><div><span class="paper-research-code">'+shortCode+'</span><h3>'+paperResearchStrategyName(id)+'</h3></div><em>'+quality.label+'</em></header>'
         +'<p>'+quality.detail+'</p><dl><div><dt>信号日</dt><dd>'+riskText((run&&run.signal_date)||'—')+'</dd></div><div><dt>候选快照</dt><dd>'+Number((run&&run.candidate_count)||0)+' 只</dd></div><div><dt>因子截至</dt><dd>'+riskText((run&&run.factor_asof_date)||'—')+'</dd></div></dl>'
         +'<div class="paper-research-outcomes">'+horizons+'</div>'
@@ -659,7 +659,7 @@ export function syncCycleControls(cycle, accounts){
 
 export function paperAccountDisplayName(account){
   var id=account&&account.id;
-  return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
+  return ({tq_breakout:'激进做T',trend_pullback:'稳健波段',sector_rotation:'板块轮动先锋',reported_profit_breakout:'保守防守',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
 }
 
 export function paperOverviewVariant(){

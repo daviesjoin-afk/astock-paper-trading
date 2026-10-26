@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sqlite3
 import sys
@@ -14,8 +15,8 @@ import asymmetric_risk as AR
 import runtime_settings as RSET
 
 CURRENT = {
-    "sector_rotation": {
-        "style": "sector", "max_positions": 3,
+    "tq_breakout": {
+        "style": "strong", "max_positions": 3,
         "max_weight_pct": 32.0, "max_exposure_pct": 92.0,
     },
 }
@@ -23,9 +24,9 @@ FULL_EVIDENCE = 25
 
 
 def _proposed(key, new):
-    override = dict(CURRENT["sector_rotation"])
+    override = dict(CURRENT["tq_breakout"])
     override[key] = new
-    return {"sector_rotation": override}
+    return {"tq_breakout": override}
 
 
 def _db():
@@ -37,11 +38,13 @@ def _db():
         " duration_days INTEGER, enabled_strategies TEXT)"
     )
     RSET.ensure_schema(conn)
+    conn.execute("UPDATE paper_runtime_settings SET value=? WHERE key='strategy_overrides'",
+                 (json.dumps(CURRENT),))
     return conn
 
 
 def _backdate_proposal(conn, days_ago, key="max_exposure_pct",
-                       new_value=94.0, strategy_id="sector_rotation"):
+                       new_value=94.0, strategy_id="tq_breakout"):
     AR.ensure_proposals_table(conn)
     proposed_at = (dt.datetime.now() - dt.timedelta(days=days_ago)).isoformat(timespec="seconds")
     existing = conn.execute(
@@ -198,7 +201,7 @@ class UnifiedRiskDirectionTests(unittest.TestCase):
         if backdate is not None:
             _backdate_proposal(conn, days_ago=backdate, key=key, new_value=float(new))
         return AR.evaluate_risk_adjustments(
-            conn, "sector_rotation", [{"key": key, "old": old, "new": new}],
+            conn, "tq_breakout", [{"key": key, "old": old, "new": new}],
             evidence_count=evidence, challenger_win=challenger_win,
         )
 
@@ -237,7 +240,7 @@ class ProposalLifecycleTests(unittest.TestCase):
     """PR-33：提案 pending → promoted / rejected / superseded。"""
 
     def _register(self, conn, key="max_exposure_pct", new_value=94.0):
-        return AR.register_proposal(conn, "sector_rotation", key, 92.0, new_value,
+        return AR.register_proposal(conn, "tq_breakout", key, 92.0, new_value,
                                     evidence_count=FULL_EVIDENCE, actor="test")
 
     def test_register_then_promote(self):
@@ -246,7 +249,7 @@ class ProposalLifecycleTests(unittest.TestCase):
         self.assertEqual("pending", proposal["status"])
         self.assertEqual([p["id"] for p in AR.pending_proposals(conn)], [proposal["id"]])
         _backdate_proposal(conn, days_ago=12)
-        AR.promote_proposal(conn, "sector_rotation", "max_exposure_pct", 94.0, actor="ui")
+        AR.promote_proposal(conn, "tq_breakout", "max_exposure_pct", 94.0, actor="ui")
         rows = conn.execute(
             "SELECT status,resolved_by FROM risk_expansion_proposals WHERE id=?",
             (proposal["id"],)).fetchone()
@@ -309,7 +312,7 @@ class RuntimeSettingsWiringTests(unittest.TestCase):
         result = RSET.update(conn, payload, actor="human-ui")
         self.assertEqual(
             85.0,
-            result["strategy"]["strategy_overrides"]["sector_rotation"]["max_exposure_pct"],
+            result["strategy"]["strategy_overrides"]["tq_breakout"]["max_exposure_pct"],
         )
 
     def test_evolution_path_is_the_only_production_expansion_route(self):
@@ -327,7 +330,7 @@ class RuntimeSettingsWiringTests(unittest.TestCase):
             evidence_count=FULL_EVIDENCE, challenger_win=True)
         self.assertEqual(
             94.0,
-            result["strategy"]["strategy_overrides"]["sector_rotation"]["max_exposure_pct"],
+            result["strategy"]["strategy_overrides"]["tq_breakout"]["max_exposure_pct"],
         )
         # 生效后对应提案进入 promoted，不会被重复利用。
         rows = conn.execute(

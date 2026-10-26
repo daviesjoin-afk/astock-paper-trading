@@ -260,6 +260,15 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             strategy_stamp=strategy_stamp, cycle_id=cycle_id, now=_now(),
             order_id=order_id,
         )
+        # F5：真实退出/入场决定的消费点。ADVISORY 只追加解释，不改写上面的规则行。
+        try:
+            import ai_advice_service as ADV
+
+            ADV.consume_risk_decision_safe(
+                conn, account_id=account_id, code=code, side=side, decision=decision,
+                strategy_stamp=strategy_stamp)
+        except Exception:  # noqa: BLE001 - 意见链绝不改变规则风险决策
+            pass
 
     if not positions:
         with ports.open_db(immediate=True, hot_path=True) as conn:
@@ -796,6 +805,13 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         "volatility_shadow": detail.get("volatility_shadow"),
                     }), strategy_stamp=strategy_stamp)
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                # F5：真实卖出成交后投递成交事件；研究侧失败不影响这笔退出。
+                import research_orchestration as RO
+
+                RO.notify_fill(order_id=order_id, account_id=position["account_id"],
+                               code=position["code"], side="sell",
+                               status=str(committed[0]), strategy_stamp=strategy_stamp,
+                               now=_now())
             except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")

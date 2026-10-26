@@ -22,20 +22,20 @@ from adaptive_common import TZ as OWNER_TZ
 
 ACCOUNT_NAMES = strategy_labels()
 ACCOUNT_MODELS = {
-    "tq_breakout": "one_to_two",
-    "trend_pullback": "bottom_reversal",
-    "sector_rotation": "sentiment_pioneer",
+    "tq_breakout": "first_board_relay",
+    "trend_pullback": "pullback_reversal",
+    "sector_rotation": "sector_sentiment",
 }
 ACCOUNT_ALLOWED_MODELS = {
-    "tq_breakout": {"one_to_two"},
-    "trend_pullback": {"bottom_reversal", "trend_continuation"},
-    "sector_rotation": {"sentiment_pioneer"},
+    "tq_breakout": {"first_board_relay"},
+    "trend_pullback": {"pullback_reversal", "trend_continuation"},
+    "sector_rotation": {"sector_sentiment"},
 }
 BASE_WEIGHTS = {
-    "one_to_two": {"mom_short": 0.45, "flow": 0.25, "volsurge": 0.20, "sentiment": 0.10},
-    "bottom_reversal": {"value": 0.28, "quality": 0.18, "volsurge": 0.22, "flow": 0.15, "mom_short": 0.10, "rsi": 0.07},
+    "first_board_relay": {"mom_short": 0.45, "flow": 0.25, "volsurge": 0.20, "sentiment": 0.10},
+    "pullback_reversal": {"value": 0.28, "quality": 0.18, "volsurge": 0.22, "flow": 0.15, "mom_short": 0.10, "rsi": 0.07},
     "trend_continuation": {"mom_short": 0.28, "mom": 0.22, "flow": 0.20, "volsurge": 0.15, "quality": 0.15},
-    "sentiment_pioneer": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
+    "sector_sentiment": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
 }
 REGIME_MULTIPLIERS = {
     "momentum": {"mom_short": 1.15, "mom": 1.15, "flow": 1.10, "volsurge": 1.05, "sentiment": 1.00, "value": 0.90, "quality": 1.00, "rsi": 0.90},
@@ -268,16 +268,16 @@ def _condition_target(model_id, regime):
     """Generate an auditable rule-set mutation for the current market regime."""
     target = _conditions(model_id)
     if regime == "momentum":
-        if model_id == "one_to_two":
+        if model_id == "first_board_relay":
             target.update({"pct_high": 6.0, "chase_guard_pct": 8.0, "chase_penalty": 0.52})
-        elif model_id == "bottom_reversal":
+        elif model_id == "pullback_reversal":
             target.update({"flow_min": 0.35, "mom20_min": -0.10})
         else:
             target.update({"sentiment_min": -0.75, "sentiment_penalty": 0.12})
     elif regime in {"risk_off", "high_volatility"}:
-        if model_id == "one_to_two":
+        if model_id == "first_board_relay":
             target.update({"pct_high": 3.5, "chase_guard_pct": 6.0, "chase_penalty": 0.65, "weak_guard_pct": -0.5})
-        elif model_id == "bottom_reversal":
+        elif model_id == "pullback_reversal":
             target.update({"vol_surge_min": 1.2, "flow_min": 0.8, "mom20_min": -0.02})
         else:
             target.update({"enabled": {"sentiment_guard": True}, "sentiment_min": 0.0, "sentiment_penalty": 0.35})
@@ -794,17 +794,17 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
     candidate_ids = []
     auto_ids = []
     try:
-        accounts = [dict(row) for row in paper.execute(
-            """SELECT * FROM paper_accounts
-               WHERE id IN ('tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10')
-               ORDER BY id"""
-        )]
+        import strategy_weight_scope as SCOPE
+        import strategy_roster as ROSTER
+        participants = set(SCOPE.participant_ids(paper))
+        accounts = [dict(row) for row in paper.execute("SELECT * FROM paper_accounts ORDER BY id")
+                    if row["id"] in participants and ROSTER.is_formal(row["id"])]
         for account in accounts:
             # 三日策略的利润披露、均线与证券范围是可解释的硬规则，不属于
             # PAPER_WEIGHTS 模型。把它伪装成可调权重模型会产生“已应用”但
             # 实盘候选根本不会读取的假版本。因此只接入同一份兑现/行情证据，
             # 生成影子复盘，任何结构或阈值变化仍必须人工另行评审。
-            if account["id"] in {"reported_profit_breakout", "main_force_top10"}:
+            if account["id"] == "reported_profit_breakout":
                 evidence = _evidence(conn, paper, account["id"], profile.get("regime"))
                 evidence["strategy_version"] = str(account.get("version") or "")
                 evidence["profile_date"] = str(profile.get("profile_date") or "")[:10]
@@ -916,7 +916,11 @@ def overview(conn, config, paper_db_path):
     if os.path.exists(paper_db_path):
         paper = _paper(paper_db_path)
         try:
+            import strategy_weight_scope as SCOPE
+            participants = set(SCOPE.participant_ids(paper))
             for row in paper.execute("SELECT id,name,version,params FROM paper_accounts ORDER BY id"):
+                if row["id"] not in participants:
+                    continue
                 params = _loads(row["params"], {})
                 meta = params.get("adaptive_selection_meta") or {}
                 if meta.get("status") == "active":

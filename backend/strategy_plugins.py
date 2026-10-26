@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import strategy_policies as SPOL
 import strategy_registry as SR
+import strategy_roster as ROSTER
 import strategy_runtime as SRT
 import strategy_trace as STRACE
 
@@ -281,15 +282,16 @@ def is_original_builtin_plugin(plugin: StrategyPlugin) -> bool:
 
 
 def plugin_ids() -> tuple[str, ...]:
-    return tuple(_PLUGINS)
+    return tuple(key for key in _PLUGINS if key not in ROSTER.exit_only_ids())
 
 
 def selector_ids() -> tuple[str, ...]:
-    return tuple(_PLUGINS_BY_SELECTOR)
+    return tuple(key for key, plugin in _PLUGINS_BY_SELECTOR.items()
+                 if plugin.strategy_id not in ROSTER.exit_only_ids())
 
 
 def manifests(*, conn=None) -> tuple[dict[str, Any], ...]:
-    return tuple(plugin.manifest(conn=conn) for plugin in _PLUGINS.values())
+    return tuple(_PLUGINS[key].manifest(conn=conn) for key in plugin_ids())
 
 
 def select_candidates(strategy_id: str, table, **kwargs) -> dict[str, Any]:
@@ -309,15 +311,15 @@ def replay_candidates(strategy_id: str, snapshot_id: str) -> dict[str, Any]:
 
 _BUILTIN_PLUGINS: Sequence[StrategyPlugin] = (
     StrategyPlugin(
-        "tq_breakout", "one_to_two",
+        "tq_breakout", "first_board_relay",
         ("mom_short", "flow", "volsurge", "sentiment"),
     ),
     StrategyPlugin(
-        "trend_pullback", "bottom_reversal",
+        "trend_pullback", "pullback_reversal",
         ("value", "quality", "volsurge", "flow", "mom_short", "rsi"),
     ),
     StrategyPlugin(
-        "sector_rotation", "sentiment_pioneer",
+        "sector_rotation", "sector_sentiment",
         ("sentiment", "flow", "mom_short", "volsurge", "sector_heat_score"),
     ),
     StrategyPlugin(

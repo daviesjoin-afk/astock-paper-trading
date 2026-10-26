@@ -19,6 +19,8 @@ import ast
 import unittest
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
 ROOT = BACKEND.parent
 
@@ -126,7 +128,7 @@ def _public_names(tree, *, methods_of=None):
 
 
 def _shadow_tree():
-    return ast.parse((BACKEND / SHADOW_MODULE).read_text(encoding="utf-8"))
+    return ast_cache.tree(BACKEND / SHADOW_MODULE)
 
 
 def _imported_modules(tree):
@@ -261,7 +263,7 @@ class ExecutionAndLearningDoNotConsumeShadow(unittest.TestCase):
             path = BACKEND / name
             if not path.exists():  # pragma: no cover - 模块清单防御
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast_cache.tree(path)
             for imported in _imported_modules(tree):
                 if "tradability_shadow" in imported:
                     offenders.append(f"{name}: {imported}")
