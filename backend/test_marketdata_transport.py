@@ -64,6 +64,14 @@ class _FailingSession:
 
 
 class MarketdataTransportTests(unittest.TestCase):
+    def setUp(self):
+        # 主机短路是模块级状态：本模块会注入多次传输失败，不清空会让"连续失败
+        # 到阈值"泄漏给同进程的后续用例（它们会拿到 breaker open 而不是真的请求）。
+        transport.reset_transport_breakers()
+
+    def tearDown(self):
+        transport.reset_transport_breakers()
+
     def test_http_get_returns_text_and_applies_encoding(self):
         response = _Response("ok")
         session = _Session([response])
