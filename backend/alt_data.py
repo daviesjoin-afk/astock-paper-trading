@@ -458,12 +458,19 @@ def minute_trend_series(code, asof_day=None, ttl_seconds=90):
         return []
 
 
-def market_microstructure(code, asof_day=None, ttl_seconds=90):
+def market_microstructure(code, asof_day=None, ttl_seconds=240):
     """Return bounded current-session order-book/tick/VWAP evidence.
 
     Public quote endpoints are not exchange L2. The result is therefore
     explicitly shadow-grade and may only contribute a small soft score. It is
     never replayed historically and provider failure is fail-open.
+
+    TTL 由 90 秒提到 240 秒（2026-10-27）：盘中扫描间隔约 180~240 秒，90 秒的
+    缓存必然在每次扫描前过期，于是每轮都要对十几只候选各发 tick/trend 两次
+    请求（生产实测每轮 36 次调用）。而本函数的所有返回都带
+    ``score_applied=False``——它不参与打分，只作为观测证据展示，因此复用
+    几分钟前的观测不会改变任何交易决策，却能省掉反复的网络等待。
+    返回体里的 ``source_at``/``data_at`` 仍然写明真实观测时刻，不伪装新鲜。
     """
     code = str(code or "").strip().zfill(6)
     asof_iso = _asof_iso(asof_day)
