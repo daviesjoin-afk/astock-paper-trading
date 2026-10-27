@@ -3047,7 +3047,15 @@ def _sync_evidence_chains(conn):
         paper.close()
 
 
-def _closed_loop_state(conn, evidence=None):
+def _closed_loop_state(conn, evidence=None, *, participant_total=None):
+    """闭环准入台事实。
+
+    ``strategy_coverage`` 是**有实际成交证据**的账户数（历史集合，可能含已退役
+    账户），分母必须由调用方给出**当前周期参与者**的权威计数 —— 本函数不推导
+    参与资格。拿不到参与者时 ``strategy_coverage_total`` 报 ``None``（unknown），
+    绝不写成 0，也绝不回落到内置策略数量：一个假的分母会让"覆盖 3/0"看起来
+    比"覆盖未知"更可信。
+    """
     evidence = evidence or _sync_evidence_chains(conn)
     profile_days = conn.execute("SELECT COUNT(DISTINCT profile_date) FROM adaptive_market_profiles").fetchone()[0]
     recent_actual = conn.execute(
@@ -3089,7 +3097,10 @@ def _closed_loop_state(conn, evidence=None):
     if profile_days < 10:
         blockers.append(f"完整画像日 {profile_days}/10")
     if recent_actual < 6 or accounts < 2:
-        blockers.append(f"可归因成交 {recent_actual} 笔、覆盖 {accounts}/2 当前策略账户")
+        blockers.append(
+            f"可归因成交 {recent_actual} 笔、成交覆盖 {accounts} 个账户"
+            "（准入门槛：6 笔且 ≥2 个账户，不是当前参与账户数）"
+        )
     try:
         state["evidence"] = json.loads(state.get("evidence") or "{}")
     except (TypeError, ValueError):
@@ -3106,6 +3117,9 @@ def _closed_loop_state(conn, evidence=None):
         "profile_days": profile_days,
         "attributable_fills": recent_actual,
         "strategy_coverage": accounts,
+        "strategy_coverage_total": (
+            int(participant_total) if participant_total else None
+        ),
         "blockers": blockers,
         "eligible_next_stage": not blockers,
         "limits": {"max_nav_pct": CANARY_MAX_NAV_PCT, "max_new_slots": CANARY_MAX_NEW_SLOTS},
@@ -3796,7 +3810,12 @@ def _overview_uncached():
         }
         evidence_result["link_pct"] = round(100 * evidence_result["linked"] / max(evidence_orders, 1), 2)
         evidence_result["valid_pct"] = round(100 * evidence_result["valid"] / max(evidence_orders, 1), 2)
-        closed_loop = _closed_loop_state(conn, evidence_result)
+        # 参与资格只取一次：闭环覆盖的分母与下面按参与者汇总的 horizon 必须
+        # 来自同一份周期快照，否则同一份 overview 里会出现两个"当前账户"口径。
+        weight_participants = _weight_participants()
+        closed_loop = _closed_loop_state(
+            conn, evidence_result, participant_total=len(weight_participants),
+        )
         portfolio_shadow = _background_shadow_read(
             "portfolio-shadow", 60.0, _portfolio_shadow_arbitration,
             {"version": "portfolio-shadow-v2", "read_only": True, "trading_impact": "none"},
@@ -3824,7 +3843,7 @@ def _overview_uncached():
     )
 
     horizon_summary = []
-    for account_id in _weight_participants():
+    for account_id in weight_participants:
         for horizon in HORIZON_WEIGHTS:
             subset = [row for row in rewards if row["account_id"] == account_id and row["horizon"] == horizon]
             horizon_summary.append({

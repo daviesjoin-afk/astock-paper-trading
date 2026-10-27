@@ -9,7 +9,7 @@ import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPo
 import { loadPaperRisk } from "./features/risk.js";
 import { loadDataValidity, loadMarketGate, loadPaperSelection, loadStrategies } from "./features/selection.js";
 import { loadSettings } from "./features/settings.js";
-import { loadStrategyWorkbench, normalizeActiveStrategyCopy } from "./features/strategies.js";
+import { loadStrategyWorkbench } from "./features/strategies.js";
 
 window.__ASTOCK_ADAPTIVE_UI_BUILD__='20261012-runtime-followup';
 
@@ -105,27 +105,6 @@ document.addEventListener('click', function(e){
     return;
   }
 });
-
-if(typeof MutationObserver!=='undefined'){
-  // 只规范化本批新增的节点。此前每次 DOM 变更都会 TreeWalker 全量遍历
-  // p-paper + p-adaptive 的所有文本节点；大盘一次渲染有几十次 innerHTML
-  // 写入，等于几十次全树扫描，是切页/渲染卡顿的主要脚本开销之一。
-  var strategyCopyObserver=new MutationObserver(function(mutations){
-    for(var i=0;i<mutations.length;i++){
-      var added=mutations[i].addedNodes;
-      for(var j=0;j<added.length;j++){
-        var node=added[j];
-        if(node.nodeType===Node.ELEMENT_NODE) normalizeActiveStrategyCopy(node);
-        else if(node.nodeType===Node.TEXT_NODE){
-          var value=node.nodeValue||'';
-          var normalized=value.replace(/(二|两|三|四|五)套(当前)?(模拟账户|策略)/g,'已启用策略').replace(/五策略/g,'已启用策略');
-          if(normalized!==value) node.nodeValue=normalized;
-        }
-      }
-    }
-  });
-  strategyCopyObserver.observe(document.body,{childList:true,subtree:true});
-}
 
 if(localStorage.getItem('darkMode')==='true') document.body.classList.add('dark');
 

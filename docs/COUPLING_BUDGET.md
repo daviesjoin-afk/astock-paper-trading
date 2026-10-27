@@ -24,6 +24,7 @@
 
 ## 本次切片
 
+- 2026-10-27（闭环覆盖口径 / 退役文案观察器）：闭环准入台的「成交覆盖」分母改为后端 owner 字段 `closed_loop.strategy_coverage_total`（由 `_weight_participants()` 的周期参与快照派生，拿不到报 `null` 而不是 0），前端不再写死 `/ 5 当前账户`；同一份 overview 里参与集合只读一次，覆盖分母与 horizon 汇总共用同一快照。删除 `boot.js` 的 `MutationObserver` 整树文案改写与 `strategies.js` 的 `normalizeActiveStrategyCopy`，改为机械守卫：生产 Python 非 docstring 字符串常量、前端去掉注释后的字面量都不允许再出现退役称谓（`test_retired_strategy_copy_guard`，含可驱动成 RED 的非空性用例）。本切片不改变导入环、裸 SQL、私有访问、最大文件/函数等计数，因此不调整任何预算额度。
 - 2026-10-27（第三批）：选股流水线从 HTTP 主入口下沉到 `selection_application`，API 与两个命令行入口共用；共享资金读取改为显式周期 owner；前端提供商设置不再反向导入设置页面。导入环 3 → 2，主文件行数降至 15,676，私有跨模块访问收紧到基线 202。缺报价账户/资金池/风险页保持 `unknown`，已实现盈亏仍可展示。
 - 2026-10-27（前端加载/候选/选股复用）：`navigation` 不再导入任何 feature，页面 loader 由 `boot` 组合根注册；非选股深链不再无条件请求选股数据。前端静态环 1 → 0；单 bundle 体积基本不变，因此不把去环当成 JS 传输缩短。候选准备新增按 `(code, asof)` 的披露证据轮内复用，失败不缓存、不同日期重取，原有来源错误语义保持不变。`paper_selection.run_daily` 与定时 `selection_runner` 在一个显式 `selection_round` 内共享 live snapshot、snap 和 fundamental 计算；单策略调用不改变原路径。
 - 2026-10-27：将无法证明来源的观测类型常量归到已有 `point_in_time` 契约；摄取层保留原名别名，观察账本不再反向导入摄取层。进化版本和全局参数边界归到共享契约，激活校验不再反导生成器。导入环从 5 组降为 3 组，守卫同步收紧；来源指纹、参数边界和事务语义不变。
