@@ -32,8 +32,13 @@ class MicrostructureBudgetTests(unittest.TestCase):
                 mock.patch.object(AD.subprocess, "run") as curl:
             with self.assertRaises(RuntimeError):
                 AD._micro_get(AD.TICK_DETAIL_URL, {})
+        # 断言"整个函数只有一个共享预算"这件事本身：主机轮换必须共享同一份
+        # 额度，而不是每个主机各起一份。预算绝对值随单次 timeout 调整（2026-10-27
+        # 由 4s 降到 2s），所以这里从函数默认值推导，不写死 12。
+        per_attempt = AD._micro_get.__defaults__[0]
         self.assertEqual(get.call_count, 3)
-        self.assertEqual(clock[0], 12)
+        self.assertEqual(clock[0], 3 * per_attempt)
+        self.assertLessEqual(clock[0], 6.0, "单次微结构请求的等待预算不得超过 6 秒")
         curl.assert_not_called()
 
     def test_quick_request_failures_still_allow_curl_recovery(self):
@@ -45,6 +50,12 @@ class MicrostructureBudgetTests(unittest.TestCase):
         self.assertEqual(curl.call_count, 1)
 
     def test_remaining_budget_is_passed_to_curl_and_no_later_attempt_starts(self):
+        """共享 deadline 的不变量：剩余额度传给 curl，耗尽后不再起新尝试。
+
+        显式传 ``timeout=4``（3 主机 → 12 秒预算）把场景固定在"三个请求各花
+        3 秒、剩 3 秒交给 curl"。这样默认预算日后调整（2026-10-27 已由 4s
+        降到 2s）不会让这条不变量测试变成在测默认值。
+        """
         clock = [0.0]
         def fail_request(*args, **kwargs):
             clock[0] += 3
@@ -57,8 +68,9 @@ class MicrostructureBudgetTests(unittest.TestCase):
                 mock.patch.object(AD.requests, "get", side_effect=fail_request), \
                 mock.patch.object(AD.subprocess, "run", side_effect=fail_curl) as curl:
             with self.assertRaises(RuntimeError):
-                AD._micro_get(AD.TICK_DETAIL_URL, {})
+                AD._micro_get(AD.TICK_DETAIL_URL, {}, timeout=4)
         self.assertEqual(curl.call_count, 1)
+        self.assertEqual(clock[0], 12)
 
     def test_partial_results_and_worker_timings_preserve_unknowns(self):
         def source(url, params, **kwargs):
