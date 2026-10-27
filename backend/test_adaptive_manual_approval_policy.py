@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+
+from test_support import asgi_client
 
 import adaptive_configuration as configuration
 import adaptive_engine as engine
@@ -72,12 +73,18 @@ class ManualApprovalPolicyTests(unittest.TestCase):
             engine._ensure_config_defaults(conn)
         app = FastAPI()
         app.include_router(api_adaptive.router)
-        with mock.patch.object(engine, "_connect", self.connect), TestClient(app) as client:
-            response = client.post("/api/adaptive/ai/settings?confirmed=true&llm_realtime_auto_apply=true")
-            self.assertEqual(response.status_code, 422)
-            response = client.post("/api/adaptive/ai/settings?confirmed=true&llm_realtime_auto_apply=false")
-            self.assertEqual(response.status_code, 200)
-            self.assertIs(response.json()["settings"]["llm_realtime_auto_apply"], False)
+        # 直接驱动 ASGI app，不用 ``fastapi.testclient``：镜像与 CI 的锁定依赖里
+        # 没有 httpx/httpx2，用它会让整个测试模块**加载失败**（读起来像真回归）。
+        with mock.patch.object(engine, "_connect", self.connect):
+            status, _body = asgi_client.call(
+                app, "POST", "/api/adaptive/ai/settings",
+                query="confirmed=true&llm_realtime_auto_apply=true")
+            self.assertEqual(422, status)
+            status, payload = asgi_client.json_call(
+                app, "POST", "/api/adaptive/ai/settings",
+                query="confirmed=true&llm_realtime_auto_apply=false")
+            self.assertEqual(200, status)
+            self.assertIs(payload["settings"]["llm_realtime_auto_apply"], False)
 
 
 if __name__ == "__main__":
