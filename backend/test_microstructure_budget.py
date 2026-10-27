@@ -15,6 +15,12 @@ class MicrostructureBudgetTests(unittest.TestCase):
     def setUp(self):
         with AD._cache_lock:
             AD._mem_cache.clear()
+        # 源级短路是模块级状态：不清空会让"连续失败到阈值"泄漏到同进程的后续
+        # 用例（后面的成功用例会拿到 breaker open 而不是真的去请求）。
+        AD.reset_micro_breakers()
+
+    def tearDown(self):
+        AD.reset_micro_breakers()
 
     def test_slow_failed_requests_do_not_start_another_transport_budget(self):
         clock = [0.0]

@@ -10,6 +10,8 @@ logs/
 *.db-*
 .swapfile
 .locks/
+# 每次部署由 deploy/deploy.sh 重写的环境身份；属于主机状态，不入库。
+.deploy-source.json
 .codex/
 .codex-test-tmp/
 .staging/

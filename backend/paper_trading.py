@@ -35,6 +35,7 @@ import strategies as S
 import universe as U
 import risk_center as RC
 import news_learning as NL
+import news_risk_policy as NRP
 import research_orchestration as RO
 # PR (paper_research) 与 SE (self_evolution) 仅在盘后收盘研究与 Challenger 管理路径使用，
 # 采用懒加载避免在交易热路径（如 fast-entry, intraday）启动时加载不必要的大模块。
@@ -3438,12 +3439,16 @@ def _today_quote_is_usable(quote, asof_day):
 
 
 def _open_runup_bonus(now=None):
-    """开盘追高上限的时段余量：早盘宽、随时间收紧、午后无。
+    """开盘追高上限的时段余量：早盘宽、随时间收紧、午后小幅容忍。
 
     开盘价只是集合竞价单点打印，且热点主题的日一动量集中在开盘
     半小时；固定 2% 上限会把板块异动车道要抓的进场窗口全部堵死
     （2026-08-25 09:34 600737 较开盘 +5.77% 被拒的教训）。余量：
-    09:30-09:45 +2.5pp、09:45-10:30 +1.0pp、其余时段 0。
+    09:30-09:45 +2.5pp、09:45-10:30 +1.0pp、13:00-14:30 +0.5pp、其余 0。
+
+    午后那一档是 2026-10-27 补的：14:00 前后的二次启动与早盘脉冲不是同一
+    种风险，原来午后余量恒为 0，等于让"午后确认恢复"只能精确落在开盘价
+    上方几个 bp。只放松 0.5pp，且所有策略原有的动量禁区/确认轮次不变。
     """
     now = now if isinstance(now, dt.datetime) else dt.datetime.now()
     t = now.time()
@@ -3451,6 +3456,8 @@ def _open_runup_bonus(now=None):
         return 0.025
     if dt.time(9, 45) < t <= dt.time(10, 30):
         return 0.010
+    if dt.time(13, 0) <= t <= dt.time(14, 30):
+        return 0.005
     return 0.0
 
 
@@ -6461,11 +6468,23 @@ def _parse_quote_timestamp(value):
 
 @PTM.timed("position_quotes")
 def _quotes(codes, asof_date=None):
-    """小批量实时查询失败时回退至本地快照，调用方仍会标记数据时效限制。"""
+    """小批量实时查询失败时回退至本地快照，调用方仍会标记数据时效限制。
+
+    同一扫描轮内已被别的账户取到、且仍新鲜有价的行直接复用，只对缺口发请求。
+    起因为旧版每账户各拉一次：三个账户持仓/候选高度重叠时同一批代码在一轮里
+    被拉三次（实测 position_quotes 单轮 63 秒）。复用不放松任何门禁——
+    ``_round_quote_take`` 仍校验价格、pct 与时鲜度，不合格的代码照旧重新取。
+    轮内缓存未开启（手动接口调用、单测直连）时行为与旧版完全一致。
+    """
     codes = [str(code) for code in (codes or []) if str(code)]
     if not codes:
         return {}
     expected_day = _date(asof_date or dt.date.today())
+    cached = _round_quote_take(codes, expected_day)
+    if cached:
+        if len(cached) == len(codes):
+            return {code: cached[code] for code in codes}
+        codes = [code for code in codes if code not in cached]
     def usable(row):
         return (_num(row.get("price"), 0) > 0
                 and _num(row.get("pct"), None) is not None
@@ -6722,6 +6741,11 @@ def _quotes(codes, asof_date=None):
             out[code]["tradability_observation"] = item
             out[code]["tradability_observation_status"] = "available"
             out[code]["execution_asof"] = completed_at
+    for code, row in cached.items():
+        # 轮内复用的行不重新走成交性校验以外的东西：
+        # 它们在入池时已通过同一套 price/pct/freshness 判定。
+        if code not in out:
+            out[code] = dict(row)
     return out
 
 
@@ -6789,24 +6813,15 @@ def _dynamic_news_risk(news, code, market=None):
     negative = [row for row in rows if _num(row.get("tone"), 0) < 0]
     verified_negative = [row for row in negative if bool(row.get("verified"))]
     market_light = str((market or {}).get("light") or "unknown")
-    if verified_negative:
-        mode, scale, allowed = "公告否决", 0.0, False
-        reason = f"已核验负面公告/事件 {len(verified_negative)} 条，禁止该股新增仓位"
-    elif negative:
-        mode, scale, allowed = "舆情收紧", 0.50, True
-        reason = f"负面快讯 {len(negative)} 条尚未完成公告核验，新增仓位缩减50%"
-    else:
-        mode, scale, allowed = "正常", 1.0, True
-        reason = "未命中负面公告或快讯"
-    if _NEWS_SCAN_META.get("stale") and not verified_negative:
-        scale *= 0.75
-        mode = "舆情源降级"
-        reason = "新闻/公告扫描已过期，新增仓位按75%额度执行"
-    if market_light in {"red", "unknown"}:
-        scale = 0.0
-        allowed = False
-        mode = "市场暂停"
-        reason = "市场红灯或数据未知，暂停该股新增仓位"
+    # 严重度分级、未核验缩量、数据源过期与市场灯全部由 news_risk_policy 统一
+    # 判定一次：在这里再乘系数会双重扣减（0.5 × 0.75 变成 0.28），也会让
+    # reason 与实际额度对不上。
+    mode, scale, allowed, reason = NRP.decide(
+        verified_negative,
+        unverified_negative_count=len(negative),
+        stale_source=bool(_NEWS_SCAN_META.get("stale")),
+        market_light=market_light,
+    )
     return {
         "mode": mode,
         "risk_scale": scale,

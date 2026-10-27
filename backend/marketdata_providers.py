@@ -244,6 +244,54 @@ def parse_eastmoney_concept_refs(rows, *, excluded_tokens=()):
     return refs
 
 
+def _tencent_volume_amount_turnover(parts, price):
+    """从腾讯 ``qt.gtimg.cn`` 报文取成交量/成交额/换手率，并做自洽校验。
+
+    为什么需要：价格-only 回退（东财 clist 返回 0 行时启用）此前只解析价格与
+    涨跌幅，于是选股因子表的 ``amount`` / ``turnover`` **整列缺失**，每轮都打
+    ``factor_columns_missing`` 告警，相关因子只能整列按 unknown 处理。但腾讯
+    报文本来就带这些字段（实测 sh600000：``[6]`` 成交量(手)、``[37]`` 成交额
+    (万元)、``[38]`` 换手率(%)），只是没被解析。
+
+    公开报文格式改过版，所以不盲信下标：先按位置取值，再用
+    ``volume × 100 × price ≈ amount`` 做量纲/错位交叉校验；不通过就返回
+    ``None``（保持 unknown）。这个仓库的口径是"未知不等于零"，也不等于一个
+    猜出来的数。单位对齐东财 clist：``amount`` 用元（万元 × 10000），
+    ``turnover`` 用百分数（与 f8 同口径）。
+    """
+    def _num_at(index):
+        if index >= len(parts):
+            return None
+        try:
+            value = float(str(parts[index] or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+
+    volume_lots = _num_at(6)      # 手
+    amount_wan = _num_at(37)      # 万元
+    turnover = _num_at(38)        # %
+    if volume_lots is not None and volume_lots < 0:
+        volume_lots = None
+    if price is None or price <= 0:
+        volume_lots = None
+    amount = None
+    if amount_wan is not None and amount_wan >= 0:
+        candidate = amount_wan * 10000.0
+        if volume_lots:
+            implied = volume_lots * 100.0 * price
+            # 日内价格会漂移，允许 60% 偏差；超过即认为字段错位或量纲不同。
+            if implied > 0 and abs(implied - candidate) / max(candidate, 1.0) <= 0.60:
+                amount = candidate
+        elif candidate > 0:
+            amount = candidate
+    if turnover is not None and not (0.0 <= turnover <= 100.0):
+        turnover = None
+    return volume_lots, amount, turnover
+
+
 def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
     """解析腾讯 ``qt.gtimg.cn`` 文本响应。"""
     allowed = {str(code) for code in allowed_codes} if allowed_codes is not None else None
@@ -271,9 +319,14 @@ def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
             None,
         )
         if price > 0:
+            volume_lots, amount, turnover = _tencent_volume_amount_turnover(parts, price)
             rows_by_code[code] = {
                 "code": code, "name": parts[1], "price": price, "prev_close": prev_close,
                 "pct": pct, "quote_at": quote_at,
+                # 取不到的字段不出现在行里，下游继续按 unknown 处理。
+                **({"volume": volume_lots} if volume_lots is not None else {}),
+                **({"amount": amount} if amount is not None else {}),
+                **({"turnover": turnover} if turnover is not None else {}),
                 "source": "tencent_public_quote", "attempt": attempt,
             }
     return list(rows_by_code.values())
@@ -319,9 +372,45 @@ def parse_sina_realtime_text(text, *, allowed_codes=None):
             "prev_close": prev_close,
             "pct": round((price - prev_close) / prev_close * 100, 4),
             "quote_at": f"{quote_date}T{quote_clock}+08:00" if quote_date and quote_clock else None,
+            **_sina_volume_amount(values),
             "source": "sina_public_quote",
         }
     return list(rows_by_code.values())
+
+
+def _sina_volume_amount(values):
+    """新浪行情里的成交量(股)与成交额(元)；取不到或自相矛盾时不写字段。
+
+    与腾讯同一动机：价格-only 回退不该让因子表的 ``amount`` 整列变 unknown。
+    新浪 ``hq.sinajs.cn`` 的成交量在 ``[8]``、成交额在 ``[9]``，仍做一次
+    ``volume × price ≈ amount`` 的交叉校验，错位就保持 unknown。
+    """
+    def _num_at(index):
+        if index >= len(values):
+            return None
+        try:
+            value = float(str(values[index] or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if value != value or value in (float("inf"), float("-inf")) or value < 0:
+            return None
+        return value
+
+    volume_shares = _num_at(8)
+    amount = _num_at(9)
+    if amount is not None and amount == 0:
+        amount = None
+    price = _num_at(3)
+    if amount is not None and volume_shares and price and price > 0:
+        implied = volume_shares * price
+        if implied > 0 and abs(implied - amount) / max(amount, 1.0) > 0.60:
+            amount = None
+    out = {}
+    if volume_shares is not None:
+        out["volume"] = volume_shares / 100.0  # 对齐腾讯"手"的口径
+    if amount is not None:
+        out["amount"] = amount
+    return out
 
 
 def parse_tencent_kline_rows(raw):

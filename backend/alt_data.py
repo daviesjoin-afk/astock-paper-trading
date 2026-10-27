@@ -207,7 +207,97 @@ def fund_flow_trajectories(codes, asof_day=None, max_workers=6):
     return output
 
 
+# ---------------------------------------------------------------------------
+# 微结构数据源熔断。
+#
+# 为什么需要：``_micro_get`` 给了「3 个主机 × 4 秒」的共享尝试预算，单次调用
+# 最坏要等 12 秒。盘中扫描会对十余只候选各发 tick / trend 两次请求，于是当
+# 东方财富 push2 集体不可用时，一轮扫描有近百秒纯粹在**等已经挂掉的源超时**
+# （生产实测 microstructure.ticks 12 次调用 108 秒、trend 112 秒，其中 8~10 次
+# 是失败）。这段证据本身是 shadow-grade：只影响一个小分值、且明确 fail-open，
+# 却把整轮扫描拖到 300 秒以上，超过了三分钟的调度间隔。
+#
+# 因此连续失败后短路一段时间：宁可这段时间没有微结构证据，也不让整轮扫描
+# 卡在超时上。恢复由时间驱动（冷却到期自动重试第一只），不需要人工干预。
+MICRO_BREAKER_THRESHOLD = 2          # 连续失败多少次后短路
+MICRO_BREAKER_COOLDOWN_SECONDS = 300.0  # 短路持续多久（秒）
+
+_micro_breaker = {}
+_micro_breaker_lock = threading.Lock()
+
+
+def _micro_source_key(url):
+    """把请求地址归到一个稳定的逻辑源名，便于按源短路与审计。"""
+    text = str(url or "")
+    if "stock/details" in text:
+        return "eastmoney_tick"
+    if "stock/trends2" in text:
+        return "eastmoney_trend"
+    if "gtimg.cn" in text:
+        return "tencent_depth"
+    return "eastmoney_other"
+
+
+def _micro_breaker_remaining(source):
+    """返回剩余短路秒数；未短路返回 None。"""
+    with _micro_breaker_lock:
+        state = _micro_breaker.get(source)
+        if not state:
+            return None
+        until = state.get("until") or 0.0
+        remaining = until - time.monotonic()
+        return remaining if remaining > 0 else None
+
+
+def _micro_breaker_note(source, ok):
+    """记录一次真实尝试的结果；成功清零，连续失败到阈值则短路。"""
+    with _micro_breaker_lock:
+        state = _micro_breaker.setdefault(source, {"fails": 0, "until": 0.0})
+        if ok:
+            state["fails"] = 0
+            state["until"] = 0.0
+            return
+        state["fails"] = int(state.get("fails") or 0) + 1
+        if state["fails"] >= MICRO_BREAKER_THRESHOLD:
+            state["until"] = time.monotonic() + MICRO_BREAKER_COOLDOWN_SECONDS
+
+
+def reset_micro_breakers():
+    """清空短路状态。给测试与故障恢复用；生产不需要定期调用。"""
+    with _micro_breaker_lock:
+        _micro_breaker.clear()
+
+
+def micro_breaker_snapshot():
+    """只读快照，供诊断与自检读取。"""
+    with _micro_breaker_lock:
+        now = time.monotonic()
+        return {
+            source: {
+                "fails": int(state.get("fails") or 0),
+                "open": bool((state.get("until") or 0.0) > now),
+                "remaining_seconds": round(max(0.0, (state.get("until") or 0.0) - now), 1),
+            }
+            for source, state in _micro_breaker.items()
+        }
+
+
 def _micro_get(url, params, timeout=4):
+    """带源级短路的数据获取；短路时立即失败，不再消耗超时预算。"""
+    source = _micro_source_key(url)
+    remaining = _micro_breaker_remaining(source)
+    if remaining is not None:
+        raise RuntimeError(f"micro source breaker open: {source} ({remaining:.0f}s)")
+    try:
+        data = _micro_fetch(url, params, timeout)
+    except Exception:
+        _micro_breaker_note(source, False)
+        raise
+    _micro_breaker_note(source, True)
+    return data
+
+
+def _micro_fetch(url, params, timeout=4):
     """Rotate hosts/transports within one shared retry budget.
 
     requests' timeout measures socket inactivity, so this is an attempt budget,
@@ -303,9 +393,11 @@ def _minute_trend_payload(code, asof_iso, ttl_seconds):
 @PTM.timed("microstructure.depth")
 def _tencent_depth(code):
     prefix = "sh" if str(code).startswith(("5", "6", "9")) else "sz"
+    # 盘口深度是 shadow 级证据（只进软分、fail-open），3 秒足够；
+    # 原来的 5 秒在源不可用时把每只候选的等待时间额外拉长。
     response = requests.get(
         TENCENT_QUOTE_URL + prefix + str(code),
-        headers={"User-Agent": UA, "Referer": "https://gu.qq.com/"}, timeout=5,
+        headers={"User-Agent": UA, "Referer": "https://gu.qq.com/"}, timeout=3,
     )
     response.raise_for_status()
     response.encoding = "gbk"
@@ -450,8 +542,12 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
     return result
 
 
-def market_microstructures(codes, asof_day=None, max_workers=5):
-    """Fetch only the small live-review set concurrently."""
+def market_microstructures(codes, asof_day=None, max_workers=8):
+    """Fetch only the small live-review set concurrently.
+
+    并发度取 8（原 5）：候选集通常十余只，而每只内部是三个串行的短请求，
+    提高并发能把批次数从 3 降到 2，且这些请求是纯 IO 等待，不会抢 CPU。
+    """
     unique = list(dict.fromkeys(str(code or "").zfill(6) for code in (codes or []) if code))
     output = {}
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique) or 1))) as pool:
