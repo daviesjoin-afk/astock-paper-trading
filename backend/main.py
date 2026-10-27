@@ -680,33 +680,7 @@ def _stock_code(code):
     return code
 
 
-def _buy_scope(code, name=None, risk_flag=None, instrument_type=None):
-    """Single read-side eligibility rule for all buy suggestions.
-
-    Execution has an equivalent hard gate in ``paper_trading``.  The public
-    scanner/detail APIs must not describe a restricted board, ST stock or a
-    non-equity instrument as a buyable idea simply because it has six digits.
-    """
-    code = str(code or "").strip()
-    label = str(name or "").strip()
-    upper = label.upper()
-    kind = str(instrument_type or "").strip().lower()
-    risk = str(risk_flag or "").strip().lower() in {"1", "true", "yes", "y", "risk", "st"}
-    if len(code) != 6 or not code.isdigit():
-        return {"allowed": False, "reason": "证券代码格式无效"}
-    if risk or "ST" in upper or "退" in label:
-        return {"allowed": False, "reason": "ST/退市风险证券不提供买入建议"}
-    if kind in {"etf", "fund", "index", "bond", "convertible_bond", "unknown"}:
-        return {"allowed": False, "reason": "当前系统仅研究可交易的沪深主板与创业板普通股"}
-    if any(token in upper for token in ("ETF", "LOF", "基金", "指数")):
-        return {"allowed": False, "reason": "基金或指数不属于当前股票买入范围"}
-    if code.startswith(("688", "689")):
-        return {"allowed": False, "reason": "科创板仅作产业共振参考，不生成买入建议"}
-    if code.startswith(("4", "8", "92")):
-        return {"allowed": False, "reason": "北交所股票不在当前交易权限范围"}
-    if not code.startswith(("000", "001", "002", "003", "600", "601", "603", "605", "300", "301", "302")):
-        return {"allowed": False, "reason": "不属于当前允许的沪深主板或创业板普通股范围"}
-    return {"allowed": True, "reason": "沪深主板/创业板普通股"}
+from paper_trading_rules import selection_buy_scope as _buy_scope
 
 
 def _completed_daily_kline(frame):
