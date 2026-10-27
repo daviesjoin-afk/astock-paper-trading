@@ -2,9 +2,10 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost, apiPostJson } from "../core/api.js";
 import { $, setEl } from "../core/dom.js";
-import { adaptiveEsc, adaptiveSafeUrl, adaptiveText, fmt, pctCls, pctTxt } from "../core/format.js";
+import { adaptiveEsc, adaptiveSafeUrl, adaptiveText, adaptiveValue, fmt, pctCls, pctTxt } from "../core/format.js";
 import { allocationActionPanel } from "./execution.js";
 import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError, toast } from "../ui/dialog.js";
+export { adaptiveValue } from "../core/format.js";
 
 export function adaptiveStageClass(stage){
   if(stage==='eligible_for_review'||stage==='advisory') return 'ready';
@@ -15,10 +16,6 @@ export function adaptiveStageClass(stage){
 export function adaptiveBar(value, tone){
   var width=Math.max(0,Math.min(100,Number(value)||0));
   return '<div class="adaptive-meter '+(tone||'')+'"><span style="width:'+width+'%"></span></div>';
-}
-
-export function adaptiveValue(value,suffix,digits){
-  return value===null||value===undefined?'—':fmt(value,digits===undefined?1:digits)+(suffix||'');
 }
 
 export function adaptiveJsonArray(value){

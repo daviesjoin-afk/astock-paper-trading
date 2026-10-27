@@ -5,9 +5,10 @@ from tools import coupling_metrics
 
 
 class CouplingBudgetTests(unittest.TestCase):
-    # Measured on PR272 HEAD with the same analyzer.  These are the baseline.
+    # PR272 baseline, with the tradability import-cycle budget tightened after
+    # its removal. Other metrics retain the original measured baseline.
     HEAD_BUDGET = {
-        "import_cycles": 5,
+        "import_cycles": 3,
         "deferred_imports": 583,
         "private_cross_access": 202,
         "raw_sql_modules": 135,
@@ -66,11 +67,9 @@ class CouplingBudgetTests(unittest.TestCase):
     def test_known_cycles_do_not_grow(self):
         actual = coupling_metrics.measure_all()
         self.assertEqual([
-            ("evolution_activation", "self_evolution"),
             ("main", "paper_selection"),
             ("market_data_service", "universe"),
             ("strategies", "strategy_plugins"),
-            ("tradability_ingestion", "tradability_observation_ledger"),
         ], actual["import_cycle_members"])
 
 

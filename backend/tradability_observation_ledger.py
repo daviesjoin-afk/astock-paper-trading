@@ -71,20 +71,6 @@ except ImportError:  # pragma: no cover - package-style import
     from . import point_in_time as PIT  # type: ignore
 
 
-def _default_observed_kind() -> str:
-    """``OBSERVED_UNPROVABLE`` 的**唯一来源**是 :mod:`tradability_ingestion`。
-
-    这里刻意用惰性 import：``tradability_ingestion`` 需要 import 本模块来写 ledger，
-    模块级互相 import 会成环。惰性 import 让两侧都能拿到同一个权威常量，而不是在本地
-    复制一个字符串字面量（复制品会在上游改值时静默漂移）。
-    """
-    try:
-        import tradability_ingestion as TI
-    except ImportError:  # pragma: no cover - package-style import
-        from . import tradability_ingestion as TI  # type: ignore
-    return TI.OBSERVED_UNPROVABLE
-
-
 CONTRACT_VERSION = "tradability-observation-ledger-v1"
 FINGERPRINT_VERSION = "sha256-canonical-observation-v1"
 MIGRATION_DESCRIPTION = "015_add_tradability_observation_ledger"
@@ -400,7 +386,7 @@ def event_from_provider_result(
         provider_id=provider_id,
         provider_version=provider_version,
         provider_status=status,
-        source_observed_kind=_text(getattr(result, "observed_kind", None)) or _default_observed_kind(),
+        source_observed_kind=_text(getattr(result, "observed_kind", None)) or PIT.OBSERVED_UNPROVABLE,
         source_observed_at=_canonical_instant(getattr(result, "observed_at", None)),
         effective_at=_canonical_instant(getattr(result, "effective_at", None)),
         recorded_at=moment,

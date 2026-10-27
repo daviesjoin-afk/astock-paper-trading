@@ -4,7 +4,7 @@
 依赖方向（单向，不可反转）：
 
     adaptive_engine.AdaptiveRunFactProjection      （owner：identity / 可用性 / 核验的 authority）
-    paper_trading.PaperJobRunFactProjection         （owner：同上）
+    paper_runtime_facts.PaperJobRunFactProjection         （owner：同上）
               ↓
     ai_research_runtime_adapter        （本模块：唯一把两个 runtime owner 投影翻译成 typed evidence 的地方）
               ↓
@@ -39,7 +39,7 @@ strategy_research   "策略实验事实" —— runtime 运行失败不是实验
 
 ```python
 adaptive_engine   ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES
-paper_trading     PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES
+paper_runtime_facts PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES
 ```
 
 归口是一张**完整表**，不是 ``if/else`` 链。每次签发前都做**双向**一致性检查（表必须恰好
@@ -120,7 +120,7 @@ from typing import Any, Mapping
 
 import adaptive_runtime_facts as AE
 import ai_research_contract as ARC
-import paper_trading as PT
+import paper_runtime_facts as PT
 
 __all__ = (
     "evidence_ref_from_runtime_projection",

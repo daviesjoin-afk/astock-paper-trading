@@ -1,6 +1,10 @@
 /* PR-55：由 frontend/app.js 拆分（纯搬运，逻辑/文案未改） */
 export function fmt(v, d){ if(v===null||v===undefined||v===''||isNaN(v)) return '-'; return Number(v).toFixed(d===undefined?2:d); }
 
+export function adaptiveValue(value,suffix,digits){
+  return value===null||value===undefined?'—':fmt(value,digits===undefined?1:digits)+(suffix||'');
+}
+
 /* 百分比专用：缺值渲染成「—」。直接写 fmt(v)+'%' 会把占位符拼成 '-%'，
    让「没有数据」看起来像一个真实的百分比读数。 */
 export function fmtPct(v, d){ if(v===null||v===undefined||v===''||isNaN(v)) return '—'; return Number(v).toFixed(d===undefined?2:d)+'%'; }

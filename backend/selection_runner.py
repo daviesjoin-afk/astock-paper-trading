@@ -9,6 +9,7 @@ import main as M
 import paper_trading as P
 import selection_tracking as ST
 import strategies as S
+import universe as U
 from resource_guard import heavy_job_lease
 
 
@@ -19,7 +20,7 @@ def run_daily():
     # calendar is the single source of truth; if it cannot classify the date,
     # fail closed and let the next scheduled run retry.
     try:
-        if not M.U.is_trade_day(now.date()):
+        if not U.is_trade_day(now.date()):
             return {"status": "skipped", "reason": "non-trading-day"}
     except Exception as exc:
         return {"status": "skipped", "reason": "calendar-unavailable",

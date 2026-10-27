@@ -37,6 +37,7 @@ import sqlite3
 from typing import Any, Optional
 
 from adaptive_common import _json, _loads, _now
+import evolution_contract as EC
 
 # ─── scope ───
 
@@ -582,8 +583,6 @@ def _validate_params_payload(conn, params_id: int, scope: str) -> dict:
     单步步长、风险方向、scope 一致性、base 存在性、摘要一致性。
     **不**做任何统计显著性/收益比较（那是 PR-4 的 promotion gate）。
     """
-    import self_evolution as SE
-
     violations: list[str] = []
     row = _query_one(
         conn,
@@ -604,7 +603,7 @@ def _validate_params_payload(conn, params_id: int, scope: str) -> dict:
         violations.append(f"scope 不一致：候选属于 {expected_scope}，校验请求 {scope}")
 
     # 必备键 + 有限数值 + 全局边界
-    for key, bounds in SE.BOUNDS.items():
+    for key, bounds in EC.BOUNDS.items():
         if key not in params:
             violations.append(f"缺少必备参数 {key}")
             continue
@@ -690,7 +689,7 @@ def _validate_params_payload(conn, params_id: int, scope: str) -> dict:
     detail = {
         "params_digest": params_digest(params),
         "scope_key": expected_scope,
-        "checked_keys": sorted(SE.BOUNDS),
+        "checked_keys": sorted(EC.BOUNDS),
         "base_params_id": base_id,
         # 已获授权的风险放大：只在**真正激活**时才闭环成 promoted，
         # 未激活/被拒绝的候选永远不会推进提案生命周期。
@@ -824,8 +823,7 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
 
 
 def _version() -> str:
-    import self_evolution as SE
-    return SE.EVOLUTION_VERSION
+    return EC.EVOLUTION_VERSION
 
 
 # ─── 显式激活 ───

@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
 from adaptive_common import _now, _json, _loads  # C3: 收敛重复工具函数
+from evolution_contract import BOUNDS, EVOLUTION_VERSION
 
 # 生命周期契约：candidate / validated / active 三者分离，由显式指针决定
 # "当前生效参数"。本模块所有读写都必须经过它，绝不用 id 顺序推断 current。
@@ -44,18 +45,7 @@ CandidateTampered = EA.CandidateTampered
 ActivationConflict = EA.ActivationConflict
 ActivationSideEffectFailed = EA.ActivationSideEffectFailed
 
-# ─── 进化参数默认值 ───
-EVOLUTION_VERSION = "self-evolution-v1"
-
-# 进化参数的边界限制（防止过度进化）
-BOUNDS = {
-    "max_weight_delta": {"min": 0.01, "max": 0.06, "step": 0.003},      # 单个权重最大调整幅度
-    "max_delta_threshold": {"min": 0.001, "max": 0.015, "step": 0.0005}, # 入场阈值最大调整
-    "confidence_threshold": {"min": 50, "max": 90, "step": 3},           # 决策置信度阈值
-    "consensus_weight_ratio": {"min": 0.40, "max": 0.80, "step": 0.03},  # 共识权重幅度比
-    "consensus_direction_threshold": {"min": 0.002, "max": 0.015, "step": 0.001}, # 方向一致性阈值
-    "hold_bias": {"min": 0.0, "max": 0.5, "step": 0.02},                # hold倾向（越保守越难propose）
-}
+# BOUNDS and EVOLUTION_VERSION are re-exported above for existing callers.
 
 # 最小样本量：少于此数量不触发进化
 MIN_SAMPLES_FOR_EVOLUTION = 5

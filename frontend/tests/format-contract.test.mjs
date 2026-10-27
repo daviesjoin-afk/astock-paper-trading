@@ -4,10 +4,31 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import {
-  adaptiveEsc, dataValidityTone, fmt, fmtPct, pctTxt, sellTag, sigTag,
+  adaptiveEsc, adaptiveValue, dataValidityTone, fmt, fmtPct, pctTxt, sellTag, sigTag,
 } from '../src/core/format.js';
+import { adaptiveValue as legacyAdaptiveValue } from '../src/features/adaptive.js';
+import { allocationActionPanel } from '../src/features/execution.js';
 
 const source = (relative) => readFileSync(new URL(relative, import.meta.url), 'utf8');
+
+test('adaptiveValue 保持缺值、精度、后缀和旧导出兼容', () => {
+  assert.equal(legacyAdaptiveValue, adaptiveValue);
+  assert.equal(adaptiveValue(null, '%'), '—');
+  assert.equal(adaptiveValue(undefined, '%'), '—');
+  assert.equal(adaptiveValue(0, '%'), '0.0%');
+  assert.equal(adaptiveValue(1.2345, '', 3), '1.234');
+  assert.equal(adaptiveValue('2.5', 'ms', 0), '3ms');
+  assert.equal(adaptiveValue('', '%'), '-%');
+  assert.equal(adaptiveValue(NaN, '%'), '-%');
+});
+
+test('分摊展示从公共格式模块取值，不再依赖研究页面', () => {
+  const execution = source('../src/features/execution.js');
+  assert.doesNotMatch(execution, /from\s+["']\.\/adaptive\.js["']/);
+  const html = allocationActionPanel({allocation:{active:{alpha:{weight_pct:12.34}, beta:{weight_pct:null}}}});
+  assert.match(html, /当前分摊 12\.3%/);
+  assert.match(html, /当前分摊 —/);
+});
 
 test('fmtPct 把缺值渲染为占位符，而不是拼成 "-%"', () => {
   assert.equal(fmtPct(null), '—');

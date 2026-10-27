@@ -88,7 +88,7 @@ OBSERVED_SOURCE_TIMESTAMP = "source_timestamp"
 OBSERVED_PUBLICATION_TIMESTAMP = "publication_timestamp"
 OBSERVED_SNAPSHOT_TIMESTAMP = "snapshot_timestamp"
 OBSERVED_RETRIEVED_AT = "retrieved_at"
-OBSERVED_UNPROVABLE = "unprovable"
+OBSERVED_UNPROVABLE = PIT.OBSERVED_UNPROVABLE  # 兼容已有摄取层调用者
 #: 可**证明历史可见性**的 observed 类型：只有这些类型能作为"当年已经可知"的证据。
 #: ``retrieved_at``（今天才抓到）与 ``unprovable`` 一律不构成历史可见性证明。
 PIT_PROVABLE_OBSERVED_KINDS = {
