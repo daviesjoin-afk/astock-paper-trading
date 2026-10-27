@@ -22,6 +22,7 @@ class CandidateScanInputs:
         self._fundamentals = {}
         self._universe = None
         self._finance = None
+        self._disclosures = {}
 
     def universe(self, loader):
         if self._universe is None:
@@ -40,6 +41,33 @@ class CandidateScanInputs:
                 return value
             self._finance = deepcopy(value)
         return deepcopy(self._finance)
+
+    def disclosures(self, codes, *, asof, loader):
+        """Memoize disclosure rows by code and as-of inside one scan round.
+
+        Candidate sets differ per strategy, so only the missing codes are
+        fetched. Only rows actually returned are cached; a missing row or a
+        failed source is retried by another account instead of becoming a
+        round-wide negative result.
+        """
+        cutoff = asof.isoformat() if hasattr(asof, "isoformat") else str(asof)
+        requested = list(dict.fromkeys(str(code) for code in codes if code))
+        missing = [code for code in requested
+                   if (code, cutoff) not in self._disclosures]
+        if missing:
+            with PTM.phase("candidate.disclosure_round_source"):
+                rows = loader(missing, asof=asof) or []
+            found = {
+                str(row.get("code")): row
+                for row in rows
+                if isinstance(row, dict) and row.get("code")
+            }
+            for code in missing:
+                if code in found:
+                    self._disclosures[(code, cutoff)] = deepcopy(found[code])
+        return [deepcopy(self._disclosures[(code, cutoff)])
+                for code in requested
+                if self._disclosures.get((code, cutoff)) is not None]
 
     def fundamentals(self, universe, finance, *, asof):
         def cutoff(value):

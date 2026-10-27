@@ -2,12 +2,14 @@
    顺序即执行顺序，重排等于改行为。 */
 import { api, apiPost } from "./core/api.js";
 import { $, charts } from "./core/dom.js";
-import { PAPER_VIEW_KEY, SETTINGS_SECTION_KEY, activatePage, installHashRouting, installWorkspaceTabRails, renderClock, restoreAppNavigation, syncThemeControl, syncWorkspaceTabRails } from "./core/navigation.js";
-import { loadEvolutionStatus, renderAdaptive, setAdaptiveSection } from "./features/adaptive.js";
-import { loadPaper } from "./features/paper.js";
+import { PAPER_VIEW_KEY, SETTINGS_SECTION_KEY, activatePage, installHashRouting, installWorkspaceTabRails, registerMarketGateLoader, registerPageLoader, registerPaperViewLoader, renderClock, restoreAppNavigation, syncThemeControl, syncWorkspaceTabRails } from "./core/navigation.js";
+import { loadAdaptive, loadEvolutionStatus, renderAdaptive, setAdaptiveSection } from "./features/adaptive.js";
+import { loadPaperExecution } from "./features/execution.js";
+import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPortfolioWorkspace } from "./features/paper.js";
 import { loadPaperRisk } from "./features/risk.js";
-import { loadDataValidity, loadMarketGate, loadStrategies } from "./features/selection.js";
-import { normalizeActiveStrategyCopy } from "./features/strategies.js";
+import { loadDataValidity, loadMarketGate, loadPaperSelection, loadStrategies } from "./features/selection.js";
+import { loadSettings } from "./features/settings.js";
+import { loadStrategyWorkbench, normalizeActiveStrategyCopy } from "./features/strategies.js";
 
 window.__ASTOCK_ADAPTIVE_UI_BUILD__='20261012-runtime-followup';
 
@@ -58,9 +60,35 @@ setInterval(renderClock,1000);
 window._paperOrderSide = 'buy';
 
 // ---------- 个股分析 ----------
-loadStrategies();
+// Composition root: navigation only routes; it never imports feature modules.
+function _once(loader){
+  var used=false;
+  return function(){ if(used) return Promise.resolve(); used=true; return loader(); };
+}
+registerMarketGateLoader(loadMarketGate);
+// Static selection inputs are fetched once; reopening the page only refreshes
+// the persisted selection result. The explicit refresh button reloads all.
+registerPageLoader('p-select', _once(loadStrategies));
+registerPageLoader('p-select', _once(loadDataValidity));
+registerPageLoader('p-select', loadPaperSelection);
+registerPageLoader('p-select', loadStrategies, 'refresh');
+registerPageLoader('p-select', loadDataValidity, 'refresh');
+registerPageLoader('p-select', loadPaperSelection, 'refresh');
+registerPageLoader('p-adaptive', loadAdaptive);
+registerPageLoader('p-adaptive', loadAdaptive, 'refresh');
+registerPageLoader('p-settings', function(refresh){ return loadSettings(!!refresh); });
+registerPageLoader('p-settings', function(refresh){ return loadSettings(!!refresh); }, 'refresh');
+registerPageLoader('p-strategies', loadStrategyWorkbench);
 
-loadDataValidity();
+registerPaperViewLoader('portfolio', function(refresh){ return loadPaper(refresh ? {refresh:true} : undefined); });
+registerPaperViewLoader('activity', function(refresh){ return loadPaper(refresh ? {refresh:true} : undefined); });
+registerPaperViewLoader('history', function(refresh){ return loadPaper(refresh ? {refresh:true} : undefined); });
+registerPaperViewLoader('all', function(refresh){ return loadPaper(refresh ? {refresh:true} : undefined); });
+registerPaperViewLoader('strategy', loadPaperStrategyCenter);
+registerPaperViewLoader('research', loadPaperResearchValidation);
+registerPaperViewLoader('risk', function(refresh){ return loadPaperRisk(!!refresh); });
+registerPaperViewLoader('execution', function(refresh){ return loadPaperExecution(!!refresh); });
+registerPaperViewLoader('allocation', loadPortfolioWorkspace);
 
 loadMarketGate();
 

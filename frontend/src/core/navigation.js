@@ -1,15 +1,44 @@
 /* PR-55：由 frontend/app.js 拆分（纯搬运，逻辑/文案未改） */
 // 跨模块依赖（由原单文件作用域推导）
 import { $, charts } from "./dom.js";
-import { loadAdaptive } from "../features/adaptive.js";
-import { loadPaperExecution } from "../features/execution.js";
-import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPortfolioWorkspace } from "../features/paper.js";
-import { loadPaperRisk } from "../features/risk.js";
-import { loadDataValidity, loadMarketGate, loadPaperSelection, loadStrategies } from "../features/selection.js";
-import { loadSettings } from "../features/settings.js";
-import { loadStrategyWorkbench } from "../features/strategies.js";
 
 export var APP_PAGE_KEY='astock.activePage', PAPER_VIEW_KEY='astock.paperView', SETTINGS_SECTION_KEY='astock.settingsSection';
+
+/* Page loaders are registered by the composition root (boot.js). Navigation
+   owns routing only, so feature modules never have to be imported here. */
+var _pageLoaders={}, _paperViewLoaders={}, _marketGateLoader=null;
+
+export function registerPageLoader(page,loader,phase){
+  if(!page||typeof loader!=='function') return;
+  var entry=_pageLoaders[page]||(_pageLoaders[page]={activate:[],refresh:[]});
+  entry[phase==='refresh'?'refresh':'activate'].push(loader);
+}
+
+export function registerPaperViewLoader(view,loader){
+  if(!view||typeof loader!=='function') return;
+  (_paperViewLoaders[view]=_paperViewLoaders[view]||[]).push(loader);
+}
+
+export function registerMarketGateLoader(loader){
+  if(typeof loader==='function') _marketGateLoader=loader;
+}
+
+function _runLoaders(loaders,refresh){
+  return Promise.all((loaders||[]).map(function(loader){
+    try{ return Promise.resolve(loader(!!refresh)); }
+    catch(e){ return Promise.reject(e); }
+  }));
+}
+
+function _loadPage(page,phase){
+  var entry=_pageLoaders[page];
+  if(!entry) return Promise.resolve([]);
+  return _runLoaders(entry[phase]||entry.activate||[], phase==='refresh');
+}
+
+function _loadPaperView(view,refresh){
+  return _runLoaders(_paperViewLoaders[view], refresh);
+}
 
 export function activatePage(page, options){
   options=options||{};
@@ -22,11 +51,11 @@ export function activatePage(page, options){
   if(options.writeHash!==false){
     history.replaceState(null,'','#'+page.replace(/^p-/,'')+(page==='p-paper'?'/'+(window._paperWorkspace||'portfolio'):(page==='p-settings'?'/'+(window._settingsSection||'simulation'):'')));
   }
-  if(page==='p-adaptive') loadAdaptive();
-  if(page==='p-settings') loadSettings();
-  if(page==='p-strategies'&&typeof loadStrategyWorkbench==='function') loadStrategyWorkbench();
-  // 进入策略选股页（含首次加载默认落在本页）时读取一次结果，否则占位文案会一直停在“正在读取…”。
-  if(page==='p-select'&&typeof loadPaperSelection==='function') loadPaperSelection();
+  if(['p-adaptive','p-settings','p-strategies','p-select'].indexOf(page)>=0){
+    _loadPage(page,'activate').catch(function(error){
+      console.error('page load failed:',page,error);
+    });
+  }
   if(page==='p-paper'){
     var paperTab=document.querySelector('#p-paper [data-paper-view="'+(window._paperWorkspace||'portfolio')+'"]');
     showPaperWorkspace(window._paperWorkspace||'portfolio',paperTab,{restore:true});
@@ -147,7 +176,9 @@ export function showPaperWorkspace(view,button,options){
   window._paperWorkspace=view;
   sessionStorage.setItem(PAPER_VIEW_KEY,view);
   if(!options.restore) history.replaceState(null,'','#paper/'+view);
-  if(view==='strategy') loadPaperStrategyCenter(); else if(view==='research') loadPaperResearchValidation(); else if(view==='risk') loadPaperRisk(false); else if(view==='execution') loadPaperExecution(); else if(view==='allocation') loadPortfolioWorkspace(); else loadPaper();
+  _loadPaperView(view,false).catch(function(error){
+    console.error('paper view load failed:',view,error);
+  });
 }
 
 // 暗色模式切换
@@ -157,26 +188,12 @@ export async function refreshApp(){
   var button=document.querySelector('.page-refresh'), original=button&&button.textContent;
   if(button){ button.disabled=true; button.textContent='刷新中…'; }
   try{
-    await loadMarketGate();
+    if(_marketGateLoader) await _marketGateLoader();
     var page=(document.querySelector('.page.active')||{}).id;
     if(page==='p-paper'){
-      var view=window._paperWorkspace||'portfolio';
-      if(view==='risk') await loadPaperRisk(true);
-      else if(view==='strategy') await loadPaperStrategyCenter();
-      else if(view==='research') await loadPaperResearchValidation();
-      else if(view==='execution') await loadPaperExecution(true);
-      else if(view==='allocation') await loadPortfolioWorkspace();
-      else await loadPaper({refresh:true});
-    }else if(page==='p-select'){
-      var jobs=[];
-      if(typeof loadStrategies==='function') jobs.push(loadStrategies());
-      if(typeof loadDataValidity==='function') jobs.push(loadDataValidity());
-      if(typeof loadPaperSelection==='function') jobs.push(loadPaperSelection());
-      await Promise.all(jobs);
-    }else if(page==='p-adaptive'&&typeof loadAdaptive==='function'){
-      await loadAdaptive();
-    }else if(page==='p-settings'&&typeof loadSettings==='function'){
-      await loadSettings(true);
+      await _loadPaperView(window._paperWorkspace||'portfolio',true);
+    }else if(page==='p-select'||page==='p-adaptive'||page==='p-settings'){
+      await _loadPage(page,'refresh');
     }else{
       window.location.reload();
     }

@@ -2,9 +2,10 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost, apiPostJson } from "../core/api.js";
 import { $, setEl } from "../core/dom.js";
-import { adaptiveEsc, adaptiveSafeUrl, adaptiveText, fmt, pctCls, pctTxt } from "../core/format.js";
+import { adaptiveEsc, adaptiveSafeUrl, adaptiveText, adaptiveValue, fmt, pctCls, pctTxt } from "../core/format.js";
 import { allocationActionPanel } from "./execution.js";
 import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError, toast } from "../ui/dialog.js";
+export { adaptiveValue } from "../core/format.js";
 
 export function adaptiveStageClass(stage){
   if(stage==='eligible_for_review'||stage==='advisory') return 'ready';
@@ -15,10 +16,6 @@ export function adaptiveStageClass(stage){
 export function adaptiveBar(value, tone){
   var width=Math.max(0,Math.min(100,Number(value)||0));
   return '<div class="adaptive-meter '+(tone||'')+'"><span style="width:'+width+'%"></span></div>';
-}
-
-export function adaptiveValue(value,suffix,digits){
-  return value===null||value===undefined?'—':fmt(value,digits===undefined?1:digits)+(suffix||'');
 }
 
 export function adaptiveJsonArray(value){
@@ -481,12 +478,34 @@ export function setAdaptiveSection(section,button){
   }
 }
 
+export function adaptiveNeuralPanelHtml(neural){
+  neural=neural||{};
+  var readiness=neural.readiness||{},ready=readiness.admitted===true,approved=neural.approved===true;
+  var hasReadiness=neural.readiness&&typeof neural.readiness==='object';
+  var condition=hasReadiness?(ready?'已满足':'尚未满足'):'未取得结果';
+  var human=neural.approved===true?'已确认':(neural.approved===false?'未确认':'未取得状态');
+  var training=readiness.evaluation_model_artifact_fingerprint&&readiness.evaluation_trained_through?'已记录训练溯源':'尚不能确认';
+  var prediction=readiness.evaluation_admitted===true?'样本外评估已通过':'样本外有效性尚未证明';
+  var blockers=(readiness.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('');
+  if(!blockers) blockers=ready?'<li class="pass">研究条件已满足，可以记录人工确认。</li>':'<li>研究条件尚未满足或未取得结果。</li>';
+  return '<section class="adaptive-panel neural-control-panel"><details><summary><b>模型研究条件检查（神经网络）</b> · 查看条件与人工确认状态</summary>'
+    +'<p class="adaptive-copy">这里检查研究数据与样本外评估证据。人工确认只保存确认记录；当前结果不参与交易候选排序，也不会直接下单。</p>'
+    +'<div class="closed-loop-kpis"><div><small>研究条件</small><b>'+condition+'</b></div><div><small>人工确认</small><b>'+human+'</b></div>'
+    +'<div><small>模型训练</small><b>'+training+'</b></div><div><small>预测证据</small><b>'+prediction+'</b></div><div><small>交易排序</small><b>未参与</b></div></div>'
+    +'<div class="closed-loop-kpis"><div><small>特征样本</small><b>'+Number(readiness.feature_rows||0)+'</b></div><div><small>标签样本</small><b>'+Number(readiness.label_rows||0)+'</b></div>'
+    +'<div><small>独立盘面日</small><b>'+Number(readiness.profile_days||0)+' / '+adaptiveEsc((readiness.requirements||{}).min_profile_days==null?'—':readiness.requirements.min_profile_days)+'</b></div>'
+    +'<div><small>可用周期</small><b>'+adaptiveEsc((readiness.available_horizons||[]).join('/')||'—')+'</b></div></div>'
+    +'<ul class="adaptive-guardrails neural-blockers">'+blockers+'</ul>'
+    +(ready&&!approved?'<button class="ghost" onclick="approveAdaptiveNeural()">记录人工确认</button>':'')
+    +'</details></section>';
+}
+
 export function renderAdaptive(d){
   window._adaptiveOverviewPayload=d||{};
   var engine=d.engine||{},profile=d.market_profile||{},features=profile.features||{},drivers=profile.drivers||[];
   var decision=d.decision||{},weights=decision.weights||{},evidence=((decision.evidence||{}).strategies)||{};
   var alpha=d.alpha_lab||{},alphaRun=alpha.latest_run||{},alphaDetail=alphaRun.detail||{};
-  var neural=d.neural_control||alpha.neural_control||{},neuralReady=!!((neural.readiness||{}).admitted),neuralApproved=!!neural.approved;
+  var neural=d.neural_control||alpha.neural_control||{};
   var riskOpt=d.risk_optimizer||{},riskCandidates=riskOpt.candidates||[],riskClosure=riskOpt.closure||{},deepseek=d.deepseek_advisor||riskOpt.deepseek_advisor||{};
   var selectionOpt=d.selection_optimizer||{},selectionCandidates=selectionOpt.candidates||[];
   var newsLearning=d.news_learning||{},newsTotals=newsLearning.totals||{},newsFactor=newsLearning.factor||{},newsGates=newsFactor.gates||{};
@@ -575,8 +594,7 @@ export function renderAdaptive(d){
   var dataCards=dataCategories.map(function(x){var coverage=x.coverage_pct==null?'分项统计':fmt(x.coverage_pct,1)+'%';var freshness=x.freshness_minutes==null?'':(' · 延迟 '+fmt(x.freshness_minutes,1)+'分钟');return '<article class="data-input-card '+adaptiveEsc(x.status||'partial')+'"><header><div><span>'+adaptiveEsc(x.id||'data')+'</span><h4>'+adaptiveEsc(x.name)+'</h4></div><em>'+adaptiveEsc(({usable:'可用于交易',shadow:'仅影子',partial:'部分可用',blocked:'禁止新增'})[x.status]||x.status)+'</em></header><div class="data-input-metric"><b>'+coverage+'</b><small>'+Number(x.records||0)+' 条/行'+freshness+'</small></div><p>'+adaptiveEsc(x.detail||'')+'</p><div class="data-input-sources">'+(x.sources||[]).map(function(s){return '<span>'+adaptiveEsc(s)+'</span>';}).join('')+'</div><small>'+adaptiveEsc(x.authority||'')+'</small></article>';}).join('');
   var dataBlockers=(dataInputs.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">五类输入均达到当前使用门槛</li>';
   var dataInputPanel='<section class="adaptive-panel data-input-panel"><header><div><span>DATA INPUT BUS · QUALITY GATES</span><h3>五类数据输入总线</h3></div><em>'+adaptiveEsc(dataInputs.version||'data-input-bus-v1')+'</em></header><p class="adaptive-copy">全面不等于把所有字段都接进来，而是每类数据都要有来源、覆盖率、源时间、降级状态和明确使用权限。缺失数据不会静默用代理值冒充。</p><div class="data-input-grid">'+dataCards+'</div><div class="data-input-bottom"><div><h4>当前数据缺口</h4><ul>'+dataBlockers+'</ul></div><div><h4>输入纪律</h4><ul>'+(dataInputs.rules||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')+'</ul></div></div></section>';
-  var neuralBlockers=(neural.readiness&&neural.readiness.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">样本门槛已满足，可申请人工确认</li>';
-  var neuralPanel='<section class="adaptive-panel neural-control-panel"><header><div><span>NEURAL SHADOW · HUMAN GATE</span><h3>神经网络候选评分</h3></div><em class="'+(neuralApproved?'tag-ok':'tag-warn')+'">'+adaptiveEsc(({shadow_only:'影子运行',approval_waiting_data:'已申请 · 等待数据',approval_waiting_evaluation:'已申请 · 等待样本外评估',approved_bounded_shadow:'人工确认 · 有界影子',disabled:'已停用'})[neural.status]||'影子运行')+'</em></header><p class="adaptive-copy">当前对已启用策略集合做候选排序对照，最多影响排序分 '+fmt(neural.max_rank_adjustment||0,3)+'；不直接下单、不绕过行情双源、板块权限、仓位、T+1或风控卖出。</p><div class="neural-gate-kpis"><div><small>特征样本</small><b>'+Number((neural.readiness||{}).feature_rows||0)+'</b></div><div><small>标签样本</small><b>'+Number((neural.readiness||{}).label_rows||0)+'</b></div><div><small>独立盘面日</small><b>'+Number((neural.readiness||{}).profile_days||0)+' / '+Number((neural.readiness||{}).requirements&&neural.readiness.requirements.min_profile_days||60)+'</b></div><div><small>可用周期</small><b>'+adaptiveEsc(((neural.readiness||{}).available_horizons||[]).join('/')||'—')+'</b></div></div><ul class="adaptive-guardrails neural-blockers">'+neuralBlockers+'</ul>'+(neuralReady&&!neuralApproved?'<button class="ghost" onclick="approveAdaptiveNeural()">人工确认，启用有界影子评分</button>':'')+(neuralApproved?'<div class="adaptive-notice">已确认：仅作为排序副分，硬门禁仍由原策略和风控最终决定。</div>':'<div class="adaptive-notice">未满足样本外门槛前，按钮不会放权；当前结果只记录在自进化证据中。</div>')+'</section>';
+  var neuralPanel=adaptiveNeuralPanelHtml(neural);
   $('adaptiveResult').innerHTML='<div class="adaptive-shell">'
     +closedLoopPanel
     +dataInputPanel
@@ -736,11 +754,11 @@ export async function runAdaptive(){
 }
 
 export async function approveAdaptiveNeural(){
-  var confirmation=await adaptiveConfirm({title:'批准神经网络影子评分',detail:'神经网络只作为三个短线策略的候选排序参考。',boundary:'不会绕过行情双源、仓位、T+1 或风控门禁；不会直接下单。'}); if(!confirmation.approved) return;
+  var confirmation=await adaptiveConfirm({title:'记录模型研究人工确认',detail:'确认后只保存人工确认记录；当前结果尚未接入交易候选排序。',boundary:'不会直接下单，也不会改变交易风控。'}); if(!confirmation.approved) return;
   try{renderAdaptive(await apiPost('/api/adaptive/neural/approve?confirmed=true'));}
   catch(e){
-    var handled=await handleOperatorError(e, '批准神经网络影子评分', approveAdaptiveNeural);
-    if(!handled) adaptiveActionNotice('神经网络仍未达到放权门槛',e.message);
+    var handled=await handleOperatorError(e, '记录模型研究人工确认', approveAdaptiveNeural);
+    if(!handled) adaptiveActionNotice('模型研究条件尚未满足',e.message);
   }
 }
 

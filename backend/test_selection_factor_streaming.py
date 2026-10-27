@@ -16,7 +16,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import factors as F
-import main as M
+import selection_application as M
 import paper_trading as P
 import selection_factor_store as STORE
 

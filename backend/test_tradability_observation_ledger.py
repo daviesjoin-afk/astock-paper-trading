@@ -11,9 +11,13 @@
    时点下给出，且两者都仍然是 not_comparable（绝不进入 disagreement 分母）。
 """
 
+import os
 import sqlite3
+import subprocess
+import sys
 import unittest
 
+import point_in_time as PIT
 import tradability_archive as TA
 import tradability_ingestion as TI
 import tradability_observation_ledger as OL
@@ -82,6 +86,40 @@ class LedgerTestCase(unittest.TestCase):
 
 
 class ObservationRecording(LedgerTestCase):
+    def test_missing_observed_kind_uses_shared_unprovable_value(self):
+        self.assertIs(TI.OBSERVED_UNPROVABLE, PIT.OBSERVED_UNPROVABLE)
+        missing = event(status=OL.OBSERVED_UNKNOWN, source_observed_kind=None)
+        explicit = event(status=OL.OBSERVED_UNKNOWN, source_observed_kind=TI.OBSERVED_UNPROVABLE)
+        self.assertEqual("unprovable", missing.source_observed_kind)
+        self.assertEqual(explicit.observation_fingerprint, missing.observation_fingerprint)
+        self.assertTrue(self.ledger.append(missing))
+        self.assertFalse(self.ledger.append(explicit))
+        row = self.ledger.events(CODE, SESSION)[0]
+        self.assertEqual("unprovable", row["source_observed_kind"])
+        self.assertEqual(RUN, row["ingestion_run_id"])
+        self.assertEqual(missing.observation_fingerprint, row["observation_fingerprint"])
+
+    def test_ledger_can_build_default_event_without_importing_ingestion(self):
+        script = '''
+import sys
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import point_in_time as PIT
+import tradability_observation_ledger as ledger
+assert "tradability_ingestion" not in sys.modules
+result = SimpleNamespace(provider_id="listing", provider_version="1", status="unknown")
+event = ledger.event_from_provider_result(result, code="000001", session="2024-01-10", recorded_at="2024-01-10T16:00:00+08:00", ingestion_run_id="run-0001")
+assert event.source_observed_kind == PIT.OBSERVED_UNPROVABLE == "unprovable"
+assert "tradability_ingestion" not in sys.modules
+import tradability_ingestion as ingestion
+assert ingestion.OBSERVED_UNPROVABLE is PIT.OBSERVED_UNPROVABLE
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", script, os.path.dirname(os.path.abspath(__file__))],
+            text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def test_o1_first_observation_recorded_correctly(self):
         self.assertTrue(self.ledger.append(event()))
         rows = self.ledger.events(CODE, SESSION)

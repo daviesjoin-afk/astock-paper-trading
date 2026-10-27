@@ -6,24 +6,27 @@
 
 | 指标 | PR272 基线 | 本次收口后 | 允许增量 | 长期目标 |
 |---|---:|---:|---:|---:|
-| import 环 | 5 | 5 | 0 | 0 |
-| 延迟 import | 583 | 626 | 43 | 逐步降低；仅移除无必要的延迟依赖 |
+| import 环 | 5 | 2 | 不允许反弹 | 0 |
+| 延迟 import | 583 | 621 | 38 | 逐步降低；仅移除无必要的延迟依赖 |
 | 裸 SQL 模块 | 135 | 140 | 5 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
-| 跨模块私有属性访问 | 202 | 205 | 3 | 0 |
-| 跨域 import 边 | 624 | 649 | 25 | 分阶段降低 |
-| 最大文件 | 16367 行 | 16439 行 | 72 | ≤2500 |
-| 最大函数 | 1191 行 | 1196 行 | 5 | <200 |
+| 跨模块私有属性访问 | 202 | 202 | 0 | 0 |
+| 跨域 import 边 | 624 | 661 | 37 | 分阶段降低 |
+| 最大文件 | 16367 行 | 15676 行 | 0 | ≤2500 |
+| 最大函数 | 1191 行 | 1195 行 | 4 | <200 |
 | 单函数最大全局引用 | 56 | 57 | 1 | <80 |
-| 重复顶层 helper 名 | 307 | 312 | 5 | <30 |
+| 重复顶层 helper 名 | 307 | 313 | 6 | <30 |
 | `_num`/`_number`/`_finite` 重复定义 | 54 | 54 | 0 | 按语义逐模块收敛，不按名称批量替换 |
-| 无归属前缀模块占比 | 41.39% | 40.72% | 0 | <30% |
-| 顶层 import 副作用 | 25 | 25 | 0 | <5 |
+| 无归属前缀模块占比 | 41.39% | 39.94% | 0 | <30% |
+| 顶层 import 副作用 | 25 | 23 | 0 | <5 |
 
-允许增量来自本次审核修复必须新增的生产模块与调用点（`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 只做了读模型外移，最大函数仍是 `_buy_order`，未做高风险重写。
+允许增量来自本次审核修复必须新增的生产模块与调用点（`selection_application`、`paper_runtime_facts`、`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 已降至 15,676 行，最大函数仍是 `_buy_order`，未做高风险重写。
 
 ## 本次切片
 
+- 2026-10-27（第三批）：选股流水线从 HTTP 主入口下沉到 `selection_application`，API 与两个命令行入口共用；共享资金读取改为显式周期 owner；前端提供商设置不再反向导入设置页面。导入环 3 → 2，主文件行数降至 15,676，私有跨模块访问收紧到基线 202。缺报价账户/资金池/风险页保持 `unknown`，已实现盈亏仍可展示。
+- 2026-10-27（前端加载/候选/选股复用）：`navigation` 不再导入任何 feature，页面 loader 由 `boot` 组合根注册；非选股深链不再无条件请求选股数据。前端静态环 1 → 0；单 bundle 体积基本不变，因此不把去环当成 JS 传输缩短。候选准备新增按 `(code, asof)` 的披露证据轮内复用，失败不缓存、不同日期重取，原有来源错误语义保持不变。`paper_selection.run_daily` 与定时 `selection_runner` 在一个显式 `selection_round` 内共享 live snapshot、snap 和 fundamental 计算；单策略调用不改变原路径。
+- 2026-10-27：将无法证明来源的观测类型常量归到已有 `point_in_time` 契约；摄取层保留原名别名，观察账本不再反向导入摄取层。进化版本和全局参数边界归到共享契约，激活校验不再反导生成器。导入环从 5 组降为 3 组，守卫同步收紧；来源指纹、参数边界和事务语义不变。
 - 建立可执行基线；历史预算采用本分支实测值，而非沿用旧报告数字。
 - `paper_account_metrics` 承接账户绩效读投影；facade 保留 `_account_metrics` 导出及原签名。
 - 外部事实通过冻结的 `AccountMetricDependencies` 晚绑定，不反向 import `paper_trading`，不冻结可变运行时依赖，不改变 SQL 和事务边界。

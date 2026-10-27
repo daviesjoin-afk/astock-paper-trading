@@ -2,9 +2,8 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $ } from "../core/dom.js";
-import { adaptiveEsc, fmt, riskText } from "../core/format.js";
+import { adaptiveEsc, adaptiveValue, fmt, riskText } from "../core/format.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
-import { adaptiveValue } from "./adaptive.js";
 
 export function allocationActionPanel(d){
   var alloc=(d&&d.allocation)||{},latest=alloc.latest_decision||{},active=alloc.active||{};

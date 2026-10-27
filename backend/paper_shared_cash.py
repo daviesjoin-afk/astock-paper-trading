@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """Shared cash arithmetic and the narrow cash-ledger mutation boundary.
 
-This module deliberately accepts already-resolved account rows.  The caller
-owns membership, ordering of the input rows, cycle selection, and all other
-portfolio or execution policy.  Runtime numeric and clock functions are
-injected by the compatibility facade so monkeypatches remain effective.
+Existing arithmetic accepts already-resolved account rows.  The explicit-cycle
+read entry delegates economic ownership to its existing owner.  The caller
+selects the cycle and owns the connection and transaction; no reservation,
+portfolio or execution policy is inferred here.
 """
 from __future__ import annotations
 
 import math
+
+import paper_cycle_ownership as PCY
 
 
 def _default_num(value, default=0.0):
@@ -24,6 +26,28 @@ def _default_now():
 def shared_cash(rows, *, num_fn=_default_num):
     """Return the exact cash total for the already-resolved rows."""
     return sum(num_fn(row.get("cash")) for row in rows)
+
+
+def cycle_account_rows(conn, cycle_id, *, builtin_scope):
+    """Read economic account rows for an explicitly selected cycle.
+
+    Selection and any legacy cycle initialization remain the caller's job.
+    Lifecycle status is not an economic ownership filter.  The supplied
+    connection is used as-is and this function never commits it.
+    """
+    if cycle_id is None:
+        raise ValueError("explicit_cycle_id_required")
+    return PCY.cycle_ledger_rows(conn, cycle_id, builtin_scope=builtin_scope)
+
+
+def cycle_shared_cash(conn, cycle_id, *, builtin_scope, num_fn=_default_num):
+    """Sum the economic owners' cash in the caller's transaction snapshot.
+
+    This is gross cash, not available buying power: open reservations, including
+    those from other cycles, must still be accounted for by their owner.
+    """
+    return shared_cash(cycle_account_rows(conn, cycle_id, builtin_scope=builtin_scope),
+                       num_fn=num_fn)
 
 
 def shared_initial_cash(rows, declared_capital=None, *, num_fn=_default_num):

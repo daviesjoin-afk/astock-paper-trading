@@ -5,7 +5,7 @@
 --------------------------
 1. **策略来源**：取自 ``strategy_registry`` 的正式策略集合，
    与「策略模拟」页同源；每个策略带当前编号与名称。
-2. **评分选股**：复用既有选股因子链 ``main._select_uncached``（同一套
+2. **评分选股**：复用选股应用流水线（同一套
    覆盖率/行情新鲜度/买卖范围门禁），每个策略按其模型族评分取 Top N
    （默认 5，候选不足则少于 5 只并给出空状态）。
 3. **分组归属**：结果按策略分组存储，run 的唯一键为
@@ -42,6 +42,7 @@ import sys
 from contextlib import closing
 
 import data_fetcher as dfc
+import selection_application as selection
 import strategy_registry as SR
 import strategy_selection_provenance as SP
 import strategy_selection_resolver as SRES
@@ -412,8 +413,7 @@ def _registry_active_ids() -> tuple[str, ...]:
 
 def _run_one(model_id: str, topn: int):
     """调用既有选股流水线（含覆盖率与行情新鲜度门禁）。"""
-    import main as M
-    return M._select_uncached(strategy=model_id, topn=topn)
+    return selection.select_uncached(strategy=model_id, topn=topn)
 
 
 _DATE_KEYS = ("historical_factor_date", "trade_date", "reference_date", "complete_cutoff")
@@ -422,7 +422,7 @@ _DATE_KEYS = ("historical_factor_date", "trade_date", "reference_date", "complet
 def _trade_date_of(result):
     """从选股返回里解析一个**展示用**的因子基准日。
 
-    真实的 ``main._select_uncached`` 并不会在顶层放日期：它把
+    选股应用流水线并不会在顶层放日期：它把
     ``historical_factor_date`` 写到每只 pick 上，把 ``reference_date`` /
     ``complete_cutoff`` 放在 ``data_quality`` 里。因此按
     顶层 → data_quality → pick 逐级回退，保证落库时不会丢数据来源。
@@ -447,6 +447,7 @@ def _trade_date_of(result):
     return ""
 
 
+@selection.shared_selection_round
 def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = None,
               source: str = "scheduled", asof_day: str | None = None) -> dict:
     """为每套策略跑一次评分选股，并覆盖写入当天结果。

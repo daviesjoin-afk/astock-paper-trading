@@ -1,30 +1,32 @@
 # frontend/src —— 前端模块地图
 
-单文件 `frontend/app.js` 在 PR-55 按 **feature ownership** 拆到 `src/`；PR-57 在策略工作流上做了可读性与交互层级重构，并落地了共享的标签/对话框模块。本文件描述**当前**结构。
+单文件 `frontend/app.js` 在 PR-55 按 **feature ownership** 拆到 `src/`；PR-57 在策略工作流上做了可读性与交互层级重构，并落地了共享的标签/对话框模块。项目总体职责入口见 [架构说明](../../ARCHITECTURE.md)；本文件说明前端模块职责和交付约定。
 
 样式在 `frontend/styles/`（`styles/index.css` 按原顺序 `@import` 各片段），构建产物是 `frontend/dist/app.js` 与 `frontend/dist/app.css`。
 
-## 目录与依赖（由 import 推导）
+## 目录与依赖
 
-| 模块 | 行数 | 依赖（同仓库） |
-| --- | --- | --- |
-| `app.js` | 6 | — |
-| `boot.js` | 120 | `core/api.js`, `core/dom.js`, `core/navigation.js`, `features/adaptive.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/strategies.js` |
-| `bridge.js` | 111 | `core/format.js`, `core/navigation.js`, `features/adaptive.js`, `features/execution.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/settings.js`, `features/strategies.js` |
-| `core/api.js` | 46 | — |
-| `core/dom.js` | 30 | — |
-| `core/format.js` | 101 | — |
-| `core/navigation.js` | 202 | `core/dom.js`, `features/*.js`（各页面装载入口 + hash 路由意图） |
-| `core/state.js` | 8 | — |
-| `core/strategy_labels.js` | 77 | — （PR-57：状态/技术标签的唯一口径） |
-| `features/adaptive.js` | 749 | `core/api.js`, `core/dom.js`, `core/format.js`, `features/execution.js`, `ui/dialog.js` |
-| `features/execution.js` | 144 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js`, `features/adaptive.js` |
-| `features/paper.js` | 869 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js`, `features/risk.js`, `features/strategies.js`, `ui/dialog.js` |
-| `features/risk.js` | 107 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js` |
-| `features/selection.js` | 547 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js` |
-| `features/settings.js` | 252 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `features/paper.js`, `features/strategies.js`, `ui/dialog.js` |
-| `features/strategies.js` | 712 | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/strategy_labels.js`, `ui/dialog.js` |
-| `ui/dialog.js` | 174 | `core/format.js` |
+下表保留拆分时的主要依赖，用于定位职责；新增和实际依赖以各模块的 import 为准。
+
+| 模块 | 主要依赖（同仓库） |
+| --- | --- |
+| `app.js` | — |
+| `boot.js` | `core/api.js`, `core/dom.js`, `core/navigation.js`, `features/adaptive.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/strategies.js` |
+| `bridge.js` | `core/format.js`, `core/navigation.js`, `features/adaptive.js`, `features/execution.js`, `features/paper.js`, `features/risk.js`, `features/selection.js`, `features/settings.js`, `features/strategies.js` |
+| `core/api.js` | — |
+| `core/dom.js` | — |
+| `core/format.js` | — |
+| `core/navigation.js` | `core/dom.js`, `features/*.js`（各页面装载入口 + hash 路由意图） |
+| `core/state.js` | — |
+| `core/strategy_labels.js` | — （PR-57：状态/技术标签的唯一口径） |
+| `features/adaptive.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `features/execution.js`, `ui/dialog.js` |
+| `features/execution.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js`, `features/adaptive.js` |
+| `features/paper.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js`, `features/risk.js`, `features/strategies.js`, `ui/dialog.js` |
+| `features/risk.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `core/state.js` |
+| `features/selection.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/state.js` |
+| `features/settings.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `features/paper.js`, `features/strategies.js`, `ui/dialog.js` |
+| `features/strategies.js` | `core/api.js`, `core/dom.js`, `core/format.js`, `core/navigation.js`, `core/strategy_labels.js`, `ui/dialog.js` |
+| `ui/dialog.js` | `core/format.js` |
 
 ## 功能归属（feature ownership）
 

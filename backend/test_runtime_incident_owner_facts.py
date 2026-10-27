@@ -503,7 +503,7 @@ class RuntimeLifecycleVsVerificationTests(_DbTestCase):
         源文本。
         """
         for name in (
-            "adaptive_engine.py", "paper_trading.py", "ai_research_runtime_adapter.py",
+            "adaptive_engine.py", "paper_trading.py", "paper_runtime_facts.py", "ai_research_runtime_adapter.py",
         ):
             identifiers = _code_identifiers(name)
             hits = sorted(
@@ -1064,7 +1064,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         for module, function in (
             ("adaptive_engine.py", "adaptive_run_fact"),
             ("adaptive_runtime_facts.py", "adaptive_run_fact"),
-            ("paper_trading.py", "paper_job_run_fact"),
+            ("paper_runtime_facts.py", "paper_job_run_fact"),
         ):
             identifiers, constants = _function_facts(module, function)
             with self.subTest(module=module, function=function):
@@ -1115,7 +1115,7 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
         若让它变成 runtime owner fact，研究就能给自己签 factual verification（自引用回路）。
         可执行形式：两个 owner 与 adapter 都不得触达 canonical research ledger。
         """
-        for name in ("adaptive_engine.py", "paper_trading.py", "ai_research_runtime_adapter.py"):
+        for name in ("adaptive_engine.py", "paper_trading.py", "paper_runtime_facts.py", "ai_research_runtime_adapter.py"):
             roots = _imported_roots(name)
             for forbidden in ("ai_research_repository", "ai_research_provider",
                               "ai_research_service"):

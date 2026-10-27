@@ -14,8 +14,30 @@ import numpy as np
 import pandas as pd
 
 import main as M
+import paper_trading_rules as rules
 
 _buy_scope = M._buy_scope
+
+
+class SelectionScopeOwnershipTests(unittest.TestCase):
+    def test_http_facade_reuses_selection_scope_owner_without_changing_rules(self):
+        self.assertIs(M._buy_scope, rules.selection_buy_scope)
+        cases = [
+            (("600000", "普通股票", 0, "stock"), True),
+            (("300750", "普通股票", "false", "stock"), True),
+            (("1", "普通股票", 0, "stock"), False),
+            (("600001", "ST股票", 0, "stock"), False),
+            (("600001", "普通股票", "true", "stock"), False),
+            (("600001", "普通股票", 0, "fund"), False),
+            (("688001", "普通股票", 0, "stock"), False),
+            (("830001", "普通股票", 0, "stock"), False),
+        ]
+        for args, allowed in cases:
+            with self.subTest(args=args):
+                self.assertEqual(rules.selection_buy_scope(*args)["allowed"], allowed)
+        # Selection is stricter about malformed short codes than the legacy
+        # paper ledger helper; moving ownership must not merge these policies.
+        self.assertTrue(rules.security_scope("1")["allowed"])
 
 
 def _reference_mask(table):

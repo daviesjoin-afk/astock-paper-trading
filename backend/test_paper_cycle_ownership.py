@@ -28,6 +28,7 @@ import unittest
 from unittest import mock
 
 import paper_cycle_ownership as PCY
+import paper_shared_cash as PSC
 import paper_trading as PT
 import user_strategy_participation as USP
 
@@ -87,7 +88,7 @@ FORBIDDEN_AUTHORITY_NAMES = {
 FACADE_DELEGATIONS = {
     "_lifecycle_paused_ids": "PCY.lifecycle_paused_ids",
     "_active_cycle_filter": "PCY.cycle_ledger_filter",
-    "_shared_account_rows": "PCY.cycle_ledger_rows",
+    "_shared_account_rows": "PSC.cycle_account_rows",
     "cycle_ledger_ids": "PCY.cycle_ledger_ids",
     "execution_participant_ids": "PCY.execution_participant_ids",
     "current_cycle_participant_ids": "PCY.current_cycle_participant_ids",
@@ -692,7 +693,7 @@ class CompatibilityFacadeTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(callable(getattr(PT, name, None)), f"{name} 兼容入口缺失")
 
-    def test_facade_functions_delegate_to_the_ownership_module(self):
+    def test_facade_functions_delegate_to_their_owner(self):
         tree = _parse(PAPER_PATH)
         for name, target in FACADE_DELEGATIONS.items():
             with self.subTest(name=name):
@@ -885,11 +886,13 @@ class OwnershipArchitectureGuardTests(unittest.TestCase):
                     offenders.append(f"{name}.{candidate}")
         self.assertEqual([], offenders, "解析面只允许在 paper_cycle_ownership 中定义")
 
-    def test_every_facade_target_exists_in_the_ownership_module(self):
+    def test_every_facade_target_exists_in_its_owner_module(self):
+        owners = {"PCY": PCY, "PSC": PSC}
         for name, target in FACADE_DELEGATIONS.items():
             with self.subTest(name=name):
-                attr = target.split(".", 1)[1]
-                self.assertTrue(callable(getattr(PCY, attr, None)),
+                module_name, attr = target.split(".", 1)
+                self.assertIn(module_name, owners, f"{name} 的 owner 未登记: {module_name}")
+                self.assertTrue(callable(getattr(owners[module_name], attr, None)),
                                 f"{name} 的委托目标 {target} 不存在")
 
 

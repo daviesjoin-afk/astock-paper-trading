@@ -20,8 +20,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -2766,7 +2764,7 @@ def _shared_account_rows(conn, cycle_id=None):
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
-    return PCY.cycle_ledger_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
+    return PSC.cycle_account_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def _shared_initial_cash(conn, cycle=None):
@@ -2836,7 +2834,9 @@ def _economic_pool_nav_history(conn, cycle=None):
 
 
 def _shared_cash(conn, cycle_id=None):
-    return PSC.shared_cash(_shared_account_rows(conn, cycle_id), num_fn=_num)
+    if cycle_id is None:
+        cycle_id = _active_cycle(conn)["id"]
+    return PSC.cycle_shared_cash(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS, num_fn=_num)
 
 
 def _pending_buy_reservations(conn, cycle_id=None, exclude_order_key=None):
@@ -5291,7 +5291,7 @@ def _new_entry_price_gate(account, pick, quote=None):
     return True, None
 
 
-def _attach_candidate_financial_disclosure(picks, asof_date):
+def _attach_candidate_financial_disclosure(picks, asof_date, *, shared_inputs=None):
     """Attach point-in-time disclosure evidence to the *actual* candidates.
 
     The finance endpoint provides report periods but not publication times.  We
@@ -5315,7 +5315,11 @@ def _attach_candidate_financial_disclosure(picks, asof_date):
         summary["reason"] = "披露时间模块不可用；保留财报数值但不作为点时已证实证据"
         return picks, summary
     try:
-        records = DT.fetch_disclosure_timeline(codes, asof=asof_date)
+        if shared_inputs is None:
+            records = DT.fetch_disclosure_timeline(codes, asof=asof_date)
+        else:
+            records = shared_inputs.disclosures(
+                codes, asof=asof_date, loader=DT.fetch_disclosure_timeline)
     except Exception as exc:
         summary["reason"] = f"披露时间源本轮不可用：{type(exc).__name__}"
         return picks, summary
@@ -6197,7 +6201,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             _ignition_shadow_store(shadow_rows)
     picks = entry_screened
     with PTM.phase("candidate.disclosures"):
-        picks, financial_evidence = _attach_candidate_financial_disclosure(picks, asof_date)
+        picks, financial_evidence = _attach_candidate_financial_disclosure(
+            picks, asof_date, shared_inputs=shared_inputs)
     if style == "pullback" and spec.get("selection_mode") != "dsl":
         # PR-35：声明式策略的候选不经内置风格池（其字段语义来自内置
         # 模型的 pick 负载）；DSL 门在选股层已判定，直接进入执行审批。
@@ -7698,6 +7703,7 @@ def generate_signals(asof_date=None):
     research_snapshots = {}
     all_names = {}
     all_codes = set()
+    shared_inputs = PCScan.CandidateScanInputs(F.live_snapshot_asof())
     for account in accounts:
         research_kwargs = {}
         if account["id"] == "tq_breakout":
@@ -7706,6 +7712,7 @@ def generate_signals(asof_date=None):
         candidates, meta = _candidate_rows(
             account, day, market, sector_rows=sector_rows,
             live_universe=close_universe or None,
+            shared_inputs=shared_inputs,
             **research_kwargs,
         )
         candidate_batches.append((account, candidates, meta))
@@ -7925,9 +7932,11 @@ def backfill_research_shadow(asof_date=None):
     }
     with _db() as conn:
         accounts = _active_account_rows(conn, status="running")
+        shared_inputs = PCScan.CandidateScanInputs(F.live_snapshot_asof())
         for account in accounts:
             candidates, meta = _candidate_rows(
                 account, day, market, sector_rows=sector_rows, live_universe=close_universe,
+                shared_inputs=shared_inputs,
             )
             meta = dict(meta or {})
             meta["research_backfill"] = True
@@ -14149,228 +14158,6 @@ def _account_metric_inputs(conn, account_ids, today):
     return PRP.account_metric_inputs(conn, account_ids, _date(today).isoformat())
 
 
-def _legacy_account_metrics(conn, account, quotes=None, positions=None, metric_cache=None, allow_network=True):
-    # Orphan accounts (removed from ACCOUNT_SPECS but still present in the
-    # ledger) must not crash the whole dashboard.
-    spec = ACCOUNT_SPECS.get(account["id"]) or {"entry_model_name": str(account.get("id") or "unknown")}
-    profile = _risk_profile(account, conn=conn)
-    if metric_cache is None:
-        nav_row = conn.execute(
-            "SELECT * FROM paper_nav WHERE account_id=? ORDER BY nav_date DESC LIMIT 1",
-            (account["id"],),
-        ).fetchone()
-    else:
-        nav_row = (metric_cache.get("latest_nav") or {}).get(account["id"])
-    positions = positions if positions is not None else _position_rows(conn, account["id"])
-    if quotes is None:
-        quotes = _quotes([p["code"] for p in positions]) if positions else {}
-    missing_valuation_codes = [
-        str(p.get("code")) for p in positions
-        if not isinstance((quotes.get(p["code"]) or {}).get("price"), (int, float))
-    ]
-    valuation_status = (
-        "cost_fallback" if missing_valuation_codes
-        else str((nav_row["quote_status"] if nav_row and "quote_status" in nav_row.keys() else None) or "verified")
-    )
-    position_value = sum(
-        _num((quotes.get(p["code"]) or {}).get("price"), _num(p["cost"])) * _num(p["qty"])
-        for p in positions
-    )
-    today = dt.date.today().isoformat()
-    if metric_cache is None:
-        # 直查分支与缓存分支必须产出**同一批**已验证成交：两处各写一份 SQL 会让
-        # trade_count / realized_pnl / 胜率随调用方是否传 cache 而漂移（同一账户
-        # 同一时刻出现两个执行绩效）。统一走仓储的已验证卖出投影。
-        sells = list(
-            (
-                _account_metric_inputs(conn, [account["id"]], today).get("sells") or {}
-            ).get(account["id"], [])
-        )
-    else:
-        sells = list((metric_cache.get("sells") or {}).get(account["id"], []))
-    # A strategy may have sold its last position today.  In that case the
-    # current-position quote list is empty, but today's realized attribution
-    # still needs the sold symbols' live quotes (for the previous-close
-    # baseline).  Fetch them explicitly instead of treating an empty holding
-    # list as "no daily P&L".
-    sell_codes = {
-        str(order.get("code") or "") for order in sells
-        if order.get("code") and str(order.get("executed_at") or order.get("created_at") or "")[:10] == today
-    }
-    missing_sell_codes = sorted(code for code in sell_codes if code not in quotes)
-    if missing_sell_codes and allow_network:
-        quotes = {**quotes, **_quotes(missing_sell_codes)}
-    if metric_cache is None:
-        buy_count = int(conn.execute(
-            "SELECT COUNT(*) FROM paper_fills WHERE account_id=? AND side='buy'",
-            (account["id"],),
-        ).fetchone()[0])
-        rejected = int(conn.execute(
-            "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status!='filled'",
-            (account["id"],),
-        ).fetchone()[0])
-    else:
-        buy_count = int((metric_cache.get("buy_count") or {}).get(account["id"], 0))
-        rejected = int((metric_cache.get("rejected") or {}).get(account["id"], 0))
-    unrealized = sum((_num((quotes.get(p["code"]) or {}).get("price"), _num(p["cost"])) - _num(p["cost"])) * _num(p["qty"]) for p in positions)
-    position_cost_value = sum(_num(p.get("cost")) * _num(p.get("qty")) for p in positions)
-    holding_return_pct = (
-        unrealized / position_cost_value * 100
-        if position_cost_value > 0 else None
-    )
-    # In shared-pool mode an account's cash balance is merely the ledger
-    # bucket used to attribute orders; it is not an independent 100,000 yuan
-    # account.  Therefore NAV - initial_cash is not strategy P&L and can show
-    # artificial losses of tens of thousands when another strategy consumed
-    # the shared cash.  Attribute only actual completed sell P&L plus the
-    # current mark-to-market P&L of this strategy's open lots.
-    realized = sum(_num(order.get("realized_pnl")) for order in sells)
-    strategy_pnl = realized + unrealized
-    ledger_initial_cash = max(0.0, _num(account.get("initial_cash"), 0.0))
-    # A sleeve introduced after a shared-pool cycle begins can have no private
-    # ledger allocation without minting cash into the pool.  Its optional
-    # reference capital is presentation/risk context only; orders still use
-    # the real pooled cash through _shared_account_exposure.
-    initial_cash = _account_reference_capital(account)
-    # In a shared pool, ``cash`` is only a settlement allocation bucket.  It
-    # must never be used as a strategy NAV: another model spending shared cash
-    # would otherwise manufacture a large loss here.  Persisted account NAV,
-    # drawdown, excess return and the headline card therefore all share this
-    # synthetic but fully attributable definition.
-    nav = initial_cash + strategy_pnl
-    if metric_cache is None:
-        navs = [
-            _num(row[0]) for row in conn.execute(
-                "SELECT nav FROM paper_nav WHERE account_id=? ORDER BY nav_date",
-                (account["id"],),
-            ).fetchall()
-        ]
-    else:
-        navs = [_num(value) for value in (metric_cache.get("navs") or {}).get(account["id"], [])]
-    if ledger_initial_cash <= 0 < initial_cash:
-        # Existing zero NAV snapshots belong to the late-join bookkeeping
-        # state, not a real loss.  Rebase only this sleeve's synthetic series;
-        # the persisted shared-pool NAV is deliberately untouched.
-        navs = [initial_cash if abs(value) < 0.01 else value for value in navs]
-    if not navs or abs(navs[-1] - nav) > 0.01:
-        navs.append(nav)
-    else:
-        navs[-1] = nav
-    peak = navs[0] if navs else nav
-    dd = 0.0
-    for value in navs:
-        peak = max(peak, value)
-        dd = min(dd, value / peak - 1 if peak else 0)
-    wins = [order for order in sells if _num(order.get("realized_pnl")) > 0]
-    losses = [order for order in sells if _num(order.get("realized_pnl")) < 0]
-    win_rate = len(wins) / len(sells) * 100 if sells else None
-    gain = sum(_num(order.get("realized_pnl")) for order in wins)
-    loss = abs(sum(_num(order.get("realized_pnl")) for order in losses))
-    benchmark = None
-    if nav_row and nav_row["benchmark"] and account.get("benchmark_start"):
-        benchmark = nav_row["benchmark"] / account["benchmark_start"] - 1
-    market_session = _market_session()
-    if metric_cache is None:
-        previous_nav_row = conn.execute(
-            "SELECT nav,nav_date FROM paper_nav WHERE account_id=? AND nav_date<? ORDER BY nav_date DESC LIMIT 1",
-            (account["id"], today),
-        ).fetchone()
-    else:
-        previous_nav_row = (metric_cache.get("previous_nav") or {}).get(account["id"])
-    # Today's strategy attribution is also independent of the shared cash
-    # bucket: open-position mark-to-market change plus today's completed sell
-    # P&L.  This prevents a cash transfer from appearing as +/- 10,000 yuan.
-    today_position_pnl = 0.0
-    today_position_base = 0.0
-    today_has_quote = False
-    for position in positions:
-        quote = quotes.get(position["code"]) or {}
-        price = _num(quote.get("price"), _num(position.get("cost")))
-        pnl, _pct, baseline = _today_position_performance(position, price, quote, today)
-        if pnl is not None:
-            today_has_quote = True
-            today_position_pnl += _num(pnl)
-            today_position_base += _num(baseline)
-    today_sells = [
-        order for order in sells
-        if str(order.get("executed_at") or order.get("created_at") or "")[:10] == today
-    ]
-    today_sell = _today_sell_performance(today_sells, quotes, today)
-    today_sell_pnl = today_sell["pnl"]
-    today_sell_available = today_sell["covered"] == today_sell["total"]
-    # Daily P&L is available when either an open holding was marked or there
-    # was a completed sell today.  Previously ``today_has_quote`` was required
-    # unconditionally, so a strategy that fully exited showed an em dash even
-    # though its realized loss/profit was known.
-    today_activity = today_has_quote or today_sell["total"] > 0
-    today_pnl = (
-        (today_position_pnl if today_has_quote else 0.0) + today_sell_pnl
-        if market_session["today_pnl_available"] and today_activity and today_sell_available
-        else None
-    )
-    today_baseline_nav = (
-        (today_position_base if today_has_quote else 0.0) + today_sell["baseline"]
-        if today_pnl is not None else None
-    )
-    today_return_pct = today_pnl / today_baseline_nav * 100 if today_pnl is not None and today_baseline_nav > 0 else None
-    daily_loss_pct = max(0.0, -(today_return_pct or 0.0))
-    return {
-        "id": account["id"], "name": account["name"], "status": account["status"], "cycle_days": account["cycle_days"],
-        "mode": account.get("mode"), "style": account.get("style"),
-        "style_name": ACS.style_name(account.get("style"), account.get("style")),
-        "risk_profile": account.get("risk_profile"),
-        "risk_profile_name": profile.get("name", account.get("risk_profile")),
-        "entry_model_name": spec["entry_model_name"],
-        "risk_limits": {
-            "max_weight_pct": round(profile["max_weight"] * 100, 1),
-            "max_exposure_pct": round(profile["max_exposure"] * 100, 1),
-            "max_industry_pct": round(profile["max_industry"] * 100, 1),
-            "single_risk_pct": round(profile["single_risk"] * 100, 2),
-            "daily_loss_pct": round(profile["daily_loss"] * 100, 1),
-            "drawdown_pct": round(profile["drawdown"] * 100, 1),
-        },
-        "version": account["version"], "params": _loads(account.get("params"), {}),
-        "initial_cash": round(initial_cash, 2), "cash": account["cash"],
-        "ledger_initial_cash": round(ledger_initial_cash, 2),
-        "capital_allocation_mode": "shared_pool_reference" if ledger_initial_cash <= 0 < initial_cash else "shared_pool_ledger",
-        "shared_pool_reference_capital": round(initial_cash, 2) if ledger_initial_cash <= 0 < initial_cash else None,
-        "cash_allocation_bucket": round(_num(account["cash"]), 2),
-        "strategy_synthetic_nav": round(nav, 2),
-        "nav": round(nav, 2), "return_pct": round(strategy_pnl / initial_cash * 100, 2) if initial_cash > 0 else None,
-        "valuation_status": valuation_status,
-        "valuation_missing_codes": missing_valuation_codes,
-        "benchmark_return_pct": round(benchmark * 100, 2) if benchmark is not None else None,
-        "excess_return_pct": round(((nav / initial_cash - 1) - benchmark) * 100, 2) if benchmark is not None and initial_cash > 0 else None,
-        "max_drawdown_pct": round(dd * 100, 2), "trade_count": buy_count + len(sells),
-        "risk_blocks": rejected,
-        "position_value": round(position_value, 2),
-        "position_cost_value": round(position_cost_value, 2),
-        "holding_return_pct": round(holding_return_pct, 2) if holding_return_pct is not None else None,
-        "fund_utilization_pct": round(position_value / max(nav, 1) * 100, 1),
-        "deployment_limit_pct": round(profile["max_exposure"] * 100, 1),
-        "deployment_remaining": round(max(nav * profile["max_exposure"] - position_value, 0.0), 2),
-        "realized_pnl": round(realized, 2), "unrealized_pnl": round(unrealized, 2),
-        "total_pnl": round(strategy_pnl, 2), "today_pnl": round(today_pnl, 2) if today_pnl is not None else None,
-        "today_return_pct": round(today_return_pct, 2) if today_return_pct is not None else None,
-        "today_pnl_available": today_pnl is not None,
-        "today_pnl_status": (
-            "已清仓，含当日已实现盈亏"
-            if today_pnl is not None and not positions and today_sell["total"] > 0
-            else market_session["label"] if today_pnl is None else ""
-        ),
-        "market_session": market_session["code"],
-        "today_baseline_nav": round(today_baseline_nav, 2) if today_baseline_nav is not None else None,
-        "today_baseline_date": today if today_pnl is not None else (previous_nav_row["nav_date"] if previous_nav_row else None),
-        "today_open_position_pnl": round(today_position_pnl, 2) if today_has_quote else None,
-        "today_sell_pnl": today_sell_pnl if today_sell["covered"] == today_sell["total"] else None,
-        "today_sell_quote_coverage": f"{today_sell['covered']}/{today_sell['total']}",
-        "today_sell_missing_codes": today_sell["missing_codes"],
-        "win_rate_pct": round(win_rate, 1) if win_rate is not None else None,
-        "profit_loss_ratio": round(gain / loss, 2) if loss else (None if not gain else None),
-        "daily_loss_pct": round(daily_loss_pct, 2),
-    }
-
-
 def _shared_metrics(conn, cycle, positions, quotes):
     """Portfolio-level view: strategies remain separate decisions, capital is one pool."""
     initial = _shared_initial_cash(conn, cycle)
@@ -14927,7 +14714,18 @@ def _risk_base_dashboard():
         cycle = dict(cycle)
         account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=today, readonly=True)
-        codes = sorted({str(position.get("code")) for position in positions if position.get("code")})
+        metric_cache = _account_metric_inputs(
+            conn, [row["id"] for row in account_rows], today
+        )
+        # Today's fully exited holdings also need a cached quote for their
+        # realized daily contribution; never call a provider from this reader.
+        sold_codes = {
+            str(order.get("code"))
+            for rows in (metric_cache.get("sells") or {}).values()
+            for order in rows
+            if order.get("code") and str(order.get("executed_at") or order.get("created_at") or "")[:10] == today.isoformat()
+        }
+        codes = sorted({str(position.get("code")) for position in positions if position.get("code")} | sold_codes)
         quotes = {}
         try:
             snapshot_rows = dfc.load_market_snapshot_full_cached()
@@ -14952,9 +14750,6 @@ def _risk_base_dashboard():
                ) ORDER BY score ASC,id DESC""",
             (cycle["id"], cycle["id"]),
         )
-        metric_cache = _account_metric_inputs(
-            conn, [row["id"] for row in account_rows], today
-        )
         accounts = [
             _account_metrics(
                 conn, row, quotes=quotes,
@@ -14965,6 +14760,10 @@ def _risk_base_dashboard():
             for row in account_rows
         ]
         shared = _shared_metrics(conn, cycle, positions, quotes)
+        from dashboard_queries import mark_incomplete_daily_loss
+        if mark_incomplete_daily_loss(accounts, shared) and _market_session().get("today_pnl_available"):
+            shared.update(today_pnl=None, today_return_pct=None, today_pnl_available=False,
+                          today_pnl_status="暂无完整行情", today_pnl_source="incomplete_quote_evidence")
         account_names = {account["id"]: account["name"] for account in accounts}
         for position in positions:
             quote = quotes.get(position["code"]) or {}
@@ -15791,612 +15590,40 @@ def install_platform_schedule():
     }
 
 
-# ---------------------------------------------------------------------------
-# R27-B2C-7 —— paper runtime attempt（`paper_job_runs`）的 typed owner fact
-# ---------------------------------------------------------------------------
-#
-# 契约之前，research 侧在 incident_triage 里读的是 **裸行**：
-#
-#     SELECT slot,market_date,status,detail,started_at,finished_at
-#       FROM paper_jobs WHERE status NOT IN ('completed','success')
-#
-# 于是 `deepseek_research` 必须自己解释"这一行是 current slot state 还是某次 attempt"、
-# "market_date 能不能当失败被知悉的时刻"。本段把这两个问题还给 owner。
-#
-# ────────────── 为什么是 `paper_job_runs`（attempt 级）而不是 `paper_jobs` ──────────────
-#
-# `paper_jobs` 的 PK 是 `(slot, market_date)` —— **每天每 slot 只有一行**，retry 会把
-# `failed` 物理覆盖成 `running`（`:13613`），旧失败**不复存在**。它是 current slot state，
-# **不是** attempt ledger。用当前行解释历史时点就是倒填。
-#
-# `paper_job_runs` 的 PK 是 `run_key = intraday:YYYYMMDDHHMM`（`_intraday_business_key:358`，
-# 三分钟窗口），identity 属于**attempt 窗口**而不是"今天这个 slot"。本段因此只发布
-# attempt 级事实。
-#
-# ────────────── writer 审计（闭集来自真实写路径） ──────────────
-#
-# `paper_job_runs` 的生产 writer 只有本模块一个：
-#
-#     INSERT running          :13587
-#     UPDATE → failed         :13534（stale row 回收）/ :1521（_recover_stale_runtime_state）
-#                             / :13751（异常路径）
-#     UPDATE → running        :13593（retry；输入 `status IN ('failed','interrupted')`）
-#     UPDATE → completed      :13732
-#     UPDATE heartbeat        :13656（只动 heartbeat_at / expires_at / fencing_token）
-#
-# 写侧字面量 = `running` / `completed` / `failed`。
-#
-# ────────────── 三条分离 ──────────────
-#
-#     runtime lifecycle status（running / completed / failed）  ≠ owner fact verification
-#     incident severity（critical / high / …）                  ≠ owner fact verification
-#     业务拒绝 / 风控拒单                                        ≠ 系统事故（见 paper_orders）
-#
-# `completed` **不是** `verified`，`failed` 也**不是** `unverified`：一个 `failed` 事实
-# 只要 owner 能证明记录，就是 owner-verified 的**事实**。`verified` 的意思是
-# "这个事实可信"，不是"任务成功"。
-
-PAPER_JOB_RUN_FACT_CONTRACT_VERSION = "paper-job-run-runtime-fact-v1"
-
-PAPER_JOB_RUN_RECORD_KIND = "paper_job_run"
-
-#: owner 自己能签发的 runtime lifecycle status 闭集。**不是**核验词表。
-PAPER_JOB_RUN_LIFECYCLE_STATUSES = ("running", "completed", "failed")
-
-#: retry CAS 接受的**输入**词汇（`:13548` / `:13597`），但**当前没有任何 production
-#: writer 会写出它**（旧版本留下的行可能存在）。因为它没有对应的写路径，owner 无法定义
-#: 它的时间戳形状，所以它**不在**可签发闭集里：读到这样一行时 `paper_job_run_fact`
-#: 返回 ``None``（UNAVAILABLE），而不是猜一个可用瞬间。
-PAPER_JOB_RUN_LEGACY_READONLY_STATUSES = ("interrupted",)
-
-#: 终态 status：owner 的终态写入（`:13732` / `:13751` / `:13534` / `:1521`）把
-#: `finished_at` 写成**写入瞬间**，因此终态可用性可证。
-PAPER_JOB_RUN_TERMINAL_STATUSES = ("completed", "failed")
-
-#: 非终态：行只声明"这一轮正在跑"，其**可用瞬间**是 `started_at`。
-PAPER_JOB_RUN_IN_PROGRESS_STATUSES = ("running",)
-
-#: owner 签发的**极小** factual verification 闭集。两态，与 lifecycle status 词表
-#: **零交集**，与 adaptive runtime 的闭集也**零交集**。
-#:
-#: * ``paper_job_run_recorded``：owner 能证明这条 attempt 记录是**它自己签发**的、
-#:   status 属于它的闭集、且终态/进行中的时间戳形状自洽。含义**仅**是"这是一条可靠的
-#:   owner runtime 事实"，**不是**"这个 job 成功"、**不是**"这是系统事故"。
-#: * ``paper_job_run_unproven``：记录可读，但 owner **无法自证**它的时间戳形状。
-#:   它仍然是一条事实，但 owner 不为它背书。
-PAPER_JOB_RUN_FACT_RECORDED = "paper_job_run_recorded"
-PAPER_JOB_RUN_FACT_OWNER_UNPROVEN = "paper_job_run_unproven"
-PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES = (
-    PAPER_JOB_RUN_FACT_RECORDED, PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
+# Compatibility aliases: the lower read-only owner holds the same exact types
+# and functions; existing callers do not receive a second fact contract.
+from paper_runtime_facts import (
+    PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS as PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS,
+    PAPER_JOB_RUN_AVAILABILITY_KINDS as PAPER_JOB_RUN_AVAILABILITY_KINDS,
+    PAPER_JOB_RUN_AVAILABILITY_TERMINAL as PAPER_JOB_RUN_AVAILABILITY_TERMINAL,
+    PAPER_JOB_RUN_FACT_CONTRACT_VERSION as PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
+    PAPER_JOB_RUN_FACT_OWNER_UNPROVEN as PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
+    PAPER_JOB_RUN_FACT_RECORDED as PAPER_JOB_RUN_FACT_RECORDED,
+    PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES as PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES,
+    PAPER_JOB_RUN_IN_PROGRESS_STATUSES as PAPER_JOB_RUN_IN_PROGRESS_STATUSES,
+    PAPER_JOB_RUN_LEGACY_READONLY_STATUSES as PAPER_JOB_RUN_LEGACY_READONLY_STATUSES,
+    PAPER_JOB_RUN_LIFECYCLE_STATUSES as PAPER_JOB_RUN_LIFECYCLE_STATUSES,
+    PAPER_JOB_RUN_RECORD_KIND as PAPER_JOB_RUN_RECORD_KIND,
+    PAPER_JOB_RUN_TERMINAL_STATUSES as PAPER_JOB_RUN_TERMINAL_STATUSES,
+    PaperJobRunFactProjection as PaperJobRunFactProjection,
+    PaperJobRuntimeFactError as PaperJobRuntimeFactError,
+    _PAPER_JOB_INSTANT_FORMAT as _PAPER_JOB_INSTANT_FORMAT,
+    _PAPER_JOB_RUN_REQUIRED_COLUMNS as _PAPER_JOB_RUN_REQUIRED_COLUMNS,
+    _PAPER_RUNTIME_OWNER_TZ as _PAPER_RUNTIME_OWNER_TZ,
+    _PAPER_RUNTIME_OWNER_TZ_NAME as _PAPER_RUNTIME_OWNER_TZ_NAME,
+    _paper_job_run_availability_kind as _paper_job_run_availability_kind,
+    _paper_job_run_fact_verification_status as _paper_job_run_fact_verification_status,
+    _paper_runtime_business_day as _paper_runtime_business_day,
+    _paper_runtime_canonical_detail as _paper_runtime_canonical_detail,
+    _paper_runtime_canonical_json as _paper_runtime_canonical_json,
+    _paper_runtime_owner_day as _paper_runtime_owner_day,
+    _paper_runtime_owner_instant as _paper_runtime_owner_instant,
+    _paper_runtime_owner_tz as _paper_runtime_owner_tz,
+    _paper_runtime_row_dict as _paper_runtime_row_dict,
+    _paper_runtime_strict_mapping as _paper_runtime_strict_mapping,
+    paper_job_run_fact as paper_job_run_fact,
+    paper_job_run_facts as paper_job_run_facts,
 )
-
-#: 这条事实的可用瞬间是**哪一类**。进指纹，因此"把 `market_date` 或 `started_at` 当成
-#: 终态可用性"不可能只靠读侧疏忽发生。
-PAPER_JOB_RUN_AVAILABILITY_TERMINAL = "terminal"
-PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS = "in_progress"
-PAPER_JOB_RUN_AVAILABILITY_KINDS = (
-    PAPER_JOB_RUN_AVAILABILITY_TERMINAL, PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS,
-)
-
-#: 调度器时间戳的**owner 声明的**历史格式：服务器本地时间的裸
-#: ``%Y-%m-%d %H:%M:%S``（`_now:905`），而生产容器的时区由
-#: ``TZ=Asia/Shanghai``（`Dockerfile` / `docker-compose.yml`）与
-#: ``deploy/install-centos9.sh`` 的 ``timedatectl set-timezone Asia/Shanghai`` 固定，
-#: `_market_session:914` 也逐字声明"生产环境为 Asia/Shanghai"。
-#:
-#: 因此这是一个**owner 明确拥有并一致使用**的 legacy 契约，而不是"naive 就当本地时间"
-#: 的默认猜测。`_PAPER_JOB_INSTANT_FORMAT` 之外的一切（含带 offset 的 ISO、date-only、
-#: 其它分隔符）都 fail closed —— 见 :func:`_paper_runtime_owner_instant`。
-_PAPER_JOB_INSTANT_FORMAT = "%Y-%m-%d %H:%M:%S"
-_PAPER_RUNTIME_OWNER_TZ_NAME = "Asia/Shanghai"
-
-try:  # pragma: no cover - 只在 tzdata 缺失时
-    _PAPER_RUNTIME_OWNER_TZ = ZoneInfo(_PAPER_RUNTIME_OWNER_TZ_NAME)
-except Exception:
-    _PAPER_RUNTIME_OWNER_TZ = None
-
-#: typed 读侧要求的**必需归一列**。
-_PAPER_JOB_RUN_REQUIRED_COLUMNS = (
-    "run_key", "slot", "market_date", "status", "detail",
-    "started_at", "finished_at", "owner_key", "fencing_token",
-)
-
-
-class PaperJobRuntimeFactError(ValueError):
-    """typed paper job attempt fact 读侧的 **fail closed** 拒绝（坏 JSON / 缺列 / 非法时间戳）。"""
-
-
-def _paper_runtime_owner_tz(*, what: str):
-    if _PAPER_RUNTIME_OWNER_TZ is None:  # pragma: no cover - 只在 tzdata 缺失时
-        raise PaperJobRuntimeFactError(
-            f"{what}: owner timezone ({_PAPER_RUNTIME_OWNER_TZ_NAME}) unavailable — "
-            "拒绝派生业务日（naive 时间戳的归属只能由 owner 的时区证明）"
-        )
-    return _PAPER_RUNTIME_OWNER_TZ
-
-
-def _paper_runtime_owner_instant(value: Any, *, what: str) -> dt.datetime:
-    """调度器时间戳 → Asia/Shanghai 的 aware 瞬间；其它形状一律 fail closed。
-
-    **不接受**带 offset 的 ISO：那意味着这行不是本 owner 的正常写路径产物。也**不接受**
-    date-only —— 它会被静默当成"当天 00:00 可用"，正是本层要杜绝的猜测。naive 时间戳
-    之所以可接受，仅仅因为 `_PAPER_JOB_INSTANT_FORMAT` 是 owner 自己声明并一致使用的
-    容器本地（Asia/Shanghai）格式。
-    """
-    text = str(value or "").strip()
-    if not text:
-        raise PaperJobRuntimeFactError(f"{what} is required for a typed paper job attempt fact")
-    try:
-        parsed = dt.datetime.strptime(text, _PAPER_JOB_INSTANT_FORMAT)
-    except ValueError as exc:
-        raise PaperJobRuntimeFactError(
-            f"{what} must be the owner runner's naive "
-            f"'{_PAPER_JOB_INSTANT_FORMAT}' timestamp; got {text!r} — "
-            "其它形状（带 offset / date-only / 其它分隔符）无法证明可用瞬间"
-        ) from exc
-    return parsed.replace(tzinfo=_paper_runtime_owner_tz(what=what))
-
-
-def _paper_runtime_owner_day(instant: dt.datetime, *, what: str) -> str:
-    """owner 时区（Asia/Shanghai）归一后的业务日。"""
-    return instant.astimezone(_paper_runtime_owner_tz(what=what)).date().isoformat()
-
-
-def _paper_runtime_business_day(value: Any, *, what: str) -> str:
-    text = str(value or "").strip()
-    try:
-        parsed = dt.date.fromisoformat(text)
-    except ValueError as exc:
-        raise PaperJobRuntimeFactError(
-            f"{what} requires an explicit canonical YYYY-MM-DD business day; got {value!r}"
-        ) from exc
-    if parsed.isoformat() != text:
-        raise PaperJobRuntimeFactError(f"{what} is not canonical: {value!r}")
-    return text
-
-
-def _paper_runtime_strict_mapping(value: Any, *, what: str) -> dict:
-    """严格 JSON parse + 顶层必须是 object。坏 JSON → fail closed（绝不 ``{}``）。
-
-    `paper_jobs` / `paper_job_runs` 的 `detail` 由 `_json:943` 写入，而它在遇到
-    不可序列化对象时会 ``default=str`` —— 因此"能被读回"并不等于"内容完好"。
-    把 malformed JSON 变成空对象，等于把"这条记录损坏了"伪装成"这条记录没有 detail"。
-
-    SQL ``NULL`` **不**走这里：owner 的 `running` INSERT（`:13587`）刻意不写 `detail`
-    列，因此 NULL 是合法形状，由 :func:`_paper_runtime_canonical_detail` 单独处理。
-    """
-    if value is None or (isinstance(value, str) and not value.strip()):
-        raise PaperJobRuntimeFactError(f"{what} is empty — 缺内容不是空对象")
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except (TypeError, ValueError) as exc:
-        raise PaperJobRuntimeFactError(f"{what} is not parsable JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise PaperJobRuntimeFactError(
-            f"{what} must parse to a JSON object; got {type(parsed).__name__}"
-        )
-    return parsed
-
-
-def _paper_runtime_canonical_json(value: Any, *, what: str) -> str:
-    try:
-        return json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise PaperJobRuntimeFactError(f"{what} is not canonically serializable: {exc}") from exc
-
-
-def _paper_runtime_canonical_detail(value: Any, *, what: str) -> str:
-    """`detail` 列 → canonical JSON 文本。
-
-    SQL ``NULL`` / 全空白是 owner 的**合法** in-progress 形状（`running` 的 INSERT 不写该
-    列），归一成 JSON 字面量 ``null`` —— 刻意**不是** ``{}``：``null`` 表示"owner 还没有写
-    detail"，``{}`` 表示"owner 写了空对象"，两者不是同一件事。其余坏 JSON 一律 fail closed。
-    """
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return "null"
-    if isinstance(value, str) and value.strip() == "null":
-        return "null"
-    return _paper_runtime_canonical_json(_paper_runtime_strict_mapping(value, what=what), what=what)
-
-
-def _paper_runtime_row_dict(cursor, row) -> dict:
-    """把一行转成 dict，**对行形状自适应**（与 ``execution_verification._row_as_dict`` 同手法）。
-
-    生产读路径是 ``sqlite3.Row``（有 ``keys()``），迁移 / 运维入口是裸 tuple
-    （只能借 ``cursor.description`` 配列名）。行形状是**调用方**的事实。
-    """
-    if hasattr(row, "keys"):
-        return dict(row)
-    columns = [item[0] for item in (getattr(cursor, "description", None) or ())]
-    return dict(zip(columns, row, strict=True))
-
-
-def _paper_job_run_availability_kind(runtime_status: str) -> str | None:
-    """owner 能否为这个 status **证明**一个可用瞬间；不能则 ``None``（不可签发）。
-
-    * `completed` / `failed` → ``terminal``；
-    * `running` → ``in_progress``（可用瞬间 = `started_at`）；
-    * 其余（含 legacy 只读的 `interrupted` 与**任何**不在闭集里的 status）→ ``None``。
-
-    未知 status 一并走这里，因此"新增一个 status 却没人决定它的可用性语义"不会静默
-    落进某个默认分支被当成已记录事实 —— 它直接不可签发。
-    """
-    if runtime_status in PAPER_JOB_RUN_TERMINAL_STATUSES:
-        return PAPER_JOB_RUN_AVAILABILITY_TERMINAL
-    if runtime_status in PAPER_JOB_RUN_IN_PROGRESS_STATUSES:
-        return PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS
-    return None
-
-
-def _paper_job_run_fact_verification_status(
-    *, runtime_status: str, availability_kind: str,
-    started_at: dt.datetime, finished_at: dt.datetime | None,
-) -> str:
-    """owner 自洽性 → 极小 factual verification 闭集。
-
-    * status 必须落在 owner 的 lifecycle 闭集内；
-    * **终态**行必须有 `finished_at` 且 `finished_at >= started_at`；
-    * **进行中**行必须**没有** `finished_at` —— 这是 owner 的形状（INSERT 不写该列、
-      retry 显式置 NULL）；一个 `running` 行若带着终态瞬间，owner 无法自证它。
-
-    刻意**不看** status 的"好坏"：`failed` 与 `completed` 都可以是
-    ``paper_job_run_recorded`` —— 见本段开头的三条分离。
-    """
-    if runtime_status not in PAPER_JOB_RUN_LIFECYCLE_STATUSES:
-        return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-    if availability_kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL:
-        if finished_at is None or finished_at < started_at:
-            return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-        return PAPER_JOB_RUN_FACT_RECORDED
-    if availability_kind == PAPER_JOB_RUN_AVAILABILITY_IN_PROGRESS:
-        if finished_at is not None:
-            return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-        return PAPER_JOB_RUN_FACT_RECORDED
-    return PAPER_JOB_RUN_FACT_OWNER_UNPROVEN
-
-
-@dataclasses.dataclass(frozen=True)
-class PaperJobRunFactProjection:
-    """**paper runtime scheduler 自己签发**的一次 attempt 事实 —— 不可变快照。
-
-    identity 由 ``<run_key>@<started_at>|<finished_at>`` 构成。`run_key` 只是**窗口**
-    身份（同一窗口的 retry 会改写同一行），因此 revision identity 必须带上两个时间戳：
-    每一次**改变事实内容**的改写都会推进 `started_at`（retry）或 `finished_at`（终态写入）
-    中的至少一个，而租约心跳两个都不动。于是"内容一变 identity 就变"，同时心跳不会把
-    同一条事实变成多条。
-
-    ``availability_kind`` / ``availability_day`` 是 owner 的显式声明：业务日只从
-    **可用瞬间**按 owner 时区（Asia/Shanghai）派生，**不**从 `market_date`
-    （那是"这次任务属于哪个交易日"的业务标签，D 日失败可能要 D 15:30 甚至 D+1 的回收
-    扫描才被系统知道），也**不**从 `started_at`（当它是终态时）。
-
-    ``heartbeat_at`` / ``expires_at`` **不在**本投影里：它们是租约上下文，**不是**事实。
-    "租约过期"本身**不**等于失败 —— 本层不做这个转换。
-
-    本投影**不复制执行 authority**：订单是否成交、是否被风控拒绝、not_executed / partial
-    全部继续归 ``execution_owner``（`ExecutionFactProjection`）。本层只说
-    "某次 runtime attempt 的当前记录是什么"。
-
-    **本投影不回答事故问题。** 它可以说"job close/D 的这一次尝试终态是 failed"，
-    **不能**说"根因是数据源故障"、"严重级别 high"、"需要重跑"、"数据已损坏"。
-
-    已知限制：contract-issued ≠ physical database origin；
-    physical provenance 仍是 OPEN / REQUIRED（与 B2C-3~B2C-6 一致）。
-    """
-
-    version: str
-    record_kind: str
-    run_key: str
-    slot: str
-    market_date: str
-    runtime_status: str
-    detail_canonical: str
-    started_at: str
-    finished_at: str | None
-    owner_key: str | None
-    fencing_token: int
-    availability_kind: str
-    availability_day: str
-    fact_verification_status: str
-    content_fingerprint: str = ""
-
-    def __post_init__(self) -> None:
-        record_kind = str(self.record_kind or "").strip()
-        if record_kind != PAPER_JOB_RUN_RECORD_KIND:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job attempt record_kind: {record_kind!r}; "
-                f"allowed: {PAPER_JOB_RUN_RECORD_KIND!r}"
-            )
-        object.__setattr__(self, "record_kind", record_kind)
-        object.__setattr__(
-            self, "version", str(self.version or "").strip() or PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
-        )
-        for name in ("run_key", "slot"):
-            text = str(getattr(self, name) or "").strip()
-            if not text:
-                raise PaperJobRuntimeFactError(f"paper job attempt fact requires {name}")
-            object.__setattr__(self, name, text)
-        object.__setattr__(
-            self, "market_date",
-            _paper_runtime_business_day(self.market_date, what="paper job attempt market_date"),
-        )
-
-        runtime_status = str(self.runtime_status or "").strip()
-        if runtime_status not in PAPER_JOB_RUN_LIFECYCLE_STATUSES:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job runtime lifecycle status: {runtime_status!r}; "
-                f"allowed: {PAPER_JOB_RUN_LIFECYCLE_STATUSES}"
-            )
-        object.__setattr__(self, "runtime_status", runtime_status)
-
-        detail_canonical = str(self.detail_canonical or "")
-        canonical = _paper_runtime_canonical_detail(detail_canonical, what="paper job attempt detail")
-        if canonical != detail_canonical:
-            raise PaperJobRuntimeFactError(
-                "paper job attempt detail is not canonical — 事实内容必须能确定性重算指纹"
-            )
-
-        started_at = _paper_runtime_owner_instant(
-            self.started_at, what="paper job attempt started_at",
-        )
-        object.__setattr__(self, "started_at", started_at.strftime(_PAPER_JOB_INSTANT_FORMAT))
-        finished_at = None
-        if self.finished_at is not None:
-            finished_at = _paper_runtime_owner_instant(
-                self.finished_at, what="paper job attempt finished_at",
-            )
-            object.__setattr__(
-                self, "finished_at", finished_at.strftime(_PAPER_JOB_INSTANT_FORMAT),
-            )
-        else:
-            object.__setattr__(self, "finished_at", None)
-
-        owner_key = self.owner_key
-        if owner_key is not None:
-            owner_key = str(owner_key).strip() or None
-        object.__setattr__(self, "owner_key", owner_key)
-        if isinstance(self.fencing_token, bool) or not isinstance(self.fencing_token, int):
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt fencing_token must be an int, got {self.fencing_token!r}"
-            )
-        if self.fencing_token < 0:
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt fencing_token must not be negative, got {self.fencing_token}"
-            )
-
-        kind = str(self.availability_kind or "").strip()
-        if kind not in PAPER_JOB_RUN_AVAILABILITY_KINDS:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job attempt availability_kind: {kind!r}; "
-                f"allowed: {PAPER_JOB_RUN_AVAILABILITY_KINDS}"
-            )
-        if kind != _paper_job_run_availability_kind(runtime_status):
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt availability_kind {kind!r} disagrees with the status "
-                f"{runtime_status!r} — 可用瞬间的种类只能由 owner 从 status 派生"
-            )
-        if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL and finished_at is None:
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt claims terminal status {runtime_status!r} but carries no "
-                "finished_at — 终态记录没有终态瞬间，owner 无法证明它何时可用"
-            )
-        object.__setattr__(self, "availability_kind", kind)
-
-        day = _paper_runtime_business_day(
-            self.availability_day, what="paper job attempt availability_day",
-        )
-        instant = finished_at if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL else started_at
-        expected = _paper_runtime_owner_day(instant, what="paper job attempt availability instant")
-        if day != expected:
-            raise PaperJobRuntimeFactError(
-                f"paper job attempt availability_day {day} disagrees with the owner-timezone "
-                f"day derived from the {kind} instant ({expected}) — 业务日只能由 owner 派生"
-            )
-
-        status = str(self.fact_verification_status or "").strip()
-        if status not in PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES:
-            raise PaperJobRuntimeFactError(
-                f"unknown paper job attempt fact verification status: {status!r}; "
-                f"allowed: {PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES}"
-            )
-        expected_status = _paper_job_run_fact_verification_status(
-            runtime_status=runtime_status, availability_kind=kind,
-            started_at=started_at, finished_at=finished_at,
-        )
-        if status != expected_status:
-            raise PaperJobRuntimeFactError(
-                "paper job attempt fact_verification_status disagrees with owner-derived "
-                "verification from factual fields"
-            )
-        object.__setattr__(self, "fact_verification_status", expected_status)
-        object.__setattr__(self, "content_fingerprint", self._fingerprint())
-
-    @property
-    def revision_identity(self) -> str:
-        return f"{self.run_key}@{self.started_at}|{self.finished_at or 'unfinished'}"
-
-    @property
-    def identity(self) -> tuple[str, str, str]:
-        return (self.record_kind, self.revision_identity, self.availability_day)
-
-    @property
-    def runtime_status_is_verification(self) -> bool:
-        """**恒为** ``False``：lifecycle status 与 fact verification 是两个维度。"""
-        return False
-
-    @property
-    def detail(self) -> dict | None:
-        """owner 写的 detail；``None`` 表示 owner 尚未写 detail（不是"空对象"）。"""
-        return json.loads(self.detail_canonical)
-
-    def _fingerprint(self) -> str:
-        payload = {
-            "version": self.version,
-            "record_kind": self.record_kind,
-            "run_key": self.run_key,
-            "slot": self.slot,
-            "market_date": self.market_date,
-            "runtime_status": self.runtime_status,
-            "detail": self.detail_canonical,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "owner_key": self.owner_key,
-            "fencing_token": self.fencing_token,
-            "availability_kind": self.availability_kind,
-            "availability_day": self.availability_day,
-            "fact_verification_status": self.fact_verification_status,
-        }
-        encoded = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-        )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    def projection(self) -> dict:
-        return {
-            "version": self.version,
-            "record_kind": self.record_kind,
-            "identity": self.revision_identity,
-            "run_key": self.run_key,
-            "slot": self.slot,
-            "market_date": self.market_date,
-            "runtime_status": self.runtime_status,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "owner_key": self.owner_key,
-            "fencing_token": self.fencing_token,
-            "availability_kind": self.availability_kind,
-            "availability_day": self.availability_day,
-            "fact_verification_status": self.fact_verification_status,
-            "content_fingerprint": self.content_fingerprint,
-            "authority": "owner_fact",
-            "runtime_status_is_verification": False,
-        }
-
-
-def paper_job_run_fact(conn, run_key, *, as_of):
-    """把一条 attempt 行读成 typed owner fact。``as_of`` **必须显式**。
-
-    **fail-closed 的可用性语义**（返回 ``None`` = UNAVAILABLE，绝不用别的值代替）：
-
-    * 行不存在；
-    * status 不在 owner 闭集内（含 legacy 只读的 `interrupted`）—— 没有人为它的可用性
-      语义做过决定；
-    * 当前 revision 的可用日**晚于** ``as_of`` —— 旧 revision 已被覆盖后不复存在，
-      **不**倒填历史，也**不**按 `market_date` / `started_at` 回退。
-
-    刻意**没有** ``as_of=None → latest`` / 取墙钟 / 取"今天这个 slot 的当前行"。
-
-    行存在、status 可签发但时间戳形状自洽性不成立 → 返回投影且
-    ``fact_verification_status == paper_job_run_unproven``（"owner fact unproven"），
-    而不是抛错 —— 记录确实存在，只是 owner 不为它背书。终态行**没有** ``finished_at``
-    属于记录损坏，抛 :class:`PaperJobRuntimeFactError`。
-
-    **retry 覆盖语义（必须显式知道）**：同一 `run_key` 的 `failed` 会被 retry 改写成
-    `running`（`finished_at=NULL`）再成 `completed`，旧失败**物理消失**。因此本函数
-    **不可能**从当前行重建那次失败；对早已被覆盖的 as_of 它只能返回 ``None``。
-    非 intraday slot 的同类缺口见 `OPEN PREREQUISITE: append-only attempt identity for
-    non-intraday paper job failures`。
-    """
-    day = _paper_runtime_business_day(as_of, what="paper job attempt fact as_of")
-    cursor = conn.execute("SELECT * FROM paper_job_runs WHERE run_key=?", (str(run_key),))
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    item = _paper_runtime_row_dict(cursor, row)
-    missing = [name for name in _PAPER_JOB_RUN_REQUIRED_COLUMNS if name not in item]
-    if missing:
-        raise PaperJobRuntimeFactError(
-            f"paper job run {run_key} is missing required normalized columns: {missing}"
-        )
-
-    runtime_status = str(item.get("status") or "").strip()
-    kind = _paper_job_run_availability_kind(runtime_status)
-    if kind is None:
-        return None
-
-    started_at = _paper_runtime_owner_instant(
-        item.get("started_at"), what=f"paper job run {run_key} started_at",
-    )
-    finished_raw = item.get("finished_at")
-    finished_at = None
-    if finished_raw is not None and str(finished_raw).strip():
-        finished_at = _paper_runtime_owner_instant(
-            finished_raw, what=f"paper job run {run_key} finished_at",
-        )
-    if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL and finished_at is None:
-        raise PaperJobRuntimeFactError(
-            f"paper job run {run_key} claims terminal status {runtime_status!r} but carries no "
-            "finished_at — 终态记录没有终态瞬间，owner 无法证明它何时可用"
-        )
-
-    instant = finished_at if kind == PAPER_JOB_RUN_AVAILABILITY_TERMINAL else started_at
-    available_day = _paper_runtime_owner_day(
-        instant, what=f"paper job run {run_key} availability instant",
-    )
-    if available_day > day:
-        return None
-
-    fencing_token = item.get("fencing_token")
-    if isinstance(fencing_token, bool) or not isinstance(fencing_token, int):
-        raise PaperJobRuntimeFactError(
-            f"paper job run {run_key} fencing_token must be an int, got {fencing_token!r}"
-        )
-    owner_key = item.get("owner_key")
-
-    return PaperJobRunFactProjection(
-        version=PAPER_JOB_RUN_FACT_CONTRACT_VERSION,
-        record_kind=PAPER_JOB_RUN_RECORD_KIND,
-        run_key=str(item["run_key"]),
-        slot=str(item.get("slot") or ""),
-        market_date=str(item.get("market_date") or ""),
-        runtime_status=runtime_status,
-        detail_canonical=_paper_runtime_canonical_detail(
-            item.get("detail"), what=f"paper job run {run_key} detail",
-        ),
-        started_at=started_at.strftime(_PAPER_JOB_INSTANT_FORMAT),
-        finished_at=None if finished_at is None else finished_at.strftime(_PAPER_JOB_INSTANT_FORMAT),
-        owner_key=None if owner_key is None else str(owner_key),
-        fencing_token=fencing_token,
-        availability_kind=kind,
-        availability_day=available_day,
-        fact_verification_status=_paper_job_run_fact_verification_status(
-            runtime_status=runtime_status, availability_kind=kind,
-            started_at=started_at, finished_at=finished_at,
-        ),
-    )
-
-
-def paper_job_run_facts(conn, *, as_of, limit=100):
-    """按显式 ``as_of`` 发布可证明的 job attempt typed facts。
-
-    run key 的枚举与 row → projection 的转换都属于 paper runtime owner。非 intraday
-    attempt、被 retry 覆盖的失败 revision 与其他不可证明记录继续由单条读取器返回为
-    unavailable；本 API 不创建历史 ledger。
-    """
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError("paper_job_run_facts limit must be a positive int")
-    size = min(limit, 500)
-    facts = []
-    offset = 0
-    while len(facts) < size:
-        rows = conn.execute(
-            "SELECT run_key FROM paper_job_runs ORDER BY started_at DESC,run_key DESC LIMIT ? OFFSET ?",
-            (min(size, 100), offset),
-        ).fetchall()
-        if not rows:
-            break
-        for row in rows:
-            run_key = row[0] if not hasattr(row, "keys") else row["run_key"]
-            projection = paper_job_run_fact(conn, run_key, as_of=as_of)
-            if projection is not None:
-                facts.append(projection)
-                if len(facts) == size:
-                    break
-        offset += len(rows)
-    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
-    return tuple(facts[:size])
 
 
 # Bind explicit vertical capabilities after all compatibility functions exist.

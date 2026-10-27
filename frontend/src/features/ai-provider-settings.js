@@ -2,7 +2,6 @@ import { apiJson as api } from "../core/api.js";
 import { $ } from "../core/dom.js";
 import { adaptiveEsc as esc } from "../core/format.js";
 import { confirmDialog, toast } from "../ui/dialog.js";
-import { renderSettings, saveAiSlot, testAiSlot } from "./settings.js";
 
 function reviewSettings(){ return ((window._settingsPayload||{}).ai||{}).review||{}; }
 function providers(){ return reviewSettings().providers||[]; }
@@ -48,7 +47,7 @@ export function renderAiSlotCards(review){
 
 function feedback(message){ var node=$('aiProviderFeedback'); if(node) node.textContent=message; }
 
-export function applyAiReviewSettings(review,savedSlot){
+export function applyAiReviewSettings(review,savedSlot,rerender){
   var data=window._settingsPayload||{};
   var previous=reviewSettings(), drafts=[];
   ['ai1','ai2'].forEach(function(slot){
@@ -58,7 +57,7 @@ export function applyAiReviewSettings(review,savedSlot){
       drafts.push({slot:slot,provider:p.value,model:m.value,enabled:e.checked});
     }
   });
-  renderSettings(Object.assign({},data,{ai:Object.assign({},data.ai,{review:review})}));
+  rerender(Object.assign({},data,{ai:Object.assign({},data.ai,{review:review})}));
   drafts.forEach(function(draft){
     $('aiSlot_'+draft.slot+'_provider').value=draft.provider;
     changeAiSlotProvider(draft.slot);
@@ -91,7 +90,7 @@ export function changeAiSlotProvider(slot){
   if(node) node.textContent=p?(!models.length?'请先在提供商中填写或获取模型。':'选择后点击保存生效。'):'';
 }
 
-export async function saveAiProvider(){
+export async function persistAiProvider(onSaved){
   var id=$('aiProviderEditor').value;
   var body={display_name:$('aiProviderName').value.trim(),base_url:$('aiProviderUrl').value.trim(),
     timeout_seconds:Number($('aiProviderTimeout').value),models:$('aiProviderModels').value.split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean)};
@@ -104,7 +103,7 @@ export async function saveAiProvider(){
   feedback('正在保存提供商…');
   try{
     var result=await api('/api/settings/ai-review/providers'+(id?'/'+encodeURIComponent(id):'')+'?confirmed=true',id?'PUT':'POST',body);
-    applyAiReviewSettings(result.review);
+    onSaved(result.review);
     $('aiProviderEditor').value=result.provider.id; editAiProvider();
     feedback('提供商已保存；现在可获取模型，或为 AI1、AI2 选择提供商和模型。');
   }catch(e){ feedback('保存失败：'+e.message); }
@@ -133,12 +132,12 @@ export async function refreshAiProviderModels(){
   finally{ if(button.isConnected) button.disabled=!$('aiProviderEditor').value; }
 }
 
-export async function clearAiProviderKey(){
+export async function clearAiProviderSecret(onSaved){
   var id=$('aiProviderEditor').value; if(!id) return;
   var answer=await confirmDialog({title:'清除该提供商的密钥？',detail:'所有使用该提供商的 AI 都将无法调用；其它提供商保持原状。',confirmText:'清除密钥'});
   if(!answer.approved) return;
   try{
     var result=await api('/api/settings/ai-review/providers/'+encodeURIComponent(id)+'?confirmed=true','PUT',{clear_api_key:true});
-    applyAiReviewSettings(result.review); $('aiProviderEditor').value=id; editAiProvider(); toast('提供商密钥已清除。');
+    onSaved(result.review); $('aiProviderEditor').value=id; editAiProvider(); toast('提供商密钥已清除。');
   }catch(e){ feedback('清除失败：'+e.message); }
 }

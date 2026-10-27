@@ -94,7 +94,7 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
         "backend/adaptive_selection.py": ("selection_candidate_facts", "selection_candidate_fact"),
         "backend/learning_evaluation.py": ("experiment_evaluation_facts", "experiment_evaluation_fact"),
         "backend/adaptive_runtime_facts.py": ("adaptive_run_facts", "reader"),
-        "backend/paper_trading.py": ("paper_job_run_facts", "paper_job_run_fact"),
+        "backend/paper_runtime_facts.py": ("paper_job_run_facts", "paper_job_run_fact"),
     }
     for filename, (function_name, fact_name) in list_specs.items():
         tree = ast.parse(sources.get(filename, ""))
@@ -247,7 +247,7 @@ def _load_sources() -> dict[str, str]:
         "deepseek_research.py", "ai_analysis.py", "adaptive_engine.py", "adaptive_runner.py",
         "adaptive_runtime_facts.py",
         "adaptive_risk.py", "adaptive_selection.py", "learning_evaluation.py",
-        "paper_trading.py", "api_adaptive.py",
+        "paper_trading.py", "paper_runtime_facts.py", "api_adaptive.py",
     )
     for name in names:
         with open(os.path.join(BACKEND, name), encoding="utf-8") as stream:

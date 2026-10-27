@@ -54,6 +54,7 @@ __all__ = [
     "REASON_VISIBLE",
     "REASON_FUTURE",
     "REASON_AVAILABILITY_UNKNOWN",
+    "OBSERVED_UNPROVABLE",
     "REASON_INVALID_TIMESTAMP",
     "REASON_FUTURE_PERIOD",
     "REASON_CODES",
@@ -105,6 +106,8 @@ REASON_VISIBLE = "visible"
 REASON_FUTURE = "future"
 #: 数据没有可信的可用时点，历史模式下**不等于**可用。
 REASON_AVAILABILITY_UNKNOWN = "availability_unknown"
+#: 无法证明来源的观测时间；供可交易性摄取及观察事实共同使用。
+OBSERVED_UNPROVABLE = "unprovable"
 #: 时间戳存在但无法解析；历史模式下不可作为可用性依据。
 REASON_INVALID_TIMESTAMP = "invalid_timestamp"
 #: 数据自身的统计期晚于 ``asof``（例如报告期还没到），它不是可用性证据。

@@ -680,7 +680,11 @@ def _account_card(account, positions, market, shared=None):
             "largest_industry_pct": round(largest_industry_pct, 2),
             "max_industry_pct": _number(limits.get("max_industry_pct"), 0),
             "industry_buffer_pct": round(max(_number(limits.get("max_industry_pct"), 0) - largest_industry_pct, 0), 2),
-            "daily_loss_pct": _number(shared.get("daily_loss_pct"), _number(account.get("daily_loss_pct"))),
+            # An explicit unavailable pool value must not become an account's
+            # stale/zero fallback.  Only older inputs with no pool field use
+            # the account value for compatibility.
+            "daily_loss_pct": (_number(shared.get("daily_loss_pct")) if "daily_loss_pct" in shared
+                               else _number(account.get("daily_loss_pct"))),
             "daily_loss_limit_pct": _number(limits.get("daily_loss_pct"), 0),
             "rolling_drawdown_pct": round(drawdown, 2),
             "drawdown_limit_pct": drawdown_limit,

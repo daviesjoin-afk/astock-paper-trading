@@ -18,6 +18,19 @@ except ImportError:
 
 
 class RiskCenterTests(unittest.TestCase):
+    def test_unknown_pool_daily_loss_does_not_fall_back_to_account_zero(self):
+        account = {"id": "trend_pullback", "name": "test", "status": "running",
+                   "nav": 10000, "daily_loss_pct": 0.0, "risk_limits": {}}
+        market = {"light": "green"}
+        known = RC._account_card(account, [], market, {"nav": 10000, "daily_loss_pct": 3.2})
+        missing = RC._account_card(account, [], market, {"nav": 10000, "daily_loss_pct": None})
+        legacy = RC._account_card(account, [], market, {"nav": 10000})
+        self.assertEqual(known["metrics"]["daily_loss_pct"], 3.2)
+        self.assertIsNone(missing["metrics"]["daily_loss_pct"])
+        self.assertEqual(legacy["metrics"]["daily_loss_pct"], 0.0)
+        self.assertEqual(missing["level"], known["level"])
+        self.assertEqual(missing["trade_permission"], known["trade_permission"])
+
     def test_live_quote_sources_contains_expected_sources(self):
         self.assertIn("live", RC.LIVE_QUOTE_SOURCES)
         self.assertIn("dashboard_cache", RC.LIVE_QUOTE_SOURCES)

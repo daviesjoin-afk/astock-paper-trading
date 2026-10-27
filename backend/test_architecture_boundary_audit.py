@@ -5,9 +5,9 @@ from tools import coupling_metrics
 
 
 class CouplingBudgetTests(unittest.TestCase):
-    # Measured on PR272 HEAD with the same analyzer.  These are the baseline.
+    # PR272 baseline, with boundaries tightened after each completed slice.
     HEAD_BUDGET = {
-        "import_cycles": 5,
+        "import_cycles": 2,
         "deferred_imports": 583,
         "private_cross_access": 202,
         "raw_sql_modules": 135,
@@ -26,22 +26,20 @@ class CouplingBudgetTests(unittest.TestCase):
     # rebasing the whole budget.  No allowance may be increased without a
     # matching architecture note in docs/COUPLING_BUDGET.md.
     #
-    # 2026-10-27（性能/风控切片）：`max_file_lines` 72 → 90、`cross_domain_edges`
-    # 25 → 28。来源是新增的 `news_risk_policy`（从 paper_trading 抽出的纯策略
-    # 模块，+1 跨域边）与 paper_trading 内的行情轮内复用/时段余量说明（纯原地
-    # 增量）。抽取本身已把 paper_trading 削掉约 60 行；这两项仍按"最小够用"
-    # 抬，不重设基线。详见 docs/COUPLING_BUDGET.md「2026-10-27 切片」。
+    # 2026-10-27（选股应用/共享资金/前端去环）：selection_application 是新的
+    # lower application owner，跨域边由它的实际依赖产生；其余额度按当前实测
+    # 收紧，不重设基线。详见 docs/COUPLING_BUDGET.md 的当日切片。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
-        "deferred_imports": 43,
-        "private_cross_access": 3,
+        "deferred_imports": 38,
+        "private_cross_access": 0,
         "raw_sql_modules": 5,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 28,
-        "max_file_lines": 90,
-        "max_function_lines": 5,
+        "cross_domain_edges": 37,
+        "max_file_lines": 0,
+        "max_function_lines": 4,
         "max_function_globals": 1,
-        "duplicate_helpers": 5,
+        "duplicate_helpers": 6,
         "unsuffixed_module_ratio": 0.0,
         "import_side_effects": 0,
     }
@@ -66,11 +64,8 @@ class CouplingBudgetTests(unittest.TestCase):
     def test_known_cycles_do_not_grow(self):
         actual = coupling_metrics.measure_all()
         self.assertEqual([
-            ("evolution_activation", "self_evolution"),
-            ("main", "paper_selection"),
             ("market_data_service", "universe"),
             ("strategies", "strategy_plugins"),
-            ("tradability_ingestion", "tradability_observation_ledger"),
         ], actual["import_cycle_members"])
 
 

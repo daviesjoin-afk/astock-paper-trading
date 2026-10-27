@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 import sys  # noqa: E402
@@ -137,6 +138,97 @@ class DeterministicDemoTests(unittest.TestCase):
             self.assertIn(needle, alert_text, needle)
         self.assertIn("T+1", alert_text)
         self.assertIn("硬止损", alert_text)
+
+    def test_missing_holding_quote_does_not_publish_partial_pool_daily_pnl(self):
+        # Run the real dashboard and account projections over the demo ledger.
+        # Even if the legacy pool calculation returns a number, one holding
+        # without usable daily evidence cannot be reported as complete P&L.
+        original_shared = PT._shared_metrics
+
+        def shared_with_legacy_value(*args, **kwargs):
+            result = original_shared(*args, **kwargs)
+            result.update(today_pnl=123.0, today_return_pct=1.23,
+                          today_baseline_nav=10000.0, today_pnl_available=True,
+                          daily_loss_pct=3.2)
+            return result
+
+        session = {"code": "trading", "label": "交易中", "today_pnl_available": True}
+        with patch.object(PT, "_market_session", return_value=session), \
+             patch.object(PT, "_today_position_performance", return_value=(None, None, None)), \
+             patch.object(PT, "_shared_metrics", side_effect=shared_with_legacy_value):
+            overview = PT.dashboard()
+        self.assertTrue(overview["positions"])
+        self.assertTrue(any(a["today_position_missing_codes"] for a in overview["accounts"]))
+        self.assertEqual(overview["shared"]["ledger_today_pnl"], 123.0)
+        self.assertIsNone(overview["shared"]["today_pnl"])
+        self.assertIsNone(overview["shared"]["today_return_pct"])
+        self.assertFalse(overview["shared"]["today_pnl_available"])
+        self.assertEqual(overview["shared"]["today_pnl_status"], "暂无完整行情")
+        self.assertIsNone(overview["shared"]["daily_loss_pct"])
+        for account in overview["accounts"]:
+            if account["today_position_missing_codes"] or account["today_sell_missing_codes"]:
+                self.assertIsNone(account["daily_loss_pct"])
+
+    def test_risk_dashboard_does_not_publish_stale_daily_loss_when_quote_missing(self):
+        original_shared = PT._shared_metrics
+
+        def shared_with_legacy_value(*args, **kwargs):
+            result = original_shared(*args, **kwargs)
+            result.update(today_pnl=-320.0, today_return_pct=-3.2,
+                          today_baseline_nav=10000.0, today_pnl_available=True,
+                          daily_loss_pct=3.2)
+            return result
+
+        session = {"code": "trading", "label": "交易中", "today_pnl_available": True}
+        snapshot = {"asof": "2026-10-27T10:00:00+08:00", "market": {"light": "green"},
+                    "data_quality": [], "dynamic_risk": {"mode": "normal"}, "news": {}}
+        with patch.object(PT, "_market_session", return_value=session), \
+             patch.object(PT, "_today_position_performance", return_value=(None, None, None)), \
+             patch.object(PT, "_shared_metrics", side_effect=shared_with_legacy_value), \
+             patch.object(PT.RC, "load_snapshot", return_value=snapshot), \
+             patch.object(PT.RC, "snapshot_age_seconds", return_value=1), \
+             patch.object(PT.dfc, "load_source_health", return_value={}):
+            base = PT._risk_base_dashboard()
+            result = PT.risk_dashboard(allow_network=False)
+        self.assertTrue(base["positions"])
+        self.assertTrue(any(a["today_position_missing_codes"] for a in base["accounts"]))
+        self.assertIsNone(base["shared"]["daily_loss_pct"])
+        for account in base["accounts"]:
+            if account["today_position_missing_codes"] or account["today_sell_missing_codes"]:
+                self.assertIsNone(account["daily_loss_pct"])
+        self.assertTrue(result["accounts"])
+        self.assertIsNone(result["shared"]["daily_loss_pct"])
+        self.assertIsNone(result["shared"]["today_pnl"])
+        self.assertIsNone(result["shared"]["today_return_pct"])
+        self.assertFalse(result["shared"]["today_pnl_available"])
+        self.assertEqual(result["shared"]["today_pnl_status"], "暂无完整行情")
+        for account in result["accounts"]:
+            self.assertIsNone(account["metrics"]["daily_loss_pct"])
+
+    def test_risk_reader_loads_cached_quote_for_today_fully_sold_symbol(self):
+        requested = []
+
+        def cached_quotes(codes):
+            requested.extend(codes)
+            return {code: {"price": 10.0, "pct": 0.0, "previous_close": 10.0,
+                           "quote_at": "2026-10-27T10:00:00+08:00",
+                           "quote_source": "dashboard_cache"} for code in codes}
+
+        session = {"code": "trading", "label": "交易中", "today_pnl_available": True}
+        with patch.object(PT, "_market_session", return_value=session), \
+             patch.object(PT, "_today_position_performance", return_value=(20.0, 2.0, 1000.0)), \
+             patch.object(PT.PPerf, "quote_is_usable", return_value=True), \
+             patch.object(PT.dfc, "load_market_snapshot_full_cached", return_value=[]), \
+             patch.object(PT, "_latest_price_map", side_effect=cached_quotes), \
+             patch.object(PT, "_quotes", side_effect=AssertionError("unexpected network")):
+            base = PT._risk_base_dashboard()
+        self.assertIn("600905", requested)
+        self.assertNotIn("600905", {position["code"] for position in base["positions"]})
+        account = next(row for row in base["accounts"] if row["id"] == "tq_breakout")
+        self.assertEqual(account["today_sell_quote_coverage"], "1/1")
+        self.assertEqual(account["today_sell_pnl"], 37106.46)
+        self.assertEqual(account["today_position_missing_codes"], [])
+        self.assertIsNotNone(base["shared"]["daily_loss_pct"])
 
 
 if __name__ == "__main__":

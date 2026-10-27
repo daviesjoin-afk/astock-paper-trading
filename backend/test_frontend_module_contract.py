@@ -63,6 +63,27 @@ def _handler_texts(blob: str):
         yield "".join(out)
 
 
+def _strip_handler_attributes(blob: str) -> str:
+    """Blank inline handler bodies; they resolve via bridge globals, not imports."""
+    chars = list(blob)
+    for match in HANDLER_ATTR.finditer(blob):
+        i, quote, depth = match.end(), blob[match.end() - 1], 0
+        while i < len(blob):
+            ch = blob[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote and depth == 0:
+                break
+            chars[i] = " "
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+    return "".join(chars)
+
+
 class BridgeCoverageTests(unittest.TestCase):
     """inline handler 调用的每个本仓库函数都必须能被浏览器解析到。"""
 
@@ -141,7 +162,8 @@ class CrossModuleImportTests(unittest.TestCase):
             if path.endswith(("bridge.js",)):
                 continue  # bridge 自己就是全局映射表，单独校验
             imported = self._imported(text)
-            body = self._strip_comments(IMPORT_LINE.sub("", text))
+            body = _strip_handler_attributes(
+                self._strip_comments(IMPORT_LINE.sub("", text)))
             for name, owner in self.owner.items():
                 if owner == path or name in imported:
                     continue
@@ -176,6 +198,21 @@ class ModuleLayoutTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(SRC, "boot.js")))
         self.assertTrue(os.path.isfile(os.path.join(SRC, "bridge.js")))
         self.assertTrue(os.path.isfile(os.path.join(STYLES, "index.css")))
+
+    def test_navigation_is_free_of_feature_imports_and_boot_registers_loaders(self):
+        with open(os.path.join(SRC, "core", "navigation.js"), encoding="utf-8") as handle:
+            navigation = handle.read()
+        self.assertNotIn("../features/", navigation,
+                         "navigation 必须只做路由，页面能力由 boot 注册")
+        with open(os.path.join(SRC, "boot.js"), encoding="utf-8") as handle:
+            boot = handle.read()
+        self.assertNotRegex(boot, r"(?m)^loadStrategies\(\);",
+                            "选股数据不能在 boot 顶层对所有页面无条件加载")
+        self.assertNotRegex(boot, r"(?m)^loadDataValidity\(\);",
+                            "数据有效性不能在 boot 顶层对所有页面无条件加载")
+        for view in ("portfolio", "activity", "history", "all", "strategy", "research",
+                     "risk", "execution", "allocation"):
+            self.assertIn("registerPaperViewLoader('%s'" % view, boot, view)
 
     def test_build_id_is_declared_in_the_entry(self):
         with open(os.path.join(SRC, "app.js"), encoding="utf-8") as handle:

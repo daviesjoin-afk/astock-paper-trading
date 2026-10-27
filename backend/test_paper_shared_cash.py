@@ -95,6 +95,48 @@ class SharedCashAggregateTests(unittest.TestCase):
         self.assertEqual(2.5, PSC.shared_cash(rows))
 
 
+class ExplicitCycleCashReadTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.executescript("""
+            CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, enabled_strategies TEXT);
+            CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, cycle_id INTEGER, status TEXT,
+                                        cash REAL, initial_cash REAL);
+            CREATE TABLE strategy_definitions(id TEXT PRIMARY KEY, origin TEXT);
+            INSERT INTO paper_cycles VALUES(7, '["tq_breakout", "trend_pullback"]');
+            INSERT INTO paper_cycles VALUES(8, '["reported_profit_breakout"]');
+            INSERT INTO paper_cycles VALUES(9, '[]');
+            INSERT INTO paper_accounts VALUES('tq_breakout', 7, 'paused', 20, 100);
+            INSERT INTO paper_accounts VALUES('trend_pullback', 7, 'running', 30, 100);
+            INSERT INTO paper_accounts VALUES('reported_profit_breakout', 8, 'running', 80, 100);
+            INSERT INTO paper_accounts VALUES('unlisted', 7, 'running', 900, 100);
+        """)
+        self.scope = ("tq_breakout", "trend_pullback", "reported_profit_breakout")
+
+    def test_cycle_owners_include_paused_exclude_other_cycles_and_unlisted(self):
+        for row_factory in (None, sqlite3.Row):
+            with self.subTest(row_factory=row_factory):
+                self.conn.row_factory = row_factory
+                rows = PSC.cycle_account_rows(self.conn, 7, builtin_scope=self.scope)
+                self.assertEqual(["tq_breakout", "trend_pullback"], [row["id"] for row in rows])
+                self.assertEqual(50.0, PSC.cycle_shared_cash(self.conn, 7, builtin_scope=self.scope))
+                self.assertEqual(80.0, PSC.cycle_shared_cash(self.conn, 8, builtin_scope=self.scope))
+                self.assertEqual(0, PSC.cycle_shared_cash(self.conn, 9, builtin_scope=self.scope))
+
+    def test_missing_cycle_never_implicitly_selects_or_initializes_one(self):
+        with self.assertRaisesRegex(ValueError, "explicit_cycle_id_required"):
+            PSC.cycle_shared_cash(self.conn, None, builtin_scope=self.scope)
+
+    def test_reads_use_caller_transaction_without_committing(self):
+        self.conn.execute("UPDATE paper_accounts SET cash=5 WHERE id='tq_breakout'")
+        self.assertTrue(self.conn.in_transaction)
+        self.assertEqual(35.0, PSC.cycle_shared_cash(self.conn, 7, builtin_scope=self.scope))
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+        self.assertEqual(50.0, PSC.cycle_shared_cash(self.conn, 7, builtin_scope=self.scope))
+
+
 class SharedCashDebitTests(CashDatabaseMixin, unittest.TestCase):
     def test_preferred_account_is_consumed_first(self):
         rows = _rows(("a", 20.0, 0.0), ("b", 50.0, 0.0))
@@ -254,11 +296,21 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
             str(inspect.signature(PT._credit_shared_cash)),
         )
 
-    def test_shared_cash_facade_uses_rows_at_call_time(self):
+    def test_shared_cash_facade_uses_explicit_cycle_owner_at_call_time(self):
         rows = _rows(("a", 12.0, 0.0))
-        with mock.patch.object(PT, "_shared_account_rows", return_value=rows) as get_rows:
+        with mock.patch.object(PSC, "cycle_account_rows", return_value=rows) as get_rows, \
+                mock.patch.object(PT, "_active_cycle") as get_active:
             self.assertEqual(12.0, PT._shared_cash(self.conn, 7))
-        get_rows.assert_called_once_with(self.conn, 7)
+        get_rows.assert_called_once_with(self.conn, 7, builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
+        get_active.assert_not_called()
+
+    def test_shared_cash_facade_resolves_legacy_default_cycle(self):
+        rows = _rows(("a", 12.0, 0.0))
+        with mock.patch.object(PT, "_active_cycle", return_value={"id": 8}) as get_active, \
+                mock.patch.object(PSC, "cycle_account_rows", return_value=rows) as get_rows:
+            self.assertEqual(12.0, PT._shared_cash(self.conn))
+        get_active.assert_called_once_with(self.conn)
+        get_rows.assert_called_once_with(self.conn, 8, builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
 
     def test_initial_cash_facade_keeps_declared_capital_short_circuit(self):
         with mock.patch.object(PT, "_active_cycle", return_value={"id": 7, "capital": 100.0}), \
@@ -294,7 +346,7 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
             calls.append(value)
             return original_num(value, default)
 
-        with mock.patch.object(PT, "_shared_account_rows", return_value=rows), \
+        with mock.patch.object(PSC, "cycle_account_rows", return_value=rows), \
                 mock.patch.object(PT, "_num", side_effect=patched_num):
             self.assertEqual(10.0, PT._shared_cash(self.conn, 7))
         self.assertTrue(calls)
@@ -302,7 +354,7 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
     def test_facades_have_no_second_cash_algorithm(self):
         tree = ast.parse(TRADING_PATH.read_text(encoding="utf-8"))
         expected = {
-            "_shared_cash": "shared_cash",
+            "_shared_cash": "cycle_shared_cash",
             "_shared_initial_cash": "shared_initial_cash",
             "_debit_shared_cash": "debit_shared_cash",
             "_credit_shared_cash": "credit_shared_cash",
@@ -329,7 +381,7 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
 
 
 class SharedCashArchitectureGuardTests(unittest.TestCase):
-    def test_module_imports_only_stdlib_and_has_no_membership_or_exposure_truth(self):
+    def test_module_only_delegates_membership_and_has_no_exposure_truth(self):
         tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
         roots = set()
         for node in ast.walk(tree):
@@ -337,7 +389,11 @@ class SharedCashArchitectureGuardTests(unittest.TestCase):
                 roots.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 roots.add(node.module.split(".")[0])
-        self.assertEqual({"__future__", "math"}, roots)
+        self.assertEqual({"__future__", "math", "paper_cycle_ownership"}, roots)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and isinstance(node.func.value, ast.Name) and node.func.value.id == "PCY"]
+        self.assertEqual(["cycle_ledger_rows"], [node.func.attr for node in calls])
         source = MODULE_PATH.read_text(encoding="utf-8")
         for forbidden in (
             "enabled_strategies", "paper_cycles", "strategy_definitions",

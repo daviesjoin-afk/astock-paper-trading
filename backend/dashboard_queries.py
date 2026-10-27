@@ -72,6 +72,25 @@ def _dependencies() -> DashboardDependencies:
     return _dependencies_factory()
 
 
+def mark_incomplete_daily_loss(accounts, shared):
+    """Do not present a partial daily-loss ratio as a known read-model value."""
+    missing = False
+    for account in accounts:
+        coverage = str(account.get("today_sell_quote_coverage") or "")
+        covered, separator, total = coverage.partition("/")
+        incomplete = bool(
+            account.get("today_position_missing_codes")
+            or account.get("today_sell_missing_codes")
+            or (separator and covered != total)
+        )
+        if incomplete:
+            account["daily_loss_pct"] = None
+            missing = True
+    if missing:
+        shared["daily_loss_pct"] = None
+    return missing
+
+
 def dashboard(include_activity=False, include_history_symbols=False, *, dependencies=None):
     """Return the paper workspace read model without hidden-page ledger scans.
 
@@ -258,12 +277,24 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
         shared["ledger_today_reconciliation_delta"] = round(_num(pool_today) - raw_today, 2) if (
             pool_today is not None and today_complete
         ) else None
-        if today_complete:
+        missing_daily_quotes = mark_incomplete_daily_loss(accounts, shared)
+        if market_session.get("today_pnl_available") and missing_daily_quotes:
+            # Cost fallback and a partial sum are useful diagnostics, but
+            # neither is the complete pool's daily profit when a position or
+            # completed sell lacks usable same-day evidence.
+            shared["today_pnl"] = None
+            shared["today_return_pct"] = None
+            shared["today_pnl_available"] = False
+            shared["today_pnl_status"] = "暂无完整行情"
+            shared["today_pnl_source"] = "incomplete_quote_evidence"
+        elif today_complete:
             economic_today = round(raw_today, 2)
             economic_base = _num(shared.get("nav")) - economic_today
             shared["today_pnl"] = economic_today
             shared["today_baseline_nav"] = round(economic_base, 2) if economic_base > 0 else None
             shared["today_return_pct"] = round(economic_today / economic_base * 100, 2) if economic_base > 0 else None
+            shared["today_pnl_available"] = True
+            shared["today_pnl_status"] = ""
             shared["daily_loss_pct"] = round(max(0.0, -economic_today / economic_base * 100), 2) if economic_base > 0 else 0.0
             shared["today_pnl_source"] = "strategy_contribution_sum"
         for account in accounts:
