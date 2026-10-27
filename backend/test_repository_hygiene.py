@@ -163,6 +163,10 @@ class CronBackupHygieneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             cron_dir = os.path.join(temp_dir, "cron.d")
             backup_dir = os.path.join(temp_dir, "backup-dir")
+            deploy_root = os.path.join(temp_dir, "project")
+            os.makedirs(os.path.join(deploy_root, "deploy"))
+            shutil.copyfile(os.path.join(ROOT, "deploy", "astock-codex.cron"),
+                            os.path.join(deploy_root, "deploy", "astock-codex.cron"))
             os.mkdir(cron_dir)
             active = os.path.join(cron_dir, "astock-codex")
             with open(active, "w", encoding="utf-8") as handle:
@@ -174,7 +178,7 @@ class CronBackupHygieneTests(unittest.TestCase):
 
             env = os.environ.copy()
             env.update({
-                "ASTOCK_DEPLOY_ROOT": ROOT,
+                "ASTOCK_DEPLOY_ROOT": deploy_root,
                 "ASTOCK_CRON_DIR": cron_dir,
                 "ASTOCK_CRON_BACKUP_DIR": backup_dir,
             })
@@ -187,10 +191,13 @@ class CronBackupHygieneTests(unittest.TestCase):
             self.assertEqual(["astock-codex"], sorted(os.listdir(cron_dir)))
             self.assertTrue(os.path.isfile(os.path.join(backup_dir, legacy_names[0])))
             self.assertTrue(os.path.isfile(os.path.join(backup_dir, legacy_names[1])))
+            lock = os.path.join(deploy_root, ".locks", "research-worker.lock")
+            # 真正获取外层锁，验证新安装无需先运行 paper runner。
+            subprocess.run(["flock", "-n", lock, "true"], check=True)
             with open(active, encoding="utf-8") as handle:
                 synced = handle.read()
             with open(os.path.join(ROOT, "deploy", "astock-codex.cron"), encoding="utf-8") as handle:
-                expected = handle.read().replace("/opt/astock-codex", ROOT)
+                expected = handle.read().replace("/opt/astock-codex", deploy_root)
             self.assertEqual(expected, synced)
 
 

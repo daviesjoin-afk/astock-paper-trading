@@ -344,6 +344,23 @@ class ProductionConsumptionTests(unittest.TestCase):
         return [dict(row) for row in self.ledger.execute(
             "SELECT * FROM ai_decision_audits ORDER BY rowid").fetchall()]
 
+    def test_another_stock_does_not_hide_a_matching_opinion(self):
+        first = self._opinion(payload={"code": "600001"})
+        self._opinion(payload={"code": "600002"})
+        result = self._consume()
+        self.assertEqual(result["audit"]["ai_opinion"]["recommendation_id"],
+                         first["recommendation_id"])
+        self.assertEqual(result["final_decision"], result["audit"]["rules_only_decision"])
+
+    def test_global_and_stock_opinions_use_latest_in_scope_without_stale_fallback(self):
+        self._opinion(payload={"code": "600001"})
+        latest = self._opinion(payload={}, valid_until="2026-10-26T01:00:00+00:00")
+        result = self._consume()
+        self.assertEqual(result["audit"]["effect_reason"], ADV.R_OPINION_EXPIRED)
+        self.assertEqual(result["audit"]["ai_opinion"]["recommendation_id"],
+                         latest["recommendation_id"])
+
+
     def test_without_any_opinion_the_rule_decision_is_audited_unchanged(self):
         result = self._consume()
         self.assertEqual(result["status"], "recorded")

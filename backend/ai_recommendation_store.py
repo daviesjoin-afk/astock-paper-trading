@@ -19,7 +19,7 @@ import math
 import uuid
 
 RECOMMENDATION_SCHEMA_VERSION = "ai-recommendation-v1"
-PROMPT_VERSION = "research-agent-prompt-v1"
+PROMPT_VERSION = "research-agent-prompt-v2"
 TOOLSET_VERSION = "research-toolset-v1"
 
 ACTION_SKIP_ENTRY = "skip_entry"

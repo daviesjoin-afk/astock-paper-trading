@@ -2,6 +2,8 @@
 """F5 生产编排：事件入库、worker 接续、配置 owner 与只读实验结果。"""
 from __future__ import annotations
 
+import datetime as dt
+
 
 def config_connection():
     """模型配置只来自配置 owner，不从研究队列库复制。
@@ -98,7 +100,8 @@ def sessions_from_rows(rows, *, decision_at=None) -> list[dict]:
 
 
 def session_from_quotes(quotes, *, session_date: str, decision_at: str | None = None,
-                        first_board_codes=(), factor_table=None) -> list[dict]:
+                        first_board_codes=(), factor_table=None,
+                        preserve_unknown_status=False) -> list[dict]:
     """把交易 owner 已经冻结的收盘行情投影成一次回放会话。
 
     只搬运调用方给出的字段：没有价格的标的直接跳过，不补价、不换算、不猜
@@ -114,9 +117,11 @@ def session_from_quotes(quotes, *, session_date: str, decision_at: str | None = 
         projected.append({"code": code, "price": float(price),
                           "prev_close": row.get("prev_close"),
                           "volume": row.get("volume"),
-                          "halted": bool(row.get("halted") or False),
+                          "halted": (row.get("halted") if preserve_unknown_status
+                                     else bool(row.get("halted") or False)),
                           "name": row.get("name"),
-                          "risk_flag": bool(row.get("risk_flag") or False)})
+                          "risk_flag": (row.get("risk_flag") if preserve_unknown_status
+                                        else bool(row.get("risk_flag") or False))})
     if not projected:
         return []
     return sessions_from_rows([{
@@ -125,6 +130,57 @@ def session_from_quotes(quotes, *, session_date: str, decision_at: str | None = 
         "quotes": projected, "factor_table": factor_table,
         "first_board_codes": tuple(first_board_codes or ()),
     }])
+
+
+def session_from_selection(table, *, quotes, first_board_codes, session_date,
+                           decision_at=None) -> list[dict]:
+    """冻结实际选股表和完整候选证券范围，不从已选股票反推研究输入。"""
+    if table is None or not hasattr(table, "index") or table.empty:
+        raise ValueError("frozen_factor_table_required")
+    codes = {str(code) for code in table.index}
+    rows = [dict(row) for row in quotes if str(row.get("code")) in codes]
+    if {str(row.get("code")) for row in rows if row.get("price") is not None} != codes:
+        raise ValueError("frozen_selection_quotes_incomplete")
+    return session_from_quotes(
+        rows, session_date=session_date, decision_at=decision_at,
+        first_board_codes=first_board_codes, factor_table=table, preserve_unknown_status=True)
+
+
+def _capture_time():
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+def capture_selection_snapshot(snapshot, *, table, live_map, first_board_codes,
+                               asof_date, selection_model, selection_overlay):
+    """把选股输入冻结到独立容器；研究失败不影响调用方的规则决策。"""
+    try:
+        if (selection_model != "first_board_relay"
+                or selection_overlay.get("weights") or selection_overlay.get("conditions")):
+            raise ValueError("research_requires_default_selection_parameters")
+        day = asof_date.isoformat()
+        captured_at = _capture_time()
+        if captured_at[:10] != day:
+            raise ValueError("not_contemporaneous_selection_snapshot")
+        snapshot["frozen_sessions"] = session_from_selection(
+            table, quotes=[dict(row, code=str(code)) for code, row in live_map.items()],
+            first_board_codes=first_board_codes, session_date=day,
+            decision_at=captured_at)
+    except Exception as exc:  # noqa: BLE001 - 研究不得阻断选股
+        snapshot["reason"] = f"frozen_selection_unavailable:{type(exc).__name__}:{exc}"
+
+
+def capture_other_strategy_event(candidates, evidence_quotes, session_date):
+    """保留其他策略原有的行情事件和等待任务唤醒，不生成研究候选。"""
+    try:
+        sessions = session_from_quotes(
+            [{"code": str(pick.get("code") or ""),
+              **dict(evidence_quotes.get(pick.get("code")) or {})} for pick in candidates],
+            session_date=session_date,
+            decision_at=f"{session_date}T15:00:00+08:00",
+            first_board_codes=[str(pick.get("code") or "") for pick in candidates])
+        return {"frozen_sessions": sessions}
+    except Exception as exc:  # noqa: BLE001 - 原交易流程不依赖研究投影
+        return {"reason": f"frozen_session_projection_failed:{type(exc).__name__}: {exc}"}
 
 
 def fill_event(order) -> dict:
@@ -137,9 +193,9 @@ def fill_event(order) -> dict:
 
 
 def market_event(strategy_id, *, session_date, environment_ref, exact_identity=None,
-                 frozen_sessions=None) -> dict:
+                 frozen_sessions=None, observed_at=None) -> dict:
     return {"kind": "market", "strategy_id": strategy_id,
-            "observed_at": f"{session_date}T15:00:00+08:00",
+            "observed_at": observed_at or f"{session_date}T15:00:00+08:00",
             "session_date": session_date, "environment_ref": environment_ref,
             "exact_identity": exact_identity,
             "frozen_sessions": list(frozen_sessions or ())}

@@ -33,7 +33,7 @@ import execution_planner as EP
 import paper_trading_rules as PTR
 import selection_tradability as TA
 
-REPLAY_VERSION = "native-paired-replay-v2"
+REPLAY_VERSION = "native-paired-replay-v3"
 """v2：环境身份纳入因子表内容。旧回执（v1）不能冒充新格式的证据。"""
 EVALUATOR_VERSION = "paired-nav-evaluator-v1"
 RECEIPT_VERSION = "paired-replay-receipt-v1"
@@ -123,9 +123,9 @@ class ReplayQuote:
         if self.prev_close is not None:
             object.__setattr__(self, "prev_close", _positive(self.prev_close, "prev_close"))
 
-    def evidence(self, session_date: str):
+    def evidence(self, session_date: str, *, available_at=None):
         return TA.MarketEvidence(
-            session=session_date, available_at=f"{session_date}T15:00:00+08:00",
+            session=session_date, available_at=available_at or f"{session_date}T15:00:00+08:00",
             price=self.price, reference_price=self.prev_close, volume=self.volume,
             halted=self.halted, name=self.name, risk_flag=self.risk_flag,
         )
@@ -468,12 +468,16 @@ def _size_quantity(cash: float, price: float, lot_size: int, budget: float) -> i
 
 
 def _can_buy(session: ReplaySession, quote: ReplayQuote):
-    return TA.entry_tradability(quote.evidence(session.session_date), code=quote.code,
+    close_at = _instant(f"{session.session_date}T15:00:00+08:00", "session_close")
+    evidence = quote.evidence(session.session_date, available_at=max(close_at, session.decision_at))
+    return TA.entry_tradability(evidence, code=quote.code,
                                 entry_session=session.session_date)
 
 
 def _can_sell(session: ReplaySession, quote: ReplayQuote, entry_session: str):
-    return TA.exit_tradability(quote.evidence(session.session_date), code=quote.code,
+    close_at = _instant(f"{session.session_date}T15:00:00+08:00", "session_close")
+    evidence = quote.evidence(session.session_date, available_at=max(close_at, session.decision_at))
+    return TA.exit_tradability(evidence, code=quote.code,
                                exit_session=session.session_date,
                                entry_session=entry_session)
 
@@ -854,11 +858,15 @@ def sides_from_manifest(strategy_id: str, *, target_kind: str, model_family: str
     challenger_overrides = {**champion_overrides, **changed}
     canonical = NAMING.canonical_model_family(model_family)
     if target_kind == ETM.TARGET_SELECTION_WEIGHTS:
+        # 生产选股器只接受完整权重表；部分字段会被静默忽略。
+        # 冻结两侧完整输入，再由既有选股器使用同一套归一化/相关性门禁。
+        champion_weights = {**defaults, **champion_overrides}
+        challenger_weights = {**champion_weights, **changed}
         return (
             SideParameters(label=SIDE_CHAMPION, model_family=canonical,
-                           weight_overrides=tuple(sorted(champion_overrides.items()))),
+                           weight_overrides=tuple(sorted(champion_weights.items()))),
             SideParameters(label=SIDE_CHALLENGER, model_family=canonical,
-                           weight_overrides=tuple(sorted(challenger_overrides.items()))),
+                           weight_overrides=tuple(sorted(challenger_weights.items()))),
         )
     return (
         SideParameters(label=SIDE_CHAMPION, model_family=canonical,
@@ -887,6 +895,8 @@ def strategies_selector(module=None):
             first_board_codes=list(session.first_board_codes or ()),
             weight_overrides=weight_overrides,
             condition_overrides=dict(condition_overrides or {}))
+        if (result.get("factor_calibration") or {}).get("weight_override_rejected"):
+            raise ReplayRefused("selection_weight_override_rejected")
         return [str(pick.get("code")) for pick in (result.get("picks") or ())]
 
     return select

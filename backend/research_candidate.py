@@ -56,13 +56,17 @@ def mark_complete(conn, experiment_id) -> bool:
         (STATUS_COMPLETE, str(experiment_id), STATUS_RUNNING)).rowcount == 1
 
 
-def _frozen_sessions(frozen_sessions):
+def validate_frozen_sessions(frozen_sessions):
     """事件冻结的会话是**唯一**允许的行情来源；空集合同样拒绝。"""
     if not isinstance(frozen_sessions, (list, tuple)) or not frozen_sessions:
         raise ValueError(R_FROZEN_SESSIONS_REQUIRED)
     sessions = []
     for item in frozen_sessions:
-        sessions.append(NPR.session_from_payload(dict(item or {})))
+        session = NPR.session_from_payload(dict(item or {}))
+        table = session.factor_table
+        if table is None or not hasattr(table, "index") or table.empty:
+            raise ValueError("frozen_factor_table_required")
+        sessions.append(session)
     return sessions
 
 
@@ -89,12 +93,23 @@ def create_and_enqueue(conn, arguments, *, task_id=None, frozen_sessions=None) -
 
     if args.get("sessions") not in (None, (), []):
         raise ValueError(R_MODEL_SUPPLIED_SESSIONS)
-    sessions = _frozen_sessions(frozen_sessions)
+    sessions = validate_frozen_sessions(frozen_sessions)
     environment = NPR.ReplayEnvironment(sessions=tuple(sessions))
 
     champion, challenger = NPR.sides_from_manifest(
         strategy_id, target_kind=ETM.TARGET_SELECTION_WEIGHTS,
         model_family=model_family, variant_fields={SUPPORTED_FIELD: variant})
+    # 保持目标字段为模型提出的实际比例；其余字段按原比例分配剩余权重。
+    # 否则简单覆盖完整权重表后由选股器归一化，记录的 variant 会大于实际值。
+    baseline_weights = champion.weight_map()
+    other_total = sum(value for name, value in baseline_weights.items() if name != SUPPORTED_FIELD)
+    if other_total <= 0:
+        raise ValueError("selection_weight_baseline_invalid")
+    adjusted = {name: (variant if name == SUPPORTED_FIELD
+                       else value * (1.0 - variant) / other_total)
+                for name, value in baseline_weights.items()}
+    challenger = NPR.SideParameters(label=challenger.label, model_family=challenger.model_family,
+                                    weight_overrides=tuple(sorted(adjusted.items())))
     rules = NPR.ReplayRules(
         reference_capital=float(args.get("reference_capital") or 100_000.0),
         max_positions=int(args.get("max_positions") or 3),

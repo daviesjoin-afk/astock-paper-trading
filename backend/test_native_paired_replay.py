@@ -492,6 +492,17 @@ class ValuationTests(unittest.TestCase):
 class ManifestGatingTests(unittest.TestCase):
     """实验清单必须真正管住回放：未声明字段、无变化变体、不支持的策略一律拒绝。"""
 
+    def test_after_close_snapshot_cannot_prove_a_same_close_fill(self):
+        import selection_tradability as TA
+
+        day = TRADING_DAYS[0]
+        late = N.ReplaySession(session_date=day, decision_at=f"{day}T15:05:00+08:00",
+                               quotes=(quote("600001", 10.0),), factor_table={"day": day})
+        buy = N._can_buy(late, late.quotes[0])
+        sell = N._can_sell(late, late.quotes[0], TRADING_DAYS[0])
+        self.assertEqual(buy.reason, TA.REASON_EVIDENCE_NOT_VISIBLE)
+        self.assertEqual(sell.reason, TA.REASON_EVIDENCE_NOT_VISIBLE)
+
     def test_the_variant_only_carries_the_declared_change(self):
         champion, challenger = N.sides_from_manifest(
             "tq_breakout", target_kind=ETM.TARGET_ENTRY_POLICY,
@@ -537,9 +548,44 @@ class ManifestGatingTests(unittest.TestCase):
         champion, challenger = N.sides_from_manifest(
             "tq_breakout", target_kind=ETM.TARGET_SELECTION_WEIGHTS,
             model_family="first_board_relay", variant_fields={"volsurge": 0.3})
-        self.assertIsNone(champion.weight_map())
-        self.assertEqual(challenger.weight_map(), {"volsurge": 0.3})
+        defaults = dict(ETM.manifest_for("tq_breakout", ETM.TARGET_SELECTION_WEIGHTS,
+                                         "first_board_relay").baseline_defaults)
+        self.assertEqual(champion.weight_map(), defaults)
+        self.assertEqual(challenger.weight_map(), {**defaults, "volsurge": 0.3})
         self.assertEqual(challenger.condition_map(), {})
+
+    def test_flow_weight_change_reaches_the_real_selector_and_changes_score(self):
+        import strategies as S
+        from test_research_candidate import factor_table
+
+        table = factor_table()
+        manifest = ETM.manifest_for("tq_breakout", ETM.TARGET_SELECTION_WEIGHTS,
+                                     "first_board_relay")
+        baseline = dict(manifest.baseline_defaults)["flow"]
+        champion, challenger = N.sides_from_manifest(
+            "tq_breakout", target_kind=ETM.TARGET_SELECTION_WEIGHTS,
+            model_family="first_board_relay", variant_fields={"flow": baseline + 0.03})
+        common = dict(topn=3, first_board_codes=["600001"])
+        before = S.run_strategy("first_board_relay", table,
+                                weight_overrides=champion.weight_map(), **common)
+        after = S.run_strategy("first_board_relay", table,
+                               weight_overrides=challenger.weight_map(), **common)
+        self.assertTrue(before["picks"])
+        self.assertTrue(after["picks"])
+        self.assertFalse(after["factor_calibration"]["weight_override_rejected"])
+        self.assertNotEqual(before["weights_used"], after["weights_used"])
+        self.assertNotEqual(before["picks"][0]["score_components"]["base_score"],
+                            after["picks"][0]["score_components"]["base_score"])
+
+    def test_rejected_weight_override_does_not_publish_a_default_weight_replay(self):
+        from unittest import mock
+
+        module = mock.Mock()
+        module.run_strategy.return_value = {
+            "factor_calibration": {"weight_override_rejected": True}, "picks": [{"code": "600001"}]}
+        with self.assertRaisesRegex(N.ReplayRefused, "selection_weight_override_rejected"):
+            N.strategies_selector(module)("first_board_relay", session(TRADING_DAYS[0]),
+                                          {}, {"flow": 0.6}, 1)
 
     def test_manifest_to_replay_end_to_end(self):
         champion, challenger = N.sides_from_manifest(

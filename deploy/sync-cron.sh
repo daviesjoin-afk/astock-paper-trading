@@ -27,6 +27,8 @@ if [[ ! -f "$TEMPLATE" ]]; then
   exit 1
 fi
 
+# Cron takes its outer flock before the runner can create this directory.
+mkdir -p "$ROOT_DIR/.locks"
 mkdir -p "$CRON_BACKUP_DIR"
 chmod 700 "$CRON_BACKUP_DIR"
 

@@ -36,10 +36,15 @@ jobs:
       - name: Assert the canonical runtime is Python 3.14
         run: python -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version; print(sys.version)"
 
+      # 单进程跑全量要十几分钟，而最贵的 12 个测试模块占了 37% 的耗时（单个模块
+      # 从 0.06 秒到 56.7 秒，差 900 倍）。这里用成本均衡分片把这些模块打散到
+      # 多个进程，墙钟由最慢分片决定。分片脚本同时给每个分片独立的 ASTOCK_DATA_DIR
+      # （paper_trading.DB_PATH 是 import 期常量，env 必须在 import 前设置）。
+      # 详见 scripts/run_tests_parallel.py 的模块文档。
       - name: Run backend unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: python -m unittest discover -s backend -p "test_*.py" -v
+        run: python scripts/run_tests_parallel.py --shards 4
 
   syntax:
     runs-on: ubuntu-latest
@@ -162,7 +167,7 @@ jobs:
         run: >
           docker run --rm --network none
           --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001
-          astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
+          astock-codex:ci python scripts/run_tests_parallel.py --shards 4
 
       - name: Start isolated paper-only container
         run: |

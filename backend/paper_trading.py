@@ -35,6 +35,7 @@ import strategies as S
 import universe as U
 import risk_center as RC
 import news_learning as NL
+import research_orchestration as RO
 # PR (paper_research) 与 SE (self_evolution) 仅在盘后收盘研究与 Challenger 管理路径使用，
 # 采用懒加载避免在交易热路径（如 fast-entry, intraday）启动时加载不必要的大模块。
 def _get_pr():
@@ -5663,7 +5664,7 @@ def ignition_shadow_report(asof_day=None, limit=200):
 
 
 def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=None, live_asof_date=None,
-                    *, shared_inputs=None):
+                    *, shared_inputs=None, research_snapshot=None):
     """用完整历史因子排序，并用当日实时快照覆盖可变字段。
 
     ``asof_date`` 是历史因子截止日；``live_asof_date`` 允许盘中用当天
@@ -5990,6 +5991,10 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             }
         )
         table["sentiment"] = F.zscore(heat_values).reindex(table.index).fillna(-1.5)
+    if research_snapshot is not None:
+        RO.capture_selection_snapshot(research_snapshot, table=table, live_map=live_map,
+            first_board_codes=first_board_codes, asof_date=asof_date,
+            selection_model=selection_model, selection_overlay=selection_overlay)
     if spec.get("selection_mode") == "dsl":
         # PR-35：声明式策略通道——同一份共享因子表，选股由编译后的 DSL
         # 完成（纯离线求值器），不再要求模型在 strategies.STRATEGIES 注册。
@@ -7675,12 +7680,18 @@ def generate_signals(asof_date=None):
     with _db_readonly() as read_conn:
         accounts = _active_account_rows(read_conn, status="running")
     candidate_batches = []
+    research_snapshots = {}
     all_names = {}
     all_codes = set()
     for account in accounts:
+        research_kwargs = {}
+        if account["id"] == "tq_breakout":
+            research_snapshots[account["id"]] = {}
+            research_kwargs["research_snapshot"] = research_snapshots[account["id"]]
         candidates, meta = _candidate_rows(
             account, day, market, sector_rows=sector_rows,
             live_universe=close_universe or None,
+            **research_kwargs,
         )
         candidate_batches.append((account, candidates, meta))
         for pick in candidates:
@@ -7828,35 +7839,26 @@ def generate_signals(asof_date=None):
             _audit(conn, account["id"], "close_signal_scan", f"候选 {len(candidates)}，通过 {created}")
             summary["accounts"].append({"id": account["id"], "created": created, "candidates": len(candidates), **meta})
     # 收盘事实提交后再打开研究库；不用研究 IO 阻塞正式账本事务。
-    import research_orchestration as RO
     for account, candidates, meta in candidate_batches:
         stamp = account_stamps.get(account["id"])
         if meta.get("blocked") or not stamp or not stamp[0]:
             continue
-        try:
-            frozen_sessions = RO.session_from_quotes(
-                [{"code": str(pick.get("code") or ""),
-                  **dict(evidence_quotes.get(pick.get("code")) or {})}
-                 for pick in candidates],
-                session_date=day.isoformat(),
-                decision_at=f"{day.isoformat()}T15:00:00+08:00",
-                first_board_codes=[str(pick.get("code") or "") for pick in candidates])
-        except Exception as exc:  # noqa: BLE001 - 投影失败只跳过研究，不影响规则结论
-            summary.setdefault("research_events", []).append(
-                {"status": "skipped", "account_id": account["id"],
-                 "reason": f"frozen_session_projection_failed:{type(exc).__name__}: {exc}"})
-            continue
+        snapshot = research_snapshots.get(account["id"], {})
+        if account["id"] != "tq_breakout":
+            snapshot = RO.capture_other_strategy_event(candidates, evidence_quotes, day.isoformat())
+        frozen_sessions = snapshot.get("frozen_sessions") or []
         if not frozen_sessions:
             summary.setdefault("research_events", []).append(
                 {"status": "skipped", "account_id": account["id"],
-                 "reason": "no_frozen_quotes_for_session"})
+                 "reason": snapshot.get("reason") or "no_supported_frozen_selection"})
             continue
         identity = dict(zip(("strategy_id", "strategy_version", "strategy_checksum"), stamp, strict=True))
         research = RO.notify_research(RO.market_event(
             identity["strategy_id"], session_date=day.isoformat(),
             environment_ref={"factor_refresh": factor_refresh,
                              "candidate_count": len(candidates)},
-            exact_identity=identity, frozen_sessions=frozen_sessions))
+            exact_identity=identity, frozen_sessions=frozen_sessions,
+            observed_at=(frozen_sessions[-1]["decision_at"] if account["id"] == "tq_breakout" else None)))
         summary.setdefault("research_events", []).append(research)
     return summary
 
@@ -10391,7 +10393,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             conn, cycle["id"], account["id"], code, fill_price, "exceptional_entry",
             exceptional["reason"], {"signal_id": signal["id"], "sizing": sizing, "risk": risk},
         )
-    import research_orchestration as RO
     RO.notify_research(RO.fill_event({
         "id": order_id, "account_id": account["id"], "code": code, "side": "buy",
         "status": "filled", "executed_at": _now(), "strategy_id": strategy_id,
@@ -12206,7 +12207,6 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
         "status": str(committed[0]),
         "opening_event": bool(opening_event), "trigger": trigger,
     }
-    import research_orchestration as RO
     RO.notify_research(RO.fill_event({
         **result, "account_id": account["id"], "strategy_id": strategy_stamp[0],
         "strategy_version": strategy_stamp[1], "strategy_checksum": strategy_stamp[2],

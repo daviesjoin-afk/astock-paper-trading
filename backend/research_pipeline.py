@@ -96,6 +96,12 @@ def submit(conn, event) -> dict:
         except ETM.ManifestError:
             manifest = None
         if manifest is not None:
+            try:
+                RC.validate_frozen_sessions(body["frozen_sessions"])
+            except (ValueError, TypeError, KeyError) as exc:
+                return {"event_id": event_id, "created": created, "task_id": None,
+                        "task_created": False, "woken_task_ids": woken,
+                        "task_blocked_reason": str(exc), "status": "recorded"}
             identity = dict(body.get("exact_identity") or {
                 "strategy_id": strategy_id, "strategy_version": 1,
                 "strategy_checksum": body.get("strategy_checksum") or "runtime-current",
@@ -115,6 +121,8 @@ def submit(conn, event) -> dict:
                         "target_kind": manifest.target_kind,
                         "field": RC.SUPPORTED_FIELD,
                         "baseline": RC.baseline(manifest),
+                        "min": RC.MIN_FLOW, "max": RC.MAX_FLOW,
+                        "max_delta": RC.MAX_DELTA,
                     },
                     # 冻结会话只随事件走：模型工具不能自带行情，只能消费这里的一份。
                     "frozen_sessions": list(body.get("frozen_sessions") or ()),
