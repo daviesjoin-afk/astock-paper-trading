@@ -199,6 +199,32 @@ class CompletionTests(CandidateTestCase):
 
 
 class EnvironmentFixtureTests(unittest.TestCase):
+    def test_missing_suspension_and_risk_status_stay_unknown_in_selection_snapshot(self):
+        import native_paired_replay as NPR
+        sessions = RO.session_from_selection(
+            factor_table(), quotes=[{"code": "600001", "name": "普通样本", "price": 10.0,
+                                     "prev_close": 9.8, "volume": 10000}],
+            first_board_codes=["600001"], session_date=DAYS[0])
+        restored = NPR.session_from_payload(sessions[0])
+        self.assertIsNone(restored.quotes[0].halted)
+        self.assertIsNone(restored.quotes[0].risk_flag)
+        verdict = NPR._can_buy(restored, restored.quotes[0])
+        # 有效价格与名称仍可由现有门禁作为证据，不把字段缺失当成一律拒绝。
+        self.assertTrue(verdict.executable)
+
+    def test_other_strategies_keep_their_quote_event_without_a_research_task(self):
+        import research_pipeline as RP
+
+        snapshot = RO.capture_other_strategy_event(
+            [{"code": "600001"}], {"600001": {"price": 10.0, "prev_close": 9.8}}, DAYS[0])
+        self.assertEqual(snapshot["frozen_sessions"][0]["quotes"][0]["code"], "600001")
+        with AQ.connect(":memory:") as conn:
+            event = RO.market_event("trend_pullback", session_date=DAYS[0], environment_ref={},
+                                    frozen_sessions=snapshot["frozen_sessions"])
+            result = RP.submit(conn, event)
+            self.assertTrue(result["created"])
+            self.assertFalse(result["task_created"])
+
     def test_historical_selection_cannot_be_mislabeled_as_a_contemporaneous_snapshot(self):
         from unittest import mock
         import datetime as dt

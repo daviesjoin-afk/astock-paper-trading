@@ -7844,6 +7844,8 @@ def generate_signals(asof_date=None):
         if meta.get("blocked") or not stamp or not stamp[0]:
             continue
         snapshot = research_snapshots.get(account["id"], {})
+        if account["id"] != "tq_breakout":
+            snapshot = RO.capture_other_strategy_event(candidates, evidence_quotes, day.isoformat())
         frozen_sessions = snapshot.get("frozen_sessions") or []
         if not frozen_sessions:
             summary.setdefault("research_events", []).append(
@@ -7856,7 +7858,7 @@ def generate_signals(asof_date=None):
             environment_ref={"factor_refresh": factor_refresh,
                              "candidate_count": len(candidates)},
             exact_identity=identity, frozen_sessions=frozen_sessions,
-            observed_at=frozen_sessions[-1]["decision_at"]))
+            observed_at=(frozen_sessions[-1]["decision_at"] if account["id"] == "tq_breakout" else None)))
         summary.setdefault("research_events", []).append(research)
     return summary
 
