@@ -287,12 +287,14 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
     def test_original_symbols_and_signatures_remain_compatible(self):
         self.assertEqual("(conn, cycle_id=None)", str(inspect.signature(PT._shared_cash)))
         self.assertEqual("(conn, cycle=None)", str(inspect.signature(PT._shared_initial_cash)))
+        # 写入侧刻意不兼容旧的调用形状：``cycle_id`` 是 keyword-only 且必须显式给出，
+        # 位置参数保持原义，避免"按位置调错顺序就悄悄换了周期"。
         self.assertEqual(
-            "(conn, amount, preferred_account_id=None)",
+            "(conn, amount, preferred_account_id=None, *, cycle_id=None)",
             str(inspect.signature(PT._debit_shared_cash)),
         )
         self.assertEqual(
-            "(conn, amount, account_id)",
+            "(conn, amount, account_id, *, cycle_id=None)",
             str(inspect.signature(PT._credit_shared_cash)),
         )
 
@@ -328,13 +330,17 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
         self.insert_accounts(("a", 10.0, 7.0))
         with mock.patch.object(PT, "_shared_account_rows", return_value=rows), \
                 mock.patch.object(PT, "_now", return_value="patched-now"):
-            self.assertTrue(PT._debit_shared_cash(self.conn, 2.0, preferred_account_id="a"))
+            self.assertTrue(PT._debit_shared_cash(
+                self.conn, 2.0, preferred_account_id="a", cycle_id=7,
+            ))
         self.assertEqual("patched-now", self.snapshot()[0][5])
 
     def test_credit_facade_delegates_and_uses_current_clock(self):
+        rows = _rows(("a", 10.0, 7.0))
         self.insert_accounts(("a", 10.0, 7.0))
-        with mock.patch.object(PT, "_now", return_value="patched-now"):
-            PT._credit_shared_cash(self.conn, 2.0, "a")
+        with mock.patch.object(PT, "_shared_account_rows", return_value=rows), \
+                mock.patch.object(PT, "_now", return_value="patched-now"):
+            PT._credit_shared_cash(self.conn, 2.0, "a", cycle_id=7)
         self.assertEqual(("a", 12.0, 7.0, 7, "running", "patched-now"), self.snapshot()[0])
 
     def test_facade_passes_current_numeric_normalizer(self):
@@ -434,6 +440,100 @@ class SharedCashArchitectureGuardTests(unittest.TestCase):
         self.assertIn("position exposure", source)
         self.assertIn("risk-exit eligibility", source)
         self.assertIn("paper_trading` → `paper_shared_cash", source)
+
+
+class ExplicitCycleCashMutationTests(unittest.TestCase):
+    """成交扣款/回款必须带显式周期，但两侧的边界**不对称**。
+
+    延迟成交的订单可能属于已经不是 active 的周期。扣款要是回落 ``_active_cycle``，
+    新一轮的现金池就会替上一轮的成交付钱 —— 账本仍然"平衡"，钱却花在了别人身上。
+
+    回款不一样：卖出回款只能回到**持有该仓位**的账户。已归档或已不在当前周期参与的
+    账户仍然必须执行风控退出，所以这里**不能**要求它是当前周期的经济所有者
+    （实测：那样会把真实的风控卖出打成 ``execution_retry``）。可靠的一致性检查是
+    「账户的耐久周期 == 订单周期」；周期未知（NULL）不算冲突。
+    """
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.executescript("""
+            CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, enabled_strategies TEXT);
+            CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, cycle_id INTEGER, status TEXT,
+                                        cash REAL, initial_cash REAL, updated_at TEXT);
+            CREATE TABLE strategy_definitions(id TEXT PRIMARY KEY, origin TEXT);
+            INSERT INTO paper_cycles VALUES(7, '["tq_breakout", "trend_pullback"]');
+            INSERT INTO paper_cycles VALUES(8, '["reported_profit_breakout"]');
+            INSERT INTO paper_accounts VALUES('tq_breakout', 7, 'paused', 20, 100, 'old');
+            INSERT INTO paper_accounts VALUES('trend_pullback', 7, 'running', 30, 100, 'old');
+            INSERT INTO paper_accounts VALUES('reported_profit_breakout', 8, 'running', 80, 100, 'old');
+            INSERT INTO paper_accounts VALUES('archived_sleeve', 7, 'archived', 5, 0, 'old');
+            INSERT INTO paper_accounts VALUES('legacy_unknown', NULL, 'archived', 3, 0, 'old');
+        """)
+
+    def cash(self, account_id):
+        return self.conn.execute(
+            "SELECT cash FROM paper_accounts WHERE id=?", (account_id,)
+        ).fetchone()[0]
+
+    def test_debit_requires_an_explicit_cycle(self):
+        with self.assertRaisesRegex(ValueError, "explicit_cycle_id_required"):
+            PT._debit_shared_cash(self.conn, 5.0)
+        self.assertEqual(20.0, self.cash("tq_breakout"))
+
+    def test_debit_stays_inside_the_requested_cycle_and_never_commits(self):
+        self.assertTrue(PT._debit_shared_cash(
+            self.conn, 40.0, preferred_account_id="trend_pullback", cycle_id=7,
+        ))
+        self.assertEqual(0.0, self.cash("trend_pullback"))
+        self.assertEqual(10.0, self.cash("tq_breakout"))
+        self.assertEqual(80.0, self.cash("reported_profit_breakout"))
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+        self.assertEqual(30.0, self.cash("trend_pullback"))
+
+    def test_debit_never_spends_another_cycles_pool(self):
+        # 周期 8 只有 80；要扣 100 必须失败，而不是去花周期 7 的 50。
+        with self.assertRaises(ValueError):
+            PT._debit_shared_cash(self.conn, 100.0, cycle_id=8)
+        self.assertEqual(20.0, self.cash("tq_breakout"))
+        self.assertEqual(30.0, self.cash("trend_pullback"))
+        self.assertEqual(80.0, self.cash("reported_profit_breakout"))
+
+    def test_credit_to_an_account_of_another_cycle_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "credit_account_cycle_mismatch"):
+            PT._credit_shared_cash(
+                self.conn, 5.0, "reported_profit_breakout", cycle_id=7,
+            )
+        self.assertEqual(80.0, self.cash("reported_profit_breakout"))
+
+    def test_credit_requires_a_known_account(self):
+        with self.assertRaisesRegex(ValueError, "credit_account_unknown"):
+            PT._credit_shared_cash(self.conn, 5.0, "no_such_account", cycle_id=7)
+
+    def test_credit_inside_the_cycle_moves_only_that_account(self):
+        PT._credit_shared_cash(self.conn, 7.5, "tq_breakout", cycle_id=7)
+        self.assertEqual(27.5, self.cash("tq_breakout"))
+        self.assertEqual(30.0, self.cash("trend_pullback"))
+        self.assertEqual(80.0, self.cash("reported_profit_breakout"))
+
+    def test_credit_still_reaches_an_account_outside_the_current_participants(self):
+        # 归档账户不属于周期 7 的经济所有者，但它自己的周期就是 7：风控退出必须能回款。
+        self.assertNotIn(
+            "archived_sleeve",
+            {row["id"] for row in PSC.cycle_account_rows(
+                self.conn, 7, builtin_scope=("tq_breakout", "trend_pullback",
+                                             "reported_profit_breakout"))},
+        )
+        PT._credit_shared_cash(self.conn, 9.0, "archived_sleeve", cycle_id=7)
+        self.assertEqual(14.0, self.cash("archived_sleeve"))
+
+    def test_credit_accepts_unknown_cycles_instead_of_blocking_the_exit(self):
+        # 账户周期为 NULL（历史数据）时不把"未知"当成"冲突"：不回款才是真正的账本错误。
+        PT._credit_shared_cash(self.conn, 2.0, "legacy_unknown", cycle_id=7)
+        self.assertEqual(5.0, self.cash("legacy_unknown"))
+        PT._credit_shared_cash(self.conn, 1.0, "legacy_unknown")
+        self.assertEqual(6.0, self.cash("legacy_unknown"))
 
 
 if __name__ == "__main__":

@@ -20,20 +20,6 @@ export function openInStrategyWorkbench(strategyId){
   if(typeof wbShowView==='function') wbShowView('list');
 }
 
-// Legacy adaptive/paper fragments can still arrive from a cached API payload.
-// Normalize only the visible workspace copy so a stale cached payload cannot
-// reintroduce the retired two/three/four-strategy wording. Historical replay
-// data stays untouched in the backend.
-export function normalizeActiveStrategyCopy(root){
-  if(!root) return;
-  var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT), node;
-  while((node=walker.nextNode())){
-    var value=node.nodeValue||'';
-    var normalized=value.replace(/(二|两|三|四|五)套(当前)?(模拟账户|策略)/g,'已启用策略').replace(/五策略/g,'已启用策略');
-    if(normalized!==value) node.nodeValue=normalized;
-  }
-}
-
 /* ================= PR-46：策略工坊（Strategy Workbench） =================
    Registry 驱动的策略生命周期工作台：列表 → 新建/编辑（条件构建器 + 高级
    DSL）→ 验证 → 风险与资金预览 → 保存草稿 → 激活 → 版本/事件 → 克隆/归档。

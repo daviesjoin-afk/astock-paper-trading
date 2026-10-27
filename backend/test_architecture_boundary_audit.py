@@ -29,13 +29,23 @@ class CouplingBudgetTests(unittest.TestCase):
     # 2026-10-27（选股应用/共享资金/前端去环）：selection_application 是新的
     # lower application owner，跨域边由它的实际依赖产生；其余额度按当前实测
     # 收紧，不重设基线。详见 docs/COUPLING_BUDGET.md 的当日切片。
+    #
+    # 2026-10-27（手单能力桥）：把 6 个有独立 owner 的模块对象从 paper_trading 的
+    # 全局桥移到 manual_orders 的直接 import。业务依赖没有增加，但同一条依赖
+    # 现在由**两个消费者**各自声明，跨域边因此 +5（666）。这是"声明位置更诚实"
+    # 的代价，不是新增耦合；其余额度不变。
+    #
+    # 2026-10-28（A5 任务生命周期）：`paper_jobs` / `paper_job_runs` 的 9 处写入
+    # 收进 `paper_job_lifecycle`，SQL 从主文件搬出后"含 execute 的模块"多了一个
+    # （141）。这是归属明确化的代价，不是新增写入面：`paper_trading` 里对这两张表
+    # 的 INSERT/UPDATE/DELETE 已归零（`test_paper_job_lifecycle` 有机械守卫）。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
         "deferred_imports": 38,
         "private_cross_access": 0,
-        "raw_sql_modules": 5,
+        "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 37,
+        "cross_domain_edges": 42,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,

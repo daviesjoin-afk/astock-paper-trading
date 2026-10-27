@@ -7,6 +7,57 @@ import { allocationActionPanel } from "./execution.js";
 import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError, toast } from "../ui/dialog.js";
 export { adaptiveValue } from "../core/format.js";
 
+/* ================= 资金分摊 / 调参的人工操作（本页持有） =================
+   这四个动作原本挂在 window 上、由 boot.js 承接：启动文件不该拥有业务写操作，
+   且它们只能被 inline onclick 触发。现在按钮只声明 ``data-adaptive-action``，
+   由本模块在容器上统一委托 —— 页面自己拥有自己的写操作与确认流程。
+
+   验收要点不变：仍需人工 confirm、确认后重新请求、失败提示原文照旧。 */
+export var ADAPTIVE_OPERATOR_ACTIONS = {
+  'apply-allocation': {
+    url: function(arg){return '/api/adaptive/allocation/apply?decision_id='+encodeURIComponent(arg)+'&approved_by=human-ui&confirmed=true';},
+    confirm: function(arg){return '确认把 Bandit 决策 #'+arg+' 的策略权重应用为共享资金池分摊？';},
+    fail: '应用失败：',
+    after: function(payload){renderAdaptive(payload);},
+  },
+  'rollback-allocation': {
+    url: function(arg){return '/api/adaptive/allocation/rollback?account_id='+encodeURIComponent(arg)+'&confirmed=true';},
+    confirm: function(arg){return '确认回滚 '+arg+' 的资金分摊覆盖到上一版？';},
+    fail: '回滚失败：',
+    after: function(payload){renderAdaptive(payload);},
+  },
+  'apply-tuner': {
+    url: function(arg){return '/api/adaptive/tuner/apply?run_id='+encodeURIComponent(arg)+'&approved_by=human-ui&confirmed=true';},
+    confirm: function(arg){return '确认把双AI共识运行 #'+arg+' 的提案应用为选股因子覆盖？';},
+    fail: '应用失败：',
+    after: function(){return loadEvolutionStatus();},
+  },
+  'rollback-tuner': {
+    url: function(arg){return '/api/adaptive/tuner/rollback?account_id='+encodeURIComponent(arg)+'&confirmed=true';},
+    confirm: function(arg){return '确认回滚 '+arg+' 的 AI 调参覆盖到 apply 前状态？';},
+    fail: '回滚失败：',
+    after: function(){return loadEvolutionStatus();},
+  },
+};
+
+export function installAdaptiveOperatorActions(root){
+  var container=root||(typeof document!=='undefined'?document:null);
+  if(!container||typeof container.addEventListener!=='function') return false;
+  container.addEventListener('click', async function(event){
+    var target=event.target;
+    var button=target&&target.closest?target.closest('[data-adaptive-action]'):null;
+    if(!button) return;
+    var action=ADAPTIVE_OPERATOR_ACTIONS[String(button.dataset.adaptiveAction||'')];
+    if(!action) return;
+    event.preventDefault();
+    var arg=button.dataset.adaptiveArg;
+    if(!window.confirm(action.confirm(arg))) return;
+    try{ action.after(await apiPost(action.url(arg)),arg); }
+    catch(e){ alert(action.fail+(e.message||e)); }
+  });
+  return true;
+}
+
 export function adaptiveStageClass(stage){
   if(stage==='eligible_for_review'||stage==='advisory') return 'ready';
   if(stage==='shadow'||stage==='regime_validation') return 'learning';
@@ -59,6 +110,17 @@ function adaptiveResearchResultNotice(payload){
 
 export function adaptiveResearchStatusLabel(value){
   return ({supported:'支持（研究假设）',unsupported:'不支持（研究假设）',insufficient_evidence:'证据不足（研究假设）'})[String(value||'').toLowerCase()]||'未知研究状态';
+}
+
+/* 闭环准入台的成交覆盖口径。分子是**有成交证据**的账户数（历史上可能含已退役
+   账户），分母只能来自后端 owner 的当前周期参与集合（closed_loop.
+   strategy_coverage_total）。拿不到分母时只报分子 —— 绝不写死一个策略数量，
+   也绝不拿"覆盖 N/0"冒充已知比例。 */
+export function adaptiveCoverageLabel(coverage,total){
+  var numerator=Number(coverage||0),denominator=Number(total||0);
+  if(!isFinite(numerator)) numerator=0;
+  if(!isFinite(denominator)||denominator<=0) return numerator+' 个账户';
+  return numerator+' / '+denominator+' 当前参与账户';
 }
 
 /* 验证/鲁棒性视图的运行状态同样是英文枚举，直接印出来等于把内部标识
@@ -510,7 +572,7 @@ export function renderAdaptive(d){
   var selectionOpt=d.selection_optimizer||{},selectionCandidates=selectionOpt.candidates||[];
   var newsLearning=d.news_learning||{},newsTotals=newsLearning.totals||{},newsFactor=newsLearning.factor||{},newsGates=newsFactor.gates||{};
   var tradeAttribution=d.trade_attribution||{},tradeAttrAccounts=tradeAttribution.by_account||{};
-  var closedLoop=d.closed_loop||{},chain=closedLoop.evidence_chain||{},admissionWindow=closedLoop.admission_window||{},legacyDebt=closedLoop.legacy_debt||{},canaryLimits=closedLoop.limits||{};
+  var closedLoop=d.closed_loop||{},coverageTotal=Number(closedLoop.strategy_coverage_total||0)||0,chain=closedLoop.evidence_chain||{},admissionWindow=closedLoop.admission_window||{},legacyDebt=closedLoop.legacy_debt||{},canaryLimits=closedLoop.limits||{};
   var portfolioShadow=d.portfolio_shadow||{},portfolioSelected=portfolioShadow.selected||[];
   var dataInputs=d.data_inputs||{},dataCategories=dataInputs.categories||[];
   var dynamicRisk=d.dynamic_risk||{},dynamicNews=dynamicRisk.news||{},dynamicMode=dynamicRisk.mode||'normal';
@@ -588,7 +650,7 @@ export function renderAdaptive(d){
   var tradeAttrPanel='<section class="adaptive-panel trade-attribution-panel"><header><div><span>TRADE → REASON → LEARNING</span><h3>盘后逐笔涨跌归因</h3></div><em>'+Number(tradeAttribution.records||0)+' 条记录</em></header><p class="adaptive-copy">每个收盘任务先计算个股涨跌、大盘拖累、板块贡献、公告/舆情和行情质量，再批量调用 AI 做可审计解释；AI 结论只进入自进化证据，不直接下单。</p><div class="adaptive-grid trade-attribution-summary">'+tradeAttrAccountCards+'</div><ul class="adaptive-run-log trade-attribution-list">'+tradeAttrRows+'</ul></section>';
   var closedLoopStages=(closedLoop.timeline||[]).map(function(x){var active=String(x.stage)===String(closedLoop.stage);return '<div class="closed-loop-stage '+(active?'active':'')+'"><b>'+adaptiveEsc(x.stage)+'</b><span>'+adaptiveEsc(x.mode)+'</span><em>'+Number(x.nav_pct||0)+'% 资金</em></div>';}).join('');
   var closedLoopBlockers=(closedLoop.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">当前阶段的确定性门禁已通过</li>';
-  var closedLoopPanel='<section class="adaptive-panel closed-loop-panel"><header><div><span>DATA → ALPHA → PORTFOLIO → RISK → EXECUTION → FEEDBACK</span><h3>量化闭环准入台</h3></div><em>'+adaptiveEsc(closedLoop.stage||'D1-D3')+' · '+adaptiveEsc(closedLoop.mode==='shadow'?'影子运行':closedLoop.mode||'影子运行')+'</em></header><p class="adaptive-copy">先把信号、风控、委托、成交和结果串成同一证据链，再让自适应模块按 0% → 5% → 10% 的模拟资金逐级接管。日期到了但证据不达标不会强行放权。</p><div class="closed-loop-stages">'+closedLoopStages+'</div><div class="closed-loop-kpis"><div><small>历史证据链委托</small><b>'+Number(chain.orders||0)+'</b></div><div><small>新窗口关联率</small><b>'+adaptiveValue(admissionWindow.link_pct,'%',1)+'</b></div><div><small>新窗口完整率</small><b>'+adaptiveValue(admissionWindow.valid_pct,'%',1)+'</b></div><div><small>实际 / 反事实</small><b>'+Number(chain.actual||0)+' / '+Number(chain.counterfactual||0)+'</b></div><div><small>策略成交覆盖</small><b>'+Number(closedLoop.strategy_coverage||0)+' / 5 当前账户</b></div><div><small>灰度硬上限</small><b>'+Number(canaryLimits.max_nav_pct||10)+'% · '+Number(canaryLimits.max_new_slots||2)+'槽</b></div></div><div class="closed-loop-gates"><h4>当前阻断项</h4><ul>'+closedLoopBlockers+'</ul><small>历史债务：未完整关联 '+Number(legacyDebt.unlinked_orders||0)+' 条；只保留审计，不计入新闭环准入。</small></div><div class="adaptive-notice">未成交、风控拒绝、容量延期只进入反事实账本，不再混入真实 Bandit 收益。GA、神经网络和 DeepSeek 在本阶段只能生成影子研究证据，不能直接控制订单。</div></section>';
+  var closedLoopPanel='<section class="adaptive-panel closed-loop-panel"><header><div><span>DATA → ALPHA → PORTFOLIO → RISK → EXECUTION → FEEDBACK</span><h3>量化闭环准入台</h3></div><em>'+adaptiveEsc(closedLoop.stage||'D1-D3')+' · '+adaptiveEsc(closedLoop.mode==='shadow'?'影子运行':closedLoop.mode||'影子运行')+'</em></header><p class="adaptive-copy">先把信号、风控、委托、成交和结果串成同一证据链，再让自适应模块按 0% → 5% → 10% 的模拟资金逐级接管。日期到了但证据不达标不会强行放权。</p><div class="closed-loop-stages">'+closedLoopStages+'</div><div class="closed-loop-kpis"><div><small>历史证据链委托</small><b>'+Number(chain.orders||0)+'</b></div><div><small>新窗口关联率</small><b>'+adaptiveValue(admissionWindow.link_pct,'%',1)+'</b></div><div><small>新窗口完整率</small><b>'+adaptiveValue(admissionWindow.valid_pct,'%',1)+'</b></div><div><small>实际 / 反事实</small><b>'+Number(chain.actual||0)+' / '+Number(chain.counterfactual||0)+'</b></div><div><small>策略成交覆盖</small><b>'+adaptiveCoverageLabel(closedLoop.strategy_coverage,coverageTotal)+'</b></div><div><small>灰度硬上限</small><b>'+Number(canaryLimits.max_nav_pct||10)+'% · '+Number(canaryLimits.max_new_slots||2)+'槽</b></div></div><div class="closed-loop-gates"><h4>当前阻断项</h4><ul>'+closedLoopBlockers+'</ul><small>历史债务：未完整关联 '+Number(legacyDebt.unlinked_orders||0)+' 条；只保留审计，不计入新闭环准入。</small></div><div class="adaptive-notice">未成交、风控拒绝、容量延期只进入反事实账本，不再混入真实 Bandit 收益。GA、神经网络和 DeepSeek 在本阶段只能生成影子研究证据，不能直接控制订单。</div></section>';
   var portfolioRows=portfolioSelected.map(function(x){return '<article><div><span>'+adaptiveEsc(x.account_name)+'</span><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><small>'+adaptiveEsc(x.industry||'未知行业')+' · '+adaptiveEsc((x.reasons||[]).join('；'))+'</small></div><strong>'+fmt(x.utility,1)+'</strong></article>';}).join('')||'<div class="paper-empty">当前没有可进入组合比较的新增候选。</div>';
   var portfolioPanel='<section class="adaptive-panel portfolio-shadow-panel"><header><div><span>PORTFOLIO ARBITER · SHADOW</span><h3>跨策略组合裁决</h3></div><em>影子运行 · 不改变订单</em></header><p class="adaptive-copy">已启用策略继续独立选股；组合层只在共享资金池里比较边际效用，并对同股重复、行业集中和容量延期扣分。当前最多展示 '+Number(portfolioShadow.max_canary_slots||2)+' 个灰度候选。</p><div class="portfolio-shadow-kpis"><span>候选 <b>'+Number(portfolioShadow.candidate_count||0)+'</b></span><span>当前持仓槽 <b>'+Number(portfolioShadow.held_slots||0)+'</b></span><span>重复代码 <b>'+Number(portfolioShadow.duplicate_code_count||0)+'</b></span></div><div class="portfolio-shadow-list">'+portfolioRows+'</div><div class="adaptive-notice">该裁决器不会因为 Bandit 权重变化强制卖出现有持仓；T+1、双源行情、82%总暴露和原策略风控仍拥有最终否决权。</div></section>';
   var dataCards=dataCategories.map(function(x){var coverage=x.coverage_pct==null?'分项统计':fmt(x.coverage_pct,1)+'%';var freshness=x.freshness_minutes==null?'':(' · 延迟 '+fmt(x.freshness_minutes,1)+'分钟');return '<article class="data-input-card '+adaptiveEsc(x.status||'partial')+'"><header><div><span>'+adaptiveEsc(x.id||'data')+'</span><h4>'+adaptiveEsc(x.name)+'</h4></div><em>'+adaptiveEsc(({usable:'可用于交易',shadow:'仅影子',partial:'部分可用',blocked:'禁止新增'})[x.status]||x.status)+'</em></header><div class="data-input-metric"><b>'+coverage+'</b><small>'+Number(x.records||0)+' 条/行'+freshness+'</small></div><p>'+adaptiveEsc(x.detail||'')+'</p><div class="data-input-sources">'+(x.sources||[]).map(function(s){return '<span>'+adaptiveEsc(s)+'</span>';}).join('')+'</div><small>'+adaptiveEsc(x.authority||'')+'</small></article>';}).join('');
@@ -923,9 +985,9 @@ export function renderDualAiRuns(runs){
     var action='';
     if(r.status==='consensus'&&proposalCount>0&&applied&&applied.length===0){
       var fresh=(Date.now()-new Date(String(r.created_at||'').replace(' ','T')).getTime())<30*60*1000;
-      action=fresh?'<button class="ghost" onclick="applyAdaptiveTunerProposal('+Number(r.id)+')">应用共识</button>':'<span style="color:#9aa5b1;font-size:11px">已过期</span>';
+      action=fresh?'<button class="ghost" data-adaptive-action="apply-tuner" data-adaptive-arg="'+Number(r.id)+'">应用共识</button>':'<span style="color:#9aa5b1;font-size:11px">已过期</span>';
     }else if(applied&&applied.length){
-      action=applied.map(function(a){return '<button class="ghost" onclick="rollbackAdaptiveTunerOverlay(\''+adaptiveEsc(a)+'\')">回滚'+adaptiveEsc(a)+'</button>';}).join(' ');
+      action=applied.map(function(a){return '<button class="ghost" data-adaptive-action="rollback-tuner" data-adaptive-arg="'+adaptiveEsc(a)+'">回滚'+adaptiveEsc(a)+'</button>';}).join(' ');
     }else if(applied===null){action='落地记录格式异常';}
     h+='<tr>'
       +'<td>#'+r.id+'</td>'

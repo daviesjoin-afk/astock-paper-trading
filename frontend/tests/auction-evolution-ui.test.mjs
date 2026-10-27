@@ -20,7 +20,8 @@ test('旧空对象和新版数组均可读取，非法落地记录不能生成�
     assert.match(target.innerHTML,/#6/);
     assert.doesNotMatch(target.innerHTML,/回滚|应用共识/);
     renderDualAiRuns([{id:7,status:'consensus',applied_ids:['tq_breakout'],reviewers:{}}]);
-    assert.match(target.innerHTML,/rollbackAdaptiveTunerOverlay/);
+    assert.match(target.innerHTML,/data-adaptive-action="rollback-tuner"/);
+    assert.doesNotMatch(target.innerHTML,/onclick=/);
   });
 });
 

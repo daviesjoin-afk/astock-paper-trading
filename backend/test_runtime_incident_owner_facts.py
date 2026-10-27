@@ -46,8 +46,8 @@ ADAPTIVE_EXECUTION_EVIDENCE = "adaptive_execution_evidence"
 #: 其余出现方式（行清除、旧时间戳格式归一）在 ``_DYNAMIC_WRITER_REGISTRY`` 里逐项登记。
 OWNER_BY_TABLE = {
     ADAPTIVE_RUNS: "adaptive_engine.py",
-    PAPER_JOBS: "paper_trading.py",
-    PAPER_JOB_RUNS: "paper_trading.py",
+    PAPER_JOBS: "paper_job_lifecycle.py",
+    PAPER_JOB_RUNS: "paper_job_lifecycle.py",
     PAPER_RUNTIME_LOCKS: "paper_trading.py",
     ADAPTIVE_EXECUTION_EVIDENCE: "adaptive_engine.py",
 }
@@ -171,11 +171,55 @@ def _function_facts(module: str, function: str) -> tuple[set[str], list[str]]:
     raise AssertionError(f"{module} 里没有函数 {function}")
 
 
+def _rendered_statements(name: str) -> list[str]:
+    """模块里的语句文本，**把模块级字符串常量渲染回占位符**。
+
+    owner（``paper_job_lifecycle``）用 ``f"UPDATE {DAILY_TABLE} ..."`` 构造语句，
+    表名是模块常量而不是字面量。只扫源码文本会把它看成"没有写语句"，于是
+    "只有 owner 能写"这条断言就变成了空转 —— 空集当然等于空集。这里按 AST 取出
+    字符串/模板，再用本模块的常量替换 ``{NAME}``，让两种写法等价可见。
+    注释不参与（不是 AST 节点），避免"文档里提到 UPDATE paper_jobs"被误判。
+    """
+    tree = ast.parse(_source(name))
+    values = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+            if isinstance(target, ast.Name) and isinstance(value, ast.Constant) \
+                    and isinstance(value.value, str):
+                values[target.id] = value.value
+    rendered = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = node.value
+        elif isinstance(node, ast.JoinedStr):
+            parts = []
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    parts.append(part.value)
+                elif isinstance(part, ast.FormattedValue) and isinstance(part.value, ast.Name):
+                    parts.append("{" + part.value.id + "}")
+                else:
+                    parts.append("{}")
+            text = "".join(parts)
+        else:
+            continue
+        for key, value in values.items():
+            text = text.replace("{" + key + "}", value)
+        rendered.append(text)
+    return rendered
+
+
 def _literal_write_modules(table: str) -> set[str]:
     """**字面**写语句（含 ``INSERT OR REPLACE`` / ``INSERT OR IGNORE`` / UPSERT 头）指向
-    ``table`` 的模块。UPSERT 的 ``ON CONFLICT ... DO UPDATE`` 由同一句 INSERT 覆盖。"""
+    ``table`` 的模块。UPSERT 的 ``ON CONFLICT ... DO UPDATE`` 由同一句 INSERT 覆盖。
+
+    模块级常量会先渲染回表名，因此 ``f"UPDATE {TABLE}"`` 与 ``"UPDATE paper_jobs"``
+    在"谁写了这张表"这件事上等价。
+    """
     pattern = re.compile(rf"{_WRITE_VERB}[\s\S]{{0,60}}?\b{table}\b")
-    return {name for name in _production_modules() if pattern.search(_source(name))}
+    return {name for name in _production_modules()
+            if any(pattern.search(text) for text in _rendered_statements(name))}
 
 
 def _string_constants(name: str) -> list[str]:
@@ -344,7 +388,11 @@ class RuntimeWriterBoundaryTests(unittest.TestCase):
             {OWNER_BY_TABLE[PAPER_JOBS]}, writers,
             f"{PAPER_JOBS} 的写者集合发生变化：{sorted(writers)}",
         )
-        self.assertIn("INSERT INTO paper_jobs", _source(OWNER_BY_TABLE[PAPER_JOBS]))
+        self.assertTrue(
+            any("INSERT INTO paper_jobs" in text
+                for text in _rendered_statements(OWNER_BY_TABLE[PAPER_JOBS])),
+            "owner 源码里找不到 INSERT INTO paper_jobs（渲染常量后）",
+        )
 
     def test_INC_03_paper_job_runs_writer_is_the_owner_only(self):
         """INC-03：``paper_job_runs``（本轮的 attempt 级 fact 来源）同样只有一个 writer。"""
@@ -353,7 +401,11 @@ class RuntimeWriterBoundaryTests(unittest.TestCase):
             {OWNER_BY_TABLE[PAPER_JOB_RUNS]}, writers,
             f"{PAPER_JOB_RUNS} 的写者集合发生变化：{sorted(writers)}",
         )
-        self.assertIn("INSERT INTO paper_job_runs", _source(OWNER_BY_TABLE[PAPER_JOB_RUNS]))
+        self.assertTrue(
+            any("INSERT INTO paper_job_runs" in text
+                for text in _rendered_statements(OWNER_BY_TABLE[PAPER_JOB_RUNS])),
+            "owner 源码里找不到 INSERT INTO paper_job_runs（渲染常量后）",
+        )
 
     def test_INC_03b_adaptive_execution_evidence_writer_is_the_owner_only(self):
         """INC-03b：``adaptive_execution_evidence`` 的 writer 也只有 owner 一个模块。

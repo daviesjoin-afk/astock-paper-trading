@@ -2106,7 +2106,8 @@ def commit_fill(
             if not ok:
                 raise RuntimeError(reserve_reason or "共享资金池预占失败")
         PT._assert_active_lease(conn, "execution planner cash debit")
-        PT._debit_shared_cash(conn, amount + fees, preferred_account_id=account_id)
+        PT._debit_shared_cash(conn, amount + fees, preferred_account_id=account_id,
+                              cycle_id=order_cycle_id)
         if reserved:
             PT._consume_capital_reservation(
                 conn, order_id, amount, fees, final=(remaining_qty == 0),
@@ -2129,7 +2130,7 @@ def commit_fill(
         if consumed != qty:
             raise RuntimeError("可卖份额在成交前发生变化，委托已停止")
         realized_pnl = amount - cost_amount - fees
-        PT._credit_shared_cash(conn, amount - fees, account_id)
+        PT._credit_shared_cash(conn, amount - fees, account_id, cycle_id=order_cycle_id)
         # R14 §17：SELL 的 episode 收尾与 lot 消耗同处一个事务，并直接依赖
         # paper_position_risk_state（不经 paper_trading 转发）。manual / deferred
         # SELL 同样能卖光最后一股，必须关闭 episode，否则权威表残留"看着还活着"

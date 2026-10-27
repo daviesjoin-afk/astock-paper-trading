@@ -8,10 +8,10 @@
 |---|---:|---:|---:|---:|
 | import 环 | 5 | 2 | 不允许反弹 | 0 |
 | 延迟 import | 583 | 621 | 38 | 逐步降低；仅移除无必要的延迟依赖 |
-| 裸 SQL 模块 | 135 | 140 | 5 | ≤60 |
+| 裸 SQL 模块 | 135 | 141 | 6 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
 | 跨模块私有属性访问 | 202 | 202 | 0 | 0 |
-| 跨域 import 边 | 624 | 661 | 37 | 分阶段降低 |
+| 跨域 import 边 | 624 | 666 | 42 | 分阶段降低 |
 | 最大文件 | 16367 行 | 15676 行 | 0 | ≤2500 |
 | 最大函数 | 1191 行 | 1195 行 | 4 | <200 |
 | 单函数最大全局引用 | 56 | 57 | 1 | <80 |
@@ -24,6 +24,22 @@
 
 ## 本次切片
 
+- 2026-10-28（A5 任务生命周期）：`paper_jobs` / `paper_job_runs` 的 **9 处**状态写入（认领探测、运行中过期判失败、首次 INSERT、重试认领 CAS、心跳续期 CAS、完成 CAS、失败 CAS、启动回收、历史清理）从 `paper_trading` 收进新 owner `paper_job_lifecycle`，语句只有一份，`paper_trading` 里对这两张表的 INSERT/UPDATE/DELETE **归零**（`test_paper_job_lifecycle` 用 AST 扫描 + 常量渲染做机械守卫，含空结果非空性）。行为不变：owner 不 commit、不做"该不该重试"的业务判断，CAS 谓词（`owner_key` + `fencing_token` + `status='running'`）逐字保留。裸 SQL 模块 140 → 141（SQL 换了归属，模块数多一个，额度 +1 已登记）；主文件 `paper_trading.py` 少 84 行。
+- 2026-10-27（§13.4 复用资源测量）：`backend/tools/modularity_reuse_bench.py` 把「同轮输入复用」的净效果做成可重跑证据 ——
+  三个消费者、5000 只证券、合成输入、不联网不碰生产库。分开取数时 universe/finance/fundamental 各 **3** 次；
+  共用一轮输入后各 **1** 次。本机（Windows / Python 3.14.5 / 中位数口径单次运行）：
+  墙钟 **2.102 s → 1.215 s**、进程 CPU **2.047 s → 1.203 s**、tracemalloc 峰值 **20.80 MiB → 17.84 MiB**，
+  即 −0.887 s / −0.844 s CPU / −2.96 MiB，且把哈希与深拷贝开销算在内。结果等价由三份 frame 的 SHA256 全部相等来断言，
+  另有三个失效反例（重复读复用、空读不进缓存、消费者改写不影响下一个）。**限制**：合成输入、无行情网络、
+  无数据库与盘中竞争，不能当成生产线整轮提速或收益。
+- 2026-10-27（手单能力桥）：`manual_orders` 不再经 `paper_trading` 的全局桥取模块对象 ——
+  `decision_engine` / `portfolio_allocation_policy` / `portfolio_allocation_weights` /
+  `portfolio_runtime` / `portfolio_runtime_service` / `runtime_settings` 与
+  `ReservationCycleMismatch` 改为直接依赖各自 owner，能力桥字段 57 → 50。业务依赖没有增加，
+  但同一条依赖现在由两个消费者各自声明，`跨域 import 边` 661 → 666（额度 +5，已登记）。
+  新增守卫：桥里不允许出现任何模块对象（带合成样本的非空性用例），且
+  `import manual_orders` 不得把 `paper_trading` 拉进 `sys.modules`。
+- 2026-10-27（闭环覆盖口径 / 退役文案观察器）：闭环准入台的「成交覆盖」分母改为后端 owner 字段 `closed_loop.strategy_coverage_total`（由 `_weight_participants()` 的周期参与快照派生，拿不到报 `null` 而不是 0），前端不再写死 `/ 5 当前账户`；同一份 overview 里参与集合只读一次，覆盖分母与 horizon 汇总共用同一快照。删除 `boot.js` 的 `MutationObserver` 整树文案改写与 `strategies.js` 的 `normalizeActiveStrategyCopy`，改为机械守卫：生产 Python 非 docstring 字符串常量、前端去掉注释后的字面量都不允许再出现退役称谓（`test_retired_strategy_copy_guard`，含可驱动成 RED 的非空性用例）。本切片不改变导入环、裸 SQL、私有访问、最大文件/函数等计数，因此不调整任何预算额度。
 - 2026-10-27（第三批）：选股流水线从 HTTP 主入口下沉到 `selection_application`，API 与两个命令行入口共用；共享资金读取改为显式周期 owner；前端提供商设置不再反向导入设置页面。导入环 3 → 2，主文件行数降至 15,676，私有跨模块访问收紧到基线 202。缺报价账户/资金池/风险页保持 `unknown`，已实现盈亏仍可展示。
 - 2026-10-27（前端加载/候选/选股复用）：`navigation` 不再导入任何 feature，页面 loader 由 `boot` 组合根注册；非选股深链不再无条件请求选股数据。前端静态环 1 → 0；单 bundle 体积基本不变，因此不把去环当成 JS 传输缩短。候选准备新增按 `(code, asof)` 的披露证据轮内复用，失败不缓存、不同日期重取，原有来源错误语义保持不变。`paper_selection.run_daily` 与定时 `selection_runner` 在一个显式 `selection_round` 内共享 live snapshot、snap 和 fundamental 计算；单策略调用不改变原路径。
 - 2026-10-27：将无法证明来源的观测类型常量归到已有 `point_in_time` 契约；摄取层保留原名别名，观察账本不再反向导入摄取层。进化版本和全局参数边界归到共享契约，激活校验不再反导生成器。导入环从 5 组降为 3 组，守卫同步收紧；来源指纹、参数边界和事务语义不变。

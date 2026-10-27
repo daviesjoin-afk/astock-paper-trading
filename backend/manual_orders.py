@@ -14,8 +14,21 @@ from __future__ import annotations
 
 import datetime as dt
 
+import decision_engine as DE
 import market_data_contract as MDC
 import market_data_service as MDSvc
+import paper_capital_reservations as PCR
+import portfolio_allocation_policy as PAPolicy
+import portfolio_allocation_weights as PAW
+import portfolio_runtime as PRuntime
+import portfolio_runtime_service as PRS
+import runtime_settings as RSET
+
+# 这些能力有**独立 owner**（决策引擎、组合分配/运行时、预占、运行时设置），
+# 手单直接依赖 owner，而不是经 `paper_trading` 的全局桥转发一遍。桥只保留
+# 真正属于交易引擎的业务函数与常量 —— 转发一层并不会让依赖变少，只会让
+# "谁负责" 更难看出来。
+ReservationCycleMismatch = PCR.ReservationCycleMismatch
 
 
 from dataclasses import dataclass
@@ -26,18 +39,11 @@ from typing import Any, Callable
 class ManualOrderDependencies:
     """Explicit capabilities supplied by the application composition root."""
     ACTIVE_ACCOUNT_IDS: Any
-    DE: Any
     ENTRY_FREEZE_ENV: Any
     ENTRY_FROZEN_WAITLIST_STATUS: Any
     ENTRY_RETRY_ORDER_STATUSES: Any
     LOT_SIZE: Any
     MANUAL_EXECUTION_RETRY_STATUS: Any
-    PAPolicy: Any
-    PAW: Any
-    PRS: Any
-    PRuntime: Any
-    RSET: Any
-    ReservationCycleMismatch: Any
     SHARED_POOL_MAX_EXPOSURE: Any
     STRATEGY_EXECUTION_RETRY_STATUS: Any
     _assert_active_lease: Any
@@ -104,11 +110,9 @@ def _manual_order_plan(
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     ACTIVE_ACCOUNT_IDS = deps.ACTIVE_ACCOUNT_IDS
-    DE = deps.DE
     ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
     ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
     LOT_SIZE = deps.LOT_SIZE
-    RSET = deps.RSET
     SHARED_POOL_MAX_EXPOSURE = deps.SHARED_POOL_MAX_EXPOSURE
     _spec_for = deps._spec_for
     _asset_type = deps._asset_type
@@ -131,10 +135,6 @@ def _manual_order_plan(
     _shared_cash = deps._shared_cash
     _shared_risk_state = deps._shared_risk_state
     _strategy_entry_assessment = deps._strategy_entry_assessment
-    PAPolicy = deps.PAPolicy
-    PAW = deps.PAW
-    PRuntime = deps.PRuntime
-    PRS = deps.PRS
     _universe_snapshot_time = deps._universe_snapshot_time
     _with_decision_snapshot = deps._with_decision_snapshot
     import execution_planner as EP
@@ -703,7 +703,6 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
     """
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ReservationCycleMismatch = deps.ReservationCycleMismatch
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
     _finish_capital_reservation = deps._finish_capital_reservation
     _risk_log = deps._risk_log
@@ -885,7 +884,7 @@ def submit_manual_order(
     _strategy_stamp = deps._strategy_stamp
     init_db = deps.init_db
     deps = _dependencies()
-    _ReservationCycleMismatch = deps.ReservationCycleMismatch
+    _ReservationCycleMismatch = ReservationCycleMismatch
     import execution_planner as EP
     init_db()
     day = _date(asof_date)
@@ -1121,7 +1120,6 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     """
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ReservationCycleMismatch = deps.ReservationCycleMismatch
     _audit = deps._audit
     _finish_capital_reservation = deps._finish_capital_reservation
     _json = deps._json
@@ -1200,7 +1198,7 @@ def process_pending_manual_orders(asof_date=None):
     _rows = deps._rows
     init_db = deps.init_db
     deps = _dependencies()
-    _ReservationCycleMismatch = deps.ReservationCycleMismatch
+    _ReservationCycleMismatch = ReservationCycleMismatch
     import execution_planner as EP
     init_db()
     day = _date(asof_date)

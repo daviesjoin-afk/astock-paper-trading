@@ -7,9 +7,9 @@ import { PAPER_NAV_TTL_MS } from "../core/state.js";
 
 export function allocationActionPanel(d){
   var alloc=(d&&d.allocation)||{},latest=alloc.latest_decision||{},active=alloc.active||{};
-  var rows=Object.keys(active).map(function(id){var a=active[id]||{};return '<li><div><b>'+adaptiveEsc(id)+'</b><small>当前分摊 '+adaptiveValue(a.weight_pct,'%',1)+' · 决策 #'+adaptiveEsc(String(a.decision_id||'—'))+' · 生效 '+adaptiveEsc(String(a.effective_date||'—'))+'</small></div><button class="ghost" onclick="rollbackAdaptiveAllocation(\''+adaptiveEsc(id)+'\')">回滚分摊</button></li>';}).join('');
+  var rows=Object.keys(active).map(function(id){var a=active[id]||{};return '<li><div><b>'+adaptiveEsc(id)+'</b><small>当前分摊 '+adaptiveValue(a.weight_pct,'%',1)+' · 决策 #'+adaptiveEsc(String(a.decision_id||'—'))+' · 生效 '+adaptiveEsc(String(a.effective_date||'—'))+'</small></div><button class="ghost" data-adaptive-action="rollback-allocation" data-adaptive-arg="'+adaptiveEsc(id)+'">回滚分摊</button></li>';}).join('');
   var canApply=latest&&latest.can_apply;
-  var applyBar=canApply?'<div class="adaptive-human-actions"><span>最新决策 #'+Number(latest.id)+' · 阶段 '+adaptiveEsc(latest.stage||'')+'</span><button class="ghost" onclick="applyAdaptiveAllocation('+Number(latest.id)+')">人工批准权重分摊</button></div>':(latest&&latest.status==='applied'?'<div class="adaptive-notice">最新决策已应用为资金分摊覆盖。</div>':'');
+  var applyBar=canApply?'<div class="adaptive-human-actions"><span>最新决策 #'+Number(latest.id)+' · 阶段 '+adaptiveEsc(latest.stage||'')+'</span><button class="ghost" data-adaptive-action="apply-allocation" data-adaptive-arg="'+Number(latest.id)+'">人工批准权重分摊</button></div>':(latest&&latest.status==='applied'?'<div class="adaptive-notice">最新决策已应用为资金分摊覆盖。</div>':'');
   if(!canApply&&!rows){return '<div class="adaptive-notice">资金分摊覆盖未启用：继续使用各策略 max_exposure 基准权重。需要决策进入 advisory/eligible 阶段且人工批准后才生效。</div>';}
   return applyBar+(rows?'<ul class="adaptive-run-log">'+rows+'</ul>':'');
 }
