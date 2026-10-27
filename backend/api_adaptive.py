@@ -89,25 +89,33 @@ def _experiment_validation_connection(*, query_only: bool):
         conn.close()
 
 
+_experiment_service_module = None
+
+
+def _experiment_service():
+    """Load the experiment application flow only when an experiment route runs.
+
+    The R29/R30 stack pulls in archives, dataset builders and runners; importing
+    it at API boot would slow every worker and every test that only touches the
+    adaptive page. One cached accessor keeps that laziness while giving the four
+    call sites a single place to import from (instead of four local imports).
+    """
+    global _experiment_service_module
+    if _experiment_service_module is None:
+        import experiment_validation_service as module
+
+        _experiment_service_module = module
+    return _experiment_service_module
+
+
 def _validation_run_projection(row):
-    return {key: row.get(key) for key in (
-        "id", "run_key", "experiment_fingerprint", "strategy_id", "strategy_version",
-        "strategy_checksum", "calendar_fingerprint", "universe_archive_fingerprint",
-        "financial_archive_fingerprint", "tradability_evidence_fingerprint",
-        "market_archive_fingerprint", "dataset_fingerprint",
-        "validation_status", "validation_evidence", "result", "folds", "runner_version",
-        "runner_code_revision", "created_at")}
+    """兼容入口：投影字段的唯一实现在 ``experiment_validation_service``。"""
+    return _experiment_service().validation_run_projection(row)
 
 
 def _robustness_owner_identities(request, baseline):
-    expected = {key: baseline.get(key) for key in (
-        "calendar_fingerprint", "universe_archive_fingerprint",
-        "financial_archive_fingerprint", "tradability_evidence_fingerprint",
-        "market_archive_fingerprint", "dataset_fingerprint", "strategy_id",
-        "strategy_version", "strategy_checksum")}
-    if request.owner_identities != expected:
-        raise ValueError("baseline_owner_identity_mismatch")
-    return expected
+    """兼容入口：身份钉定的唯一实现在 ``experiment_validation_service``。"""
+    return _experiment_service().robustness_owner_identities(request.owner_identities, baseline)
 
 
 @contextmanager
@@ -449,94 +457,22 @@ def canonical_research_run(run_id: int = Path(..., gt=0)):
 
 @router.post("/experiments/validate")
 def validate_canonical_experiment(request: ExperimentValidationRequest):
-    """Run an exact-identity validation offline; never refresh or select inputs."""
-    try:
-        import experiment_contract as EC
-        import experiment_execution_model  # noqa: F401
-        import financial_feature_evidence as FFE
-        import experiment_validation_repository as EVR
-        import historical_financial_archive as HFA
-        import experiment_validation_runner as runner
-        import historical_market_archive as HMA
-        import historical_session_calendar as HSC
-        import historical_universe_archive as HUA
-        import learning_dataset as LD
-        import strategy_registry as SR
-        import tradability_archive as TA
-        import walk_forward_validation as WFV
+    """Run an exact-identity validation offline; never refresh or select inputs.
 
-        raw = dict(request.spec)
-        strategy = raw.get("strategy")
-        if not isinstance(strategy, dict):
-            raise ValueError("strategy_identity_required")
-        raw["strategy"] = EC.StrategyIdentity(**strategy)
-        raw["start_date"] = raw.pop("start_date", raw.get("date_range", {}).get("start"))
-        raw["end_date"] = raw.pop("end_date", raw.get("date_range", {}).get("end"))
-        raw.pop("date_range", None)
-        spec = EC.ExperimentSpec(**raw)
-        if (spec.market_data_fingerprint != request.market_archive_fingerprint
-                or spec.universe_fingerprint != request.universe_archive_fingerprint
-                or spec.parameter_set.get("validation_calendar_fingerprint") != request.calendar_fingerprint
-                or spec.parameter_set.get("financial_archive_fingerprint") != request.financial_archive_fingerprint):
-            raise ValueError("owner_identity_mismatch")
-        config = WFV.WalkForwardConfig(**request.walk_forward)
-        with _experiment_validation_connection(query_only=False) as conn:
-            market_repo = HMA.HistoricalMarketArchiveRepository(conn)
-            financial_archive_repo = HFA.HistoricalFinancialArchiveRepository(conn)
-            financial_feature_repo = FFE.FinancialFeatureEvidenceRepository(conn, financial_archive_repo)
-            universe_repo = HUA.HistoricalUniverseArchiveRepository(conn)
-            tradability_repo = TA.TradabilityArchiveRepository(conn)
-            ledger = EVR.ExperimentValidationRepository(conn)
-            calendar = HSC.issue_from_market_archive(
-                market_repo, archive_fingerprint=request.market_archive_fingerprint,
-                benchmark_symbol=request.benchmark_symbol, start=spec.start_date, end=spec.end_date,
-            )
-            if calendar.calendar_fingerprint != request.calendar_fingerprint:
-                raise ValueError("calendar_identity_mismatch")
-            LD.ensure_schema(conn)
-            manifest = LD.read_manifest(conn, spec.dataset_fingerprint)
-            if manifest is None:
-                raise ValueError("dataset_identity_unavailable")
-            dataset = LD.build_dataset(
-                conn, cutoff=manifest["cutoff"], split_spec=manifest["split_spec"],
-                feature_names=manifest["feature_names"],
-                horizon_semantics=manifest["horizon_semantics"],
-                contract_version=manifest["contract_version"],
-                financial_feature_repository=financial_feature_repo
-                if request.financial_archive_fingerprint else None,
-                financial_archive_fingerprint=request.financial_archive_fingerprint,
-                persist=False,
-            )
-            if dataset.fingerprint != spec.dataset_fingerprint:
-                raise ValueError("dataset_identity_mismatch")
-            samples = [sample for partition in LD.PARTITIONS
-                       for sample in dataset.partitions.get(partition, ())]
-            strategy_version = SR.get_version(
-                spec.strategy.strategy_id, spec.strategy.version,
-                checksum=spec.strategy.checksum,
-            )
-            # The app process injects its build identity. The request cannot claim it.
-            build_revision = _canonical_build_revision()
-            output = runner.run_validation(
-                spec, runner_code_revision=build_revision,
-                strategy_version=strategy_version, dataset_manifest=manifest,
-                samples=samples, walk_forward_config=config,
-                session_calendar=calendar, market_archive_repository=market_repo,
-                market_archive_fingerprint=request.market_archive_fingerprint,
-                universe_archive_repository=universe_repo,
-                universe_archive_fingerprint=request.universe_archive_fingerprint,
-                tradability_repository=tradability_repo,
-                financial_feature_repository=financial_feature_repo,
-                financial_archive_fingerprint=request.financial_archive_fingerprint,
-                validation_repository=ledger,
-                created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-            )
-            if output.get("run"):
-                output["run"] = _validation_run_projection(output["run"])
-            return output
-    except (TypeError, ValueError, KeyError) as exc:
-        reason = str(exc) if str(exc).isidentifier() else "validation_request_invalid"
-        raise HTTPException(status_code=422, detail=reason) from exc
+    装配与身份复核在 ``experiment_validation_service``；本函数只解析请求、调用
+    流程、把有类型的失败映射成状态码。
+    """
+    EVS = _experiment_service()
+
+    try:
+        return EVS.validate_experiment(
+            request.model_dump(),
+            connection_factory=_experiment_validation_connection,
+            build_revision=_canonical_build_revision(),
+            created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        )
+    except EVS.ExperimentValidationRequestInvalid as exc:
+        raise HTTPException(status_code=422, detail=exc.reason) from exc
     except Exception as exc:
         # Do not expose SQL, filesystem details, paths, or raw exception text.
         raise HTTPException(status_code=503, detail="validation_inputs_unavailable") from exc
@@ -604,181 +540,29 @@ def canonical_experiment_run(run_id: str = Path(..., min_length=1, max_length=64
 @router.post("/experiments/runs/{run_id}/robustness")
 def create_canonical_robustness_report(request: RobustnessRequest,
                                        run_id: int = Path(..., gt=0)):
-    """Run a bounded offline adversarial report against one canonical R29 run."""
-    try:
-        import experiment_contract as EC
-        import experiment_execution_model  # noqa: F401
-        import experiment_pit_validation as PV
-        import financial_feature_evidence as FFE
-        import experiment_validation_repository as EVR
-        import historical_financial_archive as HFA
-        import historical_market_archive as HMA
-        import historical_session_calendar as HSC
-        import historical_universe_archive as HUA
-        import learning_dataset as LD
-        import robustness_contract as RC
-        import robustness_repository as RREP
-        import robustness_runner as RRUN
-        import strategy_dsl_schema as DSL
-        import strategy_registry as SR
-        import tradability_archive as TA
-        import walk_forward_validation as WFV
+    """Run a bounded offline adversarial report against one canonical R29 run.
 
-        raw = dict(request.spec)
-        strategy = raw.get("strategy")
-        if not isinstance(strategy, dict):
-            raise ValueError("strategy_identity_required")
-        raw["strategy"] = EC.StrategyIdentity(**strategy)
-        date_range = raw.get("date_range") or {}
-        raw["start_date"] = raw.pop("start_date", date_range.get("start"))
-        raw["end_date"] = raw.pop("end_date", date_range.get("end"))
-        raw.pop("date_range", None)
-        spec = EC.ExperimentSpec(**raw)
-        plan = RC.RobustnessPlan(**request.plan)
-        with _experiment_validation_connection(query_only=False) as conn:
-            market_repo = HMA.HistoricalMarketArchiveRepository(conn)
-            financial_archive_repo = HFA.HistoricalFinancialArchiveRepository(conn)
-            financial_feature_repo = FFE.FinancialFeatureEvidenceRepository(conn, financial_archive_repo)
-            universe_repo = HUA.HistoricalUniverseArchiveRepository(conn)
-            tradability_repo = TA.TradabilityArchiveRepository(conn)
-            validation_repo = EVR.ExperimentValidationRepository(conn)
-            baseline = validation_repo.get_run(run_id=run_id)
-            if baseline is None:
-                raise HTTPException(status_code=404, detail="validation_run_not_found")
-            expected_owners = _robustness_owner_identities(request, baseline)
-            if (spec.market_data_fingerprint != expected_owners["market_archive_fingerprint"]
-                    or spec.universe_fingerprint != expected_owners["universe_archive_fingerprint"]
-                    or spec.dataset_fingerprint != expected_owners["dataset_fingerprint"]
-                    or spec.parameter_set.get("validation_calendar_fingerprint") != expected_owners["calendar_fingerprint"]
-                    or spec.parameter_set.get("financial_archive_fingerprint") != expected_owners["financial_archive_fingerprint"]
-                    or request.benchmark_symbol != plan.regime_policy["benchmark_symbol"]):
-                raise ValueError("baseline_owner_identity_mismatch")
-            calendar = HSC.issue_from_market_archive(
-                market_repo, archive_fingerprint=spec.market_data_fingerprint,
-                benchmark_symbol=request.benchmark_symbol,
-                start=spec.start_date, end=spec.end_date)
-            if calendar.calendar_fingerprint != expected_owners["calendar_fingerprint"]:
-                raise ValueError("baseline_calendar_identity_mismatch")
-            manifest = LD.read_manifest(conn, spec.dataset_fingerprint)
-            if manifest is None:
-                raise ValueError("baseline_dataset_unavailable")
-            dataset = LD.build_dataset(
-                conn, cutoff=manifest["cutoff"], split_spec=manifest["split_spec"],
-                feature_names=manifest["feature_names"],
-                horizon_semantics=manifest["horizon_semantics"],
-                contract_version=manifest["contract_version"],
-                financial_feature_repository=financial_feature_repo
-                if expected_owners["financial_archive_fingerprint"] else None,
-                financial_archive_fingerprint=expected_owners["financial_archive_fingerprint"],
-                persist=False)
-            if dataset.fingerprint != spec.dataset_fingerprint:
-                raise ValueError("baseline_dataset_identity_mismatch")
-            samples = [sample for partition in LD.PARTITIONS
-                       for sample in dataset.partitions.get(partition, ())]
-            strategy_version = SR.get_version(spec.strategy.strategy_id, spec.strategy.version,
-                                              checksum=spec.strategy.checksum)
-            ast = DSL.normalize(strategy_version.definition.get("dsl_ast"))
-            dependencies = PV.strategy_dsl_dependencies(ast)
-            financial_by_pair = {}
-            if dependencies["financial_fields"]:
-                for sample in samples:
-                    sample_key = getattr(sample, "sample_key", None)
-                    code = getattr(sample, "code", None)
-                    session = (getattr(sample, "feature_asof", None)
-                               or getattr(sample, "decision_session", None))
-                    if not sample_key or not code or not session:
-                        continue
-                    for field_name in dependencies["financial_fields"]:
-                        item = financial_feature_repo.resolve_for_dataset_sample(
-                            dataset_fingerprint=spec.dataset_fingerprint,
-                            sample_key=str(sample_key), feature_name=field_name,
-                            financial_archive_fingerprint=expected_owners["financial_archive_fingerprint"],
-                        ).projection()
-                        if item.get("verification") != "proven":
-                            continue
-                        pair = (str(code), str(session))
-                        entry = financial_by_pair.setdefault(pair, {"decision_at": item.get("decision_at")})
-                        if entry["decision_at"] != item.get("decision_at"):
-                            raise ValueError("financial_feature_decision_mismatch")
-                        if field_name in entry and entry[field_name] != item.get("feature_value"):
-                            raise ValueError("financial_feature_value_mismatch")
-                        entry[field_name] = item.get("feature_value")
-            config = WFV.WalkForwardConfig(**request.walk_forward) if request.walk_forward else None
-            extended_calendar = None
-            date_scenarios = [scenario for scenario in plan.scenarios()
-                              if scenario["category"] in {"start_date", "end_date"}]
-            if date_scenarios:
-                calendar_manifest = market_repo.get_manifest(spec.market_data_fingerprint)
-                benchmark_calendar = (calendar_manifest.benchmark_calendars.get(request.benchmark_symbol)
-                                      if calendar_manifest is not None else None)
-                if not isinstance(benchmark_calendar, dict):
-                    raise ValueError("historical_benchmark_calendar_unavailable")
-                owner_sessions = list(benchmark_calendar.get("sessions") or ())
-                try:
-                    base_start, base_end = RRUN._baseline_session_bounds(spec, owner_sessions)
-                except ValueError as exc:
-                    raise ValueError("historical_benchmark_calendar_unavailable") from exc
-                if owner_sessions != sorted(set(owner_sessions)):
-                    raise ValueError("historical_benchmark_calendar_unavailable")
-                baseline_sessions = owner_sessions[base_start:base_end + 1]
-                ranges = []
-                for scenario in date_scenarios:
-                    try:
-                        selected = RRUN._scenario_sessions(scenario, spec, owner_sessions)
-                    except ValueError:
-                        # Out-of-coverage scenarios remain unavailable in the
-                        # runner; they must not make the whole POST fail.
-                        continue
-                    if selected != baseline_sessions:
-                        ranges.append((selected[0], selected[-1]))
-                if ranges:
-                    coverage_start = min(spec.start_date, *(start for start, _ in ranges))
-                    coverage_end = max(spec.end_date, *(end for _, end in ranges))
-                    try:
-                        extended_calendar = HSC.issue_from_market_archive(
-                            market_repo, archive_fingerprint=spec.market_data_fingerprint,
-                            benchmark_symbol=request.benchmark_symbol,
-                            start=coverage_start, end=coverage_end)
-                    except ValueError:
-                        # The owner cannot prove this expanded range. R30 records
-                        # each affected case as unavailable instead of guessing.
-                        extended_calendar = None
-            if extended_calendar is not None and extended_calendar.calendar_fingerprint == calendar.calendar_fingerprint:
-                extended_calendar = None
-            report = RRUN.run_robustness(
-                baseline_run=baseline, spec=spec, plan=plan,
-                strategy_version=strategy_version, session_calendar=calendar,
-                market_archive_repository=market_repo,
-                universe_archive_repository=universe_repo,
-                tradability_repository=tradability_repo,
-                financial_features=financial_by_pair,
-                required_financial_fields=dependencies["financial_fields"],
-                extended_session_calendar=extended_calendar,
-                date_range_validation_context={
-                    "benchmark_symbol": request.benchmark_symbol,
-                    "walk_forward_config": config,
-                    "dataset_manifest": manifest,
-                    "samples": samples,
-                    "financial_feature_repository": financial_feature_repo
-                        if expected_owners["financial_archive_fingerprint"] else None,
-                },
-                created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
-            report["plan_fingerprint"] = plan.fingerprint
-            repository = RREP.RobustnessRepository(conn)
-            stored = repository.append_report(report)
-            return {"status": "ok", "report_id": stored["id"],
-                    "report_key": stored["report_key"],
-                    "report_fingerprint": stored["report_fingerprint"],
-                    "report": stored["report"]}
-    except HTTPException:
-        raise
-    except RRUN.RobustnessBaselineError as exc:
+    流程（装配、身份钉定、扩展日历、持久化）在 ``experiment_validation_service``；
+    本函数只做请求解析与错误映射，422/404/409/503 的分类与旧实现逐条对应。
+    """
+    EVS = _experiment_service()
+
+    try:
+        return EVS.create_robustness_report(
+            run_id, request.model_dump(),
+            connection_factory=_experiment_validation_connection,
+            created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        )
+    except EVS.ExperimentValidationRunMissing as exc:
+        raise HTTPException(status_code=404, detail=exc.reason) from exc
+    except EVS.ExperimentRobustnessBaselineError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except RREP.RobustnessPersistenceError as exc:
+    except EVS.ExperimentRobustnessConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (TypeError, ValueError, KeyError) as exc:
-        reason = str(exc) if str(exc).isidentifier() else "robustness_request_invalid"
-        raise HTTPException(status_code=422, detail=reason) from exc
+    except EVS.ExperimentValidationRequestInvalid as exc:
+        raise HTTPException(status_code=422, detail=exc.reason) from exc
+    except EVS.ExperimentValidationInputsUnavailable as exc:
+        raise HTTPException(status_code=503, detail="robustness_inputs_unavailable") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="robustness_inputs_unavailable") from exc
 
