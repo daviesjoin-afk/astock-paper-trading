@@ -204,6 +204,48 @@ class TransportBreakerTests(unittest.TestCase):
         self.assertNotEqual(T._transport_host("https://sinajs.cn/a"),
                             T._transport_host("https://qt.gtimg.cn/a"))
 
+    # ------------------------------------------------------------------
+    # alt_data._alt_get：本模块原先绕过短路，现在与 http_get 共享主机健康
+    # ------------------------------------------------------------------
+
+    def test_alt_get_short_circuits_on_a_shared_breaker(self):
+        import alt_data as AD
+
+        for _ in range(T._TRANSPORT_BREAKER_THRESHOLD):
+            T._transport_breaker_note("qt.gtimg.cn", ok=False)
+        with mock.patch.object(AD.requests, "get") as get:
+            with self.assertRaises(requests.ConnectionError):
+                AD._alt_get(URL)
+        get.assert_not_called()
+
+    def test_alt_get_records_server_error_as_host_failure(self):
+        import alt_data as AD
+
+        response = mock.Mock(status_code=502, text="bad")
+        with mock.patch.object(AD.requests, "get", return_value=response):
+            self.assertIs(AD._alt_get(URL), response)
+        snapshot = T.transport_breaker_snapshot()["qt.gtimg.cn"]
+        self.assertGreaterEqual(snapshot["fails"], 1)
+
+    def test_alt_get_does_not_raise_on_client_error(self):
+        """4xx 不能改变返回语义：本模块的调用方会自己看 status_code。"""
+        import alt_data as AD
+
+        response = mock.Mock(status_code=404, text="")
+        with mock.patch.object(AD.requests, "get", return_value=response):
+            self.assertIs(AD._alt_get(URL), response)
+        self.assertFalse(T.transport_breaker_snapshot()["qt.gtimg.cn"]["open"])
+
+    def test_alt_get_success_resets_the_host(self):
+        import alt_data as AD
+
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=10.0)
+        with mock.patch.object(AD.requests, "get", return_value=mock.Mock(status_code=200)):
+            AD._alt_get(URL)
+        snapshot = T.transport_breaker_snapshot()["qt.gtimg.cn"]
+        self.assertEqual(snapshot["fails"], 0)
+        self.assertEqual(snapshot["burned_seconds"], 0.0)
+
     def test_success_path_still_returns_text(self):
         """回归：短路包装不能改变正常返回。"""
         with mock.patch.object(T, "_http_get_impl", return_value='{"ok":true}'):
