@@ -33,15 +33,43 @@ from test_production_path_golden_replay import (  # noqa: E402
     ProductionPathGoldenReplayTests,
 )
 
+try:  # 共享 AST/源码缓存；不可用时退回直接读取解析。
+    from test_support import ast_cache  # noqa: E402
+except ImportError:  # pragma: no cover
+    ast_cache = None
+
+_SOURCES_CACHE = None
+
 
 def _production_sources():
-    """所有生产模块的 (文件名, 源码)。测试文件不参与闸门判定。"""
-    for name in sorted(os.listdir(BACKEND_DIR)):
-        if not name.endswith(".py") or name.startswith("test_"):
-            continue
-        path = os.path.join(BACKEND_DIR, name)
-        with open(path, encoding="utf-8") as handle:
-            yield name, handle.read()
+    """所有生产模块的 (文件名, 源码)。测试文件不参与闸门判定。
+
+    结果在进程内缓存一次：本模块有多个用例各自遍历全部生产模块，而
+    ``paper_trading.py`` 单次解析约 0.5 秒，重复读取+解析是这些静态门禁
+    变慢的主因。源码与语法树都走 ``test_support.ast_cache``，按
+    (路径, mtime, 大小) 失效，不会读到改动前的旧源码。
+    """
+    global _SOURCES_CACHE
+    if _SOURCES_CACHE is None:
+        items = []
+        for name in sorted(os.listdir(BACKEND_DIR)):
+            if not name.endswith(".py") or name.startswith("test_"):
+                continue
+            path = os.path.join(BACKEND_DIR, name)
+            if ast_cache is not None:
+                items.append((name, ast_cache.source(path)))
+            else:
+                with open(path, encoding="utf-8") as handle:
+                    items.append((name, handle.read()))
+        _SOURCES_CACHE = items
+    yield from _SOURCES_CACHE
+
+
+def _parse(name, source):
+    """解析生产模块语法树；可用时走共享 AST 缓存。"""
+    if ast_cache is not None:
+        return ast_cache.tree(os.path.join(BACKEND_DIR, name))
+    return ast.parse(source, filename=name)
 
 
 def _docstring_nodes(tree):
@@ -78,7 +106,7 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
         offenders = []
         seen = []
         for name, source in _production_sources():
-            tree = ast.parse(source, filename=name)
+            tree = _parse(name, source)
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -125,7 +153,7 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
         for name, source in _production_sources():
             if name == "execution_verification.py":
                 continue
-            tree = ast.parse(source, filename=name)
+            tree = _parse(name, source)
             for _node, value in _string_literals(tree):
                 for fragment in forbidden:
                     if fragment in value:
@@ -172,7 +200,7 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
         #: 用 AST 的 ``Attribute`` 视图而不是裸子串扫描 —— 本仓库的文档风格会在注释里
         #: 逐字写出被禁止的符号（本构造函数上方的注释、``test_pnl_attribution_typed_runtime``
         #: 的 FORBIDDEN 词表都是这种形态），裸子串会把散文当成违规而误报 RED。
-        migrated_tree = ast.parse(sources.get("deepseek_research.py", ""))
+        migrated_tree = _parse("deepseek_research.py", sources.get("deepseek_research.py", ""))
         predicate_holders = [
             node.attr for node in ast.walk(migrated_tree)
             if isinstance(node, ast.Attribute) and node.attr == "VERIFIED_PREDICATE"
@@ -185,7 +213,7 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
         #: 同一条反向断言也覆盖 ``strategy_champion.py``：它的正式账本读路径已在
         #: R32 Final 删除（见上表说明），因此它同样不得持有唯一执行绩效谓词。
         #: 若将来它重新判断正式账本的执行绩效，必须先接回唯一谓词本身。
-        champion_tree = ast.parse(sources.get("strategy_champion.py", ""))
+        champion_tree = _parse("strategy_champion.py", sources.get("strategy_champion.py", ""))
         champion_holders = [
             node.attr for node in ast.walk(champion_tree)
             if isinstance(node, ast.Attribute) and node.attr == "VERIFIED_PREDICATE"

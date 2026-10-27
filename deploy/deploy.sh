@@ -1,7 +1,7 @@
 #!/bin/bash
 # A股模拟盘一键部署脚本
 # 用法：bash deploy/deploy.sh [--backup] [--no-migrate]
-# 流程：备份(可选) → 构建镜像 → 重启容器 → schema迁移 → cron同步 → 健康检查
+# 流程：备份(可选) → 构建镜像 → 重启容器 → schema迁移 → cron同步 → 健康检查 → 写部署元数据
 #
 # 数据库备份默认**关闭**：部署只替换代码，不改账本数据，而每次全量复制
 # paper_trading(2.9G)+adaptive_learning(1G) 会拖慢部署并挤占磁盘。数据保护
@@ -69,6 +69,35 @@ METRICS=$(curl -s --max-time 15 http://127.0.0.1:18600/metrics 2>/dev/null | gre
 echo "  /metrics 指标数: $METRICS"
 
 if [[ "$HEALTH" == "healthy" && "$API" == "200" ]]; then
+  # 7. 部署元数据：把这次真正跑起来的提交与镜像身份写进 .deploy-source.json。
+  #    该文件此前无人自动维护（2026-10-27 核查时仍指向上一版），而"服务器
+  #    跑的是哪个提交"只能靠它一眼看出。放在健康检查**之后**写：失败的部署
+  #    不会把自己的身份留在文件里。非 root 或目录不可写时跳过并明确提示。
+  echo "▶ 写入部署元数据..."
+  META="$ROOT/.deploy-source.json"
+  IMAGE_ID=$(docker inspect astock-codex --format '{{.Image}}' 2>/dev/null | sed 's/^sha256://')
+  BASE_COMMIT=$(git rev-parse --verify --quiet HEAD^1 || true)
+  if git symbolic-ref --quiet --short HEAD >/dev/null 2>&1; then
+    SOURCE_REF="github:$(git symbolic-ref --quiet --short HEAD)"
+  else
+    SOURCE_REF="detached:$(git rev-parse --short HEAD)"
+  fi
+  META_TMP="$(mktemp)"
+  {
+    echo "commit=$(git rev-parse HEAD)"
+    echo "image=${IMAGE_ID}"
+    echo "base_commit=${BASE_COMMIT}"
+    echo "deployed_at=$(date -Iseconds)"
+    echo "source=${SOURCE_REF}"
+    echo "health=${HEALTH}"
+    echo "api_health=${API}"
+  } > "$META_TMP"
+  if install -m 0644 "$META_TMP" "$META" 2>/dev/null; then
+    echo "  $META"
+  else
+    echo "  跳过：$META 不可写（非 root 或只读目录）" >&2
+  fi
+  rm -f "$META_TMP"
   echo "════════════════════════════════════════"
   echo "✅ 部署成功！"
   echo "════════════════════════════════════════"

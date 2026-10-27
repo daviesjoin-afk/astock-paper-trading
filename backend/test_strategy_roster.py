@@ -151,7 +151,19 @@ class StrategyRosterContractTests(unittest.TestCase):
         profile = ACS.RISK_PROFILES[spec["risk_profile"]]
         self.assertEqual(profile["max_weight"], 0.12)
         self.assertEqual(profile["single_risk"], 0.006)
-        self.assertLessEqual(spec["max_open_runup_pct"], 0.012)
+        # 2026-10-27 操作员决定：日内溢价上限 1.2% → 2.2%。1.2% 比同组回踩策略
+        # （2.5%）还紧，导致财报确认后的正常承接几乎全被拒。放宽的只是这一个
+        # 数字；跳空带、入场上限、风险画像与全池熔断字段全部保持原值。
+        # 断言改成"必须仍是五个策略里最紧的"，比写死 0.022 更难被悄悄漂移。
+        self.assertLessEqual(spec["max_open_runup_pct"], 0.022)
+        others = [
+            other["max_open_runup_pct"]
+            for account_id, other in ACS.ACCOUNT_SPECS.items()
+            if account_id != "reported_profit_breakout"
+            and "max_open_runup_pct" in other
+        ]
+        self.assertTrue(others, "缺少可比较的其它策略上限")
+        self.assertLess(spec["max_open_runup_pct"], min(others))
         self.assertLessEqual(spec["gap_q2"][1], 0.03)
         self.assertLessEqual(spec["entry_pct_high"], 4.0)
         # 全池熔断字段必须保持原值：它们不是单策略止损。

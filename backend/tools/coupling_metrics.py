@@ -34,7 +34,21 @@ def production_paths(root: Path = BACKEND) -> tuple[Path, ...]:
 
 
 def _trees(paths: Iterable[Path]):
+    """逐个产出 (路径, 源码, 语法树)。
+
+    优先走测试侧的共享 AST 缓存：架构守卫与耦合度量会把同一批生产文件解析
+    很多遍（``paper_trading.py`` 单次约 0.5 秒），缓存按 (路径, mtime, 大小)
+    失效所以不会读到过期语法树。``tools/`` 需要能脱离测试环境单独运行，
+    因此这里是"可用则用、不可用则退回直接解析"，不把工具硬绑到测试包上。
+    """
+    try:
+        from test_support import ast_cache
+    except ImportError:
+        ast_cache = None
     for path in paths:
+        if ast_cache is not None:
+            yield path, ast_cache.source(path), ast_cache.tree(path)
+            continue
         source = path.read_text(encoding="utf-8")
         yield path, source, ast.parse(source, filename=str(path))
 

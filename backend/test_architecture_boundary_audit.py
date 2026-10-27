@@ -25,14 +25,20 @@ class CouplingBudgetTests(unittest.TestCase):
     # modules and call sites; the allowance is explicit instead of silently
     # rebasing the whole budget.  No allowance may be increased without a
     # matching architecture note in docs/COUPLING_BUDGET.md.
+    #
+    # 2026-10-27（性能/风控切片）：`max_file_lines` 72 → 90、`cross_domain_edges`
+    # 25 → 28。来源是新增的 `news_risk_policy`（从 paper_trading 抽出的纯策略
+    # 模块，+1 跨域边）与 paper_trading 内的行情轮内复用/时段余量说明（纯原地
+    # 增量）。抽取本身已把 paper_trading 削掉约 60 行；这两项仍按"最小够用"
+    # 抬，不重设基线。详见 docs/COUPLING_BUDGET.md「2026-10-27 切片」。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
         "deferred_imports": 43,
         "private_cross_access": 3,
         "raw_sql_modules": 5,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 25,
-        "max_file_lines": 72,
+        "cross_domain_edges": 28,
+        "max_file_lines": 90,
         "max_function_lines": 5,
         "max_function_globals": 1,
         "duplicate_helpers": 5,
