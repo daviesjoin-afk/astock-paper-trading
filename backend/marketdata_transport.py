@@ -76,6 +76,82 @@ def _connection_dropped(exc, attempt_seconds):
     )
 
 
+# ---------------------------------------------------------------------------
+# 按主机的传输层短路。
+#
+# 为什么需要：盘中扫描 95% 的时间是网络等待，而其中很大一部分是在等**已经
+# 挂掉的主机**。生产实测单轮 `http_get_attempt` 58 次调用里 34 次失败、累计
+# 44 秒墙钟但只有 1.1 秒 CPU；这些等待串在 `risk_pass`（67s）、`position_quotes`
+# （25s）等串行阶段里，直接把整轮扫描拖到 190 秒以上。
+#
+# 语义边界（刻意保持保守）：
+# * 只在**传输层**失败（超时/连接错误）时计数；HTTP 状态错误说明对端活着，
+#   反而清零。
+# * 只有连续失败到阈值才短路，单次抖动不会触发。
+# * 短路时抛 ``requests.ConnectionError``——与真实连接失败的异常类型一致，
+#   因此所有调用方原有的 fail-closed 分支（缺数据即不发布/不入场）原样生效，
+#   不会因为短路而放宽任何门禁。
+_TRANSPORT_BREAKER_THRESHOLD = 6      # 连续多少次传输失败后短路
+_TRANSPORT_BREAKER_COOLDOWN_SECONDS = 90.0
+
+_transport_breaker = {}
+_transport_breaker_lock = threading.Lock()
+
+
+def _transport_host(url):
+    """取主机名作为短路键；解析不出来就用固定 key，避免每个 URL 各占一格。"""
+    text = str(url or "")
+    marker = "://"
+    if marker not in text:
+        return "unknown"
+    rest = text.split(marker, 1)[1]
+    host = rest.split("/", 1)[0].split("?", 1)[0]
+    return host.lower() or "unknown"
+
+
+def _transport_breaker_remaining(host):
+    """返回剩余短路秒数；未短路返回 None。"""
+    with _transport_breaker_lock:
+        state = _transport_breaker.get(host)
+        if not state:
+            return None
+        remaining = (state.get("until") or 0.0) - time.monotonic()
+        return remaining if remaining > 0 else None
+
+
+def _transport_breaker_note(host, *, ok):
+    """记录一次请求的健康结果；成功清零，连续失败到阈值则短路。"""
+    with _transport_breaker_lock:
+        state = _transport_breaker.setdefault(host, {"fails": 0, "until": 0.0})
+        if ok:
+            state["fails"] = 0
+            state["until"] = 0.0
+            return
+        state["fails"] = int(state.get("fails") or 0) + 1
+        if state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD:
+            state["until"] = time.monotonic() + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
+
+
+def reset_transport_breakers():
+    """清空短路状态。给测试与故障恢复用；生产不需要定期调用。"""
+    with _transport_breaker_lock:
+        _transport_breaker.clear()
+
+
+def transport_breaker_snapshot():
+    """只读快照，供诊断与自检读取。"""
+    with _transport_breaker_lock:
+        now = time.monotonic()
+        return {
+            host: {
+                "fails": int(state.get("fails") or 0),
+                "open": bool((state.get("until") or 0.0) > now),
+                "remaining_seconds": round(max(0.0, (state.get("until") or 0.0) - now), 1),
+            }
+            for host, state in _transport_breaker.items()
+        }
+
+
 def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
     """执行带连接复用和空响应重试的 GET 请求。
 
@@ -83,7 +159,35 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
     一个扫描轮次里累计十几秒空转（实测每轮 18~19 秒纯 sleep）。重试次数、
     超时、请求参数与返回值都不变；超时、HTTP 状态错误和空响应仍按原退避
     等待，外层仍拥有主机轮换与分批补查。
+
+    外层再加一道**按主机短路**（见 ``_TRANSPORT_BREAKER_*``）：同一主机连续
+    多次传输失败后，短时间内直接快速失败，不再为每个调用方重复付超时。
     """
+    host = _transport_host(url)
+    open_for = _transport_breaker_remaining(host)
+    if open_for is not None:
+        with PTM.phase("http_breaker_skip"):
+            raise requests.ConnectionError(
+                f"transport breaker open for {host} ({open_for:.0f}s left)")
+    try:
+        text = _http_get_impl(url, params=params, timeout=timeout,
+                              encoding=encoding, retries=retries)
+    except requests.RequestException as exc:
+        if isinstance(exc, requests.HTTPError):
+            # 拿到 HTTP 响应说明主机**可达**，必须清零连续失败计数，否则
+            # "超时/超时/500/超时..." 这种穿插会把 6 次**非连续**超时累加成
+            # 一次短路，与"连续失败才触发"的策略自相矛盾，并且会误伤同一
+            # 主机上所有正常端点。
+            _transport_breaker_note(host, ok=True)
+        else:
+            _transport_breaker_note(host, ok=False)
+        raise
+    _transport_breaker_note(host, ok=True)
+    return text
+
+
+def _http_get_impl(url, params=None, timeout=15, encoding="utf-8", retries=2):
+    """``http_get`` 的原实现（不含主机短路）。"""
     for index in range(retries + 1):
         attempt_started = time.perf_counter()
         try:

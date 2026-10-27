@@ -11,6 +11,8 @@ import marketdata_transport as transport
 
 class QuoteRetryOwnerTests(unittest.TestCase):
     def setUp(self):
+        # 主机短路是模块级状态；本模块会注入传输失败，先清空。
+        transport.reset_transport_breakers()
         self.session = mock.Mock()
         self.outer_sleep = mock.Mock()
         self.inner_sleep = mock.Mock()
@@ -103,10 +105,17 @@ class QuoteRetryOwnerTests(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(feed.fetch_realtime(["000001", "000002"]), [])
         calls = self.session.get.call_count
-        self.assertEqual(calls, 36)
+        self.assertGreater(calls, 0, "断电也要真的尝试过，不能一次都没发")
+        # 两层短路共同生效：feed 层 circuit + 2026-10-27 的传输层主机短路
+        # （连续 6 次传输失败后 90 秒内快速失败）。断言契约"断电后请求不再增长"，
+        # 而不是写死次数——次数会随任一层阈值调整，契约不会。
+        self.assertLess(calls, 36, "传输层短路应让断电期间的请求次数下降")
         self.assertEqual(feed.fetch_realtime(["000001", "000002"]), [])
-        self.assertEqual(self.session.get.call_count, calls)
+        self.assertEqual(self.session.get.call_count, calls, "短路后不得再发新请求")
         self.assertTrue(self.health.snapshot()["eastmoney_ulist"]["circuit_open"])
+        opened = [host for host, state in transport.transport_breaker_snapshot().items()
+                  if state["open"]]
+        self.assertTrue(opened, "传输层短路也应打开，覆盖 feed 之外的调用方")
 
 
 if __name__ == "__main__":
