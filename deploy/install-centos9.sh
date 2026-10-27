@@ -21,34 +21,14 @@ if [[ ! "${ASTOCK_GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
-# This script is the explicit native-CentOS profile.  Docker deployments must
-# use docker-compose.server.yml and astock-codex.cron; refusing an ambiguous
-# profile prevents installing the legacy scheduler by accident.
-if [[ "${ASTOCK_DEPLOY_PROFILE:-native}" != "native" ]]; then
-  echo "本脚本仅支持 native CentOS 部署；Docker 请使用 docker-compose.server.yml" >&2
-  exit 2
-fi
-
-# This script is deliberately the native CentOS profile.  The Docker profile
-# has a different image, data directory, worker split and 3-minute scheduler;
-# it is deployed from /opt/astock-codex and must never be mixed with this service.
-# Keep the historical default (native) for existing installations, but make
-# an accidental Docker invocation fail before packages or files are changed.
-DEPLOY_PROFILE="${ASTOCK_DEPLOY_PROFILE:-native-centos9}"
-case "${DEPLOY_PROFILE}" in
-  native|native-centos9)
-    DEPLOY_PROFILE="native-centos9"
-    ;;
-  docker|docker-compose|docker-compose-server)
-    echo "拒绝：ASTOCK_DEPLOY_PROFILE=${DEPLOY_PROFILE} 属于 Docker profile。" >&2
-    echo "请使用 Docker 部署流程；本脚本只安装 native-centos9 profile。" >&2
-    exit 2
-    ;;
-  *)
-    echo "未知 ASTOCK_DEPLOY_PROFILE=${DEPLOY_PROFILE}；可选值：native-centos9。" >&2
-    exit 2
-    ;;
-esac
+# 部署 profile 的判定只有一处实现（deploy/lib/deploy_profile.sh）。它同时被本
+# 脚本与测试 source —— 以前这里有两段互相矛盾的守卫：前一段只接受 `native`，
+# 后一段接受 `native|native-centos9`，于是文档推荐的 `ASTOCK_DEPLOY_PROFILE=
+# native-centos9` 会在前一段被直接拒绝。Docker profile 与未知值都在判定函数里
+# 被拒绝（非零退出），且拒绝发生在改动任何文件之前。
+# shellcheck source=lib/deploy_profile.sh
+source "${SOURCE_DIR}/deploy/lib/deploy_profile.sh"
+DEPLOY_PROFILE="$(resolve_deploy_profile)"
 
 # A Docker cron file left behind on a host is still an active deployment
 # choice, even when its containers are currently stopped.  Do not silently
