@@ -181,7 +181,7 @@ AI_SETTINGS_META = {
     "llm_provider": {"label": "AI供应商", "description": "选择实际调用的模型供应商；当前默认 DeepSeek，Kimi/MIMO 先作为兼容预留，不会自动启用。", "effect": "决定后端使用哪套 API 凭据、地址和模型默认值。", "recommended": "deepseek", "risk": "供应商切换可能带来模型能力、费用和返回格式差异。"},
     "llm_advisor_enabled": {"label": "启用 DeepSeek 审阅", "description": "允许 AI 对数据质量、盈亏归因和异常证据进行解释。", "effect": "只生成审阅报告，不直接下单。", "recommended": False, "risk": "需要外部 API 调用，不能把 AI 结论当作行情真实性证明。"},
     "llm_realtime_tuning_enabled": {"label": "启用实时有界调参", "description": "允许 AI 基于模拟盘证据生成白名单范围内的参数候选。", "effect": "候选仍需确定性门禁、样本和跨源校验。", "recommended": True, "risk": "关闭后只保留确定性进化，不生成 AI 候选。"},
-    "llm_realtime_auto_apply": {"label": "允许候选自动应用", "description": "是否允许通过全部门禁的 AI 候选在模拟盘内同日应用。", "effect": "关闭时仅保存 shadow_proposal，便于人工复核。", "recommended": False, "risk": "开启会减少人工确认，建议长期保持关闭或仅在充分验证后开启。"},
+    "llm_realtime_auto_apply": {"label": "候选自动应用（不支持）", "description": "旧版自动应用选项，当前固定关闭，不支持开启。", "effect": "候选只保存为 shadow_proposal，需通过人工采用流程处理。", "recommended": False, "risk": "旧配置中的开启值也会被视为关闭。", "read_only": True},
     "llm_realtime_require_cross_source": {"label": "必须通过双源校验", "description": "要求主行情与第二独立行情源对关键数据完成一致性校验。", "effect": "未 verified 时阻断 AI 调参。", "recommended": True, "risk": "第二源不可用时会降低调参频率，但可避免脏数据驱动调整。"},
     "llm_realtime_mode": {"label": "调参模式", "description": "shadow 只观察，intraday 允许盘中候选，close 只在收盘后运行。", "effect": "控制候选的生效时机，不改变风控硬上限。", "recommended": "intraday", "risk": "intraday 对数据时效要求更高；close 反应更慢但更稳。"},
     "llm_realtime_min_interval_minutes": {"label": "调参冷却时间（分钟）", "description": "两次 AI 调参之间的最短间隔。", "effect": "减少重复调用和短期噪声追随。", "recommended": 15, "risk": "过短增加成本和过拟合，过长可能错过环境变化。"},
@@ -600,8 +600,7 @@ def _ensure_config_defaults(conn):
         # 盘后逐笔归因默认开启确定性记录；配置了 DeepSeek 密钥时再做 AI
         # 批量解释，密钥/网络不可用不会阻断学习链。
         "trade_attribution_ai_enabled": True,
-        # DeepSeek 只在模拟盘内对已知权重、入场阈值和条件做有界建议；
-        # 同日自动生效仍受质量、跨源和冷却门禁约束。
+        # DeepSeek 只生成有界建议；旧版自动应用开关固定关闭。
         "llm_realtime_tuning_enabled": True,
         "llm_realtime_auto_apply": False,
         "llm_weight_auto_apply": False,
@@ -609,9 +608,8 @@ def _ensure_config_defaults(conn):
         "llm_realtime_min_valid_rows": 1000,
         "llm_realtime_require_cross_source": True,
         "llm_realtime_max_accounts": 3,
-        # 有界自动通道：只接受纯因子权重小步调整（单因子 ±3pp、键集固定、
-        # 组合上限校验）。条件、门槛与结构变更仍必须人工确认。
-        "selection_auto_apply_bounded": True,
+        # 保留旧键以兼容已有配置，但不自动应用选股候选。
+        "selection_auto_apply_bounded": False,
         "selection_shadow_nav_days": 1,
         "selection_shadow_trade_events": 1,
         "selection_shadow_reward_samples": 2,
