@@ -372,9 +372,13 @@ class RefreshFallbackTests(unittest.TestCase):
     def test_refresh_falls_back_to_tencent_when_primary_is_empty(self):
         codes = _codes(4100)
         rows = [_TencentRow.build(code) for code in codes]
+        # 代码集合来自本模块上一份快照：行情权威不再跨域读 universe。
+        cached = {"saved_at": NOW.isoformat(), "complete": True, "expected_rows": 4100,
+                  "rows": [{"code": code, "price": 10.0, "quote_at": NOW.isoformat()}
+                           for code in codes]}
         with mock.patch.object(dfc, "fetch_market_snapshot_full", return_value=[]), \
                 mock.patch.object(dfc, "fetch_tencent_realtime_for_codes", return_value=rows), \
-                mock.patch("universe.load_universe", return_value=[{"code": code} for code in codes]):
+                mock.patch.object(dfc, "load_market_snapshot_full_payload", return_value=cached):
             reading = MDSvc.refresh_snapshot(now=NOW)
         self.assertTrue(reading.available)
         self.assertEqual(MDC.STATUS_DEGRADED, reading.status)

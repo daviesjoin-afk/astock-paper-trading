@@ -351,19 +351,24 @@ def refresh_snapshot(
         # prices are an independent fallback for the price cross-section, not a
         # replacement for the missing flow / valuation / sector fields, so the
         # persisted artifact is explicitly labelled price-only.
-        try:
-            import universe as universe_module
-        except ImportError:
-            from . import universe as universe_module
-        try:
-            codes = [
-                str(row.get("code") or "") for row in universe_module.load_universe()
-            ]
-            rows = dfc_module.fetch_tencent_market_snapshot(
-                codes, max_age=max_age, now=deadline, force=force,
-            )
-        except Exception:
-            rows = []
+        #
+        # 代码集合取自**本模块自己上一份快照**，而不是去读证券基础库：行情权威不该
+        # 跨域依赖 universe（那正是它与 universe 互相 import 的原因）。语义也更准：
+        # 备用源要回答的是"我们上次到底看过哪些标的"，而不是"全市场应该有哪些"。
+        codes = []
+        if last_known is not None:
+            rows_of = getattr(last_known, "rows", ())
+            for row in (rows_of() if callable(rows_of) else rows_of) or []:
+                code = str(row.get("code") or "") if isinstance(row, dict) else ""
+                if code:
+                    codes.append(code)
+        if codes:
+            try:
+                rows = dfc_module.fetch_tencent_market_snapshot(
+                    codes, max_age=max_age, now=deadline, force=force,
+                )
+            except Exception:
+                rows = []
     if not isinstance(rows, list) or not rows:
         return MDC.reading_for_refresh_failure(
             policy, last_known=last_known, now=deadline,

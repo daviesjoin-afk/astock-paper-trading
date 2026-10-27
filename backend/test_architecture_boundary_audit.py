@@ -74,7 +74,6 @@ class CouplingBudgetTests(unittest.TestCase):
     def test_known_cycles_do_not_grow(self):
         actual = coupling_metrics.measure_all()
         self.assertEqual([
-            ("market_data_service", "universe"),
             ("strategies", "strategy_plugins"),
         ], actual["import_cycle_members"])
 

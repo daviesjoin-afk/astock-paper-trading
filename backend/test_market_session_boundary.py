@@ -135,9 +135,12 @@ class ClosingRefreshTests(unittest.TestCase):
     def test_tencent_fallback_receives_the_same_window(self):
         data=rows()
         for row in data:row["source"]="tencent_public_quote"
-        with mock.patch.object(S.dfc_module,"load_market_snapshot_full_payload",return_value={}), \
+        # 备用源现在吃**本模块自己上一份快照**的代码集合：行情权威不再跨域读
+        # universe，所以代码由持久化 payload 提供，而不是 patch universe。
+        cached = {"rows": [{"code": r["code"]} for r in data], "complete": True,
+                  "expected_rows": 4000, "saved_at": NOW.isoformat()}
+        with mock.patch.object(S.dfc_module,"load_market_snapshot_full_payload",return_value=cached), \
                 mock.patch.object(S.dfc_module,"fetch_market_snapshot_full",return_value=[]), \
-                mock.patch("universe.load_universe",return_value=[{"code":r["code"]} for r in data]), \
                 mock.patch.object(S.dfc_module,"fetch_tencent_market_snapshot",return_value=data) as fetch:
             r=S.refresh_snapshot(C.CLOSE_SNAPSHOT_POLICY,now=NOW,force=True)
         self.assertEqual(10860.,fetch.call_args.kwargs["max_age"])
@@ -149,7 +152,7 @@ class ClosingRefreshTests(unittest.TestCase):
         payload={"rows":data,"complete":True,"expected_rows":4000,"saved_at":NOW.isoformat()}
         with mock.patch.object(S.dfc_module,"load_market_snapshot_full_payload",return_value=payload), \
                 mock.patch.object(S.dfc_module,"fetch_market_snapshot_full",return_value=[]), \
-                mock.patch("universe.load_universe",return_value=[]):
+                mock.patch.object(S.dfc_module,"fetch_tencent_market_snapshot",return_value=[]):
             r=S.refresh_snapshot(C.CLOSE_SNAPSHOT_POLICY,now=NOW,force=True)
         self.assertEqual("refresh_failed",r.reason)
         self.assertEqual("stale",r.freshness)
