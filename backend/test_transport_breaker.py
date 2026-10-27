@@ -25,6 +25,18 @@ import marketdata_transport as T
 URL = "https://qt.gtimg.cn/q=sh600000"
 
 
+def _http_error(status):
+    """构造带 ``response.status_code`` 的 HTTPError。
+
+    真实 ``raise_for_status()`` 一定带 response；短路要区分 4xx（主机可达）
+    与 5xx（主机侧异常），所以测试也必须带上状态码，不能用裸 HTTPError。
+    """
+    response = mock.Mock()
+    response.status_code = status
+    error = requests.HTTPError(f"{status} error", response=response)
+    return error
+
+
 class TransportBreakerTests(unittest.TestCase):
     def setUp(self):
         T.reset_transport_breakers()
@@ -65,36 +77,64 @@ class TransportBreakerTests(unittest.TestCase):
         self.assertEqual(snapshot["fails"], 0)
         self.assertFalse(snapshot["open"])
 
-    def test_http_status_error_does_not_count_as_transport_failure(self):
-        """对端返回 4xx/5xx 说明它活着，不能因此短路整个主机。"""
+    def test_client_error_resets_and_never_opens(self):
+        """4xx = 我们的请求有问题，主机可达 → 清零，永不短路。"""
         for _ in range(T._TRANSPORT_BREAKER_THRESHOLD + 2):
             with self.assertRaises(requests.HTTPError):
                 with mock.patch.object(T, "_http_get_impl",
-                                       side_effect=requests.HTTPError("500")):
+                                       side_effect=_http_error(404)):
                     T.http_get(URL, timeout=1, retries=0)
         self.assertIsNone(T._transport_breaker_remaining("qt.gtimg.cn"))
 
-    def test_interleaved_http_error_resets_the_consecutive_count(self):
-        """穿插的 HTTP 响应必须清零连续失败，否则会误短路整个主机。
+    def test_server_error_counts_as_host_failure(self):
+        """5xx = 主机侧异常，必须计入失败。
 
-        场景：超时、超时、500、超时、超时、500……如果 HTTP 错误只是"不计数"，
-        六次**非连续**超时仍会把短路打开，这与"连续失败才触发"的文档矛盾，
+        生产实测 push2 的 `trends2` 会快速返回 502，而同主机的 `details` /
+        `ulist` 在读超时。若把 5xx 也算"可达"，两者交替出现会让短路永远不触发。
+        """
+        for _ in range(T._TRANSPORT_BREAKER_THRESHOLD):
+            with self.assertRaises(requests.HTTPError):
+                with mock.patch.object(T, "_http_get_impl",
+                                       side_effect=_http_error(502)):
+                    T.http_get(URL, timeout=1, retries=0)
+        self.assertIsNotNone(T._transport_breaker_remaining("qt.gtimg.cn"))
+
+    def test_interleaved_client_error_resets_the_consecutive_count(self):
+        """穿插的 4xx 必须清零连续失败，否则会误短路整个主机。
+
+        场景：超时、超时、404、超时、超时、404……如果 4xx 只是"不计数"，
+        六次**非连续**超时仍会把短路打开，与"连续失败才触发"的文档矛盾，
         并且会让同一主机上所有正常端点被误伤 90 秒。
         """
         def boom(_url, **_kwargs):
             raise requests.Timeout("slow")
 
-        def http_500(_url, **_kwargs):
-            raise requests.HTTPError("500")
+        def not_found(_url, **_kwargs):
+            raise _http_error(404)
 
-        sequence = [boom, boom, http_500] * 4  # 远超阈值的非连续失败
+        sequence = [boom, boom, not_found] * 4
         for step in sequence:
             with mock.patch.object(T, "_http_get_impl", side_effect=step):
                 with self.assertRaises(requests.RequestException):
                     T.http_get(URL, timeout=1, retries=0)
             self.assertIsNone(
                 T._transport_breaker_remaining("qt.gtimg.cn"),
-                "穿插 HTTP 响应后不得累积成短路")
+                "穿插 4xx 后不得累积成短路")
+
+    def test_interleaved_server_error_still_opens(self):
+        """生产实况：超时与 502 交替，短路的应是"主机在坏"，不能永不触发。"""
+        def boom(_url, **_kwargs):
+            raise requests.Timeout("slow")
+
+        def bad_gateway(_url, **_kwargs):
+            raise _http_error(502)
+
+        sequence = [boom, bad_gateway] * T._TRANSPORT_BREAKER_THRESHOLD
+        for step in sequence:
+            with mock.patch.object(T, "_http_get_impl", side_effect=step):
+                with self.assertRaises(requests.RequestException):
+                    T.http_get(URL, timeout=1, retries=0)
+        self.assertIsNotNone(T._transport_breaker_remaining("qt.gtimg.cn"))
 
     def test_hosts_are_isolated(self):
         self._fail(T._TRANSPORT_BREAKER_THRESHOLD)
