@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 import sys  # noqa: E402
@@ -137,6 +138,31 @@ class DeterministicDemoTests(unittest.TestCase):
             self.assertIn(needle, alert_text, needle)
         self.assertIn("T+1", alert_text)
         self.assertIn("硬止损", alert_text)
+
+    def test_missing_holding_quote_does_not_publish_partial_pool_daily_pnl(self):
+        # Run the real dashboard and account projections over the demo ledger.
+        # Even if the legacy pool calculation returns a number, one holding
+        # without usable daily evidence cannot be reported as complete P&L.
+        original_shared = PT._shared_metrics
+
+        def shared_with_legacy_value(*args, **kwargs):
+            result = original_shared(*args, **kwargs)
+            result.update(today_pnl=123.0, today_return_pct=1.23,
+                          today_baseline_nav=10000.0, today_pnl_available=True)
+            return result
+
+        session = {"code": "trading", "label": "交易中", "today_pnl_available": True}
+        with patch.object(PT, "_market_session", return_value=session), \
+             patch.object(PT, "_today_position_performance", return_value=(None, None, None)), \
+             patch.object(PT, "_shared_metrics", side_effect=shared_with_legacy_value):
+            overview = PT.dashboard()
+        self.assertTrue(overview["positions"])
+        self.assertTrue(any(a["today_position_missing_codes"] for a in overview["accounts"]))
+        self.assertEqual(overview["shared"]["ledger_today_pnl"], 123.0)
+        self.assertIsNone(overview["shared"]["today_pnl"])
+        self.assertIsNone(overview["shared"]["today_return_pct"])
+        self.assertFalse(overview["shared"]["today_pnl_available"])
+        self.assertEqual(overview["shared"]["today_pnl_status"], "暂无完整行情")
 
 
 if __name__ == "__main__":

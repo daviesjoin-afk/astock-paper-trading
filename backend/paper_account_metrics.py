@@ -6,6 +6,7 @@ module never imports the trading facade and does not add database queries.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any, Callable
 
 import paper_account_specs as ACS
@@ -175,14 +176,22 @@ def account_metrics(conn, account, quotes=None, positions=None, metric_cache=Non
     today_position_pnl = 0.0
     today_position_base = 0.0
     today_has_quote = False
+    today_position_missing_codes = []
     for position in positions:
+        if _num(position.get("qty"), 0.0) <= 0:
+            continue
         quote = quotes.get(position["code"]) or {}
-        price = _num(quote.get("price"), _num(position.get("cost")))
-        pnl, _pct, baseline = _ports().today_position_performance(position, price, quote, today)
+        price = _num(quote.get("price"), None)
+        if price is None or not math.isfinite(price) or price <= 0:
+            pnl, baseline = None, None
+        else:
+            pnl, _pct, baseline = _ports().today_position_performance(position, price, quote, today)
         if pnl is not None:
             today_has_quote = True
             today_position_pnl += _num(pnl)
             today_position_base += _num(baseline)
+        else:
+            today_position_missing_codes.append(str(position["code"]))
     today_sells = [
         order for order in sells
         if str(order.get("executed_at") or order.get("created_at") or "")[:10] == today
@@ -197,7 +206,8 @@ def account_metrics(conn, account, quotes=None, positions=None, metric_cache=Non
     today_activity = today_has_quote or today_sell["total"] > 0
     today_pnl = (
         (today_position_pnl if today_has_quote else 0.0) + today_sell_pnl
-        if market_session["today_pnl_available"] and today_activity and today_sell_available
+        if (market_session["today_pnl_available"] and today_activity and today_sell_available
+            and not today_position_missing_codes)
         else None
     )
     today_baseline_nav = (
@@ -248,12 +258,15 @@ def account_metrics(conn, account, quotes=None, positions=None, metric_cache=Non
         "today_pnl_status": (
             "已清仓，含当日已实现盈亏"
             if today_pnl is not None and not positions and today_sell["total"] > 0
+            else "暂无完整行情" if (today_pnl is None and market_session["today_pnl_available"]
+                              and (today_position_missing_codes or not today_sell_available))
             else market_session["label"] if today_pnl is None else ""
         ),
         "market_session": market_session["code"],
         "today_baseline_nav": round(today_baseline_nav, 2) if today_baseline_nav is not None else None,
         "today_baseline_date": today if today_pnl is not None else (previous_nav_row["nav_date"] if previous_nav_row else None),
-        "today_open_position_pnl": round(today_position_pnl, 2) if today_has_quote else None,
+        "today_open_position_pnl": round(today_position_pnl, 2) if today_has_quote and not today_position_missing_codes else None,
+        "today_position_missing_codes": sorted(set(today_position_missing_codes)),
         "today_sell_pnl": today_sell_pnl if today_sell["covered"] == today_sell["total"] else None,
         "today_sell_quote_coverage": f"{today_sell['covered']}/{today_sell['total']}",
         "today_sell_missing_codes": today_sell["missing_codes"],

@@ -137,7 +137,44 @@ class AccountMetricLedgerTests(unittest.TestCase):
         self.assertEqual(actual["position_value"], 1000.0)
         self.assertEqual(actual["unrealized_pnl"], 0.0)
         self.assertEqual(actual["nav"], 10095.0)
+        # The verified sell is known, but the missing open holding makes the
+        # account's *complete* daily P&L unknown.
+        self.assertEqual(actual["today_sell_pnl"], 95.0)
+        self.assertIsNone(actual["today_pnl"])
+        self.assertIsNone(actual["today_return_pct"])
+        self.assertFalse(actual["today_pnl_available"])
+        self.assertEqual(actual["today_position_missing_codes"], ["000001"])
+
+    def test_one_missing_holding_does_not_publish_partial_daily_profit(self):
+        self.positions.append({"code": "000004", "qty": 50, "cost": 10,
+                               "today_acquired_qty": 0, "today_acquired_cost": 0})
+        actual = self.project()
+        self.assertIsNone(actual["today_pnl"])
+        self.assertFalse(actual["today_pnl_available"])
+        self.assertEqual(actual["today_position_missing_codes"], ["000004"])
+
+    def test_quote_without_price_is_not_replaced_by_cost_for_daily_profit(self):
+        quotes = {code: dict(quote) for code, quote in self.quotes.items()}
+        del quotes["000001"]["price"]
+        actual = self.project(quotes=quotes)
+        self.assertIsNone(actual["today_pnl"])
+        self.assertEqual(actual["today_position_missing_codes"], ["000001"])
+
+    def test_unusable_or_incomplete_holding_quote_makes_daily_profit_unknown(self):
+        for changes in ({"pct": None}, {"quote_at": "2026-01-01T10:00:00+08:00"}):
+            with self.subTest(changes=changes):
+                quotes = {code: dict(quote) for code, quote in self.quotes.items()}
+                quotes["000001"].update(changes)
+                actual = self.project(quotes=quotes)
+                self.assertIsNone(actual["today_pnl"])
+                self.assertEqual(actual["today_position_missing_codes"], ["000001"])
+
+    def test_fully_sold_position_with_covered_sell_remains_available(self):
+        self.positions.clear()
+        actual = self.project()
         self.assertEqual(actual["today_pnl"], 95.0)
+        self.assertTrue(actual["today_pnl_available"])
+        self.assertEqual(actual["today_position_missing_codes"], [])
 
     def test_empty_account_has_fixed_values(self):
         self.conn.executescript("DELETE FROM paper_orders; DELETE FROM paper_fills; DELETE FROM paper_nav;")
