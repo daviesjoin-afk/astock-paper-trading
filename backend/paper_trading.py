@@ -14707,7 +14707,18 @@ def _risk_base_dashboard():
         cycle = dict(cycle)
         account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=today, readonly=True)
-        codes = sorted({str(position.get("code")) for position in positions if position.get("code")})
+        metric_cache = _account_metric_inputs(
+            conn, [row["id"] for row in account_rows], today
+        )
+        # Today's fully exited holdings also need a cached quote for their
+        # realized daily contribution; never call a provider from this reader.
+        sold_codes = {
+            str(order.get("code"))
+            for rows in (metric_cache.get("sells") or {}).values()
+            for order in rows
+            if order.get("code") and str(order.get("executed_at") or order.get("created_at") or "")[:10] == today.isoformat()
+        }
+        codes = sorted({str(position.get("code")) for position in positions if position.get("code")} | sold_codes)
         quotes = {}
         try:
             snapshot_rows = dfc.load_market_snapshot_full_cached()
@@ -14732,9 +14743,6 @@ def _risk_base_dashboard():
                ) ORDER BY score ASC,id DESC""",
             (cycle["id"], cycle["id"]),
         )
-        metric_cache = _account_metric_inputs(
-            conn, [row["id"] for row in account_rows], today
-        )
         accounts = [
             _account_metrics(
                 conn, row, quotes=quotes,
@@ -14745,6 +14753,10 @@ def _risk_base_dashboard():
             for row in account_rows
         ]
         shared = _shared_metrics(conn, cycle, positions, quotes)
+        from dashboard_queries import mark_incomplete_daily_loss
+        if mark_incomplete_daily_loss(accounts, shared) and _market_session().get("today_pnl_available"):
+            shared.update(today_pnl=None, today_return_pct=None, today_pnl_available=False,
+                          today_pnl_status="暂无完整行情", today_pnl_source="incomplete_quote_evidence")
         account_names = {account["id"]: account["name"] for account in accounts}
         for position in positions:
             quote = quotes.get(position["code"]) or {}
