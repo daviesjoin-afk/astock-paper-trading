@@ -85,13 +85,20 @@ def _connection_dropped(exc, attempt_seconds):
 # （25s）等串行阶段里，直接把整轮扫描拖到 190 秒以上。
 #
 # 语义边界（刻意保持保守）：
-# * 只在**传输层**失败（超时/连接错误）时计数；HTTP 状态错误说明对端活着，
-#   反而清零。
-# * 只有连续失败到阈值才短路，单次抖动不会触发。
+# * 只在**传输层**失败（超时/连接错误/5xx）时计数；4xx 说明我们的请求有问题、
+#   主机可达，反而清零。
 # * 短路时抛 ``requests.ConnectionError``——与真实连接失败的异常类型一致，
 #   因此所有调用方原有的 fail-closed 分支（缺数据即不发布/不入场）原样生效，
 #   不会因为短路而放宽任何门禁。
+#
+# 为什么还要有"浪费预算"这一条：`http_get` 的默认参数是 ``timeout=15,
+# retries=2``，**单个失败 URL 就要烧 45 秒**。若只按"连续 6 次"触发，最坏要
+# 先浪费 270 秒才把主机短路——生产 close 时段实测出现过 480 秒里约 408 秒
+# 没有任何子阶段覆盖的黑洞，正是这类"还没到阈值就先把超时预算烧光"的表现。
+# 因此再加一条按**累计浪费时长**触发的闸门：同一主机累计浪费到 45 秒（约等于一次 timeout=15, retries=2 的最坏尝试）就短路，
+# 与次数阈值取"或"关系。
 _TRANSPORT_BREAKER_THRESHOLD = 6      # 连续多少次传输失败后短路
+_TRANSPORT_BREAKER_BURN_BUDGET = 45.0  # 或：累计浪费多少秒后短路（=一次最坏尝试）
 _TRANSPORT_BREAKER_COOLDOWN_SECONDS = 90.0
 
 _transport_breaker = {}
@@ -119,16 +126,25 @@ def _transport_breaker_remaining(host):
         return remaining if remaining > 0 else None
 
 
-def _transport_breaker_note(host, *, ok):
-    """记录一次请求的健康结果；成功清零，连续失败到阈值则短路。"""
+def _transport_breaker_note(host, *, ok, burned=0.0):
+    """记录一次请求的健康结果。
+
+    成功清零；**连续失败到次数阈值**或**累计浪费到时长预算**任一满足即短路。
+    后者是必要的：``timeout=15, retries=2`` 下单次失败就烧 45 秒，只按次数
+    触发会让扫描先白等几百秒。
+    """
     with _transport_breaker_lock:
-        state = _transport_breaker.setdefault(host, {"fails": 0, "until": 0.0})
+        state = _transport_breaker.setdefault(
+            host, {"fails": 0, "burned": 0.0, "until": 0.0})
         if ok:
             state["fails"] = 0
+            state["burned"] = 0.0
             state["until"] = 0.0
             return
         state["fails"] = int(state.get("fails") or 0) + 1
-        if state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD:
+        state["burned"] = float(state.get("burned") or 0.0) + max(0.0, float(burned or 0.0))
+        if (state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD
+                or state["burned"] >= _TRANSPORT_BREAKER_BURN_BUDGET):
             state["until"] = time.monotonic() + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
 
 
@@ -145,6 +161,7 @@ def transport_breaker_snapshot():
         return {
             host: {
                 "fails": int(state.get("fails") or 0),
+                "burned_seconds": round(float(state.get("burned") or 0.0), 2),
                 "open": bool((state.get("until") or 0.0) > now),
                 "remaining_seconds": round(max(0.0, (state.get("until") or 0.0) - now), 1),
             }
@@ -170,9 +187,11 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
             raise requests.ConnectionError(
                 f"transport breaker open for {host} ({open_for:.0f}s left)")
     try:
+        started = time.perf_counter()
         text = _http_get_impl(url, params=params, timeout=timeout,
                               encoding=encoding, retries=retries)
     except requests.RequestException as exc:
+        burned = max(0.0, time.perf_counter() - started)
         if isinstance(exc, requests.HTTPError):
             # 4xx = 我们的请求有问题，主机本身可达 → 清零连续计数。
             # 5xx = 主机侧异常 → 计入失败（生产实测 push2 的 trends2 会快速返回
@@ -182,9 +201,10 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
             if status is not None and 400 <= int(status) < 500:
                 _transport_breaker_note(host, ok=True)
             else:
-                _transport_breaker_note(host, ok=False)
+                _transport_breaker_note(host, ok=False, burned=burned)
         else:
-            _transport_breaker_note(host, ok=False)
+            # 超时/连接错误：这次失败实际烧掉多少墙钟就记多少。
+            _transport_breaker_note(host, ok=False, burned=burned)
         raise
     _transport_breaker_note(host, ok=True)
     return text
