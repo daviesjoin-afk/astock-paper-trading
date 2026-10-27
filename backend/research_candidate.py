@@ -99,6 +99,17 @@ def create_and_enqueue(conn, arguments, *, task_id=None, frozen_sessions=None) -
     champion, challenger = NPR.sides_from_manifest(
         strategy_id, target_kind=ETM.TARGET_SELECTION_WEIGHTS,
         model_family=model_family, variant_fields={SUPPORTED_FIELD: variant})
+    # 保持目标字段为模型提出的实际比例；其余字段按原比例分配剩余权重。
+    # 否则简单覆盖完整权重表后由选股器归一化，记录的 variant 会大于实际值。
+    baseline_weights = champion.weight_map()
+    other_total = sum(value for name, value in baseline_weights.items() if name != SUPPORTED_FIELD)
+    if other_total <= 0:
+        raise ValueError("selection_weight_baseline_invalid")
+    adjusted = {name: (variant if name == SUPPORTED_FIELD
+                       else value * (1.0 - variant) / other_total)
+                for name, value in baseline_weights.items()}
+    challenger = NPR.SideParameters(label=challenger.label, model_family=challenger.model_family,
+                                    weight_overrides=tuple(sorted(adjusted.items())))
     rules = NPR.ReplayRules(
         reference_capital=float(args.get("reference_capital") or 100_000.0),
         max_positions=int(args.get("max_positions") or 3),

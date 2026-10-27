@@ -102,6 +102,22 @@ class BoundsTests(CandidateTestCase):
 
 
 class CreationTests(CandidateTestCase):
+    def test_requested_flow_weight_matches_real_selector_after_normalization(self):
+        import replay_receipt_ledger as RL
+        import strategies as S
+
+        target = self.baseline + 0.03
+        created = self.create(variant=target)
+        with AQ.connect(self.path) as conn:
+            run = RL.get_run(conn, created["experiment_id"])
+        weights = run["challenger"]["weight_overrides"]
+        self.assertAlmostEqual(sum(weights.values()), 1.0)
+        result = S.run_strategy("first_board_relay", factor_table(), topn=3,
+                                first_board_codes=["600001"], weight_overrides=weights)
+        self.assertFalse(result["factor_calibration"]["weight_override_rejected"])
+        self.assertAlmostEqual(result["weights_used"]["flow"], target)
+        self.assertAlmostEqual(created["variant"], result["weights_used"]["flow"])
+
     def test_a_candidate_is_persisted_with_the_frozen_environment(self):
         created = self.create()
         self.assertEqual(created["field"], RC.SUPPORTED_FIELD)
