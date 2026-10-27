@@ -148,6 +148,29 @@ def _transport_breaker_note(host, *, ok, burned=0.0):
             state["until"] = time.monotonic() + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
 
 
+# ---------------------------------------------------------------------------
+# 公开的短路 API。
+#
+# 别的模块（如 ``alt_data`` 的自有 GET 出口）需要共享同一份"这个主机是否已经
+# 不可用"的判断。跨模块直接调用下划线函数属于隐性耦合，也会触发耦合预算里的
+# ``private_cross_access`` 门禁，因此这里把三个操作显式公开；内部实现与
+# ``http_get`` 用的是同一份状态。
+# ---------------------------------------------------------------------------
+def transport_host(url):
+    """``url`` 对应的短路键（主机名）。"""
+    return _transport_host(url)
+
+
+def transport_breaker_remaining(host):
+    """剩余短路秒数；未短路返回 None。"""
+    return _transport_breaker_remaining(host)
+
+
+def note_transport_result(host, *, ok, burned=0.0):
+    """上报一次请求的健康结果（成功清零；失败按次数/累计浪费判定短路）。"""
+    return _transport_breaker_note(host, ok=ok, burned=burned)
+
+
 def reset_transport_breakers():
     """清空短路状态。给测试与故障恢复用；生产不需要定期调用。"""
     with _transport_breaker_lock:

@@ -65,7 +65,7 @@ def _minute_flow_payload(params):
     errors = []
     for endpoint in MINUTE_FLOW_URLS:
         try:
-            response = requests.get(
+            response = _alt_get(
                 endpoint, params=params,
                 headers={"User-Agent": UA, "Referer": "https://data.eastmoney.com/"},
                 timeout=5,
@@ -226,6 +226,49 @@ _micro_breaker = {}
 _micro_breaker_lock = threading.Lock()
 
 
+def _alt_get(url, **kwargs):
+    """本模块的 GET 出口，与 ``marketdata_transport`` 共享同一份主机健康状态。
+
+    为什么需要：本模块原先直接用 ``requests.get``，因此**完全绕过**传输层的主机
+    短路。生产实测 `risk.alt_evidence` 单轮 10~20 秒墙钟、CPU 只有 0.5 秒，正是
+    这类"只有等待、没有计算"的调用。统一走这里之后，同一个坏主机在别处已经被
+    判定不可用时，这里也会立刻失败，而不是再排一次队等超时。
+
+    语义边界：**不改变返回值**。成功时原样返回 response（不额外 raise_for_status，
+    免得把原先容忍 4xx 的调用方变成抛异常）；失败时只记健康状态再原样抛出。
+    """
+    try:
+        import marketdata_transport as MT
+    except ImportError:  # pragma: no cover - 理论上的可选依赖
+        return requests.get(url, **kwargs)
+    host = MT.transport_host(url)
+    remaining = MT.transport_breaker_remaining(host)
+    if remaining is not None:
+        raise requests.ConnectionError(
+            f"transport breaker open for {host} ({remaining:.0f}s left)")
+    started = time.perf_counter()
+    try:
+        response = requests.get(url, **kwargs)
+    except requests.RequestException:
+        MT.note_transport_result(
+            host, ok=False, burned=max(0.0, time.perf_counter() - started))
+        raise
+    status = getattr(response, "status_code", None)
+    try:
+        code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        # 非标准 response（测试替身、代理适配器）不得让健康记账抛异常。
+        code = None
+    if code is not None and code >= 500:
+        # 5xx = 主机侧异常；4xx 说明对端可达，按成功记账。
+        MT.note_transport_result(
+            host, ok=False, burned=max(0.0, time.perf_counter() - started))
+    else:
+        MT.note_transport_result(host, ok=True)
+    return response
+
+
+
 def _micro_source_key(url):
     """把请求地址归到一个稳定的逻辑源名，便于按源短路与审计。"""
     text = str(url or "")
@@ -322,7 +365,7 @@ def _micro_fetch(url, params, timeout=4):
         if remaining <= 0:
             break
         try:
-            response = requests.get(
+            response = _alt_get(
                 endpoint, params=params,
                 headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"},
                 timeout=min(timeout, remaining),
@@ -400,7 +443,7 @@ def _tencent_depth(code):
     prefix = "sh" if str(code).startswith(("5", "6", "9")) else "sz"
     # 盘口深度是 shadow 级证据（只进软分、fail-open），3 秒足够；
     # 原来的 5 秒在源不可用时把每只候选的等待时间额外拉长。
-    response = requests.get(
+    response = _alt_get(
         TENCENT_QUOTE_URL + prefix + str(code),
         headers={"User-Agent": UA, "Referer": "https://gu.qq.com/"}, timeout=3,
     )
@@ -620,7 +663,7 @@ def eastmoney_datacenter(report_name, columns="ALL", filter_str="",
         "sortColumns": sort_columns, "sortTypes": sort_types,
         "source": "WEB", "client": "WEB",
     }
-    r = requests.get(DATACENTER_URL, params=params,
+    r = _alt_get(DATACENTER_URL, params=params,
                      headers={"User-Agent": UA}, timeout=15)
     r.raise_for_status()
     d = r.json()
@@ -645,7 +688,7 @@ def ths_hot_reason(date=None, ttl_seconds=600):
     try:
         url = (f"http://zx.10jqka.com.cn/event/api/getharden/"
                f"date/{date}/orderby/date/orderway/desc/charset/GBK/")
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=10)
+        r = _alt_get(url, headers={"User-Agent": UA}, timeout=10)
         data = r.json()
         if data.get("errocode", 0) != 0:
             rows = []
@@ -790,7 +833,7 @@ def northbound_realtime(ttl_seconds=300):
         return hit
     result = None
     try:
-        r = requests.get("https://data.hexin.cn/market/hsgtApi/method/dayChart/",
+        r = _alt_get("https://data.hexin.cn/market/hsgtApi/method/dayChart/",
                          headers=HSGT_HEADERS, timeout=10)
         d = r.json()
         times = d.get("time") or []
@@ -1102,7 +1145,7 @@ def ths_eps_forecast(code, cache_days=7, asof_day=None):
     try:
         from io import StringIO
         url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
-        r = requests.get(url, headers={
+        r = _alt_get(url, headers={
             "User-Agent": UA, "Referer": "https://basic.10jqka.com.cn/",
         }, timeout=15)
         r.encoding = "gbk"
