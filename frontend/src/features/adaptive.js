@@ -7,6 +7,57 @@ import { allocationActionPanel } from "./execution.js";
 import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError, toast } from "../ui/dialog.js";
 export { adaptiveValue } from "../core/format.js";
 
+/* ================= 资金分摊 / 调参的人工操作（本页持有） =================
+   这四个动作原本挂在 window 上、由 boot.js 承接：启动文件不该拥有业务写操作，
+   且它们只能被 inline onclick 触发。现在按钮只声明 ``data-adaptive-action``，
+   由本模块在容器上统一委托 —— 页面自己拥有自己的写操作与确认流程。
+
+   验收要点不变：仍需人工 confirm、确认后重新请求、失败提示原文照旧。 */
+export var ADAPTIVE_OPERATOR_ACTIONS = {
+  'apply-allocation': {
+    url: function(arg){return '/api/adaptive/allocation/apply?decision_id='+encodeURIComponent(arg)+'&approved_by=human-ui&confirmed=true';},
+    confirm: function(arg){return '确认把 Bandit 决策 #'+arg+' 的策略权重应用为共享资金池分摊？';},
+    fail: '应用失败：',
+    after: function(payload){renderAdaptive(payload);},
+  },
+  'rollback-allocation': {
+    url: function(arg){return '/api/adaptive/allocation/rollback?account_id='+encodeURIComponent(arg)+'&confirmed=true';},
+    confirm: function(arg){return '确认回滚 '+arg+' 的资金分摊覆盖到上一版？';},
+    fail: '回滚失败：',
+    after: function(payload){renderAdaptive(payload);},
+  },
+  'apply-tuner': {
+    url: function(arg){return '/api/adaptive/tuner/apply?run_id='+encodeURIComponent(arg)+'&approved_by=human-ui&confirmed=true';},
+    confirm: function(arg){return '确认把双AI共识运行 #'+arg+' 的提案应用为选股因子覆盖？';},
+    fail: '应用失败：',
+    after: function(){return loadEvolutionStatus();},
+  },
+  'rollback-tuner': {
+    url: function(arg){return '/api/adaptive/tuner/rollback?account_id='+encodeURIComponent(arg)+'&confirmed=true';},
+    confirm: function(arg){return '确认回滚 '+arg+' 的 AI 调参覆盖到 apply 前状态？';},
+    fail: '回滚失败：',
+    after: function(){return loadEvolutionStatus();},
+  },
+};
+
+export function installAdaptiveOperatorActions(root){
+  var container=root||(typeof document!=='undefined'?document:null);
+  if(!container||typeof container.addEventListener!=='function') return false;
+  container.addEventListener('click', async function(event){
+    var target=event.target;
+    var button=target&&target.closest?target.closest('[data-adaptive-action]'):null;
+    if(!button) return;
+    var action=ADAPTIVE_OPERATOR_ACTIONS[String(button.dataset.adaptiveAction||'')];
+    if(!action) return;
+    event.preventDefault();
+    var arg=button.dataset.adaptiveArg;
+    if(!window.confirm(action.confirm(arg))) return;
+    try{ action.after(await apiPost(action.url(arg)),arg); }
+    catch(e){ alert(action.fail+(e.message||e)); }
+  });
+  return true;
+}
+
 export function adaptiveStageClass(stage){
   if(stage==='eligible_for_review'||stage==='advisory') return 'ready';
   if(stage==='shadow'||stage==='regime_validation') return 'learning';
@@ -934,9 +985,9 @@ export function renderDualAiRuns(runs){
     var action='';
     if(r.status==='consensus'&&proposalCount>0&&applied&&applied.length===0){
       var fresh=(Date.now()-new Date(String(r.created_at||'').replace(' ','T')).getTime())<30*60*1000;
-      action=fresh?'<button class="ghost" onclick="applyAdaptiveTunerProposal('+Number(r.id)+')">应用共识</button>':'<span style="color:#9aa5b1;font-size:11px">已过期</span>';
+      action=fresh?'<button class="ghost" data-adaptive-action="apply-tuner" data-adaptive-arg="'+Number(r.id)+'">应用共识</button>':'<span style="color:#9aa5b1;font-size:11px">已过期</span>';
     }else if(applied&&applied.length){
-      action=applied.map(function(a){return '<button class="ghost" onclick="rollbackAdaptiveTunerOverlay(\''+adaptiveEsc(a)+'\')">回滚'+adaptiveEsc(a)+'</button>';}).join(' ');
+      action=applied.map(function(a){return '<button class="ghost" data-adaptive-action="rollback-tuner" data-adaptive-arg="'+adaptiveEsc(a)+'">回滚'+adaptiveEsc(a)+'</button>';}).join(' ');
     }else if(applied===null){action='落地记录格式异常';}
     h+='<tr>'
       +'<td>#'+r.id+'</td>'

@@ -1,9 +1,8 @@
 /* PR-55：顶层语句与 var 初始化 —— **保持原始顺序**，由 src/app.js 最后 import。
    顺序即执行顺序，重排等于改行为。 */
-import { api, apiPost } from "./core/api.js";
 import { $, charts } from "./core/dom.js";
 import { PAPER_VIEW_KEY, SETTINGS_SECTION_KEY, activatePage, installHashRouting, installWorkspaceTabRails, registerMarketGateLoader, registerPageLoader, registerPaperViewLoader, renderClock, restoreAppNavigation, syncThemeControl, syncWorkspaceTabRails } from "./core/navigation.js";
-import { loadAdaptive, loadEvolutionStatus, renderAdaptive, setAdaptiveSection } from "./features/adaptive.js";
+import { installAdaptiveOperatorActions, loadAdaptive, loadEvolutionStatus, setAdaptiveSection } from "./features/adaptive.js";
 import { loadPaperExecution } from "./features/execution.js";
 import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPortfolioWorkspace } from "./features/paper.js";
 import { loadPaperRisk } from "./features/risk.js";
@@ -26,29 +25,9 @@ window.addEventListener('popstate',restoreAppNavigation);
 
 window.addEventListener('resize',syncWorkspaceTabRails,{passive:true});
 
-window.applyAdaptiveAllocation=async function(decisionId){
-  if(!window.confirm('确认把 Bandit 决策 #'+decisionId+' 的策略权重应用为共享资金池分摊？'))return;
-  try{renderAdaptive(await apiPost('/api/adaptive/allocation/apply?decision_id='+decisionId+'&approved_by=human-ui&confirmed=true'));}
-  catch(e){alert('应用失败：'+(e.message||e));}
-};
-
-window.rollbackAdaptiveAllocation=async function(accountId){
-  if(!window.confirm('确认回滚 '+accountId+' 的资金分摊覆盖到上一版？'))return;
-  try{renderAdaptive(await apiPost('/api/adaptive/allocation/rollback?account_id='+encodeURIComponent(accountId)+'&confirmed=true'));}
-  catch(e){alert('回滚失败：'+(e.message||e));}
-};
-
-window.applyAdaptiveTunerProposal=async function(runId){
-  if(!window.confirm('确认把双AI共识运行 #'+runId+' 的提案应用为选股因子覆盖？'))return;
-  try{await apiPost('/api/adaptive/tuner/apply?run_id='+runId+'&approved_by=human-ui&confirmed=true');await loadEvolutionStatus();}
-  catch(e){alert('应用失败：'+(e.message||e));}
-};
-
-window.rollbackAdaptiveTunerOverlay=async function(accountId){
-  if(!window.confirm('确认回滚 '+accountId+' 的 AI 调参覆盖到 apply 前状态？'))return;
-  try{await apiPost('/api/adaptive/tuner/rollback?account_id='+encodeURIComponent(accountId)+'&confirmed=true');await loadEvolutionStatus();}
-  catch(e){alert('回滚失败：'+(e.message||e));}
-};
+/* 资金分摊 / 调参的应用与回滚由 p-adaptive 自己持有（data-adaptive-action 委托），
+   启动文件不再挂这四个 window 全局、也不再承接业务写操作。 */
+installAdaptiveOperatorActions(document);
 
 /* 页面加载时自动执行 */
 setTimeout(function(){if(document.getElementById('aiStatusCards')) loadEvolutionStatus();},1000);
