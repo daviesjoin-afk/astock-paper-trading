@@ -598,7 +598,7 @@ class MarketDataReadPathTests(unittest.TestCase):
         self.assertEqual([], guard.attempts,
                          "allocation-explain 的行情读取访问了 provider")
         self.assertEqual(MDC.STATUS_UNAVAILABLE, payload["market_data"]["status"])
-        self.assertEqual(5, len(payload["strategies"]),
+        self.assertEqual(3, len(payload["strategies"]),
                          "只读投影迁移后策略行数发生变化")
 
     def test_MDR07_dashboard_projection_is_network_free(self):

@@ -58,7 +58,7 @@ class HotLeaderProfileNaNTests(unittest.TestCase):
 
     def test_missing_column_does_not_wipe_paper_picks(self):
         table = _mini_table()
-        result = S.run_strategy("one_to_two", table, topn=5, gate=None,
+        result = S.run_strategy("first_board_relay", table, topn=5, gate=None,
                                 first_board_codes=None)
         self.assertEqual(len(result["picks"]), 5)
         scores = [pick["score"] for pick in result["picks"]]
@@ -77,7 +77,7 @@ class HotLeaderProfileNaNTests(unittest.TestCase):
         table["sector_heat_score"] = np.nan
         profile = S._hot_leader_profile(table)
         self.assertEqual(int(profile["score"].isna().sum()), 0)
-        result = S.run_strategy("bottom_reversal", table, topn=3, gate=None,
+        result = S.run_strategy("pullback_reversal", table, topn=3, gate=None,
                                 first_board_codes=None)
         self.assertEqual(len(result["picks"]), 3)
 

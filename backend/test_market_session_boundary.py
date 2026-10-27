@@ -239,7 +239,7 @@ class FactorReadinessTests(unittest.TestCase):
             sentiment.return_value = {"known":{}}
             # Scheduled jobs use this default mode and must consume the data
             # before their short-lived process exits, without starting threads.
-            scheduled = M._select_uncached(strategy="one_to_two", topn=10)
+            scheduled = M._select_uncached(strategy="first_board_relay", topn=10)
             finance.assert_called_once_with()
             sentiment.assert_called_once()
             self.assertNotIn("context_pending", scheduled)

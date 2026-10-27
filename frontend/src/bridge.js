@@ -130,8 +130,12 @@ window.wbTransition = wbTransition;
 window.wbValidateDraft = wbValidateDraft;
 
 import { editAiProvider, changeAiSlotProvider, saveAiProvider, refreshAiProviderModels, clearAiProviderKey } from "./features/ai-provider-settings.js";
+import { issueAiCapability, revokeAiCapability, refreshAiCapabilities } from "./features/ai-capability.js";
 window.editAiProvider = editAiProvider;
 window.changeAiSlotProvider = changeAiSlotProvider;
 window.saveAiProvider = saveAiProvider;
 window.refreshAiProviderModels = refreshAiProviderModels;
+window.issueAiCapability = issueAiCapability;
+window.revokeAiCapability = revokeAiCapability;
+window.refreshAiCapabilities = refreshAiCapabilities;
 window.clearAiProviderKey = clearAiProviderKey;

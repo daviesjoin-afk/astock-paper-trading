@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""「策略选股」：模拟盘 5 套策略的盘后自动选股与持久化。
+"""「策略选股」：当前正式策略的盘后自动选股与持久化。
 
 设计要点（与需求一一对应）
 --------------------------
-1. **策略来源**：完全取自模拟盘账户注册表 ``strategy_registry``（5 套），
-   与「策略模拟」页同源；每个策略带编号（策略1…策略5）与名称。
+1. **策略来源**：取自 ``strategy_registry`` 的正式策略集合，
+   与「策略模拟」页同源；每个策略带当前编号与名称。
 2. **评分选股**：复用既有选股因子链 ``main._select_uncached``（同一套
    覆盖率/行情新鲜度/买卖范围门禁），每个策略按其模型族评分取 Top N
    （默认 5，候选不足则少于 5 只并给出空状态）。
@@ -85,9 +85,9 @@ def _registry_conn() -> sqlite3.Connection:
 # 可以被多个策略（或完全没有策略）使用，所以绝不能用它反推 strategy_id —— 那会
 # 造出不存在的 provenance。
 STRATEGY_MODEL = {
-    "tq_breakout": "one_to_two",
-    "trend_pullback": "bottom_reversal",
-    "sector_rotation": "sentiment_pioneer",
+    "tq_breakout": "first_board_relay",
+    "trend_pullback": "pullback_reversal",
+    "sector_rotation": "sector_sentiment",
     "reported_profit_breakout": "reported_profit_breakout",
     "main_force_top10": "main_force_top10",
 }
@@ -378,7 +378,7 @@ def _migrate_picks(conn) -> None:
 
 
 def catalog():
-    """返回 5 套策略的编号/名称/模型族（顺序与注册表一致）。
+    """返回当前正式策略的编号/名称/模型族（顺序与注册表一致）。
 
     只用于「现在能跑哪些策略」的**展示与调度**，不是历史 authority。
     """

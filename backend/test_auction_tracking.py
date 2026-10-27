@@ -114,3 +114,70 @@ class AuctionTrackingTests(unittest.TestCase):
         saved=json.loads((self.root/'auction_tracking/current.json').read_text())
         self.assertEqual('final_snapshot',saved['observations'][0]['phase'])
         self.assertFalse(A.record_final([self.quote(now)],self.now(40),{'healthy':True}))
+
+
+class AuctionAmountSummaryTests(unittest.TestCase):
+    """竞价金额：只汇总真实可用的金额，缺失不填零，并逐日落档。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        env = mock.patch.dict('os.environ', {'ASTOCK_DATA_DIR': str(self.root)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def quote(self, now, **updates):
+        row = {'code': '000001', 'price': 10.0, 'quote_at': now.isoformat()}
+        row.update(updates)
+        return row
+
+    def test_summary_counts_only_rows_that_really_carry_amount(self):
+        summary = A.summarize([
+            {'code': '000001', 'name': '甲', 'pct': 1.5, 'amount': 1000.0, 'volume': 100},
+            {'code': '000002', 'name': '乙', 'pct': -2.5, 'amount': 2500.0, 'volume': 200},
+            {'code': '000003', 'name': '丙', 'pct': 0.0, 'amount': None, 'volume': 0},
+        ])
+        self.assertEqual(summary['tracked'], 3)
+        self.assertEqual(summary['with_amount'], 2)
+        self.assertEqual(summary['amount_total'], 3500.0)
+        self.assertEqual(summary['volume_total'], 300.0)
+        self.assertAlmostEqual(summary['amount_coverage_pct'], 66.67, places=2)
+        self.assertEqual((summary['up'], summary['down'], summary['flat']), (1, 1, 1))
+        self.assertEqual([row['code'] for row in summary['largest']], ['000002', '000001'])
+        self.assertEqual(summary['unit'], {'amount': '元', 'volume': '手'})
+        self.assertIn('未覆盖部分不计入', summary['boundary'])
+
+    def test_missing_amounts_are_never_filled_with_zero_rows(self):
+        summary = A.summarize([{'code': '000001'}, {'code': '000002', 'amount': 0}])
+        self.assertEqual(summary['with_amount'], 0)
+        self.assertEqual(summary['amount_total'], 0.0)
+        self.assertEqual(summary['largest'], [])
+        self.assertEqual(summary['amount_coverage_pct'], 0.0)
+        self.assertIsNone(summary['mean_pct'])
+        self.assertEqual(A.summarize([])['tracked'], 0)
+
+    def test_final_snapshot_is_archived_once_per_day(self):
+        now = dt.datetime(2026, 10, 26, 9, 25, tzinfo=A.CN)
+        rows = [self.quote(now, code='600001', code_name='甲', amount=1234.5, volume=321.0),
+                self.quote(now, code='600002', code_name='乙', amount=None)]
+        self.assertTrue(A.record_final(rows, now, {'healthy': True}))
+        archived = A.load_archived_day('2026-10-26')
+        self.assertEqual(archived['trade_date'], '2026-10-26')
+        self.assertEqual(len(archived['rows']), 2)
+        self.assertEqual(archived['summary']['amount_total'], 1234.5)
+        self.assertEqual([path.name for path in A.archived_days()], ['2026-10-26.json'])
+        self.assertEqual(A.load_archived_day('2026-10-27'), {})
+
+    def test_archive_prunes_to_the_retention_window(self):
+        folder = self.root / 'auction_tracking'
+        folder.mkdir(parents=True, exist_ok=True)
+        start = dt.date(2026, 6, 1)
+        names = [(start + dt.timedelta(days=offset)).isoformat() for offset in range(65)]
+        for name in names:
+            (folder / f'{name}.json').write_text('{}', encoding='utf-8')
+        A._prune_archive(folder)
+        kept = sorted(path.stem for path in folder.glob('*.json'))
+        self.assertEqual(len(kept), A.ARCHIVE_KEEP_DAYS)
+        self.assertEqual(kept, names[-A.ARCHIVE_KEEP_DAYS:])
+        self.assertNotIn(names[0], kept)

@@ -3,17 +3,17 @@
 
 背景
 ----
-PR #107 把 ``PAPER_CONDITION_DEFAULTS["sentiment_pioneer"]["individual_mom5_min"]``
+PR #107 把 ``PAPER_CONDITION_DEFAULTS["sector_sentiment"]["individual_mom5_min"]``
 从错误的 ``2.0``（percentage points）改成 canonical ``0.02``（fraction）。
 但**历史自进化 overlay 已经把旧值持久化**进 ``paper_accounts.params``：
 
 .. code-block:: json
 
-    {"adaptive_selection": {"model_family": "sentiment_pioneer",
+    {"adaptive_selection": {"model_family": "sector_sentiment",
                             "conditions": {"individual_mom5_min": 2.0}}}
 
 运行时 ``_paper_conditions()`` 会用 overlay 覆盖代码默认值，于是
-``mom5_raw >= 2.0``（等价 +200%）继续生效，``sentiment_pioneer`` 的
+``mom5_raw >= 2.0``（等价 +200%）继续生效，``sector_sentiment`` 的
 ``individual_strong`` 路径仍是死分支。**代码默认值修好了，持久化状态没有** ——
 所以需要一次数据兼容迁移，而不是再加一个代码补丁。
 
@@ -26,7 +26,7 @@ PR #107 把 ``PAPER_CONDITION_DEFAULTS["sentiment_pioneer"]["individual_mom5_min
 
 只修**已证实的 legacy sentinel**。
 ---------------------
-本模块**只**修 ``sentiment_pioneer`` 的 ``conditions.individual_mom5_min`` 且值恰为
+本模块**只**修 ``sector_sentiment`` 的 ``conditions.individual_mom5_min`` 且值恰为
 ``2.0`` 的情形。绝不写 ``if value > 1: value /= 100`` 这类猜测式归一化：
 ``2.1`` / ``0.025`` / ``20`` / ``"2.0"`` / ``True`` 一律保持原样。
 """
@@ -40,11 +40,12 @@ import math
 
 import factor_units as FU
 import paper_repository as PRP
+import strategy_naming as NAMING
 
 __all__ = [
     "LEGACY_MOM5_MIN_PCT_POINTS",
     "MOM5_MIN_FIELD",
-    "SENTIMENT_PIONEER_MODEL",
+    "TARGET_MODEL_FAMILY",
     "MIGRATION_ID",
     "AUDIT_EVENT",
     "AUDIT_REASON",
@@ -59,7 +60,10 @@ __all__ = [
 #: 历史 bug signature：错误地以 percentage points 写入的 2.0（意图 +2%）。
 LEGACY_MOM5_MIN_PCT_POINTS = 2.0
 MOM5_MIN_FIELD = "individual_mom5_min"
-SENTIMENT_PIONEER_MODEL = "sentiment_pioneer"
+#: 目标模型族（canonical 名）。历史 overlay 里存的是旧名号，所以匹配一律先经
+#: ``NAMING.canonical_model_family`` 归一化再比较 —— 旧值与新值都会命中，
+#: 数据迁移前后都能正常修到。
+TARGET_MODEL_FAMILY = NAMING.CANONICAL_SECTOR_SENTIMENT
 MIGRATION_ID = "legacy-sentiment-pioneer-mom5-unit-v1"
 AUDIT_EVENT = "adaptive_selection_unit_migrated"
 NORMALIZED_EVENT = "adaptive_selection_unit_normalized"
@@ -121,13 +125,13 @@ def normalize_legacy_conditions(conditions, *, model_family=None, canonical=None
     - ``normalized_copy`` 永远是**新对象**，绝不原地修改调用方入参；
     - ``details`` 为空列表表示什么都没改（含"值不是已证实 sentinel"的情形）。
 
-    只有 ``model_family == "sentiment_pioneer"`` 且 ``individual_mom5_min`` 恰为
+    只有 ``model_family`` 归一化后等于 ``sector_sentiment`` 且 ``individual_mom5_min`` 恰为
     ``2.0``（JSON number）时才会替换为 canonical fraction。
     """
     if not isinstance(conditions, dict):
         return conditions, []
     result = copy.deepcopy(conditions)
-    if str(model_family or "") != SENTIMENT_PIONEER_MODEL:
+    if NAMING.canonical_model_family(model_family) != TARGET_MODEL_FAMILY:
         return result, []
     if MOM5_MIN_FIELD not in result:
         return result, []
@@ -148,14 +152,15 @@ def normalize_legacy_selection_units(overlay, *, effective_model=None):
     if not isinstance(overlay, dict):
         return overlay, []
     result = copy.deepcopy(overlay)
-    model = str(result.get("model_family") or effective_model or "")
-    if model != SENTIMENT_PIONEER_MODEL:
+    model = NAMING.canonical_model_family(
+        result.get("model_family") or effective_model or "")
+    if model != TARGET_MODEL_FAMILY:
         return result, []
     conditions = result.get("conditions")
     if not isinstance(conditions, dict):
         return result, []
     normalized, details = normalize_legacy_conditions(
-        conditions, model_family=SENTIMENT_PIONEER_MODEL,
+        conditions, model_family=TARGET_MODEL_FAMILY,
     )
     if details:
         result["conditions"] = normalized
@@ -229,7 +234,7 @@ def migrate_legacy_selection_units(conn, *, now_fn=None):
 
     设计约束（PR-1.1 §6–§9）：
 
-    - **精确匹配**：只处理 ``model_family == "sentiment_pioneer"`` 且
+    - **精确匹配**：只处理归一化后等于 ``sector_sentiment`` 的型号 且
       ``conditions.individual_mom5_min`` 恰为数值 ``2.0`` 的行；
     - **不改其它任何 JSON 字段**，也不"顺便刷新成新 defaults"；
     - **同一事务**内完成 写回 + audit —— audit 失败则 params 不落盘
@@ -267,8 +272,8 @@ def migrate_legacy_selection_units(conn, *, now_fn=None):
             stats["skipped"] += 1
             continue
 
-        model = str(overlay.get("model_family") or "")
-        if model != SENTIMENT_PIONEER_MODEL:
+        model = NAMING.canonical_model_family(overlay.get("model_family") or "")
+        if model != TARGET_MODEL_FAMILY:
             stats["skipped"] += 1
             continue
 

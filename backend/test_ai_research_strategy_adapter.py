@@ -105,7 +105,7 @@ def _calls_in(name: str) -> list[tuple[str, int]]:
 
 
 def _selection_fact(conn, **overrides):
-    baseline = {"weights": dict(ASEL.BASE_WEIGHTS["one_to_two"])}
+    baseline = {"weights": dict(ASEL.BASE_WEIGHTS["first_board_relay"])}
     candidate = dict(baseline["weights"])
     keys = sorted(candidate)
     candidate[keys[0]] = round(candidate[keys[0]] + 0.02, 6)
@@ -114,7 +114,7 @@ def _selection_fact(conn, **overrides):
         conn, run_date=overrides.get("run_date", "2026-09-18"),
         account_id=overrides.get("account_id", "tq_breakout"),
         regime=overrides.get("regime", "momentum:ai:1030"),
-        model_id=overrides.get("model_id", "one_to_two"),
+        model_id=overrides.get("model_id", "first_board_relay"),
         baseline_params=baseline, candidate_params={"weights": candidate},
         evidence={"source": "DeepSeek"}, reason="bounded",
         now=overrides.get("now", "2026-09-21T09:10:00+08:00"),

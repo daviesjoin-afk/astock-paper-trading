@@ -34,6 +34,9 @@ class RiskAuditPaginationTests(unittest.TestCase):
         cls._old_db = PT.DB_PATH
         PT.DB_PATH = os.path.join(cls._tmp, "paper_trading.sqlite3")
         PT.init_db()
+        from test_strategy_lifecycle_fixtures import seed_historical_builtin_accounts
+        with PT._db() as conn:
+            seed_historical_builtin_accounts(conn)
 
     @classmethod
     def tearDownClass(cls):
@@ -314,6 +317,9 @@ class RiskAuditRouteTests(unittest.TestCase):
         PT.DB_PATH = os.path.join(cls._tmp, "paper_trading.sqlite3")
         PT.init_db()
 
+        from test_strategy_lifecycle_fixtures import seed_historical_builtin_accounts
+        with PT._db() as conn:
+            seed_historical_builtin_accounts(conn)
         app = FastAPI()
         app.include_router(api_paper.router)
         cls._operation = app.openapi()["paths"]["/api/paper/risk-audit"]["get"]

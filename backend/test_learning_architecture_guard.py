@@ -19,6 +19,8 @@ import ast
 import unittest
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
 
 # 会产生/筛选/晋级学习候选的正式模块：这些模块不得自行切分数据。
@@ -45,7 +47,7 @@ FRACTION_TOLERANCE = 1e-9
 
 
 def _load_tree(name):
-    return ast.parse((BACKEND / name).read_text(encoding="utf-8"))
+    return ast_cache.tree(BACKEND / name)
 
 
 def _is_len_call(node):

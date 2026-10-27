@@ -32,6 +32,8 @@ import re
 import unittest
 from pathlib import Path
 
+from test_support import ast_cache
+
 BACKEND = Path(__file__).resolve().parent
 PAPER_TRADING = BACKEND / "paper_trading.py"
 EXECUTION_PLANNER = BACKEND / "execution_planner.py"
@@ -200,11 +202,11 @@ FINALIZER_OWNER = "PPRS"
 
 
 def _source(name):
-    return (BACKEND / name).read_text(encoding="utf-8")
+    return ast_cache.source(BACKEND / name)
 
 
 def _tree(name):
-    return ast.parse(_source(name))
+    return ast_cache.tree(BACKEND / name)
 
 
 def _imported_roots(tree):
@@ -260,6 +262,11 @@ def _function_source(tree, name, raw):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return "\n".join(raw.splitlines()[node.lineno - 1:node.end_lineno])
     raise AssertionError(f"未找到函数 {name}")
+
+
+def _named_function_source(name, function, raw):
+    """Source-backed file parsing shares the cache; dynamic probes stay on ast.parse."""
+    return _function_source(_tree(name), function, raw)
 
 
 class DomainModulesNeverDependOnPaperTrading(unittest.TestCase):
@@ -432,7 +439,7 @@ class RiskDecisionModuleIsDeterministic(unittest.TestCase):
 
     def test_guard6e_sell_plan_delegates_to_the_pure_engine(self):
         raw = _source("paper_risk_evidence.py")
-        body = _function_source(ast.parse(raw), "sell_plan", raw)
+        body = _named_function_source("paper_risk_evidence.py", "sell_plan", raw)
         self.assertIn(
             "PRD.evaluate_sell(", body,
             "_sell_plan 不再委托 paper_risk_decision.evaluate_sell —— "
@@ -452,7 +459,7 @@ class EveryProductionSellPathFinalizesTheEpisode(unittest.TestCase):
         for filename, function in PRODUCTION_SELL_PATHS:
             with self.subTest(path=f"{filename}:{function}"):
                 raw = _source(filename)
-                body = _function_source(ast.parse(raw), function, raw)
+                body = _named_function_source(filename, function, raw)
                 if filename == "execution_planner.py":
                     self.assertIn(
                         f"{FINALIZER_OWNER}.{FINALIZER_CALL}", body,
@@ -525,7 +532,7 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
     def test_guard7d_scan_state_module_owns_no_transaction(self):
         raw = _source(RISK_SCAN_STATE_MODULE)
         body = raw[raw.find('"""', raw.find('"""') + 3) + 3:]
-        leaked = sorted(_call_names(ast.parse(raw)) & {"commit", "rollback"})
+        leaked = sorted(_call_names(_tree(RISK_SCAN_STATE_MODULE)) & {"commit", "rollback"})
         self.assertEqual(
             leaked, [],
             f"{RISK_SCAN_STATE_MODULE} 出现了事务调用 {leaked}：事务由调用方"
@@ -561,12 +568,12 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
             "paper_trading.py 又用 paper_audit 的 risk_scan_state 标记做控制判断；"
             "执行权威只能是 paper_risk_scan_runs",
         )
-        body = _function_source(ast.parse(raw), "monitor_risk", raw)
+        body = _named_function_source("paper_trading.py", "monitor_risk", raw)
         self.assertIn(
             "PRSS.claim_scan(", body,
             "monitor_risk 不再通过 paper_risk_scan_state 认领扫描身份",
         )
-        impl = _function_source(ast.parse(raw), "_monitor_risk_impl", raw)
+        impl = _named_function_source("paper_trading.py", "_monitor_risk_impl", raw)
         self.assertNotIn(
             "risk_scan_state", impl,
             "_monitor_risk_impl 又碰了 paper_audit 的 risk_scan_state 标记：scan "
@@ -579,7 +586,7 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
         )
 
     def test_guard7g_impl_cycle_id_is_keyword_only_and_required(self):
-        tree = ast.parse(_source("paper_trading.py"))
+        tree = _tree("paper_trading.py")
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef) or node.name != "_monitor_risk_impl":
                 continue
@@ -599,7 +606,7 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
     def test_guard7h_scan_snapshot_is_pinned_to_the_claimed_cycle(self):
         """风险扫描的持仓读取必须走显式周期，不能重新猜 active cycle。"""
         raw = _source("paper_risk_service.py")
-        tree = ast.parse(raw)
+        tree = _tree("paper_risk_service.py")
         impl = _function_source(tree, "run", raw)
         scope = _function_source(tree, "_bounded_risk_scope", raw)
         self.assertIn(
@@ -668,7 +675,7 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
 
     def test_guard8d_evidence_module_never_latest_searches(self):
         raw = _source(REVIEW_EVIDENCE_MODULE)
-        tree = ast.parse(raw)
+        tree = _tree(REVIEW_EVIDENCE_MODULE)
         first = tree.body[0]
         body = "\n".join(raw.splitlines()[first.end_lineno:]) if isinstance(
             first, ast.Expr) else raw
@@ -688,7 +695,7 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
                           f"精确 id 之外的形状：{text}")
 
     def test_guard8e_position_quality_requires_explicit_cycle(self):
-        tree = ast.parse(_source("paper_risk_evidence.py"))
+        tree = _tree("paper_risk_evidence.py")
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef) or node.name != "position_quality_score":
                 continue
@@ -703,7 +710,7 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
 
     def test_guard8f_position_quality_uses_the_resolver(self):
         raw = _source("paper_risk_evidence.py")
-        body = _function_source(ast.parse(raw), "position_quality_score", raw)
+        body = _named_function_source("paper_risk_evidence.py", "position_quality_score", raw)
         self.assertIn("PREV.resolve_entry_signal(", body,
                       "_position_quality_score 不再经 episode provenance 解析入场模型分")
         self.assertNotIn("ORDER BY signal_date DESC", body,
@@ -721,7 +728,7 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
 
     def test_guard8h_save_position_review_has_no_wall_clock_fallback(self):
         raw = _source("paper_risk_evidence.py")
-        body = _function_source(ast.parse(raw), "save_position_review", raw)
+        body = _named_function_source("paper_risk_evidence.py", "save_position_review", raw)
         # 只查**代码**：注释里会引用旧实现作为历史说明，不应误报。
         code = "\n".join(
             line for line in body.splitlines() if not line.strip().startswith("#")
@@ -820,7 +827,7 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         用途（例如结算/归档窗口），因此这里只钉 replacement 候选这条读取路径。
         """
         raw = _source("paper_risk_evidence.py")
-        body = _function_source(ast.parse(raw), "best_replacement_candidate", raw)
+        body = _named_function_source("paper_risk_evidence.py", "best_replacement_candidate", raw)
         for shape in FORBIDDEN_REPLACEMENT_SHAPES:
             self.assertNotIn(shape, body,
                              f"_best_replacement_candidate 又出现 {shape!r}："
@@ -839,7 +846,7 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
 
     def test_guard9l_candidate_selection_uses_the_evidence_layer_and_pure_module(self):
         raw = _source("paper_risk_evidence.py")
-        body = _function_source(ast.parse(raw), "best_replacement_candidate", raw)
+        body = _named_function_source("paper_risk_evidence.py", "best_replacement_candidate", raw)
         self.assertIn("PREPL.load_replacement_candidates(", body,
                       "候选读取没有经过 as-of 有界的 evidence 层")
         self.assertIn("PRep.choose_best_candidate(", body,
@@ -862,7 +869,7 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         """
         raw = _source("paper_trading.py")
         body = " ".join(
-            _function_source(ast.parse(raw), "_buy_order", raw).split())
+            _named_function_source("paper_trading.py", "_buy_order", raw).split())
         self.assertIn(
             "_pending_position_slots(conn, positions, cycle_id=current_cycle[\"id\"])",
             body,
@@ -879,7 +886,7 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
 
     # ── 共用断言 ──────────────────────────────────────────────────────────
     def _assert_kwonly_required(self, name, param):
-        tree = ast.parse(_source("paper_trading.py"))
+        tree = _tree("paper_trading.py")
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef) or node.name != name:
                 continue
@@ -894,7 +901,7 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
 
     def _assert_no_active_cycle(self, name):
         raw = _source("paper_trading.py")
-        tree = ast.parse(raw)
+        tree = _tree("paper_trading.py")
         node = _function_node(tree, name)
         body = "\n".join(raw.splitlines()[node.lineno - 1:node.end_lineno])
         # 只查**代码**：docstring 会引用旧实现（``_active_cycle()``）作为历史说明。
@@ -926,7 +933,7 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
     def _flat(self, name, filename="paper_trading.py"):
         """函数源码的**空白无关**形式（换行/缩进不影响断言）。"""
         raw = _source(filename)
-        body = _function_source(ast.parse(raw), name, raw)
+        body = _named_function_source(filename, name, raw)
         return "".join(body.split())
 
     # ── capital planning provenance ───────────────────────────────────────
@@ -1257,7 +1264,7 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
 
     def _flat(self, name, filename="paper_trading.py"):
         raw = _source(filename)
-        body = _function_source(ast.parse(raw), name, raw)
+        body = _named_function_source(filename, name, raw)
         return "".join(body.split())
 
     def _assert_app_sell_delegates(self, function, filename="paper_trading.py"):
@@ -1287,7 +1294,7 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
         self._assert_app_sell_delegates("_intraday_sell")
 
     def test_guard11c_paper_trading_has_no_runtime_fill_insert(self):
-        tree = ast.parse(_source("paper_trading.py"))
+        tree = _tree("paper_trading.py")
         offenders = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -1364,7 +1371,7 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
 
     def test_guard12b_paper_trading_facade_is_thin(self):
         raw = _source("paper_trading.py")
-        body = _function_source(ast.parse(raw), "_monitor_risk_impl", raw)
+        body = _named_function_source("paper_trading.py", "_monitor_risk_impl", raw)
         self.assertLessEqual(
             len(body.splitlines()), 40,
             "_monitor_risk_impl 不再是 thin compatibility adapter",
@@ -1376,7 +1383,7 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
 
     def test_guard12c_explicit_context_and_no_active_cycle_resolution(self):
         raw = _source(self.SERVICE)
-        run_body = _function_source(ast.parse(raw), "run", raw)
+        run_body = _named_function_source(self.SERVICE, "run", raw)
         flat = "".join(run_body.split())
         self.assertIn("run(context:RiskRunContext,*,ports:RiskServicePorts)", flat,
                       "paper_risk_service.run 没有显式接收 RiskRunContext")
@@ -1451,7 +1458,7 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
 
     def test_guard12h_user_spec_is_cycle_pinned(self):
         raw = _source(self.SERVICE)
-        body = _function_source(ast.parse(raw), "_spec_for", raw)
+        body = _named_function_source(self.SERVICE, "_spec_for", raw)
         self.assertIn(
             "SRT.get_context_for_cycle(", body,
             "paper_risk_service._spec_for 仍读取 current strategy head",
@@ -1466,14 +1473,14 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             2,
             "risk service 的 stale/fresh SELL 路径没有全部把 explicit cycle 传给 _spec_for",
         )
-        context = _function_source(ast.parse(_source("strategy_runtime.py")), "get_context_for_cycle", _source("strategy_runtime.py"))
+        context = _named_function_source("strategy_runtime.py", "get_context_for_cycle", _source("strategy_runtime.py"))
         self.assertIn("SR.cycle_version_for_account(", context)
         self.assertNotIn("SR.get_version(", context)
         self.assertNotIn("stamp_for_account(", context)
 
     def test_guard12i_risk_stamps_use_strict_cycle_resolver(self):
         raw = _source(self.SERVICE)
-        body = _function_source(ast.parse(raw), "_strategy_stamp", raw)
+        body = _named_function_source(self.SERVICE, "_strategy_stamp", raw)
         self.assertIn("SR.cycle_stamp_for_account(", body)
         self.assertNotIn("SR.stamp_for_account(", body)
         service = "".join(raw.split())
@@ -1486,12 +1493,12 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
 
     def test_guard12j_commit_fill_inherits_durable_order_stamp(self):
         raw = _source("execution_planner.py")
-        commit = _function_source(ast.parse(raw), "commit_fill", raw)
+        commit = _named_function_source("execution_planner.py", "commit_fill", raw)
         self.assertIn("order_strategy_stamp = _assert_order_identity(", commit)
         self.assertIn("PT._risk_log(", commit)
         self.assertIn("PT._audit(", commit)
         self.assertGreaterEqual(commit.count("strategy_stamp=order_strategy_stamp"), 2)
-        identity = _function_source(ast.parse(raw), "_assert_order_identity", raw)
+        identity = _named_function_source("execution_planner.py", "_assert_order_identity", raw)
         self.assertIn("strategy_id, strategy_version, strategy_checksum", identity)
         self.assertIn("partial strategy stamp", identity)
         for forbidden in ("SR.stamp_for_account(", "SR.get_version(", "SRT.get_context("):
@@ -2172,7 +2179,7 @@ def _strip_function_docstring(node, body):
 def _module_body(name):
     """模块 docstring 之外的**代码**（docstring 会引用旧 SQL 作为历史说明）。"""
     raw = _source(name)
-    tree = ast.parse(raw)
+    tree = _tree(name)
     first = tree.body[0]
     if isinstance(first, ast.Expr):
         return "\n".join(raw.splitlines()[first.end_lineno:])

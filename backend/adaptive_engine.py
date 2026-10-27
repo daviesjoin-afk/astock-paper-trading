@@ -48,6 +48,7 @@ import adaptive_shadow_risk as ASR
 from strategy_registry import labels as strategy_labels
 import adaptive_configuration as AConfig
 from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
+import research_runtime_config
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -126,6 +127,20 @@ DISCLOSURE_MAX_CODES = 150
 DISCLOSURE_CACHE_TTL_SECONDS = 6 * 60 * 60
 DISCLOSURE_REFRESH_AFTER = dt.time(15, 15)
 ACCOUNT_LABELS = strategy_labels()
+
+
+def _display_name(account_id):
+    """展示名：三个正式策略用名册里的名字，其余回落到注册表标签。
+
+    注册表名字属于不可变版本快照，改名要建新版本；展示层因此统一走这里，
+    免得同一策略在仪表盘和自进化页显示成两个名字。
+    """
+    import strategy_roster as ROSTER
+
+    return ROSTER.display_name(
+        account_id, fallback=ACCOUNT_LABELS.get(account_id, account_id))
+
+
 REGIME_LABELS = {
     "momentum": "资金共振·动量扩张",
     "rotation": "板块轮动·结构分化",
@@ -283,6 +298,12 @@ def _connect():
         conn.commit()
     finally:
         conn.close()
+
+
+# 组合根注册：研究运行时只从这里拿配置连接，反向依赖为零（AE → RRC 单向）。
+# 保留返回值：注册结果是"当前绑定的 owner 工厂"，便于运维与测试断言，
+# 不注册就读不到槽位配置（读函数抛 ConfigurationConnectionUnbound，不换库）。
+CONFIG_OWNER_BOUND = research_runtime_config.bind_config_connection(_connect)
 
 
 def _init_schema(conn):
@@ -820,6 +841,8 @@ def _manual_apply_gate(kind, candidate_snapshot, account_id):
     """
     if not candidate_snapshot:
         raise ValueError("进化候选不存在，拒绝应用")
+    if str(account_id) not in _weight_participants():
+        raise ValueError("目标策略不是当前周期执行参与者，拒绝应用")
     candidate = candidate_snapshot["candidate"]
     created = _aware_time(candidate.get("created_at") or candidate.get("updated_at"))
     now = dt.datetime.now(TZ)
@@ -1878,13 +1901,38 @@ def _recency_weight(row, profile_date):
     return 0.22 + 0.78 * math.exp(-0.35 * age)
 
 
+def _weight_participants():
+    """只为当前周期执行参与者提案；账本不可读或空周期返回空集。"""
+    import strategy_weight_scope as SCOPE
+
+    if not os.path.exists(PAPER_DB_PATH):
+        return []
+    try:
+        paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
+    except Exception:
+        return []
+    try:
+        ids = SCOPE.participant_ids(paper)
+    except Exception:
+        ids = ()
+    finally:
+        try:
+            paper.close()
+        except Exception:
+            pass
+    return sorted(ids)
+
+
 def _bandit_decision(conn, profile, profile_id):
     cfg = _config(conn)
     rows, global_rows, regime_rows, horizons, regimes = _reward_stats(conn, profile["regime"])
     attribution = trade_attribution.summary_from_conn(conn, limit=240)
     attribution_by_account = attribution.get("by_account") or {}
     total_samples = len(rows)
-    strategy_ids = sorted(ACCOUNT_LABELS)
+    strategy_ids = _weight_participants()
+    if not strategy_ids:
+        return {"status": "no_participant", "stage": "blocked", "weights": {},
+                "reason": "当前周期没有可核验的执行参与者，未生成权重决策"}
     exploration = float(cfg["exploration_strength"])
     total_effective = sum(HORIZON_WEIGHTS.get(row["horizon"], 0) * _recency_weight(row, profile["profile_date"]) for row in rows)
     scores, evidence = {}, {}
@@ -1926,7 +1974,7 @@ def _bandit_decision(conn, profile, profile_id):
                 "mean_reward": round(statistics.mean([row["raw_reward"] for row in subset]), 3) if subset else None,
             })
         evidence[account_id] = {
-            "name": ACCOUNT_LABELS[account_id],
+            "name": _display_name(account_id),
             "samples": len(global_arm),
             "regime_samples": len(local_arm),
             "posterior_mean": round(posterior_mean, 4),
@@ -1950,9 +1998,19 @@ def _bandit_decision(conn, profile, profile_id):
     mixed = {key: equal * (1 - confidence) + raw_weights[key] * confidence for key in strategy_ids}
     min_weight = float(cfg["min_strategy_weight_pct"]) / 100
     max_weight = float(cfg["max_strategy_weight_pct"]) / 100
-    bounded = {key: _clamp(value, min_weight, max_weight) for key, value in mixed.items()}
-    normalizer = sum(bounded.values()) or 1.0
-    weights = {key: round(100 * value / normalizer, 1) for key, value in bounded.items()}
+    # 先限幅再归一化会把策略压到下限以下（例如 5 套时 12.5%），而审批通道按
+    # 同一组上下限严格校验，等于引擎自己产出自己拒绝的提案。这里改成有界投影：
+    # 恰好 100%、每项都在 [min, max] 内、0.1 个百分点分辨率。
+    import strategy_weight_scope as SCOPE
+
+    projection = "bounded"
+    try:
+        weights = SCOPE.project_weights(
+            mixed, strategy_ids,
+            min_pct=min_weight * 100, max_pct=max_weight * 100)
+    except ValueError as exc:
+        return {"status": "infeasible_bounds", "stage": "blocked", "weights": {},
+                "reason": str(exc)}
 
     if total_samples < int(cfg["min_samples_shadow"]):
         stage = "collecting"
@@ -1975,6 +2033,12 @@ def _bandit_decision(conn, profile, profile_id):
         "guardrail_pass": profile["quality"] == "valid_close",
         "trade_attribution_records": attribution.get("records", 0),
         "trade_attribution_reason_counts": attribution.get("reason_counts", {}),
+        # 权重对象是本周期执行参与者；审批时按同一集合核对，退出独立资金账户的
+        # 旧策略不再出现在提案里。
+        "weight_participants": sorted(strategy_ids),
+        "weight_projection": projection,
+        "min_weight_pct": float(cfg["min_strategy_weight_pct"]),
+        "max_weight_pct": float(cfg["max_strategy_weight_pct"]),
     }
     now = _now()
     conn.execute(
@@ -2275,7 +2339,7 @@ def run_learning_cycle(trigger="manual"):
         with _connect() as conn:
             execution_evidence = _execution_evidence_state(conn, dt.datetime.now(TZ).date(), persist=True)
             decision = _bandit_decision(conn, profile, profile_id)
-            decision_id = decision["id"]
+            decision_id = decision.get("id")
         print(f"[learning-cycle] stage3 decision done decision_id={decision_id}", flush=True)
         # —— 阶段 4：风控进化评估（独立事务）——
         _learning_update_stage(run_id, "risk_evolution")
@@ -2289,6 +2353,15 @@ def run_learning_cycle(trigger="manual"):
             advisor_config = _config(conn)
             selection_result = selection_evolution.evaluate(conn, profile, advisor_config, PAPER_DB_PATH, _now)
         print(f"[learning-cycle] stage5 selection done candidates={selection_result.get('candidates', 0)}", flush=True)
+        # F5：标签成熟只投递研究事件，模型/实验不占用学习事务，也不改变原结论。
+        try:
+            import research_orchestration as RO
+            RO.notify_research({"kind": "label", "strategy_id": "tq_breakout",
+                                "observed_at": _now(), "profile_date": profile["profile_date"],
+                                "new_rewards": new_rewards,
+                                "environment_ref": dataset_manifest.get("dataset_fingerprint")})
+        except Exception:
+            pass
         # —— 阶段 5.5：AI 审核调参（独立于学习事务；未就绪自动跳过，失败不阻塞）——
         # D1 接线：调参结果经 dual_ai_tuner.track_run 落入 evolution_tracking，
         # 供 evolution_loop 的 EVALUATE / MUTATE 消费，形成"越调越准"数据闭环。
@@ -3753,12 +3826,12 @@ def _overview_uncached():
     )
 
     horizon_summary = []
-    for account_id in sorted(ACCOUNT_LABELS):
+    for account_id in _weight_participants():
         for horizon in HORIZON_WEIGHTS:
             subset = [row for row in rewards if row["account_id"] == account_id and row["horizon"] == horizon]
             horizon_summary.append({
                 "account_id": account_id,
-                "name": ACCOUNT_LABELS[account_id],
+                "name": _display_name(account_id),
                 "horizon": horizon,
                 "samples": len(subset),
                 "mean_return_pct": round(statistics.mean([row["strategy_return_pct"] for row in subset]), 3) if subset else None,
@@ -3893,7 +3966,10 @@ def self_test():
         decision = _bandit_decision(conn, profile, conn.execute(
             "SELECT id FROM adaptive_market_profiles WHERE profile_date=?", (profile["profile_date"],)
         ).fetchone()["id"])
-        assert abs(sum(decision["weights"].values()) - 100) <= 0.2
+        if decision.get("id") is not None:
+            assert abs(sum(decision["weights"].values()) - 100) <= 0.2
+        else:
+            assert decision["stage"] == "blocked" and not decision["weights"]
         assert alpha_lab["status"] in {
             "waiting_data", "waiting_dataset", "waiting_validation_window", "completed"
         }

@@ -15,11 +15,29 @@ sys.path.insert(0, os.path.dirname(__file__))
 # (declared in requirements.lock), but a MagicMock in ``sys.modules`` guarantees
 # no module under test can construct a real HTTP client, so the suite stays
 # offline and deterministic.
-sys.modules.setdefault("requests", mock.MagicMock())
-import adaptive_selection as AS  # noqa: E402
-import deepseek_advisor as DA  # noqa: E402
-import dual_ai_tuner as DT  # noqa: E402
-import trade_attribution as TA  # noqa: E402
+#
+# 这个替身只能覆盖**本模块的导入过程**。原先写成模块级
+# ``sys.modules.setdefault("requests", mock.MagicMock())`` 是永久性的：它依赖
+# "此前没人导入过 requests" 这一偶然事实，随后会把**真包**永久替换成 MagicMock。
+# 全量测试按字母序运行时，更早的模块已导入真包，``setdefault`` 退化成 no-op，
+# 缺陷被顺序掩盖；一旦顺序改变（分片并行、随机序、单独运行本模块），
+# ``test_ai_controls`` 会先执行，之后任何 ``from requests.adapters import ...``
+# 都抛 ``ModuleNotFoundError: 'requests' is not a package``。
+# 因此改成"导入期临时替换 + 无条件恢复"。
+_requests_before = sys.modules.get("requests")
+if _requests_before is None:
+    sys.modules["requests"] = mock.MagicMock()
+try:
+    import adaptive_selection as AS  # noqa: E402
+    import deepseek_advisor as DA  # noqa: E402
+    import dual_ai_tuner as DT  # noqa: E402
+    import trade_attribution as TA  # noqa: E402
+finally:
+    # 恢复真实模块（或还原"从未导入"状态），不把替身泄漏给后续测试。
+    if _requests_before is not None:
+        sys.modules["requests"] = _requests_before
+    else:
+        sys.modules.pop("requests", None)
 
 
 class _FakeKlineFrame:
@@ -60,47 +78,47 @@ def _isolated_kline_source(fake_fetcher):
 
 class AIControlTests(unittest.TestCase):
     def test_realtime_patch_is_factor_only_and_three_percent(self):
-        base = dict(AS.BASE_WEIGHTS["one_to_two"])
+        base = dict(AS.BASE_WEIGHTS["first_board_relay"])
         patch = DA._bounded_tuning_patch(
             {"entry_score_delta": 0.0},
             {"weights": {key: 100 for key in base},
              "entry_score_delta": 0.9,
              "conditions": {"pct_high": 0.01}},
-            "one_to_two", base, AS._conditions("one_to_two"),
+            "first_board_relay", base, AS._conditions("first_board_relay"),
         )
         self.assertEqual(set(patch), {"weights"})
         self.assertTrue(all(abs(patch["weights"][key] - base[key]) <= 0.030001 for key in base))
 
     def test_auto_validator_rejects_conditions_and_thresholds(self):
-        base = {"weights": dict(AS.BASE_WEIGHTS["one_to_two"]), "entry_score_delta": 0.0}
+        base = {"weights": dict(AS.BASE_WEIGHTS["first_board_relay"]), "entry_score_delta": 0.0}
         self.assertFalse(AS._factor_only_patch(
-            {"weights": dict(base["weights"]), "conditions": {}}, base, "one_to_two"
+            {"weights": dict(base["weights"]), "conditions": {}}, base, "first_board_relay"
         ))
         self.assertFalse(AS._factor_only_patch(
-            {"weights": dict(base["weights"]), "entry_score_delta": 0.01}, base, "one_to_two"
+            {"weights": dict(base["weights"]), "entry_score_delta": 0.01}, base, "first_board_relay"
         ))
         changed = dict(base["weights"])
         changed["mom_short"] += 0.02
-        self.assertTrue(AS._factor_only_patch({"weights": changed}, base, "one_to_two"))
+        self.assertTrue(AS._factor_only_patch({"weights": changed}, base, "first_board_relay"))
 
     def test_weight_patch_merges_current_overlay(self):
         params = {"adaptive_selection": {
-            "model_family": "one_to_two",
+            "model_family": "first_board_relay",
             "conditions": {"pct_high": 5.0},
             "entry_paths": {"normal": True},
-            "weights": dict(AS.BASE_WEIGHTS["one_to_two"]),
+            "weights": dict(AS.BASE_WEIGHTS["first_board_relay"]),
         }}
         changed = dict(params["adaptive_selection"]["weights"])
         changed["mom_short"] += 0.01
         merged = AS._merge_selection_overlay(
-            params, {"weights": changed}, params["adaptive_selection"]["weights"], "one_to_two"
+            params, {"weights": changed}, params["adaptive_selection"]["weights"], "first_board_relay"
         )
         self.assertEqual(merged["conditions"], {"pct_high": 5.0})
         self.assertEqual(merged["entry_paths"], {"normal": True})
         self.assertEqual(merged["weights"], changed)
 
     def test_dual_ai_unknown_factor_is_rejected(self):
-        base = {"weights": dict(AS.BASE_WEIGHTS["one_to_two"])}
+        base = {"weights": dict(AS.BASE_WEIGHTS["first_board_relay"])}
         unknown = dict(base["weights"])
         unknown["invented_factor"] = 0.05
         proposal = {"account_id": "tq_breakout", "confidence": 90,

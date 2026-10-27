@@ -220,7 +220,7 @@ class AllocationExplainTests(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         paper.DB_PATH = os.path.join(tmp, "paper_trading.sqlite3")
         data = paper.strategy_allocation_explain()
-        self.assertEqual(5, len(data["strategies"]))
+        self.assertEqual(3, len(data["strategies"]))
         for row in data["strategies"]:
             for key in ("base_priority", "regime", "confidence", "health",
                         "data_quality", "diversification", "capital_scale",

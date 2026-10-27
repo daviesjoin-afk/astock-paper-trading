@@ -108,6 +108,9 @@ class EvolutionApplyTestBase(unittest.TestCase):
         with self._paper_ctx() as conn:
             conn.executescript(
                 """
+                CREATE TABLE paper_cycles(
+                    id INTEGER PRIMARY KEY, status TEXT, capital REAL,
+                    enabled_strategies TEXT);
                 CREATE TABLE paper_accounts(
                     id TEXT PRIMARY KEY, name TEXT, source_strategy TEXT,
                     status TEXT, initial_cash REAL, cash REAL, cycle_days INTEGER,
@@ -125,9 +128,9 @@ class EvolutionApplyTestBase(unittest.TestCase):
                 """
             )
             for account_id, source in (
-                ("tq_breakout", "one_to_two"),
-                ("trend_pullback", "bottom_reversal"),
-                ("sector_rotation", "sentiment_pioneer"),
+                ("tq_breakout", "first_board_relay"),
+                ("trend_pullback", "pullback_reversal"),
+                ("sector_rotation", "sector_sentiment"),
                 ("reported_profit_breakout", "quality_breakout"),
                 ("main_force_top10", "main_force"),
             ):
@@ -138,6 +141,20 @@ class EvolutionApplyTestBase(unittest.TestCase):
                     (account_id, account_id, source, "active", 100000.0, 100000.0,
                      60, 15, 0.10, 0.80, "v1", "balanced", 1, "{}", _iso_recent()),
                 )
+            conn.execute(
+                "INSERT INTO paper_cycles(id,status,capital,enabled_strategies) VALUES(?,?,?,?)",
+                (1, "running", 500000.0,
+                 json.dumps(["main_force_top10", "reported_profit_breakout",
+                             "sector_rotation", "tq_breakout", "trend_pullback"])),
+            )
+
+    def _bind_participants(self, account_ids):
+        """把当前周期的执行参与者收窄到给定集合（权重对象的唯一真相）。"""
+        with self._paper_ctx() as conn:
+            conn.execute(
+                "UPDATE paper_cycles SET enabled_strategies=? WHERE id=1",
+                (json.dumps(sorted(account_ids)),),
+            )
 
     @contextmanager
     def _paper_ctx(self):
@@ -184,7 +201,54 @@ class EvolutionApplyTestBase(unittest.TestCase):
             return json.loads(row["params"] or "{}")
 
 
+class ParticipantScopedApprovalTests(EvolutionApplyTestBase):
+    """审批口径 = 当前周期执行参与者（三策略），不是全部注册策略（五套）。"""
+
+    PARTICIPANTS = ("tq_breakout", "trend_pullback", "reported_profit_breakout")
+
+    def test_five_sleeve_decision_is_rejected_when_three_participate(self):
+        self._bind_participants(self.PARTICIPANTS)
+        decision_id = self._seed_decision()  # 默认五套权重
+        with self.assertRaisesRegex(ValueError, "执行参与者"):
+            evolution_apply.apply_allocation(
+                self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+
+    def test_roster_budget_decision_applies_for_the_three_participants(self):
+        self._bind_participants(self.PARTICIPANTS)
+        decision_id = self._seed_decision(weights={
+            "tq_breakout": 20.0, "trend_pullback": 50.0, "reported_profit_breakout": 30.0})
+        result = evolution_apply.apply_allocation(
+            self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+        self.assertEqual(result["weights"], {"tq_breakout": 20.0, "trend_pullback": 50.0,
+                                             "reported_profit_breakout": 30.0})
+        self.assertAlmostEqual(self._paper_params("trend_pullback")["adaptive_allocation"]["weight_pct"], 50.0)
+
+    def test_overview_hides_retired_sleeves_and_flags_stale_scope(self):
+        for account in (*self.PARTICIPANTS, "sector_rotation", "main_force_top10"):
+            with self._paper_ctx() as conn:
+                conn.execute(
+                    "UPDATE paper_accounts SET params=? WHERE id=?",
+                    (json.dumps({"adaptive_allocation": {"status": "active", "weight_pct": 15.0}}),
+                     account))
+        self._bind_participants(self.PARTICIPANTS)
+        self._seed_decision()  # 五套时代的决策
+        overview = evolution_apply.allocation_overview(self._adaptive_ctx, self.paper_path)
+        self.assertEqual(sorted(overview["participants"]), sorted(self.PARTICIPANTS))
+        self.assertEqual(sorted(overview["active"]), sorted(self.PARTICIPANTS))
+        self.assertFalse(overview["latest_decision"]["can_apply"])
+        self.assertIn("执行参与者", overview["latest_decision"]["scope_reason"])
+
+
 class ApplyAllocationTests(EvolutionApplyTestBase):
+    def setUp(self):
+        super().setUp()
+        self._bind_participants(ParticipantScopedApprovalTests.PARTICIPANTS)
+
+    def _seed_decision(self, **kwargs):
+        kwargs.setdefault("weights", {"tq_breakout": 40.0, "trend_pullback": 25.0,
+                                     "reported_profit_breakout": 35.0})
+        return super()._seed_decision(**kwargs)
+
     def test_rejects_shadow_stage(self):
         decision_id = self._seed_decision(stage="shadow")
         with self.assertRaises(ValueError):
@@ -232,9 +296,7 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
         conn = self._paper()
         try:
             rows = PAW.read_canonical_allocation_weight_owner_rows(
-                conn, eligible_account_ids=tuple(
-                    row["id"] for row in conn.execute(
-                        "SELECT id FROM paper_accounts ORDER BY id").fetchall()),
+                conn, eligible_account_ids=tuple(row["id"] for row in self._paper_account_rows()),
                 cycle_id=1,
             )
         finally:
@@ -258,7 +320,8 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
         conn = self._paper()
         try:
             return [dict(row) for row in conn.execute(
-                "SELECT id FROM paper_accounts ORDER BY id")]
+                "SELECT id FROM paper_accounts ORDER BY id")
+                    if row["id"] in ParticipantScopedApprovalTests.PARTICIPANTS]
         finally:
             conn.close()
 
@@ -281,18 +344,15 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
         self._apply_two_account_decision(weights)
 
     def _apply_two_account_decision(self, weights):
-        import adaptive_engine as engine
-
         with self._adaptive_ctx() as conn:
             conn.execute(
                 "UPDATE adaptive_config SET value=? WHERE key='max_strategy_weight_pct'",
                 (json.dumps(100.0),),
             )
+        self._bind_participants(("tq_breakout", "trend_pullback"))
         decision_id = self._seed_decision(weights=weights)
-        with mock.patch.object(engine, "ACCOUNT_LABELS", {
-                "tq_breakout": "突破策略", "trend_pullback": "回撤策略"}):
-            evolution_apply.apply_allocation(
-                self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+        evolution_apply.apply_allocation(
+            self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
         return decision_id
 
     def _allocation_params(self, current, previous, marker):
@@ -311,14 +371,11 @@ class ApplyAllocationTests(EvolutionApplyTestBase):
             )
 
     def _apply_two_account_decision_with_status_failure(self, weights):
-        import adaptive_engine as engine
-
+        self._bind_participants(("tq_breakout", "trend_pullback"))
         decision_id = self._seed_decision(weights=weights)
-        with mock.patch.object(engine, "ACCOUNT_LABELS", {
-                "tq_breakout": "突破策略", "trend_pullback": "回撤策略"}):
-            with self.assertRaisesRegex(sqlite3.IntegrityError, "forced status update failure"):
-                evolution_apply.apply_allocation(
-                    self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "forced status update failure"):
+            evolution_apply.apply_allocation(
+                self._adaptive_ctx, self.paper_path, decision_id, confirmed=True)
         return decision_id
 
     def test_rc15_later_weight_apply_cannot_heal_earlier_decision(self):

@@ -310,15 +310,18 @@ class StrategyHealthDimensionTests(_HealthCase):
         self.assertNotIn("fill_ratio", facts)
         self.assertTrue(unknown_order)
 
-    def test_h8_performance_has_no_owner_and_stays_unavailable(self):
+    def test_h8_performance_is_owned_and_reports_specific_reasons(self):
+        """绩效维度已由 strategy_performance 这个 owner 产出：缺证据时给**具体**原因。"""
         performance = self._dimension(self._capture(), SH.DIMENSION_PERFORMANCE)
         self.assertEqual("UNAVAILABLE", performance["status"])
         self.assertEqual("UNAVAILABLE", performance["provenance"])
-        self.assertEqual([SH.REASON_STRATEGY_PERFORMANCE_OWNER_UNAVAILABLE],
+        # 这个 fixture 没有周期绑定：owner 无从建立版本绩效，但原因必须是具体的。
+        self.assertIn("no_exact_pin", performance["blocking_reasons"])
+        self.assertNotIn(SH.REASON_STRATEGY_PERFORMANCE_OWNER_UNAVAILABLE,
                          performance["blocking_reasons"])
-        self.assertIsNone(performance["facts"]["strategy_version_scoped_owner"])
-        self.assertEqual({}, {key: value for key, value in performance["facts"].items()
-                              if key != "strategy_version_scoped_owner"})
+        self.assertEqual("strategy-performance-owner-v1",
+                         performance["facts"]["strategy_version_scoped_owner"])
+        self.assertIsNone(performance["facts"]["metrics"]["realized_pnl"]["value"])
 
     def test_h9_zero_activity_is_a_fact_not_a_verdict(self):
         activity = self._dimension(self._capture(), SH.DIMENSION_ACTIVITY_COVERAGE)

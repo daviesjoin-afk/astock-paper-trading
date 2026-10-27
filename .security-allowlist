@@ -126,6 +126,11 @@ value:23ef095dddca45e29331000436c2426fd4c7ec9d
 
 # Public upstream SQLite archive checksum pinned in Dockerfile, not a credential.
 value:92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
+# PR #272's public audit baseline commit cited in plans/ai-deep-intervention-master-plan.md.
+# After the branch history rewrite it is no longer a reachable object, so the
+# scanner can no longer recognize it as an object id; it is still a public
+# GitHub commit SHA, not a credential.
+value:11bb14476c7d0455aadc9f6353b26b6760a4a1be
 # Generic Git-for-Windows installation prefix in this branch's regression history.
 # The scanner stops at the space in the standard Program Files directory name;
 # this exact synthetic prefix contains no user, machine or project identity.

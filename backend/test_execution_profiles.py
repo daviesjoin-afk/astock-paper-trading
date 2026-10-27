@@ -202,7 +202,7 @@ class ProfileCenterTests(unittest.TestCase):
         self.assertEqual("rotation", accounts["sector_rotation"]["family"])
         self.assertEqual("event_driven",
                          accounts["reported_profit_breakout"]["family"])
-        self.assertTrue(accounts["sector_rotation"]["active"])
+        self.assertFalse(accounts["sector_rotation"]["active"])
         self.assertIn("settings", data["dispatch"])
         self.assertIn("batch_queue", data["dispatch"])
         self.assertIn("verification_queue", data["dispatch"])

@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 import data_paths
 import strategy_dsl_schema as DSL
 import strategy_lifecycle as SL
+import strategy_roster as ROSTER
 
 
 ORIGINS = ("builtin", "user")
@@ -74,21 +75,24 @@ class StrategyVersion:
 
 
 BUILTIN_STRATEGIES = (
-    StrategySpec("tq_breakout", "短线日内做T", "paper", True,
+    StrategySpec("tq_breakout", "激进做T", "paper", True,
                  implementation_key="tq_breakout"),
-    StrategySpec("trend_pullback", "趋势波段优选", "paper", True,
+    StrategySpec("trend_pullback", "稳健波段", "paper", True,
                  implementation_key="trend_pullback"),
-    StrategySpec("sector_rotation", "板块轮动先锋", "paper", True,
-                 implementation_key="sector_rotation"),
-    StrategySpec("reported_profit_breakout", "三日策略", "paper", True,
+    StrategySpec("reported_profit_breakout", "保守防守", "paper", True,
                  implementation_key="reported_profit_breakout"),
-    StrategySpec("main_force_top10", "超强主力股", "paper", True,
+)
+
+# Historical identities are reserved, but are never new-cycle defaults.
+LEGACY_STRATEGIES = (
+    StrategySpec("sector_rotation", "板块轮动先锋", "retiring", False,
+                 implementation_key="sector_rotation"),
+    StrategySpec("main_force_top10", "超强主力股", "retiring", False,
                  implementation_key="main_force_top10"),
 )
 
-# Compatibility export for integrations that import the original tuple.
 STRATEGY_REGISTRY = BUILTIN_STRATEGIES
-_BUILTIN_BY_ID = {spec.id: spec for spec in BUILTIN_STRATEGIES}
+_BUILTIN_BY_ID = {spec.id: spec for spec in (*BUILTIN_STRATEGIES, *LEGACY_STRATEGIES)}
 
 
 def _now():
@@ -327,7 +331,7 @@ def _create_version_schema(conn):
 
 
 def ensure_schema(conn):
-    """Create identity/version schema and seed the five built-ins as v1.
+    """Seed the three formal strategies; retain existing historical identities.
 
     Lifecycle rows are initialized by the dedicated strategy_lifecycle owner.
     The legacy status columns remain only as migration/bootstrap compatibility.
@@ -374,7 +378,12 @@ def ensure_schema(conn):
     )
     _create_version_schema(conn)
     now = _now()
-    for sort_order, spec in enumerate(BUILTIN_STRATEGIES):
+    historical_ids = set()
+    if _table_exists(conn, "paper_accounts"):
+        historical_ids = {str(row[0]) for row in conn.execute("SELECT id FROM paper_accounts")}
+    seeds = (*BUILTIN_STRATEGIES,
+             *(spec for spec in LEGACY_STRATEGIES if spec.id in historical_ids))
+    for sort_order, spec in enumerate(seeds):
         payload, canonical, checksum = _canonical_definition(
             name=spec.name, implementation_key=spec.implementation_key or spec.id,
             description=spec.description, metadata=spec.metadata, dsl_ast=None,
@@ -478,7 +487,8 @@ def _row_to_spec(row):
         metadata = {}
     return StrategySpec(
         id=values["id"], name=values["name"], status=values["state"],
-        supports_new_cycle=SL.allows_formal_cycle(values["state"]), origin=values["origin"],
+        supports_new_cycle=(SL.allows_formal_cycle(values["state"])
+                            and values["id"] not in ROSTER.exit_only_ids()), origin=values["origin"],
         implementation_key=values["implementation_key"],
         description=values.get("description") or "", metadata=metadata,
         created_at=values.get("created_at"), updated_at=values.get("updated_at"),
@@ -580,7 +590,7 @@ def labels(*, conn=None, db_path=None):
 
 def active_ids(*, conn=None, db_path=None):
     return tuple(spec.id for spec in list_definitions(conn=conn, db_path=db_path)
-                 if SL.allows_formal_cycle(spec.status))
+                 if spec.supports_new_cycle)
 
 
 def runtime_readiness(conn, strategy_id, *, version=None, checksum=None):

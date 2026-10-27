@@ -435,3 +435,110 @@ def settings_audit(limit: int = Query(50, ge=1, le=200)):
     P.init_db()
     with P._db() as conn:
         return {"items": RSET.audit(conn, limit)}
+
+
+# --------------------------------------------------------------------------- #
+# AI 能力凭据签发（方案 §5.2）：没有签发就没有自动采用
+# --------------------------------------------------------------------------- #
+
+_CAPABILITY_FIELDS = (
+    "capability_id", "mode", "strategy_ids", "allowed_target_kinds", "allowed_fields",
+    "bounds_version", "evidence_policy_id", "max_change_per_apply", "max_change_per_day",
+    "loss_stop_policy_id", "max_trials_per_day", "daily_cost_cap",
+    "max_tool_steps_per_task", "expires_at", "revocation_epoch", "issued_by",
+)
+
+
+def _read_capabilities():
+    import ai_capability as CAP
+    import ai_capability_store as STORE
+
+    def _work():
+        with P._db() as conn:
+            return STORE.list_capabilities(conn), CAP.describe_capability(None)
+
+    return _work()
+
+
+@router.get("/ai-review/capabilities")
+def ai_capabilities_snapshot():
+    """列出已签发的授权凭据（不含任何密钥）与"当前是否在自动采用"。"""
+    try:
+        rows, current = _read_capabilities()
+    except Exception as exc:  # noqa: BLE001 - 读不到就明说，不假装没有凭据
+        raise HTTPException(status_code=500,
+                            detail=f"读取授权凭据失败：{type(exc).__name__}") from exc
+    return {"capabilities": rows, "current": current}
+
+
+@router.post("/ai-review/capabilities")
+async def issue_ai_capability(request: Request, confirmed: bool = Query(False)):
+    """签发一份有界授权。这是**运维行为**：需确认，且不提供任何自动签发路径。"""
+    _require_confirmation(confirmed, "签发AI授权凭据")
+    body = await _read_json_object(request, "授权凭据必须是JSON对象")
+    unknown = set(body) - set(_CAPABILITY_FIELDS)
+    if unknown:
+        raise HTTPException(status_code=422,
+                            detail="未知凭据字段: " + ",".join(sorted(unknown)))
+    missing = [name for name in _CAPABILITY_FIELDS if name not in body]
+    if missing:
+        raise HTTPException(status_code=422,
+                            detail="凭据缺少必填字段: " + ",".join(missing))
+    import ai_capability as CAP
+    import ai_capability_store as STORE
+
+    try:
+        credential = CAP.CapabilityCredential(
+            capability_id=str(body["capability_id"]),
+            mode=str(body["mode"]),
+            strategy_ids=tuple(body["strategy_ids"]),
+            allowed_target_kinds=tuple(body["allowed_target_kinds"]),
+            allowed_fields=tuple(body["allowed_fields"]),
+            bounds_version=str(body["bounds_version"]),
+            evidence_policy_id=str(body["evidence_policy_id"]),
+            max_change_per_apply=body["max_change_per_apply"],
+            max_change_per_day=body["max_change_per_day"],
+            loss_stop_policy_id=str(body["loss_stop_policy_id"]),
+            max_trials_per_day=body["max_trials_per_day"],
+            daily_cost_cap=body["daily_cost_cap"],
+            max_tool_steps_per_task=body["max_tool_steps_per_task"],
+            expires_at=str(body["expires_at"]),
+            revocation_epoch=body["revocation_epoch"],
+            issued_by=str(body["issued_by"]))
+    except (CAP.AdoptionRefused, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"凭据不合法：{exc}") from exc
+
+    def _work():
+        with P._db(immediate=True) as conn:
+            issued = STORE.issue(conn, credential, operator=credential.issued_by)
+            return CAP.describe_capability(issued)
+
+    try:
+        return await run_in_threadpool(_work)
+    except STORE.CapabilityStoreError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/ai-review/capabilities/{capability_id}/revoke")
+async def revoke_ai_capability(capability_id: str, request: Request,
+                               confirmed: bool = Query(False)):
+    """撤销：递增撤销代号，持旧代号的请求立即失效。"""
+    _require_confirmation(confirmed, "撤销AI授权凭据")
+    body = await _read_json_object(request, "撤销请求必须是JSON对象")
+    operator = str(body.get("operator") or "").strip()
+    if not operator:
+        raise HTTPException(status_code=422, detail="撤销必须填写操作人")
+    reason = str(body.get("reason") or "")[:200]
+    import ai_capability as CAP
+    import ai_capability_store as STORE
+
+    def _work():
+        with P._db(immediate=True) as conn:
+            revoked = STORE.revoke(conn, capability_id, operator=operator, reason=reason)
+            return CAP.describe_capability(revoked)
+
+    try:
+        return await run_in_threadpool(_work)
+    except STORE.CapabilityStoreError as exc:
+        status = 404 if str(exc) == STORE.R_CAPABILITY_UNKNOWN else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc

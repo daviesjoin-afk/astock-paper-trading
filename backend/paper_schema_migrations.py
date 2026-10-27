@@ -2060,3 +2060,45 @@ def ensure_experiment_search(conn):
                 BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
         )
     return changes
+
+def ensure_ai_decision_audits(conn):
+    """v40：AI 意见消费结果的独立追加式审计行（DDL 单一事实来源）。
+
+    方案 §6.3 要求：开启 AI 时同时记录 ``rules_only_decision`` / ``ai_opinion`` /
+    ``final_decision`` / ``effect_reason``。这些是**解释**，不是新的决策权威：
+    正式决策仍由原职责模块写入，本表只回答"这次和纯规则差在哪、为什么"。
+
+    **绝不回填**：升级前的历史决策没有 AI 意见，反推一条等于伪造证据。
+    """
+    changes = {}
+    statements = (
+        """CREATE TABLE IF NOT EXISTS ai_decision_audits (
+            audit_id TEXT PRIMARY KEY,
+            decision_id TEXT NOT NULL,
+            code TEXT,
+            strategy_id TEXT,
+            mode TEXT NOT NULL,
+            rules_only_decision TEXT NOT NULL,
+            ai_opinion TEXT,
+            final_decision TEXT NOT NULL,
+            effect_reason TEXT NOT NULL,
+            consumed_recommendation_id TEXT,
+            audit_fingerprint TEXT NOT NULL,
+            audit_schema_version TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ai_decision_audits_identity"
+        " ON ai_decision_audits(decision_id, audit_fingerprint)",
+        "CREATE INDEX IF NOT EXISTS ai_decision_audits_effect"
+        " ON ai_decision_audits(effect_reason, created_at)",
+        """CREATE TRIGGER IF NOT EXISTS ai_decision_audits_no_update
+           BEFORE UPDATE ON ai_decision_audits
+           BEGIN SELECT RAISE(ABORT,'ai decision audits are append-only'); END""",
+        """CREATE TRIGGER IF NOT EXISTS ai_decision_audits_no_delete
+           BEFORE DELETE ON ai_decision_audits
+           BEGIN SELECT RAISE(ABORT,'ai decision audits are append-only'); END""",
+    )
+    for statement in statements:
+        conn.execute(statement)
+    changes["ai_decision_audits"] = True
+    return changes

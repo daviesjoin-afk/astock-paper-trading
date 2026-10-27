@@ -168,7 +168,7 @@ def evidence(now, market_rows, conn, focus_codes=()):
                 stocks.setdefault(code, {'code': code, 'points': []})['points'].append({
                     'quote_at': stamp.isoformat(), 'captured_at': captured.isoformat(), 'price': price,
                     'pct': row.get('pct'), 'volume': row.get('volume'), 'amount': row.get('amount'),
-                    'main_net': row.get('main_net'), 'bid1':row.get('bid1'), 'ask1':row.get('ask1'),
+                    'main_net': row.get('main_net'),
                     'phase': observation.get('phase'), 'source': row.get('source')})
     focus = set(focus_codes) | _selection_codes(now)
     current = _current_quotes(market_rows, now)
@@ -179,11 +179,22 @@ def evidence(now, market_rows, conn, focus_codes=()):
         item['activity_available'] = any((_number(p.get('volume')) or 0) > 0 or (_number(p.get('amount')) or 0) > 0 for p in points)
         item['reference_quote'] = current.get(code) or {key:points[-1].get(key) for key in ('price','quote_at','source')}
     selected = sorted(stocks.values(), key=lambda s:(s['code'] not in focus,-abs(s['auction_change_pct']),s['code']))[:MAX_STOCKS]
+    # 竞价成交额只在最终快照上聚合：更早的轮次还在可撤单阶段，金额会被撤单改写。
+    final_rows = []
+    for observation in saved.get('observations', []) if saved.get('trade_date') == now.date().isoformat() else []:
+        if observation.get('phase') == 'final_snapshot':
+            final_rows = observation.get('rows') or []
+    amount_summary = tracking.summarize(final_rows) if final_rows else None
+    for item in selected:
+        latest = item['points'][-1]
+        item['amount_latest'] = latest.get('amount')
+        item['volume_latest'] = latest.get('volume')
     return {'status': 'observed' if selected else 'not_collected', 'as_of': now.isoformat(),
             'observed_stocks': len(stocks), 'included_stocks': len(selected), 'stocks': selected,
+            'amount_summary': amount_summary,
             'sampling': 'current_candidates_and_positions_then_largest_price_change',
             'review_feedback': _merge_feedback(_archive(now),feedback(conn,current,now)),
-            'assessment_boundary': '意图是AI推断；后续方向复核只比较截至观察时点的价格，不证明真实主力意图。0.2%以内按横盘记录，不等于交易收益。'}
+            'assessment_boundary': '意图是AI推断；后续方向复核只比较截至观察时点的价格，不证明真实主力意图。0.2%以内按横盘记录，不等于交易收益。竞价金额只覆盖本次观测到的个股。'}
 
 
 def normalize_intents(raw, context):

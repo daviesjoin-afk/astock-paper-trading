@@ -350,7 +350,7 @@ class SelectionProvenanceTests(_IsolatedStudy):
             conn.execute(
                 "INSERT INTO paper_selection_runs(trade_date,strategy_id,strategy_no,"
                 "strategy_name,model_id,status,message,factor_date,topn,source,created_at)"
-                " VALUES('2026-08-04','trend_pullback',2,'趋势波段优选','bottom_reversal',"
+                " VALUES('2026-08-04','trend_pullback',2,'趋势波段优选','pullback_reversal',"
                 "'ok','','2026-08-04',5,'scheduled','2026-08-04T17:25:00')")
             conn.execute(
                 "INSERT INTO paper_selection_picks(trade_date,strategy_id,rank_no,code,name)"
@@ -400,7 +400,7 @@ class SelectionProvenanceTests(_IsolatedStudy):
         self.assertEqual(after["strategy_version"], before["strategy_version"])
         group = next(g for g in PS.latest(trade_date=DAY)["strategies"]
                      if g["strategy_id"] == "tq_breakout")
-        self.assertEqual(group["strategy_name"], "短线日内做T")
+        self.assertEqual(group["strategy_name"], "激进做T")
         self.assertEqual(group["current_strategy_name"], "完全不同的名字")
 
     def test_SP18_pause_archive_does_not_mutate_historical_stamp(self):
@@ -459,7 +459,7 @@ class ScopeSemanticsTests(_IsolatedStudy):
                     "strategy_version,strategy_checksum,asof_day,scope,cycle_id,"
                     "provenance_status,provenance_key) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (DAY, "injected", 9, "注入", "one_to_two", "ok", "", DAY, 5,
+                    (DAY, "injected", 9, "注入", "first_board_relay", "ok", "", DAY, 5,
                      "manual", "2026-09-07T17:00:00", 1, "b" * 64, DAY,
                      SP.SCOPE_RESEARCH, active, SP.STATUS_VERIFIED, "injected|key"))
 

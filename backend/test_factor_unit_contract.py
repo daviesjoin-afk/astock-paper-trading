@@ -48,7 +48,7 @@ def _base_row(**overrides):
         "mom5_raw": 0.0,             # fraction
         "mom20_raw": 0.0,            # fraction
         "mom60_raw": 0.0,            # fraction
-        # sentiment_pioneer 的权重列（_run_paper_strategy 按权重取列）。
+        # sector_sentiment 的权重列（_run_paper_strategy 按权重取列）。
         "mom_short": 0.0,
         "volsurge": 0.0,
         "vol_surge_raw": 1.0,
@@ -197,10 +197,10 @@ class HotLeaderOverheatTests(unittest.TestCase):
 # C. 底部反转：1%~10% 短转带 与 15% 过热
 # --------------------------------------------------------------------------
 class BottomReversalMomentumTests(unittest.TestCase):
-    """``_bottom_reversal_profile`` 的动量带/过热必须按 fraction 触发。"""
+    """``_pullback_reversal_profile`` 的动量带/过热必须按 fraction 触发。"""
 
     def _profile(self, rows):
-        return S._bottom_reversal_profile(_table(rows))
+        return S._pullback_reversal_profile(_table(rows))
 
     def test_three_percent_enters_the_one_to_ten_percent_band(self):
         # 控制变量：只改目标行的 mom5，其余行逐字节相同 → 排名类分量不变。
@@ -240,7 +240,7 @@ class BottomReversalMomentumTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# D. sentiment_pioneer 独立强势路径：+2% 门槛
+# D. sector_sentiment 独立强势路径：+2% 门槛
 # --------------------------------------------------------------------------
 class SentimentPioneerIndividualMomentumTests(unittest.TestCase):
     """``individual_mom5_min = 0.02`` 必须在 +2% 处放行、在 +1% 处拦截。"""
@@ -254,7 +254,7 @@ class SentimentPioneerIndividualMomentumTests(unittest.TestCase):
             mom5_raw=mom5_raw,
             mom20_raw=0.0,
         )])
-        return S.run_strategy("sentiment_pioneer", table, topn=5, gate=None,
+        return S.run_strategy("sector_sentiment", table, topn=5, gate=None,
                               first_board_codes=None)
 
     def test_two_percent_satisfies_the_momentum_gate(self):
@@ -268,7 +268,7 @@ class SentimentPioneerIndividualMomentumTests(unittest.TestCase):
         self.assertNotEqual(result["picks"][0]["entry_path"], "individual_strong")
 
     def test_gate_difference_equals_the_configured_bonus(self):
-        bonus = S.PAPER_CONDITION_DEFAULTS["sentiment_pioneer"]["individual_bonus"]
+        bonus = S.PAPER_CONDITION_DEFAULTS["sector_sentiment"]["individual_bonus"]
         delta = (self._run(0.02)["picks"][0]["score"]
                  - self._run(0.01)["picks"][0]["score"])
         self.assertAlmostEqual(delta, bonus, places=9)
@@ -298,7 +298,7 @@ class SectorClimaxExclusionTests(unittest.TestCase):
 
     def _run(self, industry, mom5_raw):
         table = _table([self._row(industry, mom5_raw)])
-        return S.run_strategy("sentiment_pioneer", table, topn=5, gate=None,
+        return S.run_strategy("sector_sentiment", table, topn=5, gate=None,
                               first_board_codes=None)
 
     def test_climax_sector_candidate_cannot_return_through_individual_bonus(self):
@@ -357,7 +357,7 @@ class MomentumUnitGuardTests(unittest.TestCase):
     独立问题，见 PR 的 Residual Risk），以免产生高误报的噪声守卫。
     """
 
-    GUARDED_FUNCTIONS = ("_hot_leader_profile", "_bottom_reversal_profile")
+    GUARDED_FUNCTIONS = ("_hot_leader_profile", "_pullback_reversal_profile")
     MOMENTUM_LOCALS = ("mom5", "mom20")
     COMPARISON_METHODS = ("ge", "gt", "le", "lt", "between")
 
@@ -421,8 +421,8 @@ class MomentumUnitGuardTests(unittest.TestCase):
 
     def test_condition_defaults_bound_to_raw_momentum_are_fractions(self):
         bound_fields = {
-            ("sentiment_pioneer", "individual_mom5_min"): "mom5_raw",
-            ("bottom_reversal", "mom20_min"): "mom20_raw",
+            ("sector_sentiment", "individual_mom5_min"): "mom5_raw",
+            ("pullback_reversal", "mom20_min"): "mom20_raw",
             ("trend_continuation", "mom20_min"): "mom20_raw",
         }
         for (strategy_id, key), raw_field in bound_fields.items():

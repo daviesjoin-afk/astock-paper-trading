@@ -1,0 +1,194 @@
+"""周一开盘前的只读自检：账本、三策略、预算、竞价归档、调度契约。
+
+用法（在 API 容器里跑，容器内已有 backend 与数据目录）::
+
+    docker exec astock-codex python /app/scripts/monday_preflight.py
+    docker exec astock-codex python /app/scripts/monday_preflight.py --json
+
+它**只读**：不建表、不补周期、不改权重、不联网、不下单。任何一项 FAIL 都会让退出码
+变成 1；WARN 只提示，不阻塞。宿主机侧的检查（git 身份、镜像构建参数、容器健康、
+cron 文件）在 ``deploy/preflight.sh`` 里，两者合起来才算"三端一致"。
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+BACKEND = Path(__file__).resolve().parents[1] / "backend"
+sys.path.insert(0, str(BACKEND))
+
+CN = dt.timezone(dt.timedelta(hours=8))
+
+
+def _check(rows, name, ok, detail, *, warn=False):
+    rows.append({"check": name, "status": "PASS" if ok else ("WARN" if warn else "FAIL"),
+                 "detail": str(detail)[:400]})
+    return ok
+
+
+def run(now=None):
+    import strategy_roster as ROSTER
+    import paper_trading as PT
+
+    current = (now or dt.datetime.now(CN)).astimezone(CN)
+    rows = []
+    ledger_path = Path(PT.DB_PATH)
+    _check(rows, "ledger_present", ledger_path.is_file(), f"账本 {ledger_path}")
+    if not ledger_path.is_file():
+        return {'as_of': current.isoformat(), 'checks': rows,
+                'summary': {'pass': 0, 'warn': 0, 'fail': 1}, 'ok': False}
+    # 真正只读：不经 PT.init_db / PT._db / PT._active_cycle —— 后者在没有活动周期时
+    # 会**补建**周期，等于把被检查对象改了。缺表或缺周期都如实报 FAIL。
+    conn = sqlite3.connect(ledger_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in ("paper_cycles", "paper_accounts", "paper_orders"):
+            _check(rows, f"table:{table}", table in tables, "存在" if table in tables else "缺表")
+        cycle = None
+        if "paper_cycles" in tables:
+            cycle = conn.execute(
+                "SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused')"
+                " ORDER BY id DESC LIMIT 1").fetchone()
+        if cycle is None:
+            _check(rows, "cycle_present", False, "没有 draft/running/paused 周期")
+            cycle = None
+        else:
+            cycle = dict(cycle)
+            raw_enabled = cycle.get("enabled_strategies")
+            enabled = (tuple(PT._loads(raw_enabled, []) or ())
+                       if isinstance(raw_enabled, str) else tuple(raw_enabled or ()))
+            _check(rows, "cycle_window_status", cycle["status"] in ("paused", "running"),
+                   f"当前周期 {cycle['id']} 状态 {cycle['status']}")
+            _check(rows, "cycle_three_sleeves", enabled == ROSTER.formal_strategy_ids(),
+                   f"启用集合 {enabled}（期望 {ROSTER.formal_strategy_ids()}）")
+            _check(rows, "cycle_capital", abs(float(cycle.get("capital") or 0) - 300000.0) < 0.01,
+                   f"资本 {cycle.get('capital')}")
+        accounts = ({row["id"]: dict(row) for row in conn.execute(
+            "SELECT id,initial_cash,cash,params,cycle_id FROM paper_accounts WHERE cycle_id=?",
+            (cycle["id"],))} if cycle and "paper_accounts" in tables else {})
+        expected_share = {item.strategy_id: item.budget_share for item in ROSTER.formal_roles()}
+        for strategy_id, share in expected_share.items():
+            account = accounts.get(strategy_id)
+            if account is None:
+                _check(rows, f"account_present:{strategy_id}", False, "当前周期没有该账户")
+                continue
+            want = round(float(cycle["capital"]) * share, 2)
+            _check(rows, f"account_capital:{strategy_id}",
+                   abs(float(account["initial_cash"]) - want) < 1.0,
+                   f"归属 {account['initial_cash']:.2f}（期望 {want:.2f}）")
+            params = json.loads(account["params"] or "{}")
+            allocation = params.get("adaptive_allocation") or {}
+            weight = allocation.get("weight_pct")
+            _check(rows, f"allocation_declared:{strategy_id}",
+                   weight is not None and abs(float(weight) - share * 100) < 0.01,
+                   f"权重 {weight}（期望 {share * 100:.1f}）eff={allocation.get('effective_date')}")
+            policy = params.get("adaptive_allocation_policy") or {}
+            _check(rows, f"daily_policy:{strategy_id}",
+                   policy.get("id") == "authorized-daily-performance-v2"
+                   and policy.get("min_weight_pct") == 5.0,
+                   f"policy={policy.get('id')} bounds={policy.get('min_weight_pct')}-{policy.get('max_weight_pct')}",
+                   warn=policy.get("id") != "authorized-daily-performance-v2")
+        if cycle:
+            import strategy_weight_scope as SCOPE
+            participants = tuple(SCOPE.participant_ids(conn))
+            _check(rows, "execution_participants", participants == ROSTER.formal_strategy_ids(),
+                   f"执行参与者 {participants}")
+            # 不用 RSET.enabled_strategies：它内部会 SR.ensure_schema（写库），
+            # 在只读连接上直接炸。这里只读原始设置，未配置时下一周期回落到
+            # 注册表 active 集合（执行参与者那一条已经覆盖）。
+            try:
+                setting_row = conn.execute(
+                    "SELECT value FROM paper_runtime_settings WHERE key='enabled_strategies'"
+                ).fetchone()
+                raw_scope = PT._loads(setting_row[0], None) if setting_row else None
+            except sqlite3.Error:
+                raw_scope = None
+            scope = tuple(raw_scope) if isinstance(raw_scope, list) else ()
+            _check(rows, "next_cycle_enabled",
+                   (not scope) or scope == ROSTER.formal_strategy_ids(),
+                   f"下一周期启用 {list(scope) or '（未配置，回落到注册表 active）'}",
+                   warn=bool(scope) and scope != ROSTER.formal_strategy_ids())
+            orders = conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0]
+            _check(rows, "clean_ledger", orders == 0, f"活动账本订单 {orders} 条", warn=True)
+    finally:
+        conn.close()
+
+    ledger = Path(PT.DB_PATH)
+    _check(rows, "ledger_readable", ledger.is_file(),
+           f"{ledger} {ledger.stat().st_size if ledger.is_file() else 0} bytes")
+    try:
+        probe = sqlite3.connect(Path(PT.DB_PATH).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        probe.execute("SELECT 1").fetchone()
+        probe.close()
+        readable = True
+    except sqlite3.Error as exc:
+        readable = False
+        _check(rows, "ledger_ro_open", False, exc)
+    if readable:
+        _check(rows, "ledger_ro_open", True, "只读连接可用")
+
+    import auction_tracking as AT
+    folder = Path(AT.data_paths.data_path("auction_tracking"))
+    _check(rows, "auction_dir_writable", os.access(folder if folder.exists() else folder.parent, os.W_OK),
+           f"竞价归档目录 {folder}（{'已存在' if folder.exists() else '尚未创建，开盘后写入'}）")
+    archived = AT.archived_days()
+    _check(rows, "auction_archive", True,
+           f"已归档 {len(archived)} 天" + (f"，最近 {archived[-1].stem}" if archived else "（10-26 起逐日落档）"),
+           warn=not archived)
+
+    import paper_schedule_contract as SC
+    task = next((item for item in SC.SCHEDULE_TASKS if item.slot == "auction-track"), None)
+    _check(rows, "schedule_auction_track", task is not None and getattr(task, "clock", None) == "09:15",
+           f"竞价跟踪时钟 {getattr(task, 'clock', None) if task else '缺失'}")
+
+    import universe
+    today = current.date()
+    _check(rows, "trade_calendar", universe.is_trade_day(today),
+           f"{today.isoformat()} 交易日={universe.is_trade_day(today)}")
+    try:
+        nxt = universe.next_trade_day(today)
+        _check(rows, "next_trade_day", nxt is not None and nxt > today,
+               f"下一交易日 {nxt}")
+    except Exception as exc:  # noqa: BLE001 - 交易日历无法解析时必须显式暴露
+        _check(rows, "next_trade_day", False, f"{type(exc).__name__}: {exc}")
+
+    import data_fetcher as dfc  # noqa: F401  (确认数据层可导入)
+    kline_dir = Path(getattr(dfc, "KLINE_DIR", "")) if getattr(dfc, "KLINE_DIR", None) else None
+    if kline_dir is not None:
+        count = len(list(kline_dir.glob("*.csv"))) if kline_dir.is_dir() else 0
+        _check(rows, "kline_cache", count > 0, f"{kline_dir} 下 {count} 个 CSV", warn=count == 0)
+
+    failures = [row for row in rows if row["status"] == "FAIL"]
+    warnings = [row for row in rows if row["status"] == "WARN"]
+    return {"as_of": current.isoformat(), "checks": rows,
+            "summary": {"pass": len(rows) - len(failures) - len(warnings),
+                        "warn": len(warnings), "fail": len(failures)},
+            "ok": not failures}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    args = parser.parse_args(argv)
+    report = run()
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, indent=1))
+    else:
+        print(f"周一开盘前自检 {report['as_of']}")
+        for row in report["checks"]:
+            print(f"  [{row['status']}] {row['check']}: {row['detail']}")
+        summary = report["summary"]
+        print(f"合计 PASS={summary['pass']} WARN={summary['warn']} FAIL={summary['fail']}")
+    return 0 if report["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

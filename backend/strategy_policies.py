@@ -22,7 +22,7 @@ MAIN_FORCE_STRATEGY_ID = "main_force_top10"
 # ---------------------------------------------------------------------------
 OPENING_EVENT_POLICIES: dict[str, dict] = {
     "tq_breakout": {
-        "name": "短线日内做T",
+        "name": "激进做T",
         "enabled": True,
         "min_peak_pct": 3.0,
         "min_retrace_pct": 2.2,
@@ -37,7 +37,7 @@ OPENING_EVENT_POLICIES: dict[str, dict] = {
         "rebuy_min_current_pct": -1.5,
     },
     "trend_pullback": {
-        "name": "趋势波段优选",
+        "name": "稳健波段",
         "enabled": True,
         "min_peak_pct": 4.0,
         "min_retrace_pct": 2.6,
@@ -67,7 +67,7 @@ OPENING_EVENT_POLICIES: dict[str, dict] = {
         "rebuy_min_current_pct": -0.5,
     },
     NEW_STRATEGY_ID: {
-        "name": "三日策略",
+        "name": "保守防守",
         "enabled": True,
         "min_peak_pct": 3.5,
         "min_retrace_pct": 2.4,

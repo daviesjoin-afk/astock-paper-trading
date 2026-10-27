@@ -180,11 +180,12 @@ def _review(conn, cycle_id, account_id, code, review_date, score, grade, action,
          json.dumps(detail, ensure_ascii=False), f"{review_date} 15:05:00"))
 
 
-def _nav_days(conn, accounts, share, day_counts):
+def _nav_days(conn, accounts, shares, day_counts):
     # day_counts[account_index][day_index] = percent move vs share base
     nav_dates = [_iso_days_ago(d) for d in range(4, -1, -1)]
     for day_index, nav_date in enumerate(nav_dates):
         for acct_index, account_id in enumerate(accounts):
+            share = shares[account_id]
             nav = share * (1 + day_counts[acct_index][day_index] / 100.0)
             PT._rows(conn, """
                 INSERT OR IGNORE INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at,quote_status)
@@ -222,8 +223,9 @@ def ensure_demo_data(force=False):
             PT._archive_current_cycle(conn, "demo seed 重建确定性演示周期")
         cycle = PT._create_cycle(conn, DEMO_CAPITAL, status="running", reason="确定性演示账本播种")
         cycle_id = cycle["id"]
-        accounts = [row["id"] for row in PT._rows(conn, "SELECT id FROM paper_accounts ORDER BY id")]
-        share = DEMO_CAPITAL / max(len(accounts), 1)
+        accounts = sorted(cycle["enabled_strategies"])
+        shares = {row["id"]: float(row["initial_cash"]) for row in PT._rows(
+            conn, "SELECT id,initial_cash FROM paper_accounts WHERE cycle_id=?", (cycle_id,))}
         # deterministic assignment: first two accounts carry the story
         acc_hold = accounts[0]     # 正常买入 + T+1 卖拒
         acc_flow = accounts[1]     # 行情过期拒 + 止损
@@ -305,7 +307,7 @@ def ensure_demo_data(force=False):
             [+0.1, +0.1, +0.1, +0.1, +0.1],
             [+0.1, +0.2, +0.0, -0.1, +0.2],
         ]
-        _nav_days(conn, accounts, share, day_counts)
+        _nav_days(conn, accounts, shares, day_counts)
 
         # sync account cash with the handwritten fills so shared-pool reads
         # reconcile (seed fills never went through the engine's cash ledger)
@@ -318,11 +320,11 @@ def ensure_demo_data(force=False):
                 (account_id,),
             ).fetchone()[0]
             PT._rows(conn, "UPDATE paper_accounts SET cash=?,updated_at=? WHERE id=?",
-                     (round(share + float(flow), 2), _now(), account_id))
+                     (round(shares[account_id] + float(flow), 2), _now(), account_id))
 
         PT._audit(conn, None, "demo_seeded",
                   "确定性演示账本已播种：10 只合成股票，事件链含正常成交/T+1 拒绝/行情过期拒绝/止损/涨停")
-        PT._audit(conn, None, "capital_configured", f"演示资金池 {DEMO_CAPITAL:.0f} 元，五策略等分 {share:.0f} 元")
+        PT._audit(conn, None, "capital_configured", f"演示资金池 {DEMO_CAPITAL:.0f} 元，按正式策略预算分配")
     return True
 
 

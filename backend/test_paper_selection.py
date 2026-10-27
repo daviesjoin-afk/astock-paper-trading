@@ -65,11 +65,11 @@ class PaperSelectionTests(unittest.TestCase):
 
         def fake_run(model_id, topn):
             self.calls.append((model_id, topn))
-            if model_id == "one_to_two":
+            if model_id == "first_board_relay":
                 return _payload(_picks("6001", 8))
-            if model_id == "bottom_reversal":
+            if model_id == "pullback_reversal":
                 return _payload(_picks("6001", 2))
-            if model_id == "sentiment_pioneer":
+            if model_id == "sector_sentiment":
                 return _payload([])
             if model_id == "reported_profit_breakout":
                 return {"need_init": True, "message": "数据未就绪"}
@@ -78,14 +78,14 @@ class PaperSelectionTests(unittest.TestCase):
         PS._run_one = fake_run
 
     # -- 映射 -------------------------------------------------------------
-    def test_catalog_has_five_strategies(self):
+    def test_catalog_has_three_strategies(self):
         items = PS.catalog()
-        self.assertEqual(len(items), 5)
-        self.assertEqual([item["no"] for item in items], [1, 2, 3, 4, 5])
+        self.assertEqual(len(items), 3)
+        self.assertEqual([item["no"] for item in items], [1, 2, 3])
         self.assertEqual([item["label"] for item in items],
-                         ["策略1", "策略2", "策略3", "策略4", "策略5"])
+                         ["策略1", "策略2", "策略3"])
         self.assertTrue(all(item["strategy_name"] for item in items))
-        self.assertEqual(items[0]["model_id"], "one_to_two")
+        self.assertEqual(items[0]["model_id"], "first_board_relay")
 
     # -- 交易日来源 -------------------------------------------------------
     def test_trade_date_is_read_from_real_payload_shape(self):
@@ -134,7 +134,7 @@ class PaperSelectionTests(unittest.TestCase):
         PS._run_one = lambda model_id, topn: _payload(_picks("6001", 3))
         code, _ = self._run_cli(["--slot", "daily", "--date", "2026-09-07"])
         self.assertEqual(code, 0)
-        self.assertEqual(self._count_runs(), 5)
+        self.assertEqual(self._count_runs(), 3)
 
     # -- 运行与持久化 -----------------------------------------------------
     def test_run_daily_topn_cap_and_statuses(self):
@@ -145,9 +145,17 @@ class PaperSelectionTests(unittest.TestCase):
         self.assertEqual(by_id["tq_breakout"]["status"], "ok")
         self.assertEqual(len(by_id["trend_pullback"]["picks"]), 2)       # 候选不足
         self.assertEqual(by_id["trend_pullback"]["status"], "ok")
-        self.assertEqual(by_id["sector_rotation"]["status"], "empty")    # 空状态
+        self.assertNotIn("sector_rotation", by_id)
         self.assertEqual(by_id["reported_profit_breakout"]["status"], "blocked")
-        self.assertEqual(by_id["main_force_top10"]["status"], "error")
+        self.assertNotIn("main_force_top10", by_id)
+
+    def test_empty_and_error_states_still_apply_to_current_strategies(self):
+        PS._run_one = lambda *_: _payload([])
+        self.assertEqual(PS.run_daily(run_date="2026-09-07")["strategies"][0]["status"], "empty")
+        def fail(*_):
+            raise RuntimeError("boom")
+        PS._run_one = fail
+        self.assertEqual(PS.run_daily(run_date="2026-09-07")["strategies"][0]["status"], "error")
 
     def test_rerun_overwrites_same_trade_date_and_strategy(self):
         PS.run_daily(topn=5, run_date="2026-09-07")
@@ -197,15 +205,15 @@ class PaperSelectionTests(unittest.TestCase):
         data = PS.latest()
         self.assertTrue(data["found"])
         self.assertEqual(data["trade_date"], "2026-09-07")
-        self.assertEqual(len(data["strategies"]), 5)
+        self.assertEqual(len(data["strategies"]), 3)
         first = data["strategies"][0]
         self.assertEqual(first["label"], "策略1")
         self.assertTrue(first["strategy_name"])
         self.assertEqual(first["picks"][0]["rank_no"], 1)
         self.assertEqual(first["picks"][0]["reasons"], ["理由1"])
-        empty_group = [g for g in data["strategies"] if g["strategy_id"] == "sector_rotation"][0]
+        empty_group = [g for g in data["strategies"] if g["strategy_id"] == "reported_profit_breakout"][0]
         self.assertEqual(empty_group["picks"], [])
-        self.assertEqual(empty_group["status"], "empty")
+        self.assertEqual(empty_group["status"], "blocked")
 
     def test_latest_before_any_run(self):
         data = PS.latest()
@@ -214,8 +222,8 @@ class PaperSelectionTests(unittest.TestCase):
 
     def test_filter_single_strategy(self):
         PS.run_daily(topn=5, run_date="2026-09-07")
-        data = PS.latest(strategy_id="main_force_top10")
-        self.assertEqual([g["strategy_id"] for g in data["strategies"]], ["main_force_top10"])
+        data = PS.latest(strategy_id="reported_profit_breakout")
+        self.assertEqual([g["strategy_id"] for g in data["strategies"]], ["reported_profit_breakout"])
 
     # -- 选股链路兼容（2026-09-08 生产事故回归）---------------------------
     def test_model_ids_within_select_whitelist(self):
@@ -231,7 +239,7 @@ class PaperSelectionTests(unittest.TestCase):
         # 防御纵深：选股链路拒绝场景返回 JSONResponse（非 dict）时，
         # run_daily 必须给出可定位的 message，而不是 AttributeError。
         def bad_run(model_id, topn):
-            if model_id == "one_to_two":
+            if model_id == "first_board_relay":
                 return object()  # 模拟 JSONResponse 之类的非 dict 返回
             return _payload(_picks("6002", 1))
 
@@ -250,7 +258,7 @@ class PaperSelectionTests(unittest.TestCase):
 class SelectUncachedWhitelistTests(unittest.TestCase):
     """直接验证 main._select_uncached 对模拟盘模型 id 的白名单行为。
 
-    2026-09-08 生产首跑：one_to_two/bottom_reversal/sentiment_pioneer 不在
+    2026-09-08 生产首跑：first_board_relay/pullback_reversal/sector_sentiment 不在
     白名单内，_select_uncached 返回 JSONResponse，run_daily 逐策略炸出
     AttributeError → error(0)。此测试用低覆盖率门禁短路重链路，只验证
     「id 通过白名单且返回 dict」，不触网、不依赖本地数据。

@@ -45,8 +45,8 @@ BASE_RISK = {
         "single_risk": 0.005, "daily_loss": 0.025, "drawdown": 0.085,
         "cooldown_days": 2, "min_cost_edge": 0.005,
     },
-    # Active in the current five-strategy cycle.  Keep this overlay inside the
-    # adaptive bounds; the execution profile remains the stricter authority.
+    # Historical overlays remain readable for audit/rollback. New proposals
+    # are restricted to current execution participants below.
     "main_force_top10": {
         "max_weight": 0.22, "max_exposure": 0.78, "max_industry": 0.45,
         "single_risk": 0.006, "daily_loss": 0.025, "drawdown": 0.100,
@@ -1393,9 +1393,10 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
     created = 0
     auto_applied = []
     try:
-        accounts = [dict(row) for row in paper.execute(
-            "SELECT * FROM paper_accounts WHERE id IN ('tq_breakout','trend_pullback','sector_rotation') ORDER BY id"
-        )]
+        import strategy_weight_scope as SCOPE
+        participants = set(SCOPE.participant_ids(paper))
+        accounts = [dict(row) for row in paper.execute("SELECT * FROM paper_accounts ORDER BY id")
+                    if row["id"] in participants and row["id"] in BASE_RISK]
         for account in accounts:
             account_id = account["id"]
             current, _, _ = _current_risk(account)
@@ -1462,9 +1463,13 @@ def overview(conn, config, paper_db_path):
     if os.path.exists(paper_db_path):
         paper = _paper_connection(paper_db_path)
         try:
+            import strategy_weight_scope as SCOPE
+            participants = set(SCOPE.participant_ids(paper))
             for row in paper.execute(
-                "SELECT id,name,version,params FROM paper_accounts WHERE id IN ('tq_breakout','trend_pullback','sector_rotation') ORDER BY id"
+                "SELECT id,name,version,params FROM paper_accounts ORDER BY id"
             ):
+                if row["id"] not in participants:
+                    continue
                 params = _loads(row["params"], {})
                 meta = params.get("adaptive_risk_meta") or {}
                 if meta.get("status") == "active":

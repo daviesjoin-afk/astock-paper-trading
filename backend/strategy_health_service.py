@@ -244,14 +244,57 @@ def _activity_dimension(conn, identity, window):
     )
 
 
-def _performance_dimension():
-    # 仓库没有「exact strategy version 历史绩效（NAV/return/drawdown/PnL）」的 owner：
-    # paper_performance 是日内持仓 P&L，paper_portfolio_read_model 明确不发布
-    # nav/market_value/return。缺 owner 就只能 UNAVAILABLE，绝不拿日内数据升级成
-    # 策略历史绩效权威。
-    return SH.unavailable_dimension(
-        SH.DIMENSION_PERFORMANCE, SH.REASON_STRATEGY_PERFORMANCE_OWNER_UNAVAILABLE,
-        facts={"strategy_version_scoped_owner": None})
+def _performance_dimension(conn, identity, window):
+    """版本级绩效证据，由 :mod:`strategy_performance` 这个 owner 产出。
+
+    这里只做"事实 → 证据状态"的翻译，**不改任何健康/退休阈值**（方案 §2.5 要求那是
+    独立变更）。owner 说不可用就不可用；不会因为"看起来没亏"就升成 AVAILABLE。
+    """
+    import strategy_performance as SPF
+
+    try:
+        request = SPF.PerformanceRequest(
+            strategy_id=identity[0], strategy_version=int(identity[1]),
+            strategy_checksum=identity[2],
+            observation_start=window.observation_start,
+            observation_end=window.observation_end)
+        fact = SPF.build_fact_using_conn(conn, request)
+    except SPF.PerformanceEvidenceError as exc:
+        return SH.unavailable_dimension(
+            SH.DIMENSION_PERFORMANCE, SH.REASON_STRATEGY_PERFORMANCE_OWNER_UNAVAILABLE,
+            facts={"owner_error": str(exc)[:200]})
+
+    status = str(fact.get("status") or SPF.STATUS_UNAVAILABLE)
+    metrics = fact.get("metrics") or {}
+    reasons = tuple(sorted({
+        reason
+        for metric in metrics.values()
+        for reason in (metric.get("reasons") or ())
+    } | set(fact.get("blocking_reasons") or ())))
+    facts = {
+        "strategy_version_scoped_owner": SPF.OWNER_VERSION,
+        "owner_status": status,
+        "metrics": {name: {"status": metric.get("status"),
+                           "value": metric.get("value")}
+                    for name, metric in metrics.items()},
+        "coverage": fact.get("coverage") or {},
+        "fact_fingerprint": fact.get("fingerprint"),
+    }
+    if status == SPF.STATUS_UNAVAILABLE:
+        # 不可用就是不可用：不发布数值，只给原因。
+        return SH.HealthDimension(
+            name=SH.DIMENSION_PERFORMANCE, status=SH.STATUS_UNAVAILABLE, facts=facts,
+            provenance=SH.PROVENANCE_UNAVAILABLE,
+            source_identity=f"strategy_performance:{fact.get('fingerprint')}",
+            blocking_reasons=reasons or (SPF.R_NO_EXACT_PIN,))
+    return SH.HealthDimension(
+        name=SH.DIMENSION_PERFORMANCE,
+        status=(SH.STATUS_AVAILABLE if status == SPF.STATUS_AVAILABLE
+                else SH.STATUS_PARTIAL),
+        facts=facts, provenance=SH.PROVENANCE_OWNER_ISSUED,
+        source_identity=f"strategy_performance:{fact.get('fingerprint')}",
+        source_fingerprint=SH.fingerprint(facts),
+        blocking_reasons=reasons)
 
 
 def _comparable_dimension(conn, identity, comparison_report_id):
@@ -309,7 +352,7 @@ def _capture(conn, *, strategy_id, strategy_version, strategy_checksum,
         _execution_dimension(conn, identity, window),
         _risk_dimension(conn, identity, window),
         _activity_dimension(conn, identity, window),
-        _performance_dimension(),
+        _performance_dimension(conn, identity, window),
         _comparable_dimension(conn, identity, comparison_report_id),
     )
     return SH.build_strategy_health(

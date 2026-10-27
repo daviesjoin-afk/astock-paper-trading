@@ -44,11 +44,11 @@ class DbMigrateTests(unittest.TestCase):
                 self.assertIsNotNone(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_ignition_shadow'").fetchone())
                 self.assertEqual(
                     conn.execute("SELECT COUNT(*) FROM strategy_definitions WHERE origin='builtin'").fetchone()[0],
-                    5,
+                    3,
                 )
                 self.assertEqual(
                     conn.execute("SELECT COUNT(*) FROM paper_strategy_versions WHERE version=1").fetchone()[0],
-                    5,
+                    3,
                 )
             finally:
                 conn.close()

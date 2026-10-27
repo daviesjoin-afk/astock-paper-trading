@@ -173,7 +173,7 @@ class CycleCapitalFacadeTests(unittest.TestCase):
 
         with mock.patch.object(PT, "_active_cycle_filter", return_value=("1=1", ())):
             with mock.patch.object(PT, "_num", side_effect=patched_num):
-                self.assertEqual(60000.0, PT._available_cycle_ledger_capital(self.conn, self.cycle, "target"))
+                self.assertEqual(100000.0, PT._available_cycle_ledger_capital(self.conn, self.cycle, "target"))
         self.assertTrue(calls)
 
 

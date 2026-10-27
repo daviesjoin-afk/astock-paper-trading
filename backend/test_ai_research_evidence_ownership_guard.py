@@ -64,6 +64,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import ai_research_contract as ARC  # noqa: E402
+from test_support import ast_cache  # noqa: E402
 
 CONTRACT_MODULE_FILE = "ai_research_contract.py"
 CONTRACT_MODULE_NAME = "ai_research_contract"
@@ -145,12 +146,11 @@ EXPECTED_EVENT_CONSTRUCTORS = frozenset({
 
 
 def _source(name: str) -> str:
-    with open(os.path.join(BACKEND, name), encoding="utf-8") as handle:
-        return handle.read()
+    return ast_cache.source(os.path.join(BACKEND, name))
 
 
 def _tree(name: str) -> ast.Module:
-    return ast.parse(_source(name))
+    return ast_cache.tree(os.path.join(BACKEND, name))
 
 
 def _production_modules() -> list[str]:
