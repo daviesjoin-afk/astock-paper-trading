@@ -24,6 +24,13 @@
 
 ## 本次切片
 
+- 2026-10-27（§13.4 复用资源测量）：`backend/tools/modularity_reuse_bench.py` 把「同轮输入复用」的净效果做成可重跑证据 ——
+  三个消费者、5000 只证券、合成输入、不联网不碰生产库。分开取数时 universe/finance/fundamental 各 **3** 次；
+  共用一轮输入后各 **1** 次。本机（Windows / Python 3.14.5 / 中位数口径单次运行）：
+  墙钟 **2.102 s → 1.215 s**、进程 CPU **2.047 s → 1.203 s**、tracemalloc 峰值 **20.80 MiB → 17.84 MiB**，
+  即 −0.887 s / −0.844 s CPU / −2.96 MiB，且把哈希与深拷贝开销算在内。结果等价由三份 frame 的 SHA256 全部相等来断言，
+  另有三个失效反例（重复读复用、空读不进缓存、消费者改写不影响下一个）。**限制**：合成输入、无行情网络、
+  无数据库与盘中竞争，不能当成生产线整轮提速或收益。
 - 2026-10-27（手单能力桥）：`manual_orders` 不再经 `paper_trading` 的全局桥取模块对象 ——
   `decision_engine` / `portfolio_allocation_policy` / `portfolio_allocation_weights` /
   `portfolio_runtime` / `portfolio_runtime_service` / `runtime_settings` 与
