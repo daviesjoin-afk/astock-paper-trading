@@ -1,6 +1,8 @@
 """Business owners work without the trading composition module."""
 import ast
+import dataclasses
 import datetime as dt
+import importlib
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -8,6 +10,7 @@ import sys
 import unittest
 from unittest import mock
 
+import paper_capital_reservations as PCR
 import paper_lot_ledger as L
 import paper_order_execution_authority as O
 
@@ -151,6 +154,66 @@ class BusinessOwnerTests(unittest.TestCase):
             }:
                 self.assertFalse(any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
                                      and call.func.attr == "execute" for call in ast.walk(node)), node.name)
+
+
+class ManualOrderCapabilityBridgeTests(unittest.TestCase):
+    """手单的能力桥只保留交易引擎自己的业务能力。
+
+    模块对象（决策引擎、组合分配/运行时、预占、运行时设置）都有**独立 owner**。
+    把它们经 ``paper_trading`` 的全局桥转发一遍，依赖数量一个不少，"谁负责" 却
+    更难看出来 —— 而且这条转发会让"手单不加载交易引擎"变成一句空话。这里用
+    机械口径把它固定住：桥里不允许出现任何模块对象。
+    """
+
+    DIRECT_OWNERS = {
+        "DE": "decision_engine",
+        "PAPolicy": "portfolio_allocation_policy",
+        "PAW": "portfolio_allocation_weights",
+        "PRS": "portfolio_runtime_service",
+        "PRuntime": "portfolio_runtime",
+        "RSET": "runtime_settings",
+    }
+
+    @staticmethod
+    def _relayed_modules(field_names, resolve):
+        """Return field names whose value is a module other than the engine."""
+        relayed = []
+        for name in field_names:
+            value = resolve(name)
+            module_name = getattr(value, "__name__", None)
+            if isinstance(value, type(sys)) and module_name != "paper_trading":
+                relayed.append(f"{name}->{module_name}")
+        return relayed
+
+    def test_scan_detects_a_relayed_module(self):
+        # 非空性：同一份扫描必须能把"模块对象走桥"这种情况抓出来。
+        synthetic = {"DE": sys, "LOT_SIZE": 100}
+        self.assertEqual(["DE->sys"], self._relayed_modules(synthetic, synthetic.get))
+
+    def test_bridge_carries_no_module_objects(self):
+        import manual_orders as M
+        import paper_trading as P
+
+        names = [field.name for field in dataclasses.fields(M.ManualOrderDependencies)]
+        self.assertGreater(len(names), 20, "能力桥为空，扫描没有意义")
+        self.assertEqual([], self._relayed_modules(names, lambda name: getattr(P, name, None)))
+
+    def test_owners_are_imported_directly(self):
+        import manual_orders as M
+
+        for attr, module_name in self.DIRECT_OWNERS.items():
+            with self.subTest(attr=attr):
+                self.assertIs(getattr(M, attr), importlib.import_module(module_name))
+        self.assertIs(M.ReservationCycleMismatch, PCR.ReservationCycleMismatch)
+
+    def test_manual_orders_import_does_not_load_the_trading_engine(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; import manual_orders; "
+             "assert 'paper_trading' not in sys.modules, sorted(sys.modules)[:5]"],
+            cwd=BACKEND, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

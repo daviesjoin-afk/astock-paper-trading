@@ -11,7 +11,7 @@
 | 裸 SQL 模块 | 135 | 140 | 5 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
 | 跨模块私有属性访问 | 202 | 202 | 0 | 0 |
-| 跨域 import 边 | 624 | 661 | 37 | 分阶段降低 |
+| 跨域 import 边 | 624 | 666 | 42 | 分阶段降低 |
 | 最大文件 | 16367 行 | 15676 行 | 0 | ≤2500 |
 | 最大函数 | 1191 行 | 1195 行 | 4 | <200 |
 | 单函数最大全局引用 | 56 | 57 | 1 | <80 |
@@ -24,6 +24,13 @@
 
 ## 本次切片
 
+- 2026-10-27（手单能力桥）：`manual_orders` 不再经 `paper_trading` 的全局桥取模块对象 ——
+  `decision_engine` / `portfolio_allocation_policy` / `portfolio_allocation_weights` /
+  `portfolio_runtime` / `portfolio_runtime_service` / `runtime_settings` 与
+  `ReservationCycleMismatch` 改为直接依赖各自 owner，能力桥字段 57 → 50。业务依赖没有增加，
+  但同一条依赖现在由两个消费者各自声明，`跨域 import 边` 661 → 666（额度 +5，已登记）。
+  新增守卫：桥里不允许出现任何模块对象（带合成样本的非空性用例），且
+  `import manual_orders` 不得把 `paper_trading` 拉进 `sys.modules`。
 - 2026-10-27（闭环覆盖口径 / 退役文案观察器）：闭环准入台的「成交覆盖」分母改为后端 owner 字段 `closed_loop.strategy_coverage_total`（由 `_weight_participants()` 的周期参与快照派生，拿不到报 `null` 而不是 0），前端不再写死 `/ 5 当前账户`；同一份 overview 里参与集合只读一次，覆盖分母与 horizon 汇总共用同一快照。删除 `boot.js` 的 `MutationObserver` 整树文案改写与 `strategies.js` 的 `normalizeActiveStrategyCopy`，改为机械守卫：生产 Python 非 docstring 字符串常量、前端去掉注释后的字面量都不允许再出现退役称谓（`test_retired_strategy_copy_guard`，含可驱动成 RED 的非空性用例）。本切片不改变导入环、裸 SQL、私有访问、最大文件/函数等计数，因此不调整任何预算额度。
 - 2026-10-27（第三批）：选股流水线从 HTTP 主入口下沉到 `selection_application`，API 与两个命令行入口共用；共享资金读取改为显式周期 owner；前端提供商设置不再反向导入设置页面。导入环 3 → 2，主文件行数降至 15,676，私有跨模块访问收紧到基线 202。缺报价账户/资金池/风险页保持 `unknown`，已实现盈亏仍可展示。
 - 2026-10-27（前端加载/候选/选股复用）：`navigation` 不再导入任何 feature，页面 loader 由 `boot` 组合根注册；非选股深链不再无条件请求选股数据。前端静态环 1 → 0；单 bundle 体积基本不变，因此不把去环当成 JS 传输缩短。候选准备新增按 `(code, asof)` 的披露证据轮内复用，失败不缓存、不同日期重取，原有来源错误语义保持不变。`paper_selection.run_daily` 与定时 `selection_runner` 在一个显式 `selection_round` 内共享 live snapshot、snap 和 fundamental 计算；单策略调用不改变原路径。
