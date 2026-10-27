@@ -199,6 +199,21 @@ class ModuleLayoutTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(SRC, "bridge.js")))
         self.assertTrue(os.path.isfile(os.path.join(STYLES, "index.css")))
 
+    def test_navigation_is_free_of_feature_imports_and_boot_registers_loaders(self):
+        with open(os.path.join(SRC, "core", "navigation.js"), encoding="utf-8") as handle:
+            navigation = handle.read()
+        self.assertNotIn("../features/", navigation,
+                         "navigation 必须只做路由，页面能力由 boot 注册")
+        with open(os.path.join(SRC, "boot.js"), encoding="utf-8") as handle:
+            boot = handle.read()
+        self.assertNotRegex(boot, r"(?m)^loadStrategies\(\);",
+                            "选股数据不能在 boot 顶层对所有页面无条件加载")
+        self.assertNotRegex(boot, r"(?m)^loadDataValidity\(\);",
+                            "数据有效性不能在 boot 顶层对所有页面无条件加载")
+        for view in ("portfolio", "activity", "history", "all", "strategy", "research",
+                     "risk", "execution", "allocation"):
+            self.assertIn("registerPaperViewLoader('%s'" % view, boot, view)
+
     def test_build_id_is_declared_in_the_entry(self):
         with open(os.path.join(SRC, "app.js"), encoding="utf-8") as handle:
             entry = handle.read()
