@@ -7696,6 +7696,7 @@ def generate_signals(asof_date=None):
     research_snapshots = {}
     all_names = {}
     all_codes = set()
+    shared_inputs = PCScan.CandidateScanInputs(F.live_snapshot_asof())
     for account in accounts:
         research_kwargs = {}
         if account["id"] == "tq_breakout":
@@ -7704,6 +7705,7 @@ def generate_signals(asof_date=None):
         candidates, meta = _candidate_rows(
             account, day, market, sector_rows=sector_rows,
             live_universe=close_universe or None,
+            shared_inputs=shared_inputs,
             **research_kwargs,
         )
         candidate_batches.append((account, candidates, meta))
@@ -7923,9 +7925,11 @@ def backfill_research_shadow(asof_date=None):
     }
     with _db() as conn:
         accounts = _active_account_rows(conn, status="running")
+        shared_inputs = PCScan.CandidateScanInputs(F.live_snapshot_asof())
         for account in accounts:
             candidates, meta = _candidate_rows(
                 account, day, market, sector_rows=sector_rows, live_universe=close_universe,
+                shared_inputs=shared_inputs,
             )
             meta = dict(meta or {})
             meta["research_backfill"] = True
