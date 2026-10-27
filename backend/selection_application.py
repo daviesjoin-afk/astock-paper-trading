@@ -3,7 +3,7 @@
 
 HTTP and scheduled consumers share this owner; it does not import the HTTP app.
 """
-import os, time, datetime, threading, json, uuid
+import os, time, datetime, threading, json, uuid, contextvars, functools
 from contextlib import contextmanager
 import pandas as pd
 
@@ -92,6 +92,38 @@ _SELECTION_CONTEXT_RETRY_SECONDS = 30
 _SELECTION_CONTEXT_TTL = {"finance": 6 * 3600, "sentiment": 300}
 
 _SELECTION_CONTEXT_PROVIDER_KEY = {"finance": "finance", "sentiment": "hot_100"}
+
+
+class SelectionRound:
+    """Facts and pure calculations shared by consecutive strategy selections."""
+
+    def __init__(self):
+        self.live_rows = None
+        self.live_map = None
+        self.snap_f = None
+        self.fund_f = None
+
+
+_CURRENT_ROUND = contextvars.ContextVar("selection_round", default=None)
+
+
+@contextmanager
+def selection_round():
+    """Scope a batch of strategy runs to one explicit, isolated input round."""
+    token = _CURRENT_ROUND.set(SelectionRound())
+    try:
+        yield _CURRENT_ROUND.get()
+    finally:
+        _CURRENT_ROUND.reset(token)
+
+
+def shared_selection_round(func):
+    """Decorate a strategy batch so consecutive selections share one round."""
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        with selection_round():
+            return func(*args, **kwargs)
+    return wrapped
 
 
 def _health_file_signature(path):
@@ -428,6 +460,7 @@ def _select_uncached(
     topn: int = 10,
     *, background_context: bool = False,
 ):
+    round_inputs = _CURRENT_ROUND.get()
     # 「策略选股」页复用本流水线跑模拟盘模型族（paper_selection.STRATEGY_MODEL
     # → strategies.PAPER_WEIGHTS），run_strategy 会把这些 id 分派给
     # _run_paper_strategy，因此白名单必须同时放行两套 id 体系。
@@ -575,26 +608,30 @@ def _select_uncached(
         return MDSvc.refresh_rows(force=force, now=quote_now,
                                  policy=MDC.CLOSE_SNAPSHOT_POLICY, asof_day=expected_live_date)
 
-    live_rows = _safe_live_snapshot()
-    # A disk fallback can be complete in row count but several days old.  Do
-    # not let that cache masquerade as today's real-time quote; force a source
-    # health probe and one full refresh before failing closed.
-    live_rows = _valid_live_rows(live_rows)
-    if len(set(str(row.get("code")) for row in live_rows) & eligible_codes) < required_live:
-        try:
-            dfc.check_data_source_health(force=True)
-        except Exception:
-            pass
-        live_rows = _safe_live_snapshot(force=True)
+    if round_inputs is not None and round_inputs.live_rows is not None:
+        live_rows = round_inputs.live_rows
+        live_map = round_inputs.live_map or {}
+    else:
+        live_rows = _safe_live_snapshot()
+        # A disk fallback can be complete in row count but several days old.  Do
+        # not let that cache masquerade as today's real-time quote; force a source
+        # health probe and one full refresh before failing closed.
         live_rows = _valid_live_rows(live_rows)
-    live_map = {
-        str(row.get("code")): row
-        for row in live_rows
-        if row.get("code")
-        and isinstance(row.get("price"), (int, float))
-        and row.get("price") > 0
-        and isinstance(row.get("pct"), (int, float))
-    }
+        if len(set(str(row.get("code")) for row in live_rows) & eligible_codes) < required_live:
+            try:
+                dfc.check_data_source_health(force=True)
+            except Exception:
+                pass
+            live_rows = _safe_live_snapshot(force=True)
+            live_rows = _valid_live_rows(live_rows)
+        live_map = {
+            str(row.get("code")): row
+            for row in live_rows
+            if row.get("code")
+            and isinstance(row.get("price"), (int, float))
+            and row.get("price") > 0
+            and isinstance(row.get("pct"), (int, float))
+        }
     eligible_live_codes = {
         code for code, row in universe_by_code.items()
         if _buy_scope(code, row.get("name"), row.get("risk_flag"),
@@ -608,23 +645,36 @@ def _select_uncached(
             "need_init": True,
             "message": f"实时行情覆盖不足 {len(live_eligible)}/{len(eligible_live_codes)}（{live_coverage * 100:.1f}%），已停止使用旧快照；请稍后重试",
         }
-    snap_f = [
-        {**row, **live_map[row["code"]]}
-        for row in universe_by_code.values()
-        if row["code"] in covered_codes and row["code"] in live_map
-    ]
-    if len(snap_f) < required_live:
-        return {
-            "need_init": True,
-            "message": f"实时行情覆盖不足 {len(snap_f)}/{required_live}，已停止使用旧快照进行今日选股",
-        }
+    if round_inputs is not None:
+        round_inputs.live_rows = live_rows
+        round_inputs.live_map = live_map
+    if round_inputs is not None and round_inputs.snap_f is not None:
+        snap_f = round_inputs.snap_f
+    else:
+        snap_f = [
+            {**row, **live_map[row["code"]]}
+            for row in universe_by_code.values()
+            if row["code"] in covered_codes and row["code"] in live_map
+        ]
+        if len(snap_f) < required_live:
+            return {
+                "need_init": True,
+                "message": f"实时行情覆盖不足 {len(snap_f)}/{required_live}，已停止使用旧快照进行今日选股",
+            }
+        if round_inputs is not None:
+            round_inputs.snap_f = snap_f
     finance = _load_selection_context("finance", dfc.fetch_finance_latest,
                                       background=background_context)
     # 两套 cutoff 必须分开：``complete_cutoff`` 是"最近完整交易日"（盘中即昨天），
     # 只用于已收盘日线与财务披露；当日实时截面（PE/PB/换手/资金/行业）的决策时点
     # 是**现在**。混用会把盘中每一行都判成 future 并清空这些列。
-    fund_f = F.compute_fundamental_factors(
-        snap_f, finance, asof=complete_cutoff, snapshot_asof=F.live_snapshot_asof())
+    if round_inputs is not None and round_inputs.fund_f is not None:
+        fund_f = round_inputs.fund_f
+    else:
+        fund_f = F.compute_fundamental_factors(
+            snap_f, finance, asof=complete_cutoff, snapshot_asof=F.live_snapshot_asof())
+        if round_inputs is not None:
+            round_inputs.fund_f = fund_f
     # Technical factors remain anchored to downloaded complete daily K-lines;
     # mutable same-day fields must come from this validated live snapshot.
     price_f = price_f.copy()

@@ -103,15 +103,16 @@ def _run_daily(admission=None, now=None):
             factor_refresh = P._rebuild_selection_factor_cache(target_date)
     # One stored top-10 list per strategy is enough to form an unbiased daily
     # research sample without turning the job into a second paper-trading engine.
-    for strategy in S.STRATEGIES:
-        try:
-            result = selection.select_uncached(strategy=strategy, topn=10)
-            if not isinstance(result, dict) or result.get("need_init") or result.get("error"):
-                failures.append({"strategy": strategy, "error": result})
-                continue
-            saved.append(ST.record_run(result, run_date=now.date().isoformat(), source="scheduled"))
-        except Exception as exc:
-            failures.append({"strategy": strategy, "error": str(exc)})
+    with selection.selection_round():
+        for strategy in S.STRATEGIES:
+            try:
+                result = selection.select_uncached(strategy=strategy, topn=10)
+                if not isinstance(result, dict) or result.get("need_init") or result.get("error"):
+                    failures.append({"strategy": strategy, "error": result})
+                    continue
+                saved.append(ST.record_run(result, run_date=now.date().isoformat(), source="scheduled"))
+            except Exception as exc:
+                failures.append({"strategy": strategy, "error": str(exc)})
     # A run is only successful when every configured strategy produced a
     # persisted result.  Returning success after one strategy failed prevents
     # the scheduler from retrying the missing strategy and leaves the daily

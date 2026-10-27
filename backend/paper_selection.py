@@ -42,6 +42,7 @@ import sys
 from contextlib import closing
 
 import data_fetcher as dfc
+import selection_application as selection
 import strategy_registry as SR
 import strategy_selection_provenance as SP
 import strategy_selection_resolver as SRES
@@ -412,7 +413,6 @@ def _registry_active_ids() -> tuple[str, ...]:
 
 def _run_one(model_id: str, topn: int):
     """调用既有选股流水线（含覆盖率与行情新鲜度门禁）。"""
-    import selection_application as selection
     return selection.select_uncached(strategy=model_id, topn=topn)
 
 
@@ -447,6 +447,7 @@ def _trade_date_of(result):
     return ""
 
 
+@selection.shared_selection_round
 def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = None,
               source: str = "scheduled", asof_day: str | None = None) -> dict:
     """为每套策略跑一次评分选股，并覆盖写入当天结果。
