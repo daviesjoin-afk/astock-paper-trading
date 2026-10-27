@@ -63,6 +63,27 @@ def _handler_texts(blob: str):
         yield "".join(out)
 
 
+def _strip_handler_attributes(blob: str) -> str:
+    """Blank inline handler bodies; they resolve via bridge globals, not imports."""
+    chars = list(blob)
+    for match in HANDLER_ATTR.finditer(blob):
+        i, quote, depth = match.end(), blob[match.end() - 1], 0
+        while i < len(blob):
+            ch = blob[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote and depth == 0:
+                break
+            chars[i] = " "
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+    return "".join(chars)
+
+
 class BridgeCoverageTests(unittest.TestCase):
     """inline handler 调用的每个本仓库函数都必须能被浏览器解析到。"""
 
@@ -141,7 +162,8 @@ class CrossModuleImportTests(unittest.TestCase):
             if path.endswith(("bridge.js",)):
                 continue  # bridge 自己就是全局映射表，单独校验
             imported = self._imported(text)
-            body = self._strip_comments(IMPORT_LINE.sub("", text))
+            body = _strip_handler_attributes(
+                self._strip_comments(IMPORT_LINE.sub("", text)))
             for name, owner in self.owner.items():
                 if owner == path or name in imported:
                     continue

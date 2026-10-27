@@ -452,7 +452,7 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
       +'<div>持仓周期<b>'+riskText(boundary.hold_range||'—')+'</b></div>'
       +'<div>单股 / 总池预算<b>'+fmt(boundary.max_weight_pct,1)+'% / '+fmt(boundary.pool_budget_pct,2)+'%</b></div>'
       +'<div>保底 / 风险画像<b>'+fmt(boundary.pool_floor_pct,2)+'% / '+fmt(boundary.max_exposure_pct,0)+'%</b></div>'
-      +'<div>单日亏损 / 回撤<b>'+fmt(boundary.daily_loss_pct,1)+'% / '+fmt(boundary.drawdown_pct,1)+'%</b></div>'
+      +'<div>单日亏损 / 回撤<b>'+fmtPct(boundary.daily_loss_pct,1)+' / '+fmt(boundary.drawdown_pct,1)+'%</b></div>'
       +'<div>行业 / 冷却<b>'+fmt(boundary.industry_limit_pct,0)+'% / '+riskText(boundary.cooldown_days)+'天</b></div>'
       +'<div>入场模型<b>'+riskText(boundary.entry_model||'—')+'</b></div>'
       +'</div></div>';

@@ -8,8 +8,22 @@ import {
 } from '../src/core/format.js';
 import { adaptiveValue as legacyAdaptiveValue } from '../src/features/adaptive.js';
 import { allocationActionPanel } from '../src/features/execution.js';
+import { paperRunningStrategyCard } from '../src/features/paper.js';
 
 const source = (relative) => readFileSync(new URL(relative, import.meta.url), 'utf8');
+
+test('策略运行卡片区分未知与已知的单日亏损', () => {
+  const render = value => paperRunningStrategyCard('tq_breakout', {}, {}, {
+    daily_loss_pct: value, drawdown_pct: 2,
+  });
+  assert.match(render(null), /单日亏损 \/ 回撤<b>— \/ 2\.0%<\/b>/);
+  assert.match(render(1.25), /单日亏损 \/ 回撤<b>1\.3% \/ 2\.0%<\/b>/);
+  assert.match(render(0), /单日亏损 \/ 回撤<b>0\.0% \/ 2\.0%<\/b>/);
+});
+
+test('提供商设置模块不再反向导入设置页面', () => {
+  assert.doesNotMatch(source('../src/features/ai-provider-settings.js'), /from\s+["']\.\/settings\.js["']/);
+});
 
 test('adaptiveValue 保持缺值、精度、后缀和旧导出兼容', () => {
   assert.equal(legacyAdaptiveValue, adaptiveValue);

@@ -7,7 +7,7 @@ import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
 import { PAPER_STAGE_LABELS } from "./paper.js";
-import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings } from "./ai-provider-settings.js";
+import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings, persistAiProvider as saveProvider, clearAiProviderSecret as clearProviderKey } from "./ai-provider-settings.js";
 import { renderAiCapabilitySection, refreshAiCapabilities } from "./ai-capability.js";
 
 // 周期状态直接印英文会让「当前周期：running」这种行看起来像没做完的界面。
@@ -398,6 +398,14 @@ export async function saveAiReviewMode(){
   catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
 }
 
+function applyUpdatedAiReview(review,slot){
+  applyAiReviewSettings(review,slot,renderSettings);
+}
+
+export function saveAiProvider(){ return saveProvider(applyUpdatedAiReview); }
+
+export function clearAiProviderKey(){ return clearProviderKey(applyUpdatedAiReview); }
+
 export async function saveAiSlot(slot){
   var providerNode=$('aiSlot_'+slot+'_provider'), modelNode=$('aiSlot_'+slot+'_model');
   var enabledNode=$('aiSlot_'+slot+'_enabled');
@@ -410,7 +418,7 @@ export async function saveAiSlot(slot){
   aiSlotFeedback(slot,'正在保存…');
   try{
     var review=await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
-    applyAiReviewSettings(review,slot);
+    applyUpdatedAiReview(review,slot);
     aiSlotFeedback(slot,slot.toUpperCase()+' 设置已保存。','ok');
   }catch(e){ aiSlotFeedback(slot,'保存失败：'+e.message,'danger'); }
   finally{ if(button&&button.isConnected) button.disabled=false; }
