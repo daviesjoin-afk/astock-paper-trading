@@ -2764,7 +2764,7 @@ def _shared_account_rows(conn, cycle_id=None):
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
-    return PCY.cycle_ledger_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
+    return PSC.cycle_account_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def _shared_initial_cash(conn, cycle=None):
@@ -2834,7 +2834,9 @@ def _economic_pool_nav_history(conn, cycle=None):
 
 
 def _shared_cash(conn, cycle_id=None):
-    return PSC.shared_cash(_shared_account_rows(conn, cycle_id), num_fn=_num)
+    if cycle_id is None:
+        cycle_id = _active_cycle(conn)["id"]
+    return PSC.cycle_shared_cash(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS, num_fn=_num)
 
 
 def _pending_buy_reservations(conn, cycle_id=None, exclude_order_key=None):
