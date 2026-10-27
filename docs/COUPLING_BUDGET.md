@@ -8,7 +8,7 @@
 |---|---:|---:|---:|---:|
 | import 环 | 5 | 2 | 不允许反弹 | 0 |
 | 延迟 import | 583 | 621 | 38 | 逐步降低；仅移除无必要的延迟依赖 |
-| 裸 SQL 模块 | 135 | 140 | 5 | ≤60 |
+| 裸 SQL 模块 | 135 | 141 | 6 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
 | 跨模块私有属性访问 | 202 | 202 | 0 | 0 |
 | 跨域 import 边 | 624 | 666 | 42 | 分阶段降低 |
@@ -24,6 +24,7 @@
 
 ## 本次切片
 
+- 2026-10-28（A5 任务生命周期）：`paper_jobs` / `paper_job_runs` 的 **9 处**状态写入（认领探测、运行中过期判失败、首次 INSERT、重试认领 CAS、心跳续期 CAS、完成 CAS、失败 CAS、启动回收、历史清理）从 `paper_trading` 收进新 owner `paper_job_lifecycle`，语句只有一份，`paper_trading` 里对这两张表的 INSERT/UPDATE/DELETE **归零**（`test_paper_job_lifecycle` 用 AST 扫描 + 常量渲染做机械守卫，含空结果非空性）。行为不变：owner 不 commit、不做"该不该重试"的业务判断，CAS 谓词（`owner_key` + `fencing_token` + `status='running'`）逐字保留。裸 SQL 模块 140 → 141（SQL 换了归属，模块数多一个，额度 +1 已登记）；主文件 `paper_trading.py` 少 84 行。
 - 2026-10-27（§13.4 复用资源测量）：`backend/tools/modularity_reuse_bench.py` 把「同轮输入复用」的净效果做成可重跑证据 ——
   三个消费者、5000 只证券、合成输入、不联网不碰生产库。分开取数时 universe/finance/fundamental 各 **3** 次；
   共用一轮输入后各 **1** 次。本机（Windows / Python 3.14.5 / 中位数口径单次运行）：

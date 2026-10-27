@@ -49,6 +49,7 @@ def _get_se():
 
 import paper_storage as PST
 import paper_timing as PTM
+import paper_job_lifecycle as PJL
 import paper_order_execution_authority as POEA
 import paper_lot_ledger as PLL
 import paper_position_read_model as PPRM
@@ -1542,29 +1543,10 @@ def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     # 把 retry_count / history_refresh / factor_refresh / timing 一并抹掉，
     # 于是"进程超时"这一类失败事后无法和"日线覆盖不足"区分。``elapsed_seconds``
     # 同时给出这次运行到被回收为止的时长（超时类的唯一可观测口径）。
-    recovered_detail = (
-        "json_patch(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END,"
-        " json_object('error','任务进程中断或超时，系统已自动回收',"
-        " 'recovered_at',?,"
-        " 'recovered_from_running',1,"
-        " 'failure_kind','interrupted',"
-        " 'elapsed_seconds',CAST(ROUND((julianday(?) - julianday(started_at)) * 86400) AS INTEGER)))"
-    )
-    conn.execute(
-        f"""UPDATE paper_job_runs
-           SET status='failed',detail={recovered_detail},finished_at=?
-           WHERE status='running'
-             AND ((expires_at IS NOT NULL AND expires_at<?)
-                  OR (expires_at IS NULL AND started_at<?))""",
-        (now, now, now, now, intraday_cutoff),
-    )
-    conn.execute(
-        f"""UPDATE paper_jobs
-           SET status='failed',detail={recovered_detail},finished_at=?
-           WHERE status='running'
-             AND ((expires_at IS NOT NULL AND expires_at<?)
-                  OR (expires_at IS NULL AND started_at<?))""",
-        (now, now, now, now, job_cutoff),
+    # 两条 UPDATE 语句（intraday / daily）与那份 detail 表达式都归
+    # ``paper_job_lifecycle``，本层只提供时间窗口。
+    PJL.recover_abandoned(
+        conn, now=now, intraday_cutoff=intraday_cutoff, job_cutoff=job_cutoff,
     )
     # Never delete a live lease merely because a new process started.
     conn.execute("DELETE FROM paper_runtime_locks WHERE expires_at<?", (now,))
@@ -13752,19 +13734,10 @@ def _cleanup_stale_data():
         # intraday 分钟级运行记录无界增长：每个交易日约 220 个 key，单行
         # detail JSON 数十 KB。保留 30 天供审计/复盘，超期直接删除（这些
         # 记录只服务于“当日幂等”，历史价值有限；周期归档另有全量清理）。
-        cursor = conn.execute("""
-            DELETE FROM paper_job_runs
-            WHERE market_date < date('now', '-30 days')
-        """)
-        cleaned["job_runs_purged"] = cursor.rowcount
-
         # 同步收紧 paper_jobs 的历史深度：保留 180 天，防止多年累积后
-        # dashboard 的 ORDER BY 查询变慢。
-        cursor = conn.execute("""
-            DELETE FROM paper_jobs
-            WHERE market_date < date('now', '-180 days')
-        """)
-        cleaned["jobs_purged"] = cursor.rowcount
+        # dashboard 的 ORDER BY 查询变慢。两条 DELETE 与保留窗口都归
+        # ``paper_job_lifecycle``。
+        cleaned.update(PJL.prune_jobs(conn))
 
         # 记录清理日志
         _audit(conn, None, "cleanup_stale_data", _json(cleaned))
@@ -13889,10 +13862,8 @@ def _run_slot_impl(slot, day, force=False):
     with _db(immediate=True, hot_path=hot_path) as conn:
         new_run = True
         prior_detail = {}
-        if intraday_key:
-            exists = conn.execute("SELECT * FROM paper_job_runs WHERE run_key=?", (intraday_key,)).fetchone()
-        else:
-            exists = conn.execute("SELECT * FROM paper_jobs WHERE slot=? AND market_date=?", (slot, day.isoformat())).fetchone()
+        exists = PJL.read_job(conn, slot=slot, market_date=day.isoformat(),
+                           run_key=intraday_key)
         if exists:
             prior_detail = _loads(exists["detail"], {}) or {}
             if exists["status"] == "running":
@@ -13917,21 +13888,12 @@ def _run_slot_impl(slot, day, force=False):
                         "elapsed_seconds": _stamp_elapsed_seconds(exists["started_at"]),
                         "retry_count": int(prior_detail.get("retry_count") or 0),
                     }
-                    if intraday_key:
-                        conn.execute(
-                            "UPDATE paper_job_runs SET status='failed',detail=?,finished_at=? WHERE run_key=?",
-                            (_json(prior_detail), _now(), intraday_key),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE paper_jobs SET status='failed',detail=?,finished_at=? WHERE slot=? AND market_date=?",
-                            (_json(prior_detail), _now(), slot, day.isoformat()),
-                        )
-                    exists = conn.execute(
-                        "SELECT * FROM paper_job_runs WHERE run_key=?" if intraday_key
-                        else "SELECT * FROM paper_jobs WHERE slot=? AND market_date=?",
-                        (intraday_key,) if intraday_key else (slot, day.isoformat()),
-                    ).fetchone()
+                    PJL.mark_interrupted(
+                        conn, slot=slot, market_date=day.isoformat(),
+                        run_key=intraday_key, detail=_json(prior_detail), now=_now(),
+                    )
+                    exists = PJL.read_job(conn, slot=slot, market_date=day.isoformat(),
+                                       run_key=intraday_key)
             retry_count = int(prior_detail.get("retry_count") or 0)
             retryable = exists["status"] in {"failed", "interrupted"}
             # 失败任务由同一时段的兜底计划自动重试两次；成功任务仍严格幂等。
@@ -13971,41 +13933,18 @@ def _run_slot_impl(slot, day, force=False):
         fencing_token = int(lease_row["fencing_token"] or 0)
         runtime_lock_acquired = True
         try:
-            if intraday_key and new_run:
-                conn.execute(
-                    """INSERT INTO paper_job_runs(
-                           run_key,slot,market_date,status,started_at,owner_key,heartbeat_at,expires_at,fencing_token
-                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (intraday_key, slot, day.isoformat(), "running", _now(), owner, _now(), expires_at, fencing_token),
+            if new_run:
+                PJL.claim_job(
+                    conn, slot=slot, market_date=day.isoformat(),
+                    run_key=intraday_key, owner=owner, expires_at=expires_at,
+                    fencing_token=fencing_token, now=_now(),
                 )
-            elif intraday_key:
-                cursor = conn.execute(
-                    """UPDATE paper_job_runs
-                       SET status='running',detail=?,started_at=?,finished_at=NULL,
-                           owner_key=?,heartbeat_at=?,expires_at=?,fencing_token=?
-                       WHERE run_key=? AND status IN ('failed','interrupted')""",
-                    (_json(retry_detail), _now(), owner, _now(), expires_at, fencing_token, intraday_key),
-                )
-                if cursor.rowcount != 1:
-                    _release_runtime_lease(conn, runtime_lock_key, owner, fencing_token)
-                    runtime_lock_acquired = False
-                    return {"status": "already_done", "slot": slot, "date": day.isoformat(),
-                            "detail": "重试竞争中任务已被其他实例领取"}
-            elif not intraday_key and new_run:
-                conn.execute(
-                    """INSERT INTO paper_jobs(
-                           slot,market_date,status,started_at,owner_key,heartbeat_at,expires_at,fencing_token
-                       ) VALUES(?,?,?,?,?,?,?,?)""",
-                    (slot, day.isoformat(), "running", _now(), owner, _now(), expires_at, fencing_token),
-                )
-            elif not intraday_key:
-                cursor = conn.execute(
-                    """UPDATE paper_jobs
-                       SET status='running',detail=?,started_at=?,finished_at=NULL,
-                           owner_key=?,heartbeat_at=?,expires_at=?,fencing_token=?
-                       WHERE slot=? AND market_date=? AND status IN ('failed','interrupted')""",
-                    (_json(retry_detail), _now(), owner, _now(), expires_at, fencing_token,
-                     slot, day.isoformat()),
+            else:
+                cursor = PJL.reclaim_job(
+                    conn, slot=slot, market_date=day.isoformat(),
+                    run_key=intraday_key, owner=owner, expires_at=expires_at,
+                    fencing_token=fencing_token, detail=_json(retry_detail),
+                    now=_now(),
                 )
                 if cursor.rowcount != 1:
                     _release_runtime_lease(conn, runtime_lock_key, owner, fencing_token)
@@ -14040,18 +13979,12 @@ def _run_slot_impl(slot, day, force=False):
                     if lock_cursor.rowcount != 1:
                         lease_lost_event.set()
                         return
-                    if intraday_key:
-                        job_cursor = renew_conn.execute(
-                            "UPDATE paper_job_runs SET heartbeat_at=?,expires_at=?,fencing_token=? "
-                            "WHERE run_key=? AND owner_key=? AND fencing_token=? AND status='running'",
-                            (heartbeat_at, expires, fencing_token, intraday_key, owner, fencing_token),
-                        )
-                    else:
-                        job_cursor = renew_conn.execute(
-                            "UPDATE paper_jobs SET heartbeat_at=?,expires_at=?,fencing_token=? "
-                            "WHERE slot=? AND market_date=? AND owner_key=? AND fencing_token=? AND status='running'",
-                            (heartbeat_at, expires, slot, day.isoformat(), owner, fencing_token),
-                        )
+                    job_cursor = PJL.renew_lease(
+                        renew_conn, slot=slot, market_date=day.isoformat(),
+                        run_key=intraday_key, owner=owner,
+                        fencing_token=fencing_token, heartbeat_at=heartbeat_at,
+                        expires_at=expires,
+                    )
                     if job_cursor.rowcount != 1:
                         lease_lost_event.set()
                         return
@@ -14111,18 +14044,11 @@ def _run_slot_impl(slot, day, force=False):
         detail["timing"] = PTM.snapshot("before_job_finalize")
         with _db(immediate=True, hot_path=hot_path) as conn:
             _assert_active_lease(conn, "job completion")
-            if intraday_key:
-                cursor = conn.execute(
-                    "UPDATE paper_job_runs SET status=?,detail=?,finished_at=? "
-                    "WHERE run_key=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (completion_status, _json(detail), _now(), intraday_key, owner, fencing_token),
-                )
-            else:
-                cursor = conn.execute(
-                    "UPDATE paper_jobs SET status=?,detail=?,finished_at=? "
-                    "WHERE slot=? AND market_date=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (completion_status, _json(detail), _now(), slot, day.isoformat(), owner, fencing_token),
-                )
+            cursor = PJL.complete_job(
+                conn, slot=slot, market_date=day.isoformat(),
+                run_key=intraday_key, owner=owner, fencing_token=fencing_token,
+                status=completion_status, detail=_json(detail), now=_now(),
+            )
             if cursor.rowcount != 1:
                 raise RuntimeError("paper lease lost: completion CAS")
         return {**detail, "status": completion_status}
@@ -14130,20 +14056,13 @@ def _run_slot_impl(slot, day, force=False):
         with _db(immediate=True, hot_path=hot_path) as conn:
             if _lease_lost(exc) or lease_lost_event.is_set():
                 raise
-            if intraday_key:
-                conn.execute(
-                    "UPDATE paper_job_runs SET status='failed',detail=?,finished_at=? "
-                    "WHERE run_key=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json({"error": str(exc), "retry_count": retry_count,
-                            "timing": PTM.snapshot("before_failure_finalize")}), _now(), intraday_key, owner, fencing_token),
-                )
-            else:
-                conn.execute(
-                    "UPDATE paper_jobs SET status='failed',detail=?,finished_at=? "
-                    "WHERE slot=? AND market_date=? AND owner_key=? AND fencing_token=? AND status='running'",
-                    (_json({"error": str(exc), "retry_count": retry_count,
-                            "timing": PTM.snapshot("before_failure_finalize")}), _now(), slot, day.isoformat(), owner, fencing_token),
-                )
+            PJL.fail_job(
+                conn, slot=slot, market_date=day.isoformat(),
+                run_key=intraday_key, owner=owner, fencing_token=fencing_token,
+                detail=_json({"error": str(exc), "retry_count": retry_count,
+                              "timing": PTM.snapshot("before_failure_finalize")}),
+                now=_now(),
+            )
         raise
     finally:
         if runtime_lock_acquired:
