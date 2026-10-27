@@ -10,7 +10,7 @@ import pandas as pd
 import market_data_contract as C
 import market_data_service as S
 import close_snapshot_runner as R
-import main as M
+import selection_application as M
 import paper_trading as P
 
 ZONE = dt.timezone(dt.timedelta(hours=8))

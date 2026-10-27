@@ -992,8 +992,9 @@ class LiveSnapshotCutoffTests(PointInTimeBase):
 
         import main as M
         import paper_trading as PT
+        import selection_application as selection
 
-        for module, name in ((M, "_select_uncached"), (M, "scanner"),
+        for module, name in ((selection, "_select_uncached"), (M, "scanner"),
                              (PT, "_candidate_rows")):
             source = inspect.getsource(getattr(module, name))
             self.assertIn("snapshot_asof=F.live_snapshot_asof()", source,

@@ -6,7 +6,7 @@ import unittest
 from contextlib import ExitStack
 from unittest import mock
 
-import main as M
+import selection_application as M
 
 Thread = threading.Thread
 FINANCE = {"data": {"600000": {"net_profit": 123., "report_date": "2026-06-30",
