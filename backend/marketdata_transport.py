@@ -174,11 +174,15 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
                               encoding=encoding, retries=retries)
     except requests.RequestException as exc:
         if isinstance(exc, requests.HTTPError):
-            # 拿到 HTTP 响应说明主机**可达**，必须清零连续失败计数，否则
-            # "超时/超时/500/超时..." 这种穿插会把 6 次**非连续**超时累加成
-            # 一次短路，与"连续失败才触发"的策略自相矛盾，并且会误伤同一
-            # 主机上所有正常端点。
-            _transport_breaker_note(host, ok=True)
+            # 4xx = 我们的请求有问题，主机本身可达 → 清零连续计数。
+            # 5xx = 主机侧异常 → 计入失败（生产实测 push2 的 trends2 会快速返回
+            # 502，而同主机的 details/ulist 在超时；若把 5xx 也算"可达"，两者
+            # 交替出现会让短路永远不触发）。
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status is not None and 400 <= int(status) < 500:
+                _transport_breaker_note(host, ok=True)
+            else:
+                _transport_breaker_note(host, ok=False)
         else:
             _transport_breaker_note(host, ok=False)
         raise
