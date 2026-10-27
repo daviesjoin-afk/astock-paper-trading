@@ -5291,7 +5291,7 @@ def _new_entry_price_gate(account, pick, quote=None):
     return True, None
 
 
-def _attach_candidate_financial_disclosure(picks, asof_date):
+def _attach_candidate_financial_disclosure(picks, asof_date, *, shared_inputs=None):
     """Attach point-in-time disclosure evidence to the *actual* candidates.
 
     The finance endpoint provides report periods but not publication times.  We
@@ -5315,7 +5315,11 @@ def _attach_candidate_financial_disclosure(picks, asof_date):
         summary["reason"] = "披露时间模块不可用；保留财报数值但不作为点时已证实证据"
         return picks, summary
     try:
-        records = DT.fetch_disclosure_timeline(codes, asof=asof_date)
+        if shared_inputs is None:
+            records = DT.fetch_disclosure_timeline(codes, asof=asof_date)
+        else:
+            records = shared_inputs.disclosures(
+                codes, asof=asof_date, loader=DT.fetch_disclosure_timeline)
     except Exception as exc:
         summary["reason"] = f"披露时间源本轮不可用：{type(exc).__name__}"
         return picks, summary
@@ -6197,7 +6201,8 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             _ignition_shadow_store(shadow_rows)
     picks = entry_screened
     with PTM.phase("candidate.disclosures"):
-        picks, financial_evidence = _attach_candidate_financial_disclosure(picks, asof_date)
+        picks, financial_evidence = _attach_candidate_financial_disclosure(
+            picks, asof_date, shared_inputs=shared_inputs)
     if style == "pullback" and spec.get("selection_mode") != "dsl":
         # PR-35：声明式策略的候选不经内置风格池（其字段语义来自内置
         # 模型的 pick 负载）；DSL 门在选股层已判定，直接进入执行审批。
