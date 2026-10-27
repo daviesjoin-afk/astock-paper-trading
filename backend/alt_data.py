@@ -282,8 +282,13 @@ def micro_breaker_snapshot():
         }
 
 
-def _micro_get(url, params, timeout=4):
-    """带源级短路的数据获取；短路时立即失败，不再消耗超时预算。"""
+def _micro_get(url, params, timeout=2):
+    """带源级短路的数据获取；短路时立即失败，不再消耗超时预算。
+
+    单次预算 = 主机数 × timeout。2026-10-27 由 4 秒降到 2 秒（3 主机 → 6 秒
+    上限，原为 12 秒）：部署后实测 18 次调用里仍有 5~10 次失败、累计 56~59 秒，
+    而这段微结构证据是 shadow-grade、只进软分，不值得为它保留 12 秒最坏等待。
+    """
     source = _micro_source_key(url)
     remaining = _micro_breaker_remaining(source)
     if remaining is not None:
@@ -542,11 +547,11 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
     return result
 
 
-def market_microstructures(codes, asof_day=None, max_workers=8):
+def market_microstructures(codes, asof_day=None, max_workers=12):
     """Fetch only the small live-review set concurrently.
 
-    并发度取 8（原 5）：候选集通常十余只，而每只内部是三个串行的短请求，
-    提高并发能把批次数从 3 降到 2，且这些请求是纯 IO 等待，不会抢 CPU。
+    并发度 5 → 8 → 12：候选集通常十余到二十只，每只内部是三个串行短请求；
+    这些是纯 IO 等待，提高并发把批次数压到 1~2，不会抢 CPU。
     """
     unique = list(dict.fromkeys(str(code or "").zfill(6) for code in (codes or []) if code))
     output = {}
