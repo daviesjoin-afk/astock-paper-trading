@@ -444,21 +444,24 @@ def latest_opinion(conn, *, kind: str, strategy_id: str, exact_identity: dict,
         params = tuple(actions)
     else:
         sql = (f"SELECT * FROM ai_recommendations WHERE strategy_id=? AND action IN ({marks})"
-               " ORDER BY created_at DESC LIMIT 1")
+               " ORDER BY created_at DESC, rowid DESC")
         params = (str(strategy_id), *actions)
-    row = conn.execute(sql, params).fetchone()
-    if row is None:
-        return None
-    try:
-        payload = json.loads(row["payload"] or "{}")
-        identity = json.loads(row["exact_identity"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if code is not None and payload.get("code") not in (None, code):
-        return None
-    return Opinion(recommendation_id=row["recommendation_id"], action=row["action"],
-                   valid_until=row["valid_until"], exact_identity=identity,
-                   reason=row["reason"])
+    # 股票意见与全策略意见按时间竞争；其他股票的意见不遮蔽本股票。
+    # 命中范围后仍由 compose 校验身份/期限，不回退到旧的有效意见。
+    for row in conn.execute(sql, params):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            identity = json.loads(row["exact_identity"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not isinstance(identity, dict):
+            continue
+        if code is not None and payload.get("code") not in (None, code):
+            continue
+        return Opinion(recommendation_id=row["recommendation_id"], action=row["action"],
+                       valid_until=row["valid_until"], exact_identity=identity,
+                       reason=row["reason"])
+    return None
 
 
 def consume_safe(ledger_conn, *, kind: str, decision_id: str, strategy_id: str,

@@ -56,13 +56,17 @@ def mark_complete(conn, experiment_id) -> bool:
         (STATUS_COMPLETE, str(experiment_id), STATUS_RUNNING)).rowcount == 1
 
 
-def _frozen_sessions(frozen_sessions):
+def validate_frozen_sessions(frozen_sessions):
     """事件冻结的会话是**唯一**允许的行情来源；空集合同样拒绝。"""
     if not isinstance(frozen_sessions, (list, tuple)) or not frozen_sessions:
         raise ValueError(R_FROZEN_SESSIONS_REQUIRED)
     sessions = []
     for item in frozen_sessions:
-        sessions.append(NPR.session_from_payload(dict(item or {})))
+        session = NPR.session_from_payload(dict(item or {}))
+        table = session.factor_table
+        if table is None or not hasattr(table, "index") or table.empty:
+            raise ValueError("frozen_factor_table_required")
+        sessions.append(session)
     return sessions
 
 
@@ -89,7 +93,7 @@ def create_and_enqueue(conn, arguments, *, task_id=None, frozen_sessions=None) -
 
     if args.get("sessions") not in (None, (), []):
         raise ValueError(R_MODEL_SUPPLIED_SESSIONS)
-    sessions = _frozen_sessions(frozen_sessions)
+    sessions = validate_frozen_sessions(frozen_sessions)
     environment = NPR.ReplayEnvironment(sessions=tuple(sessions))
 
     champion, challenger = NPR.sides_from_manifest(

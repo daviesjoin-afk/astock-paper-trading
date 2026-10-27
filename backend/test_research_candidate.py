@@ -199,6 +199,51 @@ class CompletionTests(CandidateTestCase):
 
 
 class EnvironmentFixtureTests(unittest.TestCase):
+    def test_historical_selection_cannot_be_mislabeled_as_a_contemporaneous_snapshot(self):
+        from unittest import mock
+        import datetime as dt
+
+        snapshot = {}
+        with mock.patch.object(RO, "_capture_time", return_value="2026-10-21T15:05:00+08:00"):
+            RO.capture_selection_snapshot(snapshot, table=factor_table(),
+                live_map={"600001": {"price": 10.0}}, first_board_codes=["600001"],
+                asof_date=dt.date.fromisoformat(DAYS[0]), selection_model="first_board_relay",
+                selection_overlay={})
+        self.assertIn("not_contemporaneous_selection_snapshot", snapshot["reason"])
+        self.assertNotIn("frozen_sessions", snapshot)
+
+    def test_market_event_preserves_actual_snapshot_time(self):
+        event = RO.market_event("tq_breakout", session_date=DAYS[0], environment_ref={},
+                                observed_at=f"{DAYS[0]}T15:05:00+08:00")
+        self.assertEqual(event["observed_at"], f"{DAYS[0]}T15:05:00+08:00")
+
+    def test_selection_snapshot_freezes_factors_and_first_board_membership(self):
+        import native_paired_replay as NPR
+
+        table = factor_table()
+        sessions = RO.session_from_selection(
+            table, quotes=[{"code": "600001", "price": 10.0, "prev_close": 9.8}],
+            first_board_codes=["600001"], session_date=DAYS[0])
+        table.loc["600001", "flow"] = -99.0
+        restored = NPR.session_from_payload(sessions[0])
+        self.assertEqual(restored.factor_table.loc["600001", "flow"], 1.0)
+        self.assertEqual(restored.first_board_codes, ("600001",))
+        with AQ.connect(":memory:") as conn:
+            created = RC.create_and_enqueue(conn, {"variant": RC.baseline() + 0.03},
+                                            frozen_sessions=sessions)
+            AQ.commit(conn)
+            RW.run_once_pass(conn, max_tasks=5)
+            self.assertTrue(RC.result(conn, created["experiment_id"])["complete"])
+
+    def test_missing_factors_are_refused_before_an_experiment_is_created(self):
+        sessions = RO.session_from_quotes([{"code": "600001", "price": 10.0}],
+                                           session_date=DAYS[0])
+        with AQ.connect(":memory:") as conn:
+            with self.assertRaisesRegex(ValueError, "frozen_factor_table_required"):
+                RC.create_and_enqueue(conn, {"variant": RC.baseline() + 0.03},
+                                      frozen_sessions=sessions)
+            self.assertEqual(RW.known_experiments(conn), [])
+
     def test_quotes_without_a_price_are_skipped_instead_of_fabricated(self):
         sessions = RO.session_from_quotes(
             [{"code": "600001", "price": None}, {"code": "600002", "price": 5.0}],

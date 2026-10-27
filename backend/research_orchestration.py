@@ -2,6 +2,8 @@
 """F5 生产编排：事件入库、worker 接续、配置 owner 与只读实验结果。"""
 from __future__ import annotations
 
+import datetime as dt
+
 
 def config_connection():
     """模型配置只来自配置 owner，不从研究队列库复制。
@@ -127,6 +129,43 @@ def session_from_quotes(quotes, *, session_date: str, decision_at: str | None = 
     }])
 
 
+def session_from_selection(table, *, quotes, first_board_codes, session_date,
+                           decision_at=None) -> list[dict]:
+    """冻结实际选股表和完整候选证券范围，不从已选股票反推研究输入。"""
+    if table is None or not hasattr(table, "index") or table.empty:
+        raise ValueError("frozen_factor_table_required")
+    codes = {str(code) for code in table.index}
+    rows = [dict(row) for row in quotes if str(row.get("code")) in codes]
+    if {str(row.get("code")) for row in rows if row.get("price") is not None} != codes:
+        raise ValueError("frozen_selection_quotes_incomplete")
+    return session_from_quotes(
+        rows, session_date=session_date, decision_at=decision_at,
+        first_board_codes=first_board_codes, factor_table=table)
+
+
+def _capture_time():
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+def capture_selection_snapshot(snapshot, *, table, live_map, first_board_codes,
+                               asof_date, selection_model, selection_overlay):
+    """把选股输入冻结到独立容器；研究失败不影响调用方的规则决策。"""
+    try:
+        if (selection_model != "first_board_relay"
+                or selection_overlay.get("weights") or selection_overlay.get("conditions")):
+            raise ValueError("research_requires_default_selection_parameters")
+        day = asof_date.isoformat()
+        captured_at = _capture_time()
+        if captured_at[:10] != day:
+            raise ValueError("not_contemporaneous_selection_snapshot")
+        snapshot["frozen_sessions"] = session_from_selection(
+            table, quotes=[dict(row, code=str(code)) for code, row in live_map.items()],
+            first_board_codes=first_board_codes, session_date=day,
+            decision_at=captured_at)
+    except Exception as exc:  # noqa: BLE001 - 研究不得阻断选股
+        snapshot["reason"] = f"frozen_selection_unavailable:{type(exc).__name__}:{exc}"
+
+
 def fill_event(order) -> dict:
     return {"kind": "fill", "strategy_id": order.get("strategy_id") or order.get("account_id"),
             "code": order.get("code"), "order_id": order.get("id"),
@@ -137,9 +176,9 @@ def fill_event(order) -> dict:
 
 
 def market_event(strategy_id, *, session_date, environment_ref, exact_identity=None,
-                 frozen_sessions=None) -> dict:
+                 frozen_sessions=None, observed_at=None) -> dict:
     return {"kind": "market", "strategy_id": strategy_id,
-            "observed_at": f"{session_date}T15:00:00+08:00",
+            "observed_at": observed_at or f"{session_date}T15:00:00+08:00",
             "session_date": session_date, "environment_ref": environment_ref,
             "exact_identity": exact_identity,
             "frozen_sessions": list(frozen_sessions or ())}

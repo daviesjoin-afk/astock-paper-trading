@@ -87,6 +87,15 @@ class PipelineTestCase(unittest.TestCase):
 
 
 class MarketEventTests(PipelineTestCase):
+    def test_missing_factor_table_records_event_without_creating_broken_task(self):
+        sessions = frozen_sessions()
+        sessions[0]["factor_table"] = None
+        result = self.submit(market_event(frozen_sessions=sessions))
+        self.assertTrue(result["created"])
+        self.assertFalse(result["task_created"])
+        self.assertEqual(result["task_blocked_reason"], "frozen_factor_table_required")
+        self.assertEqual(self.tasks(), [])
+
     def test_a_market_event_becomes_one_durable_research_task(self):
         result = self.submit(market_event())
         self.assertEqual(result["status"], "recorded")
@@ -325,6 +334,51 @@ class EndToEndLoopTests(PipelineTestCase):
             AQ.commit(conn)
         return results
 
+    def _complete_waiting_question(self):
+        self.submit(market_event())
+        first = self._run_research(self._provider())
+        self.assertEqual(first[0]["status"], AQ.STATUS_WAITING_DATA)
+        with AQ.connect(self.path) as conn:
+            RW.run_once_pass(conn, max_tasks=20, worker_id="experiment")
+            AQ.commit(conn)
+
+    def test_woken_model_sees_committed_results_without_requesting_a_second_read(self):
+        import json
+
+        self._complete_waiting_question()
+        seen = []
+
+        def resumed(system_prompt, user_prompt):
+            observations = [row["result"] for row in json.loads(user_prompt)["tool_history"]
+                            if row.get("name") == AGENT_TOOL_RESULT]
+            self.assertTrue(observations[-1]["complete"])
+            self.assertEqual(observations[-1]["sessions_published"], len(DAYS))
+            seen.append(observations[-1]["receipt_count"])
+            return json.dumps({"action": "eliminate", "reason": "完整回执没有证明优势"})
+
+        result = self._run_research(resumed)
+        self.assertEqual(result[0]["status"], AQ.STATUS_REJECTED)
+        self.assertIn("recommendation_id", result[0]["result"])
+        self.assertEqual(seen, [2 * len(DAYS)])
+
+    def test_waiting_again_for_a_completed_experiment_is_terminal_not_permanently_waiting(self):
+        import json
+
+        self._complete_waiting_question()
+        result = self._run_research(lambda *_: json.dumps({
+            "action": "wait_for_data", "reason": "仍然等待", "wait_for": "experiment_complete"}))
+        self.assertEqual(result[0]["status"], AQ.STATUS_REJECTED)
+        self.assertEqual(result[0]["blocking_reason"], "cannot_wait_for_completed_experiment")
+
+    def test_completed_experiment_can_still_wait_for_new_market_labels(self):
+        import json
+
+        self._complete_waiting_question()
+        result = self._run_research(lambda *_: json.dumps({
+            "action": "wait_for_data", "reason": "需要新的收益标签", "wait_for": "new_label"}))
+        self.assertEqual(result[0]["status"], AQ.STATUS_WAITING_DATA)
+        self.assertEqual(result[0]["payload"]["wait_subscription"]["kind"], "label")
+
     def test_the_loop_publishes_advisory_without_adopting_anything(self):
         self.submit(market_event())
         provider = self._provider()
@@ -348,6 +402,20 @@ class EndToEndLoopTests(PipelineTestCase):
         self.assertEqual(stored[0]["action"], "prefer_entry")
         self.assertEqual(stored[0]["payload"]["mode"], "ADVISORY")
         self.assertTrue(stored[0]["payload"]["experiment_ids"])
+
+    def test_all_cash_replay_cannot_be_used_as_trade_advice_evidence(self):
+        sessions = frozen_sessions()
+        for session in sessions:
+            session["quotes"][0]["prev_close"] = None
+        self.submit(market_event(frozen_sessions=sessions))
+        provider = self._provider()
+        self.assertEqual(self._run_research(provider)[0]["status"], AQ.STATUS_WAITING_DATA)
+        with AQ.connect(self.path) as conn:
+            RW.run_once_pass(conn, max_tasks=20, worker_id="experiment")
+            AQ.commit(conn)
+        result = self._run_research(provider)[0]
+        self.assertEqual(result["status"], AQ.STATUS_REJECTED)
+        self.assertEqual(result["blocking_reason"], "advisory_requires_observable_fills")
 
     def test_consuming_the_published_opinion_never_moves_the_rule_decision(self):
         import sqlite3

@@ -111,6 +111,29 @@ class DecisionParsingTests(unittest.TestCase):
 
 
 class LoopTests(AgentTestCase):
+    def test_model_receives_target_identity_and_explicit_tool_contracts(self):
+        target = {"strategy_id": "tq_breakout", "field": "flow", "baseline": 0.25,
+                  "min": 0.05, "max": 0.45, "max_delta": 0.05}
+        seen = []
+
+        def provider(system_prompt, user_prompt):
+            body = json.loads(user_prompt)
+            seen.append(body)
+            self.assertEqual(body["research_target"], target)
+            self.assertEqual(body["exact_identity"], IDENTITY)
+            contracts = {row["name"]: row for row in body["tools"]}
+            self.assertEqual(set(contracts), set(AGENT.TOOL_NAMES))
+            self.assertEqual(contracts[AGENT.TOOL_CREATE_FLOW_CANDIDATE]["parameters"]["required"],
+                             ["variant"])
+            self.assertIn('"name":"create_flow_candidate"', system_prompt)
+            return json.dumps(decision())
+
+        with AQ.connect(self.path) as conn:
+            task, _ = self.enqueue(conn, payload_extra={"research_target": target})
+            self.run_task(conn, provider)
+            self.assertEqual(len(STORE.list_for_task(conn, task["task_id"])), 1)
+        self.assertEqual(len(seen), 1)
+
     def test_a_tool_round_trip_ends_in_a_persisted_recommendation(self):
         provider = scripted(
             decision(action="continue", reason="先看清单",

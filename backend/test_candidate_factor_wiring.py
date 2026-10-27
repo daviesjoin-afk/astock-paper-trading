@@ -8,6 +8,7 @@ from unittest import mock
 import pandas as pd
 
 import paper_trading as PT
+import research_orchestration as RO
 import test_factor_calibration_v2 as Fixture
 
 
@@ -17,7 +18,7 @@ class _SelectionReached(Exception):
 
 class CandidateFactorWiringTests(unittest.TestCase):
     def capture(self, account, *, live_day=None, hot_rows=(), source_error=None,
-                run_selector=False, near_tie=False):
+                run_selector=False, near_tie=False, research_snapshot=None):
         day = dt.date(2026, 10, 20)
         price, fund = Fixture.FactorTableTests._frames()
         if near_tie:
@@ -68,6 +69,8 @@ class CandidateFactorWiringTests(unittest.TestCase):
             selector = stack.enter_context(
                 mock.patch.object(PT.S, "run_strategy", side_effect=select)
             )
+            stack.enter_context(mock.patch.object(RO, "_capture_time",
+                                                  return_value="2026-10-20T15:05:00+08:00"))
             with self.assertRaises(_SelectionReached):
                 live = None if live_day is None else [
                     {"code": code, "price": float(price.loc[code, "price"]),
@@ -77,7 +80,8 @@ class CandidateFactorWiringTests(unittest.TestCase):
                     for code in price.index
                 ]
                 PT._candidate_rows(account, day, {"light": "green"},
-                                   live_universe=live, live_asof_date=live_day)
+                                   live_universe=live, live_asof_date=live_day,
+                                   research_snapshot=research_snapshot)
             builder.assert_called_once()
             selector.assert_called_once()
             captured["source_calls"] = source.call_count
@@ -219,6 +223,38 @@ class CandidateFactorWiringTests(unittest.TestCase):
             self.assertEqual(new[code]["score_components"]["weights"], old[code]["score_components"]["weights"])
         for key in ("score", "score_components", "factor_snapshot", "reasons"):
             self.assertEqual(new["000001"][key], old["000001"][key])
+
+    def test_research_uses_the_real_selection_table_and_all_quotes(self):
+        import native_paired_replay as NPR
+
+        snapshot = {}
+        captured = self.capture({"id": "tq_breakout"}, live_day="2026-10-20",
+                                research_snapshot=snapshot)
+        session = NPR.session_from_payload(snapshot["frozen_sessions"][0])
+        self.assertEqual(dt.datetime.fromisoformat(session.decision_at),
+                         dt.datetime.fromisoformat("2026-10-20T15:05:00+08:00"))
+        pd.testing.assert_frame_equal(session.factor_table, captured["selection_table"],
+                                      check_dtype=False)
+        self.assertEqual(set(session.quote_map()), set(captured["selection_table"].index))
+        self.assertNotIn("reason", snapshot)
+
+    def test_missing_live_quotes_only_skips_research_not_selection(self):
+        snapshot = {}
+        captured = self.capture({"id": "tq_breakout"}, research_snapshot=snapshot)
+        self.assertIn("frozen_selection_quotes_incomplete", snapshot["reason"])
+        self.assertNotIn("frozen_sessions", snapshot)
+        self.assertEqual(captured["model"], "first_board_relay")
+
+    def test_an_active_overlay_is_not_misrepresented_as_the_default_research_baseline(self):
+        snapshot = {}
+        overlay = {"model_family": "first_board_relay",
+                   "weights": dict(PT.S.PAPER_WEIGHTS["first_board_relay"])}
+        with mock.patch.object(PT, "_adaptive_selection", return_value=overlay):
+            captured = self.capture({"id": "tq_breakout"}, live_day="2026-10-20",
+                                    research_snapshot=snapshot)
+        self.assertIn("research_requires_default_selection_parameters", snapshot["reason"])
+        self.assertEqual(captured["weights"], overlay["weights"])
+        self.assertNotIn("frozen_sessions", snapshot)
 
 
 if __name__ == "__main__":
