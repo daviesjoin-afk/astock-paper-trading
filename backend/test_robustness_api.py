@@ -82,19 +82,35 @@ class RobustnessApiTests(unittest.TestCase):
         self.assertNotIn(os.path.abspath(self.path), API.canonical_robustness_reports(1).__repr__())
 
     def test_persistence_errors_are_mapped_before_value_error(self):
+        """持久化冲突必须先于通用 ValueError 被捕获 —— 否则 409 会退化成 422。
+
+        流程搬到 ``experiment_validation_service`` 之后，这条顺序成立在两处：
+        服务里 ``RobustnessPersistenceError`` 必须早于 ``(TypeError, ValueError,
+        KeyError)``；路由里 ``ExperimentRobustnessConflict`` 必须早于
+        ``ExperimentValidationRequestInvalid``。两处都断言，缺一处就等于把
+        状态码分类交给 catch 的书写顺序去赌。
+        """
+        service = Path(os.path.join(
+            BACKEND, "experiment_validation_service.py")).read_text(encoding="utf-8")
+        # 只看稳健性那一段：验证流程里也有一个同样的 ValueError 兜底，
+        # 全局 index 会把两段混在一起比较。
+        robustness = service[service.index("def create_robustness_report("):]
+        self.assertLess(robustness.index("except RREP.RobustnessPersistenceError"),
+                        robustness.index("except (TypeError, ValueError, KeyError)"))
         source = Path(os.path.join(BACKEND, "api_adaptive.py")).read_text(encoding="utf-8")
         route_marker = "\n\n" + "@router" + '.get("/experiments/runs/{run_id}/robustness")'
         handler = source[source.index("def create_canonical_robustness_report("):
                          source.index(route_marker)]
-        self.assertLess(handler.index("except RREP.RobustnessPersistenceError"),
-                        handler.index("except (TypeError, ValueError, KeyError)"))
+        self.assertLess(handler.index("except EVS.ExperimentRobustnessConflict"),
+                        handler.index("except EVS.ExperimentValidationRequestInvalid"))
 
     def test_date_perturbation_api_uses_owner_session_anchors_for_date_boundaries(self):
-        source = Path(os.path.join(BACKEND, "api_adaptive.py")).read_text(encoding="utf-8")
-        self.assertIn("RRUN._baseline_session_bounds(spec, owner_sessions)", source)
-        self.assertIn("RRUN._scenario_sessions(scenario, spec, owner_sessions)", source)
-        self.assertNotIn("spec.start_date not in owner_sessions", source)
-        self.assertNotIn("spec.end_date not in owner_sessions", source)
+        service = Path(os.path.join(
+            BACKEND, "experiment_validation_service.py")).read_text(encoding="utf-8")
+        self.assertIn("RRUN._baseline_session_bounds(spec, owner_sessions)", service)
+        self.assertIn("RRUN._scenario_sessions(scenario, spec, owner_sessions)", service)
+        self.assertNotIn("spec.start_date not in owner_sessions", service)
+        self.assertNotIn("spec.end_date not in owner_sessions", service)
 
 
 if __name__ == "__main__":
