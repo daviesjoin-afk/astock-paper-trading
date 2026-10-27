@@ -61,6 +61,34 @@ class TransportBreakerTests(unittest.TestCase):
         self.assertTrue(snapshot["open"])
         self.assertEqual(snapshot["fails"], T._TRANSPORT_BREAKER_THRESHOLD)
 
+    def test_burn_budget_opens_before_the_count_threshold(self):
+        """累计浪费到预算就该短路，不必等到第 6 次。
+
+        `http_get` 默认 ``timeout=15, retries=2``，单个失败 URL 就烧 45 秒。
+        只按次数触发会让扫描先白等 270 秒——生产 close 时段出现过 480 秒里
+        约 408 秒没有子阶段覆盖的黑洞。
+        """
+        burned = T._TRANSPORT_BREAKER_BURN_BUDGET
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=burned)
+        snapshot = T.transport_breaker_snapshot()["qt.gtimg.cn"]
+        self.assertTrue(snapshot["open"])
+        self.assertLess(snapshot["fails"], T._TRANSPORT_BREAKER_THRESHOLD)
+
+    def test_small_failures_do_not_spend_the_burn_budget_early(self):
+        """快速失败（例如立即被断开）不该把主机提前拉黑。"""
+        for _ in range(T._TRANSPORT_BREAKER_THRESHOLD - 1):
+            T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=0.01)
+        snapshot = T.transport_breaker_snapshot()["qt.gtimg.cn"]
+        self.assertFalse(snapshot["open"])
+        self.assertLess(snapshot["burned_seconds"], T._TRANSPORT_BREAKER_BURN_BUDGET)
+
+    def test_success_clears_the_burn_budget(self):
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=20.0)
+        T._transport_breaker_note("qt.gtimg.cn", ok=True)
+        snapshot = T.transport_breaker_snapshot()["qt.gtimg.cn"]
+        self.assertEqual(snapshot["burned_seconds"], 0.0)
+        self.assertFalse(snapshot["open"])
+
     def test_open_host_fails_fast_without_touching_the_transport(self):
         self._fail(T._TRANSPORT_BREAKER_THRESHOLD)
         with mock.patch.object(T, "_http_get_impl") as impl:
