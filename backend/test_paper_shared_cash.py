@@ -443,12 +443,15 @@ class SharedCashArchitectureGuardTests(unittest.TestCase):
 
 
 class ExplicitCycleCashMutationTests(unittest.TestCase):
-    """成交扣款/回款必须带显式周期：不隐式选 active，也不许跨周期入账。
+    """成交扣款/回款必须带显式周期，但两侧的边界**不对称**。
 
-    延迟成交的订单可能属于已经不是 active 的周期。若扣款回落 ``_active_cycle``，
-    新一轮的现金池会替上一轮的成交付钱 —— 账本仍然"平衡"，但钱花在了别人身上，
-    而且事后无法从账本看出。这里把三种边界固定下来：缺周期 fail closed、
-    扣款只作用于请求周期、回款账户必须属于该周期。
+    延迟成交的订单可能属于已经不是 active 的周期。扣款要是回落 ``_active_cycle``，
+    新一轮的现金池就会替上一轮的成交付钱 —— 账本仍然"平衡"，钱却花在了别人身上。
+
+    回款不一样：卖出回款只能回到**持有该仓位**的账户。已归档或已不在当前周期参与的
+    账户仍然必须执行风控退出，所以这里**不能**要求它是当前周期的经济所有者
+    （实测：那样会把真实的风控卖出打成 ``execution_retry``）。可靠的一致性检查是
+    「账户的耐久周期 == 订单周期」；周期未知（NULL）不算冲突。
     """
 
     def setUp(self):
@@ -464,6 +467,8 @@ class ExplicitCycleCashMutationTests(unittest.TestCase):
             INSERT INTO paper_accounts VALUES('tq_breakout', 7, 'paused', 20, 100, 'old');
             INSERT INTO paper_accounts VALUES('trend_pullback', 7, 'running', 30, 100, 'old');
             INSERT INTO paper_accounts VALUES('reported_profit_breakout', 8, 'running', 80, 100, 'old');
+            INSERT INTO paper_accounts VALUES('archived_sleeve', 7, 'archived', 5, 0, 'old');
+            INSERT INTO paper_accounts VALUES('legacy_unknown', NULL, 'archived', 3, 0, 'old');
         """)
 
     def cash(self, account_id):
@@ -495,22 +500,40 @@ class ExplicitCycleCashMutationTests(unittest.TestCase):
         self.assertEqual(30.0, self.cash("trend_pullback"))
         self.assertEqual(80.0, self.cash("reported_profit_breakout"))
 
-    def test_credit_requires_an_explicit_cycle(self):
-        with self.assertRaisesRegex(ValueError, "explicit_cycle_id_required"):
-            PT._credit_shared_cash(self.conn, 5.0, "tq_breakout")
-
     def test_credit_to_an_account_of_another_cycle_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "credit_account_not_in_cycle"):
+        with self.assertRaisesRegex(ValueError, "credit_account_cycle_mismatch"):
             PT._credit_shared_cash(
                 self.conn, 5.0, "reported_profit_breakout", cycle_id=7,
             )
         self.assertEqual(80.0, self.cash("reported_profit_breakout"))
+
+    def test_credit_requires_a_known_account(self):
+        with self.assertRaisesRegex(ValueError, "credit_account_unknown"):
+            PT._credit_shared_cash(self.conn, 5.0, "no_such_account", cycle_id=7)
 
     def test_credit_inside_the_cycle_moves_only_that_account(self):
         PT._credit_shared_cash(self.conn, 7.5, "tq_breakout", cycle_id=7)
         self.assertEqual(27.5, self.cash("tq_breakout"))
         self.assertEqual(30.0, self.cash("trend_pullback"))
         self.assertEqual(80.0, self.cash("reported_profit_breakout"))
+
+    def test_credit_still_reaches_an_account_outside_the_current_participants(self):
+        # 归档账户不属于周期 7 的经济所有者，但它自己的周期就是 7：风控退出必须能回款。
+        self.assertNotIn(
+            "archived_sleeve",
+            {row["id"] for row in PSC.cycle_account_rows(
+                self.conn, 7, builtin_scope=("tq_breakout", "trend_pullback",
+                                             "reported_profit_breakout"))},
+        )
+        PT._credit_shared_cash(self.conn, 9.0, "archived_sleeve", cycle_id=7)
+        self.assertEqual(14.0, self.cash("archived_sleeve"))
+
+    def test_credit_accepts_unknown_cycles_instead_of_blocking_the_exit(self):
+        # 账户周期为 NULL（历史数据）时不把"未知"当成"冲突"：不回款才是真正的账本错误。
+        PT._credit_shared_cash(self.conn, 2.0, "legacy_unknown", cycle_id=7)
+        self.assertEqual(5.0, self.cash("legacy_unknown"))
+        PT._credit_shared_cash(self.conn, 1.0, "legacy_unknown")
+        self.assertEqual(6.0, self.cash("legacy_unknown"))
 
 
 if __name__ == "__main__":

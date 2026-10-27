@@ -103,10 +103,33 @@ def credit_shared_cash(
     amount,
     account_id,
     *,
+    cycle_id=None,
     now_fn=_default_now,
     num_fn=_default_num,
 ):
-    """Credit proceeds to the explicitly supplied account only."""
+    """Credit proceeds to the account that owns the position.
+
+    Sell proceeds can only go back to the account holding the position, so this
+    deliberately does **not** require the account to be an economic owner of the
+    requested cycle: archived sleeves and accounts that no longer participate in
+    the current cycle still have to execute risk exits, and blocking their
+    proceeds strands real cash (it turned genuine risk exits into
+    ``execution_retry`` in practice).
+
+    The consistency rule that does hold is "the account's durable cycle equals
+    the order's cycle" whenever both are known. An unknown cycle (``NULL`` in
+    historical data) is not a conflict: the position owner remains the authority
+    for the proceeds, and withholding the credit is the bigger ledger error.
+    """
+    row = conn.execute(
+        "SELECT cycle_id FROM paper_accounts WHERE id=?", (account_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("credit_account_unknown")
+    account_cycle = row[0]
+    if cycle_id is not None and account_cycle is not None:
+        if int(account_cycle) != int(cycle_id):
+            raise ValueError("credit_account_cycle_mismatch")
     amount = num_fn(amount)
     if amount < 0:
         raise ValueError(

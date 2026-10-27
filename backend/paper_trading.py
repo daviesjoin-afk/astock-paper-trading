@@ -2944,20 +2944,22 @@ def _debit_shared_cash(conn, amount, preferred_account_id=None, *, cycle_id=None
 
 
 def _credit_shared_cash(conn, amount, account_id, *, cycle_id=None):
-    """Credit proceeds to the account, proving it owns the requested cycle.
+    """Credit proceeds to the position owner (identity rule lives in the owner).
 
-    卖出回款只能进**这张订单自己那一轮周期**的经济所有者账户。跨周期入账会
-    让另一轮的资金凭空变多，而这一轮的成交记在别处，事后无法从账本看出。
+    卖出回款只能回到**持有该仓位**的账户，因此这里刻意**不**要求它是当前周期的
+    经济所有者：已归档、或已不在当前周期参与的账户仍然必须执行风控退出，它的
+    成交回款要原路回到自己的现金。把"回款账户"和"本周期资金所有者"混为一谈，
+    会把真实的风控卖出打成 ``execution_retry``（实测过）。
+
+    周期一致性（账户耐久周期 == 订单周期，NULL 不算冲突）由
+    :func:`paper_shared_cash.credit_shared_cash` 在**同一处**判定 —— 现金 SQL
+    只有一个 owner，facade 不再自己写第二条读写语句。
     """
-    if cycle_id is None:
-        raise ValueError("explicit_cycle_id_required")
-    owners = {str(row["id"]) for row in _shared_account_rows(conn, cycle_id)}
-    if str(account_id) not in owners:
-        raise ValueError("credit_account_not_in_cycle")
     return PSC.credit_shared_cash(
         conn,
         amount,
         account_id,
+        cycle_id=cycle_id,
         now_fn=_now,
         num_fn=_num,
     )
