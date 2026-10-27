@@ -775,7 +775,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _reserve_shared_capital=lambda conn, order_id, account_id, code, amount, fees,
             expected_cycle_id=None: (
                 calls.append(("reserve", code, amount, expected_cycle_id)), (True, None))[1],
-            _debit_shared_cash=lambda conn, value, preferred_account_id=None: calls.append(
+            _debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(
                 ("debit", round(value, 2))),
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(
                 ("reservation", status)),
@@ -783,7 +783,7 @@ class CommitFillTests(_StubbedPlannerTest):
             cycle_id=None, acquired_at=None: calls.append(("lot", qty, cycle_id)),
             _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
                 calls.append(("consume_cycle", cycle_id)), (qty, 0.0))[1],
-            _credit_shared_cash=lambda conn, value, account_id=None: calls.append(("credit", value)),
+            _credit_shared_cash=lambda conn, value, account_id=None, **kwargs: calls.append(("credit", value)),
             _json=lambda value: value,
             _now=lambda: NOW,
             _date=lambda day: day,
@@ -829,7 +829,7 @@ class CommitFillTests(_StubbedPlannerTest):
         stub = types.SimpleNamespace(
             _assert_active_lease=lambda conn, label: None,
             _reserve_shared_capital=lambda *args, **kwargs: calls.append(("reserve",)) or (True, None),
-            _debit_shared_cash=lambda conn, value, preferred_account_id=None: calls.append(("debit",)),
+            _debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(("debit",)),
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(("reservation", status)),
             _consume_capital_reservation=lambda conn, order_id, amount, fees, final=False: calls.append(
                 ("consume_reservation", amount, fees, final)),
@@ -868,7 +868,7 @@ class CommitFillTests(_StubbedPlannerTest):
         stub = types.SimpleNamespace(
             _assert_active_lease=lambda conn, label: None,
             _reserve_shared_capital=lambda *args, **kwargs: (True, None),
-            _debit_shared_cash=lambda conn, value, preferred_account_id=None: None,
+            _debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: None,
             _finish_capital_reservation=lambda conn, order_id, status: None,
             _record_lot=lambda *args, **kwargs: None,
             _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),

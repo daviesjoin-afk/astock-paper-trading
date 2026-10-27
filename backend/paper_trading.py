@@ -2405,7 +2405,7 @@ def _reconcile_shared_cash(conn, cycle_id):
         # Remove excess cash without making any attribution bucket negative.
         # This is intentionally equivalent to a shared-pool debit, not a
         # proportional rewrite of strategy history.
-        _debit_shared_cash(conn, -drift)
+        _debit_shared_cash(conn, -drift, cycle_id=cycle_id)
     _audit(conn, None, "shared_cash_reconciled", f"共享资金池现金账差 {drift:+.2f} 元，已按周期固定本金与成交现金流修复")
     return drift
 
@@ -2923,11 +2923,19 @@ def _consume_capital_reservation(conn, order_key, amount, fees, *, final=False):
     )
 
 
-def _debit_shared_cash(conn, amount, preferred_account_id=None):
-    """Debit a shared cash pool while retaining per-strategy audit ownership."""
+def _debit_shared_cash(conn, amount, preferred_account_id=None, *, cycle_id=None):
+    """Debit a shared cash pool while retaining per-strategy audit ownership.
+
+    ``cycle_id`` 必须显式给出。成交与对账都发生在**某一轮具体周期**上：延迟
+    成交的订单可能属于已经不再是 active 的周期，若这里回落 ``_active_cycle``，
+    就会拿新一轮的现金池去支付上一轮的成交（账本看起来仍然平衡，钱却花在了
+    别人身上）。宁可 fail closed，也不隐式选周期。
+    """
+    if cycle_id is None:
+        raise ValueError("explicit_cycle_id_required")
     return PSC.debit_shared_cash(
         conn,
-        _shared_account_rows(conn),
+        _shared_account_rows(conn, cycle_id),
         amount,
         preferred_account_id=preferred_account_id,
         now_fn=_now,
@@ -2935,7 +2943,17 @@ def _debit_shared_cash(conn, amount, preferred_account_id=None):
     )
 
 
-def _credit_shared_cash(conn, amount, account_id):
+def _credit_shared_cash(conn, amount, account_id, *, cycle_id=None):
+    """Credit proceeds to the account, proving it owns the requested cycle.
+
+    卖出回款只能进**这张订单自己那一轮周期**的经济所有者账户。跨周期入账会
+    让另一轮的资金凭空变多，而这一轮的成交记在别处，事后无法从账本看出。
+    """
+    if cycle_id is None:
+        raise ValueError("explicit_cycle_id_required")
+    owners = {str(row["id"]) for row in _shared_account_rows(conn, cycle_id)}
+    if str(account_id) not in owners:
+        raise ValueError("credit_account_not_in_cycle")
     return PSC.credit_shared_cash(
         conn,
         amount,
