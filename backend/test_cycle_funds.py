@@ -105,5 +105,16 @@ class StatusVocabularyOwnerTests(unittest.TestCase):
         self.assertEqual(PSC.SHARED_POOL_MAX_EXPOSURE, PT.SHARED_POOL_MAX_EXPOSURE)
 
 
+class SharedMetricsCycleConsistencyTests(unittest.TestCase):
+    """A4 phase 2：组合读数的初始资金与现金必须来自同一个周期。"""
+
+    def test_shared_metrics_does_not_mix_cycles(self):
+        import inspect
+        source = inspect.getsource(PT._shared_metrics)
+        self.assertIn("_cycle_funds", source)
+        self.assertNotIn("_shared_cash(conn)", source,
+                         "组合读数又退回'当前周期'现金，与传入周期的初始资金不同源")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12389,7 +12389,8 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     value = sizing_facts["position_value"]
     shared_cash = sizing_facts["shared_cash"]
     strategy_budget = sizing_facts["strategy_budget"]
-    shared_risk = _shared_risk_state(conn, account, nav, asof_day)
+    # A4 phase 2：日内两条执行路径都已有明确周期，风险基线必须绑定它。
+    shared_risk = _shared_risk_state(conn, account, nav, asof_day, cycle_id=cycle["id"])
     if shared_risk["blocked"]:
         return None, "；".join(shared_risk["reasons"])
     code_value = sizing_facts["code_values"].get(position["code"], 0.0)
@@ -12567,7 +12568,8 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     position_value = sizing_facts["position_value"]
     shared_cash = sizing_facts["shared_cash"]
     strategy_budget = sizing_facts["strategy_budget"]
-    risk_state = _shared_risk_state(conn, account, nav, asof_day)
+    # A4 phase 2：同上，绑定该路径已认领的周期。
+    risk_state = _shared_risk_state(conn, account, nav, asof_day, cycle_id=cycle["id"])
     if risk_state["blocked"]:
         return None, "；".join(risk_state["reasons"])
     # 加仓同样按组合口径计入所有策略的在途买单（同 symbol 聚合上限不被绕过）。
@@ -13225,7 +13227,8 @@ def monitor_intraday(asof_datetime=None, force=False):
             quote = quotes.get(position["code"], {})
             price = _num(quote.get("price"))
             profile = _risk_profile(account, conn=conn)
-            risk_state = _shared_risk_state(conn, account, shared_nav, day)
+            # A4 phase 2：盘中执行绑定当前已认领周期。
+            risk_state = _shared_risk_state(conn, account, shared_nav, day, cycle_id=cycle["id"])
             reason = "共享风控状态正常，等待策略专属事件或加仓条件"
             if account.get("mode") == "intraday_t":
                 action, reason = _run_intraday_action(
@@ -14193,8 +14196,11 @@ def _account_metric_inputs(conn, account_ids, today):
 
 def _shared_metrics(conn, cycle, positions, quotes):
     """Portfolio-level view: strategies remain separate decisions, capital is one pool."""
-    initial = _shared_initial_cash(conn, cycle)
-    cash = _shared_cash(conn)
+    # A4 phase 2：初始资金与现金必须来自**同一个明确周期**。
+    # 旧实现一半用传入周期、一半用"当前周期"，多周期并存时会自相矛盾。
+    funds = _cycle_funds(conn, cycle["id"])
+    initial = funds["initial_cash"]
+    cash = funds["cash"]
     missing_valuation_codes = [
         str(pos.get("code")) for pos in positions
         if not isinstance((quotes.get(pos["code"]) or {}).get("price"), (int, float))
