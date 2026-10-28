@@ -17,9 +17,18 @@ import market_data_service as MDSvc
 from marketdata_transport import http_get
 import tradability_archive as TA
 import tradability_ingestion as TI
+from env_utils import env_float
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 STATUS_MAX_AGE_SECONDS = 120
+
+
+# 停牌/上市日/ST 名单是低频状态：交易所当天只会增删少量记录，盘中每 3 分钟
+# 重拉一次完整停牌报表没有收益（一天 80 次），却把 quote.tradability 拖到
+# 数秒到三十秒。缓存窗口取 15 分钟（一天约 16 次），仍能在一个扫描周期内
+# 发现新停牌；状态本身的新鲜度仍由 `STATUS_MAX_AGE_SECONDS` 对最终成交
+# 观测单独校验，缓存只复用**报表内容**，不延后 observed_at。
+STATUS_CACHE_TTL_SECONDS = env_float("ASTOCK_TRADABILITY_STATUS_TTL_SECONDS", 900, minimum=1.0)
 _CACHE = {}
 _LOCK = threading.Lock()
 PROFILE_SOURCE = "eastmoney_stock_profile+complete_suspension_report+verified_quote"
@@ -29,7 +38,7 @@ MARKET_SOURCE = "current_full_market_membership+complete_suspension_report+verif
 def _get(key, url, params):
     with _LOCK:
         cached = _CACHE.get(key)
-    if cached and time.monotonic() - cached[0] < 60:
+    if cached and time.monotonic() - cached[0] < STATUS_CACHE_TTL_SECONDS:
         return cached[1], cached[2]
     data = json.loads(http_get(url, params=params, timeout=3, retries=1))
     observed = dt.datetime.now(TZ).isoformat(timespec="microseconds")

@@ -13,6 +13,7 @@ import uuid
 
 import requests
 import paper_timing as PTM
+from env_utils import env_float
 
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -109,14 +110,6 @@ _transport_breaker_lock = threading.Lock()
 _PROCESS_STARTED = time.monotonic()
 
 
-def _env_float(name, default):
-    try:
-        value = float(os.environ.get(name, "").strip() or default)
-    except (TypeError, ValueError):
-        return float(default)
-    return value
-
-
 # ---------------------------------------------------------------------------
 # 扫描尾部的预算收敛。
 #
@@ -134,8 +127,8 @@ def _env_float(name, default):
 # 未设置预算的进程（API、测试、离线脚本）完全不受影响；扫描也只有在**已经
 # 跑过尾部阈值**后才收敛，正常轮次的请求参数与现在完全一致。
 # ---------------------------------------------------------------------------
-_SCAN_BUDGET_SECONDS = _env_float("ASTOCK_SCAN_BUDGET_SECONDS", 0.0)
-_SCAN_TAIL_AFTER_SECONDS = _env_float("ASTOCK_SCAN_TAIL_AFTER_SECONDS", 90.0)
+_SCAN_BUDGET_SECONDS = env_float("ASTOCK_SCAN_BUDGET_SECONDS", 0.0, minimum=0.0)
+_SCAN_TAIL_AFTER_SECONDS = env_float("ASTOCK_SCAN_TAIL_AFTER_SECONDS", 90.0, minimum=1.0)
 _SCAN_TAIL_TIMEOUT_CAP = 8.0
 _SCAN_TAIL_RETRIES_CAP = 1
 

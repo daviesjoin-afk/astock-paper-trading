@@ -14,6 +14,7 @@ import marketdata_feeds as MDF
 import marketdata_normalizers as MN
 import marketdata_providers as MP
 import data_paths
+from env_utils import env_float
 from marketdata_transport import (
     HEADERS,
     _session,
@@ -37,6 +38,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # runtime state instead of splitting it between the source tree and an
 # isolated directory.
 CACHE_DIR = data_paths.data_dir()
+
+
+# 低频事件源的缓存窗口。7x24 快讯每轮扫描都会整页重拉；公告按持仓代码
+# 单独拉取。两者都属于"分钟级变化、分钟级可见"的数据，没必要在 3 分钟一轮
+# 的扫描里各拉一次。新闻保留 5 分钟（风控负面事件仍需较快可见），公告保留
+# 30 分钟（公告发布本身有交易所披露节奏，且重抓同一批文本没有新信息）。
+NEWS_CACHE_TTL_SECONDS = env_float("ASTOCK_NEWS_CACHE_TTL_SECONDS", 300, minimum=1.0)
+ANNOUNCEMENT_CACHE_TTL_SECONDS = env_float("ASTOCK_ANNOUNCEMENT_CACHE_TTL_SECONDS", 1800, minimum=1.0)
+
 KLINE_DIR = os.path.join(CACHE_DIR, "klines")
 KLINE_MANIFEST_PATH = os.path.join(CACHE_DIR, "kline_manifest.json")
 # Full-market and risk-proxy snapshots must never overwrite each other.  The
@@ -1214,9 +1224,20 @@ def _sina_realtime_feed():
     )
 
 
+def _ths_realtime_feed():
+    return MDF.ThsRealtimeFeed(
+        http_get=http_get,
+        parser=MP.parse_ths_realtime_text,
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+    )
+
+
 def _independent_realtime_feed():
+    # 腾讯 → 新浪 → 同花顺。前两家都缺价时才启用同花顺（单票一请求，上限 8 只），
+    # 让"独立核验源整体不可用"不再等于"只能按单一源价格决策"。
     return MDF.DataFeedChain(
-        (_tencent_realtime_feed(), _sina_realtime_feed()),
+        (_tencent_realtime_feed(), _sina_realtime_feed(), _ths_realtime_feed()),
         reset_data_source=reset_data_source,
         sleep=time.sleep,
         retry_last_feed=True,
@@ -2003,7 +2024,7 @@ def fetch_fast_news(page_size=50):
                 "evidence_grade": "C",
             })
         return output
-    return _cached("news", 120, _do)
+    return _cached("news", NEWS_CACHE_TTL_SECONDS, _do)
 
 
 def fetch_company_announcements(codes, page_size=100):
@@ -2054,7 +2075,7 @@ def fetch_company_announcements(codes, page_size=100):
             })
         return output
 
-    return _cached("announcements:" + ",".join(normalized), 300, _do)
+    return _cached("announcements:" + ",".join(normalized), ANNOUNCEMENT_CACHE_TTL_SECONDS, _do)
 
 
 def fetch_hot_rank(topn=100):

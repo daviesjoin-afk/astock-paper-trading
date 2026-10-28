@@ -7,31 +7,24 @@ spread tolerances, and execution policy remain in the paper-trading layer.
 from __future__ import annotations
 
 import math
-import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from env_utils import env_float
+
 QuoteRow = dict[str, Any]
-
-
-def _env_budget(name, default):
-    try:
-        value = float(os.environ.get(name, "").strip() or default)
-    except (TypeError, ValueError):
-        return float(default)
-    return value if value > 0 else 0.0
 
 
 # 单个报价 adapter 的**总尝试预算**（秒）。adapter 拥有主机轮换与重试：
 # 3 次尝试 × 3 台主机 × 8 秒超时最坏是 72 秒，而盘中一轮只值 180 秒。
 # 预算只限制"愿意等多久"，不改变失败后的 fail-closed：耗尽即返回当前已取到
 # 的行（通常为空），由调用方按覆盖不足处理。0 表示不设预算（测试/离线）。
-QUOTE_TRANSPORT_BUDGET_SECONDS = _env_budget("ASTOCK_QUOTE_BUDGET_SECONDS", 12.0)
+QUOTE_TRANSPORT_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_BUDGET_SECONDS", 12.0, minimum=0.0)
 # 有序回退链（腾讯→新浪→末源重试）的整体预算；避免每个源各用一份预算后
 # 又叠成一整轮超时。
-QUOTE_CHAIN_BUDGET_SECONDS = _env_budget("ASTOCK_QUOTE_CHAIN_BUDGET_SECONDS", 18.0)
+QUOTE_CHAIN_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_CHAIN_BUDGET_SECONDS", 18.0, minimum=0.0)
 
 
 def _budget_exhausted(started, budget):
@@ -500,6 +493,79 @@ class SinaRealtimeFeed:
         else:
             self.health.record_result(
                 self.name, requested=len(normalized), returned=len(rows), policy=self.reliability,
+                reason=None if len(rows) == len(normalized) else "partial or empty provider response",
+            )
+        return rows
+
+
+@dataclass(frozen=True)
+class ThsRealtimeFeed:
+    """同花顺分时快照：独立第四源，仅作为最后缺口兜底。
+
+    同花顺没有批量报价接口，只能一只一请求；因此严格限制 ``max_codes``，
+    且只在腾讯、新浪都缺价时由 ``DataFeedChain`` 调用。它是价格/时间戳的
+    独立证据，不参与成交额等没有公开单位契约的字段。
+    """
+
+    http_get: Callable[..., str]
+    parser: Callable[..., list[QuoteRow]]
+    reset_data_source: Callable[..., Any]
+    sleep: Callable[[float], Any] = time.sleep
+    max_codes: int = 8
+    attempts: int = 2
+    name: str = "ths_public_quote"
+    reliability: FeedReliabilityPolicy = FeedReliabilityPolicy(timeout_seconds=3.0)
+    health: FeedHealthRegistry = field(default_factory=lambda: FEED_HEALTH, repr=False, compare=False)
+
+    def fetch_realtime(self, codes: Sequence[str]) -> list[QuoteRow]:
+        normalized = normalize_codes(codes)
+        if not normalized or not self.health.allow(self.name):
+            return []
+        if len(normalized) > max(1, int(self.max_codes)):
+            return []
+        rows_by_code: dict[str, QuoteRow] = {}
+        transport_succeeded = False
+        last_transport_error: BaseException | None = None
+        started = time.monotonic()
+        budget = min(QUOTE_TRANSPORT_BUDGET_SECONDS, 3.0 * max(1, int(self.max_codes)))
+        try:
+            for code in normalized:
+                if not str(code).startswith(("0", "3", "6")):
+                    continue
+                if _budget_exhausted(started, budget):
+                    break
+                url = f"http://d.10jqka.com.cn/v6/time/hs_{code}/last.js"
+                for attempt in range(max(1, int(self.attempts))):
+                    if _budget_exhausted(started, budget):
+                        break
+                    try:
+                        text = self.http_get(
+                            url, timeout=self.reliability.timeout_seconds,
+                            encoding="utf-8", retries=0,
+                        )
+                        transport_succeeded = True
+                    except Exception as exc:
+                        last_transport_error = exc
+                        text = ""
+                    parsed = self.parser(text, allowed_codes=[code]) if text else []
+                    if parsed:
+                        rows_by_code[code] = parsed[0]
+                        break
+                    if attempt < max(1, int(self.attempts)) - 1 and not _budget_exhausted(started, budget):
+                        self.reset_data_source("同花顺分时源空响应")
+                        self.sleep(0.2 * (attempt + 1))
+        except Exception as exc:
+            self.health.record_exception(self.name, exc, self.reliability, len(normalized))
+            return []
+        rows = [rows_by_code[code] for code in normalized if code in rows_by_code]
+        if not transport_succeeded and last_transport_error is not None:
+            self.health.record_exception(
+                self.name, last_transport_error, self.reliability, len(normalized),
+            )
+        else:
+            self.health.record_result(
+                self.name, requested=len(normalized), returned=len(rows),
+                policy=self.reliability,
                 reason=None if len(rows) == len(normalized) else "partial or empty provider response",
             )
         return rows

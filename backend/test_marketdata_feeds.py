@@ -468,5 +468,53 @@ class QuoteAttemptBudgetTests(unittest.TestCase):
         self.assertEqual(called, ["first"], "链预算耗尽后不得再启动第二个源")
 
 
+class ThsRealtimeFeedTests(unittest.TestCase):
+    def _feed(self, get):
+        return feeds.ThsRealtimeFeed(
+            http_get=get,
+            parser=lambda text, **_: [{"code": "600000", "price": 10.0,
+                                       "quote_at": "2026-10-28T14:04:00+08:00",
+                                       "source": "ths_public_quote"}],
+            reset_data_source=mock.Mock(),
+            sleep=mock.Mock(),
+        )
+
+    def test_single_code_limit_avoids_request_fanout(self):
+        get = mock.Mock()
+        feed = self._feed(get)
+        self.assertEqual(feed.fetch_realtime([f"60000{i}" for i in range(9)]), [])
+        get.assert_not_called()
+
+    def test_returns_independent_quote_for_missing_code(self):
+        get = mock.Mock(return_value="payload")
+        feed = self._feed(get)
+        rows = feed.fetch_realtime(["600000"])
+        self.assertEqual(rows[0]["source"], "ths_public_quote")
+        url = get.call_args.args[0]
+        self.assertIn("hs_600000", url)
+        self.assertEqual(get.call_args.kwargs["retries"], 0)
+
+    def test_chain_uses_ths_only_after_tencent_and_sina_miss(self):
+        calls = []
+
+        class Feed:
+            def __init__(self, tag, rows=()):
+                self.tag, self.rows = tag, list(rows)
+                self.name = tag
+            def fetch_realtime(self, codes):
+                calls.append(self.tag)
+                return list(self.rows)
+
+        quote = {"code": "600000", "price": 10.0,
+                 "quote_at": "2026-10-28T14:04:00+08:00", "source": "ths_public_quote"}
+        chain = feeds.DataFeedChain(
+            (Feed("tencent"), Feed("sina"), Feed("ths", [quote])),
+            retry_last_feed=False,
+        )
+        rows = chain.fetch_realtime(["600000"])
+        self.assertEqual(calls, ["tencent", "sina", "ths"])
+        self.assertEqual(rows[0]["source"], "ths_public_quote")
+
+
 if __name__ == "__main__":
     unittest.main()

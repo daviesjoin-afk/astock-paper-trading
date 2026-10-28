@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -478,5 +479,72 @@ def parse_eastmoney_kline_rows(klines):
             "high": float(parts[3]), "low": float(parts[4]),
             "volume": float(parts[5]), "amount": float(parts[6]),
             "amplitude": float(parts[7]) if len(parts) > 7 else None,
+        })
+    return rows
+
+
+def parse_ths_realtime_text(text, *, allowed_codes=None):
+    """解析同花顺 ``d.10jqka.com.cn/v6/time/hs_<code>/last.js`` 分时快照。
+
+    这是独立于东财/腾讯/新浪的第四方报价源，只在两家独立源都缺价时使用。
+    报文形如::
+
+        quotebridge_v6_time_hs_600000_last({"hs_600000": {
+            "name": "浦发银行", "pre": "9.82", "date": "20261028",
+            "data": "0930,9.80,4071900,9.800,415500;0931,..."}})
+
+    ``data`` 是当日分钟序列 ``时间,价格,成交额,均价,成交量``。我们只取最后
+    一根的**价格**并用 ``pre``（昨收）计算涨跌幅；成交额/均价的单位没有公开
+    契约，宁可不填，也不把猜测值写进报价。时间戳由 ``date`` + 最后一根
+    ``HHMM`` 组合为 +08:00，供调用方做同日/时效校验。
+    """
+    allowed = {str(code) for code in allowed_codes} if allowed_codes is not None else None
+    raw = str(text or "")
+    start, end = raw.find("("), raw.rfind(")")
+    if start < 0 or end <= start:
+        return []
+    try:
+        payload = json.loads(raw[start + 1:end])
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    rows = []
+    for key, item in payload.items():
+        if not isinstance(item, dict):
+            continue
+        code = str(key).split("_")[-1][-6:]
+        if not code.isdigit() or len(code) != 6:
+            continue
+        if allowed is not None and code not in allowed:
+            continue
+        series = [part for part in str(item.get("data") or "").split(";") if part]
+        if not series:
+            continue
+        parts = str(series[-1]).split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            price = float(parts[1])
+            prev_close = float(item.get("pre"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or prev_close <= 0:
+            continue
+        day = str(item.get("date") or "")
+        clock = str(parts[0]).strip()
+        quote_at = None
+        if re.fullmatch(r"\d{8}", day) and re.fullmatch(r"\d{4}", clock):
+            quote_at = (
+                f"{day[:4]}-{day[4:6]}-{day[6:8]}T"
+                f"{clock[:2]}:{clock[2:]}:00+08:00"
+            )
+        if not quote_at:
+            continue
+        rows.append({
+            "code": code, "name": item.get("name"), "price": price,
+            "prev_close": prev_close,
+            "pct": round((price - prev_close) / prev_close * 100, 4),
+            "quote_at": quote_at, "source": "ths_public_quote",
         })
     return rows

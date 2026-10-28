@@ -21,6 +21,7 @@ import requests
 import paper_timing as PTM
 
 import data_paths
+from env_utils import env_int
 
 try:
     import pandas as pd
@@ -223,19 +224,12 @@ MICRO_BREAKER_THRESHOLD = 2          # 连续失败多少次后短路
 MICRO_BREAKER_COOLDOWN_SECONDS = 300.0  # 短路持续多久（秒）
 
 
-def _env_int(name, default):
-    try:
-        return int(os.environ.get(name, "").strip() or default)
-    except (TypeError, ValueError):
-        return int(default)
-
-
 # 一轮扫描会对十余只候选并发取微结构。难点不是"慢"，而是**所有候选同时出发**：
 # 源已经挂掉时，12 个线程都在熔断器打开之前就把请求发了出去，于是阈值形同虚设
 # （生产实测 microstructure.ticks/trend 各 12 次调用、各 100 秒以上，整轮被拖到
 # 346 秒）。改为**分批出发**：第一批的失败足以打开源级熔断，后续批次立刻快速失败，
 # 只留一次真实等待。批次越小尾延迟越低，但健康时批次数会变多；默认 6。
-MICRO_BATCH_SIZE = max(1, _env_int("ASTOCK_MICRO_BATCH_SIZE", 6))
+MICRO_BATCH_SIZE = max(1, env_int("ASTOCK_MICRO_BATCH_SIZE", 6, minimum=1))
 
 _micro_breaker = {}
 _micro_breaker_lock = threading.Lock()

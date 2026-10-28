@@ -48,13 +48,19 @@ class CouplingBudgetTests(unittest.TestCase):
     # 基线里 `import_cycles` 与 `private_cross_access` 直接收紧到实测值。
     # 顶层 import 副作用 23 → 24，来自组装期那一次 `bind_default_runner` 调用，
     # 仍在 PR272 基线 25 以内，不是新增的副作用类别。
+    #
+    # 2026-10-28（行情源预算/TTL 配置）：新增基础模块 `env_utils`，把 5 处各自
+    # 解析环境变量的副本收敛成 1 个实现（duplicate_helpers 314 → 313，回到额度
+    # 内）。`data_fetcher`(data) 与 `paper_live_tradability`(paper) 各新增一条
+    # 跨域边，共 +2（664 → 666）；其余三个调用方都在 `other` 域，不新增边。
+    # 这是"共享实现替代复制"的代价，不是新业务耦合。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
         "deferred_imports": 35,
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 40,
+        "cross_domain_edges": 42,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,

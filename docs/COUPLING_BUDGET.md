@@ -188,3 +188,14 @@
   的规模（越大越值得）。
 * 若未来需要真正跨模块共享，应当缓存**源码文本/字节**而不是只读语法树，避免为
   每个 AST 节点付包装成本。
+
+## 2026-10-28：行情源预算与低频状态缓存
+
+- 新增基础模块 `env_utils`（`env_float` / `env_int`），替换 5 个模块里各自
+  复制粘贴的环境变量解析。`duplicate_helpers` 314 → **313**（回到 313 额度内）。
+- `data_fetcher`（data 域）与 `paper_live_tradability`（paper 域）各新增一条
+  指向 `env_utils`（other 域）的边，`cross_domain_edges` 664 → **666**；
+  `marketdata_transport` / `marketdata_feeds` / `alt_data` 也在 other 域，不新增边。
+  额度 40 → 42 并在此记录：这是共享实现替代复制，不是新增业务耦合。
+- 低频状态缓存窗口（停牌 15 分钟、公告 30 分钟、快讯 5 分钟）是运行时策略，
+  不改变模块依赖。

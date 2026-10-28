@@ -3770,14 +3770,37 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True,
         light, reason = "unknown", "沪深300收盘趋势数据早于上一交易日且缺少当日实时指数"
     elif live_pct is None:
         light, reason = "unknown", "未取得当日沪深300实时行情"
-    elif overseas.get("light") == "red" or live_pct <= -2.0:
+    # 市场灯采用"趋势 + 广度"双确认（成熟市场状态分类的通行做法）：
+    #   * 绿灯：指数在 MA20 上方且上涨家数占比不低于 45%；
+    #     或出现广度推力——指数当日 ≥ +0.5%、上涨家数 ≥ 60%、
+    #     且 5 日跌幅未超过 3%（此时 MA20 仍可能未修复）。
+    #   * 黄灯：指数弱势、宽度不足、海外偏弱/未知、或趋势明显走坏。
+    #   * 红灯：指数 ≤ -2%、海外红灯，或宽度崩溃（≤20%）叠加下跌。
+    # 旧规则只用 MA20 做最后一道门：一根前一日阴线就能让全市场 72% 上涨、
+    # 指数 +0.55% 的强势日仍停留在黄灯，风控中心显示"收紧"。广度推力必须
+    # 同时满足指数与宽度两个独立条件，不是单一指标放宽。
+    elif (overseas.get("light") == "red" or live_pct <= -2.0
+          or (breadth is not None and breadth <= 0.20 and live_pct <= -1.0)):
         light, reason = "red", f"实时沪深300 {live_pct:+.2f}% 或海外风险偏弱"
     elif live_pct <= -0.6 or (not above_ma20 and (bench_5d or 0) <= -3):
         light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，中期趋势偏谨慎"
-    elif overseas.get("light") in ("yellow", "unknown") or not above_ma20:
-        light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，按谨慎仓位执行"
-    else:
+    elif overseas.get("light") in ("yellow", "unknown"):
+        light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，海外风险未确认，按谨慎仓位执行"
+    elif breadth is not None and breadth < 0.45:
+        light, reason = (
+            "yellow",
+            f"实时沪深300 {live_pct:+.2f}%，上涨家数占比 {breadth * 100:.0f}%，市场宽度不足",
+        )
+    elif above_ma20:
         light, reason = "green", f"实时沪深300 {live_pct:+.2f}%，指数趋势正常"
+    elif (live_pct >= 0.5 and breadth is not None and breadth >= 0.60
+          and (bench_5d if bench_5d is not None else -99.0) > -3.0):
+        light, reason = (
+            "green",
+            f"实时沪深300 {live_pct:+.2f}%，上涨家数占比 {breadth * 100:.0f}%，广度推力覆盖中期趋势",
+        )
+    else:
+        light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，按谨慎仓位执行"
     # 北向资金（P1）：同花顺分钟累计净流入。仅作情绪上下文展示与审计，
     # 不改变 light 门控——北向数据的当日语义（是否含买断额度）仍不稳。
     # 与指数/海外源一致：read-model 调用（allow_network=False，例如
