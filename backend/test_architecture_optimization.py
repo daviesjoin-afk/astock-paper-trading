@@ -205,7 +205,13 @@ class ExtractedDecisionTests(unittest.TestCase):
         ports.news.assert_not_called()
         ports.trajectories.assert_not_called()
 
-    def test_risk_acquisition_preserves_order_and_optional_failure(self):
+    def test_risk_acquisition_preserves_inputs_and_optional_failure(self):
+        """新闻/资金流与报价并行后，只保留仍然有意义的次序约束。
+
+        市场背景必须先取（空持仓时会短路整条链）；``news_meta`` 必须在新闻
+        之后读取；报价仍在调用线程执行。其余两条支路互不依赖，因此不再断言
+        它们与报价的先后。
+        """
         calls = []
         ports = PRMI.RiskMarketInputs(
             market_context=lambda day: calls.append("market") or {},
@@ -215,7 +221,10 @@ class ExtractedDecisionTests(unittest.TestCase):
             trajectories=mock.Mock(side_effect=RuntimeError("optional source down")),
         )
         result = PRMI.load(day="2026-09-01", positions=[{"code": "000002", "name": "sample"}], candidate_codes={"000001"}, ports=ports)
-        self.assertEqual(calls, ["market", ("quotes", ["000001", "000002"]), "news", "news_meta"])
+        self.assertEqual(calls[0], "market")
+        self.assertIn(("quotes", ["000001", "000002"]), calls)
+        self.assertIn("news", calls)
+        self.assertEqual(calls[-1], "news_meta")
         self.assertEqual(result["quote_map"], {"quote": True})
         self.assertEqual(result["flow_trajectory_map"], {})
         self.assertEqual(replace(ports, trajectories=lambda *args, **kwargs: {}).news, ports.news)

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pandas as pd
@@ -6500,15 +6501,36 @@ def _quotes(codes, asof_date=None):
                 and abs(_num(row.get("pct"), 999)) <= 30
                 and _quote_is_fresh({**row, "quote_source": "live"}, expected_day))
     source_errors = {}
-    try:
-        with PTM.phase("quote.primary"):
-            live_rows = dfc.fetch_realtime_for_codes(list(codes)) or []
-    except Exception as exc:
-        # One provider must never abort a risk pass for every holding.  Keep
-        # the exception in the quote envelope so entry remains fail-closed and
-        # exits can surface a structured degraded/unavailable reason.
-        live_rows = []
-        source_errors["live"] = f"{type(exc).__name__}: {exc}"
+
+    def _primary_quotes():
+        try:
+            with PTM.phase("quote.primary"):
+                return dfc.fetch_realtime_for_codes(list(codes)) or [], None
+        except Exception as exc:
+            # One provider must never abort a risk pass for every holding.  Keep
+            # the exception in the quote envelope so entry remains fail-closed and
+            # exits can surface a structured degraded/unavailable reason.
+            return [], f"{type(exc).__name__}: {exc}"
+
+    def _independent_quotes():
+        try:
+            with PTM.phase("quote.independent"):
+                return dfc.fetch_independent_realtime_for_codes(list(codes)) or [], None
+        except Exception as exc:
+            return [], f"{type(exc).__name__}: {exc}"
+
+    # 主源与独立核验源只需要同一份代码集合，谁先返回都不影响对方。旧实现先
+    # 串行等主源、再串行等核验源，两个 8 秒级等待直接相加；这里并行后取较大值。
+    # 失败仍分别写入 source_errors，后续 fail-closed/fail-open 分支完全不变。
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="quote-src") as pool:
+        primary_future = pool.submit(PTM.bind_worker(_primary_quotes))
+        independent_future = pool.submit(PTM.bind_worker(_independent_quotes))
+        live_rows, live_error = primary_future.result()
+        cross_rows, cross_error = independent_future.result()
+    if live_error:
+        source_errors["live"] = live_error
+    if cross_error:
+        source_errors["cross"] = cross_error
     live = {str(r.get("code")): {**r, "source": r.get("source") or "eastmoney_ulist"}
             for r in live_rows if r.get("code")}
     fallback_identity = None
@@ -6549,12 +6571,8 @@ def _quotes(codes, asof_date=None):
         except Exception as exc:
             source_errors["snapshot"] = f"{type(exc).__name__}: {exc}"
     # A failed primary must not hide a usable provider from the fallback chain.
-    try:
-        with PTM.phase("quote.independent"):
-            cross_rows = dfc.fetch_independent_realtime_for_codes(list(codes)) or []
-    except Exception as exc:
-        cross_rows = []
-        source_errors["cross"] = f"{type(exc).__name__}: {exc}"
+    # The independent source was already fetched in parallel above; its failure
+    # is preserved in ``source_errors`` exactly as before.
     cross = {str(r.get("code")): r for r in cross_rows if r.get("code")}
     for code in codes:
         primary = live.get(code) or {}
@@ -10968,16 +10986,24 @@ def _risk_load_market_inputs(*, day, positions, candidate_codes):
         _round_quote_offer(day, quote_map)
         return quote_map
 
-    inputs = PRMI.load(
-        day=day, positions=positions, candidate_codes=candidate_codes,
-        ports=PRMI.RiskMarketInputs(
-            market_context=market_context, quotes=quotes, news=_news_for,
-            news_meta=lambda: _NEWS_SCAN_META,
-            trajectories=lambda codes, **kwargs: AD.fund_flow_trajectories(codes, **kwargs) if AD is not None else {},
-        ),
-    )
-    with PTM.phase("risk.alt_evidence"):
-        inputs["position_alt_data"] = PREv.prefetch_position_alt_data(positions, day, alt_data=AD)
+    def _position_alt_evidence():
+        with PTM.phase("risk.alt_evidence"):
+            return PREv.prefetch_position_alt_data(positions, day, alt_data=AD)
+
+    # 持仓替代证据（解禁/龙虎榜/两融/大宗/股东户数）只依赖 positions + day，
+    # 与行情、新闻、资金流无关。旧实现等整条行情链跑完再串行取它，等于把两段
+    # 等待相加（生产实测 risk.alt_evidence 单轮 2~26 秒）。现在与报价链并行。
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="risk-alt") as pool:
+        alt_future = pool.submit(PTM.bind_worker(_position_alt_evidence))
+        inputs = PRMI.load(
+            day=day, positions=positions, candidate_codes=candidate_codes,
+            ports=PRMI.RiskMarketInputs(
+                market_context=market_context, quotes=quotes, news=_news_for,
+                news_meta=lambda: _NEWS_SCAN_META,
+                trajectories=lambda codes, **kwargs: AD.fund_flow_trajectories(codes, **kwargs) if AD is not None else {},
+            ),
+        )
+        inputs["position_alt_data"] = alt_future.result()
     return inputs
 
 

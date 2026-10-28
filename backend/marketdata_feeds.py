@@ -7,12 +7,35 @@ spread tolerances, and execution policy remain in the paper-trading layer.
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 QuoteRow = dict[str, Any]
+
+
+def _env_budget(name, default):
+    try:
+        value = float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else 0.0
+
+
+# 单个报价 adapter 的**总尝试预算**（秒）。adapter 拥有主机轮换与重试：
+# 3 次尝试 × 3 台主机 × 8 秒超时最坏是 72 秒，而盘中一轮只值 180 秒。
+# 预算只限制"愿意等多久"，不改变失败后的 fail-closed：耗尽即返回当前已取到
+# 的行（通常为空），由调用方按覆盖不足处理。0 表示不设预算（测试/离线）。
+QUOTE_TRANSPORT_BUDGET_SECONDS = _env_budget("ASTOCK_QUOTE_BUDGET_SECONDS", 12.0)
+# 有序回退链（腾讯→新浪→末源重试）的整体预算；避免每个源各用一份预算后
+# 又叠成一整轮超时。
+QUOTE_CHAIN_BUDGET_SECONDS = _env_budget("ASTOCK_QUOTE_CHAIN_BUDGET_SECONDS", 18.0)
+
+
+def _budget_exhausted(started, budget):
+    return budget > 0 and (time.monotonic() - started) >= budget
 
 
 @runtime_checkable
@@ -237,8 +260,13 @@ class EastmoneyRealtimeFeed:
             return self._empty_meta(normalized)
         transport_succeeded = False
         last_transport_error: BaseException | None = None
+        budget = QUOTE_TRANSPORT_BUDGET_SECONDS
         try:
             for offset in range(0, len(normalized), batch_size):
+                # 预算是**每批**的，不是整次调用的：全市场扫描器会一次请求
+                # 5000 只（25 批），整次预算会把它截成不完整横截面；而单批
+                # 上限保证任何一批都不会烧掉 9 次超时。
+                started = time.monotonic()
                 batch = normalized[offset:offset + batch_size]
                 params = {
                     "pn": 1, "pz": len(batch), "np": 1, "fltt": 2, "invt": 2,
@@ -248,8 +276,12 @@ class EastmoneyRealtimeFeed:
                 batch_by_code: dict[str, QuoteRow] = {}
                 attempts_used = 0
                 for attempt in range(attempts):
+                    if _budget_exhausted(started, budget):
+                        break
                     attempts_used = attempt + 1
                     for host_index in range(len(host_list)):
+                        if _budget_exhausted(started, budget):
+                            break
                         host = host_list[(offset // batch_size + host_index + attempt) % len(host_list)]
                         try:
                             payload = self.get_json(
@@ -272,18 +304,23 @@ class EastmoneyRealtimeFeed:
                             if len(batch_by_code) >= len(batch):
                                 break
                         self.reset_data_source("实时行情源空响应")
-                        self.sleep(0.25 * (attempt + 1))
+                        if not _budget_exhausted(started, budget):
+                            self.sleep(0.25 * (attempt + 1))
                     if len(batch_by_code) >= len(batch):
                         break
                 missing = [code for code in batch if code not in batch_by_code]
                 if missing and len(missing) > 1:
                     small_size = max(1, int(self.small_batch_size))
                     for start in range(0, len(missing), small_size):
+                        if _budget_exhausted(started, budget):
+                            break
                         small = missing[start:start + small_size]
                         small_params = dict(
                             params, secids=",".join(self.secid(code) for code in small), pz=len(small),
                         )
                         for host in host_list:
+                            if _budget_exhausted(started, budget):
+                                break
                             try:
                                 payload = self.get_json(
                                     f"https://{host}/api/qt/ulist.np/get", small_params,
@@ -357,12 +394,14 @@ class TencentRealtimeFeed:
         rows_by_code: dict[str, QuoteRow] = {}
         transport_succeeded = False
         last_transport_error: BaseException | None = None
+        budget = QUOTE_TRANSPORT_BUDGET_SECONDS
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
+                started = time.monotonic()
                 batch = normalized[start:start + max(1, int(self.batch_size))]
                 pending = list(batch)
                 for attempt in range(max(1, int(self.attempts))):
-                    if not pending:
+                    if not pending or _budget_exhausted(started, budget):
                         break
                     try:
                         text = self.http_get(
@@ -381,7 +420,8 @@ class TencentRealtimeFeed:
                     if pending and attempt < max(1, int(self.attempts)) - 1:
                         if not text:
                             self.reset_data_source("腾讯个股独立行情源空响应")
-                        self.sleep(0.25 * (attempt + 1))
+                        if not _budget_exhausted(started, budget):
+                            self.sleep(0.25 * (attempt + 1))
         except Exception as exc:
             self.health.record_exception(self.name, exc, self.reliability, len(normalized))
             return []
@@ -418,11 +458,15 @@ class SinaRealtimeFeed:
         rows_by_code: dict[str, QuoteRow] = {}
         transport_succeeded = False
         last_transport_error: BaseException | None = None
+        budget = QUOTE_TRANSPORT_BUDGET_SECONDS
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
+                started = time.monotonic()
                 batch = normalized[start:start + max(1, int(self.batch_size))]
                 text = ""
                 for attempt in range(max(1, int(self.attempts))):
+                    if _budget_exhausted(started, budget):
+                        break
                     try:
                         response = self.session_factory().get(
                             "https://hq.sinajs.cn/list=" + ",".join(market_symbol(code) for code in batch),
@@ -495,13 +539,17 @@ class DataFeedChain:
         if not normalized:
             return []
         by_code: dict[str, QuoteRow] = {}
+        started = time.monotonic()
         for feed in self.feeds:
+            if _budget_exhausted(started, QUOTE_CHAIN_BUDGET_SECONDS):
+                break
             missing = [code for code in normalized if code not in by_code]
             if not missing:
                 break
             self._merge(by_code, self._safe_fetch(feed, missing), set(missing))
         missing = [code for code in normalized if code not in by_code]
-        if missing and self.retry_last_feed and self.feeds:
+        if (missing and self.retry_last_feed and self.feeds
+                and not _budget_exhausted(started, QUOTE_CHAIN_BUDGET_SECONDS)):
             if self.reset_data_source is not None:
                 self.reset_data_source("腾讯/新浪独立行情均有缺口，自动切换后重试")
             self.sleep(0.25)

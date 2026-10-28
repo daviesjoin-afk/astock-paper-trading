@@ -27,6 +27,8 @@ def fetch_eastmoney_clist(
     fs,
     cooldown_base=30,
     max_cooldown=300,
+    timeout=10,
+    retries=1,
     now=time.time,
 ):
     """Fetch paginated Eastmoney ``clist`` rows through an injected transport.
@@ -66,7 +68,7 @@ def fetch_eastmoney_clist(
             try:
                 response = get_json(
                     f"https://{host}/api/qt/clist/get", params,
-                    timeout=10, retries=1,
+                    timeout=timeout, retries=retries,
                 )
                 data = (response or {}).get("data") or {}
                 diff = data.get("diff") or []

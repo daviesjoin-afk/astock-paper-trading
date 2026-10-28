@@ -325,17 +325,23 @@ def fetch_sector_flow(sector_type="industry"):
             "fields": "f12,f14,f2,f3,f62,f66,f72,f78,f84,f124,f184,f204,f205",
         }
         # 多主机轮换 + 重试：主域名对该接口间歇性返回空（与全市场快照同样的问题）
+        # 但这里是板块轮动的一个输入，单次 15 秒 × 2 次重试 × 3 主机 = 90 秒
+        # 的尾部等待没有意义；改成 6 秒/0 重试 + 12 秒总预算，超时即按缺失处理。
         diff = []
+        deadline = time.monotonic() + 12.0
         for attempt in range(2):
             for host in ["push2delay.eastmoney.com", "push2.eastmoney.com", "82.push2.eastmoney.com"]:
+                if time.monotonic() >= deadline:
+                    break
                 try:
-                    j = _get_json(f"https://{host}/api/qt/clist/get", params)
+                    j = _get_json(f"https://{host}/api/qt/clist/get", params,
+                                  timeout=6, retries=0)
                     diff = (j or {}).get("data", {}).get("diff", []) or []
                 except Exception:
                     diff = []
                 if diff:
                     break
-            if diff:
+            if diff or time.monotonic() >= deadline:
                 break
             time.sleep(0.3)
         rows = []
@@ -663,7 +669,8 @@ _hot_sector_fetch_state = {
 def _sanitize_market_row(row):
     return MN.sanitize_market_row(row)
 
-def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
+def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False,
+                 timeout=10, retries=1):
     """分页拉取 clist，并可返回分页完整性元数据。
 
     ``clist`` 会在单页失败时返回一个看似合法的残片。历史调用方仍默认
@@ -683,6 +690,8 @@ def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
         fs=SNAP_FS,
         cooldown_base=_CLIST_HOST_COOLDOWN_BASE,
         max_cooldown=_CLIST_HOST_MAX_COOLDOWN,
+        timeout=timeout,
+        retries=retries,
     )
 
 def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
@@ -1084,7 +1093,10 @@ def fetch_hot_sector_snapshot(pages=4):
         fields = "f2,f3,f8,f12,f14,f62,f100,f184"
         global _hot_sector_fetch_state
         requested_pages = max(1, min(int(pages), 6))
-        raw_meta = _fetch_clist(fields, fid="f3", pages=requested_pages, return_meta=True)
+        # 热点板块只是候选评分的一个输入（4 页、可降级），不值得为它保留
+        # 「3 主机 × 2 次 × 10 秒」的尾部等待；5 秒/0 重试仍保留主机轮换。
+        raw_meta = _fetch_clist(fields, fid="f3", pages=requested_pages,
+                                return_meta=True, timeout=5, retries=0)
         if not isinstance(raw_meta, dict):
             raw_meta = {"rows": raw_meta or [], "complete": False,
                         "pages_expected": requested_pages, "pages_ok": 0,
