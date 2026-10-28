@@ -65,6 +65,21 @@ ACTIVE_OR_RETRY_ORDER_STATUSES = RECOVERABLE_ORDER_STATUSES + (
     "awaiting_batch", "pending_verification",
 )
 
+# ── A1 phase 2：状态词表的唯一 owner ────────────────────────────────────
+# 引擎此前在 `paper_trading` 里另抄了一份同样的字面量，手单/看板再经
+# 依赖注入拿到它。字面量散落两处时，一次口径调整必然漏改一处；这里让
+# 状态词表只有一个 owner，引擎与下层都从这里取。
+ENTRY_FREEZE_ENV = "PAPER_ENTRY_FREEZE"
+ENTRY_FROZEN_WAITLIST_STATUS = "entry_frozen_waitlist"
+MANUAL_EXECUTION_RETRY_STATUS = "manual_execution_retry"
+STRATEGY_EXECUTION_RETRY_STATUS = "execution_retry"
+ENTRY_RETRY_SIGNAL_STATUSES = ("pending", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS)
+ENTRY_RETRY_ORDER_STATUSES = (
+    "pending_limit", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS,
+    MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
+    "pending_execution", "partially_filled",
+)
+
 
 def _now() -> dt.datetime:
     return dt.datetime.now()

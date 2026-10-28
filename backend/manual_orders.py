@@ -27,6 +27,14 @@ import runtime_settings as RSET
 # `paper_trading` 的全局桥转发一层。时钟（_now/_date）仍作为**可替换的
 # 窄能力**注入：回放与测试需要固定时间点，那是能力而不是实现细节。
 from paper_common import dump_json as _json, load_json as _loads
+# A1 phase 2：状态词表、整手数量与共享池敞口各自由其 owner 提供。
+from entry_lifecycle import (
+    ENTRY_FREEZE_ENV,
+    ENTRY_FROZEN_WAITLIST_STATUS,
+    ENTRY_RETRY_ORDER_STATUSES,
+)
+from paper_shared_cash import SHARED_POOL_MAX_EXPOSURE
+from paper_trading_rules import LOT_SIZE
 from paper_numeric import num as _num
 
 # 这些能力有**独立 owner**（决策引擎、组合分配/运行时、预占、运行时设置），
@@ -44,12 +52,7 @@ from typing import Any, Callable
 class ManualOrderDependencies:
     """Explicit capabilities supplied by the application composition root."""
     ACTIVE_ACCOUNT_IDS: Any
-    ENTRY_FREEZE_ENV: Any
-    ENTRY_FROZEN_WAITLIST_STATUS: Any
-    ENTRY_RETRY_ORDER_STATUSES: Any
-    LOT_SIZE: Any
     MANUAL_EXECUTION_RETRY_STATUS: Any
-    SHARED_POOL_MAX_EXPOSURE: Any
     STRATEGY_EXECUTION_RETRY_STATUS: Any
     _assert_active_lease: Any
     _assert_order_execution_cycle: Any
@@ -113,10 +116,6 @@ def _manual_order_plan(
     deps = _dependencies()
     _order_cycle_id = deps._order_cycle_id
     ACTIVE_ACCOUNT_IDS = deps.ACTIVE_ACCOUNT_IDS
-    ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
-    LOT_SIZE = deps.LOT_SIZE
-    SHARED_POOL_MAX_EXPOSURE = deps.SHARED_POOL_MAX_EXPOSURE
     _spec_for = deps._spec_for
     _asset_type = deps._asset_type
     _completed_kline = deps._completed_kline
@@ -864,7 +863,6 @@ def submit_manual_order(
 ):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
     MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
     _audit = deps._audit
     _date = deps._date
@@ -1020,7 +1018,6 @@ def submit_manual_order(
 def cancel_manual_order(order_id):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ENTRY_RETRY_ORDER_STATUSES = deps.ENTRY_RETRY_ORDER_STATUSES
     _audit = deps._audit
     _db = deps._db
     _finish_capital_reservation = deps._finish_capital_reservation
@@ -1171,9 +1168,6 @@ def _terminalize_cycle_stale_order(conn, order, exc):
 def process_pending_manual_orders(asof_date=None):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
-    ENTRY_RETRY_ORDER_STATUSES = deps.ENTRY_RETRY_ORDER_STATUSES
     MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
     _assert_active_lease = deps._assert_active_lease
     _audit = deps._audit

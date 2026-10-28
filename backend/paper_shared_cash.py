@@ -13,6 +13,10 @@ import math
 import paper_cycle_ownership as PCY
 
 
+# A1 phase 2：共享池敞口硬上限的唯一 owner（引擎此前只在 paper_trading 里定义）。
+SHARED_POOL_MAX_EXPOSURE = 0.82
+
+
 def _default_num(value, default=0.0):
     if isinstance(value, (int, float)) and not math.isnan(float(value)):
         return float(value)

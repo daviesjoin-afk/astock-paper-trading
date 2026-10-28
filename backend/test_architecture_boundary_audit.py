@@ -62,6 +62,13 @@ class CouplingBudgetTests(unittest.TestCase):
     # （666 → 673；paper_risk_evidence / paper_risk_service 等早已这样做）。
     # 显式依赖比隐藏的 globals 桥更可核对，故按实测收紧额度外的增量记录。
     #
+    # 同日（A1 phase 2：常量归位）：状态词表（entry_lifecycle）、整手数量
+    # （paper_trading_rules）、共享池敞口（paper_shared_cash）各自成为唯一
+    # owner，引擎与三个 vertical 都直接取用，不再各抄一份字面量。
+    # 依赖字段 86 → 78，代价是 +3 条指向这些**叶子/基础 owner** 的显式边
+    # （673 → 676）。度量器把叶子模块也算作跨域，这是口径问题：这些模块
+    # 不含任何业务域依赖，导入它们不产生新的域间耦合。额度 49 → 52。
+    #
     # 同日（低频状态跨进程缓存）：`paper_live_tradability` 新增 `data_paths`
     # 与 `marketdata_cache` 两条跨域边（paper → data / other），用于把停牌报表
     # 落到 data_cache 并复用 single-flight 原子发布。664 → 668。额度 42 → 44。
@@ -71,7 +78,7 @@ class CouplingBudgetTests(unittest.TestCase):
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 49,
+        "cross_domain_edges": 52,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,

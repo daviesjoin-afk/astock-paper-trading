@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 # A1：纯工具直接 import，不再经 `paper_trading` 的全局桥转发。
 from paper_common import load_json as _loads
+from entry_lifecycle import ENTRY_FROZEN_WAITLIST_STATUS
 from paper_numeric import num as _num
 
 
@@ -37,7 +38,6 @@ def active_cycle_readonly(conn):
 class DashboardDependencies:
     """Explicit capabilities supplied by the application composition root."""
     ACCOUNT_SPECS: Any
-    ENTRY_FROZEN_WAITLIST_STATUS: Any
     _account_metric_inputs: Any
     _account_metrics: Any
     _account_reference_capital: Any
@@ -104,7 +104,6 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
 
     deps = dependencies if dependencies is not None else _dependencies()
     ACCOUNT_SPECS = deps.ACCOUNT_SPECS
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
     _account_metric_inputs = deps._account_metric_inputs
     _account_metrics = deps._account_metrics
     _account_reference_capital = deps._account_reference_capital

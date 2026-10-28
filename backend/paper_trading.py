@@ -118,6 +118,7 @@ import paper_risk_service as PRSVC
 import runtime_settings as RSET
 from market_policy import market_light_scale
 from paper_trading_rules import (
+    LOT_SIZE as _LOT_SIZE,  # A1 phase 2: the lot-size owner
     CHINEXT_PREFIXES,  # noqa: F401 - legacy public compatibility export
     COMMISSION,  # noqa: F401 - legacy public compatibility export
     MAIN_BOARD_PREFIXES,  # noqa: F401 - legacy public compatibility export
@@ -190,7 +191,7 @@ MAIN_FORCE_STRATEGY_ID = SPOL.MAIN_FORCE_STRATEGY_ID
 # ``paper_account_specs``；本模块只保留兼容别名与唯一解析口 ``_spec_for``。
 NEW_STRATEGY_VERSION = ACS.NEW_STRATEGY_VERSION
 MAIN_FORCE_STRATEGY_VERSION = ACS.MAIN_FORCE_STRATEGY_VERSION
-LOT_SIZE = 100
+LOT_SIZE = _LOT_SIZE
 # 集中化配对约束：席位稀缺时，低于当前周期单席可表达金额的新开仓是
 # "尘埃仓"。阈值按周期声明本金、共享池硬敞口和股票持仓上限动态计算，
 # 不再固定为 10,000 元；仅约束预算侧小单，风险约束导致的低价股整手规模
@@ -202,7 +203,7 @@ MIN_ORDER_ROUNDING = 100.0
 # using any one of them as the pool ceiling makes the other strategies see a
 # permanently full account (for example 70% pool utilisation is already above
 # the 55% breakout ceiling).  Keep one explicit pool-level hard cap instead.
-SHARED_POOL_MAX_EXPOSURE = 0.82
+SHARED_POOL_MAX_EXPOSURE = PSC.SHARED_POOL_MAX_EXPOSURE
 # 超强主力资金优先（2026-09-03）：该策略池内收益最高、仅 3 席集中持仓，
 # 市场黄灯 60% 缩水后目标额度可能不足一手高价股（例：300489 一手
 # ¥23,202，黄灯下剩余额度仅约 ¥20,000）。为其保留不随灯色缩水的最低
@@ -284,16 +285,14 @@ ENTRY_CAPACITY_POLICY = "count-primary-amount-soft-v1"
 # stale or incomplete gate freezes only new entries.  Operators can still use
 # ``1`` for a hard freeze or ``0`` for a controlled replay; risk exits never
 # consult this switch.
-ENTRY_FREEZE_ENV = "PAPER_ENTRY_FREEZE"
-ENTRY_FROZEN_WAITLIST_STATUS = "entry_frozen_waitlist"
-ENTRY_RETRY_SIGNAL_STATUSES = ("pending", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS)
-MANUAL_EXECUTION_RETRY_STATUS = "manual_execution_retry"
-STRATEGY_EXECUTION_RETRY_STATUS = "execution_retry"
-ENTRY_RETRY_ORDER_STATUSES = (
-    "pending_limit", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS,
-    MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
-    "pending_execution", "partially_filled",
-)
+ENTRY_FREEZE_ENV = ELC.ENTRY_FREEZE_ENV
+# 状态词表的唯一 owner 是 `entry_lifecycle`（A1 phase 2）：引擎、手单与看板
+# 都从那里取，避免同一批字面量在多处漂移。
+ENTRY_FROZEN_WAITLIST_STATUS = ELC.ENTRY_FROZEN_WAITLIST_STATUS
+ENTRY_RETRY_SIGNAL_STATUSES = ELC.ENTRY_RETRY_SIGNAL_STATUSES
+MANUAL_EXECUTION_RETRY_STATUS = ELC.MANUAL_EXECUTION_RETRY_STATUS
+STRATEGY_EXECUTION_RETRY_STATUS = ELC.STRATEGY_EXECUTION_RETRY_STATUS
+ENTRY_RETRY_ORDER_STATUSES = ELC.ENTRY_RETRY_ORDER_STATUSES
 # Retry/waitlist states are kept for research and re-ranking, but are not all
 # real capacity reservations.  In particular, a deferred candidate has no
 # cash reservation and must never consume a slot merely because it is waiting

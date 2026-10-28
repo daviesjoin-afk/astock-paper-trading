@@ -6,6 +6,8 @@
 旧的内部调用和回放脚本不需要一次性迁移。
 """
 
+# A1 phase 2：整手数量的唯一 owner（引擎此前只在 paper_trading 里定义）。
+LOT_SIZE = 100
 COMMISSION = 0.0001
 MIN_COMMISSION = 0.0
 STAMP_SELL = 0.0005

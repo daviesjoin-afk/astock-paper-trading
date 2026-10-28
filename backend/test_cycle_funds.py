@@ -86,5 +86,24 @@ class CycleFundsTests(unittest.TestCase):
         self.assertEqual(7, funds["cycle_id"])
 
 
+class StatusVocabularyOwnerTests(unittest.TestCase):
+    """A1 phase 2：状态词表只有一个 owner，引擎不得再抄一份。"""
+
+    def test_engine_constants_come_from_the_owner(self):
+        import entry_lifecycle as ELC
+        self.assertEqual(ELC.ENTRY_FROZEN_WAITLIST_STATUS, PT.ENTRY_FROZEN_WAITLIST_STATUS)
+        self.assertEqual(ELC.ENTRY_RETRY_SIGNAL_STATUSES, PT.ENTRY_RETRY_SIGNAL_STATUSES)
+        self.assertEqual(ELC.ENTRY_RETRY_ORDER_STATUSES, PT.ENTRY_RETRY_ORDER_STATUSES)
+        self.assertEqual(ELC.MANUAL_EXECUTION_RETRY_STATUS, PT.MANUAL_EXECUTION_RETRY_STATUS)
+        self.assertEqual(ELC.STRATEGY_EXECUTION_RETRY_STATUS, PT.STRATEGY_EXECUTION_RETRY_STATUS)
+        self.assertEqual(ELC.ENTRY_FREEZE_ENV, PT.ENTRY_FREEZE_ENV)
+
+    def test_lot_size_and_pool_exposure_come_from_their_owners(self):
+        import paper_shared_cash as PSC
+        import paper_trading_rules as PTRules
+        self.assertEqual(PTRules.LOT_SIZE, PT.LOT_SIZE)
+        self.assertEqual(PSC.SHARED_POOL_MAX_EXPOSURE, PT.SHARED_POOL_MAX_EXPOSURE)
+
+
 if __name__ == "__main__":
     unittest.main()
