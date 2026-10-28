@@ -21,12 +21,14 @@ the deterministic data-quality and evolution gates.
 留在旧表（legacy rows stay legacy，不迁移、不回填）。
 
 **本模块里没有迁移的是 tuner。** ``run_realtime_tuning`` / ``_tuning_*`` 仍然是有界调参
-的 legacy 路径，仍然走 ``call_json``。R27-B2C-6 起它**不再自己写候选 ledger**：影子候选由
+的 legacy 路径，仍然走 ``call_json``（B5 后它只是共享传输层的薄 facade）。R27-B2C-6 起它**不再自己写候选 ledger**：影子候选由
 selection owner 的窄接口 ``adaptive_selection.record_shadow_proposal`` 持久化，``status`` /
 ``tier`` 由 owner 独占决定，本模块只作为 **proposal producer / caller**。tuner 自身的运行
 记录仍写在本模块自己的 ``adaptive_ai_tuning_runs`` 里，属于它的 legacy 记账。
-这也意味着本模块**仍然**持有 legacy provider 网络调用（``call_json``），它不是 R27
-provider 链路的一部分。
+B5 之后本模块**不再自己发网络请求**：legacy 调参的配置解析收进
+``ai_provider_config``（唯一 owner），实际 HTTP 仍由 ``ai_provider_transport``
+发出——与 R27 provider 链路共用同一套传输与错误归一化，但输入/证据/权限/输出
+仍是 legacy 调参自己的那一套。
 
 ──────────────── 迁移后的 provider 配置权威 ────────────────
 
@@ -53,8 +55,6 @@ import os
 import sqlite3
 from pathlib import Path
 import time
-import urllib.error
-import urllib.request
 from collections import Counter
 from zoneinfo import ZoneInfo
 
@@ -62,6 +62,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("Asia/Shanghai")
 from adaptive_common import _now  # C3: _loads 保留本地（空值语义与规范版不同）
 
+import ai_provider_config as APC
 import ai_research_contract as ARC
 import ai_research_repository
 import ai_research_service
@@ -98,18 +99,12 @@ class ResearchReadinessError(RuntimeError):
 
 # Provider-neutral catalog: only DeepSeek is active today; Kimi/MIMO are
 # deliberately capability placeholders until their credentials are configured.
-PROVIDER_CATALOG = {
-    "deepseek": {"label": "DeepSeek", "status": "active", "default_model": DEFAULT_MODEL, "base_url_env": "DEEPSEEK_BASE_URL", "api_key_env": "DEEPSEEK_API_KEY"},
-    "kimi": {"label": "Kimi", "status": "reserved", "default_model": "moonshot-v1-8k", "base_url_env": "KIMI_BASE_URL", "api_key_env": "KIMI_API_KEY"},
-    "mimo": {"label": "MIMO", "status": "active", "default_model": "mimo-v1", "base_url_env": "MIMO_BASE_URL", "api_key_env": "MIMO_API_KEY"},
-}
-
-def provider_catalog():
-    return {key: dict(value) for key, value in PROVIDER_CATALOG.items()}
-
-def provider_name():
-    value = str(os.getenv("LLM_PROVIDER") or "deepseek").strip().lower()
-    return value if value in PROVIDER_CATALOG else "deepseek"
+# B5：厂商目录与环境变量解析收敛到 `ai_provider_config`（唯一 owner）。
+# 这里直接别名导出，历史调用方与页面不需要一次性迁移；别名而不是包装函数，
+# 是为了同一份实现只存在一份（度量器按定义计数，包装会变成第二份副本）。
+PROVIDER_CATALOG = APC.PROVIDER_CATALOG
+provider_catalog = APC.provider_catalog
+provider_name = APC.provider_name
 
 SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
@@ -132,19 +127,9 @@ def _truthy(value):
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
-def enabled(config=None):
-    return _truthy(os.getenv("LLM_ADVISOR_ENABLED")) or bool((config or {}).get("llm_advisor_enabled", False))
-
-
-def configured():
-    spec = PROVIDER_CATALOG[provider_name()]
-    return bool(str(os.getenv(spec["api_key_env"]) or "").strip())
-
-
-def model_name():
-    provider = provider_name()
-    env_name = PROVIDER_CATALOG[provider]["default_model"]
-    return str(os.getenv(f"{provider.upper()}_MODEL") or env_name).strip() or env_name
+enabled = APC.enabled
+configured = APC.configured
+model_name = APC.model_name
 
 
 def ensure_schema(conn):
@@ -547,36 +532,13 @@ def collect_evidence(adaptive_conn, paper_db_path, snapshot_paths):
 
 
 def call_json(system, user, max_tokens=1800):
-    provider = provider_name()
-    spec = PROVIDER_CATALOG[provider]
-    api_key = str(os.getenv(spec["api_key_env"]) or "").strip()
-    if not api_key:
-        raise RuntimeError("api_key_missing")
-    defaults = {"deepseek": "https://api.deepseek.com", "kimi": "https://api.moonshot.cn/v1", "mimo": "https://api.mimo.ai/v1"}
-    base_url = str(os.getenv(spec["base_url_env"]) or defaults[provider]).rstrip("/")
-    model = model_name()
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-        "max_tokens": max(400, min(int(max_tokens), 4000)),
-        "stream": False,
-    }
-    request = urllib.request.Request(
-        base_url + "/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS") or 35)) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    content = payload["choices"][0]["message"]["content"]
-    usage = payload.get("usage") or {}
-    return json.loads(content), int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+    """B5：网络与协议解析统一由 `ai_provider_transport` 负责。
+
+    legacy 曾经自带一份 urllib 调用：同一厂商两套 base_url 默认值、两套超时、
+    两套错误文案，而且凭据可能随异常逃逸。这里只保留旧的三元组形状与
+    ``api_key_missing`` reason，实际请求走共享传输层。
+    """
+    return APC.call_json(system, user, max_tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
