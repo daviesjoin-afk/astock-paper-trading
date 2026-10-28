@@ -50,6 +50,23 @@ def cycle_shared_cash(conn, cycle_id, *, builtin_scope, num_fn=_default_num):
                        num_fn=num_fn)
 
 
+def cycle_funds(conn, cycle_id, *, builtin_scope, declared_capital=None, num_fn=_default_num):
+    """Explicit-cycle fund facts for one cycle's economic owners.
+
+    A4：资金读数必须能绑定到**明确的周期**，而不是"当前周期"。这里返回该
+    周期自己的 owner 行、初始资金与现金。跨周期的在途预占由预占 owner
+    单独全局统计（旧周期的预占同样占用真实共享池），本模块不按周期过滤，
+    也不引用预占实现。
+    """
+    rows = cycle_account_rows(conn, cycle_id, builtin_scope=builtin_scope)
+    return {
+        "cycle_id": cycle_id,
+        "initial_cash": shared_initial_cash(rows, declared_capital, num_fn=num_fn),
+        "cash": shared_cash(rows, num_fn=num_fn),
+        "owner_ids": tuple(str(row.get("id") or "") for row in rows),
+    }
+
+
 def shared_initial_cash(rows, declared_capital=None, *, num_fn=_default_num):
     """Return declared capital or the existing per-row initial-cash fallback."""
     declared = num_fn(declared_capital)

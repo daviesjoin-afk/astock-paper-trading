@@ -43,6 +43,9 @@ from zoneinfo import ZoneInfo
 from collections.abc import Mapping
 from typing import Any
 
+# A1：JSON 序列化直接 import owner；时钟仍是可替换的窄能力。
+from paper_common import dump_json as _json
+
 import paper_position_risk_state as PPRS
 import market_data_contract as MDC
 import paper_trading_rules as PTR
@@ -1030,7 +1033,6 @@ class ExecutionDependencies:
     _debit_shared_cash: Any
     _execution_quote_status: Any
     _finish_capital_reservation: Any
-    _json: Any
     _now: Any
     _order_cycle_provenance_for_order: Any
     _pending_buy_reservations: Any
@@ -1982,7 +1984,7 @@ def commit_fill(
                           remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
                     WHERE id=? AND execution_version=?""",
                 (next_status, decision.execution_asof,
-                 PT._json(list(decision.reasons)), PT._json(execution_evidence),
+                 _json(list(decision.reasons)), _json(execution_evidence),
                  decision.ruleset_version, order_id, current_version),
             )
             PT._risk_log(
@@ -2072,8 +2074,8 @@ def commit_fill(
                              'pending_limit','pending_verification','execution_retry',
                              'manual_execution_retry')""",
         (next_status, total_filled, remaining_qty, average_price, total_amount,
-         total_fees, reason, PT._json(fill_detail), decision.execution_asof,
-         PT._json(list(decision.reasons)), PT._json(execution_evidence),
+         total_fees, reason, _json(fill_detail), decision.execution_asof,
+         _json(list(decision.reasons)), _json(execution_evidence),
          decision.pricing_basis, decision.slippage_amount, decision.ruleset_version,
          decision.execution_asof, order_id, current_version, prior_qty, qty),
     )
@@ -2159,8 +2161,8 @@ def commit_fill(
          (order_id, account_id, side, code, qty, fill_price, amount, fees,
           PT._date(asof_day).isoformat(), quote_at, assumption, event_key,
           decision.execution_asof, decision.pricing_basis, decision.slippage_amount,
-          PT._json(_plain_evidence(decision.market_evidence)), decision.ruleset_version,
-          PT._json(_plain_evidence(fill_event.execution_evidence))),
+          _json(_plain_evidence(decision.market_evidence)), decision.ruleset_version,
+          _json(_plain_evidence(fill_event.execution_evidence))),
     )
     # 逐笔成交血缘（R26）：一次 BUY 成交 → 一个 lot → **这一笔** FillEvent。
     # 只有 ``source_order_id`` 时，"一笔委托多次部分成交"的每个 lot 都只能指向

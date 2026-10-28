@@ -2970,7 +2970,24 @@ def _shared_account_exposure(conn, quotes, asof_day=None, *, cycle_id=None):
     return positions, value, (cash + value) if cash is not None else None, industries, codes
 
 
-def _shared_risk_state(conn, account, nav, asof_day):
+def _cycle_funds(conn, cycle_id):
+    """显式周期的资金事实（初始资金 + 现金 + owner 集合）。
+
+    A4：读资金必须带周期；跨周期在途预占仍由
+    ``_pending_buy_reservations`` 全局统计，不因周期过滤而少算。
+    """
+    cycle_id = int(cycle_id)
+    declared = None
+    row = conn.execute("SELECT capital FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
+    if row is not None:
+        declared = _num(row["capital"])
+    return PSC.cycle_funds(
+        conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS,
+        declared_capital=declared, num_fn=_num,
+    )
+
+
+def _shared_risk_state(conn, account, nav, asof_day, *, cycle_id=None):
     """Apply each strategy's risk profile to the same pool-level NAV path."""
     profile = _risk_profile(account, conn=conn)
     day = _date(asof_day).isoformat()
@@ -2978,8 +2995,12 @@ def _shared_risk_state(conn, account, nav, asof_day):
     # 无影响，但未来多周期并存时未过滤会把其他周期的净值混入熔断基线。
     rows = _economic_pool_nav_history(conn)
     previous = [(_num(row.get("nav")), row.get("nav_date")) for row in rows if row.get("nav_date") < day]
-    start_nav = previous[-1][0] if previous else _shared_initial_cash(conn)
-    peak = max([value for value, _ in previous] + [nav, _shared_initial_cash(conn)])
+    if cycle_id is None:
+        baseline_cash = _shared_initial_cash(conn)
+    else:
+        baseline_cash = _cycle_funds(conn, cycle_id)["initial_cash"]
+    start_nav = previous[-1][0] if previous else baseline_cash
+    peak = max([value for value, _ in previous] + [nav, baseline_cash])
     daily_loss = 1 - nav / start_nav if start_nav else 0.0
     drawdown = 1 - nav / peak if peak else 0.0
     reasons = []

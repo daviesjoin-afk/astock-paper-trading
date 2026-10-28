@@ -55,6 +55,13 @@ class CouplingBudgetTests(unittest.TestCase):
     # 跨域边，共 +2（664 → 666）；其余三个调用方都在 `other` 域，不新增边。
     # 这是"共享实现替代复制"的代价，不是新业务耦合。
     #
+    # 同日（A1 第一组：共享工具下沉）：`manual_orders` / `dashboard_queries` /
+    # `execution_planner` 把时钟/JSON/数值工具改为直接 import 各自的 owner
+    # （paper_common / paper_numeric），不再经 `paper_trading` 的全局桥转发。
+    # 三个 vertical 的依赖字段共 92 → 80（-12），代价是 +5 条显式跨域边
+    # （666 → 673；paper_risk_evidence / paper_risk_service 等早已这样做）。
+    # 显式依赖比隐藏的 globals 桥更可核对，故按实测收紧额度外的增量记录。
+    #
     # 同日（低频状态跨进程缓存）：`paper_live_tradability` 新增 `data_paths`
     # 与 `marketdata_cache` 两条跨域边（paper → data / other），用于把停牌报表
     # 落到 data_cache 并复用 single-flight 原子发布。664 → 668。额度 42 → 44。
@@ -64,7 +71,7 @@ class CouplingBudgetTests(unittest.TestCase):
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 44,
+        "cross_domain_edges": 49,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,

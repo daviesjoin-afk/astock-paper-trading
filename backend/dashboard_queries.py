@@ -14,6 +14,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+# A1：纯工具直接 import，不再经 `paper_trading` 的全局桥转发。
+from paper_common import load_json as _loads
+from paper_numeric import num as _num
+
 
 class DashboardUnavailable(RuntimeError):
     """The initialized ledger has no readable current cycle."""
@@ -44,9 +48,7 @@ class DashboardDependencies:
     _execution_verified_predicate: Any
     _hold_days: Any
     _latest_price_map: Any
-    _loads: Any
     _market_session: Any
-    _num: Any
     _position_rows: Any
     _recent_orders_with_archives: Any
     _rows: Any
@@ -112,9 +114,7 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
     _entry_freeze_status = deps._entry_freeze_status
     _hold_days = deps._hold_days
     _latest_price_map = deps._latest_price_map
-    _loads = deps._loads
     _market_session = deps._market_session
-    _num = deps._num
     _position_rows = deps._position_rows
     _recent_orders_with_archives = deps._recent_orders_with_archives
     _rows = deps._rows
