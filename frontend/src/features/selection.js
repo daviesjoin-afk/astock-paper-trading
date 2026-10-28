@@ -245,20 +245,35 @@ export async function checkInit(){
     }
     if(!st.data_ready){
       $('initBanner').innerHTML = '<div class="banner">首次使用需初始化沪深北全市场 3 年历史K线（当前约5500只，耗时取决于网络）。'
-        + '<button style="margin-left:12px" onclick="startInit()">开始初始化</button></div>';
+        + '<button style="margin-left:12px" data-selection-action="init">开始初始化</button></div>';
       return;
     }
     if(h.warnings && h.warnings.length){
       $('initBanner').innerHTML = '<div class="banner">数据状态：'+h.warnings.join('；')
         +'。最新交易日 '+(h.latest_trade_date||'-')+'，历史覆盖 '+h.kline_files+'/'+h.history_required+'（'+fmt(h.coverage_pct,1)+'%），待上市 '+h.pending_listing_count+' 只；'
         +'选股可用 '+h.selection_usable+' 只，回测可用 '+h.backtest_usable+' 只。'
-        +'<button style="margin-left:12px" onclick="startInit()">增量补齐</button></div>';
+        +'<button style="margin-left:12px" data-selection-action="init">增量补齐</button></div>';
     }else{
       $('initBanner').innerHTML = '<div style="font-size:12px;color:#6b7280;margin-bottom:10px">数据已就绪 · 全市场 '+h.universe_size+' 只（待上市 '+h.pending_listing_count+'）· 历史覆盖 '+fmt(h.coverage_pct,1)+'% · 选股可用 '+h.selection_usable+' · 回测可用 '+h.backtest_usable+'</div>';
     }
   }catch(e){
     $('initBanner').innerHTML = '<div class="banner">数据健康检查失败：'+e.message+'</div>';
   }
+}
+
+// C2（逐页撤全局桥）：选股页的初始化按钮改为 data 属性 + 事件委托。
+export function installSelectionActions(root){
+  var container=root||(typeof document!=='undefined'?document:null);
+  if(!container||typeof container.addEventListener!=='function') return false;
+  container.addEventListener('click', function(event){
+    var target=event.target;
+    var button=target&&target.closest?target.closest('[data-selection-action]'):null;
+    if(!button) return;
+    if(String(button.dataset.selectionAction||'')!=='init') return;
+    event.preventDefault();
+    startInit();
+  });
+  return true;
 }
 
 export async function startInit(){ await apiPost('/api/init?years=3&size=0'); checkInit(); }

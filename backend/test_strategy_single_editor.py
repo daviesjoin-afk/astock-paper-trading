@@ -114,7 +114,8 @@ class FrontendSingleEditorTests(unittest.TestCase):
 
     def test_paper_view_links_to_the_workbench(self):
         block = self._paper_view_block()
-        self.assertIn("openInStrategyWorkbench", block)
+        # C2：链接改成 data 属性 + 事件委托，不再直接调用全局函数。
+        self.assertIn('data-paper-action="open-workbench"', block)
         start = self.source.index("function openInStrategyWorkbench(strategyId){")
         body = self.source[start:start + 600]
         self.assertIn("activatePage('p-strategies')", body)
