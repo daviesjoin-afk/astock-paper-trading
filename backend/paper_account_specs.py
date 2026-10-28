@@ -138,7 +138,7 @@ RISK_PROFILES = {
 # ---------------------------------------------------------------------------
 ACCOUNT_SPECS = {
     "tq_breakout": {
-        "name": "激进做T",
+        "name": "短线日内做T",
         "mode": "intraday_t",
         "source_strategy": "first_board_relay",
         "risk_profile": "breakout",
@@ -169,7 +169,7 @@ ACCOUNT_SPECS = {
         "gap_q2": (-0.03, 0.07),
     },
     "trend_pullback": {
-        "name": "稳健波段",
+        "name": "趋势波段优选",
         "mode": "swing",
         "source_strategy": "pullback_reversal",
         "risk_profile": "trend",
@@ -228,7 +228,7 @@ ACCOUNT_SPECS = {
         "gap_q2": (-0.025, 0.06),
     },
     NEW_STRATEGY_ID: {
-        "name": "保守防守",
+        "name": "三日策略",
         "mode": "swing",
         "source_strategy": NEW_STRATEGY_ID,
         "risk_profile": "core_quality",

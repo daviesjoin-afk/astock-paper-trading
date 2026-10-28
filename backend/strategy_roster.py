@@ -68,7 +68,7 @@ ROLES = (
     StrategyRole(
         strategy_id="tq_breakout",
         role=AGGRESSIVE,
-        name="激进做T",
+        name="短线日内做T",
         objective="用已有底仓的日内波动降低持仓成本；底仓涨跌另计",
         budget_share=0.20,
         within_budget_exposure=0.70,
@@ -84,7 +84,7 @@ ROLES = (
     StrategyRole(
         strategy_id="trend_pullback",
         role=BALANCED,
-        name="稳健波段",
+        name="趋势波段优选",
         objective="吃持续数日至数周的趋势；趋势确认后等回踩，不因单日涨幅第一而换股",
         budget_share=0.50,
         within_budget_exposure=0.65,
@@ -100,7 +100,7 @@ ROLES = (
     StrategyRole(
         strategy_id="reported_profit_breakout",
         role=CONSERVATIVE,
-        name="保守防守",
+        name="三日策略",
         objective="少犯错、低换手、多留现金；质量与估值先承担风险过滤职责",
         budget_share=0.30,
         within_budget_exposure=0.35,
