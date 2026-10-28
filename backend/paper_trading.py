@@ -13952,6 +13952,17 @@ def _run_slot_impl(slot, day, force=False):
                         conn, slot=slot, market_date=day.isoformat(),
                         run_key=intraday_key, detail=_json(prior_detail), now=_now(),
                     )
+                    # 进程被 SIGKILL/OOM 时任务行会被回收，但全局 runtime lease
+                    # 仍留在 paper_runtime_locks 直到 TTL（close/risk 为 40 分钟）。
+                    # 不释放它，15:10/15:12/15:25 的兜底窗口都会以
+                    # "上一轮全市场任务仍在执行" 被跳过。fencing_token 保证只删除
+                    # 被回收的那一代，不会误删新进程的租约。
+                    stale_owner = exists["owner_key"] if "owner_key" in exists.keys() else None
+                    if stale_owner:
+                        _release_runtime_lease(
+                            conn, runtime_lock_key, stale_owner,
+                            exists["fencing_token"] if "fencing_token" in exists.keys() else None,
+                        )
                     exists = PJL.read_job(conn, slot=slot, market_date=day.isoformat(),
                                        run_key=intraday_key)
             retry_count = int(prior_detail.get("retry_count") or 0)
