@@ -5,7 +5,7 @@ import { PAPER_VIEW_KEY, SETTINGS_SECTION_KEY, activatePage, installHashRouting,
 import { installAdaptiveOperatorActions, loadAdaptive, loadEvolutionStatus, setAdaptiveSection } from "./features/adaptive.js";
 import { loadPaperExecution } from "./features/execution.js";
 import { loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPortfolioWorkspace } from "./features/paper.js";
-import { loadPaperRisk } from "./features/risk.js";
+import { installPaperRiskActions, loadPaperRisk } from "./features/risk.js";
 import { loadDataValidity, loadMarketGate, loadPaperSelection, loadStrategies } from "./features/selection.js";
 import { loadSettings } from "./features/settings.js";
 import { loadStrategyWorkbench } from "./features/strategies.js";
@@ -28,6 +28,7 @@ window.addEventListener('resize',syncWorkspaceTabRails,{passive:true});
 /* 资金分摊 / 调参的应用与回滚由 p-adaptive 自己持有（data-adaptive-action 委托），
    启动文件不再挂这四个 window 全局、也不再承接业务写操作。 */
 installAdaptiveOperatorActions(document);
+installPaperRiskActions(document);
 
 /* 页面加载时自动执行 */
 setTimeout(function(){if(document.getElementById('aiStatusCards')) loadEvolutionStatus();},1000);

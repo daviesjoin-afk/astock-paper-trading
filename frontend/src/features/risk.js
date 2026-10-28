@@ -7,6 +7,24 @@ import { PAPER_NAV_TTL_MS } from "../core/state.js";
 
 var auditState={filters:{account_id:'',level:'',date:''},cursors:[null],page:0,data:null,sequence:0};
 
+// C2（逐页撤全局桥）：风控页的动作按钮改为 data 属性 + 事件委托，
+// 不再依赖 window.loadPaperAudit / window.loadPaperRisk 这两个全局函数。
+export function installPaperRiskActions(root){
+  var container=root||(typeof document!=='undefined'?document:null);
+  if(!container||typeof container.addEventListener!=='function') return false;
+  container.addEventListener('click', function(event){
+    var target=event.target;
+    var button=target&&target.closest?target.closest('[data-risk-action]'):null;
+    if(!button) return;
+    var action=String(button.dataset.riskAction||'');
+    if(action==='audit-retry'){ event.preventDefault(); loadPaperAudit(); return; }
+    if(action==='audit-prev'){ event.preventDefault(); loadPaperAudit('prev'); return; }
+    if(action==='audit-next'){ event.preventDefault(); loadPaperAudit('next'); return; }
+    if(action==='risk-retry'){ event.preventDefault(); loadPaperRisk(true); }
+  });
+  return true;
+}
+
 export function applyPaperRiskAuditFilter(){
   auditState.filters={
     account_id:($('paperRiskAccountFilter')||{}).value||'',
@@ -47,7 +65,7 @@ export async function loadPaperAudit(direction, prefetched){
     var message='风控历史查询失败：'+(e.message||e)+'。请重试。';
     status=$('paperRiskAuditStatus');
     if(status) status.textContent=message;
-    else host.innerHTML='<div class="banner" role="status">'+riskText(message)+'</div><button onclick="loadPaperAudit()">重试</button>';
+    else host.innerHTML='<div class="banner" role="status">'+riskText(message)+'</div><button data-risk-action="audit-retry">重试</button>';
     if($('paperRiskAuditPrev')) $('paperRiskAuditPrev').disabled=auditState.page===0;
     if($('paperRiskAuditNext')) $('paperRiskAuditNext').disabled=!next.has_next;
   }
@@ -75,7 +93,7 @@ export function renderPaperAudit(d,filters,page){
     return '<tr data-account="'+riskText(a.account_id)+'" data-level="'+riskText(a.level)+'" data-date="'+riskText(String(a.time||'').slice(0,10))+'"><td>'+riskText(a.time)+'</td><td>'+riskText(a.account_name)+'</td><td>'+symbol+'</td><td><span class="risk-pill '+riskText(a.level)+'">'+riskText(riskLevelView(a.level)[1])+'</span></td><td>'+zhRiskText(a.reason)+'</td><td><span class="quote-check '+validationClass+'" title="'+zhRiskText(validationText)+'">'+validationLabel+'</span><small class="quote-check-detail">'+zhRiskText(validationText)+'</small></td><td>'+zhRiskText(actionText)+'</td><td>'+zhRiskText(a.execution_mode)+'</td><td>'+zhRiskText(a.rule_version)+'</td></tr>';
   }).join('');
   var pagination=d.pagination||{};
-  var navigation='<div class="paper-filter-bar"><span id="paperRiskAuditStatus" role="status">共 '+riskText(pagination.total==null?(d.alerts||[]).length:pagination.total)+' 条 · 第 '+(page+1)+' 页</span><button id="paperRiskAuditPrev" onclick="loadPaperAudit(\'prev\')"'+(page===0?' disabled':'')+'>上一页</button><button id="paperRiskAuditNext" onclick="loadPaperAudit(\'next\')"'+(!pagination.has_next?' disabled':'')+'>下一页</button></div>';
+  var navigation='<div class="paper-filter-bar"><span id="paperRiskAuditStatus" role="status">共 '+riskText(pagination.total==null?(d.alerts||[]).length:pagination.total)+' 条 · 第 '+(page+1)+' 页</span><button id="paperRiskAuditPrev" data-risk-action="audit-prev"'+(page===0?' disabled':'')+'>上一页</button><button id="paperRiskAuditNext" data-risk-action="audit-next"'+(!pagination.has_next?' disabled':'')+'>下一页</button></div>';
   return '<section class="paper-terminal-section paper-risk-audit-section" style="border-top:1px solid var(--border-light)"><div class="paper-risk-toolbar"><h3 style="margin:0;border:0;padding:0">风控审计记录</h3><div class="controls" style="margin:0"><select aria-label="风控策略" id="paperRiskAccountFilter" onchange="applyPaperRiskAuditFilter()">'+options+'</select><select aria-label="风控等级" id="paperRiskLevelFilter" onchange="applyPaperRiskAuditFilter()"><option value="">全部等级</option><option value="watch"'+(filters.level==='watch'?' selected':'')+'>关注</option><option value="tightened"'+(filters.level==='tightened'?' selected':'')+'>收紧</option></select><input aria-label="风控日期" id="paperRiskDateFilter" type="date" value="'+riskText(filters.date||'')+'" onchange="applyPaperRiskAuditFilter()"></div></div>'+scanNote+navigation+tableScroll('<table><tr><th>时间</th><th>策略</th><th>标的</th><th>等级</th><th>原因</th><th>行情核验</th><th>系统动作</th><th>模式</th><th>版本</th></tr><tbody id="paperRiskAuditRows">'+audit+'</tbody></table>',1180)+(!audit?'<div class="paper-empty">所选条件下没有风控事件。</div>':'')+'</section>';
 }
 
@@ -139,7 +157,7 @@ export async function loadPaperRisk(forceRefresh){
     }
     return d;
   }).catch(function(e){
-    if(!window._paperRiskDashboard) $('paperRiskResult').innerHTML='<div class="banner">风控中心加载失败：'+riskText(e.message||e)+' <button onclick="loadPaperRisk(true)">重试</button></div>';
+    if(!window._paperRiskDashboard) $('paperRiskResult').innerHTML='<div class="banner">风控中心加载失败：'+riskText(e.message||e)+' <button data-risk-action="risk-retry">重试</button></div>';
     else $('paperRiskResult').insertAdjacentHTML('afterbegin','<div class="banner">刷新失败，已保留上次成功快照：'+riskText(e.message||e)+'</div>');
     throw e;
   }).finally(function(){
