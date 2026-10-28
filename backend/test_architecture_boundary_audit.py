@@ -41,7 +41,7 @@ class CouplingBudgetTests(unittest.TestCase):
     # 的 INSERT/UPDATE/DELETE 已归零（`test_paper_job_lifecycle` 有机械守卫）。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
-        "deferred_imports": 38,
+        "deferred_imports": 39,
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,

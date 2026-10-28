@@ -5777,7 +5777,9 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                 continue
         except (TypeError, ValueError):
             continue
-        live_map[code] = row
+        # Flow enrichment below modifies rows. Keep the round snapshot owned
+        # by the caller unchanged so later strategies see identical inputs.
+        live_map[code] = dict(row)
     if live_universe is not None:
         # A live cross-sectional scan must never rank a code using persisted
         # price/pct/flow fields.  Metadata may come from the universe file,

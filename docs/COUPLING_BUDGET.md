@@ -1,5 +1,8 @@
 # 耦合预算与模块化进度
 
+2026-10-28：入场时机状态的跨进程文件锁需要按平台加载 Windows 标准库
+`msvcrt`，延迟导入额度由 38 增至 39；这是平台兼容导入，不增加项目模块依赖。
+
 基线：PR272 HEAD `961c09f`。度量入口：`backend/tools/coupling_metrics.py`，由 `backend/test_architecture_boundary_audit.py` 执行不回退门禁。分析器只读 AST，不 import 生产模块。
 
 ## 当前预算

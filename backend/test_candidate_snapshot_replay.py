@@ -127,6 +127,7 @@ class CandidateSnapshotReplayTests(Replay._RolloverFixture):
             account = dict(conn.execute("SELECT * FROM paper_accounts WHERE id=?", (Replay.STRATEGY_ID,)).fetchone())
         base = PT.U.load_universe()
         live = [{**row, "quote_at": Replay.D_DAY.isoformat() + "T15:00:00+08:00"} for row in base]
+        original_live = copy.deepcopy(live)
         finance = {"data": {"600901": {"net_profit": 100., "profit_yoy": 20.}}}
         researcher = mock.Mock()
         researcher.record_shadow_run.return_value = {"status": "saved"}
@@ -136,12 +137,15 @@ class CandidateSnapshotReplayTests(Replay._RolloverFixture):
                 mock.patch.object(PT, "_get_pr", return_value=researcher), \
                 mock.patch.object(PT, "_active_account_rows", return_value=[dict(account) for _ in range(3)]), \
                 mock.patch.object(PT.dfc, "fetch_finance_latest", return_value=finance) as source, \
+                mock.patch.object(PT.dfc, "enrich_live_flow_details", return_value={
+                    "600901": {"super_net": 100.0, "main_pct": 2.0, "flow_source": "fixture"}}), \
                 mock.patch.object(PT.U, "load_universe", wraps=PT.U.load_universe) as universe, \
                 mock.patch.object(PT.F, "compute_fundamental_factors", wraps=PT.F.compute_fundamental_factors) as compute, \
                 mock.patch.object(PT.F, "live_snapshot_asof", return_value=Replay.D_DAY.isoformat() + "T15:05:00+08:00"):
             result = PT.backfill_research_shadow(Replay.D_DAY)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(result["accounts"]), 3)
+        self.assertEqual(live, original_live)
         self.assertTrue(all(row.get("candidates", 0) > 0 for row in result["accounts"]), result)
         source.assert_called_once()
         universe.assert_called_once()
