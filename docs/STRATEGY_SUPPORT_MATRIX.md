@@ -60,3 +60,16 @@
 4. 退役账户是否还有未完成订单与未退出持仓。
 
 在拿到这些证据之前，"删除"只能是猜测；猜测会让真实的旧持仓失去退出路径。
+
+## 2026-10-28 退役实现删除前置证据（服务器只读查询）
+
+在 `paper_trading.sqlite3` 上只读核对：
+
+- `paper_accounts`：`sector_rotation` / `main_force_top10` 均为 `paused`，且没有当前持仓或订单行；
+- `strategy_definitions`：只有 5 个 builtin，没有 `origin=user` 的克隆/自定义策略引用这两个 `implementation_key`；
+- `paper_strategy_legacy_bindings`：只有内置绑定，没有额外的用户历史绑定；
+- 当前周期 `enabled_strategies` 只含三套正式策略。
+
+因此 `paper_trading` 中 `style=="sector"` / `main_force` 的**正式新入场**分支已无正式账户可达，
+可以在独立批次中删除；`strategies.py` 的研究/回放实现、`EXIT_ONLY` 退出与历史解释仍须保留。
+删除前仍需补查研究/回放任务窗口（第 3 项证据），不能把"当前没有持仓"当成"从未使用"。
