@@ -716,7 +716,8 @@ def close_snapshot_rows(rows: Any, now: Any, asof_day: Any = None):
     for row in rows or ():
         if not isinstance(row, Mapping):
             continue
-        observed = _parse_instant(row.get("quote_at") or row.get("observed_at"))
+        # 收盘快照必须是**交易所/行情源揭示时间**；本地抓取时刻不能冒充收盘成交。
+        observed = _parse_instant(row.get("quote_at"))
         if observed is not None and lower <= observed <= upper:
             valid.append(row)
     return valid
@@ -747,7 +748,9 @@ def fresh_ratio(rows: Any, now: Any, max_age: float, *, max_future_seconds=None)
         count += 1
         if not isinstance(row, Mapping):
             continue
-        value = row.get("quote_at") or row.get("observed_at")
+        # 只认来源行情时间。``observed_at`` 在缺失时是本地抓取时刻（PIT 可用），
+        # 但把它当新鲜度证据会让"刚抓到一条没有行情时间的旧数据"被判成 fresh。
+        value = row.get("quote_at")
         age = _age_seconds(value, current)
         if age is None:
             continue
@@ -760,8 +763,9 @@ def fresh_ratio(rows: Any, now: Any, max_age: float, *, max_future_seconds=None)
             fresh += -max_future_seconds <= signed_age <= max_age
     if not parsed:
         return None
-    # Price-only artifacts count missing timestamps against their coverage.
-    return fresh / (count if max_future_seconds is not None else parsed)
+    # 没有来源行情时间的行必须计入分母：本地抓取时刻只证明"我们何时看到它"，
+    # 不能证明"行情何时产生"。否则 3999 条缺时间 + 1 条新鲜会被算成 100%。
+    return fresh / count if count else None
 
 
 def _cross_section_freshness(

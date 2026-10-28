@@ -447,6 +447,30 @@ class QuoteAttemptBudgetTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(len(calls), 2)
 
+    def test_small_batch_call_stops_at_the_total_budget(self):
+        """25 个批次各用一份预算仍会叠成几分钟；小批必须有整次截止时刻。"""
+        clock = [0.0]
+        calls = []
+
+        def slow_get(*_args, **_kwargs):
+            calls.append(1)
+            clock[0] += 13.0
+            raise TimeoutError("host down")
+
+        feed = feeds.EastmoneyRealtimeFeed(
+            get_json=slow_get,
+            secid=lambda code: "0." + code,
+            row_parser=lambda raw: None,
+            reset_data_source=mock.Mock(),
+            ut="test", fields="f2,f12",
+            hosts=("h1",), attempts=1, batch_size=100,
+            sleep=mock.Mock(),
+        )
+        with mock.patch.object(feeds.time, "monotonic", side_effect=lambda: clock[0]),                 mock.patch.object(feeds, "QUOTE_TRANSPORT_BUDGET_SECONDS", 12.0),                 mock.patch.object(feeds, "QUOTE_TOTAL_BUDGET_SECONDS", 18.0),                 mock.patch.object(feeds, "QUOTE_TOTAL_BUDGET_MAX_CODES", 400):
+            result = feed.fetch_realtime([f"6{i:05d}" for i in range(300)])
+        self.assertEqual(result, [])
+        self.assertLessEqual(len(calls), 2, "整次预算 18 秒不应跑到第三个 13 秒批次")
+
     def test_chain_stops_after_the_chain_budget(self):
         clock, now = self._clock()
         called = []

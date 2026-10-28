@@ -5604,7 +5604,9 @@ def _ignition_shadow_backfill(asof_day=None, quote_fetch=None):
     """
     now = dt.datetime.now()
     try:
-        with _db(immediate=True) as conn:
+        # 读取待回填记录和取报价都在**写事务之外**。旧实现持有 SQLite 写锁
+        # 等待网络报价，一个慢源就能阻塞成交与风控写入（MD 审查 P2）。
+        with _db() as conn:
             pending = _rows(
                 conn,
                 """SELECT * FROM paper_ignition_shadow
@@ -5612,37 +5614,46 @@ def _ignition_shadow_backfill(asof_day=None, quote_fetch=None):
                    ORDER BY id LIMIT 80""",
                 ((now - dt.timedelta(minutes=30)).isoformat(timespec="seconds"),),
             )
-            if not pending:
-                return {"updated": 0}
-            codes = sorted({str(row["code"]) for row in pending})
-            if quote_fetch is None:
-                quote_map = _quotes(codes, asof_date=asof_day or now.date())
-            else:
-                quote_map = quote_fetch(codes)
-            updated = 0
+        if not pending:
+            return {"updated": 0}
+        codes = sorted({str(row["code"]) for row in pending})
+        if quote_fetch is None:
+            quote_map = _quotes(codes, asof_date=asof_day or now.date())
+        else:
+            quote_map = quote_fetch(codes)
+        updated = 0
+        with _db(immediate=True) as conn:
             for row in pending:
-                recorded = dt.datetime.fromisoformat(str(row["recorded_at"])[:19])
-                quote = dict(quote_map.get(str(row["code"])) or {})
+                # 短事务内按 id 重新读取并检查未完成状态：并发回填/60 分钟
+                # 解析后不能再用旧快照覆盖，也不把无关记录锁在事务里。
+                fresh = conn.execute(
+                    "SELECT * FROM paper_ignition_shadow WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+                if fresh is None or int(fresh["resolved"] or 0):
+                    continue
+                recorded = dt.datetime.fromisoformat(str(fresh["recorded_at"])[:19])
+                quote = dict(quote_map.get(str(fresh["code"])) or {})
                 price_now = _num(quote.get("price"), 0.0)
                 if price_now <= 0:
                     continue
                 age_min = (now - recorded).total_seconds() / 60
                 sets, params = [], []
-                if price_now and _num(row["price_30m"], 0.0) <= 0 and age_min >= 30:
+                if _num(fresh["price_30m"], 0.0) <= 0 and age_min >= 30:
                     sets.append("price_30m=?"); params.append(price_now)
                     sets.append("at_30m=?"); params.append(now.isoformat(timespec="seconds"))
-                if price_now and _num(row["price_60m"], 0.0) <= 0 and age_min >= 60:
+                if _num(fresh["price_60m"], 0.0) <= 0 and age_min >= 60:
                     sets.append("price_60m=?"); params.append(price_now)
                     sets.append("at_60m=?"); params.append(now.isoformat(timespec="seconds"))
                     sets.append("resolved=1")
                 if sets:
                     params.append(row["id"])
                     conn.execute(
-                        f"UPDATE paper_ignition_shadow SET {', '.join(sets)} WHERE id=?",
+                        f"UPDATE paper_ignition_shadow SET {', '.join(sets)} WHERE id=? AND resolved=0",
                         tuple(params),
                     )
                     updated += 1
-            return {"updated": updated, "pending": len(pending)}
+        return {"updated": updated, "pending": len(pending)}
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
 

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from env_utils import env_float
+from env_utils import env_float, env_int
 
 QuoteRow = dict[str, Any]
 
@@ -25,10 +25,22 @@ QUOTE_TRANSPORT_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_BUDGET_SECONDS", 12.0, 
 # 有序回退链（腾讯→新浪→末源重试）的整体预算；避免每个源各用一份预算后
 # 又叠成一整轮超时。
 QUOTE_CHAIN_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_CHAIN_BUDGET_SECONDS", 18.0, minimum=0.0)
+# 小批（持仓/候选）还需要一个**整次调用**的绝对预算，否则 25 个批次各用
+# 一份 12 秒预算仍会叠成几分钟。全市场大批（>400 只）保持每批预算，
+# 避免把合法的大横截面截断。
+QUOTE_TOTAL_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_TOTAL_BUDGET_SECONDS", 18.0, minimum=0.0)
+QUOTE_TOTAL_BUDGET_MAX_CODES = env_int("ASTOCK_QUOTE_TOTAL_BUDGET_MAX_CODES", 400, minimum=1)
 
 
 def _budget_exhausted(started, budget):
     return budget > 0 and (time.monotonic() - started) >= budget
+
+
+def _call_budget(normalized):
+    """小批使用整次调用预算；大批按批预算，避免截断全市场横截面。"""
+    if QUOTE_TOTAL_BUDGET_SECONDS <= 0 or len(normalized) > QUOTE_TOTAL_BUDGET_MAX_CODES:
+        return 0.0
+    return QUOTE_TOTAL_BUDGET_SECONDS
 
 
 @runtime_checkable
@@ -254,11 +266,15 @@ class EastmoneyRealtimeFeed:
         transport_succeeded = False
         last_transport_error: BaseException | None = None
         budget = QUOTE_TRANSPORT_BUDGET_SECONDS
+        overall_started = time.monotonic()
+        total_budget = _call_budget(normalized)
         try:
             for offset in range(0, len(normalized), batch_size):
                 # 预算是**每批**的，不是整次调用的：全市场扫描器会一次请求
                 # 5000 只（25 批），整次预算会把它截成不完整横截面；而单批
                 # 上限保证任何一批都不会烧掉 9 次超时。
+                if _budget_exhausted(overall_started, total_budget):
+                    break
                 started = time.monotonic()
                 batch = normalized[offset:offset + batch_size]
                 params = {
@@ -269,11 +285,11 @@ class EastmoneyRealtimeFeed:
                 batch_by_code: dict[str, QuoteRow] = {}
                 attempts_used = 0
                 for attempt in range(attempts):
-                    if _budget_exhausted(started, budget):
+                    if _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
                         break
                     attempts_used = attempt + 1
                     for host_index in range(len(host_list)):
-                        if _budget_exhausted(started, budget):
+                        if _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
                             break
                         host = host_list[(offset // batch_size + host_index + attempt) % len(host_list)]
                         try:
@@ -305,7 +321,7 @@ class EastmoneyRealtimeFeed:
                 if missing and len(missing) > 1:
                     small_size = max(1, int(self.small_batch_size))
                     for start in range(0, len(missing), small_size):
-                        if _budget_exhausted(started, budget):
+                        if _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
                             break
                         small = missing[start:start + small_size]
                         small_params = dict(
@@ -388,13 +404,17 @@ class TencentRealtimeFeed:
         transport_succeeded = False
         last_transport_error: BaseException | None = None
         budget = QUOTE_TRANSPORT_BUDGET_SECONDS
+        overall_started = time.monotonic()
+        total_budget = _call_budget(normalized)
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
+                if _budget_exhausted(overall_started, total_budget):
+                    break
                 started = time.monotonic()
                 batch = normalized[start:start + max(1, int(self.batch_size))]
                 pending = list(batch)
                 for attempt in range(max(1, int(self.attempts))):
-                    if not pending or _budget_exhausted(started, budget):
+                    if not pending or _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
                         break
                     try:
                         text = self.http_get(
@@ -452,8 +472,12 @@ class SinaRealtimeFeed:
         transport_succeeded = False
         last_transport_error: BaseException | None = None
         budget = QUOTE_TRANSPORT_BUDGET_SECONDS
+        overall_started = time.monotonic()
+        total_budget = _call_budget(normalized)
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
+                if _budget_exhausted(overall_started, total_budget):
+                    break
                 started = time.monotonic()
                 batch = normalized[start:start + max(1, int(self.batch_size))]
                 text = ""

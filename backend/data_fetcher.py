@@ -1057,14 +1057,16 @@ def _fresh_full_snapshot_from_disk(max_age):
             except (TypeError, ValueError):
                 # Preserve the previous mtime fallback for malformed quote_at.
                 pass
-        if payload.get("source") in {"tencent_public_quote_full_snapshot", "public_quote_full_snapshot"}:
-            try:
-                from market_data_contract import fresh_ratio
-            except ImportError:
-                from .market_data_contract import fresh_ratio
-            ratio = fresh_ratio(rows, dt.datetime.now(dt.timezone.utc), max_age, max_future_seconds=120)
-            if ratio is None or ratio < 0.90:
-                return None
+        # 缓存准入必须和消费契约使用同一套横截面时效规则：只看"最新一行"
+        # 会把 3999 条 600 秒前的旧数据 + 1 条刚更新当成新鲜，随后才被
+        # market_data_service 判 stale。东财快照和腾讯价格快照都要检查覆盖率。
+        try:
+            from market_data_contract import fresh_ratio
+        except ImportError:
+            from .market_data_contract import fresh_ratio
+        ratio = fresh_ratio(rows, dt.datetime.now(dt.timezone.utc), max_age, max_future_seconds=120)
+        if ratio is None or ratio < 0.90:
+            return None
         return rows
     except (OSError, ValueError, TypeError):
         return None
