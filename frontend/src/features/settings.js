@@ -61,7 +61,7 @@ export function refreshOperatorUnlockState(){
 }
 
 // ---------- 统一设置中心 ----------
-export var SETTINGS_STRATEGY_NAMES={tq_breakout:'激进做T',trend_pullback:'稳健波段',reported_profit_breakout:'保守防守'};
+export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',reported_profit_breakout:'三日策略'};
 
 export var SETTINGS_DURATION_OPTIONS=[15,30,60,90,180,0];
 
@@ -292,7 +292,11 @@ export async function loadSettings(force){
 // PR-47：Registry 不可用时的兜底显示名单（仅用于渲染，不再是策略集合权威）。
 export function settingsStrategyItems(){
   if(Array.isArray(window._registryItems)&&window._registryItems.length){
-    return window._registryItems.filter(function(item){return item.status!=='archived';});
+    // 设置页只展示能进入下一周期的策略：退役中的 sector_rotation /
+    // main_force_top10 不再作为可配置卡片出现（历史账本仍保留，不在本页管理）。
+    return window._registryItems.filter(function(item){
+      return item.status!=='archived' && (item.origin==='user' || !!item.formal_cycle_allowed);
+    });
   }
   return Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
     return {id:id,name:SETTINGS_STRATEGY_NAMES[id],origin:'builtin',status:'paper',formal_cycle_allowed:true,current_version:1,metadata:{},description:''};

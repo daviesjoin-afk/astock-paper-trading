@@ -776,6 +776,10 @@ def _active_account_rows(conn, status=None):
         rows = _rows(conn, sql, params)
     order = {account_id: index for index, account_id in enumerate(ACTIVE_ACCOUNT_IDS)}
     rows.sort(key=lambda row: order.get(row.get("id"), len(order)))
+    # 名册是展示名的唯一权威：DB 行的 name 是历史创建时的名字，不能让
+    # "短线日内做T" 在订单/风控里又变回 "激进做T"。
+    for row in rows:
+        row["name"] = ROSTER.display_name(row.get("id"), fallback=row.get("name"))
     return rows
 
 
@@ -2747,7 +2751,10 @@ def _shared_account_rows(conn, cycle_id=None):
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
-    return PSC.cycle_account_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
+    rows = PSC.cycle_account_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
+    for row in rows:
+        row["name"] = ROSTER.display_name(row.get("id"), fallback=row.get("name"))
+    return rows
 
 
 def _shared_initial_cash(conn, cycle=None):

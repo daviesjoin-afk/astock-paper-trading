@@ -37,6 +37,28 @@ export var WB_INDICATOR_LABELS={ma:'均线 MA',ema:'指数均线 EMA',rsi:'RSI',
 
 export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder',challengerReportId:'',pinnedCandidatePin:null,aiCandidateView:null};
 
+// 详情页里仍会出现 exact id；展示时优先用注册表里的中文名，id 只作为小字。
+function wbName(strategyId){
+  var hit=(WB_STATE.items||[]).filter(function(x){return x.id===strategyId;})[0];
+  return (hit&&hit.name)||strategyId;
+}
+var WB_BLOCK_REASON_LABELS={
+  paper_runtime_evidence_owner_unavailable:'缺少当前策略的运行时证据（需先完成一次模拟盘运行并采集证据）',
+  lifecycle_edge_not_legal:'当前生命周期状态不允许该迁移',
+  shadow_comparison_report_required:'需要指定 ShadowComparisonReport',
+  strategy_checksum_mismatch:'策略校验和与冻结版本不一致',
+  evidence_bundle_incomplete:'晋级证据不完整',
+};
+function wbReasonList(reasons){
+  return (reasons||[]).map(function(reason){
+    var label=WB_BLOCK_REASON_LABELS[String(reason||'')];
+    return '<li>'+adaptiveEsc(label||reason)+(label?' <code>'+adaptiveEsc(String(reason))+'</code>':'')+'</li>';
+  }).join('');
+}
+function wbStateList(states){
+  return (states||[]).map(function(state){return strategyStatusLabel(state)+'（'+state+'）';}).join('、')||'无';
+}
+
 export async function loadStrategyWorkbench(force){
   var target=$('wbList'); if(!target) return;
   if(window._wbLoading&&!force) return window._wbLoading;
@@ -679,7 +701,7 @@ function wbLegHtml(leg){
   if(!leg||leg.available===false){
     return '<span class="strategy-fact-unknown">不可用</span> · '+wbFact((leg&&leg.unavailable_reason)||null);
   }
-  return adaptiveEsc(leg.strategy_id||'')+' v'+adaptiveEsc(String(leg.version==null?'':leg.version))
+  return adaptiveEsc(wbName(leg.strategy_id)||leg.strategy_id||'')+' <small>('+adaptiveEsc(leg.strategy_id||'')+')</small> v'+adaptiveEsc(String(leg.version==null?'':leg.version))
     +' · '+adaptiveEsc(leg.lifecycle_state||'不可用')
     +' · <code>'+adaptiveEsc(String(leg.checksum||''))+'</code>'
     +(leg.identity_source?' <small>来源 '+adaptiveEsc(leg.identity_source)+'</small>':'');
@@ -696,7 +718,7 @@ export function wbChallengerHtml(strategyId,view){
   var promotionReasons=(promotion.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
   var activationRows=(activation.versions||[]).map(function(item){
     return '<li>'+adaptiveEsc(item.role||'')+' · '+adaptiveEsc(item.status||'')+' · v'+adaptiveEsc(String(item.id))+'</li>';}).join('');
-  return '<h4>Active vs Challenger（生命周期晋级与参数头晋升互相独立）</h4>'
+  return '<h4>Active / Challenger 对比（高级 · 两条晋级链互相独立）</h4>'
     +'<label>Exact ShadowComparisonReport id<input id="wbChallengerReport" maxlength="64" autocomplete="off" value="'+adaptiveEsc(WB_STATE.challengerReportId||'')+'"></label>'
     +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" onclick="wbLoadChallengerReport(\''+adaptiveEsc(strategyId)+'\')">按 exact id 读取比对证据</button></div>'
     +'<dl class="strategy-preview-grid">'
@@ -964,12 +986,12 @@ export async function wbOpenDetail(strategyId){
   }).join('');
   var eligible=(lifecycle.eligible_transitions||[]);
   var safetyButtons=(lifecycle.safety_transitions||[]).map(function(target){
-    return '<button type="button" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" onclick="wbTransition(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">提交 '+adaptiveEsc(strategyStatusLabel(target))+'安全意图</button>';
+    return '<button type="button" class="ghost" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" onclick="wbTransition(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">提交「'+adaptiveEsc(strategyStatusLabel(target))+'」状态变更意图</button>';
   }).join('');
   var promotionButtons=(lifecycle.promotion_transitions||[]).map(function(target){
     var allowed=eligible.indexOf(target)>=0;
     var decision=(lifecycle.evidence||{})[target]||{};
-    var reasons=(decision.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
+    var reasons=wbReasonList(decision.blocking_reasons);
     return '<article class="strategy-promotion-target" data-testid="promotion-target-'+adaptiveEsc(target)+'"><b>'+adaptiveEsc(lifecycle.state)+' → '+adaptiveEsc(target)+'</b>'
       +'<p>当前后端判断：'+(allowed?'eligible':'blocked')+'</p>'+(reasons?'<ul>'+reasons+'</ul>':'')
       +'<button type="button" onclick="wbCreatePromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">为该目标创建 proposal</button></article>';
@@ -977,7 +999,7 @@ export async function wbOpenDetail(strategyId){
   var proposals=(lifecycle.proposals||[]).map(function(proposal){
     var decision=proposal.decision||{};
     var bundle=proposal.evidence_bundle||{};
-    var reasons=(decision.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
+    var reasons=wbReasonList(decision.blocking_reasons);
     var evidence='<small>R29 '+adaptiveEsc(bundle.r29_run_key||'未指定')+' · R30 '+adaptiveEsc(bundle.r30_report_key||'未指定')+'</small>';
     var apply=proposal.proposer_type!=='ai'&&decision.eligible
       ?'<button type="button" data-testid="promotion-apply" onclick="wbApplyPromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(proposal.proposal_fingerprint)+'\')">重新验证并提交 transition</button>':'';
@@ -991,17 +1013,28 @@ export async function wbOpenDetail(strategyId){
     +'<label>Exact ShadowComparisonReport id<input id="wbPromotionComparisonReport" maxlength="64" autocomplete="off"></label>'
     +'<label>Future paper runtime evidence ref<input id="wbPromotionPaper" autocomplete="off"></label></div>';
   var historyHtml=historyRows||'<li>当前 exact version 尚无生命周期事件。</li>';
+  var editAction=item.origin==='user'
+    ? '<button type="button" class="strategy-workbench-primary" data-testid="strategy-edit-detail" onclick="wbOpenEditor(\''+adaptiveEsc(strategyId)+'\')">编辑策略</button>'
+    : '<button type="button" class="strategy-workbench-primary" data-testid="strategy-clone-detail" onclick="wbCloneStrategy(\''+adaptiveEsc(strategyId)+'\')">复制并编辑</button>';
+  var summary='<section class="strategy-detail-summary" data-testid="strategy-detail-summary"><dl class="strategy-preview-grid">'
+    +'<dt>策略名称</dt><dd>'+adaptiveEsc(item.name||item.id)+'</dd>'
+    +'<dt>当前状态</dt><dd>'+wbStatusBadge(lifecycle.state||item.status)+'</dd>'
+    +'<dt>当前版本</dt><dd>v'+adaptiveEsc(lifecycle.version||currentVersion)+'</dd>'
+    +'<dt>下一周期资格</dt><dd>'+((lifecycle.formal_cycle_allowed||item.formal_cycle_allowed)?'是':'否')+'</dd>'
+    +'<dt>运行时就绪</dt><dd>'+(item.runtime_ready===false?'否 · '+adaptiveEsc(item.runtime_error||''):'是')+'</dd>'
+    +'</dl><p class="strategy-detail-hint">日常修改请使用右上角「编辑策略」；下方是技术证据与生命周期操作，除非明确需要，不要直接改变生命周期状态。</p></section>';
   box.innerHTML='<header class="strategy-editor-head"><h3>'+adaptiveEsc(item.name||item.id)+' '+wbStatusBadge(lifecycle.state||item.status)+'</h3>'
-    +'<div><button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
-    +'<section class="strategy-lifecycle-read-model" data-testid="strategy-lifecycle-read-model"><h4>当前生命周期</h4><dl class="strategy-preview-grid">'
-    +'<dt>Exact version</dt><dd>v'+adaptiveEsc(lifecycle.version||currentVersion)+'</dd><dt>Checksum</dt><dd><code>'+adaptiveEsc(lifecycle.checksum||item.current_checksum||'')+'</code></dd>'
-    +'<dt>允许正式新周期</dt><dd>'+(lifecycle.formal_cycle_allowed?'是':'否')+'</dd><dt>Legal transitions</dt><dd>'+adaptiveEsc((lifecycle.legal_transitions||[]).join(', ')||'无')+'</dd>'
-    +'<dt>Eligible transitions</dt><dd data-testid="eligible-transitions">'+adaptiveEsc(eligible.join(', ')||'无')+'</dd>'
-    +'<dt>Blocking reasons</dt><dd>'+adaptiveEsc((lifecycle.blocking_reasons||[]).join(', ')||'无')+'</dd></dl>'
-    +'<h4>安全意图</h4><div class="strategy-lifecycle-actions">'+(safetyButtons||'<small>没有安全迁移可用。</small>')+'</div>'
-    +'<h4>Promotion Policy 与 exact evidence</h4><p>eligibility 和阻断原因由后端返回；这里仅提交明确的 evidence identity 与 rationale。</p>'
-    +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有 promotion transition 可用。</small>')+'</div>'
-    +'<h4>Promotion proposals</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无 proposal。</p>')+'</div></section>'
+    +'<div>'+editAction+'<button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
+    +summary
+    +'<section class="strategy-lifecycle-read-model" data-testid="strategy-lifecycle-read-model"><h4>生命周期状态（技术）</h4><dl class="strategy-preview-grid">'
+    +'<dt>精确版本（Exact version）</dt><dd>v'+adaptiveEsc(lifecycle.version||currentVersion)+'</dd><dt>版本校验和（Checksum）</dt><dd><code>'+adaptiveEsc(lifecycle.checksum||item.current_checksum||'')+'</code></dd>'
+    +'<dt>允许正式新周期</dt><dd>'+(lifecycle.formal_cycle_allowed?'是':'否')+'</dd><dt>合法迁移</dt><dd>'+adaptiveEsc(wbStateList(lifecycle.legal_transitions))+'</dd>'
+    +'<dt>当前可迁移</dt><dd data-testid="eligible-transitions">'+adaptiveEsc(wbStateList(eligible))+'</dd>'
+    +'<dt>阻断原因</dt><dd>'+(wbReasonList(lifecycle.blocking_reasons)||'无')+'</dd></dl>'
+    +'<h4>生命周期操作（人工确认）</h4><p class="strategy-detail-hint">下列按钮会改变策略的正式状态，不是普通编辑；请仅在明确需要时使用。</p><div class="strategy-lifecycle-actions">'+(safetyButtons||'<small>没有安全迁移可用。</small>')+'</div>'
+    +'<h4>晋级证据（高级）</h4><p>资格与阻断原因由后端判定；这里只提交明确的证据身份与理由。</p>'
+    +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有可用的晋级迁移。</small>')+'</div>'
+    +'<h4>晋级提案</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无提案。</p>')+'</div></section>'
     +'<section class="strategy-challenger-workspace" data-testid="challenger-workspace">'+wbChallengerHtml(strategyId,challengerView)+'</section>'
     +'<section class="strategy-ai-candidate-workspace" data-testid="ai-candidate-workspace">'+wbAiCandidateHtml(strategyId,aiView)+'</section>'
     +'<section class="strategy-candidate-workspace" data-testid="candidate-workspace">'+wbCandidatesHtml(strategyId,candidatesView)+'</section>'
@@ -1009,8 +1042,8 @@ export async function wbOpenDetail(strategyId){
     +'<dt>ID</dt><dd>'+adaptiveEsc(item.id)+'</dd><dt>来源</dt><dd>'+(item.origin==='user'?'自定义':'内置')+'</dd>'
     +'<dt>生命周期阶段</dt><dd>'+(runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—')+'</dd>'
     +'<dt>运行时就绪</dt><dd>'+(item.runtime_ready===false?'否 · '+adaptiveEsc(item.runtime_error||''):'是')+'</dd></dl>'
-    +'<h4>State history（全部版本）</h4><ul class="strategy-version-list" data-testid="strategy-lifecycle-history">'+historyHtml+'</ul></section>'
-    +'<section><h4>Strategy version history</h4><ul class="strategy-version-list" data-testid="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
+    +'<h4>生命周期变更历史</h4><ul class="strategy-version-list" data-testid="strategy-lifecycle-history">'+historyHtml+'</ul></section>'
+    +'<section><h4>版本历史</h4><ul class="strategy-version-list" data-testid="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
   wbShowView('detail');
   window._strategiesRouteId=null;
   history.replaceState(null,'','#strategies/'+encodeURIComponent(strategyId));
