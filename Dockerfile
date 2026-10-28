@@ -32,18 +32,21 @@ RUN gcc -O2 -fPIC -shared -Wl,-soname,libsqlite3.so.0 \
 
 FROM python:3.14-slim-bookworm
 
-ARG ASTOCK_GIT_COMMIT=unknown
+# Build identity must be injected **after** dependency installation: any change
+# to ARG/ENV invalidates every later Docker layer. Keeping it here made each
+# commit re-download all wheels (the Tencent mirror delivered 1.8 MB in 20 s
+# from this host and pip was reset mid-transfer). Runtime readers still get
+# the exact SHA through the final ENV below.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUTF8=1 \
     TZ=Asia/Shanghai \
-    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    MALLOC_ARENA_MAX=2 \
-    ASTOCK_GIT_COMMIT=${ASTOCK_GIT_COMMIT}
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 
@@ -70,9 +73,15 @@ RUN ln -sf libsqlite3.so.0.8.6 /usr/local/lib/libsqlite3.so.0 \
     && python -c "import sqlite3, sys; version = sqlite3.sqlite_version; \
 print('runtime sqlite:', version); \
 sys.exit(0 if tuple(int(p) for p in version.split('.')[:2]) >= (3, 51) else 'runtime sqlite is older than 3.51')"
-RUN python -m pip install --no-cache-dir -r requirements.lock
+RUN python -m pip install --no-cache-dir --retries 5 --timeout 60 -r requirements.lock
 
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
+
+# Build identity is injected only after dependency layers so code commits reuse
+# the pip/apt cache. Runtime readers (build_info) still see the exact SHA.
+ARG ASTOCK_GIT_COMMIT=unknown
+ENV ASTOCK_GIT_COMMIT=${ASTOCK_GIT_COMMIT}
+
 COPY --chown=app:app backend ./backend
 RUN find /app/backend -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 COPY --chown=app:app frontend ./frontend
