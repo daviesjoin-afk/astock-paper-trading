@@ -1727,6 +1727,23 @@ def fetch_kline(code, beg="20230101", end="20500101", klt=101, fqt=1, secid=None
 def kline_cache_path(code):
     return os.path.join(KLINE_DIR, f"{code}.csv")
 
+def completed_kline(code, cutoff_date, *, inclusive=True):
+    """K 线 owner：只返回截止指定完整交易日的日线。
+
+    盘中"当日 K 线"是半根，禁止被当成完整收盘数据使用；这个截断语义原来
+    只存在于交易引擎内部，下层模块必须能自己取到同一份事实。
+    """
+    frame = load_cached_kline(str(code))
+    if frame is None or frame.empty:
+        return frame
+    cutoff = dt.date.fromisoformat(str(cutoff_date)[:10])
+    try:
+        mask = frame.index.date <= cutoff if inclusive else frame.index.date < cutoff
+        return frame.loc[mask].copy()
+    except Exception:
+        return frame
+
+
 def load_cached_kline(code):
     p = kline_cache_path(code)
     if os.path.exists(p):

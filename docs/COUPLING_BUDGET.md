@@ -203,3 +203,33 @@
   期副作用（`import_side_effects` 保持 25）。
 - 低频状态缓存窗口（停牌 15 分钟、公告 30 分钟、快讯 5 分钟）是运行时策略，
   不改变模块依赖。
+
+## 2026-10-28 A1：vertical 依赖下沉 + 度量口径修正
+
+### 依赖字段（三个 vertical 的 `*Dependencies` dataclass）
+
+| 批次 | manual_orders | dashboard_queries | execution_planner | 合计 |
+|---|---:|---:|---:|---:|
+| 起点 | 53 | 23 | 16 | 92 |
+| phase 1（纯工具直连 owner） | 48 | 21 | 13 | 82 |
+| phase 2（常量归位） | 43 | 21 | 13 | 77 |
+| phase 3（行读取/K 线/持仓天数归位） | 38 | 19 | 13 | **70** |
+
+迁移的内容都是**已有 owner 的能力**，不是新实现：JSON/数值 → `paper_common` / `paper_numeric`；
+状态词表 → `entry_lifecycle`；整手数量 → `paper_trading_rules`；共享池敞口 → `paper_shared_cash`；
+行读取 → `paper_repository`；完整日线截断 → `data_fetcher.completed_kline`；持仓天数 → `paper_risk_evidence.hold_days`。
+时钟（`_now` / `_date`）与数据库连接仍作为**可替换的窄能力**注入：回放与测试需要固定时点与固定账本。
+
+### 度量口径修正
+
+`coupling_metrics.domain_of` 之前按文件名前缀判定业务域，于是
+`paper_repository` / `paper_trading_rules` / `paper_risk_evidence` /
+`paper_position_read_model` / `paper_decision_audit` / `entry_lifecycle` /
+`paper_common` / `paper_numeric` / `paper_storage` / `data_paths` / `env_utils`
+这些**事实与基础 owner**被算进 "paper" 域。结果是：业务域模块直接 import owner
+（A1 想要的方向）反而显示"跨域边上涨"。
+
+现在这些模块单列为 `foundation`，与 foundation 相关的边不计入业务域跨域边
+（foundation 反向依赖业务域由 import_cycles / private_cross_access 覆盖）。
+实测跨域边 624（改口径前的基线）→ **613**，import 环保持 **0**，duplicate_helpers 312。
+预算基线按实测收紧为 613，额度 4。

@@ -34,7 +34,11 @@ from entry_lifecycle import (
     ENTRY_RETRY_ORDER_STATUSES,
 )
 from paper_shared_cash import SHARED_POOL_MAX_EXPOSURE
-from paper_trading_rules import LOT_SIZE
+from paper_trading_rules import LOT_SIZE, asset_type as _asset_type, limit_pct as _limit_pct
+# A1 phase 3：查询行、K 线截断与持仓天数各有 owner，vertical 直接取用。
+from data_fetcher import completed_kline as _completed_kline
+from paper_repository import rows as _rows
+from paper_risk_evidence import hold_days as _hold_days
 from paper_numeric import num as _num
 
 # 这些能力有**独立 owner**（决策引擎、组合分配/运行时、预占、运行时设置），
@@ -56,19 +60,15 @@ class ManualOrderDependencies:
     STRATEGY_EXECUTION_RETRY_STATUS: Any
     _assert_active_lease: Any
     _assert_order_execution_cycle: Any
-    _asset_type: Any
     _audit: Any
     _build_portfolio_entry_plan: Any
-    _completed_kline: Any
     _date: Any
     _db: Any
     _entry_freeze_enabled: Any
     _entry_frozen_reason: Any
     _existing_position_addition_gate: Any
     _finish_capital_reservation: Any
-    _hold_days: Any
     _lease_lost: Any
-    _limit_pct: Any
     _market_state: Any
     _now: Any
     _order_cycle_id: Any
@@ -81,7 +81,6 @@ class ManualOrderDependencies:
     _risk_log: Any
     _risk_profile: Any
     _rollback_slot_borrow: Any
-    _rows: Any
     _shared_account_exposure: Any
     _shared_cash: Any
     _shared_risk_state: Any
@@ -117,15 +116,11 @@ def _manual_order_plan(
     _order_cycle_id = deps._order_cycle_id
     ACTIVE_ACCOUNT_IDS = deps.ACTIVE_ACCOUNT_IDS
     _spec_for = deps._spec_for
-    _asset_type = deps._asset_type
-    _completed_kline = deps._completed_kline
     _date = deps._date
     _build_portfolio_entry_plan = deps._build_portfolio_entry_plan
     _entry_freeze_enabled = deps._entry_freeze_enabled
     _entry_frozen_reason = deps._entry_frozen_reason
     _existing_position_addition_gate = deps._existing_position_addition_gate
-    _hold_days = deps._hold_days
-    _limit_pct = deps._limit_pct
     _market_state = deps._market_state
     _pending_position_slots = deps._pending_position_slots
     _position_rows = deps._position_rows
@@ -431,7 +426,7 @@ def _manual_order_plan(
                 "code": code, "name": local_quote.get("name"),
                 "cost": position.get("cost") if position else None,
                 "peak_price": position.get("peak_price") if position else None,
-                "hold_days": _hold_days(position, day) if position else 0,
+                "hold_days": _hold_days(position, day, _completed_kline) if position else 0,
             },
             kline=_completed_kline(code, day, inclusive=False), snap=local_quote,
             overseas_gate={"light": "unknown"}, news_hits=[],
@@ -876,7 +871,6 @@ def submit_manual_order(
     _record_nav = deps._record_nav
     _reserve_shared_capital = deps._reserve_shared_capital
     _risk_log = deps._risk_log
-    _rows = deps._rows
     _strategy_stamp = deps._strategy_stamp
     init_db = deps.init_db
     deps = _dependencies()
@@ -1182,7 +1176,6 @@ def process_pending_manual_orders(asof_date=None):
     _record_nav = deps._record_nav
     _reserve_shared_capital = deps._reserve_shared_capital
     _risk_log = deps._risk_log
-    _rows = deps._rows
     init_db = deps.init_db
     deps = _dependencies()
     _ReservationCycleMismatch = ReservationCycleMismatch

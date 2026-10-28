@@ -4264,16 +4264,8 @@ def _history_manifest():
 
 
 def _completed_kline(code, cutoff_date, *, inclusive=True):
-    """只返回截止指定完整交易日的日线，排除当天尚未收盘的半根 K 线。"""
-    frame = dfc.load_cached_kline(str(code))
-    if frame is None or frame.empty:
-        return frame
-    cutoff = _date(cutoff_date)
-    try:
-        mask = frame.index.date <= cutoff if inclusive else frame.index.date < cutoff
-        return frame.loc[mask].copy()
-    except Exception:
-        return frame
+    """兼容 facade：K 线截断语义由 ``data_fetcher`` 拥有（A1 phase 3）。"""
+    return dfc.completed_kline(code, _date(cutoff_date), inclusive=inclusive)
 
 
 def _new_listing_profile(account_id, code, kline, history_meta, asof_date):
@@ -10877,13 +10869,8 @@ def execute_open(asof_date=None):
 
 
 def _hold_days(position, asof_day):
-    frame = _completed_kline(position["code"], asof_day, inclusive=False)
-    if frame is not None and not frame.empty:
-        try:
-            return int((frame.index.date > _date(position["entry_date"])).sum())
-        except Exception:
-            pass
-    return max((_date(asof_day) - _date(position["entry_date"])).days, 0)
+    """兼容 facade：持仓天数由 ``paper_risk_evidence`` 拥有（A1 phase 3）。"""
+    return PREv.hold_days(position, asof_day, _completed_kline)
 
 
 def _replacement_min_hold_days(account_id):

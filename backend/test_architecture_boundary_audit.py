@@ -12,7 +12,7 @@ class CouplingBudgetTests(unittest.TestCase):
         "private_cross_access": 201,
         "raw_sql_modules": 135,
         "paper_table_fanout_max": 49,
-        "cross_domain_edges": 624,
+        "cross_domain_edges": 613,
         "max_file_lines": 16367,
         "max_function_lines": 1191,
         "max_function_globals": 56,
@@ -62,6 +62,15 @@ class CouplingBudgetTests(unittest.TestCase):
     # （666 → 673；paper_risk_evidence / paper_risk_service 等早已这样做）。
     # 显式依赖比隐藏的 globals 桥更可核对，故按实测收紧额度外的增量记录。
     #
+    # 同日（A1 phase 3：度量口径修正 + owner 归位）：`coupling_metrics` 把
+    # 事实/基础 owner（paper_repository / paper_trading_rules /
+    # paper_risk_evidence / paper_position_read_model / paper_decision_audit /
+    # entry_lifecycle / paper_common / paper_numeric / paper_storage /
+    # data_paths / env_utils）从业务域里单列为 foundation：业务域直接 import
+    # 这些 owner 是 A1 想要的"显式依赖"，不是新的业务域耦合。修正口径后
+    # 跨域边 676 → **613**（口径修正前这些 owner 被算作 "paper" 域）。
+    # 三个 vertical 的依赖字段 78 → **71**。
+    #
     # 同日（A1 phase 2：常量归位）：状态词表（entry_lifecycle）、整手数量
     # （paper_trading_rules）、共享池敞口（paper_shared_cash）各自成为唯一
     # owner，引擎与三个 vertical 都直接取用，不再各抄一份字面量。
@@ -78,7 +87,7 @@ class CouplingBudgetTests(unittest.TestCase):
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 52,
+        "cross_domain_edges": 4,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,

@@ -79,7 +79,8 @@ def _negative_hits(news, code):
     ]
 
 
-def _hold_days(position, asof_day, load_kline):
+def hold_days(position, asof_day, load_kline):
+    """持仓天数（owner）：K 线缺失时回落到自然日差。"""
     frame = load_kline(position["code"], asof_day, inclusive=False)
     if frame is not None and not frame.empty:
         try:
@@ -851,3 +852,7 @@ def unreserved_risk_sell_quantity(conn, *, cycle_id, account_id, code, requested
     working = pending_risk_sell_orders(conn, cycle_id=cycle_id, account_id=account_id, code=code)
     committed = sum(max(0, int(row["remaining"] or 0)) for row in working)
     return max(0, int(requested_qty) - committed), int(working[0]["id"]) if committed else None
+
+
+#: 兼容旧私有名。
+_hold_days = hold_days
