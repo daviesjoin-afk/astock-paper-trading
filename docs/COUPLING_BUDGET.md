@@ -1,5 +1,10 @@
 # 耦合预算与模块化进度
 
+2026-10-28（A8 收尾）：最后两组环关闭后 `import 环` 由 2 降为 **0**，门禁改为
+「一个环都不允许」。本次同时收紧 `延迟 import`（39 → 35）、`跨域 import 边`
+（42 → 40）与 `跨模块私有属性访问` 基线（202 → 201）；`顶层 import 副作用`
+23 → 24，来自组装期的一次 `bind_default_runner` 调用，仍在基线 25 以内。
+
 2026-10-28：入场时机状态的跨进程文件锁需要按平台加载 Windows 标准库
 `msvcrt`，延迟导入额度由 38 增至 39；这是平台兼容导入，不增加项目模块依赖。
 
@@ -9,24 +14,48 @@
 
 | 指标 | PR272 基线 | 本次收口后 | 允许增量 | 长期目标 |
 |---|---:|---:|---:|---:|
-| import 环 | 5 | 2 | 不允许反弹 | 0 |
-| 延迟 import | 583 | 621 | 38 | 逐步降低；仅移除无必要的延迟依赖 |
+| import 环 | 5 | **0** | 不允许任何新环 | 0 |
+| 延迟 import | 583 | 618 | 35 | 逐步降低；仅移除无必要的延迟依赖 |
 | 裸 SQL 模块 | 135 | 141 | 6 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
-| 跨模块私有属性访问 | 202 | 202 | 0 | 0 |
-| 跨域 import 边 | 624 | 666 | 42 | 分阶段降低 |
-| 最大文件 | 16367 行 | 15676 行 | 0 | ≤2500 |
+| 跨模块私有属性访问 | 201 | 201 | 0 | 0 |
+| 跨域 import 边 | 624 | 664 | 40 | 分阶段降低 |
+| 最大文件 | 16367 行 | 15622 行 | 0 | ≤2500 |
 | 最大函数 | 1191 行 | 1195 行 | 4 | <200 |
 | 单函数最大全局引用 | 56 | 57 | 1 | <80 |
 | 重复顶层 helper 名 | 307 | 313 | 6 | <30 |
 | `_num`/`_number`/`_finite` 重复定义 | 54 | 54 | 0 | 按语义逐模块收敛，不按名称批量替换 |
-| 无归属前缀模块占比 | 41.39% | 39.94% | 0 | <30% |
-| 顶层 import 副作用 | 25 | 23 | 0 | <5 |
+| 无归属前缀模块占比 | 41.39% | 39.87% | 0 | <30% |
+| 顶层 import 副作用 | 25 | 24 | 0 | <5 |
 
-允许增量来自本次审核修复必须新增的生产模块与调用点（`selection_application`、`paper_runtime_facts`、`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 已降至 15,676 行，最大函数仍是 `_buy_order`，未做高风险重写。
+允许增量来自本次审核修复必须新增的生产模块与调用点（`selection_application`、`paper_runtime_facts`、`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 已降至 15,622 行，最大函数仍是 `_buy_order`，未做高风险重写。
 
 ## 本次切片
 
+- 2026-10-28（A8 收尾：最后两组环，环 2 → 0）
+  - **`market_data_service` ↔ `universe`**。新的下层事实 owner `data_universe_store`
+    承接 `universe.json` 的读取边界（路径、`(路径, mtime, size)` 轮内复用、正式清单门槛），
+    `universe.load_universe()` 与行情备用报价都向它取同一份代码集合，行情侧不再
+    import 基础库构建流程。**关键点**：正式清单门槛 `FORMAL_UNIVERSE_MIN_ROWS` 随读取一起
+    搬到 store 并在调用时查找——门槛必须和"按门槛判定"的那份读取同属一个 owner，否则
+    只要有人改一侧，就会出现「读取方认为清单合格、构建方认为不合格（或反之）」的隐性
+    不一致。`universe.build_universe()` 因此直接读 `USTORE.FORMAL_UNIVERSE_MIN_ROWS`。
+    测试侧只改缝的位置，不改断言：腾讯回退的 3 处 patch 目标从 `universe.load_universe`
+    改为 `data_universe_store.load_formal_universe`，回放夹具的规模放宽目标从
+    `universe.FORMAL_UNIVERSE_MIN_ROWS` 改为 `data_universe_store.FORMAL_UNIVERSE_MIN_ROWS`。
+    新增 `test_data_universe_store`（8 项）钉住下沉后的判据本身：正式清单门槛、
+    `scope` / `requested_limit` 的老文件防误用、**缓存身份含路径**（两个路径不得互相串用）、
+    重建后按文件签名失效、读失败不被记忆成成功，以及 `universe.UNIVERSE_PATH` 这条部署
+    seam 仍然有效。
+  - **`strategies` ↔ `strategy_plugins`**。插件表不再 `import strategies`；需要原生算法的
+    插件通过 `bind_default_runner()` 由算法 owner 在**组装期**绑定，`strategies.py` 模块级
+    那一行就是唯一绑定点。默认 runner 是 `_plugin_default_runner`，内部仍按模块全局
+    `_run_strategy_legacy` 在**调用时**查找，所以替换该全局的测试/组装方语义不变。
+    插件对象自身**没有**被塞进 `candidate_runner`——一旦塞进去，`is_original_builtin_plugin`
+    会变成 False，`scoring_factor_inputs` 就会退回"全量输入"，属于行为变更。未绑定就调用
+    默认路径时报明确错误，而不是在 import 处埋一个隐性顺序依赖。
+  - 顺带收紧：`strategies` 里 3 处函数内 `import strategy_plugins` 上移到模块级（少 3 个
+    延迟 import），`strategy_plugins` 里 `S._run_strategy_legacy` 这处跨模块私有属性访问消失。
 - 2026-10-28（A5 任务生命周期）：`paper_jobs` / `paper_job_runs` 的 **9 处**状态写入（认领探测、运行中过期判失败、首次 INSERT、重试认领 CAS、心跳续期 CAS、完成 CAS、失败 CAS、启动回收、历史清理）从 `paper_trading` 收进新 owner `paper_job_lifecycle`，语句只有一份，`paper_trading` 里对这两张表的 INSERT/UPDATE/DELETE **归零**（`test_paper_job_lifecycle` 用 AST 扫描 + 常量渲染做机械守卫，含空结果非空性）。行为不变：owner 不 commit、不做"该不该重试"的业务判断，CAS 谓词（`owner_key` + `fencing_token` + `status='running'`）逐字保留。裸 SQL 模块 140 → 141（SQL 换了归属，模块数多一个，额度 +1 已登记）；主文件 `paper_trading.py` 少 84 行。
 - 2026-10-27（§13.4 复用资源测量）：`backend/tools/modularity_reuse_bench.py` 把「同轮输入复用」的净效果做成可重跑证据 ——
   三个消费者、5000 只证券、合成输入、不联网不碰生产库。分开取数时 universe/finance/fundamental 各 **3** 次；

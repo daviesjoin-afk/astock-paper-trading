@@ -8,6 +8,7 @@ import datetime as dt
 import os, json, time, threading, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import data_fetcher as dfc
+import data_universe_store as USTORE
 import market_data_contract as MDC
 import market_data_service as MDSvc
 
@@ -21,7 +22,7 @@ try:
 except ImportError:  # pragma: no cover - requirements installs the provider.
     _cn_calendar = None
 
-UNIVERSE_PATH = os.path.join(dfc.CACHE_DIR, "universe.json")
+UNIVERSE_PATH = USTORE.universe_path()
 INIT_STATE = {
     "status": "idle", "phase": "idle", "done": 0, "total": 0, "started_at": None,
     "errors": 0, "retried": 0, "recovered": 0,
@@ -29,13 +30,6 @@ INIT_STATE = {
 }
 _state_lock = threading.Lock()
 
-# 基础库是低频变更的静态文件，但每轮盘中扫描会通过
-# _latest_price_map / _candidate_rows / _live_scan_gate 等路径重复读取
-# 数十次（1.86MB JSON）。按 (mtime, size) 缓存，文件被重建时自动失效。
-_universe_cache = None
-_universe_cache_sig = None
-_universe_cache_lock = threading.Lock()
-FORMAL_UNIVERSE_MIN_ROWS = 4000
 FORMAL_UNIVERSE_MIN_COVERAGE = 0.90
 COVERAGE_DISPLAY_CACHE_TTL_SECONDS = 10.0
 _coverage_cache_lock = threading.Lock()
@@ -66,10 +60,7 @@ def invalidate_coverage_cache():
 
 
 def _universe_cache_signature():
-    try:
-        return (os.path.getmtime(UNIVERSE_PATH), os.path.getsize(UNIVERSE_PATH))
-    except OSError:
-        return None
+    return USTORE.universe_file_signature(UNIVERSE_PATH)
 
 def _board(code):
     code = str(code)
@@ -142,7 +133,7 @@ def build_universe(size=0):
     coverage = len(unique_codes) / max(baseline, len(unique_codes), 1)
     formal_ok = (
         debug_limit == 0
-        and len(unique_codes) >= FORMAL_UNIVERSE_MIN_ROWS
+        and len(unique_codes) >= USTORE.FORMAL_UNIVERSE_MIN_ROWS
         and coverage >= FORMAL_UNIVERSE_MIN_COVERAGE
     )
     if debug_limit > 0:
@@ -173,43 +164,8 @@ def build_universe(size=0):
     return uni
 
 def load_universe():
-    global _universe_cache, _universe_cache_sig
-    sig = _universe_cache_signature()
-    if sig is None:
-        return []
-    if _universe_cache is not None and sig == _universe_cache_sig:
-        return _universe_cache
-    with _universe_cache_lock:
-        # 双检：锁内再确认一次，避免并发下重复读盘。
-        if _universe_cache is not None and sig == _universe_cache_sig:
-            return _universe_cache
-        rows = []
-        if os.path.exists(UNIVERSE_PATH):
-            try:
-                with open(UNIVERSE_PATH, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                candidate = payload.get("stocks", []) if isinstance(payload, dict) else []
-                codes = {str(row.get("code") or "") for row in candidate
-                         if isinstance(row, dict) and row.get("code")}
-                # Legacy/debug files must not become a formal input merely
-                # because the JSON itself is parseable.  The writer records
-                # requested_limit=None for the only publishable all-market
-                # form; a formal file also needs the same 4,000-row floor.
-                if (
-                    not isinstance(candidate, list)
-                    or not isinstance(payload, dict)
-                    or payload.get("scope") != "all_a_shares"
-                    or payload.get("requested_limit") is not None
-                    or len(codes) < FORMAL_UNIVERSE_MIN_ROWS
-                ):
-                    rows = []
-                else:
-                    rows = candidate
-            except (OSError, ValueError, TypeError):
-                rows = []
-        _universe_cache = rows
-        _universe_cache_sig = sig
-    return rows
+    """读取已持久化的全 A 股基础库；读取与轮内复用归 ``data_universe_store``。"""
+    return USTORE.load_formal_universe(UNIVERSE_PATH)
 
 def get_init_state():
     with _state_lock:

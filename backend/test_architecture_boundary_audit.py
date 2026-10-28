@@ -7,9 +7,9 @@ from tools import coupling_metrics
 class CouplingBudgetTests(unittest.TestCase):
     # PR272 baseline, with boundaries tightened after each completed slice.
     HEAD_BUDGET = {
-        "import_cycles": 2,
+        "import_cycles": 0,
         "deferred_imports": 583,
-        "private_cross_access": 202,
+        "private_cross_access": 201,
         "raw_sql_modules": 135,
         "paper_table_fanout_max": 49,
         "cross_domain_edges": 624,
@@ -39,13 +39,22 @@ class CouplingBudgetTests(unittest.TestCase):
     # 收进 `paper_job_lifecycle`，SQL 从主文件搬出后"含 execute 的模块"多了一个
     # （141）。这是归属明确化的代价，不是新增写入面：`paper_trading` 里对这两张表
     # 的 INSERT/UPDATE/DELETE 已归零（`test_paper_job_lifecycle` 有机械守卫）。
+    # 2026-10-28（A8 收尾：最后两组环）：`universe.json` 的读取下沉到
+    # `data_universe_store`，行情回退与 `universe` 都向它取同一份事实；
+    # `strategy_plugins` 不再 import `strategies`，改由算法 owner 在组装期
+    # `bind_default_runner` 绑定。实测：环 2 → **0**，私有跨模块访问 202 → 201
+    # （少掉 `S._run_strategy_legacy` 这一处），延迟 import 621 → 618，
+    # 跨域边 666 → 664。因此按实测收紧额度：延迟 39 → 35、跨域 42 → 40，
+    # 基线里 `import_cycles` 与 `private_cross_access` 直接收紧到实测值。
+    # 顶层 import 副作用 23 → 24，来自组装期那一次 `bind_default_runner` 调用，
+    # 仍在 PR272 基线 25 以内，不是新增的副作用类别。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
-        "deferred_imports": 39,
+        "deferred_imports": 35,
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 42,
+        "cross_domain_edges": 40,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,
@@ -71,12 +80,11 @@ class CouplingBudgetTests(unittest.TestCase):
         self.assertEqual(set(self.HEAD_BUDGET), set(self.FEATURE_ALLOWANCE))
         self.assertTrue(all(value >= 0 for value in self.FEATURE_ALLOWANCE.values()))
 
-    def test_known_cycles_do_not_grow(self):
+    def test_no_backend_import_cycles(self):
+        """2026-10-28：已知闭环全部关闭，现在不允许任何新环出现。"""
         actual = coupling_metrics.measure_all()
-        self.assertEqual([
-            ("market_data_service", "universe"),
-            ("strategies", "strategy_plugins"),
-        ], actual["import_cycle_members"])
+        self.assertEqual([], actual["import_cycle_members"])
+        self.assertEqual(0, actual["import_cycles"])
 
 
 if __name__ == "__main__":

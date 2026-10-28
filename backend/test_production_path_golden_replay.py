@@ -41,6 +41,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import data_fetcher as dfc  # noqa: E402
+import data_universe_store as USTORE  # noqa: E402
 import factors as FACTORS  # noqa: E402
 import market_data_contract as MDC  # noqa: E402
 import market_data_service as MDSvc  # noqa: E402
@@ -407,8 +408,8 @@ class OfflinePaperEnv:
         PT.CANDIDATE_FACTOR_MIN_ROWS = 1
         cls._patches.append((PT, "LIVE_SCAN_GATE_MIN_ROWS", PT.LIVE_SCAN_GATE_MIN_ROWS))
         PT.LIVE_SCAN_GATE_MIN_ROWS = 1
-        cls._patches.append((U, "FORMAL_UNIVERSE_MIN_ROWS", U.FORMAL_UNIVERSE_MIN_ROWS))
-        U.FORMAL_UNIVERSE_MIN_ROWS = 1
+        cls._patches.append((USTORE, "FORMAL_UNIVERSE_MIN_ROWS", USTORE.FORMAL_UNIVERSE_MIN_ROWS))
+        USTORE.FORMAL_UNIVERSE_MIN_ROWS = 1
         # 交易日历属于外部数据：离线环境按工作日近似（不影响被测逻辑）。
         cls._patches.append((U, "is_trade_day", U.is_trade_day))
         U.is_trade_day = staticmethod(lambda value=None: (_as_date(value) or dt.date.today()).weekday() < 5)

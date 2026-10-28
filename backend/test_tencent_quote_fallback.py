@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 
 import data_fetcher as dfc
+import data_universe_store as USTORE
 import market_data_contract as MDC
 import market_data_service as MDSvc
 import paper_trading as PT
@@ -374,7 +375,7 @@ class RefreshFallbackTests(unittest.TestCase):
         rows = [_TencentRow.build(code) for code in codes]
         with mock.patch.object(dfc, "fetch_market_snapshot_full", return_value=[]), \
                 mock.patch.object(dfc, "fetch_tencent_realtime_for_codes", return_value=rows), \
-                mock.patch("universe.load_universe", return_value=[{"code": code} for code in codes]):
+                mock.patch.object(USTORE, "load_formal_universe", return_value=[{"code": code} for code in codes]):
             reading = MDSvc.refresh_snapshot(now=NOW)
         self.assertTrue(reading.available)
         self.assertEqual(MDC.STATUS_DEGRADED, reading.status)
