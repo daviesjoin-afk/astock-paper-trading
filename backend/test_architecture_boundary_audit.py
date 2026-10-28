@@ -54,13 +54,17 @@ class CouplingBudgetTests(unittest.TestCase):
     # 内）。`data_fetcher`(data) 与 `paper_live_tradability`(paper) 各新增一条
     # 跨域边，共 +2（664 → 666）；其余三个调用方都在 `other` 域，不新增边。
     # 这是"共享实现替代复制"的代价，不是新业务耦合。
+    #
+    # 同日（低频状态跨进程缓存）：`paper_live_tradability` 新增 `data_paths`
+    # 与 `marketdata_cache` 两条跨域边（paper → data / other），用于把停牌报表
+    # 落到 data_cache 并复用 single-flight 原子发布。664 → 668。额度 42 → 44。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
         "deferred_imports": 35,
         "private_cross_access": 0,
         "raw_sql_modules": 6,
         "paper_table_fanout_max": 1,
-        "cross_domain_edges": 42,
+        "cross_domain_edges": 44,
         "max_file_lines": 0,
         "max_function_lines": 4,
         "max_function_globals": 1,

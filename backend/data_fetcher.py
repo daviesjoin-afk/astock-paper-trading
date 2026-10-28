@@ -4,6 +4,7 @@
 import datetime as dt
 import contextvars
 import copy
+import hashlib
 import os, json, time, threading, uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +47,12 @@ CACHE_DIR = data_paths.data_dir()
 # 30 分钟（公告发布本身有交易所披露节奏，且重抓同一批文本没有新信息）。
 NEWS_CACHE_TTL_SECONDS = env_float("ASTOCK_NEWS_CACHE_TTL_SECONDS", 300, minimum=1.0)
 ANNOUNCEMENT_CACHE_TTL_SECONDS = env_float("ASTOCK_ANNOUNCEMENT_CACHE_TTL_SECONDS", 1800, minimum=1.0)
+# 每个 cron 轮次都是新进程：只在内存里做 TTL 等于每次重新联网。新闻与公告
+# 结果落到 data_cache，并用 flock single-flight 防止多个容器同时抓同一批。
+NEWS_CACHE_PATH = os.path.join(CACHE_DIR, "fast_news.json")
+ANNOUNCEMENT_CACHE_DIR = os.path.join(CACHE_DIR, "announcements")
+_news_fetch_lock = threading.Lock()
+_announcement_fetch_lock = threading.Lock()
 
 KLINE_DIR = os.path.join(CACHE_DIR, "klines")
 KLINE_MANIFEST_PATH = os.path.join(CACHE_DIR, "kline_manifest.json")
@@ -100,6 +107,14 @@ def health_probe_scope():
 
 def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
+
+
+def _persistent_list(key, path, ttl, fn, fetch_lock):
+    """跨进程复用列表型低频数据；空列表也是有效答案。"""
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, fetch_lock, key, path, ttl, fn,
+        lambda value: isinstance(value, list), allow_empty=True,
+    )
 
 
 def cached_age_seconds(key):
@@ -2024,7 +2039,7 @@ def fetch_fast_news(page_size=50):
                 "evidence_grade": "C",
             })
         return output
-    return _cached("news", NEWS_CACHE_TTL_SECONDS, _do)
+    return _persistent_list("news", NEWS_CACHE_PATH, NEWS_CACHE_TTL_SECONDS, _do, _news_fetch_lock)
 
 
 def fetch_company_announcements(codes, page_size=100):
@@ -2075,7 +2090,11 @@ def fetch_company_announcements(codes, page_size=100):
             })
         return output
 
-    return _cached("announcements:" + ",".join(normalized), ANNOUNCEMENT_CACHE_TTL_SECONDS, _do)
+    key = "announcements:" + ",".join(normalized)
+    os.makedirs(ANNOUNCEMENT_CACHE_DIR, exist_ok=True)
+    path = os.path.join(
+        ANNOUNCEMENT_CACHE_DIR, hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".json")
+    return _persistent_list(key, path, ANNOUNCEMENT_CACHE_TTL_SECONDS, _do, _announcement_fetch_lock)
 
 
 def fetch_hot_rank(topn=100):

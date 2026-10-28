@@ -196,6 +196,10 @@
 - `data_fetcher`（data 域）与 `paper_live_tradability`（paper 域）各新增一条
   指向 `env_utils`（other 域）的边，`cross_domain_edges` 664 → **666**；
   `marketdata_transport` / `marketdata_feeds` / `alt_data` 也在 other 域，不新增边。
-  额度 40 → 42 并在此记录：这是共享实现替代复制，不是新增业务耦合。
+- 低频状态改为**跨进程**缓存后，`paper_live_tradability` 再新增 `data_paths`
+  （paper → data）与 `marketdata_cache`（paper → other）两条边，666 → **668**。
+  额度 40 → 44 并在此记录：这是共享实现替代复制，不是新增业务耦合。
+- 缓存目录改为在 `_get` / `fetch_company_announcements` 内懒创建，避免 import
+  期副作用（`import_side_effects` 保持 25）。
 - 低频状态缓存窗口（停牌 15 分钟、公告 30 分钟、快讯 5 分钟）是运行时策略，
   不改变模块依赖。
