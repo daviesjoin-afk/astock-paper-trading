@@ -189,7 +189,15 @@ export function wbRenderList(){
   }else if(WB_STATE.originFilter==='all'&&WB_STATE.statusFilter==='all'&&!($('wbSearch')&&$('wbSearch').value.trim())){
     html+='<div class="strategy-workbench-empty strategy-workbench-empty-inline"><b>还没有自定义策略</b><p>内置策略可直接复制成自定义策略后修改。</p><button type="button" class="strategy-workbench-primary" onclick="wbNewStrategy()">创建第一个策略</button></div>';
   }
-  if(builtins.length) html+='<h3 class="strategy-list-group">内置策略（平台自带，可复制后修改）</h3><div class="strategy-card-grid">'+builtins.map(wbCard).join('')+'</div>';
+  // 内置模板共有 5 套，但当前只启用 3 套。把"当前可用"与"已退役/未启用"
+  // 分开：默认视野只呈现真正能参与下一周期的策略，历史模板折叠保留。
+  var activeBuiltins=builtins.filter(function(x){return !!x.formal_cycle_allowed;});
+  var inactiveBuiltins=builtins.filter(function(x){return !x.formal_cycle_allowed;});
+  if(activeBuiltins.length) html+='<h3 class="strategy-list-group">内置策略 · 当前可用（'+activeBuiltins.length+'）</h3><div class="strategy-card-grid">'+activeBuiltins.map(wbCard).join('')+'</div>';
+  if(inactiveBuiltins.length){
+    var open=WB_STATE.statusFilter!=='all'?' open':'';
+    html+='<details class="strategy-retired-group"'+open+'><summary>已退役 / 未启用内置策略（'+inactiveBuiltins.length+'）</summary><div class="strategy-card-grid">'+inactiveBuiltins.map(wbCard).join('')+'</div></details>';
+  }
   list.innerHTML=html;
 }
 

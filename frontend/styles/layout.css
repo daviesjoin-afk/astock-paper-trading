@@ -125,8 +125,11 @@ tr:hover td { background:var(--surface-hover); }
 .paper-order-scroll { max-height:360px; overflow-y:auto; padding-right:4px; scrollbar-gutter:stable; }
 .paper-filter-count { color:#8a9690; font-size:11px; white-space:nowrap; }
 .paper-mini-btn { padding:6px 12px; border-radius:8px; font-size:11px; }.paper-mini-btn.sell { background:#238064; }.paper-mini-btn.cancel { background:#fff; border:1px solid #e5a39c; color:#c1483f; }
-.paper-order-list { display:grid; gap:7px; }.paper-order-row { display:grid; grid-template-columns:82px minmax(120px,1fr) 80px 90px minmax(110px,1.2fr) auto; gap:9px; align-items:center; padding:9px 11px; border-radius:10px; background:#f8faf9; font-size:12px; }
-.paper-execution-facts { display:block; margin-top:4px; color:var(--text-muted); font-size:10px; font-weight:400; line-height:1.5; }
+.paper-order-list { display:grid; gap:7px; }
+.paper-order-row { display:grid; grid-template-columns:82px minmax(120px,1fr) 92px 90px minmax(110px,1.2fr) auto; gap:6px 9px; align-items:center; padding:8px 11px; border-radius:10px; background:#f8faf9; font-size:12px; }
+/* 执行证据单独占一行：主行只放"谁/方向/价格/状态"，避免窄列把明细逐字换行。 */
+.paper-order-facts { grid-column:1/-1; min-width:0; }
+.paper-execution-facts { display:block; min-width:0; color:var(--text-muted); font-size:10px; font-weight:400; line-height:1.5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .paper-order-status { display:inline-flex; width:max-content; padding:3px 8px; border-radius:999px; font-size:10px; font-weight:700; }.paper-order-status.filled { background:#e8f7ef; color:#19704f; }.paper-order-status.pending { background:#fff6dc; color:#9b6a0e; }.paper-order-status.rejected { background:#ffeded; color:#a83f38; }.paper-order-status.cancelled { background:#eef1f3; color:#657078; }
 .paper-empty { padding:20px; text-align:center; color:#9aa49f; font-size:12px; }
 .paper-risk-audit-section .table-scroll { max-height:clamp(380px,58vh,620px); overflow:auto; overscroll-behavior:contain; }

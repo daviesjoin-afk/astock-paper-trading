@@ -296,7 +296,11 @@ export function paperExecutionFactsHtml(item){
   if(item.pricing_basis) facts.push('计价依据 '+zhRiskText(item.pricing_basis));
   if(item.execution_market_asof) facts.push('市场 as-of '+adaptiveEsc(item.execution_market_asof));
   if(reasons) facts.push('执行原因 '+zhRiskText(reasons));
-  return '<small class="paper-execution-facts">'+facts.join('<br>')+'</small>';
+  // 委托列表是“一行一单”的密度视图：完整证据放进 title，正文只保留一条
+  // 摘要，避免 5 行明细把行高撑到只能看见一单。
+  var full=facts.join(' · ');
+  var brief=facts.slice(0,3).join(' · ');
+  return '<small class="paper-execution-facts" title="'+adaptiveEsc(full)+'">'+brief+'</small>';
 }
 
 export function setPaperTerminalFilter(kind,value){
@@ -360,7 +364,9 @@ export var PAPER_MARKET_REASON_LABELS={
   missing:'还没有可信行情',stale:'行情已超过新鲜度窗口',incomplete:'行情覆盖不完整',
   provider_unavailable:'行情源不可用',refresh_failed:'行情刷新失败',
   cross_source_failed:'多源核验未通过',asof_unprovable:'无法证明该时点行情',
-  asof_mismatch:'行情时点与请求不一致'
+  asof_mismatch:'行情时点与请求不一致',
+  // 分配计划身份 ≠ 行情状态：不要把这个规划代码渲染成“行情不可用”。
+  explicit_cycle_and_plan_id_required:'需要指定周期与计划编号（到「组合计划」查看）'
 };
 
 export function paperMarketDataHtml(md){
@@ -849,8 +855,9 @@ export async function renderPaperDashboard(d,auditRequest){
     var recentOrders=(d.orders||[]).map(function(o){
       var view=paperOrderStatusView(o.status,o.reason), cancel=(!o.archived_cycle&&o.origin==='manual'&&['pending_limit','pending_execution','partially_filled'].indexOf(o.status)>=0)?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤销剩余</button>':'';
       return '<div class="paper-order-row" data-account="'+adaptiveEsc(o.account_id)+'" data-date="'+adaptiveEsc(String(o.created_at||'').slice(0,10))+'" data-side="'+adaptiveEsc(o.side)+'" data-status="'+adaptiveEsc(o.status)+'"><span>'+shortStamp(o.created_at)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+adaptiveJsArg(o.code)+'\')">'+adaptiveEsc(o.name)+'</button><br><small>'+adaptiveEsc(o.code)+' · '+adaptiveEsc(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
-        +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+' '+o.qty+paperExecutionFactsHtml(o)+'</span><span>'+fmt(o.filled_price||o.planned_price)+'</span>'
-        +'<span class="paper-order-status '+view[0]+'">'+view[1]+'</span><span>'+cancel+'</span></div>';
+        +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+' '+o.qty+'</span><span>'+fmt(o.filled_price||o.planned_price)+'</span>'
+        +'<span class="paper-order-status '+view[0]+'">'+view[1]+'</span><span>'+cancel+'</span>'
+        +'<div class="paper-order-facts">'+paperExecutionFactsHtml(o)+'</div></div>';
     }).join('');
     var riskFeed=(d.risk_decisions||[]).slice(0,5).map(function(r){
       return '<div style="padding:8px 0;border-bottom:1px solid #edf1ef;font-size:12px"><b>'+(r.account_name||r.account_id)+' · '+(r.side==='buy'?'买入':'卖出')+' '+(r.code||'')+'</b><br><span style="color:var(--text-secondary)">'+zhRiskText(r.reason||r.decision)+'</span></div>';

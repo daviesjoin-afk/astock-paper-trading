@@ -9018,6 +9018,22 @@ def strategy_allocation_explain():
     with _db() as conn:
         cycle_id = int(_active_cycle_id_readonly(conn) or 0)
         rows = _shared_account_rows(conn, cycle_id) if cycle_id else []
+        # 分配计划需要显式周期/计划身份，但**行情**不是：用最近一次风险快照
+        # 的只读市场事实填充，不能让页面把"缺少计划编号"误报成"行情不可用"。
+        try:
+            snapshot = RC.load_snapshot() or {}
+        except Exception:
+            snapshot = {}
+        market = snapshot.get("market") or {}
+        light = str(market.get("light") or "")
+        market_known = light in ("green", "yellow", "red")
+        market_data = {
+            "status": MDC.STATUS_FRESH if market_known else MDC.STATUS_UNAVAILABLE,
+            "reason": None if market_known else "missing",
+            "observed_at": snapshot.get("asof") or market.get("live_index_time"),
+            "as_of": market.get("data_date") or snapshot.get("asof"),
+            "verification": "verified" if market_known else None,
+        }
         strategies = []
         for row in rows:
             account_id = str(row.get("id") or "")
@@ -9029,7 +9045,7 @@ def strategy_allocation_explain():
                 "allocation_status": "UNAVAILABLE",
                 "allocation_unavailable_reason": "explicit_cycle_and_plan_id_required",
                 "base_priority": None,
-                "regime": {"market_light": None, "market_scale_pct": None,
+                "regime": {"market_light": light or None, "market_scale_pct": None,
                            "market_scale_applied": None},
                 "confidence": None,
                 "health": None,
@@ -9052,13 +9068,6 @@ def strategy_allocation_explain():
                 "waiting_reason": {"status": None, "code": None, "reason": None,
                                    "intended_date": None},
             })
-        unavailable_market = {
-            "status": MDC.STATUS_UNAVAILABLE,
-            "reason": "explicit_cycle_and_plan_id_required",
-            "observed_at": None,
-            "as_of": None,
-            "verification": None,
-        }
         return {
             "engine": PA.ALLOCATION_ENGINE_VERSION,
             "cycle_id": cycle_id or None,
@@ -9066,8 +9075,8 @@ def strategy_allocation_explain():
             "allocation_unavailable_reason": "explicit_cycle_and_plan_id_required",
             "nav": None,
             "pool_limit": None,
-            "market_light": None,
-            "market_data": unavailable_market,
+            "market_light": light or None,
+            "market_data": market_data,
             "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
             "allocation_plan": {"total_deployable_amount": None,
                                 "total_waiting_capital": None,
