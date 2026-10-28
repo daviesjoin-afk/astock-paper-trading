@@ -452,6 +452,7 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
     :(runtime.deployment&&runtime.deployment.blocked_reason))
     ||(runtime.waiting_reason&&runtime.waiting_reason.reason)
     ||(runtime.running?'正常运行，无阻塞':'未参与当前周期');
+  var allocationKnown=runtime.allocation_status!=='UNAVAILABLE';
   var limits='';
   if(boundary){
     limits='<div class="paper-strategy-section"><label>风险 / 执行边界（摘要）</label><div class="paper-strategy-metrics">'
@@ -468,11 +469,13 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
     +'<div class="paper-strategy-section"><label>当前周期运行时</label><div class="paper-strategy-metrics">'
     +'<div>参与本周期<b>'+(runtime.running?'是':'否')+'</b></div>'
     +'<div>生命周期阶段<b>'+riskText(paperRunningStageLabel(runtime))+'</b></div>'
-    +'<div>资金系数<b>'+scale+'</b></div>'
-    +'<div>持仓席位<b>'+fmt(runtime.position_count,0)+' / '+fmt(runtime.position_limit,0)+'</b></div>'
-    +'<div>目标额度<b>'+target+'</b></div>'
-    +'<div>可部署<b>'+deployable+'</b></div>'
-    +'<div>未部署余额<b>'+waiting+'</b></div>'
+    +(allocationKnown
+      ? ('<div>资金系数<b>'+scale+'</b></div>'
+        +'<div>持仓席位<b>'+fmt(runtime.position_count,0)+' / '+fmt(runtime.position_limit,0)+'</b></div>'
+        +'<div>目标额度<b>'+target+'</b></div>'
+        +'<div>可部署<b>'+deployable+'</b></div>'
+        +'<div>未部署余额<b>'+waiting+'</b></div>')
+      : '<div class="paper-strategy-muted" style="grid-column:1/-1">分配额度与席位需在「组合计划」指定周期与计划编号后验证；此处不展示空占位。</div>')
     +'</div></div>'
     +limits
     +'<div class="paper-strategy-section"><label>不可变版本</label><p>v'+riskText(version)

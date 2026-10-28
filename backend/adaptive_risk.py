@@ -66,19 +66,24 @@ DOWNSIDE_BASE = {
         "downside_peak_retrace_pct": 3.5, "downside_partial_ratio": 0.35,
     },
     "trend_pullback": {
-        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
-        "downside_full_pct": -5.5, "downside_relative_pct": -3.0,
-        "downside_peak_retrace_pct": 4.5, "downside_partial_ratio": 0.30,
+        "downside_warning_pct": -2.2, "downside_partial_pct": -3.0,
+        "downside_full_pct": -5.0, "downside_relative_pct": -2.7,
+        "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.35,
     },
     "sector_rotation": {
-        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
-        "downside_full_pct": -5.5, "downside_relative_pct": -3.0,
-        "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.30,
+        "downside_warning_pct": -2.2, "downside_partial_pct": -3.0,
+        "downside_full_pct": -4.5, "downside_relative_pct": -2.5,
+        "downside_peak_retrace_pct": 3.5, "downside_partial_ratio": 0.40,
+    },
+    "reported_profit_breakout": {
+        "downside_warning_pct": -1.8, "downside_partial_pct": -3.2,
+        "downside_full_pct": -5.8, "downside_relative_pct": -2.4,
+        "downside_peak_retrace_pct": 3.2, "downside_partial_ratio": 0.40,
     },
     "main_force_top10": {
-        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
-        "downside_full_pct": -5.0, "downside_relative_pct": -3.0,
-        "downside_peak_retrace_pct": 4.5, "downside_partial_ratio": 0.30,
+        "downside_warning_pct": -2.0, "downside_partial_pct": -3.0,
+        "downside_full_pct": -5.0, "downside_relative_pct": -2.5,
+        "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.50,
     },
 }
 
