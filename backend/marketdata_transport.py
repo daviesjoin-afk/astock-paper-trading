@@ -5,8 +5,11 @@
 ``data_fetcher`` 维护。通过从旧模块重新导出名称，保留现有调用方兼容性。
 """
 
+import json
+import os
 import threading
 import time
+import uuid
 
 import requests
 import paper_timing as PTM
@@ -103,6 +106,145 @@ _TRANSPORT_BREAKER_COOLDOWN_SECONDS = 90.0
 
 _transport_breaker = {}
 _transport_breaker_lock = threading.Lock()
+_PROCESS_STARTED = time.monotonic()
+
+
+def _env_float(name, default):
+    try:
+        value = float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return float(default)
+    return value
+
+
+# ---------------------------------------------------------------------------
+# 扫描尾部的预算收敛。
+#
+# 为什么需要：``http_get`` 的默认参数是 ``timeout=15, retries=2``，单个失败
+# URL 最坏要烧 45 秒。一次 intraday 扫描有上百次 HTTP 调用，尾部几次"还在等
+# 已经挂掉的源"就把整轮从 120 秒推到 300~500 秒，直接吃掉下一个三分钟调度窗。
+# 主机短路能止住后续调用，但它只在**本轮进程内**生效，且要等到阈值才会触发。
+#
+# 这里的策略只作用于**扫描进程的后半程**：``ASTOCK_SCAN_BUDGET_SECONDS`` 由
+# 调度入口（每轮一个全新 ``paper_runner`` 进程）注入，超过
+# ``ASTOCK_SCAN_TAIL_AFTER_SECONDS`` 后，把后续请求的超时压到 4 秒、重试压到
+# 1 次。语义不变——失败仍然抛给调用方，原有的 fail-closed/fail-open 分支照旧；
+# 变的只是"愿意为一个已经不可用的源等多久"。
+#
+# 未设置预算的进程（API、测试、离线脚本）完全不受影响；扫描也只有在**已经
+# 跑过尾部阈值**后才收敛，正常轮次的请求参数与现在完全一致。
+# ---------------------------------------------------------------------------
+_SCAN_BUDGET_SECONDS = _env_float("ASTOCK_SCAN_BUDGET_SECONDS", 0.0)
+_SCAN_TAIL_AFTER_SECONDS = _env_float("ASTOCK_SCAN_TAIL_AFTER_SECONDS", 90.0)
+_SCAN_TAIL_TIMEOUT_CAP = 8.0
+_SCAN_TAIL_RETRIES_CAP = 1
+
+
+def scan_tail_active():
+    """当前进程是否已进入扫描尾部（未配置预算时永远为 False）。"""
+    if _SCAN_BUDGET_SECONDS <= 0:
+        return False
+    return (time.monotonic() - _PROCESS_STARTED) >= _SCAN_TAIL_AFTER_SECONDS
+
+
+def scan_budget_limits(timeout, retries):
+    """按扫描尾部预算收敛单次请求的 ``(timeout, retries)``。
+
+    ``timeout`` 可能是 ``(connect, read)`` 元组；无法比较时原样返回，绝不因为
+    诊断优化改动调用方的请求契约。
+    """
+    if not scan_tail_active():
+        return timeout, retries
+    try:
+        capped_timeout = min(float(timeout), _SCAN_TAIL_TIMEOUT_CAP)
+        capped_retries = min(int(retries), _SCAN_TAIL_RETRIES_CAP)
+    except (TypeError, ValueError):
+        return timeout, retries
+    return capped_timeout, capped_retries
+
+
+# ---------------------------------------------------------------------------
+# 跨进程熔断记忆。
+#
+# 每个 cron 轮次都是一次全新的 ``docker exec python paper_runner.py``，进程内
+# 熔断表随进程销毁。于是同一个已经挂掉的主机，每一轮都要重新"学习"一次：
+# 先烧 6 次失败 / 45 秒累计浪费，才开始短路。生产日志里每轮 20~159 次
+# ``http_get_attempt`` 失败正是这个重复学习成本。
+#
+# 只持久化**已经短路**的主机与到期时刻，冷却很短（90s），文件原子替换；
+# 读写失败一律忽略，熔断是优化而不是正确性依赖。默认不启用，由调度入口显式
+# 注入 ``ASTOCK_TRANSPORT_BREAKER_FILE``，避免测试与 API 进程互相污染。
+# ---------------------------------------------------------------------------
+_BREAKER_STATE_FILE = (os.environ.get("ASTOCK_TRANSPORT_BREAKER_FILE") or "").strip()
+_BREAKER_STATE_MAX_HOSTS = 32
+_breaker_state_loaded = False
+
+
+def _load_breaker_state():
+    """把上一次进程留下的、仍未到期的短路状态并入当前熔断表。"""
+    global _breaker_state_loaded
+    if _breaker_state_loaded:
+        return
+    _breaker_state_loaded = True
+    if not _BREAKER_STATE_FILE:
+        return
+    try:
+        with open(_BREAKER_STATE_FILE, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    now_mono, now_wall = time.monotonic(), time.time()
+    with _transport_breaker_lock:
+        for host, raw in list(payload.items())[:_BREAKER_STATE_MAX_HOSTS]:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                remaining = float(raw.get("until_wall") or 0.0) - now_wall
+            except (TypeError, ValueError):
+                continue
+            if remaining <= 0:
+                continue
+            _transport_breaker[str(host)] = {
+                "fails": int(raw.get("fails") or 0),
+                "burned": float(raw.get("burned") or 0.0),
+                "until": now_mono + remaining,
+            }
+
+
+def _persist_breaker_state():
+    """原子写出当前仍短路的主机；没有配置文件或写失败时静默跳过。"""
+    if not _BREAKER_STATE_FILE:
+        return
+    now_mono, now_wall = time.monotonic(), time.time()
+    with _transport_breaker_lock:
+        payload = {
+            host: {
+                "fails": int(state.get("fails") or 0),
+                "burned": round(float(state.get("burned") or 0.0), 2),
+                "until_wall": round(now_wall + (state["until"] - now_mono), 3),
+            }
+            for host, state in _transport_breaker.items()
+            if (state.get("until") or 0.0) > now_mono
+        }
+    if len(payload) > _BREAKER_STATE_MAX_HOSTS:
+        payload = dict(list(payload.items())[:_BREAKER_STATE_MAX_HOSTS])
+    temp_path = f"{_BREAKER_STATE_FILE}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+        os.replace(temp_path, _BREAKER_STATE_FILE)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def breaker_state_path():
+    """当前进程使用的持久化路径（诊断用；未启用时为空串）。"""
+    return _BREAKER_STATE_FILE
 
 
 def _transport_host(url):
@@ -118,6 +260,7 @@ def _transport_host(url):
 
 def _transport_breaker_remaining(host):
     """返回剩余短路秒数；未短路返回 None。"""
+    _load_breaker_state()
     with _transport_breaker_lock:
         state = _transport_breaker.get(host)
         if not state:
@@ -133,19 +276,26 @@ def _transport_breaker_note(host, *, ok, burned=0.0):
     后者是必要的：``timeout=15, retries=2`` 下单次失败就烧 45 秒，只按次数
     触发会让扫描先白等几百秒。
     """
+    _load_breaker_state()
+    state_changed = False
     with _transport_breaker_lock:
         state = _transport_breaker.setdefault(
             host, {"fails": 0, "burned": 0.0, "until": 0.0})
         if ok:
+            state_changed = bool(state.get("until"))
             state["fails"] = 0
             state["burned"] = 0.0
             state["until"] = 0.0
-            return
-        state["fails"] = int(state.get("fails") or 0) + 1
-        state["burned"] = float(state.get("burned") or 0.0) + max(0.0, float(burned or 0.0))
-        if (state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD
-                or state["burned"] >= _TRANSPORT_BREAKER_BURN_BUDGET):
-            state["until"] = time.monotonic() + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
+        else:
+            state["fails"] = int(state.get("fails") or 0) + 1
+            state["burned"] = float(state.get("burned") or 0.0) + max(0.0, float(burned or 0.0))
+            if (state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD
+                    or state["burned"] >= _TRANSPORT_BREAKER_BURN_BUDGET):
+                if not (state.get("until") or 0.0) > time.monotonic():
+                    state_changed = True
+                state["until"] = time.monotonic() + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
+    if state_changed:
+        _persist_breaker_state()
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +322,16 @@ def note_transport_result(host, *, ok, burned=0.0):
 
 
 def reset_transport_breakers():
-    """清空短路状态。给测试与故障恢复用；生产不需要定期调用。"""
+    """清空短路状态（含跨进程文件）。给测试与故障恢复用。"""
+    global _breaker_state_loaded
     with _transport_breaker_lock:
         _transport_breaker.clear()
+        _breaker_state_loaded = True
+    if _BREAKER_STATE_FILE:
+        try:
+            os.unlink(_BREAKER_STATE_FILE)
+        except OSError:
+            pass
 
 
 def transport_breaker_snapshot():
@@ -209,6 +366,7 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
         with PTM.phase("http_breaker_skip"):
             raise requests.ConnectionError(
                 f"transport breaker open for {host} ({open_for:.0f}s left)")
+    timeout, retries = scan_budget_limits(timeout, retries)
     try:
         started = time.perf_counter()
         text = _http_get_impl(url, params=params, timeout=timeout,

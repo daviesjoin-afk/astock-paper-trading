@@ -222,6 +222,21 @@ def fund_flow_trajectories(codes, asof_day=None, max_workers=6):
 MICRO_BREAKER_THRESHOLD = 2          # 连续失败多少次后短路
 MICRO_BREAKER_COOLDOWN_SECONDS = 300.0  # 短路持续多久（秒）
 
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# 一轮扫描会对十余只候选并发取微结构。难点不是"慢"，而是**所有候选同时出发**：
+# 源已经挂掉时，12 个线程都在熔断器打开之前就把请求发了出去，于是阈值形同虚设
+# （生产实测 microstructure.ticks/trend 各 12 次调用、各 100 秒以上，整轮被拖到
+# 346 秒）。改为**分批出发**：第一批的失败足以打开源级熔断，后续批次立刻快速失败，
+# 只留一次真实等待。批次越小尾延迟越低，但健康时批次数会变多；默认 6。
+MICRO_BATCH_SIZE = max(1, _env_int("ASTOCK_MICRO_BATCH_SIZE", 6))
+
 _micro_breaker = {}
 _micro_breaker_lock = threading.Lock()
 
@@ -591,23 +606,32 @@ def market_microstructure(code, asof_day=None, ttl_seconds=90):
 
 
 def market_microstructures(codes, asof_day=None, max_workers=12):
-    """Fetch only the small live-review set concurrently.
+    """Fetch only the small live-review set, in breaker-friendly batches.
 
-    并发度 5 → 8 → 12：候选集通常十余到二十只，每只内部是三个串行短请求；
-    这些是纯 IO 等待，提高并发把批次数压到 1~2，不会抢 CPU。
+    候选集通常十余到二十只，每只内部是三个串行短请求（深度/逐笔/分时）。
+    之前一次性把所有候选交给 12 个线程：源不可用时，所有请求都在熔断器打开
+    之前发出，等于每只都完整等一遍超时。现在按 ``MICRO_BATCH_SIZE`` 分批：
+    第一批失败打开源级熔断，后续批次立即快速失败（fail-open、不写分）。
+    健康时每批仍然并发，只有批次数从 1 变成 2~3，这是有意的取舍。
     """
     unique = list(dict.fromkeys(str(code or "").zfill(6) for code in (codes or []) if code))
     output = {}
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique) or 1))) as pool:
-        futures = {pool.submit(PTM.bind_worker(market_microstructure), code, asof_day): code for code in unique}
-        for future in as_completed(futures):
-            code = futures[future]
-            try:
-                output[code] = future.result()
-            except Exception as exc:
-                output[code] = {"status": "source_unavailable", "code": code,
-                                "error": type(exc).__name__, "score_applied": False,
-                                "grade": "public_quote_shadow"}
+    batch_size = max(1, min(int(MICRO_BATCH_SIZE), max(1, int(max_workers))))
+    for start in range(0, len(unique), batch_size):
+        chunk = unique[start:start + batch_size]
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(chunk)))) as pool:
+            futures = {
+                pool.submit(PTM.bind_worker(market_microstructure), code, asof_day): code
+                for code in chunk
+            }
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    output[code] = future.result()
+                except Exception as exc:
+                    output[code] = {"status": "source_unavailable", "code": code,
+                                    "error": type(exc).__name__, "score_applied": False,
+                                    "grade": "public_quote_shadow"}
     return output
 
 
