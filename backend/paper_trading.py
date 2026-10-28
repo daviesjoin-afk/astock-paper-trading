@@ -13952,21 +13952,19 @@ def _run_slot_impl(slot, day, force=False):
                         conn, slot=slot, market_date=day.isoformat(),
                         run_key=intraday_key, detail=_json(prior_detail), now=_now(),
                     )
-                    # 进程被 SIGKILL/OOM 时任务行会被回收，但全局 runtime lease
-                    # 仍留在 paper_runtime_locks 直到 TTL（close/risk 为 40 分钟）。
-                    # 不释放它，15:10/15:12/15:25 的兜底窗口都会以
-                    # "上一轮全市场任务仍在执行" 被跳过。fencing_token 保证只删除
-                    # 被回收的那一代，不会误删新进程的租约。
-                    stale_owner = exists["owner_key"] if "owner_key" in exists.keys() else None
-                    if stale_owner:
-                        _release_runtime_lease(
-                            conn, runtime_lock_key, stale_owner,
-                            exists["fencing_token"] if "fencing_token" in exists.keys() else None,
-                        )
                     exists = PJL.read_job(conn, slot=slot, market_date=day.isoformat(),
                                        run_key=intraday_key)
             retry_count = int(prior_detail.get("retry_count") or 0)
             retryable = exists["status"] in {"failed", "interrupted"}
+            if retryable and "owner_key" in exists.keys() and exists["owner_key"]:
+                # 任务已经进入 failed/interrupted，上一代进程不可能仍在合法执行。
+                # 但它被 SIGKILL 时留下的全局租约还会阻止本次重试（close/risk 的
+                # TTL 是 40 分钟）。按 job 行保存的 owner + fencing 精确释放，
+                # 不影响任何新进程持有的代际。
+                _release_runtime_lease(
+                    conn, runtime_lock_key, exists["owner_key"],
+                    exists["fencing_token"] if "fencing_token" in exists.keys() else None,
+                )
             # 失败任务由同一时段的兜底计划自动重试两次；成功任务仍严格幂等。
             # force 保留给人工诊断，但不会无限自动重跑失败任务。
             if not (retryable and (force or retry_count < max_auto_retries)):
