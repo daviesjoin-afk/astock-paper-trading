@@ -1130,8 +1130,9 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                 candidate = item["candidate_params"]
                 # Fail closed permanently: DeepSeek cannot write an account,
                 # even when a stale/forged config explicitly asks for it.
-                # Apply is available only through the human UI boundary.
-                auto_apply = False
+                # Apply is available only through the human UI boundary. There
+                # is deliberately no variable here: an "auto applied" branch
+                # would be unreachable dead code (S1).
                 # Writer 收敛（R27-B2C-6）：本模块不再自己拼 INSERT。影子候选由
                 # selection owner 的窄接口持久化，status / tier 由 owner 独占决定 ——
                 # 因此"AI 提案直接生效"在这里结构性不可表达（见 owner 侧
@@ -1168,10 +1169,10 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                         "proposals": proposals, "response": response, "conflicts": conflicts,
                         "reason": "候选槽位已被占用，且不是同一条仍处影子状态的提案；"
                                   "本次提案未持久化"}
-            status = "applied" if applied_ids else ("shadow_proposal" if mode == "shadow" else "proposal_only")
-            if auto_apply:
-                reason = f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
-            elif conflicts:
+            # 本模块只写 shadow/proposal；"已应用"状态由人工 UI 边界在
+            # 复核后产生，不能由模型响应直接触发。
+            status = "shadow_proposal" if mode == "shadow" else "proposal_only"
+            if conflicts:
                 reason = (f"通过确定性门禁；仅保存候选 {len(persisted_ids)}/{len(proposals)} 个，"
                           f"{len(conflicts)} 个因候选槽位冲突未持久化")
             else:
