@@ -301,21 +301,21 @@ class SharedCashFacadeTests(CashDatabaseMixin, unittest.TestCase):
     def test_shared_cash_facade_uses_explicit_cycle_owner_at_call_time(self):
         rows = _rows(("a", 12.0, 0.0))
         with mock.patch.object(PSC, "cycle_account_rows", return_value=rows) as get_rows, \
-                mock.patch.object(PT, "_active_cycle") as get_active:
+                mock.patch.object(PT, "load_active_cycle") as get_active:
             self.assertEqual(12.0, PT._shared_cash(self.conn, 7))
         get_rows.assert_called_once_with(self.conn, 7, builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
         get_active.assert_not_called()
 
     def test_shared_cash_facade_resolves_legacy_default_cycle(self):
         rows = _rows(("a", 12.0, 0.0))
-        with mock.patch.object(PT, "_active_cycle", return_value={"id": 8}) as get_active, \
+        with mock.patch.object(PT, "load_active_cycle", return_value={"id": 8}) as get_active, \
                 mock.patch.object(PSC, "cycle_account_rows", return_value=rows) as get_rows:
             self.assertEqual(12.0, PT._shared_cash(self.conn))
         get_active.assert_called_once_with(self.conn)
         get_rows.assert_called_once_with(self.conn, 8, builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
 
     def test_initial_cash_facade_keeps_declared_capital_short_circuit(self):
-        with mock.patch.object(PT, "_active_cycle", return_value={"id": 7, "capital": 100.0}), \
+        with mock.patch.object(PT, "load_active_cycle", return_value={"id": 7, "capital": 100.0}), \
                 mock.patch.object(PT, "_shared_account_rows") as get_rows:
             self.assertEqual(100.0, PT._shared_initial_cash(self.conn))
         get_rows.assert_not_called()

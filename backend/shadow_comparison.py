@@ -140,7 +140,7 @@ def _frozen_mapping(value: Any, label: str) -> Mapping[str, Any] | None:
         return None
     if not isinstance(value, Mapping) or not value:
         raise ValueError(f"{label} must be a non-empty mapping")
-    return MappingProxyType(dict(SR._plain(value)))
+    return MappingProxyType(dict(SR.plain(value)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,10 +332,10 @@ class ActiveOrderEvidence:
             "fees": self.fees,
             "realized_pnl": self.realized_pnl,
             "created_at": self.created_at,
-            "signal_evidence": SR._plain(self.signal_evidence),
-            "admission_evidence": SR._plain(self.admission_evidence),
-            "execution_evidence": SR._plain(self.execution_evidence),
-            "risk_decision_evidence": SR._plain(self.risk_decision_evidence),
+            "signal_evidence": SR.plain(self.signal_evidence),
+            "admission_evidence": SR.plain(self.admission_evidence),
+            "execution_evidence": SR.plain(self.execution_evidence),
+            "risk_decision_evidence": SR.plain(self.risk_decision_evidence),
         }
 
 
@@ -461,7 +461,7 @@ class ComparisonSpec:
         object.__setattr__(self, "session_date", day)
         # Both owners persist the canonical UTC instant; normalizing here with the
         # same rule keeps the declared instant comparable by exact string equality.
-        object.__setattr__(self, "decision_at", SR._instant(self.decision_at))
+        object.__setattr__(self, "decision_at", SR.parse_shadow_instant(self.decision_at))
         object.__setattr__(self, "expected_observations", observations)
 
     def declared(self) -> dict[str, Any]:
@@ -572,24 +572,24 @@ class ShadowComparisonReport:
             "schema_version": self.schema_version,
             "report_id": self.report_id,
             "report_fingerprint": self.report_fingerprint,
-            "comparison_spec": SR._plain(self.comparison_spec),
-            "active_evidence": SR._plain(self.active_evidence),
-            "active_order_lifecycle": SR._plain(self.active_order_lifecycle),
+            "comparison_spec": SR.plain(self.comparison_spec),
+            "active_evidence": SR.plain(self.active_evidence),
+            "active_order_lifecycle": SR.plain(self.active_order_lifecycle),
             "shadow_run_id": self.shadow_run_id,
             "shadow_run_fingerprint": self.shadow_run_fingerprint,
-            "environment_identity": SR._plain(self.environment_identity),
-            "active_strategy_stamp": SR._plain(self.active_strategy_stamp),
-            "challenger_strategy_stamp": SR._plain(self.challenger_strategy_stamp),
+            "environment_identity": SR.plain(self.environment_identity),
+            "active_strategy_stamp": SR.plain(self.active_strategy_stamp),
+            "challenger_strategy_stamp": SR.plain(self.challenger_strategy_stamp),
             "availability": self.availability,
-            "coverage": SR._plain(self.coverage),
-            "observations": SR._plain(self.observations),
-            "signal_delta": SR._plain(self.signal_delta),
-            "decision_delta": SR._plain(self.decision_delta),
-            "turnover": SR._plain(self.turnover),
-            "execution": SR._plain(self.execution),
-            "risk_rejection": SR._plain(self.risk_rejection),
-            "performance": SR._plain(self.performance),
-            "provenance": SR._plain(self.provenance),
+            "coverage": SR.plain(self.coverage),
+            "observations": SR.plain(self.observations),
+            "signal_delta": SR.plain(self.signal_delta),
+            "decision_delta": SR.plain(self.decision_delta),
+            "turnover": SR.plain(self.turnover),
+            "execution": SR.plain(self.execution),
+            "risk_rejection": SR.plain(self.risk_rejection),
+            "performance": SR.plain(self.performance),
+            "provenance": SR.plain(self.provenance),
             "blocking_reasons": list(self.blocking_reasons),
         }
 
@@ -1811,7 +1811,7 @@ def build_shadow_comparison(*, spec: ComparisonSpec,
         "challenger_strategy_stamp": spec.challenger.projection(),
         "availability": availability,
         "coverage": coverage.projection(),
-        "observations": [SR._plain(item) for item in observations],
+        "observations": [SR.plain(item) for item in observations],
         "signal_delta": signal_delta,
         "decision_delta": decision_delta,
         "turnover": turnover,

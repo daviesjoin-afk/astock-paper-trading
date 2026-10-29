@@ -74,7 +74,7 @@ class StreamingFactorTests(unittest.TestCase):
                 mock.patch.object(P, "_selection_factor_manifest_signature", return_value={"size": 1}), \
                 mock.patch.object(P, "SELECTION_FACTORS_PATH", os.path.join(tmp, "f.csv")), \
                 mock.patch.object(P, "SELECTION_META_PATH", os.path.join(tmp, "m.json")):
-            result = P._rebuild_selection_factor_cache()
+            result = P.rebuild_selection_factor_cache()
         self.assertEqual("ok", result["status"])
         self.assertEqual(codes, reads)
 
@@ -84,7 +84,7 @@ class StreamingFactorTests(unittest.TestCase):
                 mock.patch.object(P, "_selection_factor_manifest_signature", side_effect=[{"size": 1}, {"size": 2}]), \
                 mock.patch.object(P, "SELECTION_META_PATH", os.path.join(tmp, "m.json")), \
                 mock.patch.object(STORE, "publish", side_effect=AssertionError("must not publish")):
-            result = P._rebuild_selection_factor_cache()
+            result = P.rebuild_selection_factor_cache()
         self.assertEqual("blocked", result["status"])
 
     def test_duplicate_builder_is_deferred_before_loading_data(self):
@@ -92,7 +92,7 @@ class StreamingFactorTests(unittest.TestCase):
                 mock.patch.object(P, "SELECTION_META_PATH", os.path.join(tmp, "m.json")), \
                 mock.patch.object(P.U, "load_universe", side_effect=AssertionError("duplicate I/O")):
             with STORE.file_lock(P.SELECTION_META_PATH + ".build.lock"):
-                result = P._rebuild_selection_factor_cache()
+                result = P.rebuild_selection_factor_cache()
         self.assertEqual("deferred", result["status"])
 
 
@@ -173,7 +173,7 @@ class FactorPublicationTests(unittest.TestCase):
                 mock.patch.object(M, "_SELECTION_FACTORS_PATH", self.csv), \
                 mock.patch.object(M, "_SELECTION_META_PATH", self.meta), \
                 mock.patch.dict(M._SELECTION_CACHE, {"signature": None, "price_factors": None}), \
-                mock.patch.object(P, "_rebuild_selection_factor_cache", side_effect=AssertionError("request build")), \
+                mock.patch.object(P, "rebuild_selection_factor_cache", side_effect=AssertionError("request build")), \
                 mock.patch.object(M.dfc, "load_shared_kline", side_effect=AssertionError("market I/O")):
             self.assertTrue(M._load_selection_base()[0].empty)
 
@@ -193,7 +193,7 @@ class FactorPublicationTests(unittest.TestCase):
                 mock.patch.object(M, "_SELECTION_FACTORS_PATH", self.csv), \
                 mock.patch.object(M, "_SELECTION_META_PATH", self.meta), \
                 mock.patch.dict(M._SELECTION_CACHE, {"signature": None, "price_factors": None}), \
-                mock.patch.object(P, "_selection_factor_freshness", return_value={"passed": True}), \
+                mock.patch.object(P, "selection_factor_freshness", return_value={"passed": True}), \
                 mock.patch.object(M.U, "load_universe", return_value=[]), \
                 mock.patch.object(M.dfc, "load_shared_kline", side_effect=AssertionError("market I/O")):
             actual, first_boards = M._load_selection_base()

@@ -26,7 +26,7 @@ import paper_selection_runner as runner
 import universe
 day = dt.date(2026, 10, 25)
 with patch.object(universe, "is_trade_day", return_value=False) as calendar, \
-     patch.object(runner.PS, "_today", return_value=day), \
+     patch.object(runner.PS, "today", return_value=day), \
      patch.object(runner.PS, "run_daily", side_effect=AssertionError("closed day ran selection")), \
      patch.object(sys, "argv", ["paper_selection_runner.py", "--slot", "daily"]):
     assert runner.main() == 0

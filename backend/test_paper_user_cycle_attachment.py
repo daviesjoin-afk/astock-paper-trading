@@ -406,7 +406,7 @@ class TransactionAndFacadeTests(unittest.TestCase):
                                         with mock.patch.object(PT, "_num", num):
                                             with mock.patch.object(PT, "_date", date):
                                                 with mock.patch.object(PT, "_now", now):
-                                                    with mock.patch.object(PT, "_audit", audit):
+                                                    with mock.patch.object(PT, "audit", audit):
                                                         with mock.patch.object(PT.SR, "bind_cycle_versions", side_effect=bind):
                                                             with mock.patch.object(PT.PUCA, "reconcile_user_cycle_accounts",
                                                                                    side_effect=attach) as delegate:

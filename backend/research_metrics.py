@@ -126,7 +126,7 @@ def task_breakdown(conn, task_id: str) -> dict:
 def latency_report(conn, *, task_type: str | None = None,
                    limit: int = 500) -> dict:
     """汇总拆分：每段的 p50/p95，以及"最长的那一段是什么"。"""
-    if not AQ._has_table(conn, "agent_tasks"):
+    if not AQ.has_table(conn, "agent_tasks"):
         return {"schema_version": SCHEMA_VERSION, "samples": 0, "stages": {},
                 "bottleneck": None, "tasks": []}
     sql = "SELECT task_id FROM agent_tasks WHERE finished_at IS NOT NULL"

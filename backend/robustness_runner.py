@@ -261,9 +261,9 @@ def _apply_parameter_stress(ast: Mapping[str, Any], parameters: Mapping[str, Any
     return SPS.apply_parameter_stress(ast, parameters)
 
 
-def _scenario_sessions(scenario: Mapping[str, Any], spec: EC.ExperimentSpec,
+def build_scenario_sessions(scenario: Mapping[str, Any], spec: EC.ExperimentSpec,
                        sessions: Sequence[str]) -> list[str]:
-    start, end = _baseline_session_bounds(spec, sessions)
+    start, end = baseline_session_bounds(spec, sessions)
     parameters = scenario["parameters"]
     if scenario["category"] == "start_date":
         start += parameters["shift_sessions"]
@@ -274,7 +274,8 @@ def _scenario_sessions(scenario: Mapping[str, Any], spec: EC.ExperimentSpec,
     return list(sessions[start:end + 1])
 
 
-def _baseline_session_bounds(spec: EC.ExperimentSpec,
+
+def baseline_session_bounds(spec: EC.ExperimentSpec,
                              sessions: Sequence[str]) -> tuple[int, int]:
     """Anchor a declared date interval to its first/last owner sessions."""
     if not sessions or list(sessions) != sorted(set(sessions)):
@@ -284,6 +285,7 @@ def _baseline_session_bounds(spec: EC.ExperimentSpec,
     if start >= len(sessions) or end < 0 or start > end:
         raise ValueError("date_perturbation_baseline_sessions_unavailable")
     return start, end
+
 
 
 def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec,
@@ -314,7 +316,7 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec,
         market_archive_repository, archive_fingerprint=spec.market_data_fingerprint,
         benchmark_symbol=validation_context["benchmark_symbol"],
         start=sessions[0], end=sessions[-1])
-    ranged_members = R29._universe_rows(
+    ranged_members = R29.universe_rows(
         universe_archive_repository, spec.universe_fingerprint, sessions)
     if candidate_path:
         try:
@@ -524,7 +526,7 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec,
             or tuple(coverage_calendar.sessions) != issued_calendar.sessions):
         raise RobustnessBaselineError("extended_calendar_not_owner_issued")
     sessions = list(coverage_calendar.sessions)
-    members = R29._universe_rows(universe_archive_repository, spec.universe_fingerprint, sessions)
+    members = R29.universe_rows(universe_archive_repository, spec.universe_fingerprint, sessions)
     if candidate_path:
         # Candidate scope FIRST, then every perturbation (incl. universe stress).
         members = CE.filter_candidate_members(candidate_replay, members, spec.universe_fingerprint)
@@ -574,8 +576,8 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec,
             case_evidence["candidate_replay_fingerprint"] = canonical_replay.replay_fingerprint
         result = None
         try:
-            scenario_sessions = _scenario_sessions(scenario, spec, sessions)
-            baseline_start, baseline_end = _baseline_session_bounds(spec, sessions)
+            scenario_sessions = build_scenario_sessions(scenario, spec, sessions)
+            baseline_start, baseline_end = baseline_session_bounds(spec, sessions)
             declared_baseline_sessions = sessions[baseline_start:baseline_end + 1]
             expands_baseline = (scenario_sessions[0] < declared_baseline_sessions[0]
                                 or scenario_sessions[-1] > declared_baseline_sessions[-1])
@@ -770,3 +772,8 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec,
                 "plan_fingerprint": plan.fingerprint, "runner_version": runner_version}),
             "report_version": runner_version, **report_core,
             "created_at": created_at}
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_baseline_session_bounds = baseline_session_bounds
+_scenario_sessions = build_scenario_sessions

@@ -21,7 +21,7 @@ def _execute_one(request):
             print(json.dumps({"status": "deferred", "admission": admission}, ensure_ascii=False), flush=True)
             return 75
         adaptive.run_learning_cycle(trigger=trigger)
-        with adaptive._connect() as conn:
+        with adaptive.adaptive_connection() as conn:
             row = conn.execute(
                 "SELECT status,detail FROM adaptive_runs WHERE trigger=? ORDER BY id DESC LIMIT 1",
                 (trigger,),

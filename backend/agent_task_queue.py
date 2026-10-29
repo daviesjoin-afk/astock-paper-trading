@@ -354,11 +354,12 @@ def connect_readonly(path: str | None = None):
         conn.close()
 
 
-def _has_table(conn, name: str) -> bool:
+def has_table(conn, name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(name),)
     ).fetchone()
     return row is not None
+
 
 
 def _open_writer(conn):
@@ -391,7 +392,7 @@ def _record_event(conn, task_id, from_status, to_status, attempt, reason, now_is
 
 
 def get(conn, task_id: str):
-    if not _has_table(conn, "agent_tasks"):
+    if not has_table(conn, "agent_tasks"):
         return None
     row = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (str(task_id),)).fetchone()
     return _row_to_task(row) if row is not None else None
@@ -860,7 +861,7 @@ def _percentile(values, fraction: float):
 
 def stage_report(conn, *, attempt_scope: str = "all", limit: int = 1000) -> dict:
     """按阶段给出 p50/p95，并指出真正最长的那一段等待（W0 的验收要求）。"""
-    if not _has_table(conn, "agent_task_stage_timing"):
+    if not has_table(conn, "agent_task_stage_timing"):
         return {"stages": {}, "longest_waiting_stage": None}
     sql = "SELECT stage, duration_ms FROM agent_task_stage_timing"
     params: list = []
@@ -891,7 +892,7 @@ def stage_report(conn, *, attempt_scope: str = "all", limit: int = 1000) -> dict
 
 def queue_report(conn) -> dict:
     """队列现状：活跃任务按状态/阻塞原因分组，终态按结果统计。"""
-    if not _has_table(conn, "agent_tasks"):
+    if not has_table(conn, "agent_tasks"):
         return {"active_total": 0, "active_by_status": {}, "blocking_reasons": {},
                 "terminal_by_status": {}}
     active_by_status: dict[str, int] = {}
@@ -925,7 +926,7 @@ def queue_report(conn) -> dict:
 
 
 def list_tasks(conn, *, status=None, task_type=None, strategy_id=None, limit: int = 50) -> list[dict]:
-    if not _has_table(conn, "agent_tasks"):
+    if not has_table(conn, "agent_tasks"):
         return []
     sql = "SELECT * FROM agent_tasks WHERE 1=1"
     params: list = []
@@ -947,7 +948,7 @@ def list_tasks(conn, *, status=None, task_type=None, strategy_id=None, limit: in
 
 
 def events(conn, task_id: str) -> list[dict]:
-    if not _has_table(conn, "agent_task_events"):
+    if not has_table(conn, "agent_task_events"):
         return []
     return [dict(row) for row in conn.execute(
         "SELECT * FROM agent_task_events WHERE task_id = ? ORDER BY id", (str(task_id),)
@@ -975,3 +976,7 @@ class StageTimer:
         if name not in STAGES:
             raise UnknownStage(f"未知阶段: {name!r}")
         self.totals[name] = self.totals.get(name, 0.0) + float(duration_ms)
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_has_table = has_table

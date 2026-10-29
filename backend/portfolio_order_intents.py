@@ -33,7 +33,7 @@ class PendingIntentEvidenceUnavailable(RuntimeError):
 
 
 def _instant(value, *, reason):
-    parsed = MDC._parse_instant(value)
+    parsed = MDC.parse_instant(value)
     if parsed is None:
         raise PendingIntentEvidenceUnavailable(reason)
     return parsed.astimezone(dt.timezone.utc)
@@ -128,7 +128,7 @@ def pending_resource_intents(conn, *, cycle_id, asof_day, decision_at):
         row = dict(raw) if hasattr(raw, "keys") else dict(zip(
             [value.strip() for value in columns.split(",")], raw, strict=True))
         code = str(row.get("code") or "")
-        created = MDC._parse_instant(row.get("created_at"))
+        created = MDC.parse_instant(row.get("created_at"))
         if created is None:
             unknown.append(_unknown(row, "pending_order_created_at_unavailable"))
             continue

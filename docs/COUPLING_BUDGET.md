@@ -32,18 +32,18 @@
 | 指标 | PR272 基线 | 本次收口后 | 允许增量 | 长期目标 |
 |---|---:|---:|---:|---:|
 | import 环 | 5 | **0** | 不允许任何新环 | 0 |
-| 延迟 import | 583 | 619 | 36 | 逐步降低；仅移除无必要的延迟依赖 |
+| 延迟 import | 583 | **618** | 35 | 逐步降低；仅移除无必要的延迟依赖 |
 | 裸 SQL 模块 | 135 | 141 | 6 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
-| 跨模块私有属性访问 | 201 | 201 | 0 | 0 |
+| 跨模块私有属性访问 | 201 | **6** | 0 | 0 |
 | 跨域 import 边 | 624 | 619 | 9 | 分阶段降低 |
-| 最大文件 | 16367 行 | 15047 行 | 0 | ≤2500 |
+| 最大文件 | 16367 行 | **14713** 行 | 0 | ≤2500 |
 | 最大函数 | 1191 行 | 1195 行 | 4 | <200 |
 | 单函数最大全局引用 | 56 | 61 | 2 | <80 |
-| 重复顶层 helper 名 | 307 | 313 | 6 | <30 |
+| 重复顶层 helper 名 | 307 | **301** | -6 | <30 |
 | `_num`/`_number`/`_finite` 重复定义 | 54 | 54 | 0 | 按语义逐模块收敛，不按名称批量替换 |
 | 无归属前缀模块占比 | 41.39% | 39.56% | 0 | <30% |
-| 顶层 import 副作用 | 25 | 24 | 0 | <5 |
+| 顶层 import 副作用 | 25 | **25** | 0 | <5 |
 
 允许增量来自本次审核修复必须新增的生产模块与调用点（`selection_application`、`paper_runtime_facts`、`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 已降至 15,622 行，最大函数仍是 `_buy_order`，未做高风险重写。
 
@@ -267,3 +267,137 @@
   相关浏览器回归 17 项既有旅程通过，更新后的动作契约 **6/6** 通过（合计 23 项）。
   桌面与移动端 390 / 768 / 1024 / 1440px 布局检查通过；测试使用临时离线账本。
   首轮新增契约中两项未先填入有效 DSL，修正测试输入后复验通过；未放宽断言或浏览器错误检查。
+
+## 2026-10-30 P1：账本连接公开面（私有跨模块访问 201 → 174）
+
+`paper_trading._db` / `_db_readonly` / `_evolution_conn` 与 `adaptive_engine._connect`
+一直是外部拿数据库连接的唯一途径。10 个模块为了**一条连接**去 import 交易主引擎，
+其中 `api_paper` / `api_settings` / `main` / `push_report` / 四个 `strategy_*_service`
+根本不需要交易规则。连接与事务重试属于存储边界，不属于交易规则，方向是反的。
+
+### 改动
+
+- `paper_storage` 增加公开面：`paper_db(immediate, hot_path, db_path)`、
+  `paper_db_readonly(db_path)`、`evolution_connection(db_path)`、
+  `paper_db_path()` / `adaptive_db_path()`，以及 `SLOT_HOT_PATH`。
+  连接参数（1s/120s 超时、800ms/60000ms busy_timeout、WAL、`foreign_keys`、
+  `query_only`）逐字保留，没有改任何 PRAGMA 或重试策略。
+- `paper_trading`：`DB_PATH = PST.paper_db_path()`（路径单一来源）；
+  `_SLOT_HOT_PATH = PST.SLOT_HOT_PATH`（**同一个 ContextVar 对象**，所以
+  `run_slot` 的 set/reset 与 `test_paper_hotpath_boundaries` 的断言都照旧）；
+  三个私有包装改为薄委托。
+- 14 个模块改调公开面，共 **27 个访问点**。
+- `PST.bind_ledger_path(lambda: DB_PATH)` 是组装期的晚绑定（与
+  `bind_default_runner` / `bind_config_connection` 同一 idiom）：
+  本仓 88 处测试用 `P.DB_PATH = <tmp>` 把账本指向临时库，公开连接面
+  必须跟随这个取值，否则测试会写到真实账本。代价是 `import_side_effects`
+  24 → 25（仍在上限 25 内，未登记放宽）。
+- `adaptive_engine.adaptive_connection` 是 `_connect` 的公开别名（同一对象）——
+  `research_runtime_config.bind_config_connection` 的 identity 断言不受影响。
+
+### 度量（实测）
+
+| 指标 | 改动前 | 改动后 |
+|---|---:|---:|
+| `private_cross_access` | 201 | **174** |
+| `deferred_imports` | 619 | **618** |
+| `paper_trading.py` 行数 | 15,047 | **15,046** |
+| `import_cycles` / `foundation_violations` | 0 / 0 | 0 / 0 |
+
+### 测试 seam 的两处移动（断言未改）
+
+- `test_settings_async_isolation`：`patch.object(SETTINGS.P, "_db")` →
+  `patch.object(SETTINGS.PST, "paper_db")`。
+- `test_api_ai_capabilities`：`P._db = _temp_db` → `API.PST.paper_db = _temp_db`。
+
+这两处本来就是"把临时库注入到连接入口"，入口换名后 seam 跟着换，断言逐字未动。
+不换的话测试会写到真实账本——这正是私有名穿透的实际风险。
+
+### 本轮**没有**做
+
+`init_db`（409 行，schema 迁移 + 恢复 + 登记 + 对账）仍在 `paper_trading`，
+消费者改完连接后仍 import 它。把 `init_db` 归位是下一批（需要旧库升级顺序与
+回滚证据），因此本次只声明"连接由存储边界提供"，不声称"这些模块已与交易引擎解耦"。
+
+## 2026-10-30 声明批次：两个共用 helper 提为公开名（私有访问 174 → 142）
+
+上一批（P1）把连接能力搬到了 `paper_storage`。这一批处理另一类**已经存在但没被
+声明**的公共能力：多个模块已经在用，只是名字还是私有的。
+
+| 能力 | owner | 消费者 | 访问点 | 公开名 |
+|---|---|---|---:|---|
+| 影子域值归一化 | `shadow_runtime` | `shadow_comparison`、`shadow_run_repository` | **27** | `plain` |
+| 时点解析 | `market_data_contract` | `market_data_service`、`paper_capital_reservations`、`portfolio_order_intents` | 5 | `parse_instant` |
+
+两处都是**纯改名**：函数体一行未改，逻辑完全不动。owner 侧保留 `_old = new`
+别名（既有测试按私有名引用同一实现，共 17 / 0 处），跨模块**访问点**改走公开名。
+
+度量：`private_cross_access` 174 → **142**（累计 201 → 142，−29%）；
+`duplicate_helpers` 313 → 312（`_plain` 此前是一个重复名）。
+
+### 撤回：`ai_research_contract._issue_evidence_ref` 保持私有
+
+审计报告把它列为"应当公开"（P4：6 个 adapter 都在伸手）。**实际改完被测试推翻**：
+
+`test_ai_research_evidence_ownership_guard` 等 **5 条架构守卫**（EVIDENCE-03 /
+NEWS_25 / INC_29 / INC_30 / FINAL_G08）用"私有签发口 + `(模块, enclosing function)`
+精确 allowlist"来保证契约外零签发。这个签发口的**私有性本身就是强制机制**——
+`ResearchEvidenceRef` 没有公开裸构造器，唯一签发口私有，谁在签发是可枚举的。
+
+把名字改成公开的，等于把"谁能签发证据"从**强制**降级为**约定**。所以这条建议
+作废：保持私有，不为降低计数而削弱不变量。这是本批唯一一条被推翻的审计结论。
+
+### 回归
+
+全量后端 **7,345 项全绿（exit=0，跳过 25）**。上一批的 P1 与本批合计改动
+27 个文件；`test_architecture_boundary_audit` 的额度按实测收紧到 142 / 312。
+
+## 2026-10-30 第三批：公开名收口（私有访问 142 → 6）
+
+76 个 owner 侧私有 helper 改为公开名，跨模块调用点全部改走公开名；owner 末尾保留
+一行 `<private> = <public>` 别名。全量后端 **7,345 项绿（exit=0）**。
+
+**剩余 6 处是刻意保留**：全部是 `ai_research_contract._issue_evidence_ref`。它的私有性
+就是强制机制——`ResearchEvidenceRef` 没有公开裸构造器，唯一签发口私有，因此 5 条架构
+守卫能用 `(模块, enclosing function)` 精确 allowlist 保证契约外零签发。**本指标的可达
+下界是 6，不是 0。**
+
+### 三条必须记住的教训（本批第一版全量回归是 1136 errors）
+
+1. **改名 + 别名只修好"引用"，修不好"patch 的绑定"。** 测试用
+   `patch.object(PT, "_audit")` 注入；若 owner 内部仍调 `_audit(...)`（别名），而消费者
+   调 `audit(...)`（公开名），注入只作用于别名，消费者路径绕过 mock，测试看似通过却测的是
+   真实函数。**owner 内部也必须改用公开名。**
+2. **公开名会撞局部变量。** `_rows` → `rows` 让 `rows = _rows(conn, ...)` 变成
+   `rows = rows(conn, ...)`。9 个目标撞名，最终改用 `query_rows` / `parse_shadow_instant` /
+   `current_selection` / `account_conditions` / `rule_constraints` / `load_account_params` /
+   `build_scenario_sessions` / `resolve_strategy_stamp` / `load_active_cycle`。
+   **下划线原本就在充当防撞机制**，公开化前必须做 AST 级撞名扫描。
+3. **批量正则只替换"裸调用 `name(`"**，不能替换裸引用——否则会改到形参
+   （`def f(asof_day, rows)`）和默认值（`_num(x, rows)`）。
+
+### 代价与残余
+
+- `paper_trading.py` 15,046 → **15,069**（+23 = 别名行）。这是唯一变差的指标，
+  换来的是 136 处跨模块私有访问归零。
+- **指标降到 6 不等于公共层做完。** 它只证明"没有模块在偷用别人的内部实现"。
+  下一层是"公共能力是否真的收敛到少数 owner"——这要靠重复实现清单与语义矩阵
+  （见 `plans/全仓职责拆分与公共层收口审计-20261030.md` §5、§11.3）。
+
+## 2026-10-30 第四批：init_db 归位（409 → 28 行）
+
+`init_db` 409 行里 307 行与交易规则无关：231 行建表 DDL + 55 行列升级/历史行修补 +
+21 个逐特性 `ensure_*`。全部下沉到 `paper_schema_migrations`
+（`CORE_TABLES_DDL` / `ensure_core_tables` / `ensure_current` / `ensure_feature_tables`），
+SQL 与顺序逐字保留，三个业务常量由调用方传入（schema owner 不反向依赖引擎）。
+
+`paper_trading.py` 15,069 → **14,713**；`init_db` → **28 行** + `_upgrade_ledger` 23 行。
+
+**顺手修掉的真实缺陷**：快速路径与完整路径原来各维护一份升级链，且已经漂移
+（快速路径有 `ensure_rebalance_state_cycle_ownership`，完整路径没有）。这正是
+"升级后的库缺新表、第一次写入 `no such table`"反复出现的根因。现在两条路径共用
+`_upgrade_ledger`，不可能再漂移。全量 **7,345 项绿（exit=0）**。
+
+**依赖没有消失**：消费者仍调 `PT.init_db()`，因为它还剩业务引导（账户/周期/启动恢复/
+对账）。要摘掉这条依赖，得先把 `_ensure_accounts`/`_ensure_cycle` 归位到
+`paper_user_account_provisioning`/`paper_cycle_service`——那是下一批。

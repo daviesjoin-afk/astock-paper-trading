@@ -92,10 +92,11 @@ def _load(value, fallback=None):
         return fallback
 
 
-def _has_table(conn, name: str) -> bool:
+def has_table(conn, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(name),)
     ).fetchone() is not None
+
 
 
 def ensure_schema(conn) -> None:
@@ -130,7 +131,7 @@ def record_run(conn, *, experiment_id: str, target_identity: str, environment_ha
 
 
 def get_run(conn, experiment_id: str):
-    if not _has_table(conn, "experiment_runs"):
+    if not has_table(conn, "experiment_runs"):
         return None
     row = conn.execute("SELECT * FROM experiment_runs WHERE experiment_id=?",
                        (str(experiment_id),)).fetchone()
@@ -238,7 +239,7 @@ def publish_pair(conn, *, champion, challenger, champion_step: dict, challenger_
 
 
 def _session_rows(conn, experiment_id: str) -> dict[str, dict[str, dict]]:
-    if not _has_table(conn, "paired_replay_receipts"):
+    if not has_table(conn, "paired_replay_receipts"):
         return {}
     grouped: dict[str, dict[str, dict]] = {}
     for row in conn.execute(
@@ -292,7 +293,7 @@ def incomplete_sessions(conn, experiment_id: str) -> dict[str, list[str]]:
 
 
 def receipts(conn, experiment_id: str) -> list[dict]:
-    if not _has_table(conn, "paired_replay_receipts"):
+    if not has_table(conn, "paired_replay_receipts"):
         return []
     rows = conn.execute(
         "SELECT * FROM paired_replay_receipts WHERE experiment_id=?"
@@ -308,7 +309,7 @@ def receipts(conn, experiment_id: str) -> list[dict]:
 
 def latest_state(conn, experiment_id: str, side: str):
     """某一侧最后发布的后继状态。没有就是 None（= 从期初资本开始）。"""
-    if not _has_table(conn, "paired_replay_receipts"):
+    if not has_table(conn, "paired_replay_receipts"):
         return None
     row = conn.execute(
         "SELECT next_state, transition_sequence, session_date FROM paired_replay_receipts"
@@ -319,3 +320,7 @@ def latest_state(conn, experiment_id: str, side: str):
     return {"state": _load(row["next_state"], {}),
             "transition_sequence": int(row["transition_sequence"]),
             "session_date": str(row["session_date"])}
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_has_table = has_table

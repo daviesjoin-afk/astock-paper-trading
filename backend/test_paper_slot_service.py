@@ -285,7 +285,7 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIsInstance(keywords.get("db_factory"), ast.Name)
         self.assertEqual("_db", keywords["db_factory"].id)
         self.assertIsInstance(keywords.get("audit"), ast.Name)
-        self.assertEqual("_audit", keywords["audit"].id)
+        self.assertEqual("audit", keywords["audit"].id)
         resolver = keywords.get("resolve_asof_day")
         self.assertIsInstance(resolver, ast.Lambda)
         self.assertEqual([], resolver.args.args)

@@ -72,7 +72,7 @@ class _TrackingDbCase(unittest.TestCase):
         patches = [
             mock.patch.object(ST, "DB_PATH", self.db_path),
             mock.patch.object(ST, "refresh_benchmark", return_value=True),
-            mock.patch.object(ST, "_benchmark_price_on_or_before", return_value=4000.0),
+            mock.patch.object(ST, "benchmark_price_on_or_before", return_value=4000.0),
         ]
         for patcher in patches:
             patcher.start()

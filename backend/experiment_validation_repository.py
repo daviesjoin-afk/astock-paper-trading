@@ -226,7 +226,7 @@ class ExperimentValidationRepository:
             normalized_subject = _candidate_subject(subject).projection()
             if any(value is not None for value in (strategy_id, strategy_version, strategy_checksum)):
                 raise ExperimentValidationPersistenceError("candidate_must_not_masquerade_as_strategy_version")
-            experiment_plan_fingerprint = EC._stable_fingerprint(experiment_plan_fingerprint, name="experiment_plan_fingerprint")
+            experiment_plan_fingerprint = EC.stable_fingerprint(experiment_plan_fingerprint, name="experiment_plan_fingerprint")
             record_version = RECORD_V2
             parent = normalized_subject["parent_strategy"]
             payload.update(record_contract_version=record_version, subject=normalized_subject,

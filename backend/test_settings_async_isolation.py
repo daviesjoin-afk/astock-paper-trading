@@ -75,8 +75,8 @@ class SettingsOffLoopTests(unittest.TestCase):
         patchers = [
             mock.patch.object(SETTINGS, "_get_adaptive", return_value=self.adaptive),
             mock.patch.object(SETTINGS.P, "init_db", side_effect=fake_init_db),
-            mock.patch.object(SETTINGS.P, "_db", side_effect=fake_db),
-            mock.patch.object(SETTINGS.P, "_audit",
+            mock.patch.object(SETTINGS.PST, "paper_db", side_effect=fake_db),
+            mock.patch.object(SETTINGS.P, "audit",
                               side_effect=lambda *a, **k: self.audits.append(a)),
             mock.patch.object(SETTINGS.RSET, "update", side_effect=fake_update),
             mock.patch.object(SETTINGS, "_snapshot", return_value={"ok": True}),

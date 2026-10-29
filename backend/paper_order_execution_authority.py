@@ -10,7 +10,7 @@ ORDER_CYCLE_LEGACY_UNKNOWN = "legacy_unknown"
 ORDER_CYCLE_ORDER_MISSING = "order_missing"
 ORDER_CYCLE_PRE_V18_SCHEMA = "pre_v18_schema"
 
-def _active_cycle_id_readonly(conn):
+def active_cycle_id_readonly(conn):
     """**只读**读取当前 active cycle id；不存在则返回 ``None``，绝不创建周期。
 
     与 :func:`_active_cycle` 的关键区别：后者在没有任何周期时会调用
@@ -36,7 +36,8 @@ def _active_cycle_id_readonly(conn):
         return None
 
 
-def _account_cycle_id_readonly(conn, account_id):
+
+def account_cycle_id_readonly(conn, account_id):
     """**只读**读取账户当前绑定的经济周期；账户缺失或为 NULL 时返回 ``None``。"""
     if account_id is None:
         return None
@@ -53,6 +54,7 @@ def _account_cycle_id_readonly(conn, account_id):
         return int(value)
     except (TypeError, ValueError):
         return None
+
 
 
 class OrderCycleProvenanceUnknown(RuntimeError):
@@ -149,7 +151,7 @@ class OrderCycleProvenance:
         )
 
 
-def _order_cycle_provenance_for_order(conn, order_id) -> OrderCycleProvenance:
+def order_cycle_provenance_for_order(conn, order_id) -> OrderCycleProvenance:
     """**已存在订单**的 durable 周期归属：四态，绝不回退到当前 active cycle。
 
     这是成交阶段的唯一权威读法。``order_id`` 缺失、行缺失、schema 无列、列为
@@ -160,7 +162,7 @@ def _order_cycle_provenance_for_order(conn, order_id) -> OrderCycleProvenance:
     每一行都会被报成 ``order_missing``，于是「schema 太旧」这个**环境事实**被
     伪装成「订单不存在」这个**调用错误**，运维会去查订单号而不会去跑迁移。
     """
-    has_column = _orders_have_cycle_column(conn)
+    has_column = orders_have_cycle_column(conn)
     if order_id is None:
         return OrderCycleProvenance(False, has_column, None, ORDER_CYCLE_ORDER_MISSING)
     if not has_column:
@@ -193,17 +195,19 @@ def _order_cycle_provenance_for_order(conn, order_id) -> OrderCycleProvenance:
     return OrderCycleProvenance(True, True, cycle, ORDER_CYCLE_PROVEN)
 
 
-def _order_cycle_id_for_order(conn, order_id):
+
+def order_cycle_id_for_order(conn, order_id):
     """**只读**入口：仅当归属可证明时返回 ``int``，否则 ``None``。
 
     保留旧签名供 ``_record_lot`` 使用；成交路径必须用
-    :func:`_order_cycle_provenance_for_order` 拿到四态并据此 fail closed。
+    :func:`order_cycle_provenance_for_order` 拿到四态并据此 fail closed。
     """
-    provenance = _order_cycle_provenance_for_order(conn, order_id)
+    provenance = order_cycle_provenance_for_order(conn, order_id)
     return provenance.cycle_id if provenance.is_proven else None
 
 
-def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
+
+def assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
     """**已存在订单**的成交授权闸门：返回可证明的 ``order_cycle_id``，否则抛异常。
 
     这是 execution-cycle invariant 的**唯一**实现（§8：不要把判断抄成三四份）。
@@ -222,7 +226,7 @@ def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance
 
     ``provenance`` 允许调用方把已经读到的归属结论传进来（§12 要求先读归属、再校验
     身份、最后校验周期一致性）。传入时不再重复查询；结论本身仍只由
-    :func:`_order_cycle_provenance_for_order` 产生，所以「同一个事实的两套读法」不会
+    :func:`order_cycle_provenance_for_order` 产生，所以「同一个事实的两套读法」不会
     出现。
 
     **纯只读**（§9）：只做 SELECT / PRAGMA。刻意不使用 :func:`_active_cycle` —— 后者
@@ -231,7 +235,7 @@ def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance
     fail closed。
     """
     if provenance is None:
-        provenance = _order_cycle_provenance_for_order(conn, order_id)
+        provenance = order_cycle_provenance_for_order(conn, order_id)
     if not provenance.is_proven:
         raise OrderCycleProvenanceUnknown(
             order_id, provenance.status,
@@ -239,8 +243,8 @@ def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance
         )
     order_cycle_id = provenance.cycle_id
 
-    account_cycle_id = _account_cycle_id_readonly(conn, account_id)
-    active_cycle_id = _active_cycle_id_readonly(conn)
+    account_cycle_id = account_cycle_id_readonly(conn, account_id)
+    active_cycle_id = active_cycle_id_readonly(conn)
     # 暂停/归档/退出当前周期的账户仍可清掉旧 lot；仅 SELL 且订单周期 == active cycle 时放行。
     archived_out_of_cycle = account_cycle_id is None and active_cycle_id == order_cycle_id and (conn.execute("SELECT status FROM paper_accounts WHERE id=?", (account_id,)).fetchone() or [None])[0] in ("paused", "archived")
     if (account_cycle_id != order_cycle_id and not (allow_out_of_cycle_account and archived_out_of_cycle)) or active_cycle_id != order_cycle_id:
@@ -251,7 +255,8 @@ def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance
     return order_cycle_id
 
 
-def _orders_have_cycle_column(conn):
+
+def orders_have_cycle_column(conn):
     """``paper_orders`` 是否有 ``cycle_id``（v18 之后恒为真；旧库可能尚未迁移）。
 
     用 ``PRAGMA`` 发现而不是写死：写死会在 pre-v18 库上报 ``no such column``，
@@ -271,3 +276,13 @@ def _orders_have_cycle_column(conn):
     except sqlite3.Error:  # pragma: no cover - 表不存在
         return False
     return "cycle_id" in columns
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_order_cycle_provenance_for_order = order_cycle_provenance_for_order
+_account_cycle_id_readonly = account_cycle_id_readonly
+_active_cycle_id_readonly = active_cycle_id_readonly
+_assert_order_execution_cycle = assert_order_execution_cycle
+_order_cycle_id_for_order = order_cycle_id_for_order
+_orders_have_cycle_column = orders_have_cycle_column
+_order_cycle_id_for_order = order_cycle_id_for_order

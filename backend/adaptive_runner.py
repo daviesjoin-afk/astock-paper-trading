@@ -33,7 +33,7 @@ def _scheduled_close_due(trigger):
     except Exception:
         pass
     try:
-        with adaptive._connect() as conn:
+        with adaptive.adaptive_connection() as conn:
             row = conn.execute(
                 "SELECT finished_at FROM adaptive_runs WHERE status='completed' ORDER BY id DESC LIMIT 1"
             ).fetchone()

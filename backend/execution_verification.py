@@ -405,7 +405,7 @@ def verification_for_order(order: Any, fill_rows: Any = None) -> dict:
     )
 
 
-def _row_as_dict(cursor: Any, row: Any) -> dict:
+def row_as_dict(cursor: Any, row: Any) -> dict:
     """把一行转成 dict，**对行形状自适应**。
 
     三种行对象都会出现，且都合法：
@@ -424,6 +424,7 @@ def _row_as_dict(cursor: Any, row: Any) -> dict:
     return dict(zip(columns, row, strict=True))
 
 
+
 def _dict_rows(cursor: Any) -> list:
     """把游标结果转成 dict 行，**不依赖** ``row_factory``。
 
@@ -433,7 +434,7 @@ def _dict_rows(cursor: Any) -> list:
     —— 恰恰是 v12 回填必须跑通的地方。列名取自 ``cursor.description``，因此对
     ``SELECT *`` 与本模块自己的显式列清单都成立。
     """
-    return [_row_as_dict(cursor, row) for row in cursor.fetchall()]
+    return [row_as_dict(cursor, row) for row in cursor.fetchall()]
 
 
 def _load_fills_with_identity(conn, order_id: Any) -> list:
@@ -649,7 +650,7 @@ def stamp_order(conn, order_id: Any) -> dict:
     if row is None:
         return verification_from_evidence(None)
     verdict = verification_for_order(
-        _row_as_dict(cursor, row), _load_fills_with_identity(conn, order_id)
+        row_as_dict(cursor, row), _load_fills_with_identity(conn, order_id)
     )
     conn.execute(
         "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
@@ -1342,3 +1343,7 @@ def _self_check() -> None:
 
 if __name__ == "__main__":
     _self_check()
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_row_as_dict = row_as_dict

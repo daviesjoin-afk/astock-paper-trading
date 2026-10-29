@@ -297,6 +297,11 @@ def _connect():
         conn.close()
 
 
+# 公开别名：runner/worker 与 HTTP 层不该摸 ``_connect`` 这个私有名。
+# 内部调用与 ``research_runtime_config`` 的绑定仍用 ``_connect``（同一对象）。
+adaptive_connection = _connect
+
+
 # 组合根注册：研究运行时只从这里拿配置连接，反向依赖为零（AE → RRC 单向）。
 # 保留返回值：注册结果是"当前绑定的 owner 工厂"，便于运维与测试断言，
 # 不注册就读不到槽位配置（读函数抛 ConfigurationConnectionUnbound，不换库）。
@@ -4461,7 +4466,7 @@ def run_dual_ai_tuning_fn(trigger="manual", mode="intraday"):
         paper_db_path=PAPER_DB_PATH,
         snapshot_paths=SNAPSHOT_PATHS,
         evidence_collector=deepseek_advisor.collect_evidence,
-        tuning_accounts_fn=deepseek_advisor._tuning_accounts,
+        tuning_accounts_fn=deepseek_advisor.tuning_accounts,
         config=cfg,
         profile=profile,
         trigger=trigger,

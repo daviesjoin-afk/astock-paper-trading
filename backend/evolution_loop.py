@@ -242,7 +242,7 @@ class ProductionBackend(Backend):
                 }
 
         # 校验当前生效参数仍在合法边界内（防退化 / 越界）。
-        clamped = SE._clamp_params(cur["params"])
+        clamped = SE.clamp_params(cur["params"])
         degenerate = any(
             abs(_num(clamped.get(k)) - _num(cur["params"].get(k))) > 1e-9
             for k in clamped
@@ -273,7 +273,7 @@ class ProductionBackend(Backend):
 
         cand_id = ctx.get("candidate_params_id")
         if cand_id is not None:
-            row = EA._params_row(conn, int(cand_id))
+            row = EA.params_row(conn, int(cand_id))
             if row is None:
                 raise EA.CandidateNotFound(f"Candidate {cand_id} not found at apply stage")
             return {

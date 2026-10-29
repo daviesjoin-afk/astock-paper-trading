@@ -154,3 +154,12 @@ value:15e7b122583dcff235bb6bcef3dc9cddeccdd594808bee95a186da0291686a63
 value:34d28b8d5295cd9050667ea82a3d9df4b84273b169b43b334e4119b9118078c0
 value:7a57b191bea1be55f0c3f16f62dc63e73ee5dd9e870f22674ab7f8aa166c84a9
 value:1c159c32c9c79c5751e8b8d4b3449c313cd45e61a9ae24ba803208f8bd64e4c6
+
+# plans/modularity-simplification-audit-20261027.md 把四个公开 GitHub commit SHA
+# 作为自己的审计基线写进正文。它们不是凭据：GitHub 上可公开访问；只是 CI 的
+# 浅克隆里没有这些对象，扫描器的 object-id 识别因此失效，按裸长 hex 报出。
+# 与上面 697f565e… / 23ef095d… / 11bb1447… 属同一类（公开 commit 引用）。
+value:b1158bc14608bd5e529b7d372927f4d4c2d3e3bd
+value:dc93441314398a16945fa31fc4f4c52bf286b1e5
+value:e7fc3601983577dd98bccf057919073977625598
+value:f5bff025eee6f7d6ab5bbd0ceb09f400f748af5d

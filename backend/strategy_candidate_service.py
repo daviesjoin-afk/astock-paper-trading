@@ -27,6 +27,7 @@ import secrets
 import sqlite3
 from collections.abc import Mapping
 
+import paper_storage as PST
 import strategy_candidate as SC
 import strategy_candidate_repository as SCRepo
 import strategy_candidate_search_space as SS
@@ -86,11 +87,11 @@ def generation_batch_identity(*, search_space: SS.CandidateSearchSpace,
         "search_space_material": search_space_material,
         "parent_pin": dict(search_space.parent_pin.identity),
         "asof": search_space.asof,
-        "research_provenance": SS._thaw(search_space.research_provenance or {}),
+        "research_provenance": SS.thaw(search_space.research_provenance or {}),
         "hypothesis_id": search_space.hypothesis_id,
-        "universe_spec": SS._thaw(search_space.universe_spec),
+        "universe_spec": SS.thaw(search_space.universe_spec),
         "intended_market_regime": search_space.intended_market_regime,
-        "constraints": SS._thaw(search_space.constraints),
+        "constraints": SS.thaw(search_space.constraints),
         "candidate_count": int(candidate_count),
     }
     input_fingerprint = hashlib.sha256(_canonical(material).encode("utf-8")).hexdigest()
@@ -146,7 +147,7 @@ def pin_parent_strategy(conn: sqlite3.Connection, *, strategy_id: str,
     if isinstance(strategy_version, bool) or not isinstance(strategy_version, int) \
             or strategy_version < 1:
         raise StrategyCandidateUnavailable("explicit_parent_strategy_version_required")
-    if not isinstance(strategy_checksum, str) or not SC._SHA256.fullmatch(strategy_checksum):
+    if not isinstance(strategy_checksum, str) or not SC.SHA256.fullmatch(strategy_checksum):
         raise StrategyCandidateUnavailable("explicit_parent_strategy_checksum_required")
     try:
         record = SR.get_version(str(strategy_id).strip(), int(strategy_version),
@@ -271,9 +272,9 @@ def generate_and_record_candidates(
     # 绝不再从 candidate 反推：candidate 是内容身份，不携带 provenance。
     provenance = {
         "hypothesis_id": search_space.hypothesis_id,
-        "research_provenance": SS._thaw(search_space.research_provenance or {}),
+        "research_provenance": SS.thaw(search_space.research_provenance or {}),
         "random_seed": search_space.random_seed,
-        "model_identity": SS._thaw(search_space.model_identity or {}),
+        "model_identity": SS.thaw(search_space.model_identity or {}),
     }
     recorded = []
     for candidate in candidates:
@@ -420,7 +421,7 @@ def _with_paper_connection(work, *, immediate: bool = False):
     """
     import paper_trading as PT
     PT.init_db()
-    with PT._db(immediate=immediate) as conn:
+    with PST.paper_db(immediate=immediate) as conn:
         return work(conn)
 
 
@@ -433,7 +434,7 @@ def paper_connection(*, immediate: bool = False):
     """
     import paper_trading as PT
     PT.init_db()
-    return PT._db(immediate=immediate)
+    return PST.paper_db(immediate=immediate)
 
 
 def capture_strategy_candidates(strategy_id: str, **kwargs) -> dict:

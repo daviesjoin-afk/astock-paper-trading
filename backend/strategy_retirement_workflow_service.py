@@ -6,6 +6,7 @@ import datetime as dt
 import json
 
 import paper_trading as PT
+import paper_storage as PST
 import strategy_health as SH
 import strategy_health_repository as SHR
 import strategy_lifecycle as SL
@@ -22,7 +23,7 @@ def _now() -> str:
 
 def _with_connection(work, *, immediate: bool = False):
     PT.init_db()
-    with PT._db(immediate=immediate) as conn:
+    with PST.paper_db(immediate=immediate) as conn:
         return work(conn)
 
 

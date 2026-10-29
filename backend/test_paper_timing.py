@@ -71,7 +71,7 @@ class TimingTests(unittest.TestCase):
         with mock.patch.object(paper.dfc, "fetch_realtime_for_codes", return_value=[quote]), \
                 mock.patch.object(paper.dfc, "enrich_live_flow_details", return_value={}), \
                 mock.patch.object(paper.dfc, "fetch_independent_realtime_for_codes", return_value=[quote]), \
-                mock.patch.object(paper.dfc, "_fetch_sina_realtime_for_codes",
+                mock.patch.object(paper.dfc, "fetch_sina_realtime_for_codes",
                                   side_effect=RuntimeError("private-marker")), \
                 mock.patch.object(paper, "_latest_price_map", return_value={}), \
                 mock.patch.object(paper, "_universe_snapshot_time", return_value=None), \

@@ -401,13 +401,15 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
 
     @classmethod
     def _real_ddl(cls, table):
-        with open(os.path.join(BACKEND_DIR, "paper_trading.py"), encoding="utf-8") as handle:
+        # 建表 DDL 的 owner 是 paper_schema_migrations（2026-10-30 从 init_db 下沉）。
+        with open(os.path.join(BACKEND_DIR, "paper_schema_migrations.py"),
+                  encoding="utf-8") as handle:
             source = handle.read()
         match = re.search(
             r"CREATE TABLE IF NOT EXISTS %s\s*\((.*?)\n\s*\);" % table, source, re.S
         )
         if match is None:
-            raise AssertionError("paper_trading.py no longer declares %s" % table)
+            raise AssertionError("paper_schema_migrations.py no longer declares %s" % table)
         body = re.sub(r"(PRIMARY|UNIQUE)\s*\([^)]*\)", "", match.group(1), flags=re.I)
         columns = set()
         for part in body.split(","):

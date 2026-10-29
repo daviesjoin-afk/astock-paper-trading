@@ -223,7 +223,7 @@ def is_live_cycle_pinned(conn: sqlite3.Connection, strategy_id: str, version: in
         LIMIT 1""", (str(strategy_id), int(version), str(checksum))).fetchone() is not None
 
 
-def _resume_policy(conn: sqlite3.Connection, strategy_id: str, version: int,
+def resume_policy(conn: sqlite3.Connection, strategy_id: str, version: int,
                    checksum: str) -> tuple[str, str | None]:
     row = conn.execute("""SELECT event_fingerprint,transition_kind,evidence_json
         FROM strategy_lifecycle_events WHERE strategy_id=? AND strategy_version=?
@@ -244,6 +244,7 @@ def _resume_policy(conn: sqlite3.Connection, strategy_id: str, version: int,
     if row[1] == "legacy_import":
         return "paper", str(row[0])
     raise LifecycleError("paused_resume_source_unavailable")
+
 
 
 def _insert_initial(conn, strategy_id, version, checksum, state, *, transition_kind,
@@ -374,7 +375,7 @@ def transition(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: 
             if expected_state in RESUME_TRANSITION_TARGETS else None)
     resume_event_fingerprint = None
     if transition_kind == "resume":
-        resume_target, resume_event_fingerprint = _resume_policy(
+        resume_target, resume_event_fingerprint = resume_policy(
             conn, strategy_id, strategy_version, strategy_checksum)
         if target_state != resume_target:
             raise LifecycleError("paused_resume_target_mismatch")
@@ -440,3 +441,7 @@ def transition(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: 
             conn.rollback()
         raise
     return get_state(conn, strategy_id, strategy_version, checksum=strategy_checksum)
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_resume_policy = resume_policy

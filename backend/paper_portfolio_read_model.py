@@ -273,7 +273,7 @@ class PortfolioReadUnavailable(RuntimeError):
 
 
 @_snapshot_evidence
-def _cycle_is_archived(conn, context: PortfolioReadContext) -> bool:
+def cycle_is_archived(conn, context: PortfolioReadContext) -> bool:
     """Return whether the requested cycle's live ledger has been archived."""
     if _has_columns(conn, "paper_archives", {"cycle_id"}):
         try:
@@ -292,6 +292,9 @@ def _cycle_is_archived(conn, context: PortfolioReadContext) -> bool:
         return bool(row is not None and str(row[0] or "") == "archived")
     return False
 
+
+
+cycle_is_archived = cycle_is_archived  # 兼容别名：模块内与既有测试仍用私有名
 
 @dataclass(frozen=True)
 class PortfolioReadContext:
@@ -316,7 +319,7 @@ class PortfolioReadContext:
 
 
 @_snapshot_evidence
-def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
+def sell_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Return (proven rows, all rows, proof_available).
 
     Every fill attached to a bounded SELL order is selected, **not** just the
@@ -366,6 +369,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
         if _identity_ok(row) and EV.is_positive_execution_row(row):
             proven.append(row)
     return proven, rows, True
+
 
 
 @_snapshot_evidence
@@ -427,7 +431,7 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
 def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Return (verified rows, all rows, proof_available).
 
-    As with :func:`_sell_fills`, every fill attached to a bounded BUY order is
+    As with :func:`sell_fills`, every fill attached to a bounded BUY order is
     selected so a side-contradicting fill reaches the completeness checks
     instead of being filtered out by ``f.side``.
     """
@@ -501,7 +505,7 @@ def _has_any_fill_rows(conn, context: PortfolioReadContext,
 @_snapshot_evidence
 def _unproven_sell_exists(conn, context: PortfolioReadContext,
                           account_id: str | None = None) -> bool:
-    _proven, rows, proof_available = _sell_fills(conn, context, account_id)
+    _proven, rows, proof_available = sell_fills(conn, context, account_id)
     if not proof_available:
         # No verification columns at all: any historical sell row is unproven.
         required_columns = {"cycle_id", "side", "status", "executed_at"}
@@ -749,7 +753,7 @@ def bounded_lots(conn, context: PortfolioReadContext, *, account_id: str | None 
 def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
                              account_id: str | None = None) -> tuple[list[dict], str]:
     """Return ``(lots, quantity_status)`` for an explicit context."""
-    if _cycle_is_archived(conn, context):
+    if cycle_is_archived(conn, context):
         return [], STATUS_UNKNOWN
     if not _has_columns(conn, "paper_position_lots", _POSITION_LOT_COLUMNS):
         return [], STATUS_UNKNOWN
@@ -800,7 +804,7 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         suffix = original[10:] if len(original) >= 10 else " 00:00:00"
         lot["acquired_at"] = economic + (suffix or " 00:00:00")
         bounded.append(lot)
-    sells, _rows, proof_available = _sell_fills(conn, context, account_id)
+    sells, _rows, proof_available = sell_fills(conn, context, account_id)
     unproven = _unproven_sell_exists(conn, context, account_id)
     rebuilt, fully_consumed = _consume_fifo(bounded, sells)
     # Uncertainty is only resolved by a **fully closed** account/code position.
@@ -839,7 +843,7 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
     layer falls back to durable lot settlement cost.
     """
     buys, all_buys, proof = _buy_fills(conn, context, account_id)
-    sells, all_sells, sell_proof = _sell_fills(conn, context, account_id)
+    sells, all_sells, sell_proof = sell_fills(conn, context, account_id)
     if not proof or not sell_proof:
         return {}
     flows: dict[tuple[str, str], dict] = {}
@@ -919,11 +923,11 @@ def positions_for_context(conn, context: PortfolioReadContext, *,
 def realized_pnl(conn, context: PortfolioReadContext, *,
                  account_id: str | None = None) -> tuple[float | None, str]:
     """Sum verified committed SELL realized PnL up to ``context.asof_day``."""
-    if _cycle_is_archived(conn, context):
+    if cycle_is_archived(conn, context):
         return None, STATUS_UNKNOWN
     if _unproven_sell_exists(conn, context, account_id):
         return None, STATUS_UNKNOWN
-    verified, _rows, proof_available = _sell_fills(conn, context, account_id)
+    verified, _rows, proof_available = sell_fills(conn, context, account_id)
     if not proof_available:
         return None, STATUS_UNKNOWN
     total = 0.0
@@ -1066,7 +1070,7 @@ def account_attached_by_asof(conn, *, cycle_id: int, asof_day, account_id) -> bo
 
 
 @_snapshot_evidence
-def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
+def cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Resolve cycle/account initial capital without reading current cash."""
     if account_id:
         if not _has_columns(conn, "paper_accounts", {"id", "initial_cash", "cycle_id"}):
@@ -1101,6 +1105,7 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
     return _ledger_num(row[1])
 
 
+
 def _confirmed_zero_orders(conn, orders):
     candidates = {int(row["id"]) for row in orders if EV.is_confirmed_zero_row(row)}
     if not candidates or not _has_columns(conn, "paper_fills", {"order_id"}):
@@ -1116,10 +1121,10 @@ def _confirmed_zero_orders(conn, orders):
 
 
 def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None = None):
-    if _cycle_is_archived(conn, context):
+    if cycle_is_archived(conn, context):
         return None, STATUS_UNKNOWN
     buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
-    sells, _sell_rows, sell_proof = _sell_fills(conn, context, account_id)
+    sells, _sell_rows, sell_proof = sell_fills(conn, context, account_id)
     buy_orders, buy_orders_proof = _all_filled_buy_orders(conn, context, account_id)
     if buy_orders_proof:
         zero_orders = _confirmed_zero_orders(conn, buy_orders)
@@ -1176,9 +1181,9 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
 def cash(conn, context: PortfolioReadContext, *,
          account_id: str | None = None) -> tuple[float | None, str]:
     """Reconstruct bounded cash from the cycle declaration and verified fills."""
-    if _cycle_is_archived(conn, context):
+    if cycle_is_archived(conn, context):
         return None, STATUS_UNKNOWN
-    initial = _cycle_initial(conn, context, account_id)
+    initial = cycle_initial(conn, context, account_id)
     if initial is None:
         return None, STATUS_UNKNOWN
     net, status = _cash_flow_total(conn, context, account_id)
@@ -1190,7 +1195,7 @@ def cash(conn, context: PortfolioReadContext, *,
 
 def initial_capital(conn, context: PortfolioReadContext):
     """Return the durable cycle/account initial capital without current cash."""
-    return _cycle_initial(conn, context)
+    return cycle_initial(conn, context)
 
 
 def _uncovered_lot_facts(conn, lots: list[dict]):
@@ -1227,9 +1232,9 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
     bounded to the requested cycle/as-of and accounts for recorded fills or
     held lot cost, without reading current account cash.
     """
-    if _cycle_is_archived(conn, context):
+    if cycle_is_archived(conn, context):
         return None
-    initial = _cycle_initial(conn, context, account_id)
+    initial = cycle_initial(conn, context, account_id)
     if initial is None:
         return None
     all_lots, _quantity_status = bounded_lots_with_status(
@@ -1239,7 +1244,7 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
         row for row in all_lots if int(row.get("remaining_qty") or 0) > 0
     ]
     buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
-    sells, sell_rows, sell_proof = _sell_fills(conn, context, account_id)
+    sells, sell_rows, sell_proof = sell_fills(conn, context, account_id)
     rows = list(buy_rows or ()) + list(sell_rows or ())
     if rows and (buy_proof or sell_proof):
         total = initial
@@ -1379,7 +1384,7 @@ def portfolio_for_context(
         },
         "positions": positions,
         "quantity_status": quantity_status,
-        "archived": _cycle_is_archived(conn, context),
+        "archived": cycle_is_archived(conn, context),
         "realized_pnl": realized,
         "realized_pnl_status": realized_status,
         "cash": cash_value,
@@ -1735,7 +1740,7 @@ def accounting_fact_projections(
     升级成自己的 verified 事实。
 
     归属证明优先复用既有 bounded owner logic：先要求
-    :func:`_cycle_initial`（内部即 ``paper_accounts`` 的 cycle 绑定 +
+    :func:`cycle_initial`（内部即 ``paper_accounts`` 的 cycle 绑定 +
     :func:`_account_attached_by`）能证明该 account 属于该 cycle 且在 ``asof_day`` 前已
     挂载。**证明不了**时三条事实全部 ``unknown`` 且 ``value=None`` —— 绝不退化成
     "这个账户没有卖出，所以已实现盈亏 = verified 0"（PFACT-06）。
@@ -1758,7 +1763,7 @@ def accounting_fact_projections(
             "（不接受 active account fallback）"
         )
 
-    if _cycle_initial(conn, context, account_id=account) is None:
+    if cycle_initial(conn, context, account_id=account) is None:
         # 归属/挂载不可证明 —— 绝不能发布 verified zero，也不能发布别的数字。
         return tuple(
             _portfolio_fact(context, account, kind, None)
@@ -1781,3 +1786,9 @@ def accounting_fact_projections(
             context, account, PORTFOLIO_FACT_POSITION_COST_SUMMARY, summary,
         ),
     )
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_cycle_is_archived = cycle_is_archived
+_cycle_initial = cycle_initial
+_sell_fills = sell_fills

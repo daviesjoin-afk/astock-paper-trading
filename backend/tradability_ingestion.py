@@ -264,7 +264,7 @@ class ListingStatusProvider(TradabilityFactProvider):
             # 既推不出 is_listed，也没有可写的历史字段。诚实返回 unknown，而不是
             # 生成一条全 None 的 evidence、虚报 evidence_present 与覆盖率。
             return _result(self, OUTCOME_UNKNOWN, observed_kind=self._observed_kind)
-        is_listed = TA._resolve_listed(  # noqa: SLF001 - 复用 archive 的唯一推导口径
+        is_listed = TA.resolve_listed(  # noqa: SLF001 - 复用 archive 的唯一推导口径
             str(session), listing_date, delisting_date, None
         )
         return _result(
@@ -524,7 +524,7 @@ class PriceLimitProvider(TradabilityFactProvider):
         if not isinstance(record, Mapping):
             return _result(self, OUTCOME_UNKNOWN)
         locked = PIT.as_strict_bool(record.get("locked"))
-        direction = TA._direction(record.get("direction"))  # noqa: SLF001 - 复用白名单
+        direction = TA.direction(record.get("direction"))  # noqa: SLF001 - 复用白名单
         if locked is None:
             return _result(self, OUTCOME_UNKNOWN)
         return _result(

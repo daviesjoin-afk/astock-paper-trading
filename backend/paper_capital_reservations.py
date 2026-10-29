@@ -117,7 +117,7 @@ def pending_reservation_evidence(conn, *, asof_day, decision_at):
     except (TypeError, ValueError) as exc:
         raise CapitalReservationEvidenceUnavailable(
             "explicit_reservation_asof_required") from exc
-    decision = MDC._parse_instant(decision_at)
+    decision = MDC.parse_instant(decision_at)
     if decision is None:
         raise CapitalReservationEvidenceUnavailable(
             "explicit_reservation_decision_at_required")
@@ -140,7 +140,7 @@ def pending_reservation_evidence(conn, *, asof_day, decision_at):
         row = dict(raw) if hasattr(raw, "keys") else dict(zip(
             ("id", "cycle_id", "order_key", "account_id", "code", "side",
              "amount", "fees", "status", "created_at"), raw, strict=True))
-        created = MDC._parse_instant(row.get("created_at"))
+        created = MDC.parse_instant(row.get("created_at"))
         try:
             cycle = int(row.get("cycle_id"))
             amount = float(row.get("amount"))

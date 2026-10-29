@@ -179,11 +179,11 @@ def ensure_order_cycle_provenance(conn):
     changes = {}
     for table in ("paper_orders", "paper_orders_archive"):
         changes[table] = ensure_columns(conn, table, definitions)
-    _ensure_order_cycle_provenance_guards(conn)
+    ensure_order_cycle_provenance_guards(conn)
     return changes
 
 
-def _ensure_order_cycle_provenance_guards(conn):
+def ensure_order_cycle_provenance_guards(conn):
     """Reject new orders without a durable cycle, and freeze it once written.
 
     Historical NULL rows are intentionally left untouched: a trigger never
@@ -213,6 +213,7 @@ def _ensure_order_cycle_provenance_guards(conn):
                 WHEN NEW.cycle_id IS NOT OLD.cycle_id
                 BEGIN SELECT RAISE(ABORT, 'order cycle provenance is immutable'); END"""
         )
+
 
 
 # ─── 调仓状态表的周期归属（v19） ─────────────────────────────────────────────
@@ -2102,3 +2103,341 @@ def ensure_ai_decision_audits(conn):
         conn.execute(statement)
     changes["ai_decision_audits"] = True
     return changes
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_ensure_order_cycle_provenance_guards = ensure_order_cycle_provenance_guards
+
+# ---------------------------------------------------------------------------
+# 核心建表 DDL（从 `paper_trading.init_db` 下沉：schema 属于存储边界）
+#
+# 只做 `CREATE TABLE/INDEX IF NOT EXISTS`，幂等、不改数据。逐字保留原 SQL，
+# 换行与缩进也不动，避免任何 DDL 文本漂移。
+# ---------------------------------------------------------------------------
+CORE_TABLES_DDL = r'''
+            CREATE TABLE IF NOT EXISTS paper_accounts (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, source_strategy TEXT NOT NULL,
+                status TEXT NOT NULL, initial_cash REAL NOT NULL, cash REAL NOT NULL,
+                cycle_days INTEGER NOT NULL, max_positions INTEGER NOT NULL,
+                max_weight REAL NOT NULL, max_exposure REAL NOT NULL, version TEXT NOT NULL,
+                benchmark_start REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS paper_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+                signal_date TEXT NOT NULL, intended_date TEXT NOT NULL, code TEXT NOT NULL,
+                name TEXT, industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT,
+                t_score REAL, payload TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+                created_at TEXT NOT NULL, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT,
+                cycle_id INTEGER,
+                UNIQUE(account_id, signal_date, code)
+            );
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+                signal_id INTEGER, side TEXT NOT NULL, code TEXT NOT NULL, name TEXT,
+                qty INTEGER NOT NULL, planned_price REAL, filled_price REAL,
+                amount REAL, fees REAL, status TEXT NOT NULL, reason TEXT,
+                risk_payload TEXT NOT NULL, realized_pnl REAL, created_at TEXT NOT NULL, executed_at TEXT,
+                order_type TEXT NOT NULL DEFAULT 'market',
+                origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
+                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
+                retry_of_order_id INTEGER,
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
+                cycle_id INTEGER,
+                allocation_intent_kind TEXT, portfolio_snapshot_id TEXT,
+                allocation_plan_id TEXT, allocation_plan_fingerprint TEXT,
+                allocation_policy_version TEXT
+            );
+            -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
+            CREATE TABLE IF NOT EXISTS paper_orders_archive (
+                id INTEGER, account_id TEXT, signal_id INTEGER, side TEXT, code TEXT, name TEXT,
+                qty INTEGER, planned_price REAL, filled_price REAL, amount REAL, fees REAL,
+                status TEXT, reason TEXT, risk_payload TEXT, realized_pnl REAL,
+                created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
+                expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER,
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
+                cycle_id INTEGER,
+                allocation_intent_kind TEXT, portfolio_snapshot_id TEXT,
+                allocation_plan_id TEXT, allocation_plan_fingerprint TEXT,
+                allocation_policy_version TEXT
+            );
+            CREATE TABLE IF NOT EXISTS paper_signals_archive (
+                id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
+                industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT, t_score REAL,
+                payload TEXT, status TEXT, reason TEXT, created_at TEXT,
+                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
+                cycle_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                account_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT, industry TEXT,
+                qty INTEGER NOT NULL, cost REAL NOT NULL, entry_date TEXT NOT NULL,
+                available_date TEXT NOT NULL, asset_type TEXT NOT NULL DEFAULT 'stock_t1', peak_price REAL, take_stage INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(account_id, code)
+            );
+            CREATE TABLE IF NOT EXISTS paper_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL, side TEXT NOT NULL, code TEXT NOT NULL,
+                qty INTEGER NOT NULL, price REAL NOT NULL, amount REAL NOT NULL, fees REAL NOT NULL,
+                fill_date TEXT NOT NULL, quote_at TEXT, assumption TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS paper_risk_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+                code TEXT, side TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT,
+                payload TEXT NOT NULL, created_at TEXT NOT NULL, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_recent
+                ON paper_risk_decisions(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_filter
+                ON paper_risk_decisions(account_id, created_at DESC, code, decision);
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_recent
+                ON paper_orders(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_account_status
+                ON paper_orders(account_id, status, created_at DESC);
+            CREATE TABLE IF NOT EXISTS paper_capital_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                order_key TEXT NOT NULL UNIQUE,
+                account_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                side TEXT NOT NULL,
+                amount REAL NOT NULL,
+                fees REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'reserved',
+                created_at TEXT NOT NULL,
+                released_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_capital_reservations_cycle_status
+                ON paper_capital_reservations(cycle_id, status);
+            CREATE TABLE IF NOT EXISTS paper_ignition_shadow (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                code TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                price REAL,
+                pct REAL,
+                runup REAL,
+                old_rule_passed INTEGER NOT NULL DEFAULT 0,
+                old_rule_reason TEXT,
+                ignition_passed INTEGER NOT NULL DEFAULT 0,
+                ignition_reasons TEXT,
+                price_30m REAL,
+                at_30m TEXT,
+                price_60m REAL,
+                at_60m TEXT,
+                resolved INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_ignition_shadow_unique
+                ON paper_ignition_shadow(day, bucket, code);
+            CREATE INDEX IF NOT EXISTS idx_paper_ignition_shadow_recent
+                ON paper_ignition_shadow(day, resolved);
+            CREATE TABLE IF NOT EXISTS paper_position_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                review_date TEXT NOT NULL,
+                score REAL NOT NULL,
+                grade TEXT NOT NULL,
+                action TEXT NOT NULL,
+                market_value REAL NOT NULL DEFAULT 0,
+                position_pct REAL NOT NULL DEFAULT 0,
+                replacement_code TEXT,
+                replacement_score REAL,
+                reasons TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(cycle_id, account_id, code, review_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_position_reviews_recent
+                ON paper_position_reviews(cycle_id, review_date, score);
+            CREATE TABLE IF NOT EXISTS paper_nav (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+                nav_date TEXT NOT NULL, cash REAL NOT NULL, market_value REAL NOT NULL,
+                nav REAL NOT NULL, benchmark REAL, created_at TEXT NOT NULL,
+                quote_status TEXT NOT NULL DEFAULT 'verified',
+                UNIQUE(account_id, nav_date)
+            );
+            CREATE TABLE IF NOT EXISTS paper_jobs (
+                slot TEXT NOT NULL, market_date TEXT NOT NULL, status TEXT NOT NULL,
+                detail TEXT, started_at TEXT NOT NULL, finished_at TEXT,
+                 owner_key TEXT, heartbeat_at TEXT, expires_at TEXT,
+                 fencing_token INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(slot, market_date)
+            );
+            CREATE TABLE IF NOT EXISTS paper_reviews (
+                week_key TEXT NOT NULL, account_id TEXT NOT NULL, report TEXT NOT NULL,
+                recommendation TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(week_key, account_id)
+            );
+            CREATE TABLE IF NOT EXISTS paper_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, event TEXT NOT NULL,
+                detail TEXT, created_at TEXT NOT NULL, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT
+            );
+            CREATE TABLE IF NOT EXISTS paper_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL, capital REAL NOT NULL, risk_profile TEXT NOT NULL,
+                started_at TEXT, ended_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS paper_position_lots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT, industry TEXT,
+                qty INTEGER NOT NULL, remaining_qty INTEGER NOT NULL, cost REAL NOT NULL,
+                acquired_at TEXT NOT NULL, available_date TEXT NOT NULL,
+                asset_type TEXT NOT NULL DEFAULT 'stock_t1', source_order_id INTEGER,
+                cost_fee_included INTEGER NOT NULL DEFAULT 0,
+                is_t_base INTEGER NOT NULL DEFAULT 1, source_fill_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_lots_active
+                ON paper_position_lots(cycle_id, account_id, code, available_date);
+            CREATE TABLE IF NOT EXISTS paper_intraday_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL, code TEXT, observed_at TEXT NOT NULL,
+                price REAL, action TEXT NOT NULL, reason TEXT, payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_intraday_obs
+                ON paper_intraday_observations(cycle_id, account_id, observed_at);
+            CREATE TABLE IF NOT EXISTS paper_parameter_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL, version TEXT NOT NULL, style TEXT NOT NULL,
+                params TEXT NOT NULL, reason TEXT NOT NULL, effective_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS paper_archives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER, cycle_key TEXT,
+                reason TEXT NOT NULL, snapshot TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS paper_job_runs (
+                run_key TEXT PRIMARY KEY, slot TEXT NOT NULL, market_date TEXT NOT NULL,
+                status TEXT NOT NULL, detail TEXT, started_at TEXT NOT NULL, finished_at TEXT,
+                 owner_key TEXT, heartbeat_at TEXT, expires_at TEXT,
+                 fencing_token INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS paper_runtime_locks (
+                lock_key TEXT PRIMARY KEY,
+                owner_key TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                heartbeat_at TEXT,
+                expires_at TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS paper_position_limit_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                allocation_key TEXT NOT NULL,
+                pool_limit INTEGER NOT NULL,
+                limits TEXT NOT NULL,
+                weights TEXT NOT NULL,
+                inputs TEXT NOT NULL,
+                source TEXT NOT NULL,
+                effective_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(cycle_id, allocation_key)
+
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_position_limit_versions_cycle
+                ON paper_position_limit_versions(cycle_id, effective_at DESC);
+
+'''
+
+
+def ensure_core_tables(conn):
+    """创建核心账本表（幂等）。只建表，不做迁移与业务对账。"""
+    conn.executescript(CORE_TABLES_DDL)
+
+def ensure_current(
+    conn,
+    *,
+    now,
+    entry_retry_order_statuses,
+    entry_frozen_waitlist_status,
+):
+    """核心建表 + 列升级 + 历史行修补（幂等）。
+
+    从 ``paper_trading.init_db`` 下沉：只依赖本模块自己的 schema 函数与调用方传入的
+    三个业务常量，不含交易规则。三条 UPDATE 修补的是旧库遗留的行状态。
+    """
+    now_fn = now
+    retry_statuses = tuple(entry_retry_order_statuses)
+    frozen_status = entry_frozen_waitlist_status
+    ensure_core_tables(conn)
+    ensure_paper_columns(conn)
+    ensure_execution_verification_columns(conn)
+    conn.execute(
+        """UPDATE paper_position_lots
+           SET cost=cost+COALESCE((SELECT fees / NULLIF(qty,0) FROM paper_orders o WHERE o.id=paper_position_lots.source_order_id),0),
+               cost_fee_included=1
+           WHERE cost_fee_included=0 AND source_order_id IS NOT NULL"""
+    )
+    # A crashed worker must not leave a phantom reservation blocking the
+    # shared pool forever.  Filled orders consume their reservation;
+    # cancelled/expired/rejected orders release it.  Pending limit and
+    # entry-frozen waitlist orders are intentionally kept reserved for the
+    # next trigger/retry pass.
+    conn.execute(
+        """UPDATE paper_capital_reservations
+           SET status='consumed',released_at=COALESCE(released_at,?)
+           WHERE status='reserved' AND EXISTS(
+               SELECT 1 FROM paper_orders o
+               WHERE CAST(o.id AS TEXT)=paper_capital_reservations.order_key
+                 AND o.status='filled'
+           )""",
+        (now_fn(),),
+    )
+    retry_order_placeholders = ",".join("?" for _ in retry_statuses)
+    conn.execute(
+        f"""UPDATE paper_capital_reservations
+           SET status='released',released_at=COALESCE(released_at,?)
+           WHERE status='reserved' AND NOT EXISTS(
+               SELECT 1 FROM paper_orders o
+               WHERE CAST(o.id AS TEXT)=paper_capital_reservations.order_key
+                 AND o.status IN ({retry_order_placeholders})
+           )""",
+        (now_fn(), *retry_statuses),
+    )
+    # Backfill waitlist markers produced before the recheck lifecycle was
+    # unified.  They are historical audit evidence, but must not remain
+    # visible as live pending orders once a newer decision for the same
+    # account/code has been written.
+    conn.execute(
+        """UPDATE paper_orders AS marker
+           SET status='superseded',
+               reason=COALESCE(marker.reason,'') || '；已由后续实时复核委托替代'
+           WHERE marker.status=? AND marker.side='buy'
+             AND EXISTS(
+                 SELECT 1 FROM paper_orders AS newer
+                 WHERE newer.account_id=marker.account_id
+                   AND newer.code=marker.code AND newer.side='buy'
+                   AND newer.id>marker.id
+             )""",
+        (frozen_status,),
+    )
+
+
+def ensure_feature_tables(conn):
+    """逐特性建表/加列（幂等）。顺序与原先 ``init_db`` 中的调用顺序一致。"""
+    ensure_strategy_reference_columns(conn)
+    ensure_execution_verification_columns(conn)
+    ensure_order_cycle_provenance(conn)
+    ensure_signal_cycle_provenance(conn)
+    ensure_rebalance_state_cycle_ownership(conn)
+    ensure_position_risk_state(conn)
+    ensure_risk_scan_run_state(conn)
+    ensure_shadow_runs_table(conn)
+    ensure_shadow_comparison_reports(conn)
+    ensure_risk_decision_order_linkage(conn)
+    ensure_strategy_health_snapshots(conn)
+    ensure_strategy_retirement_decisions(conn)
+    ensure_strategy_retirement_workflow(conn)
+    ensure_portfolio_runtime_snapshots(conn)
+    ensure_portfolio_allocation_plans(conn)
+    ensure_strategy_candidates(conn)
+    ensure_experiment_search(conn)
+    ensure_candidate_selection(conn)
+    ensure_paper_metrics_indexes(conn)
+    ensure_portfolio_order_read_index(conn)
+    ensure_ai_decision_audits(conn)

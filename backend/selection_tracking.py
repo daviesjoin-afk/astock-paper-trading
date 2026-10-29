@@ -368,7 +368,7 @@ def _latest_signal_date(picks):
     return min(dates) if dates else None
 
 
-def _benchmark_price_on_or_before(day):
+def benchmark_price_on_or_before(day):
     frame = dfc.load_shared_kline(BENCHMARK_CODE)
     if frame is None or frame.empty:
         return None
@@ -377,6 +377,7 @@ def _benchmark_price_on_or_before(day):
         return None
     value = rows.iloc[-1].get("close")
     return _number(value)
+
 
 
 def refresh_benchmark():
@@ -427,7 +428,7 @@ def record_run(result, run_date=None, source="scheduled", *, asof_day=None):
     day = run_date or _today().isoformat()
     picks = list(result.get("picks") or [])
     data_asof = _latest_signal_date(picks)
-    bench_entry = _benchmark_price_on_or_before(dt.date.fromisoformat(day))
+    bench_entry = benchmark_price_on_or_before(dt.date.fromisoformat(day))
     generated_at = dt.datetime.now(CHINA_TZ).isoformat(timespec="seconds")
     safe_result = _json_safe(result)
     provenance = _run_provenance(result, strategy, asof_day=asof_day,
@@ -649,7 +650,7 @@ def update_observations():
             "date": today,
         }
     refresh_benchmark()
-    benchmark = _benchmark_price_on_or_before(dt.date.fromisoformat(today))
+    benchmark = benchmark_price_on_or_before(dt.date.fromisoformat(today))
     inserted = 0
     with closing(_connect()) as conn, conn:
         active = conn.execute(
@@ -922,3 +923,7 @@ def dashboard(strategy="", limit=30):
         "duplicate_picks": duplicate_picks[:300],
         "note": "Returns start at the saved signal close and only verified post-close quotes are recorded. Rules are never auto-mutated from a small sample.",
     }
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_benchmark_price_on_or_before = benchmark_price_on_or_before

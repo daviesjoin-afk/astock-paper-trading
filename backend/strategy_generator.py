@@ -200,11 +200,11 @@ def generate_candidates(
             parent_identity=pin.identity,
             asof=search_space.asof,
             entry_spec=entry_ast,
-            universe_spec=SS._thaw(search_space.universe_spec),
+            universe_spec=SS.thaw(search_space.universe_spec),
             intended_market_regime=search_space.intended_market_regime,
             factor_spec=chosen["factor"],
             exit_spec=chosen["exit"],
-            constraints=SS._thaw(search_space.constraints),
+            constraints=SS.thaw(search_space.constraints),
         )
         # 去重的唯一权威是 canonical candidate identity；同一个候选被重复提出时
         # 只保留一个身份，绝不制造"语义相同但 ID 不同"的两个策略。

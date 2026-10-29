@@ -419,7 +419,7 @@ def _capture(conn, *, cycle_id: int, asof_day: str, decision_at: str,
                                         "nav": None,
                                         "nav_status": PPRM.STATUS_UNKNOWN}
                           for account in owners}
-    capital_facts = PR._thaw(capital.facts)
+    capital_facts = PR.thaw(capital.facts)
     capital_facts["portfolio_valuation_by_account"] = nav_by_account
     capital_facts["nav"] = portfolio_nav
     capital_facts["nav_uses_portfolio_read_model_composer"] = True

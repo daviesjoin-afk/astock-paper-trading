@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 import paper_trading as P
+import paper_storage as PST
 import dashboard_queries as DQ
 import portfolio_allocation_policy as PAP
 import portfolio_allocation_repository as PAPRepo
@@ -34,7 +35,7 @@ portfolio_workspace_router = APIRouter(prefix="/api/portfolio",
 
 
 def _allocation_service_config():
-    return P._portfolio_allocation_service_config()
+    return P.portfolio_allocation_service_config()
 
 
 class AllocationIntentRequest(BaseModel):
@@ -78,7 +79,7 @@ def capture_portfolio_runtime_snapshot(payload: PortfolioRuntimeCaptureRequest):
         market_reading = MDSvc.read_snapshot(
             MDC.LIVE_MARKET_POLICY, now=decision_at,
             asof_day=payload.asof_day)
-        with P._db(immediate=True) as conn:
+        with PST.paper_db(immediate=True) as conn:
             result = PRS.capture_portfolio_runtime_snapshot(
                 conn, cycle_id=payload.cycle_id, asof_day=payload.asof_day,
                 decision_at=payload.decision_at,
@@ -97,7 +98,7 @@ def capture_portfolio_runtime_snapshot(payload: PortfolioRuntimeCaptureRequest):
 def get_portfolio_runtime_snapshot(snapshot_id: str):
     """Read only the exact immutable snapshot named by its fingerprint ID."""
     try:
-        with P._db_readonly() as conn:
+        with PST.paper_db_readonly() as conn:
             return PRS.get_portfolio_runtime_snapshot(conn, snapshot_id)
     except (PR.PortfolioRuntimeError, PRRepo.PortfolioRuntimeRepositoryError,
             ValueError) as exc:
@@ -112,7 +113,7 @@ def capture_portfolio_allocation_plan(payload: PortfolioAllocationPlanRequest):
     the plan, does not place or cancel orders, and emits no Risk ALLOW/BLOCK.
     """
     try:
-        with P._db(immediate=True) as conn:
+        with PST.paper_db(immediate=True) as conn:
             result = PAS.capture_portfolio_allocation_plan(
                 conn, config=_allocation_service_config(),
                 portfolio_snapshot_id=payload.portfolio_snapshot_id,
@@ -131,7 +132,7 @@ def capture_portfolio_allocation_plan(payload: PortfolioAllocationPlanRequest):
 def get_portfolio_allocation_plan(plan_id: str):
     """Read only the exact immutable plan named by its fingerprint ID."""
     try:
-        with P._db_readonly() as conn:
+        with PST.paper_db_readonly() as conn:
             return PAS.get_portfolio_allocation_plan(conn, plan_id)
     except (PAP.PortfolioAllocationPolicyError,
             PAPRepo.PortfolioAllocationRepositoryError, ValueError) as exc:
@@ -146,7 +147,7 @@ def get_portfolio_workspace(
 ):
     """Read the workspace projection for an explicitly named cycle and plan."""
     try:
-        with P._db_readonly() as conn:
+        with PST.paper_db_readonly() as conn:
             return PWS.get_portfolio_workspace(
                 conn, cycle_id=cycle_id, plan_id=plan_id)
     except PWS.PortfolioWorkspaceUnavailable as exc:

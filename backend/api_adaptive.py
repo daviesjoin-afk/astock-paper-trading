@@ -128,7 +128,7 @@ def _paper_rebalance_db():
     因此它的事务模型天然是 **paper-ledger coupled**：这些状态一旦与账本事实分开，
     「扫到的持仓」与「据此写下的计划」就不再来自同一个快照。
 
-    旧实现用 ``adaptive._connect()``（= ``adaptive_learning.sqlite3``）。那张库既没有
+    旧实现用 ``adaptive_engine.adaptive_connection()``（= ``adaptive_learning.sqlite3``）。那张库既没有
     ``paper_accounts`` 也没有 ``paper_position_lots``，于是 endpoint 在错误的数据库上
     找 paper 事实 —— 读不到就报 ``no such table``；更糟的是它会在错误库里建出
     rebalance 状态，让 status/plans 与 scan 各说各话（split-brain）。
@@ -872,7 +872,7 @@ def apply_allocation(
     import evolution_apply
     try:
         return evolution_apply.apply_allocation(
-            adaptive._connect, adaptive.PAPER_DB_PATH, decision_id,
+            adaptive.adaptive_connection, adaptive.PAPER_DB_PATH, decision_id,
             approved_by=_MANUAL_ACTOR, confirmed=True,
         )
     except ValueError as exc:
@@ -909,7 +909,7 @@ def apply_tuner_proposals(
     import evolution_apply
     try:
         return evolution_apply.apply_tuner_proposals(
-            adaptive._connect, adaptive.PAPER_DB_PATH, run_id,
+            adaptive.adaptive_connection, adaptive.PAPER_DB_PATH, run_id,
             approved_by=_MANUAL_ACTOR, confirmed=True,
         )
     except ValueError as exc:
@@ -927,7 +927,7 @@ def rollback_tuner_overlay(
     import evolution_apply
     try:
         return evolution_apply.rollback_tuner_overlay(
-            adaptive._connect, adaptive.PAPER_DB_PATH, account_id, reason,
+            adaptive.adaptive_connection, adaptive.PAPER_DB_PATH, account_id, reason,
             approved_by=_MANUAL_ACTOR, confirmed=True,
         )
     except ValueError as exc:
@@ -1200,7 +1200,7 @@ def dual_ai_runs(limit: int = Query(20, ge=1, le=100)):
     adaptive = _implementation("adaptive")
     try:
         import dual_ai_tuner
-        with adaptive._connect() as conn:
+        with adaptive.adaptive_connection() as conn:
             dual_ai_tuner.ensure_schema(conn)
             return {"runs": dual_ai_tuner.recent_runs(conn, limit)}
     except Exception as exc:

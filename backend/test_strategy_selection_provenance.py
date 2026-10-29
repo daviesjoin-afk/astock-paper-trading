@@ -104,7 +104,7 @@ class _IsolatedStudy(unittest.TestCase):
         self.addCleanup(setattr, PS, "_run_one", self.old_run_one)
         for module, attr, value in (
             (ST, "_latest_signal_date", lambda picks: DAY),
-            (ST, "_benchmark_price_on_or_before", lambda day: None),
+            (ST, "benchmark_price_on_or_before", lambda day: None),
         ):
             old = getattr(module, attr)
             setattr(module, attr, value)

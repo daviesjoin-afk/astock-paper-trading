@@ -49,7 +49,7 @@ class CandidateFactorWiringTests(unittest.TestCase):
         with ExitStack() as stack:
             patches = (
                 (PT, "_selection_inputs", (price, set())),
-                (PT, "_selection_factor_freshness", {"passed": True}),
+                (PT, "selection_factor_freshness", {"passed": True}),
                 (PT.U, "load_universe", universe),
                 (PT.U, "latest_complete_trade_date", day),
                 (PT.dfc, "fetch_finance_latest", {"data": {}}),

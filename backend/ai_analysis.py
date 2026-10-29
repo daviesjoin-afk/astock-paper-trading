@@ -271,7 +271,7 @@ def run_analysis(connect_factory, paper_db_path, snapshot_paths, provider_module
             raise ValueError("market_evidence_unavailable")
         events.append(market_event)
         events.extend(_portfolio_events(paper_db_path, context))
-        provider_config = advisor._research_provider_config(connect_factory)
+        provider_config = advisor.research_provider_config(connect_factory)
         result = service.run_research_run(
             connect_factory,
             purpose="ai_analysis",

@@ -134,7 +134,7 @@ def bench_experiment(conn, *, sessions: int = 6, handlers=None,
     # 基准也走生产资源准入，不能为了计时绕过重型任务租约。
     table = handlers or {
         EI.TASK_TYPE_SESSION: AR.HandlerSpec(
-            handler=EI._handle_session_task, heavy=True)}
+            handler=EI.handle_session_task, heavy=True)}
     AR.run_batch(conn, max_tasks=len(environment.sessions) + 2, handlers=table,
                  worker_id=worker_id)
     finished = time.perf_counter()

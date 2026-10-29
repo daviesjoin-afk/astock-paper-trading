@@ -57,7 +57,7 @@ class TencentSnapshotGateTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self._patch_min_rows()
-        fallback = mock.patch.object(dfc, "_fetch_sina_realtime_for_codes", return_value=[])
+        fallback = mock.patch.object(dfc, "fetch_sina_realtime_for_codes", return_value=[])
         fallback.start()
         self.addCleanup(fallback.stop)
 
@@ -93,7 +93,7 @@ class TencentSnapshotGateTests(unittest.TestCase):
         rows = [{**_TencentRow.build(code), "source": "sina_public_quote",
                  "quote_at": NOW.isoformat()} for code in codes]
         with mock.patch.object(dfc, "fetch_tencent_realtime_for_codes", side_effect=RuntimeError("offline")), \
-                mock.patch.object(dfc, "_fetch_sina_realtime_for_codes", return_value=rows) as fallback:
+                mock.patch.object(dfc, "fetch_sina_realtime_for_codes", return_value=rows) as fallback:
             snapshot = dfc.fetch_tencent_market_snapshot(codes, max_age=240, now=NOW)
         fallback.assert_called_once_with(codes)
         self.assertEqual(len(snapshot), len(codes))
@@ -297,7 +297,7 @@ class SameSourceCrossCheckTests(unittest.TestCase):
                                return_value=[tencent_row]), \
                 mock.patch.object(PT.dfc, "fetch_independent_realtime_for_codes",
                                   return_value=[tencent_row]), \
-                mock.patch.object(PT.dfc, "_fetch_sina_realtime_for_codes",
+                mock.patch.object(PT.dfc, "fetch_sina_realtime_for_codes",
                                   return_value=[sina_row]) as sina:
             row = PT._quotes(["600001"], asof_date=owner_now.date())["600001"]
         sina.assert_called_once_with(["600001"])
@@ -314,7 +314,7 @@ class SameSourceCrossCheckTests(unittest.TestCase):
                     mock.patch.object(PT.dfc,"fetch_independent_realtime_for_codes",return_value=[row]), \
                     mock.patch.object(PT.dfc,"enrich_live_flow_details",return_value={}), \
                     mock.patch.object(PT.PLTrad,"prefetch",return_value={}), \
-                    mock.patch.object(PT.dfc,"_fetch_sina_realtime_for_codes",
+                    mock.patch.object(PT.dfc,"fetch_sina_realtime_for_codes",
                                       **({"side_effect":failure} if isinstance(failure,Exception) else {"return_value":failure})):
                 actual=PT._quotes(["600001"],asof_date=owner_now.date())["600001"]
             self.assertNotEqual("cross_source_checked",actual["quote_validation"])
@@ -337,7 +337,7 @@ class SameSourceCrossCheckTests(unittest.TestCase):
                 mock.patch.object(PT,"_latest_price_map",return_value={"600001":old}), \
                 mock.patch.object(PT.dfc,"enrich_live_flow_details",return_value={}), \
                 mock.patch.object(PT.dfc,"fetch_independent_realtime_for_codes",return_value=[row]), \
-                mock.patch.object(PT.dfc,"_fetch_sina_realtime_for_codes",return_value=[{**row,"source":"sina_public_quote"}]), \
+                mock.patch.object(PT.dfc,"fetch_sina_realtime_for_codes",return_value=[{**row,"source":"sina_public_quote"}]), \
                 mock.patch.object(PT.dfc,"enrich_live_flow_details",return_value={}), \
                 mock.patch.object(PT.PLTrad,"prefetch",return_value={}):
             actual=PT._quotes(["600001"],asof_date=owner_now.date())["600001"]

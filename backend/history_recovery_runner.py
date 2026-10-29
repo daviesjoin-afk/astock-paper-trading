@@ -44,7 +44,7 @@ def _run_recovery(workers=2, max_seconds=780, admission=None):
     if coverage.get("ready"):
         try:
             import paper_trading as P
-            factor_refresh = P._rebuild_selection_factor_cache(target)
+            factor_refresh = P.rebuild_selection_factor_cache(target)
         except Exception as exc:
             factor_refresh = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
     refresh_status = str((refresh or {}).get("status") or "failed")

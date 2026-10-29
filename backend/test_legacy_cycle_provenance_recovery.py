@@ -229,7 +229,7 @@ class LegacyCycleProvenanceRecoveryTests(unittest.TestCase):
             return original(conn)
 
         with mock.patch.object(
-            RECOVERY.PSM, "_ensure_order_cycle_provenance_guards", fail_on_restore
+            RECOVERY.PSM, "ensure_order_cycle_provenance_guards", fail_on_restore
         ):
             with self.assertRaisesRegex(RuntimeError, "restore failure"):
                 RECOVERY.apply_plan(self.conn, plan)

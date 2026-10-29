@@ -84,12 +84,13 @@ def _freeze(value):
     raise SearchSpaceError("search_space_fact_not_serializable")
 
 
-def _thaw(value):
+def thaw(value):
     if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
+        return {str(key): thaw(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_thaw(item) for item in value]
+        return [thaw(item) for item in value]
     return value
+
 
 
 def _text(value, label: str, *, required: bool = True) -> str | None:
@@ -178,13 +179,13 @@ class ParentStrategyPin:
 
     def __post_init__(self):
         strategy_id = _text(self.strategy_id, "parent_strategy_id")
-        if not SC._IDENT.fullmatch(strategy_id):
+        if not SC.IDENT.fullmatch(strategy_id):
             raise SearchSpaceError("parent_strategy_id_is_not_a_canonical_identifier")
         if isinstance(self.strategy_version, bool) or not isinstance(self.strategy_version, int) \
                 or self.strategy_version < 1:
             raise SearchSpaceError("parent_strategy_version_must_be_a_positive_integer")
         checksum = _text(self.strategy_checksum, "parent_strategy_checksum")
-        if not SC._SHA256.fullmatch(checksum):
+        if not SC.SHA256.fullmatch(checksum):
             raise SearchSpaceError("parent_strategy_checksum_must_be_a_sha256_hex_digest")
         if not isinstance(self.dsl_ast, Mapping):
             raise SearchSpaceError("parent_dsl_ast_must_be_an_object")
@@ -194,7 +195,7 @@ class ParentStrategyPin:
             raise SearchSpaceError(f"parent_dsl_ast_rejected:{exc}") from exc
         object.__setattr__(self, "strategy_id", strategy_id)
         object.__setattr__(self, "strategy_checksum", checksum)
-        object.__setattr__(self, "asof", SC._asof_day(self.asof))
+        object.__setattr__(self, "asof", SC.asof_day(self.asof))
         object.__setattr__(self, "dsl_ast", _freeze(DSL.normalize(self.dsl_ast)))
         object.__setattr__(self, "research_provenance",
                            None if self.research_provenance is None
@@ -224,7 +225,7 @@ class ParentStrategyPin:
                 "strategy_version": self.strategy_version,
                 "strategy_checksum": self.strategy_checksum,
                 "asof": self.asof,
-                "dsl_ast": _thaw(self.dsl_ast)}
+                "dsl_ast": thaw(self.dsl_ast)}
 
 
 def _slot(value, role: str) -> dict:
@@ -257,7 +258,7 @@ def _slot(value, role: str) -> dict:
         # 每一个 alternative 都必须单独通过既有 bounded DSL 契约：R35-B 不发明
         # 第二套表达式语言，也不接受 Python / eval / exec / 自由源码。
         try:
-            normalized_ast = SC._rule_spec(ast, role, allow_strategy_root=(role == "entry"))
+            normalized_ast = SC.rule_spec(ast, role, allow_strategy_root=(role == "entry"))
         except SC.CandidateValidationError as exc:
             raise SearchSpaceError(f"{role}_alternative_rejected:{exc}") from exc
         normalized.append(_canonical(normalized_ast))
@@ -299,10 +300,10 @@ def _tightened_constraints(parent_constraints, override) -> dict:
     是风险放大动作，必须走正式 risk evidence gate（``asymmetric_risk`` 的观察期），
     不属于 candidate generator 的权限。这里没有那个 gate，因此 fail closed。
     """
-    inherited = SC._constraints(parent_constraints)
+    inherited = SC.rule_constraints(parent_constraints)
     if override is None:
         return inherited
-    declared = SC._constraints(override)
+    declared = SC.rule_constraints(override)
     for key, parent_value in inherited.items():
         if key not in declared:
             # override 缺了父策略有的边界 = 把该边界丢掉 = 放宽。
@@ -351,7 +352,7 @@ class CandidateSearchSpace:
                            _text(self.generator_type, "generator_type"))
         object.__setattr__(self, "generator_version",
                            _text(self.generator_version, "generator_version"))
-        object.__setattr__(self, "asof", SC._asof_day(self.asof))
+        object.__setattr__(self, "asof", SC.asof_day(self.asof))
         if not isinstance(self.universe_spec, Mapping) or not self.universe_spec:
             raise SearchSpaceError("explicit_universe_spec_required")
         object.__setattr__(self, "universe_spec", _freeze(dict(self.universe_spec)))
@@ -420,15 +421,15 @@ class CandidateSearchSpace:
                 combinations = expanded
             return tuple(combinations)
         if dimension == "entry":
-            slot, inherited = self.entry_slot, _thaw(self.parent_pin.dsl_ast)
+            slot, inherited = self.entry_slot, thaw(self.parent_pin.dsl_ast)
         elif dimension == "factor":
             slot, inherited = self.factor_slot, (
                 None if self.parent_pin.factor_spec is None
-                else _thaw(self.parent_pin.factor_spec))
+                else thaw(self.parent_pin.factor_spec))
         elif dimension == "exit":
             slot, inherited = self.exit_slot, (
                 None if self.parent_pin.exit_spec is None
-                else _thaw(self.parent_pin.exit_spec))
+                else thaw(self.parent_pin.exit_spec))
         else:
             raise SearchSpaceError(f"unknown_search_space_dimension:{dimension}")
         if slot["kind"] == INHERIT_PARENT:
@@ -466,20 +467,20 @@ class CandidateSearchSpace:
             "asof": self.asof,
             "generator_type": self.generator_type,
             "generator_version": self.generator_version,
-            "universe_spec": _thaw(self.universe_spec),
+            "universe_spec": thaw(self.universe_spec),
             "intended_market_regime": self.intended_market_regime,
             "parameter_variants": {name: list(values)
                                    for name, values in sorted(self.parameter_variants.items())},
-            "factor_slot": _thaw(self.factor_slot),
-            "entry_slot": _thaw(self.entry_slot),
-            "exit_slot": _thaw(self.exit_slot),
+            "factor_slot": thaw(self.factor_slot),
+            "entry_slot": thaw(self.entry_slot),
+            "exit_slot": thaw(self.exit_slot),
             "combination_policy": self.combination_policy,
             "evidence_count": self.evidence_count,
             "hypothesis_id": self.hypothesis_id,
-            "research_provenance": _thaw(self.research_provenance or {}),
+            "research_provenance": thaw(self.research_provenance or {}),
             "random_seed": self.random_seed,
-            "model_identity": _thaw(self.model_identity or {}),
-            "constraints": _thaw(self.constraints or {}),
+            "model_identity": thaw(self.model_identity or {}),
+            "constraints": thaw(self.constraints or {}),
         }
 
     @property
@@ -499,3 +500,7 @@ __all__ = [
     "ParentStrategyPin", "ROLE_SLOTS", "SEARCH_SPACE_CONTRACT_VERSION", "SLOT_KINDS",
     "SearchSpaceError", "StrategyGeneratorError",
 ]
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_thaw = thaw

@@ -31,7 +31,8 @@ MAX_LARGEST = 5
 
 
 # 数值读取合同的唯一 owner：宽松解析、严格有效（布尔/NaN/无穷一律未知）。
-_number = _coerced_number
+number = _coerced_number
+
 
 
 def summarize(rows, *, top=MAX_LARGEST):
@@ -41,11 +42,11 @@ def summarize(rows, *, top=MAX_LARGEST):
     ``amount_coverage_pct`` 明确覆盖率，避免把部分覆盖读成全市场。
     """
     rows = list(rows or ())
-    amounts = [(row, _number(row.get("amount"))) for row in rows]
-    volumes = [(row, _number(row.get("volume"))) for row in rows]
+    amounts = [(row, number(row.get("amount"))) for row in rows]
+    volumes = [(row, number(row.get("volume"))) for row in rows]
     with_amount = [(row, value) for row, value in amounts if value is not None and value > 0]
     with_volume = [(row, value) for row, value in volumes if value is not None and value > 0]
-    pcts = [value for value in (_number(row.get("pct")) for row in rows) if value is not None]
+    pcts = [value for value in (number(row.get("pct")) for row in rows) if value is not None]
     largest = sorted(with_amount, key=lambda item: -item[1])[:max(int(top), 0)]
     return {
         "tracked": len(rows),
@@ -61,7 +62,7 @@ def summarize(rows, *, top=MAX_LARGEST):
         "mean_pct": round(sum(pcts) / len(pcts), 3) if pcts else None,
         "largest": [
             {"code": str(row.get("code") or ""), "name": row.get("name"),
-             "pct": _number(row.get("pct")), "amount": round(value, 2)}
+             "pct": number(row.get("pct")), "amount": round(value, 2)}
             for row, value in largest
         ],
         "unit": {"amount": "元", "volume": "手"},
@@ -69,7 +70,7 @@ def summarize(rows, *, top=MAX_LARGEST):
     }
 
 
-def _write(path, value):
+def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                      prefix=".auction-", suffix=".tmp", delete=False) as handle:
@@ -81,7 +82,8 @@ def _write(path, value):
         temporary.unlink(missing_ok=True)
 
 
-def _read(path):
+
+def read(path):
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
@@ -89,17 +91,19 @@ def _read(path):
         return {}
 
 
+
 def status():
     """只读小型状态文件，页面查询不读取全市场历史、更不联网。"""
-    return _read(Path(data_paths.data_path("auction_tracking", "status.json"))) or {"status": "not_run"}
+    return read(Path(data_paths.data_path("auction_tracking", "status.json"))) or {"status": "not_run"}
 
 
-def _observed_at(value):
+def observed_at(value):
     try:
         stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return stamp.replace(tzinfo=CN) if stamp.tzinfo is None else stamp.astimezone(CN)
     except (TypeError, ValueError):
         return None
+
 
 
 def run(now=None):
@@ -116,7 +120,7 @@ def run(now=None):
         fresh = reading.available and reading.freshness == MDC.FRESHNESS_FRESH
         rows = []
         for raw in reading.rows() if fresh else ():
-            observed = _observed_at(raw.get("quote_at"))
+            observed = observed_at(raw.get("quote_at"))
             try:
                 valid_price = math.isfinite(float(raw.get("price"))) and float(raw["price"]) > 0
             except (ValueError, TypeError, OverflowError):
@@ -140,7 +144,7 @@ def run(now=None):
 
 def _publish(rows, current, reason, health, *, final=False):
     root = Path(data_paths.data_path("auction_tracking"))
-    previous = _read(root / "current.json")
+    previous = read(root / "current.json")
     observations = previous.get("observations", []) if previous.get("trade_date") == current.date().isoformat() else []
     tick = "09:25" if final else f"09:{15 + ((current.minute - 15) // 3) * 3:02d}"
     observations = [item for item in observations if item.get("tick") != tick]
@@ -155,8 +159,8 @@ def _publish(rows, current, reason, health, *, final=False):
               "observations": len(observations), "tracked_stocks": len(rows),
               "reason": reason, "source_healthy": bool(health.get("healthy")),
               "observation_only": True, "summary": summary}
-    _write(root / "current.json", {"trade_date": report["trade_date"], "observations": observations})
-    _write(root / "status.json", report)
+    write(root / "current.json", {"trade_date": report["trade_date"], "observations": observations})
+    write(root / "status.json", report)
     if final and rows:
         _archive_day(root, current, rows, summary)
     return report
@@ -183,7 +187,7 @@ def archive_path(trade_date):
 def _archive_day(root, current, rows, summary):
     """09:25 收尾：一天一个文件，作为竞价因子的唯一时点数据源。"""
     day = current.date().isoformat()
-    _write(root / f"{day}.json", {
+    write(root / f"{day}.json", {
         "trade_date": day,
         "captured_at": current.isoformat(),
         "final_tick": "09:25",
@@ -225,12 +229,12 @@ def load_archived_day(trade_date):
         path = archive_path(trade_date)
     except ValueError:
         return {}
-    return _read(path)
+    return read(path)
 
 
 def current_snapshot():
     """当天的 current.json（可能为空表），只读；供 API 在归档前展示。"""
-    return _read(Path(data_paths.data_path("auction_tracking", "current.json")))
+    return read(Path(data_paths.data_path("auction_tracking", "current.json")))
 
 
 def record_final(rows, now, health):
@@ -245,7 +249,7 @@ def record_final(rows, now, health):
         return False
     usable = []
     for row in rows:
-        stamp = _observed_at(row.get('quote_at'))
+        stamp = observed_at(row.get('quote_at'))
         if (stamp and stamp.date() == current.date() and dt.time(9, 24) <= stamp.time() < dt.time(9, 32)
                 and 0 <= (current-stamp).total_seconds() <= 90):
             usable.append({key:row.get(key) for key in FIELDS if key in row})
@@ -260,5 +264,12 @@ def record_archive_error(exc):
     report = dict(status() or {})
     report["archive_error"] = f"{type(exc).__name__}: {exc}"[:200]
     report["archive_error_at"] = dt.datetime.now(CN).isoformat()
-    _write(Path(data_paths.data_path("auction_tracking", "status.json")), report)
+    write(Path(data_paths.data_path("auction_tracking", "status.json")), report)
     return report
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_read = read
+_number = number
+_observed_at = observed_at
+_write = write

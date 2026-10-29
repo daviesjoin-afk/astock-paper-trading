@@ -110,8 +110,9 @@ LEGACY_PICK_COLUMNS = (
 LEGACY_KEY_PREFIX = "legacy"
 
 
-def _today():
+def today():
     return dt.datetime.now(CHINA_TZ).date()
+
 
 
 def _connect():
@@ -468,7 +469,7 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
       ``provenance_status='unknown'``，**不**退回 today / 最新因子日 / min-max。
     """
     topn = max(1, min(int(topn), MAX_TOPN))
-    trade_date = str(run_date or _today().isoformat())[:10]
+    trade_date = str(run_date or today().isoformat())[:10]
     items = catalog()
     if strategies:
         wanted = {str(item) for item in strategies}
@@ -768,3 +769,7 @@ def latest(trade_date: str | None = None, strategy_id: str = "") -> dict:
              for pick in (item.get("picks") or [])]
     return {"found": True, "trade_date": day, "strategies": strategies,
             "disclosure_references": SDR.references_for_codes(codes, as_of=day)}
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_today = today

@@ -26,7 +26,7 @@ class SingleSourceExecutionTests(unittest.TestCase):
     def quotes(self, primary, independent, *, sina=()):
         with mock.patch.object(P.dfc, "fetch_realtime_for_codes", return_value=primary), \
                 mock.patch.object(P.dfc, "fetch_independent_realtime_for_codes", return_value=independent), \
-                mock.patch.object(P.dfc, "_fetch_sina_realtime_for_codes", return_value=list(sina)), \
+                mock.patch.object(P.dfc, "fetch_sina_realtime_for_codes", return_value=list(sina)), \
                 mock.patch.object(P.dfc, "enrich_live_flow_details", return_value={}), \
                 mock.patch.object(P.PLTrad, "prefetch", return_value={}), \
                 mock.patch.object(P.MDSvc, "read_snapshot", return_value=M.unavailable_reading(
@@ -85,8 +85,8 @@ class SingleSourceExecutionTests(unittest.TestCase):
         old = mock.Mock(name="old");new = mock.Mock(name="new")
         old.fetch_realtime.return_value = [{**self.quote, "quote_at": "2000-01-01T10:00:00+08:00"}]
         new.fetch_realtime.return_value = [self.quote]
-        with mock.patch.object(D, "_tencent_realtime_feed", return_value=old), \
-                mock.patch.object(D, "_sina_realtime_feed", return_value=new):
+        with mock.patch.object(D, "tencent_realtime_feed", return_value=old), \
+                mock.patch.object(D, "sina_realtime_feed", return_value=new):
             rows = D.fetch_independent_realtime_for_codes(["600001"])
         self.assertEqual(rows, [self.quote])
         new.fetch_realtime.assert_called_once_with(["600001"])

@@ -350,11 +350,12 @@ def policy_named(name: str) -> MarketDataPolicy:
 # ---------------------------------------------------------------------------
 
 
-def _freeze(mapping: Mapping[str, Any] | None) -> Mapping[str, Any]:
+def freeze(mapping: Mapping[str, Any] | None) -> Mapping[str, Any]:
     """把证据 mapping 冻结成只读视图；``None`` 归一成空。"""
     if not mapping:
         return MappingProxyType({})
     return MappingProxyType(dict(mapping))
+
 
 
 def canonical_day(value: Any) -> str | None:
@@ -380,7 +381,8 @@ def canonical_day(value: Any) -> str | None:
     return parsed.date().isoformat()
 
 
-def _parse_instant(value: Any) -> dt.datetime | None:
+
+def parse_instant(value: Any) -> dt.datetime | None:
     """把时间戳归一成带时区的 datetime；无法解析即 ``None``。"""
     if isinstance(value, dt.datetime):
         parsed = value
@@ -400,6 +402,10 @@ def _parse_instant(value: Any) -> dt.datetime | None:
         parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
     return parsed
 
+
+
+# 兼容别名：账本原有用私有名调用，公开名才是契约。
+_parse_instant = parse_instant
 
 def _age_seconds(observed_at: Any, now: Any) -> float | None:
     """观测时点到 ``now`` 的间隔（**绝对值**）。
@@ -470,7 +476,7 @@ class MarketDataSnapshot:
             raise ValueError(
                 f"snapshot {self.kind}: unknown reason {self.degraded_reason!r}"
             )
-        frozen = _freeze(self.verification_detail)
+        frozen = freeze(self.verification_detail)
         object.__setattr__(self, "verification_detail", frozen)
 
     @property
@@ -1058,3 +1064,7 @@ def symbol_quote_snapshot(
             "quote_cross_check": envelope.get("quote_cross_check"),
         },
     )
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_freeze = freeze

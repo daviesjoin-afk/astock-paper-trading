@@ -119,7 +119,7 @@ def verified_close_prices(payload: Any, asof: Any = None) -> tuple[dt.datetime, 
 
 def _benchmark_price(day: str) -> float | None:
     try:
-        return ST._benchmark_price_on_or_before(dt.date.fromisoformat(day))
+        return ST.benchmark_price_on_or_before(dt.date.fromisoformat(day))
     except Exception:
         return None
 

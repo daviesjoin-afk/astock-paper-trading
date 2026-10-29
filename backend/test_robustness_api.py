@@ -107,8 +107,8 @@ class RobustnessApiTests(unittest.TestCase):
     def test_date_perturbation_api_uses_owner_session_anchors_for_date_boundaries(self):
         service = Path(os.path.join(
             BACKEND, "experiment_validation_service.py")).read_text(encoding="utf-8")
-        self.assertIn("RRUN._baseline_session_bounds(spec, owner_sessions)", service)
-        self.assertIn("RRUN._scenario_sessions(scenario, spec, owner_sessions)", service)
+        self.assertIn("RRUN.baseline_session_bounds(spec, owner_sessions)", service)
+        self.assertIn("RRUN.build_scenario_sessions(scenario, spec, owner_sessions)", service)
         self.assertNotIn("spec.start_date not in owner_sessions", service)
         self.assertNotIn("spec.end_date not in owner_sessions", service)
 

@@ -200,7 +200,7 @@ def _flag(value: Any) -> Optional[bool]:
     return PIT.as_strict_bool(value)
 
 
-def _direction(value: Any) -> Optional[str]:
+def direction(value: Any) -> Optional[str]:
     """规范化涨跌停方向；无法识别返回 ``None``（未知，而不是"无方向"）。
 
     只接受白名单词表。未知方向**保留**为 ``None`` 而不猜测，由判断层决定是否
@@ -210,6 +210,7 @@ def _direction(value: Any) -> Optional[str]:
     if text is None:
         return None
     return _PRICE_LIMIT_ALIASES.get(text.lower())
+
 
 
 def _instant(value: Any) -> Optional["_dt.datetime"]:
@@ -379,7 +380,7 @@ class TradabilityCoverageProjection:
 # ───────────────────────────── 规范化 / 指纹 ─────────────────────────────
 
 
-def _resolve_listed(
+def resolve_listed(
     session: str,
     listing_date: Optional[str],
     delisting_date: Optional[str],
@@ -403,6 +404,7 @@ def _resolve_listed(
         return True
     # 只有退市日、且 session 在它之前：能证明"尚未退市"，但证明不了"当时已上市"。
     return None
+
 
 
 def normalize_record(
@@ -442,7 +444,7 @@ def normalize_record(
 
     listing_date = _session(record.get("listing_date"))
     delisting_date = _session(record.get("delisting_date"))
-    is_listed = _resolve_listed(
+    is_listed = resolve_listed(
         session,
         listing_date,
         delisting_date,
@@ -461,7 +463,7 @@ def normalize_record(
         has_market_quote=_flag(record.get("has_market_quote")),
         has_trade_volume=_flag(record.get("has_trade_volume")),
         is_price_limit_locked=_flag(record.get("is_price_limit_locked")),
-        price_limit_direction=_direction(
+        price_limit_direction=direction(
             record.get("price_limit_direction") or record.get("limit_direction")
         ),
         source=src,
@@ -585,7 +587,7 @@ def _row_to_evidence(row: Any) -> TradabilityEvidence:
         has_market_quote=_flag(_value("has_market_quote")),
         has_trade_volume=_flag(_value("has_trade_volume")),
         is_price_limit_locked=_flag(_value("is_price_limit_locked")),
-        price_limit_direction=_direction(_value("price_limit_direction")),
+        price_limit_direction=direction(_value("price_limit_direction")),
         source=str(named.get("source") or ""),
         observed_at=str(named.get("observed_at") or ""),
         effective_at=str(named.get("effective_at") or ""),
@@ -1113,3 +1115,8 @@ def tradability_at(
         decision_time=decision_time,
         fingerprint=evidence_fingerprint(evidence),
     )
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_direction = direction
+_resolve_listed = resolve_listed

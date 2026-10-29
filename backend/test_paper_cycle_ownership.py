@@ -747,9 +747,9 @@ class CompatibilityFacadeTests(unittest.TestCase):
     def test_facade_cycle_selection_still_owns_the_write_side_helper(self):
         """``_active_cycle``（可能触发旧库补周期）必须留在 ``paper_trading``。"""
         tree = _parse(PAPER_PATH)
-        self.assertIsNotNone(_find_function(tree, "_active_cycle"))
+        self.assertIsNotNone(_find_function(tree, "load_active_cycle"))
         self.assertIsNotNone(_find_function(tree, "_ensure_cycle"))
-        self.assertIsNone(_find_function(_parse(OWNERSHIP_PATH), "_active_cycle"))
+        self.assertIsNone(_find_function(_parse(OWNERSHIP_PATH), "load_active_cycle"))
         self.assertIsNone(_find_function(_parse(OWNERSHIP_PATH), "_ensure_cycle"))
 
 

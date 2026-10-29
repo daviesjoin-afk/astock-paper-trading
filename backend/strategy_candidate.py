@@ -132,8 +132,10 @@ FORBIDDEN_EVALUATION_KEYS = frozenset({
 #: （null 的语义是"本候选未声明该角色"，绝不代表"沿用当前策略"）。
 RULE_ROLES = ("factor", "entry", "exit")
 
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_IDENT = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+IDENT = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
 #: 版本/契约标识允许连字符与点（``strategy-generator-contract-v1``），
 #: 但仍然是**封闭字符集**：版本字符串永远来自代码常量，不来自自由文本。
 _SYMBOL = re.compile(r"^[0-9]{6}$")
@@ -202,7 +204,7 @@ def _sha_text(value, label: str, *, required: bool = True) -> str | None:
     text = _declared_text(value, label, required=required)
     if text is None:
         return None
-    if not _SHA256.fullmatch(text):
+    if not SHA256.fullmatch(text):
         raise CandidateValidationError(f"{label}_must_be_a_sha256_hex_digest")
     return text
 
@@ -216,13 +218,14 @@ def _finite(value, label: str) -> float:
     return number
 
 
-def _asof_day(value) -> str:
+def asof_day(value) -> str:
     """显式业务 as-of 日期。绝不接受"现在"：没有默认值，没有机器时钟。"""
     text = _declared_text(value, "asof")
     try:
         return dt.date.fromisoformat(text).isoformat()
     except ValueError as exc:
         raise CandidateValidationError("asof_must_be_an_iso_date") from exc
+
 
 
 def _reject_forbidden_evaluation_keys(value, label: str) -> None:
@@ -239,7 +242,7 @@ def _reject_forbidden_evaluation_keys(value, label: str) -> None:
             _reject_forbidden_evaluation_keys(item, label)
 
 
-def _rule_spec(ast, role: str, *, allow_strategy_root: bool):
+def rule_spec(ast, role: str, *, allow_strategy_root: bool):
     """校验一个 rule 角色：必须是 bounded DSL 的 boolean AST。
 
     只接受 ``strategy_dsl_schema.normalize`` 认得的声明式节点。任何"像代码"的
@@ -264,6 +267,7 @@ def _rule_spec(ast, role: str, *, allow_strategy_root: bool):
         # 参数只能在 entry 的 ``strategy`` 根上声明一次，避免第二套参数 authority。
         raise CandidateValidationError(f"{role}_spec_must_not_declare_parameters")
     return normalized
+
 
 
 def _contains_strategy_node(value) -> bool:
@@ -311,7 +315,7 @@ def _universe_spec(value) -> dict:
     return result
 
 
-def _constraints(value) -> dict:
+def rule_constraints(value) -> dict:
     declared = _closed_mapping(value, CONSTRAINT_KEYS, "constraints")
     result = {}
     if "max_positions" in declared:
@@ -326,6 +330,7 @@ def _constraints(value) -> dict:
                 raise CandidateValidationError(f"constraint_{key}_must_be_a_fraction")
             result[key] = number
     return result
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,7 +480,7 @@ def build_strategy_candidate(
             frozenset({"strategy_id", "strategy_version", "strategy_checksum"}),
             "parent_identity")
         parent_id = _declared_text(pinned.get("strategy_id"), "parent_strategy_id",
-                                   _IDENT, required=False)
+                                   IDENT, required=False)
         if parent_id is not None:
             raw_version = pinned.get("strategy_version")
             if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 1:
@@ -488,9 +493,9 @@ def build_strategy_candidate(
             if leftover:
                 raise CandidateValidationError("parent_identity_without_a_strategy_id")
 
-    entry = _rule_spec(entry_spec, "entry", allow_strategy_root=True)
-    factor = _rule_spec(factor_spec, "factor", allow_strategy_root=False)
-    exit_rule = _rule_spec(exit_spec, "exit", allow_strategy_root=False)
+    entry = rule_spec(entry_spec, "entry", allow_strategy_root=True)
+    factor = rule_spec(factor_spec, "factor", allow_strategy_root=False)
+    exit_rule = rule_spec(exit_spec, "exit", allow_strategy_root=False)
     # 参数契约由既有 owner 编译：候选不自己解析参数，也不复制第二套参数规则。
     # 没有声明可调参数的候选仍然合法（结构变体），此时 editable/immutable 都是空集。
     parameter_spec = SPS.StrategyParameterSchema.from_dsl(entry).to_dict()
@@ -507,9 +512,9 @@ def build_strategy_candidate(
         "parameter_spec": parameter_spec,
         "universe_spec": _universe_spec(universe_spec),
         "intended_market_regime": _declared_text(
-            intended_market_regime, "intended_market_regime", _IDENT),
-        "constraints": _constraints(constraints),
-        "asof": _asof_day(asof),
+            intended_market_regime, "intended_market_regime", IDENT),
+        "constraints": rule_constraints(constraints),
+        "asof": asof_day(asof),
     }
     fingerprint = _sha(material)
     return StrategyCandidate(
@@ -642,3 +647,11 @@ __all__ = [
     "build_strategy_candidate", "candidate_from_projection",
     "candidate_projection_keys", "verify_candidate_fingerprint",
 ]
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_SHA256 = SHA256
+_asof_day = asof_day
+_constraints = rule_constraints
+_IDENT = IDENT
+_rule_spec = rule_spec

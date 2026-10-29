@@ -14,7 +14,7 @@
 3. 把 domain exception 映射成 HTTP 状态码；
 4. 返回响应。
 
-因此这里**不再**出现 ``paper_trading._db()``，也**不再**用
+因此这里**不再**出现 ``paper_storage.paper_db()``，也**不再**用
 ``if "already exists" in message`` 之类的字符串匹配来猜状态码——分类只在
 ``strategy_service.translate_registry_error`` 一处发生。
 

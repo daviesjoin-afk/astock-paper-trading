@@ -113,7 +113,7 @@ class CandidateSnapshotReplayTests(Replay._RolloverFixture):
     def test_blocked_freshness_keeps_reason_and_never_reads_finance(self):
         self.assertEqual(PT._rebuild_selection_factor_cache(Replay.D_DAY)["status"], "ok")
         account = {"id": Replay.STRATEGY_ID}
-        with mock.patch.object(PT, "_selection_factor_freshness", return_value={
+        with mock.patch.object(PT, "selection_factor_freshness", return_value={
                 "passed": False, "reason": "fixture incomplete factors"}), \
                 mock.patch.object(PT.dfc, "fetch_finance_latest") as source:
             expected = PT._candidate_rows(account, Replay.D_DAY, {"light": "green"})

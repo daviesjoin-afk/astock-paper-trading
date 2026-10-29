@@ -398,7 +398,7 @@ def _load_selection_base(*, with_status=False):
             if not _SELECTION_REQUIRED_COLUMNS.issubset(candidate.columns):
                 status.update(reason="选股因子缓存版本过旧，等待后台重建", reason_code="factor_schema_outdated")
             else:
-                freshness = P._selection_factor_freshness(
+                freshness = P.selection_factor_freshness(
                     candidate, U.load_universe(), datetime.date.today(), meta=meta)
                 status.update(freshness)
                 if freshness["passed"]:
