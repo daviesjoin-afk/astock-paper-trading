@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import tempfile
 import threading
@@ -54,8 +55,17 @@ class RuntimeSimplificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "snapshot.json"
             lock_path = Path(tmp) / "snapshot.lock"
-            rows = [{"code": f"{i:06d}"} for i in range(4000)]
             calls = []
+
+            # 生产快照的每一行都带**来源行情时间**（``quote_at``）。缓存准入
+            # 用来源时间判定新鲜度（横截面比例 ≥90%），所以夹具必须与生产
+            # 形状一致；缺时间的行会被正确地判为不可用，于是第二个线程
+            # 会重新抓取 —— 那不是 singleflight 失效，而是夹具不真实。
+            quote_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            rows = [
+                {"code": f"{i:06d}", "quote_at": quote_at, "price": 10.0, "pct": 1.0}
+                for i in range(4000)
+            ]
 
             def fake_fetch(*_args, **_kwargs):
                 calls.append(time.monotonic())
