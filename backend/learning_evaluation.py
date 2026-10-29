@@ -55,6 +55,7 @@ import json
 import math
 import re
 import sqlite3
+from paper_numeric import strict_finite as _strict_finite
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
@@ -270,21 +271,7 @@ def _iso_date(value: Any) -> Optional[str]:
 
 def _finite(value: Any) -> Optional[float]:
     """Return a finite float, or ``None``.  Never coerces missing to ``0``."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text or text.lower() in {"nan", "none", "null", "-", "inf", "-inf", "+inf"}:
-            return None
-        try:
-            number = float(text)
-        except ValueError:
-            return None
-    elif isinstance(value, (int, float)):
-        number = float(value)
-    else:
-        return None
-    return number if math.isfinite(number) else None
+    return _strict_finite(value)
 
 
 def _canon_number(value: Any) -> Optional[str]:

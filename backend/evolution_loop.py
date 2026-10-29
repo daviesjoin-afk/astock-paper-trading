@@ -46,6 +46,7 @@ try:
 except Exception:  # pragma: no cover - 极旧环境兜底
     TZ = None
 from adaptive_common import _now, _json, _loads  # C3: 收敛重复工具函数
+from paper_numeric import bounded_num as _bounded_num
 
 # 阶段顺序即为闭环方向；APPLY 之后自动回到 OBSERVE 开启下一代。
 STAGES = ("observe", "evaluate", "mutate", "validate", "apply")
@@ -60,11 +61,7 @@ EVOLUTION_VERSION = "evolution-loop-v1"
 # 基础工具（_now/_json/_loads 源自 adaptive_common；_num 保留模块本地）
 # ──────────────────────────────────────────────────────────────────────────
 def _num(value, default=None):
-    try:
-        v = float(value)
-        return v if abs(v) < 1e15 else default
-    except (TypeError, ValueError):
-        return default
+    return _bounded_num(value, default)
 
 
 # ──────────────────────────────────────────────────────────────────────────

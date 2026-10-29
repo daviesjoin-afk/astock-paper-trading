@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
 from adaptive_common import _now, _json, _loads  # C3: 收敛重复工具函数
+from paper_numeric import bounded_num as _bounded_num
 from evolution_contract import BOUNDS, EVOLUTION_VERSION
 
 # 生命周期契约：candidate / validated / active 三者分离，由显式指针决定
@@ -69,11 +70,7 @@ ATTRIBUTION_LINKAGE_SOURCE = "explicit_tuner_apply_overlay"
 
 
 def _num(value, default=None):
-    try:
-        v = float(value)
-        return v if abs(v) < 1e15 else default
-    except (TypeError, ValueError):
-        return default
+    return _bounded_num(value, default)
 
 
 def _rate(numerator: int, denominator: int) -> Optional[float]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from paper_numeric import coerced_number as _coerced_number
 
 VERSION = "main-force-confirmation-v1"
 MARKET_TZ = dt.timezone(dt.timedelta(hours=8))
@@ -15,14 +16,8 @@ MAX_QUOTE_AGE_SECONDS = 180
 BONUS_BY_STRATEGY = {"tq_breakout": 0.03, "trend_pullback": 0.02}
 
 
-def _number(value):
-    if isinstance(value, bool):
-        return None
-    try:
-        value = float(value)
-    except (ValueError, TypeError, OverflowError):
-        return None
-    return value if math.isfinite(value) else None
+# 数值读取合同的唯一 owner：宽松解析、严格有效（布尔/NaN/无穷一律未知）。
+_number = _coerced_number
 
 
 def _time(value):

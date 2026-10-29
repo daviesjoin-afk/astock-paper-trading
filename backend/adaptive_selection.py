@@ -13,6 +13,7 @@ import statistics
 from typing import Any
 
 import strategies as S
+from paper_numeric import finite_num as _finite_num
 import paper_repository as PRP
 import execution_verification as EV
 import adaptive_selection_compat as UNIT_COMPAT
@@ -48,11 +49,7 @@ REGIME_MULTIPLIERS = {
 
 
 def _num(value, default=0.0):
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else default
-    except (TypeError, ValueError):
-        return default
+    return _finite_num(value, default)
 
 
 def _next_weekday(value):

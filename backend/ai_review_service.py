@@ -82,6 +82,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ai_provider_transport as transport
 from adaptive_common import _json, _loads, _now
+from paper_numeric import bounded_num as _bounded_num
 
 # ─── 槽位与审核模式 ───
 AI_SLOTS = ("ai1", "ai2")
@@ -175,11 +176,7 @@ _AUDIT_EXTRA_COLUMNS = {
 
 
 def _num(value, default=None):
-    try:
-        v = float(value)
-        return v if abs(v) < 1e15 else default
-    except (TypeError, ValueError):
-        return default
+    return _bounded_num(value, default)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

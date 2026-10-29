@@ -18,6 +18,7 @@ import os
 import random
 import sqlite3
 import statistics
+from paper_numeric import finite_num as _finite_num
 import threading
 import time
 from bisect import bisect_right as _bisect_right
@@ -241,11 +242,7 @@ def _load_json(path: str, default=None):
 
 
 def _num(value, default=None):
-    try:
-        number = float(value)
-        return number if math.isfinite(number) else default
-    except (TypeError, ValueError):
-        return default
+    return _finite_num(value, default)
 
 
 def _background_shadow_read(key: str, ttl_seconds: float, loader, placeholder: dict) -> dict:
