@@ -53,6 +53,25 @@ class CouplingMetricTests(unittest.TestCase):
             (root / "test_paper_a.py").touch()
             self.assertEqual(("paper_a.py",), tuple(p.name for p in metrics.production_paths(root)))
 
+    def test_foundation_owner_edges_are_not_cross_domain(self):
+        """A1：业务域直接 import 事实/基础 owner 不算业务域耦合。"""
+        result = self.measure({
+            "paper_a": "import paper_repository\n",
+            "paper_repository": "import strategy_registry\n",
+            "strategy_registry": "VALUE = 1\n",
+        })
+        # paper_a -> paper_repository（foundation）不计；
+        # paper_repository -> strategy_registry（foundation -> 业务域）不计。
+        self.assertEqual(0, result["cross_domain_edges"])
+
+    def test_business_domain_edges_still_count(self):
+        result = self.measure({
+            "paper_a": "import ai_agent\n",
+            "ai_agent": "import paper_b\n",
+            "paper_b": "VALUE = 1\n",
+        })
+        self.assertEqual(2, result["cross_domain_edges"])
+
 
 if __name__ == "__main__":
     unittest.main()

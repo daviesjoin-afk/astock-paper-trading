@@ -142,3 +142,15 @@ host:slot.example
 host:library.example
 host:ai1.example
 host:other.example
+
+# Source-file SHA-256 digests recorded as evidence in
+# plans/modularity-simplification-evidence-20261027.json (`source_sha256` map).
+# These are checksums of the reviewed 2026-10-27 tree, not credentials; the
+# scanner's digest-context heuristic only recognizes the sibling `sha256`
+# field, not the per-file map, so the exact values are listed here.
+value:6d3d99ded7617dc2bb409142cae5a5a363d8963443fe4f8873dd9517a14b3ec1
+value:d0fd08a5c1a2985fd7c6dc0e444a8d141e7d65863d46e409d23f1d9e6cd17b37
+value:15e7b122583dcff235bb6bcef3dc9cddeccdd594808bee95a186da0291686a63
+value:34d28b8d5295cd9050667ea82a3d9df4b84273b169b43b334e4119b9118078c0
+value:7a57b191bea1be55f0c3f16f62dc63e73ee5dd9e870f22674ab7f8aa166c84a9
+value:1c159c32c9c79c5751e8b8d4b3449c313cd45e61a9ae24ba803208f8bd64e4c6

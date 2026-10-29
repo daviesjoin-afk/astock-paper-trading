@@ -60,3 +60,31 @@
 4. 退役账户是否还有未完成订单与未退出持仓。
 
 在拿到这些证据之前，"删除"只能是猜测；猜测会让真实的旧持仓失去退出路径。
+
+## 2026-10-28 退役实现删除前置证据（服务器只读查询）
+
+在 `paper_trading.sqlite3` 上只读核对：
+
+- `paper_accounts`：`sector_rotation` / `main_force_top10` 均为 `paused`，且没有当前持仓或订单行；
+- `strategy_definitions`：只有 5 个 builtin，没有 `origin=user` 的克隆/自定义策略引用这两个 `implementation_key`；
+- `paper_strategy_legacy_bindings`：只有内置绑定，没有额外的用户历史绑定；
+- 当前周期 `enabled_strategies` 只含三套正式策略。
+
+因此 `paper_trading` 中 `style=="sector"` / `main_force` 的**正式新入场**分支已无正式账户可达，
+可以在独立批次中删除；`strategies.py` 的研究/回放实现、`EXIT_ONLY` 退出与历史解释仍须保留。
+删除前仍需补查研究/回放任务窗口（第 3 项证据），不能把"当前没有持仓"当成"从未使用"。
+
+## 2026-10-28 B3 删除前置证据补齐（结论：保留，不删）
+
+MD 的删除前置证据（第 3 项）已在生产库只读核对完成：
+
+- `paper_research.sqlite3:paper_research_runs` 仍存在 `sector_rotation` / `main_force_top10` 的运行记录 → **研究/回放链路仍在使用这两个 id**，因此 `strategies.py` 的实现必须保留；
+- `paper_trading` 里 `style == "sector"` / `main_force` 的候选与入场分支**仍被用户策略使用**：`strategy_creation_preview` 的风格别名表仍接受 `板块轮动`（sector rotation）与 `超强主力股`（flow momentum），用户可创建该 archetype 的策略并进入正式周期；这些账户的 `source_strategy` 是用户自定义 id，但 `style` 命中同一分支。
+- 退役的两个内置账户 `sector_rotation` / `main_force_top10` 均为 `paused`，无持仓、无订单、无用户克隆引用其 `implementation_key`。
+
+因此删除这 297 行会让**用户自建的板块轮动/主力类策略静默失去候选与入场路径**，
+属于"猜测当证据"。本轮结论：**不删**；退役内置账户的新入场已被周期参与集合
+（`paper_cycle_ownership`）与生命周期关闭，无需靠删代码实现关闭。
+
+如果将来要删，前置条件是：①用户策略的 style 语义收敛到仍在役的 archetype，
+或②把 sector/main_force 候选与入场实现迁到独立 owner 模块并由用户策略显式引用。

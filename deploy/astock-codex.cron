@@ -79,9 +79,12 @@ HOME=/opt/astock-codex
 5,20,35,50 23,0-8 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/opt/astock-codex/reports/history-recovery.log 2>&1
 
 # 候选池新闻与全市场重大事件雷达：盘前、午间、盘后各一次。
+# 22:00 追加一次：晚间公告是集中披露时段，18:45 之后仍会有新公告；该任务
+# 只固化事件/公告证据，不产生订单，因此放在收盘后任意时刻都安全。
 15 8 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot premarket >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
 15 12 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot noon >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
 45 18 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot after-close >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
+0 22 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot after-close >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
 
 # 午间自进化观测：只保存盘中画像，不把未收盘数据混入奖励或调参。
 5 12 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive.lock docker exec astock-task-worker python backend/adaptive_runner.py --session midday --trigger scheduled-midday >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1

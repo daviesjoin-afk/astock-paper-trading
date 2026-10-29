@@ -7,35 +7,62 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+import data_paths
 import market_data_contract as MDC
 import market_data_service as MDSvc
+import marketdata_cache as MCache
 from marketdata_transport import http_get
 import tradability_archive as TA
 import tradability_ingestion as TI
+from env_utils import env_float
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 STATUS_MAX_AGE_SECONDS = 120
+
+
+# 停牌/上市日/ST 名单是低频状态：交易所当天只会增删少量记录，盘中每 3 分钟
+# 重拉一次完整停牌报表没有收益（一天 80 次），却把 quote.tradability 拖到
+# 数秒到三十秒。缓存窗口取 15 分钟（一天约 16 次），仍能在一个扫描周期内
+# 发现新停牌；状态本身的新鲜度仍由 `STATUS_MAX_AGE_SECONDS` 对最终成交
+# 观测单独校验，缓存只复用**报表内容**，不延后 observed_at。
+STATUS_CACHE_TTL_SECONDS = env_float("ASTOCK_TRADABILITY_STATUS_TTL_SECONDS", 900, minimum=1.0)
+STATUS_CACHE_DIR = os.path.join(data_paths.data_dir(), "tradability_status")
 _CACHE = {}
 _LOCK = threading.Lock()
+_FETCH_LOCK = threading.Lock()
 PROFILE_SOURCE = "eastmoney_stock_profile+complete_suspension_report+verified_quote"
 MARKET_SOURCE = "current_full_market_membership+complete_suspension_report+verified_quote_range"
 
 
 def _get(key, url, params):
-    with _LOCK:
-        cached = _CACHE.get(key)
-    if cached and time.monotonic() - cached[0] < 60:
-        return cached[1], cached[2]
-    data = json.loads(http_get(url, params=params, timeout=3, retries=1))
-    observed = dt.datetime.now(TZ).isoformat(timespec="microseconds")
-    with _LOCK:
-        _CACHE[key] = (time.monotonic(), data, observed)
-    return data, observed
+    """Read one low-frequency status payload, sharing it across runner processes.
+
+    Each 3-minute scan is a fresh process, so an in-memory-only TTL never skips
+    a fetch. The payload is published to ``data_cache`` with the same
+    single-flight + atomic-replace contract used by other provider caches; the
+    caller still applies its own 120-second observation gate.
+    """
+    os.makedirs(STATUS_CACHE_DIR, exist_ok=True)
+    path = os.path.join(
+        STATUS_CACHE_DIR,
+        hashlib.sha1(json.dumps(key, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16] + ".json",
+    )
+
+    def fetch():
+        payload = json.loads(http_get(url, params=params, timeout=3, retries=1))
+        return {"data": payload,
+                "observed": dt.datetime.now(TZ).isoformat(timespec="microseconds")}
+
+    value = MCache.persistent_cached(
+        _CACHE, _LOCK, _FETCH_LOCK, key, path, STATUS_CACHE_TTL_SECONDS, fetch,
+        lambda item: isinstance(item, dict) and "data" in item,
+    )
+    return value["data"], value["observed"]
 
 
 def _suspensions(day):

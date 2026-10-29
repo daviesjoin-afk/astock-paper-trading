@@ -4,6 +4,7 @@
 import datetime as dt
 import contextvars
 import copy
+import hashlib
 import os, json, time, threading, uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,7 @@ import marketdata_feeds as MDF
 import marketdata_normalizers as MN
 import marketdata_providers as MP
 import data_paths
+from env_utils import env_float
 from marketdata_transport import (
     HEADERS,
     _session,
@@ -37,6 +39,21 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # runtime state instead of splitting it between the source tree and an
 # isolated directory.
 CACHE_DIR = data_paths.data_dir()
+
+
+# 低频事件源的缓存窗口。7x24 快讯每轮扫描都会整页重拉；公告按持仓代码
+# 单独拉取。两者都属于"分钟级变化、分钟级可见"的数据，没必要在 3 分钟一轮
+# 的扫描里各拉一次。新闻保留 5 分钟（风控负面事件仍需较快可见），公告保留
+# 30 分钟（公告发布本身有交易所披露节奏，且重抓同一批文本没有新信息）。
+NEWS_CACHE_TTL_SECONDS = env_float("ASTOCK_NEWS_CACHE_TTL_SECONDS", 300, minimum=1.0)
+ANNOUNCEMENT_CACHE_TTL_SECONDS = env_float("ASTOCK_ANNOUNCEMENT_CACHE_TTL_SECONDS", 1800, minimum=1.0)
+# 每个 cron 轮次都是新进程：只在内存里做 TTL 等于每次重新联网。新闻与公告
+# 结果落到 data_cache，并用 flock single-flight 防止多个容器同时抓同一批。
+NEWS_CACHE_PATH = os.path.join(CACHE_DIR, "fast_news.json")
+ANNOUNCEMENT_CACHE_DIR = os.path.join(CACHE_DIR, "announcements")
+_news_fetch_lock = threading.Lock()
+_announcement_fetch_lock = threading.Lock()
+
 KLINE_DIR = os.path.join(CACHE_DIR, "klines")
 KLINE_MANIFEST_PATH = os.path.join(CACHE_DIR, "kline_manifest.json")
 # Full-market and risk-proxy snapshots must never overwrite each other.  The
@@ -90,6 +107,14 @@ def health_probe_scope():
 
 def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
+
+
+def _persistent_list(key, path, ttl, fn, fetch_lock):
+    """跨进程复用列表型低频数据；空列表也是有效答案。"""
+    return MDC.persistent_cached(
+        _mem_cache, _cache_lock, fetch_lock, key, path, ttl, fn,
+        lambda value: isinstance(value, list), allow_empty=True,
+    )
 
 
 def cached_age_seconds(key):
@@ -325,17 +350,23 @@ def fetch_sector_flow(sector_type="industry"):
             "fields": "f12,f14,f2,f3,f62,f66,f72,f78,f84,f124,f184,f204,f205",
         }
         # 多主机轮换 + 重试：主域名对该接口间歇性返回空（与全市场快照同样的问题）
+        # 但这里是板块轮动的一个输入，单次 15 秒 × 2 次重试 × 3 主机 = 90 秒
+        # 的尾部等待没有意义；改成 6 秒/0 重试 + 12 秒总预算，超时即按缺失处理。
         diff = []
+        deadline = time.monotonic() + 12.0
         for attempt in range(2):
             for host in ["push2delay.eastmoney.com", "push2.eastmoney.com", "82.push2.eastmoney.com"]:
+                if time.monotonic() >= deadline:
+                    break
                 try:
-                    j = _get_json(f"https://{host}/api/qt/clist/get", params)
+                    j = _get_json(f"https://{host}/api/qt/clist/get", params,
+                                  timeout=6, retries=0)
                     diff = (j or {}).get("data", {}).get("diff", []) or []
                 except Exception:
                     diff = []
                 if diff:
                     break
-            if diff:
+            if diff or time.monotonic() >= deadline:
                 break
             time.sleep(0.3)
         rows = []
@@ -663,7 +694,8 @@ _hot_sector_fetch_state = {
 def _sanitize_market_row(row):
     return MN.sanitize_market_row(row)
 
-def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
+def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False,
+                 timeout=10, retries=1):
     """分页拉取 clist，并可返回分页完整性元数据。
 
     ``clist`` 会在单页失败时返回一个看似合法的残片。历史调用方仍默认
@@ -683,6 +715,8 @@ def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
         fs=SNAP_FS,
         cooldown_base=_CLIST_HOST_COOLDOWN_BASE,
         max_cooldown=_CLIST_HOST_MAX_COOLDOWN,
+        timeout=timeout,
+        retries=retries,
     )
 
 def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
@@ -1023,14 +1057,16 @@ def _fresh_full_snapshot_from_disk(max_age):
             except (TypeError, ValueError):
                 # Preserve the previous mtime fallback for malformed quote_at.
                 pass
-        if payload.get("source") in {"tencent_public_quote_full_snapshot", "public_quote_full_snapshot"}:
-            try:
-                from market_data_contract import fresh_ratio
-            except ImportError:
-                from .market_data_contract import fresh_ratio
-            ratio = fresh_ratio(rows, dt.datetime.now(dt.timezone.utc), max_age, max_future_seconds=120)
-            if ratio is None or ratio < 0.90:
-                return None
+        # 缓存准入必须和消费契约使用同一套横截面时效规则：只看"最新一行"
+        # 会把 3999 条 600 秒前的旧数据 + 1 条刚更新当成新鲜，随后才被
+        # market_data_service 判 stale。东财快照和腾讯价格快照都要检查覆盖率。
+        try:
+            from market_data_contract import fresh_ratio
+        except ImportError:
+            from .market_data_contract import fresh_ratio
+        ratio = fresh_ratio(rows, dt.datetime.now(dt.timezone.utc), max_age, max_future_seconds=120)
+        if ratio is None or ratio < 0.90:
+            return None
         return rows
     except (OSError, ValueError, TypeError):
         return None
@@ -1084,7 +1120,10 @@ def fetch_hot_sector_snapshot(pages=4):
         fields = "f2,f3,f8,f12,f14,f62,f100,f184"
         global _hot_sector_fetch_state
         requested_pages = max(1, min(int(pages), 6))
-        raw_meta = _fetch_clist(fields, fid="f3", pages=requested_pages, return_meta=True)
+        # 热点板块只是候选评分的一个输入（4 页、可降级），不值得为它保留
+        # 「3 主机 × 2 次 × 10 秒」的尾部等待；5 秒/0 重试仍保留主机轮换。
+        raw_meta = _fetch_clist(fields, fid="f3", pages=requested_pages,
+                                return_meta=True, timeout=5, retries=0)
         if not isinstance(raw_meta, dict):
             raw_meta = {"rows": raw_meta or [], "complete": False,
                         "pages_expected": requested_pages, "pages_ok": 0,
@@ -1202,9 +1241,20 @@ def _sina_realtime_feed():
     )
 
 
+def _ths_realtime_feed():
+    return MDF.ThsRealtimeFeed(
+        http_get=http_get,
+        parser=MP.parse_ths_realtime_text,
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+    )
+
+
 def _independent_realtime_feed():
+    # 腾讯 → 新浪 → 同花顺。前两家都缺价时才启用同花顺（单票一请求，上限 8 只），
+    # 让"独立核验源整体不可用"不再等于"只能按单一源价格决策"。
     return MDF.DataFeedChain(
-        (_tencent_realtime_feed(), _sina_realtime_feed()),
+        (_tencent_realtime_feed(), _sina_realtime_feed(), _ths_realtime_feed()),
         reset_data_source=reset_data_source,
         sleep=time.sleep,
         retry_last_feed=True,
@@ -1677,6 +1727,23 @@ def fetch_kline(code, beg="20230101", end="20500101", klt=101, fqt=1, secid=None
 def kline_cache_path(code):
     return os.path.join(KLINE_DIR, f"{code}.csv")
 
+def completed_kline(code, cutoff_date, *, inclusive=True):
+    """K 线 owner：只返回截止指定完整交易日的日线。
+
+    盘中"当日 K 线"是半根，禁止被当成完整收盘数据使用；这个截断语义原来
+    只存在于交易引擎内部，下层模块必须能自己取到同一份事实。
+    """
+    frame = load_cached_kline(str(code))
+    if frame is None or frame.empty:
+        return frame
+    cutoff = dt.date.fromisoformat(str(cutoff_date)[:10])
+    try:
+        mask = frame.index.date <= cutoff if inclusive else frame.index.date < cutoff
+        return frame.loc[mask].copy()
+    except Exception:
+        return frame
+
+
 def load_cached_kline(code):
     p = kline_cache_path(code)
     if os.path.exists(p):
@@ -1991,7 +2058,7 @@ def fetch_fast_news(page_size=50):
                 "evidence_grade": "C",
             })
         return output
-    return _cached("news", 120, _do)
+    return _persistent_list("news", NEWS_CACHE_PATH, NEWS_CACHE_TTL_SECONDS, _do, _news_fetch_lock)
 
 
 def fetch_company_announcements(codes, page_size=100):
@@ -2042,7 +2109,11 @@ def fetch_company_announcements(codes, page_size=100):
             })
         return output
 
-    return _cached("announcements:" + ",".join(normalized), 300, _do)
+    key = "announcements:" + ",".join(normalized)
+    os.makedirs(ANNOUNCEMENT_CACHE_DIR, exist_ok=True)
+    path = os.path.join(
+        ANNOUNCEMENT_CACHE_DIR, hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".json")
+    return _persistent_list(key, path, ANNOUNCEMENT_CACHE_TTL_SECONDS, _do, _announcement_fetch_lock)
 
 
 def fetch_hot_rank(topn=100):

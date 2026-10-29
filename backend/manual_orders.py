@@ -23,6 +23,23 @@ import portfolio_allocation_weights as PAW
 import portfolio_runtime as PRuntime
 import portfolio_runtime_service as PRS
 import runtime_settings as RSET
+# A1：纯工具（JSON/数值）各有独立 owner，直接 import，不再经
+# `paper_trading` 的全局桥转发一层。时钟（_now/_date）仍作为**可替换的
+# 窄能力**注入：回放与测试需要固定时间点，那是能力而不是实现细节。
+from paper_common import dump_json as _json, load_json as _loads
+# A1 phase 2：状态词表、整手数量与共享池敞口各自由其 owner 提供。
+from entry_lifecycle import (
+    ENTRY_FREEZE_ENV,
+    ENTRY_FROZEN_WAITLIST_STATUS,
+    ENTRY_RETRY_ORDER_STATUSES,
+)
+from paper_shared_cash import SHARED_POOL_MAX_EXPOSURE
+from paper_trading_rules import LOT_SIZE, asset_type as _asset_type, limit_pct as _limit_pct
+# A1 phase 3：查询行、K 线截断与持仓天数各有 owner，vertical 直接取用。
+from data_fetcher import completed_kline as _completed_kline
+from paper_repository import rows as _rows
+from paper_risk_evidence import hold_days as _hold_days
+from paper_numeric import num as _num
 
 # 这些能力有**独立 owner**（决策引擎、组合分配/运行时、预占、运行时设置），
 # 手单直接依赖 owner，而不是经 `paper_trading` 的全局桥转发一遍。桥只保留
@@ -39,33 +56,21 @@ from typing import Any, Callable
 class ManualOrderDependencies:
     """Explicit capabilities supplied by the application composition root."""
     ACTIVE_ACCOUNT_IDS: Any
-    ENTRY_FREEZE_ENV: Any
-    ENTRY_FROZEN_WAITLIST_STATUS: Any
-    ENTRY_RETRY_ORDER_STATUSES: Any
-    LOT_SIZE: Any
     MANUAL_EXECUTION_RETRY_STATUS: Any
-    SHARED_POOL_MAX_EXPOSURE: Any
     STRATEGY_EXECUTION_RETRY_STATUS: Any
     _assert_active_lease: Any
     _assert_order_execution_cycle: Any
-    _asset_type: Any
     _audit: Any
     _build_portfolio_entry_plan: Any
-    _completed_kline: Any
     _date: Any
     _db: Any
     _entry_freeze_enabled: Any
     _entry_frozen_reason: Any
     _existing_position_addition_gate: Any
     _finish_capital_reservation: Any
-    _hold_days: Any
-    _json: Any
     _lease_lost: Any
-    _limit_pct: Any
-    _loads: Any
     _market_state: Any
     _now: Any
-    _num: Any
     _order_cycle_id: Any
     _pending_position_slots: Any
     _position_rows: Any
@@ -76,7 +81,6 @@ class ManualOrderDependencies:
     _risk_log: Any
     _risk_profile: Any
     _rollback_slot_borrow: Any
-    _rows: Any
     _shared_account_exposure: Any
     _shared_cash: Any
     _shared_risk_state: Any
@@ -109,23 +113,15 @@ def _manual_order_plan(
 ):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
+    _order_cycle_id = deps._order_cycle_id
     ACTIVE_ACCOUNT_IDS = deps.ACTIVE_ACCOUNT_IDS
-    ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
-    LOT_SIZE = deps.LOT_SIZE
-    SHARED_POOL_MAX_EXPOSURE = deps.SHARED_POOL_MAX_EXPOSURE
     _spec_for = deps._spec_for
-    _asset_type = deps._asset_type
-    _completed_kline = deps._completed_kline
     _date = deps._date
     _build_portfolio_entry_plan = deps._build_portfolio_entry_plan
     _entry_freeze_enabled = deps._entry_freeze_enabled
     _entry_frozen_reason = deps._entry_frozen_reason
     _existing_position_addition_gate = deps._existing_position_addition_gate
-    _hold_days = deps._hold_days
-    _limit_pct = deps._limit_pct
     _market_state = deps._market_state
-    _num = deps._num
     _pending_position_slots = deps._pending_position_slots
     _position_rows = deps._position_rows
     _price_aware_qty = deps._price_aware_qty
@@ -315,7 +311,8 @@ def _manual_order_plan(
             code_values[symbol] = code_values.get(symbol, 0.0) + amount_value
             industry = industry_for_position.get((account_key, symbol), "未知")
             industries[industry] = industries.get(industry, 0.0) + amount_value
-    risk_state = _shared_risk_state(conn, account, nav, day)
+    # A4：风险基线绑定**明确周期**（写时周期事实），不再默认"当前周期"。
+    risk_state = _shared_risk_state(conn, account, nav, day, cycle_id=_order_cycle_id(conn))
     plan["risk"]["account"] = risk_state
     plan["risk"]["strategy_budget"] = strategy_budget
     plan["nav"] = round(nav, 2)
@@ -429,7 +426,7 @@ def _manual_order_plan(
                 "code": code, "name": local_quote.get("name"),
                 "cost": position.get("cost") if position else None,
                 "peak_price": position.get("peak_price") if position else None,
-                "hold_days": _hold_days(position, day) if position else 0,
+                "hold_days": _hold_days(position, day, _completed_kline) if position else 0,
             },
             kline=_completed_kline(code, day, inclusive=False), snap=local_quote,
             overseas_gate={"light": "unknown"}, news_hits=[],
@@ -618,10 +615,8 @@ def _commit_strategy_buy(
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
     _assert_active_lease = deps._assert_active_lease
     _finish_capital_reservation = deps._finish_capital_reservation
-    _json = deps._json
     _lease_lost = deps._lease_lost
     _now = deps._now
-    _num = deps._num
     _order_cycle_id = deps._order_cycle_id
     _risk_log = deps._risk_log
     _strategy_stamp = deps._strategy_stamp
@@ -765,7 +760,6 @@ def commit_strategy_entry_fill(
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     _assert_active_lease = deps._assert_active_lease
-    _json = deps._json
     _lease_lost = deps._lease_lost
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
@@ -864,23 +858,19 @@ def submit_manual_order(
 ):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
     MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
     _audit = deps._audit
     _date = deps._date
     _db = deps._db
     _entry_frozen_reason = deps._entry_frozen_reason
     _finish_capital_reservation = deps._finish_capital_reservation
-    _json = deps._json
     _market_state = deps._market_state
     _now = deps._now
-    _num = deps._num
     _order_cycle_id = deps._order_cycle_id
     _quotes = deps._quotes
     _record_nav = deps._record_nav
     _reserve_shared_capital = deps._reserve_shared_capital
     _risk_log = deps._risk_log
-    _rows = deps._rows
     _strategy_stamp = deps._strategy_stamp
     init_db = deps.init_db
     deps = _dependencies()
@@ -1022,7 +1012,6 @@ def submit_manual_order(
 def cancel_manual_order(order_id):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ENTRY_RETRY_ORDER_STATUSES = deps.ENTRY_RETRY_ORDER_STATUSES
     _audit = deps._audit
     _db = deps._db
     _finish_capital_reservation = deps._finish_capital_reservation
@@ -1122,8 +1111,6 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     deps = _dependencies()
     _audit = deps._audit
     _finish_capital_reservation = deps._finish_capital_reservation
-    _json = deps._json
-    _loads = deps._loads
     _now = deps._now
     _risk_log = deps._risk_log
     order_id = int(order["id"])
@@ -1175,9 +1162,6 @@ def _terminalize_cycle_stale_order(conn, order, exc):
 def process_pending_manual_orders(asof_date=None):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    ENTRY_FREEZE_ENV = deps.ENTRY_FREEZE_ENV
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
-    ENTRY_RETRY_ORDER_STATUSES = deps.ENTRY_RETRY_ORDER_STATUSES
     MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
     _assert_active_lease = deps._assert_active_lease
     _audit = deps._audit
@@ -1186,16 +1170,12 @@ def process_pending_manual_orders(asof_date=None):
     _entry_freeze_enabled = deps._entry_freeze_enabled
     _entry_frozen_reason = deps._entry_frozen_reason
     _finish_capital_reservation = deps._finish_capital_reservation
-    _json = deps._json
     _lease_lost = deps._lease_lost
-    _loads = deps._loads
     _market_state = deps._market_state
-    _num = deps._num
     _quotes = deps._quotes
     _record_nav = deps._record_nav
     _reserve_shared_capital = deps._reserve_shared_capital
     _risk_log = deps._risk_log
-    _rows = deps._rows
     init_db = deps.init_db
     deps = _dependencies()
     _ReservationCycleMismatch = ReservationCycleMismatch

@@ -95,8 +95,7 @@ class StrategyPlugin:
     def _run_candidate(self, table, **kwargs):
         if self.candidate_runner is not None:
             return self.candidate_runner(table, **kwargs)
-        import strategies as S
-        return S._run_strategy_legacy(self.selector_id, table, **kwargs)
+        return default_runner()(self.selector_id, table, **kwargs)
 
     def _validate_candidate_output(self, result) -> dict[str, Any]:
         if not isinstance(result, Mapping):
@@ -233,6 +232,30 @@ class StrategyPlugin:
 
 _PLUGINS: dict[str, StrategyPlugin] = {}
 _PLUGINS_BY_SELECTOR: dict[str, StrategyPlugin] = {}
+_DEFAULT_RUNNER: CandidateRunner | None = None
+
+
+def bind_default_runner(runner: CandidateRunner) -> None:
+    """Bind the native selector algorithm once, from its owner module.
+
+    This table must not import the algorithm module: production dispatch
+    (``strategies.run_strategy``) lives there and delegates into this table, so a
+    reverse import makes the two modules load-order dependent.  Plugins that do
+    declare their own ``candidate_runner`` never consult this binding.
+    """
+    global _DEFAULT_RUNNER
+    if not callable(runner):
+        raise TypeError("default strategy runner must be callable")
+    _DEFAULT_RUNNER = runner
+
+
+def default_runner() -> CandidateRunner:
+    if _DEFAULT_RUNNER is None:
+        raise RuntimeError(
+            "strategy plugin default runner is not bound; the algorithm owner "
+            "(strategies) must be imported before plugins dispatch natives"
+        )
+    return _DEFAULT_RUNNER
 
 
 def register_plugin(plugin: StrategyPlugin, *, replace: bool = False) -> StrategyPlugin:

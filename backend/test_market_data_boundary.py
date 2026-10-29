@@ -402,6 +402,22 @@ class MarketDataContractTests(unittest.TestCase):
         )
         self.assertEqual(MDC.STATUS_FRESH, ok.status)
 
+    def test_MD19_local_fetch_time_is_not_source_freshness(self):
+        """只有本地抓取时刻（observed_at）、没有 quote_at 的行不算新鲜。
+
+        旧实现把 observed_at 当 fresh_ratio 的输入，于是"3999 条缺来源时间
+        + 1 条新鲜行情"会被算成 100% 新鲜；本地采集时刻不能证明行情产生时刻。
+        """
+        rows = [{"code": str(600000 + i), "observed_at": _ago(5)} for i in range(3999)]
+        rows.append({"code": "699999", "quote_at": _ago(5)})
+        reading = MDC.classify(
+            _snapshot(rows=rows), MDC.LIVE_MARKET_POLICY, now=NOW,
+        )
+        self.assertNotEqual(MDC.STATUS_FRESH, reading.status)
+        ratio = reading.snapshot.verification_detail.get("fresh_ratio")
+        self.assertIsNotNone(ratio)
+        self.assertLess(ratio, MDC.CROSS_SECTION_MIN_FRESH_RATIO)
+
     def test_MD19_point_kind_without_ratio_requirement_still_works(self):
         """没有比例要求的 policy（单点事实）仍按最新一条判定。"""
         reading = MDC.classify(
@@ -1166,6 +1182,42 @@ class MarketDataArchitectureGuardTests(unittest.TestCase):
                 "fresh", dumped,
                 "health 里重新出现了内联 fresh 判决",
             )
+
+
+class CachedFullSnapshotAgeTests(unittest.TestCase):
+    """缓存准入与消费契约必须用同一套横截面时效判据（MD 审查 P1-2）。"""
+
+    def _write(self, path, rows):
+        import json
+        payload = _payload(rows)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        os.utime(path, (now, now))
+
+    def test_mixed_age_cache_is_rejected_before_the_service_sees_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "snapshot.json")
+            now = dt.datetime.now(dt.timezone.utc)
+            old = (now - dt.timedelta(seconds=600)).isoformat()
+            fresh = (now - dt.timedelta(seconds=5)).isoformat()
+            rows = [{"code": str(600000 + i), "quote_at": old, "price": 10.0}
+                    for i in range(dfc.FULL_MARKET_MIN_ROWS - 1)]
+            rows.append({"code": "699999", "quote_at": fresh, "price": 10.0})
+            self._write(path, rows)
+            with mock.patch.object(dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH", path):
+                self.assertIsNone(
+                    dfc._fresh_full_snapshot_from_disk(240),
+                    "1 条新鲜 + 3999 条旧的缓存仍被准入，服务层随后才判 stale",
+                )
+
+    def test_all_fresh_cache_is_still_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "snapshot.json")
+            rows = _full_rows(quote_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            self._write(path, rows)
+            with mock.patch.object(dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH", path):
+                self.assertEqual(rows, dfc._fresh_full_snapshot_from_disk(240))
 
 
 if __name__ == "__main__":

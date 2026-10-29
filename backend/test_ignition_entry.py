@@ -264,6 +264,54 @@ class IgnitionShadowMigrationTests(unittest.TestCase):
         self.assertEqual(row, (0, 1, 3.40, 0))
 
 
+class IgnitionShadowLockScopeTests(unittest.TestCase):
+    """MD P2：影子回填不得在 SQLite 写事务里等待行情。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "paper.sqlite3")
+        self.patch = mock.patch.object(P, "DB_PATH", self.path)
+        self.patch.start()
+        conn = sqlite3.connect(self.path)
+        P._ensure_ignition_shadow_table(conn)
+        recorded = (dt.datetime.now() - dt.timedelta(minutes=31)).isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO paper_ignition_shadow(day,bucket,code,recorded_at,
+                   price,pct,old_rule_passed,ignition_passed)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            ("2026-10-28", "intraday:202610281030", "600000", recorded,
+             10.0, 2.0, 1, 0),
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def test_quote_fetch_runs_before_the_write_transaction(self):
+        def quote_fetch(codes):
+            # 旧实现此时持有写锁；第二个连接会 database is locked。
+            other = sqlite3.connect(self.path, timeout=0.2)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.execute("UPDATE paper_ignition_shadow SET pct=pct WHERE 0")
+                other.commit()
+            finally:
+                other.close()
+            return {code: {"price": 12.0} for code in codes}
+
+        result = P._ignition_shadow_backfill(quote_fetch=quote_fetch)
+        self.assertNotIn("error", result, result)
+        self.assertEqual(1, result["updated"])
+        conn = sqlite3.connect(self.path)
+        row = conn.execute(
+            "SELECT price_30m, resolved FROM paper_ignition_shadow"
+        ).fetchone()
+        conn.close()
+        self.assertEqual((12.0, 0), row)
+
+
 class MainForceGateRoutingTests(unittest.TestCase):
     def test_ignition_zone_routes_instead_of_rejecting(self):
         account = {"id": P.MAIN_FORCE_STRATEGY_ID}

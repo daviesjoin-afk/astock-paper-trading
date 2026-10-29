@@ -351,13 +351,16 @@ def refresh_snapshot(
         # prices are an independent fallback for the price cross-section, not a
         # replacement for the missing flow / valuation / sector fields, so the
         # persisted artifact is explicitly labelled price-only.
+        #
+        # 证券集合从 ``data_universe_store`` 取：那是持久化基础库的读取 owner，
+        # 本模块因此不必反向 import ``universe`` 构建流程。
         try:
-            import universe as universe_module
+            import data_universe_store as universe_store
         except ImportError:
-            from . import universe as universe_module
+            from . import data_universe_store as universe_store
         try:
             codes = [
-                str(row.get("code") or "") for row in universe_module.load_universe()
+                str(row.get("code") or "") for row in universe_store.load_formal_universe()
             ]
             rows = dfc_module.fetch_tencent_market_snapshot(
                 codes, max_age=max_age, now=deadline, force=force,

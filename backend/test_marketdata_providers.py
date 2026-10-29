@@ -92,5 +92,30 @@ class MarketDataProviderParserTests(unittest.TestCase):
         self.assertEqual(providers.parse_sina_realtime_text('var hq_str_sz000001="a,b";'), [])
 
 
+
+class ThsRealtimeParserTests(unittest.TestCase):
+    PAYLOAD = (
+        'quotebridge_v6_time_hs_600000_last({"hs_600000":{'
+        '"name":"\u6d66\u53d1\u94f6\u884c","pre":"9.82","date":"20261028",'
+        '"data":"0930,9.80,1,9.800,1;1404,9.84,2,9.840,2"}})'
+    )
+
+    def test_last_minute_price_and_timestamp(self):
+        rows = providers.parse_ths_realtime_text(self.PAYLOAD)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["code"], "600000")
+        self.assertAlmostEqual(row["price"], 9.84)
+        self.assertAlmostEqual(row["pct"], 0.2037, places=3)
+        self.assertEqual(row["quote_at"], "2026-10-28T14:04:00+08:00")
+        self.assertEqual(row["source"], "ths_public_quote")
+
+    def test_allowed_codes_filter_and_malformed_payload(self):
+        self.assertEqual(providers.parse_ths_realtime_text(
+            self.PAYLOAD, allowed_codes=["000001"]), [])
+        self.assertEqual(providers.parse_ths_realtime_text("not-json"), [])
+        self.assertEqual(providers.parse_ths_realtime_text(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

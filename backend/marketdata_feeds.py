@@ -12,7 +12,35 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from env_utils import env_float, env_int
+
 QuoteRow = dict[str, Any]
+
+
+# 单个报价 adapter 的**总尝试预算**（秒）。adapter 拥有主机轮换与重试：
+# 3 次尝试 × 3 台主机 × 8 秒超时最坏是 72 秒，而盘中一轮只值 180 秒。
+# 预算只限制"愿意等多久"，不改变失败后的 fail-closed：耗尽即返回当前已取到
+# 的行（通常为空），由调用方按覆盖不足处理。0 表示不设预算（测试/离线）。
+QUOTE_TRANSPORT_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_BUDGET_SECONDS", 12.0, minimum=0.0)
+# 有序回退链（腾讯→新浪→末源重试）的整体预算；避免每个源各用一份预算后
+# 又叠成一整轮超时。
+QUOTE_CHAIN_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_CHAIN_BUDGET_SECONDS", 18.0, minimum=0.0)
+# 小批（持仓/候选）还需要一个**整次调用**的绝对预算，否则 25 个批次各用
+# 一份 12 秒预算仍会叠成几分钟。全市场大批（>400 只）保持每批预算，
+# 避免把合法的大横截面截断。
+QUOTE_TOTAL_BUDGET_SECONDS = env_float("ASTOCK_QUOTE_TOTAL_BUDGET_SECONDS", 18.0, minimum=0.0)
+QUOTE_TOTAL_BUDGET_MAX_CODES = env_int("ASTOCK_QUOTE_TOTAL_BUDGET_MAX_CODES", 400, minimum=1)
+
+
+def _budget_exhausted(started, budget):
+    return budget > 0 and (time.monotonic() - started) >= budget
+
+
+def _call_budget(normalized):
+    """小批使用整次调用预算；大批按批预算，避免截断全市场横截面。"""
+    if QUOTE_TOTAL_BUDGET_SECONDS <= 0 or len(normalized) > QUOTE_TOTAL_BUDGET_MAX_CODES:
+        return 0.0
+    return QUOTE_TOTAL_BUDGET_SECONDS
 
 
 @runtime_checkable
@@ -237,8 +265,17 @@ class EastmoneyRealtimeFeed:
             return self._empty_meta(normalized)
         transport_succeeded = False
         last_transport_error: BaseException | None = None
+        budget = QUOTE_TRANSPORT_BUDGET_SECONDS
+        overall_started = time.monotonic()
+        total_budget = _call_budget(normalized)
         try:
             for offset in range(0, len(normalized), batch_size):
+                # 预算是**每批**的，不是整次调用的：全市场扫描器会一次请求
+                # 5000 只（25 批），整次预算会把它截成不完整横截面；而单批
+                # 上限保证任何一批都不会烧掉 9 次超时。
+                if _budget_exhausted(overall_started, total_budget):
+                    break
+                started = time.monotonic()
                 batch = normalized[offset:offset + batch_size]
                 params = {
                     "pn": 1, "pz": len(batch), "np": 1, "fltt": 2, "invt": 2,
@@ -248,8 +285,12 @@ class EastmoneyRealtimeFeed:
                 batch_by_code: dict[str, QuoteRow] = {}
                 attempts_used = 0
                 for attempt in range(attempts):
+                    if _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
+                        break
                     attempts_used = attempt + 1
                     for host_index in range(len(host_list)):
+                        if _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
+                            break
                         host = host_list[(offset // batch_size + host_index + attempt) % len(host_list)]
                         try:
                             payload = self.get_json(
@@ -272,18 +313,23 @@ class EastmoneyRealtimeFeed:
                             if len(batch_by_code) >= len(batch):
                                 break
                         self.reset_data_source("实时行情源空响应")
-                        self.sleep(0.25 * (attempt + 1))
+                        if not _budget_exhausted(started, budget):
+                            self.sleep(0.25 * (attempt + 1))
                     if len(batch_by_code) >= len(batch):
                         break
                 missing = [code for code in batch if code not in batch_by_code]
                 if missing and len(missing) > 1:
                     small_size = max(1, int(self.small_batch_size))
                     for start in range(0, len(missing), small_size):
+                        if _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
+                            break
                         small = missing[start:start + small_size]
                         small_params = dict(
                             params, secids=",".join(self.secid(code) for code in small), pz=len(small),
                         )
                         for host in host_list:
+                            if _budget_exhausted(started, budget):
+                                break
                             try:
                                 payload = self.get_json(
                                     f"https://{host}/api/qt/ulist.np/get", small_params,
@@ -357,12 +403,18 @@ class TencentRealtimeFeed:
         rows_by_code: dict[str, QuoteRow] = {}
         transport_succeeded = False
         last_transport_error: BaseException | None = None
+        budget = QUOTE_TRANSPORT_BUDGET_SECONDS
+        overall_started = time.monotonic()
+        total_budget = _call_budget(normalized)
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
+                if _budget_exhausted(overall_started, total_budget):
+                    break
+                started = time.monotonic()
                 batch = normalized[start:start + max(1, int(self.batch_size))]
                 pending = list(batch)
                 for attempt in range(max(1, int(self.attempts))):
-                    if not pending:
+                    if not pending or _budget_exhausted(started, budget) or _budget_exhausted(overall_started, total_budget):
                         break
                     try:
                         text = self.http_get(
@@ -381,7 +433,8 @@ class TencentRealtimeFeed:
                     if pending and attempt < max(1, int(self.attempts)) - 1:
                         if not text:
                             self.reset_data_source("腾讯个股独立行情源空响应")
-                        self.sleep(0.25 * (attempt + 1))
+                        if not _budget_exhausted(started, budget):
+                            self.sleep(0.25 * (attempt + 1))
         except Exception as exc:
             self.health.record_exception(self.name, exc, self.reliability, len(normalized))
             return []
@@ -418,11 +471,19 @@ class SinaRealtimeFeed:
         rows_by_code: dict[str, QuoteRow] = {}
         transport_succeeded = False
         last_transport_error: BaseException | None = None
+        budget = QUOTE_TRANSPORT_BUDGET_SECONDS
+        overall_started = time.monotonic()
+        total_budget = _call_budget(normalized)
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
+                if _budget_exhausted(overall_started, total_budget):
+                    break
+                started = time.monotonic()
                 batch = normalized[start:start + max(1, int(self.batch_size))]
                 text = ""
                 for attempt in range(max(1, int(self.attempts))):
+                    if _budget_exhausted(started, budget):
+                        break
                     try:
                         response = self.session_factory().get(
                             "https://hq.sinajs.cn/list=" + ",".join(market_symbol(code) for code in batch),
@@ -462,6 +523,79 @@ class SinaRealtimeFeed:
 
 
 @dataclass(frozen=True)
+class ThsRealtimeFeed:
+    """同花顺分时快照：独立第四源，仅作为最后缺口兜底。
+
+    同花顺没有批量报价接口，只能一只一请求；因此严格限制 ``max_codes``，
+    且只在腾讯、新浪都缺价时由 ``DataFeedChain`` 调用。它是价格/时间戳的
+    独立证据，不参与成交额等没有公开单位契约的字段。
+    """
+
+    http_get: Callable[..., str]
+    parser: Callable[..., list[QuoteRow]]
+    reset_data_source: Callable[..., Any]
+    sleep: Callable[[float], Any] = time.sleep
+    max_codes: int = 8
+    attempts: int = 2
+    name: str = "ths_public_quote"
+    reliability: FeedReliabilityPolicy = FeedReliabilityPolicy(timeout_seconds=3.0)
+    health: FeedHealthRegistry = field(default_factory=lambda: FEED_HEALTH, repr=False, compare=False)
+
+    def fetch_realtime(self, codes: Sequence[str]) -> list[QuoteRow]:
+        normalized = normalize_codes(codes)
+        if not normalized or not self.health.allow(self.name):
+            return []
+        if len(normalized) > max(1, int(self.max_codes)):
+            return []
+        rows_by_code: dict[str, QuoteRow] = {}
+        transport_succeeded = False
+        last_transport_error: BaseException | None = None
+        started = time.monotonic()
+        budget = min(QUOTE_TRANSPORT_BUDGET_SECONDS, 3.0 * max(1, int(self.max_codes)))
+        try:
+            for code in normalized:
+                if not str(code).startswith(("0", "3", "6")):
+                    continue
+                if _budget_exhausted(started, budget):
+                    break
+                url = f"http://d.10jqka.com.cn/v6/time/hs_{code}/last.js"
+                for attempt in range(max(1, int(self.attempts))):
+                    if _budget_exhausted(started, budget):
+                        break
+                    try:
+                        text = self.http_get(
+                            url, timeout=self.reliability.timeout_seconds,
+                            encoding="utf-8", retries=0,
+                        )
+                        transport_succeeded = True
+                    except Exception as exc:
+                        last_transport_error = exc
+                        text = ""
+                    parsed = self.parser(text, allowed_codes=[code]) if text else []
+                    if parsed:
+                        rows_by_code[code] = parsed[0]
+                        break
+                    if attempt < max(1, int(self.attempts)) - 1 and not _budget_exhausted(started, budget):
+                        self.reset_data_source("同花顺分时源空响应")
+                        self.sleep(0.2 * (attempt + 1))
+        except Exception as exc:
+            self.health.record_exception(self.name, exc, self.reliability, len(normalized))
+            return []
+        rows = [rows_by_code[code] for code in normalized if code in rows_by_code]
+        if not transport_succeeded and last_transport_error is not None:
+            self.health.record_exception(
+                self.name, last_transport_error, self.reliability, len(normalized),
+            )
+        else:
+            self.health.record_result(
+                self.name, requested=len(normalized), returned=len(rows),
+                policy=self.reliability,
+                reason=None if len(rows) == len(normalized) else "partial or empty provider response",
+            )
+        return rows
+
+
+@dataclass(frozen=True)
 class DataFeedChain:
     """Resolve missing codes through ordered feeds; one failed source never aborts the chain."""
 
@@ -495,13 +629,17 @@ class DataFeedChain:
         if not normalized:
             return []
         by_code: dict[str, QuoteRow] = {}
+        started = time.monotonic()
         for feed in self.feeds:
+            if _budget_exhausted(started, QUOTE_CHAIN_BUDGET_SECONDS):
+                break
             missing = [code for code in normalized if code not in by_code]
             if not missing:
                 break
             self._merge(by_code, self._safe_fetch(feed, missing), set(missing))
         missing = [code for code in normalized if code not in by_code]
-        if missing and self.retry_last_feed and self.feeds:
+        if (missing and self.retry_last_feed and self.feeds
+                and not _budget_exhausted(started, QUOTE_CHAIN_BUDGET_SECONDS)):
             if self.reset_data_source is not None:
                 self.reset_data_source("腾讯/新浪独立行情均有缺口，自动切换后重试")
             self.sleep(0.25)

@@ -61,6 +61,18 @@ class AgentTestCase(unittest.TestCase):
         kwargs.update(overrides)
         return AGENT.enqueue_research_question(conn, **kwargs)
 
+    def enqueue_at(self, conn, moment, **overrides):
+        """按**指定时刻**入队。
+
+        任务的可领取时间（``available_at``）由入队时刻决定，所以凡是随后
+        用注入时钟领取的任务，入队也必须用同一条时间线 —— 否则"过去"
+        的时钟永远查不到它。
+        """
+        kwargs = dict(goal="判断首板接力最近一段是否改善", hypothesis="软门槛过紧",
+                      exact_identity=IDENTITY, input_fingerprint="fp-1")
+        kwargs.update(overrides)
+        return AGENT.enqueue_research_question(conn, now=moment, **kwargs)
+
     def run_task(self, conn, provider, *, max_tasks=1, clock=None):
         import functools
 
@@ -306,18 +318,26 @@ class LoopTests(AgentTestCase):
                      next_tool={"name": AGENT.TOOL_LIST_TARGETS, "arguments": {}}),
             decision(action="eliminate", reason="证据不足"))
         with AQ.connect(self.path) as conn:
-            task, _ = self.enqueue(conn)
+            task, _ = self.enqueue_at(conn, at(0))
             # 第一轮只跑一步：拿到工具结果后人为中断。
-            claimed = AQ.claim(conn, worker_id="w1", lease_seconds=60, now=None)
+            # **所有时钟都用同一个注入时刻**：租约、回收、重试可见时间必须
+            # 来自同一条时间线。之前这里混用了真实时钟（claim/reclaim 的
+            # now=None）与夹具时钟（at(3600)），于是"回收"根本没发生
+            # （租约还没到期），任务停在 running，而 at(3600) 又早于它按
+            # 真实时钟写入的 available_at —— 领取永远查不到任务。
+            # 这个用例原本只在真实时间早于 BASE+3600 时才通过，是颗定时炸弹。
+            claimed = AQ.claim(conn, worker_id="w1", lease_seconds=60, now=at(0))
             AQ.commit(conn)
-            AQ.start(conn, claimed["task_id"], claimed["lease_token"])
+            AQ.start(conn, claimed["task_id"], claimed["lease_token"], now=at(0))
             AQ.checkpoint(conn, claimed["task_id"], claimed["lease_token"], step=1,
                           checkpoint={"transcript": [{"role": "tool",
                                                       "name": AGENT.TOOL_LIST_TARGETS,
                                                       "result": {"ok": True}}],
-                                      "hypothesis": "软门槛过紧"})
+                                      "hypothesis": "软门槛过紧"},
+                          now=at(0))
             AQ.commit(conn)
-            AQ.reclaim_expired(conn, now=None)
+            # 租约在 at(60) 到期；回收发生在 at(120)。
+            AQ.reclaim_expired(conn, now=at(120))
             AQ.commit(conn)
             # 回收后任务进入延迟重试；时钟前进再跑，模拟"另一个进程稍后接手"。
             results = self.run_task(conn, provider, clock=lambda: at(3600))

@@ -10,6 +10,7 @@ import pandas as pd
 import factors as F
 import factor_calibration as FC
 import strategy_naming as NAMING
+import strategy_plugins as SP
 
 
 STRATEGIES = {
@@ -458,8 +459,6 @@ def scoring_factor_inputs(strategy_id):
     These are calibrated score factors, not raw facts, hard entry conditions or
     the shared ranking/audit context. Adaptive weights retain the same key set.
     """
-    import strategy_plugins as SP
-
     plugin = SP.plugin_for_selector(strategy_id)
     if plugin is not None and not SP.is_original_builtin_plugin(plugin):
         # Replacements can extend execution or replay dependencies. Only the
@@ -1823,10 +1822,20 @@ def _percent(value):
 _run_strategy_legacy = run_strategy
 
 
+def _plugin_default_runner(strategy_id, table, **kwargs):
+    """Late-bound default algorithm for plugins without their own runner.
+
+    ``_run_strategy_legacy`` 是模块级全局，因此这里保持"调用时查找"的语义：
+    测试或组装方替换该全局后，插件默认路径同样跟着变。
+    """
+    return _run_strategy_legacy(strategy_id, table, **kwargs)
+
+
+SP.bind_default_runner(_plugin_default_runner)
+
+
 def available_selection_models():
     """Return legacy and registered plugin selector ids accepted by production."""
-    import strategy_plugins as SP
-
     return set(PAPER_WEIGHTS) | set(STRATEGIES) | set(SP.selector_ids())
 
 
@@ -1845,8 +1854,6 @@ def run_strategy(
     replay_required=False,
 ):
     """Production selector facade: plugin first, exact legacy fallback otherwise."""
-    import strategy_plugins as SP
-
     # 持久化与历史调用方可能仍在用旧模型族名：入口处一次性归一化，
     # 下游（PAPER_WEIGHTS / PAPER_CONDITION_DEFAULTS / 插件表）只认 canonical 名。
     strategy_id = NAMING.canonical_model_family(strategy_id)

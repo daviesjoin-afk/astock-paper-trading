@@ -371,5 +371,174 @@ class SinaRealtimeFeedTests(unittest.TestCase):
         parser.assert_called_once_with("quote", allowed_codes=["000001"])
 
 
+class QuoteAttemptBudgetTests(unittest.TestCase):
+    """adapter 的总尝试预算：不能把 3 次尝试 × 3 台主机 × 8 秒叠加进一轮扫描。
+
+    预算只限制等待时间；失败仍然返回当前已取到的行（通常为空），由调用方按
+    覆盖不足 fail-closed。
+    """
+
+    def _clock(self):
+        clock = [0.0]
+        return clock, (lambda: clock[0])
+
+    def test_eastmoney_stops_host_rotation_after_the_budget(self):
+        clock, now = self._clock()
+        calls = []
+
+        def slow_get(*_args, **_kwargs):
+            calls.append(1)
+            clock[0] += 8.0
+            raise TimeoutError("host down")
+
+        feed = feeds.EastmoneyRealtimeFeed(
+            get_json=slow_get,
+            secid=lambda code: "0." + code,
+            row_parser=lambda raw: None,
+            reset_data_source=mock.Mock(),
+            ut="test", fields="f2,f12",
+            hosts=("h1", "h2", "h3"), attempts=3, sleep=mock.Mock(),
+        )
+        with mock.patch.object(feeds.time, "monotonic", side_effect=now), \
+                mock.patch.object(feeds, "QUOTE_TRANSPORT_BUDGET_SECONDS", 10.0):
+            result = feed.fetch_realtime(["000001"])
+        self.assertEqual(result, [])
+        self.assertEqual(len(calls), 2, "预算 10 秒、单次 8 秒时最多两次尝试")
+
+    def test_tencent_stops_retries_after_the_budget(self):
+        clock, now = self._clock()
+        calls = []
+
+        def slow_get(*_args, **_kwargs):
+            calls.append(1)
+            clock[0] += 8.0
+            raise TimeoutError("host down")
+
+        feed = feeds.TencentRealtimeFeed(
+            http_get=slow_get,
+            parser=lambda text, **_: [],
+            reset_data_source=mock.Mock(),
+            attempts=3, sleep=mock.Mock(),
+        )
+        with mock.patch.object(feeds.time, "monotonic", side_effect=now), \
+                mock.patch.object(feeds, "QUOTE_TRANSPORT_BUDGET_SECONDS", 10.0):
+            result = feed.fetch_realtime(["000001"])
+        self.assertEqual(result, [])
+        self.assertEqual(len(calls), 2)
+
+    def test_sina_stops_retries_after_the_budget(self):
+        clock, now = self._clock()
+        calls = []
+
+        class Session:
+            def get(self, *_args, **_kwargs):
+                calls.append(1)
+                clock[0] += 8.0
+                raise TimeoutError("host down")
+
+        feed = feeds.SinaRealtimeFeed(
+            session_factory=Session,
+            headers={}, parser=lambda text, **_: [],
+            reset_data_source=mock.Mock(), attempts=3, sleep=mock.Mock(),
+        )
+        with mock.patch.object(feeds.time, "monotonic", side_effect=now), \
+                mock.patch.object(feeds, "QUOTE_TRANSPORT_BUDGET_SECONDS", 10.0):
+            result = feed.fetch_realtime(["000001"])
+        self.assertEqual(result, [])
+        self.assertEqual(len(calls), 2)
+
+    def test_small_batch_call_stops_at_the_total_budget(self):
+        """25 个批次各用一份预算仍会叠成几分钟；小批必须有整次截止时刻。"""
+        clock = [0.0]
+        calls = []
+
+        def slow_get(*_args, **_kwargs):
+            calls.append(1)
+            clock[0] += 13.0
+            raise TimeoutError("host down")
+
+        feed = feeds.EastmoneyRealtimeFeed(
+            get_json=slow_get,
+            secid=lambda code: "0." + code,
+            row_parser=lambda raw: None,
+            reset_data_source=mock.Mock(),
+            ut="test", fields="f2,f12",
+            hosts=("h1",), attempts=1, batch_size=100,
+            sleep=mock.Mock(),
+        )
+        with mock.patch.object(feeds.time, "monotonic", side_effect=lambda: clock[0]),                 mock.patch.object(feeds, "QUOTE_TRANSPORT_BUDGET_SECONDS", 12.0),                 mock.patch.object(feeds, "QUOTE_TOTAL_BUDGET_SECONDS", 18.0),                 mock.patch.object(feeds, "QUOTE_TOTAL_BUDGET_MAX_CODES", 400):
+            result = feed.fetch_realtime([f"6{i:05d}" for i in range(300)])
+        self.assertEqual(result, [])
+        self.assertLessEqual(len(calls), 2, "整次预算 18 秒不应跑到第三个 13 秒批次")
+
+    def test_chain_stops_after_the_chain_budget(self):
+        clock, now = self._clock()
+        called = []
+
+        class Feed:
+            name = "f"
+            def __init__(self, tag):
+                self.tag = tag
+            def fetch_realtime(self, codes):
+                called.append(self.tag)
+                clock[0] += 10.0
+                return []
+
+        chain = feeds.DataFeedChain(
+            (Feed("first"), Feed("second")), retry_last_feed=True, sleep=mock.Mock())
+        with mock.patch.object(feeds.time, "monotonic", side_effect=now), \
+                mock.patch.object(feeds, "QUOTE_CHAIN_BUDGET_SECONDS", 8.0):
+            self.assertEqual(chain.fetch_realtime(["000001"]), [])
+        self.assertEqual(called, ["first"], "链预算耗尽后不得再启动第二个源")
+
+
+class ThsRealtimeFeedTests(unittest.TestCase):
+    def _feed(self, get):
+        return feeds.ThsRealtimeFeed(
+            http_get=get,
+            parser=lambda text, **_: [{"code": "600000", "price": 10.0,
+                                       "quote_at": "2026-10-28T14:04:00+08:00",
+                                       "source": "ths_public_quote"}],
+            reset_data_source=mock.Mock(),
+            sleep=mock.Mock(),
+        )
+
+    def test_single_code_limit_avoids_request_fanout(self):
+        get = mock.Mock()
+        feed = self._feed(get)
+        self.assertEqual(feed.fetch_realtime([f"60000{i}" for i in range(9)]), [])
+        get.assert_not_called()
+
+    def test_returns_independent_quote_for_missing_code(self):
+        get = mock.Mock(return_value="payload")
+        feed = self._feed(get)
+        rows = feed.fetch_realtime(["600000"])
+        self.assertEqual(rows[0]["source"], "ths_public_quote")
+        url = get.call_args.args[0]
+        self.assertIn("hs_600000", url)
+        self.assertEqual(get.call_args.kwargs["retries"], 0)
+
+    def test_chain_uses_ths_only_after_tencent_and_sina_miss(self):
+        calls = []
+
+        class Feed:
+            def __init__(self, tag, rows=()):
+                self.tag, self.rows = tag, list(rows)
+                self.name = tag
+            def fetch_realtime(self, codes):
+                calls.append(self.tag)
+                return list(self.rows)
+
+        quote = {"code": "600000", "price": 10.0,
+                 "quote_at": "2026-10-28T14:04:00+08:00", "source": "ths_public_quote"}
+        chain = feeds.DataFeedChain(
+            (Feed("tencent"), Feed("sina"), Feed("ths", [quote])),
+            retry_last_feed=False,
+        )
+        rows = chain.fetch_realtime(["600000"])
+        self.assertEqual(calls, ["tencent", "sina", "ths"])
+        self.assertEqual(rows[0]["source"], "ths_public_quote")
+
+
 if __name__ == "__main__":
     unittest.main()

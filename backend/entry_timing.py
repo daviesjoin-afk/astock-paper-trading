@@ -17,6 +17,10 @@ import datetime as dt
 import json
 import os
 import threading
+from contextlib import contextmanager
+
+if os.name == "nt":
+    import msvcrt
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
@@ -24,6 +28,38 @@ STATE_PATH = data_paths.data_path("entry_timing_state.json")
 
 _lock = threading.Lock()
 _state = None
+
+
+@contextmanager
+def _locked_state():
+    """Serialize the JSON read/modify/write across paper and fast runners.
+
+    A thread lock alone cannot protect separate scheduled processes. Reload
+    after acquiring the file lock so a cached earlier state cannot erase a
+    confirmation or a completed entry published by another runner.
+    """
+    global _state
+    with _lock:
+        os.makedirs(os.path.dirname(os.path.abspath(STATE_PATH)), exist_ok=True)
+        with open(STATE_PATH + ".lock", "a+b") as handle:
+            if os.name == "nt":
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                handle.seek(0)
+                os.lockf(handle.fileno(), os.F_LOCK, 0)
+            try:
+                _state = None
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    os.lockf(handle.fileno(), os.F_ULOCK, 0)
 
 PROFILES = {
     # 短线日内做T：正常带 +0.2%~+3.5%；>3.5% 进入动量确认模式
@@ -153,7 +189,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
     if price <= 0:
         return True, {"state": "bad_input"}
 
-    with _lock:
+    with _locked_state():
         state = _load()
         bucket = state.setdefault(strategy_id, {})
         record = bucket.get(code)
@@ -591,7 +627,7 @@ def _evaluate_recovery_watch(profile, code, record, price, pct, now, *, evidence
 def recovery_watch_evidence(strategy_id, code):
     """读取某标的的跌后恢复观察记录（只读、不读时钟）；没有则 ``None``。"""
     try:
-        with _lock:
+        with _locked_state():
             state = _load()
             record = state.get(strategy_id, {}).get(code)
             if not record or record.get("state") != "recovery_watch":
@@ -611,7 +647,7 @@ def recovery_watch_evidence(strategy_id, code):
 def mark_entered(strategy_id, code, price=None):
     """成交后标记 entered：同日不再对同一标的重复触发。"""
     try:
-        with _lock:
+        with _locked_state():
             state = _load()
             record = state.get(strategy_id, {}).get(code)
             if record is not None:
@@ -626,7 +662,7 @@ def mark_entered(strategy_id, code, price=None):
 def reset(strategy_id=None, code=None):
     global _state
     try:
-        with _lock:
+        with _locked_state():
             state = _load()
             if strategy_id is None:
                 # 必须原地清空：state 是模块级缓存，重绑局部变量会让

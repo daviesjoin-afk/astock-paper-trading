@@ -66,19 +66,24 @@ DOWNSIDE_BASE = {
         "downside_peak_retrace_pct": 3.5, "downside_partial_ratio": 0.35,
     },
     "trend_pullback": {
-        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
-        "downside_full_pct": -5.5, "downside_relative_pct": -3.0,
-        "downside_peak_retrace_pct": 4.5, "downside_partial_ratio": 0.30,
+        "downside_warning_pct": -2.2, "downside_partial_pct": -3.0,
+        "downside_full_pct": -5.0, "downside_relative_pct": -2.7,
+        "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.35,
     },
     "sector_rotation": {
-        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
-        "downside_full_pct": -5.5, "downside_relative_pct": -3.0,
-        "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.30,
+        "downside_warning_pct": -2.2, "downside_partial_pct": -3.0,
+        "downside_full_pct": -4.5, "downside_relative_pct": -2.5,
+        "downside_peak_retrace_pct": 3.5, "downside_partial_ratio": 0.40,
+    },
+    "reported_profit_breakout": {
+        "downside_warning_pct": -1.8, "downside_partial_pct": -3.2,
+        "downside_full_pct": -5.8, "downside_relative_pct": -2.4,
+        "downside_peak_retrace_pct": 3.2, "downside_partial_ratio": 0.40,
     },
     "main_force_top10": {
-        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
-        "downside_full_pct": -5.0, "downside_relative_pct": -3.0,
-        "downside_peak_retrace_pct": 4.5, "downside_partial_ratio": 0.30,
+        "downside_warning_pct": -2.0, "downside_partial_pct": -3.0,
+        "downside_full_pct": -5.0, "downside_relative_pct": -2.5,
+        "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.50,
     },
 }
 
@@ -1449,22 +1454,35 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
 
 def overview(conn, config, paper_db_path):
     ensure_schema(conn)
-    candidates = []
-    for row in conn.execute(
-        "SELECT * FROM adaptive_risk_candidates ORDER BY run_date DESC,id DESC LIMIT 12"
-    ):
-        item = dict(row)
-        for key in ("baseline_params", "candidate_params", "evidence"):
-            item[key] = _loads(item[key], {})
-        item.pop("previous_account_params", None)
-        item["account_name"] = ACCOUNT_NAMES.get(item["account_id"], item["account_id"])
-        candidates.append(item)
-    active = []
+    participants = set()
     if os.path.exists(paper_db_path):
         paper = _paper_connection(paper_db_path)
         try:
             import strategy_weight_scope as SCOPE
             participants = set(SCOPE.participant_ids(paper))
+        finally:
+            paper.close()
+    candidates = []
+    for row in conn.execute(
+        "SELECT * FROM adaptive_risk_candidates ORDER BY run_date DESC,id DESC LIMIT 24"
+    ):
+        item = dict(row)
+        # 候选表是可变历史：退役策略的行仍会保留。展示"当前候选"时只保留
+        # 当前周期参与者，否则页面会继续列出 sector_rotation / main_force 等
+        # 早已退出的策略（2026-10-28 现场：五个策略里三个在运行）。
+        if participants and item["account_id"] not in participants:
+            continue
+        for key in ("baseline_params", "candidate_params", "evidence"):
+            item[key] = _loads(item[key], {})
+        item.pop("previous_account_params", None)
+        item["account_name"] = ACCOUNT_NAMES.get(item["account_id"], item["account_id"])
+        candidates.append(item)
+        if len(candidates) >= 12:
+            break
+    active = []
+    if os.path.exists(paper_db_path):
+        paper = _paper_connection(paper_db_path)
+        try:
             for row in paper.execute(
                 "SELECT id,name,version,params FROM paper_accounts ORDER BY id"
             ):
@@ -1536,11 +1554,13 @@ def overview(conn, config, paper_db_path):
         },
         "candidates": candidates,
         "active_versions": active,
+        "participants": sorted(participants),
         "closure": closure,
         "downside_policy": {
             "engine": "主力意图 + 三段式下跌防线",
             "confirmation_scans": 2,
-            "defaults": DOWNSIDE_BASE,
+            "defaults": ({key: value for key, value in DOWNSIDE_BASE.items()
+                          if key in participants} if participants else DOWNSIDE_BASE),
             "bounds": DOWNSIDE_BOUNDS,
             "auto_change_rule": "至少3个事件且确认出货占比≥60%、奖励窗口为负时，只允许保守收紧；放宽必须人工审批",
         },

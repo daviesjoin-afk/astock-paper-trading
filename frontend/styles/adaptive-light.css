@@ -612,6 +612,9 @@ body.dark #p-adaptive .adaptive-shell {
 .strategy-workbench-search:focus-visible { outline:2px solid var(--primary); outline-offset:1px; }
 .strategy-list-group { margin:18px 0 10px; font-size:14px; color:var(--text-secondary); }
 .strategy-card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
+.strategy-retired-group { margin-top:20px; border-top:1px dashed var(--border); padding-top:12px; }
+.strategy-retired-group > summary { cursor:pointer; color:var(--text-secondary); font-size:13px; font-weight:600; padding:4px 0; }
+.strategy-retired-group[open] > summary { margin-bottom:10px; }
 .strategy-card { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:8px; }
 .strategy-card header { display:flex; justify-content:space-between; align-items:center; gap:10px; }
 .strategy-card header h3 { margin:0; font-size:15px; }

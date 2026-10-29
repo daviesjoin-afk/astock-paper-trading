@@ -904,20 +904,31 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
 
 def overview(conn, config, paper_db_path):
     ensure_schema(conn)
-    candidates = []
-    for row in conn.execute("SELECT * FROM adaptive_selection_candidates ORDER BY run_date DESC,id DESC LIMIT 12"):
-        item = dict(row)
-        for key in ("baseline_params", "candidate_params", "evidence"):
-            item[key] = _loads(item[key], {})
-        item.pop("previous_account_params", None)
-        item["account_name"] = ACCOUNT_NAMES.get(item["account_id"], item["account_id"])
-        candidates.append(item)
-    active = []
+    participants = set()
     if os.path.exists(paper_db_path):
         paper = _paper(paper_db_path)
         try:
             import strategy_weight_scope as SCOPE
             participants = set(SCOPE.participant_ids(paper))
+        finally:
+            paper.close()
+    candidates = []
+    for row in conn.execute("SELECT * FROM adaptive_selection_candidates ORDER BY run_date DESC,id DESC LIMIT 24"):
+        item = dict(row)
+        # 与风控候选相同：历史行可能属于已退役策略，不在“当前候选”里展示。
+        if participants and item["account_id"] not in participants:
+            continue
+        for key in ("baseline_params", "candidate_params", "evidence"):
+            item[key] = _loads(item[key], {})
+        item.pop("previous_account_params", None)
+        item["account_name"] = ACCOUNT_NAMES.get(item["account_id"], item["account_id"])
+        candidates.append(item)
+        if len(candidates) >= 12:
+            break
+    active = []
+    if os.path.exists(paper_db_path):
+        paper = _paper(paper_db_path)
+        try:
             for row in paper.execute("SELECT id,name,version,params FROM paper_accounts ORDER BY id"):
                 if row["id"] not in participants:
                     continue
@@ -954,6 +965,7 @@ def overview(conn, config, paper_db_path):
             "mature": {"label": "10日成熟进化", "max_step": "完整结构候选，人工确认后生效并可回滚", "requirements": _requirements(config, "mature")},
         },
         "candidates": candidates, "active_versions": active,
+        "participants": sorted(participants),
     }
 
 

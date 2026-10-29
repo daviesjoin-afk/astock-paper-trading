@@ -72,6 +72,30 @@ class MicrostructureBudgetTests(unittest.TestCase):
         self.assertEqual(curl.call_count, 1)
         self.assertEqual(clock[0], 12)
 
+    def test_failure_batches_do_not_all_pay_the_timeout(self):
+        """源整体不可用时，后续批次必须被熔断器挡住。
+
+        旧实现把全部候选一次性交给线程池：12 个候选都在熔断器打开前发出请求，
+        阈值形同虚设（生产实测 ticks/trend 各 12 次调用、各 100 秒以上）。
+        新实现分批出发，只有第一批真的等超时。
+        """
+        codes = [f"9{index:05d}" for index in range(1, 13)]
+        calls = []
+
+        def fail(url, params=None, timeout=2):
+            calls.append(url)
+            raise TimeoutError("down")
+
+        with mock.patch.object(AD, "_micro_fetch", side_effect=fail), \
+                mock.patch.object(AD, "_tencent_depth", return_value={}):
+            output = AD.market_microstructures(codes, asof_day=dt.date.today())
+
+        self.assertEqual(len(output), len(codes))
+        self.assertLessEqual(
+            len(calls), 2 * AD.MICRO_BATCH_SIZE,
+            "后续批次应在熔断打开后立即失败，不再消耗网络预算")
+        self.assertTrue(all(row["score_applied"] is False for row in output.values()))
+
     def test_partial_results_and_worker_timings_preserve_unknowns(self):
         def source(url, params, **kwargs):
             if url == AD.TICK_DETAIL_URL:

@@ -1,29 +1,61 @@
 # 耦合预算与模块化进度
 
+2026-10-28（A8 收尾）：最后两组环关闭后 `import 环` 由 2 降为 **0**，门禁改为
+「一个环都不允许」。本次同时收紧 `延迟 import`（39 → 35）、`跨域 import 边`
+（42 → 40）与 `跨模块私有属性访问` 基线（202 → 201）；`顶层 import 副作用`
+23 → 24，来自组装期的一次 `bind_default_runner` 调用，仍在基线 25 以内。
+
+2026-10-28：入场时机状态的跨进程文件锁需要按平台加载 Windows 标准库
+`msvcrt`，延迟导入额度由 38 增至 39；这是平台兼容导入，不增加项目模块依赖。
+
 基线：PR272 HEAD `961c09f`。度量入口：`backend/tools/coupling_metrics.py`，由 `backend/test_architecture_boundary_audit.py` 执行不回退门禁。分析器只读 AST，不 import 生产模块。
 
 ## 当前预算
 
 | 指标 | PR272 基线 | 本次收口后 | 允许增量 | 长期目标 |
 |---|---:|---:|---:|---:|
-| import 环 | 5 | 2 | 不允许反弹 | 0 |
-| 延迟 import | 583 | 621 | 38 | 逐步降低；仅移除无必要的延迟依赖 |
+| import 环 | 5 | **0** | 不允许任何新环 | 0 |
+| 延迟 import | 583 | 618 | 35 | 逐步降低；仅移除无必要的延迟依赖 |
 | 裸 SQL 模块 | 135 | 141 | 6 | ≤60 |
 | paper 表最大模块 fan-out | 49 | 50 | 1 | ≤8（逐表 owner/read model） |
-| 跨模块私有属性访问 | 202 | 202 | 0 | 0 |
-| 跨域 import 边 | 624 | 666 | 42 | 分阶段降低 |
-| 最大文件 | 16367 行 | 15676 行 | 0 | ≤2500 |
+| 跨模块私有属性访问 | 201 | 201 | 0 | 0 |
+| 跨域 import 边 | 624 | 664 | 40 | 分阶段降低 |
+| 最大文件 | 16367 行 | 15622 行 | 0 | ≤2500 |
 | 最大函数 | 1191 行 | 1195 行 | 4 | <200 |
 | 单函数最大全局引用 | 56 | 57 | 1 | <80 |
 | 重复顶层 helper 名 | 307 | 313 | 6 | <30 |
 | `_num`/`_number`/`_finite` 重复定义 | 54 | 54 | 0 | 按语义逐模块收敛，不按名称批量替换 |
-| 无归属前缀模块占比 | 41.39% | 39.94% | 0 | <30% |
-| 顶层 import 副作用 | 25 | 23 | 0 | <5 |
+| 无归属前缀模块占比 | 41.39% | 39.87% | 0 | <30% |
+| 顶层 import 副作用 | 25 | 24 | 0 | <5 |
 
-允许增量来自本次审核修复必须新增的生产模块与调用点（`selection_application`、`paper_runtime_facts`、`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 已降至 15,676 行，最大函数仍是 `_buy_order`，未做高风险重写。
+允许增量来自本次审核修复必须新增的生产模块与调用点（`selection_application`、`paper_runtime_facts`、`research_pipeline`、`research_candidate`、`research_orchestration`、`research_runtime_config`、`paper_account_metrics`）。允许增量是显式预算，不是重设基线；未来任何恶化仍会失败。`paper_trading.py` 已降至 15,622 行，最大函数仍是 `_buy_order`，未做高风险重写。
 
 ## 本次切片
 
+- 2026-10-28（A8 收尾：最后两组环，环 2 → 0）
+  - **`market_data_service` ↔ `universe`**。新的下层事实 owner `data_universe_store`
+    承接 `universe.json` 的读取边界（路径、`(路径, mtime, size)` 轮内复用、正式清单门槛），
+    `universe.load_universe()` 与行情备用报价都向它取同一份代码集合，行情侧不再
+    import 基础库构建流程。**关键点**：正式清单门槛 `FORMAL_UNIVERSE_MIN_ROWS` 随读取一起
+    搬到 store 并在调用时查找——门槛必须和"按门槛判定"的那份读取同属一个 owner，否则
+    只要有人改一侧，就会出现「读取方认为清单合格、构建方认为不合格（或反之）」的隐性
+    不一致。`universe.build_universe()` 因此直接读 `USTORE.FORMAL_UNIVERSE_MIN_ROWS`。
+    测试侧只改缝的位置，不改断言：腾讯回退的 3 处 patch 目标从 `universe.load_universe`
+    改为 `data_universe_store.load_formal_universe`，回放夹具的规模放宽目标从
+    `universe.FORMAL_UNIVERSE_MIN_ROWS` 改为 `data_universe_store.FORMAL_UNIVERSE_MIN_ROWS`。
+    新增 `test_data_universe_store`（8 项）钉住下沉后的判据本身：正式清单门槛、
+    `scope` / `requested_limit` 的老文件防误用、**缓存身份含路径**（两个路径不得互相串用）、
+    重建后按文件签名失效、读失败不被记忆成成功，以及 `universe.UNIVERSE_PATH` 这条部署
+    seam 仍然有效。
+  - **`strategies` ↔ `strategy_plugins`**。插件表不再 `import strategies`；需要原生算法的
+    插件通过 `bind_default_runner()` 由算法 owner 在**组装期**绑定，`strategies.py` 模块级
+    那一行就是唯一绑定点。默认 runner 是 `_plugin_default_runner`，内部仍按模块全局
+    `_run_strategy_legacy` 在**调用时**查找，所以替换该全局的测试/组装方语义不变。
+    插件对象自身**没有**被塞进 `candidate_runner`——一旦塞进去，`is_original_builtin_plugin`
+    会变成 False，`scoring_factor_inputs` 就会退回"全量输入"，属于行为变更。未绑定就调用
+    默认路径时报明确错误，而不是在 import 处埋一个隐性顺序依赖。
+  - 顺带收紧：`strategies` 里 3 处函数内 `import strategy_plugins` 上移到模块级（少 3 个
+    延迟 import），`strategy_plugins` 里 `S._run_strategy_legacy` 这处跨模块私有属性访问消失。
 - 2026-10-28（A5 任务生命周期）：`paper_jobs` / `paper_job_runs` 的 **9 处**状态写入（认领探测、运行中过期判失败、首次 INSERT、重试认领 CAS、心跳续期 CAS、完成 CAS、失败 CAS、启动回收、历史清理）从 `paper_trading` 收进新 owner `paper_job_lifecycle`，语句只有一份，`paper_trading` 里对这两张表的 INSERT/UPDATE/DELETE **归零**（`test_paper_job_lifecycle` 用 AST 扫描 + 常量渲染做机械守卫，含空结果非空性）。行为不变：owner 不 commit、不做"该不该重试"的业务判断，CAS 谓词（`owner_key` + `fencing_token` + `status='running'`）逐字保留。裸 SQL 模块 140 → 141（SQL 换了归属，模块数多一个，额度 +1 已登记）；主文件 `paper_trading.py` 少 84 行。
 - 2026-10-27（§13.4 复用资源测量）：`backend/tools/modularity_reuse_bench.py` 把「同轮输入复用」的净效果做成可重跑证据 ——
   三个消费者、5000 只证券、合成输入、不联网不碰生产库。分开取数时 universe/finance/fundamental 各 **3** 次；
@@ -156,3 +188,48 @@
   的规模（越大越值得）。
 * 若未来需要真正跨模块共享，应当缓存**源码文本/字节**而不是只读语法树，避免为
   每个 AST 节点付包装成本。
+
+## 2026-10-28：行情源预算与低频状态缓存
+
+- 新增基础模块 `env_utils`（`env_float` / `env_int`），替换 5 个模块里各自
+  复制粘贴的环境变量解析。`duplicate_helpers` 314 → **313**（回到 313 额度内）。
+- `data_fetcher`（data 域）与 `paper_live_tradability`（paper 域）各新增一条
+  指向 `env_utils`（other 域）的边，`cross_domain_edges` 664 → **666**；
+  `marketdata_transport` / `marketdata_feeds` / `alt_data` 也在 other 域，不新增边。
+- 低频状态改为**跨进程**缓存后，`paper_live_tradability` 再新增 `data_paths`
+  （paper → data）与 `marketdata_cache`（paper → other）两条边，666 → **668**。
+  额度 40 → 44 并在此记录：这是共享实现替代复制，不是新增业务耦合。
+- 缓存目录改为在 `_get` / `fetch_company_announcements` 内懒创建，避免 import
+  期副作用（`import_side_effects` 保持 25）。
+- 低频状态缓存窗口（停牌 15 分钟、公告 30 分钟、快讯 5 分钟）是运行时策略，
+  不改变模块依赖。
+
+## 2026-10-28 A1：vertical 依赖下沉 + 度量口径修正
+
+### 依赖字段（三个 vertical 的 `*Dependencies` dataclass）
+
+| 批次 | manual_orders | dashboard_queries | execution_planner | 合计 |
+|---|---:|---:|---:|---:|
+| 起点 | 53 | 23 | 16 | 92 |
+| phase 1（纯工具直连 owner） | 48 | 21 | 13 | 82 |
+| phase 2（常量归位） | 43 | 21 | 13 | 77 |
+| phase 3（行读取/K 线/持仓天数归位） | 38 | 19 | 13 | **70** |
+
+迁移的内容都是**已有 owner 的能力**，不是新实现：JSON/数值 → `paper_common` / `paper_numeric`；
+状态词表 → `entry_lifecycle`；整手数量 → `paper_trading_rules`；共享池敞口 → `paper_shared_cash`；
+行读取 → `paper_repository`；完整日线截断 → `data_fetcher.completed_kline`；持仓天数 → `paper_risk_evidence.hold_days`。
+时钟（`_now` / `_date`）与数据库连接仍作为**可替换的窄能力**注入：回放与测试需要固定时点与固定账本。
+
+### 度量口径修正
+
+`coupling_metrics.domain_of` 之前按文件名前缀判定业务域，于是
+`paper_repository` / `paper_trading_rules` / `paper_risk_evidence` /
+`paper_position_read_model` / `paper_decision_audit` / `entry_lifecycle` /
+`paper_common` / `paper_numeric` / `paper_storage` / `data_paths` / `env_utils`
+这些**事实与基础 owner**被算进 "paper" 域。结果是：业务域模块直接 import owner
+（A1 想要的方向）反而显示"跨域边上涨"。
+
+现在这些模块单列为 `foundation`，与 foundation 相关的边不计入业务域跨域边
+（foundation 反向依赖业务域由 import_cycles / private_cross_access 覆盖）。
+实测跨域边 624（改口径前的基线）→ **613**，import 环保持 **0**，duplicate_helpers 312。
+预算基线按实测收紧为 613，额度 4。

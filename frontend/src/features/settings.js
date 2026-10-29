@@ -61,7 +61,7 @@ export function refreshOperatorUnlockState(){
 }
 
 // ---------- 统一设置中心 ----------
-export var SETTINGS_STRATEGY_NAMES={tq_breakout:'激进做T',trend_pullback:'稳健波段',reported_profit_breakout:'保守防守'};
+export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',reported_profit_breakout:'三日策略'};
 
 export var SETTINGS_DURATION_OPTIONS=[15,30,60,90,180,0];
 
@@ -143,7 +143,7 @@ export function renderSettings(data){
       var id=item.id;
       var itemOverride=overrides[id]||{};
       return '<article class="strategy-setting-card" data-strategy-id="'+adaptiveEsc(id)+'"><header><div><b>'+adaptiveEsc(item.name||id)+'</b><small>'+adaptiveEsc(id)+'</small></div><span class="tag tag-info">下一周期</span></header>'
-        +'<div class="setting-control"><label>风格</label><select class="strategy-style"><option value="strong"'+(itemOverride.style==='strong'?' selected':'')+'>强势接力</option><option value="pullback"'+(itemOverride.style==='pullback'?' selected':'')+'>趋势回踩</option><option value="sector"'+(itemOverride.style==='sector'?' selected':'')+'>板块轮动</option><option value="quality"'+(itemOverride.style==='quality'?' selected':'')+'>质量突破</option><option value="main_force"'+(itemOverride.style==='main_force'?' selected':'')+'>主力跟随</option></select></div>'
+        +'<div class="setting-control"><label>风格</label><select class="strategy-style"><option value="strong"'+(itemOverride.style==='strong'?' selected':'')+'>强势接力</option><option value="pullback"'+(itemOverride.style==='pullback'?' selected':'')+'>趋势回踩</option><option value="quality"'+(itemOverride.style==='quality'?' selected':'')+'>质量突破</option></select></div>'
         +'<div class="setting-control"><label>最大席位</label><input class="strategy-max-positions" type="number" min="1" max="6" step="1" value="'+Number(itemOverride.max_positions||3)+'"><span class="setting-value-preview">席</span></div>'
         +'<div class="setting-control"><label>单票权重</label><input class="strategy-max-weight" type="number" min="8" max="36" step="1" value="'+Number(itemOverride.max_weight_pct||32)+'"><span class="setting-value-preview">%</span></div>'
         +'<div class="setting-control"><label>策略敞口</label><input class="strategy-max-exposure" type="number" min="35" max="96" step="1" value="'+Number(itemOverride.max_exposure_pct||90)+'"><span class="setting-value-preview">%</span></div></article>';
@@ -162,7 +162,7 @@ export function renderSettings(data){
     var userItems=allItems.filter(function(x){return x.origin==='user';});
     var cardsHtml=builtinItems.map(builtinCard).join('');
     if(userItems.length) cardsHtml+='<h4 style="grid-column:1/-1;margin:4px 0 0">我的策略（参数在策略工坊维护）</h4>'+userItems.map(userCard).join('');
-    html='<div class="settings-grid"><section class="settings-panel"><h3>策略运行参数</h3><p>内置策略保留独立模型和审计身份。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+cardsHtml+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
+    html='<div class="settings-grid"><section class="settings-panel"><h3>策略运行参数</h3><p>当前三套正式策略保留独立模型和审计身份（板块轮动/超强主力已退役，不再提供新入场风格）。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+cardsHtml+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='execution'){
     var exe=settings.execution||{}, exeDefaults=(data.defaults||{}).execution||{};
     var execSwitch=function(key,label,help){ var value=(exe[key]===undefined?exeDefaults[key]:exe[key]); return '<div class="setting-row"><div class="setting-label"><b>'+riskText(label)+'</b><small>'+riskText(help)+'</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingExec_'+key+'" type="checkbox"'+settingsChecked(!!value)+'><span>'+(value?'开启':'关闭')+'</span></label></div></div>'; };
@@ -292,7 +292,11 @@ export async function loadSettings(force){
 // PR-47：Registry 不可用时的兜底显示名单（仅用于渲染，不再是策略集合权威）。
 export function settingsStrategyItems(){
   if(Array.isArray(window._registryItems)&&window._registryItems.length){
-    return window._registryItems.filter(function(item){return item.status!=='archived';});
+    // 设置页只展示能进入下一周期的策略：退役中的 sector_rotation /
+    // main_force_top10 不再作为可配置卡片出现（历史账本仍保留，不在本页管理）。
+    return window._registryItems.filter(function(item){
+      return item.status!=='archived' && (item.origin==='user' || !!item.formal_cycle_allowed);
+    });
   }
   return Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
     return {id:id,name:SETTINGS_STRATEGY_NAMES[id],origin:'builtin',status:'paper',formal_cycle_allowed:true,current_version:1,metadata:{},description:''};

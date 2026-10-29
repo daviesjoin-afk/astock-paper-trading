@@ -59,7 +59,7 @@ class StrategyRosterContractTests(unittest.TestCase):
 
     def test_roles_are_ordered_aggressive_balanced_conservative(self):
         names = [item.name for item in ROSTER.formal_roles()]
-        self.assertEqual(names, ["激进做T", "稳健波段", "保守防守"])
+        self.assertEqual(names, ["短线日内做T", "趋势波段优选", "三日策略"])
 
     def test_only_the_aggressive_role_runs_intraday_t(self):
         self.assertEqual([item.strategy_id for item in ROSTER.formal_roles() if item.intraday_t],

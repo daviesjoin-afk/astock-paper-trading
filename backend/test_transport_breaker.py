@@ -15,6 +15,11 @@ CPU 只有 1.1 秒；这些等待串在 `risk_pass`(67s)、`position_quotes`(25s
 * 一次成功即清零；冷却到期自动恢复。
 * 按主机隔离：一个域挂了不该让别的域停止尝试。
 """
+import json
+import os
+import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -250,6 +255,142 @@ class TransportBreakerTests(unittest.TestCase):
         """回归：短路包装不能改变正常返回。"""
         with mock.patch.object(T, "_http_get_impl", return_value='{"ok":true}'):
             self.assertEqual(T.http_get(URL), '{"ok":true}')
+
+
+class PersistedBreakerTests(unittest.TestCase):
+    """跨进程熔断记忆：每轮扫描都是新进程，不能每次都重新学习同一台坏主机。"""
+
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.root.name, "transport_breaker.json")
+        self.patcher = mock.patch.object(T, "_BREAKER_STATE_FILE", self.path)
+        self.patcher.start()
+        T.reset_transport_breakers()
+        T._breaker_state_loaded = False
+
+    def tearDown(self):
+        T.reset_transport_breakers()
+        self.patcher.stop()
+        self.root.cleanup()
+
+    def test_open_host_survives_a_new_process(self):
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=100.0)
+        self.assertTrue(os.path.exists(self.path))
+        with open(self.path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertGreater(payload["qt.gtimg.cn"]["until_wall"], time.time())
+
+        # 模拟下一轮 cron：全新进程内存表为空，只靠文件恢复。
+        T._transport_breaker.clear()
+        T._breaker_state_loaded = False
+        remaining = T._transport_breaker_remaining("qt.gtimg.cn")
+        self.assertIsNotNone(remaining)
+        self.assertGreater(remaining, 0)
+
+    def test_stale_entry_is_ignored(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"qt.gtimg.cn": {"fails": 6, "burned": 60,
+                                       "until_wall": time.time() - 5}}, handle)
+        T._transport_breaker.clear()
+        T._breaker_state_loaded = False
+        self.assertIsNone(T._transport_breaker_remaining("qt.gtimg.cn"))
+
+    def test_success_removes_the_persisted_host(self):
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=100.0)
+        T._transport_breaker_note("qt.gtimg.cn", ok=True)
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {})
+
+    def test_unwritable_path_never_breaks_the_transport(self):
+        with mock.patch.object(T, "_BREAKER_STATE_FILE",
+                               os.path.join(self.root.name, "missing", "x.json")):
+            T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=100.0)
+        self.assertTrue(T.transport_breaker_snapshot()["qt.gtimg.cn"]["open"])
+
+    def test_an_older_snapshot_cannot_replace_a_newer_one(self):
+        """快照与发布必须在同一把锁内，否则旧快照会覆盖新状态。
+
+        复现路径：一次失败拍到"已打开的短路"，一次成功拍到"已清空"；如果
+        写盘在锁外完成，后者的替换先落地，前者的旧快照随后覆盖文件 ——
+        内存里主机是健康的，重新加载文件却恢复出整段冷却期。
+
+        这里用两个线程把"发布"卡在替换文件的那一步，再让另一次状态更新
+        跑完，最后断言文件里的状态与内存一致（而不是被旧快照覆盖）。
+        """
+        release = threading.Event()
+        entered = threading.Event()
+        original_replace = os.replace
+
+        def gated_replace(src, dst):
+            # 只卡住"写入已打开短路"那一次发布。
+            if not entered.is_set():
+                entered.set()
+                release.wait(timeout=10)
+            return original_replace(src, dst)
+
+        # 让失败先拍到快照（已打开）。
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=100.0)
+        with mock.patch.object(T.os, "replace", side_effect=gated_replace):
+            writer = threading.Thread(target=T._persist_breaker_state)
+            writer.start()
+            self.assertTrue(entered.wait(timeout=10), "发布没有进入替换步骤")
+            # 成功那次必须在**另一个线程**里完成：它要拿到锁才能改状态，
+            # 所以只要它能完成，就证明发布期间锁被持有。
+            done = threading.Event()
+
+            def succeed():
+                T._transport_breaker_note("qt.gtimg.cn", ok=True)
+                done.set()
+
+            other = threading.Thread(target=succeed)
+            other.start()
+            # 成功那次应当被锁挡住，直到旧快照发布完成。
+            self.assertFalse(done.wait(timeout=0.5),
+                             "发布快照期间状态更新不应插队")
+            release.set()
+            writer.join(timeout=10)
+            other.join(timeout=10)
+
+        with open(self.path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertNotIn("qt.gtimg.cn", payload,
+                         "文件里不能残留旧快照里的短路状态")
+        self.assertFalse(T.transport_breaker_snapshot()["qt.gtimg.cn"]["open"])
+
+
+class ScanTailBudgetTests(unittest.TestCase):
+    """扫描尾部把单次请求的超时/重试压到有界值；未配置预算时完全不变。"""
+
+    def test_without_budget_the_limits_are_untouched(self):
+        with mock.patch.object(T, "_SCAN_BUDGET_SECONDS", 0.0):
+            self.assertEqual(T.scan_budget_limits(15, 2), (15, 2))
+
+    def test_tail_mode_caps_timeout_and_retries(self):
+        with mock.patch.object(T, "_SCAN_BUDGET_SECONDS", 150.0), \
+                mock.patch.object(T, "_SCAN_TAIL_AFTER_SECONDS", 90.0), \
+                mock.patch.object(T, "_PROCESS_STARTED",
+                                  time.monotonic() - 120.0):
+            self.assertTrue(T.scan_tail_active())
+            self.assertEqual(T.scan_budget_limits(15, 2), (8.0, 1))
+            self.assertEqual(T.scan_budget_limits(2, 0), (2.0, 0))
+
+    def test_before_the_tail_threshold_the_scan_keeps_full_budget(self):
+        with mock.patch.object(T, "_SCAN_BUDGET_SECONDS", 150.0), \
+                mock.patch.object(T, "_SCAN_TAIL_AFTER_SECONDS", 90.0), \
+                mock.patch.object(T, "_PROCESS_STARTED",
+                                  time.monotonic() - 10.0):
+            self.assertFalse(T.scan_tail_active())
+            self.assertEqual(T.scan_budget_limits(15, 2), (15, 2))
+
+    def test_http_get_passes_the_capped_limits_to_the_transport(self):
+        with mock.patch.object(T, "_SCAN_BUDGET_SECONDS", 150.0), \
+                mock.patch.object(T, "_SCAN_TAIL_AFTER_SECONDS", 90.0), \
+                mock.patch.object(T, "_PROCESS_STARTED",
+                                  time.monotonic() - 120.0), \
+                mock.patch.object(T, "_http_get_impl", return_value="ok") as impl:
+            self.assertEqual(T.http_get(URL, timeout=15, retries=2), "ok")
+        self.assertEqual(impl.call_args.kwargs["timeout"], 8.0)
+        self.assertEqual(impl.call_args.kwargs["retries"], 1)
 
 
 if __name__ == "__main__":

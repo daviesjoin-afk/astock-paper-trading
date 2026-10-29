@@ -63,16 +63,28 @@ def full_snapshot_singleflight_lock(thread_lock, lock_path):
                 lock_handle.close()
 
 
-def persistent_cached(cache, cache_lock, fetch_lock, key, path, ttl, fn, valid):
+def persistent_cached(cache, cache_lock, fetch_lock, key, path, ttl, fn, valid,
+                      allow_empty=False):
     """Share a valid provider value across processes without restarting its TTL.
 
     Use the existing thread/flock boundary, recheck after waiting, and publish
     atomically. Read-only storage can still consume a fresh snapshot or fetch;
     an empty/failed refresh neither renews nor overwrites old evidence.
+
+    ``allow_empty`` is for sources where "no rows" is a real answer (an empty
+    suspension report, no announcements). The default keeps the old conservative
+    rule that a falsy provider result is a failure and must not be cached.
     """
+    def acceptable(value):
+        if value is None:
+            return False
+        if allow_empty and value in ([], {}):
+            return True
+        return bool(value) and bool(valid(value))
+
     def usable(stamp, value):
         age = time.time() - float(stamp)
-        return math.isfinite(age) and 0 <= age < ttl and valid(value)
+        return math.isfinite(age) and 0 <= age < ttl and acceptable(value)
 
     def remember(stamp, value):
         with cache_lock:
@@ -105,7 +117,7 @@ def persistent_cached(cache, cache_lock, fetch_lock, key, path, ttl, fn, valid):
             pass
         stamp = time.time()  # Keep the original query-start age, not publication time.
         value = fn()
-        if value and valid(value):
+        if acceptable(value):
             temporary = os.fspath(path) + "." + uuid.uuid4().hex + ".tmp"
             try:
                 with open(temporary, "w", encoding="utf-8") as handle:

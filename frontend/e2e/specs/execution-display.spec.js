@@ -50,11 +50,23 @@ test("执行委托在真实浏览器中呈现后端状态与逐笔事实", async
 
   const row = page.getByTestId("execution-facts-fixture");
   await expect(row).toBeVisible();
+  // 委托行是"一行一单"的密度视图：正文只保留一条**摘要**（前三条事实），
+  // 完整证据放在 title 里（见 paper.js 的 paperExecutionFactsHtml）。
+  // 所以"执行原因"与"计价依据"必须在 title 上，而不是正文里。
   for (const text of [
     "部分成交", "成交 300 / 1000 股 · 剩余 700 股",
     "执行时点 2026-09-09 10:15:00", "市场 双源核验通过 · 新鲜",
-    "T+1 锁定", "成交量不足，等待后续成交", "￥12.34", "0.0200 元/股",
+    "￥12.34", "0.0200 元/股",
   ]) await expect(row).toContainText(text);
+
+  const factsNode = row.locator(".paper-execution-facts");
+  await expect(factsNode).toBeVisible();
+  const title = await factsNode.getAttribute("title");
+  for (const text of [
+    "T+1 锁定", "成交量不足，等待后续成交", "计价依据",
+  ]) {
+    expect(title, `完整证据必须在 title 上：${text}`).toContain(text);
+  }
 
   await page.screenshot({ path: "e2e/.artifacts/execution-display-desktop.png", fullPage: true });
   await page.setViewportSize({ width: 375, height: 812 });

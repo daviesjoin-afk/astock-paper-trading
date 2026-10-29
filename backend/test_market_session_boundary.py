@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 import pandas as pd
+import data_universe_store as USTORE
 import market_data_contract as C
 import market_data_service as S
 import close_snapshot_runner as R
@@ -137,7 +138,7 @@ class ClosingRefreshTests(unittest.TestCase):
         for row in data:row["source"]="tencent_public_quote"
         with mock.patch.object(S.dfc_module,"load_market_snapshot_full_payload",return_value={}), \
                 mock.patch.object(S.dfc_module,"fetch_market_snapshot_full",return_value=[]), \
-                mock.patch("universe.load_universe",return_value=[{"code":r["code"]} for r in data]), \
+                mock.patch.object(USTORE,"load_formal_universe",return_value=[{"code":r["code"]} for r in data]), \
                 mock.patch.object(S.dfc_module,"fetch_tencent_market_snapshot",return_value=data) as fetch:
             r=S.refresh_snapshot(C.CLOSE_SNAPSHOT_POLICY,now=NOW,force=True)
         self.assertEqual(10860.,fetch.call_args.kwargs["max_age"])
@@ -149,7 +150,7 @@ class ClosingRefreshTests(unittest.TestCase):
         payload={"rows":data,"complete":True,"expected_rows":4000,"saved_at":NOW.isoformat()}
         with mock.patch.object(S.dfc_module,"load_market_snapshot_full_payload",return_value=payload), \
                 mock.patch.object(S.dfc_module,"fetch_market_snapshot_full",return_value=[]), \
-                mock.patch("universe.load_universe",return_value=[]):
+                mock.patch.object(USTORE,"load_formal_universe",return_value=[]):
             r=S.refresh_snapshot(C.CLOSE_SNAPSHOT_POLICY,now=NOW,force=True)
         self.assertEqual("refresh_failed",r.reason)
         self.assertEqual("stale",r.freshness)

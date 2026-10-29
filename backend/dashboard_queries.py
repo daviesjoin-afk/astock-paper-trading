@@ -14,6 +14,15 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+# A1：纯工具直接 import，不再经 `paper_trading` 的全局桥转发。
+from paper_common import load_json as _loads
+from entry_lifecycle import ENTRY_FROZEN_WAITLIST_STATUS
+# A1 phase 3：查询行与持仓天数各有 owner。
+from data_fetcher import completed_kline as _completed_kline
+from paper_repository import rows as _rows
+from paper_risk_evidence import hold_days as _hold_days
+from paper_numeric import num as _num
+
 
 class DashboardUnavailable(RuntimeError):
     """The initialized ledger has no readable current cycle."""
@@ -33,7 +42,6 @@ def active_cycle_readonly(conn):
 class DashboardDependencies:
     """Explicit capabilities supplied by the application composition root."""
     ACCOUNT_SPECS: Any
-    ENTRY_FROZEN_WAITLIST_STATUS: Any
     _account_metric_inputs: Any
     _account_metrics: Any
     _account_reference_capital: Any
@@ -42,14 +50,10 @@ class DashboardDependencies:
     _economic_pool_nav_history: Any
     _entry_freeze_status: Any
     _execution_verified_predicate: Any
-    _hold_days: Any
     _latest_price_map: Any
-    _loads: Any
     _market_session: Any
-    _num: Any
     _position_rows: Any
     _recent_orders_with_archives: Any
-    _rows: Any
     _schedule_cache: Any
     _shared_initial_cash: Any
     _shared_metrics: Any
@@ -102,7 +106,6 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
 
     deps = dependencies if dependencies is not None else _dependencies()
     ACCOUNT_SPECS = deps.ACCOUNT_SPECS
-    ENTRY_FROZEN_WAITLIST_STATUS = deps.ENTRY_FROZEN_WAITLIST_STATUS
     _account_metric_inputs = deps._account_metric_inputs
     _account_metrics = deps._account_metrics
     _account_reference_capital = deps._account_reference_capital
@@ -110,14 +113,10 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
     _db_readonly = deps._db_readonly
     _economic_pool_nav_history = deps._economic_pool_nav_history
     _entry_freeze_status = deps._entry_freeze_status
-    _hold_days = deps._hold_days
     _latest_price_map = deps._latest_price_map
-    _loads = deps._loads
     _market_session = deps._market_session
-    _num = deps._num
     _position_rows = deps._position_rows
     _recent_orders_with_archives = deps._recent_orders_with_archives
-    _rows = deps._rows
     _schedule_cache = deps._schedule_cache
     _shared_initial_cash = deps._shared_initial_cash
     _shared_metrics = deps._shared_metrics
@@ -348,7 +347,7 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
                 pos, price, quote, dt.date.today()
             )
             pos["today_pnl_status"] = market_session["label"] if pos["today_pnl"] is None else ""
-            pos["hold_days"] = _hold_days(pos, dt.date.today())
+            pos["hold_days"] = _hold_days(pos, dt.date.today(), _completed_kline)
             pos["quote_at"] = (quotes.get(pos["code"]) or {}).get("quote_at")
             pos["quote_source"] = (quotes.get(pos["code"]) or {}).get("quote_source")
             pos["quote_validation"] = (quotes.get(pos["code"]) or {}).get("quote_validation")
