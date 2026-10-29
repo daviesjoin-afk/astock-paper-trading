@@ -78,3 +78,5 @@ mailmap.txt
 work/
 .start_three_strategy_cycle
 .docker/
+# agent/会话过程产物：子 agent 的 progress 笔记，不是项目交付物（与 .codex-test-tmp/、work/ 同类）
+tasks/
