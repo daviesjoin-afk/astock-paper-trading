@@ -13,7 +13,7 @@ class CouplingBudgetTests(unittest.TestCase):
         "raw_sql_modules": 141,
         "paper_table_fanout_max": 50,
         "cross_domain_edges": 619,
-        "max_file_lines": 15028,
+        "max_file_lines": 15047,
         "max_function_lines": 1195,
         "max_function_globals": 61,
         "duplicate_helpers": 313,

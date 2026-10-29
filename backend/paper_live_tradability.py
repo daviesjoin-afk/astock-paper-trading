@@ -31,6 +31,15 @@ STATUS_MAX_AGE_SECONDS = 120
 # 发现新停牌；状态本身的新鲜度仍由 `STATUS_MAX_AGE_SECONDS` 对最终成交
 # 观测单独校验，缓存只复用**报表内容**，不延后 observed_at。
 STATUS_CACHE_TTL_SECONDS = env_float("ASTOCK_TRADABILITY_STATUS_TTL_SECONDS", 900, minimum=1.0)
+
+# 个股档案（`stock/get`）里带着**实时价格证据**（``f43``）与行情时间
+# （``f86``）。这类证据的有效期就是 `STATUS_MAX_AGE_SECONDS`（120 秒）：
+# 把它按 15 分钟缓存，等于把一份 13 分钟前的价格当成当前价格发布，而
+# 读取方又会按 120 秒把它判为过期 —— 结果是**整段缓存窗口内都拿不到
+# 停牌/可交易观测**，哪怕行情源本身是健康的。
+#
+# 所以：低频状态（停牌报表）用长 TTL；带价格证据的档案用与它的新鲜度
+# 门槛一致的短 TTL。两者共用同一个读取器，但 TTL 由调用方显式给出。
 STATUS_CACHE_DIR = os.path.join(data_paths.data_dir(), "tradability_status")
 _CACHE = {}
 _LOCK = threading.Lock()
@@ -39,13 +48,18 @@ PROFILE_SOURCE = "eastmoney_stock_profile+complete_suspension_report+verified_qu
 MARKET_SOURCE = "current_full_market_membership+complete_suspension_report+verified_quote_range"
 
 
-def _get(key, url, params):
-    """Read one low-frequency status payload, sharing it across runner processes.
+def _get(key, url, params, *, ttl_seconds=None):
+    """Read one status payload, sharing it across runner processes.
 
     Each 3-minute scan is a fresh process, so an in-memory-only TTL never skips
     a fetch. The payload is published to ``data_cache`` with the same
     single-flight + atomic-replace contract used by other provider caches; the
     caller still applies its own 120-second observation gate.
+
+    ``ttl_seconds`` lets the caller pick the window that matches the payload:
+    a genuinely low-frequency report may be reused for 15 minutes, while a
+    payload carrying live price evidence must not outlive the freshness gate
+    that will judge it.
     """
     os.makedirs(STATUS_CACHE_DIR, exist_ok=True)
     path = os.path.join(
@@ -59,7 +73,8 @@ def _get(key, url, params):
                 "observed": dt.datetime.now(TZ).isoformat(timespec="microseconds")}
 
     value = MCache.persistent_cached(
-        _CACHE, _LOCK, _FETCH_LOCK, key, path, STATUS_CACHE_TTL_SECONDS, fetch,
+        _CACHE, _LOCK, _FETCH_LOCK, key, path,
+        STATUS_CACHE_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds), fetch,
         lambda item: isinstance(item, dict) and "data" in item,
     )
     return value["data"], value["observed"]
@@ -78,7 +93,11 @@ def _suspensions(day):
             break
         params["pageNumber"] = page
         payload, stamp = _get(("suspend", day, page),
-                              "https://datacenter-web.eastmoney.com/api/data/v1/get", params)
+                              "https://datacenter-web.eastmoney.com/api/data/v1/get", params,
+                              # 停牌报表是低频状态：交易所当天只增删少量记录，
+                              # 用长窗口复用它的**内容**（observed_at 仍按实际
+                              # 取数时刻记录）。
+                              ttl_seconds=STATUS_CACHE_TTL_SECONDS)
         result = payload.get("result")
         if payload.get("success") is not True or not isinstance(result, dict):
             raise ValueError("suspension source unavailable")
@@ -183,7 +202,11 @@ def prefetch(quotes, *, asof_day):
                 payload, profile_at = _get(("profile", day, code),
                     "https://push2.eastmoney.com/api/qt/stock/get",
                     {"fltt": 2, "invt": 2, "secid": f"{1 if code.startswith('6') else 0}.{code}",
-                     "fields": "f57,f58,f189,f51,f52,f43,f86"})
+                     "fields": "f57,f58,f189,f51,f52,f43,f86"},
+                    # 这份档案带着实时价格与行情时间，缓存窗口必须与
+                    # `STATUS_MAX_AGE_SECONDS` 一致，否则它在被读取之前
+                    # 就已经过期，整段窗口内都拿不到可交易观测。
+                    ttl_seconds=STATUS_MAX_AGE_SECONDS)
                 profile = payload.get("data") or {}
                 if payload.get("rc") != 0 or profile.get("f57") != code or not profile.get("f58"):
                     return code, None

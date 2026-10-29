@@ -8361,12 +8361,31 @@ def strategy_allocation_explain():
         market = snapshot.get("market") or {}
         light = str(market.get("light") or "")
         market_known = light in ("green", "yellow", "red")
+        # ``RC.load_snapshot()`` 只读盘上的 JSON，**不做过期判定**。若风险扫描
+        # 停了、或盘上的快照属于上一个交易日，光看"灯是绿的"就会把**过期**
+        # 的行情证据报成 fresh + verified，运行中策略页会一直显示健康。
+        # 这里按风险页同一套口径判定年龄：盘中 5 分钟、盘外 30 分钟。
+        #
+        # 优先级：先看有没有事实（没有 → unavailable），再看事实是不是过期
+        # （过期 → stale 且**不再声称已核验**）。过期不能盖掉"根本没有"，
+        # 否则"没有行情"会被误报成"行情过期"。
+        snapshot_age = RC.snapshot_age_seconds(snapshot) if snapshot else None
+        snapshot_ttl = 300 if (dt.datetime.now().weekday() < 5
+                               and dt.time(9, 20) <= dt.datetime.now().time() <= dt.time(15, 15)) else 1800
+        market_stale = bool(market_known and snapshot
+                            and (snapshot_age is None or snapshot_age > snapshot_ttl))
+        if market_stale:
+            market_known = False
         market_data = {
-            "status": MDC.STATUS_FRESH if market_known else MDC.STATUS_UNAVAILABLE,
-            "reason": None if market_known else "missing",
+            "status": (MDC.STATUS_STALE if market_stale
+                       else MDC.STATUS_FRESH if market_known
+                       else MDC.STATUS_UNAVAILABLE),
+            "reason": ("stale" if market_stale else None if market_known else "missing"),
             "observed_at": snapshot.get("asof") or market.get("live_index_time"),
             "as_of": market.get("data_date") or snapshot.get("asof"),
             "verification": "verified" if market_known else None,
+            "snapshot_age_seconds": round(snapshot_age or 0.0, 1) if snapshot_age is not None else None,
+            "snapshot_ttl_seconds": snapshot_ttl,
         }
         strategies = []
         for row in rows:
