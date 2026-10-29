@@ -18,6 +18,7 @@ CPU 只有 1.1 秒；这些等待串在 `risk_pass`(67s)、`position_quotes`(25s
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -305,6 +306,56 @@ class PersistedBreakerTests(unittest.TestCase):
                                os.path.join(self.root.name, "missing", "x.json")):
             T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=100.0)
         self.assertTrue(T.transport_breaker_snapshot()["qt.gtimg.cn"]["open"])
+
+    def test_an_older_snapshot_cannot_replace_a_newer_one(self):
+        """快照与发布必须在同一把锁内，否则旧快照会覆盖新状态。
+
+        复现路径：一次失败拍到"已打开的短路"，一次成功拍到"已清空"；如果
+        写盘在锁外完成，后者的替换先落地，前者的旧快照随后覆盖文件 ——
+        内存里主机是健康的，重新加载文件却恢复出整段冷却期。
+
+        这里用两个线程把"发布"卡在替换文件的那一步，再让另一次状态更新
+        跑完，最后断言文件里的状态与内存一致（而不是被旧快照覆盖）。
+        """
+        release = threading.Event()
+        entered = threading.Event()
+        original_replace = os.replace
+
+        def gated_replace(src, dst):
+            # 只卡住"写入已打开短路"那一次发布。
+            if not entered.is_set():
+                entered.set()
+                release.wait(timeout=10)
+            return original_replace(src, dst)
+
+        # 让失败先拍到快照（已打开）。
+        T._transport_breaker_note("qt.gtimg.cn", ok=False, burned=100.0)
+        with mock.patch.object(T.os, "replace", side_effect=gated_replace):
+            writer = threading.Thread(target=T._persist_breaker_state)
+            writer.start()
+            self.assertTrue(entered.wait(timeout=10), "发布没有进入替换步骤")
+            # 成功那次必须在**另一个线程**里完成：它要拿到锁才能改状态，
+            # 所以只要它能完成，就证明发布期间锁被持有。
+            done = threading.Event()
+
+            def succeed():
+                T._transport_breaker_note("qt.gtimg.cn", ok=True)
+                done.set()
+
+            other = threading.Thread(target=succeed)
+            other.start()
+            # 成功那次应当被锁挡住，直到旧快照发布完成。
+            self.assertFalse(done.wait(timeout=0.5),
+                             "发布快照期间状态更新不应插队")
+            release.set()
+            writer.join(timeout=10)
+            other.join(timeout=10)
+
+        with open(self.path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertNotIn("qt.gtimg.cn", payload,
+                         "文件里不能残留旧快照里的短路状态")
+        self.assertFalse(T.transport_breaker_snapshot()["qt.gtimg.cn"]["open"])
 
 
 class ScanTailBudgetTests(unittest.TestCase):

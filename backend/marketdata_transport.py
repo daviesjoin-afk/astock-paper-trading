@@ -207,7 +207,17 @@ def _load_breaker_state():
 
 
 def _persist_breaker_state():
-    """原子写出当前仍短路的主机；没有配置文件或写失败时静默跳过。"""
+    """原子写出当前仍短路的主机；没有配置文件或写失败时静默跳过。
+
+    **快照与发布必须在同一把锁内**：否则两次并发写可能乱序完成 ——
+    一次失败拍到"已打开的短路"，一次成功拍到"已清空"，但后者的文件替换
+    先落地，前者的旧快照随后覆盖它。内存里主机是健康的，重新加载文件却
+    又恢复出整段冷却期（实测约 90 秒），后续扫描会因此拒绝一个已经恢复
+    的源；反过来的顺序则会丢掉刚打开的短路。
+
+    所以这里一直持有 ``_transport_breaker_lock`` 到 ``os.replace`` 完成：
+    状态更新与快照发布成为同一个临界区，旧的快照不可能替换新的。
+    """
     if not _BREAKER_STATE_FILE:
         return
     now_mono, now_wall = time.monotonic(), time.time()
@@ -221,18 +231,18 @@ def _persist_breaker_state():
             for host, state in _transport_breaker.items()
             if (state.get("until") or 0.0) > now_mono
         }
-    if len(payload) > _BREAKER_STATE_MAX_HOSTS:
-        payload = dict(list(payload.items())[:_BREAKER_STATE_MAX_HOSTS])
-    temp_path = f"{_BREAKER_STATE_FILE}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-        os.replace(temp_path, _BREAKER_STATE_FILE)
-    except (OSError, TypeError, ValueError):
+        if len(payload) > _BREAKER_STATE_MAX_HOSTS:
+            payload = dict(list(payload.items())[:_BREAKER_STATE_MAX_HOSTS])
+        temp_path = f"{_BREAKER_STATE_FILE}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            os.replace(temp_path, _BREAKER_STATE_FILE)
+        except (OSError, TypeError, ValueError):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def breaker_state_path():
@@ -320,11 +330,13 @@ def reset_transport_breakers():
     with _transport_breaker_lock:
         _transport_breaker.clear()
         _breaker_state_loaded = True
-    if _BREAKER_STATE_FILE:
-        try:
-            os.unlink(_BREAKER_STATE_FILE)
-        except OSError:
-            pass
+        # 删除也必须在同一把锁内：否则并发写可能刚落盘就被这里删掉，
+        # 或者这里的删除晚于一次发布，把已经清空的状态又写回去。
+        if _BREAKER_STATE_FILE:
+            try:
+                os.unlink(_BREAKER_STATE_FILE)
+            except OSError:
+                pass
 
 
 def transport_breaker_snapshot():
