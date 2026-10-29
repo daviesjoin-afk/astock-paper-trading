@@ -108,6 +108,52 @@ FOUNDATION_MODULES = frozenset({
 })
 
 
+#: 基础层允许依赖的**业务域**模块白名单。
+#:
+#: 基础层的定义是"只提供账本读法、规则与纯工具"，所以它**不能**反过来
+#: 依赖任何业务域模块。单向的 foundation → 业务域 公开导入不会产生导入环，
+#: 也不会产生私有跨模块访问，因此 :func:`measure_all` 的两个指标都发现不了
+#: 它 —— 这正是审计第 4 项指出的口径缺口，必须由独立守卫覆盖。
+#:
+#: 基础层**之间**的互相依赖不算违规（它们同属这一层）；这里只登记需要
+#: 越过层边界的例外，每一条都是一个**已确认的装配边界**：
+#: - ``execution_verification``：唯一一份"成交已验证"谓词。基础层用它来
+#:   fail-closed 排除未验证行；它本身是账本事实的读取方，不含业务决策。
+#: - ``paper_portfolio``：持仓聚合的读模型 owner；基础层只调用它聚合行。
+#: - ``strategy_registry``：审计戳的唯一 owner（策略版本 pin）。
+#: - ``paper_timing``：低开销诊断计时器，无业务语义。
+#: - ``universe`` / ``factors``：交易日历与涨跌停阈值的事实来源。
+FOUNDATION_ALLOWED_DEPENDENCIES = {
+    "paper_position_read_model": frozenset({"execution_verification", "paper_portfolio"}),
+    "paper_repository": frozenset({"execution_verification", "strategy_registry"}),
+    "paper_storage": frozenset({"paper_timing"}),
+    "paper_trading_rules": frozenset({"factors", "universe"}),
+}
+
+
+def foundation_violations(root: Path = BACKEND):
+    """基础层 → 业务域的反向依赖。
+
+    返回 ``[(foundation_module, offending_target), ...]``，按模块与目标排序。
+
+    基础层之间的互相依赖是允许的（它们同属"事实/规则/纯工具"这一层）；
+    基础层依赖**业务域**模块才是方向错误。白名单之外的依赖一律视为违规。
+    """
+    records = list(_trees(production_paths(root)))
+    modules = {path.stem for path, _, _ in records}
+    violations = []
+    for path, _, tree in records:
+        module = path.stem
+        if module not in FOUNDATION_MODULES:
+            continue
+        allowed = (FOUNDATION_ALLOWED_DEPENDENCIES.get(module, frozenset())
+                   | (FOUNDATION_MODULES - {module}))
+        for target in sorted(_local_imports(tree, modules) - {module}):
+            if target not in allowed:
+                violations.append((module, target))
+    return sorted(violations)
+
+
 def domain_of(module: str) -> str:
     if module in FOUNDATION_MODULES:
         return "foundation"
@@ -208,8 +254,9 @@ def measure_all(root: Path = BACKEND):
         "paper_table_fanout_max": max(fanout.values(), default=0),
         "private_cross_access": private_access,
         # 事实/基础 owner 两侧的边不算业务域耦合：业务域直接 import owner
-        # 是 A1 期望的"显式依赖"，foundation 反向依赖业务域属于另一种问题，
-        # 由 import_cycles / private_cross_access 覆盖。
+        # 是 A1 期望的"显式依赖"。foundation 反向依赖业务域属于另一种问题，
+        # 由 import_cycles / private_cross_access 以及独立的
+        # ``foundation_violations`` 守卫覆盖（单向导入不会产生前两者）。
         "cross_domain_edges": sum(
             1 for source, targets in edges.items()
             for target in targets
@@ -228,4 +275,8 @@ def measure_all(root: Path = BACKEND):
         "unsuffixed_module_ratio": round(unsuffixed / len(records), 4) if records else 0,
         "import_side_effects": side_effects,
         "production_modules": len(records),
+        # 基础层 → 业务域的反向依赖：单向公开导入既不产生环也不产生私有
+        # 访问，上面的指标发现不了，必须单列（审计第 4 项）。
+        "foundation_violations": len(foundation_violations(root)),
+        "foundation_violation_members": foundation_violations(root),
     }
