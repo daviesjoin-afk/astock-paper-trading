@@ -1096,20 +1096,13 @@ class ReservationCycleProvenance(_LedgerCase):
         self.assertEqual(self._reservation_cycle(), self.cycle)
 
 
-class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
-    """§8/§9/§10：**真实** ``process_pending_manual_orders`` 下的预占周期冲突。
+class _ApprovedAllocationFixture:
+    """提供"已批准的精确组合分配"事实的公共夹具。
 
-    规格明确要求这些场景必须走真实 scanner，而不是只测预占原语 —— 因为缺陷恰恰
-    出在 scanner 把「永久归属冲突」当成「临时资金不足」的那两处分支里：
-    not-triggered 分支甚至**没有**把订单周期传下去，triggered 分支则把它打回
-    ``pending_limit`` 无限重试。
+    买入路径必须先拿到分配证据才能走到模型层，否则计划会停在
+    ``deferred_capacity``。这里把已被验证过的分配事实独立成夹具，
+    供多个测试文件复用，避免各写一份会漂移的替代品。
     """
-
-    def _current_cycle(self):
-        return int(self.conn.execute(
-            "SELECT cycle_id FROM paper_accounts WHERE id=?",
-            (self.account_id,),
-        ).fetchone()["cycle_id"])
 
     def _approved_allocation_plan(self, conn, *, cycle_id, asof_day,
                                   decision_at, account_id, symbol, intent_kind):
@@ -1167,6 +1160,22 @@ class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
 
     def _same_allocation_snapshot(self, *args, **kwargs):
         return self._allocation_snapshot
+
+
+class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness, _ApprovedAllocationFixture):
+    """§8/§9/§10：**真实** ``process_pending_manual_orders`` 下的预占周期冲突。
+
+    规格明确要求这些场景必须走真实 scanner，而不是只测预占原语 —— 因为缺陷恰恰
+    出在 scanner 把「永久归属冲突」当成「临时资金不足」的那两处分支里：
+    not-triggered 分支甚至**没有**把订单周期传下去，triggered 分支则把它打回
+    ``pending_limit`` 无限重试。
+    """
+
+    def _current_cycle(self):
+        return int(self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?",
+            (self.account_id,),
+        ).fetchone()["cycle_id"])
 
     def _seed_pending_buy_with_mismatched_reservation(self, *, triggered):
         """构造 order(cycle 8) + reservation(cycle 9) 的 pending 限价 BUY 订单。

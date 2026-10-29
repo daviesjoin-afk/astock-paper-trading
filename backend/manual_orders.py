@@ -39,6 +39,7 @@ from paper_trading_rules import LOT_SIZE, asset_type as _asset_type, limit_pct a
 from data_fetcher import completed_kline as _completed_kline
 from paper_repository import rows as _rows
 from paper_risk_evidence import hold_days as _hold_days
+from paper_kline_snapshot import RoundKlineCache
 from paper_numeric import num as _num
 
 # 这些能力有**独立 owner**（决策引擎、组合分配/运行时、预占、运行时设置），
@@ -136,6 +137,13 @@ def _manual_order_plan(
     import execution_planner as EP
     day = _date(asof_day)
     code = str(code or "").strip()
+    # 一次规划内复用成功的完整日线；失败或空结果继续按原路径重读。
+    # 返回独立副本，防止决策、持仓天数和快照消费者相互修改。
+    kline_cache = RoundKlineCache(_completed_kline)
+
+    def round_kline(security, cutoff, *, inclusive=True):
+        return kline_cache.get(security, cutoff, inclusive=inclusive)
+
     side = str(side or "").lower()
     order_type = str(order_type or "market").lower()
     requested_qty = int(_num(qty))
@@ -373,7 +381,7 @@ def _manual_order_plan(
             reasons.append("短线日内做T账户只接受普通股票")
         if local_quote.get("risk_flag") or "ST" in str(local_quote.get("name") or "").upper():
             reasons.append("ST/退市风险标的禁止开仓")
-        kline = _completed_kline(code, day, inclusive=False)
+        kline = round_kline(code, day, inclusive=False)
         decision = DE.buy_decision(
             code, name=local_quote.get("name"), kline=kline, snap=local_quote,
             sector_flow=[], overseas_gate=market.get("overseas") or {"light": "unknown"},
@@ -426,9 +434,9 @@ def _manual_order_plan(
                 "code": code, "name": local_quote.get("name"),
                 "cost": position.get("cost") if position else None,
                 "peak_price": position.get("peak_price") if position else None,
-                "hold_days": _hold_days(position, day, _completed_kline) if position else 0,
+                "hold_days": _hold_days(position, day, round_kline) if position else 0,
             },
-            kline=_completed_kline(code, day, inclusive=False), snap=local_quote,
+            kline=round_kline(code, day, inclusive=False), snap=local_quote,
             overseas_gate={"light": "unknown"}, news_hits=[],
         )
         plan["risk"]["model"] = decision
@@ -547,7 +555,7 @@ def _manual_order_plan(
         ),
         reason="；".join(plan.get("reasons") or []) or None,
         asof_date=day, quote=local_quote,
-        kline=_completed_kline(code, day, inclusive=False),
+        kline=round_kline(code, day, inclusive=False),
         final_score=((plan.get("risk") or {}).get("model") or {}).get("avg_score")
         if isinstance((plan.get("risk") or {}).get("model"), dict) else None,
     )
