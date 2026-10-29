@@ -24,7 +24,9 @@ class SelectionRoundInputTests(unittest.TestCase):
         prepared.live_rows = live_rows
         prepared.live_map = live_map
         prepared.snap_f = snap_f
-        prepared.fund_f = pd.DataFrame(index=codes)
+        # 基本面结果必须连同它的财务输入标识一起登记，否则视为来源不明，
+        # 轮次缓存不得复用（fail-closed）。
+        prepared.publish_fundamentals(pd.DataFrame(index=codes), "")
 
         def context(key, loader, **_kwargs):
             return {"data": {}} if key == "finance" else {}
