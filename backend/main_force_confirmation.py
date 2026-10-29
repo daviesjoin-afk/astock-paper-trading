@@ -7,7 +7,6 @@ alpha. This confirmation cannot rescue a failed entry or override risk gates.
 from __future__ import annotations
 
 import datetime as dt
-import math
 from paper_numeric import coerced_number as _coerced_number
 
 VERSION = "main-force-confirmation-v1"

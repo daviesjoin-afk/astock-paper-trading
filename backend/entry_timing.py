@@ -17,6 +17,7 @@ import datetime as dt
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 
 if os.name == "nt":
@@ -28,6 +29,51 @@ STATE_PATH = data_paths.data_path("entry_timing_state.json")
 
 _lock = threading.Lock()
 _state = None
+
+#: 拿不到文件锁时的重试上限与退避。Windows 的 msvcrt.locking 只尝试 10 次
+#: （约 10 秒）就抛 OSError；POSIX 的 os.lockf 是阻塞的。两边都必须"一直
+#: 重试到拿到锁"，否则上层 fail-open 会静默丢掉这个标的的状态。
+_LOCK_TIMEOUT_SECONDS = 60.0
+_LOCK_RETRY_SECONDS = 0.02
+
+
+def _lock_file(handle):
+    """独占锁住锁文件的第一个字节。
+
+    Windows 的 ``msvcrt.locking`` 与 POSIX 的 ``os.lockf`` 语义不同：前者只
+    尝试 10 次、约 10 秒，之后**抛 OSError**；后者是阻塞式的。两种实现
+    在"拿不到锁"时都会让异常冒到调用方，而 ``evaluate`` 的兜底是 fail-open
+    放行且**不落盘** —— 那个标的就被静默丢掉了（实测跨进程写同一份状态
+    时会出现 23/24 而不是 24/24）。
+
+    所以这里必须**一直重试到拿到锁**，而不是把 OSError 交给上层。
+    """
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            if os.name == "nt":
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                handle.seek(0)
+                os.lockf(handle.fileno(), os.F_LOCK, 0)
+            return
+        except OSError:
+            # 拿不到锁不是失败，只是"有人正在写"。退避后重试，直到超时。
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_LOCK_RETRY_SECONDS)
+
+
+def _unlock_file(handle):
+    if os.name == "nt":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        os.lockf(handle.fileno(), os.F_ULOCK, 0)
 
 
 @contextmanager
@@ -42,24 +88,12 @@ def _locked_state():
     with _lock:
         os.makedirs(os.path.dirname(os.path.abspath(STATE_PATH)), exist_ok=True)
         with open(STATE_PATH + ".lock", "a+b") as handle:
-            if os.name == "nt":
-                if os.fstat(handle.fileno()).st_size == 0:
-                    handle.write(b"0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                handle.seek(0)
-                os.lockf(handle.fileno(), os.F_LOCK, 0)
+            _lock_file(handle)
             try:
                 _state = None
                 yield
             finally:
-                if os.name == "nt":
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    os.lockf(handle.fileno(), os.F_ULOCK, 0)
+                _unlock_file(handle)
 
 PROFILES = {
     # 短线日内做T：正常带 +0.2%~+3.5%；>3.5% 进入动量确认模式

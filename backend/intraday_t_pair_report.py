@@ -29,7 +29,6 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import json
-import math
 import sqlite3
 from pathlib import Path
 

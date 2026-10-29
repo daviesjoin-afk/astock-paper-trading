@@ -21,8 +21,6 @@ from __future__ import annotations
 import datetime as dt
 
 import pandas as pd
-import strategies as S
-import universe as U
 
 try:
     import alt_data as AD

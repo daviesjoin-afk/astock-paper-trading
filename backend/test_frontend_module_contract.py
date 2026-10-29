@@ -150,8 +150,7 @@ class BridgeCoverageTests(unittest.TestCase):
             "unlockOperatorTab", "clearOperatorTab", "clearWxpusherToken",
             "resetSettingsSection", "saveAiProvider", "saveAiReviewMode",
             "saveAiSlot", "saveSettingsSection", "setSettingsSection",
-            "testAiSlot", "testWxpusher", "unlockOperatorTab",
-            "editAiProvider", "changeAiSlotProvider", "refreshAiProviderModels",
+            "testAiSlot", "testWxpusher", "editAiProvider", "changeAiSlotProvider", "refreshAiProviderModels",
             "issueAiCapability", "revokeAiCapability", "refreshAiCapabilities",
             "clearAiProviderKey",
         }

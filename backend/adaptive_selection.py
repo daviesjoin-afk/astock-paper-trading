@@ -6,7 +6,6 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
-import math
 import os
 import sqlite3
 import statistics

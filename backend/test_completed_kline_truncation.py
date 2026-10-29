@@ -4,7 +4,6 @@
 异常时直接返回原始 frame，于是截止日之后的行可能被当成完整收盘数据使用。
 新的语义是 fail-closed：无法解析日期的行被丢弃，截断绝不失败。
 """
-import datetime as dt
 import unittest
 from unittest import mock
 
