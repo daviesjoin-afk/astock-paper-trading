@@ -43,30 +43,30 @@
 
 <main id="appMain" tabindex="-1">
 <div id="p-strategies" class="page strategy-workbench-page">
-  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略工坊</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" data-testid="strategy-new" onclick="wbNewStrategy()">+ 新建策略</button></div></div>
+  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略工坊</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" data-testid="strategy-new" data-wb-action="new">+ 新建策略</button></div></div>
   <div id="wbSummary" class="strategy-workbench-summary" role="status" aria-live="polite" data-testid="strategy-summary">正在读取策略 Registry…</div>
   <div class="strategy-workbench-toolbar">
     <div class="strategy-workbench-filters" role="group" aria-label="策略筛选">
-      <button class="strategy-workbench-filter active" type="button" data-wb-origin="all" onclick="wbSetOriginFilter('all',this)">全部</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-origin="builtin" onclick="wbSetOriginFilter('builtin',this)">内置</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-origin="user" onclick="wbSetOriginFilter('user',this)">我的策略</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="all" onclick="wbSetStatusFilter('all',this)">全部状态</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="draft" onclick="wbSetStatusFilter('draft',this)">草稿</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="candidate" onclick="wbSetStatusFilter('candidate',this)">候选</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="research" onclick="wbSetStatusFilter('research',this)">研究中</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="validated" onclick="wbSetStatusFilter('validated',this)">已验证</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="shadow" onclick="wbSetStatusFilter('shadow',this)">影子阶段</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="paper" onclick="wbSetStatusFilter('paper',this)">模拟运行中</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="production_sim" onclick="wbSetStatusFilter('production_sim',this)">生产模拟</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="paused" onclick="wbSetStatusFilter('paused',this)">已暂停</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="degraded" onclick="wbSetStatusFilter('degraded',this)">已降级</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="retiring" onclick="wbSetStatusFilter('retiring',this)">退役中</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="archived" onclick="wbSetStatusFilter('archived',this)">已归档</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="rejected" onclick="wbSetStatusFilter('rejected',this)">已拒绝</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="validation_failed" onclick="wbSetStatusFilter('validation_failed',this)">验证失败</button>
-      <button class="strategy-workbench-filter" type="button" data-wb-status="quarantined" onclick="wbSetStatusFilter('quarantined',this)">安全隔离</button>
+      <button class="strategy-workbench-filter active" type="button" data-wb-origin="all" data-wb-action="origin-filter">全部</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-origin="builtin" data-wb-action="origin-filter">内置</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-origin="user" data-wb-action="origin-filter">我的策略</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="all" data-wb-action="status-filter">全部状态</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="draft" data-wb-action="status-filter">草稿</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="candidate" data-wb-action="status-filter">候选</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="research" data-wb-action="status-filter">研究中</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="validated" data-wb-action="status-filter">已验证</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="shadow" data-wb-action="status-filter">影子阶段</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="paper" data-wb-action="status-filter">模拟运行中</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="production_sim" data-wb-action="status-filter">生产模拟</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="paused" data-wb-action="status-filter">已暂停</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="degraded" data-wb-action="status-filter">已降级</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="retiring" data-wb-action="status-filter">退役中</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="archived" data-wb-action="status-filter">已归档</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="rejected" data-wb-action="status-filter">已拒绝</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="validation_failed" data-wb-action="status-filter">验证失败</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="quarantined" data-wb-action="status-filter">安全隔离</button>
     </div>
-    <input id="wbSearch" class="strategy-workbench-search" type="search" placeholder="搜索策略名称或 ID…" aria-label="搜索策略" oninput="wbRenderList()">
+    <input id="wbSearch" class="strategy-workbench-search" type="search" placeholder="搜索策略名称或 ID…" aria-label="搜索策略" data-wb-input="search">
   </div>
   <div id="wbList" class="strategy-workbench-list" aria-live="polite" data-testid="strategy-list"><div class="loading">正在读取策略…</div></div>
   <div id="wbEditor" class="strategy-workbench-editor" data-testid="strategy-editor" hidden></div>
@@ -76,13 +76,13 @@
   <div class="page-header"><div><span class="page-kicker">运行控制 · 安全边界 · 版本审计</span><h2>设置中心</h2><p>集中管理模拟资金、策略集合、共享池风控和自进化接口。每次保存都会校验边界并留下审计记录。</p></div><div class="settings-head-state" id="settingsHeadState" role="status" aria-live="polite">正在读取设置…</div></div>
   <div class="settings-shell">
     <nav class="module-tabs settings-module-tabs" aria-label="设置二级导航" role="tablist">
-      <button class="module-tab settings-section-tab active" role="tab" aria-selected="true" data-settings-section="simulation" onclick="setSettingsSection('simulation',this)"><span class="module-code">资金</span><span class="module-copy"><b>模拟盘与资金</b><small>启动金额 · 周期 · 策略数量</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="risk" onclick="setSettingsSection('risk',this)"><span class="module-code">风险 · 审计</span><span class="module-copy"><b>仓位与风控</b><small>共享池 · 单票 · 建仓门槛</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略运行参数</b><small>内置与自定义策略 · 风格 · 席位</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" data-testid="settings-section-evolution" onclick="setSettingsSection('evolution',this)"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="execution" onclick="setSettingsSection('execution',this)"><span class="module-code">执行画像</span><span class="module-copy"><b>执行画像执行器</b><small>批量窗口 · 人工核验 · 时限</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="notification" data-testid="settings-section-notification" onclick="setSettingsSection('notification',this)"><span class="module-code">推送</span><span class="module-copy"><b>日报与周报推送</b><small>WxPusher · 发送时间 · 测试</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="operator" data-testid="settings-section-operator" onclick="setSettingsSection('operator',this)"><span class="module-code">授权</span><span class="module-copy"><b>操作员授权</b><small>本标签页解锁 · 写操作凭据</small></span></button>
+      <button class="module-tab settings-section-tab active" role="tab" aria-selected="true" data-settings-section="simulation" data-settings-action="section-tab" data-settings-section="simulation"><span class="module-code">资金</span><span class="module-copy"><b>模拟盘与资金</b><small>启动金额 · 周期 · 策略数量</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="risk" data-settings-action="section-tab" data-settings-section="risk"><span class="module-code">风险 · 审计</span><span class="module-copy"><b>仓位与风控</b><small>共享池 · 单票 · 建仓门槛</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" data-settings-action="section-tab" data-settings-section="strategy"><span class="module-code">策略</span><span class="module-copy"><b>策略运行参数</b><small>内置与自定义策略 · 风格 · 席位</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" data-testid="settings-section-evolution" data-settings-action="section-tab" data-settings-section="evolution"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="execution" data-settings-action="section-tab" data-settings-section="execution"><span class="module-code">执行画像</span><span class="module-copy"><b>执行画像执行器</b><small>批量窗口 · 人工核验 · 时限</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="notification" data-testid="settings-section-notification" data-settings-action="section-tab" data-settings-section="notification"><span class="module-code">推送</span><span class="module-copy"><b>日报与周报推送</b><small>WxPusher · 发送时间 · 测试</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="operator" data-testid="settings-section-operator" data-settings-action="section-tab" data-settings-section="operator"><span class="module-code">授权</span><span class="module-copy"><b>操作员授权</b><small>本标签页解锁 · 写操作凭据</small></span></button>
     </nav>
     <div id="settingsResult" aria-live="polite" data-testid="settings-result"><div class="loading">正在读取统一设置…</div></div>
   </div>

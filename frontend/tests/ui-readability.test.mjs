@@ -78,8 +78,15 @@ test('模型名称支持从上游列表选择', () => {
   assert.ok(!text.includes('datalist'), '槽位仍使用输入框补全而不是下拉选择');
   assert.ok(text.includes('refreshAiProviderModels'), '缺少获取模型的处理函数');
   assert.ok(text.includes('/models'), '未调用上游模型列表接口');
+  // 设置中心自己承接动作，不再依赖 window 全局桥。
+  assert.ok(text.includes('data-settings-action="refresh-provider-models"'),
+    '获取模型按钮未声明页面动作');
   const bridge = source('../src/bridge.js');
-  assert.ok(bridge.includes('window.refreshAiProviderModels'), '获取模型函数未挂到全局');
+  assert.ok(!bridge.includes('window.refreshAiProviderModels'),
+    '获取模型函数不应回流到全局桥');
+  const settings = source('../src/features/settings.js');
+  assert.ok(settings.includes("'refresh-provider-models':refreshAiProviderModels"),
+    '设置页动作表缺少获取模型');
 });
 
 test('授权页提供关闭写操作凭据的开关', () => {
