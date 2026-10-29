@@ -87,7 +87,7 @@ MIN_EVAL_DATES = 5
 MIN_CODES_PER_DATE = 3
 MIN_MEAN_RANK_IC = 0.02
 MIN_IC_LOWER_BOUND = 0.0
-CONFIDENCE_Z = 1.645
+IC_LOWER_BOUND_Z_ONE_SIDED_95 = 1.645
 CONFIDENCE_LABEL = "one_sided_95pct"
 
 # Chronological *tail* robustness.  A verdict built only from the full-sample
@@ -920,7 +920,7 @@ def scoring_spec(
     min_codes_per_date: int = MIN_CODES_PER_DATE,
     min_mean_rank_ic: float = MIN_MEAN_RANK_IC,
     min_ic_lower_bound: float = MIN_IC_LOWER_BOUND,
-    confidence_z: float = CONFIDENCE_Z,
+    confidence_z: float = IC_LOWER_BOUND_Z_ONE_SIDED_95,
     holdout_fraction: float = HOLDOUT_FRACTION,
     min_holdout_dates: int = MIN_HOLDOUT_DATES,
     min_holdout_positive_ratio: float = MIN_HOLDOUT_POSITIVE_RATIO,
@@ -1153,7 +1153,7 @@ def build_evaluation(
     min_codes_per_date: int = MIN_CODES_PER_DATE,
     min_mean_rank_ic: float = MIN_MEAN_RANK_IC,
     min_ic_lower_bound: float = MIN_IC_LOWER_BOUND,
-    confidence_z: float = CONFIDENCE_Z,
+    confidence_z: float = IC_LOWER_BOUND_Z_ONE_SIDED_95,
     holdout_fraction: float = HOLDOUT_FRACTION,
     min_holdout_dates: int = MIN_HOLDOUT_DATES,
     min_holdout_positive_ratio: float = MIN_HOLDOUT_POSITIVE_RATIO,
@@ -1909,7 +1909,7 @@ def _empty_metrics(holdout_partition: str) -> dict:
         "ic_std": None,
         "ic_std_error": None,
         "ic_lower_bound": None,
-        "confidence_z": float(CONFIDENCE_Z),
+        "confidence_z": float(IC_LOWER_BOUND_Z_ONE_SIDED_95),
         "confidence_label": CONFIDENCE_LABEL,
         "unit_of_observation": "date",
         "holdout_partition": holdout_partition,

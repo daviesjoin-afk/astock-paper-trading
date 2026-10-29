@@ -6,7 +6,12 @@
 
 1. 从 `master` 创建短分支，说明要解决的问题。
 2. 使用 **Python 3.14** 安装 `requirements.lock`；`requirements.txt` 仅用于维护允许的版本范围。
-3. 运行 `python -m unittest discover -s backend -p "test_*.py" -v`。
+3. 跑测试按**分层**来（2026-10-29 起，见下节"测试耗时"）：
+   - 改了哪个模块，先只跑它自己：`python -m pytest backend/test_<模块>.py -q`；
+   - 日常全量用**并行分片**：`python scripts/run_tests_parallel.py`（成本均衡 LPT，实测 882s → 193s）；
+   - 收尾/夜间基线用**串行**：`python -m unittest discover -s backend -p "test_*.py" -v`，
+     或 `python -m pytest backend -q --durations=25`（会打印最慢用例，实测 983.6s / 7345 用例）。
+   串行数字是"可比较的基线"，并行数字是"日常反馈速度"，两者都保留，不要互相替代。
 4. 运行 `ruff check backend` 和 `pip-audit --requirement requirements.lock --strict`；修改依赖后用仓库约定的 uv 命令重新生成锁文件。
 5. 对策略、撮合或风控改动补充回归测试，并在 PR 中说明数据假设和风险边界。
 6. 不提交 `data_cache/`、`reports/`、`.env`、日志、运行时数据库或任何凭据。

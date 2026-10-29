@@ -136,31 +136,6 @@ def execute_with_retry(conn, sql, params=(), max_retries=3, hot_path=True):
             raise
 
 
-def executemany_with_retry(conn, sql, params_list, max_retries=3, hot_path=True):
-    """批量执行 SQL，并在数据库锁定时按递增间隔重试。"""
-    for attempt in range(max_retries):
-        try:
-            return conn.executemany(sql, params_list)
-        except Exception as exc:
-            if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
-                time.sleep(sqlite_busy_backoff(attempt, hot_path=hot_path))
-                continue
-            raise
-
-
-def commit_with_retry(conn, max_retries=3, hot_path=True):
-    """提交事务，并在数据库锁定时按递增间隔重试。"""
-    for attempt in range(max_retries):
-        try:
-            conn.commit()
-            return
-        except Exception as exc:
-            if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
-                time.sleep(sqlite_busy_backoff(attempt, hot_path=hot_path))
-                continue
-            raise
-
-
 @contextmanager
 def db_readonly(db_path):
     """打开不执行迁移、不获取写锁的只读 ledger 连接。"""

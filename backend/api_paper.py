@@ -595,17 +595,6 @@ def order_preview_get(
         raise HTTPException(status_code=500, detail=f"Preview failed: {type(exc).__name__}") from exc
 
 
-@router.post("/order/preview")
-def order_preview(
-    account_id: str = Query(...), code: str = Query(...), side: str = Query(...),
-    qty: int = Query(0, ge=0), order_type: str = Query("market"), limit_price: float = Query(None),
-):
-    try:
-        return _call_with_retry(P.preview_manual_order, account_id, code, side, qty, order_type, limit_price)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Preview failed: {type(exc).__name__}") from exc
-
-
 @router.post("/order/submit")
 def order_submit(
     account_id: str = Query(...), code: str = Query(...), side: str = Query(...),

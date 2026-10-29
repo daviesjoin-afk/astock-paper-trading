@@ -833,19 +833,6 @@ def _risk_exit_account_ids(conn, status="running"):
     )
 
 
-def _accounts_by_id(conn, account_ids):
-    """按 id 取账户行（含已退出当前周期、但仍 running 的账户）。"""
-    ids = sorted({str(a) for a in account_ids or () if a})
-    if not ids:
-        return []
-    placeholders = ",".join("?" for _ in ids)
-    return query_rows(
-        conn,
-        f"SELECT * FROM paper_accounts WHERE id IN ({placeholders}) AND status=?",
-        (*ids, "running"),
-    )
-
-
 def _active_cycle_filter(conn, cycle_id, column="id"):
     """兼容 facade：周期经济所有权谓词（实现见 ``paper_cycle_ownership.cycle_ledger_filter``）。
 
@@ -2565,19 +2552,6 @@ def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0,
 ReservationCycleMismatch = PCR.ReservationCycleMismatch
 
 
-def _is_reservation_cycle_mismatch(exc):
-    """该异常是否为「预占周期与订单周期不一致」。
-
-    §4 备用的统一 helper：优先按**类型**判定（``isinstance`` 对真实的
-    :class:`ReservationCycleMismatch`）；仅当异常被跨进程/跨层包装过、类型信息
-    丢失时，才回退到 ``marker`` 字符串比对。刻意不做宽泛的文本 contains —— 那样
-    一旦改写文案就会静默失效。
-    """
-    if isinstance(exc, ReservationCycleMismatch):
-        return True
-    return getattr(exc, "marker", None) == ReservationCycleMismatch.marker
-
-
 def _finish_capital_reservation(conn, order_key, status):
     return PCR.finish_capital_reservation(conn, order_key, status, now_fn=_now)
 
@@ -2780,46 +2754,6 @@ SignalCycleUnprovable = SRES.SignalCycleUnprovable
 SignalOrderUnprovable = SRES.SignalOrderUnprovable
 SignalStaleContext = SRES.SignalStaleContext
 _cycle_signal_provenance = SRES.signal_cycle_provenance
-
-def _volatility_shadow(code, asof_day, price=None):
-    """Return volatility diagnostics only; never changes a risk threshold."""
-    result = {"version": "volatility-shadow-v1", "status": "unknown", "atr20_pct": None,
-              "daily_std_pct": None, "samples": 0, "asof_date": _date(asof_day).isoformat()}
-    try:
-        frame = _completed_kline(str(code), _date(asof_day), inclusive=False)
-        if frame is None or len(frame) < 15:
-            result["reason"] = "历史K线不足15根"
-            return result
-        closes, trs, prev = [], [], None
-        for _, row in frame.iterrows():
-            close = _num(row.get("close"), None)
-            high = _num(row.get("high"), close)
-            low = _num(row.get("low"), close)
-            if not close or close <= 0:
-                continue
-            closes.append(close)
-            if prev:
-                trs.append(max(high - low, abs(high - prev), abs(low - prev)))
-            prev = close
-        if len(closes) < 15:
-            result["reason"] = "有效收盘价不足15根"
-            return result
-        returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
-        recent_tr = trs[-20:]
-        recent_ret = returns[-20:]
-        mean_ret = sum(recent_ret) / len(recent_ret) if recent_ret else 0.0
-        variance = sum((value - mean_ret) ** 2 for value in recent_ret) / max(len(recent_ret) - 1, 1)
-        last_close = _num(price, closes[-1]) or closes[-1]
-        result.update({
-            "status": "ok", "samples": len(closes),
-            "atr20_pct": round(sum(recent_tr) / len(recent_tr) / last_close * 100, 3) if recent_tr else None,
-            "daily_std_pct": round((variance ** 0.5) * 100, 3),
-            "last_close": round(last_close, 4),
-        })
-    except Exception as exc:
-        result["reason"] = f"影子计算失败：{type(exc).__name__}"
-    return result
-
 
 def _recovery_policy(account_id):
     return SPOL.recovery_policy(account_id)
@@ -9472,21 +9406,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     return {"filled": True, "code": code, "qty": qty, "price": round(fill_price, 2)}
 
 
-def _manual_order_plan(*args, **kwargs):
-    """Facade (Phase 2): moved to manual_orders. Original signature: _manual_order_plan("""
-    from manual_orders import _manual_order_plan as _impl
-    return _impl(*args, **kwargs)
-
-
 def preview_manual_order(*args, **kwargs):
     """Facade (Phase 2): moved to manual_orders. Original signature: preview_manual_order("""
     from manual_orders import preview_manual_order as _impl
-    return _impl(*args, **kwargs)
-
-
-def _execute_manual_plan(*args, **kwargs):
-    """Facade (Phase 2): moved to manual_orders. Original signature: _execute_manual_plan(conn, account, plan, order_id, asof_day)"""
-    from manual_orders import _execute_manual_plan as _impl
     return _impl(*args, **kwargs)
 
 
@@ -9633,14 +9555,18 @@ def process_pending_execution_orders(asof_date=None):
 
 
 @PTM.timed("open_execution")
-def execute_open(asof_date=None):
-    """09:31 开盘审批：先复核共享开盘事件，再查询待执行候选。"""
+def execute_open(asof_date=None, *, risk_result=None):
+    """09:31 开盘审批：先复核共享开盘事件，再查询待执行候选。
+
+    ``risk_result`` = 同一轮已跑过的风控结论；不传则自己跑（默认行为不变）。
+    复用的原因与实测收益见 ``docs/COUPLING_BUDGET.md`` 2026-10-29 切片。
+    """
     init_db()
     day = _date(asof_date)
     # Risk exits must run before the opening data gate and before any waitlist
     # order is reconsidered.  A quote gate may stop buys, but never stops a
     # protective sell pass.
-    opening_risk = monitor_risk(day)
+    opening_risk = risk_result if risk_result is not None else monitor_risk(day)
     execution_orders = process_pending_execution_orders(day)
     # P3 审计修复（2026-09-03）：开盘 slot 与 monitor_intraday 一样先做
     # 轻量数据源探活。此前 09:31 只拉快照而不探活，入场门禁
@@ -9845,16 +9771,6 @@ def _replacement_min_hold_days(account_id):
     position may yield a full slot to a materially stronger candidate.
     """
     return int(SPOL.position_review_min_hold_days(account_id))
-
-
-def _score100(value, default=50.0):
-    """Normalize model/rank scores that may be expressed as 0..1 or 0..100."""
-    if value is None:
-        return default
-    value = _num(value, default / 100.0)
-    if 0.0 <= value <= 1.5:
-        value *= 100.0
-    return max(0.0, min(100.0, value))
 
 
 @PTM.timed("execution.waitlist_rank")
@@ -12111,12 +12027,19 @@ def monitor_intraday(asof_datetime=None, force=False):
         if scan_ready else {"status": "blocked", "reason": scan_block, "accounts": []}
     )
     open_result = (
-        execute_open(day)
+        execute_open(day, risk_result=risk_result)
         if scan_ready else
         {"status": "blocked", "reason": scan_block, "orders": [], "manual_orders": [],
          "opening_event": {"orders": []}, "live_scan_gate": live_gate}
     )
     opening_orders = list(open_result.get("orders", []))
+    # 复用的风控单已被 execute_open 并进它的 orders；按对象身份去重，
+    # 否则同一笔风控单会在响应与 job detail 里出现两次（code-review P2）。
+    _already_merged = {id(order) for order in opening_orders}
+    risk_orders_for_result = [
+        order for order in (risk_result.get("orders") or [])
+        if id(order) not in _already_merged
+    ]
     # Reuse the already validated, same-round full-market snapshot.  Reading
     # the previous close snapshot here made live market state ``unknown`` and
     # silently disabled intraday buyback/scale-in even when the scan itself
@@ -12132,7 +12055,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     if not positions:
         return {
             "slot": "intraday", "date": day.isoformat(), "observed": 0,
-            "orders": list(risk_result.get("orders", [])) + opening_orders,
+            "orders": risk_orders_for_result + opening_orders,
             "reason": "首次建仓候选已检查，暂无可做T底仓",
             "bootstrap": bootstrap,
             "opening_event": open_result.get("opening_event"),
@@ -12152,7 +12075,7 @@ def monitor_intraday(asof_datetime=None, force=False):
         if not positions:
             return {
                 "slot": "intraday", "date": day.isoformat(), "observed": 0,
-                "orders": list(risk_result.get("orders", [])) + opening_orders,
+                "orders": risk_orders_for_result + opening_orders,
                 "reason": "持仓在行情抓取期间已被平仓或暂停",
                 "bootstrap": bootstrap,
                 "opening_event": open_result.get("opening_event"),
@@ -12162,7 +12085,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             }
         account_map = {a["id"]: a for a in accounts}
         _, shared_position_value, shared_nav, _, _ = _shared_account_exposure(conn, quotes, day)
-        actions = list(risk_result.get("orders", [])) + opening_orders
+        actions = risk_orders_for_result + opening_orders
 
         def _run_intraday_action(position, action_fn, side):
             """Isolate one strategy/stock action from the rest of the pass."""
@@ -14696,6 +14619,5 @@ _audit = audit
 _archive_current_cycle = archive_current_cycle
 _create_cycle = create_cycle
 _order_cycle_id = order_cycle_id
-_portfolio_allocation_service_config = portfolio_allocation_service_config
 _selection_factor_freshness = selection_factor_freshness
 _rebuild_selection_factor_cache = rebuild_selection_factor_cache

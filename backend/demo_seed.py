@@ -226,6 +226,19 @@ def ensure_demo_data(force=False):
         cycle = PT.create_cycle(conn, DEMO_CAPITAL, status="running", reason="确定性演示账本播种")
         cycle_id = cycle["id"]
         accounts = sorted(cycle["enabled_strategies"])
+        if len(accounts) < 3:
+            # 演示剧本固定需要三个不同的策略账户（各自的账户必须能独立承载
+            # 一条叙事线：正常买入 / 行情过期+止损 / 涨停成交）。当策略注册表
+            # 被收窄（例如只启用 1~2 个策略的部署配置或测试夹具）时，硬取
+            # accounts[1] / accounts[2] 会抛 IndexError —— 而它发生在应用
+            # lifespan 里，会让整个服务起不来（实测 test_operator_boundary 的
+            # 4 个用例因此 setup 超时失败）。这里改为显式跳过播种并留下审计
+            # 证据：服务能启动、账本保持空、原因可查，而不是崩在启动阶段。
+            PT.audit(conn, None, "demo_seed_skipped", json.dumps({
+                "reason": "demo 剧本需要三个策略账户",
+                "enabled_strategies": accounts,
+            }, ensure_ascii=False))
+            return False
         shares = {row["id"]: float(row["initial_cash"]) for row in PT.query_rows(
             conn, "SELECT id,initial_cash FROM paper_accounts WHERE cycle_id=?", (cycle_id,))}
         # deterministic assignment: first two accounts carry the story

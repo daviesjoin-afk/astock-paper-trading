@@ -214,7 +214,7 @@ python work/probe_architecture_boundaries.py
 
 ### 证据
 
-新增 backend/test_architecture_boundary_fixes.py 的 13 项行为回归，覆盖缺价格禁联网、只读连接、缺周期不补写、缓存超时/异常、同步与后台去重、失败退出、真实临时账本租约释放，以及重试不重复运行交易。连同既有相关测试共 77 项通过，0 失败、0 错误、0 跳过；结果 work/architecture_boundary_tests_scoped_result.json。
+新增 backend/test_dashboard_refresh_semantics.py 的 13 项行为回归，覆盖缺价格禁联网、只读连接、缺周期不补写、缓存超时/异常、同步与后台去重、失败退出、真实临时账本租约释放，以及重试不重复运行交易。连同既有相关测试共 77 项通过，0 失败、0 错误、0 跳过；结果 work/architecture_boundary_tests_scoped_result.json。
 
 `work/probe_architecture_boundaries.py` 已改为验证修复后行为：只模拟一次 25 秒等待、返回 503、保留原计算者，并核对 dashboard 禁联网调用契约；输出 work/architecture_boundary_fix_probe_result.json。原审计漏洞实验结果 work/architecture_boundary_probe_result.json 保留。完整行为验证以新增后端测试为准。
 
