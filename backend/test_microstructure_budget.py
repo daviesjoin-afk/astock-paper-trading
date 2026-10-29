@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import alt_data as AD
+import marketdata_transport as MT
 import paper_timing as PTM
 
 
@@ -18,9 +19,18 @@ class MicrostructureBudgetTests(unittest.TestCase):
         # 源级短路是模块级状态：不清空会让"连续失败到阈值"泄漏到同进程的后续
         # 用例（后面的成功用例会拿到 breaker open 而不是真的去请求）。
         AD.reset_micro_breakers()
+        # **传输层**短路同样是进程级状态，而且它是"先短路、后 curl"的开关：
+        # ``alt_data._alt_get`` 在传输短路打开时直接抛 ConnectionError，连
+        # ``requests.get`` 都不调用，于是本文件断言的"3 次 requests、0 次
+        # curl"会变成"2 次 requests、3 次 curl"。
+        # 任何同进程的用例（哪怕在别的模块）只要让该主机连续失败到阈值，
+        # 就会污染这里。这不是本文件的问题，但它必须自证不依赖别的用例的
+        # 顺序 —— 分片组合一变就会暴露。
+        MT.reset_transport_breakers()
 
     def tearDown(self):
         AD.reset_micro_breakers()
+        MT.reset_transport_breakers()
 
     def test_slow_failed_requests_do_not_start_another_transport_budget(self):
         clock = [0.0]

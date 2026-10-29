@@ -355,5 +355,5 @@ test("R35C-C5：AI 面板不自动触发（无 scheduler / cron / 自动批量�
                            "autoGenerate"]) {
     assert.ok(!code.includes(forbidden), `AI 面板不得自动触发：${forbidden}`);
   }
-  assert.ok(section.includes("onclick"), "必须由人显式点击触发");
+  assert.ok(section.includes('data-wb-action="ai-generate"'), "必须由人显式点击触发");
 });

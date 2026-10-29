@@ -19,6 +19,7 @@ import statistics
 from collections import Counter
 from typing import Any
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+from paper_numeric import finite_num as _finite_num
 from adaptive_common import TZ as OWNER_TZ
 import paper_repository as PRP
 import execution_verification as EV
@@ -133,11 +134,7 @@ REGIME_SCALE = {
 
 
 def _num(value, default=0.0):
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else default
-    except (TypeError, ValueError):
-        return default
+    return _finite_num(value, default)
 
 
 def _next_weekday(value):

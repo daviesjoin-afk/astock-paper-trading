@@ -8,19 +8,34 @@ class CouplingBudgetTests(unittest.TestCase):
     # PR272 baseline, with boundaries tightened after each completed slice.
     HEAD_BUDGET = {
         "import_cycles": 0,
-        "deferred_imports": 583,
+        "deferred_imports": 619,
         "private_cross_access": 201,
-        "raw_sql_modules": 135,
-        "paper_table_fanout_max": 49,
-        "cross_domain_edges": 613,
-        "max_file_lines": 16367,
-        "max_function_lines": 1191,
-        "max_function_globals": 56,
-        "duplicate_helpers": 307,
-        "unsuffixed_module_ratio": 0.4139,
+        "raw_sql_modules": 141,
+        "paper_table_fanout_max": 50,
+        "cross_domain_edges": 619,
+        "max_file_lines": 15047,
+        "max_function_lines": 1195,
+        "max_function_globals": 61,
+        "duplicate_helpers": 313,
+        "unsuffixed_module_ratio": 0.3956,
         "import_side_effects": 25,
     }
 
+    # 2026-10-28（公共层瘦身审计切片）：主引擎按业务簇下沉两个 owner ——
+    # `paper_candidate_lanes`（板块热度图与三条候选车道）与
+    # `paper_entry_price_rules`（新开仓价格门禁 + 开盘追高时段余量）。
+    # `paper_trading.py` 15,720 → 15,028 行。代价是 +5 条跨域边与 +1 个
+    # 延迟 import（`alt_data` 的可选导入兜底）—— 这是"归属明确化"的成本，
+    # 不是新增业务耦合。额度按实测**收紧到 0**：基线已包含本次下沉，
+    # 以后任何新增都必须重新登记，而不是自动放行。
+    #
+    # `_candidate_rows` 的全局引用数本轮**没有**下降（它依赖大量引擎内部，
+    # 切开需要先把这些能力各自归位），因此基线直接记为实测值 61，
+    # 额度 0 而不是掩盖这个事实。
+    #
+    # 同日新增 `foundation_violations` 独立守卫：基础层 → 业务域的**单向**
+    # 公开导入既不产生环也不产生私有访问，之前的口径发现不了它。
+    #
     # Reviewed growth from the PR272 repair wave.  The new pipeline adds real
     # modules and call sites; the allowance is explicit instead of silently
     # rebasing the whole budget.  No allowance may be increased without a
@@ -83,15 +98,15 @@ class CouplingBudgetTests(unittest.TestCase):
     # 落到 data_cache 并复用 single-flight 原子发布。664 → 668。额度 42 → 44。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
-        "deferred_imports": 35,
+        "deferred_imports": 0,
         "private_cross_access": 0,
-        "raw_sql_modules": 6,
-        "paper_table_fanout_max": 1,
-        "cross_domain_edges": 4,
+        "raw_sql_modules": 0,
+        "paper_table_fanout_max": 0,
+        "cross_domain_edges": 0,
         "max_file_lines": 0,
-        "max_function_lines": 4,
-        "max_function_globals": 1,
-        "duplicate_helpers": 6,
+        "max_function_lines": 0,
+        "max_function_globals": 0,
+        "duplicate_helpers": 0,
         "unsuffixed_module_ratio": 0.0,
         "import_side_effects": 0,
     }
@@ -118,6 +133,44 @@ class CouplingBudgetTests(unittest.TestCase):
         actual = coupling_metrics.measure_all()
         self.assertEqual([], actual["import_cycle_members"])
         self.assertEqual(0, actual["import_cycles"])
+
+    def test_foundation_never_depends_on_a_business_domain(self):
+        """基础层 → 业务域的反向依赖守卫。
+
+        审计第 4 项：单向的 foundation → 业务域 **公开**导入既不产生导入环，
+        也不产生私有跨模块访问，所以 ``import_cycles`` /
+        ``private_cross_access`` 都发现不了它。这里单独守一条方向。
+
+        白名单里的每一条都是已确认的装配边界（见
+        ``coupling_metrics.FOUNDATION_ALLOWED_DEPENDENCIES`` 的注释）。
+        """
+        violations = coupling_metrics.foundation_violations()
+        self.assertEqual([], violations, (
+            "基础层不得反向依赖业务域；如确有需要，先把该能力下沉为基础层，"
+            "或显式登记为装配边界并写明理由"))
+
+    def test_foundation_allowlist_has_no_unused_entries(self):
+        """白名单里的模块必须真的被用到，否则它会变成"看起来允许"的额度。"""
+        records = list(coupling_metrics._trees(coupling_metrics.production_paths()))
+        modules = {path.stem for path, _, _ in records}
+        edges = {path.stem: coupling_metrics._local_imports(tree, modules) - {path.stem}
+                 for path, _, tree in records}
+        for module, allowed in coupling_metrics.FOUNDATION_ALLOWED_DEPENDENCIES.items():
+            with self.subTest(module=module):
+                self.assertIn(module, coupling_metrics.FOUNDATION_MODULES)
+                used = set(edges.get(module, ())) & set(allowed)
+                self.assertEqual(
+                    set(allowed), used,
+                    "白名单必须与实际依赖一致；多余条目等于默许新的反向依赖")
+
+    def test_foundation_allowlist_never_names_a_foundation_module(self):
+        """白名单是"越过层边界"的例外，不得用来登记基础层之间的依赖。"""
+        for module, allowed in coupling_metrics.FOUNDATION_ALLOWED_DEPENDENCIES.items():
+            with self.subTest(module=module):
+                overlap = set(allowed) & coupling_metrics.FOUNDATION_MODULES
+                self.assertEqual(
+                    set(), overlap,
+                    "基础层之间的依赖不需要登记为例外")
 
 
 if __name__ == "__main__":

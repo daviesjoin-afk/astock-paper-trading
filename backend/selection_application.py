@@ -95,13 +95,93 @@ _SELECTION_CONTEXT_PROVIDER_KEY = {"finance": "finance", "sentiment": "hot_100"}
 
 
 class SelectionRound:
-    """Facts and pure calculations shared by consecutive strategy selections."""
+    """Facts and pure calculations shared by consecutive strategy selections.
+
+    轮次缓存**必须带输入身份**：同一轮里如果输入集合、时间截点或来源变了
+    （例如一轮跨过完整交易日边界，或财务上下文被后台刷新），旧结果就不能
+    再被复用。
+
+    身份由**缓存内容自身**推导，而不是由调用方登记：
+    - 实时快照：报价时间所属的交易日 + 覆盖的股票集合；
+    - 截面：覆盖的股票集合；
+    - 基本面：覆盖的股票集合 + 产生它时的财务输入标识。
+
+    推导不出来身份的缓存项一律视为**不可复用**（fail-closed）：宁可多算一次，
+    也不能把来源不明的旧结果当成"同一份输入"。
+    """
 
     def __init__(self):
         self.live_rows = None
         self.live_map = None
         self.snap_f = None
         self.fund_f = None
+        self._fund_finance_identity = None
+
+    # ---- 输入身份 --------------------------------------------------------
+    def publish_fundamentals(self, frame, finance_identity):
+        """登记基本面结果及其财务输入标识（成对发布，不允许只登记其一）。"""
+        self.fund_f = frame
+        self._fund_finance_identity = finance_identity
+        return frame
+
+    @property
+    def fund_finance_identity(self):
+        return self._fund_finance_identity
+
+    def forget(self, *names):
+        for name in names:
+            if name == "fund":
+                self.fund_f = None
+                self._fund_finance_identity = None
+            elif name == "snap":
+                self.snap_f = None
+            elif name == "live":
+                self.live_rows = None
+                self.live_map = None
+
+
+def _live_snapshot_identity(live_rows):
+    """实时快照的身份：报价所属交易日 + 覆盖的股票集合。"""
+    rows = [row for row in (live_rows or []) if row]
+    if not rows:
+        return None
+    days = tuple(sorted({str(row.get("quote_at") or "")[:10] for row in rows}))
+    codes = tuple(sorted({str(row.get("code")) for row in rows if row.get("code")}))
+    return days, codes
+
+
+def _frame_code_identity(frame):
+    """表格类缓存的身份：覆盖的股票集合。"""
+    if frame is None:
+        return None
+    try:
+        index = frame.index
+    except AttributeError:
+        return None
+    codes = tuple(sorted(str(code) for code in index))
+    return codes or None
+
+
+def _live_rows_belong_to_day(live_rows, expected_live_date):
+    """缓存的实时快照是否确实属于这一天。
+
+    自校验而不是依赖外部登记：只要快照里的报价时间与当前期望交易日一致，
+    就说明它没有被上一轮跨交易日边界留下的旧数据污染。
+    """
+    identity = _live_snapshot_identity(live_rows)
+    if identity is None:
+        return False
+    days, _ = identity
+    return days == (str(expected_live_date or "")[:10],)
+
+
+def _snapshot_covers(snap_f, expected_codes, live_map):
+    """缓存的截面是否仍然覆盖当前应当参与的股票集合。"""
+    if not snap_f:
+        return False
+    cached = {str(row.get("code")) for row in snap_f if row.get("code")}
+    expected = {str(code) for code in expected_codes if code} & set(live_map or {})
+    return expected.issubset(cached)
 
 
 _CURRENT_ROUND = contextvars.ContextVar("selection_round", default=None)
@@ -608,10 +688,20 @@ def _select_uncached(
         return MDSvc.refresh_rows(force=force, now=quote_now,
                                  policy=MDC.CLOSE_SNAPSHOT_POLICY, asof_day=expected_live_date)
 
-    if round_inputs is not None and round_inputs.live_rows is not None:
-        live_rows = round_inputs.live_rows
+    # 一轮之内的缓存必须带输入身份。实时快照的身份由**它自己携带的报价时间**
+    # 推导：只要不属于当前期望交易日（跨过收盘/跨日边界），上一轮的结果就
+    # 不能复用，必须重新取证。
+    cached_live = round_inputs.live_rows if round_inputs is not None else None
+    if (cached_live
+            and _live_rows_belong_to_day(cached_live, expected_live_date)):
+        live_rows = cached_live
         live_map = round_inputs.live_map or {}
     else:
+        if cached_live:
+            # 输入身份变了：上一轮的实时快照作废，必须重新取证。
+            round_inputs.forget("live")
+            round_inputs.forget("snap")
+            round_inputs.forget("fund")
         live_rows = _safe_live_snapshot()
         # A disk fallback can be complete in row count but several days old.  Do
         # not let that cache masquerade as today's real-time quote; force a source
@@ -648,9 +738,14 @@ def _select_uncached(
     if round_inputs is not None:
         round_inputs.live_rows = live_rows
         round_inputs.live_map = live_map
-    if round_inputs is not None and round_inputs.snap_f is not None:
+    # 截面缓存的身份 = 它覆盖的股票集合。必须仍然覆盖当前应当参与的股票，
+    # 否则上一轮的结果不能复用。
+    if (round_inputs is not None and round_inputs.snap_f is not None
+            and _snapshot_covers(round_inputs.snap_f, covered_codes, live_map)):
         snap_f = round_inputs.snap_f
     else:
+        if round_inputs is not None:
+            round_inputs.forget("snap")
         snap_f = [
             {**row, **live_map[row["code"]]}
             for row in universe_by_code.values()
@@ -668,13 +763,22 @@ def _select_uncached(
     # 两套 cutoff 必须分开：``complete_cutoff`` 是"最近完整交易日"（盘中即昨天），
     # 只用于已收盘日线与财务披露；当日实时截面（PE/PB/换手/资金/行业）的决策时点
     # 是**现在**。混用会把盘中每一行都判成 future 并清空这些列。
-    if round_inputs is not None and round_inputs.fund_f is not None:
-        fund_f = round_inputs.fund_f
+    # 财务输入的身份由报告期决定；财务上下文被后台刷新后身份即改变。
+    finance_identity = "|".join(str(value) for value in (finance.get("report_dates") or ()))
+    cached_fund = round_inputs.fund_f if round_inputs is not None else None
+    snap_codes = frozenset(str(row.get("code")) for row in (snap_f or []) if row.get("code"))
+    if (cached_fund is not None
+            and round_inputs.fund_finance_identity == finance_identity
+            and _frame_code_identity(cached_fund) is not None
+            and snap_codes.issubset(set(_frame_code_identity(cached_fund)))):
+        fund_f = cached_fund
     else:
+        if round_inputs is not None:
+            round_inputs.forget("fund")
         fund_f = F.compute_fundamental_factors(
             snap_f, finance, asof=complete_cutoff, snapshot_asof=F.live_snapshot_asof())
         if round_inputs is not None:
-            round_inputs.fund_f = fund_f
+            round_inputs.publish_fundamentals(fund_f, finance_identity)
     # Technical factors remain anchored to downloaded complete daily K-lines;
     # mutable same-day fields must come from this validated live snapshot.
     price_f = price_f.copy()
@@ -709,11 +813,15 @@ def _select_uncached(
         super_rows = _load_super_flow(topn=max(len(snap_f), 100))
     except Exception:
         super_rows = []
-    has_expected_super = any(
-        str(r.get("quote_at") or "")[:10] == expected_live_date
-        and _quote_age_ok(r.get("quote_at"), quote_age_limit)
-        for r in (super_rows or [])
-    )
+    # 资金流行的新鲜度判定只做一次：下面既用它判断"是否需要后台刷新"，
+    # 又用它过滤注入横截面的行。两次判定必须基于**同一份**结果，否则
+    # "认为需要刷新"和"认为可用"可能互相矛盾。
+    fresh_super_rows = [
+        row for row in (super_rows or [])
+        if str(row.get("quote_at") or "")[:10] == expected_live_date
+        and _quote_age_ok(row.get("quote_at"), quote_age_limit)
+    ]
+    has_expected_super = bool(fresh_super_rows)
     if not has_expected_super:
         _schedule_super_flow_refresh(topn=max(len(snap_f), 100))
     # The flow rank endpoint is cached independently from the quote snapshot.
@@ -721,10 +829,8 @@ def _select_uncached(
     # such rows silently turn stale capital-flow data into a live factor.
     realtime_super_flow = {
         str(row.get("code")): row.get("super_net")
-        for row in super_rows
+        for row in fresh_super_rows
         if row.get("code")
-        and str(row.get("quote_at") or "")[:10] == expected_live_date
-        and _quote_age_ok(row.get("quote_at"), quote_age_limit)
         and isinstance(row.get("super_net"), (int, float))
     }
     news_hits = _LIVE_CACHE["news_hits"]

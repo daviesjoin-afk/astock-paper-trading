@@ -128,6 +128,43 @@ class BridgeCoverageTests(unittest.TestCase):
             imported.update(part.strip().split(" as ")[-1].strip() for part in names.split(","))
         self.assertEqual(set(), self.bridged - imported, "bridge.js 赋值了没有 import 的名字")
 
+    def test_settings_page_owns_its_actions_without_the_global_bridge(self):
+        """设置中心已经迁移到页面事件委托，行为必须留在自己页面里。
+
+        这一条是**方向**守卫：既不许内联处理器回流，也不许设置动作回到
+        window 全局桥上。两边都要机械证明，而不是靠"跑起来没报错"。
+        """
+        settings_sources = {
+            path: text for path, text in self.modules.items()
+            if os.path.basename(path) in (
+                "settings.js", "ai-provider-settings.js", "ai-capability.js")
+        }
+        self.assertTrue(settings_sources, "找不到设置中心的源文件")
+        for path, text in settings_sources.items():
+            with self.subTest(module=os.path.basename(path)):
+                self.assertNotRegex(
+                    text, r"\bon(?:click|change|input|submit)\s*=",
+                    "设置中心不允许内联事件处理器")
+
+        settings_names = {
+            "unlockOperatorTab", "clearOperatorTab", "clearWxpusherToken",
+            "resetSettingsSection", "saveAiProvider", "saveAiReviewMode",
+            "saveAiSlot", "saveSettingsSection", "setSettingsSection",
+            "testAiSlot", "testWxpusher", "editAiProvider", "changeAiSlotProvider", "refreshAiProviderModels",
+            "issueAiCapability", "revokeAiCapability", "refreshAiCapabilities",
+            "clearAiProviderKey",
+        }
+        leaked = sorted(settings_names & self.bridged)
+        self.assertEqual([], leaked,
+                         "设置中心的动作不应再挂到 window 全局桥")
+
+        # 页面必须自己声明动作分发入口。
+        settings_text = self.modules[
+            os.path.join(SRC, "features", "settings.js")]
+        self.assertIn("installSettingsActions", settings_text)
+        boot = self.modules[os.path.join(SRC, "boot.js")]
+        self.assertIn("installSettingsActions(document)", boot)
+
 
 class CrossModuleImportTests(unittest.TestCase):
     """模块引用别的模块的声明时，必须有对应 import（漏了只在运行时炸）。"""

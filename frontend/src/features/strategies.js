@@ -37,6 +37,56 @@ export var WB_INDICATOR_LABELS={ma:'均线 MA',ema:'指数均线 EMA',rsi:'RSI',
 
 export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder',challengerReportId:'',pinnedCandidatePin:null,aiCandidateView:null};
 
+// 工坊自己承接静态按钮和重绘后的动态按钮，无需 window 全局桥。
+export function installStrategyWorkbenchActions(root){
+  var container=root||(typeof document!=='undefined'?document:null);
+  if(!container||typeof container.addEventListener!=='function') return false;
+  var page=container.querySelector('#p-strategies');
+  if(!page) return false;
+  if(page.dataset.wbActionsInstalled) return true;
+  page.dataset.wbActionsInstalled='true';
+  page.addEventListener('click', function(event){
+    var button=event.target&&event.target.closest?event.target.closest('[data-wb-action]'):null;
+    if(!button||!page.contains(button)||button.disabled) return;
+    var data=button.dataset;
+    var actions={
+      'reload':function(){return loadStrategyWorkbench(true);},
+      'new':wbNewStrategy,
+      'origin-filter':function(){return wbSetOriginFilter(data.wbOrigin,button);},
+      'status-filter':function(){return wbSetStatusFilter(data.wbStatus,button);},
+      'reset-filters':wbResetFilters,
+      'edit':function(){return wbOpenEditor(data.wbId);},
+      'clone':function(){return wbCloneStrategy(data.wbId);},
+      'clone-first-builtin':wbCloneFirstBuiltin,
+      'delete':function(){return wbDeleteDraft(data.wbId);},
+      'detail':function(){return wbOpenDetail(data.wbId);},
+      'back':wbBackToList,
+      'mode':function(){return wbSetMode(data.wbMode);},
+      'add-condition':wbAddCondition,
+      'remove-condition':function(){return wbRemoveCondition(button);},
+      'format-dsl':wbFormatDsl,
+      'conditions-to-dsl':wbFromConditionsToDsl,
+      'save':wbSaveDraft,
+      'validate':wbValidateDraft,
+      'preview':wbPreviewDraft,
+      'challenger':function(){return wbLoadChallengerReport(data.wbId);},
+      'ai-generate':wbAiGenerateCandidates,
+      'transition':function(){return wbTransition(data.wbId,data.wbTargetState);},
+      'create-proposal':function(){return wbCreatePromotionProposal(data.wbId,data.wbTargetState);},
+      'apply-proposal':function(){return wbApplyPromotionProposal(data.wbId,data.wbFingerprint);}
+    };
+    if(!Object.prototype.hasOwnProperty.call(actions,data.wbAction)) return;
+    event.preventDefault();
+    Promise.resolve().then(actions[data.wbAction]).catch(function(error){
+      toast('操作失败：'+(error.message||error), {tone:'danger'});
+    });
+  });
+  page.addEventListener('input', function(event){
+    if(event.target.matches('[data-wb-input="search"]')) wbRenderList();
+  });
+  return true;
+}
+
 // 详情页里仍会出现 exact id；展示时优先用注册表里的中文名，id 只作为小字。
 function wbName(strategyId){
   var hit=(WB_STATE.items||[]).filter(function(x){return x.id===strategyId;})[0];
@@ -82,7 +132,7 @@ export async function loadStrategyWorkbench(force){
       }
       return data;
     }catch(e){
-      if(target) target.innerHTML='<div class="strategy-workbench-error"><b>无法加载策略</b><span>'+adaptiveEsc(e.message||e)+'</span><button type="button" onclick="loadStrategyWorkbench(true)">重试</button></div>';
+      if(target) target.innerHTML='<div class="strategy-workbench-error"><b>无法加载策略</b><span>'+adaptiveEsc(e.message||e)+'</span><button type="button" data-wb-action="reload">重试</button></div>';
       throw e;
     }finally{ window._wbLoading=null; }
   })();
@@ -126,14 +176,14 @@ export function wbCard(item){
   var hold=meta.hold?meta.hold+' 日':'—';
   var actions='';
   if(userCard){
-    var sid='\''+adaptiveEsc(item.id)+'\'';
-    actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+sid+')">编辑并生成新版本</button>';
-    actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">复制为新草稿</button>';
-    if(item.status==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除未使用草稿</button>';
+    var sid=adaptiveEsc(item.id);
+    actions+='<button type="button" data-testid="strategy-edit" data-wb-action="edit" data-wb-id="'+sid+'">编辑并生成新版本</button>';
+    actions+='<button type="button" data-testid="strategy-clone" data-wb-action="clone" data-wb-id="'+sid+'">复制为新草稿</button>';
+    if(item.status==='draft') actions+='<button type="button" class="strategy-card-danger" data-wb-action="delete" data-wb-id="'+sid+'">删除未使用草稿</button>';
   }else{
-    actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
+    actions='<button type="button" data-testid="strategy-clone" data-wb-action="clone" data-wb-id="'+adaptiveEsc(item.id)+'">复制并编辑</button>';
   }
-  actions+='<button type="button" data-testid="strategy-open-detail" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
+  actions+='<button type="button" data-testid="strategy-open-detail" data-wb-action="detail" data-wb-id="'+adaptiveEsc(item.id)+'">版本与详情</button>';
   // PR-57：卡片分两层。主视觉 = 用户判断"这是什么、现在什么状态、能不能参与"所需的信息；
   // 技术标识（id/校验和/实现键/原始指纹）收进 <details> 披露区，降低默认认知负荷。
   var runtime=item.runtime||{};
@@ -199,17 +249,17 @@ export function wbRenderList(){
     list.innerHTML=WB_STATE.originFilter==='user'
       ? '<div class="strategy-workbench-empty" data-testid="strategy-empty-user"><b>还没有自定义策略</b><p>从空白策略开始，或复制一套内置策略后修改。</p>'
         +'<div class="strategy-workbench-empty-actions">'
-        +'<button type="button" class="strategy-workbench-primary" data-testid="strategy-empty-create" onclick="wbNewStrategy()">创建第一个策略</button>'
-        +'<button type="button" class="ghost" data-testid="strategy-empty-clone-builtin" onclick="wbCloneFirstBuiltin()">复制内置策略</button>'
+        +'<button type="button" class="strategy-workbench-primary" data-testid="strategy-empty-create" data-wb-action="new">创建第一个策略</button>'
+        +'<button type="button" class="ghost" data-testid="strategy-empty-clone-builtin" data-wb-action="clone-first-builtin">复制内置策略</button>'
         +'</div></div>'
-      : '<div class="strategy-workbench-empty"><b>没有匹配的策略</b><p>换个来源/状态筛选，或清空搜索词再试。</p><button type="button" class="ghost" onclick="wbResetFilters()">重置筛选</button></div>';
+      : '<div class="strategy-workbench-empty"><b>没有匹配的策略</b><p>换个来源/状态筛选，或清空搜索词再试。</p><button type="button" class="ghost" data-wb-action="reset-filters">重置筛选</button></div>';
     return;
   }
   var html='';
   if(users.length){
     html+='<h3 class="strategy-list-group">我的策略</h3><div class="strategy-card-grid">'+users.map(wbCard).join('')+'</div>';
   }else if(WB_STATE.originFilter==='all'&&WB_STATE.statusFilter==='all'&&!($('wbSearch')&&$('wbSearch').value.trim())){
-    html+='<div class="strategy-workbench-empty strategy-workbench-empty-inline"><b>还没有自定义策略</b><p>内置策略可直接复制成自定义策略后修改。</p><button type="button" class="strategy-workbench-primary" onclick="wbNewStrategy()">创建第一个策略</button></div>';
+    html+='<div class="strategy-workbench-empty strategy-workbench-empty-inline"><b>还没有自定义策略</b><p>内置策略可直接复制成自定义策略后修改。</p><button type="button" class="strategy-workbench-primary" data-wb-action="new">创建第一个策略</button></div>';
   }
   // 内置模板共有 5 套，但当前只启用 3 套。把"当前可用"与"已退役/未启用"
   // 分开：默认视野只呈现真正能参与下一周期的策略，历史模板折叠保留。
@@ -272,7 +322,7 @@ export function wbConditionRowHtml(row){
       +'<select data-wb-indicator'+(row.rightKind==='indicator'?'':' hidden')+'>'+inds+'</select>'
       +'<input type="number" data-wb-window value="'+(row.rightWindow!=null?row.rightWindow:20)+'" min="2" max="250" aria-label="窗口"'+(row.rightKind==='indicator'?'':' hidden')+'>'
       +'<input type="number" data-wb-const value="'+(row.rightConst!=null?row.rightConst:'')+'" step="any" aria-label="数值"'+(row.rightKind==='const'?'':' hidden')+'></span>'
-    +'<button type="button" class="strategy-condition-remove" aria-label="删除该条件" onclick="wbRemoveCondition(this)">✕</button>'
+    +'<button type="button" class="strategy-condition-remove" aria-label="删除该条件" data-wb-action="remove-condition">✕</button>'
     +'</div>';
 }
 
@@ -306,7 +356,7 @@ export function wbRenderEditor(item){
   if(!conditions.length) conditions=[{}];
   var meta=item&&item.metadata||{};
   editor.innerHTML='<header class="strategy-editor-head"><h3>'+(isNew?'新建自定义策略':'编辑策略 · '+adaptiveEsc(item.name||item.id))+'</h3>'
-    +'<div><button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
+    +'<div><button type="button" data-wb-action="back">返回列表</button></div></header>'
     +'<div class="strategy-editor-columns"><section class="strategy-editor-form">'
     +'<h4>基本信息</h4>'
     +'<label>策略名称 <input data-testid="strategy-name" id="wbName" type="text" maxlength="64" value="'+adaptiveEsc(item?item.name:'')+'" placeholder="例如：趋势放量突破"></label>'
@@ -314,21 +364,21 @@ export function wbRenderEditor(item){
            :'<p class="strategy-editor-static">ID：<b>'+adaptiveEsc(item.id)+'</b> · 当前版本 v'+(item.version||item.current_version||1)+'</p>')
     +'<label>策略说明 <textarea id="wbDescription" rows="2" maxlength="300">'+adaptiveEsc(item?item.description:'')+'</textarea></label>'
     +'<h4>策略条件</h4>'
-    +'<div class="strategy-editor-modes"><button type="button" class="active" data-testid="strategy-mode-builder" id="wbModeBuilder" onclick="wbSetMode(\'builder\')">可视化模式</button><button type="button" data-testid="strategy-mode-dsl" id="wbModeDsl" onclick="wbSetMode(\'dsl\')">高级 DSL / JSON</button></div>'
+    +'<div class="strategy-editor-modes"><button type="button" class="active" data-testid="strategy-mode-builder" id="wbModeBuilder" data-wb-action="mode" data-wb-mode="builder">可视化模式</button><button type="button" data-testid="strategy-mode-dsl" id="wbModeDsl" data-wb-action="mode" data-wb-mode="dsl">高级 DSL / JSON</button></div>'
     +'<p class="strategy-editor-note" id="wbCombineNote">条件之间以 AND 组合</p>'
     +'<div id="wbConditions" class="strategy-conditions" data-testid="strategy-condition-builder">'+conditions.map(wbConditionRowHtml).join('')+'</div>'
-    +'<button type="button" class="strategy-condition-add" data-testid="strategy-add-condition" onclick="wbAddCondition()">+ 添加条件</button>'
+    +'<button type="button" class="strategy-condition-add" data-testid="strategy-add-condition" data-wb-action="add-condition">+ 添加条件</button>'
     +'<div id="wbDslPane" hidden><p class="strategy-editor-note">这里只接受声明式策略 DSL（JSON），不执行 Python / SQL / Shell。</p>'
     +'<textarea data-testid="strategy-dsl" id="wbDslText" class="strategy-dsl-input" rows="10" spellcheck="false" placeholder=\'{"op":"and","args":[…]}\''+'>'+adaptiveEsc(dsl)+'</textarea>'
-    +'<div class="strategy-editor-dsl-tools"><button type="button" onclick="wbFormatDsl()">格式化</button><button type="button" onclick="wbFromConditionsToDsl()">从条件生成</button></div></div>'
+    +'<div class="strategy-editor-dsl-tools"><button type="button" data-wb-action="format-dsl">格式化</button><button type="button" data-wb-action="conditions-to-dsl">从条件生成</button></div></div>'
     +'<h4>运行参数</h4>'
     +'<label>候选数量 <input id="wbCandidateTopn" type="number" min="1" max="50" value="'+(meta.candidate_topn!=null?meta.candidate_topn:10)+'"></label>'
     +'<label>持有周期（天） <input id="wbHold" type="number" min="1" max="60" value="'+(meta.hold!=null?meta.hold:8)+'"></label>'
     +(isNew?'':'<label>变更说明（保存后生成新版本）<input id="wbChangeNote" type="text" maxlength="120" value="Web editor update"></label>')
     +'<footer class="strategy-editor-footer">'
-    +'<button type="button" class="strategy-workbench-primary" data-testid="strategy-save" onclick="wbSaveDraft()">保存草稿</button>'
-    +'<button type="button" data-testid="strategy-validate" onclick="wbValidateDraft()">验证策略</button>'
-    +'<button type="button" data-testid="strategy-preview" onclick="wbPreviewDraft()">预览风险与资金</button>'
+    +'<button type="button" class="strategy-workbench-primary" data-testid="strategy-save" data-wb-action="save">保存草稿</button>'
+    +'<button type="button" data-testid="strategy-validate" data-wb-action="validate">验证策略</button>'
+    +'<button type="button" data-testid="strategy-preview" data-wb-action="preview">预览风险与资金</button>'
     +'</footer>'
     +'<div id="wbValidateResult" class="strategy-preview-result" role="status" aria-live="polite"></div>'
     +'</section>'
@@ -670,7 +720,7 @@ export async function wbDeleteDraft(strategyId){
 export function wbRenderNotFound(strategyId,message){
   var box=$('wbDetail'); if(!box) return;
   box.innerHTML='<header class="strategy-editor-head"><h3>策略不存在</h3>'
-    +'<div><button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
+    +'<div><button type="button" data-wb-action="back">返回列表</button></div></header>'
     +'<div class="strategy-editor-note" data-testid="strategy-not-found">'
     +'找不到策略 <code>'+adaptiveEsc(strategyId)+'</code>。它可能已被删除，或链接里的 ID 拼错了。'
     +(message?'<br><small>'+adaptiveEsc(message)+'</small>':'')+'</div>';
@@ -720,7 +770,7 @@ export function wbChallengerHtml(strategyId,view){
     return '<li>'+adaptiveEsc(item.role||'')+' · '+adaptiveEsc(item.status||'')+' · v'+adaptiveEsc(String(item.id))+'</li>';}).join('');
   return '<h4>Active / Challenger 对比（高级 · 两条晋级链互相独立）</h4>'
     +'<label>Exact ShadowComparisonReport id<input id="wbChallengerReport" maxlength="64" autocomplete="off" value="'+adaptiveEsc(WB_STATE.challengerReportId||'')+'"></label>'
-    +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" onclick="wbLoadChallengerReport(\''+adaptiveEsc(strategyId)+'\')">按 exact id 读取比对证据</button></div>'
+    +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" data-wb-action="challenger" data-wb-id="'+adaptiveEsc(strategyId)+'">按 exact id 读取比对证据</button></div>'
     +'<dl class="strategy-preview-grid">'
     +'<dt>Active</dt><dd data-testid="challenger-active">'+wbLegHtml(active)+'</dd>'
     +'<dt>Challenger</dt><dd data-testid="challenger-challenger">'+wbLegHtml(challenger)+'</dd>'
@@ -860,7 +910,7 @@ export function wbAiCandidateHtml(strategyId, view){
     +'<label>Provider slot<select id="wbAiProviderSlot" data-testid="ai-provider-slot">'
     +'<option value="">默认槽位</option><option value="ai1">ai1</option><option value="ai2">ai2</option></select></label>'
     +'<label>Max candidates（≤ 32）<input id="wbAiMaxCandidates" data-testid="ai-max-candidates" type="number" min="1" max="32" value="32"></label>'
-    +'<button type="button" data-testid="ai-generate" onclick="wbAiGenerateCandidates()">生成 AI 候选</button></div>'
+    +'<button type="button" data-testid="ai-generate" data-wb-action="ai-generate">生成 AI 候选</button></div>'
     +'<div data-testid="ai-candidate-panel">'+(result||'<p>尚未发起生成。</p>')+'</div>';
 }
 export function wbCandidatesHtml(strategyId,view){
@@ -986,7 +1036,7 @@ export async function wbOpenDetail(strategyId){
   }).join('');
   var eligible=(lifecycle.eligible_transitions||[]);
   var safetyButtons=(lifecycle.safety_transitions||[]).map(function(target){
-    return '<button type="button" class="ghost" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" onclick="wbTransition(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">提交「'+adaptiveEsc(strategyStatusLabel(target))+'」状态变更意图</button>';
+    return '<button type="button" class="ghost" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" data-wb-action="transition" data-wb-id="'+adaptiveEsc(strategyId)+'" data-wb-target-state="'+adaptiveEsc(target)+'">提交「'+adaptiveEsc(strategyStatusLabel(target))+'」状态变更意图</button>';
   }).join('');
   var promotionButtons=(lifecycle.promotion_transitions||[]).map(function(target){
     var allowed=eligible.indexOf(target)>=0;
@@ -994,7 +1044,7 @@ export async function wbOpenDetail(strategyId){
     var reasons=wbReasonList(decision.blocking_reasons);
     return '<article class="strategy-promotion-target" data-testid="promotion-target-'+adaptiveEsc(target)+'"><b>'+adaptiveEsc(lifecycle.state)+' → '+adaptiveEsc(target)+'</b>'
       +'<p>当前后端判断：'+(allowed?'eligible':'blocked')+'</p>'+(reasons?'<ul>'+reasons+'</ul>':'')
-      +'<button type="button" onclick="wbCreatePromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">为该目标创建 proposal</button></article>';
+      +'<button type="button" data-wb-action="create-proposal" data-wb-id="'+adaptiveEsc(strategyId)+'" data-wb-target-state="'+adaptiveEsc(target)+'">为该目标创建 proposal</button></article>';
   }).join('');
   var proposals=(lifecycle.proposals||[]).map(function(proposal){
     var decision=proposal.decision||{};
@@ -1002,7 +1052,7 @@ export async function wbOpenDetail(strategyId){
     var reasons=wbReasonList(decision.blocking_reasons);
     var evidence='<small>R29 '+adaptiveEsc(bundle.r29_run_key||'未指定')+' · R30 '+adaptiveEsc(bundle.r30_report_key||'未指定')+'</small>';
     var apply=proposal.proposer_type!=='ai'&&decision.eligible
-      ?'<button type="button" data-testid="promotion-apply" onclick="wbApplyPromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(proposal.proposal_fingerprint)+'\')">重新验证并提交 transition</button>':'';
+      ?'<button type="button" data-testid="promotion-apply" data-wb-action="apply-proposal" data-wb-id="'+adaptiveEsc(strategyId)+'" data-wb-fingerprint="'+adaptiveEsc(proposal.proposal_fingerprint)+'">重新验证并提交 transition</button>':'';
     return '<article class="strategy-proposal" data-testid="strategy-promotion-proposal"><b>PROPOSAL · '+adaptiveEsc(proposal.proposer_type)+' / '+adaptiveEsc(proposal.proposer_id)+'</b>'
       +'<p>'+adaptiveEsc(proposal.from_state)+' → '+adaptiveEsc(proposal.target_state)+' · '+(decision.eligible?'后端当前 eligible':'blocked')+'</p>'
       +evidence+(proposal.rationale?'<p>'+adaptiveEsc(proposal.rationale)+'</p>':'')+(reasons?'<ul>'+reasons+'</ul>':'')+apply+'</article>';
@@ -1014,8 +1064,8 @@ export async function wbOpenDetail(strategyId){
     +'<label>Future paper runtime evidence ref<input id="wbPromotionPaper" autocomplete="off"></label></div>';
   var historyHtml=historyRows||'<li>当前 exact version 尚无生命周期事件。</li>';
   var editAction=item.origin==='user'
-    ? '<button type="button" class="strategy-workbench-primary" data-testid="strategy-edit-detail" onclick="wbOpenEditor(\''+adaptiveEsc(strategyId)+'\')">编辑策略</button>'
-    : '<button type="button" class="strategy-workbench-primary" data-testid="strategy-clone-detail" onclick="wbCloneStrategy(\''+adaptiveEsc(strategyId)+'\')">复制并编辑</button>';
+    ? '<button type="button" class="strategy-workbench-primary" data-testid="strategy-edit-detail" data-wb-action="edit" data-wb-id="'+adaptiveEsc(strategyId)+'">编辑策略</button>'
+    : '<button type="button" class="strategy-workbench-primary" data-testid="strategy-clone-detail" data-wb-action="clone" data-wb-id="'+adaptiveEsc(strategyId)+'">复制并编辑</button>';
   var summary='<section class="strategy-detail-summary" data-testid="strategy-detail-summary"><dl class="strategy-preview-grid">'
     +'<dt>策略名称</dt><dd>'+adaptiveEsc(item.name||item.id)+'</dd>'
     +'<dt>当前状态</dt><dd>'+wbStatusBadge(lifecycle.state||item.status)+'</dd>'
@@ -1024,7 +1074,7 @@ export async function wbOpenDetail(strategyId){
     +'<dt>运行时就绪</dt><dd>'+(item.runtime_ready===false?'否 · '+adaptiveEsc(item.runtime_error||''):'是')+'</dd>'
     +'</dl><p class="strategy-detail-hint">日常修改请使用右上角「编辑策略」；下方是技术证据与生命周期操作，除非明确需要，不要直接改变生命周期状态。</p></section>';
   box.innerHTML='<header class="strategy-editor-head"><h3>'+adaptiveEsc(item.name||item.id)+' '+wbStatusBadge(lifecycle.state||item.status)+'</h3>'
-    +'<div>'+editAction+'<button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
+    +'<div>'+editAction+'<button type="button" data-wb-action="back">返回列表</button></div></header>'
     +summary
     +'<section class="strategy-lifecycle-read-model" data-testid="strategy-lifecycle-read-model"><h4>生命周期状态（技术）</h4><dl class="strategy-preview-grid">'
     +'<dt>精确版本（Exact version）</dt><dd>v'+adaptiveEsc(lifecycle.version||currentVersion)+'</dd><dt>版本校验和（Checksum）</dt><dd><code>'+adaptiveEsc(lifecycle.checksum||item.current_checksum||'')+'</code></dd>'

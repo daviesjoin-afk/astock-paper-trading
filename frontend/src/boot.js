@@ -7,8 +7,8 @@ import { loadPaperExecution } from "./features/execution.js";
 import { installPaperActions, loadPaper, loadPaperResearchValidation, loadPaperStrategyCenter, loadPortfolioWorkspace } from "./features/paper.js";
 import { installPaperRiskActions, loadPaperRisk } from "./features/risk.js";
 import { installSelectionActions, loadDataValidity, loadMarketGate, loadPaperSelection, loadStrategies } from "./features/selection.js";
-import { loadSettings } from "./features/settings.js";
-import { loadStrategyWorkbench } from "./features/strategies.js";
+import { installSettingsActions, loadSettings } from "./features/settings.js";
+import { installStrategyWorkbenchActions, loadStrategyWorkbench } from "./features/strategies.js";
 
 window.__ASTOCK_ADAPTIVE_UI_BUILD__='20261012-runtime-followup';
 
@@ -31,6 +31,8 @@ installAdaptiveOperatorActions(document);
 installPaperRiskActions(document);
 installPaperActions(document);
 installSelectionActions(document);
+installStrategyWorkbenchActions(document);
+installSettingsActions(document);
 
 /* 页面加载时自动执行 */
 setTimeout(function(){if(document.getElementById('aiStatusCards')) loadEvolutionStatus();},1000);

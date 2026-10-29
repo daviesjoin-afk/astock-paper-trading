@@ -15,6 +15,7 @@ from pathlib import Path
 import tempfile
 
 import data_fetcher as dfc
+from paper_numeric import coerced_number as _coerced_number
 import data_paths
 import market_data_contract as MDC
 import market_data_service as market
@@ -29,14 +30,8 @@ ARCHIVE_KEEP_DAYS = 60
 MAX_LARGEST = 5
 
 
-def _number(value):
-    if isinstance(value, bool):
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return value if math.isfinite(value) else None
+# 数值读取合同的唯一 owner：宽松解析、严格有效（布尔/NaN/无穷一律未知）。
+_number = _coerced_number
 
 
 def summarize(rows, *, top=MAX_LARGEST):

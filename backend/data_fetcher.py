@@ -1727,21 +1727,73 @@ def fetch_kline(code, beg="20230101", end="20500101", klt=101, fqt=1, secid=None
 def kline_cache_path(code):
     return os.path.join(KLINE_DIR, f"{code}.csv")
 
+def _kline_bar_dates(index):
+    """把日线索引解析成逐行的自然日；无法解析的行返回 None。
+
+    返回 None 表示整段索引都不可用（例如混合时区字符串索引），此时调用方
+    必须 fail-closed，绝不能退化成"返回原始未截断数据"。
+
+    自然日取索引自身的**本地日期**（缓存 CSV 写出的就是本地日期），因此
+    不用 UTC 归一化，避免带时区索引被挪到前一天。
+    """
+    if isinstance(index, pd.DatetimeIndex):
+        values = list(index.date)
+    else:
+        values = list(index)
+    dates = []
+    for value in values:
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            dates.append(None)
+            continue
+        if isinstance(value, dt.datetime):
+            dates.append(value.date())
+            continue
+        if isinstance(value, dt.date):
+            dates.append(value)
+            continue
+        text = str(value).strip()
+        if not text:
+            dates.append(None)
+            continue
+        try:
+            dates.append(dt.date.fromisoformat(text[:10]))
+            continue
+        except ValueError:
+            pass
+        try:
+            parsed = pd.to_datetime(text, errors="raise")
+        except (TypeError, ValueError, OverflowError):
+            dates.append(None)
+            continue
+        try:
+            dates.append(parsed.date() if hasattr(parsed, "date") else None)
+        except (TypeError, ValueError):
+            dates.append(None)
+    return dates
+
+
 def completed_kline(code, cutoff_date, *, inclusive=True):
     """K 线 owner：只返回截止指定完整交易日的日线。
 
     盘中"当日 K 线"是半根，禁止被当成完整收盘数据使用；这个截断语义原来
     只存在于交易引擎内部，下层模块必须能自己取到同一份事实。
+
+    截断失败的历史语义是 fail-closed：宁可返回空（=没有可用日线证据），
+    也绝不把截止日之后的原始行交给决策使用。日期无法解析的行会被丢弃，
+    因为"无法确认是否越界"等同于越界风险。
     """
     frame = load_cached_kline(str(code))
     if frame is None or frame.empty:
         return frame
     cutoff = dt.date.fromisoformat(str(cutoff_date)[:10])
-    try:
-        mask = frame.index.date <= cutoff if inclusive else frame.index.date < cutoff
-        return frame.loc[mask].copy()
-    except Exception:
-        return frame
+    dates = _kline_bar_dates(frame.index)
+    mask = [
+        value is not None and (value <= cutoff if inclusive else value < cutoff)
+        for value in dates
+    ]
+    truncated = frame.loc[mask].copy()
+    truncated.attrs.update(dict(getattr(frame, "attrs", {}) or {}))
+    return truncated
 
 
 def load_cached_kline(code):

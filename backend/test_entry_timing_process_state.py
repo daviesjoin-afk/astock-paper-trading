@@ -67,6 +67,41 @@ for i in range(12):
         state = json.loads(self.path.read_text())
         self.assertEqual(len(state['tq_breakout']), 24)
 
+    def test_a_contended_lock_never_drops_the_symbol(self):
+        """拿不到文件锁时必须**重试**，不能 fail-open 丢状态。
+
+        Windows 的 ``msvcrt.locking`` 只尝试 10 次就抛 OSError；POSIX 的
+        ``os.lockf`` 是阻塞的。两种实现在"拿不到锁"时都可能让异常冒到
+        ``evaluate``，而它的兜底是 fail-open 放行**且不落盘** —— 那个标的
+        就被静默丢掉了（实测表现为 24 个标的只落盘 23 个）。
+
+        这里把锁调用打成"前两次失败、第三次成功"，断言状态仍然写进去了。
+        """
+        module = self.worker()
+        module.STATE_PATH = str(self.path)
+        module._state = None
+        real_locking = module.msvcrt.locking if hasattr(module, 'msvcrt') else None
+        if real_locking is None:  # pragma: no cover - POSIX path.
+            self.skipTest("POSIX 的 os.lockf 是阻塞的，不会在这里抛错")
+        attempts = []
+
+        def flaky(fd, mode, length):
+            attempts.append(mode)
+            if len(attempts) < 3:
+                raise OSError(36, "Resource deadlock avoided")
+            return real_locking(fd, mode, length)
+
+        module.msvcrt.locking = flaky
+        try:
+            allowed, info = module.evaluate('tq_breakout', '600001', 10, 1, now=self.now)
+        finally:
+            module.msvcrt.locking = real_locking
+        self.assertNotEqual(info.get('state'), 'error', info)
+        self.assertIsInstance(allowed, bool)
+        state = json.loads(self.path.read_text())
+        self.assertIn('600001', state['tq_breakout'],
+                      '拿不到锁必须重试到成功，不能 fail-open 丢掉这个标的')
+
 
 if __name__ == '__main__':
     unittest.main()

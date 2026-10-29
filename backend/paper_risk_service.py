@@ -203,10 +203,12 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
     day = context.asof_day
     cycle_id = context.cycle_id
     manual_orders = []
+    # 读上下文不可变（cycle_id + asof_day）；两处读取共用同一份身份事实。
+    read_context = PPort.PortfolioReadContext(cycle_id, day)
     with ports.open_db() as snapshot_conn:
         # 快照阶段就固定到**已认领**的周期，而不是"此刻 active 的那个周期"。
         positions, risk_ids = _bounded_risk_scope(
-            snapshot_conn, PPort.PortfolioReadContext(cycle_id, day), ports=ports,
+            snapshot_conn, read_context, ports=ports,
         )
         retry_placeholders = ",".join("?" for _ in ports.evidence.entry_retry_signal_statuses)
         candidate_rows = snapshot_conn.execute(
@@ -285,7 +287,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         # 证明"已认领的周期仍是当前 active cycle"。周期变了 ⇒ fail closed。
         PRSS.assert_cycle_active(conn, cycle_id=cycle_id)
         positions, risk_ids = _bounded_risk_scope(
-            conn, PPort.PortfolioReadContext(cycle_id, day), ports=ports,
+            conn, read_context, ports=ports,
         )
         account_map = {
             row["id"]: row for row in _accounts_by_id(conn, risk_ids)

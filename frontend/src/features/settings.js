@@ -7,8 +7,8 @@ import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
 import { PAPER_STAGE_LABELS } from "./paper.js";
-import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings, persistAiProvider as saveProvider, clearAiProviderSecret as clearProviderKey } from "./ai-provider-settings.js";
-import { renderAiCapabilitySection, refreshAiCapabilities } from "./ai-capability.js";
+import { renderProviderLibrary, renderAiSlotCards, applyAiReviewSettings, persistAiProvider as saveProvider, clearAiProviderSecret as clearProviderKey, editAiProvider, changeAiSlotProvider, refreshAiProviderModels } from "./ai-provider-settings.js";
+import { renderAiCapabilitySection, refreshAiCapabilities, issueAiCapability, revokeAiCapability } from "./ai-capability.js";
 
 // 周期状态直接印英文会让「当前周期：running」这种行看起来像没做完的界面。
 var CYCLE_STATUS_LABELS={running:'运行中',paused:'已暂停',pending:'待执行',completed:'已完成',archived:'已归档',idle:'空闲',starting:'启动中',stopping:'停止中'};
@@ -30,8 +30,8 @@ export function renderOperatorUnlockPanel(){
     +'<div class="setting-control"><label for="operatorTokenInput">操作员凭据</label>'
     +'<input id="operatorTokenInput" data-testid="operator-token-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴操作员凭据"></div>'
     +'<div class="settings-actions">'
-    +'<button type="button" data-testid="operator-unlock-btn" onclick="unlockOperatorTab()">本标签页解锁</button>'
-    +'<button type="button" class="ghost" data-testid="operator-clear-btn" onclick="clearOperatorTab()">清除授权</button>'
+    +'<button type="button" data-testid="operator-unlock-btn" data-settings-action="unlock">本标签页解锁</button>'
+    +'<button type="button" class="ghost" data-testid="operator-clear-btn" data-settings-action="clear-authorization">清除授权</button>'
     +'</div>'
     +'<div class="setting-row"><div class="setting-label"><b>当前状态</b><small>授权只影响本标签页；其它标签页需各自解锁。</small></div>'
     +'<div class="setting-control">'+operatorUnlockStateHtml()+'</div></div>'
@@ -58,6 +58,63 @@ export function clearOperatorTab(){
 export function refreshOperatorUnlockState(){
   var node=$('operatorUnlockState');
   if(node) node.textContent=getOperatorToken()?'本标签页已授权':'未授权';
+}
+
+// ---------- 页面动作分发（不依赖 window 全局桥） ----------
+// 设置中心自己承接本页的所有动作：静态按钮与重绘后的动态按钮都通过
+// ``data-settings-action`` 声明，由一个事件委托统一分发。
+// 这样内联处理器与全局桥都不会回流，行为也留在自己的页面里。
+export function installSettingsActions(root){
+  var container=root||(typeof document!=='undefined'?document:null);
+  if(!container||typeof container.addEventListener!=='function') return false;
+  var page=container.querySelector('#p-settings');
+  if(!page) return false;
+  if(page.dataset.settingsActionsInstalled) return true;
+  page.dataset.settingsActionsInstalled='true';
+  // 动作表只声明"做什么"；参数一律从触发元素的 dataset 读取。
+  var actions={
+    'unlock':unlockOperatorTab,
+    'clear-authorization':clearOperatorTab,
+    'save-section':function(el){return saveSettingsSection(el.dataset.settingsSection);},
+    'reset-section':function(el){return resetSettingsSection(el.dataset.settingsSection);},
+    'section-tab':function(el){return setSettingsSection(el.dataset.settingsSection,el);},
+    'goto-strategies':function(){return activatePage('p-strategies');},
+    'save-review-mode':saveAiReviewMode,
+    'clear-wxpusher':clearWxpusherToken,
+    'test-notification':testWxpusher,
+    'edit-provider':editAiProvider,
+    'save-provider':saveAiProvider,
+    'refresh-provider-models':refreshAiProviderModels,
+    'clear-provider-key':clearAiProviderKey,
+    'change-slot-provider':function(el){return changeAiSlotProvider(el.dataset.slot);},
+    'save-slot':function(el){return saveAiSlot(el.dataset.slot);},
+    'test-slot':function(el){return testAiSlot(el.dataset.slot);},
+    'issue-capability':issueAiCapability,
+    'refresh-capabilities':refreshAiCapabilities,
+    'revoke-capability':function(el){return revokeAiCapability(el.dataset.capabilityId);}
+  };
+  function dispatch(event, element){
+    var action=element.dataset.settingsAction;
+    if(!action||!Object.prototype.hasOwnProperty.call(actions,action)) return;
+    event.preventDefault();
+    Promise.resolve().then(function(){ return actions[action](element); })
+      .catch(function(error){
+        toast('操作失败：'+(error.message||error), {tone:'danger'});
+      });
+  }
+  page.addEventListener('click', function(event){
+    var element=event.target&&event.target.closest?event.target.closest('[data-settings-action]'):null;
+    if(!element||!page.contains(element)||element.disabled) return;
+    dispatch(event,element);
+  });
+  page.addEventListener('change', function(event){
+    var element=event.target;
+    if(!element||!element.dataset||!element.dataset.settingsAction) return;
+    // 只有 <select> 上的动作走 change 分支；按钮走 click 分支。
+    if(element.tagName!=='SELECT') return;
+    dispatch(event,element);
+  });
+  return true;
 }
 
 // ---------- 统一设置中心 ----------
@@ -109,7 +166,7 @@ export function renderSettings(data){
       var checked=strategyChecks.indexOf(item.id)>=0;
       var badge=wbStatusBadge(item.status);
       var extra='';
-      if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" onclick="activatePage(\'p-strategies\')">去策略工坊恢复</button>';
+      if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" data-settings-action="goto-strategies"">去策略工坊恢复</button>';
       else if(!checkable) extra='<small class="setting-help">'+adaptiveEsc((STRATEGY_STATUS_LABELS[item.status]||item.status)+' · 不可勾选')+'</small>';
       return '<label data-testid="settings-strategy-'+adaptiveEsc(item.id)+'" class="settings-strategy-item'+(checkable?'':' settings-strategy-item-disabled')+'">'
         +'<input data-testid="settings-strategy-checkbox-'+adaptiveEsc(item.id)+'" type="checkbox" class="setting-strategy-enabled" value="'+adaptiveEsc(item.id)+'"'+settingsChecked(checked)+(checkable?'':' disabled')+'>'
@@ -129,14 +186,14 @@ export function renderSettings(data){
       +settingsInputRow('default_starting_capital','默认启动金额','创建新周期时的共享资金池预填值。','<input id="settingDefaultCapital" data-settings-preview-input type="number" min="1000" max="10000000" step="1000" value="'+Number(sim.default_starting_capital||300000)+'"> <span class="setting-value-preview">元</span>')
       +settingsInputRow('cycle_duration_days','模拟周期','可选 15/30/60/90/180 个交易日或长期。','<select id="settingCycleDuration" data-settings-preview-input>'+durationOptions+'</select>')
       +'<div class="setting-row"><div class="setting-label"><b>下一周期启用策略</b><small>只有 Active 且支持新周期的策略可勾选；只对下一周期生效。</small></div><div class="setting-control settings-strategy-checks">'+strategyHtml+'</div></div>'
-      +'</div><div class="settings-actions"><button data-testid="settings-save-simulation" onclick="saveSettingsSection(\'simulation\')">保存资金与周期</button><button class="ghost" onclick="resetSettingsSection(\'simulation\')">恢复默认</button></div><div class="settings-note">当前周期：'+adaptiveEsc(cur.status||'—')+'；已启用 '+(cur.enabled_strategies||[]).length+' 套策略。保存后点击“保存并启动新周期”才会切换账本。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
+      +'</div><div class="settings-actions"><button data-testid="settings-save-simulation" data-settings-action="save-section" data-settings-section="simulation"">保存资金与周期</button><button class="ghost" data-settings-action="reset-section" data-settings-section="simulation"">恢复默认</button></div><div class="settings-note">当前周期：'+adaptiveEsc(cur.status||'—')+'；已启用 '+(cur.enabled_strategies||[]).length+' 套策略。保存后点击“保存并启动新周期”才会切换账本。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='risk'){
     html='<div class="settings-grid"><section class="settings-panel"><h3>仓位与风控</h3><p>风险边界设有后端白名单。系统永远不会因界面输入突破单票、共享池、现金、T+1 或交易所涨跌停门禁。</p><div class="settings-form">'
       +settingsInputRow('shared_pool_position_limit','共享池持仓上限','总池有效持仓席位，范围 1–30。','<input id="settingPoolLimit" data-settings-preview-input type="number" min="1" max="30" step="1" value="'+Number(risk.shared_pool_position_limit||15)+'"> <span class="setting-value-preview">席</span>')
       +settingsInputRow('shared_pool_exposure_cap','共享池敞口上限','持仓与待成交金额合计的硬上限，范围 35%–95%。','<input id="settingExposureCap" data-settings-preview-input type="number" min="35" max="95" step="1" value="'+(Number(risk.shared_pool_exposure_cap||.82)*100).toFixed(0)+'"> <span class="setting-value-preview">%</span>')
       +settingsInputRow('single_position_max_amount','单票最大金额','0 为自动按策略权重；大于 0 为额外绝对上限。','<input id="settingSingleMax" data-settings-preview-input type="number" min="0" max="10000000" step="100" value="'+Number(risk.single_position_max_amount||0)+'"> <span class="setting-value-preview">元</span>')
       +settingsInputRow('minimum_entry_slot_utilization','最小建仓席位利用率','动态建仓金额比例，范围 30%–80%；剩余空间交给风控加仓。','<input id="settingSlotUtilization" data-settings-preview-input type="number" min="30" max="80" step="1" value="'+(Number(risk.minimum_entry_slot_utilization||.6)*100).toFixed(0)+'"> <span class="setting-value-preview">%</span>')
-      +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'risk\')">保存风控设置</button><button class="ghost" onclick="resetSettingsSection(\'risk\')">恢复默认</button></div><div class="settings-note">动态最小建仓金额会随周期金额、敞口上限、席位上限和利用率实时变化；不是固定的 10,000 元门槛。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
+      +'</div><div class="settings-actions"><button data-settings-action="save-section" data-settings-section="risk"">保存风控设置</button><button class="ghost" data-settings-action="reset-section" data-settings-section="risk"">恢复默认</button></div><div class="settings-note">动态最小建仓金额会随周期金额、敞口上限、席位上限和利用率实时变化；不是固定的 10,000 元门槛。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='strategy'){
     var overrides=strat.strategy_overrides||{};
     var builtinCard=function(item){
@@ -155,14 +212,14 @@ export function renderSettings(data){
       return '<article class="strategy-user-card" data-strategy-user-id="'+adaptiveEsc(item.id)+'"><header><div><b>'+adaptiveEsc(item.name||item.id)+'</b><small>'+adaptiveEsc(item.id)+' · v'+(item.current_version||1)+'</small></div>'+wbStatusBadge(item.status)+'</header>'
         +'<div class="strategy-preview-grid"><dt>生命周期阶段</dt><dd>'+stage+'</dd><dt>资金系数</dt><dd>'+scale+'</dd></div>'
         +'<p class="setting-help">风险画像与参数由策略工坊统一管理，这里只控制组合参与。</p>'
-        +'<div class="settings-actions"><button class="ghost" onclick="activatePage(\'p-strategies\')">去策略工坊编辑</button></div></article>';
+        +'<div class="settings-actions"><button class="ghost" data-settings-action="goto-strategies"">去策略工坊编辑</button></div></article>';
     };
     var allItems=settingsStrategyItems();
     var builtinItems=allItems.filter(function(x){return x.origin==='builtin';});
     var userItems=allItems.filter(function(x){return x.origin==='user';});
     var cardsHtml=builtinItems.map(builtinCard).join('');
     if(userItems.length) cardsHtml+='<h4 style="grid-column:1/-1;margin:4px 0 0">我的策略（参数在策略工坊维护）</h4>'+userItems.map(userCard).join('');
-    html='<div class="settings-grid"><section class="settings-panel"><h3>策略运行参数</h3><p>当前三套正式策略保留独立模型和审计身份（板块轮动/超强主力已退役，不再提供新入场风格）。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+cardsHtml+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
+    html='<div class="settings-grid"><section class="settings-panel"><h3>策略运行参数</h3><p>当前三套正式策略保留独立模型和审计身份（板块轮动/超强主力已退役，不再提供新入场风格）。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+cardsHtml+'</div><div class="settings-actions"><button data-settings-action="save-section" data-settings-section="strategy"">保存策略参数</button><button class="ghost" data-settings-action="reset-section" data-settings-section="strategy"">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='execution'){
     var exe=settings.execution||{}, exeDefaults=(data.defaults||{}).execution||{};
     var execSwitch=function(key,label,help){ var value=(exe[key]===undefined?exeDefaults[key]:exe[key]); return '<div class="setting-row"><div class="setting-label"><b>'+riskText(label)+'</b><small>'+riskText(help)+'</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingExec_'+key+'" type="checkbox"'+settingsChecked(!!value)+'><span>'+(value?'开启':'关闭')+'</span></label></div></div>'; };
@@ -170,7 +227,7 @@ export function renderSettings(data){
       +execSwitch('execution_batch_gate','批量撮合窗口','轮动画像委托挂起至收盘前批量窗口统一撮合；窗口内到达的委托仍立即成交。')
       +execSwitch('execution_verification_gate','事件人工核验','开启后事件画像的每笔买入都需人工放行；默认关闭，避免无人值守时账户停摆。')
       +execSwitch('execution_ttl_sweep','执行时限清扫','清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。')
-      +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'execution\')">保存执行开关</button><button class="ghost" onclick="resetSettingsSection(\'execution\')">恢复默认</button></div>'
+      +'</div><div class="settings-actions"><button data-settings-action="save-section" data-settings-section="execution"">保存执行开关</button><button class="ghost" data-settings-action="reset-section" data-settings-section="execution"">恢复默认</button></div>'
       +'<div class="settings-note">挂起委托不占用资金与席位；所有放行/驳回都写入审计。开关立即生效，无需重启扫描。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='notification'){
     var note=settings.notification||{}, noteDefaults=(data.defaults||{}).notification||{};
@@ -182,14 +239,14 @@ export function renderSettings(data){
     html='<div class="settings-grid"><section class="settings-panel"><h3>日报与周报推送</h3>'
       +'<p>通过 WxPusher 把模拟盘摘要推到微信。推送内容只有净值、超额与成交统计，不包含操作凭据，也不改变任何交易状态或账本。</p><div class="settings-form">'
       +settingsInputRow('wxpusher_enabled','推送总开关','关闭后日报与周报都不发送，无论分项开关如何设置。',noteSwitch('settingWxEnabled',noteVal('wxpusher_enabled')))
-      +settingsInputRow('wxpusher_app_token','appToken','在 WxPusher 后台创建应用后获得，以 AT_ 开头。留空表示保持现有凭据；读取接口只回显掩码。','<input id="settingWxToken" type="password" autocomplete="off" placeholder="'+(tokenConfigured?adaptiveEsc(note.wxpusher_app_token||'已配置'):'未配置，请输入 AT_...')+'">'+(tokenConfigured?'<button type="button" class="ghost" data-testid="settings-clear-wxpusher" onclick="clearWxpusherToken()">清除凭据</button>':''))
+      +settingsInputRow('wxpusher_app_token','appToken','在 WxPusher 后台创建应用后获得，以 AT_ 开头。留空表示保持现有凭据；读取接口只回显掩码。','<input id="settingWxToken" type="password" autocomplete="off" placeholder="'+(tokenConfigured?adaptiveEsc(note.wxpusher_app_token||'已配置'):'未配置，请输入 AT_...')+'">'+(tokenConfigured?'<button type="button" class="ghost" data-testid="settings-clear-wxpusher" data-settings-action="clear-wxpusher">清除凭据</button>':''))
       +settingsInputRow('wxpusher_topic_id','推送主题 ID','主题 ID 表示群发到该主题的订阅者；留空只发给应用自己的订阅用户。','<input id="settingWxTopic" type="text" inputmode="numeric" value="'+adaptiveEsc(noteVal('wxpusher_topic_id')||'')+'" placeholder="可选">')
       +settingsInputRow('wxpusher_daily_enabled','启用日报','每个交易日收盘后推送一次当日净值与成交摘要。',noteSwitch('settingWxDaily',noteVal('wxpusher_daily_enabled')))
       +settingsInputRow('wxpusher_daily_time','日报发送时间','本地时区（Asia/Shanghai）。','<input id="settingWxDailyTime" type="time" value="'+adaptiveEsc(noteVal('wxpusher_daily_time')||'15:40')+'">')
       +settingsInputRow('wxpusher_weekly_enabled','启用周报','每周指定星期推送一次周度净值与超额。',noteSwitch('settingWxWeekly',noteVal('wxpusher_weekly_enabled')))
       +settingsInputRow('wxpusher_weekly_weekday','周报星期','默认周五收盘后。','<select id="settingWxWeekday">'+weekdayOptions+'</select>')
       +settingsInputRow('wxpusher_weekly_time','周报发送时间','本地时区（Asia/Shanghai）。','<input id="settingWxWeeklyTime" type="time" value="'+adaptiveEsc(noteVal('wxpusher_weekly_time')||'15:45')+'">')
-      +'</div><div class="settings-actions"><button data-testid="settings-save-notification" onclick="saveSettingsSection(\'notification\')">保存推送设置</button><button class="ghost" data-testid="settings-test-notification" onclick="testWxpusher()">发送测试推送</button><button class="ghost" onclick="resetSettingsSection(\'notification\')">恢复默认</button></div>'
+      +'</div><div class="settings-actions"><button data-testid="settings-save-notification" data-settings-action="save-section" data-settings-section="notification"">保存推送设置</button><button class="ghost" data-testid="settings-test-notification" data-settings-action="test-notification">发送测试推送</button><button class="ghost" data-settings-action="reset-section" data-settings-section="notification"">恢复默认</button></div>'
       +'<div class="settings-note">appToken 保存在服务端，接口只回显掩码；保存时留空表示保持原值。测试推送会真的发到微信，需要二次确认。发送时间由后台调度任务读取，修改后下一轮调度生效。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='operator'){
     var security=settings.security||{}, authRequired=security.operator_auth_required!==false;
@@ -198,7 +255,7 @@ export function renderSettings(data){
       +'只读接口（看板、行情、健康检查）不需要授权；写接口在未授权时会返回 401，前端不会自动重放，请解锁后重新点击原操作。</p>'
       +renderOperatorUnlockPanel()
       +'<div class="setting-row"><div class="setting-label"><b>写操作要求操作员凭据</b><small>关闭后任何能访问本站的人都能改配置、触发扫描和下模拟单。仅建议在受信网络的单机部署里关闭。</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingOperatorAuth" data-testid="setting-operator-auth" type="checkbox"'+settingsChecked(authRequired)+'><span>'+(authRequired?'要求凭据':'已关闭')+'</span></label></div></div>'
-      +'<div class="settings-actions"><button data-testid="settings-save-operator" onclick="saveSettingsSection(\'operator\')">保存授权设置</button></div>'
+      +'<div class="settings-actions"><button data-testid="settings-save-operator" data-settings-action="save-section" data-settings-section="operator"">保存授权设置</button></div>'
       +'<div class="settings-note"><strong>边界说明：</strong>这是一道单操作员共享密钥边界，不是 RBAC；它不替代既有的风险与人工确认门禁，也不会把凭据写入日志或页面。</div>'
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
@@ -221,7 +278,7 @@ export function renderSettings(data){
       +'<span data-testid="ai-review-readiness" class="setting-value-preview">'+(reviewMode==='single'?(review.single_ready?'就绪':'未就绪'):(review.dual_ready?'双AI就绪':'双AI未就绪'))+'</span></div></div>'
       +'<div class="setting-row"><div class="setting-label"><b>AI运行开关</b><small>只影响审阅/候选生成，不直接下单。</small></div><div class="setting-control"><label><input id="settingAiAdvisor" type="checkbox"'+settingsChecked(ais.llm_advisor_enabled)+'><span>启用 AI 审阅</span></label><label><input id="settingAiRealtime" type="checkbox"'+settingsChecked(ais.llm_realtime_tuning_enabled)+'><span>启用有界调参</span></label><label><input type="checkbox" checked disabled><span>人工确认候选（强制）</span></label></div></div>'
       +'<div class="setting-row"><div class="setting-label"><b>调参模式</b><small>shadow 最稳，intraday 更及时，close 只在收盘运行。</small></div><div class="setting-control"><select id="settingAiMode"><option value="shadow"'+(ais.llm_realtime_mode==='shadow'?' selected':'')+'>shadow · 只观察</option><option value="intraday"'+(ais.llm_realtime_mode==='intraday'?' selected':'')+'>intraday · 盘中候选</option><option value="close"'+(ais.llm_realtime_mode==='close'?' selected':'')+'>close · 收盘候选</option></select></div></div>'
-      +'</div><div class="settings-actions"><button data-testid="settings-save-ai-review" onclick="saveAiReviewMode()">保存审核模式</button><button class="ghost" data-testid="settings-save-ai-switches" onclick="saveSettingsSection(\'evolution\')">保存 AI 开关</button><button class="ghost" onclick="resetSettingsSection(\'evolution\')">恢复默认</button></div>'
+      +'</div><div class="settings-actions"><button data-testid="settings-save-ai-review" data-settings-action="save-review-mode">保存审核模式</button><button class="ghost" data-testid="settings-save-ai-switches" data-settings-action="save-section" data-settings-section="evolution"">保存 AI 开关</button><button class="ghost" data-settings-action="reset-section" data-settings-section="evolution"">恢复默认</button></div>'
       +'<div class="settings-note"><strong>安全边界：</strong>单AI审阅的运行状态是 <code>single_review</code>，不是 <code>consensus</code>，因此永远无法穿过人工应用门禁；双AI的共识提案仍需人工确认后才生效。自进化周期只控制后台学习频率，不改变已启用策略的交易硬规则。</div>'
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }

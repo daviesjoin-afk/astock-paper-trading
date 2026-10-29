@@ -12,12 +12,12 @@ import datetime as dt
 import csv
 import hashlib
 import json
-import math
 import os
 import sqlite3
 from collections import Counter, defaultdict
 
 import data_paths
+from paper_numeric import finite_num as _finite_num
 import execution_verification as EV
 try:
     from zoneinfo import ZoneInfo
@@ -43,11 +43,7 @@ def _now() -> str:
 
 
 def _num(value, default=None):
-    try:
-        number = float(value)
-        return number if math.isfinite(number) else default
-    except (TypeError, ValueError):
-        return default
+    return _finite_num(value, default)
 
 
 def _json(value) -> str:

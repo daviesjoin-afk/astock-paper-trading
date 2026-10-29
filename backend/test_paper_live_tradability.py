@@ -23,7 +23,10 @@ class LiveTradabilityTests(unittest.TestCase):
         self.report = {"success": True, "result": {"pages": 1, "count": 0, "data": []}}
 
     def prefetch(self, quote=None, profile=None, report=None, reading=None):
-        def get(key, url, params):
+        # ``_get`` 接受 ``ttl_seconds``：低频状态用长窗口，带实时价格证据
+        # 的个股档案用与新鲜度门槛一致的短窗口。夹具这里不关心窗口，但签名
+        # 必须与生产一致，否则夹具会掩盖真实调用约定。
+        def get(key, url, params, **kwargs):
             value = (report or self.report) if key[0] == "suspend" else (profile or self.profile)
             return value, self.now.isoformat()
         with patch.object(L, "_get", side_effect=get), patch.object(L.MDSvc, "read_snapshot", return_value=(
@@ -42,7 +45,7 @@ class LiveTradabilityTests(unittest.TestCase):
 
     def test_complete_current_membership_and_interior_range_need_no_profile_endpoint(self):
         reading = self.market_reading()
-        def get(key, *args):
+        def get(key, *args, **kwargs):
             self.assertEqual(key[0], "suspend", "interior quote should not need the blocked profile endpoint")
             return self.report, self.now.isoformat()
         with patch.object(L, "_get", side_effect=get), patch.object(L.MDSvc, "read_snapshot", return_value=reading):
@@ -103,6 +106,29 @@ class LiveTradabilityTests(unittest.TestCase):
         profile = copy.deepcopy(self.profile)
         profile["data"]["f86"] = (self.now - dt.timedelta(hours=1)).timestamp()
         self.assertEqual(self.prefetch(profile=profile), {})
+
+    def test_the_stock_profile_may_not_outlive_its_own_freshness_gate(self):
+        """带实时价格证据的档案不能用低频状态的长缓存窗口。
+
+        个股档案里带 ``f43``（实时价）与 ``f86``（行情时间），而读取方按
+        ``STATUS_MAX_AGE_SECONDS``（120 秒）判它是否可用。如果缓存窗口是
+        15 分钟，那么这份价格在**被读到之前**就已经过期，整段窗口内都拿不
+        到可交易观测 —— 哪怕行情源本身是健康的。
+        """
+        seen = {}
+
+        def get(key, url, params, **kwargs):
+            seen[key[0]] = kwargs.get("ttl_seconds")
+            value = self.report if key[0] == "suspend" else self.profile
+            return value, self.now.isoformat()
+
+        with patch.object(L, "_get", side_effect=get), patch.object(L.MDSvc, "read_snapshot", return_value=(
+                L.MDC.unavailable_reading(L.MDC.LIVE_MARKET_POLICY, L.MDC.REASON_MISSING))):
+            L.prefetch({"600001": self.quote}, asof_day=self.day)
+        self.assertEqual(L.STATUS_MAX_AGE_SECONDS, seen.get("profile"),
+                         "个股档案的缓存窗口必须与它的 120 秒新鲜度门槛一致")
+        self.assertEqual(L.STATUS_CACHE_TTL_SECONDS, seen.get("suspend"),
+                         "停牌报表是低频状态，可以用长窗口")
 
     def test_mismatched_or_future_listing_profile_is_rejected(self):
         for change in ({"f57": "600002"}, {"f189": 20990101}):

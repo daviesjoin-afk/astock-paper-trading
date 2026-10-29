@@ -52,8 +52,8 @@ export function renderAiCapabilitySection(payload) {
           + '<td>' + esc(row.expires_at) + '</td>'
           + '<td>' + esc(String(row.revocation_epoch)) + '</td>'
           + '<td><button type="button" class="ghost" data-testid="ai-capability-revoke-'
-          + esc(row.capability_id) + '" onclick="revokeAiCapability(\''
-          + esc(row.capability_id) + '\')">撤销</button></td></tr>';
+          + esc(row.capability_id) + '" data-settings-action="revoke-capability"'
+          + ' data-capability-id="' + esc(row.capability_id) + '">撤销</button></td></tr>';
       }).join('') + '</tbody></table>'
     : '<p class="setting-help" data-testid="ai-capability-empty">还没有签发任何凭据。</p>';
 
@@ -78,8 +78,8 @@ export function renderAiCapabilitySection(payload) {
     + textField('aiCapExpires', '到期时间（ISO，带时区）', '', 'ai-capability-expires')
     + textField('aiCapOperator', '操作人', '', 'ai-capability-operator')
     + '<div class="settings-actions"><button type="button" data-testid="ai-capability-submit"'
-    + ' onclick="issueAiCapability()">签发凭据</button>'
-    + '<button type="button" class="ghost" onclick="refreshAiCapabilities()">刷新</button></div>'
+    + ' data-settings-action="issue-capability">签发凭据</button>'
+    + '<button type="button" class="ghost" data-settings-action="refresh-capabilities">刷新</button></div>'
     + '<div id="aiCapabilityFeedback" class="setting-help" role="status" aria-live="polite"></div>'
     + '</div>';
 

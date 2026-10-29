@@ -9,11 +9,15 @@ import entry_timing as timing
 class FastEntryTimingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # STATE_PATH 是模块级全局：不还原的话，后面的用例会继承一个指向
+        # **已被删除**的临时目录的路径，写入静默失败。
+        self.original_path = timing.STATE_PATH
         timing.STATE_PATH = os.path.join(self.tmp.name, "entry.json")
         timing._state = None
         self.t0 = dt.datetime.combine(dt.date.today(), dt.time(9, 40))
 
     def tearDown(self):
+        timing.STATE_PATH = self.original_path
         timing._state = None
         self.tmp.cleanup()
 

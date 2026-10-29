@@ -288,8 +288,11 @@ def run_shadow_context(paper_conn, evo_conn, strategy_id: str, market_snapshot: 
         return {"recorded": False, "reason": "immutable Challenger 参数版本缺失"}
     champion_params = _json_loads(context["champion_params"])
     challenger_params = _json_loads(candidate["params"])
-    champion_output = runner(ROLE_CHAMPION, champion_params, _json_loads(_json_dumps(market_snapshot)))
-    challenger_output = runner(ROLE_CHALLENGER, challenger_params, _json_loads(_json_dumps(market_snapshot)))
+    # Champion 与 Challenger 必须拿到**同一份**市场快照事实。序列化只做一次，
+    # 然后各自拿一个独立副本（runner 可以自由修改自己那份）。
+    snapshot_json = _json_dumps(market_snapshot)
+    champion_output = runner(ROLE_CHAMPION, champion_params, _json_loads(snapshot_json))
+    challenger_output = runner(ROLE_CHALLENGER, challenger_params, _json_loads(snapshot_json))
     return run_shadow_counterfactual(
         paper_conn, strategy_id, market_snapshot, champion_output, challenger_output, observed_at=observed_at,
     )
