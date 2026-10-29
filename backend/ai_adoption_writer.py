@@ -54,7 +54,7 @@ def live_selection_baseline(conn, account_id: str) -> dict:
     if row is None:
         raise AdoptionWiringError(R_ACCOUNT_MISSING, str(account_id))
     account = dict(row)
-    model, weights, _delta, params, meta = AS._current(account)
+    model, weights, _delta, params, meta = AS.current_selection(account)
     overlay = _loads(params.get("adaptive_selection"))
     return {"active": str(meta.get("status") or "") == "active",
             "weights": dict(weights), "conditions": dict(_loads(overlay.get("conditions"))),

@@ -205,7 +205,7 @@ class FacadeContractTests(unittest.TestCase):
         with mock.patch.object(USP, "user_participant_ids", return_value=(USER_A,)) as ids:
             with mock.patch.object(PT, "_spec_for", return_value=spec) as spec_for:
                 with mock.patch.object(PT, "_now", return_value=NOW) as now_fn:
-                    with mock.patch.object(PT, "_audit") as audit_fn:
+                    with mock.patch.object(PT, "audit") as audit_fn:
                         PT._ensure_user_strategy_accounts(self.conn)
         ids.assert_called_once_with(self.conn)
         spec_for.assert_called_once_with(USER_A, conn=self.conn)

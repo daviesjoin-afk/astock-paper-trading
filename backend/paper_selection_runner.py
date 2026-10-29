@@ -43,7 +43,7 @@ def main() -> int:
     # 按当天日期落库，而「最近交易日」读取会让休市日的空结果顶掉上一个真实
     # 交易日的结果。手工重跑（带 --date 或 --strategy）不受此限制。
     if not args.date and not strategies:
-        today = PS._today()
+        today = PS.today()
         if not _is_trade_day(today):
             print(json.dumps({"skipped": "non_trading_day", "date": today.isoformat()},
                              ensure_ascii=False))

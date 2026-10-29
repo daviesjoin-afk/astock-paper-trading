@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import paper_trading as P
+import paper_storage as PST
 import strategy_api_models as Models
 import strategy_dsl_schema as DSL
 import strategy_registry as SR
@@ -139,12 +140,12 @@ def translate_registry_error(exc: Exception) -> StrategyError:
 def _with_connection(work, *, immediate: bool = False):
     """在 ``paper_trading`` 的连接与事务里执行 ``work(conn)``。
 
-    唯一的连接出口：HTTP 层不再出现 ``P._db()``。Registry 自己的
+    唯一的连接出口：HTTP 层不再出现 ``PST.paper_db()``。Registry 自己的
     ``ValueError`` 在这里统一翻译，调用方（含测试）只看到 domain exception。
     """
     P.init_db()
     try:
-        with P._db(immediate=immediate) as conn:
+        with PST.paper_db(immediate=immediate) as conn:
             return work(conn)
     except StrategyError:
         raise
@@ -361,7 +362,7 @@ def update_strategy(strategy_id: str, request: Models.StrategyUpdateRequest) -> 
 
 def _open_evidence_connection():
     """Open the separate append-only adaptive evidence store for exact reads."""
-    return P._evolution_conn()
+    return PST.evolution_connection()
 
 
 def lifecycle_read_model(strategy_id: str) -> dict:
@@ -390,7 +391,7 @@ def lifecycle_read_model(strategy_id: str) -> dict:
                     continue
                 if state["state"] == "paused" and target in SL.RESUME_TRANSITION_TARGETS:
                     try:
-                        resume_target, _ = SL._resume_policy(
+                        resume_target, _ = SL.resume_policy(
                             conn, spec.id, version.version, version.checksum)
                     except SL.LifecycleError:
                         resume_target = None

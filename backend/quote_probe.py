@@ -25,9 +25,9 @@ def parse_codes(values):
 
 def make_feed(source, timeout):
     factories = {
-        "tencent": dfc._tencent_realtime_feed,
-        "sina": dfc._sina_realtime_feed,
-        "eastmoney": dfc._eastmoney_realtime_feed,
+        "tencent": dfc.tencent_realtime_feed,
+        "sina": dfc.sina_realtime_feed,
+        "eastmoney": dfc.eastmoney_realtime_feed,
     }
     options = dict(
         attempts=1, health=feeds.FeedHealthRegistry(),

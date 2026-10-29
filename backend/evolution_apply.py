@@ -81,8 +81,9 @@ def _paper_connect(paper_db_path):
     return conn
 
 
-def _account_params(row):
+def load_account_params(row):
     return _loads(row["params"] if "params" in row.keys() else "{}", {}) or {}
+
 
 
 def _baseline_weights(account_params, source_strategy):
@@ -113,14 +114,15 @@ def _baseline_conditions(account_params):
     return {}
 
 
-def _write_account_params(conn, account_id, params, *, updated_at=None):
+def write_account_params(conn, account_id, params, *, updated_at=None):
     conn.execute(
         "UPDATE paper_accounts SET params=?,updated_at=? WHERE id=?",
         (_json(params), updated_at or _now(), account_id),
     )
 
 
-def _append_parameter_snapshot(conn, account_row, params, *, reason, created_at):
+
+def append_parameter_snapshot(conn, account_row, params, *, reason, created_at):
     """Append the complete parameter state to the exact account cycle owner."""
     try:
         cycle_id = int(account_row["cycle_id"])
@@ -143,6 +145,7 @@ def _append_parameter_snapshot(conn, account_row, params, *, reason, created_at)
         (cycle_id, str(account_row["id"]), version, style, _json(params),
          str(reason), effective.date().isoformat(), str(created_at)),
     )
+
 
 
 def _audit(conn, account_id, event, detail):
@@ -251,7 +254,7 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
             row = by_id.get(account_id)
             if row is None:
                 raise ValueError(f"模拟盘账户 {account_id} 不存在，拒绝应用")
-            pre_apply_params[account_id] = copy.deepcopy(_account_params(row))
+            pre_apply_params[account_id] = copy.deepcopy(load_account_params(row))
         for account_id in weights:
             row = by_id[account_id]
             params = copy.deepcopy(pre_apply_params[account_id])
@@ -265,8 +268,8 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
                 "applied_at": written_at,
                 "approved_by": actor,
             }
-            _write_account_params(paper, account_id, params, updated_at=written_at)
-            _append_parameter_snapshot(
+            write_account_params(paper, account_id, params, updated_at=written_at)
+            append_parameter_snapshot(
                 paper, row, params,
                 reason=f"adaptive allocation applied decision_id={decision_id}",
                 created_at=written_at,
@@ -312,9 +315,9 @@ def _restore_parameter_states(paper_db_path, pre_apply_params, *, reason):
             params = _loads(row["params"], {}) or {}
             restored = copy.deepcopy(previous_params)
             if params != restored:
-                _write_account_params(
+                write_account_params(
                     paper, account_id, restored, updated_at=written_at)
-                _append_parameter_snapshot(
+                append_parameter_snapshot(
                     paper, row, restored, reason=reason, created_at=written_at)
         paper.commit()
     finally:
@@ -343,9 +346,9 @@ def _rollback_allocation_to_previous(paper_db_path, previous_map, *,
                 params["adaptive_allocation"] = previous
             params.pop("adaptive_allocation_previous", None)
             if params != before:
-                _write_account_params(
+                write_account_params(
                     paper, account_id, params, updated_at=written_at)
-                _append_parameter_snapshot(
+                append_parameter_snapshot(
                     paper, row, params, reason=reason, created_at=written_at)
             _audit(paper, account_id, "adaptive_allocation_rolled_back",
                    {"restored": bool(previous is not None)})
@@ -533,7 +536,7 @@ def apply_tuner_proposals(adaptive_connect, paper_db_path, run_id: int,
             ).fetchone()
             if row is None:
                 raise ValueError(f"模拟盘账户 {account_id} 不存在，拒绝应用")
-            params = _account_params(row)
+            params = load_account_params(row)
             meta = params.get("adaptive_selection_meta") or {}
             if params.get("adaptive_selection") and str(meta.get("status") or "") == "active":
                 raise ValueError(
@@ -543,7 +546,7 @@ def apply_tuner_proposals(adaptive_connect, paper_db_path, run_id: int,
             if base_weights_fn is not None:
                 base_weights = dict(base_weights_fn(account_id) or {})
             else:
-                base_weights = _baseline_weights(_account_params(row), row["source_strategy"])
+                base_weights = _baseline_weights(load_account_params(row), row["source_strategy"])
             # 策略级进化画像：每个账户的幅度硬边界用其策略专属参数版本
             # （无专属版本时回落全局默认），锁定/边界由此约束该策略提案。
             proposal_max_weight = max_weight_delta
@@ -610,7 +613,7 @@ def apply_tuner_proposals(adaptive_connect, paper_db_path, run_id: int,
                 "approved_by": actor,
                 "run_id": run_id,
             }
-            _write_account_params(paper, account_id, params)
+            write_account_params(paper, account_id, params)
             _audit(paper, account_id, "adaptive_tuner_applied",
                    {"run_id": run_id, "version": f"llm-tuner-{run_id}",
                     "skipped_unknown_conditions": skipped_conditions})
@@ -663,7 +666,7 @@ def _restore_tuner_snapshots(paper_db_path, run_id, account_ids):
                 params.pop("adaptive_selection", None)
                 params.pop("adaptive_selection_meta", None)
             params.pop("adaptive_selection_previous", None)
-            _write_account_params(paper, account_id, params)
+            write_account_params(paper, account_id, params)
             _audit(paper, account_id, "adaptive_tuner_rolled_back", {"run_id": run_id})
         paper.commit()
     finally:
@@ -712,3 +715,9 @@ def rollback_tuner_overlay(adaptive_connect, paper_db_path, account_id: str,
             pass
     return {"rolled_back": True, "account_id": account_id, "run_id": run_id,
             "reason": str(reason)[:300]}
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_account_params = load_account_params
+_append_parameter_snapshot = append_parameter_snapshot
+_write_account_params = write_account_params

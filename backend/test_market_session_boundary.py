@@ -272,7 +272,7 @@ class FactorReadinessTests(unittest.TestCase):
     def test_invalid_snapshot_is_cached_without_request_rebuild(self):
         st=self.context()
         read=st.enter_context(mock.patch.object(M.SFS,"read",side_effect=ValueError("bad pair")))
-        st.enter_context(mock.patch.object(P,"_rebuild_selection_factor_cache",side_effect=AssertionError("request rebuild")))
+        st.enter_context(mock.patch.object(P,"rebuild_selection_factor_cache",side_effect=AssertionError("request rebuild")))
         for _ in range(2):
             f,_,status=M._load_selection_base(with_status=True)
             self.assertTrue(f.empty)
@@ -283,7 +283,7 @@ class FactorReadinessTests(unittest.TestCase):
         st=self.context()
         frame=pd.DataFrame({c:[True] for c in M._SELECTION_REQUIRED_COLUMNS},index=["600001"])
         st.enter_context(mock.patch.object(M.SFS,"read",return_value=(frame,{})))
-        st.enter_context(mock.patch.object(P,"_selection_factor_freshness",return_value={"passed":False,
+        st.enter_context(mock.patch.object(P,"selection_factor_freshness",return_value={"passed":False,
             "target_date":"2026-10-14","factor_date":"2026-10-13","reason":"waiting factors"}))
         st.enter_context(mock.patch.object(M.U,"coverage_report",return_value={"fresh_selection":4000,"fresh_selection_pct":100}))
         st.enter_context(mock.patch.object(M.MDSvc,"refresh_rows",side_effect=AssertionError("live request before factors")))
@@ -304,7 +304,7 @@ class FactorReadinessTests(unittest.TestCase):
         st=self.context()
         frame=pd.DataFrame({c:[True] for c in M._SELECTION_REQUIRED_COLUMNS},index=["600001"])
         read=st.enter_context(mock.patch.object(M.SFS,"read",side_effect=[FileNotFoundError(),(frame,{})]))
-        st.enter_context(mock.patch.object(P,"_selection_factor_freshness",return_value={"passed":True}))
+        st.enter_context(mock.patch.object(P,"selection_factor_freshness",return_value={"passed":True}))
         self.assertTrue(M._load_selection_base()[0].empty)
         with mock.patch.object(M,"_selection_signature",return_value=("new factors",)):
             f,_,status=M._load_selection_base(with_status=True)

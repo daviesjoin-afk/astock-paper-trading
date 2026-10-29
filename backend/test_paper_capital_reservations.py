@@ -290,7 +290,7 @@ class FacadeContractTests(unittest.TestCase):
              mock.patch.object(PT, "_num", side_effect=lambda value, default=0.0: 99.0), \
              mock.patch.object(PT, "_now", return_value="patched"), \
              mock.patch.object(PT, "_shared_cash", return_value=88.0), \
-             mock.patch.object(PT, "_active_cycle", return_value={"id": 1}):
+             mock.patch.object(PT, "load_active_cycle", return_value={"id": 1}):
             PT._pending_buy_reservations(object())
             PT._reserve_shared_capital(object(), "x", "a", "c", 1)
             PT._finish_capital_reservation(object(), "x", "released")
@@ -298,7 +298,7 @@ class FacadeContractTests(unittest.TestCase):
             self.assertIs(PT._num, kwargs["num_fn"])
             self.assertIs(PT._now, reserve.call_args.kwargs["now_fn"])
             self.assertIs(PT._shared_cash, reserve.call_args.kwargs["shared_cash_fn"])
-            self.assertIs(PT._active_cycle, reserve.call_args.kwargs["active_cycle_fn"])
+            self.assertIs(PT.load_active_cycle, reserve.call_args.kwargs["active_cycle_fn"])
             self.assertIs(PT._now, finish.call_args.kwargs["now_fn"])
 
     def test_facade_contains_no_reservation_sql_algorithm(self):
@@ -355,14 +355,17 @@ class ArchitectureGuardTests(unittest.TestCase):
             if "paper_capital_reservations" in body
             and ("INSERT INTO" in body or "UPDATE paper_capital_reservations" in body)
         }
-        # ``init_db`` is bootstrap/schema reconciliation, not normal runtime
-        # CRUD.  Prove that classification before excluding it from the
-        # runtime set; this keeps the recovery detector non-vacuous.
-        self.assertIn("init_db", direct_mutators)
-        self.assertIn("CREATE TABLE IF NOT EXISTS paper_capital_reservations", function_sources["init_db"])
-        runtime_mutators = direct_mutators - {"init_db"}
-        self.assertIn("_reconcile_signal_order_states", runtime_mutators)
-        self.assertEqual({"_reconcile_signal_order_states"}, runtime_mutators)
+        # 建表与历史行修补已下沉到 schema owner（paper_schema_migrations）；
+        # ``init_db`` 只按正确顺序驱动它。因此"非运行时直接写预占表"的那一类
+        # 已经**不在** paper_trading 里了 —— 判据比原来的"排除 init_db"更强：
+        # 运行时直接写预占表的函数只剩恢复例外这一处。
+        self.assertNotIn("init_db", direct_mutators)
+        schema_source = pathlib.Path(__file__).with_name(
+            "paper_schema_migrations.py").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE IF NOT EXISTS paper_capital_reservations", schema_source)
+        self.assertIn('"""UPDATE paper_capital_reservations', schema_source)
+        self.assertIn("_reconcile_signal_order_states", direct_mutators)
+        self.assertEqual({"_reconcile_signal_order_states"}, direct_mutators)
 
 
 if __name__ == "__main__":

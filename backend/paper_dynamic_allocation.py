@@ -23,6 +23,7 @@ import json
 import math
 
 import evolution_apply as E
+from adaptive_common import _json
 import paper_portfolio_read_model as P
 import paper_repository as R
 
@@ -102,7 +103,7 @@ def rebalance(conn, *, cycle_id, decision_at, account_ids=None):
             return {"status": "no_participant_in_cycle"}
     if not rows or any(r["status"] != "running" for r in rows):
         return {"status": "inactive"}
-    params = {r["id"]: E._account_params(r) for r in rows}
+    params = {r["id"]: E.load_account_params(r) for r in rows}
     policies = [p.get("adaptive_allocation_policy") for p in params.values()]
     policy = policies[0]
     if not isinstance(policy, dict) or any(p != policy for p in policies):
@@ -124,9 +125,9 @@ def rebalance(conn, *, cycle_id, decision_at, account_ids=None):
     context = P.PortfolioReadContext(int(cycle_id), instant.date() - dt.timedelta(days=1))
     returns, evidence = {}, {}
     for account in params:
-        initial = P._cycle_initial(conn, context, account)
+        initial = P.cycle_initial(conn, context, account)
         pnl, status = P.realized_pnl(conn, context, account_id=account)
-        fills, _, proof = P._sell_fills(conn, context, account)
+        fills, _, proof = P.sell_fills(conn, context, account)
         samples = {int(f["order_id"]) for f in fills}
         if (status != P.STATUS_VERIFIED or pnl is None or not initial or initial <= 0
                 or not proof or len(samples) < policy["min_sell_samples"]):
@@ -165,11 +166,11 @@ def rebalance(conn, *, cycle_id, decision_at, account_ids=None):
             "source": "authorized_policy_execution", "evidence_asof": context.asof_day.isoformat(),
             "evidence_fingerprint": fingerprint,
         }
-        E._write_account_params(conn, account, updated, updated_at=instant.isoformat())
-        E._append_parameter_snapshot(conn, row, updated,
+        E.write_account_params(conn, account, updated, updated_at=instant.isoformat())
+        E.append_parameter_snapshot(conn, row, updated,
                                      reason=f"dynamic allocation policy={POLICY_ID}",
                                      created_at=instant.isoformat())
-    R.audit(conn, None, "dynamic_allocation_evaluated", E._json({
+    R.audit(conn, None, "dynamic_allocation_evaluated", _json({
         "cycle_id": cycle_id, "policy_id": POLICY_ID, "weights_before": current,
         "weights_after": weights, "evidence": evidence, "fingerprint": fingerprint,
     }), instant.isoformat())

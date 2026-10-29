@@ -624,7 +624,7 @@ def _canonical_trigger_sql() -> str:
             "CREATE TABLE paper_orders(id INTEGER PRIMARY KEY,account_id TEXT,cycle_id INTEGER);"
             "CREATE TABLE paper_orders_archive(id INTEGER PRIMARY KEY,cycle_id INTEGER);"
         )
-        PSM._ensure_order_cycle_provenance_guards(memory)
+        PSM.ensure_order_cycle_provenance_guards(memory)
         row = memory.execute(
             "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
             (ORDER_IMMUTABLE_TRIGGER,),
@@ -688,7 +688,7 @@ def apply_plan(conn: sqlite3.Connection, saved_plan: dict[str, Any]) -> int:
             changed += cur.rowcount
         # Reuse the schema owner; the same canonical immutable rule is restored
         # before any invariant is checked or the transaction can commit.
-        PSM._ensure_order_cycle_provenance_guards(conn)
+        PSM.ensure_order_cycle_provenance_guards(conn)
         if _trigger_sql(conn) != canonical:
             raise RecoveryError("cycle immutability trigger was not restored exactly")
         after = _protected_fingerprints(conn)

@@ -32,7 +32,7 @@ WORKER_VERSION = "research-worker-v2"
 
 #: 这个入口负责注册的全部研究任务类型。
 HANDLERS = {
-    EI.TASK_TYPE_SESSION: AR.HandlerSpec(handler=EI._handle_session_task, heavy=True),
+    EI.TASK_TYPE_SESSION: AR.HandlerSpec(handler=EI.handle_session_task, heavy=True),
     AGENT.TASK_TYPE_RESEARCH: AR.HandlerSpec(handler=AGENT.run_research_task),
 }
 
@@ -46,8 +46,8 @@ def bind_config_owner():
     import adaptive_engine as AE
     import research_runtime_config as RRC
 
-    RRC.bind_config_connection(AE._connect)
-    return AE._connect
+    RRC.bind_config_connection(AE.adaptive_connection)
+    return AE.adaptive_connection
 
 
 def register() -> dict:
@@ -59,7 +59,7 @@ def register() -> dict:
 
 
 def known_experiments(conn) -> list[str]:
-    if not RL._has_table(conn, "experiment_runs"):
+    if not RL.has_table(conn, "experiment_runs"):
         return []
     return [str(row[0]) for row in conn.execute(
         "SELECT experiment_id FROM experiment_runs ORDER BY created_at").fetchall()]

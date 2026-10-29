@@ -138,7 +138,7 @@ def ensure_next_session_enqueued(conn, experiment_id: str, *, now=None):
     return task
 
 
-def _handle_session_task(task, ctx):
+def handle_session_task(task, ctx):
     """一个会话的完整推进：续状态 → 成对回放 → 原子发回执 → 投递下一会话。"""
     payload = dict(task.get("payload") or {})
     experiment_id = str(payload.get("experiment_id") or "")
@@ -227,8 +227,9 @@ def _handle_session_task(task, ctx):
         publish=publish)
 
 
+
 def register_handlers() -> None:
-    AR.register(TASK_TYPE_SESSION, _handle_session_task)
+    AR.register(TASK_TYPE_SESSION, handle_session_task)
 
 
 def main(argv=None) -> int:
@@ -295,3 +296,7 @@ def experiment_progress(conn, experiment_id: str) -> dict:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_handle_session_task = handle_session_task

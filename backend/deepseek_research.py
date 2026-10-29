@@ -783,7 +783,7 @@ def _run_evidence_task(connect_factory, purpose, events, context, trigger="manua
                 "error_code": "owner_evidence_unavailable", "latency_ms": 0,
                 "authority": "canonical_research_ledger_only"}
     try:
-        config = advisor._research_provider_config(connect_factory)
+        config = advisor.research_provider_config(connect_factory)
         service = ai_research_service.run_research_run(
             connect_factory,
             purpose=purpose,

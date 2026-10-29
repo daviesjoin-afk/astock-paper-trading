@@ -237,7 +237,7 @@ class DataPipelineP1Tests(unittest.TestCase):
         self._patch(selection_runner.ST, "update_observations", lambda: {"updated": 0})
         self._patch(selection_runner.selection, "_complete_daily_cutoff", lambda: dt.date(2026, 8, 20))
         self._patch(selection_runner.U, "refresh_history", lambda **_kwargs: {"status": "up_to_date"})
-        self._patch(selection_runner.P, "_rebuild_selection_factor_cache", lambda _target: {"status": "ok"})
+        self._patch(selection_runner.P, "rebuild_selection_factor_cache", lambda _target: {"status": "ok"})
         self._patch(selection_runner.S, "STRATEGIES", ["one", "two"])
         self._patch(
             selection_runner.selection,

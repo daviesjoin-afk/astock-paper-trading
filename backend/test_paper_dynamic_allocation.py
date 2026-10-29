@@ -38,9 +38,9 @@ class DynamicPolicyTests(unittest.TestCase):
         def metric(conn, context, *, account_id):
             self.assertEqual(context.asof_day.isoformat(), "2026-10-12")
             return int(account_id) * 1000.0, "verified"
-        with patch.object(D.P, "_cycle_initial", return_value=60000.0), \
+        with patch.object(D.P, "cycle_initial", return_value=60000.0), \
                 patch.object(D.P, "realized_pnl", side_effect=changes.get("metric", metric)), \
-                patch.object(D.P, "_sell_fills", return_value=changes.get(
+                patch.object(D.P, "sell_fills", return_value=changes.get(
                     "fills", ([{"order_id": 1}, {"order_id": 2}, {"order_id": 3}], [], True))):
             return D.rebalance(self.conn, cycle_id=13, decision_at="2026-10-13T09:31:00+08:00")
 
@@ -148,9 +148,9 @@ class DynamicPolicyTests(unittest.TestCase):
             self.conn.execute("UPDATE paper_accounts SET params=? WHERE id=?",
                               (json.dumps(params), participant_id))
         self.conn.commit()
-        with patch.object(D.P, "_cycle_initial", return_value=60000.0), \
+        with patch.object(D.P, "cycle_initial", return_value=60000.0), \
                 patch.object(D.P, "realized_pnl", return_value=(1000.0, "verified")), \
-                patch.object(D.P, "_sell_fills", return_value=(
+                patch.object(D.P, "sell_fills", return_value=(
                     [{"order_id": 1}, {"order_id": 2}, {"order_id": 3}], [], True)):
             result = D.rebalance(self.conn, cycle_id=13, decision_at="2026-10-13T09:31:00+08:00",
                                  account_ids=("0", "1", "2", "3", "4")[:3])

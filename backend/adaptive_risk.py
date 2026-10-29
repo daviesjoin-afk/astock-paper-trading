@@ -1927,7 +1927,7 @@ def risk_candidate_fact(conn, candidate_id, *, as_of):
         return None
     # 行形状是**调用方**的事实：生产连接设了 ``row_factory = sqlite3.Row``，迁移 / 运维
     # 入口却是裸 tuple。两种都必须能读。
-    item = EV._row_as_dict(cursor, row)
+    item = EV.row_as_dict(cursor, row)
     missing = [name for name in _RISK_REQUIRED_COLUMNS if name not in item]
     if missing:
         raise RiskFactContractError(

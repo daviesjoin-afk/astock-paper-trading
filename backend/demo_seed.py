@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import data_fetcher as dfc  # noqa: E402
 import universe as U  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import paper_common as PC
+import paper_storage as PST
 import execution_verification as EV  # noqa: E402
 
 # 10 virtual tickers. Prefix 600xxx passes paper_trading_rules.security_scope
@@ -99,12 +101,12 @@ def _write_universe():
 
 
 def _now():
-    return PT._now()
+    return PC.now_text()
 
 
 def _decision(conn, account_id, code, side, decision, reason, name):
-    strategy_stamp = PT._strategy_stamp(conn, account_id)
-    PT._rows(conn, """
+    strategy_stamp = PT.resolve_strategy_stamp(conn, account_id)
+    PT.query_rows(conn, """
         INSERT INTO paper_risk_decisions(account_id,code,side,decision,reason,payload,created_at,
                                          strategy_id,strategy_version,strategy_checksum)
         VALUES (?,?,?,?,?,?,?,?,?,?)""", (
@@ -116,7 +118,7 @@ def _decision(conn, account_id, code, side, decision, reason, name):
 
 def _order(conn, account_id, code, name, side, qty, status, reason, created_at, planned=None, filled=None, cycle_id=None):
     price = filled if filled is not None else (planned if planned is not None else 0.0)
-    strategy_stamp = PT._strategy_stamp(conn, account_id)
+    strategy_stamp = PT.resolve_strategy_stamp(conn, account_id)
     cur = conn.execute(
         "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at,strategy_id,strategy_version,strategy_checksum,cycle_id) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -124,13 +126,13 @@ def _order(conn, account_id, code, name, side, qty, status, reason, created_at, 
          planned if planned is not None else price, filled, round(price * qty, 2),
          round(price * qty * 0.0003, 2), status, reason, "{}", created_at,
          created_at if status == "filled" else None, *strategy_stamp,
-         cycle_id if cycle_id is not None else PT._order_cycle_id(conn)),
+         cycle_id if cycle_id is not None else PT.order_cycle_id(conn)),
     )
     return cur.lastrowid
 
 
 def _fill(conn, order_id, account_id, code, side, qty, price, created_at):
-    PT._rows(conn, """
+    PT.query_rows(conn, """
         INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (
         order_id, account_id, side, code, qty, price, round(price * qty, 2),
@@ -142,34 +144,34 @@ def _fill(conn, order_id, account_id, code, side, qty, price, created_at):
 
 
 def _position(conn, cycle_id, account_id, code, name, industry, qty, cost, entry_day, available_day):
-    PT._rows(conn, """
+    PT.query_rows(conn, """
         INSERT INTO paper_positions(account_id,code,name,industry,qty,cost,entry_date,available_date,asset_type,peak_price,take_stage)
         VALUES (?,?,?,?,?,?,?,?,'stock_t1',?,0)""",
         (account_id, code, name, industry, qty, cost, entry_day, available_day, round(cost * 1.03, 2)))
-    PT._rows(conn, """
+    PT.query_rows(conn, """
         INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
         VALUES (?,?,?,?,?,?,?,?,?,?,'stock_t1',NULL,0,1)""",
         (cycle_id, account_id, code, name, industry, qty, qty, cost, f"{entry_day} 10:00:00", available_day))
     # R14：runtime 风险状态（peak/take_stage）的权威在 cycle-owned 表；
     # 种子数据同样必须写那里，否则演示持仓会走"状态缺失"的 fail-safe 语义。
     # 投影里的 peak/take_stage 只是展示镜像。
-    PT._rows(conn, """
+    PT.query_rows(conn, """
         INSERT OR REPLACE INTO paper_position_risk_state(cycle_id,account_id,code,peak_price,take_stage,opened_order_id,initialized_at,updated_at)
         VALUES (?,?,?,?,0,NULL,?,?)""",
         (cycle_id, account_id, code, round(cost * 1.03, 2), f"{entry_day} 10:00:00", f"{entry_day} 10:00:00"))
 
 
 def _drop_position(conn, account_id, code):
-    PT._rows(conn, "DELETE FROM paper_positions WHERE account_id=? AND code=?", (account_id, code))
-    PT._rows(conn, "DELETE FROM paper_position_risk_state WHERE account_id=? AND code=?",
+    PT.query_rows(conn, "DELETE FROM paper_positions WHERE account_id=? AND code=?", (account_id, code))
+    PT.query_rows(conn, "DELETE FROM paper_position_risk_state WHERE account_id=? AND code=?",
              (account_id, code))
-    PT._rows(conn, "UPDATE paper_position_lots SET remaining_qty=0 WHERE account_id=? AND code=?",
+    PT.query_rows(conn, "UPDATE paper_position_lots SET remaining_qty=0 WHERE account_id=? AND code=?",
              (account_id, code))
 
 
 def _review(conn, cycle_id, account_id, code, review_date, score, grade, action, market_value, position_pct,
             reasons, detail, replacement_code=None, replacement_score=None):
-    PT._rows(conn, """
+    PT.query_rows(conn, """
         INSERT INTO paper_position_reviews
         (cycle_id,account_id,code,review_date,score,grade,action,market_value,position_pct,
          replacement_code,replacement_score,reasons,detail,created_at)
@@ -187,7 +189,7 @@ def _nav_days(conn, accounts, shares, day_counts):
         for acct_index, account_id in enumerate(accounts):
             share = shares[account_id]
             nav = share * (1 + day_counts[acct_index][day_index] / 100.0)
-            PT._rows(conn, """
+            PT.query_rows(conn, """
                 INSERT OR IGNORE INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at,quote_status)
                 VALUES (?,?,?,?,?,?,?,'verified')""",
                 (account_id, nav_date, share, nav - share, round(nav, 2),
@@ -200,7 +202,7 @@ def ensure_demo_data(force=False):
     # dashboard/risk paths use synthetic marks instead of network fallbacks.
     os.environ["ASTOCK_FULL_MARKET_MIN_ROWS"] = "1"
     PT.init_db()
-    with PT._db() as conn:
+    with PST.paper_db() as conn:
         marker = conn.execute(
             "SELECT 1 FROM paper_audit WHERE event='demo_seeded' LIMIT 1"
         ).fetchone()
@@ -212,19 +214,19 @@ def ensure_demo_data(force=False):
 
     _write_universe()
 
-    with PT._db() as conn:
+    with PST.paper_db() as conn:
         # Rebuild a running cycle so the ledger is deterministic on every
         # (re)seed: archive whatever draft/running/paused cycle exists first.
-        current = PT._rows(
+        current = PT.query_rows(
             conn,
             "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1",
         )
         if current:
-            PT._archive_current_cycle(conn, "demo seed 重建确定性演示周期")
-        cycle = PT._create_cycle(conn, DEMO_CAPITAL, status="running", reason="确定性演示账本播种")
+            PT.archive_current_cycle(conn, "demo seed 重建确定性演示周期")
+        cycle = PT.create_cycle(conn, DEMO_CAPITAL, status="running", reason="确定性演示账本播种")
         cycle_id = cycle["id"]
         accounts = sorted(cycle["enabled_strategies"])
-        shares = {row["id"]: float(row["initial_cash"]) for row in PT._rows(
+        shares = {row["id"]: float(row["initial_cash"]) for row in PT.query_rows(
             conn, "SELECT id,initial_cash FROM paper_accounts WHERE cycle_id=?", (cycle_id,))}
         # deterministic assignment: first two accounts carry the story
         acc_hold = accounts[0]     # 正常买入 + T+1 卖拒
@@ -319,12 +321,12 @@ def ensure_demo_data(force=False):
                    FROM paper_fills WHERE account_id=?""",
                 (account_id,),
             ).fetchone()[0]
-            PT._rows(conn, "UPDATE paper_accounts SET cash=?,updated_at=? WHERE id=?",
+            PT.query_rows(conn, "UPDATE paper_accounts SET cash=?,updated_at=? WHERE id=?",
                      (round(shares[account_id] + float(flow), 2), _now(), account_id))
 
-        PT._audit(conn, None, "demo_seeded",
+        PT.audit(conn, None, "demo_seeded",
                   "确定性演示账本已播种：10 只合成股票，事件链含正常成交/T+1 拒绝/行情过期拒绝/止损/涨停")
-        PT._audit(conn, None, "capital_configured", f"演示资金池 {DEMO_CAPITAL:.0f} 元，按正式策略预算分配")
+        PT.audit(conn, None, "capital_configured", f"演示资金池 {DEMO_CAPITAL:.0f} 元，按正式策略预算分配")
     return True
 
 

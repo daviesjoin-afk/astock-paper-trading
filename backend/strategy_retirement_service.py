@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import paper_trading as PT
+import paper_storage as PST
 import strategy_health_repository as SHRepo
 import strategy_lifecycle as SL
 import strategy_retirement_policy as RP
@@ -22,7 +23,7 @@ import strategy_retirement_repository as RR
 
 def _with_paper_connection(work, *, immediate: bool = False):
     PT.init_db()
-    with PT._db(immediate=immediate) as conn:
+    with PST.paper_db(immediate=immediate) as conn:
         return work(conn)
 
 

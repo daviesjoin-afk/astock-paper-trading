@@ -293,7 +293,7 @@ def create_robustness_report(
                     raise ValueError("historical_benchmark_calendar_unavailable")
                 owner_sessions = list(benchmark_calendar.get("sessions") or ())
                 try:
-                    base_start, base_end = RRUN._baseline_session_bounds(spec, owner_sessions)
+                    base_start, base_end = RRUN.baseline_session_bounds(spec, owner_sessions)
                 except ValueError as exc:
                     raise ValueError("historical_benchmark_calendar_unavailable") from exc
                 if owner_sessions != sorted(set(owner_sessions)):
@@ -302,7 +302,7 @@ def create_robustness_report(
                 ranges = []
                 for scenario in date_scenarios:
                     try:
-                        selected = RRUN._scenario_sessions(scenario, spec, owner_sessions)
+                        selected = RRUN.build_scenario_sessions(scenario, spec, owner_sessions)
                     except ValueError:
                         # Out-of-coverage scenarios remain unavailable in the
                         # runner; they must not make the whole POST fail.

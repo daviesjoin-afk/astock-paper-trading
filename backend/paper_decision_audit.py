@@ -62,7 +62,7 @@ def snapshot_safe(value):
     return value
 
 
-def _snapshot_date(value):
+def snapshot_date(value):
     """Normalise a replay date, returning None for invalid/future-free input."""
     if value is None or value == "":
         return None
@@ -72,7 +72,8 @@ def _snapshot_date(value):
         return None
 
 
-def _snapshot_first(mapping, *keys):
+
+def snapshot_first(mapping, *keys):
     if not isinstance(mapping, dict):
         return None
     for key in keys:
@@ -82,6 +83,7 @@ def _snapshot_first(mapping, *keys):
     return None
 
 
+
 def _snapshot_bar_date(index):
     try:
         return _date(index).isoformat()
@@ -89,7 +91,7 @@ def _snapshot_bar_date(index):
         return str(index)[:10] or None
 
 
-def _snapshot_kline(kline, asof_date=None):
+def snapshot_kline(kline, asof_date=None):
     """Serialise retained daily bars with full history and future-bar counts."""
     if kline is None or not hasattr(kline, "iterrows"):
         return {
@@ -101,7 +103,7 @@ def _snapshot_kline(kline, asof_date=None):
             "future_rows": 0,
             "status": "unknown",
         }
-    cutoff = _snapshot_date(asof_date)
+    cutoff = snapshot_date(asof_date)
     rows, future_rows = [], 0
     raw_columns = getattr(kline, "columns", None)
     columns = list(raw_columns) if raw_columns is not None else []
@@ -165,7 +167,8 @@ def _snapshot_kline(kline, asof_date=None):
     }
 
 
-def _snapshot_factor_evidence(payload):
+
+def snapshot_factor_evidence(payload):
     """Extract raw factors and contribution evidence already produced upstream."""
     payload = payload if isinstance(payload, dict) else {}
     pick = payload.get("pick") if isinstance(payload.get("pick"), dict) else {}
@@ -238,6 +241,7 @@ def _snapshot_factor_evidence(payload):
     }
 
 
+
 def build_decision_snapshot(
     payload=None,
     *,
@@ -276,7 +280,7 @@ def build_decision_snapshot(
         entry = payload.get("entry_model")
     quote_data = dict(quote or payload.get("quote") or {})
     resolved_code = str(code or pick.get("code") or payload.get("code") or "") or None
-    resolved_asof = _snapshot_date(
+    resolved_asof = snapshot_date(
         asof_date
         or payload.get("asof")
         or payload.get("asof_date")
@@ -289,41 +293,41 @@ def build_decision_snapshot(
             kline = kline_loader(resolved_code, resolved_asof, inclusive=True)
         except Exception:
             kline = None
-    quote_at = _snapshot_first(quote_data, "quote_at", "time", "timestamp")
-    quote_source = _snapshot_first(quote_data, "quote_source", "source") or "unknown"
+    quote_at = snapshot_first(quote_data, "quote_at", "time", "timestamp")
+    quote_source = snapshot_first(quote_data, "quote_source", "source") or "unknown"
     history = (
         payload.get("history")
         or payload.get("history_meta")
         or payload.get("factor", {})
     )
     history = history if isinstance(history, dict) else {}
-    factor_evidence = _snapshot_factor_evidence(payload)
+    factor_evidence = snapshot_factor_evidence(payload)
     financial_source = (
-        _snapshot_first(
+        snapshot_first(
             pick, "financial_source", "finance_source", "fundamental_source"
         )
-        or _snapshot_first(history, "financial_source", "finance_source")
+        or snapshot_first(history, "financial_source", "finance_source")
         or "unknown"
     )
     report_period = (
-        _snapshot_first(pick, "report_date", "report_period", "financial_period")
-        or _snapshot_first(factor_evidence.get("raw"), "report_date", "report_period")
+        snapshot_first(pick, "report_date", "report_period", "financial_period")
+        or snapshot_first(factor_evidence.get("raw"), "report_date", "report_period")
     )
     disclosure_at = (
-        _snapshot_first(
+        snapshot_first(
             pick,
             "disclosure_at",
             "disclosure_time",
             "announce_at",
             "announcement_at",
         )
-        or _snapshot_first(
+        or snapshot_first(
             history, "disclosure_at", "disclosure_time", "announce_at"
         )
     )
-    annual_report_date = _snapshot_first(
+    annual_report_date = snapshot_first(
         pick, "annual_report_date"
-    ) or _snapshot_first(factor_evidence.get("raw"), "annual_report_date")
+    ) or snapshot_first(factor_evidence.get("raw"), "annual_report_date")
     news_rows = news if news is not None else payload.get("news")
     news_rows = news_rows if isinstance(news_rows, list) else []
     news_events = []
@@ -331,7 +335,7 @@ def build_decision_snapshot(
     for item in news_rows:
         if not isinstance(item, dict):
             continue
-        event_time = _snapshot_first(
+        event_time = snapshot_first(
             item, "time", "quote_at", "published_at", "announcement_at"
         )
         event = snapshot_safe(dict(item))
@@ -364,20 +368,20 @@ def build_decision_snapshot(
         or components.get("version")
         or risk_version
     )
-    threshold_value = _snapshot_first(entry, "threshold") or _snapshot_first(
+    threshold_value = snapshot_first(entry, "threshold") or snapshot_first(
         threshold_context, "threshold"
     )
-    threshold_delta = _snapshot_first(news_learning, "threshold_delta")
+    threshold_delta = snapshot_first(news_learning, "threshold_delta")
     if threshold_delta is None:
-        threshold_delta = _snapshot_first(selection_meta, "entry_score_delta")
+        threshold_delta = snapshot_first(selection_meta, "entry_score_delta")
     if final_score is None:
         final_score = (
-            _snapshot_first(entry, "score")
-            or _snapshot_first(model, "final_score", "avg_score")
-            or _snapshot_first(components, "final_score")
-            or _snapshot_first(pick, "score")
+            snapshot_first(entry, "score")
+            or snapshot_first(model, "final_score", "avg_score")
+            or snapshot_first(components, "final_score")
+            or snapshot_first(pick, "score")
         )
-    final_reason = reason or payload.get("reason") or _snapshot_first(entry, "reason")
+    final_reason = reason or payload.get("reason") or snapshot_first(entry, "reason")
     if not final_reason:
         reasons = (
             entry.get("reasons") if isinstance(entry.get("reasons"), list) else []
@@ -388,9 +392,9 @@ def build_decision_snapshot(
         final_reason = (
             "；".join(str(item) for item in (reasons or blockers) if item) or None
         )
-    kline_evidence = _snapshot_kline(kline, resolved_asof)
-    history_last = _snapshot_first(history, "last_date", "factor_date")
-    quote_validation = _snapshot_first(quote_data, "quote_validation") or "unknown"
+    kline_evidence = snapshot_kline(kline, resolved_asof)
+    history_last = snapshot_first(history, "last_date", "factor_date")
+    quote_validation = snapshot_first(quote_data, "quote_validation") or "unknown"
     scan_meta = (
         news_scan_meta
         if isinstance(news_scan_meta, dict)
@@ -511,3 +515,10 @@ def with_decision_snapshot(payload=None, **kwargs):
         enriched["strategy_id"] = kwargs.get("account_id")
     enriched["decision_snapshot"] = build_decision_snapshot(enriched, **kwargs)
     return enriched
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_snapshot_date = snapshot_date
+_snapshot_factor_evidence = snapshot_factor_evidence
+_snapshot_first = snapshot_first
+_snapshot_kline = snapshot_kline

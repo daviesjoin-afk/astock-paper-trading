@@ -114,11 +114,12 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _decode(value: str, fallback: Any = None) -> Any:
+def decode(value: str, fallback: Any = None) -> Any:
     try:
         return json.loads(value)
     except (TypeError, ValueError):
         return fallback
+
 
 
 # 这些键的值只能留在运行时，写进审计时必须掩码：设置审计会随快照一起返回给
@@ -240,7 +241,7 @@ def _flat_read(conn: sqlite3.Connection) -> dict[str, Any]:
     result = defaults(conn)
     for row in conn.execute("SELECT key,value FROM paper_runtime_settings"):
         if row[0] in result:
-            value = _decode(row[1], result[row[0]])
+            value = decode(row[1], result[row[0]])
             if row[0] == "strategy_overrides" and isinstance(value, dict):
                 # Existing records are a user overlay.  Rebase it on today's
                 # registry-derived profiles so newly active strategies receive
@@ -282,7 +283,7 @@ def get(conn: sqlite3.Connection, key: str, fallback: Any = None) -> Any:
         return fallback
     if not row:
         return fallback
-    return _decode(row[0], fallback)
+    return decode(row[0], fallback)
 
 
 def _number(value: Any, key: str, low: float, high: float, integer: bool = False) -> float | int:
@@ -496,8 +497,8 @@ def audit(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
     result = []
     for row in rows:
         item = dict(row)
-        item["old_value"] = _decode(item["old_value"], None)
-        item["new_value"] = _decode(item["new_value"], None)
+        item["old_value"] = decode(item["old_value"], None)
+        item["new_value"] = decode(item["new_value"], None)
         result.append(item)
     return result
 
@@ -515,7 +516,7 @@ def enabled_strategies(conn: sqlite3.Connection) -> list[str]:
         ).fetchone()
     except sqlite3.Error:
         row = None
-    if row is not None and _decode(row[0], None) == []:
+    if row is not None and decode(row[0], None) == []:
         return []
     value = get(conn, "enabled_strategies", eligible)
     # A saved list is an explicit scope. If all saved identities become
@@ -525,3 +526,7 @@ def enabled_strategies(conn: sqlite3.Connection) -> list[str]:
 
 def cycle_duration_label(days: int | None) -> str:
     return "长期" if not days else f"{int(days)} 个交易日"
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_decode = decode

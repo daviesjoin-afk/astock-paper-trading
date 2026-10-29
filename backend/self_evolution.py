@@ -263,7 +263,7 @@ def init_params(conn, params: Optional[dict] = None, source: str = "init") -> di
         p.update(params)
 
     # 验证边界
-    p = _clamp_params(p)
+    p = clamp_params(p)
 
     created = EA.create_candidate(
         conn, p, strategy_id=None, source=source, reason="初始化", validate=True,
@@ -281,13 +281,14 @@ def init_params(conn, params: Optional[dict] = None, source: str = "init") -> di
     }
 
 
-def _clamp_params(params: dict) -> dict:
+def clamp_params(params: dict) -> dict:
     """将参数限制在合法边界内。"""
     clamped = dict(params)
     for key, bounds in BOUNDS.items():
         if key in clamped:
             clamped[key] = max(bounds["min"], min(bounds["max"], clamped[key]))
     return clamped
+
 
 
 def track_run(conn, run_id: int, trigger: str, mode: str, status: str,
@@ -733,7 +734,7 @@ def evolve(conn, reason: str = "auto") -> dict:
     # 驱动；这里不再有任何路径让 reviewer failure 改动或回滚 evolution params。
 
     # 边界约束
-    new_params = _clamp_params(new_params)
+    new_params = clamp_params(new_params)
 
     # 检查是否有实际变化
     changed_keys = [k for k in new_params if new_params.get(k) != old_params.get(k)]
@@ -801,9 +802,9 @@ def _find_rollback_target(conn) -> Optional[dict]:
             FROM evolution_params ep
             JOIN evolution_activation_history h ON h.to_params_id = ep.id
             WHERE ep.strategy_id IS NULL
-              AND h.action IN ({','.join('?' for _ in EA._SWITCH_ACTIONS)})
+              AND h.action IN ({','.join('?' for _ in EA.SWITCH_ACTIONS)})
             ORDER BY ep.id DESC LIMIT 10""",
-        tuple(EA._SWITCH_ACTIONS),
+        tuple(EA.SWITCH_ACTIONS),
     ).fetchall()
 
     for row in rows:
@@ -838,7 +839,7 @@ def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
     old_params = dict(current["params"])
     new_params = dict(old_params)
     new_params.update(adjustments)
-    new_params = _clamp_params(new_params)
+    new_params = clamp_params(new_params)
 
     changed_keys = [k for k in new_params if new_params.get(k) != old_params.get(k)]
     if not changed_keys:
@@ -909,7 +910,7 @@ def adjust_strategy_dsl_parameters(paper_conn, strategy_id: str, adjustments: di
 
 def _ensure_strategy_column(conn) -> None:
     """幂等补齐 evolution_params 的生命周期列（旧库迁移）。"""
-    EA._ensure_params_columns(conn)
+    EA.ensure_params_columns(conn)
 
 
 def get_strategy_params(conn, strategy_id: str) -> dict:
@@ -1245,3 +1246,7 @@ def auto_evolve_if_needed(conn) -> Optional[dict]:
     if not should:
         return None
     return evolve(conn, reason=reason)
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_clamp_params = clamp_params

@@ -19,7 +19,7 @@ MAX_JUDGMENTS = 8
 
 
 def _time(value):
-    return tracking._observed_at(value)
+    return tracking.observed_at(value)
 
 
 def _number(value):
@@ -111,7 +111,7 @@ def feedback(conn, quotes, now):
 
 
 def _archive(now):
-    saved = tracking._read(Path(data_paths.data_path('auction_tracking','feedback.json')))
+    saved = tracking.read(Path(data_paths.data_path('auction_tracking','feedback.json')))
     return [r for r in saved.get('reviews',[]) if isinstance(r,dict)
             and _time(r.get('observed_at')) is not None and _time(r['observed_at']) <= now]
 
@@ -142,7 +142,7 @@ def record_outcomes(market_rows, now):
         valid = [row for row in rows if row['direction_verdict'] != 'pending']
         if valid:
             merged = _merge_feedback(_archive(now),valid,limit=100)
-            tracking._write(Path(data_paths.data_path('auction_tracking','feedback.json')),{'reviews':merged})
+            tracking.write(Path(data_paths.data_path('auction_tracking','feedback.json')),{'reviews':merged})
         return len(valid)
     except (OSError,sqlite3.Error,ValueError):
         return 0
@@ -150,7 +150,7 @@ def record_outcomes(market_rows, now):
 
 def evidence(now, market_rows, conn, focus_codes=()):
     now = now.astimezone(tracking.CN)
-    saved = tracking._read(Path(data_paths.data_path('auction_tracking', 'current.json')))
+    saved = tracking.read(Path(data_paths.data_path('auction_tracking', 'current.json')))
     stocks = {}
     if saved.get('trade_date') == now.date().isoformat():
         for observation in saved.get('observations', []):

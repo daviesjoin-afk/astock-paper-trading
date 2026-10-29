@@ -39,7 +39,7 @@ class ShadowRuntimeError(ValueError):
         super().__init__(reason_code)
 
 
-def _plain(value: Any) -> Any:
+def plain(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -64,6 +64,10 @@ def _plain(value: Any) -> Any:
         return _plain(value.to_dict())
     raise ValueError(f"unsupported shadow evidence value: {type(value).__name__}")
 
+
+
+# 兼容别名：既有测试按私有名引用同一实现。
+_plain = plain
 
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -115,7 +119,7 @@ def _captured_entry_state_projection(state: EP.EntryGateState) -> dict[str, Any]
     return {item.name: _plain(getattr(state, item.name)) for item in dataclass_fields(state)}
 
 
-def _instant(value: Any) -> str:
+def parse_shadow_instant(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("decision_at must be an exact instant")
     try:
@@ -125,6 +129,7 @@ def _instant(value: Any) -> str:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("decision_at must include a timezone")
     return parsed.astimezone(dt.timezone.utc).isoformat()
+
 
 
 def _fingerprint_map(value: Mapping[str, str], *, label: str) -> tuple[tuple[str, str], ...]:
@@ -162,7 +167,7 @@ class ComparableEnvironmentIdentity:
               tradability_evidence_fingerprints: Mapping[str, str],
               execution_ruleset_identity: str):
         day = dt.date.fromisoformat(str(session_date)).isoformat()
-        instant = _instant(decision_at)
+        instant = parse_shadow_instant(decision_at)
         policy, ruleset = str(market_policy_name or "").strip(), str(
             execution_ruleset_identity or "").strip()
         if (policy != MDC.EXECUTION_QUOTE_POLICY.name
@@ -320,7 +325,7 @@ class FrozenShadowEnvironment:
         for code, quote in quote_map.items():
             if str(quote.get("code") or "").strip() != code:
                 raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
-            if _instant(str(quote.get("execution_asof") or "")) != self.identity.decision_at:
+            if parse_shadow_instant(str(quote.get("execution_asof") or "")) != self.identity.decision_at:
                 raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
             quote_snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
             if quote_snapshot is None or MDC.snapshot_fingerprint(quote_snapshot) != expected_quotes[code]:
@@ -331,7 +336,7 @@ class FrozenShadowEnvironment:
                     or evidence.code != code
                     or evidence.session_date != day
                     or not evidence.decision_time
-                    or _instant(evidence.decision_time) != self.identity.decision_at
+                    or parse_shadow_instant(evidence.decision_time) != self.identity.decision_at
                     or not isinstance(evidence.can_buy, bool)
                     or not isinstance(evidence.can_sell, bool)
                     or not _SHA256.fullmatch(str(evidence.fingerprint or ""))
@@ -390,7 +395,7 @@ class ShadowRunSpec:
         if not _SHA256.fullmatch(str(self.environment_fingerprint or "")):
             raise ValueError("environment fingerprint is invalid")
         object.__setattr__(self, "session_date", dt.date.fromisoformat(self.session_date).isoformat())
-        object.__setattr__(self, "decision_at", _instant(self.decision_at))
+        object.__setattr__(self, "decision_at", parse_shadow_instant(self.decision_at))
         capital = float(self.reference_capital)
         if isinstance(self.reference_capital, bool) or not math.isfinite(capital) or capital <= 0:
             raise ValueError("reference capital must be positive and finite")
@@ -568,7 +573,7 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
         if (previous_spec["challenger"] != spec.challenger.projection()
                 or previous_spec["reference_capital"] != spec.reference_capital):
             raise ValueError("previous_shadow_run_chain_mismatch")
-        state = _state_for_run(spec, previous_run)
+        state = state_for_run(spec, previous_run)
 
     quote_fingerprints = dict(environment.identity.symbol_quote_fingerprints)
     # Run-level evidence, recorded once: every candidate below consumed this exact
@@ -747,10 +752,10 @@ def state_before_projection(spec: ShadowRunSpec,
                             previous_run: ShadowRunEvidence | None) -> dict[str, Any]:
     if previous_run is None:
         return ShadowRuntimeState.initial(spec.reference_capital, spec.session_date).projection()
-    return _state_for_run(spec, previous_run).projection()
+    return state_for_run(spec, previous_run).projection()
 
 
-def _state_for_run(spec: ShadowRunSpec, previous_run: ShadowRunEvidence) -> ShadowRuntimeState:
+def state_for_run(spec: ShadowRunSpec, previous_run: ShadowRunEvidence) -> ShadowRuntimeState:
     previous_spec = previous_run.spec
     if previous_spec["challenger"] != spec.challenger.projection():
         raise ValueError("previous_shadow_run_chain_mismatch")
@@ -775,6 +780,7 @@ def _state_for_run(spec: ShadowRunSpec, previous_run: ShadowRunEvidence) -> Shad
     )
 
 
+
 def resolve_exact_shadow_strategy(conn, stamp: StrategyStamp):
     """Read one explicit immutable version and its R31 state; never read head."""
     import strategy_registry as SR
@@ -788,3 +794,7 @@ def resolve_exact_shadow_strategy(conn, stamp: StrategyStamp):
         raise ValueError("challenger_lifecycle_not_shadow")
     return version, state["state"]
 
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_instant = parse_shadow_instant
+_state_for_run = state_for_run

@@ -133,8 +133,8 @@ def _factor_only_patch(candidate, baseline, model_id):
     if set(base) != set(allowed) or set(requested) != set(base):
         return False
     try:
-        base_norm = _normalize(base)
-        requested_norm = _normalize(requested)
+        base_norm = normalize(base)
+        requested_norm = normalize(requested)
     except Exception:
         return False
     return all(abs(float(requested_norm[key]) - float(base_norm[key])) <= 0.030001
@@ -160,7 +160,7 @@ def _merge_selection_overlay(account_params, candidate, current_weights, model_i
     return overlay
 
 
-def _normalize(weights):
+def normalize(weights):
     raw = {key: max(1e-9, _num(value)) for key, value in weights.items()}
     result = {}
     free = set(raw)
@@ -186,7 +186,8 @@ def _normalize(weights):
     return {key: round(result[key], 6) for key in weights}
 
 
-def _current(account):
+
+def current_selection(account):
     account_id = account["id"]
     base_model_id = ACCOUNT_MODELS[account_id]
     params = _loads(account.get("params"), {})
@@ -201,12 +202,13 @@ def _current(account):
     if meta.get("status") == "active":
         candidate_weights = overlay.get("weights") or {}
         if set(candidate_weights) == set(weights):
-            weights = _normalize(candidate_weights)
+            weights = normalize(candidate_weights)
         entry_delta = max(-0.02, min(0.03, _num(overlay.get("entry_score_delta"), entry_delta)))
     return model_id, weights, round(entry_delta, 4), params, meta
 
 
-def _conditions(model_id, override=None):
+
+def account_conditions(model_id, override=None):
     base = S.paper_condition_defaults(model_id)
     if not isinstance(override, dict):
         return base
@@ -220,6 +222,7 @@ def _conditions(model_id, override=None):
         if value is not None:
             base[key] = value
     return base
+
 
 
 # 结构变更（换模型 / 加入场路径）必须人工确认，因此它一旦被无条件生成，
@@ -262,7 +265,7 @@ def _structure_target(account_id, current_model, tier, mean_reward=None):
 
 def _condition_target(model_id, regime):
     """Generate an auditable rule-set mutation for the current market regime."""
-    target = _conditions(model_id)
+    target = account_conditions(model_id)
     if regime == "momentum":
         if model_id == "first_board_relay":
             target.update({"pct_high": 6.0, "chase_guard_pct": 8.0, "chase_penalty": 0.52})
@@ -287,7 +290,7 @@ def _blend_conditions(model_id, current, target, tier):
     # 既不是旧值也不是 canonical 的垃圾值，而 activation 边界认不出它（它不是
     # 已证实的 sentinel）。因此在生成候选前先把 current 在内存里归一化。
     current = UNIT_COMPAT.normalize_legacy_conditions(current, model_family=model_id)[0]
-    result = _conditions(model_id, current)
+    result = account_conditions(model_id, current)
     result["enabled"] = dict(current.get("enabled") or {})
     for key in target:
         if key == "enabled":
@@ -375,10 +378,10 @@ def _proposal(account_id, model_id, current_weights, current_delta, current_cond
     structural = mutation not in {None, "none"}
     proposal_model = target_model if target_model in BASE_WEIGHTS else model_id
     multipliers = REGIME_MULTIPLIERS.get(regime, {})
-    target = _normalize({key: value * multipliers.get(key, 1.0) for key, value in BASE_WEIGHTS[proposal_model].items()})
+    target = normalize({key: value * multipliers.get(key, 1.0) for key, value in BASE_WEIGHTS[proposal_model].items()})
     blend = {"waiting": 0.20, "fast_shadow": 0.35, "micro": 0.65, "standard": 0.85, "mature": 1.0}.get(tier, 0.20)
     if set(current_weights) == set(target):
-        weights = _normalize({key: current_weights[key] + (target[key] - current_weights[key]) * blend for key in current_weights})
+        weights = normalize({key: current_weights[key] + (target[key] - current_weights[key]) * blend for key in current_weights})
     else:
         # 模型族切换先生成完整基线，执行仍由结构门禁控制。
         weights = target
@@ -556,7 +559,7 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
         if not account_row:
             raise ValueError("模拟策略账户不存在")
         account = dict(account_row)
-        current_model, current_weights, _, account_params, _ = _current(account)
+        current_model, current_weights, _, account_params, _ = current_selection(account)
         previous = _json(account_params)
         if approved in _AUTO_APPROVERS and not _factor_only_patch(
                 candidate_preview, {"weights": current_weights}, current_model):
@@ -582,7 +585,7 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
             (item["account_id"], version),
         ).fetchone()
         if not existing_version:
-            current_model, current_weights, _, account_params, _ = _current(account)
+            current_model, current_weights, _, account_params, _ = current_selection(account)
             merged_overlay = _merge_selection_overlay(
                 account_params, candidate, current_weights, current_model,
             )
@@ -820,8 +823,8 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
                 }
                 candidate_ids.append(_upsert(conn, payload, now_fn()))
                 continue
-            model_id, weights, delta, params, _ = _current(account)
-            current_conditions = _conditions(model_id, (params.get("adaptive_selection") or {}).get("conditions"))
+            model_id, weights, delta, params, _ = current_selection(account)
+            current_conditions = account_conditions(model_id, (params.get("adaptive_selection") or {}).get("conditions"))
             evidence = _evidence(conn, paper, account["id"], profile.get("regime"))
             evidence["strategy_version"] = str(account.get("version") or "")
             evidence["profile_date"] = str(profile.get("profile_date") or "")[:10]
@@ -1476,7 +1479,7 @@ def selection_candidate_fact(conn, candidate_id, *, as_of):
         return None
     # 行形状是**调用方**的事实，不是本读侧可以假定的前提：生产连接设了
     # ``row_factory = sqlite3.Row``，迁移 / 运维入口却是裸 tuple。两种都必须能读。
-    item = EV._row_as_dict(cursor, row)
+    item = EV.row_as_dict(cursor, row)
     missing = [name for name in _SELECTION_REQUIRED_COLUMNS if name not in item]
     if missing:
         raise SelectionFactContractError(
@@ -1641,7 +1644,7 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
         raise SelectionProposalConflict(
             f"shadow proposal slot {day}/{account}/{regime_text} vanished during the insert"
         )
-    item = EV._row_as_dict(probe, existing_row)
+    item = EV.row_as_dict(probe, existing_row)
     if _shadow_proposal_is_identical(
         item, stored_model=resolved_model,
         baseline_canonical=baseline_canonical, candidate_canonical=candidate_canonical,
@@ -1733,3 +1736,9 @@ def _shadow_proposal_is_identical(
         and stored_evidence == evidence_canonical
         and str(item.get("reason") or "") == reason_text
     )
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_normalize = normalize
+_conditions = account_conditions
+_current = current_selection

@@ -83,7 +83,7 @@ def consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None,
     return int(qty) - remaining, cost_amount
 
 
-def record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None, acquired_at=None, *, num_fn=_num, date_fn=_date, now_fn=_now, asset_type_fn=PTR.asset_type, next_trade_day_fn=PTR.next_weekday, provenance_fn=POEA._order_cycle_provenance_for_order):
+def record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None, acquired_at=None, *, num_fn=_num, date_fn=_date, now_fn=_now, asset_type_fn=PTR.asset_type, next_trade_day_fn=PTR.next_weekday, provenance_fn=POEA.order_cycle_provenance_for_order):
     """写入买入 lot。周期归属必须与**来源买单**一致（§15 硬 invariant）。
 
     归属**只**接受两种来源，且都不允许回退到当前 active cycle：

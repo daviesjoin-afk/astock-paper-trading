@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import notify_wxpusher as NOTIFY
 import paper_trading as P
+import paper_storage as PST
 import runtime_settings as RSET
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -61,7 +62,7 @@ def main(argv: list[str]) -> int:
         return 2
     now = dt.datetime.now(TZ)
     P.init_db()
-    with P._db() as conn:
+    with PST.paper_db() as conn:
         settings = RSET.read(conn)["notification"]
         if not settings.get("wxpusher_enabled"):
             print(json.dumps({"sent": False, "reason": "推送总开关未开启"}, ensure_ascii=False))

@@ -501,8 +501,9 @@ class RetirementArchitectureGuardTests(unittest.TestCase):
                 self.assertNotIn(token, literal)
 
     def test_service_never_reads_raw_ledgers(self):
-        self.assertEqual({"__future__", "paper_trading", "strategy_health_repository",
-                          "strategy_lifecycle", "strategy_retirement_policy",
+        self.assertEqual({"__future__", "paper_storage", "paper_trading",
+                          "strategy_health_repository", "strategy_lifecycle",
+                          "strategy_retirement_policy",
                           "strategy_retirement_repository"}, _imports(RTV))
         for literal in _string_literals(RTV):
             for token in ("INSERT INTO paper_", "UPDATE paper_", "DELETE FROM paper_",

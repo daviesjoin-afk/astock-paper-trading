@@ -920,6 +920,7 @@ def _market_evidence_identity(reading: Any) -> tuple[str, str, str]:
     return source_id, as_of, _content_fingerprint(snapshot)
 
 
+
 def _issue_evidence_ref(
     *, source_type: str, source_id: Any, as_of: Any,
     owner_verification: OwnerVerification, detail: Mapping[str, Any],

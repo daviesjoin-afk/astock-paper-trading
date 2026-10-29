@@ -357,11 +357,11 @@ class ExperimentSearchPlan:
         if not isinstance(self.walk_forward_config, WFV.WalkForwardConfig):
             raise SearchContractError("canonical_walk_forward_config_required")
         object.__setattr__(self, "session_calendar_fingerprint",
-                           EC._stable_fingerprint(self.session_calendar_fingerprint, name="session_calendar_fingerprint"))
+                           EC.stable_fingerprint(self.session_calendar_fingerprint, name="session_calendar_fingerprint"))
         if self.financial_archive_fingerprint is not None:
             object.__setattr__(self, "financial_archive_fingerprint",
-                               EC._stable_fingerprint(self.financial_archive_fingerprint, name="financial_archive_fingerprint"))
-        normalized = EC._normalize_experiment_environment({
+                               EC.stable_fingerprint(self.financial_archive_fingerprint, name="financial_archive_fingerprint"))
+        normalized = EC.normalize_experiment_environment({
             **self.experiment_environment(), "tradability_fingerprint": "0" * 64,
             "contract_version": EC.CANDIDATE_EXPERIMENT_CONTRACT_VERSION})
         for name in ("code_revision", "dataset_fingerprint", "start_date", "end_date",
@@ -369,7 +369,7 @@ class ExperimentSearchPlan:
             object.__setattr__(self, name, normalized[name])
         object.__setattr__(self, "market_archive_fingerprint", normalized["market_data_fingerprint"])
         object.__setattr__(self, "universe_archive_fingerprint", normalized["universe_fingerprint"])
-        object.__setattr__(self, "validation_portfolio", EC._freeze_json(self.validation_portfolio))
+        object.__setattr__(self, "validation_portfolio", EC.freeze_json(self.validation_portfolio))
 
     def experiment_environment(self):
         return {"code_revision": self.code_revision, "dataset_fingerprint": self.dataset_fingerprint,
@@ -391,15 +391,15 @@ class ExperimentSearchPlan:
                 "financial_archive_fingerprint": self.financial_archive_fingerprint,
                 "session_calendar_fingerprint": self.session_calendar_fingerprint,
                 "date_range": {"start": self.start_date, "end": self.end_date},
-                "asof_policy": EC._thaw_json(self.asof_policy),
-                "execution_assumptions": EC._thaw_json(self.execution_assumptions),
-                "cost_model": EC._thaw_json(self.cost_model),
-                "validation_portfolio": EC._thaw_json(self.validation_portfolio),
+                "asof_policy": EC.thaw_json(self.asof_policy),
+                "execution_assumptions": EC.thaw_json(self.execution_assumptions),
+                "cost_model": EC.thaw_json(self.cost_model),
+                "validation_portfolio": EC.thaw_json(self.validation_portfolio),
                 "walk_forward_config": self.walk_forward_config.projection(), "random_seed": self.random_seed}
 
     @property
     def fingerprint(self):
-        return EC._digest(self.projection())
+        return EC.digest(self.projection())
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,7 +451,7 @@ class ExperimentSearchPlanV2:
 
     @property
     def fingerprint(self) -> str:
-        return EC._digest(self.projection())
+        return EC.digest(self.projection())
 
 
 def _experiment_plan_v2_from_projection(value: dict) -> ExperimentSearchPlanV2:

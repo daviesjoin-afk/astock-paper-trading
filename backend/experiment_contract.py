@@ -43,13 +43,14 @@ def _text(value: Any, *, name: str) -> str:
     return value.strip()
 
 
-def _stable_fingerprint(value: Any, *, name: str) -> str:
+def stable_fingerprint(value: Any, *, name: str) -> str:
     text = _text(value, name=name)
     if text.lower() in _UNSTABLE_IDENTITIES:
         raise ValueError(f"{name} must not use a current/latest identity")
     if not _SHA256_PATTERN.fullmatch(text):
         raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
     return text
+
 
 
 def _explicit_label(value: Any, *, name: str) -> str:
@@ -59,7 +60,7 @@ def _explicit_label(value: Any, *, name: str) -> str:
     return text
 
 
-def _freeze_json(value: Any, *, path: str = "value") -> Any:
+def freeze_json(value: Any, *, path: str = "value") -> Any:
     """Validate JSON-like values and recursively freeze mappings and sequences."""
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -74,30 +75,33 @@ def _freeze_json(value: Any, *, path: str = "value") -> Any:
         for key, item in value.items():
             if not isinstance(key, str) or not key:
                 raise ValueError(f"{path} keys must be non-empty strings")
-            frozen[key] = _freeze_json(item, path=f"{path}.{key}")
+            frozen[key] = freeze_json(item, path=f"{path}.{key}")
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item, path=f"{path}[]") for item in value)
+        return tuple(freeze_json(item, path=f"{path}[]") for item in value)
     raise ValueError(f"{path} contains unsupported JSON value {type(value).__name__}")
 
 
-def _thaw_json(value: Any) -> Any:
+
+def thaw_json(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
+        return {key: thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
-        return [_thaw_json(item) for item in value]
+        return [thaw_json(item) for item in value]
     return value
+
 
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(
-        _thaw_json(value), sort_keys=True, separators=(",", ":"),
+        thaw_json(value), sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, allow_nan=False,
     )
 
 
-def _digest(value: Any) -> str:
+def digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
 
 
 def _date(value: Any, *, name: str) -> str:
@@ -144,7 +148,7 @@ def _required_mapping(value: Any, *, name: str, fields: tuple[str, ...]) -> Mapp
     missing = [field for field in fields if field not in value]
     if missing:
         raise ValueError(f"{name} is missing required fields: {', '.join(missing)}")
-    frozen = _freeze_json(value, path=name)
+    frozen = freeze_json(value, path=name)
     if not isinstance(frozen, Mapping):  # for static type narrowing
         raise ValueError(f"{name} must be an object")
     return frozen
@@ -153,7 +157,7 @@ def _required_mapping(value: Any, *, name: str, fields: tuple[str, ...]) -> Mapp
 _ENVIRONMENT_FIELDS = ('code_revision', 'dataset_fingerprint', 'universe_fingerprint', 'tradability_fingerprint', 'market_data_fingerprint', 'parameter_set', 'start_date', 'end_date', 'asof_policy', 'execution_assumptions', 'cost_model', 'random_seed', 'contract_version')
 
 
-def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, Any]:
     """Shared canonicalization; legacy projections remain unchanged."""
     normalized = dict(values)
     code_revision = _text(normalized["code_revision"], name="code_revision")
@@ -164,7 +168,7 @@ def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, An
         "dataset_fingerprint", "universe_fingerprint", "tradability_fingerprint",
         "market_data_fingerprint",
     ):
-        normalized[name] = _stable_fingerprint(normalized[name], name=name)
+        normalized[name] = stable_fingerprint(normalized[name], name=name)
     normalized["contract_version"] = _explicit_label(normalized["contract_version"], name="contract_version")
     if not isinstance(normalized["random_seed"], int) or isinstance(normalized["random_seed"], bool):
         raise ValueError("random_seed must be an explicit integer")
@@ -175,7 +179,7 @@ def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, An
     normalized["start_date"] = start
     normalized["end_date"] = end
 
-    parameter_set = _freeze_json(normalized["parameter_set"], path="parameter_set")
+    parameter_set = freeze_json(normalized["parameter_set"], path="parameter_set")
     if not isinstance(parameter_set, Mapping):
         raise ValueError("parameter_set must be an explicit JSON-like object")
     normalized["parameter_set"] = parameter_set
@@ -185,7 +189,7 @@ def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, An
         asof["policy_id"], name="asof_policy.policy_id",
     )
     normalized_asof["cutoff"] = _asof_cutoff(asof["cutoff"])
-    asof = _freeze_json(normalized_asof, path="asof_policy")
+    asof = freeze_json(normalized_asof, path="asof_policy")
     normalized["asof_policy"] = asof
     execution = _required_mapping(
         normalized["execution_assumptions"], name="execution_assumptions", fields=_EXECUTION_FIELDS,
@@ -199,7 +203,7 @@ def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, An
     for field in ("fill_assumptions", "capacity_assumptions"):
         if not isinstance(execution[field], Mapping) or not execution[field]:
             raise ValueError(f"execution_assumptions.{field} must be a non-empty object")
-    execution = _freeze_json(normalized_execution, path="execution_assumptions")
+    execution = freeze_json(normalized_execution, path="execution_assumptions")
     normalized["execution_assumptions"] = execution
     cost = _required_mapping(normalized["cost_model"], name="cost_model", fields=_COST_FIELDS)
     normalized_cost = dict(cost)
@@ -212,9 +216,10 @@ def _normalize_experiment_environment(values: Mapping[str, Any]) -> dict[str, An
         normalized_cost[field] = _explicit_label(cost[field], name=f"cost_model.{field}")
     if not isinstance(cost["slippage_parameters"], Mapping) or not cost["slippage_parameters"]:
         raise ValueError("cost_model.slippage_parameters must be a non-empty explicit object")
-    cost = _freeze_json(normalized_cost, path="cost_model")
+    cost = freeze_json(normalized_cost, path="cost_model")
     normalized["cost_model"] = cost
     return normalized
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +265,7 @@ class ExperimentSpec:
     def __post_init__(self) -> None:
         if not isinstance(self.strategy, StrategyIdentity):
             raise ValueError("strategy must be a pinned StrategyIdentity")
-        normalized = _normalize_experiment_environment({
+        normalized = normalize_experiment_environment({
             name: getattr(self, name) for name in _ENVIRONMENT_FIELDS
         })
         for name, value in normalized.items():
@@ -276,7 +281,7 @@ class ExperimentSpec:
 
     @property
     def fingerprint(self) -> str:
-        return _digest(self.projection())
+        return digest(self.projection())
 
     @property
     def experiment_id(self) -> str:
@@ -291,11 +296,11 @@ def _projection_environment(self):
             "universe_fingerprint": self.universe_fingerprint,
             "tradability_fingerprint": self.tradability_fingerprint,
             "market_data_fingerprint": self.market_data_fingerprint,
-            "parameter_set": _thaw_json(self.parameter_set),
+            "parameter_set": thaw_json(self.parameter_set),
             "date_range": {"start": self.start_date, "end": self.end_date},
-            "asof_policy": _thaw_json(self.asof_policy),
-            "execution_assumptions": _thaw_json(self.execution_assumptions),
-            "cost_model": _thaw_json(self.cost_model),
+            "asof_policy": thaw_json(self.asof_policy),
+            "execution_assumptions": thaw_json(self.execution_assumptions),
+            "cost_model": thaw_json(self.cost_model),
             "random_seed": self.random_seed,
     }
 
@@ -316,7 +321,7 @@ class CandidateExperimentSubject:
 
     def __post_init__(self):
         for name in ("candidate_id", "candidate_fingerprint", "replay_fingerprint"):
-            object.__setattr__(self, name, _stable_fingerprint(getattr(self, name), name=name))
+            object.__setattr__(self, name, stable_fingerprint(getattr(self, name), name=name))
         if self.candidate_id != self.candidate_fingerprint:
             raise ValueError("candidate_identity_mismatch")
         if not isinstance(self.parent_strategy, StrategyIdentity):
@@ -360,9 +365,9 @@ class CandidateExperimentSpec:
             raise ValueError("unsupported_candidate_experiment_contract")
         if self.robustness_scenario_fingerprint is not None:
             object.__setattr__(self, "robustness_scenario_fingerprint",
-                               _stable_fingerprint(self.robustness_scenario_fingerprint,
+                               stable_fingerprint(self.robustness_scenario_fingerprint,
                                                    name="robustness_scenario_fingerprint"))
-        for name, value in _normalize_experiment_environment({
+        for name, value in normalize_experiment_environment({
                 name: getattr(self, name) for name in _ENVIRONMENT_FIELDS}).items():
             object.__setattr__(self, name, value)
 
@@ -376,7 +381,7 @@ class CandidateExperimentSpec:
 
     @property
     def fingerprint(self):
-        return _digest(self.projection())
+        return digest(self.projection())
 
     @property
     def experiment_id(self):
@@ -431,7 +436,7 @@ class ExperimentResult:
         if self.data_coverage is not None and not 0 <= self.data_coverage <= 1:
             raise ValueError("data_coverage must be a ratio within [0, 1]")
         if self.regime_breakdown is not None:
-            breakdown = _freeze_json(self.regime_breakdown, path="regime_breakdown")
+            breakdown = freeze_json(self.regime_breakdown, path="regime_breakdown")
             if not isinstance(breakdown, Mapping):
                 raise ValueError("regime_breakdown must be a JSON-like object")
             object.__setattr__(self, "regime_breakdown", breakdown)
@@ -456,7 +461,7 @@ class ExperimentResult:
             if populated:
                 raise ValueError(f"{self.status} result cannot claim metrics: {', '.join(populated)}")
 
-        expected = _digest(self.projection(include_fingerprint=False))
+        expected = digest(self.projection(include_fingerprint=False))
         supplied = self.result_fingerprint
         if supplied is _UNSET_RESULT_FINGERPRINT:
             object.__setattr__(self, "result_fingerprint", expected)
@@ -479,7 +484,7 @@ class ExperimentResult:
                 "cost": self.total_cost,
                 "exposure": self.exposure,
                 "capacity_proxy": self.capacity_proxy,
-                "regime_breakdown": _thaw_json(self.regime_breakdown),
+                "regime_breakdown": thaw_json(self.regime_breakdown),
                 "data_coverage": self.data_coverage,
             },
             "failure_reason": self.failure_reason,
@@ -494,3 +499,11 @@ class ExperimentResult:
             raise ValueError("result validation requires an ExperimentSpec")
         if self.experiment_fingerprint != spec.fingerprint:
             raise ValueError("experiment result is bound to a different ExperimentSpec")
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_digest = digest
+_thaw_json = thaw_json
+_stable_fingerprint = stable_fingerprint
+_freeze_json = freeze_json
+_normalize_experiment_environment = normalize_experiment_environment

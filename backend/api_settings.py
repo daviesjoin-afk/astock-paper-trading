@@ -14,6 +14,7 @@ import notify_wxpusher as NOTIFY
 import operator_auth
 import paper_sizing as sizing
 import paper_trading as P
+import paper_storage as PST
 import runtime_settings as RSET
 
 
@@ -62,7 +63,7 @@ def _planned_end(started_at: str | None, duration_days: int | None) -> str | Non
 def _snapshot() -> dict:
     adaptive = _get_adaptive()
     P.init_db()
-    with P._db() as conn:  # the paper module owns the storage boundary
+    with PST.paper_db() as conn:  # the storage boundary owns the connection
         settings = RSET.read(conn)
         # appToken 只回显掩码：明文不得出现在任何 GET 响应里。
         notification = dict(settings.get("notification") or {})
@@ -70,12 +71,12 @@ def _snapshot() -> dict:
         notification["wxpusher_app_token"] = NOTIFY.mask_token(raw_token)
         notification["wxpusher_token_configured"] = bool(raw_token)
         settings["notification"] = notification
-        cycle = P._active_cycle(conn)
+        cycle = P.load_active_cycle(conn)
         audit = RSET.audit(conn, 40)
         capital = float(cycle.get("capital") or settings["simulation"]["default_starting_capital"])
         enabled = cycle.get("enabled_strategies")
         if isinstance(enabled, str):
-            enabled = RSET._decode(enabled, None)
+            enabled = RSET.decode(enabled, None)
         enabled = list(enabled) if isinstance(enabled, (list, tuple)) else RSET.enabled_strategies(conn)
         cycle_duration = cycle.get("duration_days")
         if cycle_duration is None:
@@ -162,19 +163,19 @@ def _apply_runtime_settings(runtime_updates: dict, ai_updates: dict,
                             clear_token: bool = False) -> dict:
     """一次完整的同步业务单元：连接与事务都在**线程内**创建和关闭。
 
-    ``P.init_db()`` / ``P._db(immediate=True)`` 是同步 SQLite 调用，且可能要等
+    ``P.init_db()`` / ``PST.paper_db(immediate=True)`` 是同步 SQLite 调用，且可能要等
     写锁（普通数据库锁等待可达 60 秒）。在 ``async def`` 里直接执行它们会阻塞
     事件循环本身 —— 同一进程调度其它请求也正是这条循环，于是一个保存设置的
     请求会把并发心跳一起拖住。所以整块搬进线程池，而不是只搬某一行。
     """
     adaptive = _get_adaptive()
     P.init_db()
-    with P._db(immediate=True) as conn:
+    with PST.paper_db(immediate=True) as conn:
         if clear_token:
             runtime_updates["wxpusher_app_token"] = ""
         if runtime_updates:
             RSET.update(conn, runtime_updates, actor="human-ui")
-            P._audit(conn, None, "settings_changed", "统一设置中心更新运行参数（详见设置审计）")
+            P.audit(conn, None, "settings_changed", "统一设置中心更新运行参数（详见设置审计）")
             # 保存后立即生效，不必等重启；关闭时该状态会写进设置审计。
             if "operator_auth_required" in runtime_updates:
                 operator_auth.set_bypass(not bool(runtime_updates["operator_auth_required"]))
@@ -419,7 +420,7 @@ def test_notification(kind: str = Query("daily"), confirmed: bool = Query(False)
     """发送一条真实测试推送；因为会真的发到微信，必须显式确认。"""
     _require_confirmation(confirmed, "发送测试推送")
     P.init_db()
-    with P._db() as conn:
+    with PST.paper_db() as conn:
         settings = RSET.read(conn)["notification"]
         try:
             result = NOTIFY.dispatch(conn, kind, settings)
@@ -433,7 +434,7 @@ def test_notification(kind: str = Query("daily"), confirmed: bool = Query(False)
 @router.get("/audit")
 def settings_audit(limit: int = Query(50, ge=1, le=200)):
     P.init_db()
-    with P._db() as conn:
+    with PST.paper_db() as conn:
         return {"items": RSET.audit(conn, limit)}
 
 
@@ -454,7 +455,7 @@ def _read_capabilities():
     import ai_capability_store as STORE
 
     def _work():
-        with P._db() as conn:
+        with PST.paper_db() as conn:
             return STORE.list_capabilities(conn), CAP.describe_capability(None)
 
     return _work()
@@ -509,7 +510,7 @@ async def issue_ai_capability(request: Request, confirmed: bool = Query(False)):
         raise HTTPException(status_code=422, detail=f"凭据不合法：{exc}") from exc
 
     def _work():
-        with P._db(immediate=True) as conn:
+        with PST.paper_db(immediate=True) as conn:
             issued = STORE.issue(conn, credential, operator=credential.issued_by)
             return CAP.describe_capability(issued)
 
@@ -533,7 +534,7 @@ async def revoke_ai_capability(capability_id: str, request: Request,
     import ai_capability_store as STORE
 
     def _work():
-        with P._db(immediate=True) as conn:
+        with PST.paper_db(immediate=True) as conn:
             revoked = STORE.revoke(conn, capability_id, operator=operator, reason=reason)
             return CAP.describe_capability(revoked)
 

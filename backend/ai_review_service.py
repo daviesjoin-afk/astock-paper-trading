@@ -996,7 +996,7 @@ def list_slot_models(conn, slot):
     return result
 
 
-def _build_tuning_system_prompt():
+def build_tuning_system_prompt():
     """构建调参系统提示词。"""
     return (
         "你是A股模拟盘的受约束调参器，不是交易员。只输出严格JSON。\n"
@@ -1032,7 +1032,8 @@ def _build_tuning_system_prompt():
     )
 
 
-def _build_tuning_user_prompt(evidence, accounts, mode):
+
+def build_tuning_user_prompt(evidence, accounts, mode):
     """构建调参用户提示词。"""
     example = {
         "decision": "propose|hold",
@@ -1055,6 +1056,7 @@ def _build_tuning_user_prompt(evidence, accounts, mode):
         "\n证据=" + json.dumps(evidence, ensure_ascii=False, separators=(",", ":")) +
         "\n账户状态=" + json.dumps(accounts, ensure_ascii=False, separators=(",", ":"))
     )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1100,7 +1102,7 @@ def build_outcome_detail(status, decisions, issues=None):
     }
 
 
-def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
+def check_consensus(proposals_by_slot, accounts_map, evolution=None,
                      evolution_by_account=None, labels=None):
     """检查两个槽位的提案是否达成共识。
 
@@ -1373,7 +1375,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
             try:
                 import adaptive_selection as _selection
                 if bounded_weights:
-                    bounded_weights = dict(_selection._normalize(bounded_weights))
+                    bounded_weights = dict(_selection.normalize(bounded_weights))
             except Exception:
                 pass
             if set(bounded_weights) != set(base_weights) or any(
@@ -1433,6 +1435,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                     len(merged), len(disagreements)),
                 merged, issues)
     return True, "双AI对 %d 个账户达成共识" % len(merged), merged, []
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1511,9 +1514,9 @@ def normalize_reviewer_proposals(decision, value):
 
     ``propose``
         ``proposals`` **必须**是非空列表且每个元素是对象。这不是风格偏好：
-        ``_check_consensus`` 要把两侧提案逐账户比对方向与幅度，没有可比的提案
+        ``check_consensus`` 要把两侧提案逐账户比对方向与幅度，没有可比的提案
         就根本无从谈共识。若这里把畸形值悄悄替换成 ``[]``，一次**协议失败**会在
-        ``_check_consensus`` 里被记成"至少一个AI未提出有效提案"，最终落成
+        ``check_consensus`` 里被记成"至少一个AI未提出有效提案"，最终落成
         ``no_consensus`` —— 与"双方都成功、只是真的谈不拢"无法区分，还会从
         ``failure_rate`` 里蒸发。因此判为"该 reviewer 不可用"。
     ``hold``
@@ -1559,7 +1562,7 @@ def classify_dual_review_outcome(reviewers, decisions, consensus, merged):
     ``decisions``
         ``[ai1_decision, ai2_decision]``，已归一化。
     ``consensus`` / ``merged``
-        ``_check_consensus`` 的结果；``merged`` 非空才可能判 ``consensus``。
+        ``check_consensus`` 的结果；``merged`` 非空才可能判 ``consensus``。
 
     判定顺序即优先级：**任何一端不可用 ⇒ failed**（系统故障优先于语义分歧），
     只有在两端都完整成功之后，才允许进入"两端都成功但意见不一致"的 no_consensus。
@@ -1891,8 +1894,8 @@ def _run_single_review(context, slot):
             None, [], track_evolution=False, outcome_detail=outcome_detail,
         )
 
-    system_prompt = _build_tuning_system_prompt()
-    user_prompt = _build_tuning_user_prompt(context["evidence"], context["accounts"], context["mode"])
+    system_prompt = build_tuning_system_prompt()
+    user_prompt = build_tuning_user_prompt(context["evidence"], context["accounts"], context["mode"])
     reviewers[slot] = _call_reviewer(slot, cfg, system_prompt, user_prompt)
     result = reviewers[slot]
     if result["status"] != "completed":
@@ -1948,8 +1951,8 @@ def _run_dual_review(context):
                 None, [], track_evolution=False, outcome_detail=outcome_detail,
             )
 
-    system_prompt = _build_tuning_system_prompt()
-    user_prompt = _build_tuning_user_prompt(context["evidence"], context["accounts"], context["mode"])
+    system_prompt = build_tuning_system_prompt()
+    user_prompt = build_tuning_user_prompt(context["evidence"], context["accounts"], context["mode"])
 
     with ThreadPoolExecutor(max_workers=len(AI_SLOTS), thread_name_prefix="ai-review") as pool:
         futures = {
@@ -1983,7 +1986,7 @@ def _run_dual_review(context):
     elif decisions == ["propose", "propose"]:
         evolution, evolution_by_account = _evolution_bounds(
             context["connect_factory"], context["accounts_map"])
-        consensus, reason, merged, issues = _check_consensus(
+        consensus, reason, merged, issues = check_consensus(
             {"ai1": left["proposals"], "ai2": right["proposals"]},
             context["accounts_map"], evolution=evolution,
             evolution_by_account=evolution_by_account, labels=labels,
@@ -1998,7 +2001,7 @@ def _run_dual_review(context):
 
     status = classify_dual_review_outcome(reviewers, decisions, consensus, merged)
     outcome_detail = build_outcome_detail(status, decisions, issues)
-    # 状态机保证：merged 非空只可能出现在 consensus 分支（_check_consensus 的
+    # 状态机保证：merged 非空只可能出现在 consensus 分支（check_consensus 的
     # 成功返回必然带非空合并且已由分类函数复核），因此这里无需再清洗一次。
     return _context_audit(
         context, MODE_DUAL_REVIEW, status, reviewers, consensus, reason,
@@ -2084,3 +2087,9 @@ def review_status(conn):
             "rule": "两个AI必须同时propose且方向一致、幅度接近，才合并为最终提案",
         },
     }
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_build_tuning_system_prompt = build_tuning_system_prompt
+_build_tuning_user_prompt = build_tuning_user_prompt
+_check_consensus = check_consensus

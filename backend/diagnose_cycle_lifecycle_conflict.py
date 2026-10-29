@@ -178,7 +178,7 @@ def snapshot_summary(raw):
 
 def read_status(conn, cycle_id, asof_day):
     ctx = PRM.PortfolioReadContext(cycle_id=cycle_id, asof_day=asof_day)
-    archived = PRM._cycle_is_archived(conn, ctx)
+    archived = PRM.cycle_is_archived(conn, ctx)
     lots, qty = PRM.bounded_lots_with_status(conn, ctx)
     cash_v, cash = PRM.cash(conn, ctx)
     pnl_v, pnl = PRM.realized_pnl(conn, ctx)
@@ -212,7 +212,7 @@ def simulate_without_marker(db_path, cycle_id, asof_day):
         cash_v, cash = PRM.cash(mem, ctx)
         pnl_v, pnl = PRM.realized_pnl(mem, ctx)
         return {
-            "archived": PRM._cycle_is_archived(mem, ctx),
+            "archived": PRM.cycle_is_archived(mem, ctx),
             "quantity": qty, "cash": cash, "realized_pnl": pnl,
             "lots_visible": len(lots),
             "all_verified": qty == PRM.STATUS_VERIFIED

@@ -247,7 +247,7 @@ class SlotOccupancyFacadeContractTests(unittest.TestCase):
         with mock.patch.object(PT, "ENTRY_SLOT_OCCUPYING_ORDER_STATUSES", custom_statuses), \
              mock.patch.object(PT, "LOT_SIZE", custom_lot_size), \
              mock.patch.object(PT, "_num", custom_num), \
-             mock.patch.object(PT, "_rows", custom_rows), \
+             mock.patch.object(PT, "query_rows", custom_rows), \
              mock.patch.object(PT.PSO, "pending_position_slots", return_value=set()) as mock_pso:
             PT._pending_position_slots(mock.MagicMock(), positions=[])
             kwargs = mock_pso.call_args.kwargs

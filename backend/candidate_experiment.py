@@ -71,7 +71,7 @@ class CandidateReplayDefinition:
 
     @property
     def replay_fingerprint(self):
-        return EC._digest(self.projection())
+        return EC.digest(self.projection())
 
     @property
     def subject(self):
@@ -88,12 +88,12 @@ class CandidateReplayDefinition:
 
     @property
     def derived_entry_fingerprint(self) -> str:
-        return EC._digest(self.effective_entry_ast)
+        return EC.digest(self.effective_entry_ast)
 
     @property
     def scenario_replay_fingerprint(self) -> str:
         """Fingerprint of the exact replay a robustness scenario actually runs."""
-        return EC._digest({"candidate_replay_fingerprint": self.replay_fingerprint,
+        return EC.digest({"candidate_replay_fingerprint": self.replay_fingerprint,
                            "entry_ast": self.effective_entry_ast})
 
     def derive_entry_ast(self, entry_ast: Mapping) -> "CandidateReplayDefinition":

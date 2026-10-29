@@ -187,7 +187,7 @@ class SignalEvidence:
         object.__setattr__(self, "verification", str(self.verification or ""))
         object.__setattr__(self, "verification_method", str(self.verification_method or ""))
         object.__setattr__(self, "asof_day", str(self.asof_day or ""))
-        object.__setattr__(self, "detail", MDC._freeze(self.detail))
+        object.__setattr__(self, "detail", MDC.freeze(self.detail))
 
     @property
     def cross_source_verified(self) -> bool:

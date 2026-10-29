@@ -53,7 +53,7 @@ def _sha(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _universe_rows(repository: HUA.HistoricalUniverseArchiveRepository,
+def universe_rows(repository: HUA.HistoricalUniverseArchiveRepository,
                    fingerprint: str, sessions: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
     for session in sessions:
@@ -67,6 +67,7 @@ def _universe_rows(repository: HUA.HistoricalUniverseArchiveRepository,
             raise ValueError("historical_universe_unproven")
         result[session] = list(projection.get("members") or ())
     return result
+
 
 
 def _tradability_fingerprint(members: Mapping[str, Sequence[Any]], sessions: Sequence[str],
@@ -226,7 +227,7 @@ def run_validation(
         tradability_replay_capture=tradability_replay_capture,
         tradability_capture_out=tradability_capture,
     )
-    folds = list(EC._thaw_json(evidence.walk_forward.get("windows") or ()))
+    folds = list(EC.thaw_json(evidence.walk_forward.get("windows") or ()))
     members = tradability_capture.get("members_by_session", {})
     if evidence.status != "ready":
         result = _unavailable(spec, evidence.reason_codes[0])
@@ -311,3 +312,7 @@ def run_validation(
             created_at=created_at,
         )
     return output
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_universe_rows = universe_rows

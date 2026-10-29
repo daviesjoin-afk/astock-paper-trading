@@ -546,7 +546,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
             with mock.patch.object(DA, "enabled", return_value=True), \
                     mock.patch.object(DA, "configured", return_value=True), \
                     mock.patch.object(DA, "_now", return_value="2026-09-18T10:30:00+08:00"), \
-                    mock.patch.object(DA, "_tuning_accounts", return_value=accounts), \
+                    mock.patch.object(DA, "tuning_accounts", return_value=accounts), \
                     mock.patch.object(
                         DA, "collect_evidence",
                         return_value=({"market_snapshot": {}}, "h" * 8)), \
@@ -687,7 +687,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
             with mock.patch.object(DA, "enabled", return_value=True), \
                     mock.patch.object(DA, "configured", return_value=True), \
                     mock.patch.object(DA, "_now", return_value="2026-09-18T10:30:00+08:00"), \
-                    mock.patch.object(DA, "_tuning_accounts", return_value=accounts), \
+                    mock.patch.object(DA, "tuning_accounts", return_value=accounts), \
                     mock.patch.object(DA, "collect_evidence",
                                       return_value=({"market_snapshot": {}}, evidence_hash)), \
                     mock.patch.object(DA, "call_json", return_value=(response, 0, 0)):
@@ -753,7 +753,7 @@ class SelectionWriterConvergenceTests(_DbTestCase):
             with mock.patch.object(DA, "enabled", return_value=True), \
                     mock.patch.object(DA, "configured", return_value=True), \
                     mock.patch.object(DA, "_now", return_value="2026-09-18T10:30:00+08:00"), \
-                    mock.patch.object(DA, "_tuning_accounts", return_value=accounts), \
+                    mock.patch.object(DA, "tuning_accounts", return_value=accounts), \
                     mock.patch.object(DA, "collect_evidence",
                                       return_value=({"market_snapshot": {}}, "H" * 8)), \
                     mock.patch.object(DA, "call_json", return_value=(response, 0, 0)):

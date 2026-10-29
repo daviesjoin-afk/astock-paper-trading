@@ -167,7 +167,7 @@ def record_generation_batch(conn: sqlite3.Connection, *, batch: Mapping,
     没有 ``current_generation_batch``：读路径只能按显式 batch id 取。
     """
     batch_id = batch.get("batch_id")
-    if not isinstance(batch_id, str) or not SC._SHA256.fullmatch(batch_id):
+    if not isinstance(batch_id, str) or not SC.SHA256.fullmatch(batch_id):
         raise StrategyCandidateRepositoryError("generation_batch_id_invalid")
     payload = json.dumps(dict(batch), sort_keys=True, separators=(",", ":"),
                          ensure_ascii=False, allow_nan=False)
@@ -202,7 +202,7 @@ def get_generation_batch(conn: sqlite3.Connection, batch_id: str, *,
 
     历史展示仍可读取 legacy batch；verify_input=True 才能作为搜索输入，缺材料时拒绝。
     """
-    if not isinstance(batch_id, str) or not SC._SHA256.fullmatch(batch_id):
+    if not isinstance(batch_id, str) or not SC.SHA256.fullmatch(batch_id):
         raise StrategyCandidateRepositoryError("explicit_generation_batch_id_required")
     columns = ("batch_id", "generation_input_fingerprint", "search_space_fingerprint",
                "search_space_contract_version", "generator_type", "generator_version",
@@ -269,11 +269,11 @@ def record_proposal(conn: sqlite3.Connection, candidate: SC.StrategyCandidate, *
     """
     if not isinstance(candidate, SC.StrategyCandidate):
         raise TypeError("canonical strategy candidate is required")
-    if not isinstance(input_fingerprint, str) or not SC._SHA256.fullmatch(input_fingerprint):
+    if not isinstance(input_fingerprint, str) or not SC.SHA256.fullmatch(input_fingerprint):
         raise StrategyCandidateRepositoryError("proposal_input_fingerprint_invalid")
     if generation_batch_id is not None and (
             not isinstance(generation_batch_id, str)
-            or not SC._SHA256.fullmatch(generation_batch_id)):
+            or not SC.SHA256.fullmatch(generation_batch_id)):
         raise StrategyCandidateRepositoryError("proposal_generation_batch_id_invalid")
     payload = _proposal_payload(
         generator_type=generator_type, generator_version=generator_version,
@@ -368,7 +368,7 @@ def list_proposals(conn: sqlite3.Connection, candidate_id: str) -> tuple[dict, .
 def list_batch_proposals(conn: sqlite3.Connection,
                          generation_batch_id: str) -> tuple[dict, ...]:
     """Read the proposal events of one explicit generation batch (append order)."""
-    if not isinstance(generation_batch_id, str) or not SC._SHA256.fullmatch(
+    if not isinstance(generation_batch_id, str) or not SC.SHA256.fullmatch(
             generation_batch_id):
         raise StrategyCandidateRepositoryError("explicit_generation_batch_id_required")
     rows = conn.execute(

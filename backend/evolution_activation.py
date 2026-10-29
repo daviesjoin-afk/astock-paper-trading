@@ -50,7 +50,8 @@ ACTION_ACTIVATE = "activate"
 ACTION_ROLLBACK = "rollback"
 
 #: 只有这些 action 记录了"一次真正的切换"，rollback 目标由它们决定。
-_SWITCH_ACTIONS = (ACTION_ACTIVATE, ACTION_BOOTSTRAP, ACTION_LEGACY_BOOTSTRAP)
+SWITCH_ACTIONS = (ACTION_ACTIVATE, ACTION_BOOTSTRAP, ACTION_LEGACY_BOOTSTRAP)
+
 
 #: evolution_params.validation_state 取值
 STATE_CANDIDATE = "candidate"
@@ -266,7 +267,7 @@ def _params_of(conn, params_id: int) -> Optional[dict]:
 
 def ensure_schema(conn) -> None:
     """幂等创建生命周期表并补齐列；随后跑一次 legacy bootstrap。"""
-    _ensure_params_columns(conn)
+    ensure_params_columns(conn)
     conn.executescript(
         """
         -- 每个 scope 最多一个显式 active 指针。
@@ -332,7 +333,7 @@ def ensure_ready(conn) -> None:
     ensure_schema(conn)
 
 
-def _ensure_params_columns(conn) -> None:
+def ensure_params_columns(conn) -> None:
     """幂等补齐 evolution_params 的生命周期列（含旧库的 strategy_id）。"""
     if not _table_exists(conn, "evolution_params"):
         return
@@ -340,6 +341,7 @@ def _ensure_params_columns(conn) -> None:
     for name, sql_type in _LIFECYCLE_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE evolution_params ADD COLUMN {name} {sql_type}")
+
 
 
 # ─── legacy bootstrap ───
@@ -391,7 +393,7 @@ def bootstrap_legacy_pointers(conn) -> dict:
     """
     if not _table_exists(conn, "evolution_params"):
         return {"bootstrapped": [], "skipped": "no_params_table"}
-    _ensure_params_columns(conn)
+    ensure_params_columns(conn)
     if _meta_get(conn, META_LEGACY_BOOTSTRAP) is not None:
         return {"bootstrapped": [], "skipped": "already_bootstrapped"}
     bootstrapped = []
@@ -403,7 +405,7 @@ def bootstrap_legacy_pointers(conn) -> dict:
         detail = _validate_params_payload(conn, params_id, scope)
         now = _now()
         state = STATE_VALIDATED if detail["valid"] else STATE_CANDIDATE
-        legacy_row = _params_row(conn, int(params_id))
+        legacy_row = params_row(conn, int(params_id))
         sealed_detail = _json({"legacy_bootstrap": True, **detail})
         if legacy_row is not None:
             legacy_row = dict(legacy_row)
@@ -472,8 +474,9 @@ def _log_event(conn, event_type: str, params_id, detail: dict, metrics: dict | N
     )
 
 
-def _params_row(conn, params_id: int):
+def params_row(conn, params_id: int):
     return _query_one(conn, f"{_PARAMS_SELECT} WHERE id=?", (int(params_id),))
+
 
 
 def _shape(row, *, scope: str, inherited_from: Optional[str] = None) -> dict:
@@ -506,7 +509,7 @@ def resolve_scope_active(conn, scope: str) -> Optional[dict]:
     pointer = _pointer_row(conn, scope)
     if pointer is None:
         return None
-    row = _params_row(conn, int(pointer["params_id"]))
+    row = params_row(conn, int(pointer["params_id"]))
     if row is None:
         raise EvolutionLifecycleError(
             f"active pointer for scope {scope!r} references missing params_id="
@@ -701,7 +704,7 @@ def _validate_params_payload(conn, params_id: int, scope: str) -> dict:
 
 def validate_candidate(conn, params_id: int) -> dict:
     """对候选跑一次确定性校验并落库状态；**绝不改变 active 指针**。"""
-    row = _params_row(conn, params_id)
+    row = params_row(conn, params_id)
     if row is None:
         raise CandidateNotFound(f"候选 {params_id} 不存在")
     scope = scope_key(row["strategy_id"])
@@ -844,7 +847,7 @@ def activate_params_candidate(conn, params_id: int, *, actor: str,
     隐式事务：任何一步失败都不会留下半推进的指针。
     """
     ensure_schema(conn)
-    row = _params_row(conn, params_id)
+    row = params_row(conn, params_id)
     if row is None:
         raise CandidateNotFound(f"候选 {params_id} 不存在")
 
@@ -1045,9 +1048,9 @@ def rollback_active(conn, *, strategy_id: Optional[str] = None, actor: str,
         conn,
         f"""SELECT from_pointer_params_id, from_effective_params_id, to_params_id, action
             FROM evolution_activation_history
-            WHERE scope_key=? AND action IN ({','.join('?' for _ in _SWITCH_ACTIONS)})
+            WHERE scope_key=? AND action IN ({','.join('?' for _ in SWITCH_ACTIONS)})
             ORDER BY id DESC LIMIT 1""",
-        (scope, *_SWITCH_ACTIONS),
+        (scope, *SWITCH_ACTIONS),
     )
     if entry is None:
         return {"rolled_back": False, "reason": "没有可回滚的激活历史",
@@ -1196,7 +1199,13 @@ def assert_pointer_integrity(conn) -> None:
     for (scope, params_id) in conn.execute(
         "SELECT scope_key, params_id FROM evolution_active_params"
     ).fetchall():
-        if _params_row(conn, int(params_id)) is None:
+        if params_row(conn, int(params_id)) is None:
             raise EvolutionLifecycleError(
                 f"active pointer for scope {scope!r} references missing params_id={params_id}"
             )
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_SWITCH_ACTIONS = SWITCH_ACTIONS
+_ensure_params_columns = ensure_params_columns
+_params_row = params_row

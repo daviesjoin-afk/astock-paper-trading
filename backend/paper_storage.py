@@ -7,11 +7,13 @@
 """
 from __future__ import annotations
 
+import contextvars
 import random
 import sqlite3
 import time
 from contextlib import contextmanager
 
+import data_paths
 import paper_timing as PTM
 
 
@@ -171,3 +173,74 @@ def db_readonly(db_path):
         yield conn
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 账本连接的公开面
+#
+# 逐笔交易账本的连接以前由 ``paper_trading._db`` / ``_db_readonly`` /
+# ``_evolution_conn`` 私下提供，10 个模块为了拿一条连接去 import 交易主引擎：
+# 连接与事务重试属于存储边界，不属于交易规则，方向是反的。这里把它声明成
+# 公开能力；``paper_trading`` 的同名包装保留为薄委托，行为不变。
+#
+# 复用与失效口径：连接是进程内短生命周期的，不缓存、不跨事务共享；调用方
+# 拿到的是它自己那条连接。本轮只搬"谁提供连接"，不搬 schema 迁移
+# （``init_db``）——那属于下一批。
+# ---------------------------------------------------------------------------
+
+SLOT_HOT_PATH = contextvars.ContextVar("slot_hot_path", default=False)
+
+PAPER_DB_FILENAME = "paper_trading.sqlite3"
+ADAPTIVE_DB_FILENAME = "adaptive_learning.sqlite3"
+
+
+_ledger_path_provider = None
+
+
+def bind_ledger_path(provider) -> None:
+    """由账本 owner 在组装期登记"当前账本路径"的取值方式。
+
+    存储边界不认识交易引擎，也不需要认识：它只在下一次开连接时问一次。
+    这样测试把账本指到临时库（``P.DB_PATH = tmp``）时，公开连接面自动跟随，
+    不必逐个 patch 私有函数。
+    """
+    global _ledger_path_provider
+    _ledger_path_provider = provider
+
+
+def paper_db_path() -> str:
+    """当前账本 SQLite 路径（唯一来源；跟随账本 owner 的实时取值）。"""
+    if _ledger_path_provider is not None:
+        return str(_ledger_path_provider())
+    return data_paths.data_path(PAPER_DB_FILENAME)
+
+
+def adaptive_db_path() -> str:
+    """自进化参数仓 SQLite 路径（唯一来源）。"""
+    return data_paths.data_path(ADAPTIVE_DB_FILENAME)
+
+
+@contextmanager
+def paper_db(immediate: bool = False, hot_path: bool = False, db_path: str | None = None):
+    """账本连接。
+
+    ``hot_path`` 为假时服从当前 slot 的热路径标记：交易热路径要短超时、短
+    busy_timeout，冷路径要能容忍长等待。两者用同一个 ``SLOT_HOT_PATH``。
+    """
+    effective = bool(hot_path or SLOT_HOT_PATH.get())
+    with db(db_path or paper_db_path(), immediate=immediate, hot_path=effective) as conn:
+        yield conn
+
+
+@contextmanager
+def paper_db_readonly(db_path: str | None = None):
+    """只读账本连接：不迁移、不取写锁，浏览器读历史不被盘中 worker 挡住。"""
+    with db_readonly(db_path or paper_db_path()) as conn:
+        yield conn
+
+
+def evolution_connection(db_path: str | None = None):
+    """自进化参数仓连接；调用方负责关闭。刻意不做 schema 迁移。"""
+    conn = sqlite3.connect(db_path or adaptive_db_path(), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn

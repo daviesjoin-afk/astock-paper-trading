@@ -111,7 +111,7 @@ def _older_instant(first: Any, second: Any) -> str | None:
     才是真正能证明的下界，属保守方向。
     """
     parsed = [
-        (MDC._parse_instant(item), str(item))
+        (MDC.parse_instant(item), str(item))
         for item in (first, second)
     ]
     usable = [(instant, text) for instant, text in parsed if instant is not None]
@@ -135,7 +135,7 @@ def snapshot_from_cached_payload(
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
         return None
-    complete = bool(dfc_module._full_snapshot_payload_is_complete(payload))
+    complete = bool(dfc_module.full_snapshot_payload_is_complete(payload))
     saved_at = payload.get("saved_at")
     observed_at = _older_instant(_newest_quote_at(rows), saved_at)
     try:

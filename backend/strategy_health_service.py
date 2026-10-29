@@ -19,6 +19,7 @@ import json
 import execution_verification as EV
 import paper_schema_migrations as PSM
 import paper_trading as PT
+import paper_storage as PST
 import shadow_comparison_repository as SCR
 import strategy_health as SH
 import strategy_health_repository as SHRepo
@@ -368,7 +369,7 @@ def _capture(conn, *, strategy_id, strategy_version, strategy_checksum,
 
 def _with_paper_connection(work, *, immediate: bool = False):
     PT.init_db()
-    with PT._db(immediate=immediate) as conn:
+    with PST.paper_db(immediate=immediate) as conn:
         return work(conn)
 
 

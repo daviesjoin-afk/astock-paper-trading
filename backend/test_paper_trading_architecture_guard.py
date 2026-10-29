@@ -180,7 +180,7 @@ IMMUTABLE_PROVENANCE_TABLES = ("paper_selection_runs", "selection_runs", "paper_
 CURRENT_HEAD_RESOLVERS = frozenset({"get_version", "current_version_for_account"})
 
 #: Guard 14 —— signal / order 写入器必须沿用 cycle pin，不得重新取 current head。
-STRICT_STAMP_FUNCTIONS = ("_strategy_stamp",)
+STRICT_STAMP_FUNCTIONS = ("resolve_strategy_stamp",)
 
 #: Guard 6 —— 纯决策边界不得触碰的任何 I/O / 时钟 API 名（属性名或调用名）。
 FORBIDDEN_IO_CALLS = frozenset({
@@ -1717,7 +1717,7 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
                              f"paper_trading 回退 current/latest：{forbidden}")
         self.assertNotIn(
             "FROM paper_accounts WHERE id=?",
-            _function_source(tree, "_strategy_stamp", raw),
+            _function_source(tree, "resolve_strategy_stamp", raw),
             "_strategy_stamp 自己推导周期归属（应经 SRES.signal_cycle_provenance）")
 
     def test_guard14i_signal_writer_uses_the_strict_pin_resolver(self):
@@ -2119,12 +2119,16 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
         self.assertIn("BEFORE UPDATE OF cycle_id", body,
                       "cycle 归属的不可变 guard 消失了")
         # 唯一 owner：调用方只调用它，不复制一套。
-        for module in ("paper_trading.py", "paper_risk_service.py"):
+        # 公开名在 paper_trading，risk 服务保留自己的私有周期固定版。
+        for module, name in (
+            ("paper_trading.py", "resolve_strategy_stamp"),
+            ("paper_risk_service.py", "_strategy_stamp"),
+        ):
             module_body = _module_body(module)
             self.assertIn("signal_order_provenance", module_body,
                           f"{module} 没有经 resolver 解析 signal 血缘")
             tree_m = _tree(module)
-            for name in ("_strategy_stamp",):
+            if True:
                 fn = _function_source(tree_m, name, _source(module))
                 self.assertIn("signal_order_provenance", fn,
                               f"{module}.{name} 的 signal 分支不再走唯一 owner")

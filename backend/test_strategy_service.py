@@ -297,7 +297,8 @@ class StrategyServiceTests(unittest.TestCase):
     def test_service_owns_database_access(self):
         with open(SERVICE_SOURCE, encoding="utf-8") as handle:
             source = handle.read()
-        self.assertIn("P._db(", source)
+        self.assertIn("PST.paper_db(", source)
+        self.assertNotIn("P._db(", source)
 
     def test_translate_maps_registry_value_errors(self):
         cases = {

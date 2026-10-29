@@ -21,6 +21,7 @@ import optimizer as O
 import decision_engine as DE
 import linkage as L
 import paper_trading as P
+import paper_storage as PST
 import selection_application as SEL
 from selection_application import health_file_signature as _health_file_signature
 from selection_application import completed_daily_kline as _completed_daily_kline
@@ -149,7 +150,7 @@ def _sync_operator_bypass_from_settings() -> None:
     """
     try:
         import runtime_settings as _RSET
-        with P._db() as conn:
+        with PST.paper_db() as conn:
             security = _RSET.read(conn).get("security") or {}
         operator_auth.set_bypass(not bool(security.get("operator_auth_required", True)))
     except Exception:
@@ -940,7 +941,7 @@ def auction_summary(trade_date: str | None = None, limit: int = 30):
     # 上游可能把缺失金额给成 "--" 之类的字符串：用跟踪模块的 _number 归一到 None，
     # 否则一次脏数据就让只读接口 500。
     ranked = sorted(
-        rows, key=lambda row: -(auction_tracking._number(row.get("amount")) or 0.0))[:size]
+        rows, key=lambda row: -(auction_tracking.number(row.get("amount")) or 0.0))[:size]
     return {
         "trade_date": day,
         "source": source,

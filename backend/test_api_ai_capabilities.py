@@ -16,7 +16,6 @@ from fastapi import HTTPException
 import ai_capability as CAP
 import ai_capability_store as STORE
 import api_settings as API
-import paper_trading as P
 
 NOW = "2026-10-26T02:00:00+00:00"
 FUTURE = "2026-11-26T02:00:00+00:00"
@@ -92,7 +91,7 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self._folder = tempfile.TemporaryDirectory()
         self.path = f"{self._folder.name}/paper.sqlite3"
-        self._original = P._db
+        self._original = API.PST.paper_db
 
         conn = sqlite3.connect(self.path)
         conn.execute("CREATE TABLE placeholder(id INTEGER)")
@@ -109,8 +108,8 @@ class LifecycleTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        P._db = _temp_db
-        self._cleanup = lambda: setattr(P, "_db", self._original)
+        API.PST.paper_db = _temp_db
+        self._cleanup = lambda: setattr(API.PST, "paper_db", self._original)
 
     def tearDown(self):
         self._cleanup()

@@ -211,7 +211,7 @@ class DataFetcherFacadeTests(unittest.TestCase):
         feed = mock.Mock()
         feed.fetch_realtime.return_value = rows
         feed.fetch_realtime_with_meta.return_value = metadata
-        with mock.patch.object(dfc, "_eastmoney_realtime_feed", return_value=feed) as factory:
+        with mock.patch.object(dfc, "eastmoney_realtime_feed", return_value=feed) as factory:
             self.assertEqual(dfc.fetch_realtime_for_codes(["000001"]), rows)
             self.assertEqual(dfc.fetch_realtime_for_codes(["000001"], return_meta=True), metadata)
         factory.assert_has_calls([mock.call(dfc._REALTIME_FIELDS), mock.call(dfc._REALTIME_FIELDS)])
@@ -231,9 +231,9 @@ class DataFetcherFacadeTests(unittest.TestCase):
         sina = mock.Mock()
         tencent.fetch_realtime.return_value = [{"code": "000001"}]
         sina.fetch_realtime.return_value = [{"code": "000002"}]
-        with mock.patch.object(dfc, "_tencent_realtime_feed", return_value=tencent):
+        with mock.patch.object(dfc, "tencent_realtime_feed", return_value=tencent):
             self.assertEqual(dfc.fetch_tencent_realtime_for_codes(["000001"]), [{"code": "000001"}])
-        with mock.patch.object(dfc, "_sina_realtime_feed", return_value=sina):
+        with mock.patch.object(dfc, "sina_realtime_feed", return_value=sina):
             self.assertEqual(dfc._fetch_sina_realtime_for_codes(["000002"]), [{"code": "000002"}])
 
 

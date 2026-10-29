@@ -1,0 +1,762 @@
+{
+  "baseline": {
+    "commit": "ee9e604",
+    "date": "2026-10-30",
+    "production_modules": 316,
+    "import_cycles": 0,
+    "foundation_violations": 0,
+    "private_cross_access": 6,
+    "cross_domain_edges": 617,
+    "deferred_imports": 618,
+    "raw_sql_modules": 141,
+    "paper_table_fanout_max": 50,
+    "max_file": {
+      "module": "paper_trading.py",
+      "lines": 14702
+    },
+    "max_function": {
+      "symbol": "paper_trading._buy_order",
+      "lines": 1195
+    },
+    "max_function_globals": 61,
+    "duplicate_helpers": 301,
+    "duplicate_numeric_helpers": 49,
+    "budget_targets": {
+      "import_cycles": 0,
+      "private_cross_access": 0,
+      "raw_sql_modules": 60,
+      "paper_table_fanout_max": 8,
+      "max_file_lines": 2500,
+      "max_function_lines": 200
+    },
+    "import_side_effects": 25
+  },
+  "layer_inventory": {
+    "L0-base": {
+      "modules": 22,
+      "lines": 6592
+    },
+    "L1-fact": {
+      "modules": 49,
+      "lines": 29350
+    },
+    "L2-rule": {
+      "modules": 40,
+      "lines": 15603
+    },
+    "L2-strategy": {
+      "modules": 39,
+      "lines": 13550
+    },
+    "L3-ledger": {
+      "modules": 28,
+      "lines": 10609
+    },
+    "L4-app": {
+      "modules": 15,
+      "lines": 21105
+    },
+    "L4-research": {
+      "modules": 80,
+      "lines": 47156
+    },
+    "L5-job": {
+      "modules": 22,
+      "lines": 5456
+    },
+    "L6-entry": {
+      "modules": 8,
+      "lines": 5902
+    },
+    "L6-read": {
+      "modules": 13,
+      "lines": 6523
+    },
+    "mixed_duty_modules": 24
+  },
+  "undeclared_public_layer": {
+    "targets": 85,
+    "sites": 201,
+    "top_owners": {
+      "paper_trading": {
+        "targets": 14,
+        "sites": 51
+      },
+      "shadow_runtime": {
+        "targets": 3,
+        "sites": 29
+      },
+      "experiment_contract": {
+        "targets": 5,
+        "sites": 16
+      },
+      "strategy_candidate": {
+        "targets": 5,
+        "sites": 13
+      },
+      "adaptive_selection": {
+        "targets": 3,
+        "sites": 7
+      },
+      "paper_order_execution_authority": {
+        "targets": 6,
+        "sites": 7
+      },
+      "ai_research_contract": {
+        "targets": 1,
+        "sites": 6
+      },
+      "market_data_contract": {
+        "targets": 2,
+        "sites": 6
+      }
+    },
+    "top_targets": [
+      {
+        "target": "paper_trading._db",
+        "consumers": 10,
+        "sites": 19
+      },
+      {
+        "target": "shadow_runtime._plain",
+        "consumers": 2,
+        "sites": 27
+      },
+      {
+        "target": "strategy_candidate._SHA256",
+        "consumers": 3,
+        "sites": 7
+      },
+      {
+        "target": "experiment_contract._digest",
+        "consumers": 3,
+        "sites": 6
+      },
+      {
+        "target": "market_data_contract._parse_instant",
+        "consumers": 3,
+        "sites": 5
+      },
+      {
+        "target": "ai_research_contract._issue_evidence_ref",
+        "consumers": 6,
+        "sites": 6
+      }
+    ],
+    "required_public_capabilities": [
+      "P1 db connection -> paper_storage",
+      "P2 freeze/digest/fingerprint -> L0 contract (semantics matrix first)",
+      "P3 instant parsing -> L0 time contract",
+      "P4 evidence ref issuing -> ai_research_contract public",
+      "P5 cycle ownership read-only -> paper_order_execution_authority public",
+      "P6 factor freshness -> selection_factor_store",
+      "P7 spec resolution: two same-named impls with different cycle semantics, rename only",
+      "P8 quote fetch -> single narrow market application entry",
+      "P9 decision snapshot -> paper_decision_audit public"
+    ]
+  },
+  "dependency_bridges": {
+    "manual_orders": {
+      "fields": 35,
+      "via_globals": 33,
+      "direct_owner": 2
+    },
+    "dashboard_queries": {
+      "fields": 19,
+      "via_globals": 18,
+      "direct_owner": 1
+    },
+    "execution_planner": {
+      "fields": 21,
+      "via_globals": 15,
+      "direct_owner": 6
+    },
+    "total_fields": 75,
+    "total_via_globals": 66,
+    "distinct_paper_trading_names": 60,
+    "lines_pulled": 2551,
+    "owner_clusters": {
+      "策略规则/入场": {
+        "names": 8,
+        "lines": 748
+      },
+      "组合/读模型": {
+        "names": 11,
+        "lines": 439
+      },
+      "存储/连接": {
+        "names": 4,
+        "lines": 425
+      },
+      "行情应用": {
+        "names": 3,
+        "lines": 336
+      },
+      "资金/预占/席位": {
+        "names": 13,
+        "lines": 239
+      },
+      "时钟/时段": {
+        "names": 3,
+        "lines": 187
+      },
+      "租约/周期归属": {
+        "names": 5,
+        "lines": 83
+      },
+      "审计/决策快照": {
+        "names": 3,
+        "lines": 65
+      },
+      "账户声明": {
+        "names": 5,
+        "lines": 7
+      }
+    }
+  },
+  "split_maps": {
+    "paper_trading._buy_order": {
+      "range": [
+        8637,
+        9831
+      ],
+      "lines": 1195,
+      "pure_blocks_lines": 462,
+      "blocks": {
+        "A-gates": [
+          8641,
+          8673
+        ],
+        "B-freeze": [
+          8674,
+          8716
+        ],
+        "C-intent-inputs": [
+          8720,
+          8829
+        ],
+        "D-admission-pure": [
+          8830,
+          8900
+        ],
+        "E-eps-external": [
+          8896,
+          8937
+        ],
+        "F-timing-price": [
+          8938,
+          8972
+        ],
+        "G-capital-facts": [
+          8973,
+          9078
+        ],
+        "H-quota": [
+          9079,
+          9129
+        ],
+        "I-quantity-pure": [
+          9136,
+          9286
+        ],
+        "J-exec-plan": [
+          9287,
+          9353
+        ],
+        "K-amount-pure": [
+          9357,
+          9494
+        ],
+        "L-reasons-revalidate": [
+          9498,
+          9582
+        ],
+        "M-write-order": [
+          9647,
+          9802
+        ],
+        "N-result-notify": [
+          9803,
+          9830
+        ]
+      }
+    },
+    "paper_trading._candidate_rows": {
+      "range": [
+        5037,
+        5810
+      ],
+      "lines": 774,
+      "globals": 61,
+      "blocks": {
+        "A-factor-gate": [
+          5044,
+          5128
+        ],
+        "B-live-overlay": [
+          5129,
+          5204
+        ],
+        "C-finance-flow": [
+          5205,
+          5252
+        ],
+        "D-model-sentiment": [
+          5251,
+          5284
+        ],
+        "E-factor-table": [
+          5285,
+          5366
+        ],
+        "F-dsl-disclosure": [
+          5367,
+          5453
+        ],
+        "G-pick-arrange": [
+          5454,
+          5563
+        ],
+        "H-style-lanes": [
+          5564,
+          5738
+        ],
+        "I-intraday-t": [
+          5739,
+          5745
+        ],
+        "J-projection": [
+          5753,
+          5810
+        ]
+      },
+      "recommended_order": [
+        "A -> selection_factor_store",
+        "C -> CandidateScanInputs",
+        "J -> paper_candidate_projection"
+      ]
+    },
+    "paper_risk_service.run": {
+      "range": [
+        201,
+        924
+      ],
+      "lines": 724,
+      "write_txn": [
+        285,
+        912
+      ],
+      "per_position_loop": [
+        360,
+        897
+      ],
+      "per_position_sql_approx": "10-12",
+      "batchable_marker_queries": [
+        467,
+        528,
+        537,
+        547
+      ],
+      "evidence_read_inside_write_txn": [
+        314,
+        336
+      ]
+    },
+    "manual_orders._manual_order_plan": {
+      "range": [
+        110,
+        562
+      ],
+      "lines": 453,
+      "duplicate_sizing_block": [
+        332,
+        452
+      ],
+      "shared_with": "paper_trading._buy_order I-block [9136,9286]"
+    },
+    "execution_planner.commit_fill": {
+      "range": [
+        1858,
+        2195
+      ],
+      "lines": 338,
+      "only_safe_extract": "C idempotency+aggregation [1998,2062]"
+    }
+  },
+  "reproduced_duplicate_work": [
+    {
+      "what": "learning_evaluation double dataset build",
+      "callers": {
+        "LE._evaluate": 2,
+        "LE.evaluate_dataset": 2,
+        "LE.contract_status": 2,
+        "LD.contract_status": 1,
+        "neural_shadow.readiness": 3,
+        "run_learning_cycle_alpha": 1
+      },
+      "same_fingerprint": true,
+      "fingerprint_sample": "24e089492185c76e...",
+      "eligible_rows": 148,
+      "cost_ms": {
+        "single_build": [
+          26,
+          36
+        ],
+        "evaluate_dataset": [
+          64,
+          71
+        ]
+      },
+      "correctness_finding": "SAVEPOINT released between the two builds; in_transaction=False after RELEASE under WAL, so gate-approved dataset and evaluated dataset can come from different snapshots",
+      "method": "in-memory sqlite instrumentation, 160 samples / 156 returns"
+    },
+    {
+      "what": "risk loop execution marker queries",
+      "sites": [
+        467,
+        528,
+        537,
+        547
+      ],
+      "per_position_queries": 4,
+      "proposed": "execution_verification.verified_execution_markers(...)"
+    },
+    {
+      "what": "manual vs automatic entry quantity",
+      "sites": {
+        "paper_trading._buy_order": [
+          9136,
+          9286
+        ],
+        "manual_orders._manual_order_plan": [
+          332,
+          452
+        ]
+      },
+      "proposed": "paper_sizing.entry_quantity(requested=None|requested_qty)"
+    }
+  ],
+  "zero_reference_modules": [
+    {
+      "module": "retention_maintenance.py",
+      "lines": 172
+    },
+    {
+      "module": "daily_report.py",
+      "lines": 63
+    },
+    {
+      "module": "diag_loop.py",
+      "lines": 58
+    },
+    {
+      "module": "disclosure_cache_migrate.py",
+      "lines": 16
+    },
+    {
+      "module": "quote_probe.py",
+      "lines": 88
+    },
+    {
+      "module": "tradability_backfill.py",
+      "lines": 351
+    },
+    {
+      "module": "ai_adoption_writer.py",
+      "lines": 363
+    },
+    {
+      "module": "selection_tracking_repair.py",
+      "lines": 270
+    }
+  ],
+  "zero_reference_total_lines": 1381,
+  "dead_island": {
+    "modules": [
+      "tradability_position_evidence.py",
+      "tradability_position_shadow.py",
+      "tradability_observation_ledger.py"
+    ],
+    "lines": 3743,
+    "note": "keep as type/issuance authority; no execution-path consumer"
+  },
+  "cron_only_runners": [
+    "selection_alpha_report",
+    "evolution_loop_runner",
+    "adaptive_runner",
+    "selection_runner",
+    "earnings_disclosure_runner",
+    "push_report",
+    "history_recovery_runner",
+    "close_snapshot_runner",
+    "paper_runner",
+    "news_runner",
+    "adaptive_learning_worker"
+  ],
+  "encoding_damage": [
+    {
+      "file": "backend/selection_tracking.py",
+      "kind": "docstring replaced by 90 literal '?'",
+      "reversible": false
+    },
+    {
+      "file": "backend/paper_entry_price_rules.py",
+      "kind": "3x U+FFFD",
+      "offsets": [
+        216,
+        217,
+        218
+      ]
+    },
+    {
+      "file": "backend/test_numeric_contract_matrix.py",
+      "kind": "3x U+FFFD",
+      "offsets": [
+        1941,
+        1942,
+        1943
+      ]
+    }
+  ],
+  "frontend": {
+    "js_files": 20,
+    "js_lines": 6322,
+    "bridge_js_window_assignments": 111,
+    "window_assignments_total": 203
+  },
+  "tests_run": {
+    "test_learning_architecture_guard": 8,
+    "test_learning_dataset": 169,
+    "test_learning_evaluation": 176,
+    "test_evolution_reward_attribution": 42,
+    "total_green": 395
+  },
+  "executed_batches": [
+    {
+      "id": "P1 ledger connection public surface",
+      "status": "landed in working tree, regression-green",
+      "public_api_owner": "paper_storage",
+      "public_api": [
+        "paper_db",
+        "paper_db_readonly",
+        "evolution_connection",
+        "paper_db_path",
+        "adaptive_db_path",
+        "bind_ledger_path",
+        "SLOT_HOT_PATH"
+      ],
+      "consumers_migrated": 14,
+      "access_sites_migrated": 27,
+      "metrics_before": {
+        "private_cross_access": 201,
+        "deferred_imports": 619,
+        "paper_trading_lines": 15047
+      },
+      "metrics_after": {
+        "private_cross_access": 174,
+        "deferred_imports": 618,
+        "paper_trading_lines": 15046
+      },
+      "test_seams_moved": [
+        "test_settings_async_isolation: SETTINGS.P._db -> SETTINGS.PST.paper_db",
+        "test_api_ai_capabilities: P._db -> API.PST.paper_db",
+        "test_strategy_service: assertIn('P._db(') -> assertIn('PST.paper_db(') + assertNotIn('P._db(')",
+        "test_r33b_retirement_policy: exact import set + paper_storage"
+      ],
+      "regression": {
+        "backend_total": 7345,
+        "failures": 0,
+        "skipped": 25,
+        "failures_are": "test_deploy_profile_guard (pre-existing, no bash on Windows; same 9 before the change)",
+        "note": "run with Git Bash prepended to PATH; the earlier 9 test_deploy_profile_guard failures were a PATH issue (system32 WSL bash picked first), not code"
+      },
+      "not_done": [
+        "init_db still lives in paper_trading",
+        "_buy_order 1195 lines untouched",
+        "remaining 174 private access sites"
+      ]
+    },
+    {
+      "id": "declaration batch: shared helpers promoted to public names",
+      "status": "landed, full regression green",
+      "changes": [
+        {
+          "owner": "shadow_runtime",
+          "from": "_plain",
+          "to": "plain",
+          "consumers": [
+            "shadow_comparison",
+            "shadow_run_repository"
+          ],
+          "sites": 27
+        },
+        {
+          "owner": "market_data_contract",
+          "from": "_parse_instant",
+          "to": "parse_instant",
+          "consumers": [
+            "market_data_service",
+            "paper_capital_reservations",
+            "portfolio_order_intents"
+          ],
+          "sites": 5
+        }
+      ],
+      "aliases_kept": [
+        "shadow_runtime._plain = plain"
+      ],
+      "metrics": {
+        "private_cross_access": {
+          "before": 174,
+          "after": 142
+        },
+        "duplicate_helpers": {
+          "before": 313,
+          "after": 312
+        }
+      }
+    },
+    {
+      "id": "public-name consolidation (all remaining private accesses)",
+      "status": "landed, full regression green (7345 tests, exit=0)",
+      "renamed_helpers": 76,
+      "public_names_renamed_again_to_avoid_local_shadowing": {
+        "_rows": "query_rows",
+        "_strategy_stamp": "resolve_strategy_stamp",
+        "_active_cycle": "load_active_cycle",
+        "_constraints": "rule_constraints",
+        "_conditions": "account_conditions",
+        "_current": "current_selection",
+        "_account_params": "load_account_params",
+        "_scenario_sessions": "build_scenario_sessions",
+        "_instant": "parse_shadow_instant"
+      },
+      "aliases_kept": "one `<private> = <public>` line per owner for old callers/tests",
+      "metrics": {
+        "private_cross_access": {
+          "before": 142,
+          "after": 6
+        },
+        "duplicate_helpers": {
+          "before": 312,
+          "after": 301
+        },
+        "max_file_lines": {
+          "before": 15046,
+          "after": 15069
+        }
+      },
+      "remaining_6_sites": {
+        "target": "ai_research_contract._issue_evidence_ref",
+        "why_not_promoted": "its privacy IS the enforcement mechanism; 5 architecture guards enforce an exact (module, function) allowlist on the private issuance point",
+        "conclusion": "reachable lower bound of this metric is 6, not 0"
+      },
+      "lessons": [
+        "rename+alias fixes references but NOT mock.patch bindings: the owner's own internal calls must move to the public name too, or test injection silently bypasses",
+        "public names collide with local variables (rows/current/conditions); the leading underscore was acting as collision protection — scan locals with AST before promoting",
+        "blanket regex over call sites also hits parameters and default values; only replace bare calls `name(`, never bare references"
+      ],
+      "regression": {
+        "backend_total": 7345,
+        "failures": 0,
+        "skipped": 25
+      }
+    },
+    {
+      "id": "init_db responsibility split (schema half moved to its owner)",
+      "status": "landed, full regression green (7345 tests, exit=0)",
+      "where": {
+        "231 lines": "paper_schema_migrations.CORE_TABLES_DDL + ensure_core_tables",
+        "55 lines": "paper_schema_migrations.ensure_current (column upgrades + 3 repair UPDATEs)",
+        "21 calls": "paper_schema_migrations.ensure_feature_tables",
+        "70 lines": "stay in paper_trading as business bootstrap (_ensure_accounts/_ensure_cycle/...)"
+      },
+      "init_db_lines": {
+        "before": 409,
+        "after": 28
+      },
+      "paper_trading_lines": {
+        "before": 15069,
+        "after": 14713
+      },
+      "defect_fixed": "the fast-path and full-path each maintained their own ensure chain and had already drifted (fast path had ensure_rebalance_state_cycle_ownership, full path did not) - both now share _upgrade_ledger",
+      "dependency_not_removed": "consumers still call PT.init_db() because it still runs business bootstrap (accounts/cycle/recovery/reconcile); removing it needs _ensure_accounts/_ensure_cycle to move to their owners first"
+    }
+  ],
+  "withdrawn_recommendations": [
+    {
+      "item": "P4 promote ai_research_contract._issue_evidence_ref to public",
+      "reason": "its privacy IS the enforcement mechanism: 5 architecture guards (EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08) enforce an exact (module, function) allowlist on the private issuance point; making it public would downgrade an enforced boundary to a convention",
+      "evidence": "the 5 guards failed when the name was made public, and passed again after reverting"
+    }
+  ],
+  "still_unmet": [
+    {
+      "metric": "max_function_lines",
+      "current": 1195,
+      "target": 200,
+      "reason": "the 462 pure lines inside _buy_order are interleaved with 40+ locals; needs an input dataclass plus block-by-block golden replay"
+    },
+    {
+      "metric": "max_file_lines",
+      "current": 14713,
+      "target": 2500,
+      "reason": "needs the account/cycle/job/candidate dependency chains to move first"
+    },
+    {
+      "metric": "raw_sql_modules",
+      "current": 141,
+      "target": 60,
+      "reason": "per-table owner + read-model migration"
+    },
+    {
+      "metric": "paper_table_fanout_max",
+      "current": 50,
+      "target": 8,
+      "reason": "same as raw_sql_modules: needs a per-table owner map"
+    }
+  ],
+  "remaining_scope": {
+    "paper_table_fanout": {
+      "definition": "number of MODULE FILES that name a given core table",
+      "per_table": {
+        "paper_orders": 50,
+        "paper_accounts": 45,
+        "paper_signals": 27,
+        "paper_cycles": 23,
+        "paper_fills": 21,
+        "paper_nav": 20,
+        "paper_positions": 19,
+        "paper_position_lots": 18,
+        "paper_risk_decisions": 16,
+        "paper_audit": 13
+      },
+      "target_max": 8,
+      "implication": "50 modules name paper_orders; at least 42 must stop naming it"
+    },
+    "raw_sql_modules": {
+      "current": 141,
+      "target": 60,
+      "implication": "about 81 modules must hand their SQL to an owner"
+    },
+    "max_function_lines": {
+      "current": 1195,
+      "target": 200,
+      "blocked_by": "the 462 pure lines share 40+ locals with the rest of the function; needs a per-block input/output snapshot fixture before extracting"
+    },
+    "next_batch_order": [
+      "_buy_order per-block snapshot fixture, then move blocks D/F (106 lines)",
+      "route paper_orders READ paths into paper_repository (50 -> <=8 modules)",
+      "move _ensure_accounts/_ensure_cycle to their owners, then consumers call paper_schema_migrations.ensure_current()",
+      "one table per batch: paper_signals -> paper_nav -> paper_fills -> paper_positions"
+    ]
+  },
+  "incidents": [
+    {
+      "what": "anchored a structural edit on a generic line and deleted ~5,815 lines of paper_trading.py",
+      "detected": "immediately: ast.parse + import smoke test failed with NameError",
+      "recovery": "git checkout the single file, then replay all session changes to it (10 renames / 151 sites, P1 wrappers, alias block, DDL move, init_db rewrite, 11 cross-module renames), then two full regression rounds back to green",
+      "lesson": "structural edits on a 15k-line file need unique, semantic anchors (e.g. the executescript whose next lines declare paper_accounts) plus pre-checks; a bare generic line is not an anchor"
+    }
+  ]
+}

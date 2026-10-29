@@ -52,7 +52,7 @@ def _run_daily(admission=None, now=None):
         refresh = U.refresh_history(asof_day=target_date, workers=2, max_seconds=420)
         # A partial history refresh is not permission to publish a partial factor cache.
         if refresh.get("status") in {"ok", "up_to_date"}:
-            factor_refresh = P._rebuild_selection_factor_cache(target_date)
+            factor_refresh = P.rebuild_selection_factor_cache(target_date)
     except Exception as exc:
         refresh = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
     saved = []
@@ -100,7 +100,7 @@ def _run_daily(admission=None, now=None):
                 "failures": failures,
             }
         if factor_refresh is None:
-            factor_refresh = P._rebuild_selection_factor_cache(target_date)
+            factor_refresh = P.rebuild_selection_factor_cache(target_date)
     # One stored top-10 list per strategy is enough to form an unbiased daily
     # research sample without turning the job into a second paper-trading engine.
     with selection.selection_round():

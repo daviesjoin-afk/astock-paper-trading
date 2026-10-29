@@ -656,7 +656,7 @@ def _ai_batches(items, config, trigger, conn_factory):
         # Use the same canonical slot resolver as post-close research. It
         # respects saved-provider bindings, cleared keys, enablement and model
         # settings; legacy environment credentials are not a second authority.
-        provider_config = deepseek_advisor._research_provider_config(conn_factory)
+        provider_config = deepseek_advisor.research_provider_config(conn_factory)
     except Exception as exc:
         reason = str(getattr(exc, "reason", type(exc).__name__))
         with conn_factory() as conn:

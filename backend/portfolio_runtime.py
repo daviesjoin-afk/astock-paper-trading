@@ -52,12 +52,13 @@ def _freeze(value):
     raise PortfolioRuntimeError("portfolio_fact_not_json_serializable")
 
 
-def _thaw(value):
+def thaw(value):
     if isinstance(value, Mapping):
-        return {str(k): _thaw(v) for k, v in value.items()}
+        return {str(k): thaw(v) for k, v in value.items()}
     if isinstance(value, tuple):
-        return [_thaw(v) for v in value]
+        return [thaw(v) for v in value]
     return value
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +97,7 @@ class PortfolioDimension:
 
     def projection(self) -> dict:
         return {"name": self.name, "status": self.status,
-                "facts": _thaw(self.facts), "provenance": self.provenance,
+                "facts": thaw(self.facts), "provenance": self.provenance,
                 "source_identity": self.source_identity,
                 "source_fingerprint": self.source_fingerprint,
                 "blocking_reasons": list(self.blocking_reasons)}
@@ -127,12 +128,12 @@ class PortfolioRuntimeSnapshot:
                 "contract_version": self.contract_version,
                 "cycle_id": self.cycle_id, "asof_day": self.asof_day,
                 "decision_at": self.decision_at,
-                "cycle_identity": _thaw(self.cycle_identity),
-                "strategy_pins": [_thaw(v) for v in self.strategy_pins],
+                "cycle_identity": thaw(self.cycle_identity),
+                "strategy_pins": [thaw(v) for v in self.strategy_pins],
                 "economic_owner_ids": list(self.economic_owner_ids),
                 "execution_participant_ids": list(self.execution_participant_ids),
                 "risk_exit_participant_ids": list(self.risk_exit_participant_ids),
-                "source_identities": _thaw(self.source_identities),
+                "source_identities": thaw(self.source_identities),
                 "market_evidence_identity": self.market_evidence_identity,
                 "dimensions": [v.projection() for v in self.dimensions]}
 
@@ -197,12 +198,12 @@ def build_portfolio_runtime_snapshot(*, cycle_id, asof_day: str, decision_at: st
         raise PortfolioRuntimeError("portfolio_dimensions_must_be_complete_and_unique")
     material = {"schema_version": SCHEMA_VERSION, "contract_version": CONTRACT_VERSION,
                 "cycle_id": cycle, "asof_day": day, "decision_at": decision,
-                "cycle_identity": _thaw(_freeze(cycle_identity)),
-                "strategy_pins": [_thaw(pin) for pin in pins],
+                "cycle_identity": thaw(_freeze(cycle_identity)),
+                "strategy_pins": [thaw(pin) for pin in pins],
                 "economic_owner_ids": list(owners),
                 "execution_participant_ids": list(execution),
                 "risk_exit_participant_ids": list(risk_exit),
-                "source_identities": _thaw(_freeze(source_identities)),
+                "source_identities": thaw(_freeze(source_identities)),
                 "market_evidence_identity": market_evidence_identity,
                 "dimensions": [d.projection() for d in dims]}
     fingerprint = _sha(material)
@@ -225,3 +226,7 @@ __all__ = ["CONTRACT_VERSION", "SCHEMA_VERSION", "DIMENSIONS", "AVAILABLE", "PAR
            "UNAVAILABLE", "NOT_APPLICABLE", "PortfolioRuntimeError", "PortfolioDimension",
            "PortfolioRuntimeSnapshot", "build_portfolio_runtime_snapshot",
            "verify_snapshot_fingerprint"]
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_thaw = thaw

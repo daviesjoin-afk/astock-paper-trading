@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-import contextvars
 import datetime as dt
 import dataclasses
 import functools
@@ -200,7 +199,9 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
 import selection_factor_store as SFS
 from paper_common import now_text as _now, as_date as _date, dump_json as _json, load_json as _loads
-DB_PATH = data_paths.data_path("paper_trading.sqlite3")
+DB_PATH = PST.paper_db_path()  # 路径的唯一来源在存储边界
+# 允许测试/回放把它指向临时库：公开连接面在调用时才问路径。
+PST.bind_ledger_path(lambda: DB_PATH)
 REPORT_DIR = data_paths.report_dir()
 SELECTION_FACTORS_PATH = data_paths.data_path("selection_factors.csv")
 SELECTION_META_PATH = data_paths.data_path("selection_cache.json")
@@ -796,7 +797,7 @@ def _active_account_rows(conn, status=None):
             sql += " AND status=?"
             params = (*params, status)
         sql += " ORDER BY id"
-        rows = _rows(conn, sql, params)
+        rows = query_rows(conn, sql, params)
     else:
         clause, params = _active_account_clause(conn=conn)
         sql = f"SELECT * FROM paper_accounts WHERE {clause}"
@@ -804,7 +805,7 @@ def _active_account_rows(conn, status=None):
             sql += " AND status=?"
             params = (*params, status)
         sql += " ORDER BY id"
-        rows = _rows(conn, sql, params)
+        rows = query_rows(conn, sql, params)
     order = {account_id: index for index, account_id in enumerate(ACTIVE_ACCOUNT_IDS)}
     rows.sort(key=lambda row: order.get(row.get("id"), len(order)))
     # 名册是展示名的唯一权威：DB 行的 name 是历史创建时的名字，不能让
@@ -838,7 +839,7 @@ def _accounts_by_id(conn, account_ids):
     if not ids:
         return []
     placeholders = ",".join("?" for _ in ids)
-    return _rows(
+    return query_rows(
         conn,
         f"SELECT * FROM paper_accounts WHERE id IN ({placeholders}) AND status=?",
         (*ids, "running"),
@@ -859,10 +860,10 @@ def cycle_ledger_ids(conn, cycle_id=None):
     语义 = ``cycle.enabled_strategies``（能力位过滤，不查 Registry
     lifecycle/status）∩ ``paper_accounts.cycle_id == 该周期``；**lifecycle
     pause 不改变这个集合**（Cycle owns capital; lifecycle controls execution
-    permission）。周期选择留在本层（``_active_cycle`` 可能触发旧库补周期）。
+    permission）。周期选择留在本层（``load_active_cycle`` 可能触发旧库补周期）。
     """
     if cycle_id is None:
-        cycle_id = _active_cycle(conn)["id"]
+        cycle_id = load_active_cycle(conn)["id"]
     return PCY.cycle_ledger_ids(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
@@ -1239,8 +1240,8 @@ def _record_entry_frozen_waitlist(
         payload["signal_id"] = int(signal_id)
     if existing:
         return int(existing["id"]), False, reason, payload
-    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
-        conn, account_id, signal_id, cycle_id=_order_cycle_id(conn, cycle_id),
+    strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
+        conn, account_id, signal_id, cycle_id=order_cycle_id(conn, cycle_id),
     )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
@@ -1253,13 +1254,13 @@ def _record_entry_frozen_waitlist(
             _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
             _json(payload), "strategy", _now(),
             strategy_id, strategy_version, strategy_checksum,
-            _previous_attempt_order_id(conn, signal_id, _order_cycle_id(conn, cycle_id)),
-            _order_cycle_id(conn, cycle_id),
+            _previous_attempt_order_id(conn, signal_id, order_cycle_id(conn, cycle_id)),
+            order_cycle_id(conn, cycle_id),
         ),
     )
     order_id = int(cursor.lastrowid)
     _risk_log(conn, account_id, code, "buy", ENTRY_FROZEN_WAITLIST_STATUS, reason, payload)
-    _audit(conn, account_id, ENTRY_FROZEN_WAITLIST_STATUS, f"{source}: {code} order={order_id}")
+    audit(conn, account_id, ENTRY_FROZEN_WAITLIST_STATUS, f"{source}: {code} order={order_id}")
     return order_id, True, reason, payload
 
 
@@ -1276,10 +1277,10 @@ def _record_entry_frozen_waitlist(
 DECISION_SNAPSHOT_VERSION = PDA.DECISION_SNAPSHOT_VERSION
 
 _snapshot_safe = PDA.snapshot_safe
-_snapshot_date = PDA._snapshot_date
-_snapshot_first = PDA._snapshot_first
-_snapshot_kline = PDA._snapshot_kline
-_snapshot_factor_evidence = PDA._snapshot_factor_evidence
+_snapshot_date = PDA.snapshot_date
+_snapshot_first = PDA.snapshot_first
+_snapshot_kline = PDA.snapshot_kline
+_snapshot_factor_evidence = PDA.snapshot_factor_evidence
 
 
 def _decision_snapshot(
@@ -1465,7 +1466,7 @@ def _rebuild_realized_pnl(conn):
     绝不因为 ``status='filled'`` 就被当成真实成交收益。
     """
     lots = {}
-    rows = _rows(
+    rows = query_rows(
         conn,
         "SELECT id,account_id,code,side,qty,amount,filled_price,fees,status"
         " FROM paper_orders WHERE status='filled' AND "
@@ -1515,14 +1516,15 @@ def _is_hot_path_slot(slot: str | None) -> bool:
     return bool(slot and str(slot).lower() in HOT_PATH_SLOTS)
 
 
-_SLOT_HOT_PATH = contextvars.ContextVar("slot_hot_path", default=False)
+# 与存储边界共享同一个 ContextVar 对象：``paper_storage.paper_db`` 读它决定
+# 冷/热路径参数，而 run_slot 与既有测试都从本模块 set/reset 它。
+_SLOT_HOT_PATH = PST.SLOT_HOT_PATH
 
 
 @contextmanager
 def _db(immediate=False, hot_path=False):
     """获取数据库连接（兼容包装，实际实现位于 ``paper_storage``）。"""
-    effective_hot_path = bool(hot_path or _SLOT_HOT_PATH.get())
-    with PST.db(DB_PATH, immediate=immediate, hot_path=effective_hot_path) as conn:
+    with PST.paper_db(immediate=immediate, hot_path=hot_path) as conn:
         yield conn
 
 
@@ -1542,7 +1544,7 @@ def _db_readonly():
     reconciles lots and performs schema upgrades), so it must not be called by
     a request that only displays archived orders.
     """
-    with PST.db_readonly(DB_PATH) as conn:
+    with PST.paper_db_readonly(DB_PATH) as conn:
         yield conn
 
 
@@ -1891,412 +1893,55 @@ def _ensure_ignition_shadow_table(conn):
 def init_db():
     global _RUNNER_BOOT_RECOVERED
     """创建独立账本。不会启动任务、不会请求行情。"""
-    # Quick check: if tables already exist, skip the expensive executescript
+    # 快速路径：核心表已存在时只跑幂等升级链，跳过昂贵的建表 DDL。
+    # 两条路径共用同一条升级链：历史上它们各写一份，导致"快路径漏掉新迁移"
+    # 反复出现（新表只在完整路径建，升级后的库第一次写入就 no such table）。
     try:
         with _db() as conn:
             tables = [r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='paper_accounts'"
             ).fetchall()]
             if tables:
-                # Existing ledgers still need configuration migrations.  A
-                # fast-path return previously skipped newly registered
-                # strategy accounts forever, so code/UI could show a strategy
-                # that the scheduler never ran.
-                PSM.ensure_paper_columns(conn)
-                RSET.ensure_schema(conn)
-                SR.ensure_schema(conn)
-                PSM.ensure_strategy_reference_columns(conn)
-                PSM.ensure_execution_verification_columns(conn)
-                PSM.ensure_order_cycle_provenance(conn)
-                # R23（v23）：signal 的不可变周期归属。既有账本的新列必须走
-                # 这里显式迁移，否则线上库永远缺 cycle_id（幂等、不回填）。
-                PSM.ensure_signal_cycle_provenance(conn)
-                # Round-12：调仓状态（scan / plan / cooldown）的周期归属。
-                # 与上面几行同理 —— 既有账本走快路径直接 return，永远不会执行
-                # 新建库的 executescript 建表块，新增列/约束必须在这里显式迁移，
-                # 否则线上库永远缺 cycle_id 与含周期的唯一契约。
-                PSM.ensure_rebalance_state_cycle_ownership(conn)
-                # R14（v20）：既有账本走这条快路径，新表必须显式补建（幂等、不回填）。
-                PSM.ensure_position_risk_state(conn)
-                PSM.ensure_risk_scan_run_state(conn)  # R16 v21 风险扫描运行状态
-                # R32-C（v24）：既有账本同样要走这条快路径补建 ShadowRun 证据表，
-                # 否则升级后的库永远没有 shadow_runs（Shadow 运行只能 fail closed）。
-                PSM.ensure_shadow_runs_table(conn)
-                # R32-D（v25）：同理，既有账本走快路径时也必须补建比对报告表。
-                PSM.ensure_shadow_comparison_reports(conn)
-                # R32-E1（v26）：风险决策的精确 order 关联列（幂等、不回填）。
-                PSM.ensure_risk_decision_order_linkage(conn)
-                # R33-A（v27）：既有账本走快路径时也必须补建策略健康快照表。
-                PSM.ensure_strategy_health_snapshots(conn)
-                # R33-B（v28）：退休决策追加表同理。
-                PSM.ensure_strategy_retirement_decisions(conn)
-                # R33-C（v29）：受控提案与人工审批也是追加式记录。
-                PSM.ensure_strategy_retirement_workflow(conn)
-                # R34-A：精确组合事实快照表（DDL owner 在 paper_schema_migrations）。
-                PSM.ensure_portfolio_runtime_snapshots(conn)
-                # R34-B（v31）：多策略分配计划追加表（DDL owner 同上）。
-                PSM.ensure_portfolio_allocation_plans(conn)
-                # R35-A（v33）：策略候选台账（DDL 同样只在 paper_schema_migrations）。
-                # R35-B（v34）：候选表按内容身份重建 + generation batch 追加表。
-                PSM.ensure_strategy_candidates(conn)
-                # R36-A（v35）：实验搜索控制面三张追加表（DDL 同样只在
-                # paper_schema_migrations）。**必须**在这里也建：v35 migration 只是
-                # 升级路径，正常 bootstrap 若缺少它，第一次 search 写入会直接
-                # `no such table`。
-                PSM.ensure_experiment_search(conn)
-                # R36-C（v36）：search-level selection report 追加表。**必须**在这里也建：
-                # v36 migration 只是升级路径，正常 bootstrap 若缺少它，第一次 selection
-                # 写入会直接 `no such table`。
-                PSM.ensure_candidate_selection(conn)
-                PSM.ensure_paper_metrics_indexes(conn)
-                PSM.ensure_portfolio_order_read_index(conn)
-                # S3（v40）：AI 决策归因审计表。同理必须在快路径也建，否则正常
-                # bootstrap 出来的库第一次写归因行就 `no such table`。
-                PSM.ensure_ai_decision_audits(conn)
-                _ensure_accounts(conn)
-                _ensure_user_strategy_accounts(conn)
-                _ensure_cycle(conn)
-                _ensure_runtime_lease_columns(conn)
-                _recover_stale_runtime_state(conn)
-                _reconcile_signal_order_states(conn)
-                _ensure_performance_indexes(conn)
-                _ensure_ignition_shadow_table(conn)
-                SCM.ensure_schema(conn)
+                _upgrade_ledger(conn)
                 return
     except Exception:
         pass
     with _db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS paper_accounts (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, source_strategy TEXT NOT NULL,
-                status TEXT NOT NULL, initial_cash REAL NOT NULL, cash REAL NOT NULL,
-                cycle_days INTEGER NOT NULL, max_positions INTEGER NOT NULL,
-                max_weight REAL NOT NULL, max_exposure REAL NOT NULL, version TEXT NOT NULL,
-                benchmark_start REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
-                signal_date TEXT NOT NULL, intended_date TEXT NOT NULL, code TEXT NOT NULL,
-                name TEXT, industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT,
-                t_score REAL, payload TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
-                created_at TEXT NOT NULL, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT,
-                cycle_id INTEGER,
-                UNIQUE(account_id, signal_date, code)
-            );
-            CREATE TABLE IF NOT EXISTS paper_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
-                signal_id INTEGER, side TEXT NOT NULL, code TEXT NOT NULL, name TEXT,
-                qty INTEGER NOT NULL, planned_price REAL, filled_price REAL,
-                amount REAL, fees REAL, status TEXT NOT NULL, reason TEXT,
-                risk_payload TEXT NOT NULL, realized_pnl REAL, created_at TEXT NOT NULL, executed_at TEXT,
-                order_type TEXT NOT NULL DEFAULT 'market',
-                origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
-                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
-                retry_of_order_id INTEGER,
-                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
-                cycle_id INTEGER,
-                allocation_intent_kind TEXT, portfolio_snapshot_id TEXT,
-                allocation_plan_id TEXT, allocation_plan_fingerprint TEXT,
-                allocation_policy_version TEXT
-            );
-            -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
-            CREATE TABLE IF NOT EXISTS paper_orders_archive (
-                id INTEGER, account_id TEXT, signal_id INTEGER, side TEXT, code TEXT, name TEXT,
-                qty INTEGER, planned_price REAL, filled_price REAL, amount REAL, fees REAL,
-                status TEXT, reason TEXT, risk_payload TEXT, realized_pnl REAL,
-                created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
-                expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER,
-                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
-                cycle_id INTEGER,
-                allocation_intent_kind TEXT, portfolio_snapshot_id TEXT,
-                allocation_plan_id TEXT, allocation_plan_fingerprint TEXT,
-                allocation_policy_version TEXT
-            );
-            CREATE TABLE IF NOT EXISTS paper_signals_archive (
-                id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
-                industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT, t_score REAL,
-                payload TEXT, status TEXT, reason TEXT, created_at TEXT,
-                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
-                cycle_id INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS paper_positions (
-                account_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT, industry TEXT,
-                qty INTEGER NOT NULL, cost REAL NOT NULL, entry_date TEXT NOT NULL,
-                available_date TEXT NOT NULL, asset_type TEXT NOT NULL DEFAULT 'stock_t1', peak_price REAL, take_stage INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(account_id, code)
-            );
-            CREATE TABLE IF NOT EXISTS paper_fills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
-                account_id TEXT NOT NULL, side TEXT NOT NULL, code TEXT NOT NULL,
-                qty INTEGER NOT NULL, price REAL NOT NULL, amount REAL NOT NULL, fees REAL NOT NULL,
-                fill_date TEXT NOT NULL, quote_at TEXT, assumption TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_risk_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
-                code TEXT, side TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT,
-                payload TEXT NOT NULL, created_at TEXT NOT NULL, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_recent
-                ON paper_risk_decisions(id DESC);
-            CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_filter
-                ON paper_risk_decisions(account_id, created_at DESC, code, decision);
-            CREATE INDEX IF NOT EXISTS idx_paper_orders_recent
-                ON paper_orders(id DESC);
-            CREATE INDEX IF NOT EXISTS idx_paper_orders_account_status
-                ON paper_orders(account_id, status, created_at DESC);
-            CREATE TABLE IF NOT EXISTS paper_capital_reservations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                order_key TEXT NOT NULL UNIQUE,
-                account_id TEXT NOT NULL,
-                code TEXT NOT NULL,
-                side TEXT NOT NULL,
-                amount REAL NOT NULL,
-                fees REAL NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'reserved',
-                created_at TEXT NOT NULL,
-                released_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_paper_capital_reservations_cycle_status
-                ON paper_capital_reservations(cycle_id, status);
-            CREATE TABLE IF NOT EXISTS paper_ignition_shadow (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                day TEXT NOT NULL,
-                bucket TEXT NOT NULL,
-                code TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
-                price REAL,
-                pct REAL,
-                runup REAL,
-                old_rule_passed INTEGER NOT NULL DEFAULT 0,
-                old_rule_reason TEXT,
-                ignition_passed INTEGER NOT NULL DEFAULT 0,
-                ignition_reasons TEXT,
-                price_30m REAL,
-                at_30m TEXT,
-                price_60m REAL,
-                at_60m TEXT,
-                resolved INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_ignition_shadow_unique
-                ON paper_ignition_shadow(day, bucket, code);
-            CREATE INDEX IF NOT EXISTS idx_paper_ignition_shadow_recent
-                ON paper_ignition_shadow(day, resolved);
-            CREATE TABLE IF NOT EXISTS paper_position_reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                account_id TEXT NOT NULL,
-                code TEXT NOT NULL,
-                review_date TEXT NOT NULL,
-                score REAL NOT NULL,
-                grade TEXT NOT NULL,
-                action TEXT NOT NULL,
-                market_value REAL NOT NULL DEFAULT 0,
-                position_pct REAL NOT NULL DEFAULT 0,
-                replacement_code TEXT,
-                replacement_score REAL,
-                reasons TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(cycle_id, account_id, code, review_date)
-            );
-            CREATE INDEX IF NOT EXISTS idx_paper_position_reviews_recent
-                ON paper_position_reviews(cycle_id, review_date, score);
-            CREATE TABLE IF NOT EXISTS paper_nav (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
-                nav_date TEXT NOT NULL, cash REAL NOT NULL, market_value REAL NOT NULL,
-                nav REAL NOT NULL, benchmark REAL, created_at TEXT NOT NULL,
-                quote_status TEXT NOT NULL DEFAULT 'verified',
-                UNIQUE(account_id, nav_date)
-            );
-            CREATE TABLE IF NOT EXISTS paper_jobs (
-                slot TEXT NOT NULL, market_date TEXT NOT NULL, status TEXT NOT NULL,
-                detail TEXT, started_at TEXT NOT NULL, finished_at TEXT,
-                 owner_key TEXT, heartbeat_at TEXT, expires_at TEXT,
-                 fencing_token INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(slot, market_date)
-            );
-            CREATE TABLE IF NOT EXISTS paper_reviews (
-                week_key TEXT NOT NULL, account_id TEXT NOT NULL, report TEXT NOT NULL,
-                recommendation TEXT NOT NULL, created_at TEXT NOT NULL,
-                PRIMARY KEY(week_key, account_id)
-            );
-            CREATE TABLE IF NOT EXISTS paper_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, event TEXT NOT NULL,
-                detail TEXT, created_at TEXT NOT NULL, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT
-            );
-            CREATE TABLE IF NOT EXISTS paper_cycles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL UNIQUE,
-                status TEXT NOT NULL, capital REAL NOT NULL, risk_profile TEXT NOT NULL,
-                started_at TEXT, ended_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_position_lots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
-                account_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT, industry TEXT,
-                qty INTEGER NOT NULL, remaining_qty INTEGER NOT NULL, cost REAL NOT NULL,
-                acquired_at TEXT NOT NULL, available_date TEXT NOT NULL,
-                asset_type TEXT NOT NULL DEFAULT 'stock_t1', source_order_id INTEGER,
-                cost_fee_included INTEGER NOT NULL DEFAULT 0,
-                is_t_base INTEGER NOT NULL DEFAULT 1, source_fill_id INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_paper_lots_active
-                ON paper_position_lots(cycle_id, account_id, code, available_date);
-            CREATE TABLE IF NOT EXISTS paper_intraday_observations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
-                account_id TEXT NOT NULL, code TEXT, observed_at TEXT NOT NULL,
-                price REAL, action TEXT NOT NULL, reason TEXT, payload TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_paper_intraday_obs
-                ON paper_intraday_observations(cycle_id, account_id, observed_at);
-            CREATE TABLE IF NOT EXISTS paper_parameter_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
-                account_id TEXT NOT NULL, version TEXT NOT NULL, style TEXT NOT NULL,
-                params TEXT NOT NULL, reason TEXT NOT NULL, effective_date TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_archives (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER, cycle_key TEXT,
-                reason TEXT NOT NULL, snapshot TEXT NOT NULL, created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_job_runs (
-                run_key TEXT PRIMARY KEY, slot TEXT NOT NULL, market_date TEXT NOT NULL,
-                status TEXT NOT NULL, detail TEXT, started_at TEXT NOT NULL, finished_at TEXT,
-                 owner_key TEXT, heartbeat_at TEXT, expires_at TEXT,
-                 fencing_token INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS paper_runtime_locks (
-                lock_key TEXT PRIMARY KEY,
-                owner_key TEXT NOT NULL,
-                slot TEXT NOT NULL,
-                acquired_at TEXT NOT NULL,
-                heartbeat_at TEXT,
-                expires_at TEXT NOT NULL,
-                fencing_token INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS paper_position_limit_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                allocation_key TEXT NOT NULL,
-                pool_limit INTEGER NOT NULL,
-                limits TEXT NOT NULL,
-                weights TEXT NOT NULL,
-                inputs TEXT NOT NULL,
-                source TEXT NOT NULL,
-                effective_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(cycle_id, allocation_key)
-
-            );
-            CREATE INDEX IF NOT EXISTS idx_paper_position_limit_versions_cycle
-                ON paper_position_limit_versions(cycle_id, effective_at DESC);
-
-"""
-        )
-        RSET.ensure_schema(conn)
-        PSM.ensure_paper_columns(conn)
-        PSM.ensure_execution_verification_columns(conn)
-        # 升级前的 lot 只记录成交价。来源订单存在时，将已实际扣除的买入费用
-        # 分摊到每股成本；无来源的历史兼容 lot 不臆造费用，保留原始成本。
-        conn.execute(
-            """UPDATE paper_position_lots
-               SET cost=cost+COALESCE((SELECT fees / NULLIF(qty,0) FROM paper_orders o WHERE o.id=paper_position_lots.source_order_id),0),
-                   cost_fee_included=1
-               WHERE cost_fee_included=0 AND source_order_id IS NOT NULL"""
-        )
-        # A crashed worker must not leave a phantom reservation blocking the
-        # shared pool forever.  Filled orders consume their reservation;
-        # cancelled/expired/rejected orders release it.  Pending limit and
-        # entry-frozen waitlist orders are intentionally kept reserved for the
-        # next trigger/retry pass.
-        conn.execute(
-            """UPDATE paper_capital_reservations
-               SET status='consumed',released_at=COALESCE(released_at,?)
-               WHERE status='reserved' AND EXISTS(
-                   SELECT 1 FROM paper_orders o
-                   WHERE CAST(o.id AS TEXT)=paper_capital_reservations.order_key
-                     AND o.status='filled'
-               )""",
-            (_now(),),
-        )
-        retry_order_placeholders = ",".join("?" for _ in ENTRY_RETRY_ORDER_STATUSES)
-        conn.execute(
-            f"""UPDATE paper_capital_reservations
-               SET status='released',released_at=COALESCE(released_at,?)
-               WHERE status='reserved' AND NOT EXISTS(
-                   SELECT 1 FROM paper_orders o
-                   WHERE CAST(o.id AS TEXT)=paper_capital_reservations.order_key
-                     AND o.status IN ({retry_order_placeholders})
-               )""",
-            (_now(), *ENTRY_RETRY_ORDER_STATUSES),
-        )
-        # Backfill waitlist markers produced before the recheck lifecycle was
-        # unified.  They are historical audit evidence, but must not remain
-        # visible as live pending orders once a newer decision for the same
-        # account/code has been written.
-        conn.execute(
-            """UPDATE paper_orders AS marker
-               SET status='superseded',
-                   reason=COALESCE(marker.reason,'') || '；已由后续实时复核委托替代'
-               WHERE marker.status=? AND marker.side='buy'
-                 AND EXISTS(
-                     SELECT 1 FROM paper_orders AS newer
-                     WHERE newer.account_id=marker.account_id
-                       AND newer.code=marker.code AND newer.side='buy'
-                       AND newer.id>marker.id
-                 )""",
-            (ENTRY_FROZEN_WAITLIST_STATUS,),
+        PSM.ensure_current(
+            conn,
+            now=_now,
+            entry_retry_order_statuses=ENTRY_RETRY_ORDER_STATUSES,
+            entry_frozen_waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
         )
         _rebuild_realized_pnl(conn)
-        SR.ensure_schema(conn)
-        PSM.ensure_strategy_reference_columns(conn)
-        PSM.ensure_order_cycle_provenance(conn)
-        # R23（v23）：signal 的不可变周期归属（幂等、不回填）。
-        PSM.ensure_signal_cycle_provenance(conn)
-        # R14（v20）：DDL 单一事实来源在 paper_schema_migrations，这里显式调用。
-        PSM.ensure_position_risk_state(conn)
-        PSM.ensure_risk_scan_run_state(conn)  # R16 v21（DDL 只在 migration）
-        PSM.ensure_shadow_runs_table(conn)  # R32-C v24（DDL 只在 paper_schema_migrations）
-        # R32-D v25：比对报告表（DDL 同样只在 paper_schema_migrations）。
-        PSM.ensure_shadow_comparison_reports(conn)
-        # R32-E1 v26：风险决策的精确 order 关联列。
-        PSM.ensure_risk_decision_order_linkage(conn)
-        # R33-A v27：策略健康快照表（DDL 只在 paper_schema_migrations）。
-        PSM.ensure_strategy_health_snapshots(conn)
-        # R33-B v28：策略退休决策表（DDL 同样只在 paper_schema_migrations）。
-        PSM.ensure_strategy_retirement_decisions(conn)
-        # R33-C v29：策略退休 proposal/approval 追加表。
-        PSM.ensure_strategy_retirement_workflow(conn)
-        PSM.ensure_portfolio_runtime_snapshots(conn)
-        # R34-B v31：多策略分配计划追加表（DDL 同样只在 paper_schema_migrations）。
-        PSM.ensure_portfolio_allocation_plans(conn)
-        # R35-A v33：策略候选台账（DDL 同样只在 paper_schema_migrations）。
-        PSM.ensure_strategy_candidates(conn)
-        # R36-A v35：实验搜索控制面三张追加表。与上面同样必须在这里幂等建表，
-        # 否则正常 bootstrap 出来的库缺少 search 表，第一次写入即 `no such table`。
-        PSM.ensure_experiment_search(conn)
-        # R36-C v36：selection report 追加表。与上面同样必须在这里幂等建表，否则正常
-        # bootstrap 出来的库缺少 selection 表，第一次写入即 `no such table`。
-        PSM.ensure_candidate_selection(conn)
-        PSM.ensure_paper_metrics_indexes(conn)
-        PSM.ensure_portfolio_order_read_index(conn)
-        # S3（v40）：AI 决策归因审计表（DDL 只在 paper_schema_migrations）。
-        PSM.ensure_ai_decision_audits(conn)
-        _ensure_accounts(conn)
-        _ensure_user_strategy_accounts(conn)
-        _ensure_cycle(conn)
-        _ensure_runtime_lease_columns(conn)
-        _recover_stale_runtime_state(conn)
-        _reconcile_signal_order_states(conn)
-        _ensure_performance_indexes(conn)
-        SCM.ensure_schema(conn)
+        _upgrade_ledger(conn)
         _RUNNER_BOOT_RECOVERED = True
     # H9: 建表/迁移/启动回收是批量写，显式收缩 WAL，避免 -wal 无界增长。
     _wal_checkpoint()
+
+
+def _upgrade_ledger(conn):
+    """幂等升级链：列升级 → 逐特性建表 → 业务引导。init_db 两条路径共用。
+
+    每一步都必须幂等：既在全新库上跑（紧随建表之后），也在跑过几十轮的旧库上跑。
+    建表 DDL 与历史行修补已归 ``paper_schema_migrations``，本函数只负责按顺序驱动
+    它们，以及引擎自己的业务引导（账户 / 周期 / 回收 / 对账）。
+    """
+    PSM.ensure_paper_columns(conn)
+    RSET.ensure_schema(conn)
+    SR.ensure_schema(conn)
+    PSM.ensure_execution_verification_columns(conn)
+    PSM.ensure_rebalance_state_cycle_ownership(conn)
+    PSM.ensure_feature_tables(conn)
+    _ensure_accounts(conn)
+    _ensure_user_strategy_accounts(conn)
+    _ensure_cycle(conn)
+    _ensure_runtime_lease_columns(conn)
+    _recover_stale_runtime_state(conn)
+    _reconcile_signal_order_states(conn)
+    _ensure_performance_indexes(conn)
+    _ensure_ignition_shadow_table(conn)
+    SCM.ensure_schema(conn)
 
 
 def _benchmark_close():
@@ -2356,7 +2001,7 @@ def _ensure_user_strategy_accounts(conn):
 
     处于正式周期状态的用户策略必须有 paper_accounts 行，
     否则信号/订单/持仓没有账本主体。新建行保持 paused/零资金：
-    资金与周期挂接只由 ``_create_cycle`` / ``_ensure_cycle`` 分配，
+    资金与周期挂接只由 ``create_cycle`` / ``_ensure_cycle`` 分配，
     激活绝不私自挪用共享池。策略暂停/归档后行保留（历史账本语义），
     但参与资格消失，不会再被任何周期启用。
     """
@@ -2365,7 +2010,7 @@ def _ensure_user_strategy_accounts(conn):
         USP.user_participant_ids(conn),
         spec_for=lambda account_id: _spec_for(account_id, conn=conn),
         now_fn=_now,
-        audit_fn=_audit,
+        audit_fn=audit,
     )
 
 
@@ -2378,7 +2023,7 @@ def _reconcile_shared_cash(conn, cycle_id):
     be understated.  The correction is idempotent and is audited.
     """
     active_clause, active_ids = _active_cycle_filter(conn, cycle_id, "id")
-    accounts = _rows(
+    accounts = query_rows(
         conn,
         f"SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=? AND {active_clause} ORDER BY id",
         (cycle_id, *active_ids),
@@ -2424,7 +2069,7 @@ def _reconcile_shared_cash(conn, cycle_id):
         # This is intentionally equivalent to a shared-pool debit, not a
         # proportional rewrite of strategy history.
         _debit_shared_cash(conn, -drift, cycle_id=cycle_id)
-    _audit(conn, None, "shared_cash_reconciled", f"共享资金池现金账差 {drift:+.2f} 元，已按周期固定本金与成交现金流修复")
+    audit(conn, None, "shared_cash_reconciled", f"共享资金池现金账差 {drift:+.2f} 元，已按周期固定本金与成交现金流修复")
     return drift
 
 
@@ -2540,7 +2185,7 @@ def _ensure_cycle(conn):
         if is_new_for_cycle:
             capital = _num(active["capital"], 100000.0)
             # Preserve the shared-pool synthetic attribution used by
-            # _create_cycle: a newly added strategy receives one equal ledger
+            # create_cycle: a newly added strategy receives one equal ledger
             # share, never the entire pool as a private bankroll.  When
             # joining an already active legacy cycle, only unallocated
             # configured capital is attributed; zero is safe and keeps the
@@ -2638,7 +2283,7 @@ def _ensure_cycle(conn):
                         (active["id"], account_id, spec.get("strategy_version") or "v2.0", desired_style,
                          _json(params), "中途接入主力策略修复：" + "；".join(repairs), _date().isoformat(), now),
                     )
-                    _audit(conn, account_id, "main_force_activation_repaired", "；".join(repairs) + "；共享池现金和历史成交未改写")
+                    audit(conn, account_id, "main_force_activation_repaired", "；".join(repairs) + "；共享池现金和历史成交未改写")
                 reference_capital = max(
                     _num(current["initial_cash"], 0.0),
                     _num(params.get("shared_pool_reference_capital"), 0.0),
@@ -2681,13 +2326,13 @@ def _ensure_cycle(conn):
         num_fn=_num,
         date_fn=_date,
         now_fn=_now,
-        audit_fn=_audit,
+        audit_fn=audit,
     )
     SR.bind_cycle_versions(conn, active["id"], enabled_ids)
     _reconcile_shared_cash(conn, active["id"])
 
 
-def _active_cycle(conn):
+def load_active_cycle(conn):
     cycle = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     if cycle is None:
         _ensure_cycle(conn)
@@ -2697,15 +2342,15 @@ def _active_cycle(conn):
 
 def _active_cycle_id_readonly(conn):
     """Compatibility facade for the read-only order authority."""
-    return POEA._active_cycle_id_readonly(conn)
+    return POEA.active_cycle_id_readonly(conn)
 
 
 def _account_cycle_id_readonly(conn, account_id):
     """Compatibility facade for the read-only order authority."""
-    return POEA._account_cycle_id_readonly(conn, account_id)
+    return POEA.account_cycle_id_readonly(conn, account_id)
 
 
-def _order_cycle_id(conn, cycle_id=None):
+def order_cycle_id(conn, cycle_id=None):
     """订单/lot 写入时刻所属周期的**唯一解析入口**（v18 write-time fact）。
 
     优先级：
@@ -2731,7 +2376,7 @@ def _order_cycle_id(conn, cycle_id=None):
             explicit = None
         if explicit is not None:
             return explicit
-    return int(_active_cycle(conn)["id"])
+    return int(load_active_cycle(conn)["id"])
 
 
 #: ``provenance.status`` 的四个取值（§3）。``None`` 与它们的区别是**语义区别**，
@@ -2755,32 +2400,32 @@ OrderCycleProvenance = POEA.OrderCycleProvenance
 
 def _order_cycle_provenance_for_order(conn, order_id):
     """Compatibility facade for the read-only order authority."""
-    return POEA._order_cycle_provenance_for_order(conn, order_id)
+    return POEA.order_cycle_provenance_for_order(conn, order_id)
 
 
 def _order_cycle_id_for_order(conn, order_id):
     """Compatibility facade for the read-only order authority."""
-    return POEA._order_cycle_id_for_order(conn, order_id)
+    return POEA.order_cycle_id_for_order(conn, order_id)
 
 
 def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
     """Compatibility facade for the read-only order authority."""
-    return POEA._assert_order_execution_cycle(conn, order_id, account_id=account_id, provenance=provenance, allow_out_of_cycle_account=allow_out_of_cycle_account)
+    return POEA.assert_order_execution_cycle(conn, order_id, account_id=account_id, provenance=provenance, allow_out_of_cycle_account=allow_out_of_cycle_account)
 
 
 def _orders_have_cycle_column(conn):
     """Compatibility facade for the read-only order authority."""
-    return POEA._orders_have_cycle_column(conn)
+    return POEA.orders_have_cycle_column(conn)
 
 
 def _shared_account_rows(conn, cycle_id=None):
     """Return the strategy ledgers participating in the shared capital pool.
 
     兼容 facade：所有权谓词与账本行解析在 ``paper_cycle_ownership``；周期
-    选择留在本层（``_active_cycle`` 可能触发旧库补周期）。
+    选择留在本层（``load_active_cycle`` 可能触发旧库补周期）。
     """
     if cycle_id is None:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         cycle_id = cycle["id"]
     rows = PSC.cycle_account_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
     for row in rows:
@@ -2790,7 +2435,7 @@ def _shared_account_rows(conn, cycle_id=None):
 
 def _shared_initial_cash(conn, cycle=None):
     """Total capital for the current simulation cycle, not per strategy."""
-    cycle = cycle or _active_cycle(conn)
+    cycle = cycle or load_active_cycle(conn)
     declared = _num(cycle["capital"])
     accounts = () if declared > 0 else _shared_account_rows(conn, cycle["id"])
     return PSC.shared_initial_cash(accounts, declared, num_fn=_num)
@@ -2823,10 +2468,10 @@ def _economic_pool_nav_history(conn, cycle=None):
     capital must be subtracted before strategy contributions are aggregated,
     otherwise a late-joining strategy creates a fake deposit in pool history.
     """
-    cycle = cycle or _active_cycle(conn)
+    cycle = cycle or load_active_cycle(conn)
     accounts = _shared_account_rows(conn, cycle["id"])
     references = {row["id"]: _account_reference_capital(row) for row in accounts}
-    rows = _rows(
+    rows = query_rows(
         conn,
         f"""SELECT account_id,nav_date,nav FROM paper_nav
              WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=? AND {_active_cycle_filter(conn, cycle['id'], 'id')[0]})
@@ -2856,7 +2501,7 @@ def _economic_pool_nav_history(conn, cycle=None):
 
 def _shared_cash(conn, cycle_id=None):
     if cycle_id is None:
-        cycle_id = _active_cycle(conn)["id"]
+        cycle_id = load_active_cycle(conn)["id"]
     return PSC.cycle_shared_cash(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS, num_fn=_num)
 
 
@@ -2892,7 +2537,7 @@ def _pending_position_slots(conn, positions=None, exclude_order_key=None, *, cyc
         occupying_statuses=ENTRY_SLOT_OCCUPYING_ORDER_STATUSES,
         lot_size=LOT_SIZE,
         num_fn=_num,
-        rows_fn=_rows,
+        rows_fn=query_rows,
     )
 
 
@@ -2910,7 +2555,7 @@ def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0,
     return PCR.reserve_shared_capital(
         conn, order_key, account_id, code, amount, fees,
         num_fn=_num, now_fn=_now, shared_cash_fn=_shared_cash,
-        active_cycle_fn=_active_cycle,
+        active_cycle_fn=load_active_cycle,
         expected_cycle_id=expected_cycle_id,
     )
 
@@ -2948,7 +2593,7 @@ def _debit_shared_cash(conn, amount, preferred_account_id=None, *, cycle_id=None
     """Debit a shared cash pool while retaining per-strategy audit ownership.
 
     ``cycle_id`` 必须显式给出。成交与对账都发生在**某一轮具体周期**上：延迟
-    成交的订单可能属于已经不再是 active 的周期，若这里回落 ``_active_cycle``，
+    成交的订单可能属于已经不再是 active 的周期，若这里回落 ``load_active_cycle``，
     就会拿新一轮的现金池去支付上一轮的成交（账本看起来仍然平衡，钱却花在了
     别人身上）。宁可 fail closed，也不隐式选周期。
     """
@@ -3072,11 +2717,11 @@ def _shared_risk_state(conn, account, nav, asof_day, *, cycle_id=None):
             "pool_cash": round(_shared_cash(conn), 2)}
 
 
-def _rows(conn, sql, params=()):
+def query_rows(conn, sql, params=()):
     return PRP.rows(conn, sql, params)
 
 
-def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
+def audit(conn, account_id, event, detail, *, strategy_stamp=None):
     return PRP.audit(
         conn, account_id, event, detail, _now(),
         strategy_stamp=strategy_stamp,
@@ -3104,11 +2749,11 @@ def _audit_once_per_day(conn, event, detail):
     except sqlite3.Error:
         exists = None
     if exists is None:
-        return _audit(conn, None, event, detail)
+        return audit(conn, None, event, detail)
     return None
 
 
-def _strategy_stamp(conn, account_id, signal_id=None, *, cycle_id=None):
+def resolve_strategy_stamp(conn, account_id, signal_id=None, *, cycle_id=None):
     """Return one complete causal Strategy Definition version stamp.
 
     With a ``signal_id`` the stamp is **inherited** from that signal — the decision
@@ -3215,7 +2860,7 @@ def _recovery_watches(conn, account_id, day):
     """Latest protective watches, bounded to avoid stale audit rows."""
     cutoff = (_date(day) - dt.timedelta(days=5)).isoformat()
     watches = {}
-    rows = _rows(conn, """SELECT detail,created_at FROM paper_audit
+    rows = query_rows(conn, """SELECT detail,created_at FROM paper_audit
                          WHERE account_id=? AND event='protective_exit_recovery_watch'
                            AND substr(created_at,1,10)>=? ORDER BY id DESC LIMIT 100""",
                  (account_id, cutoff))
@@ -3254,7 +2899,7 @@ def _recovery_observation(conn, account_id, code, watch, quote, day):
         (account_id, f'%"code": "{code}"%', exit_at or "0000-01-01")).fetchone()[0]
     observation = {"code": code, "price": price, "exit_price": exit_price, "scans": int(obs) + 1,
                    "required_scans": policy["min_scans"], "reclaim_pct": policy["reclaim_pct"]}
-    _audit(conn, account_id, "protective_recovery_observation", _json(observation))
+    audit(conn, account_id, "protective_recovery_observation", _json(observation))
     if price < exit_price * (1 + policy["reclaim_pct"]):
         return False, f"止损后尚未收复 {policy['reclaim_pct']*100:.1f}%", observation
     if int(obs) + 1 < policy["min_scans"]:
@@ -3288,7 +2933,7 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
         payload["decision_provenance"] = PSM.risk_decision_provenance(
             authority, decision_kind or decision)
     if strategy_stamp is None:
-        strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
+        strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(conn, account_id)
     else:
         strategy_id, strategy_version, strategy_checksum = strategy_stamp
     conn.execute(
@@ -3308,7 +2953,7 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
             strategy_stamp=(strategy_id, strategy_version, strategy_checksum))
     except Exception as exc:  # noqa: BLE001 - 意见链绝不改变规则风险决策
         try:
-            _audit(conn, account_id, "ai_advice_consumption_failed",
+            audit(conn, account_id, "ai_advice_consumption_failed",
                    f"{type(exc).__name__}: {exc}")
         except Exception:
             pass
@@ -3389,7 +3034,7 @@ def _bootstrap_risk_rejection_cooldown(conn, account_id, code, asof_day):
     if base <= 0:
         return None
     day = _date(asof_day).isoformat()
-    rows = _rows(
+    rows = query_rows(
         conn,
         """SELECT decision,reason,created_at FROM paper_risk_decisions
            WHERE account_id=? AND code=? AND side='buy'
@@ -3541,13 +3186,13 @@ def _consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None
         raise OrderCycleProvenanceUnknown(None, ORDER_CYCLE_ORDER_MISSING,
             "lot 消耗必须由来源订单显式提供周期；拒绝回退到当前 active cycle")
     return PLL.consume_available_lots(conn, account_id, code, qty, asof_day,
-        cycle_id=_order_cycle_id(conn, cycle_id), rows_fn=_rows, num_fn=_num, date_fn=_date)
+        cycle_id=order_cycle_id(conn, cycle_id), rows_fn=query_rows, num_fn=_num, date_fn=_date)
 
 
 def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None, acquired_at=None):
     """Compatibility adapter; only order-free creation may resolve a cycle here."""
     if order_id is None:
-        cycle_id = _order_cycle_id(conn, cycle_id)
+        cycle_id = order_cycle_id(conn, cycle_id)
     return PLL.record_lot(conn, account, signal, qty, fill_price, asof_day, order_id,
         is_t_base=is_t_base, fees=fees, cycle_id=cycle_id, acquired_at=acquired_at,
         num_fn=_num, date_fn=_date, now_fn=_now, asset_type_fn=_asset_type,
@@ -3975,7 +3620,7 @@ def _selection_factor_manifest_signature():
         return None
 
 
-def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
+def selection_factor_freshness(price_f, universe, asof_date, meta=None):
     """Require a complete, exact-date factor snapshot before candidate ranking.
 
     A cache containing a few fresh rows plus thousands of old rows is not a
@@ -4116,7 +3761,7 @@ def _selection_factor_history_gate(universe, cutoff):
         "passed": bool(required and covered >= minimum),
     }
 
-def _rebuild_selection_factor_cache(asof_date=None):
+def rebuild_selection_factor_cache(asof_date=None):
     """One nonblocking builder across API, data and paper workers."""
     with SFS.file_lock(SELECTION_META_PATH + ".build.lock", blocking=False) as acquired:
         if not acquired:
@@ -4923,7 +4568,7 @@ def _ignition_shadow_backfill(asof_day=None, quote_fetch=None):
         # 读取待回填记录和取报价都在**写事务之外**。旧实现持有 SQLite 写锁
         # 等待网络报价，一个慢源就能阻塞成交与风控写入（MD 审查 P2）。
         with _db() as conn:
-            pending = _rows(
+            pending = query_rows(
                 conn,
                 """SELECT * FROM paper_ignition_shadow
                    WHERE resolved=0 AND recorded_at <= ?
@@ -4979,7 +4624,7 @@ def ignition_shadow_report(asof_day=None, limit=200):
     day = _date(asof_day or dt.date.today()).isoformat()
     try:
         with _db() as conn:
-            rows = _rows(
+            rows = query_rows(
                 conn,
                 """SELECT * FROM paper_ignition_shadow WHERE day=?
                    ORDER BY id DESC LIMIT ?""",
@@ -5050,7 +4695,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                            else shared_inputs.universe(U.load_universe))
         base_universe = {str(row.get("code")): row for row in (source_universe or [])}
     with PTM.phase("candidate.factor_gate"):
-        factor_freshness = _selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
+        factor_freshness = selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
     if not factor_freshness.get("passed"):
         return [], {
             "blocked": True,
@@ -5977,7 +5622,7 @@ def _quotes(codes, asof_date=None):
             cross.pop(code, None)  # A failed independent request must not retain self-verification.
         try:
             with PTM.phase("quote.same_source_fallback"):
-                sina_rows = dfc._fetch_sina_realtime_for_codes(same_source_codes) or []
+                sina_rows = dfc.fetch_sina_realtime_for_codes(same_source_codes) or []
         except Exception as exc:
             sina_rows = []
             source_errors["sina"] = f"{type(exc).__name__}: {exc}"
@@ -6984,7 +6629,7 @@ def generate_signals(asof_date=None):
             "error": f"{type(exc).__name__}: {exc}",
         }
     try:
-        factor_refresh = _rebuild_selection_factor_cache(close_target)
+        factor_refresh = rebuild_selection_factor_cache(close_target)
     except Exception as exc:
         factor_refresh = {
             "status": "failed",
@@ -7036,7 +6681,7 @@ def generate_signals(asof_date=None):
             accounts = _active_account_rows(conn, status="running")
             for account in accounts:
                 detail = f"{reason}；{_json(factor_refresh.get('refresh_gate') or {})}"
-                _audit(conn, account["id"], "close_signal_blocked_history", detail)
+                audit(conn, account["id"], "close_signal_blocked_history", detail)
                 summary["accounts"].append({
                     "id": account["id"], "created": 0, "blocked": True, "reason": reason,
                 })
@@ -7050,7 +6695,7 @@ def generate_signals(asof_date=None):
         summary.update({"status": "blocked", "reason": reason})
         with _db() as conn:
             for account in _active_account_rows(conn, status="running"):
-                _audit(conn, account["id"], "close_signal_blocked_market", reason)
+                audit(conn, account["id"], "close_signal_blocked_market", reason)
                 summary["accounts"].append({
                     "id": account["id"], "created": 0, "blocked": True,
                     "reason": reason, "live_scan_gate": close_gate,
@@ -7149,9 +6794,9 @@ def generate_signals(asof_date=None):
                 continue
             research = research_results.get(account["id"], {})
             if research.get("candidate_snapshot_error"):
-                _audit(conn, account["id"], "candidate_snapshot_failed", research["candidate_snapshot_error"])
+                audit(conn, account["id"], "candidate_snapshot_failed", research["candidate_snapshot_error"])
             if meta.get("blocked"):
-                _audit(conn, account["id"], "signal_blocked", meta["reason"])
+                audit(conn, account["id"], "signal_blocked", meta["reason"])
                 summary["accounts"].append({"id": account["id"], "created": 0, **meta})
                 continue
             if research.get("shadow") is not None:
@@ -7161,7 +6806,7 @@ def generate_signals(asof_date=None):
                 # close signal that has already passed the existing data gates is
                 # not allowed to disappear because an optional shadow write failed.
                 meta["research_shadow"] = {"status": "failed", "error": research["shadow_error"]}
-                _audit(conn, account["id"], "research_shadow_failed", research["shadow_error"])
+                audit(conn, account["id"], "research_shadow_failed", research["shadow_error"])
             created = 0
             # R23：signal provenance 在账户粒度循环外解析一次（规格 §24），周期与
             # 写锁内重读的账户周期比对，不一致即整批 stale。
@@ -7169,7 +6814,7 @@ def generate_signals(asof_date=None):
                 conn, account["id"], cycle_id=account["cycle_id"],
                 account_cycle_id=current["cycle_id"], asof_day=day.isoformat())
             if context_error is not None:
-                _audit(conn, account["id"], context_error.event, context_error.detail)
+                audit(conn, account["id"], context_error.event, context_error.detail)
                 summary["accounts"].append({
                     "id": account["id"], "created": 0, "candidates": len(candidates),
                     "provenance_unprovable": True, "reason": context_error.detail, **meta})
@@ -7237,7 +6882,7 @@ def generate_signals(asof_date=None):
                           else "rejected_signal", reason, committed_payload,
                           strategy_stamp=account_stamp)
                 created += int(passed)
-            _audit(conn, account["id"], "close_signal_scan", f"候选 {len(candidates)}，通过 {created}")
+            audit(conn, account["id"], "close_signal_scan", f"候选 {len(candidates)}，通过 {created}")
             summary["accounts"].append({"id": account["id"], "created": created, "candidates": len(candidates), **meta})
     # 收盘事实提交后再打开研究库；不用研究 IO 阻塞正式账本事务。
     for account, candidates, meta in candidate_batches:
@@ -7443,7 +7088,7 @@ STRATEGY_MAX_POSITIONS = 6
 STRATEGY_PROTECTED_SLOT_FLOOR = 2
 
 
-def _portfolio_allocation_service_config(conn=None):
+def portfolio_allocation_service_config(conn=None):
     """Snapshot the legacy declarative limits for the exact plan builder."""
     return PAS.AllocationServiceConfig(
         allocation_slot_caps=ALLOCATION_SLOT_CAPS,
@@ -7472,7 +7117,7 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
             "explicit_decision_at_must_include_timezone")
     reconciled = EV.stamp_terminal_zero_orders(conn, cycle_id=cycle_id)
     if reconciled["confirmed_zero"]:
-        _audit(conn, None, "terminal_execution_reconciled",
+        audit(conn, None, "terminal_execution_reconciled",
                _json({"cycle_id": int(cycle_id), **reconciled}))
     reading = MDSvc.read_snapshot(
         MDC.LIVE_MARKET_POLICY, now=instant, asof_day=asof_day)
@@ -7524,7 +7169,7 @@ def _build_portfolio_entry_plan(conn, *, cycle_id, asof_day, decision_at,
                          f":account:{account_id}:symbol:{symbol}"),
     ))
     plan = PAS.capture_portfolio_allocation_plan(
-        conn, config=_portfolio_allocation_service_config(conn),
+        conn, config=portfolio_allocation_service_config(conn),
         portfolio_snapshot_id=snapshot["snapshot_id"],
         allocation_weights=weights["weights"],
         allocation_weights_source_identity=weights["source_identity"],
@@ -7736,7 +7381,7 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots,
     day = _date(asof_day)
     if day != dt.date.today():
         return {"allowed": True, "phase": "historical_replay", "reason": "历史回放不使用实时释位时钟"}
-    cycle = _active_cycle(conn)
+    cycle = load_active_cycle(conn)
     first_trade_day = _cycle_first_trade_day(cycle)
     if day != first_trade_day:
         return {
@@ -7938,7 +7583,7 @@ def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     显式周期，而簇画像的持仓与成交证据仍来自 active cycle（甚至 as-of 之后）。
     """
     explicit_cycle = cycle_id is not None
-    cycle_id = int(cycle_id) if explicit_cycle else int(_active_cycle(conn)["id"])
+    cycle_id = int(cycle_id) if explicit_cycle else int(load_active_cycle(conn)["id"])
     explicit_empty_cycle = (
         explicit_cycle and PCY.explicit_empty_cycle(conn, cycle_id))
     hard_pool_cap = int(RSET.get(conn, "shared_pool_position_limit", SHARED_POOL_MAX_POSITIONS))
@@ -8266,12 +7911,8 @@ def execution_profile_center():
 
 
 def _evolution_conn():
-    """打开自进化参数仓（adaptive_learning.sqlite3）连接；调用方负责关闭。"""
-    import db_migrate as DBM
-
-    conn = sqlite3.connect(DBM.DB_PATHS["adaptive_learning"], timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """打开自进化参数仓连接；调用方负责关闭（公开面在 ``paper_storage``）。"""
+    return PST.evolution_connection()
 
 
 def strategy_champion_overview():
@@ -8288,7 +7929,7 @@ def strategy_champion_overview():
             }
         finally:
             evo_conn.close()
-        rows = _rows(conn.execute(
+        rows = query_rows(conn.execute(
             """SELECT id,strategy_id,role,params,base_version_id,base_checksum,
                       shadow_param_version_id,source,status,proposed_at,evaluated_at,metrics,decision
                  FROM strategy_champion_versions ORDER BY id DESC LIMIT 80"""
@@ -8642,7 +8283,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # Pause/reset may happen while a scheduled scan is already in progress.
     # Re-read the account and cycle immediately before any execution decision.
     current_account = conn.execute("SELECT status,cycle_id FROM paper_accounts WHERE id=?", (account["id"],)).fetchone()
-    current_cycle = _active_cycle(conn)
+    current_cycle = load_active_cycle(conn)
     if not current_account or current_account["status"] != "running" or current_account["cycle_id"] != current_cycle["id"]:
         return {
             "code": signal["code"], "status": "risk_rejected",
@@ -9646,12 +9287,12 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # cannot reserve a second slot or cash on the following scan.
     _supersede_signal_execution_retries(conn, signal.get("id"))
     _assert_active_lease(conn, "strategy buy order write")
-    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
+    strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
         conn, account["id"], signal.get("id"), cycle_id=current_cycle["id"],
     )
     # PR-29：同一信号重建的新委托记录审计血缘——上一条终态尝试的 order id。
     retry_of_order_id = _previous_attempt_order_id(
-        conn, signal.get("id"), _order_cycle_id(conn, current_cycle["id"]),
+        conn, signal.get("id"), order_cycle_id(conn, current_cycle["id"]),
     )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
@@ -9668,7 +9309,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
          None, None, order_status, reason,
          _json(risk), _now(), None, dispatch_plan["expires_at"],
          strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
-          _order_cycle_id(conn, current_cycle["id"]), allocation_intent_kind,
+          order_cycle_id(conn, current_cycle["id"]), allocation_intent_kind,
           exact_plan["portfolio_snapshot_id"], exact_plan["plan_id"],
           exact_plan["plan_fingerprint"], exact_plan["allocation_policy_version"]),
     )
@@ -9757,7 +9398,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 "UPDATE paper_signals SET status='shadow_q3', reason=?, payload=? WHERE id=?",
                 (reason, _json({**payload, "q3_shadow": q3_shadow_detail}), signal["id"]),
             )
-            _audit(conn, account["id"], "q3_shadow_candidate", f"{code}：{reason}")
+            audit(conn, account["id"], "q3_shadow_candidate", f"{code}：{reason}")
             return {
                 "filled": False, "shadow": True, "status": "shadow_q3",
                 "code": code, "qty": 0, "reason": reason,
@@ -9819,7 +9460,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     if ET is not None:
         ET.mark_entered(account["id"], code, fill_price)
     if exceptional.get("approved"):
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         _observe_intraday(
             conn, cycle["id"], account["id"], code, fill_price, "exceptional_entry",
             exceptional["reason"], {"signal_id": signal["id"], "sizing": sizing, "risk": risk},
@@ -9889,7 +9530,7 @@ def process_pending_execution_orders(asof_date=None):
     day = _date(asof_date)
     placeholders = "?,?"
     with _db() as snapshot_conn:
-        candidates = _rows(
+        candidates = query_rows(
             snapshot_conn,
             f"""SELECT id,code FROM paper_orders
                  WHERE COALESCE(origin,'strategy')<>'manual'
@@ -9907,7 +9548,7 @@ def process_pending_execution_orders(asof_date=None):
     )
     output = []
     with _db(immediate=True) as conn:
-        active = _rows(
+        active = query_rows(
             conn,
             f"""SELECT * FROM paper_orders
                  WHERE COALESCE(origin,'strategy')<>'manual'
@@ -10072,7 +9713,7 @@ def execute_open(asof_date=None):
         # 冻结等待池只预取 5 天内的信号；更老的会在下方统一按过期处理，
         # 不值得为它们消耗行情/新闻配额。
         _waitlist_cutoff = (day - dt.timedelta(days=5)).isoformat()
-        prefetch_pending = _rows(
+        prefetch_pending = query_rows(
             prefetch_conn,
             """SELECT code,name FROM paper_signals
                WHERE (status=? AND intended_date>?) OR (status='pending' AND intended_date<=?)
@@ -10095,7 +9736,7 @@ def execute_open(asof_date=None):
         accounts = _active_account_rows(conn, status="running")
         # Limited slots must be won by the strongest live candidate, not by
         # whichever signal happened to be inserted first.
-        pending = _rows(
+        pending = query_rows(
             conn,
             """SELECT * FROM paper_signals
                WHERE status IN ('pending',?)
@@ -10268,7 +9909,7 @@ def _rollback_slot_borrow(conn, borrow, *, cycle_id):
 
     R18：``cycle_id`` 是 **keyword-only 且必填**，并且必须是**当初借位时那个周期**。
     一次 borrow 生命周期必须 ``same cycle in → same cycle out``：若回滚去问
-    ``_active_cycle()``，周期翻转后会把 cycle 8 的借位从 cycle 9 的版本行里回滚
+    ``load_active_cycle()``，周期翻转后会把 cycle 8 的借位从 cycle 9 的版本行里回滚
     （或在 cycle 9 找不到行而静默留下泄漏的席位），§13/§40。
     """
     if not borrow or not borrow.get("allowed") or borrow.get("rolled_back"):
@@ -10443,7 +10084,7 @@ def monitor_risk(asof_date=None):
     with _db(immediate=True, hot_path=True) as conn:
         _assert_active_lease(conn, "risk scan claim")
         scan_context = {
-            "cycle_id": int(_active_cycle(conn)["id"]),
+            "cycle_id": int(load_active_cycle(conn)["id"]),
             "asof_date": day.isoformat(),
             "scan_minute": run_at.strftime("%Y-%m-%d %H:%M"),
             "started_at": run_at.strftime("%Y-%m-%d %H:%M:%S"),
@@ -10458,13 +10099,13 @@ def monitor_risk(asof_date=None):
                 "status": "already_scanned",
                 "reason": f"{scan_context['scan_minute']} 风控扫描已由同一调度周期完成",
             }
-        _audit(conn, None, "risk_scan_claimed", _json(dict(scan_context)))  # 仅可观测
+        audit(conn, None, "risk_scan_claimed", _json(dict(scan_context)))  # 仅可观测
     try:
         result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])
         with _db(immediate=True, hot_path=True) as conn:
             _assert_active_lease(conn, "risk scan completion")
             PRSS.complete_scan(conn, **ident, finished_at=_now())
-            _audit(conn, None, "risk_scan_completed", _json(dict(ident)))
+            audit(conn, None, "risk_scan_completed", _json(dict(ident)))
         return result
     except Exception as exc:
         if _lease_lost(exc):
@@ -10475,7 +10116,7 @@ def monitor_risk(asof_date=None):
                 # 异常也会走到这里，把仍 running 的同一身份推进到 failed（无 orphan）。
                 PRSS.fail_scan(conn, **ident, finished_at=_now(),
                                error=f"{type(exc).__name__}: {exc}")
-                _audit(conn, None, "risk_scan_failed", _json({
+                audit(conn, None, "risk_scan_failed", _json({
                     **ident,
                     "failure_code": ("cycle_changed"
                                      if isinstance(exc, PRSS.RiskScanCycleChanged) else "error"),
@@ -10690,7 +10331,7 @@ def _bootstrap_cooled_candidates(conn, account_id, candidates, day):
     candidates = [dict(item) for item in (candidates or [])]
     candidate_codes = {str(item.get("code") or "") for item in candidates}
     deferred_discards = set()
-    recheck_rows = _rows(
+    recheck_rows = query_rows(
         conn,
         """SELECT code,payload FROM paper_signals
            WHERE account_id=? AND intended_date=?
@@ -10814,7 +10455,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
             complete_day = U.latest_complete_trade_date(day)
             lag = _trading_weekday_lag(factor_date, complete_day)
             meta = _selection_factor_cache_meta()
-            freshness = _selection_factor_freshness(
+            freshness = selection_factor_freshness(
                 factor_table, list(U.load_universe() or []), complete_day, meta=meta
             )
             factor_degraded = bool(lag == 1 and freshness.get("passed") and
@@ -10862,14 +10503,14 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # 证据按账户预取一次，写事务内只读这份快照。
     bootstrap_evidence = prepared.evidence_by_account
     with PTM.phase("candidate.writer"), _db(immediate=True) as conn:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         for account in accounts:
             try:
                 # 已成交或待执行的同一标的当天不可重复委托；但已有持仓、已有其他
                 # 候选均不能停止账户继续扫描。数量由资金/风险预算而非持仓个数约束。
                 actionable_codes = {
                     str(row["code"])
-                    for row in _rows(
+                    for row in query_rows(
                         conn,
                         """SELECT code FROM paper_signals
                            WHERE account_id=? AND intended_date=? AND status='pending'""",
@@ -10878,7 +10519,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 }
                 filled_codes = {
                     str(row["code"])
-                    for row in _rows(
+                    for row in query_rows(
                         conn,
                         """SELECT code FROM paper_signals
                            WHERE account_id=? AND intended_date=? AND status='filled'""",
@@ -10887,7 +10528,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 }
                 deferred_codes = {
                     str(row.get("code") or "")
-                    for row in _rows(
+                    for row in query_rows(
                         conn,
                         """SELECT code FROM paper_signals
                            WHERE account_id=? AND intended_date=?
@@ -10900,7 +10541,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 # 永远停在第一片（切片续跑是复核路径，不是重复开仓）。
                 staged_entry_codes = {
                     str(row["code"])
-                    for row in _rows(
+                    for row in query_rows(
                         conn,
                         """SELECT code,payload FROM paper_signals
                            WHERE account_id=? AND intended_date=?
@@ -10914,7 +10555,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 # 保留审计，下一交易日再用新的行情、量能和Q级重新评估。
                 chase_rejected_codes = {
                     str(row["code"])
-                    for row in _rows(
+                    for row in query_rows(
                         conn,
                         """SELECT code FROM paper_signals
                            WHERE account_id=? AND intended_date=? AND status='rejected'
@@ -10934,7 +10575,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     # "今日已卖出"是成交声称：只有被证据证明卖出的标的才进入回补池。
                     sold_today = {
                         str(row["code"])
-                        for row in _rows(
+                        for row in query_rows(
                             conn,
                             """SELECT DISTINCT code FROM paper_orders
                                WHERE account_id=? AND side='sell' AND status='filled'
@@ -11001,7 +10642,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     with PTM.phase("candidate.learning_snapshot"):
                         NL.capture_candidate_snapshot(account["id"], candidates, factor_day, slot=source_slot)
                 except Exception as exc:
-                    _audit(conn, account["id"], "candidate_snapshot_failed", f"{type(exc).__name__}: {exc}")
+                    audit(conn, account["id"], "candidate_snapshot_failed", f"{type(exc).__name__}: {exc}")
                 for candidate in candidates:
                     candidate["microstructure"] = global_microstructure_map.get(
                         str(candidate.get("code") or ""),
@@ -11018,7 +10659,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         conn, account["id"], cycle_id=cycle["id"],
                         account_cycle_id=account["cycle_id"], asof_day=day.isoformat())
                 if bootstrap_error is not None:
-                    _audit(conn, account["id"], bootstrap_error.event, bootstrap_error.detail)
+                    audit(conn, account["id"], bootstrap_error.event, bootstrap_error.detail)
                     _observe_intraday(conn, cycle["id"], account["id"], None, None, "scan",
                                       bootstrap_error.detail, {"provenance_unprovable": True})
                     continue
@@ -11217,7 +10858,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 )
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-                _audit(conn, account["id"], "account_scan_error", error)
+                audit(conn, account["id"], "account_scan_error", error)
                 item = {"id": account["id"], "status": "error", "reason": error,
                         "candidates": 0, "approved": 0, "full_market_scan": None}
                 result["accounts"].append(item)
@@ -11305,7 +10946,7 @@ def run_auction_preselection(asof_date=None, force=False):
         "execution_note": "仅预选；09:31 开盘审批仍需最新有效实时行情通过后才可成交",
     })
     with _db() as conn:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         for account in _active_account_rows(conn, status="running"):
             _observe_intraday(
                 conn, cycle["id"], account["id"], None, None, "auction_preselect",
@@ -11345,7 +10986,7 @@ def _existing_position_addition_gate(conn, account, code, asof_day, quote=None,
     pool_limit = int(slot_plan["total_cap"])
     if pool_count > pool_limit:
         return False, f"总持仓 {pool_count}/{pool_limit} 超限，暂停追加仓位"
-    cycle = _active_cycle(conn)
+    cycle = load_active_cycle(conn)
     review = conn.execute(
         """SELECT score,action FROM paper_position_reviews
            WHERE cycle_id=? AND account_id=? AND code=?
@@ -11578,8 +11219,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     savepoint = f"intraday_sell_{account['id']}_{position['code']}"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        sell_cycle_id = _order_cycle_id(conn, cycle["id"])
-        strategy_stamp = _strategy_stamp(conn, account["id"])
+        sell_cycle_id = order_cycle_id(conn, cycle["id"])
+        strategy_stamp = resolve_strategy_stamp(conn, account["id"])
         cursor = conn.execute(
             """INSERT INTO paper_orders(
                    account_id,side,code,name,qty,planned_price,status,reason,
@@ -11995,7 +11636,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
         return {"status": "skipped", "slot": "opening_event", "date": day.isoformat(), "clock": clock,
                 "reason": "不在开盘事件窗口"}
     with _db() as snapshot_conn:
-        cycle = _active_cycle(snapshot_conn)
+        cycle = load_active_cycle(snapshot_conn)
         accounts = _active_account_rows(snapshot_conn, status="running")
         positions = [p for account in accounts for p in _position_rows(snapshot_conn, account["id"], day)]
     if not positions:
@@ -12007,7 +11648,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
     with _db(immediate=True, hot_path=True) as conn:
         # Re-read mutable account/position state after network evidence is
         # ready; a concurrent pause/reset can only reduce the work performed.
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
         if not positions:
@@ -12164,7 +11805,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
             # 2) 主力策略当日观察池信号——主力候选多数被容量/资金拦下而非
             #    入场时机，若只扫第一类，主力股票永远进不了 30 秒通道
             #    （2026-08-31 复核确认的 P0）。
-            candidates = _rows(
+            candidates = query_rows(
                 snapshot_conn,
                 f"""SELECT s.* FROM paper_signals s
                     JOIN (
@@ -12177,7 +11818,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     ORDER BY s.t_score DESC,s.rank_score DESC,s.id DESC LIMIT 20""",
                 (day.isoformat(), *ENTRY_RETRY_SIGNAL_STATUSES),
             )
-            main_force_candidates = _rows(
+            main_force_candidates = query_rows(
                 snapshot_conn,
                 f"""SELECT s.* FROM paper_signals s
                     JOIN (
@@ -12280,7 +11921,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                         "UPDATE paper_signals SET payload=? WHERE id=?",
                         (_json(payload), signal["id"]),
                     )
-            _audit(conn, None, "fast_entry_monitor", _json({
+            audit(conn, None, "fast_entry_monitor", _json({
                 "checked": checked, "confirmed": len(confirmed), "orders_created": 0,
                 "candidate_codes": sorted(candidate_codes),
                 "interval_seconds": 30,
@@ -12318,7 +11959,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     except Exception as exc:
         try:
             with _db() as clean_conn:
-                _audit(clean_conn, None, "cleanup_stale_data_error", _json({"error": f"{type(exc).__name__}: {exc}"}))
+                audit(clean_conn, None, "cleanup_stale_data_error", _json({"error": f"{type(exc).__name__}: {exc}"}))
         except Exception:
             pass
     # 每轮 3 分钟扫描先做轻量数据源探活；失败时 data_fetcher 会关闭连接池、
@@ -12376,7 +12017,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                      snapshot_price_only=snapshot_source.get("price_only"),
                      snapshot_flow_coverage=flow_coverage, scan_ready=live_gate["ready"])
         with _db() as gate_conn:
-            _audit(gate_conn, None, "live_scan_gate", _json({
+            audit(gate_conn, None, "live_scan_gate", _json({
                 "ready": scan_ready,
                 "covered_codes": live_gate["covered_codes"],
                 "eligible_codes": live_gate["eligible_codes"],
@@ -12409,7 +12050,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             fb_gate = _live_scan_gate(fb_universe, day)
             if fb_gate["ready"]:
                 with _db() as fb_conn:
-                    _audit(fb_conn, None, "live_scan_gate_fallback", _json({
+                    audit(fb_conn, None, "live_scan_gate_fallback", _json({
                         "fallback_covered": fb_gate["covered_codes"],
                         "fallback_eligible": fb_gate["eligible_codes"],
                         "fallback_coverage_pct": fb_gate["coverage_pct"],
@@ -12419,7 +12060,7 @@ def monitor_intraday(asof_datetime=None, force=False):
         except Exception as exc:
             try:
                 with _db() as fb_err_conn:
-                    _audit(fb_err_conn, None, "live_scan_gate_fallback_error", _json({
+                    audit(fb_err_conn, None, "live_scan_gate_fallback_error", _json({
                         "error": f"{type(exc).__name__}: {exc}",
                     }))
             except Exception:
@@ -12485,7 +12126,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     # pinned to ``live_universe`` from this scan.
     live_market = _market_state(day, live_universe=live_universe, allow_network=True)
     with _db() as snapshot_conn:
-        cycle = _active_cycle(snapshot_conn)
+        cycle = load_active_cycle(snapshot_conn)
         accounts = _active_account_rows(snapshot_conn, status="running")
         positions = [p for account in accounts for p in _position_rows(snapshot_conn, account["id"], day)]
     if not positions:
@@ -12505,7 +12146,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     # 未污染的 quotes）。必须在写事务外生成——内部读取本地快照文件。
     nav_quotes = _nav_quotes_with_snapshot_fallback(quotes)
     with _db(immediate=True, hot_path=True) as conn:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
         if not positions:
@@ -12753,7 +12394,7 @@ def _nav_quotes_with_snapshot_fallback(quotes):
 @PTM.timed("execution.nav_write")
 def _record_nav(conn, asof_day, quotes=None):
     _assert_active_lease(conn, "NAV write")
-    accounts = _rows(conn, "SELECT * FROM paper_accounts")
+    accounts = query_rows(conn, "SELECT * FROM paper_accounts")
     all_positions = _position_rows(conn, asof_day=asof_day)
     # NAV persistence is commonly called while the ledger write transaction
     # is open.  Never perform provider or disk I/O while holding that
@@ -12811,7 +12452,7 @@ def _record_nav(conn, asof_day, quotes=None):
         )
     if fallback_accounts:
         try:
-            _audit(
+            audit(
                 conn, None, "nav_record_skipped",
                 f"{'、'.join(fallback_accounts)} 的持仓行情缺失（{','.join(missing_codes)[:200]}），"
                 "本次按成本价一致估值并标记 cost_fallback；行情恢复后下一轮自动重估",
@@ -12822,10 +12463,10 @@ def _record_nav(conn, asof_day, quotes=None):
 
 def _weekly_review(conn, day):
     week = f"{day.isocalendar().year}-W{day.isocalendar().week:02d}"
-    accounts = _rows(conn, "SELECT * FROM paper_accounts")
+    accounts = query_rows(conn, "SELECT * FROM paper_accounts")
     output = []
     for account in accounts:
-        nav_rows = _rows(conn, "SELECT * FROM paper_nav WHERE account_id=? ORDER BY nav_date", (account["id"],))
+        nav_rows = query_rows(conn, "SELECT * FROM paper_nav WHERE account_id=? ORDER BY nav_date", (account["id"],))
         navs = [r["nav"] for r in nav_rows]
         reference_capital = _account_reference_capital(account)
         peak = navs[0] if navs else reference_capital
@@ -12833,10 +12474,10 @@ def _weekly_review(conn, day):
         for nav in navs:
             peak = max(peak, nav)
             max_dd = min(max_dd, nav / peak - 1 if peak else 0)
-        fills = _rows(conn, "SELECT * FROM paper_fills WHERE account_id=?", (account["id"],))
+        fills = query_rows(conn, "SELECT * FROM paper_fills WHERE account_id=?", (account["id"],))
         # 已平仓笔数是**执行绩效**口径：只有被证据证明的成交才算平仓，
         # "账本自称成交"的旧行不得抬高样本量去触发参数自动微调。
-        closed = _rows(
+        closed = query_rows(
             conn,
             "SELECT * FROM paper_orders WHERE account_id=? AND side='sell'"
             " AND status='filled' AND " + _execution_verified_predicate(),
@@ -12864,7 +12505,7 @@ def _weekly_review(conn, day):
                 version = f"v3.{week.split('W')[-1]}"
                 reason = "本周负收益，提高策略专属入场门槛" if ret < 0 else "本周正收益，小幅放宽策略专属入场门槛"
                 conn.execute("UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?", (_json(params), version, _now(), account["id"]))
-                cycle = _active_cycle(conn)
+                cycle = load_active_cycle(conn)
                 conn.execute(
                     "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (cycle["id"], account["id"], version, account.get("style") or "pullback", _json(params), reason, effective, _now()),
@@ -13151,7 +12792,7 @@ def _cleanup_stale_data():
         cleaned.update(PJL.prune_jobs(conn))
 
         # 记录清理日志
-        _audit(conn, None, "cleanup_stale_data", _json(cleaned))
+        audit(conn, None, "cleanup_stale_data", _json(cleaned))
         conn.commit()
 
     # H9: 归档删除是批量写，显式收缩 WAL，避免 -wal 无界增长。
@@ -13182,7 +12823,7 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
     with PTM.phase("preflight"):
         PSS.run_preflight(
             db_factory=_db,
-            audit=_audit,
+            audit=audit,
             resolve_asof_day=lambda: _date(asof_date),
         )
     day = _date(asof_date)
@@ -13641,7 +13282,7 @@ def _store_archive_order_projection(signature, rows):
 def _archived_order_rows(conn):
     """Return a cached, UI-safe projection of immutable archived orders."""
     try:
-        archive_meta = _rows(
+        archive_meta = query_rows(
             conn,
             "SELECT id,cycle_key,created_at,length(snapshot) AS snapshot_bytes "
             "FROM paper_archives ORDER BY id DESC",
@@ -13667,7 +13308,7 @@ def _archived_order_rows(conn):
         return [dict(row) for row in projected_rows]
 
     try:
-        archives = _rows(conn, "SELECT id,cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
+        archives = query_rows(conn, "SELECT id,cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
     except sqlite3.Error:
         archives = []
     archived_rows = PAP.project_order_rows(archives, _loads)
@@ -13796,13 +13437,13 @@ def stock_trade_history(code, account_id=None):
     # run reconciliation writes and intermittently returned HTTP 500 whenever
     # the intraday scanner held the SQLite writer.
     with _db_readonly() as conn:
-        accounts = _rows(conn, "SELECT id,name FROM paper_accounts")
+        accounts = query_rows(conn, "SELECT id,name FROM paper_accounts")
         account_names = {item["id"]: item["name"] for item in accounts}
         if account_id and account_id not in account_names:
             raise ValueError("unknown paper account")
         where = "WHERE o.code=?" + (" AND o.account_id=?" if account_id else "")
         args = (code, account_id) if account_id else (code,)
-        orders = _rows(
+        orders = query_rows(
             conn,
             f"""SELECT o.*,
                          (SELECT MAX(f.fill_date) FROM paper_fills f WHERE f.order_id=o.id) AS fill_date,
@@ -13820,7 +13461,7 @@ def stock_trade_history(code, account_id=None):
                 order.get("execution_evidence"), order.get("execution_reasons"),
             ))
             order.pop("execution_evidence", None)
-        fills = _rows(
+        fills = query_rows(
             conn,
             "SELECT * FROM paper_fills WHERE code=?" + (" AND account_id=?" if account_id else "") + " ORDER BY fill_date DESC, id DESC",
             args,
@@ -13833,7 +13474,7 @@ def stock_trade_history(code, account_id=None):
             fill.pop("execution_evidence", None)
         # 重置周期会将账本归档成只读快照；个股档案必须同时查询这些归档，
         # 否则“全部历史”会在重置后错误地只剩当前周期。
-        archives = _rows(conn, "SELECT cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
+        archives = query_rows(conn, "SELECT cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
         for archive in archives:
             snapshot = _loads(archive.get("snapshot"), {}) or {}
             archived_accounts = {
@@ -14103,7 +13744,7 @@ def _risk_base_dashboard():
         for quote in quotes.values():
             quote.setdefault("quote_source", "dashboard_cache")
             quote.setdefault("quote_validation", "dashboard_cached")
-        review_rows = _rows(
+        review_rows = query_rows(
             conn,
             """SELECT * FROM paper_position_reviews
                WHERE cycle_id=? AND id IN (
@@ -14150,7 +13791,7 @@ def _risk_base_dashboard():
             position["super_net"] = quote.get("super_net")
             position["risk_price"] = round(_num(position.get("cost")) * (1 + spec["hard_stop"]), 3)
             position["t1_status"] = "可卖" if int(position.get("available_qty") or 0) > 0 else "今日不可卖"
-        risk_decisions = _rows(
+        risk_decisions = query_rows(
             conn,
             """SELECT id,account_id,code,side,decision,reason,created_at
                FROM paper_risk_decisions ORDER BY id DESC LIMIT 60""",
@@ -14377,7 +14018,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
     # schema maintenance belongs to the scheduler/API write paths.
     try:
         with _db_readonly() as conn:
-            accounts = _rows(conn, "SELECT id,name FROM paper_accounts ORDER BY id")
+            accounts = query_rows(conn, "SELECT id,name FROM paper_accounts ORDER BY id")
             cycle_id = _active_cycle_id_readonly(conn)
             scan_status = (PRSS.latest_scan(conn, cycle_id=cycle_id,
                                              asof_date=dt.date.today().isoformat())
@@ -14408,7 +14049,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
             else:
                 query = f"""SELECT {columns} FROM paper_risk_decisions
                     WHERE {page_where} ORDER BY id DESC LIMIT ?"""
-            decisions = _rows(conn, query, (*page_params, fetch_limit + 1))
+            decisions = query_rows(conn, query, (*page_params, fetch_limit + 1))
             has_next = len(decisions) > fetch_limit
             decisions = decisions[:fetch_limit]
             decision_keys = {
@@ -14425,7 +14066,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
                 # one of the visible decisions.  Reading every historical
                 # pending/waitlist signal grew without bound and made a page
                 # refresh contend with the scanner's SQLite work.
-                signal_rows = _rows(
+                signal_rows = query_rows(
                     conn,
                     f"""SELECT id,account_id,code,status,intended_date,created_at
                         FROM paper_signals
@@ -14434,7 +14075,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
                         ORDER BY id DESC""",
                     key_params,
                 )
-                for row in _rows(
+                for row in query_rows(
                     conn,
                     f"SELECT account_id,code,name FROM paper_positions WHERE {key_clause}",
                     key_params,
@@ -14445,7 +14086,7 @@ def risk_audit(limit=160, *, page_size=None, account_id=None,
                 # The display fallback only needs one immutable order label
                 # per account/code.  Loading every matching historical order
                 # makes a risk refresh grow with the lifetime of the ledger.
-                for row in _rows(
+                for row in query_rows(
                     conn,
                     f"""SELECT o.account_id,o.code,o.name
                         FROM paper_orders o
@@ -14590,12 +14231,12 @@ def _cycle_snapshot(conn):
     ``paper_trading`` 必须把这三处 cycle 操作显式转交给 ``PCS``，所以它即
     使当前没有调用方也**不可删除**（删掉等于悄悄取消一个已声明的边界）。
     """
-    return PCS.cycle_snapshot(conn, _active_cycle(conn))
+    return PCS.cycle_snapshot(conn, load_active_cycle(conn))
 
 
-def _archive_current_cycle(conn, reason):
+def archive_current_cycle(conn, reason):
     """PR-58：归档实现已移至 ``paper_cycle_service``（存档 + 翻状态 + 清表 + 审计）。"""
-    return PCS.archive_cycle(conn, _active_cycle(conn), reason)
+    return PCS.archive_cycle(conn, load_active_cycle(conn), reason)
 
 
 def _cycle_capital_shares(enabled_strategies):
@@ -14620,7 +14261,7 @@ def _cycle_capital_shares(enabled_strategies):
     return {item: equal for item in ids}
 
 
-def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", duration_days=None, enabled_strategies=None):
+def create_cycle(conn, capital, status="paused", reason="新建模拟周期", duration_days=None, enabled_strategies=None):
     capital = _validate_capital(capital)
     if duration_days is None:
         duration_days = int(RSET.get(conn, "cycle_duration_days", 0) or 0)
@@ -14721,7 +14362,7 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
                      (cycle_id, account_id, spec.get("strategy_version") or "v3.0", style, initial_params, reason, _date().isoformat(), param_stamp))
     SR.bind_cycle_versions(conn, cycle_id, enabled_strategies)
-    _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，启用 {len(enabled_strategies)} 套策略，周期 {RSET.cycle_duration_label(duration_days)}，{reason}")
+    audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，启用 {len(enabled_strategies)} 套策略，周期 {RSET.cycle_duration_label(duration_days)}，{reason}")
     return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital, "duration_days": duration_days, "enabled_strategies": enabled_strategies}
 
 
@@ -14730,7 +14371,7 @@ def configure_capital(capital):
     capital = _validate_capital(capital)
     init_db()
     with _db() as conn:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         if cycle["status"] == "running":
             raise ValueError("当前周期运行中，请先暂停后再修改资金")
         activity = conn.execute("SELECT COUNT(*) FROM paper_orders WHERE status='filled'").fetchone()[0]
@@ -14741,7 +14382,7 @@ def configure_capital(capital):
         configured = _loads(cycle.get("enabled_strategies"), None)
         enabled_ids = (tuple(configured) if isinstance(configured, list) and configured
                        else tuple(ACTIVE_ACCOUNT_IDS))
-        # 与 _create_cycle 用同一套份额：三策略周期按 20/50/30 归属，其他组合等额。
+        # 与 create_cycle 用同一套份额：三策略周期按 20/50/30 归属，其他组合等额。
         # 否则"暂停期改资金"会把三策略的参考本金改回各三分之一，而权重声明仍是
         # 20/50/30，收益率分母与分配权重从此不一致。
         shares = _cycle_capital_shares(enabled_ids)
@@ -14761,7 +14402,7 @@ def configure_capital(capital):
                 "  SELECT id FROM paper_nav WHERE account_id=? ORDER BY nav_date DESC, id DESC LIMIT 1)",
                 (share, share, account_id),
             )
-        _audit(conn, None, "capital_configured",
+        audit(conn, None, "capital_configured",
                f"共享模拟资金池草稿设为 {capital:.2f} 元；策略归属按名册比例（{len(active_ids)} 套）")
     return dashboard()
 
@@ -14777,11 +14418,11 @@ def start_new_cycle(capital=None, include_dashboard=True):
     with _db() as conn:
         if capital is None:
             capital = RSET.get(conn, "default_starting_capital", 300000.0)
-        current = _active_cycle(conn)
+        current = load_active_cycle(conn)
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停再启动新周期")
-        _archive_current_cycle(conn, "用户保存资金并启动新周期")
-        cycle = _create_cycle(conn, capital, status="running", reason="保存资金并启动")
+        archive_current_cycle(conn, "用户保存资金并启动新周期")
+        cycle = create_cycle(conn, capital, status="running", reason="保存资金并启动")
     summary = dashboard() if include_dashboard else {
         "cycle": cycle,
         # PR-47：显式空启用集合 = idle 周期，策略数如实显示 0。
@@ -14801,11 +14442,11 @@ def reset_cycle(capital=None, include_dashboard=True):
     with _db() as conn:
         if capital is None:
             capital = RSET.get(conn, "default_starting_capital", 300000.0)
-        current = _active_cycle(conn)
+        current = load_active_cycle(conn)
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停后再完全重置")
-        _archive_current_cycle(conn, "用户完全重置")
-        cycle = _create_cycle(conn, capital, status="paused", reason="完全重置后等待启动")
+        archive_current_cycle(conn, "用户完全重置")
+        cycle = create_cycle(conn, capital, status="paused", reason="完全重置后等待启动")
     if include_dashboard:
         return dashboard(), cycle
     return {
@@ -14822,11 +14463,11 @@ def set_account_style(account_id, style):
         raise ValueError("风格必须是 strong、pullback、sector、quality 或 main_force")
     init_db()
     with _db() as conn:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         if cycle["status"] == "running":
             raise ValueError("当前周期运行中，暂停后才能调整策略风格")
         conn.execute("UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?", (style, _now(), account_id))
-        _audit(conn, account_id, "style_changed", f"后续候选风格切换为 {ACS.style_name(style)}；已有持仓不强平")
+        audit(conn, account_id, "style_changed", f"后续候选风格切换为 {ACS.style_name(style)}；已有持仓不强平")
     return dashboard()
 
 
@@ -14837,7 +14478,7 @@ def set_accounts_status(status, capital=None):
     if capital is not None:
         configure_capital(capital)
     with _db() as conn:
-        cycle = _active_cycle(conn)
+        cycle = load_active_cycle(conn)
         # 幂等：已是目标状态时直接返回当前状态，避免前端重复点击报 500
         # （此前 paused 再 pause / running 再 resume 都抛 ValueError）。
         if cycle["status"] == status:
@@ -14853,14 +14494,14 @@ def set_accounts_status(status, capital=None):
         )
         conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
                      (status, _now() if status == "running" else None, _now(), cycle["id"]))
-        _audit(conn, None, "accounts_" + status, f"{len(active_ids)}套当前策略模拟盘状态变更")
+        audit(conn, None, "accounts_" + status, f"{len(active_ids)}套当前策略模拟盘状态变更")
     return dashboard()
 
 
 def latest_reviews():
     init_db()
     with _db() as conn:
-        return _rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id")
+        return query_rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id")
 
 
 def schedule_status():
@@ -14882,14 +14523,14 @@ def schedule_status():
             found.extend(names)
     today = dt.date.today().isoformat()
     with _db_readonly() as conn:
-        latest = _rows(conn, """
+        latest = query_rows(conn, """
             SELECT slot,status,started_at,finished_at,detail
             FROM paper_jobs
             WHERE market_date=?
             ORDER BY COALESCE(finished_at,started_at) DESC
             LIMIT 12
         """, (today,))
-        intraday = _rows(conn, """
+        intraday = query_rows(conn, """
             SELECT run_key,status,started_at,finished_at,detail
             FROM paper_job_runs
             WHERE run_key LIKE ?
@@ -15045,3 +14686,16 @@ def _bind_application_dependencies():
 
 
 _bind_application_dependencies()
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_rows = query_rows
+_strategy_stamp = resolve_strategy_stamp
+_active_cycle = load_active_cycle
+_audit = audit
+_archive_current_cycle = archive_current_cycle
+_create_cycle = create_cycle
+_order_cycle_id = order_cycle_id
+_portfolio_allocation_service_config = portfolio_allocation_service_config
+_selection_factor_freshness = selection_factor_freshness
+_rebuild_selection_factor_cache = rebuild_selection_factor_cache

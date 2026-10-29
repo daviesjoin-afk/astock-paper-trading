@@ -30,13 +30,13 @@ def _run_spec(value: dict) -> SR.ShadowRunSpec:
 def _material(evidence: SR.ShadowRunEvidence) -> dict:
     return {
         "schema_version": SR.SHADOW_RUN_SCHEMA_VERSION,
-        "spec": SR._plain(evidence.spec),
-        "challenger_runtime_inputs": SR._plain(evidence.challenger_runtime_inputs),
-        "environment": SR._plain(evidence.environment),
+        "spec": SR.plain(evidence.spec),
+        "challenger_runtime_inputs": SR.plain(evidence.challenger_runtime_inputs),
+        "environment": SR.plain(evidence.environment),
         "strategy_definition_fingerprint": evidence.strategy_definition_fingerprint,
-        "before_state": SR._plain(evidence.before_state),
-        "decisions": SR._plain(evidence.decisions),
-        "after_state": SR._plain(evidence.after_state),
+        "before_state": SR.plain(evidence.before_state),
+        "decisions": SR.plain(evidence.decisions),
+        "after_state": SR.plain(evidence.after_state),
         "previous_run_fingerprint": evidence.previous_run_fingerprint,
     }
 
@@ -56,7 +56,7 @@ def append_run(conn: sqlite3.Connection, evidence: SR.ShadowRunEvidence) -> SR.S
         previous = get_run(conn, previous_id)
         if previous is None or previous.run_fingerprint != evidence.previous_run_fingerprint:
             raise ShadowRunRepositoryError("explicit_previous_shadow_run_required")
-        expected_before = SR._state_for_run(run_spec, previous).projection()
+        expected_before = SR.state_for_run(run_spec, previous).projection()
         if expected_before != evidence.before_state:
             raise ShadowRunRepositoryError("shadow_run_continuation_state_mismatch")
     elif evidence.previous_run_fingerprint is not None:

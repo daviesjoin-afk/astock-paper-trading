@@ -736,7 +736,7 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
             # A full-market cache is a formal input only when the writer
             # recorded a complete page set.  Legacy files without the marker
             # are treated as unknown and must be refreshed.
-            if pages is None and not _full_snapshot_payload_is_complete(payload):
+            if pages is None and not full_snapshot_payload_is_complete(payload):
                 return []
             return rows
         except (OSError, ValueError, TypeError):
@@ -875,7 +875,7 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
     if missing:
         missing_codes = set(missing)
         try:
-            alternate = _fetch_sina_realtime_for_codes(missing)
+            alternate = fetch_sina_realtime_for_codes(missing)
         except Exception:
             alternate = []
         for row in alternate:
@@ -958,7 +958,7 @@ def _persist_tencent_snapshot(snapshot, normalized):
     return True
 
 
-def _full_snapshot_payload_is_complete(payload):
+def full_snapshot_payload_is_complete(payload):
     """Validate the persisted full-market snapshot marker and row coverage."""
     if not isinstance(payload, dict) or payload.get("complete") is not True:
         return False
@@ -974,6 +974,7 @@ def _full_snapshot_payload_is_complete(payload):
     codes = {str(row.get("code") or "") for row in rows if isinstance(row, dict)}
     codes.discard("")
     return len(codes) >= max(_full_market_min_rows(), int(expected * 0.90))
+
 
 
 def full_market_snapshot_source():
@@ -1012,7 +1013,7 @@ def load_market_snapshot_full_payload():
 
     Callers that need the source metadata (``saved_at`` / ``expected_rows``)
     must use this instead of ``open()``-ing the cache file directly: the raw
-    file read skips ``_full_snapshot_payload_is_complete`` and would let a
+    file read skips ``full_snapshot_payload_is_complete`` and would let a
     truncated or legacy payload be counted as a normal snapshot.
     """
     try:
@@ -1020,7 +1021,7 @@ def load_market_snapshot_full_payload():
             payload = json.load(handle)
     except (OSError, ValueError, TypeError):
         return {}
-    if not _full_snapshot_payload_is_complete(payload):
+    if not full_snapshot_payload_is_complete(payload):
         return {}
     return payload
 
@@ -1034,7 +1035,7 @@ def _fresh_full_snapshot_from_disk(max_age):
         with open(MARKET_SNAPSHOT_FULL_CACHE_PATH, encoding="utf-8") as handle:
             payload = json.load(handle)
         rows = payload.get("rows") if isinstance(payload, dict) else None
-        if not _full_snapshot_payload_is_complete(payload):
+        if not full_snapshot_payload_is_complete(payload):
             return None
         # Content-level freshness: check newest quote_at timestamp.  Keep the
         # source timezone intact; forcing a UTC label makes Beijing timestamps
@@ -1200,7 +1201,7 @@ def _realtime_row_from_ulist(raw):
 _REALTIME_FIELDS = "f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62,f66,f72,f78,f84,f184,f100,f124"
 
 
-def _eastmoney_realtime_feed(fields=_REALTIME_FIELDS):
+def eastmoney_realtime_feed(fields=_REALTIME_FIELDS):
     return MDF.EastmoneyRealtimeFeed(
         get_json=_get_json,
         secid=_secid,
@@ -1212,17 +1213,18 @@ def _eastmoney_realtime_feed(fields=_REALTIME_FIELDS):
     )
 
 
+
 def fetch_realtime_for_codes(codes, fields=_REALTIME_FIELDS, return_meta=False):
     """Batch realtime quotes through the primary DataFeed adapter.
 
     The historical list/metadata return shapes stay unchanged so scan and
     execution callers keep their existing fail-closed coverage checks.
     """
-    feed = _eastmoney_realtime_feed(fields)
+    feed = eastmoney_realtime_feed(fields)
     return feed.fetch_realtime_with_meta(codes) if return_meta else feed.fetch_realtime(codes)
 
 
-def _tencent_realtime_feed():
+def tencent_realtime_feed():
     return MDF.TencentRealtimeFeed(
         http_get=http_get,
         parser=MP.parse_tencent_realtime_text,
@@ -1231,7 +1233,8 @@ def _tencent_realtime_feed():
     )
 
 
-def _sina_realtime_feed():
+
+def sina_realtime_feed():
     return MDF.SinaRealtimeFeed(
         session_factory=_session,
         headers=HEADERS,
@@ -1239,6 +1242,7 @@ def _sina_realtime_feed():
         reset_data_source=reset_data_source,
         sleep=time.sleep,
     )
+
 
 
 def _ths_realtime_feed():
@@ -1254,7 +1258,7 @@ def _independent_realtime_feed():
     # 腾讯 → 新浪 → 同花顺。前两家都缺价时才启用同花顺（单票一请求，上限 8 只），
     # 让"独立核验源整体不可用"不再等于"只能按单一源价格决策"。
     return MDF.DataFeedChain(
-        (_tencent_realtime_feed(), _sina_realtime_feed(), _ths_realtime_feed()),
+        (tencent_realtime_feed(), sina_realtime_feed(), _ths_realtime_feed()),
         reset_data_source=reset_data_source,
         sleep=time.sleep,
         retry_last_feed=True,
@@ -1264,12 +1268,13 @@ def _independent_realtime_feed():
 
 def fetch_tencent_realtime_for_codes(codes):
     """Independent Tencent quote source through the shared DataFeed contract."""
-    return _tencent_realtime_feed().fetch_realtime(codes)
+    return tencent_realtime_feed().fetch_realtime(codes)
 
 
-def _fetch_sina_realtime_for_codes(codes):
+def fetch_sina_realtime_for_codes(codes):
     """Independent Sina fallback through the shared DataFeed contract."""
-    return _sina_realtime_feed().fetch_realtime(codes)
+    return sina_realtime_feed().fetch_realtime(codes)
+
 
 
 def fetch_independent_realtime_for_codes(codes):
@@ -2181,3 +2186,11 @@ def fetch_hot_rank(topn=100):
             out.append({"code": sc[2:], "market": sc[:2], "rank": d.get("rk"), "rank_chg": d.get("hisRc")})
         return out
     return _cached(f"hot_{topn}", 300, _do)
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_eastmoney_realtime_feed = eastmoney_realtime_feed
+_fetch_sina_realtime_for_codes = fetch_sina_realtime_for_codes
+_full_snapshot_payload_is_complete = full_snapshot_payload_is_complete
+_sina_realtime_feed = sina_realtime_feed
+_tencent_realtime_feed = tencent_realtime_feed

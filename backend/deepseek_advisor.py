@@ -611,7 +611,7 @@ def market_research_events(snapshot_paths):
     )
 
 
-def _research_provider_config(connect_factory):
+def research_provider_config(connect_factory):
     """解析 canonical 槽位配置并**判定就绪** —— 已经迁移的 research 路径的 provider 凭据来源。
 
     本轮不新增 provider 配置模型，也没有第三套 API Key：槽位词表、解析与就绪判据都在
@@ -638,6 +638,7 @@ def _research_provider_config(connect_factory):
     if not readiness["ready"]:
         raise ResearchReadinessError(readiness["reason"])
     return cfg
+
 
 
 def _research_report_view(*, run_id, hypothesis, narrative, counter_arguments):
@@ -758,7 +759,7 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
                 "error_code": "market_evidence_unavailable", "latency_ms": 0}
     as_of = events[0].as_of
     try:
-        provider_config = _research_provider_config(connect_factory)
+        provider_config = research_provider_config(connect_factory)
         run = ai_research_service.run_research_run(
             connect_factory,
             purpose=RESEARCH_PURPOSE_DATA_QUALITY,
@@ -813,7 +814,7 @@ def _baseline_weights(account_id, overlay):
         return {}
 
 
-def _tuning_accounts(paper_db_path):
+def tuning_accounts(paper_db_path):
     """Only send current execution participants with tunable factors to the model."""
     import strategy_weight_scope as SCOPE
     try:
@@ -857,6 +858,7 @@ def _tuning_accounts(paper_db_path):
             "automatic_scope": "existing_factor_weights_only",
         })
     return accounts
+
 
 
 def _tuning_prompt(evidence, accounts, mode):
@@ -904,7 +906,7 @@ def _bounded_tuning_patch(account, proposal, model_id, base_weights, base_condit
         requested = {}
     requested = {key: requested.get(key, value) for key, value in base_weights.items()}
     try:
-        normalized = selection._normalize(requested)
+        normalized = selection.normalize(requested)
     except Exception:
         normalized = dict(base_weights)
     # Every automatic mode has the same hard limit.  ``mode`` is retained for
@@ -974,7 +976,7 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
             "quality": profile.get("quality"), "valid_rows": profile.get("valid_rows"),
             "source_at": profile.get("source_at"),
         }
-        accounts = _tuning_accounts(paper_db_path)
+        accounts = tuning_accounts(paper_db_path)
         min_interval = max(5, int(cfg.get("llm_realtime_min_interval_minutes", 15) or 15))
         last = conn.execute(
             "SELECT finished_at FROM adaptive_ai_tuning_runs ORDER BY id DESC LIMIT 1"
@@ -1061,8 +1063,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                 base_weights = dict(selection.BASE_WEIGHTS[model_id])
                 current_overlay = paper_accounts[account_id].get("weights") or {}
                 if set(current_overlay) == set(base_weights):
-                    base_weights = selection._normalize(current_overlay)
-                base_conditions = selection._conditions(model_id, paper_accounts[account_id].get("conditions") or {})
+                    base_weights = selection.normalize(current_overlay)
+                base_conditions = selection.account_conditions(model_id, paper_accounts[account_id].get("conditions") or {})
                 patch = _bounded_tuning_patch(paper_accounts[account_id], raw, model_id,
                                                base_weights, base_conditions, mode=mode)
                 if not patch:
@@ -1086,8 +1088,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                 effective_weights = paper_accounts[account_id].get("weights") or {}
                 if set(effective_weights) != set(selection.BASE_WEIGHTS[model_id]):
                     effective_weights = dict(selection.BASE_WEIGHTS[model_id])
-                baseline = {"weights": selection._normalize(effective_weights),
-                            "conditions": selection._conditions(model_id),
+                baseline = {"weights": selection.normalize(effective_weights),
+                            "conditions": selection.account_conditions(model_id),
                             "entry_score_delta": float(paper_accounts[account_id].get("entry_score_delta") or 0)}
                 candidate = item["candidate_params"]
                 # Fail closed permanently: DeepSeek cannot write an account,
@@ -1188,3 +1190,8 @@ def overview(conn, config=None):
             "latest": latest_tuning,
         },
     }
+
+# ---------------------------------------------------------------------------
+# 兼容别名：模块内部已全部改用公开名；下面这些只为旧调用方/旧测试保留。
+_research_provider_config = research_provider_config
+_tuning_accounts = tuning_accounts

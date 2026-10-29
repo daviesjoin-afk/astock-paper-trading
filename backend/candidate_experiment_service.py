@@ -54,7 +54,7 @@ def prepare_candidate_experiment(conn, *, job_id, session_calendar, universe_arc
         raise CandidateExperimentUnavailable("historical_session_calendar_unavailable")
     if session_calendar.coverage_start != plan.start_date or session_calendar.coverage_end != plan.end_date:
         raise CandidateExperimentUnavailable("historical_session_calendar_unavailable")
-    members = RUNNER._universe_rows(universe_archive_repository, plan.universe_archive_fingerprint,
+    members = RUNNER.universe_rows(universe_archive_repository, plan.universe_archive_fingerprint,
                                     session_calendar.sessions)
     try:
         members = CE.filter_candidate_members(replay, members, plan.universe_archive_fingerprint)
@@ -103,7 +103,7 @@ def complete_candidate_pit_job(conn, *, job_id, run_key, validation_repository,
               "financial_archive_fingerprint": run["financial_archive_fingerprint"],
               "dataset_fingerprint": run["dataset_fingerprint"], "experiment_subject": run["subject"],
               "experiment_plan_fingerprint": run["experiment_plan_fingerprint"],
-              "validation_evidence_fingerprint": EC._digest(evidence)}
+              "validation_evidence_fingerprint": EC.digest(evidence)}
     if EVR.ExperimentValidationRepository.build_run_key(spec.fingerprint, owners, run["runner_version"]) != run_key:
         raise CandidateExperimentUnavailable("validation_evidence_identity_mismatch")
     conn.execute("BEGIN IMMEDIATE")
