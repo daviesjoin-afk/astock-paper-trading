@@ -49,6 +49,38 @@
 
 ## 本次切片
 
+- 2026-10-29（对抗性审查落地 + adaptive 库 schema 收口）
+  - **度量事实化**：`coupling_metrics` 新增三项事实指标并进 `HEAD_BUDGET`，额度 0——
+    `injected_private_fields`（*Dependencies 容器上的私有字段名，66）、
+    `from_import_private_names`（`from x import _y`，63）、`dynamic_name_bridges`
+    （`globals()[...]` / `getattr(x, 计算值)` / `sys.modules[...]`，80）。旧指标
+    `private_cross_access = 6` 只覆盖 `import 别名.私有名` 一种写法，用它论证"解耦完成"
+    是不成立的。`duplicate_helpers = 301` 的计量单位是"函数名"，301 个名字背后是 4,220
+    个顶层定义（新输出 `helper_definitions` 暴露该事实）。
+  - **预算机械锁**：`FEATURE_ALLOWANCE` 中额度 > 0 的指标必须在本文档出现（切片登记），
+    `HEAD_BUDGET` 必须与 `backend/coupling_budget.lock.json` 完全一致。两条锁都用
+    "篡改必须失败"自证过（allowance 0→40、HEAD 80→40、lock 漂移三种都红）。
+  - **adaptive 库 schema 所有权**：`db_migrate.MIGRATIONS["adaptive_learning"]` 由 1 步变
+    **11 步**（核心 + 9 个 owner 各一步），建表顺序、失败容忍度与版本登记归新增的
+    `adaptive_schema_migrations`；引擎两处手写的 8 次 `ensure_schema` 改为一次调用。
+    实测空库跑到 v11、建出 51 张表、二次运行幂等。顺带修掉 `self_evolution` 的
+    "用过才建"缺陷（同一份代码在不同部署会得到不同 schema）。
+  - **schema 所有权守卫**：新增 `test_schema_ownership` + `schema_ownership.lock.json`
+    （48 个建表模块 / 15 个改表模块，只减不增；扫描排除 docstring）。
+  - **性能**：`execute_open(*, risk_result)` 复用同轮风控结论（约 880 秒/交易日），
+    并把复用到的风控单按对象身份去重（否则同一笔风控单在响应与 job detail 里出现两次）。
+
+### 显式额度登记（2026-10-29）
+
+- `cross_domain_edges` **+8**：新增 schema owner 显式持有 9 个下游 owner 的建表依赖，
+  属"归属明确化"的代价，不是新增业务耦合。
+- `deferred_imports` **+1**：`db_migrate` 的核心表步骤延迟导入 `adaptive_engine`，
+  避免迁移器在 import 期拉起重引擎。
+- `max_file_lines` **+11**：`paper_trading.py` 14,612 → 14,623，差额是
+  `execute_open(*, risk_result)` 的签名与说明，以及风控单去重的 6 行。
+- `import_cycles` 保持 **0**：第一版把 `ensure_current` 放进 owner 就造出
+  `adaptive_engine ↔ adaptive_schema_migrations` 的环，已改为由 `db_migrate` 单向调用。
+
 - 2026-10-28（A8 收尾：最后两组环，环 2 → 0）
   - **`market_data_service` ↔ `universe`**。新的下层事实 owner `data_universe_store`
     承接 `universe.json` 的读取边界（路径、`(路径, mtime, size)` 轮内复用、正式清单门槛），

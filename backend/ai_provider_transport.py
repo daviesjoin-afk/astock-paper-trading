@@ -51,7 +51,7 @@ __all__ = [
     "REASON_CHOICES_MISSING",
     "REASON_CONTENT_NOT_STRING",
     "REASON_CONTENT_NOT_OBJECT",
-    "DEFAULT_TIMEOUT_SECONDS",
+    "DEFAULT_PROVIDER_TIMEOUT_SECONDS",
     "MIN_TIMEOUT_SECONDS",
     "MAX_TIMEOUT_SECONDS",
     "MIN_MAX_TOKENS",
@@ -65,7 +65,7 @@ __all__ = [
 ]
 
 # ─── 资源边界 ───
-DEFAULT_TIMEOUT_SECONDS = 40
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 40
 MIN_TIMEOUT_SECONDS = 5
 MAX_TIMEOUT_SECONDS = 300
 MIN_MAX_TOKENS = 400
@@ -198,9 +198,9 @@ def validate_base_url(value) -> str:
 
 def _timeout_seconds(provider_config) -> float:
     try:
-        value = float(provider_config.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
+        value = float(provider_config.get("timeout_seconds") or DEFAULT_PROVIDER_TIMEOUT_SECONDS)
     except (TypeError, ValueError):
-        return float(DEFAULT_TIMEOUT_SECONDS)
+        return float(DEFAULT_PROVIDER_TIMEOUT_SECONDS)
     return max(float(MIN_TIMEOUT_SECONDS), min(float(MAX_TIMEOUT_SECONDS), value))
 
 

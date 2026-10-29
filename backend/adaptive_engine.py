@@ -28,6 +28,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import adaptive_risk as risk_evolution
+import adaptive_schema_migrations as ASM
 import adaptive_selection as selection_evolution
 import deepseek_advisor
 import deepseek_research
@@ -38,7 +39,6 @@ import trade_attribution
 import ai_analysis
 import factor_quality_shadow
 import learning_dataset
-import learning_evaluation
 import neural_shadow
 import evolution_adversarial as adversarial
 import dual_ai_tuner
@@ -308,7 +308,7 @@ adaptive_connection = _connect
 CONFIG_OWNER_BOUND = research_runtime_config.bind_config_connection(_connect)
 
 
-def _init_schema(conn):
+def init_schema(conn):
     # 快速路径：核心表已存在时跳过 200 行 executescript 的重复解析。
     # executescript 全部为 CREATE IF NOT EXISTS / INSERT OR IGNORE（幂等），
     # 跳过不会改变任何数据，只是避免每个会话/请求都重新解析大段 DDL。
@@ -317,21 +317,16 @@ def _init_schema(conn):
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adaptive_rewards'"
         ).fetchone()
         if exists:
-            # 仍需保证 canary 种子与 6 个模块的表存在（新部署/升级时）
+            # 仍需保证 canary 种子与 8 个 owner 的表存在（新部署/升级时）
             conn.execute(
                 """INSERT OR IGNORE INTO adaptive_canary_state(
                    id,mode,stage,max_nav_pct,max_new_slots,effective_at,frozen_reason,evidence,updated_at)
                    VALUES(1,'shadow','D1-D3',0,0,NULL,'等待证据链验收','{}',?)""",
                 (_now(),),
             )
-            risk_evolution.ensure_schema(conn)
-            selection_evolution.ensure_schema(conn)
-            deepseek_advisor.ensure_schema(conn)
-            news_learning.ensure_schema(conn)
-            trade_attribution.ensure_schema(conn)
-            ai_analysis.ensure_schema(conn)
-            learning_dataset.ensure_schema(conn)
-            learning_evaluation.ensure_schema(conn)
+            # 建表编排归 schema owner（2026-10-29）：顺序、失败容忍度与
+            # 版本登记都在 ``adaptive_schema_migrations``，引擎不再逐个点名。
+            ASM.ensure_adaptive_feature_tables(conn)
             _ensure_config_defaults(conn)
             return
     except Exception:
@@ -544,24 +539,14 @@ def _init_schema(conn):
            VALUES(1,'shadow','D1-D3',0,0,NULL,'等待证据链验收','{}',?)""",
         (_now(),),
     )
-    risk_evolution.ensure_schema(conn)
-    selection_evolution.ensure_schema(conn)
-    deepseek_advisor.ensure_schema(conn)
-    news_learning.ensure_schema(conn)
-    trade_attribution.ensure_schema(conn)
-    ai_analysis.ensure_schema(conn)
-    # PR-8：学习数据集契约的表/列升级是纯 additive + 幂等的，旧库、空库、测试库
-    # 都能通过；失败也不阻断建表（契约层自身会 fail closed）。
-    try:
-        learning_dataset.ensure_schema(conn)
-    except Exception:
-        pass
-    # PR-9：预测证据表与评估 manifest 表同样 additive + 幂等。
-    try:
-        learning_evaluation.ensure_schema(conn)
-    except Exception:
-        pass
+    # 与快速路径同一份契约：顺序与失败容忍度由 schema owner 持有。
+    ASM.ensure_adaptive_feature_tables(conn)
     _ensure_config_defaults(conn)
+
+
+# 兼容别名：测试与旧调用方按私有名 patch/调用（``AE._init_schema(conn)``）。
+# 内部调用点仍写 ``_init_schema(...)``，因此对私有名的 patch 依旧有效。
+_init_schema = init_schema
 
 
 def _ensure_config_defaults(conn):

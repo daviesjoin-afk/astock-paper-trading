@@ -35,7 +35,7 @@ EASTMONEY_NOTICE_URL = (
 )
 SOURCE_NAME = "eastmoney-public-notice"
 SOURCE_KIND = "public_aggregator"
-DEFAULT_TIMEOUT_SECONDS = 8.0
+DEFAULT_DISCLOSURE_TIMEOUT_SECONDS = 8.0
 DEFAULT_CACHE_TTL_SECONDS = 6 * 60 * 60
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_MAX_PAGES = 3
@@ -182,7 +182,7 @@ def _published_at(row: Mapping[str, Any]) -> Optional[_dt.datetime]:
     return _parse_dt(row.get("display_time") or row.get("published_at") or row.get("eiTime"))
 
 
-def _request_json(params: Mapping[str, Any], timeout: float = DEFAULT_TIMEOUT_SECONDS) -> Mapping[str, Any]:
+def _request_json(params: Mapping[str, Any], timeout: float = DEFAULT_DISCLOSURE_TIMEOUT_SECONDS) -> Mapping[str, Any]:
     """Fetch one public page with a bounded timeout and no hidden retries."""
     global _LAST_REQUEST_AT
     with _RATE_LOCK:
@@ -311,7 +311,7 @@ def fetch_disclosure_timeline(
     codes: Iterable[Any] | Any,
     asof: Any = None,
     *,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    timeout: float = DEFAULT_DISCLOSURE_TIMEOUT_SECONDS,
     cache_ttl: float = DEFAULT_CACHE_TTL_SECONDS,
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_PAGES,

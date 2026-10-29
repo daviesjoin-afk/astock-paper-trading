@@ -38,8 +38,6 @@
   "test_api_earnings": 0.645,
   "test_api_strategies": 12.371,
   "test_architecture_boundary_audit": 18.158,
-  "test_architecture_boundary_fixes": 1.597,
-  "test_architecture_optimization": 5.977,
   "test_asymmetric_risk": 0.738,
   "test_asymmetric_risk_gate_wiring": 1.081,
   "test_auction_analysis": 0.068,

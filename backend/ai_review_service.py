@@ -127,7 +127,7 @@ MAX_API_KEY_LENGTH = 200
 MAX_BASE_URL_LENGTH = 500
 MAX_MODEL_LENGTH = 100
 MAX_DISPLAY_NAME_LENGTH = 40
-DEFAULT_TIMEOUT_SECONDS = 40
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 40
 MIN_TIMEOUT_SECONDS = 5
 MAX_TIMEOUT_SECONDS = 300
 
@@ -218,7 +218,7 @@ def _clamp_timeout(value):
     try:
         number = int(float(value))
     except (TypeError, ValueError):
-        return DEFAULT_TIMEOUT_SECONDS
+        return DEFAULT_REVIEW_TIMEOUT_SECONDS
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, number))
 
 
@@ -255,7 +255,7 @@ def env_slot_defaults(slot):
             base_url = normalize_base_url(os.getenv(legacy + "_BASE_URL") or "")
             model = str(os.getenv(legacy + "_MODEL") or "").strip()
             raw_timeout = os.getenv(legacy + "_TIMEOUT_SECONDS")
-    timeout = _clamp_timeout(raw_timeout) if raw_timeout not in (None, "") else DEFAULT_TIMEOUT_SECONDS
+    timeout = _clamp_timeout(raw_timeout) if raw_timeout not in (None, "") else DEFAULT_REVIEW_TIMEOUT_SECONDS
     return {"api_key": api_key, "base_url": base_url, "model": model, "timeout_seconds": timeout}
 
 
@@ -416,7 +416,7 @@ def migrate_legacy_providers(conn):
             "INSERT INTO ai_provider_slots(slot,display_name,api_key,base_url,model,"
             "enabled,timeout_seconds,updated_at) VALUES(?,?,?,?,?,?,?,?)",
             (slot, display_name, str(row[1]), normalize_base_url(row[2]),
-             str(row[3] or "").strip(), int(bool(row[4])), DEFAULT_TIMEOUT_SECONDS, _now()),
+             str(row[3] or "").strip(), int(bool(row[4])), DEFAULT_REVIEW_TIMEOUT_SECONDS, _now()),
         )
         migrated[slot] = legacy_provider
     return migrated
@@ -456,7 +456,7 @@ def migrate_legacy_env_providers(conn):
         model = str(os.getenv(prefix + "_MODEL") or "").strip() or defaults.get("model", "")
         raw_timeout = os.getenv(prefix + "_TIMEOUT_SECONDS")
         timeout = (_clamp_timeout(raw_timeout) if raw_timeout not in (None, "")
-                   else int(defaults.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)))
+                   else int(defaults.get("timeout_seconds", DEFAULT_REVIEW_TIMEOUT_SECONDS)))
         conn.execute(
             "INSERT INTO ai_provider_slots(slot,display_name,api_key,base_url,model,"
             "enabled,timeout_seconds,updated_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -541,7 +541,7 @@ def save_provider(conn, provider_id=None, **updates):
         raise ValueError("未知提供商设置项")
     cfg = _provider_row(conn, provider_id) if provider_id else {
         "id": uuid.uuid4().hex, "display_name": "", "api_key": "", "base_url": "",
-        "timeout_seconds": DEFAULT_TIMEOUT_SECONDS, "models": [],
+        "timeout_seconds": DEFAULT_REVIEW_TIMEOUT_SECONDS, "models": [],
     }
     for field, limit in (("display_name", MAX_DISPLAY_NAME_LENGTH),
                          ("api_key", MAX_API_KEY_LENGTH), ("base_url", MAX_BASE_URL_LENGTH)):
@@ -759,7 +759,7 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
         ):
             raise ValueError("请先在提供商中保存该模型，再选择")
         # 只保存引用，运行时读取提供商当前地址与密钥。
-        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
+        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_REVIEW_TIMEOUT_SECONDS)
 
     if display_name is not None:
         state["display_name"] = _clean_text(display_name, MAX_DISPLAY_NAME_LENGTH, "display_name")
@@ -786,7 +786,7 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
     if state.get("provider_id") and provider_id is None and not (
         api_key or base_url is not None or timeout_seconds is not None or clear_api_key
     ):
-        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
+        state.update(api_key="", base_url="", timeout_seconds=DEFAULT_REVIEW_TIMEOUT_SECONDS)
 
     now = _now()
     conn.execute(

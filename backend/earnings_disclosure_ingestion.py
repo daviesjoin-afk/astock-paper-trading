@@ -75,7 +75,7 @@ DEFAULT_PAGE_SIZE = 100
 DEFAULT_MAX_PAGES = 40
 #: 单轮最多取多少条原文。抓正文是串行且有间隔的，这个上限把单轮时长钉在分钟级。
 DEFAULT_MAX_BODIES = 120
-DEFAULT_TIMEOUT_SECONDS = 15.0
+DEFAULT_INGESTION_TIMEOUT_SECONDS = 15.0
 MIN_REQUEST_INTERVAL_SECONDS = 0.35
 
 _RATE_LOCK = threading.Lock()
@@ -98,7 +98,7 @@ def _throttle() -> None:
 
 
 def _request_json(url: str, params: Mapping[str, Any],
-                  timeout: float = DEFAULT_TIMEOUT_SECONDS) -> Mapping[str, Any]:
+                  timeout: float = DEFAULT_INGESTION_TIMEOUT_SECONDS) -> Mapping[str, Any]:
     """一次有界请求，无隐藏重试（重试属于调度层，不属于单次抓取）。"""
     _throttle()
     query = urlencode({key: value for key, value in params.items() if value is not None})

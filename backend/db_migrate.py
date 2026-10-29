@@ -17,6 +17,7 @@ import os
 import sqlite3
 import sys
 
+import adaptive_schema_migrations as ASM
 import adaptive_selection_compat as selection_compat
 import paper_schema_migrations as paper_schema
 import strategy_naming as NAMING
@@ -259,6 +260,29 @@ def migrate_legacy_model_family_names(conn):
     return {"migrated_accounts": migrated_accounts, "migrated_params": migrated_params}
 
 
+def _ensure_adaptive_core_tables(conn):
+    """自适应库的核心表由引擎自己持有（它是唯一读写者），这里只做编排。
+
+    ``adaptive_engine.init_schema`` 是幂等的结构入口：核心表 DDL + 8 个 owner 的
+    表 + 配置默认值。作为迁移步骤 2 调用它，等于把"这个库的结构已被 owner 保证"
+    写成一条可追溯的版本记录，而不再依赖"每次连接时顺手建表"。
+    """
+    import adaptive_engine
+
+    adaptive_engine.init_schema(conn)
+
+
+def _make_adaptive_owner_step(label):
+    """把单个 owner 的建表做成一个迁移步骤（失败可定位、可从该步续跑）。"""
+
+    def _step(conn):
+        ASM.ensure_owner(conn, label)
+
+    _step.__name__ = f"ensure_adaptive_owner_{label}"
+    _step.__doc__ = f"adaptive 库：建立/升级 {label} 拥有的表（幂等）。"
+    return _step
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -451,6 +475,18 @@ MIGRATIONS = {
             description TEXT
         );
         """),
+        # 2026-10-29（adaptive 库 schema 收口）：此前本库只有上面 1 步，于是
+        # "adaptive_learning 已是最新 v1"与真实 schema 无关——40 余张表实际由 8 个
+        # owner 在建立连接时各自建出来。现在把编排权交给
+        # ``adaptive_schema_migrations``，并逐步登记版本：
+        #  · 步骤 2 = 引擎自有核心表（``adaptive_engine.init_schema``，幂等）；
+        #  · 步骤 3~10 = 每个 owner 一步，失败时能定位到具体 owner 且可从该步续跑。
+        (2, "自适应库核心表与默认配置（引擎自有，幂等）", _ensure_adaptive_core_tables),
+        *[
+            (index, f"自适应库 owner 表：{label}（幂等）",
+             _make_adaptive_owner_step(label))
+            for index, label in enumerate(ASM.OWNER_LABELS, start=3)
+        ],
     ],
 }
 

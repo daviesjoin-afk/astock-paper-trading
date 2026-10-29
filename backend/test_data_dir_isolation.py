@@ -92,6 +92,27 @@ def _cache_snapshot(root: Path) -> set:
     return found
 
 
+def _cache_signature(root: Path) -> dict:
+    """相对路径 → (大小, mtime_ns)：抓"改了已有文件"而不只是"新增文件"。
+
+    2026-10-29 实测：全量跑批期间源码根 ``data_cache/paper_trading.sqlite3``
+    的 mtime 被更新，而仅比较文件名的断言完全看不见——"没新增文件"和"没被写过"
+    是两件事。
+    """
+    if not root.exists():
+        return {}
+    signature = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature[os.path.relpath(path, root)] = (stat.st_size, stat.st_mtime_ns)
+    return signature
+
+
 class DataDirIsolationTests(unittest.TestCase):
     def setUp(self):
         self.isolated = Path(tempfile.mkdtemp(prefix="astock-data-dir-"))
@@ -135,6 +156,17 @@ class DataDirIsolationTests(unittest.TestCase):
         self._probe()
         after = _cache_snapshot(REPO_CACHE)
         self.assertEqual(after - before, set(), "设置 ASTOCK_DATA_DIR 后不得在源码目录新增运行数据")
+
+    def test_source_tree_cache_content_stays_untouched(self):
+        """已有文件也不得被改写：只看"新增"会漏掉就地更新。"""
+        before = _cache_signature(REPO_CACHE)
+        self._probe()
+        after = _cache_signature(REPO_CACHE)
+        changed = sorted(
+            name for name, meta in after.items()
+            if name in before and before[name] != meta)
+        self.assertEqual(changed, [], "设置 ASTOCK_DATA_DIR 后不得改写源码目录的运行数据")
+        self.assertEqual(sorted(after), sorted(before), "文件集合本身也不得变化")
 
 
 if __name__ == "__main__":

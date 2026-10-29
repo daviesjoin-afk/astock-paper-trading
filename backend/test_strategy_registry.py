@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -14,6 +15,35 @@ import paper_trading as paper
 
 
 class StrategyRegistryTests(unittest.TestCase):
+    """注册表契约测试。
+
+    2026-10-29：本文件原先直接读仓库里的 ``data_cache/paper_trading.sqlite3``，
+    于是本地账本里多出来的策略定义（实测 ``golden_replay_alpha`` 一行）会让
+    ``active_ids()`` 与 ``strategy_center()`` 多一项，两条断言在干净克隆上绿、
+    在开发机上红——非 hermetic。现在整类把注册表与账本都指向临时库并初始化，
+    断言的语义（干净克隆只有三个策略袖套）与原来完全一致。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="astock-registry-test-")
+        cls._db = os.path.join(cls._tmp, "paper.sqlite3")
+        cls._patches = [
+            mock.patch.object(registry, "DEFAULT_DB_PATH", cls._db),
+            mock.patch.object(paper, "DB_PATH", cls._db),
+            mock.patch.object(paper, "_benchmark_close", return_value=None),
+            mock.patch.object(paper, "_RUNNER_BOOT_RECOVERED", False),
+        ]
+        for patcher in cls._patches:
+            patcher.start()
+        paper.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        for patcher in reversed(cls._patches):
+            patcher.stop()
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
     def test_active_ids_match_public_new_cycle_scope(self):
         self.assertEqual(registry.active_ids(), (
             "tq_breakout", "trend_pullback", "reported_profit_breakout",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 import re
 from typing import Iterable
@@ -40,17 +41,29 @@ def _trees(paths: Iterable[Path]):
     很多遍（``paper_trading.py`` 单次约 0.5 秒），缓存按 (路径, mtime, 大小)
     失效所以不会读到过期语法树。``tools/`` 需要能脱离测试环境单独运行，
     因此这里是"可用则用、不可用则退回直接解析"，不把工具硬绑到测试包上。
+
+    2026-10-29：同一批路径的解析结果在本进程内只做一次。守卫里
+    ``test_foundation_allowlist_has_no_unused_entries`` 自己也要全仓 316 个
+    文件的语法树（实测 33.5 秒），与 ``measure_all`` 完全重叠，因此共享同一份
+    ``(路径, 源码, 树)`` 元组。路径集合是缓存键，临时目录夹具天然互不干扰。
     """
+    return iter(_records(tuple(paths)))
+
+
+@lru_cache(maxsize=8)
+def _records(paths: tuple[Path, ...]):
     try:
         from test_support import ast_cache
     except ImportError:
         ast_cache = None
+    records = []
     for path in paths:
         if ast_cache is not None:
-            yield path, ast_cache.source(path), ast_cache.tree(path)
+            records.append((path, ast_cache.source(path), ast_cache.tree(path)))
             continue
         source = path.read_text(encoding="utf-8")
-        yield path, source, ast.parse(source, filename=str(path))
+        records.append((path, source, ast.parse(source, filename=str(path))))
+    return tuple(records)
 
 
 def _local_imports(tree, modules):
@@ -131,13 +144,17 @@ FOUNDATION_ALLOWED_DEPENDENCIES = {
 }
 
 
-def foundation_violations(root: Path = BACKEND):
-    """基础层 → 业务域的反向依赖。
+@lru_cache(maxsize=4)
+def _foundation_violations_cached(root: Path = BACKEND):
+    """基础层 → 业务域的反向依赖（缓存版，返回不可变元组）。
 
-    返回 ``[(foundation_module, offending_target), ...]``，按模块与目标排序。
+    返回 ``((foundation_module, offending_target), ...)``，按模块与目标排序。
 
     基础层之间的互相依赖是允许的（它们同属"事实/规则/纯工具"这一层）；
     基础层依赖**业务域**模块才是方向错误。白名单之外的依赖一律视为违规。
+
+    只读 AST，所以缓存是安全的：``measure_all`` 与 ``foundation_violations``
+    原本会各自把全仓再走一遍（同一进程里 3~4 次），2026-10-29 起共用一份。
     """
     records = list(_trees(production_paths(root)))
     modules = {path.stem for path, _, _ in records}
@@ -151,7 +168,12 @@ def foundation_violations(root: Path = BACKEND):
         for target in sorted(_local_imports(tree, modules) - {module}):
             if target not in allowed:
                 violations.append((module, target))
-    return sorted(violations)
+    return tuple(sorted(violations))
+
+
+def foundation_violations(root: Path = BACKEND):
+    """``_foundation_violations_cached`` 的列表视图（调用方可安全持有）。"""
+    return list(_foundation_violations_cached(root))
 
 
 def domain_of(module: str) -> str:
@@ -178,6 +200,79 @@ def _private_cross_access(tree, module, modules):
     return count
 
 
+def dependency_private_fields(tree) -> int:
+    """统计 ``*Dependencies`` 容器上的私有字段名（跨模块私有依赖的真实载体）。
+
+    ``private_cross_access`` 只认 ``import 别名.私有名`` 这一种写法，因此
+    "把 66 个私有函数注入 dataclass、消费者再用 ``deps._x`` 调用"这种形态
+    完全落在它的视野外（见 2026-10-29 对抗性审查 F-01）。这里度量的是**契约
+    本身**：容器上有多少个私有字段名，就有多少个跨模块私有依赖需要治理。
+    """
+    total = 0
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or not node.name.endswith("Dependencies"):
+            continue
+        for item in node.body:
+            targets = []
+            if isinstance(item, ast.AnnAssign):
+                targets = [item.target]
+            elif isinstance(item, ast.Assign):
+                targets = item.targets
+            for target in targets:
+                if (isinstance(target, ast.Name) and target.id.startswith("_")
+                        and not target.id.startswith("__")):
+                    total += 1
+    return total
+
+
+def private_channel_counts(tree, modules) -> tuple[int, int]:
+    """一趟 AST 走查同时统计两条"口径外私有通道"。
+
+    返回 ``(from_import_private, dynamic_name_bridges)``：
+
+    * ``from <项目模块> import _私有名`` —— 别名形态之外的第二条私有通道；
+    * ``globals()[...]`` / ``getattr(x, computed)`` / ``sys.modules[...]``
+      —— 任何基于静态 Name/Attribute 的守卫都看不见的"按名字取成员"。
+
+    合并成一次 ``ast.walk``：``measure_all`` 对 316 个模块逐个调用，分成两趟
+    会让守卫多付一次全仓走查（实测各约 0.7 秒）。
+    """
+    from_import = 0
+    bridges = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (node.level == 0 and node.module
+                    and node.module.split(".")[0] in modules):
+                from_import += sum(
+                    1 for alias in node.names
+                    if alias.name.startswith("_") and not alias.name.startswith("__"))
+        elif isinstance(node, ast.Subscript):
+            value = node.value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
+                    and value.func.id == "globals":
+                bridges += 1
+            elif isinstance(value, ast.Attribute) and value.attr == "modules" \
+                    and isinstance(value.value, ast.Name) and value.value.id == "sys":
+                bridges += 1
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "getattr" and len(node.args) >= 2:
+            name_arg = node.args[1]
+            if not (isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str)
+                    and not name_arg.value.startswith("_")):
+                bridges += 1
+    return from_import, bridges
+
+
+def from_import_private_names(tree, modules) -> int:
+    """``from <项目模块> import _私有名`` 的数量（独立入口，便于定点核查）。"""
+    return private_channel_counts(tree, modules)[0]
+
+
+def dynamic_name_bridges(tree) -> int:
+    """按名字字符串动态取模块成员的站点数（独立入口，便于定点核查）。"""
+    return private_channel_counts(tree, ())[1]
+
+
 def function_names(node):
     """Names loaded/stored in one function, excluding nested scopes."""
     referenced, locals_used = set(), set()
@@ -195,12 +290,28 @@ def function_names(node):
 
 
 def measure_all(root: Path = BACKEND):
+    """全部耦合事实（同一进程内按 ``root`` 复用一次全仓 AST 走查）。
+
+    2026-10-29：架构守卫里 ``test_no_metric_regresses`` 与
+    ``test_no_backend_import_cycles`` 各调一次本函数，实测各约 10 秒。
+    度量是纯只读 AST，因此按 ``root`` 缓存；返回浅拷贝，调用方改键不会污染
+    缓存。需要强制重算时用 ``measure_all.cache_clear()``。
+    """
+    return dict(_measure_all_cached(root))
+
+
+measure_all.cache_clear = lambda: _measure_all_cached.cache_clear()  # type: ignore[attr-defined]
+
+
+@lru_cache(maxsize=4)
+def _measure_all_cached(root: Path = BACKEND):
     records = list(_trees(production_paths(root)))
     modules = {path.stem for path, _, _ in records}
     edges = {path.stem: _local_imports(tree, modules) - {path.stem}
              for path, _, tree in records}
     cycles = strongly_connected(edges)
     deferred = raw_sql = private_access = max_globals = 0
+    injected_fields = from_import_private = name_bridges = 0
     max_file_lines = max_function_lines = 0
     helpers = Counter()
     numeric_helpers = Counter()
@@ -217,6 +328,10 @@ def measure_all(root: Path = BACKEND):
         for table in {match.group(0) for match in PAPER_TABLE.finditer(source)}:
             fanout[table] += 1
         private_access += _private_cross_access(tree, path.stem, modules)
+        injected_fields += dependency_private_fields(tree)
+        from_import_tree, bridges_tree = private_channel_counts(tree, modules)
+        from_import_private += from_import_tree
+        name_bridges += bridges_tree
         defined = {node.name for node in tree.body
                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
         helpers.update(defined)
@@ -248,6 +363,9 @@ def measure_all(root: Path = BACKEND):
     return {
         "import_cycles": len(cycles),
         "import_cycle_members": cycles,
+        # 模块 → 项目内依赖（排序后的列表）。守卫要用同一份边集合做白名单
+        # 核查，不必再自己走一遍全仓（原先那份重复走查实测 33 秒）。
+        "import_edges": {source: sorted(targets) for source, targets in sorted(edges.items())},
         "deferred_imports": deferred,
         "raw_sql_modules": raw_sql,
         "paper_table_fanout": dict(sorted(fanout.items())),
@@ -268,10 +386,17 @@ def measure_all(root: Path = BACKEND):
         "largest_function": largest_function,
         "max_function_globals": max_globals,
         "duplicate_helpers": sum(1 for count in helpers.values() if count > 1),
+        "helper_definitions": sum(helpers.values()),
         "duplicate_helper_names": dict(sorted(
             (name, count) for name, count in helpers.items() if count > 1)),
         "duplicate_numeric_helpers": sum(numeric_helpers.values()),
         "duplicate_numeric_helper_names": dict(sorted(numeric_helpers.items())),
+        # 私有跨模块依赖的三条"口径外"通道（2026-10-29 对抗性审查 F-01/F-02）：
+        # ``private_cross_access`` 只认 ``import 别名.私有名``，上面这三种形态
+        # 能拿到私有成员却完全不计数，因此必须各自成为独立事实指标。
+        "injected_private_fields": injected_fields,
+        "from_import_private_names": from_import_private,
+        "dynamic_name_bridges": name_bridges,
         "unsuffixed_module_ratio": round(unsuffixed / len(records), 4) if records else 0,
         "import_side_effects": side_effects,
         "production_modules": len(records),

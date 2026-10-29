@@ -16,8 +16,20 @@ TZ = dt.timezone(dt.timedelta(hours=8))
 
 
 class QuoteSourceParallelismTests(unittest.TestCase):
+    def setUp(self):
+        # 同一进程里前面的用例可能留下"轮内报价池"（``threading.local``），
+        # 那样 ``_quotes`` 会直接命中缓存、两个源一个都不会被请求——本文件
+        # 要验证的是"并行取数"，必须从干净的池状态开始（2026-10-30 CI 在
+        # 分片重排后暴露出这个跨用例泄漏）。
+        PT._end_round_quote_cache()
+        self.addCleanup(PT._end_round_quote_cache)
+
+        # 2026-10-30：``dt.date.today()`` 取的是**机器本地**日期，而行情时间戳用的是
+        # 固定 +8 时钟。CI 在 16:00–24:00 UTC 跑时两者差一天，``_quote_is_fresh``
+        # 会把"明天"的报价判为不可用，于是这两个本文件里的用例在 Linux 上随机红。
+        # 日期必须与时间戳同源。
     def test_primary_and_independent_sources_run_concurrently(self):
-        day = dt.date.today()
+        day = dt.datetime.now(TZ).date()
         stamp = dt.datetime.now(TZ).isoformat(timespec="seconds")
         common = {
             "code": "600001", "price": 10.0, "pct": 1.0, "quote_at": stamp,
@@ -52,7 +64,7 @@ class QuoteSourceParallelismTests(unittest.TestCase):
         self.assertEqual(row["quote_cross_check"]["source"], "sina_public_quote")
 
     def test_one_source_failure_is_recorded_without_cancelling_the_other(self):
-        day = dt.date.today()
+        day = dt.datetime.now(TZ).date()
         stamp = dt.datetime.now(TZ).isoformat(timespec="seconds")
         common = {"code": "600001", "price": 10.0, "pct": 1.0, "quote_at": stamp}
         reading = mock.Mock(status="unavailable", available=False, freshness=None,

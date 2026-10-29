@@ -1,0 +1,17 @@
+{
+ "cross_domain_edges": 618,
+ "deferred_imports": 616,
+ "duplicate_helpers": 296,
+ "dynamic_name_bridges": 80,
+ "from_import_private_names": 63,
+ "import_cycles": 0,
+ "import_side_effects": 25,
+ "injected_private_fields": 66,
+ "max_file_lines": 14612,
+ "max_function_globals": 61,
+ "max_function_lines": 1195,
+ "paper_table_fanout_max": 50,
+ "private_cross_access": 6,
+ "raw_sql_modules": 141,
+ "unsuffixed_module_ratio": 0.3956
+}

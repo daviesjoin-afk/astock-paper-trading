@@ -230,6 +230,35 @@ class DeterministicDemoTests(unittest.TestCase):
         self.assertEqual(account["today_position_missing_codes"], [])
         self.assertIsNotNone(base["shared"]["daily_loss_pct"])
 
+    def test_narrowed_strategy_registry_skips_seeding_instead_of_crashing(self):
+        """策略账户不足三个时必须**跳过播种**，不能在启动阶段抛 IndexError。
+
+        2026-10-29 实测缺陷：``ensure_demo_data`` 硬取 ``accounts[1]`` /
+        ``accounts[2]``，当策略注册表被收窄（只启用 1~2 个策略）时它在应用
+        lifespan 里抛 ``IndexError``，uvicorn 启动直接失败——
+        ``test_operator_boundary`` 的 4 个用例因此 setup 超时。这里钉住新行为：
+        返回 False、留下可查的审计证据、不写坏账本。
+        """
+        real_create_cycle = PT.create_cycle
+
+        def narrow_create_cycle(*args, **kwargs):
+            # 仍然真的建周期（否则共享账本会停在"没有活动周期"，后续用例的
+            # 读模型会去补 legacy 周期，键精确到秒，同一秒内两次就撞 UNIQUE），
+            # 只把返回的 enabled_strategies 收窄成 1 个。
+            cycle = real_create_cycle(*args, **kwargs)
+            return {**cycle, "enabled_strategies": ["tq_breakout"]}
+
+        with patch.object(PT, "create_cycle", side_effect=narrow_create_cycle):
+            self.assertFalse(demo_seed.ensure_demo_data(force=True))
+        with PT._db() as conn:
+            row = conn.execute(
+                "SELECT detail FROM paper_audit WHERE event='demo_seed_skipped' "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(row, "跳过播种必须留下审计证据")
+        payload = json.loads(row[0] if not isinstance(row, dict) else row["detail"])
+        self.assertEqual(["tq_breakout"], payload["enabled_strategies"])
+        self.assertIn("三个策略账户", payload["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

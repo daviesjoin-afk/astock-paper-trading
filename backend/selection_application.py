@@ -505,30 +505,6 @@ def _update_live(key, fn):
     except Exception:
         pass
 
-def _warm_market_context():
-    universe = U.load_universe()
-    codes = {row["code"] for row in universe}
-    names = {row["code"]: row["name"] for row in universe}
-    _load_selection_context("sentiment", lambda: F.compute_sentiment_factors(codes))
-    jobs = [
-        ("gate", F.overseas_risk_gate),
-        ("sector_flow", lambda: dfc.fetch_sector_flow("industry")),
-        ("news_hits", lambda: F.news_keyword_scan(names)),
-    ]
-    for key, fn in jobs:
-        threading.Thread(
-            target=_update_live,
-            args=(key, fn),
-            daemon=True,
-        ).start()
-
-def _warmup_caches():
-    """Precompute full-market historical factors without blocking API startup."""
-    try:
-        _load_selection_base()
-    except Exception:
-        pass
-
 def _completed_daily_kline(frame):
     """Never pass an unfinished intraday daily bar into a buy decision."""
     if frame is None or frame.empty:

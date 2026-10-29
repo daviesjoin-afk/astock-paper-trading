@@ -26,7 +26,7 @@ MIN_PAIRED_INTERVALS = 10
 MIN_DISTINCT_DAYS = 5
 HOLDOUT_FRACTION = 0.40
 MIN_HOLDOUT_INTERVALS = 4
-CONFIDENCE_Z = 1.96
+HOLDOUT_LOWER_BOUND_Z_TWO_SIDED_95 = 1.96
 MIN_HOLDOUT_POSITIVE_RATIO = 0.55
 
 
@@ -103,7 +103,7 @@ def _sample_stats(values: list[float]) -> dict[str, Any]:
     if n >= 2:
         stdev = statistics.stdev(values)
         stderr = stdev / math.sqrt(n)
-        lower = mean - CONFIDENCE_Z * stderr
+        lower = mean - HOLDOUT_LOWER_BOUND_Z_TWO_SIDED_95 * stderr
     else:
         stdev = None
         stderr = None
@@ -176,7 +176,7 @@ def evaluate_promotion_evidence(
             "min_distinct_days": MIN_DISTINCT_DAYS,
             "holdout_fraction": HOLDOUT_FRACTION,
             "min_holdout_intervals": MIN_HOLDOUT_INTERVALS,
-            "confidence_z": CONFIDENCE_Z,
+            "confidence_z": HOLDOUT_LOWER_BOUND_Z_TWO_SIDED_95,
             "min_holdout_positive_ratio": MIN_HOLDOUT_POSITIVE_RATIO,
         },
     }

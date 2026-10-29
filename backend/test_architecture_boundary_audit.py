@@ -1,10 +1,17 @@
 """Monotonic coupling budgets; tightening is preferable to loosening."""
+import json
+from pathlib import Path
 import unittest
 
 from tools import coupling_metrics
 
 
 class CouplingBudgetTests(unittest.TestCase):
+    # 预算的两个机械锚点（2026-10-29 起）：基线变动必须同时改 lock 文件，
+    # 额度 > 0 必须能在架构文档里找到对应切片。
+    BUDGET_LOCK = Path(__file__).with_name("coupling_budget.lock.json")
+    BUDGET_DOC = Path(__file__).resolve().parents[1] / "docs" / "COUPLING_BUDGET.md"
+
     # PR272 baseline, with boundaries tightened after each completed slice.
     # 2026-10-30（公开层收口，本文件额度同步实测值）：
     #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
@@ -16,119 +23,34 @@ class CouplingBudgetTests(unittest.TestCase):
     #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
     #  所以本指标的实际可达下界是 6，不是 0。
     #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
-    # 2026-10-30（公开层收口，本文件额度同步实测值）：
-    #  P1：账本连接搬到 `paper_storage`（私有访问 201 → 174）；
-    #  声明批：`shadow_runtime.plain`、`market_data_contract.parse_instant`（174 → 142）；
-    #  收尾批：剩余 136 处跨模块私有访问全部改走公开名（142 → **6**）。
-    #  76 个 owner 侧改名 + `_old = new` 单行别名；别名是显式成本：
-    #  `paper_trading.py` 因此 +21 行、单函数最大全局引用 61 → 62。
-    #  剩余 6 处全部是 `ai_research_contract._issue_evidence_ref`——它的私有性
-    #  本身就是强制机制（EVIDENCE-03/NEWS_25/INC_29/INC_30/FINAL_G08），
-    #  所以本指标的实际可达下界是 6，不是 0。
-    #  没有任何额度被放宽：每一行都是按实测收紧或等值。
+    #
+    # 2026-10-29（对抗性审查 F-01/F-02：把"事实"变成指标）：
+    #  `private_cross_access = 6` 只覆盖 ``import 别名.私有名`` 一种写法。实测
+    #  另有三条通道能拿到私有成员却完全不计数，因此各自成为独立预算项：
+    #   `injected_private_fields`（*Dependencies 容器上的私有字段名，实测 66）、
+    #   `from_import_private_names`（`from x import _y`，实测 65）、
+    #   `dynamic_name_bridges`（`globals()[...]` / `getattr(x, 计算值)` /
+    #   `sys.modules[...]`，实测 80）。三项额度都是 0：只能靠改公开名下降。
+    #  另加 `helper_definitions` 说明口径：`duplicate_helpers = 301` 的计量单位
+    #  是"函数名"，301 个名字背后是 4220 个顶层定义（换名复制不在计数内）。
     HEAD_BUDGET = {
         "import_cycles": 0,
-        "deferred_imports": 618,
+        "deferred_imports": 616,
         "private_cross_access": 6,
         "raw_sql_modules": 141,
         "paper_table_fanout_max": 50,
         "cross_domain_edges": 618,
-        "max_file_lines": 14702,
+        "max_file_lines": 14612,
         "max_function_lines": 1195,
         "max_function_globals": 61,
-        "duplicate_helpers": 301,
+        "duplicate_helpers": 296,
         "unsuffixed_module_ratio": 0.3956,
         "import_side_effects": 25,
+        # 私有跨模块依赖的三条"口径外"通道（2026-10-29 对抗性审查 F-01/F-02）。
+        # 三项都必须先归零才算真正解耦；不允许用 FEATURE_ALLOWANCE 吸收。
+        "injected_private_fields": 66,
+        "from_import_private_names": 63,
+        "dynamic_name_bridges": 80,
     }
 
     # 2026-10-28（公共层瘦身审计切片）：主引擎按业务簇下沉两个 owner ——
@@ -208,17 +130,22 @@ class CouplingBudgetTests(unittest.TestCase):
     # 落到 data_cache 并复用 single-flight 原子发布。664 → 668。额度 42 → 44。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
-        "deferred_imports": 0,
+        "deferred_imports": 1,
         "private_cross_access": 0,
         "raw_sql_modules": 0,
         "paper_table_fanout_max": 0,
-        "cross_domain_edges": 0,
-        "max_file_lines": 0,
+        # 2026-10-29（adaptive 库 schema 收口）：schema owner 显式持有 7 个下游
+        # owner 的建表依赖，README 见 docs/COUPLING_BUDGET.md 当日切片。
+        "cross_domain_edges": 8,
+        "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,
         "duplicate_helpers": 0,
         "unsuffixed_module_ratio": 0.0,
         "import_side_effects": 0,
+        "injected_private_fields": 0,
+        "from_import_private_names": 0,
+        "dynamic_name_bridges": 0,
     }
 
     def ceiling(self, name):
@@ -237,6 +164,37 @@ class CouplingBudgetTests(unittest.TestCase):
     def test_allowances_are_non_negative_and_cover_exactly_the_budget(self):
         self.assertEqual(set(self.HEAD_BUDGET), set(self.FEATURE_ALLOWANCE))
         self.assertTrue(all(value >= 0 for value in self.FEATURE_ALLOWANCE.values()))
+
+    def test_head_budget_matches_the_lock_file(self):
+        """基线只能通过"同时改 lock 文件"来变动。
+
+        2026-10-29（对抗性审查 F-07 实测）：改 ``FEATURE_ALLOWANCE`` 里的一个
+        整数即可让 6→46 的回归静默通过，因为此前没有任何机械约束。lock 文件
+        让"放宽基线"变成必须留下 diff 的动作，而不是顺手改个数字。
+        """
+        self.assertTrue(self.HEAD_BUDGET, "预算表不能为空")
+        lock_text = self.BUDGET_LOCK.read_text(encoding="utf-8")
+        lock = json.loads(lock_text)
+        self.assertTrue(lock, "lock 文件不能为空")
+        self.assertEqual(
+            dict(sorted(lock.items())),
+            dict(sorted(self.HEAD_BUDGET.items())),
+            "HEAD_BUDGET 与 coupling_budget.lock.json 不一致：改基线必须同批更新 lock")
+
+    def test_every_non_zero_allowance_has_a_documented_slice(self):
+        """额度 > 0 必须在 ``docs/COUPLING_BUDGET.md`` 里有对应切片。
+
+        全仓原本 0 处代码引用该文档（只有两行注释），所以"额度必须有架构
+        说明"完全靠自觉。这里把它变成断言：宁可额度是 0，也不允许悄悄放行。
+        """
+        doc = self.BUDGET_DOC.read_text(encoding="utf-8")
+        self.assertTrue(doc.strip(), "耦合预算文档不能是空文件")
+        documented = [name for name, allowance in sorted(self.FEATURE_ALLOWANCE.items())
+                      if allowance]
+        self.assertFalse(
+            [name for name in documented if name not in doc],
+            "有额度被放宽却没有在 docs/COUPLING_BUDGET.md 登记指标名："
+            f"{[name for name in documented if name not in doc]}")
 
     def test_no_backend_import_cycles(self):
         """2026-10-28：已知闭环全部关闭，现在不允许任何新环出现。"""
@@ -260,11 +218,20 @@ class CouplingBudgetTests(unittest.TestCase):
             "或显式登记为装配边界并写明理由"))
 
     def test_foundation_allowlist_has_no_unused_entries(self):
-        """白名单里的模块必须真的被用到，否则它会变成"看起来允许"的额度。"""
-        records = list(coupling_metrics._trees(coupling_metrics.production_paths()))
-        modules = {path.stem for path, _, _ in records}
-        edges = {path.stem: coupling_metrics._local_imports(tree, modules) - {path.stem}
-                 for path, _, tree in records}
+        """白名单里的模块必须真的被用到，否则它会变成"看起来允许"的额度。
+
+        2026-10-29：这里原先自己重走一遍全仓 316 个文件取依赖边（实测 33.6 秒），
+        与 ``measure_all`` 完全重叠。改为复用度量已经算好的 ``import_edges``，
+        断言不变。
+        """
+        measured = coupling_metrics.measure_all()
+        expected_modules = {path.stem for path in coupling_metrics.production_paths()}
+        self.assertEqual(
+            expected_modules, set(measured["import_edges"]),
+            "import_edges 必须覆盖全部生产模块，否则白名单核查会漏模块")
+        self.assertGreater(len(expected_modules), 100, "生产模块集合不能是空的")
+        edges = {module: set(targets)
+                 for module, targets in measured["import_edges"].items()}
         for module, allowed in coupling_metrics.FOUNDATION_ALLOWED_DEPENDENCIES.items():
             with self.subTest(module=module):
                 self.assertIn(module, coupling_metrics.FOUNDATION_MODULES)
