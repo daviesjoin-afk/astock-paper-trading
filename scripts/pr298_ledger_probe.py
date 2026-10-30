@@ -27,13 +27,13 @@ tables = [
     "paper_cycles",
     "paper_position_risk_state",
     "paper_risk_decisions",
-    "paper_risk_log",
 ]
 
 
 def capture(name):
     with sqlite3.connect(PT.DB_PATH) as c:
         names = {x[0] for x in c.execute("select name from sqlite_master where type='table'")}
+        assert set(tables) <= names, set(tables) - names
         out.setdefault(name, {})["ledger"] = {
             t: [dict(zip([x[0] for x in cur.description], row, strict=True)) for row in cur]
             for t in tables
