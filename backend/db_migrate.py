@@ -465,6 +465,8 @@ MIGRATIONS = {
         # AI 意见 / 最终动作 / 效果原因），**不**碰任何决策权威表，也不回填历史。
         (40, "新增 AI 决策归因追加审计表（幂等，不回填）",
          paper_schema.ensure_ai_decision_audits),
+        (41, "Dashboard 快照持久刷新任务（独立于交易任务）",
+         paper_schema.ensure_dashboard_refresh_jobs),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

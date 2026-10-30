@@ -2,7 +2,6 @@ import copy
 import datetime as dt
 import os
 import sys
-import threading
 import unittest
 from unittest.mock import patch
 
@@ -127,23 +126,19 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result["data_quality"][1]["status"], "failed")
         self.assertEqual(payload, original)
 
-    def test_scheduled_and_existing_refresh_wait_before_runner_exit(self):
+    def test_scheduled_and_existing_refresh_never_block_trading_completion(self):
         for status in ("scheduled", "already_running"):
-            with patch.object(PT, "request_risk_snapshot_refresh", return_value={"status": status}), \
-                    patch.object(PT, "wait_risk_snapshot_refresh", return_value={"status": "timeout_after_240s"}) as wait:
+            with patch.object(PT, "request_risk_snapshot_refresh", return_value={"status": status}),                     patch.object(PT, "wait_risk_snapshot_refresh", side_effect=AssertionError("waited")):
                 detail = PT._refresh_slot_risk_snapshot("risk")
-            wait.assert_called_once_with(timeout=240.0)
-            self.assertEqual(PT._slot_completion_status(detail), "failed")
-        self.assertEqual(PT._slot_completion_status({"risk_snapshot_refresh": "completed"}), "completed")
+            self.assertEqual(PT._slot_completion_status(detail), "completed")
+        self.assertEqual(PT._slot_completion_status({"status": "failed"}), "failed")
 
-    def test_already_finished_worker_failure_is_not_idle_success(self):
-        thread = threading.Thread(target=lambda: None)
-        thread.start()
-        thread.join()
-        with patch.dict(PT._RISK_SNAPSHOT_REFRESH, thread=thread, running=False, last_error="RuntimeError: failed"):
-            self.assertEqual(PT.wait_risk_snapshot_refresh()["status"], "failed")
-        with patch.dict(PT._RISK_SNAPSHOT_REFRESH, thread=thread, running=False, last_error="cache_invalidation: warning"):
-            self.assertEqual(PT.wait_risk_snapshot_refresh()["status"], "completed")
+    def test_compatibility_status_keeps_worker_failure_visible(self):
+        with patch.object(PT, "risk_snapshot_refresh_status", return_value={
+            "status": "failed", "last_error": "RuntimeError: failed",
+        }):
+            result = PT.wait_risk_snapshot_refresh()
+        self.assertEqual(result, {"status": "failed", "error": "RuntimeError: failed"})
 
 
 class QuoteProbeTests(unittest.TestCase):

@@ -27,7 +27,7 @@ import paper_job_lifecycle as PJL
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 OWNER = os.path.join(BACKEND, "paper_job_lifecycle.py")
 WRITE_ON_TABLE = re.compile(
-    r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:paper_jobs|paper_job_runs)\b",
+    r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:paper_jobs|paper_job_runs|paper_dashboard_refresh_jobs)\b",
     re.IGNORECASE,
 )
 SCHEMA = """

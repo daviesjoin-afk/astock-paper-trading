@@ -23,8 +23,6 @@ def _result_exit_code(result):
         return 1
     if str(result.get("status") or "").strip().lower() not in _SUCCESS_STATUSES:
         return 1
-    if "risk_snapshot_refresh" in result and result["risk_snapshot_refresh"] != "completed":
-        return 1
     return 0
 
 
@@ -58,7 +56,7 @@ def _run(slot):
             result = (
                 paper.monitor_fast_entries()
                 if slot == "fast-entry"
-                else paper.run_slot(slot, risk_snapshot_background=False)
+                else paper.run_slot(slot)
             )
             PTM.outcome(result.get("status", "unknown"))
             result = {**result, "timing": PTM.snapshot("runner_result")}

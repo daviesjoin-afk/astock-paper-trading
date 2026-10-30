@@ -98,8 +98,13 @@ export function renderPaperAudit(d,filters,page){
 }
 
 export function renderPaperRisk(d){
+  var refresh=d.snapshot_refresh||{};
+  var refreshLabel=({queued:'等待刷新',running:'刷新中',completed:'刷新完成',failed:'刷新失败',unavailable:'刷新状态不可用'})[refresh.status];
+  var refreshNote=refreshLabel?'<p class="paper-status-note" role="status">展示快照：'+refreshLabel
+    +(refresh.last_completed_at?' · 最近完成 '+riskText(refresh.last_completed_at):'')
+    +(refresh.last_error?' · '+riskText(refresh.last_error)+'；保留已有快照，等待任务重试。':'')+'</p>':'';
   if(d.initializing){
-    $('paperRiskResult').innerHTML='<div class="loading">'+riskText(d.message||'正在后台建立风控快照…')+'</div>';
+    $('paperRiskResult').innerHTML='<div class="loading">'+riskText(d.message||'正在后台建立风控快照…')+'</div>'+refreshNote;
     return;
   }
   var overall=d.overall||{},ov=riskLevelView(overall.level);
@@ -135,7 +140,7 @@ export function renderPaperRisk(d){
   }).join('');
   html+='<section class="panel"><h3>数据质量与降级状态</h3>'+tableScroll('<table><tr><th>数据源</th><th>新鲜度</th><th>源时间</th><th>延迟</th><th>覆盖率</th><th>真实性核验</th><th>交易影响</th></tr>'+qualityRows+'</table>',820)+'</section>';
   html+='<div class="disclaimer">'+riskText(d.disclaimer)+'</div>';
-  $('paperRiskResult').innerHTML=html;
+  $('paperRiskResult').innerHTML=refreshNote+html;
 }
 
 export async function loadPaperRisk(forceRefresh){
