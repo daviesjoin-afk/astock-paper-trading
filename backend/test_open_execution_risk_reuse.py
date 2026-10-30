@@ -26,17 +26,20 @@ class _StopDownstream(Exception):
 
 class ExecuteOpenRiskReuseTests(unittest.TestCase):
     def test_empty_resume_result_is_reused(self):
-        gate = {"ready": False, "covered_codes": 0, "eligible_codes": 1,
-                "coverage_pct": 0.0, "required_codes": 1}
-        with mock.patch.object(PT, "init_db"), \
-                mock.patch.object(PT, "process_pending_execution_orders") as resume, \
-                mock.patch.object(PT.dfc, "check_data_source_health", return_value={}), \
-                mock.patch.object(PT, "_entry_freeze_status"), \
-                mock.patch.object(PT.MDSvc, "refresh_rows", return_value=[]), \
-                mock.patch.object(PT, "_live_scan_gate", return_value=gate):
-            result = PT.execute_open("2026-10-29", risk_result={}, execution_orders=[])
-        resume.assert_not_called()
-        self.assertEqual(result["execution_orders"], [])
+        for orders in ([], [{"order_id": 7, "status": "partially_filled",
+                              "filled_qty": 300, "remaining_qty": 700}]):
+            with self.subTest(orders=orders):
+                gate = {"ready": False, "covered_codes": 0, "eligible_codes": 1,
+                        "coverage_pct": 0.0, "required_codes": 1}
+                with mock.patch.object(PT, "init_db"), \
+                        mock.patch.object(PT, "process_pending_execution_orders") as resume, \
+                        mock.patch.object(PT.dfc, "check_data_source_health", return_value={}), \
+                        mock.patch.object(PT, "_entry_freeze_status"), \
+                        mock.patch.object(PT.MDSvc, "refresh_rows", return_value=[]), \
+                        mock.patch.object(PT, "_live_scan_gate", return_value=gate):
+                    result = PT.execute_open("2026-10-29", risk_result={}, execution_orders=orders)
+                resume.assert_not_called()
+                self.assertIs(result["execution_orders"], orders)
 
     def test_a_provided_risk_result_prevents_a_second_pass(self):
         risk = {"status": "ok", "orders": [{"id": "r1"}], "manual_orders": []}
