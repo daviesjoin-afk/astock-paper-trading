@@ -226,7 +226,11 @@ class ExtractedDecisionTests(unittest.TestCase):
         self.assertIn("news", calls)
         self.assertEqual(calls[-1], "news_meta")
         self.assertEqual(result["quote_map"], {"quote": True})
-        self.assertEqual(result["flow_trajectory_map"], {})
+        self.assertEqual(result["flow_trajectory_map"], {
+            "000002": {"status": "source_unavailable", "code": "000002",
+                       "error": "RuntimeError", "score_applied": False},
+        })
+        ports.trajectories.assert_called_once_with(["000002"], asof_day="2026-09-01")
         self.assertEqual(replace(ports, trajectories=lambda *args, **kwargs: {}).news, ports.news)
 
 

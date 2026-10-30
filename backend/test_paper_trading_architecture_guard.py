@@ -847,7 +847,9 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
     def test_guard9l_candidate_selection_uses_the_evidence_layer_and_pure_module(self):
         raw = _source("paper_risk_evidence.py")
         body = _named_function_source("paper_risk_evidence.py", "best_replacement_candidate", raw)
-        self.assertIn("PREPL.load_replacement_candidates(", body,
+        eligible = _named_function_source("paper_risk_evidence.py", "eligible_replacement_candidates", raw)
+        self.assertIn("eligible_replacement_candidates(", body)
+        self.assertIn("PREPL.load_replacement_candidates(", eligible,
                       "候选读取没有经过 as-of 有界的 evidence 层")
         self.assertIn("PRep.choose_best_candidate(", body,
                       "候选排序没有交给纯域模块")
