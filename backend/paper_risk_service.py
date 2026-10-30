@@ -453,11 +453,12 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     peak_price=scan_peak,
                 )
                 position["peak_price"] = scan_peak
-            downside_confirmed = PREv.downside_confirmed(
+            # 二轮确认：intent（两轮疑似出货/收益回吐）或 price_evidence
+            # （资金字段缺失、两轮价格证据一致）。后者只解锁部分减仓。
+            confirmation = PREv.downside_confirmation(
                 conn, position["account_id"], position["code"], day, downside_guard,
                 deps=ports.evidence,
             )
-            downside_guard["confirmed"] = downside_confirmed
             # 一次性减仓动作的当日去重统一走 execution_verification 的**唯一**判据：
             # "是否存在经过验证的**正成交**"。此前这里用整单谓词
             # （status='filled' + VERIFIED_PREDICATE），部分成交会被读成"没发生过"，
@@ -544,94 +545,42 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             # 之后，若连续两轮扫描（满足最小扫描间隔）均确认"疑似出货"，
             # 允许追加一次 partial 比例的减仓——兑现"连续两次扫描确认后
             # 才允许部分减仓"的审计口径；当日一次，条件恶化仍可升级 full。
+            # 2026-10-30：确认依据还可能是 price_evidence（资金证据缺失），
+            # 该通道只到 partial；判据全部下沉到 PREv.downside_action_plan。
             warning_confirmed_trimmed = EV.has_verified_positive_execution(
                 conn, marker="downside_warning_confirmed",
                 account_id=position["account_id"], code=position["code"],
                 asof_day=day, legacy_reason_like="%下跌预警连续两次确认减仓%",
             )
-            warning_actionable = bool(
-                position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
-                and downside_guard.get("level") == "warning"
-                and _num(downside_guard.get("sell_ratio")) > 0
-                and not warning_trimmed
+            plan = PREv.downside_action_plan(
+                position["account_id"], downside_guard,
+                confirmation=confirmation,
+                warning_account_ids=("tq_breakout", NEW_STRATEGY_ID),
+                warning_trimmed=warning_trimmed,
+                warning_confirmed_trimmed=warning_confirmed_trimmed,
+                level_trimmed=guard_level_trimmed,
             )
-            warning_confirmed_trim = bool(
-                position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
-                and downside_guard.get("level") == "warning"
-                and downside_confirmed
-                and ((downside_guard.get("main_force_intent") or {}).get("classification")
-                     == "distribution")
-                and warning_trimmed
-                and not warning_confirmed_trimmed
-            )
-            guard_actionable = (
-                (downside_guard.get("level") in {"partial", "full"} and downside_confirmed
-                 and not guard_level_trimmed)
-                or warning_actionable
-                or warning_confirmed_trim
-            )
-            guard_pending = downside_guard.get("level") in {"partial", "full"} and not downside_confirmed
-            if guard_actionable and not concentration_triggered:
-                if warning_confirmed_trim:
-                    # 追加减仓按 partial 比例执行（sell_ratio 在 warning 级
-                    # 只带首段比例，不能代表确认后的处置力度）。
-                    ratio = max(
-                        ratio,
-                        _num((downside_guard.get("policy") or {}).get("partial_ratio"),
-                             _num(downside_guard.get("sell_ratio"), 0.0)),
-                    )
-                else:
-                    ratio = max(ratio, _num(downside_guard.get("sell_ratio"), 0.0))
-                guard_level = downside_guard.get("level")
-                if warning_confirmed_trim:
-                    quality_action = "downside_warning_confirmed"
-                elif warning_actionable:
-                    quality_action = "downside_warning_trim"
-                else:
-                    quality_action = f"downside_{guard_level}"
+            downside_guard["confirmed"] = plan["confirmed"]
+            if plan["confirm_basis"]:
+                downside_guard["confirm_basis"] = plan["confirm_basis"]
+            downside_guard["confirmation"] = plan
+            if plan["actionable"] and not concentration_triggered:
+                ratio = max(ratio, plan["trim_ratio"])
+                quality_action = plan["action"]
                 # 当日去重的结构化消费标记（P1 审计修复 2026-09-02）：
                 # 卖出订单 payload 携带 exit_marker，次日/下一级别仍可升级。
                 detail["exit_marker"] = quality_action
-                mfi_label = ((downside_guard.get('main_force_intent') or {}).get('label') or '不确定')
-                if warning_confirmed_trim:
-                    quality_reason = (
-                        f"下跌预警连续两次确认减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
-                        f"{downside_guard.get('reason')}；主力意图 {mfi_label}"
-                    )
-                elif warning_actionable:
-                    quality_reason = (
-                        f"下跌预警首段减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
-                        f"{downside_guard.get('reason')}；主力意图 {mfi_label}"
-                    )
-                else:
-                    quality_reason = (
-                        f"下跌{guard_level}已连续两次确认：{downside_guard.get('reason')}；"
-                        f"主力意图 {mfi_label}"
-                    )
+                quality_reason = plan["reason"]
                 reason = f"{quality_reason}；覆盖常规卖出比例" if reason else quality_reason
-            elif guard_pending or downside_guard.get("level") == "warning":
-                if not concentration_triggered:
-                    quality_action = "downside_warning"
-                    quality_reason = (
-                        f"下跌预警待确认：{downside_guard.get('reason')}；"
-                        "连续两次扫描确认后才允许部分/全部减仓"
-                    )
-                if not concentration_triggered:
-                    _risk_log(
-                        conn,
-                        position["account_id"],
-                        position["code"],
-                        "sell",
-                        (
-                            f"downside_{downside_guard.get('level')}_pending"
-                            if guard_pending else "downside_warning"
-                        ),
-                        quality_reason,
-                        {"downside_guard": downside_guard, "quote_status": quote_status},
-                        authority="RISK",
-                        decision_kind=("downside_pending" if guard_pending
-                                       else "downside_warning"),
-                    )
+            elif (plan["pending"] or guard_level == "warning") and not concentration_triggered:
+                quality_action = "downside_warning"
+                quality_reason = plan["pending_reason"]
+                _risk_log(
+                    conn, position["account_id"], position["code"], "sell",
+                    plan["pending_decision"], quality_reason,
+                    {"downside_guard": downside_guard, "quote_status": quote_status},
+                    authority="RISK", decision_kind=plan["pending_decision_kind"],
+                )
             PREv.save_position_review(conn, cycle_id, quality_review, quality_action, quality_reason)
             if ratio <= 0:
                 continue
