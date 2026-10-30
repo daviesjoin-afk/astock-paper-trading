@@ -30,6 +30,8 @@ suffix:moonshot.cn
 suffix:mimo.ai
 # --- package mirrors, docs and public assets ---
 host:deb.debian.org
+# Docker 官方 apt 源：OCI Ubuntu 实例安装 docker-ce / compose 插件的公共仓库
+host:download.docker.com
 host:mirrors.cloud.tencent.com
 host:mirrors.aliyun.com
 host:pypi.org
