@@ -12,6 +12,10 @@ CROSS_RELAX_LIMIT_SECONDS = 90.0
 CROSS_PRICE_GAP_TOLERANCE = 0.005
 CROSS_PCT_GAP_TOLERANCE = 0.20
 CROSS_RELAXED_PRICE_GAP_LIMIT = 0.020
+#: 涨跌幅差的放宽上限（百分点）。与价差同比例放宽，但上限低于价差：
+#: 涨跌幅差是"两个源对跌幅的读数差"，它一旦过大意味着两源对**方向**的
+#: 读数不一致，方向一致性那道闸门（``direction_ok``）才是主防线。
+CROSS_RELAXED_PCT_GAP_LIMIT = 0.60
 #: 平盘带：两源涨跌幅都落在这个带内时，方向一致性没有意义，不判方向冲突。
 CROSS_FLAT_PCT_BAND = 0.5
 
@@ -103,9 +107,17 @@ def cross_source_verdict(
             CROSS_RELAXED_PRICE_GAP_LIMIT,
             CROSS_PRICE_GAP_TOLERANCE * time_skew / CROSS_TIGHT_SKEW_SECONDS,
         ) * scale
+        # 涨跌幅差同样要随时滞放宽：两次采样之间价格又走了一段，涨跌幅差与
+        # 价差是同一件事的两种表达（幅差 ≈ 价差/昨收）。现网实测 603239 在
+        # 急跌中 66 秒时滞下价差 0.450%、幅差 0.406pp，价差已落在放宽容差内，
+        # 幅差却因固定 0.20pp 阈值被判失败 —— 两项口径不一致造成的假失败。
+        pct_tolerance = min(
+            CROSS_RELAXED_PCT_GAP_LIMIT,
+            CROSS_PCT_GAP_TOLERANCE * time_skew / CROSS_TIGHT_SKEW_SECONDS,
+        ) * scale
     else:
         price_tolerance = CROSS_PRICE_GAP_TOLERANCE * scale
-    pct_tolerance = CROSS_PCT_GAP_TOLERANCE * scale
+        pct_tolerance = CROSS_PCT_GAP_TOLERANCE * scale
     direction_ok = (pct is not None and cross_pct_value is not None and (
         (pct > 0 and cross_pct_value > 0) or (pct < 0 and cross_pct_value < 0)
         or (abs(pct) <= CROSS_FLAT_PCT_BAND and abs(cross_pct_value) <= CROSS_FLAT_PCT_BAND)))

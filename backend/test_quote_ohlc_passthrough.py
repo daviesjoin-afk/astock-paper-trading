@@ -143,6 +143,13 @@ class TencentSnapshotRowAssemblyTests(unittest.TestCase):
         patcher = mock.patch.object(dfc, "fetch_sina_realtime_for_codes", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 主机级可达性是 data_fetcher 的**模块级**事实（每次 _fetch_clist 都会写）。
+        # 同一进程里更早的用例若把"全部 clist 主机不可达"这条事实留下来，本类的
+        # 快照断言就会被污染成 host_unreachable。这里显式复位，让断言只依赖本用例
+        # 自己构造的输入（不代表生产行为变化：生产中每轮都会重新判定）。
+        reachability_patcher = mock.patch.object(dfc, "_clist_reachability", {})
+        reachability_patcher.start()
+        self.addCleanup(reachability_patcher.stop)
 
     def _cleanup(self):
         for name in os.listdir(self._dir):
