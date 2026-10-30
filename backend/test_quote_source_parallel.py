@@ -87,6 +87,52 @@ class QuoteSourceParallelismTests(unittest.TestCase):
         # 独立源被提升为主报价后，不能再用自己核验自己。
         self.assertNotEqual(row["quote_validation"], "cross_source_checked")
 
+    def test_missing_independent_quote_is_backfilled_once_and_marked(self):
+        """批量里缺一票时必须单票补抓，而不是直接报"独立行情源未返回"。"""
+        day = dt.datetime.now(TZ).date()
+        stamp = dt.datetime.now(TZ).isoformat(timespec="seconds")
+        primary = {"code": "600001", "price": 10.0, "pct": 1.0, "quote_at": stamp,
+                   "source": "eastmoney_ulist", "super_net": 1.0, "main_pct": 0.1}
+        backfilled = {"code": "600001", "price": 10.02, "pct": 1.05, "quote_at": stamp,
+                      "source": "sina_public_quote"}
+        with mock.patch.object(PT.dfc, "fetch_realtime_for_codes", return_value=[primary]), \
+                mock.patch.object(PT.dfc, "fetch_independent_realtime_for_codes", return_value=[]), \
+                mock.patch.object(PT.dfc, "fetch_sina_realtime_for_codes",
+                                  return_value=[backfilled]) as sina, \
+                mock.patch.object(PT.dfc, "enrich_live_flow_details", return_value={}), \
+                mock.patch.object(PT, "_latest_price_map", return_value={}), \
+                mock.patch.object(PT, "_universe_snapshot_time", return_value=None), \
+                mock.patch.object(PT.PLTrad, "prefetch", return_value={}):
+            row = PT._quotes(["600001"], asof_date=day)["600001"]
+
+        sina.assert_called_once_with(["600001"])
+        self.assertEqual(row["quote_validation"], "cross_source_checked")
+        self.assertTrue(row["quote_cross_check"]["cross_retry"])
+        self.assertTrue(row["quote_cross_check"]["passed"])
+        self.assertNotIn("未返回", str(row["quote_cross_check"]["failure_reason"] or ""))
+
+    def test_failed_backfill_keeps_the_original_source_error(self):
+        """补抓失败才允许退化：原文错误必须留在 source_errors 里。"""
+        day = dt.datetime.now(TZ).date()
+        stamp = dt.datetime.now(TZ).isoformat(timespec="seconds")
+        primary = {"code": "600001", "price": 10.0, "pct": 1.0, "quote_at": stamp,
+                   "source": "eastmoney_ulist", "super_net": 1.0, "main_pct": 0.1}
+        with mock.patch.object(PT.dfc, "fetch_realtime_for_codes", return_value=[primary]), \
+                mock.patch.object(PT.dfc, "fetch_independent_realtime_for_codes",
+                                  side_effect=RuntimeError("independent down")), \
+                mock.patch.object(PT.dfc, "fetch_sina_realtime_for_codes",
+                                  return_value=[]) as sina, \
+                mock.patch.object(PT.dfc, "enrich_live_flow_details", return_value={}), \
+                mock.patch.object(PT, "_latest_price_map", return_value={}), \
+                mock.patch.object(PT, "_universe_snapshot_time", return_value=None), \
+                mock.patch.object(PT.PLTrad, "prefetch", return_value={}):
+            row = PT._quotes(["600001"], asof_date=day)["600001"]
+
+        sina.assert_called_once_with(["600001"])
+        self.assertEqual(row["quote_validation"], "range_timestamp_checked")
+        self.assertIn("independent down", row["quote_source_errors"]["cross"])
+        self.assertNotIn("cross_retry", row["quote_cross_check"])
+
 
 if __name__ == "__main__":
     unittest.main()

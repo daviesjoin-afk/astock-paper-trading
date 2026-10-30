@@ -18,6 +18,7 @@ if BACKEND not in sys.path:
 import execution_planner as EP  # noqa: E402
 import paper_account_specs as ACS  # noqa: E402
 import paper_position_risk_state as PPRS  # noqa: E402
+import paper_risk_decision as PRD  # noqa: E402
 import paper_risk_evidence as PREv  # noqa: E402
 import paper_risk_scan_state as PRSS  # noqa: E402
 import paper_risk_service as PRSVC  # noqa: E402
@@ -831,6 +832,261 @@ class RiskServiceContractTests(_RiskServiceCase):
             finally:
                 case.doCleanups()
 
+
+
+class DownsidePriceEvidenceReachabilityTests(_RiskServiceCase):
+    """2026-10-30 P0「下跌确认不可达」回归（RSVC-20 ~ RSVC-24）。
+
+    线上现场：东贝集团 601956 当日 -8.21%、相对沪深300 -6.80%，东财 ulist 偶发
+    缺 ``super_net`` / ``main_pct`` / ``vol_ratio``——价格类证据齐全，资金类缺失。
+    旧口径把两类缺失混装成 ``len(missing)/5``，usable 只有 0.6，confidence
+    0.54 < 0.58，意图分类恒为 ``uncertain``，于是：
+
+    * ``intraday_downside_guard`` 只能落到 warning 级；
+    * ``downside_confirmed`` 要求两轮都是 ``distribution`` → 永久 False；
+    * warning 首段减仓一天只用一次 → 二次确认永久不可达 → 真跌 -8% 也不减仓。
+
+    这组用例钉住修复后的语义边界：**价格证据只能确认"部分"减仓，清仓（full）
+    仍然只认 distribution 意图**；洗盘证据的压制同样不被新通道绕过。
+    """
+
+    COST = 9.0
+    PRICE = 9.179          # 相对成本 +1.99%：硬止损/移动止损都抢不到这次处置
+    PCT = -8.21
+    HIGH = 9.30
+    LOW = 9.15
+    MARKET_PCT = -1.41     # 相对沪深300 = -8.21 - (-1.41) = -6.80%
+
+    def setUp(self):
+        super().setUp()
+        # 夹具默认只给 breadth/sentiment（相对强弱=未知）。价格证据要过 50 分
+        # 必须带上"相对沪深300弱 -6.80%"这一条，因此补一个当日指数参照。
+        PT._cached_close_market = lambda conn, day, allow_network=False: {
+            "breadth": 0.5, "sentiment": "neutral",
+            "live_index_pct": self.MARKET_PCT,
+            "live_index_time": f"{self.day.isoformat()} 14:50:00",
+            "index_reference": {"status": "same_session"},
+        }
+
+    # ── 夹具 ─────────────────────────────────────────────────────────────
+    def incident_quote(self, *, minute=50, **overrides):
+        """东贝集团式行情：资金字段（main_pct / super_net / vol_ratio）缺失。"""
+        self.set_quote(self.code, price=self.PRICE, pct=self.PCT,
+                       high=self.HIGH, low=self.LOW)
+        quote = self._inner.quotes_map[self.code]
+        quote["quote_at"] = f"{self.day.isoformat()} 14:{minute:02d}:00"
+        quote.update(overrides)
+        return quote
+
+    def position(self, *, cost=None):
+        cost = self.COST if cost is None else cost
+        return {
+            "account_id": self.ACCOUNT, "code": self.code, "name": "测试股",
+            "qty": 300, "available_qty": 300, "cost": cost, "peak_price": cost,
+            "today_acquired_qty": 0,
+            "entry_date": (self.day - dt.timedelta(days=1)).isoformat(),
+        }
+
+    def guard(self, quote, *, cost=None, news=None, market_pct=None):
+        return PREv.intraday_downside_guard(
+            self.position(cost=cost), quote,
+            market={"live_index_pct": self.MARKET_PCT if market_pct is None else market_pct},
+            news=[] if news is None else news,
+            asof_day=self.day,
+            deps=PT._risk_service_ports().evidence,
+        )
+
+    def decisions(self, decision=None):
+        sql = ("SELECT id,decision,reason,payload,created_at FROM paper_risk_decisions"
+               " WHERE account_id=? AND code=? AND side='sell'")
+        params = [self.ACCOUNT, self.code]
+        if decision is not None:
+            sql += " AND decision=?"
+            params.append(decision)
+        return self.conn.execute(sql + " ORDER BY id", tuple(params)).fetchall()
+
+    def pin_decision_to_asof_day(self, *, decision, created_at):
+        """把决策行的 created_at 钉到 asof_day。
+
+        线上不变量是"当日扫描写当日行"；历史日期夹具里 ``_now()`` 是真实时钟，
+        不钉住的话 ``downside_confirmation`` 的 ``substr(created_at,1,10)=asof``
+        过滤会把上一轮记录当成不存在——那是夹具失真，不是生产口径。
+        """
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "UPDATE paper_risk_decisions SET created_at=?"
+                " WHERE account_id=? AND code=? AND side='sell' AND decision=?",
+                (created_at, self.ACCOUNT, self.code, decision))
+
+    def seed_prior_scan(self, guard, *, decision, at):
+        with PT._db(immediate=True) as conn:
+            PT._risk_log(
+                conn, self.ACCOUNT, self.code, "sell", decision, "上一轮扫描",
+                {"downside_guard": guard}, authority="RISK",
+                decision_kind=("downside_pending" if decision.endswith("_pending")
+                               else "downside_warning"),
+            )
+        self.pin_decision_to_asof_day(decision=decision, created_at=at)
+
+    def latest_sell_payload(self):
+        row = self.conn.execute(
+            "SELECT risk_payload FROM paper_orders WHERE account_id=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1", (self.ACCOUNT,)).fetchone()
+        return json.loads(row["risk_payload"]) if row is not None else {}
+
+    # ── (i) 资金缺失 + -8.21% + 两轮 3 分钟 → 第二轮 partial（不是 full）──
+    def test_rsvc20_flow_gaps_confirm_partial_on_second_scan(self):
+        self.add_lot_for(self.code, 300, self.COST)
+        self.incident_quote(minute=50)
+        first = self.run_risk()
+        self.assertEqual(
+            [item for item in first.get("orders", []) if item.get("status") == "filled"],
+            [], f"首轮不得卖出（需要独立二次确认）：{first.get('orders')}")
+
+        pending = self.decisions("downside_partial_pending")
+        self.assertEqual(len(pending), 1, [dict(row) for row in self.decisions()])
+        prior_guard = json.loads(pending[0]["payload"])["downside_guard"]
+        self.assertEqual(prior_guard["level"], "partial")
+        self.assertEqual(prior_guard["confirm_basis"], "price_evidence")
+        self.assertFalse(prior_guard["confirmed"])
+        intent = prior_guard["main_force_intent"]
+        self.assertEqual(intent["classification"], "downturn")
+        self.assertEqual(intent["label"], "下跌确认（资金证据缺失）")
+        self.assertEqual(
+            intent["action_hint"], "价格证据充分，允许部分减仓，禁止据此加仓")
+        self.assertGreaterEqual(intent["distribution_score"], 50.0)
+        self.assertEqual(set(prior_guard["intent_data_gaps"]),
+                         {"主力净流入占比", "超大单资金", "量比"})
+        self.assertIn("资金证据缺失，按价格证据判定", prior_guard["reason"])
+        self.assertIn("待确认", self.review_detail().get("action_reason", ""))
+        self.pin_decision_to_asof_day(
+            decision="downside_partial_pending",
+            created_at=f"{self.day.isoformat()} 14:50:00")
+
+        # 下一轮独立扫描（3 分钟后）：同一份价格证据 → 确认并减仓。
+        self.clear_scan_state()
+        self.incident_quote(minute=53)
+        second = self.run_risk()
+        filled = [item for item in second.get("orders", []) if item.get("status") == "filled"]
+        self.assertEqual(len(filled), 1, f"二次确认没有减仓：{second.get('orders')}")
+        # 300 × 35% = 105 → 整手 100：部分减仓，绝不是清仓。
+        self.assertEqual(int(filled[0]["qty"]), 100)
+        orders = self.sell_orders()
+        self.assertEqual(len(orders), 1)
+        self.assertLess(int(orders[0]["qty"]), 300, "价格证据确认绝不清仓")
+        guard = self.latest_sell_payload()["downside_guard"]
+        self.assertTrue(guard["confirmed"])
+        self.assertEqual(guard["confirm_basis"], "price_evidence")
+        self.assertEqual(guard["confirmation"]["confirm_basis"], "price_evidence")
+        self.assertEqual(guard["level"], "partial")
+        self.assertEqual(self.review_detail().get("action"), "downside_partial")
+        self.assertIn("价格证据确认（资金证据缺失）",
+                      self.review_detail().get("action_reason", ""))
+
+    # ── (ii) 只有一轮 → 永不确认 ────────────────────────────────────────
+    def test_rsvc21_single_scan_never_confirms(self):
+        self.add_lot_for(self.code, 300, self.COST)
+        self.incident_quote(minute=50)
+        result = self.run_risk()
+        self.assertEqual(self.sell_orders(), [], "单轮扫描不得产生卖出委托")
+        self.assertEqual(
+            [item for item in result.get("orders", []) if item.get("status") == "filled"], [])
+        self.assertEqual(self.review_detail().get("action"), "downside_warning")
+        guard = json.loads(self.decisions()[-1]["payload"])["downside_guard"]
+        self.assertFalse(guard["confirmed"])
+        self.assertFalse(
+            PREv.downside_confirmed(
+                self.conn, self.ACCOUNT, self.code, self.day, guard,
+                deps=PT._risk_service_ports().evidence),
+            "没有更早的独立扫描时确认必须 fail-closed")
+
+    # ── (iii) downturn 不吃 0.58 置信度门槛，但仍然照实输出 confidence ──
+    def test_rsvc22_downturn_does_not_weigh_confidence_gate(self):
+        quote = self.incident_quote(minute=50, main_pct=1.5)
+        intent = PRD.main_force_intent(
+            self.position(), quote,
+            market={"live_index_pct": self.MARKET_PCT}, news=[])
+        self.assertEqual(intent["classification"], "downturn")
+        self.assertLess(intent["confidence"], 0.58,
+                        "本用例刻意构造 confidence 不足 0.58 的价格证据场景")
+        self.assertGreaterEqual(intent["distribution_score"], 50.0)
+        self.assertLess(intent["washout_score"], intent["distribution_score"])
+        self.assertEqual(intent["price_evidence_missing"], [])
+        self.assertEqual(set(intent["flow_evidence_missing"]), {"超大单资金", "量比"})
+        guard = self.guard(quote)
+        self.assertEqual(guard["level"], "partial")
+        self.assertEqual(guard["confirm_basis"], "price_evidence")
+        self.assertEqual(guard["main_force_intent"]["confidence"], intent["confidence"])
+
+    # ── (iii) distribution 正常路径不变，full 仍然只认意图 ───────────────
+    def test_rsvc23_distribution_path_unchanged_and_full_needs_intent(self):
+        quote = self.incident_quote(
+            minute=50, main_pct=-6.0, super_net=-2.0e6, vol_ratio=1.8)
+        intent = PRD.main_force_intent(
+            self.position(), quote,
+            market={"live_index_pct": self.MARKET_PCT}, news=[])
+        self.assertEqual(intent["classification"], "distribution")
+        self.assertEqual(intent["label"], "疑似出货")
+        self.assertEqual(intent["action_hint"], "冻结加仓，优先复核可卖仓位")
+        self.assertGreaterEqual(intent["confidence"], 0.58)
+        self.assertEqual(intent["missing"], [])
+
+        # 亏损仓位 + 两轮出货证据：仍是 full（清仓），confirm_basis 走意图。
+        full_guard = self.guard(quote, cost=10.0)
+        self.assertEqual(full_guard["level"], "full")
+        self.assertEqual(full_guard["sell_ratio"], 1.0)
+        self.assertEqual(full_guard["confirm_basis"], "intent")
+        prior = {**full_guard, "asof": f"{self.day.isoformat()} 14:50:00"}
+        current = {**full_guard, "asof": f"{self.day.isoformat()} 14:53:00"}
+        self.seed_prior_scan(
+            prior, decision="downside_full_pending",
+            at=f"{self.day.isoformat()} 14:50:00")
+        confirmation = PREv.downside_confirmation(
+            self.conn, self.ACCOUNT, self.code, self.day, current,
+            deps=PT._risk_service_ports().evidence)
+        self.assertTrue(confirmation["confirmed"])
+        self.assertEqual(confirmation["basis"], "intent")
+
+        # 价格证据通道绝不确认 full：级别集合直接排除它。
+        self.assertFalse(
+            PREv._price_evidence_confirmed(
+                {**prior, "level": "partial"}, {**current, "level": "full"}, "partial"),
+            "full 级不得由价格证据确认")
+
+    # ── (iv) 洗盘仍压制 downturn 的部分减仓（负新闻才解除）────────────
+    def test_rsvc24_washout_still_blocks_price_evidence_partial(self):
+        quote = self.incident_quote(
+            minute=50, high=9.25, low=9.0,
+            main_pct=3.0, super_net=1.0e6, vol_ratio=1.6)
+        guard = self.guard(quote)                       # 相对 -6.80%
+        self.assertEqual(guard["main_force_intent"]["classification"], "washout")
+        self.assertEqual(guard["level"], "warning")
+        self.assertEqual(guard["sell_ratio"], guard["policy"]["warning_trim_ratio"])
+
+        # 两轮 washout 的 warning 不得被新的价格证据通道抬成部分减仓。
+        prior = {**guard, "asof": f"{self.day.isoformat()} 14:50:00"}
+        current = {**guard, "asof": f"{self.day.isoformat()} 14:53:00"}
+        self.seed_prior_scan(
+            prior, decision="downside_warning",
+            at=f"{self.day.isoformat()} 14:50:00")
+        confirmation = PREv.downside_confirmation(
+            self.conn, self.ACCOUNT, self.code, self.day, current,
+            deps=PT._risk_service_ports().evidence)
+        self.assertFalse(confirmation["confirmed"], "洗盘证据必须否决价格证据通道")
+        self.assertIsNone(confirmation["basis"])
+
+        # 负新闻解除洗盘豁免：同样的价格证据不再读成 washout，通道恢复
+        # （守卫里的 washout 抑制只对"仍被读成洗盘"的两轮生效）。
+        news = [{"code": self.code, "tone": -1, "title": "立案调查公告"}]
+        news_guard = self.guard(quote, news=news)
+        self.assertTrue(news_guard["negative_news"])
+        self.assertNotEqual(
+            news_guard["main_force_intent"]["classification"], "washout")
+        news_prior = {**news_guard, "asof": f"{self.day.isoformat()} 14:50:00"}
+        news_current = {**news_guard, "asof": f"{self.day.isoformat()} 14:53:00"}
+        self.assertTrue(
+            PREv._price_evidence_confirmed(news_prior, news_current, "warning"),
+            "负新闻之后价格证据通道应当重新可用")
 
 
 if __name__ == "__main__":

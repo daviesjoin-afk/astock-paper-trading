@@ -41,6 +41,61 @@ class PaperQuotePolicyTests(unittest.TestCase):
         self.assertEqual(result["status"], "cross_source_checked")
         self.assertTrue(result["fresh"])
 
+    def verdict(self, *, skew_seconds, primary_price=10.0, primary_pct=1.0,
+                cross_price=10.0, cross_pct=1.0):
+        base = dt.datetime(2026, 9, 3, 10, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        return policy.cross_source_verdict(
+            primary_price, primary_pct, base.isoformat(),
+            cross_price, cross_pct,
+            (base + dt.timedelta(seconds=skew_seconds)).isoformat(),
+            expected_day=dt.date(2026, 9, 3),
+        )
+
+    def test_sixty_second_skew_relaxes_same_direction_price_gap(self):
+        """60s 采样时滞 + 1.5% 价差 + 同向：按时滞放宽后通过，但必须标 degraded。"""
+        result = self.verdict(skew_seconds=60, primary_price=10.15, primary_pct=1.2,
+                              cross_price=10.0, cross_pct=1.1)
+        self.assertEqual(result["validation"], "cross_source_checked")
+        self.assertTrue(result["degraded"])
+        self.assertTrue(result["relaxed"])
+        self.assertEqual(result["time_skew_seconds"], 60.0)
+        self.assertEqual(result["price_gap_pct"], 1.5)
+        self.assertIn("60s 采样时滞放宽", result["reason"])
+
+    def test_sixty_second_skew_with_opposite_direction_still_fails(self):
+        """时滞放宽不得掩盖方向分歧：一涨一跌必须判 failed。"""
+        result = self.verdict(skew_seconds=60, primary_price=10.0, primary_pct=1.2,
+                              cross_price=10.0, cross_pct=-0.9)
+        self.assertEqual(result["validation"], "cross_source_failed")
+        self.assertFalse(result["degraded"])
+        self.assertIn("方向不一致", result["reason"])
+
+    def test_ten_second_skew_keeps_the_strict_tolerance(self):
+        """10s 内属于同一采样窗口，1.5% 价差照旧超阈值——旧口径不放松。"""
+        result = self.verdict(skew_seconds=10, primary_price=10.15, primary_pct=1.2,
+                              cross_price=10.0, cross_pct=1.1)
+        self.assertEqual(result["validation"], "cross_source_failed")
+        self.assertFalse(result["relaxed"])
+        self.assertLess(result["price_tolerance_pct"], 1.5)
+        self.assertIn("双源差异超阈值", result["reason"])
+
+    def test_skew_beyond_the_relax_window_keeps_the_old_verdict(self):
+        """|Δt| > 90s 维持现状：不放宽、不新增语义。"""
+        result = self.verdict(skew_seconds=150, primary_price=10.15, primary_pct=1.2,
+                              cross_price=10.0, cross_pct=1.1)
+        self.assertEqual(result["validation"], "cross_source_failed")
+        self.assertFalse(result["relaxed"])
+        self.assertEqual(result["price_tolerance_pct"], 0.5)
+
+    def test_missing_cross_source_degrades_to_single_source_without_retry(self):
+        base = dt.datetime(2026, 9, 3, 10, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        result = policy.cross_source_verdict(
+            10.0, 1.0, base.isoformat(), 0, 999, None, expected_day=dt.date(2026, 9, 3),
+        )
+        self.assertEqual(result["validation"], "range_timestamp_checked")
+        self.assertEqual(result["reason"], "独立行情源未返回有效价格或时间")
+        self.assertFalse(result["available"])
+
 
 if __name__ == "__main__":
     unittest.main()

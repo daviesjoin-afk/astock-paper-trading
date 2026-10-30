@@ -242,8 +242,13 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     peak_return = (peak / cost - 1) * 100 if peak and cost else None
     giveback = peak_return - ret_pct if peak_return is not None and ret_pct is not None else None
     intent = PRD.main_force_intent(position, quote, market=market, news=news)
-    distribution = intent.get("classification") == "distribution" and intent.get("confidence", 0) >= 0.58
-    washout = intent.get("classification") == "washout" and intent.get("confidence", 0) >= 0.58
+    classification = intent.get("classification")
+    distribution = classification == "distribution" and intent.get("confidence", 0) >= 0.58
+    washout = classification == "washout" and intent.get("confidence", 0) >= 0.58
+    # 2026-10-30 P0「下跌确认不可达」：价格证据齐全、资金字段缺失时，
+    # 意图分类为 ``downturn``。它不是"出货"的证据（没有资金证据就不下这个
+    # 断言），所以只解锁**部分**减仓；清仓（full）仍然只认 distribution。
+    downturn = classification == "downturn"
     negative_news = bool(_negative_hits(news or [], str(position.get("code") or "")))
     warning = bool(
         (pct is not None and pct <= policy["warning_pct"])
@@ -273,8 +278,10 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     )
     # Distribution needs both price weakness and an independent confirmation;
     # a large fall with positive/neutral flow is treated as possible washout.
+    # ``downturn`` 走同一条部分减仓通道，但**不**参与 severe/full：
+    # 没有资金证据的深跌只允许按 partial_ratio 处理。
     partial = bool(
-        distribution
+        (distribution or downturn)
         and pct is not None and pct <= policy["partial_pct"]
         and (ret_pct is None or ret_pct <= 0 or (relative is not None and relative <= policy["relative_pct"]))
     )
@@ -349,12 +356,24 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
             f"收益回吐保护：峰值收益 {peak_return:.2f}%、已回吐 {giveback:.2f}%"
         )
     reasons.append(intent.get("label") or "主力意图不确定")
+    if downturn:
+        reasons.append("资金证据缺失，按价格证据判定")
+    # ``confirm_basis`` 说明"这次减仓结论靠什么证据成立"：意图（distribution/
+    # 洗盘对照）还是单纯的价格证据。二轮确认据此区分两条通道，且 full 只认 intent。
+    if level == "none":
+        confirm_basis = None
+    elif downturn or ((giveback_partial or giveback_severe) and not distribution):
+        confirm_basis = "price_evidence"
+    else:
+        confirm_basis = "intent"
     return {
         "level": level,
         "sell_ratio": sell_ratio,
         "reason": "；".join(reasons) if reasons else "未达到下跌预警条件",
         "policy": policy,
         "main_force_intent": intent,
+        "confirm_basis": confirm_basis,
+        "intent_data_gaps": list(intent.get("missing") or []),
         "intraday_pct": round(pct, 2) if pct is not None else None,
         "cost_return_pct": round(ret_pct, 2) if ret_pct is not None else None,
         "relative_to_market_pct": round(relative, 2) if relative is not None else None,
@@ -380,14 +399,75 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     }
 
 
-def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvidenceDeps):
-    """Require a distinct prior five-minute scan with the same adverse intent."""
+#: 价格证据确认只在 warning/partial 之间成立：**full（清仓）仍然只认
+#: distribution 意图**，绝不被价格噪声触发。
+PRICE_EVIDENCE_CONFIRMATION_LEVELS = frozenset({"warning", "partial"})
+
+#: ``downside_confirmation`` 的确认依据取值。
+CONFIRM_BASIS_INTENT = "intent"
+CONFIRM_BASIS_PRICE_EVIDENCE = "price_evidence"
+
+
+def _confirmation(confirmed, basis, reason):
+    return {"confirmed": bool(confirmed), "basis": basis, "reason": reason}
+
+
+def _price_evidence_confirmed(prior_guard, current_guard, prior_level):
+    """两轮**价格证据**是否已经一致（不依赖主力意图分类）。
+
+    2026-10-30 P0「下跌确认不可达」：资金字段（``super_net`` / ``main_pct`` /
+    ``vol_ratio``）偶发缺失时，意图分类只能给出 ``downturn`` 甚至
+    ``uncertain``，旧实现要求 ``prior==current=='distribution'``，于是二次确认
+    永远 False、真跌 -8% 也不减仓。这里改用**两轮都成立的价格证据**作为独立通道：
+
+    * 两轮级别都在 {warning, partial}（full 不在此列）；
+    * 两轮 ``intraday_pct`` 都不高于该策略 ``partial_pct``，
+      或两轮 ``peak_retrace_pct`` 都不低于 ``peak_retrace_pct`` 阈值；
+    * 任一轮读出"疑似洗盘"即否决——洗盘抑制必须继续有效
+      （只有负新闻/超线亏损才解除，那条判断在守卫里）。
+    """
+    current_level = current_guard.get("level")
+    if prior_level not in PRICE_EVIDENCE_CONFIRMATION_LEVELS:
+        return False
+    if current_level not in PRICE_EVIDENCE_CONFIRMATION_LEVELS:
+        return False
+    classes = {
+        (prior_guard.get("main_force_intent") or {}).get("classification"),
+        (current_guard.get("main_force_intent") or {}).get("classification"),
+    }
+    if "washout" in classes:
+        return False
+    policy = current_guard.get("policy") or {}
+    partial_pct = _num(policy.get("partial_pct"), None)
+    retrace_pct = _num(policy.get("peak_retrace_pct"), None)
+    prior_pct = _num(prior_guard.get("intraday_pct"), None)
+    current_pct = _num(current_guard.get("intraday_pct"), None)
+    if (partial_pct is not None and prior_pct is not None and current_pct is not None
+            and prior_pct <= partial_pct and current_pct <= partial_pct):
+        return True
+    prior_retrace = _num(prior_guard.get("peak_retrace_pct"), None)
+    current_retrace = _num(current_guard.get("peak_retrace_pct"), None)
+    if (retrace_pct is not None and prior_retrace is not None
+            and current_retrace is not None
+            and prior_retrace >= retrace_pct and current_retrace >= retrace_pct):
+        return True
+    return False
+
+
+def downside_confirmation(conn, account_id, code, asof_day, guard, *, deps: RiskEvidenceDeps):
+    """两轮独立扫描是否已确认下行信号——连同**确认依据**一起返回。
+
+    返回 ``{"confirmed": bool, "basis": "intent"|"price_evidence"|None,
+    "reason": str}``。调用方（``paper_risk_service``）据此区分
+    "意图确认"与"价格证据确认（资金证据缺失）"，并把结论写进审计 payload。
+    full 级仍严格要求 intent（distribution）；本函数的价格通道最高只到 partial。
+    """
     # 2026-09-03 二次确认减仓：warning 级也允许走两次确认。首段减仓
     # 一天只有一次，之后价格长期停在 warning 区间（跌不深但持续阴跌、
     # 主力意图反复读出疑似出货）时，两次确认是仅存的保护通道，
     # 不能再被级别门槛直接挡掉。
     if not guard or guard.get("level") not in {"partial", "full", "warning"}:
-        return False
+        return _confirmation(False, None, "级别不足，不进入二次确认")
     rows = conn.execute(
         """SELECT decision,payload,created_at FROM paper_risk_decisions
            WHERE account_id=? AND code=? AND side='sell'
@@ -397,7 +477,7 @@ def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvi
         (account_id, code, _date(asof_day).isoformat()),
     ).fetchall()
     if not rows:
-        return False
+        return _confirmation(False, None, "当日没有更早的下行扫描记录")
     latest_row = rows[0]
     latest = _loads(latest_row["payload"], {})
     prior_guard = latest.get("downside_guard") or {}
@@ -410,13 +490,13 @@ def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvi
         current_at = dt.datetime.fromisoformat(current_time.replace("Z", "+00:00"))
         prior_at = dt.datetime.fromisoformat(prior_time.replace("Z", "+00:00"))
         if bool(current_at.tzinfo) != bool(prior_at.tzinfo):
-            return False
+            return _confirmation(False, None, "两轮时间戳时区口径不一致")
         if (current_at - prior_at).total_seconds() < max(60, deps.intraday_interval_minutes * 60 - 30):
-            return False
+            return _confirmation(False, None, "两轮扫描间隔不足一个独立周期")
     except (TypeError, ValueError, OverflowError):
         # A missing timestamp must fail closed; two concurrent scheduler calls
         # must never be mistaken for two independent confirmations.
-        return False
+        return _confirmation(False, None, "时间戳缺失，按未确认处理")
     # Giveback protection is intent-independent by design (see the audit note
     # above): a position that gave back a large accumulated edge while the
     # main-force classifier returned "uncertain" (e.g. missing flow fields)
@@ -449,7 +529,111 @@ def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvi
     confirmed_intent = (
         prior_class == current_class == "distribution" or giveback_confirmed
     )
-    return prior_level in {"warning", "partial", "full"} and confirmed_intent
+    if prior_level in {"warning", "partial", "full"} and confirmed_intent:
+        return _confirmation(
+            True, CONFIRM_BASIS_INTENT, "两轮意图一致：疑似出货/收益回吐保护")
+    if _price_evidence_confirmed(prior_guard, guard, prior_level):
+        return _confirmation(
+            True, CONFIRM_BASIS_PRICE_EVIDENCE,
+            "两轮价格证据一致（资金证据缺失），允许部分减仓，不产生清仓")
+    return _confirmation(False, None, "两轮证据未形成一致确认")
+
+
+def downside_confirmed(conn, account_id, code, asof_day, guard, *, deps: RiskEvidenceDeps):
+    """``downside_confirmation`` 的布尔视图（callers 只问"确认了吗"）。"""
+    return downside_confirmation(
+        conn, account_id, code, asof_day, guard, deps=deps,
+    )["confirmed"]
+
+
+def downside_action_plan(account_id, guard, *, confirmation=None,
+                         warning_account_ids=(), warning_trimmed=False,
+                         warning_confirmed_trimmed=False, level_trimmed=False):
+    """把"下行守卫 + 二次确认"翻译成一次处置计划（纯函数，零 I/O）。
+
+    ``paper_risk_service`` 只保留编排，本函数决定 actionable / pending、处置
+    动作名、加仓比例与审计文案。语义边界（2026-10-30 P0「下跌确认不可达」）：
+
+    * ``price_evidence`` 确认（资金字段缺失、价格证据齐全）只解锁 **partial**；
+      ``full``（清仓）仍然严格要求 ``intent``/``distribution``——硬止损与清仓
+      语义绝不被价格噪声触发。
+    * warning 级首段减仓（一天一次）与"确认后追加 partial 比例"是两条独立通道。
+    """
+    guard = guard or {}
+    confirmation = confirmation or {}
+    level = guard.get("level")
+    intent = guard.get("main_force_intent") or {}
+    basis = confirmation.get("basis") or guard.get("confirm_basis") or None
+    if level == "full" and basis == CONFIRM_BASIS_PRICE_EVIDENCE:
+        # 价格证据永远到不了 full：即使上游分类被改坏，这里也 fail-closed。
+        basis = CONFIRM_BASIS_INTENT
+        confirmed = False
+    else:
+        confirmed = bool(confirmation.get("confirmed"))
+    policy = guard.get("policy") or {}
+    sell_ratio = _num(guard.get("sell_ratio"), 0.0)
+    partial_ratio = _num(policy.get("partial_ratio"), sell_ratio)
+    warning_channel = bool(
+        level == "warning" and str(account_id or "") in set(warning_account_ids))
+    warning_actionable = bool(warning_channel and sell_ratio > 0 and not warning_trimmed)
+    warning_confirmed_trim = bool(
+        warning_channel and confirmed
+        and (intent.get("classification") == "distribution"
+             or basis == CONFIRM_BASIS_PRICE_EVIDENCE)
+        and warning_trimmed and not warning_confirmed_trimmed)
+    actionable = bool(
+        (level in {"partial", "full"} and confirmed and not level_trimmed)
+        or warning_actionable or warning_confirmed_trim)
+    pending = bool(level in {"partial", "full"} and not confirmed)
+    basis_text = ("价格证据确认（资金证据缺失）"
+                  if basis == CONFIRM_BASIS_PRICE_EVIDENCE else "意图确认")
+    intent_label = intent.get("label") or "不确定"
+    guard_reason = guard.get("reason") or ""
+    if warning_confirmed_trim:
+        action = "downside_warning_confirmed"
+        # 追加减仓按 partial 比例执行（sell_ratio 在 warning 级只带首段比例，
+        # 不能代表确认后的处置力度）；保底取较大者，绝不因为口径变化而缩小。
+        trim_ratio = max(partial_ratio, sell_ratio)
+        reason = (
+            f"下跌预警连续两次确认减仓【{basis_text}】："
+            f"本次处理可卖仓位的 {trim_ratio * 100:.0f}%；"
+            f"{guard_reason}；主力意图 {intent_label}"
+        )
+    elif warning_actionable:
+        action, trim_ratio = "downside_warning_trim", sell_ratio
+        reason = (
+            f"下跌预警首段减仓：本次处理可卖仓位的 {sell_ratio * 100:.0f}%；"
+            f"{guard_reason}；主力意图 {intent_label}"
+        )
+    elif actionable:
+        action, trim_ratio = f"downside_{level}", sell_ratio
+        reason = (
+            f"下跌{level}已连续两次确认【{basis_text}】：{guard_reason}；"
+            f"主力意图 {intent_label}"
+        )
+    else:
+        action, trim_ratio, reason = None, 0.0, ""
+    gaps = "、".join(guard.get("intent_data_gaps") or []) or "资金字段"
+    pending_note = (
+        f"；当前判定依据为价格证据（缺失：{gaps}），确认后最高只到部分减仓，不会清仓"
+        if basis == CONFIRM_BASIS_PRICE_EVIDENCE else ""
+    )
+    return {
+        "actionable": actionable,
+        "pending": pending,
+        "action": action,
+        "trim_ratio": trim_ratio,
+        "confirmed": confirmed,
+        "confirm_basis": basis,
+        "confirm_basis_text": basis_text,
+        "reason": reason,
+        "pending_reason": (
+            f"下跌预警待确认：{guard_reason}；"
+            f"连续两次扫描确认后才允许部分/全部减仓{pending_note}"
+        ),
+        "pending_decision": (f"downside_{level}_pending" if pending else "downside_warning"),
+        "pending_decision_kind": ("downside_pending" if pending else "downside_warning"),
+    }
 
 
 def position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None, replacement=None, nav=None, market=None,

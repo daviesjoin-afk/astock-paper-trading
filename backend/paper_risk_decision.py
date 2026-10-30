@@ -126,11 +126,40 @@ def position_peak(position, quote, price, *, asof_day):
     return max(authoritative, _num(quote.get("high"), 0.0), price or 0.0)
 
 
+#: 证据分两类，缺失代价不同（2026-10-30 P0「下跌确认不可达」）：
+#:
+#: * 价格类（当日涨跌幅、日内高低价）：直接描述"跌了多少、收在什么位置"。
+#:   东财 ulist 的资金字段偶发缺失（``super_net`` / ``main_pct``）时，价格类仍然
+#:   齐全；把它们混装成 ``len(missing)/5`` 会让 -8% 的当日跌幅因为**资金**字段
+#:   缺失而把 usable 打到 0.6，confidence 永远够不到 0.58 门槛，于是
+#:   ``paper_risk_evidence.intraday_downside_guard`` 只能停在上报级，
+#:   全天不减仓。
+#: * 资金类（主力净流入占比、超大单资金、量比）：只影响"意图有多可信"，
+#:   不决定"价格证据是否成立"。
+#: 权重按证据强度分开：缺价格证据的代价 0.20，缺资金证据 0.08。
+PRICE_EVIDENCE_FIELDS = ("当日涨跌幅", "日内高低价")
+FLOW_EVIDENCE_FIELDS = ("主力净流入占比", "超大单资金", "量比")
+PRICE_EVIDENCE_MISSING_WEIGHT = 0.20
+FLOW_EVIDENCE_MISSING_WEIGHT = 0.08
+#: usable 的下限：缺证据可以降低置信度，但不能把结论抹成"零可信"。
+CONFIDENCE_USABLE_FLOOR = 0.35
+
+#: ``downturn``（下跌确认）分支的阈值：只吃**价格**证据。
+#: 它不参与 0.58 置信度门槛（confidence 照实输出），但要求价格证据齐全
+#: （无价格类 missing）、跌幅足够深、且出货分数不低于 50、洗盘不占优。
+DOWNTURN_PCT_THRESHOLD = -6.0
+DOWNTURN_DISTRIBUTION_FLOOR = 50.0
+
+
 def main_force_intent(position, quote, market=None, news=None):
     """判断急跌更像"洗盘"还是"出货"——可解释的**风险信号**，不是可观测事实。
 
     需要价格/资金/量能证据互相印证才会给出标签；缺失字段一律退回 ``uncertain``。
     结果只写入风险复核与卖出计划 payload，本身不是独立的下单触发器。
+
+    ``downturn``（下跌确认）是 2026-10-30 新增的**第四类**结论，专门覆盖
+    "价格证据齐全、资金证据缺失"这一种现场：它不等于 ``distribution``
+    （没有资金证据就不能断言主力在出货），因此下游只允许**部分**减仓。
     """
     quote = quote or {}
     price = _num(quote.get("price"), None)
@@ -206,13 +235,36 @@ def main_force_intent(position, quote, market=None, news=None):
 
     distribution = round(min(100.0, distribution), 1)
     washout = round(min(100.0, washout), 1)
-    usable = 1.0 - min(len(set(missing)) / 5.0, 0.8)
+    missing_fields = sorted(set(missing))
+    # 缺失代价分证据类：价格类缺失才真正削弱"跌了多少"这条事实，
+    # 资金类缺失只削弱意图判断——两者混装会让资金字段的偶发缺失
+    # 把 -8% 的当日跌幅判成"意图不确定"（P0 现场）。
+    price_missing = [item for item in missing_fields if item in PRICE_EVIDENCE_FIELDS]
+    flow_missing = [item for item in missing_fields if item in FLOW_EVIDENCE_FIELDS]
+    usable = max(
+        CONFIDENCE_USABLE_FLOOR,
+        1.0 - (PRICE_EVIDENCE_MISSING_WEIGHT * len(price_missing)
+               + FLOW_EVIDENCE_MISSING_WEIGHT * len(flow_missing)),
+    )
     gap = abs(distribution - washout)
     confidence = round(min(0.98, (0.50 + gap / 100.0) * usable), 2)
     if distribution >= 60 and distribution - washout >= 12 and confidence >= 0.58:
         classification, label, hint = "distribution", "疑似出货", "冻结加仓，优先复核可卖仓位"
     elif washout >= 58 and washout - distribution >= 10 and confidence >= 0.58:
         classification, label, hint = "washout", "疑似洗盘", "不因单日下跌单独清仓，等待承接确认"
+    elif (
+        not price_missing
+        and pct is not None and pct <= DOWNTURN_PCT_THRESHOLD
+        and distribution >= DOWNTURN_DISTRIBUTION_FLOOR
+        and washout < distribution
+    ):
+        # 价格证据自洽的深跌：不假装是"出货"（没有资金证据），但也不能
+        # 退回"意图不确定"从而让整条减仓通道不可达。
+        classification, label, hint = (
+            "downturn",
+            "下跌确认（资金证据缺失）",
+            "价格证据充分，允许部分减仓，禁止据此加仓",
+        )
     else:
         classification, label, hint = "uncertain", "意图不确定", "不得据此单独下单"
     return {
@@ -223,7 +275,10 @@ def main_force_intent(position, quote, market=None, news=None):
         "washout_score": washout,
         "action_hint": hint,
         "evidence": evidence[:8],
-        "missing": sorted(set(missing)),
+        "missing": missing_fields,
+        "price_evidence_missing": price_missing,
+        "flow_evidence_missing": flow_missing,
+        "confidence_usable": round(usable, 3),
         "relative_to_market_pct": round(relative, 2) if relative is not None else None,
         "range_position": round(range_pos, 3) if range_pos is not None else None,
         "asof": quote.get("quote_at"),
