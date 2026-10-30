@@ -706,13 +706,11 @@ def stock_history(code: str = Query(..., min_length=6, max_length=6), account_id
 @router.post("/risk-refresh")
 def risk_refresh():
     try:
-        # There is one backend-owned refresh worker.  The API no longer starts
-        # a second thread/state machine that could race the scheduled runner.
+        # Enqueue only. The external worker survives this HTTP process and the
+        # response continues to display the last trusted snapshot immediately.
         _cclear("risk_")
-        return P.request_risk_snapshot_refresh(
-            trigger="manual",
-            on_complete=lambda: _cclear("risk_"),
-        )
+        P.request_risk_snapshot_refresh(trigger="manual", request_kind="explicit")
+        return risk_overview()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Refresh failed: {type(exc).__name__}") from exc
 

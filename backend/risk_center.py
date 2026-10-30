@@ -340,7 +340,8 @@ def _snapshot_market(universe, market, snapshot_at):
     }
 
 
-def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, news_error, sector_rows):
+def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, news_error, sector_rows,
+                     publish=None):
     """生成并原子保存当前风险快照；不产生任何交易。"""
     received = _now()
     market_view = _snapshot_market(universe, market, snapshot_at)
@@ -466,7 +467,6 @@ def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, n
         history[-1] = observation
     else:
         history.append(observation)
-    _save_history(history)
     position_trends = []
     for row in positions:
         key_rows = [
@@ -551,11 +551,18 @@ def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, n
             "notice": "小单净额、人气与换手仅是拥挤度代理，不代表真实散户账户交易。",
         },
     }
-    os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
-    temp_path = SNAPSHOT_PATH + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(snapshot, handle, ensure_ascii=False, allow_nan=False)
-    os.replace(temp_path, SNAPSHOT_PATH)
+    def write_files():
+        _save_history(history)
+        os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
+        temp_path = SNAPSHOT_PATH + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, ensure_ascii=False, allow_nan=False)
+        os.replace(temp_path, SNAPSHOT_PATH)
+
+    if publish is None:
+        write_files()
+    else:
+        publish(write_files)
     return snapshot
 
 

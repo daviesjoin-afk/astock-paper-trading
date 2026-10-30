@@ -50,6 +50,7 @@ def _get_se():
 import paper_storage as PST
 import paper_timing as PTM
 import paper_job_lifecycle as PJL
+import paper_snapshot_jobs as PSJ
 import paper_order_execution_authority as POEA
 import paper_lot_ledger as PLL
 import paper_position_read_model as PPRM
@@ -12747,17 +12748,18 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
         )
     day = _date(asof_date)
     result = _run_slot_impl(slot, day=day, force=force)
-    # _run_slot_impl has completed its fenced ledger writes and released the
-    # lease before display snapshots begin. One-shot runners refresh inline;
-    # an already-completed trading job may retry only this display work.
+    # Trading is complete and its lease released. Only enqueue display work;
+    # the independent durable worker owns provider I/O and snapshot publication.
+    # risk_snapshot_background remains an accepted compatibility argument.
     if slot in {"intraday", "risk"} and (
         result.get("status") == "completed"
-        or (not risk_snapshot_background and result.get("status") == "already_done")
+        or result.get("status") == "already_done"
     ):
         try:
-            with PTM.phase("risk_snapshot"):
+            with PTM.phase("risk_snapshot_enqueue"):
                 refresh = request_risk_snapshot_refresh(
-                    trigger=f"slot:{slot}", background=risk_snapshot_background,
+                    trigger=f"slot:{slot}",
+                    request_kind="explicit" if result.get("status") == "completed" else "ensure",
                 )
             result["risk_snapshot_refresh"] = refresh.get("status")
             if refresh.get("error"):
@@ -13504,112 +13506,43 @@ def stock_trade_history(code, account_id=None):
         }
 
 
-_RISK_SNAPSHOT_REFRESH_LOCK = threading.Lock()
-_RISK_SNAPSHOT_REFRESH = {"running": False, "started_at": None, "last_error": None,
-                          "trigger": None, "thread": None}
-
-
-@PTM.timed("risk_snapshot")
 def _refresh_slot_risk_snapshot(slot):
-    kick = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
-    result = (
-        wait_risk_snapshot_refresh(timeout=240.0)
-        if kick.get("status") in {"scheduled", "already_running"} else kick
-    )
-    detail = {"risk_snapshot_refresh": result.get("status")}
-    if result.get("error"):
-        detail["risk_snapshot_refresh_error"] = str(result["error"])[:200]
-    return detail
+    """Compatibility adapter: persist a request without waiting."""
+    refresh = request_risk_snapshot_refresh(trigger=f"slot:{slot}")
+    return {"risk_snapshot_refresh": refresh["status"]}
 
 
 def _slot_completion_status(detail):
-    if detail.get("status") in {"blocked", "failed", "partial", "deferred", "in_progress"}:
-        return "failed"
-    status = detail.get("risk_snapshot_refresh")
-    if "risk_snapshot_refresh" in detail and status not in {"completed", "finished", "idle", "skipped"}:
-        return "failed"
-    return "completed"
+    return "failed" if detail.get("status") in {
+        "blocked", "failed", "partial", "deferred", "in_progress",
+    } else "completed"
 
 
-def request_risk_snapshot_refresh(trigger="background", on_complete=None, *, background=True):
-    """Refresh asynchronously for API callers or inline for one-shot runners.
-
-    同步路径不创建 daemon 线程；失败可由 runner 的非零退出码重试。
-    两种路径共享去重与状态，不改变快照质量和行情核验规则。
-    """
-    with _RISK_SNAPSHOT_REFRESH_LOCK:
-        if _RISK_SNAPSHOT_REFRESH["running"]:
-            return {"status": "already_running",
-                    "started_at": _RISK_SNAPSHOT_REFRESH["started_at"],
-                    "trigger": _RISK_SNAPSHOT_REFRESH["trigger"]}
-        _RISK_SNAPSHOT_REFRESH.update(running=True, started_at=_now(), last_error=None,
-                                      trigger=str(trigger)[:60], thread=None,
-                                      status="running", finished_at=None)
-
-    def _worker():
-        error = None
+def request_risk_snapshot_refresh(trigger="background", on_complete=None, *, background=True,
+                                  request_kind="automatic", snapshot_missing=False):
+    """Persist/coalesce a display refresh; neither compatibility mode runs it inline."""
+    result = PSJ.request_refresh(_db, trigger=trigger, request_kind=request_kind,
+                                 snapshot_missing=snapshot_missing)
+    if callable(on_complete):
         try:
-            risk_dashboard(refresh=True)
-        except Exception as exc:
-            error = exc
-            with _RISK_SNAPSHOT_REFRESH_LOCK:
-                _RISK_SNAPSHOT_REFRESH["last_error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            if callable(on_complete):
-                try:
-                    on_complete()
-                except Exception as callback_exc:
-                    # Cache invalidation is best effort and must never turn a
-                    # completed risk snapshot into a failed refresh state.
-                    with _RISK_SNAPSHOT_REFRESH_LOCK:
-                        _RISK_SNAPSHOT_REFRESH["last_error"] = (
-                            f"cache_invalidation:{type(callback_exc).__name__}: {callback_exc}"
-                        )
-            with _RISK_SNAPSHOT_REFRESH_LOCK:
-                _RISK_SNAPSHOT_REFRESH["running"] = False
-                _RISK_SNAPSHOT_REFRESH["finished_at"] = _now()
-                _RISK_SNAPSHOT_REFRESH["status"] = "failed" if error else "completed"
-                if error is None and str(_RISK_SNAPSHOT_REFRESH.get("last_error") or "").startswith("cache_invalidation:"):
-                    # Preserve a cache warning for the status endpoint, but
-                    # do not report a successful snapshot as a hard failure.
-                    pass
-        return {"status": "failed" if error else "completed",
-                "error": f"{type(error).__name__}: {error}" if error else None}
-
-    if not background:
-        return _worker()
-
-    worker_thread = threading.Thread(target=_worker, name="risk-snapshot-refresh", daemon=True)
-    with _RISK_SNAPSHOT_REFRESH_LOCK:
-        _RISK_SNAPSHOT_REFRESH["thread"] = worker_thread
-    worker_thread.start()
-    return {"status": "scheduled"}
+            on_complete()  # Invalidate this process's read cache after enqueueing.
+        except Exception:
+            pass  # Cache invalidation cannot undo a durable request.
+    return result
 
 
 def wait_risk_snapshot_refresh(timeout=240.0):
-    """Compatibility wait for an existing API background refresh.
-
-    One-shot runners now use the synchronous refresh path instead.
-    """
-    with _RISK_SNAPSHOT_REFRESH_LOCK:
-        thread = _RISK_SNAPSHOT_REFRESH.get("thread")
-        running = _RISK_SNAPSHOT_REFRESH.get("running")
-    if thread is None:
-        return {"status": "already_running" if running else "idle"}
-    thread.join(timeout=timeout)
-    with _RISK_SNAPSHOT_REFRESH_LOCK:
-        err = _RISK_SNAPSHOT_REFRESH.get("last_error")
-    if thread.is_alive():
-        return {"status": f"timeout_after_{int(timeout)}s"}
-    failed = bool(err) and not str(err).startswith("cache_invalidation:")
-    return {"status": "failed" if failed else "completed", "error": err}
+    """Nonblocking compatibility status read; refresh lives in another process."""
+    state = risk_snapshot_refresh_status()
+    return {"status": state["status"], "error": state.get("last_error")}
 
 
 def risk_snapshot_refresh_status():
-    with _RISK_SNAPSHOT_REFRESH_LOCK:
-        status = dict(_RISK_SNAPSHOT_REFRESH)
-    status.pop("thread", None)  # 不可 JSON 序列化，且不应暴露给 API
-    return status
+    return PSJ.refresh_status(_db_readonly)
+
+
+def run_risk_snapshot_refresh_job():
+    return PSJ.run_refresh_job(_db, lambda publish: refresh_risk_snapshot(publish=publish))
 
 
 def _risk_base_dashboard():
@@ -13730,10 +13663,59 @@ def _risk_base_dashboard():
         }
 
 
-def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
-    """返回独立风控中心；新增代理因子只读，不改变账户或订单。"""
+def refresh_risk_snapshot(*, publish):
+    """Worker-only refresh: provider collection precedes fenced file publication."""
     base = _risk_base_dashboard()
-    snapshot = None if refresh else RC.load_snapshot()
+    # 复用 5 分钟任务已经建立的全市场缓存。旧实现单独抓取市值前 2,000
+    # 只股票，既慢又把 36% 覆盖误标成“全市场”。
+    # 只有独立 worker 显式进入此采集入口；页面读取不调用它。
+    # 继续经行情 authority 刷新，不改变核验与降级口径。
+    live_universe = MDSvc.refresh_rows()
+    market = _market_state(dt.date.today(), live_universe=live_universe)
+    universe = U.load_universe() or []
+    # The persisted universe is a historical fallback and can lag the
+    # current session.  Refresh the market-wide snapshot from the live
+    # source, then let the risk snapshot persist it for instant reads.
+    if live_universe:
+        universe = live_universe
+    positions = list(base.get("positions") or [])
+    names = {
+        str(position.get("code")): position.get("name") or str(position.get("code"))
+        for position in positions
+    }
+    news_events = []
+    news_error = None
+    if names:
+        try:
+            news_events = F.news_keyword_scan(names, include_announcements=True)
+        except Exception as exc:
+            news_error = str(exc)
+    try:
+        sector_rows = dfc.fetch_hot_sector_snapshot()
+        if not sector_rows:
+            sector_rows = dfc.fetch_sector_flow("industry")
+    except Exception:
+        sector_rows = []
+    return RC.refresh_snapshot(
+        market=market,
+        positions=positions,
+        universe=universe,
+        snapshot_at=max((str(row.get("quote_at")) for row in universe if row.get("quote_at")), default=_universe_snapshot_time()),
+        news_events=news_events,
+        news_error=news_error,
+        sector_rows=sector_rows,
+        publish=publish,
+    )
+
+
+def risk_dashboard(refresh=False, allow_stale=False, allow_network=False):
+    """Read the last snapshot and enqueue refreshes; never collect providers inline.
+
+    allow_stale/allow_network are retained for callers of the former interface.
+    Stale display data stays labelled and does not grant execution authority.
+    """
+    base = _risk_base_dashboard()
+    snapshot = RC.load_snapshot()
     now = dt.datetime.now()
     in_market_session = now.weekday() < 5 and dt.time(9, 20) <= now.time() <= dt.time(15, 15)
     # Risk pages read the persisted snapshot immediately.  A five-minute
@@ -13743,12 +13725,17 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
     snapshot_ttl = 300 if in_market_session else 1800
     snapshot_age = RC.snapshot_age_seconds(snapshot) if snapshot is not None else None
     snapshot_stale = snapshot is not None and (snapshot_age is None or snapshot_age > snapshot_ttl)
-    if snapshot_stale and not allow_stale:
-        snapshot = None
-    if snapshot is None and not allow_network:
-        # 请求线程禁止联网（页面读取路径）：返回占位快照保持响应速度，
-        # 同时触发后台刷新；下一次读取即可拿到真实数据。
-        request_risk_snapshot_refresh(trigger="risk-dashboard-no-network")
+    enqueue_error = None
+    if refresh or snapshot is None or snapshot_stale:
+        try:
+            request_risk_snapshot_refresh(
+                trigger="risk-dashboard", request_kind="explicit" if refresh else "automatic",
+                snapshot_missing=snapshot is None,
+            )
+        except Exception as exc:
+            enqueue_error = f"{type(exc).__name__}: {exc}"
+    missing_snapshot = snapshot is None
+    if missing_snapshot:
         snapshot = {
             "asof": None, "market": {}, "positions": [], "universe": [],
             "news": {"events": [], "error": "snapshot_refreshing"},
@@ -13756,46 +13743,6 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
                               "detail": "后台正在刷新全市场快照，稍后自动恢复"}],
             "dynamic_risk": {}, "sector_rows": [],
         }
-    if snapshot is None:
-        # 复用 5 分钟任务已经建立的全市场缓存。旧实现单独抓取市值前 2,000
-        # 只股票，既慢又把 36% 覆盖误标成“全市场”。
-        # R24：走到这里必然 allow_network=True（上面已把 False 分支改成占位
-        # snapshot），因此经 authority 的 refresh 入口取数。
-        live_universe = MDSvc.refresh_rows()
-        market = _market_state(dt.date.today(), live_universe=live_universe)
-        universe = U.load_universe() or []
-        # The persisted universe is a historical fallback and can lag the
-        # current session.  Refresh the market-wide snapshot from the live
-        # source, then let the risk snapshot persist it for instant reads.
-        if live_universe:
-            universe = live_universe
-        positions = list(base.get("positions") or [])
-        names = {
-            str(position.get("code")): position.get("name") or str(position.get("code"))
-            for position in positions
-        }
-        news_events = []
-        news_error = None
-        if names:
-            try:
-                news_events = F.news_keyword_scan(names, include_announcements=True)
-            except Exception as exc:
-                news_error = str(exc)
-        try:
-            sector_rows = dfc.fetch_hot_sector_snapshot()
-            if not sector_rows:
-                sector_rows = dfc.fetch_sector_flow("industry")
-        except Exception:
-            sector_rows = []
-        snapshot = RC.refresh_snapshot(
-            market=market,
-            positions=positions,
-            universe=universe,
-            snapshot_at=max((str(row.get("quote_at")) for row in universe if row.get("quote_at")), default=_universe_snapshot_time()),
-            news_events=news_events,
-            news_error=news_error,
-            sector_rows=sector_rows,
-        )
     result = RC.build_dashboard(base, snapshot)
     # 风控页面与交易页使用同一总资金池口径；策略仍保留各自的风险模型，
     # 但不再把五套账户误展示成五个互不相关的资金账户。
@@ -13808,9 +13755,21 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
     # ``snapshot_age`` 属于**加载时**的那份快照，而快照可能被占位内容或刷新
     # 结果替换过。用旧年龄会报告错误的陈旧度。
     final_age = RC.snapshot_age_seconds(snapshot) if snapshot else None
-    result["snapshot_age_seconds"] = round(final_age or 0, 1) if snapshot else None
+    result["snapshot_age_seconds"] = round(final_age, 1) if final_age is not None else None
     result["snapshot_ttl_seconds"] = snapshot_ttl
-    result["snapshot_stale"] = bool(snapshot and (final_age or 0) > snapshot_ttl)
+    result["snapshot_stale"] = snapshot_stale
+    try:
+        state = risk_snapshot_refresh_status()
+    except Exception as exc:
+        state = {"status": "unavailable", "running": False, "last_error": f"{type(exc).__name__}: {exc}"}
+    if enqueue_error:
+        state = dict(state, last_error=enqueue_error)
+    result["snapshot_refresh"] = state
+    result["refreshing"] = bool(state.get("running") or (
+        state.get("status") == "failed" and state.get("next_retry_at")
+    ))
+    result["initializing"] = missing_snapshot
+    result["message"] = "正在等待独立任务建立展示快照" if missing_snapshot else None
     return result
 
 

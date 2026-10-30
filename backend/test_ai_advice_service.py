@@ -275,8 +275,10 @@ class AuditPersistenceTests(unittest.TestCase):
 
         versions = [row[0] for row in db_migrate.MIGRATIONS["paper_trading"]]
         self.assertEqual(len(versions), len(set(versions)), "迁移版本号不能重复")
-        self.assertEqual(max(versions), 40, "v40 应是最新迁移")
+        self.assertGreaterEqual(max(versions), 40, "不得遗漏 v40 或阻止后续独立迁移")
         self.assertIn(40, versions)
+        self.assertIs(next(row[2] for row in db_migrate.MIGRATIONS["paper_trading"] if row[0] == 40),
+                      db_migrate.paper_schema.ensure_ai_decision_audits)
 
     def test_attribution_summary_counts_reasons_without_claiming_alpha(self):
         self._record()

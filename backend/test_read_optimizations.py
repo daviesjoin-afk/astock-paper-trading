@@ -154,17 +154,15 @@ class ApiCacheSingleFlightTests(unittest.TestCase):
         self.assertEqual(results, [{"ok": True}] * 8)
         api._cclear()
 
-    def test_manual_risk_refresh_uses_backend_worker(self):
+    def test_manual_risk_refresh_enqueues_then_returns_last_snapshot(self):
         api = self.api
-        with mock.patch.object(api, "_cclear") as clear, \
-                mock.patch.object(api.P, "request_risk_snapshot_refresh",
+        view = {"asof": "previous", "refreshing": True}
+        with mock.patch.object(api, "_cclear") as clear,                 mock.patch.object(api, "risk_overview", return_value=view),                 mock.patch.object(api.P, "request_risk_snapshot_refresh",
                                   return_value={"status": "scheduled"}) as request:
             result = api.risk_refresh()
-            request.call_args.kwargs["on_complete"]()
-        self.assertEqual(result["status"], "scheduled")
-        request.assert_called_once()
-        self.assertEqual(request.call_args.kwargs["trigger"], "manual")
-        self.assertGreaterEqual(clear.call_count, 2)
+        self.assertEqual(result, view)
+        request.assert_called_once_with(trigger="manual", request_kind="explicit")
+        clear.assert_called_once_with("risk_")
 
 
 class CompactRiskReadModelTests(unittest.TestCase):

@@ -60,6 +60,13 @@ SQLite 纸盘账本（订单、成交、持仓、NAV、审计、租约）
 
 ### 一次盘中扫描的顺序
 
+Dashboard 展示快照通过独立持久任务刷新：交易 `run_slot` 完成并释放租约后只登记请求，
+`paper_job_lifecycle` 唯一管理 `paper_dashboard_refresh_jobs` 的排队、认领、心跳、失败重试和完成。
+`paper_snapshot_jobs` 在写事务外收集事实，发布快照与趋势历史前用租约和 fencing 校验资格；
+`paper_snapshot_worker` 由独立 cron 在现有 data-worker 中运行，复用 `resource-heavy.lock`，
+不持有 `paper-scan.lock`。页面只读最近快照并显示来源时间、陈旧度与刷新状态；
+展示任务失败不改变已完成交易任务的结果。操作与验证见 [Dashboard 快照持久任务](docs/DASHBOARD_SNAPSHOT_JOBS.md)。
+
 ```text
 调度触发
   → 持仓风险处理并恢复已批准的待执行委托（使用逐票新鲜报价）

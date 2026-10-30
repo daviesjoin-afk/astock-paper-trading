@@ -49,6 +49,12 @@
 
 ## 本次切片
 
+- 2026-10-30（PR299 定向修复）：`deferred_imports` 显式增加 **1** 项额度（1 → 2）。
+  `paper_snapshot_worker.main` 仅在 storage/job owner 的只读预检查发现到期任务，
+  或发现数据库/任务表缺失时，才导入完整 `paper_trading` 并走原初始化与 CAS。
+  空队列、未到退避时间和有效租约不导入重型引擎。这是该入口的单次延迟导入，
+  不使用动态 import 桥，不变更其它架构预算，也不建立第二个队列 owner。
+
 - 2026-10-29（对抗性审查落地 + adaptive 库 schema 收口）
   - **度量事实化**：`coupling_metrics` 新增三项事实指标并进 `HEAD_BUDGET`，额度 0——
     `injected_private_fields`（*Dependencies 容器上的私有字段名，66）、

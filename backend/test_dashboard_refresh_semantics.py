@@ -99,8 +99,8 @@ class DashboardBoundaryTests(unittest.TestCase):
                                risk_snapshot_background=False)
         self.assertEqual(first["status"], "completed")
         self.assertEqual(retry["status"], "already_done")
-        self.assertEqual(Runner._result_exit_code(first), 1)
-        self.assertEqual(Runner._result_exit_code(retry), 1)
+        self.assertEqual(Runner._result_exit_code(first), 0)
+        self.assertEqual(Runner._result_exit_code(retry), 0)
         trade.assert_called_once()
         self.assertEqual(snapshot.call_count, 2)
 
@@ -152,78 +152,83 @@ class CacheDeadlineTests(unittest.TestCase):
 
 class SnapshotLifetimeTests(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.object(P, "_RISK_SNAPSHOT_REFRESH", {"running": False})
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(P, "DB_PATH", os.path.join(tmp.name, "ledger.db"))
         patcher.start()
         self.addCleanup(patcher.stop)
+        P.init_db()
 
-    def test_inline_refresh_finishes_without_creating_thread(self):
-        with mock.patch.object(P, "risk_dashboard", return_value={}) as refresh, \
-                mock.patch.object(P.threading, "Thread", side_effect=AssertionError("daemon created")):
-            result = P.request_risk_snapshot_refresh(background=False)
+    def test_both_compatibility_modes_only_enqueue_without_refresh_threads(self):
+        for background in (False, True):
+            with self.subTest(background=background),                     mock.patch.object(P, "refresh_risk_snapshot", side_effect=AssertionError("inline provider work")),                     mock.patch.object(P.threading, "Thread", side_effect=AssertionError("refresh thread created")):
+                result = P.request_risk_snapshot_refresh(background=background)
+            self.assertEqual(result["status"], "scheduled")
+        self.assertEqual(P.risk_snapshot_refresh_status()["status"], "queued")
+
+    def test_status_is_durable_and_compatibility_wait_does_not_block(self):
+        P.request_risk_snapshot_refresh()
+        self.assertEqual(P.wait_risk_snapshot_refresh(timeout=999)["status"], "queued")
+        with P._db_readonly() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM paper_dashboard_refresh_jobs").fetchone()[0], "queued")
+
+    def test_slot_enqueues_after_lease_release_even_for_legacy_inline_argument(self):
+        for status in ("completed", "already_done"):
+            with self.subTest(status=status), mock.patch.object(P, "init_db"),                     mock.patch.object(P.PSS, "run_preflight"),                     mock.patch.object(P, "_run_slot_impl", return_value={"status": status}),                     mock.patch.object(P.RC, "load_snapshot", return_value={"asof": "test"}),                     mock.patch.object(P, "request_risk_snapshot_refresh", return_value={"status": "scheduled"}) as refresh:
+                result = P.run_slot("risk", risk_snapshot_background=False)
+            refresh.assert_called_once_with(trigger="slot:risk", request_kind="explicit" if status == "completed" else "ensure")
+            self.assertIsNone(P._active_lease_context())
+            self.assertEqual(result["status"], status)
+            self.assertEqual(Runner._result_exit_code(result), 0)
+
+    def test_enqueue_error_does_not_change_completed_trading_exit_status(self):
+        with mock.patch.object(P, "init_db"), mock.patch.object(P.PSS, "run_preflight"),                 mock.patch.object(P, "_run_slot_impl", return_value={"status": "completed"}),                 mock.patch.object(P.RC, "load_snapshot", return_value=None),                 mock.patch.object(P, "request_risk_snapshot_refresh", side_effect=RuntimeError("queue busy")):
+            result = P.run_slot("intraday")
         self.assertEqual(result["status"], "completed")
-        refresh.assert_called_once_with(refresh=True)
-        self.assertFalse(P.risk_snapshot_refresh_status()["running"])
-        self.assertEqual(P.risk_snapshot_refresh_status()["status"], "completed")
+        self.assertEqual(result["risk_snapshot_refresh"], "failed")
+        self.assertEqual(Runner._result_exit_code(result), 0)
 
-    def test_failure_keeps_deduplication_until_callback_finishes(self):
-        duplicate = []
-        with mock.patch.object(P, "risk_dashboard", side_effect=RuntimeError("source unavailable")):
-            result = P.request_risk_snapshot_refresh(
-                background=False,
-                on_complete=lambda: duplicate.append(P.request_risk_snapshot_refresh(background=False)),
-            )
-        self.assertEqual(duplicate[0]["status"], "already_running")
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("source unavailable", result["error"])
-        self.assertEqual(P.risk_snapshot_refresh_status()["status"], "failed")
+    def test_runner_never_selects_inline_refresh(self):
+        with mock.patch.object(sys, "argv", ["paper_runner", "--slot", "risk"]),                 mock.patch.object(P, "run_slot", return_value={"status": "completed", "risk_snapshot_refresh": "scheduled"}) as slot,                 contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(Runner.main(), 0)
+        slot.assert_called_once_with("risk")
 
-    def test_background_refresh_remains_nonblocking_and_deduplicated(self):
-        entered = threading.Event()
-        release = threading.Event()
+    def test_trading_finishes_while_display_worker_is_still_collecting(self):
+        entered, release = threading.Event(), threading.Event()
+        outcomes = []
+        P.request_risk_snapshot_refresh()
 
-        def refresh(**kwargs):
+        def refresh(*, publish):
             entered.set()
-            release.wait(timeout=3)
+            if not release.wait(5):
+                raise RuntimeError("test display worker timed out")
+            publish(lambda: None)
 
-        with mock.patch.object(P, "risk_dashboard", side_effect=refresh):
+        with mock.patch.object(P, "refresh_risk_snapshot", side_effect=refresh), \
+                mock.patch.object(P, "monitor_risk", return_value={"slot": "risk", "orders": []}) as trade, \
+                mock.patch.object(P.RC, "load_snapshot", return_value=None):
+            worker = threading.Thread(target=lambda: outcomes.append(P.run_risk_snapshot_refresh_job()))
+            worker.start()
             try:
-                self.assertEqual(P.request_risk_snapshot_refresh()["status"], "scheduled")
-                self.assertTrue(entered.wait(timeout=1))
-                self.assertEqual(P.request_risk_snapshot_refresh()["status"], "already_running")
+                self.assertTrue(entered.wait(3))
+                result = P.run_slot("risk", asof_date="2026-10-22", force=True)
+                self.assertFalse(release.is_set())
+                self.assertTrue(worker.is_alive())
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(Runner._result_exit_code(result), 0)
+                trade.assert_called_once()
             finally:
                 release.set()
-                P.wait_risk_snapshot_refresh(timeout=3)
-        self.assertEqual(P.risk_snapshot_refresh_status()["status"], "completed")
+                worker.join(5)
+        self.assertEqual(outcomes, [{"status": "completed"}])
 
-    def test_slot_refresh_runs_after_lease_release_and_completed_jobs_retry_refresh(self):
-        for status in ("completed", "already_done"):
-            with self.subTest(status=status), mock.patch.object(P, "init_db"), \
-                    mock.patch.object(P.PSS, "run_preflight"), \
-                    mock.patch.object(P, "_run_slot_impl", return_value={"status": status}), \
-                    mock.patch.object(P.RC, "load_snapshot", return_value={"asof": "test"}), \
-                    mock.patch.object(P, "request_risk_snapshot_refresh", return_value={"status": "completed"}) as refresh:
-                result = P.run_slot("risk", risk_snapshot_background=False)
-                self.assertIsNone(P._active_lease_context())
-                refresh.assert_called_once_with(trigger="slot:risk", background=False)
-                self.assertEqual(result["status"], status)
-                self.assertEqual(result["risk_snapshot_at"], "test")
-
-    def test_failed_refresh_is_retryable_without_marking_trading_failed(self):
-        with mock.patch.object(P, "init_db"), mock.patch.object(P.PSS, "run_preflight"), \
-                mock.patch.object(P, "_run_slot_impl", return_value={"status": "completed"}), \
-                mock.patch.object(P.RC, "load_snapshot", return_value=None), \
-                mock.patch.object(P, "request_risk_snapshot_refresh", return_value={"status": "failed", "error": "source failed"}):
-            result = P.run_slot("intraday", risk_snapshot_background=False)
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(Runner._result_exit_code(result), 1)
-        self.assertEqual(Runner._result_exit_code({"status": "already_done", "risk_snapshot_refresh": "completed"}), 0)
-
-    def test_runner_explicitly_selects_inline_refresh(self):
-        with mock.patch.object(sys, "argv", ["paper_runner", "--slot", "risk"]), \
-                mock.patch.object(P, "run_slot", return_value={"status": "completed", "risk_snapshot_refresh": "completed"}) as slot, \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(Runner.main(), 0)
-        slot.assert_called_once_with("risk", risk_snapshot_background=False)
+    def test_dashboard_missing_snapshot_never_collects_even_if_legacy_network_flag_is_true(self):
+        base = {"accounts": [], "positions": [], "shared": {}, "risk_decisions": []}
+        with mock.patch.object(P, "_risk_base_dashboard", return_value=base),                 mock.patch.object(P.RC, "load_snapshot", return_value=None),                 mock.patch.object(P.RC, "build_dashboard", return_value={}),                 mock.patch.object(P.dfc, "load_source_health", return_value={}),                 mock.patch.object(P, "refresh_risk_snapshot", side_effect=AssertionError("request performed provider work")):
+            result = P.risk_dashboard(refresh=True, allow_network=True)
+        self.assertTrue(result["initializing"])
+        self.assertIsNone(result["snapshot_age_seconds"])
+        self.assertEqual(result["snapshot_refresh"]["status"], "queued")
 
 
 if __name__ == "__main__":

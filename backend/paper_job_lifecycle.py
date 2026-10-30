@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""调度任务的状态迁移：``paper_jobs`` / ``paper_job_runs`` 的唯一写入 owner。
+"""调度任务及独立展示刷新队列的状态迁移和唯一写入 owner。
 
 **它回答什么**：一条任务记录从"被认领"到"完成/失败/被回收"的状态怎么写，以及
 租约（``owner_key`` + ``fencing_token``）如何参与每次 CAS。认领探测、首次写入、
@@ -211,3 +211,98 @@ def prune_jobs(conn):
         f"DELETE FROM {DAILY_TABLE} WHERE market_date < {DAILY_RETENTION}",
     ).rowcount
     return {"job_runs_purged": intraday, "jobs_purged": daily}
+
+
+class SnapshotLeaseLost(RuntimeError):
+    """A display worker no longer owns the right to publish."""
+
+
+def read_snapshot_refresh(conn):
+    row = conn.execute("SELECT * FROM paper_dashboard_refresh_jobs WHERE id=1").fetchone()
+    return dict(row) if row is not None else None
+
+
+SNAPSHOT_AUTO_REFRESH_SECONDS = 300
+_SNAPSHOT_REFRESH_DUE = (
+    "((status IN ('queued','failed') AND (next_retry_at IS NULL OR next_retry_at<=?))"
+    " OR (status='running' AND expires_at<=?))"
+)
+
+
+def snapshot_refresh_due(conn, *, now):
+    """Read-only hint; only claim_snapshot_refresh grants execution authority."""
+    return conn.execute(
+        "SELECT 1 FROM paper_dashboard_refresh_jobs WHERE id=1 AND " + _SNAPSHOT_REFRESH_DUE,
+        (now, now),
+    ).fetchone() is not None
+
+
+def enqueue_snapshot_refresh(conn, *, trigger, now, request_kind="automatic",
+                             snapshot_missing=False, completed_before):
+    """Only explicit new work creates a follow-up; reads and repeated slots do not.
+
+    automatic: keep pending/running/backoff work; throttle completed stale input.
+    explicit: manual/new-data requests coalesce to at most one pending follow-up.
+    ensure: create the first durable request only, regardless of an existing state.
+    """
+    if request_kind not in {"automatic", "explicit", "ensure"}:
+        raise ValueError("unknown snapshot refresh request kind")
+    conn.execute("""INSERT INTO paper_dashboard_refresh_jobs
+        (id,status,trigger,requested_at) VALUES(1,'queued',?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            trigger=excluded.trigger, requested_at=excluded.requested_at,
+            request_version=CASE WHEN status='running'
+                THEN MAX(request_version,claimed_version+1) ELSE request_version+1 END,
+            status=CASE WHEN status='running' THEN 'running' ELSE 'queued' END
+        WHERE
+            (? AND (status IN ('failed','completed')
+                    OR (status='running' AND request_version=claimed_version)))
+            OR (? AND status='completed'
+                AND (? OR last_completed_at IS NULL OR last_completed_at<=?))
+        """, (str(trigger)[:60], now, request_kind == "explicit",
+              request_kind == "automatic", snapshot_missing, completed_before))
+    return read_snapshot_refresh(conn)
+
+
+def claim_snapshot_refresh(conn, *, owner, now, expires_at):
+    """Claim pending/due work or recover an expired process with a new fence."""
+    changed = conn.execute("""UPDATE paper_dashboard_refresh_jobs SET
+        status='running', owner_key=?, fencing_token=fencing_token+1,
+        claimed_version=request_version, attempt=attempt+1,
+        started_at=?, heartbeat_at=?, expires_at=?, finished_at=NULL, next_retry_at=NULL
+        WHERE id=1 AND """ + _SNAPSHOT_REFRESH_DUE, (owner, now, now, expires_at, now, now))
+    return read_snapshot_refresh(conn) if changed.rowcount == 1 else None
+
+
+def renew_snapshot_refresh(conn, *, owner, fencing_token, now, expires_at):
+    return conn.execute("""UPDATE paper_dashboard_refresh_jobs
+        SET heartbeat_at=?, expires_at=?
+        WHERE id=1 AND status='running' AND owner_key=? AND fencing_token=? AND expires_at>?
+        """, (now, expires_at, owner, fencing_token, now)).rowcount == 1
+
+
+def assert_snapshot_refresh_lease(conn, *, owner, fencing_token, now):
+    row = conn.execute("""SELECT 1 FROM paper_dashboard_refresh_jobs
+        WHERE id=1 AND status='running' AND owner_key=? AND fencing_token=? AND expires_at>?
+        """, (owner, fencing_token, now)).fetchone()
+    if row is None:
+        raise SnapshotLeaseLost("dashboard snapshot lease lost")
+
+
+def complete_snapshot_refresh(conn, *, owner, fencing_token, now):
+    changed = conn.execute("""UPDATE paper_dashboard_refresh_jobs SET
+        status=CASE WHEN request_version>claimed_version THEN 'queued' ELSE 'completed' END,
+        finished_at=?, last_completed_at=?, last_error=NULL,
+        owner_key=NULL, expires_at=NULL, next_retry_at=NULL
+        WHERE id=1 AND status='running' AND owner_key=? AND fencing_token=? AND expires_at>?
+        """, (now, now, owner, fencing_token, now))
+    if changed.rowcount != 1:
+        raise SnapshotLeaseLost("dashboard snapshot completion lost its lease")
+
+
+def fail_snapshot_refresh(conn, *, owner, fencing_token, now, retry_at, error):
+    return conn.execute("""UPDATE paper_dashboard_refresh_jobs SET
+        status='failed', finished_at=?, next_retry_at=?, last_error=?,
+        owner_key=NULL, expires_at=NULL
+        WHERE id=1 AND status='running' AND owner_key=? AND fencing_token=? AND expires_at>?
+        """, (now, retry_at, str(error)[:500], owner, fencing_token, now)).rowcount == 1

@@ -2062,6 +2062,20 @@ def ensure_experiment_search(conn):
         )
     return changes
 
+def ensure_dashboard_refresh_jobs(conn):
+    """展示任务独立于交易 jobs；单一队列身份合并重复刷新请求。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS paper_dashboard_refresh_jobs (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
+        trigger TEXT NOT NULL, requested_at TEXT NOT NULL,
+        request_version INTEGER NOT NULL DEFAULT 1, claimed_version INTEGER NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 0, owner_key TEXT,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT, heartbeat_at TEXT, expires_at TEXT, finished_at TEXT,
+        next_retry_at TEXT, last_error TEXT, last_completed_at TEXT
+    )""")
+
+
 def ensure_ai_decision_audits(conn):
     """v40：AI 意见消费结果的独立追加式审计行（DDL 单一事实来源）。
 
@@ -2441,3 +2455,4 @@ def ensure_feature_tables(conn):
     ensure_paper_metrics_indexes(conn)
     ensure_portfolio_order_read_index(conn)
     ensure_ai_decision_audits(conn)
+    ensure_dashboard_refresh_jobs(conn)

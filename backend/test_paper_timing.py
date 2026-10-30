@@ -365,7 +365,7 @@ class SlotLedgerTimingTests(unittest.TestCase):
     def test_real_slot_persists_same_trace_and_keeps_idempotency(self):
         paper = self.paper
         risk = timing.timed("risk_pass")(lambda *_: {"orders": []})
-        refresh = timing.timed("risk_snapshot")(lambda **_: {"status": "completed"})
+        refresh = timing.timed("risk_snapshot_enqueue")(lambda **_: {"status": "completed"})
         with mock.patch.object(paper, "monitor_risk", side_effect=risk) as work, \
                 mock.patch.object(paper, "request_risk_snapshot_refresh", side_effect=refresh):
             first = paper.run_slot("risk", asof_date="2026-10-16", force=True)
@@ -378,8 +378,8 @@ class SlotLedgerTimingTests(unittest.TestCase):
         self.assertEqual(before["attempt_id"], first["timing"]["attempt_id"])
         self.assertEqual(before["identity"]["market_date"], "2026-10-16")
         self.assertIn("risk_pass", before["stages"])
-        self.assertNotIn("risk_snapshot", before["stages"])
-        self.assertIn("risk_snapshot", first["timing"]["stages"])
+        self.assertNotIn("risk_snapshot_enqueue", before["stages"])
+        self.assertIn("risk_snapshot_enqueue", first["timing"]["stages"])
         self.assertEqual(second["status"], "already_done")
         self.assertNotEqual(first["timing"]["attempt_id"], second["timing"]["attempt_id"])
         self.assertEqual(work.call_count, 1)

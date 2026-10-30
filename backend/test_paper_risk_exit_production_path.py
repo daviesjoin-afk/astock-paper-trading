@@ -810,7 +810,7 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             failed = PT.run_slot("risk", self.day, force=True, risk_snapshot_background=False)
             self.assertEqual(failed["status"], "completed")
             self.assertEqual(failed["risk_snapshot_refresh"], "failed")
-            self.assertEqual(paper_runner._result_exit_code(failed), 1)
+            self.assertEqual(paper_runner._result_exit_code(failed), 0)
             with PT._db() as conn:
                 self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
                 fill_count = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]

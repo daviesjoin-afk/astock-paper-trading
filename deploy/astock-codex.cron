@@ -130,6 +130,10 @@ HOME=/opt/astock-codex
 50 8 * * 1-5 root flock -w 900 /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/paper_selection_runner.py --slot daily --topn 5 >>/opt/astock-codex/reports/paper-selection.log 2>&1
 
 
+# 展示快照由独立持久任务处理；复用重型数据任务锁和现有 data-worker，
+# 不持 paper-scan.lock，不增加交易 runner 并发；无待处理任务时立即退出。
+* * * * * root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/paper_snapshot_worker.py >>/opt/astock-codex/reports/snapshot-refresh.log 2>&1
+
 # 每日自动备份（2026-09-04 排查确认此前从未有备份任务；sqlite 在线备份不锁库）。
 # backup.sh 自带路径探测（/opt/astock-codex 或 /root/codex）与清单自校验。
 10 20 * * * root flock -n /opt/astock-codex/.locks/backup.lock /opt/astock-codex/deploy/backup.sh --keep 7 >>/opt/astock-codex/reports/backup.log 2>&1
