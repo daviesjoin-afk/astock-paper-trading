@@ -8,10 +8,94 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import requests
+
+
+#: 主机级可达性的判定结果。
+#:
+#: 只有**传输层**失败（连接被拒 / 超时 / DNS 失败）才说明"这台主机从这里
+#: 出不去"；HTTP 状态错误（4xx/5xx）说明主机**可达**，只是这次请求没被
+#: 满足；主机可达但本次没返回数据是**数据级**缺失。混装这三类会让
+#: "整段机房出口被封"被读成"接口返回异常"。
+HOST_OK = "ok"
+HOST_UNREACHABLE = "host_unreachable"
+HOST_REACHABLE = "host_reachable"
+HOST_EMPTY_RESPONSE = "empty_response"
+
+
+#: 资金源"为什么没有数据"的两种**不同**语义。
+#:
+#: * ``FLOW_SOURCE_HOST_UNREACHABLE`` —— 承载资金流的主机**整段**不可达
+#:   （机房出口被封）。此时全市场都没有资金数据，"这只票没资金"这句话是
+#:   误导性的：它描述的是**整段**。
+#: * ``FLOW_SOURCE_SYMBOL_MISSING`` —— 主机可达，但这一只票（或这批页）缺
+#:   字段/缺行。属于符号级缺失。
+#:
+#: 两者绝不能混成同一批 ``missing`` 字段：看板上要能区分"这只票没资金数据"
+#: 和"今天全市场都没资金数据"。
+FLOW_SOURCE_OK = "ok"
+FLOW_SOURCE_HOST_UNREACHABLE = "host_unreachable"
+FLOW_SOURCE_SYMBOL_MISSING = "symbol_missing"
+FLOW_SOURCE_UNKNOWN = "unknown"
+
+#: 资金字段的**判定口径**：一行同时具备主力净流入占比与超大单资金，才算
+#: 拿到了资金证据。缺任何一个都按 unknown 处理（绝不猜、不用委比/成交量顶替）。
+FLOW_FIELDS = ("main_net", "super_net", "main_pct")
+
+
+def flow_source_status(row, *, host_unreachable=False):
+    """判定一行（或整批）的资金证据状态。
+
+    ``host_unreachable=True`` 表示承载资金流的主机整段不可达 —— 此时缺资金
+    是**主机级**事实，不是这一只票的符号级缺失。调用方据此把两类 missing
+    分开呈现。
+    """
+    if not isinstance(row, dict):
+        return FLOW_SOURCE_UNKNOWN
+    if any(isinstance(row.get(field), (int, float)) for field in FLOW_FIELDS):
+        return FLOW_SOURCE_OK
+    return FLOW_SOURCE_HOST_UNREACHABLE if host_unreachable else FLOW_SOURCE_SYMBOL_MISSING
+
+
+def classify_host_failure(exc):
+    """把一次主机请求失败分成"主机不可达"与"主机可达但本次失败"。
+
+    同一批候选主机**全部**返回传输层失败，说明这一段出口整体不可达（机房级
+    封锁）；某台主机返回了 HTTP 响应（哪怕是空数据或 4xx/5xx），说明主机可达，
+    那是接口级/数据级失败，不能升级成"整段不可达"。
+
+    判定只认异常类型，不看文案：``requests`` 的 ``ConnectionError`` /
+    ``Timeout`` 覆盖了 ``ConnectTimeout`` / ``ReadTimeout`` / ``SSLError``
+    （后者继承 ``ConnectionError``）；``HTTPError`` 明确属于"可达"。
+    """
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return HOST_UNREACHABLE
+    return HOST_REACHABLE
+
+
+def clist_host_summary(outcomes):
+    """把逐主机判定汇总成"这一段主机可不可达"的事实。
+
+    ``outcomes`` 是 ``{host: kind}``。只有当**每一台**被试过的主机都是
+    ``host_unreachable`` 时，整段才算不可达；只要有任意一台主机给出过
+    响应（哪怕是空数据），这一段就是可达的 —— 那属于符号级/数据级缺失。
+    """
+    ordered = {host: outcomes[host] for host in sorted(outcomes)}
+    hosts = list(ordered)
+    unreachable = [host for host in hosts if ordered[host] == HOST_UNREACHABLE]
+    reachable = [host for host in hosts if ordered[host] != HOST_UNREACHABLE]
+    return {
+        "hosts_tried": hosts,
+        "host_outcomes": ordered,
+        "host_unreachable": bool(hosts) and not reachable,
+        "reachable_hosts": reachable,
+        "unreachable_hosts": unreachable,
+    }
 
 
 def fetch_eastmoney_clist(
@@ -38,8 +122,23 @@ def fetch_eastmoney_clist(
     dictionary.  Keeping those concerns injected makes this provider adapter
     independently testable while preserving the existing fail-closed metadata
     contract used by full-market snapshots.
+
+    The adapter also records **per-host reachability** (``host_reachability``).
+    "No rows" has two very different causes: every candidate host refused the
+    TCP connection (the whole provider segment is unreachable from this
+    network) versus the hosts answered but returned no usable rows for these
+    codes (symbol-level miss).  The former must never be reported as the
+    latter, so the transport outcome of each tried host is preserved.
     """
     host_list = list(hosts)
+    host_outcomes = {}
+    outcome_lock = threading.Lock()
+
+    def _record_outcome(host, kind):
+        with outcome_lock:
+            # The first observation of a host wins: a host that answered is
+            # reachable regardless of how a later page behaved.
+            host_outcomes.setdefault(host, kind)
 
     def _host_ok(host):
         info = host_health.get(host)
@@ -74,8 +173,13 @@ def fetch_eastmoney_clist(
                 data = (response or {}).get("data") or {}
                 diff = data.get("diff") or []
                 total = data.get("total", 0)
-            except Exception:
+            except Exception as exc:
+                _record_outcome(host, classify_host_failure(exc))
                 diff, total = [], 0
+            else:
+                # The host answered: it is reachable even when this page had
+                # no usable rows (symbol-level miss, not an outage).
+                _record_outcome(host, HOST_OK if diff else HOST_EMPTY_RESPONSE)
             if diff:
                 _host_ok_set(host)
                 return diff, total
@@ -91,6 +195,7 @@ def fetch_eastmoney_clist(
         result = {
             "rows": [], "total": total, "pages_expected": 0,
             "pages_ok": 0, "failed_pages": [1], "complete": False,
+            "host_reachability": clist_host_summary(host_outcomes),
         }
         return result if return_meta else []
 
@@ -129,6 +234,7 @@ def fetch_eastmoney_clist(
         "pages_ok": len(page_rows),
         "failed_pages": sorted(failed_pages),
         "complete": complete,
+        "host_reachability": clist_host_summary(host_outcomes),
     }
     return meta if return_meta else rows
 
@@ -295,6 +401,76 @@ def _tencent_volume_amount_turnover(parts, price):
     return volume_lots, amount, turnover
 
 
+def _tencent_ohlc_range(parts, price):
+    """从腾讯报文取今开/最高/最低，并做**自洽**校验。
+
+    为什么需要：价格-only 全市场回退此前在组装快照行时把 ``high`` /
+    ``low`` / ``open_price`` **写死成 None**（腾讯报文里其实有：``[5]``=今开、
+    ``[33]``=最高、``[34]``=最低）。于是下游 ``main_force_intent`` 的
+    "日内高低价"恒缺，"收盘靠近日内低位"那 14 分永远拿不到，深跌票卡在
+    下跌确认门槛之下。
+
+    公开报文格式改过版，所以不盲信下标：先按位置取值，再做自洽校验 ——
+    ``low ≤ open ≤ high`` 且 ``low ≤ price ≤ high``，全部为正有限数；任何
+    一条不成立就整体置 None（保持 unknown）。这个仓库的口径是"未知不等于
+    零"，绝不填 0、绝不猜、绝不让别的字段顶替。
+    """
+    def _num_at(index):
+        if index >= len(parts):
+            return None
+        try:
+            value = float(str(parts[index] or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+            return None
+        return value
+
+    open_price = _num_at(5)     # 今开
+    high = _num_at(33)          # 最高
+    low = _num_at(34)           # 最低
+    if high is None or low is None:
+        return None, None, None
+    if high < low:
+        return None, None, None
+    if not (low <= price <= high):
+        return None, None, None
+    if open_price is not None and not (low <= open_price <= high):
+        open_price = None
+    return open_price, high, low
+
+
+def _sina_ohlc_range(values, price):
+    """从新浪报文取今开/最高/最低，并做与腾讯同一口径的自洽校验。
+
+    新浪个股报文的字段顺序是固定的：``[1]``=今开、``[2]``=昨收、``[3]``=现价、
+    ``[4]``=最高、``[5]``=最低。与腾讯一样，校验不通过就整体保持 None。
+    """
+    def _num_at(index):
+        if index >= len(values):
+            return None
+        try:
+            value = float(str(values[index] or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+            return None
+        return value
+
+    open_price = _num_at(1)
+    high = _num_at(4)
+    low = _num_at(5)
+    if high is None or low is None:
+        return None, None, None
+    if high < low:
+        return None, None, None
+    if not (low <= price <= high):
+        return None, None, None
+    if open_price is not None and not (low <= open_price <= high):
+        open_price = None
+    return open_price, high, low
+
+
 def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
     """解析腾讯 ``qt.gtimg.cn`` 文本响应。"""
     allowed = {str(code) for code in allowed_codes} if allowed_codes is not None else None
@@ -323,6 +499,7 @@ def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
         )
         if price > 0:
             volume_lots, amount, turnover = _tencent_volume_amount_turnover(parts, price)
+            open_price, high, low = _tencent_ohlc_range(parts, price)
             rows_by_code[code] = {
                 "code": code, "name": parts[1], "price": price, "prev_close": prev_close,
                 "pct": pct, "quote_at": quote_at,
@@ -330,6 +507,10 @@ def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
                 **({"volume": volume_lots} if volume_lots is not None else {}),
                 **({"amount": amount} if amount is not None else {}),
                 **({"turnover": turnover} if turnover is not None else {}),
+                # 日内高低：自洽校验通过才写数值，否则整体不出现（保持 unknown）。
+                **({"open_price": open_price} if open_price is not None else {}),
+                **({"high": high} if high is not None else {}),
+                **({"low": low} if low is not None else {}),
                 "source": "tencent_public_quote", "attempt": attempt,
             }
     return list(rows_by_code.values())
@@ -368,6 +549,7 @@ def parse_sina_realtime_text(text, *, allowed_codes=None):
                     quote_date = str(value).strip()
                     quote_clock = str(values[idx + 1]).strip()
                     break
+        open_price, high, low = _sina_ohlc_range(values, price)
         rows_by_code[code] = {
             "code": code,
             "name": values[0],
@@ -376,6 +558,10 @@ def parse_sina_realtime_text(text, *, allowed_codes=None):
             "pct": round((price - prev_close) / prev_close * 100, 4),
             "quote_at": f"{quote_date}T{quote_clock}+08:00" if quote_date and quote_clock else None,
             **_sina_volume_amount(values),
+            # 日内高低：与腾讯同一口径，自洽校验不通过就整体保持 unknown。
+            **({"open_price": open_price} if open_price is not None else {}),
+            **({"high": high} if high is not None else {}),
+            **({"low": low} if low is not None else {}),
             "source": "sina_public_quote",
         }
     return list(rows_by_code.values())

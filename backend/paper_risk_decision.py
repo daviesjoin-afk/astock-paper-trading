@@ -150,6 +150,70 @@ CONFIDENCE_USABLE_FLOOR = 0.35
 DOWNTURN_PCT_THRESHOLD = -6.0
 DOWNTURN_DISTRIBUTION_FLOOR = 50.0
 
+#: 「收盘靠近日内低位」这一项在**分布分**上的权重（洗盘侧另有 18 分口径）。
+RANGE_POSITION_DISTRIBUTION_POINTS = 14
+
+#: 2026-10-30（现网 601956 东贝集团跌停票"确认了却不减仓"）：
+#: 全市场快照只有 price、**没有日内高低**时，"收盘靠近日内低位"这 14 分永远
+#: 拿不到——那是**证据缺位**，不是"事实不存在"。缺位时既不加分也不扣分，
+#: 但绝不能让它把价格类证据判成"不齐全"，否则深跌永远差 10 分卡在
+#: ``DOWNTURN_DISTRIBUTION_FLOOR`` 之下，classification 恒为 uncertain。
+#:
+#: 缺位中性口径的门槛（**比完整证据口径更严，绝不放松**）：
+#:
+#: * 自身深跌：当日跌幅 ≤ ``-7%``——单边崩塌级别（跌停/准跌停）。比完整
+#:   证据口径的 -6% 更严：少了"收盘靠近日内低位"这份印证，必须自己更深。
+#: * 明显跑输：相对沪深300 ≤ ``-5%``——与自身深跌**同时**成立才算。
+#:   只跑输大盘、自身没跌的票（大盘涨、股滞涨）不是个股级下跌确认。
+#:
+#: 为什么 -7%/-5% 不会让 -3%~-5% 的普通回调误触发：普通回调在自身深跌这条
+#: 上就被挡掉（-4.78% > -7%）；-5%~-7% 的深回调也必须同时明显跑输大盘。
+#: 11:35 现网实测：603341 -3.06%（相对 -2.03%）不触发；603239 从 -7.28%
+#: 回升到 -6.13% 后也不再触发（自身深跌已不成立）；只有 601956 -10.00%
+#: （相对 -8.97%）这种跌停票成立。
+DOWNTURN_RANGE_ABSENT_PCT_THRESHOLD = -7.0
+DOWNTURN_RANGE_ABSENT_RELATIVE_THRESHOLD = -5.0
+#: 缺位口径下的分值下限 = 完整证据口径的 50 − 观测不到的 14 分。
+#: **只扣不可观测项的分，不加任何分**：观测不到的那 14 分既不补给分布分，
+#: 也不允许"因为看不到"就按补过之后的标准去要求它。
+DOWNTURN_RANGE_ABSENT_DISTRIBUTION_FLOOR = (
+    DOWNTURN_DISTRIBUTION_FLOOR - RANGE_POSITION_DISTRIBUTION_POINTS
+)
+#: 缺位口径下"洗盘优先"的否决间距：分布分必须比洗盘分高这么多才允许判成
+#: 下跌确认（比完整证据口径原有的"洗盘 < 分布"更严）。
+DOWNTURN_RANGE_ABSENT_WASHOUT_GAP = 10.0
+
+#: 在**缺位中性口径**下被当作"中性缺位"（不加不扣、也不算"价格证据不齐全"）
+#: 的价格类字段。只有当深跌+明显跑输两条腿都成立时才享受该待遇。
+PRICE_EVIDENCE_NEUTRAL_MISSING = ("日内高低价",)
+
+#: 资金证据"为什么缺"的三种取值（2026-10-30 P0「资金源整段不可达」）。
+#:
+#: 同一个"缺资金字段"在两种现场里含义完全不同：
+#:
+#: * ``host_unreachable`` —— 承载资金流的主机**整段**不可达（机房出口被封）。
+#:   全市场都没有资金数据，"这只票没资金"是误导性的说法。
+#: * ``symbol_missing``  —— 主机可达，只是这一只票/这一批页缺字段。
+#:
+#: 两者必须能被审计文案区分开：看板要能分别回答"这只票没资金数据"与
+#: "今天全市场都没资金数据"。取值直接沿用 provider 层的同一套词表。
+FLOW_SOURCE_OK = "ok"
+FLOW_SOURCE_HOST_UNREACHABLE = "host_unreachable"
+FLOW_SOURCE_SYMBOL_MISSING = "symbol_missing"
+FLOW_SOURCE_UNKNOWN = "unknown"
+
+
+def _flow_source_status(quote):
+    """读取这一行/这一轮的资金源状态（缺省按"不可判定"处理）。
+
+    行情行自带 ``flow_source_status``（由 provider 层写入）；没有该字段的
+    历史行按 ``unknown`` 处理 —— 既不声称整段不可达，也不声称符号级缺失。
+    """
+    status = str((quote or {}).get("flow_source_status") or "").strip()
+    return status if status in {
+        FLOW_SOURCE_OK, FLOW_SOURCE_HOST_UNREACHABLE,
+        FLOW_SOURCE_SYMBOL_MISSING, FLOW_SOURCE_UNKNOWN,
+    } else FLOW_SOURCE_UNKNOWN
 
 def main_force_intent(position, quote, market=None, news=None):
     """判断急跌更像"洗盘"还是"出货"——可解释的**风险信号**，不是可观测事实。
@@ -241,6 +305,23 @@ def main_force_intent(position, quote, market=None, news=None):
     # 把 -8% 的当日跌幅判成"意图不确定"（P0 现场）。
     price_missing = [item for item in missing_fields if item in PRICE_EVIDENCE_FIELDS]
     flow_missing = [item for item in missing_fields if item in FLOW_EVIDENCE_FIELDS]
+    # 资金证据"为什么缺"必须分两种现场（2026-10-30 P0「资金源整段不可达」）：
+    #   * ``host_unreachable`` —— 承载资金流的主机整段不可达（机房出口被封）。
+    #     此时"这只票缺主力净流入占比"是**误导性**表述：全市场都没有。
+    #   * ``symbol_missing``  —— 主机可达，只是这一只票缺字段。
+    #
+    # ``flow_evidence_missing`` 保持**原样**（缺口如实上报），新增
+    # ``flow_missing_scope`` 说明这些缺口的**成因范围**，让看板与审计
+    # 能区分"这只票没资金数据"与"今天全市场都没资金数据"。
+    flow_status = _flow_source_status(quote)
+    if flow_status == FLOW_SOURCE_HOST_UNREACHABLE:
+        flow_missing_scope = "host_unreachable"
+    elif flow_status == FLOW_SOURCE_SYMBOL_MISSING:
+        flow_missing_scope = "symbol_missing"
+    elif flow_status == FLOW_SOURCE_OK:
+        flow_missing_scope = None
+    else:
+        flow_missing_scope = "unknown"
     usable = max(
         CONFIDENCE_USABLE_FLOOR,
         1.0 - (PRICE_EVIDENCE_MISSING_WEIGHT * len(price_missing)
@@ -248,12 +329,49 @@ def main_force_intent(position, quote, market=None, news=None):
     )
     gap = abs(distribution - washout)
     confidence = round(min(0.98, (0.50 + gap / 100.0) * usable), 2)
+    # 「日内高低价」缺失 = **证据缺位**，不是"收盘位置未知"。
+    # 深跌时"收盘靠近日内低位"既不可观测也不可否认：只能**不加不扣**
+    # （绝不因为看不到就补分），并且不再让价格类证据因此判成"不齐全"——
+    # 否则深跌永远差那 14 分卡在 floor 之下，classification 恒为 uncertain。
+    #
+    # 缺位中性口径的两条腿（**必须同时成立**，比完整证据口径更严）：
+    #   * 自身深跌：当日跌幅 ≤ -7%（单边崩塌级别）；
+    #   * 明显跑输：相对沪深300 ≤ -5%。
+    # 相对强弱读不出来（指数不可用）时相对腿不成立：分不清"个股崩塌"与
+    # "大盘普跌"时不猜——宁可退回 uncertain 也不凭空升级。
+    range_absent = "日内高低价" in price_missing
+    deep_drop_leg = (
+        pct is not None and pct <= DOWNTURN_RANGE_ABSENT_PCT_THRESHOLD
+    )
+    relative_leg = (
+        relative is not None
+        and relative <= DOWNTURN_RANGE_ABSENT_RELATIVE_THRESHOLD
+    )
+    range_neutral = range_absent and deep_drop_leg and relative_leg
+    # 缺位中性口径生效时，"价格证据是否齐全"只看**非中性**的价格类缺口。
+    # 缺口只被"中性"掉，不被凭空补上：分值门槛按扣掉观测不到的那 14 分下调。
+    price_missing_effective = [
+        item for item in price_missing
+        if not (range_neutral and item in PRICE_EVIDENCE_NEUTRAL_MISSING)
+    ]
     if distribution >= 60 and distribution - washout >= 12 and confidence >= 0.58:
         classification, label, hint = "distribution", "疑似出货", "冻结加仓，优先复核可卖仓位"
     elif washout >= 58 and washout - distribution >= 10 and confidence >= 0.58:
         classification, label, hint = "washout", "疑似洗盘", "不因单日下跌单独清仓，等待承接确认"
     elif (
-        not price_missing
+        range_neutral
+        and distribution >= DOWNTURN_RANGE_ABSENT_DISTRIBUTION_FLOOR
+        and distribution - washout >= DOWNTURN_RANGE_ABSENT_WASHOUT_GAP
+    ):
+        # 缺位中性口径：可观测的价格证据本身已经够深（分值门槛按"扣掉观测
+        # 不到的那 14 分"下调，绝不补分）。仍然只允许**部分**减仓。
+        classification, label, hint = (
+            "downturn",
+            "下跌确认（资金与日内高低证据缺失）",
+            "价格证据充分（日内高低缺失按中性不加分），允许部分减仓，禁止据此加仓",
+        )
+    elif (
+        not price_missing_effective
         and pct is not None and pct <= DOWNTURN_PCT_THRESHOLD
         and distribution >= DOWNTURN_DISTRIBUTION_FLOOR
         and washout < distribution
@@ -278,6 +396,20 @@ def main_force_intent(position, quote, market=None, news=None):
         "missing": missing_fields,
         "price_evidence_missing": price_missing,
         "flow_evidence_missing": flow_missing,
+        # 资金缺口的**成因范围**（2026-10-30 P0「资金源整段不可达」）：
+        #   ``host_unreachable`` —— 承载资金流的主机整段不可达，全市场都没资金；
+        #   ``symbol_missing``  —— 主机可达，只是这一只票缺字段；
+        #   ``unknown`` / ``None`` —— 不可判定 / 不适用。
+        # 看板据此把"这只票没资金数据"与"今天全市场都没资金数据"分开显示。
+        "flow_source_status": flow_status,
+        "flow_missing_scope": flow_missing_scope,
+        # 缺位中性口径的判定痕迹（审计用）：两条腿各自的值 + 是否成立，
+        # 以及"被中性掉"的价格类缺口。``price_evidence_missing`` 保持**原样**
+        # （缺口仍如实上报），中性只体现在分类判定上。
+        "range_evidence_neutral": bool(range_neutral),
+        "range_absent_deep_drop_leg": bool(deep_drop_leg),
+        "range_absent_relative_leg": bool(relative_leg),
+        "price_evidence_missing_effective": price_missing_effective,
         "confidence_usable": round(usable, 3),
         "relative_to_market_pct": round(relative, 2) if relative is not None else None,
         "range_position": round(range_pos, 3) if range_pos is not None else None,
