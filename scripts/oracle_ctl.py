@@ -60,15 +60,19 @@ def proxy_tunnel(proxy: str, host: str, port: int, timeout: float = 15.0) -> soc
         )
         sock.sendall(request.encode())
         sock.settimeout(timeout)
-        head = b""
-        while b"\r\n\r\n" not in head:
-            chunk = sock.recv(4096)
+        # 精确读到 header 终止符为止，**不能多读**：代理可能把 CONNECT 响应和
+        # 目标的 SSH banner 放在同一次 TCP 到达里，多读会把 banner 一起吃掉，
+        # 之后 SSH 客户端会一直等一个已经到达的 banner（paramiko 报 EOFError）。
+        # 逐字节读取保证内核缓冲里剩下的仍是 banner，socket 对象也无需包装。
+        head = bytearray()
+        while not head.endswith(b"\r\n\r\n"):
+            chunk = sock.recv(1)
             if not chunk:
                 raise OSError("代理在 CONNECT 阶段断开连接")
             head += chunk
             if len(head) > 16384:
                 raise OSError("代理响应头过长")
-        status = head.split(b"\r\n", 1)[0].decode("latin-1")
+        status = bytes(head).split(b"\r\n", 1)[0].decode("latin-1")
         if " 200 " not in status:
             raise OSError(f"代理拒绝 CONNECT：{status}")
         return sock

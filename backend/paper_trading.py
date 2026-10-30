@@ -5580,9 +5580,8 @@ def _quotes(codes, asof_date=None):
         except Exception as exc:
             source_errors["flow"] = f"{type(exc).__name__}: {exc}"
     # 独立核验源采用腾讯优先、缺失代码自动切换新浪；不能因为腾讯一次空响应
-    # 把整轮策略都误判成“独立行情源未返回”。来源仍写入审计 payload，便于追溯。
-    # 主报价若来自腾讯（价格-only 快照回退），必须改用新浪核验：同一来源
-    # 与自己比较不构成双源证据，只会把"自己核验自己"写成 cross_source_checked。
+    # 把整轮策略都误判成“独立行情源未返回”。主报价若来自腾讯（价格-only 快照
+    # 回退），必须改用新浪核验：同一来源与自己比较不构成双源证据。
     same_source_codes = [
         code for code, row in live.items()
         if str(row.get("source") or "") == "tencent_public_quote"
@@ -5665,6 +5664,8 @@ def _quotes(codes, asof_date=None):
             "flow_fresh" if has_flow and flow_day_ok and (flow_age_seconds is None or -120 <= flow_age_seconds <= 120)
             else "flow_unavailable"
         )
+        # 资金源的**成因**随行情行传下去：主机整段不可达 vs 仅本票缺字段。
+        row["flow_source_status"] = dfc.get_flow_fetch_state().get("flow_source_status")
         if source_errors.get("flow"):
             row["flow_source_error"] = source_errors["flow"]
         if source_errors:
@@ -5705,8 +5706,7 @@ def _quotes(codes, asof_date=None):
             out[code]["tradability_observation_status"] = "available"
             out[code]["execution_asof"] = completed_at
     for code, row in cached.items():
-        # 轮内复用的行不重新走成交性校验以外的东西：
-        # 它们在入池时已通过同一套 price/pct/freshness 判定。
+        # 轮内复用的行在入池时已通过同一套 price/pct/freshness 判定，不再重跑成交性校验。
         if code not in out:
             out[code] = dict(row)
     return out
