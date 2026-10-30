@@ -40,7 +40,7 @@ class SnapshotJobsTests(unittest.TestCase):
             return PJL.read_snapshot_refresh(conn)
 
     def request(self):
-        return Jobs.request_refresh(self.db, trigger="test")
+        return Jobs.request_refresh(self.db, trigger="test", request_kind="explicit")
 
     def publish_value(self, publish, value="new"):
         publish(lambda: self.snapshot.write_text(value, encoding="utf-8"))

@@ -222,15 +222,45 @@ def read_snapshot_refresh(conn):
     return dict(row) if row is not None else None
 
 
-def enqueue_snapshot_refresh(conn, *, trigger, now):
-    """Coalesce requests, retaining a follow-up request made during a running pass."""
+SNAPSHOT_AUTO_REFRESH_SECONDS = 300
+_SNAPSHOT_REFRESH_DUE = (
+    "((status IN ('queued','failed') AND (next_retry_at IS NULL OR next_retry_at<=?))"
+    " OR (status='running' AND expires_at<=?))"
+)
+
+
+def snapshot_refresh_due(conn, *, now):
+    """Read-only hint; only claim_snapshot_refresh grants execution authority."""
+    return conn.execute(
+        "SELECT 1 FROM paper_dashboard_refresh_jobs WHERE id=1 AND " + _SNAPSHOT_REFRESH_DUE,
+        (now, now),
+    ).fetchone() is not None
+
+
+def enqueue_snapshot_refresh(conn, *, trigger, now, request_kind="automatic",
+                             snapshot_missing=False, completed_before):
+    """Only explicit new work creates a follow-up; reads and repeated slots do not.
+
+    automatic: keep pending/running/backoff work; throttle completed stale input.
+    explicit: manual/new-data requests coalesce to at most one pending follow-up.
+    ensure: create the first durable request only, regardless of an existing state.
+    """
+    if request_kind not in {"automatic", "explicit", "ensure"}:
+        raise ValueError("unknown snapshot refresh request kind")
     conn.execute("""INSERT INTO paper_dashboard_refresh_jobs
         (id,status,trigger,requested_at) VALUES(1,'queued',?,?)
         ON CONFLICT(id) DO UPDATE SET
             trigger=excluded.trigger, requested_at=excluded.requested_at,
-            request_version=request_version+1,
+            request_version=CASE WHEN status='running'
+                THEN MAX(request_version,claimed_version+1) ELSE request_version+1 END,
             status=CASE WHEN status='running' THEN 'running' ELSE 'queued' END
-        """, (str(trigger)[:60], now))
+        WHERE
+            (? AND (status IN ('failed','completed')
+                    OR (status='running' AND request_version=claimed_version)))
+            OR (? AND status='completed'
+                AND (? OR last_completed_at IS NULL OR last_completed_at<=?))
+        """, (str(trigger)[:60], now, request_kind == "explicit",
+              request_kind == "automatic", snapshot_missing, completed_before))
     return read_snapshot_refresh(conn)
 
 
@@ -240,10 +270,7 @@ def claim_snapshot_refresh(conn, *, owner, now, expires_at):
         status='running', owner_key=?, fencing_token=fencing_token+1,
         claimed_version=request_version, attempt=attempt+1,
         started_at=?, heartbeat_at=?, expires_at=?, finished_at=NULL, next_retry_at=NULL
-        WHERE id=1 AND (
-            (status IN ('queued','failed') AND (next_retry_at IS NULL OR next_retry_at<=?))
-            OR (status='running' AND expires_at<=?)
-        )""", (owner, now, now, expires_at, now, now))
+        WHERE id=1 AND """ + _SNAPSHOT_REFRESH_DUE, (owner, now, now, expires_at, now, now))
     return read_snapshot_refresh(conn) if changed.rowcount == 1 else None
 
 

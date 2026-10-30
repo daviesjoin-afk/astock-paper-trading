@@ -6,7 +6,17 @@ PR-2 基于 PR-1 合并提交 `c321e394c25f034af8938fa007b4643c62e37369`。交�
 
 `paper_schema_migrations` 持有新增表 `paper_dashboard_refresh_jobs`，正式迁移为 v41。此表独立于 `paper_jobs` / `paper_job_runs`，不混入交易运行统计，且只有 `paper_job_lifecycle` 写入；`paper_snapshot_jobs` 组织短事务与 worker 的刷新过程。
 
-队列只有一个固定身份，重复排队合并。状态为 queued → running → completed/failed。请求版本与认领版本分开记录：运行中到达的请求保留为一次后续排队，不丢失，也不展开成无界队列。记录 trigger、请求/开始/心跳/结束/最近完成时间、attempt、错误和下次重试时间。
+队列只有一个固定身份，重复排队合并。状态为 queued → running → completed/failed。请求版本与认领版本分开记录；只有明确的新刷新请求才能在 running 时保留一个后续版本，自动 GET 不会制造后续任务。记录 trigger、请求/开始/心跳/结束/最近完成时间、attempt、错误和下次重试时间。
+
+PR299 定向修复将请求分为三类，判断和状态更新均在 `paper_job_lifecycle` 的原写事务与 UPSERT/CAS 内完成：
+
+| 请求类型 | 入口 | 已有任务时的行为 |
+|---|---|---|
+| automatic | 页面 GET、默认后台请求 | queued/running/failed 不增版、不改退避；completed 按最近完成时间冷却 300 秒，之后可再请求一次；缺失快照可补建请求 |
+| explicit | 人工 POST/显式 refresh、新 completed slot | queued 合并；running 最多保留 `claimed_version+1` 这一个后续版本；失败退避时间继续保留 |
+| ensure | already_done slot | 仅缺少任务行时建立首次请求；已有任意任务均不改版，即使已过自动刷新冷却时间 |
+
+来源时间仍陈旧不会被改写成新鲜。300 秒冷却只约束展示任务重复请求，不改快照 TTL、行情证据或交易规则；人工明确刷新与新交易数据仍可立即登记。人工 POST 后的返回视图及紧接的 GET 使用 automatic，不额外增加请求版本。
 
 租约为 120 秒，每 20 秒心跳；失败后至少 60 秒再试。新请求不跳过失败退避。进程退出不丢失队列，租约到期后新进程用递增的 fencing token（区分新旧持有者的代次）认领；过期持有者不能续期、完成或发布。没有独立的交易运行权，也不会提交订单或改变资金。
 
@@ -22,7 +32,9 @@ PR-2 基于 PR-1 合并提交 `c321e394c25f034af8938fa007b4643c62e37369`。交�
 python backend/paper_snapshot_worker.py
 ```
 
-每次运行只处理一个待处理或已到重试时间的任务；无任务即退出。仅 completed/idle 返回 0，刷新失败或丢失租约返回非零。worker 进程执行刷新，唯一的辅助线程只续心跳并在退出前停止，不承担后台刷新业务。
+每次运行只处理一个待处理或已到重试时间的任务。导入完整 `paper_trading`、调用 `init_db` 之前，先通过 `paper_storage` 只读连接和 `paper_job_lifecycle.snapshot_refresh_due` 判断是否有到期任务；空队列、未到退避时间、有效 running lease 和 completed 状态直接退出。只读预检查与最终认领共享同一个 owner 的到期谓词，不授予执行权；即使两个 worker 同时通过预检查，最终仍由原 CAS/fencing 决定谁执行。缺数据库/任务表时继续原初始化路径，不能把尚未迁移当作空队列。
+
+仅 completed/idle 返回 0，刷新失败或丢失租约返回非零。worker 进程执行刷新，唯一的辅助线程只续心跳并在退出前停止，不承担后台刷新业务。
 
 Linux cron 每分钟在现有 `astock-data-worker` 中执行上述命令，持有 `resource-heavy.lock`，不经过交易 `run_paper_slot.sh`，不持 `paper-scan.lock`，也不增加交易并发。锁被历史恢复/候选数据任务占用时本次不进入 worker，持久请求留到下一次。因此这是有恢复能力的展示解耦，尚不保证一分钟内刷新，也未证明 SQLite 争锁或真实 provider 请求减少。
 
@@ -35,6 +47,37 @@ GET risk-overview 和 POST risk-refresh 都立即读取最近成功快照；缺�
 返回保留 asof、snapshot_age_seconds、snapshot_stale 与原数据源时间，并添加 snapshot_refresh 中的状态/错误/尝试次数/最近完成时间。刷新失败显示原错误和旧快照；排队、刷新中或失败等待重试时可继续轮询。缺少快照时年龄为未知，不伪装成 0 秒或已刷新。跨进程完成通过原数据库/WAL 缓存代次失效读取缓存。
 
 ## 验证证据
+
+### eb67556 后的定向对照
+
+使用同一绝对路径 `scripts/pr299_refresh_probe.py`，在 `eb6755673ce34a3f4d8f703cc065d2937577be2a` 和修复后的独立 checkout 根目录分别运行，Python 3.14.5，同机、串行测量。仅临时账本；强制每次 GET 缓存未命中，证明幂等性不依赖缓存碰巧命中。任务时钟固定，provider 返回固定离线数据；市场、板块、板块流各调用一个替身，因此一次成功刷新计 3 次替身调用。这些是隔离替身计数，不是真实 HTTP 请求数或线上性能结论。
+
+| 场景 | 最终 request_version 前→后 | 最终 attempt 前→后 | provider 替身总调用 前→后 | 实际刷新次数 前→后 |
+|---|---:|---:|---:|---:|
+| running 期间 50 次 GET，再排空队列 | 51→1 | 2→1 | 6→3 | 2→1 |
+| running 期间一次人工 POST，再 50 次 GET | 53→2 | 2→2 | 6→6 | 2→2 |
+| 人工 POST 后立即 GET，再处理任务 | 3→1 | 1→1 | 3→3 | 1→1 |
+| failed-backoff 内 50 次 GET | 51→1 | 1→1 | 1→1 | 1→1 |
+| completed 后来源仍旧，连续 5 轮“50 GET + 排空” | 251→1 | 6→1 | 18→3 | 6→1 |
+| 已有 completed 刷新任务，再 50 次 already_done slot | 51→1 | 2→1 | 6→3 | 2→1 |
+
+退避场景修改前也未提前执行 provider，但 GET 会把 failed 改成 queued 并空增 50 个版本；修复后保留 failed、原错误和重试截止。人工刷新场景始终保留恰好一次后续刷新，减少的是 GET 产生的无意义版本，不吞掉人工请求。额外测试覆盖多个人工请求合并、缺快照首次建立/重新建立、冷却到期后可刷新、新 completed slot 的首次请求，以及 already_done 不丢失人工后续请求。
+
+空队列启动测量：每版 10 个新 Python 进程，先各预热 1 次并排除；热文件系统缓存，计时含进程创建/退出。使用同样的已初始化空账本，禁止联网。
+
+| 指标 | 修改前 | 修改后 |
+|---|---:|---:|
+| 空队列启动 P50 ms | 1966.937 | 110.833 |
+| P95 / max ms（最近秩法，小样本） | 2183.029 / 2183.029 | 124.549 / 124.549 |
+| 10 次启动中完整交易引擎导入次数 | 10 | 0 |
+
+这里只证明本机空闲入口减少重型初始化成本，不代表活跃刷新、生产锁等待或全市场扫描提速。复跑命令（输出文件按实际绝对路径替换；两侧必须运行同一份修复后的脚本）：
+
+```bash
+python /absolute/path/to/scripts/pr299_refresh_probe.py /absolute/path/to/output.json --startup-samples 10
+```
+
+分层验证：L0 Ruff（backend 与三个验收脚本）、compileall、diff check 通过；L1 新定向与原 fencing/竞争测试共 25 项通过；L2 相关模块 100 项通过；L3 架构/schema/交易边界守卫 110 项通过。仅为轻量 worker 必须的 1 次正常延迟导入登记架构额度，未改其它预算。L4 完整后端、Docker 断网和其它 CI 的最终 HEAD/run 链接与实际用例数更新到 PR #299 描述，不沿用旧提交的绿色状态。
 
 - 新持久队列测试 11 项通过：重复请求合并、运行中后续请求、失败保留文件及退避、崩溃租约恢复、过期拒绝续租/发布、两个 worker 竞争、旧 worker 晚返回、心跳、网络/构建不占写事务、快照与历史共同受发布资格保护。
 - 集成测试证明展示 worker 被阻塞时真实交易 run_slot 已完成、租约已释放且 runner 返回成功；登记异常不改变交易退出码。

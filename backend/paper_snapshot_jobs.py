@@ -16,10 +16,14 @@ def _stamp(offset=0):
     return (dt.datetime.now() + dt.timedelta(seconds=offset)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def request_refresh(db_factory, *, trigger):
+def request_refresh(db_factory, *, trigger, request_kind="automatic", snapshot_missing=False):
     with db_factory(immediate=True, hot_path=True) as conn:
-        row = PJL.enqueue_snapshot_refresh(conn, trigger=trigger, now=_stamp())
-    return {"status": "already_running" if row["status"] == "running" else "scheduled"}
+        row = PJL.enqueue_snapshot_refresh(
+            conn, trigger=trigger, now=_stamp(), request_kind=request_kind,
+            snapshot_missing=snapshot_missing, completed_before=_stamp(-PJL.SNAPSHOT_AUTO_REFRESH_SECONDS),
+        )
+    return {"status": {"queued": "scheduled", "running": "already_running",
+                       "failed": "backoff", "completed": "completed"}[row["status"]]}
 
 
 def refresh_status(db_factory):

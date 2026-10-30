@@ -161,7 +161,7 @@ class ApiCacheSingleFlightTests(unittest.TestCase):
                                   return_value={"status": "scheduled"}) as request:
             result = api.risk_refresh()
         self.assertEqual(result, view)
-        request.assert_called_once_with(trigger="manual")
+        request.assert_called_once_with(trigger="manual", request_kind="explicit")
         clear.assert_called_once_with("risk_")
 
 

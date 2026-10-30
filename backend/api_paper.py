@@ -709,7 +709,7 @@ def risk_refresh():
         # Enqueue only. The external worker survives this HTTP process and the
         # response continues to display the last trusted snapshot immediately.
         _cclear("risk_")
-        P.request_risk_snapshot_refresh(trigger="manual")
+        P.request_risk_snapshot_refresh(trigger="manual", request_kind="explicit")
         return risk_overview()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Refresh failed: {type(exc).__name__}") from exc

@@ -12759,6 +12759,7 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
             with PTM.phase("risk_snapshot_enqueue"):
                 refresh = request_risk_snapshot_refresh(
                     trigger=f"slot:{slot}",
+                    request_kind="explicit" if result.get("status") == "completed" else "ensure",
                 )
             result["risk_snapshot_refresh"] = refresh.get("status")
             if refresh.get("error"):
@@ -13517,9 +13518,11 @@ def _slot_completion_status(detail):
     } else "completed"
 
 
-def request_risk_snapshot_refresh(trigger="background", on_complete=None, *, background=True):
+def request_risk_snapshot_refresh(trigger="background", on_complete=None, *, background=True,
+                                  request_kind="automatic", snapshot_missing=False):
     """Persist/coalesce a display refresh; neither compatibility mode runs it inline."""
-    result = PSJ.request_refresh(_db, trigger=trigger)
+    result = PSJ.request_refresh(_db, trigger=trigger, request_kind=request_kind,
+                                 snapshot_missing=snapshot_missing)
     if callable(on_complete):
         try:
             on_complete()  # Invalidate this process's read cache after enqueueing.
@@ -13725,7 +13728,10 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=False):
     enqueue_error = None
     if refresh or snapshot is None or snapshot_stale:
         try:
-            request_risk_snapshot_refresh(trigger="risk-dashboard")
+            request_risk_snapshot_refresh(
+                trigger="risk-dashboard", request_kind="explicit" if refresh else "automatic",
+                snapshot_missing=snapshot is None,
+            )
         except Exception as exc:
             enqueue_error = f"{type(exc).__name__}: {exc}"
     missing_snapshot = snapshot is None

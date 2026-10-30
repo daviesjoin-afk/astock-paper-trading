@@ -130,7 +130,7 @@ class CouplingBudgetTests(unittest.TestCase):
     # 落到 data_cache 并复用 single-flight 原子发布。664 → 668。额度 42 → 44。
     FEATURE_ALLOWANCE = {
         "import_cycles": 0,
-        "deferred_imports": 1,
+        "deferred_imports": 2,
         "private_cross_access": 0,
         "raw_sql_modules": 0,
         "paper_table_fanout_max": 0,

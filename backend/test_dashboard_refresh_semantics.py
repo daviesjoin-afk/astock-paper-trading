@@ -176,7 +176,7 @@ class SnapshotLifetimeTests(unittest.TestCase):
         for status in ("completed", "already_done"):
             with self.subTest(status=status), mock.patch.object(P, "init_db"),                     mock.patch.object(P.PSS, "run_preflight"),                     mock.patch.object(P, "_run_slot_impl", return_value={"status": status}),                     mock.patch.object(P.RC, "load_snapshot", return_value={"asof": "test"}),                     mock.patch.object(P, "request_risk_snapshot_refresh", return_value={"status": "scheduled"}) as refresh:
                 result = P.run_slot("risk", risk_snapshot_background=False)
-            refresh.assert_called_once_with(trigger="slot:risk")
+            refresh.assert_called_once_with(trigger="slot:risk", request_kind="explicit" if status == "completed" else "ensure")
             self.assertIsNone(P._active_lease_context())
             self.assertEqual(result["status"], status)
             self.assertEqual(Runner._result_exit_code(result), 0)
