@@ -18,6 +18,51 @@ import paper_timing as timing
 
 
 class TimingTests(unittest.TestCase):
+    def test_ready_scan_passes_nonempty_resume_result_to_open_once(self):
+        import datetime as dt
+        import paper_trading as paper
+        orders = [{"order_id": 7, "status": "partially_filled", "remaining_qty": 700}]
+        risk_result = {"orders": []}
+        gate = {"ready": True, "covered_codes": 5000, "eligible_codes": 5000,
+                "coverage_pct": 100.0, "required_codes": 4500}
+        with contextlib.ExitStack() as stack:
+            for name, value in (("init_db", None), ("_cleanup_stale_data", None),
+                                ("_validated_live_universe", [{}] * 5000),
+                                ("_live_scan_gate", gate), ("_ignition_shadow_backfill", None),
+                                ("_active_account_rows", []), ("_market_state", {}),
+                                ("_bootstrap_signals_for_today", {})):
+                stack.enter_context(mock.patch.object(paper, name, return_value=value))
+            stack.enter_context(mock.patch.object(paper, "_db"))
+            stack.enter_context(mock.patch.object(paper.dfc, "check_data_source_health", return_value={}))
+            stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", return_value=[]))
+            stack.enter_context(mock.patch.object(paper, "monitor_risk", return_value=risk_result))
+            resume = stack.enter_context(mock.patch.object(paper, "process_pending_execution_orders", return_value=orders))
+            opening = stack.enter_context(mock.patch.object(paper, "execute_open", return_value={"orders": [], "execution_orders": orders}))
+            result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10), force=True)
+        resume.assert_called_once()
+        opening.assert_called_once_with(dt.date(2026, 10, 20), risk_result=risk_result, execution_orders=orders)
+        self.assertIs(result["execution_orders"], orders)
+
+    def test_priority_failure_stops_candidate_scan_and_preserves_exception(self):
+        import datetime as dt
+        import paper_trading as paper
+        for failed in ("monitor_risk", "process_pending_execution_orders"):
+            for error in (RuntimeError("provider failure"), RuntimeError("paper lease lost: test fence")):
+                with self.subTest(failed=failed, error=type(error).__name__), \
+                        mock.patch.object(paper, "init_db"), \
+                        mock.patch.object(paper, "_cleanup_stale_data"), \
+                        mock.patch.object(paper.dfc, "check_data_source_health", return_value={}), \
+                        mock.patch.object(paper, "monitor_risk", return_value={}) as risk, \
+                        mock.patch.object(paper, "process_pending_execution_orders", return_value=[]) as resume, \
+                        mock.patch.object(paper.MDSvc, "refresh_rows") as refresh:
+                    (risk if failed == "monitor_risk" else resume).side_effect = error
+                    with self.assertRaises(type(error)) as caught:
+                        paper.monitor_intraday(dt.datetime(2026, 10, 20, 10), force=True)
+                    self.assertIs(caught.exception, error)
+                    refresh.assert_not_called()
+                    if failed == "monitor_risk":
+                        resume.assert_not_called()
+
     def test_snapshot_diagnostic_failure_cannot_skip_the_risk_pass(self):
         import datetime as dt
         from contextlib import ExitStack
@@ -29,16 +74,21 @@ class TimingTests(unittest.TestCase):
                                 ("_validated_live_universe", []), ("_live_scan_gate", gate),
                                 ("_ignition_shadow_backfill", None), ("_active_account_rows", []),
                                 ("_market_state", {}), ("_active_cycle", {"id": 1}),
-                                ("_cached_close_market", {}), ("process_pending_execution_orders", [])):
+                                ("_cached_close_market", {})):
                 stack.enter_context(mock.patch.object(paper, name, return_value=value))
             stack.enter_context(mock.patch.object(paper, "_db"))
             stack.enter_context(mock.patch.object(paper.dfc, "check_data_source_health", return_value={}))
-            stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", return_value=[]))
+            sequence = []
+            resume = stack.enter_context(mock.patch.object(paper, "process_pending_execution_orders", side_effect=lambda *_: sequence.append("resume") or []))
+            stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", side_effect=lambda: sequence.append("refresh") or []))
             stack.enter_context(mock.patch.object(paper.MDSvc, "read_snapshot", side_effect=ValueError))
             stack.enter_context(mock.patch.object(paper.dfc, "full_market_snapshot_source", side_effect=ValueError))
-            risk = stack.enter_context(mock.patch.object(paper, "monitor_risk", return_value={"orders": []}))
+            risk = stack.enter_context(mock.patch.object(paper, "monitor_risk", side_effect=lambda *_: sequence.append("risk") or {"orders": []}))
             result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10, 0), force=True)
         risk.assert_called_once()
+        resume.assert_called_once()
+        self.assertLess(sequence.index("risk"), sequence.index("resume"))
+        self.assertLess(sequence.index("resume"), sequence.index("refresh"))
         self.assertEqual(result["bootstrap"]["status"], "blocked")
 
     def test_explicit_worker_binding_collects_timing_without_other_contexts(self):

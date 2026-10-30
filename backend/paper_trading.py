@@ -9555,10 +9555,11 @@ def process_pending_execution_orders(asof_date=None):
 
 
 @PTM.timed("open_execution")
-def execute_open(asof_date=None, *, risk_result=None):
+def execute_open(asof_date=None, *, risk_result=None, execution_orders=None):
     """09:31 开盘审批：先复核共享开盘事件，再查询待执行候选。
 
     ``risk_result`` = 同一轮已跑过的风控结论；不传则自己跑（默认行为不变）。
+    ``execution_orders`` = 同一轮已恢复的委托结果；None 表示尚未恢复。
     复用的原因与实测收益见 ``docs/COUPLING_BUDGET.md`` 2026-10-29 切片。
     """
     init_db()
@@ -9567,7 +9568,8 @@ def execute_open(asof_date=None, *, risk_result=None):
     # order is reconsidered.  A quote gate may stop buys, but never stops a
     # protective sell pass.
     opening_risk = risk_result if risk_result is not None else monitor_risk(day)
-    execution_orders = process_pending_execution_orders(day)
+    if execution_orders is None:
+        execution_orders = process_pending_execution_orders(day)
     # P3 审计修复（2026-09-03）：开盘 slot 与 monitor_intraday 一样先做
     # 轻量数据源探活。此前 09:31 只拉快照而不探活，入场门禁
     # _entry_freeze_status 读到的仍是上一交易日收盘的 data_source_health
@@ -11888,6 +11890,10 @@ def monitor_intraday(asof_datetime=None, force=False):
             "healthy": False, "reconnected": False, "attempts": 0,
             "action": f"健康检查异常：{type(exc).__name__}: {exc}",
         }
+    # 即使没有持仓也运行风险服务，以保留扫描标记、恢复和手动订单处理。
+    # 风险和已批准委托使用各自的逐票证据，不等待全市场候选快照。
+    risk_result = monitor_risk(day)
+    execution_orders = process_pending_execution_orders(day)
     # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
     with PTM.phase("market_snapshot"):
         live_universe = _validated_live_universe(
@@ -11986,8 +11992,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     if clock in {"09:30", "13:00"}:
         # 午后窗口同样先跑完整持仓风控；本分支随后只生成候选/事件，
         # 不得让待买或事件处理抢在风险退出之前。
-        opening_risk = monitor_risk(day)
-        execution_orders = process_pending_execution_orders(day)
+        opening_risk = risk_result
         opening_event = monitor_opening_events(day, event_clock=clock)
         bootstrap = (
             _bootstrap_signals_for_today(day, live_universe=live_universe, source_slot="open_scan")
@@ -12013,21 +12018,12 @@ def monitor_intraday(asof_datetime=None, force=False):
             "running_accounts": len(accounts), "data_source_health": data_source_health,
             "live_universe_coverage": len(live_universe),
         }
-    # Always execute the risk pass.  The monitor itself uses lots as the
-    # settlement source of truth and returns an empty result when there are no
-    # active lots.  Skipping the pass based on a stale aggregate projection
-    # previously suppressed scan markers, recovery bookkeeping and pending
-    # manual-order handling after a restart.
-    risk_result = monitor_risk(day)
-    execution_orders = []
-    if not scan_ready:
-        execution_orders = process_pending_execution_orders(day)
     bootstrap = (
         _bootstrap_signals_for_today(day, live_universe=live_universe)
         if scan_ready else {"status": "blocked", "reason": scan_block, "accounts": []}
     )
     open_result = (
-        execute_open(day, risk_result=risk_result)
+        execute_open(day, risk_result=risk_result, execution_orders=execution_orders)
         if scan_ready else
         {"status": "blocked", "reason": scan_block, "orders": [], "manual_orders": [],
          "opening_event": {"orders": []}, "live_scan_gate": live_gate}
