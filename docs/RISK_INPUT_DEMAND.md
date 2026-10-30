@@ -77,5 +77,6 @@ python scripts/run_tests_parallel.py --shards 8 --timeout 900
 本地性能数不能替代同一版本、同一来源状态下的自然交易时段样本。
 无数据库迁移；回滚使用原镜像/代码，保留合法交易账本，不用旧备份覆盖成交。
 
-MERGE: NOT MERGED（本 PR）  
+MERGE: NOT MERGED（本 PR）
+
 DEPLOY: NOT DEPLOYED
