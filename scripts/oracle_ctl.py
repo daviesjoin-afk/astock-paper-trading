@@ -38,24 +38,60 @@ def load_conf() -> dict[str, str]:
                 continue
             k, v = line.split("=", 1)
             conf[k.strip()] = v.strip().strip('"').strip("'")
-    for key in ("ORACLE_HOST", "ORACLE_USER", "ORACLE_PASSWORD", "ORACLE_PORT"):
+    for key in ("ORACLE_HOST", "ORACLE_USER", "ORACLE_PASSWORD", "ORACLE_PORT",
+                "ORACLE_PROXY", "ORACLE_KEY"):
         if os.environ.get(key):
             conf[key] = os.environ[key]
     conf.setdefault("ORACLE_PORT", "22")
     conf.setdefault("ORACLE_USER", "ubuntu")
+    conf.setdefault("ORACLE_KEY", str(Path.home() / ".ssh" / "id_ed25519_astock"))
     return conf
 
 
-def tcp_open(host: str, port: int, timeout: float = 6.0) -> tuple[bool, str]:
-    s = socket.socket()
-    s.settimeout(timeout)
+def proxy_tunnel(proxy: str, host: str, port: int, timeout: float = 15.0) -> socket.socket:
+    """经 HTTP CONNECT 代理建立到 host:port 的裸 TCP（国内直连被丢包时的唯一通道）。"""
+    proxy_host, _, proxy_port = proxy.partition(":")
+    sock = socket.create_connection((proxy_host, int(proxy_port or 8080)), timeout=timeout)
     try:
-        s.connect((host, port))
+        request = (
+            f"CONNECT {host}:{port} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Proxy-Connection: keep-alive\r\n\r\n"
+        )
+        sock.sendall(request.encode())
+        sock.settimeout(timeout)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("代理在 CONNECT 阶段断开连接")
+            head += chunk
+            if len(head) > 16384:
+                raise OSError("代理响应头过长")
+        status = head.split(b"\r\n", 1)[0].decode("latin-1")
+        if " 200 " not in status:
+            raise OSError(f"代理拒绝 CONNECT：{status}")
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
+def tcp_open(host: str, port: int, timeout: float = 6.0, proxy: str = "") -> tuple[bool, str]:
+    try:
+        sock = proxy_tunnel(proxy, host, port, timeout) if proxy else None
+        if sock is None:
+            sock = socket.socket()
+            sock.settimeout(timeout)
+            sock.connect((host, port))
         return True, ""
     except Exception as exc:  # noqa: BLE001 - 诊断场景需要原始异常名
         return False, f"{type(exc).__name__}: {exc}"
     finally:
-        s.close()
+        try:
+            sock.close()  # type: ignore[possibly-undefined]
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def connect(conf: dict[str, str]):
@@ -63,17 +99,33 @@ def connect(conf: dict[str, str]):
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        conf["ORACLE_HOST"],
-        port=int(conf["ORACLE_PORT"]),
-        username=conf["ORACLE_USER"],
-        password=conf.get("ORACLE_PASSWORD") or None,
-        timeout=20,
-        banner_timeout=20,
-        auth_timeout=20,
-        look_for_keys=True,
-        allow_agent=False,
-    )
+    proxy = conf.get("ORACLE_PROXY") or ""
+    sock = None
+    if proxy:
+        sock = proxy_tunnel(proxy, conf["ORACLE_HOST"], int(conf["ORACLE_PORT"]))
+    key_file = conf.get("ORACLE_KEY") or ""
+    if key_file:
+        key_file = str(Path(key_file).expanduser())
+        if not Path(key_file).is_file():
+            key_file = ""
+    try:
+        client.connect(
+            conf["ORACLE_HOST"],
+            port=int(conf["ORACLE_PORT"]),
+            username=conf["ORACLE_USER"],
+            password=conf.get("ORACLE_PASSWORD") or None,
+            key_filename=key_file or None,
+            timeout=20,
+            banner_timeout=20,
+            auth_timeout=20,
+            look_for_keys=True,
+            allow_agent=False,
+            sock=sock,
+        )
+    except Exception:
+        if sock is not None:
+            sock.close()
+        raise
     return client
 
 
@@ -106,17 +158,24 @@ def shq(text: str) -> str:
 # ─────────────────────────────────────────────────────────── subcommands ──
 def cmd_probe(conf: dict[str, str], _args) -> int:
     host = conf["ORACLE_HOST"]
-    print(f"目标 {host}  user={conf['ORACLE_USER']}")
+    proxy = conf.get("ORACLE_PROXY") or ""
+    print(f"目标 {host}  user={conf['ORACLE_USER']}  代理={proxy or '直连'}")
     print("── TCP 探测 ──")
     for port in (22, 80, 443, 18600):
         ok, err = tcp_open(host, port)
-        print(f"  {port:<6} {'OPEN' if ok else 'CLOSED/TIMEOUT  ' + err}")
+        via = ""
+        if not ok and proxy:
+            ok_proxy, err_proxy = tcp_open(host, port, proxy=proxy)
+            via = f"  经代理: {'OPEN' if ok_proxy else err_proxy}"
+        print(f"  {port:<6} {'OPEN' if ok else 'CLOSED/TIMEOUT  ' + err}{via}")
 
-    ok22, _ = tcp_open(host, 22)
+    ok22, err22 = tcp_open(host, 22, proxy=proxy) if proxy else tcp_open(host, 22)
     if not ok22:
-        print("\n结论：22 端口不可达 —— 报文在 OCI 边缘被丢弃，登录无从谈起。")
+        print(f"\n结论：22 端口不可达（{err22}）—— 报文在途中被丢弃，登录无从谈起。")
         print("排查顺序：① OCI 控制台实例是否 Running；② 公网 IP 是否还挂在这台实例上；")
         print("③ 安全列表 / NSG 是否放行 0.0.0.0/0 TCP 22；④ 实例内 iptables 是否 REJECT 掉。")
+        print("若第三方（Shodan/海外节点）能看到 22 开放、只有本机超时，就是本地出口路径问题：")
+        print("写 ORACLE_PROXY=host:port 到 .env.oracle，走 HTTP CONNECT 代理登录。")
         return 2
 
     try:
