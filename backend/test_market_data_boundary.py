@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import data_fetcher as dfc
 import market_data_contract as MDC
 import market_data_service as MDSvc
+import risk_center as RC
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 #: 固定的"现在"：所有判定都相对它计算，与本机时钟无关。
@@ -609,8 +610,14 @@ class MarketDataReadPathTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         with _NetworkForbidden(self) as guard:
-            with _patch_cached(_full_rows(quote_at=_ago(7200))):
-                payload = PT.strategy_allocation_explain()
+            # 该入口的 market_data 状态取自**盘上的风险快照 JSON**（risk_center.load_snapshot），
+            # 与行情 payload 无关。共享数据目录里只要残留一份别的用例写下的风险快照，
+            # "缺行情 ⇒ unavailable" 就会随执行顺序翻转成 fresh（CI 4 分片实测复现）。
+            # 这里显式隔离：本用例断言的前提是"根本没有市场事实"。
+            with mock.patch.object(RC, "load_snapshot", return_value={}):
+                # 陈旧性同时写进 payload：saved_at 与行级 quote_at 都取 2 小时前。
+                with _patch_cached(_full_rows(quote_at=_ago(7200)), saved_at=_ago(7200)):
+                    payload = PT.strategy_allocation_explain()
         self.assertEqual([], guard.attempts,
                          "allocation-explain 的行情读取访问了 provider")
         self.assertEqual(MDC.STATUS_UNAVAILABLE, payload["market_data"]["status"])
