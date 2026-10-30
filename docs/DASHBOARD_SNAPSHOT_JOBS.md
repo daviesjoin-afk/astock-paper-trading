@@ -77,7 +77,11 @@ GET risk-overview 和 POST risk-refresh 都立即读取最近成功快照；缺�
 python /absolute/path/to/scripts/pr299_refresh_probe.py /absolute/path/to/output.json --startup-samples 10
 ```
 
-分层验证：L0 Ruff（backend 与三个验收脚本）、compileall、diff check 通过；L1 新定向与原 fencing/竞争测试共 25 项通过；L2 相关模块 100 项通过；L3 架构/schema/交易边界守卫 110 项通过。仅为轻量 worker 必须的 1 次正常延迟导入登记架构额度，未改其它预算。L4 完整后端、Docker 断网和其它 CI 的最终 HEAD/run 链接与实际用例数更新到 PR #299 描述，不沿用旧提交的绿色状态。
+分层验证：L0 Ruff（backend 与三个验收脚本）、compileall、diff check 通过；L1 新定向与原 fencing/竞争测试共 25 项通过；L2 相关模块 100 项通过；L3 架构/schema/交易边界守卫 110 项通过。仅为轻量 worker 必须的 1 次正常延迟导入登记架构额度，未改其它预算。L4 本地完整后端 7,474 项全部通过，Python 3.14.5，8 分片，268.5 秒，无失败/错误/模块加载错误。Docker 断网及其它 CI 的最终 HEAD/run 链接与实际用例数更新到 PR #299 描述，不沿用旧提交的绿色状态。
+
+### 原始 PR-2 功能证据（eb67556）
+
+以下保留原始提交的验收记录；本轮定向修复与性能对照以上节为准。
 
 - 新持久队列测试 11 项通过：重复请求合并、运行中后续请求、失败保留文件及退避、崩溃租约恢复、过期拒绝续租/发布、两个 worker 竞争、旧 worker 晚返回、心跳、网络/构建不占写事务、快照与历史共同受发布资格保护。
 - 集成测试证明展示 worker 被阻塞时真实交易 run_slot 已完成、租约已释放且 runner 返回成功；登记异常不改变交易退出码。
