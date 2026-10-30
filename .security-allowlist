@@ -168,6 +168,6 @@ value:dc93441314398a16945fa31fc4f4c52bf286b1e5
 value:e7fc3601983577dd98bccf057919073977625598
 value:f5bff025eee6f7d6ab5bbd0ceb09f400f748af5d
 
-# Public SHA256 of the synthetic ledger replay JSON in docs/DASHBOARD_SNAPSHOT_JOBS.md
-# and docs/RISK_INPUT_DEMAND.md; fixed-clock test output, not a credential.
-value:b1251b6aeb06585b21b59ce830202ac33a70867dac4c3eee21e07ef159261b4a
+# Public implementation commit of PR299, referenced by docs/DASHBOARD_SNAPSHOT_JOBS.md.
+# Squash merging removes this object from master ancestry; it is not a credential.
+value:eb6755673ce34a3f4d8f703cc065d2937577be2a
