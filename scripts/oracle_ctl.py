@@ -162,7 +162,12 @@ def cmd_watch(conf: dict[str, str], args) -> int:
 
 
 def cmd_exec(conf: dict[str, str], args) -> int:
-    cmd = " ".join(args.cmd) if args.cmd else sys.stdin.read()
+    # argparse.REMAINDER 会把 `exec -- cmd` 的分隔符一起留下，直接拼进
+    # bash -lc 会得到 `bash: --: invalid option`；去掉首个独立 `--`。
+    words = list(args.cmd or [])
+    if words and words[0] == "--":
+        words = words[1:]
+    cmd = " ".join(words) if words else sys.stdin.read()
     with connect(conf) as client:
         rc, out = sudo_run(client, cmd, conf.get("ORACLE_PASSWORD", ""), check=False)
         print(out)

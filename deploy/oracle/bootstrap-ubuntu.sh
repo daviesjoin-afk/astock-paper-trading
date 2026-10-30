@@ -196,10 +196,14 @@ EOF
 
   log "app：同步源码到 $APP_DIR（保留 data_cache/reports）"
   mkdir -p "$APP_DIR"
+  # --delete 会删掉目标端多出来的文件：源码包里没有 .env（被 gitignore、也不在
+  # git archive 里），所以必须显式排除宿主自己的持久配置，否则每次部署都会把
+  # 线上 token/参数换成本机生成的默认值。
   rsync -a --delete \
     --exclude '.git/' --exclude '.venv/' --exclude '__pycache__/' \
     --exclude 'data_cache/' --exclude 'reports/' --exclude 'logs/' \
     --exclude 'frontend/node_modules/' --exclude '.pytest_cache/' \
+    --exclude '.env' --exclude '.env.*' --exclude '.deploy-source.json' \
     "$SRC_DIR"/ "$APP_DIR"/
   mkdir -p "$APP_DIR"/{data_cache,reports,.locks}
   chown -R ubuntu:ubuntu "$APP_DIR"
