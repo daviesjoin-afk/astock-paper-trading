@@ -96,6 +96,40 @@ class PaperQuotePolicyTests(unittest.TestCase):
         self.assertEqual(result["reason"], "独立行情源未返回有效价格或时间")
         self.assertFalse(result["available"])
 
+    # ---- 涨跌幅差容差必须与价差同步放宽（现网实测口径） ----
+    def test_sixty_second_skew_also_relaxes_pct_gap(self):
+        """时滞放宽必须同时作用于价差与涨跌幅差。
+
+        现网实测（2026-10-30 15:05，603239 急跌中）：66s 时滞下价差 0.449%、
+        幅差 0.026pp，两源一致；旧口径里价差已随时滞放宽，幅差却仍卡在固定
+        0.20pp 阈值上 → 判 failed → 整笔委托被判 stale 而挂起。两项口径
+        必须同步。
+        """
+        result = self.verdict(skew_seconds=60, primary_price=13.30, primary_pct=-9.30,
+                              cross_price=13.36, cross_pct=-9.3261)
+        self.assertEqual(result["validation"], "cross_source_checked")
+        self.assertTrue(result["relaxed"])
+        self.assertGreater(result["pct_tolerance"], 0.20)
+
+    def test_pct_gap_relaxation_still_requires_same_direction(self):
+        """涨跌幅差放宽不得掩盖方向分歧：一涨一跌必须判 failed。"""
+        result = self.verdict(skew_seconds=66, primary_price=10.0, primary_pct=-5.0,
+                              cross_price=10.2, cross_pct=2.0)
+        self.assertEqual(result["validation"], "cross_source_failed")
+        self.assertIn("方向不一致", result["reason"])
+
+    def test_pct_gap_relaxation_does_not_apply_to_tight_skew(self):
+        """短时滞内幅差照旧严格：0.5pp 超阈值仍判 failed。
+
+        注意 |pct|≥3 时 scale=2.0 是**既有**语义（急涨急跌放大固有滞后差），
+        所以固定容差是 0.20pp × 2 = 0.40pp，不是 0.20pp。
+        """
+        result = self.verdict(skew_seconds=10, primary_price=10.0, primary_pct=-5.0,
+                              cross_price=10.15, cross_pct=-5.5)
+        self.assertEqual(result["validation"], "cross_source_failed")
+        self.assertFalse(result["relaxed"])
+        self.assertEqual(result["pct_tolerance"], 0.40)
+
 
 if __name__ == "__main__":
     unittest.main()
