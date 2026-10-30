@@ -167,3 +167,7 @@ value:b1158bc14608bd5e529b7d372927f4d4c2d3e3bd
 value:dc93441314398a16945fa31fc4f4c52bf286b1e5
 value:e7fc3601983577dd98bccf057919073977625598
 value:f5bff025eee6f7d6ab5bbd0ceb09f400f748af5d
+
+# Public SHA256 of the synthetic ledger replay JSON in docs/DASHBOARD_SNAPSHOT_JOBS.md
+# and docs/RISK_INPUT_DEMAND.md; fixed-clock test output, not a credential.
+value:b1251b6aeb06585b21b59ce830202ac33a70867dac4c3eee21e07ef159261b4a
