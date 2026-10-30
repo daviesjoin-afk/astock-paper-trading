@@ -5412,6 +5412,43 @@ def _parse_quote_timestamp(value):
     return None
 
 
+#: 缺失核验源补抓上限：单批 ≤30 只、墙钟 ≤2 秒（同 QUOTE_TRANSPORT_BUDGET 思路）。
+QUOTE_CROSS_RETRY_MAX_CODES = 30
+QUOTE_CROSS_RETRY_BUDGET_SECONDS = 2.0
+
+
+def _retry_missing_cross(cross, live, codes, already_tried, source_errors):
+    """批量核验源缺失时补抓一次新浪报价，返回补齐成功的代码集合。
+
+    旧实现里任何 code 在批量里缺失就只剩 range_timestamp_checked，审计写
+    "独立行情源未返回有效价格或时间"——用户每天盘中都会看到这条误报。
+    只补"确实没拿到"的代码：主源可用、主源不是新浪（同一来源不得互相核验）、
+    本轮已尝试过的不重复打。失败保留原始错误，调用方退回单源口径。
+    """
+    pending = [code for code in codes
+               if not _num((cross.get(code) or {}).get("price"), 0) > 0
+               and code not in already_tried
+               and str((live.get(code) or {}).get("source") or "") != "sina_public_quote"
+               and _num((live.get(code) or {}).get("price"), 0) > 0
+               ][:QUOTE_CROSS_RETRY_MAX_CODES]
+    if not pending:
+        return set()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quote-cross-retry")
+    try:
+        with PTM.phase("quote.cross_retry"):
+            fetch = PTM.bind_worker(lambda: dfc.fetch_sina_realtime_for_codes(list(pending)))
+            rows = pool.submit(fetch).result(timeout=QUOTE_CROSS_RETRY_BUDGET_SECONDS) or []
+    except Exception as exc:
+        rows = []
+        source_errors["cross_retry"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        pool.shutdown(wait=False)  # 超时的补抓线程不能拖住整轮扫描：不 join。
+    fills = {str(row.get("code") or ""): row for row in rows
+             if _num(row.get("price"), 0) > 0 and str(row.get("code") or "") in pending}
+    cross.update(fills)
+    return set(fills)
+
+
 @PTM.timed("position_quotes")
 def _quotes(codes, asof_date=None):
     """小批量实时查询失败时回退至本地快照，调用方仍会标记数据时效限制。
@@ -5568,6 +5605,7 @@ def _quotes(codes, asof_date=None):
         source = str(row.get("source") or "")
         if source and source == str(cross.get(code, {}).get("source") or ""):
             cross.pop(code, None)
+    retried_codes = _retry_missing_cross(cross, live, codes, same_source_codes, source_errors)
     with PTM.phase("quote.local_metadata"):
         local = _latest_price_map(codes)
         local_snapshot_at = _universe_snapshot_time()
@@ -5631,68 +5669,30 @@ def _quotes(codes, asof_date=None):
             row["flow_source_error"] = source_errors["flow"]
         if source_errors:
             row["quote_source_errors"] = dict(source_errors)
-        valid_price = isinstance(row.get("price"), (int, float)) and row.get("price") > 0
-        valid_pct = isinstance(row.get("pct"), (int, float)) and abs(row.get("pct")) <= 30
         cross_row = cross.get(str(code)) or {}
         cross_price = _num(cross_row.get("price"), 0)
         cross_pct = _num(cross_row.get("pct"), 999)
-        price_gap = abs(_num(row.get("price")) - cross_price) / max(cross_price, 0.01) if cross_price > 0 else None
-        pct_gap = abs(_num(row.get("pct")) - cross_pct) if cross_price > 0 else None
-        cross_at = str(cross_row.get("quote_at") or "")
-        cross_day = cross_at[:10].replace("-", "") if "-" in cross_at[:10] else cross_at[:8]
-        cross_day_ok = cross_day == expected_day.strftime("%Y%m%d")
-        cross_time_ok = False
-        if cross_day_ok:
-            cross_time = _parse_quote_timestamp(cross_at)
-            if cross_time is not None:
-                if expected_day != dt.date.today():
-                    # Historical replay validates source-date consistency, not
-                    # the wall-clock freshness of an already archived quote.
-                    cross_time_ok = True
-                else:
-                    now = dt.datetime.now(cross_time.tzinfo) if cross_time.tzinfo else dt.datetime.now()
-                    cross_time_ok = -120 <= (now - cross_time).total_seconds() <= 20 * 60
-        cross_available = cross_price > 0 and abs(cross_pct) <= 30 and bool(cross_at)
-        # 2026-08-28：急涨急跌时两个行情源的固有滞后差会被放大，|pct|>=3%
-        # 时容差放宽一倍，避免 V 型反转时刻系统性拒绝回补/开仓
-        # （601212 回补因 0.27pp 被拒）。
-        gap_tolerance_scale = 2.0 if abs(_num(row.get("pct"), 0.0)) >= 3.0 else 1.0
-        cross_ok = bool(is_live and valid_price and valid_pct and cross_available and cross_day_ok and cross_time_ok and price_gap <= 0.005 * gap_tolerance_scale and pct_gap <= 0.20 * gap_tolerance_scale)
-        if source_errors.get("live") and not is_live:
-            validation = "source_error"
-            failure_reason = f"主行情源异常：{source_errors['live']}"
-        elif not (is_live and valid_price and valid_pct):
-            validation = "incomplete"
-            failure_reason = "主行情价格或涨跌幅无效"
-        elif source_errors.get("cross"):
-            validation = "range_timestamp_checked"
-            failure_reason = f"独立行情源异常：{source_errors['cross']}"
-        elif not cross_available:
-            validation = "range_timestamp_checked"
-            failure_reason = "独立行情源未返回有效价格或时间"
-        elif not cross_day_ok:
-            validation = "range_timestamp_checked"
-            failure_reason = f"独立行情源时间不是交易日（{cross_at or '未知'}）"
-        elif not cross_time_ok:
-            validation = "range_timestamp_checked"
-            failure_reason = "独立行情源更新时间过期，已等待其重连/切换"
-        elif price_gap > 0.005 * gap_tolerance_scale or pct_gap > 0.20 * gap_tolerance_scale:
-            validation = "cross_source_failed"
-            failure_reason = f"双源差异超阈值：价格差 {price_gap * 100:.3f}%、涨跌幅差 {pct_gap:.3f}%"
-        else:
-            validation = "cross_source_checked"
-            failure_reason = None
-        row["quote_validation"] = validation
+        # 双源判定（含时限/时滞口径）下沉到 paper_quote_policy：两次独立 HTTP
+        # 抓取相差数十秒，急跌时 1.6% 的价差是采样时滞，不是数据错误。
+        verdict = PQP.cross_source_verdict(
+            row.get("price"), row.get("pct"), row.get("quote_at"), cross_price, cross_pct,
+            cross_row.get("quote_at"), expected_day=expected_day, primary_live=is_live,
+            live_error=source_errors.get("live"),
+            cross_error=None if code in retried_codes else source_errors.get("cross"),
+        )
+        row["quote_validation"] = verdict["validation"]
         row["quote_cross_check"] = {
             "source": cross_row.get("source") or "tencent_public_quote+sina_public_quote",
             "code": cross_row.get("code"), "price": cross_price, "pct": cross_pct,
-            "name": cross_row.get("name"),
-            "quote_at": cross_row.get("quote_at"),
-            "price_gap_pct": round(price_gap * 100, 3) if price_gap is not None else None,
-            "pct_gap": round(pct_gap, 3) if pct_gap is not None else None,
-            "available": cross_available, "date_ok": cross_day_ok, "time_ok": cross_time_ok, "passed": cross_ok,
-            "failure_reason": failure_reason,
+            "name": cross_row.get("name"), "quote_at": cross_row.get("quote_at"),
+            "price_gap_pct": verdict["price_gap_pct"], "pct_gap": verdict["pct_gap"],
+            "time_skew_seconds": verdict["time_skew_seconds"], "relaxed": verdict["relaxed"],
+            "available": verdict["available"], "date_ok": verdict["date_ok"],
+            "time_ok": verdict["time_ok"], "passed": verdict["passed"],
+            "failure_reason": verdict["reason"],
         }
+        if code in retried_codes:
+            row["quote_cross_check"]["cross_retry"] = True
         out[code] = row
     if not is_historical_asof:
         with PTM.phase("quote.tradability"):

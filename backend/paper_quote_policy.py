@@ -5,6 +5,159 @@ from __future__ import annotations
 import datetime as dt
 import math
 
+BUSINESS_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
+#: 双源核验的时间口径：两源是两次独立的 HTTP 采样，不是同一时刻的同一份报价。
+CROSS_TIGHT_SKEW_SECONDS = 20.0
+CROSS_RELAX_LIMIT_SECONDS = 90.0
+CROSS_PRICE_GAP_TOLERANCE = 0.005
+CROSS_PCT_GAP_TOLERANCE = 0.20
+CROSS_RELAXED_PRICE_GAP_LIMIT = 0.020
+#: 平盘带：两源涨跌幅都落在这个带内时，方向一致性没有意义，不判方向冲突。
+CROSS_FLAT_PCT_BAND = 0.5
+
+
+def parse_quote_instant(value):
+    """解析行情时间戳：ISO 串或 14 位数字，无法解析返回 None。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    digits = "".join(char for char in text if char.isdigit())
+    if len(digits) >= 14:
+        try:
+            return dt.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+    return None
+
+
+def _finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _business_aware(instant):
+    return instant if instant.tzinfo is not None else instant.replace(tzinfo=BUSINESS_TIMEZONE)
+
+
+def _cross_date_ok(cross_time, cross_at, expected_day):
+    if cross_time is not None:
+        return cross_time.date() == expected_day
+    text = str(cross_at or "")
+    prefix = text[:10].replace("-", "") if "-" in text[:10] else text[:8]
+    return bool(text) and prefix == expected_day.strftime("%Y%m%d")
+
+
+def cross_source_verdict(
+    primary_price, primary_pct, primary_at, cross_price, cross_pct, cross_at, *,
+    expected_day, primary_live=True, now=None, live_error=None, cross_error=None,
+):
+    """按两个采样时刻的时滞判定双源核验结果（纯函数，不联网、不读账本）。
+
+    旧判定假设两个源给的是"同一时刻"的报价，把两次相距数十秒的 HTTP 采样
+    当成同一份快照来比：急跌 60 秒里 1.6% 的价差是采样时滞，不是数据错误，
+    于是系统性写出"双源核验未通过"。这里把时滞本身变成判定输入：
+    |Δt| ≤ 20s 用原阈值；20s < |Δt| ≤ 90s 按每 20 秒 0.5pp 线性放宽价差
+    （20s→0.5%，60s→1.5%，80s 起触到 2.0% 上限并保持），同时额外要求两源
+    方向一致；|Δt| > 90s、时间戳缺失、跨日、备源缺失维持原行为。
+    ``live_error``/``cross_error`` 是两源的传输异常原文，只用于保留原始证据。
+    """
+    price = _finite_number(primary_price)
+    pct = _finite_number(primary_pct)
+    cross_value = _finite_number(cross_price)
+    cross_pct_value = _finite_number(cross_pct)
+    primary_ok = (bool(primary_live) and price is not None and price > 0
+                  and pct is not None and abs(pct) <= 30)
+    available = (cross_value is not None and cross_value > 0
+                 and cross_pct_value is not None and abs(cross_pct_value) <= 30
+                 and bool(str(cross_at or "").strip()))
+    price_gap = (abs(price - cross_value) / cross_value
+                 if price is not None and cross_value is not None and cross_value > 0
+                 else None)
+    pct_gap = (abs(pct - cross_pct_value)
+               if pct is not None and cross_pct_value is not None else None)
+    primary_time = parse_quote_instant(primary_at)
+    cross_time = parse_quote_instant(cross_at)
+    time_skew = None
+    if primary_time is not None and cross_time is not None:
+        time_skew = abs((_business_aware(cross_time) - _business_aware(primary_time)).total_seconds())
+    date_ok = _cross_date_ok(cross_time, cross_at, expected_day)
+    time_ok = False
+    if date_ok and cross_time is not None:
+        if expected_day != dt.date.today():
+            # 历史回放只校验源日期一致，不校验已归档报价的墙钟新鲜度。
+            time_ok = True
+        else:
+            current = now if now is not None else dt.datetime.now(cross_time.tzinfo)
+            seconds_behind = (_business_aware(current) - _business_aware(cross_time)).total_seconds()
+            time_ok = -120 <= seconds_behind <= 20 * 60
+    scale = 2.0 if pct is not None and abs(pct) >= 3.0 else 1.0
+    relaxed = time_skew is not None and CROSS_TIGHT_SKEW_SECONDS < time_skew <= CROSS_RELAX_LIMIT_SECONDS
+    if relaxed:
+        price_tolerance = min(
+            CROSS_RELAXED_PRICE_GAP_LIMIT,
+            CROSS_PRICE_GAP_TOLERANCE * time_skew / CROSS_TIGHT_SKEW_SECONDS,
+        ) * scale
+    else:
+        price_tolerance = CROSS_PRICE_GAP_TOLERANCE * scale
+    pct_tolerance = CROSS_PCT_GAP_TOLERANCE * scale
+    direction_ok = (pct is not None and cross_pct_value is not None and (
+        (pct > 0 and cross_pct_value > 0) or (pct < 0 and cross_pct_value < 0)
+        or (abs(pct) <= CROSS_FLAT_PCT_BAND and abs(cross_pct_value) <= CROSS_FLAT_PCT_BAND)))
+    degraded = False
+    if live_error and not primary_live:
+        validation, reason, relaxed = "source_error", f"主行情源异常：{live_error}", False
+    elif not primary_ok:
+        validation, reason, relaxed = "incomplete", "主行情价格或涨跌幅无效", False
+    elif cross_error:
+        validation, reason, relaxed = "range_timestamp_checked", f"独立行情源异常：{cross_error}", False
+    elif not available:
+        validation, reason, relaxed = "range_timestamp_checked", "独立行情源未返回有效价格或时间", False
+    elif not date_ok:
+        validation = "range_timestamp_checked"
+        reason, relaxed = f"独立行情源时间不是交易日（{cross_at or '未知'}）", False
+    elif not time_ok:
+        validation, reason, relaxed = "range_timestamp_checked", "独立行情源更新时间过期，已等待其重连/切换", False
+    elif relaxed and not direction_ok:
+        validation = "cross_source_failed"
+        reason = (f"双源涨跌方向不一致（{pct:+.2f}% vs {cross_pct_value:+.2f}%），"
+                  f"采样时滞 {time_skew:.0f}s 不予放宽")
+    elif price_gap is None or pct_gap is None:
+        validation, reason = "cross_source_failed", "双源差异无法计算"
+    elif price_gap > price_tolerance + 1e-12 or pct_gap > pct_tolerance + 1e-12:
+        validation = "cross_source_failed"
+        if relaxed:
+            reason = (f"双源差异超阈值（已按 {time_skew:.0f}s 采样时滞放宽至 "
+                      f"{price_tolerance * 100:.2f}%/{pct_tolerance:.2f}pp）："
+                      f"价格差 {price_gap * 100:.3f}%、涨跌幅差 {pct_gap:.3f}%")
+        else:
+            reason = f"双源差异超阈值：价格差 {price_gap * 100:.3f}%、涨跌幅差 {pct_gap:.3f}%"
+    else:
+        validation = "cross_source_checked"
+        degraded = relaxed
+        reason = (f"按 {time_skew:.0f}s 采样时滞放宽双源核验通过："
+                  f"价格差 {price_gap * 100:.3f}%、涨跌幅差 {pct_gap:.3f}%" if relaxed else None)
+    return {
+        "validation": validation,
+        "reason": reason,
+        "price_gap_pct": round(price_gap * 100, 3) if price_gap is not None else None,
+        "pct_gap": round(pct_gap, 3) if pct_gap is not None else None,
+        "time_skew_seconds": round(time_skew, 1) if time_skew is not None else None,
+        "degraded": degraded,
+        "relaxed": relaxed,
+        "available": available,
+        "date_ok": date_ok,
+        "time_ok": time_ok,
+        "passed": validation == "cross_source_checked",
+        "price_tolerance_pct": round(price_tolerance * 100, 3),
+        "pct_tolerance": round(pct_tolerance, 3),
+    }
+
 
 def quote_is_fresh(
     quote, asof_date, *, date_fn, today_fn=dt.date.today, now_fn=dt.datetime.now,
