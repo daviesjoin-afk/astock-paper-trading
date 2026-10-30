@@ -248,6 +248,8 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     # 2026-10-30 P0「下跌确认不可达」：价格证据齐全、资金字段缺失时，
     # 意图分类为 ``downturn``。它不是"出货"的证据（没有资金证据就不下这个
     # 断言），所以只解锁**部分**减仓；清仓（full）仍然只认 distribution。
+    # 同日补充（现网 601956 跌停票）：日内高低也缺时，"收盘靠近日内低位"
+    # 这一项按**中性缺位**处理——不加不扣，但不再阻断下跌确认判定。
     downturn = classification == "downturn"
     negative_news = bool(_negative_hits(news or [], str(position.get("code") or "")))
     warning = bool(
@@ -269,6 +271,10 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
     )
     if recovery_hold:
         warning = False
+        # 恢复形态（低开高走、已收复日内低点）优先于任何下跌确认：
+        # ``downturn`` 只是"价格证据成立"，它不是"主力在出货"的断言，
+        # 绝不允许在这条恢复通道上触发减仓。
+        downturn = False
     flow_trajectory = dict(flow_trajectory or {})
     main_force_distribution = bool(
         position.get("account_id") == deps.main_force_strategy_id
@@ -357,7 +363,23 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
         )
     reasons.append(intent.get("label") or "主力意图不确定")
     if downturn:
-        reasons.append("资金证据缺失，按价格证据判定")
+        # 审计文案必须说清"缺了什么、因此按什么判的"：缺的是日内高低与资金流，
+        # 判的是价格证据（只到部分减仓，不清仓）。
+        intent_gaps = list(intent.get("missing") or [])
+        if "日内高低价" in intent_gaps:
+            reasons.append(
+                "看不到日内高低与资金流，本次按价格证据判为下跌确认（只到部分减仓）")
+        else:
+            reasons.append("资金证据缺失，按价格证据判定")
+    # 资金缺口的原因**必须**在审计里说清楚（2026-10-30 P0「资金源整段不可达」）：
+    # "这只票没资金数据"与"今天全市场都没资金数据"是两句不同的话，混成一句
+    # 会让运维以为只是个别标的缺字段。
+    flow_scope = intent.get("flow_missing_scope")
+    if flow_scope == PRD.FLOW_SOURCE_HOST_UNREACHABLE:
+        reasons.append(
+            "资金数据缺失原因：东方财富资金流主机整段不可达（机房级，非本票缺字段）")
+    elif flow_scope == PRD.FLOW_SOURCE_SYMBOL_MISSING:
+        reasons.append("资金数据缺失原因：仅本标的缺少资金字段（主机可达）")
     # ``confirm_basis`` 说明"这次减仓结论靠什么证据成立"：意图（distribution/
     # 洗盘对照）还是单纯的价格证据。二轮确认据此区分两条通道，且 full 只认 intent。
     if level == "none":
@@ -374,6 +396,11 @@ def intraday_downside_guard(position, quote, market=None, news=None, policy_over
         "main_force_intent": intent,
         "confirm_basis": confirm_basis,
         "intent_data_gaps": list(intent.get("missing") or []),
+        # 资金缺口的原因范围（``host_unreachable`` / ``symbol_missing`` /
+        # ``unknown``）。看板上据此把"这只票没资金数据"与"今天全市场都没
+        # 资金数据"分开显示，而不是都读成"缺几个字段"。
+        "flow_source_status": intent.get("flow_source_status"),
+        "flow_missing_scope": flow_scope,
         "intraday_pct": round(pct, 2) if pct is not None else None,
         "cost_return_pct": round(ret_pct, 2) if ret_pct is not None else None,
         "relative_to_market_pct": round(relative, 2) if relative is not None else None,

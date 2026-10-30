@@ -32,6 +32,8 @@ suffix:mimo.ai
 host:deb.debian.org
 # Docker 官方 apt 源：OCI Ubuntu 实例安装 docker-ce / compose 插件的公共仓库
 host:download.docker.com
+# Shodan InternetDB：判定公网端口是否对第三方开放的公开只读接口（排查 OCI 入口用）
+host:internetdb.shodan.io
 host:mirrors.cloud.tencent.com
 host:mirrors.aliyun.com
 host:pypi.org

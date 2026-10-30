@@ -201,20 +201,43 @@ def check_data_source_health(force=False):
     def _probe_eastmoney():
         try:
             fields = "f2,f3,f12,f14,f124"
-            rows = _fetch_clist(fields, fid="f20", pages=1, pz=100)
+            result = _fetch_clist(fields, fid="f20", pages=1, pz=100, return_meta=True)
+            # 兼容旧调用方的 list 形状：没有 meta 时按"无主机可达性信息"处理，
+            # 既不声称不可达，也不声称可达。
+            meta = result if isinstance(result, dict) else {"rows": list(result or [])}
+            rows = meta.get("rows") or []
+            reach = _clist_host_reachability(meta)
             valid = [row for row in rows if len(str(row.get("f12") or "")) == 6
                      and str(row.get("f12") or "").isdigit()
                      and MN.source_quote_is_fresh({"price": row.get("f2"), "pct": row.get("f3"),
                                                   "quote_at": MN.quote_at(row.get("f124"))})]
+            # 主机级不可达与"这一页没数据"是两件事，必须分开呈现：
+            # 前者是机房出口被封（换域名无效），后者是数据级缺失。
+            host_unreachable = bool(reach.get("host_unreachable"))
+            if host_unreachable:
+                status = "host_unreachable"
+                reason = _flow_unreachable_reason(reach)
+            elif valid:
+                status = "fresh"
+                reason = None
+            else:
+                status = "degraded"
+                reason = "东方财富主机可达但本次未返回可用行情行（数据级缺失）"
             return {
-                "status": "fresh" if valid else "degraded",
+                "status": status,
                 "rows": len(rows), "valid_rows": len(valid),
                 "coverage_pct": round(len(valid) / max(len(rows), 1) * 100, 1),
                 "source": "eastmoney-clist",
+                "host_unreachable": host_unreachable,
+                "hosts_tried": list(reach.get("hosts_tried") or []),
+                "host_outcomes": dict(reach.get("host_outcomes") or {}),
+                "reason": reason,
             }
         except Exception as exc:
             return {"status": "failed", "rows": 0, "valid_rows": 0,
                     "coverage_pct": 0.0, "source": "eastmoney-clist",
+                    "host_unreachable": False, "hosts_tried": [], "host_outcomes": {},
+                    "reason": f"探测异常：{type(exc).__name__}: {exc}",
                     "error": f"{type(exc).__name__}: {exc}"}
 
     def _probe_tencent():
@@ -285,6 +308,38 @@ def check_data_source_health(force=False):
     tencent = attempts[-1]["tencent"] if attempts else {"status": "failed"}
     independent_stock = attempts[-1].get("independent_stock", {"status": "failed"}) if attempts else {"status": "failed"}
     healthy = eastmoney.get("status") == "fresh" or independent_stock.get("status") == "fresh"
+    # 资金源状态独立成段：运营要一眼看出"东财整段不可达 / 腾讯新浪可用"，
+    # 而不是从 "rows 0" 里反推。这里取的是**最近一次全市场资金流抓取**的
+    # 主机级事实（只读，不额外触网）。
+    #
+    # 两级证据的优先级：本次探测的可达性（最新、且就是同一批 clist 主机）
+    # 高于最近一次资金流抓取的快照。资金流抓取可能还没跑过（``unknown``），
+    # 但探测已经证实了整段不可达 —— 那就必须如实报出来。
+    flow_state = get_flow_fetch_state()
+    flow_status = flow_state.get("flow_source_status") or MP.FLOW_SOURCE_UNKNOWN
+    eastmoney_unreachable = bool(eastmoney.get("host_unreachable"))
+    hosts_tried = list(eastmoney.get("hosts_tried") or []) or list(
+        flow_state.get("hosts_tried") or [])
+    host_outcomes = dict(eastmoney.get("host_outcomes") or {}) or dict(
+        flow_state.get("host_outcomes") or {})
+    if eastmoney_unreachable:
+        # 探测已经证实整段不可达：状态就是 host_unreachable，不等资金流抓取。
+        flow_status = MP.FLOW_SOURCE_HOST_UNREACHABLE
+        summary = (
+            "东方财富整段不可达（已试 "
+            + "、".join(hosts_tried) +
+            "），腾讯/新浪个股源可用；资金流字段全市场缺失"
+        )
+    elif flow_status == MP.FLOW_SOURCE_HOST_UNREACHABLE:
+        summary = (
+            "东方财富资金流主机整段不可达（已试 "
+            + "、".join(hosts_tried) +
+            "），腾讯/新浪个股源可用"
+        )
+    elif flow_status == MP.FLOW_SOURCE_SYMBOL_MISSING:
+        summary = "东方财富资金流主机可达，仅个别标的/页缺资金字段（符号级缺失）"
+    else:
+        summary = "东方财富资金流状态未知或正常"
     payload = {
         "checked_at": checked_at,
         "healthy": healthy,
@@ -294,6 +349,20 @@ def check_data_source_health(force=False):
         "tencent": tencent,
         "independent_stock": independent_stock,
         "host_rotation": "东方财富主机轮换 + 腾讯个股源重试 + 新浪个股备用",
+        # 资金源可用性：**独立**于行情源可用性。行情源可用不代表资金源可用
+        # （腾讯/新浪报文里根本没有资金流字段），反之亦然。
+        "flow_source": {
+            "status": flow_status,
+            "host_unreachable": bool(flow_state.get("host_unreachable")
+                                     or eastmoney_unreachable),
+            "hosts_tried": hosts_tried,
+            "host_outcomes": host_outcomes,
+            "reason": flow_state.get("reason") or eastmoney.get("reason"),
+            "summary": summary,
+            "rows": int(flow_state.get("rows") or 0),
+            "coverage_pct": flow_state.get("coverage_pct"),
+            "checked_at": flow_state.get("fetched_at"),
+        },
         "action": ("正常使用" if eastmoney.get("status") == independent_stock.get("status") == "fresh"
                    else "单源可用，继续运行" if healthy
                    else "暂无有效行情源，等待下一轮重连"),
@@ -661,6 +730,14 @@ SNAP_FS = (
 
 CLIST_HOSTS = ["push2.eastmoney.com", "82.push2.eastmoney.com", "push2delay.eastmoney.com"]
 _clist_host_health = {}  # {host: {"failures": int, "cooldown_until": float}}
+#: 最近一次 clist 请求的**主机级**可达性事实。``_fetch_clist`` 每次都更新，
+#: 于是任何调用方（全市场快照 / 资金流 / 板块流 / 健康探测）都能读到同一份
+#: "这一段东财主机到底通不通"的事实，而不必各自再探一次网。
+#:
+#: 结构与 ``MP.clist_host_summary`` 的输出一致：
+#:   ``hosts_tried`` / ``host_outcomes`` / ``host_unreachable`` /
+#:   ``reachable_hosts`` / ``unreachable_hosts``。
+_clist_reachability = {}
 _CLIST_HOST_COOLDOWN_BASE = 30
 _CLIST_HOST_MAX_COOLDOWN = 300
 FULL_MARKET_MIN_ROWS = 4000
@@ -683,12 +760,50 @@ _flow_fetch_state = {
     "status": "unknown", "total": 0, "rows": 0, "coverage_pct": 0.0,
     "complete": False, "fetched_at": None, "failed_pages": [],
     "last_attempt_monotonic": 0.0,
+    # 资金源"为什么没有数据"。``flow_source_status`` 区分两种语义：
+    #   * ``host_unreachable`` —— 承载资金流的主机**整段**不可达（机房级）；
+    #   * ``symbol_missing``  —— 主机可达，只是这只票/这批页缺字段。
+    # 缺失时二者**必须**分开呈现，否则"今天全市场都没资金"会被读成
+    # "这只票没资金数据"。
+    "flow_source_status": MP.FLOW_SOURCE_UNKNOWN,
+    "host_unreachable": False,
+    "hosts_tried": [],
+    "host_outcomes": {},
+    "reason": None,
 }
 _hot_sector_fetch_state = {
     "status": "unknown", "shadow_only": True, "rows": 0,
     "pages_expected": 0, "pages_ok": 0, "failed_pages": [],
     "fetched_at": None,
 }
+
+
+def _clist_host_reachability(meta):
+    """从 ``_fetch_clist`` 的 meta 里取出主机级可达性事实。
+
+    ``meta`` 可能来自旧调用方（没有该字段），此时一律按"不可判定"处理：
+    既不声称不可达，也不声称可达。
+    """
+    if not isinstance(meta, dict):
+        return {}
+    reach = meta.get("host_reachability")
+    return reach if isinstance(reach, dict) else {}
+
+
+def _flow_unreachable_reason(reach):
+    """把主机级可达性事实渲染成**可辨识**的运维文案。
+
+    文案必须一眼看出"东财整段不可达"而不是"缺几个字段"，并且带上试过
+    哪些主机 —— 换域名救不回来这件事要能从日志里直接看出来。
+    """
+    if not reach or not reach.get("host_unreachable"):
+        return None
+    hosts = list(reach.get("hosts_tried") or [])
+    tried = "、".join(hosts) if hosts else "（无候选主机）"
+    return (
+        f"东方财富资金流主机整段不可达（已试 {tried}）："
+        "TCP 层全部连接失败，非字段缺失；换域名/换主机无效"
+    )
 
 
 def _sanitize_market_row(row):
@@ -701,8 +816,13 @@ def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False,
     ``clist`` 会在单页失败时返回一个看似合法的残片。历史调用方仍默认
     得到 ``list`` 以保持兼容；需要将结果写入正式全市场/资金快照的调用方
     必须传 ``return_meta=True``，并检查 ``complete``，避免残片污染横截面。
+
+    每次调用都会把**主机级**可达性事实写入 ``_clist_reachability``（模块级
+    只读快照）：所有候选主机都连不上 = 这一段出口不可达；有主机应答了但
+    没数据 = 数据级缺失。两者必须能被下游区分开。
     """
-    return MP.fetch_eastmoney_clist(
+    global _clist_reachability
+    result = MP.fetch_eastmoney_clist(
         get_json=_get_json,
         hosts=CLIST_HOSTS,
         host_health=_clist_host_health,
@@ -718,6 +838,19 @@ def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False,
         timeout=timeout,
         retries=retries,
     )
+    if isinstance(result, dict):
+        reach = result.get("host_reachability")
+        if isinstance(reach, dict):
+            _clist_reachability = dict(reach)
+    return result
+
+
+def clist_host_reachability():
+    """最近一次 clist 请求的主机级可达性事实（只读，不触网）。
+
+    供风控审计与看板区分"整段不可达"与"个别标的缺失"。
+    """
+    return dict(_clist_reachability)
 
 def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
     """全市场快照：价格/涨跌/换手/量比/PE/PB/市值/行业。注意 clist 不支持 f37 等财务扩展字段"""
@@ -755,9 +888,13 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
         else:
             raw = result if isinstance(result, list) else []
             pagination_complete = True
+        # 本批页的主机级可达性：所有候选主机都连不上 = 这一段出口不可达。
+        host_unreachable_rows = bool(
+            (_clist_host_reachability(raw_meta) or clist_host_reachability())
+            .get("host_unreachable"))
         rows = []
         for d in raw:
-            rows.append(_sanitize_market_row({
+            row = _sanitize_market_row({
                 "code": str(d.get("f12")), "name": d.get("f14"),
                 "price": d.get("f2"), "pct": d.get("f3"),
                 "open_price": d.get("f17"), "high": d.get("f15"),
@@ -774,7 +911,13 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
                 # PIT：每行都带可信观测时点（优先行情揭示时间，缺失则本地抓取时刻）。
                 # 没有它，strict 历史模式只能把这些动态字段判成不可用。
                 "observed_at": MN.observed_at(d.get("f124")),
-            }))
+            })
+            # 资金源状态随行透传：这行到底有没有拿到资金证据，以及"没有"的
+            # 原因是个别标的缺字段还是**整段主机不可达**。下游风控据此把
+            # "这只票没资金数据"和"今天全市场都没资金数据"分开表述。
+            row["flow_source_status"] = MP.flow_source_status(
+                row, host_unreachable=host_unreachable_rows)
+            rows.append(row)
         # 全市场任务不得用少量残页覆盖上一份完整快照。部分市场数据会
         # 严重扭曲市场宽度、热点排序和候选覆盖率。
         unique_codes = {
@@ -832,6 +975,39 @@ def fetch_tencent_market_snapshot(codes, *, max_age, now, force=False):
             if len(usable) >= max(_full_market_min_rows(), len(wanted) * 0.90):
                 return usable
         return _fetch_tencent_market_snapshot_locked(normalized, max_age=max_age, now=now)
+
+
+def _snapshot_ohlc(row, price):
+    """把上游行情行的日内高低/今开**如实**整理成快照字段。
+
+    上游（腾讯/新浪解析器）已经做过逐字段的自洽校验（``low ≤ price ≤ high``
+    且 ``low ≤ open ≤ high``，全部为正有限数）。这里再做一次**跨行**的
+    收口校验，防止个别行带着不自洽的值进入全市场快照：
+
+    * 三个字段各自必须是正有限数；
+    * ``low ≤ high``；
+    * 若 ``price`` 可用，必须 ``low ≤ price ≤ high``（现价落在日内区间内）。
+
+    任何一条不成立就整体返回 ``(None, None, None)`` —— 保持 unknown，
+    绝不填 0、绝不猜、绝不让别的字段顶替。**没有值就是 None**，下游按
+    unknown 处理（``MN.finite_number`` 会把 None 归一成 None，不会变 0）。
+    """
+    def _num(key):
+        value = MN.finite_number((row or {}).get(key))
+        if value is None or value <= 0:
+            return None
+        return value
+
+    low = _num("low")
+    high = _num("high")
+    open_price = _num("open_price")
+    if low is None or high is None or high < low:
+        return None, None, None
+    if price is not None and not (low <= price <= high):
+        return None, None, None
+    if open_price is not None and not (low <= open_price <= high):
+        open_price = None
+    return open_price, high, low
 
 
 def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
@@ -893,6 +1069,9 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
     if fresh / len(normalized) < 0.90:
         return []
     snapshot = []
+    # 腾讯/新浪个股报文里没有资金流字段；缺资金证据的原因是东财资金主机
+    # 整段不可达（机房级），还是这一行本身就没有资金字段（符号级）。
+    host_unreachable_rows = bool(clist_host_reachability().get("host_unreachable"))
     for code in normalized:
         row = by_code.get(code)
         if row is None:
@@ -900,18 +1079,34 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
         observed = _tencent_instant(row["quote_at"])
         if observed is None or not -120 <= (current - observed).total_seconds() <= max_age:
             continue
+        price = MN.finite_number(row["price"])
+        open_price, high, low = _snapshot_ohlc(row, price)
+        volume = MN.finite_number(row.get("volume"))
+        amount = MN.finite_number(row.get("amount"))
+        turnover = MN.finite_number(row.get("turnover"))
         snapshot.append({
-            "code": code, "name": row.get("name"), "price": MN.finite_number(row["price"]),
+            "code": code, "name": row.get("name"), "price": price,
             "pct": MN.finite_number(row["pct"]), "prev_close": MN.finite_number(row.get("prev_close")),
             "quote_at": observed.isoformat(timespec="seconds"),
             "observed_at": observed.isoformat(timespec="seconds"),
             "source": row.get("source") or "tencent_public_quote",
-            "open_price": None, "high": None, "low": None,
-            "volume": None, "amount": None, "turnover": None,
+            # 日内高低/今开：**如实透传**上游解析出的值。腾讯报文里本来就有
+            # （idx5=今开、idx33=最高、idx34=最低），此前在这里被写死成 None，
+            # 于是下游"收盘靠近日内低位"那 14 分永远拿不到、深跌票卡在门槛下。
+            # 没有值就是 None（unknown），绝不填 0、绝不猜、绝不用别的字段顶替。
+            "open_price": open_price, "high": high, "low": low,
+            # 量/额/换手：腾讯报文 idx6/37/38 已经解析并做过量纲交叉校验，
+            # 校验不通过时上游就不写这些键 —— 这里同样只透传真实值。
+            "volume": volume, "amount": amount, "turnover": turnover,
             "pe": None, "vol_ratio": None, "mktcap": None,
             "float_cap": None, "pb": None, "industry": None,
             "main_net": None, "super_net": None, "big_net": None,
             "mid_net": None, "small_net": None, "main_pct": None,
+            # 腾讯/新浪报文里**没有**资金流字段。这里如实标记"这一行没有
+            # 资金证据"，并区分原因：东财资金主机整段不可达（机房级）还是
+            # 仅仅这一行缺字段（符号级）。绝不拿委比/成交量顶替资金字段。
+            "flow_source_status": MP.flow_source_status(
+                {}, host_unreachable=host_unreachable_rows),
         })
     return snapshot if _persist_tencent_snapshot(snapshot, normalized) else []
 
@@ -1343,6 +1538,21 @@ def _fetch_all_flow_map():
     coverage_pct = round(len(out) / total * 100, 1) if total else 0.0
     complete = bool(meta.get("complete"))
     coverage_ok = bool(complete and total and coverage_pct >= FLOW_MIN_COVERAGE * 100)
+    # 主机级可达性：承载资金流的主机整段不可达时，"没有资金数据"是
+    # **机房级**事实，不是"这只票缺几个字段"。两者必须分开记。
+    # meta 上没有该字段时（旧调用方 / 被 mock 替换），回退到模块级的
+    # 最近一次可达性快照。
+    reach = _clist_host_reachability(meta) or clist_host_reachability()
+    host_unreachable = bool(reach.get("host_unreachable"))
+    if host_unreachable:
+        flow_status = MP.FLOW_SOURCE_HOST_UNREACHABLE
+    elif out:
+        flow_status = MP.FLOW_SOURCE_OK
+    elif reach:
+        # 主机可达但这批页没有资金行：符号级/数据级缺失。
+        flow_status = MP.FLOW_SOURCE_SYMBOL_MISSING
+    else:
+        flow_status = MP.FLOW_SOURCE_UNKNOWN
     _flow_fetch_state = {
         "status": "fresh" if coverage_ok else "degraded",
         "total": total,
@@ -1356,6 +1566,11 @@ def _fetch_all_flow_map():
         "pages_ok": int(meta.get("pages_ok") or 0),
         "source": "eastmoney_full_market_flow",
         "last_attempt_monotonic": time.monotonic(),
+        "flow_source_status": flow_status,
+        "host_unreachable": host_unreachable,
+        "hosts_tried": list(reach.get("hosts_tried") or []),
+        "host_outcomes": dict(reach.get("host_outcomes") or {}),
+        "reason": _flow_unreachable_reason(reach),
     }
     # A partial flow ranking is actively misleading: callers would sort the
     # returned subset as if it were the whole market.  Retain diagnostics above
@@ -1364,7 +1579,13 @@ def _fetch_all_flow_map():
 
 
 def get_flow_fetch_state():
-    """Return the last full-market super-order fetch quality metadata."""
+    """Return the last full-market super-order fetch quality metadata.
+
+    这里同时也是资金源状态的**只读**快照：``flow_source_status`` 区分
+    ``host_unreachable``（承载资金流的主机整段不可达）与 ``symbol_missing``
+    （主机可达，只是这只票缺字段）。调用方据此区分"这只票没资金数据"与
+    "今天全市场都没资金数据"。不触网、不改变任何状态。
+    """
     return dict(_flow_fetch_state)
 
 

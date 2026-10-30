@@ -16,9 +16,38 @@ Docker profile（`docker-compose.server.yml`）是这台机器的目标形态；
 | 现象 | 判定 | 处理 |
 | --- | --- | --- |
 | `ping` 全丢 + `22/80/443` 全部 timeout | 报文在 OCI 边缘被 DROP（安全列表/NSG）或实例未运行 | 见 §2 |
+| 第三方探针能连 22、只有本机超时 | 本地出口到该 IP 的路径被丢包（运营商/GFW 侧），服务器本身正常 | 走本机代理隧道，见 §1.1 |
 | `22` 可连，但认证失败 `Permission denied` | 到达 sshd；Oracle 镜像默认 `PasswordAuthentication no` | 先走控制台，见 §2.4 |
 | `22` 可连，登录后被 `Connection closed` | 用户不存在 / shell 被禁 / 磁盘满 | 控制台串口登录查看 |
 | 能登录但外网访问 80/8600 不通 | 实例内 iptables 末尾 `REJECT`（OCI 镜像默认） | `base` 阶段会补规则 |
+
+### 1.1 直连超时但服务器是好的：走本机代理隧道
+
+国内出口到某些海外 IP 的 22 端口会被静默丢弃（现象与「实例已停」完全一样）。
+判定方法：先用**第三方节点**探同一端口，再看本机结果。
+
+```bash
+# 第三方视角（Shodan InternetDB，无需 key）：返回 ports 数组即代表该口对公网开放
+curl -s https://internetdb.shodan.io/<SERVER_IP>
+# 另一路第三方探针：check-host.net 的 TCP 探针（页面为 JS 渲染，读报告页）
+```
+
+第三方能连、本机 timeout → 服务器侧无问题，是本地出口路径问题。此时用本机
+Clash/Clash Verge 的混合端口做 HTTP CONNECT 隧道（**不要用网上的随机开放代理**：
+它们会明文转发 SSH 会话，且随时失效）：
+
+```ini
+# 仓库根 .env.oracle（.gitignore 的 .env.* 已忽略）
+ORACLE_HOST=<实例公网 IP>
+ORACLE_USER=ubuntu
+ORACLE_PASSWORD=<口令>
+ORACLE_PROXY=127.0.0.1:7897      # Clash Verge 混合端口（mihomo 默认 7897）
+ORACLE_KEY=<本机家目录>/.ssh/id_ed25519_astock   # 已有部署私钥时优先用密钥
+```
+
+`oracle_ctl.py` 会先试密钥、再试口令；两者都不通时明确报 `Authentication failed`。
+注意口令里的**英文句点**是口令的一部分（`Oracle1559.` 与 `Oracle1559` 是两个口令）。
+
 
 快速判定（本机执行）：
 
@@ -93,6 +122,29 @@ sudo systemctl reload ssh
   `gcc` 现场编译 sqlite amalgamation，**aarch64 可构建**，但首次构建时间明显长于 x86。
 
 `bootstrap-ubuntu.sh --stage app` 在内存 < 3.2G 时会直接 `exit 3`，确要强上才加 `--force`。
+
+### 3.1 已有的生产实例：`oci-main`
+
+现网主机就是 OCI Ubuntu 24.04 / aarch64 / 2 OCPU / 11G 内存 / 96G 系统盘，
+`/opt/astock-codex` 是 **git checkout**（有 `.git`），而不是 rsync 投放的目录。
+更新现网要走 git 路径，**不要**用 `bootstrap-ubuntu.sh --stage app` 的 rsync 覆盖：
+
+```bash
+# 本机
+cd /d/Codex/astock-paper-trading && git push origin master   # 或先合 PR
+# 服务器（经 oracle_ctl.py exec）
+cd /opt/astock-codex && git fetch origin && git reset --hard origin/master
+ASTOCK_ENV_FILE=./.env sudo -n -E bash deploy/deploy.sh
+```
+
+`deploy/deploy.sh` 会：构建带 `ASTOCK_GIT_COMMIT=<完整 SHA>` 的镜像 → `up -d` →
+`db_migrate.py all` → 同步 `/etc/cron.d/astock-codex` → 健康检查 → 写
+`.deploy-source.json`。宿主 `.env`（含 `ASTOCK_OPERATOR_TOKEN`）由 compose 的
+`env_file` 读入，**不要**用 `rsync --delete` 覆盖它。
+
+现网还跑着别的容器（`napcat` / `astrbot` / `vaultwarden` / nginx），改防火墙或
+`docker system prune` 前先确认它们不被波及。
+
 
 ## 4. 一键上线流程（本机 → 服务器）
 

@@ -1089,5 +1089,150 @@ class DownsidePriceEvidenceReachabilityTests(_RiskServiceCase):
             "负新闻之后价格证据通道应当重新可用")
 
 
+class RangeAbsentDownturnReachabilityTests(_RiskServiceCase):
+    """2026-10-30「日内高低缺位掩盖下跌确认」回归（RSVC-25 ~ RSVC-26）。
+
+    现网现场（oci-main 11:19 真实审计）：601956 东贝集团当日 -10.00%（跌停级别）、
+    相对沪深300 -8.97%，但全市场快照只有 price —— ``low/high`` 与资金三件套
+    全缺。旧口径因此：
+
+    * 分布分只拿到 28（跌幅）+ 12（相对）= 40，够不到 floor 50；
+    * ``downturn`` 分支要求价格类证据齐全（``日内高低价`` 缺失 → 出局）；
+    * 结果 level 停在 warning、``sell_ratio=0.0`` —— **确认了却不减仓**。
+
+    修复后："日内高低价"缺失按**中性缺位**处理（不加不扣、但不再阻断判定），
+    且缺位中性口径的门槛比完整证据口径**更严**（自身深跌 ≤ -7% **且**明显
+    跑输 ≤ -5%）。本组用例走**真实风控扫描**（``monitor_risk``），钉住
+    "跌停票在第二轮扫描后真的减仓，且只减部分"。
+
+    夹具用短线日内做T（``tq_breakout``，现成 running 账户）：缺位中性口径是
+    **策略无关**的纯域判定（只看当日跌幅与相对沪深300），策略只决定
+    ``partial_ratio``。
+    """
+
+    # 跌停级快照：**没有** high/low（模拟"全市场快照只有 price"）。
+    # 价格刻意贴近成本：既模拟真实跌停，又避开硬止损通道——本用例要验的
+    # 是**下跌守卫**这条通道，不是硬止损。
+    COST = 9.0
+    PRICE = 9.179
+    PCT = -10.00
+    MARKET_PCT = -1.03                # 相对沪深300 = -10.00 - (-1.03) = -8.97%
+
+    def setUp(self):
+        super().setUp()
+        PT._cached_close_market = lambda conn, day, allow_network=False: {
+            "breadth": 0.5, "sentiment": "neutral",
+            "live_index_pct": self.MARKET_PCT,
+            "live_index_time": f"{self.day.isoformat()} 14:50:00",
+            "index_reference": {"status": "same_session"},
+        }
+
+    def limit_down_quote(self, *, minute=50):
+        """跌停级快照：**没有** high/low（模拟"全市场快照只有 price"）。"""
+        self.set_quote(self.code, price=self.PRICE, pct=self.PCT)
+        quote = self._inner.quotes_map[self.code]
+        quote.pop("high", None)
+        quote.pop("low", None)
+        quote["quote_at"] = f"{self.day.isoformat()} 14:{minute:02d}:00"
+        return quote
+
+    def decisions(self, decision=None):
+        sql = ("SELECT id,decision,reason,payload,created_at FROM paper_risk_decisions"
+               " WHERE account_id=? AND code=? AND side='sell'")
+        params = [self.ACCOUNT, self.code]
+        if decision is not None:
+            sql += " AND decision=?"
+            params.append(decision)
+        return self.conn.execute(sql + " ORDER BY id", tuple(params)).fetchall()
+
+    def pin_decision_to_asof_day(self, *, decision, created_at):
+        """把决策行的 created_at 钉到 asof_day（夹具失真修正，见基类注释）。"""
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "UPDATE paper_risk_decisions SET created_at=?"
+                " WHERE account_id=? AND code=? AND side='sell' AND decision=?",
+                (created_at, self.ACCOUNT, self.code, decision))
+
+    def latest_sell_payload(self):
+        row = self.conn.execute(
+            "SELECT risk_payload FROM paper_orders WHERE account_id=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1", (self.ACCOUNT,)).fetchone()
+        return json.loads(row["risk_payload"]) if row is not None else {}
+
+    # ── (i) 跌停 + 日内高低缺失 → 第二轮真的部分减仓（不是 full）──────────
+    def test_rsvc25_limit_down_without_intraday_range_trims_on_second_scan(self):
+        self.add_lot_for(self.code, 300, self.COST)
+        self.limit_down_quote(minute=50)
+        first = self.run_risk()
+        self.assertEqual(
+            [item for item in first.get("orders", []) if item.get("status") == "filled"],
+            [], f"首轮不得卖出（需要独立二次确认）：{first.get('orders')}")
+
+        pending = self.decisions("downside_partial_pending")
+        self.assertEqual(len(pending), 1, [dict(row) for row in self.decisions()])
+        prior_guard = json.loads(pending[0]["payload"])["downside_guard"]
+        self.assertEqual(prior_guard["level"], "partial")
+        self.assertNotEqual(prior_guard["level"], "full")
+        self.assertEqual(prior_guard["confirm_basis"], "price_evidence")
+        self.assertFalse(prior_guard["confirmed"])
+        intent = prior_guard["main_force_intent"]
+        self.assertEqual(intent["classification"], "downturn")
+        self.assertEqual(intent["price_evidence_missing"], ["日内高低价"])
+        self.assertEqual(intent["price_evidence_missing_effective"], [])
+        self.assertTrue(intent["range_evidence_neutral"])
+        # 绝不因缺证据凭空加分：可观测分布分仍是 28 + 12 = 40。
+        self.assertEqual(intent["distribution_score"], 40.0)
+        # 审计文案必须说清"缺了什么、按什么判的"。
+        self.assertIn("看不到日内高低与资金流", prior_guard["reason"])
+        self.pin_decision_to_asof_day(
+            decision="downside_partial_pending",
+            created_at=f"{self.day.isoformat()} 14:50:00")
+
+        # 下一轮独立扫描（3 分钟后）：同一份价格证据 → 确认并减仓。
+        self.clear_scan_state()
+        self.limit_down_quote(minute=53)
+        second = self.run_risk()
+        # 跌停票**成交**在现实中就是不可能的（可卖量为 0），但**决策**必须
+        # 已经做出：这一轮必须确认、必须按 partial 比例挂单。
+        self.assertEqual(
+            [item for item in second.get("orders", []) if item.get("status") == "filled"],
+            [], "跌停票不得虚构成交")
+        orders = self.sell_orders()
+        self.assertEqual(len(orders), 1, "确认后必须挂出减仓单")
+        self.assertLess(int(orders[0]["qty"]), 300, "价格证据确认绝不清仓")
+        self.assertEqual(int(orders[0]["qty"]), 100,
+                         "300 × 35% = 105 → 整手 100")
+        payload = self.latest_sell_payload()
+        guard = payload["downside_guard"]
+        self.assertTrue(guard["confirmed"])
+        self.assertEqual(guard["confirm_basis"], "price_evidence")
+        self.assertEqual(guard["level"], "partial")
+        self.assertNotEqual(guard["level"], "full")
+        self.assertEqual(
+            guard["sell_ratio"], guard["policy"]["partial_ratio"])
+        self.assertEqual(self.review_detail().get("action"), "downside_partial")
+
+    # ── (ii) 普通回调（-4.78%）不得因缺日内高低而升级成下跌确认 ───────────
+    def test_rsvc26_ordinary_pullback_without_range_never_reaches_downturn(self):
+        self.add_lot_for(self.code, 300, self.COST)
+        self.set_quote(self.code, price=self.PRICE, pct=-4.78)
+        quote = self._inner.quotes_map[self.code]
+        quote.pop("high", None)
+        quote.pop("low", None)
+        quote["quote_at"] = f"{self.day.isoformat()} 14:50:00"
+        self.run_risk()
+        rows = self.decisions()
+        self.assertTrue(rows, "普通回调也必须留下审计记录")
+        guard = json.loads(rows[-1]["payload"])["downside_guard"]
+        intent = guard["main_force_intent"]
+        self.assertEqual(
+            intent["classification"], "uncertain",
+            "缺日内高低不得让普通回调升级成下跌确认")
+        self.assertFalse(intent["range_evidence_neutral"])
+        self.assertNotEqual(guard["level"], "partial")
+        self.assertNotEqual(guard["level"], "full")
+        self.assertEqual(self.sell_orders(), [], "普通回调不得触发卖出")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,37 @@ _TRANSPORT_BREAKER_THRESHOLD = 6      # 连续多少次传输失败后短路
 _TRANSPORT_BREAKER_BURN_BUDGET = 45.0  # 或：累计浪费多少秒后短路（=一次最坏尝试）
 _TRANSPORT_BREAKER_COOLDOWN_SECONDS = 90.0
 
+# ---------------------------------------------------------------------------
+# 第二档：已确认不可达的主机（degraded）。
+#
+# 90 秒冷却只够覆盖**一次**重试间隔，不够覆盖**一整轮扫描**。生产实测单轮
+# 644~678 秒，而 90 秒冷却在轮内会过期 6~7 次：每过期一次就要重新"学习"这台
+# 机器是坏的（一次最坏尝试 = timeout 15s x retries 2 = 45 秒），于是
+# 644 秒里有 300 秒以上是在**重复确认同一个已知事实**。
+#
+# 跨进程熔断文件本来能解决"下一轮不用重新学"，但它只持久化**仍然短路**的
+# 主机，冷却一过文件里就没有这台机器了 —— 于是每一轮都从零开始学。
+#
+# 这里加第二档：**冷却过期后仍然失败**说明这不是瞬时抖动，而是这台机器在
+# 本机网络上就是不通（数据中心级封禁的典型表现）。第二次短路就升级到
+# 30 分钟，期间所有请求快速失败。这 30 分钟必须大于"一轮扫描 + 到下一轮的
+# 间隔"（约 6~8 分钟 + 15 分钟），否则下一轮又得重新学一遍。
+#
+# 语义边界与短路完全一致：快速失败抛 ``requests.ConnectionError``，调用方
+# 原有的 fail-closed 分支（缺数据即不发布/不入场）原样生效，不会因为降级
+# 而放宽任何门禁；一次成功立即清零，第二档不会永久封死一个已恢复的源。
+# ---------------------------------------------------------------------------
+_TRANSPORT_DEGRADED_TRIP_THRESHOLD = 2      # 第几次短路升级为降级档
+_TRANSPORT_DEGRADED_COOLDOWN_SECONDS = 1800.0  # 降级档冷却（30 分钟）
+
+#: 已经证明坏掉的主机再次被探测时，愿意为它等多久。
+#:
+#: 短路升级之后，"这台机器是不是恢复了"只需要一个**便宜的探测**，而不是一次
+#: 45 秒的最坏尝试。用正常预算去问一台已经确认不通的机器，得到的答案几乎
+#: 必然还是不通 —— 代价却是整轮扫描的一小截时间。
+_DEGRADED_PROBE_TIMEOUT_CAP = 6.0
+_DEGRADED_PROBE_RETRIES_CAP = 0
+
 _transport_breaker = {}
 _transport_breaker_lock = threading.Lock()
 _PROCESS_STARTED = time.monotonic()
@@ -197,12 +228,19 @@ def _load_breaker_state():
                 remaining = float(raw.get("until_wall") or 0.0) - now_wall
             except (TypeError, ValueError):
                 continue
-            if remaining <= 0:
+            try:
+                degraded_remaining = float(raw.get("degraded_remaining") or 0.0)
+            except (TypeError, ValueError):
+                degraded_remaining = 0.0
+            if remaining <= 0 and degraded_remaining <= 0:
                 continue
             _transport_breaker[str(host)] = {
                 "fails": int(raw.get("fails") or 0),
                 "burned": float(raw.get("burned") or 0.0),
-                "until": now_mono + remaining,
+                "until": now_mono + max(0.0, remaining),
+                "degraded_until": now_mono + max(0.0, degraded_remaining),
+                "trips": int(raw.get("trips") or 0),
+                "ever_tripped": bool(raw.get("ever_tripped")),
             }
 
 
@@ -227,9 +265,16 @@ def _persist_breaker_state():
                 "fails": int(state.get("fails") or 0),
                 "burned": round(float(state.get("burned") or 0.0), 2),
                 "until_wall": round(now_wall + (state["until"] - now_mono), 3),
+                # 降级档单独记剩余秒数：短路到期不代表降级也到期 —— 降级要跨
+                # 进程活过一整轮扫描，否则每轮都从零开始重新"学习"这台机器坏了。
+                "degraded_remaining": round(
+                    max(0.0, (state.get("degraded_until") or 0.0) - now_mono), 3),
+                "trips": int(state.get("trips") or 0),
+                "ever_tripped": bool(state.get("ever_tripped")),
             }
             for host, state in _transport_breaker.items()
             if (state.get("until") or 0.0) > now_mono
+            or (state.get("degraded_until") or 0.0) > now_mono
         }
         if len(payload) > _BREAKER_STATE_MAX_HOSTS:
             payload = dict(list(payload.items())[:_BREAKER_STATE_MAX_HOSTS])
@@ -272,33 +317,64 @@ def _transport_breaker_remaining(host):
         return remaining if remaining > 0 else None
 
 
+def _transport_degraded_remaining(host):
+    """返回降级档剩余秒数（已确认不可达）；未降级返回 None。"""
+    _load_breaker_state()
+    with _transport_breaker_lock:
+        state = _transport_breaker.get(host)
+        if not state:
+            return None
+        remaining = (state.get("degraded_until") or 0.0) - time.monotonic()
+        return remaining if remaining > 0 else None
+
+
 def _transport_breaker_note(host, *, ok, burned=0.0):
     """记录一次请求的健康结果。
 
     成功清零；**连续失败到次数阈值**或**累计浪费到时长预算**任一满足即短路。
     后者是必要的：``timeout=15, retries=2`` 下单次失败就烧 45 秒，只按次数
     触发会让扫描先白等几百秒。
+
+    **第二档（降级）**：短路冷却过期后这台主机**再次失败**，说明它在本机网络上
+    就是不通（数据中心级封禁的典型表现），不是瞬时抖动。此时升级到降级档
+    （30 分钟），期间只用一次便宜探测（6 秒、0 重试）确认它是否恢复，不再为
+    一个已知事实付 45 秒的最坏尝试。一次成功立即清零，降级不会永久封死源。
     """
     _load_breaker_state()
     state_changed = False
+    now = time.monotonic()
     with _transport_breaker_lock:
         state = _transport_breaker.setdefault(
-            host, {"fails": 0, "burned": 0.0, "until": 0.0})
+            host, {"fails": 0, "burned": 0.0, "until": 0.0, "degraded_until": 0.0,
+                   "trips": 0, "ever_tripped": False})
         if ok:
-            state_changed = bool(state.get("until"))
+            state_changed = bool(state.get("until") or state.get("degraded_until"))
             state["fails"] = 0
             state["burned"] = 0.0
             state["until"] = 0.0
+            state["degraded_until"] = 0.0
+            state["trips"] = 0
+            state["ever_tripped"] = False
         else:
             state["fails"] = int(state.get("fails") or 0) + 1
             state["burned"] = float(state.get("burned") or 0.0) + max(0.0, float(burned or 0.0))
-            if (state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD
-                    or state["burned"] >= _TRANSPORT_BREAKER_BURN_BUDGET):
-                if not (state.get("until") or 0.0) > time.monotonic():
+            tripped = (state["fails"] >= _TRANSPORT_BREAKER_THRESHOLD
+                       or state["burned"] >= _TRANSPORT_BREAKER_BURN_BUDGET)
+            if tripped:
+                state["ever_tripped"] = True
+                if not (state.get("until") or 0.0) > now:
                     state_changed = True
-                state["until"] = time.monotonic() + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
+                state["until"] = now + _TRANSPORT_BREAKER_COOLDOWN_SECONDS
+            # 这台主机**曾经**短路过（冷却期已过也算），现在又失败一次 ——
+            # 说明它在本机网络上就是不通，不是瞬时抖动。升级到降级档。
+            if state.get("ever_tripped"):
+                state["trips"] = int(state.get("trips") or 0) + 1
+                if state["trips"] >= _TRANSPORT_DEGRADED_TRIP_THRESHOLD:
+                    state["degraded_until"] = now + _TRANSPORT_DEGRADED_COOLDOWN_SECONDS
+                    state_changed = True
     if state_changed:
         _persist_breaker_state()
+
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +425,20 @@ def transport_breaker_snapshot():
                 "burned_seconds": round(float(state.get("burned") or 0.0), 2),
                 "open": bool((state.get("until") or 0.0) > now),
                 "remaining_seconds": round(max(0.0, (state.get("until") or 0.0) - now), 1),
+                # 已确认不可达（数据中心级封禁）：期间只做便宜探测。
+                "degraded": bool((state.get("degraded_until") or 0.0) > now),
+                "degraded_remaining_seconds": round(
+                    max(0.0, (state.get("degraded_until") or 0.0) - now), 1),
+                "trips": int(state.get("trips") or 0),
             }
             for host, state in _transport_breaker.items()
         }
+
+
+def transport_degraded_remaining(host):
+    """降级档剩余秒数；未降级返回 None。"""
+    return _transport_degraded_remaining(host)
+
 
 
 def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
@@ -366,11 +453,20 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
     多次传输失败后，短时间内直接快速失败，不再为每个调用方重复付超时。
     """
     host = _transport_host(url)
-    open_for = _transport_breaker_remaining(host)
-    if open_for is not None:
-        with PTM.phase("http_breaker_skip"):
-            raise requests.ConnectionError(
-                f"transport breaker open for {host} ({open_for:.0f}s left)")
+    # 已确认不可达的主机（数据中心级封禁）：只付一次便宜探测的钱，不再为
+    # 一个已知事实等满 45 秒的最坏尝试。**降级档优先于普通短路** —— 普通
+    # 短路是完全跳过（一个请求都不发），那会让源恢复后也永远发现不了；
+    # 降级档仍会发一次便宜探测，既省钱又能确认它是否回来了。
+    degraded_for = _transport_degraded_remaining(host)
+    if degraded_for is not None:
+        timeout = min(timeout, _DEGRADED_PROBE_TIMEOUT_CAP)
+        retries = min(retries, _DEGRADED_PROBE_RETRIES_CAP)
+    else:
+        open_for = _transport_breaker_remaining(host)
+        if open_for is not None:
+            with PTM.phase("http_breaker_skip"):
+                raise requests.ConnectionError(
+                    f"transport breaker open for {host} ({open_for:.0f}s left)")
     timeout, retries = scan_budget_limits(timeout, retries)
     try:
         started = time.perf_counter()
@@ -394,7 +490,6 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
         raise
     _transport_breaker_note(host, ok=True)
     return text
-
 
 def _http_get_impl(url, params=None, timeout=15, encoding="utf-8", retries=2):
     """``http_get`` 的原实现（不含主机短路）。"""
