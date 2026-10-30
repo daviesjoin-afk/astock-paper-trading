@@ -29,16 +29,21 @@ class TimingTests(unittest.TestCase):
                                 ("_validated_live_universe", []), ("_live_scan_gate", gate),
                                 ("_ignition_shadow_backfill", None), ("_active_account_rows", []),
                                 ("_market_state", {}), ("_active_cycle", {"id": 1}),
-                                ("_cached_close_market", {}), ("process_pending_execution_orders", [])):
+                                ("_cached_close_market", {})):
                 stack.enter_context(mock.patch.object(paper, name, return_value=value))
             stack.enter_context(mock.patch.object(paper, "_db"))
             stack.enter_context(mock.patch.object(paper.dfc, "check_data_source_health", return_value={}))
-            stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", return_value=[]))
+            sequence = []
+            resume = stack.enter_context(mock.patch.object(paper, "process_pending_execution_orders", side_effect=lambda *_: sequence.append("resume") or []))
+            stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", side_effect=lambda: sequence.append("refresh") or []))
             stack.enter_context(mock.patch.object(paper.MDSvc, "read_snapshot", side_effect=ValueError))
             stack.enter_context(mock.patch.object(paper.dfc, "full_market_snapshot_source", side_effect=ValueError))
-            risk = stack.enter_context(mock.patch.object(paper, "monitor_risk", return_value={"orders": []}))
+            risk = stack.enter_context(mock.patch.object(paper, "monitor_risk", side_effect=lambda *_: sequence.append("risk") or {"orders": []}))
             result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10, 0), force=True)
         risk.assert_called_once()
+        resume.assert_called_once()
+        self.assertLess(sequence.index("risk"), sequence.index("refresh"))
+        self.assertLess(sequence.index("resume"), sequence.index("refresh"))
         self.assertEqual(result["bootstrap"]["status"], "blocked")
 
     def test_explicit_worker_binding_collects_timing_without_other_contexts(self):
