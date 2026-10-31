@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import datetime as dt
 import inspect
 import io
 import json
@@ -27,6 +28,9 @@ from test_strategy_buy_commit_convergence import (  # noqa: E402
 )
 
 ORACLE = Path(__file__).with_name("fixtures") / "entry_sizing_stage_order.json"
+# The frozen master oracle describes a closed dispatch window (no current or
+# next batch). This is an independent clock from PT._now and fixture decision_at.
+DISPATCH_AT = dt.datetime.combine(DAY, dt.time(15, 30))
 SCENARIOS = (
     "single", "new_slices", "continuation", "zero_slice_target",
     "trial_first_cap", "dispatch_block_price_expired", "slice_builder_error",
@@ -78,9 +82,10 @@ def _audit(local):
     })
 
 
-def replay_case(name):
+def replay_case(name, *, dispatch_at=DISPATCH_AT):
     harness = _BuyCase()
-    with mock.patch.object(PT, "_now", return_value=f"{DAY} 10:00:00"):
+    with mock.patch.object(PT, "_now", return_value=f"{DAY} 10:00:00"), \
+            mock.patch.object(PT.EPD, "_now", return_value=dispatch_at):
         harness.setUp()
         try:
             harness.quotes[CODE] = _quote(CODE)
@@ -277,6 +282,27 @@ class EntrySizingStageOrderTests(unittest.TestCase):
         self.assertEqual(audit["entry_tranche_qty"], 500)
         self.assertEqual(audit["entry_slice_target_qty"], 200)
         self.assertEqual(audit["lifecycle_deployment_clamped_qty"], 100)
+
+    def test_dispatch_clock_preserves_window_evidence_and_trading_contract(self):
+        # A future window must remain observable, including at an exception.
+        # Clock control must not normalize/drop that field just to fit oracle.
+        for name in ("single", "slice_builder_error", "deployment_setting_error"):
+            for hour, minute, has_next in ((12, 17, True), (15, 30, False)):
+                with self.subTest(scenario=name, hour=hour, minute=minute):
+                    moment = dt.datetime.combine(DAY, dt.time(hour, minute))
+                    with mock.patch.object(PT.EPD, "_now", side_effect=AssertionError(
+                            "ambient dispatch clock leaked")) as ambient, \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        actual = replay_case(name, dispatch_at=moment)
+                    ambient.assert_not_called()
+                    dispatch = actual["observations"]["slice"]["execution_dispatch"]
+                    self.assertEqual(dispatch["next_window"] is not None, has_next)
+                    if has_next:
+                        self.assertTrue(dispatch["next_window"]["starts_at"].startswith(str(DAY)))
+                    if actual["exception_audit"] is not None:
+                        self.assertEqual(actual["exception_audit"]["execution_dispatch"], dispatch)
+                    for dimension in ("events", "error", "result", "ledger"):
+                        self.assertEqual(actual[dimension], self.baseline[name][dimension])
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--record":
