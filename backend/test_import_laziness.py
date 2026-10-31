@@ -24,6 +24,8 @@ class ImportBoundaryTests(unittest.TestCase):
         project_modules = {path.stem for path in BACKEND.glob("*.py")}
         for name in ("paper_candidate_projection", "paper_entry_decision", "paper_candidate_live_fields"):
             allowed = {"paper_candidate_live_fields"} if name == "paper_candidate_projection" else set()
+            if name == "paper_entry_decision":
+                allowed = {"paper_sizing"}  # Legacy slice facade → stdlib-only quantity owner.
             tree = ast.parse((BACKEND / f"{name}.py").read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):

@@ -1,4 +1,9 @@
 # Security allowlist — documented exceptions for the P0 leak scanner.
+# PR305 stage-order oracle: deterministic SHA256 identifiers from the offline
+# _BuyCase fixed cycle/day/decision_at/account/symbol/intent tuple, and its
+# snapshot_id + "|plan" hash. Public synthetic fingerprints, never credentials.
+value:174bcdb5c3f712e8751321a2d5cfcfa565025a844f5a4f40aae6d418a8bb89e9
+value:3742425fa6ed4d780351b1adc62536dc8020f257b41f0cc2ec3d08807b63c0a6
 #
 # Every entry must be publishable as-is. Format: `kind:value` (see
 # scripts/security/scan-sensitive-data.py). Real personal emails, public IPs,

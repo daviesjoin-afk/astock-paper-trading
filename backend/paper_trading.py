@@ -7782,6 +7782,7 @@ def _price_aware_qty(
     strategy_cap_amount=None, pool_cap_amount=None,
     pending_strategy_amount=0.0, pending_pool_amount=0.0,
     single_position_max_amount=None, liquidity_cap_amount=None,
+    *, quantity_cap=None, tranche_amount=None, tranche_quantity=None,
 ):
     return PSZ.price_aware_qty(
         nav, cash, position_value, industry_value, code_value,
@@ -7791,6 +7792,8 @@ def _price_aware_qty(
         num=_num, lot_size=LOT_SIZE,
         single_position_max_amount=single_position_max_amount,
         liquidity_cap_amount=liquidity_cap_amount,
+        quantity_cap=quantity_cap, tranche_amount=tranche_amount,
+        tranche_quantity=tranche_quantity,
     )
 
 
@@ -8778,7 +8781,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         key: eff_spec.get(key)
         for key in ("hard_stop", "trail_after", "trail_stop", "hold_max", "max_positions", "max_pyramiding")
     }
-    qty, sizing = _price_aware_qty(
+    quantity = PSZ.entry_quantity(
         nav, shared_cash, position_value, industry_value, code_value,
         fill_price, eff_spec["hard_stop"], profile,
         exposure_cap=exposure_cap, max_exposure_cap=exposure_cap, exposure_scale=risk_scale,
@@ -8788,8 +8791,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
         single_position_max_amount=single_position_max_amount,
-        liquidity_cap_amount=_quote_liquidity_cap(quote),
+        liquidity_cap_amount=_quote_liquidity_cap(quote), num=_num, lot_size=LOT_SIZE,
     )
+    qty, sizing = quantity.qty, quantity.sizing
     # Entry-model scaling must reduce the actual order as well as the residual
     # exposure allowance.  Otherwise a risk/weight constraint could silently
     # turn a trend "trial" into a full first position.
@@ -8801,16 +8805,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         entry_tranche_scale = min(entry_tranche_scale, _num(recovery_watch.get("probe_ratio"), 0.25))
         risk["recovery_probe"] = {"enabled": True, "ratio": entry_tranche_scale,
                                    "exit_class": recovery_watch.get("exit_class")}
-    if entry_tranche_scale < 1.0 and qty >= LOT_SIZE:
-        qty = int((qty * entry_tranche_scale) / LOT_SIZE) * LOT_SIZE
-        sizing["entry_tranche_scale_pct"] = round(entry_tranche_scale * 100, 1)
-        sizing["entry_tranche_qty"] = int(qty)
-        # P3 审计修复（P2）：同步缩放后的目标金额——动态 dust_order 地板
-        # 读取本字段，不同步会让 ¥30000 预算缩到 ¥7500 的探针仓绕过地板
-        # 直接成交。
-        sizing["target_amount"] = round(qty * fill_price, 2)
-    else:
-        sizing["entry_tranche_scale_pct"] = 100.0
+    quantity = PSZ.entry_quantity(quantity, fill_price=fill_price, num=_num,
+                                 lot_size=LOT_SIZE, entry_tranche_scale=entry_tranche_scale)
+    qty = quantity.qty
     # 首仓纪律（2026-08-31 复核 P1）：首笔不超过共享净值的一定比例，
     # 比例由执行策略声明（first_tranche_nav_pct），None 表示不限制。
     if (
@@ -8821,16 +8818,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 资金持续、价格站稳后再由既有加仓路径表达；避免一笔大仓吃掉
         # “精挑三只”的大部分预算，也不退回两三千元的无效小仓。
         first_cap = nav * _exec_policy.first_tranche_nav_pct
-        capped_qty = int(min(qty * fill_price, first_cap) / fill_price / LOT_SIZE) * LOT_SIZE
-        if capped_qty < qty:
-            sizing["main_force_first_tranche"] = {
-                "cap_pct": 12.0, "cap_amount": round(first_cap, 2),
-                "qty_before": int(qty), "qty_after": int(capped_qty),
-                "note": "资金持续且价格站稳后允许后续加仓",
-            }
-            qty = max(capped_qty, 0)
-            sizing["target_amount"] = round(qty * fill_price, 2)
-            sizing["entry_tranche_qty"] = int(qty)
+        quantity = PSZ.entry_quantity(quantity, fill_price=fill_price, num=_num,
+                                     lot_size=LOT_SIZE, first_tranche_cap_amount=first_cap)
+        qty = quantity.qty
     sizing["strategy_target_pct"] = strategy_budget["target_pct"]
     sizing["strategy_base_target_pct"] = strategy_budget.get("base_target_pct")
     sizing["strategy_floor_pct"] = strategy_budget["floor_pct"]
@@ -8936,12 +8926,13 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 分批建仓（entry slices）：一份信号可分多片成交，但每一片都是一条
     # 独立的新委托意图——本轮只执行当前片，剩余片由下一轮扫描重新取价、
     # 重新跑全部风控与 sizing；信号失效（TTL/跨日）后剩余片自动作废。
-    qty, slice_state, slice_sizing, slice_detail = PED.prepare_entry_slice(
-        payload=payload, account=account, qty=qty, asof_day=asof_day,
-        continuation=slice_continuation, existing_plan=_slice_plan,
-        lot_size=LOT_SIZE, plan_builder=ELC.entry_slice_plan,
-    )
-    sizing.update(slice_sizing)
+    quantity = PSZ.entry_quantity(quantity, num=_num, lot_size=LOT_SIZE,
+        slice_request=PSZ.EntrySliceRequest(
+            payload=payload, account=account, asof_day=asof_day,
+            continuation=slice_continuation, existing_plan=_slice_plan,
+            plan_builder=ELC.entry_slice_plan))
+    qty = quantity.qty
+    slice_state, slice_detail = quantity.slice_state, quantity.slice_detail
     if slice_detail is not None:
         risk["entry_slices"] = slice_detail
     # 组合级单票上限（可选）：0 = 关闭。开启后按"共享池净值 × 比例"约束
@@ -8979,11 +8970,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "allowed": bool(deployment.get("allowed")),
         }
     if deployment is not None and deployment.get("allowed") and fill_price > 0:
-        max_qty = int(_num(deployment.get("lots"))) * LOT_SIZE
-        if max_qty < qty:
-            sizing["lifecycle_deployment_clamped_qty"] = int(max_qty)
-            sizing["lifecycle_deployment_amount"] = _num(deployment.get("deployable_amount"))
-            qty = max(0, max_qty)
+        quantity = PSZ.entry_quantity(quantity, fill_price=fill_price, num=_num,
+            lot_size=LOT_SIZE, deployment_max_qty=int(_num(deployment.get("lots"))) * LOT_SIZE,
+            deployment_amount=deployment.get("deployable_amount"))
+        qty = quantity.qty
     amount = qty * fill_price
     fees = EP.estimate_execution_fees(amount, "buy")
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
@@ -11316,9 +11306,9 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
         single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
+        quantity_cap=sold_qty,
     )
     sizing["strategy_budget"] = strategy_budget
-    qty = min(qty, sold_qty)
     if qty < LOT_SIZE:
         return None, "价格或风控预算不足以回补一手"
     fill = EP.estimated_fill_price(price, "buy")
@@ -11496,6 +11486,9 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
         single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
+        tranche_quantity=(_num(position.get("qty")) * scale
+                          if account_id == "trend_pullback" else None),
+        tranche_amount=(nav * scale if account_id != "trend_pullback" else None),
     )
     sizing["strategy_budget"] = strategy_budget
     # 组合级单票上限同样约束确认加仓（P5）：占满即拒绝，有余量则钳制本次片。
@@ -11504,11 +11497,6 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         return None, "symbol aggregate cap 缺少 strict 风险敞口 owner，禁止波段加仓"
     # 趋势策略只补齐首笔观察仓：上限为现有可识别持仓规模，不能因一次
     # 确认把单票直接推到整个账户的最大额度。板块策略仍按其独立小仓确认。
-    if account_id == "trend_pullback":
-        tranche = int((_num(position.get("qty")) * scale) / LOT_SIZE) * LOT_SIZE
-    else:
-        tranche = int((nav * scale / fill) / LOT_SIZE) * LOT_SIZE
-    qty = min(qty, tranche)
     if qty < LOT_SIZE:
         return None, "剩余风险预算或仓位空间不足一手"
     amount = qty * fill
