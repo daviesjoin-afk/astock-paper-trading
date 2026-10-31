@@ -5716,6 +5716,20 @@ def _quotes(codes, asof_date=None):
     return out
 
 
+def _waitlist_news(names, snapshot):
+    """等待池新闻：优先复用同一轮候选阶段的事实，否则重新抓取。
+
+    复用由 ``paper_candidate_scan.NewsSnapshot`` 自己判定（成功 + 覆盖 + 未超时），
+    这里不重复实现 TTL 或覆盖逻辑。失败快照不会被当成"没有新闻"：此时照旧请求，
+    请求失败仍由 ``_news_for`` 返回空列表并把错误写进 ``_NEWS_SCAN_META``。
+    """
+    if not names:
+        return []
+    if snapshot is not None and snapshot.reusable_for(names):
+        return snapshot.rows_for(names)
+    return _news_for(names)
+
+
 def _news_for(names):
     global _NEWS_SCAN_META
     try:
@@ -9559,11 +9573,15 @@ def process_pending_execution_orders(asof_date=None):
 
 
 @PTM.timed("open_execution")
-def execute_open(asof_date=None, *, risk_result=None, execution_orders=None):
+def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
+                 news_snapshot=None):
     """09:31 开盘审批：先复核共享开盘事件，再查询待执行候选。
 
     ``risk_result`` = 同一轮已跑过的风控结论；不传则自己跑（默认行为不变）。
     ``execution_orders`` = 同一轮已恢复的委托结果；None 表示尚未恢复。
+    ``news_snapshot`` = 同一轮候选阶段抓到的新闻/公告事实；只有它的 owner 判定
+    可复用（抓取成功 + 覆盖等待池代码 + 未超时）才会省掉第二次抓取，否则照旧
+    重新请求。抓取失败永远不会被当成"没有负面新闻"。
     复用的原因与实测收益见 ``docs/COUPLING_BUDGET.md`` 2026-10-29 切片。
     """
     init_db()
@@ -9661,7 +9679,7 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None):
     with PTM.phase("execution.waitlist_market"):
         prefetch_market = _market_state(day) if prefetch_codes else None
     with PTM.phase("execution.waitlist_news"):
-        prefetch_news = _news_for(prefetch_names) if prefetch_codes else []
+        prefetch_news = _waitlist_news(prefetch_names, news_snapshot)
     with PTM.phase("execution.waitlist_quotes"):
         prefetch_quotes = _quotes(prefetch_codes, asof_date=day) if prefetch_codes else {}
     with PTM.phase("execution.writer"), _db(immediate=True, hot_path=True) as conn:
@@ -10418,6 +10436,10 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     )
     precomputed_candidates = prepared.rows_by_account
     global_microstructure_map = prepared.microstructures
+    # 候选阶段的新闻/公告事实（代码并集一次抓取）。同轮 execute_open 可以复用它，
+    # 复用条件由 owner（paper_candidate_scan.NewsSnapshot）判定：抓取成功、覆盖
+    # 所需代码、且未超过 NEWS_SNAPSHOT_MAX_AGE_SECONDS。
+    result["news_snapshot"] = prepared.news_snapshot
     # R25：bootstrap 与 close 路径必须同形 —— provider/网络证据在**写事务之外**
     # 收集完成，写锁内只做校验、决策与落库。此前 ``_quotes`` / ``_news_for`` /
     # ``fetch_sector_flow`` 在 ``_db()`` 内被逐账户调用：那不仅让每个账户各付一次
@@ -12027,7 +12049,8 @@ def monitor_intraday(asof_datetime=None, force=False):
         if scan_ready else {"status": "blocked", "reason": scan_block, "accounts": []}
     )
     open_result = (
-        execute_open(day, risk_result=risk_result, execution_orders=execution_orders)
+        execute_open(day, risk_result=risk_result, execution_orders=execution_orders,
+                     news_snapshot=bootstrap.get("news_snapshot"))
         if scan_ready else
         {"status": "blocked", "reason": scan_block, "orders": [], "manual_orders": [],
          "opening_event": {"orders": []}, "live_scan_gate": live_gate}

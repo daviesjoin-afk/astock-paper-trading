@@ -4326,3 +4326,34 @@ verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailabl
 `docs/COUPLING_BUDGET.md`）、`test_schema_ownership`、`test_db_migrate`。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-7 候选公共事实层收敛（2026-10-31）
+
+**问题**：`collect_evidence` 对**每个策略**各调一次 `ports.news(names)`，而各策略的候选代码
+在同一轮里高度重叠；`execute_open` 的等待池随后又为另一批代码再抓一次。同一份新闻/公告
+在一轮里被重复请求 N+1 次。
+
+**事实层**（owner：`paper_candidate_scan`）：
+
+| 事实 | owner | key | 生命周期 | TTL | 失败语义 |
+| --- | --- | --- | --- | --- | --- |
+| `NewsSnapshot` | `paper_candidate_scan` | 本轮账户候选代码**并集** | `prepare` → 同轮 `execute_open` | 180 s | `ok=False` 永不复用，绝不等于"没有负面新闻" |
+| `CandidateScanInputs` 的 universe/finance/disclosures/fundamentals | 同上（已有） | 内容指纹 / 代码 / as-of | 一次扫描 | 轮内 | 空读与失败不缓存，允许另一策略重新取源 |
+
+`collect_evidence` 先逐账户算冷却候选，再对**并集**做一次新闻请求，然后按代码切片
+（每片 `deepcopy`）分发；`execute_open(..., news_snapshot=…)` 只在该快照"抓取成功 + 覆盖
+所需代码 + 未超时"时复用，否则照旧重新请求。`_waitlist_news` 只做路由，TTL/覆盖判定全部
+归 `NewsSnapshot`，不重复实现。
+
+**指纹成本决策**：`sha256(json.dumps((universe, finance, asof, snapshot_asof)))` 实测
+10–13 ms / 900 KiB（5,000 标的）。曾评估"同轮只算一次"，但调用方会**原地修改**输入
+（live overlay），持有引用再比较会把已变内容误判成没变；安全短路需深拷贝 ≈ 序列化成本。
+因此保留逐调用内容哈希，用 `test_candidate_fact_layer.FundamentalsFingerprintTests` 钉住
+"原地修改必失效"。
+
+**边界**：不触碰策略评分、风险阈值、成交判定、资金、cycle/lease/fencing；风险通过顺序
+（PR-1）与 Dashboard 持久刷新（PR-2）不在本 PR。回归门禁：`backend/test_candidate_fact_layer.py`
+（18 项）+ `test_candidate_shared_inputs`（并集契约）+ `test_paper_timing`（`execute_open`
+新参数）。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

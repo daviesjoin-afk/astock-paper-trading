@@ -40,7 +40,10 @@ class TimingTests(unittest.TestCase):
             opening = stack.enter_context(mock.patch.object(paper, "execute_open", return_value={"orders": [], "execution_orders": orders}))
             result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10), force=True)
         resume.assert_called_once()
-        opening.assert_called_once_with(dt.date(2026, 10, 20), risk_result=risk_result, execution_orders=orders)
+        # PR-7：同轮候选阶段的新闻快照会一起传下去（这里 bootstrap 被 mock 成 {}，
+        # 因此是 None）；复用与否由快照 owner 判定，不在这里做决定。
+        opening.assert_called_once_with(dt.date(2026, 10, 20), risk_result=risk_result,
+                                        execution_orders=orders, news_snapshot=None)
         self.assertIs(result["execution_orders"], orders)
 
     def test_priority_failure_stops_candidate_scan_and_preserves_exception(self):
