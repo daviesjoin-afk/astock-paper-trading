@@ -180,3 +180,9 @@ value:eb6755673ce34a3f4d8f703cc065d2937577be2a
 # Public PR300 interface-fix commit referenced by docs/RISK_INPUT_DEMAND.md.
 # Squash merging removes it from master ancestry; this is not a credential.
 value:3221f2d1de8c872f3a36841e97db326a86937b73
+
+# PR305 CI 调查文档（docs/PR305_REMOTE_CI.md）引用的两个 git 提交 id。
+# 它们是本仓库自己的提交标识符（公开、可任意 reflog 复现），不是凭据；
+# 文档正文已改用短 SHA，这里只为历史 blob 保留精确值豁免。
+value:623d87fc0c8f7344060775725553b12ce182a988
+value:e622955deb702ae65e101ce260a0e3bea2e0a2f0
