@@ -257,10 +257,11 @@ class WiringGuardTests(unittest.TestCase):
 
     def test_buy_order_clamps_to_the_current_slice(self):
         body = self._source()
-        self.assertIn("PED.prepare_entry_slice(", body)
+        self.assertIn("PSZ.entry_quantity(", body)
+        self.assertIn("slice_request=PSZ.EntrySliceRequest(", body)
         self.assertIn("plan_builder=ELC.entry_slice_plan", body)
-        self.assertIn("sizing.update(slice_sizing)", body)
-        decision = self._source("paper_entry_decision.py")
+        self.assertIn("quantity.slice_state, quantity.slice_detail", body)
+        decision = self._source("paper_sizing.py")
         self.assertIn("entry_slice_target_qty", decision)
         self.assertIn("min(int(qty or 0), target)", decision)
 

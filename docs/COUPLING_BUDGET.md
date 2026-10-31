@@ -1,5 +1,16 @@
 # 耦合预算与模块化进度
 
+## 2026-10-31 PR-8：统一买入数量 owner
+
+`manual_orders` 改为直接调用 `paper_sizing.entry_quantity`，删除注入的
+`ManualOrderDependencies._price_aware_qty`。新增一条诚实的显式业务依赖
+`manual_orders → paper_sizing`：`cross_domain_edges` 628 → 629，
+FEATURE_ALLOWANCE 10 → 11；没有反向依赖或第二个 sizing owner。
+`paper_entry_decision.prepare_entry_slice` 是同一 callable 的兼容别名，
+不复制计算或新增同名 helper；`paper_sizing` 只依赖标准库。
+其余预算不放宽，数量计算从主编排迁出，注入私有能力减少一项。
+完整审计、冻结矩阵与验证见 [统一买入数量](ENTRY_QUANTITY.md)。
+
 2026-10-28（公共层瘦身审计切片）：主引擎按业务簇继续下沉，新增两个 owner ——
 `paper_candidate_lanes`（板块热度图、板块异动/概念扩张/同花顺热门车道、
 科创板板块脉冲）与 `paper_entry_price_rules`（新开仓价格门禁与开盘追高

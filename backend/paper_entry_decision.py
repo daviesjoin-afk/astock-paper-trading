@@ -1,31 +1,10 @@
 """Pure entry decisions over explicitly supplied policy and market facts."""
 
+import paper_sizing as PSZ
 
-def prepare_entry_slice(*, payload, account, qty, asof_day, continuation, existing_plan, lot_size, plan_builder):
-    """Calculate one slice without changing the signal, account or ledger."""
-    try:
-        slice_count = int(payload.get("entry_slice_policy") or account.get("entry_slices") or 1)
-    except (TypeError, ValueError):
-        slice_count = 1
-    if continuation and existing_plan:
-        slice_count = max(slice_count, len(existing_plan))
-    slice_count = max(1, min(slice_count, 5))
-    if slice_count <= 1:
-        return qty, None, {}, None
-    state = dict(payload.get("entry_slices") or {})
-    if not state.get("plan"):
-        state = {"plan": plan_builder(int(qty or 0), slice_count, lot_size=lot_size),
-                 "filled": 0, "day": str(asof_day)[:10], "slices": slice_count}
-    plan = [int(item) for item in (state.get("plan") or [])]
-    filled = max(0, int(state.get("filled") or 0))
-    sizing = {}
-    if plan and filled < len(plan):
-        target = plan[filled]
-        clamped = (min(int(qty or 0), target) // lot_size) * lot_size
-        sizing.update(entry_slice_target_qty=target, entry_slice_index=filled + 1, entry_slice_total=len(plan))
-        if clamped > 0:
-            qty = clamped
-    return qty, state, sizing, {"plan": plan, "filled": filled, "slices": slice_count}
+
+# Legacy import surface, same callable; no duplicate arithmetic or wrapper.
+prepare_entry_slice = PSZ.prepare_entry_slice
 
 
 def chase_entry_gate(pick, quote, market, entry_model, q, execution_quote, *, policy, num, limit_pct):

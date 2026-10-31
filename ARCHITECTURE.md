@@ -344,7 +344,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 
 - 2026-10-13 业务解耦续跑：`paper_order_execution_authority` 独占已存在订单的四态周期归属读取、只读成交周期授权及异常类型；只依赖 stdlib，既不创建周期，也不重绑账户。`paper_lot_ledger` 拥有买入 lot 创建、同周期 FIFO 已结算 lot 消耗、兼容持仓投影重建与旧参数形式的权威持仓读取适配；只依赖下层读取/风险状态/规则/仓储模块，不导入主编排、不拥有连接或事务。执行层直接绑定这些 owner 的实现，手动订单直接绑定周期授权与持仓读取，查询直接绑定持仓读取；`paper_trading` 仅保留旧入口适配，异常类型身份保持。新 lot owner 的无来源订单入口要求显式周期；兼容创建入口仍在调用方原事务解析周期，再传给 owner。租约、现金编排和策略决策仍是后续边界，不能宣称全部业务耦合已经消失。
 - 2026-10-13 整体优化：`execution_planner`、`manual_orders`、`dashboard_queries` 通过声明字段固定的依赖对象消费应用能力；`paper_trading` 在定义完成后绑定工厂，每次调用解析当前能力，不再由垂直模块反向导入主编排。`commit_fill` 与 `execution_context_from_facts` 可显式接收执行依赖，周期来源、租约、成交校验与原子写入顺序保持；兼容入口继续由主编排提供。该改动消除了字面导入闭环，部分能力实现仍位于主编排，不能把导入无环等同于运行时完全独立。
-- `paper_candidate_projection` 承载实时报价覆盖和候选通道排序；`paper_entry_decision` 承载追高门禁与切片数量准备。二者只消费显式输入，不导入项目模块、不取证、不写账本。`paper_risk_market_inputs` 通过五个具名能力按消费者采集风控证据：报价取持仓与有效替补候选并集，资金流轨迹仅取持仓，新闻保持原持仓范围；资格由 `paper_risk_evidence.eligible_replacement_candidates` 统一，决策写事务内仍重新读取。主编排仍负责数据库、事务和决策应用。新闻缺口与验收见 [风险输入按需采集](docs/RISK_INPUT_DEMAND.md)。
+- `paper_candidate_projection` 承载实时报价覆盖和候选通道排序；`paper_entry_decision` 承载追高门禁与分片兼容入口，分片算术已归 `paper_sizing`，兼容名是同一函数对象。它们只消费显式输入、不取证、不写账本。`paper_risk_market_inputs` 通过五个具名能力按消费者采集风控证据：报价取持仓与有效替补候选并集，资金流轨迹仅取持仓，新闻保持原持仓范围；资格由 `paper_risk_evidence.eligible_replacement_candidates` 统一，决策写事务内仍重新读取。主编排仍负责数据库、事务和决策应用。新闻缺口与验收见 [风险输入按需采集](docs/RISK_INPUT_DEMAND.md)。
 - `adaptive_runtime_facts` 是 adaptive 运行事实的只读发布实现，保留类型、显式 `as_of`、终态可用性与分页校验；`adaptive_engine` 保留同名兼容导出和包装，仍独占运行状态写入。研究读取该下层模块，不为读事实加载训练引擎。`adaptive_configuration` 集中只读配置归一化，继续强制无人值守开关关闭和 `shadow_only`；`evolution_apply` 通过具名能力读取配置与账户标识，不反向导入训练引擎。
 - `api_adaptive` 与 `api_settings` 完整注册路由后按首次使用加载研究/学习实现。K 线清单使用实际读取后确认的文件签名跳过未变化 CSV；成功强制探活仅在一个 `run_slot` 调用范围内复用最多 30 秒，失败不进入窗口，调用结束清理。详细测量与限制见 `docs/SIMULATED_TRADING_ARCHITECTURE_REVIEW.md`。
 - `backend/main.py` 负责 FastAPI 组装、只读查询和生命周期。
@@ -360,7 +360,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 - `backend/paper_trading_rules.py` 承载交易日、费用、证券类型与证券权限等无账本副作用规则；`paper_trading.py` 继续兼容导出旧的下划线函数名。
 - `backend/paper_quote_policy.py` 承载行情新鲜度、活跃度和成交核验门禁；`paper_trading.py` 保留 `_quote_is_fresh`、`_is_trading_active`、`_execution_quote_status` 兼容包装。
 - `backend/paper_allocation.py` 承载共享池席位分配和策略预算的纯计算；`paper_trading.py` 只负责读取风险/持仓/预约数据并注入常量。
-- `backend/paper_sizing.py` 承载按风险、权重、资金、行业和共享池约束计算下单股数；`paper_trading.py` 保留 `_price_aware_qty` 兼容包装。
+- `backend/paper_sizing.py::entry_quantity` 是自动/手动 BUY 委托数量的唯一计算入口：风险、权重、资金、行业、共享池、整手及显式试仓/分片/部署上限和 requested_qty 校验；手单直接调用，`price_aware_qty` / 主引擎 `_price_aware_qty` 保留兼容转发。业务资格、最小金额门禁和最终成交仍归原 owner，详见 [统一买入数量](docs/ENTRY_QUANTITY.md)。
 - `backend/paper_storage.py` 负责 SQLite 连接生命周期、只读连接、WAL 检查点和锁重试；`paper_trading.py` 只保留兼容包装，不把业务查询迁入存储层。
 - `backend/paper_portfolio.py` 负责将已读取的持仓 lot 聚合为兼容读模型；数据库查询与交易结算仍由 `paper_trading.py` 编排。
 - `backend/paper_archive_projection.py` 负责把不可变历史周期快照投影为只读订单行；损坏快照隔离在投影边界内，不影响当前账本。

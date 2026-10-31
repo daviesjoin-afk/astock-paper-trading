@@ -18,6 +18,7 @@ import decision_engine as DE
 import market_data_contract as MDC
 import market_data_service as MDSvc
 import paper_capital_reservations as PCR
+import paper_sizing as PSZ
 import portfolio_allocation_policy as PAPolicy
 import portfolio_allocation_weights as PAW
 import portfolio_runtime as PRuntime
@@ -75,7 +76,6 @@ class ManualOrderDependencies:
     _order_cycle_id: Any
     _pending_position_slots: Any
     _position_rows: Any
-    _price_aware_qty: Any
     _quotes: Any
     _record_nav: Any
     _reserve_shared_capital: Any
@@ -125,7 +125,6 @@ def _manual_order_plan(
     _market_state = deps._market_state
     _pending_position_slots = deps._pending_position_slots
     _position_rows = deps._position_rows
-    _price_aware_qty = deps._price_aware_qty
     _quotes = deps._quotes
     _risk_profile = deps._risk_profile
     _shared_account_exposure = deps._shared_account_exposure
@@ -146,8 +145,12 @@ def _manual_order_plan(
 
     side = str(side or "").lower()
     order_type = str(order_type or "market").lower()
-    requested_qty = int(_num(qty))
     reasons = []
+    try:
+        requested_qty = int(_num(qty))
+    except (ValueError, OverflowError):
+        requested_qty = 0
+        reasons.append("委托数量必须为 100 股的正整数倍")
     entry_frozen = side == "buy" and _entry_freeze_enabled()
     if entry_frozen:
         reasons.append(_entry_frozen_reason("手动委托"))
@@ -406,7 +409,7 @@ def _manual_order_plan(
         fill_reference = max(fill_reference, 0.01)
         code_value = code_values.get(code, 0.0)
         industry_value = industries.get(plan["industry"], 0.0)
-        safe_qty, sizing = _price_aware_qty(
+        quantity = PSZ.entry_quantity(
             nav, shared_cash, position_value, industry_value, code_value,
             # PR-39：用户策略账户不在 ACCOUNT_SPECS 里，直接下标会 KeyError；
             # 统一走 paper_trading._spec_for（内置 → 表，用户 → RuntimeContext）。
@@ -420,14 +423,12 @@ def _manual_order_plan(
             pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
             pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
             single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
+            requested_qty=requested_qty, num=_num, lot_size=LOT_SIZE,
         )
-        plan["risk"]["sizing"] = sizing
-        plan["recommended_qty"] = safe_qty
-        if requested_qty <= 0:
-            requested_qty = safe_qty
-        if requested_qty > safe_qty:
-            reasons.append(f"委托数量超过模型上限 {safe_qty} 股")
-        plan["qty"] = requested_qty
+        plan["risk"]["sizing"] = quantity.sizing
+        plan["recommended_qty"] = quantity.recommended_qty
+        plan["qty"] = quantity.qty
+        reasons.extend(quantity.reasons)
     else:
         decision = DE.sell_decision(
             {
@@ -451,7 +452,7 @@ def _manual_order_plan(
         plan["recommended_qty"] = available_qty
         plan["qty"] = requested_qty
 
-    if plan["qty"] < LOT_SIZE or plan["qty"] % LOT_SIZE:
+    if side == "sell" and (plan["qty"] < LOT_SIZE or plan["qty"] % LOT_SIZE):
         reasons.append("委托数量必须为 100 股的正整数倍")
     if order_type == "limit":
         limit_value = _num(limit_price)

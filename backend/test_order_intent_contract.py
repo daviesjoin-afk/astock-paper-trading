@@ -246,7 +246,7 @@ class ExecutionPathGuardTests(unittest.TestCase):
         defs = [(match.start(), match.group(1))
                 for match in re.finditer(r"^def ([a-z_]+)\(", source, re.MULTILINE)]
         call_sites = [match.start() for match in
-                      re.finditer(r"qty, sizing = _price_aware_qty\(", source)]
+                      re.finditer(r"(?:qty, sizing = _price_aware_qty|quantity = PSZ.entry_quantity)\(", source)]
         owners = []
         for position in call_sites:
             owner = next((name for start, name in reversed(defs) if start < position), None)

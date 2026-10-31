@@ -1,0 +1,2001 @@
+{
+  "base_sha": "e622955deb702ae65e101ce260a0e3bea2e0a2f0",
+  "unit": [
+    {
+      "name": "normal",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 1000,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 10000.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "weight"
+        ],
+        "qty_risk_amount": 500.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 1000.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 1,000 股，按 100 股整手向下取整 → 1000 股；若触发止损，损失金额 500.00"
+        ]
+      }
+    },
+    {
+      "name": "price_zero",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 0.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "target_amount": 0.0,
+        "reason": "无有效价格"
+      }
+    },
+    {
+      "name": "price_negative",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": -1.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "target_amount": 0.0,
+        "reason": "无有效价格"
+      }
+    },
+    {
+      "name": "lot_below",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 999.99,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 100.0
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 100.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 100 股",
+          "取最小值 100 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "lot_exact",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 1000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 100,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 1000.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 100.0
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 50.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 100.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 100 股",
+          "取最小值 100 股，按 100 股整手向下取整 → 100 股；若触发止损，损失金额 50.00"
+        ]
+      }
+    },
+    {
+      "name": "lot_above",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 1999.99,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 100,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 1000.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 200.0
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 50.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 200.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 200 股",
+          "取最小值 200 股，按 100 股整手向下取整 → 100 股；若触发止损，损失金额 50.00"
+        ]
+      }
+    },
+    {
+      "name": "cash_zero",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 0.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 0.0
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 0.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 0 股",
+          "取最小值 0 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "cash_negative",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": -1.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 0.0
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 0.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 0 股",
+          "取最小值 0 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "price_rise",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.01,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 900,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5005,
+        "target_amount": 9009.0,
+        "price": 10.01,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 1998.0,
+          "weight": 999.0,
+          "exposure": 6493.51,
+          "industry": 2997.0,
+          "cash": 4995.0
+        },
+        "binding_constraints": [
+          "weight"
+        ],
+        "qty_risk_amount": 450.45,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 999.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5005）→ 最多 1,998 股",
+          "策略预算/共享池剩余 6,494 股；单票权重上限余量 999 股",
+          "行业集中度余量 2,997 股；现金余量 4,995 股",
+          "取最小值 999 股，按 100 股整手向下取整 → 900 股；若触发止损，损失金额 450.45"
+        ]
+      }
+    },
+    {
+      "name": "risk",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.5,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 200,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 5.0,
+        "target_amount": 2000.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 200.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 1000.0,
+        "entry_stop_distance_pct": 50.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 200.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 50.00%（每股 5.0000）→ 最多 200 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 200 股，按 100 股整手向下取整 → 200 股；若触发止损，损失金额 1,000.00"
+        ]
+      }
+    },
+    {
+      "name": "weight",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 9500.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 50.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "weight"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 50.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 50 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 50 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "industry",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 29500.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        }
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 50.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "industry"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 50.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 50 股；现金余量 5,000 股",
+          "取最小值 50 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "pool",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        },
+        "pool_cap_amount": 10000.0,
+        "pending_pool_amount": 9500.0
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 500.0,
+        "strategy_remaining_amount": 500.0,
+        "pending_pool_amount": 9500.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 50.0,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "exposure"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 50.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 50 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 50 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "strategy",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        },
+        "strategy_cap_amount": 10000.0,
+        "strategy_position_value": 9000.0,
+        "pending_strategy_amount": 500.0
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 500.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 500.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 50.0,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "exposure"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 50.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 50 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 50 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    },
+    {
+      "name": "liquidity",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        },
+        "liquidity_cap_amount": 1999.99
+      },
+      "qty": 100,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 1000.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 5000.0,
+          "liquidity": 200.0
+        },
+        "binding_constraints": [
+          "liquidity"
+        ],
+        "qty_risk_amount": 50.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": 1999.99,
+        "liquidity_cap_shares": 200.0,
+        "unrounded_shares": 200.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "流动性上限 1,999.99（成交额 × 参与率）→ 最多 200 股",
+          "取最小值 200 股，按 100 股整手向下取整 → 100 股；若触发止损，损失金额 50.00"
+        ]
+      }
+    },
+    {
+      "name": "absolute_cap",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        },
+        "single_position_max_amount": 1999.99
+      },
+      "qty": 100,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 1000.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 1999.99,
+        "single_position_cap_source": "configured_absolute_cap",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 200.0,
+          "exposure": 6500.0,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "weight"
+        ],
+        "qty_risk_amount": 50.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 200.0,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6,500 股；单票权重上限余量 200 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 200 股，按 100 股整手向下取整 → 100 股；若触发止损，损失金额 50.00"
+        ]
+      }
+    },
+    {
+      "name": "exposure_scale",
+      "inputs": {
+        "nav": 100000.0,
+        "cash": 50000.0,
+        "position_value": 0.0,
+        "industry_value": 0.0,
+        "code_value": 0.0,
+        "fill_price": 10.0,
+        "hard_stop": -0.05,
+        "profile": {
+          "single_risk": 0.01,
+          "max_weight": 0.1,
+          "max_exposure": 0.65,
+          "max_industry": 0.3
+        },
+        "exposure_scale": 0.001
+      },
+      "qty": 0,
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 1000.0,
+        "loss_per_share": 0.5,
+        "target_amount": 0.0,
+        "price": 10.0,
+        "effective_max_exposure_pct": 65.0,
+        "pool_remaining_amount": 65000.0,
+        "strategy_remaining_amount": 65000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 0.1,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 2000.0,
+          "weight": 1000.0,
+          "exposure": 6.5,
+          "industry": 3000.0,
+          "cash": 5000.0
+        },
+        "binding_constraints": [
+          "exposure"
+        ],
+        "qty_risk_amount": 0.0,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 6.5,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 100,000.00 × 单笔风险 1.00% = 1,000.00；entry-stop 距离 5.00%（每股 0.5000）→ 最多 2,000 股",
+          "策略预算/共享池剩余 6 股；单票权重上限余量 1,000 股",
+          "行业集中度余量 3,000 股；现金余量 5,000 股",
+          "取最小值 6 股，按 100 股整手向下取整 → 0 股；若触发止损，损失金额 0.00"
+        ]
+      }
+    }
+  ],
+  "automatic": [
+    {
+      "name": "normal",
+      "result": {
+        "filled": true,
+        "code": "600901",
+        "qty": 19900,
+        "price": 10.01
+      },
+      "order": {
+        "qty": 19900,
+        "filled_qty": 19900,
+        "status": "filled",
+        "reason": "Q2 通过；按价格与风险预算计算 19900 股",
+        "planned_price": 10.01
+      },
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 8000.0,
+        "loss_per_share": 0.4004,
+        "target_amount": 199199.0,
+        "price": 10.01,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 820000.0,
+        "strategy_remaining_amount": 820000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 19980.02,
+          "weight": 21978.02,
+          "exposure": 81918.08,
+          "industry": 29970.03,
+          "cash": 99900.1,
+          "liquidity": 249750.25
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 7967.96,
+        "entry_stop_distance_pct": 4.0,
+        "liquidity_cap_amount": 2500000.0,
+        "liquidity_cap_shares": 249750.25,
+        "unrounded_shares": 19980.02,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 0.80% = 8,000.00；entry-stop 距离 4.00%（每股 0.4004）→ 最多 19,980 股",
+          "策略预算/共享池剩余 81,918 股；单票权重上限余量 21,978 股",
+          "行业集中度余量 29,970 股；现金余量 99,900 股",
+          "流动性上限 2,500,000.00（成交额 × 参与率）→ 最多 249,750 股",
+          "取最小值 19,980 股，按 100 股整手向下取整 → 19900 股；若触发止损，损失金额 7,967.96"
+        ],
+        "entry_tranche_scale_pct": 100.0,
+        "strategy_target_pct": 82.0,
+        "strategy_base_target_pct": null,
+        "strategy_floor_pct": null,
+        "strategy_current_pct": 0.0,
+        "strategy_market_scale_pct": null,
+        "strategy_redistribution_pct": 0.0,
+        "capacity_policy": "count-primary-amount-soft-v1",
+        "amount_constraints_soft": true,
+        "market_risk_scale": 1.0,
+        "execution_adjustment_scale": 1.0,
+        "market_scale_applied_in_budget": false,
+        "entry_execution_mode": "常规入场",
+        "minimum_order_amount": 32800.0,
+        "minimum_order_amount_inputs": {
+          "amount": 32800.0,
+          "cycle_capital": 1000000.0,
+          "pool_exposure_cap_pct": 82.0,
+          "position_limit": 15,
+          "configured_position_limit": 9,
+          "position_limit_source": "effective_dynamic_pool_limit",
+          "slot_utilization_pct": 60.0,
+          "rounding": 100.0,
+          "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)"
+        },
+        "execution_limit_price": 10.01,
+        "capital_deployment": {
+          "lifecycle_stage": "standard",
+          "capital_scale": 1.0,
+          "raw_allowance_amount": 820000.0,
+          "deployable_amount": 820000.0,
+          "waiting_capital": 0.0,
+          "lots": 819,
+          "allowed": true
+        },
+        "one_lot_amount": 1001.0,
+        "one_lot_fee": 0.1,
+        "cash_available": 1000000.0,
+        "qty_final": 19900,
+        "minimum_effective_order_amount": 4000.0,
+        "expected_edge_pct": 0.8,
+        "expected_profit_amount": 1593.59,
+        "estimated_round_trip_cost": 537.44
+      }
+    },
+    {
+      "name": "higher_price",
+      "result": {
+        "filled": false,
+        "reason": "跳空 +900.00% 超出 Q2 区间；短线预期毛收益 ¥1,594.32 未覆盖估算往返成本 ¥1,622,669.50，候选保留在等待池复核"
+      },
+      "order": {
+        "qty": 18200,
+        "filled_qty": 0,
+        "status": "risk_rejected",
+        "reason": "跳空 +900.00% 超出 Q2 区间；短线预期毛收益 ¥1,594.32 未覆盖估算往返成本 ¥1,622,669.50，候选保留在等待池复核",
+        "planned_price": 10.01
+      },
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 8000.0,
+        "loss_per_share": 0.438,
+        "target_amount": 199290.0,
+        "price": 10.95,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 820000.0,
+        "strategy_remaining_amount": 820000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 18264.84,
+          "weight": 20091.32,
+          "exposure": 74885.84,
+          "industry": 27397.26,
+          "cash": 91324.2,
+          "liquidity": 228310.5
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 7971.6,
+        "entry_stop_distance_pct": 4.0,
+        "liquidity_cap_amount": 2500000.0,
+        "liquidity_cap_shares": 228310.5,
+        "unrounded_shares": 18264.84,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 0.80% = 8,000.00；entry-stop 距离 4.00%（每股 0.4380）→ 最多 18,265 股",
+          "策略预算/共享池剩余 74,886 股；单票权重上限余量 20,091 股",
+          "行业集中度余量 27,397 股；现金余量 91,324 股",
+          "流动性上限 2,500,000.00（成交额 × 参与率）→ 最多 228,311 股",
+          "取最小值 18,265 股，按 100 股整手向下取整 → 18200 股；若触发止损，损失金额 7,971.60"
+        ],
+        "entry_tranche_scale_pct": 100.0,
+        "strategy_target_pct": 82.0,
+        "strategy_base_target_pct": null,
+        "strategy_floor_pct": null,
+        "strategy_current_pct": 0.0,
+        "strategy_market_scale_pct": null,
+        "strategy_redistribution_pct": 0.0,
+        "capacity_policy": "count-primary-amount-soft-v1",
+        "amount_constraints_soft": true,
+        "market_risk_scale": 1.0,
+        "execution_adjustment_scale": 1.0,
+        "market_scale_applied_in_budget": false,
+        "entry_execution_mode": "常规入场",
+        "minimum_order_amount": 32800.0,
+        "minimum_order_amount_inputs": {
+          "amount": 32800.0,
+          "cycle_capital": 1000000.0,
+          "pool_exposure_cap_pct": 82.0,
+          "position_limit": 15,
+          "configured_position_limit": 9,
+          "position_limit_source": "effective_dynamic_pool_limit",
+          "slot_utilization_pct": 60.0,
+          "rounding": 100.0,
+          "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)"
+        },
+        "execution_limit_price": 10.01,
+        "capital_deployment": {
+          "lifecycle_stage": "standard",
+          "capital_scale": 1.0,
+          "raw_allowance_amount": 820000.0,
+          "deployable_amount": 820000.0,
+          "waiting_capital": 0.0,
+          "lots": 748,
+          "allowed": true
+        },
+        "one_lot_amount": 1095.0,
+        "one_lot_fee": 0.11,
+        "cash_available": 1000000.0,
+        "qty_final": 18200,
+        "minimum_effective_order_amount": 4000.0,
+        "expected_edge_pct": 0.8,
+        "expected_profit_amount": 1594.32,
+        "estimated_round_trip_cost": 1622669.5
+      }
+    },
+    {
+      "name": "too_expensive",
+      "result": {
+        "filled": false,
+        "reason": "跳空 +99900.00% 超出 Q2 区间；短线预期毛收益 ¥1,594.32 未覆盖估算往返成本 ¥181,982,849.50，候选保留在等待池复核"
+      },
+      "order": {
+        "qty": 18200,
+        "filled_qty": 0,
+        "status": "risk_rejected",
+        "reason": "跳空 +99900.00% 超出 Q2 区间；短线预期毛收益 ¥1,594.32 未覆盖估算往返成本 ¥181,982,849.50，候选保留在等待池复核",
+        "planned_price": 10.01
+      },
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 8000.0,
+        "loss_per_share": 0.438,
+        "target_amount": 199290.0,
+        "price": 10.95,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 820000.0,
+        "strategy_remaining_amount": 820000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 18264.84,
+          "weight": 20091.32,
+          "exposure": 74885.84,
+          "industry": 27397.26,
+          "cash": 91324.2,
+          "liquidity": 228310.5
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 7971.6,
+        "entry_stop_distance_pct": 4.0,
+        "liquidity_cap_amount": 2500000.0,
+        "liquidity_cap_shares": 228310.5,
+        "unrounded_shares": 18264.84,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 0.80% = 8,000.00；entry-stop 距离 4.00%（每股 0.4380）→ 最多 18,265 股",
+          "策略预算/共享池剩余 74,886 股；单票权重上限余量 20,091 股",
+          "行业集中度余量 27,397 股；现金余量 91,324 股",
+          "流动性上限 2,500,000.00（成交额 × 参与率）→ 最多 228,311 股",
+          "取最小值 18,265 股，按 100 股整手向下取整 → 18200 股；若触发止损，损失金额 7,971.60"
+        ],
+        "entry_tranche_scale_pct": 100.0,
+        "strategy_target_pct": 82.0,
+        "strategy_base_target_pct": null,
+        "strategy_floor_pct": null,
+        "strategy_current_pct": 0.0,
+        "strategy_market_scale_pct": null,
+        "strategy_redistribution_pct": 0.0,
+        "capacity_policy": "count-primary-amount-soft-v1",
+        "amount_constraints_soft": true,
+        "market_risk_scale": 1.0,
+        "execution_adjustment_scale": 1.0,
+        "market_scale_applied_in_budget": false,
+        "entry_execution_mode": "常规入场",
+        "minimum_order_amount": 32800.0,
+        "minimum_order_amount_inputs": {
+          "amount": 32800.0,
+          "cycle_capital": 1000000.0,
+          "pool_exposure_cap_pct": 82.0,
+          "position_limit": 15,
+          "configured_position_limit": 9,
+          "position_limit_source": "effective_dynamic_pool_limit",
+          "slot_utilization_pct": 60.0,
+          "rounding": 100.0,
+          "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)"
+        },
+        "execution_limit_price": 10.01,
+        "capital_deployment": {
+          "lifecycle_stage": "standard",
+          "capital_scale": 1.0,
+          "raw_allowance_amount": 820000.0,
+          "deployable_amount": 820000.0,
+          "waiting_capital": 0.0,
+          "lots": 748,
+          "allowed": true
+        },
+        "one_lot_amount": 1095.0,
+        "one_lot_fee": 0.11,
+        "cash_available": 1000000.0,
+        "qty_final": 18200,
+        "minimum_effective_order_amount": 4000.0,
+        "expected_edge_pct": 0.8,
+        "expected_profit_amount": 1594.32,
+        "estimated_round_trip_cost": 181982849.5
+      }
+    },
+    {
+      "name": "sliced",
+      "result": {
+        "filled": true,
+        "code": "600901",
+        "qty": 6600,
+        "price": 10.01
+      },
+      "order": {
+        "qty": 6600,
+        "filled_qty": 6600,
+        "status": "filled",
+        "reason": "Q2 通过；按价格与风险预算计算 6600 股",
+        "planned_price": 10.01
+      },
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 8000.0,
+        "loss_per_share": 0.4004,
+        "target_amount": 199199.0,
+        "price": 10.01,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 820000.0,
+        "strategy_remaining_amount": 820000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 19980.02,
+          "weight": 21978.02,
+          "exposure": 81918.08,
+          "industry": 29970.03,
+          "cash": 99900.1,
+          "liquidity": 249750.25
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 7967.96,
+        "entry_stop_distance_pct": 4.0,
+        "liquidity_cap_amount": 2500000.0,
+        "liquidity_cap_shares": 249750.25,
+        "unrounded_shares": 19980.02,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 0.80% = 8,000.00；entry-stop 距离 4.00%（每股 0.4004）→ 最多 19,980 股",
+          "策略预算/共享池剩余 81,918 股；单票权重上限余量 21,978 股",
+          "行业集中度余量 29,970 股；现金余量 99,900 股",
+          "流动性上限 2,500,000.00（成交额 × 参与率）→ 最多 249,750 股",
+          "取最小值 19,980 股，按 100 股整手向下取整 → 19900 股；若触发止损，损失金额 7,967.96"
+        ],
+        "entry_tranche_scale_pct": 100.0,
+        "strategy_target_pct": 82.0,
+        "strategy_base_target_pct": null,
+        "strategy_floor_pct": null,
+        "strategy_current_pct": 0.0,
+        "strategy_market_scale_pct": null,
+        "strategy_redistribution_pct": 0.0,
+        "capacity_policy": "count-primary-amount-soft-v1",
+        "amount_constraints_soft": true,
+        "market_risk_scale": 1.0,
+        "execution_adjustment_scale": 1.0,
+        "market_scale_applied_in_budget": false,
+        "entry_execution_mode": "常规入场",
+        "minimum_order_amount": 32800.0,
+        "minimum_order_amount_inputs": {
+          "amount": 32800.0,
+          "cycle_capital": 1000000.0,
+          "pool_exposure_cap_pct": 82.0,
+          "position_limit": 15,
+          "configured_position_limit": 9,
+          "position_limit_source": "effective_dynamic_pool_limit",
+          "slot_utilization_pct": 60.0,
+          "rounding": 100.0,
+          "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)"
+        },
+        "execution_limit_price": 10.01,
+        "entry_slice_target_qty": 6600,
+        "entry_slice_index": 1,
+        "entry_slice_total": 3,
+        "capital_deployment": {
+          "lifecycle_stage": "standard",
+          "capital_scale": 1.0,
+          "raw_allowance_amount": 820000.0,
+          "deployable_amount": 820000.0,
+          "waiting_capital": 0.0,
+          "lots": 819,
+          "allowed": true
+        },
+        "one_lot_amount": 1001.0,
+        "one_lot_fee": 0.1,
+        "cash_available": 1000000.0,
+        "qty_final": 6600,
+        "minimum_effective_order_amount": 4000.0,
+        "expected_edge_pct": 0.8,
+        "expected_profit_amount": 528.53,
+        "estimated_round_trip_cost": 178.25
+      }
+    },
+    {
+      "name": "continuation",
+      "result": {
+        "filled": false,
+        "deferred": true,
+        "reason": "策略预算剩余仅支持 199199 元新仓，低于动态最小建仓金额 32800 元；席位稀缺时不建尘埃仓，保留为替补候选，待轮换释放预算后按全尺寸复核"
+      },
+      "order": {
+        "qty": 200,
+        "filled_qty": 0,
+        "status": "deferred_capacity",
+        "reason": "低于动态最小建仓金额 ¥32,800（当前 ¥2,002）；席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核；短线有效委托至少 ¥4,000，当前 ¥2,002；金额约束仅用于委托 sizing，候选保留在等待池复核",
+        "planned_price": 10.01
+      },
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 8000.0,
+        "loss_per_share": 0.4004,
+        "target_amount": 199199.0,
+        "price": 10.01,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 820000.0,
+        "strategy_remaining_amount": 820000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 19980.02,
+          "weight": 21978.02,
+          "exposure": 81918.08,
+          "industry": 29970.03,
+          "cash": 99900.1,
+          "liquidity": 249750.25
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 7967.96,
+        "entry_stop_distance_pct": 4.0,
+        "liquidity_cap_amount": 2500000.0,
+        "liquidity_cap_shares": 249750.25,
+        "unrounded_shares": 19980.02,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 0.80% = 8,000.00；entry-stop 距离 4.00%（每股 0.4004）→ 最多 19,980 股",
+          "策略预算/共享池剩余 81,918 股；单票权重上限余量 21,978 股",
+          "行业集中度余量 29,970 股；现金余量 99,900 股",
+          "流动性上限 2,500,000.00（成交额 × 参与率）→ 最多 249,750 股",
+          "取最小值 19,980 股，按 100 股整手向下取整 → 19900 股；若触发止损，损失金额 7,967.96"
+        ],
+        "entry_tranche_scale_pct": 100.0,
+        "strategy_target_pct": 82.0,
+        "strategy_base_target_pct": null,
+        "strategy_floor_pct": null,
+        "strategy_current_pct": 0.0,
+        "strategy_market_scale_pct": null,
+        "strategy_redistribution_pct": 0.0,
+        "capacity_policy": "count-primary-amount-soft-v1",
+        "amount_constraints_soft": true,
+        "market_risk_scale": 1.0,
+        "execution_adjustment_scale": 1.0,
+        "market_scale_applied_in_budget": false,
+        "entry_execution_mode": "常规入场",
+        "minimum_order_amount": 32800.0,
+        "minimum_order_amount_inputs": {
+          "amount": 32800.0,
+          "cycle_capital": 1000000.0,
+          "pool_exposure_cap_pct": 82.0,
+          "position_limit": 15,
+          "configured_position_limit": 9,
+          "position_limit_source": "effective_dynamic_pool_limit",
+          "slot_utilization_pct": 60.0,
+          "rounding": 100.0,
+          "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)"
+        },
+        "execution_limit_price": 10.01,
+        "entry_slice_target_qty": 200,
+        "entry_slice_index": 2,
+        "entry_slice_total": 3,
+        "capital_deployment": {
+          "lifecycle_stage": "standard",
+          "capital_scale": 1.0,
+          "raw_allowance_amount": 820000.0,
+          "deployable_amount": 820000.0,
+          "waiting_capital": 0.0,
+          "lots": 819,
+          "allowed": true
+        },
+        "one_lot_amount": 1001.0,
+        "one_lot_fee": 0.1,
+        "cash_available": 1000000.0,
+        "qty_final": 200,
+        "minimum_effective_order_amount": 4000.0,
+        "expected_edge_pct": 0.8,
+        "expected_profit_amount": 16.02,
+        "estimated_round_trip_cost": 5.4
+      }
+    },
+    {
+      "name": "intent_qty_forbidden",
+      "result": {
+        "filled": true,
+        "code": "600901",
+        "qty": 19900,
+        "price": 10.01
+      },
+      "order": {
+        "qty": 19900,
+        "filled_qty": 19900,
+        "status": "filled",
+        "reason": "Q2 通过；按价格与风险预算计算 19900 股",
+        "planned_price": 10.01
+      },
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 8000.0,
+        "loss_per_share": 0.4004,
+        "target_amount": 199199.0,
+        "price": 10.01,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 820000.0,
+        "strategy_remaining_amount": 820000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 19980.02,
+          "weight": 21978.02,
+          "exposure": 81918.08,
+          "industry": 29970.03,
+          "cash": 99900.1,
+          "liquidity": 249750.25
+        },
+        "binding_constraints": [
+          "risk"
+        ],
+        "qty_risk_amount": 7967.96,
+        "entry_stop_distance_pct": 4.0,
+        "liquidity_cap_amount": 2500000.0,
+        "liquidity_cap_shares": 249750.25,
+        "unrounded_shares": 19980.02,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 0.80% = 8,000.00；entry-stop 距离 4.00%（每股 0.4004）→ 最多 19,980 股",
+          "策略预算/共享池剩余 81,918 股；单票权重上限余量 21,978 股",
+          "行业集中度余量 29,970 股；现金余量 99,900 股",
+          "流动性上限 2,500,000.00（成交额 × 参与率）→ 最多 249,750 股",
+          "取最小值 19,980 股，按 100 股整手向下取整 → 19900 股；若触发止损，损失金额 7,967.96"
+        ],
+        "entry_tranche_scale_pct": 100.0,
+        "strategy_target_pct": 82.0,
+        "strategy_base_target_pct": null,
+        "strategy_floor_pct": null,
+        "strategy_current_pct": 0.0,
+        "strategy_market_scale_pct": null,
+        "strategy_redistribution_pct": 0.0,
+        "capacity_policy": "count-primary-amount-soft-v1",
+        "amount_constraints_soft": true,
+        "market_risk_scale": 1.0,
+        "execution_adjustment_scale": 1.0,
+        "market_scale_applied_in_budget": false,
+        "entry_execution_mode": "常规入场",
+        "minimum_order_amount": 32800.0,
+        "minimum_order_amount_inputs": {
+          "amount": 32800.0,
+          "cycle_capital": 1000000.0,
+          "pool_exposure_cap_pct": 82.0,
+          "position_limit": 15,
+          "configured_position_limit": 9,
+          "position_limit_source": "effective_dynamic_pool_limit",
+          "slot_utilization_pct": 60.0,
+          "rounding": 100.0,
+          "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)"
+        },
+        "execution_limit_price": 10.01,
+        "capital_deployment": {
+          "lifecycle_stage": "standard",
+          "capital_scale": 1.0,
+          "raw_allowance_amount": 820000.0,
+          "deployable_amount": 820000.0,
+          "waiting_capital": 0.0,
+          "lots": 819,
+          "allowed": true
+        },
+        "one_lot_amount": 1001.0,
+        "one_lot_fee": 0.1,
+        "cash_available": 1000000.0,
+        "qty_final": 19900,
+        "minimum_effective_order_amount": 4000.0,
+        "expected_edge_pct": 0.8,
+        "expected_profit_amount": 1593.59,
+        "estimated_round_trip_cost": 537.44
+      }
+    }
+  ],
+  "manual": [
+    {
+      "input_qty": 0,
+      "qty": 9000,
+      "requested_qty": 0,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": -100,
+      "qty": 9000,
+      "requested_qty": -100,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": 1,
+      "qty": 1,
+      "requested_qty": 1,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "委托数量必须为 100 股的正整数倍",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": 99,
+      "qty": 99,
+      "requested_qty": 99,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "委托数量必须为 100 股的正整数倍",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": 100,
+      "qty": 100,
+      "requested_qty": 100,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": 101,
+      "qty": 101,
+      "requested_qty": 101,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "委托数量必须为 100 股的正整数倍",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": 100.9,
+      "qty": 100,
+      "requested_qty": 100,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": 100000000,
+      "qty": 100000000,
+      "requested_qty": 100000000,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "委托数量超过模型上限 9000 股",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果",
+        "共享资金池可用现金不足"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": "100",
+      "qty": 9000,
+      "requested_qty": 0,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    },
+    {
+      "input_qty": null,
+      "qty": 9000,
+      "requested_qty": 0,
+      "recommended_qty": 9000,
+      "reasons": [
+        "策略账户未运行，请先启动或恢复当前周期",
+        "买入模型为 T3，未通过开仓门禁",
+        "成交行情未通过校验：未获得通过的独立行情源校验结果"
+      ],
+      "allowed": false,
+      "status": "risk_rejected",
+      "sizing": {
+        "engine": "risk-sizing-v2",
+        "risk_budget": 12000.0,
+        "loss_per_share": 0.5505,
+        "target_amount": 99099.0,
+        "price": 11.011,
+        "effective_max_exposure_pct": 82.0,
+        "pool_remaining_amount": 1000000.0,
+        "strategy_remaining_amount": 1000000.0,
+        "pending_pool_amount": 0.0,
+        "pending_strategy_amount": 0.0,
+        "new_exposure_scale_pct": 100.0,
+        "single_position_max_amount": 0.0,
+        "single_position_cap_source": "strategy_weight_auto",
+        "constraint_shares": {
+          "risk": 21796.39,
+          "weight": 29061.85,
+          "exposure": 90818.27,
+          "industry": 38143.67,
+          "cash": 9081.83
+        },
+        "binding_constraints": [
+          "cash"
+        ],
+        "qty_risk_amount": 4954.95,
+        "entry_stop_distance_pct": 5.0,
+        "liquidity_cap_amount": null,
+        "liquidity_cap_shares": null,
+        "unrounded_shares": 9081.83,
+        "rounded_to_lot_size": 100,
+        "sizing_explanation": [
+          "风险金额：组合净值 1,000,000.00 × 单笔风险 1.20% = 12,000.00；entry-stop 距离 5.00%（每股 0.5505）→ 最多 21,796 股",
+          "策略预算/共享池剩余 90,818 股；单票权重上限余量 29,062 股",
+          "行业集中度余量 38,144 股；现金余量 9,082 股",
+          "取最小值 9,082 股，按 100 股整手向下取整 → 9000 股；若触发止损，损失金额 4,954.95"
+        ]
+      }
+    }
+  ]
+}

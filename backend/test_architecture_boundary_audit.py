@@ -143,7 +143,9 @@ class CouplingBudgetTests(unittest.TestCase):
         # →`strategy_champion`（strategy 域）。依赖没有新增，只是从"主引擎里的
         # 隐式组装"变成"owner 自己的显式声明"；8 → 10，切片见
         # docs/COUPLING_BUDGET.md「2026-10-31 PR-6」。
-        "cross_domain_edges": 10,
+        # PR-8: manual_orders → paper_sizing replaces the injected private
+        # _price_aware_qty capability; one explicit owner edge, no reverse edge.
+        "cross_domain_edges": 11,
         "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,

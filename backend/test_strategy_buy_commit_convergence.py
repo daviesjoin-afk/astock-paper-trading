@@ -289,9 +289,9 @@ class FinalSizingUsesCyclePinnedVersion(_BuyCase):
         def spy(*args, **kwargs):
             captured["hard_stop"] = args[6]
             captured["profile"] = args[7]
-            return 0, {"qty": 0, "reason": "ec21_capture"}
+            return PT.PSZ.EntryQuantityResult(0, 0, {"qty": 0, "reason": "ec21_capture"})
 
-        with mock.patch.object(PT, "_price_aware_qty", side_effect=spy):
+        with mock.patch.object(PT.PSZ, "entry_quantity", side_effect=spy):
             result, _order = self.run_buy(signal_id=signal_id)
         self.assertIn(
             "profile", captured,
