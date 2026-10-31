@@ -25,6 +25,7 @@ from paper_common import now_text as _now, as_date as _date, dump_json as _json,
 __all__ = [
     "RiskEvidenceDeps",
     "prefetch_position_alt_data",
+    "eligible_replacement_candidates",
     "best_replacement_candidate",
     "intraday_downside_guard",
     "downside_confirmed",
@@ -170,8 +171,8 @@ def _volatility_shadow(code, asof_day, price, load_kline):
     return result
 
 
-def best_replacement_candidate(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps):
-    """Find the strongest **same-day** pending candidate that is not already held.
+def eligible_replacement_candidates(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps):
+    """Load eligible same-day candidates, preserving the existing SQL order.
 
     R18（as-of hard contract）：今天能触发今天卖出的替补必须**属于今天**。候选读取
     经 :mod:`paper_replacement_evidence` 固定在 ``intended_date == day``（**等式**，
@@ -182,6 +183,7 @@ def best_replacement_candidate(conn, account_id, day, held_codes, *, deps: RiskE
     合法 overnight 计划（``signal_date = D-1``、``intended_date = D``）仍然可用。
     归档 signal 不参与：它是历史 opening 证据，不是 executable candidate。
     """
+    held_codes = {str(code) for code in (held_codes or ())}
     statuses = ("pending", "deferred_capacity", deps.entry_frozen_waitlist_status)
     rows = PREPL.load_replacement_candidates(
         conn, account_id=account_id, asof_day=_date(day).isoformat(), statuses=statuses,
@@ -191,10 +193,15 @@ def best_replacement_candidate(conn, account_id, day, held_codes, *, deps: RiskE
     for row in rows:
         pick = (_loads(row.get("payload"), {}) or {}).get("pick") or {}
         code = str(row.get("code") or "")
-        if code and _security_scope(code, row.get("name") or pick.get("name"),
+        if code and code not in held_codes and _security_scope(code, row.get("name") or pick.get("name"),
                                     pick.get("risk_flag"))["allowed"]:
             allowed.append(row)
-    # 候选质量是稳定复合分；排序在纯域模块里（held 排除也在那里再兜一次）。
+    return allowed
+
+
+def best_replacement_candidate(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps):
+    # 预取与决策共用资格规则；writer 内仍重新读取，不复用预取时的交易结论。
+    allowed = eligible_replacement_candidates(conn, account_id, day, held_codes, deps=deps)
     return PRep.choose_best_candidate(allowed, held_codes=held_codes)
 
 

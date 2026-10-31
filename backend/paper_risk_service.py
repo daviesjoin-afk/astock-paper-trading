@@ -210,12 +210,16 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         positions, risk_ids = _bounded_risk_scope(
             snapshot_conn, read_context, ports=ports,
         )
-        retry_placeholders = ",".join("?" for _ in ports.evidence.entry_retry_signal_statuses)
-        candidate_rows = snapshot_conn.execute(
-            f"SELECT DISTINCT code FROM paper_signals WHERE status IN ({retry_placeholders})",
-            tuple(ports.evidence.entry_retry_signal_statuses),
-        ).fetchall()
-        candidate_codes = {str(row[0]) for row in candidate_rows if row[0]}
+        held_by_account = {}
+        for position in positions:
+            held_by_account.setdefault(position["account_id"], set()).add(str(position["code"]))
+        candidate_codes = {
+            str(row["code"])
+            for account_id, held_codes in held_by_account.items()
+            for row in PREv.eligible_replacement_candidates(
+                snapshot_conn, account_id, day, held_codes, deps=ports.evidence,
+            )
+        }
     market_inputs = ports.load_market_inputs(
         day=day,
         positions=positions,
