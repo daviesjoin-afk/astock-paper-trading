@@ -560,3 +560,50 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 **修正后实测**：`from_import_private_names` = **0**（在放宽后的口径下重新测得，不是沿用
 旧口径的结论）；其余通道 6 / 65 / 80 不变；`max_file_lines` 14610 不变。预算维持 **0**，
 新增 5 项计数口径测试（绝对/相对私有导入、相对公开导入、外部模块、dunder 名）。
+
+## 2026-10-31 PR-9 第三批 + 第四批：依赖容器字段与动态名称桥
+
+### 第三批：`injected_private_fields` 65 → 0
+
+三条口径外通道里，"把私有函数塞进 `*Dependencies` 容器、消费者再 `deps._x` 调用"是
+最隐蔽的一条（`private_cross_access` 看不见它）。实测 65 个私有字段全部集中在三个容器：
+
+| 容器 | 私有字段 |
+| --- | --- |
+| `manual_orders.ManualOrderDependencies` | 30 |
+| `execution_planner.ExecutionDependencies` | 19 |
+| `dashboard_queries.DashboardDependencies` | 16 |
+
+做法：
+
+1. 容器字段改为**公开名**（`_now` → `now`、`_reserve_shared_capital` → `reserve_shared_capital` …）；
+2. 各模块的读取点同步（`deps._x` → `deps.x`、`PT._x` → `PT.x`）；
+3. 组装根不再 `globals()[field.name]`，改为
+   `_dependency_implementation(name)`：先取同名、再回退到 `_name` 私有别名，查不到立刻抛错；
+4. 新增 `backend/test_dependency_contract.py`：机械校验"三个容器没有私有字段、每个字段都能解析、
+   未知字段会大声失败、绑定后每个字段都拿得到实现"。
+
+### 第四批：`dynamic_name_bridges` 80 → 72
+
+只清"**依赖桥**"性质的站点，不碰运行时字段内省：
+
+| 站点 | 处理 |
+| --- | --- |
+| `paper_trading` 的 3 处 `globals()[field.name]` | 收敛成解析函数里的 1 处（净 −2） |
+| `main` 的 2 处 `getattr(P, "_rebuild_selection_factor_cache")` | 改为公开钩子名（该钩子当前未实现，行为仍是 `None`） |
+| `main` 的 3 处 `getattr(dfc, "_mem_cache")` | 改用 `data_fetcher.memory_cache(name)` 公开只读访问器 |
+
+**剩余 72 处的构成（不宣称已清零）**：绝大多数是**运行时字段内省**——按 `for name in FIELDS: getattr(obj, name)`
+做 dataclass/契约校验（`candidate_selection` 9、`experiment_contract` 8、`learning_evaluation` 7、
+`earnings_disclosure_facts` 4、`robustness_contract` 4 …），它们不是跨模块私有依赖，强行改写只会把
+通用校验拆成几十段重复代码；另有 1 处是组装根解析函数里的 `globals()`。这些留给"逐簇显式化"的
+后续批次，本批不假装归零。
+
+**实测**：`injected_private_fields` **65 → 0**、`dynamic_name_bridges` **80 → 72**；
+`from_import_private_names` 0、`private_cross_access` 6、`import_cycles` 0、`foundation_violations` 0 不变；
+`max_file_lines` 14610 → 14619。预算按实测收紧（0 / 72），lock 同步。
+
+**命名副作用（记录在案）**：`_assert_active_lease` / `_assert_order_execution_cycle` 的公开名不能直接去掉下划线 —
+`Mock` 会把 `assert_*` 属性当成断言方法（`'assert_active_lease' is not a valid assertion`）。因此这两个字段
+公开为 `require_active_lease` / `require_order_execution_cycle`，`paper_trading` 的转发同步改名，测试替身
+也统一走公开名。

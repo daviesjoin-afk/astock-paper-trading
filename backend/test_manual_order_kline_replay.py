@@ -171,7 +171,7 @@ class ManualOrderKlineReplayTests(_PlanHarness):
         with mock.patch.object(MO, "_completed_kline", side_effect=loader) as load, \
                 mock.patch.object(MO.DE, "sell_decision", side_effect=decision), \
                 mock.patch.object(MO, "_dependencies", return_value=replace(
-                    deps, _with_decision_snapshot=snapshot)):
+                    deps, with_decision_snapshot=snapshot)):
             MO._manual_order_plan(
                 self.conn, self.account_id, self.code, "sell", qty=100,
                 asof_day=self.day, quote=quote, all_quotes={self.code: quote},
@@ -234,7 +234,7 @@ class ManualOrderKlineFailureMatrixTests(_PlanHarness):
         with mock.patch.object(MO, "_completed_kline", return_value=frame), \
                 mock.patch.object(MO.DE, "sell_decision", side_effect=decision), \
                 mock.patch.object(MO, "_dependencies", return_value=replace(
-                    deps, _with_decision_snapshot=snapshot)):
+                    deps, with_decision_snapshot=snapshot)):
             MO._manual_order_plan(
                 self.conn, self.account_id, self.code, "sell", qty=100,
                 asof_day=self.day, quote=quote, all_quotes={self.code: quote},

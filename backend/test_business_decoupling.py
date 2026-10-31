@@ -65,7 +65,7 @@ class BusinessOwnerTests(unittest.TestCase):
         self.assertEqual(O._order_cycle_provenance_for_order(self.conn, 1).status, O.ORDER_CYCLE_PROVEN)
         self.assertEqual(O._order_cycle_provenance_for_order(self.conn, 2).status, O.ORDER_CYCLE_LEGACY_UNKNOWN)
         self.assertEqual(O._order_cycle_provenance_for_order(self.conn, 99).status, O.ORDER_CYCLE_ORDER_MISSING)
-        self.assertEqual(O._assert_order_execution_cycle(self.conn, 1, account_id="account"), 8)
+        self.assertEqual(O._require_order_execution_cycle(self.conn, 1, account_id="account"), 8)
         old = sqlite3.connect(":memory:")
         self.addCleanup(old.close)
         old.executescript("CREATE TABLE paper_orders(id INTEGER); INSERT INTO paper_orders VALUES(1);")
@@ -74,12 +74,12 @@ class BusinessOwnerTests(unittest.TestCase):
     def test_rebound_economic_account_cannot_authorize_old_order(self):
         self.conn.execute("UPDATE paper_accounts SET cycle_id=9")
         with self.assertRaises(O.OrderExecutionCycleChanged):
-            O._assert_order_execution_cycle(self.conn, 1, account_id="account")
+            O._require_order_execution_cycle(self.conn, 1, account_id="account")
 
     def test_missing_cycle_does_not_create_one(self):
         self.conn.execute("DELETE FROM paper_cycles")
         with self.assertRaises(O.OrderExecutionCycleChanged):
-            O._assert_order_execution_cycle(self.conn, 1, account_id="account")
+            O._require_order_execution_cycle(self.conn, 1, account_id="account")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM paper_cycles").fetchone()[0], 0)
 
     def test_lot_inherits_order_cycle_and_t1_blocks_same_day_consumption(self):
@@ -117,17 +117,17 @@ class BusinessOwnerTests(unittest.TestCase):
         import dashboard_queries as D
         self.assertIs(P.OrderCycleProvenanceUnknown, O.OrderCycleProvenanceUnknown)
         with mock.patch.object(P, "_record_lot", side_effect=AssertionError("engine callback")), \
-                mock.patch.object(P, "_assert_order_execution_cycle", side_effect=AssertionError("engine callback")):
+                mock.patch.object(P, "_require_order_execution_cycle", side_effect=AssertionError("engine callback")):
             deps = E._pt()
-            self.assertIs(deps._record_lot, L.record_lot)
-            self.assertIs(deps._consume_available_lots, L.consume_available_lots)
-            self.assertIs(deps._sync_positions, L.sync_positions)
-            self.assertEqual(deps._assert_order_execution_cycle(self.conn, 1, account_id="account"), 8)
-            self.assertIs(M._dependencies()._assert_order_execution_cycle, O._assert_order_execution_cycle)
-            self.assertIs(M._dependencies()._position_rows, L.position_rows)
-            self.assertIs(D._dependencies()._position_rows, L.position_rows)
+            self.assertIs(deps.record_lot, L.record_lot)
+            self.assertIs(deps.consume_available_lots, L.consume_available_lots)
+            self.assertIs(deps.sync_positions, L.sync_positions)
+            self.assertEqual(deps.require_order_execution_cycle(self.conn, 1, account_id="account"), 8)
+            self.assertIs(M._dependencies().require_order_execution_cycle, O._require_order_execution_cycle)
+            self.assertIs(M._dependencies().position_rows, L.position_rows)
+            self.assertIs(D._dependencies().position_rows, L.position_rows)
         with mock.patch.object(L, "record_lot") as owner_override:
-            self.assertIs(E._pt()._record_lot, owner_override)
+            self.assertIs(E._pt().record_lot, owner_override)
 
     def test_source_guards_follow_actual_owners_and_prohibit_transactions(self):
         for module in (O, L):
@@ -150,7 +150,7 @@ class BusinessOwnerTests(unittest.TestCase):
         facade = ast.parse((BACKEND / "paper_trading.py").read_text(encoding="utf-8"))
         for node in facade.body:
             if isinstance(node, ast.FunctionDef) and node.name in {
-                "_record_lot", "_consume_available_lots", "_sync_positions", "_assert_order_execution_cycle",
+                "_record_lot", "_consume_available_lots", "_sync_positions", "_require_order_execution_cycle",
             }:
                 self.assertFalse(any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
                                      and call.func.attr == "execute" for call in ast.walk(node)), node.name)

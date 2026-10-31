@@ -50,9 +50,9 @@ class CouplingBudgetTests(unittest.TestCase):
         "import_side_effects": 25,
         # 私有跨模块依赖的三条"口径外"通道（2026-10-29 对抗性审查 F-01/F-02）。
         # 三项都必须先归零才算真正解耦；不允许用 FEATURE_ALLOWANCE 吸收。
-        "injected_private_fields": 66,
+        "injected_private_fields": 0,
         "from_import_private_names": 0,
-        "dynamic_name_bridges": 80,
+        "dynamic_name_bridges": 72,
     }
 
     # 2026-10-28（公共层瘦身审计切片）：主引擎按业务簇下沉两个 owner ——

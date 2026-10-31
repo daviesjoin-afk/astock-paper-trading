@@ -630,7 +630,7 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
         # fence 必须出现在执行侧写入之前（源码顺序只是弱证据，权威是生产回归
         # RISK-SCAN-P4；这里挡住"把 fence 挪到写完订单之后"这种明显回归）。
         fence_at = impl.index("PRSS.assert_cycle_active(")
-        for execution_write in ("_consume_available_lots(", "finalize_sell("):
+        for execution_write in ("consume_available_lots(", "finalize_sell("):
             with self.subTest(write=execution_write):
                 if execution_write in impl:
                     self.assertLess(
@@ -1256,7 +1256,7 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                                    f"{filename}:{function} 里找不到预占调用（空门禁）")
         # planner 是唯一 commit primitive，它必须自己传订单周期。
         planner = " ".join(_source("execution_planner.py").split()).replace(" ", "")
-        index = planner.index("PT._reserve_shared_capital(")
+        index = planner.index("PT.reserve_shared_capital(")
         self.assertIn("expected_cycle_id=order_cycle_id",
                       planner[index:index + 300],
                       "execution_planner.commit_fill 没有把订单周期交给预占层")
@@ -1277,7 +1277,7 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
             ("INSERTINTOpaper_fills", "成交流水写入"),
             ("EV.stamp_order(", "执行验证盖章"),
             ("_credit_shared_cash(", "现金入账"),
-            ("_consume_available_lots(", "lot 消耗"),
+            ("consume_available_lots(", "lot 消耗"),
             ("PPRS.finalize_sell(", "episode 收尾"),
         ):
             with self.subTest(function=function, shape=label):
@@ -1341,10 +1341,10 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
     def test_guard11f_sell_commit_keeps_defense_in_depth_order(self):
         body = self._flat("commit_fill", "execution_planner.py")
         ordered = (
-            "_order_cycle_provenance_for_order(",
+            "order_cycle_provenance_for_order(",
             "_assert_order_identity(",
-            "_assert_order_execution_cycle(",
-            "_consume_available_lots(",
+            "require_order_execution_cycle(",
+            "consume_available_lots(",
         )
         positions = []
         for shape in ordered:
@@ -1433,7 +1433,7 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             ("INSERTINTOpaper_fills", "成交流水写入"),
             ("EV.stamp_order(", "执行验证盖章"),
             ("_credit_shared_cash(", "现金入账"),
-            ("_consume_available_lots(", "lot 消耗"),
+            ("consume_available_lots(", "lot 消耗"),
             ("PPRS.finalize_sell(", "episode 收尾"),
         ):
             with self.subTest(shape=label):
@@ -1499,8 +1499,8 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
         raw = _source("execution_planner.py")
         commit = _named_function_source("execution_planner.py", "commit_fill", raw)
         self.assertIn("order_strategy_stamp = _assert_order_identity(", commit)
-        self.assertIn("PT._risk_log(", commit)
-        self.assertIn("PT._audit(", commit)
+        self.assertIn("PT.risk_log(", commit)
+        self.assertIn("PT.audit(", commit)
         self.assertGreaterEqual(commit.count("strategy_stamp=order_strategy_stamp"), 2)
         identity = _named_function_source("execution_planner.py", "_assert_order_identity", raw)
         self.assertIn("strategy_id, strategy_version, strategy_checksum", identity)
