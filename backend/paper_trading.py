@@ -140,18 +140,18 @@ from paper_trading_rules import (
 from paper_candidate_lanes import (
     CONCEPT_EXPANSION_LANE_VERSION,
     SECTOR_SURGE_LANE_VERSION,  # noqa: F401 - public compatibility export
-    _concept_expansion_lane_candidates,
-    _concept_reverse_map_leaders,
-    _sector_entry_threshold_context,
-    _sector_heat_map,
-    _sector_key,
-    _sector_surge_lane_candidates,
-    _star_sector_impulse,
-    _ths_hot_lane_candidates,
+    concept_expansion_lane_candidates as _concept_expansion_lane_candidates,
+    concept_reverse_map_leaders as _concept_reverse_map_leaders,
+    sector_entry_threshold_context as _sector_entry_threshold_context,
+    sector_heat_map as _sector_heat_map,
+    sector_key as _sector_key,
+    sector_surge_lane_candidates as _sector_surge_lane_candidates,
+    star_sector_impulse as _star_sector_impulse,
+    ths_hot_lane_candidates as _ths_hot_lane_candidates,
 )
 # 新开仓价格门禁与开盘追高时段余量有独立 owner（纯规则，不读库不取数）。
 from paper_entry_price_rules import (
-    _open_runup_bonus,
+    open_runup_bonus as _open_runup_bonus,
     new_entry_price_gate as _new_entry_price_gate_impl,
 )
 
@@ -14506,8 +14506,8 @@ from paper_runtime_facts import (
     PAPER_JOB_RUN_TERMINAL_STATUSES as PAPER_JOB_RUN_TERMINAL_STATUSES,
     PaperJobRunFactProjection as PaperJobRunFactProjection,
     PaperJobRuntimeFactError as PaperJobRuntimeFactError,
-    _PAPER_JOB_INSTANT_FORMAT as _PAPER_JOB_INSTANT_FORMAT,
-    _PAPER_JOB_RUN_REQUIRED_COLUMNS as _PAPER_JOB_RUN_REQUIRED_COLUMNS,
+    PAPER_JOB_INSTANT_FORMAT as PAPER_JOB_INSTANT_FORMAT,
+    PAPER_JOB_RUN_REQUIRED_COLUMNS as PAPER_JOB_RUN_REQUIRED_COLUMNS,
     _PAPER_RUNTIME_OWNER_TZ as _PAPER_RUNTIME_OWNER_TZ,
     _PAPER_RUNTIME_OWNER_TZ_NAME as _PAPER_RUNTIME_OWNER_TZ_NAME,
     _paper_job_run_availability_kind as _paper_job_run_availability_kind,
@@ -14523,6 +14523,10 @@ from paper_runtime_facts import (
     paper_job_run_fact as paper_job_run_fact,
     paper_job_run_facts as paper_job_run_facts,
 )
+
+# 旧私有名保留为别名（PR-9）：外部仍可以旧名导入，但引擎依赖的是公开契约。
+_PAPER_JOB_INSTANT_FORMAT = PAPER_JOB_INSTANT_FORMAT
+_PAPER_JOB_RUN_REQUIRED_COLUMNS = PAPER_JOB_RUN_REQUIRED_COLUMNS
 
 
 # Bind explicit vertical capabilities after all compatibility functions exist.

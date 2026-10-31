@@ -17,7 +17,7 @@ import paper_repository as PRP
 import execution_verification as EV
 import adaptive_selection_compat as UNIT_COMPAT
 from strategy_registry import labels as strategy_labels
-from adaptive_common import _loads, _json  # C3: 收敛重复工具函数
+from adaptive_common import json_loads as _loads, json_text as _json  # C3: 收敛重复工具函数
 from adaptive_common import TZ as OWNER_TZ
 
 ACCOUNT_NAMES = strategy_labels()

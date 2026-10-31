@@ -27,7 +27,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-from adaptive_common import _now, _json, _loads  # C3: 收敛重复工具函数
+from adaptive_common import now_stamp as _now, json_text as _json, json_loads as _loads  # C3: 收敛重复工具函数
 from paper_numeric import bounded_num as _bounded_num
 from evolution_contract import BOUNDS, EVOLUTION_VERSION
 

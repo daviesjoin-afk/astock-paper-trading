@@ -617,3 +617,8 @@ def paper_job_run_facts(conn, *, as_of, limit=100):
         offset += len(rows)
     facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
     return tuple(facts[:size])
+
+
+# ── 公开契约（PR-9） ───────────────────────────────────────────────────────
+PAPER_JOB_INSTANT_FORMAT = _PAPER_JOB_INSTANT_FORMAT
+PAPER_JOB_RUN_REQUIRED_COLUMNS = _PAPER_JOB_RUN_REQUIRED_COLUMNS

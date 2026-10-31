@@ -483,3 +483,31 @@ SQL 与顺序逐字保留，三个业务常量由调用方传入（schema owner 
 - `import_cycles` 保持 **0**：`paper_ledger_bootstrap` 只 import
   `paper_schema_migrations` / `runtime_settings` / `strategy_champion`，没有任何
   模块反向 import 它。
+
+## 2026-10-31 PR-9 第一批：共享工具与候选车道的私有导入收敛
+
+**问题**：`from_import_private_names`（`from x import _y` 这条能拿到 owner 内部实现、
+却完全绕开静态守卫的通道）实测 63 处，其中 29 处集中在 `adaptive_common._now/_json/
+_loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_trading` 从
+`paper_candidate_lanes`（8）、`paper_entry_price_rules`（1）、`paper_runtime_facts`（2）
+导入私有名——owner 改内部名就会打断所有消费者。
+
+**做法**（先立契约，再迁调用点，旧入口保留薄转发）：
+
+| owner | 公开契约 | 旧私有名 |
+| --- | --- | --- |
+| `adaptive_common` | `now_stamp` / `json_text` / `json_loads` / `clamp_number` | `_now` / `_json` / `_loads` / `_clamp` 保留为模块级别名 |
+| `paper_candidate_lanes` | `concept_expansion_lane_candidates` 等 8 个车道入口 | 原私有函数不变，公开名是别名 |
+| `paper_entry_price_rules` | `open_runup_bonus` | 原 `_open_runup_bonus` 不变 |
+| `paper_runtime_facts` | `PAPER_JOB_INSTANT_FORMAT` / `PAPER_JOB_RUN_REQUIRED_COLUMNS` | 原私有常量不变 |
+
+消费者改为 `from owner import public_name as _old_local`：调用点零改动，但跨模块依赖
+落在**公开名**上。没有新增模块、没有 Manager/Facade、没有缓存。
+
+**实测**：`from_import_private_names` **63 → 23**（剩余 23 处是真正的 owner 内部实现，
+需要逐个设计契约，留给后续批次）；`private_cross_access` 6、`injected_private_fields` 65、
+`dynamic_name_bridges` 80、`import_cycles` 0、`foundation_violations` 0 均**不变**
+（没有用放宽任何额度换这次下降）。`max_file_lines` 14596（+22，公开别名块与注释）。
+
+按"迁移完成后再收紧预算"的原则，本批**已把 `from_import_private_names` 收紧到实测 23**
+（lock 文件同步），后续批次继续按实测下调。

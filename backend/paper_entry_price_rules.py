@@ -189,3 +189,7 @@ def _new_entry_price_gate(account_id, pick, quote=None, *, spec=None,
     if pct > ceiling:
         return False, f"涨幅 {pct:+.2f}% 超出{entry_name}当日新开仓区间，转入观察"
     return True, None
+
+
+# ── 公开契约（PR-9） ───────────────────────────────────────────────────────
+open_runup_bonus = _open_runup_bonus

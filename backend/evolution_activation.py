@@ -36,7 +36,7 @@ import json
 import sqlite3
 from typing import Any, Optional
 
-from adaptive_common import _json, _loads, _now
+from adaptive_common import json_text as _json, json_loads as _loads, now_stamp as _now
 import evolution_contract as EC
 
 # ─── scope ───

@@ -49,7 +49,7 @@ class CouplingBudgetTests(unittest.TestCase):
         # 私有跨模块依赖的三条"口径外"通道（2026-10-29 对抗性审查 F-01/F-02）。
         # 三项都必须先归零才算真正解耦；不允许用 FEATURE_ALLOWANCE 吸收。
         "injected_private_fields": 66,
-        "from_import_private_names": 63,
+        "from_import_private_names": 23,
         "dynamic_name_bridges": 80,
     }
 

@@ -4357,3 +4357,27 @@ verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailabl
 新参数）。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-9 依赖桥按 owner 簇收敛（2026-10-31 第一批）
+
+目标：消除 `paper_trading` 的 globals、动态名称与私有字段桥接。第一批只处理**私有导入**
+这条通道（`from x import _y`），因为它是"能拿到 owner 内部实现、却完全绕开静态守卫"的三条
+口径外通道之一。
+
+- `adaptive_common` 把 `_now/_json/_loads/_clamp` 升级为公开契约
+  `now_stamp/json_text/json_loads/clamp_number`，旧私有名保留为模块级别名；12 个
+  adaptive/evolution 模块改为 `from adaptive_common import json_text as _json, ...`——
+  调用点不动，依赖落到公开名。
+- `paper_candidate_lanes`（8 个车道入口）、`paper_entry_price_rules.open_runup_bonus`、
+  `paper_runtime_facts` 的两个常量同样先立公开名，`paper_trading` 改为依赖公开名并保留
+  本地别名/旧名再导出。
+
+**量化**：`from_import_private_names` 63 → **23**；其余通道（`private_cross_access` 6、
+`injected_private_fields` 65、`dynamic_name_bridges` 80）与 `import_cycles` 0 /
+`foundation_violations` 0 均不变；预算按实测**收紧**到 23，未放宽任何额度。
+
+**后续批次**（本 PR 不承诺）：剩余 23 处私有导入需逐个设计契约（多数是 owner 内部实现，
+要先判断它是否值得成为公开 API）；`injected_private_fields` 与 `dynamic_name_bridges`
+需要按 9 个职责簇逐个迁到显式依赖。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
