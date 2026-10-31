@@ -130,7 +130,7 @@ jobs:
           cmp --silent requirements.lock /tmp/requirements.lock
 
       - name: Lint backend and acceptance probes
-        run: ruff check backend scripts/pr298_ledger_probe.py scripts/pr298_timing_probe.py scripts/pr299_refresh_probe.py scripts/pr4_risk_kline_probe.py
+        run: ruff check backend scripts/pr298_ledger_probe.py scripts/pr298_timing_probe.py scripts/pr299_refresh_probe.py scripts/pr4_risk_kline_probe.py scripts/pr6_bootstrap_probe.py scripts/pr6_ledger_compare.py
 
       - name: Audit locked dependencies
         run: pip-audit --requirement requirements.lock --strict --progress-spinner off

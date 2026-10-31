@@ -439,3 +439,36 @@ SQL 与顺序逐字保留，三个业务常量由调用方传入（schema owner 
 **依赖没有消失**：消费者仍调 `PT.init_db()`，因为它还剩业务引导（账户/周期/启动恢复/
 对账）。要摘掉这条依赖，得先把 `_ensure_accounts`/`_ensure_cycle` 归位到
 `paper_user_account_provisioning`/`paper_cycle_service`——那是下一批。
+
+## 2026-10-31 PR-6：schema bootstrap 与运行期恢复分家
+
+`init_db` 以前只有一个"升级链"，把**结构**（建表/加列/索引/触发器）和**业务恢复**
+（账户、周期、过期租约回收、signal/订单对账）混在一条无条件的调用序列里，于是每次
+启动都要重跑整套 DDL，而进程级布尔量 `_PERFORMANCE_INDEXES_READY` 又会把"上一个库
+已经建好索引"的结论错误地套到另一个 `DB_PATH` 上。
+
+本轮把结构部分搬进新 owner `paper_ledger_bootstrap`：
+
+- `paper_ledger_bootstrap.ensure_ledger_structure` —— 结构链（顺序与原
+  `_upgrade_ledger` 逐字一致），不写任何业务行；
+- `paper_ledger_bootstrap.bootstrap_schema` —— 决策"要不要重建"：读库里的
+  `ledger_schema_receipt` + 现场重算的结构摘要 + 结构 owner 源码指纹，三者一致才
+  走低成本路径；**仍然**做必需表/列校验，所以"版本相同"掩盖不了结构损坏；
+- `paper_trading._recover_ledger_runtime` —— 业务引导与合法恢复，每次 `init_db`
+  都跑，结构 ready 也不跳过。
+
+指标口径：
+
+- `cross_domain_edges` **8 → 10**。新 owner 在 paper 域，显式声明了两条**本来就在**
+  的依赖边（→`runtime_settings` other 域、→`strategy_champion` strategy 域）。
+  依赖没有新增，只是从"主引擎里隐式组装"改成"owner 自己的显式声明"。这是本指标
+  一贯的记账方式（见 2026-10-27「手单能力桥」与 A1 phase 2 两次 +边）。
+- `max_file_lines`、`duplicate_helpers`、`dynamic_name_bridges` 均**未放宽**：
+  静态初始化链从主引擎搬走后 `paper_trading.py` 14,578 → 14,582（+4，调用点与
+  注释），`duplicate_helpers` 保持 296（三个 `ensure_structure` 已按 owner 改名为
+  `ensure_settings_structure` / `ensure_registry_structure` /
+  `ensure_lifecycle_structure`，不靠额度吸收同名），`dynamic_name_bridges` 保持 80
+  （源码指纹用 `importlib.util.find_spec`，不再用 `getattr(module, "__file__")`）。
+- `import_cycles` 保持 **0**：`paper_ledger_bootstrap` 只 import
+  `paper_schema_migrations` / `runtime_settings` / `strategy_champion`，没有任何
+  模块反向 import 它。

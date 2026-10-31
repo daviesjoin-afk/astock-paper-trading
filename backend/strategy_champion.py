@@ -7,6 +7,8 @@ writes the formal active parameter head. Promotion is the only head switch.
 """
 from __future__ import annotations
 
+import paper_storage as PST
+
 import datetime as dt
 import hashlib
 import json
@@ -59,7 +61,7 @@ def _checksum(value: Any) -> str:
 
 def ensure_schema(conn) -> None:
     """Create idempotent metadata and shadow-only ledger tables."""
-    conn.executescript(
+    PST.execute_script(conn,
         """
         CREATE TABLE IF NOT EXISTS strategy_champion_versions(
             id INTEGER PRIMARY KEY AUTOINCREMENT,

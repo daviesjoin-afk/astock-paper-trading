@@ -4254,3 +4254,75 @@ fresh bootstrap 也创建该表。
 provenance、legacy/adaptive 参数选择、shadow learning evaluation）。
 
 阶段状态：R36-C **IN REVIEW**；R36-D/R37 **NOT STARTED**。
+
+## PR-6 账本 schema bootstrap 与运行期恢复分层（2026-10-31）
+
+**问题**：`init_db()` 只有一条无条件升级链，把**结构**（建表/加列/索引/触发器）与
+**业务恢复**（账户、周期、过期租约回收、signal/订单对账）混在一起。结果是每次启动都
+重跑整套 DDL；`_ensure_accounts` 每次无条件读基准 K 线；`_PERFORMANCE_INDEXES_READY`
+用进程级布尔记住"索引已建好"——它分不清两个数据库文件，第二个 `DB_PATH` 会继承第一个
+的结论而**没有索引**；`init_db` 还把探测异常 `except Exception: pass` 吞掉，半升级的
+账本可以继续交易。另外 `executescript` 会**隐式提交**调用方的事务，所谓"外层事务"并不
+覆盖整条链。
+
+**分层**（一条连接、一个 `BEGIN IMMEDIATE`、一次 `init_db`）：
+
+| 层 | owner | 职责 | 频率 |
+| --- | --- | --- | --- |
+| Schema bootstrap | `paper_ledger_bootstrap`（新）+ `paper_schema_migrations`（结构/收据原语） | 建表、加列、索引、触发器；结构摘要比对；必需表/列校验；写校验收据 | 结构未命中时 |
+| Runtime recovery | `paper_trading._recover_ledger_runtime` + 既有业务 owner | 账户配置、周期挂接、策略 seed、过期租约回收、signal/订单对账 | **每次** |
+
+`PST.schema_ready_scope(conn)` 让 `RSET/SR/SL` 的 `ensure_schema` 在一次已校验的初始化里
+跳过重复 DDL，作用域是"这一条连接 + 这一个 `with`"，不写库、无进程缓存；业务 seed 与
+恢复步骤**不**在跳过范围内。
+
+**持久收据**：`ledger_schema_receipt`（单行）。身份 = `contract_version` +
+结构 owner 源码指纹 + 现场重算的 `structure_fingerprint`（全部非 `sqlite_%` 对象的
+name+DDL 原文）。命中才走低成本路径，且**仍然**做必需表/列校验——"版本相同"掩盖不了
+缺表/缺列/表被重建。收据在 `init_db` 末尾、与 DDL 和业务恢复同一个事务写入，写入的是
+恢复之后的结构摘要；事务回滚就没有收据，下一次启动重跑完整链。收据表与
+`db_migrate.schema_version` **没有**交集：不写版本号、不改版本语义、不构成第二套迁移
+注册表。
+
+**兼容性**：`init_db()` 公开契约、新库初始化结果、旧库迁移结果、账户/周期初始化语义、
+手动订单恢复、风险扫描状态恢复、snapshot worker 与 API 初始化入口全部保持；策略、
+风险阈值、委托成交算法、行情核验政策未改。
+
+**WAL 收尾**：`PRAGMA wal_checkpoint(TRUNCATE)` 只在 fresh/cold（真正建过/升过结构）
+且事务提交、连接关闭之后执行；verified 路径与 master 的快路径一样**不**发起 checkpoint。
+`paper_storage.wal_checkpoint` 与 retention 等独立维护路径不变。
+
+**指纹 fail closed**：任一必需 owner 的源码取不到时，`schema_owner_fingerprint()` 抛
+`LedgerSchemaBootstrapError`（带 owner 名、路径与原因），不返回哨兵、不写收据、不进
+verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailable:` 值一律判无效。
+
+**返回值契约**：`init_db()` 正常返回 `None`（与拆分前一致）；`cold`/`verified` 只是
+`paper_ledger_bootstrap.bootstrap_schema()` 的内部编排结果，不构成进程级 ready 状态。
+
+**量化（同机，详见 `docs/LEDGER_BOOTSTRAP_LIFECYCLE.md`）**：日常启动 16.28 → 8.18 ms
+（P50），空库首次 91.81 → 64.15 ms，有持续只读事务时 12.04 → 6.91 ms；单次 SQL
+516 → 194，DDL 204 → **0**，schema 检查 133 → 38，基准 K 线读取 1 → **0**；
+`wal_checkpoint` 次数 fresh/cold/verified = 1/1/0（与 master 一致）；旧库首次升级
+一次性 +0～1 ms。固定输入账本对照 63 张表逐字段严格相等，结构一致，仅多出收据表。
+离线数字**不**代表生产耗时。
+
+**journal_mode 重试预算**（R4）：`paper_storage.JOURNAL_MODE_MAX_ATTEMPTS` 是唯一定义点
+（cold 6 次 / hot 3 次），`apply_journal_mode(conn, hot_path=…)` 只对
+`is_sqlite_busy_error()` 重试。冷路径最坏累计 2.6–3.5 s（保证两进程同时首次初始化不直接失败），
+热路径 ≤0.12 s（留在 1 s 连接超时预算内）；`db()` 透传 `hot_path`，连接超时、
+`busy_timeout`、隔离与 fencing 语义不变。
+
+**DDL 归属**（R5）：`paper_trading` 现在**零 DDL**，`idx_paper_orders_signal_retry` 的定义
+下沉到 `paper_schema_migrations.ensure_signal_retry_unique_index()`。结构 owner 与 DDL 的
+对应关系：`paper_schema_migrations`（48 表 / 50 索引 / 34 触发器 / 10 ALTER）、
+`runtime_settings`（2/1/0/2）、`strategy_registry`（7/2/5/1）、`strategy_lifecycle`（2/1/2/0）、
+`strategy_champion`（7/3/2/2）；`paper_ledger_bootstrap` 与 `paper_storage` 只做编排与连接。
+前五个 owner 全部参与 `schema_owner_fingerprint`，改谓词即失效收据。
+
+**回归门禁**：`backend/test_ledger_bootstrap_lifecycle.py`（32 项：新库/重复初始化/缺表缺列/中断恢复/双进程/只读并发/有效与过期租约/对账/
+换 DB_PATH/失败 fail closed/成交事实不变、checkpoint 范围、源码指纹 fail closed、
+`init_db()` 返回值契约、执行重试索引的 DDL 归属与顺序），以及
+`test_paper_storage.py` 的 journal_mode 热/冷重试预算（7 项）、`test_architecture_boundary_audit`（`cross_domain_edges` 8 → 10，切片见
+`docs/COUPLING_BUDGET.md`）、`test_schema_ownership`、`test_db_migrate`。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

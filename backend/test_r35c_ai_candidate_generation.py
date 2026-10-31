@@ -134,6 +134,11 @@ class _Base(unittest.TestCase):
             metadata={"constraints": {"max_positions": 5}}, actor="test")
         self.parent_version = created.current_version
         self.parent_checksum = created.current_checksum
+        # PR-6：schema owner 不再用 ``executescript``（它会**隐式提交**调用方打开的
+        # 事务），所以这里必须自己提交。以前这一行可以省，是因为 ``ensure_schema``
+        # 的 ``executescript`` 顺手把 setUp 打开的 ``BEGIN`` 提交掉了 —— 测试其实一直
+        # 依赖一个"谁都没声明"的副作用。
+        conn.commit()
         conn.close()
         self.calls = []
         self._transport = _FakeTransport(calls=self.calls)

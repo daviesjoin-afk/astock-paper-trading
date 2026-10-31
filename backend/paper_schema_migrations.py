@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import paper_storage as PST
+
 import sqlite3
 
 
@@ -2361,7 +2363,7 @@ CORE_TABLES_DDL = r'''
 
 def ensure_core_tables(conn):
     """创建核心账本表（幂等）。只建表，不做迁移与业务对账。"""
-    conn.executescript(CORE_TABLES_DDL)
+    PST.execute_script(conn, CORE_TABLES_DDL)
 
 def ensure_current(
     conn,
@@ -2375,12 +2377,33 @@ def ensure_current(
     从 ``paper_trading.init_db`` 下沉：只依赖本模块自己的 schema 函数与调用方传入的
     三个业务常量，不含交易规则。三条 UPDATE 修补的是旧库遗留的行状态。
     """
-    now_fn = now
-    retry_statuses = tuple(entry_retry_order_statuses)
-    frozen_status = entry_frozen_waitlist_status
     ensure_core_tables(conn)
     ensure_paper_columns(conn)
     ensure_execution_verification_columns(conn)
+    repair_legacy_ledger_rows(
+        conn,
+        now=now,
+        entry_retry_order_statuses=entry_retry_order_statuses,
+        entry_frozen_waitlist_status=entry_frozen_waitlist_status,
+    )
+
+
+def repair_legacy_ledger_rows(
+    conn,
+    *,
+    now,
+    entry_retry_order_statuses,
+    entry_frozen_waitlist_status,
+):
+    """新库一次性历史行修补（幂等，不改写成交事实）。
+
+    从 ``ensure_current`` 拆出：结构 bootstrap 与行修补是两个职责，调用方可以
+    在建表之后单独执行本步，而不必重跑整套 DDL。三条 UPDATE 只处理旧库遗留的
+    行状态（lot 成本、资金预留、等待池标记），不触碰成交金额、成交价或归属。
+    """
+    now_fn = now
+    retry_statuses = tuple(entry_retry_order_statuses)
+    frozen_status = entry_frozen_waitlist_status
     conn.execute(
         """UPDATE paper_position_lots
            SET cost=cost+COALESCE((SELECT fees / NULLIF(qty,0) FROM paper_orders o WHERE o.id=paper_position_lots.source_order_id),0),
@@ -2456,3 +2479,309 @@ def ensure_feature_tables(conn):
     ensure_portfolio_order_read_index(conn)
     ensure_ai_decision_audits(conn)
     ensure_dashboard_refresh_jobs(conn)
+
+
+# ── 账本结构 bootstrap 收据（PR-6） ─────────────────────────────────────────
+#
+# 职责边界：本段只回答"结构是否已经按当前代码建好 / 升好"。它不写账户、周期、
+# 订单、租约、任何业务行 —— 业务恢复每次 ``init_db`` 都要跑，不归这里。
+#
+# 收据只允许跳过**重复 DDL**，不允许跳过校验：
+#   * 每次进低成本路径都重算 ``structure_fingerprint`` 并与收据比对，缺表、
+#     缺列、表被重建都会失配并触发完整 bootstrap，"版本相同"掩盖不了损坏；
+#   * 结构 owner 的源码指纹也进收据身份，代码新增表/列会自动让旧收据失效；
+#   * 收据与摘要由调用方在同一事务里写入：迁移中断就没有收据，下一次启动
+#     重跑完整链，绝不会把半成品标成"已完成升级"；
+#   * 本模块不做任何进程级缓存，收据跟着数据库文件走，换 DB_PATH 天然隔离。
+
+import hashlib
+import importlib.util
+import os
+
+#: 收据形状变更时 +1；表/列契约变更由 owner 源码指纹自动覆盖，不需要手工 bump。
+BOOTSTRAP_CONTRACT_VERSION = 1
+BOOTSTRAP_RECEIPT_TABLE = "ledger_schema_receipt"
+
+BOOTSTRAP_OWNER_MODULES = (
+    "paper_schema_migrations",
+    "paper_storage",
+    "paper_ledger_bootstrap",
+    "runtime_settings",
+    "strategy_registry",
+    "strategy_lifecycle",
+    "strategy_champion",
+)
+
+#: 每次初始化都必须存在的表。任何一张缺失都视为结构损坏，fail closed。
+REQUIRED_TABLES = (
+    "paper_accounts",
+    "paper_signals",
+    "paper_orders",
+    "paper_orders_archive",
+    "paper_signals_archive",
+    "paper_positions",
+    "paper_position_lots",
+    "paper_fills",
+    "paper_nav",
+    "paper_audit",
+    "paper_cycles",
+    "paper_jobs",
+    "paper_job_runs",
+    "paper_runtime_locks",
+    "paper_parameter_versions",
+    "paper_capital_reservations",
+    "paper_risk_decisions",
+    "paper_risk_scan_runs",
+    "paper_position_risk_state",
+    "paper_runtime_settings",
+    "paper_ignition_shadow",
+)
+
+#: 由增量迁移补上的关键列（新库建表 + 旧库 ALTER 都必须得到）。只在结构校验
+#: 这一步查，不参与日常读路径。
+REQUIRED_COLUMNS = {
+    "paper_orders": (
+        "cycle_id", "realized_pnl", "retry_of_order_id", "execution_verified",
+        "execution_status", "origin", "filled_qty",
+    ),
+    "paper_orders_archive": ("cycle_id", "execution_verified"),
+    "paper_signals": ("cycle_id",),
+    "paper_accounts": ("cycle_id", "params"),
+    "paper_jobs": ("owner_key", "heartbeat_at", "expires_at", "fencing_token"),
+    "paper_job_runs": ("owner_key", "expires_at", "fencing_token"),
+    "paper_runtime_locks": ("heartbeat_at", "fencing_token"),
+    "paper_nav": ("quote_status",),
+}
+
+
+class LedgerSchemaBootstrapError(RuntimeError):
+    """结构 bootstrap 未完成或校验失败：调用方必须放弃本次初始化。"""
+
+
+def table_exists(conn, table_name):
+    """表是否已存在（只读 sqlite_schema，不取任何业务锁）。"""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (table_name,)
+    ).fetchone()
+    return row is not None
+
+
+def structure_fingerprint(conn):
+    """当前数据库结构摘要：表/索引/触发器/视图的 name + 定义原文。
+
+    ``sqlite_%`` 是 SQLite 自维护对象（``sqlite_sequence`` / 自增索引），
+    不属于任何 owner 的 DDL，排除后摘要才能跨版本稳定。
+    """
+    digest = hashlib.sha256()
+    rows = conn.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema"
+        " WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ).fetchall()
+    for row in rows:
+        digest.update("\x1f".join("" if part is None else str(part) for part in row).encode("utf-8"))
+        digest.update(b"\x1e")
+    return digest.hexdigest()
+
+
+def schema_owner_fingerprint():
+    """结构 owner 源码指纹（只描述代码，不描述任何数据库是否 ready）。
+
+    **任一必需 owner 的源码不可用时抛 :class:`LedgerSchemaBootstrapError`**，
+    而不是返回一个哨兵值：哨兵既不能证明收据仍对应当前代码，还会被写进收据，
+    下次启动再拿两个同样的哨兵互相印证，把整条校验绕过去。取不到源码就 fail
+    closed，错误里保留是哪个 owner、哪条路径、什么原因。
+
+    这里不做任何缓存 —— 指纹只描述代码，与 ``DB_PATH`` 无关，而"这个库是否
+    ready"永远只由库里的结构摘要决定。
+    """
+    digest = hashlib.sha256()
+    reasons = []
+    for name in BOOTSTRAP_OWNER_MODULES:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError) as exc:
+            reasons.append(f"{name}: 无法定位模块 ({type(exc).__name__}: {exc})")
+            continue
+        path = spec.origin if spec is not None else None
+        if not path:
+            reasons.append(f"{name}: 模块没有源码路径")
+            continue
+        if not os.path.isfile(path):
+            reasons.append(f"{name}: 源码路径不是可读文件 -> {path}")
+            continue
+        try:
+            with open(path, "rb") as handle:
+                source = handle.read()
+        except OSError as exc:
+            reasons.append(f"{name}: 读取源码失败 ({type(exc).__name__}: {exc}) -> {path}")
+            continue
+        digest.update(source)
+        digest.update(b"\x1e")
+    if reasons:
+        raise LedgerSchemaBootstrapError(
+            "结构 owner 源码指纹不可用，拒绝确认 schema 已升级：" + "；".join(reasons)
+        )
+    return digest.hexdigest()
+
+
+def is_valid_owner_fingerprint(value):
+    """收据里的 owner 指纹必须是 64 位小写十六进制 sha256。
+
+    历史版本可能写入过 ``unavailable:<module>`` 这类哨兵；它既不是指纹，也不
+    应该参与"相等即命中"的比较，因此在这里被一律判为无效（→ 重新 bootstrap）。
+    """
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value)
+
+
+def ensure_bootstrap_receipt_table(conn):
+    """建收据表（幂等）。它是结构的一部分，本身也进入结构摘要。"""
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS {BOOTSTRAP_RECEIPT_TABLE}(
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            contract_version INTEGER NOT NULL,
+            owner_fingerprint TEXT NOT NULL,
+            structure_fingerprint TEXT NOT NULL,
+            verified_at TEXT NOT NULL
+        )"""
+    )
+
+
+def read_bootstrap_receipt(conn):
+    """读取收据；表不存在或没有行时返回 ``None``（不是"损坏"）。"""
+    if not table_exists(conn, BOOTSTRAP_RECEIPT_TABLE):
+        return None
+    row = conn.execute(
+        f"SELECT contract_version,owner_fingerprint,structure_fingerprint,verified_at"
+        f" FROM {BOOTSTRAP_RECEIPT_TABLE} WHERE id=1"
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "contract_version": int(row[0]),
+        "owner_fingerprint": str(row[1]),
+        "structure_fingerprint": str(row[2]),
+        "verified_at": row[3],
+    }
+
+
+def write_bootstrap_receipt(conn, *, now, fingerprint, owner_fingerprint=None):
+    """写入"本次事务里已校验通过"的收据。
+
+    必须与 DDL、校验在同一个事务里执行；调用方负责提交/回滚。迁移中断时
+    事务回滚，收据随之消失，下一次启动自然重跑完整链。
+    """
+    ensure_bootstrap_receipt_table(conn)
+    conn.execute(
+        f"INSERT OR REPLACE INTO {BOOTSTRAP_RECEIPT_TABLE}"
+        f"(id,contract_version,owner_fingerprint,structure_fingerprint,verified_at)"
+        f" VALUES(1,?,?,?,?)",
+        (
+            BOOTSTRAP_CONTRACT_VERSION,
+            owner_fingerprint if owner_fingerprint is not None else schema_owner_fingerprint(),
+            fingerprint,
+            now,
+        ),
+    )
+
+
+def verify_required_structure(conn):
+    """必需表/列校验；缺失即抛错（调用方不得继续交易初始化）。
+
+    表名一次查询取全（而不是每张表一次 ``sqlite_schema`` 探测）：这是低成本
+    路径每次都会跑的校验，不能自己变成新的启动开销。
+    """
+    present = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_schema WHERE type='table'").fetchall()
+    }
+    missing = [name for name in REQUIRED_TABLES if name not in present]
+    if missing:
+        raise LedgerSchemaBootstrapError(
+            "账本结构 bootstrap 未完成：缺少表 " + ",".join(sorted(missing))
+        )
+    missing_columns = {}
+    for table, columns in REQUIRED_COLUMNS.items():
+        present_columns = table_columns(conn, table)
+        absent = [column for column in columns if column not in present_columns]
+        if absent:
+            missing_columns[table] = absent
+    if missing_columns:
+        detail = ";".join(f"{table}:{','.join(cols)}" for table, cols in sorted(missing_columns.items()))
+        raise LedgerSchemaBootstrapError("账本结构 bootstrap 未完成：缺少列 " + detail)
+
+
+def ensure_performance_indexes(conn):
+    """读路径索引（幂等）。不改变选股、风控、定量与订单语义。
+
+    以前由 ``paper_trading`` 用进程级布尔量"只跑一次"，那个缓存既跨数据库
+    复用结果，也会在新库上被上一次的结论骗过去。现在索引 DDL 属于结构
+    bootstrap，只在结构需要建/修时执行；进程内不再保留 ready 状态。
+    """
+    PST.execute_script(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS idx_paper_lots_account_code_remaining
+            ON paper_position_lots(cycle_id, account_id, code, remaining_qty, available_date);
+        CREATE INDEX IF NOT EXISTS idx_paper_orders_account_code_status
+            ON paper_orders(account_id, code, status, side, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_paper_fills_order_account_side
+            ON paper_fills(order_id, account_id, side, code);
+        CREATE INDEX IF NOT EXISTS idx_paper_signals_replacement
+            ON paper_signals(account_id, intended_date, status, signal_date);
+        CREATE INDEX IF NOT EXISTS idx_paper_audit_event_recent
+            ON paper_audit(event, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_latest
+            ON paper_risk_decisions(account_id, code, created_at DESC, id DESC);
+        """,
+    )
+
+
+# ── 执行重试的唯一性索引（R5：DDL 归结构 owner） ────────────────────────────
+#
+# 这条索引以前内联在 ``paper_trading._reconcile_signal_order_states`` 里，而
+# ``paper_trading`` 不参与 ``schema_owner_fingerprint``：谓词改了、收据却不失效，
+# 结构契约就会与代码脱节。DDL 定义搬到这里之后，任何改动都会让 owner 源码指纹
+# 变化，从而强制一次完整 bootstrap。
+
+SIGNAL_RETRY_UNIQUE_INDEX = "idx_paper_orders_signal_retry"
+
+#: 三种**互不相同**的结果。以前用 bool 表示，把"已经保证了唯一性"和"这一轮没能保证、
+#: 留待下一轮"压成同一个 ``False``，调用方一旦按"没有 → 建一下"去理解就会重复发 DDL，
+#: 或者更糟：把"没保证"当成"不归我管"。两个没有新建的分支必须分开表述。
+SIGNAL_RETRY_INDEX_PRESENT = "present"   # 索引已在，唯一性由结构保证，本次未发 DDL
+SIGNAL_RETRY_INDEX_CREATED = "created"   # 本次创建成功，唯一性从这一轮开始生效
+SIGNAL_RETRY_INDEX_BLOCKED = "blocked"   # 残余重复行，本轮建不上；唯一性**尚未**生效
+
+
+def ensure_signal_retry_unique_index(conn):
+    """保证「同一 signal 只允许一条活动 execution_retry」的偏唯一索引存在。
+
+    名称、唯一性、过滤谓词与原先内联的定义**逐字一致**。调用顺序是契约的一部分：
+    调用方必须**先**完成重复 retry 的行清理（同一 signal 只保留最新一条），否则
+    历史重复行会让唯一索引建不上。
+
+    返回三态（不要压成 bool）：
+
+    * :data:`SIGNAL_RETRY_INDEX_PRESENT` —— 索引已存在，本轮没有也**不需要**发 DDL；
+    * :data:`SIGNAL_RETRY_INDEX_CREATED` —— 本轮真的创建了索引；
+    * :data:`SIGNAL_RETRY_INDEX_BLOCKED` —— 清理后仍有重复行（例如另一个写者在本轮
+      清理与建索引之间插入、或旧库的遗留状态），本轮建不上。此时**唯一性尚未生效**，
+      但调用方**不得**因此阻断健康账本：按既有约定留到下一次初始化重试。
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?",
+        (SIGNAL_RETRY_UNIQUE_INDEX,),
+    ).fetchone():
+        return SIGNAL_RETRY_INDEX_PRESENT
+    try:
+        conn.execute(
+            f"""CREATE UNIQUE INDEX IF NOT EXISTS {SIGNAL_RETRY_UNIQUE_INDEX}
+                ON paper_orders(signal_id)
+                WHERE side='buy' AND signal_id IS NOT NULL
+                  AND status='execution_retry'"""
+        )
+    except sqlite3.IntegrityError:
+        return SIGNAL_RETRY_INDEX_BLOCKED
+    return SIGNAL_RETRY_INDEX_CREATED

@@ -352,7 +352,8 @@ class SlotLedgerTimingTests(unittest.TestCase):
         directory = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.stack.enter_context(mock.patch.object(paper, "DB_PATH", str(Path(directory) / "paper.db")))
         self.stack.enter_context(mock.patch.object(paper, "_RUNNER_BOOT_RECOVERED", False))
-        self.stack.enter_context(mock.patch.object(paper, "_PERFORMANCE_INDEXES_READY", False))
+        # PR-6：进程级 "索引已建好" 布尔量已删除（它无法区分不同 DB_PATH），
+        # 这里不再需要重置它。
         self.stack.enter_context(mock.patch.object(paper.PSS, "run_preflight", return_value={}))
         self.output = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 

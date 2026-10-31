@@ -1,0 +1,902 @@
+# -*- coding: utf-8 -*-
+"""PR-6 专项：账本结构 bootstrap 与运行期恢复的职责边界。
+
+覆盖三件事，全部驱动**真实** ``paper_trading.init_db``：
+
+1. 结构 bootstrap：新库建表、旧库升级、缺失表/列修复、失败回滚、中断可恢复；
+2. 运行期恢复：结构已 ready 也照跑（有效租约不动、过期租约回收、signal 与订单
+   对账），不会因为"结构完成了"而跳过业务恢复；
+3. 并发与隔离：两个进程同时初始化、API 只读与 worker 初始化并发、切换
+   ``DB_PATH`` 不继承上一个库的初始化结论、失败时 fail closed。
+
+所有断言都落在**行为**上（表/列是否存在、业务行是否被改、收据是否写入），
+不依赖私有实现细节。
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import types
+import unittest
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from unittest import mock
+
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+import paper_ledger_bootstrap as PLB  # noqa: E402
+import paper_schema_migrations as PSM  # noqa: E402
+import paper_storage as PST  # noqa: E402
+import paper_trading as PT  # noqa: E402
+
+ACCOUNT_ID = "trend_pullback"
+CODE = "600001"
+
+
+def _stamp(now):
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class LedgerBootstrapFixture(unittest.TestCase):
+    """公共夹具：每个用例一块独立 SQLite 文件；不碰 checkout 里的真实账本。
+
+    只放 setUp 与辅助方法 —— 专项场景由下面的子类各自声明，避免同一批用例被
+    重复执行。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="astock-pr6-")
+        self.old_db_path = PT.DB_PATH
+        PT.DB_PATH = os.path.join(self.tmp, "paper.sqlite3")
+        self.addCleanup(setattr, PT, "DB_PATH", self.old_db_path)
+        # 初始化不该为了基准价去读（或拉取）CSV/行情：用例只测结构与恢复边界。
+        benchmark = mock.patch.object(PT, "_benchmark_close", return_value=None)
+        benchmark.start()
+        self.addCleanup(benchmark.stop)
+
+    # ---------- 基础工具 ----------
+
+    def _init(self):
+        """跑一次 init_db，并单独拿它的公开返回值做契约断言。"""
+        result = PT.init_db()
+        self.assertIsNone(result, "init_db() 的公开契约是返回 None")
+        return result
+
+    def _init_path(self):
+        """跑一次 init_db，并从 schema bootstrap owner 的编排结果里读路径。
+
+        ``init_db()`` 本身只返回 ``None``（拆分前的公开契约），所以 cold/verified
+        只能从 owner 的返回值或真实结构状态观察，不能依赖公开返回值。
+        """
+        captured = {}
+        real = PLB.bootstrap_schema
+
+        def spy(conn, *, fresh):
+            outcome = real(conn, fresh=fresh)
+            captured["path"] = outcome["path"]
+            return outcome
+
+        with mock.patch.object(PLB, "bootstrap_schema", side_effect=spy):
+            self._init()
+        return captured["path"]
+
+    def _db(self):
+        return PT._db(immediate=True)
+
+    def _table_names(self):
+        with PT._db() as conn:
+            return {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_schema WHERE type='table'"
+                ).fetchall()
+            }
+
+    def _columns(self, table):
+        with PT._db() as conn:
+            return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    def _receipt(self):
+        with PT._db() as conn:
+            return PSM.read_bootstrap_receipt(conn)
+
+    def _account_cycle(self):
+        with PT._db() as conn:
+            row = conn.execute(
+                "SELECT id,cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()
+            return dict(row)
+
+    def _insert_verified_fill(self):
+        """一笔"有流水证据"的已验证成交；作为"不得被初始化改写"的事实。"""
+        with self._db() as conn:
+            cycle_id = conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0]
+            stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+            now = _stamp(datetime.now())
+            order_id = conn.execute(
+                """INSERT INTO paper_orders(
+                       account_id,side,code,name,qty,planned_price,filled_price,amount,fees,
+                       status,reason,risk_payload,realized_pnl,created_at,executed_at,
+                       execution_status,execution_verified,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, "buy", CODE, "专项标的", 1000, 10.0, 10.0, 10000.0, 6.0,
+                 "filled", "pr6-fixture", "{}", 0.0, now, now,
+                 "verified", 1, *stamp, cycle_id),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,
+                                           amount,fees,fill_date,quote_at,assumption)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (order_id, ACCOUNT_ID, "buy", CODE, 1000, 10.0, 10000.0, 6.0,
+                 now[:10], now, "pr6"),
+            )
+        return order_id
+
+    def _trace_init(self):
+        """跑一次 init_db，返回它实际执行过的全部 SQL（用于断言"没有重复 DDL"）。"""
+        statements = []
+        original = PST.db
+
+        @contextmanager
+        def traced(*args, **kwargs):
+            with original(*args, **kwargs) as conn:
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        with mock.patch.object(PST, "db", traced):
+            self._init()
+        return statements
+
+    def _signal_retry_index_exists(self):
+        with PT._db() as conn:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?",
+                (PSM.SIGNAL_RETRY_UNIQUE_INDEX,),
+            ).fetchone() is not None
+
+    def _insert_retry_order(self, conn, signal_id, created_at):
+        cycle_id = conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+        ).fetchone()[0]
+        stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+        return conn.execute(
+            """INSERT INTO paper_orders(
+                   account_id,side,code,name,qty,planned_price,amount,fees,status,
+                   reason,risk_payload,created_at,signal_id,
+                   strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ACCOUNT_ID, "buy", CODE, "专项标的", 100, 10.0, 1000.0, 0.6,
+             PT.STRATEGY_EXECUTION_RETRY_STATUS, "pr6-retry", "{}", created_at,
+             signal_id, *stamp, cycle_id),
+        ).lastrowid
+
+class LedgerBootstrapLifecycleTestCase(LedgerBootstrapFixture):
+    """PR-6 主场景：结构 bootstrap 与运行期恢复的边界。"""
+
+    # ---------- 1. 全新空库 ----------
+
+    def test_fresh_database_bootstraps_full_structure(self):
+        self.assertEqual(self._init_path(), "cold")
+        tables = self._table_names()
+        for required in PSM.REQUIRED_TABLES:
+            self.assertIn(required, tables, f"新库缺少必需表 {required}")
+        # 业务引导仍然发生：账户 + 周期都有行，且账户绑定到当前周期。
+        account = self._account_cycle()
+        self.assertIsNotNone(account["cycle_id"])
+        # 升级成功的收据必须存在，且记录的就是当前结构。
+        receipt = self._receipt()
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["contract_version"], PSM.BOOTSTRAP_CONTRACT_VERSION)
+        with PT._db() as conn:
+            self.assertEqual(receipt["structure_fingerprint"], PSM.structure_fingerprint(conn))
+
+    # ---------- 2. 已升级库重复初始化 ----------
+
+    def test_repeat_init_takes_verified_path_without_ddl_but_keeps_recovery(self):
+        self._init()
+        recovery = mock.patch.object(PT, "_recover_ledger_runtime", wraps=PT._recover_ledger_runtime)
+        structure = mock.patch.object(PLB, "ensure_ledger_structure", wraps=PLB.ensure_ledger_structure)
+        with recovery as recovery_spy, structure as structure_spy:
+            path = self._init_path()
+        self.assertEqual(path, "verified")
+        structure_spy.assert_not_called()   # 不重复 DDL
+        recovery_spy.assert_called_once()   # 但业务恢复照跑
+
+    # ---------- 3. 缺表/缺列的旧库 ----------
+
+    def test_legacy_database_missing_feature_table_and_column_is_repaired(self):
+        self._init()
+        with self._db() as conn:
+            conn.execute("DROP TABLE paper_position_risk_state")
+            conn.execute("ALTER TABLE paper_nav DROP COLUMN quote_status")
+        self.assertNotIn("paper_position_risk_state", self._table_names())
+        self.assertNotIn("quote_status", self._columns("paper_nav"))
+
+        self.assertEqual(self._init_path(), "cold")
+        self.assertIn("paper_position_risk_state", self._table_names())
+        self.assertIn("quote_status", self._columns("paper_nav"))
+        # 修完之后收据要跟着新结构更新，否则下一次又会全量重建。
+        self.assertEqual(self._init_path(), "verified")
+
+    # ---------- 4. 中途失败 + 5/11. 失败不落收据、fail closed ----------
+
+    def test_interrupted_bootstrap_leaves_no_receipt_and_recovers_next_run(self):
+        with mock.patch.object(
+            PSM, "ensure_feature_tables", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self._init()
+        # 事务整体回滚：没有半成品结构，也没有"已完成"的收据。
+        self.assertNotIn("paper_accounts", self._table_names())
+        self.assertNotIn(PSM.BOOTSTRAP_RECEIPT_TABLE, self._table_names())
+        self.assertIsNone(self._receipt())
+
+        self.assertEqual(self._init_path(), "cold")
+        self.assertIn("paper_accounts", self._table_names())
+        self.assertIsNotNone(self._receipt())
+
+    def test_verification_failure_aborts_initialization(self):
+        error = PSM.LedgerSchemaBootstrapError("结构缺失")
+        with mock.patch.object(PSM, "verify_required_structure", side_effect=error):
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError):
+                self._init()
+        self.assertIsNone(self._receipt())
+
+    # ---------- 5/6. 并发 ----------
+
+    def _spawn_initializers(self, count, db_dir):
+        script = os.path.join(self.tmp, "init_worker.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(textwrap.dedent(
+                f"""
+                import os, sys, time
+                sys.path.insert(0, {BACKEND_DIR!r})
+                import paper_trading as PT
+                PT._benchmark_close = lambda: None
+                go = os.environ["PR6_GO"]
+                while not os.path.exists(go):
+                    time.sleep(0.01)
+                PT.init_db()
+                print("ok")
+                """
+            ))
+        env = dict(os.environ)
+        env["ASTOCK_DATA_DIR"] = db_dir
+        env["PR6_GO"] = os.path.join(self.tmp, "go")
+        env["PYTHONIOENCODING"] = "utf-8"
+        procs = [
+            subprocess.Popen([sys.executable, script], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(count)
+        ]
+        time.sleep(0.2)
+        open(env["PR6_GO"], "w").close()
+        results = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=180)
+            results.append((proc.returncode, out.decode("utf-8", "replace"),
+                            err.decode("utf-8", "replace")))
+        return results
+
+    def test_two_processes_initializing_the_same_ledger(self):
+        db_dir = os.path.join(self.tmp, "shared")
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "paper_trading.sqlite3")
+        PT.DB_PATH = db_path
+
+        results = self._spawn_initializers(2, db_dir)
+
+        for code, out, err in results:
+            self.assertEqual(code, 0, f"初始化进程失败: {out} {err}")
+        tables = self._table_names()
+        for required in PSM.REQUIRED_TABLES:
+            self.assertIn(required, tables)
+        with PT._db() as conn:
+            receipt = PSM.read_bootstrap_receipt(conn)
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt["structure_fingerprint"], PSM.structure_fingerprint(conn))
+
+    def test_readonly_api_access_survives_concurrent_initialization(self):
+        self._init()
+        failures = []
+        stop = threading.Event()
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    with PT._db_readonly() as conn:
+                        conn.execute("SELECT count(*) FROM paper_orders").fetchone()
+            except Exception as exc:  # pragma: no cover - 只在失败时触发
+                failures.append(exc)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            for _ in range(5):
+                self._init()
+        finally:
+            stop.set()
+            thread.join(timeout=30)
+        self.assertEqual(failures, [])
+
+    # ---------- 7/8. 租约 ----------
+
+    def _insert_lease(self, *, expired):
+        now = datetime.now()
+        expires = now - timedelta(minutes=5) if expired else now + timedelta(minutes=30)
+        with self._db() as conn:
+            conn.execute(
+                """INSERT INTO paper_jobs(
+                       slot,market_date,status,detail,started_at,owner_key,
+                       heartbeat_at,expires_at,fencing_token)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                ("risk", "2026-10-31", "running", "{}", _stamp(now - timedelta(minutes=5)),
+                 "worker-1", _stamp(now - timedelta(minutes=4)), _stamp(expires), 3),
+            )
+            conn.execute(
+                """INSERT INTO paper_runtime_locks(
+                       lock_key,owner_key,slot,acquired_at,heartbeat_at,expires_at,fencing_token)
+                   VALUES(?,?,?,?,?,?,?)""",
+                ("risk:2026-10-31", "worker-1", "risk", _stamp(now - timedelta(minutes=5)),
+                 _stamp(now - timedelta(minutes=4)), _stamp(expires), 3),
+            )
+
+    def test_valid_lease_is_not_reset_by_a_new_process(self):
+        self._init()
+        self._insert_lease(expired=False)
+
+        self._init()
+
+        with PT._db() as conn:
+            job = conn.execute(
+                "SELECT status,owner_key,fencing_token FROM paper_jobs WHERE slot='risk'"
+            ).fetchone()
+            lock = conn.execute(
+                "SELECT count(*) FROM paper_runtime_locks WHERE lock_key='risk:2026-10-31'"
+            ).fetchone()[0]
+        self.assertEqual(dict(job), {"status": "running", "owner_key": "worker-1",
+                                     "fencing_token": 3})
+        self.assertEqual(lock, 1)
+
+    def test_expired_lease_is_recovered_by_the_existing_rule(self):
+        self._init()
+        self._insert_lease(expired=True)
+
+        self._init()
+
+        with PT._db() as conn:
+            job = conn.execute(
+                "SELECT status,detail FROM paper_jobs WHERE slot='risk'"
+            ).fetchone()
+            lock = conn.execute(
+                "SELECT count(*) FROM paper_runtime_locks WHERE lock_key='risk:2026-10-31'"
+            ).fetchone()[0]
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(json.loads(job["detail"])["recovered_from_running"], 1)
+        self.assertEqual(lock, 0)
+
+    # ---------- 9. 订单 / signal 对账 ----------
+
+    def test_signal_order_drift_is_still_reconciled_when_schema_is_ready(self):
+        self._init()
+        self.assertEqual(self._init_path(), "verified")  # 结构已 ready
+        with self._db() as conn:
+            cycle_id = conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0]
+            now = _stamp(datetime.now())
+            stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+            signal_id = conn.execute(
+                """INSERT INTO paper_signals(
+                       account_id,signal_date,intended_date,code,payload,status,created_at,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, now[:10], now[:10], CODE, "{}", "superseded", now,
+                 *stamp, cycle_id),
+            ).lastrowid
+            order_id = conn.execute(
+                """INSERT INTO paper_orders(
+                       account_id,side,code,name,qty,planned_price,amount,fees,status,
+                       reason,risk_payload,created_at,signal_id,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, "buy", CODE, "专项标的", 100, 10.0, 1000.0, 0.6,
+                 "pending_limit", "pr6-drift", "{}", now, signal_id, *stamp, cycle_id),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO paper_capital_reservations(
+                       order_key,account_id,cycle_id,code,side,amount,status,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (str(order_id), ACCOUNT_ID, cycle_id, CODE, "buy", 1000.0, "reserved", now),
+            )
+
+        self._init()
+
+        with PT._db() as conn:
+            order = conn.execute(
+                "SELECT status,reason FROM paper_orders WHERE id=?", (order_id,)
+            ).fetchone()
+            reservation = conn.execute(
+                "SELECT status FROM paper_capital_reservations WHERE order_key=?",
+                (str(order_id),),
+            ).fetchone()
+        self.assertEqual(order["status"], "superseded")
+        self.assertIn("信号已替代", order["reason"])
+        self.assertEqual(reservation["status"], "released")
+
+    # ---------- 10. 换 DB_PATH ----------
+
+    def test_switching_db_path_does_not_inherit_readiness(self):
+        self._init()
+        other = os.path.join(self.tmp, "other.sqlite3")
+        PT.DB_PATH = other
+
+        self.assertEqual(self._init_path(), "cold")
+        self.assertIn("paper_accounts", self._table_names())
+        self.assertIsNotNone(self._receipt())
+
+    # ---------- 12. 已验证成交不被改写 ----------
+
+    def test_repeated_initialization_preserves_verified_fills(self):
+        self._init()
+        order_id = self._insert_verified_fill()
+
+        def snapshot():
+            with PT._db() as conn:
+                order = dict(conn.execute(
+                    "SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+                fill = dict(conn.execute(
+                    "SELECT * FROM paper_fills WHERE order_id=?", (order_id,)).fetchone())
+                return order, fill
+
+        before = snapshot()
+        self._init()
+        self._init()
+        after = snapshot()
+        self.assertEqual(before, after)
+
+
+# ── 修复项一：WAL checkpoint 只跟随真正的结构初始化/升级 ──────────────────────
+
+
+class WalCheckpointScopeTests(LedgerBootstrapFixture):
+    """verified 路径不得主动发起 ``PRAGMA wal_checkpoint(TRUNCATE)``。
+
+    master 的健康账本快路径没有这个行为；拆分后必须保持。checkpoint 还必须留在
+    事务之外（``paper_db`` 已提交并关闭连接），不能进 schema/恢复事务内部。
+    """
+
+    def _spy_checkpoint(self):
+        calls = []
+        patcher = mock.patch.object(
+            PT, "_wal_checkpoint", side_effect=lambda: calls.append(1)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_fresh_initialization_triggers_checkpoint_once(self):
+        calls = self._spy_checkpoint()
+        self.assertEqual(self._init_path(), "cold")
+        self.assertEqual(len(calls), 1, "新库初始化应在提交后收缩一次 WAL")
+
+    def test_cold_upgrade_triggers_checkpoint_once(self):
+        self._init_path()                       # 先把健康账本建好
+        calls = self._spy_checkpoint()
+        with self._db() as conn:
+            conn.execute("DROP TABLE paper_position_risk_state")
+        self.assertEqual(self._init_path(), "cold")
+        self.assertEqual(len(calls), 1, "结构修复路径应保留原有 checkpoint")
+
+    def test_verified_repeat_does_not_trigger_checkpoint(self):
+        self._init_path()
+        calls = self._spy_checkpoint()
+        self.assertEqual(self._init_path(), "verified")
+        self.assertEqual(calls, [], "verified 路径不得主动 checkpoint")
+
+    def test_verified_init_does_not_wait_on_an_open_read_transaction(self):
+        """有持续只读事务时，verified 初始化不该因为 TRUNCATE checkpoint 额外等待。"""
+        self._init_path()
+        calls = self._spy_checkpoint()
+        reader = sqlite3.connect(PT.DB_PATH, timeout=10)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM paper_orders").fetchone()
+            started = time.perf_counter()
+            self.assertEqual(self._init_path(), "verified")
+            elapsed = time.perf_counter() - started
+        finally:
+            reader.rollback()
+            reader.close()
+        self.assertEqual(calls, [])
+        self.assertLess(elapsed, 10.0, "verified 初始化不应被 checkpoint 拖住")
+
+
+# ── 修复项二：源码指纹不可用时 fail closed ──────────────────────────────────
+
+
+class OwnerFingerprintFailClosedTests(LedgerBootstrapFixture):
+    """取不到任一 owner 源码时：不写收据、不认旧收据、不进入 verified。"""
+
+    def _no_spec(self):
+        return mock.patch.object(importlib.util, "find_spec", return_value=None)
+
+    def test_missing_owner_source_raises_with_reason(self):
+        with self._no_spec():
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError) as ctx:
+                PSM.schema_owner_fingerprint()
+        message = str(ctx.exception)
+        self.assertIn("paper_schema_migrations", message)
+        self.assertIn("源码", message)
+
+    def test_invalid_owner_source_path_raises(self):
+        missing = os.path.join(self.tmp, "not-there.py")
+        spec = types.SimpleNamespace(origin=missing)
+        with mock.patch.object(importlib.util, "find_spec", return_value=spec):
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError) as ctx:
+                PSM.schema_owner_fingerprint()
+        self.assertIn("not-there.py", str(ctx.exception))
+
+    def test_unavailable_fingerprint_fails_closed_without_receipt(self):
+        with self._no_spec():
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError):
+                self._init()
+        # 失败不能产生新的有效收据
+        self.assertNotIn(PSM.BOOTSTRAP_RECEIPT_TABLE, self._table_names())
+
+    def test_existing_receipt_is_not_confirmed_when_fingerprint_unavailable(self):
+        self._init_path()
+        before = self._receipt()
+        with self._no_spec():
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError):
+                self._init()
+        # 既有收据原样保留，既没有被"确认"，也没有被伪造成新值
+        self.assertEqual(self._receipt(), before)
+
+    def test_legacy_unavailable_sentinel_receipt_is_rejected(self):
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE ledger_schema_receipt SET owner_fingerprint=?"
+                " WHERE id=1",
+                ("unavailable:strategy_champion",),
+            )
+        self.assertEqual(self._init_path(), "cold", "旧式哨兵收据不得被接受")
+        receipt = self._receipt()
+        self.assertTrue(PSM.is_valid_owner_fingerprint(receipt["owner_fingerprint"]))
+        self.assertEqual(self._init_path(), "verified")
+
+    def test_owner_fingerprint_change_forces_cold(self):
+        self._init_path()
+        with mock.patch.object(PSM, "schema_owner_fingerprint", return_value="a" * 64):
+            self.assertEqual(self._init_path(), "cold")
+        # 收据里现在是那份假指纹，真实指纹仍不匹配 -> 再冷一次后才收敛
+        self.assertEqual(self._init_path(), "cold")
+        self.assertEqual(self._init_path(), "verified")
+
+    def test_fingerprint_guard_rejects_non_sha256_values(self):
+        for value in ("", "unavailable:paper_storage", "a" * 63, "A" * 64, None):
+            with self.subTest(value=value):
+                self.assertFalse(PSM.is_valid_owner_fingerprint(value))
+        self.assertTrue(PSM.is_valid_owner_fingerprint("a" * 64))
+
+
+# ── 修复项三：init_db 公开返回值 ────────────────────────────────────────────
+
+
+class PublicReturnContractTests(LedgerBootstrapFixture):
+    """``init_db()`` 与拆分前一致返回 ``None``；cold/verified 只是 owner 内部结果。"""
+
+    def test_init_db_returns_none_on_both_paths(self):
+        self.assertIsNone(PT.init_db())   # cold
+        self.assertIsNone(PT.init_db())   # verified
+
+    def test_no_process_wide_schema_ready_flag(self):
+        self.assertFalse(
+            any("SCHEMA" in name and "READY" in name for name in vars(PT)),
+            "不得新增进程级 schema ready 布尔变量",
+        )
+
+
+# ── R5：执行重试唯一索引的 DDL 归属结构 owner ───────────────────────────────
+
+
+class SignalRetryIndexOwnershipTests(LedgerBootstrapFixture):
+    """索引 DDL 必须在 ``paper_schema_migrations``（参与源码指纹），不在引擎里。"""
+
+    def test_index_exists_after_initialization(self):
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+        with self._db() as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+                (PSM.SIGNAL_RETRY_UNIQUE_INDEX,),
+            ).fetchone()[0]
+        self.assertIn("UNIQUE INDEX", sql.upper())
+        self.assertIn("status='execution_retry'", sql)
+        self.assertIn("signal_id IS NOT NULL", sql)
+
+    def test_repeat_initialization_does_not_reissue_index_ddl(self):
+        self._init_path()
+        statements = self._trace_init()
+        self.assertEqual(
+            [
+                " ".join(text.split())
+                for text in statements
+                if PSM.SIGNAL_RETRY_UNIQUE_INDEX in text
+                and text.strip().split(None, 1)[0].upper() in {"CREATE", "ALTER", "DROP"}
+            ],
+            [],
+            "索引已存在时不得重复执行索引 DDL",
+        )
+
+    def test_missing_index_is_recreated(self):
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+        self.assertFalse(self._signal_retry_index_exists())
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+
+    def test_index_definition_lives_in_the_schema_owner(self):
+        with open(PSM.__file__, encoding="utf-8") as handle:
+            psm_source = handle.read()
+        with open(PT.__file__, encoding="utf-8") as handle:
+            engine_source = handle.read()
+        self.assertIn(PSM.SIGNAL_RETRY_UNIQUE_INDEX, psm_source)
+        self.assertNotIn(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {PSM.SIGNAL_RETRY_UNIQUE_INDEX}",
+            engine_source,
+            "索引 DDL 不得回流到 paper_trading（它不参与源码指纹）",
+        )
+
+    def test_index_definition_change_changes_the_owner_fingerprint(self):
+        copy_path = os.path.join(self.tmp, "paper_schema_migrations.py")
+        shutil.copyfile(PSM.__file__, copy_path)
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name == "paper_schema_migrations":
+                return types.SimpleNamespace(origin=copy_path)
+            return real_find_spec(name, *args, **kwargs)
+
+        with mock.patch.object(importlib.util, "find_spec", side_effect=fake_find_spec):
+            before = PSM.schema_owner_fingerprint()
+            with open(copy_path, "a", encoding="utf-8") as handle:
+                handle.write(chr(10) + "# index predicate changed" + chr(10))
+            after = PSM.schema_owner_fingerprint()
+        self.assertNotEqual(before, after, "索引定义变化必须让 owner 指纹变化")
+
+    def test_duplicate_retry_rows_are_cleaned_before_index_creation(self):
+        """顺序契约：先清理重复 retry，再建唯一索引（否则索引根本建不上）。"""
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            cycle_id = conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0]
+            stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+            now = _stamp(datetime.now())
+            signal_id = conn.execute(
+                """INSERT INTO paper_signals(
+                       account_id,signal_date,intended_date,code,payload,status,created_at,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, now[:10], now[:10], CODE, "{}", "pending", now,
+                 *stamp, cycle_id),
+            ).lastrowid
+            older = self._insert_retry_order(conn, signal_id, "2026-10-30 09:31:00")
+            newer = self._insert_retry_order(conn, signal_id, "2026-10-30 09:35:00")
+
+        self._init_path()
+
+        self.assertTrue(self._signal_retry_index_exists(),
+                        "清理完成后索引必须建得起来")
+        with self._db() as conn:
+            rows = {
+                row["id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT id,status,reason FROM paper_orders WHERE signal_id=?",
+                    (signal_id,),
+                ).fetchall()
+            }
+        self.assertEqual(rows[newer]["status"], PT.STRATEGY_EXECUTION_RETRY_STATUS)
+        self.assertEqual(rows[older]["status"], "superseded")
+        self.assertIn("同一信号仅保留最新执行重试", rows[older]["reason"])
+
+    def test_index_helper_reports_three_distinct_states(self):
+        """present / created / blocked 必须是三种可区分的结果，不能压成 bool。"""
+        self._init_path()
+        with self._db() as conn:
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(conn),
+                             PSM.SIGNAL_RETRY_INDEX_PRESENT)
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(conn),
+                             PSM.SIGNAL_RETRY_INDEX_CREATED)
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(conn),
+                             PSM.SIGNAL_RETRY_INDEX_PRESENT)
+            blocked = _BlockedIndexConnection(conn)
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(blocked),
+                             PSM.SIGNAL_RETRY_INDEX_BLOCKED)
+        self.assertEqual(
+            len({PSM.SIGNAL_RETRY_INDEX_PRESENT, PSM.SIGNAL_RETRY_INDEX_CREATED,
+                 PSM.SIGNAL_RETRY_INDEX_BLOCKED}), 3)
+
+
+# ── R5 收尾：索引三态、blocked 轮次与收据语义 ───────────────────────────────
+
+
+class _NoopCursor:
+    """空结果游标：让测试能表达"这条 UPDATE 本轮没有生效"。"""
+
+    rowcount = 0
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class _BlockedIndexConnection:
+    """把真实连接上的 ``CREATE UNIQUE INDEX`` 变成 IntegrityError。
+
+    模拟的是真实竞态：清理之后、建索引之前另一个写者插入同一 signal 的第二条
+    ``execution_retry``，SQLite 在有重复 key 时抛的就是 IntegrityError。其余所有
+    语句（含对账 UPDATE / SELECT）原样转发给真实连接，逻辑仍是被测生产代码。
+    """
+
+    def __init__(self, conn, *, skip_supersede=False):
+        self._conn = conn
+        self.blocked = 0
+        self.skip_supersede = skip_supersede
+
+    def execute(self, sql, params=()):
+        text = " ".join(str(sql).split())
+        if "CREATE UNIQUE INDEX" in text:
+            self.blocked += 1
+            raise sqlite3.IntegrityError(
+                "UNIQUE constraint failed: paper_orders.signal_id")
+        upper = text.upper()
+        if (self.skip_supersede and upper.startswith("UPDATE PAPER_ORDERS")
+                and "SUPERSEDED" in upper):
+            # 模拟"这一轮的清理没有真正生效"（旧库 guard / 另一写者回填）：
+            # 重复行原样留下，于是唯一索引本轮建不上。
+            return _NoopCursor()
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class SignalRetryIndexBlockedTests(LedgerBootstrapFixture):
+    """blocked 轮次：不阻断健康账本、不冒充唯一性、下一轮可修复。"""
+
+    def _ledger_with_duplicate_retries(self):
+        """索引缺失 + 同一 signal 的三条 execution_retry（重复未被清理的状态）。"""
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            cycle_id = conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0]
+            stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+            now = _stamp(datetime.now())
+            signal_id = conn.execute(
+                """INSERT INTO paper_signals(
+                       account_id,signal_date,intended_date,code,payload,status,created_at,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, now[:10], now[:10], CODE, "{}", "pending", now,
+                 *stamp, cycle_id),
+            ).lastrowid
+            for minute in (31, 33, 35):
+                self._insert_retry_order(
+                    conn, signal_id, f"2026-10-30 09:{minute}:00")
+        return signal_id
+
+    def test_blocked_round_is_reported_and_does_not_abort_reconciliation(self):
+        signal_id = self._ledger_with_duplicate_retries()
+        with self._db() as conn:
+            proxy = _BlockedIndexConnection(conn)
+            result = PT._reconcile_signal_order_states(proxy)
+        self.assertEqual(result["status"], "ok", "blocked 不得让对账整体失败")
+        self.assertEqual(result["retry_index"], PSM.SIGNAL_RETRY_INDEX_BLOCKED)
+        self.assertEqual(proxy.blocked, 1, "只尝试一次，不在同轮内循环重试")
+        self.assertFalse(self._signal_retry_index_exists(),
+                         "blocked 轮次不得声称唯一性已生效")
+        with self._db() as conn:
+            statuses = [
+                row["status"] for row in conn.execute(
+                    "SELECT status FROM paper_orders WHERE signal_id=? ORDER BY id",
+                    (signal_id,),
+                ).fetchall()
+            ]
+        self.assertEqual(statuses.count(PT.STRATEGY_EXECUTION_RETRY_STATUS), 1,
+                         "行清理仍然生效：同一 signal 只留最新一条活动 retry")
+
+    def test_duplicates_that_survive_the_round_leave_the_index_blocked(self):
+        """本轮清理未能消除重复 → 唯一性未生效，但账本不被阻断、下轮可修复。"""
+        signal_id = self._ledger_with_duplicate_retries()
+        with self._db() as conn:
+            proxy = _BlockedIndexConnection(conn, skip_supersede=True)
+            result = PT._reconcile_signal_order_states(proxy)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["retry_index"], PSM.SIGNAL_RETRY_INDEX_BLOCKED)
+        self.assertFalse(self._signal_retry_index_exists())
+        with self._db() as conn:
+            remaining = conn.execute(
+                "SELECT count(*) FROM paper_orders WHERE signal_id=?"
+                " AND status=?",
+                (signal_id, PT.STRATEGY_EXECUTION_RETRY_STATUS),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 3, "本轮确实没能消除重复（唯一性未生效）")
+
+        # 下一轮正常初始化：清理 + 建索引，重复归到 1 条
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+        with self._db() as conn:
+            remaining = conn.execute(
+                "SELECT count(*) FROM paper_orders WHERE signal_id=?"
+                " AND status=?",
+                (signal_id, PT.STRATEGY_EXECUTION_RETRY_STATUS),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 1)
+
+    def test_next_round_repairs_a_blocked_index(self):
+        self._ledger_with_duplicate_retries()
+        with self._db() as conn:
+            PT._reconcile_signal_order_states(_BlockedIndexConnection(conn))
+        self.assertFalse(self._signal_retry_index_exists())
+
+        # 下一轮（正常连接）应当把索引补上 —— 历史约定"本轮失败、下轮恢复"仍然有效
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+
+    def test_receipt_never_claims_uniqueness_that_is_not_there(self):
+        """结构收据只描述 bootstrap 结构；唯一索引由恢复层独立维护。"""
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+        with mock.patch.object(
+            PSM, "ensure_signal_retry_unique_index",
+            return_value=PSM.SIGNAL_RETRY_INDEX_BLOCKED,
+        ):
+            self.assertEqual(self._init_path(), "cold")
+            receipt = self._receipt()
+        # 收据存在，但它记录的结构确实**不含**这条索引（没有假装唯一性已生效）
+        self.assertIsNotNone(receipt)
+        self.assertFalse(self._signal_retry_index_exists())
+        with PT._db() as conn:
+            self.assertEqual(receipt["structure_fingerprint"],
+                             PSM.structure_fingerprint(conn))
+        # 下一轮走 verified（结构摘要一致），恢复层仍会把索引补上
+        self.assertEqual(self._init_path(), "verified")
+        self.assertTrue(self._signal_retry_index_exists(),
+                        "verified 不等于唯一性已保证；恢复层必须继续维护该索引")
+        # 索引出现后结构摘要变化 → 再 cold 一次把收据对齐，之后回到 verified
+        self.assertEqual(self._init_path(), "cold")
+        self.assertTrue(self._signal_retry_index_exists())
+        self.assertEqual(self._init_path(), "verified")
+
+
+if __name__ == "__main__":
+    unittest.main()
