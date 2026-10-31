@@ -106,8 +106,8 @@ class ImportBoundaryTests(unittest.TestCase):
         import dashboard_queries as DQ
         import manual_orders as MO
         with mock.patch.object(P, "_now", return_value="late-bound"):
-            self.assertEqual(EP._pt()._now(), "late-bound")
-            self.assertEqual(MO._dependencies()._now(), "late-bound")
+            self.assertEqual(EP._pt().now(), "late-bound")
+            self.assertEqual(MO._dependencies().now(), "late-bound")
         with mock.patch.object(P, "schedule_status", return_value={"late": True}):
             self.assertEqual(DQ._dependencies().schedule_status(), {"late": True})
         for deps in (EP._pt(), DQ._dependencies(), MO._dependencies()):

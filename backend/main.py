@@ -737,7 +737,7 @@ def _run_manual_incremental_update_locked(job_id, target_date):
             pass
         _invalidate_health_cache()
         factor = None
-        rebuild = getattr(P, "_rebuild_selection_factor_cache", None)
+        rebuild = getattr(P, "rebuild_selection_factor_cache", None)  # 公开钩子名；当前未实现 -> None
         if callable(rebuild):
             factor = rebuild(target_date)
         result = {"history": history, "factor": factor}
@@ -791,7 +791,7 @@ def _run_factor_only_update_locked(job_id, target_date):
                                    "error": None, "cancel_requested": False,
                                    "trigger": "factor-only"})
     try:
-        rebuild = getattr(P, "_rebuild_selection_factor_cache", None)
+        rebuild = getattr(P, "rebuild_selection_factor_cache", None)  # 公开钩子名；当前未实现 -> None
         factor = rebuild(target_date) if callable(rebuild) else {"status": "failed", "reason": "因子重建接口不可用"}
         _invalidate_health_cache()
         final = "completed" if factor and factor.get("status") == "ok" else "partial"
@@ -1411,7 +1411,7 @@ def stock_detail(code: str, refresh: bool = False):
             finance = {"data": {}, "report_dates": []}
     else:
         s = local_snapshot
-        finance_cache = getattr(dfc, "_mem_cache", {}).get("finance")
+        finance_cache = dfc.memory_cache("finance")
         finance = finance_cache[1] if finance_cache else {"data": {}, "report_dates": []}
     scope = _buy_scope(
         code,
@@ -1476,8 +1476,8 @@ def stock_detail(code: str, refresh: bool = False):
             gate = {"status": "unknown", "reason": "海外风险数据暂不可用"}
     else:
         # 已缓存新闻/板块资料可直接复用；不存在时以空资料保守展示，不发起网络请求。
-        news_cache = getattr(dfc, "_mem_cache", {}).get("news")
-        sector_cache = getattr(dfc, "_mem_cache", {}).get("sector_industry")
+        news_cache = dfc.memory_cache("news")
+        sector_cache = dfc.memory_cache("sector_industry")
         news_hits = F.news_keyword_scan(names) if news_cache else []
         sector_flow = sector_cache[1] if sector_cache else []
         gate = SEL.live_market_context().get("gate") or {

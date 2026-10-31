@@ -33,7 +33,7 @@ class TestManualOrderRoundKline(_ProvenRiskHarness):
                  'quote_at': self.day.isoformat() + ' 10:00:00'}
         with mock.patch.object(MO, '_completed_kline', return_value=frame) as load, \
              mock.patch.object(MO.DE, 'sell_decision', side_effect=decision), \
-             mock.patch.object(MO, '_dependencies', return_value=replace(deps, _with_decision_snapshot=snapshot)):
+             mock.patch.object(MO, '_dependencies', return_value=replace(deps, with_decision_snapshot=snapshot)):
             MO._manual_order_plan(self.conn, self.account_id, self.code, 'sell', qty=100,
                                   asof_day=self.day, quote=quote,
                                   all_quotes={self.code: quote})
@@ -54,7 +54,7 @@ class TestManualOrderRoundKline(_ProvenRiskHarness):
         with mock.patch.object(MO, '_completed_kline', side_effect=[None, frame]) as load, \
              mock.patch.object(MO.DE, 'sell_decision', return_value={'action': '观察'}) as decision, \
              mock.patch.object(MO, '_dependencies', return_value=replace(
-                 deps, _with_decision_snapshot=lambda payload, **kwargs: payload)):
+                 deps, with_decision_snapshot=lambda payload, **kwargs: payload)):
             MO._manual_order_plan(self.conn, self.account_id, self.code, 'sell', qty=100,
                                   asof_day=self.day, quote=quote, all_quotes={self.code: quote})
         self.assertEqual(load.call_count, 2)

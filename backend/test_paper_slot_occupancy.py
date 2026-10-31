@@ -269,12 +269,12 @@ class SlotOccupancyFacadeContractTests(unittest.TestCase):
             and isinstance(node.value, ast.Attribute)
             and isinstance(node.value.value, ast.Name)
             and node.value.value.id == "deps"
-            and node.value.attr == "_pending_position_slots"
+            and node.value.attr == "pending_position_slots"
             for node in ast.walk(tree)
         ), "manual_orders must consume the injected canonical slot helper")
         import manual_orders as MO
         with mock.patch.object(PT, "_pending_position_slots") as canonical:
-            self.assertIs(MO._dependencies()._pending_position_slots, canonical)
+            self.assertIs(MO._dependencies().pending_position_slots, canonical)
         self.assertTrue(any(
             isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "_pending_position_slots"

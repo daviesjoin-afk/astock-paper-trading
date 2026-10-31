@@ -207,7 +207,7 @@ def order_cycle_id_for_order(conn, order_id):
 
 
 
-def assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
+def require_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
     """**已存在订单**的成交授权闸门：返回可证明的 ``order_cycle_id``，否则抛异常。
 
     这是 execution-cycle invariant 的**唯一**实现（§8：不要把判断抄成三四份）。
@@ -282,7 +282,7 @@ def orders_have_cycle_column(conn):
 _order_cycle_provenance_for_order = order_cycle_provenance_for_order
 _account_cycle_id_readonly = account_cycle_id_readonly
 _active_cycle_id_readonly = active_cycle_id_readonly
-_assert_order_execution_cycle = assert_order_execution_cycle
+_require_order_execution_cycle = require_order_execution_cycle
 _order_cycle_id_for_order = order_cycle_id_for_order
 _orders_have_cycle_column = orders_have_cycle_column
 _order_cycle_id_for_order = order_cycle_id_for_order

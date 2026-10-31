@@ -390,7 +390,7 @@ def _lease_lost(exc):
     return isinstance(exc, RuntimeError) and str(exc).startswith("paper lease lost:")
 
 
-def _assert_active_lease(conn, phase="ledger mutation"):
+def _require_active_lease(conn, phase="ledger mutation"):
     """Fence scheduler side effects after a lease hand-off.
 
     A TTL only prevents a dead process from blocking recovery; it does not
@@ -2399,9 +2399,9 @@ def _order_cycle_id_for_order(conn, order_id):
     return POEA.order_cycle_id_for_order(conn, order_id)
 
 
-def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
+def _require_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
     """Compatibility facade for the read-only order authority."""
-    return POEA.assert_order_execution_cycle(conn, order_id, account_id=account_id, provenance=provenance, allow_out_of_cycle_account=allow_out_of_cycle_account)
+    return POEA.require_order_execution_cycle(conn, order_id, account_id=account_id, provenance=provenance, allow_out_of_cycle_account=allow_out_of_cycle_account)
 
 
 def _orders_have_cycle_column(conn):
@@ -8234,7 +8234,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # PR-06：席位预留、追高/加速门限、首仓纪律等差异统一由中央执行计划器的
     # 声明式策略表提供，本函数不再按账户 ID 分支。
     import manual_orders as MO
-    _assert_active_lease(conn, "strategy buy")
+    _require_active_lease(conn, "strategy buy")
     # Pause/reset may happen while a scheduled scan is already in progress.
     # Re-read the account and cycle immediately before any execution decision.
     current_account = conn.execute("SELECT status,cycle_id FROM paper_accounts WHERE id=?", (account["id"],)).fetchone()
@@ -9228,7 +9228,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # Retire the old retry before inserting the next canonical attempt so it
     # cannot reserve a second slot or cash on the following scan.
     _supersede_signal_execution_retries(conn, signal.get("id"))
-    _assert_active_lease(conn, "strategy buy order write")
+    _require_active_lease(conn, "strategy buy order write")
     strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
         conn, account["id"], signal.get("id"), cycle_id=current_cycle["id"],
     )
@@ -9490,7 +9490,7 @@ def process_pending_execution_orders(asof_date=None):
             order_id = int(order["id"])
             if order_id not in candidate_ids:
                 continue
-            _assert_active_lease(conn, "resume pending execution order")
+            _require_active_lease(conn, "resume pending execution order")
             account_row = conn.execute(
                 "SELECT * FROM paper_accounts WHERE id=?", (order["account_id"],),
             ).fetchone()
@@ -9989,7 +9989,7 @@ def _risk_service_ports():
         rotation_buy=_buy_order,
         projection=_RISK_PROJECTION,
         process_pending_manual_orders=process_pending_manual_orders,
-        assert_active_lease=_assert_active_lease,
+        require_active_lease=_require_active_lease,
     )
 
 
@@ -10012,7 +10012,7 @@ def monitor_risk(asof_date=None):
     day = _date(asof_date)
     run_at = dt.datetime.now()  # 只取一次：身份不能由两个时钟读数拼出来
     with _db(immediate=True, hot_path=True) as conn:
-        _assert_active_lease(conn, "risk scan claim")
+        _require_active_lease(conn, "risk scan claim")
         scan_context = {
             "cycle_id": int(load_active_cycle(conn)["id"]),
             "asof_date": day.isoformat(),
@@ -10033,7 +10033,7 @@ def monitor_risk(asof_date=None):
     try:
         result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])
         with _db(immediate=True, hot_path=True) as conn:
-            _assert_active_lease(conn, "risk scan completion")
+            _require_active_lease(conn, "risk scan completion")
             PRSS.complete_scan(conn, **ident, finished_at=_now())
             audit(conn, None, "risk_scan_completed", _json(dict(ident)))
         return result
@@ -11590,7 +11590,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
         orders = []
         observed = 0
         for position in positions:
-            _assert_active_lease(conn, "opening-event position")
+            _require_active_lease(conn, "opening-event position")
             account = account_map.get(position["account_id"])
             if not account:
                 continue
@@ -11781,7 +11781,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
         checked = 0
         with _db(immediate=True, hot_path=True) as conn:
             for signal in candidates:
-                _assert_active_lease(conn, "fast entry candidate")
+                _require_active_lease(conn, "fast entry candidate")
                 account = accounts.get(signal.get("account_id"))
                 code = str(signal.get("code") or "")
                 quote = dict(quote_map.get(code) or {})
@@ -12120,7 +12120,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 return None, reason
 
         for position in positions:
-            _assert_active_lease(conn, "intraday position")
+            _require_active_lease(conn, "intraday position")
             account = account_map[position["account_id"]]
             quote = quotes.get(position["code"], {})
             price = _num(quote.get("price"))
@@ -12327,7 +12327,7 @@ def _nav_quotes_with_snapshot_fallback(quotes):
 
 @PTM.timed("execution.nav_write")
 def _record_nav(conn, asof_day, quotes=None):
-    _assert_active_lease(conn, "NAV write")
+    _require_active_lease(conn, "NAV write")
     accounts = query_rows(conn, "SELECT * FROM paper_accounts")
     all_positions = _position_rows(conn, asof_day=asof_day)
     # NAV persistence is commonly called while the ledger write transaction
@@ -13039,7 +13039,7 @@ def _run_slot_impl(slot, day, force=False):
             ))
         detail["timing"] = PTM.snapshot("before_job_finalize")
         with _db(immediate=True, hot_path=hot_path) as conn:
-            _assert_active_lease(conn, "job completion")
+            _require_active_lease(conn, "job completion")
             cursor = PJL.complete_job(
                 conn, slot=slot, market_date=day.isoformat(),
                 run_key=intraday_key, owner=owner, fencing_token=fencing_token,
@@ -14546,6 +14546,15 @@ _PAPER_JOB_RUN_REQUIRED_COLUMNS = PAPER_JOB_RUN_REQUIRED_COLUMNS
 # Bind explicit vertical capabilities after all compatibility functions exist.
 # Factories resolve each declared field at call time so runtime state and test
 # overrides are never frozen at module import. No vertical receives this module.
+def _dependency_implementation(name):
+    """按容器的公开字段名解析组装期实现（先同名、再回退到 ``_name`` 私有别名）。"""
+    module = globals()
+    value = module.get(name) or module.get("_" + name)
+    if value is None:
+        raise RuntimeError(f"未登记的依赖实现: {name}")
+    return value
+
+
 def _bind_application_dependencies():
     import paper_account_metrics as PAMetrics
     PAMetrics.bind_dependencies(lambda: PAMetrics.AccountMetricDependencies(
@@ -14566,30 +14575,30 @@ def _bind_application_dependencies():
     # Primitive clocks and cash/lease orchestration remain separate capabilities.
     owned_services = {
         "OrderCycleProvenanceUnknown": (POEA, "OrderCycleProvenanceUnknown"),
-        "_order_cycle_provenance_for_order": (POEA, "_order_cycle_provenance_for_order"),
-        "_assert_order_execution_cycle": (POEA, "_assert_order_execution_cycle"),
-        "_record_lot": (PLL, "record_lot"),
-        "_consume_available_lots": (PLL, "consume_available_lots"),
-        "_sync_positions": (PLL, "sync_positions"),
-        "_position_rows": (PLL, "position_rows"),
+        "order_cycle_provenance_for_order": (POEA, "_order_cycle_provenance_for_order"),
+        "require_order_execution_cycle": (POEA, "_require_order_execution_cycle"),
+        "record_lot": (PLL, "record_lot"),
+        "consume_available_lots": (PLL, "consume_available_lots"),
+        "sync_positions": (PLL, "sync_positions"),
+        "position_rows": (PLL, "position_rows"),
     }
     import manual_orders as MO
     MO.bind_dependencies(
         lambda: MO.ManualOrderDependencies(**{
-            field.name: getattr(*owned_services[field.name]) if field.name in owned_services else globals()[field.name]
+            field.name: getattr(*owned_services[field.name]) if field.name in owned_services else _dependency_implementation(field.name)
             for field in dataclasses.fields(MO.ManualOrderDependencies)
         }),
     )
     import dashboard_queries as DQ
     DQ.bind_dependencies(
         lambda: DQ.DashboardDependencies(**{
-            field.name: getattr(*owned_services[field.name]) if field.name in owned_services else globals()[field.name]
+            field.name: getattr(*owned_services[field.name]) if field.name in owned_services else _dependency_implementation(field.name)
             for field in dataclasses.fields(DQ.DashboardDependencies)
         }),
     )
     EP.bind_dependencies(
         lambda: EP.ExecutionDependencies(**{
-            field.name: getattr(*owned_services[field.name]) if field.name in owned_services else globals()[field.name]
+            field.name: getattr(*owned_services[field.name]) if field.name in owned_services else _dependency_implementation(field.name)
             for field in dataclasses.fields(EP.ExecutionDependencies)
         }),
     )

@@ -60,36 +60,36 @@ class ManualOrderDependencies:
     ACTIVE_ACCOUNT_IDS: Any
     MANUAL_EXECUTION_RETRY_STATUS: Any
     STRATEGY_EXECUTION_RETRY_STATUS: Any
-    _assert_active_lease: Any
-    _assert_order_execution_cycle: Any
-    _audit: Any
-    _build_portfolio_entry_plan: Any
-    _date: Any
-    _db: Any
-    _entry_freeze_enabled: Any
-    _entry_frozen_reason: Any
-    _existing_position_addition_gate: Any
-    _finish_capital_reservation: Any
-    _lease_lost: Any
-    _market_state: Any
-    _now: Any
-    _order_cycle_id: Any
-    _pending_position_slots: Any
-    _position_rows: Any
-    _quotes: Any
-    _record_nav: Any
-    _reserve_shared_capital: Any
-    _risk_log: Any
-    _risk_profile: Any
-    _rollback_slot_borrow: Any
-    _shared_account_exposure: Any
-    _shared_cash: Any
-    _shared_risk_state: Any
-    _spec_for: Any
-    _strategy_entry_assessment: Any
-    _strategy_stamp: Any
-    _universe_snapshot_time: Any
-    _with_decision_snapshot: Any
+    require_active_lease: Any
+    require_order_execution_cycle: Any
+    audit: Any
+    build_portfolio_entry_plan: Any
+    date: Any
+    db: Any
+    entry_freeze_enabled: Any
+    entry_frozen_reason: Any
+    existing_position_addition_gate: Any
+    finish_capital_reservation: Any
+    lease_lost: Any
+    market_state: Any
+    now: Any
+    order_cycle_id: Any
+    pending_position_slots: Any
+    position_rows: Any
+    quotes: Any
+    record_nav: Any
+    reserve_shared_capital: Any
+    risk_log: Any
+    risk_profile: Any
+    rollback_slot_borrow: Any
+    shared_account_exposure: Any
+    shared_cash: Any
+    shared_risk_state: Any
+    spec_for: Any
+    strategy_entry_assessment: Any
+    strategy_stamp: Any
+    universe_snapshot_time: Any
+    with_decision_snapshot: Any
     init_db: Any
 
 
@@ -114,25 +114,25 @@ def _manual_order_plan(
 ):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    _order_cycle_id = deps._order_cycle_id
+    _order_cycle_id = deps.order_cycle_id
     ACTIVE_ACCOUNT_IDS = deps.ACTIVE_ACCOUNT_IDS
-    _spec_for = deps._spec_for
-    _date = deps._date
-    _build_portfolio_entry_plan = deps._build_portfolio_entry_plan
-    _entry_freeze_enabled = deps._entry_freeze_enabled
-    _entry_frozen_reason = deps._entry_frozen_reason
-    _existing_position_addition_gate = deps._existing_position_addition_gate
-    _market_state = deps._market_state
-    _pending_position_slots = deps._pending_position_slots
-    _position_rows = deps._position_rows
-    _quotes = deps._quotes
-    _risk_profile = deps._risk_profile
-    _shared_account_exposure = deps._shared_account_exposure
-    _shared_cash = deps._shared_cash
-    _shared_risk_state = deps._shared_risk_state
-    _strategy_entry_assessment = deps._strategy_entry_assessment
-    _universe_snapshot_time = deps._universe_snapshot_time
-    _with_decision_snapshot = deps._with_decision_snapshot
+    _spec_for = deps.spec_for
+    _date = deps.date
+    _build_portfolio_entry_plan = deps.build_portfolio_entry_plan
+    _entry_freeze_enabled = deps.entry_freeze_enabled
+    _entry_frozen_reason = deps.entry_frozen_reason
+    _existing_position_addition_gate = deps.existing_position_addition_gate
+    _market_state = deps.market_state
+    _pending_position_slots = deps.pending_position_slots
+    _position_rows = deps.position_rows
+    _quotes = deps.quotes
+    _risk_profile = deps.risk_profile
+    _shared_account_exposure = deps.shared_account_exposure
+    _shared_cash = deps.shared_cash
+    _shared_risk_state = deps.shared_risk_state
+    _strategy_entry_assessment = deps.strategy_entry_assessment
+    _universe_snapshot_time = deps.universe_snapshot_time
+    _with_decision_snapshot = deps.with_decision_snapshot
     import execution_planner as EP
     day = _date(asof_day)
     code = str(code or "").strip()
@@ -568,7 +568,7 @@ def preview_manual_order(
 ):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    _db = deps._db
+    _db = deps.db
     init_db = deps.init_db
     init_db()
     with _db() as conn:
@@ -580,11 +580,11 @@ def preview_manual_order(
 def _execute_manual_plan(conn, account, plan, order_id, asof_day):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    _assert_active_lease = deps._assert_active_lease
-    _entry_freeze_enabled = deps._entry_freeze_enabled
-    _entry_frozen_reason = deps._entry_frozen_reason
+    _require_active_lease = deps.require_active_lease
+    _entry_freeze_enabled = deps.entry_freeze_enabled
+    _entry_frozen_reason = deps.entry_frozen_reason
     import execution_planner as EP
-    _assert_active_lease(conn, "manual fill")
+    _require_active_lease(conn, "manual fill")
     if plan.get("side") == "buy" and _entry_freeze_enabled():
         # Callers normally gate this earlier; keep the fill primitive itself
         # fail-closed so a future path cannot debit cash or write a lot while
@@ -622,15 +622,15 @@ def _commit_strategy_buy(
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
-    _assert_active_lease = deps._assert_active_lease
-    _finish_capital_reservation = deps._finish_capital_reservation
-    _lease_lost = deps._lease_lost
-    _now = deps._now
-    _order_cycle_id = deps._order_cycle_id
-    _risk_log = deps._risk_log
-    _strategy_stamp = deps._strategy_stamp
+    _require_active_lease = deps.require_active_lease
+    _finish_capital_reservation = deps.finish_capital_reservation
+    _lease_lost = deps.lease_lost
+    _now = deps.now
+    _order_cycle_id = deps.order_cycle_id
+    _risk_log = deps.risk_log
+    _strategy_stamp = deps.strategy_stamp
     import execution_planner as EP
-    _assert_active_lease(conn, "strategy auxiliary buy")
+    _require_active_lease(conn, "strategy auxiliary buy")
     account_id = account["id"]
     code = str(plan["code"])
     qty = int(plan["qty"])
@@ -685,7 +685,7 @@ def _commit_strategy_buy(
         )
         _risk_log(conn, account_id, code, "buy", STRATEGY_EXECUTION_RETRY_STATUS, failure, detail)
         return None, failure
-    _assert_active_lease(conn, "strategy auxiliary audit")
+    _require_active_lease(conn, "strategy auxiliary audit")
     # risk/audit 事件由 planner 的 commit_fill 统一写入，此处不再重复记录，
     # 避免同一笔成交在 paper_risk_decisions / paper_audit 中出现两次。
     return {"order_id": order_id, "side": "buy", "code": code, "qty": qty}, None
@@ -708,9 +708,9 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
-    _finish_capital_reservation = deps._finish_capital_reservation
-    _risk_log = deps._risk_log
-    _rollback_slot_borrow = deps._rollback_slot_borrow
+    _finish_capital_reservation = deps.finish_capital_reservation
+    _risk_log = deps.risk_log
+    _rollback_slot_borrow = deps.rollback_slot_borrow
     borrow = risk.get("slot_borrow") or {}
     if borrow.get("allowed"):
         risk["slot_borrow_rollback"] = _rollback_slot_borrow(
@@ -768,13 +768,13 @@ def commit_strategy_entry_fill(
     """
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    _assert_active_lease = deps._assert_active_lease
-    _lease_lost = deps._lease_lost
+    _require_active_lease = deps.require_active_lease
+    _lease_lost = deps.lease_lost
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        _assert_active_lease(conn, "strategy fill commit")
+        _require_active_lease(conn, "strategy fill commit")
         # §43：plan 必须携带完整 lot 身份（code/name/industry），否则
         # `_record_lot` 会丢失持仓元数据。
         EP.commit_fill(
@@ -824,7 +824,7 @@ def commit_strategy_entry_fill(
                 "reasons": reason_codes,
                 "order_id": order_id,
             }
-        _assert_active_lease(conn, "strategy fill finalization")
+        _require_active_lease(conn, "strategy fill finalization")
         slice_done = slice_state is None
         if slice_state is not None:
             slice_plan = [int(item) for item in (slice_state.get("plan") or [])]
@@ -868,19 +868,19 @@ def submit_manual_order(
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
-    _audit = deps._audit
-    _date = deps._date
-    _db = deps._db
-    _entry_frozen_reason = deps._entry_frozen_reason
-    _finish_capital_reservation = deps._finish_capital_reservation
-    _market_state = deps._market_state
-    _now = deps._now
-    _order_cycle_id = deps._order_cycle_id
-    _quotes = deps._quotes
-    _record_nav = deps._record_nav
-    _reserve_shared_capital = deps._reserve_shared_capital
-    _risk_log = deps._risk_log
-    _strategy_stamp = deps._strategy_stamp
+    _audit = deps.audit
+    _date = deps.date
+    _db = deps.db
+    _entry_frozen_reason = deps.entry_frozen_reason
+    _finish_capital_reservation = deps.finish_capital_reservation
+    _market_state = deps.market_state
+    _now = deps.now
+    _order_cycle_id = deps.order_cycle_id
+    _quotes = deps.quotes
+    _record_nav = deps.record_nav
+    _reserve_shared_capital = deps.reserve_shared_capital
+    _risk_log = deps.risk_log
+    _strategy_stamp = deps.strategy_stamp
     init_db = deps.init_db
     deps = _dependencies()
     _ReservationCycleMismatch = ReservationCycleMismatch
@@ -1021,10 +1021,10 @@ def submit_manual_order(
 def cancel_manual_order(order_id):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    _audit = deps._audit
-    _db = deps._db
-    _finish_capital_reservation = deps._finish_capital_reservation
-    _now = deps._now
+    _audit = deps.audit
+    _db = deps.db
+    _finish_capital_reservation = deps.finish_capital_reservation
+    _now = deps.now
     init_db = deps.init_db
     init_db()
     with _db() as conn:
@@ -1053,8 +1053,8 @@ def cancel_manual_order(order_id):
 def _order_execution_cycle_guard():
     """通过已注入能力解析订单执行周期校验器。"""
     deps = _dependencies()
-    _assert_order_execution_cycle = deps._assert_order_execution_cycle
-    return _assert_order_execution_cycle
+    _require_order_execution_cycle = deps.require_order_execution_cycle
+    return _require_order_execution_cycle
 
 
 #: 两类「订单不得进入成交语义」的拒绝标记。二者的区别是**证据状态**，不是严重性：
@@ -1118,10 +1118,10 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     """
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
-    _audit = deps._audit
-    _finish_capital_reservation = deps._finish_capital_reservation
-    _now = deps._now
-    _risk_log = deps._risk_log
+    _audit = deps.audit
+    _finish_capital_reservation = deps.finish_capital_reservation
+    _now = deps.now
+    _risk_log = deps.risk_log
     order_id = int(order["id"])
     marker = getattr(exc, "marker", None) or "order_execution_cycle_changed"
     detail = {
@@ -1172,19 +1172,19 @@ def process_pending_manual_orders(asof_date=None):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     MANUAL_EXECUTION_RETRY_STATUS = deps.MANUAL_EXECUTION_RETRY_STATUS
-    _assert_active_lease = deps._assert_active_lease
-    _audit = deps._audit
-    _date = deps._date
-    _db = deps._db
-    _entry_freeze_enabled = deps._entry_freeze_enabled
-    _entry_frozen_reason = deps._entry_frozen_reason
-    _finish_capital_reservation = deps._finish_capital_reservation
-    _lease_lost = deps._lease_lost
-    _market_state = deps._market_state
-    _quotes = deps._quotes
-    _record_nav = deps._record_nav
-    _reserve_shared_capital = deps._reserve_shared_capital
-    _risk_log = deps._risk_log
+    _require_active_lease = deps.require_active_lease
+    _audit = deps.audit
+    _date = deps.date
+    _db = deps.db
+    _entry_freeze_enabled = deps.entry_freeze_enabled
+    _entry_frozen_reason = deps.entry_frozen_reason
+    _finish_capital_reservation = deps.finish_capital_reservation
+    _lease_lost = deps.lease_lost
+    _market_state = deps.market_state
+    _quotes = deps.quotes
+    _record_nav = deps.record_nav
+    _reserve_shared_capital = deps.reserve_shared_capital
+    _risk_log = deps.risk_log
     init_db = deps.init_db
     deps = _dependencies()
     _ReservationCycleMismatch = ReservationCycleMismatch
@@ -1230,7 +1230,7 @@ def process_pending_manual_orders(asof_date=None):
             retry_params,
         )
         for order in pending:
-            _assert_active_lease(conn, "pending manual order")
+            _require_active_lease(conn, "pending manual order")
             # ── execution-cycle 预检（§7/§16/§23）：必须在**任何** reservation /
             # cash / lot / fill mutation 之前。旧代码在触发后才调用
             # ``_reserve_shared_capital``，而预占会读当前共享现金并写入**当前**

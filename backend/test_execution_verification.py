@@ -744,27 +744,27 @@ class CommitFillStampsTest(unittest.TestCase):
         import paper_trading as PT
 
         stub = types.SimpleNamespace(
-            _assert_active_lease=lambda conn, label: None,
-            _reserve_shared_capital=lambda *a, **k: (True, None),
-            _debit_shared_cash=lambda *a, **k: None,
-            _finish_capital_reservation=lambda *a, **k: None,
-            _record_lot=lambda *a, **k: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
-            _credit_shared_cash=lambda *a, **k: None,
+            require_active_lease=lambda conn, label: None,
+            reserve_shared_capital=lambda *a, **k: (True, None),
+            debit_shared_cash=lambda *a, **k: None,
+            finish_capital_reservation=lambda *a, **k: None,
+            record_lot=lambda *a, **k: None,
+            consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
+            credit_shared_cash=lambda *a, **k: None,
             _json=lambda value: "{}",
-            _now=lambda: SESSION + " 15:00:00",
-            _date=lambda day: day,
+            now=lambda: SESSION + " 15:00:00",
+            date=lambda day: day,
             _num=lambda value, default=0.0: default if value in (None, "") else float(value),
-            _risk_log=lambda *a, **k: None,
-            _audit=lambda *a, **k: None,
-            _sync_positions=lambda *a, **k: None,
-            _order_cycle_provenance_for_order=PT._order_cycle_provenance_for_order,
+            risk_log=lambda *a, **k: None,
+            audit=lambda *a, **k: None,
+            sync_positions=lambda *a, **k: None,
+            order_cycle_provenance_for_order=PT._order_cycle_provenance_for_order,
             OrderCycleProvenanceUnknown=PT.OrderCycleProvenanceUnknown,
             # Round-7：commit_fill 现在还会校验 order cycle == account cycle ==
             # active cycle。这里指向**真实**实现（连同它需要的两个只读查询入口），
             # 让本用例的周期一致性能被真实判定 —— 替身若恒真，本文件就无法在
             # 「周期一致性校验被删掉」时转红。
-            _assert_order_execution_cycle=PT._assert_order_execution_cycle,
+            require_order_execution_cycle=PT._require_order_execution_cycle,
             _active_cycle_id_readonly=PT._active_cycle_id_readonly,
             _account_cycle_id_readonly=PT._account_cycle_id_readonly,
             OrderExecutionCycleChanged=PT.OrderExecutionCycleChanged,

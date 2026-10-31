@@ -62,14 +62,14 @@ class LeaseAndFreshnessTests(unittest.TestCase):
         self.assertEqual(token2[1], token1 + 1)
 
         P._set_lease_context("test-lock", owner2, token2[1])
-        P._assert_active_lease(conn, "test")
+        P._require_active_lease(conn, "test")
         conn.execute(
             "UPDATE paper_runtime_locks SET owner_key='new-owner',fencing_token=? "
             "WHERE lock_key='test-lock'",
             (token2[1] + 1,),
         )
         with self.assertRaisesRegex(RuntimeError, "paper lease lost"):
-            P._assert_active_lease(conn, "stale worker")
+            P._require_active_lease(conn, "stale worker")
         P._clear_lease_context()
 
     def test_intraday_key_is_three_minute_bucket(self):

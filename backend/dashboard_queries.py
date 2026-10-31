@@ -42,22 +42,22 @@ def active_cycle_readonly(conn):
 class DashboardDependencies:
     """Explicit capabilities supplied by the application composition root."""
     ACCOUNT_SPECS: Any
-    _account_metric_inputs: Any
-    _account_metrics: Any
-    _account_reference_capital: Any
-    _active_account_rows: Any
-    _db_readonly: Any
-    _economic_pool_nav_history: Any
-    _entry_freeze_status: Any
-    _execution_verified_predicate: Any
-    _latest_price_map: Any
-    _market_session: Any
-    _position_rows: Any
-    _recent_orders_with_archives: Any
-    _schedule_cache: Any
-    _shared_initial_cash: Any
-    _shared_metrics: Any
-    _today_position_performance: Any
+    account_metric_inputs: Any
+    account_metrics: Any
+    account_reference_capital: Any
+    active_account_rows: Any
+    db_readonly: Any
+    economic_pool_nav_history: Any
+    entry_freeze_status: Any
+    execution_verified_predicate: Any
+    latest_price_map: Any
+    market_session: Any
+    position_rows: Any
+    recent_orders_with_archives: Any
+    schedule_cache: Any
+    shared_initial_cash: Any
+    shared_metrics: Any
+    today_position_performance: Any
     dfc: Any
     schedule_status: Any
 
@@ -106,24 +106,24 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
 
     deps = dependencies if dependencies is not None else _dependencies()
     ACCOUNT_SPECS = deps.ACCOUNT_SPECS
-    _account_metric_inputs = deps._account_metric_inputs
-    _account_metrics = deps._account_metrics
-    _account_reference_capital = deps._account_reference_capital
-    _active_account_rows = deps._active_account_rows
-    _db_readonly = deps._db_readonly
-    _economic_pool_nav_history = deps._economic_pool_nav_history
-    _entry_freeze_status = deps._entry_freeze_status
-    _latest_price_map = deps._latest_price_map
-    _market_session = deps._market_session
-    _position_rows = deps._position_rows
-    _recent_orders_with_archives = deps._recent_orders_with_archives
-    _schedule_cache = deps._schedule_cache
-    _shared_initial_cash = deps._shared_initial_cash
-    _shared_metrics = deps._shared_metrics
-    _today_position_performance = deps._today_position_performance
+    _account_metric_inputs = deps.account_metric_inputs
+    _account_metrics = deps.account_metrics
+    _account_reference_capital = deps.account_reference_capital
+    _active_account_rows = deps.active_account_rows
+    _db_readonly = deps.db_readonly
+    _economic_pool_nav_history = deps.economic_pool_nav_history
+    _entry_freeze_status = deps.entry_freeze_status
+    _latest_price_map = deps.latest_price_map
+    _market_session = deps.market_session
+    _position_rows = deps.position_rows
+    _recent_orders_with_archives = deps.recent_orders_with_archives
+    _schedule_cache = deps.schedule_cache
+    _shared_initial_cash = deps.shared_initial_cash
+    _shared_metrics = deps.shared_metrics
+    _today_position_performance = deps.today_position_performance
     dfc = deps.dfc
     schedule_status = deps.schedule_status
-    _execution_verified_predicate = deps._execution_verified_predicate
+    _execution_verified_predicate = deps.execution_verified_predicate
     import market_data_service as MDSvc
 
     # Cache schedule_status to avoid repeated init_db() calls
