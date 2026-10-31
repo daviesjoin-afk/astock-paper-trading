@@ -848,8 +848,10 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         raw = _source("paper_risk_evidence.py")
         body = _named_function_source("paper_risk_evidence.py", "best_replacement_candidate", raw)
         eligible = _named_function_source("paper_risk_evidence.py", "eligible_replacement_candidates", raw)
+        inputs = _named_function_source("paper_risk_evidence.py", "replacement_candidate_inputs", raw)
         self.assertIn("eligible_replacement_candidates(", body)
-        self.assertIn("PREPL.load_replacement_candidates(", eligible,
+        self.assertIn("replacement_candidate_inputs(", eligible)
+        self.assertIn("PREPL.load_replacement_candidates(", inputs,
                       "候选读取没有经过 as-of 有界的 evidence 层")
         self.assertIn("PRep.choose_best_candidate(", body,
                       "候选排序没有交给纯域模块")

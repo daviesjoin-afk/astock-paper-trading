@@ -1,10 +1,11 @@
-"""PR4 fixed-clock risk/ledger and real CSV-read comparison.
+"""PR4/PR5 fixed-clock risk/ledger, CSV-read and SQL-query comparison.
 
 Run the same absolute script from each checkout root with an output JSON path.
 Only temporary fixture ledgers/files are used. freezegun is a probe dependency,
 not an application dependency; source invocation counts are not HTTP counts.
 """
 from collections import Counter
+from contextlib import contextmanager
 import datetime as dt
 import json
 from pathlib import Path
@@ -28,12 +29,12 @@ TABLES = (
     "paper_position_lots", "paper_capital_reservations", "paper_nav",
     "paper_audit", "paper_cycles", "paper_position_risk_state",
     "paper_risk_decisions", "paper_risk_scan_runs", "paper_position_reviews",
-    "paper_position_limit_versions",
+    "paper_position_limit_versions", "paper_signals",
 )
 SCENARIOS = (
     "hold", "full_sell", "partial_sell", "stale_quote", "t1", "limit_down",
     "same_code_two_accounts", "missing", "empty", "corrupt",
-    "transient_empty", "transient_error", "unused_audit_error",
+    "transient_empty", "transient_error", "unused_audit_error", "three_positions_one_account",
 )
 
 
@@ -56,6 +57,28 @@ def run(scenario):
             case.set_quote(price=9.0, pct=-10.0, high=9.0, low=9.0)
         elif scenario == "same_code_two_accounts":
             case.add_lot_for_account("trend_pullback", case.code, 100, 10.0)
+        elif scenario == "three_positions_one_account":
+            for code in (case.code_b, "600003"):
+                case.add_lot_for(code, 100, 10.0)
+                case.set_quote(code)
+            with PT._db(immediate=True) as conn:
+                for code, score, intended, signal_day in (
+                    ("600004", 80, case.day, case.day - dt.timedelta(days=1)),
+                    ("600005", 90, case.day, case.day),
+                    ("600006", 100, case.day + dt.timedelta(days=1), case.day),
+                    ("600007", 100, case.day, case.day + dt.timedelta(days=1)),
+                ):
+                    conn.execute(
+                        "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,name,"
+                        "rank_score,t_score,payload,status,created_at,"
+                        "strategy_id,strategy_version,strategy_checksum,cycle_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)",
+                        (case.ACCOUNT, str(signal_day), str(intended), code, "测试股", score, score,
+                         json.dumps({"decision": {"entry_model": {"score": score}}}), str(case.day),
+                         *PT._strategy_stamp(conn, case.ACCOUNT), case.cycle),
+                    )
+            for code in ("600004", "600005"):
+                case.set_quote(code)
 
         csv = Path(case._inner.tmp_dir) / "fixture.csv"
         index = pd.date_range(case.day - dt.timedelta(days=130), case.day + dt.timedelta(days=2))
@@ -116,9 +139,18 @@ def run(scenario):
                 raise OSError("unused audit error")
             return Data.completed_kline(code, cutoff, inclusive=inclusive)
 
+        queries = []
+        original_db = PT._db
+        @contextmanager
+        def traced_db(*args, **kwargs):
+            with original_db(*args, **kwargs) as conn:
+                conn.set_trace_callback(lambda sql: queries.append((kwargs.get("immediate", False), sql)))
+                yield conn
+
         result, error = None, None
         with mock.patch.object(PT, "_completed_kline", side_effect=load), \
-             mock.patch.object(Data, "load_cached_kline", side_effect=source):
+             mock.patch.object(Data, "load_cached_kline", side_effect=source), \
+             mock.patch.object(PT, "_db", traced_db):
             try:
                 result = case.run_risk()
             except Exception as exc:
@@ -133,7 +165,14 @@ def run(scenario):
                 "source": {"loader_calls": len(reads), "csv_reads": csv_reads,
                            "inside_writer": sum(not r["outside_writer"] for r in reads), "reads": reads,
                            "csv_inside_writer": sum(not r["outside_writer"] for r in csv_observations),
-                           "csv_observations": csv_observations}}
+                           "csv_observations": csv_observations,
+                           "candidate_writer_queries": sum(writer and "FROM paper_signals WHERE account_id=" in sql
+                                                           and "signal_date<=" in sql for writer, sql in queries),
+                           "candidate_snapshot_queries": sum(not writer and "FROM paper_signals WHERE account_id=" in sql
+                                                             and "signal_date<=" in sql for writer, sql in queries),
+                           "marker_queries": sum("FROM paper_orders" in sql
+                                                 and "json_extract(risk_payload,'$.exit_marker')" in sql
+                                                 for _writer, sql in queries)}}
     finally:
         case.doCleanups()
 

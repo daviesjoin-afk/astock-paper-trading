@@ -331,12 +331,20 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             ).fetchone()[0]
             for account_id in account_map
         }
+        # These are raw rows from this writer snapshot, not replacement decisions.
+        replacement_rows = {
+            account_id: PREv.replacement_candidate_inputs(
+                conn, account_id, day, deps=ports.evidence,
+            )
+            for account_id in held_by_account
+        }
         quality_reviews = {}
         for position in positions:
             replacement = PREv.best_replacement_candidate(
                 conn, position["account_id"], day,
                 held_by_account.get(position["account_id"], set()),
                 deps=ports.evidence,
+                candidate_rows=replacement_rows[position["account_id"]],
             )
             review = PREv.position_quality_score(
                 conn, position, quote_map.get(position["code"], {}), day,
@@ -486,10 +494,20 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             # 于是每轮扫描再发一张同样的减仓单 —— 300+300+300… 突破配置比例。
             # 中文 reason LIKE 仅作标记上线前旧订单的兜底。
             # 首段减仓执行证据（成交价 + 距今分钟），全清据此要求独立确认。
-            hard_stop_trim = EV.first_verified_positive_execution(
-                conn, marker="hard_stop_first_trim",
+            guard_level = downside_guard.get("level")
+            # Keep this bounded to the current position and current writer:
+            # earlier positions may already have committed new execution facts.
+            marker_facts = EV.verified_execution_markers(
+                conn, markers={
+                    "hard_stop_first_trim": "%硬止损首段减仓%",
+                    "downside_warning_trim": "%下跌预警首段减仓%",
+                    f"downside_{guard_level}": f"%下跌{guard_level}已连续两次确认%",
+                    "downside_warning_confirmed": "%下跌预警连续两次确认减仓%",
+                },
                 account_id=position["account_id"], code=position["code"],
-                asof_day=day, legacy_reason_like="%硬止损首段减仓%")
+                asof_day=day,
+            )
+            hard_stop_trim = marker_facts["hard_stop_first_trim"]
             base_spec = _spec_for(position["account_id"], conn, cycle_id=cycle_id)
             ratio, reason, next_stage, detail = PREv.sell_plan(
                 position, quote, day, news,
@@ -547,32 +565,18 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             # 的第一次减仓，否则一个"没发生过的卖出"会把真实需要减仓的持仓永久挡住。
             # 结构化 marker 是主判据（见下方 guard_actionable 分支写入
             # detail["exit_marker"]），中文 LIKE 仅作标记上线前旧订单的同日兜底。
-            warning_trimmed = EV.has_verified_positive_execution(
-                conn, marker="downside_warning_trim",
-                account_id=position["account_id"], code=position["code"],
-                asof_day=day, legacy_reason_like="%下跌预警首段减仓%",
-            )
+            warning_trimmed = marker_facts["downside_warning_trim"] is not None
             # P3 审计修复（P1）：partial/full 缺少一次性消费标记——确认后
             # 每个扫描周期都重复减仓，弱势日 ~10 分钟内复利式清仓。按级别
             # 去重：partial 已卖不重复 partial，但条件恶化仍可升级到 full。
-            guard_level = downside_guard.get("level")
-            guard_level_trimmed = EV.has_verified_positive_execution(
-                conn, marker=f"downside_{guard_level}",
-                account_id=position["account_id"], code=position["code"],
-                asof_day=day,
-                legacy_reason_like=f"%下跌{guard_level}已连续两次确认%",
-            )
+            guard_level_trimmed = marker_facts[f"downside_{guard_level}"] is not None
             # 2026-09-03 二次确认减仓：warning 级首段减仓（一天一次）用完
             # 之后，若连续两轮扫描（满足最小扫描间隔）均确认"疑似出货"，
             # 允许追加一次 partial 比例的减仓——兑现"连续两次扫描确认后
             # 才允许部分减仓"的审计口径；当日一次，条件恶化仍可升级 full。
             # 2026-10-30：确认依据还可能是 price_evidence（资金证据缺失），
             # 该通道只到 partial；判据全部下沉到 PREv.downside_action_plan。
-            warning_confirmed_trimmed = EV.has_verified_positive_execution(
-                conn, marker="downside_warning_confirmed",
-                account_id=position["account_id"], code=position["code"],
-                asof_day=day, legacy_reason_like="%下跌预警连续两次确认减仓%",
-            )
+            warning_confirmed_trimmed = marker_facts["downside_warning_confirmed"] is not None
             plan = PREv.downside_action_plan(
                 position["account_id"], downside_guard,
                 confirmation=confirmation,

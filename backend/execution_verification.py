@@ -596,6 +596,11 @@ def first_verified_positive_execution(
         return unknown
     if row is None:
         return None
+    return _marker_execution_detail(row, now=now)
+
+
+def _marker_execution_detail(row, *, now=None):
+    """One owner formatter for single and batched marker evidence."""
     stamp = row["executed_at"] or row["created_at"]
     age_minutes = None
     if stamp:
@@ -609,6 +614,58 @@ def first_verified_positive_execution(
             age_minutes = None
     return {"created_at": row["created_at"], "executed_at": row["executed_at"],
             "filled_price": row["filled_price"], "age_minutes": age_minutes}
+
+
+def verified_execution_markers(
+    conn, *, markers: Mapping[str, str | None], account_id: Any, code: Any,
+    asof_day: Any, column: str = "risk_payload", marker_key: str = "exit_marker", now: Any = None,
+) -> dict:
+    """Read several markers for one position at one transaction boundary.
+
+    Values have the same three states as first_verified_positive_execution:
+    None, positive execution evidence, or explicit unknown evidence. JSON/LIKE
+    matching and the positive-execution predicate remain owned by this module.
+    The caller must not carry this snapshot across positions or transactions.
+    """
+    if column not in _MARKER_COLUMNS:
+        raise ValueError(f"unsupported marker column: {column!r}")
+    if marker_key not in _MARKER_KEYS:
+        raise ValueError(f"unsupported marker key: {marker_key!r}")
+    result = {marker: None for marker in markers}
+    active = [(marker, legacy) for marker, legacy in markers.items() if marker]
+    day = str(asof_day or "")[:10]
+    if not active or not day:
+        return result
+    flags, params = [], []
+    for index, (marker, legacy) in enumerate(active):
+        matcher = f"json_extract({column},'$.{marker_key}')=?"
+        params.append(str(marker))
+        if legacy:
+            matcher = f"({matcher} OR reason LIKE ?)"
+            params.append(str(legacy))
+        flags.append(f"{matcher} AS marker_{index}")
+    sql = (
+        "SELECT created_at,filled_price,executed_at," + ",".join(flags)
+        + " FROM paper_orders WHERE account_id=? AND code=? AND side='sell'"
+        + f" AND {POSITIVE_EXECUTION_PREDICATE} AND substr(created_at,1,10)=? ORDER BY id ASC"
+    )
+    try:
+        rows = _dict_rows(conn.execute(sql, (*params, str(account_id), str(code), day)))
+    except sqlite3.Error:
+        # A malformed later JSON row can fail a batch even when a single-marker
+        # LIMIT 1 would already have succeeded. Preserve each original outcome.
+        return {
+            marker: first_verified_positive_execution(
+                conn, marker=marker, account_id=account_id, code=code, asof_day=asof_day,
+                legacy_reason_like=legacy, column=column, marker_key=marker_key, now=now,
+            )
+            for marker, legacy in markers.items()
+        }
+    for row in rows:
+        for index, (marker, _legacy) in enumerate(active):
+            if result[marker] is None and row[f"marker_{index}"]:
+                result[marker] = _marker_execution_detail(row, now=now)
+    return result
 
 
 def is_confirmed_zero_row(row: Any) -> bool:

@@ -152,7 +152,7 @@ class RiskActionDedupHasOneImplementation(unittest.TestCase):
     def test_guard17a_risk_service_delegates_to_the_verification_authority(self):
         source = _source(PAPER_RISK_SERVICE)
         self.assertIn(
-            "has_verified_positive_execution", source,
+            "EV.verified_execution_markers(", source,
             "风险扫描必须走 execution_verification 的唯一去重判据",
         )
 
