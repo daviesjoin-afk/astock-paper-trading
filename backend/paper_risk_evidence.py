@@ -25,6 +25,7 @@ from paper_common import now_text as _now, as_date as _date, dump_json as _json,
 __all__ = [
     "RiskEvidenceDeps",
     "prefetch_position_alt_data",
+    "eligible_replacement_candidates",
     "best_replacement_candidate",
     "intraday_downside_guard",
     "downside_confirmed",

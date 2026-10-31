@@ -12,6 +12,14 @@ from test_replacement_asof_provenance import _EvidenceCase, ACCOUNT, DAY, DAY_NE
 from test_paper_risk_exit_production_path import PaperRiskExitProductionPathTestCase
 
 
+class PublicInterfaceTests(unittest.TestCase):
+    def test_replacement_eligibility_is_declared_public(self):
+        self.assertIn(
+            "eligible_replacement_candidates",
+            Risk.__all__,
+        )
+
+
 class ReplacementScopeTests(_EvidenceCase):
     def test_eligibility_and_winner_match_original_query_and_filters(self):
         deps = PT._risk_service_ports().evidence
