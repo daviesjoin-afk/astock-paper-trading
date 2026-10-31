@@ -4288,14 +4288,27 @@ name+DDL 原文）。命中才走低成本路径，且**仍然**做必需表/列
 手动订单恢复、风险扫描状态恢复、snapshot worker 与 API 初始化入口全部保持；策略、
 风险阈值、委托成交算法、行情核验政策未改。
 
-**量化（同机 15 次，详见 `docs/LEDGER_BOOTSTRAP_LIFECYCLE.md`）**：日常启动
-15.44 → 10.68 ms（P50），单次 SQL 516 → 194，DDL 204 → **0**，schema 检查 133 → 38，
-基准 K 线读取 1 → **0**；旧库首次升级一次性 +1.5 ms。固定输入账本对照 63 张表逐字段
-严格相等，结构一致，仅多出收据表。离线数字**不**代表生产耗时。
+**WAL 收尾**：`PRAGMA wal_checkpoint(TRUNCATE)` 只在 fresh/cold（真正建过/升过结构）
+且事务提交、连接关闭之后执行；verified 路径与 master 的快路径一样**不**发起 checkpoint。
+`paper_storage.wal_checkpoint` 与 retention 等独立维护路径不变。
 
-**回归门禁**：`backend/test_ledger_bootstrap_lifecycle.py`（12 项：新库/重复初始化/缺表
+**指纹 fail closed**：任一必需 owner 的源码取不到时，`schema_owner_fingerprint()` 抛
+`LedgerSchemaBootstrapError`（带 owner 名、路径与原因），不返回哨兵、不写收据、不进
+verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailable:` 值一律判无效。
+
+**返回值契约**：`init_db()` 正常返回 `None`（与拆分前一致）；`cold`/`verified` 只是
+`paper_ledger_bootstrap.bootstrap_schema()` 的内部编排结果，不构成进程级 ready 状态。
+
+**量化（同机，详见 `docs/LEDGER_BOOTSTRAP_LIFECYCLE.md`）**：日常启动 16.28 → 8.18 ms
+（P50），空库首次 91.81 → 64.15 ms，有持续只读事务时 12.04 → 6.91 ms；单次 SQL
+516 → 194，DDL 204 → **0**，schema 检查 133 → 38，基准 K 线读取 1 → **0**；
+`wal_checkpoint` 次数 fresh/cold/verified = 1/1/0（与 master 一致）；旧库首次升级
+一次性 +0～1 ms。固定输入账本对照 63 张表逐字段严格相等，结构一致，仅多出收据表。
+离线数字**不**代表生产耗时。
+
+**回归门禁**：`backend/test_ledger_bootstrap_lifecycle.py`（25 项：新库/重复初始化/缺表
 缺列/中断恢复/双进程/只读并发/有效与过期租约/对账/换 DB_PATH/失败 fail closed/成交事实
-不变）、`test_architecture_boundary_audit`（`cross_domain_edges` 8 → 10，切片见
+不变，以及 checkpoint 范围、源码指纹 fail closed、`init_db()` 返回值契约）、`test_architecture_boundary_audit`（`cross_domain_edges` 8 → 10，切片见
 `docs/COUPLING_BUDGET.md`）、`test_schema_ownership`、`test_db_migrate`。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

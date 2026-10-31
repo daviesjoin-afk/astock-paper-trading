@@ -100,6 +100,24 @@ def sqlite_busy_backoff(attempt: int, hot_path: bool = False) -> float:
         return base + jitter
 
 
+def apply_journal_mode(conn, attempts=6):
+    """把连接切到 WAL，并容忍"另一个进程正在初始化"的瞬时锁。
+
+    ``PRAGMA journal_mode=WAL`` 不是普通读：它可能要改写数据库头。两个进程同时
+    启动、其中一个已持有写事务时，切换会立刻返回 SQLITE_BUSY（SQLite 对
+    journal-mode 变更不做无限等待）。这里沿用存储层既有的 busy 判定与退避做有界
+    重试：连接超时、事务隔离与 fencing 语义都不变，只是不在启动竞态里直接失败。
+    """
+    for attempt in range(attempts):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if not is_sqlite_busy_error(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(sqlite_busy_backoff(attempt))
+
+
 @contextmanager
 def db(db_path, immediate=False, hot_path=False):
     """获取数据库连接并保证事务在关闭前明确提交或回滚。"""
@@ -109,7 +127,7 @@ def db(db_path, immediate=False, hot_path=False):
         conn = sqlite3.connect(db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
+        apply_journal_mode(conn)
         conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-32000")

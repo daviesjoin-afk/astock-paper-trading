@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import statistics
 import sys
 import tempfile
@@ -85,6 +86,16 @@ class Recorder:
             self.schema_checks += 1
 
 
+class CallCounter:
+    """可调用计数器（trace 之外再数 checkpoint 次数，避免闭包捕获循环变量）。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(1)
+
+
 def _traced_db_factory(original, recorder, acquire_times):
     @contextmanager
     def traced(*args, **kwargs):
@@ -101,23 +112,28 @@ def _traced_db_factory(original, recorder, acquire_times):
     return traced
 
 
-def _measure(paper_trading, paper_storage, db_path, runs):
-    """在同一个库上跑 ``runs`` 次初始化，返回耗时与单次 SQL/DDL 统计。"""
+def _measure(paper_trading, paper_storage, db_path, runs, *, reader=None):
+    """在同一个库上跑 ``runs`` 次初始化，返回耗时、SQL 与 checkpoint 统计。"""
     paper_trading.DB_PATH = db_path
     durations = []
     acquires = []
+    checkpoints = []
     last = {}
     for _ in range(runs):
         recorder = Recorder()
         acquired = []
+        counter = CallCounter()
         original = paper_storage.db
         with mock.patch.object(
             paper_storage, "db", _traced_db_factory(original, recorder, acquired)
+        ), mock.patch.object(
+            paper_storage, "wal_checkpoint", side_effect=counter
         ):
             started = time.perf_counter()
             paper_trading.init_db()
             durations.append((time.perf_counter() - started) * 1000.0)
         acquires.extend(acquired)
+        checkpoints.append(len(counter.calls))
         last = {
             "statements": recorder.statements,
             "ddl": recorder.ddl,
@@ -126,6 +142,7 @@ def _measure(paper_trading, paper_storage, db_path, runs):
     return {
         "duration_ms": _stats(durations),
         "acquire_ms": _stats(acquires),
+        "wal_checkpoint_calls_per_run": checkpoints,
         "last_run": last,
     }
 
@@ -192,6 +209,16 @@ def main():
         receipt = reader(conn) if reader else None
         current["receipt"] = None if receipt is None else receipt["contract_version"]
     result["scenarios"]["current"] = current
+
+    # ---- contention：verified 初始化期间一直有一个只读事务开着 ----
+    reader_conn = sqlite3.connect(empty_db, timeout=30)
+    try:
+        reader_conn.execute("BEGIN")
+        reader_conn.execute("SELECT count(*) FROM paper_orders").fetchone()
+        result["scenarios"]["reader_contention"] = _measure(PT, PST, empty_db, args.runs)
+    finally:
+        reader_conn.rollback()
+        reader_conn.close()
 
     # ---- legacy：master 生成的旧库 ----
     if args.legacy_db:

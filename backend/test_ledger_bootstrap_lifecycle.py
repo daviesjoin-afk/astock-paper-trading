@@ -14,14 +14,17 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
 import time
+import types
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
@@ -42,8 +45,12 @@ def _stamp(now):
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
-class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
-    """每个用例一块独立 SQLite 文件；不碰 checkout 里的真实账本。"""
+class LedgerBootstrapFixture(unittest.TestCase):
+    """公共夹具：每个用例一块独立 SQLite 文件；不碰 checkout 里的真实账本。
+
+    只放 setUp 与辅助方法 —— 专项场景由下面的子类各自声明，避免同一批用例被
+    重复执行。
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="astock-pr6-")
@@ -58,7 +65,28 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
     # ---------- 基础工具 ----------
 
     def _init(self):
-        return PT.init_db()
+        """跑一次 init_db，并单独拿它的公开返回值做契约断言。"""
+        result = PT.init_db()
+        self.assertIsNone(result, "init_db() 的公开契约是返回 None")
+        return result
+
+    def _init_path(self):
+        """跑一次 init_db，并从 schema bootstrap owner 的编排结果里读路径。
+
+        ``init_db()`` 本身只返回 ``None``（拆分前的公开契约），所以 cold/verified
+        只能从 owner 的返回值或真实结构状态观察，不能依赖公开返回值。
+        """
+        captured = {}
+        real = PLB.bootstrap_schema
+
+        def spy(conn, *, fresh):
+            outcome = real(conn, fresh=fresh)
+            captured["path"] = outcome["path"]
+            return outcome
+
+        with mock.patch.object(PLB, "bootstrap_schema", side_effect=spy):
+            self._init()
+        return captured["path"]
 
     def _db(self):
         return PT._db(immediate=True)
@@ -115,11 +143,13 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
             )
         return order_id
 
+class LedgerBootstrapLifecycleTestCase(LedgerBootstrapFixture):
+    """PR-6 主场景：结构 bootstrap 与运行期恢复的边界。"""
+
     # ---------- 1. 全新空库 ----------
 
     def test_fresh_database_bootstraps_full_structure(self):
-        result = self._init()
-        self.assertEqual(result["path"], "cold")
+        self.assertEqual(self._init_path(), "cold")
         tables = self._table_names()
         for required in PSM.REQUIRED_TABLES:
             self.assertIn(required, tables, f"新库缺少必需表 {required}")
@@ -140,8 +170,8 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
         recovery = mock.patch.object(PT, "_recover_ledger_runtime", wraps=PT._recover_ledger_runtime)
         structure = mock.patch.object(PLB, "ensure_ledger_structure", wraps=PLB.ensure_ledger_structure)
         with recovery as recovery_spy, structure as structure_spy:
-            result = self._init()
-        self.assertEqual(result["path"], "verified")
+            path = self._init_path()
+        self.assertEqual(path, "verified")
         structure_spy.assert_not_called()   # 不重复 DDL
         recovery_spy.assert_called_once()   # 但业务恢复照跑
 
@@ -155,13 +185,11 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
         self.assertNotIn("paper_position_risk_state", self._table_names())
         self.assertNotIn("quote_status", self._columns("paper_nav"))
 
-        result = self._init()
-
-        self.assertEqual(result["path"], "cold")
+        self.assertEqual(self._init_path(), "cold")
         self.assertIn("paper_position_risk_state", self._table_names())
         self.assertIn("quote_status", self._columns("paper_nav"))
         # 修完之后收据要跟着新结构更新，否则下一次又会全量重建。
-        self.assertEqual(self._init()["path"], "verified")
+        self.assertEqual(self._init_path(), "verified")
 
     # ---------- 4. 中途失败 + 5/11. 失败不落收据、fail closed ----------
 
@@ -176,8 +204,7 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
         self.assertNotIn(PSM.BOOTSTRAP_RECEIPT_TABLE, self._table_names())
         self.assertIsNone(self._receipt())
 
-        result = self._init()
-        self.assertEqual(result["path"], "cold")
+        self.assertEqual(self._init_path(), "cold")
         self.assertIn("paper_accounts", self._table_names())
         self.assertIsNotNone(self._receipt())
 
@@ -325,7 +352,7 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
 
     def test_signal_order_drift_is_still_reconciled_when_schema_is_ready(self):
         self._init()
-        self.assertEqual(self._init()["path"], "verified")  # 结构已 ready
+        self.assertEqual(self._init_path(), "verified")  # 结构已 ready
         with self._db() as conn:
             cycle_id = conn.execute(
                 "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
@@ -377,9 +404,7 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
         other = os.path.join(self.tmp, "other.sqlite3")
         PT.DB_PATH = other
 
-        result = self._init()
-
-        self.assertEqual(result["path"], "cold")
+        self.assertEqual(self._init_path(), "cold")
         self.assertIn("paper_accounts", self._table_names())
         self.assertIsNotNone(self._receipt())
 
@@ -402,6 +427,148 @@ class LedgerBootstrapLifecycleTestCase(unittest.TestCase):
         self._init()
         after = snapshot()
         self.assertEqual(before, after)
+
+
+# ── 修复项一：WAL checkpoint 只跟随真正的结构初始化/升级 ──────────────────────
+
+
+class WalCheckpointScopeTests(LedgerBootstrapFixture):
+    """verified 路径不得主动发起 ``PRAGMA wal_checkpoint(TRUNCATE)``。
+
+    master 的健康账本快路径没有这个行为；拆分后必须保持。checkpoint 还必须留在
+    事务之外（``paper_db`` 已提交并关闭连接），不能进 schema/恢复事务内部。
+    """
+
+    def _spy_checkpoint(self):
+        calls = []
+        patcher = mock.patch.object(
+            PT, "_wal_checkpoint", side_effect=lambda: calls.append(1)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_fresh_initialization_triggers_checkpoint_once(self):
+        calls = self._spy_checkpoint()
+        self.assertEqual(self._init_path(), "cold")
+        self.assertEqual(len(calls), 1, "新库初始化应在提交后收缩一次 WAL")
+
+    def test_cold_upgrade_triggers_checkpoint_once(self):
+        self._init_path()                       # 先把健康账本建好
+        calls = self._spy_checkpoint()
+        with self._db() as conn:
+            conn.execute("DROP TABLE paper_position_risk_state")
+        self.assertEqual(self._init_path(), "cold")
+        self.assertEqual(len(calls), 1, "结构修复路径应保留原有 checkpoint")
+
+    def test_verified_repeat_does_not_trigger_checkpoint(self):
+        self._init_path()
+        calls = self._spy_checkpoint()
+        self.assertEqual(self._init_path(), "verified")
+        self.assertEqual(calls, [], "verified 路径不得主动 checkpoint")
+
+    def test_verified_init_does_not_wait_on_an_open_read_transaction(self):
+        """有持续只读事务时，verified 初始化不该因为 TRUNCATE checkpoint 额外等待。"""
+        self._init_path()
+        calls = self._spy_checkpoint()
+        reader = sqlite3.connect(PT.DB_PATH, timeout=10)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM paper_orders").fetchone()
+            started = time.perf_counter()
+            self.assertEqual(self._init_path(), "verified")
+            elapsed = time.perf_counter() - started
+        finally:
+            reader.rollback()
+            reader.close()
+        self.assertEqual(calls, [])
+        self.assertLess(elapsed, 10.0, "verified 初始化不应被 checkpoint 拖住")
+
+
+# ── 修复项二：源码指纹不可用时 fail closed ──────────────────────────────────
+
+
+class OwnerFingerprintFailClosedTests(LedgerBootstrapFixture):
+    """取不到任一 owner 源码时：不写收据、不认旧收据、不进入 verified。"""
+
+    def _no_spec(self):
+        return mock.patch.object(importlib.util, "find_spec", return_value=None)
+
+    def test_missing_owner_source_raises_with_reason(self):
+        with self._no_spec():
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError) as ctx:
+                PSM.schema_owner_fingerprint()
+        message = str(ctx.exception)
+        self.assertIn("paper_schema_migrations", message)
+        self.assertIn("源码", message)
+
+    def test_invalid_owner_source_path_raises(self):
+        missing = os.path.join(self.tmp, "not-there.py")
+        spec = types.SimpleNamespace(origin=missing)
+        with mock.patch.object(importlib.util, "find_spec", return_value=spec):
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError) as ctx:
+                PSM.schema_owner_fingerprint()
+        self.assertIn("not-there.py", str(ctx.exception))
+
+    def test_unavailable_fingerprint_fails_closed_without_receipt(self):
+        with self._no_spec():
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError):
+                self._init()
+        # 失败不能产生新的有效收据
+        self.assertNotIn(PSM.BOOTSTRAP_RECEIPT_TABLE, self._table_names())
+
+    def test_existing_receipt_is_not_confirmed_when_fingerprint_unavailable(self):
+        self._init_path()
+        before = self._receipt()
+        with self._no_spec():
+            with self.assertRaises(PSM.LedgerSchemaBootstrapError):
+                self._init()
+        # 既有收据原样保留，既没有被"确认"，也没有被伪造成新值
+        self.assertEqual(self._receipt(), before)
+
+    def test_legacy_unavailable_sentinel_receipt_is_rejected(self):
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE ledger_schema_receipt SET owner_fingerprint=?"
+                " WHERE id=1",
+                ("unavailable:strategy_champion",),
+            )
+        self.assertEqual(self._init_path(), "cold", "旧式哨兵收据不得被接受")
+        receipt = self._receipt()
+        self.assertTrue(PSM.is_valid_owner_fingerprint(receipt["owner_fingerprint"]))
+        self.assertEqual(self._init_path(), "verified")
+
+    def test_owner_fingerprint_change_forces_cold(self):
+        self._init_path()
+        with mock.patch.object(PSM, "schema_owner_fingerprint", return_value="a" * 64):
+            self.assertEqual(self._init_path(), "cold")
+        # 收据里现在是那份假指纹，真实指纹仍不匹配 -> 再冷一次后才收敛
+        self.assertEqual(self._init_path(), "cold")
+        self.assertEqual(self._init_path(), "verified")
+
+    def test_fingerprint_guard_rejects_non_sha256_values(self):
+        for value in ("", "unavailable:paper_storage", "a" * 63, "A" * 64, None):
+            with self.subTest(value=value):
+                self.assertFalse(PSM.is_valid_owner_fingerprint(value))
+        self.assertTrue(PSM.is_valid_owner_fingerprint("a" * 64))
+
+
+# ── 修复项三：init_db 公开返回值 ────────────────────────────────────────────
+
+
+class PublicReturnContractTests(LedgerBootstrapFixture):
+    """``init_db()`` 与拆分前一致返回 ``None``；cold/verified 只是 owner 内部结果。"""
+
+    def test_init_db_returns_none_on_both_paths(self):
+        self.assertIsNone(PT.init_db())   # cold
+        self.assertIsNone(PT.init_db())   # verified
+
+    def test_no_process_wide_schema_ready_flag(self):
+        self.assertFalse(
+            any("SCHEMA" in name and "READY" in name for name in vars(PT)),
+            "不得新增进程级 schema ready 布尔变量",
+        )
 
 
 if __name__ == "__main__":

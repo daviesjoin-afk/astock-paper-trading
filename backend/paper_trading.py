@@ -1891,11 +1891,19 @@ def init_db():
 
     不再有"探测失败就吞掉异常再重建"的分支：拿不到结构就抛错，调用方必须
     放弃本次初始化，避免半升级账本继续交易。
+
+    **返回值契约**：与拆分前一致，正常返回 ``None``。``cold`` / ``verified``
+    只是 :func:`paper_ledger_bootstrap.bootstrap_schema` 的内部编排细节，
+    不构成进程级 "schema ready" 状态：每次调用都要重新读收据。
     """
     global _RUNNER_BOOT_RECOVERED
+    cold_bootstrap = False
     with _db(immediate=True) as conn:
         fresh_ledger = not PSM.table_exists(conn, "paper_accounts")
         bootstrap = PLB.bootstrap_schema(conn, fresh=fresh_ledger)
+        # 只有真正建/升过结构才需要收尾 WAL；健康账本的 verified 路径与 master
+        # 的快路径一样，不主动发起 checkpoint。
+        cold_bootstrap = bootstrap["path"] == "cold"
         if fresh_ledger:
             # 新库的一次性历史行修补：行为与拆分前完全一致（只在新库跑）。
             PSM.repair_legacy_ledger_rows(
@@ -1907,7 +1915,7 @@ def init_db():
             _rebuild_realized_pnl(conn)
             _RUNNER_BOOT_RECOVERED = True
         _recover_ledger_runtime(conn)
-        if bootstrap["path"] == "cold":
+        if cold_bootstrap:
             # 结构与业务恢复都已完成，才记录"本事务里验证过"的结构收据。
             # 收据覆盖**恢复之后**的结构（例如对账阶段建立的唯一索引），
             # 所以下一次启动直接命中低成本路径。
@@ -1917,9 +1925,11 @@ def init_db():
                 fingerprint=PSM.structure_fingerprint(conn),
                 owner_fingerprint=bootstrap["owner_fingerprint"],
             )
-    # H9: 建表/迁移/启动回收是批量写，显式收缩 WAL，避免 -wal 无界增长。
-    _wal_checkpoint()
-    return bootstrap
+    if cold_bootstrap:
+        # H9: 建表/迁移/启动回收是批量写，成功提交后显式收缩 WAL，避免 -wal
+        # 无界增长。checkpoint 必须在事务之外（此处事务已由 ``paper_db`` 提交并
+        # 关闭连接），也**不**在健康账本的日常初始化里执行。
+        _wal_checkpoint()
 
 
 def _benchmark_close():

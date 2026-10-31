@@ -114,7 +114,7 @@ init_db()                                   ← 唯一公开契约，未变
    索引已存在就不再发 `CREATE INDEX`。
 5. **宽异常降级**：`init_db` 原先"探测失败就吞掉异常走完整重建"的分支删除。
 
-## 专项测试（`backend/test_ledger_bootstrap_lifecycle.py`，12 项）
+## 专项测试（`backend/test_ledger_bootstrap_lifecycle.py`，25 项）
 
 | # | 场景 | 用例 |
 | --- | --- | --- |
@@ -130,6 +130,19 @@ init_db()                                   ← 唯一公开契约，未变
 | 10 | 不同 DB_PATH 不继承初始化状态 | `test_switching_db_path_does_not_inherit_readiness` |
 | 11 | 初始化失败禁止进入不安全状态 | `test_verification_failure_aborts_initialization` |
 | 12 | 重复执行不改变已验证成交事实 | `test_repeated_initialization_preserves_verified_fills` |
+| R1-1 | fresh 初始化触发一次 checkpoint | `WalCheckpointScopeTests.test_fresh_initialization_triggers_checkpoint_once` |
+| R1-2 | cold 升级触发一次 checkpoint | `test_cold_upgrade_triggers_checkpoint_once` |
+| R1-3 | verified 重复初始化不触发 checkpoint | `test_verified_repeat_does_not_trigger_checkpoint` |
+| R1-4 | 持续只读事务下 verified 不被 checkpoint 拖住 | `test_verified_init_does_not_wait_on_an_open_read_transaction` |
+| R2-1 | 缺失 owner 源码 → 抛错并给出原因 | `test_missing_owner_source_raises_with_reason` |
+| R2-2 | owner 源码路径无效 → 抛错 | `test_invalid_owner_source_path_raises` |
+| R2-3 | 指纹不可用失败时不产生收据 | `test_unavailable_fingerprint_fails_closed_without_receipt` |
+| R2-4 | 既有收据不被"确认" | `test_existing_receipt_is_not_confirmed_when_fingerprint_unavailable` |
+| R2-5 | 旧式 `unavailable:` 收据不得被接受 | `test_legacy_unavailable_sentinel_receipt_is_rejected` |
+| R2-6 | owner 指纹变化必须重新 cold | `test_owner_fingerprint_change_forces_cold` |
+| R2-7 | 非 sha256 值一律判为无效 | `test_fingerprint_guard_rejects_non_sha256_values` |
+| R3-1 | `init_db()` 两条路径都返回 `None` | `PublicReturnContractTests.test_init_db_returns_none_on_both_paths` |
+| R3-2 | 没有进程级 schema ready 布尔量 | `test_no_process_wide_schema_ready_flag` |
 
 ## 性能对照（同机、同输入、脚本可复现）
 
@@ -139,10 +152,12 @@ init_db()                                   ← 唯一公开契约，未变
 
 | 指标 | master | PR-6 | 变化 |
 | --- | --- | --- | --- |
-| 日常启动 `init_db` P50 / P95 | 15.44 / 16.43 ms | **10.68 / 11.26 ms** | −31% / −31% |
-| 空库首次初始化 | 86.9 ms | **63.8 ms** | −27% |
-| 旧库（master 生成）稳态 P50 / P95 | 16.01 / 17.68 ms | **10.63 / 11.07 ms** | −34% / −37% |
-| 旧库首次升级（一次性） | 15.8 ms | 17.3 ms | +1.5 ms（只发生一次，之后进低成本路径） |
+| 日常启动（verified）P50 / P95 | 16.28 / 17.26 ms | **8.18 / 9.07 ms** | −50% / −47% |
+| 空库首次（fresh/cold） | 91.81 ms | **64.15 ms** | −30% |
+| 旧库（master 生成）稳态 P50 | 16.30 ms | **8.19 ms** | −50% |
+| 旧库首次升级（一次性） | 15.6–17.0 ms | 16.99 ms | +0～1 ms（只发生一次，之后进低成本路径） |
+| verified + 持续只读事务 P50 / P95 | 12.04 / 12.84 ms | **6.91 / 7.76 ms** | −43% / −40% |
+| `wal_checkpoint` 次数 fresh / cold / verified | 1 / 1 / 0 | 1 / 1 / **0** | 与 master 一致 |
 | 单次初始化 SQL 条数（日常） | 516 | **194** | −62% |
 | 单次初始化 DDL 条数（日常） | 204 | **0** | −100% |
 | 单次 schema 检查次数（日常） | 133 | **38** | −71% |
@@ -150,10 +165,58 @@ init_db()                                   ← 唯一公开契约，未变
 | 空库首次：SQL / DDL / schema 检查 | 3063 / 1099 / 805 | **1858 / 248 / 557** | −39% / −77% / −31% |
 | 连接 + `BEGIN IMMEDIATE` 耗时 P50 | 2.01 ms | 1.97 ms | 持平 |
 
+> reviewed 修复后重测：`wal_checkpoint` 不再跟在 verified 路径后面，日常启动因此从
+> 10.68 ms 再降到 8.18 ms；三种路径的 checkpoint 次数与 master 完全一致（1/1/0）。
+
 **测量限制**：单机单进程、SQLite 单写者、无并发写入压力，因此"写锁等待"这一项在两种
 实现下都接近 0，**不能**用它推断生产锁竞争；也不要拿这些离线数字宣称生产已提速。
 本表能证明的是**机械事实**：日常启动不再执行任何 DDL、不再读基准 CSV、SQL 条数降到
 原来的 38%，且结构校验仍然每次执行。
+
+## 人工审核后的定向修复（R1–R3）
+
+### R1：WAL checkpoint 只跟随真正的结构初始化/升级
+
+`init_db()` 现在只在 ``bootstrap_schema`` 返回 ``cold``（fresh 建库或结构升级）时，
+在事务**之外**、上述事务已提交并关闭连接之后调用 `_wal_checkpoint()`。verified 路径
+与 master 的快路径一样，不发起 `PRAGMA wal_checkpoint(TRUNCATE)`。
+`paper_storage.wal_checkpoint` 本体、retention 等独立 WAL 维护与清理路径未改。
+
+实测 checkpoint 次数（`scripts/pr6_bootstrap_probe.py --label …`，每场景 6–15 次）：
+
+| 路径 | master | PR-6 |
+| --- | --- | --- |
+| fresh（空库首次） | 1 | **1** |
+| cold（旧库首次升级） | 1（master 无收据概念，走完整路径） | **1**（其余 5 次为 0） |
+| verified（日常启动） | 0 | **0** |
+
+持续只读事务竞争下（另一个连接持有 `BEGIN` + `SELECT`）的 verified 初始化：
+master 12.04 / 12.84 ms，PR-6 **6.91 / 7.76 ms**，两者都不发起 checkpoint。
+
+关联修复：因为初始化现在**整条链持有一个写事务**（收据与 DDL 必须原子），两个进程同时
+首次启动时，后者的 `PRAGMA journal_mode=WAL` 会瞬时拿到 SQLITE_BUSY（SQLite 对
+journal-mode 变更不做无限等待）。`paper_storage.apply_journal_mode` 用存储层既有的
+busy 判定与退避做**有界重试**；连接超时（1s/120s）、`busy_timeout`、事务隔离与
+fencing 语义全部不变。
+
+### R2：源码指纹不可用改为 fail closed
+
+`schema_owner_fingerprint()` 不再返回 `unavailable:<module>` 哨兵，而是抛
+`LedgerSchemaBootstrapError`，消息里带 owner 名、路径与具体原因（找不到模块 /
+没有源码路径 / 路径不是可读文件 / 读取失败）。因此：
+
+- 不可能把哨兵写进收据（抛错发生在写收据之前，事务整体回滚）；
+- 不可能"两个哨兵相等"就进 verified —— 比较根本不会发生；
+- 历史遗留的哨兵收据由 `is_valid_owner_fingerprint()`（必须 64 位小写十六进制
+  sha256）判为无效，一律走 cold 并重写；
+- 源码完整可用时仍是原来的快速路径。
+
+### R3：`init_db()` 公开返回值恢复为 `None`
+
+`init_db()` 正常返回 `None`（与拆分前一致）；`cold` / `verified` 只是
+`paper_ledger_bootstrap.bootstrap_schema()` 的内部编排结果。专项测试改用 spy 捕获该
+结果或观察真实结构状态，不依赖公开返回值。没有新增任何进程级 schema ready 布尔量。
+
 
 ## 与 master 的账本逐字段对照
 
@@ -173,7 +236,7 @@ init_db()                                   ← 唯一公开契约，未变
 L0：`ruff check backend scripts` → 仅剩 2 条**既有**问题（`scripts/security/scan-sensitive-data.py`，
 本分支未触碰）；`compileall` 全部通过；`git diff --check` 无空白错误。
 
-L1：`backend/test_ledger_bootstrap_lifecycle.py` 12 项全绿。
+L1：`backend/test_ledger_bootstrap_lifecycle.py` **25 项全绿**（12 主场景 + 13 项 R1–R3 定向回归）。
 
 L2（局部回归）：`test_db_migrate`、`test_paper_storage`、`test_execution_evidence`、
 `test_execution_verification_probe`、`test_execution_verification_wiring`、

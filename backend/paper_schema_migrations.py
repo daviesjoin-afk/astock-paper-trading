@@ -2586,23 +2586,53 @@ def structure_fingerprint(conn):
 def schema_owner_fingerprint():
     """结构 owner 源码指纹（只描述代码，不描述任何数据库是否 ready）。
 
-    取不到源码时返回哨兵值而不是"匹配"：无法证明收据仍对应当前代码，就必须
-    重新跑一遍完整建表链。这里不做任何缓存 —— 指纹只描述代码，与 ``DB_PATH``
-    无关，而"这个库是否 ready"永远只由库里的结构摘要决定。
+    **任一必需 owner 的源码不可用时抛 :class:`LedgerSchemaBootstrapError`**，
+    而不是返回一个哨兵值：哨兵既不能证明收据仍对应当前代码，还会被写进收据，
+    下次启动再拿两个同样的哨兵互相印证，把整条校验绕过去。取不到源码就 fail
+    closed，错误里保留是哪个 owner、哪条路径、什么原因。
+
+    这里不做任何缓存 —— 指纹只描述代码，与 ``DB_PATH`` 无关，而"这个库是否
+    ready"永远只由库里的结构摘要决定。
     """
     digest = hashlib.sha256()
+    reasons = []
     for name in BOOTSTRAP_OWNER_MODULES:
         try:
             spec = importlib.util.find_spec(name)
-        except (ImportError, ValueError):
-            spec = None
+        except (ImportError, ValueError) as exc:
+            reasons.append(f"{name}: 无法定位模块 ({type(exc).__name__}: {exc})")
+            continue
         path = spec.origin if spec is not None else None
-        if not path or not os.path.exists(path):
-            return f"unavailable:{name}"
-        with open(path, "rb") as handle:
-            digest.update(handle.read())
+        if not path:
+            reasons.append(f"{name}: 模块没有源码路径")
+            continue
+        if not os.path.isfile(path):
+            reasons.append(f"{name}: 源码路径不是可读文件 -> {path}")
+            continue
+        try:
+            with open(path, "rb") as handle:
+                source = handle.read()
+        except OSError as exc:
+            reasons.append(f"{name}: 读取源码失败 ({type(exc).__name__}: {exc}) -> {path}")
+            continue
+        digest.update(source)
         digest.update(b"\x1e")
+    if reasons:
+        raise LedgerSchemaBootstrapError(
+            "结构 owner 源码指纹不可用，拒绝确认 schema 已升级：" + "；".join(reasons)
+        )
     return digest.hexdigest()
+
+
+def is_valid_owner_fingerprint(value):
+    """收据里的 owner 指纹必须是 64 位小写十六进制 sha256。
+
+    历史版本可能写入过 ``unavailable:<module>`` 这类哨兵；它既不是指纹，也不
+    应该参与"相等即命中"的比较，因此在这里被一律判为无效（→ 重新 bootstrap）。
+    """
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value)
 
 
 def ensure_bootstrap_receipt_table(conn):

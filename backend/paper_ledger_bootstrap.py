@@ -55,6 +55,9 @@ def bootstrap_schema(conn, *, fresh):
     **不在这里写收据**：收据代表"整个初始化事务成功"，由 ``init_db`` 在业务
     恢复也走完之后、同一个事务里写入 —— 迁移/恢复中途失败就整体回滚，下一次
     启动重跑完整链，绝不会把半成品标成"已完成升级"。
+
+    源码指纹取不到时 ``schema_owner_fingerprint`` 直接抛错（fail closed）：没有
+    指纹就无法证明收据仍对应当前代码，此时既不能走 verified，也不能写新收据。
     """
     fingerprint = PSM.structure_fingerprint(conn)
     owner_fingerprint = PSM.schema_owner_fingerprint()
@@ -63,6 +66,8 @@ def bootstrap_schema(conn, *, fresh):
         not fresh
         and receipt is not None
         and receipt["contract_version"] == PSM.BOOTSTRAP_CONTRACT_VERSION
+        # 历史哨兵（unavailable:<module>）不是指纹，一律不算命中。
+        and PSM.is_valid_owner_fingerprint(receipt["owner_fingerprint"])
         and receipt["owner_fingerprint"] == owner_fingerprint
         and receipt["structure_fingerprint"] == fingerprint
     ):
