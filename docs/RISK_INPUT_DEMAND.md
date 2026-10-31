@@ -69,6 +69,31 @@ python scripts/run_tests_parallel.py --shards 8 --timeout 900
 涵盖空仓、失败重试、周期切换、完整/部分卖出、重复执行与 fencing（阻止失去运行资格的进程提交成交）。
 相关回归 164 项通过；完整后端与架构最终结果见 PR 描述。
 
+## 公开接口契约补验（2026-10-31）
+
+本轮修复基线 HEAD：`427e94f5e7779e8e23001ba67456a1cc57ed89fc`。
+修复代码 HEAD：`3221f2d1de8c872f3a36841e97db326a86937b73`；随后仅补本节验收文档。
+最终交付 HEAD 以 [PR #300 的实时头提交](https://github.com/daviesjoin-afk/astock-paper-trading/pull/300/commits) 为准，可执行：
+
+```bash
+gh pr view 300 --repo daviesjoin-afk/astock-paper-trading --json headRefOid,isDraft,state
+```
+
+仅向 `paper_risk_evidence.__all__` 增加 `eligible_replacement_candidates`，并在
+`test_risk_input_demand.PublicInterfaceTests` 断言该名称已公开。
+函数和类定义的内容及顺序与本轮基线完全一致；未修改候选筛选、状态、权限、排序、持仓排除或交易决策，
+没有新增缓存或修改 schema。
+对 PR-3 新增顶层函数及新增生产跨模块调用的复核，仅发现这一公开接口声明遗漏；未扩大修改范围。
+
+按要求依次执行并通过：
+
+- `PYTHONPATH=backend python -m unittest test_risk_input_demand test_import_laziness test_paper_trading_architecture_guard`：122 项，16.983 秒。
+- `ruff check backend`、`python -m compileall -q backend`、`git diff --check`：全部通过。
+- `python scripts/run_tests_parallel.py --shards 8 --timeout 900`：7,481 项全部通过，Python 3.14.5，342.2 秒，无失败、错误或模块加载错误。
+
+本轮完整测试较原 7,480 项增加一项公开接口契约测试。
+最终交付 HEAD 的远端 CI、安全扫描及实际日志数据同步记录在 PR #300 描述中；保持 Draft，等待再次审核。
+
 ## 限制与回滚
 
 不更改风险阈值、策略评分、资金约束、T+1、执行权威、手动订单路径、schema、cron 或部署。
