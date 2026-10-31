@@ -565,6 +565,12 @@ evidence / read model、纯决策模块、`execution_planner` 和明确注入的
 writer 内继续重验周期、持仓与运行资格；新增持仓及空/失败重试仍可能惰性读取。
 完整边界与前后对照见 [风险 K 线轮内复用](docs/RISK_ROUND_KLINE_REUSE.md)。
 
+替补原始输入经 `paper_risk_evidence.replacement_candidate_inputs` 组装范围，SQL 仍归
+`paper_replacement_evidence`；writer 重读持仓后按账户读取一次，各持仓独立做权限、排除和排序。
+`execution_verification.verified_execution_markers` 在当前持仓、当前 writer 内批量读取风险动作记录，
+沿用唯一正成交谓词及 SQLite JSON/LIKE；不将其他持仓写入前的 marker 快照沿用到后续持仓。
+查询失败回原单项核验，未知不能当作未执行。见 [风险只读查询复用](docs/RISK_QUERY_REUSE.md)。
+
 ## Portfolio / Read Model 边界（R22）
 
 ```text

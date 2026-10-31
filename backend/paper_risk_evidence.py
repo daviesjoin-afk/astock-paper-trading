@@ -25,6 +25,7 @@ from paper_common import now_text as _now, as_date as _date, dump_json as _json,
 __all__ = [
     "RiskEvidenceDeps",
     "prefetch_position_alt_data",
+    "replacement_candidate_inputs",
     "eligible_replacement_candidates",
     "best_replacement_candidate",
     "intraday_downside_guard",
@@ -171,7 +172,16 @@ def _volatility_shadow(code, asof_day, price, load_kline):
     return result
 
 
-def eligible_replacement_candidates(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps):
+def replacement_candidate_inputs(conn, account_id, day, *, deps: RiskEvidenceDeps):
+    """Load scoped raw candidate facts through their existing SQL owner."""
+    return PREPL.load_replacement_candidates(
+        conn, account_id=account_id, asof_day=_date(day).isoformat(),
+        statuses=("pending", "deferred_capacity", deps.entry_frozen_waitlist_status),
+    )
+
+
+def eligible_replacement_candidates(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps,
+                                    candidate_rows=None):
     """Load eligible same-day candidates, preserving the existing SQL order.
 
     R18（as-of hard contract）：今天能触发今天卖出的替补必须**属于今天**。候选读取
@@ -182,11 +192,12 @@ def eligible_replacement_candidates(conn, account_id, day, held_codes, *, deps: 
 
     合法 overnight 计划（``signal_date = D-1``、``intended_date = D``）仍然可用。
     归档 signal 不参与：它是历史 opening 证据，不是 executable candidate。
+    candidate_rows 仅接受同账户、同日期、同状态范围的 owner 原始输入；
+    writer 内复用读取，不复用资格或最终选择结论。
     """
     held_codes = {str(code) for code in (held_codes or ())}
-    statuses = ("pending", "deferred_capacity", deps.entry_frozen_waitlist_status)
-    rows = PREPL.load_replacement_candidates(
-        conn, account_id=account_id, asof_day=_date(day).isoformat(), statuses=statuses,
+    rows = candidate_rows if candidate_rows is not None else replacement_candidate_inputs(
+        conn, account_id, day, deps=deps,
     )
     # security scope 仍由 adapter 处理（纯域模块不 import 项目 API）。
     allowed = []
@@ -199,9 +210,12 @@ def eligible_replacement_candidates(conn, account_id, day, held_codes, *, deps: 
     return allowed
 
 
-def best_replacement_candidate(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps):
+def best_replacement_candidate(conn, account_id, day, held_codes, *, deps: RiskEvidenceDeps,
+                               candidate_rows=None):
     # 预取与决策共用资格规则；writer 内仍重新读取，不复用预取时的交易结论。
-    allowed = eligible_replacement_candidates(conn, account_id, day, held_codes, deps=deps)
+    allowed = eligible_replacement_candidates(
+        conn, account_id, day, held_codes, deps=deps, candidate_rows=candidate_rows,
+    )
     return PRep.choose_best_candidate(allowed, held_codes=held_codes)
 
 
