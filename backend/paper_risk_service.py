@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, ContextManager
 
 import execution_planner as EP
 import execution_verification as EV
 import paper_account_specs as ACS
 import paper_decision_audit as PDA
+from paper_kline_snapshot import RoundKlineCache
 import paper_portfolio_read_model as PPort
 import paper_numeric as PNum
 import paper_position_review as PReview
@@ -202,6 +203,14 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
     """Run one risk workflow for the exact context already claimed by the facade."""
     day = context.asof_day
     cycle_id = context.cycle_id
+    kline_cache = RoundKlineCache(ports.evidence.load_kline)
+
+    def round_kline(code, cutoff, *, inclusive=True):
+        return kline_cache.get(str(code), _date(cutoff), inclusive=inclusive)
+
+    # Only this claimed risk run shares facts. Each consumer receives a copy;
+    # neither the caller's ports nor another run inherits this cache.
+    ports = replace(ports, evidence=replace(ports.evidence, load_kline=round_kline))
     manual_orders = []
     # 读上下文不可变（cycle_id + asof_day）；两处读取共用同一份身份事实。
     read_context = PPort.PortfolioReadContext(cycle_id, day)
@@ -230,6 +239,14 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
     news = market_inputs["news"]
     news_meta = market_inputs["news_meta"]
     flow_trajectory_map = market_inputs["flow_trajectory_map"]
+
+    # Both boundaries are consumed: risk models exclude today, audit fallback
+    # includes it. Do not substitute one for the other. Successful reads move
+    # outside the writer; the owner hands empty/failed reads to their first
+    # consumer unchanged, and later consumers can retry as before.
+    for code in sorted({str(position["code"]) for position in positions}):
+        for inclusive in (False, True):
+            kline_cache.prefetch(code, day, inclusive=inclusive)
 
     def _with_decision_snapshot(payload=None, **kwargs):
         return PDA.with_decision_snapshot(
