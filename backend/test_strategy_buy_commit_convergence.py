@@ -285,8 +285,11 @@ class FinalSizingUsesCyclePinnedVersion(_BuyCase):
             pinned_spec.get("hard_stop"), head_spec.get("hard_stop"),
             "fixture 的 v1/v2 hard_stop 相同，无法区分 provenance")
         captured = {}
+        entry_quantity = PT.PSZ.entry_quantity
 
         def spy(*args, **kwargs):
+            if isinstance(args[0], PT.PSZ.EntryQuantityResult):
+                return entry_quantity(*args, **kwargs)
             captured["hard_stop"] = args[6]
             captured["profile"] = args[7]
             return PT.PSZ.EntryQuantityResult(0, 0, {"qty": 0, "reason": "ec21_capture"})

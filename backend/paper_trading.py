@@ -8781,27 +8781,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         key: eff_spec.get(key)
         for key in ("hard_stop", "trail_after", "trail_stop", "hold_max", "max_positions", "max_pyramiding")
     }
-    # Entry-model scaling must reduce the actual order as well as the residual
-    # exposure allowance.  Otherwise a risk/weight constraint could silently
-    # turn a trend "trial" into a full first position.
-    entry_tranche_scale = max(0.10, min(_num(entry_model.get("entry_tranche_scale"), 1.0), 1.0))
-    recovery_watch = payload.get("recovery_watch") or {}
-    if recovery_watch.get("passed"):
-        # A protective exit may re-enter only as a small probe.  It still
-        # traverses every ordinary quote, security, Q-tier and cash gate.
-        entry_tranche_scale = min(entry_tranche_scale, _num(recovery_watch.get("probe_ratio"), 0.25))
-        risk["recovery_probe"] = {"enabled": True, "ratio": entry_tranche_scale,
-                                   "exit_class": recovery_watch.get("exit_class")}
-    # 首仓纪律（2026-08-31 复核 P1）：首笔不超过共享净值的一定比例，
-    # 比例由执行策略声明（first_tranche_nav_pct），None 表示不限制。
-    first_cap = None
-    if (
-        _exec_policy.first_tranche_nav_pct is not None
-        and (account["id"], code) not in committed_open_codes
-    ):
-        # 资金持续、价格站稳后再由既有加仓路径表达；避免一笔大仓吃掉
-        # “精挑三只”的大部分预算，也不退回两三千元的无效小仓。
-        first_cap = nav * _exec_policy.first_tranche_nav_pct
     quantity = PSZ.entry_quantity(
         nav, shared_cash, position_value, industry_value, code_value,
         fill_price, eff_spec["hard_stop"], profile,
@@ -8813,17 +8792,35 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
         single_position_max_amount=single_position_max_amount,
         liquidity_cap_amount=_quote_liquidity_cap(quote), num=_num, lot_size=LOT_SIZE,
-        entry_tranche_scale=entry_tranche_scale, first_tranche_cap_amount=first_cap,
-        slice_request=PSZ.EntrySliceRequest(
-            payload=payload, account=account, asof_day=asof_day,
-            continuation=slice_continuation, existing_plan=_slice_plan,
-            plan_builder=ELC.entry_slice_plan,
-        ),
-        deployment_max_qty=(int(_num(deployment.get("lots"))) * LOT_SIZE
-                            if deployment is not None and deployment.get("allowed") else None),
-        deployment_amount=deployment.get("deployable_amount") if deployment is not None else None,
     )
     qty, sizing = quantity.qty, quantity.sizing
+    # Entry-model scaling must reduce the actual order as well as the residual
+    # exposure allowance.  Otherwise a risk/weight constraint could silently
+    # turn a trend "trial" into a full first position.
+    entry_tranche_scale = max(0.10, min(_num(entry_model.get("entry_tranche_scale"), 1.0), 1.0))
+    recovery_watch = payload.get("recovery_watch") or {}
+    if recovery_watch.get("passed"):
+        # A protective exit may re-enter only as a small probe.  It still
+        # traverses every ordinary quote, security, Q-tier and cash gate.
+        entry_tranche_scale = min(entry_tranche_scale, _num(recovery_watch.get("probe_ratio"), 0.25))
+        risk["recovery_probe"] = {"enabled": True, "ratio": entry_tranche_scale,
+                                   "exit_class": recovery_watch.get("exit_class")}
+    quantity = PSZ.entry_quantity(quantity, fill_price=fill_price, num=_num,
+                                 lot_size=LOT_SIZE, entry_tranche_scale=entry_tranche_scale)
+    qty = quantity.qty
+    # 首仓纪律（2026-08-31 复核 P1）：首笔不超过共享净值的一定比例，
+    # 比例由执行策略声明（first_tranche_nav_pct），None 表示不限制。
+    if (
+        _exec_policy.first_tranche_nav_pct is not None
+        and (account["id"], code) not in committed_open_codes
+        and qty >= LOT_SIZE
+    ):
+        # 资金持续、价格站稳后再由既有加仓路径表达；避免一笔大仓吃掉
+        # “精挑三只”的大部分预算，也不退回两三千元的无效小仓。
+        first_cap = nav * _exec_policy.first_tranche_nav_pct
+        quantity = PSZ.entry_quantity(quantity, fill_price=fill_price, num=_num,
+                                     lot_size=LOT_SIZE, first_tranche_cap_amount=first_cap)
+        qty = quantity.qty
     sizing["strategy_target_pct"] = strategy_budget["target_pct"]
     sizing["strategy_base_target_pct"] = strategy_budget.get("base_target_pct")
     sizing["strategy_floor_pct"] = strategy_budget["floor_pct"]
@@ -8851,7 +8848,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     capacity_constraints = set(sizing.get("binding_constraints") or [])
     # 特级机会仅保留审计字段；总池硬上限、现金、单股、行业和止损预算
     # 均不可被所谓“机会”放宽，必须先卖出释放额度。
-    if quantity.pre_slice_qty < LOT_SIZE and capacity_constraints == {"exposure"} and not reasons:
+    if qty < LOT_SIZE and capacity_constraints == {"exposure"} and not reasons:
         approved_exception, exception_reason = _exceptional_opportunity(
             account, pick, quote, market, entry_model, q, risk_state, asof_day, conn
         )
@@ -8929,6 +8926,12 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 分批建仓（entry slices）：一份信号可分多片成交，但每一片都是一条
     # 独立的新委托意图——本轮只执行当前片，剩余片由下一轮扫描重新取价、
     # 重新跑全部风控与 sizing；信号失效（TTL/跨日）后剩余片自动作废。
+    quantity = PSZ.entry_quantity(quantity, num=_num, lot_size=LOT_SIZE,
+        slice_request=PSZ.EntrySliceRequest(
+            payload=payload, account=account, asof_day=asof_day,
+            continuation=slice_continuation, existing_plan=_slice_plan,
+            plan_builder=ELC.entry_slice_plan))
+    qty = quantity.qty
     slice_state, slice_detail = quantity.slice_state, quantity.slice_detail
     if slice_detail is not None:
         risk["entry_slices"] = slice_detail
@@ -8966,6 +8969,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "lots": deployment.get("lots"),
             "allowed": bool(deployment.get("allowed")),
         }
+    if deployment is not None and deployment.get("allowed") and fill_price > 0:
+        quantity = PSZ.entry_quantity(quantity, fill_price=fill_price, num=_num,
+            lot_size=LOT_SIZE, deployment_max_qty=int(_num(deployment.get("lots"))) * LOT_SIZE,
+            deployment_amount=deployment.get("deployable_amount"))
+        qty = quantity.qty
     amount = qty * fill_price
     fees = EP.estimate_execution_fees(amount, "buy")
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)

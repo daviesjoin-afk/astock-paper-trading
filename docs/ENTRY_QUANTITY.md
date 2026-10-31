@@ -62,6 +62,11 @@ requested_qty、tranche scale、首仓金额、分片请求、部署数量、回
 `EntrySliceRequest` 只携带原分片所需的信号、账户、as-of、续片状态与生命周期
 plan builder，不是全局 Context；它不包含资格判定、数据库连接或成交能力。
 
+自动入口按原业务时点多次调用**同一个** `entry_quantity`：首次传基础数据，后续
+首参传同一次尝试的 `EntryQuantityResult`，只应用本阶段的显式缩放/分片/部署输入。
+后续调用复用 sizing 审计字典，不重算基础公式；金额阶段必须传原始精度的 fill_price。
+不得跨订单、扫描尝试或重验复用前阶段结果。手单仍是一次完整调用。
+
 `EntryQuantityResult`：
 
 | 字段 | 契约 |
@@ -71,11 +76,15 @@ plan builder，不是全局 Context；它不包含资格判定、数据库连接
 | sizing | 原有审计字典，逐字段保留阶段语义；target_amount / risk amount 并非最终成交值 |
 | reasons | 仅数量错误，按原顺序排列；不混入业务资格、行情、最小金额或预占拒绝 |
 | slice_state / slice_detail | 原分片状态与审计，只计算，不推进 filled，不修改原 payload |
-| pre_slice_qty | 首仓上限之后、分片之前的数量；保留旧 exceptional-opportunity 审计触发时点 |
+| pre_slice_qty | 分片前数量兼容字段；主编排已恢复在原 exceptional 时点读取当阶段 qty |
 
 计算顺序与旧代码一致：风险/权重/敞口/行业/现金/流动性取最小 → 整手向下取整
 → 试仓缩放 → 首仓金额 → 分片 → 部署上限 → 回补/加仓上限 → 手动请求校验。
 调用方决定何时适用某项业务政策，只传入数值，不再复制这套数量运算。
+
+**不能把上述算术顺序误写为连续无间隔执行**。自动路径中间仍有原业务门禁：
+基础 sizing → 读取试仓输入/缩放 → 首仓限制 → exceptional_opportunity → price_wait
+→ execution_dispatch → entry slices → 聚合设置读取/门禁 → deployment cap。
 
 ### 拒绝理由与兼容
 
@@ -130,7 +139,8 @@ python scripts/run_tests_parallel.py --shards 8 --timeout 900
 
 ## 分层验证与性能
 
-探针已加入 CI Ruff 范围。本轮 Python 3.14.5 验证：
+探针已加入 CI Ruff 范围。以下为首次提交 `bdc9530` 的 Python 3.14.5 验证记录，
+本次阶段顺序修复的验证单独列于下一节：
 
 | 层级 | 结果 |
 | --- | --- |
@@ -141,7 +151,8 @@ python scripts/run_tests_parallel.py --shards 8 --timeout 900
 | L4 | 完整后端 **7,591 项**通过，8 分片墙钟 **258.3 s**，最慢分片 243.3 s；前端单元 **254 项**通过 |
 | 安全 | 工作树文本扫描零命中；完整本地历史扫描命中旧分支残留 20 项，逐项核对全部位置后，当前发布分支可达对象中为 0；未放宽规则或例外 |
 
-性能口径为离线纯数量计算，预热 1,000 次后 30 批 × 1,000 次，基线/当前同进程交替
+以下微基准也是 `bdc9530` 的历史记录，不是阶段顺序修复后的时延。
+性能口径为离线纯数量计算，预热 1,000 次后 30 批 × 1,000 次，基线/当时实现同进程交替
 顺序，保留每批值、P50、P95、最小和最大值；不使用单次最快耗时证明改善。
 
 | 纯数量计算（微秒 / 次） | master | PR-8 |
@@ -166,8 +177,56 @@ python scripts/pr8_sizing_probe.py --output .codex-test-tmp/pr8/replay.json \
 ```
 
 旧路径已有共享基础公式，因此本轮不宣称减少基础计算次数或生产提速。
-每个自动/手动计划仍只做一次基础风险数量计算；新入口多一个显式结果对象，
-兼容路径多一次转发，无额外网络或 SQL。重复维护的最终数量运算已归唯一 owner。
+每个自动/手动计划仍只做一次基础风险数量计算，无额外网络或 SQL。
+阶段顺序修复后，正常自动新仓路径调用 entry_quantity 4 次，适用首仓限制时 5 次；
+后续均为前结果推进，基础公式仍为 1 次。手动为 1 次。未重新测量本轮端到端耗时，
+不能用上述单次纯计算的历史数字代替分阶段自动路径的成本。
+
+## PR305 阶段顺序复核（起点 bdc9530）
+
+对照真实 master `e622955` 与审核起点，发现确实不等价，故只修改
+`paper_sizing.py` / `paper_trading.py` 两处生产文件：统一入口支持同次尝试的前结果，
+主编排恢复原阶段时点，没有恢复重复数量算法，也没有修改 planner 或业务门禁。
+
+| 维度 | bdc9530 对原 master 的结果 | 修复策略 |
+| --- | --- | --- |
+| 纯计算 | 普通样本最终数量相同，但提前算分片/部署；损坏 recovery 输入还会跳过原本先执行的基础 sizing | 基础、试仓、首仓、分片、部署各自在原位置推进同一 owner |
+| 异常优先级 | 损坏 plan + 注入画像读取错误：原版先 profile 错误，新版先分片 ValueError | 恢复画像/价格等待/派单先于分片，保留原异常传播 |
+| 调用边界 | profile / price_wait / dispatch / exceptional 抛错时，新版多调用原本不会调用的 plan_builder | 这些边界未通过前，不执行分片 builder |
+| 异常现场审计 | 分片异常时 local sizing / risk.sizing 字段是否已附着、已有 reasons 等不同 | 复用同一审计字典，在原时点逐步更新 |
+| 分片与交易 | 16 个场景未发现原版与 bdc9530 的最终返回/持久交易投影差异 | 修复后继续逐项比较，不把“暂未发现交易差异”说成所有行为等价 |
+
+异常现场审计指 traceback 中的内存变量，不等于已落库审计：这些异常场景由外层
+写事务回滚。本轮没有证据说明 bdc9530 在这些样本里多写了成交或持久审计。
+
+`test_entry_sizing_stage_order.py` 在**两套完整原始 backend**上运行同一组 16 场景：
+单片、新分片、续片、零目标、试仓+首仓、价格等待过期+派单拒绝、builder 故障、
+损坏 plan、损坏 plan+画像故障、单独画像/price_wait/dispatch/exceptional 故障、
+分配提前返回、部署前设置故障、损坏 recovery 输入。
+
+固定 DAY、_now、fixture decision_at；
+`fixtures/entry_sizing_stage_order.json` 记录 git 实际 source SHA，并拒绝用其他版本
+覆盖 master oracle。测试分别比较 error、调用事件、阶段观察、异常现场审计、
+最终返回和持久交易投影（数量、状态、理由、分片 payload、现金、fill、预占/审计计数）。
+还单独验证分阶段始终只计算一次基础公式、共享审计对象、部署后保留分片状态。
+
+16 场景中，原始 bdc9530 有 15 个调用时序差异，1 个主异常类型/来源差异，
+8 个异常现场审计差异；最终返回和持久交易投影均一致。原先的 33 组冻结矩阵继续保留，
+不能用它们替代本轮新增的异常时序覆盖。
+
+```bash
+PR8_STAGE_BACKEND="$PWD/.codex-test-tmp/pr8/base/backend" \
+  python backend/test_entry_sizing_stage_order.py --record backend/fixtures/entry_sizing_stage_order.json
+PYTHONPATH=backend python -m unittest test_entry_sizing_stage_order
+```
+
+本轮 L0 Ruff/compileall/diff check 通过；L1 专项 2 项（16 场景）通过，连同
+原 sizing/自动买入共 41 项通过；L2 自动买入/分片/执行回归 165 项通过；
+L3 架构/依赖守卫 123 项通过。因生产逻辑改变，完整 L4 已重跑：
+**7,593 项全部通过**，8 分片墙钟 **341.9 s**，最慢分片 322.2 s。
+本轮未修改前端/API 契约，未另跑前端；完整后端回归包含既有 API 测试。
+安全扫描只新增两个精确例外：离线 fixture 生成的公开 SHA256 快照/计划 ID；
+不放宽任何扫描规则，也不改变旧历史残留的审计结论。
 
 ## 已知限制与回滚
 

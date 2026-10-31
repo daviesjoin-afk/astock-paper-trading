@@ -1,0 +1,2445 @@
+{
+  "source_sha": "e622955deb702ae65e101ce260a0e3bea2e0a2f0",
+  "cases": {
+    "single": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": true,
+        "code": "600901",
+        "qty": 19900,
+        "price": 10.01
+      },
+      "ledger": {
+        "orders": [
+          {
+            "qty": 19900,
+            "filled_qty": 19900,
+            "status": "filled",
+            "reason": "Q2 通过；按价格与风险预算计算 19900 股",
+            "sizing": {
+              "target_amount": 199199.0,
+              "entry_tranche_scale_pct": 100.0,
+              "minimum_order_amount": 32800.0,
+              "execution_limit_price": 10.01,
+              "capital_deployment": {
+                "lifecycle_stage": "standard",
+                "capital_scale": 1.0,
+                "raw_allowance_amount": 820000.0,
+                "deployable_amount": 820000.0,
+                "waiting_capital": 0.0,
+                "lots": 819,
+                "allowed": true
+              },
+              "qty_final": 19900
+            },
+            "entry_slices": null
+          }
+        ],
+        "signal": {
+          "status": "filled",
+          "reason": "Q2 通过；按价格与风险预算计算 19900 股",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            }
+          }
+        },
+        "cash": 800781.08,
+        "fills": [
+          {
+            "qty": 19900,
+            "price": 10.01,
+            "amount": 199199.0,
+            "fees": 19.92
+          }
+        ],
+        "reservation_count": 1,
+        "risk_count": 1,
+        "audit_count": 3
+      }
+    },
+    "new_slices": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice",
+        "plan_builder"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": true,
+        "code": "600901",
+        "qty": 6600,
+        "price": 10.01
+      },
+      "ledger": {
+        "orders": [
+          {
+            "qty": 6600,
+            "filled_qty": 6600,
+            "status": "filled",
+            "reason": "Q2 通过；按价格与风险预算计算 6600 股",
+            "sizing": {
+              "target_amount": 199199.0,
+              "entry_tranche_scale_pct": 100.0,
+              "minimum_order_amount": 32800.0,
+              "execution_limit_price": 10.01,
+              "entry_slice_target_qty": 6600,
+              "entry_slice_index": 1,
+              "entry_slice_total": 3,
+              "capital_deployment": {
+                "lifecycle_stage": "standard",
+                "capital_scale": 1.0,
+                "raw_allowance_amount": 820000.0,
+                "deployable_amount": 820000.0,
+                "waiting_capital": 0.0,
+                "lots": 819,
+                "allowed": true
+              },
+              "qty_final": 6600
+            },
+            "entry_slices": {
+              "plan": [
+                6600,
+                6600,
+                6700
+              ],
+              "filled": 0,
+              "slices": 3
+            }
+          }
+        ],
+        "signal": {
+          "status": "deferred_capacity",
+          "reason": "分批建仓第 1/3 片已成交；剩余片由后续扫描重新取价并重跑全部风控",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3,
+            "entry_slices": {
+              "plan": [
+                6600,
+                6600,
+                6700
+              ],
+              "filled": 1,
+              "day": "2026-09-10",
+              "slices": 3
+            }
+          }
+        },
+        "cash": 933927.39,
+        "fills": [
+          {
+            "qty": 6600,
+            "price": 10.01,
+            "amount": 66066.0,
+            "fees": 6.61
+          }
+        ],
+        "reservation_count": 1,
+        "risk_count": 1,
+        "audit_count": 3
+      }
+    },
+    "continuation": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": false,
+        "deferred": true,
+        "reason": "策略预算剩余仅支持 199199 元新仓，低于动态最小建仓金额 32800 元；席位稀缺时不建尘埃仓，保留为替补候选，待轮换释放预算后按全尺寸复核"
+      },
+      "ledger": {
+        "orders": [
+          {
+            "qty": 200,
+            "filled_qty": 0,
+            "status": "deferred_capacity",
+            "reason": "低于动态最小建仓金额 ¥32,800（当前 ¥2,002）；席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核；短线有效委托至少 ¥4,000，当前 ¥2,002；金额约束仅用于委托 sizing，候选保留在等待池复核",
+            "sizing": {
+              "target_amount": 199199.0,
+              "entry_tranche_scale_pct": 100.0,
+              "minimum_order_amount": 32800.0,
+              "execution_limit_price": 10.01,
+              "entry_slice_target_qty": 200,
+              "entry_slice_index": 2,
+              "entry_slice_total": 3,
+              "capital_deployment": {
+                "lifecycle_stage": "standard",
+                "capital_scale": 1.0,
+                "raw_allowance_amount": 820000.0,
+                "deployable_amount": 820000.0,
+                "waiting_capital": 0.0,
+                "lots": 819,
+                "allowed": true
+              },
+              "qty_final": 200
+            },
+            "entry_slices": {
+              "plan": [
+                100,
+                200,
+                300
+              ],
+              "filled": 1,
+              "slices": 3
+            }
+          }
+        ],
+        "signal": {
+          "status": "deferred_capacity",
+          "reason": "策略预算剩余仅支持 199199 元新仓，低于动态最小建仓金额 32800 元；席位稀缺时不建尘埃仓，保留为替补候选，待轮换释放预算后按全尺寸复核",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3,
+            "entry_slices": {
+              "plan": [
+                100,
+                200,
+                300
+              ],
+              "filled": 1,
+              "day": "2026-09-10",
+              "slices": 3
+            }
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 1,
+        "audit_count": 2
+      }
+    },
+    "zero_slice_target": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": true,
+        "code": "600901",
+        "qty": 19900,
+        "price": 10.01
+      },
+      "ledger": {
+        "orders": [
+          {
+            "qty": 19900,
+            "filled_qty": 19900,
+            "status": "filled",
+            "reason": "Q2 通过；按价格与风险预算计算 19900 股",
+            "sizing": {
+              "target_amount": 199199.0,
+              "entry_tranche_scale_pct": 100.0,
+              "minimum_order_amount": 32800.0,
+              "execution_limit_price": 10.01,
+              "entry_slice_target_qty": 0,
+              "entry_slice_index": 1,
+              "entry_slice_total": 3,
+              "capital_deployment": {
+                "lifecycle_stage": "standard",
+                "capital_scale": 1.0,
+                "raw_allowance_amount": 820000.0,
+                "deployable_amount": 820000.0,
+                "waiting_capital": 0.0,
+                "lots": 819,
+                "allowed": true
+              },
+              "qty_final": 19900
+            },
+            "entry_slices": {
+              "plan": [
+                0,
+                200,
+                300
+              ],
+              "filled": 0,
+              "slices": 3
+            }
+          }
+        ],
+        "signal": {
+          "status": "deferred_capacity",
+          "reason": "分批建仓第 1/3 片已成交；剩余片由后续扫描重新取价并重跑全部风控",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3,
+            "entry_slices": {
+              "plan": [
+                0,
+                200,
+                300
+              ],
+              "filled": 1,
+              "day": "2026-09-10",
+              "slices": 3
+            }
+          }
+        },
+        "cash": 800781.08,
+        "fills": [
+          {
+            "qty": 19900,
+            "price": 10.01,
+            "amount": 199199.0,
+            "fees": 19.92
+          }
+        ],
+        "reservation_count": 1,
+        "risk_count": 1,
+        "audit_count": 3
+      }
+    },
+    "trial_first_cap": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice",
+        "plan_builder"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 3900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 39039.0,
+            "entry_tranche_scale_pct": 50.0,
+            "entry_tranche_qty": 3900,
+            "main_force_first_tranche": {
+              "cap_pct": 12.0,
+              "cap_amount": 40000.0,
+              "qty_before": 9900,
+              "qty_after": 3900,
+              "note": "资金持续且价格站稳后允许后续加仓"
+            },
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 3900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 39039.0,
+            "entry_tranche_scale_pct": 50.0,
+            "entry_tranche_qty": 3900,
+            "main_force_first_tranche": {
+              "cap_pct": 12.0,
+              "cap_amount": 40000.0,
+              "qty_before": 9900,
+              "qty_after": 3900,
+              "note": "资金持续且价格站稳后允许后续加仓"
+            },
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 3900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 39039.0,
+            "entry_tranche_scale_pct": 50.0,
+            "entry_tranche_qty": 3900,
+            "main_force_first_tranche": {
+              "cap_pct": 12.0,
+              "cap_amount": 40000.0,
+              "qty_before": 9900,
+              "qty_after": 3900,
+              "note": "资金持续且价格站稳后允许后续加仓"
+            },
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 3900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 39039.0,
+            "entry_tranche_scale_pct": 50.0,
+            "entry_tranche_qty": 3900,
+            "main_force_first_tranche": {
+              "cap_pct": 12.0,
+              "cap_amount": 40000.0,
+              "qty_before": 9900,
+              "qty_after": 3900,
+              "note": "资金持续且价格站稳后允许后续加仓"
+            },
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": false,
+        "deferred": true,
+        "reason": "策略预算剩余仅支持 39039 元新仓，低于动态最小建仓金额 32800 元；席位稀缺时不建尘埃仓，保留为替补候选，待轮换释放预算后按全尺寸复核"
+      },
+      "ledger": {
+        "orders": [
+          {
+            "qty": 1300,
+            "filled_qty": 0,
+            "status": "deferred_capacity",
+            "reason": "低于动态最小建仓金额 ¥32,800（当前 ¥13,013）；席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核",
+            "sizing": {
+              "target_amount": 39039.0,
+              "entry_tranche_scale_pct": 50.0,
+              "entry_tranche_qty": 3900,
+              "main_force_first_tranche": {
+                "cap_pct": 12.0,
+                "cap_amount": 40000.0,
+                "qty_before": 9900,
+                "qty_after": 3900,
+                "note": "资金持续且价格站稳后允许后续加仓"
+              },
+              "minimum_order_amount": 32800.0,
+              "execution_limit_price": 10.01,
+              "entry_slice_target_qty": 1300,
+              "entry_slice_index": 1,
+              "entry_slice_total": 3,
+              "capital_deployment": {
+                "lifecycle_stage": "standard",
+                "capital_scale": 1.0,
+                "raw_allowance_amount": 820000.0,
+                "deployable_amount": 820000.0,
+                "waiting_capital": 0.0,
+                "lots": 819,
+                "allowed": true
+              },
+              "qty_final": 1300
+            },
+            "entry_slices": {
+              "plan": [
+                1300,
+                1300,
+                1300
+              ],
+              "filled": 0,
+              "slices": 3
+            }
+          }
+        ],
+        "signal": {
+          "status": "deferred_capacity",
+          "reason": "策略预算剩余仅支持 39039 元新仓，低于动态最小建仓金额 32800 元；席位稀缺时不建尘埃仓，保留为替补候选，待轮换释放预算后按全尺寸复核",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 1,
+        "audit_count": 2
+      }
+    },
+    "dispatch_block_price_expired": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice",
+        "plan_builder"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [
+            "价格等待窗口到期：等待 60 分钟现价 10.01 仍未回到冻结限价 9.00，本机会当日失效；需新机会重新确认后再评估"
+          ],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 9.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "entry_price_wait",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": {
+            "opportunity_id": "1#0",
+            "signal_id": 1,
+            "retrigger_seq": 0,
+            "opportunity_started_at": null,
+            "anchor_price": 9.0,
+            "window_minutes": 15.0,
+            "status": "expired",
+            "started_at": "2026-09-10 09:00:00",
+            "expired_at": "2026-09-10 10:00:00",
+            "waited_minutes": 60.0
+          }
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [
+            "价格等待窗口到期：等待 60 分钟现价 10.01 仍未回到冻结限价 9.00，本机会当日失效；需新机会重新确认后再评估"
+          ],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 9.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "entry_price_wait",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": true,
+            "blocked_reason": "stage dispatch veto",
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": {
+            "opportunity_id": "1#0",
+            "signal_id": 1,
+            "retrigger_seq": 0,
+            "opportunity_started_at": null,
+            "anchor_price": 9.0,
+            "window_minutes": 15.0,
+            "status": "expired",
+            "started_at": "2026-09-10 09:00:00",
+            "expired_at": "2026-09-10 10:00:00",
+            "waited_minutes": 60.0
+          }
+        }
+      },
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": false,
+        "reason": "价格等待窗口到期：等待 60 分钟现价 10.01 仍未回到冻结限价 9.00，本机会当日失效；需新机会重新确认后再评估；stage dispatch veto"
+      },
+      "ledger": {
+        "orders": [
+          {
+            "qty": 6600,
+            "filled_qty": 0,
+            "status": "expired",
+            "reason": "价格等待窗口到期：等待 60 分钟现价 10.01 仍未回到冻结限价 9.00，本机会当日失效；需新机会重新确认后再评估；stage dispatch veto",
+            "sizing": {
+              "target_amount": 199199.0,
+              "entry_tranche_scale_pct": 100.0,
+              "minimum_order_amount": 32800.0,
+              "execution_limit_price": 9.0,
+              "entry_slice_target_qty": 6600,
+              "entry_slice_index": 1,
+              "entry_slice_total": 3,
+              "capital_deployment": {
+                "lifecycle_stage": "standard",
+                "capital_scale": 1.0,
+                "raw_allowance_amount": 820000.0,
+                "deployable_amount": 820000.0,
+                "waiting_capital": 0.0,
+                "lots": 819,
+                "allowed": true
+              },
+              "qty_final": 6600
+            },
+            "entry_slices": {
+              "plan": [
+                6600,
+                6600,
+                6700
+              ],
+              "filled": 0,
+              "slices": 3
+            }
+          }
+        ],
+        "signal": {
+          "status": "rejected",
+          "reason": "价格等待窗口到期：等待 60 分钟现价 10.01 仍未回到冻结限价 9.00，本机会当日失效；需新机会重新确认后再评估；stage dispatch veto",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 1,
+        "audit_count": 2
+      }
+    },
+    "slice_builder_error": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice",
+        "plan_builder"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "plan_builder"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0,
+          "execution_limit_price": 10.01
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "entry_opportunity",
+          "exceptional_opportunity",
+          "execution_dispatch",
+          "execution_profile",
+          "sizing"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": {
+          "gate": "none",
+          "status": null,
+          "reason": null,
+          "expires_at": null,
+          "ttl_minutes": 45.0,
+          "strict_ttl": false,
+          "family": "composite",
+          "label": "保守组合",
+          "in_batch_window": false,
+          "current_window": null,
+          "next_window": null,
+          "verification": null,
+          "blocked": false,
+          "blocked_reason": null,
+          "batch_released": false,
+          "settings": {
+            "execution_batch_gate": true,
+            "execution_verification_gate": false,
+            "execution_ttl_sweep": true
+          },
+          "explanation": [
+            "画像无需挂起，按普通路径执行"
+          ],
+          "version": "execution-dispatch-v2"
+        },
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "malformed_plan": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "ValueError",
+        "message": "invalid literal for int() with base 10: 'bad'"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0,
+          "execution_limit_price": 10.01
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "entry_opportunity",
+          "exceptional_opportunity",
+          "execution_dispatch",
+          "execution_profile",
+          "sizing"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": {
+          "gate": "none",
+          "status": null,
+          "reason": null,
+          "expires_at": null,
+          "ttl_minutes": 45.0,
+          "strict_ttl": false,
+          "family": "composite",
+          "label": "保守组合",
+          "in_batch_window": false,
+          "current_window": null,
+          "next_window": null,
+          "verification": null,
+          "blocked": false,
+          "blocked_reason": null,
+          "batch_released": false,
+          "settings": {
+            "execution_batch_gate": true,
+            "execution_verification_gate": false,
+            "execution_ttl_sweep": true
+          },
+          "explanation": [
+            "画像无需挂起，按普通路径执行"
+          ],
+          "version": "execution-dispatch-v2"
+        },
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3,
+            "entry_slices": {
+              "plan": [
+                "bad"
+              ],
+              "filled": 0
+            }
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "malformed_plan_and_profile_error": {
+      "events": [
+        "base",
+        "profile"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "profile"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "exceptional_opportunity",
+          "sizing"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": null,
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3,
+            "entry_slices": {
+              "plan": [
+                "bad"
+              ],
+              "filled": 0
+            }
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "profile_error": {
+      "events": [
+        "base",
+        "profile"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "profile"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "exceptional_opportunity",
+          "sizing"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": null,
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "price_wait_error": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "price_wait"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "exceptional_opportunity",
+          "sizing"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": null,
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "dispatch_error": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 19900,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 199199.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "dispatch"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0,
+          "execution_limit_price": 10.01
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "entry_opportunity",
+          "exceptional_opportunity",
+          "execution_profile",
+          "sizing"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": null,
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "exceptional_error": {
+      "events": [
+        "base",
+        "exceptional"
+      ],
+      "observations": {
+        "exceptional": {
+          "qty": 0,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 0.0,
+            "entry_tranche_scale_pct": 100.0
+          },
+          "risk_sizing_attached": false,
+          "risk_sizing_same_object": false,
+          "risk_fields": [
+            "capital_deployment"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "exceptional"
+      },
+      "exception_audit": {
+        "qty": 0,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 0.0,
+          "entry_tranche_scale_pct": 100.0
+        },
+        "risk_sizing_attached": false,
+        "risk_sizing_same_object": false,
+        "risk_fields": [
+          "capital_deployment"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": null,
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "allocation_early_return": {
+      "events": [],
+      "observations": {},
+      "error": null,
+      "exception_audit": null,
+      "result": {
+        "filled": false,
+        "deferred": true,
+        "status": "deferred_capacity",
+        "reason": "stage allocation veto",
+        "portfolio_snapshot_id": "174bcdb5c3f712e8751321a2d5cfcfa565025a844f5a4f40aae6d418a8bb89e9",
+        "allocation_plan_id": "3742425fa6ed4d780351b1adc62536dc8020f257b41f0cc2ec3d08807b63c0a6"
+      },
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "deferred_capacity",
+          "reason": "stage allocation veto",
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 1,
+        "audit_count": 2
+      }
+    },
+    "deployment_setting_error": {
+      "events": [
+        "base",
+        "profile",
+        "price_wait",
+        "dispatch",
+        "slice",
+        "plan_builder"
+      ],
+      "observations": {
+        "profile": {
+          "qty": 400,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 4004.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "price_wait": {
+          "qty": 400,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 4004.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "exceptional_opportunity",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "dispatch": {
+          "qty": 400,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 4004.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": null,
+          "price_wait": null
+        },
+        "slice": {
+          "qty": 400,
+          "reasons": [],
+          "local_sizing": {
+            "target_amount": 4004.0,
+            "entry_tranche_scale_pct": 100.0,
+            "minimum_order_amount": 32800.0,
+            "execution_limit_price": 10.01
+          },
+          "risk_sizing_attached": true,
+          "risk_sizing_same_object": true,
+          "risk_fields": [
+            "capital_deployment",
+            "entry_opportunity",
+            "exceptional_opportunity",
+            "execution_dispatch",
+            "execution_profile",
+            "sizing"
+          ],
+          "slice_state": null,
+          "entry_slices": null,
+          "execution_dispatch": {
+            "gate": "none",
+            "status": null,
+            "reason": null,
+            "expires_at": null,
+            "ttl_minutes": 45.0,
+            "strict_ttl": false,
+            "family": "composite",
+            "label": "保守组合",
+            "in_batch_window": false,
+            "current_window": null,
+            "next_window": null,
+            "verification": null,
+            "blocked": false,
+            "blocked_reason": null,
+            "batch_released": false,
+            "settings": {
+              "execution_batch_gate": true,
+              "execution_verification_gate": false,
+              "execution_ttl_sweep": true
+            },
+            "explanation": [
+              "画像无需挂起，按普通路径执行"
+            ],
+            "version": "execution-dispatch-v2"
+          },
+          "price_wait": null
+        }
+      },
+      "error": {
+        "type": "StageFailure",
+        "message": "theme_setting"
+      },
+      "exception_audit": {
+        "qty": 100,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 4004.0,
+          "entry_tranche_scale_pct": 100.0,
+          "minimum_order_amount": 32800.0,
+          "execution_limit_price": 10.01,
+          "entry_slice_target_qty": 100,
+          "entry_slice_index": 1,
+          "entry_slice_total": 3
+        },
+        "risk_sizing_attached": true,
+        "risk_sizing_same_object": true,
+        "risk_fields": [
+          "capital_deployment",
+          "entry_opportunity",
+          "entry_slices",
+          "exceptional_opportunity",
+          "execution_dispatch",
+          "execution_profile",
+          "sizing"
+        ],
+        "slice_state": {
+          "plan": [
+            100,
+            100,
+            200
+          ],
+          "filled": 0,
+          "day": "2026-09-10",
+          "slices": 3
+        },
+        "entry_slices": {
+          "plan": [
+            100,
+            100,
+            200
+          ],
+          "filled": 0,
+          "slices": 3
+        },
+        "execution_dispatch": {
+          "gate": "none",
+          "status": null,
+          "reason": null,
+          "expires_at": null,
+          "ttl_minutes": 45.0,
+          "strict_ttl": false,
+          "family": "composite",
+          "label": "保守组合",
+          "in_batch_window": false,
+          "current_window": null,
+          "next_window": null,
+          "verification": null,
+          "blocked": false,
+          "blocked_reason": null,
+          "batch_released": false,
+          "settings": {
+            "execution_batch_gate": true,
+            "execution_verification_gate": false,
+            "execution_ttl_sweep": true
+          },
+          "explanation": [
+            "画像无需挂起，按普通路径执行"
+          ],
+          "version": "execution-dispatch-v2"
+        },
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    },
+    "recovery_input_error": {
+      "events": [
+        "base"
+      ],
+      "observations": {},
+      "error": {
+        "type": "AttributeError",
+        "message": "'list' object has no attribute 'get'"
+      },
+      "exception_audit": {
+        "qty": 19900,
+        "reasons": [],
+        "local_sizing": {
+          "target_amount": 199199.0
+        },
+        "risk_sizing_attached": false,
+        "risk_sizing_same_object": false,
+        "risk_fields": [
+          "capital_deployment"
+        ],
+        "slice_state": null,
+        "entry_slices": null,
+        "execution_dispatch": null,
+        "price_wait": null
+      },
+      "result": null,
+      "ledger": {
+        "orders": [],
+        "signal": {
+          "status": "pending",
+          "reason": null,
+          "payload": {
+            "pick": {
+              "code": "600901",
+              "score": 0.8,
+              "price": 10.0
+            },
+            "decision": {
+              "entry_model": {
+                "score": 90.0
+              }
+            },
+            "entry_slice_policy": 3,
+            "recovery_watch": [
+              "bad"
+            ]
+          }
+        },
+        "cash": 1000000.0,
+        "fills": [],
+        "reservation_count": 0,
+        "risk_count": 0,
+        "audit_count": 2
+      }
+    }
+  }
+}

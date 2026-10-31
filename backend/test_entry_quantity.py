@@ -175,13 +175,17 @@ class EntryQuantityOwnershipTests(unittest.TestCase):
                         and node.name == function)
             calls = [node for node in ast.walk(body) if isinstance(node, ast.Call)
                      and ast.unparse(node.func) == "PSZ.entry_quantity"]
-            self.assertEqual(len(calls), 1, filename)
+            self.assertEqual(len(calls), 5 if function == "_buy_order" else 1, filename)
             if function == "_buy_order":
+                bases = [node for node in calls if ast.unparse(node.args[0]) != "quantity"]
+                self.assertEqual(len(bases), 1, "one base calculation, then explicit same-owner stages")
                 assignments = [node for node in ast.walk(body) if isinstance(node, ast.Assign)
                                and any(isinstance(item, ast.Name) and item.id == "qty"
                                        for target in node.targets for item in ast.walk(target))]
-                self.assertEqual(len(assignments), 1, "automatic qty must only unpack owner result")
-                self.assertEqual(ast.unparse(assignments[0].value), "(quantity.qty, quantity.sizing)")
+                self.assertEqual(len(assignments), 5, "automatic qty must only read owner stage results")
+                for assignment in assignments:
+                    self.assertIn(ast.unparse(assignment.value),
+                                  {"quantity.qty", "(quantity.qty, quantity.sizing)"})
             else:
                 self.assertFalse(any(isinstance(node, ast.Name) and node.id == "_price_aware_qty"
                                      for node in ast.walk(body)))

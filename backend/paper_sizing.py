@@ -203,9 +203,10 @@ def prepare_entry_slice(*, payload, account, qty, asof_day, continuation, existi
 
 
 def entry_quantity(
-    nav: float, cash: float, position_value: float, industry_value: float,
-    code_value: float, fill_price: float, hard_stop: float,
-    profile: Mapping[str, float], exposure_cap: float | None = None,
+    nav: float | EntryQuantityResult, cash: float | None = None,
+    position_value: float | None = None, industry_value: float | None = None,
+    code_value: float | None = None, fill_price: float | None = None, hard_stop: float | None = None,
+    profile: Mapping[str, float] | None = None, exposure_cap: float | None = None,
     max_exposure_cap: float | None = None, exposure_scale: float = 1.0,
     strategy_position_value: float | None = None,
     strategy_cap_amount: float | None = None, pool_cap_amount: float | None = None,
@@ -231,15 +232,25 @@ def entry_quantity(
     requests select the recommendation; positive requests must fit and be lots.
     No cash subtraction, reservations, eligibility checks or fill writes occur.
     Legacy audit amounts retain their original stage (not a final fill value).
+
+    Passing the preceding EntryQuantityResult as the first argument advances
+    this same attempt at a caller-selected business boundary, without repeating
+    base sizing. Supply the unrounded fill_price for amount-based stages.
+    The same audit dictionary is retained, matching legacy partial updates on
+    exceptions. Never reuse a preceding result across attempts or revalidation.
     """
-    qty, sizing = _risk_quantity(
-        nav, cash, position_value, industry_value, code_value, fill_price,
-        hard_stop, profile, exposure_cap, max_exposure_cap, exposure_scale,
-        strategy_position_value, strategy_cap_amount, pool_cap_amount,
-        pending_strategy_amount, pending_pool_amount, num=num, lot_size=lot_size,
-        single_position_max_amount=single_position_max_amount,
-        liquidity_cap_amount=liquidity_cap_amount,
-    )
+    previous = nav if isinstance(nav, EntryQuantityResult) else None
+    if previous is not None:
+        qty, sizing = previous.qty, previous.sizing
+    else:
+        qty, sizing = _risk_quantity(
+            nav, cash, position_value, industry_value, code_value, fill_price,
+            hard_stop, profile, exposure_cap, max_exposure_cap, exposure_scale,
+            strategy_position_value, strategy_cap_amount, pool_cap_amount,
+            pending_strategy_amount, pending_pool_amount, num=num, lot_size=lot_size,
+            single_position_max_amount=single_position_max_amount,
+            liquidity_cap_amount=liquidity_cap_amount,
+        )
     if entry_tranche_scale is not None:
         if entry_tranche_scale < 1.0 and qty >= lot_size:
             qty = int((qty * entry_tranche_scale) / lot_size) * lot_size
@@ -259,8 +270,9 @@ def entry_quantity(
             qty = max(capped_qty, 0)
             sizing["target_amount"] = round(qty * fill_price, 2)
             sizing["entry_tranche_qty"] = int(qty)
-    pre_slice_qty = qty
-    slice_state = slice_detail = None
+    pre_slice_qty = previous.pre_slice_qty if previous and previous.slice_state is not None else qty
+    slice_state = previous.slice_state if previous else None
+    slice_detail = previous.slice_detail if previous else None
     if slice_request is not None:
         qty, slice_state, slice_sizing, slice_detail = prepare_entry_slice(
             payload=slice_request.payload, account=slice_request.account, qty=qty,
@@ -282,7 +294,7 @@ def entry_quantity(
         tranche = int(tranche_quantity / lot_size) * lot_size
         qty = min(qty, tranche)
     recommended = qty
-    reasons = []
+    reasons = list(previous.reasons) if previous else []
     if requested_qty is not None:
         try:
             requested = requested_qty if isinstance(requested_qty, int) else int(num(requested_qty))
