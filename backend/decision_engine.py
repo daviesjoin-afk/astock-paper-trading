@@ -14,9 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import factors as F
 from decision_context import load_evidence
 from decision_rules import (
-    _dim_status,
-    _normalize_news_hits,
-    _safe,
+    dimension_status as _dim_status,
+    normalize_news_hits as _normalize_news_hits,
+    safe_value as _safe,
     buy_timing_tier,
     forced_stop_losses,
     ladder_take_profit,

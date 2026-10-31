@@ -12,7 +12,7 @@ from pathlib import Path
 import sqlite3
 
 import execution_verification as EV
-from main_force_confirmation import _number, _time, MARKET_TZ
+from main_force_confirmation import event_time as _time, number as _number, MARKET_TZ
 
 VERSION = "main-force-trade-evidence-v1"
 ACCOUNT_ID = "main_force_top10"

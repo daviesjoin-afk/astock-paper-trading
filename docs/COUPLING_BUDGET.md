@@ -511,3 +511,29 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 
 按"迁移完成后再收紧预算"的原则，本批**已把 `from_import_private_names` 收紧到实测 23**
 （lock 文件同步），后续批次继续按实测下调。
+
+## 2026-10-31 PR-9 第二批：关闭私有导入通道（23 → 0）
+
+第一批把 `from_import_private_names` 从 63 降到 23，剩下的是**逐个 owner 的默认实现**：
+
+| owner | 公开契约 | 消费者 |
+| --- | --- | --- |
+| `paper_runtime_facts` | `paper_runtime_owner_tz/_instant/_day`、`paper_runtime_business_day`、`paper_runtime_strict_mapping`、`paper_runtime_canonical_json/_detail`、`paper_runtime_row_dict`、`paper_job_run_availability_kind/_fact_verification_status`、`PAPER_RUNTIME_OWNER_TZ(_NAME)` | `paper_trading`（12 条） |
+| `marketdata_transport` | `session_factory`、`tencent_circuit_state`、`tencent_circuit_lock`（约定：读写熔断状态前持锁） | `data_fetcher`（3 条） |
+| `decision_rules` | `safe_value`、`normalize_news_hits`、`dimension_status` | `decision_engine`（3 条） |
+| `main_force_confirmation` | `number`、`event_time` | `main_force_trade_evidence`（2 条） |
+| `deepseek_research` | `execution_leg` | `ai_analysis`（1 条） |
+| `manual_orders` | `commit_strategy_buy` | `paper_trading`（1 条） |
+| `market_data_contract` | 直接改用已公开的 `parse_instant`（owner 侧无改动） | `data_fetcher`（1 条） |
+
+做法与第一批一致：公开名是 owner 的正式契约，旧私有名保留为别名/薄转发；消费者
+`from owner import public_name as _old_local`，调用点零改动。
+
+**实测**：`from_import_private_names` **23 → 0**（通道关闭，守卫从此不允许任何新的
+`from x import _y`）；`private_cross_access` 6、`injected_private_fields` 65、
+`dynamic_name_bridges` 80、`import_cycles` 0、`foundation_violations` 0 均不变。
+`max_file_lines` 14610（+14，别名块与注释）。预算按实测收紧到 **0**（lock 同步）。
+
+**遗留**：`marketdata_transport` 的熔断状态以"公开句柄 + 约定持锁"暴露，属于迁移期
+的诚实做法；后续批次若要把熔断读写收进窄函数（`circuit_snapshot()` / `note_failure()`），
+应作为独立改动，不在本通道收口里做。

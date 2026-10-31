@@ -622,3 +622,20 @@ def paper_job_run_facts(conn, *, as_of, limit=100):
 # ── 公开契约（PR-9） ───────────────────────────────────────────────────────
 PAPER_JOB_INSTANT_FORMAT = _PAPER_JOB_INSTANT_FORMAT
 PAPER_JOB_RUN_REQUIRED_COLUMNS = _PAPER_JOB_RUN_REQUIRED_COLUMNS
+
+
+# ── 公开契约（PR-9 第二批）：paper 运行期事实的规范化入口 ───────────────────
+# 这些是 paper_jobs / paper_job_runs 事实的唯一规范化实现；引擎与读取层以前直接
+# 导入私有名，现在依赖公开名（私有名保留为别名，本模块内部仍可用）。
+PAPER_RUNTIME_OWNER_TZ = _PAPER_RUNTIME_OWNER_TZ
+PAPER_RUNTIME_OWNER_TZ_NAME = _PAPER_RUNTIME_OWNER_TZ_NAME
+paper_runtime_owner_tz = _paper_runtime_owner_tz
+paper_runtime_owner_instant = _paper_runtime_owner_instant
+paper_runtime_owner_day = _paper_runtime_owner_day
+paper_runtime_business_day = _paper_runtime_business_day
+paper_runtime_strict_mapping = _paper_runtime_strict_mapping
+paper_runtime_canonical_json = _paper_runtime_canonical_json
+paper_runtime_canonical_detail = _paper_runtime_canonical_detail
+paper_runtime_row_dict = _paper_runtime_row_dict
+paper_job_run_availability_kind = _paper_job_run_availability_kind
+paper_job_run_fact_verification_status = _paper_job_run_fact_verification_status

@@ -3,7 +3,7 @@
   "deferred_imports": 616,
   "duplicate_helpers": 296,
   "dynamic_name_bridges": 80,
-  "from_import_private_names": 23,
+  "from_import_private_names": 0,
   "import_cycles": 0,
   "import_side_effects": 25,
   "injected_private_fields": 66,

@@ -1446,3 +1446,8 @@ def process_pending_manual_orders(asof_date=None):
                 })
         _record_nav(conn, day, quotes=quote_map)
     return output
+
+
+# ── 公开契约（PR-9 第二批） ────────────────────────────────────────────────
+# 策略买入的唯一提交入口；paper_trading 以前经私有名调用。
+commit_strategy_buy = _commit_strategy_buy

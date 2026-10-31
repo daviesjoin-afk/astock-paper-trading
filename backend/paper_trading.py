@@ -9422,7 +9422,7 @@ def preview_manual_order(*args, **kwargs):
 
 def _commit_strategy_buy(*args, **kwargs):
     """Facade (Phase 2): moved to manual_orders. Original signature: _commit_strategy_buy("""
-    from manual_orders import _commit_strategy_buy as _impl
+    from manual_orders import commit_strategy_buy as _impl
     return _impl(*args, **kwargs)
 
 
@@ -14508,21 +14508,35 @@ from paper_runtime_facts import (
     PaperJobRuntimeFactError as PaperJobRuntimeFactError,
     PAPER_JOB_INSTANT_FORMAT as PAPER_JOB_INSTANT_FORMAT,
     PAPER_JOB_RUN_REQUIRED_COLUMNS as PAPER_JOB_RUN_REQUIRED_COLUMNS,
-    _PAPER_RUNTIME_OWNER_TZ as _PAPER_RUNTIME_OWNER_TZ,
-    _PAPER_RUNTIME_OWNER_TZ_NAME as _PAPER_RUNTIME_OWNER_TZ_NAME,
-    _paper_job_run_availability_kind as _paper_job_run_availability_kind,
-    _paper_job_run_fact_verification_status as _paper_job_run_fact_verification_status,
-    _paper_runtime_business_day as _paper_runtime_business_day,
-    _paper_runtime_canonical_detail as _paper_runtime_canonical_detail,
-    _paper_runtime_canonical_json as _paper_runtime_canonical_json,
-    _paper_runtime_owner_day as _paper_runtime_owner_day,
-    _paper_runtime_owner_instant as _paper_runtime_owner_instant,
-    _paper_runtime_owner_tz as _paper_runtime_owner_tz,
-    _paper_runtime_row_dict as _paper_runtime_row_dict,
-    _paper_runtime_strict_mapping as _paper_runtime_strict_mapping,
+    PAPER_RUNTIME_OWNER_TZ as PAPER_RUNTIME_OWNER_TZ,
+    PAPER_RUNTIME_OWNER_TZ_NAME as PAPER_RUNTIME_OWNER_TZ_NAME,
+    paper_job_run_availability_kind as paper_job_run_availability_kind,
+    paper_job_run_fact_verification_status as paper_job_run_fact_verification_status,
+    paper_runtime_business_day as paper_runtime_business_day,
+    paper_runtime_canonical_detail as paper_runtime_canonical_detail,
+    paper_runtime_canonical_json as paper_runtime_canonical_json,
+    paper_runtime_owner_day as paper_runtime_owner_day,
+    paper_runtime_owner_instant as paper_runtime_owner_instant,
+    paper_runtime_owner_tz as paper_runtime_owner_tz,
+    paper_runtime_row_dict as paper_runtime_row_dict,
+    paper_runtime_strict_mapping as paper_runtime_strict_mapping,
     paper_job_run_fact as paper_job_run_fact,
     paper_job_run_facts as paper_job_run_facts,
 )
+
+# 旧私有名保留为别名（PR-9）：外部仍可用旧名导入，引擎依赖的是公开契约。
+_PAPER_RUNTIME_OWNER_TZ = PAPER_RUNTIME_OWNER_TZ
+_PAPER_RUNTIME_OWNER_TZ_NAME = PAPER_RUNTIME_OWNER_TZ_NAME
+_paper_job_run_availability_kind = paper_job_run_availability_kind
+_paper_job_run_fact_verification_status = paper_job_run_fact_verification_status
+_paper_runtime_business_day = paper_runtime_business_day
+_paper_runtime_canonical_detail = paper_runtime_canonical_detail
+_paper_runtime_canonical_json = paper_runtime_canonical_json
+_paper_runtime_owner_day = paper_runtime_owner_day
+_paper_runtime_owner_instant = paper_runtime_owner_instant
+_paper_runtime_owner_tz = paper_runtime_owner_tz
+_paper_runtime_row_dict = paper_runtime_row_dict
+_paper_runtime_strict_mapping = paper_runtime_strict_mapping
 
 # 旧私有名保留为别名（PR-9）：外部仍可以旧名导入，但引擎依赖的是公开契约。
 _PAPER_JOB_INSTANT_FORMAT = PAPER_JOB_INSTANT_FORMAT

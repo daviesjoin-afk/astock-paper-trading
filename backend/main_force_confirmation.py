@@ -103,3 +103,8 @@ def entry_effect(strategy_id, evidence, *, base_score, threshold, blockers):
         "bonus": bonus, "score": min(1.0, score + bonus) if score is not None else base_score,
         "passed": bool(base_passed),
     }
+
+
+# ── 公开契约（PR-9 第二批） ────────────────────────────────────────────────
+number = _number
+event_time = _time

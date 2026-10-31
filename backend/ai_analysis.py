@@ -138,7 +138,7 @@ def _portfolio_events(paper_db_path, context):
     import ai_research_contract as ARC
     import ai_research_portfolio_adapter as PFA
     import paper_portfolio_read_model as PPRM
-    from deepseek_research import _execution_leg
+    from deepseek_research import execution_leg as _execution_leg
 
     conn = sqlite3.connect(f"file:{paper_db_path}?mode=ro", uri=True, timeout=3)
     conn.row_factory = sqlite3.Row

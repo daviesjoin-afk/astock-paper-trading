@@ -527,3 +527,11 @@ def http_post_json(url, body, timeout=15):
         return response.json() if response.text else {}
     except Exception:
         return {}
+
+
+# ── 公开契约（PR-9 第二批） ────────────────────────────────────────────────
+# 数据层需要线程本地会话与腾讯熔断状态。它们一直是"事实上的公共句柄"，只是挂着
+# 私有名；这里把名字公开，并明确约定：读写熔断状态前必须持有 tencent_circuit_lock。
+session_factory = _session
+tencent_circuit_state = _tencent_circuit
+tencent_circuit_lock = _tencent_circuit_lock
