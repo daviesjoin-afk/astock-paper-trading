@@ -112,6 +112,31 @@ class UnionNewsTests(unittest.TestCase):
         for evidence in collected.evidence_by_account.values():
             self.assertEqual(evidence["news"], [])
 
+    def test_uncoded_rows_are_a_defensive_case_not_a_production_path(self):
+        """生产源恒写 code（快讯与公告两条路径，公告还按 universe 过滤）。
+
+        这里用假 provider 造一条无代码记录，钉住"万一出现"时的分发语义：它会被
+        分发给每个消费者（按代码取值的门禁自行过滤），绝不静默丢失。
+        """
+        def news(names):
+            return [{"code": "600001", "tone": -1}, {"tone": 0, "summary": "全市场条目"}]
+
+        ports = Scan.EvidencePorts(
+            open_readonly=lambda: _NullContext(),
+            cooled_candidates=lambda conn, account_id, rows, day: {
+                "candidates": [{"code": "600001", "name": "甲"}]},
+            news=news,
+            sector_flow=lambda key: [],
+            quotes=lambda codes: {},
+        )
+        collected = Scan.collect_evidence([{"id": "a"}, {"id": "b"}],
+                                          {"a": ([], {}), "b": ([], {})},
+                                          dt.date(2026, 10, 30), ports=ports)
+        for account_id in ("a", "b"):
+            rows = collected.evidence_by_account[account_id]["news"]
+            self.assertIn("全市场条目", [row.get("summary") for row in rows],
+                          "无代码记录必须对所有消费者可见，不能静默丢弃")
+
     def test_no_codes_means_no_provider_call(self):
         calls = []
         ports = Scan.EvidencePorts(

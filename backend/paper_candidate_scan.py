@@ -75,7 +75,14 @@ class NewsSnapshot:
         return self.age_seconds(now=now) <= NEWS_SNAPSHOT_MAX_AGE_SECONDS
 
     def rows_for(self, codes):
-        """按代码切片给某一个消费者；每条记录仍是独立副本。"""
+        """按代码切片给某一个消费者；每条记录仍是独立副本。
+
+        数据源契约（``factors.news_keyword_scan``）：快讯命中与公告命中都**必然**
+        写入 ``code``，公告还会先按本次请求的 ``universe_names`` 过滤，因此生产源
+        不会产出无代码记录 —— 无代码分支在这里只是**防御**：万一将来接入一个会
+        返回全市场条目的源，宁可把该行分发给所有消费者（多给的证据由按代码取值的
+        门禁自行过滤），也不要让它悄悄消失。
+        """
         wanted = {str(code) for code in codes if code}
         return [deepcopy(row) for row in self.rows
                 if not row.get("code") or str(row.get("code")) in wanted]

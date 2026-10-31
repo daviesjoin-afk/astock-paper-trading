@@ -49,6 +49,7 @@ execute_open → _waitlist_news(names, snapshot)
 | 失效 | 抓取失败（`ok=False`）、未覆盖请求的代码、或超过 TTL → 调用方必须重新抓取 |
 | 失败语义 | 失败 **不是**"没有负面新闻"：`ok=False` 的快照永不被复用，等待池会重新请求 |
 | 隔离 | 每次切片 `deepcopy`；一个策略改写自己的行不会影响其他策略或快照本体 |
+| 数据源契约 | `factors.news_keyword_scan` 的快讯与公告两条路径都**必然**写 `code`，公告还先按本次请求的 `universe_names` 过滤（无 code 的公告项直接跳过）→ 生产源不会产出无代码记录 |
 
 ## 4. 指纹（`CandidateScanInputs.fundamentals`）成本决策
 
@@ -86,6 +87,7 @@ execute_open → _waitlist_news(names, snapshot)
 | 隔离 | 改写 A 的新闻行不影响 B，也不污染快照本体 |
 | 失败 | provider 抛错 → `ok=False` / `source="failed"`，绝不被复用；各账户 news 为空 |
 | 空集 | 无代码不发请求，`source="empty"`、`ok=True` |
+| 防御分支 | 若将来出现无代码记录，它会分发给所有消费者（按代码取值的门禁自行过滤），不静默丢失；当前生产源不会触发 |
 | 复用条件 | 成功 + 覆盖 + 未超时；未覆盖/失败/超时三种都拒绝复用 |
 | 等待池 | 可复用时不请求；不可复用时照旧 `_news_for`；无快照时行为不变；空等待池不请求 |
 | 指纹 | 内容相同只算一次且返回隔离副本；原地修改必失效；不同 asof 不共享 |
