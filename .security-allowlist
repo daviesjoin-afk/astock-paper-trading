@@ -171,3 +171,7 @@ value:f5bff025eee6f7d6ab5bbd0ceb09f400f748af5d
 # Public implementation commit of PR299, referenced by docs/DASHBOARD_SNAPSHOT_JOBS.md.
 # Squash merging removes this object from master ancestry; it is not a credential.
 value:eb6755673ce34a3f4d8f703cc065d2937577be2a
+
+# Public PR300 interface-fix commit referenced by docs/RISK_INPUT_DEMAND.md.
+# Squash merging removes it from master ancestry; this is not a credential.
+value:3221f2d1de8c872f3a36841e97db326a86937b73

@@ -559,6 +559,12 @@ durable scan claim、running/completed/failed 生命周期仍由 `paper_trading.
 公共 facade 持有；`paper_risk_service` 不 import `paper_trading`，只依赖只读
 evidence / read model、纯决策模块、`execution_planner` 和明确注入的基础设施 ports。
 
+风险服务每轮创建现有 `paper_kline_snapshot.RoundKlineCache`，仅在本轮 ports 副本中替换
+`evidence.load_kline`，供风险证据与审计共用；持仓的含/不含截止日两种边界在 writer 前分别预取。
+成功非空结果逐消费者复制；预取空值或异常仅交接给首个消费者一次，后续仍可重试，不作整轮负缓存。
+writer 内继续重验周期、持仓与运行资格；新增持仓及空/失败重试仍可能惰性读取。
+完整边界与前后对照见 [风险 K 线轮内复用](docs/RISK_ROUND_KLINE_REUSE.md)。
+
 ## Portfolio / Read Model 边界（R22）
 
 ```text
