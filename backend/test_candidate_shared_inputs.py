@@ -132,12 +132,14 @@ class BatchedCandidateEvidenceTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(PT, "_news_for", side_effect=lambda names: events.append("news") or []))
             sector = stack.enter_context(mock.patch.object(PT.dfc, "fetch_sector_flow", return_value=[{"score": 1}]))
             provider = stack.enter_context(mock.patch.object(PT, "_quotes", side_effect=query))
-            result = PT._bootstrap_candidate_evidence(accounts, candidates, dt.date(2026, 10, 16))
+            collected = PT._bootstrap_candidate_evidence(accounts, candidates, dt.date(2026, 10, 16))
             provider.assert_called_once_with(["600001", "600002", "600003"])
             sector.assert_called_once_with("industry")
-        self.assertEqual(events, ["news", "news", "quotes"])
-        self.assertNotIn("blocked", result)
-        return result, quotes
+        # PR-7：新闻按**代码并集**只抓一次（旧实现每个账户各抓一次）。
+        self.assertEqual(events, ["news", "quotes"])
+        self.assertNotIn("blocked", collected.evidence_by_account)
+        self.assertTrue(collected.news_snapshot.ok)
+        return collected.evidence_by_account, quotes
 
     def test_union_preserves_partial_missing_quotes_and_account_isolation(self):
         result, source = self.collect()
