@@ -8,6 +8,8 @@ cannot relabel signals, orders or audit evidence.
 """
 from __future__ import annotations
 
+import paper_storage as PST
+
 import datetime as dt
 import hashlib
 import json
@@ -330,7 +332,7 @@ def _create_version_schema(conn):
     )
 
 
-def ensure_schema(conn):
+def _ensure_definition_tables(conn):
     """Seed the three formal strategies; retain existing historical identities.
 
     Lifecycle rows are initialized by the dedicated strategy_lifecycle owner.
@@ -377,6 +379,18 @@ def ensure_schema(conn):
            ON strategy_definition_events(strategy_id, id DESC)"""
     )
     _create_version_schema(conn)
+
+
+def ensure_registry_structure(conn):
+    """Install registry/lifecycle structure; no account or cycle initialization."""
+    _ensure_definition_tables(conn)
+    SL.ensure_lifecycle_structure(conn)
+
+
+def ensure_schema(conn):
+    """Preserve registry seeds; skip DDL only in a verified connection scope."""
+    if not PST.schema_is_ready(conn):
+        _ensure_definition_tables(conn)
     now = _now()
     historical_ids = set()
     if _table_exists(conn, "paper_accounts"):

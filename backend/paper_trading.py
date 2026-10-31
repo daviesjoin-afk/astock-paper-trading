@@ -59,6 +59,7 @@ PPRS = PLL.PPRS  # Compatibility export; runtime mutations belong to the lot own
 import paper_repository as PRP
 import paper_performance as PPerf
 import paper_schema_migrations as PSM
+import paper_ledger_bootstrap as PLB
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
@@ -352,7 +353,12 @@ _ENTRY_FREEZE_CACHE = {"at": 0.0, "status": None}
 # one explicit boot recovery before the new scheduler starts; later init_db
 # calls in the same process must never steal an active scan.
 _RUNNER_BOOT_RECOVERED = False
-_PERFORMANCE_INDEXES_READY = False
+# NOTE: there is deliberately no process-wide "schema/indexes already ready"
+# flag any more.  Such a flag cannot tell two database files apart, so a
+# second ``DB_PATH`` (tests, replay, a new deployment dir) inherited the first
+# one's verdict and ran without its indexes.  Structure readiness is now a
+# per-database receipt plus a structure fingerprint (see
+# ``paper_schema_migrations.ensure_bootstrap_receipt_table``).
 # A scheduled slot keeps the lease context on the worker thread.  The context
 # is deliberately absent for direct read/manual API calls, while every
 # scheduler-owned order/fill path validates it before mutating the ledger.
@@ -1536,17 +1542,6 @@ def _db_readonly():
         yield conn
 
 
-def _ensure_runtime_lease_columns(conn):
-    """Add lease metadata to ledgers created by older deployments.
-
-    The scheduler and API share one SQLite file, so this migration is kept
-    deliberately small and idempotent.  Nullable columns preserve all legacy
-    rows; a missing expiry is handled by the conservative started_at fallback
-    in ``_recover_stale_runtime_state``.
-    """
-    return PSM.ensure_runtime_lease_columns(conn)
-
-
 def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     """Recover abandoned scheduler claims without running expensive migrations.
 
@@ -1653,17 +1648,22 @@ def _reconcile_signal_order_states(conn):
             _finish_capital_reservation(conn, int(retry["id"]), "released")
         else:
             seen_retry_signals.add(signal_id)
-    try:
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_signal_retry
-               ON paper_orders(signal_id)
-               WHERE side='buy' AND signal_id IS NOT NULL AND status='execution_retry'"""
-        )
-    except sqlite3.IntegrityError:
-        # A legacy database may be repaired by the next init pass; never make
-        # an otherwise healthy paper ledger unavailable because an index was
-        # created concurrently by another process.
-        pass
+    # 唯一索引只在**缺失**时才建：它的谓词依赖上面的行清理，所以不能搬进结构
+    # bootstrap；但每次启动都发一条 DDL 也没必要 —— 先看 sqlite_schema。
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_paper_orders_signal_retry'"
+    ).fetchone():
+        try:
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_signal_retry
+                   ON paper_orders(signal_id)
+                   WHERE side='buy' AND signal_id IS NOT NULL AND status='execution_retry'"""
+            )
+        except sqlite3.IntegrityError:
+            # A legacy database may be repaired by the next init pass; never make
+            # an otherwise healthy paper ledger unavailable because an index was
+            # created concurrently by another process.
+            pass
 
     order_statuses = tuple(ENTRY_RETRY_ORDER_STATUSES)
     placeholders = ",".join("?" for _ in order_statuses)
@@ -1838,33 +1838,16 @@ def _supersede_signal_execution_retries(conn, signal_id):
 
 
 def _ensure_performance_indexes(conn):
-    """Install idempotent read-path indexes once per process.
+    """Install idempotent read-path indexes (structure owner: paper_schema_migrations).
 
     These indexes only accelerate existing ledger reads; they do not alter
-    selection, risk, sizing, or order semantics.  Keeping this migration
-    separate from the large bootstrap script also upgrades databases created
-    by older deployments without rebuilding any rows.
+    selection, risk, sizing, or order semantics.  The process-wide
+    "already done" flag is gone: it could not tell two different database
+    files apart, so a second ``DB_PATH`` inherited the first one's verdict and
+    silently ran without its indexes.  Index state now belongs to the schema
+    bootstrap (structure fingerprint + receipt), not to this process.
     """
-    global _PERFORMANCE_INDEXES_READY
-    if _PERFORMANCE_INDEXES_READY:
-        return
-    conn.executescript(
-        """
-        CREATE INDEX IF NOT EXISTS idx_paper_lots_account_code_remaining
-            ON paper_position_lots(cycle_id, account_id, code, remaining_qty, available_date);
-        CREATE INDEX IF NOT EXISTS idx_paper_orders_account_code_status
-            ON paper_orders(account_id, code, status, side, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_paper_fills_order_account_side
-            ON paper_fills(order_id, account_id, side, code);
-        CREATE INDEX IF NOT EXISTS idx_paper_signals_replacement
-            ON paper_signals(account_id, intended_date, status, signal_date);
-        CREATE INDEX IF NOT EXISTS idx_paper_audit_event_recent
-            ON paper_audit(event, created_at DESC, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_latest
-            ON paper_risk_decisions(account_id, code, created_at DESC, id DESC);
-        """
-    )
-    _PERFORMANCE_INDEXES_READY = True
+    return PSM.ensure_performance_indexes(conn)
 
 
 def _ensure_ignition_shadow_table(conn):
@@ -1877,59 +1860,66 @@ def _ensure_ignition_shadow_table(conn):
     return PSM.ensure_ignition_shadow_table(conn)
 
 
+def _recover_ledger_runtime(conn):
+    """Runtime recovery：业务引导与合法恢复，**每次** ``init_db`` 都执行。
+
+    结构 ready 不等于业务 ready：账户配置、周期挂接、过期租约回收、
+    signal/订单对账都必须无条件跑。``schema_ready_scope`` 只让嵌套 owner
+    跳过重复 DDL，不跳过这里的任何一步。
+    """
+    with PST.schema_ready_scope(conn):
+        RSET.ensure_schema(conn)
+        SR.ensure_schema(conn)
+        _ensure_accounts(conn)
+        _ensure_user_strategy_accounts(conn)
+        _ensure_cycle(conn)
+        _recover_stale_runtime_state(conn)
+        _reconcile_signal_order_states(conn)
+
+
 @PTM.timed("initialization")
 def init_db():
+    """创建/升级独立账本。不会启动任务、不会请求行情。
+
+    职责分成两段，一次调用里顺序执行：
+
+    1. :func:`paper_ledger_bootstrap.bootstrap_schema` —— 只负责结构（建表、
+       加列、索引、触发器）与"升级成功"的校验。已升级且结构摘要匹配的库走
+       低成本路径：不重复 DDL、不重复建索引。
+    2. :func:`_recover_ledger_runtime` —— 账户/周期引导、过期租约回收、
+       signal 与订单对账。结构已完成也**不会**跳过。
+
+    不再有"探测失败就吞掉异常再重建"的分支：拿不到结构就抛错，调用方必须
+    放弃本次初始化，避免半升级账本继续交易。
+    """
     global _RUNNER_BOOT_RECOVERED
-    """创建独立账本。不会启动任务、不会请求行情。"""
-    # 快速路径：核心表已存在时只跑幂等升级链，跳过昂贵的建表 DDL。
-    # 两条路径共用同一条升级链：历史上它们各写一份，导致"快路径漏掉新迁移"
-    # 反复出现（新表只在完整路径建，升级后的库第一次写入就 no such table）。
-    try:
-        with _db() as conn:
-            tables = [r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='paper_accounts'"
-            ).fetchall()]
-            if tables:
-                _upgrade_ledger(conn)
-                return
-    except Exception:
-        pass
-    with _db() as conn:
-        PSM.ensure_current(
-            conn,
-            now=_now,
-            entry_retry_order_statuses=ENTRY_RETRY_ORDER_STATUSES,
-            entry_frozen_waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
-        )
-        _rebuild_realized_pnl(conn)
-        _upgrade_ledger(conn)
-        _RUNNER_BOOT_RECOVERED = True
+    with _db(immediate=True) as conn:
+        fresh_ledger = not PSM.table_exists(conn, "paper_accounts")
+        bootstrap = PLB.bootstrap_schema(conn, fresh=fresh_ledger)
+        if fresh_ledger:
+            # 新库的一次性历史行修补：行为与拆分前完全一致（只在新库跑）。
+            PSM.repair_legacy_ledger_rows(
+                conn,
+                now=_now,
+                entry_retry_order_statuses=ENTRY_RETRY_ORDER_STATUSES,
+                entry_frozen_waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
+            )
+            _rebuild_realized_pnl(conn)
+            _RUNNER_BOOT_RECOVERED = True
+        _recover_ledger_runtime(conn)
+        if bootstrap["path"] == "cold":
+            # 结构与业务恢复都已完成，才记录"本事务里验证过"的结构收据。
+            # 收据覆盖**恢复之后**的结构（例如对账阶段建立的唯一索引），
+            # 所以下一次启动直接命中低成本路径。
+            PSM.write_bootstrap_receipt(
+                conn,
+                now=_now(),
+                fingerprint=PSM.structure_fingerprint(conn),
+                owner_fingerprint=bootstrap["owner_fingerprint"],
+            )
     # H9: 建表/迁移/启动回收是批量写，显式收缩 WAL，避免 -wal 无界增长。
     _wal_checkpoint()
-
-
-def _upgrade_ledger(conn):
-    """幂等升级链：列升级 → 逐特性建表 → 业务引导。init_db 两条路径共用。
-
-    每一步都必须幂等：既在全新库上跑（紧随建表之后），也在跑过几十轮的旧库上跑。
-    建表 DDL 与历史行修补已归 ``paper_schema_migrations``，本函数只负责按顺序驱动
-    它们，以及引擎自己的业务引导（账户 / 周期 / 回收 / 对账）。
-    """
-    PSM.ensure_paper_columns(conn)
-    RSET.ensure_schema(conn)
-    SR.ensure_schema(conn)
-    PSM.ensure_execution_verification_columns(conn)
-    PSM.ensure_rebalance_state_cycle_ownership(conn)
-    PSM.ensure_feature_tables(conn)
-    _ensure_accounts(conn)
-    _ensure_user_strategy_accounts(conn)
-    _ensure_cycle(conn)
-    _ensure_runtime_lease_columns(conn)
-    _recover_stale_runtime_state(conn)
-    _reconcile_signal_order_states(conn)
-    _ensure_performance_indexes(conn)
-    _ensure_ignition_shadow_table(conn)
-    SCM.ensure_schema(conn)
+    return bootstrap
 
 
 def _benchmark_close():
@@ -1939,8 +1929,14 @@ def _benchmark_close():
     return _num(frame["close"].iloc[-1], None)
 
 
+_BENCHMARK_UNRESOLVED = object()
+
+
 def _ensure_accounts(conn):
-    benchmark = _benchmark_close()
+    # 基准收盘价只写进**新建**账户的 benchmark_start / 建仓 NAV。健康账本上一行
+    # 都不建，却为了这个值去读（甚至拉取）基准 K 线 —— 启动期的无谓 IO 就是
+    # 这么来的。改成惰性取值：只有真的要 INSERT 账户时才解析一次。
+    benchmark = _BENCHMARK_UNRESOLVED
     active_cycle = conn.execute(
         "SELECT id,status,capital FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -1970,6 +1966,8 @@ def _ensure_accounts(conn):
                 )
             continue
         now = _now()
+        if benchmark is _BENCHMARK_UNRESOLVED:
+            benchmark = _benchmark_close()
         conn.execute(
             """INSERT INTO paper_accounts
             (id,name,source_strategy,status,initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,risk_profile,version,benchmark_start,created_at,updated_at)

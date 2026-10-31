@@ -139,10 +139,10 @@ class CandidateEvidenceTests(_EvidenceCase):
         )
         before = self.load()
         queries = []
-        with mock.patch.object(PT, "_PERFORMANCE_INDEXES_READY", False):
-            PT._ensure_performance_indexes(self.conn)
-            PT._PERFORMANCE_INDEXES_READY = False
-            PT._ensure_performance_indexes(self.conn)
+        # PR-6：索引 DDL 已归结构 bootstrap，进程内不再有 "已建好" 布尔量；
+        # 幂等性直接由重复调用验证。
+        PT._ensure_performance_indexes(self.conn)
+        PT._ensure_performance_indexes(self.conn)
         self.conn.set_trace_callback(queries.append)
         try:
             after = self.load()

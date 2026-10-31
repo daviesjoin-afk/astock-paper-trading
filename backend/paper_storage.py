@@ -17,6 +17,53 @@ import data_paths
 import paper_timing as PTM
 
 
+def execute_script(conn, script):
+    """Execute SQL statements without SQLite executescript's implicit commit.
+
+    The caller owns the transaction. This is the existing migration runner's
+    statement parser, shared by schema owners so trigger bodies stay intact.
+    """
+    statement = []
+    for char in script:
+        statement.append(char)
+        if char == ";" and sqlite3.complete_statement("".join(statement)):
+            sql = "".join(statement).strip()
+            if sql:
+                conn.execute(sql)
+            statement = []
+    sql = "".join(statement).strip()
+    if sql and not sql.startswith("--"):
+        conn.execute(sql)
+
+
+_SCHEMA_SCOPE = contextvars.ContextVar("ledger_schema_scope", default=None)
+
+
+def schema_is_ready(conn):
+    """Whether *this exact connection* was already verified by the caller.
+
+    The answer is scoped to the enclosing :func:`schema_ready_scope` in the
+    current context.  Nothing about a database is cached process-wide, so a
+    switch to another ``DB_PATH`` (or a second connection) never inherits it.
+    """
+    return _SCHEMA_SCOPE.get() is conn
+
+
+@contextmanager
+def schema_ready_scope(conn):
+    """Nested owners may skip DDL only for one verified initialization call.
+
+    Scope: this connection object, inside this ``with`` block, in this context.
+    No process/DB_PATH readiness is cached, nothing is written, and business
+    seed/recovery must still run — the scope only suppresses repeated DDL.
+    """
+    token = _SCHEMA_SCOPE.set(conn)
+    try:
+        yield conn
+    finally:
+        _SCHEMA_SCOPE.reset(token)
+
+
 def is_sqlite_busy_error(exc: Exception) -> bool:
     """Check whether an exception represents an SQLite busy / locked condition.
 

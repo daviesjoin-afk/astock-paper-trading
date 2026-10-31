@@ -7,6 +7,8 @@ and the append-only state ledger. Promotion evidence is deliberately evaluated b
 """
 from __future__ import annotations
 
+import paper_storage as PST
+
 import datetime as dt
 import hashlib
 import json
@@ -74,9 +76,9 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
         f"PRAGMA table_info({table_name})").fetchall()}
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_lifecycle_structure(conn: sqlite3.Connection) -> None:
     """Install lifecycle owners and idempotently migrate exact live-cycle pins."""
-    conn.executescript("""
+    PST.execute_script(conn, """
     CREATE TABLE IF NOT EXISTS strategy_lifecycle_state (
       strategy_id TEXT NOT NULL,
       strategy_version INTEGER NOT NULL,
@@ -117,6 +119,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
       BEFORE DELETE ON strategy_lifecycle_events
       BEGIN SELECT RAISE(ABORT,'append-only strategy lifecycle events'); END;
     """)
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Preserve lifecycle/pin recovery; DDL is scoped to structural readiness."""
+    if not PST.schema_is_ready(conn):
+        ensure_lifecycle_structure(conn)
     rows = conn.execute("""SELECT d.id,d.lifecycle_status,d.current_version,d.current_checksum
         FROM strategy_definitions d WHERE d.current_version IS NOT NULL
         ORDER BY d.id""").fetchall()

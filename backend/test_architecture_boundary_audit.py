@@ -136,7 +136,14 @@ class CouplingBudgetTests(unittest.TestCase):
         "paper_table_fanout_max": 0,
         # 2026-10-29（adaptive 库 schema 收口）：schema owner 显式持有 7 个下游
         # owner 的建表依赖，README 见 docs/COUPLING_BUDGET.md 当日切片。
-        "cross_domain_edges": 8,
+        #
+        # 2026-10-31（PR-6：schema bootstrap 拆出独立 owner）：结构 bootstrap 从
+        # `paper_trading` 搬到 `paper_ledger_bootstrap`（paper 域），它显式声明了
+        # 两条**本来就有**的依赖边——→`runtime_settings`（other 域）、
+        # →`strategy_champion`（strategy 域）。依赖没有新增，只是从"主引擎里的
+        # 隐式组装"变成"owner 自己的显式声明"；8 → 10，切片见
+        # docs/COUPLING_BUDGET.md「2026-10-31 PR-6」。
+        "cross_domain_edges": 10,
         "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,

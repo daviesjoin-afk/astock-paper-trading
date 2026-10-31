@@ -12,6 +12,8 @@ masked API.
 """
 from __future__ import annotations
 
+import paper_storage as PST
+
 import datetime as dt
 import json
 import sqlite3
@@ -188,9 +190,8 @@ def strategy_override_defaults(conn: sqlite3.Connection) -> dict[str, dict[str, 
     return result
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    SR.ensure_schema(conn)
-    conn.executescript(
+def _ensure_settings_structure(conn: sqlite3.Connection) -> None:
+    PST.execute_script(conn,
         """
         CREATE TABLE IF NOT EXISTS paper_runtime_settings(
             key TEXT PRIMARY KEY,
@@ -217,6 +218,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE paper_cycles ADD COLUMN duration_days INTEGER")
     if "enabled_strategies" not in columns:
         conn.execute("ALTER TABLE paper_cycles ADD COLUMN enabled_strategies TEXT")
+
+
+def ensure_settings_structure(conn: sqlite3.Connection) -> None:
+    """Install settings and registry structure without seeding defaults."""
+    SR.ensure_registry_structure(conn)
+    _ensure_settings_structure(conn)
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Defaults remain repairable on every call, even with a current schema."""
+    SR.ensure_schema(conn)
+    if not PST.schema_is_ready(conn):
+        _ensure_settings_structure(conn)
     for group in SETTING_GROUPS:
         for key in SETTING_GROUPS[group]:
             if conn.execute("SELECT 1 FROM paper_runtime_settings WHERE key=?", (key,)).fetchone():

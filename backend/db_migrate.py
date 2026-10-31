@@ -25,6 +25,7 @@ import strategy_registry
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
+import paper_storage as PST
 CACHE_DIR = data_paths.data_dir()
 
 DB_PATHS = {
@@ -509,17 +510,7 @@ def _run_operation(conn, operation):
         if result is False:
             raise RuntimeError("迁移操作未完成")
         return
-    statement = []
-    for char in operation:
-        statement.append(char)
-        if char == ";" and sqlite3.complete_statement("".join(statement)):
-            sql = "".join(statement).strip()
-            if sql:
-                conn.execute(sql)
-            statement = []
-    sql = "".join(statement).strip()
-    if sql and not sql.startswith("--"):
-        conn.execute(sql)
+    PST.execute_script(conn, operation)
 
 
 def _backup_database(conn, path, current_version):
