@@ -2747,6 +2747,13 @@ def ensure_performance_indexes(conn):
 
 SIGNAL_RETRY_UNIQUE_INDEX = "idx_paper_orders_signal_retry"
 
+#: 三种**互不相同**的结果。以前用 bool 表示，把"已经保证了唯一性"和"这一轮没能保证、
+#: 留待下一轮"压成同一个 ``False``，调用方一旦按"没有 → 建一下"去理解就会重复发 DDL，
+#: 或者更糟：把"没保证"当成"不归我管"。两个没有新建的分支必须分开表述。
+SIGNAL_RETRY_INDEX_PRESENT = "present"   # 索引已在，唯一性由结构保证，本次未发 DDL
+SIGNAL_RETRY_INDEX_CREATED = "created"   # 本次创建成功，唯一性从这一轮开始生效
+SIGNAL_RETRY_INDEX_BLOCKED = "blocked"   # 残余重复行，本轮建不上；唯一性**尚未**生效
+
 
 def ensure_signal_retry_unique_index(conn):
     """保证「同一 signal 只允许一条活动 execution_retry」的偏唯一索引存在。
@@ -2755,15 +2762,19 @@ def ensure_signal_retry_unique_index(conn):
     调用方必须**先**完成重复 retry 的行清理（同一 signal 只保留最新一条），否则
     历史重复行会让唯一索引建不上。
 
-    索引已存在时不发任何 DDL；建不上（历史重复行尚未清理完）返回 ``False``，让
-    下一次初始化继续尝试 —— 绝不因为一条索引让健康账本不可用。
-    返回 ``True`` 表示本次真的创建了索引。
+    返回三态（不要压成 bool）：
+
+    * :data:`SIGNAL_RETRY_INDEX_PRESENT` —— 索引已存在，本轮没有也**不需要**发 DDL；
+    * :data:`SIGNAL_RETRY_INDEX_CREATED` —— 本轮真的创建了索引；
+    * :data:`SIGNAL_RETRY_INDEX_BLOCKED` —— 清理后仍有重复行（例如另一个写者在本轮
+      清理与建索引之间插入、或旧库的遗留状态），本轮建不上。此时**唯一性尚未生效**，
+      但调用方**不得**因此阻断健康账本：按既有约定留到下一次初始化重试。
     """
     if conn.execute(
         "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?",
         (SIGNAL_RETRY_UNIQUE_INDEX,),
     ).fetchone():
-        return False
+        return SIGNAL_RETRY_INDEX_PRESENT
     try:
         conn.execute(
             f"""CREATE UNIQUE INDEX IF NOT EXISTS {SIGNAL_RETRY_UNIQUE_INDEX}
@@ -2772,5 +2783,5 @@ def ensure_signal_retry_unique_index(conn):
                   AND status='execution_retry'"""
         )
     except sqlite3.IntegrityError:
-        return False
-    return True
+        return SIGNAL_RETRY_INDEX_BLOCKED
+    return SIGNAL_RETRY_INDEX_CREATED

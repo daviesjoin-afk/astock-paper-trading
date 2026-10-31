@@ -237,7 +237,8 @@ fencing 语义全部不变。
 | --- | --- | --- | --- | --- |
 | v1 初始交付 | `444f686` | 7513 项 / 231.3 s | 全绿 | 审计 + 12 项专项 |
 | v2 审核修复 R1–R3 | `afe837f` | 7526 项 / 245.4 s | 全绿 | R1–R3 章节 |
-| **v3 复核修复 R4–R6** | 本轮 HEAD | **7541 项 / 249.5 s** | 全绿 | R4、R5 章节 |
+| v3 复核修复 R4–R6 | `d7319a3` | 7541 项 / 249.5 s | 全绿 | R4、R5 章节 |
+| **v4 R5 收尾（三态 + blocked 负向）** | 本轮 HEAD | **7545 项 / 266.2 s** | 全绿 | R5 收尾章节 |
 
 > 本地耗时是**单机 8 分片并行**的墙钟；GitHub CI 的 `tests` job 是另一套串行执行环境
 > （约 5 分钟），两者**不可直接比较**，也不代表生产耗时。每轮 CI 的具体耗时见对应 PR 评论。
@@ -330,11 +331,18 @@ DEPLOY: NOT DEPLOYED
 
 1. 取 `paper_signals` / `paper_orders` / `paper_capital_reservations` 是否齐全（否则跳过）；
 2. **去重清理**：同一 `signal_id` 只保留最新一条 `execution_retry`，其余置 `superseded` 并释放预留；
-3. **`PSM.ensure_signal_retry_unique_index(conn)`**：索引已存在 → 返回 `False`、不发 DDL；
-   缺失 → 建索引并返回 `True`；历史重复行未清理干净 → 捕 `IntegrityError` 返回 `False`，
-   下次初始化再试（不让健康账本因索引不可用）；
+3. **`PSM.ensure_signal_retry_unique_index(conn)`**（返回三态，**不压成 bool**）：
+   - `present` —— 索引已在，本轮不发 DDL，唯一性由结构保证；
+   - `created` —— 本轮真的创建了索引，唯一性从这一轮开始生效；
+   - `blocked` —— 清理后仍有重复行，本轮建不上；**唯一性尚未生效**，按既有约定留到
+     下一次初始化重试，**不阻断健康账本**；
 4. 终态 signal → 回收遗留活动委托 / 释放预留；
 5. 活动委托 → signal 状态对账（`partially_filled` 不降级）。
+
+对账结果 dict 额外带 `retry_index` 字段（`present` / `created` / `blocked`；依赖表缺失时
+`null`），让"这一轮唯一性到底保证没有"可观测，而不是靠猜。**结构收据只描述 bootstrap
+结构**：`blocked` 轮次写出的收据确实不含该索引（它没有假装唯一性已生效），下一轮由恢复层
+独立创建索引，再下一轮结构摘要变化触发一次 cold 把收据对齐 —— 两条语义互不冒充。
 
 新增测试（`backend/test_ledger_bootstrap_lifecycle.py::SignalRetryIndexOwnershipTests`，7 项）：
 `test_index_exists_after_initialization`、`test_repeat_initialization_does_not_reissue_index_ddl`
@@ -342,9 +350,48 @@ DEPLOY: NOT DEPLOYED
 `test_index_definition_lives_in_the_schema_owner`（源码级断言：DDL 在 PSM、不在 paper_trading）、
 `test_index_definition_change_changes_the_owner_fingerprint`（改副本源码 → 指纹变化）、
 `test_duplicate_retry_rows_are_cleaned_before_index_creation`（先清理后建索引，旧行 `superseded`
-且理由保留）、`test_index_helper_is_idempotent_and_reports_creation`。
+且理由保留）、`test_index_helper_reports_three_distinct_states`（present / created / blocked 三态可区分）。
+
+收尾追加（`SignalRetryIndexBlockedTests`，4 项，确定性负向）：`test_blocked_round_is_reported_and_does_not_abort_reconciliation`
+（blocked 不打断对账、只尝试一次、不声称唯一性）、`test_duplicates_that_survive_the_round_leave_the_index_blocked`
+（本轮清理未生效 → 3 条重复存活、索引保持缺失，下一轮归到 1 条并建出索引）、
+`test_next_round_repairs_a_blocked_index`、`test_receipt_never_claims_uniqueness_that_is_not_there`
+（收据存在但不含该索引；下一轮 `verified` 仍由恢复层补建，再下一轮 cold 对齐收据）。
 
 ### R6：本文件
 
 验证章节改为**按提交版本记录**：v1 `444f686`（7513）、v2 `afe837f`（7526）、v3 本轮（7541），
 并区分本地 8 分片墙钟与 GitHub CI 的串行 `tests` job 耗时。R1–R3 的验收记录原样保留。
+
+
+## R5 收尾（v4）：三态返回与 blocked 负向验证
+
+**修改前的问题**：`ensure_signal_retry_unique_index()` 用 `bool` 表达三种结果，
+"索引本来就存在（唯一性已保证）"和"本轮建不上（唯一性**未**保证）"都是 `False`。
+当前调用方只是忽略返回值，所以还没有实际故障，但这是一个语义陷阱：任何后续调用方按
+"False = 不存在，再建一次"去理解，就会重复发 DDL；按"False = 失败"去理解，就会把
+历史约定（允许本轮失败、下轮恢复）误改成阻断健康账本。
+
+**修改后的行为**：
+
+| 结果 | 含义 | 调用方应如何理解 |
+| --- | --- | --- |
+| `present` | 索引已存在，本轮未发 DDL | 唯一性已由结构保证，什么都不用做 |
+| `created` | 本轮创建成功 | 唯一性从这一轮开始生效 |
+| `blocked` | 清理后仍有重复行，本轮建不上 | 唯一性**尚未**生效；不阻断账本，下一轮重试 |
+
+`_reconcile_signal_order_states` 的对账结果 dict 新增 `retry_index` 字段（依赖表缺失时为
+`null`），使"这一轮到底有没有保证唯一性"可观测。对账行结果、signal/order/reservation
+顺序、`partially_filled` 语义全部未变。
+
+**收据语义证明**：`blocked` 轮次写出的收据记录的是**实际**结构（不含该索引），所以收据存在
+≠ 唯一性已生效；下一轮即使走 `verified`，恢复层仍会创建索引；索引出现后结构摘要变化，
+再下一轮 cold 把收据对齐。这条链路由 `test_receipt_never_claims_uniqueness_that_is_not_there`
+逐段断言。
+
+**兼容性**：`blocked` 不抛错、不中断初始化、不删除/改写任何业务行；"本轮失败、下轮恢复"的
+历史约定保持不变，`test_duplicates_that_survive_the_round_leave_the_index_blocked` 与
+`test_next_round_repairs_a_blocked_index` 分别证明"重复存活时账本仍可用"与"下一轮自动修复"。
+
+**分层验证（v4）**：L0 全绿；L1 104 项（36 生命周期 + 12 storage + r26 收敛 + 资金预留消费者）；
+L2 99 项；L3 180 项；L4 **7545 项全绿**（墙钟 266.2 s，最慢分片 223.1 s）。

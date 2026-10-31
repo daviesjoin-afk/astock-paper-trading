@@ -1622,7 +1622,8 @@ def _reconcile_signal_order_states(conn):
     if present != required:
         # A partially-created legacy database is completed by the surrounding
         # init path; do not make the migration itself fail on that state.
-        return {"status": "skipped", "reason": "reconciliation_tables_not_ready"}
+        return {"status": "skipped", "reason": "reconciliation_tables_not_ready",
+                "retry_index": None}
 
     # ``execution_retry`` is a recoverable attempt, not a second intent.  A
     # crash between two retries used to leave several live retry rows for one
@@ -1650,8 +1651,10 @@ def _reconcile_signal_order_states(conn):
             seen_retry_signals.add(signal_id)
     # 索引 DDL 归结构 owner（``paper_schema_migrations``，已参与
     # ``schema_owner_fingerprint``）。顺序是契约：先清理重复 retry 行，再保证
-    # 唯一索引存在；索引已存在时不发 DDL。
-    PSM.ensure_signal_retry_unique_index(conn)
+    # 唯一索引存在；索引已存在时不发 DDL。返回值是三态（present / created /
+    # blocked）—— ``blocked`` 表示本轮唯一性**尚未**生效，按既有约定留到下一次
+    # 初始化重试，绝不阻断健康账本；它只作为诊断字段返回，不改变对账结果。
+    retry_index = PSM.ensure_signal_retry_unique_index(conn)
 
     order_statuses = tuple(ENTRY_RETRY_ORDER_STATUSES)
     placeholders = ",".join("?" for _ in order_statuses)
@@ -1665,7 +1668,8 @@ def _reconcile_signal_order_states(conn):
         order_statuses,
     ).fetchall()
     if not rows:
-        return {"status": "ok", "orders_checked": 0, "orders_reconciled": 0}
+        return {"status": "ok", "orders_checked": 0, "orders_reconciled": 0,
+                "retry_index": retry_index}
 
     # Terminal signals must never leave an active retry order behind.  In
     # particular, superseded signals are not allowed to resurrect through the
@@ -1731,6 +1735,9 @@ def _reconcile_signal_order_states(conn):
         "status": "ok",
         "orders_checked": len(rows),
         "orders_reconciled": reconciled,
+        # 唯一索引这一轮的结论：present / created / blocked（见 owner 的文档）。
+        # 对账行结果与它无关；blocked 只说明"唯一性留待下次初始化再保证"。
+        "retry_index": retry_index,
     }
 
 

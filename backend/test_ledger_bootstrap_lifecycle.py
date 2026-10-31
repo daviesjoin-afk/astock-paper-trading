@@ -721,15 +721,181 @@ class SignalRetryIndexOwnershipTests(LedgerBootstrapFixture):
         self.assertEqual(rows[older]["status"], "superseded")
         self.assertIn("同一信号仅保留最新执行重试", rows[older]["reason"])
 
-    def test_index_helper_is_idempotent_and_reports_creation(self):
+    def test_index_helper_reports_three_distinct_states(self):
+        """present / created / blocked 必须是三种可区分的结果，不能压成 bool。"""
         self._init_path()
         with self._db() as conn:
-            self.assertFalse(PSM.ensure_signal_retry_unique_index(conn),
-                             "索引存在时应返回 False 且不发 DDL")
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(conn),
+                             PSM.SIGNAL_RETRY_INDEX_PRESENT)
             conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
-            self.assertTrue(PSM.ensure_signal_retry_unique_index(conn),
-                            "索引缺失时应真正创建并返回 True")
-            self.assertFalse(PSM.ensure_signal_retry_unique_index(conn))
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(conn),
+                             PSM.SIGNAL_RETRY_INDEX_CREATED)
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(conn),
+                             PSM.SIGNAL_RETRY_INDEX_PRESENT)
+            blocked = _BlockedIndexConnection(conn)
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            self.assertEqual(PSM.ensure_signal_retry_unique_index(blocked),
+                             PSM.SIGNAL_RETRY_INDEX_BLOCKED)
+        self.assertEqual(
+            len({PSM.SIGNAL_RETRY_INDEX_PRESENT, PSM.SIGNAL_RETRY_INDEX_CREATED,
+                 PSM.SIGNAL_RETRY_INDEX_BLOCKED}), 3)
+
+
+# ── R5 收尾：索引三态、blocked 轮次与收据语义 ───────────────────────────────
+
+
+class _NoopCursor:
+    """空结果游标：让测试能表达"这条 UPDATE 本轮没有生效"。"""
+
+    rowcount = 0
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class _BlockedIndexConnection:
+    """把真实连接上的 ``CREATE UNIQUE INDEX`` 变成 IntegrityError。
+
+    模拟的是真实竞态：清理之后、建索引之前另一个写者插入同一 signal 的第二条
+    ``execution_retry``，SQLite 在有重复 key 时抛的就是 IntegrityError。其余所有
+    语句（含对账 UPDATE / SELECT）原样转发给真实连接，逻辑仍是被测生产代码。
+    """
+
+    def __init__(self, conn, *, skip_supersede=False):
+        self._conn = conn
+        self.blocked = 0
+        self.skip_supersede = skip_supersede
+
+    def execute(self, sql, params=()):
+        text = " ".join(str(sql).split())
+        if "CREATE UNIQUE INDEX" in text:
+            self.blocked += 1
+            raise sqlite3.IntegrityError(
+                "UNIQUE constraint failed: paper_orders.signal_id")
+        upper = text.upper()
+        if (self.skip_supersede and upper.startswith("UPDATE PAPER_ORDERS")
+                and "SUPERSEDED" in upper):
+            # 模拟"这一轮的清理没有真正生效"（旧库 guard / 另一写者回填）：
+            # 重复行原样留下，于是唯一索引本轮建不上。
+            return _NoopCursor()
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class SignalRetryIndexBlockedTests(LedgerBootstrapFixture):
+    """blocked 轮次：不阻断健康账本、不冒充唯一性、下一轮可修复。"""
+
+    def _ledger_with_duplicate_retries(self):
+        """索引缺失 + 同一 signal 的三条 execution_retry（重复未被清理的状态）。"""
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            cycle_id = conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0]
+            stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+            now = _stamp(datetime.now())
+            signal_id = conn.execute(
+                """INSERT INTO paper_signals(
+                       account_id,signal_date,intended_date,code,payload,status,created_at,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, now[:10], now[:10], CODE, "{}", "pending", now,
+                 *stamp, cycle_id),
+            ).lastrowid
+            for minute in (31, 33, 35):
+                self._insert_retry_order(
+                    conn, signal_id, f"2026-10-30 09:{minute}:00")
+        return signal_id
+
+    def test_blocked_round_is_reported_and_does_not_abort_reconciliation(self):
+        signal_id = self._ledger_with_duplicate_retries()
+        with self._db() as conn:
+            proxy = _BlockedIndexConnection(conn)
+            result = PT._reconcile_signal_order_states(proxy)
+        self.assertEqual(result["status"], "ok", "blocked 不得让对账整体失败")
+        self.assertEqual(result["retry_index"], PSM.SIGNAL_RETRY_INDEX_BLOCKED)
+        self.assertEqual(proxy.blocked, 1, "只尝试一次，不在同轮内循环重试")
+        self.assertFalse(self._signal_retry_index_exists(),
+                         "blocked 轮次不得声称唯一性已生效")
+        with self._db() as conn:
+            statuses = [
+                row["status"] for row in conn.execute(
+                    "SELECT status FROM paper_orders WHERE signal_id=? ORDER BY id",
+                    (signal_id,),
+                ).fetchall()
+            ]
+        self.assertEqual(statuses.count(PT.STRATEGY_EXECUTION_RETRY_STATUS), 1,
+                         "行清理仍然生效：同一 signal 只留最新一条活动 retry")
+
+    def test_duplicates_that_survive_the_round_leave_the_index_blocked(self):
+        """本轮清理未能消除重复 → 唯一性未生效，但账本不被阻断、下轮可修复。"""
+        signal_id = self._ledger_with_duplicate_retries()
+        with self._db() as conn:
+            proxy = _BlockedIndexConnection(conn, skip_supersede=True)
+            result = PT._reconcile_signal_order_states(proxy)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["retry_index"], PSM.SIGNAL_RETRY_INDEX_BLOCKED)
+        self.assertFalse(self._signal_retry_index_exists())
+        with self._db() as conn:
+            remaining = conn.execute(
+                "SELECT count(*) FROM paper_orders WHERE signal_id=?"
+                " AND status=?",
+                (signal_id, PT.STRATEGY_EXECUTION_RETRY_STATUS),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 3, "本轮确实没能消除重复（唯一性未生效）")
+
+        # 下一轮正常初始化：清理 + 建索引，重复归到 1 条
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+        with self._db() as conn:
+            remaining = conn.execute(
+                "SELECT count(*) FROM paper_orders WHERE signal_id=?"
+                " AND status=?",
+                (signal_id, PT.STRATEGY_EXECUTION_RETRY_STATUS),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 1)
+
+    def test_next_round_repairs_a_blocked_index(self):
+        self._ledger_with_duplicate_retries()
+        with self._db() as conn:
+            PT._reconcile_signal_order_states(_BlockedIndexConnection(conn))
+        self.assertFalse(self._signal_retry_index_exists())
+
+        # 下一轮（正常连接）应当把索引补上 —— 历史约定"本轮失败、下轮恢复"仍然有效
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+
+    def test_receipt_never_claims_uniqueness_that_is_not_there(self):
+        """结构收据只描述 bootstrap 结构；唯一索引由恢复层独立维护。"""
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+        with mock.patch.object(
+            PSM, "ensure_signal_retry_unique_index",
+            return_value=PSM.SIGNAL_RETRY_INDEX_BLOCKED,
+        ):
+            self.assertEqual(self._init_path(), "cold")
+            receipt = self._receipt()
+        # 收据存在，但它记录的结构确实**不含**这条索引（没有假装唯一性已生效）
+        self.assertIsNotNone(receipt)
+        self.assertFalse(self._signal_retry_index_exists())
+        with PT._db() as conn:
+            self.assertEqual(receipt["structure_fingerprint"],
+                             PSM.structure_fingerprint(conn))
+        # 下一轮走 verified（结构摘要一致），恢复层仍会把索引补上
+        self.assertEqual(self._init_path(), "verified")
+        self.assertTrue(self._signal_retry_index_exists(),
+                        "verified 不等于唯一性已保证；恢复层必须继续维护该索引")
+        # 索引出现后结构摘要变化 → 再 cold 一次把收据对齐，之后回到 verified
+        self.assertEqual(self._init_path(), "cold")
+        self.assertTrue(self._signal_retry_index_exists())
+        self.assertEqual(self._init_path(), "verified")
 
 
 if __name__ == "__main__":
