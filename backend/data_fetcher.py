@@ -1029,7 +1029,7 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
     try:
         from market_data_contract import parse_instant as _parse_instant
     except ImportError:
-        from .market_data_contract import _parse_instant
+        from .market_data_contract import parse_instant as _parse_instant
     current = _parse_instant(now)
     if current is None:
         return []

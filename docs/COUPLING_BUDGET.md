@@ -537,3 +537,26 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 **遗留**：`marketdata_transport` 的熔断状态以"公开句柄 + 约定持锁"暴露，属于迁移期
 的诚实做法；后续批次若要把熔断读写收进窄函数（`circuit_snapshot()` / `note_failure()`），
 应作为独立改动，不在本通道收口里做。
+
+## 2026-10-31 PR-9 第二批补丁：相对导入漏检与口径修正
+
+复核发现两件事，**都必须记录，不能笼统宣称"私有导入已全部关闭"**：
+
+1. `data_fetcher` 有一条相对导入回退分支仍在用私有名：
+   `except ImportError: from .market_data_contract import _parse_instant`。它只在
+   "以包方式导入失败、改按脚本方式运行"时才走到，所以普通回归永远看不到它。
+   已改为 `from .market_data_contract import parse_instant as _parse_instant`
+   （普通导入、局部变量名、调用点全部不变）。
+2. **守卫本身漏检相对导入**：`private_channel_counts` 原来只认 `node.level == 0`，
+   `from .module import _private` 这类写法完全不计数。已把条件放宽为"`node.module`
+   的头部在本仓库生产模块集合里"，绝对导入与同包相对导入同口径统计——不新增扫描
+   框架，也不扩大公开 API。
+
+**口径说明**（避免误导）：`from_import_private_names` 的统计单位是
+"`import` 语句里出现的、以单下划线开头的**导入名**个数"，覆盖绝对导入与同包相对导入；
+不覆盖 `import x` 后的属性访问（那是 `private_cross_access`）、依赖容器字段名
+（`injected_private_fields`）与动态取成员（`dynamic_name_bridges`）。
+
+**修正后实测**：`from_import_private_names` = **0**（在放宽后的口径下重新测得，不是沿用
+旧口径的结论）；其余通道 6 / 65 / 80 不变；`max_file_lines` 14610 不变。预算维持 **0**，
+新增 5 项计数口径测试（绝对/相对私有导入、相对公开导入、外部模块、dunder 名）。
