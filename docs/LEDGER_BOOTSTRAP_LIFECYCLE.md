@@ -231,27 +231,43 @@ fencing 语义全部不变。
 固定租约行、`paper_position_lots` 的剩余量与成本、`paper_risk_decisions` 的字段值均逐字
 一致——**有效租约没有被重置，成交事实没有被改写**。
 
-## 验证结果
+## 验证结果（按提交版本记录，历史数据保留）
 
-L0：`ruff check backend scripts` → 仅剩 2 条**既有**问题（`scripts/security/scan-sensitive-data.py`，
-本分支未触碰）；`compileall` 全部通过；`git diff --check` 无空白错误。
+| 轮次 | HEAD | 本地全量（`run_tests_parallel.py --shards 8`） | GitHub CI（8 项） | 本文件对应章节 |
+| --- | --- | --- | --- | --- |
+| v1 初始交付 | `444f686` | 7513 项 / 231.3 s | 全绿 | 审计 + 12 项专项 |
+| v2 审核修复 R1–R3 | `afe837f` | 7526 项 / 245.4 s | 全绿 | R1–R3 章节 |
+| **v3 复核修复 R4–R6** | 本轮 HEAD | **7541 项 / 249.5 s** | 全绿 | R4、R5 章节 |
 
-L1：`backend/test_ledger_bootstrap_lifecycle.py` **25 项全绿**（12 主场景 + 13 项 R1–R3 定向回归）。
+> 本地耗时是**单机 8 分片并行**的墙钟；GitHub CI 的 `tests` job 是另一套串行执行环境
+> （约 5 分钟），两者**不可直接比较**，也不代表生产耗时。每轮 CI 的具体耗时见对应 PR 评论。
 
-L2（局部回归）：`test_db_migrate`、`test_paper_storage`、`test_execution_evidence`、
-`test_execution_verification_probe`、`test_execution_verification_wiring`、
-`test_paper_job_lifecycle`、`test_paper_risk_scan_state`、`test_paper_snapshot_jobs`、
-`test_paper_timing`、`test_replacement_asof_provenance`、`test_ignition_entry`、
-`test_adaptive_schema_ownership`、`test_strategy_registry*`、`test_paper_schema_migrations`、
-`test_schema_ownership`、`test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、
-`test_rebalance_db_ownership`、`test_r32_final_ownership_boundary` 全绿。
+### v3（本轮）分层结果
 
-L3（架构 / cycle / lease / fencing 守卫）：`test_paper_trading_architecture_guard`、
-`test_architecture_boundary_audit` 全绿（耦合预算见下）。
+- **L0**：`ruff check backend` + 两个 PR-6 验收脚本（已在 CI lint 步骤内）全绿；
+  `compileall` 通过；`git diff --check` 无空白错误。
+- **L1**：`test_ledger_bootstrap_lifecycle.py` **32 项**（12 主场景 + 13 项 R1–R3 + 7 项 R5）、
+  `test_paper_storage.py` **12 项**（5 原有 + 7 项 R4）全绿。
+- **L2**：`test_db_migrate`、`test_paper_schema_migrations`、`test_schema_ownership`、
+  `test_paper_job_lifecycle`、`test_execution_*`、`test_paper_snapshot_jobs`、
+  `test_paper_risk_scan_state`、`test_ignition_entry`、`test_paper_timing`、
+  `test_replacement_asof_provenance`、`test_r35c_ai_candidate_generation`、
+  `test_adaptive_schema_ownership` 共 **309 项**全绿。
+- **L3**：`test_paper_trading_architecture_guard`、`test_architecture_boundary_audit`、
+  `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_rebalance_db_ownership`、
+  `test_r32_final_ownership_boundary` 共 **192 项**全绿；耦合预算未放宽
+  （`max_file_lines` 14586 → **14574**，`duplicate_helpers` 296，`dynamic_name_bridges` 80，
+  `cross_domain_edges` 628 = 基线 618 + 已登记额度 10）。
+- **L4**：`python scripts/run_tests_parallel.py --shards 8 --timeout 900` → **7541 项全绿**
+  （exit=0，墙钟 249.5 s，最慢分片 214.0 s，并行度 8）。7526 → 7541 = 新增 15 项
+  （R4 7 + R5 7 + 既有模块 +1），既有模块用例数未减少。
 
-L4：`python scripts/run_tests_parallel.py --shards 8 --timeout 900` → **7513 项全绿**
-（exit=0，墙钟 231.3 s，最慢分片 198.9 s，并行度 8）。master 基线为 7501 项，
-本分支 = master + 新增 12 项专项（其余模块未减少）。
+### 历史轮次（保留）
+
+- **v1**（`444f686`）：L4 **7513 项全绿**，墙钟 231.3 s，最慢分片 198.9 s；master 基线
+  7501 项，本分支 = master + 12 项专项。
+- **v2**（`afe837f`）：L4 **7526 项全绿**，墙钟 245.4 s，最慢分片 214.1 s；较 v1 新增
+  13 项 R1–R3 专项；L1 25 项、L2 262 项、L3 180 项全绿。
 
 **测试改动说明**：`test_paper_timing` / `test_replacement_asof_provenance` 里对
 `_PERFORMANCE_INDEXES_READY` 的重置已删除（该全局量按要求移除）；
@@ -263,3 +279,72 @@ L4：`python scripts/run_tests_parallel.py --shards 8 --timeout 900` → **7513 
 
 MERGE: NOT MERGED（等待人工审核）
 DEPLOY: NOT DEPLOYED
+
+## 复核修复（R4–R6）
+
+### R4：journal_mode 重试按热/冷路径分档
+
+`apply_journal_mode(conn, hot_path=False)` 现在接收 `hot_path`，重试预算集中定义在**唯一**的
+`JOURNAL_MODE_MAX_ATTEMPTS = {"cold": 6, "hot": 3}` + `journal_mode_attempts(hot_path)`：
+
+| 路径 | 次数 | 退避 | 最坏累计等待 |
+| --- | --- | --- | --- |
+| cold（初始化/维护） | 6 | `sqlite_busy_backoff(attempt, hot_path=False)`：0.1/0.2/0.4/0.8/1.0 s + 抖动 | **2.6 – 3.5 s**（有界） |
+| hot（交易槽位） | 3 | `sqlite_busy_backoff(attempt, hot_path=True)`：0.02/0.04 s + 抖动 | **≤ 0.12 s**（远小于 1 s 连接超时） |
+
+- 只对 `is_sqlite_busy_error()` 认定的锁竞争重试；其他异常第一次就上抛。
+- `db()` 把 `hot_path` 透传给 `apply_journal_mode()`，热路径不会再累计冷路径的秒级等待。
+- 连接 `timeout`（1 s / 120 s）、`busy_timeout`、SQLite 事务隔离、订单执行与 fencing 语义未改。
+- 冷路径**保留**有界重试（没有为了热路径把它一起取消），两进程同时首次初始化的专项测试继续通过。
+
+新增测试（`backend/test_paper_storage.py::JournalModeRetryTests`，7 项，确定性脚本化锁竞争，
+不依赖随机调度）：`test_cold_path_retries_through_a_transient_lock`、
+`test_cold_path_raises_after_the_attempt_budget`、`test_non_busy_errors_are_not_retried`、
+`test_hot_path_uses_the_short_budget`、`test_hot_path_never_uses_cold_backoff`
+（断言每次退避都带 `hot_path=True` 且累计 < 0.5 s）、`test_cold_budget_is_materially_larger_than_hot`、
+`test_db_passes_hot_path_into_journal_mode`、`test_attempt_budget_is_defined_in_one_place`。
+
+### R5：执行重试唯一索引的 DDL 归结构 owner
+
+`idx_paper_orders_signal_retry` 的 `CREATE UNIQUE INDEX` 从
+`paper_trading._reconcile_signal_order_states` 下沉到
+`paper_schema_migrations.ensure_signal_retry_unique_index`（名称、`UNIQUE`、过滤谓词逐字保留）。
+
+**schema owner 与它拥有的 DDL**（各模块顶层 `CREATE` / `ALTER` 语句计数，机械核对）：
+
+| owner | CREATE TABLE | CREATE INDEX | CREATE TRIGGER | ALTER TABLE | 覆盖结构 |
+| --- | --- | --- | --- | --- | --- |
+| `paper_schema_migrations` | 48 | 50 | 34 | 10 | 核心账本表、增量列、逐特性表、租约列、点火影子表、读路径索引、**执行重试唯一索引**、收据表 |
+| `runtime_settings` | 2 | 1 | 0 | 2 | 运行时设置表 + 设置审计 + `paper_cycles` 的 `duration_days`/`enabled_strategies` |
+| `strategy_registry` | 7 | 2 | 5 | 1 | 策略定义/版本/head/legacy 绑定及其不可变触发器 |
+| `strategy_lifecycle` | 2 | 1 | 2 | 0 | 生命周期状态 + append-only 事件表与守卫 |
+| `strategy_champion` | 7 | 3 | 2 | 2 | champion 版本、shadow 参数/上下文、影子信号/委托/成交/NAV |
+| `paper_ledger_bootstrap` | 0 | 0 | 0 | 0 | 只做编排（调上面这些 owner），自身不含 DDL |
+| `paper_storage` | 0 | 0 | 0 | 0 | 只做连接/事务/语句切分 |
+| `paper_trading` | 0 | 0 | 0 | 0 | **零 DDL**（R5 之后） |
+
+前 5 个 owner 全部在 `BOOTSTRAP_OWNER_MODULES` 里参与 `schema_owner_fingerprint`；`paper_trading`
+**不**在清单内（避免无关业务改动触发结构重建），因此它的 DDL 必须清零 —— 现在就是 0。
+
+**调用顺序**（`_reconcile_signal_order_states` 内，顺序是契约）：
+
+1. 取 `paper_signals` / `paper_orders` / `paper_capital_reservations` 是否齐全（否则跳过）；
+2. **去重清理**：同一 `signal_id` 只保留最新一条 `execution_retry`，其余置 `superseded` 并释放预留；
+3. **`PSM.ensure_signal_retry_unique_index(conn)`**：索引已存在 → 返回 `False`、不发 DDL；
+   缺失 → 建索引并返回 `True`；历史重复行未清理干净 → 捕 `IntegrityError` 返回 `False`，
+   下次初始化再试（不让健康账本因索引不可用）；
+4. 终态 signal → 回收遗留活动委托 / 释放预留；
+5. 活动委托 → signal 状态对账（`partially_filled` 不降级）。
+
+新增测试（`backend/test_ledger_bootstrap_lifecycle.py::SignalRetryIndexOwnershipTests`，7 项）：
+`test_index_exists_after_initialization`、`test_repeat_initialization_does_not_reissue_index_ddl`
+（trace 断言第二次初始化没有任何针对该索引的 DDL）、`test_missing_index_is_recreated`、
+`test_index_definition_lives_in_the_schema_owner`（源码级断言：DDL 在 PSM、不在 paper_trading）、
+`test_index_definition_change_changes_the_owner_fingerprint`（改副本源码 → 指纹变化）、
+`test_duplicate_retry_rows_are_cleaned_before_index_creation`（先清理后建索引，旧行 `superseded`
+且理由保留）、`test_index_helper_is_idempotent_and_reports_creation`。
+
+### R6：本文件
+
+验证章节改为**按提交版本记录**：v1 `444f686`（7513）、v2 `afe837f`（7526）、v3 本轮（7541），
+并区分本地 8 分片墙钟与 GitHub CI 的串行 `tests` job 耗时。R1–R3 的验收记录原样保留。

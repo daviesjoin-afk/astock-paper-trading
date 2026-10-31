@@ -4306,9 +4306,23 @@ verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailabl
 一次性 +0～1 ms。固定输入账本对照 63 张表逐字段严格相等，结构一致，仅多出收据表。
 离线数字**不**代表生产耗时。
 
-**回归门禁**：`backend/test_ledger_bootstrap_lifecycle.py`（25 项：新库/重复初始化/缺表
-缺列/中断恢复/双进程/只读并发/有效与过期租约/对账/换 DB_PATH/失败 fail closed/成交事实
-不变，以及 checkpoint 范围、源码指纹 fail closed、`init_db()` 返回值契约）、`test_architecture_boundary_audit`（`cross_domain_edges` 8 → 10，切片见
+**journal_mode 重试预算**（R4）：`paper_storage.JOURNAL_MODE_MAX_ATTEMPTS` 是唯一定义点
+（cold 6 次 / hot 3 次），`apply_journal_mode(conn, hot_path=…)` 只对
+`is_sqlite_busy_error()` 重试。冷路径最坏累计 2.6–3.5 s（保证两进程同时首次初始化不直接失败），
+热路径 ≤0.12 s（留在 1 s 连接超时预算内）；`db()` 透传 `hot_path`，连接超时、
+`busy_timeout`、隔离与 fencing 语义不变。
+
+**DDL 归属**（R5）：`paper_trading` 现在**零 DDL**，`idx_paper_orders_signal_retry` 的定义
+下沉到 `paper_schema_migrations.ensure_signal_retry_unique_index()`。结构 owner 与 DDL 的
+对应关系：`paper_schema_migrations`（48 表 / 50 索引 / 34 触发器 / 10 ALTER）、
+`runtime_settings`（2/1/0/2）、`strategy_registry`（7/2/5/1）、`strategy_lifecycle`（2/1/2/0）、
+`strategy_champion`（7/3/2/2）；`paper_ledger_bootstrap` 与 `paper_storage` 只做编排与连接。
+前五个 owner 全部参与 `schema_owner_fingerprint`，改谓词即失效收据。
+
+**回归门禁**：`backend/test_ledger_bootstrap_lifecycle.py`（32 项：新库/重复初始化/缺表缺列/中断恢复/双进程/只读并发/有效与过期租约/对账/
+换 DB_PATH/失败 fail closed/成交事实不变、checkpoint 范围、源码指纹 fail closed、
+`init_db()` 返回值契约、执行重试索引的 DDL 归属与顺序），以及
+`test_paper_storage.py` 的 journal_mode 热/冷重试预算（7 项）、`test_architecture_boundary_audit`（`cross_domain_edges` 8 → 10，切片见
 `docs/COUPLING_BUDGET.md`）、`test_schema_ownership`、`test_db_migrate`。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

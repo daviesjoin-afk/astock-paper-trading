@@ -2736,3 +2736,41 @@ def ensure_performance_indexes(conn):
             ON paper_risk_decisions(account_id, code, created_at DESC, id DESC);
         """,
     )
+
+
+# ── 执行重试的唯一性索引（R5：DDL 归结构 owner） ────────────────────────────
+#
+# 这条索引以前内联在 ``paper_trading._reconcile_signal_order_states`` 里，而
+# ``paper_trading`` 不参与 ``schema_owner_fingerprint``：谓词改了、收据却不失效，
+# 结构契约就会与代码脱节。DDL 定义搬到这里之后，任何改动都会让 owner 源码指纹
+# 变化，从而强制一次完整 bootstrap。
+
+SIGNAL_RETRY_UNIQUE_INDEX = "idx_paper_orders_signal_retry"
+
+
+def ensure_signal_retry_unique_index(conn):
+    """保证「同一 signal 只允许一条活动 execution_retry」的偏唯一索引存在。
+
+    名称、唯一性、过滤谓词与原先内联的定义**逐字一致**。调用顺序是契约的一部分：
+    调用方必须**先**完成重复 retry 的行清理（同一 signal 只保留最新一条），否则
+    历史重复行会让唯一索引建不上。
+
+    索引已存在时不发任何 DDL；建不上（历史重复行尚未清理完）返回 ``False``，让
+    下一次初始化继续尝试 —— 绝不因为一条索引让健康账本不可用。
+    返回 ``True`` 表示本次真的创建了索引。
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?",
+        (SIGNAL_RETRY_UNIQUE_INDEX,),
+    ).fetchone():
+        return False
+    try:
+        conn.execute(
+            f"""CREATE UNIQUE INDEX IF NOT EXISTS {SIGNAL_RETRY_UNIQUE_INDEX}
+                ON paper_orders(signal_id)
+                WHERE side='buy' AND signal_id IS NOT NULL
+                  AND status='execution_retry'"""
+        )
+    except sqlite3.IntegrityError:
+        return False
+    return True

@@ -1648,22 +1648,10 @@ def _reconcile_signal_order_states(conn):
             _finish_capital_reservation(conn, int(retry["id"]), "released")
         else:
             seen_retry_signals.add(signal_id)
-    # 唯一索引只在**缺失**时才建：它的谓词依赖上面的行清理，所以不能搬进结构
-    # bootstrap；但每次启动都发一条 DDL 也没必要 —— 先看 sqlite_schema。
-    if not conn.execute(
-        "SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_paper_orders_signal_retry'"
-    ).fetchone():
-        try:
-            conn.execute(
-                """CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_signal_retry
-                   ON paper_orders(signal_id)
-                   WHERE side='buy' AND signal_id IS NOT NULL AND status='execution_retry'"""
-            )
-        except sqlite3.IntegrityError:
-            # A legacy database may be repaired by the next init pass; never make
-            # an otherwise healthy paper ledger unavailable because an index was
-            # created concurrently by another process.
-            pass
+    # 索引 DDL 归结构 owner（``paper_schema_migrations``，已参与
+    # ``schema_owner_fingerprint``）。顺序是契约：先清理重复 retry 行，再保证
+    # 唯一索引存在；索引已存在时不发 DDL。
+    PSM.ensure_signal_retry_unique_index(conn)
 
     order_statuses = tuple(ENTRY_RETRY_ORDER_STATUSES)
     placeholders = ",".join("?" for _ in order_statuses)

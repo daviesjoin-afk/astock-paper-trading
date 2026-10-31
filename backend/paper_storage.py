@@ -100,14 +100,31 @@ def sqlite_busy_backoff(attempt: int, hot_path: bool = False) -> float:
         return base + jitter
 
 
-def apply_journal_mode(conn, attempts=6):
-    """把连接切到 WAL，并容忍"另一个进程正在初始化"的瞬时锁。
+#: ``PRAGMA journal_mode=WAL`` 不是普通读：它可能要改写数据库头，SQLite 对它的
+#: 切换**不做无限等待**。两个进程同时首次初始化、而其中一个已持有写事务时，后到
+#: 者会立刻拿到 SQLITE_BUSY。这里按连接类型给出**唯二**的重试预算：
+#:
+#: * ``cold``：初始化/维护可以等，允许覆盖一次完整的冷启动竞态；
+#: * ``hot``：交易槽位只有 1s 连接超时预算，必须用同一套短退避（约 0.1–0.2s 总量），
+#:   绝不能累计普通路径约 3.6–4.1 秒的等待。
+#:
+#: 次数只在这里定义，调用方不要各写一份。
+JOURNAL_MODE_MAX_ATTEMPTS = {"cold": 6, "hot": 3}
 
-    ``PRAGMA journal_mode=WAL`` 不是普通读：它可能要改写数据库头。两个进程同时
-    启动、其中一个已持有写事务时，切换会立刻返回 SQLITE_BUSY（SQLite 对
-    journal-mode 变更不做无限等待）。这里沿用存储层既有的 busy 判定与退避做有界
-    重试：连接超时、事务隔离与 fencing 语义都不变，只是不在启动竞态里直接失败。
+
+def journal_mode_attempts(hot_path: bool = False) -> int:
+    """journal_mode 的重试次数（热/冷两档的唯一取值点）。"""
+    return JOURNAL_MODE_MAX_ATTEMPTS["hot" if hot_path else "cold"]
+
+
+def apply_journal_mode(conn, hot_path: bool = False):
+    """把连接切到 WAL，并按连接类型做**有界**重试。
+
+    只对 :func:`is_sqlite_busy_error` 认定的锁竞争重试；其他异常立刻上抛。
+    连接 timeout / ``busy_timeout`` / 事务隔离 / fencing 语义都不变 —— 这里只解决
+    "启动竞态里 journal-mode 切换不该直接失败"，热路径仍然受原来的短预算约束。
     """
+    attempts = journal_mode_attempts(hot_path)
     for attempt in range(attempts):
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -115,7 +132,7 @@ def apply_journal_mode(conn, attempts=6):
         except sqlite3.OperationalError as exc:
             if not is_sqlite_busy_error(exc) or attempt == attempts - 1:
                 raise
-            time.sleep(sqlite_busy_backoff(attempt))
+            time.sleep(sqlite_busy_backoff(attempt, hot_path=hot_path))
 
 
 @contextmanager
@@ -127,7 +144,7 @@ def db(db_path, immediate=False, hot_path=False):
         conn = sqlite3.connect(db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        apply_journal_mode(conn)
+        apply_journal_mode(conn, hot_path=hot_path)
         conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-32000")

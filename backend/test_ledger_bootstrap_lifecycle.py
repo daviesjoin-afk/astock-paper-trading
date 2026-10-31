@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import threading
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from unittest import mock
 
@@ -35,6 +37,7 @@ if BACKEND_DIR not in sys.path:
 
 import paper_ledger_bootstrap as PLB  # noqa: E402
 import paper_schema_migrations as PSM  # noqa: E402
+import paper_storage as PST  # noqa: E402
 import paper_trading as PT  # noqa: E402
 
 ACCOUNT_ID = "trend_pullback"
@@ -142,6 +145,47 @@ class LedgerBootstrapFixture(unittest.TestCase):
                  now[:10], now, "pr6"),
             )
         return order_id
+
+    def _trace_init(self):
+        """跑一次 init_db，返回它实际执行过的全部 SQL（用于断言"没有重复 DDL"）。"""
+        statements = []
+        original = PST.db
+
+        @contextmanager
+        def traced(*args, **kwargs):
+            with original(*args, **kwargs) as conn:
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        with mock.patch.object(PST, "db", traced):
+            self._init()
+        return statements
+
+    def _signal_retry_index_exists(self):
+        with PT._db() as conn:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?",
+                (PSM.SIGNAL_RETRY_UNIQUE_INDEX,),
+            ).fetchone() is not None
+
+    def _insert_retry_order(self, conn, signal_id, created_at):
+        cycle_id = conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+        ).fetchone()[0]
+        stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+        return conn.execute(
+            """INSERT INTO paper_orders(
+                   account_id,side,code,name,qty,planned_price,amount,fees,status,
+                   reason,risk_payload,created_at,signal_id,
+                   strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ACCOUNT_ID, "buy", CODE, "专项标的", 100, 10.0, 1000.0, 0.6,
+             PT.STRATEGY_EXECUTION_RETRY_STATUS, "pr6-retry", "{}", created_at,
+             signal_id, *stamp, cycle_id),
+        ).lastrowid
 
 class LedgerBootstrapLifecycleTestCase(LedgerBootstrapFixture):
     """PR-6 主场景：结构 bootstrap 与运行期恢复的边界。"""
@@ -569,6 +613,123 @@ class PublicReturnContractTests(LedgerBootstrapFixture):
             any("SCHEMA" in name and "READY" in name for name in vars(PT)),
             "不得新增进程级 schema ready 布尔变量",
         )
+
+
+# ── R5：执行重试唯一索引的 DDL 归属结构 owner ───────────────────────────────
+
+
+class SignalRetryIndexOwnershipTests(LedgerBootstrapFixture):
+    """索引 DDL 必须在 ``paper_schema_migrations``（参与源码指纹），不在引擎里。"""
+
+    def test_index_exists_after_initialization(self):
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+        with self._db() as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+                (PSM.SIGNAL_RETRY_UNIQUE_INDEX,),
+            ).fetchone()[0]
+        self.assertIn("UNIQUE INDEX", sql.upper())
+        self.assertIn("status='execution_retry'", sql)
+        self.assertIn("signal_id IS NOT NULL", sql)
+
+    def test_repeat_initialization_does_not_reissue_index_ddl(self):
+        self._init_path()
+        statements = self._trace_init()
+        self.assertEqual(
+            [
+                " ".join(text.split())
+                for text in statements
+                if PSM.SIGNAL_RETRY_UNIQUE_INDEX in text
+                and text.strip().split(None, 1)[0].upper() in {"CREATE", "ALTER", "DROP"}
+            ],
+            [],
+            "索引已存在时不得重复执行索引 DDL",
+        )
+
+    def test_missing_index_is_recreated(self):
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+        self.assertFalse(self._signal_retry_index_exists())
+        self._init_path()
+        self.assertTrue(self._signal_retry_index_exists())
+
+    def test_index_definition_lives_in_the_schema_owner(self):
+        with open(PSM.__file__, encoding="utf-8") as handle:
+            psm_source = handle.read()
+        with open(PT.__file__, encoding="utf-8") as handle:
+            engine_source = handle.read()
+        self.assertIn(PSM.SIGNAL_RETRY_UNIQUE_INDEX, psm_source)
+        self.assertNotIn(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {PSM.SIGNAL_RETRY_UNIQUE_INDEX}",
+            engine_source,
+            "索引 DDL 不得回流到 paper_trading（它不参与源码指纹）",
+        )
+
+    def test_index_definition_change_changes_the_owner_fingerprint(self):
+        copy_path = os.path.join(self.tmp, "paper_schema_migrations.py")
+        shutil.copyfile(PSM.__file__, copy_path)
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name == "paper_schema_migrations":
+                return types.SimpleNamespace(origin=copy_path)
+            return real_find_spec(name, *args, **kwargs)
+
+        with mock.patch.object(importlib.util, "find_spec", side_effect=fake_find_spec):
+            before = PSM.schema_owner_fingerprint()
+            with open(copy_path, "a", encoding="utf-8") as handle:
+                handle.write(chr(10) + "# index predicate changed" + chr(10))
+            after = PSM.schema_owner_fingerprint()
+        self.assertNotEqual(before, after, "索引定义变化必须让 owner 指纹变化")
+
+    def test_duplicate_retry_rows_are_cleaned_before_index_creation(self):
+        """顺序契约：先清理重复 retry，再建唯一索引（否则索引根本建不上）。"""
+        self._init_path()
+        with self._db() as conn:
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            cycle_id = conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0]
+            stamp = PT._strategy_stamp(conn, ACCOUNT_ID)
+            now = _stamp(datetime.now())
+            signal_id = conn.execute(
+                """INSERT INTO paper_signals(
+                       account_id,signal_date,intended_date,code,payload,status,created_at,
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (ACCOUNT_ID, now[:10], now[:10], CODE, "{}", "pending", now,
+                 *stamp, cycle_id),
+            ).lastrowid
+            older = self._insert_retry_order(conn, signal_id, "2026-10-30 09:31:00")
+            newer = self._insert_retry_order(conn, signal_id, "2026-10-30 09:35:00")
+
+        self._init_path()
+
+        self.assertTrue(self._signal_retry_index_exists(),
+                        "清理完成后索引必须建得起来")
+        with self._db() as conn:
+            rows = {
+                row["id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT id,status,reason FROM paper_orders WHERE signal_id=?",
+                    (signal_id,),
+                ).fetchall()
+            }
+        self.assertEqual(rows[newer]["status"], PT.STRATEGY_EXECUTION_RETRY_STATUS)
+        self.assertEqual(rows[older]["status"], "superseded")
+        self.assertIn("同一信号仅保留最新执行重试", rows[older]["reason"])
+
+    def test_index_helper_is_idempotent_and_reports_creation(self):
+        self._init_path()
+        with self._db() as conn:
+            self.assertFalse(PSM.ensure_signal_retry_unique_index(conn),
+                             "索引存在时应返回 False 且不发 DDL")
+            conn.execute(f"DROP INDEX {PSM.SIGNAL_RETRY_UNIQUE_INDEX}")
+            self.assertTrue(PSM.ensure_signal_retry_unique_index(conn),
+                            "索引缺失时应真正创建并返回 True")
+            self.assertFalse(PSM.ensure_signal_retry_unique_index(conn))
 
 
 if __name__ == "__main__":
