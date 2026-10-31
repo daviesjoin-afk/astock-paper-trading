@@ -139,7 +139,7 @@ python scripts/run_tests_parallel.py --shards 8 --timeout 900
 | L2 | planner / deferred cycle / reservation / shared cash / rebuy / manual / slice / OrderIntent / sizing 共 **269 项**通过 |
 | L3 | architecture boundary / paper architecture / schema ownership / import laziness 共 **127 项**通过 |
 | L4 | 完整后端 **7,591 项**通过，8 分片墙钟 **258.3 s**，最慢分片 243.3 s；前端单元 **254 项**通过 |
-| 安全 | 文本扫描零命中；既有 dashboard.png 标记人工图像审核，本 PR 未改图片 |
+| 安全 | 工作树文本扫描零命中；完整本地历史扫描命中旧分支残留 20 项，逐项核对全部位置后，当前发布分支可达对象中为 0；未放宽规则或例外 |
 
 性能口径为离线纯数量计算，预热 1,000 次后 30 批 × 1,000 次，基线/当前同进程交替
 顺序，保留每批值、P50、P95、最小和最大值；不使用单次最快耗时证明改善。
@@ -172,6 +172,8 @@ python scripts/pr8_sizing_probe.py --output .codex-test-tmp/pr8/replay.json \
 ## 已知限制与回滚
 
 最低金额、费用经济性、容量资格和实际 buying power 仍由原门禁裁决。
+本地旧分支的 20 项历史敏感信息残留不属于本次发布提交链，未在本 PR 清理；
+既有 dashboard.png 仍需人工图像审核，本 PR 未改图片。不能把发布范围核验说成整个本地仓库历史已清理。
 通过纯 sizing 并不意味着能够成交；重验和提交必须继续读取当场证据。
 审计 `target_amount` 保持历史阶段口径（例如分片后不重写），避免借重构改变业务行为。
 无数据库迁移或生产配置变更。回滚整个 PR 提交/镜像，保留合法交易账本；
