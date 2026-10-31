@@ -1,6 +1,8 @@
 """Monotonic coupling budgets; tightening is preferable to loosening."""
+import ast
 import json
 from pathlib import Path
+import textwrap
 import unittest
 
 from tools import coupling_metrics
@@ -49,7 +51,7 @@ class CouplingBudgetTests(unittest.TestCase):
         # 私有跨模块依赖的三条"口径外"通道（2026-10-29 对抗性审查 F-01/F-02）。
         # 三项都必须先归零才算真正解耦；不允许用 FEATURE_ALLOWANCE 吸收。
         "injected_private_fields": 66,
-        "from_import_private_names": 63,
+        "from_import_private_names": 0,
         "dynamic_name_bridges": 80,
     }
 
@@ -261,3 +263,36 @@ class CouplingBudgetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PrivateChannelCountingTests(unittest.TestCase):
+    """`from .module import _private` 必须与绝对导入同口径计数。
+
+    背景：守卫原先只认 ``node.level == 0``，于是 ``data_fetcher`` 里那条
+    ``from .market_data_contract import _parse_instant`` 回退分支从未被统计，
+    "私有导入已归零"的说法在相对导入范围内并不成立。这里把口径钉住：相对导入
+    与绝对导入指向同一批生产模块，必须一起计数；预算仍是 0，所以任何新的同类
+    私有相对导入都会让 ``CouplingBudgetTests`` 立刻失败。
+    """
+
+    MODULES = {"owner", "other"}
+
+    def _count(self, source):
+        return coupling_metrics.from_import_private_names(
+            ast.parse(textwrap.dedent(source)), self.MODULES)
+
+    def test_absolute_private_import_is_counted(self):
+        self.assertEqual(self._count("from owner import _hidden"), 1)
+
+    def test_relative_private_import_is_counted(self):
+        self.assertEqual(self._count("from .owner import _hidden"), 1,
+                         "相对导入不得绕开私有导入统计")
+
+    def test_relative_public_import_is_not_counted(self):
+        self.assertEqual(self._count("from .owner import visible"), 0)
+
+    def test_relative_import_of_foreign_module_is_not_counted(self):
+        self.assertEqual(self._count("from .third_party import _hidden"), 0,
+                         "只统计本仓库的生产模块")
+
+    def test_dunder_names_are_not_private_channel(self):
+        self.assertEqual(self._count("from .owner import __all__"), 0)

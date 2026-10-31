@@ -231,6 +231,8 @@ def private_channel_counts(tree, modules) -> tuple[int, int]:
     返回 ``(from_import_private, dynamic_name_bridges)``：
 
     * ``from <项目模块> import _私有名`` —— 别名形态之外的第二条私有通道；
+      **绝对导入与同包相对导入（``from .module import _x``）都算**：本仓库的生产
+      模块都在同一层目录里，相对导入只是写法不同，不能因为写法绕开统计；
     * ``globals()[...]`` / ``getattr(x, computed)`` / ``sys.modules[...]``
       —— 任何基于静态 Name/Attribute 的守卫都看不见的"按名字取成员"。
 
@@ -241,8 +243,11 @@ def private_channel_counts(tree, modules) -> tuple[int, int]:
     bridges = 0
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            if (node.level == 0 and node.module
-                    and node.module.split(".")[0] in modules):
+            # level==0 是绝对导入，level>=1 是同包相对导入（``from .x import y``，
+            # 此时 node.module 只含模块名）。两种写法指向同一批生产模块，必须同口径
+            # 统计；原先只认 level==0，`from .market_data_contract import _parse_instant`
+            # 这类回退分支就成了漏检。
+            if node.module and node.module.split(".")[0] in modules:
                 from_import += sum(
                     1 for alias in node.names
                     if alias.name.startswith("_") and not alias.name.startswith("__"))

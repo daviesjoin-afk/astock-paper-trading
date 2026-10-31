@@ -27,22 +27,35 @@ except Exception:  # pragma: no cover - only if tzdata is missing
     TZ = None
 
 
-def _now() -> str:
+def now_stamp() -> str:
+    """本地时区的秒级 ISO 时间戳（adaptive/evolution 的写入时间口径）。"""
     if TZ is not None:
         return dt.datetime.now(TZ).isoformat(timespec="seconds")
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
-def _json(value) -> str:
+def json_text(value) -> str:
+    """紧凑、非 ASCII 安全、拒绝 NaN 的 JSON 文本。"""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
-def _loads(value, default=None):
+def json_loads(value, default=None):
+    """宽松读取：空值/坏 JSON 返回 ``default``（默认 ``{}``）。"""
     try:
         return json.loads(value) if value else (default if default is not None else {})
     except (TypeError, ValueError, json.JSONDecodeError):
         return default if default is not None else {}
 
 
-def _clamp(value, low, high):
+def clamp_number(value, low, high):
     return max(low, min(high, value))
+
+
+# ── 兼容转发（PR-9：先给 owner 立公开契约，旧私有名保留为薄别名） ─────────────
+# 迁移前 ~12 个模块直接 ``from adaptive_common import _now, _json, ...``，
+# 那是一条**私有跨模块依赖**：owner 改内部名就会打断所有消费者。现在公开名是
+# 唯一定义，私有名只是别名；未迁移的调用方仍然可用，但不再构成私有耦合。
+_now = now_stamp
+_json = json_text
+_loads = json_loads
+_clamp = clamp_number

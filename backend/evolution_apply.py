@@ -32,7 +32,7 @@ import adaptive_configuration as AConfig
 import strategy_registry as SR
 
 import evolution_adversarial as adversarial
-from adaptive_common import _json, _loads, _now
+from adaptive_common import json_text as _json, json_loads as _loads, now_stamp as _now
 
 
 @dataclass(frozen=True)

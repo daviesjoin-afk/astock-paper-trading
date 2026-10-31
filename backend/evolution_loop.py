@@ -45,7 +45,7 @@ try:
     TZ = ZoneInfo("Asia/Shanghai")
 except Exception:  # pragma: no cover - 极旧环境兜底
     TZ = None
-from adaptive_common import _now, _json, _loads  # C3: 收敛重复工具函数
+from adaptive_common import now_stamp as _now, json_text as _json, json_loads as _loads  # C3: 收敛重复工具函数
 from paper_numeric import bounded_num as _bounded_num
 
 # 阶段顺序即为闭环方向；APPLY 之后自动回到 OBSERVE 开启下一代。

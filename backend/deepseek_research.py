@@ -894,3 +894,7 @@ def run_suite(connect_factory, paper_db_path, trigger="post-close", *, context=N
 
 def task_catalog():
     return [{"purpose": key, **value} for key, value in TASKS.items()]
+
+
+# ── 公开契约（PR-9 第二批） ────────────────────────────────────────────────
+execution_leg = _execution_leg

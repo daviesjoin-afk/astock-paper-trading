@@ -48,7 +48,7 @@ import adaptive_genetics as AG
 import adaptive_shadow_risk as ASR
 from strategy_registry import labels as strategy_labels
 import adaptive_configuration as AConfig
-from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
+from adaptive_common import now_stamp as _now, json_text as _json, json_loads as _loads, clamp_number as _clamp  # C3: 收敛重复工具函数
 import research_runtime_config
 
 

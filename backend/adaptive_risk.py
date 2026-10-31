@@ -18,7 +18,7 @@ import sqlite3
 import statistics
 from collections import Counter
 from typing import Any
-from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+from adaptive_common import json_loads as _loads, json_text as _json, clamp_number as _clamp  # C3: 收敛重复工具函数
 from paper_numeric import finite_num as _finite_num
 from adaptive_common import TZ as OWNER_TZ
 import paper_repository as PRP

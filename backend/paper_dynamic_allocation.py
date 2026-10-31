@@ -23,7 +23,7 @@ import json
 import math
 
 import evolution_apply as E
-from adaptive_common import _json
+from adaptive_common import json_text as _json
 import paper_portfolio_read_model as P
 import paper_repository as R
 

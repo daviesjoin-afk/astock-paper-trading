@@ -81,7 +81,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ai_provider_transport as transport
-from adaptive_common import _json, _loads, _now
+from adaptive_common import json_text as _json, json_loads as _loads, now_stamp as _now
 from paper_numeric import bounded_num as _bounded_num
 
 # ─── 槽位与审核模式 ───

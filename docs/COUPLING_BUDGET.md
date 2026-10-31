@@ -483,3 +483,80 @@ SQL 与顺序逐字保留，三个业务常量由调用方传入（schema owner 
 - `import_cycles` 保持 **0**：`paper_ledger_bootstrap` 只 import
   `paper_schema_migrations` / `runtime_settings` / `strategy_champion`，没有任何
   模块反向 import 它。
+
+## 2026-10-31 PR-9 第一批：共享工具与候选车道的私有导入收敛
+
+**问题**：`from_import_private_names`（`from x import _y` 这条能拿到 owner 内部实现、
+却完全绕开静态守卫的通道）实测 63 处，其中 29 处集中在 `adaptive_common._now/_json/
+_loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_trading` 从
+`paper_candidate_lanes`（8）、`paper_entry_price_rules`（1）、`paper_runtime_facts`（2）
+导入私有名——owner 改内部名就会打断所有消费者。
+
+**做法**（先立契约，再迁调用点，旧入口保留薄转发）：
+
+| owner | 公开契约 | 旧私有名 |
+| --- | --- | --- |
+| `adaptive_common` | `now_stamp` / `json_text` / `json_loads` / `clamp_number` | `_now` / `_json` / `_loads` / `_clamp` 保留为模块级别名 |
+| `paper_candidate_lanes` | `concept_expansion_lane_candidates` 等 8 个车道入口 | 原私有函数不变，公开名是别名 |
+| `paper_entry_price_rules` | `open_runup_bonus` | 原 `_open_runup_bonus` 不变 |
+| `paper_runtime_facts` | `PAPER_JOB_INSTANT_FORMAT` / `PAPER_JOB_RUN_REQUIRED_COLUMNS` | 原私有常量不变 |
+
+消费者改为 `from owner import public_name as _old_local`：调用点零改动，但跨模块依赖
+落在**公开名**上。没有新增模块、没有 Manager/Facade、没有缓存。
+
+**实测**：`from_import_private_names` **63 → 23**（剩余 23 处是真正的 owner 内部实现，
+需要逐个设计契约，留给后续批次）；`private_cross_access` 6、`injected_private_fields` 65、
+`dynamic_name_bridges` 80、`import_cycles` 0、`foundation_violations` 0 均**不变**
+（没有用放宽任何额度换这次下降）。`max_file_lines` 14596（+22，公开别名块与注释）。
+
+按"迁移完成后再收紧预算"的原则，本批**已把 `from_import_private_names` 收紧到实测 23**
+（lock 文件同步），后续批次继续按实测下调。
+
+## 2026-10-31 PR-9 第二批：关闭私有导入通道（23 → 0）
+
+第一批把 `from_import_private_names` 从 63 降到 23，剩下的是**逐个 owner 的默认实现**：
+
+| owner | 公开契约 | 消费者 |
+| --- | --- | --- |
+| `paper_runtime_facts` | `paper_runtime_owner_tz/_instant/_day`、`paper_runtime_business_day`、`paper_runtime_strict_mapping`、`paper_runtime_canonical_json/_detail`、`paper_runtime_row_dict`、`paper_job_run_availability_kind/_fact_verification_status`、`PAPER_RUNTIME_OWNER_TZ(_NAME)` | `paper_trading`（12 条） |
+| `marketdata_transport` | `session_factory`、`tencent_circuit_state`、`tencent_circuit_lock`（约定：读写熔断状态前持锁） | `data_fetcher`（3 条） |
+| `decision_rules` | `safe_value`、`normalize_news_hits`、`dimension_status` | `decision_engine`（3 条） |
+| `main_force_confirmation` | `number`、`event_time` | `main_force_trade_evidence`（2 条） |
+| `deepseek_research` | `execution_leg` | `ai_analysis`（1 条） |
+| `manual_orders` | `commit_strategy_buy` | `paper_trading`（1 条） |
+| `market_data_contract` | 直接改用已公开的 `parse_instant`（owner 侧无改动） | `data_fetcher`（1 条） |
+
+做法与第一批一致：公开名是 owner 的正式契约，旧私有名保留为别名/薄转发；消费者
+`from owner import public_name as _old_local`，调用点零改动。
+
+**实测**：`from_import_private_names` **23 → 0**（通道关闭，守卫从此不允许任何新的
+`from x import _y`）；`private_cross_access` 6、`injected_private_fields` 65、
+`dynamic_name_bridges` 80、`import_cycles` 0、`foundation_violations` 0 均不变。
+`max_file_lines` 14610（+14，别名块与注释）。预算按实测收紧到 **0**（lock 同步）。
+
+**遗留**：`marketdata_transport` 的熔断状态以"公开句柄 + 约定持锁"暴露，属于迁移期
+的诚实做法；后续批次若要把熔断读写收进窄函数（`circuit_snapshot()` / `note_failure()`），
+应作为独立改动，不在本通道收口里做。
+
+## 2026-10-31 PR-9 第二批补丁：相对导入漏检与口径修正
+
+复核发现两件事，**都必须记录，不能笼统宣称"私有导入已全部关闭"**：
+
+1. `data_fetcher` 有一条相对导入回退分支仍在用私有名：
+   `except ImportError: from .market_data_contract import _parse_instant`。它只在
+   "以包方式导入失败、改按脚本方式运行"时才走到，所以普通回归永远看不到它。
+   已改为 `from .market_data_contract import parse_instant as _parse_instant`
+   （普通导入、局部变量名、调用点全部不变）。
+2. **守卫本身漏检相对导入**：`private_channel_counts` 原来只认 `node.level == 0`，
+   `from .module import _private` 这类写法完全不计数。已把条件放宽为"`node.module`
+   的头部在本仓库生产模块集合里"，绝对导入与同包相对导入同口径统计——不新增扫描
+   框架，也不扩大公开 API。
+
+**口径说明**（避免误导）：`from_import_private_names` 的统计单位是
+"`import` 语句里出现的、以单下划线开头的**导入名**个数"，覆盖绝对导入与同包相对导入；
+不覆盖 `import x` 后的属性访问（那是 `private_cross_access`）、依赖容器字段名
+（`injected_private_fields`）与动态取成员（`dynamic_name_bridges`）。
+
+**修正后实测**：`from_import_private_names` = **0**（在放宽后的口径下重新测得，不是沿用
+旧口径的结论）；其余通道 6 / 65 / 80 不变；`max_file_lines` 14610 不变。预算维持 **0**，
+新增 5 项计数口径测试（绝对/相对私有导入、相对公开导入、外部模块、dunder 名）。

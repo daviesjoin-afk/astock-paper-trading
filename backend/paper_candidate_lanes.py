@@ -613,3 +613,17 @@ def _star_sector_impulse(universe, asof_date=None):
             "asof": latest,
         }
     return output
+
+
+# ── 公开契约（PR-9：依赖桥按 owner 簇收敛） ─────────────────────────────────
+# 候选车道以前只以私有名被 paper_trading 导入（8 条私有跨模块依赖）。这里把对外
+# 入口声明成公开名，私有名保留（本模块内部与未迁移调用方仍可用）；引擎侧改为
+# 依赖公开名，owner 再改内部实现也不会打断消费者。
+concept_expansion_lane_candidates = _concept_expansion_lane_candidates
+concept_reverse_map_leaders = _concept_reverse_map_leaders
+sector_entry_threshold_context = _sector_entry_threshold_context
+sector_heat_map = _sector_heat_map
+sector_key = _sector_key
+sector_surge_lane_candidates = _sector_surge_lane_candidates
+star_sector_impulse = _star_sector_impulse
+ths_hot_lane_candidates = _ths_hot_lane_candidates

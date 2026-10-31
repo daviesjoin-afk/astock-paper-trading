@@ -60,7 +60,7 @@ from zoneinfo import ZoneInfo
 
 
 TZ = ZoneInfo("Asia/Shanghai")
-from adaptive_common import _now  # C3: _loads 保留本地（空值语义与规范版不同）
+from adaptive_common import now_stamp as _now  # C3: _loads 保留本地（空值语义与规范版不同）
 
 import ai_provider_config as APC
 import ai_research_contract as ARC

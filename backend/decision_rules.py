@@ -126,3 +126,10 @@ def forced_stop_losses(price, cost, peak_price, hold_days, mom20, main_pct,
         signals.append({"type": "海外风险", "level": "warn",
                         "msg": "海外风险红灯，建议降低组合仓位而非单票无条件卖出"})
     return signals
+
+
+# ── 公开契约（PR-9 第二批） ────────────────────────────────────────────────
+# decision_engine 以前导入这些纯规则函数的私有名；规则层本身就是对外的判定边界。
+safe_value = _safe
+normalize_news_hits = _normalize_news_hits
+dimension_status = _dim_status

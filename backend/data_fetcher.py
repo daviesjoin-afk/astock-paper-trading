@@ -18,9 +18,9 @@ import data_paths
 from env_utils import env_float
 from marketdata_transport import (
     HEADERS,
-    _session,
-    _tencent_circuit,
-    _tencent_circuit_lock,
+    session_factory as _session,
+    tencent_circuit_lock as _tencent_circuit_lock,
+    tencent_circuit_state as _tencent_circuit,
     http_get,
     http_post_json,
     reset_data_source,
@@ -1027,9 +1027,9 @@ def _fetch_tencent_market_snapshot_locked(codes, *, max_age, now):
         and MN.finite_number(row.get("pct")) is not None
     }
     try:
-        from market_data_contract import _parse_instant
+        from market_data_contract import parse_instant as _parse_instant
     except ImportError:
-        from .market_data_contract import _parse_instant
+        from .market_data_contract import parse_instant as _parse_instant
     current = _parse_instant(now)
     if current is None:
         return []
