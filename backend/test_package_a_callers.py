@@ -68,6 +68,10 @@ class ManualCancelTests(unittest.TestCase):
             return PCR.finish_capital_reservation(
                 conn, order_key, status, now_fn=lambda: "2026-09-11 10:00:00")
 
+        # 关键：manual_orders 的依赖工厂是**全局**状态，测试结束后必须恢复，
+        # 否则同分片的其它测试会拿到这个 SimpleNamespace 替身。
+        previous_factory = MO._dependencies_factory
+        self.addCleanup(lambda: setattr(MO, "_dependencies_factory", previous_factory))
         self.deps = types.SimpleNamespace(
             db=lambda: contextlib.nullcontext(self.conn),
             audit=lambda conn, account_id, event, detail: self.audits.append(event),
