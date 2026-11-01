@@ -4566,3 +4566,21 @@ PR-10 其他阶段与读取侧仍待验收，尚未进入 PR-11；未做交易�
 没有 schema 或数据迁移，未做真实交易时段验证。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第十批 活动委托/信号对账写入（2026-11-01）
+
+把 `paper_trading._reconcile_signal_order_states` 的三条写入移交 owner：重复
+`execution_retry` 退旧与终态信号遗留委托回收归 `execution_dispatch`（
+`supersede_duplicate_execution_retry` / `supersede_for_terminal_signal`），信号状态对账归
+`signal_service.reconcile_signal_status`。SQL 逐字保留，七状态保护、`status<>?` 的"已是
+目标态不动"语义与原因拼接均未改写。
+
+最新重试判定、终态集合、订单→信号映射、`partially_filled` 不降级、预占释放、时钟读取、
+统计与返回字典仍留在对账循环；三个 owner 不读时钟、不释放预占、不 commit。信号写入没有
+新增跨表边：SQL 不读订单表，JOIN 留在编排层 SELECT。
+
+整表仍 pending，不宣称单写；`_supersede_signal_execution_retries`、entry 路径与归档路径
+的既有写入仍由 `paper_trading` 承担。冻结对照与范围见 `docs/LEDGER_OWNERSHIP.md` 第15节；
+未做真实交易时段验证，未进入 PR-11。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
