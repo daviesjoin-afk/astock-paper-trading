@@ -77,6 +77,11 @@ paper_trading._reconcile_signal_order_states
 
 ## 6. 机器可验证的边界（`backend/test_ledger_ownership.py`，9 项）
 
+> **已知限制（必须与结论一起读）**：守卫扫描的是**静态 SQL 字面量**。f-string / 运行时拼接
+> 出来的 SQL 不在它的视野里，因此当前矩阵的准确表述是"静态 SQL 写入清单及其守卫"，
+> 不等于"所有可能的运行时写入方式都已覆盖"。动态 SQL 写入审计（例如在 `paper_storage`
+> 的连接层按语句归因）是后续独立工作项。
+
 1. 矩阵里每张表都存在于 `REQUIRED_TABLES`（防止表名写错）；
 2. **非 owner 写入不回流**：任何新模块写这些表 → 立即变红；
 3. `owned` 表必须**恰好**一个运行时写入方；
