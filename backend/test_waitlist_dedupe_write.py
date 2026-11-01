@@ -265,9 +265,11 @@ class WaitlistDedupeOwnershipTests(unittest.TestCase):
     def test_owner_is_exported_and_no_new_module_joins_the_writer_sets(self):
         self.assertIn("retire_duplicate_waitlist", EPD.__all__)
         matrix = TLO.OWNERSHIP
+        # 订单行的持久化已在 PR-10 工作包 A 移交 paper_order_ledger；
+        # 信号写入仍由 execution_dispatch 在对账/等待池阶段承担。
+        self.assertIn("paper_order_ledger", matrix["paper_orders"]["writers"])
+        self.assertIn("execution_dispatch", matrix["paper_signals"]["writers"])
         for table in ("paper_orders", "paper_signals"):
-            self.assertIn("execution_dispatch", matrix[table]["writers"])
-            self.assertIn("paper_trading", matrix[table]["writers"])
             self.assertEqual("pending", matrix[table]["status"])
         # 信号侧没有新增写入口：本批不把同一业务操作拆给 signal_service。
         self.assertNotIn("retire_duplicate_waitlist", SIG.__all__)
