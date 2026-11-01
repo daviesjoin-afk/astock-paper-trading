@@ -14509,6 +14509,7 @@ def _bind_application_dependencies():
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),
         "cancel_order": (POL, "cancel_order"),
+        "update_order_outcome": (POL, "update_order_outcome"),
         "write_signal_payload": (SIG, "write_payload"),
         "defer_signal": (SIG, "defer_for_capacity"),
         "reopen_pending": (SIG, "reopen_pending"),

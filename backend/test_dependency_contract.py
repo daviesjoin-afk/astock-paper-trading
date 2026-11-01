@@ -70,7 +70,7 @@ class DependencyContainerContractTests(unittest.TestCase):
                                       "record_execution_block", "record_fill_result",
                                       "accumulate_realized_pnl", "write_signal_payload",
                                       "defer_signal", "reopen_pending",
-                                      "mark_signal_filled"):
+                                      "mark_signal_filled", "update_order_outcome"):
                         continue
                     self.assertIsNotNone(PT._dependency_implementation(field.name))
 

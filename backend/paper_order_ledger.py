@@ -29,6 +29,7 @@ __all__ = [
     "record_realized_pnl",
     "stamp_execution",
     "stamp_execution_rows",
+    "update_order_outcome",
     "update_risk_payload",
     "TERMINAL_ORDER_STATUSES",
     "expire_order",
@@ -167,6 +168,57 @@ def record_realized_pnl(conn, order_id, *, realized):
         "UPDATE paper_orders SET realized_pnl=? WHERE id=?",
         (realized, order_id),
     )
+
+
+#: ``update_order_outcome`` 允许写入的订单状态（调用方判定结果的白名单）。
+ORDER_OUTCOME_STATUSES = (
+    "pending_limit", "pending_execution", "risk_rejected", "expired", "cancelled",
+    "superseded", "execution_retry", "manual_execution_retry", "entry_frozen_waitlist",
+    "ready_to_fill", "filled", "partially_filled",
+)
+
+_UNSET = object()
+
+
+def update_order_outcome(
+    conn, order_id, *, status=_UNSET, reason=_UNSET, risk_payload=_UNSET,
+    clear_fill=False, match_status=None,
+):
+    """订单状态推进：按调用方给出的字段写 row，返回受影响行数。
+
+    只允许写 ``status`` / ``reason`` / ``risk_payload``，外加"清空成交字段"这一
+    个固定组合（``clear_fill``）。``status`` 必须在 :data:`ORDER_OUTCOME_STATUSES`
+    白名单内，避免退化成任意列/任意值的 set_status。
+    """
+    sets: list[str] = []
+    params: list = []
+    if status is not _UNSET:
+        if status not in ORDER_OUTCOME_STATUSES:
+            raise ValueError(f"非法订单状态：{status!r}")
+        sets.append("status=?")
+        params.append(status)
+    if reason is not _UNSET:
+        sets.append("reason=?")
+        params.append(reason)
+    if risk_payload is not _UNSET:
+        sets.append("risk_payload=?")
+        params.append(risk_payload)
+    if clear_fill:
+        sets.append("filled_price=NULL")
+        sets.append("amount=NULL")
+        sets.append("fees=NULL")
+        sets.append("executed_at=NULL")
+    if not sets:
+        raise ValueError("update_order_outcome 需要至少一个字段")
+    sql = "UPDATE paper_orders SET " + ", ".join(sets) + " WHERE id=?"
+    params.append(order_id)
+    if match_status is not None:
+        states = tuple(match_status)
+        if not states:
+            raise ValueError("match_status 需要非空集合")
+        sql += " AND status IN (" + ",".join("?" for _ in states) + ")"
+        params.extend(states)
+    return conn.execute(sql, tuple(params)).rowcount
 
 
 def update_risk_payload(conn, order_id, *, payload, expected_version):

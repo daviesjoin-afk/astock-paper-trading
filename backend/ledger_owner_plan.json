@@ -49,13 +49,6 @@
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
-  "manual_orders::_commit_strategy_buy": {
-   "judge": "manual_orders 策略入口",
-   "operation": "策略买入订单创建（INSERT）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
-  },
   "manual_orders::_terminalize_cycle_stale_order": {
    "judge": "manual_orders 周期归属判定",
    "operation": "周期切换时终止跨周期残留委托",
@@ -69,27 +62,6 @@
    "single_owner": "signal_service",
    "single_package": "B",
    "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
-  },
-  "manual_orders::process_pending_manual_orders": {
-   "judge": "manual_orders 执行循环",
-   "operation": "手动委托执行状态推进",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "服务入口传入的连接"
-  },
-  "manual_orders::strategy_fill_failure": {
-   "judge": "commit_fill 失败结果",
-   "operation": "策略成交失败回写（订单侧）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
-  },
-  "manual_orders::submit_manual_order": {
-   "judge": "手动入口校验 + 风险决定",
-   "operation": "手动下单订单创建（INSERT）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "服务入口传入的连接"
   },
   "paper_cycle_service::archive_cycle": {
    "judge": "归档入口规则",
@@ -215,6 +187,13 @@
    "operation": "派发终止：订单转调用方判定的终态",
    "single_owner": "paper_order_ledger",
    "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::update_order_outcome": {
+   "judge": "manual_orders 手动入口/执行循环",
+   "operation": "订单状态推进（status/reason/risk_payload，可清空成交字段）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_order_ledger::update_risk_payload": {

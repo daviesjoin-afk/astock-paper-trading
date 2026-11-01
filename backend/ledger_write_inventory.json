@@ -254,45 +254,9 @@
    ]
   },
   {
-   "function": "_commit_strategy_buy",
-   "kind": "static",
-   "line": 692,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,reason=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "strategy_fill_failure",
-   "kind": "static",
-   "line": 736,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='risk_rejected',reason=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "strategy_fill_failure",
-   "kind": "static",
-   "line": 749,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,reason=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
    "function": "commit_strategy_entry_fill",
    "kind": "static",
-   "line": 822,
+   "line": 818,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -302,145 +266,13 @@
    ]
   },
   {
-   "function": "submit_manual_order",
-   "kind": "static",
-   "line": 988,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,reason=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "submit_manual_order",
-   "kind": "static",
-   "line": 1010,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,reason=?,risk_payload=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
    "function": "_terminalize_cycle_stale_order",
    "kind": "static",
-   "line": 1157,
+   "line": 1153,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_orders SET status='superseded',reason=?,risk_payload=?,cancelled_at=? WHERE id=? AND status NOT IN ('filled')",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1270,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1286,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='expired',reason='限价委托已过有效期' WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1303,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1318,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1328,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='risk_rejected',reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1357,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='risk_rejected',reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1364,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='pending_limit',reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1396,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='pending_limit',reason=?,risk_payload=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "process_pending_manual_orders",
-   "kind": "static",
-   "line": 1438,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status='pending_limit',reason=?,risk_payload=? WHERE id=?",
    "write_targets": [
     "paper_orders"
    ]
@@ -604,7 +436,7 @@
   {
    "function": "expire_order",
    "kind": "static",
-   "line": 63,
+   "line": 64,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -616,7 +448,7 @@
   {
    "function": "record_execution_block",
    "kind": "static",
-   "line": 92,
+   "line": 93,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -628,7 +460,7 @@
   {
    "function": "record_fill_result",
    "kind": "static",
-   "line": 115,
+   "line": 116,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -640,7 +472,7 @@
   {
    "function": "accumulate_realized_pnl",
    "kind": "static",
-   "line": 135,
+   "line": 136,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -652,7 +484,7 @@
   {
    "function": "stamp_execution",
    "kind": "static",
-   "line": 143,
+   "line": 144,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -664,7 +496,7 @@
   {
    "function": "stamp_execution_rows",
    "kind": "static",
-   "line": 156,
+   "line": 157,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -676,7 +508,7 @@
   {
    "function": "record_realized_pnl",
    "kind": "static",
-   "line": 166,
+   "line": 167,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -686,9 +518,33 @@
    ]
   },
   {
+   "function": "update_order_outcome",
+   "kind": "static",
+   "line": 212,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "update_order_outcome",
+   "kind": "dynamic",
+   "line": 212,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET {}",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
    "function": "update_risk_payload",
    "kind": "static",
-   "line": 174,
+   "line": 226,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -700,7 +556,7 @@
   {
    "function": "insert_order",
    "kind": "static",
-   "line": 195,
+   "line": 247,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -712,7 +568,7 @@
   {
    "function": "insert_order",
    "kind": "dynamic",
-   "line": 195,
+   "line": 247,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -724,7 +580,7 @@
   {
    "function": "supersede_order",
    "kind": "static",
-   "line": 204,
+   "line": 256,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -736,7 +592,7 @@
   {
    "function": "terminate_order",
    "kind": "static",
-   "line": 221,
+   "line": 273,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -748,7 +604,7 @@
   {
    "function": "supersede_for_expired_signal",
    "kind": "static",
-   "line": 231,
+   "line": 283,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -760,7 +616,7 @@
   {
    "function": "supersede_duplicate_execution_retry",
    "kind": "static",
-   "line": 246,
+   "line": 298,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -772,7 +628,7 @@
   {
    "function": "supersede_previous_execution_retry",
    "kind": "static",
-   "line": 261,
+   "line": 313,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -784,7 +640,7 @@
   {
    "function": "cancel_order",
    "kind": "static",
-   "line": 280,
+   "line": 332,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -796,7 +652,7 @@
   {
    "function": "cancel_order",
    "kind": "dynamic",
-   "line": 280,
+   "line": 332,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -808,7 +664,7 @@
   {
    "function": "supersede_for_terminal_signal",
    "kind": "static",
-   "line": 298,
+   "line": 350,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -820,7 +676,7 @@
   {
    "function": "supersede_for_terminal_signal",
    "kind": "dynamic",
-   "line": 298,
+   "line": 350,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -832,7 +688,7 @@
   {
    "function": "retire_gated_order",
    "kind": "static",
-   "line": 313,
+   "line": 365,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -844,7 +700,7 @@
   {
    "function": "retire_gated_order",
    "kind": "dynamic",
-   "line": 313,
+   "line": 365,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -856,7 +712,7 @@
   {
    "function": "retire_duplicate_waitlist_orders",
    "kind": "static",
-   "line": 327,
+   "line": 379,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
