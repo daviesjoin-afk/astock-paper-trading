@@ -87,7 +87,7 @@ OWNERSHIP = {
         "status": "pending",
         "writers": {
             "paper_trading", "manual_orders", "execution_planner",
-            "execution_dispatch", "execution_verification", "entry_lifecycle",
+            "execution_dispatch", "execution_verification",
             "paper_risk_writes",
         },
         "note": "订单状态机由多条权威路径按生命周期阶段推进；本 PR 只锁定集合，不合并状态机",
@@ -95,8 +95,7 @@ OWNERSHIP = {
     "paper_signals": {
         "status": "pending",
         "writers": {
-            "paper_trading", "manual_orders", "execution_dispatch",
-            "entry_lifecycle", "signal_service",
+            "paper_trading", "manual_orders", "execution_dispatch", "signal_service",
         },
         "note": "信号生命周期同样按阶段分写；锁定集合，下一步按阶段收口",
     },
@@ -139,7 +138,7 @@ def write_sites(table: str):
 
 
 class OrderExpiryOperationOwnershipTests(unittest.TestCase):
-    """订单自身过期的操作级边界；不宣称订单/信号整表已单写。"""
+    """订单/信号过期的操作级边界；不宣称订单/信号整表已单写。"""
 
     @staticmethod
     def inline_expiry_writes(source):
@@ -174,6 +173,24 @@ class OrderExpiryOperationOwnershipTests(unittest.TestCase):
                          list(inspect.signature(EPD.expire_order).parameters))
         self.assertEqual(["conn", "signal_id", "reason"],
                          list(inspect.signature(SIG.expire_for_expired_order).parameters))
+        self.assertEqual(["conn", "signal_id", "reason"],
+                         list(inspect.signature(SIG.expire_stale_signal).parameters))
+        self.assertEqual(["conn", "order_id", "cancelled_at"],
+                         list(inspect.signature(EPD.supersede_for_expired_signal).parameters))
+
+    def test_signal_expiry_has_required_owner_ports_and_no_inline_writes(self):
+        import inspect
+        import entry_lifecycle as ELC
+        source = inspect.getsource(ELC.expire_stale_signals)
+        self.assertEqual(set(), self.inline_expiry_writes(source))
+        self.assertEqual({"paper_orders"}, self.inline_expiry_writes(
+            source + '\n    conn.execute("UPDATE paper_orders SET status=?")\n'))
+        signature = inspect.signature(ELC.expire_stale_signals)
+        for name in ("release_reservation", "expire_signal", "supersede_order"):
+            self.assertEqual(inspect.Parameter.empty, signature.parameters[name].default)
+        for table in ("paper_orders", "paper_signals"):
+            self.assertEqual("pending", OWNERSHIP[table]["status"])
+            self.assertNotIn("entry_lifecycle", OWNERSHIP[table]["writers"])
 
     def test_cycles_are_registered_by_stage_without_claiming_single_writer(self):
         self.assertEqual("pending", OWNERSHIP["paper_cycles"]["status"])

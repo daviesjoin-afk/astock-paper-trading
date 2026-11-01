@@ -3,7 +3,7 @@
 
 Candidate → Evidence → Decision → Approval → Frozen Provenance → Signal Persistence
 
-本模块负责 ``paper_signals`` 生成持久化，以及订单自身过期后的关联信号更新；
+本模块负责 ``paper_signals`` 生成持久化、订单自身过期后的关联信号更新及信号自身失效；
 整表生命周期仍有其他阶段写入方，尚未收敛为单写方：
 
 * :func:`commit_signal` 独占 ``INSERT INTO paper_signals`` —— ``paper_trading``
@@ -49,6 +49,7 @@ __all__ = [
     "conflict_statement",
     "decide_signal",
     "expire_for_expired_order",
+    "expire_stale_signal",
     "signal_evidence",
 ]
 
@@ -459,6 +460,15 @@ def expire_for_expired_order(conn, signal_id, *, reason):
     conn.execute(
         """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
                     WHERE id=? AND status IN (?,?,?)""",
+        (ELC.SIGNAL_EXPIRED_STATUS, reason, signal_id, *ELC.RETRY_SIGNAL_STATUSES),
+    )
+
+
+def expire_stale_signal(conn, signal_id, *, reason):
+    """持久化生命周期层已判失效的复试信号；只使用传入身份和原因。"""
+    conn.execute(
+        """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
+                WHERE id=? AND status IN (?,?,?)""",
         (ELC.SIGNAL_EXPIRED_STATUS, reason, signal_id, *ELC.RETRY_SIGNAL_STATUSES),
     )
 

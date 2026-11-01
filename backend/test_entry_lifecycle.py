@@ -215,7 +215,7 @@ class SweepSignalTests(unittest.TestCase):
         conn = _db()
         signal_id = _signal(conn, minutes_ago=10, day="2026-09-08")
         order_id = _order(conn, signal_id, minutes_ago=10, status="pending_limit")
-        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
+        summary = ELC.expire_stale_signals(conn, expire_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
         self.assertEqual(1, summary["expired"])
         self.assertEqual("expired", _row(conn, "paper_signals", signal_id)["status"])
         self.assertEqual(1, summary["orders_cancelled"])
@@ -229,14 +229,14 @@ class SweepSignalTests(unittest.TestCase):
     def test_aged_signal_expires_without_asof_day(self):
         conn = _db()
         signal_id = _signal(conn, minutes_ago=200)
-        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=90)
+        summary = ELC.expire_stale_signals(conn, expire_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=90)
         self.assertEqual(1, summary["expired"])
         self.assertIn("有效期", _row(conn, "paper_signals", signal_id)["reason"])
 
     def test_fresh_today_signals_survive(self):
         conn = _db()
         _signal(conn, minutes_ago=10, status="deferred_capacity")
-        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
+        summary = ELC.expire_stale_signals(conn, expire_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
         self.assertEqual(1, summary["checked"])
         self.assertEqual(0, summary["expired"])
 
@@ -244,7 +244,7 @@ class SweepSignalTests(unittest.TestCase):
         conn = _db()
         _signal(conn, minutes_ago=600, status="filled")
         _signal(conn, minutes_ago=600, status="shadow_q3")
-        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
+        summary = ELC.expire_stale_signals(conn, expire_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
         self.assertEqual(0, summary["checked"])
 
 
@@ -275,10 +275,16 @@ class OrderExpiryOwnerParityTests(unittest.TestCase):
             def release(*args, **kw):
                 if fault == "release_value":
                     raise ValueError("release failure")
-                return PCR.release_order_reservation(*args, **kw)
+                result = PCR.release_order_reservation(*args, **kw)
+                if fault == "order_became_filled":
+                    conn.execute("UPDATE paper_orders SET status='filled' WHERE id=?", (args[1],))
+                return result
             options = {"now": NOW, "ttl_minutes": 30, **kwargs, "release_reservation": release}
             if not legacy and not signal_sweep:
                 options.update(expire_order=EPD.expire_order, expire_signal=SIG.expire_for_expired_order)
+            elif not legacy:
+                options.update(expire_signal=SIG.expire_stale_signal,
+                               supersede_order=EPD.supersede_for_expired_signal)
             try:
                 summary = [sweep(conn, **options) for _ in range(2 if repeat else 1)]
             except Exception as exc:
@@ -410,10 +416,137 @@ class OrderExpiryOwnerParityTests(unittest.TestCase):
         self.assertTrue(writes[1].startswith("UPDATE paper_capital_reservations"))
         self.assertIn("status='superseded'", writes[2])
         self.assertEqual(1, actual["summary"][0]["orders_cancelled"])
+
+
+class SignalExpiryOwnerParityTests(unittest.TestCase):
+    """第八批：信号失效与关联订单回收对照71584c8，保留两阶段及异常。"""
+
+    BASELINE = Path(__file__).with_name("fixtures") / "signal_expiry_71584c8.txt"
+
+    def setUp(self):
+        self.helper = OrderExpiryOwnerParityTests("test_sql_order_and_uncommitted_transaction_match")
+        self.helper.BASELINE = self.BASELINE
+        self.addCleanup(self.helper.doCleanups)
+
+    def compare(self, **kwargs):
+        signal = {"created_at": _iso(200), **kwargs.pop("signal", {})}
+        return self.helper.compare(signal_sweep=True, signal=signal, **kwargs)
+
+    def test_freshness_boundaries_cross_day_priority_and_missing_times_match(self):
+        cases = [
+            ({"created_at": _iso(30)}, {}), ({"created_at": _iso(29)}, {}),
+            ({"created_at": _iso(31)}, {}), ({"created_at": None}, {}),
+            ({"created_at": "invalid", "signal_date": "invalid", "intended_date": "invalid"}, {}),
+            ({"intended_date": "2026-09-08", "created_at": _iso(1)}, {"asof_day": TODAY}),
+            ({"intended_date": None, "signal_date": "2026-09-08", "created_at": _iso(1)},
+             {"asof_day": TODAY}),
+            ({"intended_date": TODAY, "signal_date": "2026-09-08", "created_at": _iso(1)},
+             {"asof_day": TODAY}),
+            ({"created_at": _iso(200)}, {"now": None}),
+        ]
+        for signal, options in cases:
+            with self.subTest(signal=signal, options=options):
+                self.compare(signal=signal, **options)
+
+    def test_signal_states_reasons_and_already_terminal_reclaim_match(self):
+        for status in (*ELC.RETRY_SIGNAL_STATUSES, "expired", "superseded", "rejected",
+                       "blocked", "shadow_q3", "filled", None, ""):
+            for reason in (None, "", "原始；原因"):
+                with self.subTest(status=status, reason=reason):
+                    actual, _ = self.compare(signal={"status": status, "reason": reason},
+                                             order={"reason": reason})
+                    if status in ("expired", "superseded", "rejected", "blocked", "shadow_q3"):
+                        self.assertEqual(0, actual["summary"][0]["expired"])
+                        self.assertEqual(1, actual["summary"][0]["orders_cancelled"])
+
+    def test_order_states_sell_missing_links_and_future_deadline_match(self):
+        for status in (*ELC.RECOVERABLE_ORDER_STATUSES, "filled", "expired", "superseded",
+                       "pending_execution", "awaiting_batch", "pending_verification"):
+            with self.subTest(status=status):
+                self.compare(order={"status": status})
+        for link in ("none", "missing"):
+            self.compare(link=link)
+        self.compare(order={"side": "sell"})
+        self.compare(order={"expires_at": "2026-09-09T23:59:59", "created_at": _iso(1)})
+        self.compare(fault="order_became_filled")
+
+    def test_repeated_sweep_keeps_statistics_and_two_clock_sources(self):
+        actual, _ = self.compare(repeat=True)
+        self.assertEqual((1, 1, 1), tuple(actual["summary"][0][k]
+                                         for k in ("checked", "expired", "orders_cancelled")))
+        self.assertEqual((0, 0, 0), tuple(actual["summary"][1][k]
+                                         for k in ("checked", "expired", "orders_cancelled")))
+        self.assertEqual(self.helper.RELEASE_NOW.isoformat(timespec="seconds"),
+                         actual["state"]["paper_capital_reservations"][0][-1])
+        self.assertTrue(actual["in_transaction"])
+        self.assertNotIn("COMMIT", actual["sql"])
+
+    def multiple_signals(self, *, fail_second=False, finalize=None):
+        conn = _db()
+        self.addCleanup(conn.close)
+        for i in range(3):
+            sid = _signal(conn, minutes_ago=200 if i < 2 else 1)
+            _order(conn, sid, minutes_ago=1)
+        _order(conn, 1, minutes_ago=1)
+        if fail_second:
+            conn.execute("CREATE TRIGGER fail_second BEFORE UPDATE ON paper_signals WHEN OLD.id=2 "
+                         "BEGIN SELECT RAISE(ABORT, 'late signal failure'); END")
+        conn.commit()
+        before = self.helper.state(conn)
+        old = sqlite3.connect(":memory:")
+        old.row_factory = sqlite3.Row
+        self.addCleanup(old.close)
+        conn.backup(old)
+        options = dict(signal_sweep=True, finalize=finalize)
+        expected = self.helper.run_sweep(old, legacy=True, **options)
+        actual = self.helper.run_sweep(conn, legacy=False, **options)
+        self.assertEqual(expected, actual)
+        return actual, before, conn
+
+    def test_all_signals_are_written_before_any_reservation_or_order(self):
+        actual, _, _ = self.multiple_signals()
+        writes = [sql for sql in actual["sql"] if sql.startswith("UPDATE")]
+        self.assertTrue(all(sql.startswith("UPDATE paper_signals") for sql in writes[:2]))
+        for i in range(2, len(writes), 2):
+            self.assertTrue(writes[i].startswith("UPDATE paper_capital_reservations"))
+            self.assertTrue(writes[i + 1].startswith("UPDATE paper_orders"))
+            self.assertIn("status='superseded'", writes[i + 1])
+        self.assertEqual((3, 2, 3), tuple(actual["summary"][0][k]
+                                         for k in ("checked", "expired", "orders_cancelled")))
+
+    def test_failure_in_later_signal_prevents_reclaim_phase_and_preserves_partial_transaction(self):
+        for finalize in (None, "commit", "rollback"):
+            with self.subTest(finalize=finalize):
+                actual, before, conn = self.multiple_signals(fail_second=True, finalize=finalize)
+                self.assertEqual(("IntegrityError", "late signal failure"), actual["error"])
+                self.assertEqual(before["paper_orders"], actual["state"]["paper_orders"])
+                self.assertEqual(before["paper_capital_reservations"], actual["state"]["paper_capital_reservations"])
+                if finalize == "rollback":
+                    self.assertEqual(before, actual["state"])
+                else:
+                    self.assertEqual("expired", _row(conn, "paper_signals", 1)["status"])
+                    self.assertEqual("pending", _row(conn, "paper_signals", 2)["status"])
+
+    def test_release_and_reclaim_errors_keep_original_tolerance_and_finalization(self):
+        actual, _ = self.compare(fault="release_sqlite")
+        self.assertIsNone(actual["error"])
+        self.assertEqual(1, actual["summary"][0]["orders_cancelled"])
+        for fault in ("signal_sqlite", "release_value", "order_sqlite"):
+            for finalize in (None, "commit", "rollback"):
+                with self.subTest(fault=fault, finalize=finalize):
+                    actual, before = self.compare(fault=fault, finalize=finalize)
+                    self.assertEqual("ValueError" if fault == "release_value" else "IntegrityError",
+                                     actual["error"][0])
+                    if finalize == "rollback" or fault == "signal_sqlite":
+                        self.assertEqual(before, actual["state"])
+        actual, before = self.compare(finalize="rollback")
+        self.assertEqual(before, actual["state"])
+
+    def test_order_self_expiry_function_stays_at_merge_base(self):
         baseline = ast.parse(self.BASELINE.read_text(encoding="utf-8"))
         frozen = next(node for node in baseline.body if isinstance(node, ast.FunctionDef)
-                      and node.name == "expire_stale_signals")
-        current = ast.parse(inspect.getsource(ELC.expire_stale_signals)).body[0]
+                      and node.name == "expire_stale_orders")
+        current = ast.parse(inspect.getsource(ELC.expire_stale_orders)).body[0]
         self.assertEqual(ast.dump(frozen), ast.dump(current))
 
 
