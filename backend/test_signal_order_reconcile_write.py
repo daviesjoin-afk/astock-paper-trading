@@ -324,7 +324,7 @@ class ReconcileOwnershipTests(unittest.TestCase):
 
     def test_write_sets_and_pending_status_unchanged(self):
         import test_ledger_ownership as TLO2
-        for table, expected in (("paper_orders", 3), ("paper_signals", 3)):
+        for table, expected in (("paper_orders", 3), ("paper_signals", 2)):
             self.assertEqual(expected, len(TLO2.real_write_modules(table)),
                              f"{table} 真实写方模块数变化")
             self.assertEqual("pending", TLO.OWNERSHIP[table]["status"])

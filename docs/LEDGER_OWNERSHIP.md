@@ -417,7 +417,6 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `paper_signals` | 策略成交联动信号状态 | `manual_orders::commit_strategy_entry_fill` | commit_fill 成交结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard` |
 | `paper_orders` | 卖出实现盈亏累加 | `paper_order_ledger::accumulate_realized_pnl` | commit_fill 卖出结算 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
 | `paper_orders` | 执行结果推进（状态 + 执行原因，乐观锁） | `paper_order_ledger::advance_execution_state` | paper_trading 执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 执行阻塞结果写库（含乐观锁版本） | `paper_order_ledger::record_execution_block` | commit_fill 执行决策 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
@@ -435,6 +434,7 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_signals` | 按状态集合把信号写为 expired | `signal_service::expire_within` | paper_trading 入场新鲜度判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 成交完成：信号转 filled | `signal_service::mark_filled` | commit_fill 成交结果 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | Q3 影子观察：信号转 shadow_q3 | `signal_service::mark_shadow` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 成交/执行结果回写信号状态与原因（状态白名单） | `signal_service::record_signal_outcome` | commit_fill 成交结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract` |
 | `paper_signals` | 订单意图收紧：信号转 rejected | `signal_service::reject_signal` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 成交失败回到 pending | `signal_service::reopen_pending` | commit_fill 失败结果 | `signal_service` | 调用方同一连接与原事务 | `test_dependency_contract` |
 | `paper_signals` | 当日引导：替代 blocked/可复评拒绝信号 | `signal_service::supersede_blocked_for_day` | paper_trading 引导规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
@@ -528,6 +528,17 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 **A 包写入面到此收口**：`ledger_owner_plan.json` 里 A 的 19 条操作全部迁移完毕
 （当前模块 == 目标 owner 的检查为 0 条待办）。`paper_orders` / `paper_signals` 仍保持
 `pending` —— B（创建、成交结果、核验戳）与 D（归档联动）还有写入没搬，标签不能提前改。
+
+**B 包写入面收口**：创建、成交结果、核验戳与信号执行反馈全部经 owner。清单里 `B` 的 24 条操作
+全部迁移完毕（`当前模块 != 目标 owner` 的 B 条目为 0）。写方模块：
+
+| 表 | 现在 | 说明 |
+| --- | --- | --- |
+| `paper_orders` | `paper_trading` / `manual_orders` / `paper_order_ledger` | 前两者只剩 D 包的归档与周期切换写入 |
+| `paper_signals` | `paper_trading` / `signal_service` | `paper_trading` 只剩 D 包的归档清理 |
+
+剩余额度（`cross_domain_edges` +1 来自 `execution_verification → paper_order_ledger`）已在
+`docs/COUPLING_BUDGET.md` 登记；B 期间没有再新增其它额度。
 
 成本登记：新增一个含 SQL 的 owner 模块 → `raw_sql_modules` 141→142、
 `paper_table_fanout_max` 50→51、`cross_domain_edges` 629→630（`execution_dispatch → paper_order_ledger`），

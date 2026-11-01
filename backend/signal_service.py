@@ -59,6 +59,7 @@ __all__ = [
     "mark_shadow",
     "reject_signal",
     "reopen_for_retry",
+    "record_signal_outcome",
     "reopen_pending",
     "supersede_blocked_for_day",
     "supersede_pending_for_day",
@@ -693,6 +694,23 @@ def supersede_pending_for_day(conn, *, account_id, intended_date, reason, create
             WHERE account_id=? AND intended_date=? AND status='pending' AND created_at < ?""",
         (reason, account_id, intended_date, created_before),
     ).rowcount
+
+
+#: ``record_signal_outcome`` 允许写入的信号状态白名单。
+SIGNAL_OUTCOME_STATUSES = (
+    "pending", "partially_filled", "filled", "deferred_capacity", "shadow_q3",
+    "expired", "superseded", "rejected", "blocked",
+)
+
+
+def record_signal_outcome(conn, signal_id, *, status, reason):
+    """成交/执行结果回写信号状态与原因（状态受白名单约束）。"""
+    if status not in SIGNAL_OUTCOME_STATUSES:
+        raise ValueError(f"非法信号状态：{status!r}")
+    conn.execute(
+        "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
+        (status, reason, int(signal_id)),
+    )
 
 
 def reject_signal(conn, signal_id, *, reason):

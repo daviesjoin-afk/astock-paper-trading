@@ -56,13 +56,6 @@
    "single_package": "D",
    "transaction": "服务入口传入的连接"
   },
-  "manual_orders::commit_strategy_entry_fill": {
-   "judge": "commit_fill 成交结果",
-   "operation": "策略成交联动信号状态",
-   "single_owner": "signal_service",
-   "single_package": "B",
-   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
-  },
   "paper_cycle_service::archive_cycle": {
    "judge": "归档入口规则",
    "operation": "周期归档 archived",
@@ -441,6 +434,13 @@
    "single_owner": "signal_service",
    "single_package": "A",
    "transaction": "启动恢复/初始化连接"
+  },
+  "signal_service::record_signal_outcome": {
+   "judge": "commit_fill 成交结果",
+   "operation": "成交/执行结果回写信号状态与原因（状态白名单）",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
   },
   "signal_service::reject_signal": {
    "judge": "paper_trading 意图规则",

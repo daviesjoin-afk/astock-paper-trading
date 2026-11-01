@@ -97,6 +97,7 @@ class ManualOrderDependencies:
     defer_signal: Any
     reopen_pending: Any
     mark_signal_filled: Any
+    record_signal_outcome: Any
     update_order_outcome: Any
 
 
@@ -638,6 +639,7 @@ def _commit_strategy_buy(
     _defer_signal = deps.defer_signal
     _reopen_pending = deps.reopen_pending
     _mark_signal_filled = deps.mark_signal_filled
+    _record_signal_outcome = deps.record_signal_outcome
     _lease_lost = deps.lease_lost
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -775,6 +777,7 @@ def commit_strategy_entry_fill(
     _defer_signal = deps.defer_signal
     _reopen_pending = deps.reopen_pending
     _mark_signal_filled = deps.mark_signal_filled
+    _record_signal_outcome = deps.record_signal_outcome
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
@@ -814,10 +817,8 @@ def commit_strategy_entry_fill(
             remaining_qty = int(committed[2] or 0) if committed else int(plan["qty"])
             reason_codes = str(committed[3] or "execution_not_filled") if committed else "execution_state_unavailable"
             signal_status = "partially_filled" if filled_qty > 0 else "pending"
-            conn.execute(
-                "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-                (signal_status, reason_codes, signal["id"]),
-            )
+            _record_signal_outcome(conn, int(signal["id"]), status=signal_status,
+                                   reason=reason_codes)
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             return {
                 "filled": filled_qty > 0,
@@ -881,6 +882,7 @@ def submit_manual_order(
     _defer_signal = deps.defer_signal
     _reopen_pending = deps.reopen_pending
     _mark_signal_filled = deps.mark_signal_filled
+    _record_signal_outcome = deps.record_signal_outcome
     _market_state = deps.market_state
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id

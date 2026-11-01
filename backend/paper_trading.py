@@ -14494,6 +14494,7 @@ def _bind_application_dependencies():
         "defer_signal": (SIG, "defer_for_capacity"),
         "reopen_pending": (SIG, "reopen_pending"),
         "mark_signal_filled": (SIG, "mark_filled"),
+        "record_signal_outcome": (SIG, "record_signal_outcome"),
         "record_execution_block": (POL, "record_execution_block"),
         "record_fill_result": (POL, "record_fill_result"),
         "accumulate_realized_pnl": (POL, "accumulate_realized_pnl"),

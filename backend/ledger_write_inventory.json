@@ -254,21 +254,9 @@
    ]
   },
   {
-   "function": "commit_strategy_entry_fill",
-   "kind": "static",
-   "line": 818,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
    "function": "_terminalize_cycle_stale_order",
    "kind": "static",
-   "line": 1153,
+   "line": 1155,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -1334,7 +1322,7 @@
   {
    "function": "conflict_statement",
    "kind": "static",
-   "line": 166,
+   "line": 167,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1346,7 +1334,7 @@
   {
    "function": "conflict_statement",
    "kind": "dynamic",
-   "line": 166,
+   "line": 167,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1358,7 +1346,7 @@
   {
    "function": "conflict_statement",
    "kind": "static",
-   "line": 169,
+   "line": 170,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1370,7 +1358,7 @@
   {
    "function": "conflict_statement",
    "kind": "dynamic",
-   "line": 169,
+   "line": 170,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1382,7 +1370,7 @@
   {
    "function": "expire_for_expired_order",
    "kind": "static",
-   "line": 478,
+   "line": 479,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1394,7 +1382,7 @@
   {
    "function": "expire_stale_signal",
    "kind": "static",
-   "line": 487,
+   "line": 488,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1406,7 +1394,7 @@
   {
    "function": "reconcile_signal_status",
    "kind": "static",
-   "line": 500,
+   "line": 501,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1418,7 +1406,7 @@
   {
    "function": "write_payload",
    "kind": "static",
-   "line": 516,
+   "line": 517,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1430,7 +1418,7 @@
   {
    "function": "reopen_for_retry",
    "kind": "static",
-   "line": 528,
+   "line": 529,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1442,7 +1430,7 @@
   {
    "function": "reopen_for_retry",
    "kind": "dynamic",
-   "line": 528,
+   "line": 529,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1454,7 +1442,7 @@
   {
    "function": "expire_after_order_retry",
    "kind": "static",
-   "line": 541,
+   "line": 542,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1466,7 +1454,7 @@
   {
    "function": "expire_after_order_retry",
    "kind": "dynamic",
-   "line": 541,
+   "line": 542,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1478,7 +1466,7 @@
   {
    "function": "terminate_for_dispatch",
    "kind": "static",
-   "line": 557,
+   "line": 558,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1490,7 +1478,7 @@
   {
    "function": "retire_waitlist_signals",
    "kind": "static",
-   "line": 573,
+   "line": 574,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1502,7 +1490,7 @@
   {
    "function": "retire_waitlist_signals",
    "kind": "dynamic",
-   "line": 573,
+   "line": 574,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1514,7 +1502,7 @@
   {
    "function": "defer_for_capacity",
    "kind": "static",
-   "line": 590,
+   "line": 591,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1526,7 +1514,7 @@
   {
    "function": "defer_for_capacity",
    "kind": "static",
-   "line": 596,
+   "line": 597,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1538,7 +1526,7 @@
   {
    "function": "defer_for_capacity",
    "kind": "static",
-   "line": 602,
+   "line": 603,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1550,7 +1538,7 @@
   {
    "function": "reopen_pending",
    "kind": "static",
-   "line": 610,
+   "line": 611,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1562,7 +1550,7 @@
   {
    "function": "mark_filled",
    "kind": "static",
-   "line": 618,
+   "line": 619,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1574,7 +1562,7 @@
   {
    "function": "advance_signal_feedback",
    "kind": "static",
-   "line": 630,
+   "line": 631,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1586,7 +1574,7 @@
   {
    "function": "advance_signal_feedback",
    "kind": "dynamic",
-   "line": 630,
+   "line": 631,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1598,7 +1586,7 @@
   {
    "function": "mark_shadow",
    "kind": "static",
-   "line": 638,
+   "line": 639,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1610,7 +1598,7 @@
   {
    "function": "expire_within",
    "kind": "static",
-   "line": 650,
+   "line": 651,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1622,7 +1610,7 @@
   {
    "function": "expire_within",
    "kind": "dynamic",
-   "line": 650,
+   "line": 651,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1634,7 +1622,7 @@
   {
    "function": "supersede_signals",
    "kind": "static",
-   "line": 666,
+   "line": 667,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1646,7 +1634,7 @@
   {
    "function": "supersede_signals",
    "kind": "dynamic",
-   "line": 666,
+   "line": 667,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1658,7 +1646,7 @@
   {
    "function": "supersede_blocked_for_day",
    "kind": "static",
-   "line": 682,
+   "line": 683,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1670,7 +1658,7 @@
   {
    "function": "supersede_pending_for_day",
    "kind": "static",
-   "line": 692,
+   "line": 693,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1680,9 +1668,21 @@
    ]
   },
   {
+   "function": "record_signal_outcome",
+   "kind": "static",
+   "line": 711,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
    "function": "reject_signal",
    "kind": "static",
-   "line": 701,
+   "line": 719,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1694,7 +1694,7 @@
   {
    "function": "expire_signal",
    "kind": "static",
-   "line": 709,
+   "line": 727,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1706,7 +1706,7 @@
   {
    "function": "update_signal_feedback",
    "kind": "static",
-   "line": 717,
+   "line": 735,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -3785,7 +3785,7 @@
   {
    "function": "_row",
    "kind": "static",
-   "line": 395,
+   "line": 396,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3797,7 +3797,7 @@
   {
    "function": "test_integer_stored_keys_are_still_matched",
    "kind": "static",
-   "line": 437,
+   "line": 438,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
