@@ -1243,22 +1243,18 @@ def _record_entry_frozen_waitlist(
     strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
         conn, account_id, signal_id, cycle_id=order_cycle_id(conn, cycle_id),
     )
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(
-               account_id,signal_id,side,code,name,qty,planned_price,status,reason,
-               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
-               retry_of_order_id,cycle_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            account_id, signal_id, "buy", code, name, max(0, int(_num(qty))),
-            _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
-            _json(payload), "strategy", _now(),
-            strategy_id, strategy_version, strategy_checksum,
-            _previous_attempt_order_id(conn, signal_id, order_cycle_id(conn, cycle_id)),
-            order_cycle_id(conn, cycle_id),
-        ),
+    order_id = POL.insert_order(
+        conn,
+        account_id=account_id, signal_id=signal_id, side="buy", code=code, name=name,
+        qty=max(0, int(_num(qty))), planned_price=_num(planned_price, None),
+        status=ENTRY_FROZEN_WAITLIST_STATUS, reason=reason, risk_payload=_json(payload),
+        origin="strategy", created_at=_now(),
+        strategy_id=strategy_id, strategy_version=strategy_version,
+        strategy_checksum=strategy_checksum,
+        retry_of_order_id=_previous_attempt_order_id(
+            conn, signal_id, order_cycle_id(conn, cycle_id)),
+        cycle_id=order_cycle_id(conn, cycle_id),
     )
-    order_id = int(cursor.lastrowid)
     _risk_log(conn, account_id, code, "buy", ENTRY_FROZEN_WAITLIST_STATUS, reason, payload)
     audit(conn, account_id, ENTRY_FROZEN_WAITLIST_STATUS, f"{source}: {code} order={order_id}")
     return order_id, True, reason, payload
@@ -1784,13 +1780,7 @@ def _supersede_signal_execution_retries(conn, signal_id):
     # second insert when a scheduler process is recovered.
     for row in rows:
         order_id = int(row["id"])
-        conn.execute(
-            """UPDATE paper_orders
-                  SET status='superseded',
-                      reason=COALESCE(reason,'') || '；新一轮执行重试已接管'
-                WHERE id=? AND status='execution_retry'""",
-            (order_id,),
-        )
+        POL.supersede_previous_execution_retry(conn, order_id)
         _finish_capital_reservation(conn, order_id, "released")
     return len(rows)
 
@@ -14545,6 +14535,8 @@ def _bind_application_dependencies():
         "consume_available_lots": (PLL, "consume_available_lots"),
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),
+        "cancel_order": (POL, "cancel_order"),
+        "insert_order": (POL, "insert_order"),
     }
     import manual_orders as MO
     MO.bind_dependencies(

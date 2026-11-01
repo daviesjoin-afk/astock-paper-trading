@@ -23,7 +23,18 @@ CREATE TABLE paper_orders(
     status TEXT,
     reason TEXT,
     signal_id INTEGER,
-    cancelled_at TEXT
+    cancelled_at TEXT,
+    name TEXT,
+    qty INTEGER,
+    planned_price REAL,
+    risk_payload TEXT,
+    origin TEXT,
+    created_at TEXT,
+    strategy_id TEXT,
+    strategy_version TEXT,
+    strategy_checksum TEXT,
+    retry_of_order_id INTEGER,
+    cycle_id INTEGER
 );
 """
 
@@ -32,13 +43,65 @@ def _db(rows=()):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
-    conn.executemany("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?)", rows)
+    conn.executemany(
+        "INSERT INTO paper_orders(id,account_id,code,side,status,reason,signal_id,cancelled_at)"
+        " VALUES(?,?,?,?,?,?,?,?)", rows)
     conn.commit()
     return conn
 
 
 def _row(conn, order_id):
     return conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+
+
+class CreationAndCancelTests(unittest.TestCase):
+    """A 第三片：创建、撤单、重试接管三个入口的边界。"""
+
+    def setUp(self):
+        self.conn = _db([(1, 7, "AAA", "buy", "execution_retry", None, 11, None),
+                         (2, 7, "AAA", "buy", "pending_limit", None, 12, None)])
+        self.addCleanup(self.conn.close)
+
+    def test_cancel_returns_rowcount_and_respects_the_status_whitelist(self):
+        changed = POL.cancel_order(self.conn, 2, reason="用户撤销模拟委托",
+                                   cancelled_at="T", statuses=("pending_limit",))
+        self.assertEqual(1, changed)
+        row = _row(self.conn, 2)
+        self.assertEqual("cancelled", row["status"])
+        self.assertEqual("用户撤销模拟委托", row["reason"])
+        self.assertEqual("T", row["cancelled_at"])
+        # 状态不在白名单 → 0 行，调用方据此判断"已成交/不可撤销"。
+        self.assertEqual(0, POL.cancel_order(self.conn, 2, reason="重复撤销",
+                                             cancelled_at="T2", statuses=("pending_limit",)))
+
+    def test_cancel_requires_a_status_vocabulary(self):
+        with self.assertRaises(ValueError):
+            POL.cancel_order(self.conn, 2, reason="x", cancelled_at="T", statuses=())
+
+    def test_previous_retry_retirement_appends_reason(self):
+        POL.supersede_previous_execution_retry(self.conn, 1)
+        row = _row(self.conn, 1)
+        self.assertEqual("superseded", row["status"])
+        self.assertEqual("；新一轮执行重试已接管", row["reason"])
+        # 不是执行重试的行不动。
+        POL.supersede_previous_execution_retry(self.conn, 2)
+        self.assertEqual("pending_limit", _row(self.conn, 2)["status"])
+
+    def test_insert_order_keeps_the_column_order_and_returns_the_row_id(self):
+        order_id = POL.insert_order(
+            self.conn, account_id=7, signal_id=13, side="buy", code="BBB", name="测试",
+            qty=100, planned_price=10.5, status="entry_frozen_waitlist", reason="冻结",
+            risk_payload="{}", origin="strategy", created_at="2026-09-11T10:00:00",
+            strategy_id="s1", strategy_version="v1", strategy_checksum="abc",
+            retry_of_order_id=1, cycle_id=3,
+        )
+        self.assertIsInstance(order_id, int)
+        row = self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertEqual(7, row["account_id"])
+        self.assertEqual(13, row["signal_id"])
+        self.assertEqual("BBB", row["code"])
+        self.assertEqual("entry_frozen_waitlist", row["status"])
+        self.assertEqual("s1", row["strategy_id"])
 
 
 class OwnerBoundaryTests(unittest.TestCase):
@@ -64,9 +127,11 @@ class OwnerBoundaryTests(unittest.TestCase):
                   "deferred_capacity", "entry_frozen_waitlist")
         conn = _db([(index, 7, "A", "buy", status, None, 11, None)
                     for index, status in enumerate(states, start=1)])
-        conn.executemany("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?)",
-                         [(9, 7, "B", "buy", "awaiting_batch", None, 12, None),
-                          (10, 7, "C", "buy", "partially_filled", None, 13, None)])
+        conn.executemany(
+            "INSERT INTO paper_orders(id,account_id,code,side,status,reason,signal_id,cancelled_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            [(9, 7, "B", "buy", "awaiting_batch", None, 12, None),
+             (10, 7, "C", "buy", "partially_filled", None, 13, None)])
         for order_id in (1, 2, 3, 4, 5):
             POL.supersede_for_expired_signal(conn, order_id, cancelled_at="T")
         statuses = dict(conn.execute("SELECT id,status FROM paper_orders").fetchall())

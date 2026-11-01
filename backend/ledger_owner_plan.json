@@ -91,13 +91,6 @@
    "single_package": "D",
    "transaction": "服务入口传入的连接"
   },
-  "manual_orders::cancel_manual_order": {
-   "judge": "用户请求 + 手动入口校验",
-   "operation": "手动撤单 cancelled",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
-   "transaction": "服务入口传入的连接"
-  },
   "manual_orders::commit_strategy_entry_fill": {
    "judge": "commit_fill 成交结果",
    "operation": "策略成交联动信号状态",
@@ -143,9 +136,23 @@
    "single_package": "D",
    "transaction": "服务入口传入的连接"
   },
+  "paper_order_ledger::cancel_order": {
+   "judge": "手动入口校验 + 用户请求",
+   "operation": "用户撤单：订单转 cancelled（可撤销状态白名单）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "服务入口传入的连接"
+  },
   "paper_order_ledger::expire_order": {
    "judge": "entry_lifecycle 判定，dispatch 落库",
    "operation": "订单自身过期终态 expired",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::insert_order": {
+   "judge": "paper_trading 入场闸门",
+   "operation": "订单创建（INSERT）：冻结等待池标记（B 包将复用同一入口）",
    "single_owner": "paper_order_ledger",
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
@@ -188,6 +195,13 @@
   "paper_order_ledger::supersede_order": {
    "judge": "execution_dispatch 重试接管判定",
    "operation": "重试接管/Dispatch 退役：订单转 superseded（含取消时间）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::supersede_previous_execution_retry": {
+   "judge": "paper_trading 重试发起",
+   "operation": "新一轮执行重试接管：退役全部旧重试",
    "single_owner": "paper_order_ledger",
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
@@ -313,25 +327,11 @@
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
-  "paper_trading::_record_entry_frozen_waitlist": {
-   "judge": "paper_trading 入场闸门",
-   "operation": "冻结等待池标记订单创建（INSERT）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_trading::_shared_risk_state": {
    "judge": "paper_trading 风控状态",
    "operation": "账户冷却窗口 cooldown_until",
    "single_owner": "paper_account_config",
    "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::_supersede_signal_execution_retries": {
-   "judge": "paper_trading 重试发起",
-   "operation": "新一轮执行重试接管：退役全部旧重试",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_trading::_weekly_review": {

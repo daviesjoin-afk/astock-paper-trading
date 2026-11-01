@@ -25,9 +25,12 @@ __all__ = [
     "ORDER_LEDGER_VERSION",
     "TERMINAL_ORDER_STATUSES",
     "expire_order",
+    "insert_order",
     "retire_duplicate_waitlist_orders",
     "retire_gated_order",
+    "cancel_order",
     "supersede_duplicate_execution_retry",
+    "supersede_previous_execution_retry",
     "supersede_for_expired_signal",
     "supersede_for_terminal_signal",
     "supersede_order",
@@ -55,6 +58,48 @@ def expire_order(conn, order_id, *, reason, cancelled_at):
                 WHERE id=?""",
         ("expired", reason, cancelled_at, order_id),
     )
+
+
+def insert_order(
+    conn,
+    *,
+    account_id,
+    side,
+    code,
+    status,
+    reason,
+    risk_payload,
+    origin,
+    created_at,
+    signal_id=None,
+    name=None,
+    qty=0,
+    planned_price=None,
+    strategy_id=None,
+    strategy_version=None,
+    strategy_checksum=None,
+    retry_of_order_id=None,
+    cycle_id=None,
+):
+    """创建一条订单行，返回新行 id。
+
+    列集合与原 INSERT 逐字一致；业务侧（策略戳、重试血缘、payload 序列化）
+    全部由调用方算好再传进来 —— owner 不算价、不解析周期、不读时钟。
+    """
+    cursor = conn.execute(
+        """INSERT INTO paper_orders(
+               account_id,signal_id,side,code,name,qty,planned_price,status,reason,
+               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
+               retry_of_order_id,cycle_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            account_id, signal_id, side, code, name, qty, planned_price, status, reason,
+            risk_payload, origin, created_at,
+            strategy_id, strategy_version, strategy_checksum,
+            retry_of_order_id, cycle_id,
+        ),
+    )
+    return int(cursor.lastrowid)
 
 
 def supersede_order(conn, order_id, *, reason, cancelled_at):
@@ -108,6 +153,39 @@ def supersede_duplicate_execution_retry(conn, order_id):
             WHERE id=? AND status='execution_retry'""",
         (order_id,),
     )
+
+
+def supersede_previous_execution_retry(conn, order_id):
+    """新一轮执行重试接管：退役上一条重试行（原因追加）。
+
+    与对账里的"保留最新一条"不同：这里是发起新重试前把**全部**旧行退掉，
+    判定与顺序由调用方负责，owner 只落库。
+    """
+    conn.execute(
+        """UPDATE paper_orders
+              SET status='superseded',
+                  reason=COALESCE(reason,'') || '；新一轮执行重试已接管'
+            WHERE id=? AND status='execution_retry'""",
+        (order_id,),
+    )
+
+
+def cancel_order(conn, order_id, *, reason, cancelled_at, statuses: Sequence[str]):
+    """用户撤单：只对传入的可撤销状态生效，返回受影响行数。
+
+    调用方用返回值判断"是否真的撤销了一条"（已成交/已终态时返回 0）；状态集合
+    由调用方给出，owner 不自己拼词表。
+    """
+    states = tuple(statuses)
+    if not states:
+        raise ValueError("cancel_order 需要非空可撤销状态集合")
+    placeholders = ",".join("?" for _ in states)
+    return conn.execute(
+        f"""UPDATE paper_orders
+               SET status='cancelled',reason=?,cancelled_at=?
+             WHERE id=? AND status IN ({placeholders})""",
+        (reason, cancelled_at, order_id, *states),
+    ).rowcount
 
 
 def supersede_for_terminal_signal(conn, order_id, *, reason, statuses: Sequence[str]):
