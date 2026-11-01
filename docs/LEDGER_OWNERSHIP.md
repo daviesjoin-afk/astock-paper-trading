@@ -18,7 +18,7 @@
 | --- | --- | --- | --- |
 | `paper_fills` | **owned** | `execution_planner` | 成交流水只有 `commit_fill` 一处写入 |
 | `paper_positions` | **owned** | `paper_lot_ledger` | 投影表，只能由 lot owner 同步 |
-| `paper_capital_reservations` | **pending** | `paper_capital_reservations`（owner）+ `entry_lifecycle`、`execution_dispatch` | 本 PR 已把 `paper_trading` 的重复实现收敛进 owner；另两处见 §5 |
+| `paper_capital_reservations` | **pending** | `paper_capital_reservations`（owner）+ `execution_dispatch` | 第二批已把 `paper_trading` 与 `entry_lifecycle` 两处收敛（后者改为调用方注入 release 回调）；`execution_dispatch` 见 §5 |
 | `paper_position_lots` | **pending** | `paper_lot_ledger`（owner）+ `execution_planner` | `commit_fill` 在同一事务里回填 `source_fill_id` |
 | `paper_risk_decisions` | **pending** | `paper_risk_writes` + `paper_trading` | `_risk_log` 仍自行组装 provenance |
 | `paper_audit` | **pending** | `paper_repository` + `adaptive_engine` | 账本审计端口 vs adaptive 恢复路径 |
@@ -68,7 +68,7 @@ paper_trading._reconcile_signal_order_states
 
 | 项 | 原因 | 下一步 |
 | --- | --- | --- |
-| `entry_lifecycle._release_reservation` | `entry_lifecycle` 属于 **foundation 层**，反向 import 业务 owner 会被 `foundation_never_depends_on_a_business_domain` 判死 | 让 `expire_stale_orders/signals` 接收 `release_reservation` 回调，由调用方注入 |
+| ~~`entry_lifecycle._release_reservation`~~ | **已迁移（第二批）**：`expire_stale_orders/signals` 现在接收 `release_reservation` 回调，`paper_slot_service` 注入 `PCR.release_order_reservation`；foundation 层不再内联预占 SQL | — |
 | `execution_dispatch._release_reservation` | `execution_dispatch`（execution 域）import paper 域 owner 会新增跨域边，而跨域预算**正好用满**（629/629） | 同上：调用方注入回调，或先消除一条既有边 |
 | `paper_position_lots.source_fill_id` | `commit_fill` 在成交事务内回填血缘，改走 lot owner 需要新窄接口且动到最敏感的提交链 | lot owner 增加 `link_source_fill(conn, lot_id, fill_id)`，随后替换 |
 | `paper_risk_decisions` 双写 | `_risk_log` 自行组装 decision provenance；`paper_risk_writes` 只有原语 | 先统一 provenance 组装，再收口 |
@@ -76,6 +76,11 @@ paper_trading._reconcile_signal_order_states
 | `paper_orders` / `paper_signals` / `paper_accounts` 多写 | 状态机按生命周期阶段分权，强行合并会把阶段判定塞进单一 owner | 逐阶段收口（先做"终态写入"单一出口） |
 
 ## 6. 机器可验证的边界（`backend/test_ledger_ownership.py`，9 项）
+
+> **已知限制（必须与结论一起读）**：守卫扫描的是**静态 SQL 字面量**。f-string / 运行时拼接
+> 出来的 SQL 不在它的视野里，因此当前矩阵的准确表述是"静态 SQL 写入清单及其守卫"，
+> 不等于"所有可能的运行时写入方式都已覆盖"。动态 SQL 写入审计（例如在 `paper_storage`
+> 的连接层按语句归因）是后续独立工作项。
 
 1. 矩阵里每张表都存在于 `REQUIRED_TABLES`（防止表名写错）；
 2. **非 owner 写入不回流**：任何新模块写这些表 → 立即变红；

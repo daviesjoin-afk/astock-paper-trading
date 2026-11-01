@@ -62,12 +62,11 @@ OWNERSHIP = {
     },
     "paper_capital_reservations": {
         "status": "pending",
-        "writers": {"paper_capital_reservations", "entry_lifecycle", "execution_dispatch"},
+        "writers": {"paper_capital_reservations", "execution_dispatch"},
         "note": (
-            "PR-10 收敛了 paper_trading 的重复释放实现；仍有两处例外："
-            "entry_lifecycle 属于 foundation 层，不能反向 import 业务 owner；"
-            "execution_dispatch（execution 域）导入 paper 域 owner 会新增跨域边，"
-            "而当前跨域预算正好用满。两者都需要「调用方注入 release 回调」，留作后续切片"
+            "PR-10 已收敛 paper_trading 与 entry_lifecycle 两处：后者改为由调用方注入 "
+            "release 回调（foundation 层不反向依赖业务 owner）。剩下的 execution_dispatch "
+            "因为 execution→paper 会新增跨域边（预算已满），仍待注入回调"
         ),
     },
     "paper_risk_decisions": {
@@ -160,10 +159,10 @@ class LedgerWriteOwnershipTests(unittest.TestCase):
                 self.assertEqual(actual, spec["writers"],
                                  f"{table} 声明为单写方但实际写入方是 {sorted(actual)}")
 
-    #: 已知例外（都必须精确列出，多一个变红、少一个也变红）：
-    #: ``entry_lifecycle`` 是 foundation 层，不能反向 import 业务 owner；
-    #: ``execution_dispatch`` 导入 paper 域 owner 会新增跨域边，而预算已用满。
-    RESERVATION_RELEASE_EXCEPTIONS = {"entry_lifecycle", "execution_dispatch"}
+    #: 已知例外（精确列出：多一个变红、少一个也变红）。
+    #: ``execution_dispatch`` 导入 paper 域 owner 会新增跨域边（预算已用满），
+    #: 下一步同样用「调用方注入 release 回调」解决。
+    RESERVATION_RELEASE_EXCEPTIONS = {"execution_dispatch"}
 
     def test_reservation_release_has_a_single_implementation(self):
         """同一句释放 UPDATE 只允许 owner + 一个已登记的 foundation 例外。"""

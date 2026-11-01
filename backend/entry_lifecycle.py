@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 __all__ = [
     "ENTRY_LIFECYCLE_VERSION",
@@ -217,14 +217,15 @@ def entry_slice_plan(
     return slices
 
 
-def _release_reservation(conn, order_id) -> None:
+def _release_reservation(conn, order_id, release) -> None:
+    """释放预占：写入权归 ``paper_capital_reservations``。
+
+    本模块属于 foundation 层，不能反向 import 业务 owner，因此由调用方把
+    ``release_order_reservation`` 注入进来；这里只提供时钟与失败容忍，**不复制**
+    任何预占判定。
+    """
     try:
-        conn.execute(
-            """UPDATE paper_capital_reservations
-                  SET status='released',released_at=COALESCE(released_at,?)
-                WHERE status='reserved' AND CAST(order_key AS TEXT)=?""",
-            (_now().isoformat(timespec="seconds"), str(int(order_id))),
-        )
+        release(conn, order_id, now=_now().isoformat(timespec="seconds"))
     except sqlite3.Error:
         pass
 
@@ -282,6 +283,7 @@ def stale_active_orders(
 def expire_stale_orders(
     conn,
     *,
+    release_reservation: Callable[..., Any],
     now: dt.datetime | None = None,
     ttl_minutes: float = ORDER_TTL_MINUTES,
 ) -> dict[str, Any]:
@@ -306,7 +308,7 @@ def expire_stale_orders(
             continue
         order_id = int(row["id"])
         reason = "委托超过时限未成交，自动作废并释放预占"
-        _release_reservation(conn, order_id)
+        _release_reservation(conn, order_id, release_reservation)
         conn.execute(
             """UPDATE paper_orders
                   SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
@@ -327,6 +329,7 @@ def expire_stale_orders(
 def expire_stale_signals(
     conn,
     *,
+    release_reservation: Callable[..., Any],
     now: dt.datetime | None = None,
     ttl_minutes: float = SIGNAL_TTL_MINUTES,
     asof_day=None,
@@ -375,7 +378,7 @@ def expire_stale_signals(
     ).fetchall()
     for row in stale:
         order_id = int(row["id"])
-        _release_reservation(conn, order_id)
+        _release_reservation(conn, order_id, release_reservation)
         conn.execute(
             """UPDATE paper_orders
                   SET status='superseded',reason=COALESCE(reason,'') || '；信号已失效，委托回收',
