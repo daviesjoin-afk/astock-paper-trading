@@ -2,7 +2,10 @@
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
+from contextlib import contextmanager
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,6 +104,171 @@ class PaperRepositoryTests(unittest.TestCase):
         self.assertEqual(facts["execution_market_verification"], "verified")
         self.assertEqual(facts["execution_market_asof"], "2026-09-10")
         self.assertEqual(facts["execution_reasons"], ["T1_NOT_SELLABLE", "MARKET_STALE"])
+
+
+class AuditCleanupEquivalenceTests(unittest.TestCase):
+    """第六批：清理目标、原始行、顺序和补偿异常的冻结回归。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "paper.sqlite3")
+        self.snapshot = {
+            "account": {"params": ' {"old": true} ', "version": "old", "updated_at": "before"},
+            "versions": [{"id": 1, "version": "old"}], "versions_complete": True,
+        }
+        self.audit_rows = [
+            ("acct", "applied", "candidate=12; 失败操作"),
+            ("acct", "applied", "CANDIDATE=12; SQLite 原有大小写语义"),
+            ("acct", "applied", "candidate=123; 相邻候选"),
+            ("other", "applied", "candidate=12; 另一账户"),
+            ("acct", "rollback", "candidate=12; 另一事件"),
+            ("acct", "applied", " candidate=12; 前导空格"),
+            ("acct", "applied", ' {"z": 1, "a": null}\n原始 detail '),
+            ("acct", "applied", None),
+            ("acct", "applied", sqlite3.Binary(b"candidate=12; raw blob")),
+            ("acct", "applied", "candidate=12"),
+        ]
+        with self.connection() as conn:
+            conn.executescript("""
+                CREATE TABLE paper_accounts(id TEXT PRIMARY KEY,params TEXT,version TEXT,updated_at TEXT);
+                INSERT INTO paper_accounts VALUES('acct','failed params','failed','after');
+                CREATE TABLE paper_parameter_versions(id INTEGER PRIMARY KEY,account_id TEXT,version TEXT);
+                INSERT INTO paper_parameter_versions VALUES(1,'acct','old'),(2,'acct','failed');
+                CREATE TABLE paper_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT,event TEXT,detail TEXT,
+                    created_at TEXT,strategy_id TEXT,strategy_version INTEGER,strategy_checksum TEXT);
+            """)
+            for index, (account, event, detail) in enumerate(self.audit_rows):
+                conn.execute(
+                    "INSERT INTO paper_audit(account_id,event,detail,created_at,"
+                    "strategy_id,strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?,?)",
+                    (account, event, detail, f"time-{index}", f"source-{index}", index, f"checksum-{index}"))
+
+    @contextmanager
+    def connection(self, path=None):
+        conn = sqlite3.connect(path or self.path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def state(self):
+        with self.connection() as conn:
+            return {table: conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+                    for table in ("paper_accounts", "paper_parameter_versions", "paper_audit")}
+
+    def restore(self, candidate_id=12, expected_version="failed"):
+        import adaptive_engine as engine
+        with mock.patch.object(engine, "PAPER_DB_PATH", self.path):
+            engine._restore_paper_account(
+                self.snapshot, "acct", candidate_id, "applied", expected_version=expected_version)
+
+    def legacy_remaining_audit(self):
+        # BLOB 的 LIKE 行为由 SQLite 编译选项决定，必须以原 SQL 为对照。
+        with self.connection() as source, self.connection(":memory:") as old:
+            source.backup(old)
+            old.execute("DELETE FROM paper_audit WHERE account_id=? AND event=? AND detail LIKE ?",
+                        ("acct", "applied", "candidate=12;%"))
+            return old.execute("SELECT * FROM paper_audit ORDER BY id").fetchall()
+
+    def test_cleanup_matches_legacy_delete_for_exact_prefixes_and_raw_rows(self):
+        for account, candidate in (("acct", 12), ("acct", "0012"), ("acct", 123),
+                                   ("acct", -12), ("other", 12), (None, 12)):
+            with self.subTest(account=account, candidate=candidate):
+                with self.connection() as conn, self.connection(":memory:") as old:
+                    conn.backup(old)
+                    old.execute(
+                        "DELETE FROM paper_audit WHERE account_id=? AND event=? AND detail LIKE ?",
+                        (account, "applied", f"candidate={int(candidate)};%"))
+                    expected = old.execute("SELECT * FROM paper_audit ORDER BY id").fetchall()
+                    statements = []
+                    conn.execute("BEGIN")
+                    conn.set_trace_callback(statements.append)
+                    repository.remove_failed_evolution_audit(conn, account, "applied", candidate)
+                    self.assertEqual(1, len(statements), "仍应只执行一条 DELETE")
+                    self.assertEqual(expected, conn.execute("SELECT * FROM paper_audit ORDER BY id").fetchall())
+                    conn.rollback()
+
+    def test_cleanup_does_not_commit_other_writes(self):
+        before = self.state()
+        with self.connection() as conn:
+            conn.execute("UPDATE paper_accounts SET params='pending' WHERE id='acct'")
+            repository.remove_failed_evolution_audit(conn, "acct", "applied", 12)
+            self.assertTrue(conn.in_transaction)
+            conn.rollback()
+        self.assertEqual(before, self.state())
+
+    def test_owner_propagates_sqlite_errors_to_caller(self):
+        before = self.state()
+        with self.connection() as conn:
+            conn.execute("PRAGMA query_only=ON")
+            with self.assertRaises(sqlite3.OperationalError):
+                repository.remove_failed_evolution_audit(conn, "acct", "applied", 12)
+        self.assertEqual(before, self.state())
+
+    def test_compensation_keeps_surviving_rows_and_write_order(self):
+        import adaptive_engine as engine
+        expected_audit = self.legacy_remaining_audit()
+        statements = []
+        connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with mock.patch.object(engine.sqlite3, "connect", side_effect=traced_connect):
+            self.restore()
+        after = self.state()
+        self.assertEqual([("acct", ' {"old": true} ', "old", "before")], after["paper_accounts"])
+        self.assertEqual([(1, "acct", "old")], after["paper_parameter_versions"])
+        self.assertEqual(expected_audit, after["paper_audit"])
+        ordered = [next(i for i, sql in enumerate(statements) if sql.startswith(prefix))
+                   for prefix in ("UPDATE paper_accounts", "DELETE FROM paper_parameter_versions",
+                                  "DELETE FROM paper_audit", "COMMIT")]
+        self.assertEqual(ordered, sorted(ordered))
+
+    def test_compensation_swallows_only_sqlite_cleanup_error_and_still_commits(self):
+        with self.connection() as conn:
+            conn.execute("""CREATE TRIGGER refuse_audit_delete BEFORE DELETE ON paper_audit
+                            BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END""")
+        before = self.state()
+        self.restore()
+        after = self.state()
+        self.assertEqual(before["paper_audit"], after["paper_audit"])
+        self.assertEqual("old", after["paper_accounts"][0][2])
+        self.assertEqual([(1, "acct", "old")], after["paper_parameter_versions"])
+
+    def test_non_sqlite_error_propagates_and_rolls_back_compensation(self):
+        before = self.state()
+        with self.assertRaises(ValueError):
+            self.restore(candidate_id="invalid")
+        self.assertEqual(before, self.state())
+
+    def test_newer_account_version_skips_cleanup(self):
+        before = self.state()
+        with mock.patch.object(repository, "remove_failed_evolution_audit") as cleanup, \
+                mock.patch("builtins.print") as alarm:
+            self.restore(expected_version="another-version")
+        cleanup.assert_not_called()
+        alarm.assert_called_once()
+        self.assertIn("restore_version_mismatch", alarm.call_args.args[0])
+        self.assertEqual(before, self.state())
+
+    def test_append_keeps_raw_detail_explicit_source_and_order(self):
+        expected_audit = self.legacy_remaining_audit()
+        raw = '  {"z": null, "a": "中文"}\n '
+        with self.connection() as conn:
+            for stamp in (("frozen", 7, "checksum"), (None, None, None)):
+                repository.audit(conn, "acct", "kept", raw, "write-time", strategy_stamp=stamp)
+            repository.remove_failed_evolution_audit(conn, "acct", "applied", 12)
+        rows = self.state()["paper_audit"]
+        self.assertEqual(expected_audit, rows[:-2])
+        self.assertEqual(("acct", "kept", raw, "write-time", "frozen", 7, "checksum"), rows[-2][1:])
+        self.assertEqual(("acct", "kept", raw, "write-time", None, None, None), rows[-1][1:])
+        self.assertLess(rows[-2][0], rows[-1][0])
 
 
 if __name__ == "__main__":

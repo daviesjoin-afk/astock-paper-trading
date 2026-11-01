@@ -4498,3 +4498,20 @@ paper_slot_service.run_preflight
 `foundation_violations` / `import_cycles` 均为 0；未放宽预算。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第六批 审计表写入收敛（2026-11-01）
+
+`paper_audit` 的运行时静态 SQL 写入统一归 `paper_repository`。
+`adaptive_engine._restore_paper_account` 的失败操作清理改为调用窄接口
+`remove_failed_evolution_audit(conn, account_id, event_name, candidate_id)`。
+
+原有审计追加接口、事件内容、来源身份和原始 detail 不变。清理使用原 DELETE 及
+candidate 前缀，保留行号和顺序；同一连接、同一事务、原调用顺序及异常处理不变。
+owner 不提交事务，补偿调用方仍只容忍原 `sqlite3.Error`。
+
+增加明确的 `adaptive_engine → paper_repository` 导入；后者已登记为基础 owner，
+业务跨域边实测仍为 629，所有预算不变。见 `docs/COUPLING_BUDGET.md` 第六批说明。
+矩阵与静态 SQL 守卫将本表收紧为 owned，
+不扩大解释为覆盖所有运行时拼接 SQL。没有 schema 或数据迁移，没有交易时段验证。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

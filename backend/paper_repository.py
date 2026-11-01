@@ -62,6 +62,18 @@ def audit(conn, account_id, event, detail, created_at, *, strategy_stamp=None):
     )
 
 
+def remove_failed_evolution_audit(conn, account_id, event_name, candidate_id):
+    """清理失败进化操作的审计行；事务及异常处理仍由补偿调用方负责。
+
+    保留原始 detail 的 LIKE 前缀匹配：candidate=12; 不匹配 candidate=123;。
+    不解析或重写 detail，不提交事务，也不修改其他审计行的来源信息。
+    """
+    conn.execute(
+        "DELETE FROM paper_audit WHERE account_id=? AND event=? AND detail LIKE ?",
+        (account_id, event_name, f"candidate={int(candidate_id)};%"),
+    )
+
+
 def account_metric_inputs(conn, account_ids, today):
     """批量读取 dashboard 账户卡片所需的窄账本投影。
 

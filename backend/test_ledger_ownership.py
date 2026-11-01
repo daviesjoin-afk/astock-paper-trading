@@ -74,9 +74,9 @@ OWNERSHIP = {
         "note": "paper_risk_writes 统一校验来源信息并写入；两个 risk_log 只准备快照和策略戳",
     },
     "paper_audit": {
-        "status": "pending",
-        "writers": {"paper_repository", "adaptive_engine"},
-        "note": "paper_repository.audit 是账本审计端口；adaptive 侧恢复路径仍直写",
+        "status": "owned",
+        "writers": {"paper_repository"},
+        "note": "paper_repository 统一审计追加及失败进化操作的清理；补偿方保留事务与异常处理",
     },
     "paper_orders": {
         "status": "pending",
