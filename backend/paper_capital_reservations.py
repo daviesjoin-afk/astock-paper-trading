@@ -275,6 +275,25 @@ def reserve_shared_capital(
     return True, None
 
 
+def release_order_reservation(conn, order_id, *, now):
+    """按**订单键**释放一条活动预占（订单终态后的统一出口）。
+
+    这条 UPDATE 以前被三个模块各抄一份（``entry_lifecycle`` / ``execution_dispatch`` /
+    ``paper_trading``）：同一业务事实出现了三份权威写入。现在只有这里一份。
+
+    语义逐字保留：只处理 ``status='reserved'`` 的行；``released_at`` 用
+    ``COALESCE`` 保留首次释放时间；``order_key`` 按 ``CAST(... AS TEXT)`` 比较，
+    兼容旧库里以整数存储的键。时间戳由调用方传入（本模块不读时钟）。
+    返回受影响行数；调用方自行决定要不要吞掉 ``sqlite3.Error``。
+    """
+    return conn.execute(
+        """UPDATE paper_capital_reservations
+              SET status='released',released_at=COALESCE(released_at,?)
+            WHERE status='reserved' AND CAST(order_key AS TEXT)=?""",
+        (now, str(int(order_id))),
+    ).rowcount
+
+
 def finish_capital_reservation(conn, order_key, status, *, now_fn):
     """Finish one reserved row; terminal transitions are idempotent no-ops."""
     if status not in {"consumed", "released"}:

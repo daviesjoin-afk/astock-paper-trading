@@ -4405,3 +4405,20 @@ verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailabl
 import_cycles 0、foundation_violations 0；`max_file_lines` 14619；预算收紧到 0 / 72。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 核心账本表 read/write owner 化（2026-11-01）
+
+**写入矩阵**（`docs/LEDGER_OWNERSHIP.md` + `backend/test_ledger_ownership.py`）：`paper_fills`
+单写方 `execution_planner`；`paper_positions` 单写方 `paper_lot_ledger`；`paper_capital_reservations`
+收敛 `paper_trading` 的重复释放实现到 owner 的 `release_order_reservation(conn, order_id, *, now)`；
+其余表（orders / signals / accounts / lots / risk_decisions / audit）以"锁定当前写入方集合、
+只减不增"的方式登记为 pending。
+
+**本 PR 切片**：`_reconcile_signal_order_states` 不再内联预占释放 SQL，改调 owner 的业务入口；
+同一连接、同一事务，语句数不变。`entry_lifecycle`（foundation 层不能反向依赖业务 owner）与
+`execution_dispatch`（跨域预算用满）两处例外显式登记在守卫里，多一个/少一个都会变红。
+
+**边界**：未改订单状态机、成交判定、资金/预占语义、lot 与 cycle/fencing；跨域预算 629/629 不增；
+`max_file_lines` 14623 → 14618。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

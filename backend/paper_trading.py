@@ -1715,12 +1715,7 @@ def _reconcile_signal_order_states(conn):
                 + placeholders + ")",
                 (reason, order_id, *order_statuses),
             )
-            conn.execute(
-                """UPDATE paper_capital_reservations
-                      SET status='released',released_at=COALESCE(released_at,?)
-                    WHERE status='reserved' AND CAST(order_key AS TEXT)=?""",
-                (now, str(order_id)),
-            )
+            PCR.release_order_reservation(conn, order_id, now=now)
             reconciled += 1
             continue
 
