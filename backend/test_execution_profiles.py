@@ -177,11 +177,12 @@ class BuyOrderWiringTests(unittest.TestCase):
         nxt = re.search(r"^def ", source[start + 1:], re.M)
         body = source[start:start + 1 + (nxt.start() if nxt else len(source))]
         self.assertIn("limit_deferred", body)
-        rejected_pos = body.index("SET status='rejected'")
+        # 工作包 A/B：信号写入已归 signal_service，这里改看 owner 调用顺序：
+        # 「限价未到 → 延期」必须出现在「终态拒绝」之前。
+        rejected_pos = body.index("SIG.reject_signal(")
         before_reject = body[:rejected_pos]
-        # rejected 之前必须存在"限价未到 → signal 转 deferred_capacity"的分支。
         self.assertLess(before_reject.rindex("if limit_deferred:"),
-                        before_reject.rindex("SET status='deferred_capacity'"))
+                        before_reject.rindex("SIG.defer_for_capacity("))
 
 
 class ProfileCenterTests(unittest.TestCase):

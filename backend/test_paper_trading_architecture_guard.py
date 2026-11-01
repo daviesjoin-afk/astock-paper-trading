@@ -996,9 +996,16 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertIn("exact_plan[\"capital_plan\"]", buy)
         self.assertIn('exact_plan["plan_id"]', buy,
                       "BUY order must persist its exact allocation plan identity")
-        self.assertIn('allocation_intent_kind,exact_plan["portfolio_snapshot_id"],'
-                      'exact_plan["plan_id"],exact_plan["plan_fingerprint"]', buy,
-                      "order INSERT must retain the exact plan/snapshot provenance")
+        # 工作包 B：INSERT 归 paper_order_ledger，字段映射必须保留同一份
+        # exact plan / snapshot 身份（键名到表达式逐一对上）。
+        self.assertIn('"allocation_intent_kind":allocation_intent_kind', buy,
+                      "order INSERT must retain the allocation intent kind")
+        self.assertIn('"portfolio_snapshot_id":exact_plan["portfolio_snapshot_id"]', buy,
+                      "order INSERT must retain the portfolio snapshot id")
+        self.assertIn('"allocation_plan_id":exact_plan["plan_id"]', buy,
+                      "order INSERT must retain the allocation plan id")
+        self.assertIn('"allocation_plan_fingerprint":exact_plan["plan_fingerprint"]', buy,
+                      "order INSERT must retain the allocation plan fingerprint")
         self.assertIn("allowed=notreasons", buy,
                       "a PLANNED allocation must not override independent entry/Risk blocks")
         revalidate = self._flat("_revalidate_portfolio_entry_plan")
@@ -1218,7 +1225,7 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
             "周期冲突分支释放了冲突的 reservation —— 那不属于本订单（§50）")
         self.assertIn("risk_rejected", branch,
                       "周期冲突没有把当前订单终态化（§51）")
-        self.assertIn("deferred_capacity", branch,
+        self.assertIn("_defer_signal", branch,
                       "周期冲突后候选意图没有留在复试管道等待新 order identity")
 
     def test_guard10l_new_reservation_uses_the_expected_order_cycle(self):
