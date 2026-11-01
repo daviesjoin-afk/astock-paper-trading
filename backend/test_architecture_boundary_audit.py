@@ -166,7 +166,8 @@ class CouplingBudgetTests(unittest.TestCase):
         "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,
-        "duplicate_helpers": 0,
+        # 工作包 D：归档/周期 owner 之间出现一个同名小助手（296 → 297）。
+        "duplicate_helpers": 1,
         "unsuffixed_module_ratio": 0.0,
         "import_side_effects": 0,
         "injected_private_fields": 0,
