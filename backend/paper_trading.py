@@ -90,6 +90,7 @@ import adaptive_selection_compat as ASC
 # 但这两个模块本身仍是 facade 的依赖，不能随 cleanup 一起删掉 import。
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
+import paper_order_ledger as POL
 import paper_slot_service as PSS
 import paper_numeric as PNum
 import strategy_champion as SCM
@@ -1624,7 +1625,7 @@ def _reconcile_signal_order_states(conn):
     for retry in retry_rows:
         signal_id = int(retry["signal_id"])
         if signal_id in seen_retry_signals:
-            EPD.supersede_duplicate_execution_retry(conn, int(retry["id"]))
+            POL.supersede_duplicate_execution_retry(conn, int(retry["id"]))
             _finish_capital_reservation(conn, int(retry["id"]), "released")
         else:
             seen_retry_signals.add(signal_id)
@@ -1682,7 +1683,8 @@ def _reconcile_signal_order_states(conn):
                 if signal_status != "superseded" else
                 "信号已替代，回收遗留活动等待委托"
             )
-            EPD.supersede_for_terminal_signal(conn, order_id, reason=reason)
+            POL.supersede_for_terminal_signal(conn, order_id, reason=reason,
+                                              statuses=order_statuses)
             PCR.release_order_reservation(conn, order_id, now=now)
             reconciled += 1
             continue
@@ -12717,8 +12719,8 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
             db_factory=_db,
             audit=audit,
             resolve_asof_day=lambda: _date(asof_date),
-            expire_order=EPD.expire_order, expire_signal=SIG.expire_for_expired_order,
-            expire_stale_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal,
+            expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order,
+            expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal,
         )
     day = _date(asof_date)
     result = _run_slot_impl(slot, day=day, force=force)

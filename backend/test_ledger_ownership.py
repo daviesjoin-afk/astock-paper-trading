@@ -87,7 +87,7 @@ OWNERSHIP = {
         "status": "pending",
         "writers": {
             "paper_trading", "manual_orders", "execution_planner",
-            "execution_dispatch", "execution_verification",
+            "paper_order_ledger", "execution_verification",
             "paper_risk_writes",
         },
         "note": "订单状态机由多条权威路径按生命周期阶段推进；本 PR 只锁定集合，不合并状态机",
@@ -137,6 +137,20 @@ def write_sites(table: str):
     return sites
 
 
+def real_write_modules(table: str) -> set[str]:
+    """该表的**真实写目标**模块集合（按 SQL 首表解析，不把子查询读表算成写入）。
+
+    与 :func:`write_sites` 的区别：``UPDATE paper_signals ... WHERE id IN
+    (SELECT ... FROM paper_orders ...)`` 在 ``write_sites`` 里会同时命中订单表，
+    本函数只认 ``UPDATE / INSERT INTO / DELETE FROM`` 后的第一张表。
+    """
+    import tools.ledger_write_inventory as INV
+    return {
+        entry["module"] for entry in INV.scan()["entries"]
+        if entry["role"] == "runtime" and table in entry["write_targets"]
+    }
+
+
 class OrderExpiryOperationOwnershipTests(unittest.TestCase):
     """订单/信号过期的操作级边界；不宣称订单/信号整表已单写。"""
 
@@ -167,16 +181,16 @@ class OrderExpiryOperationOwnershipTests(unittest.TestCase):
 
     def test_expiry_owners_expose_narrow_business_operations(self):
         import inspect
-        import execution_dispatch as EPD
+        import paper_order_ledger as POL
         import signal_service as SIG
         self.assertEqual(["conn", "order_id", "reason", "cancelled_at"],
-                         list(inspect.signature(EPD.expire_order).parameters))
+                         list(inspect.signature(POL.expire_order).parameters))
         self.assertEqual(["conn", "signal_id", "reason"],
                          list(inspect.signature(SIG.expire_for_expired_order).parameters))
         self.assertEqual(["conn", "signal_id", "reason"],
                          list(inspect.signature(SIG.expire_stale_signal).parameters))
         self.assertEqual(["conn", "order_id", "cancelled_at"],
-                         list(inspect.signature(EPD.supersede_for_expired_signal).parameters))
+                         list(inspect.signature(POL.supersede_for_expired_signal).parameters))
 
     def test_signal_expiry_has_required_owner_ports_and_no_inline_writes(self):
         import inspect
@@ -245,7 +259,7 @@ class WaitlistRetirementOperationTests(unittest.TestCase):
     def test_no_module_joins_or_leaves_the_writer_sets(self):
         self.assertEqual("pending", OWNERSHIP["paper_orders"]["status"])
         self.assertEqual("pending", OWNERSHIP["paper_signals"]["status"])
-        self.assertIn("execution_dispatch", OWNERSHIP["paper_orders"]["writers"])
+        self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("execution_dispatch", OWNERSHIP["paper_signals"]["writers"])
         self.assertIn("paper_trading", OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("paper_trading", OWNERSHIP["paper_signals"]["writers"])
@@ -266,33 +280,39 @@ class ReconcileWriteOperationTests(unittest.TestCase):
 
     def test_reconcile_owners_are_narrow_business_operations(self):
         import inspect
-        import execution_dispatch as EPD
+        import paper_order_ledger as POL
         import signal_service as SIG
         self.assertEqual(["conn", "order_id"],
-                         list(inspect.signature(EPD.supersede_duplicate_execution_retry).parameters))
-        self.assertEqual(["conn", "order_id", "reason"],
-                         list(inspect.signature(EPD.supersede_for_terminal_signal).parameters))
+                         list(inspect.signature(POL.supersede_duplicate_execution_retry).parameters))
+        self.assertEqual(["conn", "order_id", "reason", "statuses"],
+                         list(inspect.signature(POL.supersede_for_terminal_signal).parameters))
         self.assertEqual(["conn", "signal_id", "status"],
                          list(inspect.signature(SIG.reconcile_signal_status).parameters))
 
-    def test_terminal_owner_arity_tracks_the_status_tuple(self):
-        import ast
-        import inspect
-        import textwrap
+    def test_terminal_owner_takes_the_status_vocabulary_from_the_caller(self):
+        import sqlite3
         import entry_lifecycle as ELC
-        import execution_dispatch as EPD
-        source = inspect.getsource(EPD.supersede_for_terminal_signal)
-        sql = next(textwrap.dedent(node.value)
-                   for node in ast.walk(ast.parse(textwrap.dedent(source)))
-                   if isinstance(node, ast.Constant) and "status IN (" in str(node.value))
-        self.assertEqual(len(ELC.ENTRY_RETRY_ORDER_STATUSES), sql.count("?") - 2)
+        import paper_order_ledger as POL
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, status TEXT, reason TEXT)")
+        conn.executemany("INSERT INTO paper_orders VALUES(?,?,?)",
+                         [(1, "pending_limit", None), (2, "awaiting_batch", None),
+                          (3, "deferred_capacity", None)])
+        POL.supersede_for_terminal_signal(conn, 1, reason="回收",
+                                          statuses=ELC.ENTRY_RETRY_ORDER_STATUSES)
+        self.assertEqual("superseded", conn.execute(
+            "SELECT status FROM paper_orders WHERE id=1").fetchone()[0])
+        # 不在传入词表里的状态不被动：owner 不自己拼状态集合。
+        self.assertEqual("awaiting_batch", conn.execute(
+            "SELECT status FROM paper_orders WHERE id=2").fetchone()[0])
 
     def test_write_sets_keep_pending_and_unchanged_membership(self):
-        self.assertEqual(6, len(write_sites("paper_orders")))
+        self.assertEqual(7, len(write_sites("paper_orders")))
         self.assertEqual(4, len(write_sites("paper_signals")))
         for table in ("paper_orders", "paper_signals"):
             self.assertEqual("pending", OWNERSHIP[table]["status"])
-        self.assertIn("execution_dispatch", OWNERSHIP["paper_orders"]["writers"])
+        self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("signal_service", OWNERSHIP["paper_signals"]["writers"])
 
 
@@ -306,7 +326,7 @@ class LedgerWriteOwnershipTests(unittest.TestCase):
     def test_non_owner_writes_do_not_regress(self):
         problems = []
         for table, spec in OWNERSHIP.items():
-            actual = set(write_sites(table))
+            actual = real_write_modules(table)
             extra = actual - spec["writers"]
             if extra:
                 problems.append(f"{table}: 非 owner 写入 {sorted(extra)}（允许 {sorted(spec['writers'])}）")
@@ -317,7 +337,7 @@ class LedgerWriteOwnershipTests(unittest.TestCase):
             if spec["status"] != "owned":
                 continue
             with self.subTest(table=table):
-                actual = set(write_sites(table))
+                actual = real_write_modules(table)
                 self.assertEqual(actual, spec["writers"],
                                  f"{table} 声明为单写方但实际写入方是 {sorted(actual)}")
 

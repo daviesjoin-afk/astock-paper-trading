@@ -8,9 +8,11 @@ import unittest
 from unittest import mock
 
 try:
+    import paper_order_ledger as POL
     import paper_slot_service as PSS
     import signal_service as SIG
 except ImportError:
+    from . import paper_order_ledger as POL
     from . import paper_slot_service as PSS
     from . import signal_service as SIG
 
@@ -58,7 +60,7 @@ class PreflightTests(unittest.TestCase):
              mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn, release_reservation, expire_order, expire_signal: events.append("orders")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
-                expire_stale_signal=SIG.expire_stale_signal, supersede_order=PSS.EPD.supersede_for_expired_signal, expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
+                expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal, expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda *args: None,
                 resolve_asof_day=lambda: day,
             )
@@ -74,7 +76,7 @@ class PreflightTests(unittest.TestCase):
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=RuntimeError("boom")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
-                expire_stale_signal=SIG.expire_stale_signal, supersede_order=PSS.EPD.supersede_for_expired_signal, expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
+                expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal, expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((actor, event, detail)),
                 resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
@@ -91,7 +93,7 @@ class PreflightTests(unittest.TestCase):
         with mock.patch.object(PSS.ELC, "expire_stale_signals") as signals, \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
-                expire_stale_signal=SIG.expire_stale_signal, supersede_order=PSS.EPD.supersede_for_expired_signal, expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
+                expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal, expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((event, detail)),
                 resolve_asof_day=resolver,
             )
@@ -108,7 +110,7 @@ class PreflightTests(unittest.TestCase):
              mock.patch.object(PSS.ELC, "expire_stale_orders", return_value=None), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=ValueError("bad dispatch")):
             result = PSS.run_preflight(
-                expire_stale_signal=SIG.expire_stale_signal, supersede_order=PSS.EPD.supersede_for_expired_signal, expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
+                expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal, expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((event, detail)),
                 resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
@@ -120,7 +122,7 @@ class PreflightTests(unittest.TestCase):
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=RuntimeError("boom")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", return_value=None):
             result = PSS.run_preflight(
-                expire_stale_signal=SIG.expire_stale_signal, supersede_order=PSS.EPD.supersede_for_expired_signal, expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
+                expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal, expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=mock.Mock(side_effect=RuntimeError("audit unavailable")),
                 resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
@@ -288,10 +290,10 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertEqual("_db", keywords["db_factory"].id)
         self.assertIsInstance(keywords.get("audit"), ast.Name)
         self.assertEqual("audit", keywords["audit"].id)
-        self.assertEqual("EPD.expire_order", _dotted_name(keywords.get("expire_order")))
+        self.assertEqual("POL.expire_order", _dotted_name(keywords.get("expire_order")))
         self.assertEqual("SIG.expire_for_expired_order", _dotted_name(keywords.get("expire_signal")))
         self.assertEqual("SIG.expire_stale_signal", _dotted_name(keywords.get("expire_stale_signal")))
-        self.assertEqual("EPD.supersede_for_expired_signal", _dotted_name(keywords.get("supersede_order")))
+        self.assertEqual("POL.supersede_for_expired_signal", _dotted_name(keywords.get("supersede_order")))
         resolver = keywords.get("resolve_asof_day")
         self.assertIsInstance(resolver, ast.Lambda)
         self.assertEqual([], resolver.args.args)

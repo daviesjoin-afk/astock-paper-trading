@@ -52,33 +52,15 @@
   "execution_dispatch::_retire_for_retry": {
    "judge": "execution_dispatch 重试策略",
    "operation": "重试接管：信号状态同步",
-   "targets": {
-    "paper_orders": {
-     "operation": "重试接管：退役旧执行重试",
-     "owner": "paper_order_ledger",
-     "package": "A"
-    },
-    "paper_signals": {
-     "owner": "signal_service",
-     "package": "A"
-    }
-   },
+   "single_owner": "signal_service",
+   "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
   "execution_dispatch::_terminate": {
    "judge": "execution_dispatch 派发阶段",
    "operation": "派发终止：信号终态",
-   "targets": {
-    "paper_orders": {
-     "operation": "派发终止：订单转终态",
-     "owner": "paper_order_ledger",
-     "package": "A"
-    },
-    "paper_signals": {
-     "owner": "signal_service",
-     "package": "A"
-    }
-   },
+   "single_owner": "signal_service",
+   "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
   "execution_dispatch::_write_signal_marker": {
@@ -88,54 +70,10 @@
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
-  "execution_dispatch::expire_order": {
-   "judge": "entry_lifecycle 判定，dispatch 落库",
-   "operation": "订单自身过期终态 expired",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
   "execution_dispatch::retire_duplicate_waitlist": {
    "judge": "paper_trading 启动恢复",
    "operation": "等待池重复记录退役（信号）",
-   "targets": {
-    "paper_orders": {
-     "operation": "等待池重复记录退役（订单）",
-     "owner": "paper_order_ledger",
-     "package": "A"
-    },
-    "paper_signals": {
-     "owner": "signal_service",
-     "package": "A"
-    }
-   },
-   "transaction": "启动恢复/初始化连接"
-  },
-  "execution_dispatch::retire_gated_orders": {
-   "judge": "execution_dispatch 等待窗口",
-   "operation": "挂起订单退役（batch/verification 等待超时）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_dispatch::supersede_duplicate_execution_retry": {
-   "judge": "paper_trading 对账循环",
-   "operation": "重复执行重试退旧 superseded",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
-   "transaction": "启动恢复/初始化连接"
-  },
-  "execution_dispatch::supersede_for_expired_signal": {
-   "judge": "entry_lifecycle 失效判定",
-   "operation": "失效信号名下买单回收 superseded",
-   "single_owner": "paper_order_ledger",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_dispatch::supersede_for_terminal_signal": {
-   "judge": "paper_trading 对账循环",
-   "operation": "终态信号遗留委托回收",
-   "single_owner": "paper_order_ledger",
+   "single_owner": "signal_service",
    "single_package": "A",
    "transaction": "启动恢复/初始化连接"
   },
@@ -212,6 +150,7 @@
      "package": "B"
     },
     "paper_signals": {
+     "operation": "成交失败：信号回 deferred_capacity",
      "owner": "signal_service",
      "package": "B"
     }
@@ -231,6 +170,62 @@
    "single_owner": "paper_cycle_service",
    "single_package": "D",
    "transaction": "服务入口传入的连接"
+  },
+  "paper_order_ledger::expire_order": {
+   "judge": "entry_lifecycle 判定，dispatch 落库",
+   "operation": "订单自身过期终态 expired",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::retire_duplicate_waitlist_orders": {
+   "judge": "paper_trading 启动恢复",
+   "operation": "等待池重复记录退役（订单，批量）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_order_ledger::retire_gated_order": {
+   "judge": "execution_dispatch 等待窗口",
+   "operation": "挂起订单退役（batch/verification 等待超时）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::supersede_duplicate_execution_retry": {
+   "judge": "paper_trading 对账循环",
+   "operation": "重复执行重试退旧 superseded",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_order_ledger::supersede_for_expired_signal": {
+   "judge": "entry_lifecycle 失效判定",
+   "operation": "失效信号名下买单回收 superseded",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::supersede_for_terminal_signal": {
+   "judge": "paper_trading 对账循环",
+   "operation": "终态信号遗留委托回收",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_order_ledger::supersede_order": {
+   "judge": "execution_dispatch 重试接管判定",
+   "operation": "重试接管/Dispatch 退役：订单转 superseded（含取消时间）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::terminate_order": {
+   "judge": "execution_dispatch 派发阶段",
+   "operation": "派发终止：订单转调用方判定的终态",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
   },
   "paper_risk_writes::<module>": {
    "judge": "风控拒绝结论（paper_risk_writes 模块级工厂）",
@@ -270,6 +265,7 @@
      "package": "B"
     },
     "paper_signals": {
+     "operation": "买入联动信号状态/原因/payload",
      "owner": "signal_service",
      "package": "B"
     }
@@ -286,6 +282,7 @@
      "package": "D"
     },
     "paper_signals": {
+     "operation": "归档/清理超龄信号行（DELETE）",
      "owner": "signal_service",
      "package": "D"
     }
@@ -430,6 +427,7 @@
      "package": "B"
     },
     "paper_signals": {
+     "operation": "执行结果回写信号状态",
      "owner": "signal_service",
      "package": "B"
     }
@@ -515,9 +513,10 @@
    "status": "existing"
   },
   "paper_order_ledger": {
+   "note": "A 包已建立：订单行持久化入口",
    "package": "A",
    "scope": "paper_orders 全部行写入（创建/状态/成交结果/核验戳/归档删除）",
-   "status": "planned"
+   "status": "existing"
   },
   "paper_shared_cash": {
    "package": "C",

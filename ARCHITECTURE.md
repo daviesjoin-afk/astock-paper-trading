@@ -4599,3 +4599,16 @@ D `paper_cycles` 与跨表归档、E 读取契约/守卫校准/总验收。
 四组分别归现有 owner 与新建 `paper_account_config`，`paper_cycles` → `paper_cycle_service`。
 
 细节与出口见 `docs/LEDGER_OWNERSHIP.md` 第16节。仍不进入 PR-11。
+
+## PR-10 工作包 A 第一片 订单行 owner（2026-11-01）
+
+建立 `backend/paper_order_ledger.py` 作为 `paper_orders` 的唯一持久化入口，先接非成交生命周期：
+过期、失效信号回收、重复重试退旧、终态信号回收、重试接管退役、派发终止、挂起退役、等待池批量退役。
+`execution_dispatch` 不再写订单表，只保留判定、顺序、预占释放与信号写入。
+
+owner 契约：不算成交（`commit_fill` 仍唯一）、不读时钟、不 commit、不吞异常；`terminate_order`
+只接受终态白名单，状态词表由调用方传入而不是在 owner 里再抄一份。
+
+成本显式登记：新增含 SQL 模块使 `raw_sql_modules` 141→142、`paper_table_fanout_max` 50→51、
+`cross_domain_edges` 629→630，全部走 `FEATURE_ALLOWANCE` + `docs/COUPLING_BUDGET.md` 切片记录，
+`HEAD_BUDGET` 与 lock 不变。A 后续片与 B/C/D 搬走写入后需收回这些额度。
