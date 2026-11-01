@@ -4422,3 +4422,26 @@ import_cycles 0、foundation_violations 0；`max_file_lines` 14619；预算收�
 `max_file_lines` 14623 → 14618。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第二批：预占释放回调注入（2026-11-01）
+
+`entry_lifecycle` 是 foundation 层，不能反向 import 业务 owner。第二批把它的内联预占释放
+改成**调用方注入**：
+
+```
+paper_slot_service.run_preflight
+  └─ ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, …)
+  └─ ELC.expire_stale_orders(conn, release_reservation=PCR.release_order_reservation)
+        └─ _release_reservation(conn, order_id, release)
+              └─ release(conn, order_id, now=…)
+```
+
+`expire_stale_orders` / `expire_stale_signals` 的 `release_reservation` 是**必填**关键字参数
+（没有隐式回退，未知调用方无法静默跳过释放）。`paper_capital_reservations` 的非 owner 写入
+因此只剩 `execution_dispatch`（execution→paper 会新增跨域边，预算已满），守卫的例外集合同步
+收窄到 1 个。
+
+**实测**：`paper_capital_reservations` 写入方 owner + 1 例外；跨域边 629（不变）；
+`foundation_violations` 0；预算未放宽。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

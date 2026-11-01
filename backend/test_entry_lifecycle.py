@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import entry_lifecycle as ELC
+import paper_capital_reservations as PCR
 
 NOW = dt.datetime(2026, 9, 9, 10, 30)
 TODAY = "2026-09-09"
@@ -154,7 +155,7 @@ class SweepOrderTests(unittest.TestCase):
         conn = _db()
         signal_id = _signal(conn, minutes_ago=20)
         order_id = _order(conn, signal_id, minutes_ago=60)
-        summary = ELC.expire_stale_orders(conn, now=NOW, ttl_minutes=30)
+        summary = ELC.expire_stale_orders(conn, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=30)
         self.assertEqual(1, summary["expired"])
         order = _row(conn, "paper_orders", order_id)
         self.assertEqual("expired", order["status"])
@@ -171,7 +172,7 @@ class SweepOrderTests(unittest.TestCase):
         signal_id = _signal(conn, minutes_ago=600)
         order_id = _order(conn, signal_id, minutes_ago=600,
                           expires_at="2026-09-09T23:00:00")
-        summary = ELC.expire_stale_orders(conn, now=NOW, ttl_minutes=30)
+        summary = ELC.expire_stale_orders(conn, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=30)
         self.assertEqual(0, summary["expired"])
         self.assertEqual("execution_retry", _row(conn, "paper_orders", order_id)["status"])
 
@@ -180,12 +181,12 @@ class SweepOrderTests(unittest.TestCase):
         conn = _db()
         signal_id = _signal(conn, minutes_ago=600)
         order_id = _order(conn, signal_id, minutes_ago=600, expires_at="2026-09-09")
-        summary = ELC.expire_stale_orders(conn, now=NOW, ttl_minutes=30)
+        summary = ELC.expire_stale_orders(conn, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=30)
         self.assertEqual(0, summary["expired"])
         self.assertEqual("execution_retry", _row(conn, "paper_orders", order_id)["status"])
         # 次日同一清扫即作废。
         summary = ELC.expire_stale_orders(
-            conn, now=dt.datetime(2026, 9, 10, 9, 35), ttl_minutes=30)
+            conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 10, 9, 35), ttl_minutes=30)
         self.assertEqual(1, summary["expired"])
         self.assertEqual("expired", _row(conn, "paper_orders", order_id)["status"])
 
@@ -198,7 +199,7 @@ class SweepOrderTests(unittest.TestCase):
             (signal_id, _iso(600)),
         )
         conn.commit()
-        summary = ELC.expire_stale_orders(conn, now=NOW, ttl_minutes=30)
+        summary = ELC.expire_stale_orders(conn, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=30)
         self.assertEqual(0, summary["checked"])
         self.assertEqual("filled", _row(conn, "paper_signals", signal_id)["status"])
 
@@ -208,7 +209,7 @@ class SweepSignalTests(unittest.TestCase):
         conn = _db()
         signal_id = _signal(conn, minutes_ago=10, day="2026-09-08")
         order_id = _order(conn, signal_id, minutes_ago=10, status="pending_limit")
-        summary = ELC.expire_stale_signals(conn, now=NOW, asof_day=TODAY)
+        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
         self.assertEqual(1, summary["expired"])
         self.assertEqual("expired", _row(conn, "paper_signals", signal_id)["status"])
         self.assertEqual(1, summary["orders_cancelled"])
@@ -222,14 +223,14 @@ class SweepSignalTests(unittest.TestCase):
     def test_aged_signal_expires_without_asof_day(self):
         conn = _db()
         signal_id = _signal(conn, minutes_ago=200)
-        summary = ELC.expire_stale_signals(conn, now=NOW, ttl_minutes=90)
+        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, ttl_minutes=90)
         self.assertEqual(1, summary["expired"])
         self.assertIn("有效期", _row(conn, "paper_signals", signal_id)["reason"])
 
     def test_fresh_today_signals_survive(self):
         conn = _db()
         _signal(conn, minutes_ago=10, status="deferred_capacity")
-        summary = ELC.expire_stale_signals(conn, now=NOW, asof_day=TODAY)
+        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
         self.assertEqual(1, summary["checked"])
         self.assertEqual(0, summary["expired"])
 
@@ -237,7 +238,7 @@ class SweepSignalTests(unittest.TestCase):
         conn = _db()
         _signal(conn, minutes_ago=600, status="filled")
         _signal(conn, minutes_ago=600, status="shadow_q3")
-        summary = ELC.expire_stale_signals(conn, now=NOW, asof_day=TODAY)
+        summary = ELC.expire_stale_signals(conn, release_reservation=PCR.release_order_reservation, now=NOW, asof_day=TODAY)
         self.assertEqual(0, summary["checked"])
 
 

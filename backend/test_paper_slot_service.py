@@ -52,8 +52,8 @@ class PreflightTests(unittest.TestCase):
     def test_lifecycle_cleanup_precedes_dispatch(self):
         events = []
         day = dt.date(2026, 9, 11)
-        with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=lambda conn, asof_day: events.append("signals")), \
-             mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn: events.append("orders")), \
+        with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=lambda conn, asof_day, release_reservation: events.append("signals")), \
+             mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn, release_reservation: events.append("orders")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn: events.append("dispatch")):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),

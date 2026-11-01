@@ -18,7 +18,7 @@
 | --- | --- | --- | --- |
 | `paper_fills` | **owned** | `execution_planner` | 成交流水只有 `commit_fill` 一处写入 |
 | `paper_positions` | **owned** | `paper_lot_ledger` | 投影表，只能由 lot owner 同步 |
-| `paper_capital_reservations` | **pending** | `paper_capital_reservations`（owner）+ `entry_lifecycle`、`execution_dispatch` | 本 PR 已把 `paper_trading` 的重复实现收敛进 owner；另两处见 §5 |
+| `paper_capital_reservations` | **pending** | `paper_capital_reservations`（owner）+ `execution_dispatch` | 第二批已把 `paper_trading` 与 `entry_lifecycle` 两处收敛（后者改为调用方注入 release 回调）；`execution_dispatch` 见 §5 |
 | `paper_position_lots` | **pending** | `paper_lot_ledger`（owner）+ `execution_planner` | `commit_fill` 在同一事务里回填 `source_fill_id` |
 | `paper_risk_decisions` | **pending** | `paper_risk_writes` + `paper_trading` | `_risk_log` 仍自行组装 provenance |
 | `paper_audit` | **pending** | `paper_repository` + `adaptive_engine` | 账本审计端口 vs adaptive 恢复路径 |
@@ -68,7 +68,7 @@ paper_trading._reconcile_signal_order_states
 
 | 项 | 原因 | 下一步 |
 | --- | --- | --- |
-| `entry_lifecycle._release_reservation` | `entry_lifecycle` 属于 **foundation 层**，反向 import 业务 owner 会被 `foundation_never_depends_on_a_business_domain` 判死 | 让 `expire_stale_orders/signals` 接收 `release_reservation` 回调，由调用方注入 |
+| ~~`entry_lifecycle._release_reservation`~~ | **已迁移（第二批）**：`expire_stale_orders/signals` 现在接收 `release_reservation` 回调，`paper_slot_service` 注入 `PCR.release_order_reservation`；foundation 层不再内联预占 SQL | — |
 | `execution_dispatch._release_reservation` | `execution_dispatch`（execution 域）import paper 域 owner 会新增跨域边，而跨域预算**正好用满**（629/629） | 同上：调用方注入回调，或先消除一条既有边 |
 | `paper_position_lots.source_fill_id` | `commit_fill` 在成交事务内回填血缘，改走 lot owner 需要新窄接口且动到最敏感的提交链 | lot owner 增加 `link_source_fill(conn, lot_id, fill_id)`，随后替换 |
 | `paper_risk_decisions` 双写 | `_risk_log` 自行组装 decision provenance；`paper_risk_writes` 只有原语 | 先统一 provenance 组装，再收口 |

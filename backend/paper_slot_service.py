@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import entry_lifecycle as ELC
+import paper_capital_reservations as PCR
 import execution_dispatch as EPD
 
 
@@ -48,8 +49,9 @@ def run_preflight(*, db_factory, audit: Callable, resolve_asof_day: Callable) ->
             result["asof_day"] = (
                 asof_day.isoformat() if hasattr(asof_day, "isoformat") else str(asof_day)
             )
-            ELC.expire_stale_signals(conn, asof_day=asof_day)
-            ELC.expire_stale_orders(conn)
+            ELC.expire_stale_signals(
+                conn, release_reservation=PCR.release_order_reservation, asof_day=asof_day)
+            ELC.expire_stale_orders(conn, release_reservation=PCR.release_order_reservation)
     except Exception as exc:  # pragma: no cover - exercised through injected failures
         result["lifecycle"] = "error"
         _best_effort_audit(
