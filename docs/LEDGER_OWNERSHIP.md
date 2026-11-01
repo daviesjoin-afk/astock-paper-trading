@@ -21,7 +21,7 @@
 | `paper_capital_reservations` | **owned** | `paper_capital_reservations` | 三批收敛完成：`paper_trading` / `entry_lifecycle` / `execution_dispatch` 全部改为调用装配层注入的 release 回调 |
 | `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
 | `paper_risk_decisions` | **owned** | `paper_risk_writes` | 第五批统一来源信息校验及组装；两个 `_risk_log` 只准备快照、策略戳和时间 |
-| `paper_audit` | **pending** | `paper_repository` + `adaptive_engine` | 账本审计端口 vs adaptive 恢复路径 |
+| `paper_audit` | **owned** | `paper_repository` | 第六批：追加及失败进化操作的清理都归表 owner；补偿方保留事务与异常处理 |
 | `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`entry_lifecycle`、`paper_risk_writes` | 订单状态机按生命周期阶段分写 |
 | `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`entry_lifecycle`、`signal_service` | 信号同样按阶段分写 |
 | `paper_accounts` | **pending** | `paper_trading`、`paper_shared_cash`、`paper_user_cycle_attachment`、`paper_user_account_provisioning`、`strategy_registry`、`paper_order_execution_authority`、`paper_cycle_ownership`、`adaptive_engine`、`adaptive_risk`、`adaptive_selection`、`adaptive_selection_compat`、`evolution_apply`、`ai_adoption_writer` | 不同 owner 各写自己的字段（现金/周期挂接/策略参数） |
@@ -72,7 +72,7 @@ paper_trading._reconcile_signal_order_states
 | ~~`execution_dispatch._release_reservation`~~ | **已迁移（第三批）**：`run_execution_dispatch` / `retire_gated_orders` / `resolve_verification` 接收必填 `release_reservation`，由 `paper_trading` / `paper_slot_service` 注入；本模块不 import 业务 owner，跨域边不增 | — |
 | ~~`paper_position_lots.source_fill_id`~~ | **已迁移（第四批）**：lot owner 新增 `link_source_fill(conn, lot_id, fill_id)`，`commit_fill` 通过注入的依赖字段调用；同一 `conn`、同一事务、`source_fill_id` 的 legacy NULL 语义不变 | — |
 | ~~`paper_risk_decisions` 双写~~ | **已迁移（第五批）**：两个 `_risk_log` 统一调用 `paper_risk_writes.insert_risk_decision`；来源信息由写入 owner 组装，词汇及结构仍属 schema owner | — |
-| `paper_audit` 双写 | adaptive 侧恢复路径直写 | 走 `paper_repository.audit` 端口 |
+| ~~`paper_audit` 双写~~ | **已迁移（第六批）**：adaptive 补偿路径调用 `paper_repository.remove_failed_evolution_audit`；保留原 DELETE、事务位置及异常处理 | — |
 | `paper_orders` / `paper_signals` / `paper_accounts` 多写 | 状态机按生命周期阶段分权，强行合并会把阶段判定塞进单一 owner | 逐阶段收口（先做"终态写入"单一出口） |
 
 ## 6. 机器可验证的边界（`backend/test_ledger_ownership.py`，9 项）
@@ -141,3 +141,30 @@ NULL 与无显式权限声明时的旧 payload；不补造历史 provenance 或 
 排序）均被新测试拦截。以上是结构与行为证据，不声称实盘性能提升。
 
 回滚：revert 本批提交即可；没有 schema 或数据迁移。
+
+## 10. 第六批 审计清理与追加归同一表 owner
+
+基线 `master` @ `e09b473`（#313 squash 合并后）。此次只把
+`adaptive_engine._restore_paper_account` 的一条 DELETE 搬到
+`paper_repository.remove_failed_evolution_audit(conn, account_id, event_name, candidate_id)`。
+新增的是失败进化操作的清理接口，原有 `audit` 追加接口不变。
+
+SQL 与参数逐字保留：账户、事件和 `candidate=<int id>;` detail 前缀必须同时匹配，
+12 不会误删 123。仍使用 SQLite 原有 LIKE 行为，不解析、标准化或重写 detail；
+二进制 detail 的匹配也由原 SQLite 构建选项决定。保留行的所有字段和行号不变，
+因此事件内容、来源身份、原始 detail 及相对顺序不变。
+
+调用位置仍在账户恢复和参数版本清理之后、原 commit 之前。owner 使用传入连接，
+只执行原来的一条 DELETE，不 commit，也不捕获异常；补偿调用方原有的
+`except sqlite3.Error: pass`、其他异常传播及 finally close 保留。较新账户版本的
+恢复跳过规则及告警不变。
+
+静态 SQL 写入方由 2 个降为 1 个，矩阵收紧为 **owned**。这项结论仍只针对静态 SQL
+守卫覆盖范围，不证明所有运行时拼接 SQL 都只有一个写入方。
+
+为明确表 owner 依赖，增加 `adaptive_engine → paper_repository` 导入。后者已登记为
+基础 owner，按现有口径业务跨域边仍为 629，循环和基础层反向依赖均为 0；
+所有预算不变，说明见 `docs/COUPLING_BUDGET.md`。
+冻结测试覆盖完整保留行、原始 detail、显式/unknown 策略戳、写入顺序、事务回滚、
+SQLite 错误容忍、非 SQLite 错误传播及版本冲突跳过。没有 schema 或数据迁移，
+回滚本批提交即可。没有真实交易时段验证，未部署。

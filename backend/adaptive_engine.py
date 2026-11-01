@@ -44,6 +44,7 @@ import evolution_adversarial as adversarial
 import dual_ai_tuner
 import self_evolution
 import paper_ledger_reader as paper_reader
+import paper_repository as PRP
 import adaptive_genetics as AG
 import adaptive_shadow_risk as ASR
 from strategy_registry import labels as strategy_labels
@@ -778,10 +779,7 @@ def _restore_paper_account(snapshot, account_id, candidate_id, event_name, expec
         # detail format) so candidate=12 cannot delete audit rows belonging to
         # candidate=123.
         try:
-            paper.execute(
-                "DELETE FROM paper_audit WHERE account_id=? AND event=? AND detail LIKE ?",
-                (account_id, event_name, f"candidate={int(candidate_id)};%"),
-            )
+            PRP.remove_failed_evolution_audit(paper, account_id, event_name, candidate_id)
         except sqlite3.Error:
             pass
         paper.commit()

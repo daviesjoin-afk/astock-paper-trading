@@ -607,3 +607,15 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 `Mock` 会把 `assert_*` 属性当成断言方法（`'assert_active_lease' is not a valid assertion`）。因此这两个字段
 公开为 `require_active_lease` / `require_order_execution_cycle`，`paper_trading` 的转发同步改名，测试替身
 也统一走公开名。
+
+## 2026-11-01 PR-10 第六批 审计清理归属
+
+`adaptive_engine._restore_paper_account` 的失败进化操作审计清理改为直接调用
+`paper_repository.remove_failed_evolution_audit`。SQL 及事务位置不变，审计表的运行时
+静态 SQL 写入方由 2 个收敛为 1 个。
+
+新增明确的 `adaptive_engine → paper_repository` 模块依赖。`paper_repository` 已在
+`FOUNDATION_MODULES` 中，按现有口径，业务调用基础 owner 不计入业务跨域边；
+实测 `cross_domain_edges` 仍为 629，基础层反向依赖与循环均为 0。
+基线、lock 和所有 `FEATURE_ALLOWANCE` 都不变；没有新增全局依赖桥、跨层私有访问
+或通用 SQL 入口，也不为调整计数而迁移无关依赖。
