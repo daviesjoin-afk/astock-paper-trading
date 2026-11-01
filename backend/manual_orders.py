@@ -94,6 +94,9 @@ class ManualOrderDependencies:
     cancel_order: Any
     insert_order: Any
     write_signal_payload: Any
+    defer_signal: Any
+    reopen_pending: Any
+    mark_signal_filled: Any
 
 
 _dependencies_factory: Callable[[], ManualOrderDependencies] | None = None
@@ -629,6 +632,9 @@ def _commit_strategy_buy(
     _finish_capital_reservation = deps.finish_capital_reservation
     _insert_order = deps.insert_order
     _write_signal_payload = deps.write_signal_payload
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
+    _mark_signal_filled = deps.mark_signal_filled
     _lease_lost = deps.lease_lost
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -710,6 +716,8 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
     """
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
     _finish_capital_reservation = deps.finish_capital_reservation
     _risk_log = deps.risk_log
@@ -729,10 +737,7 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
             "amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
             (conflict, order_id),
         )
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-            (conflict, signal["id"]),
-        )
+        _defer_signal(conn, int(signal["id"]), reason=conflict)
         _risk_log(conn, account["id"], code, "buy", "risk_rejected", conflict, risk)
         return {
             "filled": False, "deferred": True, "status": "risk_rejected",
@@ -745,10 +750,7 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
         "fees=NULL,executed_at=NULL WHERE id=?",
         (STRATEGY_EXECUTION_RETRY_STATUS, failure, order_id),
     )
-    conn.execute(
-        "UPDATE paper_signals SET status='pending',reason=? WHERE id=?",
-        (failure, signal["id"]),
-    )
+    _reopen_pending(conn, int(signal["id"]), reason=failure)
     _risk_log(conn, account["id"], code, "buy", STRATEGY_EXECUTION_RETRY_STATUS,
               failure, risk)
     return {
@@ -774,6 +776,9 @@ def commit_strategy_entry_fill(
     _require_active_lease = deps.require_active_lease
     _lease_lost = deps.lease_lost
     _write_signal_payload = deps.write_signal_payload
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
+    _mark_signal_filled = deps.mark_signal_filled
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
@@ -843,16 +848,13 @@ def commit_strategy_entry_fill(
             # 复试管道（deferred_capacity），只有最后一片才标 filled ——
             # 否则剩余片会被永久丢失。
             if not slice_done:
-                conn.execute(
-                    "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-                    (f"分批建仓第 {slices_filled}/{len(slice_plan)} 片已成交；"
-                     "剩余片由后续扫描重新取价并重跑全部风控", signal["id"]),
+                _defer_signal(
+                    conn, int(signal["id"]),
+                    reason=(f"分批建仓第 {slices_filled}/{len(slice_plan)} 片已成交；"
+                            "剩余片由后续扫描重新取价并重跑全部风控"),
                 )
         if slice_done:
-            conn.execute(
-                "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
-                (reason, signal["id"]),
-            )
+            _mark_signal_filled(conn, int(signal["id"]), reason=reason)
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         return None
     except Exception as exc:
@@ -879,6 +881,9 @@ def submit_manual_order(
     _finish_capital_reservation = deps.finish_capital_reservation
     _insert_order = deps.insert_order
     _write_signal_payload = deps.write_signal_payload
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
+    _mark_signal_filled = deps.mark_signal_filled
     _market_state = deps.market_state
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id

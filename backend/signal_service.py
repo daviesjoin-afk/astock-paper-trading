@@ -51,9 +51,12 @@ __all__ = [
     "expire_for_expired_order",
     "expire_stale_signal",
     "reconcile_signal_status",
+    "defer_for_capacity",
     "expire_signal",
+    "mark_filled",
     "reject_signal",
     "reopen_for_retry",
+    "reopen_pending",
     "update_signal_feedback",
     "retire_waitlist_signals",
     "signal_evidence",
@@ -567,6 +570,48 @@ def retire_waitlist_signals(conn, *, statuses: Sequence[str]):
             ) AND status IN ({state_marks})""",
         states,
     ).rowcount
+
+
+def defer_for_capacity(conn, signal_id, *, reason, payload=None, unless_status=None):
+    """容量等待：信号转 deferred_capacity。
+
+    ``payload`` 非空时一并刷新载荷；``unless_status`` 给出时只在信号不处于该状态
+    时写入（保留原 ``status<>?`` 保护）。
+    """
+    signal_id = int(signal_id)
+    if payload is not None:
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=?,payload=?"
+            " WHERE id=?",
+            (reason, payload, signal_id),
+        )
+    elif unless_status is not None:
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=?"
+            " WHERE id=? AND status<>?",
+            (reason, signal_id, unless_status),
+        )
+    else:
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+            (reason, signal_id),
+        )
+
+
+def reopen_pending(conn, signal_id, *, reason):
+    """成交失败回到待处理：信号转 pending。"""
+    conn.execute(
+        "UPDATE paper_signals SET status='pending',reason=? WHERE id=?",
+        (reason, int(signal_id)),
+    )
+
+
+def mark_filled(conn, signal_id, *, reason):
+    """成交完成：信号转 filled。"""
+    conn.execute(
+        "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
+        (reason, int(signal_id)),
+    )
 
 
 def reject_signal(conn, signal_id, *, reason):

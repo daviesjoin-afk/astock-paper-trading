@@ -256,7 +256,7 @@
   {
    "function": "_commit_strategy_buy",
    "kind": "static",
-   "line": 686,
+   "line": 692,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -268,7 +268,7 @@
   {
    "function": "strategy_fill_failure",
    "kind": "static",
-   "line": 728,
+   "line": 736,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -280,19 +280,7 @@
   {
    "function": "strategy_fill_failure",
    "kind": "static",
-   "line": 733,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "strategy_fill_failure",
-   "kind": "static",
-   "line": 744,
+   "line": 749,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -302,21 +290,9 @@
    ]
   },
   {
-   "function": "strategy_fill_failure",
-   "kind": "static",
-   "line": 749,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='pending',reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
    "function": "commit_strategy_entry_fill",
    "kind": "static",
-   "line": 817,
+   "line": 822,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -326,33 +302,9 @@
    ]
   },
   {
-   "function": "commit_strategy_entry_fill",
-   "kind": "static",
-   "line": 847,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "commit_strategy_entry_fill",
-   "kind": "static",
-   "line": 853,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
    "function": "submit_manual_order",
    "kind": "static",
-   "line": 983,
+   "line": 988,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -364,7 +316,7 @@
   {
    "function": "submit_manual_order",
    "kind": "static",
-   "line": 1005,
+   "line": 1010,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -376,7 +328,7 @@
   {
    "function": "_terminalize_cycle_stale_order",
    "kind": "static",
-   "line": 1152,
+   "line": 1157,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -388,7 +340,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1265,
+   "line": 1270,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -400,7 +352,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1281,
+   "line": 1286,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -412,7 +364,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1298,
+   "line": 1303,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -424,7 +376,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1313,
+   "line": 1318,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -436,7 +388,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1323,
+   "line": 1328,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -448,7 +400,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1352,
+   "line": 1357,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -460,7 +412,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1359,
+   "line": 1364,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -472,7 +424,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1391,
+   "line": 1396,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -484,7 +436,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1433,
+   "line": 1438,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -1262,43 +1214,7 @@
   {
    "function": "_buy_order",
    "kind": "static",
-   "line": 8312,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_buy_order",
-   "kind": "static",
-   "line": 8328,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_buy_order",
-   "kind": "static",
-   "line": 9166,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=? AND status<>?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_buy_order",
-   "kind": "static",
-   "line": 9213,
+   "line": 9205,
    "module": "paper_trading",
    "read_refs": [
     "paper_orders"
@@ -1312,7 +1228,7 @@
   {
    "function": "_buy_order",
    "kind": "static",
-   "line": 9228,
+   "line": 9220,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1328,43 +1244,7 @@
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_buy_order",
-   "kind": "static",
-   "line": 9286,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
    "sql": "UPDATE paper_signals SET status='shadow_q3', reason=?, payload=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_buy_order",
-   "kind": "static",
-   "line": 9315,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_buy_order",
-   "kind": "static",
-   "line": 9323,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?",
    "write_targets": [
     "paper_signals"
    ]
@@ -1372,7 +1252,7 @@
   {
    "function": "process_pending_execution_orders",
    "kind": "static",
-   "line": 9477,
+   "line": 9463,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1384,7 +1264,7 @@
   {
    "function": "process_pending_execution_orders",
    "kind": "static",
-   "line": 9498,
+   "line": 9484,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1396,7 +1276,7 @@
   {
    "function": "execute_open",
    "kind": "static",
-   "line": 9651,
+   "line": 9637,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1408,7 +1288,7 @@
   {
    "function": "_bootstrap_signals_for_today",
    "kind": "static",
-   "line": 10467,
+   "line": 10453,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1420,7 +1300,7 @@
   {
    "function": "_bootstrap_signals_for_today",
    "kind": "static",
-   "line": 10478,
+   "line": 10464,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1430,21 +1310,9 @@
    ]
   },
   {
-   "function": "monitor_fast_entries",
-   "kind": "static",
-   "line": 11785,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=?,payload=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
    "function": "_weekly_review",
    "kind": "static",
-   "line": 12377,
+   "line": 12364,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1456,7 +1324,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12570,
+   "line": 12557,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1468,7 +1336,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12582,
+   "line": 12569,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1480,7 +1348,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12594,
+   "line": 12581,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1492,7 +1360,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12606,
+   "line": 12593,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1504,7 +1372,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12621,
+   "line": 12608,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1516,7 +1384,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12633,
+   "line": 12620,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1528,7 +1396,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12650,
+   "line": 12637,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1540,7 +1408,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14118,
+   "line": 14105,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1552,7 +1420,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14155,
+   "line": 14142,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1564,7 +1432,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14184,
+   "line": 14171,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1576,7 +1444,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14212,
+   "line": 14199,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1588,7 +1456,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14226,
+   "line": 14213,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1600,7 +1468,7 @@
   {
    "function": "set_account_style",
    "kind": "static",
-   "line": 14300,
+   "line": 14287,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1612,7 +1480,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14323,
+   "line": 14310,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1624,7 +1492,7 @@
   {
    "function": "set_accounts_status",
    "kind": "dynamic",
-   "line": 14323,
+   "line": 14310,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1636,7 +1504,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14326,
+   "line": 14313,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1696,7 +1564,7 @@
   {
    "function": "conflict_statement",
    "kind": "static",
-   "line": 157,
+   "line": 160,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1708,7 +1576,7 @@
   {
    "function": "conflict_statement",
    "kind": "dynamic",
-   "line": 157,
+   "line": 160,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1720,7 +1588,7 @@
   {
    "function": "conflict_statement",
    "kind": "static",
-   "line": 160,
+   "line": 163,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1732,7 +1600,7 @@
   {
    "function": "conflict_statement",
    "kind": "dynamic",
-   "line": 160,
+   "line": 163,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1744,7 +1612,7 @@
   {
    "function": "expire_for_expired_order",
    "kind": "static",
-   "line": 469,
+   "line": 472,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1756,7 +1624,7 @@
   {
    "function": "expire_stale_signal",
    "kind": "static",
-   "line": 478,
+   "line": 481,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1768,7 +1636,7 @@
   {
    "function": "reconcile_signal_status",
    "kind": "static",
-   "line": 491,
+   "line": 494,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1780,7 +1648,7 @@
   {
    "function": "write_payload",
    "kind": "static",
-   "line": 507,
+   "line": 510,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1792,7 +1660,7 @@
   {
    "function": "reopen_for_retry",
    "kind": "static",
-   "line": 519,
+   "line": 522,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1804,7 +1672,7 @@
   {
    "function": "reopen_for_retry",
    "kind": "dynamic",
-   "line": 519,
+   "line": 522,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1816,7 +1684,7 @@
   {
    "function": "expire_after_order_retry",
    "kind": "static",
-   "line": 532,
+   "line": 535,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1828,7 +1696,7 @@
   {
    "function": "expire_after_order_retry",
    "kind": "dynamic",
-   "line": 532,
+   "line": 535,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1840,7 +1708,7 @@
   {
    "function": "terminate_for_dispatch",
    "kind": "static",
-   "line": 548,
+   "line": 551,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1851,28 +1719,84 @@
   },
   {
    "function": "retire_waitlist_signals",
-   "kind": "dynamic",
-   "line": 560,
+   "kind": "static",
+   "line": 567,
    "module": "signal_service",
-   "read_refs": [
-    "paper_orders"
-   ],
+   "read_refs": [],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN (",
    "write_targets": [
     "paper_signals"
    ]
   },
   {
    "function": "retire_waitlist_signals",
-   "kind": "static",
-   "line": 560,
+   "kind": "dynamic",
+   "line": 567,
    "module": "signal_service",
-   "read_refs": [
-    "paper_orders"
-   ],
+   "read_refs": [],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ({}) AND status IN ({})",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "defer_for_capacity",
+   "kind": "static",
+   "line": 584,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=?,payload=? WHERE id=?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "defer_for_capacity",
+   "kind": "static",
+   "line": 590,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=? AND status<>?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "defer_for_capacity",
+   "kind": "static",
+   "line": 596,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "reopen_pending",
+   "kind": "static",
+   "line": 604,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='pending',reason=? WHERE id=?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "mark_filled",
+   "kind": "static",
+   "line": 612,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
    "write_targets": [
     "paper_signals"
    ]
@@ -1880,7 +1804,7 @@
   {
    "function": "reject_signal",
    "kind": "static",
-   "line": 575,
+   "line": 620,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1892,7 +1816,7 @@
   {
    "function": "expire_signal",
    "kind": "static",
-   "line": 583,
+   "line": 628,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1904,7 +1828,7 @@
   {
    "function": "update_signal_feedback",
    "kind": "static",
-   "line": 591,
+   "line": 636,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -10773,7 +10697,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 204,
+   "line": 179,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",
@@ -10785,7 +10709,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 205,
+   "line": 180,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",

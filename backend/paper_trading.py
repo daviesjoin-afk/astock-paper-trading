@@ -8308,10 +8308,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             PRuntime.PortfolioRuntimeError,
             PAW.AllocationWeightEvidenceUnavailable) as exc:
         allocation_reason = f"精确组合分配证据不可用：{exc}；本次新增资源已延期"
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-            (allocation_reason, signal["id"]),
-        )
+        SIG.defer_for_capacity(conn, int(signal["id"]), reason=allocation_reason)
         _risk_log(conn, account["id"], code, "buy",
                   "portfolio_allocation_unavailable", allocation_reason,
                   {"intent_kind": allocation_intent_kind,
@@ -8324,10 +8321,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         if not allocation_reason:
             allocation_reason = (
                 "精确 allocation plan 未批准当前资源意图；本次新增资源已延期")
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-            (allocation_reason, signal["id"]),
-        )
+        SIG.defer_for_capacity(conn, int(signal["id"]), reason=allocation_reason)
         _risk_log(conn, account["id"], code, "buy",
                   "portfolio_allocation_deferred", allocation_reason,
                   {"intent_kind": allocation_intent_kind,
@@ -9162,10 +9156,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         hold_reason = dispatch_plan["reason"] or "委托已在执行队列中等待放行"
         _risk_log(conn, account["id"], code, "buy", f"execution_gate_{dispatch_gate}",
                   hold_reason, risk)
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=? AND status<>?",
-            (hold_reason, signal["id"], "deferred_capacity"),
-        )
+        SIG.defer_for_capacity(conn, int(signal["id"]), reason=hold_reason,
+                               unless_status="deferred_capacity")
         return {
             "filled": False, "deferred": True, "execution_gate": dispatch_gate,
             "status": str(dispatch_duplicate.get("status") or dispatch_plan["status"]),
@@ -9271,10 +9263,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             # 挂起单已落库（不预占资金、不占席位）；信号留在复试管道里，
             # 批量窗口开启或人工核验放行后由下一轮扫描继续过闸成交。
             hold_reason = str(dispatch_plan["reason"] or "执行画像挂起，等待放行")
-            conn.execute(
-                "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-                (hold_reason, signal["id"]),
-            )
+            SIG.defer_for_capacity(conn, int(signal["id"]), reason=hold_reason)
             return {
                 "filled": False, "deferred": True,
                 "execution_gate": dispatch_gate, "status": order_status,
@@ -9312,17 +9301,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 )
             else:
                 deferred_reason = "金额/成本约束仅影响本次下单规模，候选保留在等待池；资金、席位或预算释放后按最新行情重新复核"
-            conn.execute("UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?", (deferred_reason, signal["id"]))
+            SIG.defer_for_capacity(conn, int(signal["id"]), reason=deferred_reason)
             return {"filled": False, "deferred": True, "reason": deferred_reason}
         if limit_deferred:
             # PR-10：限价未到的候选必须留在复试管道里（deferred_capacity 属于
             # ENTRY_RETRY_SIGNAL_STATUSES），下一执行窗口会重跑全部闸门；绝不能
             # 打成终态 rejected，否则限价即使到达也无法再复核。
             deferred_reason = str(entry_limit["reason"])
-            conn.execute(
-                "UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?",
-                (deferred_reason, signal["id"]),
-            )
+            SIG.defer_for_capacity(conn, int(signal["id"]), reason=deferred_reason)
             return {
                 "filled": False, "deferred": True, "deferred_limit": True,
                 "reason": deferred_reason,
@@ -11781,9 +11767,10 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     pick["fast_entry_priority"] = marker
                     payload["pick"] = pick
                     payload["fast_entry_observation"] = observation
-                    conn.execute(
-                        "UPDATE paper_signals SET status='deferred_capacity',reason=?,payload=? WHERE id=?",
-                        ("快速通道已确认；等待下一轮三分钟任务最高优先级复核", _json(payload), signal["id"]),
+                    SIG.defer_for_capacity(
+                        conn, int(signal["id"]),
+                        reason="快速通道已确认；等待下一轮三分钟任务最高优先级复核",
+                        payload=_json(payload),
                     )
                     confirmed.append({"code": code, "account_id": account["id"], "valid_until": marker["valid_until"]})
                 else:
@@ -14523,6 +14510,9 @@ def _bind_application_dependencies():
         "position_rows": (PLL, "position_rows"),
         "cancel_order": (POL, "cancel_order"),
         "write_signal_payload": (SIG, "write_payload"),
+        "defer_signal": (SIG, "defer_for_capacity"),
+        "reopen_pending": (SIG, "reopen_pending"),
+        "mark_signal_filled": (SIG, "mark_filled"),
         "record_execution_block": (POL, "record_execution_block"),
         "record_fill_result": (POL, "record_fill_result"),
         "accumulate_realized_pnl": (POL, "accumulate_realized_pnl"),

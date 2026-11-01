@@ -68,7 +68,9 @@ class DependencyContainerContractTests(unittest.TestCase):
                                       # 不再从本模块解析（避免 other 域 → paper 域的新边）。
                                       "cancel_order", "insert_order",
                                       "record_execution_block", "record_fill_result",
-                                      "accumulate_realized_pnl", "write_signal_payload"):
+                                      "accumulate_realized_pnl", "write_signal_payload",
+                                      "defer_signal", "reopen_pending",
+                                      "mark_signal_filled"):
                         continue
                     self.assertIsNotNone(PT._dependency_implementation(field.name))
 

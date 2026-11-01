@@ -79,19 +79,9 @@
   },
   "manual_orders::strategy_fill_failure": {
    "judge": "commit_fill 失败结果",
-   "operation": "成交失败：信号回 deferred_capacity",
-   "targets": {
-    "paper_orders": {
-     "operation": "策略成交失败回写（订单侧）",
-     "owner": "paper_order_ledger",
-     "package": "B"
-    },
-    "paper_signals": {
-     "operation": "成交失败：信号回 deferred_capacity",
-     "owner": "signal_service",
-     "package": "B"
-    }
-   },
+   "operation": "策略成交失败回写（订单侧）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
    "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
   },
   "manual_orders::submit_manual_order": {
@@ -375,13 +365,6 @@
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
-  "paper_trading::monitor_fast_entries": {
-   "judge": "paper_trading 盘中复核",
-   "operation": "快速入场等待：信号 deferred_capacity",
-   "single_owner": "signal_service",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_trading::process_pending_execution_orders": {
    "judge": "paper_trading 执行循环",
    "operation": "执行结果回写信号状态",
@@ -444,6 +427,13 @@
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
+  "signal_service::defer_for_capacity": {
+   "judge": "paper_trading 入场与派发闸门",
+   "operation": "容量/等待：信号转 deferred_capacity（可刷新 payload）",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
   "signal_service::expire_after_order_retry": {
    "judge": "execution_dispatch 重试接管判定",
    "operation": "重试接管：过期信号一并收敛 expired",
@@ -472,6 +462,13 @@
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
+  "signal_service::mark_filled": {
+   "judge": "commit_fill 成交结果",
+   "operation": "成交完成：信号转 filled",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
   "signal_service::reconcile_signal_status": {
    "judge": "paper_trading 对账循环",
    "operation": "信号状态对账",
@@ -491,6 +488,13 @@
    "operation": "重试接管：信号回到复试管道",
    "single_owner": "signal_service",
    "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::reopen_pending": {
+   "judge": "commit_fill 失败结果",
+   "operation": "成交失败回到 pending",
+   "single_owner": "signal_service",
+   "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
   "signal_service::retire_waitlist_signals": {
