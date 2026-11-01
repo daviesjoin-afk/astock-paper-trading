@@ -876,6 +876,30 @@
    ]
   },
   {
+   "function": "adjust_cash",
+   "kind": "static",
+   "line": 168,
+   "module": "paper_shared_cash",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_cycle_capital",
+   "kind": "static",
+   "line": 179,
+   "module": "paper_shared_cash",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
    "function": "_ensure_accounts",
    "kind": "static",
    "line": 1909,
@@ -912,21 +936,9 @@
    ]
   },
   {
-   "function": "_reconcile_shared_cash",
-   "kind": "static",
-   "line": 2006,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2069,
+   "line": 2066,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -938,7 +950,7 @@
   {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2082,
+   "line": 2079,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -950,19 +962,7 @@
   {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2108,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "_ensure_cycle",
-   "kind": "static",
-   "line": 2142,
+   "line": 2136,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -974,7 +974,7 @@
   {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2157,
+   "line": 2151,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -986,7 +986,7 @@
   {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2174,
+   "line": 2168,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -998,7 +998,7 @@
   {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2220,
+   "line": 2214,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1010,7 +1010,7 @@
   {
    "function": "_ensure_cycle",
    "kind": "static",
-   "line": 2235,
+   "line": 2229,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1022,7 +1022,7 @@
   {
    "function": "_shared_risk_state",
    "kind": "static",
-   "line": 2634,
+   "line": 2628,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1034,7 +1034,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12539,
+   "line": 12533,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1046,7 +1046,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12551,
+   "line": 12545,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1058,7 +1058,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12563,
+   "line": 12557,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1070,7 +1070,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12575,
+   "line": 12569,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1082,7 +1082,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12590,
+   "line": 12584,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1094,7 +1094,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12602,
+   "line": 12596,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1106,7 +1106,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12619,
+   "line": 12613,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1118,7 +1118,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14087,
+   "line": 14081,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1130,19 +1130,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14124,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "create_cycle",
-   "kind": "static",
-   "line": 14153,
+   "line": 14144,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1154,7 +1142,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14181,
+   "line": 14172,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1164,21 +1152,9 @@
    ]
   },
   {
-   "function": "configure_capital",
-   "kind": "static",
-   "line": 14195,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
    "function": "set_account_style",
    "kind": "static",
-   "line": 14269,
+   "line": 14257,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1190,31 +1166,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14292,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_accounts_status",
-   "kind": "dynamic",
-   "line": 14292,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE {}",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_accounts_status",
-   "kind": "static",
-   "line": 14295,
+   "line": 14281,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1255,6 +1207,42 @@
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "detach_cycle",
+   "kind": "static",
+   "line": 82,
+   "module": "paper_user_cycle_attachment",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_status",
+   "kind": "static",
+   "line": 93,
+   "module": "paper_user_cycle_attachment",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_status",
+   "kind": "dynamic",
+   "line": 93,
+   "module": "paper_user_cycle_attachment",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE {}",
    "write_targets": [
     "paper_accounts"
    ]

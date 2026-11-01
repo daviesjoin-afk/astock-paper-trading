@@ -74,3 +74,22 @@ def reconcile_user_cycle_accounts(
                 "user_strategy_cycle_attached",
                 f"用户策略 {user_spec['name']} 接入周期（{user_spec['lifecycle_stage']} 档）",
             )
+
+
+def detach_cycle(conn, account_id, *, now):
+    """账户退出当前周期：清空 cycle_id 并把账户置为暂停、资金归零。"""
+    conn.execute(
+        "UPDATE paper_accounts SET cycle_id=NULL,status='paused',"
+        "initial_cash=0,cash=0,updated_at=? WHERE id=?",
+        (now, account_id),
+    )
+
+
+def set_status(conn, *, status, now, clause, clause_params=()):
+    """账户启停：``clause`` 由调用方给出（活动周期过滤），本入口只落库状态。"""
+    if not clause:
+        raise ValueError("set_status 需要显式过滤条件")
+    return conn.execute(
+        f"UPDATE paper_accounts SET status=?, updated_at=? WHERE {clause}",
+        (status, now, *clause_params),
+    ).rowcount

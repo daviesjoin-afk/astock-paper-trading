@@ -160,3 +160,23 @@ def credit_shared_cash(
         "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
         (amount, now_fn(), account_id),
     )
+
+
+def adjust_cash(conn, account_id, *, delta, now):
+    """按增量调整单个账户现金（对账补偿用）；时间戳由调用方给出。"""
+    conn.execute(
+        "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
+        (delta, now, account_id),
+    )
+
+
+def set_cycle_capital(conn, account_id, *, cycle_id, capital, now):
+    """周期资金配置：在同一周期下把初始资金/现金/基准净值设为同一份额。
+
+    ``WHERE cycle_id=? AND id=?`` 保留原保护 —— 账户已经切到别的周期时不写。
+    """
+    return conn.execute(
+        "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=?"
+        " WHERE cycle_id=? AND id=?",
+        (capital, capital, capital, now, cycle_id, account_id),
+    ).rowcount

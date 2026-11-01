@@ -2002,10 +2002,7 @@ def _reconcile_shared_cash(conn, cycle_id):
                 _num(row.get("initial_cash")) / weight_total
                 if funded else 1.0 / max(len(targets), 1)
             )
-            conn.execute(
-                "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
-                (drift * weight, _now(), row["id"]),
-            )
+            PSC.adjust_cash(conn, row["id"], delta=drift * weight, now=_now())
     else:
         # Remove excess cash without making any attribution bucket negative.
         # This is intentionally equivalent to a shared-pool debit, not a
@@ -2104,10 +2101,7 @@ def _ensure_cycle(conn):
         if current is None:
             continue
         if account_id not in enabled_ids and current["cycle_id"] == active["id"]:
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-                (_now(), account_id),
-            )
+            PUCA.detach_cycle(conn, account_id, now=_now())
             continue
         style = current["style"] if ACS.has_style(current["style"]) else spec["default_style"]
         # 旧版数据库新增列的默认值为 pullback；给日内模型纠正为强势风格，且不影响已有成交。
@@ -14113,10 +14107,7 @@ def create_cycle(conn, capital, status="paused", reason="新建模拟周期", du
         if spec is None:
             spec = _spec_for(account_id, conn=conn)
         if account_id not in enabled_strategies:
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-                (now, account_id),
-            )
+            PUCA.detach_cycle(conn, account_id, now=now)
             continue
         override = (RSET.get(conn, "strategy_overrides", {}) or {}).get(account_id, {})
         max_positions = int(override.get("max_positions", spec["max_positions"]))
@@ -14184,11 +14175,8 @@ def configure_capital(capital):
         for account_id in active_ids:
             share = (round(capital * shares.get(account_id, 0.0), 2)
                      if shares else fallback_share)
-            conn.execute(
-                "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=?"
-                " WHERE cycle_id=? AND id=?",
-                (share, share, share, _now(), cycle["id"], account_id),
-            )
+            PSC.set_cycle_capital(conn, account_id, cycle_id=cycle["id"],
+                                  capital=share, now=_now())
             conn.execute(
                 # 只改该账户**最近一条**净值行：草稿期改资金不该重写历史净值曲线。
                 "UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE id=("
@@ -14281,10 +14269,8 @@ def set_accounts_status(status, capital=None):
         if status == "paused" and cycle["status"] != "running":
             raise ValueError("当前周期并未运行，无需再次暂停")
         active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
-        conn.execute(
-            f"UPDATE paper_accounts SET status=?, updated_at=? WHERE {active_clause}",
-            (status, _now(), *active_ids),
-        )
+        PUCA.set_status(conn, status=status, now=_now(),
+                        clause=active_clause, clause_params=tuple(active_ids))
         conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
                      (status, _now() if status == "running" else None, _now(), cycle["id"]))
         audit(conn, None, "accounts_" + status, f"{len(active_ids)}套当前策略模拟盘状态变更")
