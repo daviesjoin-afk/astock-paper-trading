@@ -4445,3 +4445,19 @@ paper_slot_service.run_preflight
 `foundation_violations` 0；预算未放宽。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第三批：预占释放回调注入覆盖执行派发（2026-11-01）
+
+`execution_dispatch` 的三条公开入口（`run_execution_dispatch` / `retire_gated_orders` /
+`resolve_verification`）以及内部 `_terminate` / `_retire_for_retry` 现在都接收必填的
+`release_reservation` 回调；`_release_reservation` 只保留时钟与 `sqlite3.Error` 容忍，
+不再持有预占 SQL。注入点：`paper_trading`（`retire_gated_orders`、`resolve_verification`）
+与 `paper_slot_service`（`run_execution_dispatch`），两者本来就在 paper 域，不新增跨域边。
+
+至此 `paper_capital_reservations` 的运行时写入方**只有 owner 一个**，守卫把它从
+`pending` 收紧为 `owned`，释放 UPDATE 的例外集合清空。
+
+**实测**：`paper_capital_reservations` 单写方；`cross_domain_edges` 629（不变）；
+`foundation_violations` 0；预算未放宽。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

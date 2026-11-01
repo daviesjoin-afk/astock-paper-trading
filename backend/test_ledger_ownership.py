@@ -61,12 +61,11 @@ OWNERSHIP = {
         ),
     },
     "paper_capital_reservations": {
-        "status": "pending",
-        "writers": {"paper_capital_reservations", "execution_dispatch"},
+        "status": "owned",
+        "writers": {"paper_capital_reservations"},
         "note": (
-            "PR-10 已收敛 paper_trading 与 entry_lifecycle 两处：后者改为由调用方注入 "
-            "release 回调（foundation 层不反向依赖业务 owner）。剩下的 execution_dispatch "
-            "因为 execution→paper 会新增跨域边（预算已满），仍待注入回调"
+            "PR-10 三批收敛完成：paper_trading / entry_lifecycle / execution_dispatch 都改为"
+            "调用装配层注入的 release 回调，预占表只剩 owner 一个运行时写入方"
         ),
     },
     "paper_risk_decisions": {
@@ -159,10 +158,8 @@ class LedgerWriteOwnershipTests(unittest.TestCase):
                 self.assertEqual(actual, spec["writers"],
                                  f"{table} 声明为单写方但实际写入方是 {sorted(actual)}")
 
-    #: 已知例外（精确列出：多一个变红、少一个也变红）。
-    #: ``execution_dispatch`` 导入 paper 域 owner 会新增跨域边（预算已用满），
-    #: 下一步同样用「调用方注入 release 回调」解决。
-    RESERVATION_RELEASE_EXCEPTIONS = {"execution_dispatch"}
+    #: 例外集合必须为空：三批迁移后，预占释放的 UPDATE 只允许出现在 owner 内。
+    RESERVATION_RELEASE_EXCEPTIONS: set[str] = set()
 
     def test_reservation_release_has_a_single_implementation(self):
         """同一句释放 UPDATE 只允许 owner + 一个已登记的 foundation 例外。"""

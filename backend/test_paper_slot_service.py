@@ -54,7 +54,7 @@ class PreflightTests(unittest.TestCase):
         day = dt.date(2026, 9, 11)
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=lambda conn, asof_day, release_reservation: events.append("signals")), \
              mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn, release_reservation: events.append("orders")), \
-             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn: events.append("dispatch")):
+             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),
                 audit=lambda *args: None,
@@ -70,7 +70,7 @@ class PreflightTests(unittest.TestCase):
         events = []
         audits = []
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=RuntimeError("boom")), \
-             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn: events.append("dispatch")):
+             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((actor, event, detail)),
@@ -87,7 +87,7 @@ class PreflightTests(unittest.TestCase):
         audits = []
         resolver = mock.Mock(side_effect=ValueError("bad date"))
         with mock.patch.object(PSS.ELC, "expire_stale_signals") as signals, \
-             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn: events.append("dispatch")):
+             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((event, detail)),
