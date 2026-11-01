@@ -288,8 +288,10 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 | 终态信号的遗留活动委托回收 | `execution_dispatch.supersede_for_terminal_signal(conn, order_id, *, reason)` | `ENTRY_RETRY_ORDER_STATUSES` 七状态保护、`reason` 前缀拼接 |
 | 信号状态对账 | `signal_service.reconcile_signal_status(conn, signal_id, *, status)` | `WHERE status<>?`（已是目标态则整行不动，不刷原因）与原固定原因 |
 
-* 三条 SQL 逐字保留；占位符按 `ENTRY_RETRY_ORDER_STATUSES` 长度静态展开（7 个），
-  守卫测试比对"元组长度 = 占位符数"，改词表会立刻变红。
+* 三条 SQL 逐字保留；占位符按 `ENTRY_RETRY_ORDER_STATUSES` 长度静态展开（7 个）。
+  状态**取值**仍来自唯一词表（SQL 里没有第二份状态字符串）。维护代价是明确的、有限的：
+  集合**长度**变化时必须同步占位符数量；只改状态值而不改长度则不需要改 SQL，
+  长度守卫也不会因此报错。该守卫只防参数数量漂移，不单独证明状态集合的业务语义。
 * "哪条算最新重试"、终态集合、`signal_for_order` 映射、`partially_filled` 不降级规则、
   预占释放调用（`PCR.release_order_reservation` / `_finish_capital_reservation`）、
   `_now()` 读取、统计与返回字典仍留在 `paper_trading`。
@@ -304,7 +306,20 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 `backend/test_signal_order_reconcile_write.py`（12 项）用最小 schema 跑真实对账路径：
 冻结函数与新实现分别执行，比较返回值、三张表完整行、**SQL trace 逐条顺序**与时钟调用次数；
 覆盖重复重试退旧+释放、五类终态信号的回收原因、信号漂移与部分成交不降级、
-无操作行不重写、混合场景、重复执行幂等、缺表早退。没有 schema 或数据迁移，回滚本批提交即可。
+无操作行不重写、混合场景、缺表早退。没有 schema 或数据迁移，回滚本批提交即可。
+
+冻结的边界要说清楚：fixture 冻结的是**函数体**，它调用的 `PSM`、`PCR`、状态常量与
+`_finish_capital_reservation` 仍是当前实现 —— 对本轮未触碰这些依赖的切片是合理边界，
+但不等于整条历史依赖栈都被冻结。
+
+重复执行幂等（本批修正）：同一对连接连跑两轮，**逐轮**对照（第 n 轮旧实现 == 第 n 轮新实现），
+再单独断言跨轮账本不变、第二轮没有 UPDATE、`retry_index` 由 `created` 转 `present`、
+`orders_reconciled` 归零。上一版只在两套新库上各跑一轮再比较首轮快照，第二轮结果被丢弃，
+属于观测缺陷：让实现只在第二轮额外改写 reason 的变异能通过旧写法、被新写法在 `round 2` 判红。
+
+`retry_index` 三态的实际来源：`created` 由本文件各场景首轮断言；`present` 由修正后的第二轮
+断言；`blocked` 由既有 `backend/test_ledger_bootstrap_lifecycle.py` 的专项回归承担
+（该文件对 `SIGNAL_RETRY_INDEX_BLOCKED` 有多处断言），本文件不重复构造。
 
 本批实测：`cross_domain_edges` 629（不变）、`import_cycles`/`foundation_violations` 均0、
 `max_file_lines` 14599→14580、`max_function_lines` 1184、`duplicate_helpers` 296、

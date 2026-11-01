@@ -163,19 +163,21 @@ MIXED = dict(
 class ReconcileParityTests(unittest.TestCase):
     """与 1d41508 冻结函数比较返回值、完整行、SQL 顺序与时钟调用。"""
 
-    def compare(self, scenario, *, repeat=False):
+    def assertRoundEqual(self, expected, actual, *, label=""):
+        """同一轮内新旧实现必须完全一致（返回值、账本行、SQL 顺序、时钟）。"""
+        self.assertEqual(expected["result"], actual["result"], label)
+        self.assertEqual(expected["state"], actual["state"], label)
+        self.assertEqual(expected["sql"], actual["sql"], label)
+        self.assertEqual(expected["clock_calls"], actual["clock_calls"], label)
+        self.assertEqual(expected["in_transaction"], actual["in_transaction"], label)
+
+    def compare(self, scenario):
         legacy, current = _db(**scenario), _db(**scenario)
+        self.addCleanup(legacy.close)
+        self.addCleanup(current.close)
         expected = run(legacy, legacy=True)
-        if repeat:
-            run(legacy, legacy=True)
         actual = run(current, legacy=False)
-        if repeat:
-            run(current, legacy=False)
-        self.assertEqual(expected["result"], actual["result"])
-        self.assertEqual(expected["state"], actual["state"])
-        self.assertEqual(expected["sql"], actual["sql"])
-        self.assertEqual(expected["clock_calls"], actual["clock_calls"])
-        self.assertEqual(expected["in_transaction"], actual["in_transaction"])
+        self.assertRoundEqual(expected, actual)
         return actual
 
     def test_duplicate_retries_keep_newest_and_release_older(self):
@@ -229,9 +231,30 @@ class ReconcileParityTests(unittest.TestCase):
         self.assertFalse(any(sql.startswith("UPDATE") for sql in actual["sql"]))
 
     def test_mixed_scenario_matches_and_repeat_run_is_idempotent(self):
-        first = self.compare(MIXED)
-        second = self.compare(MIXED, repeat=True)
+        """两轮必须逐轮对照：第 n 轮旧实现 == 第 n 轮新实现。
+
+        只在两套新建库上各跑一轮、再比较各自首轮快照，无法发现"第二轮悄悄
+        追加原因"这类污染 —— 那正是本用例上一版漏掉的东西。
+        """
+        legacy, current = _db(**MIXED), _db(**MIXED)
+        self.addCleanup(legacy.close)
+        self.addCleanup(current.close)
+
+        observed = []
+        for round_no in range(2):
+            expected = run(legacy, legacy=True)
+            actual = run(current, legacy=False)
+            self.assertRoundEqual(expected, actual, label=f"round {round_no + 1}")
+            observed.append(actual)
+
+        first, second = observed
+        # 跨轮：账本不再变化，且第二轮没有产生任何 UPDATE。
         self.assertEqual(first["state"], second["state"])
+        self.assertFalse([sql for sql in second["sql"] if sql.startswith("UPDATE")])
+        # 索引三态：首轮创建，次轮报告已存在；第二轮没有可对账的行。
+        self.assertEqual(PSM.SIGNAL_RETRY_INDEX_CREATED, first["result"]["retry_index"])
+        self.assertEqual(PSM.SIGNAL_RETRY_INDEX_PRESENT, second["result"]["retry_index"])
+        self.assertEqual(0, second["result"]["orders_reconciled"])
 
     def test_missing_tables_short_circuits_identically(self):
         results = []
