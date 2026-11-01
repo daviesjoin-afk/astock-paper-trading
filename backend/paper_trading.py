@@ -1905,33 +1905,31 @@ def _ensure_accounts(conn):
     for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         if exists:
-            conn.execute(
-                """UPDATE paper_accounts SET name=?,source_strategy=?,cycle_days=?,
-                   max_weight=?,max_exposure=?,mode=COALESCE(NULLIF(mode,''),?),
-                   risk_profile=? WHERE id=?""",
-                (spec["name"], spec["source_strategy"], spec["cycle_days"],
-                 spec["max_weight"], spec["max_exposure"], spec["mode"], spec["risk_profile"], account_id),
+            PUAP.ensure_profile(
+                conn, account_id, name=spec["name"],
+                source_strategy=spec["source_strategy"], cycle_days=spec["cycle_days"],
+                max_weight=spec["max_weight"], max_exposure=spec["max_exposure"],
+                mode=spec["mode"], risk_profile=spec["risk_profile"],
             )
             # Version only the newly introduced strategy. Existing account
             # versions remain untouched so historical audits are not rewritten
             # by a configuration refresh.
             if spec.get("strategy_version"):
-                conn.execute(
-                    "UPDATE paper_accounts SET version=? WHERE id=?",
-                    (spec["strategy_version"], account_id),
-                )
+                PUAP.set_version(conn, account_id, version=spec["strategy_version"])
             continue
         now = _now()
         if benchmark is _BENCHMARK_UNRESOLVED:
             benchmark = _benchmark_close()
-        conn.execute(
-            """INSERT INTO paper_accounts
-            (id,name,source_strategy,status,initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,risk_profile,version,benchmark_start,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (account_id, spec["name"], spec["source_strategy"], configured_status, configured_share, configured_share,
-             spec["cycle_days"], spec["max_positions"], spec["max_weight"], spec["max_exposure"],
-             spec["risk_profile"], spec.get("strategy_version") or "v3.0", benchmark, now, now),
-        )
+        PUAP.insert_account(conn, fields={
+            "id": account_id, "name": spec["name"],
+            "source_strategy": spec["source_strategy"], "status": configured_status,
+            "initial_cash": configured_share, "cash": configured_share,
+            "cycle_days": spec["cycle_days"], "max_positions": spec["max_positions"],
+            "max_weight": spec["max_weight"], "max_exposure": spec["max_exposure"],
+            "risk_profile": spec["risk_profile"],
+            "version": spec.get("strategy_version") or "v3.0",
+            "benchmark_start": benchmark, "created_at": now, "updated_at": now,
+        })
         conn.execute(
             "INSERT OR IGNORE INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
             (account_id, dt.date.today().isoformat(), configured_share, 0.0, configured_share, benchmark, now),
@@ -2210,10 +2208,8 @@ def _ensure_cycle(conn):
                         repairs.append(f"共享池参考资金 ¥{reference_capital:,.2f}")
                 if repairs:
                     now = _now()
-                    conn.execute(
-                        "UPDATE paper_accounts SET style=?,params=?,updated_at=? WHERE id=?",
-                        (desired_style, _json(params), now, account_id),
-                    )
+                    PAC.set_style(conn, account_id, style=desired_style,
+                                  params=_json(params), now=now)
                     conn.execute(
                         "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
                         (active["id"], account_id, spec.get("strategy_version") or "v2.0", desired_style,
@@ -2625,7 +2621,7 @@ def _shared_risk_state(conn, account, nav, asof_day, *, cycle_id=None):
         # 池级回撤冷却所有账户：回撤是按池 NAV 计算的，单一账户触发
         # 说明整个资金池处于回撤状态；只冷却触发者会让其他账户继续
         # 在回撤底部加仓。
-        conn.execute("UPDATE paper_accounts SET cooldown_until=?", (until,))
+        PAC.set_cooldown(conn, cooldown_until=until)
         account["cooldown_until"] = until
         cooldown_until, cooldown_active = until, True
         reasons.append(f"回撤风控冷却期至 {until}，暂停新开仓")

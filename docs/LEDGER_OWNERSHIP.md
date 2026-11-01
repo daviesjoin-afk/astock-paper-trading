@@ -454,12 +454,12 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_accounts` | 共享现金回补 | `paper_shared_cash::credit_shared_cash` | paper_shared_cash 资金规则 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
 | `paper_accounts` | 共享现金扣减 | `paper_shared_cash::debit_shared_cash` | paper_shared_cash 资金规则 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
 | `paper_accounts` | 周期资金配置（初始资金/现金/基准净值） | `paper_shared_cash::set_cycle_capital` | 配置入口校验 | `paper_shared_cash` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 内置账户创建与字段补齐 | `paper_trading::_ensure_accounts` | paper_trading 账户引导 | `paper_user_account_provisioning` | 启动恢复/初始化连接 | `test_execution_verification_probe`、`test_paper_user_account_provisioning` |
 | `paper_accounts` | legacy 引导：账户 cycle_id 清空与暂停 | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_user_cycle_attachment` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
-| `paper_accounts` | 账户冷却窗口 cooldown_until | `paper_trading::_shared_risk_state` | paper_trading 风控状态 | `paper_account_config` | 调用方同一连接与原事务 | `test_cycle_funds`、`test_r32e1_active_buy_provenance`、`test_strategy_buy_commit_convergence` |
 | `paper_accounts` | 新建周期时账户挂接重置 | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
 | `paper_accounts` | 账户风格字段 | `paper_trading::set_account_style` | 配置入口校验 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 用户策略账户创建（INSERT） | `paper_user_account_provisioning::provision_user_accounts` | provisioning 规则 | `paper_user_account_provisioning` | 服务入口传入的连接 | `test_paper_user_account_provisioning` |
+| `paper_accounts` | 既有账户档案字段补齐（mode 为空才写默认） | `paper_user_account_provisioning::ensure_profile` | 账号引导规则 | `paper_user_account_provisioning` | 启动引导 / 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 账户创建（内置/用户策略，列白名单） | `paper_user_account_provisioning::insert_account` | 账号引导与 provisioning 规则 | `paper_user_account_provisioning` | 启动引导 / 调用方同一连接与原事务 | `test_paper_shared_cash`、`test_paper_user_cycle_attachment` |
+| `paper_accounts` | 新策略首次版本号写入 | `paper_user_account_provisioning::set_version` | 账号引导规则 | `paper_user_account_provisioning` | 启动引导 / 调用方同一连接与原事务 | `test_execution_evidence`、`test_execution_planner`、`test_order_cycle_provenance` |
 | `paper_accounts` | 账户退出周期（cycle_id 清空 + 暂停 + 资金归零） | `paper_user_cycle_attachment::detach_cycle` | paper_trading 周期引导/创建 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | 待补 |
 | `paper_accounts` | 用户账户周期挂接对账 | `paper_user_cycle_attachment::reconcile_user_cycle_accounts` | 账户挂接规则 | `paper_user_cycle_attachment` | 服务入口传入的连接 | `test_paper_user_cycle_attachment` |
 | `paper_accounts` | 账户启停状态（活动周期过滤） | `paper_user_cycle_attachment::set_status` | 启停入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_learning_evaluation` |

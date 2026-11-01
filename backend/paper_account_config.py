@@ -39,17 +39,29 @@ def write_params(conn, account_id, *, params, now=None, version=None):
     )
 
 
-def set_style(conn, account_id, *, style, now):
-    """写账户风格字段。"""
-    conn.execute(
-        "UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?",
-        (style, now, account_id),
-    )
+def set_style(conn, account_id, *, style, now, params=None):
+    """写账户风格字段；``params`` 给出时同一语句里一并刷新参数快照。"""
+    if params is None:
+        conn.execute(
+            "UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?",
+            (style, now, account_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE paper_accounts SET style=?,params=?,updated_at=? WHERE id=?",
+            (style, params, now, account_id),
+        )
 
 
-def set_cooldown(conn, account_id, *, cooldown_until):
-    """写共享风控冷却窗口。"""
-    conn.execute(
-        "UPDATE paper_accounts SET cooldown_until=? WHERE id=?",
-        (cooldown_until, account_id),
-    )
+def set_cooldown(conn, *, cooldown_until, account_id=None):
+    """写共享风控冷却窗口；``account_id`` 为空表示整池（原始语义）。"""
+    if account_id is None:
+        conn.execute(
+            "UPDATE paper_accounts SET cooldown_until=?",
+            (cooldown_until,),
+        )
+    else:
+        conn.execute(
+            "UPDATE paper_accounts SET cooldown_until=? WHERE id=?",
+            (cooldown_until, account_id),
+        )
