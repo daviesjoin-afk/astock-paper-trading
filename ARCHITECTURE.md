@@ -4515,3 +4515,22 @@ owner 不提交事务，补偿调用方仍只容忍原 `sqlite3.Error`。
 不扩大解释为覆盖所有运行时拼接 SQL。没有 schema 或数据迁移，没有交易时段验证。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第七批 订单自身过期的终态写入（2026-11-01）
+
+只迁移 `entry_lifecycle.expire_stale_orders` 的持久化部分：订单 UPDATE 交给
+`execution_dispatch.expire_order`，关联信号 UPDATE 交给
+`signal_service.expire_for_expired_order`。组装根利用已有 EPD/SIG 依赖注入必填回调，
+生命周期层继续判断过期资格；不新增基础层反向 import。
+
+预占→订单→关联信号的 SQL 顺序、原因、时钟、期限边界、状态和统计均保留。
+两个写入口使用传入连接，不读当前周期、不取时钟、不提交、不统一异常处理。
+`expire_stale_signals` 原样保留，信号失效回收订单仍为 superseded，区别于本路径 expired。
+orders/signals 继续 pending，操作级守卫只覆盖本切片。
+
+同时将此前漏列的 cycles 补入 pending 矩阵：主入口负责创建/配置/状态及兼容引导，
+周期服务负责归档；登记读侧口径和事务边界，不认定分阶段写入为缺陷，不迁移周期逻辑。
+冻结对照与覆盖说明见 `docs/LEDGER_OWNERSHIP.md` 第 11、12 节。
+PR-10 其他阶段与读取侧仍待验收，尚未进入 PR-11；未做交易时段验证。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

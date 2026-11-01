@@ -284,6 +284,8 @@ def expire_stale_orders(
     conn,
     *,
     release_reservation: Callable[..., Any],
+    expire_order: Callable[..., Any],
+    expire_signal: Callable[..., Any],
     now: dt.datetime | None = None,
     ttl_minutes: float = ORDER_TTL_MINUTES,
 ) -> dict[str, Any]:
@@ -309,19 +311,10 @@ def expire_stale_orders(
         order_id = int(row["id"])
         reason = "委托超过时限未成交，自动作废并释放预占"
         _release_reservation(conn, order_id, release_reservation)
-        conn.execute(
-            """UPDATE paper_orders
-                  SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
-                WHERE id=?""",
-            (ORDER_EXPIRED_STATUS, reason, moment.isoformat(timespec="seconds"), order_id),
-        )
+        expire_order(conn, order_id, reason=reason, cancelled_at=moment.isoformat(timespec="seconds"))
         signal_id = row.get("signal_id")
         if signal_id is not None and str(row.get("signal_status") or "") not in ("filled",):
-            conn.execute(
-                """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
-                    WHERE id=? AND status IN (?,?,?)""",
-                (SIGNAL_EXPIRED_STATUS, reason, int(signal_id), *RETRY_SIGNAL_STATUSES),
-            )
+            expire_signal(conn, int(signal_id), reason=reason)
         summary["expired"] += 1
     return summary
 

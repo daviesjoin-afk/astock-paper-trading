@@ -9,8 +9,10 @@ from unittest import mock
 
 try:
     import paper_slot_service as PSS
+    import signal_service as SIG
 except ImportError:
     from . import paper_slot_service as PSS
+    from . import signal_service as SIG
 
 
 class _Conn:
@@ -53,10 +55,10 @@ class PreflightTests(unittest.TestCase):
         events = []
         day = dt.date(2026, 9, 11)
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=lambda conn, asof_day, release_reservation: events.append("signals")), \
-             mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn, release_reservation: events.append("orders")), \
+             mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn, release_reservation, expire_order, expire_signal: events.append("orders")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
-                db_factory=self._factory(events),
+                expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda *args: None,
                 resolve_asof_day=lambda: day,
             )
@@ -72,7 +74,7 @@ class PreflightTests(unittest.TestCase):
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=RuntimeError("boom")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
-                db_factory=self._factory(events),
+                expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((actor, event, detail)),
                 resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
@@ -89,7 +91,7 @@ class PreflightTests(unittest.TestCase):
         with mock.patch.object(PSS.ELC, "expire_stale_signals") as signals, \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn, release_reservation: events.append("dispatch")):
             result = PSS.run_preflight(
-                db_factory=self._factory(events),
+                expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((event, detail)),
                 resolve_asof_day=resolver,
             )
@@ -106,7 +108,7 @@ class PreflightTests(unittest.TestCase):
              mock.patch.object(PSS.ELC, "expire_stale_orders", return_value=None), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=ValueError("bad dispatch")):
             result = PSS.run_preflight(
-                db_factory=self._factory(events),
+                expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((event, detail)),
                 resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
@@ -118,7 +120,7 @@ class PreflightTests(unittest.TestCase):
         with mock.patch.object(PSS.ELC, "expire_stale_signals", side_effect=RuntimeError("boom")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", return_value=None):
             result = PSS.run_preflight(
-                db_factory=self._factory(events),
+                expire_order=PSS.EPD.expire_order, expire_signal=SIG.expire_for_expired_order, db_factory=self._factory(events),
                 audit=mock.Mock(side_effect=RuntimeError("audit unavailable")),
                 resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
@@ -278,7 +280,7 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIsInstance(validate[0].args[0], ast.Name)
         self.assertEqual("slot", validate[0].args[0].id)
 
-        # C. preflight 委托，并锁住三个 keyword 依赖（只看函数名会丢掉依赖保护）
+        # C. preflight 委托与明确的过期写入 owner 绑定。
         preflight = calls.get("PSS.run_preflight") or []
         self.assertEqual(1, len(preflight), "run_slot 必须且只能委托一次 PSS.run_preflight")
         keywords = {kw.arg: kw.value for kw in preflight[0].keywords}
@@ -286,6 +288,8 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertEqual("_db", keywords["db_factory"].id)
         self.assertIsInstance(keywords.get("audit"), ast.Name)
         self.assertEqual("audit", keywords["audit"].id)
+        self.assertEqual("EPD.expire_order", _dotted_name(keywords.get("expire_order")))
+        self.assertEqual("SIG.expire_for_expired_order", _dotted_name(keywords.get("expire_signal")))
         resolver = keywords.get("resolve_asof_day")
         self.assertIsInstance(resolver, ast.Lambda)
         self.assertEqual([], resolver.args.args)
