@@ -323,6 +323,8 @@ def expire_stale_signals(
     conn,
     *,
     release_reservation: Callable[..., Any],
+    expire_signal: Callable[..., Any],
+    supersede_order: Callable[..., Any],
     now: dt.datetime | None = None,
     ttl_minutes: float = SIGNAL_TTL_MINUTES,
     asof_day=None,
@@ -355,11 +357,7 @@ def expire_stale_signals(
             f"信号属于 {signal_day}，跨交易日失效"
             if expired_day else str(freshness["reason"])
         )
-        conn.execute(
-            """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
-                WHERE id=? AND status IN (?,?,?)""",
-            (SIGNAL_EXPIRED_STATUS, reason, int(row["id"]), *RETRY_SIGNAL_STATUSES),
-        )
+        expire_signal(conn, int(row["id"]), reason=reason)
         summary["expired"] += 1
     # 回收已失效信号名下的活动买单。
     stale = conn.execute(
@@ -372,12 +370,6 @@ def expire_stale_signals(
     for row in stale:
         order_id = int(row["id"])
         _release_reservation(conn, order_id, release_reservation)
-        conn.execute(
-            """UPDATE paper_orders
-                  SET status='superseded',reason=COALESCE(reason,'') || '；信号已失效，委托回收',
-                      cancelled_at=?
-                WHERE id=? AND status IN (?,?,?,?,?)""",
-            (moment.isoformat(timespec="seconds"), order_id, *RECOVERABLE_ORDER_STATUSES),
-        )
+        supersede_order(conn, order_id, cancelled_at=moment.isoformat(timespec="seconds"))
         summary["orders_cancelled"] += 1
     return summary

@@ -1,0 +1,103 @@
+# Frozen before PR-10 batch 8, master 71584c84e142e3fea9d1b8690372db87270a93ce
+
+def expire_stale_orders(
+    conn,
+    *,
+    release_reservation: Callable[..., Any],
+    expire_order: Callable[..., Any],
+    expire_signal: Callable[..., Any],
+    now: dt.datetime | None = None,
+    ttl_minutes: float = ORDER_TTL_MINUTES,
+) -> dict[str, Any]:
+    """把超龄的活动买单作废并释放预占；关联信号转终态 ``expired``。"""
+    moment = now or _now()
+    summary = {
+        "checked": 0, "expired": 0, "version": ENTRY_LIFECYCLE_VERSION,
+        "ttl_minutes": ttl_minutes,
+    }
+    for row in _order_rows(conn, ",".join("?" for _ in RECOVERABLE_ORDER_STATUSES)):
+        summary["checked"] += 1
+        # 显式 expires_at（gated / 手动限价单）优先；否则按委托创建时间 + TTL。
+        deadline: dt.datetime | None = None
+        explicit = _parse_deadline(row.get("expires_at"))
+        if explicit is not None:
+            deadline = explicit
+        else:
+            created = _parse_ts(row.get("created_at"))
+            if created is not None:
+                deadline = created + dt.timedelta(minutes=ttl_minutes)
+        if deadline is None or moment <= deadline:
+            continue
+        order_id = int(row["id"])
+        reason = "委托超过时限未成交，自动作废并释放预占"
+        _release_reservation(conn, order_id, release_reservation)
+        expire_order(conn, order_id, reason=reason, cancelled_at=moment.isoformat(timespec="seconds"))
+        signal_id = row.get("signal_id")
+        if signal_id is not None and str(row.get("signal_status") or "") not in ("filled",):
+            expire_signal(conn, int(signal_id), reason=reason)
+        summary["expired"] += 1
+    return summary
+
+
+def expire_stale_signals(
+    conn,
+    *,
+    release_reservation: Callable[..., Any],
+    now: dt.datetime | None = None,
+    ttl_minutes: float = SIGNAL_TTL_MINUTES,
+    asof_day=None,
+) -> dict[str, Any]:
+    """把超过 TTL / 跨交易日的复试管道信号收敛为 ``expired``，并回收其买单。
+
+    - 传入 ``asof_day`` 时：信号日期不等于当前交易日即失效（跨日信号禁止开仓）；
+    - 未传入时：按 ``ttl_minutes`` 年龄失效。
+    """
+    moment = now or _now()
+    summary = {
+        "checked": 0, "expired": 0, "orders_cancelled": 0,
+        "version": ENTRY_LIFECYCLE_VERSION, "ttl_minutes": ttl_minutes,
+    }
+    placeholders = ",".join("?" for _ in RETRY_SIGNAL_STATUSES)
+    rows = conn.execute(
+        f"""SELECT id,code,account_id,intended_date,signal_date,created_at,status
+              FROM paper_signals WHERE status IN ({placeholders})""",
+        RETRY_SIGNAL_STATUSES,
+    ).fetchall()
+    for row in rows:
+        summary["checked"] += 1
+        signal = dict(row)
+        signal_day = str(signal.get("intended_date") or signal.get("signal_date") or "")[:10]
+        expired_day = bool(asof_day and signal_day and signal_day != str(asof_day)[:10])
+        freshness = signal_freshness(signal, now=moment, ttl_minutes=ttl_minutes)
+        if not expired_day and freshness["usable"]:
+            continue
+        reason = (
+            f"信号属于 {signal_day}，跨交易日失效"
+            if expired_day else str(freshness["reason"])
+        )
+        conn.execute(
+            """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
+                WHERE id=? AND status IN (?,?,?)""",
+            (SIGNAL_EXPIRED_STATUS, reason, int(row["id"]), *RETRY_SIGNAL_STATUSES),
+        )
+        summary["expired"] += 1
+    # 回收已失效信号名下的活动买单。
+    stale = conn.execute(
+        """SELECT o.id FROM paper_orders o
+             JOIN paper_signals s ON s.id=o.signal_id
+            WHERE o.side='buy' AND o.status IN (?,?,?,?,?)
+              AND s.status IN ('expired','superseded','rejected','blocked','shadow_q3')""",
+        RECOVERABLE_ORDER_STATUSES,
+    ).fetchall()
+    for row in stale:
+        order_id = int(row["id"])
+        _release_reservation(conn, order_id, release_reservation)
+        conn.execute(
+            """UPDATE paper_orders
+                  SET status='superseded',reason=COALESCE(reason,'') || '；信号已失效，委托回收',
+                      cancelled_at=?
+                WHERE id=? AND status IN (?,?,?,?,?)""",
+            (moment.isoformat(timespec="seconds"), order_id, *RECOVERABLE_ORDER_STATUSES),
+        )
+        summary["orders_cancelled"] += 1
+    return summary

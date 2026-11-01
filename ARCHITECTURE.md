@@ -4534,3 +4534,18 @@ orders/signals 继续 pending，操作级守卫只覆盖本切片。
 PR-10 其他阶段与读取侧仍待验收，尚未进入 PR-11；未做交易时段验证。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第八批 信号失效及关联订单回收写入（2026-11-01）
+
+只迁移 `entry_lifecycle.expire_stale_signals` 的两条 UPDATE：信号写入归
+`signal_service.expire_stale_signal`，关联订单回收归
+`execution_dispatch.supersede_for_expired_signal`，通过组装根→preflight显式注入必填回调。
+保留全体信号更新后才查询/回收订单的两阶段顺序，回收终态仍为 superseded。
+
+跨日/TTL判定、状态集合、原因、时钟、统计、查询、预占释放、异常及事务不变。
+写入owner不commit、不读时钟或当前周期；订单自身过期路径保留 #315 合并后的实现。
+生命周期层不再直接写订单/信号，写方集合7→6、5→4；整表仍pending，所有其他阶段仍待治理。
+冻结对照及范围见 `docs/LEDGER_OWNERSHIP.md` 第13节；不扩大到成交链或PR-11。
+没有schema或数据迁移，未做真实交易时段验证。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

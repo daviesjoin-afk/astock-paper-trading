@@ -22,8 +22,8 @@
 | `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
 | `paper_risk_decisions` | **owned** | `paper_risk_writes` | 第五批统一来源信息校验及组装；两个 `_risk_log` 只准备快照、策略戳和时间 |
 | `paper_audit` | **owned** | `paper_repository` | 第六批：追加及失败进化操作的清理都归表 owner；补偿方保留事务与异常处理 |
-| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`entry_lifecycle`、`paper_risk_writes` | 订单状态机按生命周期阶段分写 |
-| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`entry_lifecycle`、`signal_service` | 信号同样按阶段分写 |
+| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`paper_risk_writes` | 第八批后生命周期层只判断/编排，过期与失效回收写入已移交，其他阶段仍分写 |
+| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`signal_service` | 第八批后生命周期层不再直写；其他阶段仍分写 |
 | `paper_accounts` | **pending** | `paper_trading`、`paper_shared_cash`、`paper_user_cycle_attachment`、`paper_user_account_provisioning`、`strategy_registry`、`paper_order_execution_authority`、`paper_cycle_ownership`、`adaptive_engine`、`adaptive_risk`、`adaptive_selection`、`adaptive_selection_compat`、`evolution_apply`、`ai_adoption_writer` | 不同 owner 各写自己的字段（现金/周期挂接/策略参数） |
 | `paper_cycles` | **pending** | `paper_trading`、`paper_cycle_service` | 第七批补核查：创建/配置/启停及兼容补齐 vs 周期归档，按阶段登记，不据此认定多写缺陷 |
 
@@ -215,3 +215,32 @@ orders/signals 整表仍为 **pending**，原写入模块集合不增加；新�
 新增未登记写入；新增只读连接测试验证活动周期/显式空周期读取不能创建或修改账本。
 这不是 cycles 已完成单写方或所有读取路径收口的结论。PR-10 后续仍须逐阶段治理订单、
 信号、账户字段，并逐表核验周期、读取口径和动态 SQL；完成 PR-10 验收后才进入 PR-11。
+
+## 13. 第八批 信号失效与关联订单回收的持久化
+
+基线 `master` @ `71584c8`（#315 合并后）。只迁移 `entry_lifecycle.expire_stale_signals`
+中的两条 UPDATE：`signal_service.expire_stale_signal(conn, signal_id, *, reason)`
+负责原重试状态信号写 expired；`execution_dispatch.supersede_for_expired_signal(conn, order_id, *, cancelled_at)`
+负责按原状态集合将关联活动买单写 superseded，并追加原固定回收原因。
+原 SQL、状态条件和参数顺序均保留，不给信号增加时间字段，不提供任意 set_status。
+
+组装根使用已有 SIG/EPD 依赖，经 preflight 显式注入两个新增必填回调；没有内部 SQL
+回退或默认空操作。新接口使用传入连接、不读时钟或当前周期、不提交、不吞异常。
+信号失效的跨日/TTL判断、原因文本、统计位置、查询、时钟继续由生命周期层负责。
+
+严格保留两阶段：先扫描并更新**所有**失效信号，再查询其活动买单，逐单释放预占并写
+superseded。不能改为逐信号交错回收。后续信号写失败时仍不进入订单回收阶段；
+释放预占的 SQLite 错误仍按原逻辑容忍，其他错误继续传播，已有写入留在原事务中由
+调用方提交或回滚。订单自身过期的 expired 路径保持 #315 合并后的实现不变。
+
+生命周期层至此不再直接写订单或信号，允许静态写入模块集合分别由7→6、5→4，
+整表仍为 **pending**。此结论限于静态 SQL 守卫，不代表所有动态拼接 SQL 已覆盖。
+cycles、账户字段和其他订单/信号阶段的既有待办继续保留，本批不扩大到成交链或 PR-11。
+
+冻结对照为 `backend/fixtures/signal_expiry_71584c8.txt`。比较完整行、原始字段、原因、
+时间戳、统计、SQL trace、异常和事务状态；新增多信号顺序、后续信号失败、已终态信号
+遗留订单、重复清扫及回收前订单转 filled 等用例。未迁移的订单自身过期函数保留冻结
+AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做真实交易时段验证，未部署。
+
+本批实测：`cross_domain_edges` 629、`import_cycles`/`foundation_violations` 均0，
+`max_file_lines` 14618→14619（组装根新增一行绑定），其他指标不退化，所有预算不变。

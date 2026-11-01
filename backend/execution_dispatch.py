@@ -27,6 +27,7 @@ PR-10 把 TTL / batch / verification 作为订单审计字段引入，但具体�
 
 另提供窄写入接口 ``expire_order``，承接生命周期层已判定过期的普通买单。
 它只写终态，不参与上述挂起单清扫或过期资格判断。
+``supersede_for_expired_signal`` 则承接失效信号名下买单的回收写入，判定仍由生命周期层负责。
 
 失败语义
 --------
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+import entry_lifecycle as ELC
 from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
@@ -65,6 +67,7 @@ __all__ = [
     "retire_gated_orders",
     "run_execution_dispatch",
     "settings",
+    "supersede_for_expired_signal",
     "verification_queue",
 ]
 
@@ -597,6 +600,17 @@ def expire_order(conn, order_id, *, reason, cancelled_at):
                   SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
                 WHERE id=?""",
         (EXPIRED_ORDER_STATUS, reason, cancelled_at, order_id),
+    )
+
+
+def supersede_for_expired_signal(conn, order_id, *, cancelled_at):
+    """持久化失效信号名下的活动买单回收；保持 superseded 及原状态条件。"""
+    conn.execute(
+        """UPDATE paper_orders
+                  SET status='superseded',reason=COALESCE(reason,'') || '；信号已失效，委托回收',
+                      cancelled_at=?
+                WHERE id=? AND status IN (?,?,?,?,?)""",
+        (cancelled_at, order_id, *ELC.RECOVERABLE_ORDER_STATUSES),
     )
 
 

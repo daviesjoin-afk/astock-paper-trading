@@ -12757,6 +12757,7 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
             audit=audit,
             resolve_asof_day=lambda: _date(asof_date),
             expire_order=EPD.expire_order, expire_signal=SIG.expire_for_expired_order,
+            expire_stale_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal,
         )
     day = _date(asof_date)
     result = _run_slot_impl(slot, day=day, force=force)
