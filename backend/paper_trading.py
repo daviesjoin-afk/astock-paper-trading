@@ -1243,18 +1243,18 @@ def _record_entry_frozen_waitlist(
     strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
         conn, account_id, signal_id, cycle_id=order_cycle_id(conn, cycle_id),
     )
-    order_id = POL.insert_order(
-        conn,
-        account_id=account_id, signal_id=signal_id, side="buy", code=code, name=name,
-        qty=max(0, int(_num(qty))), planned_price=_num(planned_price, None),
-        status=ENTRY_FROZEN_WAITLIST_STATUS, reason=reason, risk_payload=_json(payload),
-        origin="strategy", created_at=_now(),
-        strategy_id=strategy_id, strategy_version=strategy_version,
-        strategy_checksum=strategy_checksum,
-        retry_of_order_id=_previous_attempt_order_id(
+    order_id = POL.insert_order(conn, fields={
+        "account_id": account_id, "signal_id": signal_id, "side": "buy", "code": code,
+        "name": name, "qty": max(0, int(_num(qty))),
+        "planned_price": _num(planned_price, None),
+        "status": ENTRY_FROZEN_WAITLIST_STATUS, "reason": reason,
+        "risk_payload": _json(payload), "origin": "strategy", "created_at": _now(),
+        "strategy_id": strategy_id, "strategy_version": strategy_version,
+        "strategy_checksum": strategy_checksum,
+        "retry_of_order_id": _previous_attempt_order_id(
             conn, signal_id, order_cycle_id(conn, cycle_id)),
-        cycle_id=order_cycle_id(conn, cycle_id),
-    )
+        "cycle_id": order_cycle_id(conn, cycle_id),
+    })
     _risk_log(conn, account_id, code, "buy", ENTRY_FROZEN_WAITLIST_STATUS, reason, payload)
     audit(conn, account_id, ENTRY_FROZEN_WAITLIST_STATUS, f"{source}: {code} order={order_id}")
     return order_id, True, reason, payload
@@ -9186,25 +9186,24 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     retry_of_order_id = _previous_attempt_order_id(
         conn, signal.get("id"), order_cycle_id(conn, current_cycle["id"]),
     )
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(
-           account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
-           fees,status,reason,risk_payload,created_at,executed_at,expires_at,
-           strategy_id,strategy_version,strategy_checksum,retry_of_order_id,cycle_id,
-           allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
-           allocation_plan_fingerprint,allocation_policy_version)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
-         entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
-         entry_limit["order_type"],
-         None,
-         None, None, order_status, reason,
-         _json(risk), _now(), None, dispatch_plan["expires_at"],
-         strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
-          order_cycle_id(conn, current_cycle["id"]), allocation_intent_kind,
-          exact_plan["portfolio_snapshot_id"], exact_plan["plan_id"],
-          exact_plan["plan_fingerprint"], exact_plan["allocation_policy_version"]),
-    )
+    order_id = POL.insert_order(conn, fields={
+        "account_id": account["id"], "signal_id": signal["id"], "side": "buy", "code": code,
+        "name": signal.get("name"), "qty": qty,
+        "planned_price": (entry_limit["limit_price"]
+                          if entry_limit["limit_price"] is not None else price),
+        "order_type": entry_limit["order_type"],
+        "filled_price": None, "amount": None, "fees": None,
+        "status": order_status, "reason": reason, "risk_payload": _json(risk),
+        "created_at": _now(), "executed_at": None, "expires_at": dispatch_plan["expires_at"],
+        "strategy_id": strategy_id, "strategy_version": strategy_version,
+        "strategy_checksum": strategy_checksum, "retry_of_order_id": retry_of_order_id,
+        "cycle_id": order_cycle_id(conn, current_cycle["id"]),
+        "allocation_intent_kind": allocation_intent_kind,
+        "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+        "allocation_plan_id": exact_plan["plan_id"],
+        "allocation_plan_fingerprint": exact_plan["plan_fingerprint"],
+        "allocation_policy_version": exact_plan["allocation_policy_version"],
+    })
     # A frozen order is a waitlist marker, not a second live order.  Once the
     # data gate reopens and this candidate receives a fresh decision, retire
     # its old marker so the terminal cannot keep showing "待执行" after the
@@ -9225,7 +9224,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
              AND status IN (?,?,?)""",
         (
             account["id"], code, ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity",
-            int(cursor.lastrowid), *ENTRY_RETRY_SIGNAL_STATUSES,
+            order_id, *ENTRY_RETRY_SIGNAL_STATUSES,
         ),
     )
     conn.execute(
@@ -9235,8 +9234,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
            WHERE account_id=? AND code=? AND side='buy'
              AND status IN (?,?) AND id<>?""",
         (
-            int(cursor.lastrowid), account["id"], code,
-            ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity", int(cursor.lastrowid),
+            order_id, account["id"], code,
+            ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity", order_id,
         ),
     )
     if not allowed:
@@ -9258,7 +9257,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         else:
             admission_authority = "ENTRY"
         _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,
-                  order_id=int(cursor.lastrowid), authority=admission_authority,
+                  order_id=order_id, authority=admission_authority,
                   decision_kind=decision_name)
         if risk_state.get("blocked"):
             # 独立的 Risk Authority 结论（共享池熔断/回撤/冷静期）：这正是买入路径
@@ -9267,7 +9266,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             _risk_log(conn, account["id"], code, "buy", "shared_risk_state_blocked",
                       "；".join(str(item) for item in risk_state.get("reasons") or ()),
                       {"account_risk": risk_state},
-                      order_id=int(cursor.lastrowid), authority="RISK",
+                      order_id=order_id, authority="RISK",
                       decision_kind="shared_risk_state_blocked")
         if (risk.get("slot_borrow") or {}).get("allowed"):
             risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
@@ -9333,7 +9332,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             }
         conn.execute("UPDATE paper_signals SET status='rejected', reason=? WHERE id=?", (reason, signal["id"]))
         return {"filled": False, "reason": reason}
-    order_id = int(cursor.lastrowid)
     # ET 是纯内存状态机，无法参与事务回滚；只在成交落库成功之后推进，
     # 否则提交失败会留下一个"已入场"的虚假状态（§48）。
     failure = MO.commit_strategy_entry_fill(

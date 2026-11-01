@@ -98,13 +98,14 @@ class CreationAndCancelTests(unittest.TestCase):
         self.assertEqual("pending_limit", _row(self.conn, 2)["status"])
 
     def test_insert_order_keeps_the_column_order_and_returns_the_row_id(self):
-        order_id = POL.insert_order(
-            self.conn, account_id=7, signal_id=13, side="buy", code="BBB", name="测试",
-            qty=100, planned_price=10.5, status="entry_frozen_waitlist", reason="冻结",
-            risk_payload="{}", origin="strategy", created_at="2026-09-11T10:00:00",
-            strategy_id="s1", strategy_version="v1", strategy_checksum="abc",
-            retry_of_order_id=1, cycle_id=3,
-        )
+        order_id = POL.insert_order(self.conn, fields={
+            "account_id": 7, "signal_id": 13, "side": "buy", "code": "BBB", "name": "测试",
+            "qty": 100, "planned_price": 10.5, "status": "entry_frozen_waitlist",
+            "reason": "冻结", "risk_payload": "{}", "origin": "strategy",
+            "created_at": "2026-09-11T10:00:00", "strategy_id": "s1",
+            "strategy_version": "v1", "strategy_checksum": "abc",
+            "retry_of_order_id": 1, "cycle_id": 3,
+        })
         self.assertIsInstance(order_id, int)
         row = self.conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone()
         self.assertEqual(7, row["account_id"])

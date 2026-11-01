@@ -61,44 +61,37 @@ def expire_order(conn, order_id, *, reason, cancelled_at):
     )
 
 
-def insert_order(
-    conn,
-    *,
-    account_id,
-    side,
-    code,
-    status,
-    reason,
-    risk_payload,
-    origin,
-    created_at,
-    signal_id=None,
-    name=None,
-    qty=0,
-    planned_price=None,
-    strategy_id=None,
-    strategy_version=None,
-    strategy_checksum=None,
-    retry_of_order_id=None,
-    cycle_id=None,
-):
+#: 订单行的规范列集合（与 schema 一致）。``insert_order`` 只接受这里的列名，
+#: 调用方不能凭空插入未知列；未提供的列走 schema 默认值。
+ORDER_INSERT_COLUMNS = (
+    "account_id", "signal_id", "side", "code", "name", "qty", "planned_price",
+    "order_type", "filled_price", "amount", "fees", "status", "reason",
+    "risk_payload", "origin", "created_at", "executed_at", "expires_at",
+    "strategy_id", "strategy_version", "strategy_checksum",
+    "retry_of_order_id", "cycle_id",
+    "allocation_intent_kind", "portfolio_snapshot_id", "allocation_plan_id",
+    "allocation_plan_fingerprint", "allocation_policy_version",
+)
+
+
+def insert_order(conn, *, fields):
     """创建一条订单行，返回新行 id。
 
-    列集合与原 INSERT 逐字一致；业务侧（策略戳、重试血缘、payload 序列化）
-    全部由调用方算好再传进来 —— owner 不算价、不解析周期、不读时钟。
+    ``fields`` 的键必须落在 :data:`ORDER_INSERT_COLUMNS` 里；列序按该常量，
+    而不是调用方给的顺序 —— 写入形状由 owner 决定。业务侧（策略戳、重试血缘、
+    payload 序列化、计划快照）全部由调用方算好再传进来：owner 不算价、不解析
+    周期、不读时钟。
     """
+    unknown = set(fields) - set(ORDER_INSERT_COLUMNS)
+    if unknown:
+        raise ValueError(f"未知订单列：{sorted(unknown)}")
+    columns = [name for name in ORDER_INSERT_COLUMNS if name in fields]
+    if not columns:
+        raise ValueError("insert_order 需要至少一个字段")
+    marks = ",".join("?" for _ in columns)
     cursor = conn.execute(
-        """INSERT INTO paper_orders(
-               account_id,signal_id,side,code,name,qty,planned_price,status,reason,
-               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
-               retry_of_order_id,cycle_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            account_id, signal_id, side, code, name, qty, planned_price, status, reason,
-            risk_payload, origin, created_at,
-            strategy_id, strategy_version, strategy_checksum,
-            retry_of_order_id, cycle_id,
-        ),
+        f"INSERT INTO paper_orders({','.join(columns)}) VALUES({marks})",
+        tuple(fields[name] for name in columns),
     )
     return int(cursor.lastrowid)
 
