@@ -83,6 +83,22 @@ def consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None,
     return int(qty) - remaining, cost_amount
 
 
+def link_source_fill(conn, lot_id, fill_id):
+    """把一次成交的血缘写进**已经存在**的 lot（lot ←→ FillEvent 一对一）。
+
+    R26 的部分成交语义：只有 ``source_order_id`` 时，"一笔委托多次成交"的每个 lot
+    都只能指向同一张订单，无法证明某个 lot 由哪一笔成交产生。成交提交链在本事务内
+    回填 ``source_fill_id``；这条写入属于 lot 的归属事实，因此写入权在 lot owner。
+
+    历史旧 lot 保持 NULL（不可证明，绝不猜），读取方按 legacy 处理。返回受影响行数；
+    不 commit，事务边界由调用方持有。
+    """
+    return conn.execute(
+        "UPDATE paper_position_lots SET source_fill_id=? WHERE id=?",
+        (int(fill_id), int(lot_id)),
+    ).rowcount
+
+
 def record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None, acquired_at=None, *, num_fn=_num, date_fn=_date, now_fn=_now, asset_type_fn=PTR.asset_type, next_trade_day_fn=PTR.next_weekday, provenance_fn=POEA.order_cycle_provenance_for_order):
     """写入买入 lot。周期归属必须与**来源买单**一致（§15 硬 invariant）。
 

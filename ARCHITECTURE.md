@@ -4461,3 +4461,21 @@ paper_slot_service.run_preflight
 `foundation_violations` 0；预算未放宽。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第四批：成交血缘写入归 lot owner（2026-11-01）
+
+`execution_planner.commit_fill` 不再直接 `UPDATE paper_position_lots`。lot owner 新增窄业务操作
+`paper_lot_ledger.link_source_fill(conn, lot_id, fill_id)`（lot ←→ FillEvent 一对一），
+成交提交链通过**已有的依赖容器**调用它：`ExecutionDependencies.link_source_fill`，在
+`paper_trading` 的 `owned_services` 里绑定到 `(PLL, "link_source_fill")`。
+
+选择依赖注入而不是 import：`execution → paper` 会新增跨域边，而跨域预算已用满（629/629）；
+注入路径本来就用于 `record_lot` / `consume_available_lots` / `sync_positions`。
+
+同一 `conn`、同一事务、`commit_fill` 仍决定最终成交；`source_fill_id` 的 legacy NULL 语义不变
+（不可证明的历史 lot 保持 NULL，绝不猜）。
+
+**实测**：`paper_position_lots` 从 `pending` 收紧为 **owned**（运行时唯一写入方
+`paper_lot_ledger`）；`cross_domain_edges` 629（不变）；`max_file_lines` 14623。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

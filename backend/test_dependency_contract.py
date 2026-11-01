@@ -44,11 +44,28 @@ class DependencyContainerContractTests(unittest.TestCase):
                 self.assertEqual(private, [], f"{label} 仍有私有依赖字段")
 
     def test_every_field_resolves_to_an_implementation(self):
+        """每个字段都必须解析出实现：由别的 owner 提供，或从组装根解析。
+
+        组装根解析（``_dependency_implementation``）覆盖本模块提供的实现；由其他
+        owner 直接绑定的字段（lot / provenance）在实例上体现，所以这里以**绑定结果**
+        为准，未知字段仍必须大声失败。
+        """
+        accessors = {
+            "manual_orders": MO._dependencies,
+            "dashboard_queries": DQ._dependencies,
+            "execution_planner": EP._pt,
+        }
         for label, container in CONTAINERS:
+            instance = accessors[label]()
             for field in dataclasses.fields(container):
                 with self.subTest(container=label, field=field.name):
-                    value = PT._dependency_implementation(field.name)
-                    self.assertIsNotNone(value)
+                    self.assertIsNotNone(getattr(instance, field.name))
+                    if field.name in ("record_lot", "consume_available_lots",
+                                      "sync_positions", "position_rows",
+                                      "link_source_fill", "order_cycle_provenance_for_order",
+                                      "require_order_execution_cycle"):
+                        continue
+                    self.assertIsNotNone(PT._dependency_implementation(field.name))
 
     def test_unknown_field_fails_loudly(self):
         with self.assertRaisesRegex(RuntimeError, "未登记的依赖实现"):

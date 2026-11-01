@@ -53,11 +53,11 @@ OWNERSHIP = {
         "note": "paper_positions 是投影，只能由 lot owner 同步",
     },
     "paper_position_lots": {
-        "status": "pending",
-        "writers": {"paper_lot_ledger", "execution_planner"},
+        "status": "owned",
+        "writers": {"paper_lot_ledger"},
         "note": (
-            "lot 的创建/消耗归 paper_lot_ledger；commit_fill 仍在同一事务里回填 "
-            "source_fill_id（成交血缘），下一步迁到 lot owner 的窄接口"
+            "lot 的创建/消耗/成交血缘都归 paper_lot_ledger：commit_fill 通过注入的 "
+            "link_source_fill 回调回填 source_fill_id，本模块不再直写 lot 表"
         ),
     },
     "paper_capital_reservations": {
@@ -162,7 +162,7 @@ class LedgerWriteOwnershipTests(unittest.TestCase):
     RESERVATION_RELEASE_EXCEPTIONS: set[str] = set()
 
     def test_reservation_release_has_a_single_implementation(self):
-        """同一句释放 UPDATE 只允许 owner + 一个已登记的 foundation 例外。"""
+        """同一句释放 UPDATE 只允许出现在 owner 内（例外集合必须为空）。"""
         offenders = set()
         for path in sorted(BACKEND_DIR.glob("*.py")):
             name = path.stem
