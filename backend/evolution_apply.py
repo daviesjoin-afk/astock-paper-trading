@@ -24,6 +24,7 @@ import copy
 import datetime as dt
 import sqlite3
 import zoneinfo
+import paper_account_config as PAC
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -115,10 +116,8 @@ def _baseline_conditions(account_params):
 
 
 def write_account_params(conn, account_id, params, *, updated_at=None):
-    conn.execute(
-        "UPDATE paper_accounts SET params=?,updated_at=? WHERE id=?",
-        (_json(params), updated_at or _now(), account_id),
-    )
+    PAC.write_params(conn, account_id, params=_json(params),
+                     now=updated_at or _now())
 
 
 

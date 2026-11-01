@@ -1,60 +1,32 @@
 {
  "operations": {
-  "adaptive_engine::_restore_paper_account": {
-   "judge": "adaptive_engine 回滚规则",
-   "operation": "参数回滚恢复（params/version）",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_risk::_finish_rollback": {
-   "judge": "adaptive_risk 回滚规则",
-   "operation": "风险自适应参数回滚收尾",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_risk::apply_candidate": {
-   "judge": "adaptive_risk 采纳规则",
-   "operation": "风险自适应候选参数应用",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_selection::_finish_rollback": {
-   "judge": "adaptive_selection 回滚规则",
-   "operation": "选择自适应参数回滚收尾",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_selection::apply_candidate": {
-   "judge": "adaptive_selection 采纳规则",
-   "operation": "选择自适应候选参数应用",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_selection_compat::migrate_legacy_selection_units": {
-   "judge": "兼容迁移规则",
-   "operation": "legacy 参数单位迁移",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "服务入口传入的连接"
-  },
-  "evolution_apply::write_account_params": {
-   "judge": "evolution_apply 版本检查",
-   "operation": "进化结果参数写入",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
   "manual_orders::_terminalize_cycle_stale_order": {
    "judge": "manual_orders 周期归属判定",
    "operation": "周期切换时终止跨周期残留委托",
    "single_owner": "paper_order_ledger",
    "single_package": "D",
    "transaction": "服务入口传入的连接"
+  },
+  "paper_account_config::set_cooldown": {
+   "judge": "paper_trading 风控状态",
+   "operation": "共享风控冷却窗口写入",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_config::set_style": {
+   "judge": "配置入口校验",
+   "operation": "账户风格字段写入",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_config::write_params": {
+   "judge": "adaptive/evolution/周度复盘各自的采纳与回滚判定",
+   "operation": "账户参数快照/版本/时间戳写入",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
   },
   "paper_cycle_service::archive_cycle": {
    "judge": "归档入口规则",
@@ -275,13 +247,6 @@
   "paper_trading::_shared_risk_state": {
    "judge": "paper_trading 风控状态",
    "operation": "账户冷却窗口 cooldown_until",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::_weekly_review": {
-   "judge": "周度复盘结论",
-   "operation": "周度参数应用（params/version）",
    "single_owner": "paper_account_config",
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"

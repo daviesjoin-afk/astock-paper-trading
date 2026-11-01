@@ -105,10 +105,10 @@ OWNERSHIP = {
             "paper_trading", "paper_shared_cash", "paper_user_cycle_attachment",
             "paper_user_account_provisioning", "strategy_registry",
             "paper_order_execution_authority", "paper_cycle_ownership",
-            "adaptive_engine", "adaptive_risk", "adaptive_selection",
-            "adaptive_selection_compat", "evolution_apply", "ai_adoption_writer",
+            "ai_adoption_writer", "paper_account_config",
         },
-        "note": "账户行被多个 owner 按各自字段更新（现金、周期挂接、策略参数）；集合只减不增",
+        "note": "账户行按字段分组归属（现金/创建/身份挂接/配置）；工作包 C 把 adaptive 与 "
+                "evolution 的参数写入并进 paper_account_config，集合只减不增",
     },
 }
 

@@ -90,6 +90,7 @@ import adaptive_selection_compat as ASC
 # 但这两个模块本身仍是 facade 的依赖，不能随 cleanup 一起删掉 import。
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
+import paper_account_config as PAC
 import paper_order_ledger as POL
 import paper_slot_service as PSS
 import paper_numeric as PNum
@@ -12334,7 +12335,8 @@ def _weekly_review(conn, day):
                 params.update({"entry_score_delta": round(next_delta, 3), "effective_date": effective})
                 version = f"v3.{week.split('W')[-1]}"
                 reason = "本周负收益，提高策略专属入场门槛" if ret < 0 else "本周正收益，小幅放宽策略专属入场门槛"
-                conn.execute("UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?", (_json(params), version, _now(), account["id"]))
+                PAC.write_params(conn, account["id"], params=_json(params),
+                                 version=version, now=_now())
                 cycle = load_active_cycle(conn)
                 conn.execute(
                     "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",

@@ -8,6 +8,8 @@ conservative tightening and every version remaining auditable and reversible.
 """
 from __future__ import annotations
 
+import paper_account_config as PAC
+
 import datetime as dt
 import csv
 import hashlib
@@ -754,10 +756,9 @@ def _restore_paper_account(snapshot, account_id, candidate_id, event_name, expec
             }, ensure_ascii=False), flush=True)
             return
         account = snapshot["account"]
-        paper.execute(
-            "UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?",
-            (account.get("params"), account.get("version"), account.get("updated_at"), account_id),
-        )
+        PAC.write_params(paper, account_id, params=account.get("params"),
+                         version=account.get("version"),
+                         now=account.get("updated_at"))
         # The failed operation's version is deterministic for apply and is
         # read from the account for rollback.  Remove only that version; never
         # delete unrelated parameter history that may have arrived meanwhile.
