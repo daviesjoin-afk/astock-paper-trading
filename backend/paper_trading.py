@@ -1579,32 +1579,12 @@ def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     # A capacity wait is a single live intent per strategy/code, not an ever
     # growing order stream.  Keep the newest active marker for re-ranking and
     # retain older rows as audit evidence without letting them occupy the
-    # waitlist or distort dashboard counts.
-    conn.execute(
-        """UPDATE paper_orders AS older
-           SET status='superseded',
-               reason=COALESCE(older.reason,'') || '；同标的较新等待池记录已保留'
-           WHERE older.side='buy' AND older.status='deferred_capacity'
-             AND EXISTS(
-                 SELECT 1 FROM paper_orders AS newer
-                 WHERE newer.account_id=older.account_id
-                   AND newer.code=older.code AND newer.side='buy'
-                   AND newer.status IN ('deferred_capacity',?)
-                   AND newer.id>older.id
-             )""",
-        (ENTRY_FROZEN_WAITLIST_STATUS,),
-    )
-    conn.execute(
-        """UPDATE paper_signals
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代'
-           WHERE id IN (
-               SELECT signal_id FROM paper_orders
-               WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
-                 AND reason LIKE '%等待池记录已保留%'
-           )
-             AND status IN (?,?,?)""",
-        ENTRY_RETRY_SIGNAL_STATUSES,
+    # waitlist or distort dashboard counts.  两条 superseded 写入（旧订单 +
+    # 其信号）归 ``execution_dispatch``，本层只保留调用时机与顺序：订单先写，
+    # 信号按刚写入的原因标记反查，否则本轮新标记的行会被漏掉。
+    EPD.retire_duplicate_waitlist(
+        conn, waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
+        signal_statuses=ENTRY_RETRY_SIGNAL_STATUSES,
     )
 
 

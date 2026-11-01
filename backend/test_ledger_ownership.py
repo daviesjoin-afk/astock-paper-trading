@@ -216,6 +216,41 @@ class OrderExpiryOperationOwnershipTests(unittest.TestCase):
         self.assertIsNone(POEA.active_cycle_id_readonly(missing))
 
 
+class WaitlistRetirementOperationTests(unittest.TestCase):
+    """第九批：等待池重复记录回收的操作级边界；整表仍为 pending。"""
+
+    def test_recover_path_delegates_both_writes_to_the_dispatch_owner(self):
+        import inspect
+        import paper_trading as PT
+        source = inspect.getsource(PT._recover_stale_runtime_state)
+        inline = OrderExpiryOperationOwnershipTests.inline_expiry_writes
+        self.assertEqual(set(), inline(source))
+        # 正控：两条语句回流时守卫必须变红。
+        reflow = "\n" + '    conn.execute("UPDATE paper_orders SET status=?")\n' \
+                      '    conn.execute("UPDATE paper_signals SET status=?")\n'
+        self.assertEqual({"paper_orders", "paper_signals"}, inline(source + reflow))
+
+    def test_waitlist_owner_is_a_business_operation_not_a_sql_sink(self):
+        import inspect
+        import execution_dispatch as EPD
+        signature = inspect.signature(EPD.retire_duplicate_waitlist)
+        self.assertEqual(["conn", "waitlist_status", "signal_statuses"],
+                         list(signature.parameters))
+        for name in ("waitlist_status", "signal_statuses"):
+            self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
+                             signature.parameters[name].kind)
+            self.assertEqual(inspect.Parameter.empty,
+                             signature.parameters[name].default)
+
+    def test_no_module_joins_or_leaves_the_writer_sets(self):
+        self.assertEqual("pending", OWNERSHIP["paper_orders"]["status"])
+        self.assertEqual("pending", OWNERSHIP["paper_signals"]["status"])
+        self.assertIn("execution_dispatch", OWNERSHIP["paper_orders"]["writers"])
+        self.assertIn("execution_dispatch", OWNERSHIP["paper_signals"]["writers"])
+        self.assertIn("paper_trading", OWNERSHIP["paper_orders"]["writers"])
+        self.assertIn("paper_trading", OWNERSHIP["paper_signals"]["writers"])
+
+
 class LedgerWriteOwnershipTests(unittest.TestCase):
     def test_every_declared_table_exists_in_the_schema(self):
         import paper_schema_migrations as PSM

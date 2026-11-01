@@ -28,6 +28,7 @@ PR-10 把 TTL / batch / verification 作为订单审计字段引入，但具体�
 另提供窄写入接口 ``expire_order``，承接生命周期层已判定过期的普通买单。
 它只写终态，不参与上述挂起单清扫或过期资格判断。
 ``supersede_for_expired_signal`` 则承接失效信号名下买单的回收写入，判定仍由生命周期层负责。
+``retire_duplicate_waitlist`` 承接启动恢复里的等待池重复记录回收，订单与关联信号的 superseded 写入保持原顺序。
 
 失败语义
 --------
@@ -64,6 +65,7 @@ __all__ = [
     "expire_order",
     "plan_execution_dispatch",
     "resolve_verification",
+    "retire_duplicate_waitlist",
     "retire_gated_orders",
     "run_execution_dispatch",
     "settings",
@@ -611,6 +613,42 @@ def supersede_for_expired_signal(conn, order_id, *, cancelled_at):
                       cancelled_at=?
                 WHERE id=? AND status IN (?,?,?,?,?)""",
         (cancelled_at, order_id, *ELC.RECOVERABLE_ORDER_STATUSES),
+    )
+
+
+def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses):
+    """回收同一标的下的旧等待池记录及其信号。
+
+    调用方（``paper_trading`` 的启动恢复）已判定"较新记录保留"，本入口只按原
+    SQL 迁移终态：先写旧订单 superseded，再按刚写入的原因标记回收对应信号。
+    两条语句的顺序是契约 —— 信号集合由订单的 ``reason`` 标记反查，先信号后订单
+    会漏掉本轮新标记的行。使用传入连接，不读时钟、不提交。
+    """
+    conn.execute(
+        """UPDATE paper_orders AS older
+           SET status='superseded',
+               reason=COALESCE(older.reason,'') || '；同标的较新等待池记录已保留'
+           WHERE older.side='buy' AND older.status='deferred_capacity'
+             AND EXISTS(
+                 SELECT 1 FROM paper_orders AS newer
+                 WHERE newer.account_id=older.account_id
+                   AND newer.code=older.code AND newer.side='buy'
+                   AND newer.status IN ('deferred_capacity',?)
+                   AND newer.id>older.id
+             )""",
+        (waitlist_status,),
+    )
+    conn.execute(
+        """UPDATE paper_signals
+           SET status='superseded',
+               reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代'
+           WHERE id IN (
+               SELECT signal_id FROM paper_orders
+               WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
+                 AND reason LIKE '%等待池记录已保留%'
+           )
+             AND status IN (?,?,?)""",
+        tuple(signal_statuses),
     )
 
 
