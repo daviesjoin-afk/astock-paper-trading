@@ -459,22 +459,24 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_accounts` | 账户风格字段写入 | `paper_account_ledger::set_style` | 配置入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_accounts` | 新策略首次版本号写入 | `paper_account_ledger::set_version` | 账号引导规则 | `paper_account_ledger` | 启动引导 / 调用方同一连接与原事务 | `test_execution_evidence`、`test_execution_planner`、`test_order_cycle_provenance` |
 | `paper_accounts` | 账户参数快照/版本/时间戳写入 | `paper_account_ledger::write_params` | adaptive/evolution/周度复盘各自的采纳与回滚判定 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_account_ledger` |
-| `paper_accounts` | legacy 引导：账户 cycle_id 清空与暂停 | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_account_ledger` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
-| `paper_accounts` | 新建周期时账户挂接重置 | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
-| `paper_accounts` | 账户风格字段 | `paper_trading::set_account_style` | 配置入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | legacy 引导：账户 cycle_id 清空与暂停 | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_user_cycle_attachment` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
+| `paper_accounts` | 新建周期时账户挂接重置 | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
+| `paper_accounts` | 账户风格字段 | `paper_trading::set_account_style` | 配置入口校验 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
 
 ### 工作包 D
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `paper_orders` | 周期切换时终止跨周期残留委托 | `manual_orders::_terminalize_cycle_stale_order` | manual_orders 周期归属判定 | `paper_order_ledger` | 服务入口传入的连接 | `test_entry_capital_asof`、`test_paper_trading_architecture_guard` |
 | `paper_cycles` | 周期归档 archived | `paper_cycle_service::archive_cycle` | 归档入口规则 | `paper_cycle_service` | 服务入口传入的连接 | `test_order_cycle_provenance`、`test_paper_cycle_ownership`、`test_paper_cycle_service` |
-| `paper_orders` | 归档/清理超龄订单行（DELETE） | `paper_trading::_cleanup_stale_data` | paper_trading 归档策略 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_position_review_provenance` |
-| `paper_signals` | 归档/清理超龄信号行（DELETE） | `paper_trading::_cleanup_stale_data` | paper_trading 归档策略 | `signal_service` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_position_review_provenance` |
-| `paper_cycles` | legacy 周期引导创建（INSERT） | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_cycle_service` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
-| `paper_cycles` | 周期资金配置（capital） | `paper_trading::configure_capital` | 配置入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_strategy_roster` |
-| `paper_cycles` | 周期创建（INSERT） | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
-| `paper_cycles` | 周期启停状态/started_at | `paper_trading::set_accounts_status` | 启停入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_resume_three_strategy_cycle` |
+| `paper_cycles` | 周期创建（兼容引导 / 新建，列白名单） | `paper_cycle_service::insert_cycle` | 周期创建与引导规则 | `paper_cycle_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_cycles` | 周期资金对账写入 | `paper_cycle_service::set_capital` | paper_trading 引导/配置校验 | `paper_cycle_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_cycles` | 周期启停（started_at 保留首次） | `paper_cycle_service::set_status` | 启停入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_learning_evaluation` |
+| `paper_orders` | 归档清理：删除超龄订单 | `paper_order_ledger::archive_delete_orders` | paper_trading 归档策略 | `paper_order_ledger` | 归档入口的 immediate 事务 | 待补 |
+| `paper_orders` | 归档清理：超龄订单转 superseded | `paper_order_ledger::archive_supersede_orders` | paper_trading 归档策略 | `paper_order_ledger` | 归档入口的 immediate 事务 | 待补 |
+| `paper_orders` | 周期漂移订单终态化（已成交不改） | `paper_order_ledger::terminalize_cycle_drift_order` | manual_orders 周期归属判定 | `paper_order_ledger` | 归档入口的 immediate 事务 | `test_dependency_contract` |
+| `paper_signals` | 归档清理：删除超龄信号 | `signal_service::archive_delete_signals` | paper_trading 归档策略 | `signal_service` | 归档入口的 immediate 事务 | 待补 |
+| `paper_signals` | 归档清理：超龄信号转 expired | `signal_service::archive_expire_signals` | paper_trading 归档策略 | `signal_service` | 归档入口的 immediate 事务 | 待补 |
+| `paper_signals` | 归档清理：超龄信号转 superseded | `signal_service::archive_supersede_signals` | paper_trading 归档策略 | `signal_service` | 归档入口的 immediate 事务 | 待补 |
 
 <!-- ledger-owner-plan:end -->
 

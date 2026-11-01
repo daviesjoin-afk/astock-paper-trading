@@ -34,8 +34,11 @@ __all__ = [
     "TERMINAL_ORDER_STATUSES",
     "expire_order",
     "insert_order",
+    "terminalize_cycle_drift_order",
     "retire_duplicate_waitlist_orders",
     "retire_gated_order",
+    "archive_delete_orders",
+    "archive_supersede_orders",
     "cancel_order",
     "supersede_duplicate_execution_retry",
     "supersede_previous_execution_retry",
@@ -184,7 +187,7 @@ _UNSET = object()
 
 def update_order_outcome(
     conn, order_id, *, status=_UNSET, reason=_UNSET, risk_payload=_UNSET,
-    clear_fill=False, match_status=None,
+    clear_fill=False, match_status=None, cancelled_at=_UNSET,
 ):
     """订单状态推进：按调用方给出的字段写 row，返回受影响行数。
 
@@ -205,6 +208,9 @@ def update_order_outcome(
     if risk_payload is not _UNSET:
         sets.append("risk_payload=?")
         params.append(risk_payload)
+    if cancelled_at is not _UNSET:
+        sets.append("cancelled_at=?")
+        params.append(cancelled_at)
     if clear_fill:
         sets.append("filled_price=NULL")
         sets.append("amount=NULL")
@@ -251,6 +257,21 @@ def insert_order(conn, *, fields):
         tuple(fields[name] for name in columns),
     )
     return int(cursor.lastrowid)
+
+
+def terminalize_cycle_drift_order(conn, order_id, *, reason, risk_payload,
+                                  cancelled_at):
+    """周期漂移/归属未知的订单终态化：写 superseded + 载荷，已成交的行不动。
+
+    ``WHERE id=? AND status NOT IN ('filled')`` 逐字保留 —— 已成交事实不允许被
+    这条清理路径改写。
+    """
+    return conn.execute(
+        """UPDATE paper_orders
+              SET status='superseded',reason=?,risk_payload=?,cancelled_at=?
+            WHERE id=? AND status NOT IN ('filled')""",
+        (reason, risk_payload, cancelled_at, order_id),
+    ).rowcount
 
 
 def supersede_order(conn, order_id, *, reason, cancelled_at):
@@ -425,3 +446,20 @@ def nonfilled_order_count(conn, account_id):
         "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status!='filled'",
         (account_id,),
     ).fetchone()[0]
+
+
+def archive_delete_orders(conn, *, status, window="-1 day"):
+    """归档清理：删除早于窗口的指定状态订单，返回删除行数。"""
+    return conn.execute(
+        "DELETE FROM paper_orders WHERE status=? AND created_at < datetime('now', ?)",
+        (status, window),
+    ).rowcount
+
+
+def archive_supersede_orders(conn, *, status, reason, window="-1 day"):
+    """归档清理：把早于窗口的指定状态订单写为 superseded。"""
+    return conn.execute(
+        "UPDATE paper_orders SET status='superseded', reason=?"
+        " WHERE status=? AND created_at < datetime('now', ?)",
+        (reason, status, window),
+    ).rowcount

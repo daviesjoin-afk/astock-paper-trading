@@ -98,6 +98,7 @@ class ManualOrderDependencies:
     reopen_pending: Any
     mark_signal_filled: Any
     record_signal_outcome: Any
+    terminalize_cycle_drift_order: Any
     update_order_outcome: Any
 
 
@@ -1125,6 +1126,7 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     _finish_capital_reservation = deps.finish_capital_reservation
     _now = deps.now
     _risk_log = deps.risk_log
+    _terminalize_cycle_drift = deps.terminalize_cycle_drift_order
     order_id = int(order["id"])
     marker = getattr(exc, "marker", None) or "order_execution_cycle_changed"
     detail = {
@@ -1151,11 +1153,9 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     if not isinstance(payload, dict):
         payload = {}
     payload["cycle_guard"] = detail
-    conn.execute(
-        """UPDATE paper_orders
-              SET status='superseded',reason=?,risk_payload=?,cancelled_at=?
-            WHERE id=? AND status NOT IN ('filled')""",
-        (reason, _json(payload), _now(), order_id),
+    _terminalize_cycle_drift(
+        conn, order_id, reason=reason, risk_payload=_json(payload),
+        cancelled_at=_now(),
     )
     _risk_log(
         conn, order["account_id"], order["code"], order.get("side") or "buy",

@@ -305,9 +305,11 @@ class ReconcileWriteOperationTests(unittest.TestCase):
     def test_write_sets_keep_pending_and_unchanged_membership(self):
         # 工作包 A/B 之后：成交、核验与风控的订单写都已归 owner，只剩
         # paper_trading / manual_orders 两个调用方还没搬完。
-        self.assertEqual(3, len(real_write_modules("paper_orders")))
-        # 信号写方：paper_trading（仅 D 包归档清理）与 signal_service。
-        self.assertEqual(2, len(real_write_modules("paper_signals")))
+        # 工作包 D 之后：订单、信号、周期三张表各一个运行时写方。
+        # 用真实写目标口径：字面量计数会把 `paper_orders_archive` 也算成
+        # `paper_orders`（子串匹配），归档 INSERT 因此是假阳性。
+        self.assertEqual(1, len(real_write_modules("paper_orders")))
+        self.assertEqual(1, len(real_write_modules("paper_signals")))
         for table in ("paper_orders", "paper_signals"):
             self.assertEqual("pending", OWNERSHIP[table]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
