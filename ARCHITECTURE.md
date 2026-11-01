@@ -4549,3 +4549,20 @@ PR-10 其他阶段与读取侧仍待验收，尚未进入 PR-11；未做交易�
 没有schema或数据迁移，未做真实交易时段验证。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第九批 等待池重复记录回收写入（2026-11-01）
+
+把 `paper_trading._recover_stale_runtime_state` 的一对 superseded 写入（旧等待池订单 +
+其信号替代标记）移交 `execution_dispatch.retire_duplicate_waitlist`，SQL、`EXISTS` 谓词、
+原因字面量与状态集合逐字保留。两条语句的顺序作为 owner 内部契约固定：订单先写，
+信号按刚写入的原因标记反查，调用方不能拆开。较新判定、调用时机、事务与异常处理仍留在
+启动恢复路径；owner 不读时钟、不 commit。
+
+信号那条语句自带对 `paper_orders` 的读子查询，因此与订单写入留在同一 owner；拆到
+`signal_service` 会新增跨表边并抬高 `cross_domain_edges`。本批不新增写入口、不新增
+跨域边，`paper_orders`/`paper_signals` 仍为 pending。
+
+冻结对照与范围见 `docs/LEDGER_OWNERSHIP.md` 第14节；不扩大到成交链或 PR-11。
+没有 schema 或数据迁移，未做真实交易时段验证。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

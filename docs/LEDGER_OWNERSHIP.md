@@ -22,8 +22,8 @@
 | `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
 | `paper_risk_decisions` | **owned** | `paper_risk_writes` | 第五批统一来源信息校验及组装；两个 `_risk_log` 只准备快照、策略戳和时间 |
 | `paper_audit` | **owned** | `paper_repository` | 第六批：追加及失败进化操作的清理都归表 owner；补偿方保留事务与异常处理 |
-| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`paper_risk_writes` | 第八批后生命周期层只判断/编排，过期与失效回收写入已移交，其他阶段仍分写 |
-| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`signal_service` | 第八批后生命周期层不再直写；其他阶段仍分写 |
+| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`paper_risk_writes` | 第八批后生命周期层只判断/编排，过期与失效回收写入已移交；第九批再移交等待池重复记录回收，其他阶段仍分写 |
+| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`signal_service` | 第八批后生命周期层不再直写；第九批把等待池回收的信号写并入同一 owner，其他阶段仍分写 |
 | `paper_accounts` | **pending** | `paper_trading`、`paper_shared_cash`、`paper_user_cycle_attachment`、`paper_user_account_provisioning`、`strategy_registry`、`paper_order_execution_authority`、`paper_cycle_ownership`、`adaptive_engine`、`adaptive_risk`、`adaptive_selection`、`adaptive_selection_compat`、`evolution_apply`、`ai_adoption_writer` | 不同 owner 各写自己的字段（现金/周期挂接/策略参数） |
 | `paper_cycles` | **pending** | `paper_trading`、`paper_cycle_service` | 第七批补核查：创建/配置/启停及兼容补齐 vs 周期归档，按阶段登记，不据此认定多写缺陷 |
 
@@ -244,3 +244,35 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 
 本批实测：`cross_domain_edges` 629、`import_cycles`/`foundation_violations` 均0，
 `max_file_lines` 14618→14619（组装根新增一行绑定），其他指标不退化，所有预算不变。
+
+## 14. 第九批 等待池重复记录回收的持久化
+
+基线 `master` @ `48efdef`（#316 合并后）。迁移的是
+`paper_trading._recover_stale_runtime_state` 里的**一对** superseded 写入：
+旧等待池订单退役，及其关联信号的替代标记。两处合成
+`execution_dispatch.retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses)`。
+
+* 两条 SQL、`EXISTS` 自连接谓词、`reason` 拼接字面量、`status IN (...)` 集合全部逐字保留；
+* 顺序是契约：先用订单的原因标记写 superseded，再用
+  `reason LIKE '%等待池记录已保留%'` 反查同批信号 —— 先信号后订单会漏掉本轮新标记的行，
+  owner 内固定执行顺序，调用方无法拆开；
+* 判定（哪条算"较新"、用哪两个活动状态）仍由启动恢复路径给参数，owner 不做时钟读取、
+  不做周期解析、不 commit、不吞异常，全部写入留在调用方同一事务；
+* 旧行 `reason` 为 NULL / 空串 / 已有文本时，`COALESCE` 语义与原实现一致。
+
+为什么两条放同一个 owner：信号那条 UPDATE 在 `WHERE id IN (SELECT ... FROM paper_orders ...)`
+里读订单表。若把它拆给 `signal_service`，该模块会新增对 `paper_orders` 的跨表依赖，
+把 `cross_domain_edges` 推高；而 `execution_dispatch` 本就在两张表的写入集合内，
+既有的域内边不变。因此本批不新增写入口，也不新增跨域边 —— 写方集合仍是7/5个模块。
+
+整表仍为 **pending**：`paper_trading` 在等待池之外的订单/信号写入（entry 路径、
+归档、`_reconcile_signal_order_states`）没有迁移，本批只收口这一处操作级边界。
+
+冻结对照为 `backend/fixtures/waitlist_dedupe_48efdef.txt`（逐字复制 48efdef 的回收块）。
+`backend/test_waitlist_dedupe_write.py` 用同一场景分别跑冻结块与新 owner，比较完整行、
+原因、未涉及行、SQL 顺序、重复执行幂等性、终态信号保护与事务未提交状态。
+没有 schema 或数据迁移，回滚本批提交即可；未做真实交易时段验证，未部署。
+
+本批实测：`cross_domain_edges` 629（不变）、`import_cycles`/`foundation_violations` 均0，
+`max_file_lines` 14619→14599（`paper_trading` 净减20行），`duplicate_helpers` 296、
+`dynamic_name_bridges` 72、`unsuffixed_module_ratio` 0.3906 均不退化，所有预算不变。
