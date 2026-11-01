@@ -25,6 +25,9 @@ PR-10 把 TTL / batch / verification 作为订单审计字段引入，但具体�
 被挂起的委托**不预占资金、不占用席位**（挂起发生在预占之前），所以批量
 等待不会削弱其它策略的可用额度。
 
+另提供窄写入接口 ``expire_order``，承接生命周期层已判定过期的普通买单。
+它只写终态，不参与上述挂起单清扫或过期资格判断。
+
 失败语义
 --------
 - 设置缺省：``execution_batch_gate`` 默认开启、``execution_verification_gate``
@@ -56,6 +59,7 @@ __all__ = [
     "batch_queue",
     "batch_window_state",
     "dispatch_overview",
+    "expire_order",
     "plan_execution_dispatch",
     "resolve_verification",
     "retire_gated_orders",
@@ -584,6 +588,16 @@ def _retire_for_retry(
                  *TERMINAL_SIGNAL_STATUSES),
             )
     return True
+
+
+def expire_order(conn, order_id, *, reason, cancelled_at):
+    """持久化订单自身过期；调用方给出身份、原因和时间，且负责事务。"""
+    conn.execute(
+        """UPDATE paper_orders
+                  SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
+                WHERE id=?""",
+        (EXPIRED_ORDER_STATUS, reason, cancelled_at, order_id),
+    )
 
 
 def _terminate(

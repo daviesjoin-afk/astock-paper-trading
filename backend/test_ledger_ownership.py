@@ -42,6 +42,11 @@ MAINTENANCE_WRITERS = frozenset({
 
 #: 表 -> 允许的写入方（owner 在前）。``pending`` 表示多写方是现状，本 PR 不收敛。
 OWNERSHIP = {
+    "paper_cycles": {
+        "status": "pending",
+        "writers": {"paper_trading", "paper_cycle_service"},
+        "note": "覆盖补核查：主入口创建/配置/状态及兼容补齐，周期服务归档；分阶段职责不认定为多写缺陷",
+    },
     "paper_fills": {
         "status": "owned",
         "writers": {"execution_planner"},
@@ -131,6 +136,67 @@ def write_sites(table: str):
                 continue
             sites[name] = sites.get(name, 0) + 1
     return sites
+
+
+class OrderExpiryOperationOwnershipTests(unittest.TestCase):
+    """订单自身过期的操作级边界；不宣称订单/信号整表已单写。"""
+
+    @staticmethod
+    def inline_expiry_writes(source):
+        tables = set()
+        for node in ast.walk(ast.parse(textwrap.dedent(source))):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                sql = textwrap.dedent(node.value).strip()
+                if WRITE_HEAD.match(sql):
+                    tables.update(re.findall(r"\bpaper_(?:orders|signals)\b", sql, re.IGNORECASE))
+        return tables
+
+    def test_lifecycle_expiry_delegates_both_writes_without_inline_sql(self):
+        import inspect
+        import entry_lifecycle as ELC
+        source = inspect.getsource(ELC.expire_stale_orders)
+        self.assertEqual(set(), self.inline_expiry_writes(source))
+        # 正控证明守卫会发现回流，而不是空扫即通过。
+        self.assertEqual({"paper_orders", "paper_signals"}, self.inline_expiry_writes(
+            source + '\n    conn.execute("UPDATE paper_orders SET status=?")\n'
+            '    conn.execute("UPDATE paper_signals SET status=?")\n'))
+        signature = inspect.signature(ELC.expire_stale_orders)
+        for name in ("release_reservation", "expire_order", "expire_signal"):
+            self.assertEqual(inspect.Parameter.empty, signature.parameters[name].default)
+        self.assertEqual("pending", OWNERSHIP["paper_orders"]["status"])
+        self.assertEqual("pending", OWNERSHIP["paper_signals"]["status"])
+
+    def test_expiry_owners_expose_narrow_business_operations(self):
+        import inspect
+        import execution_dispatch as EPD
+        import signal_service as SIG
+        self.assertEqual(["conn", "order_id", "reason", "cancelled_at"],
+                         list(inspect.signature(EPD.expire_order).parameters))
+        self.assertEqual(["conn", "signal_id", "reason"],
+                         list(inspect.signature(SIG.expire_for_expired_order).parameters))
+
+    def test_cycles_are_registered_by_stage_without_claiming_single_writer(self):
+        self.assertEqual("pending", OWNERSHIP["paper_cycles"]["status"])
+        self.assertEqual({"paper_trading", "paper_cycle_service"},
+                         OWNERSHIP["paper_cycles"]["writers"])
+
+    def test_cycle_authority_reads_cannot_write_or_bootstrap(self):
+        import sqlite3
+        import paper_order_execution_authority as POEA
+        import paper_cycle_ownership as PCY
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE paper_cycles(id INTEGER,status TEXT,enabled_strategies TEXT)")
+        conn.execute("INSERT INTO paper_cycles VALUES(8,'paused','[]')")
+        conn.commit()
+        conn.execute("PRAGMA query_only=ON")
+        self.assertEqual(8, POEA.active_cycle_id_readonly(conn))
+        self.assertTrue(PCY.explicit_empty_cycle(conn, 8))
+        self.assertFalse(PCY.explicit_empty_cycle(conn, 9))
+        missing = sqlite3.connect(":memory:")
+        self.addCleanup(missing.close)
+        missing.execute("PRAGMA query_only=ON")
+        self.assertIsNone(POEA.active_cycle_id_readonly(missing))
 
 
 class LedgerWriteOwnershipTests(unittest.TestCase):

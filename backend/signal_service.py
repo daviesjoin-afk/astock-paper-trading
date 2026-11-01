@@ -3,7 +3,8 @@
 
 Candidate → Evidence → Decision → Approval → Frozen Provenance → Signal Persistence
 
-本模块是 ``paper_signals`` 生产写入的**唯一** owner：
+本模块负责 ``paper_signals`` 生成持久化，以及订单自身过期后的关联信号更新；
+整表生命周期仍有其他阶段写入方，尚未收敛为单写方：
 
 * :func:`commit_signal` 独占 ``INSERT INTO paper_signals`` —— ``paper_trading``
   的 normal / bootstrap 两条路径都必须经此落库，不得再内联 SQL；
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import market_data_contract as MDC
+import entry_lifecycle as ELC
 import strategy_selection_resolver as SRES
 
 __all__ = [
@@ -46,6 +48,7 @@ __all__ = [
     "commit_signal",
     "conflict_statement",
     "decide_signal",
+    "expire_for_expired_order",
     "signal_evidence",
 ]
 
@@ -449,6 +452,15 @@ def commit_signal(
     params = tuple(values[col] for col in _INSERT_COLUMNS)
     conn.execute(conflict_statement(conflict), params)
     return payload
+
+
+def expire_for_expired_order(conn, signal_id, *, reason):
+    """仅将原复试状态的关联信号写为 expired；不解析周期、不读时钟、不提交。"""
+    conn.execute(
+        """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
+                    WHERE id=? AND status IN (?,?,?)""",
+        (ELC.SIGNAL_EXPIRED_STATUS, reason, signal_id, *ELC.RETRY_SIGNAL_STATUSES),
+    )
 
 
 def _serialize_payload(payload: Mapping[str, Any]) -> str:

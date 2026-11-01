@@ -25,6 +25,7 @@
 | `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`entry_lifecycle`、`paper_risk_writes` | 订单状态机按生命周期阶段分写 |
 | `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`entry_lifecycle`、`signal_service` | 信号同样按阶段分写 |
 | `paper_accounts` | **pending** | `paper_trading`、`paper_shared_cash`、`paper_user_cycle_attachment`、`paper_user_account_provisioning`、`strategy_registry`、`paper_order_execution_authority`、`paper_cycle_ownership`、`adaptive_engine`、`adaptive_risk`、`adaptive_selection`、`adaptive_selection_compat`、`evolution_apply`、`ai_adoption_writer` | 不同 owner 各写自己的字段（现金/周期挂接/策略参数） |
+| `paper_cycles` | **pending** | `paper_trading`、`paper_cycle_service` | 第七批补核查：创建/配置/启停及兼容补齐 vs 周期归档，按阶段登记，不据此认定多写缺陷 |
 
 **`owned` = 单写方**；**`pending` = 多写方是现状，本 PR 只锁定集合（只减不增）**。
 
@@ -168,3 +169,49 @@ SQL 与参数逐字保留：账户、事件和 `candidate=<int id>;` detail 前�
 冻结测试覆盖完整保留行、原始 detail、显式/unknown 策略戳、写入顺序、事务回滚、
 SQLite 错误容忍、非 SQLite 错误传播及版本冲突跳过。没有 schema 或数据迁移，
 回滚本批提交即可。没有真实交易时段验证，未部署。
+
+## 11. 第七批 订单自身过期的持久化切片
+
+基线 `master` @ `5c46100`（#314 合并后）。仅迁移
+`entry_lifecycle.expire_stale_orders` 内两条 UPDATE：订单终态交给已有订单写入模块
+`execution_dispatch.expire_order(conn, order_id, *, reason, cancelled_at)`；关联信号交给
+已有信号持久化模块 `signal_service.expire_for_expired_order(conn, signal_id, *, reason)`。
+两个接口没有任意 status、SQL 或字段参数，不解析当前周期、不读时钟、不 commit。
+
+`paper_trading` 使用已有 EPD/SIG 依赖显式绑定，经 `paper_slot_service.run_preflight`
+传给生命周期层的两个必填回调。生命周期层不反向 import 业务模块。过期资格、
+expires_at/TTL 优先级、边界、可恢复状态、原因文本、时钟、统计均保留原处。
+同一连接、同一事务、每行仍依次释放预占、更新订单、按原条件更新关联信号。
+预占释放的 SQLite 错误仍按原逻辑容忍，其他错误继续传播；调用方决定提交或回滚。
+
+`expire_stale_signals` 保持原实现：先处理失效信号，再释放预占并把关联活动订单回收为
+`superseded`。订单自身过期路径仍写 `expired`；两条路径不合并状态或顺序。
+orders/signals 整表仍为 **pending**，原写入模块集合不增加；新增的只是本切片无内联写入、
+窄接口与组装绑定守卫，不宣称整张表或所有运行时拼接 SQL 已收敛。
+
+`backend/fixtures/order_expiry_5c46100.txt` 保留原函数作为冻结对照，比较完整订单/信号/
+预占行、原因、时间戳、返回统计、SQL trace、异常及事务状态。覆盖有效期边界、显式期限
+优先级、无关联/缺失信号、不同状态、重复清扫、两条路径不同终态与调用方提交/回滚。
+没有 schema 或数据迁移；回滚本批提交即可。未做真实交易时段验证，未部署。
+
+## 12. cycles 的验收覆盖补核查
+
+此次只补齐登记和守卫，不迁移周期生产逻辑，也不把分阶段写入视为已发现的多写缺陷。
+
+| 阶段 | 当前职责模块和入口 | 事务归属 |
+| --- | --- | --- |
+| 兼容引导 | `paper_trading._ensure_cycle`：必要时创建 legacy 周期、校正 legacy 参考资金，2 条静态写入 | 使用调用方连接，属于现有引导/初始化事务 |
+| 新建与配置 | `paper_trading.create_cycle`、`configure_capital`：新建、资金配置，2 条静态写入 | 前者使用传入连接；后者在原 `_db()` 中写周期与账户资金 |
+| 启停 | `paper_trading.set_accounts_status`：状态/started_at 更新，1 条静态写入 | 与账户状态、审计共用原 `_db()` 事务 |
+| 归档 | `paper_cycle_service.archive_cycle`：归档状态，1 条静态写入 | 使用传入连接，快照、清理、审计同一事务；start/reset 在同一 `_db()` 中归档后新建 |
+
+读侧：`paper_order_execution_authority.active_cycle_id_readonly` 只读活动周期身份；
+`paper_cycle_ownership` 负责显式 idle、参与者和周期经济归属读取；
+`paper_portfolio_read_model` 消费周期上下文，`paper_cycle_service.cycle_snapshot` 构造归档读模型。
+`paper_trading.load_active_cycle` 在缺周期时会调用 ensure，**不是只读接口**。
+这些职责不能机械合并为一个会隐式创建当前周期的 reader。
+
+矩阵将 cycles 以 **pending** 登记为上述两个静态运行时写入模块，通用 owner 守卫由此覆盖
+新增未登记写入；新增只读连接测试验证活动周期/显式空周期读取不能创建或修改账本。
+这不是 cycles 已完成单写方或所有读取路径收口的结论。PR-10 后续仍须逐阶段治理订单、
+信号、账户字段，并逐表核验周期、读取口径和动态 SQL；完成 PR-10 验收后才进入 PR-11。
