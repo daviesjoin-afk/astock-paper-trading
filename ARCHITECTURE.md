@@ -4381,3 +4381,27 @@ verified；收据里的 owner 指纹必须是 64 位 sha256，历史 `unavailabl
 需要按 9 个职责簇逐个迁到显式依赖。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-9 第三、四批：依赖容器字段与动态名称桥（2026-10-31）
+
+**第三批（`injected_private_fields` 65 → 0）**：三个组装期容器
+（`ManualOrderDependencies` 30 / `ExecutionDependencies` 19 / `DashboardDependencies` 16）的
+私有字段名全部改为公开名；读取点同步（`deps._x` → `deps.x`、`PT._x` → `PT.x`）；
+组装根不再 `globals()[field.name]`，改用 `_dependency_implementation(name)`（先同名、再回退
+`_name` 私有别名，查不到立刻抛错）。`owned_services` 的键同步为公开字段名。
+新增 `backend/test_dependency_contract.py` 机械校验：容器无私有字段、每个字段可解析、
+未知字段大声失败、绑定后字段齐全。
+
+命名约束：`_assert_active_lease` / `_assert_order_execution_cycle` 的公开名必须避开 `assert_`
+前缀（`Mock` 会把它当断言方法），公开为 `require_active_lease` / `require_order_execution_cycle`。
+
+**第四批（`dynamic_name_bridges` 80 → 72）**：只清依赖桥性质的站点——组装根 3 处
+`globals()[...]` 收敛为解析函数内 1 处；`main` 的 2 处 `getattr(P, "_rebuild_…")` 改公开钩子名、
+3 处 `getattr(dfc, "_mem_cache")` 改用 `data_fetcher.memory_cache(name)` 只读访问器。
+其余 72 处是运行时字段内省（按字段名循环做 dataclass/契约校验）与 1 处组装根解析，
+不属于跨模块私有依赖，留给后续"逐簇显式化"批次，不宣称归零。
+
+**实测**：injected 65→0、dynamic 80→72、from_import 0、private_cross_access 6、
+import_cycles 0、foundation_violations 0；`max_file_lines` 14619；预算收紧到 0 / 72。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

@@ -99,7 +99,7 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
 
         with patch.object(PT, "_is_trade_weekday", return_value=True), \
              patch.object(PT, "_db", side_effect=capturing_db), \
-             patch.object(PT, "_assert_active_lease", return_value=None), \
+             patch.object(PT, "_require_active_lease", return_value=None), \
              patch.object(PT, "_claim_runtime_lease", return_value=(False, "other", "exp")):
 
             # Run hot slot: "intraday"

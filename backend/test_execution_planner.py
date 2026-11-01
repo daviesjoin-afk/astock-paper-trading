@@ -67,7 +67,7 @@ def _cycle_stub_kwargs(order_cycle=ORDER_CYCLE, *, proven=True, status=None,
     import paper_trading as PT
 
     return {
-        "_order_cycle_provenance_for_order": (
+        "order_cycle_provenance_for_order": (
             lambda conn, order_id: _provenance(
                 order_cycle, proven=proven, status=status, exists=exists,
             )
@@ -81,7 +81,7 @@ def _cycle_stub_kwargs(order_cycle=ORDER_CYCLE, *, proven=True, status=None,
         # ``paper_accounts.cycle_id``、active cycle id）来决定放行与否 ——
         # 如果换成恒真的 lambda，本文件里所有成交用例都会在「周期校验被删掉」
         # 的变异下依然全绿。
-        "_assert_order_execution_cycle": PT._assert_order_execution_cycle,
+        "require_order_execution_cycle": PT._require_order_execution_cycle,
         "_active_cycle_id_readonly": PT._active_cycle_id_readonly,
         "_account_cycle_id_readonly": PT._account_cycle_id_readonly,
         "OrderExecutionCycleChanged": PT.OrderExecutionCycleChanged,
@@ -255,7 +255,7 @@ class _FakeConn:
 def _pt_stub(now=NOW, statuses=("pending", "waitlist", "retry")):
     """paper_trading 替身：只提供 planner 真正用到的成员。"""
     return types.SimpleNamespace(
-        _now=lambda: now,
+        now=lambda: now,
         ENTRY_RETRY_SIGNAL_STATUSES=statuses,
         MAIN_FORCE_STRATEGY_ID="main_force_top10",
         NEW_STRATEGY_ID="reported_profit_breakout",
@@ -685,8 +685,8 @@ class SharedGateTests(_StubbedPlannerTest):
         self.assertEqual(["熔断"], EP.account_risk_gate({"blocked": True, "reasons": ["熔断"]}))
 
     def test_cash_gate_accounts_for_pending_reservations(self):
-        stub = types.SimpleNamespace(**vars(_pt_stub()), _pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 1000.0),
-            _shared_cash=lambda conn: 5000.0,
+        stub = types.SimpleNamespace(**vars(_pt_stub()), pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 1000.0),
+            shared_cash=lambda conn: 5000.0,
         )
         with mock.patch.object(EP, "_pt", lambda: stub):
             short = EP.cash_gate(None, "buy", 4500.0, 10.0)
@@ -698,9 +698,9 @@ class SharedGateTests(_StubbedPlannerTest):
         self.assertTrue(sell["allowed"])
 
     def test_quote_and_security_gates_reuse_the_shared_implementation(self):
-        stub = types.SimpleNamespace(**vars(_pt_stub()), _execution_quote_status=lambda quote, day, purpose="entry": {
+        stub = types.SimpleNamespace(**vars(_pt_stub()), execution_quote_status=lambda quote, day, purpose="entry": {
                 "fresh": False, "reason": "行情过旧"},
-            _security_scope=lambda code, name=None, risk_flag=None: {
+            security_scope=lambda code, name=None, risk_flag=None: {
                 "allowed": False, "reason": "不在证券范围"},
         )
         with mock.patch.object(EP, "_pt", lambda: stub):
@@ -723,18 +723,18 @@ class CommitFillTests(_StubbedPlannerTest):
         mutations = []
         stub = types.SimpleNamespace(
             **vars(_pt_stub()),
-            _assert_active_lease=lambda *_args: None,
-            _pending_buy_reservations=lambda *_args, **_kwargs: ([], 0.0),
-            _shared_cash=lambda *_args: 50_000.0,
-            _reserve_shared_capital=lambda *_args, **_kwargs: mutations.append("reserve"),
-            _debit_shared_cash=lambda *_args, **_kwargs: mutations.append("cash"),
-            _finish_capital_reservation=lambda *_args, **_kwargs: mutations.append("reservation"),
-            _record_lot=lambda *_args, **_kwargs: mutations.append("lot"),
-            _consume_available_lots=lambda *_args, **_kwargs: mutations.append("consume"),
-            _credit_shared_cash=lambda *_args, **_kwargs: mutations.append("credit"),
-            _risk_log=lambda *_args, **_kwargs: mutations.append("risk"),
-            _audit=lambda *_args, **_kwargs: mutations.append("audit"),
-            _sync_positions=lambda *_args, **_kwargs: mutations.append("positions"),
+            require_active_lease=lambda *_args: None,
+            pending_buy_reservations=lambda *_args, **_kwargs: ([], 0.0),
+            shared_cash=lambda *_args: 50_000.0,
+            reserve_shared_capital=lambda *_args, **_kwargs: mutations.append("reserve"),
+            debit_shared_cash=lambda *_args, **_kwargs: mutations.append("cash"),
+            finish_capital_reservation=lambda *_args, **_kwargs: mutations.append("reservation"),
+            record_lot=lambda *_args, **_kwargs: mutations.append("lot"),
+            consume_available_lots=lambda *_args, **_kwargs: mutations.append("consume"),
+            credit_shared_cash=lambda *_args, **_kwargs: mutations.append("credit"),
+            risk_log=lambda *_args, **_kwargs: mutations.append("risk"),
+            audit=lambda *_args, **_kwargs: mutations.append("audit"),
+            sync_positions=lambda *_args, **_kwargs: mutations.append("positions"),
             _json=lambda value: value,
         )
         quote = {
@@ -771,26 +771,26 @@ class CommitFillTests(_StubbedPlannerTest):
     def test_buy_commit_reserves_debits_and_writes_the_fill(self):
         calls = []
         stub = types.SimpleNamespace(
-            _assert_active_lease=lambda conn, label: calls.append(("lease", label)),
-            _reserve_shared_capital=lambda conn, order_id, account_id, code, amount, fees,
+            require_active_lease=lambda conn, label: calls.append(("lease", label)),
+            reserve_shared_capital=lambda conn, order_id, account_id, code, amount, fees,
             expected_cycle_id=None: (
                 calls.append(("reserve", code, amount, expected_cycle_id)), (True, None))[1],
-            _debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(
+            debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(
                 ("debit", round(value, 2))),
-            _finish_capital_reservation=lambda conn, order_id, status: calls.append(
+            finish_capital_reservation=lambda conn, order_id, status: calls.append(
                 ("reservation", status)),
-            _record_lot=lambda conn, account, plan, qty, price, day, order_id, is_t_base=True, fees=0.0,
+            record_lot=lambda conn, account, plan, qty, price, day, order_id, is_t_base=True, fees=0.0,
             cycle_id=None, acquired_at=None: calls.append(("lot", qty, cycle_id)),
-            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
+            consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
                 calls.append(("consume_cycle", cycle_id)), (qty, 0.0))[1],
-            _credit_shared_cash=lambda conn, value, account_id=None, **kwargs: calls.append(("credit", value)),
+            credit_shared_cash=lambda conn, value, account_id=None, **kwargs: calls.append(("credit", value)),
             _json=lambda value: value,
-            _now=lambda: NOW,
-            _date=lambda day: day,
+            now=lambda: NOW,
+            date=lambda day: day,
             _num=lambda value, default=0.0: default if value in (None, "") else float(value),
-            _risk_log=lambda *args, **kwargs: calls.append(("risk_log", args[5])),
-            _audit=lambda *args, **kwargs: calls.append(("audit", args[2], args[3])),
-            _sync_positions=lambda conn, account_id, day: calls.append(("sync",)),
+            risk_log=lambda *args, **kwargs: calls.append(("risk_log", args[5])),
+            audit=lambda *args, **kwargs: calls.append(("audit", args[2], args[3])),
+            sync_positions=lambda conn, account_id, day: calls.append(("sync",)),
             **_cycle_stub_kwargs(),
         )
         conn = _FakeConn(
@@ -827,24 +827,24 @@ class CommitFillTests(_StubbedPlannerTest):
     def test_manual_commit_does_not_reserve_again(self):
         calls = []
         stub = types.SimpleNamespace(
-            _assert_active_lease=lambda conn, label: None,
-            _reserve_shared_capital=lambda *args, **kwargs: calls.append(("reserve",)) or (True, None),
-            _debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(("debit",)),
-            _finish_capital_reservation=lambda conn, order_id, status: calls.append(("reservation", status)),
-            _consume_capital_reservation=lambda conn, order_id, amount, fees, final=False: calls.append(
+            require_active_lease=lambda conn, label: None,
+            reserve_shared_capital=lambda *args, **kwargs: calls.append(("reserve",)) or (True, None),
+            debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(("debit",)),
+            finish_capital_reservation=lambda conn, order_id, status: calls.append(("reservation", status)),
+            consume_capital_reservation=lambda conn, order_id, amount, fees, final=False: calls.append(
                 ("consume_reservation", amount, fees, final)),
-            _record_lot=lambda *args, **kwargs: calls.append(("lot",)),
-            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
+            record_lot=lambda *args, **kwargs: calls.append(("lot",)),
+            consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
                 None or (qty, 0.0)),
             **_cycle_stub_kwargs(),
-            _credit_shared_cash=lambda *args, **kwargs: calls.append(("credit",)),
+            credit_shared_cash=lambda *args, **kwargs: calls.append(("credit",)),
             _json=lambda value: value,
-            _now=lambda: NOW,
-            _date=lambda day: day,
+            now=lambda: NOW,
+            date=lambda day: day,
             _num=lambda value, default=0.0: default if value in (None, "") else float(value),
-            _risk_log=lambda *args, **kwargs: calls.append(("risk_log", args[5])),
-            _audit=lambda *args, **kwargs: calls.append(("audit", args[2])),
-            _sync_positions=lambda conn, account_id, day: None,
+            risk_log=lambda *args, **kwargs: calls.append(("risk_log", args[5])),
+            audit=lambda *args, **kwargs: calls.append(("audit", args[2])),
+            sync_positions=lambda conn, account_id, day: None,
         )
         plan = {
             "side": "buy", "code": "002241", "qty": 100, "amount": 1000.0,
@@ -866,20 +866,20 @@ class CommitFillTests(_StubbedPlannerTest):
         # 回归护栏：成交的 risk/audit 事件由 commit_fill 独占写入。
         calls = []
         stub = types.SimpleNamespace(
-            _assert_active_lease=lambda conn, label: None,
-            _reserve_shared_capital=lambda *args, **kwargs: (True, None),
-            _debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: None,
-            _finish_capital_reservation=lambda conn, order_id, status: None,
-            _record_lot=lambda *args, **kwargs: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
-            _credit_shared_cash=lambda *args, **kwargs: None,
+            require_active_lease=lambda conn, label: None,
+            reserve_shared_capital=lambda *args, **kwargs: (True, None),
+            debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: None,
+            finish_capital_reservation=lambda conn, order_id, status: None,
+            record_lot=lambda *args, **kwargs: None,
+            consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
+            credit_shared_cash=lambda *args, **kwargs: None,
             _json=lambda value: value,
-            _now=lambda: NOW,
-            _date=lambda day: day,
+            now=lambda: NOW,
+            date=lambda day: day,
             _num=lambda value, default=0.0: default if value in (None, "") else float(value),
-            _risk_log=lambda *args, **kwargs: calls.append(("risk_log",)),
-            _audit=lambda *args, **kwargs: calls.append(("audit",)),
-            _sync_positions=lambda conn, account_id, day: None,
+            risk_log=lambda *args, **kwargs: calls.append(("risk_log",)),
+            audit=lambda *args, **kwargs: calls.append(("audit",)),
+            sync_positions=lambda conn, account_id, day: None,
             **_cycle_stub_kwargs(),
         )
         plan = {
@@ -911,20 +911,20 @@ class CommitFillTests(_StubbedPlannerTest):
 
     def test_sell_commit_requires_the_full_available_quantity(self):
         stub = types.SimpleNamespace(
-            _assert_active_lease=lambda conn, label: None,
-            _reserve_shared_capital=lambda *args, **kwargs: (True, None),
-            _debit_shared_cash=lambda *args, **kwargs: None,
-            _finish_capital_reservation=lambda *args, **kwargs: None,
-            _record_lot=lambda *args, **kwargs: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty - 100, 0.0),
-            _credit_shared_cash=lambda *args, **kwargs: None,
+            require_active_lease=lambda conn, label: None,
+            reserve_shared_capital=lambda *args, **kwargs: (True, None),
+            debit_shared_cash=lambda *args, **kwargs: None,
+            finish_capital_reservation=lambda *args, **kwargs: None,
+            record_lot=lambda *args, **kwargs: None,
+            consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty - 100, 0.0),
+            credit_shared_cash=lambda *args, **kwargs: None,
             _json=lambda value: value,
-            _now=lambda: NOW,
-            _date=lambda day: day,
+            now=lambda: NOW,
+            date=lambda day: day,
             _num=lambda value, default=0.0: default if value in (None, "") else float(value),
-            _risk_log=lambda *args, **kwargs: None,
-            _audit=lambda *args, **kwargs: None,
-            _sync_positions=lambda *args, **kwargs: None,
+            risk_log=lambda *args, **kwargs: None,
+            audit=lambda *args, **kwargs: None,
+            sync_positions=lambda *args, **kwargs: None,
             **_cycle_stub_kwargs(),
         )
         plan = {"side": "sell", "code": "002241", "qty": 200, "amount": 4000.0,
@@ -1009,8 +1009,8 @@ class PlanEntryTests(_StubbedPlannerTest):
 
         stub = types.SimpleNamespace(
             **vars(_pt_stub()),
-            _execution_quote_status=execution_quote_status,
-            _security_scope=lambda *args: {"allowed": True},
+            execution_quote_status=execution_quote_status,
+            security_scope=lambda *args: {"allowed": True},
         )
 
         def evaluate(runtime):
@@ -1049,10 +1049,10 @@ class PlanEntryTests(_StubbedPlannerTest):
         self.assertFalse(changed["gates"]["execution_quote"]["fresh"])
 
     def test_plan_entry_composes_the_shared_gates_and_reports_the_policy(self):
-        stub = types.SimpleNamespace(**vars(_pt_stub()), _execution_quote_status=lambda quote, day, purpose="entry": {"fresh": True},
-            _security_scope=lambda code, name=None, risk_flag=None: {"allowed": True},
-            _pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 0.0),
-            _shared_cash=lambda conn: 100000.0,
+        stub = types.SimpleNamespace(**vars(_pt_stub()), execution_quote_status=lambda quote, day, purpose="entry": {"fresh": True},
+            security_scope=lambda code, name=None, risk_flag=None: {"allowed": True},
+            pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 0.0),
+            shared_cash=lambda conn: 100000.0,
         )
         with mock.patch.object(EP, "_pt", lambda: stub), \
                 mock.patch.object(EP, "seat_reserve_gate", lambda *a, **k: {"reserved": False}):
@@ -1073,12 +1073,12 @@ class PlanEntryTests(_StubbedPlannerTest):
         self.assertEqual("execution-planner-v1", result["policy"]["planner"])
 
     def test_plan_entry_collects_reasons_from_every_gate(self):
-        stub = types.SimpleNamespace(**vars(_pt_stub()), _execution_quote_status=lambda quote, day, purpose="entry": {
+        stub = types.SimpleNamespace(**vars(_pt_stub()), execution_quote_status=lambda quote, day, purpose="entry": {
                 "fresh": False, "reason": "行情过旧"},
-            _security_scope=lambda code, name=None, risk_flag=None: {
+            security_scope=lambda code, name=None, risk_flag=None: {
                 "allowed": False, "reason": "不在证券范围"},
-            _pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 0.0),
-            _shared_cash=lambda conn: 100.0,
+            pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 0.0),
+            shared_cash=lambda conn: 100.0,
         )
         with mock.patch.object(EP, "_pt", lambda: stub), \
                 mock.patch.object(EP, "seat_reserve_gate", lambda *a, **k: {"reserved": False}):
@@ -1101,10 +1101,10 @@ class PlanEntryTests(_StubbedPlannerTest):
 
     def test_formal_adapter_and_explicit_entry_state_are_equivalent(self):
         stub = types.SimpleNamespace(**vars(_pt_stub()),
-            _execution_quote_status=lambda quote, day, purpose="entry": {"fresh": True},
-            _security_scope=lambda code, name=None, risk_flag=None: {"allowed": True},
-            _pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 125.0),
-            _shared_cash=lambda conn: 100000.0,
+            execution_quote_status=lambda quote, day, purpose="entry": {"fresh": True},
+            security_scope=lambda code, name=None, risk_flag=None: {"allowed": True},
+            pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 125.0),
+            shared_cash=lambda conn: 100000.0,
         )
         reserve = {"reserved": False, "owner": None, "interest": 0,
                    "deadline": EP._SEAT_RESERVE_DEADLINE,
@@ -1154,8 +1154,8 @@ class PlanEntryTests(_StubbedPlannerTest):
             entry_state=state_a, quote=kwargs["quote"], strategy_id="tq_breakout",
         )
         stub = types.SimpleNamespace(
-            _security_scope=lambda *args: {"allowed": True},
-            _execution_quote_status=lambda *args, **kwargs: {"fresh": True},
+            security_scope=lambda *args: {"allowed": True},
+            execution_quote_status=lambda *args, **kwargs: {"fresh": True},
         )
         with mock.patch.object(EP, "_pt", lambda: stub):
             unbound = EP.evaluate_entry_state(**kwargs)
@@ -1222,8 +1222,8 @@ class ExecutionStateBuilderTests(unittest.TestCase):
         conn = mock.Mock()
         conn.execute.return_value.fetchall.return_value = []
         paper = types.SimpleNamespace(
-            _pending_buy_reservations=lambda *args, **kwargs: ([], 0.0),
-            _shared_cash=lambda _conn: 50_000.0,
+            pending_buy_reservations=lambda *args, **kwargs: ([], 0.0),
+            shared_cash=lambda _conn: 50_000.0,
         )
         intent = EP.PersistedOrderIntent(
             order_id=7, account_id="trend_pullback", cycle_id=ORDER_CYCLE,
@@ -1348,8 +1348,8 @@ class ExecutionStateBuilderTests(unittest.TestCase):
         conn = mock.Mock()
         conn.execute.return_value.fetchall.return_value = []
         paper = types.SimpleNamespace(
-            _pending_buy_reservations=lambda *args, **kwargs: ([], 0.0),
-            _shared_cash=lambda _conn: 50_000.0,
+            pending_buy_reservations=lambda *args, **kwargs: ([], 0.0),
+            shared_cash=lambda _conn: 50_000.0,
         )
         intent = EP.PersistedOrderIntent(
             order_id=7, account_id="trend_pullback", cycle_id=ORDER_CYCLE,
@@ -1808,8 +1808,8 @@ class ExecutionStateBuilderTests(unittest.TestCase):
         self.assertNotEqual(context_with_gate.context_fingerprint,
                             context_without_gate.context_fingerprint)
         with mock.patch.object(EP, "_pt", lambda: types.SimpleNamespace(
-                _security_scope=lambda *args: {"allowed": True},
-                _execution_quote_status=lambda *args, **kwargs: {"fresh": True},
+                security_scope=lambda *args: {"allowed": True},
+                execution_quote_status=lambda *args, **kwargs: {"fresh": True},
         )):
             shared = {
                 "account_id": "tq_breakout", "code": "002241", "side": "buy",

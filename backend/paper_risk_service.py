@@ -83,7 +83,7 @@ class RiskServicePorts:
     rotation_buy: Callable[..., dict[str, Any]]
     projection: Any
     process_pending_manual_orders: Callable[..., list]
-    assert_active_lease: Callable[..., Any]
+    require_active_lease: Callable[..., Any]
 
 
 #: 与 `paper_numeric.num` 同一实现（严格契约），不再保留本地副本。
@@ -387,7 +387,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         rotation_results = []
         orders = []
         for position in positions:
-            ports.assert_active_lease(conn, "risk position")
+            ports.require_active_lease(conn, "risk position")
             quote = quote_map.get(position["code"], {})
             quote_status = _execution_quote_status(quote, day, purpose="exit")
             quality_review = quality_reviews.get((position["account_id"], position["code"])) or {}
@@ -673,7 +673,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     })
                     continue
                 status, order_reason = "unfilled_limit_down", (reason + "；跌停/无报价，不能虚构成交")
-                ports.assert_active_lease(conn, "risk unfilled-order write")
+                ports.require_active_lease(conn, "risk unfilled-order write")
                 detail = _with_decision_snapshot(
                     detail, account_id=position["account_id"], code=position["code"],
                     side="sell", decision="unfilled", reason=order_reason,
@@ -709,7 +709,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             savepoint = f"risk_pos_{position['account_id']}_{position['code']}"
             conn.execute(f"SAVEPOINT {savepoint}")
             try:
-                ports.assert_active_lease(conn, "risk sell order")
+                ports.require_active_lease(conn, "risk sell order")
                 sell_cycle_id = cycle_id
                 strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
                 cursor = PRW.insert_sell_order(

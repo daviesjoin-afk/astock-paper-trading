@@ -605,10 +605,10 @@ def execution_context_from_facts(
             else:
                 buying_power = max(0.0, float(reservation[0] or 0) + float(reservation[1] or 0))
         else:
-            _, pending = PT._pending_buy_reservations(
+            _, pending = PT.pending_buy_reservations(
                 conn, exclude_order_key=str(row.get("id")),
             )
-            buying_power = max(0.0, float(PT._shared_cash(conn) or 0) - float(pending or 0))
+            buying_power = max(0.0, float(PT.shared_cash(conn) or 0) - float(pending or 0))
     state = ExecutionStateSnapshot(
         buying_power=buying_power,
         sellable_quantity=sellable,
@@ -1023,25 +1023,25 @@ class ExecutionDependencies:
     """Ledger and policy capabilities, never a reference to the engine module."""
     ENTRY_RETRY_SIGNAL_STATUSES: Any
     OrderCycleProvenanceUnknown: Any
-    _assert_active_lease: Any
-    _assert_order_execution_cycle: Any
-    _audit: Any
-    _consume_available_lots: Any
-    _consume_capital_reservation: Any
-    _credit_shared_cash: Any
-    _date: Any
-    _debit_shared_cash: Any
-    _execution_quote_status: Any
-    _finish_capital_reservation: Any
-    _now: Any
-    _order_cycle_provenance_for_order: Any
-    _pending_buy_reservations: Any
-    _record_lot: Any
-    _reserve_shared_capital: Any
-    _risk_log: Any
-    _security_scope: Any
-    _shared_cash: Any
-    _sync_positions: Any
+    require_active_lease: Any
+    require_order_execution_cycle: Any
+    audit: Any
+    consume_available_lots: Any
+    consume_capital_reservation: Any
+    credit_shared_cash: Any
+    date: Any
+    debit_shared_cash: Any
+    execution_quote_status: Any
+    finish_capital_reservation: Any
+    now: Any
+    order_cycle_provenance_for_order: Any
+    pending_buy_reservations: Any
+    record_lot: Any
+    reserve_shared_capital: Any
+    risk_log: Any
+    security_scope: Any
+    shared_cash: Any
+    sync_positions: Any
 
 
 _dependencies_factory = None
@@ -1180,7 +1180,7 @@ def seat_reserve_gate(
         ).fetchone()[0] or 0)
     except Exception:
         interest = 1
-    now = PT._now()
+    now = PT.now()
     day = str(asof_day)[:10]
     deadline_at = f"{day} {policy.seat_reserve_deadline}:00" if day == now[:10] else None
     return seat_reserve_from_state(
@@ -1291,9 +1291,9 @@ def quote_gate(
     """行情新鲜度门禁（复用 ``_execution_quote_status``，口径不变）。"""
     PT = _pt()
     if reference_at is None:
-        status = PT._execution_quote_status(quote, asof_day, purpose=purpose)
+        status = PT.execution_quote_status(quote, asof_day, purpose=purpose)
     else:
-        status = PT._execution_quote_status(
+        status = PT.execution_quote_status(
             quote, asof_day, purpose=purpose, reference_at=reference_at,
         )
     return {
@@ -1307,7 +1307,7 @@ def quote_gate(
 def security_gate(code, name=None, risk_flag=None) -> dict[str, Any]:
     """证券范围门禁（复用 ``_security_scope``，口径不变）。"""
     PT = _pt()
-    scope = PT._security_scope(code, name, risk_flag)
+    scope = PT.security_scope(code, name, risk_flag)
     return {
         "scope": scope,
         "allowed": bool(scope.get("allowed")),
@@ -1356,10 +1356,10 @@ def cash_gate(
     PT = _pt()
     if side != "buy":
         return {"allowed": True, "reason": None, "pending_cash": 0.0, "shared_cash": shared_cash}
-    _, pending_cash = PT._pending_buy_reservations(
+    _, pending_cash = PT.pending_buy_reservations(
         conn, exclude_order_key=exclude_reservation_key,
     )
-    available = PT._shared_cash(conn) if shared_cash is None else float(shared_cash)
+    available = PT.shared_cash(conn) if shared_cash is None else float(shared_cash)
     return cash_gate_from_state(
         side=side, amount=amount, fees=fees, pending_cash=pending_cash,
         shared_cash=available,
@@ -1691,10 +1691,10 @@ def plan_entry(
         )
     PT = _pt()
     if side == "buy":
-        _, pending_cash = PT._pending_buy_reservations(
+        _, pending_cash = PT.pending_buy_reservations(
             conn, exclude_order_key=exclude_reservation_key,
         )
-        available_cash = PT._shared_cash(conn) if shared_cash is None else float(shared_cash)
+        available_cash = PT.shared_cash(conn) if shared_cash is None else float(shared_cash)
     else:
         pending_cash, available_cash = 0.0, shared_cash
     state = EntryGateState(
@@ -1903,7 +1903,7 @@ def commit_fill(
     realized_pnl = None
     cost_amount = None
 
-    PT._assert_active_lease(conn, "execution planner commit")
+    PT.require_active_lease(conn, "execution planner commit")
 
     # ── §12 顺序（不可调换）：lease → provenance → identity → execution-cycle
     #    invariant → 才允许任何 reservation / cash / lot / fill 写 ────────────
@@ -1911,7 +1911,7 @@ def commit_fill(
     # 一个 cycle 8 建的 pending SELL 在 cycle 9 激活后成交时，必须仍然只碰 cycle 8
     # 的 lot；legacy NULL-cycle 订单的归属**不可证明**，只能 fail closed（既不建
     # 带确定周期的 lot，也不去消费某个周期的底仓）。
-    provenance = PT._order_cycle_provenance_for_order(conn, order_id)
+    provenance = PT.order_cycle_provenance_for_order(conn, order_id)
     if not provenance.is_proven:
         raise PT.OrderCycleProvenanceUnknown(
             order_id, provenance.status,
@@ -1924,7 +1924,7 @@ def commit_fill(
     # §5 execution-cycle invariant：订单周期 == 账户当前周期 == active 周期。
     # 上层 scanner 已检查过一遍，这里仍然校验（§12 defense in depth）：调用方可能
     # 持有上一轮缓存的 account 快照，账本在两次读之间搬了家。
-    order_cycle_id = PT._assert_order_execution_cycle(
+    order_cycle_id = PT.require_order_execution_cycle(
         conn, order_id, account_id=account_id, provenance=provenance,
         allow_out_of_cycle_account=(side == "sell"),
     )
@@ -1987,7 +1987,7 @@ def commit_fill(
                  _json(list(decision.reasons)), _json(execution_evidence),
                  decision.ruleset_version, order_id, current_version),
             )
-            PT._risk_log(
+            PT.risk_log(
                 conn, account_id, code, side, "execution_blocked",
                 reason_codes or reason, execution_evidence,
                 strategy_stamp=order_strategy_stamp, order_id=order_id,
@@ -2061,7 +2061,7 @@ def commit_fill(
         "ruleset_version": fill_event.ruleset_version,
     }
 
-    PT._assert_active_lease(conn, "execution planner state transition")
+    PT.require_active_lease(conn, "execution planner state transition")
     changed = conn.execute(
         """UPDATE paper_orders
               SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?,
@@ -2101,38 +2101,38 @@ def commit_fill(
             reservation_key = f"{order_id}:execution:{event_key}"
             # §20–§22：这张订单的周期归属已经在上面证明过，把它传给预占层，
             # 让「预占周期 == 订单周期」也在同一次写入里成立。
-            ok, reserve_reason = PT._reserve_shared_capital(
+            ok, reserve_reason = PT.reserve_shared_capital(
                 conn, reservation_key, account_id, code, amount, fees,
                 expected_cycle_id=order_cycle_id,
             )
             if not ok:
                 raise RuntimeError(reserve_reason or "共享资金池预占失败")
-        PT._assert_active_lease(conn, "execution planner cash debit")
-        PT._debit_shared_cash(conn, amount + fees, preferred_account_id=account_id,
+        PT.require_active_lease(conn, "execution planner cash debit")
+        PT.debit_shared_cash(conn, amount + fees, preferred_account_id=account_id,
                               cycle_id=order_cycle_id)
         if reserved:
-            PT._consume_capital_reservation(
+            PT.consume_capital_reservation(
                 conn, order_id, amount, fees, final=(remaining_qty == 0),
             )
         else:
-            PT._finish_capital_reservation(conn, reservation_key, "consumed")
+            PT.finish_capital_reservation(conn, reservation_key, "consumed")
         # §10：lot 的周期**显式**来自来源订单（`_record_lot` 内部同样强制这一点，
         # 这里显式传入，让「订单 cycle == lot cycle」在调用点也读得出来）。
-        source_lot_id = PT._record_lot(
+        source_lot_id = PT.record_lot(
             conn, account, fill_plan, qty, fill_price, asof_day, order_id,
             is_t_base=is_t_base, fees=fees, cycle_id=order_cycle_id,
             acquired_at=decision.execution_asof,
         )
     else:
-        PT._assert_active_lease(conn, "execution planner lot consumption")
+        PT.require_active_lease(conn, "execution planner lot consumption")
         # §9：FIFO 消耗必须绑定**订单自己**的周期，绝不重新解析 active cycle。
-        consumed, cost_amount = PT._consume_available_lots(
+        consumed, cost_amount = PT.consume_available_lots(
             conn, account_id, code, qty, asof_day, cycle_id=order_cycle_id,
         )
         if consumed != qty:
             raise RuntimeError("可卖份额在成交前发生变化，委托已停止")
         realized_pnl = amount - cost_amount - fees
-        PT._credit_shared_cash(conn, amount - fees, account_id, cycle_id=order_cycle_id)
+        PT.credit_shared_cash(conn, amount - fees, account_id, cycle_id=order_cycle_id)
         # R14 §17：SELL 的 episode 收尾与 lot 消耗同处一个事务，并直接依赖
         # paper_position_risk_state（不经 paper_trading 转发）。manual / deferred
         # SELL 同样能卖光最后一股，必须关闭 episode，否则权威表残留"看着还活着"
@@ -2144,7 +2144,7 @@ def commit_fill(
             next_take_stage=sell_next_take_stage,
         )
 
-    PT._assert_active_lease(conn, "execution planner finalization")
+    PT.require_active_lease(conn, "execution planner finalization")
     if side == "sell" and cost_amount is not None:
         fill_detail["cost_amount"] = round(cost_amount, 2)
         fill_detail["realized_pnl"] = round(realized_pnl, 2)
@@ -2159,7 +2159,7 @@ def commit_fill(
                ruleset_version,execution_evidence)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
          (order_id, account_id, side, code, qty, fill_price, amount, fees,
-          PT._date(asof_day).isoformat(), quote_at, assumption, event_key,
+          PT.date(asof_day).isoformat(), quote_at, assumption, event_key,
           decision.execution_asof, decision.pricing_basis, decision.slippage_amount,
           _json(_plain_evidence(decision.market_evidence)), decision.ruleset_version,
           _json(_plain_evidence(fill_event.execution_evidence))),
@@ -2180,16 +2180,16 @@ def commit_fill(
     # 这里不重新判断任何成交规则。
     EV = _ev()
     EV.stamp_order(conn, order_id)
-    PT._risk_log(
+    PT.risk_log(
         conn, account_id, code, side, action,
         risk_log_reason or reason, fill_detail,
         strategy_stamp=order_strategy_stamp, order_id=order_id,
         authority="EXECUTION", decision_kind=str(action),
     )
-    PT._audit(
+    PT.audit(
         conn, account_id, audit_action or action,
         audit_message or f"{side} {code} {qty}股 @ {fill_price:.2f}",
         strategy_stamp=order_strategy_stamp,
     )
-    PT._sync_positions(conn, account_id, asof_day)
+    PT.sync_positions(conn, account_id, asof_day)
     return realized_pnl

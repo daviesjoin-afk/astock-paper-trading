@@ -433,17 +433,17 @@ class OrderIdentityMismatchFailsClosed(_LedgerCase):
     def _stub_side_effects(self):
         """隔离现金/lot 副作用，让断言落在身份校验本身。"""
         stub = mock.Mock()
-        stub._assert_active_lease = lambda *a, **k: None
-        stub._reserve_shared_capital = lambda *a, **k: (True, None)
+        stub.require_active_lease = lambda *a, **k: None
+        stub.reserve_shared_capital = lambda *a, **k: (True, None)
         for name in ("_debit_shared_cash", "_finish_capital_reservation",
                      "_credit_shared_cash", "_record_lot", "_risk_log",
                      "_audit", "_sync_positions"):
             setattr(stub, name, lambda *a, **k: None)
-        stub._consume_available_lots = lambda *a, **k: (0, 0.0)
+        stub.consume_available_lots = lambda *a, **k: (0, 0.0)
         stub._num = lambda value, default=0.0: default if value in (None, "") else float(value)
         stub._json = lambda value: value
-        stub._date = lambda day: day
-        stub._now = lambda: "2026-09-05 15:00:00"
+        stub.date = lambda day: day
+        stub.now = lambda: "2026-09-05 15:00:00"
         return stub
 
     def _commit_with(self, order_id, *, account_id, code, side, qty=100):
@@ -932,7 +932,7 @@ class ReadOnlyCycleLookupHasNoSideEffects(_LedgerCase):
         order = self.add_order(side="buy", qty=100, cycle_id=None)
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderCycleProvenanceUnknown):
-                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+                PT._require_order_execution_cycle(conn, order, account_id=ACCOUNT)
             active = PT._active_cycle_id_readonly(conn)
         self.assertIsNone(active, "无周期时必须返回 None，不得凭空创建")
         self.assertEqual(
@@ -968,7 +968,7 @@ class ExecutionCycleInvariantIsChecked(_LedgerCase):
                          (later, ACCOUNT))
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
-                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+                PT._require_order_execution_cycle(conn, order, account_id=ACCOUNT)
         self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
         self.assertEqual(ctx.exception.account_cycle_id, later)
         self.assertEqual(ctx.exception.marker, "order_execution_cycle_changed")
@@ -980,7 +980,7 @@ class ExecutionCycleInvariantIsChecked(_LedgerCase):
         self.assertNotEqual(later, self.cycle)
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderExecutionCycleChanged):
-                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+                PT._require_order_execution_cycle(conn, order, account_id=ACCOUNT)
 
     def test_null_account_cycle_is_rejected(self):
         """账户 ``cycle_id`` 为 NULL（未启用策略）⇒ 必须 fail closed。"""
@@ -990,21 +990,21 @@ class ExecutionCycleInvariantIsChecked(_LedgerCase):
                          (ACCOUNT,))
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderExecutionCycleChanged):
-                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+                PT._require_order_execution_cycle(conn, order, account_id=ACCOUNT)
 
     def test_missing_account_is_rejected(self):
         """账户不存在 ⇒ 必须 fail closed（不得把 None 当成"一致"）。"""
         order = self._proven_buy()
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderExecutionCycleChanged):
-                PT._assert_order_execution_cycle(conn, order, account_id="ghost")
+                PT._require_order_execution_cycle(conn, order, account_id="ghost")
 
     def test_consistent_triple_passes_and_returns_the_order_cycle(self):
         """正对照：三者一致时返回订单周期（证明上面的拒绝有区分度）。"""
         order = self._proven_buy()
         with PT._db(immediate=True) as conn:
             self.assertEqual(
-                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT),
+                PT._require_order_execution_cycle(conn, order, account_id=ACCOUNT),
                 self.cycle,
             )
 
@@ -1019,7 +1019,7 @@ class ExecutionCycleInvariantIsChecked(_LedgerCase):
         legacy = self.add_order(side="buy", qty=100, cycle_id=None)
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderCycleProvenanceUnknown):
-                PT._assert_order_execution_cycle(conn, legacy, account_id=ACCOUNT)
+                PT._require_order_execution_cycle(conn, legacy, account_id=ACCOUNT)
 
     def test_guard_does_not_fall_back_to_active_cycle_for_a_drifted_order(self):
         """§5：漂移订单也不得被"修好" —— 拒绝，而不是改用 active cycle。"""
@@ -1031,7 +1031,7 @@ class ExecutionCycleInvariantIsChecked(_LedgerCase):
                          (later, ACCOUNT))
         with PT._db(immediate=True) as conn:
             with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
-                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+                PT._require_order_execution_cycle(conn, order, account_id=ACCOUNT)
         # 异常必须携带**订单自己的**周期，而不是 active 周期 —— 否则上层无法区分
         # "归属未知" 与 "归属已知但账本已搬家"。
         self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
@@ -1712,28 +1712,28 @@ class ProvenancePrecheckHappensBeforeAnyMutation(_LedgerCase):
 
     def _spy_stub(self, calls):
         stub = mock.Mock()
-        stub._assert_active_lease = lambda *a, **k: None
-        stub._reserve_shared_capital = lambda *a, **k: (calls.append("reserve"), (True, None))[1]
-        stub._debit_shared_cash = lambda *a, **k: calls.append("debit")
-        stub._finish_capital_reservation = lambda *a, **k: calls.append("reservation")
-        stub._record_lot = lambda *a, **k: calls.append("lot")
-        stub._consume_available_lots = lambda *a, **k: (calls.append("consume"), (0, 0.0))[1]
-        stub._credit_shared_cash = lambda *a, **k: calls.append("credit")
-        stub._risk_log = lambda *a, **k: None
-        stub._audit = lambda *a, **k: None
-        stub._sync_positions = lambda *a, **k: None
+        stub.require_active_lease = lambda *a, **k: None
+        stub.reserve_shared_capital = lambda *a, **k: (calls.append("reserve"), (True, None))[1]
+        stub.debit_shared_cash = lambda *a, **k: calls.append("debit")
+        stub.finish_capital_reservation = lambda *a, **k: calls.append("reservation")
+        stub.record_lot = lambda *a, **k: calls.append("lot")
+        stub.consume_available_lots = lambda *a, **k: (calls.append("consume"), (0, 0.0))[1]
+        stub.credit_shared_cash = lambda *a, **k: calls.append("credit")
+        stub.risk_log = lambda *a, **k: None
+        stub.audit = lambda *a, **k: None
+        stub.sync_positions = lambda *a, **k: None
         stub._json = lambda value: value
-        stub._now = lambda: "2026-09-05 15:00:00"
-        stub._date = lambda day: day
+        stub.now = lambda: "2026-09-05 15:00:00"
+        stub.date = lambda day: day
         stub._num = lambda value, default=0.0: default if value in (None, "") else float(value)
         # 关键：**不**替身被验证的东西。归属读取与异常类型必须指向真实实现，
         # 否则 mock.Mock 的任意属性都是真值，`provenance.is_proven` 恒真，
         # 预检被静默跳过，测试就变成永绿的空壳。
-        stub._order_cycle_provenance_for_order = PT._order_cycle_provenance_for_order
+        stub.order_cycle_provenance_for_order = PT._order_cycle_provenance_for_order
         stub.OrderCycleProvenanceUnknown = PT.OrderCycleProvenanceUnknown
         # execution-cycle 闸门同样必须指向真实实现：auto-Mock 会返回真值，让
         # 「漏掉周期一致性校验」这件事在 spy 测试里观测不到。
-        stub._assert_order_execution_cycle = PT._assert_order_execution_cycle
+        stub.require_order_execution_cycle = PT._require_order_execution_cycle
         stub.OrderExecutionCycleChanged = PT.OrderExecutionCycleChanged
         return stub
 

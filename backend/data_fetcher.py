@@ -81,6 +81,15 @@ os.makedirs(KLINE_DIR, exist_ok=True)
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
 _cache_lock = threading.Lock()
 _mem_cache = {}
+
+
+def memory_cache(name):
+    """只读取值：返回 ``_mem_cache[name]`` 的当前值（没有则 None）。
+
+    浏览器/数据更新这类只读消费者不再 ``getattr(dfc, "_mem_cache")`` 去翻私有
+    字典；写入仍归本模块内部。
+    """
+    return _mem_cache.get(name)
 _finance_fetch_lock = threading.Lock()
 _finance_fetch_state = {"retry_at": 0.0}
 _concept_member_locks = {}
