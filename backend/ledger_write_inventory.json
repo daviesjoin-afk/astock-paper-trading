@@ -5109,6 +5109,30 @@
    ]
   },
   {
+   "function": "_db",
+   "kind": "static",
+   "line": 44,
+   "module": "test_package_a_callers",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_orders(id,account_id,signal_id,code,side,status,reason,origin,cancelled_at) VALUES(?,?,?,?,?,?,?,?,?)",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "_db",
+   "kind": "static",
+   "line": 47,
+   "module": "test_package_a_callers",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_capital_reservations(order_key,status,released_at) VALUES(?,?,?)",
+   "write_targets": [
+    "paper_capital_reservations"
+   ]
+  },
+  {
    "function": "setUp",
    "kind": "static",
    "line": 46,
