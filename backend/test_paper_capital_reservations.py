@@ -318,9 +318,9 @@ class ArchitectureGuardTests(unittest.TestCase):
         for forbidden in ("paper_orders", "paper_positions", "paper_cycles", "COMMIT", "ROLLBACK", "SAVEPOINT"):
             self.assertNotIn(forbidden, source)
         self.assertEqual(1, source.count("INSERT INTO paper_capital_reservations"))
-        # Two updates manage reservation lifecycle; two consume amounts as R26
-        # partial fills commit. Keep all reservation writes in this owner.
-        self.assertEqual(4, source.count('"""UPDATE paper_capital_reservations'))
+        # 生命周期更新 + R26 部分成交消费 + PR-10 的"按订单键释放"入口：所有
+        # 预占写入都必须在本 owner 内。
+        self.assertEqual(5, source.count('"""UPDATE paper_capital_reservations'))
 
     def test_recovery_exception_is_documented(self):
         architecture_path = pathlib.Path(__file__).parents[1].joinpath("ARCHITECTURE.md")
@@ -331,6 +331,7 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("cross-cycle", architecture.lower())
 
     def test_recovery_exception_source_is_enforced(self):
+        source_of_trading = TRADING_PATH.read_text(encoding="utf-8")
         source = TRADING_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         function_sources = {
@@ -364,8 +365,14 @@ class ArchitectureGuardTests(unittest.TestCase):
             "paper_schema_migrations.py").read_text(encoding="utf-8")
         self.assertIn("CREATE TABLE IF NOT EXISTS paper_capital_reservations", schema_source)
         self.assertIn('"""UPDATE paper_capital_reservations', schema_source)
-        self.assertIn("_reconcile_signal_order_states", direct_mutators)
-        self.assertEqual({"_reconcile_signal_order_states"}, direct_mutators)
+        # PR-10：``_reconcile_signal_order_states`` 不再自己写预占表，改为调用
+        # owner 的业务入口；因此 paper_trading 里**没有**任何运行时直接写入。
+        self.assertEqual(set(), direct_mutators,
+                         f"paper_trading 仍在直接写预占表：{sorted(direct_mutators)}")
+        reconcile_start = source_of_trading.index("def _reconcile_signal_order_states")
+        reconcile_body = source_of_trading[reconcile_start:reconcile_start + 8000]
+        self.assertIn("PCR.release_order_reservation(", reconcile_body,
+                      "对账路径必须走 owner 的释放入口")
 
 
 if __name__ == "__main__":
