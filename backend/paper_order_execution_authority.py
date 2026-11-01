@@ -283,6 +283,15 @@ _order_cycle_provenance_for_order = order_cycle_provenance_for_order
 _account_cycle_id_readonly = account_cycle_id_readonly
 _active_cycle_id_readonly = active_cycle_id_readonly
 _require_order_execution_cycle = require_order_execution_cycle
+
+
+def assert_order_execution_cycle(*args, **kwargs):
+    """历史入口（PR-9 前的公开名）：转发到 :func:`require_order_execution_cycle`。
+
+    正式接口是 ``require_order_execution_cycle``；这里不重新实现周期校验，
+    旧名无法绕过 owner 的判定与 fail-closed 行为。
+    """
+    return require_order_execution_cycle(*args, **kwargs)
 _order_cycle_id_for_order = order_cycle_id_for_order
 _orders_have_cycle_column = orders_have_cycle_column
 _order_cycle_id_for_order = order_cycle_id_for_order

@@ -425,6 +425,10 @@ def _require_active_lease(conn, phase="ledger mutation"):
     return True
 
 
+def _assert_active_lease(*args, **kwargs):
+    return _require_active_lease(*args, **kwargs)  # 历史名薄转发，运行时可替换
+
+
 def _intraday_business_key(now=None):
     """Return one idempotency key for the normalized three-minute window."""
     now = now if isinstance(now, dt.datetime) else dt.datetime.now()
@@ -14547,12 +14551,12 @@ _PAPER_JOB_RUN_REQUIRED_COLUMNS = PAPER_JOB_RUN_REQUIRED_COLUMNS
 # Factories resolve each declared field at call time so runtime state and test
 # overrides are never frozen at module import. No vertical receives this module.
 def _dependency_implementation(name):
-    """按容器的公开字段名解析组装期实现（先同名、再回退到 ``_name`` 私有别名）。"""
-    module = globals()
-    value = module.get(name) or module.get("_" + name)
-    if value is None:
-        raise RuntimeError(f"未登记的依赖实现: {name}")
-    return value
+    """按公开字段名解析：先 ``_name`` 私有别名、再同名公开；只把 None 当缺失。"""
+    for key in ("_" + name, name):
+        value = globals().get(key)
+        if value is not None:
+            return value
+    raise RuntimeError(f"未登记的依赖实现: {name}")
 
 
 def _bind_application_dependencies():

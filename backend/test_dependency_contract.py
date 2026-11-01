@@ -17,6 +17,7 @@ import dataclasses
 import os
 import sys
 import unittest
+from unittest import mock
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
@@ -68,3 +69,83 @@ class DependencyContainerContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class LegacyEntryPointCompatTests(unittest.TestCase):
+    """PR-9 依赖字段公开化时删掉的旧入口必须还在，且不得另立一套判定。"""
+
+    def test_legacy_lease_name_is_importable_and_callable(self):
+        self.assertTrue(callable(PT._assert_active_lease))
+        self.assertTrue(callable(PT._require_active_lease))
+
+    def test_legacy_lease_name_forwards_to_the_owner(self):
+        sentinel = object()
+        with mock.patch.object(PT, "_require_active_lease", return_value=sentinel) as owner:
+            self.assertIs(PT._assert_active_lease("conn", "phase"), sentinel)
+        owner.assert_called_once_with("conn", "phase")
+
+    def test_legacy_lease_name_still_fails_closed_when_lease_is_lost(self):
+        with mock.patch.object(PT, "_require_active_lease",
+                               side_effect=RuntimeError("paper lease lost: fixture")):
+            with self.assertRaisesRegex(RuntimeError, "paper lease lost"):
+                PT._assert_active_lease(object(), "phase")
+            with self.assertRaisesRegex(RuntimeError, "paper lease lost"):
+                PT._require_active_lease(object(), "phase")
+
+    def test_legacy_cycle_name_is_importable_and_forwards(self):
+        import paper_order_execution_authority as POEA
+        self.assertTrue(callable(POEA.assert_order_execution_cycle))
+        self.assertTrue(callable(POEA.require_order_execution_cycle))
+        sentinel = object()
+        with mock.patch.object(POEA, "require_order_execution_cycle",
+                               return_value=sentinel) as owner:
+            self.assertIs(POEA.assert_order_execution_cycle("c", 9, account_id="a"), sentinel)
+        owner.assert_called_once_with("c", 9, account_id="a")
+
+    def test_legacy_cycle_name_cannot_bypass_validation(self):
+        import paper_order_execution_authority as POEA
+        with mock.patch.object(POEA, "require_order_execution_cycle",
+                               side_effect=RuntimeError("cycle mismatch fixture")):
+            with self.assertRaisesRegex(RuntimeError, "cycle mismatch"):
+                POEA.assert_order_execution_cycle(object(), 9)
+            with self.assertRaisesRegex(RuntimeError, "cycle mismatch"):
+                POEA.require_order_execution_cycle(object(), 9)
+
+    def test_containers_keep_public_require_fields(self):
+        names = {f.name for _, container in CONTAINERS for f in dataclasses.fields(container)}
+        self.assertIn("require_active_lease", names)
+        self.assertIn("require_order_execution_cycle", names)
+
+    def test_no_assert_prefixed_dependency_fields_are_reintroduced(self):
+        """`assert_*` 会被 Mock 当成断言方法，依赖字段必须继续用 require_*。"""
+        for label, container in CONTAINERS:
+            for field in dataclasses.fields(container):
+                with self.subTest(container=label, field=field.name):
+                    self.assertFalse(field.name.startswith("assert_"),
+                                     "依赖字段不得以 assert_ 开头（Mock 会拦截）")
+
+
+class DependencyResolverBoundaryTests(unittest.TestCase):
+    """`_dependency_implementation` 的解析边界。"""
+
+    def test_legacy_private_alias_wins_over_an_unrelated_public_name(self):
+        with mock.patch.object(PT, "collision_probe", "public", create=True),                 mock.patch.object(PT, "_collision_probe", "legacy", create=True):
+            self.assertEqual(PT._dependency_implementation("collision_probe"), "legacy")
+
+    def test_public_name_is_used_when_no_legacy_alias_exists(self):
+        with mock.patch.object(PT, "only_public_probe", "public", create=True):
+            self.assertEqual(PT._dependency_implementation("only_public_probe"), "public")
+
+    def test_falsy_implementations_are_not_treated_as_missing(self):
+        with mock.patch.object(PT, "_falsy_probe", 0, create=True):
+            self.assertEqual(PT._dependency_implementation("falsy_probe"), 0)
+
+    def test_unknown_field_fails_immediately(self):
+        with self.assertRaisesRegex(RuntimeError, "未登记的依赖实现"):
+            PT._dependency_implementation("no_such_dependency")
+
+    def test_resolution_is_runtime_not_frozen_at_import(self):
+        sentinel = object()
+        with mock.patch.object(PT, "_audit", sentinel):
+            self.assertIs(PT._dependency_implementation("audit"), sentinel)
+            # 绑定工厂是惰性的：模块导入之后替换实现，下一次取依赖就能看到。
+            self.assertIs(MO._dependencies().audit, sentinel)
