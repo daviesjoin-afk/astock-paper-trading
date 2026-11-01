@@ -63,7 +63,8 @@ def run_preflight(*, db_factory, audit: Callable, resolve_asof_day: Callable) ->
 
     try:
         with db_factory() as conn:
-            EPD.run_execution_dispatch(conn)
+            EPD.run_execution_dispatch(
+                conn, release_reservation=PCR.release_order_reservation)
     except Exception as exc:  # pragma: no cover - exercised through injected failures
         result["dispatch"] = "error"
         _best_effort_audit(

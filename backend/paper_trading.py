@@ -8060,7 +8060,9 @@ def resolve_execution_verification(order_id, approved, operator="", note=""):
     init_db()
     with _db(immediate=True, hot_path=True) as conn:
         return EPD.resolve_verification(
-            conn, int(order_id), approved=bool(approved),
+            conn, int(order_id),
+            release_reservation=PCR.release_order_reservation,
+            approved=bool(approved),
             operator=str(operator or "")[:64], note=str(note or "")[:500],
         )
 
@@ -9194,7 +9196,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     elif allowed:
         # 闸门已开（批量窗口内 / 已人工核验）：回收该信号遗留的挂起单，
         # 避免挂起单与本次成交单同时占用审计视图。
-        EPD.retire_gated_orders(conn, signal.get("id"))
+        EPD.retire_gated_orders(
+            conn, signal.get("id"),
+            release_reservation=PCR.release_order_reservation)
     decision_name = "approved" if allowed else (
         "q3_shadow_candidate" if q3_shadow_ready else (
             "deferred_limit" if limit_deferred else

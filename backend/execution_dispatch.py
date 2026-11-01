@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
     "EXECUTION_DISPATCH_VERSION",
@@ -440,14 +440,14 @@ def _payload_of(row: Mapping[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _release_reservation(conn, order_id) -> None:
+def _release_reservation(conn, order_id, release) -> None:
+    """释放预占：写入权归 ``paper_capital_reservations``。
+
+    回调由装配层注入（本模块不 import 业务 owner，避免 execution→paper 跨域边）；
+    这里只提供时钟与 ``sqlite3.Error`` 容忍。
+    """
     try:
-        conn.execute(
-            """UPDATE paper_capital_reservations
-                  SET status='released',released_at=COALESCE(released_at,?)
-                WHERE status='reserved' AND CAST(order_key AS TEXT)=?""",
-            (_iso(_now()), str(int(order_id))),
-        )
+        release(conn, order_id, now=_iso(_now()))
     except sqlite3.Error:
         pass
 
@@ -533,6 +533,7 @@ def _retire_for_retry(
     row: Mapping[str, Any],
     reason: str,
     *,
+    release_reservation: Callable[..., Any],
     release_batch: bool = False,
     now: dt.datetime | None = None,
 ) -> bool:
@@ -560,7 +561,7 @@ def _retire_for_retry(
             WHERE id=?""",
         (reason, _iso(moment), order_id),
     )
-    _release_reservation(conn, order_id)
+    _release_reservation(conn, order_id, release_reservation)
     if release_batch and signal_id is not None:
         _write_signal_marker(conn, signal_id, BATCH_RELEASE_PAYLOAD_KEY, {
             "released": True, "reason": reason,
@@ -591,11 +592,12 @@ def _terminate(
     status: str,
     reason: str,
     *,
+    release_reservation: Callable[..., Any],
     terminal_signal: bool = True,
     signal_status: str = "rejected",
 ) -> None:
     order_id = int(row["id"])
-    _release_reservation(conn, order_id)
+    _release_reservation(conn, order_id, release_reservation)
     conn.execute(
         """UPDATE paper_orders
               SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
@@ -609,7 +611,8 @@ def _terminate(
         )
 
 
-def retire_gated_orders(conn, signal_id, *, reason: str = "执行闸门已开，挂起委托回收") -> int:
+def retire_gated_orders(conn, signal_id, *, release_reservation: Callable[..., Any],
+                        reason: str = "执行闸门已开，挂起委托回收") -> int:
     """回收某信号遗留的挂起委托（闸门打开后由成交路径调用）。"""
     if signal_id is None:
         return 0
@@ -629,12 +632,14 @@ def retire_gated_orders(conn, signal_id, *, reason: str = "执行闸门已开，
                 WHERE id=? AND status IN (?,?)""",
             (reason, order_id, *GATED_ORDER_STATUSES),
         )
-        _release_reservation(conn, order_id)
+        _release_reservation(conn, order_id, release_reservation)
     return len(rows)
 
 
 def sweep_expired_gated_orders(
     conn,
+    *,
+    release_reservation: Callable[..., Any],
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -663,7 +668,8 @@ def sweep_expired_gated_orders(
         if signal_status in TERMINAL_SIGNAL_STATUSES:
             _terminate(
                 conn, row, "superseded",
-                "关联信号已进入终态，挂起委托回收", terminal_signal=False,
+                "关联信号已进入终态，挂起委托回收",
+                release_reservation=release_reservation, terminal_signal=False,
             )
             summary["retired"] += 1
             continue
@@ -685,14 +691,14 @@ def sweep_expired_gated_orders(
             _terminate(
                 conn, row, EXPIRED_ORDER_STATUS,
                 "严格时限画像到期未成交，委托作废",
-                signal_status="expired",
+                release_reservation=release_reservation, signal_status="expired",
             )
             summary["expired"] += 1
         else:
             _retire_for_retry(
                 conn, row,
                 "执行时限到期，挂起委托作废；信号仍新鲜时由下一轮重建新委托",
-                release_batch=True, now=moment,
+                release_reservation=release_reservation, release_batch=True, now=moment,
             )
             summary["released"] += 1
     return summary
@@ -700,11 +706,15 @@ def sweep_expired_gated_orders(
 
 def run_execution_dispatch(
     conn,
+    *,
+    release_reservation: Callable[..., Any],
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """周期清扫入口（每轮扫描调用一次），返回本轮处置摘要。"""
-    return sweep_expired_gated_orders(conn, now=now, dispatch_settings=dispatch_settings)
+    return sweep_expired_gated_orders(
+        conn, release_reservation=release_reservation,
+        now=now, dispatch_settings=dispatch_settings)
 
 
 def _queue_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -783,6 +793,7 @@ def resolve_verification(
     conn,
     order_id: int,
     *,
+    release_reservation: Callable[..., Any],
     approved: bool,
     operator: str = "",
     note: str = "",
@@ -816,12 +827,13 @@ def resolve_verification(
         _retire_for_retry(
             conn, record,
             f"人工核验放行（{decision['operator'] or '运营'}）：{note or '无备注'}",
-            now=now,
+            release_reservation=release_reservation, now=now,
         )
     else:
         _terminate(
             conn, record, CANCELLED_ORDER_STATUS,
             f"人工核验驳回（{decision['operator'] or '运营'}）：{note or '无备注'}",
+            release_reservation=release_reservation,
         )
     return {
         "ok": True,
