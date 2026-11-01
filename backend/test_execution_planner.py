@@ -19,6 +19,7 @@ from dataclasses import replace
 from unittest import mock
 
 import execution_planner as EP
+import paper_order_ledger as POL
 import paper_quote_policy as PQP
 import simulation_runtime_context as SRC
 
@@ -174,10 +175,11 @@ def _runtime_context_for_state(*, execution_state=None, entry_state=None,
 
 
 class _FakeResult:
-    def __init__(self, value=None, row=None, rows=None):
+    def __init__(self, value=None, row=None, rows=None, rowcount=1):
         self._value = value
         self._row = row
         self._rows = rows
+        self.rowcount = rowcount
 
     def fetchone(self):
         if self._row is not None:
@@ -261,6 +263,9 @@ def _pt_stub(now=NOW, statuses=("pending", "waitlist", "retry")):
         NEW_STRATEGY_ID="reported_profit_breakout",
         _num=lambda value, default=0.0: default if value in (None, "") else float(value),
         link_source_fill=lambda conn, lot_id, fill_id: 1,
+        record_execution_block=POL.record_execution_block,
+        record_fill_result=POL.record_fill_result,
+        accumulate_realized_pnl=POL.accumulate_realized_pnl,
         **_cycle_stub_kwargs(),
     )
 
@@ -773,6 +778,9 @@ class CommitFillTests(_StubbedPlannerTest):
         calls = []
         stub = types.SimpleNamespace(
             require_active_lease=lambda conn, label: calls.append(("lease", label)),
+            record_execution_block=POL.record_execution_block,
+            record_fill_result=POL.record_fill_result,
+            accumulate_realized_pnl=POL.accumulate_realized_pnl,
             reserve_shared_capital=lambda conn, order_id, account_id, code, amount, fees,
             expected_cycle_id=None: (
                 calls.append(("reserve", code, amount, expected_cycle_id)), (True, None))[1],
@@ -829,6 +837,9 @@ class CommitFillTests(_StubbedPlannerTest):
         calls = []
         stub = types.SimpleNamespace(
             require_active_lease=lambda conn, label: None,
+            record_execution_block=POL.record_execution_block,
+            record_fill_result=POL.record_fill_result,
+            accumulate_realized_pnl=POL.accumulate_realized_pnl,
             reserve_shared_capital=lambda *args, **kwargs: calls.append(("reserve",)) or (True, None),
             debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: calls.append(("debit",)),
             finish_capital_reservation=lambda conn, order_id, status: calls.append(("reservation", status)),
@@ -868,6 +879,9 @@ class CommitFillTests(_StubbedPlannerTest):
         calls = []
         stub = types.SimpleNamespace(
             require_active_lease=lambda conn, label: None,
+            record_execution_block=POL.record_execution_block,
+            record_fill_result=POL.record_fill_result,
+            accumulate_realized_pnl=POL.accumulate_realized_pnl,
             reserve_shared_capital=lambda *args, **kwargs: (True, None),
             debit_shared_cash=lambda conn, value, preferred_account_id=None, **kwargs: None,
             finish_capital_reservation=lambda conn, order_id, status: None,
@@ -913,6 +927,9 @@ class CommitFillTests(_StubbedPlannerTest):
     def test_sell_commit_requires_the_full_available_quantity(self):
         stub = types.SimpleNamespace(
             require_active_lease=lambda conn, label: None,
+            record_execution_block=POL.record_execution_block,
+            record_fill_result=POL.record_fill_result,
+            accumulate_realized_pnl=POL.accumulate_realized_pnl,
             reserve_shared_capital=lambda *args, **kwargs: (True, None),
             debit_shared_cash=lambda *args, **kwargs: None,
             finish_capital_reservation=lambda *args, **kwargs: None,

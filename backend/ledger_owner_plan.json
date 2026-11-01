@@ -49,34 +49,6 @@
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
-  "execution_planner::commit_fill": {
-   "judge": "commit_fill 唯一成交权威",
-   "operation": "成交结果写入（状态/成交价/费用/证据）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
-  },
-  "execution_verification::backfill_legacy_orders": {
-   "judge": "execution_verification 兼容规则",
-   "operation": "历史订单核验戳补齐（维护）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_verification::stamp_order": {
-   "judge": "execution_verification 核验结论",
-   "operation": "执行核验戳写入",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_verification::stamp_terminal_zero_orders": {
-   "judge": "execution_verification 核验结论",
-   "operation": "零成交终态订单核验戳",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
   "manual_orders::_commit_strategy_buy": {
    "judge": "manual_orders 策略入口",
    "operation": "策略买入订单创建（INSERT）",
@@ -136,6 +108,13 @@
    "single_package": "D",
    "transaction": "服务入口传入的连接"
   },
+  "paper_order_ledger::accumulate_realized_pnl": {
+   "judge": "commit_fill 卖出结算",
+   "operation": "卖出实现盈亏累加",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
   "paper_order_ledger::cancel_order": {
    "judge": "手动入口校验 + 用户请求",
    "operation": "用户撤单：订单转 cancelled（可撤销状态白名单）",
@@ -157,6 +136,27 @@
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
+  "paper_order_ledger::record_execution_block": {
+   "judge": "commit_fill 执行决策",
+   "operation": "执行阻塞结果写库（含乐观锁版本）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
+  "paper_order_ledger::record_fill_result": {
+   "judge": "commit_fill 唯一成交权威",
+   "operation": "成交结果写库（状态/成交量/均价/金额/费用/证据/版本推进）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
+  "paper_order_ledger::record_realized_pnl": {
+   "judge": "paper_trading 重建口径",
+   "operation": "已实现盈亏回填（重建口径）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
   "paper_order_ledger::retire_duplicate_waitlist_orders": {
    "judge": "paper_trading 启动恢复",
    "operation": "等待池重复记录退役（订单，批量）",
@@ -169,6 +169,20 @@
    "operation": "挂起订单退役（batch/verification 等待超时）",
    "single_owner": "paper_order_ledger",
    "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::stamp_execution": {
+   "judge": "execution_verification 核验结论",
+   "operation": "执行核验结论单行写入",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::stamp_execution_rows": {
+   "judge": "execution_verification 核验结论",
+   "operation": "执行核验结论批量写入（含历史回填）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_order_ledger::supersede_duplicate_execution_retry": {
@@ -211,6 +225,13 @@
    "operation": "派发终止：订单转调用方判定的终态",
    "single_owner": "paper_order_ledger",
    "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::update_risk_payload": {
+   "judge": "paper_trading 日内卖出收尾",
+   "operation": "按 execution_version 乐观锁改写 risk_payload",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_shared_cash::credit_shared_cash": {
@@ -298,20 +319,6 @@
     }
    },
    "transaction": "启动恢复/初始化连接"
-  },
-  "paper_trading::_intraday_sell": {
-   "judge": "paper_trading 风控/止盈决策",
-   "operation": "卖出订单创建（INSERT）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::_rebuild_realized_pnl": {
-   "judge": "paper_trading 重建口径",
-   "operation": "已实现盈亏回填 realized_pnl",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
   },
   "paper_trading::_reconcile_shared_cash": {
    "judge": "paper_trading 现金对账口径",

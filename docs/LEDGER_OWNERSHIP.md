@@ -417,22 +417,23 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `paper_orders` | 成交结果写入（状态/成交价/费用/证据） | `execution_planner::commit_fill` | commit_fill 唯一成交权威 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
-| `paper_orders` | 历史订单核验戳补齐（维护） | `execution_verification::backfill_legacy_orders` | execution_verification 兼容规则 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_verification`、`test_tradability_position_shadow_architecture_guard` |
-| `paper_orders` | 执行核验戳写入 | `execution_verification::stamp_order` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_verification`、`test_execution_verification_wiring`、`test_paper_trading_architecture_guard` |
-| `paper_orders` | 零成交终态订单核验戳 | `execution_verification::stamp_terminal_zero_orders` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_portfolio_read_model` |
 | `paper_orders` | 策略买入订单创建（INSERT） | `manual_orders::_commit_strategy_buy` | manual_orders 策略入口 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_adaptive_dependency_boundary`、`test_execution_planner`、`test_learning_dataset` |
 | `paper_signals` | 策略成交联动信号状态 | `manual_orders::commit_strategy_entry_fill` | commit_fill 成交结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard` |
 | `paper_orders` | 手动委托执行状态推进 | `manual_orders::process_pending_manual_orders` | manual_orders 执行循环 | `paper_order_ledger` | 服务入口传入的连接 | `test_deferred_fill_cycle_binding`、`test_paper_timing`、`test_paper_trading_architecture_guard` |
 | `paper_orders` | 策略成交失败回写（订单侧） | `manual_orders::strategy_fill_failure` | commit_fill 失败结果 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard`、`test_strategy_buy_commit_convergence` |
 | `paper_signals` | 成交失败：信号回 deferred_capacity | `manual_orders::strategy_fill_failure` | commit_fill 失败结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard`、`test_strategy_buy_commit_convergence` |
 | `paper_orders` | 手动下单订单创建（INSERT） | `manual_orders::submit_manual_order` | 手动入口校验 + 风险决定 | `paper_order_ledger` | 服务入口传入的连接 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
+| `paper_orders` | 卖出实现盈亏累加 | `paper_order_ledger::accumulate_realized_pnl` | commit_fill 卖出结算 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
+| `paper_orders` | 执行阻塞结果写库（含乐观锁版本） | `paper_order_ledger::record_execution_block` | commit_fill 执行决策 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
+| `paper_orders` | 成交结果写库（状态/成交量/均价/金额/费用/证据/版本推进） | `paper_order_ledger::record_fill_result` | commit_fill 唯一成交权威 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
+| `paper_orders` | 已实现盈亏回填（重建口径） | `paper_order_ledger::record_realized_pnl` | paper_trading 重建口径 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_orders` | 执行核验结论单行写入 | `paper_order_ledger::stamp_execution` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_orders` | 执行核验结论批量写入（含历史回填） | `paper_order_ledger::stamp_execution_rows` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_orders` | 按 execution_version 乐观锁改写 risk_payload | `paper_order_ledger::update_risk_payload` | paper_trading 日内卖出收尾 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 当日信号引导：替代旧信号 | `paper_trading::_bootstrap_signals_for_today` | paper_trading 引导规则 | `signal_service` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_provenance_inflight_change` |
 | `paper_orders` | 自动买入订单创建（INSERT） | `paper_trading::_buy_order` | paper_trading 入场决策 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
 | `paper_signals` | 买入联动信号状态/原因/payload | `paper_trading::_buy_order` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
 | `paper_signals` | 订单意图收紧：信号 rejected | `paper_trading::_enforce_order_intent` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | `test_order_intent_contract`、`test_paper_trading_architecture_guard` |
-| `paper_orders` | 卖出订单创建（INSERT） | `paper_trading::_intraday_sell` | paper_trading 风控/止盈决策 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_ai_advice_service`、`test_execution_verification_wiring`、`test_paper_trading_architecture_guard` |
-| `paper_orders` | 已实现盈亏回填 realized_pnl | `paper_trading::_rebuild_realized_pnl` | paper_trading 重建口径 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_verification` |
 | `paper_signals` | 开盘信号过期（expired） | `paper_trading::execute_open` | paper_trading 开盘窗口规则 | `signal_service` | 调用方同一连接与原事务 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
 | `paper_signals` | 快速入场等待：信号 deferred_capacity | `paper_trading::monitor_fast_entries` | paper_trading 盘中复核 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 执行结果状态推进（含 execution_version 乐观锁） | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |

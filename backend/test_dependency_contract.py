@@ -66,7 +66,9 @@ class DependencyContainerContractTests(unittest.TestCase):
                                       "require_order_execution_cycle",
                                       # PR-10 工作包 A：订单行 owner 由组装根直绑，
                                       # 不再从本模块解析（避免 other 域 → paper 域的新边）。
-                                      "cancel_order", "insert_order"):
+                                      "cancel_order", "insert_order",
+                                      "record_execution_block", "record_fill_result",
+                                      "accumulate_realized_pnl"):
                         continue
                     self.assertIsNotNone(PT._dependency_implementation(field.name))
 

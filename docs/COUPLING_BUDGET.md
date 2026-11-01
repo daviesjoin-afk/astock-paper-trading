@@ -645,3 +645,21 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 `foundation_violations`、`import_cycles`、`injected_private_fields`、
 `from_import_private_names` 仍为 0；`paper_order_ledger` 只依赖
 `entry_lifecycle`（基础层），不读时钟、不 commit、不吞异常。
+
+## 2026-11-01 PR-10 工作包 B 成交结果与核验戳归 owner
+
+工作包 B 把订单创建、成交结果、核验戳与信号反馈的写入搬到 owner：
+
+* 创建：四个调用点改调 `paper_order_ledger.insert_order`（列白名单校验）；
+  `paper_risk_writes` 不再持有订单 INSERT，`paper_orders` 写方模块 6 → 5。
+* 成交结果：`commit_fill` 的三条订单写（阻塞、成交、盈亏累加）改调 owner，
+  判定与价格/费用计算仍在 `commit_fill`，事务与 SAVEPOINT 位置不变。
+* 核验戳：`execution_verification` 的单行/批量盖章改调 owner。
+
+额度变化：`execution_verification → paper_order_ledger` 是一条真实的新依赖，
+`cross_domain_edges` 631（allowance 12 → 13）；`paper_table_fanout_max` 50→51 已在 A 登记。
+`raw_sql_modules` 保持 142；`import_cycles` / `foundation_violations` 仍为 0。
+
+`execution_planner` 没有新增边：它通过既有的执行依赖容器接收 owner 能力
+（`record_execution_block` / `record_fill_result` / `accumulate_realized_pnl`），
+与 `paper_trading` 的其它注入同一套路。

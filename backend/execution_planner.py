@@ -1038,6 +1038,9 @@ class ExecutionDependencies:
     order_cycle_provenance_for_order: Any
     pending_buy_reservations: Any
     record_lot: Any
+    record_execution_block: Any
+    record_fill_result: Any
+    accumulate_realized_pnl: Any
     reserve_shared_capital: Any
     risk_log: Any
     security_scope: Any
@@ -1978,15 +1981,14 @@ def commit_fill(
             # 覆盖到 ``reason``，恢复成交时调用方又把这条被覆盖的 reason 传回来，
             # 四笔真实成交的卖单最后都写着 "TRADABILITY_UNKNOWN"——策略原因被
             # 执行插曲吃掉，复盘无法回答"当时为什么卖"。
-            conn.execute(
-                """UPDATE paper_orders
-                      SET status=?,execution_asof=?,execution_reasons=?,
-                          execution_evidence=?,ruleset_version=?,execution_version=execution_version+1,
-                          remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
-                    WHERE id=? AND execution_version=?""",
-                (next_status, decision.execution_asof,
-                 _json(list(decision.reasons)), _json(execution_evidence),
-                 decision.ruleset_version, order_id, current_version),
+            _pt().record_execution_block(
+                conn, order_id,
+                status=next_status,
+                execution_asof=decision.execution_asof,
+                reasons=_json(list(decision.reasons)),
+                evidence=_json(execution_evidence),
+                ruleset_version=decision.ruleset_version,
+                expected_version=current_version,
             )
             PT.risk_log(
                 conn, account_id, code, side, "execution_blocked",
@@ -2063,24 +2065,28 @@ def commit_fill(
     }
 
     PT.require_active_lease(conn, "execution planner state transition")
-    changed = conn.execute(
-        """UPDATE paper_orders
-              SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?,
-                  reason=?,risk_payload=?,execution_asof=?,execution_reasons=?,
-                  execution_evidence=?,pricing_basis=?,slippage=?,ruleset_version=?,
-                  executed_at=?,execution_version=execution_version+1
-            WHERE id=? AND execution_version=?
-              AND COALESCE(filled_qty,0)=? AND COALESCE(remaining_qty,qty-COALESCE(filled_qty,0))>=?
-              AND status IN ('pending_execution','partially_filled','ready_to_fill',
-                             'pending_limit','pending_verification','execution_retry',
-                             'manual_execution_retry')""",
-        (next_status, total_filled, remaining_qty, average_price, total_amount,
-         total_fees, reason, _json(fill_detail), decision.execution_asof,
-         _json(list(decision.reasons)), _json(execution_evidence),
-         decision.pricing_basis, decision.slippage_amount, decision.ruleset_version,
-         decision.execution_asof, order_id, current_version, prior_qty, qty),
+    changed = _pt().record_fill_result(
+        conn, order_id,
+        status=next_status,
+        filled_qty=total_filled,
+        remaining_qty=remaining_qty,
+        filled_price=average_price,
+        amount=total_amount,
+        fees=total_fees,
+        reason=reason,
+        risk_payload=_json(fill_detail),
+        execution_asof=decision.execution_asof,
+        execution_reasons=_json(list(decision.reasons)),
+        execution_evidence=_json(execution_evidence),
+        pricing_basis=decision.pricing_basis,
+        slippage=decision.slippage_amount,
+        ruleset_version=decision.ruleset_version,
+        executed_at=decision.execution_asof,
+        expected_version=current_version,
+        expected_filled_qty=prior_qty,
+        min_remaining=qty,
     )
-    if getattr(changed, "rowcount", 1) != 1:
+    if changed != 1:
         raise RuntimeError(f"concurrent or terminal order transition: order_id={order_id}")
 
     fill_plan = {
@@ -2149,10 +2155,7 @@ def commit_fill(
     if side == "sell" and cost_amount is not None:
         fill_detail["cost_amount"] = round(cost_amount, 2)
         fill_detail["realized_pnl"] = round(realized_pnl, 2)
-        conn.execute(
-            "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
-            (realized_pnl, order_id),
-        )
+        _pt().accumulate_realized_pnl(conn, order_id, delta=realized_pnl)
     fill_cursor = conn.execute(
         """INSERT INTO paper_fills(
                order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,

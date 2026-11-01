@@ -23,6 +23,13 @@ import entry_lifecycle as ELC
 
 __all__ = [
     "ORDER_LEDGER_VERSION",
+    "accumulate_realized_pnl",
+    "record_execution_block",
+    "record_fill_result",
+    "record_realized_pnl",
+    "stamp_execution",
+    "stamp_execution_rows",
+    "update_risk_payload",
     "TERMINAL_ORDER_STATUSES",
     "expire_order",
     "insert_order",
@@ -72,6 +79,102 @@ ORDER_INSERT_COLUMNS = (
     "allocation_intent_kind", "portfolio_snapshot_id", "allocation_plan_id",
     "allocation_plan_fingerprint", "allocation_policy_version",
 )
+
+
+def record_execution_block(
+    conn, order_id, *, status, execution_asof, reasons, evidence,
+    ruleset_version, expected_version,
+):
+    """执行阻塞结果写库（乐观锁版本不符则不写），返回受影响行数。
+
+    判定（阻塞码、目标状态、规则版本）由成交权威给出；owner 只落库。
+    """
+    return conn.execute(
+        """UPDATE paper_orders
+              SET status=?,execution_asof=?,execution_reasons=?,
+                  execution_evidence=?,ruleset_version=?,execution_version=execution_version+1,
+                  remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
+            WHERE id=? AND execution_version=?""",
+        (status, execution_asof, reasons, evidence,
+         ruleset_version, order_id, expected_version),
+    ).rowcount
+
+
+def record_fill_result(
+    conn, order_id, *, status, filled_qty, remaining_qty, filled_price, amount, fees,
+    reason, risk_payload, execution_asof, execution_reasons, execution_evidence,
+    pricing_basis, slippage, ruleset_version, executed_at, expected_version,
+    expected_filled_qty, min_remaining,
+):
+    """成交结果写库：状态、成交数量/均价/金额/费用、证据与版本推进。
+
+    五条 ``WHERE`` 条件逐字保留（版本、已成交数量、剩余量下限、活动状态集合），
+    并发或终态竞争时返回 0，由调用方抛错。价格与费用由 ``commit_fill`` 算好，
+    本入口不重算任何成交事实。
+    """
+    return conn.execute(
+        """UPDATE paper_orders
+              SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?,
+                  reason=?,risk_payload=?,execution_asof=?,execution_reasons=?,
+                  execution_evidence=?,pricing_basis=?,slippage=?,ruleset_version=?,
+                  executed_at=?,execution_version=execution_version+1
+            WHERE id=? AND execution_version=?
+              AND COALESCE(filled_qty,0)=? AND COALESCE(remaining_qty,qty-COALESCE(filled_qty,0))>=?
+              AND status IN ('pending_execution','partially_filled','ready_to_fill',
+                             'pending_limit','pending_verification','execution_retry',
+                             'manual_execution_retry')""",
+        (status, filled_qty, remaining_qty, filled_price, amount, fees,
+         reason, risk_payload, execution_asof, execution_reasons,
+         execution_evidence, pricing_basis, slippage, ruleset_version,
+         executed_at, order_id, expected_version, expected_filled_qty, min_remaining),
+    ).rowcount
+
+
+def accumulate_realized_pnl(conn, order_id, *, delta):
+    """在一笔已有 realized_pnl 上累加本次卖出实现盈亏。"""
+    conn.execute(
+        "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
+        (delta, order_id),
+    )
+
+
+def stamp_execution(conn, order_id, *, status, verified, source):
+    """写入执行核验结论的三列；结论由调用方（核验 owner）算好。"""
+    conn.execute(
+        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
+        " execution_evidence_source=? WHERE id=?",
+        (status, int(bool(verified)), source, order_id),
+    )
+
+
+def stamp_execution_rows(conn, rows):
+    """批量写核验结论：``rows`` 为 ``(status, verified, source, order_id)`` 序列。"""
+    data = [(status, int(bool(verified)), source, order_id)
+            for status, verified, source, order_id in rows]
+    if not data:
+        return 0
+    conn.executemany(
+        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
+        " execution_evidence_source=? WHERE id=?",
+        data,
+    )
+    return len(data)
+
+
+def record_realized_pnl(conn, order_id, *, realized):
+    """回填一笔订单的已实现盈亏（口径由调用方决定）。"""
+    conn.execute(
+        "UPDATE paper_orders SET realized_pnl=? WHERE id=?",
+        (realized, order_id),
+    )
+
+
+def update_risk_payload(conn, order_id, *, payload, expected_version):
+    """按乐观锁版本改写订单的 risk_payload；版本不符则不写。"""
+    return conn.execute(
+        "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
+        (payload, order_id, expected_version),
+    ).rowcount
 
 
 def insert_order(conn, *, fields):

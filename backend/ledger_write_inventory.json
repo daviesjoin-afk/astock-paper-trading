@@ -231,43 +231,7 @@
   {
    "function": "commit_fill",
    "kind": "static",
-   "line": 1982,
-   "module": "execution_planner",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,execution_asof=?,execution_reasons=?, execution_evidence=?,ruleset_version=?,execution_version=execution_version+1, remaining_q",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "commit_fill",
-   "kind": "static",
-   "line": 2067,
-   "module": "execution_planner",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?, reason=?,risk_payload=?,execution_asof=?,execution_reasons=?, exec",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "commit_fill",
-   "kind": "static",
-   "line": 2153,
-   "module": "execution_planner",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "commit_fill",
-   "kind": "static",
-   "line": 2157,
+   "line": 2160,
    "module": "execution_planner",
    "read_refs": [],
    "role": "runtime",
@@ -286,42 +250,6 @@
    "sql": "CREATE TABLE paper_accounts(id INTEGER,source_strategy TEXT); CREATE TABLE paper_orders(id INTEGER,account_id INTEGER,side TEXT,qty INTEGER,planned_price REAL,f",
    "write_targets": [
     "paper_accounts",
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "stamp_terminal_zero_orders",
-   "kind": "static",
-   "line": 695,
-   "module": "execution_verification",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET execution_status=?,execution_verified=?,execution_evidence_source=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "stamp_order",
-   "kind": "static",
-   "line": 713,
-   "module": "execution_verification",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET execution_status=?, execution_verified=?, execution_evidence_source=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "backfill_legacy_orders",
-   "kind": "static",
-   "line": 769,
-   "module": "execution_verification",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET execution_status=?, execution_verified=?, execution_evidence_source=? WHERE id=?",
-   "write_targets": [
     "paper_orders"
    ]
   },
@@ -736,7 +664,7 @@
   {
    "function": "expire_order",
    "kind": "static",
-   "line": 56,
+   "line": 63,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -746,9 +674,93 @@
    ]
   },
   {
-   "function": "insert_order",
+   "function": "record_execution_block",
    "kind": "static",
    "line": 92,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET status=?,execution_asof=?,execution_reasons=?, execution_evidence=?,ruleset_version=?,execution_version=execution_version+1, remaining_q",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "record_fill_result",
+   "kind": "static",
+   "line": 115,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?, reason=?,risk_payload=?,execution_asof=?,execution_reasons=?, exec",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "accumulate_realized_pnl",
+   "kind": "static",
+   "line": 135,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "stamp_execution",
+   "kind": "static",
+   "line": 143,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET execution_status=?, execution_verified=?, execution_evidence_source=? WHERE id=?",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "stamp_execution_rows",
+   "kind": "static",
+   "line": 156,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET execution_status=?, execution_verified=?, execution_evidence_source=? WHERE id=?",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "record_realized_pnl",
+   "kind": "static",
+   "line": 166,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET realized_pnl=? WHERE id=?",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "update_risk_payload",
+   "kind": "static",
+   "line": 174,
+   "module": "paper_order_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "insert_order",
+   "kind": "static",
+   "line": 195,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -760,7 +772,7 @@
   {
    "function": "insert_order",
    "kind": "dynamic",
-   "line": 92,
+   "line": 195,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -772,7 +784,7 @@
   {
    "function": "supersede_order",
    "kind": "static",
-   "line": 101,
+   "line": 204,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -784,7 +796,7 @@
   {
    "function": "terminate_order",
    "kind": "static",
-   "line": 118,
+   "line": 221,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -796,7 +808,7 @@
   {
    "function": "supersede_for_expired_signal",
    "kind": "static",
-   "line": 128,
+   "line": 231,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -808,7 +820,7 @@
   {
    "function": "supersede_duplicate_execution_retry",
    "kind": "static",
-   "line": 143,
+   "line": 246,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -820,7 +832,7 @@
   {
    "function": "supersede_previous_execution_retry",
    "kind": "static",
-   "line": 158,
+   "line": 261,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -832,7 +844,7 @@
   {
    "function": "cancel_order",
    "kind": "static",
-   "line": 177,
+   "line": 280,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -844,7 +856,7 @@
   {
    "function": "cancel_order",
    "kind": "dynamic",
-   "line": 177,
+   "line": 280,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -856,7 +868,7 @@
   {
    "function": "supersede_for_terminal_signal",
    "kind": "static",
-   "line": 195,
+   "line": 298,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -868,7 +880,7 @@
   {
    "function": "supersede_for_terminal_signal",
    "kind": "dynamic",
-   "line": 195,
+   "line": 298,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -880,7 +892,7 @@
   {
    "function": "retire_gated_order",
    "kind": "static",
-   "line": 210,
+   "line": 313,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -892,7 +904,7 @@
   {
    "function": "retire_gated_order",
    "kind": "dynamic",
-   "line": 210,
+   "line": 313,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -904,7 +916,7 @@
   {
    "function": "retire_duplicate_waitlist_orders",
    "kind": "static",
-   "line": 224,
+   "line": 327,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -1089,18 +1101,6 @@
    "sql": "UPDATE paper_signals SET status='rejected', reason=? WHERE id=?",
    "write_targets": [
     "paper_signals"
-   ]
-  },
-  {
-   "function": "_rebuild_realized_pnl",
-   "kind": "static",
-   "line": 1494,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET realized_pnl=? WHERE id=?",
-   "write_targets": [
-    "paper_orders"
    ]
   },
   {
@@ -1478,21 +1478,9 @@
    ]
   },
   {
-   "function": "_intraday_sell",
-   "kind": "static",
-   "line": 11149,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
    "function": "monitor_fast_entries",
    "kind": "static",
-   "line": 11793,
+   "line": 11791,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1504,7 +1492,7 @@
   {
    "function": "monitor_fast_entries",
    "kind": "static",
-   "line": 11800,
+   "line": 11798,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1516,7 +1504,7 @@
   {
    "function": "_weekly_review",
    "kind": "static",
-   "line": 12388,
+   "line": 12386,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1528,7 +1516,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12581,
+   "line": 12579,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1540,7 +1528,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12593,
+   "line": 12591,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1552,7 +1540,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12605,
+   "line": 12603,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1564,7 +1552,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12617,
+   "line": 12615,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1576,7 +1564,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12632,
+   "line": 12630,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1588,7 +1576,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12644,
+   "line": 12642,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1600,7 +1588,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12661,
+   "line": 12659,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1612,7 +1600,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14129,
+   "line": 14127,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1624,7 +1612,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14166,
+   "line": 14164,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1636,7 +1624,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14195,
+   "line": 14193,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1648,7 +1636,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14223,
+   "line": 14221,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1660,7 +1648,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14237,
+   "line": 14235,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1672,7 +1660,7 @@
   {
    "function": "set_account_style",
    "kind": "static",
-   "line": 14311,
+   "line": 14309,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1684,7 +1672,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14334,
+   "line": 14332,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1696,7 +1684,7 @@
   {
    "function": "set_accounts_status",
    "kind": "dynamic",
-   "line": 14334,
+   "line": 14332,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1708,7 +1696,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14337,
+   "line": 14335,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -3562,7 +3550,7 @@
   {
    "function": "_db",
    "kind": "static",
-   "line": 82,
+   "line": 83,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3574,7 +3562,7 @@
   {
    "function": "_db",
    "kind": "static",
-   "line": 88,
+   "line": 89,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3586,7 +3574,7 @@
   {
    "function": "_insert_order",
    "kind": "static",
-   "line": 102,
+   "line": 103,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3598,7 +3586,7 @@
   {
    "function": "_insert_fill",
    "kind": "static",
-   "line": 117,
+   "line": 118,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3610,7 +3598,7 @@
   {
    "function": "test_backfill_marks_old_rows_unknown_and_never_verified",
    "kind": "static",
-   "line": 195,
+   "line": 196,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3622,7 +3610,7 @@
   {
    "function": "test_legacy_row_that_never_claimed_a_fill_keeps_the_legacy_source",
    "kind": "static",
-   "line": 212,
+   "line": 213,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3634,7 +3622,7 @@
   {
    "function": "test_backfill_verifies_a_legacy_row_that_has_fill_evidence",
    "kind": "static",
-   "line": 248,
+   "line": 249,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3646,7 +3634,7 @@
   {
    "function": "test_backfill_never_upgrades_a_row_without_evidence",
    "kind": "static",
-   "line": 264,
+   "line": 265,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3658,7 +3646,7 @@
   {
    "function": "test_gate_predicate_excludes_null_legacy_rows",
    "kind": "static",
-   "line": 278,
+   "line": 279,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3670,7 +3658,7 @@
   {
    "function": "test_gate_predicate_rejects_inconsistent_columns",
    "kind": "static",
-   "line": 290,
+   "line": 291,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3682,7 +3670,7 @@
   {
    "function": "test_rejected_order_is_not_executed_not_unknown",
    "kind": "static",
-   "line": 322,
+   "line": 323,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3694,7 +3682,7 @@
   {
    "function": "test_columns_are_added_without_touching_existing_ones",
    "kind": "static",
-   "line": 352,
+   "line": 353,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3706,7 +3694,7 @@
   {
    "function": "test_backfill_verifies_a_filled_row_on_a_bare_connection",
    "kind": "static",
-   "line": 446,
+   "line": 447,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3718,7 +3706,7 @@
   {
    "function": "test_backfill_stamps_unknown_on_a_bare_connection",
    "kind": "static",
-   "line": 461,
+   "line": 462,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3730,7 +3718,7 @@
   {
    "function": "test_rebuild_realized_pnl_ignores_unverified_filled_orders",
    "kind": "static",
-   "line": 573,
+   "line": 574,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3742,7 +3730,7 @@
   {
    "function": "_ledger",
    "kind": "static",
-   "line": 628,
+   "line": 629,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -3755,7 +3743,7 @@
   {
    "function": "test_row_predicate_agrees_with_the_sql_predicate",
    "kind": "static",
-   "line": 868,
+   "line": 872,
    "module": "test_execution_verification",
    "read_refs": [],
    "role": "test",
@@ -4019,7 +4007,7 @@
   {
    "function": "_row",
    "kind": "static",
-   "line": 393,
+   "line": 395,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -4031,7 +4019,7 @@
   {
    "function": "test_integer_stored_keys_are_still_matched",
    "kind": "static",
-   "line": 435,
+   "line": 437,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",

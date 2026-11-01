@@ -1491,7 +1491,7 @@ def _rebuild_realized_pnl(conn):
         # 只有完整匹配到历史买入的成交才重写；异常旧数据保留原账面值供审计。
         if remaining == 0:
             realized = _num(order.get("amount")) - _num(order.get("fees")) - cost_amount
-            conn.execute("UPDATE paper_orders SET realized_pnl=? WHERE id=?", (realized, order["id"]))
+            POL.record_realized_pnl(conn, order["id"], realized=realized)
 
 HOT_PATH_SLOTS = PSch.HOT_PATH_SLOTS
 
@@ -11145,10 +11145,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
         pnl = float(committed[3] or 0.0)
         final_payload = _loads(committed[6], {})
         final_payload.update({"intended_qty": int(payload["qty"]), "qty": qty, "sell_price": fill})
-        conn.execute(
-            "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
-            (_json(final_payload), order_id, int(committed[5] or 0)),
-        )
+        POL.update_risk_payload(conn, order_id, payload=_json(final_payload),
+                                expected_version=int(committed[5] or 0))
         payload = final_payload
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as exc:
@@ -14533,6 +14531,9 @@ def _bind_application_dependencies():
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),
         "cancel_order": (POL, "cancel_order"),
+        "record_execution_block": (POL, "record_execution_block"),
+        "record_fill_result": (POL, "record_fill_result"),
+        "accumulate_realized_pnl": (POL, "accumulate_realized_pnl"),
         "insert_order": (POL, "insert_order"),
     }
     import manual_orders as MO
