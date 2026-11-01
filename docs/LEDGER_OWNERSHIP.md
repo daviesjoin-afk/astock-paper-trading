@@ -20,7 +20,7 @@
 | `paper_positions` | **owned** | `paper_lot_ledger` | 投影表，只能由 lot owner 同步 |
 | `paper_capital_reservations` | **owned** | `paper_capital_reservations` | 三批收敛完成：`paper_trading` / `entry_lifecycle` / `execution_dispatch` 全部改为调用装配层注入的 release 回调 |
 | `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
-| `paper_risk_decisions` | **pending** | `paper_risk_writes` + `paper_trading` | `_risk_log` 仍自行组装 provenance |
+| `paper_risk_decisions` | **owned** | `paper_risk_writes` | 第五批统一来源信息校验及组装；两个 `_risk_log` 只准备快照、策略戳和时间 |
 | `paper_audit` | **pending** | `paper_repository` + `adaptive_engine` | 账本审计端口 vs adaptive 恢复路径 |
 | `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`entry_lifecycle`、`paper_risk_writes` | 订单状态机按生命周期阶段分写 |
 | `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`entry_lifecycle`、`signal_service` | 信号同样按阶段分写 |
@@ -71,7 +71,7 @@ paper_trading._reconcile_signal_order_states
 | ~~`entry_lifecycle._release_reservation`~~ | **已迁移（第二批）**：`expire_stale_orders/signals` 现在接收 `release_reservation` 回调，`paper_slot_service` 注入 `PCR.release_order_reservation`；foundation 层不再内联预占 SQL | — |
 | ~~`execution_dispatch._release_reservation`~~ | **已迁移（第三批）**：`run_execution_dispatch` / `retire_gated_orders` / `resolve_verification` 接收必填 `release_reservation`，由 `paper_trading` / `paper_slot_service` 注入；本模块不 import 业务 owner，跨域边不增 | — |
 | ~~`paper_position_lots.source_fill_id`~~ | **已迁移（第四批）**：lot owner 新增 `link_source_fill(conn, lot_id, fill_id)`，`commit_fill` 通过注入的依赖字段调用；同一 `conn`、同一事务、`source_fill_id` 的 legacy NULL 语义不变 | — |
-| `paper_risk_decisions` 双写 | `_risk_log` 自行组装 decision provenance；`paper_risk_writes` 只有原语 | 先统一 provenance 组装，再收口 |
+| ~~`paper_risk_decisions` 双写~~ | **已迁移（第五批）**：两个 `_risk_log` 统一调用 `paper_risk_writes.insert_risk_decision`；来源信息由写入 owner 组装，词汇及结构仍属 schema owner | — |
 | `paper_audit` 双写 | adaptive 侧恢复路径直写 | 走 `paper_repository.audit` 端口 |
 | `paper_orders` / `paper_signals` / `paper_accounts` 多写 | 状态机按生命周期阶段分权，强行合并会把阶段判定塞进单一 owner | 逐阶段收口（先做"终态写入"单一出口） |
 
@@ -108,3 +108,36 @@ SQL 调用次数：对账路径由"内联 UPDATE"变为"调用 owner 的同一�
 * 回滚：`git revert` 单个提交即可；owner 新函数是纯新增，回滚不影响其他调用方。
 
 MERGE: NOT MERGED · DEPLOY: NOT DEPLOYED
+
+## 9. 第五批 风险决策来源信息与写入收敛
+
+`paper_trading._risk_log` 与 `paper_risk_service.run` 内的 `_risk_log` 均调用
+`paper_risk_writes.insert_risk_decision`。运行时静态 SQL 写入方由 2 个降为 1 个，
+矩阵和守卫同步收紧为 **owned**。
+
+调用方继续负责各自的决策快照、策略版本解析、时钟及 AI 意见消费；写入 owner 负责
+订单关联的权限声明校验和 `decision_provenance` 组装，合法词汇与结构继续调用
+`paper_schema_migrations.risk_decision_provenance`。不根据订单号或 payload 猜测权限。
+缺少权限声明的关联订单在快照准备前拒绝，直接调用写入 owner 同样拒绝。
+
+保留两条旧路径的 JSON 顺序：主入口不排序、风险服务排序。保留历史未关联订单的
+NULL 与无显式权限声明时的旧 payload；不补造历史 provenance 或 cycle。
+仍使用调用方的同一连接、同一事务、同一条 INSERT，owner 不 commit。
+
+冻结回归覆盖两条路径的完整行（包括原始 JSON 文本）、七种合法权限、来源信息覆盖、
+非法/缺失权限拒绝、调用方 payload 不变、事务整体回滚以及快照/策略戳/意见消费一次。
+已有风险服务、买入权限来源、卖出原因和影子比较回归验证业务链。
+
+| 指标 | 第四批基线 | 第五批 |
+| --- | --- | --- |
+| `paper_risk_decisions` 静态 SQL 写入方 | 2 | **1** |
+| `cross_domain_edges` | 629 | 629 |
+| `max_file_lines` | 14623 | 14617 |
+| `foundation_violations` / `import_cycles` | 0 / 0 | 0 / 0 |
+
+冻结离线场景（全仓风险退出、继续持有）与第四批版本逐字段比较：决策行原始 JSON、
+成交、NAV、剩余 lot 全部一致。SQL trace 证明每次仍只有一条 INSERT。
+306 项相关回归通过；四项语义变异（移除权限要求、误标权限、提前 commit、强制 JSON
+排序）均被新测试拦截。以上是结构与行为证据，不声称实盘性能提升。
+
+回滚：revert 本批提交即可；没有 schema 或数据迁移。

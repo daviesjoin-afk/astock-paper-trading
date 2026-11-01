@@ -4479,3 +4479,22 @@ paper_slot_service.run_preflight
 `paper_lot_ledger`）；`cross_domain_edges` 629（不变）；`max_file_lines` 14623。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 第五批 风险决策单写方与来源信息统一（2026-11-01）
+
+`paper_risk_decisions` 的运行时静态 SQL 写入方收敛为 `paper_risk_writes`，
+`paper_trading._risk_log` 与风险服务内部入口都调用它。写入 owner 统一检查关联订单的
+显式权限声明并组装来源信息；权限词汇和字段结构仍由 schema owner 定义。
+
+两个调用方各自保留快照准备、策略版本解析、时钟与 AI 意见消费。原始 JSON 字段顺序
+逐路径保留，历史 NULL/无来源声明不猜测补齐。每次仍为同一连接内的一条 INSERT，
+事务提交及回滚由调用方控制；不改变成交、资金、周期和风险判断。
+
+`test_ledger_ownership` 将此表从 `pending` 收紧为 **owned**；
+`test_paper_risk_writes` 冻结旧行、来源声明和事务边界，详见
+`docs/LEDGER_OWNERSHIP.md` 第 9 节。
+
+**实测**：`cross_domain_edges` 629（不变）、`max_file_lines` 14617（-6）、
+`foundation_violations` / `import_cycles` 均为 0；未放宽预算。
+
+**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
