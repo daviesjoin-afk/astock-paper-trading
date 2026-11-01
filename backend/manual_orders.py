@@ -92,6 +92,7 @@ class ManualOrderDependencies:
     with_decision_snapshot: Any
     init_db: Any
     cancel_order: Any
+    insert_order: Any
 
 
 _dependencies_factory: Callable[[], ManualOrderDependencies] | None = None
@@ -625,6 +626,7 @@ def _commit_strategy_buy(
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
     _require_active_lease = deps.require_active_lease
     _finish_capital_reservation = deps.finish_capital_reservation
+    _insert_order = deps.insert_order
     _lease_lost = deps.lease_lost
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -639,21 +641,19 @@ def _commit_strategy_buy(
     strategy_stamp = _strategy_stamp(conn, account_id)
     provenance = ((plan.get("risk") or {}).get("allocation_provenance")
                   or (detail or {}).get("allocation_provenance") or {})
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(
-           account_id,side,code,name,qty,planned_price,status,reason,
-           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id,
-           allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
-           allocation_plan_fingerprint,allocation_policy_version)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (account_id, "buy", code, plan.get("name"), qty,
-         _num(plan.get("planned_price"), fill_price), "pending_execution",
-         reason, _json(detail), _now(), *strategy_stamp, _order_cycle_id(conn),
-         provenance.get("intent_kind"), provenance.get("portfolio_snapshot_id"),
-         provenance.get("allocation_plan_id"), provenance.get("allocation_plan_fingerprint"),
-         provenance.get("allocation_policy_version")),
-    )
-    order_id = int(cursor.lastrowid)
+    order_id = _insert_order(conn, fields={
+        "account_id": account_id, "side": "buy", "code": code, "name": plan.get("name"),
+        "qty": qty, "planned_price": _num(plan.get("planned_price"), fill_price),
+        "status": "pending_execution", "reason": reason, "risk_payload": _json(detail),
+        "created_at": _now(), "strategy_id": strategy_stamp[0],
+        "strategy_version": strategy_stamp[1], "strategy_checksum": strategy_stamp[2],
+        "cycle_id": _order_cycle_id(conn),
+        "allocation_intent_kind": provenance.get("intent_kind"),
+        "portfolio_snapshot_id": provenance.get("portfolio_snapshot_id"),
+        "allocation_plan_id": provenance.get("allocation_plan_id"),
+        "allocation_plan_fingerprint": provenance.get("allocation_plan_fingerprint"),
+        "allocation_policy_version": provenance.get("allocation_policy_version"),
+    })
     savepoint = f"strategy_buy_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
@@ -874,6 +874,7 @@ def submit_manual_order(
     _db = deps.db
     _entry_frozen_reason = deps.entry_frozen_reason
     _finish_capital_reservation = deps.finish_capital_reservation
+    _insert_order = deps.insert_order
     _market_state = deps.market_state
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -921,28 +922,25 @@ def submit_manual_order(
         intent_kind = provenance.get("intent_kind") or (
             "MANUAL_EXIT" if str(side).lower() == "sell" else
             "NEW_ENTRY" if str(side).lower() == "buy" else None)
-        cursor = conn.execute(
-            """INSERT INTO paper_orders(
-               account_id,side,code,name,qty,planned_price,status,reason,risk_payload,
-               order_type,origin,expires_at,created_at,
-               strategy_id,strategy_version,strategy_checksum,cycle_id,
-               allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
-               allocation_plan_fingerprint,allocation_policy_version)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                account_id, side, code, plan.get("name"), int(plan.get("qty") or 0),
-                _num(limit_price) if order_type == "limit" else _num(plan.get("quote_price")),
-                status, reason, _json(plan.get("risk") or {}), order_type, "manual",
-                day.isoformat() if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
-                and order_type == "limit" else None, _now(),
-                *strategy_stamp, order_cycle_id, intent_kind,
-                provenance.get("portfolio_snapshot_id"),
-                provenance.get("allocation_plan_id"),
-                provenance.get("allocation_plan_fingerprint"),
-                provenance.get("allocation_policy_version"),
-            ),
-        )
-        order_id = cursor.lastrowid
+        order_id = _insert_order(conn, fields={
+            "account_id": account_id, "side": side, "code": code, "name": plan.get("name"),
+            "qty": int(plan.get("qty") or 0),
+            "planned_price": (_num(limit_price) if order_type == "limit"
+                              else _num(plan.get("quote_price"))),
+            "status": status, "reason": reason,
+            "risk_payload": _json(plan.get("risk") or {}),
+            "order_type": order_type, "origin": "manual",
+            "expires_at": (day.isoformat()
+                           if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
+                           and order_type == "limit" else None),
+            "created_at": _now(), "strategy_id": strategy_stamp[0],
+            "strategy_version": strategy_stamp[1], "strategy_checksum": strategy_stamp[2],
+            "cycle_id": order_cycle_id, "allocation_intent_kind": intent_kind,
+            "portfolio_snapshot_id": provenance.get("portfolio_snapshot_id"),
+            "allocation_plan_id": provenance.get("allocation_plan_id"),
+            "allocation_plan_fingerprint": provenance.get("allocation_plan_fingerprint"),
+            "allocation_policy_version": provenance.get("allocation_policy_version"),
+        })
         if status in {"ready_to_fill", "pending_limit"} and account \
                 and plan.get("allowed") and side == "buy":
             # Limit orders reserve at their limit price (plus commission),

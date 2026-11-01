@@ -11103,15 +11103,14 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     try:
         sell_cycle_id = order_cycle_id(conn, cycle["id"])
         strategy_stamp = resolve_strategy_stamp(conn, account["id"])
-        cursor = conn.execute(
-            """INSERT INTO paper_orders(
-                   account_id,side,code,name,qty,planned_price,status,reason,
-                   risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-               VALUES(?,?,?,?,?,?,'pending_execution',?,?,?,?,?,?,?)""",
-            (account["id"], "sell", position["code"], position.get("name"), qty, price,
-             order_reason, _json(payload), _now(), *strategy_stamp, sell_cycle_id),
-        )
-        order_id = int(cursor.lastrowid)
+        order_id = POL.insert_order(conn, fields={
+            "account_id": account["id"], "side": "sell", "code": position["code"],
+            "name": position.get("name"), "qty": qty, "planned_price": price,
+            "status": "pending_execution", "reason": order_reason,
+            "risk_payload": _json(payload), "created_at": _now(),
+            "strategy_id": strategy_stamp[0], "strategy_version": strategy_stamp[1],
+            "strategy_checksum": strategy_stamp[2], "cycle_id": sell_cycle_id,
+        })
         pnl = EP.commit_fill(
             conn,
             account=account,
@@ -11159,7 +11158,7 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
             raise
         return None, f"高抛执行失败，可重试：{type(exc).__name__}: {exc}"
     result = {
-        "order_id": cursor.lastrowid, "side": "sell", "code": position["code"],
+        "order_id": order_id, "side": "sell", "code": position["code"],
         "qty": qty, "pnl": round(pnl, 2), "sell_price": round(fill, 4),
         "status": str(committed[0]),
         "opening_event": bool(opening_event), "trigger": trigger,

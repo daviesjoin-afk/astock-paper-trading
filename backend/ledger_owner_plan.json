@@ -213,13 +213,6 @@
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
-  "paper_risk_writes::<module>": {
-   "judge": "风控拒绝结论（paper_risk_writes 模块级工厂）",
-   "operation": "风险拒绝订单创建（INSERT）",
-   "single_owner": "paper_order_ledger",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_shared_cash::credit_shared_cash": {
    "judge": "paper_shared_cash 资金规则",
    "operation": "共享现金回补",

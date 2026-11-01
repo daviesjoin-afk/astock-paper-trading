@@ -328,18 +328,6 @@
   {
    "function": "_commit_strategy_buy",
    "kind": "static",
-   "line": 643,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "INSERT INTO paper_orders( account_id,side,code,name,qty,planned_price,status,reason, risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycl",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "_commit_strategy_buy",
-   "kind": "static",
    "line": 684,
    "module": "manual_orders",
    "read_refs": [],
@@ -448,19 +436,7 @@
   {
    "function": "submit_manual_order",
    "kind": "static",
-   "line": 925,
-   "module": "manual_orders",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "INSERT INTO paper_orders( account_id,side,code,name,qty,planned_price,status,reason,risk_payload, order_type,origin,expires_at,created_at, strategy_id,strategy_",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "submit_manual_order",
-   "kind": "static",
-   "line": 981,
+   "line": 979,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -472,7 +448,7 @@
   {
    "function": "submit_manual_order",
    "kind": "static",
-   "line": 1003,
+   "line": 1001,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -484,7 +460,7 @@
   {
    "function": "_terminalize_cycle_stale_order",
    "kind": "static",
-   "line": 1150,
+   "line": 1148,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -496,7 +472,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1263,
+   "line": 1261,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -508,7 +484,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1279,
+   "line": 1277,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -520,7 +496,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1296,
+   "line": 1294,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -532,7 +508,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1311,
+   "line": 1309,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -544,7 +520,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1321,
+   "line": 1319,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -556,7 +532,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1350,
+   "line": 1348,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -568,7 +544,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1357,
+   "line": 1355,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -580,7 +556,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1389,
+   "line": 1387,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -592,7 +568,7 @@
   {
    "function": "process_pending_manual_orders",
    "kind": "static",
-   "line": 1431,
+   "line": 1429,
    "module": "manual_orders",
    "read_refs": [],
    "role": "runtime",
@@ -974,21 +950,9 @@
    ]
   },
   {
-   "function": "<module>",
-   "kind": "static",
-   "line": 18,
-   "module": "paper_risk_writes",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,status,reason,risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
    "function": "insert_risk_decision",
    "kind": "static",
-   "line": 69,
+   "line": 64,
    "module": "paper_risk_writes",
    "read_refs": [],
    "role": "runtime",
@@ -1516,19 +1480,7 @@
   {
    "function": "_intraday_sell",
    "kind": "static",
-   "line": 11107,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "INSERT INTO paper_orders( account_id,side,code,name,qty,planned_price,status,reason, risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycl",
-   "write_targets": [
-    "paper_orders"
-   ]
-  },
-  {
-   "function": "_intraday_sell",
-   "kind": "static",
-   "line": 11150,
+   "line": 11149,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1540,7 +1492,7 @@
   {
    "function": "monitor_fast_entries",
    "kind": "static",
-   "line": 11794,
+   "line": 11793,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1552,7 +1504,7 @@
   {
    "function": "monitor_fast_entries",
    "kind": "static",
-   "line": 11801,
+   "line": 11800,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1564,7 +1516,7 @@
   {
    "function": "_weekly_review",
    "kind": "static",
-   "line": 12389,
+   "line": 12388,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1576,7 +1528,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12582,
+   "line": 12581,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1588,7 +1540,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12594,
+   "line": 12593,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1600,7 +1552,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12606,
+   "line": 12605,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1612,7 +1564,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12618,
+   "line": 12617,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1624,7 +1576,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12633,
+   "line": 12632,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1636,7 +1588,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12645,
+   "line": 12644,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1648,7 +1600,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12662,
+   "line": 12661,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1660,7 +1612,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14130,
+   "line": 14129,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1672,7 +1624,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14167,
+   "line": 14166,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1684,7 +1636,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14196,
+   "line": 14195,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1696,7 +1648,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14224,
+   "line": 14223,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1708,7 +1660,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14238,
+   "line": 14237,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1720,7 +1672,7 @@
   {
    "function": "set_account_style",
    "kind": "static",
-   "line": 14312,
+   "line": 14311,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1732,7 +1684,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14335,
+   "line": 14334,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1744,7 +1696,7 @@
   {
    "function": "set_accounts_status",
    "kind": "dynamic",
-   "line": 14335,
+   "line": 14334,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1756,7 +1708,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14338,
+   "line": 14337,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
