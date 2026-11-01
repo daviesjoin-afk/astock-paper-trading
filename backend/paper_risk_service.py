@@ -28,7 +28,6 @@ import paper_risk_decision as PRD
 import paper_risk_evidence as PREv
 import paper_risk_scan_state as PRSS
 import paper_risk_writes as PRW
-import paper_schema_migrations as PSM
 import strategy_policies as SPOL
 import strategy_registry as SR
 import strategy_selection_resolver as SRES
@@ -262,26 +261,22 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                   authority=None, decision_kind=None, order_id=None):
         """Append one risk decision with its write-time provenance.
 
-        Mirrors ``paper_trading._risk_log``: the Risk Authority states its own
-        authority and kind here (never inferred by a reader), and an
+        Like ``paper_trading._risk_log``, the Risk Authority supplies its own
+        authority and kind to the write owner (never inferred by a reader). An
         order-linked row must declare its authority because an id alone only
         proves which order the row belongs to.
         """
-        if order_id is not None and authority is None:
-            raise ValueError(
-                "order-linked risk decision requires an explicit authority")
+        PRW.require_decision_authority(order_id=order_id, authority=authority)
         payload = _with_decision_snapshot(
             payload or {}, account_id=account_id, code=code, side=side,
             decision=decision, reason=reason,
         )
-        if authority is not None:
-            payload["decision_provenance"] = PSM.risk_decision_provenance(
-                authority, decision_kind or decision)
         strategy_stamp = _strategy_stamp(conn, account_id, cycle_id=cycle_id)
         PRW.insert_risk_decision(
             conn, account_id, code, side, decision, reason, payload,
             strategy_stamp=strategy_stamp, cycle_id=cycle_id, now=_now(),
             order_id=order_id,
+            authority=authority, decision_kind=decision_kind,
         )
         # F5：真实退出/入场决定的消费点。ADVISORY 只追加解释，不改写上面的规则行。
         try:

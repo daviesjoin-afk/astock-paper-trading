@@ -78,6 +78,7 @@ import paper_slot_occupancy as PSO
 import paper_schedule_contract as PSch
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
+import paper_risk_writes as PRW
 import paper_candidate_live_fields as PCLF
 import paper_dynamic_allocation as PDAlloc
 import paper_live_tradability as PLTrad
@@ -2851,36 +2852,29 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
               decision_kind=None):
     """Append one risk decision with its write-time provenance.
 
-    ``authority`` / ``decision_kind`` are injected here (not accepted from the
-    payload) so the row carries an owner-stated provenance that a reader can
+    ``authority`` / ``decision_kind`` are passed to the write owner (not read
+    from the payload) so the row carries provenance that a reader can
     consume without classifying anything itself. The legal vocabulary and the
     provenance shape belong to the schema owner
     (``paper_schema_migrations``). An order-linked row must declare its
     authority: an id alone proves which order the row belongs to, never which
     authority produced it.
     """
-    if order_id is not None and authority is None:
-        raise ValueError(
-            "order-linked risk decision requires an explicit authority")
+    PRW.require_decision_authority(order_id=order_id, authority=authority)
     payload = _with_decision_snapshot(
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
     )
-    if authority is not None:
-        payload["decision_provenance"] = PSM.risk_decision_provenance(
-            authority, decision_kind or decision)
     if strategy_stamp is None:
         strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(conn, account_id)
     else:
         strategy_id, strategy_version, strategy_checksum = strategy_stamp
-    conn.execute(
-        """INSERT INTO paper_risk_decisions(
-               account_id,code,side,decision,reason,payload,created_at,
-               strategy_id,strategy_version,strategy_checksum,order_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (account_id, code, side, decision, reason, _json(payload), _now(),
-         strategy_id, strategy_version, strategy_checksum,
-         int(order_id) if order_id is not None else None),
+    PRW.insert_risk_decision(
+        conn, account_id, code, side, decision, reason, payload,
+        strategy_stamp=(strategy_id, strategy_version, strategy_checksum),
+        cycle_id=None, now=_now(), order_id=order_id,
+        authority=authority, decision_kind=decision_kind,
+        sort_payload_keys=False,
     )
     # F5：真实交易 owner 的消费点。ADVISORY 只追加解释，最终决策仍是上面的规则事实。
     try:

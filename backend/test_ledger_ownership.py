@@ -69,9 +69,9 @@ OWNERSHIP = {
         ),
     },
     "paper_risk_decisions": {
-        "status": "pending",
-        "writers": {"paper_risk_writes", "paper_trading"},
-        "note": "paper_risk_writes.insert_risk_decision 是原语；paper_trading._risk_log 仍带自身 provenance 组装",
+        "status": "owned",
+        "writers": {"paper_risk_writes"},
+        "note": "paper_risk_writes 统一校验来源信息并写入；两个 risk_log 只准备快照和策略戳",
     },
     "paper_audit": {
         "status": "pending",
