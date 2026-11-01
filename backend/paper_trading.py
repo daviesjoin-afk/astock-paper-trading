@@ -14581,6 +14581,7 @@ def _bind_application_dependencies():
         "order_cycle_provenance_for_order": (POEA, "_order_cycle_provenance_for_order"),
         "require_order_execution_cycle": (POEA, "_require_order_execution_cycle"),
         "record_lot": (PLL, "record_lot"),
+        "link_source_fill": (PLL, "link_source_fill"),
         "consume_available_lots": (PLL, "consume_available_lots"),
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),

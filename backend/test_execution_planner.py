@@ -260,6 +260,7 @@ def _pt_stub(now=NOW, statuses=("pending", "waitlist", "retry")):
         MAIN_FORCE_STRATEGY_ID="main_force_top10",
         NEW_STRATEGY_ID="reported_profit_breakout",
         _num=lambda value, default=0.0: default if value in (None, "") else float(value),
+        link_source_fill=lambda conn, lot_id, fill_id: 1,
         **_cycle_stub_kwargs(),
     )
 

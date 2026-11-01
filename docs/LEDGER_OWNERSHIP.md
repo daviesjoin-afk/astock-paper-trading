@@ -19,7 +19,7 @@
 | `paper_fills` | **owned** | `execution_planner` | 成交流水只有 `commit_fill` 一处写入 |
 | `paper_positions` | **owned** | `paper_lot_ledger` | 投影表，只能由 lot owner 同步 |
 | `paper_capital_reservations` | **owned** | `paper_capital_reservations` | 三批收敛完成：`paper_trading` / `entry_lifecycle` / `execution_dispatch` 全部改为调用装配层注入的 release 回调 |
-| `paper_position_lots` | **pending** | `paper_lot_ledger`（owner）+ `execution_planner` | `commit_fill` 在同一事务里回填 `source_fill_id` |
+| `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
 | `paper_risk_decisions` | **pending** | `paper_risk_writes` + `paper_trading` | `_risk_log` 仍自行组装 provenance |
 | `paper_audit` | **pending** | `paper_repository` + `adaptive_engine` | 账本审计端口 vs adaptive 恢复路径 |
 | `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`entry_lifecycle`、`paper_risk_writes` | 订单状态机按生命周期阶段分写 |
@@ -70,7 +70,7 @@ paper_trading._reconcile_signal_order_states
 | --- | --- | --- |
 | ~~`entry_lifecycle._release_reservation`~~ | **已迁移（第二批）**：`expire_stale_orders/signals` 现在接收 `release_reservation` 回调，`paper_slot_service` 注入 `PCR.release_order_reservation`；foundation 层不再内联预占 SQL | — |
 | ~~`execution_dispatch._release_reservation`~~ | **已迁移（第三批）**：`run_execution_dispatch` / `retire_gated_orders` / `resolve_verification` 接收必填 `release_reservation`，由 `paper_trading` / `paper_slot_service` 注入；本模块不 import 业务 owner，跨域边不增 | — |
-| `paper_position_lots.source_fill_id` | `commit_fill` 在成交事务内回填血缘，改走 lot owner 需要新窄接口且动到最敏感的提交链 | lot owner 增加 `link_source_fill(conn, lot_id, fill_id)`，随后替换 |
+| ~~`paper_position_lots.source_fill_id`~~ | **已迁移（第四批）**：lot owner 新增 `link_source_fill(conn, lot_id, fill_id)`，`commit_fill` 通过注入的依赖字段调用；同一 `conn`、同一事务、`source_fill_id` 的 legacy NULL 语义不变 | — |
 | `paper_risk_decisions` 双写 | `_risk_log` 自行组装 decision provenance；`paper_risk_writes` 只有原语 | 先统一 provenance 组装，再收口 |
 | `paper_audit` 双写 | adaptive 侧恢复路径直写 | 走 `paper_repository.audit` 端口 |
 | `paper_orders` / `paper_signals` / `paper_accounts` 多写 | 状态机按生命周期阶段分权，强行合并会把阶段判定塞进单一 owner | 逐阶段收口（先做"终态写入"单一出口） |

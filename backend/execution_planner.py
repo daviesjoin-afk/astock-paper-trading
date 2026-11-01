@@ -1025,6 +1025,7 @@ class ExecutionDependencies:
     OrderCycleProvenanceUnknown: Any
     require_active_lease: Any
     require_order_execution_cycle: Any
+    link_source_fill: Any
     audit: Any
     consume_available_lots: Any
     consume_capital_reservation: Any
@@ -2170,10 +2171,7 @@ def commit_fill(
     # ``source_fill_id``，使 lot ←→ FillEvent 成为可证明的一对一关系。
     # 历史旧 lot 保持 NULL（不可证明，绝不猜），读取方必须按 legacy 处理。
     if source_lot_id is not None:
-        conn.execute(
-            "UPDATE paper_position_lots SET source_fill_id=? WHERE id=?",
-            (int(fill_cursor.lastrowid), int(source_lot_id)),
-        )
+        PT.link_source_fill(conn, source_lot_id, fill_cursor.lastrowid)
     # 执行验证闸门（PR-150 wiring）：**必须在 fill 流水写入之后**盖章，否则
     # evidence_from_order 看不到这条流水，会把一次真实成交记成"没有证据"。
     # 结论本身委托 execution_verification（它再委托 execution_evidence），
