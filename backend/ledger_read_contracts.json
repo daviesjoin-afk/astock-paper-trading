@@ -1,0 +1,279 @@
+{
+ "tables": {
+  "paper_accounts": {
+   "authoritative_readers": [
+    "paper_shared_cash",
+    "paper_user_account_provisioning",
+    "paper_user_cycle_attachment"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "adaptive_engine",
+    "adaptive_risk",
+    "adaptive_selection",
+    "adaptive_selection_compat",
+    "ai_adoption_writer",
+    "api_adaptive",
+    "evolution_apply",
+    "evolution_validation",
+    "manual_orders",
+    "paper_cycle_capital",
+    "paper_cycle_ownership",
+    "paper_dynamic_allocation",
+    "paper_order_execution_authority",
+    "paper_risk_service",
+    "paper_trading",
+    "strategy_registry"
+   ],
+   "projection_readers": [
+    "dashboard_queries",
+    "deepseek_advisor",
+    "intraday_t_pair_report",
+    "main_force_trade_evidence",
+    "paper_portfolio_read_model",
+    "paper_position_read_model",
+    "strategy_performance"
+   ],
+   "reads_may_trigger_writes": "读面板只读；创建只走 provisioning 入口",
+   "unknown_handling": "读路径缺账户行返回空，绝不现场建账",
+   "write_owner": [
+    "paper_shared_cash",
+    "paper_user_cycle_attachment",
+    "paper_user_account_provisioning",
+    "paper_account_config"
+   ]
+  },
+  "paper_audit": {
+   "authoritative_readers": [
+    "paper_repository"
+   ],
+   "cycle_scoped": false,
+   "in_transaction_readers": [
+    "diagnose_cycle_lifecycle_conflict",
+    "paper_risk_service",
+    "paper_trading"
+   ],
+   "projection_readers": [
+    "metrics",
+    "paper_risk_evidence"
+   ],
+   "reads_may_trigger_writes": "只读",
+   "unknown_handling": "append-only，历史行不重写",
+   "write_owner": [
+    "paper_repository"
+   ]
+  },
+  "paper_capital_reservations": {
+   "authoritative_readers": [
+    "paper_capital_reservations"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "execution_planner",
+    "paper_replay_regression"
+   ],
+   "projection_readers": [],
+   "reads_may_trigger_writes": "只读",
+   "unknown_handling": "order_key 按 CAST(... AS TEXT) 比较，兼容旧整数键",
+   "write_owner": [
+    "paper_capital_reservations"
+   ]
+  },
+  "paper_cycles": {
+   "authoritative_readers": [
+    "paper_cycle_ownership"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "diagnose_cycle_lifecycle_conflict",
+    "paper_dynamic_allocation",
+    "paper_order_execution_authority",
+    "paper_risk_scan_state",
+    "paper_trading",
+    "strategy_lifecycle"
+   ],
+   "projection_readers": [
+    "dashboard_queries",
+    "paper_portfolio_read_model",
+    "paper_position_read_model",
+    "strategy_performance",
+    "tradability_position_evidence"
+   ],
+   "reads_may_trigger_writes": "load_active_cycle 会 ensure，不是只读接口",
+   "unknown_handling": "无活动周期返回 unavailable，读路径不得补建周期",
+   "write_owner": [
+    "paper_cycle_service"
+   ]
+  },
+  "paper_fills": {
+   "authoritative_readers": [
+    "execution_planner"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "adaptive_engine",
+    "execution_verification",
+    "paper_replay_regression",
+    "paper_repository",
+    "paper_trading",
+    "trade_attribution"
+   ],
+   "projection_readers": [
+    "dashboard_queries",
+    "deepseek_advisor",
+    "execution_evidence",
+    "notify_wxpusher",
+    "paper_account_metrics",
+    "paper_portfolio_read_model",
+    "strategy_health_service",
+    "strategy_performance",
+    "tradability_position_evidence"
+   ],
+   "reads_may_trigger_writes": "只读",
+   "unknown_handling": "成交归属经 order 的 cycle_id 解析，未知保持未知",
+   "write_owner": [
+    "execution_planner"
+   ]
+  },
+  "paper_orders": {
+   "authoritative_readers": [
+    "paper_order_ledger"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "adaptive_engine",
+    "adaptive_risk",
+    "adaptive_selection",
+    "entry_lifecycle",
+    "execution_dispatch",
+    "execution_planner",
+    "execution_verification",
+    "manual_orders",
+    "news_learning",
+    "paper_cycle_service",
+    "paper_order_execution_authority",
+    "paper_replay_regression",
+    "paper_repository",
+    "paper_risk_service",
+    "paper_slot_occupancy",
+    "paper_trading",
+    "portfolio_order_intents",
+    "portfolio_workspace_service",
+    "rebalance_scanner",
+    "trade_attribution"
+   ],
+   "projection_readers": [
+    "dashboard_queries",
+    "deepseek_advisor",
+    "intraday_t_pair_report",
+    "main_force_trade_evidence",
+    "paper_account_metrics",
+    "paper_portfolio_read_model",
+    "paper_position_read_model",
+    "paper_position_review_evidence",
+    "paper_risk_evidence",
+    "shadow_comparison_service",
+    "strategy_health_service",
+    "strategy_performance",
+    "tradability_position_evidence"
+   ],
+   "reads_may_trigger_writes": "只读接口不得写入；stamp_* 与 init 修复属于写路径",
+   "unknown_handling": "legacy 行的 cycle_id 保持 NULL，读侧不得用当前周期补写",
+   "write_owner": [
+    "paper_order_ledger"
+   ]
+  },
+  "paper_position_lots": {
+   "authoritative_readers": [
+    "paper_lot_ledger"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "diagnose_cycle_lifecycle_conflict",
+    "execution_planner",
+    "manual_orders",
+    "paper_position_risk_state",
+    "paper_replay_regression",
+    "paper_risk_exit_eligibility",
+    "paper_trading"
+   ],
+   "projection_readers": [
+    "paper_portfolio_read_model",
+    "paper_position_read_model",
+    "tradability_position_evidence"
+   ],
+   "reads_may_trigger_writes": "只读",
+   "unknown_handling": "source_order_id 为 NULL 的 durable lot 未平仓量记 unknown",
+   "write_owner": [
+    "paper_lot_ledger"
+   ]
+  },
+  "paper_positions": {
+   "authoritative_readers": [
+    "paper_lot_ledger"
+   ],
+   "cycle_scoped": true,
+   "in_transaction_readers": [
+    "news_learning",
+    "paper_replay_regression",
+    "paper_trading"
+   ],
+   "projection_readers": [
+    "deepseek_advisor"
+   ],
+   "reads_may_trigger_writes": "只读",
+   "unknown_handling": "派生投影；权威数量在 position_lots",
+   "write_owner": [
+    "paper_lot_ledger"
+   ]
+  },
+  "paper_risk_decisions": {
+   "authoritative_readers": [
+    "paper_risk_evidence"
+   ],
+   "cycle_scoped": false,
+   "in_transaction_readers": [
+    "adaptive_engine",
+    "adaptive_risk",
+    "paper_trading"
+   ],
+   "projection_readers": [
+    "shadow_comparison_service",
+    "strategy_health_service"
+   ],
+   "reads_may_trigger_writes": "只读",
+   "unknown_handling": "authority 词汇与结构由 schema owner 定义",
+   "write_owner": [
+    "paper_risk_writes"
+   ]
+  },
+  "paper_signals": {
+   "authoritative_readers": [
+    "signal_service"
+   ],
+   "cycle_scoped": false,
+   "in_transaction_readers": [
+    "adaptive_engine",
+    "entry_lifecycle",
+    "execution_dispatch",
+    "execution_planner",
+    "news_learning",
+    "paper_risk_service",
+    "paper_trading",
+    "rebalance_scanner",
+    "strategy_selection_resolver"
+   ],
+   "projection_readers": [
+    "dashboard_queries",
+    "paper_replacement_evidence",
+    "selection_alpha_report",
+    "shadow_comparison_service"
+   ],
+   "reads_may_trigger_writes": "load_active_cycle 之外的读路径不得 ensure",
+   "unknown_handling": "created_at 缺失/非法时 signal_freshness 判不可用（fail-closed）",
+   "write_owner": [
+    "signal_service"
+   ]
+  }
+ }
+}

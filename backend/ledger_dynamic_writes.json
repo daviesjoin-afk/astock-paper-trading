@@ -1,0 +1,112 @@
+{
+ "writes": {
+  "paper_account_config::write_params": {
+   "tables": [
+    "paper_accounts"
+   ],
+   "reason": "SET 子句按 version/now 是否给出拼装"
+  },
+  "paper_cycle_service::insert_cycle": {
+   "tables": [
+    "paper_cycles"
+   ],
+   "reason": "列集合由调用方给（白名单校验）"
+  },
+  "paper_order_ledger::cancel_order": {
+   "tables": [
+    "paper_orders"
+   ],
+   "reason": "可撤销状态集由调用方传入，占位符数量随之变化"
+  },
+  "paper_order_ledger::insert_order": {
+   "tables": [
+    "paper_orders"
+   ],
+   "reason": "列集合由调用方给（白名单校验），占位符数量随列数变化"
+  },
+  "paper_order_ledger::retire_gated_order": {
+   "tables": [
+    "paper_orders"
+   ],
+   "reason": "挂起状态集由调用方传入"
+  },
+  "paper_order_ledger::supersede_for_terminal_signal": {
+   "tables": [
+    "paper_orders"
+   ],
+   "reason": "终态词表由调用方传入"
+  },
+  "paper_order_ledger::supersede_older_intents": {
+   "tables": [
+    "paper_orders"
+   ],
+   "reason": "状态集合由调用方传入"
+  },
+  "paper_order_ledger::update_order_outcome": {
+   "tables": [
+    "paper_orders"
+   ],
+   "reason": "SET 子句按调用方给出的字段组合拼装"
+  },
+  "paper_user_account_provisioning::insert_account": {
+   "tables": [
+    "paper_accounts"
+   ],
+   "reason": "列集合由调用方给（白名单校验）"
+  },
+  "paper_user_cycle_attachment::apply_cycle_membership": {
+   "tables": [
+    "paper_accounts"
+   ],
+   "reason": "列集合由调用方给（白名单校验）"
+  },
+  "paper_user_cycle_attachment::set_status": {
+   "tables": [
+    "paper_accounts"
+   ],
+   "reason": "过滤条件由调用方给出（活动周期 clause）"
+  },
+  "signal_service::advance_signal_feedback": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "活动状态集合由调用方传入"
+  },
+  "signal_service::conflict_statement": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "冲突语句按 upsert 列集拼装（既有实现）"
+  },
+  "signal_service::expire_after_order_retry": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "终态集合由调用方传入"
+  },
+  "signal_service::expire_within": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "状态集合由调用方传入"
+  },
+  "signal_service::reopen_for_retry": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "终态集合由调用方传入"
+  },
+  "signal_service::retire_waitlist_signals": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "身份集合由调用方传入"
+  },
+  "signal_service::supersede_signals": {
+   "tables": [
+    "paper_signals"
+   ],
+   "reason": "身份与状态集合由调用方传入"
+  }
+ }
+}
