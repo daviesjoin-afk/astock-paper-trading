@@ -481,6 +481,7 @@ def _write_signal_marker(
     key: str,
     value: Mapping[str, Any],
     *,
+    signals,
     now: dt.datetime | None = None,
 ) -> None:
     """把一次性标记写入信号 payload（信号被 supersede 后仍随行保留）。
@@ -497,10 +498,8 @@ def _write_signal_marker(
     marker["at"] = _iso(now or _now())
     payload[key] = marker
     try:
-        conn.execute(
-            "UPDATE paper_signals SET payload=? WHERE id=?",
-            (json.dumps(payload, ensure_ascii=False), int(signal_id)),
-        )
+        signals.write_payload(conn, int(signal_id),
+                              payload=json.dumps(payload, ensure_ascii=False))
     except sqlite3.Error:
         pass
 
@@ -542,6 +541,7 @@ def _retire_for_retry(
     reason: str,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     release_batch: bool = False,
     now: dt.datetime | None = None,
 ) -> bool:
@@ -567,28 +567,19 @@ def _retire_for_retry(
     if release_batch and signal_id is not None:
         _write_signal_marker(conn, signal_id, BATCH_RELEASE_PAYLOAD_KEY, {
             "released": True, "reason": reason,
-        }, now=moment)
+        }, signals=signals, now=moment)
     if signal_id is not None:
-        terminal = ",".join("?" for _ in TERMINAL_SIGNAL_STATUSES)
         if _signal_alive(conn, signal_id, now=moment):
-            conn.execute(
-                f"""UPDATE paper_signals SET status=?,reason=?
-                     WHERE id=? AND status NOT IN ({terminal})""",
-                (RETRY_SIGNAL_STATUS, reason, int(signal_id),
-                 *TERMINAL_SIGNAL_STATUSES),
-            )
+            signals.reopen_for_retry(conn, int(signal_id), reason=reason,
+                                     terminal_statuses=TERMINAL_SIGNAL_STATUSES)
         else:
-            conn.execute(
-                f"""UPDATE paper_signals SET status='expired',
-                         reason=COALESCE(reason,'') || '；' || ?
-                     WHERE id=? AND status NOT IN ({terminal})""",
-                (reason + "；信号已过有效期，一并失效", int(signal_id),
-                 *TERMINAL_SIGNAL_STATUSES),
-            )
+            signals.expire_after_order_retry(
+                conn, int(signal_id), reason=reason,
+                terminal_statuses=TERMINAL_SIGNAL_STATUSES)
     return True
 
 
-def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses):
+def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses, signals):
     """回收同一标的下的旧等待池记录及其信号。
 
     调用方（``paper_trading`` 的启动恢复）已判定"较新记录保留"，本入口只按原
@@ -597,18 +588,10 @@ def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses):
     会漏掉本轮新标记的行。使用传入连接，不读时钟、不提交。
     """
     POL.retire_duplicate_waitlist_orders(conn, waitlist_status=waitlist_status)
-    conn.execute(
-        """UPDATE paper_signals
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代'
-           WHERE id IN (
-               SELECT signal_id FROM paper_orders
-               WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
-                 AND reason LIKE '%等待池记录已保留%'
-           )
-             AND status IN (?,?,?)""",
-        tuple(signal_statuses),
-    )
+    # 订单标记由 owner 写入；信号身份用 owner 的只读反查取出，读取留在本层，
+    # 避免 signal 侧新增对订单表的静态依赖。
+    signal_ids = POL.signal_ids_by_reason_marker(conn, "等待池记录已保留")
+    signals.retire_waitlist_signals(conn, signal_ids, statuses=signal_statuses)
 
 
 def _terminate(
@@ -618,6 +601,7 @@ def _terminate(
     reason: str,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     terminal_signal: bool = True,
     signal_status: str = "rejected",
 ) -> None:
@@ -626,10 +610,8 @@ def _terminate(
     POL.terminate_order(conn, order_id, status=status, reason=reason,
                         cancelled_at=_iso(_now()))
     if terminal_signal and row.get("signal_id") is not None:
-        conn.execute(
-            "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-            (signal_status, reason, int(row["signal_id"])),
-        )
+        signals.terminate_for_dispatch(conn, int(row["signal_id"]),
+                                       status=signal_status, reason=reason)
 
 
 def retire_gated_orders(conn, signal_id, *, release_reservation: Callable[..., Any],
@@ -657,6 +639,7 @@ def sweep_expired_gated_orders(
     conn,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -686,7 +669,8 @@ def sweep_expired_gated_orders(
             _terminate(
                 conn, row, "superseded",
                 "关联信号已进入终态，挂起委托回收",
-                release_reservation=release_reservation, terminal_signal=False,
+                release_reservation=release_reservation, signals=signals,
+                terminal_signal=False,
             )
             summary["retired"] += 1
             continue
@@ -708,14 +692,16 @@ def sweep_expired_gated_orders(
             _terminate(
                 conn, row, EXPIRED_ORDER_STATUS,
                 "严格时限画像到期未成交，委托作废",
-                release_reservation=release_reservation, signal_status="expired",
+                release_reservation=release_reservation, signals=signals,
+                signal_status="expired",
             )
             summary["expired"] += 1
         else:
             _retire_for_retry(
                 conn, row,
                 "执行时限到期，挂起委托作废；信号仍新鲜时由下一轮重建新委托",
-                release_reservation=release_reservation, release_batch=True, now=moment,
+                release_reservation=release_reservation, signals=signals,
+                release_batch=True, now=moment,
             )
             summary["released"] += 1
     return summary
@@ -725,12 +711,13 @@ def run_execution_dispatch(
     conn,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """周期清扫入口（每轮扫描调用一次），返回本轮处置摘要。"""
     return sweep_expired_gated_orders(
-        conn, release_reservation=release_reservation,
+        conn, release_reservation=release_reservation, signals=signals,
         now=now, dispatch_settings=dispatch_settings)
 
 
@@ -811,6 +798,7 @@ def resolve_verification(
     order_id: int,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     approved: bool,
     operator: str = "",
     note: str = "",
@@ -837,20 +825,21 @@ def resolve_verification(
         "note": str(note or "")[:500],
         "order_id": int(order_id),
     }
-    _write_signal_marker(conn, signal_id, VERIFICATION_PAYLOAD_KEY, decision, now=now)
+    _write_signal_marker(conn, signal_id, VERIFICATION_PAYLOAD_KEY, decision,
+                         signals=signals, now=now)
     if approved:
         # PR-29：放行不是把挂起行原地改写为重试行，而是作废本次挂起尝试；
         # 放行结论已写入信号 payload，下一轮由信号重建新委托（新 expires_at）。
         _retire_for_retry(
             conn, record,
             f"人工核验放行（{decision['operator'] or '运营'}）：{note or '无备注'}",
-            release_reservation=release_reservation, now=now,
+            release_reservation=release_reservation, signals=signals, now=now,
         )
     else:
         _terminate(
             conn, record, CANCELLED_ORDER_STATUS,
             f"人工核验驳回（{decision['operator'] or '运营'}）：{note or '无备注'}",
-            release_reservation=release_reservation,
+            release_reservation=release_reservation, signals=signals,
         )
     return {
         "ok": True,

@@ -4612,3 +4612,15 @@ owner 契约：不算成交（`commit_fill` 仍唯一）、不读时钟、不 co
 成本显式登记：新增含 SQL 模块使 `raw_sql_modules` 141→142、`paper_table_fanout_max` 50→51、
 `cross_domain_edges` 629→630，全部走 `FEATURE_ALLOWANCE` + `docs/COUPLING_BUDGET.md` 切片记录，
 `HEAD_BUDGET` 与 lock 不变。A 后续片与 B/C/D 搬走写入后需收回这些额度。
+
+## PR-10 工作包 A 第二片 信号行 owner（2026-11-01）
+
+`execution_dispatch` 不再写 `paper_signals`：payload 标记、重试接通、信号过期、派发终止与等待池
+替代信号分别交由 `signal_service` 的 `write_payload` / `reopen_for_retry` /
+`expire_after_order_retry` / `terminate_for_dispatch` / `retire_waitlist_signals`。
+`paper_signals` 的运行时写方由 4 个降到 3 个。
+
+按既有注入约定，`execution_dispatch` 不 import 信号 owner，改由组装根经 preflight 传入 `signals`
+端口；`paper_slot_service` 同样只转发，不自行 import。信号身份的反查放在订单 owner
+（`POL.signal_ids_by_reason_marker`），读取仍在调用方，避免 signal 侧新增订单表依赖。
+信号写方集合的变化没有新增跨域边（`cross_domain_edges` 保持 630）。

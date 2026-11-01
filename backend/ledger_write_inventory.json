@@ -229,92 +229,6 @@
    ]
   },
   {
-   "function": "_write_signal_marker",
-   "kind": "static",
-   "line": 501,
-   "module": "execution_dispatch",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET payload=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_retire_for_retry",
-   "kind": "static",
-   "line": 575,
-   "module": "execution_dispatch",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status=?,reason=? WHERE id=? AND status NOT IN (",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_retire_for_retry",
-   "kind": "dynamic",
-   "line": 575,
-   "module": "execution_dispatch",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status=?,reason=? WHERE id=? AND status NOT IN ({})",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_retire_for_retry",
-   "kind": "static",
-   "line": 582,
-   "module": "execution_dispatch",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='expired', reason=COALESCE(reason,'') || '；' || ? WHERE id=? AND status NOT IN (",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_retire_for_retry",
-   "kind": "dynamic",
-   "line": 582,
-   "module": "execution_dispatch",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='expired', reason=COALESCE(reason,'') || '；' || ? WHERE id=? AND status NOT IN ({})",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "retire_duplicate_waitlist",
-   "kind": "static",
-   "line": 601,
-   "module": "execution_dispatch",
-   "read_refs": [
-    "paper_orders"
-   ],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
-   "function": "_terminate",
-   "kind": "static",
-   "line": 630,
-   "module": "execution_dispatch",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-   "write_targets": [
-    "paper_signals"
-   ]
-  },
-  {
    "function": "commit_fill",
    "kind": "static",
    "line": 1982,
@@ -1746,7 +1660,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14141,
+   "line": 14142,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1758,7 +1672,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14178,
+   "line": 14179,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1770,7 +1684,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14207,
+   "line": 14208,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1782,7 +1696,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14235,
+   "line": 14236,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1794,7 +1708,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14249,
+   "line": 14250,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1806,7 +1720,7 @@
   {
    "function": "set_account_style",
    "kind": "static",
-   "line": 14323,
+   "line": 14324,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1818,7 +1732,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14346,
+   "line": 14347,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1830,7 +1744,7 @@
   {
    "function": "set_accounts_status",
    "kind": "dynamic",
-   "line": 14346,
+   "line": 14347,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1842,7 +1756,7 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14349,
+   "line": 14350,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1902,7 +1816,7 @@
   {
    "function": "conflict_statement",
    "kind": "static",
-   "line": 150,
+   "line": 154,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1914,7 +1828,7 @@
   {
    "function": "conflict_statement",
    "kind": "dynamic",
-   "line": 150,
+   "line": 154,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1926,7 +1840,7 @@
   {
    "function": "conflict_statement",
    "kind": "static",
-   "line": 153,
+   "line": 157,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1938,7 +1852,7 @@
   {
    "function": "conflict_statement",
    "kind": "dynamic",
-   "line": 153,
+   "line": 157,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1950,7 +1864,7 @@
   {
    "function": "expire_for_expired_order",
    "kind": "static",
-   "line": 462,
+   "line": 466,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1962,7 +1876,7 @@
   {
    "function": "expire_stale_signal",
    "kind": "static",
-   "line": 471,
+   "line": 475,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1974,11 +1888,107 @@
   {
    "function": "reconcile_signal_status",
    "kind": "static",
-   "line": 484,
+   "line": 488,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_signals SET status=?, reason=COALESCE(reason,'') || '；按活动委托状态对账' WHERE id=? AND status<>?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "write_payload",
+   "kind": "static",
+   "line": 504,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET payload=? WHERE id=?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "reopen_for_retry",
+   "kind": "static",
+   "line": 516,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='pending',reason=? WHERE id=? AND status NOT IN (",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "reopen_for_retry",
+   "kind": "dynamic",
+   "line": 516,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='pending',reason=? WHERE id=? AND status NOT IN ({})",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "expire_after_order_retry",
+   "kind": "static",
+   "line": 529,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='expired', reason=COALESCE(reason,'') || '；' || ? WHERE id=? AND status NOT IN (",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "expire_after_order_retry",
+   "kind": "dynamic",
+   "line": 529,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='expired', reason=COALESCE(reason,'') || '；' || ? WHERE id=? AND status NOT IN ({})",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "terminate_for_dispatch",
+   "kind": "static",
+   "line": 545,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "retire_waitlist_signals",
+   "kind": "static",
+   "line": 561,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN (",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "retire_waitlist_signals",
+   "kind": "dynamic",
+   "line": 561,
+   "module": "signal_service",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ({}) AND status IN ({})",
    "write_targets": [
     "paper_signals"
    ]
@@ -3404,7 +3414,7 @@
   {
    "function": "_order",
    "kind": "static",
-   "line": 61,
+   "line": 62,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -3416,7 +3426,7 @@
   {
    "function": "_order",
    "kind": "static",
-   "line": 68,
+   "line": 69,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -3428,7 +3438,7 @@
   {
    "function": "test_expired_batch_order_rearms_a_fresh_signal",
    "kind": "static",
-   "line": 200,
+   "line": 201,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -3440,7 +3450,7 @@
   {
    "function": "test_terminal_signal_retires_the_gate",
    "kind": "static",
-   "line": 239,
+   "line": 240,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -3452,7 +3462,7 @@
   {
    "function": "test_reservation_is_released_on_termination",
    "kind": "static",
-   "line": 265,
+   "line": 267,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -3464,7 +3474,7 @@
   {
    "function": "_reject_then_recreate",
    "kind": "static",
-   "line": 338,
+   "line": 340,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -3476,7 +3486,7 @@
   {
    "function": "_reject_then_recreate",
    "kind": "static",
-   "line": 340,
+   "line": 342,
    "module": "test_execution_dispatch",
    "read_refs": [],
    "role": "test",
@@ -4041,7 +4051,7 @@
   {
    "function": "test_terminal_owner_takes_the_status_vocabulary_from_the_caller",
    "kind": "static",
-   "line": 299,
+   "line": 300,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -4053,7 +4063,7 @@
   {
    "function": "_row",
    "kind": "static",
-   "line": 392,
+   "line": 393,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -4065,7 +4075,7 @@
   {
    "function": "test_integer_stored_keys_are_still_matched",
    "kind": "static",
-   "line": 434,
+   "line": 435,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -10819,7 +10829,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 178,
+   "line": 179,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",
@@ -10831,7 +10841,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 179,
+   "line": 180,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",

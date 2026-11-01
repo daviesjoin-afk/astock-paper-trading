@@ -26,13 +26,22 @@ class InventoryScanTests(unittest.TestCase):
                          "改完源码要重新生成：python backend/tools/ledger_write_inventory.py")
 
     def test_scan_separates_write_targets_from_subquery_reads(self):
-        by_key = {(e["module"], e["function"]): e for e in INVENTORY["entries"]}
-        # 对账里那条信号 UPDATE 的子查询引用订单表：算读引用，不算订单写入。
+        entries = INVENTORY["entries"]
+        by_key = {(e["module"], e["function"]): e for e in entries}
+        # 信号对账只写信号表：子查询里出现的订单表不应被记成订单写入。
         signal_write = by_key[("signal_service", "reconcile_signal_status")]
         self.assertEqual(["paper_signals"], signal_write["write_targets"])
-        waitlist = by_key[("execution_dispatch", "retire_duplicate_waitlist")]
+        # 等待池信号的写入不再读订单表（身份由调用方给出）。
+        waitlist = by_key[("signal_service", "retire_waitlist_signals")]
         self.assertEqual(["paper_signals"], waitlist["write_targets"])
-        self.assertEqual(["paper_orders"], waitlist["read_refs"])
+        self.assertEqual([], waitlist["read_refs"])
+        # 正例：确实同时读订单表的语句，写目标与读引用分别登记。
+        readers = [e for e in entries
+                   if e["role"] == "runtime" and e["read_refs"]
+                   and "paper_orders" in e["read_refs"]]
+        self.assertTrue(readers, "扫描器应当能识别语句里的跨表读引用")
+        for entry in readers:
+            self.assertNotIn("paper_orders", entry["write_targets"])
 
     def test_non_runtime_roles_are_not_counted_as_writers(self):
         roles = {e["role"] for e in INVENTORY["entries"]}

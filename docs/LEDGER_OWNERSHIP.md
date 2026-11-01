@@ -393,13 +393,9 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `paper_signals` | 重试接管：信号状态同步 | `execution_dispatch::_retire_for_retry` | execution_dispatch 重试策略 | `signal_service` | 调用方同一连接与原事务 | 待补 |
-| `paper_signals` | 派发终止：信号终态 | `execution_dispatch::_terminate` | execution_dispatch 派发阶段 | `signal_service` | 调用方同一连接与原事务 | `test_order_ledger`、`test_position_risk_state` |
-| `paper_signals` | 信号 payload 标记写入 | `execution_dispatch::_write_signal_marker` | execution_dispatch 批次/释放标记 | `signal_service` | 调用方同一连接与原事务 | 待补 |
-| `paper_signals` | 等待池重复记录退役（信号） | `execution_dispatch::retire_duplicate_waitlist` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_ledger_ownership`、`test_order_ledger` |
 | `paper_orders` | 手动撤单 cancelled | `manual_orders::cancel_manual_order` | 用户请求 + 手动入口校验 | `paper_order_ledger` | 服务入口传入的连接 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
 | `paper_orders` | 订单自身过期终态 expired | `paper_order_ledger::expire_order` | entry_lifecycle 判定，dispatch 落库 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ledger` |
-| `paper_orders` | 等待池重复记录退役（订单，批量） | `paper_order_ledger::retire_duplicate_waitlist_orders` | paper_trading 启动恢复 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_order_ledger` |
+| `paper_orders` | 等待池重复记录退役（订单，批量） | `paper_order_ledger::retire_duplicate_waitlist_orders` | paper_trading 启动恢复 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_order_ledger`、`test_waitlist_dedupe_write` |
 | `paper_orders` | 挂起订单退役（batch/verification 等待超时） | `paper_order_ledger::retire_gated_order` | execution_dispatch 等待窗口 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_dispatch`、`test_order_ledger` |
 | `paper_orders` | 重复执行重试退旧 superseded | `paper_order_ledger::supersede_duplicate_execution_retry` | paper_trading 对账循环 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_ledger_ownership`、`test_order_ledger`、`test_signal_order_reconcile_write` |
 | `paper_orders` | 失效信号名下买单回收 superseded | `paper_order_ledger::supersede_for_expired_signal` | entry_lifecycle 失效判定 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ledger` |
@@ -408,9 +404,14 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_orders` | 派发终止：订单转调用方判定的终态 | `paper_order_ledger::terminate_order` | execution_dispatch 派发阶段 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_order_ledger` |
 | `paper_orders` | 冻结等待池标记订单创建（INSERT） | `paper_trading::_record_entry_frozen_waitlist` | paper_trading 入场闸门 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_order_cycle_provenance` |
 | `paper_orders` | 新一轮执行重试接管：退役全部旧重试 | `paper_trading::_supersede_signal_execution_retries` | paper_trading 重试发起 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 重试接管：过期信号一并收敛 expired | `signal_service::expire_after_order_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 订单过期联动信号 expired | `signal_service::expire_for_expired_order` | entry_lifecycle 过期判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ttl_lifecycle` |
 | `paper_signals` | 信号自身失效 expired | `signal_service::expire_stale_signal` | entry_lifecycle 失效判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_paper_slot_service` |
 | `paper_signals` | 信号状态对账 | `signal_service::reconcile_signal_status` | paper_trading 对账循环 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_ledger_ownership`、`test_signal_order_reconcile_write` |
+| `paper_signals` | 重试接管：信号回到复试管道 | `signal_service::reopen_for_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 等待池重复记录退役（信号） | `signal_service::retire_waitlist_signals` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_waitlist_dedupe_write` |
+| `paper_signals` | 派发终止：信号写终态（rejected/expired 白名单） | `signal_service::terminate_for_dispatch` | execution_dispatch 派发阶段 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 信号 payload 标记写入 | `signal_service::write_payload` | execution_dispatch 批次/核验标记 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 
 ### 工作包 B
 
@@ -497,6 +498,21 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 `execution_dispatch` 至此**不再写 `paper_orders`**（守卫 `test_order_ledger` 用源码断言守住），
 它只保留派发阶段的判定、顺序、预占释放与信号写入。信号写入的收口（`_retire_for_retry` /
 `_terminate` / `retire_duplicate_waitlist` / `_write_signal_marker` → `signal_service`）是 A 的下一片。
+
+**A 第二片**：`execution_dispatch` 的信号写入并入 `signal_service`，它不再写 `paper_signals`
+（信号写方集合 4 → 3 个模块：`paper_trading` / `manual_orders` / `signal_service`）：
+
+| 原写入点 | 新入口 |
+| --- | --- |
+| `_write_signal_marker` 的 payload 写 | `SIG.write_payload` |
+| `_retire_for_retry` 的"回到复试"分支 | `SIG.reopen_for_retry` |
+| `_retire_for_retry` 的"信号过期"分支 | `SIG.expire_after_order_retry` |
+| `_terminate` 的信号终态写 | `SIG.terminate_for_dispatch`（rejected / expired 白名单） |
+| `retire_duplicate_waitlist` 的信号写 | `SIG.retire_waitlist_signals`（身份由 `POL.signal_ids_by_reason_marker` 反查，读取留在调用方） |
+
+依赖方向按既有约定处理：`execution_dispatch` **不 import** `signal_service`，由组装根经
+`paper_slot_service.run_preflight` 传入 `signals` 端口（与 `release_reservation` 同一种注入方式），
+因此没有新增跨域边；`paper_slot_service` 也不再 import 信号 owner。
 
 成本登记：新增一个含 SQL 的 owner 模块 → `raw_sql_modules` 141→142、
 `paper_table_fanout_max` 50→51、`cross_domain_edges` 629→630（`execution_dispatch → paper_order_ledger`），

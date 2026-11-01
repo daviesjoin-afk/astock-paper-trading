@@ -49,34 +49,6 @@
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
-  "execution_dispatch::_retire_for_retry": {
-   "judge": "execution_dispatch 重试策略",
-   "operation": "重试接管：信号状态同步",
-   "single_owner": "signal_service",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_dispatch::_terminate": {
-   "judge": "execution_dispatch 派发阶段",
-   "operation": "派发终止：信号终态",
-   "single_owner": "signal_service",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_dispatch::_write_signal_marker": {
-   "judge": "execution_dispatch 批次/释放标记",
-   "operation": "信号 payload 标记写入",
-   "single_owner": "signal_service",
-   "single_package": "A",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "execution_dispatch::retire_duplicate_waitlist": {
-   "judge": "paper_trading 启动恢复",
-   "operation": "等待池重复记录退役（信号）",
-   "single_owner": "signal_service",
-   "single_package": "A",
-   "transaction": "启动恢复/初始化连接"
-  },
   "execution_planner::commit_fill": {
    "judge": "commit_fill 唯一成交权威",
    "operation": "成交结果写入（状态/成交价/费用/证据）",
@@ -479,6 +451,13 @@
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
+  "signal_service::expire_after_order_retry": {
+   "judge": "execution_dispatch 重试接管判定",
+   "operation": "重试接管：过期信号一并收敛 expired",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
   "signal_service::expire_for_expired_order": {
    "judge": "entry_lifecycle 过期判定",
    "operation": "订单过期联动信号 expired",
@@ -499,6 +478,34 @@
    "single_owner": "signal_service",
    "single_package": "A",
    "transaction": "启动恢复/初始化连接"
+  },
+  "signal_service::reopen_for_retry": {
+   "judge": "execution_dispatch 重试接管判定",
+   "operation": "重试接管：信号回到复试管道",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::retire_waitlist_signals": {
+   "judge": "paper_trading 启动恢复",
+   "operation": "等待池重复记录退役（信号）",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "signal_service::terminate_for_dispatch": {
+   "judge": "execution_dispatch 派发阶段",
+   "operation": "派发终止：信号写终态（rejected/expired 白名单）",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::write_payload": {
+   "judge": "execution_dispatch 批次/核验标记",
+   "operation": "信号 payload 标记写入",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
   }
  },
  "planned_owners": {

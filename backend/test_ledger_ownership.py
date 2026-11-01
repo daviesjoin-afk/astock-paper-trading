@@ -95,7 +95,7 @@ OWNERSHIP = {
     "paper_signals": {
         "status": "pending",
         "writers": {
-            "paper_trading", "manual_orders", "execution_dispatch", "signal_service",
+            "paper_trading", "manual_orders", "signal_service",
         },
         "note": "信号生命周期同样按阶段分写；锁定集合，下一步按阶段收口",
     },
@@ -248,9 +248,9 @@ class WaitlistRetirementOperationTests(unittest.TestCase):
         import inspect
         import execution_dispatch as EPD
         signature = inspect.signature(EPD.retire_duplicate_waitlist)
-        self.assertEqual(["conn", "waitlist_status", "signal_statuses"],
+        self.assertEqual(["conn", "waitlist_status", "signal_statuses", "signals"],
                          list(signature.parameters))
-        for name in ("waitlist_status", "signal_statuses"):
+        for name in ("waitlist_status", "signal_statuses", "signals"):
             self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
                              signature.parameters[name].kind)
             self.assertEqual(inspect.Parameter.empty,
@@ -260,7 +260,8 @@ class WaitlistRetirementOperationTests(unittest.TestCase):
         self.assertEqual("pending", OWNERSHIP["paper_orders"]["status"])
         self.assertEqual("pending", OWNERSHIP["paper_signals"]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
-        self.assertIn("execution_dispatch", OWNERSHIP["paper_signals"]["writers"])
+        self.assertIn("signal_service", OWNERSHIP["paper_signals"]["writers"])
+        self.assertNotIn("execution_dispatch", OWNERSHIP["paper_signals"]["writers"])
         self.assertIn("paper_trading", OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("paper_trading", OWNERSHIP["paper_signals"]["writers"])
 
@@ -308,8 +309,8 @@ class ReconcileWriteOperationTests(unittest.TestCase):
             "SELECT status FROM paper_orders WHERE id=2").fetchone()[0])
 
     def test_write_sets_keep_pending_and_unchanged_membership(self):
-        self.assertEqual(7, len(write_sites("paper_orders")))
-        self.assertEqual(4, len(write_sites("paper_signals")))
+        self.assertEqual(6, len(write_sites("paper_orders")))
+        self.assertEqual(3, len(write_sites("paper_signals")))
         for table in ("paper_orders", "paper_signals"):
             self.assertEqual("pending", OWNERSHIP[table]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])

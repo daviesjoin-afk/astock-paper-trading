@@ -126,7 +126,8 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         try:
             with mock.patch.object(EPD, "_now", side_effect=AssertionError("owner read clock")):
                 result = EPD.retire_duplicate_waitlist(
-                    conn, waitlist_status=WAITLIST, signal_statuses=SIGNAL_STATES)
+                    conn, waitlist_status=WAITLIST, signal_statuses=SIGNAL_STATES,
+                    signals=SIG)
         finally:
             conn.set_trace_callback(None)
         return result, [" ".join(sql.split()) for sql in statements]
@@ -179,7 +180,10 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         self.assertTrue(writes[1].startswith("UPDATE paper_signals"))
         self.assertIn(ORDER_MARK, writes[0])
         self.assertIn(SIGNAL_MARK, writes[1])
-        self.assertIn("LIKE '%等待池记录已保留%'", writes[1])
+        # A 第二片之后：信号身份由订单 owner 的只读反查给出，
+        # signal 语句只按 id 集合写入，不再自己在子查询里读订单表。
+        self.assertNotIn("paper_orders", writes[1].lower())
+        self.assertIn("WHERE id IN (", writes[1])
 
     def test_repeat_run_is_idempotent(self):
         conn = _db()
@@ -241,26 +245,24 @@ class WaitlistDedupeOwnershipTests(unittest.TestCase):
                  and isinstance(node.func, ast.Attribute)
                  and node.func.attr == "retire_duplicate_waitlist"]
         self.assertEqual(1, len(calls))
-        self.assertEqual(["waitlist_status", "signal_statuses"],
+        self.assertEqual(["waitlist_status", "signal_statuses", "signals"],
                          [kw.arg for kw in calls[0].keywords])
 
     def test_owner_exposes_narrow_business_operation(self):
         signature = inspect.signature(EPD.retire_duplicate_waitlist)
-        self.assertEqual(["conn", "waitlist_status", "signal_statuses"],
+        self.assertEqual(["conn", "waitlist_status", "signal_statuses", "signals"],
                          list(signature.parameters))
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
                          signature.parameters["waitlist_status"].kind)
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
                          signature.parameters["signal_statuses"].kind)
 
-    def test_owner_sql_stays_static_for_the_write_guard(self):
+    def test_owner_delegates_both_writes_and_keeps_no_sql(self):
         source = inspect.getsource(EPD.retire_duplicate_waitlist)
-        literals = [node.value for node in ast.walk(ast.parse(textwrap.dedent(source)))
-                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
-        self.assertEqual({"paper_orders", "paper_signals"},
-                         {table for table in ("paper_orders", "paper_signals")
-                          if any(table in text.lower() for text in literals)})
-        self.assertFalse(any(text.islower() and "{" in text for text in literals))
+        self.assertIn("POL.retire_duplicate_waitlist_orders", source)
+        self.assertIn("signals.retire_waitlist_signals", source)
+        self.assertIn("POL.signal_ids_by_reason_marker", source)
+        self.assertNotIn("UPDATE ", source.upper())
 
     def test_owner_is_exported_and_no_new_module_joins_the_writer_sets(self):
         self.assertIn("retire_duplicate_waitlist", EPD.__all__)
@@ -268,7 +270,7 @@ class WaitlistDedupeOwnershipTests(unittest.TestCase):
         # 订单行的持久化已在 PR-10 工作包 A 移交 paper_order_ledger；
         # 信号写入仍由 execution_dispatch 在对账/等待池阶段承担。
         self.assertIn("paper_order_ledger", matrix["paper_orders"]["writers"])
-        self.assertIn("execution_dispatch", matrix["paper_signals"]["writers"])
+        self.assertIn("signal_service", matrix["paper_signals"]["writers"])
         for table in ("paper_orders", "paper_signals"):
             self.assertEqual("pending", matrix[table]["status"])
         # 信号侧没有新增写入口：本批不把同一业务操作拆给 signal_service。

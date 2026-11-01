@@ -1585,7 +1585,7 @@ def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     # 信号按刚写入的原因标记反查，否则本轮新标记的行会被漏掉。
     EPD.retire_duplicate_waitlist(
         conn, waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
-        signal_statuses=ENTRY_RETRY_SIGNAL_STATUSES,
+        signal_statuses=ENTRY_RETRY_SIGNAL_STATUSES, signals=SIG,
     )
 
 
@@ -8018,7 +8018,7 @@ def resolve_execution_verification(order_id, approved, operator="", note=""):
     with _db(immediate=True, hot_path=True) as conn:
         return EPD.resolve_verification(
             conn, int(order_id),
-            release_reservation=PCR.release_order_reservation,
+            release_reservation=PCR.release_order_reservation, signals=SIG,
             approved=bool(approved),
             operator=str(operator or "")[:64], note=str(note or "")[:500],
         )
@@ -12721,6 +12721,7 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
             resolve_asof_day=lambda: _date(asof_date),
             expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order,
             expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal,
+            signals=SIG,
         )
     day = _date(asof_date)
     result = _run_slot_impl(slot, day=day, force=force)

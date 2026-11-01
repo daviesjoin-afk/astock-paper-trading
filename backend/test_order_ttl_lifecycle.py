@@ -94,7 +94,7 @@ def _row(conn, table, row_id):
 def _run_both_sweeps(conn, now=NOW):
     """三端生产中两个清扫器同属扫描环；测试里同样成对运行。"""
     entry_summary = ELC.expire_stale_orders(conn, expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order, release_reservation=PCR.release_order_reservation, now=now)
-    dispatch_summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=now)
+    dispatch_summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=now, signals=SIG)
     return entry_summary, dispatch_summary
 
 
