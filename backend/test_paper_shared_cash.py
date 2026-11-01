@@ -417,7 +417,8 @@ class SharedCashArchitectureGuardTests(unittest.TestCase):
             and isinstance(node.value, str)
             and node.value.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "PRAGMA"))
         ]
-        self.assertEqual(2, len(sql))
+        # debit / credit / adjust_cash 三条，都是 cash ± 与 updated_at 的更新。
+        self.assertEqual(3, len(sql))
         for statement in sql:
             self.assertTrue(statement.startswith("UPDATE PAPER_ACCOUNTS SET CASH="), statement)
             self.assertIn("UPDATED_AT", statement)

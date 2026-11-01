@@ -912,18 +912,6 @@
    ]
   },
   {
-   "function": "set_cycle_capital",
-   "kind": "static",
-   "line": 179,
-   "module": "paper_shared_cash",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
    "function": "_ensure_cycle",
    "kind": "static",
    "line": 2064,
@@ -1243,6 +1231,18 @@
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE {}",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_cycle_capital",
+   "kind": "static",
+   "line": 104,
+   "module": "paper_user_cycle_attachment",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND id=?",
    "write_targets": [
     "paper_accounts"
    ]
@@ -5737,7 +5737,7 @@
   {
    "function": "test_module_write_sql_is_only_cash_and_timestamp_update",
    "kind": "static",
-   "line": 422,
+   "line": 423,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5749,7 +5749,7 @@
   {
    "function": "setUp",
    "kind": "static",
-   "line": 460,
+   "line": 461,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5834,11 +5834,23 @@
   {
    "function": "test_module_is_stdlib_free_of_imports_and_forbidden_boundaries",
    "kind": "static",
-   "line": 245,
+   "line": 247,
    "module": "test_paper_user_account_provisioning",
    "read_refs": [],
    "role": "test",
    "sql": "INSERT INTO paper_accounts",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "test_module_is_stdlib_free_of_imports_and_forbidden_boundaries",
+   "kind": "static",
+   "line": 250,
+   "module": "test_paper_user_account_provisioning",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_accounts",
    "write_targets": [
     "paper_accounts"
    ]

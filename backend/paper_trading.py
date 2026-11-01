@@ -14171,7 +14171,7 @@ def configure_capital(capital):
         for account_id in active_ids:
             share = (round(capital * shares.get(account_id, 0.0), 2)
                      if shares else fallback_share)
-            PSC.set_cycle_capital(conn, account_id, cycle_id=cycle["id"],
+            PUCA.set_cycle_capital(conn, account_id, cycle_id=cycle["id"],
                                   capital=share, now=_now())
             conn.execute(
                 # 只改该账户**最近一条**净值行：草稿期改资金不该重写历史净值曲线。

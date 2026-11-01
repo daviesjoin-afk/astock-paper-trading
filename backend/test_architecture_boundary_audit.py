@@ -142,7 +142,7 @@ class CouplingBudgetTests(unittest.TestCase):
         # 这是"写入归属明确化"的成本，不是新增业务耦合；B/C/D 继续把写入搬离
         # `paper_trading` / `manual_orders` 后，模块数与扇出应当下降，
         # 届时额度必须收回。登记见 docs/COUPLING_BUDGET.md「2026-11-01 PR-10 A」。
-        "raw_sql_modules": 1,
+        "raw_sql_modules": 2,
         "paper_table_fanout_max": 1,
         # 2026-10-29（adaptive 库 schema 收口）：schema owner 显式持有 7 个下游
         # owner 的建表依赖，README 见 docs/COUPLING_BUDGET.md 当日切片。
@@ -159,7 +159,10 @@ class CouplingBudgetTests(unittest.TestCase):
         # `execution_verification → paper_order_ledger`（execution → paper）是一条
         # 真实的新依赖 —— 核验结论此前由该模块自己 UPDATE，现在必须经过订单 owner。
         # 12 → 13，登记见 docs/COUPLING_BUDGET.md「2026-11-01 PR-10 B」。
-        "cross_domain_edges": 13,
+        # 2026-11-01（PR-10 工作包 C：账户配置 owner）：五个 adaptive/evolution 模块
+        # 把参数写入交给 `paper_account_config`，各新增一条显式依赖边（+5）。
+        # 13 → 18；登记见 docs/COUPLING_BUDGET.md。
+        "cross_domain_edges": 18,
         "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,

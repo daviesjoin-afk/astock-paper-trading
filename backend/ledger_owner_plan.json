@@ -203,13 +203,6 @@
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
-  "paper_shared_cash::set_cycle_capital": {
-   "judge": "配置入口校验",
-   "operation": "周期资金配置（初始资金/现金/基准净值）",
-   "single_owner": "paper_shared_cash",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_trading::_cleanup_stale_data": {
    "judge": "paper_trading 归档策略",
    "operation": "归档/清理超龄信号行（DELETE）",
@@ -316,6 +309,13 @@
    "single_owner": "paper_user_cycle_attachment",
    "single_package": "C",
    "transaction": "服务入口传入的连接"
+  },
+  "paper_user_cycle_attachment::set_cycle_capital": {
+   "judge": "配置入口校验",
+   "operation": "周期资金配置（初始资金/现金/基准净值）",
+   "single_owner": "paper_user_cycle_attachment",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
   },
   "paper_user_cycle_attachment::set_status": {
    "judge": "启停入口校验",

@@ -234,16 +234,24 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         for item in forbidden:
             self.assertNotIn(item, source)
+        # 工作包 C 之后本模块是「账户创建 + 档案补齐」owner：
+        # 1 条 SELECT（是否已存在）+ 1 条 INSERT + 2 条 UPDATE（档案/版本）。
         sql_literals = [
-            node.value for node in ast.walk(tree)
+            node.value.strip() for node in ast.walk(tree)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
-            and any(keyword in node.value.upper() for keyword in ("SELECT", "INSERT", "UPDATE", "DELETE"))
+            and re.match(r"^(SELECT|INSERT|UPDATE|DELETE)\s", node.value.strip(), re.I)
         ]
-        self.assertEqual(2, len(sql_literals))
-        insert_literals = [item for item in sql_literals if "INSERT" in item.upper()]
+        self.assertEqual(4, len(sql_literals))
+        insert_literals = [item for item in sql_literals if item.upper().startswith("INSERT")]
         self.assertEqual(1, len(insert_literals))
         self.assertIn("INSERT INTO paper_accounts", insert_literals[0])
-        self.assertFalse(any(re.search(r"\b(?:UPDATE|DELETE|REPLACE)\b", item, re.I)
+        updates = [item for item in sql_literals if item.upper().startswith("UPDATE")]
+        for statement in updates:
+            self.assertIn("UPDATE paper_accounts", statement)
+            # 创建 owner 不碰现金/周期身份字段 —— 那是别的字段组。
+            self.assertNotIn("cash", statement)
+            self.assertNotIn("cycle_id", statement)
+        self.assertFalse(any(re.search(r"(?:DELETE|REPLACE)", item, re.I)
                              for item in sql_literals))
         self.assertFalse(any(isinstance(node, ast.Call) for node in tree.body))
 
