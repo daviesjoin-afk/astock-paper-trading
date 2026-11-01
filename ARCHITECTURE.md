@@ -4584,3 +4584,18 @@ PR-10 其他阶段与读取侧仍待验收，尚未进入 PR-11；未做交易�
 未做真实交易时段验证，未进入 PR-11。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 收尾计划 A–E 与冻结清单（2026-11-01）
+
+#318 合并后（master `8e3c22d`）按五个工作包收尾，不再以"一条 UPDATE 一批"推进：
+A 订单/信号非成交生命周期、B 创建/成交/核验与信号反馈、C `paper_accounts` 四组操作、
+D `paper_cycles` 与跨表归档、E 读取契约/守卫校准/总验收。
+
+四张 `pending` 表的运行时写入已逐条登记到 `backend/ledger_owner_plan.json`
+（操作、业务判定者、最终写入 owner、调用方事务、工作包），扫描口径区分真实写目标与
+子查询读表，测试/种子/迁移/夹具不混入写方集合；`backend/test_ledger_owner_plan.py`
+保证源码扫描、计划与文档三者一致。最终 owner：`paper_orders` → 新建
+`paper_order_ledger`，`paper_signals` → `signal_service`，账户按现金/创建/身份/配置
+四组分别归现有 owner 与新建 `paper_account_config`，`paper_cycles` → `paper_cycle_service`。
+
+细节与出口见 `docs/LEDGER_OWNERSHIP.md` 第16节。仍不进入 PR-11。
