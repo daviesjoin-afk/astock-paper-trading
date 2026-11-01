@@ -374,6 +374,78 @@
    ]
   },
   {
+   "function": "attach_to_cycle",
+   "kind": "static",
+   "line": 159,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?, cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?, params=",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_cycle_profile",
+   "kind": "static",
+   "line": 170,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET mode=?,style=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "activate_for_running_cycle",
+   "kind": "static",
+   "line": 179,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cycle_id=?,status='running',initial_cash=?,cash=?, daily_start_nav=?,daily_nav_date=?,updated_at=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_daily_start_nav",
+   "kind": "static",
+   "line": 188,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "apply_cycle_membership",
+   "kind": "static",
+   "line": 200,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "apply_cycle_membership",
+   "kind": "dynamic",
+   "line": 200,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET {} WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
    "function": "reserve_shared_capital",
    "kind": "static",
    "line": 252,
@@ -1077,78 +1149,6 @@
    "sql": "UPDATE paper_orders AS marker SET status='superseded', reason=COALESCE(marker.reason,'') || '；已由后续实时复核委托替代' WHERE marker.status=? AND marker.side='buy' AND EXIS",
    "write_targets": [
     "paper_orders"
-   ]
-  },
-  {
-   "function": "_ensure_cycle",
-   "kind": "static",
-   "line": 2135,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,params=CO",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "_ensure_cycle",
-   "kind": "static",
-   "line": 2150,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET mode=?,style=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "_ensure_cycle",
-   "kind": "static",
-   "line": 2167,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=?,status='running',initial_cash=?,cash=?,daily_start_nav=?,daily_nav_date=?,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "_ensure_cycle",
-   "kind": "static",
-   "line": 2226,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "create_cycle",
-   "kind": "static",
-   "line": 14117,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?, max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_account_style",
-   "kind": "static",
-   "line": 14230,
-   "module": "paper_trading",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
    ]
   },
   {
@@ -1987,6 +1987,54 @@
    "sql": "INSERT INTO paper_orders(account_id,code,origin,side,status) VALUES(?,?,?,?,?)",
    "write_targets": [
     "paper_orders"
+   ]
+  },
+  {
+   "function": "_db",
+   "kind": "static",
+   "line": 36,
+   "module": "test_cycle_archive_writes",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_orders VALUES(?,?,?,?,?,?)",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "_db",
+   "kind": "static",
+   "line": 37,
+   "module": "test_cycle_archive_writes",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_signals VALUES(?,?,?,?)",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "test_execution_dispatch_no_longer_writes_signal_or_order_rows",
+   "kind": "static",
+   "line": 144,
+   "module": "test_cycle_archive_writes",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_orders",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "test_execution_dispatch_no_longer_writes_signal_or_order_rows",
+   "kind": "static",
+   "line": 145,
+   "module": "test_cycle_archive_writes",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_signals",
+   "write_targets": [
+    "paper_signals"
    ]
   },
   {
@@ -3649,7 +3697,7 @@
   {
    "function": "test_cycle_authority_reads_cannot_write_or_bootstrap",
    "kind": "static",
-   "line": 215,
+   "line": 210,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3661,7 +3709,7 @@
   {
    "function": "test_terminal_owner_takes_the_status_vocabulary_from_the_caller",
    "kind": "static",
-   "line": 294,
+   "line": 290,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3673,7 +3721,7 @@
   {
    "function": "_row",
    "kind": "static",
-   "line": 392,
+   "line": 388,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3685,7 +3733,7 @@
   {
    "function": "test_integer_stored_keys_are_still_matched",
    "kind": "static",
-   "line": 434,
+   "line": 430,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",

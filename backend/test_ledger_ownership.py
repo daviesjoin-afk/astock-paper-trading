@@ -43,9 +43,9 @@ MAINTENANCE_WRITERS = frozenset({
 #: 表 -> 允许的写入方（owner 在前）。``pending`` 表示多写方是现状，本 PR 不收敛。
 OWNERSHIP = {
     "paper_cycles": {
-        "status": "pending",
-        "writers": {"paper_trading", "paper_cycle_service"},
-        "note": "覆盖补核查：主入口创建/配置/状态及兼容补齐，周期服务归档；分阶段职责不认定为多写缺陷",
+        "status": "owned",
+        "writers": {"paper_cycle_service"},
+        "note": "工作包 D：周期创建/配置/启停/归档全部经周期 owner；单写方",
     },
     "paper_fills": {
         "status": "owned",
@@ -84,25 +84,19 @@ OWNERSHIP = {
         "note": "paper_repository 统一审计追加及失败进化操作的清理；补偿方保留事务与异常处理",
     },
     "paper_orders": {
-        "status": "pending",
-        "writers": {
-            "paper_trading", "manual_orders", "execution_planner",
-            "paper_order_ledger", "execution_verification",
-            "paper_risk_writes",
-        },
-        "note": "订单状态机由多条权威路径按生命周期阶段推进；本 PR 只锁定集合，不合并状态机",
+        "status": "owned",
+        "writers": {"paper_order_ledger"},
+        "note": "工作包 A/B/D：订单行只有一个运行时写方；成交判定仍在 commit_fill，owner 只落库",
     },
     "paper_signals": {
-        "status": "pending",
-        "writers": {
-            "paper_trading", "manual_orders", "signal_service",
-        },
-        "note": "信号生命周期同样按阶段分写；锁定集合，下一步按阶段收口",
+        "status": "owned",
+        "writers": {"signal_service"},
+        "note": "工作包 A/B/D：信号行只有一个运行时写方",
     },
     "paper_accounts": {
-        "status": "pending",
-        "writers": {"paper_trading", "paper_account_ledger"},
-        "note": "C 包收口账户持久化；剩余周期初始化由 D 包迁到同一账户 owner",
+        "status": "owned",
+        "writers": {"paper_account_ledger"},
+        "note": "现金/开户/周期/配置保留业务职责；账户表仅由 paper_account_ledger 持久化",
     },
 }
 
@@ -170,8 +164,9 @@ class OrderExpiryOperationOwnershipTests(unittest.TestCase):
         signature = inspect.signature(ELC.expire_stale_orders)
         for name in ("release_reservation", "expire_order", "expire_signal"):
             self.assertEqual(inspect.Parameter.empty, signature.parameters[name].default)
-        self.assertEqual("pending", OWNERSHIP["paper_orders"]["status"])
-        self.assertEqual("pending", OWNERSHIP["paper_signals"]["status"])
+        # 工作包 A/B/D 收口后，两张表各只有一个运行时写方。
+        self.assertEqual("owned", OWNERSHIP["paper_orders"]["status"])
+        self.assertEqual("owned", OWNERSHIP["paper_signals"]["status"])
 
     def test_expiry_owners_expose_narrow_business_operations(self):
         import inspect
@@ -197,12 +192,12 @@ class OrderExpiryOperationOwnershipTests(unittest.TestCase):
         for name in ("release_reservation", "expire_signal", "supersede_order"):
             self.assertEqual(inspect.Parameter.empty, signature.parameters[name].default)
         for table in ("paper_orders", "paper_signals"):
-            self.assertEqual("pending", OWNERSHIP[table]["status"])
+            self.assertEqual("owned", OWNERSHIP[table]["status"])
             self.assertNotIn("entry_lifecycle", OWNERSHIP[table]["writers"])
 
     def test_cycles_are_registered_by_stage_without_claiming_single_writer(self):
-        self.assertEqual("pending", OWNERSHIP["paper_cycles"]["status"])
-        self.assertEqual({"paper_trading", "paper_cycle_service"},
+        self.assertEqual("owned", OWNERSHIP["paper_cycles"]["status"])
+        self.assertEqual({"paper_cycle_service"},
                          OWNERSHIP["paper_cycles"]["writers"])
 
     def test_cycle_authority_reads_cannot_write_or_bootstrap(self):
@@ -251,13 +246,14 @@ class WaitlistRetirementOperationTests(unittest.TestCase):
                              signature.parameters[name].default)
 
     def test_no_module_joins_or_leaves_the_writer_sets(self):
-        self.assertEqual("pending", OWNERSHIP["paper_orders"]["status"])
-        self.assertEqual("pending", OWNERSHIP["paper_signals"]["status"])
+        # 工作包 A/B/D 收口后，两张表各只有一个运行时写方。
+        self.assertEqual("owned", OWNERSHIP["paper_orders"]["status"])
+        self.assertEqual("owned", OWNERSHIP["paper_signals"]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("signal_service", OWNERSHIP["paper_signals"]["writers"])
         self.assertNotIn("execution_dispatch", OWNERSHIP["paper_signals"]["writers"])
-        self.assertIn("paper_trading", OWNERSHIP["paper_orders"]["writers"])
-        self.assertIn("paper_trading", OWNERSHIP["paper_signals"]["writers"])
+        self.assertEqual({"paper_order_ledger"}, OWNERSHIP["paper_orders"]["writers"])
+        self.assertEqual({"signal_service"}, OWNERSHIP["paper_signals"]["writers"])
 
 
 class ReconcileWriteOperationTests(unittest.TestCase):
@@ -311,7 +307,7 @@ class ReconcileWriteOperationTests(unittest.TestCase):
         self.assertEqual(1, len(real_write_modules("paper_orders")))
         self.assertEqual(1, len(real_write_modules("paper_signals")))
         for table in ("paper_orders", "paper_signals"):
-            self.assertEqual("pending", OWNERSHIP[table]["status"])
+            self.assertEqual("owned", OWNERSHIP[table]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("signal_service", OWNERSHIP["paper_signals"]["writers"])
 

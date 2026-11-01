@@ -327,7 +327,7 @@ class ReconcileOwnershipTests(unittest.TestCase):
         for table, expected in (("paper_orders", 1), ("paper_signals", 1)):
             self.assertEqual(expected, len(TLO2.real_write_modules(table)),
                              f"{table} 真实写方模块数变化")
-            self.assertEqual("pending", TLO.OWNERSHIP[table]["status"])
+            self.assertEqual("owned", TLO.OWNERSHIP[table]["status"])
         self.assertIn("paper_order_ledger", TLO.OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("signal_service", TLO.OWNERSHIP["paper_signals"]["writers"])
 

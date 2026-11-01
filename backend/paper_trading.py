@@ -2131,10 +2131,10 @@ def _ensure_cycle(conn):
                 else _available_cycle_ledger_capital(conn, active, account_id)
             )
             benchmark = _benchmark_close()
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
-                (active["id"], spec["mode"], style, active["status"], account_capital, account_capital, benchmark,
-                 account_capital, _date().isoformat(), spec["risk_profile"], account_id),
+            PUCA.attach_to_cycle(
+                conn, account_id, cycle_id=active["id"], mode=spec["mode"], style=style,
+                status=active["status"], capital=account_capital, benchmark=benchmark,
+                nav_date=_date().isoformat(), risk_profile=spec["risk_profile"],
             )
             conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
             conn.execute(
@@ -2146,10 +2146,8 @@ def _ensure_cycle(conn):
                 (active["id"], account_id, spec.get("strategy_version") or "v2.0", style, "{}", "新增并行策略", _date().isoformat(), _now()),
             )
         else:
-            conn.execute(
-                "UPDATE paper_accounts SET mode=?,style=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
-                (spec["mode"], style, spec["risk_profile"], account_id),
-            )
+            PUCA.set_cycle_profile(conn, account_id, mode=spec["mode"], style=style,
+                                   risk_profile=spec["risk_profile"])
             # A newly deployed strategy may have been inserted by an earlier
             # process with the legacy paused/default row.  If the active cycle
             # is already running and this account has no activity, activate it
@@ -2163,10 +2161,9 @@ def _ensure_cycle(conn):
                 ).fetchone()
             ):
                 account_capital = _available_cycle_ledger_capital(conn, active, account_id)
-                conn.execute(
-                    "UPDATE paper_accounts SET cycle_id=?,status='running',initial_cash=?,cash=?,daily_start_nav=?,daily_nav_date=?,updated_at=? WHERE id=?",
-                    (active["id"], account_capital, account_capital, account_capital,
-                     _date().isoformat(), _now(), account_id),
+                PUCA.activate_for_running_cycle(
+                    conn, account_id, cycle_id=active["id"], capital=account_capital,
+                    nav_date=_date().isoformat(), now=_now(),
                 )
                 conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
                 conn.execute(
@@ -2222,10 +2219,9 @@ def _ensure_cycle(conn):
                     _num(params.get("shared_pool_reference_capital"), 0.0),
                 )
                 if _num(current["initial_cash"], 0.0) <= 0 and reference_capital > 0:
-                    conn.execute(
-                        "UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?",
-                        (reference_capital, _date().isoformat(), account_id),
-                    )
+                    PUCA.set_daily_start_nav(
+                        conn, account_id, nav=reference_capital,
+                        nav_date=_date().isoformat())
                     conn.execute(
                         """UPDATE paper_nav SET cash=0,market_value=0,nav=?
                              WHERE account_id=? AND nav_date=?""",
@@ -14113,14 +14109,20 @@ def create_cycle(conn, capital, status="paused", reason="新建模拟周期", du
         # ``initial_cash`` 只是"这个策略可以动用多少"的归属口径。
         strategy_capital = round(capital * shares.get(account_id, 0.0), 2) \
             if shares else account_share
-        conn.execute(
-            """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
-               max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
-               risk_profile=?,params=?,daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
-            (spec["name"], spec["source_strategy"], status, strategy_capital, strategy_capital, spec["cycle_days"], max_positions,
-             max_weight, max_exposure, spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], style,
-             spec["risk_profile"], initial_params, strategy_capital, _date().isoformat(), now, account_id),
-        )
+        PUCA.apply_cycle_membership(conn, account_id, fields={
+            "name": spec["name"], "source_strategy": spec["source_strategy"],
+            "status": status, "initial_cash": strategy_capital,
+            "cash": strategy_capital, "cycle_days": spec["cycle_days"],
+            "max_positions": max_positions, "max_weight": max_weight,
+            "max_exposure": max_exposure,
+            "version": spec.get("strategy_version") or "v3.0",
+            "benchmark_start": benchmark, "cycle_id": cycle_id,
+            "mode": spec["mode"], "style": style,
+            "risk_profile": spec["risk_profile"], "params": initial_params,
+            "daily_start_nav": strategy_capital,
+            "daily_nav_date": _date().isoformat(), "cooldown_until": None,
+            "updated_at": now,
+        })
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
                      (account_id, _date().isoformat(), strategy_capital, 0.0, strategy_capital, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -14227,7 +14229,7 @@ def set_account_style(account_id, style):
         cycle = load_active_cycle(conn)
         if cycle["status"] == "running":
             raise ValueError("当前周期运行中，暂停后才能调整策略风格")
-        conn.execute("UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?", (style, _now(), account_id))
+        PAC.set_style(conn, account_id, style=style, now=_now())
         audit(conn, account_id, "style_changed", f"后续候选风格切换为 {ACS.style_name(style)}；已有持仓不强平")
     return dashboard()
 

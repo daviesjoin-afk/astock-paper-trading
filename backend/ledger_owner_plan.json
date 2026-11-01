@@ -1,10 +1,31 @@
 {
  "operations": {
+  "paper_account_ledger::activate_for_running_cycle": {
+   "judge": "paper_trading 周期引导",
+   "operation": "新策略跟随运行周期直接激活",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
   "paper_account_ledger::apply_cash_delta": {
    "judge": "paper_trading 现金对账口径",
    "operation": "账户现金增量调整（对账补偿）",
    "single_owner": "paper_account_ledger",
    "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::apply_cycle_membership": {
+   "judge": "周期创建规则",
+   "operation": "周期创建时的账户成员配置（列白名单）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::attach_to_cycle": {
+   "judge": "paper_trading 周期引导",
+   "operation": "首次挂接活动周期（资金/基准/日初净值）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_account_ledger::debit_cash": {
@@ -54,6 +75,20 @@
    "operation": "周期资金配置（初始资金/现金/基准净值）",
    "single_owner": "paper_account_ledger",
    "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_cycle_profile": {
+   "judge": "paper_trading 周期引导",
+   "operation": "已挂接账户的周期画像字段",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_daily_start_nav": {
+   "judge": "paper_trading 周期引导",
+   "operation": "回填日初净值与日期",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_account_ledger::set_status": {
@@ -278,27 +313,6 @@
    "operation": "按 execution_version 乐观锁改写 risk_payload",
    "single_owner": "paper_order_ledger",
    "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::_ensure_cycle": {
-   "judge": "paper_trading 兼容引导",
-   "operation": "legacy 引导：账户 cycle_id 清空与暂停",
-   "single_owner": "paper_user_cycle_attachment",
-   "single_package": "C",
-   "transaction": "启动恢复/初始化连接"
-  },
-  "paper_trading::create_cycle": {
-   "judge": "周期创建入口校验",
-   "operation": "新建周期时账户挂接重置",
-   "single_owner": "paper_user_cycle_attachment",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::set_account_style": {
-   "judge": "配置入口校验",
-   "operation": "账户风格字段",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
   "signal_service::advance_signal_feedback": {

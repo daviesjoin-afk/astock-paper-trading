@@ -3,7 +3,14 @@
 import paper_account_ledger as PAL
 from paper_account_ledger import detach_cycle, set_cycle_capital, set_status
 
-__all__ = ["detach_cycle", "set_cycle_capital", "set_status", "reconcile_user_cycle_accounts"]
+from paper_account_ledger import (
+    attach_to_cycle, set_cycle_profile,
+    activate_for_running_cycle, set_daily_start_nav, apply_cycle_membership,
+)
+
+__all__ = [
+    'attach_to_cycle', 'set_cycle_profile', 'activate_for_running_cycle', 'set_daily_start_nav', 'apply_cycle_membership',
+"detach_cycle", "set_cycle_capital", "set_status", "reconcile_user_cycle_accounts"]
 
 
 def _row(conn, sql, params=()):
