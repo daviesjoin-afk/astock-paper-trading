@@ -433,12 +433,14 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_signals` | 当日信号引导：替代旧信号 | `paper_trading::_bootstrap_signals_for_today` | paper_trading 引导规则 | `signal_service` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_provenance_inflight_change` |
 | `paper_orders` | 自动买入订单创建（INSERT） | `paper_trading::_buy_order` | paper_trading 入场决策 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
 | `paper_signals` | 买入联动信号状态/原因/payload | `paper_trading::_buy_order` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
-| `paper_signals` | 订单意图收紧：信号 rejected | `paper_trading::_enforce_order_intent` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | `test_order_intent_contract`、`test_paper_trading_architecture_guard` |
 | `paper_signals` | 开盘信号过期（expired） | `paper_trading::execute_open` | paper_trading 开盘窗口规则 | `signal_service` | 调用方同一连接与原事务 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
 | `paper_signals` | 快速入场等待：信号 deferred_capacity | `paper_trading::monitor_fast_entries` | paper_trading 盘中复核 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 执行结果状态推进（含 execution_version 乐观锁） | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |
 | `paper_signals` | 执行结果回写信号状态 | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |
 | `paper_signals` | 信号写入语句（INSERT OR IGNORE / REFRESH） | `signal_service::conflict_statement` | signal_service 冲突策略 | `signal_service` | 调用方同一连接与原事务 | `test_signal_pipeline`、`test_strategy_selection_provenance` |
+| `paper_signals` | 信号按业务原因直接失效 | `signal_service::expire_signal` | paper_trading 开盘窗口规则 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ttl_lifecycle` |
+| `paper_signals` | 订单意图收紧：信号转 rejected | `signal_service::reject_signal` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 执行反馈：状态/原因/payload 回写信号 | `signal_service::update_signal_feedback` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 
 ### 工作包 C
 

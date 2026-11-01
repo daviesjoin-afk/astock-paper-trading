@@ -289,13 +289,6 @@
    },
    "transaction": "启动恢复/初始化连接"
   },
-  "paper_trading::_enforce_order_intent": {
-   "judge": "paper_trading 意图规则",
-   "operation": "订单意图收紧：信号 rejected",
-   "single_owner": "signal_service",
-   "single_package": "B",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_trading::_ensure_accounts": {
    "judge": "paper_trading 账户引导",
    "operation": "内置账户创建与字段补齐",
@@ -465,6 +458,13 @@
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
+  "signal_service::expire_signal": {
+   "judge": "paper_trading 开盘窗口规则",
+   "operation": "信号按业务原因直接失效",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
   "signal_service::expire_stale_signal": {
    "judge": "entry_lifecycle 失效判定",
    "operation": "信号自身失效 expired",
@@ -478,6 +478,13 @@
    "single_owner": "signal_service",
    "single_package": "A",
    "transaction": "启动恢复/初始化连接"
+  },
+  "signal_service::reject_signal": {
+   "judge": "paper_trading 意图规则",
+   "operation": "订单意图收紧：信号转 rejected",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
   },
   "signal_service::reopen_for_retry": {
    "judge": "execution_dispatch 重试接管判定",
@@ -498,6 +505,13 @@
    "operation": "派发终止：信号写终态（rejected/expired 白名单）",
    "single_owner": "signal_service",
    "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::update_signal_feedback": {
+   "judge": "paper_trading 执行循环",
+   "operation": "执行反馈：状态/原因/payload 回写信号",
+   "single_owner": "signal_service",
+   "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
   "signal_service::write_payload": {

@@ -1421,10 +1421,7 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
         reason = f"OrderIntent 契约拒绝：{type(exc).__name__}: {exc}"
         if signal_id is not None:
             try:
-                conn.execute(
-                    "UPDATE paper_signals SET status='rejected', reason=? WHERE id=?",
-                    (reason, signal_id),
-                )
+                SIG.reject_signal(conn, int(signal_id), reason=reason)
             except sqlite3.Error:
                 pass
         _risk_log(conn, account_id, code, "buy", "order_intent_rejected", reason, {
@@ -9330,7 +9327,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 "filled": False, "deferred": True, "deferred_limit": True,
                 "reason": deferred_reason,
             }
-        conn.execute("UPDATE paper_signals SET status='rejected', reason=? WHERE id=?", (reason, signal["id"]))
+        SIG.reject_signal(conn, int(signal["id"]), reason=reason)
         return {"filled": False, "reason": reason}
     # ET 是纯内存状态机，无法参与事务回滚；只在成交落库成功之后推进，
     # 否则提交失败会留下一个"已入场"的虚假状态（§48）。
@@ -9683,10 +9680,7 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
             # capacity-blocked candidate can therefore be compared fairly on
             # the next 3-minute round instead of forever retaining its
             # yesterday/close rank.
-            conn.execute(
-                "UPDATE paper_signals SET payload=? WHERE id=?",
-                (_json(payload), signal["id"]),
-            )
+            SIG.write_payload(conn, int(signal["id"]), payload=_json(payload))
             signal = dict(signal)
             signal["payload"] = _json(payload)
             ranked_due.append((assessment, signal, account))
@@ -11794,10 +11788,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     confirmed.append({"code": code, "account_id": account["id"], "valid_until": marker["valid_until"]})
                 else:
                     payload["fast_entry_observation"] = observation
-                    conn.execute(
-                        "UPDATE paper_signals SET payload=? WHERE id=?",
-                        (_json(payload), signal["id"]),
-                    )
+                    SIG.write_payload(conn, int(signal["id"]), payload=_json(payload))
             audit(conn, None, "fast_entry_monitor", _json({
                 "checked": checked, "confirmed": len(confirmed), "orders_created": 0,
                 "candidate_codes": sorted(candidate_codes),
@@ -14531,6 +14522,7 @@ def _bind_application_dependencies():
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),
         "cancel_order": (POL, "cancel_order"),
+        "write_signal_payload": (SIG, "write_payload"),
         "record_execution_block": (POL, "record_execution_block"),
         "record_fill_result": (POL, "record_fill_result"),
         "accumulate_realized_pnl": (POL, "accumulate_realized_pnl"),

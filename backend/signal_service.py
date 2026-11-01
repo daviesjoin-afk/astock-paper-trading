@@ -51,7 +51,10 @@ __all__ = [
     "expire_for_expired_order",
     "expire_stale_signal",
     "reconcile_signal_status",
+    "expire_signal",
+    "reject_signal",
     "reopen_for_retry",
+    "update_signal_feedback",
     "retire_waitlist_signals",
     "signal_evidence",
     "terminate_for_dispatch",
@@ -564,6 +567,30 @@ def retire_waitlist_signals(conn, *, statuses: Sequence[str]):
             ) AND status IN ({state_marks})""",
         states,
     ).rowcount
+
+
+def reject_signal(conn, signal_id, *, reason):
+    """订单意图收紧：信号转 rejected。"""
+    conn.execute(
+        "UPDATE paper_signals SET status='rejected', reason=? WHERE id=?",
+        (reason, int(signal_id)),
+    )
+
+
+def expire_signal(conn, signal_id, *, reason):
+    """信号按业务原因直接失效（开盘无效信号等）。"""
+    conn.execute(
+        "UPDATE paper_signals SET status='expired', reason=? WHERE id=?",
+        (reason, int(signal_id)),
+    )
+
+
+def update_signal_feedback(conn, signal_id, *, status, reason, payload):
+    """执行反馈：把判定结果（状态/原因/载荷）写回信号。"""
+    conn.execute(
+        "UPDATE paper_signals SET status=?,reason=?,payload=? WHERE id=?",
+        (status, reason, payload, int(signal_id)),
+    )
 
 
 def _serialize_payload(payload: Mapping[str, Any]) -> str:

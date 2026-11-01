@@ -93,6 +93,7 @@ class ManualOrderDependencies:
     init_db: Any
     cancel_order: Any
     insert_order: Any
+    write_signal_payload: Any
 
 
 _dependencies_factory: Callable[[], ManualOrderDependencies] | None = None
@@ -627,6 +628,7 @@ def _commit_strategy_buy(
     _require_active_lease = deps.require_active_lease
     _finish_capital_reservation = deps.finish_capital_reservation
     _insert_order = deps.insert_order
+    _write_signal_payload = deps.write_signal_payload
     _lease_lost = deps.lease_lost
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -771,6 +773,7 @@ def commit_strategy_entry_fill(
     deps = _dependencies()
     _require_active_lease = deps.require_active_lease
     _lease_lost = deps.lease_lost
+    _write_signal_payload = deps.write_signal_payload
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
@@ -831,10 +834,10 @@ def commit_strategy_entry_fill(
             slice_plan = [int(item) for item in (slice_state.get("plan") or [])]
             slices_filled = max(0, int(slice_state.get("filled") or 0)) + 1
             slice_done = slices_filled >= len(slice_plan)
-            conn.execute(
-                "UPDATE paper_signals SET payload=? WHERE id=?",
-                (_json({**payload, "entry_slices": {**slice_state, "filled": slices_filled}}),
-                 signal["id"]),
+            _write_signal_payload(
+                conn, int(signal["id"]),
+                payload=_json({**payload,
+                               "entry_slices": {**slice_state, "filled": slices_filled}}),
             )
             # §47：分批建仓的切片语义绝不能变。中间片成交后信号必须留在
             # 复试管道（deferred_capacity），只有最后一片才标 filled ——
@@ -875,6 +878,7 @@ def submit_manual_order(
     _entry_frozen_reason = deps.entry_frozen_reason
     _finish_capital_reservation = deps.finish_capital_reservation
     _insert_order = deps.insert_order
+    _write_signal_payload = deps.write_signal_payload
     _market_state = deps.market_state
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
