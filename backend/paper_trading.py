@@ -1624,13 +1624,7 @@ def _reconcile_signal_order_states(conn):
     for retry in retry_rows:
         signal_id = int(retry["signal_id"])
         if signal_id in seen_retry_signals:
-            conn.execute(
-                """UPDATE paper_orders
-                      SET status='superseded',
-                          reason=COALESCE(reason,'') || '；同一信号仅保留最新执行重试'
-                    WHERE id=? AND status='execution_retry'""",
-                (int(retry["id"]),),
-            )
+            EPD.supersede_duplicate_execution_retry(conn, int(retry["id"]))
             _finish_capital_reservation(conn, int(retry["id"]), "released")
         else:
             seen_retry_signals.add(signal_id)
@@ -1688,27 +1682,14 @@ def _reconcile_signal_order_states(conn):
                 if signal_status != "superseded" else
                 "信号已替代，回收遗留活动等待委托"
             )
-            conn.execute(
-                """UPDATE paper_orders
-                      SET status='superseded',
-                          reason=COALESCE(reason,'') || '；' || ?
-                    WHERE id=? AND status IN ("""
-                + placeholders + ")",
-                (reason, order_id, *order_statuses),
-            )
+            EPD.supersede_for_terminal_signal(conn, order_id, reason=reason)
             PCR.release_order_reservation(conn, order_id, now=now)
             reconciled += 1
             continue
 
         desired_signal = signal_for_order.get(order_status)
         if desired_signal and signal_status != desired_signal:
-            conn.execute(
-                """UPDATE paper_signals
-                      SET status=?,
-                          reason=COALESCE(reason,'') || '；按活动委托状态对账'
-                    WHERE id=? AND status<>?""",
-                (desired_signal, signal_id, desired_signal),
-            )
+            SIG.reconcile_signal_status(conn, signal_id, status=desired_signal)
             reconciled += 1
 
     return {

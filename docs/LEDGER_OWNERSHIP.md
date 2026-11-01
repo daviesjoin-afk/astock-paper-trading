@@ -22,8 +22,8 @@
 | `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
 | `paper_risk_decisions` | **owned** | `paper_risk_writes` | 第五批统一来源信息校验及组装；两个 `_risk_log` 只准备快照、策略戳和时间 |
 | `paper_audit` | **owned** | `paper_repository` | 第六批：追加及失败进化操作的清理都归表 owner；补偿方保留事务与异常处理 |
-| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`paper_risk_writes` | 第八批后生命周期层只判断/编排，过期与失效回收写入已移交；第九批再移交等待池重复记录回收，其他阶段仍分写 |
-| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`signal_service` | 第八批后生命周期层不再直写；第九批把等待池回收的信号写并入同一 owner，其他阶段仍分写 |
+| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`paper_risk_writes` | 第八批后生命周期层只判断/编排，过期与失效回收写入已移交；第九批移交等待池重复记录回收，第十批移交对账路径的两条回收写入，其他阶段仍分写 |
+| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`signal_service` | 第八批后生命周期层不再直写；第九批把等待池回收的信号写并入同一 owner；第十批把对账的信号状态写入归 `signal_service`，其他阶段仍分写 |
 | `paper_accounts` | **pending** | `paper_trading`、`paper_shared_cash`、`paper_user_cycle_attachment`、`paper_user_account_provisioning`、`strategy_registry`、`paper_order_execution_authority`、`paper_cycle_ownership`、`adaptive_engine`、`adaptive_risk`、`adaptive_selection`、`adaptive_selection_compat`、`evolution_apply`、`ai_adoption_writer` | 不同 owner 各写自己的字段（现金/周期挂接/策略参数） |
 | `paper_cycles` | **pending** | `paper_trading`、`paper_cycle_service` | 第七批补核查：创建/配置/启停及兼容补齐 vs 周期归档，按阶段登记，不据此认定多写缺陷 |
 
@@ -276,3 +276,36 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 本批实测：`cross_domain_edges` 629（不变）、`import_cycles`/`foundation_violations` 均0，
 `max_file_lines` 14619→14599（`paper_trading` 净减20行），`duplicate_helpers` 296、
 `dynamic_name_bridges` 72、`unsuffixed_module_ratio` 0.3906 均不退化，所有预算不变。
+
+## 15. 第十批 活动委托/信号对账的持久化
+
+基线 `master` @ `1d41508`（#317 合并后）。迁移 `paper_trading._reconcile_signal_order_states`
+里的**三条**写入，函数结构、查询、判定与统计不变：
+
+| 写入 | owner 入口 | 保留的语义 |
+| --- | --- | --- |
+| 重复 `execution_retry` 退旧 | `execution_dispatch.supersede_duplicate_execution_retry(conn, order_id)` | `WHERE id=? AND status='execution_retry'`、原固定原因 |
+| 终态信号的遗留活动委托回收 | `execution_dispatch.supersede_for_terminal_signal(conn, order_id, *, reason)` | `ENTRY_RETRY_ORDER_STATUSES` 七状态保护、`reason` 前缀拼接 |
+| 信号状态对账 | `signal_service.reconcile_signal_status(conn, signal_id, *, status)` | `WHERE status<>?`（已是目标态则整行不动，不刷原因）与原固定原因 |
+
+* 三条 SQL 逐字保留；占位符按 `ENTRY_RETRY_ORDER_STATUSES` 长度静态展开（7 个），
+  守卫测试比对"元组长度 = 占位符数"，改词表会立刻变红。
+* "哪条算最新重试"、终态集合、`signal_for_order` 映射、`partially_filled` 不降级规则、
+  预占释放调用（`PCR.release_order_reservation` / `_finish_capital_reservation`）、
+  `_now()` 读取、统计与返回字典仍留在 `paper_trading`。
+* 三个 owner 都不读时钟、不释放预占、不提交、不吞异常；写入仍在调用方同一事务。
+* 信号写入归 `signal_service` 不新增跨表边：该表本就在其写入集合内，SQL 也不读订单表
+  （订单与信号的 JOIN 留在编排层的 SELECT）。
+
+整表仍为 **pending**。本批只收口对账这一个阶段的写入，不宣称订单/信号整表单写；
+`_supersede_signal_execution_retries`、entry 路径、归档路径的既有写入仍留在 `paper_trading`。
+
+冻结对照为 `backend/fixtures/reconcile_1d41508.txt`（逐字复制 1d41508 的整个函数）。
+`backend/test_signal_order_reconcile_write.py`（12 项）用最小 schema 跑真实对账路径：
+冻结函数与新实现分别执行，比较返回值、三张表完整行、**SQL trace 逐条顺序**与时钟调用次数；
+覆盖重复重试退旧+释放、五类终态信号的回收原因、信号漂移与部分成交不降级、
+无操作行不重写、混合场景、重复执行幂等、缺表早退。没有 schema 或数据迁移，回滚本批提交即可。
+
+本批实测：`cross_domain_edges` 629（不变）、`import_cycles`/`foundation_violations` 均0、
+`max_file_lines` 14599→14580、`max_function_lines` 1184、`duplicate_helpers` 296、
+`dynamic_name_bridges` 72、`unsuffixed_module_ratio` 0.3906，所有预算不变。

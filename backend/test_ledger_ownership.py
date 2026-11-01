@@ -251,6 +251,51 @@ class WaitlistRetirementOperationTests(unittest.TestCase):
         self.assertIn("paper_trading", OWNERSHIP["paper_signals"]["writers"])
 
 
+class ReconcileWriteOperationTests(unittest.TestCase):
+    """第十批：活动委托/信号对账的操作级边界；整表仍为 pending。"""
+
+    def test_reconcile_path_has_no_inline_order_or_signal_writes(self):
+        import inspect
+        import paper_trading as PT
+        source = inspect.getsource(PT._reconcile_signal_order_states)
+        inline = OrderExpiryOperationOwnershipTests.inline_expiry_writes
+        self.assertEqual(set(), inline(source))
+        reflow = (chr(10) + '    conn.execute("UPDATE paper_orders SET status=?")' + chr(10)
+                  + '    conn.execute("UPDATE paper_signals SET status=?")' + chr(10))
+        self.assertEqual({"paper_orders", "paper_signals"}, inline(source + reflow))
+
+    def test_reconcile_owners_are_narrow_business_operations(self):
+        import inspect
+        import execution_dispatch as EPD
+        import signal_service as SIG
+        self.assertEqual(["conn", "order_id"],
+                         list(inspect.signature(EPD.supersede_duplicate_execution_retry).parameters))
+        self.assertEqual(["conn", "order_id", "reason"],
+                         list(inspect.signature(EPD.supersede_for_terminal_signal).parameters))
+        self.assertEqual(["conn", "signal_id", "status"],
+                         list(inspect.signature(SIG.reconcile_signal_status).parameters))
+
+    def test_terminal_owner_arity_tracks_the_status_tuple(self):
+        import ast
+        import inspect
+        import textwrap
+        import entry_lifecycle as ELC
+        import execution_dispatch as EPD
+        source = inspect.getsource(EPD.supersede_for_terminal_signal)
+        sql = next(textwrap.dedent(node.value)
+                   for node in ast.walk(ast.parse(textwrap.dedent(source)))
+                   if isinstance(node, ast.Constant) and "status IN (" in str(node.value))
+        self.assertEqual(len(ELC.ENTRY_RETRY_ORDER_STATUSES), sql.count("?") - 2)
+
+    def test_write_sets_keep_pending_and_unchanged_membership(self):
+        self.assertEqual(6, len(write_sites("paper_orders")))
+        self.assertEqual(4, len(write_sites("paper_signals")))
+        for table in ("paper_orders", "paper_signals"):
+            self.assertEqual("pending", OWNERSHIP[table]["status"])
+        self.assertIn("execution_dispatch", OWNERSHIP["paper_orders"]["writers"])
+        self.assertIn("signal_service", OWNERSHIP["paper_signals"]["writers"])
+
+
 class LedgerWriteOwnershipTests(unittest.TestCase):
     def test_every_declared_table_exists_in_the_schema(self):
         import paper_schema_migrations as PSM

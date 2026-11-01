@@ -3,7 +3,7 @@
 
 Candidate → Evidence → Decision → Approval → Frozen Provenance → Signal Persistence
 
-本模块负责 ``paper_signals`` 生成持久化、订单自身过期后的关联信号更新及信号自身失效；
+本模块负责 ``paper_signals`` 生成持久化、订单自身过期后的关联信号更新、信号自身失效及活动委托状态对账；
 整表生命周期仍有其他阶段写入方，尚未收敛为单写方：
 
 * :func:`commit_signal` 独占 ``INSERT INTO paper_signals`` —— ``paper_trading``
@@ -50,6 +50,7 @@ __all__ = [
     "decide_signal",
     "expire_for_expired_order",
     "expire_stale_signal",
+    "reconcile_signal_status",
     "signal_evidence",
 ]
 
@@ -470,6 +471,21 @@ def expire_stale_signal(conn, signal_id, *, reason):
         """UPDATE paper_signals SET status=?,reason=COALESCE(reason,'') || '；' || ?
                 WHERE id=? AND status IN (?,?,?)""",
         (ELC.SIGNAL_EXPIRED_STATUS, reason, signal_id, *ELC.RETRY_SIGNAL_STATUSES),
+    )
+
+
+def reconcile_signal_status(conn, signal_id, *, status):
+    """把信号状态对账到其活动委托状态；只使用传入身份与目标状态。
+
+    原 ``WHERE status<>?`` 条件保留：目标状态已是当前状态时整行不动（不刷原因），
+    与迁移前的行数语义一致。owner 不决定"应该是什么状态"，也不读订单表。
+    """
+    conn.execute(
+        """UPDATE paper_signals
+              SET status=?,
+                  reason=COALESCE(reason,'') || '；按活动委托状态对账'
+            WHERE id=? AND status<>?""",
+        (status, signal_id, status),
     )
 
 
