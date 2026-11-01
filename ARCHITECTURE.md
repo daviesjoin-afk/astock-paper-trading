@@ -4624,3 +4624,12 @@ owner 契约：不算成交（`commit_fill` 仍唯一）、不读时钟、不 co
 端口；`paper_slot_service` 同样只转发，不自行 import。信号身份的反查放在订单 owner
 （`POL.signal_ids_by_reason_marker`），读取仍在调用方，避免 signal 侧新增订单表依赖。
 信号写方集合的变化没有新增跨域边（`cross_domain_edges` 保持 630）。
+
+## PR-10 工作包 A 第三片与 A 收口（2026-11-01）
+
+剩余三条订单写入归位：新一轮重试退役 → `POL.supersede_previous_execution_retry`、手动撤单 →
+`POL.cancel_order`、冻结等待池标记创建 → `POL.insert_order`（B 包创建路径复用）。
+`manual_orders` 通过 `ManualOrderDependencies` 接收撤单实现，不 import owner，跨域边不增。
+
+工作包 A 的 19 条操作全部迁移完成：订单与信号的非成交生命周期写入都经 owner，
+调用方不再自行拼状态 UPDATE。两张表仍为 `pending` —— B、D 还有剩余写入。

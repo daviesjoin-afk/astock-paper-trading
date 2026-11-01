@@ -514,6 +514,19 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 `paper_slot_service.run_preflight` 传入 `signals` 端口（与 `release_reservation` 同一种注入方式），
 因此没有新增跨域边；`paper_slot_service` 也不再 import 信号 owner。
 
+**A 第三片**：最后三条订单写入归位 —— `_supersede_signal_execution_retries` →
+`POL.supersede_previous_execution_retry`、`manual_orders.cancel_manual_order` →
+`POL.cancel_order`（只动调用方给的可撤销状态，返回受影响行数供调用方保留"已成交"错误）、
+`_record_entry_frozen_waitlist` 的 INSERT → `POL.insert_order`（列集合逐字保留，业务侧算好
+策略戳/血缘/payload 再传入；B 包创建路径复用同一入口）。
+
+`manual_orders` 不 import owner：`cancel_order` 声明进它的 `ManualOrderDependencies` 容器、
+由组装根绑定（与 lot / provenance 能力同法），因此没有新增 other 域 → paper 域的边。
+
+**A 包写入面到此收口**：`ledger_owner_plan.json` 里 A 的 19 条操作全部迁移完毕
+（当前模块 == 目标 owner 的检查为 0 条待办）。`paper_orders` / `paper_signals` 仍保持
+`pending` —— B（创建、成交结果、核验戳）与 D（归档联动）还有写入没搬，标签不能提前改。
+
 成本登记：新增一个含 SQL 的 owner 模块 → `raw_sql_modules` 141→142、
 `paper_table_fanout_max` 50→51、`cross_domain_edges` 629→630（`execution_dispatch → paper_order_ledger`），
 均通过 `FEATURE_ALLOWANCE` 显式登记并写入 `docs/COUPLING_BUDGET.md`；`HEAD_BUDGET` 与 lock 不动，
