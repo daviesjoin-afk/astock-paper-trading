@@ -26,22 +26,31 @@ class InventoryScanTests(unittest.TestCase):
                          "改完源码要重新生成：python backend/tools/ledger_write_inventory.py")
 
     def test_scan_separates_write_targets_from_subquery_reads(self):
-        entries = INVENTORY["entries"]
-        by_key = {(e["module"], e["function"]): e for e in entries}
-        # 信号对账只写信号表：子查询里出现的订单表不应被记成订单写入。
-        signal_write = by_key[("signal_service", "reconcile_signal_status")]
-        self.assertEqual(["paper_signals"], signal_write["write_targets"])
-        # 等待池信号只写信号表，订单表仍在集合子查询内读取。
-        waitlist = by_key[("signal_service", "retire_waitlist_signals")]
-        self.assertEqual(["paper_signals"], waitlist["write_targets"])
-        self.assertEqual(["paper_orders"], waitlist["read_refs"])
-        # 正例：确实同时读订单表的语句，写目标与读引用分别登记。
-        readers = [e for e in entries
-                   if e["role"] == "runtime" and e["read_refs"]
-                   and "paper_orders" in e["read_refs"]]
-        self.assertTrue(readers, "扫描器应当能识别语句里的跨表读引用")
-        for entry in readers:
-            self.assertNotIn("paper_orders", entry["write_targets"])
+        """写目标只认首表；子查询里的表记为读引用。
+
+        用临时目录里的合成模块验证，不依赖仓库当前是否还有"写 A 读 B"的语句 ——
+        工作包 B 收口后，运行时的跨表子查询已经全部上移到调用方。
+        """
+        import tempfile
+        from pathlib import Path as _Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = _Path(tmp) / "sample_mod.py"
+            sample.write_text(
+                (BACKEND / "fixtures" / "scan_sample_module.txt").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            entries = INV.scan(root=_Path(tmp))["entries"]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual(["paper_signals"], entry["write_targets"])
+        self.assertEqual(["paper_orders"], entry["read_refs"])
+
+        # 仓库现状：每个写条目的写目标与读引用不重叠。
+        for entry in INVENTORY["entries"]:
+            if entry["role"] != "runtime":
+                continue
+            self.assertFalse(set(entry["write_targets"]) & set(entry["read_refs"]), entry)
 
     def test_non_runtime_roles_are_not_counted_as_writers(self):
         roles = {e["role"] for e in INVENTORY["entries"]}

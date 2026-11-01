@@ -407,9 +407,9 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_signals` | 重试接管：过期信号一并收敛 expired | `signal_service::expire_after_order_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 订单过期联动信号 expired | `signal_service::expire_for_expired_order` | entry_lifecycle 过期判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ttl_lifecycle` |
 | `paper_signals` | 信号自身失效 expired | `signal_service::expire_stale_signal` | entry_lifecycle 失效判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_paper_slot_service` |
-| `paper_signals` | 信号状态对账 | `signal_service::reconcile_signal_status` | paper_trading 对账循环 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_ledger_ownership`、`test_signal_order_reconcile_write` |
+| `paper_signals` | 信号状态对账 | `signal_service::reconcile_signal_status` | paper_trading 对账循环 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_ownership`、`test_signal_order_reconcile_write` |
 | `paper_signals` | 重试接管：信号回到复试管道 | `signal_service::reopen_for_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
-| `paper_signals` | 等待池重复记录退役（信号） | `signal_service::retire_waitlist_signals` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_waitlist_dedupe_write` |
+| `paper_signals` | 等待池重复记录退役（信号） | `signal_service::retire_waitlist_signals` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_waitlist_dedupe_write` |
 | `paper_signals` | 派发终止：信号写终态（rejected/expired 白名单） | `signal_service::terminate_for_dispatch` | execution_dispatch 派发阶段 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 信号 payload 标记写入 | `signal_service::write_payload` | execution_dispatch 批次/核验标记 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 
@@ -419,25 +419,27 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | --- | --- | --- | --- | --- | --- | --- |
 | `paper_signals` | 策略成交联动信号状态 | `manual_orders::commit_strategy_entry_fill` | commit_fill 成交结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard` |
 | `paper_orders` | 卖出实现盈亏累加 | `paper_order_ledger::accumulate_realized_pnl` | commit_fill 卖出结算 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
+| `paper_orders` | 执行结果推进（状态 + 执行原因，乐观锁） | `paper_order_ledger::advance_execution_state` | paper_trading 执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 执行阻塞结果写库（含乐观锁版本） | `paper_order_ledger::record_execution_block` | commit_fill 执行决策 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
 | `paper_orders` | 成交结果写库（状态/成交量/均价/金额/费用/证据/版本推进） | `paper_order_ledger::record_fill_result` | commit_fill 唯一成交权威 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract`、`test_execution_planner`、`test_execution_verification` |
 | `paper_orders` | 已实现盈亏回填（重建口径） | `paper_order_ledger::record_realized_pnl` | paper_trading 重建口径 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 执行核验结论单行写入 | `paper_order_ledger::stamp_execution` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 执行核验结论批量写入（含历史回填） | `paper_order_ledger::stamp_execution_rows` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_orders` | 较早意图被同标的新委托替代（批量） | `paper_order_ledger::supersede_older_intents` | paper_trading 实时复核 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_orders` | 订单状态推进（status/reason/risk_payload，可清空成交字段） | `paper_order_ledger::update_order_outcome` | manual_orders 手动入口/执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_dependency_contract` |
 | `paper_orders` | 按 execution_version 乐观锁改写 risk_payload | `paper_order_ledger::update_risk_payload` | paper_trading 日内卖出收尾 | `paper_order_ledger` | 调用方同一连接与原事务 | 待补 |
-| `paper_signals` | 当日信号引导：替代旧信号 | `paper_trading::_bootstrap_signals_for_today` | paper_trading 引导规则 | `signal_service` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_provenance_inflight_change` |
-| `paper_orders` | 自动买入订单创建（INSERT） | `paper_trading::_buy_order` | paper_trading 入场决策 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
-| `paper_signals` | 买入联动信号状态/原因/payload | `paper_trading::_buy_order` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
-| `paper_signals` | 开盘信号过期（expired） | `paper_trading::execute_open` | paper_trading 开盘窗口规则 | `signal_service` | 调用方同一连接与原事务 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
-| `paper_orders` | 执行结果状态推进（含 execution_version 乐观锁） | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |
-| `paper_signals` | 执行结果回写信号状态 | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |
+| `paper_signals` | 执行事件回写信号状态/原因（活动状态集保护） | `signal_service::advance_signal_feedback` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 信号写入语句（INSERT OR IGNORE / REFRESH） | `signal_service::conflict_statement` | signal_service 冲突策略 | `signal_service` | 调用方同一连接与原事务 | `test_signal_pipeline`、`test_strategy_selection_provenance` |
 | `paper_signals` | 容量/等待：信号转 deferred_capacity（可刷新 payload） | `signal_service::defer_for_capacity` | paper_trading 入场与派发闸门 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 信号按业务原因直接失效 | `signal_service::expire_signal` | paper_trading 开盘窗口规则 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ttl_lifecycle` |
+| `paper_signals` | 按状态集合把信号写为 expired | `signal_service::expire_within` | paper_trading 入场新鲜度判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 成交完成：信号转 filled | `signal_service::mark_filled` | commit_fill 成交结果 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | Q3 影子观察：信号转 shadow_q3 | `signal_service::mark_shadow` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 订单意图收紧：信号转 rejected | `signal_service::reject_signal` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 成交失败回到 pending | `signal_service::reopen_pending` | commit_fill 失败结果 | `signal_service` | 调用方同一连接与原事务 | `test_dependency_contract` |
+| `paper_signals` | 当日引导：替代 blocked/可复评拒绝信号 | `signal_service::supersede_blocked_for_day` | paper_trading 引导规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 当日引导：90 分钟未成交的 pending 信号替代 | `signal_service::supersede_pending_for_day` | paper_trading 引导规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 按身份集合把信号转 superseded（固定后缀） | `signal_service::supersede_signals` | paper_trading 实时复核替代 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 执行反馈：状态/原因/payload 回写信号 | `signal_service::update_signal_feedback` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 
 ### 工作包 C

@@ -51,12 +51,18 @@ __all__ = [
     "expire_for_expired_order",
     "expire_stale_signal",
     "reconcile_signal_status",
+    "advance_signal_feedback",
     "defer_for_capacity",
+    "expire_within",
     "expire_signal",
     "mark_filled",
+    "mark_shadow",
     "reject_signal",
     "reopen_for_retry",
     "reopen_pending",
+    "supersede_blocked_for_day",
+    "supersede_pending_for_day",
+    "supersede_signals",
     "update_signal_feedback",
     "retire_waitlist_signals",
     "signal_evidence",
@@ -612,6 +618,81 @@ def mark_filled(conn, signal_id, *, reason):
         "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
         (reason, int(signal_id)),
     )
+
+
+def advance_signal_feedback(conn, signal_id, *, status, reason, statuses):
+    """执行事件回写：只在给定活动状态集合内推进信号状态与原因。"""
+    states = tuple(statuses)
+    if not states:
+        raise ValueError("advance_signal_feedback 需要非空状态集合")
+    marks = ",".join("?" for _ in states)
+    conn.execute(
+        f"UPDATE paper_signals SET status=?,reason=? WHERE id=? AND status IN ({marks})",
+        (status, reason, int(signal_id), *states),
+    )
+
+
+def mark_shadow(conn, signal_id, *, reason, payload):
+    """候选进入 Q3 影子观察：信号转 shadow_q3 并写观察载荷。"""
+    conn.execute(
+        "UPDATE paper_signals SET status='shadow_q3', reason=?, payload=? WHERE id=?",
+        (reason, payload, int(signal_id)),
+    )
+
+
+def expire_within(conn, signal_id, *, reason, statuses):
+    """只在给定状态集合内把信号写为 expired（保护已成交/已终态的信号）。"""
+    states = tuple(statuses)
+    if not states:
+        raise ValueError("expire_within 需要非空状态集合")
+    marks = ",".join("?" for _ in states)
+    conn.execute(
+        f"UPDATE paper_signals SET status='expired',reason=? WHERE id=? AND status IN ({marks})",
+        (reason, int(signal_id), *states),
+    )
+
+
+def supersede_signals(conn, signal_ids, *, statuses, suffix):
+    """按身份集合把信号转 superseded，原因追加调用方给出的固定后缀。"""
+    ids = [int(signal_id) for signal_id in signal_ids]
+    states = tuple(statuses)
+    if not ids:
+        return 0
+    if not states:
+        raise ValueError("supersede_signals 需要非空状态集合")
+    id_marks = ",".join("?" for _ in ids)
+    state_marks = ",".join("?" for _ in states)
+    return conn.execute(
+        f"""UPDATE paper_signals
+              SET status='superseded',
+                  reason=COALESCE(reason,'') || '；' || ?
+            WHERE id IN ({id_marks}) AND status IN ({state_marks})""",
+        (suffix, *ids, *states),
+    ).rowcount
+
+
+def supersede_blocked_for_day(conn, *, account_id, intended_date, reason,
+                              keep_rejected_like):
+    """当日引导：把 blocked 信号、以及"拒绝原因不是该固定门禁"的信号替代掉。
+
+    ``keep_rejected_like`` 是调用方给出的保留模式（原 ``reason NOT LIKE`` 的实参），
+    保证拒绝原因的分类仍由业务层决定。
+    """
+    return conn.execute(
+        """UPDATE paper_signals SET status='superseded',reason=?
+            WHERE account_id=? AND intended_date=?
+              AND (status='blocked' OR (status='rejected' AND reason NOT LIKE ?))""",
+        (reason, account_id, intended_date, keep_rejected_like),
+    ).rowcount
+
+
+def supersede_pending_for_day(conn, *, account_id, intended_date, reason, created_before):
+    """当日引导：早于给定时间的待处理信号被新一批替代。"""
+    return conn.execute(
+        """UPDATE paper_signals SET status='superseded',reason=?
+            WHERE account_id=? AND intended_date=? AND status='pending' AND created_at < ?""",
+        (reason, account_id, intended_date, created_before),
+    ).rowcount
 
 
 def reject_signal(conn, signal_id, *, reason):

@@ -41,6 +41,8 @@ __all__ = [
     "supersede_previous_execution_retry",
     "supersede_for_expired_signal",
     "supersede_for_terminal_signal",
+    "advance_execution_state",
+    "supersede_older_intents",
     "supersede_order",
     "terminate_order",
     "nonfilled_order_count",
@@ -317,6 +319,31 @@ def supersede_previous_execution_retry(conn, order_id):
             WHERE id=? AND status='execution_retry'""",
         (order_id,),
     )
+
+
+def supersede_older_intents(conn, *, account_id, code, statuses, keep_order_id):
+    """较早的等待池/延期意图被同一标的新委托替代（批量）；原因带新订单号。"""
+    states = tuple(statuses)
+    if not states:
+        raise ValueError("supersede_older_intents 需要非空状态集合")
+    marks = ",".join("?" for _ in states)
+    return conn.execute(
+        f"""UPDATE paper_orders
+              SET status='superseded',
+                  reason=COALESCE(reason,'') || '；已由最新实时复核委托替代，见 #' || ?
+            WHERE account_id=? AND code=? AND side='buy'
+              AND status IN ({marks}) AND id<>?""",
+        (keep_order_id, account_id, code, *states, keep_order_id),
+    ).rowcount
+
+
+def advance_execution_state(conn, order_id, *, status, execution_reasons, expected_version):
+    """执行结果推进：按乐观锁版本改写状态与执行原因。"""
+    return conn.execute(
+        "UPDATE paper_orders SET status=?,execution_reasons=?"
+        " WHERE id=? AND execution_version=?",
+        (status, execution_reasons, order_id, expected_version),
+    ).rowcount
 
 
 def cancel_order(conn, order_id, *, reason, cancelled_at, statuses: Sequence[str]):

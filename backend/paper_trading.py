@@ -8235,13 +8235,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             cycle_id=current_cycle["id"],
         )
         if str(signal.get("status") or "") in ENTRY_RETRY_SIGNAL_STATUSES:
-            conn.execute(
-                "UPDATE paper_signals SET status=?,reason=?,payload=? WHERE id=?",
-                (
-                    ENTRY_FROZEN_WAITLIST_STATUS, freeze_reason,
-                    _json({**payload, "entry_freeze": freeze_payload.get("entry_freeze")}),
-                    signal["id"],
-                ),
+            SIG.update_signal_feedback(
+                conn, int(signal["id"]), status=ENTRY_FROZEN_WAITLIST_STATUS,
+                reason=freeze_reason,
+                payload=_json({**payload, "entry_freeze": freeze_payload.get("entry_freeze")}),
             )
         if not _created:
             _risk_log(
@@ -8268,10 +8265,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     freshness = ELC.signal_freshness(signal, asof_day=asof_day)
     if not freshness["usable"]:
         stale_reason = freshness["reason"]
-        conn.execute(
-            "UPDATE paper_signals SET status='expired',reason=? WHERE id=? AND status IN (?,?,?)",
-            (stale_reason, signal["id"], *ELC.RETRY_SIGNAL_STATUSES),
-        )
+        SIG.expire_within(conn, int(signal["id"]), reason=stale_reason,
+                          statuses=ELC.RETRY_SIGNAL_STATUSES)
         _risk_log(conn, account["id"], code, "buy", "signal_expired", stale_reason, {
             "signal_id": signal.get("id"), "age_minutes": freshness["age_minutes"],
             "ttl_minutes": freshness["ttl_minutes"],
@@ -9201,31 +9196,21 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # previous statement retired old deferred/waitlist orders but left their
     # signal rows pending, so the UI and the recheck worker could resurrect a
     # signal whose only order had already been superseded.
-    conn.execute(
-        """UPDATE paper_signals
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；已由最新实时复核委托替代'
-           WHERE id IN (
-               SELECT signal_id FROM paper_orders
+    replaced_ids = [
+        int(row[0]) for row in conn.execute(
+            """SELECT signal_id FROM paper_orders
                WHERE account_id=? AND code=? AND side='buy'
-                 AND status IN (?,?) AND id<>? AND signal_id IS NOT NULL
-           )
-             AND status IN (?,?,?)""",
-        (
-            account["id"], code, ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity",
-            order_id, *ENTRY_RETRY_SIGNAL_STATUSES,
-        ),
-    )
-    conn.execute(
-        """UPDATE paper_orders
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；已由最新实时复核委托替代，见 #' || ?
-           WHERE account_id=? AND code=? AND side='buy'
-             AND status IN (?,?) AND id<>?""",
-        (
-            order_id, account["id"], code,
-            ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity", order_id,
-        ),
+                 AND status IN (?,?) AND id<>? AND signal_id IS NOT NULL""",
+            (account["id"], code, ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity",
+             order_id),
+        )
+    ]
+    SIG.supersede_signals(conn, replaced_ids, statuses=ENTRY_RETRY_SIGNAL_STATUSES,
+                          suffix="已由最新实时复核委托替代")
+    POL.supersede_older_intents(
+        conn, account_id=account["id"], code=code,
+        statuses=(ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity"),
+        keep_order_id=order_id,
     )
     if not allowed:
         # §56：闸门未放行的决策在此记录一次 risk 事件。成功路径的 risk log 与
@@ -9271,10 +9256,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 "reason": hold_reason,
             }
         if q3_shadow_ready:
-            conn.execute(
-                "UPDATE paper_signals SET status='shadow_q3', reason=?, payload=? WHERE id=?",
-                (reason, _json({**payload, "q3_shadow": q3_shadow_detail}), signal["id"]),
-            )
+            SIG.mark_shadow(conn, int(signal["id"]), reason=reason,
+                            payload=_json({**payload, "q3_shadow": q3_shadow_detail}))
             audit(conn, account["id"], "q3_shadow_candidate", f"{code}：{reason}")
             return {
                 "filled": False, "shadow": True, "status": "shadow_q3",
@@ -9459,11 +9442,10 @@ def process_pending_execution_orders(asof_date=None):
                 # 执行失败原因写进 ``execution_reasons``，不覆盖 ``reason``：
                 # 后者是这张委托"为什么下"的策略/风控事实，恢复成交时必须
                 # 原样留着，不能被一次执行插曲替换掉。
-                conn.execute(
-                    """UPDATE paper_orders
-                          SET status=?,execution_reasons=? WHERE id=? AND execution_version=?""",
-                    (retry_status, _json([reason]), order_id,
-                     int(order.get("execution_version") or 0)),
+                POL.advance_execution_state(
+                    conn, order_id, status=retry_status,
+                    execution_reasons=_json([reason]),
+                    expected_version=int(order.get("execution_version") or 0),
                 )
                 _risk_log(
                     conn, order["account_id"], order["code"], order["side"],
@@ -9480,10 +9462,10 @@ def process_pending_execution_orders(asof_date=None):
                     "filled": "filled", "partially_filled": "partially_filled",
                     "pending_execution": "pending",
                 }[str(state[0])]
-                conn.execute(
-                    """UPDATE paper_signals SET status=?,reason=?
-                         WHERE id=? AND status IN ('pending','partially_filled','deferred_capacity')""",
-                    (signal_status, str(state[3] or "执行事件已处理"), order["signal_id"]),
+                SIG.advance_signal_feedback(
+                    conn, int(order["signal_id"]), status=signal_status,
+                    reason=str(state[3] or "执行事件已处理"),
+                    statuses=("pending", "partially_filled", "deferred_capacity"),
                 )
             output.append({
                 "order_id": order_id, "status": str(state[0]),
@@ -9634,7 +9616,7 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
             and str(row["intended_date"] or "")[:10] <= waitlist_cutoff
         ]
         for row in expired:
-            conn.execute("UPDATE paper_signals SET status='expired', reason='错过有效交易日，不追价补单' WHERE id=?", (row["id"],))
+            SIG.expire_signal(conn, int(row["id"]), reason="错过有效交易日，不追价补单")
         due = [
             row for row in pending
             if row.get("status") != "pending" or row["intended_date"] == day.isoformat()
@@ -10449,22 +10431,20 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     reentry_codes = sold_today - position_codes - recovery_codes
                 # 普通 blocked/rejected 信号可在日内新行情下复评；短线追高专属门禁
                 # 失败则固定到下一交易日，避免每5分钟反复刷相同拒绝记录。
-                conn.execute(
-                    """UPDATE paper_signals SET status='superseded',reason=?
-                       WHERE account_id=? AND intended_date=?
-                         AND (status='blocked' OR (status='rejected' AND reason NOT LIKE '%短线追高风控未通过%'))""",
-                    (f"{RISK_VERSION} 重新评估后未再次入选", account["id"], day.isoformat()),
+                SIG.supersede_blocked_for_day(
+                    conn, account_id=account["id"], intended_date=day.isoformat(),
+                    reason=f"{RISK_VERSION} 重新评估后未再次入选",
+                    keep_rejected_like="%短线追高风控未通过%",
                 )
                 # H2: 当日待成交 pending 若长时间无法成交（资金/价格未满足），必须
                 # 有时间兜底转出，否则其 code 一直留在 actionable_codes 阻断同标的
                 # 再入场 → “永久无法再入场”死端。90 分钟未成交视为当日放弃，
                 # 释放该标的的再入场封锁；次日重新扫描时按新行情重新评估。
                 pending_cutoff = (dt.datetime.now() - dt.timedelta(minutes=90)).strftime("%Y-%m-%d %H:%M:%S")
-                conn.execute(
-                    """UPDATE paper_signals SET status='superseded',reason=?
-                       WHERE account_id=? AND intended_date=?
-                         AND status='pending' AND created_at < ?""",
-                    (f"{RISK_VERSION} 当日90分钟未成交，释放同标的再入场", account["id"], day.isoformat(), pending_cutoff),
+                SIG.supersede_pending_for_day(
+                    conn, account_id=account["id"], intended_date=day.isoformat(),
+                    reason=f"{RISK_VERSION} 当日90分钟未成交，释放同标的再入场",
+                    created_before=pending_cutoff,
                 )
 
                 candidates, meta = precomputed_candidates.get(account["id"], ([], {}))
