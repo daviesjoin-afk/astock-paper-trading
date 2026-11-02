@@ -318,6 +318,49 @@ CI的 `scripts/pr11_lane_acceptance.py` 在独立断网Docker中使用有效prof
 - 范围：展示刷新 lane 的并发与队列年龄上限、跳过原因可观测；展示失败不回滚交易结果。
 - 出口：队列年龄与跳过次数可查；展示链不占用交易 lane 的锁。
 
+#### P11-E 实施范围与验收（待审核，不部署）
+
+基线为 #327 Squash 后重新 fetch 核对的 master
+`b858f60410dd505b5b3fc95c6fc6c4ee28c74143`。复用既有单行持久队列、120秒租约、
+20秒心跳与 fencing，不新建展示任务或提高并发。有效发布者上限为1；生产入口继续
+使用 `astock-data-worker` 与 `resource-heavy.lock` 串行，保留原有数据任务资源预算，
+不持 `paper-scan.lock`、`risk-scan.lock`、`execution-scan.lock` 或交易运行租约。
+
+- **等待年龄上限为300秒**，与既有自动刷新间隔一致。这里只限制认领前的请求等待，
+  不把它当作快照数据年龄或运行时间。恰好300秒可运行；超过300秒不调用提供方，
+  将该请求记为 `expired`，保留旧快照与 `last_completed_at`，不伪报刷新完成。
+- 过期只处理本来可认领的请求或失效租约；有效租约不被队列年龄抢占，失败退避
+  仍保留。运行期间的显式跟进请求沿用自己的首次请求时间，重复请求不重置年龄。
+  无法解析或来自未来的请求时间不具备年龄证据，记录 `invalid_requested_at` 后过期。
+- 后续正常 automatic / explicit / ensure 请求可以重新排队；刷新仍读取当时最新状态。
+  不因每次轮询自动重排已过期请求，不承诺资源持续繁忙时仍能完成展示刷新。
+- Schema v42 只升级展示队列表的状态约束和过期计数。v41的16个字段全部保留，
+  包括活动 owner、fence、请求版本及跟进请求，不修改交易表、不自行 commit；
+  回滚后原表和原活动行保持。发布、心跳及失败重试事务边界不改。
+- 主机入口 `deploy/run_snapshot_refresh.sh` 保留非阻塞资源锁；锁忙时输出
+  `dashboard_refresh / skipped / resource_busy`，不再静默跳过。应用侧记录
+  `already_running`、`retry_backoff`、`queue_age_exceeded` 等原因；展示事件不混入
+  交易启动数、交易跳过数或成功风控统计。
+
+查询方式（只读，不运行刷新）：
+
+```bash
+docker exec astock-data-worker python backend/paper_snapshot_worker.py --metrics
+```
+
+`queue` 给出当前等待年龄、300秒上限、并发上限、持久 `skip_count` 及最近过期原因；
+其中 `skip_count` 只累计实际丢弃的过期/非法时间请求，重复清扫不会重复累计。
+`events.dashboard_refresh` 给出最近日志片段的各原因跳过次数和最大队列年龄；
+复用有界日志读取器，最多读取尾部4000行/1.5MB，**不是全历史计数**。已过期且无新请求
+的轮询记为空闲事件，不再次计作丢弃请求；日志缺失明确报告 unavailable。
+API 的 `snapshot_refresh` 同时暴露上述队列年龄和持久过期计数，保留既有字段。
+
+离线验收覆盖300/301秒边界、重复清扫、三种请求重排、有效租约/失败退避、旧进程
+发布隔离、跟进请求年龄、v41活动行无损迁移与回滚、命令行指标和主机真实锁争用。
+保留原有展示失败不改变交易退出状态、真实成交不重复执行及黄金回放回归；
+`paper_trading.py`、成交/风控函数与资源额度不改。完整回归与资源探针结论以本次
+HEAD的CI日志为准，不据离线场景宣布真实180秒或PR-11生产总体验收完成。
+
 ## 5. 每包验收模板
 
 1. `python -m unittest test_architecture_boundary_audit` 绿，15 项实测逐项**不上升**；

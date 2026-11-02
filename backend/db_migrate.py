@@ -468,6 +468,8 @@ MIGRATIONS = {
          paper_schema.ensure_ai_decision_audits),
         (41, "Dashboard 快照持久刷新任务（独立于交易任务）",
          paper_schema.ensure_dashboard_refresh_jobs),
+        (42, "Dashboard 队列年龄上限与过期记录（保留现有租约）",
+         paper_schema.ensure_dashboard_refresh_jobs),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

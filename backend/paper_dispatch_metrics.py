@@ -363,6 +363,8 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
     last_starts = {}
     last_risk = {"at": None, "source": None, "status": None, "slot": None}
     risk_scan_summary = {"total": 0, "by_status": {}, "by_slot": {}}
+    display = {"events": 0, "skipped": 0, "by_status": {}, "skips_by_reason": {}}
+    display_ages = []
 
     started = 0
     end_events = 0
@@ -387,6 +389,21 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
 
     for event in events:
         kind = event.get("event")
+
+        if kind == "dashboard_refresh":
+            status = _text(event.get("status")) or "unknown"
+            display["events"] += 1
+            display["by_status"][status] = display["by_status"].get(status, 0) + 1
+            reason = _text(event.get("reason")) or "unknown"
+            if status == "skipped" or (status == "idle" and reason in {
+                "already_running", "retry_backoff",
+            }):
+                display["skipped"] += 1
+                display["skips_by_reason"][reason] = display["skips_by_reason"].get(reason, 0) + 1
+            age = _wait_seconds(event.get("queue_age_seconds"))
+            if age is not None:
+                display_ages.append(age)
+            continue
 
         if kind == HOST_LOCK_EVENT:
             status = _text(event.get("status")) or ""
@@ -498,6 +515,9 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
         }
 
     return {
+        "dashboard_refresh": display | {"queue_age_seconds": {
+            "samples": len(display_ages), "max": _round(max(display_ages)) if display_ages else None,
+        }},
         "ticks": {
             "start_attempts": started,
             "skipped": skip_total,

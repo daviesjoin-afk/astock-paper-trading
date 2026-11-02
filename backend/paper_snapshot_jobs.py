@@ -10,10 +10,44 @@ import paper_job_lifecycle as PJL
 LEASE_SECONDS = 120
 HEARTBEAT_SECONDS = 20
 RETRY_SECONDS = 60
+MAX_QUEUE_AGE_SECONDS = 300
+MAX_CONCURRENCY = 1
 
 
 def _stamp(offset=0):
     return (dt.datetime.now() + dt.timedelta(seconds=offset)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def queue_state(row, *, now):
+    """Read-only admission facts; pending age is not provider snapshot age."""
+    reason = "no_request"
+    age = None
+    if row is not None:
+        status = row["status"]
+        live = status == "running" and row["expires_at"] and row["expires_at"] > now
+        pending = status in {"queued", "failed"} or (
+            status == "running" and row["request_version"] > row["claimed_version"])
+        if pending or status == "running":
+            try:
+                # A running collector's elapsed time is not queue waiting.
+                until = row["started_at"] if live and not pending else now
+                age = (dt.datetime.fromisoformat(until) - dt.datetime.fromisoformat(row["requested_at"])).total_seconds()
+                if age < 0:
+                    age = None
+            except (TypeError, ValueError):
+                age = None
+        reason = {"completed": "no_pending_request", "expired": "request_expired"}.get(status, "due")
+        if live:
+            reason = "already_running"
+        elif status == "failed" and row["next_retry_at"] and row["next_retry_at"] > now:
+            reason = "retry_backoff"
+        elif status in {"queued", "failed", "running"}:
+            if age is None:
+                reason = "invalid_requested_at"
+            elif age > MAX_QUEUE_AGE_SECONDS:
+                reason = "queue_age_exceeded"
+    return {"reason": reason, "queue_age_seconds": age,
+            "max_queue_age_seconds": MAX_QUEUE_AGE_SECONDS, "max_concurrency": MAX_CONCURRENCY}
 
 
 def request_refresh(db_factory, *, trigger, request_kind="automatic", snapshot_missing=False):
@@ -29,12 +63,14 @@ def request_refresh(db_factory, *, trigger, request_kind="automatic", snapshot_m
 def refresh_status(db_factory):
     with db_factory() as conn:
         row = PJL.read_snapshot_refresh(conn)
+    facts = queue_state(row, now=_stamp())
     if row is None:
-        return {"status": "idle", "running": False, "last_error": None}
+        return {"status": "idle", "running": False, "last_error": None, "skip_count": 0} | facts
     return {key: row[key] for key in (
         "status", "trigger", "requested_at", "started_at", "finished_at", "heartbeat_at",
         "expires_at", "attempt", "next_retry_at", "last_error", "last_completed_at",
-    )} | {"running": row["status"] in {"queued", "running"}}
+        "skip_count", "last_skip_reason", "last_skipped_at", "last_queue_age_seconds",
+    )} | {"running": row["status"] in {"queued", "running"}} | facts
 
 
 def run_refresh_job(db_factory, refresh):
@@ -46,9 +82,16 @@ def run_refresh_job(db_factory, refresh):
     """
     owner = uuid.uuid4().hex
     with db_factory(immediate=True, hot_path=True) as conn:
-        job = PJL.claim_snapshot_refresh(conn, owner=owner, now=_stamp(), expires_at=_stamp(LEASE_SECONDS))
+        now = _stamp()
+        row = PJL.read_snapshot_refresh(conn)
+        facts = queue_state(row, now=now)
+        if facts["reason"] in {"queue_age_exceeded", "invalid_requested_at"} and PJL.expire_snapshot_refresh(
+            conn, now=now, reason=facts["reason"], queue_age_seconds=facts["queue_age_seconds"],
+        ):
+            return {"status": "skipped"} | facts
+        job = PJL.claim_snapshot_refresh(conn, owner=owner, now=now, expires_at=_stamp(LEASE_SECONDS))
     if job is None:
-        return {"status": "idle"}
+        return {"status": "idle"} | facts
     fence = job["fencing_token"]
     stop = threading.Event()
     lost = threading.Event()
