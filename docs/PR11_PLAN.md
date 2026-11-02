@@ -88,9 +88,9 @@
 | 事件 | 产出者 | 关键字段 | 含义 |
 | --- | --- | --- | --- |
 | `paper_host_lock` | `deploy/run_paper_slot.sh` | `status`（`not_acquired` / `yielded_to_full_scan`）、`slot`、`wait_seconds` | 这一轮**没有进入 runner** |
-| `paper_slot_start` | `deploy/run_paper_slot.sh`（拿到锁之后） | `slot`、`tick_id`、`wait_seconds`、`at` | 这一轮**确实要启动 runner** |
-| `paper_slot_exit` | `deploy/run_paper_slot.sh`（`docker exec` 返回后） | `slot`、`tick_id`、`exit_code`、`at` | runner 进程返回（含崩溃/被杀） |
-| `paper_slot_timing` | `paper_timing.capture` | `status`、`timing.slot`、`timing.started_at`、`timing.stages`、`timing.scheduler_tick_id` | 这一轮的结束状态 |
+| `paper_slot_start` | `deploy/run_paper_slot.sh`（拿到锁之后） | `slot`、`tick_id`、`wait_seconds`、`at` | 拿锁后的启动尝试，尚不能证明进入 Python |
+| `paper_slot_exit` | `deploy/run_paper_slot.sh`（`docker exec` 返回后） | `slot`、`tick_id`、`exit_code`、`at` | docker exec 返回（也可能容器不存在、从未进入 Python） |
+| `paper_slot_timing` | `paper_timing.capture` | `status`、`timing.slot`、`timing.started_at`、`timing.stages`、`timing.risk_scans`、`timing.scheduler_tick_id` | 这一轮的结束状态 |
 
 硬约束（都是复审指出的错位点）：
 
@@ -101,17 +101,22 @@
    不再写死宿主绝对路径 `/opt/astock-codex/...`；需要指向别处时用 `ASTOCK_SCHEDULER_LOG`。
    读不到时 `dispatch` 返回 `available=False` 并给出 `error=missing|unreadable|bad_path|parse_error`；
    `parse_error` 是"观测坏了但 dashboard 不跟着 500"的最后一道闸门。
-3. **状态四分类**：`completed`（`completed` / `ok`）才算跑完一次新扫描；`skipped` /
+3. **状态四分类**：`completed`（`completed` / `ok`）仅代表外层任务完成；`skipped` /
    `already_done` / `up_to_date` 归 `idle`，**不计**为成功风控；`failed` / `error` /
    `blocked` 归 `failed`；其余归 `unknown`。格式异常的 `timing` 只降级该条证据，不抛错
    （包括 `started_at` 时区不可比时丢掉该对间隔，而不是让 naive/aware 相减抛 `TypeError`）。
 4. **风控阶段只认 `risk_pass` 与 `risk.*`**：`risk_snapshot_enqueue` 是展示快照入队
    （`run_slot` 吞掉它的异常），既不能让展示失败抹掉真实风控成功，也不能让没有风控阶段的
-   一轮虚报成功。
+   一轮虚报成功。两个 slot（risk / intraday）都还必须有 `timing.risk_scans` 中的
+   `completed` 标记：它只在原有 durable scan 完成事务提交后记录，包含 cycle、日期、
+   scan_minute 与扫描开始时间。未取得 claim 记录 `already_scanned`，抛错记录 `failed`；
+   外层 completed 和 `risk_pass` 零错误都不能替代这个标记。旧日志缺标记时保留未知。
+   阶段 errors 必须为非负有限整数，缺失、布尔、负数、小数、NaN/Infinity 均不作为成功证据。
+   若同一 capture 含失败重试，累积阶段错误仍会保守地排除该条成功证据。
 5. **tick 可对账**：`tick_id` 由主机脚本生成并注入容器（`ASTOCK_SCHEDULER_TICK_ID`），
-   启动事件与结束事件按同一个 id 配对。于是 `started`（进入 runner）、
-   `unfinished`（启动了但没有结束事件：仍在跑或被杀）、`exited_without_result`
-   （退出但从未打印结果）是三个不同的数字。
+   启动尝试与结束事件按同一个 id 配对。`start_attempts` 是尝试次数，
+   `unfinished` 是没有结束/退出证据的尝试，`exited_without_result` 是 docker exec 已返回
+   但没有 timing 结果的尝试。后二者都不能直接证明 Python 正在运行。
 6. **queue age 按轮次计**：有启动事件的轮次用进入时刻的等待；没有启动事件的轮次
    （旧日志、`weekly-review` 直连 `docker exec`）退回结束事件里的等待，同一轮不重复。
 
@@ -119,13 +124,13 @@
 
 | 字段 | 含义 |
 | --- | --- |
-| `ticks.started` / `ticks.skipped` | 进入 runner 的轮次 / 被主机锁挡住的轮次 |
+| `ticks.start_attempts` / `ticks.skipped` | docker exec 前的启动尝试 / 被主机锁挡住的轮次 |
 | `ticks.end_events` | `paper_slot_timing` 条数（结束事件） |
 | `ticks.completed` / `idle` / `failed` / `unknown_status` | 结束事件的四分类 |
-| `ticks.unfinished` / `exited_without_result` | 启动未结束 / 退出无结果 |
+| `ticks.unfinished` / `exited_without_result` | 尝试后没有结束/退出证据 / docker exec 返回但无结果 |
 | `ticks.unparsed` | 形状不成立、只降级不计入的结束事件条数 |
-| `ticks.source` | 日志里是否存在启动事件（`runner_start_events` / `slot_timing_end_events`） |
-| `runs[slot]` | 每个 lane 的 started / end_events / skipped / 四分类 |
+| `ticks.source` | 日志里是否存在启动事件（`host_start_attempt_events` / `slot_timing_end_events`） |
+| `runs[slot]` | 每个 lane 的 start_attempts / end_events / skipped / 四分类 |
 | `skips` / `skips_by_slot` | 跳过原因与 lane 归因 |
 | `queue_age_seconds` | 进入 runner 前的主机锁等待（每轮只计一次） |
 | `start_to_start_seconds[slot]` | 同一 lane 相邻 `started_at` 间隔的 p50/p95/max/breaches |
@@ -134,17 +139,17 @@
 ### 3.2 仍然存在的盲区（如实记录，不假装已覆盖）
 
 - **外层 cron 的 `flock -n` 拒绝不会执行脚本，因此不产生任何日志行**：`auction` / `open` /
-  `close` / `fast-entry` 的外层锁拒绝不可见。`ticks.started` 是"进入 runner 的次数"，
+  `close` / `fast-entry` 的外层锁拒绝不可见。`ticks.start_attempts` 是"拿锁后的启动尝试数"，
   不是"cron 触发次数"；两者的差额只有在本包之外改造 cron 行（`|| 记录拒绝`）后才能补齐，
   这属于 P11-B 起的工作，本包不动 cron。
 - **`fast-entry` 的事件写在 `/var/log/astock-fast-entry.log`**（它的 cron 行重定向不同），
   不在 `scheduler.log` 里。因此 P11-A 的 `skips_by_slot` 默认看不到 `fast-entry` 的让路；
-  要看它需要把该路径一起纳入（`ASTOCK_SCHEDULER_LOG` 指向对应文件）。
+  当前只能用 `ASTOCK_SCHEDULER_LOG` 切换为该文件，不能同时聚合两份日志。
 - **`weekly-review` 的 cron 行直接 `docker exec`**，不经过 `run_paper_slot.sh`，因此没有
   启动/退出事件，只有 `paper_timing` 结束事件。
 - `queue age` 只覆盖主机 `paper-scan.lock` 等待，不含外层 cron 锁排队与 Docker/Python 启动。
-- `paper_slot_start` 在 `docker exec` 之前发出，因此 `ticks.started` 的精确含义是
-  "拿到主机锁、准备启动 runner"。容器不存在或镜像缺失时同样是 started +
+- `paper_slot_start` 在 `docker exec` 之前发出，因此 `ticks.start_attempts` 的精确含义是
+  "拿到主机锁、准备启动 runner"。容器不存在或镜像缺失时同样是 start_attempts +
   `exited_without_result`，不会冒充"跑完一轮"。
 
 ## 4. 工作包与出口
@@ -152,7 +157,7 @@
 每包一个 PR，重基到当时 master，跑 exact-head CI，合并后重新确认 master SHA。
 **任何时候不删除现有全局锁，不提前拆进程，不改评分/阈值/风控规则。**
 
-### P11-A（本 PR 的下一包）：调度级可观测性（行为零变化）
+### P11-A（#324）：调度级可观测性收尾，部分观测完成
 
 - 范围：为 tick 级事实增加结构化记录与只读查询，覆盖上表五项缺口
   （`scheduled tick` / `runner started` / `lock skipped` / `in_progress` / `queue age` /
@@ -160,11 +165,14 @@
 - 不做：不改 cron 频率，不改锁，不改 slot 词表语义，不接 RoundKlineCache，不动交易规则。
 - 出口：同一份数据能回答"每个 scheduled tick 是否真正进入 runner"；全量回归绿；
   所有耦合预算**不上升**。
-- 出口的实际达成度（`#324` 复审后）：`runner started` / `lock skipped`（按 lane）/
-  `in_progress`（= `unfinished` + `exited_without_result`）/ `queue age` /
-  `last successful risk scan` / lane 级 start-to-start **可回答**；
-  "cron 真的触发了几次"**不可回答**，因为外层 `flock -n` 拒绝不产生日志行（见 §3.2）。
-  这条缺口如实留在计划里，不用近似值冒充。
+- 出口的实际达成度（第二轮复审修复后）：**本包代码交付收尾，部分观测完成**。
+  启动尝试、脚本可见的锁跳过、未配对尝试、主机锁等待、带独立完成标记的成功风控、
+  有结束日志的 slot start-to-start 可查。实际 runner 启动总数、真实 in_progress、全部 cron
+  触发数不可回答；fast-entry 与 scheduler.log 尚不能同时读。没有部署或生产节拍验收证据。
+  保留原目标及这些缺口，不能以本包完成声称 PR-11 总体验收通过。
+- 本次验证：真实 `monitor_risk` 同分钟两入口先完成再幂等跳过，外层均 completed，
+  但只有第一次有独立成功标记且只产生一笔成交；非法阶段错误数在直接聚合和文件读取
+  两层都只影响该条成功证据，其他指标仍可用。完整 CI 以最终 HEAD 的 Actions 为准。
 
 ### P11-B：`risk-fast` 独立 lane
 

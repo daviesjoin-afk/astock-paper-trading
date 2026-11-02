@@ -25,26 +25,28 @@
 
 口径：
 
-* **tick** 是一次调度尝试。``paper_slot_start`` 记"真正进入 runner"的那一次；
+* **tick** 是一次调度尝试。``paper_slot_start`` 记拿锁后的启动尝试；
   ``paper_host_lock`` 的 ``not_acquired`` / ``yielded_to_full_scan`` 记"被锁挡住"
   的那一次。两者相加才是日志里可观测的尝试数。
 * **queue age** 是进入 runner 之前的等待（主机 ``paper-scan.lock``），不含外层
-  cron 锁与 Docker/Python 启动。有 ``paper_slot_start`` 时以它为准（进入时刻的
+  cron 锁与 Docker/Python 启动。有 ``paper_slot_start`` 时以它为准（尝试时刻的
   权威值），否则退回 ``timing.host_paper_lock_wait_seconds``；同一轮不重复计数。
 * **start-to-start** 是同一 slot 相邻两次 ``started_at`` 的间隔，用 ``started_at``
   而不是结束时间，因为 PR-11 的验收写的是 start-to-start interval。
 * **状态四分类**（``completed`` / ``idle`` / ``failed`` / ``unknown``）：只有
-  ``completed``（``completed`` / ``ok``）代表真的跑完一次新扫描；``skipped`` /
+  ``completed``（``completed`` / ``ok``）只代表外层任务完成；``skipped`` /
   ``already_done`` / ``up_to_date`` 归入 ``idle``，**不算**新的成功风控；
   ``failed`` / ``error`` / ``blocked`` 归入 ``failed``。
-* **last successful risk scan**：优先取 ``slot == "risk"`` 的 completed 事件；旧
-  调度里风控跑在 ``intraday`` 内，此时退化为"completed 且含 ``risk`` 前缀阶段、
-  阶段 errors 全为 0"的 ``intraday`` 事件，并用 ``source`` 标明规则来源。
+* **last successful risk scan**：risk / intraday 都必须有独立的
+  ``timing.risk_scans`` completed 标记，且外层 completed、风险阶段零错误。
+  标记在 durable scan 完成事务提交后记录；``already_scanned`` 单独记录，
+  旧日志缺少标记时为未知，不能从 slot 成功或阶段耗时猜测。
 
-已知盲区（不粉饰）：外层 cron 的 ``flock -n`` 拒绝（``auction`` / ``open`` /
-``close`` 等）不会执行脚本，因而**不产生任何日志行**；被信号直接杀死的 runner
-只在 ``paper_slot_exit`` 上留痕。因此 ``ticks.started`` 是"进入 runner 的次数"，
-不是"cron 触发次数"；``ticks.source`` 会说明日志里是否存在启动事件。
+已知盲区：外层 cron 的 ``flock -n`` 拒绝没有日志；fast-entry 日志另存。
+``ticks.start_attempts`` 仅为 docker exec 前的启动尝试，容器不存在也会计数。
+``ticks.end_events`` 证明 Python 已执行到 timing 结束，但不是完整的 runner 启动数。
+没有结束的尝试可能尚未进入 Python、正在运行或被杀，不能直接称为 in_progress。
+P11-A 只完成部分观测，不证明所有 cron 触发或真实 runner 启动次数。
 
 本模块不 import 任何项目模块，不碰数据库，不读取任何凭据，也不参与交易判断；
 它只把日志行变成数字。**没有这些数字，PR-11 的"risk-fast interval 达到目标"
@@ -81,7 +83,7 @@ UNKNOWN_SLOT = "unknown"
 DEFAULT_TARGET_INTERVAL_SECONDS = 180
 
 #: 结束事件来源：有 ``paper_slot_start`` 时用启动计数，否则只能退回结束事件。
-SOURCE_START_EVENTS = "runner_start_events"
+SOURCE_START_EVENTS = "host_start_attempt_events"
 SOURCE_END_EVENTS = "slot_timing_end_events"
 
 
@@ -200,13 +202,19 @@ def _status_bucket(status):
 
 
 def _stage_errors(value):
-    """阶段 ``errors`` 转成整数；不是数字时返回 None（当作未知，不冒充 0）。"""
+    """只接受非负有限整数；缺失/非法值为未知，不能冒充零错误。"""
     if not isinstance(value, dict):
         return None
-    try:
-        return int(value.get("errors") or 0)
-    except (TypeError, ValueError):
+    raw = value.get("errors")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
         return None
+    try:
+        errors = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if errors < 0 or (isinstance(raw, float) and raw != errors):
+        return None
+    return errors
 
 
 #: ``paper_trading`` 里真正的风控阶段是 ``risk_pass`` 与 ``risk.*``。
@@ -223,15 +231,20 @@ def _is_risk_stage(name):
 
 
 def _is_risk_pass(event, slot, bucket):
-    """旧调度里风控跑在 intraday 内：completed 且 risk 阶段零错误才算成功。
+    """独立扫描完成标记 + 外层完成 + 风险阶段零错误才算成功。
 
     停在这一步的三种情况都**不算**一次新的成功风控：``skipped`` /
     ``already_done`` 之类的 idle 结束、``failed`` 结束、以及阶段 errors
     无法解析（未知不等于 0）。
     """
-    if slot != "intraday" or bucket != "completed":
+    if slot not in ("risk", "intraday") or bucket != "completed":
         return False
     timing = _timing_block(event)
+    scans = timing.get("risk_scans") if timing is not None else None
+    if not isinstance(scans, list) or not any(
+        isinstance(scan, dict) and scan.get("status") == "completed" for scan in scans
+    ):
+        return False
     stages = timing.get("stages") if timing is not None else None
     if not isinstance(stages, dict):
         return False
@@ -297,7 +310,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
 
     def _bucket_for(slot):
         return runs.setdefault(slot, {
-            "started": 0, "end_events": 0, "skipped": 0,
+            "start_attempts": 0, "end_events": 0, "skipped": 0,
             "completed": 0, "idle": 0, "failed": 0, "unknown": 0,
         })
 
@@ -328,11 +341,11 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
         if kind == SLOT_START_EVENT:
             slot = _host_slot(event) or UNKNOWN_SLOT
             started += 1
-            _bucket_for(slot)["started"] += 1
+            _bucket_for(slot)["start_attempts"] += 1
             pending.setdefault(slot, []).append({"tick": _tick_id(event), "exited": False})
             wait = _lock_wait(event)
             if wait is not None:
-                # 进入时刻的等待是这一轮的主机锁等待（权威值）。
+                # 启动尝试时刻的主机锁等待。
                 waits.append(wait)
             continue
 
@@ -340,7 +353,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
             slot = _host_slot(event) or UNKNOWN_SLOT
             entry = _take_pending(slot, _tick_id(event))
             if entry is not None:
-                # 启动过、退出过、却没有结束事件：runner 被杀或崩溃在打印之前。
+                # docker exec 返回但没有结束事件：也可能根本没进入 Python。
                 pending[slot].append(entry)
                 entry["exited"] = True
             continue
@@ -380,7 +393,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
                     intervals.setdefault(slot, []).append(gap)
             last_starts[slot] = started_at
 
-        if slot == "risk" and bucket == "completed":
+        if slot == "risk" and _is_risk_pass(event, slot, bucket):
             last_risk = {
                 "at": started_at.isoformat() if started_at else None,
                 "source": "risk_slot", "status": status, "slot": slot,
@@ -415,7 +428,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
 
     return {
         "ticks": {
-            "started": started,
+            "start_attempts": started,
             "skipped": skip_total,
             "end_events": end_events,
             "completed": buckets["completed"],

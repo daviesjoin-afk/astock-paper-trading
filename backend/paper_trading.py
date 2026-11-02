@@ -9916,6 +9916,7 @@ def monitor_risk(asof_date=None):
             conn, **ident, started_at=scan_context["started_at"])
         if not claimed["claimed"]:
             # 兼容既有 facade 契约：重复入口（含 running）一律回 already_scanned。
+            PTM.risk_scan_outcome("already_scanned", **scan_context)
             return {
                 "slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": [],
                 "status": "already_scanned",
@@ -9928,8 +9929,10 @@ def monitor_risk(asof_date=None):
             _require_active_lease(conn, "risk scan completion")
             PRSS.complete_scan(conn, **ident, finished_at=_now())
             audit(conn, None, "risk_scan_completed", _json(dict(ident)))
+        PTM.risk_scan_outcome("completed", **scan_context)
         return result
     except Exception as exc:
+        PTM.risk_scan_outcome("failed", **scan_context)
         if _lease_lost(exc):
             raise
         try:

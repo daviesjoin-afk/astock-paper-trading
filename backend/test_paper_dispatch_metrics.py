@@ -21,9 +21,10 @@ import paper_timing as timing
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _timing_event(slot, started_at, *, status="completed", wait=None, stages=None):
+def _timing_event(slot, started_at, *, status="completed", wait=None, stages=None, risk_status="completed"):
     """生产形状：slot 在 ``timing`` 里，与 ``paper_timing.capture`` 一致。"""
-    timing_block = {"started_at": started_at, "stages": stages or {}, "slot": slot}
+    timing_block = {"started_at": started_at, "stages": stages if stages is not None else {"risk_pass": {"errors": 0}}, "slot": slot,
+                    "risk_scans": [{"status": risk_status}] if risk_status else []}
     if wait is not None:
         timing_block["host_paper_lock_wait_seconds"] = wait
     return json.dumps({"event": "paper_slot_timing", "status": status,
@@ -61,6 +62,7 @@ class RealEventShapeTests(unittest.TestCase):
         with contextlib.redirect_stderr(buffer), timing.capture("intraday"):
             with timing.phase("risk_pass"):
                 pass
+            timing.risk_scan_outcome("completed")
             timing.outcome("completed")
         lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
         self.assertEqual(1, len(lines))
@@ -74,6 +76,7 @@ class RealEventShapeTests(unittest.TestCase):
         with contextlib.redirect_stderr(buffer), timing.capture("intraday"):
             with timing.phase("risk_pass"):
                 pass
+            timing.risk_scan_outcome("completed")
             timing.outcome("completed")
         summary = PDM.summarize_lines(buffer.getvalue().splitlines())
         self.assertIn("intraday", summary["runs"])
@@ -96,8 +99,8 @@ class RealEventShapeTests(unittest.TestCase):
         })
         summary = _summarize(sample)
         self.assertEqual(["intraday"], list(summary["runs"]))
-        self.assertEqual("2026-11-02T09:33:00+08:00",
-                         summary["last_successful_risk_scan"]["at"])
+        self.assertIsNone(summary["last_successful_risk_scan"]["at"],
+                          "旧日志只有阶段耗时，不能证明实际扫描")
 
     def test_flat_top_level_slot_is_not_accepted_as_evidence(self):
         """历史/自造格式（slot 在顶层）不得被当成正常事件。"""
@@ -111,6 +114,22 @@ class RealEventShapeTests(unittest.TestCase):
 
 
 class ParsingRobustnessTests(unittest.TestCase):
+    def test_stage_errors_accept_only_nonnegative_finite_integers(self):
+        for raw in (float("inf"), -float("inf"), float("nan"), -1, -0.5, 0.5,
+                    True, False, None, "", "inf", "nan", "0.5", [], {}):
+            with self.subTest(raw=raw):
+                self.assertIsNone(PDM._stage_errors({"errors": raw}))
+                event = json.loads(_timing_event(
+                    "intraday", "2026-11-02T09:33:00+08:00",
+                    stages={"risk_pass": {"errors": raw}}))
+                summary = PDM.summarize([event])
+                self.assertEqual(1, summary["ticks"]["end_events"])
+                self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+                json.dumps(summary, allow_nan=False)
+        self.assertIsNone(PDM._stage_errors({}))
+        for raw in (0, 0.0, "0", 1, "2"):
+            self.assertEqual(int(raw), PDM._stage_errors({"errors": raw}))
+
     def test_bad_lines_are_skipped_without_raising(self):
         lines = [
             "",
@@ -170,6 +189,14 @@ class ParsingRobustnessTests(unittest.TestCase):
 
 
 class TickAccountingTests(unittest.TestCase):
+    def test_missing_container_is_only_a_start_attempt(self):
+        summary = _summarize(_start("risk"), _exit("risk", code=1))
+        self.assertEqual(1, summary["ticks"]["start_attempts"])
+        self.assertEqual("host_start_attempt_events", summary["ticks"]["source"])
+        self.assertNotIn("started", summary["ticks"])
+        self.assertEqual(0, summary["ticks"]["end_events"])
+        self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+
     def test_start_and_end_events_pair_by_tick_id(self):
         summary = _summarize(
             _start("intraday", tick="a", wait=4),
@@ -177,17 +204,17 @@ class TickAccountingTests(unittest.TestCase):
             _exit("intraday", tick="a"),
         )
         ticks = summary["ticks"]
-        self.assertEqual(1, ticks["started"])
+        self.assertEqual(1, ticks["start_attempts"])
         self.assertEqual(1, ticks["end_events"])
         self.assertEqual(1, ticks["completed"])
         self.assertEqual(0, ticks["unfinished"])
         self.assertEqual(0, ticks["exited_without_result"])
         self.assertEqual(PDM.SOURCE_START_EVENTS, ticks["source"])
-        self.assertEqual(1, summary["runs"]["intraday"]["started"])
+        self.assertEqual(1, summary["runs"]["intraday"]["start_attempts"])
 
     def test_started_without_end_event_is_unfinished_not_completed(self):
         summary = _summarize(_start("intraday", tick="a"))
-        self.assertEqual(1, summary["ticks"]["started"])
+        self.assertEqual(1, summary["ticks"]["start_attempts"])
         self.assertEqual(0, summary["ticks"]["end_events"])
         self.assertEqual(1, summary["ticks"]["unfinished"])
         self.assertEqual(0, summary["ticks"]["completed"])
@@ -202,7 +229,7 @@ class TickAccountingTests(unittest.TestCase):
     def test_legacy_log_without_start_events_says_so(self):
         summary = _summarize(_timing_event("intraday", "2026-11-02T09:33:00+08:00"))
         self.assertEqual(PDM.SOURCE_END_EVENTS, summary["ticks"]["source"])
-        self.assertEqual(0, summary["ticks"]["started"])
+        self.assertEqual(0, summary["ticks"]["start_attempts"])
         self.assertEqual(1, summary["ticks"]["end_events"])
 
     def test_real_capture_tick_id_pairs_with_the_host_start_event(self):
@@ -212,10 +239,11 @@ class TickAccountingTests(unittest.TestCase):
             with contextlib.redirect_stderr(buffer), timing.capture("risk"):
                 with timing.phase("risk_pass"):
                     pass
+                timing.risk_scan_outcome("completed")
                 timing.outcome("completed")
         lines = [_start("risk", tick="risk-1793604230-1149")] + buffer.getvalue().splitlines()
         summary = PDM.summarize_lines(lines)
-        self.assertEqual(1, summary["ticks"]["started"])
+        self.assertEqual(1, summary["ticks"]["start_attempts"])
         self.assertEqual(0, summary["ticks"]["unfinished"])
         self.assertEqual(0, summary["ticks"]["exited_without_result"])
         self.assertEqual(1, summary["ticks"]["completed"])
@@ -269,6 +297,16 @@ class TickAccountingTests(unittest.TestCase):
 
 
 class StatusSemanticsTests(unittest.TestCase):
+    def test_completed_slot_without_actual_scan_cannot_advance_risk_success(self):
+        for slot in ("risk", "intraday"):
+            for marker in (None, "already_scanned", "failed"):
+                with self.subTest(slot=slot, marker=marker):
+                    last = _summarize(
+                        _timing_event(slot, "2026-11-02T09:33:00+08:00"),
+                        _timing_event(slot, "2026-11-02T09:36:00+08:00", risk_status=marker),
+                    )["last_successful_risk_scan"]
+                    self.assertEqual("2026-11-02T09:33:00+08:00", last["at"])
+
     def test_end_event_statuses_are_split_into_four_buckets(self):
         summary = _summarize(
             _timing_event("intraday", "2026-11-02T09:30:00+08:00", status="completed"),
@@ -284,7 +322,7 @@ class StatusSemanticsTests(unittest.TestCase):
         self.assertEqual(1, ticks["unknown_status"])
         runs = summary["runs"]["intraday"]
         self.assertEqual(
-            {"started": 0, "end_events": 5, "skipped": 0,
+            {"start_attempts": 0, "end_events": 5, "skipped": 0,
              "completed": 1, "idle": 2, "failed": 1, "unknown": 1},
             runs,
         )
@@ -421,6 +459,22 @@ class PathResolutionTests(unittest.TestCase):
 
 
 class FileTests(unittest.TestCase):
+    def test_nonfinite_stage_errors_do_not_break_file_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "scheduler.log"
+            good = _timing_event("intraday", "2026-11-02T09:33:00+08:00")
+            for raw in ("1e999", "-1e999", "NaN", "-1", "0.5", "null", "true"):
+                with self.subTest(raw=raw):
+                    bad = _timing_event("intraday", "2026-11-02T09:36:00+08:00")
+                    bad = bad.replace('"errors": 0', '"errors": ' + raw)
+                    path.write_text(good + "\n" + bad + "\n", encoding="utf-8")
+                    result = PDM.summarize_file(path)
+                    self.assertTrue(result["available"])
+                    self.assertEqual(2, result["ticks"]["end_events"])
+                    self.assertEqual("2026-11-02T09:33:00+08:00",
+                                     result["last_successful_risk_scan"]["at"])
+                    json.dumps(result, allow_nan=False)
+
     def test_missing_file_reports_the_reason_instead_of_raising(self):
         result = PDM.summarize_file(Path(tempfile.gettempdir()) / "no-such-scheduler.log")
         self.assertFalse(result["available"])
