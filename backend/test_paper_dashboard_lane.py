@@ -2,6 +2,7 @@
 import contextlib
 import datetime as dt
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -213,6 +214,23 @@ class DashboardLaneTests(unittest.TestCase):
         self.assertEqual(summary["ticks"]["skipped"], 0)
         self.assertEqual(summary["runs"], {})
         self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+
+    def test_resource_failure_keeps_raw_evidence_for_the_ci_artifact(self):
+        source = Path(__file__).resolve().parents[1] / "scripts/pr11_lane_acceptance.py"
+        spec = importlib.util.spec_from_file_location("lane_probe", source)
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        output = self.root / "failed-probe.json"
+        def reject(image, evidence):
+            evidence.update(phase="assertions", baseline={"raw": [6.1]}, contended={"raw": [8.2]})
+            raise AssertionError("relative interval gate")
+        with mock.patch.object(probe, "host_probe", side_effect=reject), \
+                mock.patch.object(sys, "argv", ["probe", "--output", str(output)]), \
+                self.assertRaisesRegex(AssertionError, "relative interval gate"):
+            probe.main()
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {
+            "ok": False, "phase": "assertions", "baseline": {"raw": [6.1]}, "contended": {"raw": [8.2]},
+        })
 
 
 class DashboardMigrationTests(unittest.TestCase):
