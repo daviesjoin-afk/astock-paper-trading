@@ -200,4 +200,3 @@ def apply_cycle_membership(conn, account_id, *, fields):
         f"UPDATE paper_accounts SET {','.join(f'{c}=?' for c in columns)} WHERE id=?",
         tuple(fields[name] for name in columns) + (account_id,),
     )
-
