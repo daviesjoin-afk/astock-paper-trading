@@ -4791,9 +4791,21 @@
    ]
   },
   {
+   "function": "test_cycle_membership_keeps_cross_field_update_atomic",
+   "kind": "static",
+   "line": 16,
+   "module": "test_paper_account_ledger",
+   "read_refs": [],
+   "role": "test",
+   "sql": "CREATE TABLE paper_accounts(id TEXT PRIMARY KEY,params TEXT, version TEXT NOT NULL,cash REAL NOT NULL,cycle_id INTEGER); INSERT INTO paper_accounts VALUES('a','",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
    "function": "test_restore_rejects_incomplete_snapshot_before_any_cleanup",
    "kind": "static",
-   "line": 18,
+   "line": 44,
    "module": "test_paper_account_ledger",
    "read_refs": [],
    "role": "test",
@@ -4805,7 +4817,7 @@
   {
    "function": "test_omitted_fields_are_preserved_and_explicit_null_fails_atomically",
    "kind": "static",
-   "line": 33,
+   "line": 59,
    "module": "test_paper_account_ledger",
    "read_refs": [],
    "role": "test",
