@@ -39,6 +39,7 @@ import json
 import math
 
 import factor_units as FU
+import paper_account_config as PAC
 import paper_repository as PRP
 import strategy_naming as NAMING
 
@@ -300,10 +301,8 @@ def migrate_legacy_selection_units(conn, *, now_fn=None):
 
         updated = dict(params)
         updated["adaptive_selection"] = normalized_overlay
-        conn.execute(
-            "UPDATE paper_accounts SET params=? WHERE id=?",
-            (json.dumps(updated, ensure_ascii=False), account_id),
-        )
+        PAC.write_params(conn, account_id,
+                         params=json.dumps(updated, ensure_ascii=False))
         for detail in details:
             PRP.audit(
                 conn, account_id, AUDIT_EVENT,

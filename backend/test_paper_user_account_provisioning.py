@@ -7,9 +7,21 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import paper_account_ledger as PAL
 import paper_trading as PT
 import paper_user_account_provisioning as PUAP
 import user_strategy_participation as USP
+
+
+def _sql_literals(source):
+    return [node.value.strip() for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and re.match(r"^(SELECT|INSERT|UPDATE|DELETE|REPLACE)\b", node.value.strip(), re.I)]
+
+
+def _forbidden_account_sql(source):
+    return [sql for sql in _sql_literals(source)
+            if re.search(r"\b(?:DELETE|REPLACE)\b", sql, re.I)]
 
 
 USER_A = "user_alpha"
@@ -224,7 +236,8 @@ class ArchitectureGuardTests(unittest.TestCase):
     def test_module_is_stdlib_free_of_imports_and_forbidden_boundaries(self):
         source = self.MODULE_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        self.assertFalse([node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))])
+        imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+        self.assertEqual(["paper_account_ledger"], [node.module for node in imports])
         forbidden = (
             "paper_trading", "strategy_runtime", "paper_cycle_ownership", "paper_shared_cash",
             "strategy_definitions", "supports_new_cycle", "lifecycle_status", "paper_cycles",
@@ -234,18 +247,20 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         for item in forbidden:
             self.assertNotIn(item, source)
-        sql_literals = [
-            node.value for node in ast.walk(tree)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-            and any(keyword in node.value.upper() for keyword in ("SELECT", "INSERT", "UPDATE", "DELETE"))
-        ]
-        self.assertEqual(2, len(sql_literals))
-        insert_literals = [item for item in sql_literals if "INSERT" in item.upper()]
-        self.assertEqual(1, len(insert_literals))
-        self.assertIn("INSERT INTO paper_accounts", insert_literals[0])
-        self.assertFalse(any(re.search(r"\b(?:UPDATE|DELETE|REPLACE)\b", item, re.I)
-                             for item in sql_literals))
+        # 开户编排只读账户；写入接口属于同一个账户表 owner。
+        self.assertEqual(["SELECT 1 FROM paper_accounts WHERE id=?"], _sql_literals(source))
+        for name in ("insert_account", "ensure_profile", "set_version"):
+            self.assertIs(getattr(PUAP, name), getattr(PAL, name))
+        owner_source = Path(PAL.__file__).read_text(encoding="utf-8")
+        self.assertFalse(_forbidden_account_sql(owner_source))
         self.assertFalse(any(isinstance(node, ast.Call) for node in tree.body))
+
+    def test_delete_and_replace_samples_are_rejected(self):
+        for sql in ("DELETE FROM paper_accounts", "REPLACE INTO paper_accounts(id) VALUES(?)"):
+            with self.subTest(sql=sql):
+                source = f"conn.execute({sql!r})"
+                self.assertEqual([sql], _sql_literals(source))
+                self.assertEqual([sql], _forbidden_account_sql(source))
 
     def test_facade_is_only_a_call_time_delegate_without_inline_sql(self):
         source = self.TRADING_PATH.read_text(encoding="utf-8")

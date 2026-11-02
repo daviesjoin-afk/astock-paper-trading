@@ -663,3 +663,21 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 `execution_planner` 没有新增边：它通过既有的执行依赖容器接收 owner 能力
 （`record_execution_block` / `record_fill_result` / `accumulate_realized_pnl`），
 与 `paper_trading` 的其它注入同一套路。
+
+## 2026-11-01 PR-10 工作包 C：账户配置 owner 的额度登记
+
+`paper_account_config` 成为账户参数/风格/冷却字段的唯一写入入口，五个 adaptive/evolution
+模块各新增一条指向它的显式依赖（`adaptive_engine` / `adaptive_risk` / `adaptive_selection` /
+`adaptive_selection_compat` / `evolution_apply`）。这是"写入归属明确化"的成本，不是新增业务耦合：
+
+| 指标 | C 之前 | C 之后 |
+| --- | --- | --- |
+| `cross_domain_edges` | 631 | 636 |
+| `raw_sql_modules` | 142 | 143 |
+| `paper_table_fanout_max` | 51 | 50 |
+
+`FEATURE_ALLOWANCE` 相应登记（13 → 18、1 → 2），`HEAD_BUDGET` 与 lock 不动。
+
+## 2026-11-02 PR-10 C 复审修复
+
+账户表持久化改由 paper_account_ledger 统一执行；四个业务模块保留业务职责及兼容入口。新增指向该模块的依赖均在 paper 域内部，不增加 cross_domain_edges，不改变域分类或制造注入桥。已审核七条跨域边成本的正确起点是 A 之前的 629，终点 636；618 是 HEAD_BUDGET 历史基数。FEATURE_ALLOWANCE 的增加确实提高有效上限，属于已审核例外，不能用 lock 未变来声称预算未放宽。逐表引用分散度另行列证。

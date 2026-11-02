@@ -8,6 +8,8 @@ creates orders and never connects to a broker.
 """
 from __future__ import annotations
 
+import paper_account_config as PAC
+
 import dataclasses
 import datetime as dt
 import hashlib
@@ -1128,10 +1130,8 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="cons
                 "effective_at": now,
                 "source_regime": candidate["regime"],
             }
-            paper.execute(
-                "UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?",
-                (_json(account_params), version, now, candidate["account_id"]),
-            )
+            PAC.write_params(paper, candidate["account_id"], params=_json(account_params),
+                             version=version, now=now)
             paper.execute(
                 """INSERT INTO paper_parameter_versions(
                    cycle_id,account_id,version,style,params,reason,effective_date,created_at)
@@ -1275,10 +1275,8 @@ def _finish_rollback(conn, paper_db_path, candidate, payload, now_fn):
             (account_id, version),
         ).fetchone()
         if not existing_version:
-            paper.execute(
-                "UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?",
-                (_json(previous), version, now, account_id),
-            )
+            PAC.write_params(paper, account_id, params=_json(previous),
+                             version=version, now=now)
             paper.execute(
                 """INSERT INTO paper_parameter_versions(
                    cycle_id,account_id,version,style,params,reason,effective_date,created_at)

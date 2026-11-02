@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 """Attach and detach already-provisioned user strategy ledger rows."""
+import paper_account_ledger as PAL
+from paper_account_ledger import detach_cycle, set_cycle_capital, set_status
+
+__all__ = ["detach_cycle", "set_cycle_capital", "set_status", "reconcile_user_cycle_accounts"]
 
 
 def _row(conn, sql, params=()):
@@ -38,10 +42,7 @@ def reconcile_user_cycle_accounts(
             continue
         user_spec = spec_for(account_id)
         if account_id not in enabled and row["cycle_id"] == cycle_id:
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-                (now_fn(), account_id),
-            )
+            detach_cycle(conn, account_id, now=now_fn())
             continue
         if row["cycle_id"] is None and account_id in enabled:
             capital = num_fn(cycle["capital"], 100000.0)
@@ -51,12 +52,13 @@ def reconcile_user_cycle_accounts(
                 else available_capital_fn(account_id)
             )
             benchmark = benchmark_fn()
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?,max_positions=?,max_weight=?,max_exposure=?,updated_at=? WHERE id=?",
-                (cycle_id, user_spec["mode"], user_spec["default_style"], cycle["status"],
-                 account_capital, account_capital, benchmark, account_capital, date_fn().isoformat(),
-                 user_spec["risk_profile"], user_spec["strategy_version"], user_spec["max_positions"],
-                 user_spec["max_weight"], user_spec["max_exposure"], now_fn(), account_id),
+            PAL.initialize_user_cycle(
+                conn, account_id, cycle_id=cycle_id, mode=user_spec["mode"],
+                style=user_spec["default_style"], status=cycle["status"],
+                capital=account_capital, benchmark=benchmark, nav_date=date_fn().isoformat(),
+                risk_profile=user_spec["risk_profile"], version=user_spec["strategy_version"],
+                max_positions=user_spec["max_positions"], max_weight=user_spec["max_weight"],
+                max_exposure=user_spec["max_exposure"], now=now_fn(),
             )
             conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
             conn.execute(

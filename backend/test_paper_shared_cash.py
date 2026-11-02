@@ -9,6 +9,7 @@ import sqlite3
 import unittest
 from unittest import mock
 
+import paper_account_ledger as PAL
 import paper_shared_cash as PSC
 import paper_trading as PT
 
@@ -395,7 +396,7 @@ class SharedCashArchitectureGuardTests(unittest.TestCase):
                 roots.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 roots.add(node.module.split(".")[0])
-        self.assertEqual({"__future__", "math", "paper_cycle_ownership"}, roots)
+        self.assertEqual({"__future__", "math", "paper_cycle_ownership", "paper_account_ledger"}, roots)
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute)
                  and isinstance(node.func.value, ast.Name) and node.func.value.id == "PCY"]
@@ -417,12 +418,26 @@ class SharedCashArchitectureGuardTests(unittest.TestCase):
             and isinstance(node.value, str)
             and node.value.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "PRAGMA"))
         ]
-        self.assertEqual(2, len(sql))
+        self.assertEqual([], sql)
+        owner_source = "\n".join(inspect.getsource(fn) for fn in (PAL.debit_cash, PAL.apply_cash_delta))
+        self._assert_cash_writes(owner_source)
+        for name in ("debit_shared_cash", "credit_shared_cash", "adjust_cash"):
+            self.assertIn("PAL.", inspect.getsource(getattr(PSC, name)))
+
+    def _assert_cash_writes(self, source):
+        sql = [node.value.strip().upper() for node in ast.walk(ast.parse(source))
+               if isinstance(node, ast.Constant) and isinstance(node.value, str)
+               and node.value.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))]
+        self.assertTrue(sql)
         for statement in sql:
             self.assertTrue(statement.startswith("UPDATE PAPER_ACCOUNTS SET CASH="), statement)
             self.assertIn("UPDATED_AT", statement)
             self.assertIn("WHERE ID=?", statement)
             self.assertNotIn("INITIAL_CASH", statement)
+
+    def test_cash_guard_rejects_cross_field_write(self):
+        with self.assertRaises(AssertionError):
+            self._assert_cash_writes('conn.execute("UPDATE paper_accounts SET cash=?,initial_cash=?,updated_at=? WHERE id=?")')
 
     def test_module_has_no_import_time_business_calls(self):
         tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))

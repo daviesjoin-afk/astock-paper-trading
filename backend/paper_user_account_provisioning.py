@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Materialize missing user strategy ledger identities."""
+"""账户开户业务编排；账户写入统一交给 paper_account_ledger。"""
+from paper_account_ledger import ensure_profile, insert_account, set_version
+
+__all__ = ["ensure_profile", "insert_account", "set_version", "provision_user_accounts"]
 
 
 def provision_user_accounts(conn, participant_ids, *, spec_for, now_fn, audit_fn):
@@ -10,14 +13,14 @@ def provision_user_accounts(conn, participant_ids, *, spec_for, now_fn, audit_fn
             continue
         spec = spec_for(account_id)
         now = now_fn()
-        conn.execute(
-            """INSERT INTO paper_accounts
-            (id,name,source_strategy,status,initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,
-             risk_profile,version,benchmark_start,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (account_id, spec["name"], spec["source_strategy"], "paused", 0.0, 0.0,
-             spec["cycle_days"], spec["max_positions"], spec["max_weight"], spec["max_exposure"],
-             spec["risk_profile"], spec["strategy_version"], None, now, now),
-        )
+        insert_account(conn, fields={
+            "id": account_id, "name": spec["name"],
+            "source_strategy": spec["source_strategy"], "status": "paused",
+            "initial_cash": 0.0, "cash": 0.0, "cycle_days": spec["cycle_days"],
+            "max_positions": spec["max_positions"], "max_weight": spec["max_weight"],
+            "max_exposure": spec["max_exposure"], "risk_profile": spec["risk_profile"],
+            "version": spec["strategy_version"], "benchmark_start": None,
+            "created_at": now, "updated_at": now,
+        })
         audit_fn(conn, account_id, "user_strategy_account_provisioned",
                  f"用户策略 {spec['name']} 已开户（paused，等待周期分配资金；DSL v{spec['dsl_version']}）")

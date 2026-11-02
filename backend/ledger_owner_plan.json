@@ -1,60 +1,95 @@
 {
  "operations": {
-  "adaptive_engine::_restore_paper_account": {
-   "judge": "adaptive_engine 回滚规则",
-   "operation": "参数回滚恢复（params/version）",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_risk::_finish_rollback": {
-   "judge": "adaptive_risk 回滚规则",
-   "operation": "风险自适应参数回滚收尾",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_risk::apply_candidate": {
-   "judge": "adaptive_risk 采纳规则",
-   "operation": "风险自适应候选参数应用",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_selection::_finish_rollback": {
-   "judge": "adaptive_selection 回滚规则",
-   "operation": "选择自适应参数回滚收尾",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_selection::apply_candidate": {
-   "judge": "adaptive_selection 采纳规则",
-   "operation": "选择自适应候选参数应用",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "adaptive_selection_compat::migrate_legacy_selection_units": {
-   "judge": "兼容迁移规则",
-   "operation": "legacy 参数单位迁移",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "服务入口传入的连接"
-  },
-  "evolution_apply::write_account_params": {
-   "judge": "evolution_apply 版本检查",
-   "operation": "进化结果参数写入",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
   "manual_orders::_terminalize_cycle_stale_order": {
    "judge": "manual_orders 周期归属判定",
    "operation": "周期切换时终止跨周期残留委托",
    "single_owner": "paper_order_ledger",
    "single_package": "D",
    "transaction": "服务入口传入的连接"
+  },
+  "paper_account_ledger::apply_cash_delta": {
+   "judge": "paper_trading 现金对账口径",
+   "operation": "账户现金增量调整（对账补偿）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::debit_cash": {
+   "judge": "paper_shared_cash 资金规则",
+   "operation": "共享现金扣减",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::detach_cycle": {
+   "judge": "paper_trading 周期引导/创建",
+   "operation": "账户退出周期（cycle_id 清空 + 暂停 + 资金归零）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::ensure_profile": {
+   "judge": "账号引导规则",
+   "operation": "既有账户档案字段补齐（mode 为空才写默认）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "启动引导 / 调用方同一连接与原事务"
+  },
+  "paper_account_ledger::initialize_user_cycle": {
+   "judge": "账户挂接规则",
+   "operation": "用户账户周期挂接对账",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "服务入口传入的连接"
+  },
+  "paper_account_ledger::insert_account": {
+   "judge": "账号引导与 provisioning 规则",
+   "operation": "账户创建（内置/用户策略，列白名单）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "启动引导 / 调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_cooldown": {
+   "judge": "paper_trading 风控状态",
+   "operation": "共享风控冷却窗口写入",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_cycle_capital": {
+   "judge": "配置入口校验",
+   "operation": "周期资金配置（初始资金/现金/基准净值）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_status": {
+   "judge": "启停入口校验",
+   "operation": "账户启停状态（活动周期过滤）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_style": {
+   "judge": "配置入口校验",
+   "operation": "账户风格字段写入",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_version": {
+   "judge": "账号引导规则",
+   "operation": "新策略首次版本号写入",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "启动引导 / 调用方同一连接与原事务"
+  },
+  "paper_account_ledger::write_params": {
+   "judge": "adaptive/evolution/周度复盘各自的采纳与回滚判定",
+   "operation": "账户参数快照/版本/时间戳写入",
+   "single_owner": "paper_account_ledger",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
   },
   "paper_cycle_service::archive_cycle": {
    "judge": "归档入口规则",
@@ -210,20 +245,6 @@
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
-  "paper_shared_cash::credit_shared_cash": {
-   "judge": "paper_shared_cash 资金规则",
-   "operation": "共享现金回补",
-   "single_owner": "paper_shared_cash",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_shared_cash::debit_shared_cash": {
-   "judge": "paper_shared_cash 资金规则",
-   "operation": "共享现金扣减",
-   "single_owner": "paper_shared_cash",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_trading::_cleanup_stale_data": {
    "judge": "paper_trading 归档策略",
    "operation": "归档/清理超龄信号行（DELETE）",
@@ -241,20 +262,13 @@
    },
    "transaction": "启动恢复/初始化连接"
   },
-  "paper_trading::_ensure_accounts": {
-   "judge": "paper_trading 账户引导",
-   "operation": "内置账户创建与字段补齐",
-   "single_owner": "paper_user_account_provisioning",
-   "single_package": "C",
-   "transaction": "启动恢复/初始化连接"
-  },
   "paper_trading::_ensure_cycle": {
    "judge": "paper_trading 兼容引导",
    "operation": "legacy 周期引导创建（INSERT）",
    "targets": {
     "paper_accounts": {
      "operation": "legacy 引导：账户 cycle_id 清空与暂停",
-     "owner": "paper_user_cycle_attachment",
+     "owner": "paper_account_ledger",
      "package": "C"
     },
     "paper_cycles": {
@@ -265,42 +279,11 @@
    },
    "transaction": "启动恢复/初始化连接"
   },
-  "paper_trading::_reconcile_shared_cash": {
-   "judge": "paper_trading 现金对账口径",
-   "operation": "共享现金对账调整",
-   "single_owner": "paper_shared_cash",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::_shared_risk_state": {
-   "judge": "paper_trading 风控状态",
-   "operation": "账户冷却窗口 cooldown_until",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::_weekly_review": {
-   "judge": "周度复盘结论",
-   "operation": "周度参数应用（params/version）",
-   "single_owner": "paper_account_config",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
   "paper_trading::configure_capital": {
    "judge": "配置入口校验",
    "operation": "周期资金配置（capital）",
-   "targets": {
-    "paper_accounts": {
-     "operation": "周期资金配置（账户侧现金/基准净值）",
-     "owner": "paper_shared_cash",
-     "package": "C"
-    },
-    "paper_cycles": {
-     "operation": "周期资金配置（capital）",
-     "owner": "paper_cycle_service",
-     "package": "D"
-    }
-   },
+   "single_owner": "paper_cycle_service",
+   "single_package": "D",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_trading::create_cycle": {
@@ -309,7 +292,7 @@
    "targets": {
     "paper_accounts": {
      "operation": "新建周期时账户挂接重置",
-     "owner": "paper_user_cycle_attachment",
+     "owner": "paper_account_ledger",
      "package": "C"
     },
     "paper_cycles": {
@@ -323,40 +306,16 @@
   "paper_trading::set_account_style": {
    "judge": "配置入口校验",
    "operation": "账户风格字段",
-   "single_owner": "paper_account_config",
+   "single_owner": "paper_account_ledger",
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_trading::set_accounts_status": {
    "judge": "启停入口校验",
    "operation": "周期启停状态/started_at",
-   "targets": {
-    "paper_accounts": {
-     "operation": "账户启停状态字段",
-     "owner": "paper_user_cycle_attachment",
-     "package": "C"
-    },
-    "paper_cycles": {
-     "operation": "周期启停状态/started_at",
-     "owner": "paper_cycle_service",
-     "package": "D"
-    }
-   },
+   "single_owner": "paper_cycle_service",
+   "single_package": "D",
    "transaction": "调用方同一连接与原事务"
-  },
-  "paper_user_account_provisioning::provision_user_accounts": {
-   "judge": "provisioning 规则",
-   "operation": "用户策略账户创建（INSERT）",
-   "single_owner": "paper_user_account_provisioning",
-   "single_package": "C",
-   "transaction": "服务入口传入的连接"
-  },
-  "paper_user_cycle_attachment::reconcile_user_cycle_accounts": {
-   "judge": "账户挂接规则",
-   "operation": "用户账户周期挂接对账",
-   "single_owner": "paper_user_cycle_attachment",
-   "single_package": "C",
-   "transaction": "服务入口传入的连接"
   },
   "signal_service::advance_signal_feedback": {
    "judge": "paper_trading 执行循环",
@@ -518,6 +477,11 @@
    "package": "C",
    "scope": "paper_accounts 参数/版本/风格/限额/冷却字段",
    "status": "planned"
+  },
+  "paper_account_ledger": {
+   "package": "C",
+   "scope": "paper_accounts 全表唯一持久化入口；业务判断保留在现金/开户/周期/配置模块",
+   "status": "existing"
   },
   "paper_cycle_service": {
    "package": "D",

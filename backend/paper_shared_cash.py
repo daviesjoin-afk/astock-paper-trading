@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 
+import paper_account_ledger as PAL
+
 import paper_cycle_ownership as PCY
 
 
@@ -109,10 +111,7 @@ def debit_shared_cash(
     for row in ordered_rows:
         debit = min(max(0.0, num_fn(row.get("cash"))), remaining)
         if debit:
-            conn.execute(
-                "UPDATE paper_accounts SET cash=cash-?,updated_at=? WHERE id=?",
-                (debit, now_fn(), row["id"]),
-            )
+            PAL.debit_cash(conn, row["id"], amount=debit, now=now_fn())
             remaining -= debit
         if remaining <= 1e-6:
             break
@@ -156,7 +155,9 @@ def credit_shared_cash(
         raise ValueError(
             f"_credit_shared_cash 收到负数金额 {amount}（account={account_id}），疑似上游计算错误"
         )
-    conn.execute(
-        "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
-        (amount, now_fn(), account_id),
-    )
+    PAL.apply_cash_delta(conn, account_id, delta=amount, now=now_fn())
+
+
+def adjust_cash(conn, account_id, *, delta, now):
+    """按增量调整单个账户现金（对账补偿用）；时间戳由调用方给出。"""
+    PAL.apply_cash_delta(conn, account_id, delta=delta, now=now)

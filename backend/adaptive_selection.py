@@ -2,6 +2,8 @@
 """Bounded evolution of paper-account candidate ranking models."""
 from __future__ import annotations
 
+import paper_account_config as PAC
+
 import dataclasses
 import datetime as dt
 import hashlib
@@ -602,8 +604,8 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
                 "effective_date": effective, "approved_by": approved_by,
                 "source_regime": item["regime"], "tier": item["tier"],
             }
-            paper.execute("UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?",
-                          (_json(account_params), version, now_fn(), item["account_id"]))
+            PAC.write_params(paper, item["account_id"], params=_json(account_params),
+                             version=version, now=now_fn())
             paper.execute(
                 """INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at)
                    VALUES(?,?,?,?,?,?,?,?)""",
@@ -707,8 +709,8 @@ def _finish_rollback(conn, paper_db_path, candidate_id, payload, now_fn):
             # 更早的 live params 快照）。这里同样是"写 live 之前"的兼容边界，
             # 只修已证实的 legacy sentinel，不改写 outbox payload 历史。
             restored, _unit_fixes = UNIT_COMPAT.normalize_legacy_account_params(previous)
-            paper.execute("UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?",
-                          (_json(restored), version, now_fn(), account_id))
+            PAC.write_params(paper, account_id, params=_json(restored),
+                             version=version, now=now_fn())
             paper.execute(
                 """INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at)
                    VALUES(?,?,?,?,?,?,?,?)""",
