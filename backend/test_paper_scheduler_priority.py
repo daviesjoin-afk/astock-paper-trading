@@ -219,6 +219,48 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(["paper_host_lock"], [event["event"] for event in events])
 
     # ── PR-11 B：风险快通道的独立主机锁 ────────────────────────────────────
+    def test_execution_lane_runs_while_candidate_and_risk_locks_are_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locks").mkdir()
+            runner = self._risk_runner(root)
+            (root / "locks" / "full-scan-pending.1234").touch()
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            holder = subprocess.Popen(
+                ["flock", str(root / "locks" / "paper-scan.lock"), "flock",
+                 str(root / "locks" / "risk-scan.lock"), "sh", "-c", "echo ready; read release"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual("ready", holder.stdout.readline().strip())
+                result = subprocess.run(["bash", str(runner), "execution-resume"],
+                                        env=env, text=True, capture_output=True, timeout=3)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn("--slot execution-resume", (root / "docker-call").read_text())
+                self.assertEqual(1, len(list((root / "locks").glob("full-scan-pending.*"))))
+            finally:
+                holder.communicate("release\n", timeout=3)
+
+    def test_execution_lane_refuses_its_own_busy_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locks").mkdir()
+            runner = self._risk_runner(root)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            holder = subprocess.Popen(
+                ["flock", str(root / "locks" / "execution-scan.lock"), "sh", "-c", "echo ready; read release"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual("ready", holder.stdout.readline().strip())
+                result = subprocess.run(["bash", str(runner), "execution-resume"],
+                                        env=env, text=True, capture_output=True, timeout=3)
+                self.assertEqual(1, result.returncode)
+                event = json.loads(result.stderr)
+                self.assertEqual("execution-resume", event["slot"])
+                self.assertEqual("not_acquired", event["status"])
+                self.assertFalse((root / "docker-call").exists())
+            finally:
+                holder.communicate("release\n", timeout=3)
+
     def _risk_runner(self, root):
         source = Path(__file__).resolve().parents[1] / "deploy" / "run_paper_slot.sh"
         runner = root / "runner.sh"

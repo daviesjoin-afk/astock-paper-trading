@@ -15,8 +15,26 @@ import execution_dispatch as EPD
 
 
 import paper_schedule_contract as PSch
+import paper_risk_scan_state as PRSS
 
 SUPPORTED_SLOTS = frozenset(PSch.RUN_SLOTS)
+
+
+def run_execution_resume(day, *, monitor_risk: Callable, resume_orders: Callable) -> dict:
+    """Resume approved orders after the same-window risk pass settles.
+
+    No candidate refresh or approval happens here. The execution function
+    fetches fresh quotes outside the writer transaction and owns all fills.
+    """
+    risk = monitor_risk(day)
+    if not PRSS.result_is_settled(risk):
+        return PRSS.blocked_round_result(
+            slot="execution-resume", date=day.isoformat(), risk=risk,
+            reason="风控扫描未完成：本轮不恢复已批准委托",
+            extra={"execution_orders": [], "retry_reason": "risk_in_progress"},
+        )
+    return {"status": "ok", "slot": "execution-resume", "date": day.isoformat(),
+            "risk": risk, "execution_orders": resume_orders(day)}
 
 
 def validate_slot(slot: str) -> str:

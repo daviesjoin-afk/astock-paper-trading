@@ -437,24 +437,13 @@ def _assert_active_lease(*args, **kwargs):
 def _intraday_business_key(now=None):
     """Return one idempotency key for the normalized three-minute window."""
     now = now if isinstance(now, dt.datetime) else dt.datetime.now()
-    minute = (now.minute // INTRADAY_INTERVAL_MINUTES) * INTRADAY_INTERVAL_MINUTES
-    bucket = now.replace(minute=minute, second=0, microsecond=0)
-    return f"intraday:{bucket.strftime('%Y%m%d%H%M')}"
+    return PSch.window_run_key("intraday", now)
 
 
 def _risk_business_key(now=None):
-    """Return one idempotency key for the risk lane's three-minute window.
-
-    PR-11 B：风险快通道每三分钟一跳，运行身份必须是**窗口**而不是当日。风险
-    以前没有独立 cron 条目，``paper_jobs`` 里一行当日记录就够了；一旦重复触发，
-    当天第一跳成功之后每一跳都会命中 ``already_done``，节拍直接停在早上第一
-    分钟。取整规则与 :func:`_intraday_business_key` 完全一致，两个 lane 的窗口
-    边界因此永远对齐，同一窗口内不可能出现两条并行记录。
-    """
+    """Risk uses the same window grid as intraday and execution-resume."""
     now = now if isinstance(now, dt.datetime) else dt.datetime.now()
-    minute = (now.minute // INTRADAY_INTERVAL_MINUTES) * INTRADAY_INTERVAL_MINUTES
-    bucket = now.replace(minute=minute, second=0, microsecond=0)
-    return f"risk:{bucket.strftime('%Y%m%d%H%M')}"
+    return PSch.window_run_key("risk", now)
 
 
 #: 对端仍在跑风控时的最大等待与轮询间隔（秒）；超时即 fail-closed。
@@ -470,8 +459,8 @@ def _slot_run_key(slot, now=None):
     """重复触发 lane 的窗口身份；一次性 slot 返回 ``None``（按当日幂等）。"""
     if slot == "intraday":
         return _intraday_business_key(now)
-    if slot == "risk":
-        return _risk_business_key(now)
+    if slot in {"risk", "execution-resume"}:
+        return _risk_business_key(now).replace("risk:", f"{slot}:", 1)
     return None
 
 
@@ -9517,7 +9506,7 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
             extra={"expired": 0, "execution_orders": []},
         )
     if execution_orders is None:
-        execution_orders = process_pending_execution_orders(day)
+        execution_orders = []  # P11-C：已批准委托统一由独立 lane 恢复。
     # P3 审计修复（2026-09-03）：开盘 slot 与 monitor_intraday 一样先做
     # 轻量数据源探活。此前 09:31 只拉快照而不探活，入场门禁
     # _entry_freeze_status 读到的仍是上一交易日收盘的 data_source_health
@@ -11877,7 +11866,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             reason=f"风控扫描未完成（{risk_result.get('status')}）：本轮跳过委托恢复与候选扫描",
             extra={"execution_orders": []},
         )
-    execution_orders = process_pending_execution_orders(day)
+    execution_orders = []  # P11-C：候选扫描不再重复恢复独立 lane 的委托。
     # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
     with PTM.phase("market_snapshot"):
         live_universe = _validated_live_universe(
@@ -12787,7 +12776,7 @@ def _run_slot_impl(slot, day, force=False):
     # 挂在全局租约下，等于让风险 pass 排在日内监控/候选扫描后面——那条 lane
     # 就只是"多了一条 cron"，不是独立边界。其它 slot 仍然共用
     # ``paper-runner-global``，并发没有被整体放宽。
-    runtime_lock_key = "paper-runner-risk" if slot == "risk" else "paper-runner-global"
+    runtime_lock_key = {"risk": "paper-runner-risk", "execution-resume": "paper-runner-execution"}.get(slot, "paper-runner-global")
     # H6: 租约 TTL 必须 ≥ 2× 最大单轮耗时，否则扫描尚未结束租约即过期，
     # 下一轮 cron 会抢到过期租约与未结束的 run 并发写候选/订单。
     # - auction/open 为秒级~分钟级任务：300s/600s 足够，且即使释放失败，
@@ -12808,7 +12797,7 @@ def _run_slot_impl(slot, day, force=False):
     #   intraday 的 monitor_risk 兜底仍在跑同一分钟的风控，不会留下盲区。
     runtime_lock_ttl = {
         "auction": 300, "open": 600, "risk": 900, "close": 2400,
-        "weekly-review": 2400, "intraday": 300,
+        "weekly-review": 2400, "intraday": 300, "execution-resume": 600,
     }.get(slot, 600)
     owner_seed = f"{slot}:{day.isoformat()}:{run_key or 'daily'}:{os.getpid()}:{_now()}"
     runtime_owner = hashlib.sha1(owner_seed.encode("utf-8")).hexdigest()[:20]
@@ -12862,6 +12851,8 @@ def _run_slot_impl(slot, day, force=False):
             # 失败任务由同一时段的兜底计划自动重试两次；成功任务仍严格幂等。
             # force 保留给人工诊断，但不会无限自动重跑失败任务。
             if not (retryable and (force or retry_count < max_auto_retries)):
+                if slot == "execution-resume" and exists["status"] != "completed":
+                    return {"status": "in_progress" if exists["status"] == "running" else exists["status"], "slot": slot, "date": day.isoformat()}
                 return {"status": "already_done", "slot": slot, "date": day.isoformat(), "detail": _loads(exists["detail"], {})}
             retry_count += 1
             retry_detail = {
@@ -12970,6 +12961,8 @@ def _run_slot_impl(slot, day, force=False):
             detail = execute_open(day)
         elif slot == "risk":
             detail = monitor_risk(day)
+        elif slot == "execution-resume":
+            detail = PSS.run_execution_resume(day, monitor_risk=monitor_risk, resume_orders=process_pending_execution_orders)
         elif slot == "close":
             detail = generate_signals(day)
             # Fetch the closing mark before opening the NAV write transaction;
@@ -14431,7 +14424,11 @@ def schedule_status():
             ORDER BY COALESCE(finished_at,started_at) DESC
             LIMIT 12
         """, (f"risk:{today.replace('-', '')}%",))
-    failed = [row for row in latest + intraday + risk_runs
+        execution_runs = query_rows(conn, """
+            SELECT run_key,status,started_at,finished_at,detail FROM paper_job_runs
+            WHERE run_key LIKE ? ORDER BY COALESCE(finished_at,started_at) DESC LIMIT 12
+        """, (f"execution-resume:{today.replace('-', '')}%",))
+    failed = [row for row in latest + intraday + risk_runs + execution_runs
               if row.get("status") == "failed"]
     return {
         "installed": len(found) == len(names),
@@ -14440,8 +14437,9 @@ def schedule_status():
         "latest_runs": latest,
         "latest_intraday_runs": intraday,
         "latest_risk_runs": risk_runs,
+        "latest_execution_runs": execution_runs,
         "runtime_status": "异常" if failed else (
-            "已执行" if latest or intraday or risk_runs else "等待首个任务"),
+            "已执行" if latest or intraday or risk_runs or execution_runs else "等待首个任务"),
         "runtime_failed_count": len(failed),
         # PR-11：tick / 跳过 / 队列年龄 / 上次风险成功；日志不可读时 available=False。
         "dispatch": dispatch_status(),

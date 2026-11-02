@@ -56,7 +56,7 @@ class RiskWindowKeyTests(unittest.TestCase):
         with open(PT.__file__, encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn("run_key = _slot_run_key(slot, run_asof)", text)
-        self.assertIn('"paper-runner-risk" if slot == "risk" else "paper-runner-global"', text)
+        self.assertIn('"risk": "paper-runner-risk"', text)
 
 
 class RiskLaneRuntimeTests(PaperRiskExitProductionPathTestCase):
@@ -340,7 +340,7 @@ class OpenSlotRiskGateTests(PaperRiskExitProductionPathTestCase):
         with mock.patch.object(PT, "init_db"),                 mock.patch.object(PT, "monitor_risk",
                                   return_value={"orders": [], "manual_orders": []}),                 mock.patch.object(PT, "process_pending_execution_orders", resume),                 mock.patch.object(PT.dfc, "check_data_source_health", return_value={}),                 mock.patch.object(PT, "_entry_freeze_status", return_value={}),                 mock.patch.object(PT.MDSvc, "refresh_rows", return_value=[]):
             result = PT.execute_open(self.day)
-        resume.assert_called_once()
+        resume.assert_not_called()
         self.assertNotEqual("risk_in_progress", result.get("status"))
 
 

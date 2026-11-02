@@ -32,15 +32,15 @@ class _Conn:
 
 
 class SlotContractTests(unittest.TestCase):
-    def test_supported_slots_are_exactly_the_legacy_set(self):
+    def test_supported_slots_include_the_execution_lane(self):
         self.assertEqual(PSS.SUPPORTED_SLOTS, frozenset({
-            "auction", "open", "risk", "close", "weekly-review", "intraday",
+            "auction", "open", "risk", "execution-resume", "close", "weekly-review", "intraday",
         }))
 
     def test_invalid_slot_keeps_legacy_error(self):
         with self.assertRaisesRegex(
             ValueError,
-            "slot 必须是 auction、open、risk、close、weekly-review 或 intraday",
+            "slot 必须是 auction、open、risk、execution-resume、close、weekly-review 或 intraday",
         ):
             PSS.validate_slot("unknown")
 

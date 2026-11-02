@@ -46,7 +46,7 @@ class ExecuteOpenRiskReuseTests(unittest.TestCase):
         with mock.patch.object(PT, "init_db"), \
                 mock.patch.object(PT, "monitor_risk",
                                   side_effect=AssertionError("execute_open 重跑了 monitor_risk")), \
-                mock.patch.object(PT, "process_pending_execution_orders",
+                mock.patch.object(PT, "_live_scan_gate",
                                   side_effect=_StopDownstream()):
             with self.assertRaises(_StopDownstream):
                 PT.execute_open("2026-10-29", risk_result=risk)

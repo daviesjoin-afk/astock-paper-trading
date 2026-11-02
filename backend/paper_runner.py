@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """供定时任务调用的单次模拟盘任务。"""
 import argparse
+import datetime as dt
 import json
 import time
 
+from paper_schedule_contract import is_hot_path, window_run_key
 import paper_timing as PTM
 
 
@@ -43,8 +45,31 @@ def main():
         return _run(args.slot)
 
 
+def _run_slot_with_risk_retry(paper, slot):
+    """The cron-launched process retries risk deferrals twice, in this window.
+
+    run_slot has already finalized the failed attempt and released its lease
+    and writer transaction before we sleep. Its durable retry budget and all
+    risk/cycle/fill fences still apply; no force flag is passed.
+    """
+    if slot != "execution-resume":
+        return paper.run_slot(slot)
+    window = window_run_key(slot, dt.datetime.now())
+    result = paper.run_slot(slot)
+    for _retry in range(2):
+        if (result.get("status") != "failed"
+                or result.get("retry_reason") != "risk_in_progress"
+                or window_run_key(slot, dt.datetime.now()) != window):
+            break
+        with PTM.phase("execution_risk_retry_backoff"):
+            time.sleep(10)
+        if window_run_key(slot, dt.datetime.now()) != window:
+            break
+        result = paper.run_slot(slot)
+    return result
+
+
 def _run(slot):
-    from paper_schedule_contract import is_hot_path
     if slot == "auction-track":
         import auction_tracking
         result = auction_tracking.run()
@@ -62,7 +87,7 @@ def _run(slot):
             result = (
                 paper.monitor_fast_entries()
                 if slot == "fast-entry"
-                else paper.run_slot(slot)
+                else _run_slot_with_risk_retry(paper, slot)
             )
             PTM.outcome(result.get("status", "unknown"))
             result = {**result, "timing": PTM.snapshot("runner_result")}
