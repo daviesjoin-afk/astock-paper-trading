@@ -335,13 +335,24 @@ CI的 `scripts/pr11_lane_acceptance.py` 在独立断网Docker中使用有效prof
 - 过期只处理本来可认领的请求或失效租约；有效租约不被队列年龄抢占，失败退避
   仍保留。运行期间的显式跟进请求沿用自己的首次请求时间，重复请求不重置年龄。
   无法解析或来自未来的请求时间不具备年龄证据，记录 `invalid_requested_at` 后过期。
+- **等待口径只算"等待被认领"的时间，运行耗时永不计入**，四种情形分别界定：
+  运行中且有有效租约 → 年龄止于认领时刻（`started_at`）；运行中收到跟进请求 →
+  按该请求自己的 `requested_at`；已运行后失败 → 本次等待从**失败时刻**重新起算
+  （250秒运行 + 60秒退避 = 等待60秒，不是310秒）；排队中或租约失效的孤儿认领 →
+  按 `requested_at`，防止无计划重试的陈旧意图被重新唤起。失败后的重试因此在
+  墙钟上可以超过300秒仍在推进——限制的是单次等待，不是持续重试的总时长；
+  退避60秒与并发上限1不变。
 - 后续正常 automatic / explicit / ensure 请求可以重新排队；刷新仍读取当时最新状态。
   不因每次轮询自动重排已过期请求，不承诺资源持续繁忙时仍能完成展示刷新。
 - Schema v42 只升级展示队列表的状态约束和过期计数。v41的16个字段全部保留，
   包括活动 owner、fence、请求版本及跟进请求，不修改交易表、不自行 commit；
   回滚后原表和原活动行保持。发布、心跳及失败重试事务边界不改。
 - 主机入口 `deploy/run_snapshot_refresh.sh` 保留非阻塞资源锁；锁忙时输出
-  `dashboard_refresh / skipped / resource_busy`，不再静默跳过。应用侧记录
+  `dashboard_refresh / skipped / resource_busy`，不再静默跳过。锁目录**由脚本自身
+  路径推导**：`<root>/deploy/run_snapshot_refresh.sh` → `<root>/.locks`，与
+  `sync-cron.sh` 渲染 cron 时的根目录改写同源，因此非 `/opt/astock-codex` 部署
+  （如 `/root/codex`）下展示刷新与 selection/history 仍争用同一个
+  `resource-heavy.lock`；`ASTOCK_LOCK_DIR` 仍可显式覆盖。应用侧记录
   `already_running`、`retry_backoff`、`queue_age_exceeded` 等原因；展示事件不混入
   交易启动数、交易跳过数或成功风控统计。
 

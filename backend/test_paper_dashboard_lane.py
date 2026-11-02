@@ -106,9 +106,73 @@ class DashboardLaneTests(unittest.TestCase):
             Owner.fail_snapshot_refresh(conn, owner="live", fencing_token=job["fencing_token"],
                                         now=self.stamp(), retry_at=self.stamp(60), error="upstream")
         self.assertEqual(Jobs.run_refresh_job(self.db, provider)["reason"], "retry_backoff")
-        self.now += dt.timedelta(seconds=60)
-        self.assertEqual(Jobs.run_refresh_job(self.db, provider)["reason"], "queue_age_exceeded")
         provider.assert_not_called()
+        self.now += dt.timedelta(seconds=60)
+        # The retry is due again. Its wait is the 60s backoff that just elapsed,
+        # not the 361s since the original request, so it must run rather than be
+        # expired; the provider mock publishes nothing, so the attempt fails.
+        self.assertEqual(Jobs.run_refresh_job(self.db, provider)["status"], "failed")
+        provider.assert_called_once()
+
+    def slow_failed_attempt(self, seconds, owner="slow"):
+        """Claim, renew the lease like the heartbeat thread, then fail.
+
+        Simulating the real worker matters: a 250s provider run only fails
+        cleanly because heartbeats keep the 120s lease alive. Expiring the lease
+        instead would test ``lease_lost``, not the queue-age rule.
+        """
+        with self.db(immediate=True) as conn:
+            job = Owner.claim_snapshot_refresh(conn, owner=owner, now=self.stamp(), expires_at=self.stamp(120))
+        remaining = seconds
+        while remaining:
+            step = min(60, remaining)
+            self.now += dt.timedelta(seconds=step)
+            remaining -= step
+            if remaining:  # still working: renew before the lease can lapse
+                with self.db(immediate=True) as conn:
+                    self.assertTrue(Owner.renew_snapshot_refresh(
+                        conn, owner=owner, fencing_token=job["fencing_token"],
+                        now=self.stamp(), expires_at=self.stamp(120)))
+        with self.db(immediate=True) as conn:
+            self.assertTrue(Owner.fail_snapshot_refresh(
+                conn, owner=owner, fencing_token=job["fencing_token"],
+                now=self.stamp(), retry_at=self.stamp(60), error="provider down"))
+
+    def test_provider_run_time_is_not_charged_to_the_retry_wait(self):
+        # 10:00 request -> 250s provider run -> 60s backoff -> retry at 10:05:10.
+        # Only the backoff was queue waiting; the 250s of work was not.
+        self.request()
+        self.slow_failed_attempt(250)
+        self.assertEqual(self.row()["next_retry_at"], self.stamp(60))
+        self.now += dt.timedelta(seconds=60)
+        state = Jobs.refresh_status(self.db)
+        self.assertEqual((state["status"], state["queue_age_seconds"]), ("failed", 60))
+        self.assertEqual(Jobs.run_refresh_job(self.db, self.publish)["status"], "completed")
+
+    def test_repeated_slow_failures_keep_retrying_instead_of_expiring(self):
+        # Each wait is capped at 300s; a long run is never mistaken for one.
+        self.request()
+        for attempt in range(3):
+            with self.subTest(attempt=attempt):
+                self.slow_failed_attempt(250)
+                self.now += dt.timedelta(seconds=60)
+                self.assertLess(Jobs.refresh_status(self.db)["queue_age_seconds"], 300)
+        self.assertEqual(Jobs.run_refresh_job(self.db, self.publish)["status"], "completed")
+        self.assertEqual(self.row()["skip_count"], 0)
+
+    def test_a_retry_that_never_gets_admitted_still_expires(self):
+        # Fail closed the other way: once the provider has failed, the retry
+        # wait is capped too. A tick that can never claim the resource lock must
+        # not leave a stale request reviving days later.
+        self.request()
+        self.slow_failed_attempt(250)
+        self.now += dt.timedelta(seconds=301)  # 301s past the failure, retry never ran
+        provider = mock.Mock()
+        result = Jobs.run_refresh_job(self.db, provider)
+        provider.assert_not_called()
+        self.assertEqual((result["status"], result["reason"], result["queue_age_seconds"]),
+                         ("skipped", "queue_age_exceeded", 301))
+        self.assertEqual(self.row()["status"], "expired")
 
     def test_expired_dead_worker_cannot_publish_after_a_fresh_request(self):
         self.request()
@@ -293,6 +357,57 @@ class DashboardHostAdmissionTests(unittest.TestCase):
                     marker.unlink(missing_ok=True)
         cron = (root / "deploy/astock-codex.cron").read_text(encoding="utf-8")
         self.assertIn("* * * * * root bash /opt/astock-codex/deploy/run_snapshot_refresh.sh", cron)
+
+    def test_non_default_deploy_root_shares_the_rendered_heavy_lock(self):
+        """A deployment outside /opt must contend for the same lock as cron.
+
+        sync-cron.sh rewrites /opt/astock-codex to the real root, so the script
+        has to derive that root the same way instead of defaulting to /opt: two
+        different lock files would let a dashboard refresh and a selection or
+        history run enter the same data-worker cgroup together.
+        """
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            root = temp / "srv" / "codex"  # deliberately not /opt/astock-codex
+            (root / "deploy").mkdir(parents=True)
+            for name in ("run_snapshot_refresh.sh", "sync-cron.sh", "astock-codex.cron"):
+                shutil.copy2(repo / "deploy" / name, root / "deploy" / name)
+            marker = temp / "invocation"
+            docker = temp / "docker"
+            docker.write_text("#!/bin/sh\nprintf '%s' \"$*\" > " + shlex.quote(str(marker)) + "\n")
+            docker.chmod(0o755)
+            env = {**os.environ, "PATH": str(temp) + os.pathsep + os.environ["PATH"],
+                   "ASTOCK_DEPLOY_ROOT": str(root), "ASTOCK_CRON_DIR": str(temp / "cron.d"),
+                   "ASTOCK_CRON_BACKUP_DIR": str(temp / "cron-backup")}
+            env.pop("ASTOCK_LOCK_DIR", None)  # must not rely on the operator setting it
+            (temp / "cron.d").mkdir()
+            rendered = subprocess.run(["bash", str(root / "deploy" / "sync-cron.sh")],
+                                      env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            cron = (temp / "cron.d" / "astock-codex").read_text(encoding="utf-8")
+            self.assertIn(f"bash {root}/deploy/run_snapshot_refresh.sh", cron)
+            self.assertIn(f"flock -n {root}/.locks/resource-heavy.lock", cron)
+            self.assertNotIn("/opt/astock-codex/.locks", cron)
+
+            # The rendered heavy tasks and this script now resolve one lock file.
+            holder = subprocess.Popen(["flock", str(root / ".locks" / "resource-heavy.lock"),
+                                       "sh", "-c", "echo ready; read release"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "ready")
+                result = subprocess.run(["bash", str(root / "deploy" / "run_snapshot_refresh.sh")],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["reason"], "resource_busy")
+                self.assertFalse(marker.exists())
+            finally:
+                holder.communicate("release\n", timeout=3)
+            # And the same script does run once that shared lock is free.
+            allowed = subprocess.run(["bash", str(root / "deploy" / "run_snapshot_refresh.sh")],
+                                     env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertEqual(marker.read_text(), "exec astock-data-worker python backend/paper_snapshot_worker.py")
 
 
 if __name__ == "__main__":

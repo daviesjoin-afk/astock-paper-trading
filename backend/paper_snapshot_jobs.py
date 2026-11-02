@@ -18,6 +18,45 @@ def _stamp(offset=0):
     return (dt.datetime.now() + dt.timedelta(seconds=offset)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _waiting_seconds(row, *, now, live, follow_up):
+    """Queue waiting only; a collector's own run time never counts as waiting.
+
+    The cap bounds *how long a request waits to be claimed*, not how long the
+    provider takes. Four cases, in order:
+
+      * follow-up requested while collecting — waits on its own request time;
+      * still collecting with a live lease — waited until the claim
+        (``started_at``), so a slow provider cannot consume its own budget;
+      * ran and failed — the current wait started when that attempt failed.
+        A 250s run followed by a 60s backoff is 60s of waiting, not 310s;
+      * queued, or an orphaned claim — waits since ``requested_at``. An
+        orphaned claim has no scheduled retry, so the original request age is
+        what stops us from reviving stale intent.
+
+    Repeated failures may therefore retry past 300s of wall time: the request
+    is being actively worked, not sitting in a stale queue. Each wait is still
+    capped at ``MAX_QUEUE_AGE_SECONDS``, and retries stay behind the 60s
+    backoff with ``MAX_CONCURRENCY`` of 1.
+    """
+    try:
+        requested = dt.datetime.fromisoformat(row["requested_at"])
+        now_dt = dt.datetime.fromisoformat(now)
+        if follow_up:
+            return (now_dt - requested).total_seconds()
+        if row["status"] == "running" and live:
+            age = (dt.datetime.fromisoformat(row["started_at"]) - requested).total_seconds()
+            return age if age >= 0 else None
+        if row["status"] == "failed" and row["finished_at"]:
+            # max() also keeps a future/invalid request time fail-closed.
+            since = max(dt.datetime.fromisoformat(row["finished_at"]), requested)
+            age = (now_dt - since).total_seconds()
+            return age if age >= 0 else None
+        age = (now_dt - requested).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    return age if age >= 0 else None
+
+
 def queue_state(row, *, now):
     """Read-only admission facts; pending age is not provider snapshot age."""
     reason = "no_request"
@@ -27,15 +66,13 @@ def queue_state(row, *, now):
         live = status == "running" and row["expires_at"] and row["expires_at"] > now
         pending = status in {"queued", "failed"} or (
             status == "running" and row["request_version"] > row["claimed_version"])
+        # A follow-up requested while collecting waits on its own request time;
+        # a plain failed row is a retry of the same request, not a follow-up.
+        follow_up = status == "running" and row["request_version"] > row["claimed_version"]
         if pending or status == "running":
-            try:
-                # A running collector's elapsed time is not queue waiting.
-                until = row["started_at"] if live and not pending else now
-                age = (dt.datetime.fromisoformat(until) - dt.datetime.fromisoformat(row["requested_at"])).total_seconds()
-                if age < 0:
-                    age = None
-            except (TypeError, ValueError):
-                age = None
+            # A running collector's elapsed time is not queue waiting, and a
+            # failed attempt's run time is not waiting for its own retry.
+            age = _waiting_seconds(row, now=now, live=bool(live), follow_up=follow_up)
         reason = {"completed": "no_pending_request", "expired": "request_expired"}.get(status, "due")
         if live:
             reason = "already_running"
