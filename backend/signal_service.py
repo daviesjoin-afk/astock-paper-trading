@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import market_data_contract as MDC
 import entry_lifecycle as ELC
@@ -51,7 +51,11 @@ __all__ = [
     "expire_for_expired_order",
     "expire_stale_signal",
     "reconcile_signal_status",
+    "reopen_for_retry",
+    "retire_waitlist_signals",
     "signal_evidence",
+    "terminate_for_dispatch",
+    "write_payload",
 ]
 
 #: Re-export the frozen context type so callers need only import this module
@@ -487,6 +491,79 @@ def reconcile_signal_status(conn, signal_id, *, status):
             WHERE id=? AND status<>?""",
         (status, signal_id, status),
     )
+
+
+#: 派发终止允许写入的信号终态。``terminate_for_dispatch`` 只接受这两个取值，
+#: 避免退化成"任意 set_status"。
+DISPATCH_TERMINAL_SIGNAL_STATUSES = ("rejected", "expired")
+
+
+def write_payload(conn, signal_id, *, payload):
+    """写入信号 payload（调用方已序列化并合并好标记）。"""
+    conn.execute(
+        "UPDATE paper_signals SET payload=? WHERE id=?",
+        (payload, int(signal_id)),
+    )
+
+
+def reopen_for_retry(conn, signal_id, *, reason, terminal_statuses: Sequence[str]):
+    """过期委托由信号重建新尝试：信号回到复试管道；终态信号不动。"""
+    states = tuple(terminal_statuses)
+    if not states:
+        raise ValueError("reopen_for_retry 需要非空终态集合")
+    placeholders = ",".join("?" for _ in states)
+    conn.execute(
+        f"""UPDATE paper_signals SET status='pending',reason=?
+             WHERE id=? AND status NOT IN ({placeholders})""",
+        (reason, int(signal_id), *states),
+    )
+
+
+def expire_after_order_retry(conn, signal_id, *, reason, terminal_statuses: Sequence[str]):
+    """信号已过期时一并收敛为 expired；追加原固定后缀，终态信号不动。"""
+    states = tuple(terminal_statuses)
+    if not states:
+        raise ValueError("expire_after_order_retry 需要非空终态集合")
+    placeholders = ",".join("?" for _ in states)
+    conn.execute(
+        f"""UPDATE paper_signals SET status='expired',
+                 reason=COALESCE(reason,'') || '；' || ?
+             WHERE id=? AND status NOT IN ({placeholders})""",
+        (reason + "；信号已过有效期，一并失效", int(signal_id), *states),
+    )
+
+
+def terminate_for_dispatch(conn, signal_id, *, status, reason):
+    """派发终止：把信号写为调用方判定的终态。
+
+    ``status`` 只能取 :data:`DISPATCH_TERMINAL_SIGNAL_STATUSES`；判定（驳回还是连
+    带过期）仍在派发层。
+    """
+    if status not in DISPATCH_TERMINAL_SIGNAL_STATUSES:
+        raise ValueError(f"非法派发终止状态：{status!r}")
+    conn.execute(
+        "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
+        (status, reason, int(signal_id)),
+    )
+
+
+def retire_waitlist_signals(conn, *, statuses: Sequence[str]):
+    """按订单标记集合退役信号；单条 UPDATE，不把历史 ID 搬到 Python。"""
+    states = tuple(statuses)
+    if not states:
+        raise ValueError("retire_waitlist_signals 需要非空状态集合")
+    state_marks = ",".join("?" for _ in states)
+    return conn.execute(
+        f"""UPDATE paper_signals
+              SET status='superseded',
+                  reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代'
+            WHERE id IN (
+                SELECT signal_id FROM paper_orders
+                WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
+                  AND reason LIKE '%等待池记录已保留%'
+            ) AND status IN ({state_marks})""",
+        states,
+    ).rowcount
 
 
 def _serialize_payload(payload: Mapping[str, Any]) -> str:

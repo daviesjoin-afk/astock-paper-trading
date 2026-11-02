@@ -63,7 +63,10 @@ class DependencyContainerContractTests(unittest.TestCase):
                     if field.name in ("record_lot", "consume_available_lots",
                                       "sync_positions", "position_rows",
                                       "link_source_fill", "order_cycle_provenance_for_order",
-                                      "require_order_execution_cycle"):
+                                      "require_order_execution_cycle",
+                                      # PR-10 工作包 A：订单行 owner 由组装根直绑，
+                                      # 不再从本模块解析（避免 other 域 → paper 域的新边）。
+                                      "cancel_order", "insert_order"):
                         continue
                     self.assertIsNotNone(PT._dependency_implementation(field.name))
 

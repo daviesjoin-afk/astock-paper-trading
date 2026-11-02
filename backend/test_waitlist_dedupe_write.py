@@ -126,7 +126,8 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         try:
             with mock.patch.object(EPD, "_now", side_effect=AssertionError("owner read clock")):
                 result = EPD.retire_duplicate_waitlist(
-                    conn, waitlist_status=WAITLIST, signal_statuses=SIGNAL_STATES)
+                    conn, waitlist_status=WAITLIST, signal_statuses=SIGNAL_STATES,
+                    signals=SIG)
         finally:
             conn.set_trace_callback(None)
         return result, [" ".join(sql.split()) for sql in statements]
@@ -137,6 +138,31 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         result, _ = self.run_owner(owner)
         self.assertIsNone(result)
         self.assertEqual(_state(legacy), _state(owner))
+
+    def test_history_exceeds_bind_limit_with_duplicates_and_terminal_signals(self):
+        for status in ("filled", "pending"):
+            with self.subTest(status=status):
+                orders = [(i, 7, "AAA", "buy", "superseded", ORDER_MARK, (i + 1) // 2)
+                          for i in range(1, 81)]
+                signals = [(i, status, None) for i in range(1, 41)]
+                with _db(orders, signals) as legacy, _db(orders, signals) as owner:
+                    for conn in (legacy, owner):
+                        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32)
+                    self.run_legacy(legacy)
+                    self.run_owner(owner)
+                    self.assertEqual(_state(legacy), _state(owner))
+
+    def test_signal_update_failure_is_statement_atomic_and_caller_can_rollback(self):
+        with _db() as conn:
+            before = _state(conn)
+            conn.execute("""CREATE TRIGGER reject_signal BEFORE UPDATE ON paper_signals
+                            WHEN NEW.id=12 BEGIN SELECT RAISE(ABORT,'reject'); END""")
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.run_owner(conn)
+            self.assertEqual(before["paper_signals"], _state(conn)["paper_signals"])
+            self.assertTrue(conn.in_transaction)
+            conn.rollback()
+            self.assertEqual(before, _state(conn))
 
     def test_superseded_rows_reasons_and_untouched_rows(self):
         conn = _db()
@@ -179,7 +205,9 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         self.assertTrue(writes[1].startswith("UPDATE paper_signals"))
         self.assertIn(ORDER_MARK, writes[0])
         self.assertIn(SIGNAL_MARK, writes[1])
-        self.assertIn("LIKE '%等待池记录已保留%'", writes[1])
+        # 信号 owner 只写信号表；订单表作为集合子查询读取，保留固定参数规模。
+        self.assertIn("SELECT signal_id FROM paper_orders", writes[1])
+        self.assertIn("WHERE id IN (", writes[1])
 
     def test_repeat_run_is_idempotent(self):
         conn = _db()
@@ -241,33 +269,33 @@ class WaitlistDedupeOwnershipTests(unittest.TestCase):
                  and isinstance(node.func, ast.Attribute)
                  and node.func.attr == "retire_duplicate_waitlist"]
         self.assertEqual(1, len(calls))
-        self.assertEqual(["waitlist_status", "signal_statuses"],
+        self.assertEqual(["waitlist_status", "signal_statuses", "signals"],
                          [kw.arg for kw in calls[0].keywords])
 
     def test_owner_exposes_narrow_business_operation(self):
         signature = inspect.signature(EPD.retire_duplicate_waitlist)
-        self.assertEqual(["conn", "waitlist_status", "signal_statuses"],
+        self.assertEqual(["conn", "waitlist_status", "signal_statuses", "signals"],
                          list(signature.parameters))
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
                          signature.parameters["waitlist_status"].kind)
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
                          signature.parameters["signal_statuses"].kind)
 
-    def test_owner_sql_stays_static_for_the_write_guard(self):
+    def test_owner_delegates_both_writes_and_keeps_no_sql(self):
         source = inspect.getsource(EPD.retire_duplicate_waitlist)
-        literals = [node.value for node in ast.walk(ast.parse(textwrap.dedent(source)))
-                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
-        self.assertEqual({"paper_orders", "paper_signals"},
-                         {table for table in ("paper_orders", "paper_signals")
-                          if any(table in text.lower() for text in literals)})
-        self.assertFalse(any(text.islower() and "{" in text for text in literals))
+        self.assertIn("POL.retire_duplicate_waitlist_orders", source)
+        self.assertIn("signals.retire_waitlist_signals", source)
+        self.assertNotIn("signal_ids", source)
+        self.assertNotIn("UPDATE ", source.upper())
 
     def test_owner_is_exported_and_no_new_module_joins_the_writer_sets(self):
         self.assertIn("retire_duplicate_waitlist", EPD.__all__)
         matrix = TLO.OWNERSHIP
+        # 订单行的持久化已在 PR-10 工作包 A 移交 paper_order_ledger；
+        # 信号写入仍由 execution_dispatch 在对账/等待池阶段承担。
+        self.assertIn("paper_order_ledger", matrix["paper_orders"]["writers"])
+        self.assertIn("signal_service", matrix["paper_signals"]["writers"])
         for table in ("paper_orders", "paper_signals"):
-            self.assertIn("execution_dispatch", matrix[table]["writers"])
-            self.assertIn("paper_trading", matrix[table]["writers"])
             self.assertEqual("pending", matrix[table]["status"])
         # 信号侧没有新增写入口：本批不把同一业务操作拆给 signal_service。
         self.assertNotIn("retire_duplicate_waitlist", SIG.__all__)

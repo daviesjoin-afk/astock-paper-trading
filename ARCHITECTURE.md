@@ -4584,3 +4584,52 @@ PR-10 其他阶段与读取侧仍待验收，尚未进入 PR-11；未做交易�
 未做真实交易时段验证，未进入 PR-11。
 
 **状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。
+
+## PR-10 收尾计划 A–E 与冻结清单（2026-11-01）
+
+#318 合并后（master `8e3c22d`）按五个工作包收尾，不再以"一条 UPDATE 一批"推进：
+A 订单/信号非成交生命周期、B 创建/成交/核验与信号反馈、C `paper_accounts` 四组操作、
+D `paper_cycles` 与跨表归档、E 读取契约/守卫校准/总验收。
+
+四张 `pending` 表的运行时写入已逐条登记到 `backend/ledger_owner_plan.json`
+（操作、业务判定者、最终写入 owner、调用方事务、工作包），扫描口径区分真实写目标与
+子查询读表，测试/种子/迁移/夹具不混入写方集合；`backend/test_ledger_owner_plan.py`
+保证源码扫描、计划与文档三者一致。最终 owner：`paper_orders` → 新建
+`paper_order_ledger`，`paper_signals` → `signal_service`，账户按现金/创建/身份/配置
+四组分别归现有 owner 与新建 `paper_account_config`，`paper_cycles` → `paper_cycle_service`。
+
+细节与出口见 `docs/LEDGER_OWNERSHIP.md` 第16节。仍不进入 PR-11。
+
+## PR-10 工作包 A 第一片 订单行 owner（2026-11-01）
+
+建立 `backend/paper_order_ledger.py` 作为 `paper_orders` 的唯一持久化入口，先接非成交生命周期：
+过期、失效信号回收、重复重试退旧、终态信号回收、重试接管退役、派发终止、挂起退役、等待池批量退役。
+`execution_dispatch` 不再写订单表，只保留判定、顺序、预占释放与信号写入。
+
+owner 契约：不算成交（`commit_fill` 仍唯一）、不读时钟、不 commit、不吞异常；`terminate_order`
+只接受终态白名单，状态词表由调用方传入而不是在 owner 里再抄一份。
+
+成本显式登记：新增含 SQL 模块使 `raw_sql_modules` 141→142、`paper_table_fanout_max` 50→51、
+`cross_domain_edges` 629→630，全部走 `FEATURE_ALLOWANCE` + `docs/COUPLING_BUDGET.md` 切片记录，
+`HEAD_BUDGET` 与 lock 不变。A 后续片与 B/C/D 搬走写入后需收回这些额度。
+
+## PR-10 工作包 A 第二片 信号行 owner（2026-11-01）
+
+`execution_dispatch` 不再写 `paper_signals`：payload 标记、重试接通、信号过期、派发终止与等待池
+替代信号分别交由 `signal_service` 的 `write_payload` / `reopen_for_retry` /
+`expire_after_order_retry` / `terminate_for_dispatch` / `retire_waitlist_signals`。
+`paper_signals` 的运行时写方由 4 个降到 3 个。
+
+按既有注入约定，`execution_dispatch` 不 import 信号 owner，改由组装根经 preflight 传入 `signals`
+端口；`paper_slot_service` 同样只转发，不自行 import。信号身份的反查放在订单 owner
+（`POL.signal_ids_by_reason_marker`），读取仍在调用方，避免 signal 侧新增订单表依赖。
+信号写方集合的变化没有新增跨域边（`cross_domain_edges` 保持 630）。
+
+## PR-10 工作包 A 第三片与 A 收口（2026-11-01）
+
+剩余三条订单写入归位：新一轮重试退役 → `POL.supersede_previous_execution_retry`、手动撤单 →
+`POL.cancel_order`、冻结等待池标记创建 → `POL.insert_order`（B 包创建路径复用）。
+`manual_orders` 通过 `ManualOrderDependencies` 接收撤单实现，不 import owner，跨域边不增。
+
+工作包 A 的 19 条操作全部迁移完成：订单与信号的非成交生命周期写入都经 owner，
+调用方不再自行拼状态 UPDATE。两张表仍为 `pending` —— B、D 还有剩余写入。

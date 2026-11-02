@@ -1,0 +1,549 @@
+{
+ "operations": {
+  "adaptive_engine::_restore_paper_account": {
+   "judge": "adaptive_engine 回滚规则",
+   "operation": "参数回滚恢复（params/version）",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "adaptive_risk::_finish_rollback": {
+   "judge": "adaptive_risk 回滚规则",
+   "operation": "风险自适应参数回滚收尾",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "adaptive_risk::apply_candidate": {
+   "judge": "adaptive_risk 采纳规则",
+   "operation": "风险自适应候选参数应用",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "adaptive_selection::_finish_rollback": {
+   "judge": "adaptive_selection 回滚规则",
+   "operation": "选择自适应参数回滚收尾",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "adaptive_selection::apply_candidate": {
+   "judge": "adaptive_selection 采纳规则",
+   "operation": "选择自适应候选参数应用",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "adaptive_selection_compat::migrate_legacy_selection_units": {
+   "judge": "兼容迁移规则",
+   "operation": "legacy 参数单位迁移",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "服务入口传入的连接"
+  },
+  "evolution_apply::write_account_params": {
+   "judge": "evolution_apply 版本检查",
+   "operation": "进化结果参数写入",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "execution_planner::commit_fill": {
+   "judge": "commit_fill 唯一成交权威",
+   "operation": "成交结果写入（状态/成交价/费用/证据）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
+  "execution_verification::backfill_legacy_orders": {
+   "judge": "execution_verification 兼容规则",
+   "operation": "历史订单核验戳补齐（维护）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "execution_verification::stamp_order": {
+   "judge": "execution_verification 核验结论",
+   "operation": "执行核验戳写入",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "execution_verification::stamp_terminal_zero_orders": {
+   "judge": "execution_verification 核验结论",
+   "operation": "零成交终态订单核验戳",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "manual_orders::_commit_strategy_buy": {
+   "judge": "manual_orders 策略入口",
+   "operation": "策略买入订单创建（INSERT）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
+  "manual_orders::_terminalize_cycle_stale_order": {
+   "judge": "manual_orders 周期归属判定",
+   "operation": "周期切换时终止跨周期残留委托",
+   "single_owner": "paper_order_ledger",
+   "single_package": "D",
+   "transaction": "服务入口传入的连接"
+  },
+  "manual_orders::commit_strategy_entry_fill": {
+   "judge": "commit_fill 成交结果",
+   "operation": "策略成交联动信号状态",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
+  "manual_orders::process_pending_manual_orders": {
+   "judge": "manual_orders 执行循环",
+   "operation": "手动委托执行状态推进",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "服务入口传入的连接"
+  },
+  "manual_orders::strategy_fill_failure": {
+   "judge": "commit_fill 失败结果",
+   "operation": "成交失败：信号回 deferred_capacity",
+   "targets": {
+    "paper_orders": {
+     "operation": "策略成交失败回写（订单侧）",
+     "owner": "paper_order_ledger",
+     "package": "B"
+    },
+    "paper_signals": {
+     "operation": "成交失败：信号回 deferred_capacity",
+     "owner": "signal_service",
+     "package": "B"
+    }
+   },
+   "transaction": "commit_fill 的 SAVEPOINT 内，调用方提交/回滚"
+  },
+  "manual_orders::submit_manual_order": {
+   "judge": "手动入口校验 + 风险决定",
+   "operation": "手动下单订单创建（INSERT）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "服务入口传入的连接"
+  },
+  "paper_cycle_service::archive_cycle": {
+   "judge": "归档入口规则",
+   "operation": "周期归档 archived",
+   "single_owner": "paper_cycle_service",
+   "single_package": "D",
+   "transaction": "服务入口传入的连接"
+  },
+  "paper_order_ledger::cancel_order": {
+   "judge": "手动入口校验 + 用户请求",
+   "operation": "用户撤单：订单转 cancelled（可撤销状态白名单）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "服务入口传入的连接"
+  },
+  "paper_order_ledger::expire_order": {
+   "judge": "entry_lifecycle 判定，dispatch 落库",
+   "operation": "订单自身过期终态 expired",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::insert_order": {
+   "judge": "paper_trading 入场闸门",
+   "operation": "订单创建（INSERT）：冻结等待池标记（B 包将复用同一入口）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::retire_duplicate_waitlist_orders": {
+   "judge": "paper_trading 启动恢复",
+   "operation": "等待池重复记录退役（订单，批量）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_order_ledger::retire_gated_order": {
+   "judge": "execution_dispatch 等待窗口",
+   "operation": "挂起订单退役（batch/verification 等待超时）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::supersede_duplicate_execution_retry": {
+   "judge": "paper_trading 对账循环",
+   "operation": "重复执行重试退旧 superseded",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_order_ledger::supersede_for_expired_signal": {
+   "judge": "entry_lifecycle 失效判定",
+   "operation": "失效信号名下买单回收 superseded",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::supersede_for_terminal_signal": {
+   "judge": "paper_trading 对账循环",
+   "operation": "终态信号遗留委托回收",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_order_ledger::supersede_order": {
+   "judge": "execution_dispatch 重试接管判定",
+   "operation": "重试接管/Dispatch 退役：订单转 superseded（含取消时间）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::supersede_previous_execution_retry": {
+   "judge": "paper_trading 重试发起",
+   "operation": "新一轮执行重试接管：退役全部旧重试",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::terminate_order": {
+   "judge": "execution_dispatch 派发阶段",
+   "operation": "派发终止：订单转调用方判定的终态",
+   "single_owner": "paper_order_ledger",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_risk_writes::<module>": {
+   "judge": "风控拒绝结论（paper_risk_writes 模块级工厂）",
+   "operation": "风险拒绝订单创建（INSERT）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_shared_cash::credit_shared_cash": {
+   "judge": "paper_shared_cash 资金规则",
+   "operation": "共享现金回补",
+   "single_owner": "paper_shared_cash",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_shared_cash::debit_shared_cash": {
+   "judge": "paper_shared_cash 资金规则",
+   "operation": "共享现金扣减",
+   "single_owner": "paper_shared_cash",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_bootstrap_signals_for_today": {
+   "judge": "paper_trading 引导规则",
+   "operation": "当日信号引导：替代旧信号",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_trading::_buy_order": {
+   "judge": "paper_trading 入场决策",
+   "operation": "买入联动信号状态/原因/payload",
+   "targets": {
+    "paper_orders": {
+     "operation": "自动买入订单创建（INSERT）",
+     "owner": "paper_order_ledger",
+     "package": "B"
+    },
+    "paper_signals": {
+     "operation": "买入联动信号状态/原因/payload",
+     "owner": "signal_service",
+     "package": "B"
+    }
+   },
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_cleanup_stale_data": {
+   "judge": "paper_trading 归档策略",
+   "operation": "归档/清理超龄信号行（DELETE）",
+   "targets": {
+    "paper_orders": {
+     "operation": "归档/清理超龄订单行（DELETE）",
+     "owner": "paper_order_ledger",
+     "package": "D"
+    },
+    "paper_signals": {
+     "operation": "归档/清理超龄信号行（DELETE）",
+     "owner": "signal_service",
+     "package": "D"
+    }
+   },
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_trading::_enforce_order_intent": {
+   "judge": "paper_trading 意图规则",
+   "operation": "订单意图收紧：信号 rejected",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_ensure_accounts": {
+   "judge": "paper_trading 账户引导",
+   "operation": "内置账户创建与字段补齐",
+   "single_owner": "paper_user_account_provisioning",
+   "single_package": "C",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_trading::_ensure_cycle": {
+   "judge": "paper_trading 兼容引导",
+   "operation": "legacy 周期引导创建（INSERT）",
+   "targets": {
+    "paper_accounts": {
+     "operation": "legacy 引导：账户 cycle_id 清空与暂停",
+     "owner": "paper_user_cycle_attachment",
+     "package": "C"
+    },
+    "paper_cycles": {
+     "operation": "legacy 周期引导创建（INSERT）",
+     "owner": "paper_cycle_service",
+     "package": "D"
+    }
+   },
+   "transaction": "启动恢复/初始化连接"
+  },
+  "paper_trading::_intraday_sell": {
+   "judge": "paper_trading 风控/止盈决策",
+   "operation": "卖出订单创建（INSERT）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_rebuild_realized_pnl": {
+   "judge": "paper_trading 重建口径",
+   "operation": "已实现盈亏回填 realized_pnl",
+   "single_owner": "paper_order_ledger",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_reconcile_shared_cash": {
+   "judge": "paper_trading 现金对账口径",
+   "operation": "共享现金对账调整",
+   "single_owner": "paper_shared_cash",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_shared_risk_state": {
+   "judge": "paper_trading 风控状态",
+   "operation": "账户冷却窗口 cooldown_until",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::_weekly_review": {
+   "judge": "周度复盘结论",
+   "operation": "周度参数应用（params/version）",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::configure_capital": {
+   "judge": "配置入口校验",
+   "operation": "周期资金配置（capital）",
+   "targets": {
+    "paper_accounts": {
+     "operation": "周期资金配置（账户侧现金/基准净值）",
+     "owner": "paper_shared_cash",
+     "package": "C"
+    },
+    "paper_cycles": {
+     "operation": "周期资金配置（capital）",
+     "owner": "paper_cycle_service",
+     "package": "D"
+    }
+   },
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::create_cycle": {
+   "judge": "周期创建入口校验",
+   "operation": "周期创建（INSERT）",
+   "targets": {
+    "paper_accounts": {
+     "operation": "新建周期时账户挂接重置",
+     "owner": "paper_user_cycle_attachment",
+     "package": "C"
+    },
+    "paper_cycles": {
+     "operation": "周期创建（INSERT）",
+     "owner": "paper_cycle_service",
+     "package": "D"
+    }
+   },
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::execute_open": {
+   "judge": "paper_trading 开盘窗口规则",
+   "operation": "开盘信号过期（expired）",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::monitor_fast_entries": {
+   "judge": "paper_trading 盘中复核",
+   "operation": "快速入场等待：信号 deferred_capacity",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::process_pending_execution_orders": {
+   "judge": "paper_trading 执行循环",
+   "operation": "执行结果回写信号状态",
+   "targets": {
+    "paper_orders": {
+     "operation": "执行结果状态推进（含 execution_version 乐观锁）",
+     "owner": "paper_order_ledger",
+     "package": "B"
+    },
+    "paper_signals": {
+     "operation": "执行结果回写信号状态",
+     "owner": "signal_service",
+     "package": "B"
+    }
+   },
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::set_account_style": {
+   "judge": "配置入口校验",
+   "operation": "账户风格字段",
+   "single_owner": "paper_account_config",
+   "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_trading::set_accounts_status": {
+   "judge": "启停入口校验",
+   "operation": "周期启停状态/started_at",
+   "targets": {
+    "paper_accounts": {
+     "operation": "账户启停状态字段",
+     "owner": "paper_user_cycle_attachment",
+     "package": "C"
+    },
+    "paper_cycles": {
+     "operation": "周期启停状态/started_at",
+     "owner": "paper_cycle_service",
+     "package": "D"
+    }
+   },
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_user_account_provisioning::provision_user_accounts": {
+   "judge": "provisioning 规则",
+   "operation": "用户策略账户创建（INSERT）",
+   "single_owner": "paper_user_account_provisioning",
+   "single_package": "C",
+   "transaction": "服务入口传入的连接"
+  },
+  "paper_user_cycle_attachment::reconcile_user_cycle_accounts": {
+   "judge": "账户挂接规则",
+   "operation": "用户账户周期挂接对账",
+   "single_owner": "paper_user_cycle_attachment",
+   "single_package": "C",
+   "transaction": "服务入口传入的连接"
+  },
+  "signal_service::conflict_statement": {
+   "judge": "signal_service 冲突策略",
+   "operation": "信号写入语句（INSERT OR IGNORE / REFRESH）",
+   "single_owner": "signal_service",
+   "single_package": "B",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::expire_after_order_retry": {
+   "judge": "execution_dispatch 重试接管判定",
+   "operation": "重试接管：过期信号一并收敛 expired",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::expire_for_expired_order": {
+   "judge": "entry_lifecycle 过期判定",
+   "operation": "订单过期联动信号 expired",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::expire_stale_signal": {
+   "judge": "entry_lifecycle 失效判定",
+   "operation": "信号自身失效 expired",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::reconcile_signal_status": {
+   "judge": "paper_trading 对账循环",
+   "operation": "信号状态对账",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "signal_service::reopen_for_retry": {
+   "judge": "execution_dispatch 重试接管判定",
+   "operation": "重试接管：信号回到复试管道",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::retire_waitlist_signals": {
+   "judge": "paper_trading 启动恢复",
+   "operation": "等待池重复记录退役（信号）",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "启动恢复/初始化连接"
+  },
+  "signal_service::terminate_for_dispatch": {
+   "judge": "execution_dispatch 派发阶段",
+   "operation": "派发终止：信号写终态（rejected/expired 白名单）",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::write_payload": {
+   "judge": "execution_dispatch 批次/核验标记",
+   "operation": "信号 payload 标记写入",
+   "single_owner": "signal_service",
+   "single_package": "A",
+   "transaction": "调用方同一连接与原事务"
+  }
+ },
+ "planned_owners": {
+  "paper_account_config": {
+   "package": "C",
+   "scope": "paper_accounts 参数/版本/风格/限额/冷却字段",
+   "status": "planned"
+  },
+  "paper_cycle_service": {
+   "package": "D",
+   "scope": "paper_cycles 全部行写入",
+   "status": "existing"
+  },
+  "paper_order_ledger": {
+   "note": "A 包已建立：订单行持久化入口",
+   "package": "A",
+   "scope": "paper_orders 全部行写入（创建/状态/成交结果/核验戳/归档删除）",
+   "status": "existing"
+  },
+  "paper_shared_cash": {
+   "package": "C",
+   "scope": "paper_accounts 现金字段",
+   "status": "existing"
+  },
+  "paper_user_account_provisioning": {
+   "package": "C",
+   "scope": "paper_accounts 创建",
+   "status": "existing"
+  },
+  "paper_user_cycle_attachment": {
+   "package": "C",
+   "scope": "paper_accounts cycle_id 与启停身份字段",
+   "status": "existing"
+  },
+  "signal_service": {
+   "package": "A",
+   "scope": "paper_signals 全部行写入",
+   "status": "existing"
+  }
+ }
+}

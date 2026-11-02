@@ -18,6 +18,7 @@ from unittest import mock
 
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
+import paper_order_ledger as POL
 import paper_capital_reservations as PCR
 import paper_schema_migrations as PSM
 import paper_trading as PT
@@ -298,35 +299,41 @@ class ReconcileOwnershipTests(unittest.TestCase):
 
     def test_owners_have_narrow_signatures(self):
         self.assertEqual(["conn", "order_id"],
-                         list(inspect.signature(EPD.supersede_duplicate_execution_retry).parameters))
-        sig = inspect.signature(EPD.supersede_for_terminal_signal)
-        self.assertEqual(["conn", "order_id", "reason"], list(sig.parameters))
-        self.assertEqual(inspect.Parameter.KEYWORD_ONLY, sig.parameters["reason"].kind)
-        self.assertEqual(inspect.Parameter.empty, sig.parameters["reason"].default)
+                         list(inspect.signature(POL.supersede_duplicate_execution_retry).parameters))
+        sig = inspect.signature(POL.supersede_for_terminal_signal)
+        self.assertEqual(["conn", "order_id", "reason", "statuses"], list(sig.parameters))
+        for name in ("reason", "statuses"):
+            self.assertEqual(inspect.Parameter.KEYWORD_ONLY, sig.parameters[name].kind)
+            self.assertEqual(inspect.Parameter.empty, sig.parameters[name].default)
         sig = inspect.signature(SIG.reconcile_signal_status)
         self.assertEqual(["conn", "signal_id", "status"], list(sig.parameters))
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY, sig.parameters["status"].kind)
         self.assertEqual(inspect.Parameter.empty, sig.parameters["status"].default)
 
-    def test_terminal_owner_placeholder_arity_matches_the_status_tuple(self):
-        source = inspect.getsource(EPD.supersede_for_terminal_signal)
-        sql = next(textwrap.dedent(node.value) for node in ast.walk(ast.parse(textwrap.dedent(source)))
-                   if isinstance(node, ast.Constant) and "status IN (" in str(node.value))
-        placeholders = sql.count("?") - 2  # 原因一个、order_id 一个
-        self.assertEqual(len(ELC.ENTRY_RETRY_ORDER_STATUSES), placeholders,
-                         "ENTRY_RETRY_ORDER_STATUSES 变更时必须同步静态占位符")
+    def test_terminal_owner_only_touches_the_statuses_it_is_given(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, status TEXT, reason TEXT)")
+        conn.executemany("INSERT INTO paper_orders VALUES(?,?,?)",
+                         [(1, "pending_limit", None), (2, "awaiting_batch", None)])
+        POL.supersede_for_terminal_signal(conn, 1, reason="回收", statuses=("pending_limit",))
+        rows = dict(conn.execute("SELECT id,status FROM paper_orders").fetchall())
+        self.assertEqual("superseded", rows[1])
+        self.assertEqual("awaiting_batch", rows[2])
 
     def test_write_sets_and_pending_status_unchanged(self):
-        for table, expected in (("paper_orders", 6), ("paper_signals", 4)):
-            sites = TLO.write_sites(table)
-            self.assertEqual(expected, len(sites), f"{table} 写方模块数变化")
+        import test_ledger_ownership as TLO2
+        for table, expected in (("paper_orders", 6), ("paper_signals", 3)):
+            self.assertEqual(expected, len(TLO2.real_write_modules(table)),
+                             f"{table} 真实写方模块数变化")
             self.assertEqual("pending", TLO.OWNERSHIP[table]["status"])
-        self.assertIn("execution_dispatch", TLO.OWNERSHIP["paper_orders"]["writers"])
+        self.assertIn("paper_order_ledger", TLO.OWNERSHIP["paper_orders"]["writers"])
         self.assertIn("signal_service", TLO.OWNERSHIP["paper_signals"]["writers"])
 
     def test_owners_are_exported(self):
-        self.assertIn("supersede_duplicate_execution_retry", EPD.__all__)
-        self.assertIn("supersede_for_terminal_signal", EPD.__all__)
+        self.assertIn("supersede_duplicate_execution_retry", POL.__all__)
+        self.assertIn("supersede_for_terminal_signal", POL.__all__)
         self.assertIn("reconcile_signal_status", SIG.__all__)
 
     def test_owners_do_not_read_the_clock(self):
@@ -334,8 +341,9 @@ class ReconcileOwnershipTests(unittest.TestCase):
         with mock.patch.object(EPD, "_now", side_effect=AssertionError("owner read clock")), \
                 mock.patch.object(SIG, "_now", create=True,
                                   side_effect=AssertionError("owner read clock")):
-            EPD.supersede_duplicate_execution_retry(conn, 999)
-            EPD.supersede_for_terminal_signal(conn, 999, reason="x")
+            POL.supersede_duplicate_execution_retry(conn, 999)
+            POL.supersede_for_terminal_signal(conn, 999, reason="x",
+                                              statuses=ELC.ENTRY_RETRY_ORDER_STATUSES)
             SIG.reconcile_signal_status(conn, 999, status="pending")
 
 

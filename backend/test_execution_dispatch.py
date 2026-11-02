@@ -8,6 +8,7 @@ import sqlite3
 import unittest
 
 import execution_dispatch as EPD
+import signal_service as SIG
 import paper_capital_reservations as PCR
 import execution_profiles as EPF
 
@@ -199,7 +200,7 @@ class SweepTests(unittest.TestCase):
         conn.execute(
             "UPDATE paper_signals SET created_at='2026-09-08 15:20:00' WHERE id=1")
         conn.commit()
-        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30))
+        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30), signals=SIG)
         self.assertEqual(1, summary["released"])
         order = _row(conn, "paper_orders", order_id)
         self.assertEqual("superseded", order["status"])
@@ -215,7 +216,7 @@ class SweepTests(unittest.TestCase):
         """PR-29：信号已过有效期时，委托与信号一并收敛为终态。"""
         conn = _db()
         order_id = _order(conn, expires_at="2026-09-08T15:15:00")
-        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30))
+        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30), signals=SIG)
         self.assertEqual(1, summary["released"])
         self.assertEqual("superseded", _row(conn, "paper_orders", order_id)["status"])
         self.assertEqual("expired", _row(conn, "paper_signals", 1)["status"])
@@ -226,7 +227,7 @@ class SweepTests(unittest.TestCase):
             conn, expires_at="2026-09-08T10:05:00",
             payload={"execution_profile": {"strict_ttl": True}},
         )
-        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 10, 10))
+        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 10, 10), signals=SIG)
         self.assertEqual(1, summary["expired"])
         order = _row(conn, "paper_orders", order_id)
         self.assertEqual(EPD.EXPIRED_ORDER_STATUS, order["status"])
@@ -237,14 +238,14 @@ class SweepTests(unittest.TestCase):
         conn = _db()
         order_id = _order(conn)
         conn.execute("UPDATE paper_signals SET status='filled' WHERE id=1")
-        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30))
+        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30), signals=SIG)
         self.assertEqual(1, summary["retired"])
         self.assertEqual("superseded", _row(conn, "paper_orders", order_id)["status"])
 
     def test_pending_orders_are_untouched(self):
         conn = _db()
         order_id = _order(conn, expires_at="2026-09-08T15:15:00")
-        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 11, 0))
+        summary = EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 11, 0), signals=SIG)
         self.assertEqual(0, summary["released"])
         self.assertEqual(EPD.BATCH_HOLD_STATUS, _row(conn, "paper_orders", order_id)["status"])
 
@@ -252,7 +253,8 @@ class SweepTests(unittest.TestCase):
         conn = _db()
         order_id = _order(conn, expires_at="2026-09-08T15:15:00")
         summary = EPD.run_execution_dispatch(
-            conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30),
+conn, release_reservation=PCR.release_order_reservation, signals=SIG,
+            now=dt.datetime(2026, 9, 8, 15, 30),
             dispatch_settings={"execution_ttl_sweep": False},
         )
         self.assertEqual(0, summary["checked"])
@@ -281,7 +283,7 @@ class VerificationTests(unittest.TestCase):
         order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS)
         result = EPD.resolve_verification(
             conn, order_id, release_reservation=PCR.release_order_reservation, approved=True, operator="运营A", note="财报已核实",
-            now=dt.datetime(2026, 9, 8, 10, 30),
+            now=dt.datetime(2026, 9, 8, 10, 30), signals=SIG,
         )
         self.assertTrue(result["ok"])
         self.assertEqual("released", result["status"])
@@ -299,7 +301,7 @@ class VerificationTests(unittest.TestCase):
     def test_rejection_cancels_the_order(self):
         conn = _db()
         order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS)
-        result = EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, approved=False, note="证据不足")
+        result = EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, signals=SIG, approved=False, note="证据不足")
         self.assertTrue(result["ok"])
         self.assertEqual(EPD.CANCELLED_ORDER_STATUS, result["status"])
         order = _row(conn, "paper_orders", order_id)
@@ -309,13 +311,13 @@ class VerificationTests(unittest.TestCase):
 
     def test_unknown_order_is_rejected(self):
         conn = _db()
-        result = EPD.resolve_verification(conn, 999, release_reservation=PCR.release_order_reservation, approved=True)
+        result = EPD.resolve_verification(conn, 999, release_reservation=PCR.release_order_reservation, signals=SIG, approved=True)
         self.assertFalse(result["ok"])
 
     def test_non_gated_order_cannot_be_verified(self):
         conn = _db()
         order_id = _order(conn, status="filled")
-        result = EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, approved=True)
+        result = EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, signals=SIG, approved=True)
         self.assertFalse(result["ok"])
         self.assertIn("不在核验队列", result["reason"])
 
@@ -333,7 +335,7 @@ class PersistenceTests(unittest.TestCase):
     def _reject_then_recreate(self, conn):
         order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS, signal_id=1,
                           account_id="reported_profit_breakout", code="600519")
-        EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, approved=False, note="证据不足")
+        EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, signals=SIG, approved=False, note="证据不足")
         # 日内引导把普通 rejected 信号 supersede 掉，并用新的 signal 行重建候选。
         conn.execute("UPDATE paper_signals SET status='superseded' WHERE id=1")
         conn.execute(
@@ -392,7 +394,7 @@ class PersistenceTests(unittest.TestCase):
     def test_expired_release_writes_the_batch_marker(self):
         conn = _db()
         _order(conn, expires_at="2026-09-08T15:15:00")
-        EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30))
+        EPD.run_execution_dispatch(conn, release_reservation=PCR.release_order_reservation, now=dt.datetime(2026, 9, 8, 15, 30), signals=SIG)
         payload = json.loads(_row(conn, "paper_signals", 1)["payload"] or "{}")
         self.assertTrue(payload["execution_batch_release"]["released"])
         # 标记写入后，同一信号在同一轮次内不会再被挂起。
@@ -405,7 +407,7 @@ class PersistenceTests(unittest.TestCase):
     def test_approval_marker_is_recorded(self):
         conn = _db()
         order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS, signal_id=1)
-        EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, approved=True, operator="运营A")
+        EPD.resolve_verification(conn, order_id, release_reservation=PCR.release_order_reservation, signals=SIG, approved=True, operator="运营A")
         payload = json.loads(_row(conn, "paper_signals", 1)["payload"] or "{}")
         self.assertTrue(payload["execution_verification"]["approved"])
         plan = EPD.plan_execution_dispatch(

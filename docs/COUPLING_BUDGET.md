@@ -619,3 +619,29 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 实测 `cross_domain_edges` 仍为 629，基础层反向依赖与循环均为 0。
 基线、lock 和所有 `FEATURE_ALLOWANCE` 都不变；没有新增全局依赖桥、跨层私有访问
 或通用 SQL 入口，也不为调整计数而迁移无关依赖。
+
+## 2026-11-01 PR-10 工作包 A 建立订单行 owner
+
+新增 `backend/paper_order_ledger.py`：`paper_orders` 的订单行持久化唯一入口
+（状态迁移、成交结果字段、核验戳、归档删除最终都从这里出）。工作包 A 先接
+非成交生命周期——过期、等待、替代、终止、重试接管——的写入；创建与成交结果在
+工作包 B 接入同一入口。
+
+这是**新增模块**带来的三项显式成本，全部登记而不是悄悄重基：
+
+| 指标 | 之前 | 现在 | 原因 |
+| --- | --- | --- | --- |
+| `cross_domain_edges` | 629 | 630 | `execution_dispatch → paper_order_ledger`（execution 域 → paper 域）。旧的 inline SQL 没有这条 import 边 |
+| `raw_sql_modules` | 141 | 142 | 新 owner 模块含静态 SQL 写入 |
+| `paper_table_fanout_max` | 50 | 51 | 多了一个引用 paper 表的模块 |
+
+`FEATURE_ALLOWANCE`（作业口径的"已审核增长"槽位）对应 +1 / +1 / +1，
+`HEAD_BUDGET` 与 lock 文件不动——基线仍是 618 / 141 / 50，额度显式可回收。
+
+方向性判断：这次是"写入归属明确化"的代价，不是新增业务耦合。B/C/D 继续把写入
+从 `paper_trading`、`manual_orders` 搬走后，模块数与扇出应当下降，届时这三个额度
+必须收回；收不回来就说明 owner 切分没有真正减少分散度。
+
+`foundation_violations`、`import_cycles`、`injected_private_fields`、
+`from_import_private_names` 仍为 0；`paper_order_ledger` 只依赖
+`entry_lifecycle`（基础层），不读时钟、不 commit、不吞异常。

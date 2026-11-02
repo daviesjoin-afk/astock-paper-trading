@@ -134,8 +134,16 @@ class CouplingBudgetTests(unittest.TestCase):
         "import_cycles": 0,
         "deferred_imports": 2,
         "private_cross_access": 0,
-        "raw_sql_modules": 0,
-        "paper_table_fanout_max": 0,
+        # 2026-11-01（PR-10 工作包 A：建立 paper_order_ledger）：订单行持久化有了
+        # 唯一入口，代价是**新增一个含 SQL 的 owner 模块**——
+        # raw_sql_modules 141→142、paper_table_fanout_max 50→51，
+        # 以及 `execution_dispatch → paper_order_ledger`（execution 域 → paper 域）
+        # 这一条显式的跨域依赖边（旧的 inline SQL 不存在这条 import 边）。
+        # 这是"写入归属明确化"的成本，不是新增业务耦合；B/C/D 继续把写入搬离
+        # `paper_trading` / `manual_orders` 后，模块数与扇出应当下降，
+        # 届时额度必须收回。登记见 docs/COUPLING_BUDGET.md「2026-11-01 PR-10 A」。
+        "raw_sql_modules": 1,
+        "paper_table_fanout_max": 1,
         # 2026-10-29（adaptive 库 schema 收口）：schema owner 显式持有 7 个下游
         # owner 的建表依赖，README 见 docs/COUPLING_BUDGET.md 当日切片。
         #
@@ -147,7 +155,7 @@ class CouplingBudgetTests(unittest.TestCase):
         # docs/COUPLING_BUDGET.md「2026-10-31 PR-6」。
         # PR-8: manual_orders → paper_sizing replaces the injected private
         # _price_aware_qty capability; one explicit owner edge, no reverse edge.
-        "cross_domain_edges": 11,
+        "cross_domain_edges": 12,
         "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,

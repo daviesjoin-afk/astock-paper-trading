@@ -91,6 +91,7 @@ class ManualOrderDependencies:
     universe_snapshot_time: Any
     with_decision_snapshot: Any
     init_db: Any
+    cancel_order: Any
 
 
 _dependencies_factory: Callable[[], ManualOrderDependencies] | None = None
@@ -1024,6 +1025,7 @@ def cancel_manual_order(order_id):
     _audit = deps.audit
     _db = deps.db
     _finish_capital_reservation = deps.finish_capital_reservation
+    _cancel_order = deps.cancel_order
     _now = deps.now
     init_db = deps.init_db
     init_db()
@@ -1035,15 +1037,11 @@ def cancel_manual_order(order_id):
             raise ValueError("未找到手动模拟委托")
         if row["status"] not in set(ENTRY_RETRY_ORDER_STATUSES):
             raise ValueError("只有仍有未成交份额的手动模拟委托可以撤销")
-        allowed = tuple(ENTRY_RETRY_ORDER_STATUSES)
-        placeholders = ",".join("?" for _ in allowed)
-        changed = conn.execute(
-            f"""UPDATE paper_orders
-                   SET status='cancelled',reason='用户撤销模拟委托',cancelled_at=?
-                 WHERE id=? AND status IN ({placeholders})""",
-            (_now(), int(order_id), *allowed),
+        changed = _cancel_order(
+            conn, int(order_id), reason="用户撤销模拟委托", cancelled_at=_now(),
+            statuses=tuple(ENTRY_RETRY_ORDER_STATUSES),
         )
-        if changed.rowcount != 1:
+        if changed != 1:
             raise ValueError("委托已成交或不再处于可撤销状态")
         _finish_capital_reservation(conn, order_id, "released")
         _audit(conn, row["account_id"], "manual_order_cancelled", f"order={order_id}")

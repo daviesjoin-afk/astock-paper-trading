@@ -29,7 +29,7 @@ PR-10 把 TTL / batch / verification 作为订单审计字段引入，但具体�
 它只写终态，不参与上述挂起单清扫或过期资格判断。
 ``supersede_for_expired_signal`` 则承接失效信号名下买单的回收写入，判定仍由生命周期层负责。
 ``retire_duplicate_waitlist`` 承接启动恢复里的等待池重复记录回收，订单与关联信号的 superseded 写入保持原顺序。
-``supersede_duplicate_execution_retry`` / ``supersede_for_terminal_signal`` 承接对账路径的订单回收写入，判定仍由 ``paper_trading`` 的对账循环负责。
+订单行的持久化已移交 ``paper_order_ledger``（PR-10 工作包 A）：本模块只做派发阶段的判定与顺序，调用 owner 写入。
 
 失败语义
 --------
@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
-import entry_lifecycle as ELC
+import paper_order_ledger as POL
 from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
@@ -63,16 +63,12 @@ __all__ = [
     "batch_queue",
     "batch_window_state",
     "dispatch_overview",
-    "expire_order",
     "plan_execution_dispatch",
     "resolve_verification",
     "retire_duplicate_waitlist",
-    "supersede_duplicate_execution_retry",
-    "supersede_for_terminal_signal",
     "retire_gated_orders",
     "run_execution_dispatch",
     "settings",
-    "supersede_for_expired_signal",
     "verification_queue",
 ]
 
@@ -485,6 +481,7 @@ def _write_signal_marker(
     key: str,
     value: Mapping[str, Any],
     *,
+    signals,
     now: dt.datetime | None = None,
 ) -> None:
     """把一次性标记写入信号 payload（信号被 supersede 后仍随行保留）。
@@ -501,10 +498,8 @@ def _write_signal_marker(
     marker["at"] = _iso(now or _now())
     payload[key] = marker
     try:
-        conn.execute(
-            "UPDATE paper_signals SET payload=? WHERE id=?",
-            (json.dumps(payload, ensure_ascii=False), int(signal_id)),
-        )
+        signals.write_payload(conn, int(signal_id),
+                              payload=json.dumps(payload, ensure_ascii=False))
     except sqlite3.Error:
         pass
 
@@ -546,6 +541,7 @@ def _retire_for_retry(
     reason: str,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     release_batch: bool = False,
     now: dt.datetime | None = None,
 ) -> bool:
@@ -566,90 +562,24 @@ def _retire_for_retry(
     moment = now or _now()
     order_id = int(row["id"])
     signal_id = row.get("signal_id")
-    conn.execute(
-        """UPDATE paper_orders
-              SET status='superseded',
-                  reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
-            WHERE id=?""",
-        (reason, _iso(moment), order_id),
-    )
+    POL.supersede_order(conn, order_id, reason=reason, cancelled_at=_iso(moment))
     _release_reservation(conn, order_id, release_reservation)
     if release_batch and signal_id is not None:
         _write_signal_marker(conn, signal_id, BATCH_RELEASE_PAYLOAD_KEY, {
             "released": True, "reason": reason,
-        }, now=moment)
+        }, signals=signals, now=moment)
     if signal_id is not None:
-        terminal = ",".join("?" for _ in TERMINAL_SIGNAL_STATUSES)
         if _signal_alive(conn, signal_id, now=moment):
-            conn.execute(
-                f"""UPDATE paper_signals SET status=?,reason=?
-                     WHERE id=? AND status NOT IN ({terminal})""",
-                (RETRY_SIGNAL_STATUS, reason, int(signal_id),
-                 *TERMINAL_SIGNAL_STATUSES),
-            )
+            signals.reopen_for_retry(conn, int(signal_id), reason=reason,
+                                     terminal_statuses=TERMINAL_SIGNAL_STATUSES)
         else:
-            conn.execute(
-                f"""UPDATE paper_signals SET status='expired',
-                         reason=COALESCE(reason,'') || '；' || ?
-                     WHERE id=? AND status NOT IN ({terminal})""",
-                (reason + "；信号已过有效期，一并失效", int(signal_id),
-                 *TERMINAL_SIGNAL_STATUSES),
-            )
+            signals.expire_after_order_retry(
+                conn, int(signal_id), reason=reason,
+                terminal_statuses=TERMINAL_SIGNAL_STATUSES)
     return True
 
 
-def expire_order(conn, order_id, *, reason, cancelled_at):
-    """持久化订单自身过期；调用方给出身份、原因和时间，且负责事务。"""
-    conn.execute(
-        """UPDATE paper_orders
-                  SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
-                WHERE id=?""",
-        (EXPIRED_ORDER_STATUS, reason, cancelled_at, order_id),
-    )
-
-
-def supersede_for_expired_signal(conn, order_id, *, cancelled_at):
-    """持久化失效信号名下的活动买单回收；保持 superseded 及原状态条件。"""
-    conn.execute(
-        """UPDATE paper_orders
-                  SET status='superseded',reason=COALESCE(reason,'') || '；信号已失效，委托回收',
-                      cancelled_at=?
-                WHERE id=? AND status IN (?,?,?,?,?)""",
-        (cancelled_at, order_id, *ELC.RECOVERABLE_ORDER_STATUSES),
-    )
-
-
-def supersede_duplicate_execution_retry(conn, order_id):
-    """同一信号只保留最新执行重试：把旧的重试行写 superseded。
-
-    调用方已按 ``signal_id,id DESC`` 判定"哪条算最新"，并负责随后的预占释放；
-    本入口只做原状态迁移，``WHERE`` 条件保证同一行不会被重复改写。
-    """
-    conn.execute(
-        """UPDATE paper_orders
-              SET status='superseded',
-                  reason=COALESCE(reason,'') || '；同一信号仅保留最新执行重试'
-            WHERE id=? AND status='execution_retry'""",
-        (order_id,),
-    )
-
-
-def supersede_for_terminal_signal(conn, order_id, *, reason):
-    """回收关联终态信号的遗留活动委托；原因文本由调用方按信号状态决定。
-
-    原状态集合 ``ENTRY_RETRY_ORDER_STATUSES`` 逐个占位，保持"只退役可重试态"的
-    保护；owner 不读时钟、不释放预占、不提交。
-    """
-    conn.execute(
-        """UPDATE paper_orders
-              SET status='superseded',
-                  reason=COALESCE(reason,'') || '；' || ?
-            WHERE id=? AND status IN (?,?,?,?,?,?,?)""",
-        (reason, order_id, *ELC.ENTRY_RETRY_ORDER_STATUSES),
-    )
-
-
-def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses):
+def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses, signals):
     """回收同一标的下的旧等待池记录及其信号。
 
     调用方（``paper_trading`` 的启动恢复）已判定"较新记录保留"，本入口只按原
@@ -657,32 +587,8 @@ def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses):
     两条语句的顺序是契约 —— 信号集合由订单的 ``reason`` 标记反查，先信号后订单
     会漏掉本轮新标记的行。使用传入连接，不读时钟、不提交。
     """
-    conn.execute(
-        """UPDATE paper_orders AS older
-           SET status='superseded',
-               reason=COALESCE(older.reason,'') || '；同标的较新等待池记录已保留'
-           WHERE older.side='buy' AND older.status='deferred_capacity'
-             AND EXISTS(
-                 SELECT 1 FROM paper_orders AS newer
-                 WHERE newer.account_id=older.account_id
-                   AND newer.code=older.code AND newer.side='buy'
-                   AND newer.status IN ('deferred_capacity',?)
-                   AND newer.id>older.id
-             )""",
-        (waitlist_status,),
-    )
-    conn.execute(
-        """UPDATE paper_signals
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代'
-           WHERE id IN (
-               SELECT signal_id FROM paper_orders
-               WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
-                 AND reason LIKE '%等待池记录已保留%'
-           )
-             AND status IN (?,?,?)""",
-        tuple(signal_statuses),
-    )
+    POL.retire_duplicate_waitlist_orders(conn, waitlist_status=waitlist_status)
+    signals.retire_waitlist_signals(conn, statuses=signal_statuses)
 
 
 def _terminate(
@@ -692,22 +598,17 @@ def _terminate(
     reason: str,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     terminal_signal: bool = True,
     signal_status: str = "rejected",
 ) -> None:
     order_id = int(row["id"])
     _release_reservation(conn, order_id, release_reservation)
-    conn.execute(
-        """UPDATE paper_orders
-              SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
-            WHERE id=?""",
-        (status, reason, _iso(_now()), order_id),
-    )
+    POL.terminate_order(conn, order_id, status=status, reason=reason,
+                        cancelled_at=_iso(_now()))
     if terminal_signal and row.get("signal_id") is not None:
-        conn.execute(
-            "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-            (signal_status, reason, int(row["signal_id"])),
-        )
+        signals.terminate_for_dispatch(conn, int(row["signal_id"]),
+                                       status=signal_status, reason=reason)
 
 
 def retire_gated_orders(conn, signal_id, *, release_reservation: Callable[..., Any],
@@ -725,12 +626,8 @@ def retire_gated_orders(conn, signal_id, *, release_reservation: Callable[..., A
         return 0
     for row in rows:
         order_id = int(row["id"])
-        conn.execute(
-            """UPDATE paper_orders
-                  SET status='superseded',reason=COALESCE(reason,'') || '；' || ?
-                WHERE id=? AND status IN (?,?)""",
-            (reason, order_id, *GATED_ORDER_STATUSES),
-        )
+        POL.retire_gated_order(conn, order_id, reason=reason,
+                              statuses=GATED_ORDER_STATUSES)
         _release_reservation(conn, order_id, release_reservation)
     return len(rows)
 
@@ -739,6 +636,7 @@ def sweep_expired_gated_orders(
     conn,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -768,7 +666,8 @@ def sweep_expired_gated_orders(
             _terminate(
                 conn, row, "superseded",
                 "关联信号已进入终态，挂起委托回收",
-                release_reservation=release_reservation, terminal_signal=False,
+                release_reservation=release_reservation, signals=signals,
+                terminal_signal=False,
             )
             summary["retired"] += 1
             continue
@@ -790,14 +689,16 @@ def sweep_expired_gated_orders(
             _terminate(
                 conn, row, EXPIRED_ORDER_STATUS,
                 "严格时限画像到期未成交，委托作废",
-                release_reservation=release_reservation, signal_status="expired",
+                release_reservation=release_reservation, signals=signals,
+                signal_status="expired",
             )
             summary["expired"] += 1
         else:
             _retire_for_retry(
                 conn, row,
                 "执行时限到期，挂起委托作废；信号仍新鲜时由下一轮重建新委托",
-                release_reservation=release_reservation, release_batch=True, now=moment,
+                release_reservation=release_reservation, signals=signals,
+                release_batch=True, now=moment,
             )
             summary["released"] += 1
     return summary
@@ -807,12 +708,13 @@ def run_execution_dispatch(
     conn,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """周期清扫入口（每轮扫描调用一次），返回本轮处置摘要。"""
     return sweep_expired_gated_orders(
-        conn, release_reservation=release_reservation,
+        conn, release_reservation=release_reservation, signals=signals,
         now=now, dispatch_settings=dispatch_settings)
 
 
@@ -893,6 +795,7 @@ def resolve_verification(
     order_id: int,
     *,
     release_reservation: Callable[..., Any],
+    signals,
     approved: bool,
     operator: str = "",
     note: str = "",
@@ -919,20 +822,21 @@ def resolve_verification(
         "note": str(note or "")[:500],
         "order_id": int(order_id),
     }
-    _write_signal_marker(conn, signal_id, VERIFICATION_PAYLOAD_KEY, decision, now=now)
+    _write_signal_marker(conn, signal_id, VERIFICATION_PAYLOAD_KEY, decision,
+                         signals=signals, now=now)
     if approved:
         # PR-29：放行不是把挂起行原地改写为重试行，而是作废本次挂起尝试；
         # 放行结论已写入信号 payload，下一轮由信号重建新委托（新 expires_at）。
         _retire_for_retry(
             conn, record,
             f"人工核验放行（{decision['operator'] or '运营'}）：{note or '无备注'}",
-            release_reservation=release_reservation, now=now,
+            release_reservation=release_reservation, signals=signals, now=now,
         )
     else:
         _terminate(
             conn, record, CANCELLED_ORDER_STATUS,
             f"人工核验驳回（{decision['operator'] or '运营'}）：{note or '无备注'}",
-            release_reservation=release_reservation,
+            release_reservation=release_reservation, signals=signals,
         )
     return {
         "ok": True,

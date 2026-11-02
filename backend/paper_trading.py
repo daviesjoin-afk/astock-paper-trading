@@ -90,6 +90,7 @@ import adaptive_selection_compat as ASC
 # 但这两个模块本身仍是 facade 的依赖，不能随 cleanup 一起删掉 import。
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
+import paper_order_ledger as POL
 import paper_slot_service as PSS
 import paper_numeric as PNum
 import strategy_champion as SCM
@@ -1242,22 +1243,18 @@ def _record_entry_frozen_waitlist(
     strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
         conn, account_id, signal_id, cycle_id=order_cycle_id(conn, cycle_id),
     )
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(
-               account_id,signal_id,side,code,name,qty,planned_price,status,reason,
-               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
-               retry_of_order_id,cycle_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            account_id, signal_id, "buy", code, name, max(0, int(_num(qty))),
-            _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
-            _json(payload), "strategy", _now(),
-            strategy_id, strategy_version, strategy_checksum,
-            _previous_attempt_order_id(conn, signal_id, order_cycle_id(conn, cycle_id)),
-            order_cycle_id(conn, cycle_id),
-        ),
+    order_id = POL.insert_order(
+        conn,
+        account_id=account_id, signal_id=signal_id, side="buy", code=code, name=name,
+        qty=max(0, int(_num(qty))), planned_price=_num(planned_price, None),
+        status=ENTRY_FROZEN_WAITLIST_STATUS, reason=reason, risk_payload=_json(payload),
+        origin="strategy", created_at=_now(),
+        strategy_id=strategy_id, strategy_version=strategy_version,
+        strategy_checksum=strategy_checksum,
+        retry_of_order_id=_previous_attempt_order_id(
+            conn, signal_id, order_cycle_id(conn, cycle_id)),
+        cycle_id=order_cycle_id(conn, cycle_id),
     )
-    order_id = int(cursor.lastrowid)
     _risk_log(conn, account_id, code, "buy", ENTRY_FROZEN_WAITLIST_STATUS, reason, payload)
     audit(conn, account_id, ENTRY_FROZEN_WAITLIST_STATUS, f"{source}: {code} order={order_id}")
     return order_id, True, reason, payload
@@ -1584,7 +1581,7 @@ def _recover_stale_runtime_state(conn, *, boot_recovery=False):
     # 信号按刚写入的原因标记反查，否则本轮新标记的行会被漏掉。
     EPD.retire_duplicate_waitlist(
         conn, waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
-        signal_statuses=ENTRY_RETRY_SIGNAL_STATUSES,
+        signal_statuses=ENTRY_RETRY_SIGNAL_STATUSES, signals=SIG,
     )
 
 
@@ -1624,7 +1621,7 @@ def _reconcile_signal_order_states(conn):
     for retry in retry_rows:
         signal_id = int(retry["signal_id"])
         if signal_id in seen_retry_signals:
-            EPD.supersede_duplicate_execution_retry(conn, int(retry["id"]))
+            POL.supersede_duplicate_execution_retry(conn, int(retry["id"]))
             _finish_capital_reservation(conn, int(retry["id"]), "released")
         else:
             seen_retry_signals.add(signal_id)
@@ -1682,7 +1679,8 @@ def _reconcile_signal_order_states(conn):
                 if signal_status != "superseded" else
                 "信号已替代，回收遗留活动等待委托"
             )
-            EPD.supersede_for_terminal_signal(conn, order_id, reason=reason)
+            POL.supersede_for_terminal_signal(conn, order_id, reason=reason,
+                                              statuses=order_statuses)
             PCR.release_order_reservation(conn, order_id, now=now)
             reconciled += 1
             continue
@@ -1782,13 +1780,7 @@ def _supersede_signal_execution_retries(conn, signal_id):
     # second insert when a scheduler process is recovered.
     for row in rows:
         order_id = int(row["id"])
-        conn.execute(
-            """UPDATE paper_orders
-                  SET status='superseded',
-                      reason=COALESCE(reason,'') || '；新一轮执行重试已接管'
-                WHERE id=? AND status='execution_retry'""",
-            (order_id,),
-        )
+        POL.supersede_previous_execution_retry(conn, order_id)
         _finish_capital_reservation(conn, order_id, "released")
     return len(rows)
 
@@ -8016,7 +8008,7 @@ def resolve_execution_verification(order_id, approved, operator="", note=""):
     with _db(immediate=True, hot_path=True) as conn:
         return EPD.resolve_verification(
             conn, int(order_id),
-            release_reservation=PCR.release_order_reservation,
+            release_reservation=PCR.release_order_reservation, signals=SIG,
             approved=bool(approved),
             operator=str(operator or "")[:64], note=str(note or "")[:500],
         )
@@ -12717,8 +12709,9 @@ def run_slot(slot, asof_date=None, force=False, *, risk_snapshot_background=True
             db_factory=_db,
             audit=audit,
             resolve_asof_day=lambda: _date(asof_date),
-            expire_order=EPD.expire_order, expire_signal=SIG.expire_for_expired_order,
-            expire_stale_signal=SIG.expire_stale_signal, supersede_order=EPD.supersede_for_expired_signal,
+            expire_order=POL.expire_order, expire_signal=SIG.expire_for_expired_order,
+            expire_stale_signal=SIG.expire_stale_signal, supersede_order=POL.supersede_for_expired_signal,
+            signals=SIG,
         )
     day = _date(asof_date)
     result = _run_slot_impl(slot, day=day, force=force)
@@ -14542,6 +14535,8 @@ def _bind_application_dependencies():
         "consume_available_lots": (PLL, "consume_available_lots"),
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),
+        "cancel_order": (POL, "cancel_order"),
+        "insert_order": (POL, "insert_order"),
     }
     import manual_orders as MO
     MO.bind_dependencies(

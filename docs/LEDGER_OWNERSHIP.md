@@ -324,3 +324,219 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 本批实测：`cross_domain_edges` 629（不变）、`import_cycles`/`foundation_violations` 均0、
 `max_file_lines` 14599→14580、`max_function_lines` 1184、`duplicate_helpers` 296、
 `dynamic_name_bridges` 72、`unsuffixed_module_ratio` 0.3906，所有预算不变。
+
+## 16. PR-10 收尾清单与 A–E 工作包（冻结）
+
+基线 `master` @ `8e3c22d`（#318 合并后）。本节把 PR-10 剩下的工作一次性固定下来：
+四张 `pending` 表（`paper_orders` / `paper_signals` / `paper_accounts` / `paper_cycles`）
+的运行时写入逐条登记到操作、判定者、最终 owner、事务边界与工作包，不再按"一条 UPDATE
+一批"的方式推进。清单由 `backend/tools/ledger_write_inventory.py` 扫描源码生成，
+人工判定落在 `backend/ledger_owner_plan.json`，守卫见
+`backend/test_ledger_owner_plan.py`（计划与源码不一致时直接变红）。
+
+### 16.1 扫描口径
+
+* 只登记**真实写目标**：`UPDATE / INSERT [OR ...] INTO / DELETE FROM / REPLACE INTO`
+  后的第一张表；语句里 `FROM` / `JOIN` 引用的表记为读引用（`read_refs`），
+  不再像 `write_sites()` 那样把子查询里的订单表算成订单写入。
+* 运行时之外的模块分角色登记，不混入写方集合：`test` / `seed`（`demo_seed`）/
+  `migration`（`paper_schema_migrations`、`db_migrate`、`recover_legacy_...`）/
+  `fixture`（`execution_quality_shadow`）。
+* 动态拼接（f-string / `+` / `%`）单独标 `kind=dynamic`，已知动态路径按归属人工登记，
+  不静默跳过。
+
+### 16.2 最终写入 owner 模型
+
+| 角色 | 归属 | 说明 |
+| --- | --- | --- |
+| 业务判定者 | 各阶段原有模块 | 决定"能不能做、目标状态是什么"，不搬家 |
+| 事务协调者 | 各入口原有函数 | 决定顺序、提交与回滚，不拆分 |
+| 表写入 owner | 下表 | 只做该表已授权的持久化 |
+
+| 表 | 最终写入 owner | 状态 |
+| --- | --- | --- |
+| `paper_orders` | `paper_order_ledger` | existing（A 包第一片已建立） |
+| `paper_signals` | `signal_service` | existing |
+| `paper_accounts`（现金） | `paper_shared_cash` | existing |
+| `paper_accounts`（创建） | `paper_user_account_provisioning` | existing |
+| `paper_accounts`（cycle 身份/启停） | `paper_user_cycle_attachment` | existing |
+| `paper_accounts`（参数/版本/限额/冷却） | `paper_account_config`（C 包新建） | planned |
+| `paper_cycles` | `paper_cycle_service` | existing |
+
+`paper_order_ledger` 只承担**订单行持久化**：创建 INSERT、状态迁移、成交结果字段、
+核验戳、归档删除。成交判定仍唯一属于 `commit_fill`；`paper_order_ledger` 不允许
+自己算成交价、费用、可卖量或 BUY 数量，也不 commit。
+
+账户不接受"任意字段字典"接口：现金、身份、配置三组字段分别归三个 owner，
+`paper_accounts` 不会因为收口而变成一个大 Manager。
+
+### 16.3 工作包与出口
+
+| 包 | 范围 | 出口证据 |
+| --- | --- | --- |
+| **A** | 订单/信号非成交生命周期：重试接管、等待池替代、手动取消/终止、派发等待与回收 | 调用方不再自行拼订单/信号状态 UPDATE；退役范围、原因、时钟、预占调用、统计与基线逐项对照 |
+| **B** | 订单创建、成交结果、核验戳与信号执行反馈 | 保留 `commit_fill` 唯一成交权威；自动/手动/延期/部分成交/核验/失败路径投影一致 |
+| **C** | `paper_accounts` 四组：创建补齐、现金、身份挂接、配置补偿 | 每组字段有唯一入口；现金算法与版本检查不变；13 个写方逐项归类完毕 |
+| **D** | `paper_cycles` 完整生命周期与跨表归档事务 | 创建/配置/启停/归档/恢复都有 owner；归档不删历史事实、不覆盖未知归属 |
+| **E** | 十张核心表读取契约、守卫校准、跨包最终回归与关闭报告 | 逐表权威读/投影/允许调用方/事务归属成文；关键负向测试与完整 CI 通过 |
+
+A–D 完成、且守卫与源码一致之后，四张表才允许从 `pending` 改 `owned`；只改标签不算完成。
+E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目标、不建通用数据库审计框架。
+
+### 16.4 剩余写入清单（自动生成）
+
+以下表格由 `python backend/tools/ledger_write_inventory.py --markdown` 生成，
+`test_ledger_owner_plan.py` 会比对"源码扫描结果 ↔ 计划 ↔ 本节内容"三者一致。
+
+<!-- ledger-owner-plan:start -->
+### 工作包 A
+
+| 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `paper_orders` | 用户撤单：订单转 cancelled（可撤销状态白名单） | `paper_order_ledger::cancel_order` | 手动入口校验 + 用户请求 | `paper_order_ledger` | 服务入口传入的连接 | `test_dependency_contract`、`test_operator_boundary`、`test_order_ledger` |
+| `paper_orders` | 订单自身过期终态 expired | `paper_order_ledger::expire_order` | entry_lifecycle 判定，dispatch 落库 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ledger` |
+| `paper_orders` | 订单创建（INSERT）：冻结等待池标记（B 包将复用同一入口） | `paper_order_ledger::insert_order` | paper_trading 入场闸门 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_dependency_contract`、`test_execution_verification`、`test_order_ledger` |
+| `paper_orders` | 等待池重复记录退役（订单，批量） | `paper_order_ledger::retire_duplicate_waitlist_orders` | paper_trading 启动恢复 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_order_ledger`、`test_waitlist_dedupe_write` |
+| `paper_orders` | 挂起订单退役（batch/verification 等待超时） | `paper_order_ledger::retire_gated_order` | execution_dispatch 等待窗口 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_dispatch`、`test_order_ledger` |
+| `paper_orders` | 重复执行重试退旧 superseded | `paper_order_ledger::supersede_duplicate_execution_retry` | paper_trading 对账循环 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_ledger_ownership`、`test_order_ledger`、`test_signal_order_reconcile_write` |
+| `paper_orders` | 失效信号名下买单回收 superseded | `paper_order_ledger::supersede_for_expired_signal` | entry_lifecycle 失效判定 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ledger` |
+| `paper_orders` | 终态信号遗留委托回收 | `paper_order_ledger::supersede_for_terminal_signal` | paper_trading 对账循环 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_ledger_ownership`、`test_order_ledger`、`test_signal_order_reconcile_write` |
+| `paper_orders` | 重试接管/Dispatch 退役：订单转 superseded（含取消时间） | `paper_order_ledger::supersede_order` | execution_dispatch 重试接管判定 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ledger` |
+| `paper_orders` | 新一轮执行重试接管：退役全部旧重试 | `paper_order_ledger::supersede_previous_execution_retry` | paper_trading 重试发起 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_order_ledger` |
+| `paper_orders` | 派发终止：订单转调用方判定的终态 | `paper_order_ledger::terminate_order` | execution_dispatch 派发阶段 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_order_ledger` |
+| `paper_signals` | 重试接管：过期信号一并收敛 expired | `signal_service::expire_after_order_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 订单过期联动信号 expired | `signal_service::expire_for_expired_order` | entry_lifecycle 过期判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_order_ttl_lifecycle` |
+| `paper_signals` | 信号自身失效 expired | `signal_service::expire_stale_signal` | entry_lifecycle 失效判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_paper_slot_service` |
+| `paper_signals` | 信号状态对账 | `signal_service::reconcile_signal_status` | paper_trading 对账循环 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_ledger_ownership`、`test_signal_order_reconcile_write` |
+| `paper_signals` | 重试接管：信号回到复试管道 | `signal_service::reopen_for_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 等待池重复记录退役（信号） | `signal_service::retire_waitlist_signals` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_waitlist_dedupe_write` |
+| `paper_signals` | 派发终止：信号写终态（rejected/expired 白名单） | `signal_service::terminate_for_dispatch` | execution_dispatch 派发阶段 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 信号 payload 标记写入 | `signal_service::write_payload` | execution_dispatch 批次/核验标记 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+
+### 工作包 B
+
+| 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `paper_orders` | 成交结果写入（状态/成交价/费用/证据） | `execution_planner::commit_fill` | commit_fill 唯一成交权威 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
+| `paper_orders` | 历史订单核验戳补齐（维护） | `execution_verification::backfill_legacy_orders` | execution_verification 兼容规则 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_verification`、`test_tradability_position_shadow_architecture_guard` |
+| `paper_orders` | 执行核验戳写入 | `execution_verification::stamp_order` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_verification`、`test_execution_verification_wiring`、`test_paper_trading_architecture_guard` |
+| `paper_orders` | 零成交终态订单核验戳 | `execution_verification::stamp_terminal_zero_orders` | execution_verification 核验结论 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_portfolio_read_model` |
+| `paper_orders` | 策略买入订单创建（INSERT） | `manual_orders::_commit_strategy_buy` | manual_orders 策略入口 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_adaptive_dependency_boundary`、`test_execution_planner`、`test_learning_dataset` |
+| `paper_signals` | 策略成交联动信号状态 | `manual_orders::commit_strategy_entry_fill` | commit_fill 成交结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard` |
+| `paper_orders` | 手动委托执行状态推进 | `manual_orders::process_pending_manual_orders` | manual_orders 执行循环 | `paper_order_ledger` | 服务入口传入的连接 | `test_deferred_fill_cycle_binding`、`test_paper_timing`、`test_paper_trading_architecture_guard` |
+| `paper_orders` | 策略成交失败回写（订单侧） | `manual_orders::strategy_fill_failure` | commit_fill 失败结果 | `paper_order_ledger` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard`、`test_strategy_buy_commit_convergence` |
+| `paper_signals` | 成交失败：信号回 deferred_capacity | `manual_orders::strategy_fill_failure` | commit_fill 失败结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_paper_trading_architecture_guard`、`test_strategy_buy_commit_convergence` |
+| `paper_orders` | 手动下单订单创建（INSERT） | `manual_orders::submit_manual_order` | 手动入口校验 + 风险决定 | `paper_order_ledger` | 服务入口传入的连接 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
+| `paper_orders` | 风险拒绝订单创建（INSERT） | `paper_risk_writes::<module>` | 风控拒绝结论（paper_risk_writes 模块级工厂） | `paper_order_ledger` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_adaptive_dependency_boundary`、`test_adaptive_experiment_evidence_ownership` |
+| `paper_signals` | 当日信号引导：替代旧信号 | `paper_trading::_bootstrap_signals_for_today` | paper_trading 引导规则 | `signal_service` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_provenance_inflight_change` |
+| `paper_orders` | 自动买入订单创建（INSERT） | `paper_trading::_buy_order` | paper_trading 入场决策 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
+| `paper_signals` | 买入联动信号状态/原因/payload | `paper_trading::_buy_order` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | `test_activity_overview_slim`、`test_ai_advice_service`、`test_deferred_fill_cycle_binding` |
+| `paper_signals` | 订单意图收紧：信号 rejected | `paper_trading::_enforce_order_intent` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | `test_order_intent_contract`、`test_paper_trading_architecture_guard` |
+| `paper_orders` | 卖出订单创建（INSERT） | `paper_trading::_intraday_sell` | paper_trading 风控/止盈决策 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_ai_advice_service`、`test_execution_verification_wiring`、`test_paper_trading_architecture_guard` |
+| `paper_orders` | 已实现盈亏回填 realized_pnl | `paper_trading::_rebuild_realized_pnl` | paper_trading 重建口径 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_execution_verification` |
+| `paper_signals` | 开盘信号过期（expired） | `paper_trading::execute_open` | paper_trading 开盘窗口规则 | `signal_service` | 调用方同一连接与原事务 | `test_adaptive_dependency_boundary`、`test_learning_dataset`、`test_learning_evaluation` |
+| `paper_signals` | 快速入场等待：信号 deferred_capacity | `paper_trading::monitor_fast_entries` | paper_trading 盘中复核 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_orders` | 执行结果状态推进（含 execution_version 乐观锁） | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `paper_order_ledger` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |
+| `paper_signals` | 执行结果回写信号状态 | `paper_trading::process_pending_execution_orders` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | `test_open_execution_risk_reuse`、`test_paper_timing`、`test_production_path_golden_replay` |
+| `paper_signals` | 信号写入语句（INSERT OR IGNORE / REFRESH） | `signal_service::conflict_statement` | signal_service 冲突策略 | `signal_service` | 调用方同一连接与原事务 | `test_signal_pipeline`、`test_strategy_selection_provenance` |
+
+### 工作包 C
+
+| 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `paper_accounts` | 参数回滚恢复（params/version） | `adaptive_engine::_restore_paper_account` | adaptive_engine 回滚规则 | `paper_account_config` | 调用方同一连接与原事务 | `test_paper_repository` |
+| `paper_accounts` | 风险自适应参数回滚收尾 | `adaptive_risk::_finish_rollback` | adaptive_risk 回滚规则 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 风险自适应候选参数应用 | `adaptive_risk::apply_candidate` | adaptive_risk 采纳规则 | `paper_account_config` | 调用方同一连接与原事务 | `test_adaptive_experiment_evidence_ownership`、`test_ai_adoption_writer`、`test_evolution_reward_attribution` |
+| `paper_accounts` | 选择自适应参数回滚收尾 | `adaptive_selection::_finish_rollback` | adaptive_selection 回滚规则 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 选择自适应候选参数应用 | `adaptive_selection::apply_candidate` | adaptive_selection 采纳规则 | `paper_account_config` | 调用方同一连接与原事务 | `test_adaptive_experiment_evidence_ownership`、`test_ai_adoption_writer`、`test_evolution_reward_attribution` |
+| `paper_accounts` | legacy 参数单位迁移 | `adaptive_selection_compat::migrate_legacy_selection_units` | 兼容迁移规则 | `paper_account_config` | 服务入口传入的连接 | `test_legacy_factor_unit_migration` |
+| `paper_accounts` | 进化结果参数写入 | `evolution_apply::write_account_params` | evolution_apply 版本检查 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 共享现金回补 | `paper_shared_cash::credit_shared_cash` | paper_shared_cash 资金规则 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
+| `paper_accounts` | 共享现金扣减 | `paper_shared_cash::debit_shared_cash` | paper_shared_cash 资金规则 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
+| `paper_accounts` | 内置账户创建与字段补齐 | `paper_trading::_ensure_accounts` | paper_trading 账户引导 | `paper_user_account_provisioning` | 启动恢复/初始化连接 | `test_execution_verification_probe`、`test_paper_user_account_provisioning` |
+| `paper_accounts` | legacy 引导：账户 cycle_id 清空与暂停 | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_user_cycle_attachment` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
+| `paper_accounts` | 共享现金对账调整 | `paper_trading::_reconcile_shared_cash` | paper_trading 现金对账口径 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_paper_user_cycle_attachment`、`test_shared_pool_late_join` |
+| `paper_accounts` | 账户冷却窗口 cooldown_until | `paper_trading::_shared_risk_state` | paper_trading 风控状态 | `paper_account_config` | 调用方同一连接与原事务 | `test_cycle_funds`、`test_r32e1_active_buy_provenance`、`test_strategy_buy_commit_convergence` |
+| `paper_accounts` | 周度参数应用（params/version） | `paper_trading::_weekly_review` | 周度复盘结论 | `paper_account_config` | 调用方同一连接与原事务 | `test_paper_schedule_contract` |
+| `paper_accounts` | 周期资金配置（账户侧现金/基准净值） | `paper_trading::configure_capital` | 配置入口校验 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_strategy_roster` |
+| `paper_accounts` | 新建周期时账户挂接重置 | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
+| `paper_accounts` | 账户风格字段 | `paper_trading::set_account_style` | 配置入口校验 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 账户启停状态字段 | `paper_trading::set_accounts_status` | 启停入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_resume_three_strategy_cycle` |
+| `paper_accounts` | 用户策略账户创建（INSERT） | `paper_user_account_provisioning::provision_user_accounts` | provisioning 规则 | `paper_user_account_provisioning` | 服务入口传入的连接 | `test_paper_user_account_provisioning` |
+| `paper_accounts` | 用户账户周期挂接对账 | `paper_user_cycle_attachment::reconcile_user_cycle_accounts` | 账户挂接规则 | `paper_user_cycle_attachment` | 服务入口传入的连接 | `test_paper_user_cycle_attachment` |
+
+### 工作包 D
+
+| 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `paper_orders` | 周期切换时终止跨周期残留委托 | `manual_orders::_terminalize_cycle_stale_order` | manual_orders 周期归属判定 | `paper_order_ledger` | 服务入口传入的连接 | `test_entry_capital_asof`、`test_paper_trading_architecture_guard` |
+| `paper_cycles` | 周期归档 archived | `paper_cycle_service::archive_cycle` | 归档入口规则 | `paper_cycle_service` | 服务入口传入的连接 | `test_order_cycle_provenance`、`test_paper_cycle_ownership`、`test_paper_cycle_service` |
+| `paper_orders` | 归档/清理超龄订单行（DELETE） | `paper_trading::_cleanup_stale_data` | paper_trading 归档策略 | `paper_order_ledger` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_position_review_provenance` |
+| `paper_signals` | 归档/清理超龄信号行（DELETE） | `paper_trading::_cleanup_stale_data` | paper_trading 归档策略 | `signal_service` | 启动恢复/初始化连接 | `test_paper_timing`、`test_paper_trading_architecture_guard`、`test_position_review_provenance` |
+| `paper_cycles` | legacy 周期引导创建（INSERT） | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_cycle_service` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
+| `paper_cycles` | 周期资金配置（capital） | `paper_trading::configure_capital` | 配置入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_strategy_roster` |
+| `paper_cycles` | 周期创建（INSERT） | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
+| `paper_cycles` | 周期启停状态/started_at | `paper_trading::set_accounts_status` | 启停入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_resume_three_strategy_cycle` |
+<!-- ledger-owner-plan:end -->
+
+### 16.5 工作包 A 进展
+
+**A 第一片（本 PR）**：建立 `backend/paper_order_ledger.py` 作为 `paper_orders` 唯一持久化入口，
+先接非成交生命周期的写入：
+
+| 原写入点 | 新入口 |
+| --- | --- |
+| `execution_dispatch.expire_order` | `POL.expire_order` |
+| `execution_dispatch.supersede_for_expired_signal` | `POL.supersede_for_expired_signal` |
+| `execution_dispatch.supersede_duplicate_execution_retry` | `POL.supersede_duplicate_execution_retry` |
+| `execution_dispatch.supersede_for_terminal_signal` | `POL.supersede_for_terminal_signal`（状态词表由调用方传入） |
+| `execution_dispatch._retire_for_retry` 的订单写 | `POL.supersede_order` |
+| `execution_dispatch._terminate` 的订单写 | `POL.terminate_order`（终态白名单校验） |
+| `execution_dispatch.retire_gated_orders` 的订单写 | `POL.retire_gated_order` |
+| `execution_dispatch.retire_duplicate_waitlist` 的订单写 | `POL.retire_duplicate_waitlist_orders` |
+
+`execution_dispatch` 至此**不再写 `paper_orders`**（守卫 `test_order_ledger` 用源码断言守住），
+它只保留派发阶段的判定、顺序、预占释放与信号写入。信号写入的收口（`_retire_for_retry` /
+`_terminate` / `retire_duplicate_waitlist` / `_write_signal_marker` → `signal_service`）是 A 的下一片。
+
+**A 第二片**：`execution_dispatch` 的信号写入并入 `signal_service`，它不再写 `paper_signals`
+（信号写方集合 4 → 3 个模块：`paper_trading` / `manual_orders` / `signal_service`）：
+
+| 原写入点 | 新入口 |
+| --- | --- |
+| `_write_signal_marker` 的 payload 写 | `SIG.write_payload` |
+| `_retire_for_retry` 的"回到复试"分支 | `SIG.reopen_for_retry` |
+| `_retire_for_retry` 的"信号过期"分支 | `SIG.expire_after_order_retry` |
+| `_terminate` 的信号终态写 | `SIG.terminate_for_dispatch`（rejected / expired 白名单） |
+| `retire_duplicate_waitlist` 的信号写 | `SIG.retire_waitlist_signals`（身份由 `POL.signal_ids_by_reason_marker` 反查，读取留在调用方） |
+
+依赖方向按既有约定处理：`execution_dispatch` **不 import** `signal_service`，由组装根经
+`paper_slot_service.run_preflight` 传入 `signals` 端口（与 `release_reservation` 同一种注入方式），
+因此没有新增跨域边；`paper_slot_service` 也不再 import 信号 owner。
+
+**A 第三片**：最后三条订单写入归位 —— `_supersede_signal_execution_retries` →
+`POL.supersede_previous_execution_retry`、`manual_orders.cancel_manual_order` →
+`POL.cancel_order`（只动调用方给的可撤销状态，返回受影响行数供调用方保留"已成交"错误）、
+`_record_entry_frozen_waitlist` 的 INSERT → `POL.insert_order`（列集合逐字保留，业务侧算好
+策略戳/血缘/payload 再传入；B 包创建路径复用同一入口）。
+
+`manual_orders` 不 import owner：`cancel_order` 声明进它的 `ManualOrderDependencies` 容器、
+由组装根绑定（与 lot / provenance 能力同法），因此没有新增 other 域 → paper 域的边。
+
+**A 包写入面到此收口**：`ledger_owner_plan.json` 里 A 的 19 条操作全部迁移完毕
+（当前模块 == 目标 owner 的检查为 0 条待办）。`paper_orders` / `paper_signals` 仍保持
+`pending` —— B（创建、成交结果、核验戳）与 D（归档联动）还有写入没搬，标签不能提前改。
+
+成本登记：新增一个含 SQL 的 owner 模块 → `raw_sql_modules` 141→142、
+`paper_table_fanout_max` 50→51、`cross_domain_edges` 629→630（`execution_dispatch → paper_order_ledger`），
+均通过 `FEATURE_ALLOWANCE` 显式登记并写入 `docs/COUPLING_BUDGET.md`；`HEAD_BUDGET` 与 lock 不动，
+B/C/D 搬走写入后必须收回。
+
+
+### A 包复审修复（2026-11-02）
+
+等待池信号恢复使用单条 UPDATE + 订单集合子查询；绑定参数仅随固定状态集合变化。保留先订单后信号、不提交、不吞错的边界。32 参数上限下 80 条历史订单（含重复信号）、终态/活动信号对照及 ABORT 回滚验证通过。相关回归 32 项通过。
+
+### A 独立交付预算修复（2026-11-02）
+
+恢复集合子查询使信号 owner 新增订单引用，A 单独交付的 paper_table_fanout_max 曾达 52（上限 51）。账户指标原有的非 filled 委托计数改为调用订单 owner 的窄只读接口 nonfilled_order_count；原 SELECT、状态过滤、缓存分支与事务边界不变，避免另一模块直接绑定表结构。实际模块引用降回 51，没有提高预算、改变域分类或新增跨域边。

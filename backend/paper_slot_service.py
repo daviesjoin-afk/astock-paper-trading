@@ -35,7 +35,8 @@ def _best_effort_audit(db_factory, audit: Callable, event: str, detail: str) -> 
 
 def run_preflight(*, db_factory, audit: Callable, resolve_asof_day: Callable,
                   expire_order: Callable, expire_signal: Callable,
-                  expire_stale_signal: Callable, supersede_order: Callable) -> dict:
+                  expire_stale_signal: Callable, supersede_order: Callable,
+                  signals) -> dict:
     """Run cleanup in the legacy order and keep failures fail-soft + audited.
 
     ``resolve_asof_day`` is invoked *inside* the lifecycle try/DB context.  That
@@ -69,7 +70,8 @@ def run_preflight(*, db_factory, audit: Callable, resolve_asof_day: Callable,
     try:
         with db_factory() as conn:
             EPD.run_execution_dispatch(
-                conn, release_reservation=PCR.release_order_reservation)
+                conn, release_reservation=PCR.release_order_reservation,
+                signals=signals)
     except Exception as exc:  # pragma: no cover - exercised through injected failures
         result["dispatch"] = "error"
         _best_effort_audit(

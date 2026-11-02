@@ -10,6 +10,7 @@ import math
 from typing import Any, Callable
 
 import paper_account_specs as ACS
+import paper_order_ledger as POL
 from paper_numeric import num as _num
 from paper_common import load_json as _loads
 
@@ -98,10 +99,7 @@ def account_metrics(conn, account, quotes=None, positions=None, metric_cache=Non
             "SELECT COUNT(*) FROM paper_fills WHERE account_id=? AND side='buy'",
             (account["id"],),
         ).fetchone()[0])
-        rejected = int(conn.execute(
-            "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status!='filled'",
-            (account["id"],),
-        ).fetchone()[0])
+        rejected = int(POL.nonfilled_order_count(conn, account["id"]))
     else:
         buy_count = int((metric_cache.get("buy_count") or {}).get(account["id"], 0))
         rejected = int((metric_cache.get("rejected") or {}).get(account["id"], 0))
