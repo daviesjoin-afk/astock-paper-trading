@@ -309,8 +309,8 @@ class ReconcileWriteOperationTests(unittest.TestCase):
             "SELECT status FROM paper_orders WHERE id=2").fetchone()[0])
 
     def test_write_sets_keep_pending_and_unchanged_membership(self):
-        self.assertEqual(6, len(write_sites("paper_orders")))
-        self.assertEqual(3, len(write_sites("paper_signals")))
+        self.assertEqual(6, len(real_write_modules("paper_orders")))
+        self.assertEqual(3, len(real_write_modules("paper_signals")))
         for table in ("paper_orders", "paper_signals"):
             self.assertEqual("pending", OWNERSHIP[table]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])
