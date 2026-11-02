@@ -1,51 +1,8 @@
 # -*- coding: utf-8 -*-
-"""账户创建与字段补齐的持久化 owner（PR-10 工作包 C）。
+"""账户开户业务编排；账户写入统一交给 paper_account_ledger。"""
+from paper_account_ledger import ensure_profile, insert_account, set_version
 
-负责账户行的**创建**职责：内置账户与用户策略账户的 INSERT、既有账户的档案字段
-补齐、以及新策略版本的首次写入。现金、周期身份与配置字段由其它字段组 owner 负责，
-本模块不持有它们的写入逻辑。
-
-不读时钟（``now`` 由调用方传入）、不提交、不决定"该不该建这个账户"。
-"""
-
-ACCOUNT_INSERT_COLUMNS = (
-    "id", "name", "source_strategy", "status", "initial_cash", "cash", "cycle_days",
-    "max_positions", "max_weight", "max_exposure", "risk_profile", "version",
-    "benchmark_start", "created_at", "updated_at",
-)
-
-
-def insert_account(conn, *, fields):
-    """创建一条账户行；列集合受 :data:`ACCOUNT_INSERT_COLUMNS` 约束。"""
-    unknown = set(fields) - set(ACCOUNT_INSERT_COLUMNS)
-    if unknown:
-        raise ValueError(f"未知账户列：{sorted(unknown)}")
-    columns = [name for name in ACCOUNT_INSERT_COLUMNS if name in fields]
-    marks = ",".join("?" for _ in columns)
-    conn.execute(
-        f"INSERT INTO paper_accounts({','.join(columns)}) VALUES({marks})",
-        tuple(fields[name] for name in columns),
-    )
-
-
-def ensure_profile(conn, account_id, *, name, source_strategy, cycle_days,
-                   max_weight, max_exposure, mode, risk_profile):
-    """既有账户的档案字段补齐（模式为空时才写入调用方给出的默认模式）。"""
-    conn.execute(
-        """UPDATE paper_accounts SET name=?,source_strategy=?,cycle_days=?,
-           max_weight=?,max_exposure=?,mode=COALESCE(NULLIF(mode,''),?),
-           risk_profile=? WHERE id=?""",
-        (name, source_strategy, cycle_days, max_weight, max_exposure, mode,
-         risk_profile, account_id),
-    )
-
-
-def set_version(conn, account_id, *, version):
-    """只给新引入的策略写首次版本号；已有版本不被配置刷新改写。"""
-    conn.execute(
-        "UPDATE paper_accounts SET version=? WHERE id=?",
-        (version, account_id),
-    )
+__all__ = ["ensure_profile", "insert_account", "set_version", "provision_user_accounts"]
 
 
 def provision_user_accounts(conn, participant_ids, *, spec_for, now_fn, audit_fn):

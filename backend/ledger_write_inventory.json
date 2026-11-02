@@ -184,8 +184,8 @@
   {
    "function": "write_params",
    "kind": "static",
-   "line": 37,
-   "module": "paper_account_config",
+   "line": 21,
+   "module": "paper_account_ledger",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET",
@@ -196,8 +196,8 @@
   {
    "function": "write_params",
    "kind": "dynamic",
-   "line": 37,
-   "module": "paper_account_config",
+   "line": 21,
+   "module": "paper_account_ledger",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET {} WHERE id=?",
@@ -208,8 +208,8 @@
   {
    "function": "set_style",
    "kind": "static",
-   "line": 46,
-   "module": "paper_account_config",
+   "line": 30,
+   "module": "paper_account_ledger",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?",
@@ -220,8 +220,8 @@
   {
    "function": "set_style",
    "kind": "static",
-   "line": 51,
-   "module": "paper_account_config",
+   "line": 35,
+   "module": "paper_account_ledger",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET style=?,params=?,updated_at=? WHERE id=?",
@@ -232,8 +232,8 @@
   {
    "function": "set_cooldown",
    "kind": "static",
-   "line": 60,
-   "module": "paper_account_config",
+   "line": 44,
+   "module": "paper_account_ledger",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET cooldown_until=?",
@@ -244,11 +244,143 @@
   {
    "function": "set_cooldown",
    "kind": "static",
-   "line": 65,
-   "module": "paper_account_config",
+   "line": 49,
+   "module": "paper_account_ledger",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_accounts SET cooldown_until=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "insert_account",
+   "kind": "static",
+   "line": 68,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "INSERT INTO paper_accounts(",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "insert_account",
+   "kind": "dynamic",
+   "line": 68,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "INSERT INTO paper_accounts({}) VALUES({})",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "ensure_profile",
+   "kind": "static",
+   "line": 77,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET name=?,source_strategy=?,cycle_days=?, max_weight=?,max_exposure=?,mode=COALESCE(NULLIF(mode,''),?), risk_profile=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_version",
+   "kind": "static",
+   "line": 88,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET version=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "detach_cycle",
+   "kind": "static",
+   "line": 96,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_status",
+   "kind": "static",
+   "line": 107,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_status",
+   "kind": "dynamic",
+   "line": 107,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE {}",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "set_cycle_capital",
+   "kind": "static",
+   "line": 118,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "initialize_user_cycle",
+   "kind": "static",
+   "line": 129,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "debit_cash",
+   "kind": "static",
+   "line": 137,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cash=cash-?,updated_at=? WHERE id=?",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "apply_cash_delta",
+   "kind": "static",
+   "line": 143,
+   "module": "paper_account_ledger",
+   "read_refs": [],
+   "role": "runtime",
+   "sql": "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
    "write_targets": [
     "paper_accounts"
    ]
@@ -876,42 +1008,6 @@
    ]
   },
   {
-   "function": "debit_shared_cash",
-   "kind": "static",
-   "line": 113,
-   "module": "paper_shared_cash",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cash=cash-?,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "credit_shared_cash",
-   "kind": "static",
-   "line": 160,
-   "module": "paper_shared_cash",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "adjust_cash",
-   "kind": "static",
-   "line": 168,
-   "module": "paper_shared_cash",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
    "function": "_ensure_cycle",
    "kind": "static",
    "line": 2064,
@@ -986,7 +1082,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12529,
+   "line": 12522,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -998,7 +1094,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12541,
+   "line": 12534,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1010,7 +1106,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12553,
+   "line": 12546,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1022,7 +1118,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12565,
+   "line": 12558,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1034,7 +1130,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12580,
+   "line": 12573,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1046,7 +1142,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12592,
+   "line": 12585,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1058,7 +1154,7 @@
   {
    "function": "_cleanup_stale_data",
    "kind": "static",
-   "line": 12609,
+   "line": 12602,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1070,7 +1166,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14077,
+   "line": 14070,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1082,7 +1178,7 @@
   {
    "function": "create_cycle",
    "kind": "static",
-   "line": 14140,
+   "line": 14133,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1094,7 +1190,7 @@
   {
    "function": "configure_capital",
    "kind": "static",
-   "line": 14168,
+   "line": 14161,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1106,7 +1202,7 @@
   {
    "function": "set_account_style",
    "kind": "static",
-   "line": 14253,
+   "line": 14246,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
@@ -1118,133 +1214,13 @@
   {
    "function": "set_accounts_status",
    "kind": "static",
-   "line": 14277,
+   "line": 14270,
    "module": "paper_trading",
    "read_refs": [],
    "role": "runtime",
    "sql": "UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
    "write_targets": [
     "paper_cycles"
-   ]
-  },
-  {
-   "function": "insert_account",
-   "kind": "static",
-   "line": 26,
-   "module": "paper_user_account_provisioning",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "INSERT INTO paper_accounts(",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "insert_account",
-   "kind": "dynamic",
-   "line": 26,
-   "module": "paper_user_account_provisioning",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "INSERT INTO paper_accounts({}) VALUES({})",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "ensure_profile",
-   "kind": "static",
-   "line": 35,
-   "module": "paper_user_account_provisioning",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET name=?,source_strategy=?,cycle_days=?, max_weight=?,max_exposure=?,mode=COALESCE(NULLIF(mode,''),?), risk_profile=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_version",
-   "kind": "static",
-   "line": 46,
-   "module": "paper_user_account_provisioning",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET version=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "reconcile_user_cycle_accounts",
-   "kind": "static",
-   "line": 42,
-   "module": "paper_user_cycle_attachment",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "reconcile_user_cycle_accounts",
-   "kind": "static",
-   "line": 55,
-   "module": "paper_user_cycle_attachment",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "detach_cycle",
-   "kind": "static",
-   "line": 82,
-   "module": "paper_user_cycle_attachment",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_status",
-   "kind": "static",
-   "line": 93,
-   "module": "paper_user_cycle_attachment",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_status",
-   "kind": "dynamic",
-   "line": 93,
-   "module": "paper_user_cycle_attachment",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET status=?, updated_at=? WHERE {}",
-   "write_targets": [
-    "paper_accounts"
-   ]
-  },
-  {
-   "function": "set_cycle_capital",
-   "kind": "static",
-   "line": 104,
-   "module": "paper_user_cycle_attachment",
-   "read_refs": [],
-   "role": "runtime",
-   "sql": "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND id=?",
-   "write_targets": [
-    "paper_accounts"
    ]
   },
   {
@@ -1417,24 +1393,28 @@
   },
   {
    "function": "retire_waitlist_signals",
-   "kind": "static",
-   "line": 574,
+   "kind": "dynamic",
+   "line": 570,
    "module": "signal_service",
-   "read_refs": [],
+   "read_refs": [
+    "paper_orders"
+   ],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN (",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
    "write_targets": [
     "paper_signals"
    ]
   },
   {
    "function": "retire_waitlist_signals",
-   "kind": "dynamic",
-   "line": 574,
+   "kind": "static",
+   "line": 570,
    "module": "signal_service",
-   "read_refs": [],
+   "read_refs": [
+    "paper_orders"
+   ],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ({}) AND status IN ({})",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
    "write_targets": [
     "paper_signals"
    ]
@@ -1561,24 +1541,28 @@
   },
   {
    "function": "supersede_signals",
-   "kind": "static",
-   "line": 667,
+   "kind": "dynamic",
+   "line": 666,
    "module": "signal_service",
-   "read_refs": [],
+   "read_refs": [
+    "paper_orders"
+   ],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；' || ? WHERE id IN (",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；' || ? WHERE id IN ( SELECT signal_id FROM paper_orders WHERE account_id=? AND cod",
    "write_targets": [
     "paper_signals"
    ]
   },
   {
    "function": "supersede_signals",
-   "kind": "dynamic",
-   "line": 667,
+   "kind": "static",
+   "line": 666,
    "module": "signal_service",
-   "read_refs": [],
+   "read_refs": [
+    "paper_orders"
+   ],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；' || ? WHERE id IN ({}) AND status IN ({})",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；' || ? WHERE id IN ( SELECT signal_id FROM paper_orders WHERE account_id=? AND cod",
    "write_targets": [
     "paper_signals"
    ]
@@ -1586,7 +1570,7 @@
   {
    "function": "supersede_blocked_for_day",
    "kind": "static",
-   "line": 683,
+   "line": 686,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1598,7 +1582,7 @@
   {
    "function": "supersede_pending_for_day",
    "kind": "static",
-   "line": 693,
+   "line": 696,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1610,7 +1594,7 @@
   {
    "function": "record_signal_outcome",
    "kind": "static",
-   "line": 711,
+   "line": 714,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1622,7 +1606,7 @@
   {
    "function": "reject_signal",
    "kind": "static",
-   "line": 719,
+   "line": 722,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1634,7 +1618,7 @@
   {
    "function": "expire_signal",
    "kind": "static",
-   "line": 727,
+   "line": 730,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -1646,7 +1630,7 @@
   {
    "function": "update_signal_feedback",
    "kind": "static",
-   "line": 735,
+   "line": 738,
    "module": "signal_service",
    "read_refs": [],
    "role": "runtime",
@@ -3701,7 +3685,7 @@
   {
    "function": "test_cycle_authority_reads_cannot_write_or_bootstrap",
    "kind": "static",
-   "line": 221,
+   "line": 215,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3713,7 +3697,7 @@
   {
    "function": "test_terminal_owner_takes_the_status_vocabulary_from_the_caller",
    "kind": "static",
-   "line": 300,
+   "line": 294,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3725,7 +3709,7 @@
   {
    "function": "_row",
    "kind": "static",
-   "line": 396,
+   "line": 390,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -3737,7 +3721,7 @@
   {
    "function": "test_integer_stored_keys_are_still_matched",
    "kind": "static",
-   "line": 438,
+   "line": 432,
    "module": "test_ledger_ownership",
    "read_refs": [],
    "role": "test",
@@ -4819,6 +4803,30 @@
    ]
   },
   {
+   "function": "test_restore_rejects_incomplete_snapshot_before_any_cleanup",
+   "kind": "static",
+   "line": 18,
+   "module": "test_paper_account_ledger",
+   "read_refs": [],
+   "role": "test",
+   "sql": "CREATE TABLE paper_accounts(id TEXT PRIMARY KEY,params TEXT, version TEXT NOT NULL,updated_at TEXT NOT NULL); INSERT INTO paper_accounts VALUES('a','failed','v2",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "test_omitted_fields_are_preserved_and_explicit_null_fails_atomically",
+   "kind": "static",
+   "line": 33,
+   "module": "test_paper_account_ledger",
+   "read_refs": [],
+   "role": "test",
+   "sql": "CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, params TEXT, version TEXT NOT NULL, updated_at TEXT NOT NULL); INSERT INTO paper_accounts VALUES('a','old','v1'",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
    "function": "setUp",
    "kind": "static",
    "line": 46,
@@ -5700,7 +5708,7 @@
   {
    "function": "insert_accounts",
    "kind": "static",
-   "line": 43,
+   "line": 44,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5712,7 +5720,7 @@
   {
    "function": "setUp",
    "kind": "static",
-   "line": 102,
+   "line": 103,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5725,7 +5733,7 @@
   {
    "function": "test_reads_use_caller_transaction_without_committing",
    "kind": "static",
-   "line": 132,
+   "line": 133,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5735,9 +5743,9 @@
    ]
   },
   {
-   "function": "test_module_write_sql_is_only_cash_and_timestamp_update",
+   "function": "_assert_cash_writes",
    "kind": "static",
-   "line": 423,
+   "line": 433,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5749,7 +5757,7 @@
   {
    "function": "setUp",
    "kind": "static",
-   "line": 461,
+   "line": 475,
    "module": "test_paper_shared_cash",
    "read_refs": [],
    "role": "test",
@@ -5810,7 +5818,7 @@
   {
    "function": "test_existing_account_is_untouched_and_skips_callbacks",
    "kind": "static",
-   "line": 85,
+   "line": 97,
    "module": "test_paper_user_account_provisioning",
    "read_refs": [],
    "role": "test",
@@ -5822,7 +5830,7 @@
   {
    "function": "test_multiple_accounts_only_missing_rows_follow_input_order",
    "kind": "static",
-   "line": 102,
+   "line": 114,
    "module": "test_paper_user_account_provisioning",
    "read_refs": [],
    "role": "test",
@@ -5832,25 +5840,25 @@
    ]
   },
   {
-   "function": "test_module_is_stdlib_free_of_imports_and_forbidden_boundaries",
+   "function": "test_delete_and_replace_samples_are_rejected",
    "kind": "static",
-   "line": 247,
+   "line": 259,
    "module": "test_paper_user_account_provisioning",
    "read_refs": [],
    "role": "test",
-   "sql": "INSERT INTO paper_accounts",
+   "sql": "DELETE FROM paper_accounts",
    "write_targets": [
     "paper_accounts"
    ]
   },
   {
-   "function": "test_module_is_stdlib_free_of_imports_and_forbidden_boundaries",
+   "function": "test_delete_and_replace_samples_are_rejected",
    "kind": "static",
-   "line": 250,
+   "line": 259,
    "module": "test_paper_user_account_provisioning",
    "read_refs": [],
    "role": "test",
-   "sql": "UPDATE paper_accounts",
+   "sql": "REPLACE INTO paper_accounts(id) VALUES(?)",
    "write_targets": [
     "paper_accounts"
    ]
@@ -5883,7 +5891,7 @@
   {
    "function": "test_module_has_no_backend_imports_or_forbidden_authority_names",
    "kind": "static",
-   "line": 482,
+   "line": 486,
    "module": "test_paper_user_cycle_attachment",
    "read_refs": [],
    "role": "test",
@@ -9349,6 +9357,54 @@
    ]
   },
   {
+   "function": "test_large_set_filters_and_statement_atomicity",
+   "kind": "static",
+   "line": 17,
+   "module": "test_signal_supersede_set",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_signals VALUES(?, 'pending', NULL)",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
+   "function": "test_large_set_filters_and_statement_atomicity",
+   "kind": "static",
+   "line": 19,
+   "module": "test_signal_supersede_set",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_orders VALUES(?,?,'a','AAA','buy','wait')",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "test_large_set_filters_and_statement_atomicity",
+   "kind": "static",
+   "line": 21,
+   "module": "test_signal_supersede_set",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_orders VALUES(?,?,?,?,?,?)",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "test_large_set_filters_and_statement_atomicity",
+   "kind": "static",
+   "line": 28,
+   "module": "test_signal_supersede_set",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_signals SET status='filled' WHERE id=40",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
    "function": "test_paper_order_query_does_not_materialize_full_risk_payload",
    "kind": "static",
    "line": 114,
@@ -10551,7 +10607,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 179,
+   "line": 204,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",
@@ -10563,7 +10619,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 180,
+   "line": 205,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",

@@ -447,22 +447,21 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `paper_accounts` | 共享风控冷却窗口写入 | `paper_account_config::set_cooldown` | paper_trading 风控状态 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 账户风格字段写入 | `paper_account_config::set_style` | 配置入口校验 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 账户参数快照/版本/时间戳写入 | `paper_account_config::write_params` | adaptive/evolution/周度复盘各自的采纳与回滚判定 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 账户现金增量调整（对账补偿） | `paper_shared_cash::adjust_cash` | paper_trading 现金对账口径 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_paper_shared_cash` |
-| `paper_accounts` | 共享现金回补 | `paper_shared_cash::credit_shared_cash` | paper_shared_cash 资金规则 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
-| `paper_accounts` | 共享现金扣减 | `paper_shared_cash::debit_shared_cash` | paper_shared_cash 资金规则 | `paper_shared_cash` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_execution_planner`、`test_execution_verification` |
-| `paper_accounts` | legacy 引导：账户 cycle_id 清空与暂停 | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_user_cycle_attachment` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
-| `paper_accounts` | 新建周期时账户挂接重置 | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
-| `paper_accounts` | 账户风格字段 | `paper_trading::set_account_style` | 配置入口校验 | `paper_account_config` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 既有账户档案字段补齐（mode 为空才写默认） | `paper_user_account_provisioning::ensure_profile` | 账号引导规则 | `paper_user_account_provisioning` | 启动引导 / 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 账户创建（内置/用户策略，列白名单） | `paper_user_account_provisioning::insert_account` | 账号引导与 provisioning 规则 | `paper_user_account_provisioning` | 启动引导 / 调用方同一连接与原事务 | `test_paper_shared_cash`、`test_paper_user_cycle_attachment` |
-| `paper_accounts` | 新策略首次版本号写入 | `paper_user_account_provisioning::set_version` | 账号引导规则 | `paper_user_account_provisioning` | 启动引导 / 调用方同一连接与原事务 | `test_execution_evidence`、`test_execution_planner`、`test_order_cycle_provenance` |
-| `paper_accounts` | 账户退出周期（cycle_id 清空 + 暂停 + 资金归零） | `paper_user_cycle_attachment::detach_cycle` | paper_trading 周期引导/创建 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 用户账户周期挂接对账 | `paper_user_cycle_attachment::reconcile_user_cycle_accounts` | 账户挂接规则 | `paper_user_cycle_attachment` | 服务入口传入的连接 | `test_paper_user_cycle_attachment` |
-| `paper_accounts` | 周期资金配置（初始资金/现金/基准净值） | `paper_user_cycle_attachment::set_cycle_capital` | 配置入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 账户启停状态（活动周期过滤） | `paper_user_cycle_attachment::set_status` | 启停入口校验 | `paper_user_cycle_attachment` | 调用方同一连接与原事务 | `test_learning_evaluation` |
+| `paper_accounts` | 账户现金增量调整（对账补偿） | `paper_account_ledger::apply_cash_delta` | paper_trading 现金对账口径 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_shared_cash` |
+| `paper_accounts` | 共享现金扣减 | `paper_account_ledger::debit_cash` | paper_shared_cash 资金规则 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_shared_cash` |
+| `paper_accounts` | 账户退出周期（cycle_id 清空 + 暂停 + 资金归零） | `paper_account_ledger::detach_cycle` | paper_trading 周期引导/创建 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 既有账户档案字段补齐（mode 为空才写默认） | `paper_account_ledger::ensure_profile` | 账号引导规则 | `paper_account_ledger` | 启动引导 / 调用方同一连接与原事务 | `test_paper_user_account_provisioning` |
+| `paper_accounts` | 用户账户周期挂接对账 | `paper_account_ledger::initialize_user_cycle` | 账户挂接规则 | `paper_account_ledger` | 服务入口传入的连接 | `test_paper_user_cycle_attachment` |
+| `paper_accounts` | 账户创建（内置/用户策略，列白名单） | `paper_account_ledger::insert_account` | 账号引导与 provisioning 规则 | `paper_account_ledger` | 启动引导 / 调用方同一连接与原事务 | `test_paper_shared_cash`、`test_paper_user_account_provisioning`、`test_paper_user_cycle_attachment` |
+| `paper_accounts` | 共享风控冷却窗口写入 | `paper_account_ledger::set_cooldown` | paper_trading 风控状态 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 周期资金配置（初始资金/现金/基准净值） | `paper_account_ledger::set_cycle_capital` | 配置入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 账户启停状态（活动周期过滤） | `paper_account_ledger::set_status` | 启停入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_learning_evaluation` |
+| `paper_accounts` | 账户风格字段写入 | `paper_account_ledger::set_style` | 配置入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 新策略首次版本号写入 | `paper_account_ledger::set_version` | 账号引导规则 | `paper_account_ledger` | 启动引导 / 调用方同一连接与原事务 | `test_execution_evidence`、`test_execution_planner`、`test_order_cycle_provenance` |
+| `paper_accounts` | 账户参数快照/版本/时间戳写入 | `paper_account_ledger::write_params` | adaptive/evolution/周度复盘各自的采纳与回滚判定 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_account_ledger` |
+| `paper_accounts` | legacy 引导：账户 cycle_id 清空与暂停 | `paper_trading::_ensure_cycle` | paper_trading 兼容引导 | `paper_account_ledger` | 启动恢复/初始化连接 | `test_dashboard_refresh_semantics`、`test_deferred_fill_cycle_binding`、`test_legacy_position_rematerialization` |
+| `paper_accounts` | 新建周期时账户挂接重置 | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
+| `paper_accounts` | 账户风格字段 | `paper_trading::set_account_style` | 配置入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
 
 ### 工作包 D
 
@@ -554,3 +553,7 @@ B/C/D 搬走写入后必须收回。
 ### B 包复审修复（2026-11-02）
 
 supersede_signals 恢复同账户/标的旧订单集合子查询，保留先信号后订单顺序。80 条重复订单在 32 参数上限下通过，ABORT 不留下部分信号更新。三处改写守卫均有拒绝违例的负向测试；相关行为回归通过。
+
+### C 包复审修复（2026-11-02）
+
+原字段分组并不互斥，不作为单写验收依据。现金/开户/周期/配置保留业务职责，账户写入交给 paper_account_ledger；当前仅剩 paper_trading 的周期初始化待 D 包转接，因此账户表仍 pending。配置恢复用独立未提供标记区分省略与显式 None，完整快照正常恢复，缺字段快照保留 IntegrityError。禁删/替换守卫使用正确词边界，SQL 提取包含 REPLACE，DELETE/REPLACE 和现金跨字段违例均验证会被拦截。

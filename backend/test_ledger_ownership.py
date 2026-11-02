@@ -101,14 +101,8 @@ OWNERSHIP = {
     },
     "paper_accounts": {
         "status": "pending",
-        "writers": {
-            "paper_trading", "paper_shared_cash", "paper_user_cycle_attachment",
-            "paper_user_account_provisioning", "strategy_registry",
-            "paper_order_execution_authority", "paper_cycle_ownership",
-            "ai_adoption_writer", "paper_account_config",
-        },
-        "note": "账户行按字段分组归属（现金/创建/身份挂接/配置）；工作包 C 把 adaptive 与 "
-                "evolution 的参数写入并进 paper_account_config，集合只减不增",
+        "writers": {"paper_trading", "paper_account_ledger"},
+        "note": "C 包收口账户持久化；剩余周期初始化由 D 包迁到同一账户 owner",
     },
 }
 

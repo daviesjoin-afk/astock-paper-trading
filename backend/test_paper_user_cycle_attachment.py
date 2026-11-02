@@ -463,7 +463,11 @@ class ArchitectureGuardTests(unittest.TestCase):
     def test_module_has_no_backend_imports_or_forbidden_authority_names(self):
         source = self.MODULE_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        self.assertFalse([node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))])
+        imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+        self.assertTrue(imports)
+        for node in imports:
+            self.assertEqual("paper_account_ledger", node.module if isinstance(node, ast.ImportFrom)
+                             else node.names[0].name)
         forbidden = (
             "paper_trading", "paper_cycle_ownership", "paper_shared_cash",
             "paper_user_account_provisioning", "strategy_registry", "strategy_runtime",
@@ -477,9 +481,10 @@ class ArchitectureGuardTests(unittest.TestCase):
         sql = [node.value for node in ast.walk(tree)
                if isinstance(node, ast.Constant) and isinstance(node.value, str)
                and node.value.lstrip().upper().startswith(("SELECT", "INSERT", "UPDATE", "DELETE"))]
-        self.assertGreaterEqual(len(sql), 5)
+        self.assertEqual(4, len(sql))
         self.assertTrue(any("SELECT * FROM paper_accounts" in item for item in sql))
-        self.assertTrue(any("UPDATE paper_accounts" in item for item in sql))
+        self.assertFalse(any("UPDATE paper_accounts" in item for item in sql))
+        self.assertIn("PAL.initialize_user_cycle(", source)
         self.assertTrue(any("DELETE FROM paper_nav" in item for item in sql))
         self.assertTrue(any("INSERT INTO paper_nav" in item for item in sql))
         self.assertTrue(any("INSERT INTO paper_parameter_versions" in item for item in sql))

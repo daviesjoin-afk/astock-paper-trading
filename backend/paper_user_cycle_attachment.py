@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 """Attach and detach already-provisioned user strategy ledger rows."""
+import paper_account_ledger as PAL
+from paper_account_ledger import detach_cycle, set_cycle_capital, set_status
+
+__all__ = ["detach_cycle", "set_cycle_capital", "set_status", "reconcile_user_cycle_accounts"]
 
 
 def _row(conn, sql, params=()):
@@ -38,10 +42,7 @@ def reconcile_user_cycle_accounts(
             continue
         user_spec = spec_for(account_id)
         if account_id not in enabled and row["cycle_id"] == cycle_id:
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-                (now_fn(), account_id),
-            )
+            detach_cycle(conn, account_id, now=now_fn())
             continue
         if row["cycle_id"] is None and account_id in enabled:
             capital = num_fn(cycle["capital"], 100000.0)
@@ -51,12 +52,13 @@ def reconcile_user_cycle_accounts(
                 else available_capital_fn(account_id)
             )
             benchmark = benchmark_fn()
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?,max_positions=?,max_weight=?,max_exposure=?,updated_at=? WHERE id=?",
-                (cycle_id, user_spec["mode"], user_spec["default_style"], cycle["status"],
-                 account_capital, account_capital, benchmark, account_capital, date_fn().isoformat(),
-                 user_spec["risk_profile"], user_spec["strategy_version"], user_spec["max_positions"],
-                 user_spec["max_weight"], user_spec["max_exposure"], now_fn(), account_id),
+            PAL.initialize_user_cycle(
+                conn, account_id, cycle_id=cycle_id, mode=user_spec["mode"],
+                style=user_spec["default_style"], status=cycle["status"],
+                capital=account_capital, benchmark=benchmark, nav_date=date_fn().isoformat(),
+                risk_profile=user_spec["risk_profile"], version=user_spec["strategy_version"],
+                max_positions=user_spec["max_positions"], max_weight=user_spec["max_weight"],
+                max_exposure=user_spec["max_exposure"], now=now_fn(),
             )
             conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
             conn.execute(
@@ -74,34 +76,3 @@ def reconcile_user_cycle_accounts(
                 "user_strategy_cycle_attached",
                 f"用户策略 {user_spec['name']} 接入周期（{user_spec['lifecycle_stage']} 档）",
             )
-
-
-def detach_cycle(conn, account_id, *, now):
-    """账户退出当前周期：清空 cycle_id 并把账户置为暂停、资金归零。"""
-    conn.execute(
-        "UPDATE paper_accounts SET cycle_id=NULL,status='paused',"
-        "initial_cash=0,cash=0,updated_at=? WHERE id=?",
-        (now, account_id),
-    )
-
-
-def set_status(conn, *, status, now, clause, clause_params=()):
-    """账户启停：``clause`` 由调用方给出（活动周期过滤），本入口只落库状态。"""
-    if not clause:
-        raise ValueError("set_status 需要显式过滤条件")
-    return conn.execute(
-        f"UPDATE paper_accounts SET status=?, updated_at=? WHERE {clause}",
-        (status, now, *clause_params),
-    ).rowcount
-
-
-def set_cycle_capital(conn, account_id, *, cycle_id, capital, now):
-    """周期资金配置：在同一周期下把初始资金/现金/基准净值设为同一份额。
-
-    ``WHERE cycle_id=? AND id=?`` 保留原保护 —— 账户已经切到别的周期时不写。
-    """
-    return conn.execute(
-        "UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=?"
-        " WHERE cycle_id=? AND id=?",
-        (capital, capital, capital, now, cycle_id, account_id),
-    ).rowcount
