@@ -1,5 +1,29 @@
 # 耦合预算与模块化进度
 
+## 2026-11-02 PR-11 A：冻结 PR-11 基线，归还 PR-10 遗留的扇出额度
+
+PR-10（A–E）合并完成后，以 `c78cc63` 为 PR-11 基线做了逐项实测：15 项指标里
+12 项已经贴在上限（`deferred_imports` 618/618、`cross_domain_edges` 636/636、
+`duplicate_helpers` 297/297、`raw_sql_modules` 143/143、`max_function_globals` 61/61、
+`import_side_effects` 25/25、`dynamic_name_bridges` 72/72、`private_cross_access` 6/6），
+只有 `paper_table_fanout_max` 还留着 1 的空额（实测 50，上限 51）。
+
+那 1 是 PR-10 工作包 A 建立 `paper_order_ledger` 时登记的，登记原文已写明
+"B/C/D 继续把写入搬离后，模块数与扇出应当下降，届时额度必须收回"。现在写入已经
+全部归位、扇出回到 50，额度空转，因此本包把它收回：`FEATURE_ALLOWANCE` 的
+`paper_table_fanout_max` 1 → **0**，上限 51 → 50。
+
+本包**不加代码、不改度量、不放宽任何额度**，只做两件事：一是把基线冻结成可复核的表
+（15 项实测 + 逐表扇出 + 辅助计数），二是把借来的额度还掉。PR-11 的主线是路线图
+§七 的「调度 worker 分层与资源隔离」（`risk-fast` / `execution-resume` /
+`candidate-full` / `dashboard-refresh` 分离 + 资源预算、独立锁、lease、SQLite
+busy/backoff）；前置的 PR-1~PR-10 已在 `c78cc63` 上逐条核对并入，工作包 A–E 的
+范围、度量缺口与出口写在 [PR11_PLAN.md](PR11_PLAN.md)。
+
+同时把两个方向显式排除在 PR-11 之外：`_buy_order` 切块（上一轮实测块 D 切出来后函数
+−9 行、文件 +32 行，净收益为负，已回退）与账本读路径收敛（那是 PR-10 的收尾，
+不属于调度分层）。
+
 ## 2026-10-31 PR-8：统一买入数量 owner
 
 `manual_orders` 改为直接调用 `paper_sizing.entry_quantity`，删除注入的

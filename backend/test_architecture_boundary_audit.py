@@ -143,7 +143,11 @@ class CouplingBudgetTests(unittest.TestCase):
         # `paper_trading` / `manual_orders` 后，模块数与扇出应当下降，
         # 届时额度必须收回。登记见 docs/COUPLING_BUDGET.md「2026-11-01 PR-10 A」。
         "raw_sql_modules": 2,
-        "paper_table_fanout_max": 1,
+        # 2026-11-02（PR-11 工作包 A：归还 PR-10 工作包 A 借的 1）：PR-10 的
+        # B/C/D 把写入搬离后，实测扇出已经回到 HEAD_BUDGET（50），这 1 的额度
+        # 空转。按当时"届时额度必须收回"的登记，上限 51 → 50。PR-11 后续每一包
+        # 都必须在这个天花板下做出真实下降，冻结与出口见 docs/PR11_PLAN.md。
+        "paper_table_fanout_max": 0,
         # 2026-10-29（adaptive 库 schema 收口）：schema owner 显式持有 7 个下游
         # owner 的建表依赖，README 见 docs/COUPLING_BUDGET.md 当日切片。
         #
