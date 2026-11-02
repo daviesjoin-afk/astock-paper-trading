@@ -18,7 +18,7 @@ def _stamp(offset=0):
     return (dt.datetime.now() + dt.timedelta(seconds=offset)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _waiting_seconds(row, *, now, live, follow_up):
+def _claim_wait_seconds(row, *, now, live, follow_up):
     """Queue waiting only; a collector's own run time never counts as waiting.
 
     The cap bounds *how long a request waits to be claimed*, not how long the
@@ -72,7 +72,7 @@ def queue_state(row, *, now):
         if pending or status == "running":
             # A running collector's elapsed time is not queue waiting, and a
             # failed attempt's run time is not waiting for its own retry.
-            age = _waiting_seconds(row, now=now, live=bool(live), follow_up=follow_up)
+            age = _claim_wait_seconds(row, now=now, live=bool(live), follow_up=follow_up)
         reason = {"completed": "no_pending_request", "expired": "request_expired"}.get(status, "due")
         if live:
             reason = "already_running"
