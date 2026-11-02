@@ -714,3 +714,17 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 额度影响：`duplicate_helpers` 296 → 297（owner 之间出现一个同名小助手），
 `FEATURE_ALLOWANCE` 0 → 1；`cross_domain_edges` 与 `raw_sql_modules` 沿用 C 的登记，
 `paper_table_fanout_max` 保持 50。
+
+## 2026-11-02 PR-11 B：风控完成门禁（复审修复）
+
+独立 risk lane 之后，"已有认领者"不再等于"风控已完成"。两个入口都必须等风控真正结束
+才能进入执行与候选路径，这是本轮修复的主线：
+
+| 指标 | 修复前 | 修复后 | 说明 |
+| --- | --- | --- | --- |
+| `max_file_lines` | 14,612 (+11) | 14,639 (**+27**) | 新增 16 行：`execute_open()` 与 `monitor_intraday()` 的风控完成门禁、等待结束后的周期复核、等待配置的有界收敛 |
+
+策略本体（窗口取整、有界等待、完成判定、未完成返回形状、配置收敛）都在
+`paper_risk_scan_state`，`paper_trading` 只留调用点与返回形状——所以这 16 行是**接线**，
+不是新的判断逻辑。其余指标（`cross_domain_edges` / `raw_sql_modules` / `duplicate_helpers`
+/ `import_cycles`）本轮不变。

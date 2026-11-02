@@ -30,7 +30,20 @@ marker="$lock_dir/full-scan-pending.$$"
 cleanup_marker() { rm -f "$marker"; }
 trap cleanup_marker EXIT INT TERM
 
-if [[ "$slot" == "fast-entry" ]]; then
+# ─── 每 slot 的宿主串行锁 ────────────────────────────────────────────────────
+#
+# 锁的归属由契约模块 ``paper_schedule_contract.host_lock_name`` 拥有；这里不
+# import Python，所以保留同一份事实的 shell 视图。两者的一致性由
+# ``test_paper_schedule_contract`` 的 LaneLockGuard 与
+# ``test_paper_scheduler_priority`` 的进程级用例共同盯住。
+#
+# 默认仍是 ``paper-scan.lock``：竞价、开盘审批、日内监控、快通道继续互相串行
+# （PR-11 不删除任何既有锁）。``risk`` 有自己的 ``risk-scan.lock``，因此全市场
+# 候选扫描再慢，也不会让风险 pass 在主机锁上排队。
+if [[ "$slot" == "risk" ]]; then
+  lane_lock="risk-scan.lock"
+  lock_options=(-n)
+elif [[ "$slot" == "fast-entry" ]]; then
   now=$(date +%s)
   for intent in "$lock_dir"/full-scan-pending.*; do
     [[ -e "$intent" ]] || continue
@@ -43,16 +56,18 @@ if [[ "$slot" == "fast-entry" ]]; then
     fi
     rm -f "$intent"
   done
+  lane_lock="paper-scan.lock"
   lock_options=(-n)
 else
   : > "$marker"
+  lane_lock="paper-scan.lock"
   lock_options=(-w 60)
 fi
 
 # Keep the same lock for the complete Docker invocation. SECONDS is Bash's
 # elapsed timer (one-second resolution); do not confuse this inner lock with
 # the outer cron slot lock or Docker/Python startup time.
-exec 9>"$lock_dir/paper-scan.lock"
+exec 9>"$lock_dir/$lane_lock"
 SECONDS=0
 if flock "${lock_options[@]}" 9; then
   host_wait="$SECONDS"

@@ -120,11 +120,13 @@ class ScheduleTask:
 #: platforms and is part of the contract: the Windows registration and the cron
 #: file list tasks in the same sequence so a diff between them stays reviewable.
 #:
-#: ``risk`` is intentionally absent.  It is a valid ``run_slot`` slot and the
-#: runner accepts it, but neither platform gives it a standalone entry: the
-#: intraday scan performs the risk pass in the same minute.  That convention
-#: used to exist only as a comment in the cron file; recording the absence here
-#: makes it an explicit, testable property of the contract.
+#: ``risk`` used to be absent by design: the intraday scan performed the risk
+#: pass in the same minute.  PR-11 B moves it onto its own cron entry, its own
+#: host lock and its own runtime lease, because a risk pass that waits behind a
+#: full-market candidate scan cannot hold a three-minute cadence.  The intraday
+#: scan keeps its ``monitor_risk()`` call as a fallback; the durable scan claim
+#: (:mod:`paper_risk_scan_state`) still guarantees at most one risk pass per
+#: ``(cycle_id, asof_date, scan_minute)`` no matter which entry runs first.
 SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
     ScheduleTask("A股模拟盘-竞价跟踪", "09:15", "auction-track", _WEEKDAY_DAYS,
                  repeat="00:12"),
@@ -132,7 +134,11 @@ SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
                  retry_clocks=("09:27", "09:29")),
     ScheduleTask("A股模拟盘-日内监控-上午", "09:30", "intraday", _WEEKDAY_DAYS,
                  repeat="01:55"),
+    ScheduleTask("A股模拟盘-风险快通道-上午", "09:33", "risk", _WEEKDAY_DAYS,
+                 repeat="01:55"),
     ScheduleTask("A股模拟盘-日内监控-下午", "13:00", "intraday", _WEEKDAY_DAYS,
+                 repeat="01:55"),
+    ScheduleTask("A股模拟盘-风险快通道-下午", "13:00", "risk", _WEEKDAY_DAYS,
                  repeat="01:55"),
     ScheduleTask("A股模拟盘-开盘审批", "09:31", "open", _WEEKDAY_DAYS,
                  retry_clocks=("09:33", "09:35")),
@@ -145,8 +151,8 @@ SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
 #: probe list can never disagree with the registration list again.
 SCHEDULE_TASK_NAMES: tuple[str, ...] = tuple(task.name for task in SCHEDULE_TASKS)
 
-#: Slots covered by a standalone scheduled entry.  ``risk`` and ``fast-entry``
-#: are absent by design — see the note on :data:`SCHEDULE_TASKS`.
+#: Slots covered by a standalone scheduled entry.  ``fast-entry`` stays absent by
+#: design: it is a runner-only branch with its own cron file and its own log.
 SCHEDULED_SLOTS: frozenset[str] = frozenset(task.slot for task in SCHEDULE_TASKS)
 
 #: Intraday scan windows, ``HH:MM`` inclusive on both ends.
@@ -192,6 +198,45 @@ INTRADAY_CRON_MINUTES: dict[int, str] = {
     14: "*/3",
 }
 
+#: 风险快通道的分钟字段：与 intraday 同一三分钟网格、同一交易窗口。
+#:
+#: 同网格是刻意的：两个入口在同分钟进入时，durable scan claim
+#: （``paper_risk_scan_state``）保证只有一方真正执行，另一方回 ``already_scanned``。
+#: 如果错开一分钟，同一窗口内会出现两次风险扫描（两个不同 ``scan_minute``），
+#: 既没有收益，又会让"这一分钟最多一次风控"的验收失效。
+RISK_CRON_MINUTES: dict[int, str] = dict(INTRADAY_CRON_MINUTES)
+
+#: 会重复触发的 slot → 分钟字段表。渲染顺序仍由 :data:`SCHEDULE_TASKS` 决定。
+REPEAT_CRON_MINUTES: dict[str, dict[int, str]] = {
+    "intraday": INTRADAY_CRON_MINUTES,
+    "risk": RISK_CRON_MINUTES,
+}
+
+#: 宿主串行锁（``deploy/run_paper_slot.sh`` 里 ``flock`` 的那把文件）按 slot 分配。
+#:
+#: 默认仍是共享的 ``paper-scan.lock``：竞价、开盘审批、日内监控、快通道继续互相
+#: 串行，PR-11 不删除这把锁。``risk`` 是独立的 lane，用 ``risk-scan.lock``，因此
+#: 全市场扫描/候选生成再慢，也不会让风险 pass 停在排队里。
+HOST_LOCK_BY_SLOT: dict[str, str] = {"risk": "risk-scan.lock"}
+
+#: 没有独立锁的 slot 共用的宿主锁文件名。
+DEFAULT_HOST_LOCK = "paper-scan.lock"
+
+
+def host_lock_name(slot: str | None) -> str:
+    """该 slot 在宿主机上使用哪把串行锁（纯查表，不碰文件系统）。"""
+    return HOST_LOCK_BY_SLOT.get(str(slot or "").strip().lower(), DEFAULT_HOST_LOCK)
+
+
+def joins_full_scan_intent(slot: str | None) -> bool:
+    """该 slot 是否参与"全扫描优先"的意图标记协议。
+
+    意图标记只保护共用 ``paper-scan.lock`` 的 lane：``fast-entry`` 看到全扫描
+    留下的标记就主动让路。风险 lane 有自己的锁，既不该留标记，也不该因为别人
+    留了标记而让路。
+    """
+    return host_lock_name(slot) == DEFAULT_HOST_LOCK
+
 
 def render_cron_lines() -> list[str]:
     """Cron field lines for every scheduled entry, in table order.
@@ -202,7 +247,7 @@ def render_cron_lines() -> list[str]:
     A repeating task emits its window lines once, not once per retry entry.
     """
     lines: list[str] = []
-    emitted_intraday = False
+    emitted_repeats: set[str] = set()
     for task in SCHEDULE_TASKS:
         dow = "1-5" if task.days == _WEEKDAY_DAYS else "5"
         if task.slot == "auction-track":
@@ -213,11 +258,12 @@ def render_cron_lines() -> list[str]:
                 continue
             hour, minute = clock.split(":")
             lines.append(f"{minute} {hour} * * {dow} run_paper_slot.sh {task.slot}")
-        if task.slot == "intraday" and not emitted_intraday:
-            emitted_intraday = True
-            for hour in sorted(INTRADAY_CRON_MINUTES):
+        minutes_by_hour = REPEAT_CRON_MINUTES.get(task.slot)
+        if task.repeat and minutes_by_hour and task.slot not in emitted_repeats:
+            emitted_repeats.add(task.slot)
+            for hour in sorted(minutes_by_hour):
                 lines.append(
-                    f"{INTRADAY_CRON_MINUTES[hour]} {hour:02d} * * {dow} "
-                    f"run_paper_slot.sh intraday"
+                    f"{minutes_by_hour[hour]} {hour:02d} * * {dow} "
+                    f"run_paper_slot.sh {task.slot}"
                 )
     return lines

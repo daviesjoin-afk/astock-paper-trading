@@ -159,17 +159,71 @@ class SlotVocabularyGuard(unittest.TestCase):
         )
         self.assertEqual(set(PSch.SCHEDULED_SLOTS) - set(PSch.RUN_SLOTS), {"auction-track"})
 
-    def test_risk_and_fast_entry_are_deliberately_unscheduled(self):
-        """The two unscheduled slots are a recorded decision, not an oversight.
+    def test_risk_is_a_scheduled_lane_and_fast_entry_stays_runner_only(self):
+        """PR-11 B：risk 有了独立条目；fast-entry 仍然只是 runner 分支。
 
-        ``risk`` runs inside the intraday scan, and ``fast-entry`` is a
-        runner-only branch.  Both used to be absent from the platform tables with
-        only a cron comment as evidence; the absence is now asserted.
+        在此之前 risk 靠 intraday 同分钟顺带执行（见 docs/PR11_PLAN.md）。把它
+        搬上独立 cron 条目是有意的行为变更：风险 pass 不再排在候选扫描后面。
+        ``fast-entry`` 依旧是独立的 cron 文件与独立分支，不属于
+        ``SCHEDULED_SLOTS``。
         """
         self.assertIn("risk", PSch.RUN_SLOTS)
         self.assertIn("fast-entry", PSch.RUNNER_ONLY_SLOTS)
-        self.assertNotIn("risk", PSch.SCHEDULED_SLOTS)
+        self.assertIn("risk", PSch.SCHEDULED_SLOTS)
         self.assertNotIn("fast-entry", PSch.SCHEDULED_SLOTS)
+
+
+class RiskLaneGuard(unittest.TestCase):
+    """PR-11 B：风险快通道是独立的调度边界，不是"多一条 cron"。"""
+
+    def test_risk_mirrors_the_intraday_three_minute_grid(self):
+        self.assertEqual(PSch.INTRADAY_CRON_MINUTES, PSch.RISK_CRON_MINUTES)
+
+    def test_risk_ticks_stay_inside_the_trading_windows(self):
+        windows = list(PSch.INTRADAY_WINDOWS)
+        for hour, minute_field in PSch.RISK_CRON_MINUTES.items():
+            for minute in _parse_field(minute_field, 0, 59):
+                clock = f"{hour:02d}:{minute:02d}"
+                self.assertTrue(
+                    any(start <= clock <= end for start, end in windows),
+                    f"risk tick {clock} is outside every trading window",
+                )
+
+    def test_risk_ticks_keep_the_three_minute_cadence(self):
+        for hour, minute_field in PSch.RISK_CRON_MINUTES.items():
+            minutes = sorted(_parse_field(minute_field, 0, 59))
+            gaps = {b - a for a, b in zip(minutes, minutes[1:], strict=False)}
+            self.assertEqual(
+                gaps, {PSch.INTRADAY_INTERVAL_MINUTES},
+                f"risk hour {hour} field {minute_field!r} is not a 3-minute cadence",
+            )
+
+    def test_risk_has_entries_for_both_sessions(self):
+        clocks = [task.clock for task in PSch.SCHEDULE_TASKS if task.slot == "risk"]
+        self.assertEqual(["09:33", "13:00"], clocks)
+
+    def test_risk_owns_its_host_lock_and_leaves_the_shared_one_alone(self):
+        self.assertEqual("risk-scan.lock", PSch.host_lock_name("risk"))
+        for slot in ("auction", "open", "intraday", "fast-entry", "auction-track"):
+            self.assertEqual(
+                "paper-scan.lock", PSch.host_lock_name(slot),
+                f"{slot} must keep using the shared host lock",
+            )
+        self.assertFalse(PSch.joins_full_scan_intent("risk"))
+        self.assertTrue(PSch.joins_full_scan_intent("intraday"))
+
+    def test_wrapper_script_takes_the_contract_lock_for_risk(self):
+        script = (ROOT / "deploy" / "run_paper_slot.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ "$slot" == "risk" ]]', script)
+        self.assertIn('lane_lock="risk-scan.lock"', script)
+        self.assertIn('exec 9>"$lock_dir/$lane_lock"', script)
+
+    def test_risk_branch_never_leaves_a_full_scan_intent_marker(self):
+        """意图标记只属于共用 paper-scan.lock 的 lane；风险 lane 不参与让路协议。"""
+        script = (ROOT / "deploy" / "run_paper_slot.sh").read_text(encoding="utf-8")
+        risk_branch = script.split('if [[ "$slot" == "risk" ]]', 1)[1].split("elif", 1)[0]
+        self.assertNotIn('"$marker"', risk_branch)
+        self.assertIn("lock_options=(-n)", risk_branch)
 
 
 class CronRenderingFidelityGuard(unittest.TestCase):

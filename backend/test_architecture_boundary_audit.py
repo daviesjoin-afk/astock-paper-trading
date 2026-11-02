@@ -167,7 +167,11 @@ class CouplingBudgetTests(unittest.TestCase):
         # 把参数写入交给 `paper_account_config`，各新增一条显式依赖边（+5）。
         # 13 → 18；登记见 docs/COUPLING_BUDGET.md。
         "cross_domain_edges": 18,
-        "max_file_lines": 11,
+        # 2026-11-02 PR-11 B 复审修复：execute_open 的风控完成门禁、等待后的周期
+        # 复核、等待配置的有界收敛（策略本体在 paper_risk_scan_state，此处只有
+        # 调用点与返回形状）使 paper_trading.py 14,612 → 14,639。切片见
+        # docs/COUPLING_BUDGET.md「2026-11-02 PR-11 B：风控完成门禁」。
+        "max_file_lines": 27,
         "max_function_lines": 0,
         "max_function_globals": 0,
         # 工作包 D：归档/周期 owner 之间出现一个同名小助手（296 → 297）。

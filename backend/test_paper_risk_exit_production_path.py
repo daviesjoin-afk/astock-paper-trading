@@ -812,7 +812,12 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             self.assertEqual(failed["risk_snapshot_refresh"], "failed")
             self.assertEqual(paper_runner._result_exit_code(failed), 0)
             with PT._db() as conn:
-                self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
+                # PR-11 B：风险快通道是三分钟 lane，运行身份是窗口
+                # （``risk:YYYYMMDDHHMM``），因此记录落在 ``paper_job_runs``
+                # 而不是按日的 ``paper_jobs``。
+                self.assertEqual(conn.execute(
+                    "SELECT status FROM paper_job_runs WHERE slot='risk'"
+                    " ORDER BY started_at DESC LIMIT 1").fetchone()[0], "completed")
                 fill_count = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
             retried = PT.run_slot("risk", self.day, force=True, risk_snapshot_background=False)
             self.assertEqual(retried["status"], "already_done")
@@ -820,7 +825,9 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             self.assertEqual(trading.call_count, 1)
             self.assertEqual(refresh.call_count, 2)
             with PT._db() as conn:
-                self.assertEqual(conn.execute("SELECT status FROM paper_jobs WHERE slot='risk'").fetchone()[0], "completed")
+                self.assertEqual(conn.execute(
+                    "SELECT status FROM paper_job_runs WHERE slot='risk'"
+                    " ORDER BY started_at DESC LIMIT 1").fetchone()[0], "completed")
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0], fill_count)
 
     def test_blocked_auction_is_retryable_and_preserves_failure_reason(self):

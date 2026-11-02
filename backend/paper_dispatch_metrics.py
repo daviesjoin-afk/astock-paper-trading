@@ -35,12 +35,19 @@
   而不是结束时间，因为 PR-11 的验收写的是 start-to-start interval。
 * **状态四分类**（``completed`` / ``idle`` / ``failed`` / ``unknown``）：只有
   ``completed``（``completed`` / ``ok``）只代表外层任务完成；``skipped`` /
-  ``already_done`` / ``up_to_date`` 归入 ``idle``，**不算**新的成功风控；
-  ``failed`` / ``error`` / ``blocked`` 归入 ``failed``。
+  ``already_done`` / ``up_to_date`` / ``already_scanned`` 归入 ``idle``，**不算**
+  新的成功风控（``already_scanned`` 是 PR-11 B 的耐久扫描去重结果：同一分钟已被
+  另一个入口认领）；``failed`` / ``error`` / ``blocked`` 归入 ``failed``。
 * **last successful risk scan**：risk / intraday 都必须有独立的
   ``timing.risk_scans`` completed 标记，且外层 completed、风险阶段零错误。
   标记在 durable scan 完成事务提交后记录；``already_scanned`` 单独记录，
   旧日志缺少标记时为未知，不能从 slot 成功或阶段耗时猜测。
+* **risk scan 归属**（``risk_scans``）：把每条 ``timing.risk_scans`` 标记按
+  ``by_status`` 与 ``by_slot`` 计数。PR-11 B 之后它回答"这一分钟的风控是风险
+  lane 跑的，还是 intraday 兜底跑的"——只看外层 slot completed 无法区分。
+* **start-to-start 只在交易窗口内比较**：传入 ``session_windows``（交易时段）时，
+  跨午休/跨时段的相邻对不计入 p50/p95/max/breaches，只累计
+  ``excluded_session_gaps``。否则每天的午休 96 分钟都会被算成一次节拍违规。
 
 已知盲区：外层 cron 的 ``flock -n`` 拒绝没有日志；fast-entry 日志另存。
 ``ticks.start_attempts`` 仅为 docker exec 前的启动尝试，容器不存在也会计数。
@@ -72,7 +79,7 @@ NOT_ACQUIRED = "not_acquired"
 #: 真的跑完一次新扫描。
 COMPLETED_STATUSES = frozenset({"completed", "ok"})
 #: 没有产生新扫描：幂等跳过、非交易时段、数据已最新。
-IDLE_STATUSES = frozenset({"already_done", "skipped", "up_to_date"})
+IDLE_STATUSES = frozenset({"already_done", "skipped", "up_to_date", "already_scanned"})
 #: 明确失败或被阻断。
 FAILED_STATUSES = frozenset({"failed", "error", "blocked"})
 
@@ -281,7 +288,58 @@ def _gap_seconds(previous, current):
         return None
 
 
-def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS):
+def _in_session(moment, windows):
+    """``moment`` 是否落在某个声明的交易窗口内（``HH:MM`` 闭区间比较）。"""
+    clock = moment.strftime("%H:%M")
+    return any(start <= clock <= end for start, end in windows)
+
+
+def _same_session(previous, current, windows):
+    """两个时间点是否落在**同一交易日的同一个交易窗口**内。
+
+    午休 11:24→13:00 是 96 分钟，把它当成"节拍违规"会让每天的 breach 计数
+    天然非零，验收数字就失去意义。跨窗口的一对间隔只丢进
+    ``start_to_start_seconds[slot]["excluded_session_gaps"]``，不参与 p50/p95/
+    max/breaches。
+
+    日期必须一起比较：14:55（T 日）→ 09:30（T+1）落在同一个 ``HH:MM`` 窗口，
+    只比时刻会把跨夜间隔误算成节拍样本，第二天第一跳的 breach 就凭空出现。
+    """
+    if previous.date() != current.date():
+        return False
+    return any(
+        start <= previous.strftime("%H:%M") <= end
+        and start <= current.strftime("%H:%M") <= end
+        for start, end in windows
+    )
+
+
+def _risk_scan_counts(event, slot, summary):
+    """把 ``timing.risk_scans`` 的每条完成标记计入按 lane 的分布。
+
+    ``paper_timing.risk_scan_outcome`` 在每次 ``monitor_risk`` 调用上记录一条：
+    ``completed``（durable claim 提交后）、``already_scanned``（同一分钟已被别的
+    入口认领）、``failed``。它回答的是"这一分钟的风控到底是谁、以什么结果跑完
+    的"——外层 slot 的 completed 不能替代它（P11-A 的口径）。
+    """
+    timing = _timing_block(event)
+    scans = timing.get("risk_scans") if timing is not None else None
+    if not isinstance(scans, list):
+        return
+    for scan in scans:
+        if not isinstance(scan, dict):
+            continue
+        status = str(scan.get("status") or "").strip().lower()
+        if not status:
+            continue
+        summary["total"] += 1
+        summary["by_status"][status] = summary["by_status"].get(status, 0) + 1
+        by_slot = summary["by_slot"].setdefault(slot, {})
+        by_slot[status] = by_slot.get(status, 0) + 1
+
+
+def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS,
+              session_windows=None):
     """把事件流聚合成 PR-11 的调度指标。
 
     返回纯数据（可 JSON 序列化），字段含义见模块 docstring。``events`` 按日志
@@ -289,16 +347,22 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
     坏输入（``timing`` 不是对象、``started_at`` 不是时间或时区不可比、
     ``errors`` 不是数字、``wait_seconds`` 为负）一律降级为"这条证据不成立"，
     不抛异常。
+
+    ``session_windows`` 给定时（``[("09:30","11:24"), ("13:00","14:57")]``），
+    跨窗口的相邻对不计入节拍统计，只累计 ``excluded_session_gaps``。
     """
     target = float(target_interval_seconds)
+    windows = tuple(tuple(window) for window in (session_windows or ()))
 
     runs = {}
     skips = {}
     skips_by_slot = {}
     waits = []
     intervals = {}
+    excluded_gaps = {}
     last_starts = {}
     last_risk = {"at": None, "source": None, "status": None, "slot": None}
+    risk_scan_summary = {"total": 0, "by_status": {}, "by_slot": {}}
 
     started = 0
     end_events = 0
@@ -390,8 +454,14 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
             if previous is not None:
                 gap = _gap_seconds(previous, started_at)
                 if gap is not None and gap >= 0:
-                    intervals.setdefault(slot, []).append(gap)
+                    if windows and not _same_session(previous, started_at, windows):
+                        excluded_gaps[slot] = excluded_gaps.get(slot, 0) + 1
+                    else:
+                        intervals.setdefault(slot, []).append(gap)
             last_starts[slot] = started_at
+
+        if slot in ("risk", "intraday"):
+            _risk_scan_counts(event, slot, risk_scan_summary)
 
         if slot == "risk" and _is_risk_pass(event, slot, bucket):
             last_risk = {
@@ -415,15 +485,16 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
 
     waits.sort()
     interval_summary = {}
-    for slot, gaps in intervals.items():
-        ordered = sorted(gaps)
+    for slot in sorted(set(intervals) | set(excluded_gaps)):
+        ordered = sorted(intervals.get(slot, []))
         interval_summary[slot] = {
             "samples": len(ordered),
             "p50_seconds": _round(_percentile(ordered, 0.50)),
             "p95_seconds": _round(_percentile(ordered, 0.95)),
-            "max_seconds": _round(ordered[-1]),
+            "max_seconds": _round(ordered[-1]) if ordered else None,
             "target_seconds": _round(target),
             "breaches": sum(1 for gap in ordered if gap > target),
+            "excluded_session_gaps": excluded_gaps.get(slot, 0),
         }
 
     return {
@@ -450,17 +521,26 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
             "max": _round(waits[-1]) if waits else None,
         },
         "start_to_start_seconds": interval_summary,
+        "risk_scans": {
+            "total": risk_scan_summary["total"],
+            "by_status": dict(sorted(risk_scan_summary["by_status"].items())),
+            "by_slot": {slot: dict(sorted(counts.items()))
+                        for slot, counts in sorted(risk_scan_summary["by_slot"].items())},
+        },
         "last_successful_risk_scan": last_risk,
     }
 
 
-def summarize_lines(lines, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS):
+def summarize_lines(lines, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS,
+                    session_windows=None):
     """直接吃 ``scheduler.log`` 的行迭代器（便于调用方用 ``tail`` 之类的缓冲区）。"""
-    return summarize(iter_events(lines), target_interval_seconds=target_interval_seconds)
+    return summarize(iter_events(lines), target_interval_seconds=target_interval_seconds,
+                     session_windows=session_windows)
 
 
 def summarize_file(path, *, max_lines=4000, max_bytes=1_500_000,
-                   target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS):
+                   target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS,
+                   session_windows=None):
     """读取日志尾部并聚合；读不到时返回带原因的来源标记而不是抛异常。
 
     ``max_lines`` / ``max_bytes`` 只保留尾部：调度日志是追加写的长文件，
@@ -490,7 +570,8 @@ def summarize_file(path, *, max_lines=4000, max_bytes=1_500_000,
         lines = lines[1:]
     lines = lines[-int(max_lines):] if max_lines else lines
     try:
-        summary = summarize_lines(lines, target_interval_seconds=target_interval_seconds)
+        summary = summarize_lines(lines, target_interval_seconds=target_interval_seconds,
+                                  session_windows=session_windows)
     except Exception:  # noqa: BLE001 - 展示读路径的最后一道闸门，原因写进 error
         return {"available": False, "path": str(path), "error": "parse_error",
                 "lines_scanned": len(lines)}

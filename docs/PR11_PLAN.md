@@ -49,9 +49,10 @@
 
 关键事实：
 
-1. **`risk` 是合法 slot、也在 `HOT_PATH_SLOTS` 里，但没有任何独立 cron 条目**
-   （`SCHEDULED_SLOTS` 明确记录了这个决定，cron 里也有对应注释）。风控现在跑在
+1. **`risk` 是合法 slot、也在 `HOT_PATH_SLOTS` 里，但在 P11-B 之前没有任何独立 cron 条目**
+   （当时 `SCHEDULED_SLOTS` 明确记录了这个决定，cron 里也有对应注释）。风控原来跑在
    `intraday` 里，与全市场刷新、候选生成、执行共用一条 3 分钟节拍。这就是 PR-11 要拆的对象。
+   P11-B 已把它搬上独立条目与独立锁，见下方「P11-B 实际落地」。
 2. `intraday` 用 `flock -w 60`：上一轮超时就等 60 秒，等不到就整轮放弃。
    这是"跑不完就丢一轮"的现状，也是"风险快通道"无法保证的根因。
 3. `open` 与 `auction` 共用 `paper-scan.lock`；`intraday` 有独立锁。
@@ -180,6 +181,39 @@
   `execution_planner` 权威；`intraday` 内保留"同轮已跑过就不重复"的兜底语义。
 - 出口：`risk` 的 start-to-start interval 达到目标（P11-A 的量法）；同一分钟不出现第二次
   风险 pass；保护性减仓结果逐字段等价。
+
+#### P11-B 实际落地（已实现，待审核）
+
+| 决策 | 取值 | 理由 |
+| --- | --- | --- |
+| 触发分钟 | 与 `intraday` 同一三分钟网格（`RISK_CRON_MINUTES = INTRADAY_CRON_MINUTES`） | 同分钟进入时 durable scan claim 只放一方；若错开一分钟，同一窗口会出现两次风控 |
+| 外层 cron 锁 | `flock -n .locks/risk.lock` | 风险 lane 不排队：上一轮还在跑就跳过这一跳，兜底由 intraday 承担 |
+| 脚本内主机锁 | `risk-scan.lock`（`PSch.host_lock_name("risk")`） | 全市场候选扫描占着 `paper-scan.lock` 也挡不住风险 pass |
+| 全扫描意图标记 | 风险 lane 不参与 | 该协议只服务共用 `paper-scan.lock` 的 lane（`fast-entry` 让路） |
+| 运行租约 | `paper-runner-risk` | 挂在全局 `paper-runner-global` 下等于没有独立 lane；其它 slot 仍共用全局租约 |
+| 运行身份 | `risk:YYYYMMDDHHMM`（三分钟取整，与 `intraday:` 同一规则） | 当日一次性 `paper_jobs` 行会让第二跳起全部 `already_done`，节拍停在第一分钟 |
+| 租约 TTL | 900s（原 2400s） | 三分钟 lane 只做风险 pass；死亡进程仍由心跳缺失（约 6 分钟）更早判定 |
+| `already_scanned` | 归 `idle`，runner 退出码 0。**仅当对端已经把同一身份推进到 `completed`** | 同窗口被对端跑完是幂等成功，不是故障。注意：`run_slot` 的**外层**状态仍会被归成 `completed`，所以"这一分钟到底跑没跑真扫描"只能看 `timing.risk_scans` 标记 |
+| `running` 的语义 | **不是完成**：`monitor_risk` 在写事务之外有界等待对端完成，超时即返回 `status=risk_running` | 认领只证明"这一窗口有人在跑"，不证明保护性减仓已经做完。把 `running` 当 `completed` 会让 intraday 在减仓之前恢复委托、扫候选、买入 |
+| 执行顺序门禁 | `monitor_intraday` 只接受已完成的风控结论；否则整轮返回 `risk_in_progress` 并不进入委托恢复/候选/买入 | 独立 lane 的前提是"风控先于交易"仍然成立；宁丢一跳也不能倒序 |
+| 扫描身份 | `scan_minute` 取三分钟窗口分钟（`_scan_window_minute`），与 `risk:YYYYMMDDHHMM` 同一取整规则 | 以前取自然分钟，09:34 与 09:35 是两个不同 claim，同一窗口可能跑两次真实风控 |
+| 等待事务边界 | 等待发生在认领事务**之外** | 在 `BEGIN IMMEDIATE` 里 sleep 会一直占着写锁，对端的完成事务只能撞锁，最后双方都失败 |
+| 观测 | `dispatch.risk_scans`（按状态/按 lane）+ 交易窗口内的 start-to-start | 只看外层 slot completed 无法区分"风险 lane 真跑"与"整段 intraday 兜底" |
+
+节拍与告警校准（本轮复审修复）：
+
+- start-to-start 的"同一时段"判定必须同时比较**日期**：T 日 14:55 → T+1 09:30 落在同一
+  `HH:MM` 窗口，只比时刻会把跨夜间隔算成样本，次日第一跳凭空 breach。
+- `schedule_status()` 现在汇总 `risk:` 运行记录；否则独立 lane 的失败不会进入运行状态告警。
+- 并发回归用**可控 barrier**：真实 SQLite + 线程，risk lane 认领后阻塞在执行阶段，
+  intraday 兜底进入时必须得到 `risk_running`；反向场景（对端在等待窗口内完成）必须得到
+  `already_scanned`。
+
+验收映射（离线部分）：`test_paper_schedule_contract::RiskLaneGuard` 锁住渲染与锁归属；
+`test_paper_scheduler_priority` 用真实 `flock` 证明风险不被共享锁阻塞、且只被自己的锁串行；
+`test_paper_risk_lane` 证明窗口身份/租约隔离/同窗口幂等/完成标记归属；
+`test_paper_risk_exit_production_path::RISK-SCAN-*` 冻结同一分钟最多一次风控、跨周期、
+失败重试与逐字段等价。**真实 start-to-start 必须等部署后按 `dispatch` 实测，CI 不作数。**
 
 ### P11-C：`execution-resume` 独立 lane
 

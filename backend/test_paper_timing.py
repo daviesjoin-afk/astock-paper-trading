@@ -373,8 +373,12 @@ class SlotLedgerTimingTests(unittest.TestCase):
         self.output = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
     def _job(self):
+        # PR-11 B：风险快通道按三分钟窗口运行，行落在 ``paper_job_runs``
+        # （``risk:YYYYMMDDHHMM``），不再按当日写一行 ``paper_jobs``。
         with self.paper._db_readonly() as conn:
-            row = dict(conn.execute("SELECT * FROM paper_jobs WHERE slot='risk'").fetchone())
+            row = dict(conn.execute(
+                "SELECT * FROM paper_job_runs WHERE slot='risk'"
+                " ORDER BY started_at DESC, run_key DESC LIMIT 1").fetchone())
         row["detail"] = json.loads(row["detail"])
         return row
 
