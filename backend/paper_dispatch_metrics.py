@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 
 SLOT_TIMING_EVENT = "paper_slot_timing"
@@ -204,17 +205,28 @@ def summarize_lines(lines, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SE
     return summarize(iter_events(lines), target_interval_seconds=target_interval_seconds)
 
 
-def summarize_file(path, *, max_lines=50000, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS):
+def summarize_file(path, *, max_lines=4000, max_bytes=1_500_000,
+                   target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS):
     """读取日志尾部并聚合；文件不存在时返回空来源标记而不是抛异常。
 
-    ``max_lines`` 只保留尾部若干行：调度日志是追加写的长文件，验收要看的是
-    "最近这段"的节拍，而不是开天辟地以来的累计。
+    ``max_lines`` / ``max_bytes`` 只保留尾部：调度日志是追加写的长文件，
+    验收要看的是"最近这段"的节拍。按字节从文件末尾回退读取，避免把整份
+    日志读进内存——这个函数在 dashboard 刷新路径上被调用。
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()[-max_lines:]
-    except OSError:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - int(max_bytes))
+            handle.seek(start)
+            chunk = handle.read()
+    except (OSError, ValueError):
         return {"available": False, "path": str(path)}
+    lines = chunk.decode("utf-8", "replace").splitlines()
+    if start and lines:
+        # 从任意字节偏移切进来，第一行通常是被截断的半行；它解析不了，丢掉。
+        lines = lines[1:]
+    lines = lines[-int(max_lines):]
     summary = summarize_lines(lines, target_interval_seconds=target_interval_seconds)
     summary["available"] = True
     summary["path"] = str(path)

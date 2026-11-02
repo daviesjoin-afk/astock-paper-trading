@@ -49,6 +49,7 @@ def _get_se():
 
 import paper_storage as PST
 import paper_timing as PTM
+import paper_dispatch_metrics as PDM
 import paper_job_lifecycle as PJL
 import paper_snapshot_jobs as PSJ
 import paper_order_execution_authority as POEA
@@ -14265,6 +14266,18 @@ def latest_reviews():
         return query_rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id")
 
 
+def dispatch_status():
+    """PR-11：调度级事实（tick / 跳过 / 队列年龄 / 上次风险成功）。
+
+    只读主机调度日志的尾部，不碰数据库、不改变任何调度行为；日志不存在时
+    返回 ``available=False``，dashboard 照旧显示其余字段。口径见
+    ``paper_dispatch_metrics``：tick 来自 runner 结束事件，跳过来自抢锁失败与
+    为全扫描让路，queue age 是进入 runner 之前的主机锁等待。
+    """
+    path = os.environ.get("ASTOCK_SCHEDULER_LOG", "/opt/astock-codex/reports/scheduler.log")
+    return PDM.summarize_file(path)
+
+
 def schedule_status():
     names = list(PSch.SCHEDULE_TASK_NAMES)
     found = []
@@ -14307,6 +14320,8 @@ def schedule_status():
         "latest_intraday_runs": intraday,
         "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
+        # PR-11：tick / 跳过 / 队列年龄 / 上次风险成功；日志不可读时 available=False。
+        "dispatch": dispatch_status(),
         "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新有效行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
     }
 

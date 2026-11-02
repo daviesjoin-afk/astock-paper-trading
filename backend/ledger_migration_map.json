@@ -183,7 +183,7 @@
    "owner": "paper_order_ledger",
    "function": "accumulate_realized_pnl",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14464, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14479, "kind": "call/reference/binding"}
    ]
   },
   "paper_order_ledger::advance_execution_state": {
@@ -212,7 +212,7 @@
    "owner": "paper_order_ledger",
    "function": "cancel_order",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14454, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14469, "kind": "call/reference/binding"}
    ]
   },
   "paper_order_ledger::expire_order": {
@@ -229,7 +229,7 @@
     {"module": "paper_risk_writes", "function": "insert_sell_order", "line": 29, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "_record_entry_frozen_waitlist", "line": 1248, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "_buy_order", "line": 9161, "kind": "call/reference/binding"},
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14465, "kind": "call/reference/binding"},
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14480, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "_intraday_sell", "line": 11047, "kind": "call/reference/binding"}
    ]
   },
@@ -237,14 +237,14 @@
    "owner": "paper_order_ledger",
    "function": "record_execution_block",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14462, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14477, "kind": "call/reference/binding"}
    ]
   },
   "paper_order_ledger::record_fill_result": {
    "owner": "paper_order_ledger",
    "function": "record_fill_result",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14463, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14478, "kind": "call/reference/binding"}
    ]
   },
   "paper_order_ledger::record_realized_pnl": {
@@ -329,7 +329,7 @@
    "owner": "paper_order_ledger",
    "function": "terminalize_cycle_drift_order",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14456, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14471, "kind": "call/reference/binding"}
    ]
   },
   "paper_order_ledger::terminate_order": {
@@ -343,7 +343,7 @@
    "owner": "paper_order_ledger",
    "function": "update_order_outcome",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14455, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14470, "kind": "call/reference/binding"}
    ]
   },
   "paper_order_ledger::update_risk_payload": {
@@ -393,7 +393,7 @@
    "owner": "signal_service",
    "function": "defer_for_capacity",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14458, "kind": "call/reference/binding"},
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14473, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "_buy_order", "line": 8307, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "_buy_order", "line": 9142, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "_buy_order", "line": 8294, "kind": "call/reference/binding"},
@@ -442,7 +442,7 @@
    "owner": "signal_service",
    "function": "mark_filled",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14460, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14475, "kind": "call/reference/binding"}
    ]
   },
   "signal_service::mark_shadow": {
@@ -463,7 +463,7 @@
    "owner": "signal_service",
    "function": "record_signal_outcome",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14461, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14476, "kind": "call/reference/binding"}
    ]
   },
   "signal_service::reject_signal": {
@@ -485,7 +485,7 @@
    "owner": "signal_service",
    "function": "reopen_pending",
    "call_sites": [
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14459, "kind": "call/reference/binding"}
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14474, "kind": "call/reference/binding"}
    ]
   },
   "signal_service::retire_waitlist_signals": {
@@ -535,7 +535,7 @@
    "function": "write_payload",
    "call_sites": [
     {"module": "execution_dispatch", "function": "_write_signal_marker", "line": 501, "kind": "call/reference/binding"},
-    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14457, "kind": "call/reference/binding"},
+    {"module": "paper_trading", "function": "_bind_application_dependencies", "line": 14472, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "execute_open", "line": 9632, "kind": "call/reference/binding"},
     {"module": "paper_trading", "function": "monitor_fast_entries", "line": 11739, "kind": "call/reference/binding"}
    ]
