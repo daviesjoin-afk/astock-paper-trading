@@ -51,6 +51,7 @@ trail，却被当成了"是否执行真实风险订单"的**控制状态**。
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 
@@ -200,13 +201,38 @@ def result_is_settled(result):
     return str(result.get("status") or "").strip().lower() not in UNFINISHED_RESULT_STATUSES
 
 
-def not_ready_result(*, date, state, reason):
+def blocked_round_result(*, slot, date, reason, risk, extra=None):
+    """风控未完成时，任何 slot 的统一返回形状（执行与候选路径必须停止）。"""
+    payload = {
+        "slot": slot, "date": date, "status": "risk_in_progress", "deferred": True,
+        "orders": [], "manual_orders": [], "reason": reason, "risk": risk,
+    }
+    payload.update(extra or {})
+    return payload
+
+
+def not_ready_result(*, date, state, reason, status="risk_running"):
     """未完成时的统一返回形状（调用方据此挡住执行与候选路径）。"""
     return {
         "slot": "risk", "date": date, "orders": [], "manual_orders": [],
-        "status": "risk_running", "deferred": True,
+        "status": status, "deferred": True,
         "risk_scan_state": state, "reason": reason,
     }
+
+
+def bounded_seconds(value, *, default, minimum=0.0, maximum=600.0):
+    """把配置值收敛成有限且有界的秒数；``nan`` / ``inf`` / 越界一律回退默认值。
+
+    等待用的是单调时钟截止：``nan`` 会让 ``clock() >= deadline`` 永远为假（无限
+    等待），``inf`` 同理。配置错误必须安全降级，而不是把进程挂死。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(number) or number < minimum or number > maximum:
+        return float(default)
+    return number
 
 
 def await_settled(read_scan, *, timeout=DEFAULT_SETTLE_TIMEOUT_SECONDS,
@@ -218,7 +244,11 @@ def await_settled(read_scan, *, timeout=DEFAULT_SETTLE_TIMEOUT_SECONDS,
     决定用哪个连接读。读到的状态不是 ``running`` 就立刻返回，超时仍为 ``running``
     时如实返回 ``running`` —— **绝不**把"有人认领"当成"已经完成"。
     """
-    deadline = clock() + float(timeout)
+    timeout = bounded_seconds(timeout, default=DEFAULT_SETTLE_TIMEOUT_SECONDS,
+                              minimum=0.0, maximum=600.0)
+    poll = bounded_seconds(poll, default=DEFAULT_SETTLE_POLL_SECONDS,
+                           minimum=0.001, maximum=10.0)
+    deadline = clock() + timeout
     while True:
         row = read_scan() or {}
         state = str(row.get("status") or "missing")

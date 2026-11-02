@@ -250,6 +250,42 @@ class RiskRunningGateTests(PaperRiskExitProductionPathTestCase):
         self.assertFalse(thread.is_alive())
 
 
+    def test_barrier_cycle_rollover_during_the_wait_is_fail_closed(self):
+        """等待期间周期翻转：不能拿旧身份的结果当"本轮风控已完成"。"""
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_impl(asof_date=None, *, cycle_id):
+            started.set()
+            release.wait(30)
+            return {"slot": "risk", "date": str(asof_date), "orders": [], "manual_orders": []}
+
+        def run_lane():
+            PT.monitor_risk(self.day)
+
+        def rollover(conn, *, cycle_id):
+            raise PRSS.RiskScanCycleChanged("active cycle 已切换")
+
+        with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                 mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
+            thread = threading.Thread(target=run_lane, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
+                threading.Timer(0.2, release.set).start()
+                with mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 30.0),                         mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.02),                         mock.patch.object(PRSS, "assert_cycle_active", rollover):
+                    fallback = PT.monitor_risk(self.day)
+                self.assertNotEqual("already_scanned", fallback.get("status"))
+                self.assertEqual("risk_unavailable", fallback["status"])
+                self.assertTrue(fallback["deferred"])
+                self.assertEqual("failed", PT._slot_completion_status(fallback))
+            finally:
+                release.set()
+                thread.join(30)
+        self.assertFalse(thread.is_alive())
+
+
 class ScheduleStatusRiskLaneTests(PaperRiskExitProductionPathTestCase):
     """独立风险任务的失败必须进入运行状态汇总。"""
 
@@ -268,6 +304,78 @@ class ScheduleStatusRiskLaneTests(PaperRiskExitProductionPathTestCase):
                             for row in status["latest_risk_runs"]))
         self.assertEqual("异常", status["runtime_status"])
         self.assertGreaterEqual(status["runtime_failed_count"], 1)
+
+
+class OpenSlotRiskGateTests(PaperRiskExitProductionPathTestCase):
+    """P0：开盘审批与盘中扫描共用同一条"风控完成"约束。"""
+
+    def test_execute_open_blocks_resume_and_candidates_on_unsettled_risk(self):
+        running = {"status": "risk_running", "deferred": True, "risk_scan_state": "running"}
+        resume = mock.Mock(return_value=[])
+        manual = mock.Mock(return_value=[])
+        events = mock.Mock(return_value={"status": "skipped"})
+        with mock.patch.object(PT, "init_db"),                 mock.patch.object(PT, "process_pending_execution_orders", resume),                 mock.patch.object(PT, "process_pending_manual_orders", manual),                 mock.patch.object(PT, "monitor_opening_events", events),                 mock.patch.object(PT.MDSvc, "refresh_rows") as refresh:
+            result = PT.execute_open(self.day, risk_result=running)
+        self.assertEqual("risk_in_progress", result["status"])
+        self.assertTrue(result["deferred"])
+        self.assertEqual([], result["execution_orders"])
+        resume.assert_not_called()
+        manual.assert_not_called()
+        events.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual("failed", PT._slot_completion_status(result))
+
+    def test_execute_open_blocks_when_its_own_risk_pass_is_unsettled(self):
+        resume = mock.Mock(return_value=[])
+        with mock.patch.object(PT, "init_db"),                 mock.patch.object(PT, "monitor_risk",
+                                  return_value={"status": "risk_running", "deferred": True}),                 mock.patch.object(PT, "process_pending_execution_orders", resume),                 mock.patch.object(PT.MDSvc, "refresh_rows") as refresh:
+            result = PT.execute_open(self.day)
+        self.assertEqual("risk_in_progress", result["status"])
+        resume.assert_not_called()
+        refresh.assert_not_called()
+
+    def test_execute_open_still_runs_when_the_risk_pass_settled(self):
+        """成功路径不能被新门禁误伤：风险服务不写 status 也算已完成。"""
+        resume = mock.Mock(return_value=[])
+        with mock.patch.object(PT, "init_db"),                 mock.patch.object(PT, "monitor_risk",
+                                  return_value={"orders": [], "manual_orders": []}),                 mock.patch.object(PT, "process_pending_execution_orders", resume),                 mock.patch.object(PT.dfc, "check_data_source_health", return_value={}),                 mock.patch.object(PT, "_entry_freeze_status", return_value={}),                 mock.patch.object(PT.MDSvc, "refresh_rows", return_value=[]):
+            result = PT.execute_open(self.day)
+        resume.assert_called_once()
+        self.assertNotEqual("risk_in_progress", result.get("status"))
+
+
+class SettleConfigTests(unittest.TestCase):
+    """P1：等待配置必须收敛成有限值，nan/inf 不能让截止时间永远不成立。"""
+
+    def test_illegal_values_fall_back_to_the_default(self):
+        for raw in ("nan", "inf", "-inf", "-1", "1e9", "", None, "abc"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    20.0, PRSS.bounded_seconds(raw, default=20.0, minimum=0.0, maximum=300.0))
+
+    def test_legal_values_are_kept(self):
+        self.assertEqual(0.0, PRSS.bounded_seconds("0", default=20.0, minimum=0.0, maximum=300.0))
+        self.assertEqual(2.5, PRSS.bounded_seconds("2.5", default=20.0, minimum=0.0, maximum=300.0))
+
+    def test_await_settled_sanitises_its_own_arguments(self):
+        calls = {"n": 0}
+        now = {"t": 0.0}
+
+        def read_scan():
+            calls["n"] += 1
+            return {"status": "running"}
+
+        def clock():
+            now["t"] += 1.0
+            return now["t"]
+
+        # nan/inf 会被收敛成默认的 20s / 0.25s；用假时钟证明它**有**截止，
+        # 不靠真实睡眠（否则这个用例本身就要跑 20 秒）。
+        settled = PRSS.await_settled(read_scan, timeout=float("nan"), poll=float("inf"),
+                                     clock=clock, sleep=lambda _s: None)
+        self.assertEqual("running", settled["state"])
+        self.assertLess(calls["n"], 30, "nan/inf 必须被收敛，否则循环不会终止")
+        self.assertGreaterEqual(calls["n"], 5, "收敛后仍应按默认值轮询多轮")
 
 
 if __name__ == "__main__":

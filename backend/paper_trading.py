@@ -458,12 +458,13 @@ def _risk_business_key(now=None):
 
 
 #: 对端仍在跑风控时的最大等待与轮询间隔（秒）；超时即 fail-closed。
-RISK_RUNNING_WAIT_SECONDS = float(
-    os.environ.get("PAPER_RISK_RUNNING_WAIT_SECONDS",
-                   PRSS.DEFAULT_SETTLE_TIMEOUT_SECONDS) or 20)
-RISK_RUNNING_POLL_SECONDS = float(
-    os.environ.get("PAPER_RISK_RUNNING_POLL_SECONDS",
-                   PRSS.DEFAULT_SETTLE_POLL_SECONDS) or 0.25)
+#: nan / inf / 越界配置由 owner 收敛成默认值，绝不允许"永远等不到截止"。
+RISK_RUNNING_WAIT_SECONDS = PRSS.bounded_seconds(
+    os.environ.get("PAPER_RISK_RUNNING_WAIT_SECONDS"),
+    default=PRSS.DEFAULT_SETTLE_TIMEOUT_SECONDS, minimum=0.0, maximum=300.0)
+RISK_RUNNING_POLL_SECONDS = PRSS.bounded_seconds(
+    os.environ.get("PAPER_RISK_RUNNING_POLL_SECONDS"),
+    default=PRSS.DEFAULT_SETTLE_POLL_SECONDS, minimum=0.01, maximum=10.0)
 
 def _slot_run_key(slot, now=None):
     """重复触发 lane 的窗口身份；一次性 slot 返回 ``None``（按当日幂等）。"""
@@ -9507,6 +9508,14 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
     # order is reconsidered.  A quote gate may stop buys, but never stops a
     # protective sell pass.
     opening_risk = risk_result if risk_result is not None else monitor_risk(day)
+    if not PRSS.result_is_settled(opening_risk):
+        # 与盘中扫描同一条约束：未完成就不得恢复委托、审批候选或买入。
+        # 显式传入未完成的 risk_result 同样在这里被挡住。
+        return PRSS.blocked_round_result(
+            slot="open", date=day.isoformat(), risk=opening_risk,
+            reason=f"风控扫描未完成（{opening_risk.get('status')}）：开盘审批跳过委托恢复与候选处理",
+            extra={"expired": 0, "execution_orders": []},
+        )
     if execution_orders is None:
         execution_orders = process_pending_execution_orders(day)
     # P3 审计修复（2026-09-03）：开盘 slot 与 monitor_intraday 一样先做
@@ -9972,6 +9981,16 @@ def monitor_risk(asof_date=None):
             return PRSS.not_ready_result(
                 date=day.isoformat(), state=state,
                 reason=f"风控扫描身份不可读（{state}）；本轮不进入执行与候选路径",
+            )
+        # 等待期间可能发生周期翻转：接受对端结果前必须复核**原** cycle 仍然有效。
+        try:
+            with _db_readonly() as fence_conn:
+                PRSS.assert_cycle_active(fence_conn, cycle_id=ident["cycle_id"])
+        except PRSS.RiskScanCycleChanged as exc:
+            PTM.risk_scan_outcome("cycle_changed", **scan_context)
+            return PRSS.not_ready_result(
+                date=day.isoformat(), state="cycle_changed", status="risk_unavailable",
+                reason=f"等待期间周期归属已变化（{exc}）；本轮不进入执行与候选路径",
             )
         PTM.risk_scan_outcome("already_scanned", **scan_context)
         return {
@@ -11853,12 +11872,11 @@ def monitor_intraday(asof_datetime=None, force=False):
     risk_result = monitor_risk(day)
     if not PRSS.result_is_settled(risk_result):
         # 风控未完成（对端正在跑）：本轮不恢复委托、不扫候选、不买入。
-        return {
-            "slot": "intraday", "status": "risk_in_progress", "deferred": True,
-            "date": day.isoformat(), "orders": [], "execution_orders": [],
-            "reason": f"风控扫描未完成（{risk_result.get('status')}）：本轮跳过委托恢复与候选扫描",
-            "risk": risk_result,
-        }
+        return PRSS.blocked_round_result(
+            slot="intraday", date=day.isoformat(), risk=risk_result,
+            reason=f"风控扫描未完成（{risk_result.get('status')}）：本轮跳过委托恢复与候选扫描",
+            extra={"execution_orders": []},
+        )
     execution_orders = process_pending_execution_orders(day)
     # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
     with PTM.phase("market_snapshot"):
@@ -13480,7 +13498,7 @@ def _slot_completion_status(detail):
     # 非成功（外层 scheduler 需要重试），绝不能记成 completed。
     return "failed" if detail.get("status") in {
         "blocked", "failed", "partial", "deferred", "in_progress",
-        "risk_running", "risk_in_progress",
+        "risk_running", "risk_in_progress", "risk_unavailable",
     } else "completed"
 
 
