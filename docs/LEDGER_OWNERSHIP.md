@@ -22,10 +22,10 @@
 | `paper_position_lots` | **owned** | `paper_lot_ledger` | 创建/消耗/成交血缘都归 lot owner；`commit_fill` 通过注入的 `link_source_fill` 回调回填 `source_fill_id` |
 | `paper_risk_decisions` | **owned** | `paper_risk_writes` | 第五批统一来源信息校验及组装；两个 `_risk_log` 只准备快照、策略戳和时间 |
 | `paper_audit` | **owned** | `paper_repository` | 第六批：追加及失败进化操作的清理都归表 owner；补偿方保留事务与异常处理 |
-| `paper_orders` | **pending** | `paper_trading`、`manual_orders`、`execution_planner`、`execution_dispatch`、`execution_verification`、`paper_risk_writes` | 第八批后生命周期层只判断/编排，过期与失效回收写入已移交；第九批移交等待池重复记录回收，第十批移交对账路径的两条回收写入，其他阶段仍分写 |
-| `paper_signals` | **pending** | `paper_trading`、`manual_orders`、`execution_dispatch`、`signal_service` | 第八批后生命周期层不再直写；第九批把等待池回收的信号写并入同一 owner；第十批把对账的信号状态写入归 `signal_service`，其他阶段仍分写 |
-| `paper_accounts` | **pending** | `paper_trading`、`paper_shared_cash`、`paper_user_cycle_attachment`、`paper_user_account_provisioning`、`strategy_registry`、`paper_order_execution_authority`、`paper_cycle_ownership`、`adaptive_engine`、`adaptive_risk`、`adaptive_selection`、`adaptive_selection_compat`、`evolution_apply`、`ai_adoption_writer` | 不同 owner 各写自己的字段（现金/周期挂接/策略参数） |
-| `paper_cycles` | **pending** | `paper_trading`、`paper_cycle_service` | 第七批补核查：创建/配置/启停及兼容补齐 vs 周期归档，按阶段登记，不据此认定多写缺陷 |
+| `paper_orders` | **owned** | `paper_order_ledger` | A/B/D 运行时写入收口，子查询读表不算写入 |
+| `paper_signals` | **owned** | `signal_service` | 信号持久化统一入口 |
+| `paper_accounts` | **owned** | `paper_account_ledger` | 四组业务职责保留；账户表单一持久化入口，跨字段更新仍为单条 SQL |
+| `paper_cycles` | **owned** | `paper_cycle_service` | 周期创建/配置/启停/归档统一入口 |
 
 **`owned` = 单写方**；**`pending` = 多写方是现状，本 PR 只锁定集合（只减不增）**。
 
@@ -357,18 +357,15 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 | --- | --- | --- |
 | `paper_orders` | `paper_order_ledger` | existing（A 包第一片已建立） |
 | `paper_signals` | `signal_service` | existing |
-| `paper_accounts`（现金） | `paper_shared_cash` | existing |
-| `paper_accounts`（创建） | `paper_user_account_provisioning` | existing |
-| `paper_accounts`（cycle 身份/启停） | `paper_user_cycle_attachment` | existing |
-| `paper_accounts`（参数/版本/限额/冷却） | `paper_account_config`（C 包新建） | planned |
+| `paper_accounts`（全部字段） | `paper_account_ledger` | existing；四组业务模块只保留判断/编排/兼容接口 |
 | `paper_cycles` | `paper_cycle_service` | existing |
 
 `paper_order_ledger` 只承担**订单行持久化**：创建 INSERT、状态迁移、成交结果字段、
 核验戳、归档删除。成交判定仍唯一属于 `commit_fill`；`paper_order_ledger` 不允许
 自己算成交价、费用、可卖量或 BUY 数量，也不 commit。
 
-账户不接受"任意字段字典"接口：现金、身份、配置三组字段分别归三个 owner，
-`paper_accounts` 不会因为收口而变成一个大 Manager。
+账户持久化通过窄业务操作进入同一表 owner。现金/开户/周期/配置仍保留业务职责；
+周期成员配置只接受原有列白名单，跨字段初始化保持单条 SQL 与原事务。
 
 ### 16.3 工作包与出口
 
@@ -376,15 +373,16 @@ AST 对照。没有 schema 或数据迁移，回滚本批提交即可；未做�
 | --- | --- | --- |
 | **A** | 订单/信号非成交生命周期：重试接管、等待池替代、手动取消/终止、派发等待与回收 | 调用方不再自行拼订单/信号状态 UPDATE；退役范围、原因、时钟、预占调用、统计与基线逐项对照 |
 | **B** | 订单创建、成交结果、核验戳与信号执行反馈 | 保留 `commit_fill` 唯一成交权威；自动/手动/延期/部分成交/核验/失败路径投影一致 |
-| **C** | `paper_accounts` 四组：创建补齐、现金、身份挂接、配置补偿 | 每组字段有唯一入口；现金算法与版本检查不变；13 个写方逐项归类完毕 |
+| **C** | `paper_accounts` 四组：创建补齐、现金、身份挂接、配置补偿 | 四组业务职责保留，账户表持久化单 owner；现金算法与版本检查不变 |
 | **D** | `paper_cycles` 完整生命周期与跨表归档事务 | 创建/配置/启停/归档/恢复都有 owner；归档不删历史事实、不覆盖未知归属 |
 | **E** | 十张核心表读取契约、守卫校准、跨包最终回归与关闭报告 | 逐表权威读/投影/允许调用方/事务归属成文；关键负向测试与完整 CI 通过 |
 
 A–D 完成、且守卫与源码一致之后，四张表才允许从 `pending` 改 `owned`；只改标签不算完成。
 E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目标、不建通用数据库审计框架。
 
-### 16.4 剩余写入清单（自动生成）
+### 16.4 当前写入清单（自动生成）
 
+原始冻结 ID 与迁移映射另见 `backend/ledger_frozen_baseline.json` / `backend/ledger_migration_map.json`；以下仅是当前写方清单。
 以下表格由 `python backend/tools/ledger_write_inventory.py --markdown` 生成，
 `test_ledger_owner_plan.py` 会比对"源码扫描结果 ↔ 计划 ↔ 本节内容"三者一致。
 
@@ -694,50 +692,23 @@ supersede_signals 恢复同账户/标的旧订单集合子查询，保留先信�
 | `signal_service::retire_waitlist_signals` | `paper_signals` | 身份集合由调用方传入 |
 | `signal_service::supersede_signals` | `paper_signals` | 身份与状态集合由调用方传入 |
 
-## 18. PR-10 收口报告
+## 18. PR-10 收口报告（复审后更正）
 
-### 18.1 范围与结果
+**结论：交付完成、验收未通过。** 五包保留 Draft，不开始合并，不进入 PR-11。
 
-| 工作包 | 范围 | 结果 |
-| --- | --- | --- |
-| A | 订单/信号非成交生命周期 | 19/19 操作迁移 |
-| B | 创建、成交结果、核验戳、信号反馈 | 24/24 操作迁移，`commit_fill` 仍唯一成交权威 |
-| C | 账户四组字段 | 16/16 迁移（两条与周期创建同事务，随 D 落地）|
-| D | 周期生命周期与归档 | 7/7 操作迁移 |
-| E | 读取契约、守卫校准、总验收 | 本节 |
+A/B 已恢复数据库内集合式信号更新，参数数量不随历史记录增长；C/D 已将账户表
+持久化统一到 `paper_account_ledger`，四组业务职责保留，跨字段更新不拆事务。
+显式 NULL 保留数据库约束错误，开户禁删/替换守卫及 SQL 提取已修复。
 
-### 18.2 写入归属（源码扫描口径）
+68 个原始稳定操作 ID 均有迁移接口、调用位置、事务/异常边界及关联回归模块，
+当前 70 个 writer 接口均能反查。原冻结是 57 个函数组/68 个按表操作；71 是旧
+最终树 writer 函数组数，旧报告的 66 汇总撤回。该映射不是运行时所有分支等价的单独证明。
 
-| 表 | 状态 | 运行时写方 |
-| --- | --- | --- |
-| `paper_orders` | owned | `paper_order_ledger` |
-| `paper_signals` | owned | `signal_service` |
-| `paper_cycles` | owned | `paper_cycle_service` |
-| `paper_accounts` | pending（字段分组单写，整表多 owner） | `paper_shared_cash` / `paper_user_account_provisioning` / `paper_user_cycle_attachment` / `paper_account_config` |
+十张核心表目前各有一个真实运行时写方。跨域 import 边 629→636，新增七条属于
+已审核设计成本；FEATURE_ALLOWANCE 增长提高有效预算上限。全部表引用总数没有下降，
+因此原定 fan-out 验收仍未满足，不能以写方下降、CI 通过或 lock 未变替代，也不转移到 PR-11。
 
-冻结清单里尚未迁移的操作：**0** 条。
+逐表前后对照、准确计数、原始映射与重现方法见 [PR10_REVIEW_EVIDENCE.md](PR10_REVIEW_EVIDENCE.md)。
+本轮未连接服务器、未部署，未修改生产账本。
 
-### 18.3 计划外、需要在验收时裁决的两件事
-
-1. **`paper_accounts` 的「单写方」口径**：本阶段做成「每个字段组恰好一个 owner」，
-   整表仍有 4 个运行时写方，因此保持 `pending`。是否接受「字段分组单写」作为验收模型，
-   需要明确答复；不接受则要把三组字段并进一个账户 owner。
-2. **引用分散度上升**：`cross_domain_edges` 618 → 636。owner 化让调用方多出指向
-   owner 的 import；收益在写方数量（6/4/2 → 1/1/1，账户四组各一），不在 import 边数。
-
-### 18.4 守卫与证据
-
-| 守卫 | 守什么 |
-| --- | --- |
-| `test_ledger_owner_plan` | 源码扫描 ↔ 冻结计划 ↔ 文档 §16 逐字一致 |
-| `test_ledger_read_contracts` | 十张表的读取契约覆盖所有真实读者；动态写入逐条登记 |
-| `test_ledger_ownership` | 写方集合与 `owned` 表单写方 |
-| `test_cycle_archive_writes` | 归档窗口/状态过滤/已成交行不被清理改写 |
-
-### 18.5 未验证项与回滚
-
-- 没有生产样本，**未做真实交易时段验证**；本地离线回归 + 远端容器全量。
-- 静态扫描看不到运行时拼装的 SQL；已知动态路径逐条登记，但登记完整依赖人工复核。
-- 回滚：五个工作包各自一个 PR，顺序合并；任一包可单独 revert；无 schema/数据迁移。
-
-**状态**：MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。PR-10 不进入 PR-11。
+MERGE: NOT MERGED；DEPLOY: NOT DEPLOYED。

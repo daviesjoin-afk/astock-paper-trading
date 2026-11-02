@@ -37,16 +37,12 @@
    "reads_may_trigger_writes": "读面板只读；创建只走 provisioning 入口",
    "unknown_handling": "读路径缺账户行返回空，绝不现场建账",
    "write_owner": [
-    "paper_shared_cash",
-    "paper_user_cycle_attachment",
-    "paper_user_account_provisioning",
-    "paper_account_config"
+    "paper_account_ledger"
    ]
   },
   "paper_audit": {
-   "authoritative_readers": [
-    "paper_repository"
-   ],
+   "authoritative_read_policy": "paper_repository 仅写审计事实，不执行 SELECT；现有直接读者按事务读取与投影分类，不伪造 owner 读入口。",
+   "authoritative_readers": [],
    "cycle_scoped": false,
    "in_transaction_readers": [
     "diagnose_cycle_lifecycle_conflict",
@@ -160,6 +156,7 @@
     "portfolio_order_intents",
     "portfolio_workspace_service",
     "rebalance_scanner",
+    "signal_service",
     "trade_attribution"
    ],
    "projection_readers": [
@@ -209,9 +206,8 @@
    ]
   },
   "paper_positions": {
-   "authoritative_readers": [
-    "paper_lot_ledger"
-   ],
+   "authoritative_read_policy": "paper_positions 是兼容投影；仓位权威事实由 paper_position_lots 提供，lot owner 不直接 SELECT 此投影。",
+   "authoritative_readers": [],
    "cycle_scoped": true,
    "in_transaction_readers": [
     "news_learning",
@@ -248,9 +244,8 @@
    ]
   },
   "paper_signals": {
-   "authoritative_readers": [
-    "signal_service"
-   ],
+   "authoritative_read_policy": "signal_service 负责持久化但不直接 SELECT 本表；现有信号读取仍在业务事务/投影调用方，尚无独立权威读接口。",
+   "authoritative_readers": [],
    "cycle_scoped": false,
    "in_transaction_readers": [
     "adaptive_engine",

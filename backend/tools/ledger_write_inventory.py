@@ -89,6 +89,9 @@ def _write_targets(sql: str) -> list[str]:
 
 
 def _read_tables(sql: str) -> list[str]:
+    # DELETE FROM 的首表是写目标；其余 FROM/JOIN（包括子查询）才是读引用。
+    sql = re.sub(r"^\s*DELETE\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)",
+                 r"DELETE \1", sql, flags=re.I)
     reads: list[str] = []
     for match in READ_PATTERN.finditer(sql):
         table = match.group(1).lower()
@@ -238,9 +241,6 @@ def render_plan_markdown(inventory: dict | None = None, plan: dict | None = None
         lines.extend(rows)
         lines.append("")
     return chr(10).join(lines).rstrip() + chr(10)
-
-
-SELECT_PATTERN = re.compile(r"(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
 
 
 def scan_readers(root: Path = BACKEND) -> dict[str, list[str]]:

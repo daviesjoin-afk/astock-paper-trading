@@ -1,112 +1,112 @@
 {
  "writes": {
-  "paper_account_config::write_params": {
+  "paper_account_ledger::apply_cycle_membership": {
+   "reason": "列集合由调用方给（白名单校验）",
    "tables": [
     "paper_accounts"
-   ],
-   "reason": "SET 子句按 version/now 是否给出拼装"
+   ]
+  },
+  "paper_account_ledger::insert_account": {
+   "reason": "列集合由调用方给（白名单校验）",
+   "tables": [
+    "paper_accounts"
+   ]
+  },
+  "paper_account_ledger::set_status": {
+   "reason": "过滤条件由调用方给出（活动周期 clause）",
+   "tables": [
+    "paper_accounts"
+   ]
+  },
+  "paper_account_ledger::write_params": {
+   "reason": "独立未提供标记决定 SET 字段；显式 None 仍绑定给数据库，不省略",
+   "tables": [
+    "paper_accounts"
+   ]
   },
   "paper_cycle_service::insert_cycle": {
+   "reason": "列集合由调用方给（白名单校验）",
    "tables": [
     "paper_cycles"
-   ],
-   "reason": "列集合由调用方给（白名单校验）"
+   ]
   },
   "paper_order_ledger::cancel_order": {
+   "reason": "可撤销状态集由调用方传入，占位符数量随之变化",
    "tables": [
     "paper_orders"
-   ],
-   "reason": "可撤销状态集由调用方传入，占位符数量随之变化"
+   ]
   },
   "paper_order_ledger::insert_order": {
+   "reason": "列集合由调用方给（白名单校验），占位符数量随列数变化",
    "tables": [
     "paper_orders"
-   ],
-   "reason": "列集合由调用方给（白名单校验），占位符数量随列数变化"
+   ]
   },
   "paper_order_ledger::retire_gated_order": {
+   "reason": "挂起状态集由调用方传入",
    "tables": [
     "paper_orders"
-   ],
-   "reason": "挂起状态集由调用方传入"
+   ]
   },
   "paper_order_ledger::supersede_for_terminal_signal": {
+   "reason": "终态词表由调用方传入",
    "tables": [
     "paper_orders"
-   ],
-   "reason": "终态词表由调用方传入"
+   ]
   },
   "paper_order_ledger::supersede_older_intents": {
+   "reason": "状态集合由调用方传入",
    "tables": [
     "paper_orders"
-   ],
-   "reason": "状态集合由调用方传入"
+   ]
   },
   "paper_order_ledger::update_order_outcome": {
+   "reason": "SET 子句按调用方给出的字段组合拼装",
    "tables": [
     "paper_orders"
-   ],
-   "reason": "SET 子句按调用方给出的字段组合拼装"
-  },
-  "paper_user_account_provisioning::insert_account": {
-   "tables": [
-    "paper_accounts"
-   ],
-   "reason": "列集合由调用方给（白名单校验）"
-  },
-  "paper_user_cycle_attachment::apply_cycle_membership": {
-   "tables": [
-    "paper_accounts"
-   ],
-   "reason": "列集合由调用方给（白名单校验）"
-  },
-  "paper_user_cycle_attachment::set_status": {
-   "tables": [
-    "paper_accounts"
-   ],
-   "reason": "过滤条件由调用方给出（活动周期 clause）"
+   ]
   },
   "signal_service::advance_signal_feedback": {
+   "reason": "活动状态集合由调用方传入",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "活动状态集合由调用方传入"
+   ]
   },
   "signal_service::conflict_statement": {
+   "reason": "冲突语句按 upsert 列集拼装（既有实现）",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "冲突语句按 upsert 列集拼装（既有实现）"
+   ]
   },
   "signal_service::expire_after_order_retry": {
+   "reason": "终态集合由调用方传入",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "终态集合由调用方传入"
+   ]
   },
   "signal_service::expire_within": {
+   "reason": "状态集合由调用方传入",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "状态集合由调用方传入"
+   ]
   },
   "signal_service::reopen_for_retry": {
+   "reason": "终态集合由调用方传入",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "终态集合由调用方传入"
+   ]
   },
   "signal_service::retire_waitlist_signals": {
+   "reason": "固定业务状态集合生成占位符；订单 ID 保留数据库集合子查询，不随历史行数生成参数",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "身份集合由调用方传入"
+   ]
   },
   "signal_service::supersede_signals": {
+   "reason": "固定业务状态集合生成占位符；订单 ID 保留数据库集合子查询，不随历史行数生成参数",
    "tables": [
     "paper_signals"
-   ],
-   "reason": "身份与状态集合由调用方传入"
+   ]
   }
  }
 }

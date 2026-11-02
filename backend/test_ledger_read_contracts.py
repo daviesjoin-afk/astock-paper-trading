@@ -32,7 +32,8 @@ class ContractShapeTests(unittest.TestCase):
     def test_each_contract_names_readers_and_policy(self):
         for table, spec in CONTRACTS.items():
             with self.subTest(table=table):
-                self.assertTrue(spec["authoritative_readers"], f"{table} 缺权威读者")
+                self.assertTrue(spec["authoritative_readers"] or spec.get("authoritative_read_policy"),
+                                f"{table} 缺权威读者或无独立权威读入口的说明")
                 for module in spec["authoritative_readers"]:
                     self.assertTrue(_known_module(module), f"{table}: 未知模块 {module}")
                 self.assertTrue(spec["unknown_handling"].strip(), f"{table} 缺 unknown 处理说明")
