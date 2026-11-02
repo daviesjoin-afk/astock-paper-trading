@@ -99,14 +99,21 @@
    主机脚本事件（锁/启动/退出）的 slot 在顶层，两种形状分别取、互不回落。
 2. **日志路径跟随 `data_paths.report_dir()`**（容器内 `/app/reports/scheduler.log`），
    不再写死宿主绝对路径 `/opt/astock-codex/...`；需要指向别处时用 `ASTOCK_SCHEDULER_LOG`。
-   读不到时 `dispatch` 返回 `available=False` 并给出 `error=missing|unreadable`。
+   读不到时 `dispatch` 返回 `available=False` 并给出 `error=missing|unreadable|bad_path|parse_error`；
+   `parse_error` 是"观测坏了但 dashboard 不跟着 500"的最后一道闸门。
 3. **状态四分类**：`completed`（`completed` / `ok`）才算跑完一次新扫描；`skipped` /
    `already_done` / `up_to_date` 归 `idle`，**不计**为成功风控；`failed` / `error` /
-   `blocked` 归 `failed`；其余归 `unknown`。格式异常的 `timing` 只降级该条证据，不抛错。
-4. **tick 可对账**：`tick_id` 由主机脚本生成并注入容器（`ASTOCK_SCHEDULER_TICK_ID`），
+   `blocked` 归 `failed`；其余归 `unknown`。格式异常的 `timing` 只降级该条证据，不抛错
+   （包括 `started_at` 时区不可比时丢掉该对间隔，而不是让 naive/aware 相减抛 `TypeError`）。
+4. **风控阶段只认 `risk_pass` 与 `risk.*`**：`risk_snapshot_enqueue` 是展示快照入队
+   （`run_slot` 吞掉它的异常），既不能让展示失败抹掉真实风控成功，也不能让没有风控阶段的
+   一轮虚报成功。
+5. **tick 可对账**：`tick_id` 由主机脚本生成并注入容器（`ASTOCK_SCHEDULER_TICK_ID`），
    启动事件与结束事件按同一个 id 配对。于是 `started`（进入 runner）、
    `unfinished`（启动了但没有结束事件：仍在跑或被杀）、`exited_without_result`
    （退出但从未打印结果）是三个不同的数字。
+6. **queue age 按轮次计**：有启动事件的轮次用进入时刻的等待；没有启动事件的轮次
+   （旧日志、`weekly-review` 直连 `docker exec`）退回结束事件里的等待，同一轮不重复。
 
 `paper_dispatch_metrics` 的输出字段（`schedule_status()["dispatch"]`）：
 
@@ -136,6 +143,9 @@
 - **`weekly-review` 的 cron 行直接 `docker exec`**，不经过 `run_paper_slot.sh`，因此没有
   启动/退出事件，只有 `paper_timing` 结束事件。
 - `queue age` 只覆盖主机 `paper-scan.lock` 等待，不含外层 cron 锁排队与 Docker/Python 启动。
+- `paper_slot_start` 在 `docker exec` 之前发出，因此 `ticks.started` 的精确含义是
+  "拿到主机锁、准备启动 runner"。容器不存在或镜像缺失时同样是 started +
+  `exited_without_result`，不会冒充"跑完一轮"。
 
 ## 4. 工作包与出口
 

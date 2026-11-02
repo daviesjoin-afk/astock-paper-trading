@@ -145,6 +145,16 @@ class ParsingRobustnessTests(unittest.TestCase):
         self.assertEqual(0, summary["queue_age_seconds"]["samples"])
         self.assertEqual(0, summary["start_to_start_seconds"].get("intraday", {}).get("samples", 0))
 
+    def test_mixed_timezone_offsets_drop_the_pair_instead_of_raising(self):
+        """naive 与 aware 的 ``started_at`` 相减会抛 TypeError：只能丢掉这一对。"""
+        summary = _summarize(
+            _timing_event("risk", "2026-11-02T09:30:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:33:00"),
+            _timing_event("risk", "2026-11-02T09:36:00+08:00"),
+        )
+        self.assertEqual({}, summary["start_to_start_seconds"])
+        self.assertEqual(3, summary["ticks"]["end_events"])
+
     def test_negative_wait_is_not_counted(self):
         self.assertEqual(0, _summarize(_lock(PDM.NOT_ACQUIRED, slot="intraday", wait=-5))
                          ["queue_age_seconds"]["samples"])
@@ -235,6 +245,19 @@ class TickAccountingTests(unittest.TestCase):
         self.assertEqual(2, queue["samples"])
         self.assertEqual(12.0, queue["max"])
 
+    def test_queue_age_mixes_paired_starts_and_orphan_end_events(self):
+        """有启动事件的轮次用进入等待，没有启动事件的轮次（旧日志/直连 docker exec）
+        用结束事件里的等待：同一个窗口两种轮次都要能计，且不重复。"""
+        queue = _summarize(
+            _start("intraday", tick="a", wait=5),
+            _timing_event("intraday", "2026-11-02T09:33:00+08:00", wait=5),
+            '{"event": "paper_slot_timing", "status": "completed", "timing":'
+            ' {"slot": "weekly-review", "started_at": "2026-11-02T15:20:00+08:00",'
+            '  "host_paper_lock_wait_seconds": 9}}',
+        )["queue_age_seconds"]
+        self.assertEqual(2, queue["samples"])
+        self.assertEqual(9.0, queue["max"])
+
 
 class StatusSemanticsTests(unittest.TestCase):
     def test_end_event_statuses_are_split_into_four_buckets(self):
@@ -294,6 +317,26 @@ class StatusSemanticsTests(unittest.TestCase):
             "intraday", "2026-11-02T09:36:00+08:00",
             stages={"candidate.strategy": {"seconds": 1.0, "errors": 0}}))
         self.assertIsNone(last["last_successful_risk_scan"]["at"])
+
+    def test_display_snapshot_enqueue_is_not_risk_evidence(self):
+        """``risk_snapshot_enqueue`` 是展示入队（异常被吞），不能当风控证据。"""
+        only_enqueue = _summarize(_timing_event(
+            "intraday", "2026-11-02T09:36:00+08:00",
+            stages={"risk_snapshot_enqueue": {"seconds": 0.1, "errors": 0}}))
+        self.assertIsNone(only_enqueue["last_successful_risk_scan"]["at"])
+
+        enqueue_failed = _summarize(_timing_event(
+            "intraday", "2026-11-02T09:36:00+08:00",
+            stages={"risk_pass": {"calls": 1, "errors": 0},
+                    "risk_snapshot_enqueue": {"seconds": 0.1, "errors": 1}}))
+        self.assertEqual("intraday_risk_phase",
+                         enqueue_failed["last_successful_risk_scan"]["source"])
+
+        risk_failed = _summarize(_timing_event(
+            "intraday", "2026-11-02T09:36:00+08:00",
+            stages={"risk_pass": {"calls": 1, "errors": 1},
+                    "risk_snapshot_enqueue": {"seconds": 0.1, "errors": 0}}))
+        self.assertIsNone(risk_failed["last_successful_risk_scan"]["at"])
 
     def test_later_failed_risk_event_keeps_the_last_real_success(self):
         last = _summarize(
@@ -356,8 +399,14 @@ class PathResolutionTests(unittest.TestCase):
                          os.path.relpath(path, REPO_ROOT))
 
     def test_api_image_mounts_the_same_report_dir(self):
-        compose = (REPO_ROOT / "docker-compose.server.yml").read_text(encoding="utf-8")
-        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        compose_path = REPO_ROOT / "docker-compose.server.yml"
+        dockerfile_path = REPO_ROOT / "Dockerfile"
+        if not (compose_path.exists() and dockerfile_path.exists()):
+            # docker-smoke job 在镜像内跑回归（cwd=/app），仓库根文件不在那里；
+            # 布局断言只在源码树里有意义。
+            self.skipTest("no Dockerfile / compose in this checkout root")
+        compose = compose_path.read_text(encoding="utf-8")
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
         self.assertIn("./reports:/app/reports", compose)
         self.assertIn("WORKDIR /app", dockerfile)
 
@@ -373,6 +422,16 @@ class FileTests(unittest.TestCase):
             result = PDM.summarize_file("/app/reports/scheduler.log")
         self.assertFalse(result["available"])
         self.assertEqual("unreadable", result["error"])
+
+    def test_unexpected_aggregation_failure_degrades_the_reader(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "scheduler.log"
+            path.write_text(_timing_event("risk", "2026-11-02T09:33:00+08:00") + "\n",
+                            encoding="utf-8")
+            with mock.patch.object(PDM, "summarize_lines", side_effect=RuntimeError("boom")):
+                result = PDM.summarize_file(path)
+        self.assertFalse(result["available"])
+        self.assertEqual("parse_error", result["error"])
 
     def test_file_summary_keeps_the_tail(self):
         with tempfile.TemporaryDirectory() as folder:

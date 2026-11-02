@@ -201,6 +201,19 @@ def _stage_errors(value):
         return None
 
 
+#: ``paper_trading`` 里真正的风控阶段是 ``risk_pass`` 与 ``risk.*``。
+#: ``risk_snapshot_enqueue`` 只是展示快照入队（异常被 run_slot 吞掉），把它算进
+#: 风控证据会让展示链失败抹掉真实风控成功、或让没有风控阶段的一轮虚报成功。
+_RISK_STAGE_EXCLUDED_PREFIX = "risk_snapshot"
+
+
+def _is_risk_stage(name):
+    label = str(name)
+    if not label or label.startswith(_RISK_STAGE_EXCLUDED_PREFIX):
+        return False
+    return label == "risk_pass" or label.startswith("risk.")
+
+
 def _is_risk_pass(event, slot, bucket):
     """旧调度里风控跑在 intraday 内：completed 且 risk 阶段零错误才算成功。
 
@@ -214,7 +227,7 @@ def _is_risk_pass(event, slot, bucket):
     stages = timing.get("stages") if timing is not None else None
     if not isinstance(stages, dict):
         return False
-    risk_stages = [value for name, value in stages.items() if str(name).startswith("risk")]
+    risk_stages = [value for name, value in stages.items() if _is_risk_stage(name)]
     if not risk_stages:
         return False
     errors = [_stage_errors(value) for value in risk_stages]
@@ -232,13 +245,29 @@ def _tick_id(event):
     return _text(timing.get("scheduler_tick_id")) if timing is not None else None
 
 
+def _gap_seconds(previous, current):
+    """同一 slot 相邻 ``started_at`` 的差值；时区信息不可比时返回 None。
+
+    ``paper_timing`` 写的是带 ``+08:00`` 的时间；日志里混进无时区的行（手工补录、
+    别的采集器）时，naive 与 aware 相减会抛 ``TypeError``。dashboard 的读路径
+    不能因为一行脏数据整段失败，所以这里只丢掉这一对间隔。
+    """
+    if (previous.tzinfo is None) != (current.tzinfo is None):
+        return None
+    try:
+        return (current - previous).total_seconds()
+    except TypeError:
+        return None
+
+
 def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS):
     """把事件流聚合成 PR-11 的调度指标。
 
     返回纯数据（可 JSON 序列化），字段含义见模块 docstring。``events`` 按日志
     顺序（时间递增）假定；同一 slot 的 start-to-start 只按该顺序取相邻。
-    坏输入（``timing`` 不是对象、``started_at`` 不是时间、``errors`` 不是数字、
-    ``wait_seconds`` 为负）一律降级为"这条证据不成立"，不抛异常。
+    坏输入（``timing`` 不是对象、``started_at`` 不是时间或时区不可比、
+    ``errors`` 不是数字、``wait_seconds`` 为负）一律降级为"这条证据不成立"，
+    不抛异常。
     """
     target = float(target_interval_seconds)
 
@@ -246,8 +275,6 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
     skips = {}
     skips_by_slot = {}
     waits = []
-    start_waits = []
-    timing_waits = []
     intervals = {}
     last_starts = {}
     last_risk = {"at": None, "source": None, "status": None, "slot": None}
@@ -297,7 +324,8 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
             pending.setdefault(slot, []).append({"tick": _tick_id(event), "exited": False})
             wait = _lock_wait(event)
             if wait is not None:
-                start_waits.append(wait)
+                # 进入时刻的等待是这一轮的主机锁等待（权威值）。
+                waits.append(wait)
             continue
 
         if kind == SLOT_EXIT_EVENT:
@@ -320,7 +348,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
             slot = UNKNOWN_SLOT
         # 有启动记录时把它配掉：配上的才算"跑完"，没配上的留在 pending 里
         # 计成 unfinished / exited_without_result。
-        _take_pending(slot, _tick_id(event))
+        matched = _take_pending(slot, _tick_id(event))
         status = str(event.get("status") or "").strip().lower() or "unknown"
         bucket = _status_bucket(status)
         buckets[bucket] += 1
@@ -330,15 +358,17 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
 
         timing = _timing_block(event)
         wait = _lock_wait(event)
-        if wait is not None:
-            timing_waits.append(wait)
+        if wait is not None and matched is None:
+            # 没有启动事件的轮次（旧日志、weekly-review 直连 docker exec）只能
+            # 退回结束事件里的等待；有启动事件的轮次已经计过，不重复计。
+            waits.append(wait)
 
         started_at = _parse_started_at((timing or {}).get("started_at"))
         if started_at is not None:
             previous = last_starts.get(slot)
             if previous is not None:
-                gap = (started_at - previous).total_seconds()
-                if gap >= 0:
+                gap = _gap_seconds(previous, started_at)
+                if gap is not None and gap >= 0:
                     intervals.setdefault(slot, []).append(gap)
             last_starts[slot] = started_at
 
@@ -361,12 +391,6 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
                 exited_without_result += 1
             else:
                 unfinished += 1
-
-    # 有启动事件时用进入时刻的等待；没有就退回结束事件里的等待，同一轮不重复计。
-    if start_waits:
-        waits.extend(start_waits)
-    else:
-        waits.extend(timing_waits)
 
     waits.sort()
     interval_summary = {}
@@ -422,8 +446,9 @@ def summarize_file(path, *, max_lines=4000, max_bytes=1_500_000,
     验收要看的是"最近这段"的节拍。按字节从文件末尾回退读取，避免把整份
     日志读进内存——这个函数在 dashboard 刷新路径上被调用。
 
-    ``error`` 区分 ``missing``（文件不存在）与 ``unreadable``（存在但没权限/读错），
-    因为"日志没挂进来"和"权限不对"是两种完全不同的运维动作。
+    ``error`` 区分 ``missing``（文件不存在）、``unreadable``（存在但没权限/读错）
+    与 ``parse_error``（聚合自身意外失败）。前两种是不同的运维动作，最后一种是
+    "观测坏了但 dashboard 不能跟着 500"——监控读路径不因为一行脏日志整段失败。
     """
     try:
         with open(path, "rb") as handle:
@@ -443,7 +468,11 @@ def summarize_file(path, *, max_lines=4000, max_bytes=1_500_000,
         # 从任意字节偏移切进来，第一行通常是被截断的半行；它解析不了，丢掉。
         lines = lines[1:]
     lines = lines[-int(max_lines):] if max_lines else lines
-    summary = summarize_lines(lines, target_interval_seconds=target_interval_seconds)
+    try:
+        summary = summarize_lines(lines, target_interval_seconds=target_interval_seconds)
+    except Exception:  # noqa: BLE001 - 展示读路径的最后一道闸门，原因写进 error
+        return {"available": False, "path": str(path), "error": "parse_error",
+                "lines_scanned": len(lines)}
     summary["available"] = True
     summary["path"] = str(path)
     summary["lines_scanned"] = len(lines)
