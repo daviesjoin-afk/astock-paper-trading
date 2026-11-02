@@ -130,7 +130,7 @@ jobs:
           cmp --silent requirements.lock /tmp/requirements.lock
 
       - name: Lint backend and acceptance probes
-        run: ruff check backend scripts/pr298_ledger_probe.py scripts/pr298_timing_probe.py scripts/pr299_refresh_probe.py scripts/pr4_risk_kline_probe.py scripts/pr6_bootstrap_probe.py scripts/pr6_ledger_compare.py scripts/pr8_sizing_probe.py
+        run: ruff check backend scripts/pr298_ledger_probe.py scripts/pr298_timing_probe.py scripts/pr299_refresh_probe.py scripts/pr4_risk_kline_probe.py scripts/pr6_bootstrap_probe.py scripts/pr6_ledger_compare.py scripts/pr8_sizing_probe.py scripts/pr11_capacity.py scripts/pr11_lane_acceptance.py
 
       - name: Audit locked dependencies
         run: pip-audit --requirement requirements.lock --strict --progress-spinner off
@@ -158,6 +158,18 @@ jobs:
         run: >
           docker run --rm astock-codex:ci
           python -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version; print(sys.version)"
+
+      - name: Verify P11-D isolated worker budgets under offline candidate pressure
+        run: python scripts/pr11_lane_acceptance.py --image astock-codex:ci --output "$RUNNER_TEMP/pr11-lanes.json"
+
+      - name: Upload P11-D resource evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p11d-resource-evidence
+          path: ${{ runner.temp }}/pr11-lanes.json
+          retention-days: 7
+          if-no-files-found: ignore
 
       # Issue #29: the offline test suite must pass with *no network at all*,
       # so core tests stay deterministic and cannot silently grow external

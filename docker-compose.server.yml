@@ -33,8 +33,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
-    # Keep the trading UI/risk API alive even when a data worker is paused or
-    # OOM-killed.  Heavy scans run in the separate astock-data-worker cgroup.
+    # Keep the UI/risk API apart from data and candidate worker cgroups.
     mem_limit: 950m
     memswap_limit: 1250m
     mem_reservation: 640m
@@ -99,9 +98,8 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Paper scans import the complete trading and risk stack.  Keep them apart
-  # from the long-lived adaptive-learning queue so one cannot OOM/restart the
-  # other and leave the intraday audit trail stale.
+  # Risk and execution-resume share this bounded cgroup (at most one of each
+  # lane). Candidate work has its own cgroup below; legacy admission stays intact.
   astock-paper-worker:
     image: astock-codex:latest
     container_name: astock-paper-worker
@@ -115,6 +113,10 @@ services:
       # Host cron invokes paper_runner in this container, so it must share the
       # API container's explicit point-of-ignition setting.
       PAPER_IGNITION_BUY: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
     volumes:
       - ./data_cache:/app/data_cache
       - ./reports:/app/reports
@@ -125,6 +127,42 @@ services:
     memswap_limit: 1700m
     mem_reservation: 96m
     cpus: 0.8
+    # P11-D: relative CPU priority for risk + approved-order recovery.
+    # This is a weight, not a hard CPU reservation.
+    cpu_shares: 4096
+    pids_limit: 96
+    healthcheck:
+      disable: true
+    security_opt:
+      - no-new-privileges:true
+
+  # candidate-full is the existing serialized scan lane, including its legacy
+  # approvals/events. Keep paper-scan.lock + paper-runner-global unchanged.
+  astock-candidate-worker:
+    image: astock-codex:latest
+    container_name: astock-candidate-worker
+    restart: unless-stopped
+    command: ["sleep", "infinity"]
+    env_file:
+      - ${ASTOCK_ENV_FILE:-./.env.example}
+    environment:
+      ASTOCK_CACHE_DIR: /app/data_cache
+      PAPER_IGNITION_BUY: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+    volumes:
+      - ./data_cache:/app/data_cache
+      - ./reports:/app/reports
+    read_only: true
+    tmpfs:
+      - /tmp:size=48m,mode=1777
+    mem_limit: 1250m
+    memswap_limit: 1250m
+    mem_reservation: 128m
+    cpus: 0.6
+    cpu_shares: 256
     pids_limit: 96
     healthcheck:
       disable: true

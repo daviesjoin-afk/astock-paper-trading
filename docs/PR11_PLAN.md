@@ -225,7 +225,11 @@
   仍走 `execution_planner` / execution authority / `commit_fill`。
 - 出口：恢复不再等候选重算；同轮不重复恢复同一批委托；成交结果逐字段等价。
 
-#### P11-C 实际落地（待审核，不部署）
+#### P11-C 实际落地（#326 已合并，不部署）
+
+最终 HEAD `ae74072`，3个提交；宿主与断网容器各7,871项通过、8项检查成功后，
+按用户授权 Ready → Squash，master 为 `57e559b7a8db3df114e223e4cfb8c096256b44c9`。
+本包从该完整SHA开始，未部署。
 
 - 从 #325 合并后的 master `b8b38751301bad23efe51fc7c81a7b4f68109517` 开始。
 - 新 slot `execution-resume` 与风险采用相同三分钟网格：Linux 09:33–11:24、
@@ -264,6 +268,50 @@ fencing；克隆账本逐字段比较冻结恢复函数与新 slot 的订单、�
 - 范围：候选全市场扫描独立 lane（独立锁、CPU/memory 上限、SQLite `busy_timeout`/backoff、
   按容量设并发），保证 `risk-fast` 在其运行时仍按时执行。
 - 出口：`candidate-full` 跑满时 `risk-fast` 的 interval 不劣化；无 SQLite 长事务、无 OOM。
+
+#### P11-D 实施范围与离线验收（待审核，不部署）
+
+`candidate-full` 是**部署通道**：沿用现有 intraday/open/auction/close/fast-entry
+等入口，宿主脚本按契约送入 `astock-candidate-worker`。没有新建第二个候选扫描任务。
+原 `paper-scan.lock` 与 `paper-runner-global` 继续约束这些任务，fast-entry 的让路
+协议保留；风险/恢复仍用原独立锁及租约，在 `astock-paper-worker` 中各最多一个进程。
+weekly-review 的既有 cron 直接进入 task-worker，仍按原路径运行。
+
+| 进程组 | CPU上限 / 相对权重 | 内存上限 / swap总上限 | 最大任务并发 |
+| --- | --- | --- | --- |
+| risk + execution-resume | 0.8 / 4096 | 1250 MiB / 1700 MiB（原额度） | 各1个，由既有lease约束 |
+| candidate-full | 0.6 / 256 | 1250 MiB / 1250 MiB | 1个，由既有串行锁约束 |
+
+两组pids上限96、只读根文件系统、独立/tmp、同一数据与报告目录；镜像原有的数值库
+单线程限制保留，并在profile中显式固定为1。CPU配额是**上限**，权重不是硬预留；
+允许其它worker的上限超售，不据此声称物理CPU已被独占分配。
+
+部署/引导与只读preflight增加容量门禁：从有效compose读取所有组的内存上限，
+合计4820 MiB再加1 GiB宿主余量，核对至少2个可用CPU、当前可用内存、线程、PID、
+swap与权重配置；事实不可读即失败，输出不含env_file凭据。数据/adaptive/API额度未改。
+
+SQLite沿用原热路径800ms busy_timeout、有限backoff与调用方事务。新争用回归证实
+旧实现的初始化/BEGIN失败会遗留未交付连接，因此仅补上失败时close并原样传播异常；
+成功路径的SQL、提交/回滚与业务函数保持。六个风险/恢复/候选/审批函数做了冻结AST对照。
+
+CI的 `scripts/pr11_lane_acceptance.py` 在独立断网Docker中使用有效profile的真实
+内存/CPU/PID限制和共享的临时数据卷，测量：
+
+探针额外将两组约束到同两颗可用CPU，以避免CI宿主核心数多于目标主机时掩盖争用。
+
+1. 冷Python启动、真实SQLite风险任务的6秒缩短tick；无候选负载与5000证券合成
+   基本面准备负载下各6个样本。负载时同容器并行运行恢复进程，覆盖两份交易栈的峰值。
+2. 两容器cgroup身份、实际cpu.max/memory.max/pids.max、CPU权重、memory.peak与
+   OOM事件；峰值须低于上限80%，候选负载须持续且消耗CPU，不能用空闲容器冒充压测。
+3. 风险启动间隔p95相对基线增加不超过250ms，最大间隔不超过缩短tick的1.5倍、
+   最大排队不超过半个tick；报告原始数值和容差，**不等价于真实180秒节拍已达标**。
+4. 共享卷上的SQLite锁争用：候选负控制持写锁，风险侧遇真实busy后有界补试；
+   候选回滚，风险成功提交一次。真实成交幂等与cycle边界另由原账本回归覆盖。
+
+测量结果随本次HEAD的CI日志和 `p11d-resource-evidence` artifact保存。负载是合成
+5000行基本面准备与冷启动/夹具任务，不是实盘全市场行情、历史库或全部外部提供方
+的峰值测量。预算是否覆盖生产峰值、真实180秒节拍及Windows原生调度边界，需部署后
+独立实测；本地Windows不冒充具备Docker资源隔离，PR-11总体验收尚不能因此宣布完成。
 
 ### P11-E：`dashboard-refresh` lane 收口
 

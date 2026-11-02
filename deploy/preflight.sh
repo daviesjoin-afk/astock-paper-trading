@@ -16,6 +16,12 @@ fail() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
 
 echo "宿主机自检 $(date '+%Y-%m-%d %H:%M:%S')"
 
+if python3 "$ROOT/scripts/pr11_capacity.py" --compose "$ROOT/docker-compose.server.yml"; then
+  pass "P11-D worker 容量预算"
+else
+  fail "P11-D worker 容量不足或事实不可读"
+fi
+
 # 1. 三端一致：git HEAD / 镜像内构建身份
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 IMAGE_SHA="$(docker image inspect astock-codex:latest \
@@ -38,7 +44,7 @@ else
 fi
 
 # 2. 容器
-for name in astock-codex astock-task-worker astock-paper-worker astock-data-worker; do
+for name in astock-codex astock-task-worker astock-paper-worker astock-candidate-worker astock-data-worker; do
   state="$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo missing)"
   health="$(docker inspect "$name" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || echo none)"
   if [ "$state" = "running" ] && { [ "$health" = "healthy" ] || [ "$health" = "none" ]; }; then

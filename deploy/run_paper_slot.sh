@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Serialize every paper runner invocation across the host.  Fast-entry and
-# intraday scans each import the full strategy stack; running them together in
-# one Docker cgroup caused real OOM kills and a stalled audit trail.
+# Keep legacy scan serialization; risk/recovery have independent locks and
+# a separate cgroup from candidate-full. Resource limits live in server compose.
 set -euo pipefail
 
 slot="${1:?slot is required}"
+case "$slot" in
+  risk|execution-resume) worker="astock-paper-worker" ;;
+  *) worker="astock-candidate-worker" ;;
+esac
 lock_dir="/opt/astock-codex/.locks"
 mkdir -p "$lock_dir"
 
@@ -39,7 +42,7 @@ trap cleanup_marker EXIT INT TERM
 #
 # 默认仍是 ``paper-scan.lock``：竞价、开盘审批、日内监控、快通道继续互相串行
 # （PR-11 不删除任何既有锁）。risk 与 execution-resume 各有独立锁，因此全市场
-# 候选扫描不会通过共享锁挡住风险与已批准委托恢复；cgroup 资源隔离留 P11-D。
+# 候选扫描不会通过共享锁挡住风险与已批准委托恢复；两组使用独立容器资源上限。
 if [[ "$slot" == "risk" ]]; then
   lane_lock="risk-scan.lock"
   lock_options=(-n)
@@ -102,7 +105,7 @@ docker exec \
   --env "ASTOCK_SCAN_TAIL_AFTER_SECONDS=${ASTOCK_SCAN_TAIL_AFTER_SECONDS:-90}" \
   --env "ASTOCK_TRANSPORT_BREAKER_FILE=${ASTOCK_TRANSPORT_BREAKER_FILE:-/app/data_cache/transport_breaker.json}" \
   --env "ASTOCK_MICRO_BATCH_SIZE=${ASTOCK_MICRO_BATCH_SIZE:-6}" \
-  astock-paper-worker python backend/paper_runner.py --slot "$slot"
+  "$worker" python backend/paper_runner.py --slot "$slot"
 docker_status=$?
 
 # 退出事件：有它、没有结束事件，就是"启动过但从没打印结果"（崩溃/被杀）；
