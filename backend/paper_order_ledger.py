@@ -35,6 +35,7 @@ __all__ = [
     "supersede_for_terminal_signal",
     "supersede_order",
     "terminate_order",
+    "nonfilled_order_count",
 ]
 
 ORDER_LEDGER_VERSION = "paper-order-ledger-v1"
@@ -243,3 +244,9 @@ def retire_duplicate_waitlist_orders(conn, *, waitlist_status):
     )
 
 
+def nonfilled_order_count(conn, account_id):
+    """账户指标的非 filled 委托数；只读、保留原状态过滤与异常边界。"""
+    return conn.execute(
+        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status!='filled'",
+        (account_id,),
+    ).fetchone()[0]

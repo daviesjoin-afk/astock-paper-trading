@@ -62,6 +62,16 @@ class CreationAndCancelTests(unittest.TestCase):
                          (2, 7, "AAA", "buy", "pending_limit", None, 12, None)])
         self.addCleanup(self.conn.close)
 
+    def test_nonfilled_count_retains_filters_and_caller_transaction(self):
+        self.assertEqual(2, POL.nonfilled_order_count(self.conn, 7))
+        self.assertEqual(0, POL.nonfilled_order_count(self.conn, 99))
+        self.conn.execute("UPDATE paper_orders SET status='filled' WHERE id=1")
+        self.conn.execute("UPDATE paper_orders SET status=NULL WHERE id=2")
+        self.assertEqual(0, POL.nonfilled_order_count(self.conn, 7))
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+        self.assertEqual(2, POL.nonfilled_order_count(self.conn, 7))
+
     def test_cancel_returns_rowcount_and_respects_the_status_whitelist(self):
         changed = POL.cancel_order(self.conn, 2, reason="用户撤销模拟委托",
                                    cancelled_at="T", statuses=("pending_limit",))
