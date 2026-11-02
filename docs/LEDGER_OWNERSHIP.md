@@ -465,7 +465,7 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `paper_accounts` | 新策略跟随运行周期直接激活 | `paper_account_ledger::activate_for_running_cycle` | paper_trading 周期引导 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
-| `paper_accounts` | 周期创建时的账户成员配置（列白名单） | `paper_account_ledger::apply_cycle_membership` | 周期创建规则 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
+| `paper_accounts` | 周期创建时的账户成员配置（列白名单） | `paper_account_ledger::apply_cycle_membership` | 周期创建规则 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_account_ledger` |
 | `paper_accounts` | 首次挂接活动周期（资金/基准/日初净值） | `paper_account_ledger::attach_to_cycle` | paper_trading 周期引导 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_accounts` | 已挂接账户的周期画像字段 | `paper_account_ledger::set_cycle_profile` | paper_trading 周期引导 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_accounts` | 回填日初净值与日期 | `paper_account_ledger::set_daily_start_nav` | paper_trading 周期引导 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
