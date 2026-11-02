@@ -30,6 +30,7 @@ class _Record:
         self.slot = str(slot)
         self.identity = {}
         self.stages = {}
+        self.risk_scans = []
         self.status = "unknown"
 
 
@@ -43,6 +44,14 @@ def outcome(status):
     record = _CURRENT.get()
     if record is not None:
         record.status = str(status)
+
+
+def risk_scan_outcome(status, **identity):
+    """独立记录 durable 风控结果；外层 slot 完成不代表实际又扫描了一次。"""
+    record = _CURRENT.get()
+    if record is not None:
+        with record.lock:
+            record.risk_scans.append({"status": status, **identity})
 
 
 @contextmanager
@@ -104,6 +113,7 @@ def snapshot(scope):
     if record is None:
         return {}
     with record.lock:
+        risk_scans = [dict(item) for item in record.risk_scans]
         stages = {
             name: {**value, "seconds": round(value["seconds"], 6),
                    "thread_cpu_seconds": round(value["thread_cpu_seconds"], 6)}
@@ -115,6 +125,7 @@ def snapshot(scope):
         "started_at": record.started_at, "runtime_commit": record.runtime_commit,
         "elapsed_seconds": round(max(0.0, time.perf_counter() - record.started), 6),
         "stages": stages,
+        "risk_scans": risk_scans,
     }
     # 只代表主机 paper-scan.lock 的等待；外层 cron 锁、Docker 启动不在此内。
     try:
@@ -124,6 +135,14 @@ def snapshot(scope):
             result["host_lock_resolution_seconds"] = 1
     except (KeyError, ValueError, TypeError):
         pass
+    # 调度 tick 身份：由 ``deploy/run_paper_slot.sh`` 发 ``paper_slot_start`` 时
+    # 生成并随 docker exec 注入。它只用于把"启动"和"结束"配成同一次尝试，
+    # 不参与任务身份、租约或交易判断；格式不对就当没有。
+    tick = os.environ.get("ASTOCK_SCHEDULER_TICK_ID")
+    if isinstance(tick, str):
+        candidate = tick.strip()
+        if 0 < len(candidate) <= 64 and all(ch.isalnum() or ch in "-_." for ch in candidate):
+            result["scheduler_tick_id"] = candidate
     return result
 
 

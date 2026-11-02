@@ -49,6 +49,7 @@ def _get_se():
 
 import paper_storage as PST
 import paper_timing as PTM
+import paper_dispatch_metrics as PDM
 import paper_job_lifecycle as PJL
 import paper_snapshot_jobs as PSJ
 import paper_order_execution_authority as POEA
@@ -9915,6 +9916,7 @@ def monitor_risk(asof_date=None):
             conn, **ident, started_at=scan_context["started_at"])
         if not claimed["claimed"]:
             # 兼容既有 facade 契约：重复入口（含 running）一律回 already_scanned。
+            PTM.risk_scan_outcome("already_scanned", **scan_context)
             return {
                 "slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": [],
                 "status": "already_scanned",
@@ -9927,8 +9929,10 @@ def monitor_risk(asof_date=None):
             _require_active_lease(conn, "risk scan completion")
             PRSS.complete_scan(conn, **ident, finished_at=_now())
             audit(conn, None, "risk_scan_completed", _json(dict(ident)))
+        PTM.risk_scan_outcome("completed", **scan_context)
         return result
     except Exception as exc:
+        PTM.risk_scan_outcome("failed", **scan_context)
         if _lease_lost(exc):
             raise
         try:
@@ -14265,6 +14269,22 @@ def latest_reviews():
         return query_rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id")
 
 
+def dispatch_status():
+    """PR-11：调度级事实（tick / 跳过 / 队列年龄 / 上次风险成功）。
+
+    只读主机调度日志的尾部，不碰数据库、不改变任何调度行为；日志不存在时
+    返回 ``available=False`` 并带上 ``error`` 原因（``missing`` / ``unreadable``），
+    dashboard 照旧显示其余字段。口径见 ``paper_dispatch_metrics``：tick 来自
+    ``paper_slot_start``，跳过来自抢锁失败与为全扫描让路，end 事件按
+    completed / idle / failed / unknown 四分类，queue age 是进入 runner 之前的主机锁等待。
+
+    默认路径跟随 ``data_paths.report_dir()``（仓库／容器里的 ``reports/``）：宿主 cron
+    写 ``/opt/astock-codex/reports/scheduler.log``，API 容器把它挂在 ``/app/reports``，
+    写死宿主绝对路径会让容器内永远读不到。需要指向别处时用 ``ASTOCK_SCHEDULER_LOG``。
+    """
+    return PDM.summarize_file(PDM.scheduler_log_path(data_paths.report_dir()))
+
+
 def schedule_status():
     names = list(PSch.SCHEDULE_TASK_NAMES)
     found = []
@@ -14307,6 +14327,8 @@ def schedule_status():
         "latest_intraday_runs": intraday,
         "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
+        # PR-11：tick / 跳过 / 队列年龄 / 上次风险成功；日志不可读时 available=False。
+        "dispatch": dispatch_status(),
         "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新有效行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
     }
 

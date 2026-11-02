@@ -286,6 +286,18 @@ class TimingTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"ASTOCK_PAPER_HOST_LOCK_WAIT_SECONDS": "12"}):
                 self.assertEqual(timing.snapshot("test")["host_paper_lock_wait_seconds"], 12)
 
+    def test_scheduler_tick_id_is_recorded_only_when_it_is_well_formed(self):
+        """tick 身份只用于把"启动"与"结束"配成同一次尝试，不参与任务身份。"""
+        with contextlib.redirect_stderr(io.StringIO()), timing.capture("risk"):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertNotIn("scheduler_tick_id", timing.snapshot("test"))
+            for value in ("", "   ", "a" * 65, "has space", "bad;chars", "quote\""):
+                with mock.patch.dict(os.environ, {"ASTOCK_SCHEDULER_TICK_ID": value}):
+                    self.assertNotIn("scheduler_tick_id", timing.snapshot("test"), value)
+            with mock.patch.dict(os.environ, {"ASTOCK_SCHEDULER_TICK_ID": " risk-1793604230-1149 "}):
+                self.assertEqual("risk-1793604230-1149",
+                                 timing.snapshot("test")["scheduler_tick_id"])
+
     def test_real_sqlite_commit_and_rollback_keep_semantics(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()), \
                 timing.capture("risk"):

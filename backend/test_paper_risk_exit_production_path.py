@@ -907,11 +907,46 @@ class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):
 
     # ── P1 ─────────────────────────────────────────────────────────────────
     def test_RISK_SCAN_P1_same_identity_dedupes_without_duplicate_side_effects(self):
+        self._assert_observed_scan_then_skip("risk", "intraday")
+
+    def test_intraday_first_risk_second_records_only_one_real_scan(self):
+        self._assert_observed_scan_then_skip("intraday", "risk")
+
+    def _assert_observed_scan_then_skip(self, first_slot, second_slot):
+        import contextlib
+        import io
+        import json
+        import paper_dispatch_metrics as metrics
+
         self._insert_lot("tq_breakout", self.code, 500, 10.0)
         self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
 
-        first = PT.monitor_risk(self.day)
-        second = PT.monitor_risk(self.day)
+        buffer = io.StringIO()
+        real_datetime = dt.datetime
+
+        class SameMinuteDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                fixed = real_datetime(2026, 9, 10, 14, 50)
+                return fixed if tz is None else fixed.replace(tzinfo=tz)
+
+        with mock.patch.object(PT.dt, "datetime", SameMinuteDateTime), contextlib.redirect_stderr(buffer):
+            with PT.PTM.capture(first_slot):
+                first = PT.monitor_risk(self.day)
+                PT.PTM.outcome(PT._slot_completion_status(first))
+            with PT.PTM.capture(second_slot):
+                second = PT.monitor_risk(self.day)
+                PT.PTM.outcome(PT._slot_completion_status(second))
+        events = [json.loads(line) for line in buffer.getvalue().splitlines()]
+        self.assertEqual(["completed", "completed"], [e["status"] for e in events])
+        scans = [e["timing"]["risk_scans"] for e in events]
+        self.assertEqual(["completed", "already_scanned"], [s[0]["status"] for s in scans])
+        for key in ("cycle_id", "asof_date", "scan_minute"):
+            self.assertEqual(scans[0][0][key], scans[1][0][key])
+        self.assertIsNotNone(metrics.summarize(events[:1])["last_successful_risk_scan"]["at"])
+        self.assertIsNone(metrics.summarize(events[1:])["last_successful_risk_scan"]["at"])
+        self.assertEqual(metrics.summarize(events[:1])["last_successful_risk_scan"],
+                         metrics.summarize(events)["last_successful_risk_scan"])
 
         self.assertEqual(len(first.get("orders", [])), 1)
         self.assertEqual(second.get("status"), "already_scanned")
@@ -1084,9 +1119,17 @@ class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):
         def failing_complete(*args, **kwargs):
             raise boom
 
-        with mock.patch.object(PT.PRSS, "complete_scan", side_effect=failing_complete):
-            with self.assertRaises(RuntimeError):
-                PT.monitor_risk(self.day)
+        import contextlib
+        import io
+        import json
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), PT.PTM.capture("risk"):
+            with mock.patch.object(PT.PRSS, "complete_scan", side_effect=failing_complete):
+                with self.assertRaises(RuntimeError):
+                    PT.monitor_risk(self.day)
+        event = json.loads(buffer.getvalue())
+        self.assertEqual(["failed"], [s["status"] for s in event["timing"]["risk_scans"]])
         self.assertIs(PT.PRSS.complete_scan, real_complete)
 
         runs = self._scan_runs()

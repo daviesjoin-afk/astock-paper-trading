@@ -59,18 +59,36 @@ if flock "${lock_options[@]}" 9; then
   cleanup_marker
 else
   result=$?
-  printf '{"event":"paper_host_lock","status":"not_acquired","wait_seconds":%s,"exit_code":%s}\n' \
-    "$SECONDS" "$result" >&2
+  # slot 必须出现在事件里：否则"哪条 lane 被锁挡住"无法归因，PR-11 的跳过
+  # 次数只能全记到 unknown 上。
+  printf '{"event":"paper_host_lock","status":"not_acquired","slot":"%s","wait_seconds":%s,"exit_code":%s,"at":"%s"}\n' \
+    "$slot" "$SECONDS" "$result" "$(date +%Y-%m-%dT%H:%M:%S%:z)" >&2
   exit "$result"
 fi
+
+# 启动事件：runner 真的要被启动了。它与 python 侧结束事件用同一个 tick_id
+# 配对，因此"启动了但没结束"（仍在跑或被杀）与"根本没启动"（被锁挡住）
+# 才是两种可以分开计数的事实。tick_id 不含空格/引号，可安全注入容器。
+tick_id="${slot}-$(date +%s)-$$"
+printf '{"event":"paper_slot_start","slot":"%s","tick_id":"%s","wait_seconds":%s,"at":"%s"}\n' \
+  "$slot" "$tick_id" "$host_wait" "$(date +%Y-%m-%dT%H:%M:%S%:z)" >&2
 
 # 扫描进程的尾部预算：进程内超过 90 秒后，后续 HTTP 请求的超时压到 4 秒、
 # 重试压到 1 次；跨进程熔断文件让下一轮不必重新"学习"同一个挂掉的主机。
 # 三者都只影响"愿意等多久"，不改变任何 fail-closed / fail-open 判定。
+set +e
 docker exec \
   --env "ASTOCK_PAPER_HOST_LOCK_WAIT_SECONDS=$host_wait" \
+  --env "ASTOCK_SCHEDULER_TICK_ID=$tick_id" \
   --env "ASTOCK_SCAN_BUDGET_SECONDS=${ASTOCK_SCAN_BUDGET_SECONDS:-150}" \
   --env "ASTOCK_SCAN_TAIL_AFTER_SECONDS=${ASTOCK_SCAN_TAIL_AFTER_SECONDS:-90}" \
   --env "ASTOCK_TRANSPORT_BREAKER_FILE=${ASTOCK_TRANSPORT_BREAKER_FILE:-/app/data_cache/transport_breaker.json}" \
   --env "ASTOCK_MICRO_BATCH_SIZE=${ASTOCK_MICRO_BATCH_SIZE:-6}" \
   astock-paper-worker python backend/paper_runner.py --slot "$slot"
+docker_status=$?
+
+# 退出事件：有它、没有结束事件，就是"启动过但从没打印结果"（崩溃/被杀）；
+# 连它也没有，说明整个脚本被信号打断。两者都不改变退出码。
+printf '{"event":"paper_slot_exit","slot":"%s","tick_id":"%s","exit_code":%s,"at":"%s"}\n' \
+  "$slot" "$tick_id" "$docker_status" "$(date +%Y-%m-%dT%H:%M:%S%:z)" >&2
+exit "$docker_status"
