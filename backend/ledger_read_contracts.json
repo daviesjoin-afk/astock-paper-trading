@@ -164,7 +164,6 @@
     "deepseek_advisor",
     "intraday_t_pair_report",
     "main_force_trade_evidence",
-    "paper_account_metrics",
     "paper_portfolio_read_model",
     "paper_position_read_model",
     "paper_position_review_evidence",
