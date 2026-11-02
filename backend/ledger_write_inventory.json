@@ -652,7 +652,7 @@
   {
    "function": "expire_order",
    "kind": "static",
-   "line": 69,
+   "line": 70,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -664,7 +664,7 @@
   {
    "function": "record_execution_block",
    "kind": "static",
-   "line": 98,
+   "line": 99,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -676,7 +676,7 @@
   {
    "function": "record_fill_result",
    "kind": "static",
-   "line": 121,
+   "line": 122,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -688,7 +688,7 @@
   {
    "function": "accumulate_realized_pnl",
    "kind": "static",
-   "line": 141,
+   "line": 142,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -700,7 +700,7 @@
   {
    "function": "stamp_execution",
    "kind": "static",
-   "line": 149,
+   "line": 150,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -712,7 +712,7 @@
   {
    "function": "stamp_execution_rows",
    "kind": "static",
-   "line": 162,
+   "line": 163,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -724,7 +724,7 @@
   {
    "function": "record_realized_pnl",
    "kind": "static",
-   "line": 172,
+   "line": 173,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -736,7 +736,7 @@
   {
    "function": "update_order_outcome",
    "kind": "static",
-   "line": 220,
+   "line": 221,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -748,7 +748,7 @@
   {
    "function": "update_order_outcome",
    "kind": "dynamic",
-   "line": 220,
+   "line": 221,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -760,7 +760,7 @@
   {
    "function": "update_risk_payload",
    "kind": "static",
-   "line": 234,
+   "line": 235,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -772,7 +772,7 @@
   {
    "function": "insert_order",
    "kind": "static",
-   "line": 255,
+   "line": 256,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -784,7 +784,7 @@
   {
    "function": "insert_order",
    "kind": "dynamic",
-   "line": 255,
+   "line": 256,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -796,7 +796,7 @@
   {
    "function": "terminalize_cycle_drift_order",
    "kind": "static",
-   "line": 269,
+   "line": 270,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -808,7 +808,7 @@
   {
    "function": "supersede_order",
    "kind": "static",
-   "line": 279,
+   "line": 280,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -820,7 +820,7 @@
   {
    "function": "terminate_order",
    "kind": "static",
-   "line": 296,
+   "line": 297,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -832,7 +832,7 @@
   {
    "function": "supersede_for_expired_signal",
    "kind": "static",
-   "line": 306,
+   "line": 307,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -844,7 +844,7 @@
   {
    "function": "supersede_duplicate_execution_retry",
    "kind": "static",
-   "line": 321,
+   "line": 322,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -856,7 +856,7 @@
   {
    "function": "supersede_previous_execution_retry",
    "kind": "static",
-   "line": 336,
+   "line": 337,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -868,7 +868,7 @@
   {
    "function": "supersede_older_intents",
    "kind": "dynamic",
-   "line": 351,
+   "line": 352,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -880,7 +880,7 @@
   {
    "function": "supersede_older_intents",
    "kind": "static",
-   "line": 351,
+   "line": 352,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -892,7 +892,7 @@
   {
    "function": "advance_execution_state",
    "kind": "static",
-   "line": 363,
+   "line": 364,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -904,7 +904,7 @@
   {
    "function": "cancel_order",
    "kind": "static",
-   "line": 380,
+   "line": 381,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -916,7 +916,7 @@
   {
    "function": "cancel_order",
    "kind": "dynamic",
-   "line": 380,
+   "line": 381,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -928,7 +928,7 @@
   {
    "function": "supersede_for_terminal_signal",
    "kind": "static",
-   "line": 398,
+   "line": 399,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -940,7 +940,7 @@
   {
    "function": "supersede_for_terminal_signal",
    "kind": "dynamic",
-   "line": 398,
+   "line": 399,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -952,7 +952,7 @@
   {
    "function": "retire_gated_order",
    "kind": "static",
-   "line": 413,
+   "line": 414,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -964,7 +964,7 @@
   {
    "function": "retire_gated_order",
    "kind": "dynamic",
-   "line": 413,
+   "line": 414,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -976,7 +976,7 @@
   {
    "function": "retire_duplicate_waitlist_orders",
    "kind": "static",
-   "line": 427,
+   "line": 428,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -988,7 +988,7 @@
   {
    "function": "archive_delete_orders",
    "kind": "static",
-   "line": 445,
+   "line": 454,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -1000,7 +1000,7 @@
   {
    "function": "archive_supersede_orders",
    "kind": "static",
-   "line": 453,
+   "line": 462,
    "module": "paper_order_ledger",
    "read_refs": [],
    "role": "runtime",
@@ -4659,9 +4659,33 @@
    ]
   },
   {
+   "function": "test_nonfilled_count_retains_filters_and_caller_transaction",
+   "kind": "static",
+   "line": 68,
+   "module": "test_order_ledger",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_orders SET status='filled' WHERE id=1",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "test_nonfilled_count_retains_filters_and_caller_transaction",
+   "kind": "static",
+   "line": 69,
+   "module": "test_order_ledger",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_orders SET status=NULL WHERE id=2",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
    "function": "test_supersede_for_expired_signal_keeps_the_status_vocabulary",
    "kind": "static",
-   "line": 132,
+   "line": 142,
    "module": "test_order_ledger",
    "read_refs": [],
    "role": "test",
@@ -4673,7 +4697,7 @@
   {
    "function": "test_execution_dispatch_no_longer_writes_orders",
    "kind": "static",
-   "line": 177,
+   "line": 187,
    "module": "test_order_ledger",
    "read_refs": [],
    "role": "test",
@@ -4685,7 +4709,7 @@
   {
    "function": "test_execution_dispatch_no_longer_writes_orders",
    "kind": "static",
-   "line": 178,
+   "line": 188,
    "module": "test_order_ledger",
    "read_refs": [],
    "role": "test",
@@ -4697,7 +4721,7 @@
   {
    "function": "test_execution_dispatch_no_longer_writes_orders",
    "kind": "static",
-   "line": 179,
+   "line": 189,
    "module": "test_order_ledger",
    "read_refs": [],
    "role": "test",
