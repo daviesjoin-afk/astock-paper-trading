@@ -52,6 +52,9 @@ __all__ = [
     "expire_stale_signal",
     "reconcile_signal_status",
     "advance_signal_feedback",
+    "archive_delete_signals",
+    "archive_expire_signals",
+    "archive_supersede_signals",
     "defer_for_capacity",
     "expire_within",
     "expire_signal",
@@ -747,3 +750,29 @@ def _serialize_payload(payload: Mapping[str, Any]) -> str:
     以保证落库字节与 R25 之前一致；差别只在于两个裁决键由 writer 注入。
     """
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def archive_delete_signals(conn, *, status, window="-1 day"):
+    """归档清理：删除早于窗口的指定状态信号。"""
+    return conn.execute(
+        "DELETE FROM paper_signals WHERE status=? AND created_at < datetime('now', ?)",
+        (status, window),
+    ).rowcount
+
+
+def archive_expire_signals(conn, *, status, reason, window="-1 day"):
+    """归档清理：把早于窗口的指定状态信号写为 expired。"""
+    return conn.execute(
+        "UPDATE paper_signals SET status='expired', reason=?"
+        " WHERE status=? AND created_at < datetime('now', ?)",
+        (reason, status, window),
+    ).rowcount
+
+
+def archive_supersede_signals(conn, *, status, reason, window="-1 day"):
+    """归档清理：把早于窗口的指定状态信号写为 superseded。"""
+    return conn.execute(
+        "UPDATE paper_signals SET status='superseded', reason=?"
+        " WHERE status=? AND created_at < datetime('now', ?)",
+        (reason, status, window),
+    ).rowcount

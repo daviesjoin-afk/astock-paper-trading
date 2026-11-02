@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """Attach and detach already-provisioned user strategy ledger rows."""
 import paper_account_ledger as PAL
-from paper_account_ledger import detach_cycle, set_cycle_capital, set_status
+from paper_account_ledger import (
+    activate_for_running_cycle, apply_cycle_membership, attach_to_cycle,
+    detach_cycle, set_cycle_capital, set_cycle_profile, set_daily_start_nav, set_status,
+)
 
-__all__ = ["detach_cycle", "set_cycle_capital", "set_status", "reconcile_user_cycle_accounts"]
+__all__ = [
+    "activate_for_running_cycle", "apply_cycle_membership", "attach_to_cycle",
+    "detach_cycle", "set_cycle_capital", "set_cycle_profile", "set_daily_start_nav",
+    "set_status", "reconcile_user_cycle_accounts",
+]
 
 
 def _row(conn, sql, params=()):

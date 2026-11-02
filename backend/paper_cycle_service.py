@@ -147,3 +147,40 @@ def archive_cycle(conn, cycle, reason):
     # 与抽取前逐字等价：原 _audit() 在**调用时**取 _now()，不复用归档时间戳。
     PRP.audit(conn, None, "cycle_archived", f"周期 {cycle['cycle_key']} 已归档：{reason}", now())
     return cycle
+
+
+CYCLE_INSERT_COLUMNS = (
+    "cycle_key", "status", "capital", "risk_profile", "started_at", "created_at",
+    "updated_at", "duration_days", "enabled_strategies", "ended_at",
+)
+
+
+def insert_cycle(conn, *, fields):
+    """创建周期行；列集合受 :data:`CYCLE_INSERT_COLUMNS` 约束，返回新行 id。"""
+    unknown = set(fields) - set(CYCLE_INSERT_COLUMNS)
+    if unknown:
+        raise ValueError(f"未知周期列：{sorted(unknown)}")
+    columns = [name for name in CYCLE_INSERT_COLUMNS if name in fields]
+    marks = ",".join("?" for _ in columns)
+    cursor = conn.execute(
+        f"INSERT INTO paper_cycles({','.join(columns)}) VALUES({marks})",
+        tuple(fields[name] for name in columns),
+    )
+    return int(cursor.lastrowid)
+
+
+def set_capital(conn, cycle_id, *, capital, now):
+    """周期资金配置（对账/引导路径）。"""
+    conn.execute(
+        "UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?",
+        (capital, now, cycle_id),
+    )
+
+
+def set_status(conn, cycle_id, *, status, started_at, now):
+    """周期启停：``started_at`` 用 COALESCE 保留首次启动时间。"""
+    conn.execute(
+        "UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=?"
+        " WHERE id=?",
+        (status, started_at, now, cycle_id),
+    )

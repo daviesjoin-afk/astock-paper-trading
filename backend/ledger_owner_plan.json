@@ -1,17 +1,31 @@
 {
  "operations": {
-  "manual_orders::_terminalize_cycle_stale_order": {
-   "judge": "manual_orders 周期归属判定",
-   "operation": "周期切换时终止跨周期残留委托",
-   "single_owner": "paper_order_ledger",
+  "paper_account_ledger::activate_for_running_cycle": {
+   "judge": "paper_trading 周期引导",
+   "operation": "新策略跟随运行周期直接激活",
+   "single_owner": "paper_account_ledger",
    "single_package": "D",
-   "transaction": "服务入口传入的连接"
+   "transaction": "调用方同一连接与原事务"
   },
   "paper_account_ledger::apply_cash_delta": {
    "judge": "paper_trading 现金对账口径",
    "operation": "账户现金增量调整（对账补偿）",
    "single_owner": "paper_account_ledger",
    "single_package": "C",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::apply_cycle_membership": {
+   "judge": "周期创建规则",
+   "operation": "周期创建时的账户成员配置（列白名单）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::attach_to_cycle": {
+   "judge": "paper_trading 周期引导",
+   "operation": "首次挂接活动周期（资金/基准/日初净值）",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
    "transaction": "调用方同一连接与原事务"
   },
   "paper_account_ledger::debit_cash": {
@@ -63,6 +77,20 @@
    "single_package": "C",
    "transaction": "调用方同一连接与原事务"
   },
+  "paper_account_ledger::set_cycle_profile": {
+   "judge": "paper_trading 周期引导",
+   "operation": "已挂接账户的周期画像字段",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_account_ledger::set_daily_start_nav": {
+   "judge": "paper_trading 周期引导",
+   "operation": "回填日初净值与日期",
+   "single_owner": "paper_account_ledger",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
   "paper_account_ledger::set_status": {
    "judge": "启停入口校验",
    "operation": "账户启停状态（活动周期过滤）",
@@ -98,6 +126,27 @@
    "single_package": "D",
    "transaction": "服务入口传入的连接"
   },
+  "paper_cycle_service::insert_cycle": {
+   "judge": "周期创建与引导规则",
+   "operation": "周期创建（兼容引导 / 新建，列白名单）",
+   "single_owner": "paper_cycle_service",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_cycle_service::set_capital": {
+   "judge": "paper_trading 引导/配置校验",
+   "operation": "周期资金对账写入",
+   "single_owner": "paper_cycle_service",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
+  "paper_cycle_service::set_status": {
+   "judge": "启停入口校验",
+   "operation": "周期启停（started_at 保留首次）",
+   "single_owner": "paper_cycle_service",
+   "single_package": "D",
+   "transaction": "调用方同一连接与原事务"
+  },
   "paper_order_ledger::accumulate_realized_pnl": {
    "judge": "commit_fill 卖出结算",
    "operation": "卖出实现盈亏累加",
@@ -111,6 +160,20 @@
    "single_owner": "paper_order_ledger",
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
+  },
+  "paper_order_ledger::archive_delete_orders": {
+   "judge": "paper_trading 归档策略",
+   "operation": "归档清理：删除超龄订单",
+   "single_owner": "paper_order_ledger",
+   "single_package": "D",
+   "transaction": "归档入口的 immediate 事务"
+  },
+  "paper_order_ledger::archive_supersede_orders": {
+   "judge": "paper_trading 归档策略",
+   "operation": "归档清理：超龄订单转 superseded",
+   "single_owner": "paper_order_ledger",
+   "single_package": "D",
+   "transaction": "归档入口的 immediate 事务"
   },
   "paper_order_ledger::cancel_order": {
    "judge": "手动入口校验 + 用户请求",
@@ -224,6 +287,13 @@
    "single_package": "A",
    "transaction": "调用方同一连接与原事务"
   },
+  "paper_order_ledger::terminalize_cycle_drift_order": {
+   "judge": "manual_orders 周期归属判定",
+   "operation": "周期漂移订单终态化（已成交不改）",
+   "single_owner": "paper_order_ledger",
+   "single_package": "D",
+   "transaction": "归档入口的 immediate 事务"
+  },
   "paper_order_ledger::terminate_order": {
    "judge": "execution_dispatch 派发阶段",
    "operation": "派发终止：订单转调用方判定的终态",
@@ -245,84 +315,33 @@
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
   },
-  "paper_trading::_cleanup_stale_data": {
-   "judge": "paper_trading 归档策略",
-   "operation": "归档/清理超龄信号行（DELETE）",
-   "targets": {
-    "paper_orders": {
-     "operation": "归档/清理超龄订单行（DELETE）",
-     "owner": "paper_order_ledger",
-     "package": "D"
-    },
-    "paper_signals": {
-     "operation": "归档/清理超龄信号行（DELETE）",
-     "owner": "signal_service",
-     "package": "D"
-    }
-   },
-   "transaction": "启动恢复/初始化连接"
-  },
-  "paper_trading::_ensure_cycle": {
-   "judge": "paper_trading 兼容引导",
-   "operation": "legacy 周期引导创建（INSERT）",
-   "targets": {
-    "paper_accounts": {
-     "operation": "legacy 引导：账户 cycle_id 清空与暂停",
-     "owner": "paper_account_ledger",
-     "package": "C"
-    },
-    "paper_cycles": {
-     "operation": "legacy 周期引导创建（INSERT）",
-     "owner": "paper_cycle_service",
-     "package": "D"
-    }
-   },
-   "transaction": "启动恢复/初始化连接"
-  },
-  "paper_trading::configure_capital": {
-   "judge": "配置入口校验",
-   "operation": "周期资金配置（capital）",
-   "single_owner": "paper_cycle_service",
-   "single_package": "D",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::create_cycle": {
-   "judge": "周期创建入口校验",
-   "operation": "周期创建（INSERT）",
-   "targets": {
-    "paper_accounts": {
-     "operation": "新建周期时账户挂接重置",
-     "owner": "paper_account_ledger",
-     "package": "C"
-    },
-    "paper_cycles": {
-     "operation": "周期创建（INSERT）",
-     "owner": "paper_cycle_service",
-     "package": "D"
-    }
-   },
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::set_account_style": {
-   "judge": "配置入口校验",
-   "operation": "账户风格字段",
-   "single_owner": "paper_account_ledger",
-   "single_package": "C",
-   "transaction": "调用方同一连接与原事务"
-  },
-  "paper_trading::set_accounts_status": {
-   "judge": "启停入口校验",
-   "operation": "周期启停状态/started_at",
-   "single_owner": "paper_cycle_service",
-   "single_package": "D",
-   "transaction": "调用方同一连接与原事务"
-  },
   "signal_service::advance_signal_feedback": {
    "judge": "paper_trading 执行循环",
    "operation": "执行事件回写信号状态/原因（活动状态集保护）",
    "single_owner": "signal_service",
    "single_package": "B",
    "transaction": "调用方同一连接与原事务"
+  },
+  "signal_service::archive_delete_signals": {
+   "judge": "paper_trading 归档策略",
+   "operation": "归档清理：删除超龄信号",
+   "single_owner": "signal_service",
+   "single_package": "D",
+   "transaction": "归档入口的 immediate 事务"
+  },
+  "signal_service::archive_expire_signals": {
+   "judge": "paper_trading 归档策略",
+   "operation": "归档清理：超龄信号转 expired",
+   "single_owner": "signal_service",
+   "single_package": "D",
+   "transaction": "归档入口的 immediate 事务"
+  },
+  "signal_service::archive_supersede_signals": {
+   "judge": "paper_trading 归档策略",
+   "operation": "归档清理：超龄信号转 superseded",
+   "single_owner": "signal_service",
+   "single_package": "D",
+   "transaction": "归档入口的 immediate 事务"
   },
   "signal_service::conflict_statement": {
    "judge": "signal_service 冲突策略",

@@ -91,6 +91,7 @@ import adaptive_selection_compat as ASC
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import paper_account_config as PAC
+import paper_cycle_service as PCYC
 import paper_order_ledger as POL
 import paper_slot_service as PSS
 import paper_numeric as PNum
@@ -2060,10 +2061,11 @@ def _ensure_cycle(conn):
         key = "legacy-" + now.replace("-", "").replace(":", "").replace(" ", "-")
         duration = int(RSET.get(conn, "cycle_duration_days", 0) or 0)
         enabled = RSET.enabled_strategies(conn)
-        conn.execute(
-            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,updated_at,duration_days,enabled_strategies) VALUES(?,?,?,?,?,?,?,?)",
-            (key, "paused", capital, "shared_pool", now, now, duration, _json(enabled)),
-        )
+        PCYC.insert_cycle(conn, fields={
+            "cycle_key": key, "status": "paused", "capital": capital,
+            "risk_profile": "shared_pool", "created_at": now, "updated_at": now,
+            "duration_days": duration, "enabled_strategies": _json(enabled),
+        })
         active = conn.execute("SELECT * FROM paper_cycles WHERE cycle_key=?", (key,)).fetchone()
     # Only a synthetic legacy cycle may infer its declared capital from old
     # account ledgers.  A normal shared-pool cycle keeps paper_cycles.capital
@@ -2074,8 +2076,7 @@ def _ensure_cycle(conn):
         (active["id"], *active_ids),
     ).fetchone()[0]
     if str(active["cycle_key"] or "").startswith("legacy-") and _num(account_total) > _num(active["capital"]):
-        conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?",
-                     (_num(account_total), _now(), active["id"]))
+        PCYC.set_capital(conn, active["id"], capital=_num(account_total), now=_now())
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
     configured_enabled = _loads(active["enabled_strategies"], None) if "enabled_strategies" in active.keys() else None
     # PR-35：启用集合按"能力位"过滤——内置 id 看 ACCOUNT_SPECS，用户 id 看
@@ -2130,10 +2131,10 @@ def _ensure_cycle(conn):
                 else _available_cycle_ledger_capital(conn, active, account_id)
             )
             benchmark = _benchmark_close()
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
-                (active["id"], spec["mode"], style, active["status"], account_capital, account_capital, benchmark,
-                 account_capital, _date().isoformat(), spec["risk_profile"], account_id),
+            PUCA.attach_to_cycle(
+                conn, account_id, cycle_id=active["id"], mode=spec["mode"], style=style,
+                status=active["status"], capital=account_capital, benchmark=benchmark,
+                nav_date=_date().isoformat(), risk_profile=spec["risk_profile"],
             )
             conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
             conn.execute(
@@ -2145,10 +2146,8 @@ def _ensure_cycle(conn):
                 (active["id"], account_id, spec.get("strategy_version") or "v2.0", style, "{}", "新增并行策略", _date().isoformat(), _now()),
             )
         else:
-            conn.execute(
-                "UPDATE paper_accounts SET mode=?,style=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
-                (spec["mode"], style, spec["risk_profile"], account_id),
-            )
+            PUCA.set_cycle_profile(conn, account_id, mode=spec["mode"], style=style,
+                                   risk_profile=spec["risk_profile"])
             # A newly deployed strategy may have been inserted by an earlier
             # process with the legacy paused/default row.  If the active cycle
             # is already running and this account has no activity, activate it
@@ -2162,10 +2161,9 @@ def _ensure_cycle(conn):
                 ).fetchone()
             ):
                 account_capital = _available_cycle_ledger_capital(conn, active, account_id)
-                conn.execute(
-                    "UPDATE paper_accounts SET cycle_id=?,status='running',initial_cash=?,cash=?,daily_start_nav=?,daily_nav_date=?,updated_at=? WHERE id=?",
-                    (active["id"], account_capital, account_capital, account_capital,
-                     _date().isoformat(), _now(), account_id),
+                PUCA.activate_for_running_cycle(
+                    conn, account_id, cycle_id=active["id"], capital=account_capital,
+                    nav_date=_date().isoformat(), now=_now(),
                 )
                 conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
                 conn.execute(
@@ -2221,10 +2219,9 @@ def _ensure_cycle(conn):
                     _num(params.get("shared_pool_reference_capital"), 0.0),
                 )
                 if _num(current["initial_cash"], 0.0) <= 0 and reference_capital > 0:
-                    conn.execute(
-                        "UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?",
-                        (reference_capital, _date().isoformat(), account_id),
-                    )
+                    PUCA.set_daily_start_nav(
+                        conn, account_id, nav=reference_capital,
+                        nav_date=_date().isoformat())
                     conn.execute(
                         """UPDATE paper_nav SET cash=0,market_value=0,nav=?
                              WHERE account_id=? AND nav_date=?""",
@@ -12519,11 +12516,8 @@ def _cleanup_stale_data():
             SELECT * FROM paper_orders
             WHERE status='deferred_capacity' AND created_at < datetime('now', '-1 day')
         """)
-        cursor = conn.execute("""
-            DELETE FROM paper_orders
-            WHERE status='deferred_capacity' AND created_at < datetime('now', '-1 day')
-        """)
-        cleaned["deferred_capacity_orders"] = cursor.rowcount
+        cleaned["deferred_capacity_orders"] = POL.archive_delete_orders(
+            conn, status="deferred_capacity")
 
         # 归档 deferred_capacity 信号（超过24小时）
         conn.execute("""
@@ -12531,11 +12525,8 @@ def _cleanup_stale_data():
             SELECT * FROM paper_signals
             WHERE status='deferred_capacity' AND created_at < datetime('now', '-1 day')
         """)
-        cursor = conn.execute("""
-            DELETE FROM paper_signals
-            WHERE status='deferred_capacity' AND created_at < datetime('now', '-1 day')
-        """)
-        cleaned["deferred_capacity_signals"] = cursor.rowcount
+        cleaned["deferred_capacity_signals"] = SIG.archive_delete_signals(
+            conn, status="deferred_capacity")
 
         # 归档 pending 信号（超过24小时）
         conn.execute("""
@@ -12543,11 +12534,8 @@ def _cleanup_stale_data():
             SELECT * FROM paper_signals
             WHERE status='pending' AND created_at < datetime('now', '-1 day')
         """)
-        cursor = conn.execute("""
-            UPDATE paper_signals SET status='expired', reason='auto-archive: pending超过24小时'
-            WHERE status='pending' AND created_at < datetime('now', '-1 day')
-        """)
-        cleaned["pending_signals"] = cursor.rowcount
+        cleaned["pending_signals"] = SIG.archive_expire_signals(
+            conn, status="pending", reason="auto-archive: pending超过24小时")
 
         # 归档 entry_frozen_waitlist（超过24小时）
         conn.execute("""
@@ -12555,11 +12543,9 @@ def _cleanup_stale_data():
             SELECT * FROM paper_orders
             WHERE status='entry_frozen_waitlist' AND created_at < datetime('now', '-1 day')
         """)
-        cursor = conn.execute("""
-            UPDATE paper_orders SET status='superseded', reason='auto-archive: entry_frozen_waitlist超过24小时'
-            WHERE status='entry_frozen_waitlist' AND created_at < datetime('now', '-1 day')
-        """)
-        cleaned["entry_frozen_orders"] = cursor.rowcount
+        cleaned["entry_frozen_orders"] = POL.archive_supersede_orders(
+            conn, status="entry_frozen_waitlist",
+            reason="auto-archive: entry_frozen_waitlist超过24小时")
 
         # H3: 冻结长期开启时 waitlist 信号也必须有时间兜底转出，否则活跃表
         # 只进不出——复评环每轮都会把 waitlist 信号重新加入候选，形成永不
@@ -12570,11 +12556,9 @@ def _cleanup_stale_data():
             SELECT * FROM paper_signals
             WHERE status='entry_frozen_waitlist' AND created_at < datetime('now', '-1 day')
         """)
-        cursor = conn.execute("""
-            UPDATE paper_signals SET status='superseded', reason='auto-archive: entry_frozen_waitlist信号超过24小时'
-            WHERE status='entry_frozen_waitlist' AND created_at < datetime('now', '-1 day')
-        """)
-        cleaned["entry_frozen_signals"] = cursor.rowcount
+        cleaned["entry_frozen_signals"] = SIG.archive_supersede_signals(
+            conn, status="entry_frozen_waitlist",
+            reason="auto-archive: entry_frozen_waitlist信号超过24小时")
 
         # 归档 blocked 信号（超过48小时）
         conn.execute("""
@@ -12582,11 +12566,9 @@ def _cleanup_stale_data():
             SELECT * FROM paper_signals
             WHERE status='blocked' AND created_at < datetime('now', '-2 days')
         """)
-        cursor = conn.execute("""
-            UPDATE paper_signals SET status='expired', reason='auto-archive: blocked超过48小时'
-            WHERE status='blocked' AND created_at < datetime('now', '-2 days')
-        """)
-        cleaned["blocked_signals"] = cursor.rowcount
+        cleaned["blocked_signals"] = SIG.archive_expire_signals(
+            conn, status="blocked", reason="auto-archive: blocked超过48小时",
+            window="-2 days")
 
         # 执行失败的策略/手动买单停留在 execution_retry 中间态：信号已回到
         # pending 并会生成新订单，旧行若不收敛会无界累积、污染订单计数。
@@ -12598,12 +12580,8 @@ def _cleanup_stale_data():
                    WHERE status=? AND created_at < datetime('now', '-1 day')""",
                 (_retry_status,),
             )
-            cursor = conn.execute(
-                """DELETE FROM paper_orders
-                   WHERE status=? AND created_at < datetime('now', '-1 day')""",
-                (_retry_status,),
-            )
-            cleaned[f"{_retry_status}_archived"] = cursor.rowcount
+            cleaned[f"{_retry_status}_archived"] = POL.archive_delete_orders(
+                conn, status=_retry_status)
 
         # intraday 分钟级运行记录无界增长：每个交易日约 220 个 key，单行
         # detail JSON 数十 KB。保留 30 天供审计/复盘，超期直接删除（这些
@@ -14066,11 +14044,13 @@ def create_cycle(conn, capital, status="paused", reason="新建模拟周期", du
     param_stamp = dt.datetime.now(
         dt.timezone(dt.timedelta(hours=8))).isoformat(timespec="seconds")
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    cursor = conn.execute(
-        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,created_at,updated_at,duration_days,enabled_strategies) VALUES(?,?,?,?,?,?,?,?,?)",
-        (key, status, capital, "shared_pool", now if status == "running" else None, now, now, duration_days, _json(enabled_strategies)),
-    )
-    cycle_id = cursor.lastrowid
+    cycle_id = PCYC.insert_cycle(conn, fields={
+        "cycle_key": key, "status": status, "capital": capital,
+        "risk_profile": "shared_pool",
+        "started_at": now if status == "running" else None,
+        "created_at": now, "updated_at": now, "duration_days": duration_days,
+        "enabled_strategies": _json(enabled_strategies),
+    })
     benchmark = _benchmark_close()
     shares = _cycle_capital_shares(enabled_strategies)
     account_share = capital / max(len(enabled_strategies), 1)
@@ -14129,14 +14109,20 @@ def create_cycle(conn, capital, status="paused", reason="新建模拟周期", du
         # ``initial_cash`` 只是"这个策略可以动用多少"的归属口径。
         strategy_capital = round(capital * shares.get(account_id, 0.0), 2) \
             if shares else account_share
-        conn.execute(
-            """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
-               max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
-               risk_profile=?,params=?,daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
-            (spec["name"], spec["source_strategy"], status, strategy_capital, strategy_capital, spec["cycle_days"], max_positions,
-             max_weight, max_exposure, spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], style,
-             spec["risk_profile"], initial_params, strategy_capital, _date().isoformat(), now, account_id),
-        )
+        PUCA.apply_cycle_membership(conn, account_id, fields={
+            "name": spec["name"], "source_strategy": spec["source_strategy"],
+            "status": status, "initial_cash": strategy_capital,
+            "cash": strategy_capital, "cycle_days": spec["cycle_days"],
+            "max_positions": max_positions, "max_weight": max_weight,
+            "max_exposure": max_exposure,
+            "version": spec.get("strategy_version") or "v3.0",
+            "benchmark_start": benchmark, "cycle_id": cycle_id,
+            "mode": spec["mode"], "style": style,
+            "risk_profile": spec["risk_profile"], "params": initial_params,
+            "daily_start_nav": strategy_capital,
+            "daily_nav_date": _date().isoformat(), "cooldown_until": None,
+            "updated_at": now,
+        })
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
                      (account_id, _date().isoformat(), strategy_capital, 0.0, strategy_capital, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -14158,7 +14144,7 @@ def configure_capital(capital):
         positions = conn.execute("SELECT COUNT(*) FROM paper_position_lots WHERE remaining_qty>0").fetchone()[0]
         if activity or positions:
             raise ValueError("本周期已有模拟成交或持仓，资金已锁定；请使用完全重置新建周期")
-        conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?", (capital, _now(), cycle["id"]))
+        PCYC.set_capital(conn, cycle["id"], capital=capital, now=_now())
         configured = _loads(cycle.get("enabled_strategies"), None)
         enabled_ids = (tuple(configured) if isinstance(configured, list) and configured
                        else tuple(ACTIVE_ACCOUNT_IDS))
@@ -14243,7 +14229,7 @@ def set_account_style(account_id, style):
         cycle = load_active_cycle(conn)
         if cycle["status"] == "running":
             raise ValueError("当前周期运行中，暂停后才能调整策略风格")
-        conn.execute("UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?", (style, _now(), account_id))
+        PAC.set_style(conn, account_id, style=style, now=_now())
         audit(conn, account_id, "style_changed", f"后续候选风格切换为 {ACS.style_name(style)}；已有持仓不强平")
     return dashboard()
 
@@ -14267,8 +14253,8 @@ def set_accounts_status(status, capital=None):
         active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
         PUCA.set_status(conn, status=status, now=_now(),
                         clause=active_clause, clause_params=tuple(active_ids))
-        conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
-                     (status, _now() if status == "running" else None, _now(), cycle["id"]))
+        PCYC.set_status(conn, cycle["id"], status=status,
+                        started_at=_now() if status == "running" else None, now=_now())
         audit(conn, None, "accounts_" + status, f"{len(active_ids)}套当前策略模拟盘状态变更")
     return dashboard()
 
@@ -14467,6 +14453,7 @@ def _bind_application_dependencies():
         "position_rows": (PLL, "position_rows"),
         "cancel_order": (POL, "cancel_order"),
         "update_order_outcome": (POL, "update_order_outcome"),
+        "terminalize_cycle_drift_order": (POL, "terminalize_cycle_drift_order"),
         "write_signal_payload": (SIG, "write_payload"),
         "defer_signal": (SIG, "defer_for_capacity"),
         "reopen_pending": (SIG, "reopen_pending"),

@@ -296,7 +296,7 @@ class WaitlistDedupeOwnershipTests(unittest.TestCase):
         self.assertIn("paper_order_ledger", matrix["paper_orders"]["writers"])
         self.assertIn("signal_service", matrix["paper_signals"]["writers"])
         for table in ("paper_orders", "paper_signals"):
-            self.assertEqual("pending", matrix[table]["status"])
+            self.assertEqual("owned", matrix[table]["status"])
         # 信号侧没有新增写入口：本批不把同一业务操作拆给 signal_service。
         self.assertNotIn("retire_duplicate_waitlist", SIG.__all__)
 

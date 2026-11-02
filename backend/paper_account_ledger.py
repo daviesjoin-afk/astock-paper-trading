@@ -143,3 +143,60 @@ def apply_cash_delta(conn, account_id, *, delta, now):
     conn.execute("UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?",
                  (delta, now, account_id))
 
+
+
+CYCLE_MEMBERSHIP_COLUMNS = (
+    "name", "source_strategy", "status", "initial_cash", "cash", "cycle_days",
+    "max_positions", "max_weight", "max_exposure", "version", "benchmark_start",
+    "cycle_id", "mode", "style", "risk_profile", "params", "daily_start_nav",
+    "daily_nav_date", "cooldown_until", "updated_at",
+)
+
+def attach_to_cycle(conn, account_id, *, cycle_id, mode, style, status, capital,
+                    benchmark, nav_date, risk_profile):
+    """把账户挂到活动周期并初始化资金/基准/日初净值（首次挂接路径）。"""
+    conn.execute(
+        """UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,
+             cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,
+             params=COALESCE(NULLIF(params,''),'{}') WHERE id=?""",
+        (cycle_id, mode, style, status, capital, capital, benchmark, capital,
+         nav_date, risk_profile, account_id),
+    )
+
+
+def set_cycle_profile(conn, account_id, *, mode, style, risk_profile):
+    """已挂接账户的周期画像字段（mode/style/risk_profile）；参数为空时兜底 '{}'。"""
+    conn.execute(
+        "UPDATE paper_accounts SET mode=?,style=?,risk_profile=?,"
+        "params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
+        (mode, style, risk_profile, account_id),
+    )
+
+
+def activate_for_running_cycle(conn, account_id, *, cycle_id, capital, nav_date, now):
+    """无成交记录的新策略跟随运行中的周期直接激活。"""
+    conn.execute(
+        """UPDATE paper_accounts SET cycle_id=?,status='running',initial_cash=?,cash=?,
+             daily_start_nav=?,daily_nav_date=?,updated_at=? WHERE id=?""",
+        (cycle_id, capital, capital, capital, nav_date, now, account_id),
+    )
+
+
+def set_daily_start_nav(conn, account_id, *, nav, nav_date):
+    """回填日初净值与对应日期。"""
+    conn.execute(
+        "UPDATE paper_accounts SET daily_start_nav=?,daily_nav_date=? WHERE id=?",
+        (nav, nav_date, account_id),
+    )
+
+
+def apply_cycle_membership(conn, account_id, *, fields):
+    """周期创建时的账户成员配置写入；列集合受白名单约束。"""
+    unknown = set(fields) - set(CYCLE_MEMBERSHIP_COLUMNS)
+    if unknown:
+        raise ValueError(f"未知账户列：{sorted(unknown)}")
+    columns = [name for name in CYCLE_MEMBERSHIP_COLUMNS if name in fields]
+    conn.execute(
+        f"UPDATE paper_accounts SET {','.join(f'{c}=?' for c in columns)} WHERE id=?",
+        tuple(fields[name] for name in columns) + (account_id,),
+    )

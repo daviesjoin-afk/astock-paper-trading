@@ -681,3 +681,12 @@ _loads/_clamp`（12 个 adaptive/evolution 模块），另外 11 处是 `paper_t
 ## 2026-11-02 PR-10 C 复审修复
 
 账户表持久化改由 paper_account_ledger 统一执行；四个业务模块保留业务职责及兼容入口。新增指向该模块的依赖均在 paper 域内部，不增加 cross_domain_edges，不改变域分类或制造注入桥。已审核七条跨域边成本的正确起点是 A 之前的 629，终点 636；618 是 HEAD_BUDGET 历史基数。FEATURE_ALLOWANCE 的增加确实提高有效上限，属于已审核例外，不能用 lock 未变来声称预算未放宽。逐表引用分散度另行列证。
+## 2026-11-01 PR-10 工作包 D：周期与归档 owner
+
+`paper_cycles` 只剩 `paper_cycle_service` 一个运行时写方；归档批量语句归
+`paper_order_ledger` / `signal_service`，周期漂移终态化归订单 owner。
+`paper_orders` / `paper_signals` / `paper_cycles` 在矩阵中翻为 `owned`。
+
+额度影响：`duplicate_helpers` 296 → 297（owner 之间出现一个同名小助手），
+`FEATURE_ALLOWANCE` 0 → 1；`cross_domain_edges` 与 `raw_sql_modules` 沿用 C 的登记，
+`paper_table_fanout_max` 保持 50。
