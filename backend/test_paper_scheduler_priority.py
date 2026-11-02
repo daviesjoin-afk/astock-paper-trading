@@ -217,3 +217,88 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(1, denied.returncode)
         events = [json.loads(line) for line in denied.stderr.splitlines() if line.strip()]
         self.assertEqual(["paper_host_lock"], [event["event"] for event in events])
+
+    # ── PR-11 B：风险快通道的独立主机锁 ────────────────────────────────────
+    def _risk_runner(self, root):
+        source = Path(__file__).resolve().parents[1] / "deploy" / "run_paper_slot.sh"
+        runner = root / "runner.sh"
+        runner.write_text(source.read_text().replace("/opt/astock-codex/.locks", str(root / "locks")))
+        docker = root / "docker"
+        docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shlex.quote(str(root / "docker-call")) + "\n")
+        docker.chmod(0o755)
+        return runner
+
+    def test_risk_lane_runs_while_the_shared_scan_lock_is_held(self):
+        """全扫描占着 paper-scan.lock 时，风险 lane 仍然必须能跑起来。
+
+        这正是 PR-11 B 的独立边界：如果风险任务还在等那把共享锁，它只是一条
+        多出来的 cron，节拍依旧被候选扫描拖住。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locks").mkdir()
+            runner = self._risk_runner(root)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            holder = subprocess.Popen(
+                ["flock", str(root / "locks" / "paper-scan.lock"),
+                 "sh", "-c", "echo ready; read release"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "ready")
+                run = subprocess.run(["bash", str(runner), "risk"], env=env, timeout=5,
+                                     capture_output=True, text=True)
+            finally:
+                holder.communicate("release\n", timeout=2)
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.wait()
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertTrue((root / "docker-call").exists(), "risk 被共享锁挡住了")
+        events = [json.loads(line) for line in run.stderr.splitlines() if line.strip()]
+        self.assertEqual(["paper_slot_start", "paper_slot_exit"],
+                         [event["event"] for event in events])
+        self.assertEqual("risk", events[0]["slot"])
+
+    def test_risk_lane_is_serialized_by_its_own_lock(self):
+        """两轮风险重叠时跳过这一跳（flock -n），而不是排队等自己。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locks").mkdir()
+            runner = self._risk_runner(root)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            holder = subprocess.Popen(
+                ["flock", str(root / "locks" / "risk-scan.lock"),
+                 "sh", "-c", "echo ready; read release"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "ready")
+                denied = subprocess.run(["bash", str(runner), "risk"], env=env, timeout=5,
+                                        capture_output=True, text=True)
+            finally:
+                holder.communicate("release\n", timeout=2)
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.wait()
+        self.assertEqual(1, denied.returncode)
+        event = json.loads(denied.stderr)
+        self.assertEqual("paper_host_lock", event["event"])
+        self.assertEqual("not_acquired", event["status"])
+        self.assertEqual("risk", event["slot"])
+        self.assertFalse((root / "docker-call").exists())
+
+    def test_risk_lane_never_leaves_a_full_scan_intent_marker(self):
+        """意图标记是共用 paper-scan.lock 的 lane 的协议；风险 lane 不参与。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locks").mkdir()
+            runner = self._risk_runner(root)
+            docker = root / "docker"
+            docker.write_text("#!/bin/sh\nexit 0\n")
+            docker.chmod(0o755)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            run = subprocess.run(["bash", str(runner), "risk"], env=env, timeout=5,
+                                 capture_output=True, text=True)
+            self.assertEqual(0, run.returncode, run.stderr)
+            self.assertEqual(list((root / "locks").glob("full-scan-pending.*")), [])

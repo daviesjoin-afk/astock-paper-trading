@@ -442,6 +442,30 @@ def _intraday_business_key(now=None):
     return f"intraday:{bucket.strftime('%Y%m%d%H%M')}"
 
 
+def _risk_business_key(now=None):
+    """Return one idempotency key for the risk lane's three-minute window.
+
+    PR-11 B：风险快通道每三分钟一跳，运行身份必须是**窗口**而不是当日。风险
+    以前没有独立 cron 条目，``paper_jobs`` 里一行当日记录就够了；一旦重复触发，
+    当天第一跳成功之后每一跳都会命中 ``already_done``，节拍直接停在早上第一
+    分钟。取整规则与 :func:`_intraday_business_key` 完全一致，两个 lane 的窗口
+    边界因此永远对齐，同一窗口内不可能出现两条并行记录。
+    """
+    now = now if isinstance(now, dt.datetime) else dt.datetime.now()
+    minute = (now.minute // INTRADAY_INTERVAL_MINUTES) * INTRADAY_INTERVAL_MINUTES
+    bucket = now.replace(minute=minute, second=0, microsecond=0)
+    return f"risk:{bucket.strftime('%Y%m%d%H%M')}"
+
+
+def _slot_run_key(slot, now=None):
+    """重复触发 lane 的窗口身份；一次性 slot 返回 ``None``（按当日幂等）。"""
+    if slot == "intraday":
+        return _intraday_business_key(now)
+    if slot == "risk":
+        return _risk_business_key(now)
+    return None
+
+
 def paper_cache_generation():
     """Cheap cross-process cache generation for the HTTP read models.
 
@@ -12683,9 +12707,12 @@ def _run_slot_impl(slot, day, force=False):
     if not force and not _is_trade_weekday(day):
         return {"status": "skipped", "slot": slot, "reason": "非交易工作日"}
     run_asof = dt.datetime.now()
-    intraday_key = _intraday_business_key(run_asof) if slot == "intraday" else None
-    PTM.bind_job(market_date=day.isoformat(), run_key=intraday_key,
-                 job_table="paper_job_runs" if intraday_key else "paper_jobs")
+    # 重复触发的 lane 用"窗口身份"，一次性 slot 用"当日身份"。风险快通道每三
+    # 分钟一跳：如果沿用当日 ``paper_jobs`` 行，当天第一跳成功之后每一跳都会
+    # 变成 ``already_done``，节拍直接停在早上第一分钟。
+    run_key = _slot_run_key(slot, run_asof)
+    PTM.bind_job(market_date=day.isoformat(), run_key=run_key,
+                 job_table="paper_job_runs" if run_key else "paper_jobs")
     hot_path = _is_hot_path_slot(slot)
     # 失败任务的自动重试预算按 slot 给：close 的失败有一半是"完整日线/因子
     # 还没补齐"，而 refresh_history 自带 420 秒上限 + 持久化游标，靠后续窗口
@@ -12697,7 +12724,12 @@ def _run_slot_impl(slot, day, force=False):
     # One lease spans every scheduled slot: a 15:05 full-market factor rebuild
     # must not race a manual retry, and an intraday scan that takes longer than
     # three minutes must not start another risk/open loop in parallel.
-    runtime_lock_key = "paper-runner-global"
+    #
+    # PR-11 B：风险快通道有自己的运行租约（``paper-runner-risk``）。把它继续
+    # 挂在全局租约下，等于让风险 pass 排在日内监控/候选扫描后面——那条 lane
+    # 就只是"多了一条 cron"，不是独立边界。其它 slot 仍然共用
+    # ``paper-runner-global``，并发没有被整体放宽。
+    runtime_lock_key = "paper-runner-risk" if slot == "risk" else "paper-runner-global"
     # H6: 租约 TTL 必须 ≥ 2× 最大单轮耗时，否则扫描尚未结束租约即过期，
     # 下一轮 cron 会抢到过期租约与未结束的 run 并发写候选/订单。
     # - auction/open 为秒级~分钟级任务：300s/600s 足够，且即使释放失败，
@@ -12709,21 +12741,25 @@ def _run_slot_impl(slot, day, force=False):
     #   SIGKILL 僵尸的回收时延。收紧到 300s（仍 >2× 正常耗时）把盘中
     #   风控盲区从 ~10 分钟压缩到 ~5 分钟。fencing token + 完成 CAS 保证
     #   即使慢扫描被回收，原进程后续写也会因代际不匹配而中止而非双写。
-    # - close/risk 等长任务允许因子重建与多账户全量扫描，给到 40 分钟，
+    # - close 等长任务允许因子重建与多账户全量扫描，给到 40 分钟，
     #   与下方 job stale_minutes=45 对齐，且 2×TTL 僵尸回收（80 分钟）
     #   仍远小于一天，不会滞留僵尸租约。
+    # - risk 自 PR-11 B 起是三分钟 lane（只做风险 pass，不做全市场因子重建）：
+    #   TTL 收紧到 900s（5× 预期的单轮上限）。进程死亡仍由心跳缺失（约 6 分钟）
+    #   更早判定，TTL 只决定"活进程但主线程挂住"时的回收上界；这段窗口里
+    #   intraday 的 monitor_risk 兜底仍在跑同一分钟的风控，不会留下盲区。
     runtime_lock_ttl = {
-        "auction": 300, "open": 600, "risk": 2400, "close": 2400,
+        "auction": 300, "open": 600, "risk": 900, "close": 2400,
         "weekly-review": 2400, "intraday": 300,
     }.get(slot, 600)
-    owner_seed = f"{slot}:{day.isoformat()}:{intraday_key or 'daily'}:{os.getpid()}:{_now()}"
+    owner_seed = f"{slot}:{day.isoformat()}:{run_key or 'daily'}:{os.getpid()}:{_now()}"
     runtime_owner = hashlib.sha1(owner_seed.encode("utf-8")).hexdigest()[:20]
     runtime_lock_acquired = False
     with _db(immediate=True, hot_path=hot_path) as conn:
         new_run = True
         prior_detail = {}
         exists = PJL.read_job(conn, slot=slot, market_date=day.isoformat(),
-                           run_key=intraday_key)
+                           run_key=run_key)
         if exists:
             prior_detail = _loads(exists["detail"], {}) or {}
             if exists["status"] == "running":
@@ -12750,16 +12786,16 @@ def _run_slot_impl(slot, day, force=False):
                     }
                     PJL.mark_interrupted(
                         conn, slot=slot, market_date=day.isoformat(),
-                        run_key=intraday_key, detail=_json(prior_detail), now=_now(),
+                        run_key=run_key, detail=_json(prior_detail), now=_now(),
                     )
                     exists = PJL.read_job(conn, slot=slot, market_date=day.isoformat(),
-                                       run_key=intraday_key)
+                                       run_key=run_key)
             retry_count = int(prior_detail.get("retry_count") or 0)
             retryable = exists["status"] in {"failed", "interrupted"}
             if retryable and "owner_key" in exists.keys() and exists["owner_key"]:
                 # 任务已经进入 failed/interrupted，上一代进程不可能仍在合法执行。
-                # 但它被 SIGKILL 时留下的全局租约还会阻止本次重试（close/risk 的
-                # TTL 是 40 分钟）。按 job 行保存的 owner + fencing 精确释放，
+                # 但它被 SIGKILL 时留下的租约还会阻止本次重试（close 的 TTL 是
+                # 40 分钟、risk 的 900 秒）。按 job 行保存的 owner + fencing 精确释放，
                 # 不影响任何新进程持有的代际。
                 _release_runtime_lease(
                     conn, runtime_lock_key, exists["owner_key"],
@@ -12805,13 +12841,13 @@ def _run_slot_impl(slot, day, force=False):
             if new_run:
                 PJL.claim_job(
                     conn, slot=slot, market_date=day.isoformat(),
-                    run_key=intraday_key, owner=owner, expires_at=expires_at,
+                    run_key=run_key, owner=owner, expires_at=expires_at,
                     fencing_token=fencing_token, now=_now(),
                 )
             else:
                 cursor = PJL.reclaim_job(
                     conn, slot=slot, market_date=day.isoformat(),
-                    run_key=intraday_key, owner=owner, expires_at=expires_at,
+                    run_key=run_key, owner=owner, expires_at=expires_at,
                     fencing_token=fencing_token, detail=_json(retry_detail),
                     now=_now(),
                 )
@@ -12850,7 +12886,7 @@ def _run_slot_impl(slot, day, force=False):
                         return
                     job_cursor = PJL.renew_lease(
                         renew_conn, slot=slot, market_date=day.isoformat(),
-                        run_key=intraday_key, owner=owner,
+                        run_key=run_key, owner=owner,
                         fencing_token=fencing_token, heartbeat_at=heartbeat_at,
                         expires_at=expires,
                     )
@@ -12915,7 +12951,7 @@ def _run_slot_impl(slot, day, force=False):
             _require_active_lease(conn, "job completion")
             cursor = PJL.complete_job(
                 conn, slot=slot, market_date=day.isoformat(),
-                run_key=intraday_key, owner=owner, fencing_token=fencing_token,
+                run_key=run_key, owner=owner, fencing_token=fencing_token,
                 status=completion_status, detail=_json(detail), now=_now(),
             )
             if cursor.rowcount != 1:
@@ -12927,7 +12963,7 @@ def _run_slot_impl(slot, day, force=False):
                 raise
             PJL.fail_job(
                 conn, slot=slot, market_date=day.isoformat(),
-                run_key=intraday_key, owner=owner, fencing_token=fencing_token,
+                run_key=run_key, owner=owner, fencing_token=fencing_token,
                 detail=_json({"error": str(exc), "retry_count": retry_count,
                               "timing": PTM.snapshot("before_failure_finalize")}),
                 now=_now(),
@@ -14281,8 +14317,15 @@ def dispatch_status():
     默认路径跟随 ``data_paths.report_dir()``（仓库／容器里的 ``reports/``）：宿主 cron
     写 ``/opt/astock-codex/reports/scheduler.log``，API 容器把它挂在 ``/app/reports``，
     写死宿主绝对路径会让容器内永远读不到。需要指向别处时用 ``ASTOCK_SCHEDULER_LOG``。
+
+    start-to-start 只在声明的交易窗口内比较（``PSch.INTRADAY_WINDOWS``）：午休
+    96 分钟不是节拍违规。``risk_scans`` 按 lane 拆分完成标记，用来区分"风险 lane
+    真的在跑"和"整段都是 intraday 兜底"。
     """
-    return PDM.summarize_file(PDM.scheduler_log_path(data_paths.report_dir()))
+    return PDM.summarize_file(
+        PDM.scheduler_log_path(data_paths.report_dir()),
+        session_windows=PSch.INTRADAY_WINDOWS,
+    )
 
 
 def schedule_status():
@@ -14329,7 +14372,7 @@ def schedule_status():
         "runtime_failed_count": len(failed),
         # PR-11：tick / 跳过 / 队列年龄 / 上次风险成功；日志不可读时 available=False。
         "dispatch": dispatch_status(),
-        "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新有效行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
+        "note": "09:15起每3分钟跟踪竞价个股（只观测）；09:25采集最终快照做预选并强制刷新健康检查；09:30、09:31、13:00先执行共享开盘事件扫描，09:31再用最新有效行情审批新开仓；其后每3分钟执行至11:25和14:55；风险快通道自 PR-11 B 起有独立三分钟条目（09:33 起、13:00 起）与独立锁，同分钟只跑一次风控（durable scan claim 去重），日内监控保留 monitor_risk 兜底；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试。"
     }
 
 

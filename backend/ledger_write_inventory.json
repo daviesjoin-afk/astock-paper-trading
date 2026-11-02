@@ -5638,7 +5638,7 @@
   {
    "function": "_add_cycle_and_activate",
    "kind": "static",
-   "line": 882,
+   "line": 889,
    "module": "test_paper_risk_exit_production_path",
    "read_refs": [],
    "role": "test",
@@ -5650,7 +5650,7 @@
   {
    "function": "_add_cycle_and_activate",
    "kind": "static",
-   "line": 887,
+   "line": 894,
    "module": "test_paper_risk_exit_production_path",
    "read_refs": [],
    "role": "test",
@@ -5662,7 +5662,7 @@
   {
    "function": "_add_cycle_and_activate",
    "kind": "static",
-   "line": 889,
+   "line": 896,
    "module": "test_paper_risk_exit_production_path",
    "read_refs": [],
    "role": "test",

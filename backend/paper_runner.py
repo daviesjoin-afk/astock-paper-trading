@@ -7,7 +7,13 @@ import time
 import paper_timing as PTM
 
 
-_SUCCESS_STATUSES = frozenset({"completed", "already_done", "skipped", "ok", "up_to_date"})
+_SUCCESS_STATUSES = frozenset({
+    "completed", "already_done", "skipped", "ok", "up_to_date",
+    # PR-11 B：风险 lane 与 intraday 兜底共用 durable scan claim。同一分钟被
+    # 另一个入口先认领时，本轮返回 already_scanned —— 这是幂等成功，不是失败，
+    # 退出码必须是 0，否则每一跳"被对端先跑"的调度都会在日志里冒充故障。
+    "already_scanned",
+})
 
 
 def _result_exit_code(result):

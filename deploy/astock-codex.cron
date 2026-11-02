@@ -36,9 +36,8 @@ HOME=/opt/astock-codex
 # 09:31 的 open 任务（共用 paper-scan.lock），13:55 终点用于避免 13:57 与
 # 14:00 重复扫描。契约模块 INTRADAY_CRON_MINUTES 的注释说明了这一点。
 #
-# 14:50 风控已由同一分钟的日内监控统一执行，避免重复确认和重复卖出。
-# risk 因此没有独立条目——这是契约里 SCHEDULED_SLOTS 明确记录的决定，
-# 不再只靠这条注释存在。
+# 14:50 起日内监控仍在跑风控兜底；PR-11 B 之后风险另有独立 lane（见下方
+# 「风险快通道独立 lane」一段），14:50 并不是风险的唯一入口。
 # Wait through a small overrun without overlapping runners or queuing indefinitely.
 33-59/3 9 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
 */3 10 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
@@ -46,11 +45,30 @@ HOME=/opt/astock-codex
 0-55/3 13 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
 */3 14 * * 1-5 root flock -w 60 /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
 
+# ─── PR-11 B：风险快通道独立 lane ────────────────────────────────────────────
+# 风险 pass 不再排在日内监控后面：它有自己的 cron 条目、自己的外层锁
+# （risk.lock）和脚本内的 risk-scan.lock。paper-scan.lock 继续服务竞价/开盘/
+# 日内监控，一把锁都不删，只是风险不再等它。
+#
+# 分钟字段与 intraday 同一三分钟网格（渲染由 paper_schedule_contract 的
+# RISK_CRON_MINUTES 持有，CronRenderingFidelityGuard 逐字段比对）。同网格 +
+# durable scan claim (cycle_id, asof_date, scan_minute) 保证同一分钟最多一次
+# 风险 pass：另一个入口只会拿到 already_scanned。
+#
+# 用 flock -n：本轮风险还在跑（或上一轮异常未退）就跳过这一跳，而不是排队，
+# 避免风险 lane 变成第二条队列。intraday 的 monitor_risk 兜底仍在，任何一跳
+# 被跳过都不会留下没有风控的分钟。
+33-59/3 9 * * 1-5 root flock -n /opt/astock-codex/.locks/risk.lock /opt/astock-codex/deploy/run_paper_slot.sh risk >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/3 10 * * 1-5 root flock -n /opt/astock-codex/.locks/risk.lock /opt/astock-codex/deploy/run_paper_slot.sh risk >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-25/3 11 * * 1-5 root flock -n /opt/astock-codex/.locks/risk.lock /opt/astock-codex/deploy/run_paper_slot.sh risk >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-55/3 13 * * 1-5 root flock -n /opt/astock-codex/.locks/risk.lock /opt/astock-codex/deploy/run_paper_slot.sh risk >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/3 14 * * 1-5 root flock -n /opt/astock-codex/.locks/risk.lock /opt/astock-codex/deploy/run_paper_slot.sh risk >>/opt/astock-codex/reports/scheduler.log 2>&1
+
 31 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 开盘审批与盘后因子失败时的单次兜底；已完成的日任务不会重复执行。
 33 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
 35 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
-# 14:50 风控已由同一分钟的日内监控统一执行，避免重复确认和重复卖出。
+# 14:50 的持仓风控：日内监控兜底仍在；正常节拍由上方风险快通道 lane 承担。
 5 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
 10 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
 12 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1

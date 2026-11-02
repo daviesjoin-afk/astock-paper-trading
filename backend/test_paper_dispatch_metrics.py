@@ -545,6 +545,107 @@ class DispatchStatusTests(unittest.TestCase):
         self.assertTrue(result["available"], result)
         self.assertEqual(str(log), result["path"])
 
+    def test_session_windows_come_from_the_schedule_contract(self):
+        """dispatch_status 必须把交易窗口交给聚合器，午休不算节拍违规。"""
+        paper = self._trading()
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "scheduler.log"
+            log.write_text("\n".join([
+                _timing_event("risk", "2026-11-02T11:24:00+08:00"),
+                _timing_event("risk", "2026-11-02T13:00:00+08:00"),
+            ]) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"ASTOCK_SCHEDULER_LOG": str(log)}):
+                result = paper.dispatch_status()
+        risk = result["start_to_start_seconds"]["risk"]
+        self.assertEqual(0, risk["samples"])
+        self.assertEqual(1, risk["excluded_session_gaps"])
+        self.assertEqual(0, risk["breaches"])
+
+
+class RiskScanLaneTests(unittest.TestCase):
+    """PR-11 B：完成标记要能区分"风险 lane 跑的"和"intraday 兜底跑的"。"""
+
+    def test_risk_scan_markers_are_split_by_status_and_lane(self):
+        summary = _summarize(
+            _timing_event("risk", "2026-11-02T09:33:00+08:00", risk_status="completed"),
+            _timing_event("intraday", "2026-11-02T09:33:00+08:00", risk_status="already_scanned"),
+            _timing_event("intraday", "2026-11-02T09:36:00+08:00", risk_status="completed"),
+            _timing_event("risk", "2026-11-02T09:39:00+08:00", risk_status="failed"),
+        )
+        scans = summary["risk_scans"]
+        self.assertEqual(4, scans["total"])
+        self.assertEqual({"already_scanned": 1, "completed": 2, "failed": 1}, scans["by_status"])
+        self.assertEqual({"completed": 1, "failed": 1}, scans["by_slot"]["risk"])
+        self.assertEqual({"already_scanned": 1, "completed": 1}, scans["by_slot"]["intraday"])
+
+    def test_already_scanned_is_idle_and_never_a_successful_risk_scan(self):
+        summary = _summarize(
+            _timing_event("risk", "2026-11-02T09:33:00+08:00", status="already_scanned",
+                          risk_status="already_scanned"))
+        self.assertEqual(1, summary["ticks"]["idle"])
+        self.assertEqual(0, summary["ticks"]["completed"])
+        self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+        self.assertEqual({"already_scanned": 1}, summary["risk_scans"]["by_status"])
+
+    def test_risk_scan_without_stage_evidence_is_not_a_success(self):
+        """只有完成标记、没有风险阶段耗时：证据不完整，不冒充成功风控。"""
+        summary = _summarize(
+            _timing_event("risk", "2026-11-02T09:33:00+08:00", stages={},
+                          risk_status="completed"))
+        self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+
+    def test_malformed_scan_markers_do_not_raise(self):
+        summary = _summarize(
+            '{"event": "paper_slot_timing", "status": "completed", "timing":'
+            ' {"slot": "risk", "started_at": "2026-11-02T09:33:00+08:00",'
+            '  "risk_scans": "broken", "stages": {"risk_pass": {"errors": 0}}}}',
+            '{"event": "paper_slot_timing", "status": "completed", "timing":'
+            ' {"slot": "risk", "started_at": "2026-11-02T09:36:00+08:00",'
+            '  "risk_scans": [42, {"status": ""}], "stages": {"risk_pass": {"errors": 0}}}}',
+        )
+        self.assertEqual(0, summary["risk_scans"]["total"])
+
+
+class SessionWindowTests(unittest.TestCase):
+    WINDOWS = (("09:30", "11:24"), ("13:00", "14:57"))
+
+    def test_lunch_gap_is_excluded_from_the_cadence(self):
+        risk = _summarize(
+            _timing_event("risk", "2026-11-02T11:24:00+08:00"),
+            _timing_event("risk", "2026-11-02T13:00:00+08:00"),
+            session_windows=self.WINDOWS,
+        )["start_to_start_seconds"]["risk"]
+        self.assertEqual(0, risk["samples"])
+        self.assertEqual(1, risk["excluded_session_gaps"])
+        self.assertEqual(0, risk["breaches"])
+
+    def test_in_session_gaps_still_count_breaches(self):
+        risk = _summarize(
+            _timing_event("risk", "2026-11-02T09:33:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:40:00+08:00"),
+            session_windows=self.WINDOWS,
+        )["start_to_start_seconds"]["risk"]
+        self.assertEqual(1, risk["samples"])
+        self.assertEqual(1, risk["breaches"])
+        self.assertEqual(0, risk["excluded_session_gaps"])
+
+    def test_without_windows_every_gap_counts(self):
+        risk = _summarize(
+            _timing_event("risk", "2026-11-02T11:24:00+08:00"),
+            _timing_event("risk", "2026-11-02T13:00:00+08:00"),
+        )["start_to_start_seconds"]["risk"]
+        self.assertEqual(1, risk["samples"])
+        self.assertEqual(1, risk["breaches"])
+        self.assertEqual(0, risk["excluded_session_gaps"])
+
+
+class RunnerExitCodeTests(unittest.TestCase):
+    def test_already_scanned_is_a_successful_idempotent_skip(self):
+        import paper_runner as runner
+        self.assertEqual(0, runner._result_exit_code({"status": "already_scanned"}))
+        self.assertEqual(1, runner._result_exit_code({"status": "blocked"}))
+        self.assertEqual(1, runner._result_exit_code({"status": "failed"}))
+
 
 if __name__ == "__main__":
     unittest.main()

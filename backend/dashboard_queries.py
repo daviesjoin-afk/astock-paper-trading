@@ -527,7 +527,14 @@ def dashboard(include_activity=False, include_history_symbols=False, *, dependen
                  FROM paper_orders GROUP BY code
                  ORDER BY last_activity_at DESC,code""",
         ) if include_history_symbols else []
-        monitor_runs = _rows(conn, "SELECT * FROM paper_job_runs ORDER BY started_at DESC LIMIT 24")
+        # 这块展示的是"盘中监控"的最近 24 轮。PR-11 B 起风险快通道也写
+        # ``paper_job_runs``（窗口身份 ``risk:YYYYMMDDHHMM``），而它的 detail
+        # 结构不同（没有候选 bootstrap）；按 run_key 前缀收窄，展示口径不变。
+        monitor_runs = _rows(
+            conn,
+            "SELECT * FROM paper_job_runs WHERE run_key LIKE 'intraday:%'"
+            " ORDER BY started_at DESC LIMIT 24",
+        )
         for run in monitor_runs:
             detail = _loads(run.get("detail"), {})
             bootstrap = detail.get("bootstrap") or {}
