@@ -389,6 +389,7 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 `test_ledger_owner_plan.py` 会比对"源码扫描结果 ↔ 计划 ↔ 本节内容"三者一致。
 
 <!-- ledger-owner-plan:start -->
+
 ### 工作包 A
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
@@ -409,7 +410,7 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_signals` | 信号自身失效 expired | `signal_service::expire_stale_signal` | entry_lifecycle 失效判定 | `signal_service` | 调用方同一连接与原事务 | `test_entry_lifecycle`、`test_ledger_ownership`、`test_paper_slot_service` |
 | `paper_signals` | 信号状态对账 | `signal_service::reconcile_signal_status` | paper_trading 对账循环 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_ownership`、`test_signal_order_reconcile_write` |
 | `paper_signals` | 重试接管：信号回到复试管道 | `signal_service::reopen_for_retry` | execution_dispatch 重试接管判定 | `signal_service` | 调用方同一连接与原事务 | 待补 |
-| `paper_signals` | 等待池重复记录退役（信号） | `signal_service::retire_waitlist_signals` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_waitlist_dedupe_write` |
+| `paper_signals` | 等待池重复记录退役（信号） | `signal_service::retire_waitlist_signals` | paper_trading 启动恢复 | `signal_service` | 启动恢复/初始化连接 | `test_ledger_owner_plan`、`test_waitlist_dedupe_write` |
 | `paper_signals` | 派发终止：信号写终态（rejected/expired 白名单） | `signal_service::terminate_for_dispatch` | execution_dispatch 派发阶段 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 信号 payload 标记写入 | `signal_service::write_payload` | execution_dispatch 批次/核验标记 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 
@@ -435,11 +436,11 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_signals` | 成交完成：信号转 filled | `signal_service::mark_filled` | commit_fill 成交结果 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | Q3 影子观察：信号转 shadow_q3 | `signal_service::mark_shadow` | paper_trading 入场决策 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 成交/执行结果回写信号状态与原因（状态白名单） | `signal_service::record_signal_outcome` | commit_fill 成交结果 | `signal_service` | commit_fill 的 SAVEPOINT 内，调用方提交/回滚 | `test_dependency_contract` |
-| `paper_signals` | 订单意图收紧：信号转 rejected | `signal_service::reject_signal` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | `test_execution_profiles` |
+| `paper_signals` | 订单意图收紧：信号转 rejected | `signal_service::reject_signal` | paper_trading 意图规则 | `signal_service` | 调用方同一连接与原事务 | `test_execution_profiles`、`test_waitlist_dedupe_write` |
 | `paper_signals` | 成交失败回到 pending | `signal_service::reopen_pending` | commit_fill 失败结果 | `signal_service` | 调用方同一连接与原事务 | `test_dependency_contract` |
 | `paper_signals` | 当日引导：替代 blocked/可复评拒绝信号 | `signal_service::supersede_blocked_for_day` | paper_trading 引导规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 | `paper_signals` | 当日引导：90 分钟未成交的 pending 信号替代 | `signal_service::supersede_pending_for_day` | paper_trading 引导规则 | `signal_service` | 调用方同一连接与原事务 | 待补 |
-| `paper_signals` | 按身份集合把信号转 superseded（固定后缀） | `signal_service::supersede_signals` | paper_trading 实时复核替代 | `signal_service` | 调用方同一连接与原事务 | 待补 |
+| `paper_signals` | 按身份集合把信号转 superseded（固定后缀） | `signal_service::supersede_signals` | paper_trading 实时复核替代 | `signal_service` | 调用方同一连接与原事务 | `test_signal_supersede_set` |
 | `paper_signals` | 执行反馈：状态/原因/payload 回写信号 | `signal_service::update_signal_feedback` | paper_trading 执行循环 | `signal_service` | 调用方同一连接与原事务 | 待补 |
 
 ### 工作包 C
@@ -479,6 +480,7 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_cycles` | 周期资金配置（capital） | `paper_trading::configure_capital` | 配置入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_strategy_roster` |
 | `paper_cycles` | 周期创建（INSERT） | `paper_trading::create_cycle` | 周期创建入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_deferred_fill_cycle_binding`、`test_demo_seed`、`test_order_intent_contract` |
 | `paper_cycles` | 周期启停状态/started_at | `paper_trading::set_accounts_status` | 启停入口校验 | `paper_cycle_service` | 调用方同一连接与原事务 | `test_cycle_ledger_ownership`、`test_paper_cycle_ownership`、`test_resume_three_strategy_cycle` |
+
 <!-- ledger-owner-plan:end -->
 
 ### 16.5 工作包 A 进展
@@ -553,3 +555,6 @@ B/C/D 搬走写入后必须收回。
 ### A 独立交付预算修复（2026-11-02）
 
 恢复集合子查询使信号 owner 新增订单引用，A 单独交付的 paper_table_fanout_max 曾达 52（上限 51）。账户指标原有的非 filled 委托计数改为调用订单 owner 的窄只读接口 nonfilled_order_count；原 SELECT、状态过滤、缓存分支与事务边界不变，避免另一模块直接绑定表结构。实际模块引用降回 51，没有提高预算、改变域分类或新增跨域边。
+### B 包复审修复（2026-11-02）
+
+supersede_signals 恢复同账户/标的旧订单集合子查询，保留先信号后订单顺序。80 条重复订单在 32 参数上限下通过，ABORT 不留下部分信号更新。三处改写守卫均有拒绝违例的负向测试；相关行为回归通过。

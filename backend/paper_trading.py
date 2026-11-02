@@ -9196,16 +9196,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # previous statement retired old deferred/waitlist orders but left their
     # signal rows pending, so the UI and the recheck worker could resurrect a
     # signal whose only order had already been superseded.
-    replaced_ids = [
-        int(row[0]) for row in conn.execute(
-            """SELECT signal_id FROM paper_orders
-               WHERE account_id=? AND code=? AND side='buy'
-                 AND status IN (?,?) AND id<>? AND signal_id IS NOT NULL""",
-            (account["id"], code, ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity",
-             order_id),
-        )
-    ]
-    SIG.supersede_signals(conn, replaced_ids, statuses=ENTRY_RETRY_SIGNAL_STATUSES,
+    SIG.supersede_signals(conn, account_id=account["id"], code=code,
+                          order_statuses=(ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity"),
+                          keep_order_id=order_id, statuses=ENTRY_RETRY_SIGNAL_STATUSES,
                           suffix="已由最新实时复核委托替代")
     POL.supersede_older_intents(
         conn, account_id=account["id"], code=code,

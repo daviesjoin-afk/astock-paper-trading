@@ -28,8 +28,7 @@ class InventoryScanTests(unittest.TestCase):
     def test_scan_separates_write_targets_from_subquery_reads(self):
         """写目标只认首表；子查询里的表记为读引用。
 
-        用临时目录里的合成模块验证，不依赖仓库当前是否还有"写 A 读 B"的语句 ——
-        工作包 B 收口后，运行时的跨表子查询已经全部上移到调用方。
+        用临时目录里的合成模块验证，并校验真实等待池子查询。
         """
         import tempfile
         from pathlib import Path as _Path
@@ -45,6 +44,12 @@ class InventoryScanTests(unittest.TestCase):
         entry = entries[0]
         self.assertEqual(["paper_signals"], entry["write_targets"])
         self.assertEqual(["paper_orders"], entry["read_refs"])
+
+        waitlist = next(e for e in INVENTORY["entries"]
+                        if e["module"] == "signal_service"
+                        and e["function"] == "retire_waitlist_signals")
+        self.assertEqual(["paper_signals"], waitlist["write_targets"])
+        self.assertEqual(["paper_orders"], waitlist["read_refs"])
 
         # 仓库现状：每个写条目的写目标与读引用不重叠。
         for entry in INVENTORY["entries"]:

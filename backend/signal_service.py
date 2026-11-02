@@ -653,22 +653,25 @@ def expire_within(conn, signal_id, *, reason, statuses):
     )
 
 
-def supersede_signals(conn, signal_ids, *, statuses, suffix):
-    """按身份集合把信号转 superseded，原因追加调用方给出的固定后缀。"""
-    ids = [int(signal_id) for signal_id in signal_ids]
+def supersede_signals(conn, *, account_id, code, order_statuses, keep_order_id,
+                      statuses, suffix):
+    """按同账户/标的的旧订单集合退役信号，保留单语句失败原子性。"""
     states = tuple(statuses)
-    if not ids:
-        return 0
-    if not states:
+    order_states = tuple(order_statuses)
+    if not states or not order_states:
         raise ValueError("supersede_signals 需要非空状态集合")
-    id_marks = ",".join("?" for _ in ids)
+    order_marks = ",".join("?" for _ in order_states)
     state_marks = ",".join("?" for _ in states)
     return conn.execute(
         f"""UPDATE paper_signals
               SET status='superseded',
                   reason=COALESCE(reason,'') || '；' || ?
-            WHERE id IN ({id_marks}) AND status IN ({state_marks})""",
-        (suffix, *ids, *states),
+            WHERE id IN (
+                SELECT signal_id FROM paper_orders
+                WHERE account_id=? AND code=? AND side='buy'
+                  AND status IN ({order_marks}) AND id<>? AND signal_id IS NOT NULL
+            ) AND status IN ({state_marks})""",
+        (suffix, account_id, code, *order_states, keep_order_id, *states),
     ).rowcount
 
 
