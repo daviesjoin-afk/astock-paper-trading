@@ -186,3 +186,10 @@ value:3221f2d1de8c872f3a36841e97db326a86937b73
 # 文档正文已改用短 SHA，这里只为历史 blob 保留精确值豁免。
 value:623d87fc0c8f7344060775725553b12ce182a988
 value:e622955deb702ae65e101ce260a0e3bea2e0a2f0
+
+# PR-10 冻结基线的那个提交（backend/ledger_frozen_baseline.json 的 ref），
+# 记录于 ledger_frozen_baseline.json / ledger_migration_map.json /
+# ledger_fanout_evidence.json / test_pr10_acceptance_evidence.py / docs/PR10_REVIEW_EVIDENCE.md。
+# A 包分支被 squash 合并（#319 → 165ceef）后该提交不再从任何分支可达，
+# 扫描器的“自身对象 id”豁免随之失效；它是公开的版本证据，不是凭据。
+value:52eb50d390a05f88b451cf31f12bfb1b3df59391
