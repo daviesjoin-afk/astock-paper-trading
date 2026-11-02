@@ -11,15 +11,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import paper_order_ledger as POL
 import paper_schema_migrations as PSM
-
-
-_INSERT_SELL_ORDER_SQL = (
-    "INSERT INTO paper_orders("
-    "account_id,side,code,name,qty,planned_price,status,reason,"
-    "risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id"
-    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-)
 
 
 def _json(value: Any, *, sort_keys=True) -> str:
@@ -28,17 +21,19 @@ def _json(value: Any, *, sort_keys=True) -> str:
 
 def insert_sell_order(conn, position, *, qty, price, status, reason, detail,
                       strategy_stamp, cycle_id, now):
-    """Risk Authority 的卖出委托写入，唯一入口。
+    """Risk Authority 的卖出委托写入，唯一入口（返回新订单 id）。
 
     ``strategy_stamp`` 是 ``(strategy_id, strategy_version, strategy_checksum)``；
     ``now`` 是调用方给出的写入时间戳（不读时钟）。
     """
-    return conn.execute(
-        _INSERT_SELL_ORDER_SQL,
-        (position["account_id"], "sell", position["code"], position.get("name"),
-         qty, price or None, status, reason, _json(detail), now,
-         *strategy_stamp, cycle_id),
-    )
+    return POL.insert_order(conn, fields={
+        "account_id": position["account_id"], "side": "sell", "code": position["code"],
+        "name": position.get("name"), "qty": qty, "planned_price": price or None,
+        "status": status, "reason": reason, "risk_payload": _json(detail),
+        "created_at": now, "strategy_id": strategy_stamp[0],
+        "strategy_version": strategy_stamp[1], "strategy_checksum": strategy_stamp[2],
+        "cycle_id": cycle_id,
+    })
 
 
 def require_decision_authority(*, order_id, authority):

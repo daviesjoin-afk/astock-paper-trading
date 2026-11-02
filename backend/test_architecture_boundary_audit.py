@@ -155,7 +155,11 @@ class CouplingBudgetTests(unittest.TestCase):
         # docs/COUPLING_BUDGET.md「2026-10-31 PR-6」。
         # PR-8: manual_orders → paper_sizing replaces the injected private
         # _price_aware_qty capability; one explicit owner edge, no reverse edge.
-        "cross_domain_edges": 12,
+        # 2026-11-01（PR-10 工作包 B：核验与成交结果写入归 owner）：
+        # `execution_verification → paper_order_ledger`（execution → paper）是一条
+        # 真实的新依赖 —— 核验结论此前由该模块自己 UPDATE，现在必须经过订单 owner。
+        # 12 → 13，登记见 docs/COUPLING_BUDGET.md「2026-11-01 PR-10 B」。
+        "cross_domain_edges": 13,
         "max_file_lines": 11,
         "max_function_lines": 0,
         "max_function_globals": 0,

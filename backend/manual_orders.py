@@ -92,6 +92,13 @@ class ManualOrderDependencies:
     with_decision_snapshot: Any
     init_db: Any
     cancel_order: Any
+    insert_order: Any
+    write_signal_payload: Any
+    defer_signal: Any
+    reopen_pending: Any
+    mark_signal_filled: Any
+    record_signal_outcome: Any
+    update_order_outcome: Any
 
 
 _dependencies_factory: Callable[[], ManualOrderDependencies] | None = None
@@ -582,6 +589,7 @@ def _execute_manual_plan(conn, account, plan, order_id, asof_day):
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
     _require_active_lease = deps.require_active_lease
+    _update_order_outcome = deps.update_order_outcome
     _entry_freeze_enabled = deps.entry_freeze_enabled
     _entry_frozen_reason = deps.entry_frozen_reason
     import execution_planner as EP
@@ -625,6 +633,13 @@ def _commit_strategy_buy(
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
     _require_active_lease = deps.require_active_lease
     _finish_capital_reservation = deps.finish_capital_reservation
+    _insert_order = deps.insert_order
+    _update_order_outcome = deps.update_order_outcome
+    _write_signal_payload = deps.write_signal_payload
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
+    _mark_signal_filled = deps.mark_signal_filled
+    _record_signal_outcome = deps.record_signal_outcome
     _lease_lost = deps.lease_lost
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -639,21 +654,19 @@ def _commit_strategy_buy(
     strategy_stamp = _strategy_stamp(conn, account_id)
     provenance = ((plan.get("risk") or {}).get("allocation_provenance")
                   or (detail or {}).get("allocation_provenance") or {})
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(
-           account_id,side,code,name,qty,planned_price,status,reason,
-           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id,
-           allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
-           allocation_plan_fingerprint,allocation_policy_version)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (account_id, "buy", code, plan.get("name"), qty,
-         _num(plan.get("planned_price"), fill_price), "pending_execution",
-         reason, _json(detail), _now(), *strategy_stamp, _order_cycle_id(conn),
-         provenance.get("intent_kind"), provenance.get("portfolio_snapshot_id"),
-         provenance.get("allocation_plan_id"), provenance.get("allocation_plan_fingerprint"),
-         provenance.get("allocation_policy_version")),
-    )
-    order_id = int(cursor.lastrowid)
+    order_id = _insert_order(conn, fields={
+        "account_id": account_id, "side": "buy", "code": code, "name": plan.get("name"),
+        "qty": qty, "planned_price": _num(plan.get("planned_price"), fill_price),
+        "status": "pending_execution", "reason": reason, "risk_payload": _json(detail),
+        "created_at": _now(), "strategy_id": strategy_stamp[0],
+        "strategy_version": strategy_stamp[1], "strategy_checksum": strategy_stamp[2],
+        "cycle_id": _order_cycle_id(conn),
+        "allocation_intent_kind": provenance.get("intent_kind"),
+        "portfolio_snapshot_id": provenance.get("portfolio_snapshot_id"),
+        "allocation_plan_id": provenance.get("allocation_plan_id"),
+        "allocation_plan_fingerprint": provenance.get("allocation_plan_fingerprint"),
+        "allocation_policy_version": provenance.get("allocation_policy_version"),
+    })
     savepoint = f"strategy_buy_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
@@ -680,10 +693,8 @@ def _commit_strategy_buy(
             raise
         _finish_capital_reservation(conn, order_id, "released")
         failure = f"{action}未成交：{exc}"
-        conn.execute(
-            "UPDATE paper_orders SET status=?,reason=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-            (STRATEGY_EXECUTION_RETRY_STATUS, failure, order_id),
-        )
+        _update_order_outcome(conn, order_id, status=STRATEGY_EXECUTION_RETRY_STATUS,
+                              reason=failure, clear_fill=True)
         _risk_log(conn, account_id, code, "buy", STRATEGY_EXECUTION_RETRY_STATUS, failure, detail)
         return None, failure
     _require_active_lease(conn, "strategy auxiliary audit")
@@ -708,6 +719,9 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
     """
     # Resolve the declared capabilities at call time.
     deps = _dependencies()
+    _update_order_outcome = deps.update_order_outcome
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
     STRATEGY_EXECUTION_RETRY_STATUS = deps.STRATEGY_EXECUTION_RETRY_STATUS
     _finish_capital_reservation = deps.finish_capital_reservation
     _risk_log = deps.risk_log
@@ -722,15 +736,9 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
             f"reserved_cycle={exc.reserved_cycle_id} order_cycle={exc.order_cycle_id}；"
             "该委托已终态化，候选可由新委托重试"
         )
-        conn.execute(
-            "UPDATE paper_orders SET status='risk_rejected',reason=?,filled_price=NULL,"
-            "amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-            (conflict, order_id),
-        )
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-            (conflict, signal["id"]),
-        )
+        _update_order_outcome(conn, order_id, status="risk_rejected", reason=conflict,
+                              clear_fill=True)
+        _defer_signal(conn, int(signal["id"]), reason=conflict)
         _risk_log(conn, account["id"], code, "buy", "risk_rejected", conflict, risk)
         return {
             "filled": False, "deferred": True, "status": "risk_rejected",
@@ -738,15 +746,9 @@ def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, c
         }
     _finish_capital_reservation(conn, order_id, "released")
     failure = f"策略买入执行失败，可重试：{type(exc).__name__}: {exc}"
-    conn.execute(
-        "UPDATE paper_orders SET status=?,reason=?,filled_price=NULL,amount=NULL,"
-        "fees=NULL,executed_at=NULL WHERE id=?",
-        (STRATEGY_EXECUTION_RETRY_STATUS, failure, order_id),
-    )
-    conn.execute(
-        "UPDATE paper_signals SET status='pending',reason=? WHERE id=?",
-        (failure, signal["id"]),
-    )
+    _update_order_outcome(conn, order_id, status=STRATEGY_EXECUTION_RETRY_STATUS,
+                          reason=failure, clear_fill=True)
+    _reopen_pending(conn, int(signal["id"]), reason=failure)
     _risk_log(conn, account["id"], code, "buy", STRATEGY_EXECUTION_RETRY_STATUS,
               failure, risk)
     return {
@@ -771,6 +773,11 @@ def commit_strategy_entry_fill(
     deps = _dependencies()
     _require_active_lease = deps.require_active_lease
     _lease_lost = deps.lease_lost
+    _write_signal_payload = deps.write_signal_payload
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
+    _mark_signal_filled = deps.mark_signal_filled
+    _record_signal_outcome = deps.record_signal_outcome
     import execution_planner as EP
     savepoint = f"strategy_fill_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
@@ -810,10 +817,8 @@ def commit_strategy_entry_fill(
             remaining_qty = int(committed[2] or 0) if committed else int(plan["qty"])
             reason_codes = str(committed[3] or "execution_not_filled") if committed else "execution_state_unavailable"
             signal_status = "partially_filled" if filled_qty > 0 else "pending"
-            conn.execute(
-                "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-                (signal_status, reason_codes, signal["id"]),
-            )
+            _record_signal_outcome(conn, int(signal["id"]), status=signal_status,
+                                   reason=reason_codes)
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             return {
                 "filled": filled_qty > 0,
@@ -831,25 +836,22 @@ def commit_strategy_entry_fill(
             slice_plan = [int(item) for item in (slice_state.get("plan") or [])]
             slices_filled = max(0, int(slice_state.get("filled") or 0)) + 1
             slice_done = slices_filled >= len(slice_plan)
-            conn.execute(
-                "UPDATE paper_signals SET payload=? WHERE id=?",
-                (_json({**payload, "entry_slices": {**slice_state, "filled": slices_filled}}),
-                 signal["id"]),
+            _write_signal_payload(
+                conn, int(signal["id"]),
+                payload=_json({**payload,
+                               "entry_slices": {**slice_state, "filled": slices_filled}}),
             )
             # §47：分批建仓的切片语义绝不能变。中间片成交后信号必须留在
             # 复试管道（deferred_capacity），只有最后一片才标 filled ——
             # 否则剩余片会被永久丢失。
             if not slice_done:
-                conn.execute(
-                    "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-                    (f"分批建仓第 {slices_filled}/{len(slice_plan)} 片已成交；"
-                     "剩余片由后续扫描重新取价并重跑全部风控", signal["id"]),
+                _defer_signal(
+                    conn, int(signal["id"]),
+                    reason=(f"分批建仓第 {slices_filled}/{len(slice_plan)} 片已成交；"
+                            "剩余片由后续扫描重新取价并重跑全部风控"),
                 )
         if slice_done:
-            conn.execute(
-                "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
-                (reason, signal["id"]),
-            )
+            _mark_signal_filled(conn, int(signal["id"]), reason=reason)
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         return None
     except Exception as exc:
@@ -874,6 +876,13 @@ def submit_manual_order(
     _db = deps.db
     _entry_frozen_reason = deps.entry_frozen_reason
     _finish_capital_reservation = deps.finish_capital_reservation
+    _insert_order = deps.insert_order
+    _update_order_outcome = deps.update_order_outcome
+    _write_signal_payload = deps.write_signal_payload
+    _defer_signal = deps.defer_signal
+    _reopen_pending = deps.reopen_pending
+    _mark_signal_filled = deps.mark_signal_filled
+    _record_signal_outcome = deps.record_signal_outcome
     _market_state = deps.market_state
     _now = deps.now
     _order_cycle_id = deps.order_cycle_id
@@ -921,28 +930,25 @@ def submit_manual_order(
         intent_kind = provenance.get("intent_kind") or (
             "MANUAL_EXIT" if str(side).lower() == "sell" else
             "NEW_ENTRY" if str(side).lower() == "buy" else None)
-        cursor = conn.execute(
-            """INSERT INTO paper_orders(
-               account_id,side,code,name,qty,planned_price,status,reason,risk_payload,
-               order_type,origin,expires_at,created_at,
-               strategy_id,strategy_version,strategy_checksum,cycle_id,
-               allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
-               allocation_plan_fingerprint,allocation_policy_version)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                account_id, side, code, plan.get("name"), int(plan.get("qty") or 0),
-                _num(limit_price) if order_type == "limit" else _num(plan.get("quote_price")),
-                status, reason, _json(plan.get("risk") or {}), order_type, "manual",
-                day.isoformat() if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
-                and order_type == "limit" else None, _now(),
-                *strategy_stamp, order_cycle_id, intent_kind,
-                provenance.get("portfolio_snapshot_id"),
-                provenance.get("allocation_plan_id"),
-                provenance.get("allocation_plan_fingerprint"),
-                provenance.get("allocation_policy_version"),
-            ),
-        )
-        order_id = cursor.lastrowid
+        order_id = _insert_order(conn, fields={
+            "account_id": account_id, "side": side, "code": code, "name": plan.get("name"),
+            "qty": int(plan.get("qty") or 0),
+            "planned_price": (_num(limit_price) if order_type == "limit"
+                              else _num(plan.get("quote_price"))),
+            "status": status, "reason": reason,
+            "risk_payload": _json(plan.get("risk") or {}),
+            "order_type": order_type, "origin": "manual",
+            "expires_at": (day.isoformat()
+                           if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
+                           and order_type == "limit" else None),
+            "created_at": _now(), "strategy_id": strategy_stamp[0],
+            "strategy_version": strategy_stamp[1], "strategy_checksum": strategy_stamp[2],
+            "cycle_id": order_cycle_id, "allocation_intent_kind": intent_kind,
+            "portfolio_snapshot_id": provenance.get("portfolio_snapshot_id"),
+            "allocation_plan_id": provenance.get("allocation_plan_id"),
+            "allocation_plan_fingerprint": provenance.get("allocation_plan_fingerprint"),
+            "allocation_policy_version": provenance.get("allocation_policy_version"),
+        })
         if status in {"ready_to_fill", "pending_limit"} and account \
                 and plan.get("allowed") and side == "buy":
             # Limit orders reserve at their limit price (plus commission),
@@ -977,10 +983,7 @@ def submit_manual_order(
             if not reserved:
                 status = "risk_rejected"
                 reason = reserve_reason or "共享资金池预占失败"
-                conn.execute(
-                    "UPDATE paper_orders SET status=?,reason=? WHERE id=?",
-                    (status, reason, order_id),
-                )
+                _update_order_outcome(conn, order_id, status=status, reason=reason)
                 _risk_log(conn, account_id, code, side, "manual_rejected", reason, plan)
         if status == "ready_to_fill" and account:
             savepoint = f"manual_fill_{int(order_id)}"
@@ -999,9 +1002,11 @@ def submit_manual_order(
                 _finish_capital_reservation(conn, order_id, "released")
                 status = MANUAL_EXECUTION_RETRY_STATUS
                 reason = f"手动模拟委托执行失败，可重试：{type(exc).__name__}: {exc}"
-                conn.execute(
-                    "UPDATE paper_orders SET status=?,reason=?,risk_payload=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
-                    (status, reason, _json({**(plan.get("risk") or {}), "execution_error": str(exc), "retryable": True}), order_id),
+                _update_order_outcome(
+                    conn, order_id, status=status, reason=reason,
+                    risk_payload=_json({**(plan.get("risk") or {}),
+                                        "execution_error": str(exc), "retryable": True}),
+                    clear_fill=True,
                 )
                 _risk_log(conn, account_id, code, side, status, reason, {"order_id": order_id, "error": str(exc)})
         elif status == "pending_limit" and account and plan.get("allowed"):
@@ -1177,6 +1182,7 @@ def process_pending_manual_orders(asof_date=None):
     _entry_freeze_enabled = deps.entry_freeze_enabled
     _entry_frozen_reason = deps.entry_frozen_reason
     _finish_capital_reservation = deps.finish_capital_reservation
+    _update_order_outcome = deps.update_order_outcome
     _lease_lost = deps.lease_lost
     _market_state = deps.market_state
     _quotes = deps.quotes
@@ -1259,9 +1265,9 @@ def process_pending_manual_orders(asof_date=None):
                     "previous_status": order.get("status"),
                     "reason": reason,
                 }
-                conn.execute(
-                    "UPDATE paper_orders SET status=?,reason=?,risk_payload=? WHERE id=?",
-                    (ENTRY_FROZEN_WAITLIST_STATUS, reason, _json(payload), order["id"]),
+                _update_order_outcome(
+                    conn, order["id"], status=ENTRY_FROZEN_WAITLIST_STATUS,
+                    reason=reason, risk_payload=_json(payload),
                 )
                 _risk_log(
                     conn, order["account_id"], order["code"], "buy",
@@ -1275,10 +1281,8 @@ def process_pending_manual_orders(asof_date=None):
                 })
                 continue
             if order.get("expires_at") and order["expires_at"] < day.isoformat():
-                conn.execute(
-                    "UPDATE paper_orders SET status='expired',reason='限价委托已过有效期' WHERE id=?",
-                    (order["id"],),
-                )
+                _update_order_outcome(conn, order["id"], status="expired",
+                                      reason="限价委托已过有效期")
                 _finish_capital_reservation(conn, order["id"], "released")
                 output.append({"order_id": order["id"], "status": "expired"})
                 continue
@@ -1292,9 +1296,9 @@ def process_pending_manual_orders(asof_date=None):
                 )
             except Exception as exc:
                 reason = f"待成交订单复核失败，可重试：{type(exc).__name__}: {exc}"
-                conn.execute(
-                    "UPDATE paper_orders SET status=?,reason=?,risk_payload=? WHERE id=?",
-                    (MANUAL_EXECUTION_RETRY_STATUS, reason, _json({"execution_error": str(exc), "retryable": True}), order["id"]),
+                _update_order_outcome(
+                    conn, order["id"], status=MANUAL_EXECUTION_RETRY_STATUS, reason=reason,
+                    risk_payload=_json({"execution_error": str(exc), "retryable": True}),
                 )
                 _finish_capital_reservation(conn, order["id"], "released")
                 _risk_log(conn, order["account_id"], order["code"], order["side"], MANUAL_EXECUTION_RETRY_STATUS, reason, {"order_id": order["id"], "error": str(exc)})
@@ -1307,19 +1311,17 @@ def process_pending_manual_orders(asof_date=None):
                 # 或价格解锁；不能释放资金后改用旧报价成交，也不把它伪装成风控
                 # 拒绝。策略、资金和 T+1 等其它门禁失败才会终止委托。
                 if plan.get("triggered") and deferred:
-                    conn.execute(
-                        "UPDATE paper_orders SET reason=?,risk_payload=? WHERE id=?",
-                        (reason, _json(plan["risk"]), order["id"]),
-                    )
+                    _update_order_outcome(conn, order["id"], reason=reason,
+                                          risk_payload=_json(plan["risk"]))
                     output.append({
                         "order_id": order["id"],
                         "status": "pending_execution_guard",
                         "reason": deferred.get("reason") or reason,
                     })
                     continue
-                conn.execute(
-                    "UPDATE paper_orders SET status='risk_rejected',reason=?,risk_payload=? WHERE id=?",
-                    (reason, _json(plan["risk"]), order["id"]),
+                _update_order_outcome(
+                    conn, order["id"], status="risk_rejected", reason=reason,
+                    risk_payload=_json(plan["risk"]),
                 )
                 _finish_capital_reservation(conn, order["id"], "released")
                 output.append({"order_id": order["id"], "status": "risk_rejected", "reason": reason})
@@ -1346,17 +1348,11 @@ def process_pending_manual_orders(asof_date=None):
                     continue
                 if not reserved:
                     reason = reserve_reason or "共享资金池预占失败"
-                    conn.execute(
-                        "UPDATE paper_orders SET status='risk_rejected',reason=?,risk_payload=? WHERE id=?",
-                        (reason, _json(plan["risk"]), order["id"]),
-                    )
+                    _update_order_outcome(conn, order["id"], status="risk_rejected", reason=reason, risk_payload=_json(plan["risk"]))
                     _finish_capital_reservation(conn, order["id"], "released")
                     output.append({"order_id": order["id"], "status": "risk_rejected", "reason": reason})
                     continue
-                conn.execute(
-                    "UPDATE paper_orders SET status='pending_limit',reason=?,risk_payload=? WHERE id=?",
-                    ("限价尚未触发；委托当日有效，触发时重新执行风控", _json(plan["risk"]), order["id"]),
-                )
+                _update_order_outcome(conn, order["id"], status="pending_limit", reason="限价尚未触发；委托当日有效，触发时重新执行风控", risk_payload=_json(plan["risk"]))
                 output.append({"order_id": order["id"], "status": "pending_limit"})
                 continue
             account = dict(conn.execute(
@@ -1385,11 +1381,12 @@ def process_pending_manual_orders(asof_date=None):
                 # another reservation is still active.  Keep it retryable;
                 # turning this into a terminal rejection loses the order even
                 # though a later sell/cancel may release the cash.
-                conn.execute(
-                    "UPDATE paper_orders SET status='pending_limit',reason=?,risk_payload=? WHERE id=?",
-                    (f"触发后等待资金重算：{reason}", _json({**(plan["risk"] or {}), "fill_deferred": {
+                _update_order_outcome(
+                    conn, order["id"], status="pending_limit",
+                    reason=f"触发后等待资金重算：{reason}",
+                    risk_payload=_json({**(plan["risk"] or {}), "fill_deferred": {
                         "reason": reason, "retryable": True,
-                    }}), order["id"]),
+                    }}),
                 )
                 output.append({"order_id": order["id"], "status": "pending_execution_guard", "reason": reason})
                 continue
@@ -1427,11 +1424,11 @@ def process_pending_manual_orders(asof_date=None):
                 # Release the old reservation before retrying.  The next
                 # cycle will resize it against the then-current cash pool.
                 _finish_capital_reservation(conn, order["id"], "released")
-                conn.execute(
-                    "UPDATE paper_orders SET status='pending_limit',reason=?,risk_payload=? WHERE id=?",
-                    (reason, _json({**(plan.get("risk") or {}),
-                                    "execution_error": str(exc),
-                                    "execution_retry": True}), order["id"]),
+                _update_order_outcome(
+                    conn, order["id"], status="pending_limit", reason=reason,
+                    risk_payload=_json({**(plan.get("risk") or {}),
+                                        "execution_error": str(exc),
+                                        "execution_retry": True}),
                 )
                 _risk_log(
                     conn, order["account_id"], order["code"], order["side"],

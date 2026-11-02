@@ -57,6 +57,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import sqlite3
+import paper_order_ledger as POL
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -691,9 +692,7 @@ def stamp_terminal_zero_orders(conn, *, cycle_id: int) -> dict:
         if verdict["execution_status"] == EXECUTION_STATUS_NOT_EXECUTED:
             updates.append((verdict["execution_status"], 0,
                             verdict["execution_evidence_source"], row["id"]))
-    conn.executemany(
-        "UPDATE paper_orders SET execution_status=?,execution_verified=?,"
-        "execution_evidence_source=? WHERE id=?", updates)
+    POL.stamp_execution_rows(conn, updates)
     return {"scanned": len(orders), "confirmed_zero": len(updates)}
 
 
@@ -709,15 +708,11 @@ def stamp_order(conn, order_id: Any) -> dict:
     verdict = verification_for_order(
         row_as_dict(cursor, row), _load_fills_with_identity(conn, order_id)
     )
-    conn.execute(
-        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
-        " execution_evidence_source=? WHERE id=?",
-        (
-            verdict["execution_status"],
-            int(bool(verdict["execution_verified"])),
-            verdict["execution_evidence_source"],
-            order_id,
-        ),
+    POL.stamp_execution(
+        conn, order_id,
+        status=verdict["execution_status"],
+        verified=verdict["execution_verified"],
+        source=verdict["execution_evidence_source"],
     )
     return verdict
 
@@ -765,11 +760,7 @@ def backfill_legacy_orders(conn, *, limit: Any = None) -> dict:
             verdict["execution_evidence_source"],
             row["id"],
         ))
-    conn.executemany(
-        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
-        " execution_evidence_source=? WHERE id=?",
-        updates,
-    )
+    POL.stamp_execution_rows(conn, updates)
     return {"stamped": len(updates), "verified": verified, "scanned": len(orders)}
 
 

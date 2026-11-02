@@ -1,0 +1,10 @@
+"""扫描器自测用的合成模块：写信号表、在子查询里读订单表。"""
+
+
+def reconcile(conn):
+    conn.execute(
+        """UPDATE paper_signals SET status=?
+           WHERE id IN (SELECT signal_id FROM paper_orders WHERE id>?)
+             AND status IN (?,?,?)""",
+        ("x", 1, "a", "b", "c"),
+    )

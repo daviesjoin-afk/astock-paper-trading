@@ -23,6 +23,7 @@ import unittest
 
 import execution_evidence as EE
 import execution_verification as EV
+import paper_order_ledger as POL
 import paper_schema_migrations as PSM
 
 SESSION = "2024-06-18"
@@ -745,6 +746,9 @@ class CommitFillStampsTest(unittest.TestCase):
 
         stub = types.SimpleNamespace(
             require_active_lease=lambda conn, label: None,
+            record_execution_block=POL.record_execution_block,
+            record_fill_result=POL.record_fill_result,
+            accumulate_realized_pnl=POL.accumulate_realized_pnl,
             reserve_shared_capital=lambda *a, **k: (True, None),
             debit_shared_cash=lambda *a, **k: None,
             finish_capital_reservation=lambda *a, **k: None,

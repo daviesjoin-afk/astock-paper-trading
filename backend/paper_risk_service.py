@@ -676,7 +676,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     kline=ports.evidence.load_kline(position["code"], day, inclusive=False),
                 )
                 strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
-                cursor = PRW.insert_sell_order(
+                sell_order_id = PRW.insert_sell_order(
                     conn, position, qty=planned_qty, price=price, status=status,
                     reason=order_reason, detail=detail, strategy_stamp=strategy_stamp,
                     cycle_id=cycle_id, now=_now(),
@@ -686,7 +686,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 # write time (never re-derived afterwards).
                 _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled",
                           order_reason, detail, authority="RISK", decision_kind="unfilled",
-                          order_id=int(cursor.lastrowid))
+                          order_id=sell_order_id)
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
                 continue
             qty = planned_qty
@@ -707,12 +707,12 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 ports.require_active_lease(conn, "risk sell order")
                 sell_cycle_id = cycle_id
                 strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
-                cursor = PRW.insert_sell_order(
+                sell_order_id = PRW.insert_sell_order(
                     conn, position, qty=qty, price=price, status="pending_execution",
                     reason=reason, detail=detail, strategy_stamp=strategy_stamp,
                     cycle_id=sell_cycle_id, now=_now(),
                 )
-                order_id = int(cursor.lastrowid)
+                order_id = sell_order_id
                 # R32-E1：这条卖出委托由 Risk Authority 的退出决策产生，因此在写入
                 # 当刻把**当时实际消费的那份 owner 结论**绑定到该订单（不是事后重跑
                 # 风控，也不是由 execution 结果冒充）。

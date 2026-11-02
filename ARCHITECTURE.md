@@ -4633,3 +4633,14 @@ owner 契约：不算成交（`commit_fill` 仍唯一）、不读时钟、不 co
 
 工作包 A 的 19 条操作全部迁移完成：订单与信号的非成交生命周期写入都经 owner，
 调用方不再自行拼状态 UPDATE。两张表仍为 `pending` —— B、D 还有剩余写入。
+
+## PR-10 工作包 B 收口（2026-11-01）
+
+创建、成交结果、核验戳与信号执行反馈全部经 owner 写入：`paper_order_ledger` 承担订单行
+（创建 insert_order、状态推进 update_order_outcome、成交结果 record_fill_result、
+核验 stamp_execution(_rows)、盈亏与载荷回填），`signal_service` 承担信号行
+（反馈、等待、过期、替代、影子观察、成交结果）。`commit_fill` 仍是唯一成交权威，
+价格/费用/可卖量与 SAVEPOINT 边界未动。
+
+`paper_orders` 只剩 `paper_trading` / `manual_orders` 的归档与周期切换写入（D 包）；
+`paper_signals` 只剩 `paper_trading` 的归档清理（D 包）。B 的 24 条操作全部迁移完毕。

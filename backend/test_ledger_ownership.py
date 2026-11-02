@@ -309,8 +309,11 @@ class ReconcileWriteOperationTests(unittest.TestCase):
             "SELECT status FROM paper_orders WHERE id=2").fetchone()[0])
 
     def test_write_sets_keep_pending_and_unchanged_membership(self):
-        self.assertEqual(6, len(real_write_modules("paper_orders")))
-        self.assertEqual(3, len(real_write_modules("paper_signals")))
+        # 工作包 A/B 之后：成交、核验与风控的订单写都已归 owner，只剩
+        # paper_trading / manual_orders 两个调用方还没搬完。
+        self.assertEqual(3, len(real_write_modules("paper_orders")))
+        # 信号写方：paper_trading（仅 D 包归档清理）与 signal_service。
+        self.assertEqual(2, len(real_write_modules("paper_signals")))
         for table in ("paper_orders", "paper_signals"):
             self.assertEqual("pending", OWNERSHIP[table]["status"])
         self.assertIn("paper_order_ledger", OWNERSHIP["paper_orders"]["writers"])

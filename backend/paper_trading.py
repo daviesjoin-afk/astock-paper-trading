@@ -1243,18 +1243,18 @@ def _record_entry_frozen_waitlist(
     strategy_id, strategy_version, strategy_checksum = resolve_strategy_stamp(
         conn, account_id, signal_id, cycle_id=order_cycle_id(conn, cycle_id),
     )
-    order_id = POL.insert_order(
-        conn,
-        account_id=account_id, signal_id=signal_id, side="buy", code=code, name=name,
-        qty=max(0, int(_num(qty))), planned_price=_num(planned_price, None),
-        status=ENTRY_FROZEN_WAITLIST_STATUS, reason=reason, risk_payload=_json(payload),
-        origin="strategy", created_at=_now(),
-        strategy_id=strategy_id, strategy_version=strategy_version,
-        strategy_checksum=strategy_checksum,
-        retry_of_order_id=_previous_attempt_order_id(
+    order_id = POL.insert_order(conn, fields={
+        "account_id": account_id, "signal_id": signal_id, "side": "buy", "code": code,
+        "name": name, "qty": max(0, int(_num(qty))),
+        "planned_price": _num(planned_price, None),
+        "status": ENTRY_FROZEN_WAITLIST_STATUS, "reason": reason,
+        "risk_payload": _json(payload), "origin": "strategy", "created_at": _now(),
+        "strategy_id": strategy_id, "strategy_version": strategy_version,
+        "strategy_checksum": strategy_checksum,
+        "retry_of_order_id": _previous_attempt_order_id(
             conn, signal_id, order_cycle_id(conn, cycle_id)),
-        cycle_id=order_cycle_id(conn, cycle_id),
-    )
+        "cycle_id": order_cycle_id(conn, cycle_id),
+    })
     _risk_log(conn, account_id, code, "buy", ENTRY_FROZEN_WAITLIST_STATUS, reason, payload)
     audit(conn, account_id, ENTRY_FROZEN_WAITLIST_STATUS, f"{source}: {code} order={order_id}")
     return order_id, True, reason, payload
@@ -1421,10 +1421,7 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
         reason = f"OrderIntent 契约拒绝：{type(exc).__name__}: {exc}"
         if signal_id is not None:
             try:
-                conn.execute(
-                    "UPDATE paper_signals SET status='rejected', reason=? WHERE id=?",
-                    (reason, signal_id),
-                )
+                SIG.reject_signal(conn, int(signal_id), reason=reason)
             except sqlite3.Error:
                 pass
         _risk_log(conn, account_id, code, "buy", "order_intent_rejected", reason, {
@@ -1491,7 +1488,7 @@ def _rebuild_realized_pnl(conn):
         # 只有完整匹配到历史买入的成交才重写；异常旧数据保留原账面值供审计。
         if remaining == 0:
             realized = _num(order.get("amount")) - _num(order.get("fees")) - cost_amount
-            conn.execute("UPDATE paper_orders SET realized_pnl=? WHERE id=?", (realized, order["id"]))
+            POL.record_realized_pnl(conn, order["id"], realized=realized)
 
 HOT_PATH_SLOTS = PSch.HOT_PATH_SLOTS
 
@@ -8238,13 +8235,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             cycle_id=current_cycle["id"],
         )
         if str(signal.get("status") or "") in ENTRY_RETRY_SIGNAL_STATUSES:
-            conn.execute(
-                "UPDATE paper_signals SET status=?,reason=?,payload=? WHERE id=?",
-                (
-                    ENTRY_FROZEN_WAITLIST_STATUS, freeze_reason,
-                    _json({**payload, "entry_freeze": freeze_payload.get("entry_freeze")}),
-                    signal["id"],
-                ),
+            SIG.update_signal_feedback(
+                conn, int(signal["id"]), status=ENTRY_FROZEN_WAITLIST_STATUS,
+                reason=freeze_reason,
+                payload=_json({**payload, "entry_freeze": freeze_payload.get("entry_freeze")}),
             )
         if not _created:
             _risk_log(
@@ -8271,10 +8265,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     freshness = ELC.signal_freshness(signal, asof_day=asof_day)
     if not freshness["usable"]:
         stale_reason = freshness["reason"]
-        conn.execute(
-            "UPDATE paper_signals SET status='expired',reason=? WHERE id=? AND status IN (?,?,?)",
-            (stale_reason, signal["id"], *ELC.RETRY_SIGNAL_STATUSES),
-        )
+        SIG.expire_within(conn, int(signal["id"]), reason=stale_reason,
+                          statuses=ELC.RETRY_SIGNAL_STATUSES)
         _risk_log(conn, account["id"], code, "buy", "signal_expired", stale_reason, {
             "signal_id": signal.get("id"), "age_minutes": freshness["age_minutes"],
             "ttl_minutes": freshness["ttl_minutes"],
@@ -8311,10 +8303,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             PRuntime.PortfolioRuntimeError,
             PAW.AllocationWeightEvidenceUnavailable) as exc:
         allocation_reason = f"精确组合分配证据不可用：{exc}；本次新增资源已延期"
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-            (allocation_reason, signal["id"]),
-        )
+        SIG.defer_for_capacity(conn, int(signal["id"]), reason=allocation_reason)
         _risk_log(conn, account["id"], code, "buy",
                   "portfolio_allocation_unavailable", allocation_reason,
                   {"intent_kind": allocation_intent_kind,
@@ -8327,10 +8316,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         if not allocation_reason:
             allocation_reason = (
                 "精确 allocation plan 未批准当前资源意图；本次新增资源已延期")
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-            (allocation_reason, signal["id"]),
-        )
+        SIG.defer_for_capacity(conn, int(signal["id"]), reason=allocation_reason)
         _risk_log(conn, account["id"], code, "buy",
                   "portfolio_allocation_deferred", allocation_reason,
                   {"intent_kind": allocation_intent_kind,
@@ -9165,10 +9151,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         hold_reason = dispatch_plan["reason"] or "委托已在执行队列中等待放行"
         _risk_log(conn, account["id"], code, "buy", f"execution_gate_{dispatch_gate}",
                   hold_reason, risk)
-        conn.execute(
-            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=? AND status<>?",
-            (hold_reason, signal["id"], "deferred_capacity"),
-        )
+        SIG.defer_for_capacity(conn, int(signal["id"]), reason=hold_reason,
+                               unless_status="deferred_capacity")
         return {
             "filled": False, "deferred": True, "execution_gate": dispatch_gate,
             "status": str(dispatch_duplicate.get("status") or dispatch_plan["status"]),
@@ -9186,25 +9170,24 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     retry_of_order_id = _previous_attempt_order_id(
         conn, signal.get("id"), order_cycle_id(conn, current_cycle["id"]),
     )
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(
-           account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
-           fees,status,reason,risk_payload,created_at,executed_at,expires_at,
-           strategy_id,strategy_version,strategy_checksum,retry_of_order_id,cycle_id,
-           allocation_intent_kind,portfolio_snapshot_id,allocation_plan_id,
-           allocation_plan_fingerprint,allocation_policy_version)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
-         entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
-         entry_limit["order_type"],
-         None,
-         None, None, order_status, reason,
-         _json(risk), _now(), None, dispatch_plan["expires_at"],
-         strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
-          order_cycle_id(conn, current_cycle["id"]), allocation_intent_kind,
-          exact_plan["portfolio_snapshot_id"], exact_plan["plan_id"],
-          exact_plan["plan_fingerprint"], exact_plan["allocation_policy_version"]),
-    )
+    order_id = POL.insert_order(conn, fields={
+        "account_id": account["id"], "signal_id": signal["id"], "side": "buy", "code": code,
+        "name": signal.get("name"), "qty": qty,
+        "planned_price": (entry_limit["limit_price"]
+                          if entry_limit["limit_price"] is not None else price),
+        "order_type": entry_limit["order_type"],
+        "filled_price": None, "amount": None, "fees": None,
+        "status": order_status, "reason": reason, "risk_payload": _json(risk),
+        "created_at": _now(), "executed_at": None, "expires_at": dispatch_plan["expires_at"],
+        "strategy_id": strategy_id, "strategy_version": strategy_version,
+        "strategy_checksum": strategy_checksum, "retry_of_order_id": retry_of_order_id,
+        "cycle_id": order_cycle_id(conn, current_cycle["id"]),
+        "allocation_intent_kind": allocation_intent_kind,
+        "portfolio_snapshot_id": exact_plan["portfolio_snapshot_id"],
+        "allocation_plan_id": exact_plan["plan_id"],
+        "allocation_plan_fingerprint": exact_plan["plan_fingerprint"],
+        "allocation_policy_version": exact_plan["allocation_policy_version"],
+    })
     # A frozen order is a waitlist marker, not a second live order.  Once the
     # data gate reopens and this candidate receives a fresh decision, retire
     # its old marker so the terminal cannot keep showing "待执行" after the
@@ -9213,31 +9196,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # previous statement retired old deferred/waitlist orders but left their
     # signal rows pending, so the UI and the recheck worker could resurrect a
     # signal whose only order had already been superseded.
-    conn.execute(
-        """UPDATE paper_signals
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；已由最新实时复核委托替代'
-           WHERE id IN (
-               SELECT signal_id FROM paper_orders
-               WHERE account_id=? AND code=? AND side='buy'
-                 AND status IN (?,?) AND id<>? AND signal_id IS NOT NULL
-           )
-             AND status IN (?,?,?)""",
-        (
-            account["id"], code, ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity",
-            int(cursor.lastrowid), *ENTRY_RETRY_SIGNAL_STATUSES,
-        ),
-    )
-    conn.execute(
-        """UPDATE paper_orders
-           SET status='superseded',
-               reason=COALESCE(reason,'') || '；已由最新实时复核委托替代，见 #' || ?
-           WHERE account_id=? AND code=? AND side='buy'
-             AND status IN (?,?) AND id<>?""",
-        (
-            int(cursor.lastrowid), account["id"], code,
-            ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity", int(cursor.lastrowid),
-        ),
+    SIG.supersede_signals(conn, account_id=account["id"], code=code,
+                          order_statuses=(ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity"),
+                          keep_order_id=order_id, statuses=ENTRY_RETRY_SIGNAL_STATUSES,
+                          suffix="已由最新实时复核委托替代")
+    POL.supersede_older_intents(
+        conn, account_id=account["id"], code=code,
+        statuses=(ENTRY_FROZEN_WAITLIST_STATUS, "deferred_capacity"),
+        keep_order_id=order_id,
     )
     if not allowed:
         # §56：闸门未放行的决策在此记录一次 risk 事件。成功路径的 risk log 与
@@ -9258,7 +9224,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         else:
             admission_authority = "ENTRY"
         _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,
-                  order_id=int(cursor.lastrowid), authority=admission_authority,
+                  order_id=order_id, authority=admission_authority,
                   decision_kind=decision_name)
         if risk_state.get("blocked"):
             # 独立的 Risk Authority 结论（共享池熔断/回撤/冷静期）：这正是买入路径
@@ -9267,7 +9233,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             _risk_log(conn, account["id"], code, "buy", "shared_risk_state_blocked",
                       "；".join(str(item) for item in risk_state.get("reasons") or ()),
                       {"account_risk": risk_state},
-                      order_id=int(cursor.lastrowid), authority="RISK",
+                      order_id=order_id, authority="RISK",
                       decision_kind="shared_risk_state_blocked")
         if (risk.get("slot_borrow") or {}).get("allowed"):
             risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
@@ -9275,10 +9241,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             # 挂起单已落库（不预占资金、不占席位）；信号留在复试管道里，
             # 批量窗口开启或人工核验放行后由下一轮扫描继续过闸成交。
             hold_reason = str(dispatch_plan["reason"] or "执行画像挂起，等待放行")
-            conn.execute(
-                "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
-                (hold_reason, signal["id"]),
-            )
+            SIG.defer_for_capacity(conn, int(signal["id"]), reason=hold_reason)
             return {
                 "filled": False, "deferred": True,
                 "execution_gate": dispatch_gate, "status": order_status,
@@ -9286,10 +9249,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 "reason": hold_reason,
             }
         if q3_shadow_ready:
-            conn.execute(
-                "UPDATE paper_signals SET status='shadow_q3', reason=?, payload=? WHERE id=?",
-                (reason, _json({**payload, "q3_shadow": q3_shadow_detail}), signal["id"]),
-            )
+            SIG.mark_shadow(conn, int(signal["id"]), reason=reason,
+                            payload=_json({**payload, "q3_shadow": q3_shadow_detail}))
             audit(conn, account["id"], "q3_shadow_candidate", f"{code}：{reason}")
             return {
                 "filled": False, "shadow": True, "status": "shadow_q3",
@@ -9316,24 +9277,20 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 )
             else:
                 deferred_reason = "金额/成本约束仅影响本次下单规模，候选保留在等待池；资金、席位或预算释放后按最新行情重新复核"
-            conn.execute("UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?", (deferred_reason, signal["id"]))
+            SIG.defer_for_capacity(conn, int(signal["id"]), reason=deferred_reason)
             return {"filled": False, "deferred": True, "reason": deferred_reason}
         if limit_deferred:
             # PR-10：限价未到的候选必须留在复试管道里（deferred_capacity 属于
             # ENTRY_RETRY_SIGNAL_STATUSES），下一执行窗口会重跑全部闸门；绝不能
             # 打成终态 rejected，否则限价即使到达也无法再复核。
             deferred_reason = str(entry_limit["reason"])
-            conn.execute(
-                "UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?",
-                (deferred_reason, signal["id"]),
-            )
+            SIG.defer_for_capacity(conn, int(signal["id"]), reason=deferred_reason)
             return {
                 "filled": False, "deferred": True, "deferred_limit": True,
                 "reason": deferred_reason,
             }
-        conn.execute("UPDATE paper_signals SET status='rejected', reason=? WHERE id=?", (reason, signal["id"]))
+        SIG.reject_signal(conn, int(signal["id"]), reason=reason)
         return {"filled": False, "reason": reason}
-    order_id = int(cursor.lastrowid)
     # ET 是纯内存状态机，无法参与事务回滚；只在成交落库成功之后推进，
     # 否则提交失败会留下一个"已入场"的虚假状态（§48）。
     failure = MO.commit_strategy_entry_fill(
@@ -9478,11 +9435,10 @@ def process_pending_execution_orders(asof_date=None):
                 # 执行失败原因写进 ``execution_reasons``，不覆盖 ``reason``：
                 # 后者是这张委托"为什么下"的策略/风控事实，恢复成交时必须
                 # 原样留着，不能被一次执行插曲替换掉。
-                conn.execute(
-                    """UPDATE paper_orders
-                          SET status=?,execution_reasons=? WHERE id=? AND execution_version=?""",
-                    (retry_status, _json([reason]), order_id,
-                     int(order.get("execution_version") or 0)),
+                POL.advance_execution_state(
+                    conn, order_id, status=retry_status,
+                    execution_reasons=_json([reason]),
+                    expected_version=int(order.get("execution_version") or 0),
                 )
                 _risk_log(
                     conn, order["account_id"], order["code"], order["side"],
@@ -9499,10 +9455,10 @@ def process_pending_execution_orders(asof_date=None):
                     "filled": "filled", "partially_filled": "partially_filled",
                     "pending_execution": "pending",
                 }[str(state[0])]
-                conn.execute(
-                    """UPDATE paper_signals SET status=?,reason=?
-                         WHERE id=? AND status IN ('pending','partially_filled','deferred_capacity')""",
-                    (signal_status, str(state[3] or "执行事件已处理"), order["signal_id"]),
+                SIG.advance_signal_feedback(
+                    conn, int(order["signal_id"]), status=signal_status,
+                    reason=str(state[3] or "执行事件已处理"),
+                    statuses=("pending", "partially_filled", "deferred_capacity"),
                 )
             output.append({
                 "order_id": order_id, "status": str(state[0]),
@@ -9653,7 +9609,7 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
             and str(row["intended_date"] or "")[:10] <= waitlist_cutoff
         ]
         for row in expired:
-            conn.execute("UPDATE paper_signals SET status='expired', reason='错过有效交易日，不追价补单' WHERE id=?", (row["id"],))
+            SIG.expire_signal(conn, int(row["id"]), reason="错过有效交易日，不追价补单")
         due = [
             row for row in pending
             if row.get("status") != "pending" or row["intended_date"] == day.isoformat()
@@ -9685,10 +9641,7 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
             # capacity-blocked candidate can therefore be compared fairly on
             # the next 3-minute round instead of forever retaining its
             # yesterday/close rank.
-            conn.execute(
-                "UPDATE paper_signals SET payload=? WHERE id=?",
-                (_json(payload), signal["id"]),
-            )
+            SIG.write_payload(conn, int(signal["id"]), payload=_json(payload))
             signal = dict(signal)
             signal["payload"] = _json(payload)
             ranked_due.append((assessment, signal, account))
@@ -10471,22 +10424,20 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     reentry_codes = sold_today - position_codes - recovery_codes
                 # 普通 blocked/rejected 信号可在日内新行情下复评；短线追高专属门禁
                 # 失败则固定到下一交易日，避免每5分钟反复刷相同拒绝记录。
-                conn.execute(
-                    """UPDATE paper_signals SET status='superseded',reason=?
-                       WHERE account_id=? AND intended_date=?
-                         AND (status='blocked' OR (status='rejected' AND reason NOT LIKE '%短线追高风控未通过%'))""",
-                    (f"{RISK_VERSION} 重新评估后未再次入选", account["id"], day.isoformat()),
+                SIG.supersede_blocked_for_day(
+                    conn, account_id=account["id"], intended_date=day.isoformat(),
+                    reason=f"{RISK_VERSION} 重新评估后未再次入选",
+                    keep_rejected_like="%短线追高风控未通过%",
                 )
                 # H2: 当日待成交 pending 若长时间无法成交（资金/价格未满足），必须
                 # 有时间兜底转出，否则其 code 一直留在 actionable_codes 阻断同标的
                 # 再入场 → “永久无法再入场”死端。90 分钟未成交视为当日放弃，
                 # 释放该标的的再入场封锁；次日重新扫描时按新行情重新评估。
                 pending_cutoff = (dt.datetime.now() - dt.timedelta(minutes=90)).strftime("%Y-%m-%d %H:%M:%S")
-                conn.execute(
-                    """UPDATE paper_signals SET status='superseded',reason=?
-                       WHERE account_id=? AND intended_date=?
-                         AND status='pending' AND created_at < ?""",
-                    (f"{RISK_VERSION} 当日90分钟未成交，释放同标的再入场", account["id"], day.isoformat(), pending_cutoff),
+                SIG.supersede_pending_for_day(
+                    conn, account_id=account["id"], intended_date=day.isoformat(),
+                    reason=f"{RISK_VERSION} 当日90分钟未成交，释放同标的再入场",
+                    created_before=pending_cutoff,
                 )
 
                 candidates, meta = precomputed_candidates.get(account["id"], ([], {}))
@@ -11105,15 +11056,14 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     try:
         sell_cycle_id = order_cycle_id(conn, cycle["id"])
         strategy_stamp = resolve_strategy_stamp(conn, account["id"])
-        cursor = conn.execute(
-            """INSERT INTO paper_orders(
-                   account_id,side,code,name,qty,planned_price,status,reason,
-                   risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-               VALUES(?,?,?,?,?,?,'pending_execution',?,?,?,?,?,?,?)""",
-            (account["id"], "sell", position["code"], position.get("name"), qty, price,
-             order_reason, _json(payload), _now(), *strategy_stamp, sell_cycle_id),
-        )
-        order_id = int(cursor.lastrowid)
+        order_id = POL.insert_order(conn, fields={
+            "account_id": account["id"], "side": "sell", "code": position["code"],
+            "name": position.get("name"), "qty": qty, "planned_price": price,
+            "status": "pending_execution", "reason": order_reason,
+            "risk_payload": _json(payload), "created_at": _now(),
+            "strategy_id": strategy_stamp[0], "strategy_version": strategy_stamp[1],
+            "strategy_checksum": strategy_stamp[2], "cycle_id": sell_cycle_id,
+        })
         pnl = EP.commit_fill(
             conn,
             account=account,
@@ -11148,10 +11098,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
         pnl = float(committed[3] or 0.0)
         final_payload = _loads(committed[6], {})
         final_payload.update({"intended_qty": int(payload["qty"]), "qty": qty, "sell_price": fill})
-        conn.execute(
-            "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
-            (_json(final_payload), order_id, int(committed[5] or 0)),
-        )
+        POL.update_risk_payload(conn, order_id, payload=_json(final_payload),
+                                expected_version=int(committed[5] or 0))
         payload = final_payload
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as exc:
@@ -11161,7 +11109,7 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
             raise
         return None, f"高抛执行失败，可重试：{type(exc).__name__}: {exc}"
     result = {
-        "order_id": cursor.lastrowid, "side": "sell", "code": position["code"],
+        "order_id": order_id, "side": "sell", "code": position["code"],
         "qty": qty, "pnl": round(pnl, 2), "sell_price": round(fill, 4),
         "status": str(committed[0]),
         "opening_event": bool(opening_event), "trigger": trigger,
@@ -11792,17 +11740,15 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     pick["fast_entry_priority"] = marker
                     payload["pick"] = pick
                     payload["fast_entry_observation"] = observation
-                    conn.execute(
-                        "UPDATE paper_signals SET status='deferred_capacity',reason=?,payload=? WHERE id=?",
-                        ("快速通道已确认；等待下一轮三分钟任务最高优先级复核", _json(payload), signal["id"]),
+                    SIG.defer_for_capacity(
+                        conn, int(signal["id"]),
+                        reason="快速通道已确认；等待下一轮三分钟任务最高优先级复核",
+                        payload=_json(payload),
                     )
                     confirmed.append({"code": code, "account_id": account["id"], "valid_until": marker["valid_until"]})
                 else:
                     payload["fast_entry_observation"] = observation
-                    conn.execute(
-                        "UPDATE paper_signals SET payload=? WHERE id=?",
-                        (_json(payload), signal["id"]),
-                    )
+                    SIG.write_payload(conn, int(signal["id"]), payload=_json(payload))
             audit(conn, None, "fast_entry_monitor", _json({
                 "checked": checked, "confirmed": len(confirmed), "orders_created": 0,
                 "candidate_codes": sorted(candidate_codes),
@@ -14536,6 +14482,15 @@ def _bind_application_dependencies():
         "sync_positions": (PLL, "sync_positions"),
         "position_rows": (PLL, "position_rows"),
         "cancel_order": (POL, "cancel_order"),
+        "update_order_outcome": (POL, "update_order_outcome"),
+        "write_signal_payload": (SIG, "write_payload"),
+        "defer_signal": (SIG, "defer_for_capacity"),
+        "reopen_pending": (SIG, "reopen_pending"),
+        "mark_signal_filled": (SIG, "mark_filled"),
+        "record_signal_outcome": (SIG, "record_signal_outcome"),
+        "record_execution_block": (POL, "record_execution_block"),
+        "record_fill_result": (POL, "record_fill_result"),
+        "accumulate_realized_pnl": (POL, "accumulate_realized_pnl"),
         "insert_order": (POL, "insert_order"),
     }
     import manual_orders as MO

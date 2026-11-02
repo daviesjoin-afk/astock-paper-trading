@@ -23,6 +23,14 @@ import entry_lifecycle as ELC
 
 __all__ = [
     "ORDER_LEDGER_VERSION",
+    "accumulate_realized_pnl",
+    "record_execution_block",
+    "record_fill_result",
+    "record_realized_pnl",
+    "stamp_execution",
+    "stamp_execution_rows",
+    "update_order_outcome",
+    "update_risk_payload",
     "TERMINAL_ORDER_STATUSES",
     "expire_order",
     "insert_order",
@@ -33,6 +41,8 @@ __all__ = [
     "supersede_previous_execution_retry",
     "supersede_for_expired_signal",
     "supersede_for_terminal_signal",
+    "advance_execution_state",
+    "supersede_older_intents",
     "supersede_order",
     "terminate_order",
     "nonfilled_order_count",
@@ -61,44 +71,184 @@ def expire_order(conn, order_id, *, reason, cancelled_at):
     )
 
 
-def insert_order(
-    conn,
-    *,
-    account_id,
-    side,
-    code,
-    status,
-    reason,
-    risk_payload,
-    origin,
-    created_at,
-    signal_id=None,
-    name=None,
-    qty=0,
-    planned_price=None,
-    strategy_id=None,
-    strategy_version=None,
-    strategy_checksum=None,
-    retry_of_order_id=None,
-    cycle_id=None,
+#: 订单行的规范列集合（与 schema 一致）。``insert_order`` 只接受这里的列名，
+#: 调用方不能凭空插入未知列；未提供的列走 schema 默认值。
+ORDER_INSERT_COLUMNS = (
+    "account_id", "signal_id", "side", "code", "name", "qty", "planned_price",
+    "order_type", "filled_price", "amount", "fees", "status", "reason",
+    "risk_payload", "origin", "created_at", "executed_at", "expires_at",
+    "strategy_id", "strategy_version", "strategy_checksum",
+    "retry_of_order_id", "cycle_id",
+    "allocation_intent_kind", "portfolio_snapshot_id", "allocation_plan_id",
+    "allocation_plan_fingerprint", "allocation_policy_version",
+)
+
+
+def record_execution_block(
+    conn, order_id, *, status, execution_asof, reasons, evidence,
+    ruleset_version, expected_version,
 ):
+    """执行阻塞结果写库（乐观锁版本不符则不写），返回受影响行数。
+
+    判定（阻塞码、目标状态、规则版本）由成交权威给出；owner 只落库。
+    """
+    return conn.execute(
+        """UPDATE paper_orders
+              SET status=?,execution_asof=?,execution_reasons=?,
+                  execution_evidence=?,ruleset_version=?,execution_version=execution_version+1,
+                  remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
+            WHERE id=? AND execution_version=?""",
+        (status, execution_asof, reasons, evidence,
+         ruleset_version, order_id, expected_version),
+    ).rowcount
+
+
+def record_fill_result(
+    conn, order_id, *, status, filled_qty, remaining_qty, filled_price, amount, fees,
+    reason, risk_payload, execution_asof, execution_reasons, execution_evidence,
+    pricing_basis, slippage, ruleset_version, executed_at, expected_version,
+    expected_filled_qty, min_remaining,
+):
+    """成交结果写库：状态、成交数量/均价/金额/费用、证据与版本推进。
+
+    五条 ``WHERE`` 条件逐字保留（版本、已成交数量、剩余量下限、活动状态集合），
+    并发或终态竞争时返回 0，由调用方抛错。价格与费用由 ``commit_fill`` 算好，
+    本入口不重算任何成交事实。
+    """
+    return conn.execute(
+        """UPDATE paper_orders
+              SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?,
+                  reason=?,risk_payload=?,execution_asof=?,execution_reasons=?,
+                  execution_evidence=?,pricing_basis=?,slippage=?,ruleset_version=?,
+                  executed_at=?,execution_version=execution_version+1
+            WHERE id=? AND execution_version=?
+              AND COALESCE(filled_qty,0)=? AND COALESCE(remaining_qty,qty-COALESCE(filled_qty,0))>=?
+              AND status IN ('pending_execution','partially_filled','ready_to_fill',
+                             'pending_limit','pending_verification','execution_retry',
+                             'manual_execution_retry')""",
+        (status, filled_qty, remaining_qty, filled_price, amount, fees,
+         reason, risk_payload, execution_asof, execution_reasons,
+         execution_evidence, pricing_basis, slippage, ruleset_version,
+         executed_at, order_id, expected_version, expected_filled_qty, min_remaining),
+    ).rowcount
+
+
+def accumulate_realized_pnl(conn, order_id, *, delta):
+    """在一笔已有 realized_pnl 上累加本次卖出实现盈亏。"""
+    conn.execute(
+        "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
+        (delta, order_id),
+    )
+
+
+def stamp_execution(conn, order_id, *, status, verified, source):
+    """写入执行核验结论的三列；结论由调用方（核验 owner）算好。"""
+    conn.execute(
+        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
+        " execution_evidence_source=? WHERE id=?",
+        (status, int(bool(verified)), source, order_id),
+    )
+
+
+def stamp_execution_rows(conn, rows):
+    """批量写核验结论：``rows`` 为 ``(status, verified, source, order_id)`` 序列。"""
+    data = [(status, int(bool(verified)), source, order_id)
+            for status, verified, source, order_id in rows]
+    if not data:
+        return 0
+    conn.executemany(
+        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
+        " execution_evidence_source=? WHERE id=?",
+        data,
+    )
+    return len(data)
+
+
+def record_realized_pnl(conn, order_id, *, realized):
+    """回填一笔订单的已实现盈亏（口径由调用方决定）。"""
+    conn.execute(
+        "UPDATE paper_orders SET realized_pnl=? WHERE id=?",
+        (realized, order_id),
+    )
+
+
+#: ``update_order_outcome`` 允许写入的订单状态（调用方判定结果的白名单）。
+ORDER_OUTCOME_STATUSES = (
+    "pending_limit", "pending_execution", "risk_rejected", "expired", "cancelled",
+    "superseded", "execution_retry", "manual_execution_retry", "entry_frozen_waitlist",
+    "ready_to_fill", "filled", "partially_filled",
+)
+
+_UNSET = object()
+
+
+def update_order_outcome(
+    conn, order_id, *, status=_UNSET, reason=_UNSET, risk_payload=_UNSET,
+    clear_fill=False, match_status=None,
+):
+    """订单状态推进：按调用方给出的字段写 row，返回受影响行数。
+
+    只允许写 ``status`` / ``reason`` / ``risk_payload``，外加"清空成交字段"这一
+    个固定组合（``clear_fill``）。``status`` 必须在 :data:`ORDER_OUTCOME_STATUSES`
+    白名单内，避免退化成任意列/任意值的 set_status。
+    """
+    sets: list[str] = []
+    params: list = []
+    if status is not _UNSET:
+        if status not in ORDER_OUTCOME_STATUSES:
+            raise ValueError(f"非法订单状态：{status!r}")
+        sets.append("status=?")
+        params.append(status)
+    if reason is not _UNSET:
+        sets.append("reason=?")
+        params.append(reason)
+    if risk_payload is not _UNSET:
+        sets.append("risk_payload=?")
+        params.append(risk_payload)
+    if clear_fill:
+        sets.append("filled_price=NULL")
+        sets.append("amount=NULL")
+        sets.append("fees=NULL")
+        sets.append("executed_at=NULL")
+    if not sets:
+        raise ValueError("update_order_outcome 需要至少一个字段")
+    sql = "UPDATE paper_orders SET " + ", ".join(sets) + " WHERE id=?"
+    params.append(order_id)
+    if match_status is not None:
+        states = tuple(match_status)
+        if not states:
+            raise ValueError("match_status 需要非空集合")
+        sql += " AND status IN (" + ",".join("?" for _ in states) + ")"
+        params.extend(states)
+    return conn.execute(sql, tuple(params)).rowcount
+
+
+def update_risk_payload(conn, order_id, *, payload, expected_version):
+    """按乐观锁版本改写订单的 risk_payload；版本不符则不写。"""
+    return conn.execute(
+        "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
+        (payload, order_id, expected_version),
+    ).rowcount
+
+
+def insert_order(conn, *, fields):
     """创建一条订单行，返回新行 id。
 
-    列集合与原 INSERT 逐字一致；业务侧（策略戳、重试血缘、payload 序列化）
-    全部由调用方算好再传进来 —— owner 不算价、不解析周期、不读时钟。
+    ``fields`` 的键必须落在 :data:`ORDER_INSERT_COLUMNS` 里；列序按该常量，
+    而不是调用方给的顺序 —— 写入形状由 owner 决定。业务侧（策略戳、重试血缘、
+    payload 序列化、计划快照）全部由调用方算好再传进来：owner 不算价、不解析
+    周期、不读时钟。
     """
+    unknown = set(fields) - set(ORDER_INSERT_COLUMNS)
+    if unknown:
+        raise ValueError(f"未知订单列：{sorted(unknown)}")
+    columns = [name for name in ORDER_INSERT_COLUMNS if name in fields]
+    if not columns:
+        raise ValueError("insert_order 需要至少一个字段")
+    marks = ",".join("?" for _ in columns)
     cursor = conn.execute(
-        """INSERT INTO paper_orders(
-               account_id,signal_id,side,code,name,qty,planned_price,status,reason,
-               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
-               retry_of_order_id,cycle_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            account_id, signal_id, side, code, name, qty, planned_price, status, reason,
-            risk_payload, origin, created_at,
-            strategy_id, strategy_version, strategy_checksum,
-            retry_of_order_id, cycle_id,
-        ),
+        f"INSERT INTO paper_orders({','.join(columns)}) VALUES({marks})",
+        tuple(fields[name] for name in columns),
     )
     return int(cursor.lastrowid)
 
@@ -169,6 +319,31 @@ def supersede_previous_execution_retry(conn, order_id):
             WHERE id=? AND status='execution_retry'""",
         (order_id,),
     )
+
+
+def supersede_older_intents(conn, *, account_id, code, statuses, keep_order_id):
+    """较早的等待池/延期意图被同一标的新委托替代（批量）；原因带新订单号。"""
+    states = tuple(statuses)
+    if not states:
+        raise ValueError("supersede_older_intents 需要非空状态集合")
+    marks = ",".join("?" for _ in states)
+    return conn.execute(
+        f"""UPDATE paper_orders
+              SET status='superseded',
+                  reason=COALESCE(reason,'') || '；已由最新实时复核委托替代，见 #' || ?
+            WHERE account_id=? AND code=? AND side='buy'
+              AND status IN ({marks}) AND id<>?""",
+        (keep_order_id, account_id, code, *states, keep_order_id),
+    ).rowcount
+
+
+def advance_execution_state(conn, order_id, *, status, execution_reasons, expected_version):
+    """执行结果推进：按乐观锁版本改写状态与执行原因。"""
+    return conn.execute(
+        "UPDATE paper_orders SET status=?,execution_reasons=?"
+        " WHERE id=? AND execution_version=?",
+        (status, execution_reasons, order_id, expected_version),
+    ).rowcount
 
 
 def cancel_order(conn, order_id, *, reason, cancelled_at, statuses: Sequence[str]):
