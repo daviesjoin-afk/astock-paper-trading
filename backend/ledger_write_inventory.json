@@ -3695,6 +3695,32 @@
    ]
   },
   {
+   "function": "test_delete_target_is_not_misclassified_as_a_reader",
+   "kind": "static",
+   "line": 23,
+   "module": "test_ledger_owner_plan",
+   "read_refs": [],
+   "role": "test",
+   "sql": "DELETE FROM paper_audit WHERE id=?",
+   "write_targets": [
+    "paper_audit"
+   ]
+  },
+  {
+   "function": "test_delete_target_is_not_misclassified_as_a_reader",
+   "kind": "static",
+   "line": 25,
+   "module": "test_ledger_owner_plan",
+   "read_refs": [
+    "paper_orders"
+   ],
+   "role": "test",
+   "sql": "DELETE FROM paper_signals WHERE id IN (SELECT signal_id FROM paper_orders)",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
    "function": "test_cycle_authority_reads_cannot_write_or_bootstrap",
    "kind": "static",
    "line": 210,
@@ -4864,9 +4890,21 @@
    ]
   },
   {
+   "function": "test_fill_counts_keep_account_side_and_caller_rollback_boundaries",
+   "kind": "static",
+   "line": 149,
+   "module": "test_paper_account_metrics",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_fills VALUES(?,?)",
+   "write_targets": [
+    "paper_fills"
+   ]
+  },
+  {
    "function": "test_empty_account_has_fixed_values",
    "kind": "static",
-   "line": 180,
+   "line": 206,
    "module": "test_paper_account_metrics",
    "read_refs": [],
    "role": "test",
@@ -4879,7 +4917,7 @@
   {
    "function": "test_past_cycle_and_other_account_do_not_change_account_boundary",
    "kind": "static",
-   "line": 227,
+   "line": 253,
    "module": "test_paper_account_metrics",
    "read_refs": [],
    "role": "test",

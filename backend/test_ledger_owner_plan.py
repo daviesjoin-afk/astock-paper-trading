@@ -19,6 +19,11 @@ DOC = BACKEND.parent / "docs" / "LEDGER_OWNERSHIP.md"
 
 
 class InventoryScanTests(unittest.TestCase):
+    def test_delete_target_is_not_misclassified_as_a_reader(self):
+        self.assertEqual([], INV._read_tables("DELETE FROM paper_audit WHERE id=?"))
+        self.assertEqual(["paper_orders"], INV._read_tables(
+            "DELETE FROM paper_signals WHERE id IN (SELECT signal_id FROM paper_orders)"))
+
     def test_committed_inventory_matches_fresh_scan(self):
         fresh = INV.scan()
         self.assertEqual(fresh, INVENTORY,

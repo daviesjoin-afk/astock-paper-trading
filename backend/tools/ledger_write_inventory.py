@@ -89,6 +89,9 @@ def _write_targets(sql: str) -> list[str]:
 
 
 def _read_tables(sql: str) -> list[str]:
+    # DELETE FROM 的首表是写目标；其余 FROM/JOIN（包括子查询）才是读引用。
+    sql = re.sub(r"^\s*DELETE\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)",
+                 r"DELETE \1", sql, flags=re.I)
     reads: list[str] = []
     for match in READ_PATTERN.finditer(sql):
         table = match.group(1).lower()
@@ -238,6 +241,25 @@ def render_plan_markdown(inventory: dict | None = None, plan: dict | None = None
         lines.extend(rows)
         lines.append("")
     return chr(10).join(lines).rstrip() + chr(10)
+
+
+def scan_readers(root: Path = BACKEND) -> dict[str, list[str]]:
+    """每张核心表被哪些运行时模块**读取**（SELECT/JOIN 引用），供读取契约守卫使用。"""
+    readers: dict[str, set[str]] = {table: set() for table in CORE_TABLES}
+    for path in sorted(root.glob("*.py")):
+        if module_role(path) != "runtime":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover
+            continue
+        for node, _dynamic, text in _iter_string_nodes(tree):
+            if not SQL_START.match(text):
+                continue
+            for table in _read_tables(text):
+                if table in readers:
+                    readers[table].add(path.stem)
+    return {table: sorted(modules) for table, modules in readers.items()}
 
 
 def main(argv: list[str]) -> int:

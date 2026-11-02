@@ -130,6 +130,32 @@ class AccountMetricLedgerTests(unittest.TestCase):
                 actual = self.project(cached=cached)
                 self.assertEqual({key: actual[key] for key in expected}, expected)
 
+    def test_uncached_projection_reuses_one_fill_read_from_existing_owner(self):
+        statements = []
+        self.conn.set_trace_callback(statements.append)
+        self.addCleanup(self.conn.set_trace_callback, None)
+        ports = metrics._ports()
+        with patch.object(repository, "account_metric_inputs", wraps=ports.account_metric_inputs) as read:
+            delegated = dataclasses.replace(ports, account_metric_inputs=read)
+            with patch.object(metrics, "_dependencies", lambda: delegated):
+                uncached = self.project()
+        read.assert_called_once_with(self.conn, ["acct"], "2026-01-02")
+        fill_reads = [sql for sql in statements
+                      if sql.lstrip().upper().startswith("SELECT") and "FROM paper_fills" in sql]
+        self.assertEqual(1, len(fill_reads), "读取方已有计数，不应再直接重复查询成交表")
+        self.assertEqual(self.project(cached=True), uncached)
+
+    def test_fill_counts_keep_account_side_and_caller_rollback_boundaries(self):
+        self.conn.executemany("INSERT INTO paper_fills VALUES(?,?)", [
+            ("acct", "buy"), ("acct", "sell"), ("other", "buy"), ("acct", None),
+        ])
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                self.assertEqual(4, self.project(cached=cached)["trade_count"])
+                self.assertTrue(self.conn.in_transaction, "读取方不能提交调用方的写入")
+        self.conn.rollback()
+        self.assertEqual(3, self.project()["trade_count"])
+
     def test_missing_position_quote_uses_cost_and_reports_fallback(self):
         actual = self.project(quotes={"000002": self.quotes["000002"]})
         self.assertEqual(actual["valuation_status"], "cost_fallback")
