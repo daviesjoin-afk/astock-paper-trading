@@ -186,33 +186,36 @@ class RiskRunningGateTests(PaperRiskExitProductionPathTestCase):
 
         started = threading.Event()
         release = threading.Event()
+
         def blocking_impl(asof_date=None, *, cycle_id):
             started.set()
             if not release.wait(30):
                 raise AssertionError("测试未释放 risk lane 阻塞")
             # 认领与完成事务仍由 monitor_risk 自己做；这里只模拟"执行阶段耗时"，
-            # 避免在并发窗口里再跑真实风控写事务（那会把 SQLite 锁带进断言）。
+            # 避免在并发窗口里再跑一次真实风控写事务（那会把 SQLite 锁带进断言）。
             return {"slot": "risk", "date": str(asof_date), "orders": [], "manual_orders": []}
 
         lane = {}
 
         def run_lane():
-            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
-                lane.update(PT.monitor_risk(self.day) or {})
+            lane.update(PT.monitor_risk(self.day) or {})
 
-        thread = threading.Thread(target=run_lane, daemon=True)
-        thread.start()
-        try:
-            self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
-            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 0.0),                     mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.01):
-                fallback = PT.monitor_risk(self.day)
-            self.assertEqual("risk_running", fallback["status"])
-            self.assertTrue(fallback["deferred"])
-            self.assertEqual("running", fallback["risk_scan_state"])
-            self.assertEqual("failed", PT._slot_completion_status(fallback))
-        finally:
-            release.set()
-            thread.join(30)
+        # 只打一次补丁、只由主线程打：两个线程各自 patch ``datetime.datetime``
+        # 会把"恢复顺序"变成竞态，测试结束后全局 datetime 可能留在替身上。
+        with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                 mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
+            thread = threading.Thread(target=run_lane, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
+                with mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 0.0),                         mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.01):
+                    fallback = PT.monitor_risk(self.day)
+                self.assertEqual("risk_running", fallback["status"])
+                self.assertTrue(fallback["deferred"])
+                self.assertEqual("running", fallback["risk_scan_state"])
+                self.assertEqual("failed", PT._slot_completion_status(fallback))
+            finally:
+                release.set()
+                thread.join(30)
         self.assertFalse(thread.is_alive(), "risk lane 线程未结束")
         self.assertNotIn("status", lane, "阻塞解除后 risk lane 应正常完成（无状态即成功）")
 
@@ -222,28 +225,28 @@ class RiskRunningGateTests(PaperRiskExitProductionPathTestCase):
 
         started = threading.Event()
         release = threading.Event()
+
         def blocking_impl(asof_date=None, *, cycle_id):
             started.set()
             release.wait(30)
             return {"slot": "risk", "date": str(asof_date), "orders": [], "manual_orders": []}
 
         def run_lane():
-            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
-                PT.monitor_risk(self.day)
+            PT.monitor_risk(self.day)
 
-        thread = threading.Thread(target=run_lane, daemon=True)
-        thread.start()
-        try:
-            self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
-            timer = threading.Timer(0.2, release.set)
-            timer.start()
-            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 30.0),                     mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.02):
-                fallback = PT.monitor_risk(self.day)
-            self.assertEqual("already_scanned", fallback["status"])
-            self.assertEqual("completed", PT._slot_completion_status(fallback))
-        finally:
-            release.set()
-            thread.join(30)
+        with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                 mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
+            thread = threading.Thread(target=run_lane, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
+                threading.Timer(0.2, release.set).start()
+                with mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 30.0),                         mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.02):
+                    fallback = PT.monitor_risk(self.day)
+                self.assertEqual("already_scanned", fallback["status"])
+                self.assertEqual("completed", PT._slot_completion_status(fallback))
+            finally:
+                release.set()
+                thread.join(30)
         self.assertFalse(thread.is_alive())
 
 

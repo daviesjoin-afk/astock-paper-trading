@@ -115,7 +115,9 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
 
 #: Guard 7 —— 扫描生命周期模块允许的 import 根（纯 stdlib，含 json 做 detail 编码）。
-RISK_SCAN_ALLOWED_IMPORTS = frozenset({"__future__", "json", "sqlite3"})
+#: PR-11 B：模块新增"等对端把 running 推进到终态"的有界等待，因此需要 ``time``
+#: 的 monotonic/sleep。仍然只有 stdlib，仍然不 import 任何项目模块。
+RISK_SCAN_ALLOWED_IMPORTS = frozenset({"__future__", "json", "sqlite3", "time"})
 
 #: Guard 8 —— 纯 position-review 域模块允许的 import 根（仅 stdlib）。
 POSITION_REVIEW_ALLOWED_IMPORTS = frozenset({"__future__", "dataclasses", "typing"})

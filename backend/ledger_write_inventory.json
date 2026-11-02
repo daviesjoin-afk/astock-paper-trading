@@ -5856,7 +5856,7 @@
   {
    "function": "test_guard11c_paper_trading_has_no_runtime_fill_insert",
    "kind": "static",
-   "line": 1319,
+   "line": 1321,
    "module": "test_paper_trading_architecture_guard",
    "read_refs": [],
    "role": "test",
@@ -5868,7 +5868,7 @@
   {
    "function": "test_guard14t_signal_cycle_must_match_the_account_binding",
    "kind": "static",
-   "line": 2120,
+   "line": 2122,
    "module": "test_paper_trading_architecture_guard",
    "read_refs": [],
    "role": "test",
