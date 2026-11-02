@@ -159,6 +159,15 @@ class ParsingRobustnessTests(unittest.TestCase):
         self.assertEqual(0, _summarize(_lock(PDM.NOT_ACQUIRED, slot="intraday", wait=-5))
                          ["queue_age_seconds"]["samples"])
 
+    def test_non_finite_wait_never_reaches_the_dashboard_payload(self):
+        """``1e999`` 会解析成 inf；输出必须是标准 JSON，否则前端整块解析失败。"""
+        summary = _summarize(
+            _lock(PDM.NOT_ACQUIRED, slot="intraday", wait=1e999),
+            _start("intraday", tick="a", wait=1e999),
+        )
+        self.assertEqual(0, summary["queue_age_seconds"]["samples"])
+        self.assertEqual(summary, json.loads(json.dumps(summary, allow_nan=False)))
+
 
 class TickAccountingTests(unittest.TestCase):
     def test_start_and_end_events_pair_by_tick_id(self):

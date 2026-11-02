@@ -53,6 +53,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime
 
@@ -164,11 +165,18 @@ def _host_slot(event):
 
 
 def _wait_seconds(value):
+    """非负有限秒数。
+
+    ``1e999`` 之类的行会解析成 ``inf``：它既不是真实等待，也会在 JSON 里变成
+    前端无法解析的 ``Infinity``，所以按坏输入处理。
+    """
     try:
         wait = float(value)
     except (TypeError, ValueError):
         return None
-    return wait if wait >= 0 else None
+    if not math.isfinite(wait) or wait < 0:
+        return None
+    return wait
 
 
 def _lock_wait(event):
