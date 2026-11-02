@@ -136,9 +136,9 @@ def command(args, timeout=90):
     return result.stdout
 
 
-def launch(image, name, limits, volume, cpuset):
+def launch(image, name, limits, volume, cpuset, tmpfs):
     command(["docker", "run", "-d", "--name", name, "--network", "none", "--read-only",
-             "--no-healthcheck", "--tmpfs", "/tmp:rw,size=64m,mode=1777",
+             "--no-healthcheck", "--tmpfs", tmpfs,
              "--mount", f"type=volume,source={volume},target=/app/data_cache",
              "--memory", str(limits["memory_bytes"]), "--memory-swap", str(limits["swap_bytes"]),
              "--cpus", str(limits["cpus"]), "--cpu-shares", str(limits["cpu_shares"]),
@@ -204,9 +204,11 @@ def host_probe(image):
         command(["docker", "run", "--rm", "--network", "none", "--user", "0",
                  "--mount", f"type=volume,source={volume},target=/app/data_cache", image,
                  "python", "-c", "import os; os.chown('/app/data_cache', 10001, 10001)"])
-        launch(image, paper, limits["astock-paper-worker"], volume, cpuset)
+        launch(image, paper, limits["astock-paper-worker"], volume, cpuset,
+               config["services"]["astock-paper-worker"]["tmpfs"][0])
         created.append(paper)
-        launch(image, candidate, limits["astock-candidate-worker"], volume, cpuset)
+        launch(image, candidate, limits["astock-candidate-worker"], volume, cpuset,
+               config["services"]["astock-candidate-worker"]["tmpfs"][0])
         created.append(candidate)
         baseline = sample_fast(paper, contention=False)
         holder = subprocess.Popen(invocation(candidate, "hold"),
