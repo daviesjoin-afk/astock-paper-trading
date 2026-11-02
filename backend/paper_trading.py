@@ -14270,12 +14270,16 @@ def dispatch_status():
     """PR-11：调度级事实（tick / 跳过 / 队列年龄 / 上次风险成功）。
 
     只读主机调度日志的尾部，不碰数据库、不改变任何调度行为；日志不存在时
-    返回 ``available=False``，dashboard 照旧显示其余字段。口径见
-    ``paper_dispatch_metrics``：tick 来自 runner 结束事件，跳过来自抢锁失败与
-    为全扫描让路，queue age 是进入 runner 之前的主机锁等待。
+    返回 ``available=False`` 并带上 ``error`` 原因（``missing`` / ``unreadable``），
+    dashboard 照旧显示其余字段。口径见 ``paper_dispatch_metrics``：tick 来自
+    ``paper_slot_start``，跳过来自抢锁失败与为全扫描让路，end 事件按
+    completed / idle / failed / unknown 四分类，queue age 是进入 runner 之前的主机锁等待。
+
+    默认路径跟随 ``data_paths.report_dir()``（仓库／容器里的 ``reports/``）：宿主 cron
+    写 ``/opt/astock-codex/reports/scheduler.log``，API 容器把它挂在 ``/app/reports``，
+    写死宿主绝对路径会让容器内永远读不到。需要指向别处时用 ``ASTOCK_SCHEDULER_LOG``。
     """
-    path = os.environ.get("ASTOCK_SCHEDULER_LOG", "/opt/astock-codex/reports/scheduler.log")
-    return PDM.summarize_file(path)
+    return PDM.summarize_file(PDM.scheduler_log_path(data_paths.report_dir()))
 
 
 def schedule_status():

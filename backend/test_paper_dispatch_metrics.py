@@ -1,29 +1,116 @@
 # -*- coding: utf-8 -*-
-"""PR-11 调度观测的回归：只验证聚合口径，不触碰调度行为。"""
+"""PR-11 调度观测的回归：只验证聚合口径与读取路径，不触碰调度行为。
+
+本文件刻意**不**用自造的扁平事件构造器。``paper_timing.capture`` 的真实输出把
+slot 放在 ``timing.slot`` 里，旧的构造器把它放在顶层，恰好掩盖了"读不到 slot"
+的缺陷（#324 复审第一条阻断）。因此这里：真实格式用 ``capture`` 现生成，历史格式
+单独断言它**必须**被记成 ``unknown`` 而不是被当成正常事件。
+"""
+import contextlib
+import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import paper_dispatch_metrics as PDM
+import paper_timing as timing
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _timing(slot, started_at, *, status="ok", wait=None, stages=None):
-    timing = {"started_at": started_at, "stages": stages or {}}
+def _timing_event(slot, started_at, *, status="completed", wait=None, stages=None):
+    """生产形状：slot 在 ``timing`` 里，与 ``paper_timing.capture`` 一致。"""
+    timing_block = {"started_at": started_at, "stages": stages or {}, "slot": slot}
     if wait is not None:
-        timing["host_paper_lock_wait_seconds"] = wait
-    return json.dumps({"event": "paper_slot_timing", "status": status, "timing": timing,
-                       "slot": slot}, ensure_ascii=False)
+        timing_block["host_paper_lock_wait_seconds"] = wait
+    return json.dumps({"event": "paper_slot_timing", "status": status,
+                       "timing": timing_block}, ensure_ascii=False)
 
 
-def _lock(status, wait=None):
+def _start(slot, *, tick="t1", wait=0):
+    return json.dumps({"event": "paper_slot_start", "slot": slot, "tick_id": tick,
+                       "wait_seconds": wait, "at": "2026-11-02T09:33:00+08:00"})
+
+
+def _exit(slot, *, tick="t1", code=0):
+    return json.dumps({"event": "paper_slot_exit", "slot": slot, "tick_id": tick,
+                       "exit_code": code, "at": "2026-11-02T09:33:12+08:00"})
+
+
+def _lock(status, *, slot=None, wait=None):
     payload = {"event": "paper_host_lock", "status": status}
+    if slot is not None:
+        payload["slot"] = slot
     if wait is not None:
         payload["wait_seconds"] = wait
     return json.dumps(payload)
 
 
-class EventParsingTests(unittest.TestCase):
+def _summarize(*lines, **kwargs):
+    return PDM.summarize(list(PDM.iter_events(lines)), **kwargs)
+
+
+class RealEventShapeTests(unittest.TestCase):
+    """真实 ``paper_timing.capture`` 输出必须是唯一被采信的格式。"""
+
+    def test_capture_output_carries_slot_only_inside_timing(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), timing.capture("intraday"):
+            with timing.phase("risk_pass"):
+                pass
+            timing.outcome("completed")
+        lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
+        self.assertEqual(1, len(lines))
+        event = json.loads(lines[0])
+        self.assertEqual("paper_slot_timing", event["event"])
+        self.assertNotIn("slot", event, "顶层没有 slot：从顶层读会把任务记成 unknown")
+        self.assertEqual("intraday", event["timing"]["slot"])
+
+    def test_capture_output_is_aggregated_under_its_real_slot(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), timing.capture("intraday"):
+            with timing.phase("risk_pass"):
+                pass
+            timing.outcome("completed")
+        summary = PDM.summarize_lines(buffer.getvalue().splitlines())
+        self.assertIn("intraday", summary["runs"])
+        self.assertNotIn(PDM.UNKNOWN_SLOT, summary["runs"])
+        self.assertEqual(1, summary["runs"]["intraday"]["end_events"])
+        self.assertEqual(1, summary["runs"]["intraday"]["completed"])
+        self.assertEqual("intraday_risk_phase", summary["last_successful_risk_scan"]["source"])
+        self.assertEqual(0, summary["ticks"]["unparsed"])
+
+    def test_review_sample_event_is_read_from_timing_slot(self):
+        """#324 复审给出的生产样本，逐字照抄。"""
+        sample = json.dumps({
+            "event": "paper_slot_timing",
+            "status": "completed",
+            "timing": {
+                "slot": "intraday",
+                "started_at": "2026-11-02T09:33:00+08:00",
+                "stages": {"risk_pass": {"calls": 1, "errors": 0}},
+            },
+        })
+        summary = _summarize(sample)
+        self.assertEqual(["intraday"], list(summary["runs"]))
+        self.assertEqual("2026-11-02T09:33:00+08:00",
+                         summary["last_successful_risk_scan"]["at"])
+
+    def test_flat_top_level_slot_is_not_accepted_as_evidence(self):
+        """历史/自造格式（slot 在顶层）不得被当成正常事件。"""
+        summary = _summarize(
+            '{"event": "paper_slot_timing", "status": "completed", "slot": "risk",'
+            ' "timing": {"started_at": "2026-11-02T09:33:00+08:00"}}')
+        self.assertIn(PDM.UNKNOWN_SLOT, summary["runs"])
+        self.assertNotIn("risk", summary["runs"])
+        self.assertEqual(1, summary["ticks"]["unparsed"])
+        self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+
+
+class ParsingRobustnessTests(unittest.TestCase):
     def test_bad_lines_are_skipped_without_raising(self):
         lines = [
             "",
@@ -31,55 +118,199 @@ class EventParsingTests(unittest.TestCase):
             "cron started /opt/astock-codex/deploy/run_paper_slot.sh",
             "{not json}",
             "[1,2,3]",
-            '{"event": "paper_host_lock", "status": "not_acquired", "wait_seconds": 60}',
+            '{"event": 42}',
+            '{"event": "paper_slot_timing", "status": "completed", "timing": "oops"}',
+            '{"event": "paper_slot_timing", "status": "completed", "timing": {"slot": 7}}',
+            '{"event": "paper_host_lock", "status": "not_acquired", "wait_seconds": "x"}',
         ]
-        events = list(PDM.iter_events(lines))
-        self.assertEqual(1, len(events))
-        self.assertEqual("paper_host_lock", events[0]["event"])
+        summary = PDM.summarize(list(PDM.iter_events(lines)))
+        self.assertEqual(2, summary["ticks"]["end_events"])
+        self.assertEqual(2, summary["ticks"]["unparsed"])
+        self.assertEqual(0, summary["queue_age_seconds"]["samples"])
 
-    def test_events_without_event_key_are_ignored(self):
-        events = list(PDM.iter_events(['{"status": "ok"}', '{"event": 42}']))
-        self.assertEqual([], events)
+    def test_malformed_timing_fields_degrade_without_raising(self):
+        events = [
+            '{"event": "paper_slot_timing", "status": "completed", "timing":'
+            ' {"slot": "intraday", "started_at": "not-a-time",'
+            '  "stages": {"risk_pass": {"calls": 1, "errors": "many"}}}}',
+            '{"event": "paper_slot_timing", "status": "completed", "timing":'
+            ' {"slot": "intraday", "started_at": "2026-11-02T09:36:00+08:00",'
+            '  "stages": "broken"}}',
+            '{"event": "paper_slot_start", "slot": "intraday", "wait_seconds": -3}',
+        ]
+        summary = _summarize(*events)
+        # errors 不是数字时按"未知"处理：不能冒充零错误而记为成功风控。
+        self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+        self.assertEqual(2, summary["runs"]["intraday"]["end_events"])
+        self.assertEqual(0, summary["queue_age_seconds"]["samples"])
+        self.assertEqual(0, summary["start_to_start_seconds"].get("intraday", {}).get("samples", 0))
+
+    def test_negative_wait_is_not_counted(self):
+        self.assertEqual(0, _summarize(_lock(PDM.NOT_ACQUIRED, slot="intraday", wait=-5))
+                         ["queue_age_seconds"]["samples"])
 
 
-class SkipAndQueueTests(unittest.TestCase):
-    def test_skips_count_both_reasons_separately(self):
-        events = list(PDM.iter_events([
-            _lock("not_acquired", 60),
-            _lock("not_acquired", 60),
-            _lock(PDM.YIELDED),
-            _timing("intraday", "2026-11-02T09:33:00+08:00"),
-        ]))
-        summary = PDM.summarize(events)
+class TickAccountingTests(unittest.TestCase):
+    def test_start_and_end_events_pair_by_tick_id(self):
+        summary = _summarize(
+            _start("intraday", tick="a", wait=4),
+            _timing_event("intraday", "2026-11-02T09:33:00+08:00"),
+            _exit("intraday", tick="a"),
+        )
+        ticks = summary["ticks"]
+        self.assertEqual(1, ticks["started"])
+        self.assertEqual(1, ticks["end_events"])
+        self.assertEqual(1, ticks["completed"])
+        self.assertEqual(0, ticks["unfinished"])
+        self.assertEqual(0, ticks["exited_without_result"])
+        self.assertEqual(PDM.SOURCE_START_EVENTS, ticks["source"])
+        self.assertEqual(1, summary["runs"]["intraday"]["started"])
+
+    def test_started_without_end_event_is_unfinished_not_completed(self):
+        summary = _summarize(_start("intraday", tick="a"))
+        self.assertEqual(1, summary["ticks"]["started"])
+        self.assertEqual(0, summary["ticks"]["end_events"])
+        self.assertEqual(1, summary["ticks"]["unfinished"])
+        self.assertEqual(0, summary["ticks"]["completed"])
+
+    def test_started_then_exited_without_result_is_its_own_category(self):
+        summary = _summarize(_start("risk", tick="a"), _exit("risk", tick="a", code=137))
+        self.assertEqual(1, summary["ticks"]["unfinished"] + summary["ticks"]["exited_without_result"])
+        self.assertEqual(1, summary["ticks"]["exited_without_result"])
+        self.assertEqual(0, summary["ticks"]["unfinished"])
+        self.assertEqual(0, summary["ticks"]["completed"])
+
+    def test_legacy_log_without_start_events_says_so(self):
+        summary = _summarize(_timing_event("intraday", "2026-11-02T09:33:00+08:00"))
+        self.assertEqual(PDM.SOURCE_END_EVENTS, summary["ticks"]["source"])
+        self.assertEqual(0, summary["ticks"]["started"])
+        self.assertEqual(1, summary["ticks"]["end_events"])
+
+    def test_real_capture_tick_id_pairs_with_the_host_start_event(self):
+        """主机注入 ``ASTOCK_SCHEDULER_TICK_ID`` 后，真实结束事件能与启动事件配对。"""
+        with mock.patch.dict(os.environ, {"ASTOCK_SCHEDULER_TICK_ID": "risk-1793604230-1149"}):
+            buffer = io.StringIO()
+            with contextlib.redirect_stderr(buffer), timing.capture("risk"):
+                with timing.phase("risk_pass"):
+                    pass
+                timing.outcome("completed")
+        lines = [_start("risk", tick="risk-1793604230-1149")] + buffer.getvalue().splitlines()
+        summary = PDM.summarize_lines(lines)
+        self.assertEqual(1, summary["ticks"]["started"])
+        self.assertEqual(0, summary["ticks"]["unfinished"])
+        self.assertEqual(0, summary["ticks"]["exited_without_result"])
+        self.assertEqual(1, summary["ticks"]["completed"])
+        self.assertEqual("risk_slot", summary["last_successful_risk_scan"]["source"])
+
+    def test_skips_are_attributed_to_their_slot(self):
+        summary = _summarize(
+            _lock(PDM.NOT_ACQUIRED, slot="intraday", wait=61),
+            _lock(PDM.NOT_ACQUIRED, slot="intraday", wait=61),
+            _lock(PDM.YIELDED, slot="fast-entry"),
+            _start("intraday", tick="a", wait=0),
+        )
         self.assertEqual(2, summary["skips"][PDM.NOT_ACQUIRED])
         self.assertEqual(1, summary["skips"][PDM.YIELDED])
         self.assertEqual(3, summary["ticks"]["skipped"])
-        self.assertEqual(1, summary["ticks"]["started"])
+        self.assertEqual(2, summary["skips_by_slot"]["intraday"][PDM.NOT_ACQUIRED])
+        self.assertEqual(1, summary["skips_by_slot"]["fast-entry"][PDM.YIELDED])
+        self.assertEqual(2, summary["runs"]["intraday"]["skipped"])
+        self.assertEqual(1, summary["runs"]["fast-entry"]["skipped"])
 
-    def test_queue_age_combines_lock_events_and_timing(self):
-        events = list(PDM.iter_events([
-            _lock("not_acquired", 60),
-            _timing("intraday", "2026-11-02T09:33:00+08:00", wait=0),
-            _timing("intraday", "2026-11-02T09:36:00+08:00", wait=12),
-        ]))
-        queue = PDM.summarize(events)["queue_age_seconds"]
-        self.assertEqual(3, queue["samples"])
+    def test_queue_age_counts_each_attempt_once(self):
+        summary = _summarize(
+            _lock(PDM.NOT_ACQUIRED, slot="intraday", wait=60),
+            _start("intraday", tick="a", wait=5),
+            _timing_event("intraday", "2026-11-02T09:33:00+08:00", wait=5),
+        )
+        queue = summary["queue_age_seconds"]
+        self.assertEqual(2, queue["samples"], "同一轮的主机锁等待不能计两次")
         self.assertEqual(60.0, queue["max"])
-        self.assertIsNotNone(queue["p50"])
 
-    def test_negative_wait_is_not_counted(self):
-        events = list(PDM.iter_events([_lock("not_acquired", -5)]))
-        self.assertEqual(0, PDM.summarize(events)["queue_age_seconds"]["samples"])
+    def test_queue_age_falls_back_to_end_events_for_legacy_logs(self):
+        queue = _summarize(
+            _timing_event("intraday", "2026-11-02T09:33:00+08:00", wait=0),
+            _timing_event("intraday", "2026-11-02T09:36:00+08:00", wait=12),
+        )["queue_age_seconds"]
+        self.assertEqual(2, queue["samples"])
+        self.assertEqual(12.0, queue["max"])
+
+
+class StatusSemanticsTests(unittest.TestCase):
+    def test_end_event_statuses_are_split_into_four_buckets(self):
+        summary = _summarize(
+            _timing_event("intraday", "2026-11-02T09:30:00+08:00", status="completed"),
+            _timing_event("intraday", "2026-11-02T09:33:00+08:00", status="skipped"),
+            _timing_event("intraday", "2026-11-02T09:36:00+08:00", status="already_done"),
+            _timing_event("intraday", "2026-11-02T09:39:00+08:00", status="failed"),
+            _timing_event("intraday", "2026-11-02T09:42:00+08:00", status="weird"),
+        )
+        ticks = summary["ticks"]
+        self.assertEqual(1, ticks["completed"])
+        self.assertEqual(2, ticks["idle"])
+        self.assertEqual(1, ticks["failed"])
+        self.assertEqual(1, ticks["unknown_status"])
+        runs = summary["runs"]["intraday"]
+        self.assertEqual(
+            {"started": 0, "end_events": 5, "skipped": 0,
+             "completed": 1, "idle": 2, "failed": 1, "unknown": 1},
+            runs,
+        )
+
+    def test_skipped_risk_slot_is_not_a_successful_risk_scan(self):
+        for status in ("skipped", "already_done", "up_to_date", "failed", "blocked"):
+            with self.subTest(status=status):
+                summary = _summarize(
+                    _timing_event("risk", "2026-11-02T09:33:00+08:00", status=status))
+                self.assertIsNone(summary["last_successful_risk_scan"]["at"])
+
+    def test_completed_risk_slot_wins_and_reports_status(self):
+        last = _summarize(_timing_event("risk", "2026-11-02T09:33:00+08:00"))["last_successful_risk_scan"]
+        self.assertEqual("risk_slot", last["source"])
+        self.assertEqual("completed", last["status"])
+        self.assertEqual("risk", last["slot"])
+        self.assertTrue(last["at"].startswith("2026-11-02T09:33"))
+
+    def test_intraday_risk_phase_requires_completed_with_zero_errors(self):
+        stages = {"risk.alt_evidence": {"seconds": 1.0, "errors": 0}}
+        last = _summarize(_timing_event("intraday", "2026-11-02T09:36:00+08:00", stages=stages))
+        self.assertEqual("intraday_risk_phase", last["last_successful_risk_scan"]["source"])
+
+        idle = _summarize(_timing_event("intraday", "2026-11-02T09:36:00+08:00",
+                                        status="skipped", stages=stages))
+        self.assertIsNone(idle["last_successful_risk_scan"]["at"])
+
+        failed = _summarize(_timing_event("intraday", "2026-11-02T09:36:00+08:00",
+                                          status="failed", stages=stages))
+        self.assertIsNone(failed["last_successful_risk_scan"]["at"])
+
+        errors = _summarize(_timing_event(
+            "intraday", "2026-11-02T09:36:00+08:00",
+            stages={"risk.alt_evidence": {"seconds": 1.0, "errors": 1}}))
+        self.assertIsNone(errors["last_successful_risk_scan"]["at"])
+
+    def test_intraday_without_risk_stage_is_not_a_risk_scan(self):
+        last = _summarize(_timing_event(
+            "intraday", "2026-11-02T09:36:00+08:00",
+            stages={"candidate.strategy": {"seconds": 1.0, "errors": 0}}))
+        self.assertIsNone(last["last_successful_risk_scan"]["at"])
+
+    def test_later_failed_risk_event_keeps_the_last_real_success(self):
+        last = _summarize(
+            _timing_event("risk", "2026-11-02T09:33:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:36:00+08:00", status="failed"),
+        )["last_successful_risk_scan"]
+        self.assertEqual("risk_slot", last["source"])
+        self.assertTrue(last["at"].startswith("2026-11-02T09:33"))
 
 
 class IntervalTests(unittest.TestCase):
     def test_start_to_start_uses_started_at_and_counts_breaches(self):
-        events = list(PDM.iter_events([
-            _timing("risk", "2026-11-02T09:30:00+08:00"),
-            _timing("risk", "2026-11-02T09:33:00+08:00"),
-            _timing("risk", "2026-11-02T09:40:00+08:00"),
-        ]))
-        risk = PDM.summarize(events)["start_to_start_seconds"]["risk"]
+        risk = _summarize(
+            _timing_event("risk", "2026-11-02T09:30:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:33:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:40:00+08:00"),
+        )["start_to_start_seconds"]["risk"]
         self.assertEqual(2, risk["samples"])
         self.assertEqual(180.0, risk["p50_seconds"])
         self.assertEqual(420.0, risk["max_seconds"])
@@ -87,72 +318,110 @@ class IntervalTests(unittest.TestCase):
         self.assertEqual(180.0, risk["target_seconds"])
 
     def test_intervals_are_tracked_per_slot(self):
-        events = list(PDM.iter_events([
-            _timing("risk", "2026-11-02T09:30:00+08:00"),
-            _timing("intraday", "2026-11-02T09:31:00+08:00"),
-            _timing("risk", "2026-11-02T09:33:00+08:00"),
-        ]))
-        summary = PDM.summarize(events)["start_to_start_seconds"]
+        summary = _summarize(
+            _timing_event("risk", "2026-11-02T09:30:00+08:00"),
+            _timing_event("intraday", "2026-11-02T09:31:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:33:00+08:00"),
+        )["start_to_start_seconds"]
         self.assertEqual(1, summary["risk"]["samples"])
         self.assertNotIn("intraday", summary)
 
     def test_custom_target_changes_breach_count(self):
-        events = list(PDM.iter_events([
-            _timing("risk", "2026-11-02T09:30:00+08:00"),
-            _timing("risk", "2026-11-02T09:34:00+08:00"),
-        ]))
-        summary = PDM.summarize(events, target_interval_seconds=300)
+        summary = _summarize(
+            _timing_event("risk", "2026-11-02T09:30:00+08:00"),
+            _timing_event("risk", "2026-11-02T09:34:00+08:00"),
+            target_interval_seconds=300,
+        )
         self.assertEqual(0, summary["start_to_start_seconds"]["risk"]["breaches"])
 
 
-class RiskScanTests(unittest.TestCase):
-    def test_risk_slot_event_wins(self):
-        events = list(PDM.iter_events([
-            _timing("risk", "2026-11-02T09:33:00+08:00"),
-        ]))
-        last = PDM.summarize(events)["last_successful_risk_scan"]
-        self.assertEqual("risk_slot", last["source"])
-        self.assertTrue(last["at"].startswith("2026-11-02T09:33"))
+class PathResolutionTests(unittest.TestCase):
+    def test_default_path_follows_the_report_dir(self):
+        path = PDM.scheduler_log_path("/app/reports", {})
+        self.assertEqual(os.path.join("/app/reports", "scheduler.log"), path)
 
-    def test_intraday_risk_phase_is_the_documented_fallback(self):
-        stages = {"risk.alt_evidence": {"seconds": 1.0, "errors": 0}}
-        events = list(PDM.iter_events([
-            _timing("intraday", "2026-11-02T09:36:00+08:00", stages=stages),
-        ]))
-        last = PDM.summarize(events)["last_successful_risk_scan"]
-        self.assertEqual("intraday_risk_phase", last["source"])
+    def test_override_wins_and_blank_override_is_ignored(self):
+        self.assertEqual("/tmp/custom.log",
+                         PDM.scheduler_log_path("/app/reports", {"ASTOCK_SCHEDULER_LOG": " /tmp/custom.log "}))
+        self.assertEqual(os.path.join("/app/reports", "scheduler.log"),
+                         PDM.scheduler_log_path("/app/reports", {"ASTOCK_SCHEDULER_LOG": "   "}))
 
-    def test_failed_intraday_is_not_a_successful_risk_scan(self):
-        stages = {"risk.alt_evidence": {"seconds": 1.0, "errors": 1}}
-        events = list(PDM.iter_events([
-            _timing("intraday", "2026-11-02T09:36:00+08:00", status="failed", stages=stages),
-        ]))
-        self.assertIsNone(PDM.summarize(events)["last_successful_risk_scan"]["at"])
+    def test_default_path_is_repo_relative_so_the_api_container_can_read_it(self):
+        """宿主写 ``reports/``，容器把它挂在 ``/app/reports``：默认值必须同源。"""
+        with mock.patch.dict(os.environ, {"ASTOCK_DATA_DIR": "", "ASTOCK_REPORT_DIR": "",
+                                          "ASTOCK_SCHEDULER_LOG": ""}):
+            import data_paths
+            path = PDM.scheduler_log_path(data_paths.report_dir())
+        self.assertEqual(os.path.join("reports", "scheduler.log"),
+                         os.path.relpath(path, REPO_ROOT))
 
-    def test_intraday_without_risk_stage_is_not_a_risk_scan(self):
-        stages = {"candidate.strategy": {"seconds": 1.0, "errors": 0}}
-        events = list(PDM.iter_events([
-            _timing("intraday", "2026-11-02T09:36:00+08:00", stages=stages),
-        ]))
-        self.assertIsNone(PDM.summarize(events)["last_successful_risk_scan"]["at"])
+    def test_api_image_mounts_the_same_report_dir(self):
+        compose = (REPO_ROOT / "docker-compose.server.yml").read_text(encoding="utf-8")
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("./reports:/app/reports", compose)
+        self.assertIn("WORKDIR /app", dockerfile)
 
 
 class FileTests(unittest.TestCase):
-    def test_missing_file_reports_unavailable_instead_of_raising(self):
+    def test_missing_file_reports_the_reason_instead_of_raising(self):
         result = PDM.summarize_file(Path(tempfile.gettempdir()) / "no-such-scheduler.log")
         self.assertFalse(result["available"])
+        self.assertEqual("missing", result["error"])
+
+    def test_unreadable_file_reports_the_reason_instead_of_raising(self):
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            result = PDM.summarize_file("/app/reports/scheduler.log")
+        self.assertFalse(result["available"])
+        self.assertEqual("unreadable", result["error"])
 
     def test_file_summary_keeps_the_tail(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "scheduler.log"
             path.write_text("\n".join([
-                _timing("risk", "2026-11-02T09:30:00+08:00"),
-                _timing("risk", "2026-11-02T09:33:00+08:00"),
+                _timing_event("risk", "2026-11-02T09:30:00+08:00"),
+                _timing_event("risk", "2026-11-02T09:33:00+08:00"),
             ]) + "\n", encoding="utf-8")
             result = PDM.summarize_file(path)
         self.assertTrue(result["available"])
         self.assertEqual(2, result["lines_scanned"])
         self.assertEqual(1, result["start_to_start_seconds"]["risk"]["samples"])
+
+
+class DispatchStatusTests(unittest.TestCase):
+    """``paper_trading.dispatch_status`` 必须能读到容器内的报告目录副本。"""
+
+    def _trading(self):
+        import paper_trading as paper
+        return paper
+
+    def test_reads_the_report_dir_copy_and_reports_missing(self):
+        paper = self._trading()
+        with tempfile.TemporaryDirectory() as folder:
+            reports = Path(folder) / "reports"
+            reports.mkdir()
+            log = reports / "scheduler.log"
+            log.write_text(_timing_event("risk", "2026-11-02T09:33:00+08:00") + "\n",
+                           encoding="utf-8")
+            env = {"ASTOCK_DATA_DIR": folder, "ASTOCK_REPORT_DIR": "", "ASTOCK_SCHEDULER_LOG": ""}
+            with mock.patch.dict(os.environ, env):
+                available = paper.dispatch_status()
+                self.assertTrue(available["available"], available)
+                self.assertEqual(1, available["ticks"]["end_events"])
+                log.unlink()
+                missing = paper.dispatch_status()
+        self.assertFalse(missing["available"])
+        self.assertEqual("missing", missing["error"])
+
+    def test_env_override_points_at_another_file(self):
+        paper = self._trading()
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "elsewhere.log"
+            log.write_text(_timing_event("risk", "2026-11-02T09:33:00+08:00") + "\n",
+                           encoding="utf-8")
+            with mock.patch.dict(os.environ, {"ASTOCK_SCHEDULER_LOG": str(log)}):
+                result = paper.dispatch_status()
+        self.assertTrue(result["available"], result)
+        self.assertEqual(str(log), result["path"])
 
 
 if __name__ == "__main__":

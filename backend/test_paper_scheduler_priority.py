@@ -45,6 +45,8 @@ class SchedulerPriorityTests(unittest.TestCase):
                 denied = json.loads(fast.stderr)
                 self.assertEqual(denied["event"], "paper_host_lock")
                 self.assertEqual(denied["status"], "not_acquired")
+                # PR-11 观测：被锁挡住的那一轮必须能归因到具体 lane。
+                self.assertEqual(denied["slot"], "fast-entry")
                 self.assertFalse(calls.exists())
                 full = subprocess.Popen(["bash", "-c", command], env=env)
                 time.sleep(0.1)
@@ -54,6 +56,7 @@ class SchedulerPriorityTests(unittest.TestCase):
                 invocation = calls.read_text().strip()
                 self.assertRegex(invocation,
                                  r"^exec --env ASTOCK_PAPER_HOST_LOCK_WAIT_SECONDS=\d+ "
+                                 r"--env ASTOCK_SCHEDULER_TICK_ID=intraday-\d+-\d+ "
                                  r"--env ASTOCK_SCAN_BUDGET_SECONDS=\d+ "
                                  r"--env ASTOCK_SCAN_TAIL_AFTER_SECONDS=\d+ "
                                  r"--env ASTOCK_TRANSPORT_BREAKER_FILE=\S+ "
@@ -162,3 +165,55 @@ class SchedulerPriorityTests(unittest.TestCase):
                 if first.poll() is None:
                     first.kill()
                     first.wait()
+
+    def test_runner_entry_and_exit_events_carry_slot_and_tick_id(self):
+        """进入 runner 前发 start、返回后发 exit：这是"是否真的跑起来"的唯一证据。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            locks = root / "locks"
+            locks.mkdir()
+            source = Path(__file__).resolve().parents[1] / "deploy" / "run_paper_slot.sh"
+            runner = root / "runner.sh"
+            runner.write_text(source.read_text().replace("/opt/astock-codex/.locks", str(locks)))
+            docker = root / "docker"
+            docker.write_text("#!/bin/sh\nexit 0\n")
+            docker.chmod(0o755)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            run = subprocess.run(["bash", str(runner), "intraday"], env=env,
+                                 capture_output=True, text=True, timeout=5)
+            self.assertEqual(run.returncode, 0)
+            events = [json.loads(line) for line in run.stderr.splitlines() if line.strip()]
+        self.assertEqual(["paper_slot_start", "paper_slot_exit"],
+                         [event["event"] for event in events])
+        start, exited = events
+        self.assertEqual("intraday", start["slot"])
+        self.assertEqual(0, start["wait_seconds"])
+        self.assertEqual(start["tick_id"], exited["tick_id"])
+        self.assertRegex(start["tick_id"], r"^intraday-\d+-\d+$")
+        self.assertEqual(0, exited["exit_code"])
+
+    def test_runner_entry_event_is_absent_when_the_lock_is_refused(self):
+        """没抢到锁就没有 start 事件：否则"启动次数"会把被挡住的轮次算进去。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            locks = root / "locks"
+            locks.mkdir()
+            source = Path(__file__).resolve().parents[1] / "deploy" / "run_paper_slot.sh"
+            runner = root / "runner.sh"
+            runner.write_text(source.read_text().replace("/opt/astock-codex/.locks", str(locks)))
+            holder = subprocess.Popen(
+                ["flock", str(locks / "paper-scan.lock"), "sh", "-c", "echo ready; read release"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "ready")
+                denied = subprocess.run(["bash", str(runner), "fast-entry"], timeout=2,
+                                        capture_output=True, text=True)
+            finally:
+                holder.communicate("release\n", timeout=2)
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.wait()
+        self.assertEqual(1, denied.returncode)
+        events = [json.loads(line) for line in denied.stderr.splitlines() if line.strip()]
+        self.assertEqual(["paper_host_lock"], [event["event"] for event in events])

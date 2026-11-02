@@ -1420,7 +1420,7 @@
    ["user_strategy_participation", "strategy_lifecycle"],
    ["walk_forward_validation", "selection_labels"]
   ],
-  "sha256": "0ae38584dc895ec1c8cf2195c53b5b8d04e78501838de955da88d839dba5aaf2",
+  "sha256": "9b084634f580b1ed246dc2d746aa71c464c179261266def5645a3c9afd921057",
   "sql_statement_templates": [
    {"module": "paper_account_ledger", "function": "write_params", "line": 21, "dynamic": true, "targets": ["paper_accounts"]},
    {"module": "paper_account_ledger", "function": "insert_account", "line": 68, "dynamic": true, "targets": ["paper_accounts"]},

@@ -124,6 +124,14 @@ def snapshot(scope):
             result["host_lock_resolution_seconds"] = 1
     except (KeyError, ValueError, TypeError):
         pass
+    # 调度 tick 身份：由 ``deploy/run_paper_slot.sh`` 发 ``paper_slot_start`` 时
+    # 生成并随 docker exec 注入。它只用于把"启动"和"结束"配成同一次尝试，
+    # 不参与任务身份、租约或交易判断；格式不对就当没有。
+    tick = os.environ.get("ASTOCK_SCHEDULER_TICK_ID")
+    if isinstance(tick, str):
+        candidate = tick.strip()
+        if 0 < len(candidate) <= 64 and all(ch.isalnum() or ch in "-_." for ch in candidate):
+            result["scheduler_tick_id"] = candidate
     return result
 
 
