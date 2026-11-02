@@ -12,6 +12,9 @@ cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 COMPOSE="docker compose -f docker-compose.server.yml"
 
+# P11-D: read-only capacity admission before backup/build/restart.
+python3 scripts/pr11_capacity.py --compose docker-compose.server.yml
+
 echo "════════════════════════════════════════"
 echo " A股模拟盘一键部署 $(date '+%Y-%m-%d %H:%M:%S')"
 echo "════════════════════════════════════════"

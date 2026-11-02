@@ -105,7 +105,7 @@ sudo systemctl reload ssh
 
 ## 3. 规格门槛（先算内存，再装东西）
 
-`docker-compose.server.yml` 的四个容器上限合计约 **3.5G**：
+`docker-compose.server.yml` 的五个容器内存上限合计 **4,820 MiB（约4.71 GiB）**：
 
 | 容器 | mem_limit |
 | --- | --- |
@@ -113,15 +113,22 @@ sudo systemctl reload ssh
 | `astock-data-worker` | 650m |
 | `astock-task-worker` | 720m |
 | `astock-paper-worker` | 1250m |
+| `astock-candidate-worker`（P11-D） | 1250m |
 
 - **1 OCPU / 1G 的 `VM.Standard.E2.1.Micro`** 跑不了：盘中扫描会反复 OOM，账本写入被打断。
 - 目标规格：`VM.Standard.A1.Flex` **2–4 OCPU / 8–24G**（Always Free 额度内即可），
-  或 `VM.Standard.E2.1.Micro` 之外的任意 2C4G 及以上。
+  或至少2个可用CPU、6 GiB物理内存且通过容量检查的实例；建议8 GiB以上。
 - 磁盘：引导卷 50G 起步（镜像构建 + `data_cache` + `reports` 增长）。
 - 架构：A1 是 **aarch64**。本项目镜像基于 `python:3.14-slim-bookworm`（多架构）与
   `gcc` 现场编译 sqlite amalgamation，**aarch64 可构建**，但首次构建时间明显长于 x86。
 
 `bootstrap-ubuntu.sh --stage app` 在内存 < 3.2G 时会直接 `exit 3`，确要强上才加 `--force`。
+
+P11-D 另外在正式部署和 bootstrap 构建前执行 `python3 scripts/pr11_capacity.py`：
+从实际 compose 计算五组内存上限总和，再加1 GiB宿主余量，并核对CPU、当前可用
+内存和线程上限。这个精确门禁不受旧的 bootstrap `--force` 影响。它只读配置与
+主机事实，不启动容器；输出不含 env_file 凭据。CPU配额是上限、shares是相对权重，
+不是CPU预留。候选进程不得用额外swap挤占风险工作；两组通过同一数据目录协调SQLite。
 
 ### 3.1 已有的生产实例：`oci-main`
 

@@ -232,6 +232,9 @@ EOF
   export ASTOCK_GIT_COMMIT="$COMMIT"
   COMPOSE=(docker compose -f docker-compose.server.yml)
 
+  # Precise P11-D profile gate also covers fresh installations.
+  python3 scripts/pr11_capacity.py --compose docker-compose.server.yml
+
   if [[ "$SKIP_BUILD" != "1" ]]; then
     log "app：构建镜像（首次约 8-20 分钟，构建 sqlite amalgamation）"
     "${COMPOSE[@]}" build --build-arg "ASTOCK_GIT_COMMIT=$COMMIT"

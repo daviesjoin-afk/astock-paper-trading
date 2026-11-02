@@ -231,6 +231,12 @@ HOST_LOCK_BY_SLOT: dict[str, str] = {
 DEFAULT_HOST_LOCK = "paper-scan.lock"
 
 
+def worker_container_name(slot: str | None) -> str:
+    """Deployment lane only: preserve slot identities and trading dispatch."""
+    return ("astock-paper-worker" if slot in {"risk", "execution-resume"}
+            else "astock-candidate-worker")
+
+
 def host_lock_name(slot: str | None) -> str:
     """该 slot 在宿主机上使用哪把串行锁（纯查表，不碰文件系统）。"""
     return HOST_LOCK_BY_SLOT.get(str(slot or "").strip().lower(), DEFAULT_HOST_LOCK)

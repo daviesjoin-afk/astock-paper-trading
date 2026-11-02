@@ -61,7 +61,7 @@ class SchedulerPriorityTests(unittest.TestCase):
                                  r"--env ASTOCK_SCAN_TAIL_AFTER_SECONDS=\d+ "
                                  r"--env ASTOCK_TRANSPORT_BREAKER_FILE=\S+ "
                                  r"--env ASTOCK_MICRO_BATCH_SIZE=\d+ "
-                                 r"astock-paper-worker python backend/paper_runner.py --slot intraday$")
+                                 r"astock-candidate-worker python backend/paper_runner.py --slot intraday$")
             finally:
                 for process in (holder, full):
                     if process is not None and process.poll() is None:
@@ -219,6 +219,21 @@ class SchedulerPriorityTests(unittest.TestCase):
         self.assertEqual(["paper_host_lock"], [event["event"] for event in events])
 
     # ── PR-11 B：风险快通道的独立主机锁 ────────────────────────────────────
+    def test_each_slot_uses_the_contract_container_route(self):
+        import paper_schedule_contract as schedule
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locks").mkdir()
+            runner = self._risk_runner(root)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            for slot in schedule.RUNNER_SLOTS:
+                with self.subTest(slot=slot):
+                    result = subprocess.run(["bash", str(runner), slot], env=env,
+                                            capture_output=True, text=True, timeout=3)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    call = (root / "docker-call").read_text()
+                    self.assertIn(f"{schedule.worker_container_name(slot)} python backend/paper_runner.py --slot {slot}", call)
+
     def test_execution_lane_runs_while_candidate_and_risk_locks_are_held(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

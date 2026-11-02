@@ -142,16 +142,22 @@ def db(db_path, immediate=False, hot_path=False):
     busy_timeout_ms = 800 if hot_path else 60000
     with PTM.phase("db_acquire"):
         conn = sqlite3.connect(db_path, timeout=timeout)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        apply_journal_mode(conn, hot_path=hot_path)
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-32000")
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA wal_autocheckpoint=1000")
-        if immediate:
-            conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            apply_journal_mode(conn, hot_path=hot_path)
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-32000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            # The context has not yielded yet; the transaction finally below
+            # cannot close a connection rejected during setup or writer claim.
+            conn.close()
+            raise
     try:
         with PTM.phase("db_transaction_body"):
             yield conn
