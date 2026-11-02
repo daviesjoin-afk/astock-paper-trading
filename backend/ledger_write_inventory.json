@@ -5227,6 +5227,18 @@
    ]
   },
   {
+   "function": "_run_waiting_peer",
+   "kind": "static",
+   "line": 101,
+   "module": "test_paper_execution_retry",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_orders( account_id,side,code,name,qty,remaining_qty,planned_price,status, reason,risk_payload,created_at,strategy_id,strategy_version,strategy",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
    "function": "test_account_metric_inputs_batches_legacy_safe_projection",
    "kind": "static",
    "line": 44,

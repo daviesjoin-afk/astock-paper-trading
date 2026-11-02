@@ -31,7 +31,7 @@ def run_execution_resume(day, *, monitor_risk: Callable, resume_orders: Callable
         return PRSS.blocked_round_result(
             slot="execution-resume", date=day.isoformat(), risk=risk,
             reason="风控扫描未完成：本轮不恢复已批准委托",
-            extra={"execution_orders": []},
+            extra={"execution_orders": [], "retry_reason": "risk_in_progress"},
         )
     return {"status": "ok", "slot": "execution-resume", "date": day.isoformat(),
             "risk": risk, "execution_orders": resume_orders(day)}
