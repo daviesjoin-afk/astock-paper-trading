@@ -75,11 +75,8 @@ def account_metrics(conn, account, quotes=None, positions=None, metric_cache=Non
         # 直查分支与缓存分支必须产出**同一批**已验证成交：两处各写一份 SQL 会让
         # trade_count / realized_pnl / 胜率随调用方是否传 cache 而漂移（同一账户
         # 同一时刻出现两个执行绩效）。统一走仓储的已验证卖出投影。
-        sells = list(
-            (
-                _ports().account_metric_inputs(conn, [account["id"]], today).get("sells") or {}
-            ).get(account["id"], [])
-        )
+        metric_inputs = _ports().account_metric_inputs(conn, [account["id"]], today)
+        sells = list((metric_inputs.get("sells") or {}).get(account["id"], []))
     else:
         sells = list((metric_cache.get("sells") or {}).get(account["id"], []))
     # A strategy may have sold its last position today.  In that case the
@@ -95,10 +92,7 @@ def account_metrics(conn, account, quotes=None, positions=None, metric_cache=Non
     if missing_sell_codes and allow_network:
         quotes = {**quotes, **_ports().quotes(missing_sell_codes)}
     if metric_cache is None:
-        buy_count = int(conn.execute(
-            "SELECT COUNT(*) FROM paper_fills WHERE account_id=? AND side='buy'",
-            (account["id"],),
-        ).fetchone()[0])
+        buy_count = int((metric_inputs.get("buy_count") or {}).get(account["id"], 0))
         rejected = int(POL.nonfilled_order_count(conn, account["id"]))
     else:
         buy_count = int((metric_cache.get("buy_count") or {}).get(account["id"], 0))

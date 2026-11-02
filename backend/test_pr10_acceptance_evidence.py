@@ -13,6 +13,19 @@ MAPPING = json.loads((BACKEND / "ledger_migration_map.json").read_text(encoding=
 
 
 class FrozenMigrationTests(unittest.TestCase):
+    def test_account_projection_reuses_existing_fill_read_owner(self):
+        evidence = json.loads((BACKEND / "ledger_fanout_evidence.json").read_text(encoding="utf-8"))
+        before = evidence["before"]["tables"]
+        after = evidence["after"]["tables"]
+        self.assertEqual({"paper_account_metrics"},
+                         set(before["paper_fills"]["readers"]) - set(after["paper_fills"]["readers"]))
+        self.assertEqual(set(),
+                         set(after["paper_fills"]["readers"]) - set(before["paper_fills"]["readers"]))
+        self.assertEqual(before["paper_fills"]["writers"], after["paper_fills"]["writers"])
+        self.assertNotIn("paper_account_metrics", INV.scan_readers()["paper_fills"])
+        self.assertLess(sum(len(s["references"]) for s in after.values()),
+                        sum(len(s["references"]) for s in before.values()))
+
     def test_original_ids_are_covered_once_and_keep_original_metadata(self):
         self.assertEqual("52eb50d390a05f88b451cf31f12bfb1b3df59391", FROZEN["ref"])
         self.assertEqual(57, FROZEN["writer_function_groups"])

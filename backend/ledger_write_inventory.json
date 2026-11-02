@@ -4890,9 +4890,21 @@
    ]
   },
   {
+   "function": "test_fill_counts_keep_account_side_and_caller_rollback_boundaries",
+   "kind": "static",
+   "line": 149,
+   "module": "test_paper_account_metrics",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_fills VALUES(?,?)",
+   "write_targets": [
+    "paper_fills"
+   ]
+  },
+  {
    "function": "test_empty_account_has_fixed_values",
    "kind": "static",
-   "line": 180,
+   "line": 206,
    "module": "test_paper_account_metrics",
    "read_refs": [],
    "role": "test",
@@ -4905,7 +4917,7 @@
   {
    "function": "test_past_cycle_and_other_account_do_not_change_account_boundary",
    "kind": "static",
-   "line": 227,
+   "line": 253,
    "module": "test_paper_account_metrics",
    "read_refs": [],
    "role": "test",
