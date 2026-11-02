@@ -547,22 +547,22 @@ def terminate_for_dispatch(conn, signal_id, *, status, reason):
     )
 
 
-def retire_waitlist_signals(conn, signal_ids, *, statuses: Sequence[str]):
-    """等待池旧委托对应的信号转 superseded；身份由调用方给定（不在本模块查订单表）。"""
-    ids = [int(signal_id) for signal_id in signal_ids]
+def retire_waitlist_signals(conn, *, statuses: Sequence[str]):
+    """按订单标记集合退役信号；单条 UPDATE，不把历史 ID 搬到 Python。"""
     states = tuple(statuses)
-    if not ids:
-        return 0
     if not states:
         raise ValueError("retire_waitlist_signals 需要非空状态集合")
-    id_marks = ",".join("?" for _ in ids)
     state_marks = ",".join("?" for _ in states)
     return conn.execute(
         f"""UPDATE paper_signals
               SET status='superseded',
                   reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代'
-            WHERE id IN ({id_marks}) AND status IN ({state_marks})""",
-        (*ids, *states),
+            WHERE id IN (
+                SELECT signal_id FROM paper_orders
+                WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
+                  AND reason LIKE '%等待池记录已保留%'
+            ) AND status IN ({state_marks})""",
+        states,
     ).rowcount
 
 

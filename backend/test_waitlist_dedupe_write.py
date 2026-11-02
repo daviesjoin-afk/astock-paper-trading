@@ -139,6 +139,31 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(_state(legacy), _state(owner))
 
+    def test_history_exceeds_bind_limit_with_duplicates_and_terminal_signals(self):
+        for status in ("filled", "pending"):
+            with self.subTest(status=status):
+                orders = [(i, 7, "AAA", "buy", "superseded", ORDER_MARK, (i + 1) // 2)
+                          for i in range(1, 81)]
+                signals = [(i, status, None) for i in range(1, 41)]
+                with _db(orders, signals) as legacy, _db(orders, signals) as owner:
+                    for conn in (legacy, owner):
+                        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32)
+                    self.run_legacy(legacy)
+                    self.run_owner(owner)
+                    self.assertEqual(_state(legacy), _state(owner))
+
+    def test_signal_update_failure_is_statement_atomic_and_caller_can_rollback(self):
+        with _db() as conn:
+            before = _state(conn)
+            conn.execute("""CREATE TRIGGER reject_signal BEFORE UPDATE ON paper_signals
+                            WHEN NEW.id=12 BEGIN SELECT RAISE(ABORT,'reject'); END""")
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.run_owner(conn)
+            self.assertEqual(before["paper_signals"], _state(conn)["paper_signals"])
+            self.assertTrue(conn.in_transaction)
+            conn.rollback()
+            self.assertEqual(before, _state(conn))
+
     def test_superseded_rows_reasons_and_untouched_rows(self):
         conn = _db()
         self.run_owner(conn)
@@ -180,9 +205,8 @@ class WaitlistDedupeParityTests(unittest.TestCase):
         self.assertTrue(writes[1].startswith("UPDATE paper_signals"))
         self.assertIn(ORDER_MARK, writes[0])
         self.assertIn(SIGNAL_MARK, writes[1])
-        # A 第二片之后：信号身份由订单 owner 的只读反查给出，
-        # signal 语句只按 id 集合写入，不再自己在子查询里读订单表。
-        self.assertNotIn("paper_orders", writes[1].lower())
+        # 信号 owner 只写信号表；订单表作为集合子查询读取，保留固定参数规模。
+        self.assertIn("SELECT signal_id FROM paper_orders", writes[1])
         self.assertIn("WHERE id IN (", writes[1])
 
     def test_repeat_run_is_idempotent(self):
@@ -261,7 +285,7 @@ class WaitlistDedupeOwnershipTests(unittest.TestCase):
         source = inspect.getsource(EPD.retire_duplicate_waitlist)
         self.assertIn("POL.retire_duplicate_waitlist_orders", source)
         self.assertIn("signals.retire_waitlist_signals", source)
-        self.assertIn("POL.signal_ids_by_reason_marker", source)
+        self.assertNotIn("signal_ids", source)
         self.assertNotIn("UPDATE ", source.upper())
 
     def test_owner_is_exported_and_no_new_module_joins_the_writer_sets(self):

@@ -1971,24 +1971,28 @@
   },
   {
    "function": "retire_waitlist_signals",
-   "kind": "static",
-   "line": 561,
+   "kind": "dynamic",
+   "line": 557,
    "module": "signal_service",
-   "read_refs": [],
+   "read_refs": [
+    "paper_orders"
+   ],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN (",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
    "write_targets": [
     "paper_signals"
    ]
   },
   {
    "function": "retire_waitlist_signals",
-   "kind": "dynamic",
-   "line": 561,
+   "kind": "static",
+   "line": 557,
    "module": "signal_service",
-   "read_refs": [],
+   "read_refs": [
+    "paper_orders"
+   ],
    "role": "runtime",
-   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ({}) AND status IN ({})",
+   "sql": "UPDATE paper_signals SET status='superseded', reason=COALESCE(reason,'') || '；等待池旧委托已由后续记录替代' WHERE id IN ( SELECT signal_id FROM paper_orders WHERE status='sup",
    "write_targets": [
     "paper_signals"
    ]
@@ -10853,7 +10857,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 179,
+   "line": 204,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",
@@ -10865,7 +10869,7 @@
   {
    "function": "test_order_write_precedes_signal_write",
    "kind": "static",
-   "line": 180,
+   "line": 205,
    "module": "test_waitlist_dedupe_write",
    "read_refs": [],
    "role": "test",

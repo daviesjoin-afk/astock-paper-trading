@@ -31,10 +31,10 @@ class InventoryScanTests(unittest.TestCase):
         # 信号对账只写信号表：子查询里出现的订单表不应被记成订单写入。
         signal_write = by_key[("signal_service", "reconcile_signal_status")]
         self.assertEqual(["paper_signals"], signal_write["write_targets"])
-        # 等待池信号的写入不再读订单表（身份由调用方给出）。
+        # 等待池信号只写信号表，订单表仍在集合子查询内读取。
         waitlist = by_key[("signal_service", "retire_waitlist_signals")]
         self.assertEqual(["paper_signals"], waitlist["write_targets"])
-        self.assertEqual([], waitlist["read_refs"])
+        self.assertEqual(["paper_orders"], waitlist["read_refs"])
         # 正例：确实同时读订单表的语句，写目标与读引用分别登记。
         readers = [e for e in entries
                    if e["role"] == "runtime" and e["read_refs"]

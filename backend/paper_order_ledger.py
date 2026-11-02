@@ -243,13 +243,3 @@ def retire_duplicate_waitlist_orders(conn, *, waitlist_status):
     )
 
 
-def signal_ids_by_reason_marker(conn, marker: str) -> list[int]:
-    """只读辅助：按原因标记反查需要一并回收的信号 id。"""
-    return [
-        int(row[0]) for row in conn.execute(
-            """SELECT signal_id FROM paper_orders
-               WHERE status='superseded' AND side='buy' AND signal_id IS NOT NULL
-                 AND reason LIKE ?""",
-            (f"%{marker}%",),
-        )
-    ]

@@ -588,10 +588,7 @@ def retire_duplicate_waitlist(conn, *, waitlist_status, signal_statuses, signals
     会漏掉本轮新标记的行。使用传入连接，不读时钟、不提交。
     """
     POL.retire_duplicate_waitlist_orders(conn, waitlist_status=waitlist_status)
-    # 订单标记由 owner 写入；信号身份用 owner 的只读反查取出，读取留在本层，
-    # 避免 signal 侧新增对订单表的静态依赖。
-    signal_ids = POL.signal_ids_by_reason_marker(conn, "等待池记录已保留")
-    signals.retire_waitlist_signals(conn, signal_ids, statuses=signal_statuses)
+    signals.retire_waitlist_signals(conn, statuses=signal_statuses)
 
 
 def _terminate(
