@@ -253,8 +253,10 @@ class SchedulerPriorityTests(unittest.TestCase):
                 if holder.poll() is None:
                     holder.kill()
                     holder.wait()
+            # 断言必须在临时目录还存在时取证据：目录在 with 结束时已被删除。
+            docker_called = (root / "docker-call").exists()
         self.assertEqual(0, run.returncode, run.stderr)
-        self.assertTrue((root / "docker-call").exists(), "risk 被共享锁挡住了")
+        self.assertTrue(docker_called, "risk 被共享锁挡住了")
         events = [json.loads(line) for line in run.stderr.splitlines() if line.strip()]
         self.assertEqual(["paper_slot_start", "paper_slot_exit"],
                          [event["event"] for event in events])
@@ -281,12 +283,13 @@ class SchedulerPriorityTests(unittest.TestCase):
                 if holder.poll() is None:
                     holder.kill()
                     holder.wait()
+            docker_called = (root / "docker-call").exists()
         self.assertEqual(1, denied.returncode)
         event = json.loads(denied.stderr)
         self.assertEqual("paper_host_lock", event["event"])
         self.assertEqual("not_acquired", event["status"])
         self.assertEqual("risk", event["slot"])
-        self.assertFalse((root / "docker-call").exists())
+        self.assertFalse(docker_called)
 
     def test_risk_lane_never_leaves_a_full_scan_intent_marker(self):
         """意图标记是共用 paper-scan.lock 的 lane 的协议；风险 lane 不参与。"""
