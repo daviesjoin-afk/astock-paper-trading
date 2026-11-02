@@ -40,6 +40,7 @@ RUN_SLOTS: tuple[str, ...] = (
     "auction",
     "open",
     "risk",
+    "execution-resume",
     "close",
     "weekly-review",
     "intraday",
@@ -59,13 +60,13 @@ RUNNER_SLOTS: tuple[str, ...] = RUN_SLOTS + RUNNER_ONLY_SLOTS
 #: Slots whose lease TTL and lock retry policy assume a short, latency-sensitive
 #: pass.  Mirrors ``paper_trading.HOT_PATH_SLOTS``.
 HOT_PATH_SLOTS: frozenset[str] = frozenset(
-    {"auction", "open", "risk", "intraday", "fast-entry", "auction-track"}
+    {"auction", "open", "risk", "execution-resume", "intraday", "fast-entry", "auction-track"}
 )
 
 #: Legacy validation message.  Preserved verbatim: callers and tests assert on
 #: this exact string, and rewording it would be a user-visible change disguised
 #: as a refactor.
-SLOT_ERROR = "slot 必须是 auction、open、risk、close、weekly-review 或 intraday"
+SLOT_ERROR = "slot 必须是 auction、open、risk、execution-resume、close、weekly-review 或 intraday"
 
 _WEEKDAY_DAYS = "MON,TUE,WED,THU,FRI"
 
@@ -140,6 +141,10 @@ SCHEDULE_TASKS: tuple[ScheduleTask, ...] = (
                  repeat="01:55"),
     ScheduleTask("A股模拟盘-风险快通道-下午", "13:00", "risk", _WEEKDAY_DAYS,
                  repeat="01:55"),
+    ScheduleTask("A股模拟盘-委托恢复-上午", "09:33", "execution-resume", _WEEKDAY_DAYS,
+                 repeat="01:55"),
+    ScheduleTask("A股模拟盘-委托恢复-下午", "13:00", "execution-resume", _WEEKDAY_DAYS,
+                 repeat="01:55"),
     ScheduleTask("A股模拟盘-开盘审批", "09:31", "open", _WEEKDAY_DAYS,
                  retry_clocks=("09:33", "09:35")),
     ScheduleTask("A股模拟盘-盘后评分", "15:05", "close", _WEEKDAY_DAYS,
@@ -210,14 +215,17 @@ RISK_CRON_MINUTES: dict[int, str] = dict(INTRADAY_CRON_MINUTES)
 REPEAT_CRON_MINUTES: dict[str, dict[int, str]] = {
     "intraday": INTRADAY_CRON_MINUTES,
     "risk": RISK_CRON_MINUTES,
+    "execution-resume": INTRADAY_CRON_MINUTES,
 }
 
 #: 宿主串行锁（``deploy/run_paper_slot.sh`` 里 ``flock`` 的那把文件）按 slot 分配。
 #:
 #: 默认仍是共享的 ``paper-scan.lock``：竞价、开盘审批、日内监控、快通道继续互相
-#: 串行，PR-11 不删除这把锁。``risk`` 是独立的 lane，用 ``risk-scan.lock``，因此
-#: 全市场扫描/候选生成再慢，也不会让风险 pass 停在排队里。
-HOST_LOCK_BY_SLOT: dict[str, str] = {"risk": "risk-scan.lock"}
+#: 串行，PR-11 不删除这把锁。risk 与 execution-resume 各有独立锁；候选扫描
+#: 不通过共享锁挡住它们。共享 cgroup 资源隔离留 P11-D。
+HOST_LOCK_BY_SLOT: dict[str, str] = {
+    "risk": "risk-scan.lock", "execution-resume": "execution-scan.lock",
+}
 
 #: 没有独立锁的 slot 共用的宿主锁文件名。
 DEFAULT_HOST_LOCK = "paper-scan.lock"
@@ -236,6 +244,12 @@ def joins_full_scan_intent(slot: str | None) -> bool:
     留了标记而让路。
     """
     return host_lock_name(slot) == DEFAULT_HOST_LOCK
+
+
+def window_run_key(slot, moment):
+    """Align repeating lane identities to the same three-minute grid."""
+    minute = moment.minute // INTRADAY_INTERVAL_MINUTES * INTRADAY_INTERVAL_MINUTES
+    return f"{slot}:{moment.replace(minute=minute, second=0, microsecond=0):%Y%m%d%H%M}"
 
 
 def render_cron_lines() -> list[str]:

@@ -182,7 +182,11 @@
 - 出口：`risk` 的 start-to-start interval 达到目标（P11-A 的量法）；同一分钟不出现第二次
   风险 pass；保护性减仓结果逐字段等价。
 
-#### P11-B 实际落地（已实现，待审核）
+#### P11-B 实际落地（#325 已合并，不部署）
+
+最终审核 HEAD `f1c276b`，5 个提交；宿主与断网容器各 7,845 项通过，CI 六项与
+两轮安全扫描成功。Ready 后 Squash 为 `b8b38751301bad23efe51fc7c81a7b4f68109517`。
+`max_file_lines` 的额外 +16 行门禁接线例外已登记，不能表述为所有预算均未放宽。
 
 | 决策 | 取值 | 理由 |
 | --- | --- | --- |
@@ -220,6 +224,35 @@
 - 范围：把已批准 pending execution 的恢复拆成独立短任务（独立锁 + lease），每单重新取新鲜报价，
   仍走 `execution_planner` / execution authority / `commit_fill`。
 - 出口：恢复不再等候选重算；同轮不重复恢复同一批委托；成交结果逐字段等价。
+
+#### P11-C 实际落地（待审核，不部署）
+
+- 从 #325 合并后的 master `b8b38751301bad23efe51fc7c81a7b4f68109517` 开始。
+- 新 slot `execution-resume` 与风险采用相同三分钟网格：Linux 09:33–11:24、
+  13:00–14:57，独立外层锁 `execution-resume.lock`、主机锁 `execution-scan.lock`、
+  租约 `paper-runner-execution`（TTL 600 秒，沿用心跳与 fencing）。保留所有旧全局锁。
+- 窗口身份 `execution-resume:YYYYMMDDHHMM` 进入原 `paper_job_runs`；同窗口完成后
+  不再次恢复。running 返回 `in_progress`，重试耗尽的失败仍返回非成功，不能冒充
+  `already_done`。相邻窗口也由同一租约串行，失去租约后不能完成写入。
+- **自动调用的调度变化**：open/intraday 不再自行调用恢复函数；委托统一在独立任务
+  的下一次触发时恢复。原返回字段 `execution_orders` 保留空列表，显式传入的结果
+  仍可复用。避免保留三个独立入口后又添加嵌套任务、重复恢复或重新审批。
+- 独立任务先调用原 `monitor_risk`：只有已完成结果才能恢复；未完成、不可用、失败或
+  cycle 翻转仍由 B 的门禁阻止。已完成风险的窗口 claim 不重跑风险 pass，缺少完成证据
+  时沿用现有风控兜底。不拉全市场候选，不评分、不生成或审批新信号。
+- `process_pending_execution_orders` 保持冻结实现：每次恢复重新抓取逐票报价，在
+  报价 I/O 后开启写事务，逐单重新读取状态，沿用 `commit_fill` 的执行权威、
+  事件幂等、资金、T+1、停牌/涨跌停、cycle、savepoint 与异常处理。该恢复函数排除手工单，
+  风控兜底内部既有的手工单处理不变。
+- 新 lane 失败进入 `schedule_status` 告警；真实风险完成标记按新 lane 归因，
+  不将仅完成恢复的任务计作新的成功风控。
+- Windows 任务从契约表注册。沿用的重复窗口终点差异、共享 cgroup 竞争、生产180秒
+  节拍仍待部署/P11-D 实测；独立锁不代表资源隔离已完成或 PR-11 总体验收通过。
+
+离线验收：真实 SQLite 与线程屏障覆盖同窗口/跨窗口竞争、租约隔离、失败重试和
+fencing；克隆账本逐字段比较冻结恢复函数与新 slot 的订单、成交、持仓、lots、账户、
+信号、预占、风险决策与审计。原 partial-fill golden replay 继续验证相同报价不重复成交、
+新报价继续同一订单；POSIX 主机锁由远端宿主与断网容器验收。
 
 ### P11-D：`candidate-full` lane 与资源预算
 

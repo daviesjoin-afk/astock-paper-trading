@@ -244,7 +244,7 @@ def _is_risk_pass(event, slot, bucket):
     ``already_done`` 之类的 idle 结束、``failed`` 结束、以及阶段 errors
     无法解析（未知不等于 0）。
     """
-    if slot not in ("risk", "intraday") or bucket != "completed":
+    if slot not in ("risk", "intraday", "execution-resume") or bucket != "completed":
         return False
     timing = _timing_block(event)
     scans = timing.get("risk_scans") if timing is not None else None
@@ -460,7 +460,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
                         intervals.setdefault(slot, []).append(gap)
             last_starts[slot] = started_at
 
-        if slot in ("risk", "intraday"):
+        if slot in ("risk", "intraday", "execution-resume"):
             _risk_scan_counts(event, slot, risk_scan_summary)
 
         if slot == "risk" and _is_risk_pass(event, slot, bucket):
@@ -471,7 +471,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
         elif last_risk["source"] != "risk_slot" and _is_risk_pass(event, slot, bucket):
             last_risk = {
                 "at": started_at.isoformat() if started_at else None,
-                "source": "intraday_risk_phase", "status": status, "slot": slot,
+                "source": f"{slot.replace('-', '_')}_risk_phase", "status": status, "slot": slot,
             }
 
     unfinished = 0

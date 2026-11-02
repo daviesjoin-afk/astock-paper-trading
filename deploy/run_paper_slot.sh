@@ -38,10 +38,13 @@ trap cleanup_marker EXIT INT TERM
 # ``test_paper_scheduler_priority`` 的进程级用例共同盯住。
 #
 # 默认仍是 ``paper-scan.lock``：竞价、开盘审批、日内监控、快通道继续互相串行
-# （PR-11 不删除任何既有锁）。``risk`` 有自己的 ``risk-scan.lock``，因此全市场
-# 候选扫描再慢，也不会让风险 pass 在主机锁上排队。
+# （PR-11 不删除任何既有锁）。risk 与 execution-resume 各有独立锁，因此全市场
+# 候选扫描不会通过共享锁挡住风险与已批准委托恢复；cgroup 资源隔离留 P11-D。
 if [[ "$slot" == "risk" ]]; then
   lane_lock="risk-scan.lock"
+  lock_options=(-n)
+elif [[ "$slot" == "execution-resume" ]]; then
+  lane_lock="execution-scan.lock"
   lock_options=(-n)
 elif [[ "$slot" == "fast-entry" ]]; then
   now=$(date +%s)

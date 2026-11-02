@@ -18,7 +18,7 @@ import paper_timing as timing
 
 
 class TimingTests(unittest.TestCase):
-    def test_ready_scan_passes_nonempty_resume_result_to_open_once(self):
+    def test_ready_scan_leaves_execution_recovery_to_the_independent_lane(self):
         import datetime as dt
         import paper_trading as paper
         orders = [{"order_id": 7, "status": "partially_filled", "remaining_qty": 700}]
@@ -37,19 +37,19 @@ class TimingTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", return_value=[]))
             stack.enter_context(mock.patch.object(paper, "monitor_risk", return_value=risk_result))
             resume = stack.enter_context(mock.patch.object(paper, "process_pending_execution_orders", return_value=orders))
-            opening = stack.enter_context(mock.patch.object(paper, "execute_open", return_value={"orders": [], "execution_orders": orders}))
+            opening = stack.enter_context(mock.patch.object(paper, "execute_open", return_value={"orders": [], "execution_orders": []}))
             result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10), force=True)
-        resume.assert_called_once()
+        resume.assert_not_called()
         # PR-7：同轮候选阶段的新闻快照会一起传下去（这里 bootstrap 被 mock 成 {}，
         # 因此是 None）；复用与否由快照 owner 判定，不在这里做决定。
         opening.assert_called_once_with(dt.date(2026, 10, 20), risk_result=risk_result,
-                                        execution_orders=orders, news_snapshot=None)
-        self.assertIs(result["execution_orders"], orders)
+                                        execution_orders=[], news_snapshot=None)
+        self.assertEqual(result["execution_orders"], [])
 
     def test_priority_failure_stops_candidate_scan_and_preserves_exception(self):
         import datetime as dt
         import paper_trading as paper
-        for failed in ("monitor_risk", "process_pending_execution_orders"):
+        for failed in ("monitor_risk",):
             for error in (RuntimeError("provider failure"), RuntimeError("paper lease lost: test fence")):
                 with self.subTest(failed=failed, error=type(error).__name__), \
                         mock.patch.object(paper, "init_db"), \
@@ -89,9 +89,8 @@ class TimingTests(unittest.TestCase):
             risk = stack.enter_context(mock.patch.object(paper, "monitor_risk", side_effect=lambda *_: sequence.append("risk") or {"orders": []}))
             result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10, 0), force=True)
         risk.assert_called_once()
-        resume.assert_called_once()
-        self.assertLess(sequence.index("risk"), sequence.index("resume"))
-        self.assertLess(sequence.index("resume"), sequence.index("refresh"))
+        resume.assert_not_called()
+        self.assertLess(sequence.index("risk"), sequence.index("refresh"))
         self.assertEqual(result["bootstrap"]["status"], "blocked")
 
     def test_explicit_worker_binding_collects_timing_without_other_contexts(self):
@@ -387,6 +386,7 @@ class SlotLedgerTimingTests(unittest.TestCase):
         risk = timing.timed("risk_pass")(lambda *_: {"orders": []})
         refresh = timing.timed("risk_snapshot_enqueue")(lambda **_: {"status": "completed"})
         with mock.patch.object(paper, "monitor_risk", side_effect=risk) as work, \
+                mock.patch.object(paper, "_slot_run_key", return_value="risk:202610161002"), \
                 mock.patch.object(paper, "request_risk_snapshot_refresh", side_effect=refresh):
             first = paper.run_slot("risk", asof_date="2026-10-16", force=True)
             saved = self._job()
