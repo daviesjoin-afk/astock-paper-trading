@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 import paper_dispatch_metrics as PDM
+import paper_risk_scan_state as PRSS
 import paper_trading as PT
 from test_paper_risk_exit_production_path import PaperRiskExitProductionPathTestCase
 
@@ -135,6 +136,135 @@ class RiskLaneRuntimeTests(PaperRiskExitProductionPathTestCase):
         summary = PDM.summarize([event])
         self.assertIsNone(summary["last_successful_risk_scan"]["at"],
                           "intraday 兜底没有真扫描，不能记成一次成功风控")
+
+
+class RiskScanWindowIdentityTests(unittest.TestCase):
+    """扫描身份必须与三分钟窗口对齐，否则同一窗口会跑两次真实风控。"""
+
+    #: 身份取整归 durable 扫描状态 owner（``paper_risk_scan_state``），
+    #: ``paper_trading`` 只负责调用它——两边共用一个实现才不会再漂移。
+
+    def test_scan_window_minute_matches_the_risk_business_key(self):
+        # 09:34 与 09:35 属于同一个三分钟窗口（09:33 起算），身份必须相同。
+        for moment in (REAL_DATETIME(2026, 9, 10, 9, 33, 5),
+                       REAL_DATETIME(2026, 9, 10, 9, 34, 59),
+                       REAL_DATETIME(2026, 9, 10, 9, 35, 0)):
+            with self.subTest(moment=moment):
+                self.assertEqual("2026-09-10 09:33", PRSS.window_minute(moment))
+                self.assertEqual("risk:202609100933", PT._risk_business_key(moment))
+
+    def test_scan_window_minute_rolls_to_the_next_window(self):
+        self.assertEqual("2026-09-10 09:36",
+                         PRSS.window_minute(REAL_DATETIME(2026, 9, 10, 9, 36, 1)))
+        self.assertEqual("2026-09-10 14:57",
+                         PRSS.window_minute(REAL_DATETIME(2026, 9, 10, 14, 59, 30)))
+
+
+class RiskRunningGateTests(PaperRiskExitProductionPathTestCase):
+    """P0：``running`` 不等于完成，intraday 不得在风控未完成时进入执行与候选。"""
+
+    def test_intraday_gate_blocks_execution_and_candidates_while_risk_runs(self):
+        resume = mock.Mock(return_value=[])
+        refresh = mock.Mock(return_value=[])
+        opening = mock.Mock(return_value={"orders": [], "execution_orders": []})
+        running = {"status": "risk_running", "deferred": True,
+                   "risk_scan_state": "running", "orders": []}
+        with mock.patch.object(PT, "init_db"),                 mock.patch.object(PT, "_cleanup_stale_data"),                 mock.patch.object(PT.dfc, "check_data_source_health", return_value={}),                 mock.patch.object(PT, "monitor_risk", return_value=running),                 mock.patch.object(PT, "process_pending_execution_orders", resume),                 mock.patch.object(PT.MDSvc, "refresh_rows", refresh),                 mock.patch.object(PT, "execute_open", opening):
+            result = PT.monitor_intraday(self.day, force=True)
+        self.assertEqual("risk_in_progress", result["status"])
+        self.assertTrue(result["deferred"])
+        self.assertEqual([], result["execution_orders"])
+        resume.assert_not_called()
+        refresh.assert_not_called()
+        opening.assert_not_called()
+        # 外层 scheduler 必须看到非成功状态，才会在同一窗口内重试。
+        self.assertEqual("failed", PT._slot_completion_status(result))
+
+    def test_barrier_risk_still_running_returns_risk_running_and_does_not_complete(self):
+        """可控 barrier：risk lane 认领后阻塞在执行中，intraday 兜底必须 fail-closed。"""
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+        def blocking_impl(asof_date=None, *, cycle_id):
+            started.set()
+            if not release.wait(30):
+                raise AssertionError("测试未释放 risk lane 阻塞")
+            # 认领与完成事务仍由 monitor_risk 自己做；这里只模拟"执行阶段耗时"，
+            # 避免在并发窗口里再跑真实风控写事务（那会把 SQLite 锁带进断言）。
+            return {"slot": "risk", "date": str(asof_date), "orders": [], "manual_orders": []}
+
+        lane = {}
+
+        def run_lane():
+            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
+                lane.update(PT.monitor_risk(self.day) or {})
+
+        thread = threading.Thread(target=run_lane, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
+            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 0.0),                     mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.01):
+                fallback = PT.monitor_risk(self.day)
+            self.assertEqual("risk_running", fallback["status"])
+            self.assertTrue(fallback["deferred"])
+            self.assertEqual("running", fallback["risk_scan_state"])
+            self.assertEqual("failed", PT._slot_completion_status(fallback))
+        finally:
+            release.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive(), "risk lane 线程未结束")
+        self.assertNotIn("status", lane, "阻塞解除后 risk lane 应正常完成（无状态即成功）")
+
+    def test_barrier_peer_completion_turns_the_wait_into_already_scanned(self):
+        """同一 barrier 下，对端在等待窗口内完成 ⇒ 本入口得到 already_scanned。"""
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+        def blocking_impl(asof_date=None, *, cycle_id):
+            started.set()
+            release.wait(30)
+            return {"slot": "risk", "date": str(asof_date), "orders": [], "manual_orders": []}
+
+        def run_lane():
+            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "_monitor_risk_impl", blocking_impl):
+                PT.monitor_risk(self.day)
+
+        thread = threading.Thread(target=run_lane, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(30), "risk lane 未能认领扫描")
+            timer = threading.Timer(0.2, release.set)
+            timer.start()
+            with _fixed_clock(REAL_DATETIME(2026, 9, 10, 14, 48)),                     mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 30.0),                     mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.02):
+                fallback = PT.monitor_risk(self.day)
+            self.assertEqual("already_scanned", fallback["status"])
+            self.assertEqual("completed", PT._slot_completion_status(fallback))
+        finally:
+            release.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+
+
+class ScheduleStatusRiskLaneTests(PaperRiskExitProductionPathTestCase):
+    """独立风险任务的失败必须进入运行状态汇总。"""
+
+    def test_failed_risk_run_surfaces_in_schedule_status(self):
+        today = dt.date.today().isoformat()
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO paper_job_runs"
+                "(run_key,slot,market_date,status,detail,started_at,finished_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (f"risk:{today.replace('-', '')}0933", "risk", today, "failed",
+                 "{}", f"{today} 09:33:00", f"{today} 09:33:05"),
+            )
+        status = PT.schedule_status()
+        self.assertTrue(any(row["run_key"].startswith("risk:")
+                            for row in status["latest_risk_runs"]))
+        self.assertEqual("异常", status["runtime_status"])
+        self.assertGreaterEqual(status["runtime_failed_count"], 1)
 
 
 if __name__ == "__main__":

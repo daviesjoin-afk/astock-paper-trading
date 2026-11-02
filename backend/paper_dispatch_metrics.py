@@ -295,13 +295,18 @@ def _in_session(moment, windows):
 
 
 def _same_session(previous, current, windows):
-    """两个时间点是否落在同一个交易窗口内。
+    """两个时间点是否落在**同一交易日的同一个交易窗口**内。
 
     午休 11:24→13:00 是 96 分钟，把它当成"节拍违规"会让每天的 breach 计数
     天然非零，验收数字就失去意义。跨窗口的一对间隔只丢进
     ``start_to_start_seconds[slot]["excluded_session_gaps"]``，不参与 p50/p95/
     max/breaches。
+
+    日期必须一起比较：14:55（T 日）→ 09:30（T+1）落在同一个 ``HH:MM`` 窗口，
+    只比时刻会把跨夜间隔误算成节拍样本，第二天第一跳的 breach 就凭空出现。
     """
+    if previous.date() != current.date():
+        return False
     return any(
         start <= previous.strftime("%H:%M") <= end
         and start <= current.strftime("%H:%M") <= end

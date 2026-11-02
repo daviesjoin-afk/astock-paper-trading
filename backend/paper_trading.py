@@ -457,6 +457,14 @@ def _risk_business_key(now=None):
     return f"risk:{bucket.strftime('%Y%m%d%H%M')}"
 
 
+#: 对端仍在跑风控时的最大等待与轮询间隔（秒）；超时即 fail-closed。
+RISK_RUNNING_WAIT_SECONDS = float(
+    os.environ.get("PAPER_RISK_RUNNING_WAIT_SECONDS",
+                   PRSS.DEFAULT_SETTLE_TIMEOUT_SECONDS) or 20)
+RISK_RUNNING_POLL_SECONDS = float(
+    os.environ.get("PAPER_RISK_RUNNING_POLL_SECONDS",
+                   PRSS.DEFAULT_SETTLE_POLL_SECONDS) or 0.25)
+
 def _slot_run_key(slot, now=None):
     """重复触发 lane 的窗口身份；一次性 slot 返回 ``None``（按当日幂等）。"""
     if slot == "intraday":
@@ -9932,21 +9940,45 @@ def monitor_risk(asof_date=None):
         scan_context = {
             "cycle_id": int(load_active_cycle(conn)["id"]),
             "asof_date": day.isoformat(),
-            "scan_minute": run_at.strftime("%Y-%m-%d %H:%M"),
+            # 身份取三分钟窗口分钟，与 _risk_business_key 同一取整规则。
+            "scan_minute": PRSS.window_minute(run_at),
             "started_at": run_at.strftime("%Y-%m-%d %H:%M:%S"),
         }
         ident = {k: scan_context[k] for k in ("cycle_id", "asof_date", "scan_minute")}
         claimed = PRSS.claim_scan(
             conn, **ident, started_at=scan_context["started_at"])
-        if not claimed["claimed"]:
-            # 兼容既有 facade 契约：重复入口（含 running）一律回 already_scanned。
-            PTM.risk_scan_outcome("already_scanned", **scan_context)
-            return {
-                "slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": [],
-                "status": "already_scanned",
-                "reason": f"{scan_context['scan_minute']} 风控扫描已由同一调度周期完成",
-            }
-        audit(conn, None, "risk_scan_claimed", _json(dict(scan_context)))  # 仅可观测
+        if claimed["claimed"]:
+            audit(conn, None, "risk_scan_claimed", _json(dict(scan_context)))  # 仅可观测
+    if not claimed["claimed"]:
+        # 等待必须在**写事务之外**：认领事务里 sleep 会一直占着 BEGIN IMMEDIATE，
+        # 对端的完成事务只能撞锁，最后两败俱伤（既没完成、也没等到）。
+        state = str(claimed.get("state") or "")
+        if state == "running":
+            state = PRSS.settle_state(
+                _db_readonly, ident, timeout=RISK_RUNNING_WAIT_SECONDS,
+                poll=RISK_RUNNING_POLL_SECONDS)
+        if state == "running":
+            # 等不到完成 ⇒ 保护性风控仍在进行。绝不能把"有人认领"当成
+            # "风控已完成"，否则调用方会在减仓之前进入执行与候选路径。
+            PTM.risk_scan_outcome("risk_running", **scan_context)
+            return PRSS.not_ready_result(
+                date=day.isoformat(), state="running",
+                reason=(f"{scan_context['scan_minute']} 的风控扫描仍由另一入口执行；"
+                        "本入口等待超时后放弃，执行与候选路径必须等风控完成"),
+            )
+        if state != "completed":
+            # 身份缺失/不可读（并发删除或迁移期库）：同样 fail-closed。
+            PTM.risk_scan_outcome("risk_unavailable", **scan_context)
+            return PRSS.not_ready_result(
+                date=day.isoformat(), state=state,
+                reason=f"风控扫描身份不可读（{state}）；本轮不进入执行与候选路径",
+            )
+        PTM.risk_scan_outcome("already_scanned", **scan_context)
+        return {
+            "slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": [],
+            "status": "already_scanned",
+            "reason": f"{scan_context['scan_minute']} 风控扫描已由同一调度周期完成",
+        }
     try:
         result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])
         with _db(immediate=True, hot_path=True) as conn:
@@ -11819,6 +11851,14 @@ def monitor_intraday(asof_datetime=None, force=False):
     # 即使没有持仓也运行风险服务，以保留扫描标记、恢复和手动订单处理。
     # 风险和已批准委托使用各自的逐票证据，不等待全市场候选快照。
     risk_result = monitor_risk(day)
+    if not PRSS.result_is_settled(risk_result):
+        # 风控未完成（对端正在跑）：本轮不恢复委托、不扫候选、不买入。
+        return {
+            "slot": "intraday", "status": "risk_in_progress", "deferred": True,
+            "date": day.isoformat(), "orders": [], "execution_orders": [],
+            "reason": f"风控扫描未完成（{risk_result.get('status')}）：本轮跳过委托恢复与候选扫描",
+            "risk": risk_result,
+        }
     execution_orders = process_pending_execution_orders(day)
     # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
     with PTM.phase("market_snapshot"):
@@ -13436,8 +13476,11 @@ def _refresh_slot_risk_snapshot(slot):
 
 
 def _slot_completion_status(detail):
+    # risk_running / risk_in_progress：风控尚未完成就被调用方挡住，属于
+    # 非成功（外层 scheduler 需要重试），绝不能记成 completed。
     return "failed" if detail.get("status") in {
         "blocked", "failed", "partial", "deferred", "in_progress",
+        "risk_running", "risk_in_progress",
     } else "completed"
 
 
@@ -14361,14 +14404,26 @@ def schedule_status():
             ORDER BY COALESCE(finished_at,started_at) DESC
             LIMIT 12
         """, (f"intraday:{today.replace('-', '')}%",))
-    failed = [row for row in latest + intraday if row.get("status") == "failed"]
+        # PR-11 B：风险快通道自成一类运行记录。不汇总进这里，独立 lane 的失败
+        # 就不会出现在运行状态告警里（旧实现只看 paper_jobs 与 intraday）。
+        risk_runs = query_rows(conn, """
+            SELECT run_key,status,started_at,finished_at,detail
+            FROM paper_job_runs
+            WHERE run_key LIKE ?
+            ORDER BY COALESCE(finished_at,started_at) DESC
+            LIMIT 12
+        """, (f"risk:{today.replace('-', '')}%",))
+    failed = [row for row in latest + intraday + risk_runs
+              if row.get("status") == "failed"]
     return {
         "installed": len(found) == len(names),
         "tasks": found,
         "runtime_date": today,
         "latest_runs": latest,
         "latest_intraday_runs": intraday,
-        "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
+        "latest_risk_runs": risk_runs,
+        "runtime_status": "异常" if failed else (
+            "已执行" if latest or intraday or risk_runs else "等待首个任务"),
         "runtime_failed_count": len(failed),
         # PR-11：tick / 跳过 / 队列年龄 / 上次风险成功；日志不可读时 available=False。
         "dispatch": dispatch_status(),

@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 
 __all__ = [
     "SCAN_RUN_TABLE",
@@ -144,6 +145,88 @@ def latest_scan(conn, *, cycle_id, asof_date):
             return None
         raise
     return _row_dict(row)
+
+
+#: 扫描身份与调度窗口的取整步长。风险 lane 与 intraday 兜底共用同一网格。
+SCAN_WINDOW_MINUTES = 3
+
+#: 对端仍在执行时，本入口最多等多久（秒）。超时即 fail-closed。
+DEFAULT_SETTLE_TIMEOUT_SECONDS = 20.0
+DEFAULT_SETTLE_POLL_SECONDS = 0.25
+
+
+def window_minute(moment, *, interval_minutes=SCAN_WINDOW_MINUTES):
+    """把时刻取整成扫描身份用的窗口分钟（``YYYY-MM-DD HH:MM``）。
+
+    运行身份（``risk:YYYYMMDDHHMM``）本来就是三分钟取整；``scan_minute`` 以前取
+    自然分钟，于是 09:34 与 09:35 是两个不同的 durable 身份，同一个窗口内可以
+    真的跑两次风控。身份与窗口必须来自同一取整规则。
+    """
+    minute = (moment.minute // interval_minutes) * interval_minutes
+    return moment.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+
+
+def settle_state(open_conn, ident, *, timeout=DEFAULT_SETTLE_TIMEOUT_SECONDS,
+                 poll=DEFAULT_SETTLE_POLL_SECONDS):
+    """等同一身份的 ``running`` 结束；返回终态字符串。
+
+    ``open_conn`` 是调用方的只读连接工厂。读遇 busy 时按"仍在运行"继续等 ——
+    对端很可能正在写完成事务，那不是"身份不可读"。
+    """
+    def read_scan():
+        try:
+            with open_conn() as conn:
+                return scan_run(conn, **ident)
+        except sqlite3.Error:
+            return {"status": "running"}
+    return await_settled(read_scan, timeout=timeout, poll=poll)["state"]
+
+
+#: 明确表示"风控没跑完"的结论。风险服务成功时不写顶层 status，缺省即完成。
+UNFINISHED_RESULT_STATUSES = frozenset({
+    "risk_running", "risk_unavailable", "deferred", "in_progress",
+    "blocked", "failed", "partial",
+})
+
+
+def result_is_settled(result):
+    """风控结论是否已经完成（只有完成才允许进入执行与候选路径）。
+
+    判据是"没有未完成的证据"：风险服务成功时不给顶层 status，把它记成未完成会
+    挡住正常轮次；``risk_running`` / ``deferred`` 才是明确证据。
+    """
+    if not isinstance(result, dict) or result.get("deferred"):
+        return False
+    return str(result.get("status") or "").strip().lower() not in UNFINISHED_RESULT_STATUSES
+
+
+def not_ready_result(*, date, state, reason):
+    """未完成时的统一返回形状（调用方据此挡住执行与候选路径）。"""
+    return {
+        "slot": "risk", "date": date, "orders": [], "manual_orders": [],
+        "status": "risk_running", "deferred": True,
+        "risk_scan_state": state, "reason": reason,
+    }
+
+
+def await_settled(read_scan, *, timeout=DEFAULT_SETTLE_TIMEOUT_SECONDS,
+                  poll=DEFAULT_SETTLE_POLL_SECONDS, clock=time.monotonic,
+                  sleep=time.sleep):
+    """等对端把 ``running`` 推进到终态；返回最后的 ``{"state", "attempt"}``。
+
+    ``read_scan`` 是无参可调用对象，返回 scan run 行（dict）或 ``None``；由调用方
+    决定用哪个连接读。读到的状态不是 ``running`` 就立刻返回，超时仍为 ``running``
+    时如实返回 ``running`` —— **绝不**把"有人认领"当成"已经完成"。
+    """
+    deadline = clock() + float(timeout)
+    while True:
+        row = read_scan() or {}
+        state = str(row.get("status") or "missing")
+        if state != "running":
+            return {"state": state, "attempt": int(row.get("attempt") or 0)}
+        if clock() >= deadline:
+            return {"state": "running", "attempt": int(row.get("attempt") or 0)}
+        sleep(max(0.0, float(poll)))
 
 
 def claim_scan(conn, *, cycle_id, asof_date, scan_minute, started_at):

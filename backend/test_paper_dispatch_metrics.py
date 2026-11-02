@@ -629,6 +629,30 @@ class SessionWindowTests(unittest.TestCase):
         self.assertEqual(1, risk["breaches"])
         self.assertEqual(0, risk["excluded_session_gaps"])
 
+    def test_overnight_gap_is_excluded_even_though_the_clocks_match(self):
+        """T 日 14:55 → T+1 09:30 落在同一 HH:MM 窗口，但不是同一交易日。
+
+        只比较时刻会把跨夜间隔算进节拍样本：次日第一跳的 breach 凭空出现，
+        节拍验收数字被每天的收尾/开局污染。
+        """
+        risk = _summarize(
+            _timing_event("risk", "2026-11-02T14:55:00+08:00"),
+            _timing_event("risk", "2026-11-03T09:30:00+08:00"),
+            session_windows=self.WINDOWS,
+        )["start_to_start_seconds"]["risk"]
+        self.assertEqual(0, risk["samples"])
+        self.assertEqual(1, risk["excluded_session_gaps"])
+        self.assertEqual(0, risk["breaches"])
+
+    def test_same_day_same_window_gap_still_counts(self):
+        risk = _summarize(
+            _timing_event("risk", "2026-11-02T14:48:00+08:00"),
+            _timing_event("risk", "2026-11-02T14:54:00+08:00"),
+            session_windows=self.WINDOWS,
+        )["start_to_start_seconds"]["risk"]
+        self.assertEqual(1, risk["samples"])
+        self.assertEqual(0, risk["excluded_session_gaps"])
+
     def test_without_windows_every_gap_counts(self):
         risk = _summarize(
             _timing_event("risk", "2026-11-02T11:24:00+08:00"),
