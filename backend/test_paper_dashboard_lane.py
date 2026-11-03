@@ -138,6 +138,24 @@ class DashboardLaneTests(unittest.TestCase):
                 conn, owner=owner, fencing_token=job["fencing_token"],
                 now=self.stamp(), retry_at=self.stamp(60), error="provider down"))
 
+    def failed_with_follow_up(self, run_seconds, follow_up_age):
+        """A failed run carrying an unclaimed follow-up of a given age.
+
+        The follow-up's own request time is what matters, so it is set
+        explicitly rather than raced against the 60s renewal granularity of
+        ``slow_failed_attempt``. ``fail_snapshot_refresh`` leaves
+        ``request_version > claimed_version``, which is exactly the state the
+        row is in between a failed original and its retry.
+        """
+        self.request()
+        self.slow_failed_attempt(run_seconds)
+        with self.db(immediate=True) as conn:
+            conn.execute("UPDATE paper_dashboard_refresh_jobs SET"
+                         " request_version=claimed_version+1, requested_at=?", (self.stamp(-follow_up_age),))
+        row = self.row()
+        self.assertEqual(row["status"], "failed")
+        self.assertGreater(row["request_version"], row["claimed_version"])
+
     def test_provider_run_time_is_not_charged_to_the_retry_wait(self):
         # 10:00 request -> 250s provider run -> 60s backoff -> retry at 10:05:10.
         # Only the backoff was queue waiting; the 250s of work was not.
@@ -157,6 +175,30 @@ class DashboardLaneTests(unittest.TestCase):
                 self.slow_failed_attempt(250)
                 self.now += dt.timedelta(seconds=60)
                 self.assertLess(Jobs.refresh_status(self.db)["queue_age_seconds"], 300)
+        self.assertEqual(Jobs.run_refresh_job(self.db, self.publish)["status"], "completed")
+        self.assertEqual(self.row()["skip_count"], 0)
+
+    def test_a_follow_up_still_ages_from_its_own_request_after_the_original_fails(self):
+        # 10:00 original claim -> follow-up queued 1s in -> 10:04:10 original
+        # fails after 250s -> 10:05:10 retry. The follow-up itself has waited
+        # 309s, so it must expire; a failure must not restart its clock.
+        self.failed_with_follow_up(250, follow_up_age=309)
+        self.now += dt.timedelta(seconds=60)  # retry tick: 60s backoff elapsed
+        provider = mock.Mock()
+        result = Jobs.run_refresh_job(self.db, provider)
+        provider.assert_not_called()
+        # 369s of follow-up waiting, not the 60s since the failure.
+        self.assertEqual((result["status"], result["reason"], result["queue_age_seconds"]),
+                         ("skipped", "queue_age_exceeded", 369.0))
+        expired = self.row()
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["skip_count"], 1)
+
+    def test_a_follow_up_under_the_cap_still_runs_after_the_original_fails(self):
+        # Same shape, but the follow-up is young enough to stay inside 300s.
+        self.failed_with_follow_up(250, follow_up_age=60)
+        self.now += dt.timedelta(seconds=60)
+        self.assertEqual(Jobs.refresh_status(self.db)["queue_age_seconds"], 120)
         self.assertEqual(Jobs.run_refresh_job(self.db, self.publish)["status"], "completed")
         self.assertEqual(self.row()["skip_count"], 0)
 

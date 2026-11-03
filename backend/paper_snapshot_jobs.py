@@ -24,25 +24,30 @@ def _claim_wait_seconds(row, *, now, live, follow_up):
     The cap bounds *how long a request waits to be claimed*, not how long the
     provider takes. Four cases, in order:
 
-      * follow-up requested while collecting — waits on its own request time;
+      * a follow-up request — waits on its own request time, whatever the
+        current status is. A follow-up issued 1s into a 250s run has already
+        waited 309s by the time the 60s retry backoff ends, and must expire
+        even though the row now reads ``failed``;
       * still collecting with a live lease — waited until the claim
         (``started_at``), so a slow provider cannot consume its own budget;
-      * ran and failed — the current wait started when that attempt failed.
-        A 250s run followed by a 60s backoff is 60s of waiting, not 310s;
+      * ran and failed on the same request version — the current wait started
+        when that attempt failed. A 250s run plus a 60s backoff is 60s of
+        waiting, not 310s;
       * queued, or an orphaned claim — waits since ``requested_at``. An
         orphaned claim has no scheduled retry, so the original request age is
         what stops us from reviving stale intent.
 
-    Repeated failures may therefore retry past 300s of wall time: the request
-    is being actively worked, not sitting in a stale queue. Each wait is still
-    capped at ``MAX_QUEUE_AGE_SECONDS``, and retries stay behind the 60s
-    backoff with ``MAX_CONCURRENCY`` of 1.
+    ``fail_snapshot_refresh`` keeps ``request_version > claimed_version``
+    untouched, so "is this a follow-up" must not depend on ``status == running``:
+    after a failure the same row still carries an unclaimed follow-up.
     """
     try:
         requested = dt.datetime.fromisoformat(row["requested_at"])
         now_dt = dt.datetime.fromisoformat(now)
+        age = (now_dt - requested).total_seconds()
         if follow_up:
-            return (now_dt - requested).total_seconds()
+            # Fail closed: a follow-up still needs a usable request timestamp.
+            return age if age >= 0 else None
         if row["status"] == "running" and live:
             age = (dt.datetime.fromisoformat(row["started_at"]) - requested).total_seconds()
             return age if age >= 0 else None
@@ -66,9 +71,11 @@ def queue_state(row, *, now):
         live = status == "running" and row["expires_at"] and row["expires_at"] > now
         pending = status in {"queued", "failed"} or (
             status == "running" and row["request_version"] > row["claimed_version"])
-        # A follow-up requested while collecting waits on its own request time;
-        # a plain failed row is a retry of the same request, not a follow-up.
-        follow_up = status == "running" and row["request_version"] > row["claimed_version"]
+        # A coalesced follow-up keeps its own request time in every status:
+        # fail_snapshot_refresh leaves request_version > claimed_version set.
+        # claimed_version must be non-zero, otherwise a never-claimed first
+        # request (1 > 0) would masquerade as a follow-up of itself.
+        follow_up = row["claimed_version"] > 0 and row["request_version"] > row["claimed_version"]
         if pending or status == "running":
             # A running collector's elapsed time is not queue waiting, and a
             # failed attempt's run time is not waiting for its own retry.
