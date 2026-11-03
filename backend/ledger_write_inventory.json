@@ -9853,7 +9853,7 @@
   {
    "function": "test_new_cycle_keeps_the_daily_policy_authorisation",
    "kind": "static",
-   "line": 533,
+   "line": 547,
    "module": "test_strategy_roster",
    "read_refs": [],
    "role": "test",

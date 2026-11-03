@@ -351,7 +351,12 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
 
 
     def test_daily_policy_can_be_reauthorised_for_v2_bounds(self):
-        result = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
+        import datetime as dt
+        instant = dt.datetime(2026, 10, 26, 10, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        real_datetime = dt.datetime
+        with mock.patch("datetime.datetime", wraps=real_datetime) as clock:
+            clock.now.return_value = instant
+            result = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
         self.assertTrue(result["verified"]["ok"], result["verified"])
         self.assertEqual({row["result"] for row in result["steps"]}, {"authorized"})
         conn = sqlite3.connect(self.path)
@@ -371,8 +376,17 @@ class ThreeStrategySwitchScriptTests(unittest.TestCase):
                 self.assertNotIn("adaptive_allocation_policy", params)
         finally:
             conn.close()
-        again = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
+        # approved_at 是授权内容的一部分；同一授权必须显式使用同一时刻，
+        # 不能假定文件 IO 和两次调用一定在同一个自然秒完成。
+        with mock.patch("datetime.datetime", wraps=real_datetime) as clock:
+            clock.now.return_value = instant
+            again = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
         self.assertEqual({row["result"] for row in again["steps"]}, {"already_authorized"})
+        # 保留现有的再次授权语义：审批时间改变时确实写入新授权。
+        with mock.patch("datetime.datetime", wraps=real_datetime) as clock:
+            clock.now.return_value = instant + dt.timedelta(seconds=1)
+            renewed = self.module.authorize_daily_policy(self.path, effective_date="2026-10-26")
+        self.assertEqual({row["result"] for row in renewed["steps"]}, {"authorized"})
 
 
 class CycleBudgetSeedingTests(unittest.TestCase):
