@@ -23,6 +23,36 @@ spec.loader.exec_module(capacity)
 
 
 class CandidateLaneSourceTests(unittest.TestCase):
+    def _business_hash(self, node):
+        node = copy.deepcopy(node)
+        if node.name == "monitor_risk":
+            # Only this explicit caller-clock injection is admitted. The
+            # remaining AST is still compared with the unchanged C baseline.
+            clocks = []
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call) or ast.unparse(call.func) != "PRSS.settle_state":
+                    continue
+                for keyword in list(call.keywords):
+                    if keyword.arg == "current_time":
+                        self.assertEqual("dt.datetime.now", ast.unparse(keyword.value))
+                        clocks.append(keyword)
+                        call.keywords.remove(keyword)
+            self.assertEqual(1, len(clocks), "risk wait must receive exactly one explicit caller clock")
+        if node.name == "monitor_intraday":
+            # Normalize only the reviewed move of this exact probe block past
+            # the risk gate. Its contents and every other statement stay frozen.
+            probes = [n for n in node.body if isinstance(n, ast.Try) and any(
+                isinstance(c, ast.Call) and ast.unparse(c.func) == "PTM.phase"
+                and c.args and isinstance(c.args[0], ast.Constant)
+                and c.args[0].value == "source_health" for c in ast.walk(n))]
+            self.assertEqual(1, len(probes))
+            risk_index = next(i for i, n in enumerate(node.body) if isinstance(n, ast.Assign)
+                              and any(isinstance(t, ast.Name) and t.id == "risk_result" for t in n.targets))
+            self.assertEqual(risk_index + 2, node.body.index(probes[0]))
+            node.body.remove(probes[0])
+            node.body.insert(risk_index, probes[0])
+        return hashlib.sha256(ast.dump(node).encode()).hexdigest()
+
     def test_worker_routing_keeps_risk_and_recovery_apart_from_candidate_tasks(self):
         for slot in schedule.RUNNER_SLOTS:
             expected = "astock-paper-worker" if slot in {"risk", "execution-resume"} else "astock-candidate-worker"
@@ -37,8 +67,29 @@ class CandidateLaneSourceTests(unittest.TestCase):
         tree = ast.parse((ROOT / "backend/paper_trading.py").read_text(encoding="utf-8"))
         nodes = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
         for name, record in frozen["functions"].items():
-            actual = hashlib.sha256(ast.dump(nodes[name]).encode()).hexdigest()
+            actual = self._business_hash(nodes[name])
             self.assertEqual(record["sha256"], actual, name)
+
+    def test_clock_exception_does_not_allow_business_or_clock_substitution(self):
+        tree = ast.parse((ROOT / "backend/paper_trading.py").read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "monitor_risk")
+        wrong_clock = copy.deepcopy(node)
+        for call in ast.walk(wrong_clock):
+            if isinstance(call, ast.Call) and ast.unparse(call.func) == "PRSS.settle_state":
+                next(k for k in call.keywords if k.arg == "current_time").value = ast.parse("dt.datetime.utcnow", mode="eval").body
+        with self.assertRaises(AssertionError):
+            self._business_hash(wrong_clock)
+        changed_completion = copy.deepcopy(node)
+        for call in ast.walk(changed_completion):
+            if isinstance(call, ast.Call) and ast.unparse(call.func) == "PRSS.complete_scan":
+                next(k for k in call.keywords if k.arg == "finished_at").value = ast.Constant("forged")
+        self.assertNotEqual(self._business_hash(node), self._business_hash(changed_completion))
+        scan = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "monitor_intraday")
+        changed_probe = copy.deepcopy(scan)
+        for call in ast.walk(changed_probe):
+            if isinstance(call, ast.Call) and ast.unparse(call.func) == "dfc.check_data_source_health":
+                next(k for k in call.keywords if k.arg == "force").value = ast.Constant(False)
+        self.assertNotEqual(self._business_hash(scan), self._business_hash(changed_probe))
 
     @unittest.skipUnless((ROOT / "deploy/run_paper_slot.sh").exists(), "deployment source absent")
     def test_host_script_uses_the_worker_route_and_keeps_all_lock_names(self):

@@ -63,6 +63,7 @@ class TimingTests(unittest.TestCase):
                         paper.monitor_intraday(dt.datetime(2026, 10, 20, 10), force=True)
                     self.assertIs(caught.exception, error)
                     refresh.assert_not_called()
+                    paper.dfc.check_data_source_health.assert_not_called()
                     if failed == "monitor_risk":
                         resume.assert_not_called()
 
@@ -80,8 +81,8 @@ class TimingTests(unittest.TestCase):
                                 ("_cached_close_market", {})):
                 stack.enter_context(mock.patch.object(paper, name, return_value=value))
             stack.enter_context(mock.patch.object(paper, "_db"))
-            stack.enter_context(mock.patch.object(paper.dfc, "check_data_source_health", return_value={}))
             sequence = []
+            stack.enter_context(mock.patch.object(paper.dfc, "check_data_source_health", side_effect=lambda **_: sequence.append("health") or {}))
             resume = stack.enter_context(mock.patch.object(paper, "process_pending_execution_orders", side_effect=lambda *_: sequence.append("resume") or []))
             stack.enter_context(mock.patch.object(paper.MDSvc, "refresh_rows", side_effect=lambda: sequence.append("refresh") or []))
             stack.enter_context(mock.patch.object(paper.MDSvc, "read_snapshot", side_effect=ValueError))
@@ -90,7 +91,8 @@ class TimingTests(unittest.TestCase):
             result = paper.monitor_intraday(dt.datetime(2026, 10, 20, 10, 0), force=True)
         risk.assert_called_once()
         resume.assert_not_called()
-        self.assertLess(sequence.index("risk"), sequence.index("refresh"))
+        self.assertLess(sequence.index("risk"), sequence.index("health"))
+        self.assertLess(sequence.index("health"), sequence.index("refresh"))
         self.assertEqual(result["bootstrap"]["status"], "blocked")
 
     def test_explicit_worker_binding_collects_timing_without_other_contexts(self):

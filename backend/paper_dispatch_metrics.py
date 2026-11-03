@@ -485,7 +485,7 @@ def summarize(events, *, target_interval_seconds=DEFAULT_TARGET_INTERVAL_SECONDS
                 "at": started_at.isoformat() if started_at else None,
                 "source": "risk_slot", "status": status, "slot": slot,
             }
-        elif last_risk["source"] != "risk_slot" and _is_risk_pass(event, slot, bucket):
+        elif _is_risk_pass(event, slot, bucket):
             last_risk = {
                 "at": started_at.isoformat() if started_at else None,
                 "source": f"{slot.replace('-', '_')}_risk_phase", "status": status, "slot": slot,

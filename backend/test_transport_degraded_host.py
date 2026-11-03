@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -34,6 +36,50 @@ def _url(name):
 
 
 class DegradedTransportTests(unittest.TestCase):
+    def test_degraded_host_still_observes_cooldown_then_can_recover(self):
+        with MT._transport_breaker_lock:
+            MT._transport_breaker["host-recover"] = {
+                "fails": 10, "burned": 60.0, "until": MT.time.monotonic() + 90,
+                "degraded_until": MT.time.monotonic() + 600, "trips": 5,
+            }
+        with mock.patch.object(MT, "_http_get_impl", return_value="recovered") as get:
+            for _ in range(4):
+                with self.assertRaises(requests.ConnectionError):
+                    MT.http_get(_url("recover"))
+            get.assert_not_called()
+            MT._transport_breaker["host-recover"]["until"] = 0
+            self.assertEqual("recovered", MT.http_get(_url("recover")))
+        self.assertEqual(1, get.call_count)
+        self.assertEqual(6.0, get.call_args.kwargs["timeout"])
+        self.assertEqual(0, get.call_args.kwargs["retries"])
+        self.assertIsNone(MT.transport_degraded_remaining("host-recover"))
+
+    def test_legacy_duration_ages_from_file_write_time_and_expires(self):
+        with open(MT._BREAKER_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"host-legacy": {"until_wall": 1090, "degraded_remaining": 600}}, f)
+        os.utime(MT._BREAKER_STATE_FILE, (1000, 1000))
+        for wall, expected in ((1300, 300), (1700, None)):
+            with self.subTest(wall=wall), mock.patch.object(MT.time, "time", return_value=wall), \
+                    mock.patch.object(MT.time, "monotonic", return_value=50):
+                MT._transport_breaker.clear()
+                MT._breaker_state_loaded = False
+                self.assertEqual(expected, MT.transport_degraded_remaining("host-legacy"))
+
+    def test_persisted_deadline_is_not_renewed_by_restart(self):
+        with mock.patch.object(MT.time, "time", return_value=1000), \
+                mock.patch.object(MT.time, "monotonic", return_value=100):
+            MT._transport_breaker["host-deadline"] = {
+                "fails": 6, "burned": 60.0, "until": 190,
+                "degraded_until": 700, "trips": 2,
+            }
+            MT._persist_breaker_state()
+        for wall, expected in ((1300, 300), (1601, None)):
+            with self.subTest(wall=wall), mock.patch.object(MT.time, "time", return_value=wall), \
+                    mock.patch.object(MT.time, "monotonic", return_value=2000):
+                MT._transport_breaker.clear()
+                MT._breaker_state_loaded = False
+                self.assertEqual(expected, MT.transport_degraded_remaining("host-deadline"))
+
     def setUp(self):
         self._saved_state = MT._BREAKER_STATE_FILE
         self._saved_budget = MT.scan_budget_limits
@@ -201,7 +247,12 @@ class DegradedTransportTests(unittest.TestCase):
                 MT.http_get(_url("i"), timeout=15, retries=2)
             self.assertIsNotNone(MT.transport_degraded_remaining("host-i"))
 
-            # 降级档内：只做便宜探测
+            # 降级档内仍尊重刚打开的冷却；冷却到期后才做便宜探测。
+            count = len(attempts)
+            with self.assertRaises(requests.RequestException):
+                MT.http_get(_url("i"), timeout=15, retries=2)
+            self.assertEqual(count, len(attempts))
+            MT._transport_breaker["host-i"]["until"] = 0
             with self.assertRaises(requests.RequestException):
                 MT.http_get(_url("i"), timeout=15, retries=2)
             self.assertLessEqual(attempts[-1][0], MT._DEGRADED_PROBE_TIMEOUT_CAP)

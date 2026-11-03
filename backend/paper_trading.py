@@ -9954,7 +9954,7 @@ def monitor_risk(asof_date=None):
         if state == "running":
             state = PRSS.settle_state(
                 _db_readonly, ident, timeout=RISK_RUNNING_WAIT_SECONDS,
-                poll=RISK_RUNNING_POLL_SECONDS)
+                poll=RISK_RUNNING_POLL_SECONDS, current_time=dt.datetime.now)
         if state == "running":
             # 等不到完成 ⇒ 保护性风控仍在进行。绝不能把"有人认领"当成
             # "风控已完成"，否则调用方会在减仓之前进入执行与候选路径。
@@ -11846,16 +11846,6 @@ def monitor_intraday(asof_datetime=None, force=False):
                 audit(clean_conn, None, "cleanup_stale_data_error", _json({"error": f"{type(exc).__name__}: {exc}"}))
         except Exception:
             pass
-    # 每轮 3 分钟扫描先做轻量数据源探活；失败时 data_fetcher 会关闭连接池、
-    # 清空熔断状态并轮换东方财富/腾讯重试，随后本轮仍使用可用源继续执行。
-    try:
-        with PTM.phase("source_health"):
-            data_source_health = dfc.check_data_source_health(force=True)
-    except Exception as exc:
-        data_source_health = {
-            "healthy": False, "reconnected": False, "attempts": 0,
-            "action": f"健康检查异常：{type(exc).__name__}: {exc}",
-        }
     # 即使没有持仓也运行风险服务，以保留扫描标记、恢复和手动订单处理。
     # 风险和已批准委托使用各自的逐票证据，不等待全市场候选快照。
     risk_result = monitor_risk(day)
@@ -11866,6 +11856,16 @@ def monitor_intraday(asof_datetime=None, force=False):
             reason=f"风控扫描未完成（{risk_result.get('status')}）：本轮跳过委托恢复与候选扫描",
             extra={"execution_orders": []},
         )
+    # 风控完成后再做轻量数据源探活；失败时 data_fetcher 会关闭连接池、
+    # 清空熔断状态并轮换东方财富/腾讯重试，随后本轮仍使用可用源继续执行。
+    try:
+        with PTM.phase("source_health"):
+            data_source_health = dfc.check_data_source_health(force=True)
+    except Exception as exc:
+        data_source_health = {
+            "healthy": False, "reconnected": False, "attempts": 0,
+            "action": f"健康检查异常：{type(exc).__name__}: {exc}",
+        }
     execution_orders = []  # P11-C：候选扫描不再重复恢复独立 lane 的委托。
     # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
     with PTM.phase("market_snapshot"):

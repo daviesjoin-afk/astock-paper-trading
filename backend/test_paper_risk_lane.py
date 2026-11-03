@@ -369,12 +369,11 @@ class SettleConfigTests(unittest.TestCase):
             now["t"] += 1.0
             return now["t"]
 
-        # nan/inf 会被收敛成默认的 20s / 0.25s；用假时钟证明它**有**截止，
-        # 不靠真实睡眠（否则这个用例本身就要跑 20 秒）。
+        # nan/inf 收敛为默认 120s / 0.25s；假时钟证明有截止，不实际等待。
         settled = PRSS.await_settled(read_scan, timeout=float("nan"), poll=float("inf"),
                                      clock=clock, sleep=lambda _s: None)
         self.assertEqual("running", settled["state"])
-        self.assertLess(calls["n"], 30, "nan/inf 必须被收敛，否则循环不会终止")
+        self.assertLess(calls["n"], 130, "nan/inf 必须被收敛，否则循环不会终止")
         self.assertGreaterEqual(calls["n"], 5, "收敛后仍应按默认值轮询多轮")
 
 

@@ -297,6 +297,15 @@ class TickAccountingTests(unittest.TestCase):
 
 
 class StatusSemanticsTests(unittest.TestCase):
+    def test_newer_real_execution_risk_pass_updates_earlier_risk_slot_success(self):
+        summary = _summarize(
+            _timing_event("risk", "2026-11-03T09:57:02+08:00"),
+            _timing_event("execution-resume", "2026-11-03T10:00:02+08:00"),
+        )
+        self.assertEqual("2026-11-03T10:00:02+08:00",
+                         summary["last_successful_risk_scan"]["at"])
+        self.assertEqual("execution_resume_risk_phase",
+                         summary["last_successful_risk_scan"]["source"])
     def test_completed_slot_without_actual_scan_cannot_advance_risk_success(self):
         for slot in ("risk", "intraday"):
             for marker in (None, "already_scanned", "failed"):

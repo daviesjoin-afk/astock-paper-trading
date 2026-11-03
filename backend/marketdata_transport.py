@@ -6,6 +6,7 @@
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -215,6 +216,7 @@ def _load_breaker_state():
     try:
         with open(_BREAKER_STATE_FILE, encoding="utf-8") as handle:
             payload = json.load(handle)
+            saved_at = os.fstat(handle.fileno()).st_mtime
     except (OSError, ValueError, TypeError):
         return
     if not isinstance(payload, dict):
@@ -229,9 +231,15 @@ def _load_breaker_state():
             except (TypeError, ValueError):
                 continue
             try:
-                degraded_remaining = float(raw.get("degraded_remaining") or 0.0)
+                # Legacy durations belong to the file's write time, not this
+                # process's startup; reloading must not restart a cooldown.
+                degraded_until_wall = float(raw.get("degraded_until_wall") or (
+                    saved_at + float(raw.get("degraded_remaining") or 0.0)))
+                degraded_remaining = degraded_until_wall - now_wall
             except (TypeError, ValueError):
                 degraded_remaining = 0.0
+            if not math.isfinite(remaining) or not math.isfinite(degraded_remaining):
+                continue
             if remaining <= 0 and degraded_remaining <= 0:
                 continue
             _transport_breaker[str(host)] = {
@@ -269,6 +277,8 @@ def _persist_breaker_state():
                 # 进程活过一整轮扫描，否则每轮都从零开始重新"学习"这台机器坏了。
                 "degraded_remaining": round(
                     max(0.0, (state.get("degraded_until") or 0.0) - now_mono), 3),
+                "degraded_until_wall": round(now_wall + max(
+                    0.0, (state.get("degraded_until") or 0.0) - now_mono), 3),
                 "trips": int(state.get("trips") or 0),
                 "ever_tripped": bool(state.get("ever_tripped")),
             }
@@ -453,20 +463,17 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
     多次传输失败后，短时间内直接快速失败，不再为每个调用方重复付超时。
     """
     host = _transport_host(url)
-    # 已确认不可达的主机（数据中心级封禁）：只付一次便宜探测的钱，不再为
-    # 一个已知事实等满 45 秒的最坏尝试。**降级档优先于普通短路** —— 普通
-    # 短路是完全跳过（一个请求都不发），那会让源恢复后也永远发现不了；
-    # 降级档仍会发一次便宜探测，既省钱又能确认它是否回来了。
+    # 降级不取消冷却：冷却内快速失败，到期后才允许低预算探测。
+    # 否则同一个坏源会在每个调用方处再次烧掉 6 秒。
+    open_for = _transport_breaker_remaining(host)
+    if open_for is not None:
+        with PTM.phase("http_breaker_skip"):
+            raise requests.ConnectionError(
+                f"transport breaker open for {host} ({open_for:.0f}s left)")
     degraded_for = _transport_degraded_remaining(host)
     if degraded_for is not None:
         timeout = min(timeout, _DEGRADED_PROBE_TIMEOUT_CAP)
         retries = min(retries, _DEGRADED_PROBE_RETRIES_CAP)
-    else:
-        open_for = _transport_breaker_remaining(host)
-        if open_for is not None:
-            with PTM.phase("http_breaker_skip"):
-                raise requests.ConnectionError(
-                    f"transport breaker open for {host} ({open_for:.0f}s left)")
     timeout, retries = scan_budget_limits(timeout, retries)
     try:
         started = time.perf_counter()

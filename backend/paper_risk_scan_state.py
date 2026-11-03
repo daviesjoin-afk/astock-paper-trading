@@ -152,7 +152,7 @@ def latest_scan(conn, *, cycle_id, asof_date):
 SCAN_WINDOW_MINUTES = 3
 
 #: 对端仍在执行时，本入口最多等多久（秒）。超时即 fail-closed。
-DEFAULT_SETTLE_TIMEOUT_SECONDS = 20.0
+DEFAULT_SETTLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_SETTLE_POLL_SECONDS = 0.25
 
 
@@ -168,19 +168,30 @@ def window_minute(moment, *, interval_minutes=SCAN_WINDOW_MINUTES):
 
 
 def settle_state(open_conn, ident, *, timeout=DEFAULT_SETTLE_TIMEOUT_SECONDS,
-                 poll=DEFAULT_SETTLE_POLL_SECONDS):
+                 poll=DEFAULT_SETTLE_POLL_SECONDS, current_time=None):
     """等同一身份的 ``running`` 结束；返回终态字符串。
 
     ``open_conn`` 是调用方的只读连接工厂。读遇 busy 时按"仍在运行"继续等 ——
     对端很可能正在写完成事务，那不是"身份不可读"。
     """
+    if current_time is not None:
+        current = current_time()
+        if window_minute(current) != ident["scan_minute"]:
+            return "window_changed"
+        remaining = ((SCAN_WINDOW_MINUTES - current.minute % SCAN_WINDOW_MINUTES) * 60
+                     - current.second - current.microsecond / 1_000_000)
+        timeout = min(bounded_seconds(timeout, default=DEFAULT_SETTLE_TIMEOUT_SECONDS), remaining)
+
     def read_scan():
         try:
             with open_conn() as conn:
                 return scan_run(conn, **ident)
         except sqlite3.Error:
             return {"status": "running"}
-    return await_settled(read_scan, timeout=timeout, poll=poll)["state"]
+    state = await_settled(read_scan, timeout=timeout, poll=poll)["state"]
+    if current_time is not None and window_minute(current_time()) != ident["scan_minute"]:
+        return "window_changed"
+    return state
 
 
 #: 明确表示"风控没跑完"的结论。风险服务成功时不写顶层 status，缺省即完成。
@@ -256,7 +267,7 @@ def await_settled(read_scan, *, timeout=DEFAULT_SETTLE_TIMEOUT_SECONDS,
             return {"state": state, "attempt": int(row.get("attempt") or 0)}
         if clock() >= deadline:
             return {"state": "running", "attempt": int(row.get("attempt") or 0)}
-        sleep(max(0.0, float(poll)))
+        sleep(min(float(poll), max(0.0, deadline - clock())))
 
 
 def claim_scan(conn, *, cycle_id, asof_date, scan_minute, started_at):

@@ -87,7 +87,7 @@ class RunnerRiskRetryTests(unittest.TestCase):
 
 
 class RealRunnerRiskRetryTests(PaperRiskExitProductionPathTestCase):
-    def _run_waiting_peer(self, *, finish_at, start=None):
+    def _run_waiting_peer(self, *, finish_at, start=None, wait_seconds=20.0):
         """Real SQLite/risk gate/fill path, with a virtual elapsed-time clock."""
         start = start or REAL_DATETIME(2026, 9, 10, 9, 33)
         elapsed, attempts, backoffs, observed = [0.0], [], [], []
@@ -119,6 +119,11 @@ class RealRunnerRiskRetryTests(PaperRiskExitProductionPathTestCase):
 
         def poll_sleep(seconds):
             elapsed[0] += seconds
+            if finish_at is not None and elapsed[0] >= finish_at:
+                with PT._db(immediate=True) as conn:
+                    row = PRSS.scan_run(conn, **ident)
+                    if row["status"] == "running":
+                        PRSS.complete_scan(conn, **ident, finished_at=Clock.now().isoformat(sep=" "))
 
         def backoff_sleep(seconds):
             # First timeout is a real persisted failure. No execution lease or
@@ -143,7 +148,7 @@ class RealRunnerRiskRetryTests(PaperRiskExitProductionPathTestCase):
         output = io.StringIO()
         with mock.patch.object(PT.dt, "datetime", Clock), \
                 mock.patch.object(PT, "_date", side_effect=lambda value=None: self.day if value is None else original_date(value)), \
-                mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", 20.0), \
+                mock.patch.object(PT, "RISK_RUNNING_WAIT_SECONDS", wait_seconds), \
                 mock.patch.object(PT, "RISK_RUNNING_POLL_SECONDS", 0.25), \
                 mock.patch.object(PRSS, "await_settled", side_effect=lambda read, **kw: original_wait(read, clock=lambda: elapsed[0], sleep=poll_sleep, **kw)), \
                 mock.patch.object(runner.time, "sleep", side_effect=backoff_sleep), \
@@ -170,6 +175,30 @@ class RealRunnerRiskRetryTests(PaperRiskExitProductionPathTestCase):
         self.assertEqual("completed", risk["status"])
         self.assertEqual(1, risk["attempt"])
 
+    def test_server_length_risk_pass_settles_then_fills_once(self):
+        code, result, attempts, backoffs, _, fills, risk = self._run_waiting_peer(
+            finish_at=83, wait_seconds=PRSS.DEFAULT_SETTLE_TIMEOUT_SECONDS)
+        self.assertEqual(0, code)
+        self.assertEqual([(83.0, "completed")], attempts)
+        self.assertEqual([], backoffs)
+        self.assertEqual("filled", result["execution_orders"][0]["status"])
+        self.assertEqual([1000], [r[0] for r in fills])
+        self.assertEqual(1, risk["attempt"])
+
+    def test_default_wait_never_fills_after_window_ends(self):
+        self._assert_default_wait_stops_at_window(None)
+
+    def test_completion_at_window_boundary_is_not_permission_to_fill(self):
+        self._assert_default_wait_stops_at_window(180)
+
+    def _assert_default_wait_stops_at_window(self, finish_at):
+        code, _, attempts, backoffs, _, fills, _ = self._run_waiting_peer(
+            finish_at=finish_at, wait_seconds=PRSS.DEFAULT_SETTLE_TIMEOUT_SECONDS)
+        self.assertEqual(1, code)
+        self.assertEqual([(120.0, "failed"), (180.0, "failed")], attempts)
+        self.assertEqual([10], backoffs)
+        self.assertEqual([], fills)
+
     def test_persistently_running_risk_stops_at_80s_without_any_fill(self):
         code, result, attempts, backoffs, _, fills, risk = self._run_waiting_peer(finish_at=None)
         self.assertEqual(1, code)
@@ -183,7 +212,7 @@ class RealRunnerRiskRetryTests(PaperRiskExitProductionPathTestCase):
         code, _, attempts, backoffs, _, fills, _ = self._run_waiting_peer(
             finish_at=30, start=REAL_DATETIME(2026, 9, 10, 9, 35, 50))
         self.assertEqual(1, code)
-        self.assertEqual([(20.0, "failed")], attempts)
+        self.assertEqual([(10.0, "failed")], attempts)
         self.assertEqual([], backoffs)
         self.assertEqual([], fills)
 
