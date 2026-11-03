@@ -80,9 +80,74 @@ COST_FILE = "test_costs.json"
 COST_VERSION = 1
 #: 单个测试模块的成本下限，避免除零与"零成本"模块被无限堆叠。
 MIN_COST = 0.05
-#: worker 结果文件的固定名（在分片数据目录的父目录里）。
-RESULT_NAME = "shard_result.json"
-LOG_NAME = "shard_run.log"
+#: 每个分片进程的常驻内存估计（MiB）。实测 4 分片在 16 GiB、可用 3.6 GiB 的
+#: Windows 宿主上稳定通过；8 分片在同机 OOM。按此反推单分片约 700 MiB 量级，
+#: 这里取 900 MiB 留出余量（测试进程会各自 import 一次 pandas/numpy/OpenBLAS）。
+SHARD_MEMORY_MIB = 900
+#: 启动分片时要求保留的余量：低于它就不再增加分片，避免把机器压进 swap。
+MEMORY_HEADROOM_MIB = 512
+
+
+def available_memory_mib() -> float | None:
+    """当前可用物理内存（MiB）；拿不到时返回 None（不阻止运行）。"""
+    try:  # POSIX
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # Windows
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(_MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullAvailPhys / (1024 * 1024)
+    except (ImportError, AttributeError, OSError):
+        pass
+    return None
+
+
+def memory_limited_shards(requested: int, *, avail_mib: float | None = None,
+                          probe: bool = True) -> tuple[int, str]:
+    """把请求的分片数压到当前可用内存能承受的上限。
+
+    并行分片之所以快，是因为每个进程独立 import 一次 pandas/numpy/OpenBLAS。
+    这些库各自映射上百 MiB 的共享库与堆，8 个进程在 16 GiB 可用不到 4 GiB 的
+    机器上会直接 OOM——表现为 `MemoryError`、`OpenBLAS: Memory allocation still
+    failed` 或进程崩溃码 0xC0000409，而不是普通的断言失败。
+
+    这里按可用内存下调分片数，并返回一条人类可读的说明；不改变任何测试内容。
+    ``avail_mib`` 为 None 且 ``probe`` 为 True 时才去探测真实可用内存；
+    探测失败（拿不到数字）就照原样执行，不猜。
+    """
+    avail = (available_memory_mib() if probe else None) if avail_mib is None else avail_mib
+    if avail is None or requested <= 1:
+        return requested, ""
+    affordable = int((avail - MEMORY_HEADROOM_MIB) // SHARD_MEMORY_MIB)
+    affordable = max(1, affordable)
+    if affordable >= requested:
+        return requested, ""
+    return affordable, (
+        f"可用内存 {avail / 1024:.1f} GiB，按每分片约 {SHARD_MEMORY_MIB} MiB 加 "
+        f"{MEMORY_HEADROOM_MIB} MiB 余量，分片数从 {requested} 下调到 {affordable}。"
+        "并行分片各自加载 pandas/numpy/OpenBLAS，超过内存会以 OOM 崩溃伪装成测试失败。"
+        "如需更多分片，请先释放内存或用 --shards 显式指定。"
+    )
 
 
 def repo_root() -> Path:
@@ -289,6 +354,23 @@ def _calibrate(modules: list[str]) -> int:
     return 0
 
 
+def _oom_hint(returncode: int, tail: list[str]) -> str:
+    """识别"分片是被内存打死的"而不是"测试真的失败了"。
+
+    这类失败以前只会显示成一个陌生退出码或一句 MemoryError，容易被当成回归。
+    """
+    text = "\n".join(tail)
+    markers = ("MemoryError", "Memory allocation still failed", "Unable to allocate",
+               "std::bad_alloc", "Cannot allocate memory")
+    crashed = returncode in {3221225773, -1073740791, 137, -9}  # 0xC0000409 / SIGKILL
+    if any(marker in text for marker in markers):
+        return ("看起来是内存耗尽（非测试断言失败）：分片进程在 import "
+                "pandas/numpy/OpenBLAS 时内存不足。请减少 --shards 或释放内存后重跑。")
+    if crashed:
+        return f"分片进程异常终止（退出码 {returncode}），常见原因是内存耗尽。"
+    return ""
+
+
 def _tail(path: Path, limit: int = 25) -> list[str]:
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -303,7 +385,9 @@ def main(argv: list[str] | None = None) -> int:
         description="成本均衡 + 数据目录隔离的并行后端回归",
     )
     parser.add_argument("--shards", type=int, default=0,
-                        help="分片数；0 表示按 CPU 核数（默认）")
+                        help="分片数；0 表示按 CPU 核数（默认）；会按可用内存下调")
+    parser.add_argument("--no-memory-limit", action="store_true",
+                        help="忽略可用内存，完全按 --shards 执行（仅在确认内存充足时使用）")
     parser.add_argument("--strategy", choices=("cost", "rotate"), default="cost",
                         help="分片策略；cost 需要成本档案，缺失时自动退化为 rotate")
     parser.add_argument("--pattern", default="test_*.py", help="模块名 glob")
@@ -331,6 +415,11 @@ def main(argv: list[str] | None = None) -> int:
 
     shards = args.shards or (os.cpu_count() or 1)
     shards = max(1, min(shards, len(modules)))
+
+    if not args.no_memory_limit:
+        shards, memory_note = memory_limited_shards(shards)
+        if memory_note:
+            print(f"提示：{memory_note}", file=sys.stderr)
 
     costs = load_costs()
     strategy = args.strategy
@@ -403,8 +492,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if not result_file.is_file():
                 tail = _tail(log_file)
+                hint = _oom_hint(proc.returncode, tail)
                 problems.append(
                     f"分片 {index} 没有产出结果文件（退出码 {proc.returncode}）"
+                    + (f"\n  {hint}" if hint else "")
                     + ("\n  " + "\n  ".join(tail) if tail else "")
                 )
                 continue
