@@ -86,3 +86,46 @@ Docker profile `astock-codex`）在 2026-11-03 13:09—13:30 的可观测事实�
 5. `runtime_commit` 是否已变为部署 commit（防止用旧样本冒充新结果）。
 
 不允许用"请求级变快"换算成"整轮扫描变快"或收益改善。
+
+## 6. 部署后复测（2026-11-03 13:52—14:40，同一份 scheduler.log）
+
+部署身份：`.deploy-source.json` → `commit=2844b8f7…`、`image=f18be56a…`、
+`deployed_at=13:52:42+08:00`、`health=healthy`、`api_health=200`；
+容器 `ASTOCK_GIT_COMMIT=2844b8f7…`。窗口内 18 个 attempt 全部同一 commit。
+
+| 指标 | 基线（714b434 / 09:34—13:10） | 部署后（2844b8f / 13:52—14:40） |
+| --- | --- | --- |
+| intraday 成功 | 0 / 34（714b434 之后） | 10 completed / 13 start（+1 failed、1 进行中、3 个 exit≠0） |
+| risk 成功 | 17 / 34 | 14 / 14 |
+| execution-resume 成功 | 20 / 34 | 14 / 14 |
+| 实际完成风控扫描 | 34 次，间隔 p50 180 s | 14 次，无跨入口重复 completed |
+| quote.flow | p50 42.0 s | p50 0 s / max 3.0 s |
+| quote.tradability | p50 18.1 s | p50 0.13 s / max 0.62 s |
+| position_quotes | p50 79.7 s | p50 6.6 s / max 21.5 s |
+| quote.primary | p50 18.0 s | p50 4.5 s / max 15.5 s |
+| open_execution | 54.6 s（单样本） | p50 6.6 s / max 16.5 s |
+| execution.market_snapshot | 224 s（单样本，部署当日） | p50 6.0 s / max 15.4 s |
+| intraday_scan | 530—630 s（部署后、修 transport 前） | p50 134.8 s / max 297.4 s |
+
+部署后仍有 3 次 intraday `exit≠0`、1 次 failed：这些样本的 `intraday_scan` 落在
+297 秒附近，说明单轮仍会跨过 3 分钟网格（p50 134.8 s 尚可，尾部仍超窗）。
+这与"仍然每轮都失败"是两件事，不能混写。
+
+本轮为这些数字做的改动（按提交顺序）：
+
+1. `d30dc4e`（Codex，本轮部署）：风控等待 20 s→120 s 且有窗口上限、故障主机遵守
+   冷却、跨进程降级用绝对到期时间、intraday 先风控后探活。
+2. `cace215`（部署脚本）：运行期三个目录归 app(10001)，迁移前等 API 就绪、
+   迁移失败即失败、五个容器必须 running 才写身份文件。13:21 那次部署把
+   `data_cache` chown 成 ubuntu，API 立刻 `readonly database` 崩溃重启，是靠人工
+   重启才恢复的 —— 这条修复的来源就是这次事故。
+3. `4b445e4`（传输层）：降级档主机的廉价探测失败后把"继续跳过"窗口从 90 秒延长到
+   300 秒，探测预算 6 s→2.5 s。依据：`transport_breaker.json` 里 push2 家族
+   `trips` 已达 216、`fails` 218，但每个 90 秒冷却到期后仍要重新付一次探测。
+
+仍未做（下一阶段）：`intraday_scan` 尾部 297 秒超窗。已定位的可优化项（均带行号，
+见 `docs/MARKETDATA_FLOW_LATENCY_2026-11-03.md` 与 teammate 简报）：
+`execute_open` 的第二份 `check_data_source_health(force=True)` 与 intraday 主体重复
+（约 43 s）；全市场刷新的 240 秒磁盘 TTL 与 530—630 秒的轮次时长不匹配；
+`candidate_bootstrap` 的 p50 71.8 秒属因子表/评分，不在取数层。
+
