@@ -309,7 +309,7 @@ def strategy_feedback(strategy_id=None):
     # 反馈判断：实盘跟踪表现差 → 建议优化时偏保守
     advice = []
     if fb["win_rate_pct"] is not None and fb["win_rate_pct"] < 40:
-        advice.append("跟踪胜率<40%：建议优先选择 use_gate=True 且分散度更高（topn更大）的参数")
+        advice.append("跟踪胜率<40%：建议优先选择分散度更高（topn更大）的参数")
     if fb["avg_ret_pct"] is not None and fb["avg_ret_pct"] < 0:
         advice.append("跟踪平均收益为负：回测最优参数可能过拟合当前风格，建议采用更长调仓周期(rebalance=10或20)降低换手")
     if fb["avg_hold_days"] is not None and fb["avg_hold_days"] < 5 and sell_hits > 0:

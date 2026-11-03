@@ -222,7 +222,7 @@ export function renderGate(g){
   g=g||{};
   var known = ['green','yellow','red'].indexOf(g.light)>=0;
   var cls = g.light==='red'?'gate-red':(g.light==='yellow'||!known?'gate-yellow':'gate-green');
-  var txt = g.light==='red'?'海外风险：红灯':(g.light==='yellow'?'海外风险：黄灯':(g.light==='green'?'海外风险：绿灯':'海外风险：未知（保守）'));
+  var txt = g.light==='red'?'市场门控：红灯':(g.light==='yellow'?'市场门控：黄灯':(g.light==='green'?'市场门控：绿灯':'市场门控：未知（保守）'));
   badge.className = 'gate-badge '+cls;
   badge.innerHTML = '<div class="gate-dot"></div><span>'+adaptiveEsc(txt)+'</span>';
   badge.title = adaptiveEsc(g.advice||'市场门控结果来自本地缓存；未知时按保守规则执行。');

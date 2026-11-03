@@ -40,7 +40,6 @@ class DecisionContextTests(unittest.TestCase):
             kline=self.kline,
             snap=self.snap,
             sector_flow=sector_flow,
-            overseas_gate={"light": "green"},
             news_hits=[],
         )
 
@@ -49,7 +48,6 @@ class DecisionContextTests(unittest.TestCase):
         self.assertEqual(snapshot.name, "测试标的")
         self.assertIs(snapshot.kline, self.kline)
         self.assertEqual(snapshot.sector_flow, sector_flow)
-        self.assertEqual(snapshot.overseas_gate, {"light": "green"})
 
     def test_buy_decision_accepts_a_complete_evidence_snapshot(self):
         result = DE.buy_decision(
@@ -57,21 +55,19 @@ class DecisionContextTests(unittest.TestCase):
             kline=self.kline,
             snap=self.snap,
             sector_flow=[],
-            overseas_gate={"light": "green"},
             news_hits=[],
         )
 
         self.assertEqual(result["code"], "000001")
         self.assertEqual(result["name"], "测试标的")
         self.assertIn(result["tier"], {"T1", "T2", "T3", "T4", "T5"})
-        self.assertEqual(len(result["six_dim"]), 6)
+        self.assertEqual(len(result["six_dim"]), 5)
 
     def test_sell_decision_reuses_injected_sector_evidence(self):
         result = DE.sell_decision(
             {"code": "000001", "name": "测试标的", "cost": 10.0, "peak_price": 11.0, "hold_days": 3},
             kline=self.kline,
             snap=self.snap,
-            overseas_gate={"light": "green"},
             news_hits=[],
         )
 

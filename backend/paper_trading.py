@@ -3319,25 +3319,18 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True,
     else:
         resolved_index = live_index
     live_index = resolved_index
-    if allow_network:
-        try:
-            overseas = F.overseas_risk_gate()
-        except Exception:
-            overseas = {"light": "unknown", "advice": "海外数据不可用"}
-    else:
-        overseas = {"light": "unknown", "advice": "外部数据在账本事务中不可用"}
     live_pct = _num((live_index or {}).get("pct"), None)
     if stale and not benchmark_history_ready and live_pct is not None:
         # 盘中历史基准可能暂时只有单日快照（例如基准缓存刚完成补齐）。
         # 不能因此把有效的实时指数判成 unknown；使用实时涨跌执行保守黄灯，
         # 等至少 21 根完整日线恢复后再启用 MA20/5日趋势判断。
-        light = "red" if overseas.get("light") == "red" or live_pct <= -2.0 else "yellow"
+        light = "red" if live_pct <= -2.0 else "yellow"
         reason = f"实时沪深300 {live_pct:+.2f}%；中期趋势日线不足，按谨慎仓位执行"
     elif stale and live_pct is not None:
         # 盘中最后一根完整日线落后一个交易日是正常现象；只要实时指数
         # 有当日时间戳，就按保守黄灯运行，不能把“趋势待更新”误判成未知
         # 并暂停五套策略全部新开仓。
-        light = "red" if overseas.get("light") == "red" or live_pct <= -2.0 else "yellow"
+        light = "red" if live_pct <= -2.0 else "yellow"
         reason = f"实时沪深300 {live_pct:+.2f}%；中期趋势收盘数据待更新，按谨慎仓位执行"
     elif stale:
         light, reason = "unknown", "沪深300收盘趋势数据早于上一交易日且缺少当日实时指数"
@@ -3347,18 +3340,16 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True,
     #   * 绿灯：指数在 MA20 上方且上涨家数占比不低于 45%；
     #     或出现广度推力——指数当日 ≥ +0.5%、上涨家数 ≥ 60%、
     #     且 5 日跌幅未超过 3%（此时 MA20 仍可能未修复）。
-    #   * 黄灯：指数弱势、宽度不足、海外偏弱/未知、或趋势明显走坏。
-    #   * 红灯：指数 ≤ -2%、海外红灯，或宽度崩溃（≤20%）叠加下跌。
+    #   * 黄灯：指数弱势、宽度不足、或趋势明显走坏。
+    #   * 红灯：指数 ≤ -2%，或宽度崩溃（≤20%）叠加下跌。
     # 旧规则只用 MA20 做最后一道门：一根前一日阴线就能让全市场 72% 上涨、
     # 指数 +0.55% 的强势日仍停留在黄灯，风控中心显示"收紧"。广度推力必须
     # 同时满足指数与宽度两个独立条件，不是单一指标放宽。
-    elif (overseas.get("light") == "red" or live_pct <= -2.0
+    elif (live_pct <= -2.0
           or (breadth is not None and breadth <= 0.20 and live_pct <= -1.0)):
-        light, reason = "red", f"实时沪深300 {live_pct:+.2f}% 或海外风险偏弱"
+        light, reason = "red", f"实时沪深300 {live_pct:+.2f}%，指数或宽度急剧走弱"
     elif live_pct <= -0.6 or (not above_ma20 and (bench_5d or 0) <= -3):
         light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，中期趋势偏谨慎"
-    elif overseas.get("light") in ("yellow", "unknown"):
-        light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，海外风险未确认，按谨慎仓位执行"
     elif breadth is not None and breadth < 0.45:
         light, reason = (
             "yellow",
@@ -3376,7 +3367,7 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True,
         light, reason = "yellow", f"实时沪深300 {live_pct:+.2f}%，按谨慎仓位执行"
     # 北向资金（P1）：同花顺分钟累计净流入。仅作情绪上下文展示与审计，
     # 不改变 light 门控——北向数据的当日语义（是否含买断额度）仍不稳。
-    # 与指数/海外源一致：read-model 调用（allow_network=False，例如
+    # 与指数源一致：read-model 调用（allow_network=False，例如
     # dashboard 的逐账户市场灯）不得发起外部请求，否则一次页面刷新会
     # 产生多次串行网络调用并拖慢只读响应。
     northbound = None
@@ -3393,7 +3384,7 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True,
         "light": light, "reason": reason + nb_reason, "breadth_up_pct": round(breadth * 100, 1) if breadth is not None else None,
         "up": up, "down": down, "benchmark_above_ma20": above_ma20,
         "benchmark_5d_pct": round(bench_5d, 2) if bench_5d is not None else None,
-        "data_date": last_date, "overseas": overseas,
+        "data_date": last_date,
         "northbound": northbound,
         "live_index_pct": round(live_pct, 2) if live_pct is not None else None,
         "live_index_price": _num((live_index or {}).get("price"), None),
@@ -5872,10 +5863,7 @@ def _dsl_entry_assessment(account_id, spec, pick, quote, decision, threshold_del
     vol_ratio = _num(quote.get("vol_ratio"))
     main_pct = _num(quote.get("main_pct"))
     checks = []
-    blockers = [
-        reason for reason in (decision.get("hard_vetoes") or [])
-        if reason != "海外风险红灯"
-    ]
+    blockers = list(decision.get("hard_vetoes") or [])
     overheat = {"level": "normal", "score": 0.0, "pullback_confirmed": False}
 
     def add(name, value, weight, detail):
@@ -5939,10 +5927,7 @@ def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_
     threshold_context = {}
     breakout_probe = False
     timing_mode = "常规确认"
-    blockers = [
-        reason for reason in (decision.get("hard_vetoes") or [])
-        if reason != "海外风险红灯"
-    ]
+    blockers = list(decision.get("hard_vetoes") or [])
 
     def add(name, value, weight, detail):
         checks.append({
@@ -6470,7 +6455,7 @@ def _signal_approval(
         )
     decision = DE.buy_decision(
         code, name=pick.get("name"), kline=kline, snap=quote,
-        sector_flow=sector_flow, overseas_gate=market["overseas"], news_hits=[],
+        sector_flow=sector_flow, news_hits=[],
     )
     if unadjusted_fallback:
         decision.setdefault("warnings", []).append("历史K线为不复权兜底，指标仅作降级参考")
@@ -6496,12 +6481,9 @@ def _signal_approval(
         _strategy_entry_assessment(account, pick, quote, kline, decision, delta, market=market)
     )
     # 新股路径只是替代长期均线/120日样本要求，绝不绕过价格、跌停、资金或
-    # 经验证的硬风险否决；海外红灯仍沿用各策略已有的市场状态门控。
+    # 经验证的硬风险否决。
     if is_new_listing:
-        flags.extend(
-            reason for reason in (decision.get("hard_vetoes") or [])
-            if reason != "海外风险红灯"
-        )
+        flags.extend(decision.get("hard_vetoes") or [])
     flags = [flag for flag in flags if flag]
     entry_model["news_learning"] = news_overlay
     entry_model["dynamic_news_risk"] = dynamic_news
@@ -8406,7 +8388,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     kline = _completed_kline(code, asof_day, inclusive=False)
     latest_decision = DE.buy_decision(
         code, name=signal.get("name"), kline=kline, snap=quote,
-        sector_flow=[], overseas_gate=market["overseas"], news_hits=[],
+        sector_flow=[], news_hits=[],
     )
     news_overlay = NL.code_overlay(code, asof=asof_day)
     delta = _entry_score_delta(account, asof_day) + _num(news_overlay.get("threshold_delta"))
@@ -8428,7 +8410,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         reasons.extend(entry_model["reasons"])
     q = DE.next_day_auction_matrix(
         code, name=signal.get("name"), kline=kline, snap=quote,
-        overseas_gate=market["overseas"], news_hits=[],
+        news_hits=[],
     )
     risk["q"] = q
     # 一致预期 EPS（P2）：仅三日策略，周级缓存的信息上下文。
@@ -12011,7 +11993,7 @@ def monitor_intraday(asof_datetime=None, force=False):
         order for order in (risk_result.get("orders") or [])
         if id(order) not in _already_merged
     ]
-    # Reconfirm execution-time index/overseas context after candidate preparation;
+    # Reconfirm execution-time index context after candidate preparation;
     # breadth remains pinned to this round's validated snapshot. Empty provider
     # results are briefly negatively cached by the owner, not substituted here.
     live_market = _market_state(day, live_universe=live_universe, allow_network=True)

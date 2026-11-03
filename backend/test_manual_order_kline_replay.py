@@ -94,8 +94,7 @@ class _PlanHarness(_ProvenRiskHarness, _ApprovedAllocationFixture):
                 return loader(security, cutoff, inclusive=inclusive)
             return None if frame is None else frame.copy(deep=True)
 
-        market = {"light": "green", "breadth": 0.5, "sentiment": "neutral",
-                  "overseas": {"light": "green"}}
+        market = {"light": "green", "breadth": 0.5, "sentiment": "neutral"}
         cache_owner = MO.RoundKlineCache if reuse else _NoReuseCache
         with mock.patch.object(MO, "_completed_kline", side_effect=loader_fn) as load, \
                 mock.patch.object(MO, "RoundKlineCache", cache_owner), \

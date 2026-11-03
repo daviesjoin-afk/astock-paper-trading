@@ -3621,10 +3621,10 @@ def _data_input_state(conn):
         },
         {
             "id": "macro", "name": "宏观数据", "status": "partial",
-            "coverage_pct": None, "records": 7,
-            "sources": ["沪深300", "全市场宽度", "道指", "纳指100", "恒生", "美元指数"],
-            "detail": "已有指数、市场宽度与海外风险代理；尚缺利率、汇率曲线、商品、社融/CPI/PMI等点时宏观序列。",
-            "authority": "当前仅用于市场灯号和风险缩放，不得作为单股直接买卖信号。",
+            "coverage_pct": None, "records": 3,
+            "sources": ["沪深300", "全市场宽度", "北向资金"],
+            "detail": "已有指数与市场宽度；尚缺利率、汇率曲线、商品、社融/CPI/PMI等点时宏观序列。",
+            "authority": "当前仅用于市场灯号，不得作为单股直接买卖信号。",
         },
     ]
     blockers = []

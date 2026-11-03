@@ -118,28 +118,6 @@ def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
 
 
-#: 海外历史整组不可用是明确的降级结果，不是“缓存没有答案”。仅作短暂
-#: 负缓存：同一轮不再反复支付整组 K 线超时，下一轮仍允许来源恢复。
-OVERSEAS_FAILURE_CACHE_SECONDS = 180.0
-
-
-def _cached_allow_empty(key, ttl, fn, *, failure_ttl):
-    now = time.time()
-    with _cache_lock:
-        entry = _mem_cache.get(key)
-    if entry is not None:
-        stamp, value = entry
-        lifetime = ttl if value else failure_ttl
-        if now - stamp < lifetime:
-            return value
-    value = fn()
-    with _cache_lock:
-        if key not in _mem_cache and len(_mem_cache) >= MDC.MAX_CACHE_ENTRIES:
-            _mem_cache.pop(min(_mem_cache, key=lambda item: _mem_cache[item][0]), None)
-        _mem_cache[key] = (now, value)
-    return value
-
-
 def _persistent_list(key, path, ttl, fn, fetch_lock):
     """跨进程复用列表型低频数据；空列表也是有效答案。"""
     return MDC.persistent_cached(
@@ -406,12 +384,11 @@ def check_data_source_health(force=False):
         scope.pop("successful_probe", None)
     return payload
 
-# ---------- 1. 大盘指数 + 海外市场实时（腾讯接口） ----------
+# ---------- 1. A 股大盘指数实时（腾讯接口） ----------
+# 海外指数已随海外风险模块一并移除；这里只保留 A 股指数。
 TENCENT_CODES = {
     "sh000001": "上证指数", "sz399001": "深证成指", "sz399006": "创业板指",
     "sh000300": "沪深300", "sh000905": "中证500", "sh000688": "科创50",
-    "usDJI": "道琼斯", "usIXIC": "纳斯达克", "usINX": "标普500",
-    "hkHSI": "恒生指数", "hkHSTECH": "恒生科技",
 }
 
 def fetch_indices():
@@ -434,7 +411,7 @@ def fetch_indices():
                     "change": float(parts[31] or 0), "pct": float(parts[32] or 0),
                     "amount": float(parts[37] or 0),  # 成交额(万)
                     "time": parts[30],
-                    "market": ("A股" if code.startswith(("sh", "sz")) else ("美股" if code.startswith("us") else "港股")),
+                    "market": "A股",
                 })
             except (ValueError, IndexError):
                 continue
@@ -2307,39 +2284,6 @@ def rebuild_kline_manifest():
         if _manifest_pending:
             _flush_kline_manifest_unlocked()
     return manifest
-
-# ---------- 6. 海外市场历史（用于风险门控与回测择时） ----------
-OVERSEAS_SECIDS = {
-    "DJIA": ("100.DJIA", "道琼斯"), "NDX": ("100.NDX", "纳斯达克100"),
-    "SPX": ("100.SPX", "标普500"), "HSI": ("100.HSI", "恒生指数"),
-    "USDIDX": ("100.UDI", "美元指数"),
-}
-
-def fetch_overseas_history(beg="20230101"):
-    def _do():
-        out = {}
-        def _one(item):
-            key, (secid, name) = item
-            try:
-                df = fetch_kline(None, beg=beg, secid=secid)
-                return key, {"name": name, "df": df} if (df is not None and not df.empty) else None
-            except Exception:
-                return key, None
-
-        # 5 个境外指数各自独立抓取，没有依赖顺序。串行 + 150 毫秒限速在
-        # 单线程下把 5 次 K 线抓取排成一串，整段累积到 6+ 秒。改成线程池
-        # 后只付一次 TCP/TLS 握手的最慢者，限速 sleep 也不再需要：不同
-        # 主机/不同 secid 互不争用同一个令牌桶。
-        items = list(OVERSEAS_SECIDS.items())
-        with ThreadPoolExecutor(max_workers=min(5, len(items) or 1)) as pool:
-            results = pool.map(_one, items)
-        for key, value in results:
-            if value is not None:
-                out[key] = value
-        return out
-    return _cached_allow_empty(
-        "overseas", 1800, _do, failure_ttl=OVERSEAS_FAILURE_CACHE_SECONDS,
-    )
 
 # ---------- 7. 舆情：7x24快讯 + 人气榜 ----------
 def fetch_fast_news(page_size=50):

@@ -396,8 +396,7 @@ def _manual_order_plan(
         kline = round_kline(code, day, inclusive=False)
         decision = DE.buy_decision(
             code, name=local_quote.get("name"), kline=kline, snap=local_quote,
-            sector_flow=[], overseas_gate=market.get("overseas") or {"light": "unknown"},
-            news_hits=[],
+            sector_flow=[], news_hits=[],
         )
         plan["risk"]["model"] = decision
         if decision.get("tier") not in ("T1", "T2"):
@@ -447,7 +446,7 @@ def _manual_order_plan(
                 "hold_days": _hold_days(position, day, round_kline) if position else 0,
             },
             kline=round_kline(code, day, inclusive=False), snap=local_quote,
-            overseas_gate={"light": "unknown"}, news_hits=[],
+            news_hits=[],
         )
         plan["risk"]["model"] = decision
         available_qty = int((position or {}).get("available_qty") or 0)

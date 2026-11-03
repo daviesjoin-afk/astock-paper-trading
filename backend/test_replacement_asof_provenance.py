@@ -52,10 +52,9 @@ DAY = dt.date(2026, 9, 10)
 DAY_NEXT = dt.date(2026, 9, 11)
 DAY_PREV = dt.date(2026, 9, 9)
 STATUSES = ("pending", "deferred_capacity")
-#: 真实 ``_buy_order`` 需要 ``light``（市场灯）与 ``overseas``（跳空/竞价闸门）。
+#: 真实 ``_buy_order`` 需要 ``light``（市场灯）与跳空/竞价闸门夹具。
 MARKET = {
     "light": "green",
-    "overseas": {"light": "green", "advice": "fixture"},
     "breadth": 0.5,
     "sentiment": "neutral",
 }

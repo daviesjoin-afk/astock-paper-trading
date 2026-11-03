@@ -7,17 +7,14 @@ GRIDS = {
     "first_board_relay": {
         "topn": [5, 10, 20],
         "rebalance": [1, 2, 3],
-        "use_gate": [True, False],
     },
     "pullback_reversal": {
         "topn": [5, 10, 20],
         "rebalance": [5, 10, 20],
-        "use_gate": [True, False],
     },
     "sector_sentiment": {
         "topn": [5, 10, 20],
         "rebalance": [1, 3, 5],
-        "use_gate": [True, False],
     },
 }
 
@@ -39,66 +36,63 @@ def optimize(strategy_id, fund_static=None):
     results = []
     for topn in grid["topn"]:
         for rebalance in grid["rebalance"]:
-            for use_gate in grid["use_gate"]:
-                common = {
-                    "strategy_id": strategy_id,
+            common = {
+                "strategy_id": strategy_id,
+                "topn": topn,
+                "rebalance": rebalance,
+                "fund_static": fund_static,
+                "prepared": prepared,
+            }
+            in_sample = B.run_backtest(
+                start=str(in_start.date()), end=str(in_end.date()), **common
+            )
+            out_sample = B.run_backtest(
+                start=str(out_start.date()), end=str(out_end.date()), **common
+            )
+            if "error" in in_sample or "error" in out_sample:
+                continue
+            metrics_in = in_sample["metrics"]
+            metrics_out = out_sample["metrics"]
+            overfit = (
+                metrics_in["sharpe"] > 1 and metrics_out["sharpe"] < 0.3
+            ) or (
+                metrics_in["annual_return"] > 15
+                and metrics_out["annual_return"] < 0
+            )
+            robustness = (
+                metrics_out["sharpe"]
+                - max(metrics_in["sharpe"] - metrics_out["sharpe"], 0) * 0.25
+                - abs(metrics_out["max_drawdown"]) / 500
+            )
+            # Selection must be driven by in-sample evidence only.  Ranking
+            # by an out-of-sample-dominated score spends the holdout set on
+            # parameter choice, so its metrics stop being a validation and
+            # systematically flatter the winner (selection bias).  The
+            # holdout stays reserved for the overfit check and reporting;
+            # the in-sample degradation term keeps parameters that only
+            # worked in one regime from ranking highly.
+            selection_score = (
+                metrics_in["sharpe"]
+                - abs(metrics_in["max_drawdown"]) / 500
+                - max(metrics_in["sharpe"] - metrics_out["sharpe"], 0) * 0.5
+            )
+            results.append(
+                {
                     "topn": topn,
                     "rebalance": rebalance,
-                    "use_gate": use_gate,
-                    "fund_static": fund_static,
-                    "prepared": prepared,
+                    "in_return": metrics_in["annual_return"],
+                    "in_sharpe": metrics_in["sharpe"],
+                    "in_dd": metrics_in["max_drawdown"],
+                    "out_return": metrics_out["annual_return"],
+                    "out_sharpe": metrics_out["sharpe"],
+                    "out_dd": metrics_out["max_drawdown"],
+                    "in_excess": metrics_in.get("excess_return"),
+                    "out_excess": metrics_out.get("excess_return"),
+                    "robustness_score": round(robustness, 3),
+                    "selection_score": round(selection_score, 3),
+                    "overfit_warning": overfit,
                 }
-                in_sample = B.run_backtest(
-                    start=str(in_start.date()), end=str(in_end.date()), **common
-                )
-                out_sample = B.run_backtest(
-                    start=str(out_start.date()), end=str(out_end.date()), **common
-                )
-                if "error" in in_sample or "error" in out_sample:
-                    continue
-                metrics_in = in_sample["metrics"]
-                metrics_out = out_sample["metrics"]
-                overfit = (
-                    metrics_in["sharpe"] > 1 and metrics_out["sharpe"] < 0.3
-                ) or (
-                    metrics_in["annual_return"] > 15
-                    and metrics_out["annual_return"] < 0
-                )
-                robustness = (
-                    metrics_out["sharpe"]
-                    - max(metrics_in["sharpe"] - metrics_out["sharpe"], 0) * 0.25
-                    - abs(metrics_out["max_drawdown"]) / 500
-                )
-                # Selection must be driven by in-sample evidence only.  Ranking
-                # by an out-of-sample-dominated score spends the holdout set on
-                # parameter choice, so its metrics stop being a validation and
-                # systematically flatter the winner (selection bias).  The
-                # holdout stays reserved for the overfit check and reporting;
-                # the in-sample degradation term keeps parameters that only
-                # worked in one regime from ranking highly.
-                selection_score = (
-                    metrics_in["sharpe"]
-                    - abs(metrics_in["max_drawdown"]) / 500
-                    - max(metrics_in["sharpe"] - metrics_out["sharpe"], 0) * 0.5
-                )
-                results.append(
-                    {
-                        "topn": topn,
-                        "rebalance": rebalance,
-                        "use_gate": use_gate,
-                        "in_return": metrics_in["annual_return"],
-                        "in_sharpe": metrics_in["sharpe"],
-                        "in_dd": metrics_in["max_drawdown"],
-                        "out_return": metrics_out["annual_return"],
-                        "out_sharpe": metrics_out["sharpe"],
-                        "out_dd": metrics_out["max_drawdown"],
-                        "in_excess": metrics_in.get("excess_return"),
-                        "out_excess": metrics_out.get("excess_return"),
-                        "robustness_score": round(robustness, 3),
-                        "selection_score": round(selection_score, 3),
-                        "overfit_warning": overfit,
-                    }
-                )
+            )
     results.sort(key=lambda row: row["selection_score"], reverse=True)
     best = next(
         (row for row in results if not row["overfit_warning"]),
@@ -119,12 +113,11 @@ def optimize(strategy_id, fund_static=None):
                 and tracking_feedback["avg_ret_pct"] < 0
             )
             if poor:
-                # “保守”相对于本策略自身周期：开门控、较大持仓数、最长调仓周期。
+                # “保守”相对于本策略自身周期：较大持仓数、最长调仓周期。
                 conservative = [
                     row
                     for row in results
                     if not row["overfit_warning"]
-                    and row["use_gate"]
                     and row["topn"] >= 10
                     and row["rebalance"] == max(grid["rebalance"])
                 ]
@@ -141,15 +134,15 @@ def optimize(strategy_id, fund_static=None):
         rows = [row for row in results if row["rebalance"] == rebalance]
         if rows:
             rebalance_compare[f"{rebalance}日调仓"] = {
-                "avg_out_sharpe": round(
-                    sum(row["out_sharpe"] for row in rows) / len(rows), 3
-                ),
-                "avg_out_return": round(
-                    sum(row["out_return"] for row in rows) / len(rows), 2
-                ),
-                "best_out_sharpe": round(
-                    max(row["out_sharpe"] for row in rows), 3
-                ),
+            "avg_out_sharpe": round(
+                sum(row["out_sharpe"] for row in rows) / len(rows), 3
+            ),
+            "avg_out_return": round(
+                sum(row["out_return"] for row in rows) / len(rows), 2
+            ),
+            "best_out_sharpe": round(
+                max(row["out_sharpe"] for row in rows), 3
+            ),
             }
 
     return {
