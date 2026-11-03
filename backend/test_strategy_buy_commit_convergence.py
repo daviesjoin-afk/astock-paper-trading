@@ -52,7 +52,6 @@ DAY_PREV = dt.date(2026, 9, 9)
 CAPITAL = 1_000_000.0
 MARKET = {
     "light": "green",
-    "overseas": {"light": "green", "advice": "fixture"},
     "breadth": 0.5,
     "sentiment": "neutral",
 }

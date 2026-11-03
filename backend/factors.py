@@ -500,52 +500,6 @@ def pit_provenance(price=None, fund=None, sentiment=None, asof=None):
     out["fundamental"] = fund_flags
     return out
 
-def overseas_risk_gate(history=None):
-    """海外风险门控：绿/黄/红。合成规则（可回测）：
-    - 道指+纳指近5日累计跌幅均值 < -3% → +2分; < -1.5% → +1分
-    - 恒指近5日跌幅 < -3% → +1分
-    - 美元指数近20日涨幅 > 2%（人民币贬值压力）→ +1分
-    分数 >=3 红灯, >=1.5 黄灯, 否则绿灯。没有有效历史时返回 unknown，
-    不能把"来源不可用"误报为海外环境平稳。"""
-    hist = dfc.fetch_overseas_history() if history is None else history
-    detail, score = [], 0.0
-    def _pct(df, n):
-        c = df["df"]["close"] if isinstance(df, dict) else df["close"]
-        if len(c) < n + 1:
-            return None
-        return float(c.iloc[-1] / c.iloc[-n-1] - 1) * 100
-    us = []
-    for k in ["DJIA", "NDX"]:
-        if k in hist:
-            p = _pct(hist[k], 5)
-            if p is not None:
-                us.append(p)
-                detail.append({"name": hist[k]["name"], "window": "5日", "pct": round(p, 2)})
-    if us:
-        avg = sum(us) / len(us)
-        if avg < -3: score += 2
-        elif avg < -1.5: score += 1
-    if "HSI" in hist:
-        p = _pct(hist["HSI"], 5)
-        if p is not None:
-            detail.append({"name": "恒生指数", "window": "5日", "pct": round(p, 2)})
-            if p < -3: score += 1
-    if "USDIDX" in hist:
-        p = _pct(hist["USDIDX"], 20)
-        if p is not None:
-            detail.append({"name": "美元指数", "window": "20日", "pct": round(p, 2)})
-            if p > 2: score += 1
-    if not detail:
-        return {
-            "light": "unknown", "score": None, "detail": [],
-            "advice": "海外历史证据不可用，按保守规则处理，不能据此认定外围平稳",
-        }
-    light = "red" if score >= 3 else ("yellow" if score >= 1.5 else "green")
-    advice = {"green": "外围环境平稳，策略正常仓位运行",
-              "yellow": "外围波动加大，建议仓位降至6成以内，谨慎追高",
-              "red": "外围风险显著，建议仓位降至3成以内或观望，等待企稳"}[light]
-    return {"light": light, "score": score, "detail": detail, "advice": advice}
-
 def news_keyword_scan(universe_names: dict, include_announcements=False):
     """扫描快讯；风控页可额外接入可追溯的公司公告，交易层默认保持原口径。"""
     news = dfc.fetch_fast_news(50)

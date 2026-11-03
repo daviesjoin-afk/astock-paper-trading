@@ -42,7 +42,6 @@ if BACKEND not in sys.path:
 
 import data_fetcher as dfc  # noqa: E402
 import data_universe_store as USTORE  # noqa: E402
-import factors as FACTORS  # noqa: E402
 import market_data_contract as MDC  # noqa: E402
 import market_data_service as MDSvc  # noqa: E402
 import news_learning as NL  # noqa: E402
@@ -454,8 +453,6 @@ class OfflinePaperEnv:
             }
             for day in (D0, D1, D2, D3)
         ]
-        cls._patches.append((FACTORS, "overseas_risk_gate", FACTORS.overseas_risk_gate))
-        FACTORS.overseas_risk_gate = lambda *a, **k: {"light": "green", "advice": "unit-test"}
         cls._patches.append((dfc, "fetch_finance_latest", dfc.fetch_finance_latest))
         dfc.fetch_finance_latest = lambda *a, **k: {"data": {}}
         cls._patches.append((dfc, "fetch_hot_sector_snapshot", dfc.fetch_hot_sector_snapshot))

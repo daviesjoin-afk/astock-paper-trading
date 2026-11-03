@@ -158,7 +158,7 @@ def _sync_operator_bypass_from_settings() -> None:
 
 
 async def _lifespan(_app):
-    # 启动阶段只加载应用代码：不扫描全市场 CSV、不拉财报/海外/全市场快照。
+    # 启动阶段只加载应用代码：不扫描全市场 CSV、不拉财报/全市场快照。
     # 这些工作改为用户触发功能时按需执行，避免双击启动占满 CPU、内存和网络。
     # 初始化本地模拟盘账本（幂等且不请求行情）。读模型接口刻意不在每次
     # 请求中调用 init_db()，因此必须在服务启动阶段为全新克隆创建基础表；
@@ -369,7 +369,7 @@ def frontend_app_css():
 
 def _compute_overview():
     # 初始化时已落盘的全市场快照可立即使用；禁止首页加载时再次拉 5,000+ 行情。
-    # 指数和海外数据可在后续用户操作中刷新，缺失时明确标为未知而不是阻塞页面。
+    # 指数数据可在后续用户操作中刷新，缺失时明确标为未知而不是阻塞页面。
     market_context = SEL.live_market_context()
     idx = market_context["indices"]
     snap = U.load_universe()
@@ -389,7 +389,7 @@ def _compute_overview():
     gate = market_context["gate"] or {
         "light": "unknown",
         "detail": [],
-        "advice": "海外数据未按启动阶段预加载，执行层将按保守规则处理。",
+        "advice": "指数数据未按启动阶段预加载，执行层将按保守规则处理。",
     }
     return {"indices": idx, "breadth": {"up": up, "down": down, "flat": len(snap) - up - down,
             "limit_up": limit_up, "limit_down": limit_down, "total": len(snap),
@@ -1083,13 +1083,12 @@ def backtest(
     strategy: str = "three_day",
     topn: int = Query(10, ge=1, le=100),
     rebalance: int = Query(10, ge=1, le=120),
-    gate: bool = True,
 ):
     if strategy not in S.STRATEGIES:
         return JSONResponse({"error": f"未知策略: {strategy}"}, status_code=400)
     if not U.data_ready():
         return {"need_init": True, "message": "请先初始化历史数据"}
-    return B.run_backtest(strategy, topn=topn, rebalance=rebalance, use_gate=gate)
+    return B.run_backtest(strategy, topn=topn, rebalance=rebalance)
 
 @app.get("/api/optimize")
 def optimize(strategy: str = "three_day"):
@@ -1122,9 +1121,6 @@ def hot():
                     "pct": s.get("pct"), "industry": s.get("industry")})
     return {"hot": out}
 
-@app.get("/api/gate")
-def gate():
-    return F.overseas_risk_gate()
 
 # ---------- 模拟盘 API 由 api_paper.router 管理 ----------
 
@@ -1150,16 +1146,11 @@ def track_list():
 def track_check():
     d = T.check_positions()
     # 卖出决策风控：给每只持仓叠加 8档阶梯止盈 + 4类强制止损 + 次日竞价 Q1-Q5
-    try:
-        gate = F.overseas_risk_gate()
-    except Exception:
-        gate = None
     for p in d.get("positions", []):
         p["sell_decision"] = DE.sell_decision(
             {"code": p["code"], "name": p["name"], "cost": p["cost"],
              "peak_price": p.get("peak_price"), "hold_days": p.get("hold_days")},
             kline=dfc.load_shared_kline(p["code"]),
-            overseas_gate=gate,
         )
     return d
 
@@ -1473,21 +1464,15 @@ def stock_detail(code: str, refresh: bool = False):
     if refresh:
         news_hits = F.news_keyword_scan(names)
         sector_flow = dfc.fetch_sector_flow("industry")
-        try:
-            gate = F.overseas_risk_gate()
-        except Exception:
-            gate = {"status": "unknown", "reason": "海外风险数据暂不可用"}
     else:
         # 已缓存新闻/板块资料可直接复用；不存在时以空资料保守展示，不发起网络请求。
         news_cache = dfc.memory_cache("news")
         sector_cache = dfc.memory_cache("sector_industry")
         news_hits = F.news_keyword_scan(names) if news_cache else []
         sector_flow = sector_cache[1] if sector_cache else []
-        gate = SEL.live_market_context().get("gate") or {
-            "status": "unknown", "reason": "海外风险缓存尚未刷新"}
     buy_d = (
         DE.buy_decision(code, name=s.get("name"), kline=kline, snap=s,
-                        sector_flow=sector_flow, overseas_gate=gate, news_hits=news_hits)
+                        sector_flow=sector_flow, news_hits=news_hits)
         if scope["allowed"] else {
             "tier": "禁止买入", "executable": False, "watchlist": False,
             "reason": scope["reason"], "security_scope": scope,
@@ -1495,7 +1480,7 @@ def stock_detail(code: str, refresh: bool = False):
     )
     sell_d = DE.sell_decision({"code": code, "name": s.get("name"), "cost": s.get("price"),
                                "peak_price": s.get("price"), "hold_days": 0},
-                              kline=kline, overseas_gate=gate, news_hits=news_hits)
+                              kline=kline, news_hits=news_hits)
     # 相关新闻（匹配该股的）
     stock_news = [h for h in news_hits if h["code"] == code]
     return {

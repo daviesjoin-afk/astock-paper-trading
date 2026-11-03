@@ -435,11 +435,6 @@ def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, n
             "历史K线", "本地前复权日线", (market or {}).get("data_date"),
             3 * 86400, received, coverage_pct=100 if (market or {}).get("data_date") else 0,
         ),
-        source_health(
-            "海外风险", "公开海外指数历史", None,
-            1800, received, coverage_pct=0,
-            verification={"status": "not_timestamped", "note": "provider response has no source timestamp; kept as conservative reference only"},
-        ),
     ]
     # 每次由 5 分钟任务或后台刷新写入一个同口径观察点。历史采用文件而非
     # 覆盖单点 JSON，连续少于 3 点时明确显示“样本不足”，不臆造资金趋势。

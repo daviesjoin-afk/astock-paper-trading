@@ -23,7 +23,6 @@ class EvidenceSnapshot:
     snap: Mapping[str, Any] = field(default_factory=dict)
     kline: Any = None
     sector_flow: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
-    overseas_gate: Mapping[str, Any] = field(default_factory=dict)
     news_hits: Any = None
     source: str = "injected"
 
@@ -34,7 +33,6 @@ def load_evidence(
     kline: Any = None,
     snap: Optional[Mapping[str, Any]] = None,
     sector_flow: Optional[Sequence[Mapping[str, Any]]] = None,
-    overseas_gate: Optional[Mapping[str, Any]] = None,
     news_hits: Any = None,
 ) -> EvidenceSnapshot:
     """加载决策证据，并保留旧版 ``decision_engine`` 的缺省行为。
@@ -66,22 +64,12 @@ def load_evidence(
         sector_flow = dfc.fetch_sector_flow("industry")
         source = "provider"
 
-    if overseas_gate is None:
-        try:
-            import factors as factor_module
-
-            overseas_gate = factor_module.overseas_risk_gate()
-        except Exception:
-            overseas_gate = {"light": "unknown"}
-        source = "provider"
-
     return EvidenceSnapshot(
         code=code,
         name=name or snap.get("name") or code,
         snap=snap,
         kline=kline,
         sector_flow=sector_flow or (),
-        overseas_gate=overseas_gate or {},
         news_hits=news_hits,
         source=source,
     )

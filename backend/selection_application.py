@@ -557,7 +557,7 @@ def _select_uncached(
             "message": "最近完整交易日的选股因子尚未生成，请等待增量更新完成",
             "coverage": coverage,
         }
-    # 初始化时保存的全市场快照提供横截面数据；慢速实时/财务/海外接口只在后台刷新，
+    # 初始化时保存的全市场快照提供横截面数据；慢速实时/财务接口只在后台刷新，
     # 不再阻塞每次选股。最终入选股票仍逐只经过执行风控。
     # Public selection and paper execution share the same tradable universe.
     # Keep STAR as context only (the strategy layer can turn its sector
@@ -813,7 +813,7 @@ def _select_uncached(
     gate = _LIVE_CACHE["gate"] or {
         "light": "unknown",
         "detail": [],
-        "advice": "海外历史源暂不可用，执行层按未知风险保守处理",
+        "advice": "指数数据暂不可用，执行层按保守规则处理",
     }
     table = S.build_factor_table(
         price_f,
@@ -879,7 +879,6 @@ def _select_uncached(
             kline=kline_map.get(p["code"]),
             snap=snap_map.get(p["code"]),
             sector_flow=sector_flow,
-            overseas_gate=gate,
             news_hits=news_hits,
         )
     result["executable_count"] = sum(1 for p in result["picks"] if p["buy_decision"]["executable"])

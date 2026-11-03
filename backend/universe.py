@@ -870,19 +870,13 @@ def init_history(beg="20230101", size=0, workers=6):
             with _state_lock:
                 INIT_STATE["errors"] = len(failed)
                 INIT_STATE["recovered"] = initial_failed - len(failed)
-            # 同时下载基准指数与海外指数
+            # 同时下载基准指数
             with _state_lock:
                 INIT_STATE["phase"] = "finalizing"
             try:
                 refresh_benchmark_history(latest_complete_trade_date(), beg=beg)
             except Exception:
                 pass
-            # 海外免费源偶发长时间不可达，不应让 A 股全市场下载卡在“收尾”。
-            threading.Thread(
-                target=dfc.fetch_overseas_history,
-                kwargs={"beg": beg},
-                daemon=True,
-            ).start()
             # K线文件已经变化，清除进程内回测矩阵，下一次请求重新加载。
             try:
                 import backtest

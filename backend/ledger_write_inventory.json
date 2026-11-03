@@ -2604,7 +2604,7 @@
   {
    "function": "new_cycle",
    "kind": "static",
-   "line": 113,
+   "line": 112,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2616,7 +2616,7 @@
   {
    "function": "set_account_params",
    "kind": "static",
-   "line": 124,
+   "line": 123,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2628,7 +2628,7 @@
   {
    "function": "add_signal",
    "kind": "static",
-   "line": 132,
+   "line": 131,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2640,7 +2640,7 @@
   {
    "function": "add_lot",
    "kind": "static",
-   "line": 145,
+   "line": 144,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2652,7 +2652,7 @@
   {
    "function": "add_lot",
    "kind": "static",
-   "line": 153,
+   "line": 152,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2664,7 +2664,7 @@
   {
    "function": "test_ec11_pending_reservations_are_not_cycle_filtered",
    "kind": "static",
-   "line": 209,
+   "line": 208,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2676,7 +2676,7 @@
   {
    "function": "test_ec11_pending_reservations_are_not_cycle_filtered",
    "kind": "static",
-   "line": 210,
+   "line": 209,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2688,7 +2688,7 @@
   {
    "function": "test_ec11_pending_reservations_are_not_cycle_filtered",
    "kind": "static",
-   "line": 212,
+   "line": 211,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2700,7 +2700,7 @@
   {
    "function": "_seed_pinned_cycle",
    "kind": "static",
-   "line": 289,
+   "line": 288,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -2712,7 +2712,7 @@
   {
    "function": "test_ec17_missing_cycle_pin_never_falls_back_to_current_head",
    "kind": "static",
-   "line": 402,
+   "line": 401,
    "module": "test_entry_capital_asof",
    "read_refs": [],
    "role": "test",
@@ -7417,7 +7417,7 @@
   {
    "function": "_declare_allocation_weight",
    "kind": "static",
-   "line": 241,
+   "line": 240,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7429,7 +7429,7 @@
   {
    "function": "_declare_test_allocation_weights",
    "kind": "static",
-   "line": 332,
+   "line": 331,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7441,7 +7441,7 @@
   {
    "function": "_run_risk",
    "kind": "static",
-   "line": 726,
+   "line": 723,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7453,7 +7453,7 @@
   {
    "function": "test_r26_partial_fill_retry_is_idempotent_and_finishes_same_order",
    "kind": "static",
-   "line": 1079,
+   "line": 1076,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7465,7 +7465,7 @@
   {
    "function": "test_stale_signal_does_not_fill",
    "kind": "static",
-   "line": 1228,
+   "line": 1225,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7477,7 +7477,7 @@
   {
    "function": "test_stale_signal_does_not_fill",
    "kind": "static",
-   "line": 1229,
+   "line": 1226,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7489,7 +7489,7 @@
   {
    "function": "test_stale_signal_does_not_fill",
    "kind": "static",
-   "line": 1230,
+   "line": 1227,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7501,7 +7501,7 @@
   {
    "function": "test_stale_signal_does_not_fill",
    "kind": "static",
-   "line": 1231,
+   "line": 1228,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7513,7 +7513,7 @@
   {
    "function": "test_stale_signal_does_not_fill",
    "kind": "static",
-   "line": 1233,
+   "line": 1230,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -7525,7 +7525,7 @@
   {
    "function": "test_same_day_sell_is_rejected_by_t_plus_one",
    "kind": "static",
-   "line": 1261,
+   "line": 1258,
    "module": "test_production_path_golden_replay",
    "read_refs": [],
    "role": "test",
@@ -8485,7 +8485,7 @@
   {
    "function": "add_signal",
    "kind": "static",
-   "line": 91,
+   "line": 90,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8497,7 +8497,7 @@
   {
    "function": "test_index_bounds_history_without_changing_asof_results",
    "kind": "static",
-   "line": 134,
+   "line": 133,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8509,7 +8509,7 @@
   {
    "function": "setUp",
    "kind": "static",
-   "line": 276,
+   "line": 275,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8521,7 +8521,7 @@
   {
    "function": "setUp",
    "kind": "static",
-   "line": 277,
+   "line": 276,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8533,7 +8533,7 @@
   {
    "function": "add_signal",
    "kind": "static",
-   "line": 311,
+   "line": 310,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8545,7 +8545,7 @@
   {
    "function": "add_lot",
    "kind": "static",
-   "line": 328,
+   "line": 327,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8557,7 +8557,7 @@
   {
    "function": "add_lot",
    "kind": "static",
-   "line": 338,
+   "line": 337,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8569,7 +8569,7 @@
   {
    "function": "_seed_cycle",
    "kind": "static",
-   "line": 461,
+   "line": 460,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8581,7 +8581,7 @@
   {
    "function": "_requested_cycle_borrow_fixture",
    "kind": "static",
-   "line": 498,
+   "line": 497,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8593,7 +8593,7 @@
   {
    "function": "_add_pending_buy",
    "kind": "static",
-   "line": 540,
+   "line": 539,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8605,7 +8605,7 @@
   {
    "function": "_seed_cycle",
    "kind": "static",
-   "line": 569,
+   "line": 568,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8617,7 +8617,7 @@
   {
    "function": "_activate",
    "kind": "static",
-   "line": 584,
+   "line": 583,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8629,7 +8629,7 @@
   {
    "function": "_activate",
    "kind": "static",
-   "line": 588,
+   "line": 587,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8641,7 +8641,7 @@
   {
    "function": "_add_pending_buy",
    "kind": "static",
-   "line": 598,
+   "line": 597,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8653,7 +8653,7 @@
   {
    "function": "_add_lot",
    "kind": "static",
-   "line": 610,
+   "line": 609,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -8665,7 +8665,7 @@
   {
    "function": "_add_lot",
    "kind": "static",
-   "line": 618,
+   "line": 617,
    "module": "test_replacement_asof_provenance",
    "read_refs": [],
    "role": "test",
@@ -9565,7 +9565,7 @@
   {
    "function": "new_cycle",
    "kind": "static",
-   "line": 196,
+   "line": 195,
    "module": "test_strategy_buy_commit_convergence",
    "read_refs": [],
    "role": "test",
@@ -9577,7 +9577,7 @@
   {
    "function": "add_signal",
    "kind": "static",
-   "line": 211,
+   "line": 210,
    "module": "test_strategy_buy_commit_convergence",
    "read_refs": [],
    "role": "test",
@@ -9589,7 +9589,7 @@
   {
    "function": "_prepare",
    "kind": "static",
-   "line": 534,
+   "line": 533,
    "module": "test_strategy_buy_commit_convergence",
    "read_refs": [],
    "role": "test",
@@ -9601,7 +9601,7 @@
   {
    "function": "_prepare",
    "kind": "static",
-   "line": 535,
+   "line": 534,
    "module": "test_strategy_buy_commit_convergence",
    "read_refs": [],
    "role": "test",
@@ -9613,7 +9613,7 @@
   {
    "function": "_prepare",
    "kind": "static",
-   "line": 543,
+   "line": 542,
    "module": "test_strategy_buy_commit_convergence",
    "read_refs": [],
    "role": "test",
@@ -9625,7 +9625,7 @@
   {
    "function": "_prepare",
    "kind": "static",
-   "line": 556,
+   "line": 555,
    "module": "test_strategy_buy_commit_convergence",
    "read_refs": [],
    "role": "test",

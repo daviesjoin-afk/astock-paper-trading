@@ -28,7 +28,6 @@ SLIPPAGE = 0.001
 
 _matrix_cache = {}
 _daily_score_cache = {}
-_gate_series_cache = {}
 # A backtest can touch thousands of dates and several strategy IDs.  Keep the
 # reusable score/gate projections bounded so a long-lived API process does not
 # retain one large pandas object per historical request forever.  The matrix
@@ -82,7 +81,6 @@ def load_matrices():
 def clear_matrix_cache():
     _matrix_cache.clear()
     _daily_score_cache.clear()
-    _gate_series_cache.clear()
 
 
 def _rsi_matrix(close, period=14):
@@ -148,49 +146,6 @@ def _limit_ratio(code):
 
 def _limit_series(columns):
     return pd.Series({_code: _limit_ratio(_code) for _code in columns}, dtype="float64")
-
-
-def build_gate_series(dates):
-    """按日生成海外风险门控；每个日期只读取当日以前的数据。"""
-    cache_key = (
-        str(dates[0]) if len(dates) else None,
-        str(dates[-1]) if len(dates) else None,
-        len(dates),
-    )
-    if cache_key in _gate_series_cache:
-        return _gate_series_cache[cache_key]
-    history = dfc.fetch_overseas_history()
-    lights = pd.Series("green", index=dates, dtype="object")
-
-    def _close(key):
-        return history[key]["df"]["close"] if key in history else None
-
-    dj, nd, hs, usd = (_close(k) for k in ("DJIA", "NDX", "HSI", "USDIDX"))
-    for date in dates:
-        score, us_moves = 0.0, []
-        for series in (dj, nd):
-            if series is None:
-                continue
-            known = series[series.index <= date]
-            if len(known) >= 6:
-                us_moves.append(float(known.iloc[-1] / known.iloc[-6] - 1) * 100)
-        if us_moves:
-            average = sum(us_moves) / len(us_moves)
-            score += 2 if average < -3 else (1 if average < -1.5 else 0)
-        if hs is not None:
-            known = hs[hs.index <= date]
-            if len(known) >= 6 and float(known.iloc[-1] / known.iloc[-6] - 1) * 100 < -3:
-                score += 1
-        if usd is not None:
-            known = usd[usd.index <= date]
-            if len(known) >= 21 and float(known.iloc[-1] / known.iloc[-21] - 1) * 100 > 2:
-                score += 1
-        lights.loc[date] = "red" if score >= 3 else ("yellow" if score >= 1.5 else "green")
-    _bounded_cache_set(_gate_series_cache, cache_key, lights, MAX_GATE_SERIES_CACHE)
-    return lights
-
-
-GATE_POS = {"green": 1.0, "yellow": 0.6, "red": 0.3}
 
 
 def _fundamental_frame(fund_static, columns):
@@ -286,7 +241,6 @@ def run_backtest(
     strategy_id,
     topn=10,
     rebalance=10,
-    use_gate=True,
     start=None,
     end=None,
     fund_static=None,
@@ -317,14 +271,12 @@ def run_backtest(
 
     fundamentals = _fundamental_frame(fund_static, close.columns)
     fundamentals_enabled = bool(use_latest_fundamentals and fund_static)
-    gate_series = build_gate_series(dates) if use_gate else None
     rebalance_dates = set(dates[::rebalance])
     limits = _limit_series(close.columns)
 
     cash = 1.0
     positions = {}
     equity_rows = []
-    gate_log = []
     holdings_history = []
     trade_log = []
     rejected = {"limit_up": 0, "limit_down": 0, "suspended": 0}
@@ -356,10 +308,7 @@ def run_backtest(
             if not fundamentals_enabled:
                 _bounded_cache_set(_daily_score_cache, score_key, scores, MAX_DAILY_SCORE_CACHE)
         targets = list(scores.head(topn).index)
-        light = gate_series.loc[date] if use_gate else "green"
-        position_scale = GATE_POS.get(light, 1.0)
-        if use_gate:
-            gate_log.append({"date": str(date.date()), "light": light})
+        position_scale = 1.0
 
         next_date = dates[index + 1]
         next_open = open_.loc[next_date]
@@ -457,7 +406,8 @@ def run_backtest(
                 "signal_date": str(date.date()),
                 "execution_date": str(next_date.date()),
                 "target": targets,
-                "gate": light,
+                # 海外门控已删除：仓位缩放恒为 1.0，这里如实记录"无门控"。
+                "gate": "disabled",
                 "position_scale": position_scale,
             }
         )
@@ -482,7 +432,6 @@ def run_backtest(
         "params": {
             "topn": topn,
             "rebalance": rebalance,
-            "use_gate": use_gate,
             "fundamentals_mode": (
                 "latest_snapshot_approx" if fundamentals_enabled else "disabled_no_pit_data"
             ),
@@ -493,7 +442,6 @@ def run_backtest(
         "dates": [str(date.date()) for date in equity.index],
         "equity": [round(float(value), 4) for value in equity],
         "benchmark": benchmark_curve,
-        "gate_log": gate_log[-60:] if use_gate else [],
         "recent_holdings": holdings_history[-3:],
         "trades": len(trade_log),
         "recent_trades": trade_log[-100:],

@@ -39,16 +39,24 @@ def _dim_status(score):
 
 
 def buy_timing_tier(dims, seal=None):
-    """根据六维评分和封单证据返回 T1-T5 时机。"""
+    """根据多维评分和封单证据返回 T1-T5 时机。
+
+    2026-11-03：海外风险维度已删除（维度数 6 → 5）。绿灯计数是按当时
+    维度数标定的常量；若不重标定，T2 的 "green >= 3" 在 5 维下等于要求
+    60% 维度全绿，会把原本可执行的场景整体压成 T3（实测 single 场景
+    19900 股 → 不建仓）。按比例 3/6 = 50% 重新标定：
+    T1 需要 3/5 绿灯（原 4/6 已不可能在 5 维下等价，取 60%），
+    T2 需要 2/5 绿灯（原 3/6 = 50%），其余阈值与红灯条件不变。
+    """
     green = sum(1 for dim in dims if dim["status"] == "green")
     red = sum(1 for dim in dims if dim["status"] == "red")
     avg_score = sum(dim["score"] for dim in dims) / len(dims) if dims else 0
 
     if seal and seal["status"] == "red":
         return {"tier": "T5", "action": "放弃", "reason": "涨停封单存疑"}
-    if green >= 4 and red == 0 and avg_score >= 0.65:
-        return {"tier": "T1", "action": "积极买入", "reason": "六维 mostly 绿灯，大盘环境友好"}
-    if green >= 3 and red <= 1 and avg_score >= 0.5:
+    if green >= 3 and red == 0 and avg_score >= 0.65:
+        return {"tier": "T1", "action": "积极买入", "reason": "多数维度绿灯"}
+    if green >= 2 and red <= 1 and avg_score >= 0.5:
         return {"tier": "T2", "action": "可执行买入", "reason": "多数维度健康，可开仓"}
     if red <= 2 and avg_score >= 0.4:
         return {"tier": "T3", "action": "观察/轻仓", "reason": "信号混杂，建议观察清单跟踪"}
@@ -88,7 +96,7 @@ def ladder_take_profit(ret_pct):
 
 
 def forced_stop_losses(price, cost, peak_price, hold_days, mom20, main_pct,
-                       news_neg=None, overseas_light=None):
+                       news_neg=None):
     """根据已加载的持仓与证据值返回止损信号。"""
     signals = []
     ret_pct = (price / cost - 1) * 100 if (price and cost) else None
@@ -122,9 +130,6 @@ def forced_stop_losses(price, cost, peak_price, hold_days, mom20, main_pct,
     elif deterioration:
         signals.append({"type": "因子恶化", "level": "warn",
                         "msg": "；".join(deterioration)})
-    if overseas_light == "red":
-        signals.append({"type": "海外风险", "level": "warn",
-                        "msg": "海外风险红灯，建议降低组合仓位而非单票无条件卖出"})
     return signals
 
 

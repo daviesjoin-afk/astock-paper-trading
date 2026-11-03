@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """市场灯必须同时看趋势与广度，而不是被一根滞后日线永久压成黄灯。
 
-生产 2026-10-28 14:00：沪深300 +0.55%、上涨家数占比 71.9%、海外绿灯，
+生产 2026-10-28 14:00：沪深300 +0.55%、上涨家数占比 71.9%，
 但因为 10-27 的收盘价仍在 MA20 下方，旧规则把整轮风控打成"谨慎仓位"。
 新规则保留"趋势 + 广度"双确认：广度推力必须同时满足指数强度与市场宽度，
 任何单一指标都不能单独放宽。
@@ -36,12 +36,9 @@ def _rows(up, down):
 
 
 class MarketLightRegimeTests(unittest.TestCase):
-    def _state(self, *, up, down, last_close, five_day_base, live_pct,
-               overseas="green"):
+    def _state(self, *, up, down, last_close, five_day_base, live_pct):
         with mock.patch.object(PT.dfc, "load_cached_kline",
                                return_value=_bench(last_close, five_day_base)), \
-                mock.patch.object(PT.F, "overseas_risk_gate",
-                                  return_value={"light": overseas, "advice": ""}), \
                 mock.patch.object(PT.AD, "northbound_realtime", return_value=None):
             return PT._market_state(
                 DAY, live_universe=_rows(up, down), allow_network=True,
@@ -81,12 +78,6 @@ class MarketLightRegimeTests(unittest.TestCase):
         state = self._state(up=1500, down=3000, last_close=10.4,
                             five_day_base=10.0, live_pct=-2.1)
         self.assertEqual(state["light"], "red")
-
-    def test_unknown_overseas_risk_keeps_the_old_conservative_gate(self):
-        state = self._state(up=3854, down=1507, last_close=9.9,
-                            five_day_base=10.15, live_pct=0.55,
-                            overseas="unknown")
-        self.assertEqual(state["light"], "yellow")
 
     def test_panic_breadth_with_decline_is_red(self):
         state = self._state(up=600, down=4400, last_close=10.4,
