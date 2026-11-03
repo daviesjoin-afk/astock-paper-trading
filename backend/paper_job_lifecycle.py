@@ -243,7 +243,7 @@ def enqueue_snapshot_refresh(conn, *, trigger, now, request_kind="automatic",
 
     automatic: keep pending/running/backoff work; throttle completed stale input.
     explicit: manual/new-data requests coalesce to at most one pending follow-up.
-    ensure: create the first durable request only, regardless of an existing state.
+    ensure: create the first durable request, or replace an explicitly expired one.
     """
     if request_kind not in {"automatic", "explicit", "ensure"}:
         raise ValueError("unknown snapshot refresh request kind")
@@ -255,13 +255,24 @@ def enqueue_snapshot_refresh(conn, *, trigger, now, request_kind="automatic",
                 THEN MAX(request_version,claimed_version+1) ELSE request_version+1 END,
             status=CASE WHEN status='running' THEN 'running' ELSE 'queued' END
         WHERE
-            (? AND (status IN ('failed','completed')
+            (? AND (status IN ('failed','completed','expired')
                     OR (status='running' AND request_version=claimed_version)))
-            OR (? AND status='completed'
-                AND (? OR last_completed_at IS NULL OR last_completed_at<=?))
+            OR (? AND status IN ('completed','expired')
+                AND (status='expired' OR ? OR last_completed_at IS NULL OR last_completed_at<=?))
+            OR (? AND status='expired')
         """, (str(trigger)[:60], now, request_kind == "explicit",
-              request_kind == "automatic", snapshot_missing, completed_before))
+              request_kind == "automatic", snapshot_missing, completed_before, request_kind == "ensure"))
     return read_snapshot_refresh(conn)
+
+
+def expire_snapshot_refresh(conn, *, now, reason, queue_age_seconds):
+    """Drop only due, unowned work; never revoke a live display publisher."""
+    return conn.execute("""UPDATE paper_dashboard_refresh_jobs SET
+        status='expired', finished_at=?, owner_key=NULL, expires_at=NULL, next_retry_at=NULL,
+        fencing_token=fencing_token+1, skip_count=skip_count+1,
+        last_skip_reason=?, last_skipped_at=?, last_queue_age_seconds=?
+        WHERE id=1 AND """ + _SNAPSHOT_REFRESH_DUE,
+        (now, reason, now, queue_age_seconds, now, now)).rowcount == 1
 
 
 def claim_snapshot_refresh(conn, *, owner, now, expires_at):

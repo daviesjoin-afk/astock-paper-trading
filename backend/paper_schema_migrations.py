@@ -2065,17 +2065,33 @@ def ensure_experiment_search(conn):
     return changes
 
 def ensure_dashboard_refresh_jobs(conn):
-    """展示任务独立于交易 jobs；单一队列身份合并重复刷新请求。"""
-    conn.execute("""CREATE TABLE IF NOT EXISTS paper_dashboard_refresh_jobs (
+    """v41/v42 singleton display queue; upgrade without committing caller work."""
+    ddl = """CREATE TABLE IF NOT EXISTS paper_dashboard_refresh_jobs (
         id INTEGER PRIMARY KEY CHECK(id=1),
-        status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
+        status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','expired')),
         trigger TEXT NOT NULL, requested_at TEXT NOT NULL,
         request_version INTEGER NOT NULL DEFAULT 1, claimed_version INTEGER NOT NULL DEFAULT 0,
         attempt INTEGER NOT NULL DEFAULT 0, owner_key TEXT,
         fencing_token INTEGER NOT NULL DEFAULT 0,
         started_at TEXT, heartbeat_at TEXT, expires_at TEXT, finished_at TEXT,
-        next_retry_at TEXT, last_error TEXT, last_completed_at TEXT
-    )""")
+        next_retry_at TEXT, last_error TEXT, last_completed_at TEXT,
+        skip_count INTEGER NOT NULL DEFAULT 0, last_skip_reason TEXT,
+        last_skipped_at TEXT, last_queue_age_seconds REAL
+    )"""
+    conn.execute(ddl)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_dashboard_refresh_jobs)")}
+    if "skip_count" in columns:
+        return
+    # SQLite cannot ALTER the original status CHECK. Copy every v41 column,
+    # including any active owner/fence and coalesced follow-up, in one transaction.
+    conn.execute(ddl.replace("paper_dashboard_refresh_jobs", "paper_dashboard_refresh_jobs_v42", 1))
+    names = ("id,status,trigger,requested_at,request_version,claimed_version,attempt,owner_key,"
+             "fencing_token,started_at,heartbeat_at,expires_at,finished_at,next_retry_at,"
+             "last_error,last_completed_at")
+    conn.execute(f"INSERT INTO paper_dashboard_refresh_jobs_v42 ({names}) "
+                 f"SELECT {names} FROM paper_dashboard_refresh_jobs")
+    conn.execute("DROP TABLE paper_dashboard_refresh_jobs")
+    conn.execute("ALTER TABLE paper_dashboard_refresh_jobs_v42 RENAME TO paper_dashboard_refresh_jobs")
 
 
 def ensure_ai_decision_audits(conn):

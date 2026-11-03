@@ -1086,7 +1086,7 @@
   {
    "function": "repair_legacy_ledger_rows",
    "kind": "static",
-   "line": 2408,
+   "line": 2424,
    "module": "paper_schema_migrations",
    "read_refs": [
     "paper_orders"
@@ -1100,7 +1100,7 @@
   {
    "function": "repair_legacy_ledger_rows",
    "kind": "static",
-   "line": 2419,
+   "line": 2435,
    "module": "paper_schema_migrations",
    "read_refs": [
     "paper_orders"
@@ -1114,7 +1114,7 @@
   {
    "function": "repair_legacy_ledger_rows",
    "kind": "dynamic",
-   "line": 2430,
+   "line": 2446,
    "module": "paper_schema_migrations",
    "read_refs": [
     "paper_orders"
@@ -1128,7 +1128,7 @@
   {
    "function": "repair_legacy_ledger_rows",
    "kind": "static",
-   "line": 2430,
+   "line": 2446,
    "module": "paper_schema_migrations",
    "read_refs": [
     "paper_orders"
@@ -1142,7 +1142,7 @@
   {
    "function": "repair_legacy_ledger_rows",
    "kind": "static",
-   "line": 2444,
+   "line": 2460,
    "module": "paper_schema_migrations",
    "read_refs": [],
    "role": "migration",

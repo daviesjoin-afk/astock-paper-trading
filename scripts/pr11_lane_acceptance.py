@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -155,26 +156,26 @@ def percentile(values, portion=0.95):
     return sorted(values)[max(0, int(len(values) * portion + 0.999) - 1)]
 
 
-def sample_fast(name, *, contention, samples=6, tick=6.0):
-    rows, execution_rows, queue = [], [], []
+def sample_fast(name, *, samples=6, tick=6.0):
+    rows, execution_rows, queue, roundtrips = [], [], [], []
     epoch = time.monotonic()
     for index in range(samples):
         due = epoch + index * tick
         time.sleep(max(0, due - time.monotonic()))
-        peer = None
-        if contention:
-            peer = subprocess.Popen(invocation(name, "fast", "--slot", "execution-resume", "--index", str(index)),
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        round_started = time.monotonic()
+        # Match both sides: candidate pressure is the only workload difference.
+        peer = subprocess.Popen(invocation(name, "fast", "--slot", "execution-resume", "--index", str(index)),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             row = json.loads(command(invocation(name, "fast", "--slot", "risk", "--index", str(index))))
             rows.append(row)
             queue.append(max(0.0, row["started"] - due))
-            if peer:
-                stdout, stderr = peer.communicate(timeout=90)
-                assert peer.returncode == 0, stderr[-1500:]
-                execution_rows.append(json.loads(stdout))
+            stdout, stderr = peer.communicate(timeout=90)
+            assert peer.returncode == 0, stderr[-1500:]
+            execution_rows.append(json.loads(stdout))
+            roundtrips.append(time.monotonic() - round_started)
         finally:
-            if peer and peer.poll() is None:
+            if peer.poll() is None:
                 peer.kill()
                 peer.wait()
     intervals = [b["started"] - a["started"] for a, b in zip(rows, rows[1:], strict=False)]
@@ -182,14 +183,17 @@ def sample_fast(name, *, contention, samples=6, tick=6.0):
             "interval_max_s": max(intervals), "queue_max_s": max(queue),
             "rss_max_bytes": max(r["rss_bytes"] for r in rows + execution_rows),
             "work_wall_max_s": max(r["wall_s"] for r in rows + execution_rows),
-            "execution_samples": len(execution_rows)}
+            "roundtrip_max_s": max(roundtrips),
+            "execution_samples": len(execution_rows),
+            "risk_samples": rows, "recovery_samples": execution_rows}
 
 
-def host_probe(image):
+def host_probe(image, evidence):
     from pr11_capacity import read_compose, evaluate, host_capacity, profile_limits
     root = Path(__file__).resolve().parents[1]
     config = read_compose(root / "docker-compose.server.yml")
     capacity = evaluate(config, **host_capacity())
+    evidence.update(ok=False, capacity=capacity, image=image, phase="capacity")
     assert capacity["ok"], capacity
     limits = profile_limits(config)
     cpuset = ",".join(str(cpu) for cpu in sorted(os.sched_getaffinity(0))[:2])
@@ -210,7 +214,15 @@ def host_probe(image):
         launch(image, candidate, limits["astock-candidate-worker"], volume, cpuset,
                config["services"]["astock-candidate-worker"]["tmpfs"][0])
         created.append(candidate)
-        baseline = sample_fast(paper, contention=False)
+        # A fixed 6s tick can be shorter than two cold imports on a slower CI
+        # host. Calibrate once WITHOUT candidate load, then freeze the SAME tick
+        # and matched risk/recovery workload for baseline and loaded samples.
+        calibration = sample_fast(paper, samples=2)
+        tick = float(max(6, math.ceil(calibration["roundtrip_max_s"] * 1.5)))
+        evidence.update(calibration=calibration, calibrated_tick_s=tick, phase="baseline")
+        assert tick <= 30, "quiet host cannot sustain a bounded scaled probe"
+        baseline = sample_fast(paper, tick=tick)
+        evidence["baseline"] = baseline
         holder = subprocess.Popen(invocation(candidate, "hold"),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -225,11 +237,14 @@ def host_probe(image):
             if holder.poll() is None:
                 holder.kill()
                 holder.wait()
-        pressure = subprocess.Popen(invocation(candidate, "candidate"),
+        evidence["sqlite_coordination"] = coordination
+        pressure = subprocess.Popen(invocation(candidate, "candidate", "--duration", str(int(6 * tick + 20))),
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert select.select([pressure.stdout], [], [], 60)[0], "candidate readiness timeout"
         assert json.loads(pressure.stdout.readline())["ready"]
-        loaded = sample_fast(paper, contention=True)
+        evidence["phase"] = "candidate_pressure"
+        loaded = sample_fast(paper, tick=tick)
+        evidence["contended"] = loaded
         assert pressure.poll() is None, "candidate pressure stopped before the contended samples finished"
         command(["docker", "exec", candidate, "python", "-c", "from pathlib import Path; Path('/tmp/pr11-stop').touch()"])
         stdout, stderr = pressure.communicate(timeout=60)
@@ -237,6 +252,9 @@ def host_probe(image):
         load = json.loads(stdout)
         facts = {role: json.loads(command(invocation(name, "facts")))
                  for role, name in (("paper", paper), ("candidate", candidate))}
+        evidence.update(candidate_pressure=load, cgroups=facts, probe_cpu_affinity=cpuset,
+                        phase="assertions",
+                        scope="offline synthetic 5000-row preparation + matched cold risk/recovery pairs; calibrated scaled tick, not live 180s proof")
         for role, service in (("paper", "astock-paper-worker"), ("candidate", "astock-candidate-worker")):
             actual, limit = facts[role], limits[service]
             assert actual["memory_max"] == limit["memory_bytes"]
@@ -256,11 +274,8 @@ def host_probe(image):
         assert loaded["interval_p95_s"] <= baseline["interval_p95_s"] + 0.25, (baseline, loaded)
         assert loaded["interval_max_s"] < loaded["scaled_tick_s"] * 1.5, loaded
         assert loaded["queue_max_s"] < loaded["scaled_tick_s"] * 0.5, loaded
-        return {"ok": True, "image": image, "baseline": baseline, "contended": loaded,
-                "candidate_pressure": load, "cgroups": facts, "capacity": capacity,
-                "sqlite_coordination": coordination,
-                "probe_cpu_affinity": cpuset,
-                "scope": "offline synthetic 5000-row preparation + cold imports + fixture SQLite slots; scaled tick, not live 180s proof"}
+        evidence.update(ok=True, phase="completed")
+        return evidence
     finally:
         # Only these unique, newly created CI containers may be removed.
         for name in created:
@@ -282,8 +297,8 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.inside == "candidate":
-        if not 1 <= args.duration <= 90:
-            parser.error("duration must be between 1 and 90 seconds")
+        if not 1 <= args.duration <= 210:
+            parser.error("duration must be between 1 and 210 seconds")
         result = candidate_pressure(args.duration)
     elif args.inside == "fast":
         result = fast_once(args.slot, args.index)
@@ -294,7 +309,13 @@ def main():
     elif args.inside == "coordinate":
         result = sqlite_contender()
     else:
-        result = host_probe(args.image)
+        result = {"ok": False, "phase": "setup"}
+        try:
+            result = host_probe(args.image, result)
+        finally:
+            # Keep raw samples and failure phase even when a gate rejects it.
+            if args.output:
+                args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     if args.output:
         args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, sort_keys=True), flush=True)
