@@ -9349,7 +9349,7 @@
   {
    "function": "_db",
    "kind": "static",
-   "line": 57,
+   "line": 58,
    "module": "test_signal_order_reconcile_write",
    "read_refs": [],
    "role": "test",
@@ -9361,7 +9361,7 @@
   {
    "function": "_db",
    "kind": "static",
-   "line": 58,
+   "line": 59,
    "module": "test_signal_order_reconcile_write",
    "read_refs": [],
    "role": "test",
@@ -9373,7 +9373,7 @@
   {
    "function": "_db",
    "kind": "static",
-   "line": 59,
+   "line": 60,
    "module": "test_signal_order_reconcile_write",
    "read_refs": [],
    "role": "test",
@@ -9383,9 +9383,33 @@
    ]
   },
   {
+   "function": "test_only_schema_in_membership_is_unordered",
+   "kind": "static",
+   "line": 208,
+   "module": "test_signal_order_reconcile_write",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_orders SET status='expired'",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "test_only_schema_in_membership_is_unordered",
+   "kind": "static",
+   "line": 208,
+   "module": "test_signal_order_reconcile_write",
+   "read_refs": [],
+   "role": "test",
+   "sql": "UPDATE paper_signals SET status='filled'",
+   "write_targets": [
+    "paper_signals"
+   ]
+  },
+  {
    "function": "test_terminal_owner_only_touches_the_statuses_it_is_given",
    "kind": "static",
-   "line": 318,
+   "line": 350,
    "module": "test_signal_order_reconcile_write",
    "read_refs": [],
    "role": "test",

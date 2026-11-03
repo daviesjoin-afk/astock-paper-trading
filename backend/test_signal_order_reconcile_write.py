@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import inspect
+import re
 import sqlite3
 import textwrap
 import unittest
@@ -64,6 +65,20 @@ def _db(orders=(), signals=(), reservations=()):
 def _state(conn):
     return {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
             for table in ("paper_orders", "paper_signals", "paper_capital_reservations")}
+
+
+def _normalize_schema_membership(sql):
+    """Only the three-table existence probe has unordered IN members."""
+    match = re.fullmatch(
+        r"SELECT name FROM sqlite_master WHERE type='table' AND name IN \(([^)]*)\)", sql)
+    if match:
+        names = re.findall(r"'([^']*)'", match[1])
+        if len(names) == 3 and set(names) == {
+            "paper_orders", "paper_signals", "paper_capital_reservations"
+        }:
+            return ("SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+                    + ",".join(repr(name) for name in sorted(names)) + ")")
+    return sql
 
 
 def _legacy_namespace():
@@ -168,7 +183,8 @@ class ReconcileParityTests(unittest.TestCase):
         """同一轮内新旧实现必须完全一致（返回值、账本行、SQL 顺序、时钟）。"""
         self.assertEqual(expected["result"], actual["result"], label)
         self.assertEqual(expected["state"], actual["state"], label)
-        self.assertEqual(expected["sql"], actual["sql"], label)
+        self.assertEqual([_normalize_schema_membership(s) for s in expected["sql"]],
+                         [_normalize_schema_membership(s) for s in actual["sql"]], label)
         self.assertEqual(expected["clock_calls"], actual["clock_calls"], label)
         self.assertEqual(expected["in_transaction"], actual["in_transaction"], label)
 
@@ -180,6 +196,22 @@ class ReconcileParityTests(unittest.TestCase):
         actual = run(current, legacy=False)
         self.assertRoundEqual(expected, actual)
         return actual
+
+    def test_only_schema_in_membership_is_unordered(self):
+        left = ("SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                "('paper_orders','paper_signals','paper_capital_reservations')")
+        right = ("SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                 "('paper_signals','paper_capital_reservations','paper_orders')")
+        self.assertEqual(_normalize_schema_membership(left), _normalize_schema_membership(right))
+        self.assertNotEqual(_normalize_schema_membership(left),
+                            _normalize_schema_membership(right.replace("paper_orders", "paper_accounts")))
+        writes = ["UPDATE paper_orders SET status='expired'", "UPDATE paper_signals SET status='filled'"]
+        self.assertEqual(writes, [_normalize_schema_membership(s) for s in writes])
+        expected = {"result": {}, "state": {}, "sql": [left, *writes],
+                    "clock_calls": 0, "in_transaction": True}
+        for changed in (list(reversed(writes)), [writes[0].replace("expired", "filled"), writes[1]]):
+            with self.assertRaises(AssertionError):
+                self.assertRoundEqual(expected, {**expected, "sql": [right, *changed]})
 
     def test_duplicate_retries_keep_newest_and_release_older(self):
         actual = self.compare(DUP_RETRY)
