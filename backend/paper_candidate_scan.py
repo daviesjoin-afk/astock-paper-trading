@@ -167,6 +167,16 @@ def collect_evidence(accounts, precomputed_candidates, day, *, ports: EvidencePo
 def prepare(accounts, *, factor_day, day, market, sector_rows, live_universe,
             snapshot_asof, ports: PreparationPorts):
     """Share calculations only in this invocation; keep strategy failures separate."""
+    with PTM.phase("candidate.prepare"):
+        return _prepare(
+            accounts, factor_day=factor_day, day=day, market=market,
+            sector_rows=sector_rows, live_universe=live_universe,
+            snapshot_asof=snapshot_asof, ports=ports,
+        )
+
+
+def _prepare(accounts, *, factor_day, day, market, sector_rows, live_universe,
+             snapshot_asof, ports: PreparationPorts):
     shared_inputs = CandidateScanInputs(snapshot_asof)
     candidates, micro_codes = {}, []
     for account in accounts:

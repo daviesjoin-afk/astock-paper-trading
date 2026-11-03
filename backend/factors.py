@@ -505,8 +505,9 @@ def overseas_risk_gate(history=None):
     - 道指+纳指近5日累计跌幅均值 < -3% → +2分; < -1.5% → +1分
     - 恒指近5日跌幅 < -3% → +1分
     - 美元指数近20日涨幅 > 2%（人民币贬值压力）→ +1分
-    分数 >=3 红灯, >=1.5 黄灯, 否则绿灯"""
-    hist = history or dfc.fetch_overseas_history()
+    分数 >=3 红灯, >=1.5 黄灯, 否则绿灯。没有有效历史时返回 unknown，
+    不能把"来源不可用"误报为海外环境平稳。"""
+    hist = dfc.fetch_overseas_history() if history is None else history
     detail, score = [], 0.0
     def _pct(df, n):
         c = df["df"]["close"] if isinstance(df, dict) else df["close"]
@@ -534,6 +535,11 @@ def overseas_risk_gate(history=None):
         if p is not None:
             detail.append({"name": "美元指数", "window": "20日", "pct": round(p, 2)})
             if p > 2: score += 1
+    if not detail:
+        return {
+            "light": "unknown", "score": None, "detail": [],
+            "advice": "海外历史证据不可用，按保守规则处理，不能据此认定外围平稳",
+        }
     light = "red" if score >= 3 else ("yellow" if score >= 1.5 else "green")
     advice = {"green": "外围环境平稳，策略正常仓位运行",
               "yellow": "外围波动加大，建议仓位降至6成以内，谨慎追高",

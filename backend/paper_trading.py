@@ -9535,7 +9535,8 @@ def execute_open(asof_date=None, *, risk_result=None, execution_orders=None,
     try:
         with PTM.phase("execution.market_snapshot"):
             open_rows = _validated_live_universe(
-                MDSvc.refresh_rows(policy=MDC.OPENING_EVENT_POLICY), day, max_quote_age_minutes=20,
+                MDSvc.refresh_rows_if_stale(policy=MDC.OPENING_EVENT_POLICY, asof_day=day),
+                day, max_quote_age_minutes=20,
             )
     except Exception:
         open_rows = []
@@ -12010,13 +12011,9 @@ def monitor_intraday(asof_datetime=None, force=False):
         order for order in (risk_result.get("orders") or [])
         if id(order) not in _already_merged
     ]
-    # Reuse the already validated, same-round full-market snapshot.  Reading
-    # the previous close snapshot here made live market state ``unknown`` and
-    # silently disabled intraday buyback/scale-in even when the scan itself
-    # had fresh coverage.
-    # This is intentionally before the ledger write transaction.  It may
-    # refresh the index/overseas context, while the breadth calculation stays
-    # pinned to ``live_universe`` from this scan.
+    # Reconfirm execution-time index/overseas context after candidate preparation;
+    # breadth remains pinned to this round's validated snapshot. Empty provider
+    # results are briefly negatively cached by the owner, not substituted here.
     live_market = _market_state(day, live_universe=live_universe, allow_network=True)
     with _db() as snapshot_conn:
         cycle = load_active_cycle(snapshot_conn)

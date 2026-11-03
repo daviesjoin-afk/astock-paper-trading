@@ -291,15 +291,18 @@ class ScheduleStatusRiskLaneTests(PaperRiskExitProductionPathTestCase):
 
     def test_failed_risk_run_surfaces_in_schedule_status(self):
         today = dt.date.today().isoformat()
-        with PT._db(immediate=True) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO paper_job_runs"
-                "(run_key,slot,market_date,status,detail,started_at,finished_at)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (f"risk:{today.replace('-', '')}0933", "risk", today, "failed",
-                 "{}", f"{today} 09:33:00", f"{today} 09:33:05"),
-            )
-        status = PT.schedule_status()
+        # 显式绑定本用例自己的库：并行分片里其它模块也会临时改写模块级
+        # DB_PATH，读取与写入必须是同一个库才有意义。
+        with mock.patch.object(PT, "DB_PATH", self.db_path):
+            with PT._db(immediate=True) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO paper_job_runs"
+                    "(run_key,slot,market_date,status,detail,started_at,finished_at)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (f"risk:{today.replace('-', '')}0933", "risk", today, "failed",
+                     "{}", f"{today} 09:33:00", f"{today} 09:33:05"),
+                )
+            status = PT.schedule_status()
         self.assertTrue(any(row["run_key"].startswith("risk:")
                             for row in status["latest_risk_runs"]))
         self.assertEqual("异常", status["runtime_status"])

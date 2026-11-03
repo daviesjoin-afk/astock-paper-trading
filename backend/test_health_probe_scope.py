@@ -57,11 +57,13 @@ class HealthProbeScopeTests(unittest.TestCase):
         self.assertEqual(second["eastmoney"]["status"], "fresh")
         self.assertTrue(third["healthy"])
 
-    def test_window_expires_and_a_later_failure_remains_retryable(self):
+    def test_success_is_reused_for_the_slot_but_a_later_failure_still_probes(self):
         with mock.patch.object(dfc.time, "monotonic", return_value=100.) as clock:
             with dfc.health_probe_scope():
                 dfc.check_data_source_health(force=True)
                 clock.return_value = 131.
+                self.assertTrue(dfc.check_data_source_health(force=True)["healthy"])
+                dfc._health_probe_scope.get().pop("successful_probe", None)
                 self.probe.return_value = []
                 self.assertFalse(dfc.check_data_source_health(force=True)["healthy"])
                 self.probe.return_value = self.valid_rows
