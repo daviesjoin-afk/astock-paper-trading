@@ -50,9 +50,18 @@ class DegradedTransportTests(unittest.TestCase):
             MT._transport_breaker["host-recover"]["until"] = 0
             self.assertEqual("recovered", MT.http_get(_url("recover")))
         self.assertEqual(1, get.call_count)
-        self.assertEqual(6.0, get.call_args.kwargs["timeout"])
+        # 具体秒数属于传输层契约，测试跟常量走；下面的上限用例钉住量级。
+        self.assertEqual(MT._DEGRADED_PROBE_TIMEOUT_CAP, get.call_args.kwargs["timeout"])
         self.assertEqual(0, get.call_args.kwargs["retries"])
         self.assertIsNone(MT.transport_degraded_remaining("host-recover"))
+
+    def test_degraded_probe_budget_stays_cheap(self):
+        """廉价探测必须真的便宜：建连实测 0.07~0.2 秒，封顶不应高于 3 秒。"""
+        self.assertLessEqual(MT._DEGRADED_PROBE_TIMEOUT_CAP, 3.0)
+        self.assertEqual(0, MT._DEGRADED_PROBE_RETRIES_CAP)
+        # 跳过窗口必须显著长于普通 open 冷却（90 秒），否则同一轮里仍会重复探测。
+        self.assertGreaterEqual(MT._DEGRADED_PROBE_SKIP_SECONDS,
+                                MT._TRANSPORT_BREAKER_COOLDOWN_SECONDS * 2)
 
     def test_legacy_duration_ages_from_file_write_time_and_expires(self):
         with open(MT._BREAKER_STATE_FILE, "w", encoding="utf-8") as f:
@@ -150,6 +159,70 @@ class DegradedTransportTests(unittest.TestCase):
         self.assertEqual(text, "ok")
         self.assertLessEqual(seen["timeout"], MT._DEGRADED_PROBE_TIMEOUT_CAP)
         self.assertEqual(seen["retries"], MT._DEGRADED_PROBE_RETRIES_CAP)
+
+    # ---- 降级探测失败后延长跳过窗口（2026-11-03 现网：630 秒一轮里重复十几次）----
+    def test_degraded_probe_failure_extends_skip_window(self):
+        """降级档主机连廉价探测都失败 → 继续跳过的窗口要长于普通 open 冷却。"""
+        def fake_impl(url, params=None, timeout=15, encoding="utf-8", retries=2):
+            raise requests.ConnectTimeout("syndead")
+
+        original = MT._http_get_impl
+        MT._http_get_impl = fake_impl
+        try:
+            with MT._transport_breaker_lock:
+                MT._transport_breaker["host-probe-dead"] = {
+                    "fails": 0, "burned": 0.0, "until": 0.0,
+                    "degraded_until": MT.time.monotonic() + 600.0, "trips": 3,
+                    "ever_tripped": True,
+                }
+            with self.assertRaises(requests.ConnectionError):
+                MT.http_get(_url("probe-dead"), timeout=15, retries=2)
+        finally:
+            MT._http_get_impl = original
+        remaining = MT.transport_breaker_remaining("host-probe-dead")
+        self.assertIsNotNone(remaining)
+        # 普通 open 冷却只有 90 秒；这里必须被延长到 _DEGRADED_PROBE_SKIP_SECONDS 量级。
+        self.assertGreater(remaining, MT._TRANSPORT_BREAKER_COOLDOWN_SECONDS + 60)
+        self.assertLessEqual(remaining, MT._DEGRADED_PROBE_SKIP_SECONDS + 5)
+
+    def test_degraded_probe_success_clears_skip_window(self):
+        """廉价探测成功 → open 与降级档同时清零，恢复检测不会被跳过窗口挡住。"""
+        def fake_impl(url, params=None, timeout=15, encoding="utf-8", retries=2):
+            return "ok"
+
+        original = MT._http_get_impl
+        MT._http_get_impl = fake_impl
+        try:
+            with MT._transport_breaker_lock:
+                MT._transport_breaker["host-probe-live"] = {
+                    "fails": 0, "burned": 0.0,
+                    "until": MT.time.monotonic() + 300.0,
+                    "degraded_until": MT.time.monotonic() + 600.0, "trips": 3,
+                    "ever_tripped": True,
+                }
+            # 跳过窗口内仍然短路：这正是"同一轮不再重复付探测"的表现。
+            self.assertIsNotNone(MT.transport_breaker_remaining("host-probe-live"))
+            with MT._transport_breaker_lock:
+                MT._transport_breaker["host-probe-live"]["until"] = 0.0
+            self.assertEqual(MT.http_get(_url("probe-live"), timeout=15, retries=2), "ok")
+        finally:
+            MT._http_get_impl = original
+        self.assertIsNone(MT.transport_breaker_remaining("host-probe-live"))
+        self.assertIsNone(MT.transport_degraded_remaining("host-probe-live"))
+
+    def test_healthy_host_failure_does_not_extend_skip_window(self):
+        """未降级主机的一次失败走原阈值：不能因为新逻辑提前短路。"""
+        def fake_impl(url, params=None, timeout=15, encoding="utf-8", retries=2):
+            raise requests.ConnectTimeout("one-shot")
+
+        original = MT._http_get_impl
+        MT._http_get_impl = fake_impl
+        try:
+            with self.assertRaises(requests.ConnectionError):
+                MT.http_get(_url("healthy-once"), timeout=15, retries=2)
+        finally:
+            MT._http_get_impl = original
+        self.assertIsNone(MT.transport_breaker_remaining("host-healthy-once"))
 
     def test_normal_host_keeps_full_budget(self):
         """没有降级的主机不受影响，仍用完整预算。"""
