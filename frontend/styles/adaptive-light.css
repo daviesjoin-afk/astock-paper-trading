@@ -520,18 +520,23 @@ body.dark #p-adaptive .adaptive-shell {
 .data-validity-panel { border-color:#d5e5dd !important; background:linear-gradient(135deg,#fbfefd,#f2f8f5) !important; }
 .data-validity-head { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; padding-bottom:14px; border-bottom:1px solid var(--border-light); }
 .data-validity-head h3 { margin:5px 0 4px; font-size:20px; }
-.data-validity-head p { margin:0; color:var(--text-secondary); font-size:12px; line-height:1.6; }
+.data-validity-head p { margin:0; color:var(--text-secondary); font-size:13px; line-height:1.65; }
 .data-validity-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; white-space:nowrap; }
 .data-validity-cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
 .data-validity-card { padding:13px 14px; border:1px solid #d5e1dc; border-radius:11px; background:rgba(255,255,255,.82); }
-.data-validity-card small { display:block; color:#71857b; font-size:11px; }
-.data-validity-card b { display:block; margin-top:4px; font-size:20px; color:#123d2e; }
-.data-validity-card em { display:block; margin-top:4px; font-style:normal; color:#6b8277; font-size:11px; }
+.data-validity-card small { display:block; color:var(--text-secondary); font-size:12px; }
+.data-validity-card b { display:block; margin-top:4px; font-size:20px; color:var(--text); }
+.data-validity-card em { display:block; margin-top:4px; font-style:normal; color:var(--text-secondary); font-size:12px; overflow-wrap:anywhere; }
 .data-validity-card.good { border-top:3px solid #2e9b73; }
 .data-validity-card.warn { border-top:3px solid #d7a33b; }
 .data-validity-card.bad { border-top:3px solid #c84c45; }
-.data-validity-details { margin-top:12px; padding:11px 13px; border-radius:10px; background:#f7faf8; color:#647a6e; font-size:12px; line-height:1.7; }
+.data-validity-evidence { grid-column:1/-1; color:var(--text-secondary); font-size:12px; line-height:1.65; overflow-wrap:anywhere; }
+.data-validity-details { margin-top:12px; padding:12px 14px; border-radius:10px; background:var(--surface-hover); color:var(--text); font-size:13px; line-height:1.75; overflow-wrap:anywhere; }
+.data-validity-details > div[style] { color:var(--text-secondary) !important; }
 .data-validity-details button { margin-left:8px; }
+body.dark .data-validity-panel { border-color:var(--border) !important; background:var(--surface) !important; }
+body.dark .data-validity-card { background:var(--surface-hover); border-color:var(--border); }
+body.dark .data-validity-details { background:var(--surface-hover); }
 
 @media (max-width:768px) {
   body { font-size:14px; }

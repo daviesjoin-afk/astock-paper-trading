@@ -591,6 +591,8 @@ def health():
         # live_snapshot 是因为 data-validity 页消费其行数/覆盖明细，但 status 不再
         # 在这里重新判一遍（否则同一响应里会出现两个权威口径）。
         live_snapshot["status"] = market_data["data_fact"]["status"]
+        live_snapshot["fresh_ratio"] = market_data["data_fact"].get("fresh_ratio")
+        live_snapshot["min_fresh_ratio"] = market_data["data_fact"].get("min_fresh_ratio")
         live_snapshot["closed_snapshot"] = bool(
             not in_live_session and complete_snapshot
         )
@@ -895,6 +897,7 @@ def data_validity():
         "coverage": coverage,
         "reference": {"latest_trade_date": h.get("latest_trade_date"), "expected_reference_date": h.get("expected_reference_date"), "stale_calendar_days": h.get("stale_calendar_days")},
         "live_snapshot": h.get("live_snapshot", {}),
+        "market_data": h.get("market_data", {}),
         "auction_tracking": auction_tracking.status(),
         "source_health": h.get("data_source_health", {}),
         "factor_cache": {"factor_date": meta.get("factor_date"), "built_at": meta.get("built_at"), "factor_rows": meta.get("factor_rows", 0), "eligible_factor_coverage_pct": meta.get("eligible_factor_coverage_pct", 0)},

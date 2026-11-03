@@ -637,6 +637,16 @@ class MarketDataReading:
             "reason": self.reason,
             "policy": self.policy_name,
             "row_count": self.snapshot.row_count if self.snapshot is not None else 0,
+            # 横截面覆盖是 authority 已判定的业务事实，不让前端再用股票池
+            # 总数另算一遍。缺行/缺时间时是 None，不是 0% 或通过。
+            "fresh_ratio": (
+                self.snapshot.verification_detail.get("fresh_ratio")
+                if self.snapshot is not None else None
+            ),
+            "min_fresh_ratio": (
+                self.snapshot.verification_detail.get("min_fresh_ratio")
+                if self.snapshot is not None else None
+            ),
         }
 
 

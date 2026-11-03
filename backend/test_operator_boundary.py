@@ -46,11 +46,26 @@ import paper_trading as _PT
 # ─── 环境隔离：禁用宿主计划任务探测 ───
 # Windows 沙箱里若干接口会派生后台线程去调 ``schtasks.exe``；该程序被列入
 # 黑名单时**整个测试进程会被直接终止**（即使在测试通过后的 teardown 阶段）。
-# 按既有测试的惯例把 schedule_status 换成静态实现，并在 subprocess 层兜底。
+# 因此只在**本模块用例的作用域内**替换调度状态，并在 subprocess 层兜底；
+# 导入期永久替换会污染同分片其它模块对真实 schedule_status 的断言。
 # 与本 PR 的鉴权语义无关。
 _STATIC_SCHEDULE = {"scheduler": "disabled-for-tests", "enabled": False}
-_PT.schedule_status = staticmethod(lambda: dict(_STATIC_SCHEDULE))
-_DQ.schedule_status = lambda: dict(_STATIC_SCHEDULE)
+
+
+class _DisabledScheduleMixin(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        for patcher in (
+            unittest.mock.patch.object(
+                _PT, "schedule_status",
+                staticmethod(lambda: dict(_STATIC_SCHEDULE))),
+            unittest.mock.patch.object(
+                _DQ, "schedule_status",
+                lambda: dict(_STATIC_SCHEDULE)),
+        ):
+            patcher.start()
+            cls.addClassCleanup(patcher.stop)
 
 
 class _GuardedCompleted:

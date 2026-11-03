@@ -64,7 +64,7 @@ __all__ = [
     "MarketDataAccessError",
     "full_market_snapshot_projection", "market_health_projection",
     "now_utc", "read_projection", "read_snapshot", "read_snapshot_with_meta",
-    "refresh_rows", "refresh_snapshot", "snapshot_from_cached_payload",
+    "refresh_rows", "refresh_snapshot", "refresh_rows_if_stale", "snapshot_from_cached_payload",
 ]
 
 #: 全市场横截面快照 —— 目前唯一的 Market Data fact kind。
@@ -470,6 +470,24 @@ def refresh_rows(
     if policy.name == MDC.CLOSE_SNAPSHOT_POLICY.name:
         return [dict(row) for row in MDC.close_snapshot_rows(reading.rows(), deadline, asof_day)]
     return [dict(row) for row in reading.rows() if isinstance(row, Mapping)]
+
+
+def refresh_rows_if_stale(
+    *,
+    policy: MDC.MarketDataPolicy,
+    now: Any = None,
+    asof_day: Any = None,
+) -> list[dict[str, Any]]:
+    """Reuse a policy-fresh snapshot; otherwise take the normal refresh path.
+
+    This never upgrades a 240-second display fact to a shorter execution policy:
+    the same authority must classify the exact cached snapshot as fresh first.
+    """
+    deadline = now if now is not None else now_utc()
+    reading = read_snapshot(policy, now=deadline, asof_day=asof_day)
+    if reading.available and reading.freshness == MDC.FRESHNESS_FRESH:
+        return [dict(row) for row in reading.rows()]
+    return refresh_rows(policy=policy, now=deadline, asof_day=asof_day)
 
 
 def read_snapshot_legacy_shape() -> tuple[list[dict[str, Any]], str | None, str | None]:

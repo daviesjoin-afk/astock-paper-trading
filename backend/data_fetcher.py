@@ -118,6 +118,28 @@ def _cached(key, ttl, fn):
     return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
 
 
+#: 海外历史整组不可用是明确的降级结果，不是“缓存没有答案”。仅作短暂
+#: 负缓存：同一轮不再反复支付整组 K 线超时，下一轮仍允许来源恢复。
+OVERSEAS_FAILURE_CACHE_SECONDS = 180.0
+
+
+def _cached_allow_empty(key, ttl, fn, *, failure_ttl):
+    now = time.time()
+    with _cache_lock:
+        entry = _mem_cache.get(key)
+    if entry is not None:
+        stamp, value = entry
+        lifetime = ttl if value else failure_ttl
+        if now - stamp < lifetime:
+            return value
+    value = fn()
+    with _cache_lock:
+        if key not in _mem_cache and len(_mem_cache) >= MDC.MAX_CACHE_ENTRIES:
+            _mem_cache.pop(min(_mem_cache, key=lambda item: _mem_cache[item][0]), None)
+        _mem_cache[key] = (now, value)
+    return value
+
+
 def _persistent_list(key, path, ttl, fn, fetch_lock):
     """跨进程复用列表型低频数据；空列表也是有效答案。"""
     return MDC.persistent_cached(
@@ -188,14 +210,15 @@ def check_data_source_health(force=False):
     This is intentionally small (one market page + two index quotes), so it
     can run before every five-minute paper scan.  An empty/invalid response
     never enters the cache. If neither stock-quote family works, reconnect and
-    retry once. Provider status stays separate from single-stock validation.
-    A forced success can be reused for at most 30 seconds within an explicit
-    workflow scope; failures are never reused and scope exit clears the window.
+    A forced success is reused within one explicit slot workflow; failures are
+    never reused and scope exit clears the evidence.  Candidate preparation can
+    outlive the old 30-second reuse window even when no provider state changed,
+    causing the opening stage to repeat the same three probes.
     """
     scope = _health_probe_scope.get()
     if force and scope is not None:
         cached = scope.get("successful_probe")
-        if cached is not None and time.monotonic() - cached[0] < 30:
+        if cached is not None:
             return copy.deepcopy(cached[1])
     previous = load_source_health()
     checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2314,7 +2337,9 @@ def fetch_overseas_history(beg="20230101"):
             if value is not None:
                 out[key] = value
         return out
-    return _cached("overseas", 1800, _do)
+    return _cached_allow_empty(
+        "overseas", 1800, _do, failure_ttl=OVERSEAS_FAILURE_CACHE_SECONDS,
+    )
 
 # ---------- 7. 舆情：7x24快讯 + 人气榜 ----------
 def fetch_fast_news(page_size=50):

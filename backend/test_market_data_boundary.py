@@ -313,7 +313,8 @@ class MarketDataContractTests(unittest.TestCase):
         )
         projection = reading.projection()
         for key in ("status", "availability", "freshness", "verification",
-                    "as_of", "observed_at", "reason", "policy", "row_count"):
+                    "as_of", "observed_at", "reason", "policy", "row_count",
+                    "fresh_ratio", "min_fresh_ratio"):
             self.assertIn(key, projection)
         self.assertNotIn("quality_score", projection)
 

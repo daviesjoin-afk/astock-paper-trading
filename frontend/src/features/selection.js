@@ -70,13 +70,20 @@ export async function loadPaperSelection(){
     renderPaperSelection(paperSelectionView()||paperSelectionCache);
     return;
   }
+  // 页面激活与标签点击会同时进入这里。共享同一请求，避免较早的空响应
+  // 覆盖稍后返回的有效结果，也避免慢服务器上重复请求放大延迟。
+  if(window._paperSelectionRequest) return window._paperSelectionRequest;
   target.innerHTML='<div class="loading">正在读取最近一个交易日的策略选股结果…</div>';
-  try{
-    var d=await api('/api/paper-selection');
-    paperSelectionCache=d;
-    paperSelectionCacheAt=Date.now();
-    renderPaperSelection(paperSelectionView()||d);
-  }catch(e){ target.innerHTML='<div class="banner">读取策略选股结果失败：'+adaptiveEsc(e.message||e)+'</div>'; }
+  window._paperSelectionRequest=(async function(){
+    try{
+      var d=await api('/api/paper-selection');
+      paperSelectionCache=d;
+      paperSelectionCacheAt=Date.now();
+      renderPaperSelection(paperSelectionView()||d);
+    }catch(e){ target.innerHTML='<div class="banner">读取策略选股结果失败：'+adaptiveEsc(e.message||e)+'</div>'; }
+    finally{ window._paperSelectionRequest=null; }
+  })();
+  return window._paperSelectionRequest;
 }
 
 export function renderPaperSelection(d){
@@ -293,18 +300,25 @@ export function renderDataValidity(d){
   var c=d.coverage||{}, live=d.live_snapshot||{}, f=d.factor_cache||{}, u=d.incremental_update||{};
   var status=dataValidityBadge(d);
   var statusClass=status==='正常'?'tag-ok':'tag-warn';
-  // 没有盘中快照时覆盖率是"未知"，不能算成 0 再标红。
-  var liveCoverage=live.valid_today_rows==null?null:(Number(live.valid_today_rows)/Math.max(Number(c.universe)||1,1)*100);
+  // 时效覆盖由 Market Data Authority 计算；不能用当前股票池总数代替
+  // 它的横截面分母，也不能把缺失的 ratio 当成 0%。
+  var liveCoverage=live.fresh_ratio==null?null:Number(live.fresh_ratio)*100;
   var cards=[
     ['全市场K线覆盖',fmtPct(c.coverage_pct,1),dataValidityTone(c.coverage_pct,98,90),(c.kline_files==null||c.universe==null)?'—':(c.kline_files+'/'+c.universe+' 只')],
     ['完整日线新鲜度',fmtPct(c.fresh_pct,1),dataValidityTone(c.fresh_pct,98,90), '最近完整交易日 '+(d.reference&&d.reference.expected_reference_date||'—')],
-    ['盘中行情有效覆盖',liveCoverage===null?'—':fmtPct(liveCoverage,1),dataValidityTone(liveCoverage,98,90),live.valid_today_rows==null?'无盘中快照':(live.valid_today_rows+' / '+(live.rows||0)+' 行')],
+    ['盘中行情时效覆盖',liveCoverage===null?'—':fmtPct(liveCoverage,1),dataValidityTone(liveCoverage,98,90),live.valid_today_rows==null?'无盘中快照':(live.valid_today_rows+' / '+(live.rows||0)+' 行')],
     ['选股因子缓存',fmtPct(f.eligible_factor_coverage_pct,1),dataValidityTone(f.eligible_factor_coverage_pct,98,90), '因子日 '+(f.factor_date||'—')]
   ];
+  var market=d.market_data||{}, fact=market.data_fact||{};
+  var evidence='行情事实：'+adaptiveEsc(fact.status||live.status||'未知')
+    +' · 观测时点 '+adaptiveEsc(fact.observed_at||'—')
+    +' · 覆盖门槛 '+fmtPct(live.min_fresh_ratio==null?null:Number(live.min_fresh_ratio)*100,0)
+    +' · 记录时点 '+adaptiveEsc(live.saved_at||'—');
   $('dataValidityStatus').className='tag '+statusClass; $('dataValidityStatus').textContent=status;
   var cancel=$('dataValidityCancel');
   if(cancel) cancel.style.display=['queued','running','cancelling'].indexOf(String(u.status||''))>=0?'inline-flex':'none';
-  $('dataValidityCards').innerHTML=cards.map(function(x){return '<div class="data-validity-card '+x[2]+'"><small>'+x[0]+'</small><b>'+x[1]+'</b><em>'+x[3]+'</em></div>';}).join('');
+  $('dataValidityCards').innerHTML=cards.map(function(x){return '<div class="data-validity-card '+x[2]+'"><small>'+x[0]+'</small><b>'+x[1]+'</b><em>'+x[3]+'</em></div>';}).join('')
+    +'<div class="data-validity-evidence">'+evidence+'</div>';
   var warnings=(d.warnings||[]).slice(0,5).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li>当前没有数据质量告警。</li>';
   var source=d.source_health||{};
   var tracking=d.auction_tracking||{};
@@ -320,12 +334,16 @@ export function renderDataValidity(d){
     +'<div style="margin-top:5px"><b>告警：</b><ul style="margin:3px 0 0 18px">'+warnings+'</ul></div>'
     +'<div style="margin-top:6px;color:#7b8d84">人工更新：'+adaptiveEsc({idle:'空闲',running:'运行中',queued:'排队中',cancelling:'取消中',cancelled:'已取消',completed:'已完成',failed:'失败',error:'失败',timeout:'超时'}[String(u.status||'idle').toLowerCase()]||u.status||'空闲')+(u.job_id?' · '+adaptiveEsc(u.job_id):'')+(u.error?' · '+adaptiveEsc(u.error):'')+'</div>';
   $('dataValidityDetails').innerHTML+='<div style="margin-top:6px">竞价跟踪：09:15 起每3分钟，仅观测；'+adaptiveEsc(trackingText)+'</div>';
+  $('dataValidityDetails').hidden=false;
 }
 
 export async function loadDataValidity(){
   var panel=$('dataValidityCards'); if(!panel) return;
   try{ var d=await api('/api/data-validity'); renderDataValidity(d); return d; }
-  catch(e){ panel.innerHTML='<div class="banner">数据有效性读取失败：'+adaptiveEsc(e.message||e)+'</div>'; }
+  catch(e){
+    panel.innerHTML='<div class="banner data-validity-evidence">数据有效性读取失败：'+adaptiveEsc(e.message||e)+'</div>';
+    $('dataValidityDetails').hidden=true;
+  }
 }
 
 export async function startManualDataUpdate(){
