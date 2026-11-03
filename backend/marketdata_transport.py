@@ -134,8 +134,23 @@ _TRANSPORT_DEGRADED_COOLDOWN_SECONDS = 1800.0  # 降级档冷却（30 分钟）
 #: 短路升级之后，"这台机器是不是恢复了"只需要一个**便宜的探测**，而不是一次
 #: 45 秒的最坏尝试。用正常预算去问一台已经确认不通的机器，得到的答案几乎
 #: 必然还是不通 —— 代价却是整轮扫描的一小截时间。
-_DEGRADED_PROBE_TIMEOUT_CAP = 6.0
+#:
+#: 2.5 秒的依据是实测：可达主机的 TCP 建连是 0.07~0.2 秒（腾讯 0.16、新浪
+#: 0.16、datacenter-web 0.07），而机房级不通的主机根本不会在建连阶段返回，
+#: 只会一直等到超时。6 秒与 2.5 秒给出的结论完全一样，差价是每台死主机每次
+#: 探测 3.5 秒。
+_DEGRADED_PROBE_TIMEOUT_CAP = 2.5
 _DEGRADED_PROBE_RETRIES_CAP = 0
+
+#: 降级档主机的廉价探测**再次失败**后，继续跳过它的时长（秒）。
+#:
+#: 生产实测（2026-11-03）：push2 / push2his / np-listapi / emappdata /
+#: money.finance.sina 这五六个域名在本机出口上整段不通。短路的 open 冷却只有
+#: 90 秒，而一轮 intraday 实测 630 秒 —— 于是同一个事实在一个进程里被重新
+#: 确认了十几次（每次 3~6 台 × 廉价探测），market_context 单阶段就烧掉 185 秒。
+#: 一次 SYN 超时已经足以说明"此刻仍然不通"，把跳过窗口延长到 5 分钟，
+#: 恢复检测仍在（到期后会再付一次 2.5 秒探测），也不会永久封死一个已恢复的源。
+_DEGRADED_PROBE_SKIP_SECONDS = 300.0
 
 _transport_breaker = {}
 _transport_breaker_lock = threading.Lock()
@@ -338,6 +353,32 @@ def _transport_degraded_remaining(host):
         return remaining if remaining > 0 else None
 
 
+def _transport_degraded_probe_failed(host):
+    """降级档主机的廉价探测再次失败：把它继续跳过的窗口延长。
+
+    ``_transport_breaker_note`` 已经把 open 冷却重置成 90 秒；对一台整段不可达
+    的主机来说 90 秒太短 —— 一轮 intraday 实测 630 秒，会在同一进程里重复付
+    十几次同样的探测。这里只延长"继续跳过"的窗口，**不改**降级档本身的语义：
+    到期后仍会做一次 2.5 秒探测，恢复即清零。
+    """
+    _load_breaker_state()
+    now = time.monotonic()
+    changed = False
+    with _transport_breaker_lock:
+        state = _transport_breaker.get(host)
+        if not state:
+            return
+        target = now + _DEGRADED_PROBE_SKIP_SECONDS
+        if (state.get("until") or 0.0) < target:
+            state["until"] = target
+            changed = True
+        if (state.get("degraded_until") or 0.0) < target:
+            state["degraded_until"] = target
+            changed = True
+    if changed:
+        _persist_breaker_state()
+
+
 def _transport_breaker_note(host, *, ok, burned=0.0):
     """记录一次请求的健康结果。
 
@@ -471,7 +512,8 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
             raise requests.ConnectionError(
                 f"transport breaker open for {host} ({open_for:.0f}s left)")
     degraded_for = _transport_degraded_remaining(host)
-    if degraded_for is not None:
+    probing_degraded = degraded_for is not None
+    if probing_degraded:
         timeout = min(timeout, _DEGRADED_PROBE_TIMEOUT_CAP)
         retries = min(retries, _DEGRADED_PROBE_RETRIES_CAP)
     timeout, retries = scan_budget_limits(timeout, retries)
@@ -491,9 +533,15 @@ def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
                 _transport_breaker_note(host, ok=True)
             else:
                 _transport_breaker_note(host, ok=False, burned=burned)
+                if probing_degraded:
+                    _transport_degraded_probe_failed(host)
         else:
             # 超时/连接错误：这次失败实际烧掉多少墙钟就记多少。
             _transport_breaker_note(host, ok=False, burned=burned)
+            if probing_degraded:
+                # 已确认不可达的主机连廉价探测都失败：把"继续跳过"的窗口从
+                # 90 秒延长到 5 分钟，避免同一进程里重复付同样的探测。
+                _transport_degraded_probe_failed(host)
         raise
     _transport_breaker_note(host, ok=True)
     return text

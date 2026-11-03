@@ -207,6 +207,13 @@ EOF
     "$SRC_DIR"/ "$APP_DIR"/
   mkdir -p "$APP_DIR"/{data_cache,reports,.locks}
   chown -R ubuntu:ubuntu "$APP_DIR"
+  # 运行期目录必须归容器内的 app(10001)。2026-11-03 13:21 的部署把 data_cache
+  # 一起 chown 成 ubuntu(1000)，容器随即以 "attempt to write a readonly
+  # database" 崩溃重启，adaptive_learning 的 .dispatch.lock 也写不进去。
+  # 源码树继续归 ubuntu（运维/编辑器用），三个运行期目录归 app。
+  chown -R 10001:10001 "$APP_DIR"/{data_cache,reports,.locks}
+  chmod 777 "$APP_DIR"/data_cache "$APP_DIR"/.locks
+  chmod 775 "$APP_DIR"/reports
 
   if [[ ! -s "$APP_DIR/.env" ]]; then
     log "app：生成 .env（操作员 token + env_file 指向）"
@@ -241,22 +248,49 @@ EOF
   fi
   log "app：启动容器"
   "${COMPOSE[@]}" up -d
-  sleep 10
+
+  # 迁移要求容器**正在运行**。2026-11-03 13:21 的部署在容器还处于 restart 时
+  # 就 docker exec 迁移，迁移被跳过、脚本只 warn 一句继续往下走，最后照样写出
+  # health=healthy 的身份文件；那次是靠人工重启容器才真正恢复的。这里把顺序改成
+  # 先等 API 就绪 → 迁移 → 再等一次，任一步失败就让部署失败。
+  wait_api() {
+    local tries="$1" code
+    for _ in $(seq 1 "$tries"); do
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18600/api/health || echo 000)"
+      [[ "$code" == "200" ]] && return 0
+      sleep 3
+    done
+    return 1
+  }
+
+  log "app：等待 API 就绪（最多 120 秒）"
+  if ! wait_api 40; then
+    docker ps -a --format '  {{.Names}}\t{{.Status}}' 2>&1 || true
+    docker logs astock-codex --tail 60 2>&1 || true
+    die "API 在 120 秒内未就绪，停止部署（不写出 healthy 身份文件）"
+  fi
 
   log "app：schema 迁移"
-  docker exec astock-codex python /app/backend/db_migrate.py all || warn "迁移返回非零（首次建库可忽略，逐条看日志）"
+  docker exec astock-codex python /app/backend/db_migrate.py all || die "schema 迁移失败"
 
   log "app：安装 cron（路径随 $APP_DIR，不写死 /opt）"
   ASTOCK_DEPLOY_ROOT="$APP_DIR" bash deploy/sync-cron.sh || warn "cron 同步失败，盘中不会自动扫描"
 
-  log "app：健康检查"
-  ok=0
-  for _ in $(seq 1 30); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18600/api/health || echo 000)"
-    [[ "$code" == "200" ]] && { ok=1; break; }
-    sleep 3
+  log "app：健康检查（迁移后再验一次）"
+  if ! wait_api 20; then
+    docker ps -a --format '  {{.Names}}\t{{.Status}}' 2>&1 || true
+    docker logs astock-codex --tail 60 2>&1 || true
+    die "API 健康检查未通过"
+  fi
+  # 「API 200」不等于「整条链路健康」：其余四个 worker 容器必须在 running 状态，
+  # 处于 Restarting 的容器说明它在崩溃循环（例如运行期目录权限不对）。
+  for name in astock-codex astock-paper-worker astock-candidate-worker astock-task-worker astock-data-worker; do
+    state="$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo missing)"
+    [[ "$state" == "running" ]] || die "容器 $name 状态为 $state（期望 running），停止部署"
   done
-  [[ "$ok" == "1" ]] || { docker logs astock-codex --tail 40 2>&1 || true; die "API 健康检查未通过"; }
+  restarting="$(docker ps --filter 'name=astock-' --format '{{.Names}} {{.Status}}' \
+                | grep -i 'restarting' || true)"
+  [[ -z "$restarting" ]] || { printf '%s\n' "$restarting"; die "存在处于 Restarting 的 astock 容器，停止部署"; }
 
   {
     echo "commit=$COMMIT"
