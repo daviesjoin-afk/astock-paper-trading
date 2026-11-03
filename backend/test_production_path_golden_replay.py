@@ -42,7 +42,6 @@ if BACKEND not in sys.path:
 
 import data_fetcher as dfc  # noqa: E402
 import data_universe_store as USTORE  # noqa: E402
-import factors as FACTORS  # noqa: E402
 import market_data_contract as MDC  # noqa: E402
 import market_data_service as MDSvc  # noqa: E402
 import news_learning as NL  # noqa: E402

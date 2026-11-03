@@ -2,7 +2,6 @@
 import unittest
 from unittest import mock
 
-import data_fetcher as dfc
 import market_data_contract as MDC
 import paper_trading as PT
 

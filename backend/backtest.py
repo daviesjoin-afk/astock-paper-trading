@@ -406,7 +406,8 @@ def run_backtest(
                 "signal_date": str(date.date()),
                 "execution_date": str(next_date.date()),
                 "target": targets,
-                "gate": light,
+                # 海外门控已删除：仓位缩放恒为 1.0，这里如实记录"无门控"。
+                "gate": "disabled",
                 "position_scale": position_scale,
             }
         )
