@@ -284,9 +284,13 @@ EOF
   fi
   # 「API 200」不等于「整条链路健康」：其余四个 worker 容器必须在 running 状态，
   # 处于 Restarting 的容器说明它在崩溃循环（例如运行期目录权限不对）。
-  bad="$(docker ps -a --filter 'name=astock-' --format '{{.Names}} {{.Status}}' \
-         | grep -E 'Restarting|Exited|Created' || true)"
-  [[ -z "$bad" ]] || { printf '%s\n' "$bad"; die "存在未正常运行的 astock 容器，停止部署"; }
+  for name in astock-codex astock-paper-worker astock-candidate-worker astock-task-worker astock-data-worker; do
+    state="$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo missing)"
+    [[ "$state" == "running" ]] || die "容器 $name 状态为 $state（期望 running），停止部署"
+  done
+  restarting="$(docker ps --filter 'name=astock-' --format '{{.Names}} {{.Status}}' \
+                | grep -i 'restarting' || true)"
+  [[ -z "$restarting" ]] || { printf '%s\n' "$restarting"; die "存在处于 Restarting 的 astock 容器，停止部署"; }
 
   {
     echo "commit=$COMMIT"
