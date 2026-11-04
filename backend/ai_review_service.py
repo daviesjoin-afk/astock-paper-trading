@@ -1804,6 +1804,23 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                     "status": "failed", "tracking_id": None,
                     "error_type": type(exc).__name__,
                 }
+            # 把 tracking 结果回写到**本行**的 outcome_detail，与审计行同一事务。
+            # 否则调用方拿到结果后、adaptive run detail 落库前若进程中断，
+            # 这条审计就永久丢失"下游证据是否写入成功"的事实。复用既有列，
+            # 不新增表，也不把 tracking 失败升级成 AI 审核失败。
+            # 把 tracking 的**失败事实**回写到本行的 outcome_detail，与审计行同一事务。
+            # 否则调用方拿到结果后、adaptive run detail 落库前若进程中断，
+            # 这条审计就永久丢失"下游证据是否写入成功"的事实。复用既有列，不新增表。
+            # 只记录状态与错误类型，不记录 tracking_id：后者每行自增，属于
+            # 行身份而非审核结论，混进来会让"文案不影响分类"这类比对失真。
+            merged_detail = dict(outcome_detail) if isinstance(outcome_detail, dict) else {}
+            merged_detail["evolution_tracking"] = {
+                "status": tracking["status"], "error_type": tracking["error_type"],
+            }
+            conn.execute(
+                "UPDATE dual_ai_tuning_runs SET outcome_detail=? WHERE id=?",
+                (_json(merged_detail), run_id),
+            )
     return run_id, total_latency, tracking
 
 
@@ -1876,6 +1893,14 @@ def _context_audit(context, result_mode, status, reviewers, consensus, reason,
         reason, audit_merged, context["started_at"], context["started"],
         track_evolution=track_evolution, outcome_detail=outcome_detail,
     )
+    # 审计行里的 outcome_detail 已并入 tracking 状态（见 _write_audit）。
+    # 返回值要与落库内容一致，否则调用方与审计行各说各话。同样不带 tracking_id。
+    if evolution_tracking.get("status") not in (None, "not_required"):
+        outcome_detail = dict(outcome_detail) if isinstance(outcome_detail, dict) else {}
+        outcome_detail["evolution_tracking"] = {
+            "status": evolution_tracking["status"],
+            "error_type": evolution_tracking["error_type"],
+        }
     return _base_outcome(
         result_mode, context["review_mode"], status, reviewers, consensus, reason,
         proposals, run_id, total_latency, context["evidence_hash"], context["config_snapshot"],

@@ -133,6 +133,51 @@ class EvolutionLoopTests(unittest.TestCase):
         self.assertEqual(row["status"], "completed")
         self.assertEqual(EL._loads(row["done_stages"], []), list(EL.STAGES))
 
+    def test_resume_keeps_candidate_reused_instead_of_claiming_created(self):
+        """续跑不得把"复用既有候选"改写成"本代新建"。
+
+        mutate 阶段会把 candidate_created / candidate_reused 写进
+        observe_ctx_json；恢复时若只按"存在 candidate_params_id"推断，
+        复用候选会被记成本代新建，代际统计与研究血缘随之失真。
+        """
+        class ReusingBackend(FakeBackend):
+            def mutate(self, conn, generation, ctx):
+                return {
+                    "mutated": False,
+                    "params_id": generation,
+                    "active_params_id": generation,
+                    "candidate_params_id": 4242,
+                    "candidate_created": False,
+                    "candidate_reused": True,
+                    "candidate_validation_state": "pending",
+                    "reason": "等价待激活候选已存在",
+                }
+
+        conn = _mem_conn()
+        self.addCleanup(conn.close)
+        EL.ensure_loop_schema(conn)
+        # 模拟 mutate 已完成、后续阶段中断：世界态里明确记录了"复用"。
+        ctx_json = EL._json({
+            "sample_count": 10, "has_data": True, "params_id_start": 1, "params_id_end": 1,
+            "candidate_params_id": 4242, "candidate_created": False,
+            "candidate_reused": True, "candidate_validation_state": "pending",
+        })
+        conn.execute(
+            """INSERT INTO evolution_loop_state(generation, status, current_stage, done_stages,
+               attempts, started_at, updated_at, params_id_start, observe_ctx_json,
+               candidate_params_id)
+               VALUES(1,'running','mutate','["observe","evaluate","mutate"]',1,
+                      '2026-08-19T10:00:00','2026-08-19T10:00:00',1,?,4242)""",
+            (ctx_json,),
+        )
+        conn.commit()
+        rep = EL.run_loop(conn, ReusingBackend(), generations=1)
+        self.assertGreaterEqual(rep["resumed"], 1)
+        detail = rep["details"][0]
+        self.assertFalse(detail["candidate_created"],
+                         "复用的候选不能被续跑标成本代新建")
+        self.assertTrue(detail.get("candidate_reused"), detail)
+
     def test_stage_exception_isolated_loop_continues(self):
         """某阶段抛异常，整轮不崩，循环继续跑完后续代；但下游依赖阶段严格 fail-closed。"""
         conn = _mem_conn()

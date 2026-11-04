@@ -748,8 +748,11 @@ def evolve(conn, reason: str = "auto") -> dict:
     # 相同 active base + 相同参数的待激活候选只允许存在一份。
     # evolution_loop 是每日调度；若候选一直未人工激活，旧证据会在后续
     # 日次继续满足 should_evolve。没有这个去重，系统会每天堆一条完全相同的候选。
+    # 只在同来源（evolve）内去重：人工提交的同参数候选是另一条研究结论，
+    # 不能被自动进化复用，也不能反过来被它吞掉。
     existing_id = EA.find_equivalent_candidate(
         conn, new_params, strategy_id=None, base_params_id=current["id"],
+        source="evolve",
     )
     if existing_id is not None:
         return {
@@ -1027,10 +1030,11 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
                 "strategy_id": str(strategy_id)}
     # 已经有一个等价的待激活候选时也不重复落版本（同样的理由：
     # 不要让"反复点同一个按钮"堆出成百上千条一模一样的候选）。
+    # 去重限定在同一来源内：挑战者晋级与人工调整是不同结论，不能互相复用。
     effective = EA.resolve_effective(conn, str(strategy_id))
     duplicate = EA.find_equivalent_candidate(
         conn, new_params, strategy_id=str(strategy_id),
-        base_params_id=effective["pointer_params_id"],
+        base_params_id=effective["pointer_params_id"], source=source,
     )
     if duplicate is not None:
         conn.execute(

@@ -808,17 +808,27 @@ def create_candidate(conn, params: dict, *, strategy_id: Optional[str] = None,
 
 
 def find_equivalent_candidate(conn, params: dict, *, strategy_id,
-                              base_params_id, limit: int = 50):
+                              base_params_id, source=None, limit: int = 50):
     """同 scope、同 base、参数逐值相同的既有候选（未被拒绝）。
 
     用于抑制"重复提交同一调整"造成的候选堆积。要求 base 相同是必须的：
     base 不同的等价候选永远过不了 stale CAS，留着只是噪声。
+
+    ``source`` 给出时，只把**同来源**的候选视为等价。不同来源代表不同的
+    研究结论：``manual`` 是操作员显式提交、``evolve`` 是自动进化、
+    ``challenger_promotion`` 是挑战者晋级。它们即使碰巧落在同一组参数上，
+    证据与审批链条也不同。若不隔离，一个自动进化候选会被当成人工结论
+    复用（或反过来），把两次独立研究的血缘记到同一条候选上。
+    调用方不传 ``source`` 时保持历史行为（只比参数），仅供尚未声明来源的
+    旧路径使用。
     """
     target = params_digest(params)
     for row in _scope_rows(conn, scope_key(strategy_id), limit=limit):
         if row["validation_state"] == STATE_REJECTED:
             continue
         if row["base_params_id"] != base_params_id:
+            continue
+        if source is not None and str(row["source"] or "") != str(source):
             continue
         if params_digest(row["params"]) == target:
             return row["id"]

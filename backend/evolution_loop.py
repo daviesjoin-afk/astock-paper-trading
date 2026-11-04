@@ -428,7 +428,13 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
     if row and len(row) > 4:
         if row[4] is not None:
             ctx["candidate_params_id"] = row[4]
-            ctx["candidate_created"] = True
+            # 续跑不能把"复用既有候选"改写成"本代新建"。mutate 阶段会把
+            # candidate_created / candidate_reused 写进 observe_ctx_json，
+            # 这里优先沿用持久化的真实标志；只有旧版状态行缺少这两个字段时，
+            # 才退化为按"存在候选"推断，并明确记为 created。
+            if "candidate_reused" not in ctx and "candidate_created" not in ctx:
+                ctx["candidate_created"] = True
+                ctx["candidate_reused"] = False
         if row[5] is not None:
             ctx["candidate_validation_state"] = row[5]
         if row[6] is not None:
@@ -522,12 +528,25 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
                 if result.get("candidate_params_id") is not None:
                     ctx["candidate_params_id"] = result.get("candidate_params_id")
                     ctx["candidate_created"] = bool(result.get("candidate_created", True))
+                    # 复用既有候选不产生新版本，代际统计与研究血缘必须能区分。
+                    ctx["candidate_reused"] = bool(result.get("candidate_reused", False))
                     ctx["candidate_validation_state"] = result.get("candidate_validation_state")
                     ctx["candidate_pending_activation"] = True
                 else:
                     ctx["candidate_params_id"] = None
                     ctx["candidate_created"] = False
+                    ctx["candidate_reused"] = False
                     ctx["candidate_pending_activation"] = False
+                # 候选身份随世界态落盘：续跑必须恢复"本代新建 / 复用既有"，
+                # 而不是按"有候选"重猜。
+                conn.execute(
+                    "UPDATE evolution_loop_state SET observe_ctx_json=? WHERE generation=?",
+                    (_json({key: ctx.get(key) for key in (
+                        "sample_count", "has_data", "params_id_start", "params_id_end",
+                        "candidate_params_id", "candidate_created", "candidate_reused",
+                        "candidate_validation_state",
+                    )}), generation),
+                )
                 conn.execute(
                     """UPDATE evolution_loop_state SET params_id_end=?,
                        candidate_params_id=?, candidate_validation_state=?, candidate_pending_activation=?
@@ -601,6 +620,7 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
              "candidate_params_id": ctx.get("candidate_params_id"),
              "candidate_validation_state": ctx.get("candidate_validation_state"),
              "candidate_created": ctx.get("candidate_created", False),
+             "candidate_reused": ctx.get("candidate_reused", False),
              "candidate_pending_activation": ctx.get("candidate_pending_activation", False),
          }),
          _json({"prev_intelligence": prev_score}),
@@ -620,6 +640,7 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
                 "candidate_params_id": ctx.get("candidate_params_id"),
                 "candidate_validation_state": ctx.get("candidate_validation_state"),
                 "candidate_created": ctx.get("candidate_created", False),
+                "candidate_reused": ctx.get("candidate_reused", False),
                 "candidate_pending_activation": ctx.get("candidate_pending_activation", False)}),
          _json(health), ctx.get("params_id_end") or params_id_start,
          ctx.get("candidate_params_id"), ctx.get("candidate_validation_state"),
@@ -641,6 +662,7 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
         "candidate_params_id": ctx.get("candidate_params_id"),
         "candidate_validation_state": ctx.get("candidate_validation_state"),
         "candidate_created": ctx.get("candidate_created", False),
+             "candidate_reused": ctx.get("candidate_reused", False),
         "candidate_pending_activation": ctx.get("candidate_pending_activation", False),
         "params_id_start": params_id_start,
         "params_id_end": ctx.get("params_id_end") or params_id_start,
@@ -752,6 +774,11 @@ def _accumulate(report: dict, res: dict) -> None:
         "status": res["status"],
         "intelligence_score": res["intelligence_score"],
         "improvement": res["improvement"],
+        # 本代是否真的产生了新候选，还是复用了既有候选。两者都算"有候选"，
+        # 但只有前者改变候选总数，报告不能混为一谈。
+        "candidate_params_id": res.get("candidate_params_id"),
+        "candidate_created": res.get("candidate_created", False),
+        "candidate_reused": res.get("candidate_reused", False),
     })
     if res["status"] == "completed":
         report["completed"] += 1

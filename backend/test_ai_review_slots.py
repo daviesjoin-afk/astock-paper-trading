@@ -1303,6 +1303,14 @@ class EvolutionTrackingObservabilityTests(AiReviewSlotTestBase):
                 (result["id"],),
             ),
         )
+        # 失败事实必须留在审计行本身：只塞进返回值的话，调用方拿完结果后若
+        # 进程在 adaptive run detail 落库前中断，这条审核就查不出下游缺失。
+        # 记录状态与错误类型即可；tracking_id 是行身份，不进入结论比对面。
+        detail = json.loads(audit["outcome_detail"] or "{}")
+        self.assertEqual(
+            {"status": "failed", "error_type": "OperationalError"},
+            detail.get("evolution_tracking"),
+        )
 
     def test_successful_tracking_returns_its_persisted_id_through_legacy_facade(self):
         import self_evolution as SE
