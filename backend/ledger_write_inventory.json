@@ -5892,7 +5892,7 @@
   {
    "function": "test_guard11c_paper_trading_has_no_runtime_fill_insert",
    "kind": "static",
-   "line": 1321,
+   "line": 1357,
    "module": "test_paper_trading_architecture_guard",
    "read_refs": [],
    "role": "test",
@@ -5904,7 +5904,7 @@
   {
    "function": "test_guard14t_signal_cycle_must_match_the_account_binding",
    "kind": "static",
-   "line": 2122,
+   "line": 2139,
    "module": "test_paper_trading_architecture_guard",
    "read_refs": [],
    "role": "test",
@@ -7835,33 +7835,9 @@
    ]
   },
   {
-   "function": "test_guard16a_only_the_execution_authority_writes_paper_fills",
-   "kind": "static",
-   "line": 141,
-   "module": "test_r26_execution_authority_guard",
-   "read_refs": [],
-   "role": "test",
-   "sql": "INSERT INTO paper_fills",
-   "write_targets": [
-    "paper_fills"
-   ]
-  },
-  {
-   "function": "test_guard16a_only_the_execution_authority_writes_paper_fills",
-   "kind": "static",
-   "line": 141,
-   "module": "test_r26_execution_authority_guard",
-   "read_refs": [],
-   "role": "test",
-   "sql": "INSERT OR REPLACE INTO paper_fills",
-   "write_targets": [
-    "paper_fills"
-   ]
-  },
-  {
    "function": "test_guard20a_lineage_backlink_uses_the_just_written_fill_id",
    "kind": "static",
-   "line": 249,
+   "line": 356,
    "module": "test_r26_execution_authority_guard",
    "read_refs": [],
    "role": "test",
