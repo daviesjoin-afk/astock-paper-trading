@@ -9,7 +9,7 @@
 | 项 | SHA |
 | --- | --- |
 | 本轮起始 master | `79d4390bf366dd9e19e210e350db751d07b89e2d` |
-| 本轮最终 master | `837b8fcde50b61174a370da272fc41283068115c` |
+| 本轮最终 master | `0180c4ecc8d518fbc0f54fd202f6471ffcc5d5af`（含本记录自身的合并 #335） |
 
 起始 master 上开放 4 个 PR（#179、#271、#333、#334），其中 #334 的 base
 指向 #333 的分支，必须先处理依赖。
@@ -129,8 +129,8 @@
 ## 5. 主线核验
 
 ```
-git rev-parse HEAD            -> 837b8fcde50b61174a370da272fc41283068115c
-git rev-parse origin/master   -> 837b8fcde50b61174a370da272fc41283068115c
+git rev-parse HEAD            -> 0180c4ecc8d518fbc0f54fd202f6471ffcc5d5af
+git rev-parse origin/master   -> 0180c4ecc8d518fbc0f54fd202f6471ffcc5d5af
 ```
 
 - 工作区干净（仅本地未跟踪的 `plans/*.md`，不属于仓库发布内容）。
