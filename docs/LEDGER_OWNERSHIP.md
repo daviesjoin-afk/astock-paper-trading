@@ -387,7 +387,6 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 `test_ledger_owner_plan.py` 会比对"源码扫描结果 ↔ 计划 ↔ 本节内容"三者一致。
 
 <!-- ledger-owner-plan:start -->
-
 ### 工作包 A
 
 | 表 | 业务操作 | 现有写入点 | 业务判定者 | 最终写入 owner | 调用方事务 | 相关测试 |
@@ -456,7 +455,7 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_accounts` | 账户启停状态（活动周期过滤） | `paper_account_ledger::set_status` | 启停入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_learning_evaluation` |
 | `paper_accounts` | 账户风格字段写入 | `paper_account_ledger::set_style` | 配置入口校验 | `paper_account_ledger` | 调用方同一连接与原事务 | 待补 |
 | `paper_accounts` | 新策略首次版本号写入 | `paper_account_ledger::set_version` | 账号引导规则 | `paper_account_ledger` | 启动引导 / 调用方同一连接与原事务 | `test_execution_evidence`、`test_execution_planner`、`test_order_cycle_provenance` |
-| `paper_accounts` | 账户参数快照/版本/时间戳写入 | `paper_account_ledger::write_params` | adaptive/evolution/周度复盘各自的采纳与回滚判定 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_account_ledger` |
+| `paper_accounts` | 账户参数快照/版本/时间戳写入 | `paper_account_ledger::write_params` | adaptive/evolution/周度复盘各自的采纳与回滚判定 | `paper_account_ledger` | 调用方同一连接与原事务 | `test_paper_account_ledger`、`test_weekly_review_advisory` |
 
 ### 工作包 D
 
@@ -477,7 +476,6 @@ E 不是新一轮重构：不要求清空全仓直接 SELECT、不设行数目�
 | `paper_signals` | 归档清理：删除超龄信号 | `signal_service::archive_delete_signals` | paper_trading 归档策略 | `signal_service` | 归档入口的 immediate 事务 | `test_cycle_archive_writes` |
 | `paper_signals` | 归档清理：超龄信号转 expired | `signal_service::archive_expire_signals` | paper_trading 归档策略 | `signal_service` | 归档入口的 immediate 事务 | `test_cycle_archive_writes` |
 | `paper_signals` | 归档清理：超龄信号转 superseded | `signal_service::archive_supersede_signals` | paper_trading 归档策略 | `signal_service` | 归档入口的 immediate 事务 | `test_cycle_archive_writes` |
-
 <!-- ledger-owner-plan:end -->
 
 ### 16.5 工作包 A 进展
