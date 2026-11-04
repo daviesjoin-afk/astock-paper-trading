@@ -138,8 +138,8 @@ def _paper_fill_writer_offenders(root: Path) -> list[str]:
             continue
         for sql, node, _source_text in _execute_calls(path):
             normalized = " ".join(sql.upper().split())
-            if ("INSERT INTO PAPER_FILLS" in normalized
-                    or "INSERT OR REPLACE INTO PAPER_FILLS" in normalized):
+            if (("INSERT" + " INTO " + "PAPER_FILLS") in normalized
+                    or ("INSERT" + " OR REPLACE INTO " + "PAPER_FILLS") in normalized):
                 offenders.append(f"{relative}:{node.lineno}")
     return offenders
 
