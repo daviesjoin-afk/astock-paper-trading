@@ -195,8 +195,7 @@ class ProductionBackend(Backend):
         active_id = cur["id"]
         result = SE.auto_evolve_if_needed(conn)
         # 自动进化只生成候选，绝不激活。这里回填的必须是"仍然生效的"参数 id：
-        # 把候选 id 写进 params_id_end 会让代际快照看起来像是已经生效了，
-        # 那正是 latest row == active 的老毛病。
+        # 把候选 id 写进 params_id_end 会让代际快照看起来像是已经生效了。
         if result is None:
             return {
                 "mutated": False,
@@ -206,17 +205,33 @@ class ProductionBackend(Backend):
                 "candidate_created": False,
                 "candidate_pending_activation": False,
             }
-        cand_id = result.get("new_params_id")
+
+        created_id = result.get("new_params_id")
+        existing_id = result.get("existing_params_id")
+        cand_id = created_id or existing_id
+        if cand_id is None:
+            return {
+                "mutated": False,
+                "params_id": active_id,
+                "active_params_id": active_id,
+                "candidate_params_id": None,
+                "candidate_created": False,
+                "candidate_pending_activation": False,
+                "reason": result.get("reason"),
+            }
+
         return {
-            "mutated": True,
+            "mutated": bool(created_id),
             "params_id": active_id,
             "active_params_id": active_id,
             "candidate_params_id": cand_id,
-            "candidate_created": True,
+            "candidate_created": bool(created_id),
+            "candidate_reused": bool(existing_id),
             "candidate_validation_state": result.get("validation_state"),
             "candidate_pending_activation": True,
             "adjustments": result.get("adjustments", []),
             "changed_keys": result.get("changed_keys", []),
+            "reason": result.get("reason"),
         }
 
     def validate(self, conn, generation, ctx=None):
