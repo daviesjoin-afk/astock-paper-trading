@@ -137,7 +137,10 @@ jobs:
 
   docker-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 实测上限：镜像构建+两次校验+P11 资源探针（tick 随宿主速度浮动 8~12s）
+    # +断网全量（约 6.6 分钟）+健康检查。15 分钟在探针校准变慢的轮次会被整段
+    # 取消（run 41658094113：15m15s，其中断网测试本身已全过）。
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

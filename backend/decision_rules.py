@@ -3,13 +3,19 @@
 
 这些函数只处理已经加载好的值，不联网、不读缓存、不写账本。保持
 ``decision_engine`` 的旧导出名，由兼容层继续转发调用。
+
+**不要在这里 import pandas。** 本模块被 ``decision_engine`` 顶层导入，
+而 ``decision_engine`` 又在每次调度启动时被 ``paper_trading`` 拉起来；
+为了一个 NaN 判断拖进整个 pandas 会让每个定时任务多付约 0.5 秒。
+``math.isnan`` 对 int/float 的判定与 ``pd.isna`` 等价（bool 是 int 子类，
+``math.isnan(True)`` 同样返回 False，非数值仍由 isinstance 挡在外面）。
 """
 
-import pandas as pd
+import math
 
 
 def _safe(v):
-    return v if isinstance(v, (int, float)) and not pd.isna(v) else 0.0
+    return v if isinstance(v, (int, float)) and not math.isnan(v) else 0.0
 
 
 def _normalize_news_hits(news_hits, code):
