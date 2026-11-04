@@ -107,3 +107,179 @@ class PrivateChannelCountingTests(unittest.TestCase):
 
     def test_dunder_names_are_not_private_channel(self):
         self.assertEqual(self._count("from .owner import __all__"), 0)
+
+
+class PackageAwareScanTests(unittest.TestCase):
+    """生产扫描必须递归到子包，并用完整模块身份。
+
+    改造前 `production_paths()` 只做 `root.glob("*.py")`：模块一旦迁进
+    `backend/paper/`，就会从依赖图与所有指标里**静默消失**——不是被正确统计。
+    这里用临时目录构造嵌套 package 做负向控制，证明现在的扫描能发现它们，
+    且排除规则不会误伤生产模块。
+    """
+
+    def _make_tree(self, files: dict[str, str]) -> Path:
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        for relative, source in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(textwrap.dedent(source), encoding="utf-8")
+        return root
+
+    def test_nested_package_modules_are_discovered(self):
+        root = self._make_tree({
+            "top_level.py": "x = 1\n",
+            "paper/__init__.py": "",
+            "paper/risk_service.py": "y = 1\n",
+            "paper/deep/exit_rules.py": "z = 1\n",
+        })
+        keys = {coupling_metrics.module_key(p, root)
+                for p in coupling_metrics.production_paths(root)}
+        self.assertIn("top_level", keys)
+        self.assertIn("paper.risk_service", keys)
+        self.assertIn("paper.deep.exit_rules", keys,
+                      "递归扫描没有进入第二层子包")
+        self.assertNotIn("paper.__init__", keys, "__init__ 不是生产模块")
+
+    def test_excluded_dirs_do_not_hide_production_modules(self):
+        root = self._make_tree({
+            "paper/real.py": "x = 1\n",
+            "tools/scanner.py": "y = 1\n",
+            "test_support/helpers.py": "z = 1\n",
+            "fixtures/sample.py": "w = 1\n",
+            "test_thing.py": "t = 1\n",
+        })
+        keys = {coupling_metrics.module_key(p, root)
+                for p in coupling_metrics.production_paths(root)}
+        self.assertIn("paper.real", keys, "排除规则误伤了生产模块")
+        for excluded in ("tools.scanner", "test_support.helpers",
+                         "fixtures.sample", "test_thing"):
+            self.assertNotIn(excluded, keys, f"{excluded} 不应被当作生产模块")
+
+    def test_module_identity_uses_the_full_path_not_the_stem(self):
+        """两个同名模块必须能区分，否则依赖图会把它们当成同一个节点。"""
+        root = self._make_tree({
+            "paper/common.py": "x = 1\n",
+            "data/common.py": "y = 1\n",
+        })
+        keys = [coupling_metrics.module_key(p, root)
+                for p in coupling_metrics.production_paths(root)]
+        self.assertEqual(sorted(keys), ["data.common", "paper.common"])
+        self.assertNotEqual(keys[0], keys[1], "同名模块的身份发生了碰撞")
+
+    def test_relative_import_resolves_inside_a_package(self):
+        root = self._make_tree({
+            "paper/__init__.py": "",
+            "paper/risk_service.py": "from .rules import decide\n",
+            "paper/rules.py": "def decide(): pass\n",
+        })
+        modules = {coupling_metrics.module_key(p, root)
+                   for p in coupling_metrics.production_paths(root)}
+        tree = ast.parse((root / "paper/risk_service.py").read_text(encoding="utf-8"))
+        edges = coupling_metrics._local_imports(
+            tree, modules, current="paper.risk_service")
+        self.assertEqual({"paper.rules"}, edges, "相对导入没有解析到子包内目标")
+
+    def test_parent_relative_import_resolves(self):
+        root = self._make_tree({
+            "paper/__init__.py": "",
+            "paper/common.py": "x = 1\n",
+            "paper/deep/exit_rules.py": "from ..common import x\n",
+        })
+        modules = {coupling_metrics.module_key(p, root)
+                   for p in coupling_metrics.production_paths(root)}
+        tree = ast.parse((root / "paper/deep/exit_rules.py").read_text(encoding="utf-8"))
+        edges = coupling_metrics._local_imports(
+            tree, modules, current="paper.deep.exit_rules")
+        self.assertEqual({"paper.common"}, edges, ".. 相对导入解析错误")
+
+    def test_import_cycle_is_detected_across_package_boundaries(self):
+        """负向控制：违规模块放进嵌套 package，环检测必须失败。"""
+        root = self._make_tree({
+            "paper/__init__.py": "",
+            "paper/a.py": "import data.b\n",
+            "data/__init__.py": "",
+            "data/b.py": "from paper.a import thing\n",
+        })
+        modules = {coupling_metrics.module_key(p, root)
+                   for p in coupling_metrics.production_paths(root)}
+        edges = {}
+        for path in coupling_metrics.production_paths(root):
+            key = coupling_metrics.module_key(path, root)
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            edges[key] = coupling_metrics._local_imports(tree, modules, current=key) - {key}
+        cycles = coupling_metrics.strongly_connected(edges)
+        self.assertTrue(cycles, "子包之间的导入环没有被发现")
+        joined = {frozenset(cycle) for cycle in cycles}
+        self.assertIn(frozenset({"paper.a", "data.b"}), joined, cycles)
+
+    def test_foundation_reverse_dependency_in_subpackage_is_blocked(self):
+        """基础层反向依赖在子包里同样要被拦截。"""
+        root = self._make_tree({
+            "paper/__init__.py": "",
+            "paper/data_paths.py": "from paper.business import x\n",
+            "paper/business.py": "x = 1\n",
+        })
+        violations = coupling_metrics._foundation_violations_cached(root)
+        self.assertEqual((("paper.data_paths", "paper.business"),), violations,
+                         "子包里的基础层反向依赖没有被拦截")
+
+
+class SubpackageWriteScannerTests(unittest.TestCase):
+    """唯一写入者检测必须覆盖子目录。
+
+    负向控制：把一个「第二个写方」放进嵌套 package，扫描必须能看见它，
+    从而让 owner 声明失败；否则模块一迁进子包，重复写入就会被静默放过。
+    """
+
+    def _make_tree(self, files: dict[str, str]) -> Path:
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        for relative, source in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(textwrap.dedent(source), encoding="utf-8")
+        return root
+
+    def test_second_writer_inside_a_subpackage_is_seen(self):
+        from tools import ledger_write_inventory as INV
+        root = self._make_tree({
+            "paper/__init__.py": "",
+            "paper/order_ledger.py": '''
+                def insert(conn):
+                    conn.execute("INSERT INTO paper_fills(order_id, qty) VALUES(?,?)", (1, 2))
+            ''',
+            "paper/rogue_writer.py": '''
+                def sneak(conn):
+                    conn.execute("INSERT INTO paper_fills(order_id, qty) VALUES(?,?)", (3, 4))
+            ''',
+        })
+        found = {
+            entry["module"] for entry in INV.scan(root)["entries"]
+            if entry["role"] == "runtime" and "paper_fills" in entry["write_targets"]
+        }
+        self.assertEqual({"paper.order_ledger", "paper.rogue_writer"}, found,
+                         "子包里的第二个写入方没有被发现，唯一写入者检测会漏报")
+
+    def test_excluded_directories_do_not_contribute_writers(self):
+        from tools import ledger_write_inventory as INV
+        root = self._make_tree({
+            "paper/__init__.py": "",
+            "paper/order_ledger.py": '''
+                def insert(conn):
+                    conn.execute("INSERT INTO paper_fills(order_id, qty) VALUES(?,?)", (1, 2))
+            ''',
+            "tools/helper.py": '''
+                def insert(conn):
+                    conn.execute("INSERT INTO paper_fills(order_id, qty) VALUES(?,?)", (1, 2))
+            ''',
+        })
+        found = {
+            entry["module"] for entry in INV.scan(root)["entries"]
+            if entry["role"] == "runtime" and "paper_fills" in entry["write_targets"]
+        }
+        self.assertEqual({"paper.order_ledger"}, found,
+                         "tools/ 下的文件被误当成生产写入方")

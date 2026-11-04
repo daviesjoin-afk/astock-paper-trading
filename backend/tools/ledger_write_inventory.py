@@ -143,9 +143,41 @@ def _owner_function(spans, line: int) -> str:
     return best[1] if best else "<module>"
 
 
+def _module_identity(path: Path, root: Path = BACKEND) -> str:
+    """模块的完整身份；顶层模块退化为 stem，保持既有 owner 矩阵可用。"""
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return path.stem
+    return ".".join(relative.with_suffix("").parts)
+
+
+def _iter_source_paths(root: Path = BACKEND):
+    """递归列出待扫描的 Python 文件（**含测试**，角色由 module_role 决定）。
+
+    刻意不复用 coupling_metrics.production_paths()：后者已经排除了 test_*，
+    而本模块需要看见测试文件才能把它们归类成 ``test`` 并排除在写方之外。
+    共用那份"仅生产"列表会让 894 条写入事实掉到 131 条（实测）。
+    目录级排除仍与 coupling_metrics.EXCLUDED_DIRS 保持一致，避免两套口径
+    对同一目录给出不同结论。
+    """
+    from tools.coupling_metrics import EXCLUDED_DIRS
+    found = []
+    for path in root.rglob("*.py"):
+        relative = path.relative_to(root)
+        if any(part in EXCLUDED_DIRS or part.startswith(".") for part in relative.parts[:-1]):
+            continue
+        if path.name == "conftest.py":
+            continue
+        found.append(path)
+    return sorted(found)
+
+
 def scan(root: Path = BACKEND) -> dict:
     entries: list[dict] = []
-    for path in sorted(root.glob("*.py")):
+    # 递归扫描（含子包）。生产模块迁移到 backend/<pkg>/ 后若仍用 glob，
+    # 它就会从写入者统计里静默消失，唯一写入者检测随之失效。
+    for path in _iter_source_paths(root):
         role = module_role(path)
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -161,7 +193,10 @@ def scan(root: Path = BACKEND) -> dict:
             line = getattr(node, "lineno", 0)
             reads = [t for t in _read_tables(text) if t in CORE_TABLES and t not in targets]
             entries.append({
-                "module": path.stem,
+                # 完整模块身份（``paper.order_ledger``）。顶层模块的值仍是 stem，
+                # 因此现有 owner 矩阵与预算口径不变；子包引入后同名模块不会被
+                # 合并成同一个写入方，唯一性结论才继续成立。
+                "module": _module_identity(path, root),
                 "function": _owner_function(spans, line),
                 "line": line,
                 "role": role,
@@ -246,7 +281,7 @@ def render_plan_markdown(inventory: dict | None = None, plan: dict | None = None
 def scan_readers(root: Path = BACKEND) -> dict[str, list[str]]:
     """每张核心表被哪些运行时模块**读取**（SELECT/JOIN 引用），供读取契约守卫使用。"""
     readers: dict[str, set[str]] = {table: set() for table in CORE_TABLES}
-    for path in sorted(root.glob("*.py")):
+    for path in _iter_source_paths(root):
         if module_role(path) != "runtime":
             continue
         try:
