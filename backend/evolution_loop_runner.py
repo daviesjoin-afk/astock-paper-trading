@@ -14,13 +14,15 @@
 
 设计：本 runner 与 adaptive_runner 的盘后学习读写同一份 SQLite
 （data_cache/adaptive_learning.sqlite3，D1 统一库），共享 evolution_tracking
-样本与 evolution_params 版本，互不阻塞。建议在 cron 中低频调度
-（如每个交易日收盘后），由 time-budget 保证不跨时段久占。
+样本与 evolution_params 版本。两者共用 resource_guard 的全局重型任务锁，
+因此执行串行化；竞争失败以 deferred 返回，由后续调度窗口续跑。正式执行前
+必须先获得资源许可，再初始化/写入学习数据库。
 """
 import argparse
 import datetime as dt
 import json
 import sqlite3
+from pathlib import Path
 
 import evolution_loop as EL
 from evolution_loop import ProductionBackend
@@ -97,8 +99,29 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _daily_completed_readonly(db_path: str, today_str: str) -> bool:
+    """Probe daily idempotency without schema creation or parameter initialization."""
+    if str(db_path) == ":memory:" or not Path(db_path).is_file():
+        return False
+    conn = None
+    try:
+        uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return EL.is_today_generation_completed(
+            conn, today_str, ensure_schema=False,
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        # A missing/unreadable state is not evidence of completion. The real
+        # initialization and all writes happen only after the heavy lease.
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="自进化逻辑闭环驱动")
+    parser = argparse.ArgumentParser(description="自进化闭环驱动")
     parser.add_argument("--db", default=None,
                         help="SQLite 路径（默认用 paper_trading 的 DB_PATH）")
     parser.add_argument("--generations", type=int, default=1)
@@ -125,60 +148,70 @@ def main(argv=None) -> int:
             import data_paths
             db_path = data_paths.data_path("adaptive_learning.sqlite3")
 
-    try:
-        conn = _connect(db_path)
-    except Exception as exc:
-        err_report = {
-            "status": "failed",
-            "error": f"DB initialization failed: {type(exc).__name__}: {exc}",
-            "failed": 1,
-            "interrupted": 0,
-            "completed": 0,
-            "total_stage_errors": 1,
-        }
-        print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
-        return 1
-
-    try:
-        if args.status:
+    # Status is a diagnostic command, not a heavy learning run. It does not
+    # initialize self_evolution parameters or acquire the heavy-job lease.
+    if args.status:
+        conn = None
+        try:
+            conn = sqlite3.connect(db_path, timeout=120)
+            conn.row_factory = sqlite3.Row
             status = EL.loop_status(conn)
             print(json.dumps(status, ensure_ascii=False, indent=2, default=str))
             return 0
+        except Exception as exc:
+            err_report = {
+                "status": "failed",
+                "error": f"Status query failed: {type(exc).__name__}: {exc}",
+                "failed": 1,
+                "interrupted": 0,
+                "completed": 0,
+                "total_stage_errors": 1,
+            }
+            print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
+            return 1
+        finally:
+            if conn is not None:
+                conn.close()
 
-        if args.daily:
-            today_cn = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
-            if not U.is_trade_day(today_cn):
-                report = {
-                    "status": "skipped",
-                    "reason": "non_trading_day",
-                    "date": today_cn.isoformat(),
-                    "generations_run": 0,
-                    "completed": 0,
-                    "interrupted": 0,
-                    "failed": 0,
-                    "total_stage_errors": 0,
-                    "total_stages_skipped": 0,
-                    "message": f"{today_cn} is not an A-share trading day",
-                }
-                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-                return _result_exit_code(report)
+    today_cn = None
+    if args.daily:
+        today_cn = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+        if not U.is_trade_day(today_cn):
+            report = {
+                "status": "skipped",
+                "reason": "non_trading_day",
+                "date": today_cn.isoformat(),
+                "generations_run": 0,
+                "completed": 0,
+                "interrupted": 0,
+                "failed": 0,
+                "total_stage_errors": 0,
+                "total_stages_skipped": 0,
+                "message": f"{today_cn} is not an A-share trading day",
+            }
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+            return _result_exit_code(report)
 
-            if EL.is_today_generation_completed(conn):
-                report = {
-                    "status": "already_done",
-                    "reason": "already_done",
-                    "date": today_cn.isoformat(),
-                    "generations_run": 0,
-                    "completed": 0,
-                    "interrupted": 0,
-                    "failed": 0,
-                    "total_stage_errors": 0,
-                    "total_stages_skipped": 0,
-                    "message": "Today's evolution generation already completed",
-                }
-                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-                return _result_exit_code(report)
+        # Fast read-only no-op path. Recheck after acquiring the lease to close
+        # the race between this probe and another runner completing the cycle.
+        if _daily_completed_readonly(db_path, today_cn.isoformat()):
+            report = {
+                "status": "already_done",
+                "reason": "already_done",
+                "date": today_cn.isoformat(),
+                "generations_run": 0,
+                "completed": 0,
+                "interrupted": 0,
+                "failed": 0,
+                "total_stage_errors": 0,
+                "total_stages_skipped": 0,
+                "message": "Today's evolution generation already completed",
+            }
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+            return _result_exit_code(report)
 
+    conn = None
+    try:
         with heavy_job_lease("evolution-loop") as admission:
             if not admission.get("allowed"):
                 report = {
@@ -197,6 +230,38 @@ def main(argv=None) -> int:
                 print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
                 return _result_exit_code(report)
 
+            # No schema DDL, default-parameter insert, or other DB write occurs
+            # until the process owns the global heavy-job lease.
+            try:
+                conn = _connect(db_path)
+            except Exception as exc:
+                err_report = {
+                    "status": "failed",
+                    "error": f"DB initialization failed: {type(exc).__name__}: {exc}",
+                    "failed": 1,
+                    "interrupted": 0,
+                    "completed": 0,
+                    "total_stage_errors": 1,
+                }
+                print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
+                raise RuntimeError("evolution_loop_db_initialization_failed") from exc
+
+            if args.daily and EL.is_today_generation_completed(conn, today_cn.isoformat()):
+                report = {
+                    "status": "already_done",
+                    "reason": "already_done",
+                    "date": today_cn.isoformat(),
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": "Today's evolution generation already completed",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
             report = EL.run_loop(
                 conn,
                 ProductionBackend(),
@@ -206,6 +271,19 @@ def main(argv=None) -> int:
             )
             print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
             return _result_exit_code(report)
+    except RuntimeError as exc:
+        if str(exc) == "evolution_loop_db_initialization_failed":
+            return 1
+        err_report = {
+            "status": "failed",
+            "error": f"Runner uncaught exception: {type(exc).__name__}: {exc}",
+            "failed": 1,
+            "interrupted": 0,
+            "completed": 0,
+            "total_stage_errors": 1,
+        }
+        print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
+        return 1
     except Exception as exc:
         err_report = {
             "status": "failed",
@@ -218,8 +296,8 @@ def main(argv=None) -> int:
         print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
         return 1
     finally:
-        conn.close()
-
+        if conn is not None:
+            conn.close()
 
 if __name__ == "__main__":
     raise SystemExit(main())
