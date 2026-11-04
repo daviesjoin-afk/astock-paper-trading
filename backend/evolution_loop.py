@@ -777,12 +777,25 @@ def loop_status(conn: sqlite3.Connection) -> dict:
     }
 
 
-def is_today_generation_completed(conn: sqlite3.Connection, today_str: Optional[str] = None) -> bool:
+def is_today_generation_completed(
+    conn: sqlite3.Connection,
+    today_str: Optional[str] = None,
+    *,
+    ensure_schema: bool = True,
+) -> bool:
     """检查今天是否已成功完成至少一代自进化。
-    
+
     幂等性保障：如果今天已有完成的代且无进行中/中断的代，同日重试直接 no-op。
+    ensure_schema=False 供 runner 在只读连接上做准入前探测，不执行任何 DDL。
     """
-    ensure_loop_schema(conn)
+    if ensure_schema:
+        ensure_loop_schema(conn)
+    else:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evolution_loop_state'"
+        ).fetchone()
+        if exists is None:
+            return False
     target_date = today_str or _now()[:10]
     # 先检查是否有正在运行或中断待续跑的代：如果有，则尚未完全结束，不应视为 completed
     pending = conn.execute(
