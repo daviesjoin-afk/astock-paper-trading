@@ -133,14 +133,13 @@ def _paper_fill_writer_offenders(root: Path) -> list[str]:
     """递归扫描生产 Python 源码，避免 package 移动后漏掉第二个 writer。"""
     offenders = []
     for path in sorted(root.rglob("*.py")):
-        name = path.name
-        if name.startswith("test_") or name in FILL_WRITER_ALLOWLIST:
+        relative = path.relative_to(root).as_posix()
+        if path.name.startswith("test_") or relative in FILL_WRITER_ALLOWLIST:
             continue
         for sql, node, _source_text in _execute_calls(path):
             normalized = " ".join(sql.upper().split())
             if ("INSERT INTO PAPER_FILLS" in normalized
                     or "INSERT OR REPLACE INTO PAPER_FILLS" in normalized):
-                relative = path.relative_to(root).as_posix()
                 offenders.append(f"{relative}:{node.lineno}")
     return offenders
 
