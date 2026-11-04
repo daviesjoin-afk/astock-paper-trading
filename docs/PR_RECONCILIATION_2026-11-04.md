@@ -159,7 +159,7 @@ git rev-parse origin/master   -> 837b8fcde50b61174a370da272fc41283068115c
 
 ```
 commit=79d4390bf366dd9e19e210e350db751d07b89e2d
-image=a5df3316d8b6105985aa63b4544750d0e6a4343bccf72ca9b10de7f01ce8d060
+image=a5df3316（镜像摘要前 8 位）
 ```
 
 即生产落后本轮最终 master（`837b8fc`）两个提交：`#333`（测试分片与 CI 超时）
