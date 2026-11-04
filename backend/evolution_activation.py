@@ -808,7 +808,8 @@ def create_candidate(conn, params: dict, *, strategy_id: Optional[str] = None,
 
 
 def find_equivalent_candidate(conn, params: dict, *, strategy_id,
-                              base_params_id, source=None, limit: int = 50):
+                              base_params_id, source=None, evidence=None,
+                              limit: int = 50):
     """同 scope、同 base、参数逐值相同的既有候选（未被拒绝）。
 
     用于抑制"重复提交同一调整"造成的候选堆积。要求 base 相同是必须的：
@@ -819,10 +820,17 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
     ``challenger_promotion`` 是挑战者晋级。它们即使碰巧落在同一组参数上，
     证据与审批链条也不同。若不隔离，一个自动进化候选会被当成人工结论
     复用（或反过来），把两次独立研究的血缘记到同一条候选上。
-    调用方不传 ``source`` 时保持历史行为（只比参数），仅供尚未声明来源的
-    旧路径使用。
+
+    ``evidence`` 给出时，还要求候选记录的证据快照（``performance_snapshot``）
+    与本次研究一致。参数相同但证据不同，说明这是**两次独立研究**得出同一
+    结论；复用会把新证据伪装成旧证据，事后无法判断候选当时依据什么产生。
+    传 ``evidence`` 的调用方必须与 ``create_candidate(performance_snapshot=...)``
+    写入的是同一份快照。
+
+    调用方两个都不传时保持历史行为（只比参数），仅供尚未声明来源的旧路径。
     """
     target = params_digest(params)
+    wanted_evidence = None if evidence is None else _json(evidence)
     for row in _scope_rows(conn, scope_key(strategy_id), limit=limit):
         if row["validation_state"] == STATE_REJECTED:
             continue
@@ -830,6 +838,14 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
             continue
         if source is not None and str(row["source"] or "") != str(source):
             continue
+        if wanted_evidence is not None:
+            # _shape() 已经把 performance_snapshot 解析成 dict；同时兼容尚未
+            # 解析的原始 JSON 文本（防御其它调用方直接传行）。
+            snapshot = row["performance_snapshot"]
+            if not isinstance(snapshot, (dict, list)):
+                snapshot = _loads(snapshot, {})
+            if _json(snapshot) != wanted_evidence:
+                continue
         if params_digest(row["params"]) == target:
             return row["id"]
     return None

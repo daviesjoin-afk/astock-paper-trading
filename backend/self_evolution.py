@@ -295,8 +295,14 @@ def track_run(conn, run_id: int, trigger: str, mode: str, status: str,
               market_regime: str = None, applied: bool = False, applied_count: int = 0,
               mimo_latency_ms: int = None, deepseek_latency_ms: int = None,
               total_latency_ms: int = None, mimo_confidence: float = None,
-              deepseek_confidence: float = None) -> int:
-    """追踪一次调参结果。"""
+              deepseek_confidence: float = None, commit: bool = True) -> int:
+    """追踪一次调参结果。
+
+    ``commit=True``（默认）保留历史行为：本函数自成一个写事务。
+    调用方若已拥有外层事务（AI 审核需要审计行、tracking 与 outcome_detail
+    同生共死），必须传 ``commit=False``，由那个唯一的事务负责人统一提交。
+    否则这里提前 commit 会让审核记录在后续步骤失败时仍然留下。
+    """
     params_info = get_current_params(conn)
     consensus_confidence = None
     if mimo_confidence is not None and deepseek_confidence is not None:
@@ -314,7 +320,8 @@ def track_run(conn, run_id: int, trigger: str, mode: str, status: str,
          mimo_confidence, deepseek_confidence, consensus_confidence,
          params_info["id"], _now())
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cursor.lastrowid
 
 
@@ -749,10 +756,11 @@ def evolve(conn, reason: str = "auto") -> dict:
     # evolution_loop 是每日调度；若候选一直未人工激活，旧证据会在后续
     # 日次继续满足 should_evolve。没有这个去重，系统会每天堆一条完全相同的候选。
     # 只在同来源（evolve）内去重：人工提交的同参数候选是另一条研究结论，
-    # 不能被自动进化复用，也不能反过来被它吞掉。
+    # 不能被自动进化复用，也不能反过来被它吞掉。同时要求证据快照一致：
+    # 参数相同但 metrics 不同，说明是两次独立研究，复用等于让新证据冒充旧证据。
     existing_id = EA.find_equivalent_candidate(
         conn, new_params, strategy_id=None, base_params_id=current["id"],
-        source="evolve",
+        source="evolve", evidence=metrics,
     )
     if existing_id is not None:
         return {

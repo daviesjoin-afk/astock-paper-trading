@@ -1733,7 +1733,21 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
     left = reviewers.get("ai1") or {}
     right = reviewers.get("ai2") or {}
     with connect_factory() as conn:
+        # ── 事务归属：本函数是唯一负责人 ──────────────────────────────
+        # 下面三件事必须同生共死：审计行、evolution_tracking、outcome_detail。
+        # 但 sqlite3 的 executescript() 会隐式 COMMIT 当前事务，而
+        # self_evolution / evolution_activation 的建表函数内部也各自 commit。
+        # 因此**先**把所有 schema 初始化跑完并明确提交（DDL 是幂等的，失败就
+        # 整体失败、不写任何业务行），**再**用 savepoint 包住业务写入。
         ensure_schema(conn)
+        if track_evolution:
+            import self_evolution as _SE
+            _SE.ensure_schema(conn)   # 幂等建表 + 一次性 legacy bootstrap
+            _SE.init_params(conn)     # 幂等：仅首次写入默认参数版本
+        conn.commit()
+        # 从这里开始只有业务写入。savepoint 让中途异常能整体回滚到"审计行
+        # 尚未存在"的状态，不留下半条记录。
+        conn.execute("SAVEPOINT audit_write")
         cursor = conn.execute(
             """INSERT INTO dual_ai_tuning_runs(
                 trigger, mode, status, profile_date, market_regime,
@@ -1778,8 +1792,9 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
         if track_evolution:
             try:
                 import self_evolution as _SE
-                _SE.ensure_schema(conn)
-                _SE.init_params(conn)  # 幂等：仅首次写入默认参数版本
+                # schema 与首版参数已在上面的 DDL 阶段提交完成（它们会隐式
+                # commit，不能出现在业务事务里）。这里只做纯插入，且不自行
+                # 提交 —— 提交权属于本函数末尾的 savepoint release / 外层事务。
                 tracking_id = _SE.track_run(
                     conn, run_id,
                     trigger=str(trigger)[:80], mode=mode, status=status,
@@ -1792,6 +1807,8 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                     total_latency_ms=total_latency,
                     mimo_confidence=left.get("confidence"),
                     deepseek_confidence=right.get("confidence"),
+                    # 提交权属于本函数（唯一事务负责人），这里绝不自行 commit。
+                    commit=False,
                 )
                 tracking = {
                     "status": "recorded", "tracking_id": tracking_id,
@@ -1804,10 +1821,6 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                     "status": "failed", "tracking_id": None,
                     "error_type": type(exc).__name__,
                 }
-            # 把 tracking 结果回写到**本行**的 outcome_detail，与审计行同一事务。
-            # 否则调用方拿到结果后、adaptive run detail 落库前若进程中断，
-            # 这条审计就永久丢失"下游证据是否写入成功"的事实。复用既有列，
-            # 不新增表，也不把 tracking 失败升级成 AI 审核失败。
             # 把 tracking 的**失败事实**回写到本行的 outcome_detail，与审计行同一事务。
             # 否则调用方拿到结果后、adaptive run detail 落库前若进程中断，
             # 这条审计就永久丢失"下游证据是否写入成功"的事实。复用既有列，不新增表。
@@ -1821,6 +1834,8 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                 "UPDATE dual_ai_tuning_runs SET outcome_detail=? WHERE id=?",
                 (_json(merged_detail), run_id),
             )
+        # 业务写入全部成功：释放 savepoint，由外层连接上下文统一提交。
+        conn.execute("RELEASE audit_write")
     return run_id, total_latency, tracking
 
 
