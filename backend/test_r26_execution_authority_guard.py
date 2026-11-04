@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import ast
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -128,22 +129,46 @@ class ExecutionConsumesOnlyTheMarketDataBoundary(unittest.TestCase):
         )
 
 
+def _paper_fill_writer_offenders(root: Path) -> list[str]:
+    """递归扫描生产 Python 源码，避免 package 移动后漏掉第二个 writer。"""
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        name = path.name
+        if name.startswith("test_") or name in FILL_WRITER_ALLOWLIST:
+            continue
+        for sql, node, _source_text in _execute_calls(path):
+            normalized = " ".join(sql.upper().split())
+            if ("INSERT INTO PAPER_FILLS" in normalized
+                    or "INSERT OR REPLACE INTO PAPER_FILLS" in normalized):
+                relative = path.relative_to(root).as_posix()
+                offenders.append(f"{relative}:{node.lineno}")
+    return offenders
+
+
 class PaperFillsHasASingleProductionWriter(unittest.TestCase):
-    """Guard 16：成交流水的生产写入者只有一个。"""
+    """Guard 16：paper_fills 的生产写入 authority 唯一，且递归覆盖 package。"""
 
     def test_guard16a_only_the_execution_authority_writes_paper_fills(self):
-        offenders = []
-        for path in sorted(BACKEND.rglob("*.py")):
-            name = path.name
-            if name.startswith("test_") or name in FILL_WRITER_ALLOWLIST:
-                continue
-            for sql, node, _source_text in _execute_calls(path):
-                if "INSERT INTO paper_fills" in sql or "INSERT OR REPLACE INTO paper_fills" in sql:
-                    offenders.append(f"{name}:{node.lineno}")
+        offenders = _paper_fill_writer_offenders(BACKEND)
         self.assertEqual(
             offenders, [],
             "存在绕过执行权威的成交流水写入路径：\n" + "\n".join(offenders),
         )
+
+    def test_guard16b_nested_package_writer_is_detected(self):
+        """负向控制：新 package 中出现第二 writer 时，守卫必须失败。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "paper" / "infrastructure" / "unexpected_writer.py"
+            nested.parent.mkdir(parents=True)
+            nested.write_text(
+                "def write_fill(conn):\n"
+                "    conn.execute('INSERT INTO paper_fills(account_id) VALUES (\"x\")')\n",
+                encoding="utf-8",
+            )
+            offenders = _paper_fill_writer_offenders(root)
+            self.assertEqual(1, len(offenders), offenders)
+            self.assertTrue(offenders[0].startswith("paper/infrastructure/"))
 
 
 class RiskActionDedupHasOneImplementation(unittest.TestCase):
