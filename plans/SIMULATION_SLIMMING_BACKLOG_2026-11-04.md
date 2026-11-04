@@ -93,3 +93,12 @@
   对应实现文件，不存在"指向已删除脚本"的条目。
 - 一次性三策略启动器（P1-10）仍在，但它由 `.start_three_strategy_cycle` 标记文件
   保护且幂等，是否清理需生产确认标记状态，不属于代码侧可判定项。
+
+
+## P0-G：架构守卫治理（先于 P2 大规模目录迁移）
+
+- 守卫只 hard fail 业务语义不变量；文件规模、函数规模、模块数量和 fan-out 等指标改为 review signal。
+- 已移除 risk facade 40 行与 risk service 925 行硬上限。
+- 保留唯一成交、PIT、cycle/as-of/version、风险、lease/fencing、AI 授权和操作员安全守卫。
+- P2 大规模 package 移动前，必须先完成递归源码扫描、package-aware import graph 和 capability owner registry，避免旧路径守卫漏扫或强迫保留旧 facade。
+- 具体分类和修改协议见 [架构守卫治理规则 v2](../docs/ARCHITECTURE_GUARD_GOVERNANCE.md)。
