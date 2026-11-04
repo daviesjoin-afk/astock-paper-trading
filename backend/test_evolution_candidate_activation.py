@@ -990,6 +990,47 @@ class CandidateEvidenceLineageTests(unittest.TestCase):
         self.assertEqual({"avg_eval_score": 0.7},
                          EA._loads(row_b["performance_snapshot"], {}))
 
+    def test_evidence_key_order_does_not_defeat_deduplication(self):
+        """同一份证据、只是 JSON 键序不同，必须仍被视为等价。
+
+        证据按语义比较而非序列化字符串：`json_text` 保留插入顺序，直接比
+        字符串会让同一份快照因键序不同而重复创建候选。
+        """
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.036)
+        created = EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve", reason="研究A",
+            parent_id=base,
+            performance_snapshot={"avg_eval_score": 0.6, "learning_samples": 20},
+            validate=True,
+        )
+        reused = EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base, source="evolve",
+            evidence={"learning_samples": 20, "avg_eval_score": 0.6},  # 键序不同
+        )
+        self.assertEqual(created["params_id"], reused,
+                         "键序不同被误判为不同证据，导致重复创建候选")
+        # 语义真的不同时仍然不复用。
+        self.assertIsNone(EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base, source="evolve",
+            evidence={"learning_samples": 21, "avg_eval_score": 0.6}))
+
+    def test_rejected_candidate_is_never_reused(self):
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.037)
+        created = EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve", reason="研究A",
+            parent_id=base, performance_snapshot={"avg_eval_score": 0.4}, validate=True)
+        conn.execute("UPDATE evolution_params SET validation_state='rejected' WHERE id=?",
+                     (created["params_id"],))
+        conn.commit()
+        self.assertIsNone(EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base, source="evolve",
+            evidence={"avg_eval_score": 0.4}),
+            "被拒绝的候选不应再被复用")
+
 
 if __name__ == "__main__":
     unittest.main()

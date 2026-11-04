@@ -830,7 +830,10 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
     调用方两个都不传时保持历史行为（只比参数），仅供尚未声明来源的旧路径。
     """
     target = params_digest(params)
-    wanted_evidence = None if evidence is None else _json(evidence)
+    # 证据按**语义**比较，不按序列化字符串：json_text 保留插入顺序，同一份
+    # 快照只要键序不同就会被判成"不同证据"，导致重复创建候选。这里统一解析
+    # 成结构再比，键序与空白都不影响结论。
+    wanted_evidence = None if evidence is None else _loads(_json(evidence), {})
     for row in _scope_rows(conn, scope_key(strategy_id), limit=limit):
         if row["validation_state"] == STATE_REJECTED:
             continue
@@ -844,7 +847,7 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
             snapshot = row["performance_snapshot"]
             if not isinstance(snapshot, (dict, list)):
                 snapshot = _loads(snapshot, {})
-            if _json(snapshot) != wanted_evidence:
+            if snapshot != wanted_evidence:
                 continue
         if params_digest(row["params"]) == target:
             return row["id"]

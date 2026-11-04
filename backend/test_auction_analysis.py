@@ -25,6 +25,10 @@ class AuctionAnalysisTests(unittest.TestCase):
         self.conn = sqlite3.connect(':memory:')
         self.addCleanup(self.conn.close)
         review.ensure_schema(self.conn)
+        # _write_audit 是它那次写入的唯一事务负责人：调用方连接上不允许残留
+        # 未提交事务，否则 schema 阶段的隐式 COMMIT 会把调用方数据一并提交。
+        # 建表后显式提交，让后续调用处在干净的事务边界上。
+        self.conn.commit()
 
     def at(self, minute):
         return dt.datetime(2026,10,22,9,minute,tzinfo=T.CN)

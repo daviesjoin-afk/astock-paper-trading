@@ -1737,14 +1737,27 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
         # 下面三件事必须同生共死：审计行、evolution_tracking、outcome_detail。
         # 但 sqlite3 的 executescript() 会隐式 COMMIT 当前事务，而
         # self_evolution / evolution_activation 的建表函数内部也各自 commit。
-        # 因此**先**把所有 schema 初始化跑完并明确提交（DDL 是幂等的，失败就
-        # 整体失败、不写任何业务行），**再**用 savepoint 包住业务写入。
+        # 因此**先**把所有 schema 初始化跑完并提交（DDL 是幂等的，失败就整体
+        # 失败、不写任何业务行），**再**用 savepoint 包住业务写入。
+        #
+        # 唯一事务负责人的前提是"这条连接上没有别人的未提交事务"。如果调用方
+        # 已在同一连接上开了事务，schema 阶段的隐式 COMMIT / 显式 commit 会把
+        # 调用方的数据一并提交，事后无法回滚——那是静默的数据完整性破坏。
+        # 这里 fail-closed：宁可让调用方显式分层（先提交自己的事务），也不替
+        # 它做提交决定。
+        if conn.in_transaction:
+            raise RuntimeError(
+                "ai_review_service._write_audit owns its transaction: the caller's "
+                "connection already has an open transaction, which schema setup "
+                "would commit implicitly. Commit or roll back before calling."
+            )
         ensure_schema(conn)
         if track_evolution:
             import self_evolution as _SE
             _SE.ensure_schema(conn)   # 幂等建表 + 一次性 legacy bootstrap
             _SE.init_params(conn)     # 幂等：仅首次写入默认参数版本
-        conn.commit()
+        if conn.in_transaction:
+            conn.commit()
         # 从这里开始只有业务写入。savepoint 让中途异常能整体回滚到"审计行
         # 尚未存在"的状态，不留下半条记录。
         conn.execute("SAVEPOINT audit_write")

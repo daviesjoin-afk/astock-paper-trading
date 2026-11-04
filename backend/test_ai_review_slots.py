@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -1414,6 +1415,127 @@ class AuditTransactionOwnershipTests(AiReviewSlotTestBase):
         # savepoint 语句本身会开启事务，因此执行前 in_transaction 为 False；
         # 关键是它出现在审计行插入之前，且随后所有业务写入都在事务内。
         self.assertEqual("savepoint", seen[0][0], "必须先开 savepoint 再写审计行")
+
+    def test_failure_before_the_audit_row_leaves_nothing(self):
+        self.configure_slots()
+
+        class Boom(Exception):
+            pass
+
+        def hook(conn, sql, args):
+            if isinstance(sql, str) and "INSERT INTO dual_ai_tuning_runs" in sql:
+                raise Boom("injected before audit row")
+
+        with self.stub(self.agreeing), self.assertRaises(Boom):
+            self.run_review(connect_factory=lambda: self._txn_connect(hook))
+        with self.factory() as conn:
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM dual_ai_tuning_runs").fetchone()[0])
+
+    def test_tracking_failure_is_recorded_on_the_audit_row_not_hidden(self):
+        self.configure_slots()
+
+        class Boom(Exception):
+            pass
+
+        def hook(conn, sql, args):
+            if isinstance(sql, str) and "INSERT INTO evolution_tracking" in sql:
+                raise Boom("injected after audit, before tracking")
+
+        # tracking 失败是**允许**降级的语义（不影响 AI 审核结论），但事实
+        # 必须可查：审计行里要写明失败，不能只在返回值里出现。
+        with self.stub(self.agreeing):
+            result = self.run_review(connect_factory=lambda: self._txn_connect(hook))
+        self.assertEqual("failed", result["evolution_tracking"]["status"])
+        with self.factory() as conn:
+            row = conn.execute(
+                "SELECT outcome_detail FROM dual_ai_tuning_runs").fetchone()
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM evolution_tracking").fetchone()[0])
+        detail = json.loads(row["outcome_detail"])
+        self.assertEqual({"status": "failed", "error_type": "Boom"},
+                         detail["evolution_tracking"],
+                         "tracking 缺失必须写在审计行里")
+
+    def test_failure_after_outcome_detail_rolls_everything_back(self):
+        self.configure_slots()
+
+        class Boom(Exception):
+            pass
+
+        def hook(conn, sql, args):
+            if isinstance(sql, str) and sql.startswith("RELEASE audit_write"):
+                raise Boom("injected after outcome_detail")
+
+        with self.stub(self.agreeing), self.assertRaises(Boom):
+            self.run_review(connect_factory=lambda: self._txn_connect(hook))
+        with self.factory() as conn:
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM dual_ai_tuning_runs").fetchone()[0])
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM evolution_tracking").fetchone()[0])
+
+    def test_retry_after_a_failed_attempt_produces_exactly_one_record(self):
+        self.configure_slots()
+
+        class Boom(Exception):
+            pass
+
+        def hook(conn, sql, args):
+            if isinstance(sql, str) and sql.startswith(
+                    "UPDATE dual_ai_tuning_runs SET outcome_detail"):
+                raise Boom("injected after tracking")
+
+        with self.stub(self.agreeing), self.assertRaises(Boom):
+            self.run_review(connect_factory=lambda: self._txn_connect(hook))
+        with self.stub(self.agreeing):
+            result = self.run_review()
+        self.assertEqual("recorded", result["evolution_tracking"]["status"])
+        with self.factory() as conn:
+            self.assertEqual(1, conn.execute(
+                "SELECT COUNT(*) FROM dual_ai_tuning_runs").fetchone()[0],
+                "失败后重跑不得叠加出多条审计行")
+            self.assertEqual(1, conn.execute(
+                "SELECT COUNT(*) FROM evolution_tracking").fetchone()[0])
+
+    def test_caller_transaction_is_rejected_instead_of_silently_committed(self):
+        """调用方已有未提交事务时必须 fail-closed。
+
+        schema 阶段含 executescript，会隐式 COMMIT 当前事务；若放任执行，
+        调用方的数据会被一并提交，事后 rollback 也无法撤销——静默的数据完整性
+        破坏。这里验证拒绝，且调用方数据仍然可回滚。
+        """
+        self.configure_slots()
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(self.db_path)
+        self.addCleanup(conn.close)
+        S.ensure_schema(conn)
+        conn.commit()
+        conn.execute("INSERT INTO dual_ai_tuning_runs(trigger, mode, status,"
+                     " evidence_hash, evidence, created_at, finished_at)"
+                     " VALUES('caller','intraday','consensus','h','{}','t','t')")
+        self.assertTrue(conn.in_transaction, "前提：调用方事务已开启")
+
+        with self.assertRaises(RuntimeError) as caught:
+            # 直接调 _write_audit：run_ai_review 前半段还会用自己的连接做一次
+            # 读取并提交，走到这里时事务已经被清空，测不到拒绝路径。
+            S._write_audit(
+                lambda: contextlib.nullcontext(conn),
+                "caller", "intraday", "consensus", "dual", "dual_review",
+                {}, {"note": "probe"}, "h",
+                {"ai1": {"model": "m"}, "ai2": {"model": "m"}},
+                {"ai1": {"status": "completed"}, "ai2": {"status": "completed"}},
+                "consensus", "r", None, "2026-09-14T10:00:00", 0.0,
+                track_evolution=False, outcome_detail={},
+            )
+        self.assertIn("owns its transaction", str(caught.exception))
+
+        # 调用方的写入仍然可以回滚 —— 说明没有被替它提交。
+        conn.rollback()
+        with self.factory() as verify:
+            self.assertEqual(0, verify.execute(
+                "SELECT COUNT(*) FROM dual_ai_tuning_runs").fetchone()[0])
 
 
 class ReviewerFailureIsolationTests(AiReviewSlotTestBase):
