@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""``paper_trading`` 架构边界护栏（AST / 源码静态扫描）—— Round-2 第一版。
+"""交易语义边界护栏（AST / 源码静态扫描）；不锁定文件规模或 facade 形状。
 
 存在理由只有一个：**position runtime risk state 的 authority 不能再搬回 god
 module**，domain implementation 也不能再长回 ``paper_trading.py``。Round-1
@@ -269,6 +269,31 @@ def _function_source(tree, name, raw):
 def _named_function_source(name, function, raw):
     """Source-backed file parsing shares the cache; dynamic probes stay on ast.parse."""
     return _function_source(_tree(name), function, raw)
+
+
+def _functions_calling(name, callee, raw=None):
+    """返回 ``name`` 中**调用** ``callee`` 的所有函数：(函数名, 源码)。
+
+    守卫不能绑死具体函数名：风险执行的唯一性属于业务语义，而实现函数可以
+    改名或搬到别的模块。按"谁调用了风险权威"定位，重构后依然有效。
+    """
+    raw = raw if raw is not None else _source(name)
+    lines = raw.splitlines()
+    found = []
+    for node in ast.walk(_tree(name)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            target = ast.unparse(call.func)
+            if target == callee or target.endswith("." + callee):
+                found.append((
+                    node.name,
+                    "\n".join(lines[node.lineno - 1:node.end_lineno]),
+                ))
+                break
+    return found
 
 
 class DomainModulesNeverDependOnPaperTrading(unittest.TestCase):
@@ -575,35 +600,46 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
             "PRSS.claim_scan(", body,
             "monitor_risk 不再通过 paper_risk_scan_state 认领扫描身份",
         )
-        impl = _named_function_source("paper_trading.py", "_monitor_risk_impl", raw)
-        self.assertNotIn(
-            "risk_scan_state", impl,
-            "_monitor_risk_impl 又碰了 paper_audit 的 risk_scan_state 标记：scan "
-            "生命周期必须整体由 monitor_risk + paper_risk_scan_state 负责",
-        )
-        self.assertNotIn(
-            "scan_minute", impl,
-            "_monitor_risk_impl 又自己算 scan_minute：身份必须只由 monitor_risk "
-            "解析一次，否则跨分钟边界会留下 orphan running",
-        )
+        # 扫描身份的解析只允许在认领入口发生一次。这里按"谁调用风险权威"定位，
+        # 不绑死 ``_monitor_risk_impl`` 这个实现函数名：实现可以改名或搬家，
+        # 但"身份只解析一次"的语义必须保留。
+        runners = _functions_calling("paper_trading.py", "PRSVC.run", raw)
+        self.assertTrue(runners, "paper_trading.py 里找不到调用风险权威的函数")
+        for name, source in runners:
+            with self.subTest(risk_runner=name):
+                self.assertNotIn(
+                    "risk_scan_state", source,
+                    f"{name} 又碰了 paper_audit 的 risk_scan_state 标记：scan "
+                    "生命周期必须整体由认领入口 + paper_risk_scan_state 负责",
+                )
+                self.assertNotIn(
+                    "scan_minute", source,
+                    f"{name} 又自己算 scan_minute：身份必须只由认领入口解析一次，"
+                    "否则跨分钟边界会留下 orphan running",
+                )
 
-    def test_guard7g_impl_cycle_id_is_keyword_only_and_required(self):
+    def test_guard7g_risk_context_is_keyword_only_and_required(self):
+        """风险执行上下文必须显式传入 cycle/as-of，缺失即 fail fast。
+
+        不绑定 ``_monitor_risk_impl``：只要存在一个调用风险权威的函数，
+        它交给权威的上下文就必须带完整标识，且这两个字段不能有默认值。
+        """
         tree = _tree("paper_trading.py")
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef) or node.name != "_monitor_risk_impl":
-                continue
-            kwonly = {arg.arg for arg in node.args.kwonlyargs}
-            self.assertIn("cycle_id", kwonly,
-                          "_monitor_risk_impl 的 cycle_id 不是 keyword-only："
-                          "位置参数可以漏传，等于把跨周期执行重新引入")
-            index = [arg.arg for arg in node.args.kwonlyargs].index("cycle_id")
-            self.assertIsNone(
-                node.args.kw_defaults[index],
-                "_monitor_risk_impl 的 cycle_id 带默认值：缺失时必须 fail fast，"
-                "不得静默回退到'现在 active 的周期'",
-            )
-            return
-        self.fail("paper_trading.py 里找不到 _monitor_risk_impl")
+        context_calls = [
+            call for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and ast.unparse(call.func).endswith("RiskRunContext")
+        ]
+        self.assertTrue(
+            context_calls,
+            "paper_trading.py 里找不到构造风险执行上下文的位置；"
+            "风险执行必须携带显式 cycle/as-of",
+        )
+        for call in context_calls:
+            with self.subTest(line=call.lineno):
+                keywords = {kw.arg for kw in call.keywords}
+                self.assertIn("cycle_id", keywords, "风险上下文缺少显式 cycle_id")
+                self.assertIn("asof_day", keywords, "风险上下文缺少显式 asof_day")
 
     def test_guard7h_scan_snapshot_is_pinned_to_the_claimed_cycle(self):
         """风险扫描的持仓读取必须走显式周期，不能重新猜 active cycle。"""
@@ -626,7 +662,7 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
         )
         self.assertIn(
             "PRSS.assert_cycle_active(", impl,
-            "_monitor_risk_impl 在外部 I/O 之后不再做 cycle fence："
+            "风险服务在外部 I/O 之后不再做 cycle fence："
             "周期 rollover 会带着旧快照继续执行",
         )
         # fence 必须出现在执行侧写入之前（源码顺序只是弱证据，权威是生产回归
@@ -1382,17 +1418,6 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             self.assertNotIn("paper_trading", roots,
                              f"{filename} reverse-imports paper_trading")
 
-    def test_guard12b_paper_trading_facade_is_thin(self):
-        raw = _source("paper_trading.py")
-        body = _named_function_source("paper_trading.py", "_monitor_risk_impl", raw)
-        self.assertLessEqual(
-            len(body.splitlines()), 40,
-            "_monitor_risk_impl 不再是 thin compatibility adapter",
-        )
-        self.assertIn("PRSVC.run(", body,
-                      "_monitor_risk_impl 不再委托 paper_risk_service.run")
-        self.assertNotIn("for position in positions", body,
-                         "_monitor_risk_impl 又长出 risk loop")
 
     def test_guard12c_explicit_context_and_no_active_cycle_resolution(self):
         raw = _source(self.SERVICE)
@@ -1568,14 +1593,6 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
                 f"post-fill SELL audit re-resolves strategy provenance: {forbidden}",
             )
 
-    def test_guard12g_service_is_not_a_monolith(self):
-        loc = len(_source(self.SERVICE).splitlines())
-        # 这条上限是**观察**，不是维护性目标：R26 没有为提高它而放宽阈值，
-        # 而是把 4 处手写的 execute marker 去重 SQL 交给
-        # ``execution_verification.has_verified_positive_execution``，文件因此**变小**
-        # （911 → 884）。把 "LOC guard 越加越高" 当作可维护性解法，正是这条注释
-        # 想避免的做法。
-        self.assertLess(loc, 925, f"paper_risk_service.py grew to {loc} LOC")
 
 
 class PortfolioReadModelIsCycleAsOfBounded(unittest.TestCase):

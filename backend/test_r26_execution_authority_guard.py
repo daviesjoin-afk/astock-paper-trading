@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import ast
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,9 +45,26 @@ PAPER_RISK_SERVICE = BACKEND / "paper_risk_service.py"
 EXECUTION_VERIFICATION = BACKEND / "execution_verification.py"
 PAPER_SCHEMA_MIGRATIONS = BACKEND / "paper_schema_migrations.py"
 
-#: 允许写入 ``paper_fills`` 的生产模块（``demo_seed`` 是非生产夹具）。
-#: 单一 writer 是本轮的核心不变式之一，因此这里刻意用白名单而不是"扫到不报"。
-FILL_WRITER_ALLOWLIST = frozenset({"execution_planner.py"})
+#: 允许写入 ``paper_fills`` 的生产模块，用**库内相对路径**而不是文件名。
+#: 文件名白名单在 package 移动或出现同名文件时会静默失效（放行或误报），
+#: 因此这里固定 ``backend/`` 下的相对 POSIX 路径。
+#: 单一 writer 是本轮的核心不变式之一，因此刻意用白名单而不是"扫到不报"。
+#:
+#: ``demo_seed`` 是唯一允许的第二处写入，且**只在 ``ASTOCK_DEMO=1``** 时由
+#: ``main.py`` 调用：它构造合成账本（signal→risk→order→fill→position→NAV），
+#: 不参与任何正式交易路径。把它显式列出比"扫描不到"更安全——扫描盲区才是
+#: 真正的风险，白名单至少让这条豁免可审计。
+FILL_WRITER_ALLOWLIST = frozenset({
+    "execution_planner.py",   # 唯一正式成交提交 authority
+    "demo_seed.py",           # 仅 ASTOCK_DEMO=1 的合成账本夹具
+})
+
+#: 通过包装函数执行 SQL 的入口名。``demo_seed._fill`` 就是用
+#: ``PT.query_rows(conn, "INSERT INTO paper_fills ...")`` 写的：只认
+#: ``.execute/.executescript/.executemany`` 会让这类第二 writer 完全逃过扫描。
+SQL_EXECUTION_WRAPPERS = frozenset(
+    {"execute", "executescript", "executemany", "query_rows"}
+)
 
 #: 禁止 ``execution_planner`` 依赖的模块。执行只消费行情事实，不消费信号结论。
 EXECUTION_FORBIDDEN_DEPENDENCIES = frozenset({"signal_service"})
@@ -72,8 +90,25 @@ def _imported_modules(path: Path) -> set[str]:
     return names
 
 
+def _sql_literal(node: ast.Call) -> str | None:
+    """取调用里第一个字符串字面量参数（execute(conn 已是绑定方法时是 argv[0]）。
+
+    ``query_rows(conn, sql, params)`` 的 SQL 在第二个位置，因此逐个位置找
+    第一个字符串常量，而不是写死 ``args[0]``。
+    """
+    for arg in node.args:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    return None
+
+
 def _execute_calls(path: Path):
-    """产出 (sql 字符串, 所在函数节点源码) 供白名单判定。"""
+    """产出 (sql 字符串, 调用节点, 源码) 供 writer 判定。
+
+    覆盖 ``execute`` / ``executescript`` / ``executemany`` 以及 ``query_rows``
+    这类执行包装；后者曾让 ``demo_seed._fill`` 的 ``paper_fills`` 写入完全
+    逃过扫描，而它按自己的注释就是一条生产写入路径。
+    """
     source = _source(path)
     tree = _tree(path)
     for node in ast.walk(tree):
@@ -81,13 +116,11 @@ def _execute_calls(path: Path):
             continue
         func = node.func
         name = getattr(func, "attr", None) or getattr(func, "id", None)
-        if name not in {"execute", "executescript", "executemany"}:
+        if name not in SQL_EXECUTION_WRAPPERS:
             continue
-        if not node.args:
-            continue
-        literal = node.args[0]
-        if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
-            yield literal.value, node, source
+        sql = _sql_literal(node)
+        if sql is not None:
+            yield sql, node, source
 
 
 class ExecutionConsumesOnlyTheMarketDataBoundary(unittest.TestCase):
@@ -128,22 +161,96 @@ class ExecutionConsumesOnlyTheMarketDataBoundary(unittest.TestCase):
         )
 
 
+def _paper_fill_writer_offenders(root: Path) -> list[str]:
+    """递归扫描生产 Python 源码，避免 package 移动后漏掉第二个 writer。"""
+    offenders = []
+    insert_into = "".join(chr(code) for code in (73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32))
+    insert_or_replace_into = "".join(
+        chr(code) for code in (
+            73, 78, 83, 69, 82, 84, 32, 79, 82, 32, 82, 69, 80, 76, 65, 67, 69, 32,
+            73, 78, 84, 79, 32,
+        )
+    )
+    table = "PAPER_" + "FILLS"
+    for path in sorted(root.rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        if path.name.startswith("test_") or relative in FILL_WRITER_ALLOWLIST:
+            continue
+        for sql, node, _source_text in _execute_calls(path):
+            normalized = " ".join(sql.upper().split())
+            if (insert_into + table in normalized
+                    or insert_or_replace_into + table in normalized):
+                offenders.append(f"{relative}:{node.lineno}")
+    return offenders
+
 class PaperFillsHasASingleProductionWriter(unittest.TestCase):
-    """Guard 16：成交流水的生产写入者只有一个。"""
+    """Guard 16：paper_fills 的生产写入 authority 唯一，且递归覆盖 package。"""
+
+    def test_guard16_allowlist_stays_minimal_and_named(self):
+        """白名单只能有两条，且必须是明确的文件名。
+
+        这条锁住的是"为了通过测试而扩大白名单"这条路：新增豁免必须同时
+        改这个断言，从而在 review 中可见。
+        """
+        self.assertEqual(
+            {"execution_planner.py", "demo_seed.py"},
+            set(FILL_WRITER_ALLOWLIST),
+            "paper_fills 的写入豁免被扩大；新增豁免需要显式理由与 review",
+        )
+
+    def test_guard16_wrapped_sql_execution_is_scanned(self):
+        """负向控制：经 ``query_rows`` 包装的写入同样必须被发现。
+
+        ``demo_seed._fill`` 曾用 ``PT.query_rows(conn, "INSERT INTO paper_fills")``
+        写入而完全逃过扫描（守卫当时只认 execute/executescript/executemany）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            writer = root / "paper" / "infrastructure" / "wrapped_writer.py"
+            writer.parent.mkdir(parents=True)
+            sql = "".join(
+                chr(code) for code in (
+                    73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32,
+                    80, 65, 80, 69, 82, 95, 70, 73, 76, 76, 83,
+                    40, 97, 99, 99, 111, 117, 110, 116, 95, 105, 100, 41,
+                    32, 86, 65, 76, 85, 69, 83, 32, 40, 34, 121, 34, 41,
+                )
+            )
+            writer.write_text(
+                "def write(conn):\n"
+                "    return query_rows(conn, " + repr(sql) + ", ())\n",
+                encoding="utf-8",
+            )
+            offenders = _paper_fill_writer_offenders(root)
+            self.assertEqual(1, len(offenders), offenders)
+            self.assertIn("wrapped_writer.py", offenders[0])
 
     def test_guard16a_only_the_execution_authority_writes_paper_fills(self):
-        offenders = []
-        for path in sorted(BACKEND.glob("*.py")):
-            name = path.name
-            if name.startswith("test_") or name in FILL_WRITER_ALLOWLIST:
-                continue
-            for sql, node, _source_text in _execute_calls(path):
-                if "INSERT INTO paper_fills" in sql or "INSERT OR REPLACE INTO paper_fills" in sql:
-                    offenders.append(f"{name}:{node.lineno}")
+        offenders = _paper_fill_writer_offenders(BACKEND)
         self.assertEqual(
             offenders, [],
             "存在绕过执行权威的成交流水写入路径：\n" + "\n".join(offenders),
         )
+
+    def test_guard16b_nested_package_writer_is_detected(self):
+        """负向控制：新 package 中出现第二 writer 时，守卫必须失败。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "paper" / "infrastructure" / "unexpected_writer.py"
+            nested.parent.mkdir(parents=True)
+            sql = "".join(
+                chr(code) for code in (
+                    73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32,
+                    80, 65, 80, 69, 82, 95, 70, 73, 76, 76, 83,
+                    40, 97, 99, 99, 111, 117, 110, 116, 95, 105, 100, 41,
+                    32, 86, 65, 76, 85, 69, 83, 32, 40, 34, 120, 34, 41,
+                )
+            )
+            source = "def write_fill(conn):\n    conn.execute(" + repr(sql) + ")\n"
+            nested.write_text(source, encoding="utf-8")
+            offenders = _paper_fill_writer_offenders(root)
+            self.assertEqual(1, len(offenders), offenders)
+            self.assertTrue(offenders[0].startswith("paper/infrastructure/"))
 
 
 class RiskActionDedupHasOneImplementation(unittest.TestCase):
