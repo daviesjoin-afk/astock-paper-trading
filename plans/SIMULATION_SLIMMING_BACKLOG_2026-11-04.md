@@ -9,12 +9,12 @@
 
 | ID | 候选 | 初步动作 | 风险 | 状态 |
 |---|---|---|---|---|
-| P1-01 | 周度复盘自动改参 | 保留周报，移除直接写参数；建议改为 advisory | 中 | 待实现 |
-| P1-02 | close 多个固定重试时间 | 改成持久化数据就绪/续跑，不立即删除 | 中高 | 待观测 |
+| P1-01 | 周度复盘自动改参 | 保留周报，移除直接写参数；建议改为 advisory | 中 | **已合并 #339（ff789c4）** |
+| P1-02 | close 多个固定重试时间 | 改成持久化数据就绪/续跑，不立即删除 | 中高 | 待观测（已核查，见 §代码核查） |
 | P1-03 | risk 独立 lane + intraday fallback | 在可靠性证据充分后，考虑删除重复兜底触发 | 高 | 待观测 |
 | P1-04 | adaptive_runner + evolution_loop_runner | 统一 orchestration，保留不同算法与证据产物 | 高 | 待分析 |
-| P1-05 | selection_runner + paper_selection_runner | 共享同轮行情/因子输入，不合并不同结果/身份 | 中 | 待分析 |
-| P1-06 | fast-entry 30秒任务 | 以增量成交质量/确认率决定保留或删除 | 高 | 待观测 |
+| P1-05 | selection_runner + paper_selection_runner | 共享同轮行情/因子输入，不合并不同结果/身份 | 中 | 待分析（已核查，见 §代码核查） |
+| P1-06 | fast-entry 30秒任务 | 以增量成交质量/确认率决定保留或删除 | 高 | 待观测（无孤儿任务，见 §代码核查） |
 | P1-07 | close_snapshot_runner 与 close/selection | 验证快照消费者后，评估合并行情刷新 | 中 | 待分析 |
 | P1-08 | 竞价跟踪 | 暂保留；有 AI review / auction_analysis 消费者 | 中 | 保留 |
 | P1-09 | dashboard refresh | 保留持久队列，测量 idle tick 后决定是否减少触发频次 | 低 | 待观测 |
@@ -43,3 +43,53 @@
 - 交易账本、策略版本、历史审计与 PIT 证据不受影响。
 - exact-head CI 全绿。
 - 性能改善有同口径数据支持。
+## 代码核查（2026-11-04，master `ff789c4`）
+
+以下结论来自源码与调度表实测，不是推测。复核者可按列出的位置自行验证。
+
+### P1-02：close 固定重试
+
+**结论：不删除，保持待观测。**
+
+- `deploy/astock-codex.cron` 的 close 窗口为 15:05 / 15:10 / 15:12 / 15:25 / 15:40 / 16:00，全部 `flock -n`（拿不到锁即跳过）。
+- 生产实测单轮 552–558 秒（9.2 分钟）。按此推演：15:05 那轮约 15:14 结束，
+  因此 **15:10 与 15:12 在"正常长跑"场景下必然被跳过**。
+- 但这两个窗口并非无用：它们是"进程被 SIGKILL 后的早重试"。`flock` 由 cron 行持有，
+  进程死亡即释放锁，此时 15:10/15:12 是唯一能立刻接手的窗口。
+- `universe.refresh_history` 已有：持久化游标 `kline_refresh_state.json`、失败代码的
+  指数退避重试队列（5→60 分钟、跨进程持久化）、失败原因持久化、
+  以及"按已提交代码推进游标"的轮转。数据就绪驱动机制**已存在**。
+- `deploy/run_paper_slot.sh` 已把被锁挡住的情况写成 `paper_host_lock/not_acquired`
+  事件，运维可见，不是静默失败。
+
+因此"固定重试"与"数据就绪"并非互斥的两套机制，而是重试窗口 + 增量续跑的组合。
+删除任何窗口都会削弱"进程崩溃后当天仍能完成"的保障，而收益仅是减少被跳过的 cron
+触发（成本近似为一次 `flock`）。**在没有生产调度数据证明 15:10/15:12 从未在崩溃场景
+生效之前，不删除、不改等待策略。**
+
+### P1-05：selection_runner 与 history_recovery_runner 的重复刷新
+
+**结论：重复存在，但不值得改。**
+
+- `selection_runner`（15:45/16:15/16:45/17:15）与 `history_recovery_runner`
+  （15:20 起每 15 分钟）**共用 `resource-heavy.lock`**，且都调用
+  `U.refresh_history` + `P.rebuild_selection_factor_cache`。
+- 每个 `selection_runner` 窗口前后 15 分钟内都存在 history_recovery 窗口，
+  即同一条 `refresh_history` 在相邻时间被调用两次。
+- 但 `refresh_history` 在数据已齐时走 `up_to_date` 早退（只读 manifest），
+  重复成本约为一次 manifest 扫描，不是全市场重新下载。
+- `selection_runner` 保留 refresh 是**安全边界**：它必须在选股前证明"当日完整日线
+  已落盘"，否则会把昨天的候选记成今天的运行。删除该调用会让这条门禁失去数据前提。
+
+因此不合并、不删除。若未来要优化，正确方向是让两者共享一次
+`refresh_history` 的结果（例如由 history_recovery 发布"数据就绪"事实），
+而不是从 selection_runner 移除门禁前置条件。
+
+### P1-06：无效任务扫描
+
+**结论：当前调度中没有孤儿任务。**
+
+- `deploy/astock-codex.cron` 的 17 类目标（7 个 slot + 10 个 runner 脚本）全部有
+  对应实现文件，不存在"指向已删除脚本"的条目。
+- 一次性三策略启动器（P1-10）仍在，但它由 `.start_three_strategy_cycle` 标记文件
+  保护且幂等，是否清理需生产确认标记状态，不属于代码侧可判定项。
