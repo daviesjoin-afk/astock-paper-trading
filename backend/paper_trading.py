@@ -12383,40 +12383,34 @@ def _weekly_review(conn, day):
         latest_nav = navs[-1] if navs else reference_capital
         ret = latest_nav / max(reference_capital, 1) - 1
         advice = []
-        change = None
         if max_dd <= -0.10:
             advice.append("滚动回撤达到进取档位熔断线：保持冷静期，禁止放宽任何参数")
         if len(closed) < 6 or signal_count < 10:
-            advice.append("样本不足：本周仅生成报告，不自动调参")
+            advice.append("样本不足：本周仅生成报告，不形成参数建议")
         else:
+            # P1-01：周度复盘只生成 advisory。过去这里直接 PAC.write_params 并
+            # 插入 paper_parameter_versions，绕过 evolution_apply 的双 AI 共识、
+            # 人工确认、版本校验与回滚门禁，成为隐藏的第三条参数写入通道。
+            # 现在只计算建议值并写入报告，参数应用统一走人工确认路径。
             params = _loads(account.get("params"), {})
             current = _num(params.get("entry_score_delta"), _num(params.get("min_t_score_delta")))
             next_delta = min(0.03, current + 0.01) if ret < 0 else max(-0.03, current - 0.01)
             if next_delta != current:
-                # 模拟盘参数调整当天立即生效，历史成交仍按原版本保留。
-                effective = _date(day).isoformat()
-                params.pop("min_t_score_delta", None)
-                params.update({"entry_score_delta": round(next_delta, 3), "effective_date": effective})
-                version = f"v3.{week.split('W')[-1]}"
-                reason = "本周负收益，提高策略专属入场门槛" if ret < 0 else "本周正收益，小幅放宽策略专属入场门槛"
-                PAC.write_params(conn, account["id"], params=_json(params),
-                                 version=version, now=_now())
-                cycle = load_active_cycle(conn)
-                conn.execute(
-                    "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (cycle["id"], account["id"], version, account.get("style") or "pullback", _json(params), reason, effective, _now()),
+                direction = "提高" if ret < 0 else "放宽"
+                advice.append(
+                    f"参数建议（advisory，不自动生效）：本周{'负' if ret < 0 else '正'}收益，"
+                    f"可{direction}专属入场评分偏移 {current:+.3f} → {next_delta:+.3f}；"
+                    "需经人工确认与版本校验后由 evolution_apply 应用"
                 )
-                change = f"自动微调：专属入场评分偏移 {current:+.3f} → {next_delta:+.3f}，{effective} 生效"
-                advice.append(change)
             else:
-                advice.append("参数已达到本周期受限边界，本周不再调整")
+                advice.append("参数建议（advisory）：入场评分偏移已达到受限边界，本周不建议调整")
         text = (f"# {account['name']} 周度复盘（{week}）\n\n"
                 f"- 策略绩效参考资金：{reference_capital:.0f} 元\n"
                 f"- 最新净值：{latest_nav:.2f} 元，累计收益：{ret*100:+.2f}%\n"
                 f"- 最大回撤：{max_dd*100:.2f}%\n"
                 f"- 模拟成交：{len(fills)} 笔；已平仓：{len(closed)} 笔；风控拦截/未成交：{rejected} 笔\n"
                 f"- 风格：{ACS.style_name(account.get('style'), account.get('style'))}\n"
-                f"- 参数版本：{account['version']}（自动微调当日生效，安全边界不可放宽）\n\n"
+                f"- 参数版本：{account['version']}（周报只生成参数建议，不自动改参；安全边界不可放宽）\n\n"
                 f"## 下周期建议\n" + "\n".join(f"- {x}" for x in advice) + "\n\n"
                 "模拟成交采用快照与滑点假设，不代表实际可成交价格；本报告不构成投资建议。\n")
         conn.execute("INSERT INTO paper_reviews(week_key,account_id,report,recommendation,created_at) VALUES(?,?,?,?,?) ON CONFLICT(week_key,account_id) DO UPDATE SET report=excluded.report,recommendation=excluded.recommendation,created_at=excluded.created_at",

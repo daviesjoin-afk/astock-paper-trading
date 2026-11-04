@@ -10749,6 +10749,54 @@
    "write_targets": [
     "paper_signals"
    ]
+  },
+  {
+   "function": "_seed_account",
+   "kind": "static",
+   "line": 47,
+   "module": "test_weekly_review_advisory",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT OR REPLACE INTO paper_accounts(id,name,source_strategy,status,initial_cash,cash,cycle_days, max_positions,max_weight,max_exposure,version,created_at,upda",
+   "write_targets": [
+    "paper_accounts"
+   ]
+  },
+  {
+   "function": "_seed_account",
+   "kind": "static",
+   "line": 58,
+   "module": "test_weekly_review_advisory",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT OR REPLACE INTO paper_cycles(id,cycle_key,status,capital, risk_profile,started_at,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?)",
+   "write_targets": [
+    "paper_cycles"
+   ]
+  },
+  {
+   "function": "_set_performance",
+   "kind": "static",
+   "line": 96,
+   "module": "test_weekly_review_advisory",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_orders(account_id,side,code,qty,planned_price, status,filled_price,created_at,execution_verified,execution_status, cycle_id,strategy_id,strate",
+   "write_targets": [
+    "paper_orders"
+   ]
+  },
+  {
+   "function": "_set_performance",
+   "kind": "static",
+   "line": 107,
+   "module": "test_weekly_review_advisory",
+   "read_refs": [],
+   "role": "test",
+   "sql": "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,payload,status, cycle_id,strategy_id,strategy_version,strategy_checksum,created_at) VALUES(?",
+   "write_targets": [
+    "paper_signals"
+   ]
   }
  ]
 }
