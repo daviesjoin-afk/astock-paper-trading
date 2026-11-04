@@ -12,7 +12,8 @@ import json
 import sqlite3
 from typing import Any
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import strategy_plugins as PLUGINS
 import strategy_registry as SR

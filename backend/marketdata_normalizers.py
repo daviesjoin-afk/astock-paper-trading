@@ -9,7 +9,9 @@ from __future__ import annotations
 import datetime as dt
 import math
 
-import pandas as pd
+import paper_lazy_imports as _lz
+
+pd = _lz.lazy("pandas")
 
 
 def finite_number(value):

@@ -5,7 +5,8 @@ HTTP and scheduled consumers share this owner; it does not import the HTTP app.
 """
 import os, time, datetime, threading, json, uuid, contextvars, functools
 from contextlib import contextmanager
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 try:
     import fcntl as _main_fcntl

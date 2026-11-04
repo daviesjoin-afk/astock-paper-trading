@@ -13,7 +13,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2187,
+     "line": 2210,
      "kind": "call/reference/binding"
     },
     {
@@ -49,7 +49,7 @@
     {
      "module": "paper_trading",
      "function": "create_cycle",
-     "line": 14185,
+     "line": 14208,
      "kind": "call/reference/binding"
     },
     {
@@ -67,7 +67,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2157,
+     "line": 2180,
      "kind": "call/reference/binding"
     },
     {
@@ -97,13 +97,13 @@
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2126,
+     "line": 2149,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "create_cycle",
-     "line": 14159,
+     "line": 14182,
      "kind": "call/reference/binding"
     },
     {
@@ -121,7 +121,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_accounts",
-     "line": 1932,
+     "line": 1955,
      "kind": "call/reference/binding"
     },
     {
@@ -151,7 +151,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_accounts",
-     "line": 1947,
+     "line": 1970,
      "kind": "call/reference/binding"
     },
     {
@@ -175,7 +175,7 @@
     {
      "module": "paper_trading",
      "function": "_shared_risk_state",
-     "line": 2644,
+     "line": 2667,
      "kind": "call/reference/binding"
     }
    ]
@@ -187,7 +187,7 @@
     {
      "module": "paper_trading",
      "function": "configure_capital",
-     "line": 14233,
+     "line": 14256,
      "kind": "call/reference/binding"
     },
     {
@@ -205,7 +205,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2172,
+     "line": 2195,
      "kind": "call/reference/binding"
     },
     {
@@ -223,7 +223,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2245,
+     "line": 2268,
      "kind": "call/reference/binding"
     },
     {
@@ -241,7 +241,7 @@
     {
      "module": "paper_trading",
      "function": "set_accounts_status",
-     "line": 14329,
+     "line": 14350,
      "kind": "call/reference/binding"
     },
     {
@@ -265,13 +265,13 @@
     {
      "module": "paper_trading",
      "function": "set_account_style",
-     "line": 14305,
+     "line": 14328,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2232,
+     "line": 2255,
      "kind": "call/reference/binding"
     }
    ]
@@ -283,7 +283,7 @@
     {
      "module": "paper_trading",
      "function": "_ensure_accounts",
-     "line": 1942,
+     "line": 1965,
      "kind": "call/reference/binding"
     },
     {
@@ -349,7 +349,7 @@
     {
      "module": "paper_trading",
      "function": "_weekly_review",
-     "line": 12379,
+     "line": 12402,
      "kind": "call/reference/binding"
     }
    ]
@@ -361,7 +361,7 @@
     {
      "module": "paper_trading",
      "function": "archive_current_cycle",
-     "line": 14073,
+     "line": 14096,
      "kind": "call/reference/binding"
     }
    ]
@@ -373,13 +373,13 @@
     {
      "module": "paper_trading",
      "function": "create_cycle",
-     "line": 14120,
+     "line": 14143,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2087,
+     "line": 2110,
      "kind": "call/reference/binding"
     }
    ]
@@ -391,13 +391,13 @@
     {
      "module": "paper_trading",
      "function": "_ensure_cycle",
-     "line": 2102,
+     "line": 2125,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "configure_capital",
-     "line": 14220,
+     "line": 14243,
      "kind": "call/reference/binding"
     }
    ]
@@ -409,7 +409,7 @@
     {
      "module": "paper_trading",
      "function": "set_accounts_status",
-     "line": 14329,
+     "line": 14350,
      "kind": "call/reference/binding"
     }
    ]
@@ -421,7 +421,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14579,
+     "line": 14602,
      "kind": "call/reference/binding"
     }
    ]
@@ -433,7 +433,7 @@
     {
      "module": "paper_trading",
      "function": "process_pending_execution_orders",
-     "line": 9431,
+     "line": 9454,
      "kind": "call/reference/binding"
     }
    ]
@@ -445,13 +445,13 @@
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12573,
+     "line": 12596,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12573,
+     "line": 12596,
      "kind": "call/reference/binding"
     }
    ]
@@ -463,7 +463,7 @@
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12600,
+     "line": 12623,
      "kind": "call/reference/binding"
     }
    ]
@@ -475,7 +475,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14569,
+     "line": 14592,
      "kind": "call/reference/binding"
     }
    ]
@@ -487,7 +487,7 @@
     {
      "module": "paper_trading",
      "function": "run_slot",
-     "line": 12682,
+     "line": 12705,
      "kind": "call/reference/binding"
     }
    ]
@@ -505,25 +505,25 @@
     {
      "module": "paper_trading",
      "function": "_record_entry_frozen_waitlist",
-     "line": 1271,
+     "line": 1286,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9166,
+     "line": 9189,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14580,
+     "line": 14603,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_intraday_sell",
-     "line": 11098,
+     "line": 11121,
      "kind": "call/reference/binding"
     }
    ]
@@ -535,7 +535,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14577,
+     "line": 14600,
      "kind": "call/reference/binding"
     }
    ]
@@ -547,7 +547,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14578,
+     "line": 14601,
      "kind": "call/reference/binding"
     }
    ]
@@ -559,7 +559,7 @@
     {
      "module": "paper_trading",
      "function": "_rebuild_realized_pnl",
-     "line": 1516,
+     "line": 1539,
      "kind": "call/reference/binding"
     }
    ]
@@ -625,7 +625,7 @@
     {
      "module": "paper_trading",
      "function": "_reconcile_signal_order_states",
-     "line": 1646,
+     "line": 1669,
      "kind": "call/reference/binding"
     }
    ]
@@ -637,7 +637,7 @@
     {
      "module": "paper_trading",
      "function": "run_slot",
-     "line": 12683,
+     "line": 12706,
      "kind": "call/reference/binding"
     }
    ]
@@ -649,7 +649,7 @@
     {
      "module": "paper_trading",
      "function": "_reconcile_signal_order_states",
-     "line": 1704,
+     "line": 1727,
      "kind": "call/reference/binding"
     }
    ]
@@ -661,7 +661,7 @@
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9196,
+     "line": 9219,
      "kind": "call/reference/binding"
     }
    ]
@@ -685,7 +685,7 @@
     {
      "module": "paper_trading",
      "function": "_supersede_signal_execution_retries",
-     "line": 1805,
+     "line": 1828,
      "kind": "call/reference/binding"
     }
    ]
@@ -697,7 +697,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14571,
+     "line": 14594,
      "kind": "call/reference/binding"
     }
    ]
@@ -721,7 +721,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14570,
+     "line": 14593,
      "kind": "call/reference/binding"
     }
    ]
@@ -733,7 +733,7 @@
     {
      "module": "paper_trading",
      "function": "_intraday_sell",
-     "line": 11140,
+     "line": 11163,
      "kind": "call/reference/binding"
     }
    ]
@@ -745,7 +745,7 @@
     {
      "module": "paper_trading",
      "function": "process_pending_execution_orders",
-     "line": 9451,
+     "line": 9474,
      "kind": "call/reference/binding"
     }
    ]
@@ -757,7 +757,7 @@
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12582,
+     "line": 12605,
      "kind": "call/reference/binding"
     }
    ]
@@ -769,13 +769,13 @@
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12623,
+     "line": 12614,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12623,
+     "line": 12614,
      "kind": "call/reference/binding"
     }
    ]
@@ -787,7 +787,7 @@
     {
      "module": "paper_trading",
      "function": "_cleanup_stale_data",
-     "line": 12613,
+     "line": 12636,
      "kind": "call/reference/binding"
     }
    ]
@@ -811,49 +811,49 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14573,
+     "line": 14596,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 8312,
+     "line": 8322,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9147,
+     "line": 9170,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 8312,
+     "line": 8322,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9237,
+     "line": 9260,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9280,
+     "line": 9296,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9280,
+     "line": 9296,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "monitor_fast_entries",
-     "line": 11782,
+     "line": 11805,
      "kind": "call/reference/binding"
     }
    ]
@@ -877,7 +877,7 @@
     {
      "module": "paper_trading",
      "function": "run_slot",
-     "line": 12682,
+     "line": 12705,
      "kind": "call/reference/binding"
     }
    ]
@@ -889,7 +889,7 @@
     {
      "module": "paper_trading",
      "function": "execute_open",
-     "line": 9614,
+     "line": 9637,
      "kind": "call/reference/binding"
     }
    ]
@@ -901,7 +901,7 @@
     {
      "module": "paper_trading",
      "function": "run_slot",
-     "line": 12683,
+     "line": 12706,
      "kind": "call/reference/binding"
     }
    ]
@@ -913,7 +913,7 @@
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 8261,
+     "line": 8284,
      "kind": "call/reference/binding"
     }
    ]
@@ -925,7 +925,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14575,
+     "line": 14598,
      "kind": "call/reference/binding"
     }
    ]
@@ -937,7 +937,7 @@
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9245,
+     "line": 9268,
      "kind": "call/reference/binding"
     }
    ]
@@ -949,7 +949,7 @@
     {
      "module": "paper_trading",
      "function": "_reconcile_signal_order_states",
-     "line": 1712,
+     "line": 1735,
      "kind": "call/reference/binding"
     }
    ]
@@ -961,7 +961,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14576,
+     "line": 14599,
      "kind": "call/reference/binding"
     }
    ]
@@ -973,13 +973,13 @@
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9285,
+     "line": 9308,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "_enforce_order_intent",
-     "line": 1449,
+     "line": 1472,
      "kind": "call/reference/binding"
     }
    ]
@@ -1003,7 +1003,7 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14574,
+     "line": 14597,
      "kind": "call/reference/binding"
     }
    ]
@@ -1027,7 +1027,7 @@
     {
      "module": "paper_trading",
      "function": "_bootstrap_signals_for_today",
-     "line": 10466,
+     "line": 10489,
      "kind": "call/reference/binding"
     }
    ]
@@ -1039,7 +1039,7 @@
     {
      "module": "paper_trading",
      "function": "_bootstrap_signals_for_today",
-     "line": 10476,
+     "line": 10499,
      "kind": "call/reference/binding"
     }
    ]
@@ -1051,7 +1051,7 @@
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 9192,
+     "line": 9215,
      "kind": "call/reference/binding"
     }
    ]
@@ -1075,7 +1075,7 @@
     {
      "module": "paper_trading",
      "function": "_buy_order",
-     "line": 8231,
+     "line": 8254,
      "kind": "call/reference/binding"
     }
    ]
@@ -1093,19 +1093,19 @@
     {
      "module": "paper_trading",
      "function": "_bind_application_dependencies",
-     "line": 14572,
+     "line": 14595,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "execute_open",
-     "line": 9646,
+     "line": 9669,
      "kind": "call/reference/binding"
     },
     {
      "module": "paper_trading",
      "function": "monitor_fast_entries",
-     "line": 11790,
+     "line": 11813,
      "kind": "call/reference/binding"
     }
    ]

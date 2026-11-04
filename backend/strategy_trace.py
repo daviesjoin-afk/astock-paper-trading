@@ -24,7 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 TRACE_SCHEMA = "strategy-replay-v1"
 _TABLE_SCHEMA = "strategy-replay-table-v1"

@@ -118,6 +118,9 @@ FOUNDATION_MODULES = frozenset({
     "data_paths", "env_utils", "entry_lifecycle", "paper_common",
     "paper_decision_audit", "paper_numeric", "paper_position_read_model",
     "paper_repository", "paper_storage", "paper_trading_rules",
+    # 纯技术工具：按入口延迟 import 重依赖（见模块 docstring）。零业务语义，
+    # 不读账本、不做决策；业务模块引用它不构成跨域耦合。
+    "paper_lazy_imports",
 })
 
 

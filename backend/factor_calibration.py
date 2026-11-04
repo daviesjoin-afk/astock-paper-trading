@@ -19,7 +19,8 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 
 CALIBRATION_VERSION = "factor-calibration-v2"

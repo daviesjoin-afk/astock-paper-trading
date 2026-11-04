@@ -11,7 +11,8 @@ import datetime as dt
 import os
 import time
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import data_fetcher as dfc
 import market_data_contract as MDC

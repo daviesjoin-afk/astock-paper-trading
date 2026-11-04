@@ -12,7 +12,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
+import paper_lazy_imports as _lz
+
+pd = _lz.lazy("pandas")
 import requests
 
 

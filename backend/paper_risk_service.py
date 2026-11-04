@@ -16,7 +16,14 @@ from typing import Any, Callable, ContextManager
 import execution_planner as EP
 import execution_verification as EV
 import paper_account_specs as ACS
-import paper_decision_audit as PDA
+import paper_lazy_imports as _lz
+from typing import TYPE_CHECKING as _TC
+
+if _TC:  # pragma: no cover - 仅供架构守卫静态读取依赖边
+    import paper_decision_audit as PDA
+# 运行时惰性绑定：本模块只有一处 PDA.with_decision_snapshot 调用（在函数内），
+# 而 paper_decision_audit 是 pandas 的根导入者之一。延迟它不会改变依赖边。
+PDA = _lz.lazy("paper_decision_audit")
 from paper_kline_snapshot import RoundKlineCache
 import paper_portfolio_read_model as PPort
 import paper_numeric as PNum

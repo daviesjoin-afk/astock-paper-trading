@@ -21,7 +21,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import data_fetcher as dfc
 import market_data_contract as MDC
@@ -74,13 +75,25 @@ import paper_user_account_provisioning as PUAP
 import paper_user_cycle_attachment as PUCA
 import paper_capital_reservations as PCR
 import paper_cycle_capital as PCC
-import paper_decision_audit as PDA
+from typing import TYPE_CHECKING as _TYPE_CHECKING
+
+if _TYPE_CHECKING:  # pragma: no cover - 仅供架构守卫静态读取依赖边
+    import paper_decision_audit as PDA
+# 运行时绑定惰性代理：paper_decision_audit 是 pandas 的根导入者之一，而
+# risk / execution-resume / intraday 从不产生决策快照，不该为它付约 0.34 秒。
+# 上面的 import 只在类型检查期存在，依赖边（cross_domain_edges /
+# import_cycles）的统计口径不变；_LAZY_AUDIT_ALIASES 负责按需解析成员。
+PDA = _lz.lazy("paper_decision_audit")
 import paper_slot_occupancy as PSO
 import paper_schedule_contract as PSch
 import paper_risk_exit_eligibility as PRE
 import paper_risk_scan_state as PRSS
 import paper_risk_writes as PRW
-import paper_candidate_live_fields as PCLF
+if _TYPE_CHECKING:  # pragma: no cover - 仅供架构守卫静态读取依赖边
+    import paper_candidate_live_fields as PCLF
+# 唯一的调用在函数内（overlay_factor_inputs），且该模块被强制要求不依赖
+# 项目内其他模块（test_import_laziness），因此只能在这一侧延迟。
+PCLF = _lz.lazy("paper_candidate_live_fields")
 import paper_dynamic_allocation as PDAlloc
 import paper_live_tradability as PLTrad
 import paper_position_review as PReview
@@ -103,7 +116,9 @@ import execution_planner as EP
 import execution_verification as EV
 import paper_entry_decision as PED
 import main_force_confirmation as MFC
-import paper_candidate_projection as PCP
+if _TYPE_CHECKING:  # pragma: no cover - 仅供架构守卫静态读取依赖边
+    import paper_candidate_projection as PCP
+PCP = _lz.lazy("paper_candidate_projection")
 import paper_risk_market_inputs as PRMI
 import paper_sizing as PSZ
 import order_intent as OI
@@ -1295,14 +1310,22 @@ def _record_entry_frozen_waitlist(
 # compatibility facade that keeps the historical private names importable for
 # existing callers.  It must never grow a second implementation: the aliases
 # below are the extracted functions and nothing else.
-DECISION_SNAPSHOT_VERSION = PDA.DECISION_SNAPSHOT_VERSION
+#
+# 别名改为首次使用时解析（PEP 562）：paper_decision_audit 是 pandas 的根导入者，
+# 而 risk/execution-resume/intraday 从不产生决策快照，不该为它付 0.34 秒。
+_LAZY_AUDIT_ALIASES = {
+    "DECISION_SNAPSHOT_VERSION": "DECISION_SNAPSHOT_VERSION",
+    "_snapshot_safe": "snapshot_safe", "_snapshot_date": "snapshot_date",
+    "_snapshot_first": "snapshot_first", "_snapshot_kline": "snapshot_kline",
+    "_snapshot_factor_evidence": "snapshot_factor_evidence",
+}
 
-_snapshot_safe = PDA.snapshot_safe
-_snapshot_date = PDA.snapshot_date
-_snapshot_first = PDA.snapshot_first
-_snapshot_kline = PDA.snapshot_kline
-_snapshot_factor_evidence = PDA.snapshot_factor_evidence
 
+def __getattr__(name):
+    target = _LAZY_AUDIT_ALIASES.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return _lz.member(PDA, target)  # 转发已知字面名，不命中 dynamic_name_bridges
 
 def _decision_snapshot(
     payload=None, *, account_id=None, code=None, side=None, decision=None,
