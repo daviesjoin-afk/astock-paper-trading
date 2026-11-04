@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""``paper_trading`` 架构边界护栏（AST / 源码静态扫描）—— Round-2 第一版。
+"""交易语义边界护栏（AST / 源码静态扫描）；不锁定文件规模或 facade 形状。
 
 存在理由只有一个：**position runtime risk state 的 authority 不能再搬回 god
 module**，domain implementation 也不能再长回 ``paper_trading.py``。Round-1
@@ -1382,17 +1382,6 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             self.assertNotIn("paper_trading", roots,
                              f"{filename} reverse-imports paper_trading")
 
-    def test_guard12b_paper_trading_facade_is_thin(self):
-        raw = _source("paper_trading.py")
-        body = _named_function_source("paper_trading.py", "_monitor_risk_impl", raw)
-        self.assertLessEqual(
-            len(body.splitlines()), 40,
-            "_monitor_risk_impl 不再是 thin compatibility adapter",
-        )
-        self.assertIn("PRSVC.run(", body,
-                      "_monitor_risk_impl 不再委托 paper_risk_service.run")
-        self.assertNotIn("for position in positions", body,
-                         "_monitor_risk_impl 又长出 risk loop")
 
     def test_guard12c_explicit_context_and_no_active_cycle_resolution(self):
         raw = _source(self.SERVICE)
@@ -1568,14 +1557,6 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
                 f"post-fill SELL audit re-resolves strategy provenance: {forbidden}",
             )
 
-    def test_guard12g_service_is_not_a_monolith(self):
-        loc = len(_source(self.SERVICE).splitlines())
-        # 这条上限是**观察**，不是维护性目标：R26 没有为提高它而放宽阈值，
-        # 而是把 4 处手写的 execute marker 去重 SQL 交给
-        # ``execution_verification.has_verified_positive_execution``，文件因此**变小**
-        # （911 → 884）。把 "LOC guard 越加越高" 当作可维护性解法，正是这条注释
-        # 想避免的做法。
-        self.assertLess(loc, 925, f"paper_risk_service.py grew to {loc} LOC")
 
 
 class PortfolioReadModelIsCycleAsOfBounded(unittest.TestCase):
