@@ -15,7 +15,8 @@
 import os
 
 import numpy as np
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import data_fetcher as dfc
 import strategies as S

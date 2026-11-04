@@ -9,7 +9,8 @@ import os, json, time, threading, uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 import marketdata_cache as MDC
 import marketdata_feeds as MDF
 import marketdata_normalizers as MN

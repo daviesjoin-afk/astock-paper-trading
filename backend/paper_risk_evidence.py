@@ -11,7 +11,8 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import paper_position_review as PReview
 import paper_position_review_evidence as PREV

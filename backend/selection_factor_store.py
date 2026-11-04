@@ -6,7 +6,8 @@ import os
 import tempfile
 import threading
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 try:
     import fcntl

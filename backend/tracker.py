@@ -15,7 +15,8 @@
 import os, json, threading
 from datetime import datetime
 
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import data_fetcher as dfc
 import data_paths

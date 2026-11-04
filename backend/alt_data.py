@@ -23,8 +23,10 @@ import paper_timing as PTM
 import data_paths
 from env_utils import env_int
 
+import paper_lazy_imports as _lz
+
 try:
-    import pandas as pd
+    pd = _lz.lazy("pandas")
 except ImportError:  # pragma: no cover
     pd = None
 

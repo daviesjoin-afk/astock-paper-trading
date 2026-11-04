@@ -5,7 +5,8 @@
 本地已完成的交易日 K 线；实时资金只参与排序，不冒充历史信号。
 """
 import numpy as np
-import pandas as pd
+import paper_lazy_imports as _lz
+pd = _lz.lazy("pandas")
 
 import factors as F
 import factor_calibration as FC

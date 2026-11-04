@@ -332,6 +332,13 @@ class TencentRealtimeFeedTests(unittest.TestCase):
 
 
 class SinaRealtimeFeedTests(unittest.TestCase):
+    def setUp(self):
+        # FEED_HEALTH 是模块级单例，其它测试可能留下 half_open + probe_in_flight，
+        # 那样 allow() 会直接拒绝而 fetch_realtime 静默返回 []，看起来像"没重试"。
+        # 每个用例从干净电路开始，避免依赖分片内的执行顺序。
+        feeds.FEED_HEALTH.reset()
+        self.addCleanup(feeds.FEED_HEALTH.reset)
+
     def test_retries_empty_response_and_delegates_parser(self):
         reset = mock.Mock()
         sleep = mock.Mock()
@@ -377,6 +384,12 @@ class QuoteAttemptBudgetTests(unittest.TestCase):
     预算只限制等待时间；失败仍然返回当前已取到的行（通常为空），由调用方按
     覆盖不足 fail-closed。
     """
+
+    def setUp(self):
+        # 同 SinaRealtimeFeedTests：电路是模块级单例，先例留下的
+        # half_open/probe_in_flight 会让 adapter 一个请求都不发就返回 []。
+        feeds.FEED_HEALTH.reset()
+        self.addCleanup(feeds.FEED_HEALTH.reset)
 
     def _clock(self):
         clock = [0.0]
