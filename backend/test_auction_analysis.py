@@ -109,9 +109,13 @@ class AuctionAnalysisTests(unittest.TestCase):
         reviewers={'ai1':{'status':'completed','decision':'hold','proposals':[],
                          'auction_intents':[{'code':'000001','intent':'support','expected_direction':'up'}]}}
         with mock.patch.object(review,'_now',return_value=self.at(26).isoformat()):
-            run_id,_=review._write_audit(connect,'test','intraday','both_hold','dual','dual_review',{},
+            run_id,_,tracking=review._write_audit(connect,'test','intraday','both_hold','dual','dual_review',{},
                                          {'auction_tracking':context},'test',{},reviewers,False,'hold',[],
                                          self.at(25).isoformat(),time.monotonic())
+        # 第三个返回值是本次新增的 evolution_tracking 结果。本用例传
+        # track_evolution=False，因此应为 not_required；断言结构而非丢掉它，
+        # 竞价审核证据的持久化验证保持完整。
+        self.assertEqual(tracking,{'status':'not_required','tracking_id':None,'error_type':None})
         saved=json.loads(self.conn.execute('SELECT reviewers FROM dual_ai_tuning_runs WHERE id=?',(run_id,)).fetchone()[0])
         self.assertEqual(10.1,saved['ai1']['auction_intents'][0]['reference_quote']['price'])
         self.assertIn('auction_intents',review._reviewer_response(saved['ai1']))
