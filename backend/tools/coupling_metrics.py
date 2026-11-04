@@ -29,9 +29,57 @@ DOMAIN_PREFIXES = (
 )
 
 
+#: 生产扫描必须跳过的目录名。
+#:
+#: 这些目录里即使有 .py 也不是生产模块：测试辅助、工具脚本、固定夹具、
+#: 字节码缓存。**排除是白名单式的**（按目录名），因此新增一个业务子包不会
+#: 被静默漏掉——只有显式登记在这里的名字才被排除。
+EXCLUDED_DIRS = frozenset({
+    "tools",           # 审计/度量工具自身，不是运行时代码
+    "test_support",    # 测试共享夹具
+    "fixtures",        # 静态夹具与样例数据
+    "__pycache__",
+    "node_modules",
+    "data_cache",
+})
+#: 生产扫描必须跳过的文件名前缀/精确名。
+EXCLUDED_FILE_PREFIXES = ("test_",)
+EXCLUDED_FILES = frozenset({"__init__.py", "conftest.py"})
+
+
+def _is_excluded_dir(name: str) -> bool:
+    return name in EXCLUDED_DIRS or name.startswith(".")
+
+
 def production_paths(root: Path = BACKEND) -> tuple[Path, ...]:
-    return tuple(sorted(path for path in root.glob("*.py")
-                        if not path.name.startswith("test_") and path.name != "__init__.py"))
+    """递归列出生产 Python 模块（子目录 package 一并纳入）。
+
+    #332 之前这里只做 ``root.glob("*.py")``：一旦模块迁进 ``backend/paper/``
+    这类子目录，它就会**从所有依赖图与指标里消失**，而不是被正确统计。现在
+    递归遍历，并按 :data:`EXCLUDED_DIRS` 显式排除非生产目录。
+
+    返回值仍是路径（调用方按 stem 或 module_key 取值），保持既有调用签名。
+    """
+    found = []
+    for path in root.rglob("*.py"):
+        relative = path.relative_to(root)
+        if any(_is_excluded_dir(part) for part in relative.parts[:-1]):
+            continue
+        if path.name in EXCLUDED_FILES or path.name.startswith(EXCLUDED_FILE_PREFIXES):
+            continue
+        found.append(path)
+    return tuple(sorted(found))
+
+
+def module_key(path: Path, root: Path = BACKEND) -> str:
+    """稳定的完整模块身份：``paper/risk_service`` 而非仅仅是 ``risk_service``。
+
+    子目录引入后 ``path.stem`` 不再唯一（``paper/common.py`` 与
+    ``data/common.py`` 会撞名）。依赖边、环检测与写入者统计都必须用完整
+    身份，否则两个同名模块会被当成同一个节点，环会被漏检或误报。
+    """
+    relative = path.resolve().relative_to(root.resolve())
+    return ".".join(relative.with_suffix("").parts)
 
 
 def _trees(paths: Iterable[Path]):
@@ -66,16 +114,45 @@ def _records(paths: tuple[Path, ...]):
     return tuple(records)
 
 
-def _local_imports(tree, modules):
+def _local_imports(tree, modules, *, current: str | None = None):
+    """本模块对项目内其它模块的依赖边（完整模块身份）。
+
+    ``modules`` 是完整身份集合（见 :func:`module_key`）。``current`` 给出本模块
+    的完整身份，用于解析相对导入：``from .sibling import x`` 与
+    ``from ..pkg.mod import y`` 只有在知道"我在哪"时才能落到正确目标。
+
+    绝对导入按前缀匹配：``import paper.risk`` 与 ``from paper.risk import x``
+    都指向 ``paper.risk``；若目标本身是包（``paper`` 有 ``__init__``），也允许
+    命中包内模块。解析不到时**不猜测**，该边不产生——所以宁可能漏，不会虚增。
+    """
     edges = set()
+
+    def resolve_absolute(dotted: str) -> None:
+        parts = dotted.split(".")
+        for length in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:length])
+            if candidate in modules:
+                edges.add(candidate)
+                return
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            edges.update(alias.name.split(".")[0] for alias in node.names
-                         if alias.name.split(".")[0] in modules)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            root = node.module.split(".")[0]
-            if root in modules:
-                edges.add(root)
+            for alias in node.names:
+                resolve_absolute(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                if node.module:
+                    resolve_absolute(node.module)
+                continue
+            # 相对导入：以当前模块所在包为基准向上 level-1 层。
+            if current is None:
+                continue
+            package = current.split(".")
+            if len(package) < node.level:
+                continue  # 越过根目录的相对导入不是项目内依赖
+            base = package[: len(package) - node.level]
+            target = ".".join([*base, *(node.module.split(".") if node.module else [])])
+            resolve_absolute(target)
     return edges
 
 
@@ -160,16 +237,20 @@ def _foundation_violations_cached(root: Path = BACKEND):
     原本会各自把全仓再走一遍（同一进程里 3~4 次），2026-10-29 起共用一份。
     """
     records = list(_trees(production_paths(root)))
-    modules = {path.stem for path, _, _ in records}
+    keys = {path: module_key(path, root) for path, _, _ in records}
+    modules = set(keys.values())
     violations = []
     for path, _, tree in records:
-        module = path.stem
-        if module not in FOUNDATION_MODULES:
+        module = keys[path]
+        # 基础层按**叶名**识别：模块迁进子包后（``paper.data_paths``）仍然是
+        # 同一个基础层 owner，不能因为换了目录就漏检反向依赖。
+        leaf = module.rsplit(".", 1)[-1]
+        if leaf not in FOUNDATION_MODULES:
             continue
-        allowed = (FOUNDATION_ALLOWED_DEPENDENCIES.get(module, frozenset())
-                   | (FOUNDATION_MODULES - {module}))
-        for target in sorted(_local_imports(tree, modules) - {module}):
-            if target not in allowed:
+        allowed = (FOUNDATION_ALLOWED_DEPENDENCIES.get(leaf, frozenset())
+                   | frozenset(FOUNDATION_MODULES - {leaf}))
+        for target in sorted(_local_imports(tree, modules, current=module) - {module}):
+            if target.rsplit(".", 1)[-1] not in allowed:
                 violations.append((module, target))
     return tuple(sorted(violations))
 
@@ -180,9 +261,15 @@ def foundation_violations(root: Path = BACKEND):
 
 
 def domain_of(module: str) -> str:
-    if module in FOUNDATION_MODULES:
+    """模块所属业务域。
+
+    完整身份（``paper.risk``）先取末段再按前缀判定：子包只是分组，域仍由
+    模块名决定。顶层模块的判定与改造前完全一致。
+    """
+    leaf = module.rsplit(".", 1)[-1]
+    if leaf in FOUNDATION_MODULES:
         return "foundation"
-    head = module.split("_", 1)[0]
+    head = leaf.split("_", 1)[0]
     return head if head in DOMAIN_GROUPS else "other"
 
 
@@ -314,8 +401,12 @@ measure_all.cache_clear = lambda: _measure_all_cached.cache_clear()  # type: ign
 @lru_cache(maxsize=4)
 def _measure_all_cached(root: Path = BACKEND):
     records = list(_trees(production_paths(root)))
-    modules = {path.stem for path, _, _ in records}
-    edges = {path.stem: _local_imports(tree, modules) - {path.stem}
+    # 节点身份用完整模块路径（``paper/risk`` → ``paper.risk``）。顶层模块的
+    # key 恰好等于 stem，所以现有指标与预算口径一字不变；子目录引入后同名
+    # 模块不会再互相覆盖。
+    keys = {path: module_key(path, root) for path, _, _ in records}
+    modules = set(keys.values())
+    edges = {keys[path]: _local_imports(tree, modules, current=keys[path]) - {keys[path]}
              for path, _, tree in records}
     cycles = strongly_connected(edges)
     deferred = raw_sql = private_access = max_globals = 0
