@@ -1678,7 +1678,7 @@ def _evolution_bounds(connect_factory, accounts_map):
 
 def _base_outcome(result_mode, review_mode, status, reviewers, consensus, reason,
                   proposals, run_id, total_latency, evidence_hash, config_snapshot,
-                  single_reviewer_slot=None, outcome_detail=None):
+                  single_reviewer_slot=None, outcome_detail=None, evolution_tracking=None):
     return {
         "id": run_id,
         "version": AI_REVIEW_VERSION,
@@ -1694,6 +1694,9 @@ def _base_outcome(result_mode, review_mode, status, reviewers, consensus, reason
         "total_latency_ms": total_latency,
         "evidence_hash": evidence_hash,
         "outcome_detail": outcome_detail,
+        "evolution_tracking": evolution_tracking or {
+            "status": "not_required", "tracking_id": None, "error_type": None,
+        },
     }
 
 
@@ -1769,12 +1772,15 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
         )
         run_id = cursor.lastrowid
 
+        tracking = {
+            "status": "not_required", "tracking_id": None, "error_type": None,
+        }
         if track_evolution:
             try:
                 import self_evolution as _SE
                 _SE.ensure_schema(conn)
                 _SE.init_params(conn)  # 幂等：仅首次写入默认参数版本
-                _SE.track_run(
+                tracking_id = _SE.track_run(
                     conn, run_id,
                     trigger=str(trigger)[:80], mode=mode, status=status,
                     market_regime=profile.get("regime"),
@@ -1787,9 +1793,18 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                     mimo_confidence=left.get("confidence"),
                     deepseek_confidence=right.get("confidence"),
                 )
-            except Exception:
-                pass  # 追踪失败绝不阻塞调参主流程
-    return run_id, total_latency
+                tracking = {
+                    "status": "recorded", "tracking_id": tracking_id,
+                    "error_type": None,
+                }
+            except Exception as exc:
+                # Evidence persistence is isolated from reviewer execution, but its
+                # failure must be visible to the downstream evolution orchestrator.
+                tracking = {
+                    "status": "failed", "tracking_id": None,
+                    "error_type": type(exc).__name__,
+                }
+    return run_id, total_latency, tracking
 
 
 def run_ai_review(connect_factory, paper_db_path, snapshot_paths, evidence_collector,
@@ -1854,7 +1869,7 @@ def run_ai_review(connect_factory, paper_db_path, snapshot_paths, evidence_colle
 
 def _context_audit(context, result_mode, status, reviewers, consensus, reason,
                    audit_merged, proposals, track_evolution, outcome_detail=None):
-    run_id, total_latency = _write_audit(
+    run_id, total_latency, evolution_tracking = _write_audit(
         context["connect_factory"], context["trigger"], context["mode"], status,
         context["review_mode"], result_mode, context["profile"], context["evidence"],
         context["evidence_hash"], context["config_snapshot"], reviewers, consensus,
@@ -1864,7 +1879,7 @@ def _context_audit(context, result_mode, status, reviewers, consensus, reason,
     return _base_outcome(
         result_mode, context["review_mode"], status, reviewers, consensus, reason,
         proposals, run_id, total_latency, context["evidence_hash"], context["config_snapshot"],
-        outcome_detail=outcome_detail,
+        outcome_detail=outcome_detail, evolution_tracking=evolution_tracking,
     )
 
 
