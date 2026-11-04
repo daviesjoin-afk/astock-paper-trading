@@ -2347,8 +2347,8 @@ def run_learning_cycle(trigger="manual"):
         except Exception:
             pass
         # —— 阶段 5.5：AI 审核调参（独立于学习事务；未就绪自动跳过，失败不阻塞）——
-        # D1 接线：调参结果经 dual_ai_tuner.track_run 落入 evolution_tracking，
-        # 供 evolution_loop 的 EVALUATE / MUTATE 消费，形成"越调越准"数据闭环。
+        # D1 接线：ai_review_service 在写入审核台账后，经 self_evolution.track_run
+        # 追加 evolution_tracking；写入状态随审核结果返回，供 evolution_loop 消费。
         #
         # 预检必须按**当前审核模式**判断，不能一律要求两个槽位：single 模式只需要
         # 所选槽位就绪，否则合法配置会被永久误判为 skipped（只能手动触发）。
@@ -2393,6 +2393,7 @@ def run_learning_cycle(trigger="manual"):
                             "consensus": (dual_ai_tuning or {}).get("consensus"),
                             "consensus_reason": str((dual_ai_tuning or {}).get("consensus_reason") or "")[:120],
                             "merged_proposals": len((dual_ai_tuning or {}).get("merged_proposals") or []),
+                            "evolution_tracking": (dual_ai_tuning or {}).get("evolution_tracking"),
                         } if dual_ai_tuning else None,
                         "reward_attribution": {
                             "status": reward_attribution.get("status"),
