@@ -745,6 +745,20 @@ def evolve(conn, reason: str = "auto") -> dict:
             "metrics": metrics,
         }
 
+    # 相同 active base + 相同参数的待激活候选只允许存在一份。
+    # evolution_loop 是每日调度；若候选一直未人工激活，旧证据会在后续
+    # 日次继续满足 should_evolve。没有这个去重，系统会每天堆一条完全相同的候选。
+    existing_id = EA.find_equivalent_candidate(
+        conn, new_params, strategy_id=None, base_params_id=current["id"],
+    )
+    if existing_id is not None:
+        return {
+            "evolved": False,
+            "reason": "等价待激活候选已存在",
+            "existing_params_id": int(existing_id),
+            "metrics": metrics,
+        }
+
     # 保存为**候选**：这里绝不推进 active 指针。
     # 候选要经过确定性校验，并由显式激活入口批准后才会生效。
     created = EA.create_candidate(
