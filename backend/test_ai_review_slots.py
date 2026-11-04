@@ -135,9 +135,10 @@ class AiReviewSlotTestBase(unittest.TestCase):
             return _response(proposals=[_proposal({"mom": 0.51, "sentiment": 0.49})])
         return _response(proposals=[_proposal({"mom": 0.515, "sentiment": 0.485})])
 
-    def run_review(self, review_mode=None, single_reviewer_slot=None, trigger="test"):
+    def run_review(self, review_mode=None, single_reviewer_slot=None, trigger="test",
+                   connect_factory=None):
         return S.run_ai_review(
-            self.factory, self.db_path, [], self._evidence, self._accounts,
+            connect_factory or self.factory, self.db_path, [], self._evidence, self._accounts,
             profile={"profile_date": "2026-09-14", "regime": "trend"},
             trigger=trigger, mode="intraday",
             review_mode=review_mode, single_reviewer_slot=single_reviewer_slot,
@@ -1275,6 +1276,144 @@ class ApplyGateRegressionTests(AiReviewSlotTestBase):
         message = self._gate_error(run["id"])
         self.assertNotIn("只有 consensus 状态的运行可以应用", message)
         self.assertIn("没有可应用的共识提案", message)
+
+
+class EvolutionTrackingObservabilityTests(AiReviewSlotTestBase):
+    """A completed AI review must expose whether its downstream evolution row was persisted."""
+
+    def test_tracking_write_failure_is_visible_without_failing_the_review(self):
+        import self_evolution as SE
+
+        self.configure_slots()
+        with self.stub(self.agreeing), mock.patch.object(
+            SE, "track_run", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            result = self.run_review()
+
+        self.assertEqual("consensus", result["status"])
+        self.assertEqual(
+            {"status": "failed", "tracking_id": None, "error_type": "OperationalError"},
+            result["evolution_tracking"],
+        )
+        audit = self.audit(result["id"])
+        self.assertEqual("consensus", audit["status"])
+        self.assertEqual(
+            0,
+            self.scalar(
+                "SELECT COUNT(*) FROM evolution_tracking WHERE run_id=?",
+                (result["id"],),
+            ),
+        )
+        # 失败事实必须留在审计行本身：只塞进返回值的话，调用方拿完结果后若
+        # 进程在 adaptive run detail 落库前中断，这条审核就查不出下游缺失。
+        # 记录状态与错误类型即可；tracking_id 是行身份，不进入结论比对面。
+        detail = json.loads(audit["outcome_detail"] or "{}")
+        self.assertEqual(
+            {"status": "failed", "error_type": "OperationalError"},
+            detail.get("evolution_tracking"),
+        )
+
+    def test_successful_tracking_returns_its_persisted_id_through_legacy_facade(self):
+        import self_evolution as SE
+
+        self.configure_slots()
+        with self.stub(self.agreeing):
+            result = self.run_review()
+
+        tracking = result["evolution_tracking"]
+        self.assertEqual("recorded", tracking["status"])
+        self.assertIsInstance(tracking["tracking_id"], int)
+        with self.factory() as conn:
+            row = SE.get_tracking(conn, tracking["tracking_id"])
+        self.assertEqual(result["id"], row["run_id"])
+
+        legacy = DT._legacy_view(result)
+        self.assertEqual(tracking, legacy["evolution_tracking"])
+
+    def test_single_reviewer_does_not_claim_an_evolution_tracking_write(self):
+        self.configure_slots()
+        with self.stub(self.agreeing):
+            result = self.run_review(review_mode="single", single_reviewer_slot="ai1")
+        self.assertEqual("not_required", result["evolution_tracking"]["status"])
+        self.assertIsNone(result["evolution_tracking"]["tracking_id"])
+
+
+class AuditTransactionOwnershipTests(AiReviewSlotTestBase):
+    """审计行、tracking 与 outcome_detail 必须同生共死。
+
+    `_write_audit` 是唯一事务负责人：DDL 在业务写入之前完成并提交（sqlite3 的
+    executescript 会隐式提交，不能混进业务事务），随后用 savepoint 包住业务
+    写入。这里用**真实事务语义**的连接（异常即回滚）验证：中途失败时不允许
+    留下"看起来成功"的审计行。
+    """
+
+    @contextmanager
+    def _txn_connect(self, hook=None):
+        """与 paper_storage.db 同语义：正常退出提交，异常退出回滚。
+
+        ``hook(conn, sql, args)`` 可在任意语句执行前抛异常，用于故障注入
+        （sqlite3.Connection.execute 是 C 实现，无法用 mock.patch 替换）。
+        """
+        class Hooked(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if hook is not None:
+                    hook(self, sql, args)
+                return super().execute(sql, *args)
+
+        conn = sqlite3.connect(self.db_path, factory=Hooked)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_failure_after_tracking_leaves_no_partial_audit_row(self):
+        self.configure_slots()
+
+        class Boom(Exception):
+            pass
+
+        def hook(conn, sql, args):
+            # 在 tracking 写入成功之后、outcome_detail 更新之前注入异常。
+            if isinstance(sql, str) and sql.startswith(
+                    "UPDATE dual_ai_tuning_runs SET outcome_detail"):
+                raise Boom("injected: after tracking, before outcome_detail")
+
+        with self.stub(self.agreeing):
+            with self.assertRaises(Boom):
+                self.run_review(connect_factory=lambda: self._txn_connect(hook))
+
+        with self.factory() as conn:
+            rows = conn.execute("SELECT COUNT(*) FROM dual_ai_tuning_runs").fetchone()[0]
+            tracked = conn.execute("SELECT COUNT(*) FROM evolution_tracking").fetchone()[0]
+        # 审计行与它的 tracking 都不该留下：事务整体回滚，没有"半条成功"。
+        self.assertEqual(0, rows, "注入异常后仍留下了审计行")
+        self.assertEqual(0, tracked, "注入异常后仍留下了 evolution_tracking 行")
+
+    def test_schema_setup_happens_before_the_business_transaction(self):
+        """DDL 会隐式提交，必须先于业务写入完成，否则会提前提交半条记录。"""
+        self.configure_slots()
+        seen = []
+
+        def hook(conn, sql, args):
+            text = sql if isinstance(sql, str) else ""
+            if "INSERT INTO dual_ai_tuning_runs" in text:
+                seen.append(("insert", conn.in_transaction))
+            elif text.startswith("SAVEPOINT audit_write"):
+                seen.append(("savepoint", conn.in_transaction))
+
+        with self.stub(self.agreeing):
+            self.run_review(connect_factory=lambda: self._txn_connect(hook))
+
+        self.assertIn(("insert", True), seen, "审计行插入时必须处于事务中")
+        # savepoint 语句本身会开启事务，因此执行前 in_transaction 为 False；
+        # 关键是它出现在审计行插入之前，且随后所有业务写入都在事务内。
+        self.assertEqual("savepoint", seen[0][0], "必须先开 savepoint 再写审计行")
 
 
 class ReviewerFailureIsolationTests(AiReviewSlotTestBase):

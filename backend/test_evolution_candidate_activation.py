@@ -884,5 +884,112 @@ class ApiContractTests(unittest.TestCase):
         self.assertIn(decision.status, (401, 403))
 
 
+class CandidateSourceIsolationTests(unittest.TestCase):
+    """等价去重只能发生在**同一来源**内。
+
+    参数相同不代表结论相同：人工提交、自动进化与挑战者晋级是三份独立的
+    研究证据。若跨来源复用，两次研究会被记到同一条候选上，血缘无法追溯。
+    """
+
+    def _seeded(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.init_params(conn)
+        return conn
+
+    def test_same_params_from_a_different_source_is_not_reused(self):
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.031)
+        manual = EA.create_candidate(
+            conn, params, strategy_id=None, source="manual",
+            reason="人工调整", parent_id=base, validate=True,
+        )
+        # 同参数、同 base，但来源是自动进化：不能复用人工候选。
+        self.assertIsNone(EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base, source="evolve"))
+        # 同来源仍然复用 —— 说明去重本身没有被取消。
+        self.assertEqual(manual["params_id"], EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base, source="manual"))
+
+    def test_same_params_and_source_is_reused(self):
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.032)
+        first = EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve",
+            reason="自动进化", parent_id=base, validate=True,
+        )
+        self.assertEqual(first["params_id"], EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base, source="evolve"))
+
+    def test_caller_without_source_keeps_the_historical_contract(self):
+        """未声明来源的旧调用方仍按参数去重，不被这次改动破坏。"""
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.033)
+        created = EA.create_candidate(
+            conn, params, strategy_id=None, source="manual",
+            reason="人工调整", parent_id=base, validate=True,
+        )
+        self.assertEqual(created["params_id"], EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base))
+
+
+class CandidateEvidenceLineageTests(unittest.TestCase):
+    """同参数不同证据不得复用候选。
+
+    参数相同只说明"结论一样"，不说明"依据一样"。复用会把新一次研究的
+    证据伪装成旧证据：事后看候选的 performance_snapshot，会以为它来自
+    那次旧研究。数据契约是：允许复用相同参数候选时，必须保留每次研究
+    对应的独立证据身份；证据不同就不复用（也无需为了血缘复制相同参数
+    之外的任何东西）。
+    """
+
+    def _seeded(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.init_params(conn)
+        return conn
+
+    def test_same_params_with_different_evidence_is_not_reused(self):
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.034)
+        first_evidence = {"avg_eval_score": 0.55, "learning_samples": 20}
+        created = EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve",
+            reason="自动进化", parent_id=base,
+            performance_snapshot=first_evidence, validate=True,
+        )
+        # 同一份证据：可复用。
+        self.assertEqual(created["params_id"], EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base,
+            source="evolve", evidence=dict(first_evidence)))
+        # 参数完全相同、但证据来自另一次研究：必须另立候选。
+        self.assertIsNone(EA.find_equivalent_candidate(
+            conn, params, strategy_id=None, base_params_id=base,
+            source="evolve", evidence={"avg_eval_score": 0.61, "learning_samples": 26}))
+
+    def test_different_evidence_creates_a_separate_row_with_its_own_snapshot(self):
+        """不复用的结果是两条独立候选，各自保留自己的证据，互不覆盖。"""
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.035)
+        a = EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve", reason="研究A",
+            parent_id=base, performance_snapshot={"avg_eval_score": 0.5}, validate=True)
+        b = EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve", reason="研究B",
+            parent_id=base, performance_snapshot={"avg_eval_score": 0.7}, validate=True)
+        self.assertNotEqual(a["params_id"], b["params_id"])
+        row_a = EA.params_row(conn, a["params_id"])
+        row_b = EA.params_row(conn, b["params_id"])
+        self.assertEqual({"avg_eval_score": 0.5},
+                         EA._loads(row_a["performance_snapshot"], {}))
+        self.assertEqual({"avg_eval_score": 0.7},
+                         EA._loads(row_b["performance_snapshot"], {}))
+
+
 if __name__ == "__main__":
     unittest.main()

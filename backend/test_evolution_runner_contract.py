@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import unittest
 
@@ -241,6 +242,37 @@ class TestEvolutionRunnerContract(unittest.TestCase):
                 ret = main(["--db", db_path])
                 self.assertEqual(ret, 75)
                 mock_run_loop.assert_not_called()
+                self.assertFalse(
+                    os.path.exists(db_path),
+                    "资源许可被拒绝时不得提前创建/初始化学习数据库",
+                )
+
+    def test_readonly_daily_probe_does_not_initialize_missing_schema(self):
+        import sqlite3
+        from evolution_loop_runner import _daily_completed_readonly
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            db_path = os.path.join(d, "probe.sqlite3")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE sentinel(id INTEGER PRIMARY KEY)")
+                conn.commit()
+                before = conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertFalse(_daily_completed_readonly(db_path, "2026-11-04"))
+
+            conn = sqlite3.connect(db_path)
+            try:
+                after = conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(before, after, "准入前的 daily probe 不得执行 schema DDL")
 
     def test_main_runner_non_trading_day_skips_and_exits_0(self):
         """On a non-trading day with --daily, runner exits 0 and run_loop is not called."""
@@ -257,6 +289,7 @@ class TestEvolutionRunnerContract(unittest.TestCase):
         """When today's generation is already completed, runner exits 0 without acquiring lease."""
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             db_path = os.path.join(d, "test_evo.sqlite3")
+            sqlite3.connect(db_path).close()
 
             lease_called = []
 
@@ -341,13 +374,8 @@ class TestEvolutionRunnerContract(unittest.TestCase):
                 code_w1 = main(["--db", db_path, "--daily"])
                 self.assertEqual(code_w1, 75)
 
-            # Assert 0 completed generations persisted in DB
-            conn = sqlite3.connect(db_path)
-            try:
-                count_w1 = conn.execute("SELECT count(*) FROM evolution_loop_state WHERE status='completed'").fetchone()[0]
-                self.assertEqual(count_w1, 0, "Window 1 deferred run must persist 0 completed generations")
-            finally:
-                conn.close()
+            # A denied run must not even create/initialize the learning database.
+            self.assertFalse(os.path.exists(db_path))
 
             # --- Window 2: Heavy lease granted, real run_loop execution ---
             @contextmanager
@@ -370,7 +398,7 @@ class TestEvolutionRunnerContract(unittest.TestCase):
             finally:
                 conn.close()
 
-            # --- Window 3: Real DB query finds today's completed generation, skips lease & run ---
+            # --- Window 3: Read-only DB probe finds today's completed generation ---
             lease_mock = Mock(side_effect=AssertionError("Heavy lease must NOT be acquired when already done"))
             with patch.object(U, "is_trade_day", return_value=True), \
                  patch("evolution_loop_runner.heavy_job_lease", lease_mock), \
