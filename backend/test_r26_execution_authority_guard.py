@@ -133,7 +133,7 @@ class PaperFillsHasASingleProductionWriter(unittest.TestCase):
 
     def test_guard16a_only_the_execution_authority_writes_paper_fills(self):
         offenders = []
-        for path in sorted(BACKEND.glob("*.py")):
+        for path in sorted(BACKEND.rglob("*.py")):
             name = path.name
             if name.startswith("test_") or name in FILL_WRITER_ALLOWLIST:
                 continue
