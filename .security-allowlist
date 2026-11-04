@@ -193,3 +193,14 @@ value:e622955deb702ae65e101ce260a0e3bea2e0a2f0
 # A 包分支被 squash 合并（#319 → 165ceef）后该提交不再从任何分支可达，
 # 扫描器的“自身对象 id”豁免随之失效；它是公开的版本证据，不是凭据。
 value:52eb50d390a05f88b451cf31f12bfb1b3df59391
+
+# 2026-11-04 主线整理记录（docs/PR_RECONCILIATION_2026-11-04.md）引用的提交 id。
+# 它们是本仓库自己的公开提交标识符，用于审计“哪个 head 通过了 CI、最终
+# merge 到哪个 SHA”，不是凭据；扫描器的 LONG_HEX 启发式无法把它们与密钥区分，
+# 因此按既有惯例逐条登记精确值。
+value:79d4390bf366dd9e19e210e350db751d07b89e2d
+value:25d8703eacc4c026c157a54641a0282b20521967
+value:837b8fcde50b61174a370da272fc41283068115c
+value:d14319b41409226c61f0c849cc7b6b5d0fcff488
+value:e957a05f7ce77316da212f6a21d55f408e5375a2
+value:78032d84a394b8be872bb71f62f5464d257a9157
