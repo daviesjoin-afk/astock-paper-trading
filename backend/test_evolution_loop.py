@@ -249,6 +249,49 @@ class ProductionIntegrationTests(unittest.TestCase):
             conn.close()
             os.remove(path)
 
+    def test_production_reuses_equivalent_pending_candidate_on_later_day(self):
+        fd, path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            self._seed(conn)
+            import self_evolution as SE
+
+            first = EL.run_loop(conn, ProductionBackend(), generations=1)
+            self.assertEqual(1, first["generations_run"])
+            candidate_rows = conn.execute(
+                "SELECT id FROM evolution_params WHERE source='evolve' ORDER BY id"
+            ).fetchall()
+            self.assertEqual(1, len(candidate_rows))
+            candidate_id = int(candidate_rows[0][0])
+
+            # Move the cooldown marker into the past to simulate the next scheduled day
+            # while preserving the same recent evidence and unchanged active pointer.
+            conn.execute(
+                "UPDATE evolution_log SET created_at='2000-01-01T00:00:00+08:00' "
+                "WHERE id=(SELECT MAX(id) FROM evolution_log WHERE event_type='evolve')"
+            )
+            conn.commit()
+
+            second = EL.run_loop(conn, ProductionBackend(), generations=1)
+            self.assertEqual(1, second["generations_run"])
+            candidate_rows = conn.execute(
+                "SELECT id FROM evolution_params WHERE source='evolve' ORDER BY id"
+            ).fetchall()
+            self.assertEqual(1, len(candidate_rows), "同一 active base 不得重复堆叠等价候选")
+            self.assertEqual(candidate_id, int(candidate_rows[0][0]))
+
+            generation_state = conn.execute(
+                "SELECT candidate_params_id, candidate_pending_activation "
+                "FROM evolution_loop_state WHERE generation=2"
+            ).fetchone()
+            self.assertEqual(candidate_id, generation_state[0])
+            self.assertEqual(1, generation_state[1])
+            self.assertEqual(candidate_id, SE.validated_pending(conn)[0]["id"])
+        finally:
+            conn.close()
+            os.remove(path)
+
     def test_production_no_crash_with_empty_db(self):
         fd, path = tempfile.mkstemp(suffix=".sqlite3")
         os.close(fd)
