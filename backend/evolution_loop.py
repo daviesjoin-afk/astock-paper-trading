@@ -521,7 +521,7 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
                 ctx["params_id_end"] = active_id
                 if result.get("candidate_params_id") is not None:
                     ctx["candidate_params_id"] = result.get("candidate_params_id")
-                    ctx["candidate_created"] = True
+                    ctx["candidate_created"] = bool(result.get("candidate_created", True))
                     ctx["candidate_validation_state"] = result.get("candidate_validation_state")
                     ctx["candidate_pending_activation"] = True
                 else:
