@@ -12,7 +12,7 @@
 | P1-01 | 周度复盘自动改参 | 保留周报，移除直接写参数；建议改为 advisory | 中 | **已合并 #339（ff789c4）** |
 | P1-02 | close 多个固定重试时间 | 改成持久化数据就绪/续跑，不立即删除 | 中高 | 待观测（已核查，见 §代码核查） |
 | P1-03 | risk 独立 lane + intraday fallback | 在可靠性证据充分后，考虑删除重复兜底触发 | 高 | 待观测 |
-| P1-04 | adaptive_runner + evolution_loop_runner | 统一 orchestration，保留不同算法与证据产物 | 高 | 待分析 |
+| P1-04 | adaptive_runner + evolution_loop_runner | 统一 orchestration，保留不同算法与证据产物 | 高 | 已完成代码核查；分层保留，先修复证据可见性/准入/候选幂等，编排合并另行设计 |
 | P1-05 | selection_runner + paper_selection_runner | 共享同轮行情/因子输入，不合并不同结果/身份 | 中 | 待分析（已核查，见 §代码核查） |
 | P1-06 | fast-entry 30秒任务 | 以增量成交质量/确认率决定保留或删除 | 高 | 待观测（无孤儿任务，见 §代码核查） |
 | P1-07 | close_snapshot_runner 与 close/selection | 验证快照消费者后，评估合并行情刷新 | 中 | 待分析 |
@@ -93,3 +93,29 @@
   对应实现文件，不存在"指向已删除脚本"的条目。
 - 一次性三策略启动器（P1-10）仍在，但它由 `.start_three_strategy_cycle` 标记文件
   保护且幂等，是否清理需生产确认标记状态，不属于代码侧可判定项。
+
+
+### P1-04：adaptive 与 evolution loop 编排关系（2026-11-04）
+
+**结论：保留两条业务阶段，不合并算法；统一编排控制面。**
+
+- `adaptive_engine.run_learning_cycle` 是证据生产阶段：画像、Alpha、成熟 reward、归因、Bandit、风险/选股评估、AI 审核。
+- `ai_review_service._write_audit` 把双 AI 审核审计写入 `dual_ai_tuning_runs`，并尝试写 `self_evolution.track_run` 到 `evolution_tracking`。
+- `evolution_loop.ProductionBackend` 是证据消费与候选生命周期阶段：observe / evaluate / mutate / validate / apply。其 apply 只记录待激活候选，不推进 active 参数指针；真正激活仍走显式授权入口。
+- `self_evolution` 是候选算法与效果归因 owner，不应与 AI 研究能力合并。
+- Cron 分别在 15:35/15:55/16:15 触发 adaptive close，在 16:45/17:05/17:35 触发 evolution loop。两者共用 `resource_guard` 的全局重型任务锁，执行串行化；不是两条可并行运行的独立重型 lane。
+
+**核查发现与本 PR 修复：**
+
+1. AI 审核审计成功但 `evolution_tracking` 写入失败时，旧代码吞掉异常，调用方看不到下游证据缺失。现在返回 `evolution_tracking.status / tracking_id / error_type`，并把状态写入 adaptive run detail；AI 审核主结果仍保持 best-effort，不因追踪失败被误判为失败。
+2. evolution runner 旧顺序是在 `heavy_job_lease` 之前执行 `_connect`、建表和 `SE.init_params`。现在先做只读 daily 探测，再取得 lease，之后才初始化数据库；被拒绝时不创建/写入学习库。
+3. 同一 active base 上已有相同参数的待激活候选时，旧 `self_evolution.evolve` 会在后续交易日重复创建候选。现在先用 owner 的 `find_equivalent_candidate` 去重，代际 runner 复用既有候选，不伪造新候选。
+
+**仍需后续决策，不在本 PR 猜测：**
+
+- `get_performance_metrics(window=20)` 使用最近 20 条 tracking（按 id），没有时间新鲜度上限。它可能是刻意的滚动样本窗口，也可能让长时间无新证据时旧样本继续触发候选；需先定义证据有效期和冷启动策略，再决定是否增加 freshness gate。
+- `run_evolution_loop.sh` 没有传 `--time-budget`，而 runner 默认 generations=1；现有 time-budget 只在代际之间检查，不是单代超时保护。不能把它描述成可靠的单轮墙钟上限。
+- `evolution_loop` 的持久 stage 名称 `apply` 实际表示“记录候选待人工激活”，不是 runtime activation。保留历史 stage key，后续可调整 UI/文档标签，但不得让其看起来已经改动 active 参数。
+- tracking 写入失败目前已可观测，但尚未实现基于不可变参数快照的自动补写/replay。不能简单从 `dual_ai_tuning_runs` 事后重建 tracking，因为 `evolution_params_id` 必须保留原审核时的参数版本身份。
+
+详细说明见 [P1-04 自进化编排审计](../docs/EVOLUTION_ORCHESTRATION_AUDIT_2026-11-04.md)。
