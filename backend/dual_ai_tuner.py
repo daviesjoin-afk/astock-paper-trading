@@ -115,6 +115,7 @@ def _legacy_view(result):
         "single_reviewer_slot": result.get("single_reviewer_slot"),
         "total_latency_ms": result.get("total_latency_ms"),
         "evidence_hash": result.get("evidence_hash"),
+        "evolution_tracking": result.get("evolution_tracking"),
     }
 
 
