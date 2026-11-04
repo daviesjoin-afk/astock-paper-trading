@@ -624,7 +624,6 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
         不绑定 ``_monitor_risk_impl``：只要存在一个调用风险权威的函数，
         它交给权威的上下文就必须带完整标识，且这两个字段不能有默认值。
         """
-        raw = _source("paper_trading.py")
         tree = _tree("paper_trading.py")
         context_calls = [
             call for call in ast.walk(tree)
