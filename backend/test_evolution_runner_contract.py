@@ -246,6 +246,33 @@ class TestEvolutionRunnerContract(unittest.TestCase):
                     "资源许可被拒绝时不得提前创建/初始化学习数据库",
                 )
 
+    def test_readonly_daily_probe_does_not_initialize_missing_schema(self):
+        import sqlite3
+        from evolution_loop_runner import _daily_completed_readonly
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            db_path = os.path.join(d, "probe.sqlite3")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE sentinel(id INTEGER PRIMARY KEY)")
+                conn.commit()
+                before = conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertFalse(_daily_completed_readonly(db_path, "2026-11-04"))
+
+            conn = sqlite3.connect(db_path)
+            try:
+                after = conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(before, after, "准入前的 daily probe 不得执行 schema DDL")
+
     def test_main_runner_non_trading_day_skips_and_exits_0(self):
         """On a non-trading day with --daily, runner exits 0 and run_loop is not called."""
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
