@@ -1277,6 +1277,58 @@ class ApplyGateRegressionTests(AiReviewSlotTestBase):
         self.assertIn("没有可应用的共识提案", message)
 
 
+class EvolutionTrackingObservabilityTests(AiReviewSlotTestBase):
+    """A completed AI review must expose whether its downstream evolution row was persisted."""
+
+    def test_tracking_write_failure_is_visible_without_failing_the_review(self):
+        import self_evolution as SE
+
+        self.configure_slots()
+        with self.stub(self.agreeing), mock.patch.object(
+            SE, "track_run", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            result = self.run_review()
+
+        self.assertEqual("consensus", result["status"])
+        self.assertEqual(
+            {"status": "failed", "tracking_id": None, "error_type": "OperationalError"},
+            result["evolution_tracking"],
+        )
+        audit = self.audit(result["id"])
+        self.assertEqual("consensus", audit["status"])
+        self.assertEqual(
+            0,
+            self.scalar(
+                "SELECT COUNT(*) FROM evolution_tracking WHERE run_id=?",
+                (result["id"],),
+            ),
+        )
+
+    def test_successful_tracking_returns_its_persisted_id_through_legacy_facade(self):
+        import self_evolution as SE
+
+        self.configure_slots()
+        with self.stub(self.agreeing):
+            result = self.run_review()
+
+        tracking = result["evolution_tracking"]
+        self.assertEqual("recorded", tracking["status"])
+        self.assertIsInstance(tracking["tracking_id"], int)
+        with self.factory() as conn:
+            row = SE.get_tracking(conn, tracking["tracking_id"])
+        self.assertEqual(result["id"], row["run_id"])
+
+        legacy = DT._legacy_view(result)
+        self.assertEqual(tracking, legacy["evolution_tracking"])
+
+    def test_single_reviewer_does_not_claim_an_evolution_tracking_write(self):
+        self.configure_slots()
+        with self.stub(self.agreeing):
+            result = self.run_review(review_mode="single", single_reviewer_slot="ai1")
+        self.assertEqual("not_required", result["evolution_tracking"]["status"])
+        self.assertIsNone(result["evolution_tracking"]["tracking_id"])
+
+
 class ReviewerFailureIsolationTests(AiReviewSlotTestBase):
     """T53–T62：reviewer 可靠性失败不得污染策略学习。
 
