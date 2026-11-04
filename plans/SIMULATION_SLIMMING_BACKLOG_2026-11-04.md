@@ -10,11 +10,12 @@
 | ID | 候选 | 初步动作 | 风险 | 状态 |
 |---|---|---|---|---|
 | P1-01 | 周度复盘自动改参 | 保留周报，移除直接写参数；建议改为 advisory | 中 | **已合并 #339（ff789c4）** |
+| P1-01A | 周报收益口径与职责文档 | 修正周收益/累计收益混用；更新参数写入 owner 说明；不虚构 advisory 直达 apply | 中 | 待修正（PR #339 审核发现） |
 | P1-02 | close 多个固定重试时间 | 改成持久化数据就绪/续跑，不立即删除 | 中高 | 待观测（已核查，见 §代码核查） |
 | P1-03 | risk 独立 lane + intraday fallback | 在可靠性证据充分后，考虑删除重复兜底触发 | 高 | 待观测 |
-| P1-04 | adaptive_runner + evolution_loop_runner | 统一 orchestration，保留不同算法与证据产物 | 高 | 待分析 |
+| P1-04 | adaptive_runner + evolution_loop_runner | 保留证据生产者→候选生命周期消费者；只评估统一调度/观测/资源管理，不合并业务阶段 | 高 | 已完成静态关系核查，待运行数据 |
 | P1-05 | selection_runner + paper_selection_runner | 共享同轮行情/因子输入，不合并不同结果/身份 | 中 | 待分析（已核查，见 §代码核查） |
-| P1-06 | fast-entry 30秒任务 | 以增量成交质量/确认率决定保留或删除 | 高 | 待观测（无孤儿任务，见 §代码核查） |
+| P1-06 | fast-entry 30秒任务 | 以增量成交质量/确认率决定保留或删除 | 高 | 待观测（仅排除孤儿 Cron，未证明业务收益） |
 | P1-07 | close_snapshot_runner 与 close/selection | 验证快照消费者后，评估合并行情刷新 | 中 | 待分析 |
 | P1-08 | 竞价跟踪 | 暂保留；有 AI review / auction_analysis 消费者 | 中 | 保留 |
 | P1-09 | dashboard refresh | 保留持久队列，测量 idle tick 后决定是否减少触发频次 | 低 | 待观测 |
@@ -43,6 +44,32 @@
 - 交易账本、策略版本、历史审计与 PIT 证据不受影响。
 - exact-head CI 全绿。
 - 性能改善有同口径数据支持。
+### P1-01A：周报收益口径与职责文档
+
+**结论：P1-01 的主要安全改造正确，但需要一个小型修正 PR。**
+
+- `_weekly_review` 当前 `ret = latest_nav / reference_capital - 1` 是累计收益，报告中的“累计收益”表述正确；但参数建议文字使用“本周正/负收益”，口径不一致。
+- 建议按 ISO 周起点前最后一个有效 NAV 作为周初基准，计算 week-to-date return；没有周内 NAV 或可证明的周初基准时，不生成方向性参数建议。
+- 当前 `max_dd` 使用账户全部 NAV 历史，建议明确标为“历史最大回撤”，不要称作滚动/本周回撤。
+- `docs/LEDGER_OWNERSHIP.md` 仍把周度复盘列为参数写入的业务决策者，需要改成“仅生成 advisory；不拥有参数采纳/回滚权”。
+- 周报 advisory 目前不是 `evolution_apply.apply_tuner_proposals` 的可直接输入。文档应说明“文本建议不自动进入正式候选”，除非另行实现经过验证的转换/审批链。
+
+### P1-04：adaptive 与 evolution loop 的真实关系
+
+**结论：不能把两个 runner 认定为重复流程后直接合并或删除。**
+
+源码显示它们更接近上游证据生产者与下游候选生命周期消费者：
+
+1. `adaptive_runner --session close` 调用 `adaptive_engine.run_learning_cycle`，完成市场画像、alpha 样本与收益成熟、数据集、reward、reward attribution、bandit 决策、risk/selection evolution 和双 AI 调参。
+2. `run_learning_cycle` 的 dual-AI 调参结果通过 `dual_ai_tuner.track_run` 写入 `evolution_tracking`，代码注释明确说明供 `evolution_loop` 的 EVALUATE / MUTATE 消费。
+3. `evolution_loop.ProductionBackend` 不执行 AI 网络调用；它读取 `self_evolution` 指标、调用 `auto_evolve_if_needed` 生成候选、验证候选，并将其保留为 `pending_activation`。
+4. `evolution_loop.apply` 不激活 runtime 参数；正式激活仍走显式人工确认、候选验证与 stale-CAS 入口。
+
+因此：保留两个不同业务阶段。可以研究统一 task metadata、调度入口、观测、lease/资源管理，但不能把上游证据生产与下游参数候选生命周期压成一个不可区分的步骤，也不能删掉 `evolution_tracking` 的生产/消费关系。
+
+在生产数据可用后，先统计每个 adaptive run 的 tracking 产出、evolution loop 的消费数、候选生成/验证/激活数量、跳过原因和耗时，再决定是否简化重试或调度。
+
+
 ## 代码核查（2026-11-04，master `ff789c4`）
 
 以下结论来自源码与调度表实测，不是推测。复核者可按列出的位置自行验证。
