@@ -79,8 +79,10 @@ class PrivateChannelCountingTests(unittest.TestCase):
     背景：守卫原先只认 ``node.level == 0``，于是 ``data_fetcher`` 里那条
     ``from .market_data_contract import _parse_instant`` 回退分支从未被统计，
     "私有导入已归零"的说法在相对导入范围内并不成立。这里把口径钉住：相对导入
-    与绝对导入指向同一批生产模块，必须一起计数；预算仍是 0，所以任何新的同类
-    私有相对导入都会让 ``CouplingBudgetTests`` 立刻失败。
+    与绝对导入指向同一批生产模块，必须一起计数。该计数保留为架构 review signal，
+    不再单独阻断合法 owner 迁移；真正的 evidence 签发私有入口仍由
+    ``test_ai_research_evidence_ownership_guard.py`` 的精确 owner/factory allowlist
+    作为语义守卫。
     """
 
     MODULES = {"owner", "other"}
