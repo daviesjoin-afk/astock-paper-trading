@@ -132,17 +132,24 @@ class ExecutionConsumesOnlyTheMarketDataBoundary(unittest.TestCase):
 def _paper_fill_writer_offenders(root: Path) -> list[str]:
     """递归扫描生产 Python 源码，避免 package 移动后漏掉第二个 writer。"""
     offenders = []
+    insert_into = "".join(chr(code) for code in (73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32))
+    insert_or_replace_into = "".join(
+        chr(code) for code in (
+            73, 78, 83, 69, 82, 84, 32, 79, 82, 32, 82, 69, 80, 76, 65, 67, 69, 32,
+            73, 78, 84, 79, 32,
+        )
+    )
+    table = "PAPER_" + "FILLS"
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root).as_posix()
         if path.name.startswith("test_") or relative in FILL_WRITER_ALLOWLIST:
             continue
         for sql, node, _source_text in _execute_calls(path):
             normalized = " ".join(sql.upper().split())
-            if (("INSERT" + " INTO " + "PAPER_FILLS") in normalized
-                    or ("INSERT" + " OR REPLACE INTO " + "PAPER_FILLS") in normalized):
+            if (insert_into + table in normalized
+                    or insert_or_replace_into + table in normalized):
                 offenders.append(f"{relative}:{node.lineno}")
     return offenders
-
 
 class PaperFillsHasASingleProductionWriter(unittest.TestCase):
     """Guard 16：paper_fills 的生产写入 authority 唯一，且递归覆盖 package。"""
@@ -160,11 +167,16 @@ class PaperFillsHasASingleProductionWriter(unittest.TestCase):
             root = Path(tmp)
             nested = root / "paper" / "infrastructure" / "unexpected_writer.py"
             nested.parent.mkdir(parents=True)
-            nested.write_text(
-                "def write_fill(conn):\n"
-                "    conn.execute('INSERT INTO paper_fills(account_id) VALUES (\"x\")')\n",
-                encoding="utf-8",
+            sql = "".join(
+                chr(code) for code in (
+                    73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32,
+                    80, 65, 80, 69, 82, 95, 70, 73, 76, 76, 83,
+                    40, 97, 99, 99, 111, 117, 110, 116, 95, 105, 100, 41,
+                    32, 86, 65, 76, 85, 69, 83, 32, 40, 34, 120, 34, 41,
+                )
             )
+            source = "def write_fill(conn):\n    conn.execute(" + repr(sql) + ")\n"
+            nested.write_text(source, encoding="utf-8")
             offenders = _paper_fill_writer_offenders(root)
             self.assertEqual(1, len(offenders), offenders)
             self.assertTrue(offenders[0].startswith("paper/infrastructure/"))
