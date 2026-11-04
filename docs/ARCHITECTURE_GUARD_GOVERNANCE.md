@@ -132,3 +132,55 @@ G0/G1 保护的是“系统必须做到什么”，不是“必须由哪个旧�
 - 暂不修改交易规则、调度行为、数据库 schema 或生产数据。
 
 后续 P2 的首个工程任务是 package-aware guard scanner 与 capability owner registry。
+
+## 9. 现有守卫分类清单
+
+按文件的真实测试类与断言目标分类。计数为该文件内 `test_` 方法数量。
+分类口径见 §1；"G3 待退出"表示当前仍按旧文件名/路径定位，随 P2 owner registry 改写。
+
+| 守卫文件 | 测试数 | 主要类别 | 说明 |
+| --- | ---: | --- | --- |
+| `test_paper_trading_architecture_guard.py` | 96 | G0/G1 为主，含 G3 | 14 个测试类，逐类见下表 |
+| `test_r26_execution_authority_guard.py` | 15 | G0/G1 | 唯一成交写入、风险去重判据、source_fill lineage |
+| `test_ai_research_evidence_ownership_guard.py` | 23 | G0/G1 | 研究证据 owner/factory allowlist、AI 不得直接授权 |
+| `test_tradability_observation_architecture_guard.py` | 33 | G1 | 可交易性观测的事实来源与写入边界 |
+| `test_tradability_position_shadow_architecture_guard.py` | 55 | G1 | 持仓影子证据的只读与来源约束 |
+| `test_tradability_architecture_guard.py` | 24 | G1 | TradabilityArchive 边界 |
+| `test_tradability_shadow_architecture_guard.py` | 23 | G1 | 影子对比记录边界 |
+| `test_retired_strategy_copy_guard.py` | 10 | G0/G3 | 退役策略不得被隐式复制回来 |
+| `test_r27b3_canonical_research_api_guard.py` | 9 | G1 | canonical research 单写入 |
+| `test_learning_architecture_guard.py` | 8 | G1 | 学习数据 canonical 分区 |
+| `test_deploy_profile_guard.py` | 5 | G0 | 部署 profile 与容器预算 |
+| `test_strategy_entry_guardrails.py` | 5 | G0 | 策略入场护栏 |
+| `test_pr10_guard_negative.py` | 3 | G2（负向控制） | 验证守卫本身会拒绝违例 |
+| `test_architecture_boundary_audit.py` | 10 | G0（导入环/基础层）+ G2（结构指标） | 结构指标只报告，导入方向 hard fail |
+
+### `test_paper_trading_architecture_guard.py` 逐类分类
+
+| 测试类 | 数 | 类别 | 保护的不变量 |
+| --- | ---: | --- | --- |
+| `DomainModulesNeverDependOnPaperTrading` | 2 | G0 | 领域模块不得反向依赖主引擎 |
+| `RiskStateCrudStaysInItsOwner` | 2 | G0 | 运行时 CRUD 不得重回主引擎 |
+| `RiskStateModuleIsAPureDomainBoundary` | 2 | G1 | 风险状态模块保持纯边界 |
+| `RiskDecisionModuleIsDeterministic` | 5 | G0 | 退出决策无自带 I/O 与墙钟 |
+| `EveryProductionSellPathFinalizesTheEpisode` | 2 | G0 | episode 收尾单一判据 |
+| `RiskScanStateIsACycleOwnedBoundary` | 8 | G0 | 风险扫描身份零 I/O、cycle 绑定 |
+| `PositionReviewIsProvenanceBound` | 8 | G0 | position review 的 episode 归属 |
+| `ReplacementIsAsOfAndCycleBound` | 12 | G0 | replacement 的 as-of 与 cycle 有界 |
+| `EntryCapitalPlanningIsBounded` | 12 | G0 | 资金预算 (cycle, as-of) 有界、单一 commit |
+| `SellFillCommitConvergenceIsBounded` | 6 | G0 | SELL 多路径但成交提交唯一 |
+| `RiskApplicationServiceBoundary` | 10 | G0/G1 | 已认领风险轮次归应用服务所有 |
+| `PortfolioReadModelIsCycleAsOfBounded` | 7 | G0 | 组合读模型只读、无 current 回退 |
+| `SelectionProvenanceIsVersionPinned` | 20 | G0 | 策略/选股 provenance 版本钉住 |
+
+### 本轮已移除 / 已改写
+
+| 项 | 类别 | 处理 |
+| --- | --- | --- |
+| `test_guard12b_paper_trading_facade_is_thin` | G2/G3 | 删除：40 行上限与"必须委托旧 service"只约束形状 |
+| `test_guard12g_service_is_not_a_monolith` | G2 | 删除：925 行上限只是观察值 |
+| `test_no_metric_regresses` 等 4 个预算断言 | G2 | 删除：数字天花板不阻止合法重构 |
+| `test_guard7f/7g` 中对 `_monitor_risk_impl` 的绑定 | G3 | 改写：按"谁调用风险权威"定位，语义不变 |
+| `paper_fills` 唯一 writer 扫描 | G0 | 加强：递归子目录 + 覆盖 `query_rows` 等执行包装 |
+| `guard16_allowlist_stays_minimal_and_named` | G0 | 新增：白名单扩容必须改断言，review 可见 |
+| `guard16_wrapped_sql_execution_is_scanned` | G0 | 新增负向：经 `query_rows` 包装的写入必须被发现 |
