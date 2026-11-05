@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{Side, Signal, Quote, INITIAL_CASH_CENTS, DecisionStatus};
+use crate::domain::{Side, Signal, Quote, ExecutionLiquidity, INITIAL_CASH_CENTS, DecisionStatus};
 
 fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
@@ -17,6 +17,11 @@ fn evidence(req: &SimulationRequest) -> QuoteImport {
     let day = &req.decision_at[..10];
     QuoteImport {
         schema_version: 1, available_at: format!("{day}T09:59:31+08:00"),
+        execution: Some(ExecutionLiquidity {
+            schema_version: 1, quote_ref: req.quote_ref.clone(),
+            order_side: req.signal.side.clone(), price_cents: 1234, available_quantity: 800,
+            observed_at: format!("{day}T09:59:30+08:00"),
+        }),
         quote: Quote {
             symbol: req.signal.symbol.clone(), price_cents: 1234,
             observed_at: format!("{day}T09:59:30+08:00"),
@@ -52,6 +57,163 @@ fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
         assert_eq!(view.runs_total, 1);
         let replay = db.verify_replay().unwrap();
         assert_eq!((replay.runs_verified, replay.fills_verified), (1, 0));
+    }
+}
+
+#[test]
+fn execution_import_is_strict_and_all_execution_fields_are_immutable() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-30", "execution-import", Side::Buy);
+    let good = evidence(&req);
+    let changes = db.conn.total_changes();
+    for field in ["quote_ref", "order_side", "price_cents", "available_quantity", "observed_at"] {
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["execution"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<QuoteImport>(raw).is_err());
+    }
+    for field in ["received_at", "trust_level", "provider_response_id"] {
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["execution"][field] = serde_json::json!("forged");
+        assert!(serde_json::from_value::<QuoteImport>(raw).is_err());
+    }
+    let mut invalid = Vec::new();
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().schema_version = 0; invalid.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().price_cents = 0; invalid.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().available_quantity = -1; invalid.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().quote_ref.quote_id = "mismatch".into(); invalid.push(bad);
+    for bad in invalid {
+        for _ in 0..2 { assert!(db.ingest_quote(bad.clone()).is_err()); }
+    }
+    assert_eq!(db.conn.total_changes(), changes);
+    let saved = db.ingest_quote(good.clone()).unwrap();
+    assert_eq!(saved.schema_version, 3);
+    assert_eq!(saved.execution, good.execution);
+    assert_eq!(db.ingest_quote(good.clone()).unwrap(), saved);
+    let mut variants = Vec::new();
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().price_cents += 1; variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().available_quantity += 1; variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().order_side = Side::Sell; variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().observed_at = "2026-10-30T09:59:29+08:00".into(); variants.push(bad);
+    let mut bad = good; bad.execution = None; variants.push(bad);
+    for bad in variants {
+        for _ in 0..2 { assert!(matches!(db.ingest_quote(bad.clone()), Err(StoreError::Conflict(_)))); }
+    }
+    assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(saved));
+    assert_eq!(db.state(None).unwrap().runs_total, 0);
+}
+
+#[test]
+fn insufficient_capacity_rejection_is_pinned_and_a_new_identity_can_fill() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-30", "capacity-short", Side::Buy);
+    let mut short = evidence(&req);
+    short.execution.as_mut().unwrap().available_quantity = 799;
+    db.ingest_quote(short).unwrap();
+    let first = db.submit(req.clone()).unwrap();
+    assert_eq!(first.outcome.reason, "insufficient_execution_liquidity");
+    assert!(first.outcome.fill.is_none());
+    assert_eq!(first.outcome.cash_after_cents, INITIAL_CASH_CENTS);
+    for _ in 0..2 {
+        assert!(db.submit(req.clone()).unwrap().duplicate);
+        assert!(matches!(db.ingest_quote(evidence(&req)), Err(StoreError::Conflict(_))));
+        assert_eq!(db.state(Some("2026-10-30")).unwrap().cash_cents, INITIAL_CASH_CENTS);
+        assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    }
+    let valid = request("2026-10-30", "capacity-full", Side::Buy);
+    let filled = ingest_and_submit(&mut db, valid.clone());
+    assert_eq!(filled.outcome.fill.as_ref().unwrap().quantity, 800);
+    assert!(db.submit(valid).unwrap().duplicate);
+    assert_eq!(db.submit(req).unwrap().outcome, first.outcome);
+    let report = db.verify_replay().unwrap();
+    assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
+    assert_eq!(db.state(Some("2026-10-30")).unwrap().runs_total, 2);
+}
+
+#[test]
+fn one_sided_quote_cannot_multiply_fills_across_signals_strategies_or_reopen() {
+    let file = DiskDatabase::new();
+    let historical;
+    let latest;
+    let replay;
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let buy = request("2026-10-30", "one-buy", Side::Buy);
+        let first = ingest_and_submit(&mut db, buy.clone());
+        let mut other = buy.clone();
+        other.cycle_id = "other-cycle".into();
+        other.strategy_version_id = "other-strategy".into();
+        other.signal_id = "other-buy".into();
+        assert_eq!(db.submit(other).unwrap().outcome.reason, "position_already_open");
+        historical = db.state(Some("2026-10-30")).unwrap();
+        let sell = request("2026-11-02", "one-sell", Side::Sell);
+        let sold = ingest_and_submit(&mut db, sell.clone());
+        let mut other_sell = sell.clone();
+        other_sell.cycle_id = "other-cycle".into();
+        other_sell.strategy_version_id = "other-strategy".into();
+        other_sell.signal_id = "other-sell".into();
+        assert_eq!(db.submit(other_sell).unwrap().outcome.reason, "no_t1_sellable_lot");
+        let mut tomorrow = buy.clone();
+        tomorrow.signal_id = "reuse-next-day".into();
+        tomorrow.decision_at = sell.decision_at.clone();
+        assert_eq!(db.submit(tomorrow).unwrap().outcome.reason, "stale_quote");
+        assert_eq!(db.submit(buy.clone()).unwrap().outcome, first.outcome);
+        assert_eq!(db.submit(sell).unwrap().outcome, sold.outcome);
+        assert_eq!(db.ingest_quote(evidence(&buy)).unwrap(), first.evidence.unwrap());
+        let mut uses = std::collections::BTreeMap::new();
+        for run in db.runs(100).unwrap() {
+            if let Some(fill) = run.outcome.fill {
+                assert!(fill.quantity <= run.evidence.unwrap().execution.unwrap().available_quantity);
+                *uses.entry((run.request.quote_ref.source, run.request.quote_ref.quote_id)).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(uses.len(), 2);
+        assert!(uses.values().all(|&count| count == 1));
+        latest = db.state(None).unwrap();
+        assert!(latest.positions.is_empty());
+        assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
+        replay = db.verify_replay().unwrap();
+        assert_eq!((replay.runs_verified, replay.fills_verified), (5, 2));
+    }
+    let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    for _ in 0..2 {
+        assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
+        assert_eq!(db.state(None).unwrap(), latest);
+        assert_eq!(db.verify_replay().unwrap(), replay);
+    }
+}
+
+#[test]
+fn changed_execution_evidence_is_detected_without_rewriting_facts() {
+    for (field, value) in [
+        ("price_cents", serde_json::json!(1250)), ("available_quantity", serde_json::json!(799)),
+        ("order_side", serde_json::json!("sell")), ("observed_at", serde_json::json!("2026-10-30T09:59:29+08:00")),
+    ] {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let req = request("2026-10-30", "tamper-execution", Side::Buy);
+        let first = ingest_and_submit(&mut db, req);
+        let mut raw = serde_json::to_value(first.evidence.unwrap()).unwrap();
+        raw["execution"][field] = value;
+        db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [raw.to_string()]).unwrap();
+        let changes = db.conn.total_changes();
+        for _ in 0..2 { assert!(db.verify_replay().is_err()); }
+        assert_eq!(db.conn.total_changes(), changes);
+        assert_eq!(db.state(None).unwrap().runs_total, 1);
+    }
+}
+
+#[test]
+fn prior_reference_price_policy_file_is_refused_without_disk_mutation() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        ingest_and_submit(&mut db, request("2026-10-30", "old-policy", Side::Buy));
+        db.conn.execute("UPDATE v2_meta SET value='v2-paper-policy-4' WHERE key='policy_version'", []).unwrap();
+    }
+    Connection::open(file.path()).unwrap().execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+    let before = disk_snapshot(&file);
+    for _ in 0..2 {
+        assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err());
+        assert_eq!(disk_snapshot(&file), before);
     }
 }
 
@@ -668,6 +830,7 @@ fn market_input(day: &str, time: &str, id: &str) -> (SimulationRequest, QuoteImp
     let mut input = evidence(&req);
     input.quote.observed_at = (at - chrono::Duration::seconds(30)).to_rfc3339();
     input.available_at = (at - chrono::Duration::seconds(29)).to_rfc3339();
+    input.execution.as_mut().unwrap().observed_at = input.quote.observed_at.clone();
     (req, input)
 }
 

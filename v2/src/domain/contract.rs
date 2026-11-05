@@ -10,7 +10,7 @@ pub const COMMISSION_BPS: i64 = 3;
 pub const MIN_COMMISSION_CENTS: i64 = 500;
 pub const SELL_STAMP_DUTY_BPS: i64 = 5;
 pub const MAX_QUOTE_AGE_SECONDS: i64 = 180;
-pub const POLICY_VERSION: &str = "v2-paper-policy-4";
+pub const POLICY_VERSION: &str = "v2-paper-policy-5";
 
 #[derive(Debug)]
 pub struct RuleError(pub String);
@@ -40,6 +40,7 @@ pub struct Signal {
 #[serde(deny_unknown_fields)]
 pub struct Quote {
     pub symbol: String,
+    /// Offline reference only; execution requires a separate directional level.
     pub price_cents: i64,
     pub observed_at: String,
     pub source: String,
@@ -76,6 +77,20 @@ pub struct QuoteImport {
     pub schema_version: u32,
     pub available_at: String,
     pub quote: Quote,
+    #[serde(default)]
+    pub execution: Option<ExecutionLiquidity>,
+}
+
+/// One offline price level for one order direction, never provider authentication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLiquidity {
+    pub schema_version: u32,
+    pub quote_ref: QuoteRef,
+    pub order_side: Side,
+    pub price_cents: i64,
+    pub available_quantity: i64,
+    pub observed_at: String,
 }
 
 /// No authenticated provider is implemented. Unknown grades fail deserialization.
@@ -95,8 +110,11 @@ pub struct QuoteEvidence {
     pub trust_level: QuoteTrust,
     pub provider_published_at: Option<String>,
     pub received_at: String,
+    #[serde(default)]
+    pub execution: Option<ExecutionLiquidity>,
 }
 
+/// Simulated result; its run pins the quote identity and execution evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fill {
     pub symbol: String,

@@ -59,4 +59,12 @@ run继续固定完整证据及缺失，拒绝也落账；回放不用后补或�
 重复导入/信号、跨信号容量前提、SQLite中途回滚/重开、篡改检测、固定回放与PIT。
 Release、Python、锁定前端、HTTP/SQLite和全仓质量/安全/Docker/浏览器均以新HEAD检查为准。
 
-本次首次提交仅含方案和红测试，尚未实现；最终结果与完整HEAD/CI证据记录于PR说明。
+首个提交 `0a0a3df56ddc514b8d886082b30d3475a25db690` 仅含方案和红测试，
+[真实Rust日志](https://github.com/daviesjoin-afk/astock-paper-trading/actions/runs/42033901317/job/127266949628)
+记录53项通过、2项失败；两项均为实际Filled而预期Rejected。
+后续实现复用现有职责，没有新增业务模块/依赖或改Fill/PortfolioState，完整新HEAD验收记录于PR说明。
+HTTP样本参考价1234分、执行价1250分、容量700股，验证实际按执行价计算并成交700股。
+benchmark生成器升级v2，显式提供单向离线价和容量；原v1测量记录不改写。
+
+使用全新文件，例如在v2目录运行 `ASTOCK_V2_DB=./v2-execution-paper.sqlite3 cargo run --locked`。
+旧policy4文件不修改，保留原程序回放；本次不会自动迁移或重算它。

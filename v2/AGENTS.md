@@ -42,6 +42,8 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
   dates and unsupported auctions reject. Replay uses the recorded snapshots;
   unsupported or changed snapshot versions fail rather than reinterpret history.
 - Trading remains simulated. No broker endpoints or live-order APIs.
+- A reference price cannot fill. Require matching, fresh directional execution
+  evidence and capacity for the whole candidate; no reference fallback or partial fill.
 
 ## Small-change protocol
 

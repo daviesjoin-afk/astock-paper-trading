@@ -21,9 +21,15 @@ fn request(day: &str, side: Side) -> SimulationRequest {
 
 fn evidence(day: &str) -> QuoteEvidence {
     QuoteEvidence {
-        schema_version: 2, available_at: format!("{day}T09:59:31+08:00"),
+        schema_version: 3, available_at: format!("{day}T09:59:31+08:00"),
         trust_level: QuoteTrust::OfflineFixture, provider_published_at: None,
         received_at: "2026-11-04T10:00:00+08:00".into(),
+        execution: Some(ExecutionLiquidity {
+            schema_version: 1,
+            quote_ref: QuoteRef { source: "offline-fixture".into(), quote_id: "q-1".into() },
+            order_side: Side::Buy, price_cents: 1234, available_quantity: 800,
+            observed_at: format!("{day}T09:59:30+08:00"),
+        }),
         quote: Quote {
             symbol: "600000.SH".into(), price_cents: 1234,
             observed_at: format!("{day}T09:59:30+08:00"),
@@ -60,13 +66,121 @@ fn reference_quote_without_execution_evidence_cannot_fill() {
 }
 
 #[test]
+fn execution_price_and_capacity_bound_the_whole_candidate() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let req = request("2026-10-30", Side::Buy);
+    for capacity in [0, 35, 600, 699, 700, 701] {
+        let mut quote = evidence("2026-10-30");
+        let level = quote.execution.as_mut().unwrap();
+        level.price_cents = 1250; // Reference remains 1234; budget yields 700.
+        level.available_quantity = capacity;
+        let out = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
+        assert_eq!(out, decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap());
+        if capacity < 700 {
+            assert_eq!(out.reason, "insufficient_execution_liquidity");
+            assert_eq!(out.status, DecisionStatus::Rejected);
+            assert!(out.fill.is_none());
+            assert_eq!(out.cash_after_cents, state.cash_cents);
+        } else {
+            let fill = out.fill.unwrap();
+            assert_eq!(out.status, DecisionStatus::Filled);
+            assert_eq!((fill.price_cents, fill.quantity), (1250, 700));
+        }
+    }
+    let buy = decide(&state, &req, Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap().fill.unwrap();
+    let mut held = state;
+    held.apply(&buy).unwrap();
+    for capacity in [799, 800] {
+        let mut quote = evidence("2026-11-02");
+        let level = quote.execution.as_mut().unwrap();
+        level.order_side = Side::Sell;
+        level.price_cents = 1300;
+        level.available_quantity = capacity;
+        let sell = request("2026-11-02", Side::Sell);
+        let out = decide(&held, &sell, Some(&quote), &calendar(), &sessions()).unwrap();
+        assert_eq!(out, decide(&held, &sell, Some(&quote), &calendar(), &sessions()).unwrap());
+        if capacity == 799 {
+            assert_eq!(out.reason, "insufficient_execution_liquidity");
+            assert!(out.fill.is_none());
+        } else {
+            let fill = out.fill.unwrap();
+            assert_eq!((fill.price_cents, fill.quantity), (1300, 800));
+        }
+    }
+}
+
+#[test]
+fn execution_direction_visibility_and_precise_age_fail_closed() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let req = request("2026-10-30", Side::Buy);
+    let mut wrong_side = evidence("2026-10-30");
+    wrong_side.execution.as_mut().unwrap().order_side = Side::Sell;
+    let mut boundary = evidence("2026-10-30");
+    boundary.execution.as_mut().unwrap().observed_at = "2026-10-30T09:57:00+08:00".into();
+    let mut stale = boundary.clone();
+    stale.execution.as_mut().unwrap().observed_at = "2026-10-30T09:56:59.999+08:00".into();
+    let mut yesterday = boundary.clone();
+    yesterday.execution.as_mut().unwrap().observed_at = "2026-10-29T10:00:00+08:00".into();
+    let mut future = boundary.clone();
+    future.available_at = "2026-10-30T10:00:00.001+08:00".into();
+    future.execution.as_mut().unwrap().observed_at = future.available_at.clone();
+    for (quote, reason) in [
+        (wrong_side, "execution_side_mismatch"), (stale, "stale_execution_evidence"),
+        (yesterday, "stale_execution_evidence"), (future, "quote_not_yet_available"),
+    ] {
+        for _ in 0..2 {
+            let out = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
+            assert_eq!(out.reason, reason);
+            assert_eq!(out.status, DecisionStatus::Rejected);
+            assert!(out.fill.is_none());
+            assert_eq!(out.cash_after_cents, state.cash_cents);
+        }
+    }
+    let out = decide(&state, &req, Some(&boundary), &calendar(), &sessions()).unwrap();
+    assert_eq!(out.status, DecisionStatus::Filled);
+    assert_eq!(out, decide(&state, &req, Some(&boundary), &calendar(), &sessions()).unwrap());
+}
+
+#[test]
+fn malformed_execution_cannot_bypass_direct_domain_validation() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let req = request("2026-10-30", Side::Buy);
+    let good = evidence("2026-10-30");
+    for field in ["schema_version", "quote_ref", "order_side", "price_cents", "available_quantity", "observed_at"] {
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["execution"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<QuoteEvidence>(raw).is_err(), "{field}");
+    }
+    for field in ["received_at", "trust_level", "provider_request_id"] {
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["execution"][field] = serde_json::json!("forged");
+        assert!(serde_json::from_value::<QuoteEvidence>(raw).is_err());
+    }
+    let mut variants = Vec::new();
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().schema_version = 99; variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().quote_ref.quote_id = "other".into(); variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().quote_ref.source = "provider".into(); variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().price_cents = 0; variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().available_quantity = -1; variants.push(bad);
+    let mut bad = good.clone(); bad.execution.as_mut().unwrap().observed_at = "2026-10-30T10:00:00+00:00".into(); variants.push(bad);
+    let mut bad = good; bad.execution.as_mut().unwrap().observed_at = "2026-10-30T09:59:32+08:00".into(); variants.push(bad);
+    for bad in variants {
+        for _ in 0..2 { assert!(decide(&state, &req, Some(&bad), &calendar(), &sessions()).is_err()); }
+    }
+}
+
+#[test]
 fn t_plus_one_blocks_sale_on_purchase_day_then_allows_next_day() {
     let mut state = PortfolioState::new(INITIAL_CASH_CENTS);
     let buy = decide(&state, &request("2026-10-30", Side::Buy), Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap().fill.unwrap();
     state.apply(&buy).unwrap();
-    assert_eq!(decide(&state, &request("2026-10-30", Side::Sell), Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap().reason,
+    let mut today = evidence("2026-10-30");
+    today.execution.as_mut().unwrap().order_side = Side::Sell;
+    assert_eq!(decide(&state, &request("2026-10-30", Side::Sell), Some(&today), &calendar(), &sessions()).unwrap().reason,
                "no_t1_sellable_lot");
-    let sell = decide(&state, &request("2026-11-02", Side::Sell), Some(&evidence("2026-11-02")), &calendar(), &sessions()).unwrap();
+    let mut tomorrow = evidence("2026-11-02");
+    tomorrow.execution.as_mut().unwrap().order_side = Side::Sell;
+    let sell = decide(&state, &request("2026-11-02", Side::Sell), Some(&tomorrow), &calendar(), &sessions()).unwrap();
     assert_eq!(sell.status, DecisionStatus::Filled);
     state.apply(sell.fill.as_ref().unwrap()).unwrap();
     assert_eq!(state.quantity("600000.SH"), 0);
@@ -224,6 +338,7 @@ fn market_request(day: &str, time: &str) -> (SimulationRequest, QuoteEvidence) {
     let mut quote = evidence(day);
     quote.quote.observed_at = (at - chrono::Duration::seconds(30)).to_rfc3339();
     quote.available_at = (at - chrono::Duration::seconds(29)).to_rfc3339();
+    quote.execution.as_mut().unwrap().observed_at = quote.quote.observed_at.clone();
     (req, quote)
 }
 

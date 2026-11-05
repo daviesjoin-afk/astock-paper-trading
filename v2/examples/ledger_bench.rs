@@ -61,7 +61,7 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         let day = days[day_index].to_string();
         let symbol = format!("{:06}.SH", 600000 + if fills { i % 25 } else { 0 });
         let req = SimulationRequest {
-            schema_version: 2, cycle_id: "ledger-bench-v1".into(),
+            schema_version: 2, cycle_id: "ledger-bench-v2".into(),
             strategy_version_id: "offline-fixed-v1".into(), signal_id: format!("signal-{i}"),
             decision_at: format!("{day}T10:00:00+08:00"),
             signal: Signal { symbol: symbol.clone(),
@@ -70,6 +70,12 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         };
         let input = QuoteImport {
             schema_version: 1, available_at: format!("{day}T10:00:00+08:00"),
+            execution: Some(ExecutionLiquidity {
+                schema_version: 1, quote_ref: req.quote_ref.clone(),
+                order_side: req.signal.side.clone(), price_cents: 100,
+                available_quantity: 1_000_000,
+                observed_at: format!("{day}T09:59:59+08:00"),
+            }),
             quote: Quote { symbol, price_cents: 100,
                 observed_at: format!("{day}T09:59:59+08:00"),
                 source: req.quote_ref.source.clone(), quote_id: req.quote_ref.quote_id.clone(),
@@ -167,7 +173,7 @@ fn main() -> Result<()> {
         }
     }
     println!("{}", serde_json::to_string_pretty(&json!({
-        "generator": "ledger-bench-v1", "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "generator": "ledger-bench-v2", "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
         "logical_cpus": std::thread::available_parallelism()?.get(),
         "sqlite": rusqlite::version(), "cases": cases

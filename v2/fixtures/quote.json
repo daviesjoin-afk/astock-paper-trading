@@ -10,5 +10,16 @@
     "tradable": true,
     "limit_up": false,
     "limit_down": false
+  },
+  "execution": {
+    "schema_version": 1,
+    "quote_ref": {
+      "source": "offline-fixture",
+      "quote_id": "fixture-quote-20261030-1000"
+    },
+    "order_side": "buy",
+    "price_cents": 1250,
+    "available_quantity": 700,
+    "observed_at": "2026-10-30T09:59:30+08:00"
   }
 }
