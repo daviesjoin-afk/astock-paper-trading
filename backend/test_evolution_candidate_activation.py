@@ -1031,6 +1031,43 @@ class CandidateEvidenceLineageTests(unittest.TestCase):
             evidence={"avg_eval_score": 0.4}),
             "被拒绝的候选不应再被复用")
 
+    def test_json_booleans_are_not_the_same_evidence_as_numbers(self):
+        """JSON true/false 与 1/0 是不同证据。
+
+        Python 里 ``{"f": True} == {"f": 1}`` 成立，直接比 dict 会让两种证据
+        互相复用。证据身份按 JSON 规范化比较：类型参与身份。
+        """
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.038)
+        EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve", reason="研究A",
+            parent_id=base, performance_snapshot={"gate_open": True}, validate=True)
+        self.assertIsNone(
+            EA.find_equivalent_candidate(
+                conn, params, strategy_id=None, base_params_id=base,
+                source="evolve", evidence={"gate_open": 1}),
+            "布尔证据与数字证据被错误复用")
+        # 同类型同值仍然复用（键序不同也算同一份）。
+        self.assertIsNotNone(
+            EA.find_equivalent_candidate(
+                conn, params, strategy_id=None, base_params_id=base,
+                source="evolve", evidence={"gate_open": True}))
+
+    def test_nested_evidence_also_distinguishes_booleans_from_numbers(self):
+        conn = self._seeded()
+        base = SE.get_current_params(conn)["id"]
+        params = dict(BASE_PARAMS, max_weight_delta=0.039)
+        EA.create_candidate(
+            conn, params, strategy_id=None, source="evolve", reason="研究A",
+            parent_id=base,
+            performance_snapshot={"detail": {"ok": False, "n": 0}}, validate=True)
+        self.assertIsNone(
+            EA.find_equivalent_candidate(
+                conn, params, strategy_id=None, base_params_id=base,
+                source="evolve", evidence={"detail": {"ok": 0, "n": 0}}),
+            "嵌套层面的布尔/数字仍被混同")
+
 
 if __name__ == "__main__":
     unittest.main()

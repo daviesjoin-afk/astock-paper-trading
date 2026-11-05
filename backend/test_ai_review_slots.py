@@ -1537,6 +1537,35 @@ class AuditTransactionOwnershipTests(AiReviewSlotTestBase):
             self.assertEqual(0, verify.execute(
                 "SELECT COUNT(*) FROM dual_ai_tuning_runs").fetchone()[0])
 
+    def test_public_entrypoint_rejects_a_reused_connection_before_schema(self):
+        """run_ai_review 必须在**第一次 schema 初始化之前**拒绝复用连接。
+
+        它的第一段 `with connect_factory()` 就调用 `ensure_schema()`，后者内含
+        executescript（隐式 COMMIT）。没有前置检查时，调用方在同一连接上的未
+        提交数据会被提前提交，之后 rollback 也救不回来。
+        """
+        self.configure_slots()
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(self.db_path)
+        self.addCleanup(conn.close)
+        S.ensure_schema(conn)
+        conn.execute("CREATE TABLE IF NOT EXISTS caller_marker(a)")
+        conn.commit()
+        conn.execute("INSERT INTO caller_marker VALUES(1)")
+        self.assertTrue(conn.in_transaction)
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_review(connect_factory=lambda: contextlib.nullcontext(conn))
+        self.assertIn("owns its transaction", str(caught.exception))
+
+        # 拒绝后调用方仍能自行回滚，未提交数据不保留。
+        conn.rollback()
+        with _sqlite3.connect(self.db_path) as verify:
+            self.assertEqual(0, verify.execute(
+                "SELECT COUNT(*) FROM caller_marker").fetchone()[0],
+                "调用方数据被提前提交了，rollback 已无效")
+
 
 class ReviewerFailureIsolationTests(AiReviewSlotTestBase):
     """T53–T62：reviewer 可靠性失败不得污染策略学习。

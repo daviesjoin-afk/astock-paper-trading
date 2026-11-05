@@ -807,6 +807,17 @@ def create_candidate(conn, params: dict, *, strategy_id: Optional[str] = None,
     return result
 
 
+def _evidence_identity(value) -> str:
+    """证据快照的身份串：键排序的 JSON，类型参与身份。
+
+    ``json.dumps(..., sort_keys=True)`` 保证 ``{"a":1,"b":2}`` 与
+    ``{"b":2,"a":1}`` 相同，同时保持 ``true`` 与 ``1``、``false`` 与 ``0``
+    不同——Python 的 dict 相等会把这两组判为相等，不能直接用来定身份。
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+
+
 def find_equivalent_candidate(conn, params: dict, *, strategy_id,
                               base_params_id, source=None, evidence=None,
                               limit: int = 50):
@@ -830,10 +841,12 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
     调用方两个都不传时保持历史行为（只比参数），仅供尚未声明来源的旧路径。
     """
     target = params_digest(params)
-    # 证据按**语义**比较，不按序列化字符串：json_text 保留插入顺序，同一份
-    # 快照只要键序不同就会被判成"不同证据"，导致重复创建候选。这里统一解析
-    # 成结构再比，键序与空白都不影响结论。
-    wanted_evidence = None if evidence is None else _loads(_json(evidence), {})
+    # 证据身份按 **JSON 规范化**比较：键排序后序列化，类型参与身份。
+    # 不能直接比 Python dict ——{"f": True} == {"f": 1} 在 Python 里成立，
+    # 会把两种不同的 JSON 证据当成同一份。也不能直接比 json_text 原样输出，
+    # 它保留插入顺序，键序不同会被误判成不同证据。json.dumps(sort_keys=True)
+    # 同时解决这两点：键序无关，true/1 与 false/0 保持区分。
+    wanted_evidence = None if evidence is None else _evidence_identity(evidence)
     for row in _scope_rows(conn, scope_key(strategy_id), limit=limit):
         if row["validation_state"] == STATE_REJECTED:
             continue
@@ -847,7 +860,7 @@ def find_equivalent_candidate(conn, params: dict, *, strategy_id,
             snapshot = row["performance_snapshot"]
             if not isinstance(snapshot, (dict, list)):
                 snapshot = _loads(snapshot, {})
-            if snapshot != wanted_evidence:
+            if _evidence_identity(snapshot) != wanted_evidence:
                 continue
         if params_digest(row["params"]) == target:
             return row["id"]

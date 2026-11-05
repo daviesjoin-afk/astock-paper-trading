@@ -1717,6 +1717,22 @@ def _reviewer_response(reviewer: dict) -> dict:
     }
 
 
+def _reject_caller_transaction(conn):
+    """本模块拥有它那次写入的事务，调用方连接上不允许有未提交事务。
+
+    schema 初始化含 ``executescript()``，sqlite3 会隐式 COMMIT 当前事务。若
+    连接上已有调用方未提交的数据，它会被一并提交，之后 rollback 也救不回来
+    —— 静默的数据完整性破坏。宁可让调用方显式分层（先提交自己的事务），也
+    不替它做提交决定。``run_ai_review`` 与 ``_write_audit`` 共用这一条规则。
+    """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "ai_review_service owns its transaction: the caller's connection "
+            "already has an open transaction, which schema setup would commit "
+            "implicitly. Commit or roll back before calling."
+        )
+
+
 def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mode,
                  profile, evidence, evidence_hash, config_snapshot, reviewers,
                  consensus, reason, audit_merged, started_at, started,
@@ -1739,18 +1755,7 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
         # self_evolution / evolution_activation 的建表函数内部也各自 commit。
         # 因此**先**把所有 schema 初始化跑完并提交（DDL 是幂等的，失败就整体
         # 失败、不写任何业务行），**再**用 savepoint 包住业务写入。
-        #
-        # 唯一事务负责人的前提是"这条连接上没有别人的未提交事务"。如果调用方
-        # 已在同一连接上开了事务，schema 阶段的隐式 COMMIT / 显式 commit 会把
-        # 调用方的数据一并提交，事后无法回滚——那是静默的数据完整性破坏。
-        # 这里 fail-closed：宁可让调用方显式分层（先提交自己的事务），也不替
-        # 它做提交决定。
-        if conn.in_transaction:
-            raise RuntimeError(
-                "ai_review_service._write_audit owns its transaction: the caller's "
-                "connection already has an open transaction, which schema setup "
-                "would commit implicitly. Commit or roll back before calling."
-            )
+        _reject_caller_transaction(conn)
         ensure_schema(conn)
         if track_evolution:
             import self_evolution as _SE
@@ -1866,6 +1871,10 @@ def run_ai_review(connect_factory, paper_db_path, snapshot_paths, evidence_colle
     mode = str(mode or "intraday")[:30]
 
     with connect_factory() as conn:
+        # 与 _write_audit 同一个前置条件，但必须在**第一次 schema 初始化之前**：
+        # ensure_schema() 内含 executescript（隐式 COMMIT），若连接上已有调用方
+        # 未提交的事务，它会被提前提交，之后 rollback 也救不回来。
+        _reject_caller_transaction(conn)
         ensure_schema(conn)
         stored = get_review_settings(conn)
         slot_configs = {slot: get_slot_config(conn, slot) for slot in AI_SLOTS}
