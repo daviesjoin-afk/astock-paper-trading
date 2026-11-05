@@ -1,5 +1,14 @@
 use super::*;
 
+fn calendar() -> TradingCalendar {
+    serde_json::from_str(BUNDLED_CALENDAR_JSON).unwrap()
+}
+
+fn sessions() -> SessionPolicy {
+    serde_json::from_str(BUNDLED_SESSION_POLICY_JSON).unwrap()
+}
+
+
 fn request(day: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
         schema_version: 2, cycle_id: "demo-cycle".into(),
@@ -27,7 +36,7 @@ fn evidence(day: &str) -> QuoteEvidence {
 #[test]
 fn buy_is_board_lot_and_does_not_spend_more_than_budget() {
     let state = PortfolioState::new(INITIAL_CASH_CENTS);
-    let out = decide(&state, &request("2026-10-30", Side::Buy), Some(&evidence("2026-10-30"))).unwrap();
+    let out = decide(&state, &request("2026-10-30", Side::Buy), Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap();
     let fill = out.fill.unwrap();
     assert_eq!(fill.quantity % 100, 0);
     assert!(fill.quantity > 0);
@@ -37,11 +46,11 @@ fn buy_is_board_lot_and_does_not_spend_more_than_budget() {
 #[test]
 fn t_plus_one_blocks_sale_on_purchase_day_then_allows_next_day() {
     let mut state = PortfolioState::new(INITIAL_CASH_CENTS);
-    let buy = decide(&state, &request("2026-10-30", Side::Buy), Some(&evidence("2026-10-30"))).unwrap().fill.unwrap();
+    let buy = decide(&state, &request("2026-10-30", Side::Buy), Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap().fill.unwrap();
     state.apply(&buy).unwrap();
-    assert_eq!(decide(&state, &request("2026-10-30", Side::Sell), Some(&evidence("2026-10-30"))).unwrap().reason,
+    assert_eq!(decide(&state, &request("2026-10-30", Side::Sell), Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap().reason,
                "no_t1_sellable_lot");
-    let sell = decide(&state, &request("2026-11-02", Side::Sell), Some(&evidence("2026-11-02"))).unwrap();
+    let sell = decide(&state, &request("2026-11-02", Side::Sell), Some(&evidence("2026-11-02")), &calendar(), &sessions()).unwrap();
     assert_eq!(sell.status, DecisionStatus::Filled);
     state.apply(sell.fill.as_ref().unwrap()).unwrap();
     assert_eq!(state.quantity("600000.SH"), 0);
@@ -53,13 +62,13 @@ fn stale_future_and_limit_up_quotes_fail_closed() {
     let req = request("2026-10-30", Side::Buy);
     let mut quote = evidence("2026-10-30");
     quote.quote.observed_at = "2026-10-30T09:50:00+08:00".into();
-    assert_eq!(decide(&state, &req, Some(&quote)).unwrap().reason, "stale_quote");
+    assert_eq!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap().reason, "stale_quote");
     quote.quote.observed_at = "2026-10-30T10:00:01+08:00".into();
     quote.available_at = quote.quote.observed_at.clone();
-    assert_eq!(decide(&state, &req, Some(&quote)).unwrap().reason, "quote_from_future");
+    assert_eq!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap().reason, "quote_from_future");
     quote = evidence("2026-10-30");
     quote.quote.limit_up = true;
-    assert_eq!(decide(&state, &req, Some(&quote)).unwrap().reason, "limit_up_buy_blocked");
+    assert_eq!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap().reason, "limit_up_buy_blocked");
 }
 
 #[test]
@@ -67,15 +76,15 @@ fn evidence_availability_has_an_exact_boundary_and_repeats_deterministically() {
     let state = PortfolioState::new(INITIAL_CASH_CENTS);
     let req = request("2026-10-30", Side::Buy);
     let mut quote = evidence("2026-10-30");
-    assert_eq!(decide(&state, &req, None).unwrap().reason, "quote_evidence_missing");
+    assert_eq!(decide(&state, &req, None, &calendar(), &sessions()).unwrap().reason, "quote_evidence_missing");
     quote.available_at = req.decision_at.clone();
-    let filled = decide(&state, &req, Some(&quote)).unwrap();
+    let filled = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
     assert_eq!(filled.status, DecisionStatus::Filled);
-    assert_eq!(filled, decide(&state, &req, Some(&quote)).unwrap());
+    assert_eq!(filled, decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap());
     quote.available_at = "2026-10-30T10:00:00.001+08:00".into();
-    let rejected = decide(&state, &req, Some(&quote)).unwrap();
+    let rejected = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
     assert_eq!(rejected.reason, "quote_not_yet_available");
-    assert_eq!(rejected, decide(&state, &req, Some(&quote)).unwrap());
+    assert_eq!(rejected, decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap());
     assert!(rejected.fill.is_none());
     assert_eq!(state.cash_cents, rejected.cash_after_cents);
 }
@@ -108,7 +117,7 @@ fn invalid_evidence_cannot_be_consumed_even_by_direct_domain_callers() {
     bad.quote.symbol = "000001.SZ".into();
     variants.push(bad);
     for bad in variants {
-        for _ in 0..2 { assert!(decide(&state, &req, Some(&bad)).is_err()); }
+        for _ in 0..2 { assert!(decide(&state, &req, Some(&bad), &calendar(), &sessions()).is_err()); }
     }
 }
 
@@ -118,13 +127,13 @@ fn false_symbol_wrong_timezone_and_old_contract_are_rejected() {
     let mut req = request("2026-10-30", Side::Buy);
     let quote = evidence("2026-10-30");
     req.signal.symbol = "bad".into();
-    assert!(decide(&state, &req, Some(&quote)).is_err());
+    assert!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).is_err());
     req = request("2026-10-30", Side::Buy);
     req.decision_at = "2026-10-30T10:00:00+00:00".into();
-    assert!(decide(&state, &req, Some(&quote)).is_err());
+    assert!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).is_err());
     req = request("2026-10-30", Side::Buy);
     req.schema_version = 1;
-    assert!(decide(&state, &req, Some(&quote)).is_err());
+    assert!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).is_err());
 }
 
 #[test]
@@ -154,15 +163,15 @@ fn quote_freshness_preserves_subsecond_precision_at_boundary() {
     let req = request("2026-10-30", Side::Buy);
     let mut quote = evidence("2026-10-30");
     quote.quote.observed_at = "2026-10-30T09:57:00+08:00".into();
-    let boundary = decide(&state, &req, Some(&quote)).unwrap();
+    let boundary = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
     assert_eq!(boundary.status, DecisionStatus::Filled);
-    assert_eq!(boundary, decide(&state, &req, Some(&quote)).unwrap());
+    assert_eq!(boundary, decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap());
     quote.quote.observed_at = "2026-10-30T09:56:59.999+08:00".into();
-    let stale = decide(&state, &req, Some(&quote)).unwrap();
+    let stale = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
     assert_eq!(stale.reason, "stale_quote");
     assert!(stale.fill.is_none());
     assert_eq!(stale.cash_after_cents, state.cash_cents);
-    assert_eq!(stale, decide(&state, &req, Some(&quote)).unwrap());
+    assert_eq!(stale, decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap());
 }
 
 #[test]
@@ -170,26 +179,26 @@ fn offline_trust_never_grants_provider_publication_or_authentication() {
     let state = PortfolioState::new(INITIAL_CASH_CENTS);
     let req = request("2026-10-30", Side::Buy);
     let good = evidence("2026-10-30");
-    let expected = decide(&state, &req, Some(&good)).unwrap();
+    let expected = decide(&state, &req, Some(&good), &calendar(), &sessions()).unwrap();
     // An offline simulation uses its declared historical availability. Actual
     // receipt is an independent audit fact, never a forged historical receipt.
     let mut later_receipt = good.clone();
     later_receipt.received_at = "2030-01-01T00:00:00+08:00".into();
-    assert_eq!(decide(&state, &req, Some(&later_receipt)).unwrap(), expected);
+    assert_eq!(decide(&state, &req, Some(&later_receipt), &calendar(), &sessions()).unwrap(), expected);
     let mut forged_publication = good.clone();
     forged_publication.provider_published_at = Some(good.quote.observed_at.clone());
     for _ in 0..2 {
-        assert!(decide(&state, &req, Some(&forged_publication)).is_err());
+        assert!(decide(&state, &req, Some(&forged_publication), &calendar(), &sessions()).is_err());
     }
     let mut invalid_receipt = good.clone();
     invalid_receipt.received_at = "not-a-receipt-time".into();
-    assert!(decide(&state, &req, Some(&invalid_receipt)).is_err());
+    assert!(decide(&state, &req, Some(&invalid_receipt), &calendar(), &sessions()).is_err());
     for grade in ["authenticated_provider", "verified", "live"] {
         let mut raw = serde_json::to_value(&good).unwrap();
         raw["trust_level"] = serde_json::json!(grade);
         assert!(serde_json::from_value::<QuoteEvidence>(raw).is_err());
     }
-    assert_eq!(decide(&state, &req, Some(&good)).unwrap(), expected);
+    assert_eq!(decide(&state, &req, Some(&good), &calendar(), &sessions()).unwrap(), expected);
 }
 
 fn market_request(day: &str, time: &str) -> (SimulationRequest, QuoteEvidence) {
@@ -205,12 +214,12 @@ fn market_request(day: &str, time: &str) -> (SimulationRequest, QuoteEvidence) {
 fn assert_market_rejection(day: &str, time: &str, reason: &str) {
     let state = PortfolioState::new(INITIAL_CASH_CENTS);
     let (req, quote) = market_request(day, time);
-    let out = decide(&state, &req, Some(&quote)).unwrap();
+    let out = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
     assert_eq!(out.status, DecisionStatus::Rejected, "{day} {time}");
     assert_eq!(out.reason, reason);
     assert!(out.fill.is_none());
     assert_eq!(out.cash_after_cents, INITIAL_CASH_CENTS);
-    assert_eq!(decide(&state, &req, Some(&quote)).unwrap(), out);
+    assert_eq!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap(), out);
 }
 
 #[test]
@@ -263,8 +272,31 @@ fn known_continuous_session_boundaries_are_positive_controls() {
     let state = PortfolioState::new(INITIAL_CASH_CENTS);
     for time in ["09:30:00", "11:30:00", "13:00:00", "14:56:59.999"] {
         let (req, quote) = market_request("2026-10-30", time);
-        let out = decide(&state, &req, Some(&quote)).unwrap();
+        let out = decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap();
         assert_eq!(out.status, DecisionStatus::Filled, "{time}");
-        assert_eq!(decide(&state, &req, Some(&quote)).unwrap(), out);
+        assert_eq!(decide(&state, &req, Some(&quote), &calendar(), &sessions()).unwrap(), out);
     }
+}
+
+#[test]
+fn market_versions_and_windows_cannot_be_overridden_by_research() {
+    let (req, quote) = market_request("2026-10-30", "10:00:00");
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    for field in ["calendar_version", "session_policy_version", "calendar", "sessions"] {
+        let mut raw = serde_json::to_value(&req).unwrap();
+        raw[field] = serde_json::json!("override");
+        assert!(serde_json::from_value::<SimulationRequest>(raw).is_err());
+    }
+    let mut bad = sessions();
+    bad.version = "latest".into();
+    assert!(decide(&state, &req, Some(&quote), &calendar(), &bad).is_err());
+    bad = sessions();
+    bad.continuous[0].end = "invalid-time".into();
+    assert!(decide(&state, &req, Some(&quote), &calendar(), &bad).is_err());
+    bad = sessions();
+    bad.continuous[1].end_inclusive = true;
+    assert!(bad.validate().is_err());
+    bad = sessions();
+    bad.continuous[0].end = "13:01:00".into();
+    assert!(bad.validate().is_err());
 }

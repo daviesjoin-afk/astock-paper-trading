@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "version": "cn-a-share-continuous-only-v1",
+  "continuous": [
+    {"start": "09:30:00", "end": "11:30:00", "end_inclusive": true},
+    {"start": "13:00:00", "end": "14:57:00", "end_inclusive": false}
+  ],
+  "opening_auction": {"start": "09:15:00", "end": "09:25:00", "end_inclusive": true},
+  "closing_auction": {"start": "14:57:00", "end": "15:00:00", "end_inclusive": true},
+  "sources": [
+    "https://www.sse.com.cn/lawandrules/sselawsrules2025/trade/universal/c/c_20260424_10816492.shtml",
+    "https://docs.static.szse.cn/www/lawrules/rule/trade/current/W020260424690713155663.pdf"
+  ]
+}
