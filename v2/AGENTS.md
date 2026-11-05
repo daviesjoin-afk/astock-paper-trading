@@ -1,0 +1,56 @@
+# AStock V2: instructions for coding agents
+
+This directory is a **new, independent, paper-only system**. Follow these rules
+for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
+
+## Default design
+
+- Keep **one Cargo package and one Rust service**. New modules are allowed only
+  for distinct business responsibilities; do not create another crate,
+  microservice, message bus, ORM, generic DI framework, or compatibility
+  facade merely to reduce file size.
+- Code dependency direction: HTTP `main.rs` -> `store/` -> `domain/`.
+  The domain must not use networking, storage, filesystem, runtime clock,
+  SQLite, axum, tokio, or any V1 modules.
+- `domain/contract.rs`: versioned data contracts and identity.
+  `portfolio.rs`: cash, lots and T+1 state transitions.
+  `execution.rs`: pure decision policy.
+- `store/mod.rs` exclusively owns durable writes, schema, transactions,
+  idempotency and storage policy. `store/query.rs` only reads, projects
+  and verifies replay; it never commits or writes.
+- Python research only emits proposals. It cannot write the ledger, decide
+  final order quantity or activate strategies. TypeScript only presents V2 API
+  read models; it must not replicate paper execution rules.
+- Do not import, reuse, mutate, auto-migrate or query legacy V1 runtime code,
+  databases, Cron jobs or broker credentials.
+
+## Business invariants
+
+- Explicit cycle, version, quote identity, source and as-of timestamp;
+  never silently use newest/latest or machine time in the core.
+- Integer cents and whole-lot quantities; quote freshness, T+1,
+  cash budget and market eligibility are fail-closed.
+- Strict JSON parsing rejects unexpected nested signal/quote fields.
+  Research cannot set `quantity`, `shares`, `amount` or final fills.
+- Accepted decision + fill must commit atomically. Same signal identity
+  + same payload must be idempotent; conflicting payload must fail.
+- Replay must verify the exact persisted request, outcome and fill,
+  including rejected decisions. Never silently append earlier
+  decision times after a later one.
+- Trading remains simulated. No broker endpoints or live-order APIs.
+
+## Small-change protocol
+
+1. State the **single business owner**, consumer(s), dependency direction,
+   and invariant before introducing a new module.
+2. Prefer editing the existing owner. Only split when business ownership,
+   change cadence or tested isolation requires it. Never set LOC limits.
+3. New dependency? Document its concrete benefit and reject it if stdlib
+   or an existing dependency solves the same need.
+4. Add at least one **behavioral** test per changed rule and a negative
+   control when removing a possible bypass. Avoid tests that only assert
+   private function layout or source lines.
+5. Run Rust tests/release build, Python research tests, TypeScript build
+   and HTTP integration smoke. Preserve or document any failures.
+6. Keep PRs reviewable and single-purpose. Never auto-merge, deploy,
+   alter active parameters, or edit V1 for a V2 refactor.
