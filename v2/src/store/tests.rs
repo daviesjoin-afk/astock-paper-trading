@@ -100,6 +100,110 @@ fn buy_and_next_day_sell_replay() {
 }
 
 #[test]
+fn historical_state_excludes_future_buys_sells_and_decisions() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let empty = db.state(Some("2026-10-29")).unwrap();
+    let buy = request("2026-10-30", "pit-buy", Side::Buy);
+    let bought = ingest_and_submit(&mut db, buy.clone());
+    let buy_day = db.state(Some("2026-10-30")).unwrap();
+    assert_eq!(buy_day.positions[0].quantity, 800);
+    assert_eq!(buy_day.positions[0].sellable_quantity, Some(0));
+    assert_eq!(buy_day.cash_cents, bought.outcome.cash_after_cents);
+    assert_eq!(buy_day.runs_total, 1);
+    let blocked = ingest_and_submit(&mut db, request("2026-10-30", "pit-t0", Side::Sell));
+    assert_eq!(blocked.outcome.status, DecisionStatus::Rejected);
+    let mut buy_day_with_rejection = buy_day;
+    buy_day_with_rejection.runs_total = 2;
+    let sold = ingest_and_submit(&mut db, request("2026-11-02", "pit-sell", Side::Sell));
+    assert_eq!(sold.outcome.status, DecisionStatus::Filled);
+    assert!(db.submit(buy).unwrap().duplicate);
+    let changes = db.conn.total_changes();
+    let replay = db.verify_replay().unwrap();
+    for _ in 0..3 {
+        assert_eq!(db.state(Some("2026-10-29")).unwrap(), empty);
+        assert_eq!(db.state(Some("2026-10-30")).unwrap(), buy_day_with_rejection);
+        let held = db.state(Some("2026-11-01")).unwrap();
+        assert_eq!(held.positions[0].quantity, 800);
+        assert_eq!(held.positions[0].sellable_quantity, Some(800));
+        assert_eq!(held.cash_cents, buy_day_with_rejection.cash_cents);
+        assert_eq!(held.runs_total, 2);
+        let sell_day = db.state(Some("2026-11-02")).unwrap();
+        assert!(sell_day.positions.is_empty() && sell_day.lots.is_empty());
+        assert_eq!(sell_day.cash_cents, sold.outcome.cash_after_cents);
+        assert_eq!(sell_day.runs_total, 3);
+        assert_eq!(db.state(None).unwrap().cash_cents, sell_day.cash_cents);
+        assert_eq!(db.verify_replay().unwrap(), replay);
+    }
+    assert_eq!(db.conn.total_changes(), changes);
+}
+
+#[test]
+fn historical_state_uses_china_day_end_including_rejected_decisions() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut last = request("2026-10-30", "pit-last-nanosecond", Side::Buy);
+    last.decision_at = "2026-10-30T23:59:59.999999999+08:00".into();
+    // Missing quote is an immutable rejected decision and still counts on its day.
+    assert_eq!(db.submit(last).unwrap().outcome.status, DecisionStatus::Rejected);
+    let end = db.state(Some("2026-10-30")).unwrap();
+    assert_eq!(end.runs_total, 1);
+    let mut next = request("2026-10-31", "pit-next-midnight", Side::Buy);
+    // This instant is still October 30 in UTC, but the next China date.
+    next.decision_at = "2026-10-31T00:00:00+08:00".into();
+    db.submit(next).unwrap();
+    assert_eq!(db.state(Some("2026-10-30")).unwrap(), end);
+    assert_eq!(db.state(Some("2026-10-31")).unwrap().runs_total, 2);
+    assert_eq!(db.state(None).unwrap().runs_total, 2);
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+}
+
+#[test]
+fn historical_state_survives_disk_reopen_without_writes_or_reinterpretation() {
+    let file = DiskDatabase::new();
+    let historical;
+    let latest;
+    let replay;
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        historical = {
+            ingest_and_submit(&mut db, request("2026-10-30", "pit-disk-buy", Side::Buy));
+            db.state(Some("2026-10-30")).unwrap()
+        };
+        ingest_and_submit(&mut db, request("2026-11-02", "pit-disk-sell", Side::Sell));
+        latest = db.state(None).unwrap();
+        replay = db.verify_replay().unwrap();
+    }
+    let before = disk_snapshot(&file);
+    {
+        let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let changes = db.conn.total_changes();
+        for _ in 0..2 {
+            assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
+            assert_eq!(db.state(None).unwrap(), latest);
+            assert_eq!(db.verify_replay().unwrap(), replay);
+        }
+        assert_eq!(db.conn.total_changes(), changes);
+    }
+    assert_eq!(disk_snapshot(&file), before);
+}
+
+#[test]
+fn historical_state_empty_history_and_invalid_dates_are_read_only() {
+    let db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let changes = db.conn.total_changes();
+    for day in ["2026-10-29", "2025-01-01", "2027-01-01"] {
+        let view = db.state(Some(day)).unwrap();
+        assert_eq!(view.cash_cents, INITIAL_CASH_CENTS);
+        assert!(view.positions.is_empty() && view.lots.is_empty());
+        assert_eq!(view.runs_total, 0);
+    }
+    for day in ["bad", "2026-02-30", "2026-1-1", "2026-10-30T10:00:00+08:00"] {
+        for _ in 0..2 { assert!(db.state(Some(day)).is_err(), "{day}"); }
+    }
+    assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+    assert_eq!(db.conn.total_changes(), changes);
+}
+
+#[test]
 fn quote_ingestion_is_idempotent_and_every_evidence_field_is_immutable() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
@@ -254,13 +358,16 @@ fn fill_failure_rolls_back_decision_but_retains_independent_evidence() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     db.ingest_quote(evidence(&req)).unwrap();
+    let historical = db.state(Some("2026-10-30")).unwrap();
     db.conn.execute_batch("CREATE TRIGGER block_fill BEFORE INSERT ON v2_fills BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
     assert!(db.submit(req.clone()).is_err());
     assert_eq!(db.state(None).unwrap().runs_total, 0);
     assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
     assert!(load_evidence(&db.conn, &req.quote_ref).unwrap().is_some());
     db.conn.execute_batch("DROP TRIGGER block_fill;").unwrap();
     assert_eq!(db.submit(req).unwrap().outcome.status, DecisionStatus::Filled);
+    assert_eq!(db.state(Some("2026-10-30")).unwrap().runs_total, 1);
     assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
 }
 
