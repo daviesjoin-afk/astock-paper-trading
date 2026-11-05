@@ -174,6 +174,16 @@ for run in runs:
     assert run["calendar_version"] == calendar_version
     assert run["session_policy_version"] == session_version
 
+historical_buy = call("portfolio?asof_day=2026-10-30")
+assert historical_buy["positions"][0]["quantity"] == 800, historical_buy
+assert historical_buy["positions"][0]["sellable_quantity"] == 0
+assert historical_buy["runs_total"] == 4
+before_buy = call("portfolio?asof_day=2026-10-29")
+assert not before_buy["positions"] and not before_buy["lots"], before_buy
+assert before_buy["cash_cents"] == before_buy["initial_cash_cents"]
+assert before_buy["runs_total"] == 1  # The October 1 holiday rejection only.
+call("portfolio?asof_day=2026-1-1", expected=422)
+
 cases = [
     ("2026-10-31", "10:00:00", "saturday", "weekend_market_closed", "buy"),
     ("2026-11-01", "10:00:00", "sunday", "weekend_market_closed", "buy"),
@@ -199,10 +209,17 @@ cases = [
 for args in cases:
     market_case(*args)
 for _ in range(2):
+    assert call("portfolio?asof_day=2026-10-30") == historical_buy
+    assert call("portfolio?asof_day=2026-10-29") == before_buy
+    sold_then_bought = call("portfolio?asof_day=2026-11-02")
+    assert sold_then_bought["runs_total"] == 4 + len(cases) - 1, sold_then_bought
+    assert sold_then_bought["positions"][0]["sellable_quantity"] == 0
+for _ in range(2):
     report = call("replay")
     assert report["ok"] and (report["runs_verified"], report["fills_verified"]) == (4 + len(cases), 3), report
 assert call("portfolio")["runs_total"] == 4 + len(cases)
 print("HTTP calendar/session/auction/unknown-date/retry/replay passed")
+print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed")
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
 echo "V2 HTTP/Python/Rust/SQLite end-to-end smoke passed"

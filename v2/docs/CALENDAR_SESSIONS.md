@@ -31,6 +31,14 @@ Python 仍只提供信号与报价引用，TypeScript 不新增撮合逻辑。
 固定数据：`data/session-policy-v1.json`，版本 `cn-a-share-continuous-only-v1`。
 来源为 [上交所2026交易规则2.4.2](https://www.sse.com.cn/lawandrules/sselawsrules2025/trade/universal/c/c_20260424_10816492.shtml)
 与 [深交所2026交易规则2.3.2](https://docs.static.szse.cn/www/lawrules/rule/trade/current/W020260424690713155663.pdf)。
+2026 版自 2026-07-06 施行，不能用其发布时间替代生效日期。
+此前日期的 A 股竞价时段依据
+[上交所2023版2.4.2](https://www.sse.com.cn/lawandrules/sselawsrules2025/repeal/rules/c/c_20250612_10824490.shtml)
+及 [深交所2023版2.3.2](https://docs.static.szse.cn/www/lawrules/rule/allrules/bussiness/W020230217564423808793.pdf)；
+这两版对应的开盘/连续/收盘竞价时段一致。本说明只补齐 A 股时段的历史来源，
+不声称整套 2026 交易规则适用于上半年，也不扩展至基金或盘后交易。
+生效日参见 [上交所发布通知](https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/exchange/c/c_20260424_10816482.shtml)。
+不修改已固定的 session-policy-v1 JSON、版本或任何账本快照。
 下列端点是本系统明确固定的模拟策略，不是完整交易所订单匹配模型。所有时间均 `+08:00`，
 用完整 NaiveTime 比较，保留秒、毫秒及更细精度。
 
