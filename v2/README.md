@@ -16,12 +16,15 @@ module, schema, task, broker or runtime database is imported or reused.
 - Local-only Rust HTTP API, Python standard-library offline research signal
   producer, TypeScript/Vite read-only dashboard.
 - Separate V2 CI pipeline; no V1 test suite dependency.
+- Immutable offline quote evidence, explicitly referenced by contract v2;
+  decisions pin both evidence availability and missing-evidence rejections.
+  See [the evidence contract](docs/QUOTE_EVIDENCE.md).
 
 **This is a deterministic demonstration kernel, not market-ready exchange
 simulation.** It does not verify whether a quote truly originates from a market
 provider, exchange holiday calendars, ST/STAR/ChiNext/Beijing price-limit tiers,
 intraday liquidity, call auctions, partial fills, slippage or broker custody.
-It treats a supplied quote as a fixture and assumes complete fills at that
+It accepts separately ingested `offline-fixture` evidence and assumes complete fills at that
 price once basic conditions hold. The fixed fee model is deliberately
 illustrative rather than a regulatory claim. It must not be used to estimate
 investment returns or to trade real money.
@@ -59,12 +62,15 @@ From repository root:
 ```bash
 cd v2
 cargo test
+export ASTOCK_V2_DB=./v2-evidence-paper.sqlite3
 cargo run
 ```
 
 In another terminal, from repository root:
 
 ```bash
+curl --fail -H 'Content-Type: application/json' \
+  --data-binary @v2/fixtures/quote.json http://127.0.0.1:8765/v2/quotes
 python3 v2/research/worker.py --output /tmp/v2-signal.json
 python3 v2/research/worker.py --output /tmp/v2-signal.json --send
 curl -s http://127.0.0.1:8765/v2/portfolio
@@ -102,7 +108,14 @@ The read-only V2 UI never touches a V1 endpoint.
   are not implemented yet.
 - Transactional writes are owned by Rust. The Python worker emits a proposal,
   not an order quantity, not a fill, not an activation decision.
-- Once recorded, decisions are replayed in ledger insertion order. Contract v1
+- Contract v2 replaces inline `quote` with `quote_ref` (source + quote ID).
+  Evidence is ingested separately using `POST /v2/quotes`. An identical retry
+  succeeds; a changed payload under the same evidence identity returns 409.
+  Missing evidence or availability after the decision produces a saved rejection.
+- Policy `v2-paper-policy-2` requires a **fresh V2 database**. Existing policy-1
+  databases are refused before schema additions; no automatic migration or
+  reinterpretation of earlier fills is provided. Keep old files separately.
+- Once recorded, decisions are replayed in ledger insertion order. Contract v2
   does not yet support historical out-of-order correction or cancellation:
   consumers must submit decision times monotonically.
 

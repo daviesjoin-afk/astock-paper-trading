@@ -29,18 +29,19 @@ impl Store {
 
     pub fn runs(&self, limit: i64) -> StoreResult<Vec<RunRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,request_json,outcome_json FROM v2_simulation_runs
+            "SELECT id,request_json,outcome_json,evidence_json FROM v2_simulation_runs
              ORDER BY id DESC LIMIT ?"
         )?;
         let rows = stmt.query_map([limit.clamp(1, 1000)], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?))
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?))
         })?;
         let mut runs = Vec::new();
         for row in rows {
-            let (id, req, outcome) = row?;
+            let (id, req, outcome, evidence) = row?;
             runs.push(RunRecord {
                 id, request: serde_json::from_str(&req)?,
+                evidence: serde_json::from_str(&evidence)?,
                 outcome: serde_json::from_str(&outcome)?, duplicate: false,
             });
         }
@@ -51,19 +52,25 @@ impl Store {
     pub fn verify_replay(&self) -> StoreResult<ReplayReport> {
         let mut state = PortfolioState::new(self.initial_cash_cents);
         let mut runs = self.conn.prepare(
-            "SELECT id,request_json,outcome_json FROM v2_simulation_runs ORDER BY id"
+            "SELECT id,request_json,outcome_json,evidence_json FROM v2_simulation_runs ORDER BY id"
         )?;
         let rows = runs.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?))
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?))
         })?;
         let mut run_count = 0;
         let mut fill_count = 0;
         for row in rows {
-            let (id, req_json, result_json) = row?;
+            let (id, req_json, result_json, evidence_json) = row?;
             let req: SimulationRequest = serde_json::from_str(&req_json)?;
             let recorded: Outcome = serde_json::from_str(&result_json)?;
-            let calculated = decide(&state, &req)?;
+            let evidence: Option<QuoteEvidence> = serde_json::from_str(&evidence_json)?;
+            // Missing evidence is a pinned fact too: later ingestion cannot
+            // turn an already-recorded rejection into a historical fill.
+            if evidence.is_some() && load_evidence(&self.conn, &req.quote_ref)? != evidence {
+                return Err(StoreError::Integrity(format!("replay_evidence_mismatch_at_run_{id}")));
+            }
+            let calculated = decide(&state, &req, evidence.as_ref())?;
             if calculated != recorded {
                 return Err(StoreError::Integrity(
                     format!("replay_outcome_mismatch_at_run_{id}")

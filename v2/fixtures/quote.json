@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "available_at": "2026-10-30T09:59:31+08:00",
+  "quote": {
+    "symbol": "600000.SH",
+    "price_cents": 1234,
+    "observed_at": "2026-10-30T09:59:30+08:00",
+    "source": "offline-fixture",
+    "quote_id": "fixture-quote-20261030-1000",
+    "tradable": true,
+    "limit_up": false,
+    "limit_down": false
+  }
+}

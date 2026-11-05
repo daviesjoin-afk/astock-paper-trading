@@ -47,31 +47,65 @@ fn key_valid(key: &str) -> bool {
         && key.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c))
 }
 
+fn symbol_valid(symbol: &str) -> bool {
+    symbol.len() == 9 &&
+        (symbol.ends_with(".SH") || symbol.ends_with(".SZ")) &&
+        symbol.as_bytes()[..6].iter().all(u8::is_ascii_digit)
+}
+
+/// Pure evidence validation. This phase deliberately accepts offline fixtures only.
+pub fn validate_evidence(evidence: &QuoteEvidence) -> Result<(), RuleError> {
+    if evidence.schema_version != 1 {
+        return Err(RuleError("unsupported_evidence_version".into()));
+    }
+    let quote = &evidence.quote;
+    if quote.source != "offline-fixture" {
+        return Err(RuleError("unsupported_quote_source".into()));
+    }
+    if !key_valid(&quote.quote_id) || !symbol_valid(&quote.symbol) || quote.price_cents <= 0 {
+        return Err(RuleError("invalid_quote_evidence".into()));
+    }
+    if timestamp(&quote.observed_at)? > timestamp(&evidence.available_at)? {
+        return Err(RuleError("quote_observed_after_availability".into()));
+    }
+    Ok(())
+}
+
 /// One immutable decision. Caller provides all time/quote inputs.
-pub fn decide(state: &PortfolioState, req: &SimulationRequest) -> Result<Outcome, RuleError> {
-    if req.schema_version != 1 {
+pub fn decide(
+    state: &PortfolioState, req: &SimulationRequest, evidence: Option<&QuoteEvidence>,
+) -> Result<Outcome, RuleError> {
+    if req.schema_version != 2 {
         return Err(RuleError("unsupported_contract_version".into()));
     }
     if !key_valid(&req.cycle_id) || !key_valid(&req.strategy_version_id)
-        || !key_valid(&req.signal_id) || !key_valid(&req.quote.quote_id)
-        || !key_valid(&req.quote.source)
+        || !key_valid(&req.signal_id) || !key_valid(&req.quote_ref.quote_id)
+        || !key_valid(&req.quote_ref.source)
     {
         return Err(RuleError("invalid_identity".into()));
     }
     let symbol = req.signal.symbol.as_str();
-    let valid_symbol = symbol.len() == 9 &&
-        (symbol.ends_with(".SH") || symbol.ends_with(".SZ")) &&
-        symbol.as_bytes()[..6].iter().all(u8::is_ascii_digit);
-    if !valid_symbol || symbol != req.quote.symbol {
-        return Err(RuleError("symbol_mismatch_or_invalid_a_share_symbol".into()));
-    }
-    if req.quote.price_cents <= 0 {
-        return Err(RuleError("invalid_quote_price".into()));
+    if !symbol_valid(symbol) {
+        return Err(RuleError("invalid_a_share_symbol".into()));
     }
     let decision_at = timestamp(&req.decision_at)?;
-    let observed_at = timestamp(&req.quote.observed_at)?;
+    let Some(evidence) = evidence else {
+        return Ok(rejected(state, "quote_evidence_missing"));
+    };
+    validate_evidence(evidence)?;
+    let quote = &evidence.quote;
+    if req.quote_ref.source != quote.source || req.quote_ref.quote_id != quote.quote_id {
+        return Err(RuleError("quote_evidence_identity_mismatch".into()));
+    }
+    if symbol != quote.symbol {
+        return Err(RuleError("symbol_mismatch_or_invalid_a_share_symbol".into()));
+    }
+    let observed_at = timestamp(&quote.observed_at)?;
     if observed_at > decision_at {
         return Ok(rejected(state, "quote_from_future"));
+    }
+    if timestamp(&evidence.available_at)? > decision_at {
+        return Ok(rejected(state, "quote_not_yet_available"));
     }
     if observed_at.date_naive() != decision_at.date_naive() ||
         (decision_at - observed_at) > chrono::Duration::seconds(MAX_QUOTE_AGE_SECONDS)
@@ -82,17 +116,17 @@ pub fn decide(state: &PortfolioState, req: &SimulationRequest) -> Result<Outcome
     if !((570..=690).contains(&time) || (780..=900).contains(&time)) {
         return Ok(rejected(state, "outside_trading_session"));
     }
-    if !req.quote.tradable {
+    if !quote.tradable {
         return Ok(rejected(state, "not_tradable"));
     }
-    if req.signal.side == Side::Buy && req.quote.limit_up {
+    if req.signal.side == Side::Buy && quote.limit_up {
         return Ok(rejected(state, "limit_up_buy_blocked"));
     }
-    if req.signal.side == Side::Sell && req.quote.limit_down {
+    if req.signal.side == Side::Sell && quote.limit_down {
         return Ok(rejected(state, "limit_down_sell_blocked"));
     }
     let trade_day = decision_at.date_naive().to_string();
-    let price = req.quote.price_cents;
+    let price = quote.price_cents;
     let quantity = match req.signal.side {
         Side::Buy => {
             if state.quantity(symbol) > 0 {

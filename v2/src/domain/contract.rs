@@ -10,7 +10,7 @@ pub const COMMISSION_BPS: i64 = 3;
 pub const MIN_COMMISSION_CENTS: i64 = 500;
 pub const SELL_STAMP_DUTY_BPS: i64 = 5;
 pub const MAX_QUOTE_AGE_SECONDS: i64 = 180;
-pub const POLICY_VERSION: &str = "v2-paper-policy-1";
+pub const POLICY_VERSION: &str = "v2-paper-policy-2";
 
 #[derive(Debug)]
 pub struct RuleError(pub String);
@@ -58,6 +58,23 @@ pub struct SimulationRequest {
     pub signal_id: String,
     pub decision_at: String,
     pub signal: Signal,
+    pub quote_ref: QuoteRef,
+}
+
+/// Identity of an immutable quote already held by Store; never an inline price.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteRef {
+    pub source: String,
+    pub quote_id: String,
+}
+
+/// Explicit offline availability time, not an authenticated provider receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteEvidence {
+    pub schema_version: u32,
+    pub available_at: String,
     pub quote: Quote,
 }
 

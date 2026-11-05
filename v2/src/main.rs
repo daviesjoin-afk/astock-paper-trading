@@ -1,5 +1,5 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{SimulationRequest, INITIAL_CASH_CENTS}, store::{Store, StoreError}};
+use astock_v2::{domain::{QuoteEvidence, SimulationRequest, INITIAL_CASH_CENTS}, store::{Store, StoreError}};
 use axum::{
     extract::{Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
@@ -47,6 +47,13 @@ async fn submit(
     response(db.submit(request).map_err(api_error)?)
 }
 
+async fn ingest_quote(
+    State(state): State<Shared>, Json(evidence): Json<QuoteEvidence>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(db.ingest_quote(evidence).map_err(api_error)?)
+}
+
 #[derive(Deserialize)]
 struct PortfolioQuery {
     asof_day: Option<String>,
@@ -79,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always local-only. No network exposure, broker or real-money endpoints.
     let app = Router::new()
         .route("/v2/health", get(health))
+        .route("/v2/quotes", post(ingest_quote))
         .route("/v2/simulations", post(submit).get(runs))
         .route("/v2/portfolio", get(portfolio))
         .route("/v2/replay", get(replay))

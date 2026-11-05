@@ -22,21 +22,15 @@ def build_fixture_proposal() -> dict:
     """Fixed, offline example. Never fetch real-time market data implicitly."""
     day = dt.datetime(2026, 10, 30, 10, 0, tzinfo=CN_TZ)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "cycle_id": "offline-fixture-cycle",
         "strategy_version_id": "research-fixture-v1",
         "signal_id": "fixture-buy-600000-20261030",
         "decision_at": day.isoformat(timespec="seconds"),
         "signal": {"symbol": "600000.SH", "side": "buy"},
-        "quote": {
-            "symbol": "600000.SH",
-            "price_cents": 1234,
-            "observed_at": (day - dt.timedelta(seconds=30)).isoformat(timespec="seconds"),
+        "quote_ref": {
             "source": "offline-fixture",
             "quote_id": "fixture-quote-20261030-1000",
-            "tradable": True,
-            "limit_up": False,
-            "limit_down": False,
         },
     }
 
