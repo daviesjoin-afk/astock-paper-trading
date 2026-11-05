@@ -191,3 +191,80 @@ fn offline_trust_never_grants_provider_publication_or_authentication() {
     }
     assert_eq!(decide(&state, &req, Some(&good)).unwrap(), expected);
 }
+
+fn market_request(day: &str, time: &str) -> (SimulationRequest, QuoteEvidence) {
+    let mut req = request(day, Side::Buy);
+    req.decision_at = format!("{day}T{time}+08:00");
+    let at = chrono::DateTime::parse_from_rfc3339(&req.decision_at).unwrap();
+    let mut quote = evidence(day);
+    quote.quote.observed_at = (at - chrono::Duration::seconds(30)).to_rfc3339();
+    quote.available_at = (at - chrono::Duration::seconds(29)).to_rfc3339();
+    (req, quote)
+}
+
+fn assert_market_rejection(day: &str, time: &str, reason: &str) {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let (req, quote) = market_request(day, time);
+    let out = decide(&state, &req, Some(&quote)).unwrap();
+    assert_eq!(out.status, DecisionStatus::Rejected, "{day} {time}");
+    assert_eq!(out.reason, reason);
+    assert!(out.fill.is_none());
+    assert_eq!(out.cash_after_cents, INITIAL_CASH_CENTS);
+    assert_eq!(decide(&state, &req, Some(&quote)).unwrap(), out);
+}
+
+#[test]
+fn weekend_quotes_cannot_fill() {
+    for day in ["2026-10-31", "2026-11-01"] {
+        assert_market_rejection(day, "10:00:00", "weekend_market_closed");
+    }
+}
+
+#[test]
+fn published_holidays_cannot_fill() {
+    for day in ["2026-01-01", "2026-02-23", "2026-10-01"] {
+        assert_market_rejection(day, "10:00:00", "holiday_market_closed");
+    }
+}
+
+#[test]
+fn unknown_calendar_dates_cannot_fill() {
+    for day in ["2025-12-31", "2027-01-04"] {
+        assert_market_rejection(day, "10:00:00", "unknown_trading_date");
+    }
+}
+
+#[test]
+fn midday_boundary_is_not_rounded_to_minutes() {
+    for time in ["11:30:00.001", "11:30:59", "12:59:59.999"] {
+        assert_market_rejection("2026-10-30", time, "midday_break");
+    }
+}
+
+#[test]
+fn after_close_boundary_is_not_rounded_to_minutes() {
+    for time in ["15:00:00.001", "15:00:59", "15:05:00"] {
+        assert_market_rejection("2026-10-30", time, "outside_trading_session");
+    }
+}
+
+#[test]
+fn auctions_are_explicitly_unsupported() {
+    for time in ["09:15:00", "09:25:00"] {
+        assert_market_rejection("2026-10-30", time, "opening_auction_not_supported");
+    }
+    for time in ["14:57:00", "14:59:59.999", "15:00:00"] {
+        assert_market_rejection("2026-10-30", time, "closing_auction_not_supported");
+    }
+}
+
+#[test]
+fn known_continuous_session_boundaries_are_positive_controls() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    for time in ["09:30:00", "11:30:00", "13:00:00", "14:56:59.999"] {
+        let (req, quote) = market_request("2026-10-30", time);
+        let out = decide(&state, &req, Some(&quote)).unwrap();
+        assert_eq!(out.status, DecisionStatus::Filled, "{time}");
+        assert_eq!(decide(&state, &req, Some(&quote)).unwrap(), out);
+    }
+}

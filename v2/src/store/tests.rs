@@ -529,3 +529,59 @@ fn empty_disk_initialization_reopen_and_millisecond_rejections_replay() {
         assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
     }
 }
+
+fn market_input(day: &str, time: &str, id: &str) -> (SimulationRequest, QuoteImport) {
+    let mut req = request(day, id, Side::Buy);
+    req.decision_at = format!("{day}T{time}+08:00");
+    let at = chrono::DateTime::parse_from_rfc3339(&req.decision_at).unwrap();
+    let mut input = evidence(&req);
+    input.quote.observed_at = (at - chrono::Duration::seconds(30)).to_rfc3339();
+    input.available_at = (at - chrono::Duration::seconds(29)).to_rfc3339();
+    (req, input)
+}
+
+#[test]
+fn closed_dates_and_precise_session_rejections_persist_and_replay() {
+    for (day, time, reason) in [
+        ("2026-10-31", "10:00:00", "weekend_market_closed"),
+        ("2026-10-01", "10:00:00", "holiday_market_closed"),
+        ("2027-01-04", "10:00:00", "unknown_trading_date"),
+        ("2026-10-30", "11:30:00.001", "midday_break"),
+        ("2026-10-30", "15:00:00.001", "outside_trading_session"),
+        ("2026-10-30", "14:57:00", "closing_auction_not_supported"),
+    ] {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let (req, input) = market_input(day, time, "closed");
+        db.ingest_quote(input).unwrap();
+        let first = db.submit(req.clone()).unwrap();
+        assert_eq!(first.outcome.reason, reason, "{day} {time}");
+        assert_eq!(first.outcome.status, DecisionStatus::Rejected);
+        let retry = db.submit(req).unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.id, first.id);
+        assert_eq!(retry.outcome, first.outcome);
+        assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+        for _ in 0..2 {
+            let report = db.verify_replay().unwrap();
+            assert_eq!((report.runs_verified, report.fills_verified), (1, 0));
+        }
+    }
+}
+
+#[test]
+fn closed_day_decision_write_failure_rolls_back_then_retries_once() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let (req, input) = market_input("2026-10-31", "10:00:00", "rollback-closed");
+    db.ingest_quote(input).unwrap();
+    db.conn.execute_batch("CREATE TRIGGER block_run BEFORE INSERT ON v2_simulation_runs
+        BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+    assert!(db.submit(req.clone()).is_err());
+    assert_eq!(db.state(None).unwrap().runs_total, 0);
+    assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    db.conn.execute_batch("DROP TRIGGER block_run;").unwrap();
+    let first = db.submit(req.clone()).unwrap();
+    assert_eq!(first.outcome.reason, "weekend_market_closed");
+    assert!(db.submit(req).unwrap().duplicate);
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.state(None).unwrap().runs_total, 1);
+}
