@@ -108,7 +108,7 @@ pub fn decide(
         return Ok(rejected(state, "quote_not_yet_available"));
     }
     if observed_at.date_naive() != decision_at.date_naive() ||
-        (decision_at - observed_at).num_seconds() > MAX_QUOTE_AGE_SECONDS
+        (decision_at - observed_at) > chrono::Duration::seconds(MAX_QUOTE_AGE_SECONDS)
     {
         return Ok(rejected(state, "stale_quote"));
     }

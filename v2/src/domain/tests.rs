@@ -145,3 +145,20 @@ fn research_cannot_smuggle_prices_quantities_or_inline_quotes() {
     injected["quote"]["override_price_cents"] = serde_json::json!(1);
     assert!(serde_json::from_value::<QuoteEvidence>(injected).is_err());
 }
+
+#[test]
+fn quote_freshness_preserves_subsecond_precision_at_boundary() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let req = request("2026-10-30", Side::Buy);
+    let mut quote = evidence("2026-10-30");
+    quote.quote.observed_at = "2026-10-30T09:57:00+08:00".into();
+    let boundary = decide(&state, &req, Some(&quote)).unwrap();
+    assert_eq!(boundary.status, DecisionStatus::Filled);
+    assert_eq!(boundary, decide(&state, &req, Some(&quote)).unwrap());
+    quote.quote.observed_at = "2026-10-30T09:56:59.999+08:00".into();
+    let stale = decide(&state, &req, Some(&quote)).unwrap();
+    assert_eq!(stale.reason, "stale_quote");
+    assert!(stale.fill.is_none());
+    assert_eq!(stale.cash_after_cents, state.cash_cents);
+    assert_eq!(stale, decide(&state, &req, Some(&quote)).unwrap());
+}
