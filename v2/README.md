@@ -28,6 +28,9 @@ investment returns or to trade real money.
 
 ## Architecture
 
+V2 module boundaries: [docs/MODULE_BOUNDARIES.md](docs/MODULE_BOUNDARIES.md).
+Coding-agent conventions: [AGENTS.md](AGENTS.md).
+
 ```text
 v2/web/  TypeScript + Vite — localhost read-only UI
       |
