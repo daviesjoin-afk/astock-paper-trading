@@ -35,8 +35,8 @@ v2/web/  TypeScript + Vite — localhost read-only UI
 v2/src/main.rs — Rust localhost-only API (127.0.0.1:8765)
       |
       v
-v2/src/domain.rs — pure decision function, explicit quote + time + state
-v2/src/store.rs  — only writer, SQLite v2_* ledger, replay verifier
+v2/src/domain/ — typed contract, pure execution policy, T+1 portfolio rules
+v2/src/store/  — sole SQLite writer, read models and deterministic replay
       ^
       | explicit versioned HTTP POST only; never access the ledger directly
       |
