@@ -30,6 +30,15 @@ jobs:
         run: cargo test --locked --all-targets --verbose
       - name: Rust release build
         run: cargo build --release --locked
+      - name: Measure the real offline Store path (no performance threshold)
+        run: |
+          mkdir -p benchmark-results
+          { rustc --version; cargo --version; uname -a; lscpu; df -T .; } > benchmark-results/environment.txt
+          cargo run --release --locked --example ledger_bench -- 100 1000 5000 > benchmark-results/ledger.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-ledger-benchmark-${{ github.sha }}
+          path: v2/benchmark-results/
 
   research-contract:
     runs-on: ubuntu-latest

@@ -358,13 +358,16 @@ fn fill_failure_rolls_back_decision_but_retains_independent_evidence() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     db.ingest_quote(evidence(&req)).unwrap();
+    let historical = db.state(Some("2026-10-30")).unwrap();
     db.conn.execute_batch("CREATE TRIGGER block_fill BEFORE INSERT ON v2_fills BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
     assert!(db.submit(req.clone()).is_err());
     assert_eq!(db.state(None).unwrap().runs_total, 0);
     assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
     assert!(load_evidence(&db.conn, &req.quote_ref).unwrap().is_some());
     db.conn.execute_batch("DROP TRIGGER block_fill;").unwrap();
     assert_eq!(db.submit(req).unwrap().outcome.status, DecisionStatus::Filled);
+    assert_eq!(db.state(Some("2026-10-30")).unwrap().runs_total, 1);
     assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
 }
 

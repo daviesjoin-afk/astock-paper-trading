@@ -4,11 +4,45 @@ use std::collections::BTreeMap;
 
 impl Store {
     pub fn state(&self, asof_day: Option<&str>) -> StoreResult<PortfolioView> {
-        if let Some(day) = asof_day {
-            chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        // A dated view is the end of that China (+08:00) day. Apply only
+        // persisted fills belonging to decisions on/before it; never re-decide.
+        let (state, runs_total) = if let Some(day) = asof_day {
+            let cutoff = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
                 .map_err(|_| StoreError::Rules(RuleError("invalid_asof_day".into())))?;
-        }
-        let state = load_state(&self.conn, self.initial_cash_cents)?;
+            if cutoff.to_string() != day {
+                return Err(StoreError::Rules(RuleError("invalid_asof_day".into())));
+            }
+            let mut state = PortfolioState::new(self.initial_cash_cents);
+            let mut count = 0;
+            // One SELECT gives the projection and count the same SQLite read
+            // snapshot, including rejected decisions with no fill.
+            let mut stmt = self.conn.prepare(
+                "SELECT r.request_json,f.fill_json FROM v2_simulation_runs r
+                 LEFT JOIN v2_fills f ON f.run_id=r.id ORDER BY r.id"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            let china = chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset");
+            for row in rows {
+                let (raw_request, raw_fill) = row?;
+                let request: SimulationRequest = serde_json::from_str(&raw_request)?;
+                let at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
+                    .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+                if at.with_timezone(&china).date_naive() > cutoff { continue; }
+                count += 1;
+                if let Some(raw) = raw_fill {
+                    state.apply(&serde_json::from_str::<Fill>(&raw)?)?;
+                }
+            }
+            (state, count)
+        } else {
+            let state = load_state(&self.conn, self.initial_cash_cents)?;
+            let count = self.conn.query_row(
+                "SELECT COUNT(*) FROM v2_simulation_runs", [], |row| row.get(0)
+            )?;
+            (state, count)
+        };
         let mut quantities = BTreeMap::<String, i64>::new();
         for lot in &state.lots {
             *quantities.entry(lot.symbol.clone()).or_default() += lot.quantity;
@@ -17,9 +51,6 @@ impl Store {
             sellable_quantity: asof_day.map(|day| state.sellable_quantity(&symbol, day)),
             symbol, quantity,
         }).collect();
-        let runs_total = self.conn.query_row(
-            "SELECT COUNT(*) FROM v2_simulation_runs", [], |row| row.get(0)
-        )?;
         Ok(PortfolioView {
             initial_cash_cents: self.initial_cash_cents,
             cash_cents: state.cash_cents, asof_day: asof_day.map(str::to_owned),
