@@ -50,3 +50,18 @@ jobs:
           node-version: "22"
       - run: npm install --no-audit --no-fund
       - run: npm run build
+
+  integration-smoke:
+    runs-on: ubuntu-latest
+    needs: [rust-kernel, research-contract]
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Full Rust API + Python signal + replay smoke
+        run: bash scripts/smoke.sh
