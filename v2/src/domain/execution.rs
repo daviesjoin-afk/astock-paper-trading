@@ -53,19 +53,34 @@ fn symbol_valid(symbol: &str) -> bool {
         symbol.as_bytes()[..6].iter().all(u8::is_ascii_digit)
 }
 
-/// Pure evidence validation. This phase deliberately accepts offline fixtures only.
+/// Validate a command without granting it receipt or provider authority.
+pub fn validate_quote_import(input: &QuoteImport) -> Result<(), RuleError> {
+    if input.schema_version != 1 {
+        return Err(RuleError("unsupported_quote_import_version".into()));
+    }
+    validate_fixture_quote(&input.quote, &input.available_at)
+}
+
+/// Pure validation of pinned facts; never reads a clock or provider.
 pub fn validate_evidence(evidence: &QuoteEvidence) -> Result<(), RuleError> {
-    if evidence.schema_version != 1 {
+    if evidence.schema_version != 2 {
         return Err(RuleError("unsupported_evidence_version".into()));
     }
-    let quote = &evidence.quote;
+    if evidence.provider_published_at.is_some() {
+        return Err(RuleError("offline_fixture_has_no_verified_provider_publication".into()));
+    }
+    timestamp(&evidence.received_at)?;
+    validate_fixture_quote(&evidence.quote, &evidence.available_at)
+}
+
+fn validate_fixture_quote(quote: &Quote, available_at: &str) -> Result<(), RuleError> {
     if quote.source != "offline-fixture" {
         return Err(RuleError("unsupported_quote_source".into()));
     }
     if !key_valid(&quote.quote_id) || !symbol_valid(&quote.symbol) || quote.price_cents <= 0 {
         return Err(RuleError("invalid_quote_evidence".into()));
     }
-    if timestamp(&quote.observed_at)? > timestamp(&evidence.available_at)? {
+    if timestamp(&quote.observed_at)? > timestamp(available_at)? {
         return Err(RuleError("quote_observed_after_availability".into()));
     }
     Ok(())

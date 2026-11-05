@@ -1,5 +1,5 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{QuoteEvidence, SimulationRequest, INITIAL_CASH_CENTS}, store::{Store, StoreError}};
+use astock_v2::{domain::{QuoteImport, SimulationRequest, INITIAL_CASH_CENTS}, store::{Store, StoreError}};
 use axum::{
     extract::{Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
@@ -48,10 +48,10 @@ async fn submit(
 }
 
 async fn ingest_quote(
-    State(state): State<Shared>, Json(evidence): Json<QuoteEvidence>,
+    State(state): State<Shared>, Json(input): Json<QuoteImport>,
 ) -> ApiResult {
     let mut db = state.lock().await;
-    response(db.ingest_quote(evidence).map_err(api_error)?)
+    response(db.ingest_quote(input).map_err(api_error)?)
 }
 
 #[derive(Deserialize)]

@@ -12,7 +12,9 @@ fn request(day: &str, side: Side) -> SimulationRequest {
 
 fn evidence(day: &str) -> QuoteEvidence {
     QuoteEvidence {
-        schema_version: 1, available_at: format!("{day}T09:59:31+08:00"),
+        schema_version: 2, available_at: format!("{day}T09:59:31+08:00"),
+        trust_level: QuoteTrust::OfflineFixture, provider_published_at: None,
+        received_at: "2026-11-04T10:00:00+08:00".into(),
         quote: Quote {
             symbol: "600000.SH".into(), price_cents: 1234,
             observed_at: format!("{day}T09:59:30+08:00"),
@@ -161,4 +163,31 @@ fn quote_freshness_preserves_subsecond_precision_at_boundary() {
     assert!(stale.fill.is_none());
     assert_eq!(stale.cash_after_cents, state.cash_cents);
     assert_eq!(stale, decide(&state, &req, Some(&quote)).unwrap());
+}
+
+#[test]
+fn offline_trust_never_grants_provider_publication_or_authentication() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let req = request("2026-10-30", Side::Buy);
+    let good = evidence("2026-10-30");
+    let expected = decide(&state, &req, Some(&good)).unwrap();
+    // An offline simulation uses its declared historical availability. Actual
+    // receipt is an independent audit fact, never a forged historical receipt.
+    let mut later_receipt = good.clone();
+    later_receipt.received_at = "2030-01-01T00:00:00+08:00".into();
+    assert_eq!(decide(&state, &req, Some(&later_receipt)).unwrap(), expected);
+    let mut forged_publication = good.clone();
+    forged_publication.provider_published_at = Some(good.quote.observed_at.clone());
+    for _ in 0..2 {
+        assert!(decide(&state, &req, Some(&forged_publication)).is_err());
+    }
+    let mut invalid_receipt = good.clone();
+    invalid_receipt.received_at = "not-a-receipt-time".into();
+    assert!(decide(&state, &req, Some(&invalid_receipt)).is_err());
+    for grade in ["authenticated_provider", "verified", "live"] {
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["trust_level"] = serde_json::json!(grade);
+        assert!(serde_json::from_value::<QuoteEvidence>(raw).is_err());
+    }
+    assert_eq!(decide(&state, &req, Some(&good)).unwrap(), expected);
 }

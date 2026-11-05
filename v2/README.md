@@ -19,6 +19,9 @@ module, schema, task, broker or runtime database is imported or reused.
 - Immutable offline quote evidence, explicitly referenced by contract v2;
   decisions pin both evidence availability and missing-evidence rejections.
   See [the evidence contract](docs/QUOTE_EVIDENCE.md).
+- Store records actual receipt separately from the fixture's declared times,
+  fixes trust to `offline_fixture`, and leaves provider publication unknown.
+  See [source trust and time facts](docs/SOURCE_TRUST.md).
 
 **This is a deterministic demonstration kernel, not market-ready exchange
 simulation.** It does not verify whether a quote truly originates from a market
@@ -112,7 +115,7 @@ The read-only V2 UI never touches a V1 endpoint.
   Evidence is ingested separately using `POST /v2/quotes`. An identical retry
   succeeds; a changed payload under the same evidence identity returns 409.
   Missing evidence or availability after the decision produces a saved rejection.
-- Policy `v2-paper-policy-2` requires a **fresh V2 database**. Existing policy-1
+- Policy `v2-paper-policy-3` / SQLite schema version 3 requires a **fresh V2 database**. Existing older
   databases are refused before schema additions; no automatic migration or
   reinterpretation of earlier fills is provided. Keep old files separately.
 - Once recorded, decisions are replayed in ledger insertion order. Contract v2

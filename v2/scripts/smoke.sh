@@ -33,6 +33,7 @@ python3 research/worker.py --output "${RUNNER_TEMP:-/tmp}/v2-proposal.json" --se
 python3 research/worker.py --output "${RUNNER_TEMP:-/tmp}/v2-proposal.json" --send
 python3 - <<'PY'
 import copy
+import datetime as dt
 import json
 from pathlib import Path
 import sys
@@ -56,7 +57,27 @@ def call(path, payload=None, expected=200):
 
 proposal = build_fixture_proposal()
 quote = json.loads(Path("fixtures/quote.json").read_text())
-assert call("quotes", quote) == quote  # Duplicate ingress.
+registered = call("quotes", quote)  # Duplicate ingress.
+assert registered["trust_level"] == "offline_fixture", registered
+assert registered["provider_published_at"] is None, registered
+assert registered["schema_version"] == 2, registered
+assert registered["quote"] == quote["quote"]
+assert registered["available_at"] == quote["available_at"]
+received = dt.datetime.fromisoformat(registered["received_at"])
+assert received.utcoffset() == dt.timedelta(hours=8)
+assert dt.timedelta(0) <= dt.datetime.now(dt.timezone.utc) - received < dt.timedelta(minutes=2)
+assert call("quotes", quote) == registered  # First receipt never refreshes.
+for field, value in (
+    ("received_at", "2000-01-01T00:00:00+08:00"),
+    ("trust_level", "authenticated_provider"),
+    ("provider_published_at", "2026-10-30T09:59:30+08:00"),
+    ("provider_request_id", "invented-proof"),
+    ("provider_response_id", "invented-proof"),
+):
+    injected = copy.deepcopy(quote)
+    injected[field] = value
+    call("quotes", injected, 422)
+call("quotes", registered, 422)  # A durable record is not an import command.
 for field, value in (("price_cents", 1), ("tradable", False)):
     changed = copy.deepcopy(quote)
     changed["quote"][field] = value
@@ -110,7 +131,7 @@ for _ in range(2):
     assert report["ok"] and (report["runs_verified"], report["fills_verified"]) == (3, 1), report
 runs = call("simulations")
 filled = next(run for run in runs if run["outcome"]["status"] == "filled")
-assert filled["evidence"] == quote
+assert filled["evidence"] == registered
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
 echo "V2 HTTP/Python/Rust/SQLite end-to-end smoke passed"
