@@ -91,3 +91,19 @@ fn nested_request_cannot_smuggle_execution_quantity_or_extra_quote_fields() {
     assert!(serde_json::from_value::<SimulationRequest>(injected_quote).is_err(),
             "unknown quote fields must fail closed");
 }
+
+#[test]
+fn quote_freshness_preserves_subsecond_precision_at_boundary() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let mut req = request("2026-10-30", Side::Buy);
+    req.quote.observed_at = "2026-10-30T09:57:00+08:00".into();
+    let boundary = decide(&state, &req).unwrap();
+    assert_eq!(boundary.status, DecisionStatus::Filled);
+    assert_eq!(boundary, decide(&state, &req).unwrap());
+    req.quote.observed_at = "2026-10-30T09:56:59.999+08:00".into();
+    let stale = decide(&state, &req).unwrap();
+    assert_eq!(stale.reason, "stale_quote");
+    assert!(stale.fill.is_none());
+    assert_eq!(stale.cash_after_cents, state.cash_cents);
+    assert_eq!(stale, decide(&state, &req).unwrap());
+}
