@@ -22,11 +22,13 @@ jobs:
         working-directory: v2
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Record Rust toolchain
+        run: rustc --version && cargo --version
       - name: Rust tests
-        run: cargo test --all-targets --verbose
+        run: cargo test --locked --all-targets --verbose
       - name: Rust release build
-        run: cargo build --release
+        run: cargo build --release --locked
 
   research-contract:
     runs-on: ubuntu-latest
@@ -48,7 +50,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
       - run: npm run build
 
   integration-smoke:
@@ -59,7 +61,7 @@ jobs:
         working-directory: v2
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
