@@ -84,76 +84,95 @@ impl Store {
         Self::with_connection(Connection::open_in_memory()?, initial_cash_cents)
     }
 
-    fn with_connection(conn: Connection, initial_cash_cents: i64) -> StoreResult<Self> {
+    fn with_connection(mut conn: Connection, initial_cash_cents: i64) -> StoreResult<Self> {
+        const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
+        const SCHEMA_VERSION: i64 = 1;
         if initial_cash_cents <= 0 {
             return Err(StoreError::Integrity("initial_cash_must_be_positive".into()));
         }
+        // Everything above the acceptance boundary is read-only. In particular,
+        // journal_mode, CREATE, metadata writes and transactions must wait.
+        let objects: Vec<(String, String, String)> = conn.prepare(
+            "SELECT type,name,tbl_name FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY name"
+        )?.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let app_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let fresh = objects.is_empty() && app_id == 0 && version == 0;
+        if !fresh {
+            if objects.iter().any(|(_, name, _)| matches!(name.as_str(),
+                "paper_orders" | "paper_fills" | "dual_ai_tuning_runs")) {
+                return Err(StoreError::Integrity("refusing_to_open_legacy_v1_database".into()));
+            }
+            if app_id != APPLICATION_ID || version != SCHEMA_VERSION {
+                return Err(StoreError::Integrity("database_identity_or_schema_version_mismatch".into()));
+            }
+            let tables: &[(&str, &[&str])] = &[
+                ("v2_meta", &["key", "value"]),
+                ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "outcome_json"]),
+                ("v2_fills", &["id", "run_id", "fill_json"]),
+            ];
+            for (kind, name, table) in &objects {
+                let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
+                    || (kind == "index" && name == "idx_v2_runs_cycle" && table == "v2_simulation_runs");
+                if !known {
+                    return Err(StoreError::Integrity("unknown_database_schema".into()));
+                }
+            }
+            for (table, expected_columns) in tables {
+                let actual: Vec<String> = conn.prepare(&format!("PRAGMA table_info({table})"))?
+                    .query_map([], |r| r.get(1))?.collect::<Result<_, _>>()?;
+                if actual != *expected_columns {
+                    return Err(StoreError::Integrity("unexpected_or_incomplete_v2_schema".into()));
+                }
+            }
+            let policy: Option<String> = conn.query_row(
+                "SELECT value FROM v2_meta WHERE key='policy_version'", [], |r| r.get(0)
+            ).optional()?;
+            if policy.as_deref() != Some(POLICY_VERSION) {
+                return Err(StoreError::Integrity("policy_version_mismatch_migration_required".into()));
+            }
+            let seed: Option<String> = conn.query_row(
+                "SELECT value FROM v2_meta WHERE key='initial_cash_cents'", [], |r| r.get(0)
+            ).optional()?;
+            if seed.as_deref() != Some(initial_cash_cents.to_string().as_str()) {
+                return Err(StoreError::Integrity("initial_cash_mismatch_refusing_to_reinterpret_ledger".into()));
+            }
+        }
+
+        // Accepted empty/current V2 file only. No refused file reaches a write.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        let legacy: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-             ('paper_orders','paper_fills','dual_ai_tuning_runs')",
-            [], |row| row.get(0),
-        )?;
-        if legacy > 0 {
-            return Err(StoreError::Integrity(
-                "refusing_to_open_legacy_v1_database".into()
-            ));
-        }
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS v2_meta (
-                key TEXT PRIMARY KEY NOT NULL,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS v2_simulation_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id TEXT NOT NULL,
-                strategy_version_id TEXT NOT NULL,
-                signal_id TEXT NOT NULL,
-                request_json TEXT NOT NULL,
-                outcome_json TEXT NOT NULL,
-                UNIQUE(cycle_id, strategy_version_id, signal_id)
-            );
-            CREATE TABLE IF NOT EXISTS v2_fills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL UNIQUE
-                    REFERENCES v2_simulation_runs(id) ON DELETE RESTRICT,
-                fill_json TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_v2_runs_cycle
-                ON v2_simulation_runs(cycle_id, id);"
-        )?;
-        let existing: Option<String> = conn.query_row(
-            "SELECT value FROM v2_meta WHERE key='initial_cash_cents'",
-            [], |row| row.get(0),
-        ).optional()?;
-        match existing {
-            None => {
-                conn.execute(
-                    "INSERT INTO v2_meta(key,value) VALUES('initial_cash_cents',?)",
-                    [initial_cash_cents.to_string()],
-                )?;
-            }
-            Some(stored) if stored == initial_cash_cents.to_string() => {}
-            Some(_) => return Err(StoreError::Integrity(
-                "initial_cash_mismatch_refusing_to_reinterpret_ledger".into()
-            )),
-        }
-        let policy: Option<String> = conn.query_row(
-            "SELECT value FROM v2_meta WHERE key='policy_version'",
-            [], |row| row.get(0),
-        ).optional()?;
-        match policy {
-            None => {
-                conn.execute(
-                    "INSERT INTO v2_meta(key,value) VALUES('policy_version',?)",
-                    [POLICY_VERSION],
-                )?;
-            }
-            Some(stored) if stored == POLICY_VERSION => {}
-            Some(_) => return Err(StoreError::Integrity(
-                "policy_version_mismatch_migration_required".into()
-            )),
+        if fresh {
+            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            txn.execute_batch(
+                "CREATE TABLE v2_meta (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE v2_simulation_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_id TEXT NOT NULL,
+                    strategy_version_id TEXT NOT NULL,
+                    signal_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    outcome_json TEXT NOT NULL,
+                    UNIQUE(cycle_id, strategy_version_id, signal_id)
+                );
+                CREATE TABLE v2_fills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL UNIQUE
+                        REFERENCES v2_simulation_runs(id) ON DELETE RESTRICT,
+                    fill_json TEXT NOT NULL
+                );
+                CREATE INDEX idx_v2_runs_cycle ON v2_simulation_runs(cycle_id, id);"
+            )?;
+            txn.pragma_update(None, "application_id", APPLICATION_ID)?;
+            txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            txn.execute("INSERT INTO v2_meta(key,value) VALUES('initial_cash_cents',?)",
+                [initial_cash_cents.to_string()])?;
+            txn.execute("INSERT INTO v2_meta(key,value) VALUES('policy_version',?)", [POLICY_VERSION])?;
+            txn.commit()?;
         }
         Ok(Self { conn, initial_cash_cents })
     }
