@@ -1,0 +1,15 @@
+[package]
+name = "astock-v2"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Independent A-share paper-trading and strategy-factory V2 kernel"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+chrono = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

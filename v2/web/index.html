@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AStock V2 · 纯模拟交易</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111725; color: #e9f0fa; }
+      body { margin: 0; }
+      main { max-width: 1080px; padding: 48px 24px; margin: auto; }
+      header { display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap; }
+      h1 { font-size: 30px; margin: 8px 0; }
+      p { color: #a4b2c8; }
+      .pill { background: #20324b; border-radius: 99px; padding: 9px 16px; font-size: 13px; }
+      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 26px 0; }
+      .card, section { background: #192338; border: 1px solid #2c3950; padding: 22px; border-radius: 12px; }
+      .card strong { display:block; font-size: 24px; margin-top: 12px; }
+      section { margin-top: 22px; overflow-x: auto; }
+      button { background: #527bd8; border: 0; padding: 11px 18px; border-radius: 8px; font-weight: 600; color: white; cursor: pointer; }
+      button:disabled { opacity: 0.5; }
+      table { width: 100%; border-collapse: collapse; min-width: 560px; }
+      th, td { padding: 12px; border-bottom: 1px solid #344155; text-align: left; }
+      .muted { color: #9bb0cc; } .error { color: #eaa4a4; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><div class="muted">ASTOCK / NEW ENGINE</div><h1>独立 V2 模拟交易系统</h1></div>
+        <div class="pill">PAPER ONLY · LOCALHOST</div>
+      </header>
+      <p>Rust 为唯一交易事实写入者；Python 仅生成研究信号；本页面只读。没有券商下单入口。</p>
+      <div class="cards">
+        <div class="card"><span class="muted">现金</span><strong id="cash">—</strong></div>
+        <div class="card"><span class="muted">持仓标的</span><strong id="positions-count">—</strong></div>
+        <div class="card"><span class="muted">模拟请求</span><strong id="run-count">—</strong></div>
+      </div>
+      <div><button id="refresh">刷新</button> <button id="replay">校验确定性回放</button><span id="status" class="muted" role="status"></span></div>
+      <section><h2>当前持仓</h2><table><thead><tr><th>代码</th><th>数量</th></tr></thead><tbody id="positions"></tbody></table></section>
+      <section><h2>最近模拟决策</h2><table><thead><tr><th>ID</th><th>信号</th><th>方向</th><th>状态</th><th>原因</th></tr></thead><tbody id="runs"></tbody></table></section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

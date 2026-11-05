@@ -1,0 +1,52 @@
+name: v2-independent-kernel
+
+on:
+  pull_request:
+    paths:
+      - "v2/**"
+      - ".github/workflows/v2.yml"
+  push:
+    branches: [master]
+    paths:
+      - "v2/**"
+      - ".github/workflows/v2.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-kernel:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust tests
+        run: cargo test --all-targets --verbose
+      - name: Rust release build
+        run: cargo build --release
+
+  research-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m unittest discover -s v2/research -p 'test_*.py' -v
+      - run: python v2/research/worker.py --output /tmp/v2-fixture.json
+
+  web-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
