@@ -58,15 +58,16 @@ research worker.
 
 ## Quick start
 
-Prerequisites: Rust stable >= 1.85, Python >= 3.11, Node.js >= 20.
+Prerequisites: Rust **1.99.1** (pinned by `rust-toolchain.toml`), Python >= 3.11,
+Node.js >= 20. CI uses Node 22 and Python 3.13. See [build reproducibility](docs/BUILD_REPRODUCIBILITY.md).
 
 From repository root:
 
 ```bash
 cd v2
-cargo test
+cargo test --locked
 export ASTOCK_V2_DB=./v2-evidence-paper.sqlite3
-cargo run
+cargo run --locked
 ```
 
 In another terminal, from repository root:
@@ -85,7 +86,7 @@ For the web UI:
 
 ```bash
 cd v2/web
-npm install
+npm ci
 npm run dev
 ```
 
