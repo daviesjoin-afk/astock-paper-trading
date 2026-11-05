@@ -6,7 +6,8 @@ on:
       - "v2/**"
       - ".github/workflows/v2.yml"
   push:
-    branches: [master]
+    # Temporary validation branch: no sixth stacked PR before manual integration.
+    branches: [master, codex/v2-pit-state]
     paths:
       - "v2/**"
       - ".github/workflows/v2.yml"
