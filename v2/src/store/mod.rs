@@ -1,5 +1,5 @@
 //! SQLite is an append-only simulation ledger with exactly one Rust write owner.
-use crate::domain::{decide, validate_evidence, Fill, Lot, Outcome, POLICY_VERSION, PortfolioState, QuoteEvidence, QuoteRef, RuleError, SimulationRequest};
+use crate::domain::{decide, validate_quote_import, Fill, Lot, Outcome, POLICY_VERSION, PortfolioState, QuoteEvidence, QuoteImport, QuoteRef, QuoteTrust, RuleError, SimulationRequest};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -87,7 +87,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection, initial_cash_cents: i64) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 2;
+        const SCHEMA_VERSION: i64 = 3;
         if initial_cash_cents <= 0 {
             return Err(StoreError::Integrity("initial_cash_must_be_positive".into()));
         }
@@ -187,18 +187,28 @@ impl Store {
     }
 
     /// Immutable evidence, owned by the same single writer as the ledger.
-    pub fn ingest_quote(&mut self, evidence: QuoteEvidence) -> StoreResult<QuoteEvidence> {
-        validate_evidence(&evidence)?;
+    pub fn ingest_quote(&mut self, input: QuoteImport) -> StoreResult<QuoteEvidence> {
+        validate_quote_import(&input)?;
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let identity = QuoteRef {
-            source: evidence.quote.source.clone(), quote_id: evidence.quote.quote_id.clone(),
+            source: input.quote.source.clone(), quote_id: input.quote.quote_id.clone(),
         };
         if let Some(stored) = load_evidence(&txn, &identity)? {
-            if stored != evidence {
+            if stored.quote != input.quote || stored.available_at != input.available_at {
                 return Err(StoreError::Conflict("quote_identity_payload_conflict".into()));
             }
             return Ok(stored);
         }
+        // Only this Rust ingress records actual receipt. Caller declarations
+        // remain offline claims and never become authenticated provider facts.
+        let received_at = chrono::Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset"))
+            .to_rfc3339();
+        let evidence = QuoteEvidence {
+            schema_version: 2, available_at: input.available_at, quote: input.quote,
+            trust_level: QuoteTrust::OfflineFixture,
+            provider_published_at: None, received_at,
+        };
         txn.execute(
             "INSERT INTO v2_quote_evidence(source,quote_id,evidence_json) VALUES(?,?,?)",
             params![identity.source, identity.quote_id, serde_json::to_string(&evidence)?],

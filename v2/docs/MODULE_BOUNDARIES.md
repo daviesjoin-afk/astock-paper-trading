@@ -25,6 +25,7 @@
 6. V2 从不读取/迁移 V1 运行库，不接券商，不触发自动激活。
 7. 契约 v2 的研究请求只引用 `quote_ref`，不接受内嵌报价。Store 独占证据入库和按身份解析；Domain 只接收显式证据，校验其可见时点。
 8. 每次决策固定实际使用的证据快照（包括缺失）；回放不得用后补报价改写拒绝。现有证据入库内容必须与已固定快照一致。详见 [QUOTE_EVIDENCE.md](QUOTE_EVIDENCE.md)。
+9. `QuoteImport` 是不可信离线导入命令；`QuoteEvidence` 是 Store 生成的持久化事实。只有 Store 记录 `received_at`，Domain 不读时钟。离线证据固定为 `offline_fixture`，供应商发布时间未知，不存在可自报的认证等级。详见 [SOURCE_TRUST.md](SOURCE_TRUST.md)。
 
 **不做的事情**：不设计通用事件总线、不做微服务、不接 Kafka/Redis/ORM、不增加“为了模块化而存在”的 facade 或重复数据模型、不使用硬编码 LOC/函数行数阈值作为合并门禁。
 

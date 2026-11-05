@@ -10,7 +10,7 @@ pub const COMMISSION_BPS: i64 = 3;
 pub const MIN_COMMISSION_CENTS: i64 = 500;
 pub const SELL_STAMP_DUTY_BPS: i64 = 5;
 pub const MAX_QUOTE_AGE_SECONDS: i64 = 180;
-pub const POLICY_VERSION: &str = "v2-paper-policy-2";
+pub const POLICY_VERSION: &str = "v2-paper-policy-3";
 
 #[derive(Debug)]
 pub struct RuleError(pub String);
@@ -69,13 +69,32 @@ pub struct QuoteRef {
     pub quote_id: String,
 }
 
-/// Explicit offline availability time, not an authenticated provider receipt.
+/// Untrusted offline import command. Server-owned receipt/trust fields are absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteImport {
+    pub schema_version: u32,
+    pub available_at: String,
+    pub quote: Quote,
+}
+
+/// No authenticated provider is implemented. Unknown grades fail deserialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteTrust {
+    OfflineFixture,
+}
+
+/// Durable facts constructed by Store, never accepted as an ingress command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteEvidence {
     pub schema_version: u32,
     pub available_at: String,
     pub quote: Quote,
+    pub trust_level: QuoteTrust,
+    pub provider_published_at: Option<String>,
+    pub received_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

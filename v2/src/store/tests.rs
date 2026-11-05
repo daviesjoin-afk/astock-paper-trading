@@ -13,9 +13,9 @@ fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
     }
 }
 
-fn evidence(req: &SimulationRequest) -> QuoteEvidence {
+fn evidence(req: &SimulationRequest) -> QuoteImport {
     let day = &req.decision_at[..10];
-    QuoteEvidence {
+    QuoteImport {
         schema_version: 1, available_at: format!("{day}T09:59:31+08:00"),
         quote: Quote {
             symbol: req.signal.symbol.clone(), price_cents: 1234,
@@ -104,8 +104,10 @@ fn quote_ingestion_is_idempotent_and_every_evidence_field_is_immutable() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     let quote = evidence(&req);
-    assert_eq!(db.ingest_quote(quote.clone()).unwrap(), quote);
-    assert_eq!(db.ingest_quote(quote.clone()).unwrap(), quote);
+    let stored = db.ingest_quote(quote.clone()).unwrap();
+    assert_eq!(stored.quote, quote.quote);
+    assert_eq!(stored.available_at, quote.available_at);
+    assert_eq!(db.ingest_quote(quote.clone()).unwrap(), stored);
     let mut variants = Vec::new();
     let mut bad = quote.clone();
     bad.quote.price_cents += 1;
@@ -133,7 +135,7 @@ fn quote_ingestion_is_idempotent_and_every_evidence_field_is_immutable() {
             assert!(matches!(db.ingest_quote(bad.clone()), Err(StoreError::Conflict(_))));
         }
     }
-    assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(quote));
+    assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(stored));
     let count: i64 = db.conn.query_row("SELECT COUNT(*) FROM v2_quote_evidence", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
     assert_eq!(db.state(None).unwrap().runs_total, 0);
@@ -233,12 +235,12 @@ fn replay_detects_changed_or_deleted_evidence_for_fills_and_rejections() {
         let req = request("2026-10-30", "b1", Side::Buy);
         let mut quote = evidence(&req);
         if late { quote.available_at = "2026-10-30T10:00:01+08:00".into(); }
-        db.ingest_quote(quote.clone()).unwrap();
+        let mut stored = db.ingest_quote(quote.clone()).unwrap();
         db.submit(req).unwrap();
         assert!(db.verify_replay().unwrap().ok);
-        let original = serde_json::to_string(&quote).unwrap();
-        quote.quote.price_cents += 1;
-        db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [serde_json::to_string(&quote).unwrap()]).unwrap();
+        let original = serde_json::to_string(&stored).unwrap();
+        stored.quote.price_cents += 1;
+        db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [serde_json::to_string(&stored).unwrap()]).unwrap();
         assert!(db.verify_replay().is_err());
         db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [original]).unwrap();
         assert!(db.verify_replay().unwrap().ok);
@@ -296,6 +298,84 @@ fn old_policy_database_is_refused_before_adding_evidence_schema() {
     assert!(matches!(Store::with_connection(Connection::open(&path).unwrap(), INITIAL_CASH_CENTS), Err(StoreError::Integrity(_))));
     let tables: i64 = keeper.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0)).unwrap();
     assert_eq!(tables, 1);
+}
+
+#[test]
+fn server_receipt_and_offline_trust_survive_retries_reopen_and_replay() {
+    let file = DiskDatabase::new();
+    let req = request("2026-10-30", "receipt", Side::Buy);
+    let input = evidence(&req);
+    let saved;
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let before = chrono::Utc::now();
+        saved = db.ingest_quote(input.clone()).unwrap();
+        let after = chrono::Utc::now();
+        let receipt = chrono::DateTime::parse_from_rfc3339(&saved.received_at).unwrap();
+        assert!(receipt >= before && receipt <= after);
+        assert_ne!(saved.received_at, input.available_at);
+        assert_eq!(saved.trust_level, QuoteTrust::OfflineFixture);
+        assert!(saved.provider_published_at.is_none());
+        assert_eq!(db.ingest_quote(input.clone()).unwrap(), saved);
+        let run = db.submit(req.clone()).unwrap();
+        assert_eq!(run.outcome.status, DecisionStatus::Filled);
+        assert_eq!(run.evidence, Some(saved.clone()));
+    }
+    let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    assert_eq!(db.ingest_quote(input).unwrap(), saved);
+    let retry = db.submit(req).unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(retry.evidence, Some(saved));
+    let first_replay = db.verify_replay().unwrap();
+    assert_eq!((first_replay.runs_verified, first_replay.fills_verified), (1, 1));
+    assert_eq!(db.verify_replay().unwrap(), first_replay);
+}
+
+#[test]
+fn import_command_rejects_server_facts_and_invented_proofs() {
+    let input = evidence(&request("2026-10-30", "b1", Side::Buy));
+    let good = serde_json::to_value(&input).unwrap();
+    assert!(serde_json::from_value::<QuoteImport>(good.clone()).is_ok());
+    for field in ["received_at", "trust_level", "provider_published_at",
+                  "provider_request_id", "provider_response_id"] {
+        let mut forged = good.clone();
+        forged[field] = serde_json::json!("forged-server-or-provider-fact");
+        for _ in 0..2 {
+            assert!(serde_json::from_value::<QuoteImport>(forged.clone()).is_err());
+        }
+    }
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let saved = db.ingest_quote(input).unwrap();
+    assert!(serde_json::from_value::<QuoteImport>(serde_json::to_value(saved).unwrap()).is_err());
+    assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+}
+
+#[test]
+fn replay_detects_changed_receipt_or_trust_even_without_price_change() {
+    for late in [false, true] {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let req = request("2026-10-30", "receipt", Side::Buy);
+        let mut input = evidence(&req);
+        if late { input.available_at = "2026-10-30T10:00:00.001+08:00".into(); }
+        let saved = db.ingest_quote(input).unwrap();
+        let run = db.submit(req.clone()).unwrap();
+        assert_eq!(run.outcome.status, if late { DecisionStatus::Rejected } else { DecisionStatus::Filled });
+        assert!(db.submit(req).unwrap().duplicate);
+        let original = serde_json::to_string(&saved).unwrap();
+        for (field, value) in [
+            ("received_at", serde_json::json!("2000-01-01T00:00:00+08:00")),
+            ("trust_level", serde_json::json!("authenticated_provider")),
+            ("provider_published_at", serde_json::json!("2026-10-30T09:59:30+08:00")),
+        ] {
+            let mut changed = serde_json::to_value(&saved).unwrap();
+            changed[field] = value;
+            db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [changed.to_string()]).unwrap();
+            assert!(db.verify_replay().is_err());
+            db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [&original]).unwrap();
+            assert!(db.verify_replay().unwrap().ok);
+        }
+        assert_eq!(db.verify_replay().unwrap(), db.verify_replay().unwrap());
+    }
 }
 
 // Real disk files are essential: :memory: cannot expose journal-mode changes.
