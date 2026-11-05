@@ -31,6 +31,8 @@ Store/query 以已保存的 `SimulationRequest.decision_at` 确定日期，
 方向仍为 HTTP → Store → Domain；计算委托已有 PortfolioState，API 不复制规则。
 不增加业务模块、第三方依赖、表、索引、schema 版本或数据库迁移。
 Store 仍是唯一写入权威；submit 和 verify_replay 的交易规则与写入过程没有变化。
+Rust/Python/前端依赖及 lockfile 不变；V2 CI 新增 GitHub 官方
+`actions/upload-artifact@v4`，仅用于上传测量 JSON 与环境证据。
 
 ## 可运行的性能测量
 
