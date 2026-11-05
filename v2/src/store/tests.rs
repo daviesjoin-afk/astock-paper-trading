@@ -32,6 +32,30 @@ fn ingest_and_submit(db: &mut Store, req: SimulationRequest) -> RunRecord {
 }
 
 #[test]
+fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-30", "reference-only", Side::Buy);
+    let mut raw = serde_json::to_value(evidence(&req)).unwrap();
+    raw.as_object_mut().unwrap().remove("execution");
+    db.ingest_quote(serde_json::from_value(raw).unwrap()).unwrap();
+    let first = db.submit(req.clone()).unwrap();
+    assert_eq!(first.outcome.status, DecisionStatus::Rejected);
+    assert_eq!(first.outcome.reason, "execution_evidence_missing");
+    assert!(first.outcome.fill.is_none());
+    for _ in 0..2 {
+        let retry = db.submit(req.clone()).unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.outcome, first.outcome);
+        let view = db.state(Some("2026-10-30")).unwrap();
+        assert_eq!(view.cash_cents, INITIAL_CASH_CENTS);
+        assert!(view.positions.is_empty());
+        assert_eq!(view.runs_total, 1);
+        let replay = db.verify_replay().unwrap();
+        assert_eq!((replay.runs_verified, replay.fills_verified), (1, 0));
+    }
+}
+
+#[test]
 fn dedup_is_exact_and_does_not_duplicate_fills() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);

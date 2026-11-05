@@ -44,6 +44,22 @@ fn buy_is_board_lot_and_does_not_spend_more_than_budget() {
 }
 
 #[test]
+fn reference_quote_without_execution_evidence_cannot_fill() {
+    let state = PortfolioState::new(INITIAL_CASH_CENTS);
+    let req = request("2026-10-30", Side::Buy);
+    let mut raw = serde_json::to_value(evidence("2026-10-30")).unwrap();
+    raw.as_object_mut().unwrap().remove("execution");
+    let reference_only: QuoteEvidence = serde_json::from_value(raw).unwrap();
+    for _ in 0..2 {
+        let out = decide(&state, &req, Some(&reference_only), &calendar(), &sessions()).unwrap();
+        assert_eq!(out.status, DecisionStatus::Rejected);
+        assert_eq!(out.reason, "execution_evidence_missing");
+        assert!(out.fill.is_none());
+        assert_eq!(out.cash_after_cents, INITIAL_CASH_CENTS);
+    }
+}
+
+#[test]
 fn t_plus_one_blocks_sale_on_purchase_day_then_allows_next_day() {
     let mut state = PortfolioState::new(INITIAL_CASH_CENTS);
     let buy = decide(&state, &request("2026-10-30", Side::Buy), Some(&evidence("2026-10-30")), &calendar(), &sessions()).unwrap().fill.unwrap();
