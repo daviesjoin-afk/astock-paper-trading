@@ -1,8 +1,81 @@
 //! Pure decision policy: explicit snapshots in, deterministic outcome out.
 use super::contract::*;
+use super::calendar::{CalendarDay, TradingCalendar};
 use super::portfolio::PortfolioState;
-use chrono::{DateTime, FixedOffset, Timelike};
+use chrono::{DateTime, FixedOffset, NaiveTime};
 use serde::{Deserialize, Serialize};
+
+pub const SESSION_POLICY_VERSION: &str = "cn-a-share-continuous-only-v1";
+pub const BUNDLED_SESSION_POLICY_JSON: &str = include_str!("../../data/session-policy-v1.json");
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionWindow {
+    pub start: String,
+    pub end: String,
+    pub end_inclusive: bool,
+}
+
+fn session_time(value: &str) -> Result<NaiveTime, RuleError> {
+    NaiveTime::parse_from_str(value, "%H:%M:%S%.f")
+        .map_err(|_| RuleError("invalid_session_policy_time".into()))
+}
+
+impl SessionWindow {
+    fn bounds(&self) -> Result<(NaiveTime, NaiveTime), RuleError> {
+        let start = session_time(&self.start)?;
+        let end = session_time(&self.end)?;
+        if start >= end { return Err(RuleError("invalid_session_window".into())); }
+        Ok((start, end))
+    }
+
+    fn contains(&self, time: NaiveTime) -> Result<bool, RuleError> {
+        let (start, end) = self.bounds()?;
+        Ok(time >= start && (time < end || (self.end_inclusive && time == end)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPolicy {
+    pub schema_version: u32,
+    pub version: String,
+    pub continuous: [SessionWindow; 2],
+    pub opening_auction: SessionWindow,
+    pub closing_auction: SessionWindow,
+    pub sources: [String; 2],
+}
+
+impl SessionPolicy {
+    pub fn validate(&self) -> Result<(), RuleError> {
+        if self.schema_version != 1 || self.version != SESSION_POLICY_VERSION
+            || self.sources.iter().any(String::is_empty)
+        { return Err(RuleError("unsupported_session_policy".into())); }
+        let morning = self.continuous[0].bounds()?;
+        let afternoon = self.continuous[1].bounds()?;
+        let opening = self.opening_auction.bounds()?;
+        let closing = self.closing_auction.bounds()?;
+        if opening.1 >= morning.0 || morning.1 >= afternoon.0 || afternoon.1 != closing.0
+            || self.continuous[1].end_inclusive
+        {
+            return Err(RuleError("overlapping_or_inconsistent_sessions".into()));
+        }
+        Ok(())
+    }
+
+    fn rejection(&self, time: NaiveTime) -> Result<Option<&'static str>, RuleError> {
+        self.validate()?;
+        if self.opening_auction.contains(time)? { return Ok(Some("opening_auction_not_supported")); }
+        if self.closing_auction.contains(time)? { return Ok(Some("closing_auction_not_supported")); }
+        for window in &self.continuous {
+            if window.contains(time)? { return Ok(None); }
+        }
+        if time > self.continuous[0].bounds()?.1 && time < self.continuous[1].bounds()?.0 {
+            return Ok(Some("midday_break"));
+        }
+        Ok(Some("outside_trading_session"))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,7 +162,10 @@ fn validate_fixture_quote(quote: &Quote, available_at: &str) -> Result<(), RuleE
 /// One immutable decision. Caller provides all time/quote inputs.
 pub fn decide(
     state: &PortfolioState, req: &SimulationRequest, evidence: Option<&QuoteEvidence>,
+    calendar: &TradingCalendar, sessions: &SessionPolicy,
 ) -> Result<Outcome, RuleError> {
+    calendar.validate()?;
+    sessions.validate()?;
     if req.schema_version != 2 {
         return Err(RuleError("unsupported_contract_version".into()));
     }
@@ -127,9 +203,14 @@ pub fn decide(
     {
         return Ok(rejected(state, "stale_quote"));
     }
-    let time = decision_at.hour() * 60 + decision_at.minute();
-    if !((570..=690).contains(&time) || (780..=900).contains(&time)) {
-        return Ok(rejected(state, "outside_trading_session"));
+    match calendar.day(decision_at.date_naive())? {
+        CalendarDay::Trading => {}
+        CalendarDay::Weekend => return Ok(rejected(state, "weekend_market_closed")),
+        CalendarDay::Holiday => return Ok(rejected(state, "holiday_market_closed")),
+        CalendarDay::Unknown => return Ok(rejected(state, "unknown_trading_date")),
+    }
+    if let Some(reason) = sessions.rejection(decision_at.time())? {
+        return Ok(rejected(state, reason));
     }
     if !quote.tradable {
         return Ok(rejected(state, "not_tradable"));

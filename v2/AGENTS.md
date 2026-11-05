@@ -14,6 +14,7 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
   SQLite, axum, tokio, or any V1 modules.
 - `domain/contract.rs`: versioned data contracts and identity.
   `portfolio.rs`: cash, lots and T+1 state transitions.
+  `calendar.rs`: fixed-version scheduled trading-day facts and source coverage.
   `execution.rs`: pure decision policy.
 - `store/mod.rs` exclusively owns durable writes, schema, transactions,
   idempotency and storage policy. `store/query.rs` only reads, projects
@@ -37,6 +38,9 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
 - Replay must verify the exact persisted request, outcome and fill,
   including rejected decisions. Never silently append earlier
   decision times after a later one.
+- Calendar/session snapshots and run version references are immutable. Unknown
+  dates and unsupported auctions reject. Replay uses the recorded snapshots;
+  unsupported or changed snapshot versions fail rather than reinterpret history.
 - Trading remains simulated. No broker endpoints or live-order APIs.
 
 ## Small-change protocol

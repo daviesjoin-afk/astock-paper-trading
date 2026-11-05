@@ -529,3 +529,152 @@ fn empty_disk_initialization_reopen_and_millisecond_rejections_replay() {
         assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
     }
 }
+
+fn market_input(day: &str, time: &str, id: &str) -> (SimulationRequest, QuoteImport) {
+    let mut req = request(day, id, Side::Buy);
+    req.decision_at = format!("{day}T{time}+08:00");
+    let at = chrono::DateTime::parse_from_rfc3339(&req.decision_at).unwrap();
+    let mut input = evidence(&req);
+    input.quote.observed_at = (at - chrono::Duration::seconds(30)).to_rfc3339();
+    input.available_at = (at - chrono::Duration::seconds(29)).to_rfc3339();
+    (req, input)
+}
+
+#[test]
+fn closed_dates_and_precise_session_rejections_persist_and_replay() {
+    for (day, time, reason) in [
+        ("2026-10-31", "10:00:00", "weekend_market_closed"),
+        ("2026-10-01", "10:00:00", "holiday_market_closed"),
+        ("2027-01-04", "10:00:00", "unknown_trading_date"),
+        ("2026-10-30", "11:30:00.001", "midday_break"),
+        ("2026-10-30", "15:00:00.001", "outside_trading_session"),
+        ("2026-10-30", "14:57:00", "closing_auction_not_supported"),
+    ] {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let (req, input) = market_input(day, time, "closed");
+        db.ingest_quote(input).unwrap();
+        let first = db.submit(req.clone()).unwrap();
+        assert_eq!(first.outcome.reason, reason, "{day} {time}");
+        assert_eq!(first.outcome.status, DecisionStatus::Rejected);
+        let retry = db.submit(req).unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.id, first.id);
+        assert_eq!(retry.outcome, first.outcome);
+        assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+        for _ in 0..2 {
+            let report = db.verify_replay().unwrap();
+            assert_eq!((report.runs_verified, report.fills_verified), (1, 0));
+        }
+    }
+}
+
+#[test]
+fn closed_day_decision_write_failure_rolls_back_then_retries_once() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let (req, input) = market_input("2026-10-31", "10:00:00", "rollback-closed");
+    db.ingest_quote(input).unwrap();
+    db.conn.execute_batch("CREATE TRIGGER block_run BEFORE INSERT ON v2_simulation_runs
+        BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+    assert!(db.submit(req.clone()).is_err());
+    assert_eq!(db.state(None).unwrap().runs_total, 0);
+    assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    db.conn.execute_batch("DROP TRIGGER block_run;").unwrap();
+    let first = db.submit(req.clone()).unwrap();
+    assert_eq!(first.outcome.reason, "weekend_market_closed");
+    assert!(db.submit(req).unwrap().duplicate);
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.state(None).unwrap().runs_total, 1);
+}
+
+#[test]
+fn fixed_market_snapshots_and_run_references_survive_disk_reopen() {
+    let file = DiskDatabase::new();
+    let snapshots;
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        for (day, id) in [("2026-10-30", "open"), ("2026-10-31", "closed")] {
+            let (req, input) = market_input(day, "10:00:00", id);
+            db.ingest_quote(input).unwrap();
+            let first = db.submit(req.clone()).unwrap();
+            assert_eq!(first.calendar_version, crate::domain::CALENDAR_VERSION);
+            assert_eq!(first.session_policy_version, crate::domain::SESSION_POLICY_VERSION);
+            let retry = db.submit(req).unwrap();
+            assert!(retry.duplicate);
+            assert_eq!(first.calendar_version, retry.calendar_version);
+        }
+        snapshots = (
+            db.conn.query_row("SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get::<_, String>(0)).unwrap(),
+            db.conn.query_row("SELECT value FROM v2_meta WHERE key='session_policy_snapshot_json'", [], |r| r.get::<_, String>(0)).unwrap(),
+        );
+    }
+    let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    let (calendar, sessions) = load_market_context(&db.conn).unwrap();
+    assert_eq!(serde_json::from_str::<TradingCalendar>(&snapshots.0).unwrap(), calendar);
+    assert_eq!(serde_json::from_str::<SessionPolicy>(&snapshots.1).unwrap(), sessions);
+    for _ in 0..2 {
+        let report = db.verify_replay().unwrap();
+        assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
+    }
+}
+
+#[test]
+fn changed_market_snapshots_or_run_versions_never_reinterpret_history() {
+    for day in ["2026-10-30", "2026-10-31"] {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let (req, input) = market_input(day, "10:00:00", "pin");
+        db.ingest_quote(input).unwrap();
+        let saved = db.submit(req.clone()).unwrap();
+        let state = db.state(None).unwrap();
+        for key in ["calendar_snapshot_json", "session_policy_snapshot_json"] {
+            let original: String = db.conn.query_row("SELECT value FROM v2_meta WHERE key=?", [key], |r| r.get(0)).unwrap();
+            let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+            if key == "calendar_snapshot_json" {
+                changed["holidays"][6]["end"] = serde_json::json!("2026-10-08");
+            } else {
+                changed["continuous"][0]["end"] = serde_json::json!("11:31:00");
+            }
+            db.conn.execute("UPDATE v2_meta SET value=? WHERE key=?", params![changed.to_string(), key]).unwrap();
+            assert!(db.verify_replay().is_err());
+            let mut next = req.clone();
+            next.signal_id = "next".into();
+            assert!(db.submit(next).is_err());
+            assert_eq!(db.state(None).unwrap(), state);
+            db.conn.execute("UPDATE v2_meta SET value=? WHERE key=?", params![original, key]).unwrap();
+            assert!(db.verify_replay().unwrap().ok);
+        }
+        for (column, original) in [
+            ("calendar_version", saved.calendar_version.as_str()),
+            ("session_policy_version", saved.session_policy_version.as_str()),
+        ] {
+            db.conn.execute(&format!("UPDATE v2_simulation_runs SET {column}='later-version'"), []).unwrap();
+            assert!(db.verify_replay().is_err());
+            assert!(db.submit(req.clone()).is_err());
+            db.conn.execute(&format!("UPDATE v2_simulation_runs SET {column}=?"), [original]).unwrap();
+            assert!(db.verify_replay().unwrap().ok);
+        }
+        assert_eq!(db.runs(10).unwrap()[0], saved);
+        assert_eq!(db.verify_replay().unwrap(), db.verify_replay().unwrap());
+    }
+}
+
+#[test]
+fn invalid_pinned_calendar_is_refused_before_wal_or_schema_writes() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        ingest_and_submit(&mut db, request("2026-10-30", "keep", Side::Buy));
+    }
+    {
+        let conn = Connection::open(file.path()).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        let raw: String = conn.query_row("SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get(0)).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        changed["coverage_end"] = serde_json::json!("2026-12-30");
+        conn.execute("UPDATE v2_meta SET value=? WHERE key='calendar_snapshot_json'", [changed.to_string()]).unwrap();
+    }
+    let before = disk_snapshot(&file);
+    for _ in 0..2 {
+        assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err());
+        assert_eq!(disk_snapshot(&file), before);
+    }
+}

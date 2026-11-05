@@ -22,10 +22,14 @@ module, schema, task, broker or runtime database is imported or reused.
 - Store records actual receipt separately from the fixture's declared times,
   fixes trust to `offline_fixture`, and leaves provider publication unknown.
   See [source trust and time facts](docs/SOURCE_TRUST.md).
+- Pinned 2026 SSE/SZSE scheduled calendar and full-precision continuous-session
+  policy; weekends, published holidays, uncovered dates and unsupported auctions
+  reject. Store pins complete market snapshots and each run's version references.
+  See [calendar and session scope](docs/CALENDAR_SESSIONS.md).
 
 **This is a deterministic demonstration kernel, not market-ready exchange
 simulation.** It does not verify whether a quote truly originates from a market
-provider, exchange holiday calendars, ST/STAR/ChiNext/Beijing price-limit tiers,
+provider, live emergency market closures, ST/STAR/ChiNext/Beijing price-limit tiers,
 intraday liquidity, call auctions, partial fills, slippage or broker custody.
 It accepts separately ingested `offline-fixture` evidence and assumes complete fills at that
 price once basic conditions hold. The fixed fee model is deliberately
@@ -66,7 +70,7 @@ From repository root:
 ```bash
 cd v2
 cargo test --locked
-export ASTOCK_V2_DB=./v2-evidence-paper.sqlite3
+export ASTOCK_V2_DB=./v2-calendar-paper.sqlite3
 cargo run --locked
 ```
 
@@ -116,7 +120,7 @@ The read-only V2 UI never touches a V1 endpoint.
   Evidence is ingested separately using `POST /v2/quotes`. An identical retry
   succeeds; a changed payload under the same evidence identity returns 409.
   Missing evidence or availability after the decision produces a saved rejection.
-- Policy `v2-paper-policy-3` / SQLite schema version 3 requires a **fresh V2 database**. Existing older
+- Policy `v2-paper-policy-4` / SQLite schema version 4 requires a **fresh V2 database**. Existing older
   databases are refused before schema additions; no automatic migration or
   reinterpretation of earlier fills is provided. Keep old files separately.
 - Once recorded, decisions are replayed in ledger insertion order. Contract v2
