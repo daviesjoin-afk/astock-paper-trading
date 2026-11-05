@@ -28,7 +28,7 @@ investment returns or to trade real money.
 
 ## Architecture
 
-\`\`\`text
+```text
 v2/web/  TypeScript + Vite — localhost read-only UI
       |
       v
@@ -41,7 +41,7 @@ v2/src/store.rs  — only writer, SQLite v2_* ledger, replay verifier
       | explicit versioned HTTP POST only; never access the ledger directly
       |
 v2/research/worker.py — offline research proposal (Python stdlib)
-\`\`\`
+```
 
 There are no live-market, broker, autonomous activation, scheduler, or live
 portfolio endpoints. The trading path is isolated from V1 and from the
@@ -53,43 +53,43 @@ Prerequisites: Rust stable >= 1.85, Python >= 3.11, Node.js >= 20.
 
 From repository root:
 
-\`\`\`bash
+```bash
 cd v2
 cargo test
 cargo run
-\`\`\`
+```
 
 In another terminal, from repository root:
 
-\`\`\`bash
+```bash
 python3 v2/research/worker.py --output /tmp/v2-signal.json
 python3 v2/research/worker.py --output /tmp/v2-signal.json --send
 curl -s http://127.0.0.1:8765/v2/portfolio
 curl -s http://127.0.0.1:8765/v2/replay
 python3 -m unittest discover -s v2/research -p 'test_*.py' -v
-\`\`\`
+```
 
 For the web UI:
 
-\`\`\`bash
+```bash
 cd v2/web
 npm install
 npm run dev
-\`\`\`
+```
 
-Open http://127.0.0.1:5174. The dev server proxies \`/v2\` to the Rust API.
+Open http://127.0.0.1:5174. The dev server proxies `/v2` to the Rust API.
 The read-only V2 UI never touches a V1 endpoint.
 
 ## State and data boundaries
 
-- Default data file is \`v2/v2-paper.sqlite3\` if run from \`v2/\`.
-  Set \`ASTOCK_V2_DB\` to select an isolated path, **never** a V1 path.
+- Default data file is `v2/v2-paper.sqlite3` if run from `v2/`.
+  Set `ASTOCK_V2_DB` to select an isolated path, **never** a V1 path.
 - Default seed cash is CNY 100,000 (10,000,000 cents). Override only for a
-  *new database* with \`ASTOCK_V2_INITIAL_CASH_CENTS\`.
+  *new database* with `ASTOCK_V2_INITIAL_CASH_CENTS`.
 - Database startup refuses known V1 schema names and existing seed-cash
   / policy mismatches. Back up before migrating schema versions.
 - Idempotency identity is
-  \`(cycle_id, strategy_version_id, signal_id)\`; same payload returns the
+  `(cycle_id, strategy_version_id, signal_id)`; same payload returns the
   original result, changed payload fails 409, without a second fill.
 - Money and quantities are integers. Store and replay make decisions against
   recorded inputs, not current time or later quotes.
@@ -115,5 +115,5 @@ The read-only V2 UI never touches a V1 endpoint.
 5. **V2-5:** scenario replay/shadow comparison against V1 snapshots (read-only);
    signed V2 import and standalone repo extraction only after verification.
 
-\`V1\` continues to run independently and must not be reconfigured, migrated,
+`V1` continues to run independently and must not be reconfigured, migrated,
 or connected to the new V2 database by this PR.

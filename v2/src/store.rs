@@ -178,6 +178,25 @@ impl Store {
             let outcome = serde_json::from_str(&raw_outcome)?;
             return Ok(RunRecord { id, request, outcome, duplicate: true });
         }
+        // V2 is append-only. Out-of-order historical corrections require a
+        // separate explicit rebase/import operation; never silently recalculate
+        // past positions by appending a request with an earlier decision time.
+        let previous_request: Option<String> = txn.query_row(
+            "SELECT request_json FROM v2_simulation_runs ORDER BY id DESC LIMIT 1",
+            [], |row| row.get(0),
+        ).optional()?;
+        if let Some(raw) = previous_request {
+            let previous: SimulationRequest = serde_json::from_str(&raw)?;
+            let previous_at = chrono::DateTime::parse_from_rfc3339(&previous.decision_at)
+                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+            let next_at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
+                .map_err(|_| StoreError::Rules(RuleError("invalid_decision_time".into())))?;
+            if next_at < previous_at {
+                return Err(StoreError::Conflict(
+                    "out_of_order_decision_requires_separate_replay_branch".into()
+                ));
+            }
+        }
         let state = load_state(&txn, self.initial_cash_cents)?;
         let outcome = decide(&state, &request)?;
         txn.execute(
@@ -363,6 +382,16 @@ mod tests {
         assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
         db.conn.execute("UPDATE v2_fills SET fill_json='{}' WHERE id=1", []).unwrap();
         assert!(db.verify_replay().is_err());
+    }
+
+    #[test]
+    fn out_of_order_decision_does_not_mutate_the_ledger() {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        db.submit(request("2026-11-02", "later", Side::Buy)).unwrap();
+        let earlier = request("2026-10-30", "earlier", Side::Sell);
+        assert!(matches!(db.submit(earlier), Err(StoreError::Conflict(_))));
+        assert_eq!(db.state(None).unwrap().runs_total, 1);
+        assert_eq!(db.verify_replay().unwrap().runs_verified, 1);
     }
 
     #[test]

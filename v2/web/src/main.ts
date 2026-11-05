@@ -14,7 +14,7 @@ const find = (id: string): HTMLElement => {
   if (!node) throw new Error("missing DOM node " + id);
   return node;
 };
-const status = (message: string, isError = false): void => {
+const setStatus = (message: string, isError = false): void => {
   const node = find("status");
   node.textContent = " " + message;
   node.className = isError ? "error" : "muted";
@@ -52,16 +52,16 @@ async function refresh(): Promise<void> {
       String(r.id), r.request.signal_id, r.request.signal.side,
       r.outcome.status, r.outcome.reason
     ]));
-    status("已读取 V2 最新状态");
+    setStatus("已读取 V2 最新状态");
   } catch (error) {
-    status(String(error), true);
+    setStatus(String(error), true);
   }
 }
 find("refresh").addEventListener("click", () => void refresh());
 find("replay").addEventListener("click", async () => {
   try {
     const result = await get<{ok: boolean; runs_verified: number}>("/v2/replay");
-    status(result.ok ? "回放校验通过：" + result.runs_verified + " 次决策" : "回放校验失败", !result.ok);
-  } catch (error) { status(String(error), true); }
+    setStatus(result.ok ? "回放校验通过：" + result.runs_verified + " 次决策" : "回放校验失败", !result.ok);
+  } catch (error) { setStatus(String(error), true); }
 });
 void refresh();
