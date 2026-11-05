@@ -56,7 +56,10 @@ def call(path, payload=None, expected=200):
 
 proposal = build_fixture_proposal()
 quote = json.loads(Path("fixtures/quote.json").read_text())
-assert call("quotes", quote) == quote  # Duplicate ingress.
+registered = call("quotes", quote)  # Duplicate ingress.
+assert registered["trust_level"] == "offline_fixture", registered
+assert registered["provider_published_at"] is None, registered
+assert registered["received_at"], registered
 for field, value in (("price_cents", 1), ("tradable", False)):
     changed = copy.deepcopy(quote)
     changed["quote"][field] = value
