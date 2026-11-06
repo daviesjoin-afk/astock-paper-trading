@@ -52,7 +52,7 @@ curl --fail -H 'Content-Type: application/json' \
   --data-binary @v2/fixtures/quote.json http://127.0.0.1:8765/v2/quotes
 ```
 
-返回版本 3 的证据，包含离线信任等级、未知供应商发布时间、实际接收时间和可选执行块。
+返回版本 4 的证据，包含离线信任等级、未知供应商发布时间、实际接收时间、可选执行块及Store解析的固定离线证券身份。
 未提供执行块的参考报价仍可导入，但新策略拒绝据此成交；执行块也只是离线声明，见 [EXECUTION_EVIDENCE.md](EXECUTION_EVIDENCE.md)。
 导入命令不能包含 `received_at`、`trust_level`、`provider_published_at` 或虚构证明 ID；
 这些未知字段返回 422。把完整落库证据重新当导入命令提交也返回 422。
