@@ -528,8 +528,8 @@ fn supported_main_board_quantity_minimum_step_and_maximum_are_enforced() {
     for (cash, price, quantity, reason) in [
         (INITIAL_CASH_CENTS, 9995, Some(100), "filled"),
         (INITIAL_CASH_CENTS, 9996, None, "insufficient_budget_for_board_lot_and_fees"),
-        (10_003_000, 1, Some(1_000_000), "filled"),
-        (10_005_000, 1, None, "order_quantity_exceeds_instrument_limit"),
+        (10_005_000, 1, Some(1_000_000), "filled"),
+        (10_006_000, 1, None, "order_quantity_exceeds_instrument_limit"),
     ] {
         let state = PortfolioState::new(cash);
         let mut quote = evidence("2026-10-30");
@@ -568,5 +568,35 @@ fn malformed_or_conflicting_instrument_snapshots_never_execute() {
             assert!(decide(&PortfolioState::new(INITIAL_CASH_CENTS), &request("2026-10-30", Side::Buy),
                 Some(&evidence("2026-10-30")), &calendar(), &sessions(), &snapshot).is_err());
         }
+    }
+}
+
+#[test]
+fn explicitly_unknown_classifications_never_inherit_supported_parameters() {
+    // Deliberately altered test inputs, not claims about the real 600000 identity.
+    // Store cannot replace its bundled snapshot with these inputs.
+    for case in ["unknown-type", "other-type", "unknown-board", "unknown-exchange"] {
+        let mut snapshot = instruments();
+        let identity = &mut snapshot.instruments[0];
+        match case {
+            "unknown-type" => identity.security_type = SecurityType::Unknown,
+            "other-type" => identity.security_type = SecurityType::Other,
+            "unknown-board" => identity.board = Board::Unknown,
+            _ => identity.exchange = Exchange::Unknown,
+        }
+        let mut quote = evidence("2026-10-30");
+        quote.instrument = snapshot.identity("600000.SH").cloned();
+        for _ in 0..2 {
+            let out = decide(&PortfolioState::new(INITIAL_CASH_CENTS), &request("2026-10-30", Side::Buy),
+                Some(&quote), &calendar(), &sessions(), &snapshot).unwrap();
+            assert_eq!(out.status, DecisionStatus::Rejected);
+            assert!(out.reason.starts_with("unsupported_"));
+            assert!(out.fill.is_none());
+        }
+    }
+    for (field, value) in [("board", "future_board"), ("exchange", "future_exchange"), ("security_type", "future_type")] {
+        let mut raw = serde_json::to_value(evidence("2026-10-30")).unwrap();
+        raw["instrument"][field] = serde_json::json!(value);
+        assert!(serde_json::from_value::<QuoteEvidence>(raw).is_err());
     }
 }

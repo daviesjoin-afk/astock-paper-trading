@@ -254,6 +254,37 @@ fn old_instrument_policy_or_changed_snapshot_is_refused_before_disk_writes() {
 }
 
 #[test]
+fn instrument_quantity_boundaries_are_persisted_idempotent_and_replayed() {
+    for (cash, price, reason, quantity) in [
+        (INITIAL_CASH_CENTS, 9995, "filled", Some(100)),
+        (INITIAL_CASH_CENTS, 9996, "insufficient_budget_for_board_lot_and_fees", None),
+        (10_005_000, 1, "filled", Some(1_000_000)),
+        (10_006_000, 1, "order_quantity_exceeds_instrument_limit", None),
+    ] {
+        let mut db = Store::in_memory(cash).unwrap();
+        let req = request("2026-10-30", "quantity-boundary", Side::Buy);
+        let mut input = evidence(&req);
+        input.execution.as_mut().unwrap().price_cents = price;
+        input.execution.as_mut().unwrap().available_quantity = 2_000_000;
+        let pinned = db.ingest_quote(input.clone()).unwrap();
+        let first = db.submit(req.clone()).unwrap();
+        assert_eq!(first.outcome.reason, reason);
+        assert_eq!(first.outcome.fill.as_ref().map(|fill| fill.quantity), quantity);
+        let view = db.state(Some("2026-10-30")).unwrap();
+        let report = db.verify_replay().unwrap();
+        assert_eq!((report.runs_verified, report.fills_verified), (1, usize::from(quantity.is_some())));
+        for _ in 0..2 {
+            assert_eq!(db.ingest_quote(input.clone()).unwrap(), pinned);
+            let retry = db.submit(req.clone()).unwrap();
+            assert!(retry.duplicate);
+            assert_eq!(retry.outcome, first.outcome);
+            assert_eq!(db.state(Some("2026-10-30")).unwrap(), view);
+            assert_eq!(db.verify_replay().unwrap(), report);
+        }
+    }
+}
+
+#[test]
 fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "reference-only", Side::Buy);
