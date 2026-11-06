@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "version": "cn-instruments-offline-v1",
+  "trust_level": "offline_fixture",
+  "coverage_start": "2026-10-27",
+  "coverage_end": "2026-11-05",
+  "sources": [
+    {
+      "id": "sse-trading-2026",
+      "url": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/exchange/c/10816482/files/e3a3b98e36894edca77841837936e006.docx",
+      "sha256": "fc922c433438b2636cb631eab25cca405209712acbb6aaded768c45456ff8888",
+      "published_on": "2026-04-24",
+      "locator": "3.3.8, 3.3.9, 6.7; effective 2026-07-06"
+    },
+    {
+      "id": "sse-deferred-2026",
+      "url": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/exchange/c/10816482/files/c4510656662e48dc9d8d0deb8cc864b3.docx",
+      "sha256": "f4a0d0976a01e3e95f82460170900993824b70d91183e42d09e13ba10a9958c5",
+      "published_on": "2026-04-24",
+      "locator": "deferred provisions: 3.6.2/3/4/9/10; not 3.3.8/9 or 6.7"
+    },
+    {
+      "id": "600000-issuer-2026h1",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-08-28/1225521915.PDF",
+      "sha256": "934d0f3d7c88c460eb22c83d775072a42ba2dedda27ad77a3c885297d176b2fe",
+      "published_on": "2026-08-28",
+      "locator": "p1 stock table: ordinary A share, SSE, 600000"
+    },
+    {
+      "id": "cicpa-20260331",
+      "url": "https://www.cicpa.org.cn/xxfb/news/202604/W020260403418633826334.pdf",
+      "sha256": "bab9fc828adae2633b0e01049adf69b05aca47b143bca420b1a9a81344992d74",
+      "published_on": "2026-04-03",
+      "locator": "p1 table 1-1 SSE main board, row 1: 600000"
+    },
+    {
+      "id": "688001-issuer-2026h1",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-08-29/1225526328.PDF",
+      "sha256": "07113f6233e420236a640167c40790ab50be9a80a418527d90d66f83d6927aee",
+      "published_on": "2026-08-29",
+      "locator": "p10 stock table: A share, SSE STAR, 688001"
+    },
+    {
+      "id": "513150-product-20260318",
+      "url": "https://www.sse.com.cn/disclosure/fund/announcement/c/new/2026-03-18/513150_20260318_6WMR.pdf",
+      "sha256": "5410e756e64f581713cc157954ac74c1834111f3cfa9117b1c897a934eb84ca9",
+      "published_on": "2026-03-18",
+      "locator": "p1 product table: ETF, code 513150, SSE listing"
+    },
+    {
+      "id": "513150-2026q3",
+      "url": "https://www.sse.com.cn/disclosure/fund/announcement/c/new/2026-10-27/513150_20261027_3EBN.pdf",
+      "sha256": "9beaae32f7f2cae95de2a09d7e9c5df3edc3018d09b7100e57c6b8a27f60ab44",
+      "published_on": "2026-10-27",
+      "locator": "p2 section 2: ETF, code 513150, exchange-traded open-end fund"
+    }
+  ],
+  "instruments": [
+    {
+      "schema_version": 1,
+      "evidence_version": "cn-instruments-offline-v1",
+      "symbol": "600000.SH",
+      "exchange": "sse",
+      "board": "main_board",
+      "security_type": "ordinary_a_share",
+      "valid_from": "2026-10-27",
+      "valid_through": "2026-11-05",
+      "source_ids": ["600000-issuer-2026h1", "cicpa-20260331"],
+      "quantity_rule_version": "sse-main-board-whole-lot-2026-v1"
+    },
+    {
+      "schema_version": 1,
+      "evidence_version": "cn-instruments-offline-v1",
+      "symbol": "688001.SH",
+      "exchange": "sse",
+      "board": "star",
+      "security_type": "ordinary_a_share",
+      "valid_from": "2026-10-27",
+      "valid_through": "2026-11-05",
+      "source_ids": ["688001-issuer-2026h1"],
+      "quantity_rule_version": null
+    },
+    {
+      "schema_version": 1,
+      "evidence_version": "cn-instruments-offline-v1",
+      "symbol": "513150.SH",
+      "exchange": "sse",
+      "board": "not_applicable",
+      "security_type": "etf",
+      "valid_from": "2026-10-27",
+      "valid_through": "2026-11-05",
+      "source_ids": ["513150-product-20260318", "513150-2026q3"],
+      "quantity_rule_version": null
+    }
+  ],
+  "quantity_rules": [
+    {
+      "version": "sse-main-board-whole-lot-2026-v1",
+      "effective_from": "2026-07-06",
+      "covered_through": "2026-11-05",
+      "minimum": 100,
+      "step": 100,
+      "maximum": 1000000,
+      "source_ids": ["sse-trading-2026", "sse-deferred-2026"]
+    }
+  ]
+}

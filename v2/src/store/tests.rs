@@ -36,6 +36,51 @@ fn ingest_and_submit(db: &mut Store, req: SimulationRequest) -> RunRecord {
     db.submit(req).unwrap()
 }
 
+// Fixed classifications and primary-source locators, not code-prefix inference.
+// The price/capacity below are deliberately synthetic offline inputs.
+fn assert_instrument_rejected(symbol: &str, reason: &str) {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut req = request("2026-10-30", "instrument-red", Side::Buy);
+    req.signal.symbol = symbol.into();
+    let mut input = evidence(&req);
+    input.execution.as_mut().unwrap().price_cents = 6000;
+    db.ingest_quote(input).unwrap();
+    let first = db.submit(req.clone()).unwrap();
+    if let Some(fill) = &first.outcome.fill {
+        // Proves the old policy actually bought 100, rather than merely parsing.
+        assert_eq!(fill.quantity, 100);
+    }
+    assert_eq!(first.outcome.status, DecisionStatus::Rejected);
+    assert_eq!(first.outcome.reason, reason);
+    assert!(first.outcome.fill.is_none());
+    assert_eq!(first.outcome.cash_after_cents, INITIAL_CASH_CENTS);
+    assert!(db.submit(req).unwrap().duplicate);
+    assert_eq!(db.state(None).unwrap().runs_total, 1);
+    assert!(db.state(None).unwrap().positions.is_empty());
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+}
+
+#[test]
+fn star_identity_cannot_use_a_100_share_main_board_fill() {
+    let sample: serde_json::Value = serde_json::from_str(include_str!("../../data/instruments-offline-v1.json")).unwrap();
+    let star = &sample["instruments"][1];
+    assert_eq!(star["board"], "star");
+    assert_instrument_rejected(star["symbol"].as_str().unwrap(), "unsupported_instrument_board");
+}
+
+#[test]
+fn etf_identity_cannot_pass_as_an_ordinary_a_share() {
+    let sample: serde_json::Value = serde_json::from_str(include_str!("../../data/instruments-offline-v1.json")).unwrap();
+    let etf = &sample["instruments"][2];
+    assert_eq!(etf["security_type"], "etf");
+    assert_instrument_rejected(etf["symbol"].as_str().unwrap(), "unsupported_security_type");
+}
+
+#[test]
+fn valid_code_format_without_identity_and_rules_cannot_fill() {
+    assert_instrument_rejected("999999.SH", "instrument_identity_missing");
+}
+
 #[test]
 fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
