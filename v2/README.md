@@ -26,13 +26,18 @@ module, schema, task, broker or runtime database is imported or reused.
   policy; weekends, published holidays, uncovered dates and unsupported auctions
   reject. Store pins complete market snapshots and each run's version references.
   See [calendar and session scope](docs/CALENDAR_SESSIONS.md).
+- Explicit offline directional execution price and capacity; missing, stale,
+  wrong-direction or insufficient evidence rejects the whole candidate.
+  See [execution evidence and limits](docs/EXECUTION_EVIDENCE.md).
 
 **This is a deterministic demonstration kernel, not market-ready exchange
 simulation.** It does not verify whether a quote truly originates from a market
 provider, live emergency market closures, ST/STAR/ChiNext/Beijing price-limit tiers,
 intraday liquidity, call auctions, partial fills, slippage or broker custody.
-It accepts separately ingested `offline-fixture` evidence and assumes complete fills at that
-price once basic conditions hold. The fixed fee model is deliberately
+It accepts separately ingested `offline-fixture` evidence. A reference price alone
+cannot fill; a complete candidate must fit an explicit directional price level.
+That offline level is an assumption, not a verified order book or fill guarantee.
+The fixed fee model is deliberately
 illustrative rather than a regulatory claim. It must not be used to estimate
 investment returns or to trade real money.
 
@@ -120,7 +125,7 @@ The read-only V2 UI never touches a V1 endpoint.
   Evidence is ingested separately using `POST /v2/quotes`. An identical retry
   succeeds; a changed payload under the same evidence identity returns 409.
   Missing evidence or availability after the decision produces a saved rejection.
-- Policy `v2-paper-policy-4` / SQLite schema version 4 requires a **fresh V2 database**. Existing older
+- Policy `v2-paper-policy-5` / unchanged SQLite schema version 4 requires a **fresh V2 database**. Existing older
   databases are refused before schema additions; no automatic migration or
   reinterpretation of earlier fills is provided. Keep old files separately.
 - Once recorded, decisions are replayed in ledger insertion order. Contract v2

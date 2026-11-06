@@ -210,7 +210,8 @@ impl Store {
             source: input.quote.source.clone(), quote_id: input.quote.quote_id.clone(),
         };
         if let Some(stored) = load_evidence(&txn, &identity)? {
-            if stored.quote != input.quote || stored.available_at != input.available_at {
+            if stored.quote != input.quote || stored.available_at != input.available_at
+                || stored.execution != input.execution {
                 return Err(StoreError::Conflict("quote_identity_payload_conflict".into()));
             }
             return Ok(stored);
@@ -221,7 +222,8 @@ impl Store {
             .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset"))
             .to_rfc3339();
         let evidence = QuoteEvidence {
-            schema_version: 2, available_at: input.available_at, quote: input.quote,
+            schema_version: 3, available_at: input.available_at, quote: input.quote,
+            execution: input.execution,
             trust_level: QuoteTrust::OfflineFixture,
             provider_published_at: None, received_at,
         };

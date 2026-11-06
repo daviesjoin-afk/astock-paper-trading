@@ -131,22 +131,22 @@ pub fn validate_quote_import(input: &QuoteImport) -> Result<(), RuleError> {
     if input.schema_version != 1 {
         return Err(RuleError("unsupported_quote_import_version".into()));
     }
-    validate_fixture_quote(&input.quote, &input.available_at)
+    validate_fixture_quote(&input.quote, &input.available_at, input.execution.as_ref())
 }
 
 /// Pure validation of pinned facts; never reads a clock or provider.
 pub fn validate_evidence(evidence: &QuoteEvidence) -> Result<(), RuleError> {
-    if evidence.schema_version != 2 {
+    if evidence.schema_version != 3 {
         return Err(RuleError("unsupported_evidence_version".into()));
     }
     if evidence.provider_published_at.is_some() {
         return Err(RuleError("offline_fixture_has_no_verified_provider_publication".into()));
     }
     timestamp(&evidence.received_at)?;
-    validate_fixture_quote(&evidence.quote, &evidence.available_at)
+    validate_fixture_quote(&evidence.quote, &evidence.available_at, evidence.execution.as_ref())
 }
 
-fn validate_fixture_quote(quote: &Quote, available_at: &str) -> Result<(), RuleError> {
+fn validate_fixture_quote(quote: &Quote, available_at: &str, execution: Option<&ExecutionLiquidity>) -> Result<(), RuleError> {
     if quote.source != "offline-fixture" {
         return Err(RuleError("unsupported_quote_source".into()));
     }
@@ -155,6 +155,17 @@ fn validate_fixture_quote(quote: &Quote, available_at: &str) -> Result<(), RuleE
     }
     if timestamp(&quote.observed_at)? > timestamp(available_at)? {
         return Err(RuleError("quote_observed_after_availability".into()));
+    }
+    if let Some(level) = execution {
+        if level.schema_version != 1 || level.quote_ref.source != quote.source
+            || level.quote_ref.quote_id != quote.quote_id || level.price_cents <= 0
+            || level.available_quantity < 0
+        {
+            return Err(RuleError("invalid_execution_evidence".into()));
+        }
+        if timestamp(&level.observed_at)? > timestamp(available_at)? {
+            return Err(RuleError("execution_observed_after_availability".into()));
+        }
     }
     Ok(())
 }
@@ -222,7 +233,19 @@ pub fn decide(
         return Ok(rejected(state, "limit_down_sell_blocked"));
     }
     let trade_day = decision_at.date_naive().to_string();
-    let price = quote.price_cents;
+    let Some(level) = evidence.execution.as_ref() else {
+        return Ok(rejected(state, "execution_evidence_missing"));
+    };
+    if level.order_side != req.signal.side {
+        return Ok(rejected(state, "execution_side_mismatch"));
+    }
+    let execution_at = timestamp(&level.observed_at)?;
+    if execution_at.date_naive() != decision_at.date_naive()
+        || (decision_at - execution_at) > chrono::Duration::seconds(MAX_QUOTE_AGE_SECONDS)
+    {
+        return Ok(rejected(state, "stale_execution_evidence"));
+    }
+    let price = level.price_cents;
     let quantity = match req.signal.side {
         Side::Buy => {
             if state.quantity(symbol) > 0 {
@@ -255,6 +278,10 @@ pub fn decide(
             qty
         }
     };
+    // Whole candidate or no fill: never silently downsize to visible capacity.
+    if quantity > level.available_quantity {
+        return Ok(rejected(state, "insufficient_execution_liquidity"));
+    }
     let gross = quantity.checked_mul(price)
         .ok_or_else(|| RuleError("amount_overflow".into()))?;
     let commission = checked_fee(gross, COMMISSION_BPS)?.max(MIN_COMMISSION_CENTS);
