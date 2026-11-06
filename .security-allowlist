@@ -49,6 +49,11 @@ host:docs.python.org
 # Public primary sources cited by the system audit; exact hosts only.
 host:pandas.pydata.org
 host:www.sqlite.org
+# V2 fixed offline instrument classification: public issuer disclosures at
+# CNINFO and the CICPA public main-board audit table. Exact source hosts only;
+# no path/value exemption, private endpoints, credentials or scanning change.
+host:static.cninfo.com.cn
+host:www.cicpa.org.cn
 # Public AWS Builders' Library documentation cited for the retry design.
 host:aws.amazon.com
 host:tracker.debian.org
