@@ -78,7 +78,7 @@ async fn replay(State(state): State<Shared>) -> ApiResult {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-paper.sqlite3".into());
+    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-instrument-paper.sqlite3".into());
     let initial = env::var("ASTOCK_V2_INITIAL_CASH_CENTS")
         .ok().map(|x| x.parse::<i64>()).transpose()?
         .unwrap_or(INITIAL_CASH_CENTS);

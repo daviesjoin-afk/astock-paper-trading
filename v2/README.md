@@ -7,7 +7,8 @@ module, schema, task, broker or runtime database is imported or reused.
 
 - Rust 2024 pure decision engine: explicitly pinned cycle, strategy version,
   signal identity, timestamp and immutable quote input.
-- A-share *MVP* paper rules: 100-share board lots, no same-day sales (T+1),
+- Fixed offline main-board A-share subset: explicit identity and dated quantity
+  rules (100-share minimum/step, 1,000,000 maximum), no same-day sales (T+1),
   simple freshness and session checks, conservative limit-up buy and limit-down
   sell rejection, fixed illustrative commission and stamp duty.
 - A single-writer SQLite V2 event store: idempotent signal identity, immediate
@@ -29,6 +30,11 @@ module, schema, task, broker or runtime database is imported or reused.
 - Explicit offline directional execution price and capacity; missing, stale,
   wrong-direction or insufficient evidence rejects the whole candidate.
   See [execution evidence and limits](docs/EXECUTION_EVIDENCE.md).
+- Store-resolved offline instrument identities; missing, conflicting, unsupported
+  or uncovered identities/rules reject. Initially only the explicit 600000.SH
+  fixture supports execution, for 2026-10-27 through 2026-11-05. STAR/ChiNext,
+  ETFs and other unimplemented types cannot inherit main-board parameters.
+  See [instrument eligibility and sources](docs/INSTRUMENT_ELIGIBILITY.md).
 
 **This is a deterministic demonstration kernel, not market-ready exchange
 simulation.** It does not verify whether a quote truly originates from a market
@@ -75,7 +81,7 @@ From repository root:
 ```bash
 cd v2
 cargo test --locked
-export ASTOCK_V2_DB=./v2-calendar-paper.sqlite3
+export ASTOCK_V2_DB=./v2-instrument-paper.sqlite3
 cargo run --locked
 ```
 
@@ -104,7 +110,7 @@ The read-only V2 UI never touches a V1 endpoint.
 
 ## State and data boundaries
 
-- Default data file is `v2/v2-paper.sqlite3` if run from `v2/`.
+- Default data file is `v2/v2-instrument-paper.sqlite3` if run from `v2/`.
   Set `ASTOCK_V2_DB` to select an isolated path, **never** a V1 path.
 - Default seed cash is CNY 100,000 (10,000,000 cents). Override only for a
   *new database* with `ASTOCK_V2_INITIAL_CASH_CENTS`.
@@ -125,7 +131,7 @@ The read-only V2 UI never touches a V1 endpoint.
   Evidence is ingested separately using `POST /v2/quotes`. An identical retry
   succeeds; a changed payload under the same evidence identity returns 409.
   Missing evidence or availability after the decision produces a saved rejection.
-- Policy `v2-paper-policy-5` / unchanged SQLite schema version 4 requires a **fresh V2 database**. Existing older
+- Policy `v2-paper-policy-6` / SQLite schema version 5 requires a **fresh V2 database**. Existing older
   databases are refused before schema additions; no automatic migration or
   reinterpretation of earlier fills is provided. Keep old files separately.
 - Once recorded, decisions are replayed in ledger insertion order. Contract v2

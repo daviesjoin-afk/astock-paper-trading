@@ -15,6 +15,7 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
 - `domain/contract.rs`: versioned data contracts and identity.
   `portfolio.rs`: cash, lots and T+1 state transitions.
   `calendar.rs`: fixed-version scheduled trading-day facts and source coverage.
+  `instrument.rs`: fixed offline security identities and supported quantity-rule applicability.
   `execution.rs`: pure decision policy.
 - `store/mod.rs` exclusively owns durable writes, schema, transactions,
   idempotency and storage policy. `store/query.rs` only reads, projects
@@ -44,6 +45,9 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
 - Trading remains simulated. No broker endpoints or live-order APIs.
 - A reference price cannot fill. Require matching, fresh directional execution
   evidence and capacity for the whole candidate; no reference fallback or partial fill.
+- A six-digit symbol is syntax only. Store resolves identity from its pinned
+  offline snapshot; execution rejects missing/conflicting identities, unsupported
+  types/boards/rules and uncovered dates. Research/import cannot declare eligibility.
 
 ## Small-change protocol
 

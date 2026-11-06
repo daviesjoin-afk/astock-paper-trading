@@ -1,4 +1,5 @@
-//! Portfolio state transitions and A-share T+1 lot accounting.
+//! Cash and T+1 accounting for this policy's supported whole-lot universe.
+//! This invariant does not classify instruments; execution checks eligibility.
 use super::contract::{Fill, Lot, RuleError, Side, LOT_SIZE};
 use serde::{Deserialize, Serialize};
 

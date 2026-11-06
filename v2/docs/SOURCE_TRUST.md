@@ -68,7 +68,7 @@ Python 研究代码保持只产生 `quote_ref` 提案，不调用行情导入、
 
 ## 数据与验收边界
 
-规则版本 `v2-paper-policy-5`，SQLite 文件 schema version 4 表结构不变，需全新 V2 文件；
+规则版本 `v2-paper-policy-6`，SQLite 文件 schema version 5，需全新 V2 文件；
 旧文件在修改日志模式或 schema 之前拒绝打开，不自动迁移。
 
 测试覆盖首次接收时间范围、重试/重开后保持原值、拒绝伪造字段和认证等级、

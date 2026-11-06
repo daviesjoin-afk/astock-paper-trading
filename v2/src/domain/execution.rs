@@ -2,6 +2,7 @@
 use super::contract::*;
 use super::calendar::{CalendarDay, TradingCalendar};
 use super::portfolio::PortfolioState;
+use super::instrument::InstrumentSnapshot;
 use chrono::{DateTime, FixedOffset, NaiveTime};
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +121,7 @@ fn key_valid(key: &str) -> bool {
         && key.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c))
 }
 
-fn symbol_valid(symbol: &str) -> bool {
+fn symbol_format_valid(symbol: &str) -> bool {
     symbol.len() == 9 &&
         (symbol.ends_with(".SH") || symbol.ends_with(".SZ")) &&
         symbol.as_bytes()[..6].iter().all(u8::is_ascii_digit)
@@ -136,7 +137,7 @@ pub fn validate_quote_import(input: &QuoteImport) -> Result<(), RuleError> {
 
 /// Pure validation of pinned facts; never reads a clock or provider.
 pub fn validate_evidence(evidence: &QuoteEvidence) -> Result<(), RuleError> {
-    if evidence.schema_version != 3 {
+    if evidence.schema_version != 4 {
         return Err(RuleError("unsupported_evidence_version".into()));
     }
     if evidence.provider_published_at.is_some() {
@@ -150,7 +151,7 @@ fn validate_fixture_quote(quote: &Quote, available_at: &str, execution: Option<&
     if quote.source != "offline-fixture" {
         return Err(RuleError("unsupported_quote_source".into()));
     }
-    if !key_valid(&quote.quote_id) || !symbol_valid(&quote.symbol) || quote.price_cents <= 0 {
+    if !key_valid(&quote.quote_id) || !symbol_format_valid(&quote.symbol) || quote.price_cents <= 0 {
         return Err(RuleError("invalid_quote_evidence".into()));
     }
     if timestamp(&quote.observed_at)? > timestamp(available_at)? {
@@ -174,9 +175,11 @@ fn validate_fixture_quote(quote: &Quote, available_at: &str, execution: Option<&
 pub fn decide(
     state: &PortfolioState, req: &SimulationRequest, evidence: Option<&QuoteEvidence>,
     calendar: &TradingCalendar, sessions: &SessionPolicy,
+    instruments: &InstrumentSnapshot,
 ) -> Result<Outcome, RuleError> {
     calendar.validate()?;
     sessions.validate()?;
+    instruments.validate()?;
     if req.schema_version != 2 {
         return Err(RuleError("unsupported_contract_version".into()));
     }
@@ -187,8 +190,8 @@ pub fn decide(
         return Err(RuleError("invalid_identity".into()));
     }
     let symbol = req.signal.symbol.as_str();
-    if !symbol_valid(symbol) {
-        return Err(RuleError("invalid_a_share_symbol".into()));
+    if !symbol_format_valid(symbol) {
+        return Err(RuleError("invalid_symbol_format".into()));
     }
     let decision_at = timestamp(&req.decision_at)?;
     let Some(evidence) = evidence else {
@@ -200,7 +203,7 @@ pub fn decide(
         return Err(RuleError("quote_evidence_identity_mismatch".into()));
     }
     if symbol != quote.symbol {
-        return Err(RuleError("symbol_mismatch_or_invalid_a_share_symbol".into()));
+        return Err(RuleError("symbol_mismatch".into()));
     }
     let observed_at = timestamp(&quote.observed_at)?;
     if observed_at > decision_at {
@@ -223,6 +226,10 @@ pub fn decide(
     if let Some(reason) = sessions.rejection(decision_at.time())? {
         return Ok(rejected(state, reason));
     }
+    let rule = match instruments.quantity_rule(symbol, evidence.instrument.as_ref(), decision_at.date_naive()) {
+        Ok(rule) => rule,
+        Err(reason) => return Ok(rejected(state, reason)),
+    };
     if !quote.tradable {
         return Ok(rejected(state, "not_tradable"));
     }
@@ -253,31 +260,37 @@ pub fn decide(
             }
             let budget = state.cash_cents.checked_mul(BUY_BUDGET_BPS)
                 .ok_or_else(|| RuleError("amount_overflow".into()))? / 10_000;
-            let board_price = price.checked_mul(LOT_SIZE)
+            let board_price = price.checked_mul(rule.step)
                 .ok_or_else(|| RuleError("amount_overflow".into()))?;
-            let mut qty = (budget / board_price) * LOT_SIZE;
-            while qty >= LOT_SIZE {
+            let mut qty = (budget / board_price) * rule.step;
+            while qty >= rule.minimum {
                 let gross = qty.checked_mul(price)
                     .ok_or_else(|| RuleError("amount_overflow".into()))?;
                 let fee = checked_fee(gross, COMMISSION_BPS)?.max(MIN_COMMISSION_CENTS);
                 let total = gross.checked_add(fee)
                     .ok_or_else(|| RuleError("amount_overflow".into()))?;
                 if total <= budget && total <= state.cash_cents { break; }
-                qty -= LOT_SIZE;
+                qty -= rule.step;
             }
-            if qty == 0 {
+            if qty < rule.minimum {
                 return Ok(rejected(state, "insufficient_budget_for_board_lot_and_fees"));
             }
             qty
         }
         Side::Sell => {
             let qty = state.sellable_quantity(symbol, &trade_day);
-            if qty < LOT_SIZE {
+            if qty < rule.minimum {
                 return Ok(rejected(state, "no_t1_sellable_lot"));
             }
             qty
         }
     };
+    if quantity % rule.step != 0 {
+        return Ok(rejected(state, "unsupported_odd_lot_position"));
+    }
+    if quantity > rule.maximum {
+        return Ok(rejected(state, "order_quantity_exceeds_instrument_limit"));
+    }
     // Whole candidate or no fill: never silently downsize to visible capacity.
     if quantity > level.available_quantity {
         return Ok(rejected(state, "insufficient_execution_liquidity"));

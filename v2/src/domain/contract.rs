@@ -10,7 +10,7 @@ pub const COMMISSION_BPS: i64 = 3;
 pub const MIN_COMMISSION_CENTS: i64 = 500;
 pub const SELL_STAMP_DUTY_BPS: i64 = 5;
 pub const MAX_QUOTE_AGE_SECONDS: i64 = 180;
-pub const POLICY_VERSION: &str = "v2-paper-policy-5";
+pub const POLICY_VERSION: &str = "v2-paper-policy-6";
 
 #[derive(Debug)]
 pub struct RuleError(pub String);
@@ -100,6 +100,34 @@ pub enum QuoteTrust {
     OfflineFixture,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Exchange { Sse, Szse, Unknown }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Board { MainBoard, Star, ChiNext, NotApplicable, Unknown }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityType { OrdinaryAShare, Etf, Other, Unknown }
+
+/// Store-resolved offline classification; never accepted from research/import.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentIdentity {
+    pub schema_version: u32,
+    pub evidence_version: String,
+    pub symbol: String,
+    pub exchange: Exchange,
+    pub board: Board,
+    pub security_type: SecurityType,
+    pub valid_from: String,
+    pub valid_through: String,
+    pub source_ids: Vec<String>,
+    pub quantity_rule_version: Option<String>,
+}
+
 /// Durable facts constructed by Store, never accepted as an ingress command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +140,8 @@ pub struct QuoteEvidence {
     pub received_at: String,
     #[serde(default)]
     pub execution: Option<ExecutionLiquidity>,
+    #[serde(default)]
+    pub instrument: Option<InstrumentIdentity>,
 }
 
 /// Simulated result; its run pins the quote identity and execution evidence.

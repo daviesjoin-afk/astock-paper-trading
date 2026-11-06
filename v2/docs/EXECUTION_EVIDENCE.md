@@ -27,8 +27,8 @@ quote_ref必须等于父报价身份。必需字段缺失/未知字段、非法�
 available_at仍约束可见时间；执行观察时间不得晚于它。Domain不读系统时钟。
 这是离线模拟政策，不是实时市场报价的充分新鲜度标准或成交保证。
 
-导入命令schema1保持，存储证据升级schema3，执行规则升级policy5。
-SQLite表结构/schema4保持不变；旧policy4文件在WAL/DDL前拒绝，不迁移或重解释旧账本。
+执行证据引入时使用schema3/policy5/schema4。后续[证券身份规则](INSTRUMENT_ELIGIBILITY.md)
+使用证据schema4/policy6/SQLite schema5，执行块schema1保持；旧文件在WAL/DDL前拒绝，不迁移或重解释旧账本。
 新规则使用全新V2文件，保留旧版本程序回放旧账本。
 
 ## 数量不重复使用：复用现有规则
