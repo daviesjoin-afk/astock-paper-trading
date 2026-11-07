@@ -1,15 +1,12 @@
 name: v2-independent-kernel
 
+# V2 is the only application in this repository, so these checks are required
+# on every pull request and every master push. Do not re-add a `paths:` filter:
+# a retirement or repository-level change must not skip the kernel suite.
 on:
   pull_request:
-    paths:
-      - "v2/**"
-      - ".github/workflows/v2.yml"
   push:
     branches: [master]
-    paths:
-      - "v2/**"
-      - ".github/workflows/v2.yml"
 
 permissions:
   contents: read

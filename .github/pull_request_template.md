@@ -1,32 +1,37 @@
 ## Summary
 
-Describe what this PR changes and why the change is needed.
+What changes, and why. This repository maintains AStock V2 only (`v2/`).
 
 ## Scope
 
-- Affected strategy / module:
-- User-visible behavior:
-- Data or execution assumptions changed:
+- Module / owner touched:
+- Behavior or contract changed:
+- Data, schema or execution assumptions changed:
 
 ## Validation
 
-Please include the commands you ran and the relevant result.
+Commands you actually ran (see [CONTRIBUTING.md](CONTRIBUTING.md)):
 
 ```bash
-python -m unittest discover -s backend -p "test_*.py" -v
+cd v2 && cargo test --locked && cargo build --release --locked
+python3 -m unittest discover -s v2/research -p 'test_*.py' -v
+cd v2/web && npm ci && npm run build
+bash v2/scripts/smoke.sh
+python3 scripts/security/scan-sensitive-data.py --repo . --scope all
 ```
 
-Add focused regression tests for changes to execution, risk, quote freshness, concurrency, strategy entry/exit logic or audit semantics.
+Note anything not run, and why.
 
-## Safety / reproducibility checklist
+## Checklist
 
-- [ ] I did not add broker routing or real-money execution.
-- [ ] A-share hard constraints (T+1, lot size, price limits, suspension and freshness checks) remain fail-closed unless the PR explicitly documents a safer replacement.
-- [ ] No API keys, tokens, credentials, private server paths, runtime databases or real holdings are included.
-- [ ] Point-in-time/replay behavior does not consume future data.
-- [ ] Risk/audit behavior remains traceable with stable structured fields where applicable.
-- [ ] Tests and documentation are updated for behavior changes.
+- [ ] Single Cargo package, single Rust service, Store is the only SQLite writer.
+- [ ] Paper-only: no broker routing, no real-money execution, no live market-data dependency.
+- [ ] Explicit versions, timestamps and evidence; no implicit "current"/"latest"/clock reads.
+- [ ] Replay and research reproduction are reported separately, never as each other's evidence.
+- [ ] Synthetic fixtures are labelled as synthetic; no historical returns or strategy-advantage claims.
+- [ ] No secrets, real holdings, private server paths or runtime databases.
+- [ ] Docs/ADRs updated for behavior or contract changes.
 
 ## Reviewer notes
 
-Call out anything that deserves extra scrutiny, especially changes involving order sizing, shared capital, risk exits, data-source fallbacks, timestamps or concurrent writes.
+Anything a reviewer should look at first, plus known limits.

@@ -241,3 +241,8 @@ value:9fd0f857019280e7ec05c8852bb7eac11bcc5bb7b3d66b270847cc58c7c0375d
 value:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 value:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 value:248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+
+# docs/V1_RETIREMENT.md 记录的 V1 归档 annotated tag 对象 id：公开、远端可读
+# （git ls-remote --tags origin 可核验），不是凭据；扫描器只对可达 commit 做
+# 自身对象豁免，tag 对象按裸长 hex 报出，故逐值登记。
+value:82d50ea08110edaa6d24ed9f2cd1e8d19919e4f1
