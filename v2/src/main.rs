@@ -89,7 +89,7 @@ async fn complete_experiment(State(state): State<Shared>, Path(id): Path<String>
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-experiments.sqlite3".into());
+    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-market-packs.sqlite3".into());
     if env::var_os("ASTOCK_V2_INITIAL_CASH_CENTS").is_some() {
         return Err("global initial cash is unsupported; create an experiment explicitly".into());
     }

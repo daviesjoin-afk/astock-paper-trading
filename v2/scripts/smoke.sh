@@ -76,7 +76,7 @@ instrument_version = "cn-instruments-offline-v1"
 def bind_execution(incoming, side="buy"):
     level = incoming.get("execution")
     if level is not None:
-        level["quote_ref"] = {key: incoming["quote"][key] for key in ("source", "quote_id")}
+        level["quote_ref"] = {"market_data_pack_id": incoming["market_data_pack_id"], **{key: incoming["quote"][key] for key in ("source", "quote_id")}}
         level["order_side"] = side
         level["observed_at"] = incoming["quote"]["observed_at"]
 
@@ -170,7 +170,7 @@ for _ in range(2):
 registered = call("quotes", quote)  # Duplicate ingress.
 assert registered["trust_level"] == "offline_fixture", registered
 assert registered["provider_published_at"] is None, registered
-assert registered["schema_version"] == 4, registered
+assert registered["schema_version"] == 5, registered
 assert registered["instrument"]["symbol"] == "600000.SH"
 assert registered["instrument"]["exchange"] == "sse"
 assert registered["instrument"]["board"] == "main_board"
@@ -331,8 +331,8 @@ for _ in range(2):
 assert call("portfolio")["runs_total"] == prefix_runs + len(cases)
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
-    snapshot = json.loads(connection.execute("SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'").fetchone()[0])
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+    snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
     assert connection.execute("SELECT count(*) FROM v2_fills").fetchone()[0] == 3

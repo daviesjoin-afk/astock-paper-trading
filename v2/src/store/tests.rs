@@ -13,11 +13,13 @@ fn packs_can_ingest_equal_external_quote_ids_with_different_prices() {
     let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "same-external-id", Side::Buy);
     let a = evidence(&req);
+    db.register_reviewed_pack("cn-offline-fixture-pack-2").unwrap();
     let mut b = a.clone();
+    b.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    b.execution.as_mut().unwrap().quote_ref.market_data_pack_id = b.market_data_pack_id.clone();
     b.quote.price_cents = 2000;
     b.execution.as_mut().unwrap().price_cents = 2000;
     db.ingest_quote(a).unwrap();
-    // The current contract has no pack dimension; these are intended A/B inputs.
     assert!(db.ingest_quote(b).is_ok(), "B must not collide with A's external quote ID");
 }
 
@@ -28,10 +30,7 @@ fn adding_reviewed_context_does_not_break_a_completed_experiment_on_reopen() {
         let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         ingest_and_submit(&mut db, request("2026-10-30", "old-pack", Side::Buy));
         db.complete_experiment("cycle-1").unwrap();
-        // Model the only current storage location for a replacement context.
-        // This is a fixture setup, not an authorized production mutation path.
-        db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'",
-            [include_str!("../../data/instruments-offline-v2.json")]).unwrap();
+        db.register_reviewed_pack("cn-offline-fixture-pack-2").unwrap();
     }
     let reopened = Store::open(file.path());
     assert!(reopened.is_ok(), "installing B must leave completed A readable");
@@ -272,11 +271,11 @@ fn independent_experiments_can_buy_the_same_signal_and_evidence() {
 
 fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
-        schema_version: 3, cycle_id: "cycle-1".into(),
+        schema_version: 4, cycle_id: "cycle-1".into(),
         strategy_version_id: "strategy-v1".into(), signal_id: signal_id.into(),
         decision_at: format!("{day}T10:00:00+08:00"),
         signal: Signal { symbol: "600000.SH".into(), side },
-        quote_ref: QuoteRef {
+        quote_ref: QuoteRef { market_data_pack_id: crate::domain::MARKET_DATA_PACK_ID.into(),
             source: "offline-fixture".into(), quote_id: format!("quote-{signal_id}"),
         },
     }
@@ -284,10 +283,10 @@ fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
 
 fn evidence(req: &SimulationRequest) -> QuoteImport {
     let day = &req.decision_at[..10];
-    QuoteImport {
-        schema_version: 1, available_at: format!("{day}T09:59:31+08:00"),
+    QuoteImport { market_data_pack_id: req.quote_ref.market_data_pack_id.clone(),
+        schema_version: 2, available_at: format!("{day}T09:59:31+08:00"),
         execution: Some(ExecutionLiquidity {
-            schema_version: 1, quote_ref: req.quote_ref.clone(),
+            schema_version: 2, quote_ref: req.quote_ref.clone(),
             order_side: req.signal.side.clone(), price_cents: 1234, available_quantity: 800,
             observed_at: format!("{day}T09:59:30+08:00"),
         }),
@@ -479,17 +478,17 @@ fn instrument_snapshot_and_run_version_cannot_be_changed_in_place() {
     let req = request("2026-10-30", "pin-identity-version", Side::Buy);
     let saved = ingest_and_submit(&mut db, req.clone());
     let state = db.state("cycle-1", None).unwrap();
-    let original: String = db.conn.query_row("SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'", [], |r| r.get(0)).unwrap();
+    let original: String = db.conn.query_row("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'", [], |r| r.get(0)).unwrap();
     let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
     changed["sources"][0]["locator"] = serde_json::json!("same-version-different-content");
-    db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [changed.to_string()]).unwrap();
+    db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json,'$.instruments',json(?)) WHERE pack_id='cn-offline-fixture-pack-1'", [changed.to_string()]).unwrap();
     for _ in 0..2 {
         assert!(db.submit(req.clone()).is_err());
         assert!(db.ingest_quote(evidence(&req)).is_err());
         assert!(db.verify_replay("cycle-1").is_err());
         assert_eq!(db.state("cycle-1", None).unwrap(), state);
     }
-    db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [original]).unwrap();
+    db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json,'$.instruments',json(?)) WHERE pack_id='cn-offline-fixture-pack-1'", [original]).unwrap();
     db.conn.execute("UPDATE v2_simulation_runs SET instrument_version='later-version'", []).unwrap();
     assert!(db.submit(req.clone()).is_err());
     assert!(db.verify_replay("cycle-1").is_err());
@@ -510,7 +509,7 @@ fn old_instrument_policy_or_changed_snapshot_is_refused_before_disk_writes() {
             } else {
                 let mut changed: serde_json::Value = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON).unwrap();
                 changed["sources"][0]["locator"] = serde_json::json!("tampered");
-                db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [changed.to_string()]).unwrap();
+                db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json,'$.instruments',json(?)) WHERE pack_id='cn-offline-fixture-pack-1'", [changed.to_string()]).unwrap();
             }
         }
         Connection::open(file.path()).unwrap().execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
@@ -603,7 +602,7 @@ fn execution_import_is_strict_and_all_execution_fields_are_immutable() {
     }
     assert_eq!(db.conn.total_changes(), changes);
     let saved = db.ingest_quote(good.clone()).unwrap();
-    assert_eq!(saved.schema_version, 4);
+    assert_eq!(saved.schema_version, 5);
     assert_eq!(saved.execution, good.execution);
     assert_eq!(db.ingest_quote(good.clone()).unwrap(), saved);
     let mut variants = Vec::new();
@@ -956,7 +955,7 @@ fn invalid_ingress_never_writes_and_cannot_be_retried_into_success() {
     bad.quote.source = "claimed-live-provider".into();
     variants.push(bad);
     let mut bad = good.clone();
-    bad.schema_version = 2;
+    bad.schema_version = 1;
     variants.push(bad);
     let mut bad = good.clone();
     bad.quote.price_cents = -1;
@@ -1300,7 +1299,7 @@ fn current_v2_with_foreign_schema_or_previous_schema_version_is_untouched() {
             if foreign {
                 conn.execute_batch("CREATE TABLE unexpected(payload TEXT); INSERT INTO unexpected VALUES('keep');").unwrap();
             } else {
-                conn.pragma_update(None, "user_version", 5).unwrap();
+                conn.pragma_update(None, "user_version", 6).unwrap();
             }
         }
         let before = disk_snapshot(&file);
@@ -1411,12 +1410,12 @@ fn fixed_market_snapshots_and_run_references_survive_disk_reopen() {
             assert_eq!(first.calendar_version, retry.calendar_version);
         }
         snapshots = (
-            db.conn.query_row("SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get::<_, String>(0)).unwrap(),
-            db.conn.query_row("SELECT value FROM v2_meta WHERE key='session_policy_snapshot_json'", [], |r| r.get::<_, String>(0)).unwrap(),
+            db.conn.query_row("SELECT json_extract(pack_json,'$.calendar') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'", [], |r| r.get::<_, String>(0)).unwrap(),
+            db.conn.query_row("SELECT json_extract(pack_json,'$.sessions') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'", [], |r| r.get::<_, String>(0)).unwrap(),
         );
     }
     let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
-    let (calendar, sessions, _) = load_market_context(&db.conn).unwrap();
+    let (calendar, sessions, _) = load_market_context(&db.conn, MARKET_DATA_PACK_ID).unwrap();
     assert_eq!(serde_json::from_str::<TradingCalendar>(&snapshots.0).unwrap(), calendar);
     assert_eq!(serde_json::from_str::<SessionPolicy>(&snapshots.1).unwrap(), sessions);
     for _ in 0..2 {
@@ -1433,21 +1432,21 @@ fn changed_market_snapshots_or_run_versions_never_reinterpret_history() {
         db.ingest_quote(input).unwrap();
         let saved = db.submit(req.clone()).unwrap();
         let state = db.state("cycle-1", None).unwrap();
-        for key in ["calendar_snapshot_json", "session_policy_snapshot_json"] {
-            let original: String = db.conn.query_row("SELECT value FROM v2_meta WHERE key=?", [key], |r| r.get(0)).unwrap();
+        for key in ["calendar", "sessions"] {
+            let original: String = db.conn.query_row("SELECT json_extract(pack_json, '$.' || ?) FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'", [key], |r| r.get(0)).unwrap();
             let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
-            if key == "calendar_snapshot_json" {
+            if key == "calendar" {
                 changed["holidays"][6]["end"] = serde_json::json!("2026-10-08");
             } else {
                 changed["continuous"][0]["end"] = serde_json::json!("11:31:00");
             }
-            db.conn.execute("UPDATE v2_meta SET value=? WHERE key=?", params![changed.to_string(), key]).unwrap();
+            db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json, '$.' || ?2,json(?1)) WHERE pack_id='cn-offline-fixture-pack-1'", params![changed.to_string(), key]).unwrap();
             assert!(db.verify_replay("cycle-1").is_err());
             let mut next = req.clone();
             next.signal_id = "next".into();
             assert!(db.submit(next).is_err());
             assert_eq!(db.state("cycle-1", None).unwrap(), state);
-            db.conn.execute("UPDATE v2_meta SET value=? WHERE key=?", params![original, key]).unwrap();
+            db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json, '$.' || ?2,json(?1)) WHERE pack_id='cn-offline-fixture-pack-1'", params![original, key]).unwrap();
             assert!(db.verify_replay("cycle-1").unwrap().ok);
         }
         for (column, original) in [
@@ -1475,10 +1474,10 @@ fn invalid_pinned_calendar_is_refused_before_wal_or_schema_writes() {
     {
         let conn = Connection::open(file.path()).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
-        let raw: String = conn.query_row("SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get(0)).unwrap();
+        let raw: String = conn.query_row("SELECT json_extract(pack_json,'$.calendar') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'", [], |r| r.get(0)).unwrap();
         let mut changed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         changed["coverage_end"] = serde_json::json!("2026-12-30");
-        conn.execute("UPDATE v2_meta SET value=? WHERE key='calendar_snapshot_json'", [changed.to_string()]).unwrap();
+        conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json,'$.calendar',json(?)) WHERE pack_id='cn-offline-fixture-pack-1'", [changed.to_string()]).unwrap();
     }
     let before = disk_snapshot(&file);
     for _ in 0..2 {

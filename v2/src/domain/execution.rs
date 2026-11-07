@@ -129,19 +129,27 @@ fn symbol_format_valid(symbol: &str) -> bool {
 
 /// Validate a command without granting it receipt or provider authority.
 pub fn validate_quote_import(input: &QuoteImport) -> Result<(), RuleError> {
-    if input.schema_version != 1 {
+    if input.schema_version != 2 {
         return Err(RuleError("unsupported_quote_import_version".into()));
+    }
+    if !key_valid(&input.market_data_pack_id)
+        || input.execution.as_ref().is_some_and(|level| level.quote_ref.market_data_pack_id != input.market_data_pack_id) {
+        return Err(RuleError("execution_data_pack_mismatch".into()));
     }
     validate_fixture_quote(&input.quote, &input.available_at, input.execution.as_ref())
 }
 
 /// Pure validation of pinned facts; never reads a clock or provider.
 pub fn validate_evidence(evidence: &QuoteEvidence) -> Result<(), RuleError> {
-    if evidence.schema_version != 4 {
+    if evidence.schema_version != 5 {
         return Err(RuleError("unsupported_evidence_version".into()));
     }
     if evidence.provider_published_at.is_some() {
         return Err(RuleError("offline_fixture_has_no_verified_provider_publication".into()));
+    }
+    if !key_valid(&evidence.market_data_pack_id)
+        || evidence.execution.as_ref().is_some_and(|level| level.quote_ref.market_data_pack_id != evidence.market_data_pack_id) {
+        return Err(RuleError("execution_data_pack_mismatch".into()));
     }
     timestamp(&evidence.received_at)?;
     validate_fixture_quote(&evidence.quote, &evidence.available_at, evidence.execution.as_ref())
@@ -158,7 +166,7 @@ fn validate_fixture_quote(quote: &Quote, available_at: &str, execution: Option<&
         return Err(RuleError("quote_observed_after_availability".into()));
     }
     if let Some(level) = execution {
-        if level.schema_version != 1 || level.quote_ref.source != quote.source
+        if level.schema_version != 2 || level.quote_ref.source != quote.source
             || level.quote_ref.quote_id != quote.quote_id || level.price_cents <= 0
             || level.available_quantity < 0
         {
@@ -180,7 +188,7 @@ pub fn decide(
     calendar.validate()?;
     sessions.validate()?;
     instruments.validate()?;
-    if req.schema_version != 3 {
+    if req.schema_version != 4 {
         return Err(RuleError("unsupported_contract_version".into()));
     }
     if !key_valid(&req.cycle_id) || !key_valid(&req.strategy_version_id)
@@ -198,6 +206,9 @@ pub fn decide(
         return Ok(rejected(state, "quote_evidence_missing"));
     };
     validate_evidence(evidence)?;
+    if req.quote_ref.market_data_pack_id != evidence.market_data_pack_id {
+        return Err(RuleError("quote_data_pack_mismatch".into()));
+    }
     let quote = &evidence.quote;
     if req.quote_ref.source != quote.source || req.quote_ref.quote_id != quote.quote_id {
         return Err(RuleError("quote_evidence_identity_mismatch".into()));

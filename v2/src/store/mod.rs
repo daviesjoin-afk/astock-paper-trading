@@ -5,7 +5,7 @@ use crate::domain::{InstrumentSnapshot, BUNDLED_INSTRUMENTS_JSON};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use crate::domain::{Experiment, ExperimentSpec, ExperimentStatus, StrategyArtifact, MARKET_DATA_PACK_ID};
+use crate::domain::{Experiment, ExperimentSpec, ExperimentStatus, StrategyArtifact, MARKET_DATA_PACK_ID, MarketDataPack, MarketDataPackManifest};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -94,7 +94,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 6;
+        const SCHEMA_VERSION: i64 = 7;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -114,11 +114,12 @@ impl Store {
             }
             let tables: &[(&str, &[&str])] = &[
                 ("v2_meta", &["key", "value"]),
-                ("v2_experiments", &["cycle_id", "spec_json", "status"]),
+                ("v2_experiments", &["cycle_id", "spec_json", "status", "pack_manifest_json"]),
+                ("v2_market_data_packs", &["pack_id", "pack_json"]),
                 ("v2_strategy_artifacts", &["strategy_version_id", "artifact_json"]),
                 ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_fills", &["id", "run_id", "fill_json"]),
-                ("v2_quote_evidence", &["source", "quote_id", "evidence_json"]),
+                ("v2_quote_evidence", &["pack_id", "source", "quote_id", "evidence_json"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
@@ -134,6 +135,9 @@ impl Store {
                     return Err(StoreError::Integrity("unexpected_or_incomplete_v2_schema".into()));
                 }
             }
+            let pack_ids = conn.prepare("SELECT pack_id FROM v2_market_data_packs")?
+                .query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            for id in pack_ids { load_market_pack(&conn, &id)?; }
             let mut stmt = conn.prepare("SELECT cycle_id FROM v2_experiments")?;
             let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             for id in ids { load_experiment(&conn, &id)?; }
@@ -147,10 +151,7 @@ impl Store {
             calendar.validate()?;
             sessions.validate()?;
             instruments.validate()?;
-        } else {
-            // Persisted market facts must be checked before changing journal mode.
-            load_market_context(&conn)?;
-        }
+        } // Existing packs and experiment references were verified above, before writes.
         // Accepted empty/current V2 file only. No refused file reaches a write.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
@@ -161,6 +162,10 @@ impl Store {
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE v2_market_data_packs (
+                    pack_id TEXT PRIMARY KEY NOT NULL,
+                    pack_json TEXT NOT NULL
+                );
                 CREATE TABLE v2_strategy_artifacts (
                     strategy_version_id TEXT PRIMARY KEY NOT NULL,
                     artifact_json TEXT NOT NULL
@@ -168,7 +173,8 @@ impl Store {
                 CREATE TABLE v2_experiments (
                     cycle_id TEXT PRIMARY KEY NOT NULL,
                     spec_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('active','completed'))
+                    status TEXT NOT NULL CHECK(status IN ('active','completed')),
+                    pack_manifest_json TEXT NOT NULL
                 );
                 CREATE TABLE v2_simulation_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,18 +197,17 @@ impl Store {
                 );
                 CREATE INDEX idx_v2_runs_cycle ON v2_simulation_runs(cycle_id, id);
                 CREATE TABLE v2_quote_evidence (
+                    pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,
                     source TEXT NOT NULL,
                     quote_id TEXT NOT NULL,
                     evidence_json TEXT NOT NULL,
-                    PRIMARY KEY(source, quote_id)
+                    PRIMARY KEY(pack_id, source, quote_id)
                 );"
             )?;
             txn.pragma_update(None, "application_id", APPLICATION_ID)?;
             txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('market_data_pack_id',?)", [MARKET_DATA_PACK_ID])?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('calendar_snapshot_json',?)", [BUNDLED_CALENDAR_JSON])?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('session_policy_snapshot_json',?)", [BUNDLED_SESSION_POLICY_JSON])?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('instrument_snapshot_json',?)", [BUNDLED_INSTRUMENTS_JSON])?;
+            txn.execute("INSERT INTO v2_meta(key,value) VALUES('storage_contract','pack-ledger-v1')", [])?;
+            register_pack(&txn, &reviewed_market_pack(MARKET_DATA_PACK_ID)?)?;
             txn.commit()?;
         }
         Ok(Self { conn })
@@ -212,7 +217,8 @@ impl Store {
     pub fn create_experiment(&mut self, spec: ExperimentSpec) -> StoreResult<Experiment> {
         validate_experiment_spec(&spec)?;
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_market_context(&txn)?;
+        let pack = reviewed_market_pack(&spec.market_data_pack_id)?;
+        register_pack(&txn, &pack)?;
         let existing: Option<String> = txn.query_row("SELECT spec_json FROM v2_experiments WHERE cycle_id=?", [&spec.cycle_id], |r| r.get(0)).optional()?;
         if let Some(raw) = existing {
             if serde_json::from_str::<ExperimentSpec>(&raw)? != spec {
@@ -228,7 +234,7 @@ impl Store {
         } else {
             txn.execute("INSERT INTO v2_strategy_artifacts VALUES(?,?)", params![spec.strategy.strategy_version_id, serde_json::to_string(&spec.strategy)?])?;
         }
-        txn.execute("INSERT INTO v2_experiments VALUES(?,?,'active')", params![spec.cycle_id, serde_json::to_string(&spec)?])?;
+        txn.execute("INSERT INTO v2_experiments VALUES(?,?,'active',?)", params![spec.cycle_id, serde_json::to_string(&spec)?, serde_json::to_string(&pack.manifest)?])?;
         txn.commit()?;
         Ok(Experiment { spec, status: ExperimentStatus::Active })
     }
@@ -244,12 +250,22 @@ impl Store {
         Ok(result)
     }
 
+    /// Only reviewed IDs are accepted; there is no arbitrary pack upload API.
+    pub fn register_reviewed_pack(&mut self, pack_id: &str) -> StoreResult<MarketDataPack> {
+        let pack = reviewed_market_pack(pack_id)?;
+        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        register_pack(&txn, &pack)?;
+        txn.commit()?;
+        Ok(pack)
+    }
+
     /// Immutable evidence, owned by the same single writer as the ledger.
     pub fn ingest_quote(&mut self, input: QuoteImport) -> StoreResult<QuoteEvidence> {
         validate_quote_import(&input)?;
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, _, instruments) = load_market_context(&txn)?;
+        let (_, _, instruments) = load_market_context(&txn, &input.market_data_pack_id)?;
         let identity = QuoteRef {
+            market_data_pack_id: input.market_data_pack_id.clone(),
             source: input.quote.source.clone(), quote_id: input.quote.quote_id.clone(),
         };
         if let Some(stored) = load_evidence(&txn, &identity)? {
@@ -266,7 +282,8 @@ impl Store {
             .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset"))
             .to_rfc3339();
         let evidence = QuoteEvidence {
-            schema_version: 4,
+            schema_version: 5,
+            market_data_pack_id: input.market_data_pack_id,
             instrument: instruments.identity(&input.quote.symbol).cloned(),
             available_at: input.available_at, quote: input.quote,
             execution: input.execution,
@@ -274,8 +291,8 @@ impl Store {
             provider_published_at: None, received_at,
         };
         txn.execute(
-            "INSERT INTO v2_quote_evidence(source,quote_id,evidence_json) VALUES(?,?,?)",
-            params![identity.source, identity.quote_id, serde_json::to_string(&evidence)?],
+            "INSERT INTO v2_quote_evidence(pack_id,source,quote_id,evidence_json) VALUES(?,?,?,?)",
+            params![identity.market_data_pack_id, identity.source, identity.quote_id, serde_json::to_string(&evidence)?],
         )?;
         txn.commit()?;
         Ok(evidence)
@@ -285,13 +302,16 @@ impl Store {
     pub fn submit(&mut self, request: SimulationRequest) -> StoreResult<RunRecord> {
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let experiment = load_experiment(&txn, &request.cycle_id)?;
-        if request.schema_version != 3 {
+        if request.schema_version != 4 {
             return Err(StoreError::Rules(RuleError("unsupported_contract_version".into())));
         }
         if request.strategy_version_id != experiment.spec.strategy.strategy_version_id {
             return Err(StoreError::Conflict("experiment_strategy_mismatch".into()));
         }
-        let (calendar, sessions, instruments) = load_market_context(&txn)?;
+        if request.quote_ref.market_data_pack_id != experiment.spec.market_data_pack_id {
+            return Err(StoreError::Conflict("experiment_quote_data_pack_mismatch".into()));
+        }
+        let (calendar, sessions, instruments) = load_market_context(&txn, &experiment.spec.market_data_pack_id)?;
         let prior: Option<(i64, String, String, String, String, String, String)> = txn.query_row(
             "SELECT id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version FROM v2_simulation_runs
              WHERE cycle_id=? AND strategy_version_id=? AND signal_id=?",
@@ -361,35 +381,56 @@ impl Store {
 
 }
 
-fn load_market_context(conn: &Connection) -> StoreResult<(TradingCalendar, SessionPolicy, InstrumentSnapshot)> {
-    let pack: String = conn.query_row("SELECT value FROM v2_meta WHERE key='market_data_pack_id'", [], |r| r.get(0))?;
-    if pack != MARKET_DATA_PACK_ID { return Err(StoreError::Integrity("unsupported_market_data_pack".into())); }
-    // This equality is the integrity check for this explicitly selected pack,
-    // not a schema version. See ADR-001 before adding another supported pack.
-    let raw_calendar: String = conn.query_row(
-        "SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get(0)
-    )?;
-    let raw_sessions: String = conn.query_row(
-        "SELECT value FROM v2_meta WHERE key='session_policy_snapshot_json'", [], |r| r.get(0)
-    )?;
-    let calendar: TradingCalendar = serde_json::from_str(&raw_calendar)?;
-    let sessions: SessionPolicy = serde_json::from_str(&raw_sessions)?;
-    let raw_instruments: String = conn.query_row(
-        "SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'", [], |r| r.get(0)
-    )?;
-    let instruments: InstrumentSnapshot = serde_json::from_str(&raw_instruments)?;
-    calendar.validate()?;
-    sessions.validate()?;
-    instruments.validate()?;
-    // Never reinterpret a ledger using a later edited file or the same version
-    // name with different content. Unsupported versions require an explicit path.
-    if serde_json::to_value(&calendar)? != serde_json::from_str::<serde_json::Value>(BUNDLED_CALENDAR_JSON)?
-        || serde_json::to_value(&sessions)? != serde_json::from_str::<serde_json::Value>(BUNDLED_SESSION_POLICY_JSON)?
-        || serde_json::to_value(&instruments)? != serde_json::from_str::<serde_json::Value>(BUNDLED_INSTRUMENTS_JSON)?
-    {
-        return Err(StoreError::Integrity("pinned_market_snapshot_mismatch".into()));
+fn load_market_context(conn: &Connection, pack_id: &str) -> StoreResult<(TradingCalendar, SessionPolicy, InstrumentSnapshot)> {
+    let pack = load_market_pack(conn, pack_id)?;
+    Ok((pack.calendar, pack.sessions, pack.instruments))
+}
+
+/// The reviewed catalogue retains old definitions; no latest/current fallback.
+fn reviewed_market_pack(pack_id: &str) -> StoreResult<MarketDataPack> {
+    let (manifest, instruments) = match pack_id {
+        MARKET_DATA_PACK_ID => (include_str!("../../data/market-pack-1.json"), BUNDLED_INSTRUMENTS_JSON),
+        "cn-offline-fixture-pack-2" => (include_str!("../../data/market-pack-2.json"), include_str!("../../data/instruments-offline-v2.json")),
+        _ => return Err(StoreError::Rules(RuleError("unsupported_market_data_pack".into()))),
+    };
+    let pack = MarketDataPack {
+        manifest: serde_json::from_str(manifest)?,
+        calendar: serde_json::from_str(BUNDLED_CALENDAR_JSON)?,
+        sessions: serde_json::from_str(BUNDLED_SESSION_POLICY_JSON)?,
+        instruments: serde_json::from_str(instruments)?,
+    };
+    pack.calendar.validate()?;
+    pack.sessions.validate()?;
+    pack.instruments.validate()?;
+    if pack.manifest.pack_id != pack_id || pack.manifest.coverage_start != pack.instruments.coverage_start
+        || pack.manifest.coverage_end != pack.instruments.coverage_end || pack.manifest.sources.is_empty()
+        || pack.manifest.content_summary.len() != 3 {
+        return Err(StoreError::Integrity("invalid_reviewed_pack_manifest".into()));
     }
-    Ok((calendar, sessions, instruments))
+    Ok(pack)
+}
+
+fn register_pack(conn: &Connection, pack: &MarketDataPack) -> StoreResult<()> {
+    if *pack != reviewed_market_pack(&pack.manifest.pack_id)? {
+        return Err(StoreError::Conflict("pack_identity_content_conflict".into()));
+    }
+    let existing: Option<String> = conn.query_row("SELECT pack_json FROM v2_market_data_packs WHERE pack_id=?", [&pack.manifest.pack_id], |r| r.get(0)).optional()?;
+    if let Some(raw) = existing {
+        if serde_json::from_str::<MarketDataPack>(&raw)? != *pack {
+            return Err(StoreError::Conflict("pack_identity_content_conflict".into()));
+        }
+    } else {
+        conn.execute("INSERT INTO v2_market_data_packs VALUES(?,?)", params![pack.manifest.pack_id, serde_json::to_string(pack)?])?;
+    }
+    Ok(())
+}
+
+fn load_market_pack(conn: &Connection, pack_id: &str) -> StoreResult<MarketDataPack> {
+    let expected = reviewed_market_pack(pack_id)?;
+    let raw: Option<String> = conn.query_row("SELECT pack_json FROM v2_market_data_packs WHERE pack_id=?", [pack_id], |r| r.get(0)).optional()?;
+    let saved: MarketDataPack = serde_json::from_str(&raw.ok_or_else(|| StoreError::Integrity("market_data_pack_missing".into()))?)?;
+    if saved != expected { return Err(StoreError::Integrity("pinned_market_snapshot_mismatch".into())); }
+    Ok(saved)
 }
 
 fn verify_market_versions(
@@ -404,10 +445,15 @@ fn verify_market_versions(
 
 fn load_evidence(conn: &Connection, identity: &QuoteRef) -> StoreResult<Option<QuoteEvidence>> {
     let raw: Option<String> = conn.query_row(
-        "SELECT evidence_json FROM v2_quote_evidence WHERE source=? AND quote_id=?",
-        params![identity.source, identity.quote_id], |row| row.get(0),
+        "SELECT evidence_json FROM v2_quote_evidence WHERE pack_id=? AND source=? AND quote_id=?",
+        params![identity.market_data_pack_id, identity.source, identity.quote_id], |row| row.get(0),
     ).optional()?;
-    Ok(raw.map(|value| serde_json::from_str(&value)).transpose()?)
+    let evidence: Option<QuoteEvidence> = raw.map(|value| serde_json::from_str(&value)).transpose()?;
+    if evidence.as_ref().is_some_and(|e| e.market_data_pack_id != identity.market_data_pack_id
+        || e.quote.source != identity.source || e.quote.quote_id != identity.quote_id) {
+        return Err(StoreError::Integrity("stored_evidence_identity_mismatch".into()));
+    }
+    Ok(evidence)
 }
 
 // Storage referential integrity applies even to closed-date/rejected runs.
@@ -444,17 +490,19 @@ fn validate_experiment_spec(spec: &ExperimentSpec) -> StoreResult<()> {
     if spec.execution_policy_version != POLICY_VERSION {
         return Err(StoreError::Rules(RuleError("unsupported_execution_policy".into())));
     }
-    if spec.market_data_pack_id != MARKET_DATA_PACK_ID {
-        return Err(StoreError::Rules(RuleError("unsupported_market_data_pack".into())));
-    }
+    reviewed_market_pack(&spec.market_data_pack_id)?;
     Ok(())
 }
 
 fn load_experiment(conn: &Connection, cycle_id: &str) -> StoreResult<Experiment> {
-    let row: Option<(String, String)> = conn.query_row("SELECT spec_json,status FROM v2_experiments WHERE cycle_id=?", [cycle_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    let (raw, status) = row.ok_or_else(|| StoreError::Rules(RuleError("experiment_not_found".into())))?;
+    let row: Option<(String, String, String)> = conn.query_row("SELECT spec_json,status,pack_manifest_json FROM v2_experiments WHERE cycle_id=?", [cycle_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let (raw, status, raw_manifest) = row.ok_or_else(|| StoreError::Rules(RuleError("experiment_not_found".into())))?;
     let spec: ExperimentSpec = serde_json::from_str(&raw)?;
     validate_experiment_spec(&spec)?;
+    let pack = load_market_pack(conn, &spec.market_data_pack_id)?;
+    if serde_json::from_str::<MarketDataPackManifest>(&raw_manifest)? != pack.manifest {
+        return Err(StoreError::Integrity("experiment_pack_reference_mismatch".into()));
+    }
     if spec.cycle_id != cycle_id { return Err(StoreError::Integrity("experiment_identity_mismatch".into())); }
     let raw_artifact: String = conn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0))?;
     if serde_json::from_str::<StrategyArtifact>(&raw_artifact)? != spec.strategy {

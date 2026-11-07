@@ -18,17 +18,18 @@ import urllib.request
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
-def build_fixture_proposal(cycle_id: str = "offline-fixture-cycle") -> dict:
+def build_fixture_proposal(cycle_id: str = "offline-fixture-cycle", pack_id: str = "cn-offline-fixture-pack-1") -> dict:
     """Fixed, offline example. Never fetch real-time market data implicitly."""
     day = dt.datetime(2026, 10, 30, 10, 0, tzinfo=CN_TZ)
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "cycle_id": cycle_id,
         "strategy_version_id": "research-fixture-v1",
         "signal_id": "fixture-buy-600000-20261030",
         "decision_at": day.isoformat(timespec="seconds"),
         "signal": {"symbol": "600000.SH", "side": "buy"},
         "quote_ref": {
+            "market_data_pack_id": pack_id,
             "source": "offline-fixture",
             "quote_id": "fixture-quote-20261030-1000",
         },
@@ -46,11 +47,12 @@ def emit(proposal: dict, path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("v2-signal.json"))
+    parser.add_argument("--pack-id", default="cn-offline-fixture-pack-1")
     parser.add_argument("--cycle-id", default="offline-fixture-cycle")
     parser.add_argument("--send", action="store_true",
                         help="Explicitly POST fixture to localhost Rust paper gateway")
     args = parser.parse_args()
-    proposal = build_fixture_proposal(args.cycle_id)
+    proposal = build_fixture_proposal(args.cycle_id, args.pack_id)
     emit(proposal, args.output)
     print(f"Wrote paper-only, offline research proposal: {args.output}")
     if args.send:

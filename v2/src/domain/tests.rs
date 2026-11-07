@@ -15,22 +15,22 @@ fn sessions() -> SessionPolicy {
 
 fn request(day: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
-        schema_version: 3, cycle_id: "demo-cycle".into(),
+        schema_version: 4, cycle_id: "demo-cycle".into(),
         strategy_version_id: "alpha-v1".into(), signal_id: "signal-1".into(),
         decision_at: format!("{day}T10:00:00+08:00"),
         signal: Signal { symbol: "600000.SH".into(), side },
-        quote_ref: QuoteRef { source: "offline-fixture".into(), quote_id: "q-1".into() },
+        quote_ref: QuoteRef { market_data_pack_id: crate::domain::MARKET_DATA_PACK_ID.into(), source: "offline-fixture".into(), quote_id: "q-1".into() },
     }
 }
 
 fn evidence(day: &str) -> QuoteEvidence {
-    QuoteEvidence {
-        schema_version: 4, instrument: instruments().identity("600000.SH").cloned(), available_at: format!("{day}T09:59:31+08:00"),
+    QuoteEvidence { market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+        schema_version: 5, instrument: instruments().identity("600000.SH").cloned(), available_at: format!("{day}T09:59:31+08:00"),
         trust_level: QuoteTrust::OfflineFixture, provider_published_at: None,
         received_at: "2026-11-04T10:00:00+08:00".into(),
         execution: Some(ExecutionLiquidity {
-            schema_version: 1,
-            quote_ref: QuoteRef { source: "offline-fixture".into(), quote_id: "q-1".into() },
+            schema_version: 2,
+            quote_ref: QuoteRef { market_data_pack_id: crate::domain::MARKET_DATA_PACK_ID.into(), source: "offline-fixture".into(), quote_id: "q-1".into() },
             order_side: Side::Buy, price_cents: 1234, available_quantity: 800,
             observed_at: format!("{day}T09:59:30+08:00"),
         }),
