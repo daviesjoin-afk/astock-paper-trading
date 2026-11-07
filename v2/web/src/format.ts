@@ -1,6 +1,6 @@
-// Presentation helpers only. No business rules are re-implemented here: labels
-// translate ids that the Rust kernel already produced, and money/quantities are
-// formatted from integer cents. Nothing here derives a return, NAV or price.
+// Presentation helpers. Labels translate kernel identifiers into business
+// wording; raw identifiers stay out of the page (technical details panel only).
+// No valuation, return or price is derived here.
 
 export const money = (cents: number): string =>
   "¥" + (cents / 100).toLocaleString("zh-CN", {
@@ -13,8 +13,23 @@ export const integer = (value: number): string => value.toLocaleString("zh-CN");
 export const experimentStatus = (status: string): string => {
   if (status === "active") return "进行中";
   if (status === "completed") return "已完成";
-  return status;
+  return "未知状态";
 };
+
+export const strategyName = (id: string): string => {
+  if (id === "research-momentum-v1") return "动量策略";
+  if (id === "research-reversion-v1") return "均值回归策略";
+  return "自定义策略";
+};
+
+export const inputName = (id: string): string =>
+  id === "offline-research-input-v1" ? "固定离线研究输入" : "自定义研究输入";
+
+export const packName = (id: string): string =>
+  id.startsWith("cn-offline-fixture-pack-") ? "离线样本包" : "自定义数据包";
+
+export const policyName = (id: string): string =>
+  id === "v2-paper-policy-6" ? "默认执行规则" : "自定义执行规则";
 
 export const sideLabel = (side: string): string => {
   if (side === "buy") return "买入";
@@ -26,6 +41,11 @@ export const resultLabel = (status: string): string => {
   if (status === "filled") return "已成交";
   if (status === "rejected") return "已拒绝";
   return status;
+};
+
+export const signalName = (signalId: string): string => {
+  const match = /-(\d{4})-/.exec(signalId);
+  return match ? `第 ${Number(match[1])} 条信号` : "模拟信号";
 };
 
 const REASONS: Record<string, string> = {
@@ -60,10 +80,7 @@ const REASONS: Record<string, string> = {
   instrument_identity_conflict: "证券身份冲突",
 };
 
-export const reasonLabel = (code: string): string => REASONS[code] ?? code;
-
-export const shortDigest = (digest: string | null | undefined): string =>
-  digest ? `${digest.slice(0, 12)}…` : "—";
+export const reasonLabel = (code: string): string => REASONS[code] ?? "其它原因";
 
 /** Fixed-format decision time from the stored RFC3339 string (no timezone math). */
 export const decisionTime = (value: string): string => {

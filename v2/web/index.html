@@ -27,140 +27,191 @@
       </form>
     </header>
 
-    <main id="main" tabindex="-1">
-      <section class="notice" id="loading" data-testid="loading" hidden>
-        <h2>正在读取实验…</h2>
-        <p class="muted">从本地 Rust 内核读取已登记事实；不读取实时行情。</p>
-      </section>
+    <div class="shell">
+      <nav class="sidenav" aria-label="主导航">
+        <div class="nav-group">
+          <p class="nav-title">研究</p>
+          <button type="button" class="nav-item" data-view="overview" data-testid="nav-overview">概览</button>
+          <button type="button" class="nav-item" data-view="positions" data-testid="nav-positions">持仓</button>
+          <button type="button" class="nav-item" data-view="decisions" data-testid="nav-decisions">决策记录</button>
+        </div>
+        <div class="nav-group">
+          <p class="nav-title">质量校验</p>
+          <button type="button" class="nav-item" data-view="replay" data-testid="nav-replay">交易回放</button>
+          <button type="button" class="nav-item" data-view="reproduction" data-testid="nav-reproduction">研究重做</button>
+        </div>
+        <div class="nav-group">
+          <p class="nav-title">实验</p>
+          <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">实验信息</button>
+        </div>
+      </nav>
 
-      <section class="notice notice-error" id="service-error" data-testid="service-error" hidden>
-        <h2>本地服务不可用</h2>
-        <p>无法连接 <code>127.0.0.1:8765</code>。请确认 Rust 内核正在运行：<code>cd v2 &amp;&amp; cargo run --locked</code>。</p>
-        <p class="muted" data-testid="service-detail"></p>
-        <p class="notice-actions"><button type="button" class="btn" id="retry" data-testid="retry">重试</button></p>
-      </section>
-
-      <section class="notice" id="empty-experiments" data-testid="empty-experiments" hidden>
-        <h2>数据库里还没有实验</h2>
-        <p>V2 不会自动创建实验。先在本地离线演示中建立固定实验，然后回到本页刷新：</p>
-        <pre><code>cd v2
-python3 scripts/experiment_demo.py     # 需要 Rust 服务已在 127.0.0.1:8765 运行</code></pre>
-        <p class="muted">已有实验但这里为空，说明连的不是同一个数据库文件（<code>ASTOCK_V2_DB</code>）。</p>
-      </section>
-
-      <section class="notice notice-warn" id="unknown-experiment" data-testid="unknown-experiment" hidden>
-        <h2>找不到这个实验</h2>
-        <p>地址里的 <code id="unknown-cycle"></code> 不在当前数据库中。它可能来自另一个数据库文件，或已被删除。</p>
-        <p class="muted">从上方“当前实验”选择已有实验；不会自动替换成其它实验。</p>
-      </section>
-
-      <div id="workspace" hidden>
-        <section class="summary" data-testid="summary" aria-label="实验摘要">
-          <dl>
-            <div><dt>实验状态</dt><dd data-testid="summary-status">—</dd></div>
-            <div><dt>策略版本</dt><dd data-testid="summary-strategy">—</dd></div>
-            <div><dt>研究输入</dt><dd data-testid="summary-input">—</dd></div>
-            <div><dt>市场数据包</dt><dd data-testid="summary-pack">—</dd></div>
-            <div><dt>执行策略</dt><dd data-testid="summary-policy">—</dd></div>
-          </dl>
-          <p class="summary-note">以上均来自 Store 已登记事实；本页不读取实时行情，也不计算净值或收益。</p>
+      <main id="main" tabindex="-1">
+        <section class="notice" id="loading" data-testid="loading" hidden>
+          <h2>正在读取实验…</h2>
+          <p class="muted">从本地服务读取已登记事实；不读取实时行情。</p>
         </section>
 
-        <section class="kpis" aria-label="关键事实">
-          <article class="kpi"><h2>初始资金</h2><p class="num" data-testid="kpi-initial-cash">—</p></article>
-          <article class="kpi"><h2>现金余额</h2><p class="num" data-testid="kpi-cash">—</p></article>
-          <article class="kpi"><h2>持仓标的</h2><p class="num" data-testid="kpi-positions">—</p></article>
-          <article class="kpi"><h2>模拟决策</h2><p class="num" data-testid="kpi-runs">—</p></article>
+        <section class="notice notice-error" id="service-error" data-testid="service-error" hidden>
+          <h2>服务不可用</h2>
+          <p>无法连接本地内核。请确认它正在运行：<code>cd v2 &amp;&amp; cargo run --locked</code>。</p>
+          <p class="muted" data-testid="service-detail"></p>
+          <p class="notice-actions"><button type="button" class="btn" id="retry" data-testid="retry">重试</button></p>
         </section>
 
-        <section class="panel" data-testid="verification" aria-labelledby="verification-title">
-          <header class="panel-head">
-            <h2 id="verification-title">校验</h2>
-            <p class="muted">两项独立证明：回放只重算已存储决策；重做只核对研究信号。互不替代。</p>
-          </header>
-          <div class="verify-grid">
-            <div class="verify">
-              <h3>确定性交易回放</h3>
+        <section class="notice" id="empty-experiments" data-testid="empty-experiments" hidden>
+          <h2>还没有实验</h2>
+          <p>系统不会自动创建实验。先在本地离线演示里建立固定实验，再回到本页刷新：</p>
+          <pre><code>cd v2
+python3 scripts/experiment_demo.py</code></pre>
+        </section>
+
+        <section class="notice notice-warn" id="unknown-experiment" data-testid="unknown-experiment" hidden>
+          <h2>找不到这个实验</h2>
+          <p>地址里的 <code id="unknown-cycle"></code> 不在当前数据库中。</p>
+          <p class="muted">从上方“当前实验”选择已有实验；不会自动替换成其它实验。</p>
+        </section>
+
+        <div id="workspace" hidden>
+          <!-- 概览 -->
+          <section class="panel" id="panel-overview" data-testid="panel-overview" hidden>
+            <header class="panel-head">
+              <h2>概览</h2>
+              <p class="muted">当前实验的关键事实；不展示净值、收益率或排名。</p>
+            </header>
+            <div class="summary" aria-label="实验摘要">
+              <dl>
+                <div><dt>实验状态</dt><dd data-testid="summary-status">—</dd></div>
+                <div><dt>策略</dt><dd data-testid="summary-strategy">—</dd></div>
+                <div><dt>研究输入</dt><dd data-testid="summary-input">—</dd></div>
+                <div><dt>数据包</dt><dd data-testid="summary-pack">—</dd></div>
+                <div><dt>执行规则</dt><dd data-testid="summary-policy">—</dd></div>
+              </dl>
+            </div>
+            <div class="kpis">
+              <article class="kpi"><h2>初始资金</h2><p class="num" data-testid="kpi-initial-cash">—</p></article>
+              <article class="kpi"><h2>现金余额</h2><p class="num" data-testid="kpi-cash">—</p></article>
+              <article class="kpi"><h2>持仓标的</h2><p class="num" data-testid="kpi-positions">—</p></article>
+              <article class="kpi"><h2>模拟决策</h2><p class="num" data-testid="kpi-runs">—</p></article>
+            </div>
+            <div class="quick">
+              <button type="button" class="link" data-goto="positions">查看持仓 →</button>
+              <button type="button" class="link" data-goto="decisions">查看决策记录 →</button>
+              <button type="button" class="link" data-goto="replay">运行交易回放 →</button>
+            </div>
+          </section>
+
+          <!-- 持仓 -->
+          <section class="panel" id="panel-positions" data-testid="panel-positions" hidden>
+            <header class="panel-head">
+              <h2>当前持仓</h2>
+              <div class="asof">
+                <label class="field field-inline">
+                  <span class="field-label">日终口径</span>
+                  <input type="date" id="asof-day" data-testid="asof-day" aria-label="日终口径日期" />
+                </label>
+                <button type="button" class="btn btn-ghost" id="asof-apply" data-testid="asof-apply">应用</button>
+                <button type="button" class="btn btn-ghost" id="asof-clear" data-testid="asof-clear">清除</button>
+                <span class="hint" id="asof-error" data-testid="asof-error" hidden>请先选择日期再应用</span>
+              </div>
+            </header>
+            <div class="section-error" data-testid="positions-error" hidden></div>
+            <p class="scroll-hint">左右滑动查看完整列</p>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="当前持仓表格，可横向滚动">
+              <table>
+                <caption class="sr-only">当前持仓数量；只有指定日终口径时才显示可卖数量</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">代码</th>
+                    <th scope="col" class="num-col">持仓数量</th>
+                    <th scope="col" class="num-col" id="sellable-header" data-testid="sellable-header" hidden>可卖数量</th>
+                  </tr>
+                </thead>
+                <tbody id="positions-body" data-testid="positions-body"></tbody>
+              </table>
+            </div>
+            <p class="empty" data-testid="positions-empty-state" hidden>
+              没有持仓。当前实验的模拟决策尚未产生成交持仓。
+            </p>
+          </section>
+
+          <!-- 决策 -->
+          <section class="panel" id="panel-decisions" data-testid="panel-decisions" hidden>
+            <header class="panel-head">
+              <h2>决策记录</h2>
+              <p class="muted">最近 100 条；按写入顺序倒序。原因已转为业务说明。</p>
+            </header>
+            <div class="section-error" data-testid="runs-error" hidden></div>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="决策记录表格，可横向滚动">
+              <table>
+                <caption class="sr-only">最近的模拟决策：时间、信号、方向、结果与原因</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">时间</th>
+                    <th scope="col">信号</th>
+                    <th scope="col">方向</th>
+                    <th scope="col">结果</th>
+                    <th scope="col">原因</th>
+                  </tr>
+                </thead>
+                <tbody id="runs-body" data-testid="runs-body"></tbody>
+              </table>
+            </div>
+            <p class="empty" data-testid="runs-empty-state" hidden>
+              还没有决策。研究信号需要显式提交后才会成为决策。
+            </p>
+          </section>
+
+          <!-- 交易回放 -->
+          <section class="panel" id="panel-replay" data-testid="panel-replay" hidden>
+            <header class="panel-head">
+              <h2>交易回放</h2>
               <p class="muted">用已固定的输入重新执行已存储的决策，逐字段比对请求、证据与成交。</p>
+            </header>
+            <div class="verify-body">
               <p><button type="button" class="btn" data-testid="verify-replay">运行回放</button></p>
               <p class="verify-status" data-testid="replay-status" data-state="idle">未验证</p>
               <p class="verify-detail muted" data-testid="replay-detail"></p>
             </div>
-            <div class="verify">
-              <h3>研究重做</h3>
-              <p class="muted">用固定策略工件与冻结研究输入核对研究信号，不判断收益。</p>
+          </section>
+
+          <!-- 研究重做 -->
+          <section class="panel" id="panel-reproduction" data-testid="panel-reproduction" hidden>
+            <header class="panel-head">
+              <h2>研究重做</h2>
+              <p class="muted">用固定策略与冻结研究输入重新生成研究信号；不判断收益。</p>
+            </header>
+            <div class="verify-body">
               <p><button type="button" class="btn" data-testid="verify-reproduction">运行重做</button></p>
               <p class="verify-status" data-testid="reproduction-status" data-state="idle">未验证</p>
               <p class="verify-detail muted" data-testid="reproduction-detail"></p>
             </div>
-          </div>
-        </section>
+          </section>
 
-        <section class="panel" data-testid="positions-section" aria-labelledby="positions-title">
-          <header class="panel-head">
-            <h2 id="positions-title">当前持仓</h2>
-            <div class="asof">
-              <label class="field field-inline">
-                <span class="field-label">日终口径</span>
-                <input type="date" id="asof-day" data-testid="asof-day" aria-label="日终口径日期（YYYY-MM-DD）" />
-              </label>
-              <button type="button" class="btn btn-ghost" id="asof-apply" data-testid="asof-apply">应用</button>
-              <button type="button" class="btn btn-ghost" id="asof-clear" data-testid="asof-clear">清除</button>
-              <span class="hint" id="asof-error" data-testid="asof-error" hidden>请先选择日期再应用</span>
+          <!-- 实验信息 -->
+          <section class="panel" id="panel-experiment" data-testid="panel-experiment" hidden>
+            <header class="panel-head">
+              <h2>实验信息</h2>
+              <p class="muted">只有排障时才需要展开技术细节。</p>
+            </header>
+            <div class="verify-body">
+              <p>实验：<strong id="experiment-name" data-testid="experiment-name">—</strong></p>
+              <p>状态：<strong id="experiment-state" data-testid="experiment-state">—</strong></p>
+              <details class="tech">
+                <summary>技术细节</summary>
+                <dl class="tech-list">
+                  <div><dt>策略标识</dt><dd id="tech-strategy" data-testid="tech-strategy">—</dd></div>
+                  <div><dt>研究输入标识</dt><dd id="tech-input" data-testid="tech-input">—</dd></div>
+                  <div><dt>数据包标识</dt><dd id="tech-pack" data-testid="tech-pack">—</dd></div>
+                  <div><dt>执行规则标识</dt><dd id="tech-policy" data-testid="tech-policy">—</dd></div>
+                </dl>
+              </details>
+              <p class="muted">行情、成交价与容量均为离线合成输入；本页不展示净值、收益率、夏普或排行榜。</p>
             </div>
-          </header>
-          <div class="section-error" data-testid="positions-error" hidden></div>
-          <p class="scroll-hint">左右滑动查看完整列</p>
-          <div class="table-scroll" tabindex="0" role="region" aria-label="当前持仓表格，可横向滚动">
-            <table>
-              <caption class="sr-only">当前持仓数量；只有指定日终口径时才显示可卖数量</caption>
-              <thead>
-                <tr>
-                  <th scope="col">代码</th>
-                  <th scope="col" class="num-col">持仓数量</th>
-                  <th scope="col" class="num-col" id="sellable-header" data-testid="sellable-header" hidden>可卖数量</th>
-                </tr>
-              </thead>
-              <tbody id="positions-body" data-testid="positions-body"></tbody>
-            </table>
-          </div>
-          <p class="empty" data-testid="positions-empty-state" hidden>
-            没有持仓。该实验当前的模拟决策尚未产生任何成交持仓；成交与持仓以后端账本为准。
-          </p>
-        </section>
-
-        <section class="panel" data-testid="runs-section" aria-labelledby="runs-title">
-          <header class="panel-head">
-            <h2 id="runs-title">最近模拟决策 <span class="badge">最近 100 条</span></h2>
-            <p class="muted">按写入顺序倒序；不是完整历史。拒绝保留原始原因码以便追踪。</p>
-          </header>
-          <div class="section-error" data-testid="runs-error" hidden></div>
-          <p class="scroll-hint">左右滑动查看完整列（时间 / 信号 / 方向 / 结果 / 原因）</p>
-          <div class="table-scroll" tabindex="0" role="region" aria-label="最近模拟决策表格，可横向滚动">
-            <table>
-              <caption class="sr-only">最近一次模拟决策的请求、方向、结果与原因</caption>
-              <thead>
-                <tr>
-                  <th scope="col">时间</th>
-                  <th scope="col">信号</th>
-                  <th scope="col">方向</th>
-                  <th scope="col">结果</th>
-                  <th scope="col">原因</th>
-                </tr>
-              </thead>
-              <tbody id="runs-body" data-testid="runs-body"></tbody>
-            </table>
-          </div>
-          <p class="empty" data-testid="runs-empty-state" hidden>
-            还没有决策。该实验已登记但尚未提交任何模拟请求；研究信号需要显式提交后才会成为决策。
-          </p>
-        </section>
-
-        <p class="footnote">
-          行情、成交价与容量均为离线合成输入（<code>offline_fixture</code>）；本页不展示净值、收益率、夏普或排行榜。
-        </p>
-      </div>
-    </main>
+          </section>
+        </div>
+      </main>
+    </div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

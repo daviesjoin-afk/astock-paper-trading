@@ -27,7 +27,9 @@ test.describe("failure isolation", () => {
     });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await expect(page.getByTestId("kpi-cash")).toContainText("90,930.00");
+    await page.getByTestId("nav-positions").click();
     await expect(page.getByTestId("positions-body")).toContainText("600000.SH");
+    await page.getByTestId("nav-decisions").click();
     await expect(page.getByTestId("runs-error")).toBeVisible();
     await expect(page.getByTestId("runs-error")).toContainText("决策读取失败");
   });
@@ -68,7 +70,7 @@ test.describe("error semantics", () => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await expect(page.getByTestId("unknown-experiment")).toBeHidden();
     await expect(page.getByTestId("service-error")).toBeVisible();
-    await expect(page.getByTestId("service-detail")).toContainText("invalid_experiment_spec");
+    await expect(page.getByTestId("service-detail")).toContainText("Invalid Experiment Spec");
   });
 });
 
@@ -98,7 +100,13 @@ test.describe("safety", () => {
       });
     });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
-    await expect(page.getByTestId("runs-body")).toContainText("<img src=x");
+    await page.getByTestId("nav-decisions").click();
+    const signalCell = page.getByTestId("runs-body").locator("tr").first().locator("td").nth(1);
+    await expect(signalCell).toHaveAttribute("title", payload);
+    await expect(signalCell).not.toContainText("<img");
+    const reasonCell = page.getByTestId("runs-body").locator("tr").first().locator("td").last();
+    await expect(reasonCell).toHaveAttribute("title", payload);
+    await page.getByTestId("nav-positions").click();
     await expect(page.getByTestId("positions-body")).toContainText("<img src=x");
     await expect(page.locator("main img")).toHaveCount(0);
     expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
@@ -114,6 +122,7 @@ test.describe("safety", () => {
     });
     await page.goto("/");
     await page.getByTestId("experiment-select").selectOption(CYCLES.flat);
+    await page.getByTestId("nav-replay").click();
     await page.getByTestId("verify-replay").click();
     await expect(page.getByTestId("replay-status")).toContainText("通过", { timeout: 15_000 });
     expect(writes).toEqual([]);

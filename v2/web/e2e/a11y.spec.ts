@@ -20,7 +20,9 @@ for (const viewport of [{ width: 1280, height: 800, name: "desktop" }, { width: 
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await expect(page.getByTestId("summary-strategy")).toBeVisible();
-    await scan(page, `light-${viewport.name}`);
+    await scan(page, `light-overview-${viewport.name}`);
+    await page.getByTestId("nav-decisions").click();
+    await scan(page, `light-decisions-${viewport.name}`);
   });
 
   test(`no WCAG A/AA violations in dark theme at ${viewport.name}`, async ({ page }) => {
@@ -28,7 +30,7 @@ for (const viewport of [{ width: 1280, height: 800, name: "desktop" }, { width: 
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("theme-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-    await scan(page, `dark-${viewport.name}`);
+    await scan(page, `dark-overview-${viewport.name}`);
   });
 }
 
@@ -48,6 +50,7 @@ test("refreshing announces itself and keeps the explicit as-of scope", async ({ 
     if (request.url().includes("/v2/portfolio")) portfolios.push(request.url());
   });
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+  await page.getByTestId("nav-positions").click();
   await page.getByTestId("asof-day").fill("2026-10-30");
   await page.getByTestId("asof-apply").click();
   await expect(page.getByTestId("sellable-header")).toBeVisible();
@@ -71,6 +74,7 @@ test("refreshing announces itself and keeps the explicit as-of scope", async ({ 
 
 test("an empty as-of date is a visible error, not a silent no-op", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+  await page.getByTestId("nav-positions").click();
   await page.getByTestId("asof-apply").click();
   await expect(page.getByTestId("asof-error")).toBeVisible();
   await expect(page.getByTestId("asof-day")).toHaveAttribute("aria-invalid", "true");

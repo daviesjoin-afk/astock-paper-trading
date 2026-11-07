@@ -18,7 +18,8 @@ test.describe("responsive and keyboard", () => {
   test("390px keeps tables scrollable inside their own container", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
-    const scroller = page.getByTestId("runs-section").locator(".table-scroll");
+    await page.getByTestId("nav-decisions").click();
+    const scroller = page.getByTestId("panel-decisions").locator(".table-scroll");
     const box = await scroller.evaluate((node) => ({
       scrollWidth: node.scrollWidth,
       clientWidth: node.clientWidth,

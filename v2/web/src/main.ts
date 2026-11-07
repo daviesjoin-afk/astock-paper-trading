@@ -1,18 +1,12 @@
 import "./styles.css";
 import {
-  decisionTime, experimentStatus, integer, money, reasonLabel, resultLabel,
-  shortDigest, sideLabel,
+  decisionTime, experimentStatus, inputName, integer, money, packName,
+  policyName, reasonLabel, resultLabel, sideLabel, signalName, strategyName,
 } from "./format";
 
 // ---------------------------------------------------------------------------
-// Wire types: exactly the JSON the Rust kernel already returns.
+// Wire types: exactly the JSON the kernel returns.
 // ---------------------------------------------------------------------------
-type ExperimentCatalogue = {
-  experiments: ExperimentSummary[];
-  total?: number;
-  skipped?: number;
-};
-
 type ExperimentSummary = {
   cycle_id: string;
   status: string;
@@ -22,6 +16,12 @@ type ExperimentSummary = {
   execution_policy_version: string;
   initial_cash_cents: number;
   runs_total: number;
+};
+
+type ExperimentCatalogue = {
+  experiments: ExperimentSummary[];
+  total?: number;
+  skipped?: number;
 };
 
 type ExperimentDetail = {
@@ -57,16 +57,10 @@ type Run = {
 };
 
 type ReplayReport = { ok: boolean; runs_verified: number; fills_verified: number; cash_cents: number };
-type ReproductionReport = {
-  ok: boolean;
-  signals_verified: number;
-  research_output_id: string;
-  research_output_digest: string;
-  research_input_id: string;
-};
+type ReproductionReport = { ok: boolean; signals_verified: number };
 
 // ---------------------------------------------------------------------------
-// DOM helpers. Every external string goes through textContent: no HTML.
+// DOM helpers. External strings only ever go through textContent.
 // ---------------------------------------------------------------------------
 const byId = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -85,7 +79,7 @@ const live = byId<HTMLElement>("live");
 const announce = (message: string): void => { live.textContent = message; };
 
 // ---------------------------------------------------------------------------
-// API: one helper, typed failures, caller-owned AbortSignal.
+// API
 // ---------------------------------------------------------------------------
 class ApiError extends Error {
   constructor(readonly status: number | null, readonly detail: string) {
@@ -114,12 +108,72 @@ const errorDetail = (error: unknown): string => {
     let code = error.detail;
     try {
       const parsed = JSON.parse(error.detail) as { error?: string };
-      if (typeof parsed.error === "string") code = parsed.error;
+      if (typeof parsed.error === "string") {
+        code = parsed.error
+          .replace(/_/g, " ")
+          .replace(/\b\w/g, (letter) => letter.toUpperCase());
+      }
     } catch { /* keep raw body */ }
-    return `HTTP ${error.status} · ${code}`;
+    return code;
   }
   return error instanceof Error ? error.message : String(error);
 };
+
+// ---------------------------------------------------------------------------
+// Views: a two-level menu; one panel at a time.
+// ---------------------------------------------------------------------------
+const VIEWS = {
+  overview: { panel: "panel-overview", label: "概览" },
+  positions: { panel: "panel-positions", label: "持仓" },
+  decisions: { panel: "panel-decisions", label: "决策记录" },
+  replay: { panel: "panel-replay", label: "交易回放" },
+  reproduction: { panel: "panel-reproduction", label: "研究重做" },
+  experiment: { panel: "panel-experiment", label: "实验信息" },
+} as const;
+type View = keyof typeof VIEWS;
+const viewFromHash = (): View => {
+  const candidate = location.hash.replace(/^#\/?/, "") as View;
+  return candidate in VIEWS ? candidate : "overview";
+};
+let currentView: View = viewFromHash();
+
+const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-view]"));
+
+const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
+  currentView = view;
+  for (const [name, meta] of Object.entries(VIEWS)) {
+    toggle(byId(meta.panel), name === view);
+  }
+  for (const button of navButtons) {
+    const active = button.dataset.view === view;
+    button.classList.toggle("is-active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  if (options.updateUrl !== false && location.hash !== `#/${view}`) {
+    history.replaceState(null, "", `#/${view}`);
+  }
+  announce(`已切换到${VIEWS[view].label}`);
+};
+
+const showOnly = (panel: "service" | "empty" | "unknown" | "workspace" | "loading" | null): void => {
+  const active = document.activeElement as HTMLElement | null;
+  toggle(testId("loading"), panel === "loading");
+  toggle(testId("service-error"), panel === "service");
+  toggle(testId("empty-experiments"), panel === "empty");
+  toggle(testId("unknown-experiment"), panel === "unknown");
+  toggle(byId("workspace"), panel === "workspace");
+  if (active && active !== document.body && !isVisible(active)) {
+    const region = panel === "workspace" ? byId("workspace")
+      : panel ? testId(`${panel === "service" ? "service-error" : panel === "empty" ? "empty-experiments" : panel === "unknown" ? "unknown-experiment" : "loading"}`)
+      : byId("main");
+    const heading = region.querySelector<HTMLElement>("h1, h2");
+    if (heading) { heading.tabIndex = -1; heading.focus(); } else { byId("main").focus(); }
+  }
+};
+
+const isVisible = (node: HTMLElement | null): boolean =>
+  !!node && (node.offsetWidth > 0 || node.offsetHeight > 0 || node.getClientRects().length > 0);
 
 // ---------------------------------------------------------------------------
 // State
@@ -129,57 +183,24 @@ let listTotal = 0;
 let listSkipped = 0;
 let currentCycle = "";
 let loadSequence = 0;
+let asofSequence = 0;
 let listController: AbortController | null = null;
 let cycleController: AbortController | null = null;
-let asofSequence = 0;
 let asofDay: string | null = null;
-let lastRuns: Run[] = [];
 let lastPositions: Position[] = [];
 let rendered = false;
 
 const select = testId<HTMLSelectElement>("experiment-select");
 const hint = testId("cycle-hint");
 
-const panels = {
-  service: testId<HTMLElement>("service-error"),
-  loading: testId<HTMLElement>("loading"),
-  empty: testId<HTMLElement>("empty-experiments"),
-  unknown: testId<HTMLElement>("unknown-experiment"),
-  workspace: byId<HTMLElement>("workspace"),
-};
-
-const isVisible = (node: HTMLElement | null): boolean =>
-  !!node && (node.offsetWidth > 0 || node.offsetHeight > 0 || node.getClientRects().length > 0);
-
-const showOnly = (panel: "service" | "empty" | "unknown" | "workspace" | "loading" | null): void => {
-  const active = document.activeElement as HTMLElement | null;
-  toggle(panels.loading, panel === "loading");
-  toggle(panels.service, panel === "service");
-  toggle(panels.empty, panel === "empty");
-  toggle(panels.unknown, panel === "unknown");
-  toggle(panels.workspace, panel === "workspace");
-  // Hiding the region that owns focus would drop the user on <body>.
-  if (active && active !== document.body && !isVisible(active)) {
-    const region = panel === "workspace" ? panels.workspace : panel ? panels[panel] : byId("main");
-    const heading = region.querySelector<HTMLElement>("h1, h2");
-    if (heading) {
-      heading.tabIndex = -1;
-      heading.focus();
-    } else {
-      byId("main").focus();
-    }
-  }
-};
-
 const setBusy = (busy: boolean): void => {
   byId("workspace").setAttribute("aria-busy", String(busy));
 };
 
 // ---------------------------------------------------------------------------
-// URL <-> selection
+// URL
 // ---------------------------------------------------------------------------
 const urlCycle = (): string => new URLSearchParams(location.search).get("cycle_id")?.trim() ?? "";
-
 const syncUrl = (cycle: string): void => {
   const url = new URL(location.href);
   if (cycle) url.searchParams.set("cycle_id", cycle);
@@ -195,6 +216,9 @@ const resetWorkspace = (): void => {
                     "kpi-initial-cash", "kpi-cash", "kpi-positions", "kpi-runs"]) {
     setText(id, "—");
   }
+  setText("experiment-name", "—");
+  setText("experiment-state", "—");
+  for (const id of ["tech-strategy", "tech-input", "tech-pack", "tech-policy"]) setText(id, "—");
   byId("positions-body").replaceChildren();
   byId("runs-body").replaceChildren();
   toggle(testId("positions-empty-state"), true);
@@ -209,10 +233,9 @@ const resetWorkspace = (): void => {
 };
 
 const describeCatalogue = (selected: string): string => {
-  const shown = experiments.length;
   const parts = [`共 ${listTotal} 个实验`];
-  if (shown < listTotal) parts.push(`显示前 ${shown} 个`);
-  if (listSkipped > 0) parts.push(`${listSkipped} 个元数据损坏已跳过`);
+  if (experiments.length < listTotal) parts.push(`显示前 ${experiments.length} 个`);
+  if (listSkipped > 0) parts.push(`${listSkipped} 个数据损坏已跳过`);
   if (!selected) parts.push("未指定时默认选择第一个");
   return parts.join(" · ");
 };
@@ -222,7 +245,7 @@ const renderSelector = (): void => {
   for (const experiment of experiments) {
     const option = document.createElement("option");
     option.value = experiment.cycle_id;
-    option.textContent = `${experiment.cycle_id} · ${experimentStatus(experiment.status)} · ${experiment.strategy_version_id}`;
+    option.textContent = experiment.cycle_id;
     select.appendChild(option);
   }
   select.disabled = experiments.length === 0;
@@ -231,11 +254,17 @@ const renderSelector = (): void => {
 const renderSummary = (detail: ExperimentDetail): void => {
   const { spec } = detail;
   setText("summary-status", experimentStatus(detail.status));
-  setText("summary-strategy", spec.strategy.strategy_version_id);
-  setText("summary-input",
-    `${spec.strategy.research_input_id} · 摘要 ${shortDigest(spec.strategy.research_input_digest)}`);
-  setText("summary-pack", spec.market_data_pack_id);
-  setText("summary-policy", `${spec.execution_policy_version} · 源码 ${shortDigest(spec.strategy.source_digest)}`);
+  setText("summary-strategy", strategyName(spec.strategy.strategy_version_id));
+  setText("summary-input", inputName(spec.strategy.research_input_id));
+  setText("summary-pack", packName(spec.market_data_pack_id));
+  setText("summary-policy", policyName(spec.execution_policy_version));
+  setText("experiment-name", spec.cycle_id);
+  setText("experiment-state", experimentStatus(detail.status));
+  // Raw identifiers exist only inside the collapsed technical panel.
+  setText("tech-strategy", spec.strategy.strategy_version_id);
+  setText("tech-input", spec.strategy.research_input_id);
+  setText("tech-pack", spec.market_data_pack_id);
+  setText("tech-policy", spec.execution_policy_version);
 };
 
 const renderPortfolio = (portfolio: Portfolio): void => {
@@ -251,7 +280,6 @@ const renderPositions = (): void => {
   const body = byId("positions-body");
   body.replaceChildren();
   toggle(testId("sellable-header"), asofDay !== null);
-
   if (asofDay !== null) {
     const note = document.createElement("tr");
     note.className = "asof-row";
@@ -261,7 +289,6 @@ const renderPositions = (): void => {
     note.appendChild(cell);
     body.appendChild(note);
   }
-
   for (const position of lastPositions) {
     const row = document.createElement("tr");
     const symbol = document.createElement("td");
@@ -273,8 +300,7 @@ const renderPositions = (): void => {
     if (asofDay !== null) {
       const sellable = document.createElement("td");
       sellable.className = "num-col";
-      sellable.textContent = position.sellable_quantity === null
-        ? "—" : integer(position.sellable_quantity);
+      sellable.textContent = position.sellable_quantity === null ? "—" : integer(position.sellable_quantity);
       row.appendChild(sellable);
     }
     body.appendChild(row);
@@ -285,13 +311,13 @@ const renderPositions = (): void => {
 const renderRuns = (runs: Run[]): void => {
   const body = byId("runs-body");
   body.replaceChildren();
-  lastRuns = runs;
   for (const run of runs) {
     const row = document.createElement("tr");
     const time = document.createElement("td");
     time.textContent = decisionTime(run.request.decision_at);
     const signal = document.createElement("td");
-    signal.textContent = run.request.signal_id;
+    signal.textContent = signalName(run.request.signal_id);
+    signal.title = run.request.signal_id;
     const side = document.createElement("td");
     side.textContent = sideLabel(run.request.signal.side);
     side.className = run.request.signal.side === "buy" ? "side-buy" : "side-sell";
@@ -300,14 +326,8 @@ const renderRuns = (runs: Run[]): void => {
     result.className = run.outcome.status === "filled" ? "result-filled" : "result-rejected";
     const reason = document.createElement("td");
     reason.className = "wrap";
-    const label = document.createElement("span");
-    label.textContent = reasonLabel(run.outcome.reason);
-    reason.appendChild(label);
-    if (run.outcome.status !== "filled") {
-      const code = document.createElement("code");
-      code.textContent = ` ${run.outcome.reason}`;
-      reason.appendChild(code);
-    }
+    reason.textContent = reasonLabel(run.outcome.reason);
+    reason.title = run.outcome.reason;
     row.append(time, signal, side, result, reason);
     body.appendChild(row);
   }
@@ -345,6 +365,11 @@ const showSectionError = (section: "positions" | "runs", message: string, retry:
   if (hadFocus) button.focus();
 };
 
+const showListFailure = (message: string): void => {
+  setText("service-detail", message);
+  showOnly("service");
+};
+
 const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {}): Promise<void> => {
   const sequence = ++loadSequence;
   cycleController?.abort();
@@ -363,7 +388,7 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
     api<Portfolio>(`/v2/portfolio?cycle_id=${encoded}`, controller.signal),
     api<Run[]>(`/v2/simulations?cycle_id=${encoded}`, controller.signal),
   ]);
-  if (sequence !== loadSequence) return; // a newer selection owns the page
+  if (sequence !== loadSequence) return;
 
   setBusy(false);
   const [detail, portfolio, runs] = results;
@@ -373,16 +398,16 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
     if (error instanceof ApiError && error.status === 404) {
       byId("unknown-cycle").textContent = cycle;
       showOnly("unknown");
-      announce(`实验 ${cycle} 不存在`);
+      announce("实验不存在");
       return;
     }
-    setText("service-detail", `原因：${errorDetail(error)}`);
-    showOnly("service");
+    showListFailure(`读取实验失败：${errorDetail(error)}`);
     return;
   }
 
   rendered = true;
   showOnly("workspace");
+  showView(currentView);
   renderSummary(detail.value);
 
   if (portfolio.status === "fulfilled") {
@@ -418,8 +443,7 @@ const loadList = async (): Promise<void> => {
     listSkipped = typeof body.skipped === "number" ? body.skipped : 0;
   } catch (error) {
     if (controller.signal.aborted) return;
-    setText("service-detail", `原因：${errorDetail(error)}`);
-    showOnly("service");
+    showListFailure(`无法连接本地服务（${errorDetail(error)}）`);
     announce("服务不可用");
     return;
   }
@@ -430,7 +454,7 @@ const loadList = async (): Promise<void> => {
   if (list.length === 0) {
     showOnly("empty");
     hint.textContent = "未登记实验";
-    announce("数据库里还没有实验");
+    announce("还没有实验");
     return;
   }
 
@@ -445,12 +469,10 @@ const loadList = async (): Promise<void> => {
     select.prepend(placeholder);
     hint.textContent = `共 ${list.length} 个实验；地址中的实验不存在`;
     showOnly("unknown");
-    announce(`实验 ${requested} 不存在`);
+    announce("实验不存在");
     return;
   }
 
-  // Deterministic: the URL wins, otherwise the first stored experiment. Never
-  // "the latest" and never a newly created one.
   const cycle = requested || list[0].cycle_id;
   select.value = cycle;
   hint.textContent = describeCatalogue(requested);
@@ -480,12 +502,23 @@ byId("refresh").addEventListener("click", () => {
 });
 testId("retry").addEventListener("click", () => void loadList());
 
+for (const button of navButtons) {
+  button.addEventListener("click", () => showView(button.dataset.view as View));
+}
+for (const link of Array.from(document.querySelectorAll<HTMLElement>("[data-goto]"))) {
+  link.addEventListener("click", () => showView(link.dataset.goto as View));
+}
+window.addEventListener("hashchange", () => {
+  const view = viewFromHash();
+  if (view !== currentView) showView(view, { updateUrl: false });
+});
+
 const runVerification = async (kind: "replay" | "reproduction"): Promise<void> => {
   const cycle = currentCycle;
   if (!cycle) return;
   const label = kind === "replay" ? "回放" : "研究重做";
   setVerify(kind, "running", "进行中…", "");
-  announce(`${label}校验开始`);
+  announce(`${label}开始`);
   const encoded = encodeURIComponent(cycle);
   try {
     if (kind === "replay") {
@@ -498,8 +531,7 @@ const runVerification = async (kind: "replay" | "reproduction"): Promise<void> =
       const report = await api<ReproductionReport>(
         `/v2/experiments/${encoded}/research-reproduction`, new AbortController().signal);
       if (cycle !== currentCycle) return;
-      setVerify(kind, "ok", `通过（${report.signals_verified} 条研究信号）`,
-        `${report.research_output_id} · 摘要 ${shortDigest(report.research_output_digest)}`);
+      setVerify(kind, "ok", `通过（${report.signals_verified} 条研究信号）`, "研究信号与固定输入一致");
       announce("研究重做通过");
     }
   } catch (error) {
@@ -574,4 +606,5 @@ themeButton.addEventListener("click", () => {
 // Boot
 // ---------------------------------------------------------------------------
 showOnly(null);
+showView(currentView, { updateUrl: false });
 void loadList();
