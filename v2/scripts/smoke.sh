@@ -61,6 +61,7 @@ quote = json.loads(Path("fixtures/quote.json").read_text())
 
 calendar_version = "sse-szse-scheduled-2026-v1"
 session_version = "cn-a-share-continuous-only-v1"
+instrument_version = "cn-instruments-offline-v1"
 
 def bind_execution(incoming, side="buy"):
     level = incoming.get("execution")
@@ -69,13 +70,15 @@ def bind_execution(incoming, side="buy"):
         level["order_side"] = side
         level["observed_at"] = incoming["quote"]["observed_at"]
 
-def market_case(day, time, label, reason, side="buy"):
+def market_case(day, time, label, reason, side="buy", symbol="600000.SH"):
     req = copy.deepcopy(proposal)
     req["signal_id"] = "calendar-" + label
     req["signal"]["side"] = side
+    req["signal"]["symbol"] = symbol
     req["decision_at"] = day + "T" + time + "+08:00"
     instant = dt.datetime.fromisoformat(req["decision_at"])
     incoming = copy.deepcopy(quote)
+    incoming["quote"]["symbol"] = symbol
     incoming["quote"]["quote_id"] = "calendar-quote-" + label
     incoming["quote"]["observed_at"] = (instant - dt.timedelta(seconds=30)).isoformat()
     incoming["available_at"] = (instant - dt.timedelta(seconds=29)).isoformat()
@@ -87,6 +90,7 @@ def market_case(day, time, label, reason, side="buy"):
     assert first["outcome"]["status"] == ("filled" if reason == "filled" else "rejected"), first
     assert first["calendar_version"] == calendar_version, first
     assert first["session_policy_version"] == session_version, first
+    assert first["instrument_version"] == instrument_version, first
     assert first["evidence"] == saved
     retry = call("simulations", req)
     assert retry["duplicate"] and retry["id"] == first["id"], retry
@@ -95,6 +99,18 @@ def market_case(day, time, label, reason, side="buy"):
 
 # Keep append-only decision times monotonic: this holiday precedes the worker fixture.
 market_case("2026-10-01", "10:00:00", "holiday", "holiday_market_closed")
+market_case("2026-10-26", "10:00:00", "identity-before-coverage", "instrument_date_not_covered")
+for symbol, label, reason in [
+    ("688001.SH", "star", "unsupported_instrument_board"),
+    ("513150.SH", "etf", "unsupported_security_type"),
+    ("999999.SH", "identity-missing", "instrument_identity_missing"),
+]:
+    # Independent, explicit fixture identities; enough price/capacity cannot
+    # turn an unsupported instrument into an ordinary main-board stock.
+    first = market_case("2026-10-30", "09:59:58", label, reason, symbol=symbol)
+    assert first["outcome"]["fill"] is None
+    assert first["outcome"]["cash_after_cents"] == 10_000_000
+    assert (first["evidence"]["instrument"] is None) == (symbol == "999999.SH")
 
 # Empty portfolio: each negative case must reject for execution evidence, not
 # merely because an earlier purchase already opened the position.
@@ -136,7 +152,7 @@ for label, reason in execution_cases:
         enriched["quote"]["quote_id"] = req["quote_ref"]["quote_id"]
         bind_execution(enriched)
         call("quotes", enriched, 409)  # Cannot retrofit evidence into old identity.
-prefix_runs = 4 + len(execution_cases)
+prefix_runs = 8 + len(execution_cases)
 
 output = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "v2-proposal.json"
 for _ in range(2):
@@ -144,7 +160,13 @@ for _ in range(2):
 registered = call("quotes", quote)  # Duplicate ingress.
 assert registered["trust_level"] == "offline_fixture", registered
 assert registered["provider_published_at"] is None, registered
-assert registered["schema_version"] == 3, registered
+assert registered["schema_version"] == 4, registered
+assert registered["instrument"]["symbol"] == "600000.SH"
+assert registered["instrument"]["exchange"] == "sse"
+assert registered["instrument"]["board"] == "main_board"
+assert registered["instrument"]["security_type"] == "ordinary_a_share"
+assert registered["instrument"]["evidence_version"] == instrument_version
+assert registered["instrument"]["quantity_rule_version"] == "sse-main-board-whole-lot-2026-v1"
 assert registered["quote"] == quote["quote"]
 assert registered["available_at"] == quote["available_at"]
 assert registered["execution"] == quote["execution"]
@@ -240,13 +262,17 @@ assert filled["evidence"] == registered
 assert filled["outcome"]["fill"]["price_cents"] == 1250 != quote["quote"]["price_cents"]
 assert filled["outcome"]["fill"]["quantity"] == 700
 
-for field in ("calendar_version", "session_policy_version", "calendar", "sessions"):
+for field in ("calendar_version", "session_policy_version", "calendar", "sessions", "instrument", "instrument_version", "board", "quantity_rule_version"):
     injected = copy.deepcopy(proposal)
     injected[field] = "override"
     call("simulations", injected, 422)
+    injected = copy.deepcopy(quote)
+    injected[field] = "forged"
+    call("quotes", injected, 422)
 for run in runs:
     assert run["calendar_version"] == calendar_version
     assert run["session_policy_version"] == session_version
+    assert run["instrument_version"] == instrument_version
 
 historical_buy = call("portfolio?asof_day=2026-10-30")
 assert historical_buy["positions"][0]["quantity"] == 700, historical_buy
@@ -255,7 +281,7 @@ assert historical_buy["runs_total"] == prefix_runs
 before_buy = call("portfolio?asof_day=2026-10-29")
 assert not before_buy["positions"] and not before_buy["lots"], before_buy
 assert before_buy["cash_cents"] == before_buy["initial_cash_cents"]
-assert before_buy["runs_total"] == 1  # The October 1 holiday rejection only.
+assert before_buy["runs_total"] == 2  # Holiday and pre-coverage rejections only.
 call("portfolio?asof_day=2026-1-1", expected=422)
 
 cases = [
@@ -278,6 +304,7 @@ cases = [
     ("2026-11-02", "15:00:00.001", "after-close-ms", "outside_trading_session", "buy"),
     ("2026-11-02", "15:00:59", "after-close-sec", "outside_trading_session", "buy"),
     ("2026-11-02", "15:05:00", "postmarket", "outside_trading_session", "buy"),
+    ("2026-11-06", "10:00:00", "identity-after-coverage", "instrument_date_not_covered", "buy"),
     ("2027-01-04", "10:00:00", "unknown-year", "unknown_trading_date", "buy"),
 ]
 for args in cases:
@@ -286,12 +313,26 @@ for _ in range(2):
     assert call("portfolio?asof_day=2026-10-30") == historical_buy
     assert call("portfolio?asof_day=2026-10-29") == before_buy
     sold_then_bought = call("portfolio?asof_day=2026-11-02")
-    assert sold_then_bought["runs_total"] == prefix_runs + len(cases) - 1, sold_then_bought
+    assert sold_then_bought["runs_total"] == prefix_runs + len(cases) - 2, sold_then_bought
     assert sold_then_bought["positions"][0]["sellable_quantity"] == 0
 for _ in range(2):
     report = call("replay")
     assert report["ok"] and (report["runs_verified"], report["fills_verified"]) == (prefix_runs + len(cases), 3), report
 assert call("portfolio")["runs_total"] == prefix_runs + len(cases)
+import sqlite3
+with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    snapshot = json.loads(connection.execute("SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'").fetchone()[0])
+    assert snapshot["version"] == instrument_version
+    assert snapshot["trust_level"] == "offline_fixture"
+    assert connection.execute("SELECT count(*) FROM v2_fills").fetchone()[0] == 3
+    for request_json, evidence_json, version in connection.execute("SELECT request_json,evidence_json,instrument_version FROM v2_simulation_runs"):
+        assert version == instrument_version
+        evidence = json.loads(evidence_json)
+        if evidence is not None and evidence["instrument"] is not None:
+            assert evidence["instrument"] in snapshot["instruments"]
+        assert "instrument" not in json.loads(request_json)
+print("HTTP/SQLite instrument identity/coverage/unsupported types/immutable snapshot/replay passed")
 print("HTTP execution evidence/price/capacity/missing/expiry/conflicts/retry/replay passed")
 print("HTTP calendar/session/auction/unknown-date/retry/replay passed")
 print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed")

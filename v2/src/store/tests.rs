@@ -36,6 +36,254 @@ fn ingest_and_submit(db: &mut Store, req: SimulationRequest) -> RunRecord {
     db.submit(req).unwrap()
 }
 
+// Fixed classifications and primary-source locators, not code-prefix inference.
+// The price/capacity below are deliberately synthetic offline inputs.
+fn assert_instrument_rejected(symbol: &str, reason: &str) {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut req = request("2026-10-30", "instrument-red", Side::Buy);
+    req.signal.symbol = symbol.into();
+    let mut input = evidence(&req);
+    input.execution.as_mut().unwrap().price_cents = 6000;
+    db.ingest_quote(input).unwrap();
+    let first = db.submit(req.clone()).unwrap();
+    if let Some(fill) = &first.outcome.fill {
+        // Proves the old policy actually bought 100, rather than merely parsing.
+        assert_eq!(fill.quantity, 100);
+    }
+    assert_eq!(first.outcome.status, DecisionStatus::Rejected);
+    assert_eq!(first.outcome.reason, reason);
+    assert!(first.outcome.fill.is_none());
+    assert_eq!(first.outcome.cash_after_cents, INITIAL_CASH_CENTS);
+    assert!(db.submit(req).unwrap().duplicate);
+    assert_eq!(db.state(None).unwrap().runs_total, 1);
+    assert!(db.state(None).unwrap().positions.is_empty());
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+}
+
+#[test]
+fn star_identity_cannot_use_a_100_share_main_board_fill() {
+    let sample: serde_json::Value = serde_json::from_str(include_str!("../../data/instruments-offline-v1.json")).unwrap();
+    let star = &sample["instruments"][1];
+    assert_eq!(star["board"], "star");
+    assert_instrument_rejected(star["symbol"].as_str().unwrap(), "unsupported_instrument_board");
+}
+
+#[test]
+fn etf_identity_cannot_pass_as_an_ordinary_a_share() {
+    let sample: serde_json::Value = serde_json::from_str(include_str!("../../data/instruments-offline-v1.json")).unwrap();
+    let etf = &sample["instruments"][2];
+    assert_eq!(etf["security_type"], "etf");
+    assert_instrument_rejected(etf["symbol"].as_str().unwrap(), "unsupported_security_type");
+}
+
+#[test]
+fn valid_code_format_without_identity_and_rules_cannot_fill() {
+    assert_instrument_rejected("999999.SH", "instrument_identity_missing");
+}
+
+#[test]
+fn fixed_instrument_facts_rejections_and_pit_survive_disk_reopen() {
+    let file = DiskDatabase::new();
+    let historical;
+    let latest;
+    let replay;
+    let mut saved = Vec::new();
+    {
+        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        for (symbol, id, reason) in [
+            ("688001.SH", "star", "unsupported_instrument_board"),
+            ("513150.SH", "etf", "unsupported_security_type"),
+            ("999999.SH", "missing", "instrument_identity_missing"),
+            ("600000.SH", "main", "filled"),
+        ] {
+            let mut req = request("2026-10-30", id, Side::Buy);
+            req.signal.symbol = symbol.into();
+            let input = evidence(&req);
+            let pinned = db.ingest_quote(input.clone()).unwrap();
+            assert_eq!(pinned.instrument.is_some(), symbol != "999999.SH");
+            assert_eq!(pinned.trust_level, QuoteTrust::OfflineFixture);
+            if let Some(identity) = &pinned.instrument {
+                assert_eq!(identity.evidence_version, crate::domain::INSTRUMENT_VERSION);
+                assert_eq!(identity.symbol, symbol);
+            }
+            let first = db.submit(req.clone()).unwrap();
+            assert_eq!(first.instrument_version, crate::domain::INSTRUMENT_VERSION);
+            assert_eq!(first.outcome.reason, reason);
+            assert_eq!(first.evidence, Some(pinned.clone()));
+            assert_eq!(db.ingest_quote(input).unwrap(), pinned);
+            assert!(db.submit(req).unwrap().duplicate);
+            saved.push(first);
+        }
+        historical = db.state(Some("2026-10-30")).unwrap();
+        assert_eq!(historical.positions[0].quantity, 800);
+        ingest_and_submit(&mut db, request("2026-11-02", "main-sell", Side::Sell));
+        assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
+        latest = db.state(None).unwrap();
+        assert!(latest.positions.is_empty());
+        replay = db.verify_replay().unwrap();
+        assert_eq!((replay.runs_verified, replay.fills_verified), (5, 2));
+    }
+    let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    for first in saved {
+        for _ in 0..2 {
+            let retry = db.submit(first.request.clone()).unwrap();
+            assert!(retry.duplicate);
+            assert_eq!(retry.outcome, first.outcome);
+            assert_eq!(retry.evidence, first.evidence);
+            assert_eq!(retry.instrument_version, first.instrument_version);
+            assert_eq!(db.verify_replay().unwrap(), replay);
+            assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
+            assert_eq!(db.state(None).unwrap(), latest);
+        }
+    }
+}
+
+#[test]
+fn identity_rejection_transaction_failure_cannot_leave_a_partial_run() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut req = request("2026-10-30", "blocked-identity", Side::Buy);
+    req.signal.symbol = "688001.SH".into();
+    let pinned = db.ingest_quote(evidence(&req)).unwrap();
+    let before = db.state(None).unwrap();
+    db.conn.execute_batch("CREATE TRIGGER fail_identity_run BEFORE INSERT ON v2_simulation_runs
+        BEGIN SELECT RAISE(ABORT,'injected identity run failure'); END;").unwrap();
+    for _ in 0..2 {
+        assert!(db.submit(req.clone()).is_err());
+        assert_eq!(db.state(None).unwrap(), before);
+        assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(pinned.clone()));
+        assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+    }
+    db.conn.execute_batch("DROP TRIGGER fail_identity_run;").unwrap();
+    assert_eq!(db.submit(req.clone()).unwrap().outcome.reason, "unsupported_instrument_board");
+    assert!(db.submit(req).unwrap().duplicate);
+    assert_eq!(db.verify_replay().unwrap().runs_verified, 1);
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+}
+
+#[test]
+fn research_and_import_cannot_supply_instrument_qualification() {
+    let req = request("2026-10-30", "no-self-qualification", Side::Buy);
+    for field in ["instrument", "instrument_version", "board", "exchange", "security_type", "quantity_rule_version"] {
+        let mut request_json = serde_json::to_value(&req).unwrap();
+        request_json[field] = serde_json::json!("forged-main-board");
+        assert!(serde_json::from_value::<SimulationRequest>(request_json).is_err());
+        let mut request_json = serde_json::to_value(&req).unwrap();
+        request_json["signal"][field] = serde_json::json!("forged-main-board");
+        assert!(serde_json::from_value::<SimulationRequest>(request_json).is_err());
+        let mut import = serde_json::to_value(evidence(&req)).unwrap();
+        import[field] = serde_json::json!("forged-main-board");
+        assert!(serde_json::from_value::<QuoteImport>(import).is_err());
+        let mut import = serde_json::to_value(evidence(&req)).unwrap();
+        import["quote"][field] = serde_json::json!("forged-main-board");
+        assert!(serde_json::from_value::<QuoteImport>(import).is_err());
+    }
+}
+
+#[test]
+fn identity_tampering_in_both_evidence_copies_cannot_rewrite_history() {
+    for (symbol, day) in [("600000.SH", "2026-10-30"), ("688001.SH", "2026-10-30"),
+        ("999999.SH", "2026-10-30"), ("600000.SH", "2026-10-31"), ("999999.SH", "2026-10-31")] {
+        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut req = request(day, "tamper-identity", Side::Buy);
+        req.signal.symbol = symbol.into();
+        let first = ingest_and_submit(&mut db, req.clone());
+        let mut changed = serde_json::to_value(first.evidence.unwrap()).unwrap();
+        let snapshot: InstrumentSnapshot = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON).unwrap();
+        let mut forged = snapshot.instruments[0].clone();
+        forged.symbol = symbol.into();
+        forged.evidence_version = "later-unverified".into();
+        changed["instrument"] = serde_json::to_value(forged).unwrap();
+        db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [changed.to_string()]).unwrap();
+        db.conn.execute("UPDATE v2_simulation_runs SET evidence_json=?", [changed.to_string()]).unwrap();
+        let before = db.state(None).unwrap();
+        let writes = db.conn.total_changes();
+        for _ in 0..2 { assert!(db.verify_replay().is_err()); }
+        assert_eq!(db.state(None).unwrap(), before);
+        assert_eq!(db.conn.total_changes(), writes);
+        assert!(db.ingest_quote(evidence(&req)).is_err());
+    }
+}
+
+#[test]
+fn instrument_snapshot_and_run_version_cannot_be_changed_in_place() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-30", "pin-identity-version", Side::Buy);
+    let saved = ingest_and_submit(&mut db, req.clone());
+    let state = db.state(None).unwrap();
+    let original: String = db.conn.query_row("SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'", [], |r| r.get(0)).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+    changed["sources"][0]["locator"] = serde_json::json!("same-version-different-content");
+    db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [changed.to_string()]).unwrap();
+    for _ in 0..2 {
+        assert!(db.submit(req.clone()).is_err());
+        assert!(db.ingest_quote(evidence(&req)).is_err());
+        assert!(db.verify_replay().is_err());
+        assert_eq!(db.state(None).unwrap(), state);
+    }
+    db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [original]).unwrap();
+    db.conn.execute("UPDATE v2_simulation_runs SET instrument_version='later-version'", []).unwrap();
+    assert!(db.submit(req.clone()).is_err());
+    assert!(db.verify_replay().is_err());
+    db.conn.execute("UPDATE v2_simulation_runs SET instrument_version=?", [saved.instrument_version]).unwrap();
+    assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
+    assert_eq!(db.state(None).unwrap(), state);
+}
+
+#[test]
+fn old_instrument_policy_or_changed_snapshot_is_refused_before_disk_writes() {
+    for old_policy in [true, false] {
+        let file = DiskDatabase::new();
+        {
+            let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+            ingest_and_submit(&mut db, request("2026-10-30", "keep-identity", Side::Buy));
+            if old_policy {
+                db.conn.execute("UPDATE v2_meta SET value='v2-paper-policy-5' WHERE key='policy_version'", []).unwrap();
+            } else {
+                let mut changed: serde_json::Value = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON).unwrap();
+                changed["sources"][0]["locator"] = serde_json::json!("tampered");
+                db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [changed.to_string()]).unwrap();
+            }
+        }
+        Connection::open(file.path()).unwrap().execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        let before = disk_snapshot(&file);
+        for _ in 0..2 {
+            assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err());
+            assert_eq!(disk_snapshot(&file), before);
+        }
+    }
+}
+
+#[test]
+fn instrument_quantity_boundaries_are_persisted_idempotent_and_replayed() {
+    for (cash, price, reason, quantity) in [
+        (INITIAL_CASH_CENTS, 9995, "filled", Some(100)),
+        (INITIAL_CASH_CENTS, 9996, "insufficient_budget_for_board_lot_and_fees", None),
+        (10_005_000, 1, "filled", Some(1_000_000)),
+        (10_006_000, 1, "order_quantity_exceeds_instrument_limit", None),
+    ] {
+        let mut db = Store::in_memory(cash).unwrap();
+        let req = request("2026-10-30", "quantity-boundary", Side::Buy);
+        let mut input = evidence(&req);
+        input.execution.as_mut().unwrap().price_cents = price;
+        input.execution.as_mut().unwrap().available_quantity = 2_000_000;
+        let pinned = db.ingest_quote(input.clone()).unwrap();
+        let first = db.submit(req.clone()).unwrap();
+        assert_eq!(first.outcome.reason, reason);
+        assert_eq!(first.outcome.fill.as_ref().map(|fill| fill.quantity), quantity);
+        let view = db.state(Some("2026-10-30")).unwrap();
+        let report = db.verify_replay().unwrap();
+        assert_eq!((report.runs_verified, report.fills_verified), (1, usize::from(quantity.is_some())));
+        for _ in 0..2 {
+            assert_eq!(db.ingest_quote(input.clone()).unwrap(), pinned);
+            let retry = db.submit(req.clone()).unwrap();
+            assert!(retry.duplicate);
+            assert_eq!(retry.outcome, first.outcome);
+            assert_eq!(db.state(Some("2026-10-30")).unwrap(), view);
+            assert_eq!(db.verify_replay().unwrap(), report);
+        }
+    }
+}
+
 #[test]
 fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
     let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
@@ -86,7 +334,7 @@ fn execution_import_is_strict_and_all_execution_fields_are_immutable() {
     }
     assert_eq!(db.conn.total_changes(), changes);
     let saved = db.ingest_quote(good.clone()).unwrap();
-    assert_eq!(saved.schema_version, 3);
+    assert_eq!(saved.schema_version, 4);
     assert_eq!(saved.execution, good.execution);
     assert_eq!(db.ingest_quote(good.clone()).unwrap(), saved);
     let mut variants = Vec::new();
@@ -902,7 +1150,7 @@ fn fixed_market_snapshots_and_run_references_survive_disk_reopen() {
         );
     }
     let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
-    let (calendar, sessions) = load_market_context(&db.conn).unwrap();
+    let (calendar, sessions, _) = load_market_context(&db.conn).unwrap();
     assert_eq!(serde_json::from_str::<TradingCalendar>(&snapshots.0).unwrap(), calendar);
     assert_eq!(serde_json::from_str::<SessionPolicy>(&snapshots.1).unwrap(), sessions);
     for _ in 0..2 {

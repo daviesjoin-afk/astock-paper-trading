@@ -52,7 +52,7 @@ curl --fail -H 'Content-Type: application/json' \
   --data-binary @v2/fixtures/quote.json http://127.0.0.1:8765/v2/quotes
 ```
 
-返回版本 3 的证据，包含离线信任等级、未知供应商发布时间、实际接收时间和可选执行块。
+返回版本 4 的证据，包含离线信任等级、未知供应商发布时间、实际接收时间、可选执行块及Store解析的固定离线证券身份。
 未提供执行块的参考报价仍可导入，但新策略拒绝据此成交；执行块也只是离线声明，见 [EXECUTION_EVIDENCE.md](EXECUTION_EVIDENCE.md)。
 导入命令不能包含 `received_at`、`trust_level`、`provider_published_at` 或虚构证明 ID；
 这些未知字段返回 422。把完整落库证据重新当导入命令提交也返回 422。
@@ -68,7 +68,7 @@ Python 研究代码保持只产生 `quote_ref` 提案，不调用行情导入、
 
 ## 数据与验收边界
 
-规则版本 `v2-paper-policy-5`，SQLite 文件 schema version 4 表结构不变，需全新 V2 文件；
+规则版本 `v2-paper-policy-6`，SQLite 文件 schema version 5，需全新 V2 文件；
 旧文件在修改日志模式或 schema 之前拒绝打开，不自动迁移。
 
 测试覆盖首次接收时间范围、重试/重开后保持原值、拒绝伪造字段和认证等级、

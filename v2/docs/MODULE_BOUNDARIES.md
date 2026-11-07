@@ -7,7 +7,8 @@
 | `src/domain/contract.rs` | 强类型请求、报价证据及引用、成交、规则版本 | serde、标准库 | IO、SQLite、HTTP、V1 |
 | `src/domain/portfolio.rs` | 现金/持仓 lot、T+1 状态转移 | contract | IO、SQLite、HTTP、V1 |
 | `src/domain/calendar.rs` | 固定日历版本下日期是否计划开市、覆盖范围与来源 | contract、chrono、serde、标准库 | IO、系统时钟、网络、成交数量、V1 |
-| `src/domain/execution.rs` | 精确时段策略、证据有效性和可见时点、决策、手续费 | contract、calendar、portfolio、chrono | IO、SQLite、HTTP、V1 |
+| `src/domain/instrument.rs` | 固定离线证券身份及适用日期下受支持的数量规则 | contract、chrono、serde、标准库 | IO、时钟、网络、价格、持仓、V1 |
+| `src/domain/execution.rs` | 精确时段策略、资格与证据有效性、决策、手续费 | contract、calendar、instrument、portfolio、chrono | IO、SQLite、HTTP、V1 |
 | `src/store/mod.rs` | 单 SQLite 写入口、schema、原子提交、幂等 | domain、rusqlite | HTTP、Python、V1 schema |
 | `src/store/query.rs` | 只读投影、历史回放 | store、domain | SQL 写入、提交 |
 | `src/main.rs` | localhost HTTP 路由、请求响应转换 | store、domain、axum | 交易规则复制、直接 SQL |
@@ -29,6 +30,7 @@
 9. `QuoteImport` 是不可信离线导入命令；`QuoteEvidence` 是 Store 生成的持久化事实。只有 Store 记录 `received_at`，Domain 不读时钟。离线证据固定为 `offline_fixture`，供应商发布时间未知，不存在可自报的认证等级。详见 [SOURCE_TRUST.md](SOURCE_TRUST.md)。
 10. Store 在现有 meta 表固定日历/时段完整快照，每条正常或拒绝决策记录版本引用；回放只读这些快照并核对引用。资料或代码策略升级使用新版本，旧快照不匹配时拒绝，不用后来资料重算。详见 [CALENDAR_SESSIONS.md](CALENDAR_SESSIONS.md)。
 11. 参考价不能直接成交。execution 只使用同报价身份、同方向且新鲜的执行证据价格；候选量超过显式容量就整笔拒绝。Store固定执行块且不可覆盖，不新增容量余额权威。详见 [EXECUTION_EVIDENCE.md](EXECUTION_EVIDENCE.md)。
+12. 六位代码只代表格式，不能推导板块/类型。instrument独占固定身份及数量规则适用事实，消费者为execution；Store固定完整离线快照、每份证据的解析身份及run版本，query仅只读核对。未知/冲突/未实现类型与规则、覆盖外日期拒绝。研究和普通导入不能自报资格或覆盖快照。详见 [INSTRUMENT_ELIGIBILITY.md](INSTRUMENT_ELIGIBILITY.md)。
 
 **不做的事情**：不设计通用事件总线、不做微服务、不接 Kafka/Redis/ORM、不增加“为了模块化而存在”的 facade 或重复数据模型、不使用硬编码 LOC/函数行数阈值作为合并门禁。
 

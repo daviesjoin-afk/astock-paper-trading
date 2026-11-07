@@ -1,6 +1,6 @@
 //! Offline measurement of the real Store path; no bulk inserts or cached state.
 use astock_v2::{domain::*, store::Store};
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use serde_json::{json, Value};
 use std::{error::Error, path::PathBuf, time::Instant};
 
@@ -50,18 +50,21 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
     let path = path.to_str().ok_or("non-UTF8 temporary path")?;
     let mut db = if disk { Store::open(path, INITIAL_CASH_CENTS)? }
         else { Store::in_memory(INITIAL_CASH_CENTS)? };
-    let cutoff = days[if fills { ((size - 1) / 25) / 2 } else { 0 }].to_string();
+    // The pinned identity fixture covers one supported symbol and eight days.
+    // Never manufacture 25 "main-board" identities from a numeric prefix.
+    let per_day = if fills { size.div_ceil(days.len()) } else { size };
+    let cutoff = days[if fills { ((size - 1) / per_day) / 2 } else { 0 }].to_string();
     let mut expected_historical = None;
     let mut submit_ms = Vec::with_capacity(size);
     let mut ingest_ms = Vec::with_capacity(size);
     let mut filled = 0;
     let mut last_request = None;
     for i in 0..size {
-        let day_index = if fills { i / 25 } else { 0 };
+        let day_index = if fills { i / per_day } else { 0 };
         let day = days[day_index].to_string();
-        let symbol = format!("{:06}.SH", 600000 + if fills { i % 25 } else { 0 });
+        let symbol = "600000.SH".to_string();
         let req = SimulationRequest {
-            schema_version: 2, cycle_id: "ledger-bench-v2".into(),
+            schema_version: 2, cycle_id: "ledger-bench-v3".into(),
             strategy_version_id: "offline-fixed-v1".into(), signal_id: format!("signal-{i}"),
             decision_at: format!("{day}T10:00:00+08:00"),
             signal: Signal { symbol: symbol.clone(),
@@ -85,14 +88,15 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         ingest_ms.push(elapsed);
         let (record, elapsed) = timed(|| Ok(db.submit(req.clone())?))?;
         submit_ms.push(elapsed);
-        if fills || i == 0 {
+        if i == 0 || (fills && i % per_day == 0) {
             assert_eq!(record.outcome.status, DecisionStatus::Filled);
             filled += 1;
         } else {
-            assert_eq!(record.outcome.reason, "position_already_open");
+            assert_eq!(record.outcome.reason,
+                if fills && day_index % 2 == 1 { "no_t1_sellable_lot" } else { "position_already_open" });
         }
         // Capture the prefix before any later day is appended, outside timing.
-        if day == cutoff && (i + 1 == size || (fills && (i + 1) % 25 == 0)) {
+        if day == cutoff && (i + 1 == size || (fills && (i + 1) % per_day == 0)) {
             expected_historical = Some(db.state(Some(&cutoff))?);
         }
         last_request = Some(req);
@@ -138,7 +142,7 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
     }
     let window = size.min(50);
     Ok(json!({"storage": if disk { "disk_wal" } else { "memory" },
-        "scenario": if fills { "all_fills" } else { "mostly_rejected" },
+        "scenario": if fills { "daily_first_fill" } else { "mostly_rejected" },
         "runs": size, "fills": filled, "cutoff": cutoff,
         "historical_runs": expected_historical.runs_total,
         "submit_total_ms": submit_ms.iter().sum::<f64>(),
@@ -154,26 +158,30 @@ fn main() -> Result<()> {
     let sizes: Vec<usize> = if args.is_empty() { vec![100, 1000, 5000] }
         else { args.iter().map(|v| v.parse()).collect::<std::result::Result<_, _>>()? };
     let calendar: TradingCalendar = serde_json::from_str(BUNDLED_CALENDAR_JSON)?;
+    let instruments: InstrumentSnapshot = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON)?;
+    instruments.validate()?;
     let mut days = Vec::new();
-    let mut day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-    while day.year_ce().1 == 2026 {
+    let mut day = NaiveDate::parse_from_str(&instruments.coverage_start, "%Y-%m-%d")?;
+    let end = NaiveDate::parse_from_str(&instruments.coverage_end, "%Y-%m-%d")?;
+    while day <= end {
         if calendar.day(day)? == CalendarDay::Trading { days.push(day); }
         day = day.succ_opt().unwrap();
     }
     if sizes.iter().any(|&n| n == 0 || n > 5000) {
-        return Err("sizes must be in 1..=5000 (fixed 2026 offline coverage)".into());
+        return Err("sizes must be in 1..=5000 (fixed offline identity coverage)".into());
     }
     let mut cases = Vec::new();
     for size in sizes {
         for disk in [false, true] {
             for fills in [true, false] {
-                eprintln!("benchmark runs={size} disk={disk} all_fills={fills}");
+                eprintln!("benchmark runs={size} disk={disk} daily_first_fill={fills}");
                 cases.push(measure(size, disk, fills, &days)?);
             }
         }
     }
     println!("{}", serde_json::to_string_pretty(&json!({
-        "generator": "ledger-bench-v2", "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "generator": "ledger-bench-v3", "instrument_version": instruments.version,
+        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
         "logical_cpus": std::thread::available_parallelism()?.get(),
         "sqlite": rusqlite::version(), "cases": cases

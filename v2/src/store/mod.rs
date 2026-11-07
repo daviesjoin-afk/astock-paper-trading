@@ -1,6 +1,7 @@
 //! SQLite is an append-only simulation ledger with exactly one Rust write owner.
 use crate::domain::{decide, validate_quote_import, Fill, Lot, Outcome, POLICY_VERSION, PortfolioState, QuoteEvidence, QuoteImport, QuoteRef, QuoteTrust, RuleError, SimulationRequest};
 use crate::domain::{TradingCalendar, SessionPolicy, BUNDLED_CALENDAR_JSON, BUNDLED_SESSION_POLICY_JSON};
+use crate::domain::{InstrumentSnapshot, BUNDLED_INSTRUMENTS_JSON};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -45,6 +46,7 @@ pub struct RunRecord {
     pub evidence: Option<QuoteEvidence>,
     pub calendar_version: String,
     pub session_policy_version: String,
+    pub instrument_version: String,
     pub outcome: Outcome,
     pub duplicate: bool,
 }
@@ -90,7 +92,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection, initial_cash_cents: i64) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 4;
+        const SCHEMA_VERSION: i64 = 5;
         if initial_cash_cents <= 0 {
             return Err(StoreError::Integrity("initial_cash_must_be_positive".into()));
         }
@@ -113,7 +115,7 @@ impl Store {
             }
             let tables: &[(&str, &[&str])] = &[
                 ("v2_meta", &["key", "value"]),
-                ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version"]),
+                ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_fills", &["id", "run_id", "fill_json"]),
                 ("v2_quote_evidence", &["source", "quote_id", "evidence_json"]),
             ];
@@ -148,8 +150,10 @@ impl Store {
         if fresh {
             let calendar: TradingCalendar = serde_json::from_str(BUNDLED_CALENDAR_JSON)?;
             let sessions: SessionPolicy = serde_json::from_str(BUNDLED_SESSION_POLICY_JSON)?;
+            let instruments: InstrumentSnapshot = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON)?;
             calendar.validate()?;
             sessions.validate()?;
+            instruments.validate()?;
         } else {
             // Persisted market facts must be checked before changing journal mode.
             load_market_context(&conn)?;
@@ -174,6 +178,7 @@ impl Store {
                     outcome_json TEXT NOT NULL,
                     calendar_version TEXT NOT NULL,
                     session_policy_version TEXT NOT NULL,
+                    instrument_version TEXT NOT NULL,
                     UNIQUE(cycle_id, strategy_version_id, signal_id)
                 );
                 CREATE TABLE v2_fills (
@@ -197,6 +202,7 @@ impl Store {
             txn.execute("INSERT INTO v2_meta(key,value) VALUES('policy_version',?)", [POLICY_VERSION])?;
             txn.execute("INSERT INTO v2_meta(key,value) VALUES('calendar_snapshot_json',?)", [BUNDLED_CALENDAR_JSON])?;
             txn.execute("INSERT INTO v2_meta(key,value) VALUES('session_policy_snapshot_json',?)", [BUNDLED_SESSION_POLICY_JSON])?;
+            txn.execute("INSERT INTO v2_meta(key,value) VALUES('instrument_snapshot_json',?)", [BUNDLED_INSTRUMENTS_JSON])?;
             txn.commit()?;
         }
         Ok(Self { conn, initial_cash_cents })
@@ -206,6 +212,7 @@ impl Store {
     pub fn ingest_quote(&mut self, input: QuoteImport) -> StoreResult<QuoteEvidence> {
         validate_quote_import(&input)?;
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, _, instruments) = load_market_context(&txn)?;
         let identity = QuoteRef {
             source: input.quote.source.clone(), quote_id: input.quote.quote_id.clone(),
         };
@@ -214,6 +221,7 @@ impl Store {
                 || stored.execution != input.execution {
                 return Err(StoreError::Conflict("quote_identity_payload_conflict".into()));
             }
+            verify_instrument_identity(&instruments, &stored)?;
             return Ok(stored);
         }
         // Only this Rust ingress records actual receipt. Caller declarations
@@ -222,7 +230,9 @@ impl Store {
             .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset"))
             .to_rfc3339();
         let evidence = QuoteEvidence {
-            schema_version: 3, available_at: input.available_at, quote: input.quote,
+            schema_version: 4,
+            instrument: instruments.identity(&input.quote.symbol).cloned(),
+            available_at: input.available_at, quote: input.quote,
             execution: input.execution,
             trust_level: QuoteTrust::OfflineFixture,
             provider_published_at: None, received_at,
@@ -238,15 +248,15 @@ impl Store {
     /// All mutations and idempotency checks occur under one IMMEDIATE transaction.
     pub fn submit(&mut self, request: SimulationRequest) -> StoreResult<RunRecord> {
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (calendar, sessions) = load_market_context(&txn)?;
-        let prior: Option<(i64, String, String, String, String, String)> = txn.query_row(
-            "SELECT id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version FROM v2_simulation_runs
+        let (calendar, sessions, instruments) = load_market_context(&txn)?;
+        let prior: Option<(i64, String, String, String, String, String, String)> = txn.query_row(
+            "SELECT id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version FROM v2_simulation_runs
              WHERE cycle_id=? AND strategy_version_id=? AND signal_id=?",
             params![request.cycle_id, request.strategy_version_id, request.signal_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         ).optional()?;
-        if let Some((id, raw_request, raw_outcome, raw_evidence, calendar_version, session_policy_version)) = prior {
-            verify_market_versions(&calendar, &sessions, &calendar_version, &session_policy_version, id)?;
+        if let Some((id, raw_request, raw_outcome, raw_evidence, calendar_version, session_policy_version, instrument_version)) = prior {
+            verify_market_versions(&calendar, &sessions, &instruments, &calendar_version, &session_policy_version, &instrument_version, id)?;
             let old_request: SimulationRequest = serde_json::from_str(&raw_request)?;
             if old_request != request {
                 return Err(StoreError::Conflict(
@@ -255,7 +265,7 @@ impl Store {
             }
             let outcome = serde_json::from_str(&raw_outcome)?;
             let evidence = serde_json::from_str(&raw_evidence)?;
-            return Ok(RunRecord { id, request, evidence, calendar_version, session_policy_version, outcome, duplicate: true });
+            return Ok(RunRecord { id, request, evidence, calendar_version, session_policy_version, instrument_version, outcome, duplicate: true });
         }
         // V2 is append-only. Out-of-order historical corrections require a
         // separate explicit rebase/import operation; never silently recalculate
@@ -278,15 +288,16 @@ impl Store {
         }
         let state = load_state(&txn, self.initial_cash_cents)?;
         let evidence = load_evidence(&txn, &request.quote_ref)?;
-        let outcome = decide(&state, &request, evidence.as_ref(), &calendar, &sessions)?;
+        if let Some(pinned) = &evidence { verify_instrument_identity(&instruments, pinned)?; }
+        let outcome = decide(&state, &request, evidence.as_ref(), &calendar, &sessions, &instruments)?;
         txn.execute(
             "INSERT INTO v2_simulation_runs
-             (cycle_id,strategy_version_id,signal_id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version)
-             VALUES(?,?,?,?,?,?,?,?)",
+             (cycle_id,strategy_version_id,signal_id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version)
+             VALUES(?,?,?,?,?,?,?,?,?)",
             params![
                 request.cycle_id, request.strategy_version_id, request.signal_id,
                 serde_json::to_string(&request)?, serde_json::to_string(&outcome)?,
-                serde_json::to_string(&evidence)?, calendar.version, sessions.version
+                serde_json::to_string(&evidence)?, calendar.version, sessions.version, instruments.version
             ],
         )?;
         let id = txn.last_insert_rowid();
@@ -298,12 +309,13 @@ impl Store {
         }
         txn.commit()?;
         Ok(RunRecord { id, request, evidence, calendar_version: calendar.version,
-            session_policy_version: sessions.version, outcome, duplicate: false })
+            session_policy_version: sessions.version, instrument_version: instruments.version,
+            outcome, duplicate: false })
     }
 
 }
 
-fn load_market_context(conn: &Connection) -> StoreResult<(TradingCalendar, SessionPolicy)> {
+fn load_market_context(conn: &Connection) -> StoreResult<(TradingCalendar, SessionPolicy, InstrumentSnapshot)> {
     let raw_calendar: String = conn.query_row(
         "SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get(0)
     )?;
@@ -312,23 +324,29 @@ fn load_market_context(conn: &Connection) -> StoreResult<(TradingCalendar, Sessi
     )?;
     let calendar: TradingCalendar = serde_json::from_str(&raw_calendar)?;
     let sessions: SessionPolicy = serde_json::from_str(&raw_sessions)?;
+    let raw_instruments: String = conn.query_row(
+        "SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'", [], |r| r.get(0)
+    )?;
+    let instruments: InstrumentSnapshot = serde_json::from_str(&raw_instruments)?;
     calendar.validate()?;
     sessions.validate()?;
+    instruments.validate()?;
     // Never reinterpret a ledger using a later edited file or the same version
     // name with different content. Unsupported versions require an explicit path.
     if serde_json::to_value(&calendar)? != serde_json::from_str::<serde_json::Value>(BUNDLED_CALENDAR_JSON)?
         || serde_json::to_value(&sessions)? != serde_json::from_str::<serde_json::Value>(BUNDLED_SESSION_POLICY_JSON)?
+        || serde_json::to_value(&instruments)? != serde_json::from_str::<serde_json::Value>(BUNDLED_INSTRUMENTS_JSON)?
     {
         return Err(StoreError::Integrity("pinned_market_snapshot_mismatch".into()));
     }
-    Ok((calendar, sessions))
+    Ok((calendar, sessions, instruments))
 }
 
 fn verify_market_versions(
-    calendar: &TradingCalendar, sessions: &SessionPolicy,
-    calendar_version: &str, session_version: &str, id: i64,
+    calendar: &TradingCalendar, sessions: &SessionPolicy, instruments: &InstrumentSnapshot,
+    calendar_version: &str, session_version: &str, instrument_version: &str, id: i64,
 ) -> StoreResult<()> {
-    if calendar_version != calendar.version || session_version != sessions.version {
+    if calendar_version != calendar.version || session_version != sessions.version || instrument_version != instruments.version {
         return Err(StoreError::Integrity(format!("run_market_version_mismatch_at_{id}")));
     }
     Ok(())
@@ -340,6 +358,14 @@ fn load_evidence(conn: &Connection, identity: &QuoteRef) -> StoreResult<Option<Q
         params![identity.source, identity.quote_id], |row| row.get(0),
     ).optional()?;
     Ok(raw.map(|value| serde_json::from_str(&value)).transpose()?)
+}
+
+// Storage referential integrity applies even to closed-date/rejected runs.
+fn verify_instrument_identity(snapshot: &InstrumentSnapshot, evidence: &QuoteEvidence) -> StoreResult<()> {
+    if evidence.instrument.as_ref() != snapshot.identity(&evidence.quote.symbol) {
+        return Err(StoreError::Integrity("stored_instrument_identity_mismatch".into()));
+    }
+    Ok(())
 }
 
 fn load_state(conn: &Connection, initial_cash: i64) -> StoreResult<PortfolioState> {
