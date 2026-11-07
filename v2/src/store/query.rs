@@ -3,6 +3,10 @@ use super::*;
 use std::collections::BTreeMap;
 
 impl Store {
+    pub fn market_data_pack(&self, pack_id: &str) -> StoreResult<MarketDataPack> {
+        load_market_pack(&self.conn, pack_id)
+    }
+
     pub fn experiment(&self, cycle_id: &str) -> StoreResult<Experiment> {
         load_experiment(&self.conn, cycle_id)
     }

@@ -1,6 +1,128 @@
 use super::*;
 
 #[test]
+fn two_packs_keep_equal_external_ids_independent_after_completion_and_restart() {
+    let file = DiskDatabase::new();
+    let a_req = request("2026-10-30", "external-shared", Side::Buy);
+    let mut b_req = a_req.clone();
+    b_req.cycle_id = "pack-b".into();
+    b_req.quote_ref.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    let a_old;
+    let a_replay;
+    let b_old;
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let a_fill = ingest_and_submit(&mut db, a_req.clone());
+        assert_eq!(a_fill.outcome.fill.unwrap().quantity, 800);
+        a_old = db.state("cycle-1", Some("2026-10-30")).unwrap();
+        db.complete_experiment("cycle-1").unwrap();
+        a_replay = db.verify_replay("cycle-1").unwrap();
+        // A is completed before B's pack registration and evidence arrival.
+        let mut b_spec = spec("pack-b", INITIAL_CASH_CENTS);
+        b_spec.market_data_pack_id = b_req.quote_ref.market_data_pack_id.clone();
+        db.create_experiment(b_spec).unwrap();
+        let mut input = evidence(&b_req);
+        input.quote.price_cents = 2000;
+        input.execution.as_mut().unwrap().price_cents = 2000;
+        let b_evidence = db.ingest_quote(input.clone()).unwrap();
+        let second = db.submit(b_req.clone()).unwrap();
+        assert_eq!(second.outcome.fill.as_ref().unwrap().quantity, 400);
+        assert_eq!(second.outcome.fill.as_ref().unwrap().price_cents, 2000);
+        assert_eq!(second.instrument_version, "cn-instruments-offline-v2");
+        assert_eq!(db.ingest_quote(input.clone()).unwrap(), b_evidence);
+        assert!(db.submit(b_req.clone()).unwrap().duplicate);
+        input.execution.as_mut().unwrap().price_cents += 1;
+        assert!(matches!(db.ingest_quote(input), Err(StoreError::Conflict(_))));
+        let mut sell = b_req.clone();
+        sell.signal_id = "b-t1".into(); sell.signal.side = Side::Sell;
+        sell.quote_ref.quote_id = "b-t1-quote".into();
+        assert_eq!(ingest_and_submit(&mut db, sell).outcome.reason, "no_t1_sellable_lot");
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), a_old);
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), a_replay);
+        b_old = db.state("pack-b", None).unwrap();
+        assert_eq!(b_old.runs_total, 2);
+        assert_eq!(a_old.runs_total, 1);
+        assert_ne!(a_old.cash_cents, b_old.cash_cents);
+    }
+    let mut db = Store::open(file.path()).unwrap();
+    assert_eq!(db.verify_replay("cycle-1").unwrap(), a_replay);
+    assert_eq!(db.verify_replay("pack-b").unwrap().fills_verified, 1);
+    assert_eq!(db.state("pack-b", None).unwrap(), b_old);
+    assert!(db.submit(a_req).unwrap().duplicate);
+    assert!(db.submit(b_req).unwrap().duplicate);
+}
+
+#[test]
+fn pack_identity_summary_contents_and_experiment_references_are_verified() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut b_spec = spec("pack-b", INITIAL_CASH_CENTS);
+        b_spec.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+        db.create_experiment(b_spec).unwrap();
+        ingest_and_submit(&mut db, request("2026-10-30", "keep-a", Side::Buy));
+        let before = db.verify_replay("cycle-1").unwrap();
+        let original: String = db.conn.query_row("SELECT pack_json FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-2'", [], |r| r.get(0)).unwrap();
+        for path in ["manifest.pack_id", "manifest.version", "manifest.content_summary.instruments", "instruments.version", "calendar.version"] {
+            db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json,?,'tampered') WHERE pack_id='cn-offline-fixture-pack-2'", [format!("$.{path}")]).unwrap();
+            assert!(db.verify_replay("pack-b").is_err());
+            assert!(db.state("pack-b", None).is_err());
+            assert_eq!(db.verify_replay("cycle-1").unwrap(), before);
+            assert!(db.register_reviewed_pack("cn-offline-fixture-pack-2").is_err());
+            db.conn.execute("UPDATE v2_market_data_packs SET pack_json=? WHERE pack_id='cn-offline-fixture-pack-2'", [&original]).unwrap();
+        }
+        db.conn.execute("UPDATE v2_experiments SET spec_json=json_set(spec_json,'$.market_data_pack_id','cn-offline-fixture-pack-1') WHERE cycle_id='pack-b'", []).unwrap();
+        assert!(db.verify_replay("pack-b").is_err());
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), before);
+    }
+    let before = disk_snapshot(&file);
+    assert!(Store::open(file.path()).is_err());
+    assert_eq!(disk_snapshot(&file), before);
+}
+
+#[test]
+fn pack_registration_is_idempotent_rejects_replacement_and_rolls_back_with_creation() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let a = db.state("cycle-1", None).unwrap();
+    let mut b = spec("pack-b", INITIAL_CASH_CENTS);
+    b.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    db.conn.execute_batch("CREATE TRIGGER fail_pack_experiment BEFORE INSERT ON v2_experiments BEGIN SELECT RAISE(ABORT,'test rollback'); END;").unwrap();
+    assert!(db.create_experiment(b.clone()).is_err());
+    let count: i64 = db.conn.query_row("SELECT count(*) FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-2'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+    db.conn.execute_batch("DROP TRIGGER fail_pack_experiment;").unwrap();
+    db.create_experiment(b).unwrap();
+    let saved = db.register_reviewed_pack("cn-offline-fixture-pack-2").unwrap();
+    assert_eq!(db.register_reviewed_pack("cn-offline-fixture-pack-2").unwrap(), saved);
+    let mut bad = saved.clone(); bad.manifest.description = "same-id-different-content".into();
+    assert!(matches!(register_pack(&db.conn, &bad), Err(StoreError::Conflict(_))));
+    assert_eq!(load_market_pack(&db.conn, "cn-offline-fixture-pack-2").unwrap(), saved);
+    assert!(db.register_reviewed_pack("unknown-pack").is_err());
+    assert_eq!(db.state("cycle-1", None).unwrap(), a);
+}
+
+#[test]
+fn cross_pack_execution_and_request_references_fail_without_writes() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.register_reviewed_pack("cn-offline-fixture-pack-2").unwrap();
+    let mut req = request("2026-10-30", "cross", Side::Buy);
+    let mut input = evidence(&req);
+    input.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    assert!(db.ingest_quote(input).is_err()); // Nested execution still claims A.
+    req.quote_ref.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    assert!(db.submit(req).is_err()); // Experiment still pins A.
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+    let mut b = spec("pack-b", INITIAL_CASH_CENTS);
+    b.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    db.create_experiment(b).unwrap();
+    db.conn.execute("DELETE FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-2'", []).unwrap();
+    assert!(db.verify_replay("pack-b").is_err());
+    assert!(db.state("pack-b", None).is_err());
+    assert!(db.verify_replay("cycle-1").unwrap().ok);
+}
+
+
+#[test]
 fn pack_selection_allows_a_second_reviewed_experiment() {
     let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let mut b = spec("pack-b", INITIAL_CASH_CENTS);
@@ -47,6 +169,10 @@ fn experiments_select_market_coverage_without_redefining_a_global_context() {
     b.market_data_pack_id = "cn-offline-fixture-pack-2".into();
     let created = db.create_experiment(b);
     assert!(created.is_ok(), "B's narrower coverage must not redefine A's context");
+    let mut b_req = request("2026-10-27", "coverage-b", Side::Buy);
+    b_req.cycle_id = "pack-b".into();
+    b_req.quote_ref.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    assert_eq!(ingest_and_submit(&mut db, b_req).outcome.reason, "instrument_date_not_covered");
     assert_eq!(db.state("cycle-1", None).unwrap(), before);
 }
 
@@ -486,7 +612,7 @@ fn instrument_snapshot_and_run_version_cannot_be_changed_in_place() {
         assert!(db.submit(req.clone()).is_err());
         assert!(db.ingest_quote(evidence(&req)).is_err());
         assert!(db.verify_replay("cycle-1").is_err());
-        assert_eq!(db.state("cycle-1", None).unwrap(), state);
+        assert!(db.state("cycle-1", None).is_err());
     }
     db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json,'$.instruments',json(?)) WHERE pack_id='cn-offline-fixture-pack-1'", [original]).unwrap();
     db.conn.execute("UPDATE v2_simulation_runs SET instrument_version='later-version'", []).unwrap();
@@ -1445,7 +1571,7 @@ fn changed_market_snapshots_or_run_versions_never_reinterpret_history() {
             let mut next = req.clone();
             next.signal_id = "next".into();
             assert!(db.submit(next).is_err());
-            assert_eq!(db.state("cycle-1", None).unwrap(), state);
+            assert!(db.state("cycle-1", None).is_err());
             db.conn.execute("UPDATE v2_market_data_packs SET pack_json=json_set(pack_json, '$.' || ?2,json(?1)) WHERE pack_id='cn-offline-fixture-pack-1'", params![original, key]).unwrap();
             assert!(db.verify_replay("cycle-1").unwrap().ok);
         }

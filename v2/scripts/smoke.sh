@@ -349,6 +349,7 @@ print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
 python3 scripts/experiment_demo.py
+python3 scripts/market_pack_demo.py
 # Reopen the exact SQLite file in a new Rust process, then verify both frozen ledgers.
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
@@ -356,4 +357,5 @@ cargo run --locked --quiet >"${RUNNER_TEMP:-/tmp}/astock-v2-api.log" 2>&1 &
 server_pid=$!
 wait_ready
 python3 scripts/experiment_demo.py --verify-only
+python3 scripts/market_pack_demo.py --verify-only
 echo "V2 HTTP/Python/Rust/SQLite end-to-end smoke passed"
