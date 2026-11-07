@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn pack_selection_allows_a_second_reviewed_experiment() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let mut b = spec("pack-b", INITIAL_CASH_CENTS);
+    b.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    assert!(db.create_experiment(b).is_ok(), "an independently reviewed pack must be selectable");
+}
+
+#[test]
+fn packs_can_ingest_equal_external_quote_ids_with_different_prices() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-30", "same-external-id", Side::Buy);
+    let a = evidence(&req);
+    let mut b = a.clone();
+    b.quote.price_cents = 2000;
+    b.execution.as_mut().unwrap().price_cents = 2000;
+    db.ingest_quote(a).unwrap();
+    // The current contract has no pack dimension; these are intended A/B inputs.
+    assert!(db.ingest_quote(b).is_ok(), "B must not collide with A's external quote ID");
+}
+
+#[test]
+fn adding_reviewed_context_does_not_break_a_completed_experiment_on_reopen() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        ingest_and_submit(&mut db, request("2026-10-30", "old-pack", Side::Buy));
+        db.complete_experiment("cycle-1").unwrap();
+        // Model the only current storage location for a replacement context.
+        // This is a fixture setup, not an authorized production mutation path.
+        db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'",
+            [include_str!("../../data/instruments-offline-v2.json")]).unwrap();
+    }
+    let reopened = Store::open(file.path());
+    assert!(reopened.is_ok(), "installing B must leave completed A readable");
+    assert_eq!(reopened.unwrap().verify_replay("cycle-1").unwrap().fills_verified, 1);
+}
+
+#[test]
+fn experiments_select_market_coverage_without_redefining_a_global_context() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-27", "coverage", Side::Buy);
+    assert_eq!(ingest_and_submit(&mut db, req).outcome.status, DecisionStatus::Filled);
+    let before = db.state("cycle-1", None).unwrap();
+    let mut b = spec("pack-b", INITIAL_CASH_CENTS);
+    b.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    let created = db.create_experiment(b);
+    assert!(created.is_ok(), "B's narrower coverage must not redefine A's context");
+    assert_eq!(db.state("cycle-1", None).unwrap(), before);
+}
+
+
+#[test]
 fn failed_experiment_creation_and_completion_roll_back_without_touching_other_experiments() {
     let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let a = db.state("cycle-1", None).unwrap();
