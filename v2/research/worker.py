@@ -1,5 +1,10 @@
 """V2 offline research producer. Never opens or writes the trading ledger.
 
+This module emits a *kernel fixture proposal*: a fixed offline request used to
+exercise the Rust kernel. It is not a research signal. The reproducible research
+path is `research/run_research.py`, which builds a reviewed strategy artifact and
+a research output from a frozen input.
+
 Example:
     python3 v2/research/worker.py --output /tmp/v2-signal.json
     python3 v2/research/worker.py --output /tmp/v2-signal.json --send
@@ -24,7 +29,7 @@ def build_fixture_proposal(cycle_id: str = "offline-fixture-cycle", pack_id: str
     return {
         "schema_version": 4,
         "cycle_id": cycle_id,
-        "strategy_version_id": "research-fixture-v1",
+        "strategy_version_id": "research-momentum-v1",
         "signal_id": "fixture-buy-600000-20261030",
         "decision_at": day.isoformat(timespec="seconds"),
         "signal": {"symbol": "600000.SH", "side": "buy"},

@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use crate::domain::{Experiment, ExperimentSpec, ExperimentStatus, StrategyArtifact, MARKET_DATA_PACK_ID, MarketDataPack, MarketDataPackManifest};
+use crate::domain::{ResearchInputManifest, ResearchOutput};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -79,6 +80,22 @@ pub struct ReplayReport {
     pub cash_cents: i64,
 }
 
+/// Proof that one experiment realized exactly the reviewed research signals for
+/// its frozen strategy definition and frozen research input. It describes
+/// research identity only: fills, prices, fees and cash stay with replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchReproductionReport {
+    pub cycle_id: String,
+    pub ok: bool,
+    pub strategy_version_id: String,
+    pub research_input_id: String,
+    pub research_output_id: String,
+    pub research_output_digest: String,
+    pub parameters_digest: String,
+    pub source_digest: String,
+    pub signals_verified: usize,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -94,7 +111,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 7;
+        const SCHEMA_VERSION: i64 = 8;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -116,6 +133,7 @@ impl Store {
                 ("v2_meta", &["key", "value"]),
                 ("v2_experiments", &["cycle_id", "spec_json", "status", "pack_manifest_json"]),
                 ("v2_market_data_packs", &["pack_id", "pack_json"]),
+                ("v2_research_inputs", &["research_input_id", "manifest_json"]),
                 ("v2_strategy_artifacts", &["strategy_version_id", "artifact_json"]),
                 ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_fills", &["id", "run_id", "fill_json"]),
@@ -138,6 +156,9 @@ impl Store {
             let pack_ids = conn.prepare("SELECT pack_id FROM v2_market_data_packs")?
                 .query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             for id in pack_ids { load_market_pack(&conn, &id)?; }
+            let input_ids = conn.prepare("SELECT research_input_id FROM v2_research_inputs")?
+                .query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            for id in input_ids { load_research_input(&conn, &id)?; }
             let mut stmt = conn.prepare("SELECT cycle_id FROM v2_experiments")?;
             let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             for id in ids { load_experiment(&conn, &id)?; }
@@ -165,6 +186,10 @@ impl Store {
                 CREATE TABLE v2_market_data_packs (
                     pack_id TEXT PRIMARY KEY NOT NULL,
                     pack_json TEXT NOT NULL
+                );
+                CREATE TABLE v2_research_inputs (
+                    research_input_id TEXT PRIMARY KEY NOT NULL,
+                    manifest_json TEXT NOT NULL
                 );
                 CREATE TABLE v2_strategy_artifacts (
                     strategy_version_id TEXT PRIMARY KEY NOT NULL,
@@ -226,6 +251,7 @@ impl Store {
         }
         let pack = reviewed_market_pack(&spec.market_data_pack_id)?;
         register_pack(&txn, &pack)?;
+        register_research_input(&txn, &reviewed_research_input(&spec.strategy.research_input_id)?)?;
         let artifact: Option<String> = txn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0)).optional()?;
         if let Some(raw) = artifact {
             if serde_json::from_str::<StrategyArtifact>(&raw)? != spec.strategy {
@@ -420,6 +446,96 @@ fn reviewed_market_pack(pack_id: &str) -> StoreResult<MarketDataPack> {
     Ok(pack)
 }
 
+/// Reviewed strategy research records: definition, source bytes, frozen input
+/// and the research output those two must reproduce.
+///
+/// A strategy definition is data plus the exact source bytes whose digest the
+/// artifact pins. Adding a strategy means adding both records and a reviewed
+/// definition, never accepting an uploaded one.
+fn strategy_source(strategy_version_id: &str) -> StoreResult<&'static str> {
+    Ok(match strategy_version_id {
+        "research-momentum-v1" => include_str!("../../research/strategies/momentum.py"),
+        "research-reversion-v1" => include_str!("../../research/strategies/reversion.py"),
+        _ => return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into()))),
+    })
+}
+
+fn reviewed_strategy_artifact(strategy_version_id: &str) -> StoreResult<StrategyArtifact> {
+    let raw = match strategy_version_id {
+        "research-momentum-v1" => include_str!("../../data/strategy-momentum-v1.json"),
+        "research-reversion-v1" => include_str!("../../data/strategy-reversion-v1.json"),
+        _ => return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into()))),
+    };
+    let artifact: StrategyArtifact = serde_json::from_str(raw)?;
+    artifact.verify_content()?;
+    if artifact.strategy_version_id != strategy_version_id {
+        return Err(StoreError::Integrity("reviewed_strategy_identity_mismatch".into()));
+    }
+    let source = crate::domain::normalize_newlines(strategy_source(strategy_version_id)?);
+    if artifact.source_digest != crate::domain::sha256_hex(source.as_bytes()) {
+        return Err(StoreError::Integrity("reviewed_strategy_source_digest_mismatch".into()));
+    }
+    Ok(artifact)
+}
+
+fn reviewed_research_input(research_input_id: &str) -> StoreResult<ResearchInputManifest> {
+    let raw = match research_input_id {
+        "offline-research-input-v1" => include_str!("../../data/research-input-offline-v1.json"),
+        _ => return Err(StoreError::Rules(RuleError("unsupported_research_input".into()))),
+    };
+    let manifest: ResearchInputManifest = serde_json::from_str(raw)?;
+    manifest.validate()?;
+    if manifest.research_input_id != research_input_id {
+        return Err(StoreError::Integrity("research_input_identity_mismatch".into()));
+    }
+    Ok(manifest)
+}
+
+fn reviewed_research_output(strategy_version_id: &str) -> StoreResult<ResearchOutput> {
+    let raw = match strategy_version_id {
+        "research-momentum-v1" => include_str!("../../data/research-output-momentum-v1.json"),
+        "research-reversion-v1" => include_str!("../../data/research-output-reversion-v1.json"),
+        _ => return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into()))),
+    };
+    let output: ResearchOutput = serde_json::from_str(raw)?;
+    output.validate()?;
+    if output.strategy_version_id != strategy_version_id {
+        return Err(StoreError::Integrity("reviewed_research_output_identity_mismatch".into()));
+    }
+    Ok(output)
+}
+
+fn register_research_input(conn: &Connection, manifest: &ResearchInputManifest) -> StoreResult<()> {
+    if *manifest != reviewed_research_input(&manifest.research_input_id)? {
+        return Err(StoreError::Conflict("research_input_identity_content_conflict".into()));
+    }
+    let existing: Option<String> = conn.query_row(
+        "SELECT manifest_json FROM v2_research_inputs WHERE research_input_id=?",
+        [&manifest.research_input_id], |r| r.get(0)).optional()?;
+    if let Some(raw) = existing {
+        if serde_json::from_str::<ResearchInputManifest>(&raw)? != *manifest {
+            return Err(StoreError::Conflict("research_input_identity_content_conflict".into()));
+        }
+    } else {
+        conn.execute("INSERT INTO v2_research_inputs VALUES(?,?)",
+            params![manifest.research_input_id, serde_json::to_string(manifest)?])?;
+    }
+    Ok(())
+}
+
+fn load_research_input(conn: &Connection, research_input_id: &str) -> StoreResult<ResearchInputManifest> {
+    let expected = reviewed_research_input(research_input_id)?;
+    let raw: Option<String> = conn.query_row(
+        "SELECT manifest_json FROM v2_research_inputs WHERE research_input_id=?",
+        [research_input_id], |r| r.get(0)).optional()?;
+    let saved: ResearchInputManifest = serde_json::from_str(
+        &raw.ok_or_else(|| StoreError::Integrity("research_input_missing".into()))?)?;
+    if saved != expected {
+        return Err(StoreError::Integrity("pinned_research_input_mismatch".into()));
+    }
+    Ok(saved)
+}
+
 fn register_pack(conn: &Connection, pack: &MarketDataPack) -> StoreResult<()> {
     if *pack != reviewed_market_pack(&pack.manifest.pack_id)? {
         return Err(StoreError::Conflict("pack_identity_content_conflict".into()));
@@ -501,6 +617,29 @@ fn validate_experiment_spec(spec: &ExperimentSpec) -> StoreResult<()> {
         return Err(StoreError::Rules(RuleError("unsupported_execution_policy".into())));
     }
     reviewed_market_pack(&spec.market_data_pack_id)?;
+    // Identity alone never authorizes an experiment: the artifact must equal the
+    // reviewed definition for that id, and its digests must be recomputable from
+    // repository bytes and the frozen research input.
+    spec.strategy.verify_content()?;
+    let reviewed = reviewed_strategy_artifact(&spec.strategy.strategy_version_id)?;
+    if reviewed != spec.strategy {
+        return Err(StoreError::Conflict("strategy_artifact_content_mismatch".into()));
+    }
+    let input = reviewed_research_input(&spec.strategy.research_input_id)?;
+    if input.content_digest != spec.strategy.research_input_digest {
+        return Err(StoreError::Integrity("research_input_digest_mismatch".into()));
+    }
+    // The artifact fixes the input; an experiment that selects another pack can
+    // still be created, but its decisions can never match the frozen signals, so
+    // reproduction fails instead of silently claiming the same research result.
+    let output = reviewed_research_output(&spec.strategy.strategy_version_id)?;
+    if output.research_input_id != spec.strategy.research_input_id
+        || output.algorithm_version != spec.strategy.algorithm_version
+        || output.algorithm_digest != spec.strategy.source_digest
+        || output.parameters_digest != spec.strategy.parameters_digest
+        || output.research_input_digest != spec.strategy.research_input_digest {
+        return Err(StoreError::Integrity("reviewed_research_output_mismatch".into()));
+    }
     Ok(())
 }
 
@@ -518,6 +657,9 @@ fn load_experiment(conn: &Connection, cycle_id: &str) -> StoreResult<Experiment>
     if serde_json::from_str::<StrategyArtifact>(&raw_artifact)? != spec.strategy {
         return Err(StoreError::Integrity("experiment_artifact_mismatch".into()));
     }
+    // The frozen research input is an independently referenced fact; it must
+    // still resolve and still equal the reviewed bytes on every read.
+    load_research_input(conn, &spec.strategy.research_input_id)?;
     let status = match status.as_str() {
         "active" => ExperimentStatus::Active,
         "completed" => ExperimentStatus::Completed,

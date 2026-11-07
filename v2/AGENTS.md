@@ -17,6 +17,11 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
   `calendar.rs`: fixed-version scheduled trading-day facts and source coverage.
   `instrument.rs`: fixed offline security identities and supported quantity-rule applicability.
   `execution.rs`: pure decision policy.
+- `src/domain/digest.rs`: SHA-256 and canonical JSON text for content identity.
+  `research/research_contract.py`: the producer half of the same identity
+  (standard library only). A strategy artifact is reviewed data plus exact
+  source bytes; `research/run_research.py` regenerates the reviewed research
+  output from a frozen input.
 - `store/mod.rs` exclusively owns durable writes, schema, transactions,
   idempotency and storage policy. `store/query.rs` only reads, projects
   and verifies replay; it never commits or writes.
@@ -45,6 +50,9 @@ for all changes under `v2/`. Read `docs/MODULE_BOUNDARIES.md` first.
 - Trading remains simulated. No broker endpoints or live-order APIs.
 - A reference price cannot fill. Require matching, fresh directional execution
   evidence and capacity for the whole candidate; no reference fallback or partial fill.
+- Replay verifies stored decisions; research reproduction verifies that those
+  decisions are the ones the fixed strategy definition and frozen input must
+  produce. Never present one as evidence for the other.
 - A six-digit symbol is syntax only. Store resolves identity from its pinned
   offline snapshot; execution rejects missing/conflicting identities, unsupported
   types/boards/rules and uncovered dates. Research/import cannot declare eligibility.

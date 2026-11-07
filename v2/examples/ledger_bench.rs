@@ -52,7 +52,7 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         else { Store::in_memory()? };
     db.create_experiment(ExperimentSpec {
         schema_version: 1, cycle_id: "ledger-bench-v3".into(), initial_cash_cents: INITIAL_CASH_CENTS,
-        strategy: StrategyArtifact { strategy_version_id: "offline-fixed-v1".into(), research_input_id: "ledger-bench-v3".into() },
+        strategy: serde_json::from_str(include_str!("../data/strategy-momentum-v1.json"))?,
         market_data_pack_id: MARKET_DATA_PACK_ID.into(), execution_policy_version: POLICY_VERSION.into(),
     })?;
     // The pinned identity fixture covers one supported symbol and eight days.
@@ -70,7 +70,7 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         let symbol = "600000.SH".to_string();
         let req = SimulationRequest {
             schema_version: 4, cycle_id: "ledger-bench-v3".into(),
-            strategy_version_id: "offline-fixed-v1".into(), signal_id: format!("signal-{i}"),
+            strategy_version_id: "research-momentum-v1".into(), signal_id: format!("signal-{i}"),
             decision_at: format!("{day}T10:00:00+08:00"),
             signal: Signal { symbol: symbol.clone(),
                 side: if fills && day_index % 2 == 1 { Side::Sell } else { Side::Buy } },

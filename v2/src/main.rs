@@ -77,6 +77,11 @@ async fn replay(State(state): State<Shared>, Query(query): Query<PortfolioQuery>
     response(db.verify_replay(&query.cycle_id).map_err(api_error)?)
 }
 
+async fn research_reproduction(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    let db = state.lock().await;
+    response(db.verify_research_reproduction(&id).map_err(api_error)?)
+}
+
 async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
 }
@@ -109,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/simulations", post(submit).get(runs))
         .route("/v2/portfolio", get(portfolio))
         .route("/v2/replay", get(replay))
+        .route("/v2/experiments/{cycle_id}/research-reproduction", get(research_reproduction))
         .with_state(db);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8765").await?;
     println!("astock-v2 paper-only gateway listening at http://127.0.0.1:8765");

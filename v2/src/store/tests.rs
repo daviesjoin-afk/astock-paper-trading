@@ -201,16 +201,16 @@ fn failed_experiment_creation_and_completion_roll_back_without_touching_other_ex
     let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let a = db.state("cycle-1", None).unwrap();
     let mut b = spec("b", 5_000_000);
-    b.strategy.strategy_version_id = "strategy-v2".into();
+    b.strategy = reversion_artifact();
     db.conn.execute_batch("CREATE TRIGGER fail_create BEFORE INSERT ON v2_experiments BEGIN SELECT RAISE(ABORT,'create failure'); END;").unwrap();
     assert!(db.create_experiment(b.clone()).is_err());
-    let artifacts: i64 = db.conn.query_row("SELECT count(*) FROM v2_strategy_artifacts WHERE strategy_version_id='strategy-v2'", [], |r| r.get(0)).unwrap();
+    let artifacts: i64 = db.conn.query_row("SELECT count(*) FROM v2_strategy_artifacts WHERE strategy_version_id='research-reversion-v1'", [], |r| r.get(0)).unwrap();
     assert_eq!(artifacts, 0);
     db.conn.execute_batch("DROP TRIGGER fail_create;").unwrap();
     db.create_experiment(b).unwrap();
     let mut req = request("2026-10-30", "new-version-buy", Side::Buy);
     req.cycle_id = "b".into();
-    req.strategy_version_id = "strategy-v2".into();
+    req.strategy_version_id = "research-reversion-v1".into();
     assert_eq!(ingest_and_submit(&mut db, req).outcome.status, DecisionStatus::Filled);
     db.conn.execute_batch("CREATE TRIGGER fail_complete BEFORE UPDATE ON v2_experiments BEGIN SELECT RAISE(ABORT,'complete failure'); END;").unwrap();
     assert!(db.complete_experiment("b").is_err());
@@ -417,7 +417,7 @@ fn independent_experiments_can_buy_the_same_signal_and_evidence() {
 fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
         schema_version: 4, cycle_id: "cycle-1".into(),
-        strategy_version_id: "strategy-v1".into(), signal_id: signal_id.into(),
+        strategy_version_id: "research-momentum-v1".into(), signal_id: signal_id.into(),
         decision_at: format!("{day}T10:00:00+08:00"),
         signal: Signal { symbol: "600000.SH".into(), side },
         quote_ref: QuoteRef { market_data_pack_id: crate::domain::MARKET_DATA_PACK_ID.into(),
@@ -1631,10 +1631,18 @@ fn invalid_pinned_calendar_is_refused_before_wal_or_schema_writes() {
     }
 }
 
+fn reviewed_artifact() -> StrategyArtifact {
+    serde_json::from_str(include_str!("../../data/strategy-momentum-v1.json")).unwrap()
+}
+
+fn reversion_artifact() -> StrategyArtifact {
+    serde_json::from_str(include_str!("../../data/strategy-reversion-v1.json")).unwrap()
+}
+
 fn spec(cycle_id: &str, initial_cash_cents: i64) -> ExperimentSpec {
     ExperimentSpec {
         schema_version: 1, cycle_id: cycle_id.into(), initial_cash_cents,
-        strategy: StrategyArtifact { strategy_version_id: "strategy-v1".into(), research_input_id: "offline-research-input-v1".into() },
+        strategy: reviewed_artifact(),
         market_data_pack_id: MARKET_DATA_PACK_ID.into(), execution_policy_version: POLICY_VERSION.into(),
     }
 }
@@ -1651,29 +1659,247 @@ fn test_open(path: &str, cash: i64) -> StoreResult<Store> {
     Ok(db)
 }
 
-// Red tests for ADR 003. They are written against the *desired* behaviour and
-// fail on the pre-fix kernel: identity-only artifacts cannot carry content, and
-// an unreviewed strategy id is accepted.
-#[test]
-fn reviewed_strategy_artifact_with_content_identity_is_accepted() {
-    let raw = include_str!("../../data/strategy-momentum-v1.json");
-    let artifact: StrategyArtifact = serde_json::from_str(raw)
-        .expect("a reviewed strategy artifact must parse into StrategyArtifact");
-    let mut db = Store::in_memory().unwrap();
-    let created = db.create_experiment(ExperimentSpec {
-        schema_version: 1, cycle_id: "reviewed-strategy".into(),
-        initial_cash_cents: INITIAL_CASH_CENTS, strategy: artifact,
-        market_data_pack_id: MARKET_DATA_PACK_ID.into(),
-        execution_policy_version: POLICY_VERSION.into(),
-    });
-    assert!(created.is_ok(), "the reviewed artifact must be accepted: {created:?}");
+
+// --- Frozen research input and reproducible research output ---------------
+
+fn frozen_manifest() -> ResearchInputManifest {
+    serde_json::from_str(include_str!("../../data/research-input-offline-v1.json")).unwrap()
+}
+
+fn frozen_momentum_output() -> ResearchOutput {
+    serde_json::from_str(include_str!("../../data/research-output-momentum-v1.json")).unwrap()
+}
+
+fn frozen_quote_ref(signal: &crate::domain::ResearchSignal) -> QuoteRef {
+    QuoteRef {
+        market_data_pack_id: signal.market_data_pack_id.clone(),
+        source: signal.source.clone(),
+        quote_id: signal.quote_id.clone(),
+    }
+}
+
+fn frozen_evidence(pack: &str, entry: &crate::domain::ResearchInputEntry, side: Side) -> QuoteImport {
+    let reference = QuoteRef {
+        market_data_pack_id: pack.into(),
+        source: entry.quote.source.clone(),
+        quote_id: entry.quote.quote_id.clone(),
+    };
+    QuoteImport {
+        market_data_pack_id: pack.into(),
+        schema_version: 2,
+        available_at: entry.available_at.clone(),
+        quote: entry.quote.clone(),
+        execution: Some(ExecutionLiquidity {
+            schema_version: 2,
+            quote_ref: reference,
+            order_side: side.clone(),
+            price_cents: entry.level(&side).price_cents,
+            available_quantity: entry.level(&side).available_quantity,
+            observed_at: entry.quote.observed_at.clone(),
+        }),
+    }
+}
+
+fn frozen_request(cycle_id: &str, signal: &crate::domain::ResearchSignal) -> SimulationRequest {
+    SimulationRequest {
+        schema_version: 4,
+        cycle_id: cycle_id.into(),
+        strategy_version_id: "research-momentum-v1".into(),
+        signal_id: signal.signal_id.clone(),
+        decision_at: signal.decision_at.clone(),
+        signal: Signal { symbol: signal.symbol.clone(), side: signal.side.clone() },
+        quote_ref: frozen_quote_ref(signal),
+    }
+}
+
+fn realise_frozen_signals(db: &mut Store, cycle_id: &str, output: &ResearchOutput) {
+    let manifest = frozen_manifest();
+    for signal in &output.signals {
+        let entry = manifest.entry_for(&frozen_quote_ref(signal)).expect("frozen entry");
+        db.ingest_quote(frozen_evidence(MARKET_DATA_PACK_ID, entry, signal.side.clone())).unwrap();
+        let _ = db.submit(frozen_request(cycle_id, signal)).unwrap();
+    }
+}
+
+fn fills_of(db: &Store, cycle_id: &str) -> Vec<Fill> {
+    let mut statement = db.conn.prepare(
+        "SELECT f.fill_json FROM v2_fills f JOIN v2_simulation_runs r ON r.id=f.run_id
+         WHERE r.cycle_id=? ORDER BY f.id").unwrap();
+    statement.query_map([cycle_id], |row| row.get::<_, String>(0)).unwrap()
+        .map(|row| serde_json::from_str::<Fill>(&row.unwrap()).unwrap()).collect()
 }
 
 #[test]
-fn an_unreviewed_strategy_identity_cannot_open_an_experiment() {
-    let mut db = Store::in_memory().unwrap();
-    let mut candidate = spec("invented-strategy", INITIAL_CASH_CENTS);
-    candidate.strategy.strategy_version_id = "research-invented-v1".into();
-    assert!(db.create_experiment(candidate).is_err(),
-        "an unreviewed strategy identity must not register");
+fn strategy_identity_with_changed_content_is_rejected() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let reviewed = reviewed_artifact();
+    // Same id, different reviewed parameters. Digests are recomputed so the
+    // artifact is internally consistent: only content identity can reject it.
+    let mut changed = reviewed.clone();
+    changed.parameters_canonical = "{\"lookback\":3,\"threshold_bps\":25}".into();
+    changed.parameters_digest = crate::domain::sha256_hex(changed.parameters_canonical.as_bytes());
+    changed.verify_content().unwrap();
+    let mut candidate = spec("param-change", INITIAL_CASH_CENTS);
+    candidate.strategy = changed;
+    assert!(matches!(db.create_experiment(candidate), Err(StoreError::Conflict(_))));
+
+    // Same id, different research source bytes and different frozen input.
+    let mut source_changed = reviewed.clone();
+    source_changed.source_digest = "0".repeat(64);
+    let mut candidate = spec("source-change", INITIAL_CASH_CENTS);
+    candidate.strategy = source_changed;
+    assert!(matches!(db.create_experiment(candidate), Err(StoreError::Conflict(_))));
+
+    let mut input_changed = reviewed.clone();
+    input_changed.research_input_digest = "1".repeat(64);
+    let mut candidate = spec("input-change", INITIAL_CASH_CENTS);
+    candidate.strategy = input_changed;
+    assert!(matches!(db.create_experiment(candidate), Err(StoreError::Conflict(_))));
+
+    // Unreviewed identities never register.
+    let mut invented = reviewed.clone();
+    invented.strategy_version_id = "research-invented-v1".into();
+    let mut candidate = spec("invented", INITIAL_CASH_CENTS);
+    candidate.strategy = invented;
+    assert!(matches!(db.create_experiment(candidate), Err(StoreError::Rules(_))));
+
+    // A legacy two-field artifact cannot carry content at all.
+    assert!(serde_json::from_value::<StrategyArtifact>(serde_json::json!({
+        "strategy_version_id": "research-momentum-v1",
+        "research_input_id": "offline-research-input-v1",
+    })).is_err());
+
+    for cycle in ["param-change", "source-change", "input-change", "invented"] {
+        assert!(db.experiment(cycle).is_err(), "{cycle} must not be registered");
+    }
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+}
+
+#[test]
+fn research_reproduction_matches_frozen_signals_and_rust_owned_fills() {
+    let file = DiskDatabase::new();
+    let output = frozen_momentum_output();
+    let facts;
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        db.create_experiment(spec("reproduction", INITIAL_CASH_CENTS)).unwrap();
+        realise_frozen_signals(&mut db, "cycle-1", &output);
+        realise_frozen_signals(&mut db, "reproduction", &output);
+        let first = db.verify_research_reproduction("cycle-1").unwrap();
+        let second = db.verify_research_reproduction("reproduction").unwrap();
+        assert_eq!(first.signals_verified, output.signals.len());
+        assert_eq!(first.research_output_digest, output.content_digest);
+        assert_eq!(first.strategy_version_id, "research-momentum-v1");
+        assert_eq!(first.research_input_id, "offline-research-input-v1");
+        assert_eq!(first.parameters_digest, reviewed_artifact().parameters_digest);
+        assert_eq!(first.source_digest, reviewed_artifact().source_digest);
+        assert_eq!(second.research_output_digest, first.research_output_digest);
+        // Same fixed definition and input, two independent experiments: the
+        // research identity is equal and Rust's own trading facts are equal.
+        facts = fills_of(&db, "cycle-1");
+        assert_eq!(facts, fills_of(&db, "reproduction"));
+        assert_eq!(facts.len(), 2);
+        assert_eq!((facts[0].side.clone(), facts[0].quantity), (Side::Buy, 700));
+        assert_eq!((facts[1].side.clone(), facts[1].quantity), (Side::Sell, 700));
+        assert_eq!(facts[0].price_cents, 1295);
+        assert_eq!(facts[1].price_cents, 1245);
+        // Replay and research reproduction are separate proofs, both required.
+        assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 2);
+        assert_eq!(db.verify_replay("reproduction").unwrap().fills_verified, 2);
+        // Idempotent retries are still the frozen signals.
+        realise_frozen_signals(&mut db, "cycle-1", &output);
+        assert_eq!(db.verify_research_reproduction("cycle-1").unwrap(), first);
+    }
+    // Fresh process on the same file: the reviewed definitions must still match
+    // byte for byte, and the stored facts must still verify.
+    let db = Store::open(file.path()).unwrap();
+    assert_eq!(db.verify_research_reproduction("cycle-1").unwrap().signals_verified, 2);
+    assert!(db.verify_replay("cycle-1").unwrap().ok);
+    assert_eq!(fills_of(&db, "cycle-1"), facts);
+}
+
+#[test]
+fn research_reproduction_refuses_extra_missing_and_substituted_inputs() {
+    // Extra decision: replay still accepts it, research reproduction rejects it.
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let output = frozen_momentum_output();
+    realise_frozen_signals(&mut db, "cycle-1", &output);
+    let entry = frozen_manifest().entries.last().cloned().unwrap();
+    let post_hoc = crate::domain::ResearchSignal {
+        sequence: entry.sequence,
+        signal_id: "post-hoc-signal".into(),
+        decision_at: entry.decision_at.clone(),
+        symbol: entry.quote.symbol.clone(),
+        side: Side::Buy,
+        source: entry.quote.source.clone(),
+        quote_id: entry.quote.quote_id.clone(),
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+    };
+    db.ingest_quote(frozen_evidence(MARKET_DATA_PACK_ID, &entry, Side::Buy)).unwrap();
+    db.submit(frozen_request("cycle-1", &post_hoc)).unwrap();
+    assert!(db.verify_replay("cycle-1").unwrap().ok, "replay only follows pinned inputs");
+    assert!(matches!(db.verify_research_reproduction("cycle-1"), Err(StoreError::Integrity(_))));
+
+    // Missing decision.
+    let mut short = test_store(INITIAL_CASH_CENTS).unwrap();
+    let first = output.signals[0].clone();
+    let entry = frozen_manifest().entry_for(&frozen_quote_ref(&first)).cloned().unwrap();
+    short.ingest_quote(frozen_evidence(MARKET_DATA_PACK_ID, &entry, first.side.clone())).unwrap();
+    short.submit(frozen_request("cycle-1", &first)).unwrap();
+    assert!(short.verify_research_reproduction("cycle-1").is_err());
+
+    // Substituted evidence content inside the pinned decision snapshot.
+    let mut substituted = test_store(INITIAL_CASH_CENTS).unwrap();
+    realise_frozen_signals(&mut substituted, "cycle-1", &output);
+    substituted.conn.execute(
+        "UPDATE v2_simulation_runs SET evidence_json=json_set(evidence_json,'$.quote.price_cents',9999)
+         WHERE signal_id='research-momentum-v1-0003-buy'", []).unwrap();
+    assert!(substituted.verify_research_reproduction("cycle-1").is_err());
+    // Changing the pack-level evidence row instead is replay's business.
+    let mut repacked = test_store(INITIAL_CASH_CENTS).unwrap();
+    realise_frozen_signals(&mut repacked, "cycle-1", &output);
+    repacked.conn.execute(
+        "UPDATE v2_quote_evidence SET evidence_json=json_set(evidence_json,'$.quote.price_cents',9999)
+         WHERE quote_id='offline-quote-20261030-1359'", []).unwrap();
+    assert!(repacked.verify_replay("cycle-1").is_err());
+    assert!(repacked.verify_research_reproduction("cycle-1").is_ok());
+
+    // A different reviewed pack cannot host the same research input's signals.
+    let mut other_pack = test_store(INITIAL_CASH_CENTS).unwrap();
+    let mut pack_spec = spec("pack-two", INITIAL_CASH_CENTS);
+    pack_spec.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    other_pack.create_experiment(pack_spec).unwrap();
+    other_pack.ingest_quote(frozen_evidence("cn-offline-fixture-pack-2", &entry, first.side.clone())).unwrap();
+    let mut elsewhere = frozen_request("pack-two", &first);
+    elsewhere.quote_ref.market_data_pack_id = "cn-offline-fixture-pack-2".into();
+    other_pack.submit(elsewhere).unwrap();
+    assert!(other_pack.verify_research_reproduction("pack-two").is_err());
+}
+
+#[test]
+fn frozen_research_input_registration_is_immutable_and_tamper_proof() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        assert_eq!(db.experiment("cycle-1").unwrap().status, ExperimentStatus::Active);
+        db.create_experiment(spec("second", INITIAL_CASH_CENTS)).unwrap();
+        let count: i64 = db.conn.query_row("SELECT count(*) FROM v2_research_inputs", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "one frozen input identity is registered once");
+    }
+    {
+        let conn = Connection::open(file.path()).unwrap();
+        let original: String = conn.query_row(
+            "SELECT manifest_json FROM v2_research_inputs WHERE research_input_id='offline-research-input-v1'",
+            [], |r| r.get(0)).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+        changed["entries"][2]["quote"]["price_cents"] = serde_json::json!(1);
+        conn.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        conn.execute("UPDATE v2_research_inputs SET manifest_json=? WHERE research_input_id='offline-research-input-v1'",
+            [changed.to_string()]).unwrap();
+    }
+    let before = disk_snapshot(&file);
+    for _ in 0..2 {
+        assert!(Store::open(file.path()).is_err(), "tampered frozen input must refuse the file");
+        assert_eq!(disk_snapshot(&file), before);
+    }
 }

@@ -36,8 +36,7 @@ def proposal(cycle):
 def create(cycle, cash):
     return call("experiments", {
         "schema_version": 1, "cycle_id": cycle, "initial_cash_cents": cash,
-        "strategy": {"strategy_version_id": "research-fixture-v1",
-                     "research_input_id": "offline-fixture-input-v1"},
+        "strategy": json.loads((ROOT / "data" / "strategy-momentum-v1.json").read_text(encoding="utf8")),
         "market_data_pack_id": "cn-offline-fixture-pack-1",
         "execution_policy_version": "v2-paper-policy-6",
     })

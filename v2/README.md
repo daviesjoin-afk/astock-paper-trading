@@ -20,6 +20,12 @@ module, schema, task, broker or runtime database is imported or reused.
 - Immutable offline quote evidence, explicitly referenced by contract v4;
   decisions pin both evidence availability and missing-evidence rejections.
   See [the evidence contract](docs/QUOTE_EVIDENCE.md).
+- Versioned, content-addressed research: a reviewed strategy artifact pins the
+  algorithm source digest, canonical parameters, the frozen research input digest
+  and the runtime contract. Two original offline strategies regenerate their
+  research signals from one frozen input; the kernel verifies the stored decisions
+  and the reviewed research output independently of deterministic replay.
+  See [the reproducibility ADR](docs/ADR-003-REPRODUCIBLE-RESEARCH.md).
 - Store records actual receipt separately from the fixture's declared times,
   fixes trust to `offline_fixture`, and leaves provider publication unknown.
   See [source trust and time facts](docs/SOURCE_TRUST.md).
@@ -64,7 +70,9 @@ v2/src/store/  — sole SQLite writer, read models and deterministic replay
       ^
       | explicit versioned HTTP POST only; never access the ledger directly
       |
-v2/research/worker.py — offline research proposal (Python stdlib)
+v2/research/worker.py — offline kernel fixture proposal (Python stdlib)
+v2/research/run_research.py — reviewed strategy + frozen input -> research output
+v2/research/research_contract.py — canonical JSON, SHA-256 and content identity
 ```
 
 There are no live-market, broker, autonomous activation, scheduler, or live
@@ -115,11 +123,13 @@ The read-only V2 UI never touches a V1 endpoint.
 - Experiments must be explicitly created with positive initial cash through
   POST /v2/experiments. There is no global cash setting or automatic experiment.
   The old ASTOCK_V2_INITIAL_CASH_CENTS environment variable explicitly fails startup.
-- SQLite schema 7 adds per-pack immutable context storage and evidence identity.
-  Schema 6 and earlier files are refused before writes; keep those files with the
-  original binary. There is no automatic migration. Subsequent reviewed pack
-  registrations add rows without changing trade tables.
-  See [ADR 002](docs/ADR-002-MARKET-DATA-PACKS.md).
+- SQLite schema 8 adds the immutable frozen-research-input table on top of the
+  schema 7 per-pack context and evidence identity. Schema 7 and earlier files are
+  refused before writes; keep those files with the original binary. There is no
+  automatic migration. Subsequent reviewed pack or research registrations add
+  rows without changing trade tables.
+  See [ADR 002](docs/ADR-002-MARKET-DATA-PACKS.md) and
+  [ADR 003](docs/ADR-003-REPRODUCIBLE-RESEARCH.md).
 - Idempotency identity is
   `(cycle_id, strategy_version_id, signal_id)`; same payload returns the
   original result, changed payload fails 409, without a second fill.
@@ -128,7 +138,8 @@ The read-only V2 UI never touches a V1 endpoint.
 - cycle_id is the unique independently funded experiment identity. Cash, positions,
   T+1, monotonic decision time, decision counts, historical views and replay are
   scoped to it. Identical evidence can be used by independent counterfactual experiments.
-- Creation pins a StrategyArtifact (strategy version + immutable research input ID),
+- Creation pins a reviewed StrategyArtifact (strategy version, algorithm source
+  digest, canonical parameters, frozen research input identity and digest),
   either cn-offline-fixture-pack-1 or cn-offline-fixture-pack-2, plus
   v2-paper-policy-6. Unknown rules/packs fail explicitly. The two pack manifests,
   sources, coverage and snapshot SHA256 summaries live in data/market-pack-*.json.
@@ -138,6 +149,10 @@ The read-only V2 UI never touches a V1 endpoint.
   input returns 409. GET /v2/experiments/{cycle_id} reads these references.
 - POST /v2/experiments/{cycle_id}/complete verifies the ledger then freezes new
   submissions. Exact retries remain idempotent; it cannot be reactivated.
+- GET /v2/experiments/{cycle_id}/research-reproduction proves the stored decisions
+  are exactly the reviewed research signals for the pinned artifact and frozen
+  input. It describes research identity only; fills, prices, fees and cash remain
+  replay's subject. Replay success does not imply research reproduction.
 - Portfolio, simulations GET and replay require ?cycle_id=...; no whole-store fallback.
 - Transactional writes are owned by Rust. The Python worker emits a proposal,
   not an order quantity, not a fill, not an activation decision.

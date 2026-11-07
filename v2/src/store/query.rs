@@ -165,5 +165,94 @@ impl Store {
             cash_cents: state.cash_cents,
         })
     }
+
+    /// Prove that this experiment's stored decisions are exactly the reviewed
+    /// research signals for its frozen strategy definition and frozen input.
+    ///
+    /// Replay answers "do the trading facts follow from the pinned inputs".
+    /// This answers "are the research signals the ones the fixed definition and
+    /// the fixed input must produce". Neither substitutes for the other.
+    pub fn verify_research_reproduction(&self, cycle_id: &str) -> StoreResult<ResearchReproductionReport> {
+        let experiment = load_experiment(&self.conn, cycle_id)?;
+        let artifact = experiment.spec.strategy.clone();
+        let output = reviewed_research_output(&artifact.strategy_version_id)?;
+        let manifest = reviewed_research_input(&artifact.research_input_id)?;
+        if output.research_input_id != manifest.research_input_id
+            || output.research_input_digest != manifest.content_digest {
+            return Err(StoreError::Integrity("reviewed_research_output_mismatch".into()));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id,request_json,evidence_json FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id"
+        )?;
+        let rows = statement.query_map([cycle_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut index = 0usize;
+        for row in rows {
+            let (id, request_json, evidence_json) = row?;
+            let frozen = output.signals.get(index).ok_or_else(|| StoreError::Integrity(
+                format!("research_output_has_no_signal_for_run_{id}")))?;
+            let request: SimulationRequest = serde_json::from_str(&request_json)?;
+            let evidence: Option<QuoteEvidence> = serde_json::from_str(&evidence_json)?;
+            if request.cycle_id != cycle_id
+                || request.strategy_version_id != artifact.strategy_version_id
+                || request.signal_id != frozen.signal_id
+                || request.decision_at != frozen.decision_at
+                || request.signal.symbol != frozen.symbol
+                || request.signal.side != frozen.side
+                || request.quote_ref.market_data_pack_id != frozen.market_data_pack_id
+                || request.quote_ref.source != frozen.source
+                || request.quote_ref.quote_id != frozen.quote_id
+            {
+                return Err(StoreError::Integrity(format!("research_signal_mismatch_at_run_{id}")));
+            }
+            let entry = manifest.entry_for(&request.quote_ref).ok_or_else(|| {
+                StoreError::Integrity(format!("research_input_missing_entry_for_run_{id}"))
+            })?;
+            if entry.decision_at != request.decision_at || entry.quote.symbol != request.signal.symbol {
+                return Err(StoreError::Integrity(
+                    format!("research_input_entry_mismatch_at_run_{id}")));
+            }
+            // Missing evidence stays missing: only a pinned snapshot is compared,
+            // and a substituted quote or liquidity level fails instead of being
+            // silently accepted because the identity still resolves.
+            if let Some(saved) = &evidence {
+                if saved.market_data_pack_id != manifest.market_data_pack_id
+                    || saved.quote != entry.quote
+                    || saved.available_at != entry.available_at
+                {
+                    return Err(StoreError::Integrity(
+                        format!("research_input_evidence_substitution_at_run_{id}")));
+                }
+                if let Some(level) = &saved.execution {
+                    let frozen_level = entry.level(&level.order_side);
+                    if level.price_cents != frozen_level.price_cents
+                        || level.available_quantity != frozen_level.available_quantity
+                        || level.observed_at != entry.quote.observed_at
+                        || level.quote_ref != request.quote_ref
+                    {
+                        return Err(StoreError::Integrity(
+                            format!("research_input_liquidity_substitution_at_run_{id}")));
+                    }
+                }
+            }
+            index += 1;
+        }
+        if index != output.signals.len() {
+            return Err(StoreError::Integrity(
+                format!("research_signal_missing_after_run_{index}")));
+        }
+        Ok(ResearchReproductionReport {
+            cycle_id: cycle_id.into(),
+            ok: true,
+            strategy_version_id: artifact.strategy_version_id,
+            research_input_id: artifact.research_input_id,
+            research_output_id: output.research_output_id,
+            research_output_digest: output.content_digest,
+            parameters_digest: artifact.parameters_digest,
+            source_digest: artifact.source_digest,
+            signals_verified: index,
+        })
+    }
 }
 
