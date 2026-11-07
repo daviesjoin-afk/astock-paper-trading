@@ -1,6 +1,19 @@
 use super::*;
 use crate::domain::{Side, Signal, Quote, ExecutionLiquidity, INITIAL_CASH_CENTS, DecisionStatus};
 
+#[test]
+fn independent_experiments_can_buy_the_same_signal_and_evidence() {
+    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let a = request("2026-10-30", "shared-signal", Side::Buy);
+    let mut b = a.clone();
+    b.cycle_id = "experiment-b".into();
+    db.ingest_quote(evidence(&a)).unwrap();
+    assert_eq!(db.submit(a).unwrap().outcome.status, DecisionStatus::Filled);
+    let second = db.submit(b).unwrap();
+    assert_eq!(second.outcome.status, DecisionStatus::Filled,
+        "B must use its own capital; actual rejection: {}", second.outcome.reason);
+}
+
 fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
         schema_version: 2, cycle_id: "cycle-1".into(),
