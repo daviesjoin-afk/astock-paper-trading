@@ -1,46 +1,218 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AStock V2 · 纯模拟交易</title>
-    <style>
-      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111725; color: #e9f0fa; }
-      body { margin: 0; }
-      main { max-width: 1080px; padding: 48px 24px; margin: auto; }
-      header { display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap; }
-      h1 { font-size: 30px; margin: 8px 0; }
-      p { color: #a4b2c8; }
-      .pill { background: #20324b; border-radius: 99px; padding: 9px 16px; font-size: 13px; }
-      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 26px 0; }
-      .card, section { background: #192338; border: 1px solid #2c3950; padding: 22px; border-radius: 12px; }
-      .card strong { display:block; font-size: 24px; margin-top: 12px; }
-      section { margin-top: 22px; overflow-x: auto; }
-      button { background: #527bd8; border: 0; padding: 11px 18px; border-radius: 8px; font-weight: 600; color: white; cursor: pointer; }
-      button:disabled { opacity: 0.5; }
-      table { width: 100%; border-collapse: collapse; min-width: 560px; }
-      th, td { padding: 12px; border-bottom: 1px solid #344155; text-align: left; }
-      .muted { color: #9bb0cc; } .error { color: #eaa4a4; }
-      #experiment, #status { overflow-wrap: anywhere; }
-    </style>
+    <meta name="color-scheme" content="light dark" />
+    <title>AStock V2 · 独立策略实验工作台</title>
   </head>
   <body>
-    <main>
-      <header>
-        <div><div class="muted">ASTOCK / NEW ENGINE</div><h1>独立 V2 模拟交易系统</h1></div>
-        <div class="pill">PAPER ONLY · LOCALHOST</div>
-      </header>
-      <p>Rust 为唯一交易事实写入者；Python 仅生成研究信号；本页面只读。没有券商下单入口。</p>
-      <p>当前实验：<strong id="experiment">—</strong></p>
-      <div class="cards">
-        <div class="card"><span class="muted">现金</span><strong id="cash">—</strong></div>
-        <div class="card"><span class="muted">持仓标的</span><strong id="positions-count">—</strong></div>
-        <div class="card"><span class="muted">模拟请求</span><strong id="run-count">—</strong></div>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="live-status"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <h1>AStock V2</h1>
+        <p>独立策略实验工作台 · <span class="tag">离线模拟</span> · <span class="tag">只读</span></p>
       </div>
-      <div><button id="refresh">刷新</button> <button id="replay">校验确定性回放</button><span id="status" class="muted" role="status"></span></div>
-      <section><h2>当前持仓</h2><table><thead><tr><th>代码</th><th>数量</th></tr></thead><tbody id="positions"></tbody></table></section>
-      <section><h2>最近模拟决策</h2><table><thead><tr><th>ID</th><th>信号</th><th>方向</th><th>状态</th><th>原因</th></tr></thead><tbody id="runs"></tbody></table></section>
-    </main>
+      <form class="controls" id="controls" aria-label="实验选择与刷新">
+        <label class="field">
+          <span class="field-label">当前实验</span>
+          <select id="cycle-select" data-testid="experiment-select" aria-describedby="cycle-hint"></select>
+        </label>
+        <span id="cycle-hint" class="hint" data-testid="cycle-hint"></span>
+        <button type="button" class="btn btn-ghost" id="refresh" data-testid="refresh">刷新</button>
+        <button type="button" class="btn btn-ghost" id="theme-toggle" data-testid="theme-toggle"
+                aria-pressed="false">深色模式</button>
+      </form>
+    </header>
+
+    <div class="shell">
+      <nav class="sidenav" aria-label="主导航">
+        <div class="nav-group">
+          <p class="nav-title">研究</p>
+          <button type="button" class="nav-item" data-view="overview" data-testid="nav-overview">概览</button>
+          <button type="button" class="nav-item" data-view="positions" data-testid="nav-positions">持仓</button>
+          <button type="button" class="nav-item" data-view="decisions" data-testid="nav-decisions">决策记录</button>
+        </div>
+        <div class="nav-group">
+          <p class="nav-title">质量校验</p>
+          <button type="button" class="nav-item" data-view="replay" data-testid="nav-replay">交易回放</button>
+          <button type="button" class="nav-item" data-view="reproduction" data-testid="nav-reproduction">研究重做</button>
+        </div>
+        <div class="nav-group">
+          <p class="nav-title">实验</p>
+          <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">实验信息</button>
+        </div>
+      </nav>
+
+      <main id="main" tabindex="-1">
+        <section class="notice" id="loading" data-testid="loading" hidden>
+          <h2>正在读取实验…</h2>
+          <p class="muted">从本地服务读取已登记事实；不读取实时行情。</p>
+        </section>
+
+        <section class="notice notice-error" id="service-error" data-testid="service-error" hidden>
+          <h2>服务不可用</h2>
+          <p>无法连接本地内核。请确认它正在运行：<code>cd v2 &amp;&amp; cargo run --locked</code>。</p>
+          <p class="muted" data-testid="service-detail"></p>
+          <p class="notice-actions"><button type="button" class="btn" id="retry" data-testid="retry">重试</button></p>
+        </section>
+
+        <section class="notice" id="empty-experiments" data-testid="empty-experiments" hidden>
+          <h2>还没有实验</h2>
+          <p>系统不会自动创建实验。先在本地离线演示里建立固定实验，再回到本页刷新：</p>
+          <pre><code>cd v2
+python3 scripts/experiment_demo.py</code></pre>
+        </section>
+
+        <section class="notice notice-warn" id="unknown-experiment" data-testid="unknown-experiment" hidden>
+          <h2>找不到这个实验</h2>
+          <p>地址里的 <code id="unknown-cycle"></code> 不在当前数据库中。</p>
+          <p class="muted">从上方“当前实验”选择已有实验；不会自动替换成其它实验。</p>
+        </section>
+
+        <div id="workspace" hidden>
+          <!-- 概览 -->
+          <section class="panel" id="panel-overview" data-testid="panel-overview" hidden>
+            <header class="panel-head">
+              <h2>概览</h2>
+              <p class="muted">当前实验的关键事实；不展示净值、收益率或排名。</p>
+            </header>
+            <div class="summary" aria-label="实验摘要">
+              <dl>
+                <div><dt>实验状态</dt><dd data-testid="summary-status">—</dd></div>
+                <div><dt>策略</dt><dd data-testid="summary-strategy">—</dd></div>
+                <div><dt>研究输入</dt><dd data-testid="summary-input">—</dd></div>
+                <div><dt>数据包</dt><dd data-testid="summary-pack">—</dd></div>
+                <div><dt>执行规则</dt><dd data-testid="summary-policy">—</dd></div>
+              </dl>
+            </div>
+            <div class="kpis">
+              <article class="kpi"><h2>初始资金</h2><p class="num" data-testid="kpi-initial-cash">—</p></article>
+              <article class="kpi"><h2>现金余额</h2><p class="num" data-testid="kpi-cash">—</p></article>
+              <article class="kpi"><h2>持仓标的</h2><p class="num" data-testid="kpi-positions">—</p></article>
+              <article class="kpi"><h2>模拟决策</h2><p class="num" data-testid="kpi-runs">—</p></article>
+            </div>
+            <div class="quick">
+              <button type="button" class="link" data-goto="positions">查看持仓 →</button>
+              <button type="button" class="link" data-goto="decisions">查看决策记录 →</button>
+              <button type="button" class="link" data-goto="replay">运行交易回放 →</button>
+            </div>
+          </section>
+
+          <!-- 持仓 -->
+          <section class="panel" id="panel-positions" data-testid="panel-positions" hidden>
+            <header class="panel-head">
+              <h2>当前持仓</h2>
+              <div class="asof">
+                <label class="field field-inline">
+                  <span class="field-label">日终口径</span>
+                  <input type="date" id="asof-day" data-testid="asof-day" aria-label="日终口径日期" />
+                </label>
+                <button type="button" class="btn btn-ghost" id="asof-apply" data-testid="asof-apply">应用</button>
+                <button type="button" class="btn btn-ghost" id="asof-clear" data-testid="asof-clear">清除</button>
+                <span class="hint" id="asof-error" data-testid="asof-error" hidden>请先选择日期再应用</span>
+              </div>
+            </header>
+            <div class="section-error" data-testid="positions-error" hidden></div>
+            <p class="scroll-hint">左右滑动查看完整列</p>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="当前持仓表格，可横向滚动">
+              <table>
+                <caption class="sr-only">当前持仓数量；只有指定日终口径时才显示可卖数量</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">代码</th>
+                    <th scope="col" class="num-col">持仓数量</th>
+                    <th scope="col" class="num-col" id="sellable-header" data-testid="sellable-header" hidden>可卖数量</th>
+                  </tr>
+                </thead>
+                <tbody id="positions-body" data-testid="positions-body"></tbody>
+              </table>
+            </div>
+            <p class="empty" data-testid="positions-empty-state" hidden>
+              没有持仓。当前实验的模拟决策尚未产生成交持仓。
+            </p>
+          </section>
+
+          <!-- 决策 -->
+          <section class="panel" id="panel-decisions" data-testid="panel-decisions" hidden>
+            <header class="panel-head">
+              <h2>决策记录</h2>
+              <p class="muted">最近 100 条；按写入顺序倒序。原因已转为业务说明。</p>
+            </header>
+            <div class="section-error" data-testid="runs-error" hidden></div>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="决策记录表格，可横向滚动">
+              <table>
+                <caption class="sr-only">最近的模拟决策：时间、信号、方向、结果与原因</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">时间</th>
+                    <th scope="col">信号</th>
+                    <th scope="col">方向</th>
+                    <th scope="col">结果</th>
+                    <th scope="col">原因</th>
+                  </tr>
+                </thead>
+                <tbody id="runs-body" data-testid="runs-body"></tbody>
+              </table>
+            </div>
+            <p class="empty" data-testid="runs-empty-state" hidden>
+              还没有决策。研究信号需要显式提交后才会成为决策。
+            </p>
+          </section>
+
+          <!-- 交易回放 -->
+          <section class="panel" id="panel-replay" data-testid="panel-replay" hidden>
+            <header class="panel-head">
+              <h2>交易回放</h2>
+              <p class="muted">用已固定的输入重新执行已存储的决策，逐字段比对请求、证据与成交。</p>
+            </header>
+            <div class="verify-body">
+              <p><button type="button" class="btn" data-testid="verify-replay">运行回放</button></p>
+              <p class="verify-status" data-testid="replay-status" data-state="idle">未验证</p>
+              <p class="verify-detail muted" data-testid="replay-detail"></p>
+            </div>
+          </section>
+
+          <!-- 研究重做 -->
+          <section class="panel" id="panel-reproduction" data-testid="panel-reproduction" hidden>
+            <header class="panel-head">
+              <h2>研究重做</h2>
+              <p class="muted">用固定策略与冻结研究输入重新生成研究信号；不判断收益。</p>
+            </header>
+            <div class="verify-body">
+              <p><button type="button" class="btn" data-testid="verify-reproduction">运行重做</button></p>
+              <p class="verify-status" data-testid="reproduction-status" data-state="idle">未验证</p>
+              <p class="verify-detail muted" data-testid="reproduction-detail"></p>
+            </div>
+          </section>
+
+          <!-- 实验信息 -->
+          <section class="panel" id="panel-experiment" data-testid="panel-experiment" hidden>
+            <header class="panel-head">
+              <h2>实验信息</h2>
+              <p class="muted">只有排障时才需要展开技术细节。</p>
+            </header>
+            <div class="verify-body">
+              <p>实验：<strong id="experiment-name" data-testid="experiment-name">—</strong></p>
+              <p>状态：<strong id="experiment-state" data-testid="experiment-state">—</strong></p>
+              <details class="tech">
+                <summary>技术细节</summary>
+                <dl class="tech-list">
+                  <div><dt>策略标识</dt><dd id="tech-strategy" data-testid="tech-strategy">—</dd></div>
+                  <div><dt>研究输入标识</dt><dd id="tech-input" data-testid="tech-input">—</dd></div>
+                  <div><dt>数据包标识</dt><dd id="tech-pack" data-testid="tech-pack">—</dd></div>
+                  <div><dt>执行规则标识</dt><dd id="tech-policy" data-testid="tech-policy">—</dd></div>
+                </dl>
+              </details>
+              <p class="muted">行情、成交价与容量均为离线合成输入；本页不展示净值、收益率、夏普或排行榜。</p>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -3,6 +3,57 @@ use super::*;
 use std::collections::BTreeMap;
 
 impl Store {
+    /// Read-only catalogue of registered experiments for the picker.
+    ///
+    /// Stable ordering by `cycle_id`, clamped limit, no writes and no derived
+    /// metrics: only facts the ledger already stores.
+    pub fn experiments(&self, limit: i64) -> StoreResult<ExperimentCatalogue> {
+        let total: i64 = self.conn.query_row("SELECT COUNT(*) FROM v2_experiments", [], |row| row.get(0))?;
+        let mut statement = self.conn.prepare(
+            "SELECT e.cycle_id, e.status, e.spec_json,
+                    (SELECT COUNT(*) FROM v2_simulation_runs r WHERE r.cycle_id = e.cycle_id)
+             FROM v2_experiments e ORDER BY e.cycle_id LIMIT ?"
+        )?;
+        let rows = statement.query_map([limit.clamp(1, 500)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut experiments = Vec::new();
+        let mut skipped = 0usize;
+        for row in rows {
+            let (cycle_id, status, raw_spec, runs_total) = row?;
+            let parsed = serde_json::from_str::<ExperimentSpec>(&raw_spec)
+                .ok()
+                .filter(|spec| spec.cycle_id == cycle_id)
+                .and_then(|spec| match status.as_str() {
+                    "active" => Some((spec, ExperimentStatus::Active)),
+                    "completed" => Some((spec, ExperimentStatus::Completed)),
+                    _ => None,
+                });
+            let Some((spec, status)) = parsed else {
+                // One unreadable row must not take the whole picker down.
+                eprintln!("v2 catalogue: skipping unreadable experiment row {cycle_id}");
+                skipped += 1;
+                continue;
+            };
+            experiments.push(ExperimentSummary {
+                cycle_id,
+                status,
+                strategy_version_id: spec.strategy.strategy_version_id,
+                research_input_id: spec.strategy.research_input_id,
+                market_data_pack_id: spec.market_data_pack_id,
+                execution_policy_version: spec.execution_policy_version,
+                initial_cash_cents: spec.initial_cash_cents,
+                runs_total,
+            });
+        }
+        Ok(ExperimentCatalogue { experiments, total, skipped })
+    }
+
     pub fn market_data_pack(&self, pack_id: &str) -> StoreResult<MarketDataPack> {
         load_market_pack(&self.conn, pack_id)
     }
