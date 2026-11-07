@@ -97,6 +97,7 @@ pub struct SimulationRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteRef {
+    pub market_data_pack_id: String,
     pub source: String,
     pub quote_id: String,
 }
@@ -105,6 +106,7 @@ pub struct QuoteRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteImport {
+    pub market_data_pack_id: String,
     pub schema_version: u32,
     pub available_at: String,
     pub quote: Quote,
@@ -163,6 +165,7 @@ pub struct InstrumentIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteEvidence {
+    pub market_data_pack_id: String,
     pub schema_version: u32,
     pub available_at: String,
     pub quote: Quote,
@@ -193,3 +196,27 @@ pub struct Lot {
     pub bought_on: String,
 }
 
+
+/// Immutable reviewed context manifest; hashes summarize fixed snapshot bytes,
+/// not evidence that may be appended later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketDataPackManifest {
+    pub pack_id: String,
+    pub version: String,
+    pub trust_level: QuoteTrust,
+    pub coverage_start: String,
+    pub coverage_end: String,
+    pub sources: Vec<String>,
+    pub description: String,
+    pub content_summary: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketDataPack {
+    pub manifest: MarketDataPackManifest,
+    pub calendar: super::TradingCalendar,
+    pub sessions: super::SessionPolicy,
+    pub instruments: super::InstrumentSnapshot,
+}

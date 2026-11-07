@@ -1,0 +1,18 @@
+{
+  "pack_id": "cn-offline-fixture-pack-2",
+  "version": "offline-context-2",
+  "trust_level": "offline_fixture",
+  "coverage_start": "2026-10-30",
+  "coverage_end": "2026-11-05",
+  "sources": [
+    "calendar-2026-v1.json:exchange-notices",
+    "instruments-offline-v2.json:source-locators-and-sha256",
+    "offline-fixture:synthetic-prices-and-capacity"
+  ],
+  "description": "Reviewed synthetic regression context; one supported main-board A-share and explicit unsupported samples. Evidence is appended immutably within this namespace.",
+  "content_summary": {
+    "calendar": "5a7467d083e232a4298922310d8461b4f59b120ce879f538dae3eeafbab8c0a1",
+    "sessions": "7b1f0d7960de538c45cc1a0286575379d794906321dc9e642688e78b23e77fb2",
+    "instruments": "7c9a0aae27a6f4f8b12bfc50cd86cc7724dcbe26518b067a1560928b1bdd1c64"
+  }
+}

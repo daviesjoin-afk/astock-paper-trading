@@ -69,17 +69,17 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         let day = days[day_index].to_string();
         let symbol = "600000.SH".to_string();
         let req = SimulationRequest {
-            schema_version: 3, cycle_id: "ledger-bench-v3".into(),
+            schema_version: 4, cycle_id: "ledger-bench-v3".into(),
             strategy_version_id: "offline-fixed-v1".into(), signal_id: format!("signal-{i}"),
             decision_at: format!("{day}T10:00:00+08:00"),
             signal: Signal { symbol: symbol.clone(),
                 side: if fills && day_index % 2 == 1 { Side::Sell } else { Side::Buy } },
-            quote_ref: QuoteRef { source: "offline-fixture".into(), quote_id: format!("quote-{i}") },
+            quote_ref: QuoteRef { market_data_pack_id: MARKET_DATA_PACK_ID.into(), source: "offline-fixture".into(), quote_id: format!("quote-{i}") },
         };
-        let input = QuoteImport {
-            schema_version: 1, available_at: format!("{day}T10:00:00+08:00"),
+        let input = QuoteImport { market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+            schema_version: 2, available_at: format!("{day}T10:00:00+08:00"),
             execution: Some(ExecutionLiquidity {
-                schema_version: 1, quote_ref: req.quote_ref.clone(),
+                schema_version: 2, quote_ref: req.quote_ref.clone(),
                 order_side: req.signal.side.clone(), price_cents: 100,
                 available_quantity: 1_000_000,
                 observed_at: format!("{day}T09:59:59+08:00"),

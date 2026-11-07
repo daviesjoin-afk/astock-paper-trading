@@ -3,6 +3,10 @@ use super::*;
 use std::collections::BTreeMap;
 
 impl Store {
+    pub fn market_data_pack(&self, pack_id: &str) -> StoreResult<MarketDataPack> {
+        load_market_pack(&self.conn, pack_id)
+    }
+
     pub fn experiment(&self, cycle_id: &str) -> StoreResult<Experiment> {
         load_experiment(&self.conn, cycle_id)
     }
@@ -90,7 +94,7 @@ impl Store {
     /// Re-run every stored decision from pinned inputs, comparing persisted facts.
     pub fn verify_replay(&self, cycle_id: &str) -> StoreResult<ReplayReport> {
         let experiment = load_experiment(&self.conn, cycle_id)?;
-        let (calendar, sessions, instruments) = load_market_context(&self.conn)?;
+        let (calendar, sessions, instruments) = load_market_context(&self.conn, &experiment.spec.market_data_pack_id)?;
         let mut state = PortfolioState::new(experiment.spec.initial_cash_cents);
         let mut runs = self.conn.prepare(
             "SELECT id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id"
@@ -106,7 +110,7 @@ impl Store {
             let (id, req_json, result_json, evidence_json, calendar_version, session_policy_version, instrument_version) = row?;
             verify_market_versions(&calendar, &sessions, &instruments, &calendar_version, &session_policy_version, &instrument_version, id)?;
             let req: SimulationRequest = serde_json::from_str(&req_json)?;
-            if req.cycle_id != cycle_id || req.strategy_version_id != experiment.spec.strategy.strategy_version_id {
+            if req.quote_ref.market_data_pack_id != experiment.spec.market_data_pack_id || req.cycle_id != cycle_id || req.strategy_version_id != experiment.spec.strategy.strategy_version_id {
                 return Err(StoreError::Integrity("replay_experiment_ownership_mismatch".into()));
             }
             let at = chrono::DateTime::parse_from_rfc3339(&req.decision_at)

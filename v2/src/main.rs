@@ -77,6 +77,10 @@ async fn replay(State(state): State<Shared>, Query(query): Query<PortfolioQuery>
     response(db.verify_replay(&query.cycle_id).map_err(api_error)?)
 }
 
+async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
+}
+
 async fn create_experiment(State(state): State<Shared>, Json(spec): Json<ExperimentSpec>) -> ApiResult {
     response(state.lock().await.create_experiment(spec).map_err(api_error)?)
 }
@@ -89,7 +93,7 @@ async fn complete_experiment(State(state): State<Shared>, Path(id): Path<String>
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-experiments.sqlite3".into());
+    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-market-packs.sqlite3".into());
     if env::var_os("ASTOCK_V2_INITIAL_CASH_CENTS").is_some() {
         return Err("global initial cash is unsupported; create an experiment explicitly".into());
     }
@@ -98,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/v2/health", get(health))
         .route("/v2/experiments", post(create_experiment))
+        .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/experiments/{cycle_id}", get(experiment))
         .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))
         .route("/v2/quotes", post(ingest_quote))

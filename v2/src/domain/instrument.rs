@@ -53,7 +53,7 @@ fn date(value: &str) -> Result<NaiveDate, RuleError> {
 
 impl InstrumentSnapshot {
     pub fn validate(&self) -> Result<(), RuleError> {
-        if self.schema_version != 1 || self.version != INSTRUMENT_VERSION {
+        if self.schema_version != 1 || !matches!(self.version.as_str(), INSTRUMENT_VERSION | "cn-instruments-offline-v2") {
             return Err(RuleError("unsupported_instrument_snapshot".into()));
         }
         let start = date(&self.coverage_start)?;

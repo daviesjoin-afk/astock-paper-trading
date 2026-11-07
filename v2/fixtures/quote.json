@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "available_at": "2026-10-30T09:59:31+08:00",
   "quote": {
     "symbol": "600000.SH",
@@ -12,14 +12,16 @@
     "limit_down": false
   },
   "execution": {
-    "schema_version": 1,
+    "schema_version": 2,
     "quote_ref": {
       "source": "offline-fixture",
-      "quote_id": "fixture-quote-20261030-1000"
+      "quote_id": "fixture-quote-20261030-1000",
+      "market_data_pack_id": "cn-offline-fixture-pack-1"
     },
     "order_side": "buy",
     "price_cents": 1250,
     "available_quantity": 700,
     "observed_at": "2026-10-30T09:59:30+08:00"
-  }
+  },
+  "market_data_pack_id": "cn-offline-fixture-pack-1"
 }
