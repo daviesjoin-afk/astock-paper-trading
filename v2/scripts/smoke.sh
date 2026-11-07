@@ -62,9 +62,10 @@ def call(path, payload=None, expected=200):
         return error.read()
 
 proposal = build_fixture_proposal()
+reviewed_strategy = json.loads(Path("data/strategy-momentum-v1.json").read_text(encoding="utf-8"))
 call("experiments", {
     "schema_version": 1, "cycle_id": proposal["cycle_id"], "initial_cash_cents": 10_000_000,
-    "strategy": {"strategy_version_id": proposal["strategy_version_id"], "research_input_id": "offline-fixture-input-v1"},
+    "strategy": reviewed_strategy,
     "market_data_pack_id": "cn-offline-fixture-pack-1", "execution_policy_version": "v2-paper-policy-6",
 })
 quote = json.loads(Path("fixtures/quote.json").read_text())
@@ -331,7 +332,7 @@ for _ in range(2):
 assert call("portfolio")["runs_total"] == prefix_runs + len(cases)
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
@@ -350,6 +351,7 @@ print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed
 PY
 python3 scripts/experiment_demo.py
 python3 scripts/market_pack_demo.py
+python3 scripts/research_reproduction_demo.py
 # Reopen the exact SQLite file in a new Rust process, then verify both frozen ledgers.
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
@@ -358,4 +360,5 @@ server_pid=$!
 wait_ready
 python3 scripts/experiment_demo.py --verify-only
 python3 scripts/market_pack_demo.py --verify-only
-echo "V2 HTTP/Python/Rust/SQLite end-to-end smoke passed"
+python3 scripts/research_reproduction_demo.py --verify-only
+echo "V2 HTTP/Python/Rust/SQLite research-reproduction smoke passed"

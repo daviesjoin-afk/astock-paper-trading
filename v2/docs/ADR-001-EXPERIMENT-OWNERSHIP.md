@@ -41,3 +41,7 @@ V2 是独立实验系统，不是 V1 移植。现有 cycle_id 只用于去重，
 cn-offline-fixture-pack-1：信任等级 offline_fixture。交易日历来自 data/calendar-2026-v1.json 的两所公告及原文 URL，覆盖 2026 年；身份/数量规则来源、原文位置及文件 SHA256 在 data/instruments-offline-v1.json，适用覆盖为 2026-10-27 至 2026-11-05。时段规则为 data/session-policy-v1.json。内容摘要：一个支持的普通主板 A 股样本 600000.SH，STAR/ETF 为明确拒绝样本，不代表全市场证券库。
 
 fixtures/quote.json 和测试生成的价格/容量都是人工合成回归输入。证据命名空间为 offline-fixture + quote_id，Store 记录来源、声明时点、首次接收时点和不可覆盖内容；每个实验的实际数据集由其决策固定的证据引用及完整快照组成。研究输入 ID 是不可变身份声明，不是研究代码内容的签名或有效性认证；更换研究输入必须使用新的策略版本。
+
+## 后续修订（ADR 003）
+
+本文中"研究输入 ID 是不可变身份声明，不是研究代码内容的签名"已被 [ADR 003](ADR-003-REPRODUCIBLE-RESEARCH.md) 取代：策略工件现在固定算法源码摘要、规范化参数摘要、冻结研究输入摘要与运行环境，实验的存储决策可按冻结研究输出重做核验。`StrategyArtifact` 升为 schema 2，旧两字段工件被拒绝。

@@ -12,7 +12,11 @@
 | `src/store/mod.rs` | 单 SQLite 写入口、实验初始资金及固定引用、schema、原子提交、幂等 | domain、rusqlite | HTTP、Python、V1 schema |
 | `src/store/query.rs` | 只读投影、历史回放 | store、domain | SQL 写入、提交 |
 | `src/main.rs` | localhost HTTP 路由、请求响应转换 | store、domain、axum | 交易规则复制、直接 SQL |
-| `research/worker.py` | 产出可复现的研究信号 | Python 标准库和 API 契约 | 下单数量、账本直写、旧框架 import |
+| `src/domain/digest.rs` | SHA-256 与规范化 JSON 文本，供内容身份核验 | 标准库、serde_json | IO、时钟、SQLite、HTTP、V1 |
+| `research/research_contract.py` | 研究工件/冻结输入/研究输出的规范化与摘要 | Python 标准库 | 账本访问、下单数量、时钟、随机、执行外部代码 |
+| `research/strategies/*.py` | 已审核的离线研究算法与参数 | 标准库 | 账本、数量/价格/资金、网络、时钟、随机 |
+| `research/run_research.py` | 由已审核源码与冻结输入重算研究输出 | research_contract、strategies | 账本、任意策略加载器 |
+| `research/worker.py` | 产出内核回归用的离线 fixture 请求（不是研究信号） | Python 标准库和 API 契约 | 下单数量、账本直写、旧框架 import |
 | `web/src/main.ts` | 只读交互和可视化 | V2 HTTP API | 业务撮合、仓位写入、V1 接口 |
 
 依赖方向固定：**HTTP → Store → Domain**。研究通过版本化 JSON 调用 HTTP，浏览器读取投影。Domain 没有任何运行时副作用；只有 Store 具有账本写权限。
@@ -32,6 +36,10 @@
 11. 参考价不能直接成交。execution 只使用同报价身份、同方向且新鲜的执行证据价格；候选量超过显式容量就整笔拒绝。Store固定执行块且不可覆盖，不新增容量余额权威。详见 [EXECUTION_EVIDENCE.md](EXECUTION_EVIDENCE.md)。
 12. 六位代码只代表格式，不能推导板块/类型。instrument独占固定身份及数量规则适用事实，消费者为execution；Store固定完整离线快照、每份证据的解析身份及run版本，query仅只读核对。未知/冲突/未实现类型与规则、覆盖外日期拒绝。研究和普通导入不能自报资格或覆盖快照。详见 [INSTRUMENT_ELIGIBILITY.md](INSTRUMENT_ELIGIBILITY.md)。
 
+13. 策略身份必须携带内容。`StrategyArtifact` 固定算法源码摘要、规范化参数摘要、冻结研究输入身份与摘要、算法版本和运行环境；同一 `strategy_version_id` 与不同内容冲突。Rust 从仓库字节重算摘要，不信任调用者自报；未审核 id 拒绝。详见 [ADR 003](ADR-003-REPRODUCIBLE-RESEARCH.md)。
+14. 研究输入必须冻结。有序条目（顺序、决策时点、声明可见时点、双边离线流动性）进内容摘要并整体登记；同 id 异内容冲突，被篡改的文件在写入前整库拒绝。系统实际接收时间只由 Store 记录，永不进入研究身份。
+15. 回放与研究重做是两种证明。`verify_replay` 重算已存储决策；`verify_research_reproduction` 证明已存储决策正是固定策略与固定输入必须产出的研究信号（多一条、少一条、换一条都失败），并核对决策固定的证据未被替换。任一方通过都不代表另一方通过。
+
 **不做的事情**：不设计通用事件总线、不做微服务、不接 Kafka/Redis/ORM、不增加“为了模块化而存在”的 facade 或重复数据模型、不使用硬编码 LOC/函数行数阈值作为合并门禁。
 
 ## 进一步拆分的门槛
@@ -41,6 +49,13 @@
 ## 独立实验（ADR 001）
 
 cycle_id 是唯一资金归属，不是调度周期。创建后固定初始资金、策略研究身份、数据包和执行规则，完成后拒绝新决策。写入、时间顺序、状态重建、历史查询、计数与回放全部按实验隔离。SQLite schema 6、信号契约 3；规则版本保持 6。当前只开放 cn-offline-fixture-pack-1，多个受审核数据包的登记扩展边界见 [ADR 001](ADR-001-EXPERIMENT-OWNERSHIP.md)。
+
+## 可复现研究（ADR 003）
+
+已审核策略工件 = 数据文件 + 精确源码字节；`data/strategy-*.json`、`data/research-input-*.json`、
+`data/research-output-*.json` 三者由 Python 标准库生成，CI 重算后与仓库字节比对，Rust 只读比对
+与重算摘要。新增策略或研究输入是新增审核记录，不提供上传、动态加载或策略注册中心。
+详见 [ADR 003](ADR-003-REPRODUCIBLE-RESEARCH.md)。
 
 ## 独立数据包（ADR 002）
 

@@ -600,3 +600,83 @@ fn explicitly_unknown_classifications_never_inherit_supported_parameters() {
         assert!(serde_json::from_value::<QuoteEvidence>(raw).is_err());
     }
 }
+
+// --- SHA-256 and canonical JSON (published FIPS 180-4 test vectors) -------
+
+#[test]
+fn sha256_matches_published_vectors() {
+    for (input, expected) in [
+        ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        ("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"),
+    ] {
+        assert_eq!(sha256_hex(input.as_bytes()), expected, "{input:?}");
+    }
+    // Every padding boundary: 55, 56, 63, 64, 65 bytes.
+    for size in [55usize, 56, 63, 64, 65, 119, 120] {
+        let first = sha256_hex(&vec![b'a'; size]);
+        assert_eq!(first.len(), 64);
+        assert_eq!(first, sha256_hex(&vec![b'a'; size]), "digest is deterministic at {size}");
+        assert_ne!(first, sha256_hex(&vec![b'b'; size]));
+    }
+}
+
+#[test]
+fn canonical_json_text_is_key_sorted_and_idempotent() {
+    let value = serde_json::json!({"b": [1, 2, {"z": 1, "a": 2}], "a": "x"});
+    assert_eq!(canonical_json_text(&value), r#"{"a":"x","b":[1,2,{"a":2,"z":1}]}"#);
+    assert!(is_canonical_json_text(&canonical_json_text(&value)));
+    assert!(!is_canonical_json_text(r#"{"b":1,"a":2}"#));
+    assert!(!is_canonical_json_text(r#"{"a": 2}"#));
+    assert_eq!(normalize_newlines("a\r\nb\rc"), "a\nb\nc");
+}
+
+#[test]
+fn strategy_artifact_rejects_identity_without_content() {
+    let reviewed: StrategyArtifact =
+        serde_json::from_str(include_str!("../../data/strategy-momentum-v1.json")).unwrap();
+    reviewed.verify_content().unwrap();
+    // Legacy two-field identity cannot express content and must not parse.
+    assert!(serde_json::from_str::<StrategyArtifact>(
+        r#"{"strategy_version_id":"research-momentum-v1","research_input_id":"offline-research-input-v1"}"#
+    ).is_err());
+    for (field, value) in [
+        ("schema_version", serde_json::json!(1)),
+        ("algorithm_version", serde_json::json!("research-signal-v9")),
+        ("runtime_version", serde_json::json!("cpython-3.11")),
+        ("parameters_canonical", serde_json::json!("{\"lookback\": 2}")),
+        ("parameters_digest", serde_json::json!("00")),
+    ] {
+        let mut raw = serde_json::to_value(&reviewed).unwrap();
+        raw[field] = value;
+        let changed: StrategyArtifact = serde_json::from_value(raw).unwrap();
+        assert!(changed.verify_content().is_err(), "{field}");
+    }
+}
+
+#[test]
+fn research_input_and_output_identity_are_self_verifying() {
+    let manifest: ResearchInputManifest =
+        serde_json::from_str(include_str!("../../data/research-input-offline-v1.json")).unwrap();
+    manifest.validate().unwrap();
+    let output: ResearchOutput =
+        serde_json::from_str(include_str!("../../data/research-output-momentum-v1.json")).unwrap();
+    output.validate().unwrap();
+    // Appending an entry, reordering entries and changing body text are all
+    // content changes, never an id-preserving edit.
+    let mut appended = manifest.clone();
+    let mut clone = manifest.entries[0].clone();
+    clone.sequence = 9;
+    appended.entries.push(clone);
+    assert_ne!(appended.computed_digest(), manifest.content_digest);
+    let mut reordered = manifest.clone();
+    reordered.entries.swap(0, 3);
+    assert_ne!(reordered.computed_digest(), manifest.content_digest);
+    let mut repriced = manifest.clone();
+    repriced.entries[2].quote.price_cents += 1;
+    assert_ne!(repriced.computed_digest(), manifest.content_digest);
+    for broken in [appended, reordered, repriced] {
+        assert!(broken.validate().is_err());
+    }
+}

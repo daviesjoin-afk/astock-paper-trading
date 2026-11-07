@@ -1,0 +1,33 @@
+{
+  "algorithm_digest": "0575ebd0bffb093c7598b2227759d24a509bd53b96c76f84ea601233184849c4",
+  "algorithm_version": "research-signal-v1",
+  "content_digest": "de2e06b066157886c92bec7cb48725a0326af17b2df447212204697fa5acc92e",
+  "parameters_digest": "9cf61d6ba01c3eee4e07a560e652c86134cac29f42502d26c0bfd97907c0364a",
+  "research_input_digest": "beca60bbe45de282cf1c3a7f3a3b20f981fab56ad6104e701d376222da145fdf",
+  "research_input_id": "offline-research-input-v1",
+  "research_output_id": "research-output-research-momentum-v1",
+  "schema_version": 1,
+  "signals": [
+    {
+      "decision_at": "2026-10-30T14:00:00+08:00",
+      "market_data_pack_id": "cn-offline-fixture-pack-1",
+      "quote_id": "offline-quote-20261030-1359",
+      "sequence": 3,
+      "side": "buy",
+      "signal_id": "research-momentum-v1-0003-buy",
+      "source": "offline-fixture",
+      "symbol": "600000.SH"
+    },
+    {
+      "decision_at": "2026-11-02T10:00:00+08:00",
+      "market_data_pack_id": "cn-offline-fixture-pack-1",
+      "quote_id": "offline-quote-20261102-0959",
+      "sequence": 4,
+      "side": "sell",
+      "signal_id": "research-momentum-v1-0004-sell",
+      "source": "offline-fixture",
+      "symbol": "600000.SH"
+    }
+  ],
+  "strategy_version_id": "research-momentum-v1"
+}

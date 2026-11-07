@@ -1,0 +1,124 @@
+{
+  "content_digest": "beca60bbe45de282cf1c3a7f3a3b20f981fab56ad6104e701d376222da145fdf",
+  "description": "Frozen synthetic research input for 600000.SH: five ordered offline observations with declared availability, both directional levels and each entry's research decision time. Not market data and not a provider claim.",
+  "entries": [
+    {
+      "available_at": "2026-10-30T09:59:31+08:00",
+      "buy": {
+        "available_quantity": 800,
+        "price_cents": 1210
+      },
+      "decision_at": "2026-10-30T10:00:00+08:00",
+      "quote": {
+        "limit_down": false,
+        "limit_up": false,
+        "observed_at": "2026-10-30T09:59:30+08:00",
+        "price_cents": 1200,
+        "quote_id": "offline-quote-20261030-0959",
+        "source": "offline-fixture",
+        "symbol": "600000.SH",
+        "tradable": true
+      },
+      "sell": {
+        "available_quantity": 800,
+        "price_cents": 1190
+      },
+      "sequence": 1
+    },
+    {
+      "available_at": "2026-10-30T10:29:31+08:00",
+      "buy": {
+        "available_quantity": 800,
+        "price_cents": 1245
+      },
+      "decision_at": "2026-10-30T10:30:00+08:00",
+      "quote": {
+        "limit_down": false,
+        "limit_up": false,
+        "observed_at": "2026-10-30T10:29:30+08:00",
+        "price_cents": 1240,
+        "quote_id": "offline-quote-20261030-1029",
+        "source": "offline-fixture",
+        "symbol": "600000.SH",
+        "tradable": true
+      },
+      "sell": {
+        "available_quantity": 800,
+        "price_cents": 1235
+      },
+      "sequence": 2
+    },
+    {
+      "available_at": "2026-10-30T13:59:31+08:00",
+      "buy": {
+        "available_quantity": 800,
+        "price_cents": 1295
+      },
+      "decision_at": "2026-10-30T14:00:00+08:00",
+      "quote": {
+        "limit_down": false,
+        "limit_up": false,
+        "observed_at": "2026-10-30T13:59:30+08:00",
+        "price_cents": 1290,
+        "quote_id": "offline-quote-20261030-1359",
+        "source": "offline-fixture",
+        "symbol": "600000.SH",
+        "tradable": true
+      },
+      "sell": {
+        "available_quantity": 800,
+        "price_cents": 1285
+      },
+      "sequence": 3
+    },
+    {
+      "available_at": "2026-11-02T09:59:31+08:00",
+      "buy": {
+        "available_quantity": 800,
+        "price_cents": 1255
+      },
+      "decision_at": "2026-11-02T10:00:00+08:00",
+      "quote": {
+        "limit_down": false,
+        "limit_up": false,
+        "observed_at": "2026-11-02T09:59:30+08:00",
+        "price_cents": 1250,
+        "quote_id": "offline-quote-20261102-0959",
+        "source": "offline-fixture",
+        "symbol": "600000.SH",
+        "tradable": true
+      },
+      "sell": {
+        "available_quantity": 800,
+        "price_cents": 1245
+      },
+      "sequence": 4
+    },
+    {
+      "available_at": "2026-11-02T13:59:31+08:00",
+      "buy": {
+        "available_quantity": 800,
+        "price_cents": 1255
+      },
+      "decision_at": "2026-11-02T14:00:00+08:00",
+      "quote": {
+        "limit_down": false,
+        "limit_up": false,
+        "observed_at": "2026-11-02T13:59:30+08:00",
+        "price_cents": 1250,
+        "quote_id": "offline-quote-20261102-1359",
+        "source": "offline-fixture",
+        "symbol": "600000.SH",
+        "tradable": true
+      },
+      "sell": {
+        "available_quantity": 800,
+        "price_cents": 1245
+      },
+      "sequence": 5
+    }
+  ],
+  "market_data_pack_id": "cn-offline-fixture-pack-1",
+  "research_input_id": "offline-research-input-v1",
+  "schema_version": 1
+}
