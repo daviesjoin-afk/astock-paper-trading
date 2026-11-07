@@ -1,21 +1,44 @@
-.git
-data_cache/
-reports/
-backups/
-cp/
-logs/
+# --- V2 only: one Rust service, one SQLite writer, Python research, read-only web ---
+# Rust build output
+v2/target/
+# Node build output and dependencies (v2/web/dist is generated)
+v2/web/node_modules/
+v2/web/dist/
+
+# Local runtime state: never commit databases, logs or backups
 *.sqlite
 *.sqlite3
 *.db
 *.db-*
-.swapfile
-.locks/
-# 每次部署由 deploy/deploy.sh 重写的环境身份；属于主机状态，不入库。
+*.log
+logs/
+data_cache/
+reports/
+backups/
+work/
+tasks/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.bak
+*.backup
+*.tgz
+secrets/
+credentials.json
+.netrc
 .deploy-source.json
+
+# Agent / session scratch (not deliverables)
 .codex/
 .codex-test-tmp/
 .staging/
 .staging-*/
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -25,58 +48,9 @@ venv/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
-*.log
-server.log
+
+# Editor / OS
+.DS_Store
+Thumbs.db
 *.tmp
-*.bak
-*.before-*
-*.before_*
-*.bak-*
-*.bak_*
-*.tmp.*
 *.old
-.env
-.env.*
-!.env.example
-*.tgz
-
-# Node build artifacts
-frontend/node_modules/
-
-# PR-56：Playwright E2E 产物（截图 / trace / video / 报告）不入库
-frontend/e2e/.artifacts/
-frontend/playwright-report/
-frontend/test-results/
-
-# --- security: never commit local/runtime material -------------------------
-.env
-.env.*
-!.env.example
-!.env.sample
-!.env.template
-*.pem
-*.key
-*.p12
-*.pfx
-*.sqlite
-*.sqlite3
-*.db
-*.db-*
-*.dump
-*.bak
-*.backup
-*.log
-logs/
-secrets/
-credentials.json
-.netrc
-security-cleanup/
-replacements.txt
-mailmap.txt
-
-# r9~r36 轮次审计的一次性脚本与日志：仅本地留存，不入库（Dockerfile 不 COPY，backend 禁止 import）。
-work/
-.start_three_strategy_cycle
-.docker/
-# agent/会话过程产物：子 agent 的 progress 笔记，不是项目交付物（与 .codex-test-tmp/、work/ 同类）
-tasks/
