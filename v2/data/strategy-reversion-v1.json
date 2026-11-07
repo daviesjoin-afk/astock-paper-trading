@@ -1,0 +1,12 @@
+{
+  "algorithm_version": "research-signal-v1",
+  "parameters_canonical": "{\"lookback\":2,\"threshold_bps\":40}",
+  "parameters_digest": "afd38458954950fe449ffefac668ffde7fd27284d4dfca303e6ecba8f9272bfe",
+  "random_seed": null,
+  "research_input_digest": "beca60bbe45de282cf1c3a7f3a3b20f981fab56ad6104e701d376222da145fdf",
+  "research_input_id": "offline-research-input-v1",
+  "runtime_version": "python-3.13-stdlib",
+  "schema_version": 2,
+  "source_digest": "aed1a0cae609952e6004153597ff8d3af46747a9ef76b54434aa5832d2f76e25",
+  "strategy_version_id": "research-reversion-v1"
+}

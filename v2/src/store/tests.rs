@@ -1650,3 +1650,30 @@ fn test_open(path: &str, cash: i64) -> StoreResult<Store> {
     db.create_experiment(spec("cycle-1", cash))?;
     Ok(db)
 }
+
+// Red tests for ADR 003. They are written against the *desired* behaviour and
+// fail on the pre-fix kernel: identity-only artifacts cannot carry content, and
+// an unreviewed strategy id is accepted.
+#[test]
+fn reviewed_strategy_artifact_with_content_identity_is_accepted() {
+    let raw = include_str!("../../data/strategy-momentum-v1.json");
+    let artifact: StrategyArtifact = serde_json::from_str(raw)
+        .expect("a reviewed strategy artifact must parse into StrategyArtifact");
+    let mut db = Store::in_memory().unwrap();
+    let created = db.create_experiment(ExperimentSpec {
+        schema_version: 1, cycle_id: "reviewed-strategy".into(),
+        initial_cash_cents: INITIAL_CASH_CENTS, strategy: artifact,
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+        execution_policy_version: POLICY_VERSION.into(),
+    });
+    assert!(created.is_ok(), "the reviewed artifact must be accepted: {created:?}");
+}
+
+#[test]
+fn an_unreviewed_strategy_identity_cannot_open_an_experiment() {
+    let mut db = Store::in_memory().unwrap();
+    let mut candidate = spec("invented-strategy", INITIAL_CASH_CENTS);
+    candidate.strategy.strategy_version_id = "research-invented-v1".into();
+    assert!(db.create_experiment(candidate).is_err(),
+        "an unreviewed strategy identity must not register");
+}

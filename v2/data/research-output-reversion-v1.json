@@ -1,0 +1,33 @@
+{
+  "algorithm_digest": "aed1a0cae609952e6004153597ff8d3af46747a9ef76b54434aa5832d2f76e25",
+  "algorithm_version": "research-signal-v1",
+  "content_digest": "9fd0f857019280e7ec05c8852bb7eac11bcc5bb7b3d66b270847cc58c7c0375d",
+  "parameters_digest": "afd38458954950fe449ffefac668ffde7fd27284d4dfca303e6ecba8f9272bfe",
+  "research_input_digest": "beca60bbe45de282cf1c3a7f3a3b20f981fab56ad6104e701d376222da145fdf",
+  "research_input_id": "offline-research-input-v1",
+  "research_output_id": "research-output-research-reversion-v1",
+  "schema_version": 1,
+  "signals": [
+    {
+      "decision_at": "2026-10-30T14:00:00+08:00",
+      "market_data_pack_id": "cn-offline-fixture-pack-1",
+      "quote_id": "offline-quote-20261030-1359",
+      "sequence": 3,
+      "side": "sell",
+      "signal_id": "research-reversion-v1-0003-sell",
+      "source": "offline-fixture",
+      "symbol": "600000.SH"
+    },
+    {
+      "decision_at": "2026-11-02T10:00:00+08:00",
+      "market_data_pack_id": "cn-offline-fixture-pack-1",
+      "quote_id": "offline-quote-20261102-0959",
+      "sequence": 4,
+      "side": "buy",
+      "signal_id": "research-reversion-v1-0004-buy",
+      "source": "offline-fixture",
+      "symbol": "600000.SH"
+    }
+  ],
+  "strategy_version_id": "research-reversion-v1"
+}
