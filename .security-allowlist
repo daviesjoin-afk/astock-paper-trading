@@ -209,3 +209,15 @@ value:837b8fcde50b61174a370da272fc41283068115c
 value:d14319b41409226c61f0c849cc7b6b5d0fcff488
 value:e957a05f7ce77316da212f6a21d55f408e5375a2
 value:78032d84a394b8be872bb71f62f5464d257a9157
+
+# V2 reviewed market-pack snapshot SHA256 values: public file-content digests,
+# recomputed by research/test_market_packs.py, never credentials.
+# Exact values only; no path exemption or scanner change. Keep historical manifests auditable.
+# v2/data/calendar-2026-v1.json
+value:5a7467d083e232a4298922310d8461b4f59b120ce879f538dae3eeafbab8c0a1
+# v2/data/session-policy-v1.json
+value:7b1f0d7960de538c45cc1a0286575379d794906321dc9e642688e78b23e77fb2
+# v2/data/instruments-offline-v1.json
+value:c7e53bf71664d933d19439186aeae5df9330cc5287365272659023e4a66464bd
+# v2/data/instruments-offline-v2.json
+value:7c9a0aae27a6f4f8b12bfc50cd86cc7724dcbe26518b067a1560928b1bdd1c64
