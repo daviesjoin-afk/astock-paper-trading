@@ -45,6 +45,8 @@ sys.path.insert(0, str(Path("research").resolve()))
 from worker import build_fixture_proposal
 
 def call(path, payload=None, expected=200):
+    if payload is None and path.split("?")[0] in ("portfolio", "simulations", "replay"):
+        path += ("&" if "?" in path else "?") + "cycle_id=offline-fixture-cycle"
     body = None if payload is None else json.dumps(payload).encode()
     request = urllib.request.Request("http://127.0.0.1:8765/v2/" + path, body,
                                      {"Content-Type": "application/json"})
@@ -57,6 +59,11 @@ def call(path, payload=None, expected=200):
         return error.read()
 
 proposal = build_fixture_proposal()
+call("experiments", {
+    "schema_version": 1, "cycle_id": proposal["cycle_id"], "initial_cash_cents": 10_000_000,
+    "strategy": {"strategy_version_id": proposal["strategy_version_id"], "research_input_id": "offline-fixture-input-v1"},
+    "market_data_pack_id": "cn-offline-fixture-pack-1", "execution_policy_version": "v2-paper-policy-6",
+})
 quote = json.loads(Path("fixtures/quote.json").read_text())
 
 calendar_version = "sse-szse-scheduled-2026-v1"
@@ -321,7 +328,7 @@ for _ in range(2):
 assert call("portfolio")["runs_total"] == prefix_runs + len(cases)
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
     snapshot = json.loads(connection.execute("SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
@@ -338,4 +345,5 @@ print("HTTP calendar/session/auction/unknown-date/retry/replay passed")
 print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed")
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
+python3 scripts/experiment_demo.py
 echo "V2 HTTP/Python/Rust/SQLite end-to-end smoke passed"

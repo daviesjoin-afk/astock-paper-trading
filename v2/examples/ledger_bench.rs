@@ -48,8 +48,13 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
     let scratch = Scratch::new()?;
     let path = scratch.0.join("ledger.sqlite3");
     let path = path.to_str().ok_or("non-UTF8 temporary path")?;
-    let mut db = if disk { Store::open(path, INITIAL_CASH_CENTS)? }
-        else { Store::in_memory(INITIAL_CASH_CENTS)? };
+    let mut db = if disk { Store::open(path)? }
+        else { Store::in_memory()? };
+    db.create_experiment(ExperimentSpec {
+        schema_version: 1, cycle_id: "ledger-bench-v3".into(), initial_cash_cents: INITIAL_CASH_CENTS,
+        strategy: StrategyArtifact { strategy_version_id: "offline-fixed-v1".into(), research_input_id: "ledger-bench-v3".into() },
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(), execution_policy_version: POLICY_VERSION.into(),
+    })?;
     // The pinned identity fixture covers one supported symbol and eight days.
     // Never manufacture 25 "main-board" identities from a numeric prefix.
     let per_day = if fills { size.div_ceil(days.len()) } else { size };
@@ -64,7 +69,7 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         let day = days[day_index].to_string();
         let symbol = "600000.SH".to_string();
         let req = SimulationRequest {
-            schema_version: 2, cycle_id: "ledger-bench-v3".into(),
+            schema_version: 3, cycle_id: "ledger-bench-v3".into(),
             strategy_version_id: "offline-fixed-v1".into(), signal_id: format!("signal-{i}"),
             decision_at: format!("{day}T10:00:00+08:00"),
             signal: Signal { symbol: symbol.clone(),
@@ -97,27 +102,27 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
         }
         // Capture the prefix before any later day is appended, outside timing.
         if day == cutoff && (i + 1 == size || (fills && (i + 1) % per_day == 0)) {
-            expected_historical = Some(db.state(Some(&cutoff))?);
+            expected_historical = Some(db.state("ledger-bench-v3", Some(&cutoff))?);
         }
         last_request = Some(req);
     }
     let expected_historical = expected_historical.ok_or("missing cutoff prefix")?;
-    let latest = db.state(None)?;
+    let latest = db.state("ledger-bench-v3", None)?;
     assert_eq!(latest.runs_total, size as i64);
     let mut latest_ms = Vec::new();
     let mut historical_ms = Vec::new();
     let mut replay_ms = Vec::new();
     for _ in 0..9 {
-        let (view, elapsed) = timed(|| Ok(db.state(None)?))?;
+        let (view, elapsed) = timed(|| Ok(db.state("ledger-bench-v3", None)?))?;
         assert_eq!(view, latest);
         latest_ms.push(elapsed);
-        let (view, elapsed) = timed(|| Ok(db.state(Some(&cutoff))?))?;
+        let (view, elapsed) = timed(|| Ok(db.state("ledger-bench-v3", Some(&cutoff))?))?;
         assert_eq!(view, expected_historical);
         historical_ms.push(elapsed);
     }
     let mut report = None;
     for _ in 0..3 {
-        let (verified, elapsed) = timed(|| Ok(db.verify_replay()?))?;
+        let (verified, elapsed) = timed(|| Ok(db.verify_replay("ledger-bench-v3")?))?;
         assert!(verified.ok);
         assert_eq!((verified.runs_verified, verified.fills_verified), (size, filled));
         assert_eq!(verified.cash_cents, latest.cash_cents);
@@ -130,15 +135,15 @@ fn measure(size: usize, disk: bool, fills: bool, days: &[NaiveDate]) -> Result<V
     let mut conflict = req;
     conflict.quote_ref.quote_id = "conflict".into();
     assert!(db.submit(conflict).is_err());
-    assert_eq!(db.state(None)?, latest);
-    assert_eq!(db.state(Some(&cutoff))?, expected_historical);
-    assert_eq!(Some(db.verify_replay()?), report);
+    assert_eq!(db.state("ledger-bench-v3", None)?, latest);
+    assert_eq!(db.state("ledger-bench-v3", Some(&cutoff))?, expected_historical);
+    assert_eq!(Some(db.verify_replay("ledger-bench-v3")?), report);
     if disk {
         drop(db);
-        let reopened = Store::open(path, INITIAL_CASH_CENTS)?;
-        assert_eq!(reopened.state(None)?, latest);
-        assert_eq!(reopened.state(Some(&cutoff))?, expected_historical);
-        assert_eq!(Some(reopened.verify_replay()?), report);
+        let reopened = Store::open(path)?;
+        assert_eq!(reopened.state("ledger-bench-v3", None)?, latest);
+        assert_eq!(reopened.state("ledger-bench-v3", Some(&cutoff))?, expected_historical);
+        assert_eq!(Some(reopened.verify_replay("ledger-bench-v3")?), report);
     }
     let window = size.min(50);
     Ok(json!({"storage": if disk { "disk_wal" } else { "memory" },

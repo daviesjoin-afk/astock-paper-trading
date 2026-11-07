@@ -1,12 +1,169 @@
 use super::*;
+
+#[test]
+fn experiments_isolate_cash_t1_history_counts_time_order_and_reopen() {
+    let file = DiskDatabase::new();
+    let a_history;
+    let a_final;
+    let b_final;
+    let a_buy = request("2026-10-30", "shared-buy", Side::Buy);
+    let mut b_buy = a_buy.clone();
+    b_buy.cycle_id = "b".into();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        db.create_experiment(spec("b", INITIAL_CASH_CENTS / 2)).unwrap();
+        db.ingest_quote(evidence(&a_buy)).unwrap();
+        assert_eq!(db.submit(a_buy.clone()).unwrap().outcome.fill.unwrap().quantity, 800);
+        a_history = db.state("cycle-1", Some("2026-10-30")).unwrap();
+        assert_eq!(db.state("b", None).unwrap().cash_cents, INITIAL_CASH_CENTS / 2);
+        assert_eq!(db.state("b", None).unwrap().runs_total, 0);
+        // Advance A before submitting B's earlier independent timeline.
+        let a_sell = request("2026-11-02", "shared-sell", Side::Sell);
+        ingest_and_submit(&mut db, a_sell.clone());
+        a_final = db.state("cycle-1", None).unwrap();
+        assert_eq!(db.submit(b_buy.clone()).unwrap().outcome.fill.unwrap().quantity, 400);
+        assert!(db.submit(b_buy.clone()).unwrap().duplicate);
+        assert!(db.submit(a_buy.clone()).unwrap().duplicate);
+        let mut t1 = request("2026-10-30", "b-t1", Side::Sell);
+        t1.cycle_id = "b".into();
+        assert_eq!(ingest_and_submit(&mut db, t1).outcome.reason, "no_t1_sellable_lot");
+        let mut b_sell = a_sell;
+        b_sell.cycle_id = "b".into();
+        assert_eq!(db.submit(b_sell).unwrap().outcome.fill.unwrap().quantity, 400);
+        b_final = db.state("b", None).unwrap();
+        assert_eq!(db.state("cycle-1", None).unwrap(), a_final);
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), a_history);
+        assert_eq!(a_final.runs_total, 2);
+        assert_eq!(b_final.runs_total, 3);
+        assert_eq!(db.runs("b", 100).unwrap().len(), 3);
+        assert!(db.runs("b", 100).unwrap().iter().all(|r| r.request.cycle_id == "b"));
+        assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 2);
+        assert_eq!(db.verify_replay("b").unwrap().fills_verified, 2);
+    }
+    let mut db = Store::open(file.path()).unwrap();
+    assert_eq!(db.state("cycle-1", None).unwrap(), a_final);
+    assert_eq!(db.state("b", None).unwrap(), b_final);
+    assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), a_history);
+    assert!(db.submit(a_buy).unwrap().duplicate);
+    assert!(db.submit(b_buy).unwrap().duplicate);
+    assert_eq!(db.verify_replay("b").unwrap().runs_verified, 3);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 2);
+}
+
+#[test]
+fn experiments_isolate_transaction_failure_evidence_conflict_and_capital_limits() {
+    let file = DiskDatabase::new();
+    let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    db.create_experiment(spec("b", 1)).unwrap();
+    let a = request("2026-10-30", "same", Side::Buy);
+    db.ingest_quote(evidence(&a)).unwrap();
+    let mut b = a.clone(); b.cycle_id = "b".into();
+    let poor = db.submit(b).unwrap();
+    assert!(poor.outcome.fill.is_none());
+    assert_eq!(poor.outcome.cash_after_cents, 1);
+    let b_before = db.state("b", None).unwrap();
+    db.conn.execute_batch("CREATE TRIGGER fail_a BEFORE INSERT ON v2_fills BEGIN SELECT RAISE(ABORT,'simulated failure'); END;").unwrap();
+    assert!(matches!(db.submit(a.clone()), Err(StoreError::Database(_))));
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    assert_eq!(db.state("b", None).unwrap(), b_before);
+    db.conn.execute_batch("DROP TRIGGER fail_a;").unwrap();
+    assert_eq!(db.submit(a.clone()).unwrap().outcome.status, DecisionStatus::Filled);
+    let a_before = db.state("cycle-1", None).unwrap();
+    let mut bad = evidence(&a); bad.execution.as_mut().unwrap().price_cents += 1;
+    assert!(matches!(db.ingest_quote(bad), Err(StoreError::Conflict(_))));
+    assert_eq!(db.state("cycle-1", None).unwrap(), a_before);
+    assert_eq!(db.state("b", None).unwrap(), b_before);
+    drop(db);
+    let db = Store::open(file.path()).unwrap();
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
+    assert_eq!(db.verify_replay("b").unwrap().fills_verified, 0);
+    assert_eq!(db.state("b", None).unwrap(), b_before);
+}
+
+#[test]
+fn experiment_inputs_versions_and_completion_are_immutable() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let original = db.experiment("cycle-1").unwrap();
+    assert_eq!(db.create_experiment(original.spec.clone()).unwrap(), original);
+    let mut changed = original.spec.clone(); changed.initial_cash_cents += 1;
+    assert!(matches!(db.create_experiment(changed), Err(StoreError::Conflict(_))));
+    let mut changed = spec("b", INITIAL_CASH_CENTS); changed.strategy.research_input_id = "other-input".into();
+    assert!(matches!(db.create_experiment(changed), Err(StoreError::Conflict(_))));
+    assert!(db.experiment("b").is_err());
+    for field in ["policy", "pack", "cash", "schema"] {
+        let mut bad = spec("invalid", INITIAL_CASH_CENTS);
+        match field {
+            "policy" => bad.execution_policy_version = "unsupported-old-policy".into(),
+            "pack" => bad.market_data_pack_id = "unverified-pack".into(),
+            "cash" => bad.initial_cash_cents = 0,
+            _ => bad.schema_version = 0,
+        }
+        assert!(db.create_experiment(bad).is_err());
+        assert!(db.experiment("invalid").is_err());
+    }
+    let buy = request("2026-10-30", "buy", Side::Buy);
+    ingest_and_submit(&mut db, buy.clone());
+    let before = db.state("cycle-1", None).unwrap();
+    assert_eq!(db.complete_experiment("cycle-1").unwrap().status, ExperimentStatus::Completed);
+    assert_eq!(db.complete_experiment("cycle-1").unwrap().status, ExperimentStatus::Completed);
+    assert_eq!(db.create_experiment(original.spec).unwrap().status, ExperimentStatus::Completed);
+    assert!(db.submit(buy.clone()).unwrap().duplicate);
+    let mut next = buy.clone(); next.signal_id = "new-signal".into();
+    assert!(matches!(db.submit(next), Err(StoreError::Conflict(_))));
+    let mut wrong = buy; wrong.strategy_version_id = "different-strategy".into();
+    assert!(matches!(db.submit(wrong), Err(StoreError::Conflict(_))));
+    assert_eq!(db.state("cycle-1", None).unwrap(), before);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
+    db.create_experiment(spec("b", INITIAL_CASH_CENTS)).unwrap();
+    assert_eq!(db.experiment("b").unwrap().status, ExperimentStatus::Active);
+}
+
+#[test]
+fn uncreated_experiment_and_legacy_contract_never_mutate_ledger() {
+    let mut db = Store::in_memory().unwrap();
+    let mut req = request("2026-10-30", "buy", Side::Buy);
+    assert!(db.submit(req.clone()).is_err());
+    assert!(db.state("cycle-1", None).is_err());
+    assert!(db.runs("cycle-1", 100).is_err());
+    assert!(db.verify_replay("cycle-1").is_err());
+    db.create_experiment(spec("cycle-1", INITIAL_CASH_CENTS)).unwrap();
+    req.schema_version = 2;
+    assert!(db.submit(req).is_err());
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+}
+
+#[test]
+fn replay_refuses_cross_experiment_request_and_unsupported_old_policy() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        db.create_experiment(spec("b", INITIAL_CASH_CENTS)).unwrap();
+        let req = request("2026-10-30", "buy", Side::Buy);
+        ingest_and_submit(&mut db, req);
+        db.conn.execute("UPDATE v2_simulation_runs SET cycle_id='b'", []).unwrap();
+        assert!(db.verify_replay("b").is_err());
+        assert!(db.complete_experiment("b").is_err());
+        assert_eq!(db.experiment("b").unwrap().status, ExperimentStatus::Active);
+        db.conn.execute("UPDATE v2_simulation_runs SET cycle_id='cycle-1'", []).unwrap();
+        db.conn.execute("UPDATE v2_experiments SET spec_json=json_set(spec_json,'$.execution_policy_version','unknown') WHERE cycle_id='b'", []).unwrap();
+        assert!(db.verify_replay("b").is_err());
+        assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
+    }
+    let before = disk_snapshot(&file);
+    assert!(Store::open(file.path()).is_err());
+    assert_eq!(disk_snapshot(&file), before);
+}
+
 use crate::domain::{Side, Signal, Quote, ExecutionLiquidity, INITIAL_CASH_CENTS, DecisionStatus};
 
 #[test]
 fn independent_experiments_can_buy_the_same_signal_and_evidence() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let a = request("2026-10-30", "shared-signal", Side::Buy);
     let mut b = a.clone();
     b.cycle_id = "experiment-b".into();
+    db.create_experiment(spec("experiment-b", INITIAL_CASH_CENTS)).unwrap();
     db.ingest_quote(evidence(&a)).unwrap();
     assert_eq!(db.submit(a).unwrap().outcome.status, DecisionStatus::Filled);
     let second = db.submit(b).unwrap();
@@ -16,7 +173,7 @@ fn independent_experiments_can_buy_the_same_signal_and_evidence() {
 
 fn request(day: &str, signal_id: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
-        schema_version: 2, cycle_id: "cycle-1".into(),
+        schema_version: 3, cycle_id: "cycle-1".into(),
         strategy_version_id: "strategy-v1".into(), signal_id: signal_id.into(),
         decision_at: format!("{day}T10:00:00+08:00"),
         signal: Signal { symbol: "600000.SH".into(), side },
@@ -52,7 +209,7 @@ fn ingest_and_submit(db: &mut Store, req: SimulationRequest) -> RunRecord {
 // Fixed classifications and primary-source locators, not code-prefix inference.
 // The price/capacity below are deliberately synthetic offline inputs.
 fn assert_instrument_rejected(symbol: &str, reason: &str) {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let mut req = request("2026-10-30", "instrument-red", Side::Buy);
     req.signal.symbol = symbol.into();
     let mut input = evidence(&req);
@@ -68,9 +225,9 @@ fn assert_instrument_rejected(symbol: &str, reason: &str) {
     assert!(first.outcome.fill.is_none());
     assert_eq!(first.outcome.cash_after_cents, INITIAL_CASH_CENTS);
     assert!(db.submit(req).unwrap().duplicate);
-    assert_eq!(db.state(None).unwrap().runs_total, 1);
-    assert!(db.state(None).unwrap().positions.is_empty());
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 1);
+    assert!(db.state("cycle-1", None).unwrap().positions.is_empty());
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
 }
 
 #[test]
@@ -102,7 +259,7 @@ fn fixed_instrument_facts_rejections_and_pit_survive_disk_reopen() {
     let replay;
     let mut saved = Vec::new();
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         for (symbol, id, reason) in [
             ("688001.SH", "star", "unsupported_instrument_board"),
             ("513150.SH", "etf", "unsupported_security_type"),
@@ -127,16 +284,16 @@ fn fixed_instrument_facts_rejections_and_pit_survive_disk_reopen() {
             assert!(db.submit(req).unwrap().duplicate);
             saved.push(first);
         }
-        historical = db.state(Some("2026-10-30")).unwrap();
+        historical = db.state("cycle-1", Some("2026-10-30")).unwrap();
         assert_eq!(historical.positions[0].quantity, 800);
         ingest_and_submit(&mut db, request("2026-11-02", "main-sell", Side::Sell));
-        assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
-        latest = db.state(None).unwrap();
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), historical);
+        latest = db.state("cycle-1", None).unwrap();
         assert!(latest.positions.is_empty());
-        replay = db.verify_replay().unwrap();
+        replay = db.verify_replay("cycle-1").unwrap();
         assert_eq!((replay.runs_verified, replay.fills_verified), (5, 2));
     }
-    let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
     for first in saved {
         for _ in 0..2 {
             let retry = db.submit(first.request.clone()).unwrap();
@@ -144,33 +301,33 @@ fn fixed_instrument_facts_rejections_and_pit_survive_disk_reopen() {
             assert_eq!(retry.outcome, first.outcome);
             assert_eq!(retry.evidence, first.evidence);
             assert_eq!(retry.instrument_version, first.instrument_version);
-            assert_eq!(db.verify_replay().unwrap(), replay);
-            assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
-            assert_eq!(db.state(None).unwrap(), latest);
+            assert_eq!(db.verify_replay("cycle-1").unwrap(), replay);
+            assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), historical);
+            assert_eq!(db.state("cycle-1", None).unwrap(), latest);
         }
     }
 }
 
 #[test]
 fn identity_rejection_transaction_failure_cannot_leave_a_partial_run() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let mut req = request("2026-10-30", "blocked-identity", Side::Buy);
     req.signal.symbol = "688001.SH".into();
     let pinned = db.ingest_quote(evidence(&req)).unwrap();
-    let before = db.state(None).unwrap();
+    let before = db.state("cycle-1", None).unwrap();
     db.conn.execute_batch("CREATE TRIGGER fail_identity_run BEFORE INSERT ON v2_simulation_runs
         BEGIN SELECT RAISE(ABORT,'injected identity run failure'); END;").unwrap();
     for _ in 0..2 {
         assert!(db.submit(req.clone()).is_err());
-        assert_eq!(db.state(None).unwrap(), before);
+        assert_eq!(db.state("cycle-1", None).unwrap(), before);
         assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(pinned.clone()));
-        assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+        assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 0);
     }
     db.conn.execute_batch("DROP TRIGGER fail_identity_run;").unwrap();
     assert_eq!(db.submit(req.clone()).unwrap().outcome.reason, "unsupported_instrument_board");
     assert!(db.submit(req).unwrap().duplicate);
-    assert_eq!(db.verify_replay().unwrap().runs_verified, 1);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 1);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
 }
 
 #[test]
@@ -196,7 +353,7 @@ fn research_and_import_cannot_supply_instrument_qualification() {
 fn identity_tampering_in_both_evidence_copies_cannot_rewrite_history() {
     for (symbol, day) in [("600000.SH", "2026-10-30"), ("688001.SH", "2026-10-30"),
         ("999999.SH", "2026-10-30"), ("600000.SH", "2026-10-31"), ("999999.SH", "2026-10-31")] {
-        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
         let mut req = request(day, "tamper-identity", Side::Buy);
         req.signal.symbol = symbol.into();
         let first = ingest_and_submit(&mut db, req.clone());
@@ -208,10 +365,10 @@ fn identity_tampering_in_both_evidence_copies_cannot_rewrite_history() {
         changed["instrument"] = serde_json::to_value(forged).unwrap();
         db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [changed.to_string()]).unwrap();
         db.conn.execute("UPDATE v2_simulation_runs SET evidence_json=?", [changed.to_string()]).unwrap();
-        let before = db.state(None).unwrap();
+        let before = db.state("cycle-1", None).unwrap();
         let writes = db.conn.total_changes();
-        for _ in 0..2 { assert!(db.verify_replay().is_err()); }
-        assert_eq!(db.state(None).unwrap(), before);
+        for _ in 0..2 { assert!(db.verify_replay("cycle-1").is_err()); }
+        assert_eq!(db.state("cycle-1", None).unwrap(), before);
         assert_eq!(db.conn.total_changes(), writes);
         assert!(db.ingest_quote(evidence(&req)).is_err());
     }
@@ -219,10 +376,10 @@ fn identity_tampering_in_both_evidence_copies_cannot_rewrite_history() {
 
 #[test]
 fn instrument_snapshot_and_run_version_cannot_be_changed_in_place() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "pin-identity-version", Side::Buy);
     let saved = ingest_and_submit(&mut db, req.clone());
-    let state = db.state(None).unwrap();
+    let state = db.state("cycle-1", None).unwrap();
     let original: String = db.conn.query_row("SELECT value FROM v2_meta WHERE key='instrument_snapshot_json'", [], |r| r.get(0)).unwrap();
     let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
     changed["sources"][0]["locator"] = serde_json::json!("same-version-different-content");
@@ -230,16 +387,16 @@ fn instrument_snapshot_and_run_version_cannot_be_changed_in_place() {
     for _ in 0..2 {
         assert!(db.submit(req.clone()).is_err());
         assert!(db.ingest_quote(evidence(&req)).is_err());
-        assert!(db.verify_replay().is_err());
-        assert_eq!(db.state(None).unwrap(), state);
+        assert!(db.verify_replay("cycle-1").is_err());
+        assert_eq!(db.state("cycle-1", None).unwrap(), state);
     }
     db.conn.execute("UPDATE v2_meta SET value=? WHERE key='instrument_snapshot_json'", [original]).unwrap();
     db.conn.execute("UPDATE v2_simulation_runs SET instrument_version='later-version'", []).unwrap();
     assert!(db.submit(req.clone()).is_err());
-    assert!(db.verify_replay().is_err());
+    assert!(db.verify_replay("cycle-1").is_err());
     db.conn.execute("UPDATE v2_simulation_runs SET instrument_version=?", [saved.instrument_version]).unwrap();
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
-    assert_eq!(db.state(None).unwrap(), state);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
+    assert_eq!(db.state("cycle-1", None).unwrap(), state);
 }
 
 #[test]
@@ -247,10 +404,10 @@ fn old_instrument_policy_or_changed_snapshot_is_refused_before_disk_writes() {
     for old_policy in [true, false] {
         let file = DiskDatabase::new();
         {
-            let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+            let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
             ingest_and_submit(&mut db, request("2026-10-30", "keep-identity", Side::Buy));
             if old_policy {
-                db.conn.execute("UPDATE v2_meta SET value='v2-paper-policy-5' WHERE key='policy_version'", []).unwrap();
+                db.conn.execute("UPDATE v2_experiments SET spec_json=json_set(spec_json,'$.execution_policy_version','v2-paper-policy-5')", []).unwrap();
             } else {
                 let mut changed: serde_json::Value = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON).unwrap();
                 changed["sources"][0]["locator"] = serde_json::json!("tampered");
@@ -260,7 +417,7 @@ fn old_instrument_policy_or_changed_snapshot_is_refused_before_disk_writes() {
         Connection::open(file.path()).unwrap().execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
         let before = disk_snapshot(&file);
         for _ in 0..2 {
-            assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err());
+            assert!(test_open(file.path(), INITIAL_CASH_CENTS).is_err());
             assert_eq!(disk_snapshot(&file), before);
         }
     }
@@ -274,7 +431,7 @@ fn instrument_quantity_boundaries_are_persisted_idempotent_and_replayed() {
         (10_005_000, 1, "filled", Some(1_000_000)),
         (10_006_000, 1, "order_quantity_exceeds_instrument_limit", None),
     ] {
-        let mut db = Store::in_memory(cash).unwrap();
+        let mut db = test_store(cash).unwrap();
         let req = request("2026-10-30", "quantity-boundary", Side::Buy);
         let mut input = evidence(&req);
         input.execution.as_mut().unwrap().price_cents = price;
@@ -283,23 +440,23 @@ fn instrument_quantity_boundaries_are_persisted_idempotent_and_replayed() {
         let first = db.submit(req.clone()).unwrap();
         assert_eq!(first.outcome.reason, reason);
         assert_eq!(first.outcome.fill.as_ref().map(|fill| fill.quantity), quantity);
-        let view = db.state(Some("2026-10-30")).unwrap();
-        let report = db.verify_replay().unwrap();
+        let view = db.state("cycle-1", Some("2026-10-30")).unwrap();
+        let report = db.verify_replay("cycle-1").unwrap();
         assert_eq!((report.runs_verified, report.fills_verified), (1, usize::from(quantity.is_some())));
         for _ in 0..2 {
             assert_eq!(db.ingest_quote(input.clone()).unwrap(), pinned);
             let retry = db.submit(req.clone()).unwrap();
             assert!(retry.duplicate);
             assert_eq!(retry.outcome, first.outcome);
-            assert_eq!(db.state(Some("2026-10-30")).unwrap(), view);
-            assert_eq!(db.verify_replay().unwrap(), report);
+            assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), view);
+            assert_eq!(db.verify_replay("cycle-1").unwrap(), report);
         }
     }
 }
 
 #[test]
 fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "reference-only", Side::Buy);
     let mut raw = serde_json::to_value(evidence(&req)).unwrap();
     raw.as_object_mut().unwrap().remove("execution");
@@ -312,18 +469,18 @@ fn reference_only_import_cannot_write_a_fill_and_replays_its_rejection() {
         let retry = db.submit(req.clone()).unwrap();
         assert!(retry.duplicate);
         assert_eq!(retry.outcome, first.outcome);
-        let view = db.state(Some("2026-10-30")).unwrap();
+        let view = db.state("cycle-1", Some("2026-10-30")).unwrap();
         assert_eq!(view.cash_cents, INITIAL_CASH_CENTS);
         assert!(view.positions.is_empty());
         assert_eq!(view.runs_total, 1);
-        let replay = db.verify_replay().unwrap();
+        let replay = db.verify_replay("cycle-1").unwrap();
         assert_eq!((replay.runs_verified, replay.fills_verified), (1, 0));
     }
 }
 
 #[test]
 fn execution_import_is_strict_and_all_execution_fields_are_immutable() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "execution-import", Side::Buy);
     let good = evidence(&req);
     let changes = db.conn.total_changes();
@@ -360,12 +517,12 @@ fn execution_import_is_strict_and_all_execution_fields_are_immutable() {
         for _ in 0..2 { assert!(matches!(db.ingest_quote(bad.clone()), Err(StoreError::Conflict(_)))); }
     }
     assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(saved));
-    assert_eq!(db.state(None).unwrap().runs_total, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
 }
 
 #[test]
 fn insufficient_capacity_rejection_is_pinned_and_a_new_identity_can_fill() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "capacity-short", Side::Buy);
     let mut short = evidence(&req);
     short.execution.as_mut().unwrap().available_quantity = 799;
@@ -377,40 +534,36 @@ fn insufficient_capacity_rejection_is_pinned_and_a_new_identity_can_fill() {
     for _ in 0..2 {
         assert!(db.submit(req.clone()).unwrap().duplicate);
         assert!(matches!(db.ingest_quote(evidence(&req)), Err(StoreError::Conflict(_))));
-        assert_eq!(db.state(Some("2026-10-30")).unwrap().cash_cents, INITIAL_CASH_CENTS);
-        assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap().cash_cents, INITIAL_CASH_CENTS);
+        assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
     }
     let valid = request("2026-10-30", "capacity-full", Side::Buy);
     let filled = ingest_and_submit(&mut db, valid.clone());
     assert_eq!(filled.outcome.fill.as_ref().unwrap().quantity, 800);
     assert!(db.submit(valid).unwrap().duplicate);
     assert_eq!(db.submit(req).unwrap().outcome, first.outcome);
-    let report = db.verify_replay().unwrap();
+    let report = db.verify_replay("cycle-1").unwrap();
     assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
-    assert_eq!(db.state(Some("2026-10-30")).unwrap().runs_total, 2);
+    assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap().runs_total, 2);
 }
 
 #[test]
-fn one_sided_quote_cannot_multiply_fills_across_signals_strategies_or_reopen() {
+fn one_sided_quote_cannot_multiply_fills_within_experiment_or_reopen() {
     let file = DiskDatabase::new();
     let historical;
     let latest;
     let replay;
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         let buy = request("2026-10-30", "one-buy", Side::Buy);
         let first = ingest_and_submit(&mut db, buy.clone());
         let mut other = buy.clone();
-        other.cycle_id = "other-cycle".into();
-        other.strategy_version_id = "other-strategy".into();
         other.signal_id = "other-buy".into();
         assert_eq!(db.submit(other).unwrap().outcome.reason, "position_already_open");
-        historical = db.state(Some("2026-10-30")).unwrap();
+        historical = db.state("cycle-1", Some("2026-10-30")).unwrap();
         let sell = request("2026-11-02", "one-sell", Side::Sell);
         let sold = ingest_and_submit(&mut db, sell.clone());
         let mut other_sell = sell.clone();
-        other_sell.cycle_id = "other-cycle".into();
-        other_sell.strategy_version_id = "other-strategy".into();
         other_sell.signal_id = "other-sell".into();
         assert_eq!(db.submit(other_sell).unwrap().outcome.reason, "no_t1_sellable_lot");
         let mut tomorrow = buy.clone();
@@ -421,7 +574,7 @@ fn one_sided_quote_cannot_multiply_fills_across_signals_strategies_or_reopen() {
         assert_eq!(db.submit(sell).unwrap().outcome, sold.outcome);
         assert_eq!(db.ingest_quote(evidence(&buy)).unwrap(), first.evidence.unwrap());
         let mut uses = std::collections::BTreeMap::new();
-        for run in db.runs(100).unwrap() {
+        for run in db.runs("cycle-1", 100).unwrap() {
             if let Some(fill) = run.outcome.fill {
                 assert!(fill.quantity <= run.evidence.unwrap().execution.unwrap().available_quantity);
                 *uses.entry((run.request.quote_ref.source, run.request.quote_ref.quote_id)).or_insert(0) += 1;
@@ -429,17 +582,17 @@ fn one_sided_quote_cannot_multiply_fills_across_signals_strategies_or_reopen() {
         }
         assert_eq!(uses.len(), 2);
         assert!(uses.values().all(|&count| count == 1));
-        latest = db.state(None).unwrap();
+        latest = db.state("cycle-1", None).unwrap();
         assert!(latest.positions.is_empty());
-        assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
-        replay = db.verify_replay().unwrap();
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), historical);
+        replay = db.verify_replay("cycle-1").unwrap();
         assert_eq!((replay.runs_verified, replay.fills_verified), (5, 2));
     }
-    let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
     for _ in 0..2 {
-        assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
-        assert_eq!(db.state(None).unwrap(), latest);
-        assert_eq!(db.verify_replay().unwrap(), replay);
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), historical);
+        assert_eq!(db.state("cycle-1", None).unwrap(), latest);
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), replay);
     }
 }
 
@@ -449,16 +602,16 @@ fn changed_execution_evidence_is_detected_without_rewriting_facts() {
         ("price_cents", serde_json::json!(1250)), ("available_quantity", serde_json::json!(799)),
         ("order_side", serde_json::json!("sell")), ("observed_at", serde_json::json!("2026-10-30T09:59:29+08:00")),
     ] {
-        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
         let req = request("2026-10-30", "tamper-execution", Side::Buy);
         let first = ingest_and_submit(&mut db, req);
         let mut raw = serde_json::to_value(first.evidence.unwrap()).unwrap();
         raw["execution"][field] = value;
         db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [raw.to_string()]).unwrap();
         let changes = db.conn.total_changes();
-        for _ in 0..2 { assert!(db.verify_replay().is_err()); }
+        for _ in 0..2 { assert!(db.verify_replay("cycle-1").is_err()); }
         assert_eq!(db.conn.total_changes(), changes);
-        assert_eq!(db.state(None).unwrap().runs_total, 1);
+        assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 1);
     }
 }
 
@@ -466,21 +619,21 @@ fn changed_execution_evidence_is_detected_without_rewriting_facts() {
 fn prior_reference_price_policy_file_is_refused_without_disk_mutation() {
     let file = DiskDatabase::new();
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         ingest_and_submit(&mut db, request("2026-10-30", "old-policy", Side::Buy));
-        db.conn.execute("UPDATE v2_meta SET value='v2-paper-policy-4' WHERE key='policy_version'", []).unwrap();
+        db.conn.execute("UPDATE v2_experiments SET spec_json=json_set(spec_json,'$.execution_policy_version','v2-paper-policy-4')", []).unwrap();
     }
     Connection::open(file.path()).unwrap().execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
     let before = disk_snapshot(&file);
     for _ in 0..2 {
-        assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err());
+        assert!(test_open(file.path(), INITIAL_CASH_CENTS).is_err());
         assert_eq!(disk_snapshot(&file), before);
     }
 }
 
 #[test]
 fn dedup_is_exact_and_does_not_duplicate_fills() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     let first = ingest_and_submit(&mut db, req.clone());
     let second = db.submit(req).unwrap();
@@ -489,70 +642,70 @@ fn dedup_is_exact_and_does_not_duplicate_fills() {
     assert_eq!(first.id, second.id);
     assert_eq!(first.evidence, second.evidence);
     assert_eq!(first.outcome, second.outcome);
-    let view = db.state(Some("2026-10-30")).unwrap();
+    let view = db.state("cycle-1", Some("2026-10-30")).unwrap();
     assert_eq!(view.runs_total, 1);
     assert_eq!(view.positions.len(), 1);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
-    assert_eq!(db.runs(10).unwrap()[0], first);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
+    assert_eq!(db.runs("cycle-1", 10).unwrap()[0], first);
 }
 
 #[test]
 fn conflicting_payload_under_same_identity_is_rejected() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     ingest_and_submit(&mut db, request("2026-10-30", "b1", Side::Buy));
     let mut changed = request("2026-10-30", "b1", Side::Buy);
     changed.quote_ref.quote_id = "another-price".into();
     assert!(matches!(db.submit(changed), Err(StoreError::Conflict(_))));
-    assert_eq!(db.state(None).unwrap().runs_total, 1);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 1);
 }
 
 #[test]
 fn replay_detects_tampered_fill() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     ingest_and_submit(&mut db, request("2026-10-30", "b1", Side::Buy));
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
     db.conn.execute("UPDATE v2_fills SET fill_json='{}' WHERE id=1", []).unwrap();
-    assert!(db.verify_replay().is_err());
+    assert!(db.verify_replay("cycle-1").is_err());
 }
 
 #[test]
 fn out_of_order_decision_does_not_mutate_the_ledger() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     ingest_and_submit(&mut db, request("2026-11-02", "later", Side::Buy));
     let earlier = request("2026-10-30", "earlier", Side::Sell);
     assert!(matches!(db.submit(earlier), Err(StoreError::Conflict(_))));
-    assert_eq!(db.state(None).unwrap().runs_total, 1);
-    assert_eq!(db.verify_replay().unwrap().runs_verified, 1);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 1);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 1);
 }
 
 #[test]
 fn rejection_is_persisted_without_fill() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let out = ingest_and_submit(&mut db, request("2026-11-02", "s1", Side::Sell));
     assert_eq!(out.outcome.status, DecisionStatus::Rejected);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
 }
 
 #[test]
 fn buy_and_next_day_sell_replay() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     ingest_and_submit(&mut db, request("2026-10-30", "b1", Side::Buy));
     let blocked = ingest_and_submit(&mut db, request("2026-10-30", "s0", Side::Sell));
     assert_eq!(blocked.outcome.reason, "no_t1_sellable_lot");
     let sold = ingest_and_submit(&mut db, request("2026-11-02", "s1", Side::Sell));
     assert_eq!(sold.outcome.status, DecisionStatus::Filled);
-    assert_eq!(db.state(Some("2026-11-02")).unwrap().positions.len(), 0);
-    let verified = db.verify_replay().unwrap();
+    assert_eq!(db.state("cycle-1", Some("2026-11-02")).unwrap().positions.len(), 0);
+    let verified = db.verify_replay("cycle-1").unwrap();
     assert_eq!((verified.runs_verified, verified.fills_verified), (3, 2));
 }
 
 #[test]
 fn historical_state_excludes_future_buys_sells_and_decisions() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
-    let empty = db.state(Some("2026-10-29")).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let empty = db.state("cycle-1", Some("2026-10-29")).unwrap();
     let buy = request("2026-10-30", "pit-buy", Side::Buy);
     let bought = ingest_and_submit(&mut db, buy.clone());
-    let buy_day = db.state(Some("2026-10-30")).unwrap();
+    let buy_day = db.state("cycle-1", Some("2026-10-30")).unwrap();
     assert_eq!(buy_day.positions[0].quantity, 800);
     assert_eq!(buy_day.positions[0].sellable_quantity, Some(0));
     assert_eq!(buy_day.cash_cents, bought.outcome.cash_after_cents);
@@ -565,42 +718,42 @@ fn historical_state_excludes_future_buys_sells_and_decisions() {
     assert_eq!(sold.outcome.status, DecisionStatus::Filled);
     assert!(db.submit(buy).unwrap().duplicate);
     let changes = db.conn.total_changes();
-    let replay = db.verify_replay().unwrap();
+    let replay = db.verify_replay("cycle-1").unwrap();
     for _ in 0..3 {
-        assert_eq!(db.state(Some("2026-10-29")).unwrap(), empty);
-        assert_eq!(db.state(Some("2026-10-30")).unwrap(), buy_day_with_rejection);
-        let held = db.state(Some("2026-11-01")).unwrap();
+        assert_eq!(db.state("cycle-1", Some("2026-10-29")).unwrap(), empty);
+        assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), buy_day_with_rejection);
+        let held = db.state("cycle-1", Some("2026-11-01")).unwrap();
         assert_eq!(held.positions[0].quantity, 800);
         assert_eq!(held.positions[0].sellable_quantity, Some(800));
         assert_eq!(held.cash_cents, buy_day_with_rejection.cash_cents);
         assert_eq!(held.runs_total, 2);
-        let sell_day = db.state(Some("2026-11-02")).unwrap();
+        let sell_day = db.state("cycle-1", Some("2026-11-02")).unwrap();
         assert!(sell_day.positions.is_empty() && sell_day.lots.is_empty());
         assert_eq!(sell_day.cash_cents, sold.outcome.cash_after_cents);
         assert_eq!(sell_day.runs_total, 3);
-        assert_eq!(db.state(None).unwrap().cash_cents, sell_day.cash_cents);
-        assert_eq!(db.verify_replay().unwrap(), replay);
+        assert_eq!(db.state("cycle-1", None).unwrap().cash_cents, sell_day.cash_cents);
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), replay);
     }
     assert_eq!(db.conn.total_changes(), changes);
 }
 
 #[test]
 fn historical_state_uses_china_day_end_including_rejected_decisions() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let mut last = request("2026-10-30", "pit-last-nanosecond", Side::Buy);
     last.decision_at = "2026-10-30T23:59:59.999999999+08:00".into();
     // Missing quote is an immutable rejected decision and still counts on its day.
     assert_eq!(db.submit(last).unwrap().outcome.status, DecisionStatus::Rejected);
-    let end = db.state(Some("2026-10-30")).unwrap();
+    let end = db.state("cycle-1", Some("2026-10-30")).unwrap();
     assert_eq!(end.runs_total, 1);
     let mut next = request("2026-10-31", "pit-next-midnight", Side::Buy);
     // This instant is still October 30 in UTC, but the next China date.
     next.decision_at = "2026-10-31T00:00:00+08:00".into();
     db.submit(next).unwrap();
-    assert_eq!(db.state(Some("2026-10-30")).unwrap(), end);
-    assert_eq!(db.state(Some("2026-10-31")).unwrap().runs_total, 2);
-    assert_eq!(db.state(None).unwrap().runs_total, 2);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), end);
+    assert_eq!(db.state("cycle-1", Some("2026-10-31")).unwrap().runs_total, 2);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 2);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
 }
 
 #[test]
@@ -610,23 +763,23 @@ fn historical_state_survives_disk_reopen_without_writes_or_reinterpretation() {
     let latest;
     let replay;
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         historical = {
             ingest_and_submit(&mut db, request("2026-10-30", "pit-disk-buy", Side::Buy));
-            db.state(Some("2026-10-30")).unwrap()
+            db.state("cycle-1", Some("2026-10-30")).unwrap()
         };
         ingest_and_submit(&mut db, request("2026-11-02", "pit-disk-sell", Side::Sell));
-        latest = db.state(None).unwrap();
-        replay = db.verify_replay().unwrap();
+        latest = db.state("cycle-1", None).unwrap();
+        replay = db.verify_replay("cycle-1").unwrap();
     }
     let before = disk_snapshot(&file);
     {
-        let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         let changes = db.conn.total_changes();
         for _ in 0..2 {
-            assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
-            assert_eq!(db.state(None).unwrap(), latest);
-            assert_eq!(db.verify_replay().unwrap(), replay);
+            assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), historical);
+            assert_eq!(db.state("cycle-1", None).unwrap(), latest);
+            assert_eq!(db.verify_replay("cycle-1").unwrap(), replay);
         }
         assert_eq!(db.conn.total_changes(), changes);
     }
@@ -635,24 +788,24 @@ fn historical_state_survives_disk_reopen_without_writes_or_reinterpretation() {
 
 #[test]
 fn historical_state_empty_history_and_invalid_dates_are_read_only() {
-    let db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let db = test_store(INITIAL_CASH_CENTS).unwrap();
     let changes = db.conn.total_changes();
     for day in ["2026-10-29", "2025-01-01", "2027-01-01"] {
-        let view = db.state(Some(day)).unwrap();
+        let view = db.state("cycle-1", Some(day)).unwrap();
         assert_eq!(view.cash_cents, INITIAL_CASH_CENTS);
         assert!(view.positions.is_empty() && view.lots.is_empty());
         assert_eq!(view.runs_total, 0);
     }
     for day in ["bad", "2026-02-30", "2026-1-1", "2026-10-30T10:00:00+08:00"] {
-        for _ in 0..2 { assert!(db.state(Some(day)).is_err(), "{day}"); }
+        for _ in 0..2 { assert!(db.state("cycle-1", Some(day)).is_err(), "{day}"); }
     }
-    assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 0);
     assert_eq!(db.conn.total_changes(), changes);
 }
 
 #[test]
 fn quote_ingestion_is_idempotent_and_every_evidence_field_is_immutable() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     let quote = evidence(&req);
     let stored = db.ingest_quote(quote.clone()).unwrap();
@@ -689,15 +842,15 @@ fn quote_ingestion_is_idempotent_and_every_evidence_field_is_immutable() {
     assert_eq!(load_evidence(&db.conn, &req.quote_ref).unwrap(), Some(stored));
     let count: i64 = db.conn.query_row("SELECT COUNT(*) FROM v2_quote_evidence", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
-    assert_eq!(db.state(None).unwrap().runs_total, 0);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
     assert_eq!(db.submit(req).unwrap().outcome.status, DecisionStatus::Filled);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
 }
 
 #[test]
 fn invalid_ingress_never_writes_and_cannot_be_retried_into_success() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let good = evidence(&request("2026-10-30", "b1", Side::Buy));
     let mut variants = Vec::new();
     let mut bad = good.clone();
@@ -720,12 +873,12 @@ fn invalid_ingress_never_writes_and_cannot_be_retried_into_success() {
     }
     let count: i64 = db.conn.query_row("SELECT COUNT(*) FROM v2_quote_evidence", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
-    assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 0);
 }
 
 #[test]
 fn missing_quote_rejection_stays_pinned_after_later_ingestion() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     let first = db.submit(req.clone()).unwrap();
     assert_eq!(first.outcome.reason, "quote_evidence_missing");
@@ -735,19 +888,19 @@ fn missing_quote_rejection_stays_pinned_after_later_ingestion() {
     assert!(retry.duplicate);
     assert_eq!(retry.outcome, first.outcome);
     assert!(retry.evidence.is_none());
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
     let mut next = req;
     next.signal_id = "b2".into();
     assert_eq!(db.submit(next).unwrap().outcome.status, DecisionStatus::Filled);
     for _ in 0..2 {
-        let replay = db.verify_replay().unwrap();
+        let replay = db.verify_replay("cycle-1").unwrap();
         assert_eq!((replay.runs_verified, replay.fills_verified), (2, 1));
     }
 }
 
 #[test]
 fn late_evidence_rejection_and_exact_availability_boundary_replay() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "late", Side::Buy);
     let mut quote = evidence(&req);
     quote.available_at = "2026-10-30T10:00:00.001+08:00".into();
@@ -762,60 +915,60 @@ fn late_evidence_rejection_and_exact_availability_boundary_replay() {
     db.ingest_quote(quote).unwrap();
     assert_eq!(db.submit(on_time).unwrap().outcome.status, DecisionStatus::Filled);
     for _ in 0..2 {
-        let report = db.verify_replay().unwrap();
+        let report = db.verify_replay("cycle-1").unwrap();
         assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
     }
 }
 
 #[test]
 fn source_is_part_of_quote_identity_and_cannot_resolve_another_source() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let mut req = request("2026-10-30", "b1", Side::Buy);
     db.ingest_quote(evidence(&req)).unwrap();
     req.quote_ref.source = "forged-provider".into();
     let result = db.submit(req.clone()).unwrap();
     assert_eq!(result.outcome.reason, "quote_evidence_missing");
     assert_eq!(db.submit(req).unwrap().outcome, result.outcome);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
 }
 
 #[test]
 fn replay_detects_changed_or_deleted_evidence_for_fills_and_rejections() {
     for late in [false, true] {
-        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
         let req = request("2026-10-30", "b1", Side::Buy);
         let mut quote = evidence(&req);
         if late { quote.available_at = "2026-10-30T10:00:01+08:00".into(); }
         let mut stored = db.ingest_quote(quote.clone()).unwrap();
         db.submit(req).unwrap();
-        assert!(db.verify_replay().unwrap().ok);
+        assert!(db.verify_replay("cycle-1").unwrap().ok);
         let original = serde_json::to_string(&stored).unwrap();
         stored.quote.price_cents += 1;
         db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [serde_json::to_string(&stored).unwrap()]).unwrap();
-        assert!(db.verify_replay().is_err());
+        assert!(db.verify_replay("cycle-1").is_err());
         db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [original]).unwrap();
-        assert!(db.verify_replay().unwrap().ok);
+        assert!(db.verify_replay("cycle-1").unwrap().ok);
         db.conn.execute("DELETE FROM v2_quote_evidence", []).unwrap();
-        assert!(db.verify_replay().is_err());
+        assert!(db.verify_replay("cycle-1").is_err());
     }
 }
 
 #[test]
 fn fill_failure_rolls_back_decision_but_retains_independent_evidence() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let req = request("2026-10-30", "b1", Side::Buy);
     db.ingest_quote(evidence(&req)).unwrap();
-    let historical = db.state(Some("2026-10-30")).unwrap();
+    let historical = db.state("cycle-1", Some("2026-10-30")).unwrap();
     db.conn.execute_batch("CREATE TRIGGER block_fill BEFORE INSERT ON v2_fills BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
     assert!(db.submit(req.clone()).is_err());
-    assert_eq!(db.state(None).unwrap().runs_total, 0);
-    assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
-    assert_eq!(db.state(Some("2026-10-30")).unwrap(), historical);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap(), historical);
     assert!(load_evidence(&db.conn, &req.quote_ref).unwrap().is_some());
     db.conn.execute_batch("DROP TRIGGER block_fill;").unwrap();
     assert_eq!(db.submit(req).unwrap().outcome.status, DecisionStatus::Filled);
-    assert_eq!(db.state(Some("2026-10-30")).unwrap().runs_total, 1);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 1);
+    assert_eq!(db.state("cycle-1", Some("2026-10-30")).unwrap().runs_total, 1);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 1);
 }
 
 #[test]
@@ -824,11 +977,11 @@ fn evidence_and_missing_snapshots_survive_store_reopen() {
     let _keeper = Connection::open(&path).unwrap();
     let req = request("2026-10-30", "missing", Side::Buy);
     {
-        let mut db = Store::open(&path, INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(&path, INITIAL_CASH_CENTS).unwrap();
         assert_eq!(db.submit(req.clone()).unwrap().outcome.reason, "quote_evidence_missing");
         db.ingest_quote(evidence(&req)).unwrap();
     }
-    let mut reopened = Store::open(&path, INITIAL_CASH_CENTS).unwrap();
+    let mut reopened = test_open(&path, INITIAL_CASH_CENTS).unwrap();
     let retry = reopened.submit(req.clone()).unwrap();
     assert!(retry.duplicate && retry.evidence.is_none());
     let mut next = req;
@@ -836,9 +989,9 @@ fn evidence_and_missing_snapshots_survive_store_reopen() {
     let filled = reopened.submit(next).unwrap();
     assert_eq!(filled.outcome.status, DecisionStatus::Filled);
     drop(reopened);
-    let reopened = Store::open(&path, INITIAL_CASH_CENTS).unwrap();
+    let reopened = test_open(&path, INITIAL_CASH_CENTS).unwrap();
     for _ in 0..2 {
-        let report = reopened.verify_replay().unwrap();
+        let report = reopened.verify_replay("cycle-1").unwrap();
         assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
     }
 }
@@ -849,7 +1002,7 @@ fn old_policy_database_is_refused_before_adding_evidence_schema() {
     let keeper = Connection::open(&path).unwrap();
     keeper.execute_batch("CREATE TABLE v2_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         INSERT INTO v2_meta VALUES('policy_version','v2-paper-policy-1');").unwrap();
-    assert!(matches!(Store::with_connection(Connection::open(&path).unwrap(), INITIAL_CASH_CENTS), Err(StoreError::Integrity(_))));
+    assert!(matches!(Store::with_connection(Connection::open(&path).unwrap()), Err(StoreError::Integrity(_))));
     let tables: i64 = keeper.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0)).unwrap();
     assert_eq!(tables, 1);
 }
@@ -861,7 +1014,7 @@ fn server_receipt_and_offline_trust_survive_retries_reopen_and_replay() {
     let input = evidence(&req);
     let saved;
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         let before = chrono::Utc::now();
         saved = db.ingest_quote(input.clone()).unwrap();
         let after = chrono::Utc::now();
@@ -875,14 +1028,14 @@ fn server_receipt_and_offline_trust_survive_retries_reopen_and_replay() {
         assert_eq!(run.outcome.status, DecisionStatus::Filled);
         assert_eq!(run.evidence, Some(saved.clone()));
     }
-    let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
     assert_eq!(db.ingest_quote(input).unwrap(), saved);
     let retry = db.submit(req).unwrap();
     assert!(retry.duplicate);
     assert_eq!(retry.evidence, Some(saved));
-    let first_replay = db.verify_replay().unwrap();
+    let first_replay = db.verify_replay("cycle-1").unwrap();
     assert_eq!((first_replay.runs_verified, first_replay.fills_verified), (1, 1));
-    assert_eq!(db.verify_replay().unwrap(), first_replay);
+    assert_eq!(db.verify_replay("cycle-1").unwrap(), first_replay);
 }
 
 #[test]
@@ -898,16 +1051,16 @@ fn import_command_rejects_server_facts_and_invented_proofs() {
             assert!(serde_json::from_value::<QuoteImport>(forged.clone()).is_err());
         }
     }
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let saved = db.ingest_quote(input).unwrap();
     assert!(serde_json::from_value::<QuoteImport>(serde_json::to_value(saved).unwrap()).is_err());
-    assert_eq!(db.verify_replay().unwrap().runs_verified, 0);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 0);
 }
 
 #[test]
 fn replay_detects_changed_receipt_or_trust_even_without_price_change() {
     for late in [false, true] {
-        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
         let req = request("2026-10-30", "receipt", Side::Buy);
         let mut input = evidence(&req);
         if late { input.available_at = "2026-10-30T10:00:00.001+08:00".into(); }
@@ -924,11 +1077,11 @@ fn replay_detects_changed_receipt_or_trust_even_without_price_change() {
             let mut changed = serde_json::to_value(&saved).unwrap();
             changed[field] = value;
             db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [changed.to_string()]).unwrap();
-            assert!(db.verify_replay().is_err());
+            assert!(db.verify_replay("cycle-1").is_err());
             db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=?", [&original]).unwrap();
-            assert!(db.verify_replay().unwrap().ok);
+            assert!(db.verify_replay("cycle-1").unwrap().ok);
         }
-        assert_eq!(db.verify_replay().unwrap(), db.verify_replay().unwrap());
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), db.verify_replay("cycle-1").unwrap());
     }
 }
 
@@ -1003,7 +1156,7 @@ fn assert_disk_refusal_is_read_only(setup: &str) {
     }
     let before = disk_snapshot(&file);
     for _ in 0..2 {
-        assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err(), "foreign database accepted");
+        assert!(test_open(file.path(), INITIAL_CASH_CENTS).is_err(), "foreign database accepted");
         assert_eq!(disk_snapshot(&file), before, "refused database changed on disk");
     }
 }
@@ -1035,11 +1188,11 @@ fn rejected_partial_v2_identity_is_untouched() {
 }
 
 #[test]
-fn current_v2_with_foreign_schema_or_wrong_seed_is_untouched() {
-    for foreign in [false, true] {
+fn current_v2_with_foreign_schema_is_untouched() {
+    for foreign in [true] {
         let file = DiskDatabase::new();
         {
-            let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+            let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
             ingest_and_submit(&mut db, request("2026-10-30", "disk-buy", Side::Buy));
         }
         {
@@ -1052,7 +1205,7 @@ fn current_v2_with_foreign_schema_or_wrong_seed_is_untouched() {
         let before = disk_snapshot(&file);
         for _ in 0..2 {
             let cash = INITIAL_CASH_CENTS + if foreign { 0 } else { 1 };
-            assert!(Store::open(file.path(), cash).is_err());
+            assert!(test_open(file.path(), cash).is_err());
             assert_eq!(disk_snapshot(&file), before);
         }
     }
@@ -1063,7 +1216,7 @@ fn empty_disk_initialization_reopen_and_millisecond_rejections_replay() {
     let file = DiskDatabase::new();
     std::fs::write(&file.0, []).unwrap();
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         let req = request("2026-10-30", "expired", Side::Buy);
         let mut quote = evidence(&req);
         quote.quote.observed_at = "2026-10-30T09:56:59.999+08:00".into();
@@ -1077,9 +1230,9 @@ fn empty_disk_initialization_reopen_and_millisecond_rejections_replay() {
         db.ingest_quote(quote).unwrap();
         assert_eq!(db.submit(req).unwrap().outcome.status, DecisionStatus::Filled);
     }
-    let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
     for _ in 0..2 {
-        let report = db.verify_replay().unwrap();
+        let report = db.verify_replay("cycle-1").unwrap();
         assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
     }
 }
@@ -1105,7 +1258,7 @@ fn closed_dates_and_precise_session_rejections_persist_and_replay() {
         ("2026-10-30", "15:00:00.001", "outside_trading_session"),
         ("2026-10-30", "14:57:00", "closing_auction_not_supported"),
     ] {
-        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
         let (req, input) = market_input(day, time, "closed");
         db.ingest_quote(input).unwrap();
         let first = db.submit(req.clone()).unwrap();
@@ -1115,9 +1268,9 @@ fn closed_dates_and_precise_session_rejections_persist_and_replay() {
         assert!(retry.duplicate);
         assert_eq!(retry.id, first.id);
         assert_eq!(retry.outcome, first.outcome);
-        assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+        assert_eq!(db.state("cycle-1", None).unwrap().cash_cents, INITIAL_CASH_CENTS);
         for _ in 0..2 {
-            let report = db.verify_replay().unwrap();
+            let report = db.verify_replay("cycle-1").unwrap();
             assert_eq!((report.runs_verified, report.fills_verified), (1, 0));
         }
     }
@@ -1125,20 +1278,20 @@ fn closed_dates_and_precise_session_rejections_persist_and_replay() {
 
 #[test]
 fn closed_day_decision_write_failure_rolls_back_then_retries_once() {
-    let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let (req, input) = market_input("2026-10-31", "10:00:00", "rollback-closed");
     db.ingest_quote(input).unwrap();
     db.conn.execute_batch("CREATE TRIGGER block_run BEFORE INSERT ON v2_simulation_runs
         BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
     assert!(db.submit(req.clone()).is_err());
-    assert_eq!(db.state(None).unwrap().runs_total, 0);
-    assert_eq!(db.state(None).unwrap().cash_cents, INITIAL_CASH_CENTS);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().cash_cents, INITIAL_CASH_CENTS);
     db.conn.execute_batch("DROP TRIGGER block_run;").unwrap();
     let first = db.submit(req.clone()).unwrap();
     assert_eq!(first.outcome.reason, "weekend_market_closed");
     assert!(db.submit(req).unwrap().duplicate);
-    assert_eq!(db.verify_replay().unwrap().fills_verified, 0);
-    assert_eq!(db.state(None).unwrap().runs_total, 1);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
+    assert_eq!(db.state("cycle-1", None).unwrap().runs_total, 1);
 }
 
 #[test]
@@ -1146,7 +1299,7 @@ fn fixed_market_snapshots_and_run_references_survive_disk_reopen() {
     let file = DiskDatabase::new();
     let snapshots;
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         for (day, id) in [("2026-10-30", "open"), ("2026-10-31", "closed")] {
             let (req, input) = market_input(day, "10:00:00", id);
             db.ingest_quote(input).unwrap();
@@ -1162,12 +1315,12 @@ fn fixed_market_snapshots_and_run_references_survive_disk_reopen() {
             db.conn.query_row("SELECT value FROM v2_meta WHERE key='session_policy_snapshot_json'", [], |r| r.get::<_, String>(0)).unwrap(),
         );
     }
-    let db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+    let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
     let (calendar, sessions, _) = load_market_context(&db.conn).unwrap();
     assert_eq!(serde_json::from_str::<TradingCalendar>(&snapshots.0).unwrap(), calendar);
     assert_eq!(serde_json::from_str::<SessionPolicy>(&snapshots.1).unwrap(), sessions);
     for _ in 0..2 {
-        let report = db.verify_replay().unwrap();
+        let report = db.verify_replay("cycle-1").unwrap();
         assert_eq!((report.runs_verified, report.fills_verified), (2, 1));
     }
 }
@@ -1175,11 +1328,11 @@ fn fixed_market_snapshots_and_run_references_survive_disk_reopen() {
 #[test]
 fn changed_market_snapshots_or_run_versions_never_reinterpret_history() {
     for day in ["2026-10-30", "2026-10-31"] {
-        let mut db = Store::in_memory(INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
         let (req, input) = market_input(day, "10:00:00", "pin");
         db.ingest_quote(input).unwrap();
         let saved = db.submit(req.clone()).unwrap();
-        let state = db.state(None).unwrap();
+        let state = db.state("cycle-1", None).unwrap();
         for key in ["calendar_snapshot_json", "session_policy_snapshot_json"] {
             let original: String = db.conn.query_row("SELECT value FROM v2_meta WHERE key=?", [key], |r| r.get(0)).unwrap();
             let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
@@ -1189,26 +1342,26 @@ fn changed_market_snapshots_or_run_versions_never_reinterpret_history() {
                 changed["continuous"][0]["end"] = serde_json::json!("11:31:00");
             }
             db.conn.execute("UPDATE v2_meta SET value=? WHERE key=?", params![changed.to_string(), key]).unwrap();
-            assert!(db.verify_replay().is_err());
+            assert!(db.verify_replay("cycle-1").is_err());
             let mut next = req.clone();
             next.signal_id = "next".into();
             assert!(db.submit(next).is_err());
-            assert_eq!(db.state(None).unwrap(), state);
+            assert_eq!(db.state("cycle-1", None).unwrap(), state);
             db.conn.execute("UPDATE v2_meta SET value=? WHERE key=?", params![original, key]).unwrap();
-            assert!(db.verify_replay().unwrap().ok);
+            assert!(db.verify_replay("cycle-1").unwrap().ok);
         }
         for (column, original) in [
             ("calendar_version", saved.calendar_version.as_str()),
             ("session_policy_version", saved.session_policy_version.as_str()),
         ] {
             db.conn.execute(&format!("UPDATE v2_simulation_runs SET {column}='later-version'"), []).unwrap();
-            assert!(db.verify_replay().is_err());
+            assert!(db.verify_replay("cycle-1").is_err());
             assert!(db.submit(req.clone()).is_err());
             db.conn.execute(&format!("UPDATE v2_simulation_runs SET {column}=?"), [original]).unwrap();
-            assert!(db.verify_replay().unwrap().ok);
+            assert!(db.verify_replay("cycle-1").unwrap().ok);
         }
-        assert_eq!(db.runs(10).unwrap()[0], saved);
-        assert_eq!(db.verify_replay().unwrap(), db.verify_replay().unwrap());
+        assert_eq!(db.runs("cycle-1", 10).unwrap()[0], saved);
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), db.verify_replay("cycle-1").unwrap());
     }
 }
 
@@ -1216,7 +1369,7 @@ fn changed_market_snapshots_or_run_versions_never_reinterpret_history() {
 fn invalid_pinned_calendar_is_refused_before_wal_or_schema_writes() {
     let file = DiskDatabase::new();
     {
-        let mut db = Store::open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
         ingest_and_submit(&mut db, request("2026-10-30", "keep", Side::Buy));
     }
     {
@@ -1229,7 +1382,27 @@ fn invalid_pinned_calendar_is_refused_before_wal_or_schema_writes() {
     }
     let before = disk_snapshot(&file);
     for _ in 0..2 {
-        assert!(Store::open(file.path(), INITIAL_CASH_CENTS).is_err());
+        assert!(test_open(file.path(), INITIAL_CASH_CENTS).is_err());
         assert_eq!(disk_snapshot(&file), before);
     }
+}
+
+fn spec(cycle_id: &str, initial_cash_cents: i64) -> ExperimentSpec {
+    ExperimentSpec {
+        schema_version: 1, cycle_id: cycle_id.into(), initial_cash_cents,
+        strategy: StrategyArtifact { strategy_version_id: "strategy-v1".into(), research_input_id: "offline-research-input-v1".into() },
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(), execution_policy_version: POLICY_VERSION.into(),
+    }
+}
+
+// Test setup only: production has no implicit experiment or seed fallback.
+fn test_store(cash: i64) -> StoreResult<Store> {
+    let mut db = Store::in_memory()?;
+    db.create_experiment(spec("cycle-1", cash))?;
+    Ok(db)
+}
+fn test_open(path: &str, cash: i64) -> StoreResult<Store> {
+    let mut db = Store::open(path)?;
+    db.create_experiment(spec("cycle-1", cash))?;
+    Ok(db)
 }

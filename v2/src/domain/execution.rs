@@ -180,7 +180,7 @@ pub fn decide(
     calendar.validate()?;
     sessions.validate()?;
     instruments.validate()?;
-    if req.schema_version != 2 {
+    if req.schema_version != 3 {
         return Err(RuleError("unsupported_contract_version".into()));
     }
     if !key_valid(&req.cycle_id) || !key_valid(&req.strategy_version_id)

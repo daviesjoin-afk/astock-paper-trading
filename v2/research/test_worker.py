@@ -12,7 +12,7 @@ class ContractTests(unittest.TestCase):
 
     def test_proposal_is_versioned_and_does_not_set_order_quantity(self):
         value = build_fixture_proposal()
-        self.assertEqual(2, value["schema_version"])
+        self.assertEqual(3, value["schema_version"])
         self.assertEqual("buy", value["signal"]["side"])
         self.assertNotIn("quantity", value["signal"])
         self.assertNotIn("cash", value)

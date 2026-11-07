@@ -15,7 +15,7 @@ fn sessions() -> SessionPolicy {
 
 fn request(day: &str, side: Side) -> SimulationRequest {
     SimulationRequest {
-        schema_version: 2, cycle_id: "demo-cycle".into(),
+        schema_version: 3, cycle_id: "demo-cycle".into(),
         strategy_version_id: "alpha-v1".into(), signal_id: "signal-1".into(),
         decision_at: format!("{day}T10:00:00+08:00"),
         signal: Signal { symbol: "600000.SH".into(), side },

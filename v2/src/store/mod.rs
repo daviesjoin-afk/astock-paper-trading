@@ -5,6 +5,7 @@ use crate::domain::{InstrumentSnapshot, BUNDLED_INSTRUMENTS_JSON};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use crate::domain::{Experiment, ExperimentSpec, ExperimentStatus, StrategyArtifact, MARKET_DATA_PACK_ID};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -60,6 +61,7 @@ pub struct PositionView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortfolioView {
+    pub cycle_id: String,
     pub initial_cash_cents: i64,
     pub cash_cents: i64,
     pub asof_day: Option<String>,
@@ -70,6 +72,7 @@ pub struct PortfolioView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayReport {
+    pub cycle_id: String,
     pub ok: bool,
     pub runs_verified: usize,
     pub fills_verified: usize,
@@ -78,24 +81,20 @@ pub struct ReplayReport {
 
 pub struct Store {
     conn: Connection,
-    initial_cash_cents: i64,
 }
 
 impl Store {
-    pub fn open(path: &str, initial_cash_cents: i64) -> StoreResult<Self> {
-        Self::with_connection(Connection::open(path)?, initial_cash_cents)
+    pub fn open(path: &str) -> StoreResult<Self> {
+        Self::with_connection(Connection::open(path)?)
     }
 
-    pub fn in_memory(initial_cash_cents: i64) -> StoreResult<Self> {
-        Self::with_connection(Connection::open_in_memory()?, initial_cash_cents)
+    pub fn in_memory() -> StoreResult<Self> {
+        Self::with_connection(Connection::open_in_memory()?)
     }
 
-    fn with_connection(mut conn: Connection, initial_cash_cents: i64) -> StoreResult<Self> {
+    fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 5;
-        if initial_cash_cents <= 0 {
-            return Err(StoreError::Integrity("initial_cash_must_be_positive".into()));
-        }
+        const SCHEMA_VERSION: i64 = 6;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -115,6 +114,8 @@ impl Store {
             }
             let tables: &[(&str, &[&str])] = &[
                 ("v2_meta", &["key", "value"]),
+                ("v2_experiments", &["cycle_id", "spec_json", "status"]),
+                ("v2_strategy_artifacts", &["strategy_version_id", "artifact_json"]),
                 ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_fills", &["id", "run_id", "fill_json"]),
                 ("v2_quote_evidence", &["source", "quote_id", "evidence_json"]),
@@ -133,18 +134,10 @@ impl Store {
                     return Err(StoreError::Integrity("unexpected_or_incomplete_v2_schema".into()));
                 }
             }
-            let policy: Option<String> = conn.query_row(
-                "SELECT value FROM v2_meta WHERE key='policy_version'", [], |r| r.get(0)
-            ).optional()?;
-            if policy.as_deref() != Some(POLICY_VERSION) {
-                return Err(StoreError::Integrity("policy_version_mismatch_migration_required".into()));
-            }
-            let seed: Option<String> = conn.query_row(
-                "SELECT value FROM v2_meta WHERE key='initial_cash_cents'", [], |r| r.get(0)
-            ).optional()?;
-            if seed.as_deref() != Some(initial_cash_cents.to_string().as_str()) {
-                return Err(StoreError::Integrity("initial_cash_mismatch_refusing_to_reinterpret_ledger".into()));
-            }
+            let mut stmt = conn.prepare("SELECT cycle_id FROM v2_experiments")?;
+            let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            for id in ids { load_experiment(&conn, &id)?; }
+
         }
 
         if fresh {
@@ -168,9 +161,18 @@ impl Store {
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE v2_strategy_artifacts (
+                    strategy_version_id TEXT PRIMARY KEY NOT NULL,
+                    artifact_json TEXT NOT NULL
+                );
+                CREATE TABLE v2_experiments (
+                    cycle_id TEXT PRIMARY KEY NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('active','completed'))
+                );
                 CREATE TABLE v2_simulation_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cycle_id TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL REFERENCES v2_experiments(cycle_id) ON DELETE RESTRICT,
                     strategy_version_id TEXT NOT NULL,
                     signal_id TEXT NOT NULL,
                     request_json TEXT NOT NULL,
@@ -197,15 +199,49 @@ impl Store {
             )?;
             txn.pragma_update(None, "application_id", APPLICATION_ID)?;
             txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('initial_cash_cents',?)",
-                [initial_cash_cents.to_string()])?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('policy_version',?)", [POLICY_VERSION])?;
+            txn.execute("INSERT INTO v2_meta(key,value) VALUES('market_data_pack_id',?)", [MARKET_DATA_PACK_ID])?;
             txn.execute("INSERT INTO v2_meta(key,value) VALUES('calendar_snapshot_json',?)", [BUNDLED_CALENDAR_JSON])?;
             txn.execute("INSERT INTO v2_meta(key,value) VALUES('session_policy_snapshot_json',?)", [BUNDLED_SESSION_POLICY_JSON])?;
             txn.execute("INSERT INTO v2_meta(key,value) VALUES('instrument_snapshot_json',?)", [BUNDLED_INSTRUMENTS_JSON])?;
             txn.commit()?;
         }
-        Ok(Self { conn, initial_cash_cents })
+        Ok(Self { conn })
+    }
+
+    /// Explicit, immutable capital ownership; no implicit default experiment.
+    pub fn create_experiment(&mut self, spec: ExperimentSpec) -> StoreResult<Experiment> {
+        validate_experiment_spec(&spec)?;
+        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_market_context(&txn)?;
+        let existing: Option<String> = txn.query_row("SELECT spec_json FROM v2_experiments WHERE cycle_id=?", [&spec.cycle_id], |r| r.get(0)).optional()?;
+        if let Some(raw) = existing {
+            if serde_json::from_str::<ExperimentSpec>(&raw)? != spec {
+                return Err(StoreError::Conflict("experiment_identity_payload_conflict".into()));
+            }
+            return load_experiment(&txn, &spec.cycle_id);
+        }
+        let artifact: Option<String> = txn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0)).optional()?;
+        if let Some(raw) = artifact {
+            if serde_json::from_str::<StrategyArtifact>(&raw)? != spec.strategy {
+                return Err(StoreError::Conflict("strategy_artifact_identity_conflict".into()));
+            }
+        } else {
+            txn.execute("INSERT INTO v2_strategy_artifacts VALUES(?,?)", params![spec.strategy.strategy_version_id, serde_json::to_string(&spec.strategy)?])?;
+        }
+        txn.execute("INSERT INTO v2_experiments VALUES(?,?,'active')", params![spec.cycle_id, serde_json::to_string(&spec)?])?;
+        txn.commit()?;
+        Ok(Experiment { spec, status: ExperimentStatus::Active })
+    }
+
+    pub fn complete_experiment(&mut self, cycle_id: &str) -> StoreResult<Experiment> {
+        // The HTTP mutex serializes this verification and transition with submit.
+        // BEGIN IMMEDIATE also serializes against other SQLite connections.
+        let txn = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.verify_replay(cycle_id)?;
+        txn.execute("UPDATE v2_experiments SET status='completed' WHERE cycle_id=?", [cycle_id])?;
+        let result = load_experiment(&txn, cycle_id)?;
+        txn.commit()?;
+        Ok(result)
     }
 
     /// Immutable evidence, owned by the same single writer as the ledger.
@@ -248,6 +284,13 @@ impl Store {
     /// All mutations and idempotency checks occur under one IMMEDIATE transaction.
     pub fn submit(&mut self, request: SimulationRequest) -> StoreResult<RunRecord> {
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let experiment = load_experiment(&txn, &request.cycle_id)?;
+        if request.schema_version != 3 {
+            return Err(StoreError::Rules(RuleError("unsupported_contract_version".into())));
+        }
+        if request.strategy_version_id != experiment.spec.strategy.strategy_version_id {
+            return Err(StoreError::Conflict("experiment_strategy_mismatch".into()));
+        }
         let (calendar, sessions, instruments) = load_market_context(&txn)?;
         let prior: Option<(i64, String, String, String, String, String, String)> = txn.query_row(
             "SELECT id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version FROM v2_simulation_runs
@@ -267,12 +310,15 @@ impl Store {
             let evidence = serde_json::from_str(&raw_evidence)?;
             return Ok(RunRecord { id, request, evidence, calendar_version, session_policy_version, instrument_version, outcome, duplicate: true });
         }
+        if experiment.status != ExperimentStatus::Active {
+            return Err(StoreError::Conflict("experiment_completed".into()));
+        }
         // V2 is append-only. Out-of-order historical corrections require a
         // separate explicit rebase/import operation; never silently recalculate
         // past positions by appending a request with an earlier decision time.
         let previous_request: Option<String> = txn.query_row(
-            "SELECT request_json FROM v2_simulation_runs ORDER BY id DESC LIMIT 1",
-            [], |row| row.get(0),
+            "SELECT request_json FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id DESC LIMIT 1",
+            [&request.cycle_id], |row| row.get(0),
         ).optional()?;
         if let Some(raw) = previous_request {
             let previous: SimulationRequest = serde_json::from_str(&raw)?;
@@ -286,7 +332,7 @@ impl Store {
                 ));
             }
         }
-        let state = load_state(&txn, self.initial_cash_cents)?;
+        let state = load_state(&txn, &experiment.spec)?;
         let evidence = load_evidence(&txn, &request.quote_ref)?;
         if let Some(pinned) = &evidence { verify_instrument_identity(&instruments, pinned)?; }
         let outcome = decide(&state, &request, evidence.as_ref(), &calendar, &sessions, &instruments)?;
@@ -316,6 +362,10 @@ impl Store {
 }
 
 fn load_market_context(conn: &Connection) -> StoreResult<(TradingCalendar, SessionPolicy, InstrumentSnapshot)> {
+    let pack: String = conn.query_row("SELECT value FROM v2_meta WHERE key='market_data_pack_id'", [], |r| r.get(0))?;
+    if pack != MARKET_DATA_PACK_ID { return Err(StoreError::Integrity("unsupported_market_data_pack".into())); }
+    // This equality is the integrity check for this explicitly selected pack,
+    // not a schema version. See ADR-001 before adding another supported pack.
     let raw_calendar: String = conn.query_row(
         "SELECT value FROM v2_meta WHERE key='calendar_snapshot_json'", [], |r| r.get(0)
     )?;
@@ -368,10 +418,10 @@ fn verify_instrument_identity(snapshot: &InstrumentSnapshot, evidence: &QuoteEvi
     Ok(())
 }
 
-fn load_state(conn: &Connection, initial_cash: i64) -> StoreResult<PortfolioState> {
-    let mut state = PortfolioState::new(initial_cash);
-    let mut stmt = conn.prepare("SELECT fill_json FROM v2_fills ORDER BY id")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+fn load_state(conn: &Connection, experiment: &ExperimentSpec) -> StoreResult<PortfolioState> {
+    let mut state = PortfolioState::new(experiment.initial_cash_cents);
+    let mut stmt = conn.prepare("SELECT f.fill_json FROM v2_fills f JOIN v2_simulation_runs r ON r.id=f.run_id WHERE r.cycle_id=? ORDER BY f.id")?;
+    let rows = stmt.query_map([&experiment.cycle_id], |row| row.get::<_, String>(0))?;
     for row in rows {
         let fill: Fill = serde_json::from_str(&row?)?;
         state.apply(&fill)?;
@@ -384,3 +434,36 @@ fn load_state(conn: &Connection, initial_cash: i64) -> StoreResult<PortfolioStat
 mod query;
 #[cfg(test)]
 mod tests;
+
+fn validate_experiment_spec(spec: &ExperimentSpec) -> StoreResult<()> {
+    fn key(s: &str) -> bool { !s.is_empty() && s.len() <= 128 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c)) }
+    if spec.schema_version != 1 || !key(&spec.cycle_id) || !key(&spec.strategy.strategy_version_id)
+        || !key(&spec.strategy.research_input_id) || spec.initial_cash_cents <= 0 {
+        return Err(StoreError::Rules(RuleError("invalid_experiment_spec".into())));
+    }
+    if spec.execution_policy_version != POLICY_VERSION {
+        return Err(StoreError::Rules(RuleError("unsupported_execution_policy".into())));
+    }
+    if spec.market_data_pack_id != MARKET_DATA_PACK_ID {
+        return Err(StoreError::Rules(RuleError("unsupported_market_data_pack".into())));
+    }
+    Ok(())
+}
+
+fn load_experiment(conn: &Connection, cycle_id: &str) -> StoreResult<Experiment> {
+    let row: Option<(String, String)> = conn.query_row("SELECT spec_json,status FROM v2_experiments WHERE cycle_id=?", [cycle_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let (raw, status) = row.ok_or_else(|| StoreError::Rules(RuleError("experiment_not_found".into())))?;
+    let spec: ExperimentSpec = serde_json::from_str(&raw)?;
+    validate_experiment_spec(&spec)?;
+    if spec.cycle_id != cycle_id { return Err(StoreError::Integrity("experiment_identity_mismatch".into())); }
+    let raw_artifact: String = conn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0))?;
+    if serde_json::from_str::<StrategyArtifact>(&raw_artifact)? != spec.strategy {
+        return Err(StoreError::Integrity("experiment_artifact_mismatch".into()));
+    }
+    let status = match status.as_str() {
+        "active" => ExperimentStatus::Active,
+        "completed" => ExperimentStatus::Completed,
+        _ => return Err(StoreError::Integrity("invalid_experiment_status".into())),
+    };
+    Ok(Experiment { spec, status })
+}
