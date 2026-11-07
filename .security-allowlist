@@ -246,3 +246,9 @@ value:248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
 # （git ls-remote --tags origin 可核验），不是凭据；扫描器只对可达 commit 做
 # 自身对象豁免，tag 对象按裸长 hex 报出，故逐值登记。
 value:82d50ea08110edaa6d24ed9f2cd1e8d19919e4f1
+
+# docs/V1_RETIREMENT.md 记录的未合并 V1 分支归档 tag 对象 id：公开、远端可读
+# （与本地 annotated tag 逐字节一致，只由 tag 引用），不是凭据；扫描器只对
+# 可达 commit 做自身对象豁免，tag 对象按裸长 hex 报出，故逐值登记。
+value:961b53d17506448112302a07f6a7ec39641cf136
+value:5d4c58c38235b814b2f5cf81ac0d30cefb4a60fe
