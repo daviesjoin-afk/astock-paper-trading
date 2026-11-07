@@ -65,6 +65,9 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
+      - name: Build the read-only dashboard served by the preview server
+        working-directory: v2/web
+        run: npm run build
       - name: Browser interaction, race, failure and safety tests
         working-directory: v2/web
         env:
