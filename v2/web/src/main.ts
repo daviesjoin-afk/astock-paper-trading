@@ -9,6 +9,12 @@ type Run = {
   outcome: {status: string; reason: string};
 };
 
+const cycleId = new URLSearchParams(location.search).get("cycle_id")?.trim() ?? "";
+const scoped = (path: string): string => {
+  if (!cycleId) throw new Error("请在地址中指定实验，例如 ?cycle_id=experiment-A");
+  return path + "?cycle_id=" + encodeURIComponent(cycleId);
+};
+
 const find = (id: string): HTMLElement => {
   const node = document.getElementById(id);
   if (!node) throw new Error("missing DOM node " + id);
@@ -40,7 +46,7 @@ function renderRows(id: string, rows: Array<Array<string>>): void {
 async function refresh(): Promise<void> {
   try {
     const [portfolio, runs] = await Promise.all([
-      get<Portfolio>("/v2/portfolio"), get<Run[]>("/v2/simulations")
+      get<Portfolio>(scoped("/v2/portfolio")), get<Run[]>(scoped("/v2/simulations"))
     ]);
     find("cash").textContent = (portfolio.cash_cents / 100).toLocaleString("zh-CN", {
       style: "currency", currency: "CNY"
@@ -52,7 +58,7 @@ async function refresh(): Promise<void> {
       String(r.id), r.request.signal_id, r.request.signal.side,
       r.outcome.status, r.outcome.reason
     ]));
-    setStatus("已读取 V2 最新状态");
+    setStatus("已读取实验 " + cycleId + " 的状态");
   } catch (error) {
     setStatus(String(error), true);
   }
@@ -60,8 +66,9 @@ async function refresh(): Promise<void> {
 find("refresh").addEventListener("click", () => void refresh());
 find("replay").addEventListener("click", async () => {
   try {
-    const result = await get<{ok: boolean; runs_verified: number}>("/v2/replay");
+    const result = await get<{ok: boolean; runs_verified: number}>(scoped("/v2/replay"));
     setStatus(result.ok ? "回放校验通过：" + result.runs_verified + " 次决策" : "回放校验失败", !result.ok);
   } catch (error) { setStatus(String(error), true); }
 });
+find("experiment").textContent = cycleId || "未指定";
 void refresh();

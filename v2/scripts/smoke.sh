@@ -10,22 +10,25 @@ cleanup() {
   rm -f "$ASTOCK_V2_DB" "$ASTOCK_V2_DB-wal" "$ASTOCK_V2_DB-shm"
 }
 trap cleanup EXIT
-ready=0
-for _ in $(seq 1 90); do
-  if curl --fail --silent http://127.0.0.1:8765/v2/health > /dev/null; then
-    ready=1
-    break
-  fi
-  if ! kill -0 "$server_pid" 2>/dev/null; then
+wait_ready() {
+  ready=0
+  for _ in $(seq 1 90); do
+    if curl --fail --silent http://127.0.0.1:8765/v2/health > /dev/null; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      cat "${RUNNER_TEMP:-/tmp}/astock-v2-api.log"
+      exit 1
+    fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
     cat "${RUNNER_TEMP:-/tmp}/astock-v2-api.log"
     exit 1
   fi
-  sleep 1
-done
-if [ "$ready" -ne 1 ]; then
-  cat "${RUNNER_TEMP:-/tmp}/astock-v2-api.log"
-  exit 1
-fi
+}
+wait_ready
 
 curl --fail --silent -H 'Content-Type: application/json' \
   --data-binary @fixtures/quote.json http://127.0.0.1:8765/v2/quotes > /dev/null
@@ -346,4 +349,11 @@ print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
 python3 scripts/experiment_demo.py
+# Reopen the exact SQLite file in a new Rust process, then verify both frozen ledgers.
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+cargo run --locked --quiet >"${RUNNER_TEMP:-/tmp}/astock-v2-api.log" 2>&1 &
+server_pid=$!
+wait_ready
+python3 scripts/experiment_demo.py --verify-only
 echo "V2 HTTP/Python/Rust/SQLite end-to-end smoke passed"

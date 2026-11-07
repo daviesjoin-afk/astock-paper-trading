@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn failed_experiment_creation_and_completion_roll_back_without_touching_other_experiments() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let a = db.state("cycle-1", None).unwrap();
+    let mut b = spec("b", 5_000_000);
+    b.strategy.strategy_version_id = "strategy-v2".into();
+    db.conn.execute_batch("CREATE TRIGGER fail_create BEFORE INSERT ON v2_experiments BEGIN SELECT RAISE(ABORT,'create failure'); END;").unwrap();
+    assert!(db.create_experiment(b.clone()).is_err());
+    let artifacts: i64 = db.conn.query_row("SELECT count(*) FROM v2_strategy_artifacts WHERE strategy_version_id='strategy-v2'", [], |r| r.get(0)).unwrap();
+    assert_eq!(artifacts, 0);
+    db.conn.execute_batch("DROP TRIGGER fail_create;").unwrap();
+    db.create_experiment(b).unwrap();
+    let mut req = request("2026-10-30", "new-version-buy", Side::Buy);
+    req.cycle_id = "b".into();
+    req.strategy_version_id = "strategy-v2".into();
+    assert_eq!(ingest_and_submit(&mut db, req).outcome.status, DecisionStatus::Filled);
+    db.conn.execute_batch("CREATE TRIGGER fail_complete BEFORE UPDATE ON v2_experiments BEGIN SELECT RAISE(ABORT,'complete failure'); END;").unwrap();
+    assert!(db.complete_experiment("b").is_err());
+    assert_eq!(db.experiment("b").unwrap().status, ExperimentStatus::Active);
+    db.conn.execute_batch("DROP TRIGGER fail_complete;").unwrap();
+    assert_eq!(db.complete_experiment("b").unwrap().status, ExperimentStatus::Completed);
+    assert_eq!(db.state("cycle-1", None).unwrap(), a);
+    assert_eq!(db.experiment("cycle-1").unwrap().status, ExperimentStatus::Active);
+}
+
+#[test]
+fn completed_missing_evidence_stays_missing_after_another_experiment_ingests_it() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_experiment(spec("b", INITIAL_CASH_CENTS)).unwrap();
+    let req = request("2026-10-30", "missing-at-a", Side::Buy);
+    let missing = db.submit(req.clone()).unwrap();
+    assert_eq!(missing.outcome.reason, "quote_evidence_missing");
+    db.complete_experiment("cycle-1").unwrap();
+    let old = db.state("cycle-1", None).unwrap();
+    db.ingest_quote(evidence(&req)).unwrap();
+    let mut b = req.clone(); b.cycle_id = "b".into();
+    assert_eq!(db.submit(b).unwrap().outcome.status, DecisionStatus::Filled);
+    let retry = db.submit(req).unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(retry.evidence, None);
+    assert_eq!(retry.outcome, missing.outcome);
+    assert_eq!(db.state("cycle-1", None).unwrap(), old);
+    assert_eq!(db.verify_replay("cycle-1").unwrap().fills_verified, 0);
+    assert_eq!(db.verify_replay("b").unwrap().fills_verified, 1);
+}
+
+
+#[test]
 fn experiments_isolate_cash_t1_history_counts_time_order_and_reopen() {
     let file = DiskDatabase::new();
     let a_history;
@@ -1188,8 +1235,8 @@ fn rejected_partial_v2_identity_is_untouched() {
 }
 
 #[test]
-fn current_v2_with_foreign_schema_is_untouched() {
-    for foreign in [true] {
+fn current_v2_with_foreign_schema_or_previous_schema_version_is_untouched() {
+    for foreign in [false, true] {
         let file = DiskDatabase::new();
         {
             let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
@@ -1200,12 +1247,13 @@ fn current_v2_with_foreign_schema_is_untouched() {
             conn.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
             if foreign {
                 conn.execute_batch("CREATE TABLE unexpected(payload TEXT); INSERT INTO unexpected VALUES('keep');").unwrap();
+            } else {
+                conn.pragma_update(None, "user_version", 5).unwrap();
             }
         }
         let before = disk_snapshot(&file);
         for _ in 0..2 {
-            let cash = INITIAL_CASH_CENTS + if foreign { 0 } else { 1 };
-            assert!(test_open(file.path(), cash).is_err());
+            assert!(Store::open(file.path()).is_err());
             assert_eq!(disk_snapshot(&file), before);
         }
     }
