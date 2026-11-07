@@ -221,3 +221,23 @@ value:7b1f0d7960de538c45cc1a0286575379d794906321dc9e642688e78b23e77fb2
 value:c7e53bf71664d933d19439186aeae5df9330cc5287365272659023e4a66464bd
 # v2/data/instruments-offline-v2.json
 value:7c9a0aae27a6f4f8b12bfc50cd86cc7724dcbe26518b067a1560928b1bdd1c64
+
+# ADR 003（PR #356）可复现研究的内容身份摘要：公开的文件/源码/参数 SHA-256，
+# 由 v2/research/research_contract.py 生成、v2/src/domain/digest.rs 从仓库字节重算，
+# research/test_research_reproducibility.py 在 CI 内逐字节核对。不是凭据。
+# 逐值登记的原因：扫描器的 \bdigest\b 上下文启发式匹配不到 `content_digest`
+# 这类下划线键名，因此按既有惯例精确放行，不做路径级或规则级豁免。
+# research_input_digest（v2/data/research-input-offline-v1.json 内容摘要）
+value:beca60bbe45de282cf1c3a7f3a3b20f981fab56ad6104e701d376222da145fdf
+# research-momentum-v1: source_digest / parameters_digest / research_output_digest
+value:0575ebd0bffb093c7598b2227759d24a509bd53b96c76f84ea601233184849c4
+value:9cf61d6ba01c3eee4e07a560e652c86134cac29f42502d26c0bfd97907c0364a
+value:de2e06b066157886c92bec7cb48725a0326af17b2df447212204697fa5acc92e
+# research-reversion-v1: source_digest / parameters_digest / research_output_digest
+value:aed1a0cae609952e6004153597ff8d3af46747a9ef76b54434aa5832d2f76e25
+value:afd38458954950fe449ffefac668ffde7fd27284d4dfca303e6ecba8f9272bfe
+value:9fd0f857019280e7ec05c8852bb7eac11bcc5bb7b3d66b270847cc58c7c0375d
+# FIPS 180-4 公开测试向量（"" / "abc" / 448-bit 消息），用于 domain/digest.rs 自检。
+value:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+value:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+value:248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
