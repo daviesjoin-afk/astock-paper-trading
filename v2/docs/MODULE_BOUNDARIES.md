@@ -41,3 +41,7 @@
 ## 独立实验（ADR 001）
 
 cycle_id 是唯一资金归属，不是调度周期。创建后固定初始资金、策略研究身份、数据包和执行规则，完成后拒绝新决策。写入、时间顺序、状态重建、历史查询、计数与回放全部按实验隔离。SQLite schema 6、信号契约 3；规则版本保持 6。当前只开放 cn-offline-fixture-pack-1，多个受审核数据包的登记扩展边界见 [ADR 001](ADR-001-EXPERIMENT-OWNERSHIP.md)。
+
+## 独立数据包（ADR 002）
+
+Store 仍唯一登记固定清单及写入证据；query 按实验固定的包读取和校验。contract 定义不可变清单/完整上下文及显式带包的报价身份；calendar/instrument/execution 只消费传入快照。schema 7 一次增加包表、实验清单引用及证据 pack_id 主键；执行策略仍为 6。只允许明确审核的两个 offline_fixture 包，不提供任意上传。后续包增加记录和审核定义，不改变交易表。详见 [ADR 002](ADR-002-MARKET-DATA-PACKS.md)，其版本说明取代上文之前阶段的单包限制。

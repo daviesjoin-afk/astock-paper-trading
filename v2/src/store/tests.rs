@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn tampering_evidence_pack_identity_is_rejected_on_retry_and_replay() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let req = request("2026-10-30", "identity-corruption", Side::Buy);
+    ingest_and_submit(&mut db, req.clone());
+    db.conn.execute("UPDATE v2_quote_evidence SET evidence_json=json_set(evidence_json,'$.market_data_pack_id','cn-offline-fixture-pack-2')", []).unwrap();
+    assert!(db.submit(req.clone()).is_err());
+    assert!(db.verify_replay("cycle-1").is_err());
+    db.conn.execute("UPDATE v2_simulation_runs SET evidence_json=json_set(evidence_json,'$.market_data_pack_id','cn-offline-fixture-pack-2')", []).unwrap();
+    assert!(db.submit(req).is_err());
+    assert!(db.verify_replay("cycle-1").is_err());
+}
+
+
+#[test]
 fn two_packs_keep_equal_external_ids_independent_after_completion_and_restart() {
     let file = DiskDatabase::new();
     let a_req = request("2026-10-30", "external-shared", Side::Buy);
@@ -25,6 +39,11 @@ fn two_packs_keep_equal_external_ids_independent_after_completion_and_restart() 
         input.quote.price_cents = 2000;
         input.execution.as_mut().unwrap().price_cents = 2000;
         let b_evidence = db.ingest_quote(input.clone()).unwrap();
+        db.conn.execute_batch("CREATE TRIGGER fail_b_fill BEFORE INSERT ON v2_fills BEGIN SELECT RAISE(ABORT,'B fill rollback'); END;").unwrap();
+        assert!(db.submit(b_req.clone()).is_err());
+        assert_eq!(db.state("pack-b", None).unwrap().runs_total, 0);
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), a_replay);
+        db.conn.execute_batch("DROP TRIGGER fail_b_fill;").unwrap();
         let second = db.submit(b_req.clone()).unwrap();
         assert_eq!(second.outcome.fill.as_ref().unwrap().quantity, 400);
         assert_eq!(second.outcome.fill.as_ref().unwrap().price_cents, 2000);

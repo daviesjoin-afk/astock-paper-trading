@@ -217,8 +217,6 @@ impl Store {
     pub fn create_experiment(&mut self, spec: ExperimentSpec) -> StoreResult<Experiment> {
         validate_experiment_spec(&spec)?;
         let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let pack = reviewed_market_pack(&spec.market_data_pack_id)?;
-        register_pack(&txn, &pack)?;
         let existing: Option<String> = txn.query_row("SELECT spec_json FROM v2_experiments WHERE cycle_id=?", [&spec.cycle_id], |r| r.get(0)).optional()?;
         if let Some(raw) = existing {
             if serde_json::from_str::<ExperimentSpec>(&raw)? != spec {
@@ -226,6 +224,8 @@ impl Store {
             }
             return load_experiment(&txn, &spec.cycle_id);
         }
+        let pack = reviewed_market_pack(&spec.market_data_pack_id)?;
+        register_pack(&txn, &pack)?;
         let artifact: Option<String> = txn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0)).optional()?;
         if let Some(raw) = artifact {
             if serde_json::from_str::<StrategyArtifact>(&raw)? != spec.strategy {
@@ -327,7 +327,17 @@ impl Store {
                 ));
             }
             let outcome = serde_json::from_str(&raw_outcome)?;
-            let evidence = serde_json::from_str(&raw_evidence)?;
+            let evidence: Option<QuoteEvidence> = serde_json::from_str(&raw_evidence)?;
+            if let Some(pinned) = &evidence {
+                if pinned.market_data_pack_id != request.quote_ref.market_data_pack_id
+                    || pinned.quote.source != request.quote_ref.source || pinned.quote.quote_id != request.quote_ref.quote_id {
+                    return Err(StoreError::Integrity("stored_evidence_identity_mismatch".into()));
+                }
+                verify_instrument_identity(&instruments, pinned)?;
+                if load_evidence(&txn, &request.quote_ref)?.as_ref() != Some(pinned) {
+                    return Err(StoreError::Integrity("stored_evidence_payload_mismatch".into()));
+                }
+            }
             return Ok(RunRecord { id, request, evidence, calendar_version, session_policy_version, instrument_version, outcome, duplicate: true });
         }
         if experiment.status != ExperimentStatus::Active {

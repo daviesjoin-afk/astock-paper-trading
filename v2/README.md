@@ -17,7 +17,7 @@ module, schema, task, broker or runtime database is imported or reused.
 - Local-only Rust HTTP API, Python standard-library offline research signal
   producer, TypeScript/Vite read-only dashboard.
 - Separate V2 CI pipeline; no V1 test suite dependency.
-- Immutable offline quote evidence, explicitly referenced by contract v3;
+- Immutable offline quote evidence, explicitly referenced by contract v4;
   decisions pin both evidence availability and missing-evidence rejections.
   See [the evidence contract](docs/QUOTE_EVIDENCE.md).
 - Store records actual receipt separately from the fixture's declared times,
@@ -81,7 +81,7 @@ From repository root:
 ```bash
 cd v2
 cargo test --locked
-export ASTOCK_V2_DB=./v2-experiments.sqlite3
+export ASTOCK_V2_DB=./v2-market-packs.sqlite3
 cargo run --locked
 ```
 
@@ -89,11 +89,11 @@ In another terminal, from repository root:
 
 ```bash
 # Creates experiments A/B, emits Python signals, runs Rust decisions, reads and replays each ledger.
-python3 v2/scripts/experiment_demo.py
-curl -s 'http://127.0.0.1:8765/v2/portfolio?cycle_id=experiment-A'
-curl -s 'http://127.0.0.1:8765/v2/replay?cycle_id=experiment-B'
+python3 v2/scripts/market_pack_demo.py
+curl -s 'http://127.0.0.1:8765/v2/portfolio?cycle_id=pack-experiment-A'
+curl -s 'http://127.0.0.1:8765/v2/replay?cycle_id=pack-experiment-B'
 # After restarting the Rust service against the same file:
-python3 v2/scripts/experiment_demo.py --verify-only
+python3 v2/scripts/market_pack_demo.py --verify-only
 python3 -m unittest discover -s v2/research -p 'test_*.py' -v
 ```
 
@@ -105,19 +105,21 @@ npm ci
 npm run dev
 ```
 
-Open http://127.0.0.1:5174/?cycle_id=experiment-A (or experiment-B). The dev server proxies `/v2` to the Rust API.
+Open http://127.0.0.1:5174/?cycle_id=pack-experiment-A (or pack-experiment-B). The dev server proxies `/v2` to the Rust API.
 The read-only V2 UI never touches a V1 endpoint.
 
 ## State and data boundaries
 
-- Default data file is `v2/v2-experiments.sqlite3` if run from `v2/`.
+- Default data file is `v2/v2-market-packs.sqlite3` if run from `v2/`.
   Set `ASTOCK_V2_DB` to select an isolated path, **never** a V1 path.
 - Experiments must be explicitly created with positive initial cash through
   POST /v2/experiments. There is no global cash setting or automatic experiment.
   The old ASTOCK_V2_INITIAL_CASH_CENTS environment variable explicitly fails startup.
-- SQLite schema 6 adds experiment ownership. Earlier database files are refused
-  before writes; this one-time ownership change does not imply future data updates
-  require new schemas. See [ADR 001](docs/ADR-001-EXPERIMENT-OWNERSHIP.md).
+- SQLite schema 7 adds per-pack immutable context storage and evidence identity.
+  Schema 6 and earlier files are refused before writes; keep those files with the
+  original binary. There is no automatic migration. Subsequent reviewed pack
+  registrations add rows without changing trade tables.
+  See [ADR 002](docs/ADR-002-MARKET-DATA-PACKS.md).
 - Idempotency identity is
   `(cycle_id, strategy_version_id, signal_id)`; same payload returns the
   original result, changed payload fails 409, without a second fill.
@@ -127,7 +129,11 @@ The read-only V2 UI never touches a V1 endpoint.
   T+1, monotonic decision time, decision counts, historical views and replay are
   scoped to it. Identical evidence can be used by independent counterfactual experiments.
 - Creation pins a StrategyArtifact (strategy version + immutable research input ID),
-  cn-offline-fixture-pack-1 and v2-paper-policy-6. Unknown rules/packs fail explicitly.
+  either cn-offline-fixture-pack-1 or cn-offline-fixture-pack-2, plus
+  v2-paper-policy-6. Unknown rules/packs fail explicitly. The two pack manifests,
+  sources, coverage and snapshot SHA256 summaries live in data/market-pack-*.json.
+  GET /v2/market-data-packs/{pack_id} reads the installed fixed inputs; there is
+  no HTTP pack registration or upload route.
   Same experiment ID with different parameters or strategy ID with different research
   input returns 409. GET /v2/experiments/{cycle_id} reads these references.
 - POST /v2/experiments/{cycle_id}/complete verifies the ledger then freezes new
@@ -135,27 +141,43 @@ The read-only V2 UI never touches a V1 endpoint.
 - Portfolio, simulations GET and replay require ?cycle_id=...; no whole-store fallback.
 - Transactional writes are owned by Rust. The Python worker emits a proposal,
   not an order quantity, not a fill, not an activation decision.
-- Contract v3 retains inline `quote` with `quote_ref` (source + quote ID).
+- Contract v4 rejects inline `quote` and requires explicit quote_ref (pack ID + source + quote ID).
+  QuoteImport schema 2 and QuoteEvidence schema 5 carry the pack ID; nested
+  execution evidence schema 2 must match it. Cross-pack references are rejected.
   Evidence is ingested separately using `POST /v2/quotes`. An identical retry
   succeeds; a changed payload under the same evidence identity returns 409.
   Missing evidence or availability after the decision produces a saved rejection.
-- Policy `v2-paper-policy-6` / SQLite schema version 6 requires a **fresh V2 database**. Existing older
+- Policy `v2-paper-policy-6` / SQLite schema version 7 requires a **fresh V2 database**. Existing older
   databases are refused before schema additions; no automatic migration or
   reinterpretation of earlier fills is provided. Keep old files separately.
-- Once recorded, decisions are replayed in ledger insertion order. Contract v3
+- Once recorded, decisions are replayed in ledger insertion order. Contract v4
   does not yet support historical out-of-order correction or cancellation:
   consumers must submit decision times monotonically within each experiment.
 
 ## Current extension boundary
 
-The implemented chain is independent offline experiments. The single reviewed fixture
-pack keeps the prior exact-content checks for its snapshots; arbitrary pack ingestion
-and multiple simultaneously installed packs are not implemented. ADR 001 separates
-the future pack registry, execution policy dispatch and SQLite schema ownership.
-New securities/data should add verified versions, not force structural migrations.
+Experiments independently select one of two explicitly reviewed offline_fixture
+contexts. Pack 1 retains the original 2026-10-27 through 2026-11-05 identity
+coverage. Pack 2 narrows the test identity coverage to 2026-10-30 through 2026-11-05
+and uses a distinct snapshot version. This restriction is synthetic, not a newly
+certified security listing/tradability history.
 
-The next step is explicit verified pack registration and immutable research inputs,
-not V1 scheduling, strategy evolution, news learning or compatibility interfaces.
+The immutable manifest and stored snapshots are compared with the exact reviewed
+definition for their own pack ID. Old definitions must remain supported to open
+and replay old experiments; unsupported/missing/altered definitions fail explicitly.
+No current/latest pack substitution is used. SHA256 manifest/file consistency is
+verified by the Python contract CI; Rust additionally compares the entire persisted
+typed manifest and snapshots to the selected reviewed definition, avoiding a new
+crypto dependency.
+
+The summary hashes cover fixed snapshot bytes. Offline quote evidence can be
+appended to a pack namespace, but an existing identity cannot change; each
+experiment pins the exact evidence used by every decision, including missing
+evidence. Completing A before registering B or importing B evidence cannot change
+A's replay. This is not arbitrary data-package upload or provider authentication.
+
+Verifiable StrategyArtifact content and experiment comparison are separate future
+work. There is no dynamic plugin, V1 scheduler, strategy evolution or news learning.
 
 `V1` continues to run independently and must not be reconfigured, migrated,
 or connected to the new V2 database by this PR.
