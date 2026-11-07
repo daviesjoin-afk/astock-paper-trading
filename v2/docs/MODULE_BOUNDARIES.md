@@ -4,12 +4,12 @@
 
 | 模块 | 唯一职责 | 可依赖 | 禁止 |
 | --- | --- | --- | --- |
-| `src/domain/contract.rs` | 强类型请求、报价证据及引用、成交、规则版本 | serde、标准库 | IO、SQLite、HTTP、V1 |
+| `src/domain/contract.rs` | 强类型实验/策略身份、请求、报价证据及引用、成交、规则版本 | serde、标准库 | IO、SQLite、HTTP、V1 |
 | `src/domain/portfolio.rs` | 现金/持仓 lot、T+1 状态转移 | contract | IO、SQLite、HTTP、V1 |
 | `src/domain/calendar.rs` | 固定日历版本下日期是否计划开市、覆盖范围与来源 | contract、chrono、serde、标准库 | IO、系统时钟、网络、成交数量、V1 |
 | `src/domain/instrument.rs` | 固定离线证券身份及适用日期下受支持的数量规则 | contract、chrono、serde、标准库 | IO、时钟、网络、价格、持仓、V1 |
 | `src/domain/execution.rs` | 精确时段策略、资格与证据有效性、决策、手续费 | contract、calendar、instrument、portfolio、chrono | IO、SQLite、HTTP、V1 |
-| `src/store/mod.rs` | 单 SQLite 写入口、schema、原子提交、幂等 | domain、rusqlite | HTTP、Python、V1 schema |
+| `src/store/mod.rs` | 单 SQLite 写入口、实验初始资金及固定引用、schema、原子提交、幂等 | domain、rusqlite | HTTP、Python、V1 schema |
 | `src/store/query.rs` | 只读投影、历史回放 | store、domain | SQL 写入、提交 |
 | `src/main.rs` | localhost HTTP 路由、请求响应转换 | store、domain、axum | 交易规则复制、直接 SQL |
 | `research/worker.py` | 产出可复现的研究信号 | Python 标准库和 API 契约 | 下单数量、账本直写、旧框架 import |
@@ -37,3 +37,7 @@
 ## 进一步拆分的门槛
 
 只有出现以下可证明原因才拆新模块或 crate：独立业务事实所有权、可观察的循环依赖、不同的持久化事务生命周期、跨进程安全边界、独立可复用 API。出现单纯的大文件或行数增长，不自动触发拆分；优先审查函数是否承载了多种不同业务职责。
+
+## 独立实验（ADR 001）
+
+cycle_id 是唯一资金归属，不是调度周期。创建后固定初始资金、策略研究身份、数据包和执行规则，完成后拒绝新决策。写入、时间顺序、状态重建、历史查询、计数与回放全部按实验隔离。SQLite schema 6、信号契约 3；规则版本保持 6。当前只开放 cn-offline-fixture-pack-1，多个受审核数据包的登记扩展边界见 [ADR 001](ADR-001-EXPERIMENT-OWNERSHIP.md)。

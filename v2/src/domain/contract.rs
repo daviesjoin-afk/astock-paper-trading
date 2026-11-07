@@ -11,6 +11,37 @@ pub const MIN_COMMISSION_CENTS: i64 = 500;
 pub const SELL_STAMP_DUTY_BPS: i64 = 5;
 pub const MAX_QUOTE_AGE_SECONDS: i64 = 180;
 pub const POLICY_VERSION: &str = "v2-paper-policy-6";
+pub const MARKET_DATA_PACK_ID: &str = "cn-offline-fixture-pack-1";
+
+/// Research-owned immutable identity, not permission to mutate a ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrategyArtifact {
+    pub strategy_version_id: String,
+    pub research_input_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentSpec {
+    pub schema_version: u32,
+    /// The sole experiment/capital owner, not a scheduler cycle.
+    pub cycle_id: String,
+    pub initial_cash_cents: i64,
+    pub strategy: StrategyArtifact,
+    pub market_data_pack_id: String,
+    pub execution_policy_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentStatus { Active, Completed }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Experiment {
+    pub spec: ExperimentSpec,
+    pub status: ExperimentStatus,
+}
 
 #[derive(Debug)]
 pub struct RuleError(pub String);

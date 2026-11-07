@@ -17,7 +17,7 @@ module, schema, task, broker or runtime database is imported or reused.
 - Local-only Rust HTTP API, Python standard-library offline research signal
   producer, TypeScript/Vite read-only dashboard.
 - Separate V2 CI pipeline; no V1 test suite dependency.
-- Immutable offline quote evidence, explicitly referenced by contract v2;
+- Immutable offline quote evidence, explicitly referenced by contract v3;
   decisions pin both evidence availability and missing-evidence rejections.
   See [the evidence contract](docs/QUOTE_EVIDENCE.md).
 - Store records actual receipt separately from the fixture's declared times,
@@ -81,19 +81,19 @@ From repository root:
 ```bash
 cd v2
 cargo test --locked
-export ASTOCK_V2_DB=./v2-instrument-paper.sqlite3
+export ASTOCK_V2_DB=./v2-experiments.sqlite3
 cargo run --locked
 ```
 
 In another terminal, from repository root:
 
 ```bash
-curl --fail -H 'Content-Type: application/json' \
-  --data-binary @v2/fixtures/quote.json http://127.0.0.1:8765/v2/quotes
-python3 v2/research/worker.py --output /tmp/v2-signal.json
-python3 v2/research/worker.py --output /tmp/v2-signal.json --send
-curl -s http://127.0.0.1:8765/v2/portfolio
-curl -s http://127.0.0.1:8765/v2/replay
+# Creates experiments A/B, emits Python signals, runs Rust decisions, reads and replays each ledger.
+python3 v2/scripts/experiment_demo.py
+curl -s 'http://127.0.0.1:8765/v2/portfolio?cycle_id=experiment-A'
+curl -s 'http://127.0.0.1:8765/v2/replay?cycle_id=experiment-B'
+# After restarting the Rust service against the same file:
+python3 v2/scripts/experiment_demo.py --verify-only
 python3 -m unittest discover -s v2/research -p 'test_*.py' -v
 ```
 
@@ -105,50 +105,57 @@ npm ci
 npm run dev
 ```
 
-Open http://127.0.0.1:5174. The dev server proxies `/v2` to the Rust API.
+Open http://127.0.0.1:5174/?cycle_id=experiment-A (or experiment-B). The dev server proxies `/v2` to the Rust API.
 The read-only V2 UI never touches a V1 endpoint.
 
 ## State and data boundaries
 
-- Default data file is `v2/v2-instrument-paper.sqlite3` if run from `v2/`.
+- Default data file is `v2/v2-experiments.sqlite3` if run from `v2/`.
   Set `ASTOCK_V2_DB` to select an isolated path, **never** a V1 path.
-- Default seed cash is CNY 100,000 (10,000,000 cents). Override only for a
-  *new database* with `ASTOCK_V2_INITIAL_CASH_CENTS`.
-- Database startup refuses known V1 schema names and existing seed-cash
-  / policy mismatches. Back up before migrating schema versions.
+- Experiments must be explicitly created with positive initial cash through
+  POST /v2/experiments. There is no global cash setting or automatic experiment.
+  The old ASTOCK_V2_INITIAL_CASH_CENTS environment variable explicitly fails startup.
+- SQLite schema 6 adds experiment ownership. Earlier database files are refused
+  before writes; this one-time ownership change does not imply future data updates
+  require new schemas. See [ADR 001](docs/ADR-001-EXPERIMENT-OWNERSHIP.md).
 - Idempotency identity is
   `(cycle_id, strategy_version_id, signal_id)`; same payload returns the
   original result, changed payload fails 409, without a second fill.
 - Money and quantities are integers. Store and replay make decisions against
   recorded inputs, not current time or later quotes.
-- A cycle in this first MVP is an explicit identity namespace rather than an
-  independently funded portfolio. All accepted events share **one**
-  demonstration portfolio; multi-account capital and strategy risk allocation
-  are not implemented yet.
+- cycle_id is the unique independently funded experiment identity. Cash, positions,
+  T+1, monotonic decision time, decision counts, historical views and replay are
+  scoped to it. Identical evidence can be used by independent counterfactual experiments.
+- Creation pins a StrategyArtifact (strategy version + immutable research input ID),
+  cn-offline-fixture-pack-1 and v2-paper-policy-6. Unknown rules/packs fail explicitly.
+  Same experiment ID with different parameters or strategy ID with different research
+  input returns 409. GET /v2/experiments/{cycle_id} reads these references.
+- POST /v2/experiments/{cycle_id}/complete verifies the ledger then freezes new
+  submissions. Exact retries remain idempotent; it cannot be reactivated.
+- Portfolio, simulations GET and replay require ?cycle_id=...; no whole-store fallback.
 - Transactional writes are owned by Rust. The Python worker emits a proposal,
   not an order quantity, not a fill, not an activation decision.
-- Contract v2 replaces inline `quote` with `quote_ref` (source + quote ID).
+- Contract v3 retains inline `quote` with `quote_ref` (source + quote ID).
   Evidence is ingested separately using `POST /v2/quotes`. An identical retry
   succeeds; a changed payload under the same evidence identity returns 409.
   Missing evidence or availability after the decision produces a saved rejection.
-- Policy `v2-paper-policy-6` / SQLite schema version 5 requires a **fresh V2 database**. Existing older
+- Policy `v2-paper-policy-6` / SQLite schema version 6 requires a **fresh V2 database**. Existing older
   databases are refused before schema additions; no automatic migration or
   reinterpretation of earlier fills is provided. Keep old files separately.
-- Once recorded, decisions are replayed in ledger insertion order. Contract v2
+- Once recorded, decisions are replayed in ledger insertion order. Contract v3
   does not yet support historical out-of-order correction or cancellation:
-  consumers must submit decision times monotonically.
+  consumers must submit decision times monotonically within each experiment.
 
-## V2 roadmap (not claimed implemented)
+## Current extension boundary
 
-1. **V2-1:** finished minimal kernel; validate CI, real HTTP E2E and coverage.
-2. **V2-2:** trusted point-in-time data ingress; exchange calendars, board-
-   specific limits, fees, fills, liquidity and price-source attestations.
-3. **V2-3:** separate account/cycle ledger, order lifecycle and rigorous
-   versioned strategy model plus command authorization.
-4. **V2-4:** immutable research dataset + experiment IDs + walk-forward /
-   leakage checks; deterministic promotion and explicit strategy approvals.
-5. **V2-5:** scenario replay/shadow comparison against V1 snapshots (read-only);
-   signed V2 import and standalone repo extraction only after verification.
+The implemented chain is independent offline experiments. The single reviewed fixture
+pack keeps the prior exact-content checks for its snapshots; arbitrary pack ingestion
+and multiple simultaneously installed packs are not implemented. ADR 001 separates
+the future pack registry, execution policy dispatch and SQLite schema ownership.
+New securities/data should add verified versions, not force structural migrations.
+
+The next step is explicit verified pack registration and immutable research inputs,
+not V1 scheduling, strategy evolution, news learning or compatibility interfaces.
 
 `V1` continues to run independently and must not be reconfigured, migrated,
 or connected to the new V2 database by this PR.

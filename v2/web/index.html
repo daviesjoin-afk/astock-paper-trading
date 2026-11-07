@@ -21,6 +21,7 @@
       table { width: 100%; border-collapse: collapse; min-width: 560px; }
       th, td { padding: 12px; border-bottom: 1px solid #344155; text-align: left; }
       .muted { color: #9bb0cc; } .error { color: #eaa4a4; }
+      #experiment, #status { overflow-wrap: anywhere; }
     </style>
   </head>
   <body>
@@ -30,6 +31,7 @@
         <div class="pill">PAPER ONLY · LOCALHOST</div>
       </header>
       <p>Rust 为唯一交易事实写入者；Python 仅生成研究信号；本页面只读。没有券商下单入口。</p>
+      <p>当前实验：<strong id="experiment">—</strong></p>
       <div class="cards">
         <div class="card"><span class="muted">现金</span><strong id="cash">—</strong></div>
         <div class="card"><span class="muted">持仓标的</span><strong id="positions-count">—</strong></div>

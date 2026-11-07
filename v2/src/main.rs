@@ -1,7 +1,7 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{QuoteImport, SimulationRequest, INITIAL_CASH_CENTS}, store::{Store, StoreError}};
+use astock_v2::{domain::{QuoteImport, SimulationRequest, ExperimentSpec}, store::{Store, StoreError}};
 use axum::{
-    extract::{Query, State}, http::StatusCode,
+    extract::{Path, Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
 };
 use serde::Deserialize;
@@ -56,6 +56,7 @@ async fn ingest_quote(
 
 #[derive(Deserialize)]
 struct PortfolioQuery {
+    cycle_id: String,
     asof_day: Option<String>,
 }
 
@@ -63,29 +64,42 @@ async fn portfolio(
     State(state): State<Shared>, Query(query): Query<PortfolioQuery>,
 ) -> ApiResult {
     let db = state.lock().await;
-    response(db.state(query.asof_day.as_deref()).map_err(api_error)?)
+    response(db.state(&query.cycle_id, query.asof_day.as_deref()).map_err(api_error)?)
 }
 
-async fn runs(State(state): State<Shared>) -> ApiResult {
+async fn runs(State(state): State<Shared>, Query(query): Query<PortfolioQuery>) -> ApiResult {
     let db = state.lock().await;
-    response(db.runs(100).map_err(api_error)?)
+    response(db.runs(&query.cycle_id, 100).map_err(api_error)?)
 }
 
-async fn replay(State(state): State<Shared>) -> ApiResult {
+async fn replay(State(state): State<Shared>, Query(query): Query<PortfolioQuery>) -> ApiResult {
     let db = state.lock().await;
-    response(db.verify_replay().map_err(api_error)?)
+    response(db.verify_replay(&query.cycle_id).map_err(api_error)?)
+}
+
+async fn create_experiment(State(state): State<Shared>, Json(spec): Json<ExperimentSpec>) -> ApiResult {
+    response(state.lock().await.create_experiment(spec).map_err(api_error)?)
+}
+async fn experiment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    response(state.lock().await.experiment(&id).map_err(api_error)?)
+}
+async fn complete_experiment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    response(state.lock().await.complete_experiment(&id).map_err(api_error)?)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-instrument-paper.sqlite3".into());
-    let initial = env::var("ASTOCK_V2_INITIAL_CASH_CENTS")
-        .ok().map(|x| x.parse::<i64>()).transpose()?
-        .unwrap_or(INITIAL_CASH_CENTS);
-    let db = Arc::new(Mutex::new(Store::open(&db_path, initial)?));
+    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-experiments.sqlite3".into());
+    if env::var_os("ASTOCK_V2_INITIAL_CASH_CENTS").is_some() {
+        return Err("global initial cash is unsupported; create an experiment explicitly".into());
+    }
+    let db = Arc::new(Mutex::new(Store::open(&db_path)?));
     // Always local-only. No network exposure, broker or real-money endpoints.
     let app = Router::new()
         .route("/v2/health", get(health))
+        .route("/v2/experiments", post(create_experiment))
+        .route("/v2/experiments/{cycle_id}", get(experiment))
+        .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))
         .route("/v2/quotes", post(ingest_quote))
         .route("/v2/simulations", post(submit).get(runs))
         .route("/v2/portfolio", get(portfolio))
