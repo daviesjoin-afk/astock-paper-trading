@@ -900,6 +900,16 @@ td:first-child { font-weight: 550; }
   font-size: 11.5px; color: var(--muted);
 }
 
+/* ---------- account overview ---------- */
+.account-overview { display: grid; gap: 6px; margin: 10px 20px 0; }
+.account-overview-row {
+  text-align: left; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface); color: var(--text); padding: 8px 12px;
+  font-size: 11.5px; cursor: pointer;
+}
+.account-overview-row:hover { border-color: var(--accent); }
+.account-overview-row[data-state="active"] { border-color: var(--accent); background: var(--surface-2); }
+
 /* ---------- allocation proposal ---------- */
 .account-allocation { padding: 4px 20px 8px; }
 .account-allocation h4 { margin: 6px 0; font-size: 13px; }

@@ -205,6 +205,38 @@ pub struct PerformanceReport {
     pub digest: String,
 }
 
+/// Session counts for one account, by lifecycle status.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCounts {
+    pub created: i64,
+    pub running: i64,
+    pub paused: i64,
+    pub completed: i64,
+    pub stopped: i64,
+}
+
+/// Compact slot facts for the multi-account overview.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSlotOverview {
+    pub slot: String,
+    pub weight_bps: i64,
+    pub budget_cents: i64,
+    pub cash_cents: i64,
+}
+
+/// One row of the account overview: money, sessions and audit health.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountOverview {
+    pub account_id: String,
+    pub initial_cash_cents: i64,
+    pub cash_cents: i64,
+    pub reserve_cents: i64,
+    pub created_at: String,
+    pub slots: Vec<AccountSlotOverview>,
+    pub sessions: SessionCounts,
+    pub audit_ok: bool,
+}
+
 /// One page of the evolution event log, newest first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionEventPage {

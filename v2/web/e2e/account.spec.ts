@@ -204,6 +204,39 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("status-evolution")).toContainText("research-momentum-v1-ab12cd34");
   });
 
+  test("lists every account and switches on click", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/overview$/, (route) => route.fulfill({
+      json: [
+        {
+          account_id: "e2e-account", initial_cash_cents: 10_000_000, cash_cents: 9_600_000,
+          reserve_cents: 1_000_000, created_at: "2026-11-08T09:00:00+08:00",
+          slots: [
+            { slot: "A", weight_bps: 4500, budget_cents: 4_500_000, cash_cents: 4_100_000 },
+            { slot: "B", weight_bps: 4500, budget_cents: 4_500_000, cash_cents: 4_500_000 },
+          ],
+          sessions: { created: 0, running: 0, paused: 0, completed: 0, stopped: 0 },
+          audit_ok: true,
+        },
+        {
+          account_id: "e2e-session-account", initial_cash_cents: 10_000_000, cash_cents: 10_000_000,
+          reserve_cents: 1_000_000, created_at: "2026-11-08T09:00:00+08:00",
+          slots: [
+            { slot: "A", weight_bps: 4500, budget_cents: 4_500_000, cash_cents: 4_500_000 },
+            { slot: "B", weight_bps: 4500, budget_cents: 4_500_000, cash_cents: 4_500_000 },
+          ],
+          sessions: { created: 1, running: 0, paused: 0, completed: 0, stopped: 0 },
+          audit_ok: true,
+        },
+      ],
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-overview")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("overview-e2e-account")).toContainText("A 45.0% / B 45.0%");
+    await page.getByTestId("overview-e2e-session-account").click();
+    await expect(page.getByTestId("account-select")).toHaveValue("e2e-session-account");
+    await expect(page.getByTestId("overview-e2e-session-account")).toHaveAttribute("data-state", "active");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();
