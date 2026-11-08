@@ -2841,3 +2841,77 @@ fn price_set_registry_selects_only_reviewed_covering_sets() {
     assert!(still_unavailable.valuation.is_none());
     assert_eq!(still_unavailable.digest.len(), 64);
 }
+
+#[test]
+fn equity_series_marks_each_reviewed_day_and_refuses_gaps() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("series-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("series-acct", PaperSlotId::A, buy)).unwrap();
+    let fill = order.outcome.fill.expect("filled");
+    let day1 = fill.trade_day.clone();
+    let day2 = "2026-11-02".to_string();
+    let quantity = fill.quantity;
+
+    let mut set = price_set("reviewed", &day1, 1_300, MARKET_DATA_PACK_ID);
+    set.coverage_end = day2.clone();
+    set.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: day2.clone(),
+        price_cents: 1_200,
+        source: "offline-fixture".into(),
+        observed_at: format!("{day2}T15:00:00+08:00"),
+    });
+    let registry = crate::domain::PriceSetRegistry { schema_version: 1, sets: vec![set.clone()] };
+    registry.validate().unwrap();
+
+    let series = db
+        .paper_equity_series_with_registry("series-acct", &[day1.clone(), day2.clone()], &registry)
+        .unwrap()
+        .expect("reviewed set covers both days");
+    assert_eq!(series.status, "valued");
+    assert_eq!(series.points.len(), 2);
+    let account = db.paper_account("series-acct").unwrap();
+    assert_eq!(series.points[0].cash_cents, account.cash_cents);
+    assert_eq!(series.points[0].market_value_cents, quantity * 1_300);
+    assert_eq!(series.points[1].market_value_cents, quantity * 1_200);
+    // A 100-cent-per-share drop is the drawdown.
+    assert_eq!(series.max_drawdown_cents, quantity * 100);
+    assert_eq!(series.max_drawdown_day.as_deref(), Some(day2.as_str()));
+    assert!(series.profit_cents.is_some());
+    assert_eq!(series.digest.len(), 64);
+
+    // A day outside the set coverage means the series is unavailable, not clipped.
+    assert!(db
+        .paper_equity_series_with_registry(
+            "series-acct",
+            &[day1.clone(), "2026-11-30".into()],
+            &registry
+        )
+        .unwrap()
+        .is_none());
+
+    // Synthetic sets are never used for a user-facing series.
+    let mut synthetic = price_set("synthetic", &day1, 1_300, MARKET_DATA_PACK_ID);
+    synthetic.coverage_end = day2.clone();
+    synthetic.entries.push(set.entries[1].clone());
+    let synthetic_registry = crate::domain::PriceSetRegistry { schema_version: 1, sets: vec![synthetic] };
+    assert!(db
+        .paper_equity_series_with_registry("series-acct", &[day1.clone(), day2.clone()], &synthetic_registry)
+        .unwrap()
+        .is_none());
+
+    // Missing a price for a held symbol refuses the series.
+    let mut incomplete = registry.sets[0].clone();
+    incomplete.entries.pop();
+    let incomplete_registry = crate::domain::PriceSetRegistry { schema_version: 1, sets: vec![incomplete] };
+    assert!(matches!(
+        db.paper_equity_series_with_registry("series-acct", &[day1.clone(), day2], &incomplete_registry),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "valuation_missing_symbol"
+    ));
+
+    // The bundled catalogue is empty: the HTTP path stays unavailable.
+    assert!(db.paper_equity_series("series-acct", &[day1]).unwrap().is_none());
+}

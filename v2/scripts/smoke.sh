@@ -367,6 +367,10 @@ call("paper-accounts", conflicting, expected=409)
 call("paper-accounts/does-not-exist", expected=404)
 # The bundled reviewed price-set catalogue is empty by design: no invented prices.
 assert call("price-sets") == []
+# No reviewed price set is bundled: the equity series refuses instead of guessing.
+series = call("paper-accounts/smoke-account/equity-series?days=2026-10-30")
+assert series["status"] == "unavailable" and series["reason"] == "no_reviewed_price_set", series
+call("paper-accounts/smoke-account/equity-series?days=", expected=422)
 
 # Slot-owned order path: evidence, budget and conservation.
 paper_order = {
