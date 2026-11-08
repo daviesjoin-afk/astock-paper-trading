@@ -246,3 +246,26 @@ impl PaperSessionSpec {
         Ok(())
     }
 }
+
+/// Client-facing account request: strategies are named by reviewed id and the
+/// server resolves the artifact, so the browser never has to carry digests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperAccountRequestSlot {
+    pub slot: PaperSlotId,
+    pub strategy_version_id: String,
+    pub market_data_pack_id: String,
+    pub execution_policy_version: String,
+    pub weight_bps: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperAccountRequest {
+    pub schema_version: u32,
+    pub account_id: String,
+    pub initial_cash_cents: i64,
+    pub reserve_bps: i64,
+    pub created_at: String,
+    pub slots: Vec<PaperAccountRequestSlot>,
+}

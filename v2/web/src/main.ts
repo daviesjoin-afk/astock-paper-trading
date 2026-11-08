@@ -1053,12 +1053,26 @@ type PaperSessionView = {
   clock_at: string; cursor: number; total: number; last_order_id: number | null;
 };
 
+type StrategyCatalogue = {
+  strategies: Array<{ strategy_version_id: string; research_input_id: string; research_input_digest: string }>;
+  market_data_pack_id: string;
+  execution_policy_version: string;
+  reserve_bps: number;
+};
+type PaperSlotRequest = {
+  slot: string; strategy_version_id: string; market_data_pack_id: string;
+  execution_policy_version: string; weight_bps: number;
+};
+
+let strategyCatalogue: StrategyCatalogue | null = null;
 let accounts: PaperAccountSummary[] = [];
 let currentAccountId = "";
 const accountSelect = byId<HTMLSelectElement>("account-select");
 const accountError = testId<HTMLElement>("account-error");
 const accountBody = byId("account-body");
 const accountEmpty = testId<HTMLElement>("account-empty");
+const createForm = byId<HTMLFormElement>("account-create");
+const createToggle = testId<HTMLButtonElement>("account-create-toggle");
 
 const urlAccount = (): string =>
   new URLSearchParams(location.search).get("account")?.trim() ?? "";
@@ -1283,6 +1297,111 @@ const loadAccount = async (accountId: string): Promise<void> => {
     showAccountError(`读取账户失败：${errorDetail(error)}`);
   }
 };
+
+const loadStrategies = async (): Promise<void> => {
+  if (strategyCatalogue) return;
+  try {
+    const catalogue = await api<StrategyCatalogue>("/v2/strategies", new AbortController().signal);
+    strategyCatalogue = catalogue;
+    for (const id of ["create-a", "create-b"]) {
+      const select = byId<HTMLSelectElement>(id);
+      select.replaceChildren();
+      for (const strategy of catalogue.strategies) {
+        const option = document.createElement("option");
+        option.value = strategy.strategy_version_id;
+        option.textContent = strategyName(strategy.strategy_version_id);
+        select.appendChild(option);
+      }
+    }
+    const strategies = catalogue.strategies;
+    if (strategies.length > 1) byId<HTMLSelectElement>("create-b").value = strategies[1].strategy_version_id;
+  } catch (error) {
+    showAccountError(`读取策略目录失败：${errorDetail(error)}`);
+  }
+};
+
+const openCreateForm = async (): Promise<void> => {
+  await loadStrategies();
+  toggle(createForm, true);
+  toggle(createToggle, false);
+  byId<HTMLInputElement>("create-id").focus();
+};
+
+const closeCreateForm = (): void => {
+  toggle(createForm, false);
+  toggle(createToggle, true);
+};
+
+createToggle.addEventListener("click", () => void openCreateForm());
+testId("create-cancel").addEventListener("click", closeCreateForm);
+
+createForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void (async () => {
+    const accountId = byId<HTMLInputElement>("create-id").value.trim();
+    const cashYuan = Number(byId<HTMLInputElement>("create-cash").value);
+    const slotA = byId<HTMLSelectElement>("create-a").value;
+    const slotB = byId<HTMLSelectElement>("create-b").value;
+    clearAccountError();
+    if (!accountId) {
+      showAccountError("请填写账户标识");
+      return;
+    }
+    if (!Number.isFinite(cashYuan) || cashYuan < 100) {
+      showAccountError("初始资金至少 100 元");
+      return;
+    }
+    if (slotA === slotB) {
+      showAccountError("两个槽位不能使用同一策略");
+      return;
+    }
+    if (!strategyCatalogue) {
+      showAccountError("策略目录尚未载入");
+      return;
+    }
+    const weight = 4_500;
+    const slots: PaperSlotRequest[] = [
+      {
+        slot: "A", strategy_version_id: slotA,
+        market_data_pack_id: strategyCatalogue.market_data_pack_id,
+        execution_policy_version: strategyCatalogue.execution_policy_version,
+        weight_bps: weight,
+      },
+      {
+        slot: "B", strategy_version_id: slotB,
+        market_data_pack_id: strategyCatalogue.market_data_pack_id,
+        execution_policy_version: strategyCatalogue.execution_policy_version,
+        weight_bps: weight,
+      },
+    ];
+    const button = testId<HTMLButtonElement>("create-submit");
+    button.disabled = true;
+    try {
+      await postJson<PaperAccountView>("/v2/paper-accounts", {
+        schema_version: 1,
+        account_id: accountId,
+        initial_cash_cents: Math.round(cashYuan * 100),
+        reserve_bps: strategyCatalogue.reserve_bps,
+        created_at: new Date().toISOString(),
+        slots,
+      });
+      announce(`账户 ${accountId} 已创建`);
+      closeCreateForm();
+      byId<HTMLInputElement>("create-id").value = "";
+      await loadAccounts();
+      const created = accounts.find((account) => account.account_id === accountId);
+      if (created) {
+        accountSelect.value = created.account_id;
+        await loadAccount(created.account_id);
+      }
+    } catch (error) {
+      showAccountError(`创建账户失败：${errorDetail(error)}`);
+      announce("创建账户失败");
+    } finally {
+      button.disabled = false;
+    }
+  })();
+});
 
 const loadAccounts = async (): Promise<void> => {
   clearAccountError();

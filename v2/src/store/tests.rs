@@ -2463,3 +2463,47 @@ fn paper_session_run_advances_to_completion_or_pause() {
     assert_eq!(listed[0].session_id, "run-session");
     assert_eq!(db.paper_sessions(None, 10).unwrap().len(), 2);
 }
+
+#[test]
+fn paper_account_request_resolves_reviewed_strategies_by_id() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let request = crate::domain::PaperAccountRequest {
+        schema_version: 1,
+        account_id: "request-acct".into(),
+        initial_cash_cents: 10_000_000,
+        reserve_bps: 1_000,
+        created_at: "2026-11-08T09:00:00+08:00".into(),
+        slots: vec![
+            crate::domain::PaperAccountRequestSlot {
+                slot: PaperSlotId::A,
+                strategy_version_id: "research-momentum-v1".into(),
+                market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+                execution_policy_version: POLICY_VERSION.into(),
+                weight_bps: 4_500,
+            },
+            crate::domain::PaperAccountRequestSlot {
+                slot: PaperSlotId::B,
+                strategy_version_id: "research-reversion-v1".into(),
+                market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+                execution_policy_version: POLICY_VERSION.into(),
+                weight_bps: 4_500,
+            },
+        ],
+    };
+    let view = db.create_paper_account_request(request.clone()).unwrap();
+    assert_eq!(view.slots[0].strategy_version_id, "research-momentum-v1");
+    assert_eq!(view.slots[1].strategy_version_id, "research-reversion-v1");
+    assert_eq!(view.slots[0].research_input_id, "offline-research-input-v1");
+
+    let mut unknown = request.clone();
+    unknown.account_id = "unknown-strategy".into();
+    unknown.slots[0].strategy_version_id = "research-invented-v1".into();
+    assert!(matches!(
+        db.create_paper_account_request(unknown),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "unsupported_strategy_artifact"
+    ));
+
+    let catalogue = db.strategy_catalogue().unwrap();
+    assert_eq!(catalogue.strategies.len(), 2);
+    assert_eq!(catalogue.reserve_bps, 1_000);
+}

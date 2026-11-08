@@ -61,7 +61,6 @@ const read = <T>(name: string): T =>
   JSON.parse(readFileSync(join(dataDir, name), "utf8")) as T;
 
 export const artifact = (): Artifact => read("strategy-momentum-v1.json");
-const reversionArtifact = (): Artifact => read("strategy-reversion-v1.json");
 const manifest = (): Manifest => read("research-input-offline-v1.json");
 const output = (): Output => read("research-output-momentum-v1.json");
 
@@ -166,11 +165,11 @@ async function ensureSessionAccount(
       created_at: "2026-11-08T09:00:00+08:00",
       slots: [
         {
-          slot: "A", strategy: artifact(), market_data_pack_id: PACK,
+          slot: "A", strategy_version_id: "research-momentum-v1", market_data_pack_id: PACK,
           execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
         },
         {
-          slot: "B", strategy: reversionArtifact(), market_data_pack_id: PACK,
+          slot: "B", strategy_version_id: "research-reversion-v1", market_data_pack_id: PACK,
           execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
         },
       ],
@@ -217,11 +216,11 @@ async function ensurePaperAccount(
       created_at: "2026-11-08T09:00:00+08:00",
       slots: [
         {
-          slot: "A", strategy: artifact(), market_data_pack_id: PACK,
+          slot: "A", strategy_version_id: "research-momentum-v1", market_data_pack_id: PACK,
           execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
         },
         {
-          slot: "B", strategy: reversionArtifact(), market_data_pack_id: PACK,
+          slot: "B", strategy_version_id: "research-reversion-v1", market_data_pack_id: PACK,
           execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
         },
       ],

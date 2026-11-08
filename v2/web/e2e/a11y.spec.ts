@@ -42,6 +42,15 @@ for (const viewport of [{ width: 1280, height: 800, name: "desktop" }, { width: 
   });
 }
 
+test("the account creation form is accessible", async ({ page }) => {
+  await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+  await page.getByTestId("summary-strategy").waitFor();
+  await page.getByTestId("nav-account").click();
+  await page.getByTestId("account-create-toggle").click();
+  await expect(page.getByTestId("account-create")).toBeVisible();
+  await scan(page, "account-create");
+});
+
 test("the shortcut sheet is an accessible modal", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);
   await page.getByTestId("shortcuts-open").click();

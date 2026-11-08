@@ -124,6 +124,16 @@ test.describe("screenshots", () => {
     await capture(page, "account-sessions");
   });
 
+  test("account creation form", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.repro}`);
+    await page.getByTestId("summary-strategy").waitFor();
+    await page.getByTestId("nav-account").click();
+    await page.getByTestId("account-create-toggle").click();
+    await page.getByTestId("account-create").waitFor();
+    await settle(page);
+    await capture(page, "account-create");
+  });
+
   test("shortcut reference", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("summary-strategy").waitFor();
