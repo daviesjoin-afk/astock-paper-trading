@@ -93,6 +93,11 @@ async fn research_reproduction(State(state): State<Shared>, Path(id): Path<Strin
     response(db.verify_research_reproduction(&id).map_err(api_error)?)
 }
 
+async fn accounts_overview(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    response(db.accounts_overview().map_err(api_error)?)
+}
+
 async fn paper_accounts(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     response(db.paper_accounts(100).map_err(api_error)?)
@@ -639,6 +644,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/experiments", post(create_experiment).get(list_experiments))
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
+        .route("/v2/paper-accounts/overview", get(accounts_overview))
         .route("/v2/strategies", get(strategy_catalogue))
         .route("/v2/evolution/decisions", post(evolution_decision))
         .route("/v2/signal-diff", get(signal_diff))

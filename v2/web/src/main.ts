@@ -2163,6 +2163,47 @@ byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", re
 
 testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
 
+type AccountOverviewRow = {
+  account_id: string; initial_cash_cents: number; cash_cents: number; reserve_cents: number;
+  created_at: string;
+  slots: Array<{ slot: string; weight_bps: number; budget_cents: number; cash_cents: number }>;
+  sessions: { created: number; running: number; paused: number; completed: number; stopped: number };
+  audit_ok: boolean;
+};
+
+const loadOverview = async (): Promise<void> => {
+  const blockEl = testId<HTMLElement>("account-overview");
+  try {
+    const rows = await api<AccountOverviewRow[]>("/v2/paper-accounts/overview", new AbortController().signal);
+    if (!Array.isArray(rows) || rows.length === 0) {
+      toggle(blockEl, false);
+      return;
+    }
+    toggle(blockEl, true);
+    blockEl.replaceChildren(...rows.map((row) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "account-overview-row";
+      if (row.account_id === currentAccountId) button.dataset.state = "active";
+      button.dataset.testid = `overview-${row.account_id}`;
+      const weights = row.slots
+        .map((slot) => `${slot.slot} ${(slot.weight_bps / 100).toFixed(1)}%`)
+        .join(" / ");
+      const sessions = row.sessions.running + row.sessions.paused + row.sessions.created;
+      button.textContent =
+        `${row.account_id} · ${money(row.cash_cents)} · ${weights} · 活动会话 ${sessions} · ` +
+        `自检 ${row.audit_ok ? "通过" : "失败"}`;
+      button.addEventListener("click", () => {
+        accountSelect.value = row.account_id;
+        void loadAccount(row.account_id).then(() => loadOverview());
+      });
+      return button;
+    }));
+  } catch {
+    toggle(blockEl, false);
+  }
+};
+
 const loadAccounts = async (): Promise<void> => {
   clearAccountError();
   try {
@@ -2194,6 +2235,7 @@ const loadAccounts = async (): Promise<void> => {
     : accounts[0].account_id;
   accountSelect.value = selected;
   await loadAccount(selected);
+  await loadOverview();
 };
 
 accountSelect.addEventListener("change", () => {

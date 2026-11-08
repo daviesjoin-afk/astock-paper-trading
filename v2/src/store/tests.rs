@@ -3897,3 +3897,35 @@ fn experiment_segments_require_each_window_to_be_covered() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn accounts_overview_lists_money_sessions_and_audit() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("overview-a", 10_000_000)).unwrap();
+    db.create_paper_account(paper_spec("overview-b", 5_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    db.create_paper_session(session_spec(
+        "overview-a",
+        "overview-a-session",
+        vec![session_signal(PaperSlotId::A, &output.signals[0])],
+    ))
+    .unwrap();
+
+    let rows = db.accounts_overview().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].account_id, "overview-a");
+    assert_eq!(rows[1].account_id, "overview-b");
+    assert_eq!(rows[0].initial_cash_cents, 10_000_000);
+    assert_eq!(rows[1].initial_cash_cents, 5_000_000);
+    assert_eq!(rows[0].slots.len(), 2);
+    assert_eq!(rows[0].slots[0].weight_bps, 4_500);
+    assert_eq!(rows[0].slots[0].budget_cents, 4_500_000);
+    assert_eq!(rows[0].sessions.created, 1);
+    assert_eq!(rows[0].sessions.running, 0);
+    assert_eq!(rows[1].sessions.created, 0);
+    assert!(rows.iter().all(|row| row.audit_ok));
+    assert_eq!(
+        rows[0].cash_cents,
+        rows[0].reserve_cents + rows[0].slots.iter().map(|slot| slot.cash_cents).sum::<i64>()
+    );
+}

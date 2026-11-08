@@ -1703,3 +1703,72 @@ impl Store {
         Ok(report)
     }
 }
+
+impl Store {
+    /// Every account with the facts an operator needs before choosing one.
+    pub fn accounts_overview(&self) -> StoreResult<Vec<AccountOverview>> {
+        let mut statement =
+            self.conn.prepare("SELECT account_id FROM v2_paper_accounts ORDER BY account_id")?;
+        let ids: Vec<String> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        let mut rows = Vec::new();
+        for account_id in ids {
+            let view = self.paper_account(&account_id)?;
+            let sessions = self.session_counts(&account_id)?;
+            let audit_ok = self
+                .paper_account_audit(&account_id)
+                .map(|report| report.ok)
+                .unwrap_or(false);
+            rows.push(AccountOverview {
+                account_id: view.account_id.clone(),
+                initial_cash_cents: view.initial_cash_cents,
+                cash_cents: view.cash_cents,
+                reserve_cents: view.reserve_cents,
+                created_at: view.created_at.clone(),
+                slots: view
+                    .slots
+                    .iter()
+                    .map(|slot| AccountSlotOverview {
+                        slot: slot.slot.clone(),
+                        weight_bps: slot.weight_bps,
+                        budget_cents: slot.budget_cents,
+                        cash_cents: slot.cash_cents,
+                    })
+                    .collect(),
+                sessions,
+                audit_ok,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn session_counts(&self, account_id: &str) -> StoreResult<SessionCounts> {
+        let mut counts = SessionCounts {
+            created: 0,
+            running: 0,
+            paused: 0,
+            completed: 0,
+            stopped: 0,
+        };
+        let mut statement = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM v2_paper_sessions WHERE account_id=? GROUP BY status")?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (status, count) = row?;
+            match status.as_str() {
+                "created" => counts.created = count,
+                "running" => counts.running = count,
+                "paused" => counts.paused = count,
+                "completed" => counts.completed = count,
+                "stopped" => counts.stopped = count,
+                _ => {}
+            }
+        }
+        Ok(counts)
+    }
+}
