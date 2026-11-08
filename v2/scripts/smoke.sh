@@ -629,6 +629,35 @@ if bash scripts/daily_advance.sh --account smoke-account --day bad-day > /dev/nu
   exit 1
 fi
 
+# Publishing helper: generate into a staging dir, install, refuse overwrite.
+PUB_DIR="${RUNNER_TEMP:-/tmp}/astock-publish-${GITHUB_RUN_ID:-local}"
+PUB_CSV="$PUB_DIR/prices.csv"
+rm -rf "$PUB_DIR"; mkdir -p "$PUB_DIR"
+cat > "$PUB_CSV" <<'CSV'
+symbol,day,price,source,observed_at
+600000.SH,2026-10-30,12.34,offline-fixture,2026-10-30T15:00:00+08:00
+600000.SH,2026-11-02,12.19,offline-fixture,2026-11-02T15:00:00+08:00
+CSV
+bash scripts/publish_price_set.sh --input "$PUB_CSV" --set-id smoke-publish \
+  --pack cn-offline-fixture-pack-1 --trust synthetic \
+  --coverage-start 2026-10-30 --coverage-end 2026-11-02 \
+  --symbols 600000.SH --days 2026-10-30,2026-11-02 --out "$PUB_DIR/installed" \
+  | grep -q "published set=smoke-publish"
+if bash scripts/publish_price_set.sh --input "$PUB_CSV" --set-id smoke-publish \
+    --pack cn-offline-fixture-pack-1 --trust synthetic \
+    --coverage-start 2026-10-30 --coverage-end 2026-11-02 \
+    --symbols 600000.SH --out "$PUB_DIR/installed" > /dev/null 2>&1; then
+  echo "publish helper overwrote an existing artifact" >&2
+  exit 1
+else
+  test $? -eq 3
+fi
+bash scripts/publish_price_set.sh --input "$PUB_CSV" --set-id smoke-publish \
+  --pack cn-offline-fixture-pack-1 --trust synthetic \
+  --coverage-start 2026-10-30 --coverage-end 2026-11-02 \
+  --symbols 600000.SH --out "$PUB_DIR/installed" --dry-run | grep -q "install:"
+rm -rf "$PUB_DIR"
+
 # Weekly review: synthetic data means no coverage, so the verdict is unstable.
 if python scripts/weekly_review.py --base-cycle shadow-base-1 \
     --candidate-cycle shadow-candidate-1 --windows "2026-10-30;2026-11-02" \

@@ -70,7 +70,14 @@ python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --day
 
 ## 价格集合发布
 
-1. 供应商 CSV → `python research/make_price_set.py ...`（缺口默认失败）；
+1. 供应商 CSV → 生成 + 安装一步完成（缺口默认失败，已存在的工件需 `--force` 才覆盖）：
+
+```bash
+bash scripts/publish_price_set.sh --input prices.csv --set-id cn-close-2026-11   --pack cn-offline-fixture-pack-1 --coverage-start 2026-10-01 --coverage-end 2026-10-31   --symbols 600000.SH --days 2026-10-30,2026-11-02 --trust reviewed
+```
+
+`--dry-run` 只打印计划；目标已存在时拒绝覆盖（退出码 3）；成功后打印 `published set=… source_digest=…` 与后续核对命令。
+
 2. 按 `data/price-sets/README.md` 审核来源、覆盖、复权口径与停牌处理；
 3. 将 JSON 放入 `ASTOCK_PRICE_SETS_DIR`（默认 `data/price-sets`）；
 4. `GET /v2/price-sets` 核对 `price_set_id`、信任级别与摘要；
