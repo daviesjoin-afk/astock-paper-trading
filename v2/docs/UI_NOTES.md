@@ -104,6 +104,9 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Shadow comparison: the evolution view can compare two experiments at the
+  signal level (base/candidate ids → matched, base-only and candidate-only
+  signals). It is a read-only research tool; empty inputs are rejected inline.
 - Evolution history: a dedicated view (shortcut 8) lists promotion/rollback
   events with candidate id, status pill, decision time and the rule reasons.
   Candidate/status filters narrow the log client-side (“没有匹配的事件” when

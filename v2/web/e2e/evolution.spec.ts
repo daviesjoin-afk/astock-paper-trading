@@ -59,6 +59,39 @@ test.describe("evolution history", () => {
     await expect(page.getByTestId("evolution-empty")).toContainText("没有匹配的事件");
   });
 
+  test("compares two experiments at the signal level", async ({ page }) => {
+    await page.route(/\/v2\/signal-diff/, (route) => route.fulfill({
+      json: {
+        base_cycle: "shadow-base-1", candidate_cycle: "shadow-candidate-1",
+        base_runs: 2, candidate_runs: 1, matched: 1,
+        base_only: [{
+          decision_at: "2026-10-30T14:00:00+08:00",
+          quote_ref: { market_data_pack_id: "p", source: "offline-fixture", quote_id: "q-1359" },
+          symbol: "600000.SH", side: "buy",
+        }],
+        candidate_only: [],
+        digest: "a".repeat(64),
+      },
+    }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
+    await openEvolution(page);
+    await page.getByTestId("diff-base").fill("shadow-base-1");
+    await page.getByTestId("diff-candidate").fill("shadow-candidate-1");
+    await page.getByTestId("diff-run").click();
+    await expect(page.getByTestId("diff-summary")).toContainText("命中 1");
+    await expect(page.getByTestId("diff-summary")).toContainText("基准独有 1");
+    await expect(page.getByTestId("diff-list")).toContainText("基准独有");
+    await expect(page.getByTestId("diff-list")).toContainText("600000.SH 买入");
+  });
+
+  test("signal comparison needs both experiment ids", async ({ page }) => {
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
+    await openEvolution(page);
+    await page.getByTestId("diff-run").click();
+    await expect(page.getByTestId("diff-error")).toContainText("请填写基准与候选实验 id");
+    await expect(page.getByTestId("diff-result")).toBeHidden();
+  });
+
   test("an empty log explains itself", async ({ page }) => {
     await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
     await openEvolution(page);
