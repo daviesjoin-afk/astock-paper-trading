@@ -146,6 +146,32 @@ async fn paper_allocation_proposal(
     }
 }
 
+#[derive(Deserialize)]
+struct RebalanceBody {
+    targets: [i64; 2],
+    proposal_digest: String,
+    applied_at: String,
+    note: String,
+}
+
+async fn apply_rebalance(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Json(body): Json<RebalanceBody>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(
+        db.apply_rebalance(
+            &id,
+            body.targets,
+            &body.proposal_digest,
+            &body.applied_at,
+            &body.note,
+        )
+        .map_err(api_error)?,
+    )
+}
+
 async fn paper_account_audit(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -361,6 +387,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/audit",
             get(paper_account_audit),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/rebalances",
+            post(apply_rebalance),
         )
         .route(
             "/v2/paper-accounts/{account_id}/allocation-proposal",

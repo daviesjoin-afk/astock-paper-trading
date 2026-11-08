@@ -386,6 +386,22 @@ assert catalogue[0]["trust"] == "synthetic", catalogue
 # The account ledger proves its own invariants and links fills to outcomes.
 audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit
+# A rebalance moves cash and updates weights without touching fills.
+rebalance = call("paper-accounts/smoke-account/rebalances", {
+    "targets": [3500, 5500],
+    "proposal_digest": "a" * 64,
+    "applied_at": "2026-11-03T09:00:00+08:00",
+    "note": "smoke rebalance",
+})
+assert rebalance["weights_before"] == [4500, 4500], rebalance
+assert rebalance["weights_after"] == [3500, 5500], rebalance
+assert rebalance["from_slot"] == "A" and rebalance["to_slot"] == "B", rebalance
+account = call("paper-accounts/smoke-account")
+assert account["slots"][0]["weight_bps"] == 3500, account["slots"][0]
+assert account["slots"][0]["budget_cents"] == 3_500_000, account["slots"][0]
+assert account["slots"][0]["cash_cents"] == 3_500_000, account["slots"][0]
+audit = call("paper-accounts/smoke-account/audit")
+assert audit["ok"] is True, audit
 assert [check["name"] for check in audit["checks"]] == [
     "budget_split", "fills_replay", "capital_conservation",
     "order_fill_link", "fill_matches_outcome", "session_link", "session_signals",
@@ -447,7 +463,7 @@ assert last_step["session"]["status"] == "completed" and last_step["session"]["c
 assert call("paper-sessions/smoke-session")["status"] == "completed"
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"

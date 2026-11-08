@@ -752,23 +752,27 @@ impl Store {
         let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
         let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
         let split = spec.validate().map_err(StoreError::Rules)?;
+        let weights = Store::account_weights(&self.conn, &spec)?;
+        let expected = spec
+            .split_with_weights(weights)
+            .map_err(StoreError::Rules)?;
         let view = self.paper_account(account_id)?;
 
         let mut checks = Vec::new();
 
-        // 1. Budgets are exactly the validated split of the initial capital.
+        // 1. Budgets are exactly the split of the initial capital at current weights.
         let budgets_ok = view
             .slots
             .iter()
             .enumerate()
-            .all(|(index, slot)| slot.budget_cents == split.slot_budgets[index]);
+            .all(|(index, slot)| slot.budget_cents == expected.slot_budgets[index]);
         checks.push(PaperAuditCheck {
             name: "budget_split".into(),
             ok: budgets_ok,
             detail: format!(
                 "budgets {:?} vs split {:?}",
                 view.slots.iter().map(|slot| slot.budget_cents).collect::<Vec<_>>(),
-                split.slot_budgets
+                expected.slot_budgets
             ),
         });
 

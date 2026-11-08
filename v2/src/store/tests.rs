@@ -3173,3 +3173,100 @@ fn allocation_proposal_scores_slots_and_respects_bounds() {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(synthetic_dir);
 }
+
+#[test]
+fn rebalance_moves_cash_between_slots_and_keeps_history() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("rebalance-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    db.submit_paper_order(paper_order("rebalance-acct", PaperSlotId::A, buy)).unwrap();
+    let before = db.paper_account("rebalance-acct").unwrap();
+    let total_before = before.cash_cents;
+
+    let digest = "a".repeat(64);
+    let record = db
+        .apply_rebalance(
+            "rebalance-acct",
+            [3_500, 5_500],
+            &digest,
+            "2026-11-03T09:00:00+08:00",
+            "reduce momentum slot",
+        )
+        .unwrap();
+    assert_eq!(record.weights_before, [4_500, 4_500]);
+    assert_eq!(record.weights_after, [3_500, 5_500]);
+    assert_eq!(record.from_slot, "A");
+    assert_eq!(record.to_slot, "B");
+    let expected_move = before.slots[0].cash_cents - before.slots[0].budget_cents + 1_000_000;
+    assert_eq!(record.amount_cents, expected_move);
+    assert_eq!(record.digest.len(), 64);
+
+    let after = db.paper_account("rebalance-acct").unwrap();
+    assert_eq!(after.slots[0].weight_bps, 3_500);
+    assert_eq!(after.slots[0].budget_cents, 3_500_000);
+    assert_eq!(after.slots[1].budget_cents, 5_500_000);
+    assert_eq!(after.slots[0].cash_cents, before.slots[0].cash_cents - record.amount_cents);
+    assert_eq!(after.slots[1].cash_cents, before.slots[1].cash_cents + record.amount_cents);
+    assert_eq!(after.cash_cents, total_before, "cash is conserved");
+    // Fills are untouched by a capital decision.
+    assert_eq!(after.slots[0].positions, before.slots[0].positions);
+    assert_eq!(after.slots[0].orders_total, before.slots[0].orders_total);
+    assert!(db.paper_account_audit("rebalance-acct").unwrap().ok);
+
+    // Same digest and same target is idempotent.
+    let replay = db
+        .apply_rebalance(
+            "rebalance-acct",
+            [3_500, 5_500],
+            &digest,
+            "2026-11-03T09:00:00+08:00",
+            "reduce momentum slot",
+        )
+        .unwrap();
+    assert_eq!(replay.amount_cents, record.amount_cents);
+    // Same digest with a different target conflicts.
+    assert!(matches!(
+        db.apply_rebalance(
+            "rebalance-acct",
+            [4_000, 5_000],
+            &digest,
+            "2026-11-03T09:00:00+08:00",
+            "different",
+        ),
+        Err(StoreError::Conflict(ref code)) if code == "rebalance_digest_conflict"
+    ));
+
+    // Step cap, bounds and reserve floor are hard rejections.
+    assert!(matches!(
+        db.apply_rebalance(
+            "rebalance-acct",
+            [1_000, 8_000],
+            &"b".repeat(64),
+            "2026-11-04T09:00:00+08:00",
+            "out of bounds",
+        ),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "rebalance_weight_out_of_bounds"
+    ));
+    assert!(matches!(
+        db.apply_rebalance(
+            "rebalance-acct",
+            [3_500, 5_500],
+            "not-a-digest",
+            "2026-11-04T09:00:00+08:00",
+            "bad digest",
+        ),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_proposal_digest"
+    ));
+    assert!(matches!(
+        db.apply_rebalance(
+            "rebalance-acct",
+            [5_000, 4_500],
+            &"d".repeat(64),
+            "2026-11-04T09:00:00+08:00",
+            "bad sum",
+        ),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "rebalance_weights_must_keep_reserve"
+    ));
+}
