@@ -405,6 +405,7 @@ assert audit["ok"] is True, audit
 assert [check["name"] for check in audit["checks"]] == [
     "budget_split", "fills_replay", "capital_conservation",
     "order_fill_link", "fill_matches_outcome", "session_link", "session_signals",
+    "rebalance_chain",
 ]
 # No reviewed price set is bundled: the equity series refuses instead of guessing.
 # Allocation proposals need reviewed prices; synthetic data never drives them.

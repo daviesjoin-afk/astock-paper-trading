@@ -42,11 +42,12 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-audit")).toBeVisible();
     await expect(page.getByTestId("account-audit")).toContainText("账本自检：通过");
     await expect(page.getByTestId("account-audit")).toHaveAttribute("data-state", "ok");
+    await expect(page.getByTestId("account-rebalances")).toBeHidden();
     await page.getByTestId("account-audit-details").locator("summary").click();
     const checks = page.getByTestId("account-audit-checks").locator("li");
-    await expect(checks).toHaveCount(7);
+    await expect(checks).toHaveCount(8);
     await expect(checks.first()).toContainText("budget_split");
-    await expect(checks.last()).toContainText("session_signals");
+    await expect(checks.last()).toContainText("rebalance_chain");
 
     const orders = page.getByTestId("account-orders").locator("tr");
     await expect(orders).toHaveCount(1);
@@ -73,6 +74,24 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-valuation-detail")).toContainText("权益");
     await expect(page.getByTestId("account-valuation-detail")).toContainText("盈亏");
     await expect(page.getByTestId("account-valuation-detail")).toContainText("reviewed-prices-2026-11-02");
+  });
+
+  test("applied rebalances are listed with their weight change", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/.+\/rebalances$/, (route) => route.fulfill({
+      json: [{
+        account_id: "e2e-account", from_slot: "A", to_slot: "B", amount_cents: 1_000_000,
+        weights_before: [4500, 4500], weights_after: [3500, 5500],
+        applied_at: "2026-11-03T09:00:00+08:00", note: "rebalance",
+        proposal_digest: "a".repeat(64), digest: "b".repeat(64),
+      }],
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-rebalances")).toBeVisible({ timeout: 15_000 });
+    const items = page.getByTestId("account-rebalance-list").locator("li");
+    await expect(items).toHaveCount(1);
+    await expect(items.first()).toContainText("A→B");
+    await expect(items.first()).toContainText("45.0%/45.0% → 35.0%/55.0%");
+    await expect(items.first()).toContainText("2026-11-03");
   });
 
   test("a valued equity series renders points and drawdown", async ({ page }) => {
