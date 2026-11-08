@@ -104,6 +104,9 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Risk boundaries: every slot card prints the account's cost-basis limits
+  (single order / single symbol / slot cash floor) so a rejected order can be
+  explained without opening the API.
 - Valuation: the account panel always states that valuation is unavailable
   (`No reviewed price set`) and, below it, the exact snapshot request: the
   as-of day (last decision day, else the account's created day), the missing

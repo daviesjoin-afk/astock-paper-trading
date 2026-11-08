@@ -96,6 +96,9 @@ const REASONS: Record<string, string> = {
   instrument_identity_missing: "缺少证券身份",
   instrument_date_not_covered: "不在证券覆盖日期内",
   instrument_identity_conflict: "证券身份冲突",
+  risk_order_notional_exceeded: "超过单笔金额上限",
+  risk_symbol_concentration_exceeded: "超过单标的持仓上限",
+  risk_cash_floor_exceeded: "低于槽位现金下限",
 };
 
 export const reasonLabel = (code: string): string => REASONS[code] ?? "其它原因";

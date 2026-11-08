@@ -109,6 +109,7 @@ pub struct PaperAccountView {
     pub slots: Vec<PaperSlotView>,
     /// No reviewed price set exists yet, so no market value or return is computed.
     pub valuation: PaperValuation,
+    pub limits: crate::domain::PaperRiskLimits,
 }
 
 /// Summary returned by a batch run.
@@ -989,6 +990,7 @@ impl Store {
                 status: "unavailable".into(),
                 reason: "no_reviewed_price_set".into(),
             },
+            limits: spec.limits.clone(),
         })
     }
 
@@ -1088,7 +1090,7 @@ impl Store {
             quote_ref: request.quote_ref.clone(),
         };
         let evidence = load_evidence(&txn, &request.quote_ref)?;
-        let outcome = decide(
+        let mut outcome = decide(
             &state,
             &internal,
             evidence.as_ref(),
@@ -1097,6 +1099,18 @@ impl Store {
             &instruments,
         )
         .map_err(StoreError::Rules)?;
+        // Risk boundaries become an explicit rejection, never a partial fill.
+        if let Some(fill) = outcome.fill.clone() {
+            let budget = split.slot_budgets[slot_index];
+            if let Some(reason) = risk_violation(&spec.limits, budget, &state, &fill) {
+                outcome = Outcome {
+                    status: crate::domain::DecisionStatus::Rejected,
+                    reason: reason.into(),
+                    fill: None,
+                    cash_after_cents: state.cash_cents,
+                };
+            }
+        }
 
         txn.execute(
             "INSERT INTO v2_paper_orders(account_id,slot,strategy_version_id,signal_id,
@@ -1450,6 +1464,7 @@ impl Store {
             reserve_bps: request.reserve_bps,
             created_at: request.created_at,
             slots,
+            limits: request.limits,
         })
     }
 }
@@ -1533,4 +1548,32 @@ impl Store {
             signals,
         })
     }
+}
+
+/// Cost-basis risk check. Prices come from the fill itself, so no valuation is
+/// required and the decision stays deterministic.
+fn risk_violation(
+    limits: &crate::domain::PaperRiskLimits,
+    budget_cents: i64,
+    state: &PortfolioState,
+    fill: &Fill,
+) -> Option<&'static str> {
+    if fill.side != crate::domain::Side::Buy {
+        return None;
+    }
+    let gross = (fill.quantity as i128) * (fill.price_cents as i128);
+    let budget = budget_cents as i128;
+    if gross * 10_000 > budget * limits.max_order_notional_bps as i128 {
+        return Some("risk_order_notional_exceeded");
+    }
+    let held = state.quantity(&fill.symbol) as i128;
+    let basis = (held + fill.quantity as i128) * fill.price_cents as i128;
+    if basis * 10_000 > budget * limits.max_symbol_weight_bps as i128 {
+        return Some("risk_symbol_concentration_exceeded");
+    }
+    let cash_after = state.cash_cents as i128 - gross - fill.fees_cents as i128;
+    if cash_after * 10_000 < budget * limits.min_slot_cash_bps as i128 {
+        return Some("risk_cash_floor_exceeded");
+    }
+    None
 }

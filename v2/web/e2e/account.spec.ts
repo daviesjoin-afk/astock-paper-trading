@@ -29,6 +29,7 @@ test.describe("paper account console", () => {
     await expect(slotA).toContainText("预算");
     await expect(slotA).toContainText("¥45,000.00");
     await expect(slotA).toContainText("600000.SH");
+    await expect(slotA).toContainText("风控：单笔 ≤ 50% · 单标的 ≤ 25% · 现金 ≥ 10%");
     await expect(slotB).toContainText("槽位 B · 均值回归策略");
     await expect(slotB).toContainText("无持仓");
 

@@ -1981,6 +1981,7 @@ fn paper_spec(account_id: &str, cash: i64) -> PaperAccountSpec {
         initial_cash_cents: cash,
         reserve_bps: 1_000,
         created_at: "2026-11-08T09:00:00+08:00".into(),
+        limits: crate::domain::PaperRiskLimits::default(),
         slots: vec![
             paper_slot(PaperSlotId::A, reviewed_artifact(), 4_500),
             paper_slot(PaperSlotId::B, reversion_artifact(), 4_500),
@@ -2473,6 +2474,7 @@ fn paper_account_request_resolves_reviewed_strategies_by_id() {
         initial_cash_cents: 10_000_000,
         reserve_bps: 1_000,
         created_at: "2026-11-08T09:00:00+08:00".into(),
+        limits: crate::domain::PaperRiskLimits::default(),
         slots: vec![
             crate::domain::PaperAccountRequestSlot {
                 slot: PaperSlotId::A,
@@ -2732,5 +2734,66 @@ fn valuation_marks_positions_only_when_the_set_covers_them() {
     assert!(matches!(
         db.paper_valuation_with_set("value-acct", day, &bad_trust),
         Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_price_set_trust"
+    ));
+}
+
+#[test]
+fn risk_limits_reject_breaching_fills_without_touching_the_ledger() {
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+
+    let mut capped = paper_spec("risk-order", 10_000_000);
+    capped.limits = crate::domain::PaperRiskLimits {
+        max_symbol_weight_bps: 10_000,
+        max_order_notional_bps: 500,
+        min_slot_cash_bps: 0,
+    };
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(capped).unwrap();
+    ingest_signal_evidence(&mut db, buy);
+    let record = db.submit_paper_order(paper_order("risk-order", PaperSlotId::A, buy)).unwrap();
+    assert_eq!(record.outcome.status, DecisionStatus::Rejected);
+    assert_eq!(record.outcome.reason, "risk_order_notional_exceeded");
+    assert!(record.outcome.fill.is_none());
+    let view = db.paper_account("risk-order").unwrap();
+    assert_eq!(view.slots[0].cash_cents, view.slots[0].budget_cents);
+    assert!(view.slots[0].positions.is_empty());
+
+    let mut floor = paper_spec("risk-cash", 10_000_000);
+    floor.limits = crate::domain::PaperRiskLimits {
+        max_symbol_weight_bps: 10_000,
+        max_order_notional_bps: 10_000,
+        min_slot_cash_bps: 10_000,
+    };
+    db.create_paper_account(floor).unwrap();
+    let record = db.submit_paper_order(paper_order("risk-cash", PaperSlotId::A, buy)).unwrap();
+    assert_eq!(record.outcome.reason, "risk_cash_floor_exceeded");
+    assert!(record.outcome.fill.is_none());
+
+    let mut concentrated = paper_spec("risk-symbol", 10_000_000);
+    concentrated.limits = crate::domain::PaperRiskLimits {
+        max_symbol_weight_bps: 0,
+        max_order_notional_bps: 10_000,
+        min_slot_cash_bps: 0,
+    };
+    db.create_paper_account(concentrated).unwrap();
+    let record = db.submit_paper_order(paper_order("risk-symbol", PaperSlotId::A, buy)).unwrap();
+    assert_eq!(record.outcome.reason, "risk_symbol_concentration_exceeded");
+    assert!(record.outcome.fill.is_none());
+
+    // A sell is not constrained by the buy-side notional/concentration caps.
+    let mut selling = paper_spec("risk-sell", 10_000_000);
+    selling.limits = crate::domain::PaperRiskLimits {
+        max_symbol_weight_bps: 0,
+        max_order_notional_bps: 0,
+        min_slot_cash_bps: 0,
+    };
+    db.create_paper_account(selling.clone()).unwrap();
+    let mut invalid = selling.clone();
+    invalid.account_id = "risk-invalid".into();
+    invalid.limits.max_order_notional_bps = 10_001;
+    assert!(matches!(
+        db.create_paper_account(invalid),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_risk_limits"
     ));
 }
