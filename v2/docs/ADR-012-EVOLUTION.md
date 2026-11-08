@@ -74,6 +74,16 @@ python scripts/shadow_candidates.py --artifact cands/X.artifact.json   --output 
 - 指标口径：`out_of_sample_days = shadow_days = 序列天数`，`trades` 来自成交；
 - 输出包含 `performance{base,candidate}`、`decision` 与 `event`。
 
+## 回退演练（已覆盖）
+
+冒烟在合成指标上走完“晋级 → 风险恶化 → 回退”：
+
+1. `POST /v2/evolution/events`（kind=promotion）→ `promoted`；
+2. `POST /v2/evolution/events`（kind=rollback，当前回撤 2500 bps、收益 100 bps）→ `reverted`；
+3. `GET /v2/evolution/events?status=reverted` → 恰好该事件。
+
+说明：这验证的是**规则与事件链路**，不代表任何真实绩效。
+
 ## 未决问题
 
 - 指标来源：需要由审核净值序列（ADR 007）统一生成，禁止手工填写；

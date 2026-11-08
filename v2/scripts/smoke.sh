@@ -449,6 +449,19 @@ assert _diff["digest"] and len(_diff["digest"]) == 64, _diff
 _shadow_decision = _shadow.decide("http://127.0.0.1:8765", "shadow-base-1",
                                   "shadow-candidate-1", ["2026-10-30", "2026-11-02"])
 assert _shadow_decision["status"] == "unavailable", _shadow_decision
+# Rollback rehearsal: a promoted version can be reverted when risk deteriorates.
+rollback_event = call("evolution/events", {
+    "event_id": "smoke-evo-2",
+    "decided_at": "2026-11-06T15:00:00+08:00",
+    "kind": "rollback",
+    "incumbent": {"candidate_id": "cand", "out_of_sample_days": 25, "shadow_days": 12,
+                  "trades": 25, "return_bps": 700, "drawdown_bps": 900},
+    "candidate": {"candidate_id": "cand", "out_of_sample_days": 25, "shadow_days": 12,
+                  "trades": 25, "return_bps": 100, "drawdown_bps": 2500},
+})
+assert rollback_event["status"] == "reverted", rollback_event
+reverted = call("evolution/events?status=reverted")
+assert len(reverted) == 1 and reverted[0]["event_id"] == "smoke-evo-2", reverted
 _segments = call("experiments/shadow-base-1/performance/segments?segments=2026-10-30;2026-11-02")
 assert len(_segments["segments"]) == 2, _segments
 assert all(segment["status"] == "unavailable" for segment in _segments["segments"]), _segments
