@@ -2915,3 +2915,46 @@ fn equity_series_marks_each_reviewed_day_and_refuses_gaps() {
     // The bundled catalogue is empty: the HTTP path stays unavailable.
     assert!(db.paper_equity_series("series-acct", &[day1]).unwrap().is_none());
 }
+
+#[test]
+fn account_audit_balances_and_detects_tampering() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("audit-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    db.submit_paper_order(paper_order("audit-acct", PaperSlotId::A, buy)).unwrap();
+
+    let report = db.paper_account_audit("audit-acct").unwrap();
+    assert!(report.ok, "checks: {:?}", report.checks);
+    let names: Vec<&str> = report.checks.iter().map(|check| check.name.as_str()).collect();
+    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link"]);
+    assert_eq!(report.digest.len(), 64);
+    assert_eq!(report, db.paper_account_audit("audit-acct").unwrap());
+
+    // Tampering with a stored fill must break the conservation check.
+    let raw: String = db.conn.query_row("SELECT fill_json FROM v2_paper_fills LIMIT 1", [], |row| row.get(0)).unwrap();
+    let mut fill: Fill = serde_json::from_str(&raw).unwrap();
+    fill.quantity += 100;
+    db.conn.execute(
+        "UPDATE v2_paper_fills SET fill_json=? WHERE id=(SELECT MIN(id) FROM v2_paper_fills)",
+        [serde_json::to_string(&fill).unwrap()],
+    ).unwrap();
+    let tampered = db.paper_account_audit("audit-acct").unwrap();
+    assert!(!tampered.ok);
+    assert!(tampered.checks.iter().any(|check| check.name == "fill_matches_outcome" && !check.ok));
+
+    // A session cursor pointing at a missing order is caught as well.
+    let mut clean = test_store(INITIAL_CASH_CENTS).unwrap();
+    clean.create_paper_account(paper_spec("audit-session", 10_000_000)).unwrap();
+    clean.conn.execute(
+        "INSERT INTO v2_paper_sessions(session_id,account_id,spec_json,status,clock_at,cursor,last_order_id)
+         VALUES('s1','audit-session','{}','created','2026-10-30T00:00:00+08:00',0,999)",
+        [],
+    ).unwrap();
+    let linked = clean.paper_account_audit("audit-session").unwrap();
+    assert!(!linked.ok);
+    assert!(linked.checks.iter().any(|check| check.name == "session_link" && !check.ok));
+
+    assert!(matches!(db.paper_account_audit("nope"), Err(StoreError::NotFound(_))));
+}

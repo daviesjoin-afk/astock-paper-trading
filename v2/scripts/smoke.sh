@@ -367,6 +367,13 @@ call("paper-accounts", conflicting, expected=409)
 call("paper-accounts/does-not-exist", expected=404)
 # The bundled reviewed price-set catalogue is empty by design: no invented prices.
 assert call("price-sets") == []
+# The account ledger proves its own invariants and links fills to outcomes.
+audit = call("paper-accounts/smoke-account/audit")
+assert audit["ok"] is True, audit
+assert [check["name"] for check in audit["checks"]] == [
+    "budget_split", "fills_replay", "capital_conservation",
+    "order_fill_link", "fill_matches_outcome", "session_link",
+]
 # No reviewed price set is bundled: the equity series refuses instead of guessing.
 series = call("paper-accounts/smoke-account/equity-series?days=2026-10-30")
 assert series["status"] == "unavailable" and series["reason"] == "no_reviewed_price_set", series
