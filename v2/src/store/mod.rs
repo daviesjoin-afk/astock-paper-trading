@@ -152,6 +152,28 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// Version-independent identity of one research signal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalFingerprint {
+    pub decision_at: String,
+    pub quote_ref: crate::domain::QuoteRef,
+    pub symbol: String,
+    pub side: crate::domain::Side,
+}
+
+/// Read-only comparison of two experiments' signals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalDiffReport {
+    pub base_cycle: String,
+    pub candidate_cycle: String,
+    pub base_runs: usize,
+    pub candidate_runs: usize,
+    pub matched: i64,
+    pub base_only: Vec<SignalFingerprint>,
+    pub candidate_only: Vec<SignalFingerprint>,
+    pub digest: String,
+}
+
 /// One persisted evolution decision. Evidence metrics travel with it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionEventRecord {

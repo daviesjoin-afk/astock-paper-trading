@@ -264,6 +264,23 @@ async fn evolution_events(
     )
 }
 
+#[derive(Deserialize)]
+struct SignalDiffQuery {
+    base_cycle: String,
+    candidate_cycle: String,
+}
+
+async fn signal_diff(
+    State(state): State<Shared>,
+    Query(query): Query<SignalDiffQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(
+        db.signal_diff(&query.base_cycle, &query.candidate_cycle)
+            .map_err(api_error)?,
+    )
+}
+
 async fn evolution_decision(Json(body): Json<EvolutionRequest>) -> ApiResult {
     let policy = body.policy.clone().unwrap_or_default();
     let decision = match body.kind.as_str() {
@@ -495,6 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
         .route("/v2/strategies", get(strategy_catalogue))
         .route("/v2/evolution/decisions", post(evolution_decision))
+        .route("/v2/signal-diff", get(signal_diff))
         .route(
             "/v2/evolution/events",
             post(record_evolution_event).get(evolution_events),
