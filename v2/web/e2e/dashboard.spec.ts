@@ -45,7 +45,7 @@ test.describe("navigation and discovery", () => {
   test("technical identifiers exist only behind the collapsed details", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await view(page, "experiment");
-    const details = page.locator("details.tech");
+    const details = page.locator("#panel-experiment details.tech");
     await expect(details).not.toHaveAttribute("open", "");
     await expect(page.getByTestId("tech-strategy")).toBeHidden();
     await details.locator("summary").click();
@@ -56,7 +56,7 @@ test.describe("navigation and discovery", () => {
     await page.goto("/");
     const select = page.getByTestId("experiment-select");
     await expect(select).toBeVisible();
-    await expect(select.locator("option")).toHaveCount(5);
+    await expect(select.locator("option")).toHaveCount(6);
 
     await select.selectOption(CYCLES.holdings);
     await expect(page).toHaveURL(new RegExp(`cycle_id=${CYCLES.holdings}`));

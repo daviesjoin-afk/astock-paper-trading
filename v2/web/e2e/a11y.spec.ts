@@ -15,7 +15,7 @@ const scan = async (page: import("@playwright/test").Page, name: string) => {
   expect(summary, `axe violations on ${name}`).toEqual([]);
 };
 
-const VIEWS = ["overview", "positions", "decisions", "replay", "reproduction", "experiment"] as const;
+const VIEWS = ["overview", "positions", "decisions", "replay", "reproduction", "comparison", "experiment"] as const;
 
 for (const viewport of [{ width: 1280, height: 800, name: "desktop" }, { width: 390, height: 844, name: "mobile" }]) {
   test(`no WCAG A/AA violations in light theme at ${viewport.name}`, async ({ page }) => {
@@ -41,6 +41,19 @@ for (const viewport of [{ width: 1280, height: 800, name: "desktop" }, { width: 
     }
   });
 }
+
+test("a rendered comparison is accessible", async ({ page }) => {
+  await page.goto(`/?cycle_id=${CYCLES.repro}`);
+  await page.getByTestId("summary-strategy").waitFor();
+  await page.getByTestId("nav-comparison").click();
+  await page.getByTestId("compare-a").selectOption(CYCLES.repro);
+  await page.getByTestId("compare-b").selectOption(CYCLES.reproB);
+  await page.getByTestId("compare-start").fill("2026-10-30");
+  await page.getByTestId("compare-end").fill("2026-11-02");
+  await page.getByTestId("compare-run").click();
+  await expect(page.getByTestId("compare-status")).toContainText("可比", { timeout: 20_000 });
+  await scan(page, "comparison-result");
+});
 
 test("the shortcut sheet is an accessible modal", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);

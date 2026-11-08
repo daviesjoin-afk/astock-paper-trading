@@ -108,6 +108,20 @@ test.describe("screenshots", () => {
     await capture(page, "decisions-filtered");
   });
 
+  test("experiment comparison", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.repro}`);
+    await page.getByTestId("summary-strategy").waitFor();
+    await page.getByTestId("nav-comparison").click();
+    await page.getByTestId("compare-a").selectOption(CYCLES.repro);
+    await page.getByTestId("compare-b").selectOption(CYCLES.reproB);
+    await page.getByTestId("compare-start").fill("2026-10-30");
+    await page.getByTestId("compare-end").fill("2026-11-02");
+    await page.getByTestId("compare-run").click();
+    await page.getByTestId("compare-status").filter({ hasText: "可比" }).waitFor();
+    await settle(page);
+    await capture(page, "comparison");
+  });
+
   test("shortcut reference", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("summary-strategy").waitFor();

@@ -125,6 +125,13 @@
         </div>
         <div class="nav-group">
           <p class="nav-title">实验</p>
+          <button type="button" class="nav-item" data-view="comparison" data-testid="nav-comparison">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M2.6 4.4h5.2M2.6 11.6h5.2M8.2 8h5.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              <path d="m10.6 5.6 2.8 2.4-2.8 2.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>实验比较</span>
+          </button>
           <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">
             <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
               <circle cx="8" cy="8" r="5.9" fill="none" stroke="currentColor" stroke-width="1.4" />
@@ -417,6 +424,91 @@ python3 scripts/experiment_demo.py</code></pre>
             <p class="panel-foot">重做只验证研究信号是否可由固定策略与冻结输入再次产生。</p>
           </section>
 
+          <!-- 实验比较 -->
+          <section class="panel" id="panel-comparison" data-testid="panel-comparison" hidden>
+            <header class="panel-head">
+              <div>
+                <h2>实验比较</h2>
+                <p class="muted">并列两个可验证实验的已存事实；不计算收益、净值、回撤或排名。</p>
+              </div>
+            </header>
+            <form class="compare-form" id="compare-form" aria-label="实验比较参数">
+              <label class="field">
+                <span class="field-label">实验 A</span>
+                <select id="compare-a" data-testid="compare-a"></select>
+              </label>
+              <label class="field">
+                <span class="field-label">实验 B</span>
+                <select id="compare-b" data-testid="compare-b"></select>
+              </label>
+              <label class="field">
+                <span class="field-label">开始日</span>
+                <input type="date" id="compare-start" data-testid="compare-start" aria-label="比较窗口开始日" />
+              </label>
+              <label class="field">
+                <span class="field-label">结束日</span>
+                <input type="date" id="compare-end" data-testid="compare-end" aria-label="比较窗口结束日" />
+              </label>
+              <button type="submit" class="btn" id="compare-run" data-testid="compare-run">运行比较</button>
+            </form>
+            <div class="section-error" data-testid="compare-error" hidden></div>
+            <div class="compare-body" id="compare-result" hidden>
+              <p class="verify-status" id="compare-status" data-testid="compare-status" data-state="idle">未比较</p>
+              <p class="verify-detail muted" id="compare-detail" data-testid="compare-detail"></p>
+              <div class="compare-section" id="compare-reasons-wrap" hidden>
+                <h3>不可比原因</h3>
+                <ul class="compare-reasons" id="compare-reasons" data-testid="compare-reasons"></ul>
+              </div>
+              <div class="compare-section">
+                <h3>可比条件</h3>
+                <table class="compare-table">
+                  <caption class="sr-only">两个实验的可比条件逐项核对</caption>
+                  <thead><tr><th scope="col">条件</th><th scope="col">A</th><th scope="col">B</th><th scope="col">结果</th></tr></thead>
+                  <tbody id="compare-checks" data-testid="compare-checks"></tbody>
+                </table>
+              </div>
+              <div class="compare-section">
+                <h3>核验状态</h3>
+                <table class="compare-table">
+                  <caption class="sr-only">两个实验的交易回放与研究重做结果</caption>
+                  <thead><tr><th scope="col">实验</th><th scope="col">交易回放</th><th scope="col">研究重做</th></tr></thead>
+                  <tbody id="compare-verification" data-testid="compare-verification"></tbody>
+                </table>
+              </div>
+              <div class="compare-section" id="compare-totals-wrap">
+                <h3>窗口内事实</h3>
+                <table class="compare-table">
+                  <caption class="sr-only">窗口内的决策、成交、费用、现金与持仓数量</caption>
+                  <thead><tr><th scope="col">事实</th><th scope="col">A</th><th scope="col">B</th></tr></thead>
+                  <tbody id="compare-totals" data-testid="compare-totals"></tbody>
+                </table>
+              </div>
+              <div class="compare-section" id="compare-slots-wrap">
+                <h3>按决策时点并列</h3>
+                <p class="muted" id="compare-unmatched" data-testid="compare-unmatched"></p>
+                <div class="table-scroll" tabindex="0" role="region" aria-label="决策时点并列表格，可横向滚动">
+                  <table class="compare-table">
+                    <caption class="sr-only">同一决策时点两侧的决策、成交与拒绝原因</caption>
+                    <thead><tr><th scope="col">决策时点</th><th scope="col">A</th><th scope="col">B</th></tr></thead>
+                    <tbody id="compare-slots" data-testid="compare-slots"></tbody>
+                  </table>
+                </div>
+              </div>
+              <p class="valuation-note" id="compare-valuation" data-testid="compare-valuation" hidden></p>
+              <details class="tech">
+                <summary>比较口径与摘要</summary>
+                <dl class="tech-list">
+                  <div><dt>比较版本</dt><dd id="compare-version" data-testid="compare-version">—</dd></div>
+                  <div><dt>窗口</dt><dd id="compare-window" data-testid="compare-window">—</dd></div>
+                  <div><dt>摘要</dt><dd id="compare-digest" data-testid="compare-digest">—</dd></div>
+                  <div><dt>实验 A</dt><dd id="compare-identity-a" data-testid="compare-identity-a">—</dd></div>
+                  <div><dt>实验 B</dt><dd id="compare-identity-b" data-testid="compare-identity-b">—</dd></div>
+                </dl>
+              </details>
+            </div>
+            <p class="panel-foot">比较只读取已存事实；没有审核过的估值价格集合时不输出收益类指标。</p>
+          </section>
+
           <!-- 实验信息 -->
           <section class="panel" id="panel-experiment" data-testid="panel-experiment" hidden>
             <header class="panel-head">
@@ -461,8 +553,8 @@ python3 scripts/experiment_demo.py</code></pre>
         <button type="button" class="btn btn-quiet" id="shortcuts-close" data-testid="shortcuts-close">关闭</button>
       </header>
       <dl class="shortcut-list">
-        <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>6</kbd></dt>
-          <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 实验</dd></div>
+        <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>7</kbd></dt>
+          <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 比较 · 实验</dd></div>
         <div><dt><kbd>/</kbd></dt><dd>聚焦“当前实验”选择器</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>刷新当前实验</dd></div>
         <div><dt><kbd>t</kbd></dt><dd>切换深色 / 浅色</dd></div>

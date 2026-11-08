@@ -88,6 +88,30 @@ padding, stacked controls), 560px (rail grid), 480px (compact type), 420px
   damaged catalogue (`total > 0`, nothing readable) instead of “还没有实验”.
   Partially damaged catalogues stay usable with a visible warning.
 
+## Experiment comparison (ADR 004)
+
+`#/comparison` (or `?a=&b=&from=&to=` deep link) juxtaposes two finished
+experiments over a caller-supplied window. The page is a read model only: it
+never re-decides, re-fills, values or writes anything.
+
+- The window is explicit (`from`/`to`, China trading days, inclusive) and both
+  experiments must fully cover every decision day inside it. A partially covered
+  window is refused (`comparison_window_not_covered`), never clipped to the
+  intersection, and the UI hides the fact tables in that case.
+- Preconditions are shown as four checks (research input, market data pack,
+  execution policy, initial cash). A mismatch rejects the comparison with the
+  reason list; no partial facts are rendered.
+- Both sides must pass replay (and research reproduction). Verification status
+  is printed per side, never merged into one badge.
+- Facts are grouped by the exact decision instant: several decisions may share a
+  slot, a one-sided slot is labelled “无决策（不补造）” and counted as an
+  unmatched decision.
+- Fees, cash and positions are projected to the window end; no NAV, return,
+  drawdown, Sharpe or ranking is computed. `valuation.status` stays
+  `unavailable` because the offline packs declare no reviewed price set.
+- The response carries a canonical digest over the whole model, so an identical
+  request reproduces an identical comparison after a restart.
+
 ## Components
 
 - **KPI cards** state one fact each and never compute an implied return.
@@ -122,7 +146,7 @@ a notice owns the screen (nothing is navigable there anyway):
 
 | Key | Action |
 | --- | --- |
-| `1`–`6` | Switch to overview, positions, decisions, replay, reproduction, experiment |
+| `1`–`7` | Switch to overview, positions, decisions, replay, reproduction, comparison, experiment |
 | `/` | Focus the experiment selector |
 | `r` | Refresh the current experiment |
 | `t` | Toggle light / dark |
@@ -153,7 +177,12 @@ and wins from then on. With no stored choice the page follows
 `service-*`, `loading`, `empty-experiments`, `unknown-experiment`,
 `live-status`, `copy-demo`, `copy-link`, `copy-tech`, `shortcuts`,
 `shortcuts-open`, `shortcuts-close`, `catalogue-broken`, `catalogue-retry`,
-`catalogue-warning`, `kpi-scope`, `positions-count`, `broken-detail`. Renaming one requires updating the specs.
+`catalogue-warning`, `kpi-scope`, `positions-count`, `broken-detail`,
+`compare-a`, `compare-b`, `compare-start`, `compare-end`, `compare-run`,
+`compare-error`, `compare-status`, `compare-detail`, `compare-checks`,
+`compare-verification`, `compare-totals`, `compare-slots`, `compare-unmatched`,
+`compare-valuation`, `compare-version`, `compare-window`, `compare-digest`,
+`compare-identity-a`, `compare-identity-b`. Renaming one requires updating the specs.
 
 `#runs-filtered-empty`, `#recent-note`, `#overview-replay`,
 `#overview-reproduction`, `#context-*`, `#last-refresh` and `#recent-empty` are

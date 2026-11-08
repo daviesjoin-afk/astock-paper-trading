@@ -274,7 +274,7 @@ test.describe("auditability of visible facts", () => {
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("nav-experiment").click();
-    await page.locator("details.tech summary").click();
+    await page.locator("#panel-experiment details.tech summary").click();
     await page.getByTestId("copy-tech").focus();
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("live-status")).toContainText("技术细节已复制");
