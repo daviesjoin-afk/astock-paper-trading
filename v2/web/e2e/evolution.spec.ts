@@ -172,6 +172,21 @@ test.describe("evolution history", () => {
     await expect(page.getByTestId("perf-result")).toBeHidden();
   });
 
+  test("filters by the linked experiments", async ({ page }) => {
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf(events) }));
+    await openEvolution(page);
+    await page.getByTestId("evolution-filter-experiment").fill("shadow-base-1");
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(1);
+    await expect(page.getByTestId("evolution-event-evo-1")).toBeVisible();
+
+    await page.getByTestId("evolution-filter-experiment").fill("shadow-candidate-1");
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(1);
+
+    await page.getByTestId("evolution-filter-experiment").fill("no-such-cycle");
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(0);
+    await expect(page.getByTestId("evolution-empty")).toContainText("没有匹配的事件");
+  });
+
   test("an empty log explains itself", async ({ page }) => {
     await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await openEvolution(page);

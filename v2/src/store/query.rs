@@ -1313,6 +1313,17 @@ impl Store {
         candidate_id: Option<&str>,
         status: Option<&str>,
     ) -> StoreResult<Vec<EvolutionEventRecord>> {
+        self.evolution_events_filtered(limit, candidate_id, status, None, None)
+    }
+
+    pub fn evolution_events_filtered(
+        &self,
+        limit: i64,
+        candidate_id: Option<&str>,
+        status: Option<&str>,
+        base_cycle: Option<&str>,
+        candidate_cycle: Option<&str>,
+    ) -> StoreResult<Vec<EvolutionEventRecord>> {
         const EVENT_SCAN_LIMIT: i64 = 200;
         let mut statement = self.conn.prepare(
             "SELECT event_id,candidate_id,status,decision_json,decided_at,base_cycle,candidate_cycle
@@ -1331,11 +1342,17 @@ impl Store {
         })?;
         let mut records = Vec::new();
         for row in rows {
-            let (event_id, row_candidate, row_status, raw_decision, decided_at, base_cycle, candidate_cycle) = row?;
+            let (event_id, row_candidate, row_status, raw_decision, decided_at, row_base, row_candidate_cycle) = row?;
             if candidate_id.is_some_and(|wanted| wanted != row_candidate) {
                 continue;
             }
             if status.is_some_and(|wanted| wanted != row_status) {
+                continue;
+            }
+            if base_cycle.is_some_and(|wanted| row_base.as_deref() != Some(wanted)) {
+                continue;
+            }
+            if candidate_cycle.is_some_and(|wanted| row_candidate_cycle.as_deref() != Some(wanted)) {
                 continue;
             }
             let decision: crate::domain::EvolutionDecision = serde_json::from_str(&raw_decision)?;
@@ -1345,8 +1362,8 @@ impl Store {
                 status: row_status,
                 decision,
                 decided_at,
-                base_cycle,
-                candidate_cycle,
+                base_cycle: row_base,
+                candidate_cycle: row_candidate_cycle,
                 digest: String::new(),
             };
             record.digest = evolution_event_digest(&record)?;
@@ -1466,6 +1483,8 @@ impl Store {
         before: Option<&str>,
         before_id: Option<&str>,
         after: Option<&str>,
+        base_cycle: Option<&str>,
+        candidate_cycle: Option<&str>,
     ) -> StoreResult<EvolutionEventPage> {
         const SCAN_LIMIT: i64 = 2_000;
         let parse = |value: &str| {
@@ -1492,12 +1511,18 @@ impl Store {
         let mut scanned = 0usize;
         let mut events = Vec::new();
         for row in rows {
-            let (event_id, row_candidate, row_status, raw_decision, decided_at, base_cycle, candidate_cycle) = row?;
+            let (event_id, row_candidate, row_status, raw_decision, decided_at, row_base, row_candidate_cycle) = row?;
             scanned += 1;
             if candidate_id.is_some_and(|wanted| wanted != row_candidate) {
                 continue;
             }
             if status.is_some_and(|wanted| wanted != row_status) {
+                continue;
+            }
+            if base_cycle.is_some_and(|wanted| row_base.as_deref() != Some(wanted)) {
+                continue;
+            }
+            if candidate_cycle.is_some_and(|wanted| row_candidate_cycle.as_deref() != Some(wanted)) {
                 continue;
             }
             let at = parse(&decided_at)?;
@@ -1518,8 +1543,8 @@ impl Store {
                 status: row_status,
                 decision,
                 decided_at,
-                base_cycle,
-                candidate_cycle,
+                base_cycle: row_base,
+                candidate_cycle: row_candidate_cycle,
                 digest: String::new(),
             };
             record.digest = evolution_event_digest(&record)?;

@@ -2004,10 +2004,14 @@ const renderEvolutionList = (): void => {
   const container = testId<HTMLElement>("evolution-events");
   const empty = testId<HTMLElement>("evolution-empty");
   const candidate = byId<HTMLInputElement>("evolution-filter-candidate").value.trim().toLowerCase();
+  const experiment = byId<HTMLInputElement>("evolution-filter-experiment").value.trim().toLowerCase();
   const status = byId<HTMLSelectElement>("evolution-filter-status").value;
   const list = evolutionEvents.filter((event) =>
     (candidate === "" || event.candidate_id.toLowerCase().includes(candidate)) &&
-    (status === "" || event.status === status));
+    (status === "" || event.status === status) &&
+    (experiment === "" ||
+      (event.base_cycle ?? "").toLowerCase().includes(experiment) ||
+      (event.candidate_cycle ?? "").toLowerCase().includes(experiment)));
   toggle(empty, list.length === 0);
   if (list.length === 0) {
     empty.textContent = evolutionEvents.length === 0 ? "还没有进化事件。" : "没有匹配的事件。";
@@ -2211,6 +2215,7 @@ testId<HTMLButtonElement>("evolution-more").addEventListener("click", () => void
 
 byId<HTMLInputElement>("evolution-filter-candidate").addEventListener("input", renderEvolutionList);
 byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", renderEvolutionList);
+byId<HTMLInputElement>("evolution-filter-experiment").addEventListener("input", renderEvolutionList);
 
 testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
 

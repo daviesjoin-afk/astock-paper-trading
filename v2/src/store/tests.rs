@@ -3665,7 +3665,7 @@ fn evolution_pages_use_timestamp_and_id_cursor() {
     db.record_evolution_event("e2", "2026-11-05T10:00:00+08:00", make("c2")).unwrap();
     db.record_evolution_event("e3", "2026-11-05T09:00:00+08:00", make("c3")).unwrap();
 
-    let first = db.evolution_events_page(2, None, None, None, None, None).unwrap();
+    let first = db.evolution_events_page(2, None, None, None, None, None, None, None).unwrap();
     assert_eq!(first.events.len(), 2);
     assert_eq!(first.events[0].event_id, "e2");
     assert_eq!(first.events[1].event_id, "e1");
@@ -3681,6 +3681,8 @@ fn evolution_pages_use_timestamp_and_id_cursor() {
             first.next_before.as_deref(),
             first.next_before_id.as_deref(),
             None,
+            None,
+            None,
         )
         .unwrap();
     assert_eq!(second.events.len(), 1);
@@ -3688,18 +3690,18 @@ fn evolution_pages_use_timestamp_and_id_cursor() {
     assert!(second.next_before.is_none());
 
     let after = db
-        .evolution_events_page(10, None, None, None, None, Some("2026-11-05T09:30:00+08:00"))
+        .evolution_events_page(10, None, None, None, None, Some("2026-11-05T09:30:00+08:00"), None, None)
         .unwrap();
     assert_eq!(after.events.len(), 2);
 
     let filtered = db
-        .evolution_events_page(10, Some("c3"), Some("kept"), None, None, None)
+        .evolution_events_page(10, Some("c3"), Some("kept"), None, None, None, None, None)
         .unwrap();
     assert_eq!(filtered.events.len(), 1);
     assert_eq!(filtered.events[0].event_id, "e3");
 
     assert!(matches!(
-        db.evolution_events_page(10, None, None, Some("not-a-time"), None, None),
+        db.evolution_events_page(10, None, None, Some("not-a-time"), None, None, None, None),
         Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_cursor"
     ));
 }
@@ -4053,6 +4055,38 @@ fn evolution_events_can_link_the_experiments_they_judged() {
     let listed = db.evolution_events(10, None, None).unwrap();
     assert_eq!(listed[0].base_cycle.as_deref(), Some("shadow-base-1"));
     assert_eq!(listed[0].candidate_cycle.as_deref(), Some("shadow-candidate-1"));
-    let page = db.evolution_events_page(10, None, None, None, None, None).unwrap();
+    let page = db.evolution_events_page(10, None, None, None, None, None, None, None).unwrap();
     assert_eq!(page.events[0].candidate_cycle.as_deref(), Some("shadow-candidate-1"));
+}
+
+#[test]
+fn evolution_events_filter_by_linked_experiments() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let make = |id: &str| crate::domain::EvolutionDecision {
+        candidate_id: id.into(),
+        status: "promoted".into(),
+        reasons: vec!["通过".into()],
+        digest: "a".repeat(64),
+    };
+    db.record_evolution_event_with_links(
+        "link-a", "2026-11-05T10:00:00+08:00", make("c1"), Some("base-a"), Some("cand-a"),
+    ).unwrap();
+    db.record_evolution_event_with_links(
+        "link-b", "2026-11-05T09:00:00+08:00", make("c2"), Some("base-b"), Some("cand-b"),
+    ).unwrap();
+    db.record_evolution_event("plain", "2026-11-05T08:00:00+08:00", make("c3")).unwrap();
+
+    let by_base = db.evolution_events_filtered(10, None, None, Some("base-a"), None).unwrap();
+    assert_eq!(by_base.len(), 1);
+    assert_eq!(by_base[0].event_id, "link-a");
+    let by_candidate = db.evolution_events_filtered(10, None, None, None, Some("cand-b")).unwrap();
+    assert_eq!(by_candidate[0].event_id, "link-b");
+    let both = db.evolution_events_filtered(10, None, None, Some("base-b"), Some("cand-b")).unwrap();
+    assert_eq!(both.len(), 1);
+    assert_eq!(db.evolution_events_filtered(10, None, None, Some("missing"), None).unwrap().len(), 0);
+    let page = db
+        .evolution_events_page(10, None, None, None, None, None, Some("base-a"), None)
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].event_id, "link-a");
 }

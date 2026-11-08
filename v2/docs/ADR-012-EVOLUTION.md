@@ -92,6 +92,6 @@ python scripts/shadow_candidates.py --artifact cands/X.artifact.json   --output 
 
 - 指标来源：需要由审核净值序列（ADR 007）统一生成，禁止手工填写；
 - 滚动验证与多重比较校正：候选数量多时需要显著性控制；
-- 事件查询：`GET /v2/evolution/events?limit=&candidate=&status=` 支持按候选 id 与状态精确过滤（在最近 200 条内过滤后再截断）；分页用 `GET /v2/evolution/events/page?limit=&before=&before_id=&after=`，游标为 `(decided_at, event_id)`（均不含），同一时刻多条事件不会漏读，最大扫描 2000 条。
+- 事件查询：`GET /v2/evolution/events?limit=&candidate=&status=&base_cycle=&candidate_cycle=` 支持按候选 id、状态与关联实验精确过滤（在最近 200 条内过滤后再截断）；分页端点同样接受这两个实验参数；分页用 `GET /v2/evolution/events/page?limit=&before=&before_id=&after=`，游标为 `(decided_at, event_id)`（均不含），同一时刻多条事件不会漏读，最大扫描 2000 条。
 - 晋级/回退事件已可持久化（`POST/GET /v2/evolution/events`，schema v13）：`event_id` 幂等、同 id 不同决策冲突、列表按时间倒序；仍需与影子运行流水线打通；
 - 参数搜索空间与算力预算。
