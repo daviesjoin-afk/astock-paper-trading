@@ -14,7 +14,7 @@ pub const PAPER_SLOT_COUNT: usize = 2;
 pub const TOTAL_BPS: i64 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "UPPERCASE")]
 pub enum PaperSlotId {
     A,
     B,

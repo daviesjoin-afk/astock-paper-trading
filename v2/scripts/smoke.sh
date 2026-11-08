@@ -337,9 +337,38 @@ for _ in range(2):
     report = call("replay")
     assert report["ok"] and (report["runs_verified"], report["fills_verified"]) == (prefix_runs + len(cases), 3), report
 assert call("portfolio")["runs_total"] == prefix_runs + len(cases)
+
+# Paper account: one user-funded account, two frozen slots, exact split.
+reversion_strategy = json.loads(Path("data/strategy-reversion-v1.json").read_text(encoding="utf-8"))
+paper_spec = {
+    "schema_version": 1, "account_id": "smoke-account", "initial_cash_cents": 10_000_000,
+    "reserve_bps": 1000, "created_at": "2026-11-08T09:00:00+08:00",
+    "slots": [
+        {"slot": "A", "strategy": reviewed_strategy,
+         "market_data_pack_id": "cn-offline-fixture-pack-1",
+         "execution_policy_version": "v2-paper-policy-6", "weight_bps": 4500},
+        {"slot": "B", "strategy": reversion_strategy,
+         "market_data_pack_id": "cn-offline-fixture-pack-1",
+         "execution_policy_version": "v2-paper-policy-6", "weight_bps": 4500},
+    ],
+}
+paper = call("paper-accounts", paper_spec)
+assert paper["initial_cash_cents"] == 10_000_000
+assert paper["reserve_cents"] == 1_000_000
+assert [slot["budget_cents"] for slot in paper["slots"]] == [4_500_000, 4_500_000]
+assert [slot["cash_cents"] for slot in paper["slots"]] == [4_500_000, 4_500_000]
+assert paper["cash_cents"] == paper["initial_cash_cents"]
+assert paper["reserve_cents"] + sum(slot["cash_cents"] for slot in paper["slots"]) == paper["initial_cash_cents"]
+assert all(slot["positions"] == [] for slot in paper["slots"])
+assert call("paper-accounts/smoke-account") == paper  # read must not drift
+assert call("paper-accounts", paper_spec) == paper  # identical spec is idempotent
+conflicting = copy.deepcopy(paper_spec)
+conflicting["initial_cash_cents"] = 20_000_000
+call("paper-accounts", conflicting, expected=409)
+call("paper-accounts/does-not-exist", expected=404)
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
