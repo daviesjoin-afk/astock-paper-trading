@@ -202,6 +202,18 @@ python3 scripts/experiment_demo.py</code></pre>
           </div>
         </section>
 
+        <section class="notice notice-error" id="catalogue-broken" data-testid="catalogue-broken" hidden>
+          <span class="notice-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 2.4 14.4 13H1.6L8 2.4Z" />
+              <path d="M8 6.4v3M8 11.2v.5" />
+            </svg>
+          </span>
+          <h2>实验目录数据异常</h2>
+          <p data-testid="broken-detail"></p>
+          <p class="notice-actions"><button type="button" class="btn" id="catalogue-retry" data-testid="catalogue-retry">重新读取</button></p>
+        </section>
+
         <section class="notice notice-warn" id="unknown-experiment" data-testid="unknown-experiment" hidden>
           <span class="notice-icon" aria-hidden="true">
             <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -213,6 +225,8 @@ python3 scripts/experiment_demo.py</code></pre>
           <p>地址里的 <code id="unknown-cycle"></code> 不在当前数据库中。</p>
           <p class="muted">从上方“当前实验”选择已有实验；不会自动替换成其它实验。</p>
         </section>
+
+        <p class="catalogue-warning" id="catalogue-warning" data-testid="catalogue-warning" role="status" hidden></p>
 
         <div id="workspace" hidden>
           <!-- 概览 -->
@@ -254,6 +268,7 @@ python3 scripts/experiment_demo.py</code></pre>
                 <p class="kpi-note">含被拒绝的决策</p>
               </article>
             </div>
+            <p class="kpi-scope" id="kpi-scope" data-testid="kpi-scope">资产口径：—</p>
             <div class="quick">
               <button type="button" class="link" data-goto="positions">查看持仓 <span aria-hidden="true">→</span></button>
               <button type="button" class="link" data-goto="decisions">查看决策记录 <span aria-hidden="true">→</span></button>
@@ -288,7 +303,7 @@ python3 scripts/experiment_demo.py</code></pre>
             <header class="panel-head">
               <div>
                 <h2>当前持仓</h2>
-                <p class="muted" id="positions-count">按标的汇总的剩余数量</p>
+                <p class="muted" id="positions-count" data-testid="positions-count">按标的汇总的剩余数量</p>
               </div>
               <div class="asof">
                 <label class="field field-inline">
@@ -332,7 +347,7 @@ python3 scripts/experiment_demo.py</code></pre>
             <header class="panel-head">
               <div>
                 <h2>决策记录</h2>
-                <p class="muted">最近 100 条；按写入顺序倒序。原因已转为业务说明。</p>
+                <p class="muted">最近 100 条；按写入顺序倒序；时间按中国时间（UTC+8）显示。</p>
               </div>
               <div class="filter-bar" role="group" aria-label="按结果筛选决策">
                 <button type="button" class="chip" data-filter="all" aria-pressed="true">全部</button>
@@ -415,6 +430,11 @@ python3 scripts/experiment_demo.py</code></pre>
               <p>状态：<strong id="experiment-state" data-testid="experiment-state">—</strong></p>
               <details class="tech">
                 <summary>技术细节</summary>
+                <p class="tech-actions">
+                  <button type="button" class="btn btn-quiet btn-small" id="copy-tech" data-testid="copy-tech">
+                    复制技术细节
+                  </button>
+                </p>
                 <dl class="tech-list">
                   <div><dt>策略标识</dt><dd id="tech-strategy" data-testid="tech-strategy">—</dd></div>
                   <div><dt>研究输入标识</dt><dd id="tech-input" data-testid="tech-input">—</dd></div>

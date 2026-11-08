@@ -451,6 +451,10 @@ html[data-busy="true"] #refresh { color: var(--accent); border-color: color-mix(
 }
 .kpi-note { margin: 6px 0 0; font-size: 10.5px; color: var(--muted); }
 
+.kpi-scope {
+  margin: 0; padding: 0 20px 6px;
+  color: var(--muted); font-size: 11.5px;
+}
 .quick { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 20px 18px; }
 .link {
   display: inline-flex; align-items: center; gap: 6px;
@@ -514,6 +518,7 @@ html[data-busy="true"] #refresh { color: var(--accent); border-color: color-mix(
 .check::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .check[data-state="ok"] { color: var(--ok); }
 .check[data-state="fail"] { color: var(--danger); }
+.check[data-state="stale"] { color: var(--warn); }
 .check[data-state="running"] { color: var(--warn); }
 .subcard-note { margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 
@@ -555,6 +560,10 @@ html[data-busy="true"] #refresh { color: var(--accent); border-color: color-mix(
   color: var(--ok); background: var(--ok-soft);
   border-color: color-mix(in srgb, var(--ok) 30%, var(--border));
 }
+.verify-status[data-state="stale"] {
+  color: var(--warn); background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 30%, var(--border));
+}
 .verify-status[data-state="fail"] {
   color: var(--danger); background: var(--danger-soft);
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
@@ -580,6 +589,14 @@ html[data-busy="true"] #refresh { color: var(--accent); border-color: color-mix(
 .tech-list dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
 
 .asof { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+.catalogue-warning {
+  margin: 0; padding: 10px 14px; border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
+  background: var(--warn-soft); color: var(--warn); font-size: 12.5px;
+}
+
+.tech-actions { margin: 8px 0 0; }
 
 .section-error {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
@@ -611,6 +628,7 @@ tbody tr:hover { background: color-mix(in srgb, var(--accent-soft) 55%, transpar
 tbody tr:last-child td { border-bottom: 0; }
 .num-col { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 td:first-child { font-weight: 550; }
+.run-id { margin-right: 8px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .symbol { font-family: var(--mono); letter-spacing: -0.01em; }
 
 .side-buy, .side-sell, .result-filled, .result-rejected {
@@ -719,7 +737,15 @@ td:first-child { font-weight: 550; }
   th, td { padding: 9px 14px; }
   /* Keep column widths readable; the scroller owns the overflow. */
   table { min-width: 540px; }
-  .section-error { margin: 12px 14px 0; }
+  .catalogue-warning {
+  margin: 0; padding: 10px 14px; border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
+  background: var(--warn-soft); color: var(--warn); font-size: 12.5px;
+}
+
+.tech-actions { margin: 8px 0 0; }
+
+.section-error { margin: 12px 14px 0; }
 }
 
 @media (max-width: 560px) {
@@ -851,7 +877,7 @@ kbd {
   }
   body { background: #ffffff; display: block; }
   .topbar, .sidenav, .page-foot, .control-actions, .filter-bar, .quick, .asof,
-  .notice-actions, .scroll-hint, .sheet, .empty-icon, .noscript, .link-quiet,
+  .notice-actions, .scroll-hint, .sheet, .empty-icon, .noscript, .link-quiet, .tech-actions,
   [aria-busy="true"]::after { display: none !important; }
   /* Ink, not branding: printed cards stay white. */
   .kpi, .kpi-accent, .subcard, .panel, .context-bar { background: #ffffff !important; }

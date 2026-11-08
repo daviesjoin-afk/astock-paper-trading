@@ -124,6 +124,36 @@ test.describe("screenshots", () => {
     await page.screenshot({ path: `${dir}/${prefix}-print.png`, fullPage: true });
   });
 
+  test("stale verification after a reload", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("summary-strategy").waitFor();
+    await page.getByTestId("nav-replay").click();
+    await page.getByTestId("verify-replay").click();
+    await page.getByTestId("replay-status").filter({ hasText: "通过" }).waitFor();
+    await page.getByTestId("refresh").click();
+    await page.getByTestId("replay-status").filter({ hasText: "需要重新验证" }).waitFor();
+    await capture(page, "verify-stale");
+  });
+
+  test("damaged catalogue", async ({ page }) => {
+    await page.route(/\/v2\/experiments\?limit=500$/, (route) =>
+      route.fulfill({ json: { experiments: [], total: 3, skipped: 3 } }));
+    await page.goto("/");
+    await page.getByTestId("catalogue-broken").waitFor();
+    await capture(page, "catalogue-broken");
+  });
+
+  test("as-of scope label on the overview", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("summary-strategy").waitFor();
+    await page.getByTestId("nav-positions").click();
+    await page.getByTestId("asof-day").fill("2026-10-30");
+    await page.getByTestId("asof-apply").click();
+    await page.getByTestId("sellable-header").waitFor();
+    await settle(page);
+    await capture(page, "positions-asof-scope");
+  });
+
   test("error state", async ({ page }) => {
     await page.route("**/v2/**", (route) => route.abort("connectionrefused"));
     await page.goto("/");

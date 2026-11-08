@@ -25,8 +25,15 @@ export const strategyName = (id: string): string => {
 export const inputName = (id: string): string =>
   id === "offline-research-input-v1" ? "固定离线研究输入" : "自定义研究输入";
 
-export const packName = (id: string): string =>
-  id.startsWith("cn-offline-fixture-pack-") ? "离线样本包" : "自定义数据包";
+const PACK_PREFIX = "cn-offline-fixture-pack-";
+/** Distinct packs must stay distinguishable: different ids never share a label. */
+export const packName = (id: string): string => {
+  if (id.startsWith(PACK_PREFIX)) {
+    const suffix = id.slice(PACK_PREFIX.length).trim();
+    return suffix ? `离线样本包 #${suffix}` : "离线样本包";
+  }
+  return "自定义数据包";
+};
 
 export const policyName = (id: string): string =>
   id === "v2-paper-policy-6" ? "默认执行规则" : "自定义执行规则";
@@ -43,9 +50,20 @@ export const resultLabel = (status: string): string => {
   return status;
 };
 
+/** Stable short fingerprint so two different ids never render identically. */
+const fingerprint = (value: string): string => {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash * 33) ^ value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(36).padStart(4, "0").slice(0, 5);
+};
+
 export const signalName = (signalId: string): string => {
   const match = /-(\d{4})-/.exec(signalId);
-  return match ? `第 ${Number(match[1])} 条信号` : "模拟信号";
+  if (match) return `第 ${Number(match[1])} 条信号`;
+  // Unknown shapes still need a traceable, non-identical label.
+  return `信号 ${fingerprint(signalId)}`;
 };
 
 const REASONS: Record<string, string> = {
@@ -82,8 +100,34 @@ const REASONS: Record<string, string> = {
 
 export const reasonLabel = (code: string): string => REASONS[code] ?? "其它原因";
 
-/** Fixed-format decision time from the stored RFC3339 string (no timezone math). */
+/** Decision times are stored as RFC3339 instants; the ledger day is China (+08:00). */
+export const DECISION_TIME_ZONE = "Asia/Shanghai";
+
+const decisionFormat = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: DECISION_TIME_ZONE,
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+  hourCycle: "h23",
+});
+
+const part = (parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string =>
+  parts.find((item) => item.type === type)?.value ?? "";
+
+/**
+ * China-time rendering of an RFC3339 instant, independent of the browser zone.
+ * Unparseable values fall back to the stored text so nothing is invented.
+ */
 export const decisionTime = (value: string): string => {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value);
-  return match ? `${match[2]}-${match[3]} ${match[4]}:${match[5]}` : value;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const parts = decisionFormat.formatToParts(date);
+  const month = part(parts, "month");
+  const day = part(parts, "day");
+  const hour = part(parts, "hour");
+  const minute = part(parts, "minute");
+  if (!month || !day || !hour || !minute) return value;
+  return `${month}-${day} ${hour}:${minute}`;
 };

@@ -111,6 +111,25 @@ test.describe("notice and interaction states", () => {
     await scan(page, "empty-catalogue");
   });
 
+  test("a damaged catalogue notice is accessible", async ({ page }) => {
+    await page.route(/\/v2\/experiments\?limit=500$/, (route) =>
+      route.fulfill({ json: { experiments: [], total: 2, skipped: 2 } }));
+    await page.goto("/");
+    await expect(page.getByTestId("catalogue-broken")).toBeVisible();
+    await scan(page, "catalogue-broken");
+  });
+
+  test("a partially damaged catalogue keeps its warning readable", async ({ page, request }) => {
+    await page.route(/\/v2\/experiments\?limit=500$/, async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      await route.fulfill({ json: { ...body, skipped: 1 } });
+    });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await expect(page.getByTestId("catalogue-warning")).toBeVisible();
+    await scan(page, "catalogue-warning");
+  });
+
   test("the service error state is accessible", async ({ page }) => {
     await page.route("**/v2/**", (route) => route.abort("connectionrefused"));
     await page.goto("/");

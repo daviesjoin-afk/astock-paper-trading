@@ -43,6 +43,7 @@ type ExperimentDetail = {
 
 type Position = { symbol: string; quantity: number; sellable_quantity: number | null };
 type Portfolio = {
+  cycle_id: string;
   initial_cash_cents: number;
   cash_cents: number;
   asof_day: string | null;
@@ -56,8 +57,14 @@ type Run = {
   outcome: { status: string; reason: string };
 };
 
-type ReplayReport = { ok: boolean; runs_verified: number; fills_verified: number; cash_cents: number };
-type ReproductionReport = { ok: boolean; signals_verified: number };
+type ReplayReport = {
+  cycle_id: string; ok: boolean; runs_verified: number; fills_verified: number; cash_cents: number;
+};
+type ReproductionReport = { cycle_id: string; ok: boolean; signals_verified: number };
+
+/** An experiment plus the exact as-of scope of the facts on screen. */
+type Scope = { cycle: string; asof: string | null };
+type VerifyKind = "replay" | "reproduction";
 
 // ---------------------------------------------------------------------------
 // DOM helpers. External strings only ever go through textContent.
@@ -162,20 +169,35 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
   announce(`已切换到${VIEWS[view].label}`);
 };
 
-const showOnly = (panel: "service" | "empty" | "unknown" | "workspace" | "loading" | null): void => {
+type PanelState = "service" | "empty" | "unknown" | "broken" | "workspace" | "loading" | null;
+const NOTICE_IDS: Record<Exclude<PanelState, "workspace" | null>, string> = {
+  service: "service-error",
+  empty: "empty-experiments",
+  unknown: "unknown-experiment",
+  broken: "catalogue-broken",
+  loading: "loading",
+};
+
+const showOnly = (panel: PanelState): void => {
   const active = document.activeElement as HTMLElement | null;
-  toggle(testId("loading"), panel === "loading");
-  toggle(testId("service-error"), panel === "service");
-  toggle(testId("empty-experiments"), panel === "empty");
-  toggle(testId("unknown-experiment"), panel === "unknown");
+  for (const [state, id] of Object.entries(NOTICE_IDS)) {
+    toggle(testId(id), panel === state);
+  }
   toggle(byId("context-bar"), panel === "workspace");
   toggle(byId("workspace"), panel === "workspace");
+  // The damaged-row warning belongs to a readable workspace, not to notices.
+  const warningVisible = panel === "workspace" && listSkipped > 0;
+  toggle(byId("catalogue-warning"), warningVisible);
+  if (warningVisible) {
+    setById("catalogue-warning",
+      `有 ${listSkipped} 个实验记录数据损坏已跳过；其余 ${experiments.length} 个实验仍可正常读取。`);
+  }
   // Nothing to navigate to while a notice owns the screen.
   const navEnabled = panel === "workspace";
   for (const button of navButtons) button.disabled = !navEnabled;
   if (active && active !== document.body && !isVisible(active)) {
     const region = panel === "workspace" ? byId("workspace")
-      : panel ? testId(`${panel === "service" ? "service-error" : panel === "empty" ? "empty-experiments" : panel === "unknown" ? "unknown-experiment" : "loading"}`)
+      : panel ? testId(NOTICE_IDS[panel])
       : byId("main");
     const heading = region.querySelector<HTMLElement>("h1, h2");
     if (heading) { heading.tabIndex = -1; heading.focus(); } else { byId("main").focus(); }
@@ -196,7 +218,13 @@ let loadSequence = 0;
 let asofSequence = 0;
 let listController: AbortController | null = null;
 let cycleController: AbortController | null = null;
+// `asofDay` is what the user asks for; `loadedScope` is what the API actually
+// returned and what the screen is currently allowed to show.
 let asofDay: string | null = null;
+let loadedScope: Scope | null = null;
+let dataEpoch = 0;
+const verifySeq: Record<VerifyKind, number> = { replay: 0, reproduction: 0 };
+const verifiedEpoch: Record<VerifyKind, number> = { replay: -1, reproduction: -1 };
 let lastPositions: Position[] = [];
 let lastRuns: Run[] = [];
 const FILTER_LABELS = { all: "全部", filled: "已成交", rejected: "已拒绝" } as const;
@@ -256,15 +284,18 @@ const resetWorkspace = (): void => {
   setVerify("replay", "idle", "未验证", "");
   setVerify("reproduction", "idle", "未验证", "");
   asofDay = null;
+  loadedScope = null;
   (byId<HTMLInputElement>("asof-day")).value = "";
   toggle(testId("sellable-header"), false);
   setById("positions-count", "按标的汇总的剩余数量");
+  setById("kpi-scope", "资产口径：—");
 };
 
-const describeCatalogue = (selected: string): string => {
+const describeCatalogue = (selected: string, options: { unlisted?: boolean } = {}): string => {
   const parts = [`共 ${listTotal} 个实验`];
-  if (experiments.length < listTotal) parts.push(`显示前 ${experiments.length} 个`);
+  if (experiments.length < listTotal) parts.push(`末页可读取 ${experiments.length} 个（上限 ${CATALOGUE_LIMIT}）`);
   if (listSkipped > 0) parts.push(`${listSkipped} 个数据损坏已跳过`);
+  if (options.unlisted) parts.push("当前实验不在目录中，已直接核对");
   if (!selected) parts.push("未指定时默认选择第一个");
   return parts.join(" · ");
 };
@@ -301,28 +332,50 @@ const renderSummary = (detail: ExperimentDetail): void => {
   setText("tech-policy", spec.execution_policy_version);
 };
 
-const renderPortfolio = (portfolio: Portfolio): void => {
+const scopeText = (scope: Scope | null): string =>
+  !scope || scope.asof === null ? "当前持仓（未指定日终）" : `日终 ${scope.asof}（中国时间）`;
+
+const sameScope = (left: Scope, right: Scope): boolean =>
+  left.cycle === right.cycle && left.asof === right.asof;
+
+class ScopeMismatchError extends Error {}
+
+/**
+ * Render facts only when the response proves it belongs to the requested
+ * experiment and as-of day. A mismatch is an error, never a silent relabel.
+ */
+const renderPortfolio = (portfolio: Portfolio, expected: Scope): void => {
+  const actual: Scope = { cycle: portfolio.cycle_id, asof: portfolio.asof_day ?? null };
+  if (!sameScope(actual, expected)) {
+    throw new ScopeMismatchError(
+      `资产口径不一致：请求 ${expected.cycle} / ${scopeText(expected)}，返回 ${actual.cycle} / ${scopeText(actual)}`,
+    );
+  }
+  loadedScope = actual;
   setText("kpi-initial-cash", money(portfolio.initial_cash_cents));
   setText("kpi-cash", money(portfolio.cash_cents));
   setText("kpi-positions", integer(portfolio.positions.length));
   setText("kpi-runs", integer(portfolio.runs_total));
+  setById("kpi-scope", `资产口径：${scopeText(actual)}`);
   lastPositions = portfolio.positions;
+  toggle(testId("positions-error"), false);
   renderPositions();
 };
 
 const renderPositions = (): void => {
   const body = byId("positions-body");
   body.replaceChildren();
-  toggle(testId("sellable-header"), asofDay !== null);
-  setById("positions-count", asofDay === null
+  const asof = loadedScope?.asof ?? null;
+  toggle(testId("sellable-header"), asof !== null);
+  setById("positions-count", asof === null
     ? `共 ${lastPositions.length} 个标的 · 未指定日终口径`
-    : `共 ${lastPositions.length} 个标的 · 日终口径 ${asofDay}`);
-  if (asofDay !== null) {
+    : `共 ${lastPositions.length} 个标的 · 日终口径 ${asof}`);
+  if (asof !== null) {
     const note = document.createElement("tr");
     note.className = "asof-row";
     const cell = document.createElement("td");
     cell.colSpan = 3;
-    cell.textContent = `日终口径 ${asofDay} · 可卖数量按该日计算`;
+    cell.textContent = `日终口径 ${asof} · 可卖数量按该日计算`;
     note.appendChild(cell);
     body.appendChild(note);
   }
@@ -335,7 +388,7 @@ const renderPositions = (): void => {
     quantity.className = "num-col";
     quantity.textContent = integer(position.quantity);
     row.append(symbol, quantity);
-    if (asofDay !== null) {
+    if (asof !== null) {
       const sellable = document.createElement("td");
       sellable.className = "num-col";
       sellable.textContent = position.sellable_quantity === null ? "—" : integer(position.sellable_quantity);
@@ -358,7 +411,11 @@ const paintRuns = (): void => {
   for (const run of rows) {
     const row = document.createElement("tr");
     const time = document.createElement("td");
-    time.textContent = decisionTime(run.request.decision_at);
+    const runId = document.createElement("span");
+    runId.className = "run-id";
+    runId.textContent = `#${run.id}`;
+    runId.title = `记录 #${run.id}`;
+    time.append(runId, document.createTextNode(decisionTime(run.request.decision_at)));
     const signal = document.createElement("td");
     signal.textContent = signalName(run.request.signal_id);
     signal.title = run.request.signal_id;
@@ -425,12 +482,13 @@ const renderRecent = (): void => {
 
 const renderRuns = (runs: Run[]): void => {
   lastRuns = runs;
+  toggle(testId("runs-error"), false);
   paintRuns();
 };
 
 const setVerify = (
-  kind: "replay" | "reproduction",
-  state: "idle" | "running" | "ok" | "fail",
+  kind: VerifyKind,
+  state: "idle" | "running" | "ok" | "fail" | "stale",
   message: string,
   detail: string,
 ): void => {
@@ -477,6 +535,27 @@ const showListFailure = (message: string): void => {
   showOnly("service");
 };
 
+const portfolioQuery = (cycle: string, asof: string | null): string => {
+  const base = `/v2/portfolio?cycle_id=${encodeURIComponent(cycle)}`;
+  return asof === null ? base : `${base}&asof_day=${encodeURIComponent(asof)}`;
+};
+
+/** Report a portfolio failure without ever relabelling facts already on screen. */
+const portfolioFailure = (error: unknown, keepContent: boolean, retry: () => void): void => {
+  if (keepContent && loadedScope) {
+    showSectionError("positions",
+      `本次资产查询失败，仍显示${scopeText(loadedScope)}：${errorDetail(error)}`, retry);
+    announce("资产查询失败，已保留上次成功的资产口径");
+    return;
+  }
+  setText("kpi-cash", "读取失败");
+  setText("kpi-positions", "读取失败");
+  setText("kpi-runs", "读取失败");
+  setById("kpi-scope", "资产口径：读取失败");
+  showSectionError("positions", `资产读取失败：${errorDetail(error)}`, retry);
+  announce("资产读取失败");
+};
+
 const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {}): Promise<void> => {
   const sequence = ++loadSequence;
   cycleController?.abort();
@@ -489,10 +568,13 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
   setBusy(true);
   if (options.keepContent) announce("正在刷新…");
 
+  // One request per refresh: the applied as-of day is part of the request, so a
+  // current-holdings response can never be shown under a historical label.
+  const requestedScope: Scope = { cycle, asof: asofDay };
   const encoded = encodeURIComponent(cycle);
   const results = await Promise.allSettled([
     api<ExperimentDetail>(`/v2/experiments/${encoded}`, controller.signal),
-    api<Portfolio>(`/v2/portfolio?cycle_id=${encoded}`, controller.signal),
+    api<Portfolio>(portfolioQuery(cycle, requestedScope.asof), controller.signal),
     api<Run[]>(`/v2/simulations?cycle_id=${encoded}`, controller.signal),
   ]);
   if (sequence !== loadSequence) return;
@@ -511,31 +593,68 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
     showListFailure(`读取实验失败：${errorDetail(error)}`);
     return;
   }
+  if (detail.value.spec.cycle_id !== cycle) {
+    showListFailure(`读取实验失败：返回的实验与请求不一致（${detail.value.spec.cycle_id}）`);
+    return;
+  }
 
   rendered = true;
   showOnly("workspace");
   showView(currentView);
   renderSummary(detail.value);
   setById("last-refresh", new Date().toLocaleTimeString("zh-CN", { hour12: false }));
+  const retry = () => void loadCycle(currentCycle, { keepContent: true });
 
   if (portfolio.status === "fulfilled") {
-    renderPortfolio(portfolio.value);
+    try {
+      renderPortfolio(portfolio.value, requestedScope);
+    } catch (error) {
+      portfolioFailure(error, options.keepContent === true, retry);
+    }
   } else {
-    setText("kpi-cash", "读取失败");
-    setText("kpi-positions", "读取失败");
-    setText("kpi-runs", "读取失败");
-    showSectionError("positions", `资产读取失败：${errorDetail(portfolio.reason)}`,
-      () => void loadCycle(currentCycle, { keepContent: true }));
+    portfolioFailure(portfolio.reason, options.keepContent === true, retry);
   }
 
   if (runs.status === "fulfilled") {
     renderRuns(runs.value);
   } else {
-    showSectionError("runs", `决策读取失败：${errorDetail(runs.reason)}`,
-      () => void loadCycle(currentCycle, { keepContent: true }));
+    showSectionError("runs", `决策读取失败：${errorDetail(runs.reason)}`, retry);
   }
 
-  announce(`已载入实验 ${cycle}`);
+  // A fresh snapshot invalidates earlier verification results.
+  dataEpoch += 1;
+  for (const kind of ["replay", "reproduction"] as VerifyKind[]) {
+    verifySeq[kind] += 1;
+    if (verifiedEpoch[kind] !== -1) {
+      verifiedEpoch[kind] = -1;
+      setVerify(kind, "stale", "需要重新验证", "实验数据已重新载入，请重新运行校验");
+    }
+  }
+
+  announce(`已载入实验 ${cycle}（${scopeText(portfolio.status === "fulfilled" ? loadedScope : null)}）`);
+};
+
+const CATALOGUE_LIMIT = 500;
+
+/** Ask the single-experiment endpoint whether an unlisted cycle really exists. */
+const probeExperiment = async (
+  cycle: string,
+  signal: AbortSignal,
+): Promise<ExperimentDetail | ApiError> => {
+  try {
+    return await api<ExperimentDetail>(`/v2/experiments/${encodeURIComponent(cycle)}`, signal);
+  } catch (error) {
+    return error instanceof ApiError ? error : new ApiError(null, String(error));
+  }
+};
+
+const showCatalogueBroken = (total: number, skipped: number): void => {
+  setText("broken-detail",
+    `目录登记 ${total} 个实验，可读取 0 个${skipped > 0 ? `（${skipped} 个记录数据损坏）` : ""}。` +
+    "这不是“没有实验”，而是登记数据无法读取。");
+  hint.textContent = `共 ${total} 个实验，均无法读取`;
+  showOnly("broken");
+  announce("实验目录数据异常");
 };
 
 const loadList = async (): Promise<void> => {
@@ -545,7 +664,7 @@ const loadList = async (): Promise<void> => {
   listController = controller;
   let list: ExperimentSummary[];
   try {
-    const body = await api<ExperimentCatalogue>("/v2/experiments", controller.signal);
+    const body = await api<ExperimentCatalogue>(`/v2/experiments?limit=${CATALOGUE_LIMIT}`, controller.signal);
     list = Array.isArray(body.experiments) ? body.experiments : [];
     listTotal = typeof body.total === "number" ? body.total : list.length;
     listSkipped = typeof body.skipped === "number" ? body.skipped : 0;
@@ -560,6 +679,10 @@ const loadList = async (): Promise<void> => {
   renderSelector();
 
   if (list.length === 0) {
+    if (listTotal > 0 || listSkipped > 0) {
+      showCatalogueBroken(listTotal, listSkipped);
+      return;
+    }
     showOnly("empty");
     hint.textContent = "未登记实验";
     announce("还没有实验");
@@ -567,23 +690,39 @@ const loadList = async (): Promise<void> => {
   }
 
   const requested = urlCycle();
+  let unlisted = false;
   if (requested && !list.some((item) => item.cycle_id === requested)) {
-    byId("unknown-cycle").textContent = requested;
-    const placeholder = document.createElement("option");
-    placeholder.value = "";
-    placeholder.textContent = "选择实验…";
-    placeholder.disabled = true;
-    placeholder.selected = true;
-    select.prepend(placeholder);
-    hint.textContent = `共 ${list.length} 个实验；地址中的实验不存在`;
-    showOnly("unknown");
-    announce("实验不存在");
-    return;
+    const probe = await probeExperiment(requested, controller.signal);
+    if (controller.signal.aborted) return;
+    if (probe instanceof ApiError) {
+      if (probe.status === 404) {
+        byId("unknown-cycle").textContent = requested;
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "选择实验…";
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        select.prepend(placeholder);
+        hint.textContent = `共 ${list.length} 个实验（目录最多显示 ${CATALOGUE_LIMIT} 条）；地址中的实验不存在`;
+        showOnly("unknown");
+        announce("实验不存在");
+        return;
+      }
+      showListFailure(`读取实验失败：${errorDetail(probe)}`);
+      announce("实验读取失败");
+      return;
+    }
+    // It exists beyond the catalogue window: keep the identity visible.
+    unlisted = true;
+    const option = document.createElement("option");
+    option.value = requested;
+    option.textContent = `${requested}（目录未列出）`;
+    select.prepend(option);
   }
 
   const cycle = requested || list[0].cycle_id;
   select.value = cycle;
-  hint.textContent = describeCatalogue(requested);
+  hint.textContent = describeCatalogue(requested, { unlisted });
   syncUrl(cycle);
   await loadCycle(cycle);
 };
@@ -600,15 +739,12 @@ select.addEventListener("change", () => {
 });
 
 byId("refresh").addEventListener("click", () => {
-  if (currentCycle) {
-    void loadCycle(currentCycle, { keepContent: true }).then(() => {
-      if (asofDay !== null) void loadPortfolioOnly();
-    });
-  } else {
-    void loadList();
-  }
+  // The refresh keeps whatever as-of scope is applied and loads it exactly once.
+  if (currentCycle) void loadCycle(currentCycle, { keepContent: true });
+  else void loadList();
 });
 testId("retry").addEventListener("click", () => void loadList());
+testId("catalogue-retry").addEventListener("click", () => void loadList());
 
 for (const button of navButtons) {
   button.addEventListener("click", () => showView(button.dataset.view as View));
@@ -638,31 +774,68 @@ for (const chip of filterChips) {
   });
 }
 
-const runVerification = async (kind: "replay" | "reproduction"): Promise<void> => {
+const runVerification = async (kind: VerifyKind): Promise<void> => {
   const cycle = currentCycle;
   if (!cycle) return;
+  const button = testId<HTMLButtonElement>(`verify-${kind}`);
+  if (button.disabled) return; // one in-flight check per kind
   const label = kind === "replay" ? "回放" : "研究重做";
+  const seq = ++verifySeq[kind];
+  const epoch = dataEpoch;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   setVerify(kind, "running", "进行中…", "");
   announce(`${label}开始`);
   const encoded = encodeURIComponent(cycle);
+  const current = (): boolean =>
+    seq === verifySeq[kind] && epoch === dataEpoch && cycle === currentCycle;
   try {
     if (kind === "replay") {
       const report = await api<ReplayReport>(`/v2/replay?cycle_id=${encoded}`, new AbortController().signal);
-      if (cycle !== currentCycle) return;
+      if (!current()) return;
+      if (report.cycle_id !== cycle) {
+        setVerify(kind, "fail", "失败：回放报告属于其它实验", "跨实验的校验结果不能作为本实验证据");
+        announce("交易回放实验身份不一致");
+        return;
+      }
+      if (report.ok !== true) {
+        setVerify(kind, "fail", `未通过（${report.runs_verified} 次决策，${report.fills_verified} 次成交）`,
+          "回放报告未声明通过，不能视为可复现");
+        announce("交易回放未通过");
+        return;
+      }
+      verifiedEpoch[kind] = epoch;
       setVerify(kind, "ok", `通过（${report.runs_verified} 次决策，${report.fills_verified} 次成交）`,
         `校验后现金 ${money(report.cash_cents)}`);
       announce("交易回放通过");
     } else {
       const report = await api<ReproductionReport>(
         `/v2/experiments/${encoded}/research-reproduction`, new AbortController().signal);
-      if (cycle !== currentCycle) return;
+      if (!current()) return;
+      if (report.cycle_id !== cycle) {
+        setVerify(kind, "fail", "失败：重做报告属于其它实验", "跨实验的校验结果不能作为本实验证据");
+        announce("研究重做实验身份不一致");
+        return;
+      }
+      if (report.ok !== true) {
+        setVerify(kind, "fail", `未通过（${report.signals_verified} 条研究信号）`,
+          "重做报告未声明通过，研究信号不可复现");
+        announce("研究重做未通过");
+        return;
+      }
+      verifiedEpoch[kind] = epoch;
       setVerify(kind, "ok", `通过（${report.signals_verified} 条研究信号）`, "研究信号与固定输入一致");
       announce("研究重做通过");
     }
   } catch (error) {
-    if (cycle !== currentCycle) return;
+    if (!current()) return;
     setVerify(kind, "fail", `失败：${errorDetail(error)}`, "该实验结果不能用于研究比较");
     announce(`${label}失败`);
+  } finally {
+    if (seq === verifySeq[kind] && cycle === currentCycle) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
   }
 };
 testId("verify-replay").addEventListener("click", () => void runVerification("replay"));
@@ -671,17 +844,23 @@ testId("verify-reproduction").addEventListener("click", () => void runVerificati
 const loadPortfolioOnly = async (): Promise<void> => {
   const cycle = currentCycle;
   if (!cycle) return;
+  const requested: Scope = { cycle, asof: asofDay };
   const sequence = ++asofSequence;
-  const query = `/v2/portfolio?cycle_id=${encodeURIComponent(cycle)}` +
-    (asofDay === null ? "" : `&asof_day=${encodeURIComponent(asofDay)}`);
   try {
-    const portfolio = await api<Portfolio>(query, new AbortController().signal);
+    const portfolio = await api<Portfolio>(portfolioQuery(cycle, requested.asof), new AbortController().signal);
     if (sequence !== asofSequence || cycle !== currentCycle) return;
-    renderPortfolio(portfolio);
-    announce(asofDay === null ? "已清除日终口径" : `已按 ${asofDay} 日终口径读取`);
+    renderPortfolio(portfolio, requested);
+    announce(requested.asof === null ? "已清除日终口径" : `已按 ${requested.asof} 日终口径读取`);
   } catch (error) {
-    if (sequence !== asofSequence) return;
-    showSectionError("positions", `资产读取失败：${errorDetail(error)}`, () => void loadPortfolioOnly());
+    if (sequence !== asofSequence || cycle !== currentCycle) return;
+    // The screen keeps the last successfully loaded scope; the failed request is
+    // reported as a failed query, never as new facts for the requested date.
+    showSectionError("positions",
+      loadedScope
+        ? `本次日终查询失败，仍显示${scopeText(loadedScope)}：${errorDetail(error)}`
+        : `资产读取失败：${errorDetail(error)}`,
+      () => void loadPortfolioOnly());
+    announce("日终查询失败，已保留上次成功的资产口径");
   }
 };
 
@@ -721,6 +900,26 @@ copyLink.addEventListener("click", async () => {
     window.setTimeout(() => { if (label) label.textContent = "复制链接"; }, 2000);
   } catch {
     announce("复制失败，请手动复制地址栏链接");
+  }
+});
+
+const copyTech = testId<HTMLButtonElement>("copy-tech");
+copyTech.addEventListener("click", async () => {
+  const fields: Array<[string, string]> = [
+    ["实验", "experiment-name"],
+    ["策略标识", "tech-strategy"],
+    ["研究输入标识", "tech-input"],
+    ["数据包标识", "tech-pack"],
+    ["执行规则标识", "tech-policy"],
+  ];
+  const text = fields.map(([label, id]) => `${label}: ${byId(id).textContent ?? ""}`).join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    copyTech.textContent = "已复制";
+    announce("技术细节已复制");
+    window.setTimeout(() => { copyTech.textContent = "复制技术细节"; }, 2000);
+  } catch {
+    announce("复制失败，请展开技术细节手动选择");
   }
 });
 

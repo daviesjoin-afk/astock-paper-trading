@@ -31,7 +31,7 @@ test.describe("navigation and discovery", () => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await expect(page.getByTestId("summary-strategy")).toHaveText("动量策略");
     await expect(page.getByTestId("summary-input")).toHaveText("固定离线研究输入");
-    await expect(page.getByTestId("summary-pack")).toHaveText("离线样本包");
+    await expect(page.getByTestId("summary-pack")).toHaveText("离线样本包 #1");
     await expect(page.getByTestId("summary-policy")).toHaveText("默认执行规则");
     await expect(page.getByTestId("summary-status")).toHaveText("进行中");
 

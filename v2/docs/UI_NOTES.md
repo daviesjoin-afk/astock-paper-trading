@@ -58,6 +58,32 @@ Breakpoints: 1100px (rail → strip), 900px (4 → 2 KPI columns), 720px (tablet
 padding, stacked controls), 560px (rail grid), 480px (compact type), 420px
 (button labels), 360px (single-column KPIs, icon-only controls).
 
+## Facts must stay attached to their scope
+
+- A portfolio read is issued **once per refresh** with the applied `asof_day`
+  (`portfolioQuery`). The screen never chains a current read and a historical
+  read, so a current book cannot be rendered under a historical label.
+- `renderPortfolio()` rejects a response whose `cycle_id` or `asof_day` differs
+  from the request (`ScopeMismatchError`) and shows an error instead of
+  relabelling facts.
+- `asofDay` is the date the user asked for; `loadedScope` is what the API
+  actually returned and what the positions table, its count line, and the
+  overview `kpi-scope` line all read. A failed as-of query keeps the previous
+  scope on screen and says which scope is still displayed.
+- Decision times are rendered with `Intl.DateTimeFormat` fixed to
+  `Asia/Shanghai`, so `…T06:00:00Z`, `…T14:00:00+08:00` and
+  `…T20:00:00-08:00` produce the China wall-clock values the ledger uses. The
+  decisions panel states “中国时间（UTC+8）”.
+- Verification state is bound to a data epoch: a successful reload marks earlier
+  passes as `stale` (“需要重新验证”), and every check carries its own request
+  sequence, so a late answer for another experiment cannot repaint the screen.
+  `ok !== true` is a failure, and the report's `cycle_id` must match.
+- The catalogue asks for the API maximum (`limit=500`). When a `cycle_id` is not
+  in that window the UI probes `GET /v2/experiments/{id}` before deciding it is
+  missing, distinguishes “not listed” from “does not exist”, and reports a
+  damaged catalogue (`total > 0`, nothing readable) instead of “还没有实验”.
+  Partially damaged catalogues stay usable with a visible warning.
+
 ## Components
 
 - **KPI cards** state one fact each and never compute an implied return.
@@ -65,6 +91,14 @@ padding, stacked controls), 560px (rail grid), 480px (compact type), 420px
   the panel on desktop so a 100-row window does not push the page.
 - **Status pills** are spans inside cells; styling a `<td>` as a pill breaks row
   baseline alignment.
+- **Decision rows** lead with the stored record id (`#id`) so a row can be cited
+  even when the signal id shape is unknown; unknown signal shapes render a stable
+  short fingerprint instead of a shared “模拟信号” label.
+- **Technical details** stay collapsed but carry a keyboard-reachable
+  “复制技术细节” button that copies experiment, strategy, input, pack and policy
+  identifiers as `label: value` lines.
+- **Data-pack labels** keep the pack suffix (`离线样本包 #1`, `… #2`), so two
+  packs are never shown as the same fact.
 - **Decision filters** (`全部 / 已成交 / 已拒绝`) narrow the rendered rows, carry
   their own counts, survive experiment switches, and are written to the URL;
   filtering never mutates stored facts.
@@ -113,8 +147,9 @@ and wins from then on. With no stored choice the page follows
 `sellable-header`, `asof-*`, `runs-body`, `runs-empty-state`, `recent-list`,
 `verify-replay`, `verify-reproduction`, `*-status`, `*-detail`, `tech-*`,
 `service-*`, `loading`, `empty-experiments`, `unknown-experiment`,
-`live-status`, `copy-demo`, `copy-link`, `shortcuts`, `shortcuts-open`,
-`shortcuts-close`. Renaming one requires updating the specs.
+`live-status`, `copy-demo`, `copy-link`, `copy-tech`, `shortcuts`,
+`shortcuts-open`, `shortcuts-close`, `catalogue-broken`, `catalogue-retry`,
+`catalogue-warning`, `kpi-scope`, `positions-count`, `broken-detail`. Renaming one requires updating the specs.
 
 `#runs-filtered-empty`, `#recent-note`, `#overview-replay`,
 `#overview-reproduction`, `#context-*`, `#last-refresh` and `#recent-empty` are
