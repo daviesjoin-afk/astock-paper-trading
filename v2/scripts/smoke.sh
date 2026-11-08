@@ -365,6 +365,8 @@ conflicting = copy.deepcopy(paper_spec)
 conflicting["initial_cash_cents"] = 20_000_000
 call("paper-accounts", conflicting, expected=409)
 call("paper-accounts/does-not-exist", expected=404)
+# The bundled reviewed price-set catalogue is empty by design: no invented prices.
+assert call("price-sets") == []
 
 # Slot-owned order path: evidence, budget and conservation.
 paper_order = {

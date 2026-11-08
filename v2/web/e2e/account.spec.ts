@@ -47,6 +47,26 @@ test.describe("paper account console", () => {
     await expect(page).toHaveURL(new RegExp(`account=${PAPER_ACCOUNT}`));
   });
 
+  test("a reviewed price set renders market value and profit", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/.+\/valuation\?/, (route) => route.fulfill({
+      json: {
+        account_id: "e2e-account", as_of_day: "2026-11-02", status: "valued", reason: "",
+        requirements: [], missing: [], priced_symbols: 1, digest: "d".repeat(64),
+        valuation: {
+          trust: "reviewed", price_set_id: "reviewed-prices-2026-11-02",
+          market_value_cents: 900_000, cash_cents: 9_000_000, equity_cents: 9_900_000,
+          profit_cents: -100_000,
+        },
+      },
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-valuation")).toContainText("估值可用", { timeout: 15_000 });
+    await expect(page.getByTestId("account-valuation-detail")).toContainText("市值");
+    await expect(page.getByTestId("account-valuation-detail")).toContainText("权益");
+    await expect(page.getByTestId("account-valuation-detail")).toContainText("盈亏");
+    await expect(page.getByTestId("account-valuation-detail")).toContainText("reviewed-prices-2026-11-02");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();

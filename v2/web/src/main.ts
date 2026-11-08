@@ -1057,6 +1057,10 @@ type PaperValuationReport = {
   account_id: string; as_of_day: string; status: string; reason: string;
   requirements: Array<{ slot: string; market_data_pack_id: string; symbols: string[] }>;
   missing: string[]; priced_symbols: number; digest: string;
+  valuation?: {
+    trust: string; price_set_id: string; market_value_cents: number;
+    cash_cents: number; equity_cents: number; profit_cents: number | null;
+  } | null;
 };
 
 type PaperSessionView = {
@@ -1349,11 +1353,26 @@ const chinaDayOf = (value: string): string => {
 
 const renderValuation = (report: PaperValuationReport | null, asOf: string): void => {
   const detail = testId<HTMLElement>("account-valuation-detail");
+  const banner = testId<HTMLElement>("account-valuation");
   if (!report || !asOf) {
     toggle(detail, false);
     return;
   }
   toggle(detail, true);
+  if (report.status === "valued" && report.valuation) {
+    const valued = report.valuation;
+    banner.textContent = valued.trust === "reviewed"
+      ? "估值可用：使用审核价格集合。"
+      : "估值可用：使用合成价格集合（不计算盈亏）。";
+    const profit = valued.profit_cents;
+    detail.textContent =
+      `估值快照（截至 ${asOf}）：市值 ${money(valued.market_value_cents)} · ` +
+      `权益 ${money(valued.equity_cents)} · 现金 ${money(valued.cash_cents)}` +
+      (profit === null ? " · 不计算盈亏" : ` · 盈亏 ${money(profit)}`) +
+      ` · 价格集合 ${valued.price_set_id}`;
+    return;
+  }
+  banner.textContent = "估值不可用：没有审核过的市价集合，本页不计算市值、净值或收益。";
   if (report.status === "unavailable") {
     const needs = report.requirements
       .flatMap((requirement) => requirement.symbols.map((symbol) => `${symbol}（${packName(requirement.market_data_pack_id)}）`));

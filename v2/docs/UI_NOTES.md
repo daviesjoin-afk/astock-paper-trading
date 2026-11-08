@@ -107,7 +107,11 @@ form, no valuation.
 - Risk boundaries: every slot card prints the account's cost-basis limits
   (single order / single symbol / slot cash floor) so a rejected order can be
   explained without opening the API.
-- Valuation: the account panel always states that valuation is unavailable
+- Valuation (valued): when a reviewed set covers the book, the banner switches
+  to “估值可用”, and the detail line prints market value, equity, cash and
+  profit (profit only when the set is reviewed). Synthetic sets never show
+  profit.
+- Valuation (unavailable): the account panel always states that valuation is unavailable
   (`No reviewed price set`) and, below it, the exact snapshot request: the
   as-of day (last decision day, else the account's created day), the missing
   `reviewed_price_set` and the (symbol, pack) pairs a price set would need to
