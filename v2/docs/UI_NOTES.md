@@ -104,6 +104,9 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Evolution history: a dedicated view (shortcut 8) lists promotion/rollback
+  events with candidate id, status pill, decision time and the rule reasons.
+  Empty logs and fetch failures explain themselves; the log is read-only.
 - Account advance: a date input plus “推进账户到该日” drives every running
   session on the account in one call (paused sessions stay paused); the status
   line reports steps/fills/rejections.

@@ -59,6 +59,20 @@ test("the session creation form is accessible", async ({ page }) => {
   await scan(page, "session-create");
 });
 
+test("the evolution history is accessible", async ({ page }) => {
+  await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({
+    json: [{
+      event_id: "evo-a11y", candidate_id: "research-momentum-v1-ab12cd34",
+      status: "promoted", decided_at: "2026-11-05T15:00:00+08:00",
+      decision: { reasons: ["通过：收益与回撤均在阈值内"], digest: "a".repeat(64) },
+      digest: "b".repeat(64),
+    }],
+  }));
+  await page.goto(`/?cycle_id=${CYCLES.repro}#/evolution`);
+  await expect(page.getByTestId("evolution-event-evo-a11y")).toBeVisible();
+  await scan(page, "evolution");
+});
+
 test("the shortcut sheet is an accessible modal", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);
   await page.getByTestId("shortcuts-open").click();

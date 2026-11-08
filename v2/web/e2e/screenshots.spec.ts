@@ -143,6 +143,29 @@ test.describe("screenshots", () => {
     await capture(page, "session-create");
   });
 
+  test("evolution history", async ({ page }) => {
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({
+      json: [
+        {
+          event_id: "evo-shot", candidate_id: "research-momentum-v1-ab12cd34",
+          status: "promoted", decided_at: "2026-11-05T15:00:00+08:00",
+          decision: { reasons: ["通过：收益 700 bps 超过基准 500 + 50，回撤 900 bps 在 1500 以内"], digest: "a".repeat(64) },
+          digest: "b".repeat(64),
+        },
+        {
+          event_id: "evo-shot-2", candidate_id: "research-reversion-v1-99887766",
+          status: "rejected", decided_at: "2026-11-04T15:00:00+08:00",
+          decision: { reasons: ["风险恶化：最大回撤 2000 bps 超过上限 1500 bps"], digest: "c".repeat(64) },
+          digest: "d".repeat(64),
+        },
+      ],
+    }));
+    await page.goto(`/?cycle_id=${CYCLES.repro}#/evolution`);
+    await page.getByTestId("evolution-event-evo-shot").waitFor();
+    await settle(page);
+    await capture(page, "evolution");
+  });
+
   test("shortcut reference", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("summary-strategy").waitFor();
