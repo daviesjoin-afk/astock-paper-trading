@@ -314,6 +314,31 @@ python3 scripts/experiment_demo.py</code></pre>
                 <summary>审计详情</summary>
                 <ul id="account-audit-checks" data-testid="account-audit-checks"></ul>
               </details>
+              <section class="strategy-switches" id="strategy-switches" data-testid="strategy-switches">
+                <h4>策略版本</h4>
+                <p class="strategy-current" id="strategy-current" data-testid="strategy-current"></p>
+                <ul class="strategy-switch-list" id="strategy-switch-list" data-testid="strategy-switch-list"></ul>
+                <div class="switch-form">
+                  <label class="field field-inline">
+                    <span class="field-label">槽位</span>
+                    <select id="switch-slot" data-testid="switch-slot"><option>A</option><option>B</option></select>
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">目标版本</span>
+                    <input id="switch-version" data-testid="switch-version" autocomplete="off" placeholder="research-momentum-v2" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">生效时刻</span>
+                    <input id="switch-at" data-testid="switch-at" type="datetime-local" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">理由</span>
+                    <input id="switch-reason" data-testid="switch-reason" autocomplete="off" placeholder="晋级/回退依据" />
+                  </label>
+                  <button type="button" class="btn btn-small" id="switch-submit" data-testid="switch-submit">切换版本</button>
+                </div>
+                <p class="section-error" id="switch-error" data-testid="switch-error" hidden></p>
+              </section>
               <p class="account-performance" id="account-performance" data-testid="account-performance" hidden></p>
               <section class="account-equity" id="account-equity" data-testid="account-equity" hidden>
                 <h4>净值序列</h4>

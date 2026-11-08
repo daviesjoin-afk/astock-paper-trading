@@ -1026,7 +1026,9 @@ type PaperAccountSummary = {
   created_at: string; slots: PaperAccountSummarySlot[];
 };
 type PaperAccountSlotView = {
-  slot: string; strategy_version_id: string; research_input_id: string;
+  slot: string; strategy_version_id: string;
+  current_strategy_version_id?: string; switch_count?: number;
+  research_input_id: string;
   market_data_pack_id: string; execution_policy_version: string;
   weight_bps: number; budget_cents: number; cash_cents: number;
   positions: Array<{ symbol: string; quantity: number; sellable_quantity: number | null }>;
@@ -1545,6 +1547,74 @@ const renderRebalances = (records: RebalanceRecord[]): void => {
   }));
 };
 
+type StrategySwitch = {
+  switch_id: string; account_id: string; slot: string;
+  from_version: string; to_version: string;
+  effective_from: string; reason: string; digest: string;
+};
+
+let accountSwitches: StrategySwitch[] = [];
+
+const renderStrategySwitches = (rows: StrategySwitch[]): void => {
+  accountSwitches = rows;
+  const current = testId<HTMLElement>("strategy-current");
+  const versions = (lastAccountView?.slots ?? [])
+    .map((slot) => `${slot.slot}：${slot.current_strategy_version_id ?? slot.strategy_version_id}（切换 ${slot.switch_count ?? 0} 次）`)
+    .join(" · ");
+  current.textContent = versions || "—";
+  const list = testId<HTMLUListElement>("strategy-switch-list");
+  list.replaceChildren(...rows.map((row) => {
+    const item = document.createElement("li");
+    item.dataset.testid = `switch-${row.switch_id}`;
+    item.textContent =
+      `${row.slot}：${row.from_version} → ${row.to_version} · 生效 ${decisionTime(row.effective_from)} · ${row.reason}`;
+    return item;
+  }));
+};
+
+async function loadStrategySwitches(accountId: string): Promise<void> {
+  try {
+    const rows = await api<StrategySwitch[]>(
+      `/v2/paper-accounts/${encodeURIComponent(accountId)}/strategy-switches`,
+      new AbortController().signal,
+    );
+    if (currentAccountId === accountId) renderStrategySwitches(Array.isArray(rows) ? rows : []);
+  } catch {
+    if (currentAccountId === accountId) renderStrategySwitches([]);
+  }
+}
+
+const submitStrategySwitch = async (): Promise<void> => {
+  const slot = byId<HTMLSelectElement>("switch-slot").value;
+  const version = byId<HTMLInputElement>("switch-version").value.trim();
+  const at = byId<HTMLInputElement>("switch-at").value;
+  const reason = byId<HTMLInputElement>("switch-reason").value.trim();
+  const error = testId<HTMLElement>("switch-error");
+  if (!version || !at || !reason) {
+    toggle(error, true);
+    error.textContent = "请填写目标版本、生效时刻与理由";
+    return;
+  }
+  try {
+    await postJson(`/v2/paper-accounts/${encodeURIComponent(currentAccountId)}/strategy-switches`, {
+      slot,
+      to_version: version,
+      effective_from: new Date(at).toISOString(),
+      reason,
+      switch_id: `switch-${Date.now()}`,
+    });
+    toggle(error, false);
+    announce("策略版本切换已记录");
+    await loadAccount(currentAccountId);
+    await loadStrategySwitches(currentAccountId);
+  } catch (failure) {
+    toggle(error, true);
+    error.textContent = `切换失败：${errorDetail(failure)}`;
+  }
+};
+
+testId<HTMLButtonElement>("switch-submit").addEventListener("click", () => void submitStrategySwitch());
+
 const renderAccountPerformance = (
   report: (PerformanceReport & { status?: string; reason?: string }) | null,
 ): void => {
@@ -1797,6 +1867,7 @@ const loadAccount = async (accountId: string): Promise<void> => {
     toggle(accountBody, false);
     showAccountError(`读取账户失败：${errorDetail(error)}`);
   }
+  await loadStrategySwitches(accountId);
 };
 
 const loadStrategies = async (): Promise<void> => {

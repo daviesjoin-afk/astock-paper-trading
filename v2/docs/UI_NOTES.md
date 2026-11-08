@@ -129,6 +129,9 @@ form, no valuation.
 - Price sets: 实验信息 shows the loaded catalogue (id, trust, pack, coverage,
   entry count, digest prefix) and a coverage checker for explicit pack/symbol/
   day inputs; reviewed-only rules are stated in the panel.
+- Strategy versions: the account page prints the current version and switch
+  count per slot, lists the append-only switch history, and records a switch
+  (slot, target version, explicit effective time, reason) from the console.
 - Account performance: one line with profit, return, drawdown, fees, trades and
   days when reviewed prices cover the known days; hidden (never zero-filled)
   when they do not.

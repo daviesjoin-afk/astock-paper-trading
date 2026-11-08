@@ -287,6 +287,37 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-performance")).toBeHidden();
   });
 
+  test("shows and records strategy version switches", async ({ page }) => {
+    const switchRow = {
+      switch_id: "switch-1", account_id: "e2e-account", slot: "A",
+      from_version: "research-momentum-v1", to_version: "research-momentum-v2",
+      effective_from: "2026-11-06T09:00:00+08:00",
+      reason: "promotion decision", digest: "a".repeat(64),
+    };
+    let posted: Record<string, unknown> | null = null;
+    await page.route(/\/v2\/paper-accounts\/.+\/strategy-switches/, (route) => {
+      if (route.request().method() === "POST") {
+        posted = route.request().postDataJSON();
+        return route.fulfill({ json: switchRow });
+      }
+      return route.fulfill({ json: [switchRow] });
+    });
+    await openAccount(page);
+    await expect(page.getByTestId("strategy-switch-list")).toContainText("research-momentum-v1 → research-momentum-v2", { timeout: 15_000 });
+    await expect(page.getByTestId("strategy-current")).toContainText("切换 0 次");
+
+    await page.getByTestId("switch-version").fill("research-momentum-v3");
+    await page.getByTestId("switch-at").fill("2026-11-10T09:00");
+    await page.getByTestId("switch-reason").fill("rollback rehearsal");
+    await page.getByTestId("switch-submit").click();
+    await expect.poll(() => posted).not.toBeNull();
+    expect(posted?.["slot"]).toBe("A");
+    expect(posted?.["to_version"]).toBe("research-momentum-v3");
+    expect(String(posted?.["effective_from"])).toContain("2026-11-10T");
+    expect(posted?.["reason"]).toBe("rollback rehearsal");
+    await expect(page.getByTestId("live-status")).toContainText("策略版本切换已记录");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();

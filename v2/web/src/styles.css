@@ -906,6 +906,14 @@ td:first-child { font-weight: 550; }
 .experiment-performance-form input { min-width: 190px; }
 .experiment-performance-result { margin: 0; font-size: 12px; color: var(--muted); }
 
+/* ---------- strategy switches ---------- */
+.strategy-switches { margin: 12px 20px; border-top: 1px solid var(--border); padding-top: 12px; }
+.strategy-switches h4 { margin: 0 0 6px; font-size: 13px; }
+.strategy-current { margin: 0 0 8px; font-size: 11.5px; color: var(--muted); }
+.strategy-switch-list { margin: 0 0 10px; padding-left: 18px; display: grid; gap: 4px; font-size: 11.5px; color: var(--muted); }
+.switch-form { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-end; }
+.switch-form input { min-width: 150px; }
+
 /* ---------- account performance ---------- */
 .account-performance { margin: 0 20px 10px; font-size: 12px; color: var(--muted); }
 
