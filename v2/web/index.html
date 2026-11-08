@@ -591,6 +591,26 @@ python3 scripts/experiment_demo.py</code></pre>
                 </label>
               </div>
               <div class="evolution-events" id="evolution-events" data-testid="evolution-events"></div>
+              <section class="signal-diff" id="signal-diff" data-testid="signal-diff">
+                <h3>影子对比</h3>
+                <p class="panel-note">比较两个实验的已存信号：只比较决策时刻、报价引用、标的与方向，不含数量与成交结果。</p>
+                <div class="signal-diff-form">
+                  <label class="field field-inline">
+                    <span class="field-label">基准实验</span>
+                    <input id="diff-base" data-testid="diff-base" autocomplete="off" placeholder="例如 shadow-base-1" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">候选实验</span>
+                    <input id="diff-candidate" data-testid="diff-candidate" autocomplete="off" placeholder="例如 shadow-candidate-1" />
+                  </label>
+                  <button type="button" class="btn btn-quiet" id="diff-run" data-testid="diff-run">比较</button>
+                </div>
+                <p class="section-error" id="diff-error" data-testid="diff-error" hidden></p>
+                <div id="diff-result" data-testid="diff-result" hidden>
+                  <p class="diff-summary" id="diff-summary" data-testid="diff-summary"></p>
+                  <ul class="diff-list" id="diff-list" data-testid="diff-list"></ul>
+                </div>
+              </section>
               <p class="empty-state" id="evolution-empty" data-testid="evolution-empty" hidden>还没有进化事件。</p>
             </div>
           </section>

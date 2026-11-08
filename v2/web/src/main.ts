@@ -1855,6 +1855,70 @@ const renderEvolutionList = (): void => {
   }));
 };
 
+type SignalFingerprintView = {
+  decision_at: string;
+  quote_ref: { market_data_pack_id: string; source: string; quote_id: string };
+  symbol: string;
+  side: string;
+};
+type SignalDiff = {
+  base_cycle: string; candidate_cycle: string;
+  base_runs: number; candidate_runs: number; matched: number;
+  base_only: SignalFingerprintView[]; candidate_only: SignalFingerprintView[];
+  digest: string;
+};
+
+const describeSignal = (signal: SignalFingerprintView): string =>
+  `${signal.decision_at.slice(0, 16)} · ${signal.symbol} ${signal.side === "buy" ? "买入" : "卖出"} · ${signal.quote_ref.quote_id}`;
+
+const renderDiff = (diff: SignalDiff | null): void => {
+  const result = testId<HTMLElement>("diff-result");
+  if (!diff) {
+    toggle(result, false);
+    return;
+  }
+  toggle(result, true);
+  setText("diff-summary",
+    `基准 ${diff.base_runs} 条 · 候选 ${diff.candidate_runs} 条 · 命中 ${diff.matched} · ` +
+    `基准独有 ${diff.base_only.length} · 候选独有 ${diff.candidate_only.length}`);
+  const list = testId<HTMLUListElement>("diff-list");
+  const rows = [
+    ...diff.base_only.map((signal) => `基准独有：${describeSignal(signal)}`),
+    ...diff.candidate_only.map((signal) => `候选独有：${describeSignal(signal)}`),
+  ];
+  if (rows.length === 0) rows.push("两侧信号完全一致");
+  list.replaceChildren(...rows.map((text) => {
+    const item = document.createElement("li");
+    item.textContent = text;
+    return item;
+  }));
+};
+
+const runDiff = async (): Promise<void> => {
+  const base = byId<HTMLInputElement>("diff-base").value.trim();
+  const candidate = byId<HTMLInputElement>("diff-candidate").value.trim();
+  const error = testId<HTMLElement>("diff-error");
+  if (!base || !candidate) {
+    toggle(error, true);
+    error.textContent = "请填写基准与候选实验 id";
+    return;
+  }
+  try {
+    const diff = await api<SignalDiff>(
+      `/v2/signal-diff?base_cycle=${encodeURIComponent(base)}&candidate_cycle=${encodeURIComponent(candidate)}`,
+      new AbortController().signal,
+    );
+    toggle(error, false);
+    renderDiff(diff);
+  } catch (failure) {
+    toggle(error, true);
+    error.textContent = `比较失败：${errorDetail(failure)}`;
+    renderDiff(null);
+  }
+};
+
+testId<HTMLButtonElement>("diff-run").addEventListener("click", () => void runDiff());
+
 const loadEvolution = async (): Promise<void> => {
   const empty = testId<HTMLElement>("evolution-empty");
   try {
