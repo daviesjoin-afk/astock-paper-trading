@@ -6,6 +6,7 @@
 #
 #   --fast       skip the browser suite (needs a release build + Playwright)
 #   --no-scan    skip the sensitive-data scan
+#   --archive D  also verify every ledger/export pair in directory D
 #   --dry-run    print the commands instead of running them
 #
 # Exit code: 0 all green, 1 any suite failed, 2 usage error.
@@ -14,13 +15,15 @@ set -uo pipefail
 FAST=0
 SCAN=1
 DRY=0
-for arg in "$@"; do
-  case "$arg" in
-    --fast) FAST=1 ;;
-    --no-scan) SCAN=0 ;;
-    --dry-run) DRY=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
-    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+ARCHIVE=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fast) FAST=1; shift ;;
+    --no-scan) SCAN=0; shift ;;
+    --archive) ARCHIVE="${2:-}"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -43,6 +46,9 @@ if [ "$FAST" -eq 0 ]; then
 fi
 if [ "$SCAN" -eq 1 ]; then
   add "security-scan" "$PYTHON scripts/security/scan-sensitive-data.py --repo . --scope worktree"
+fi
+if [ -n "$ARCHIVE" ]; then
+  add "archive" "$PYTHON scripts/verify_archive.py --dir '$ARCHIVE'"
 fi
 
 if [ "$DRY" -eq 1 ]; then
