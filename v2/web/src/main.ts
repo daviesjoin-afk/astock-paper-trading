@@ -1049,6 +1049,12 @@ type PaperOrderRecord = {
   duplicate: boolean;
 };
 
+type PaperValuationReport = {
+  account_id: string; as_of_day: string; status: string; reason: string;
+  requirements: Array<{ slot: string; market_data_pack_id: string; symbols: string[] }>;
+  missing: string[]; priced_symbols: number; digest: string;
+};
+
 type PaperSessionView = {
   session_id: string; account_id: string; status: string;
   clock_at: string; cursor: number; total: number; last_order_id: number | null;
@@ -1322,6 +1328,31 @@ const sessionAction = async (sessionId: string, action: string): Promise<void> =
   }
 };
 
+const chinaDayOf = (value: string): string => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(date);
+};
+
+const renderValuation = (report: PaperValuationReport | null, asOf: string): void => {
+  const detail = testId<HTMLElement>("account-valuation-detail");
+  if (!report || !asOf) {
+    toggle(detail, false);
+    return;
+  }
+  toggle(detail, true);
+  if (report.status === "unavailable") {
+    const needs = report.requirements
+      .flatMap((requirement) => requirement.symbols.map((symbol) => `${symbol}（${packName(requirement.market_data_pack_id)}）`));
+    detail.textContent = `估值快照（截至 ${asOf}）：不可用 · 缺少 ${report.missing.join("、")}` +
+      (needs.length > 0 ? ` · 需要 ${needs.join("、")}` : " · 当前无持仓");
+  } else {
+    detail.textContent = `估值快照（截至 ${asOf}）：${report.status}`;
+  }
+};
+
 const loadAccount = async (accountId: string): Promise<void> => {
   if (!accountId) return;
   clearAccountError();
@@ -1341,8 +1372,25 @@ const loadAccount = async (accountId: string): Promise<void> => {
       return;
     }
     syncAccountUrl(accountId);
-    renderAccount(account, Array.isArray(orders) ? orders : []);
+    const orderList = Array.isArray(orders) ? orders : [];
+    renderAccount(account, orderList);
     renderSessions(Array.isArray(sessions) ? sessions : []);
+    const asOf = orderList.length > 0
+      ? chinaDayOf(orderList[0].request.decision_at)
+      : chinaDayOf(account.created_at);
+    if (asOf) {
+      try {
+        const valuation = await api<PaperValuationReport>(
+          `/v2/paper-accounts/${encoded}/valuation?as_of_day=${encodeURIComponent(asOf)}`,
+          new AbortController().signal,
+        );
+        if (currentAccountId === accountId) renderValuation(valuation, asOf);
+      } catch {
+        if (currentAccountId === accountId) renderValuation(null, asOf);
+      }
+    } else {
+      renderValuation(null, "");
+    }
   } catch (error) {
     toggle(accountBody, false);
     showAccountError(`读取账户失败：${errorDetail(error)}`);

@@ -101,6 +101,20 @@ async fn strategy_catalogue(State(state): State<Shared>) -> ApiResult {
     response(db.strategy_catalogue().map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct ValuationQuery {
+    as_of_day: String,
+}
+
+async fn paper_valuation(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<ValuationQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_valuation(&id, &query.as_of_day).map_err(api_error)?)
+}
+
 async fn paper_account(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     let db = state.lock().await;
     response(db.paper_account(&id).map_err(api_error)?)
@@ -259,6 +273,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
         .route("/v2/strategies", get(strategy_catalogue))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
+        .route(
+            "/v2/paper-accounts/{account_id}/valuation",
+            get(paper_valuation),
+        )
         .route(
             "/v2/paper-accounts/{account_id}/orders",
             post(submit_paper_order).get(paper_orders),

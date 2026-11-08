@@ -2612,3 +2612,39 @@ fn paper_session_advances_only_through_reached_days() {
     assert_eq!(view.valuation.status, "unavailable");
     assert_eq!(view.valuation.reason, "no_reviewed_price_set");
 }
+
+#[test]
+fn valuation_refuses_without_a_reviewed_price_set() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("valuation-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    db.submit_paper_order(paper_order("valuation-acct", PaperSlotId::A, buy)).unwrap();
+
+    let report = db.paper_valuation("valuation-acct", "2026-11-02").unwrap();
+    assert_eq!(report.status, "unavailable");
+    assert_eq!(report.reason, "no_reviewed_price_set");
+    assert_eq!(report.priced_symbols, 0);
+    assert_eq!(report.missing, vec!["reviewed_price_set".to_string()]);
+    assert_eq!(report.requirements[0].slot, "A");
+    assert_eq!(report.requirements[0].market_data_pack_id, MARKET_DATA_PACK_ID);
+    assert!(report.requirements[0].symbols.contains(&"600000.SH".to_string()));
+    assert_eq!(report.digest.len(), 64);
+    assert_eq!(report, db.paper_valuation("valuation-acct", "2026-11-02").unwrap());
+
+    // No value fields leak into the JSON.
+    let json = serde_json::to_value(&report).unwrap();
+    for forbidden in ["market_value", "equity", "profit", "return", "nav"] {
+        assert!(json.get(forbidden).is_none(), "{forbidden} must be absent");
+    }
+
+    assert!(matches!(
+        db.paper_valuation("valuation-acct", "2026-13-01"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_valuation_day"
+    ));
+    assert!(matches!(
+        db.paper_valuation("missing-acct", "2026-11-02"),
+        Err(StoreError::NotFound(_))
+    ));
+}

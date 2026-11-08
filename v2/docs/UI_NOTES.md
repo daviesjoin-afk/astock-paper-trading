@@ -105,7 +105,10 @@ form, no valuation.
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
 - Valuation: the account panel always states that valuation is unavailable
-  (`No reviewed price set`), so the page never implies a market value or return.
+  (`No reviewed price set`) and, below it, the exact snapshot request: the
+  as-of day (last decision day, else the account's created day), the missing
+  `reviewed_price_set` and the (symbol, pack) pairs a price set would need to
+  cover. No market value, NAV or return is ever rendered.
 - Advancing: a running session offers “推进到该日” with an explicit trading day;
   only signals on or before that China day are executed, intermediate days move
   nothing.
