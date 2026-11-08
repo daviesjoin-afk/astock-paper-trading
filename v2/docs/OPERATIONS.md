@@ -44,7 +44,16 @@
 curl -fsS "http://127.0.0.1:8765/v2/evolution/events/export?from_day=2026-11-01&to_day=2026-11-30"   -o evolution-2026-11.json
 ```
 
-响应含 `count`、`events[]` 与 `digest`（对除 digest 外的内容做 canonical 摘要）；同一过滤条件重放应得到同一 `digest`。
+响应含 `count`、`events[]` 与 `digest`（对除 digest 外的内容做 canonical 摘要）；同一过滤条件重放应得到同一 `digest`。响应含 `count`、`events[]` 与 `digest`（对除 digest 外的内容做 canonical 摘要）；同一过滤条件重放应得到同一 `digest`。
+
+离线复核（不依赖服务）：
+
+```bash
+python scripts/verify_export.py evolution-2026-11.json
+# verified count=42 digest=…
+```
+
+退出码：0 通过、1 摘要/计数不一致、2 文件不可读或非法 JSON。
 
 每周复核（只读，不写账本）：
 
