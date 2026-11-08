@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 策略版本界面：账户页展示槽位当前版本与切换次数、切换历史（from→to/生效时刻/理由），并提供切换表单（槽位/目标版本/生效时刻/理由，`switch_id` 由前端生成），成功后刷新账户与历史；浏览器 126 passed（+1 展示与请求体断言）；Rust 153 / Python 48 不变。
 - V2 策略切换写路径（ADR-018 完成）：`POST /v2/paper-accounts/{id}/strategy-switches`；订单归因/幂等/内部请求改用“当前版本”，且拒绝切换前决策（409 `paper_order_before_strategy_switch`）；切换时刻必须晚于最后一次会话；实验派生会话校验当前版本；视图与审计已具备。Rust 153 passed（归因/时序/幂等/会话约束）；冒烟覆盖切换写读与审计。
 - V2 策略切换读路径（schema v15，ADR-018 部分实现）：新增 `v2_paper_slot_switches` 与 `record_strategy_switch`（版本连续/幂等/时间单调/理由必填/canonical 摘要）、只读 `GET /v2/paper-accounts/{id}/strategy-switches`、槽位视图 `current_strategy_version_id` 与 `switch_count`、审计第 9 项 `switch_chain`（末项）；HTTP 写端点与会话/订单随动校验留待下一步。Rust 152 passed（链/幂等/冲突/时间/审计）；冒烟升级 v15 并校验空链与审计项。
 - V2 账户绩效提示：账户页新增一行绩效摘要（收益/收益率/回撤/费用/成交笔数/天数），数据来自 `/v2/paper-accounts/{id}/performance`；缺审核覆盖时整行隐藏，不补零。浏览器 125 passed（+2：有覆盖/缺覆盖）；Rust 151 / Python 48 不变。
