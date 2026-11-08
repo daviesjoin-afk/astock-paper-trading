@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 归档 manifest 侧车：`verify_archive.py --manifest-out` 在校验通过后写出清单（两文件 SHA-256、schema、事件数、合并 manifest），失败不写；`OPERATIONS.md` 补充；Python 研究套件 54 passed（+2：侧车写入/失败不写）；冒烟断言 sidecar 非空。Rust 154 / 浏览器 128 不变。
 - V2 会话切换时序保护：`create_paper_session` 拒绝起点早于该槽最后一次切换的会话（422 `session_starts_before_strategy_switch`），避免“创建成功但每条信号都被订单时序拒绝”的卡死会话；Rust 154 passed（早/晚两例）；冒烟/浏览器/研究不变。
 - V2 资金提案标注版本切换：提案计算窗口内发生切换的槽位，理由追加“历史绩效来自旧版本”并重算摘要（ADR-018 待解问题 2 结案）；权重算法与边界不变。Rust 153 passed（同用例扩展断言：B 标注、A 不标注、摘要变化）；冒烟/浏览器/研究不变。
 - V2 概览运行状态：落地页新增状态条——账户数、活动会话（created+running+paused 汇总）、已加载价格集合数、最近进化事件；探测失败显示“—”；浏览器 128 passed（+2：汇总与失败回退）；Rust 153 / Python 52 不变。

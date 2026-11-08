@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, help="ledger backup (.sqlite3)")
     parser.add_argument("--export", required=True, help="evolution export (.json)")
+    parser.add_argument("--manifest-out", help="write a JSON manifest sidecar here")
     args = parser.parse_args(argv)
 
     problems: list[str] = []
@@ -76,6 +77,23 @@ def main(argv: list[str] | None = None) -> int:
         "db": file_digest(db_path),
         "export": file_digest(export_path),
     })
+    if args.manifest_out:
+        sidecar = Path(args.manifest_out)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "db": {"path": db_path.name, "sha256": file_digest(db_path)},
+                    "export": {"path": export_path.name, "sha256": file_digest(export_path)},
+                    "schema_version": db_facts["schema_version"],
+                    "export_count": document["count"],
+                    "manifest": manifest,
+                },
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
     print(
         f"archive ok schema={db_facts['schema_version']} accounts={db_facts['accounts']} "
         f"events={db_facts['events']} export_count={document['count']} "

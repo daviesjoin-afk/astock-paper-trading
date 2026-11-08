@@ -66,6 +66,33 @@ class VerifyArchiveTest(unittest.TestCase):
         self.db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
         self.assertEqual(verify_archive.main(["--db", str(self.db), "--export", str(self.export)]), 1)
 
+    def test_manifest_sidecar_is_written(self) -> None:
+        sidecar = self.dir / "manifest.json"
+        code = verify_archive.main([
+            "--db", str(self.db),
+            "--export", str(self.export),
+            "--manifest-out", str(sidecar),
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], 15)
+        self.assertEqual(payload["export_count"], 1)
+        self.assertEqual(len(payload["manifest"]), 64)
+        self.assertEqual(payload["db"]["path"], self.db.name)
+
+    def test_failed_archive_writes_no_manifest(self) -> None:
+        self.db.write_bytes(b"SQLite format 3" + bytes(64))
+        sidecar = self.dir / "manifest.json"
+        self.assertEqual(
+            verify_archive.main([
+                "--db", str(self.db),
+                "--export", str(self.export),
+                "--manifest-out", str(sidecar),
+            ]),
+            1,
+        )
+        self.assertFalse(sidecar.exists())
+
     def test_missing_file_is_usage_error(self) -> None:
         self.assertEqual(
             verify_archive.main(["--db", str(self.dir / "nope.sqlite3"), "--export", str(self.export)]),
