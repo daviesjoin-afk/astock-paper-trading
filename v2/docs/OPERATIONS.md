@@ -28,10 +28,16 @@
 
 ```bash
 # 每交易日 15:30（中国时区）推进账户到当天
-curl -fsS -X POST http://127.0.0.1:8765/v2/paper-accounts/paper-001/advance \
-  -H 'content-type: application/json' \
-  -d '{"day":"2026-11-09"}'
+30 15 * * 1-5 /opt/astock/v2/scripts/daily_advance.sh   --account paper-001 --day "$(TZ=Asia/Shanghai date +%F)"
 ```
+
+脚本行为：
+
+- `--day` 必填（`YYYY-MM-DD`），非法格式退出码 2；
+- `--dry-run` 只打印请求，不写账本；
+- 请求失败（HTTP 非 2xx）退出码 3；
+- 成功输出 `advanced account=… day=… sessions=… steps=… filled=… rejected=…`，可直接作为调度日志。
+
 
 - 只推进 `running` 会话；暂停的会话保持暂停。
 - 返回 `{sessions, steps, filled, rejected}`，可直接作为调度日志。

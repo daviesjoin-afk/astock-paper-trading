@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 调度示例脚本：新增 `v2/scripts/daily_advance.sh`——显式交易日（非法格式退出 2）、`--dry-run` 只打印请求、HTTP 失败退出 3、成功输出 sessions/steps/filled/rejected 摘要；`OPERATIONS.md` 的 cron 示例改为调用该脚本。冒烟覆盖 dry-run、成功调用与非法日期；Rust 143 / Python 37 / 浏览器 112 不变。
 - V2 滚动窗口验证（ADR 017）：新增 `GET /v2/experiments/{cycle_id}/performance/segments?segments=a,b;c`——每段独立计算绩效并独立声明可用性（缺覆盖 `unavailable`），空段拒绝；影子脚本新增 `--rolling-windows/--margin-bps/--max-drawdown-bps`，`rolling_consistency()` 要求每段覆盖齐全、收益超过基准 + 门槛、回撤不超上限，任一不满足则 `--decide` 返回 `unstable` 且不写事件。Rust 143 passed（分段可用性/空段/摘要）；Python 37 passed（+1 一致性四类失败）；冒烟覆盖分段不可用 → 一致性 unstable。
 - V2 影子决策 CLI（ADR 012/016）：`scripts/shadow_candidates.py` 新增 `--base-cycle/--performance-days/--decide/--record-event/--event-id/--decided-at`——用同一审核序列为基准与候选取绩效，任一缺失即 `unavailable` 不决策；`--decide` 调用治理规则，`--record-event` 需显式事件 id 与时刻。Python 研究套件 36 passed（新增 4：覆盖缺失、指标映射、事件记录、显式时刻）；冒烟覆盖“合成数据 → 决策 unavailable”；Rust 142 / 浏览器 112 不变。
 - V2 实验绩效（ADR 016）：新增 `GET /v2/experiments/{cycle_id}/performance?days=`——以实验成交与初始本金、同一审核价格集合口径计算收益/回撤/费用/笔数与摘要；影子候选可与基准同口径比较，接入 ADR-012 决策输入（需数据覆盖）。Rust 142 passed（实验绩效一致/确定性/合成与缺覆盖/缺失实验）；浏览器 112 不变；冒烟覆盖不可用路径。

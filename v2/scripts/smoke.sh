@@ -601,6 +601,16 @@ print("HTTP calendar/session/auction/unknown-date/retry/replay passed")
 print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed")
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
+# Scheduler helper: explicit day, dry-run and validation without writes.
+bash scripts/daily_advance.sh --account smoke-account --day 2026-10-30 --dry-run \
+  | grep -q "POST .*/v2/paper-accounts/smoke-account/advance"
+bash scripts/daily_advance.sh --account smoke-account --day 2026-10-30 \
+  | grep -q "advanced account=smoke-account day=2026-10-30"
+if bash scripts/daily_advance.sh --account smoke-account --day bad-day > /dev/null 2>&1; then
+  echo "daily_advance accepted an invalid day" >&2
+  exit 1
+fi
+
 python3 scripts/experiment_demo.py
 python3 scripts/market_pack_demo.py
 python3 scripts/research_reproduction_demo.py
