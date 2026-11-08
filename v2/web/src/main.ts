@@ -73,6 +73,7 @@ const testId = <T extends HTMLElement>(id: string): T => {
   return node;
 };
 const setText = (id: string, value: string): void => { testId(id).textContent = value; };
+const setById = (id: string, value: string): void => { byId(id).textContent = value; };
 const toggle = (node: HTMLElement, visible: boolean): void => { node.hidden = !visible; };
 
 const live = byId<HTMLElement>("live");
@@ -152,6 +153,11 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
   }
   if (options.updateUrl !== false && location.hash !== `#/${view}`) {
     history.replaceState(null, "", `#/${view}`);
+    // Switching panels from a scrolled page would otherwise land mid-table.
+    if (window.scrollY > 0) {
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      byId("main").scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    }
   }
   announce(`已切换到${VIEWS[view].label}`);
 };
@@ -162,7 +168,11 @@ const showOnly = (panel: "service" | "empty" | "unknown" | "workspace" | "loadin
   toggle(testId("service-error"), panel === "service");
   toggle(testId("empty-experiments"), panel === "empty");
   toggle(testId("unknown-experiment"), panel === "unknown");
+  toggle(byId("context-bar"), panel === "workspace");
   toggle(byId("workspace"), panel === "workspace");
+  // Nothing to navigate to while a notice owns the screen.
+  const navEnabled = panel === "workspace";
+  for (const button of navButtons) button.disabled = !navEnabled;
   if (active && active !== document.body && !isVisible(active)) {
     const region = panel === "workspace" ? byId("workspace")
       : panel ? testId(`${panel === "service" ? "service-error" : panel === "empty" ? "empty-experiments" : panel === "unknown" ? "unknown-experiment" : "loading"}`)
@@ -188,6 +198,14 @@ let listController: AbortController | null = null;
 let cycleController: AbortController | null = null;
 let asofDay: string | null = null;
 let lastPositions: Position[] = [];
+let lastRuns: Run[] = [];
+const FILTER_LABELS = { all: "全部", filled: "已成交", rejected: "已拒绝" } as const;
+type RunFilter = keyof typeof FILTER_LABELS;
+const urlResult = (): RunFilter | null => {
+  const raw = new URLSearchParams(location.search).get("result");
+  return raw === "filled" || raw === "rejected" || raw === "all" ? raw : null;
+};
+let runFilter: RunFilter = urlResult() ?? "all";
 let rendered = false;
 
 const select = testId<HTMLSelectElement>("experiment-select");
@@ -195,6 +213,7 @@ const hint = testId("cycle-hint");
 
 const setBusy = (busy: boolean): void => {
   byId("workspace").setAttribute("aria-busy", String(busy));
+  document.documentElement.dataset.busy = String(busy);
 };
 
 // ---------------------------------------------------------------------------
@@ -205,6 +224,8 @@ const syncUrl = (cycle: string): void => {
   const url = new URL(location.href);
   if (cycle) url.searchParams.set("cycle_id", cycle);
   else url.searchParams.delete("cycle_id");
+  if (runFilter === "all") url.searchParams.delete("result");
+  else url.searchParams.set("result", runFilter);
   if (url.toString() !== location.href) history.replaceState(null, "", url);
 };
 
@@ -219,8 +240,15 @@ const resetWorkspace = (): void => {
   setText("experiment-name", "—");
   setText("experiment-state", "—");
   for (const id of ["tech-strategy", "tech-input", "tech-pack", "tech-policy"]) setText(id, "—");
+  setById("context-cycle", "—");
+  setById("last-refresh", "—");
+  const contextStatus = byId("context-status");
+  contextStatus.textContent = "—";
+  contextStatus.dataset.state = "idle";
   byId("positions-body").replaceChildren();
   byId("runs-body").replaceChildren();
+  lastRuns = [];
+  paintRuns();
   toggle(testId("positions-empty-state"), true);
   toggle(testId("runs-empty-state"), true);
   toggle(testId("positions-error"), false);
@@ -230,6 +258,7 @@ const resetWorkspace = (): void => {
   asofDay = null;
   (byId<HTMLInputElement>("asof-day")).value = "";
   toggle(testId("sellable-header"), false);
+  setById("positions-count", "按标的汇总的剩余数量");
 };
 
 const describeCatalogue = (selected: string): string => {
@@ -260,6 +289,11 @@ const renderSummary = (detail: ExperimentDetail): void => {
   setText("summary-policy", policyName(spec.execution_policy_version));
   setText("experiment-name", spec.cycle_id);
   setText("experiment-state", experimentStatus(detail.status));
+  // Context bar: the same experiment identity, visible from every panel.
+  setById("context-cycle", spec.cycle_id);
+  const contextStatus = byId("context-status");
+  contextStatus.textContent = experimentStatus(detail.status);
+  contextStatus.dataset.state = detail.status;
   // Raw identifiers exist only inside the collapsed technical panel.
   setText("tech-strategy", spec.strategy.strategy_version_id);
   setText("tech-input", spec.strategy.research_input_id);
@@ -280,6 +314,9 @@ const renderPositions = (): void => {
   const body = byId("positions-body");
   body.replaceChildren();
   toggle(testId("sellable-header"), asofDay !== null);
+  setById("positions-count", asofDay === null
+    ? `共 ${lastPositions.length} 个标的 · 未指定日终口径`
+    : `共 ${lastPositions.length} 个标的 · 日终口径 ${asofDay}`);
   if (asofDay !== null) {
     const note = document.createElement("tr");
     note.className = "asof-row";
@@ -292,6 +329,7 @@ const renderPositions = (): void => {
   for (const position of lastPositions) {
     const row = document.createElement("tr");
     const symbol = document.createElement("td");
+    symbol.className = "symbol";
     symbol.textContent = position.symbol;
     const quantity = document.createElement("td");
     quantity.className = "num-col";
@@ -308,22 +346,34 @@ const renderPositions = (): void => {
   toggle(testId("positions-empty-state"), lastPositions.length === 0);
 };
 
-const renderRuns = (runs: Run[]): void => {
+const filterChips = Array.from(document.querySelectorAll<HTMLButtonElement>(".chip[data-filter]"));
+
+/** Repaint the decision table for the active result filter. */
+const paintRuns = (): void => {
   const body = byId("runs-body");
   body.replaceChildren();
-  for (const run of runs) {
+  const rows = runFilter === "all"
+    ? lastRuns
+    : lastRuns.filter((run) => run.outcome.status === runFilter);
+  for (const run of rows) {
     const row = document.createElement("tr");
     const time = document.createElement("td");
     time.textContent = decisionTime(run.request.decision_at);
     const signal = document.createElement("td");
     signal.textContent = signalName(run.request.signal_id);
     signal.title = run.request.signal_id;
+    // The pill is a span inside the cell: styling a <td> as a pill breaks
+    // table layout and pushes the cell out of the row's baseline.
     const side = document.createElement("td");
-    side.textContent = sideLabel(run.request.signal.side);
-    side.className = run.request.signal.side === "buy" ? "side-buy" : "side-sell";
+    const sidePill = document.createElement("span");
+    sidePill.className = run.request.signal.side === "buy" ? "side-buy" : "side-sell";
+    sidePill.textContent = sideLabel(run.request.signal.side);
+    side.appendChild(sidePill);
     const result = document.createElement("td");
-    result.textContent = resultLabel(run.outcome.status);
-    result.className = run.outcome.status === "filled" ? "result-filled" : "result-rejected";
+    const resultPill = document.createElement("span");
+    resultPill.className = run.outcome.status === "filled" ? "result-filled" : "result-rejected";
+    resultPill.textContent = resultLabel(run.outcome.status);
+    result.appendChild(resultPill);
     const reason = document.createElement("td");
     reason.className = "wrap";
     reason.textContent = reasonLabel(run.outcome.reason);
@@ -331,7 +381,51 @@ const renderRuns = (runs: Run[]): void => {
     row.append(time, signal, side, result, reason);
     body.appendChild(row);
   }
-  toggle(testId("runs-empty-state"), runs.length === 0);
+  toggle(testId("runs-empty-state"), lastRuns.length === 0);
+  toggle(byId("runs-filtered-empty"), lastRuns.length > 0 && rows.length === 0);
+  for (const chip of filterChips) {
+    const value = (chip.dataset.filter ?? "all") as RunFilter;
+    const count = value === "all"
+      ? lastRuns.length
+      : lastRuns.filter((run) => run.outcome.status === value).length;
+    chip.setAttribute("aria-pressed", String(value === runFilter));
+    chip.textContent = `${FILTER_LABELS[value]} ${count}`;
+  }
+  renderRecent();
+};
+
+/** The overview shows the three newest decisions; the panel owns the detail. */
+const renderRecent = (): void => {
+  const list = byId("recent-list");
+  list.replaceChildren();
+  const recent = lastRuns.slice(0, 3);
+  for (const run of recent) {
+    const item = document.createElement("li");
+    const time = document.createElement("span");
+    time.className = "recent-time";
+    time.textContent = decisionTime(run.request.decision_at);
+    const signal = document.createElement("span");
+    signal.className = "recent-signal";
+    signal.textContent = signalName(run.request.signal_id);
+    const side = document.createElement("span");
+    side.className = run.request.signal.side === "buy" ? "side-buy" : "side-sell";
+    side.textContent = sideLabel(run.request.signal.side);
+    const result = document.createElement("span");
+    result.className = run.outcome.status === "filled" ? "result-filled" : "result-rejected";
+    result.textContent = resultLabel(run.outcome.status);
+    item.append(time, signal, side, result);
+    list.appendChild(item);
+  }
+  toggle(byId("recent-empty"), recent.length === 0);
+  const filled = lastRuns.filter((run) => run.outcome.status === "filled").length;
+  setById("recent-note", lastRuns.length === 0
+    ? "共 0 条决策"
+    : `共 ${lastRuns.length} 条决策 · 已成交 ${filled} · 已拒绝 ${lastRuns.length - filled}`);
+};
+
+const renderRuns = (runs: Run[]): void => {
+  lastRuns = runs;
+  paintRuns();
 };
 
 const setVerify = (
@@ -344,6 +438,12 @@ const setVerify = (
   status.dataset.state = state;
   status.textContent = message;
   setText(`${kind}-detail`, detail);
+  // The overview shows the same two facts at a glance.
+  const mirror = document.getElementById(`overview-${kind}`);
+  if (mirror) {
+    mirror.dataset.state = state;
+    mirror.textContent = message;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -363,6 +463,13 @@ const showSectionError = (section: "positions" | "runs", message: string, retry:
   node.append(text, button);
   toggle(node, true);
   if (hadFocus) button.focus();
+};
+
+/** One sentence describing why the catalogue could not be read — never duplicates
+ *  the "本地服务不可用" wording that the notice already shows. */
+const listFailureText = (error: unknown): string => {
+  if (error instanceof ApiError && error.status === null) return "无法连接本地服务。请确认内核已启动。";
+  return `无法连接本地服务：${errorDetail(error)}`;
 };
 
 const showListFailure = (message: string): void => {
@@ -409,6 +516,7 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
   showOnly("workspace");
   showView(currentView);
   renderSummary(detail.value);
+  setById("last-refresh", new Date().toLocaleTimeString("zh-CN", { hour12: false }));
 
   if (portfolio.status === "fulfilled") {
     renderPortfolio(portfolio.value);
@@ -443,7 +551,7 @@ const loadList = async (): Promise<void> => {
     listSkipped = typeof body.skipped === "number" ? body.skipped : 0;
   } catch (error) {
     if (controller.signal.aborted) return;
-    showListFailure(`无法连接本地服务（${errorDetail(error)}）`);
+    showListFailure(listFailureText(error));
     announce("服务不可用");
     return;
   }
@@ -504,7 +612,10 @@ testId("retry").addEventListener("click", () => void loadList());
 
 for (const button of navButtons) {
   button.addEventListener("click", () => showView(button.dataset.view as View));
+  const index = (Object.keys(VIEWS) as View[]).indexOf(button.dataset.view as View);
+  if (index >= 0) button.setAttribute("aria-keyshortcuts", String(index + 1));
 }
+testId("refresh").setAttribute("aria-keyshortcuts", "r");
 for (const link of Array.from(document.querySelectorAll<HTMLElement>("[data-goto]"))) {
   link.addEventListener("click", () => showView(link.dataset.goto as View));
 }
@@ -512,6 +623,20 @@ window.addEventListener("hashchange", () => {
   const view = viewFromHash();
   if (view !== currentView) showView(view, { updateUrl: false });
 });
+
+for (const chip of filterChips) {
+  chip.addEventListener("click", () => {
+    const value = (chip.dataset.filter ?? "all") as RunFilter;
+    if (value === runFilter) return;
+    runFilter = value;
+    syncUrl(currentCycle);
+    paintRuns();
+    const shown = value === "all"
+      ? lastRuns.length
+      : lastRuns.filter((run) => run.outcome.status === value).length;
+    announce(`已筛选为${FILTER_LABELS[value]}，${shown} 条决策`);
+  });
+}
 
 const runVerification = async (kind: "replay" | "reproduction"): Promise<void> => {
   const cycle = currentCycle;
@@ -586,20 +711,125 @@ byId("asof-clear").addEventListener("click", () => {
 
 byId("controls").addEventListener("submit", (event) => event.preventDefault());
 
+const copyLink = testId<HTMLButtonElement>("copy-link");
+copyLink.addEventListener("click", async () => {
+  const label = copyLink.querySelector<HTMLElement>(".copy-label");
+  try {
+    await navigator.clipboard.writeText(location.href);
+    if (label) label.textContent = "已复制";
+    announce("当前视图链接已复制");
+    window.setTimeout(() => { if (label) label.textContent = "复制链接"; }, 2000);
+  } catch {
+    announce("复制失败，请手动复制地址栏链接");
+  }
+});
+
+byId("copy-demo").addEventListener("click", async () => {
+  const command = byId("demo-command").textContent ?? "";
+  const button = testId<HTMLButtonElement>("copy-demo");
+  try {
+    await navigator.clipboard.writeText(command);
+    button.textContent = "已复制";
+    announce("命令已复制到剪贴板");
+    window.setTimeout(() => { button.textContent = "复制命令"; }, 2000);
+  } catch {
+    announce("复制失败，请手动选择命令文本");
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
 const themeButton = testId<HTMLButtonElement>("theme-toggle");
+const themeLabel = themeButton.querySelector<HTMLElement>(".theme-label");
 const applyTheme = (theme: "light" | "dark"): void => {
   document.documentElement.dataset.theme = theme;
-  themeButton.setAttribute("aria-pressed", String(theme === "dark"));
+  const dark = theme === "dark";
+  themeButton.setAttribute("aria-pressed", String(dark));
+  themeButton.setAttribute("aria-label", dark ? "切换浅色模式" : "切换深色模式");
+  if (themeLabel) themeLabel.textContent = dark ? "浅色模式" : "深色模式";
 };
+// Explicit choice wins; otherwise the operating system decides.
+themeButton.setAttribute("aria-keyshortcuts", "t");
+testId("shortcuts-open").setAttribute("aria-keyshortcuts", "?");
+select.setAttribute("aria-keyshortcuts", "/");
 const storedTheme = localStorage.getItem("astock-v2-theme");
-applyTheme(storedTheme === "dark" ? "dark" : "light");
+const systemQuery = window.matchMedia("(prefers-color-scheme: dark)");
+applyTheme(storedTheme === null ? (systemQuery.matches ? "dark" : "light")
+  : storedTheme === "dark" ? "dark" : "light");
+systemQuery.addEventListener("change", (event) => {
+  if (localStorage.getItem("astock-v2-theme") !== null) return;
+  applyTheme(event.matches ? "dark" : "light");
+});
 themeButton.addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   localStorage.setItem("astock-v2-theme", next);
   applyTheme(next);
+  announce(next === "dark" ? "已切换到深色模式" : "已切换到浅色模式");
+});
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts
+// ---------------------------------------------------------------------------
+const sheet = byId<HTMLDialogElement>("shortcuts");
+const sheetClose = testId<HTMLButtonElement>("shortcuts-close");
+const workspaceVisible = (): boolean => !byId("workspace").hidden;
+
+const openSheet = (): void => {
+  if (sheet.open) return;
+  sheet.showModal();
+  announce("已打开快捷键说明");
+};
+const closeSheet = (): void => {
+  if (!sheet.open) return;
+  sheet.close();
+};
+testId("shortcuts-open").addEventListener("click", openSheet);
+sheetClose.addEventListener("click", closeSheet);
+sheet.addEventListener("close", () => announce("已关闭快捷键说明"));
+
+const VIEW_ORDER = Object.keys(VIEWS) as View[];
+const isTypingTarget = (target: EventTarget | null): boolean => {
+  const node = target as HTMLElement | null;
+  if (!node || !node.tagName) return false;
+  const tag = node.tagName;
+  return tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || node.isContentEditable;
+};
+
+window.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+  if (isTypingTarget(event.target) || sheet.open) return;
+  const key = event.key;
+
+  if (key === "?") {
+    event.preventDefault();
+    openSheet();
+    return;
+  }
+  if (key === "/") {
+    event.preventDefault();
+    select.focus();
+    announce("已聚焦实验选择器");
+    return;
+  }
+  if (!workspaceVisible()) return;
+  if (key >= "1" && key <= "6") {
+    const view = VIEW_ORDER[Number(key) - 1];
+    if (view && view !== currentView) {
+      event.preventDefault();
+      showView(view);
+    }
+    return;
+  }
+  if (key.toLowerCase() === "r") {
+    event.preventDefault();
+    byId<HTMLButtonElement>("refresh").click();
+    return;
+  }
+  if (key.toLowerCase() === "t") {
+    event.preventDefault();
+    themeButton.click();
+  }
 });
 
 // ---------------------------------------------------------------------------

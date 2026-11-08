@@ -42,6 +42,7 @@ test.describe("responsive and keyboard", () => {
   });
 
   test("light is the default theme and dark stays readable", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "light" });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
     const light = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
@@ -52,5 +53,19 @@ test.describe("responsive and keyboard", () => {
     await expect(page.getByTestId("kpi-cash")).toBeVisible();
     await page.reload();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  });
+
+  test("without a stored choice the operating system theme is used", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect(page.getByTestId("theme-toggle")).toHaveAttribute("aria-pressed", "true");
+
+    // An explicit choice then wins over the system setting.
+    await page.getByTestId("theme-toggle").click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 });

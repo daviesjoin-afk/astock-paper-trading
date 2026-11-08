@@ -195,3 +195,116 @@ test.describe("verification is two independent facts", () => {
     await expect(page.getByTestId("reproduction-status")).toContainText("2 条研究信号");
   });
 });
+
+test.describe("working-surface behaviour", () => {
+  test("the decision filter narrows the table and keeps both totals on the chips", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.rejected}`);
+    await view(page, "decisions");
+    const rows = page.getByTestId("runs-body").locator("tr");
+    await expect(rows).toHaveCount(1);
+
+    const all = page.getByRole("button", { name: /^全部/ });
+    const filled = page.getByRole("button", { name: /^已成交/ });
+    const rejected = page.getByRole("button", { name: /^已拒绝/ });
+    await expect(all).toHaveAttribute("aria-pressed", "true");
+    await expect(rejected).toContainText("1");
+
+    await filled.click();
+    await expect(filled).toHaveAttribute("aria-pressed", "true");
+    await expect(rows).toHaveCount(0);
+    await expect(page.locator("#runs-filtered-empty")).toBeVisible();
+    await expect(page.getByTestId("runs-empty-state")).toBeHidden();
+
+    await rejected.click();
+    await expect(rows).toHaveCount(1);
+
+    await all.click();
+    await expect(rows).toHaveCount(1);
+    await expect(page.locator("#runs-filtered-empty")).toBeHidden();
+  });
+
+  test("the overview mirrors the newest decision and the quality checks", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    const recent = page.getByTestId("recent-list");
+    await expect(recent.locator("li")).toHaveCount(1);
+    await expect(recent).toContainText("第 3 条信号");
+    await expect(page.locator("#recent-note")).toContainText("共 1 条决策");
+
+    await view(page, "replay");
+    await page.getByTestId("verify-replay").click();
+    await expect(page.getByTestId("replay-status")).toContainText("通过", { timeout: 15_000 });
+    await view(page, "overview");
+    await expect(page.locator("#overview-replay")).toHaveAttribute("data-state", "ok");
+    await expect(page.locator("#overview-replay")).toContainText("通过");
+    await expect(page.locator("#overview-reproduction")).toHaveAttribute("data-state", "idle");
+  });
+
+  test("navigation stays unavailable while a notice owns the screen", async ({ page }) => {
+    await page.route(/\/v2\/experiments(\?.*)?$/, async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      await route.fulfill({ status: 500, json: { error: "storage_error" } });
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("service-error")).toBeVisible();
+    await expect(page.getByTestId("nav-overview")).toBeDisabled();
+    await expect(page.getByTestId("nav-decisions")).toBeDisabled();
+  });
+
+  test("the empty state offers the exact local command", async ({ page, context }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.route(/\/v2\/experiments(\?.*)?$/, async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      await route.fulfill({ json: { experiments: [] } });
+    });
+    await page.goto("/");
+    const empty = page.getByTestId("empty-experiments");
+    await expect(empty).toContainText("experiment_demo.py");
+    await page.getByTestId("copy-demo").click();
+    await expect(page.getByTestId("live-status")).toContainText("命令已复制");
+    await expect(page.getByTestId("copy-demo")).toHaveText("已复制");
+  });
+});
+
+test.describe("long lists and small screens", () => {
+  test("a long decision list keeps its header visible while scrolling", async ({ page }) => {
+    const runs = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      request: {
+        signal_id: `signal-${String(1000 + index)}-buy`,
+        decision_at: `2026-10-30T14:${String(59 - (index % 60)).padStart(2, "0")}:00Z`,
+        signal: { side: index % 3 === 0 ? "sell" : "buy" },
+      },
+      outcome: index % 4 === 0
+        ? { status: "rejected", reason: "stale_quote" }
+        : { status: "filled", reason: "filled" },
+    }));
+    await page.route("**/v2/simulations?*", async (route) => {
+      await route.fulfill({ json: runs });
+    });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("summary-strategy").waitFor();
+    await view(page, "decisions");
+
+    const scroller = page.getByTestId("panel-decisions").locator(".table-scroll");
+    await expect(page.getByTestId("runs-body").locator("tr")).toHaveCount(100);
+    const header = scroller.locator("thead th").first();
+    await scroller.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+    await page.waitForTimeout(150);
+    const [headerBox, scrollerBox] = await Promise.all([
+      header.boundingBox(), scroller.boundingBox(),
+    ]);
+    expect(headerBox).not.toBeNull();
+    expect(scrollerBox).not.toBeNull();
+    expect(Math.abs((headerBox?.y ?? 0) - (scrollerBox?.y ?? 0))).toBeLessThan(3);
+    await expect(page.getByTestId("runs-body").locator("tr").last()).toBeVisible();
+  });
+
+  test("320px keeps the page free of horizontal overflow", async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await expect(page.getByTestId("summary-strategy")).toBeVisible();
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow).toBeLessThanOrEqual(1);
+  });
+});

@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="AStock V2 独立策略实验工作台：只读查看离线模拟实验的持仓、决策与可核验记录。" />
+    <meta name="theme-color" content="#f4f6fa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b1017" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M8 21.5 13.2 15l4.1 3.6L24 10.5' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <title>AStock V2 · 独立策略实验工作台</title>
   </head>
   <body>
@@ -11,48 +15,171 @@
     <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="live-status"></div>
 
     <header class="topbar">
-      <div class="brand">
-        <h1>AStock V2</h1>
-        <p>独立策略实验工作台 · <span class="tag">离线模拟</span> · <span class="tag">只读</span></p>
+      <div class="topbar-inner">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 16.5 9.2 10l4.1 3.6L20 5.5" />
+              <path d="M15.4 5.5H20v4.6" />
+            </svg>
+          </span>
+          <div class="brand-text">
+            <h1>AStock<span class="brand-version">V2</span></h1>
+            <p class="brand-sub">独立策略实验工作台</p>
+          </div>
+          <div class="brand-tags">
+            <span class="tag">离线模拟</span>
+            <span class="tag">只读</span>
+          </div>
+        </div>
+
+        <form class="controls" id="controls" aria-label="实验选择与刷新">
+          <label class="field">
+            <span class="field-label">当前实验</span>
+            <span class="select-wrap">
+              <select id="cycle-select" data-testid="experiment-select" aria-describedby="cycle-hint"></select>
+              <svg class="select-chevron" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                <path d="m4 6.5 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </span>
+          </label>
+          <span id="cycle-hint" class="hint" data-testid="cycle-hint"></span>
+          <div class="control-actions">
+            <button type="button" class="btn btn-quiet" id="refresh" data-testid="refresh">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                <path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6V6h-3.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <span>刷新</span>
+            </button>
+            <button type="button" class="btn btn-quiet" id="theme-toggle" data-testid="theme-toggle"
+                    aria-pressed="false" aria-label="切换深色模式">
+              <svg class="icon-sun" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                <circle cx="8" cy="8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5" />
+                <path d="M8 1v1.6M8 13.4V15M1 8h1.6M13.4 8H15M3 3l1.1 1.1M11.9 11.9 13 13M13 3l-1.1 1.1M4.1 11.9 3 13"
+                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              </svg>
+              <svg class="icon-moon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                <path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8 5.4 5.4 0 1 0 13.2 9.6Z"
+                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+              </svg>
+              <span class="theme-label">深色模式</span>
+            </button>
+            <button type="button" class="btn btn-quiet btn-compact" id="shortcuts-open" data-testid="shortcuts-open"
+                    aria-haspopup="dialog" aria-label="键盘快捷键">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                <rect x="1.6" y="4" width="12.8" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                <path d="M4.4 6.6h.8M7.6 6.6h.8M10.8 6.6h.8M4.4 9.4h.8M10.8 9.4h.8M7.6 9.4h1.2"
+                      fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              </svg>
+              <span class="btn-label">快捷键</span>
+            </button>
+          </div>
+        </form>
       </div>
-      <form class="controls" id="controls" aria-label="实验选择与刷新">
-        <label class="field">
-          <span class="field-label">当前实验</span>
-          <select id="cycle-select" data-testid="experiment-select" aria-describedby="cycle-hint"></select>
-        </label>
-        <span id="cycle-hint" class="hint" data-testid="cycle-hint"></span>
-        <button type="button" class="btn btn-ghost" id="refresh" data-testid="refresh">刷新</button>
-        <button type="button" class="btn btn-ghost" id="theme-toggle" data-testid="theme-toggle"
-                aria-pressed="false">深色模式</button>
-      </form>
     </header>
 
     <div class="shell">
       <nav class="sidenav" aria-label="主导航">
         <div class="nav-group">
           <p class="nav-title">研究</p>
-          <button type="button" class="nav-item" data-view="overview" data-testid="nav-overview">概览</button>
-          <button type="button" class="nav-item" data-view="positions" data-testid="nav-positions">持仓</button>
-          <button type="button" class="nav-item" data-view="decisions" data-testid="nav-decisions">决策记录</button>
+          <button type="button" class="nav-item" data-view="overview" data-testid="nav-overview">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <rect x="2" y="2" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <rect x="9" y="2" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <rect x="2" y="9" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <rect x="9" y="9" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            <span>概览</span>
+          </button>
+          <button type="button" class="nav-item" data-view="positions" data-testid="nav-positions">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M8 2 14 5 8 8 2 5l6-3Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+              <path d="m2 8.4 6 3 6-3M2 11.6l6 3 6-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+            </svg>
+            <span>持仓</span>
+          </button>
+          <button type="button" class="nav-item" data-view="decisions" data-testid="nav-decisions">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M3 4.2h10M3 8h10M3 11.8h6.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+            <span>决策记录</span>
+          </button>
         </div>
         <div class="nav-group">
           <p class="nav-title">质量校验</p>
-          <button type="button" class="nav-item" data-view="replay" data-testid="nav-replay">交易回放</button>
-          <button type="button" class="nav-item" data-view="reproduction" data-testid="nav-reproduction">研究重做</button>
+          <button type="button" class="nav-item" data-view="replay" data-testid="nav-replay">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M2.6 8a5.4 5.4 0 1 0 1.7-4M2.4 2.6v3.6h3.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M6.6 6.1 10 8l-3.4 1.9V6.1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+            </svg>
+            <span>交易回放</span>
+          </button>
+          <button type="button" class="nav-item" data-view="reproduction" data-testid="nav-reproduction">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M3 6.4h6.6a3.2 3.2 0 0 1 0 6.4H5.4M3 6.4l2.2-2.2M3 6.4l2.2 2.2"
+                    fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M13 9.6H6.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+            <span>研究重做</span>
+          </button>
         </div>
         <div class="nav-group">
           <p class="nav-title">实验</p>
-          <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">实验信息</button>
+          <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <circle cx="8" cy="8" r="5.9" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path d="M8 7.2V11M8 5.1v.9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+            <span>实验信息</span>
+          </button>
+        </div>
+        <div class="nav-foot">
+          <p class="nav-foot-title">本地内核</p>
+          <p class="nav-foot-text">只读 API · 不写账本 · 不取实时行情</p>
         </div>
       </nav>
 
       <main id="main" tabindex="-1">
-        <section class="notice" id="loading" data-testid="loading" hidden>
+        <section class="context-bar" id="context-bar" aria-label="实验上下文" hidden>
+          <div class="context-main">
+            <span class="context-label">当前实验</span>
+            <strong class="context-cycle" id="context-cycle">—</strong>
+            <span class="pill" id="context-status" data-state="idle">—</span>
+          </div>
+          <p class="context-meta">更新于 <span id="last-refresh">—</span></p>
+          <div class="context-actions">
+            <button type="button" class="btn btn-quiet btn-small" id="copy-link" data-testid="copy-link">
+              <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
+                <path d="M6.6 9.4a2.6 2.6 0 0 0 3.7 0l1.9-1.9a2.6 2.6 0 1 0-3.7-3.7l-.8.8"
+                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                <path d="M9.4 6.6a2.6 2.6 0 0 0-3.7 0L3.8 8.5a2.6 2.6 0 1 0 3.7 3.7l.8-.8"
+                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              </svg>
+              <span class="copy-label">复制链接</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="notice skeleton-notice" id="loading" data-testid="loading" hidden>
           <h2>正在读取实验…</h2>
           <p class="muted">从本地服务读取已登记事实；不读取实时行情。</p>
+          <div class="skeleton" aria-hidden="true">
+            <span class="sk-line sk-line-lg"></span>
+            <span class="sk-line"></span>
+            <div class="sk-cards">
+              <span class="sk-card"></span><span class="sk-card"></span>
+              <span class="sk-card"></span><span class="sk-card"></span>
+            </div>
+          </div>
         </section>
 
         <section class="notice notice-error" id="service-error" data-testid="service-error" hidden>
+          <span class="notice-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 4.2h10v7.6H3z" />
+              <path d="M3 6.4h10M5.6 9.4h2.2" />
+            </svg>
+          </span>
           <h2>服务不可用</h2>
           <p>无法连接本地内核。请确认它正在运行：<code>cd v2 &amp;&amp; cargo run --locked</code>。</p>
           <p class="muted" data-testid="service-detail"></p>
@@ -60,13 +187,28 @@
         </section>
 
         <section class="notice" id="empty-experiments" data-testid="empty-experiments" hidden>
+          <span class="notice-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3.4 2.4h6l3.2 3.2v8H3.4z" />
+              <path d="M9.2 2.6v3.2h3.2M5.6 9h4.8M5.6 11.2h3.4" />
+            </svg>
+          </span>
           <h2>还没有实验</h2>
           <p>系统不会自动创建实验。先在本地离线演示里建立固定实验，再回到本页刷新：</p>
-          <pre><code>cd v2
+          <div class="cmd">
+            <pre><code id="demo-command">cd v2
 python3 scripts/experiment_demo.py</code></pre>
+            <button type="button" class="btn btn-quiet" id="copy-demo" data-testid="copy-demo">复制命令</button>
+          </div>
         </section>
 
         <section class="notice notice-warn" id="unknown-experiment" data-testid="unknown-experiment" hidden>
+          <span class="notice-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="8" cy="8" r="5.6" />
+              <path d="M8 4.9v3.6M8 11.2v.6" />
+            </svg>
+          </span>
           <h2>找不到这个实验</h2>
           <p>地址里的 <code id="unknown-cycle"></code> 不在当前数据库中。</p>
           <p class="muted">从上方“当前实验”选择已有实验；不会自动替换成其它实验。</p>
@@ -76,8 +218,10 @@ python3 scripts/experiment_demo.py</code></pre>
           <!-- 概览 -->
           <section class="panel" id="panel-overview" data-testid="panel-overview" hidden>
             <header class="panel-head">
-              <h2>概览</h2>
-              <p class="muted">当前实验的关键事实；不展示净值、收益率或排名。</p>
+              <div>
+                <h2>概览</h2>
+                <p class="muted">当前实验的关键事实；不展示净值、收益率或排名。</p>
+              </div>
             </header>
             <div class="summary" aria-label="实验摘要">
               <dl>
@@ -89,29 +233,70 @@ python3 scripts/experiment_demo.py</code></pre>
               </dl>
             </div>
             <div class="kpis">
-              <article class="kpi"><h2>初始资金</h2><p class="num" data-testid="kpi-initial-cash">—</p></article>
-              <article class="kpi"><h2>现金余额</h2><p class="num" data-testid="kpi-cash">—</p></article>
-              <article class="kpi"><h2>持仓标的</h2><p class="num" data-testid="kpi-positions">—</p></article>
-              <article class="kpi"><h2>模拟决策</h2><p class="num" data-testid="kpi-runs">—</p></article>
+              <article class="kpi">
+                <h2>初始资金</h2>
+                <p class="num" data-testid="kpi-initial-cash">—</p>
+                <p class="kpi-note">实验建立时固定</p>
+              </article>
+              <article class="kpi kpi-accent">
+                <h2>现金余额</h2>
+                <p class="num" data-testid="kpi-cash">—</p>
+                <p class="kpi-note">按已成交决策扣减</p>
+              </article>
+              <article class="kpi">
+                <h2>持仓标的</h2>
+                <p class="num" data-testid="kpi-positions">—</p>
+                <p class="kpi-note">当前仍有数量</p>
+              </article>
+              <article class="kpi">
+                <h2>模拟决策</h2>
+                <p class="num" data-testid="kpi-runs">—</p>
+                <p class="kpi-note">含被拒绝的决策</p>
+              </article>
             </div>
             <div class="quick">
-              <button type="button" class="link" data-goto="positions">查看持仓 →</button>
-              <button type="button" class="link" data-goto="decisions">查看决策记录 →</button>
-              <button type="button" class="link" data-goto="replay">运行交易回放 →</button>
+              <button type="button" class="link" data-goto="positions">查看持仓 <span aria-hidden="true">→</span></button>
+              <button type="button" class="link" data-goto="decisions">查看决策记录 <span aria-hidden="true">→</span></button>
+              <button type="button" class="link" data-goto="replay">运行交易回放 <span aria-hidden="true">→</span></button>
+            </div>
+            <div class="overview-grid">
+              <section class="subcard" aria-labelledby="recent-title">
+                <header class="subcard-head">
+                  <h3 id="recent-title">最近决策</h3>
+                  <button type="button" class="link-quiet" data-goto="decisions">全部记录 →</button>
+                </header>
+                <ul class="recent" id="recent-list" data-testid="recent-list"></ul>
+                <p class="subcard-note" id="recent-note">共 0 条决策</p>
+                <p class="subcard-empty" id="recent-empty" data-testid="recent-empty" hidden>还没有决策。研究信号需要显式提交后才会成为决策。</p>
+              </section>
+              <section class="subcard" aria-labelledby="quality-title">
+                <header class="subcard-head">
+                  <h3 id="quality-title">质量校验</h3>
+                  <button type="button" class="link-quiet" data-goto="replay">去运行 →</button>
+                </header>
+                <ul class="checks">
+                  <li><span>交易回放</span><span class="check" id="overview-replay" data-state="idle">未验证</span></li>
+                  <li><span>研究重做</span><span class="check" id="overview-reproduction" data-state="idle">未验证</span></li>
+                </ul>
+                <p class="subcard-note">两项互相独立：回放校验已存决策，重做校验研究输入。</p>
+              </section>
             </div>
           </section>
 
           <!-- 持仓 -->
           <section class="panel" id="panel-positions" data-testid="panel-positions" hidden>
             <header class="panel-head">
-              <h2>当前持仓</h2>
+              <div>
+                <h2>当前持仓</h2>
+                <p class="muted" id="positions-count">按标的汇总的剩余数量</p>
+              </div>
               <div class="asof">
                 <label class="field field-inline">
                   <span class="field-label">日终口径</span>
                   <input type="date" id="asof-day" data-testid="asof-day" aria-label="日终口径日期" />
                 </label>
-                <button type="button" class="btn btn-ghost" id="asof-apply" data-testid="asof-apply">应用</button>
-                <button type="button" class="btn btn-ghost" id="asof-clear" data-testid="asof-clear">清除</button>
+                <button type="button" class="btn btn-quiet" id="asof-apply" data-testid="asof-apply">应用</button>
+                <button type="button" class="btn btn-quiet" id="asof-clear" data-testid="asof-clear">清除</button>
                 <span class="hint" id="asof-error" data-testid="asof-error" hidden>请先选择日期再应用</span>
               </div>
             </header>
@@ -131,15 +316,29 @@ python3 scripts/experiment_demo.py</code></pre>
               </table>
             </div>
             <p class="empty" data-testid="positions-empty-state" hidden>
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
+                  <path d="M10 2.6 17 6l-7 3.4L3 6l7-3.4Z" />
+                  <path d="m3 10.2 7 3.4 7-3.4M3 14.2l7 3.4 7-3.4" />
+                </svg>
+              </span>
               没有持仓。当前实验的模拟决策尚未产生成交持仓。
             </p>
+            <p class="panel-foot">日终口径只影响“可卖数量”；持仓数量本身来自已成交决策。</p>
           </section>
 
           <!-- 决策 -->
           <section class="panel" id="panel-decisions" data-testid="panel-decisions" hidden>
             <header class="panel-head">
-              <h2>决策记录</h2>
-              <p class="muted">最近 100 条；按写入顺序倒序。原因已转为业务说明。</p>
+              <div>
+                <h2>决策记录</h2>
+                <p class="muted">最近 100 条；按写入顺序倒序。原因已转为业务说明。</p>
+              </div>
+              <div class="filter-bar" role="group" aria-label="按结果筛选决策">
+                <button type="button" class="chip" data-filter="all" aria-pressed="true">全部</button>
+                <button type="button" class="chip" data-filter="filled" aria-pressed="false">已成交</button>
+                <button type="button" class="chip" data-filter="rejected" aria-pressed="false">已拒绝</button>
+              </div>
             </header>
             <div class="section-error" data-testid="runs-error" hidden></div>
             <div class="table-scroll" tabindex="0" role="region" aria-label="决策记录表格，可横向滚动">
@@ -158,41 +357,58 @@ python3 scripts/experiment_demo.py</code></pre>
               </table>
             </div>
             <p class="empty" data-testid="runs-empty-state" hidden>
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M4 5.4h12M4 10h12M4 14.6h7" />
+                </svg>
+              </span>
               还没有决策。研究信号需要显式提交后才会成为决策。
             </p>
+            <p class="empty" id="runs-filtered-empty" hidden>
+              当前筛选没有匹配的决策。切换到“全部”查看完整记录。
+            </p>
+            <p class="panel-foot">决策记录只读；被拒绝的决策同样保留，用于回放校验。</p>
           </section>
 
           <!-- 交易回放 -->
           <section class="panel" id="panel-replay" data-testid="panel-replay" hidden>
             <header class="panel-head">
-              <h2>交易回放</h2>
-              <p class="muted">用已固定的输入重新执行已存储的决策，逐字段比对请求、证据与成交。</p>
+              <div>
+                <h2>交易回放</h2>
+                <p class="muted">用已固定的输入重新执行已存储的决策，逐字段比对请求、证据与成交。</p>
+              </div>
             </header>
             <div class="verify-body">
               <p><button type="button" class="btn" data-testid="verify-replay">运行回放</button></p>
               <p class="verify-status" data-testid="replay-status" data-state="idle">未验证</p>
               <p class="verify-detail muted" data-testid="replay-detail"></p>
             </div>
+            <p class="panel-foot">回放逐字段比对已存储的请求、证据与成交；通过不代表研究结论正确。</p>
           </section>
 
           <!-- 研究重做 -->
           <section class="panel" id="panel-reproduction" data-testid="panel-reproduction" hidden>
             <header class="panel-head">
-              <h2>研究重做</h2>
-              <p class="muted">用固定策略与冻结研究输入重新生成研究信号；不判断收益。</p>
+              <div>
+                <h2>研究重做</h2>
+                <p class="muted">用固定策略与冻结研究输入重新生成研究信号；不判断收益。</p>
+              </div>
             </header>
             <div class="verify-body">
               <p><button type="button" class="btn" data-testid="verify-reproduction">运行重做</button></p>
               <p class="verify-status" data-testid="reproduction-status" data-state="idle">未验证</p>
               <p class="verify-detail muted" data-testid="reproduction-detail"></p>
             </div>
+            <p class="panel-foot">重做只验证研究信号是否可由固定策略与冻结输入再次产生。</p>
           </section>
 
           <!-- 实验信息 -->
           <section class="panel" id="panel-experiment" data-testid="panel-experiment" hidden>
             <header class="panel-head">
-              <h2>实验信息</h2>
-              <p class="muted">只有排障时才需要展开技术细节。</p>
+              <div>
+                <h2>实验信息</h2>
+                <p class="muted">只有排障时才需要展开技术细节。</p>
+              </div>
             </header>
             <div class="verify-body">
               <p>实验：<strong id="experiment-name" data-testid="experiment-name">—</strong></p>
@@ -212,6 +428,33 @@ python3 scripts/experiment_demo.py</code></pre>
         </div>
       </main>
     </div>
+
+    <footer class="page-foot">
+      <p>AStock V2 · 模拟交易研究环境 · 数据来自本地只读 API</p>
+      <p class="page-foot-meta"><span>离线合成行情</span><span aria-hidden="true">·</span><span>不连接券商</span></p>
+    </footer>
+
+    <dialog class="sheet" id="shortcuts" data-testid="shortcuts"
+            aria-labelledby="shortcuts-title" aria-describedby="shortcuts-note">
+      <header class="sheet-head">
+        <h2 id="shortcuts-title">键盘快捷键</h2>
+        <button type="button" class="btn btn-quiet" id="shortcuts-close" data-testid="shortcuts-close">关闭</button>
+      </header>
+      <dl class="shortcut-list">
+        <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>6</kbd></dt>
+          <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 实验</dd></div>
+        <div><dt><kbd>/</kbd></dt><dd>聚焦“当前实验”选择器</dd></div>
+        <div><dt><kbd>r</kbd></dt><dd>刷新当前实验</dd></div>
+        <div><dt><kbd>t</kbd></dt><dd>切换深色 / 浅色</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>打开本说明</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>关闭本说明</dd></div>
+      </dl>
+      <p class="sheet-note" id="shortcuts-note">在输入框或下拉框中输入时不会触发快捷键；没有实验或服务不可用时，导航类快捷键不生效。</p>
+    </dialog>
+
+    <noscript>
+      <p class="noscript">本页需要 JavaScript 才能读取本地实验数据。</p>
+    </noscript>
 
     <script type="module" src="/src/main.ts"></script>
   </body>
