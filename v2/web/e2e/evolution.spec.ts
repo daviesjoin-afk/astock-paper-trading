@@ -187,6 +187,24 @@ test.describe("evolution history", () => {
     await expect(page.getByTestId("evolution-empty")).toContainText("没有匹配的事件");
   });
 
+  test("filters by decision date", async ({ page }) => {
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf(events) }));
+    await openEvolution(page);
+    await page.getByTestId("evolution-from").fill("2026-11-05");
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(1);
+    await expect(page.getByTestId("evolution-event-evo-1")).toBeVisible();
+
+    await page.getByTestId("evolution-from").fill("");
+    await page.getByTestId("evolution-to").fill("2026-11-04");
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(1);
+    await expect(page.getByTestId("evolution-event-evo-2")).toBeVisible();
+
+    await page.getByTestId("evolution-from").fill("2026-11-06");
+    await page.getByTestId("evolution-to").fill("");
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(0);
+    await expect(page.getByTestId("evolution-empty")).toContainText("没有匹配的事件");
+  });
+
   test("an empty log explains itself", async ({ page }) => {
     await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await openEvolution(page);
