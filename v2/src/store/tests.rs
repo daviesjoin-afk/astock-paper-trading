@@ -3389,3 +3389,77 @@ fn account_advance_drives_running_sessions_only() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+#[test]
+fn evolution_decisions_require_evidence_margin_and_risk() {
+    let policy = crate::domain::EvolutionPolicy::default();
+    let incumbent = crate::domain::CandidateMetrics {
+        candidate_id: "incumbent".into(),
+        out_of_sample_days: 30,
+        shadow_days: 15,
+        trades: 40,
+        return_bps: 500,
+        drawdown_bps: 800,
+    };
+    let strong = crate::domain::CandidateMetrics {
+        candidate_id: "candidate-strong".into(),
+        out_of_sample_days: 25,
+        shadow_days: 12,
+        trades: 25,
+        return_bps: 700,
+        drawdown_bps: 900,
+    };
+    let promoted = crate::domain::decide_promotion(&incumbent, &strong, &policy).unwrap();
+    assert_eq!(promoted.status, "promoted");
+    assert!(promoted.reasons[0].contains("通过"));
+    assert_eq!(promoted.digest.len(), 64);
+
+    // Too little evidence never promotes, even with great numbers.
+    let thin = crate::domain::CandidateMetrics {
+        out_of_sample_days: 5,
+        shadow_days: 2,
+        trades: 3,
+        return_bps: 5_000,
+        ..strong.clone()
+    };
+    let insufficient = crate::domain::decide_promotion(&incumbent, &thin, &policy).unwrap();
+    assert_eq!(insufficient.status, "insufficient_evidence");
+    assert!(insufficient.reasons[0].contains("样本不足"));
+
+    // Drawdown above the cap rejects regardless of return.
+    let risky = crate::domain::CandidateMetrics {
+        drawdown_bps: 2_000,
+        ..strong.clone()
+    };
+    let rejected = crate::domain::decide_promotion(&incumbent, &risky, &policy).unwrap();
+    assert_eq!(rejected.status, "rejected");
+    assert!(rejected.reasons.iter().any(|reason| reason.contains("风险恶化")));
+
+    // A marginal gain below the margin is not enough.
+    let marginal = crate::domain::CandidateMetrics {
+        return_bps: 520,
+        ..strong.clone()
+    };
+    let marginal_decision = crate::domain::decide_promotion(&incumbent, &marginal, &policy).unwrap();
+    assert_eq!(marginal_decision.status, "rejected");
+    assert!(marginal_decision.reasons.iter().any(|reason| reason.contains("优势不足")));
+
+    // Post-promotion monitoring reverts on risk deterioration and keeps calm.
+    let calm = crate::domain::CandidateMetrics {
+        candidate_id: "candidate-strong".into(),
+        drawdown_bps: 1_000,
+        return_bps: 680,
+        ..strong.clone()
+    };
+    let kept = crate::domain::decide_rollback(&strong, &calm, &policy).unwrap();
+    assert_eq!(kept.status, "kept");
+    let storm = crate::domain::CandidateMetrics {
+        drawdown_bps: 2_500,
+        return_bps: 100,
+        ..strong.clone()
+    };
+    let reverted = crate::domain::decide_rollback(&strong, &storm, &policy).unwrap();
+    assert_eq!(reverted.status, "reverted");
+    assert!(reverted.reasons.iter().any(|reason| reason.contains("回撤恶化")));
+    assert!(reverted.reasons.iter().any(|reason| reason.contains("优势消失")));
+}

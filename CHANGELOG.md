@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 自进化治理（ADR 012）：新增纯域 `EvolutionPolicy` / `CandidateMetrics` / `decide_promotion()` / `decide_rollback()`——样本外天数、影子天数、成交笔数、回撤上限、相对基准收益门槛全部硬约束；证据不足即使收益极高也不晋级，回撤恶化或优势消失触发回退，决策附逐条理由与 canonical 摘要。新增 `POST /v2/evolution/decisions`（promotion/rollback）。Rust 135 passed（晋级/证据不足/风险拒绝/优势不足/回退/保持）；浏览器 102 passed（无 UI 变更）；冒烟覆盖晋级决策。
 - V2 账户级按日推进（ADR 011）：新增 `Store::advance_account_to(account, day)` 与 `POST /v2/paper-accounts/{id}/advance`——只推进 `running` 会话到指定中国日，暂停/完成会话不动，汇总 `sessions/steps/filled/rejected`；无运行中会话或已无信号时为 no-op；非法日期 422、账户缺失 404。控制台会话区新增日期控件与“推进账户到该日”。Rust 134 passed（两会话推进、暂停不动、跨日完成、no-op、错误码）；浏览器 102 passed（账户级推进用例）。
 - V2 成本口径敞口分析（ADR 010）：新增纯域 `compute_exposure()`——按成交移动平均成本计算每槽成本占用率与逐标的占比，超过 `max_symbol_weight_bps` 时报告 `symbol_concentration` breach；不读价格、不算盈亏、不写账本，附 canonical 摘要。新增 `Store::paper_exposure()` 与 `GET /v2/paper-accounts/{id}/exposure`；账户页新增“仓位与集中度”区块（占用率 + 无超限/超限标的）。Rust 133 passed（买入成本、卖光归零、上限 breach、摘要）；浏览器 101 passed（区块展示）。
 - V2 划拨审计与展示（ADR 009）：审计新增第 8 项 `rebalance_chain`——权重链连续、每次划拨保持准备金、现金只在不同槽位间移动、最后权重等于当前权重；篡改权重链会被发现。新增 `GET /v2/paper-accounts/{id}/rebalances` 只读列表；账户页展示“资金划拨”（方向、金额、前后权重、日期），无划拨时隐藏。Rust 132 passed（审计链检查 + 篡改检测 + 读模型）；浏览器 101 passed（stub 划拨列表）；冒烟断言 8 项检查名。
