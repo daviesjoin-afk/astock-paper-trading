@@ -48,6 +48,7 @@ python3 - <<'PY'
 import copy
 import datetime as dt
 import json
+import threading
 import os
 import subprocess
 import tempfile
@@ -462,6 +463,47 @@ assert call("paper-accounts/smoke-account/orders", paper_order)["duplicate"] is 
 orders = call("paper-accounts/smoke-account/orders")
 assert len(orders) == 1 and orders[0]["id"] == order["id"], orders
 assert orders[0]["slot"] == "A" and orders[0]["outcome"] == order["outcome"]
+
+# Concurrency: identical orders under contention collapse into one fill.
+concurrency_account = {
+    "schema_version": 1, "account_id": "concurrency-account",
+    "initial_cash_cents": 10_000_000, "reserve_bps": 1000,
+    "created_at": "2026-11-08T09:00:00+08:00",
+    "slots": [
+        {"slot": "A", "strategy_version_id": "research-momentum-v1",
+         "market_data_pack_id": "cn-offline-fixture-pack-1",
+         "execution_policy_version": "v2-paper-policy-6", "weight_bps": 4500},
+        {"slot": "B", "strategy_version_id": "research-reversion-v1",
+         "market_data_pack_id": "cn-offline-fixture-pack-1",
+         "execution_policy_version": "v2-paper-policy-6", "weight_bps": 4500},
+    ],
+}
+call("paper-accounts", concurrency_account)
+concurrent_order = {
+    "schema_version": 1, "account_id": "concurrency-account", "slot": "A",
+    "signal_id": "conc-buy", "decision_at": "2026-10-30T14:00:00+08:00",
+    "signal": {"symbol": "600000.SH", "side": "buy"},
+    "quote_ref": {"market_data_pack_id": "cn-offline-fixture-pack-1",
+                  "source": "offline-fixture", "quote_id": "offline-quote-20261030-1359"},
+}
+responses, failures = [], []
+def place():
+    try:
+        responses.append(call("paper-accounts/concurrency-account/orders", concurrent_order))
+    except Exception as error:  # noqa: BLE001 - surfaced below
+        failures.append(error)
+threads = [threading.Thread(target=place) for _ in range(8)]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+assert not failures, failures
+assert len({response["id"] for response in responses}) == 1, responses
+assert sum(1 for response in responses if not response["duplicate"]) == 1
+assert sum(1 for response in responses if response["duplicate"]) == 7
+contended = call("paper-accounts/concurrency-account")
+assert contended["slots"][0]["orders_total"] == 1, contended["slots"][0]
+assert call("paper-accounts/concurrency-account/audit")["ok"] is True
+health = call("health")
+assert health["schema_version"] == 13 and health["writer"] == "store-single-writer", health
 
 # Deterministic session clock: explicit start, two frozen signals, pause gates.
 session_spec = {
