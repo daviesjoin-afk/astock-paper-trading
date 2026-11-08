@@ -383,6 +383,15 @@ catalogue = call("price-sets")
 assert len(catalogue) == 1, catalogue
 assert catalogue[0]["price_set_id"] == "smoke-synthetic", catalogue
 assert catalogue[0]["trust"] == "synthetic", catalogue
+# Evolution governance: evidence-based promotion, no lucky single backtest.
+evolution = call("evolution/decisions", {
+    "kind": "promotion",
+    "incumbent": {"candidate_id": "base", "out_of_sample_days": 30, "shadow_days": 15,
+                  "trades": 40, "return_bps": 500, "drawdown_bps": 800},
+    "candidate": {"candidate_id": "cand", "out_of_sample_days": 25, "shadow_days": 12,
+                  "trades": 25, "return_bps": 700, "drawdown_bps": 900},
+})
+assert evolution["status"] == "promoted", evolution
 # The account ledger proves its own invariants and links fills to outcomes.
 audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit
