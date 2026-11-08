@@ -71,7 +71,16 @@ python scripts/verify_export.py evolution-2026-11.json
 # verified count=42 digest=…
 ```
 
-退出码：0 通过、1 摘要/计数不一致、2 文件不可读或非法 JSON。
+退出码：0 通过、1 摘要/计数不一致、2 文件不可读或非法 JSON。退出码：0 通过、1 摘要/计数不一致、2 文件不可读或非法 JSON。
+
+账本与导出一起归档时，用联合校验（输出合并 manifest 摘要）：
+
+```bash
+python scripts/verify_archive.py --db /backup/astock.sqlite3 --export evolution-2026-11.json
+# archive ok schema=15 accounts=2 events=4 export_count=4 manifest=…
+```
+
+退出码：0 全部通过、1 任一产物无效、2 文件缺失或不可读。
 
 每周复核（只读，不写账本）：
 

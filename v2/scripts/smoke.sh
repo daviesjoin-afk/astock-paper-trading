@@ -748,7 +748,7 @@ python3 scripts/research_reproduction_demo.py
 DB_BACKUP="${RUNNER_TEMP:-/tmp}/astock-backup-${GITHUB_RUN_ID:-local}.sqlite3"
 DB_RESTORED="${RUNNER_TEMP:-/tmp}/astock-restored-${GITHUB_RUN_ID:-local}.sqlite3"
 DB_CORRUPT="${RUNNER_TEMP:-/tmp}/astock-corrupt-${GITHUB_RUN_ID:-local}.sqlite3"
-rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT"
+
 
 python scripts/db_tool.py backup --db "$ASTOCK_V2_DB" --out "$DB_BACKUP" \
   | grep -Eq "backup ok schema=[0-9]+ accounts=[1-9]"
@@ -772,6 +772,18 @@ else
   test $? -eq 1
 fi
 
+# One command verifies both artifacts and prints a combined manifest.
+DB_EXPORT="${RUNNER_TEMP:-/tmp}/astock-archive-export-${GITHUB_RUN_ID:-local}.json"
+python - "$DB_EXPORT" <<'ARCHIVE'
+import sys, urllib.request
+url = "http://127.0.0.1:8765/v2/evolution/events/export"
+with urllib.request.urlopen(url, timeout=10) as response:
+    data = response.read()
+open(sys.argv[1], "wb").write(data)
+ARCHIVE
+python scripts/verify_archive.py --db "$DB_BACKUP" --export "$DB_EXPORT"   | grep -q "archive ok"
+
+rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT" "$DB_EXPORT"
 rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT"
 
 # Reopen the exact SQLite file in a new Rust process, then verify both frozen ledgers.
