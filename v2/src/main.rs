@@ -96,6 +96,11 @@ async fn create_paper_account(
     response(db.create_paper_account_request(request).map_err(api_error)?)
 }
 
+async fn price_set_catalogue(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    response(db.price_set_catalogue().map_err(api_error)?)
+}
+
 async fn strategy_catalogue(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     response(db.strategy_catalogue().map_err(api_error)?)
@@ -272,6 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
         .route("/v2/strategies", get(strategy_catalogue))
+        .route("/v2/price-sets", get(price_set_catalogue))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
         .route(
             "/v2/paper-accounts/{account_id}/valuation",

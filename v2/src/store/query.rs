@@ -447,6 +447,11 @@ impl Store {
                 symbols,
             });
         }
+        let pack = spec.slots[0].market_data_pack_id.clone();
+        if spec.slots.iter().any(|slot| slot.market_data_pack_id != pack) {
+            return Err(StoreError::Rules(RuleError("valuation_mixed_packs".into())));
+        }
+        let registry = bundled_price_registry()?;
         let mut report = PaperValuationReport {
             account_id: account_id.into(),
             as_of_day: as_of_day.into(),
@@ -455,8 +460,17 @@ impl Store {
             requirements,
             missing: vec!["reviewed_price_set".into()],
             priced_symbols: 0,
+            valuation: None,
             digest: String::new(),
         };
+        if let Some(set) = registry.select(&pack, as_of_day) {
+            let valued = self.paper_valuation_with_set(&report.account_id, as_of_day, set)?;
+            report.status = "valued".into();
+            report.reason = String::new();
+            report.missing.clear();
+            report.priced_symbols = valued.positions.len();
+            report.valuation = Some(valued);
+        }
         let mut value = serde_json::to_value(&report)?;
         if let Some(object) = value.as_object_mut() {
             object.remove("digest");
@@ -514,5 +528,87 @@ impl Store {
             &pack,
         )
         .map_err(StoreError::Rules)
+    }
+}
+
+/// Bundled, reviewed price sets. Adding data means adding a reviewed artifact,
+/// never a runtime write.
+fn bundled_price_registry() -> StoreResult<crate::domain::PriceSetRegistry> {
+    let raw = include_str!("../../data/price-sets-registry.json");
+    let registry: crate::domain::PriceSetRegistry = serde_json::from_str(raw)?;
+    registry.validate()?;
+    Ok(registry)
+}
+
+impl Store {
+    pub fn price_set_catalogue(&self) -> StoreResult<Vec<crate::domain::PriceSetSummary>> {
+        Ok(bundled_price_registry()?.summaries())
+    }
+
+    /// Valuation using an explicit registry (tests can supply one).
+    pub fn paper_valuation_with_registry(
+        &self,
+        account_id: &str,
+        as_of_day: &str,
+        registry: &crate::domain::PriceSetRegistry,
+    ) -> StoreResult<PaperValuationReport> {
+        let day = chrono::NaiveDate::parse_from_str(as_of_day, "%Y-%m-%d")
+            .map_err(|_| StoreError::Rules(RuleError("invalid_valuation_day".into())))?;
+        if day.to_string() != as_of_day {
+            return Err(StoreError::Rules(RuleError("invalid_valuation_day".into())));
+        }
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate()?;
+        let mut requirements = Vec::new();
+        for (index, slot) in spec.slots.iter().enumerate() {
+            let state = Store::paper_slot_state(&self.conn, &spec, &split, index)?;
+            let mut symbols: Vec<String> =
+                state.lots.iter().map(|lot| lot.symbol.clone()).collect();
+            symbols.sort();
+            symbols.dedup();
+            requirements.push(PaperValuationRequirement {
+                slot: slot.slot.as_str().into(),
+                market_data_pack_id: slot.market_data_pack_id.clone(),
+                symbols,
+            });
+        }
+        let pack = spec.slots[0].market_data_pack_id.clone();
+        if spec.slots.iter().any(|slot| slot.market_data_pack_id != pack) {
+            return Err(StoreError::Rules(RuleError("valuation_mixed_packs".into())));
+        }
+        let mut report = PaperValuationReport {
+            account_id: account_id.into(),
+            as_of_day: as_of_day.into(),
+            status: "unavailable".into(),
+            reason: "no_reviewed_price_set".into(),
+            requirements,
+            missing: vec!["reviewed_price_set".into()],
+            priced_symbols: 0,
+            valuation: None,
+            digest: String::new(),
+        };
+        if let Some(set) = registry.select(&pack, as_of_day) {
+            let valued = self.paper_valuation_with_set(account_id, as_of_day, set)?;
+            report.status = "valued".into();
+            report.reason = String::new();
+            report.missing.clear();
+            report.priced_symbols = valued.positions.len();
+            report.valuation = Some(valued);
+        }
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
     }
 }

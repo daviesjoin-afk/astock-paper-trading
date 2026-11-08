@@ -86,7 +86,8 @@ ADR 004 已禁止在缺少审核估值价格时输出收益类指标。账户与
 
 - **已实现（纯域 + Store）**：`PriceSet` 校验（版本、信任级别、覆盖区间、逐条价格、重复条目）、`value_account()` 标记市值、权益、`profit_cents`（仅 `reviewed`），以及 `Store::paper_valuation_with_set()` 从槽位成交派生持仓并按数据包绑定校验。
 - **已实现（HTTP/UI）**：无价格集合时的拒绝路径与需求清单（ADR 006 §4）。
-- **未实现**：bundled `reviewed` 价格集合的加载与对外端点；净值日序列与回撤；真实数据源接入。
+- **已实现（目录与选择）**：bundled `data/price-sets-registry.json`（当前为空）、`GET /v2/price-sets` 只读目录、`PriceSetRegistry::select()` 仅选择 `reviewed` 且覆盖日期且绑定数据包的集合；HTTP 估值在选中集合时返回 `status:"valued"` 与 `valuation{市值,现金,权益,盈亏}`，否则维持 `unavailable`。
+- **未实现**：真实 `reviewed` 价格集合数据（仓库当前目录为空，刻意不伪造）；净值日序列与回撤；真实数据源接入。
 - **约束**：当前 HTTP 端点不会返回任何估值数字；正向逻辑只通过单元测试验证，且 `synthetic` 集合永远不产生 `profit_cents`。
 
 ## 未决问题

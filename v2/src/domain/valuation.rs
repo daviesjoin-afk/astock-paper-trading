@@ -182,3 +182,66 @@ pub fn value_account(
         profit_cents,
     })
 }
+
+/// One publishable price set in the catalogue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceSetSummary {
+    pub price_set_id: String,
+    pub market_data_pack_id: String,
+    pub trust: String,
+    pub coverage_start: String,
+    pub coverage_end: String,
+    pub entries: usize,
+    pub digest: String,
+}
+
+/// The reviewed catalogue, loaded from a bundled JSON artifact. It contains
+/// data only: no runtime write path can add a set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceSetRegistry {
+    pub schema_version: u32,
+    pub sets: Vec<PriceSet>,
+}
+
+impl PriceSetRegistry {
+    pub fn validate(&self) -> Result<(), RuleError> {
+        if self.schema_version != PRICE_SET_SCHEMA_VERSION {
+            return Err(RuleError("unsupported_price_registry_version".into()));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for set in &self.sets {
+            set.validate()?;
+            if !seen.insert(set.price_set_id.clone()) {
+                return Err(RuleError("duplicate_price_set_id".into()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn summaries(&self) -> Vec<PriceSetSummary> {
+        self.sets.iter().map(|set| PriceSetSummary {
+            price_set_id: set.price_set_id.clone(),
+            market_data_pack_id: set.market_data_pack_id.clone(),
+            trust: set.trust.clone(),
+            coverage_start: set.coverage_start.clone(),
+            coverage_end: set.coverage_end.clone(),
+            entries: set.entries.len(),
+            digest: set.digest(),
+        }).collect()
+    }
+
+    /// Only a reviewed set that binds the pack and covers the day may be used
+    /// for a user-facing valuation.
+    pub fn select(&self, pack_id: &str, day: &str) -> Option<&PriceSet> {
+        let as_of = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+        self.sets.iter().find(|set| {
+            if set.trust != TRUST_REVIEWED || set.market_data_pack_id != pack_id {
+                return false;
+            }
+            let Ok(start) = chrono::NaiveDate::parse_from_str(&set.coverage_start, "%Y-%m-%d") else { return false };
+            let Ok(end) = chrono::NaiveDate::parse_from_str(&set.coverage_end, "%Y-%m-%d") else { return false };
+            start <= as_of && as_of <= end
+        })
+    }
+}

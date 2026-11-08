@@ -2797,3 +2797,47 @@ fn risk_limits_reject_breaching_fills_without_touching_the_ledger() {
         Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_risk_limits"
     ));
 }
+
+#[test]
+fn price_set_registry_selects_only_reviewed_covering_sets() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("registry-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("registry-acct", PaperSlotId::A, buy)).unwrap();
+    let day = order.outcome.fill.expect("filled").trade_day;
+
+    // The bundled catalogue starts empty: no invented prices.
+    assert!(db.price_set_catalogue().unwrap().is_empty());
+    let unavailable = db.paper_valuation("registry-acct", &day).unwrap();
+    assert_eq!(unavailable.status, "unavailable");
+    assert!(unavailable.valuation.is_none());
+
+    let reviewed = price_set("reviewed", &day, 1_300, MARKET_DATA_PACK_ID);
+    let registry = crate::domain::PriceSetRegistry {
+        schema_version: 1,
+        sets: vec![reviewed.clone()],
+    };
+    registry.validate().unwrap();
+    let valued = db
+        .paper_valuation_with_registry("registry-acct", &day, &registry)
+        .unwrap();
+    assert_eq!(valued.status, "valued");
+    assert!(valued.missing.is_empty());
+    assert_eq!(valued.priced_symbols, 1);
+    let valuation = valued.valuation.expect("valued model");
+    assert!(valuation.profit_cents.is_some());
+
+    // A synthetic set is never selected for a user-facing valuation.
+    let synthetic_registry = crate::domain::PriceSetRegistry {
+        schema_version: 1,
+        sets: vec![price_set("synthetic", &day, 1_300, MARKET_DATA_PACK_ID)],
+    };
+    let still_unavailable = db
+        .paper_valuation_with_registry("registry-acct", &day, &synthetic_registry)
+        .unwrap();
+    assert_eq!(still_unavailable.status, "unavailable");
+    assert!(still_unavailable.valuation.is_none());
+    assert_eq!(still_unavailable.digest.len(), 64);
+}

@@ -140,6 +140,8 @@ pub struct PaperValuationReport {
     pub requirements: Vec<PaperValuationRequirement>,
     pub missing: Vec<String>,
     pub priced_symbols: usize,
+    /// Present only when a reviewed set covered the book.
+    pub valuation: Option<crate::domain::AccountValuation>,
     pub digest: String,
 }
 

@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 价格集合目录与估值接线（ADR 006）：新增 bundled `v2/data/price-sets-registry.json`（空集合，刻意不伪造数据）、`GET /v2/price-sets` 只读目录、`PriceSetRegistry::select()`（仅 `reviewed` + 数据包匹配 + 覆盖日期）；估值端点在选中集合时返回 `status:"valued"` 与市值/现金/权益/盈亏（`synthetic` 永不出现盈亏），否则维持 `unavailable`；账户页在可用时切换为“估值可用”并展示市值/权益/盈亏，不可用时仍展示需求清单。Rust 126 passed（注册表选择、审核集合正向估值、合成集合拒绝）；浏览器 99 passed（stub 审核集合的估值展示）；冒烟断言 `/v2/price-sets` 为空。
 - V2 账户风险边界（ADR 005）：新增 `PaperRiskLimits`（单笔金额 / 单标的成本 / 槽位现金下限，默认 25% / 50% / 10%，均以槽位预算 bps 计，向后兼容旧 spec）；账户创建请求与视图携带 `limits`，控制台槽位卡显示当前边界。下单在 `decide` 后做成本口径校验：越界即整笔 `rejected`（`risk_order_notional_exceeded` / `risk_symbol_concentration_exceeded` / `risk_cash_floor_exceeded`），不产生部分成交、不动账本；卖出不受买入侧限制。Rust 125 passed（新增风控拒绝与非法边界）；浏览器 98 passed（槽位风控展示）。
 - V2 估值核心（ADR 006 实现）：新增纯域 `PriceSet` / `PriceEntry` / `AccountValuation` 与 `value_account()`——校验价格集合版本、`reviewed|synthetic` 信任级别、覆盖区间、重复条目与非法价格；按 as_of 日为每个持仓取价，任一持仓缺价或数据包不匹配即整体拒绝（`valuation_missing_symbol` / `valuation_pack_mismatch` / `valuation_day_outside_price_set`）；`reviewed` 才输出 `profit_cents`，`synthetic` 永远为 `None`。`Store::paper_valuation_with_set()` 从槽位成交派生持仓并汇出现金/权益。HTTP 仍只返回 `unavailable`（尚无审核价格集合），正向逻辑由单元测试覆盖。Rust 124 passed。
 - V2 估值契约（ADR 006 起步）：新增 `GET /v2/paper-accounts/{id}/valuation?as_of_day=`，在缺少审核价格集合时只返回 `unavailable + no_reviewed_price_set` 与需求清单（槽位、数据包、需覆盖标的）、`priced_symbols=0` 和 canonical 摘要，绝不包含市值/净值/盈亏字段；非法日期 422、账户缺失 404。前端账户页显示“估值快照（截至 X）：不可用 · 缺少 reviewed_price_set · 需要 600000.SH（离线样本包）”。Rust 123 passed（新增估值拒绝、字段缺失、确定性、错误码）；浏览器 98 passed（账户页展示需求明细）。
