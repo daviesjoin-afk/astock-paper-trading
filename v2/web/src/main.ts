@@ -2005,8 +2005,14 @@ const renderEvolutionList = (): void => {
   const empty = testId<HTMLElement>("evolution-empty");
   const candidate = byId<HTMLInputElement>("evolution-filter-candidate").value.trim().toLowerCase();
   const experiment = byId<HTMLInputElement>("evolution-filter-experiment").value.trim().toLowerCase();
+  const fromDay = byId<HTMLInputElement>("evolution-from").value;
+  const toDay = byId<HTMLInputElement>("evolution-to").value;
   const status = byId<HTMLSelectElement>("evolution-filter-status").value;
-  const list = evolutionEvents.filter((event) =>
+  const list = evolutionEvents.filter((event) => {
+    const day = chinaDayOf(event.decided_at);
+    return (fromDay === "" || day >= fromDay) &&
+      (toDay === "" || day <= toDay);
+  }).filter((event) =>
     (candidate === "" || event.candidate_id.toLowerCase().includes(candidate)) &&
     (status === "" || event.status === status) &&
     (experiment === "" ||
@@ -2216,6 +2222,8 @@ testId<HTMLButtonElement>("evolution-more").addEventListener("click", () => void
 byId<HTMLInputElement>("evolution-filter-candidate").addEventListener("input", renderEvolutionList);
 byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", renderEvolutionList);
 byId<HTMLInputElement>("evolution-filter-experiment").addEventListener("input", renderEvolutionList);
+byId<HTMLInputElement>("evolution-from").addEventListener("change", renderEvolutionList);
+byId<HTMLInputElement>("evolution-to").addEventListener("change", renderEvolutionList);
 
 testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
 

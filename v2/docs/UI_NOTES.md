@@ -114,7 +114,8 @@ form, no valuation.
   signals). It is a read-only research tool; empty inputs are rejected inline.
 - Evolution history: a dedicated view (shortcut 8) lists promotion/rollback
   events with candidate id, status pill, decision time and the rule reasons.
-  Candidate/status/experiment filters narrow the log client-side (the
+  Candidate/status/experiment/date-range filters narrow the log client-side
+  (dates compare on the China day of the decision) (the
   experiment filter matches either the recorded base or candidate cycle) (“没有匹配的事件” when
   nothing matches). The log loads the newest 20 events and “加载更早” follows a
   (decided_at, event_id) cursor. Empty logs and fetch failures explain
