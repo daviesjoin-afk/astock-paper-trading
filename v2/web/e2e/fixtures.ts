@@ -202,6 +202,32 @@ async function ensureSessionAccount(
   }
 }
 
+/** Create an isolated account for a test that will mutate its slots. */
+export async function createAccount(api: APIRequestContext, accountId: string): Promise<void> {
+  const created = await api.post("/v2/paper-accounts", {
+    data: {
+      schema_version: 1,
+      account_id: accountId,
+      initial_cash_cents: 10_000_000,
+      reserve_bps: 1_000,
+      created_at: "2026-11-08T09:00:00+08:00",
+      slots: [
+        {
+          slot: "A", strategy_version_id: "research-momentum-v1", market_data_pack_id: PACK,
+          execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
+        },
+        {
+          slot: "B", strategy_version_id: "research-reversion-v1", market_data_pack_id: PACK,
+          execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
+        },
+      ],
+    },
+  });
+  if (!created.ok() && created.status() !== 409) {
+    throw new Error(`account ${accountId}: ${created.status()} ${await created.text()}`);
+  }
+}
+
 /** One user-funded account with two slots and one filled slot-A order. */
 async function ensurePaperAccount(
   api: APIRequestContext,

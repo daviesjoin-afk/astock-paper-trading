@@ -104,6 +104,10 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Session creation: “新建会话” picks a slot (A/B) and a signal source experiment
+  filtered by that slot's reviewed strategy; the session id defaults from the
+  experiment but stays editable. A slot without a matching experiment shows a
+  hint and disables the submit instead of sending an invalid request.
 - Sessions: each session card shows status (未开始/运行中/已暂停/已停止/已完成),
   the explicit clock and cursor progress, plus the controls that are legal for
   that status (启动 / 暂停 / 继续 / 运行到结束 / 停止). Controls POST only to

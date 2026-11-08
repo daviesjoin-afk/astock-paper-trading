@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 从实验导入模拟会话（ADR 005）：新增 `POST /v2/paper-sessions/from-experiment`（会话 id + 账户 + 槽位 + 可选起始时刻），把实验已存决策按 id 顺序冻结为会话信号；校验槽位策略/数据包/执行规则一致，缺省起点取首条决策的中国日 00:00，空实验拒绝；控制台新增“新建会话”表单（槽位过滤可用实验、无匹配时禁用并提示）。测试：Rust 121 passed（导入、策略不匹配、空实验、缺失实验、显式起点）；浏览器新增 4 项（导入并运行、无匹配实验、缺会话 id 零请求、390px），合计 97 passed；会话控制测试改用每用例独立账户避免槽位顺序干扰。
 - V2 账户创建表单（ADR 005）：新增 `PaperAccountRequest`（客户端只提交已审核策略 id，服务端解析 artifact）与 `GET /v2/strategies` 策略目录（策略、默认数据包、执行规则、准备金比例）；账户控制台新增“新建账户”表单（账户标识、初始资金、A/B 策略选择、固定 45/45/10），重复 id、非法本金、同策略占用两个槽位都会被明确拒绝。测试：Rust 120 passed（新增按 id 创建 + 未知策略拒绝）；浏览器新增 6 项（创建、重复、同策略、非法本金、390px、表单 axe），合计 92 passed；冒烟改走 id 创建并通过。
 - V2 会话批量运行与控制台（ADR 005 第二阶段）：新增 `POST /v2/paper-sessions/{id}/run`（批量推进到完成/暂停/停止，返回步数与成交/拒绝计数）与 `GET /v2/paper-sessions?account_id=`（只读列表）；账户控制台新增“模拟会话”区块：状态、显式时钟、进度与按状态可用的启动/暂停/继续/运行到结束/停止操作，操作后重新读取账户，保证订单与现金不漂移。浏览器测试新增 5 项（完整控制流、暂停不成交、只写会话端点、390px、夹具会话），合计 86 passed；截图 `after-account-sessions.png`。
 - V2 确定性模拟会话（ADR 005 第二阶段起步）：新增 `PaperSessionSpec`（显式 `start_at` + 冻结信号列表，必须按时间非降序且不早于起点）与状态机 `created → running ⇄ paused → stopped/completed`；`POST /v2/paper-sessions`、`GET /v2/paper-sessions/{id}`、`POST /v2/paper-sessions/{id}/{start|pause|resume|stop|step}`。`step` 每次只提交一笔槽位订单并把显式时钟推进到该决策时刻；暂停/停止/完成后拒绝成交；会话订单以 `session_id:signal_id` 作为幂等身份。Rust 测试 118 passed（新增 4 项：逐步时钟、暂停/继续/停止、双账户确定性、非法 spec）。schema v10 → v11（`v2_paper_sessions`）。

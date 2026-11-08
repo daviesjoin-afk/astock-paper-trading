@@ -97,6 +97,16 @@ ADR 001 让每个实验拥有独立资金与账本，实验是**研究身份**�
 - 校验仍在 domain：权重和、A/B 槽位、重复策略、本金、时间、数据包/规则兼容。
 - 同 id 重复提交同内容幂等，不同内容冲突。
 
+### 9. 从实验导入会话（已实现）
+
+`POST /v2/paper-sessions/from-experiment { session_id, account_id, cycle_id, slot, start_at? }`
+
+- 只读读取实验已存的决策（含被拒绝的决策），按 id 升序转成会话信号；不重新撮合、不改写实验。
+- 槽位策略、数据包、执行规则必须与该实验一致，否则分别返回 `paper_slot_strategy_mismatch` / `paper_session_pack_mismatch` / `paper_session_policy_mismatch`。
+- `start_at` 缺省时取第一条决策所在**中国日**的 00:00（显式派生，不读机器时间）。
+- 空实验拒绝（`paper_session_requires_signals`）；不存在的实验返回 404。
+- 导入后的会话与手工会话同构：启动、暂停、继续、运行到结束、重放规则完全一致。
+
 ## 未决问题
 
 - 自动运行时钟（第二阶段）与账户的关系：账户是否需要"当前模拟日期"这一显式状态？倾向放入独立的 run session，而不是写进账户 spec。

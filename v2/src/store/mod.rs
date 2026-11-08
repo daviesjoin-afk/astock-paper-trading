@@ -1362,3 +1362,84 @@ impl Store {
         })
     }
 }
+// ---------------------------------------------------------------------------
+// Session import: turn an existing experiment's stored decisions into a frozen
+// paper-session signal list. Read-only with respect to the experiment.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn create_paper_session_from_experiment(
+        &mut self,
+        session_id: &str,
+        account_id: &str,
+        cycle_id: &str,
+        slot: crate::domain::PaperSlotId,
+        start_at: Option<String>,
+    ) -> StoreResult<PaperSessionView> {
+        let raw_spec: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw_spec =
+            raw_spec.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let account: crate::domain::PaperAccountSpec = serde_json::from_str(&raw_spec)?;
+        account.validate()?;
+        let slot_spec = account
+            .slots
+            .iter()
+            .find(|candidate| candidate.slot == slot)
+            .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_not_found".into())))?;
+
+        let experiment = load_experiment(&self.conn, cycle_id)?;
+        if experiment.spec.strategy.strategy_version_id != slot_spec.strategy.strategy_version_id {
+            return Err(StoreError::Rules(RuleError("paper_slot_strategy_mismatch".into())));
+        }
+        if experiment.spec.market_data_pack_id != slot_spec.market_data_pack_id {
+            return Err(StoreError::Rules(RuleError("paper_session_pack_mismatch".into())));
+        }
+        if experiment.spec.execution_policy_version != slot_spec.execution_policy_version {
+            return Err(StoreError::Rules(RuleError("paper_session_policy_mismatch".into())));
+        }
+
+        let mut signals = Vec::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT request_json FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id",
+            )?;
+            let rows = statement.query_map([cycle_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let request: SimulationRequest = serde_json::from_str(&row?)?;
+                signals.push(crate::domain::PaperSessionSignal {
+                    slot,
+                    signal_id: request.signal_id,
+                    decision_at: request.decision_at,
+                    signal: request.signal,
+                    quote_ref: request.quote_ref,
+                });
+            }
+        }
+        if signals.is_empty() {
+            return Err(StoreError::Rules(RuleError("paper_session_requires_signals".into())));
+        }
+        let start_at = match start_at {
+            Some(value) => value,
+            None => {
+                let first = chrono::DateTime::parse_from_rfc3339(&signals[0].decision_at)
+                    .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+                let china = first.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"));
+                format!("{}T00:00:00+08:00", china.date_naive())
+            }
+        };
+        self.create_paper_session(crate::domain::PaperSessionSpec {
+            schema_version: crate::domain::PAPER_SESSION_SCHEMA_VERSION,
+            session_id: session_id.into(),
+            account_id: account_id.into(),
+            start_at,
+            signals,
+        })
+    }
+}

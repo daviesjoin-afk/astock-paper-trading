@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { CYCLES, SESSION_ACCOUNT, PAPER_SESSION, ensureFixtures } from "./fixtures";
+import { CYCLES, createAccount, ensureFixtures } from "./fixtures";
 
 test.beforeEach(async ({ request }) => {
   await ensureFixtures(request);
@@ -8,6 +8,7 @@ test.beforeEach(async ({ request }) => {
 /** Create a fresh session per test so shared fixtures stay deterministic. */
 const createSession = async (
   request: import("@playwright/test").APIRequestContext,
+  accountId: string,
   sessionId: string,
   signalCount = 2,
 ) => {
@@ -28,7 +29,7 @@ const createSession = async (
     data: {
       schema_version: 1,
       session_id: sessionId,
-      account_id: SESSION_ACCOUNT,
+      account_id: accountId,
       start_at: "2026-10-30T00:00:00+08:00",
       signals,
     },
@@ -36,18 +37,18 @@ const createSession = async (
   expect(response.ok(), `${response.status()} ${await response.text()}`).toBeTruthy();
 };
 
-const openSessionAccount = async (page: import("@playwright/test").Page) => {
-  await page.goto(`/?cycle_id=${CYCLES.repro}&account=${SESSION_ACCOUNT}#/account`);
-  await expect(page.getByTestId("account-select")).toHaveValue(SESSION_ACCOUNT);
+const openAccount = async (page: import("@playwright/test").Page, accountId: string) => {
+  await page.goto(`/?cycle_id=${CYCLES.repro}&account=${accountId}#/account`);
+  await expect(page.getByTestId("account-select")).toHaveValue(accountId);
   await expect(page.getByTestId("account-sessions")).toBeVisible();
 };
 
 test.describe("paper session control", () => {
   test("start, pause, resume and run the clock to completion", async ({ page, request }) => {
-    const id = "ui-session-flow";
-    await createSession(request, id);
-    await openSessionAccount(page);
-    const card = page.getByTestId(`session-card-${id}`);
+    await createAccount(request, "ui-acc-flow");
+    await createSession(request, "ui-acc-flow", "ui-session-flow");
+    await openAccount(page, "ui-acc-flow");
+    const card = page.getByTestId("session-card-ui-session-flow");
     await expect(card).toContainText("未开始");
     await expect(card).toContainText("0/2");
 
@@ -69,10 +70,10 @@ test.describe("paper session control", () => {
   });
 
   test("a paused session does not trade when run is pressed", async ({ page, request }) => {
-    const id = "ui-session-paused";
-    await createSession(request, id);
-    await openSessionAccount(page);
-    const card = page.getByTestId(`session-card-${id}`);
+    await createAccount(request, "ui-acc-paused");
+    await createSession(request, "ui-acc-paused", "ui-session-paused");
+    await openAccount(page, "ui-acc-paused");
+    const card = page.getByTestId("session-card-ui-session-paused");
 
     await card.getByRole("button", { name: "启动" }).click();
     await expect(card).toContainText("运行中");
@@ -85,16 +86,16 @@ test.describe("paper session control", () => {
   });
 
   test("session controls only post to session endpoints", async ({ page, request }) => {
-    const id = "ui-session-readonly";
-    await createSession(request, id);
+    await createAccount(request, "ui-acc-readonly");
+    await createSession(request, "ui-acc-readonly", "ui-session-readonly");
     const writes: string[] = [];
     page.on("request", (req) => {
       if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method()) && req.url().includes("/v2/")) {
         writes.push(`${req.method()} ${req.url()}`);
       }
     });
-    await openSessionAccount(page);
-    const card = page.getByTestId(`session-card-${id}`);
+    await openAccount(page, "ui-acc-readonly");
+    const card = page.getByTestId("session-card-ui-session-readonly");
     await card.getByRole("button", { name: "启动" }).click();
     await expect(card).toContainText("运行中");
     expect(writes.length).toBeGreaterThan(0);
@@ -102,18 +103,18 @@ test.describe("paper session control", () => {
   });
 
   test("390px keeps session cards inside the viewport", async ({ page, request }) => {
-    const id = "ui-session-mobile";
-    await createSession(request, id);
+    await createAccount(request, "ui-acc-mobile");
+    await createSession(request, "ui-acc-mobile", "ui-session-mobile");
     await page.setViewportSize({ width: 390, height: 844 });
-    await openSessionAccount(page);
-    await expect(page.getByTestId(`session-card-${id}`)).toBeVisible();
+    await openAccount(page, "ui-acc-mobile");
+    await expect(page.getByTestId("session-card-ui-session-mobile")).toBeVisible();
     const overflow = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth);
     expect(overflow).toBeLessThanOrEqual(1);
   });
 
-  test("the fixture session exists for the session account", async ({ page }) => {
-    await openSessionAccount(page);
-    await expect(page.getByTestId(`session-card-${PAPER_SESSION}`)).toBeVisible();
+  test("the fixture session exists for its account", async ({ page }) => {
+    await openAccount(page, "e2e-session-account");
+    await expect(page.getByTestId("session-card-e2e-session")).toBeVisible();
   });
 });

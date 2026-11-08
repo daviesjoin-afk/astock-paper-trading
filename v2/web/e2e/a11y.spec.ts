@@ -51,6 +51,14 @@ test("the account creation form is accessible", async ({ page }) => {
   await scan(page, "account-create");
 });
 
+test("the session creation form is accessible", async ({ page }) => {
+  await page.goto(`/?cycle_id=${CYCLES.repro}&account=e2e-session-account#/account`);
+  await page.getByTestId("session-card-e2e-session").waitFor();
+  await page.getByTestId("session-create-toggle").click();
+  await expect(page.getByTestId("session-create")).toBeVisible();
+  await scan(page, "session-create");
+});
+
 test("the shortcut sheet is an accessible modal", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);
   await page.getByTestId("shortcuts-open").click();

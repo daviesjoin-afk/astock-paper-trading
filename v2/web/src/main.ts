@@ -1066,6 +1066,7 @@ type PaperSlotRequest = {
 
 let strategyCatalogue: StrategyCatalogue | null = null;
 let accounts: PaperAccountSummary[] = [];
+let lastAccountView: PaperAccountView | null = null;
 let currentAccountId = "";
 const accountSelect = byId<HTMLSelectElement>("account-select");
 const accountError = testId<HTMLElement>("account-error");
@@ -1073,6 +1074,13 @@ const accountBody = byId("account-body");
 const accountEmpty = testId<HTMLElement>("account-empty");
 const createForm = byId<HTMLFormElement>("account-create");
 const createToggle = testId<HTMLButtonElement>("account-create-toggle");
+const sessionForm = byId<HTMLFormElement>("session-create");
+const sessionToggle = testId<HTMLButtonElement>("session-create-toggle");
+const sessionIdInput = byId<HTMLInputElement>("session-id");
+const sessionSlot = byId<HTMLSelectElement>("session-slot");
+const sessionCycle = byId<HTMLSelectElement>("session-cycle");
+const sessionHint = testId<HTMLElement>("session-hint");
+const sessionSubmit = testId<HTMLButtonElement>("session-submit");
 
 const urlAccount = (): string =>
   new URLSearchParams(location.search).get("account")?.trim() ?? "";
@@ -1134,6 +1142,7 @@ const accountSlotCard = (slot: PaperAccountSlotView): HTMLElement => {
 };
 
 const renderAccount = (account: PaperAccountView, orders: PaperOrderRecord[]): void => {
+  lastAccountView = account;
   toggle(accountBody, true);
   toggle(accountEmpty, false);
   setText("account-initial", money(account.initial_cash_cents));
@@ -1399,6 +1408,77 @@ createForm.addEventListener("submit", (event) => {
       announce("创建账户失败");
     } finally {
       button.disabled = false;
+    }
+  })();
+});
+
+const slotStrategy = (slot: string): string =>
+  lastAccountView?.slots.find((candidate) => candidate.slot === slot)?.strategy_version_id ?? "";
+
+const refreshSessionOptions = (): void => {
+  const strategy = slotStrategy(sessionSlot.value);
+  const matching = experiments.filter((experiment) => experiment.strategy_version_id === strategy);
+  sessionCycle.replaceChildren();
+  for (const experiment of matching) {
+    const option = document.createElement("option");
+    option.value = experiment.cycle_id;
+    option.textContent = experiment.cycle_id;
+    sessionCycle.appendChild(option);
+  }
+  sessionCycle.disabled = matching.length === 0;
+  sessionSubmit.disabled = matching.length === 0;
+  toggle(sessionHint, matching.length === 0);
+  if (matching.length === 0) {
+    sessionHint.textContent = "当前槽位的策略没有可用实验；换一个槽位或先建立匹配的实验。";
+  } else if (!sessionIdInput.value.trim()) {
+    sessionIdInput.value = `sess-${matching[0].cycle_id}`;
+  }
+};
+
+sessionToggle.addEventListener("click", () => {
+  refreshSessionOptions();
+  toggle(sessionForm, true);
+  toggle(sessionToggle, false);
+  sessionIdInput.focus();
+});
+testId("session-cancel").addEventListener("click", () => {
+  toggle(sessionForm, false);
+  toggle(sessionToggle, true);
+});
+sessionSlot.addEventListener("change", refreshSessionOptions);
+
+sessionForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void (async () => {
+    const sessionId = sessionIdInput.value.trim();
+    const cycleId = sessionCycle.value;
+    clearAccountError();
+    if (!sessionId) {
+      showAccountError("请填写会话标识");
+      return;
+    }
+    if (!cycleId) {
+      showAccountError("没有可用的信号来源实验");
+      return;
+    }
+    sessionSubmit.disabled = true;
+    try {
+      await postJson("/v2/paper-sessions/from-experiment", {
+        session_id: sessionId,
+        account_id: currentAccountId,
+        cycle_id: cycleId,
+        slot: sessionSlot.value,
+      });
+      announce(`会话 ${sessionId} 已创建`);
+      toggle(sessionForm, false);
+      toggle(sessionToggle, true);
+      sessionIdInput.value = "";
+      await loadAccount(currentAccountId);
+    } catch (error) {
+      showAccountError(`创建会话失败：${errorDetail(error)}`);
+      announce("创建会话失败");
+    } finally {
+      sessionSubmit.disabled = false;
     }
   })();
 });
