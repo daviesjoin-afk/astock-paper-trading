@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::{PaperAccountSpec, PaperSlotId, PaperSlotSpec};
 
 #[test]
 fn tampering_evidence_pack_identity_is_rejected_on_retry_and_replay() {
@@ -1957,4 +1958,114 @@ fn one_unreadable_experiment_row_does_not_hide_the_rest() {
     assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 0);
     // A missing experiment is a distinct, non-integrity failure now.
     assert!(matches!(db.experiment("nope"), Err(StoreError::NotFound(_))));
+}
+
+// ---------------------------------------------------------------------------
+// ADR 005: paper account + dual strategy capital core
+// ---------------------------------------------------------------------------
+
+fn paper_slot(slot: PaperSlotId, strategy: StrategyArtifact, weight_bps: i64) -> PaperSlotSpec {
+    PaperSlotSpec {
+        slot,
+        strategy,
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+        execution_policy_version: POLICY_VERSION.into(),
+        weight_bps,
+    }
+}
+
+fn paper_spec(account_id: &str, cash: i64) -> PaperAccountSpec {
+    PaperAccountSpec {
+        schema_version: 1,
+        account_id: account_id.into(),
+        initial_cash_cents: cash,
+        reserve_bps: 1_000,
+        created_at: "2026-11-08T09:00:00+08:00".into(),
+        slots: vec![
+            paper_slot(PaperSlotId::A, reviewed_artifact(), 4_500),
+            paper_slot(PaperSlotId::B, reversion_artifact(), 4_500),
+        ],
+    }
+}
+
+#[test]
+fn paper_capital_split_is_exact_and_the_reserve_absorbs_remainders() {
+    let split = paper_spec("acct-split", 10_000_000).validate().unwrap();
+    assert_eq!(split.slot_budgets, [4_500_000, 4_500_000]);
+    assert_eq!(split.reserve_cents, 1_000_000);
+
+    // 1 cent cannot be split by the weights: it must stay in the reserve.
+    let odd = paper_spec("acct-odd", 10_000_001).validate().unwrap();
+    assert_eq!(odd.slot_budgets, [4_500_000, 4_500_000]);
+    assert_eq!(odd.reserve_cents, 1_000_001);
+    assert_eq!(
+        odd.reserve_cents + odd.slot_budgets.iter().sum::<i64>(),
+        10_000_001
+    );
+}
+
+#[test]
+fn paper_account_rejects_specs_that_cannot_preserve_capital() {
+    let mut weights = paper_spec("acct-weights", 10_000_000);
+    weights.slots[1].weight_bps = 4_000;
+    assert!(matches!(weights.validate(), Err(RuleError(ref code)) if code == "paper_account_weights_must_sum_to_total"));
+
+    let mut duplicate_slot = paper_spec("acct-dupe-slot", 10_000_000);
+    duplicate_slot.slots[1].slot = PaperSlotId::A;
+    assert!(matches!(duplicate_slot.validate(), Err(RuleError(ref code)) if code == "duplicate_paper_slot"));
+
+    let mut duplicate_strategy = paper_spec("acct-dupe-strategy", 10_000_000);
+    duplicate_strategy.slots[1].strategy = reviewed_artifact();
+    assert!(matches!(duplicate_strategy.validate(), Err(RuleError(ref code)) if code == "duplicate_strategy_in_paper_account"));
+
+    let mut zero_cash = paper_spec("acct-zero", 0);
+    zero_cash.initial_cash_cents = 0;
+    assert!(matches!(zero_cash.validate(), Err(RuleError(ref code)) if code == "invalid_initial_cash"));
+
+    let mut bad_time = paper_spec("acct-time", 10_000_000);
+    bad_time.created_at = "2026-11-08 09:00".into();
+    assert!(matches!(bad_time.validate(), Err(RuleError(ref code)) if code == "invalid_created_at"));
+
+    let mut bad_reserve = paper_spec("acct-reserve", 10_000_000);
+    bad_reserve.reserve_bps = 10_000;
+    assert!(matches!(bad_reserve.validate(), Err(RuleError(ref code)) if code == "invalid_reserve_bps"));
+}
+
+#[test]
+fn paper_account_is_idempotent_conflict_checked_and_survives_reopen() {
+    let file = DiskDatabase::new();
+    let spec = paper_spec("acct-main", 10_000_000);
+    let created;
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        created = db.create_paper_account(spec.clone()).unwrap();
+        assert_eq!(created.initial_cash_cents, 10_000_000);
+        assert_eq!(created.reserve_cents, 1_000_000);
+        assert_eq!(created.cash_cents, 10_000_000);
+        assert_eq!(created.slots.len(), 2);
+        assert_eq!(created.slots[0].slot, "A");
+        assert_eq!(created.slots[1].slot, "B");
+        assert_eq!(created.slots[0].budget_cents, 4_500_000);
+        assert_eq!(created.slots[1].budget_cents, 4_500_000);
+        assert!(created.slots.iter().all(|slot| slot.positions.is_empty()));
+        assert_eq!(created.slots[0].cash_cents, created.slots[0].budget_cents);
+        assert_ne!(created.slots[0].strategy_version_id, created.slots[1].strategy_version_id);
+
+        // Capital conservation: no cash exists outside the reserve and the slots.
+        let accounted = created.reserve_cents + created.slots.iter().map(|slot| slot.cash_cents).sum::<i64>();
+        assert_eq!(accounted, created.initial_cash_cents);
+
+        // Identical re-post is idempotent; a different account under the same id conflicts.
+        let again = db.create_paper_account(spec.clone()).unwrap();
+        assert_eq!(again, created);
+        let mut changed = spec.clone();
+        changed.initial_cash_cents = 20_000_000;
+        assert!(matches!(db.create_paper_account(changed), Err(StoreError::Conflict(_))));
+    }
+    {
+        let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let reopened = db.paper_account("acct-main").unwrap();
+        assert_eq!(reopened, created, "a restart must not change the split");
+        assert!(matches!(db.paper_account("acct-missing"), Err(StoreError::NotFound(_))));
+    }
 }

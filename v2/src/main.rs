@@ -1,5 +1,5 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{QuoteImport, SimulationRequest, ExperimentSpec}, store::{Store, StoreError}};
+use astock_v2::{domain::{ExperimentSpec, PaperAccountSpec, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
 use axum::{
     extract::{Path, Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
@@ -83,6 +83,19 @@ async fn research_reproduction(State(state): State<Shared>, Path(id): Path<Strin
     response(db.verify_research_reproduction(&id).map_err(api_error)?)
 }
 
+async fn create_paper_account(
+    State(state): State<Shared>,
+    Json(spec): Json<PaperAccountSpec>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(db.create_paper_account(spec).map_err(api_error)?)
+}
+
+async fn paper_account(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_account(&id).map_err(api_error)?)
+}
+
 async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
 }
@@ -122,6 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/health", get(health))
         .route("/v2/experiments", post(create_experiment).get(list_experiments))
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
+        .route("/v2/paper-accounts", post(create_paper_account))
+        .route("/v2/paper-accounts/{account_id}", get(paper_account))
         .route("/v2/experiments/{cycle_id}", get(experiment))
         .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))
         .route("/v2/quotes", post(ingest_quote))
