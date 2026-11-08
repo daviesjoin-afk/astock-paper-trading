@@ -860,7 +860,9 @@ td:first-child { font-weight: 550; }
 .account-session-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .account-session-head strong { font-family: var(--mono); font-size: 12.5px; }
 .account-session-meta { margin: 0; color: var(--muted); font-size: 12px; }
-.account-session-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.account-session-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.session-advance { display: flex; gap: 6px; align-items: center; }
+.session-advance input { min-width: 140px; }
 
 /* ---------- shortcut sheet ---------- */
 .sheet {

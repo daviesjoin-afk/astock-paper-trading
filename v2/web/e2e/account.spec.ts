@@ -32,6 +32,10 @@ test.describe("paper account console", () => {
     await expect(slotB).toContainText("槽位 B · 均值回归策略");
     await expect(slotB).toContainText("无持仓");
 
+    await expect(page.getByTestId("account-valuation")).toBeVisible();
+    await expect(page.getByTestId("account-valuation")).toContainText("估值不可用");
+    await expect(page.getByTestId("account-valuation")).toContainText("不计算市值");
+
     const orders = page.getByTestId("account-orders").locator("tr");
     await expect(orders).toHaveCount(1);
     await expect(orders.first()).toContainText("A");

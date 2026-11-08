@@ -104,6 +104,11 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Valuation: the account panel always states that valuation is unavailable
+  (`No reviewed price set`), so the page never implies a market value or return.
+- Advancing: a running session offers “推进到该日” with an explicit trading day;
+  only signals on or before that China day are executed, intermediate days move
+  nothing.
 - Session creation: “新建会话” picks a slot (A/B) and a signal source experiment
   filtered by that slot's reviewed strategy; the session id defaults from the
   experiment but stays editable. A slot without a matching experiment shows a

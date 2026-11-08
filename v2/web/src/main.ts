@@ -1032,6 +1032,7 @@ type PaperAccountSlotView = {
 type PaperAccountView = {
   account_id: string; initial_cash_cents: number; created_at: string;
   cash_cents: number; reserve_cents: number; slots: PaperAccountSlotView[];
+  valuation: { status: string; reason: string };
 };
 type PaperFill = {
   symbol: string; side: string; quantity: number; price_cents: number;
@@ -1148,6 +1149,11 @@ const renderAccount = (account: PaperAccountView, orders: PaperOrderRecord[]): v
   setText("account-initial", money(account.initial_cash_cents));
   setText("account-reserve", money(account.reserve_cents));
   setText("account-cash", money(account.cash_cents));
+  const valuation = testId<HTMLElement>("account-valuation");
+  toggle(valuation, true);
+  valuation.textContent = account.valuation.status === "unavailable"
+    ? "估值不可用：没有审核过的市价集合，本页不计算市值、净值或收益。"
+    : "估值可用：价格来源与版本见账户摘要。";
 
   const slots = byId("account-slots");
   slots.replaceChildren(...account.slots.map(accountSlotCard));
@@ -1252,6 +1258,30 @@ const sessionCard = (session: PaperSessionView): HTMLElement => {
     add("pause", "暂停");
     add("run", "运行到结束", true);
   }
+  if (session.status === "running") {
+    const advanceWrap = document.createElement("div");
+    advanceWrap.className = "session-advance";
+    const date = document.createElement("input");
+    date.type = "date";
+    date.dataset.testid = "session-advance-date";
+    date.setAttribute("aria-label", "推进到的交易日");
+    const advanceButton = document.createElement("button");
+    advanceButton.type = "button";
+    advanceButton.className = "btn btn-quiet btn-small";
+    advanceButton.dataset.testid = "session-advance";
+    advanceButton.textContent = "推进到该日";
+    advanceButton.addEventListener("click", () => {
+      if (!date.value) {
+        showAccountError("请先选择要推进到的交易日");
+        return;
+      }
+      advanceButton.disabled = true;
+      advanceButton.setAttribute("aria-busy", "true");
+      void sessionAdvance(session.session_id, date.value);
+    });
+    advanceWrap.append(date, advanceButton);
+    actions.appendChild(advanceWrap);
+  }
   if (session.status === "paused") {
     add("resume", "继续", true);
     add("run", "运行到结束");
@@ -1266,6 +1296,18 @@ const renderSessions = (sessions: PaperSessionView[]): void => {
   const container = byId("account-sessions");
   container.replaceChildren(...sessions.map(sessionCard));
   toggle(testId("account-sessions-empty"), sessions.length === 0);
+};
+
+const sessionAdvance = async (sessionId: string, day: string): Promise<void> => {
+  clearAccountError();
+  try {
+    await postJson(`/v2/paper-sessions/${encodeURIComponent(sessionId)}/advance`, { day });
+    announce(`会话 ${sessionId} 已推进到 ${day}`);
+    await loadAccount(currentAccountId);
+  } catch (error) {
+    showAccountError(`推进会话失败：${errorDetail(error)}`);
+    announce("推进会话失败");
+  }
 };
 
 const sessionAction = async (sessionId: string, action: string): Promise<void> => {
