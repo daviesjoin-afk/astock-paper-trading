@@ -2060,6 +2060,41 @@ const runDiff = async (): Promise<void> => {
 
 testId<HTMLButtonElement>("diff-run").addEventListener("click", () => void runDiff());
 
+const runExperimentPerformance = async (): Promise<void> => {
+  const cycle = byId<HTMLInputElement>("perf-cycle").value.trim();
+  const days = byId<HTMLInputElement>("perf-days").value.split(",")
+    .map((day) => day.trim()).filter(Boolean);
+  const error = testId<HTMLElement>("perf-error");
+  const result = testId<HTMLElement>("perf-result");
+  if (!cycle || days.length === 0) {
+    toggle(error, true);
+    error.textContent = "请填写实验 id 与至少一个交易日";
+    return;
+  }
+  try {
+    const report = await api<PerformanceReport & { status?: string; reason?: string }>(
+      `/v2/experiments/${encodeURIComponent(cycle)}/performance?days=${encodeURIComponent(days.join(","))}`,
+      new AbortController().signal,
+    );
+    toggle(error, false);
+    toggle(result, true);
+    if (report.status === "unavailable") {
+      result.textContent = `不可用：缺少审核价格集合（${report.reason}）`;
+      return;
+    }
+    result.textContent =
+      `${cycle}：收益 ${money(report.profit_cents)}（${(report.return_bps / 100).toFixed(2)}%）· ` +
+      `回撤 ${(report.drawdown_bps / 100).toFixed(2)}% · 费用 ${money(report.fees_cents)} · ` +
+      `${report.trades} 笔成交 · ${report.days} 天`;
+  } catch (failure) {
+    toggle(result, false);
+    toggle(error, true);
+    error.textContent = `查询失败：${errorDetail(failure)}`;
+  }
+};
+
+testId<HTMLButtonElement>("perf-run").addEventListener("click", () => void runExperimentPerformance());
+
 type EvolutionPage = {
   events: EvolutionEvent[];
   next_before: string | null;
