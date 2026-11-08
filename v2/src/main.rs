@@ -111,6 +111,39 @@ struct ValuationQuery {
     as_of_day: String,
 }
 
+#[derive(Deserialize)]
+struct EquitySeriesQuery {
+    days: String,
+}
+
+async fn paper_equity_series(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<EquitySeriesQuery>,
+) -> ApiResult {
+    let days: Vec<String> = query
+        .days
+        .split(',')
+        .map(|day| day.trim().to_string())
+        .filter(|day| !day.is_empty())
+        .collect();
+    if days.is_empty() {
+        return Err((
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "empty_equity_series"})),
+        ));
+    }
+    let db = state.lock().await;
+    match db.paper_equity_series(&id, &days).map_err(api_error)? {
+        Some(series) => response(series),
+        None => response(json!({
+            "status": "unavailable",
+            "reason": "no_reviewed_price_set",
+            "days": days.len(),
+        })),
+    }
+}
+
 async fn paper_valuation(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -282,6 +315,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/valuation",
             get(paper_valuation),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/equity-series",
+            get(paper_equity_series),
         )
         .route(
             "/v2/paper-accounts/{account_id}/orders",

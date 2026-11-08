@@ -612,3 +612,70 @@ impl Store {
         Ok(report)
     }
 }
+// ---------------------------------------------------------------------------
+// Equity series: replay fills up to each requested day and mark to market with
+// one reviewed price set. Missing coverage refuses the series.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    fn account_fills(&self, account_id: &str) -> StoreResult<Vec<Fill>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.fill_json FROM v2_paper_fills f
+             JOIN v2_paper_orders o ON o.id=f.order_id
+             WHERE o.account_id=? ORDER BY o.id",
+        )?;
+        let rows = statement.query_map([account_id], |row| row.get::<_, String>(0))?;
+        let mut fills = Vec::new();
+        for row in rows {
+            fills.push(serde_json::from_str::<Fill>(&row?)?);
+        }
+        Ok(fills)
+    }
+
+    fn account_pack(&self, account_id: &str) -> StoreResult<(String, i64, i64)> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate()?;
+        let pack = spec.slots[0].market_data_pack_id.clone();
+        if spec.slots.iter().any(|slot| slot.market_data_pack_id != pack) {
+            return Err(StoreError::Rules(RuleError("valuation_mixed_packs".into())));
+        }
+        Ok((pack, spec.initial_cash_cents, split.reserve_cents))
+    }
+
+    pub fn paper_equity_series(
+        &self,
+        account_id: &str,
+        days: &[String],
+    ) -> StoreResult<Option<crate::domain::EquitySeries>> {
+        let registry = bundled_price_registry()?;
+        self.paper_equity_series_with_registry(account_id, days, &registry)
+    }
+
+    pub fn paper_equity_series_with_registry(
+        &self,
+        account_id: &str,
+        days: &[String],
+        registry: &crate::domain::PriceSetRegistry,
+    ) -> StoreResult<Option<crate::domain::EquitySeries>> {
+        if days.is_empty() {
+            return Err(StoreError::Rules(RuleError("empty_equity_series".into())));
+        }
+        let (pack, initial_cash_cents, _) = self.account_pack(account_id)?;
+        let Some(set) = registry.select_covering(&pack, &days[0], &days[days.len() - 1]) else {
+            return Ok(None);
+        };
+        let fills = self.account_fills(account_id)?;
+        crate::domain::equity_series(initial_cash_cents, &fills, set, days, &pack)
+            .map(Some)
+            .map_err(StoreError::Rules)
+    }
+}
