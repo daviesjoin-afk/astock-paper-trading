@@ -74,6 +74,10 @@ python scripts/shadow_candidates.py --artifact cands/X.artifact.json   --output 
 - 指标口径：`out_of_sample_days = shadow_days = 序列天数`，`trades` 来自成交；
 - 输出包含 `performance{base,candidate}`、`decision` 与 `event`。
 
+## 事件与实验关联（已实现）
+
+`POST /v2/evolution/events` 可带 `base_cycle` / `candidate_cycle`（均可选），事件因此能指向产生指标的实验；`GET` 列表与分页均返回这两个字段，进化视图显示“基准 … · 候选 …”。schema v14。
+
 ## 回退演练（已覆盖）
 
 冒烟在合成指标上走完“晋级 → 风险恶化 → 回退”：

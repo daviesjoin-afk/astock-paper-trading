@@ -1228,6 +1228,17 @@ impl Store {
         decided_at: &str,
         decision: crate::domain::EvolutionDecision,
     ) -> StoreResult<EvolutionEventRecord> {
+        self.record_evolution_event_with_links(event_id, decided_at, decision, None, None)
+    }
+
+    pub fn record_evolution_event_with_links(
+        &mut self,
+        event_id: &str,
+        decided_at: &str,
+        decision: crate::domain::EvolutionDecision,
+        base_cycle: Option<&str>,
+        candidate_cycle: Option<&str>,
+    ) -> StoreResult<EvolutionEventRecord> {
         let valid_id = !event_id.is_empty()
             && event_id.len() <= 128
             && event_id
@@ -1258,14 +1269,16 @@ impl Store {
                 status: decision.status.clone(),
                 decision,
                 decided_at: decided_at.into(),
+                base_cycle: base_cycle.map(str::to_string),
+                candidate_cycle: candidate_cycle.map(str::to_string),
                 digest: String::new(),
             };
             record.digest = evolution_event_digest(&record)?;
             return Ok(record);
         }
         txn.execute(
-            "INSERT INTO v2_evolution_events(event_id,candidate_id,status,decision_json,decided_at,digest)
-             VALUES(?,?,?,?,?,?)",
+            "INSERT INTO v2_evolution_events(event_id,candidate_id,status,decision_json,decided_at,digest,base_cycle,candidate_cycle)
+             VALUES(?,?,?,?,?,?,?,?)",
             params![
                 event_id,
                 decision.candidate_id,
@@ -1273,6 +1286,8 @@ impl Store {
                 raw_decision,
                 decided_at,
                 "",
+                base_cycle,
+                candidate_cycle,
             ],
         )?;
         txn.commit()?;
@@ -1282,6 +1297,8 @@ impl Store {
             status: decision.status.clone(),
             decision,
             decided_at: decided_at.into(),
+            base_cycle: base_cycle.map(str::to_string),
+            candidate_cycle: candidate_cycle.map(str::to_string),
             digest: String::new(),
         };
         record.digest = evolution_event_digest(&record)?;
@@ -1298,7 +1315,7 @@ impl Store {
     ) -> StoreResult<Vec<EvolutionEventRecord>> {
         const EVENT_SCAN_LIMIT: i64 = 200;
         let mut statement = self.conn.prepare(
-            "SELECT event_id,candidate_id,status,decision_json,decided_at
+            "SELECT event_id,candidate_id,status,decision_json,decided_at,base_cycle,candidate_cycle
              FROM v2_evolution_events ORDER BY decided_at DESC, event_id DESC LIMIT ?",
         )?;
         let rows = statement.query_map([EVENT_SCAN_LIMIT], |row| {
@@ -1308,11 +1325,13 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut records = Vec::new();
         for row in rows {
-            let (event_id, row_candidate, row_status, raw_decision, decided_at) = row?;
+            let (event_id, row_candidate, row_status, raw_decision, decided_at, base_cycle, candidate_cycle) = row?;
             if candidate_id.is_some_and(|wanted| wanted != row_candidate) {
                 continue;
             }
@@ -1326,6 +1345,8 @@ impl Store {
                 status: row_status,
                 decision,
                 decided_at,
+                base_cycle,
+                candidate_cycle,
                 digest: String::new(),
             };
             record.digest = evolution_event_digest(&record)?;
@@ -1454,7 +1475,7 @@ impl Store {
         let before_at = before.map(parse).transpose()?;
         let after_at = after.map(parse).transpose()?;
         let mut statement = self.conn.prepare(
-            "SELECT event_id,candidate_id,status,decision_json,decided_at
+            "SELECT event_id,candidate_id,status,decision_json,decided_at,base_cycle,candidate_cycle
              FROM v2_evolution_events ORDER BY decided_at DESC, event_id DESC LIMIT ?",
         )?;
         let rows = statement.query_map([SCAN_LIMIT], |row| {
@@ -1464,12 +1485,14 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut scanned = 0usize;
         let mut events = Vec::new();
         for row in rows {
-            let (event_id, row_candidate, row_status, raw_decision, decided_at) = row?;
+            let (event_id, row_candidate, row_status, raw_decision, decided_at, base_cycle, candidate_cycle) = row?;
             scanned += 1;
             if candidate_id.is_some_and(|wanted| wanted != row_candidate) {
                 continue;
@@ -1495,6 +1518,8 @@ impl Store {
                 status: row_status,
                 decision,
                 decided_at,
+                base_cycle,
+                candidate_cycle,
                 digest: String::new(),
             };
             record.digest = evolution_event_digest(&record)?;

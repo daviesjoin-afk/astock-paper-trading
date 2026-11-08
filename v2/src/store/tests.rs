@@ -4028,3 +4028,31 @@ fn coverage_report_lists_missing_pairs_and_ignores_synthetic() {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(synthetic_only);
 }
+
+#[test]
+fn evolution_events_can_link_the_experiments_they_judged() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let decision = crate::domain::EvolutionDecision {
+        candidate_id: "cand-linked".into(),
+        status: "promoted".into(),
+        reasons: vec!["通过".into()],
+        digest: "a".repeat(64),
+    };
+    let record = db
+        .record_evolution_event_with_links(
+            "evo-linked",
+            "2026-11-07T15:00:00+08:00",
+            decision,
+            Some("shadow-base-1"),
+            Some("shadow-candidate-1"),
+        )
+        .unwrap();
+    assert_eq!(record.base_cycle.as_deref(), Some("shadow-base-1"));
+    assert_eq!(record.candidate_cycle.as_deref(), Some("shadow-candidate-1"));
+
+    let listed = db.evolution_events(10, None, None).unwrap();
+    assert_eq!(listed[0].base_cycle.as_deref(), Some("shadow-base-1"));
+    assert_eq!(listed[0].candidate_cycle.as_deref(), Some("shadow-candidate-1"));
+    let page = db.evolution_events_page(10, None, None, None, None, None).unwrap();
+    assert_eq!(page.events[0].candidate_cycle.as_deref(), Some("shadow-candidate-1"));
+}

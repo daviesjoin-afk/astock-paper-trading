@@ -7,6 +7,8 @@ const events = [
     candidate_id: "research-momentum-v1-ab12cd34",
     status: "promoted",
     decided_at: "2026-11-05T15:00:00+08:00",
+    base_cycle: "shadow-base-1",
+    candidate_cycle: "shadow-candidate-1",
     decision: { reasons: ["通过：收益 700 bps 超过基准 500 + 50，回撤 900 bps 在 1500 以内"], digest: "a".repeat(64) },
     digest: "b".repeat(64),
   },
@@ -46,6 +48,8 @@ test.describe("evolution history", () => {
     await expect(page.getByTestId("evolution-event-evo-1")).toContainText("research-momentum-v1-ab12cd34");
     await expect(page.getByTestId("evolution-event-evo-1").getByTestId("evolution-status")).toHaveText("已晋级");
     await expect(page.getByTestId("evolution-event-evo-1")).toContainText("通过：收益 700 bps");
+    await expect(page.getByTestId("evolution-event-evo-1").getByTestId("evolution-links"))
+      .toContainText("基准 shadow-base-1 · 候选 shadow-candidate-1");
     await expect(page.getByTestId("evolution-event-evo-2").getByTestId("evolution-status")).toHaveText("已淘汰");
     await expect(page.getByTestId("evolution-event-evo-2")).toContainText("优势不足");
   });

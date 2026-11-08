@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 进化事件关联实验（schema v14）：`POST /v2/evolution/events` 支持可选 `base_cycle/candidate_cycle`，列表与分页均返回并在进化视图展示“基准 … · 候选 …”；新增 `record_evolution_event_with_links`，旧接口保持兼容（空链接）。Rust 147 passed（写入/列表/分页关联）；浏览器 119 passed（卡片展示）；冒烟升级 v14 并覆盖带链接与无链接事件。
 - V2 价格集合发布脚本：新增 `v2/scripts/publish_price_set.sh`——生成器输出到临时目录、校验通过后安装到 `ASTOCK_PRICE_SETS_DIR`；目标已存在默认拒绝覆盖（退出码 3，`--force` 可覆盖），`--dry-run` 只打印计划，成功后输出 `published set/trust/entries/source_digest` 与覆盖核对命令。冒烟覆盖发布、拒绝覆盖与 dry-run；`OPERATIONS.md` 更新发布步骤。Rust 146 / Python 44 / 浏览器 119 不变。
 - V2 覆盖提示界面：账户页新增价格覆盖行——用持仓标的与已知交易日调用 `/v2/price-sets/coverage`，显示“完整 n/n”或“x/y · 缺口 标的@日期”（最多 4 项 + 计数），缺口以警告色呈现；无持仓或无交易日时隐藏。浏览器 119 passed（+1 覆盖断言含请求参数）；Rust 146 / Python 44 不变。
 - V2 价格覆盖报告：新增 `GET /v2/price-sets/coverage?pack_id=&symbols=&days=`——按 `(symbol, day)` 列出已覆盖对数与缺口清单（仅 reviewed 集合，合成数据忽略），空请求拒绝，附 canonical 摘要；`OPERATIONS.md` 增加发布前核对步骤。Rust 146 passed（覆盖/缺口/合成排除/空请求）；冒烟覆盖空目录全缺口；Python 44 / 浏览器 118 不变。

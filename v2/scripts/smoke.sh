@@ -392,6 +392,8 @@ assert len(coverage["missing"]) == 2, coverage
 # Evolution governance: evidence-based promotion, no lucky single backtest.
 evolution = call("evolution/decisions", {
     "kind": "promotion",
+    "base_cycle": "shadow-base-1",
+    "candidate_cycle": "shadow-candidate-1",
     "incumbent": {"candidate_id": "base", "out_of_sample_days": 30, "shadow_days": 15,
                   "trades": 40, "return_bps": 500, "drawdown_bps": 800},
     "candidate": {"candidate_id": "cand", "out_of_sample_days": 25, "shadow_days": 12,
@@ -403,6 +405,8 @@ event = call("evolution/events", {
     "event_id": "smoke-evo-1",
     "decided_at": "2026-11-05T15:00:00+08:00",
     "kind": "promotion",
+    "base_cycle": "shadow-base-1",
+    "candidate_cycle": "shadow-candidate-1",
     "incumbent": {"candidate_id": "base", "out_of_sample_days": 30, "shadow_days": 15,
                   "trades": 40, "return_bps": 500, "drawdown_bps": 800},
     "candidate": {"candidate_id": "cand", "out_of_sample_days": 25, "shadow_days": 12,
@@ -465,6 +469,8 @@ rollback_event = call("evolution/events", {
                   "trades": 25, "return_bps": 100, "drawdown_bps": 2500},
 })
 assert rollback_event["status"] == "reverted", rollback_event
+assert rollback_event["base_cycle"] is None and rollback_event["candidate_cycle"] is None, rollback_event
+assert event["base_cycle"] == "shadow-base-1" and event["candidate_cycle"] == "shadow-candidate-1", event
 reverted = call("evolution/events?status=reverted")
 assert len(reverted) == 1 and reverted[0]["event_id"] == "smoke-evo-2", reverted
 _segments = call("experiments/shadow-base-1/performance/segments?segments=2026-10-30;2026-11-02")
@@ -574,7 +580,7 @@ contended = call("paper-accounts/concurrency-account")
 assert contended["slots"][0]["orders_total"] == 1, contended["slots"][0]
 assert call("paper-accounts/concurrency-account/audit")["ok"] is True
 health = call("health")
-assert health["schema_version"] == 13 and health["writer"] == "store-single-writer", health
+assert health["schema_version"] == 14 and health["writer"] == "store-single-writer", health
 
 # Deterministic session clock: explicit start, two frozen signals, pause gates.
 session_spec = {
@@ -602,7 +608,7 @@ assert last_step["session"]["status"] == "completed" and last_step["session"]["c
 assert call("paper-sessions/smoke-session")["status"] == "completed"
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
