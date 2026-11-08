@@ -1984,6 +1984,8 @@ accountAdvanceButton.addEventListener("click", () => {
 type EvolutionEvent = {
   event_id: string; candidate_id: string; status: string;
   decided_at: string;
+  base_cycle?: string | null;
+  candidate_cycle?: string | null;
   decision: { reasons: string[]; digest: string };
   digest: string;
 };
@@ -2025,6 +2027,14 @@ const renderEvolutionList = (): void => {
       const time = document.createElement("time");
       time.textContent = decisionTime(event.decided_at);
       head.append(title, pill, time);
+      if (event.base_cycle || event.candidate_cycle) {
+        const links = document.createElement("p");
+        links.className = "evolution-links";
+        links.dataset.testid = "evolution-links";
+        links.textContent =
+          `基准 ${event.base_cycle ?? "—"} · 候选 ${event.candidate_cycle ?? "—"}`;
+        card.append(links);
+      }
       const reasons = document.createElement("ul");
       reasons.className = "evolution-reasons";
       reasons.replaceChildren(...(event.decision?.reasons ?? []).map((reason) => {

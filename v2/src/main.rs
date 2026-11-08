@@ -265,6 +265,10 @@ struct EvolutionEventRequest {
     candidate: astock_v2::domain::CandidateMetrics,
     #[serde(default)]
     policy: Option<astock_v2::domain::EvolutionPolicy>,
+    #[serde(default)]
+    base_cycle: Option<String>,
+    #[serde(default)]
+    candidate_cycle: Option<String>,
 }
 
 async fn record_evolution_event(
@@ -285,8 +289,14 @@ async fn record_evolution_event(
     .map_err(|error| (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error.0}))))?;
     let mut db = state.lock().await;
     response(
-        db.record_evolution_event(&body.event_id, &body.decided_at, decision)
-            .map_err(api_error)?,
+        db.record_evolution_event_with_links(
+            &body.event_id,
+            &body.decided_at,
+            decision,
+            body.base_cycle.as_deref(),
+            body.candidate_cycle.as_deref(),
+        )
+        .map_err(api_error)?,
     )
 }
 

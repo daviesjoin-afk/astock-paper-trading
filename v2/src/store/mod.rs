@@ -293,6 +293,10 @@ pub struct EvolutionEventRecord {
     pub status: String,
     pub decision: crate::domain::EvolutionDecision,
     pub decided_at: String,
+    /// Optional experiment whose metrics formed the incumbent side.
+    pub base_cycle: Option<String>,
+    /// Optional experiment that produced the candidate metrics.
+    pub candidate_cycle: Option<String>,
     pub digest: String,
 }
 
@@ -466,7 +470,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 13;
+        const SCHEMA_VERSION: i64 = 14;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -498,7 +502,7 @@ impl Store {
                 ("v2_paper_fills", &["id", "order_id", "fill_json"]),
                 ("v2_paper_sessions", &["session_id", "account_id", "spec_json", "status", "clock_at", "cursor", "last_order_id"]),
                 ("v2_paper_transfers", &["id", "account_id", "from_slot", "to_slot", "amount_cents", "applied_at", "note", "digest", "weights_before_json", "weights_after_json"]),
-                ("v2_evolution_events", &["event_id", "candidate_id", "status", "decision_json", "decided_at", "digest"]),
+                ("v2_evolution_events", &["event_id", "candidate_id", "status", "decision_json", "decided_at", "digest", "base_cycle", "candidate_cycle"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
@@ -637,7 +641,9 @@ impl Store {
                     status TEXT NOT NULL,
                     decision_json TEXT NOT NULL,
                     decided_at TEXT NOT NULL,
-                    digest TEXT NOT NULL
+                    digest TEXT NOT NULL,
+                    base_cycle TEXT,
+                    candidate_cycle TEXT
                 );
                 CREATE TABLE v2_quote_evidence (
                     pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,

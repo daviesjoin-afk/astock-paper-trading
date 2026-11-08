@@ -107,6 +107,8 @@ form, no valuation.
 - Experiment performance: the evolution view can query one experiment's
   reviewed-series metrics (profit, return, drawdown, fees, trades) or show the
   explicit “缺少审核价格集合” reason; id/day validation is inline.
+- Evolution events now show the base/candidate experiments they judged
+  (“基准 … · 候选 …”) when the event was recorded with those links.
 - Shadow comparison: the evolution view can compare two experiments at the
   signal level (base/candidate ids → matched, base-only and candidate-only
   signals). It is a read-only research tool; empty inputs are rejected inline.

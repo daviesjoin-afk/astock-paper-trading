@@ -885,6 +885,7 @@ td:first-child { font-weight: 550; }
 .evolution-card[data-state="rejected"], .evolution-card[data-state="reverted"] {
   border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
 }
+.evolution-links { margin: 0; font-size: 11.5px; color: var(--muted); }
 .evolution-reasons { margin: 0; padding-left: 18px; display: grid; gap: 3px; font-size: 11.5px; color: var(--muted); }
 
 /* ---------- experiment performance ---------- */
