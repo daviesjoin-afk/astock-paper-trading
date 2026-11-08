@@ -1063,6 +1063,13 @@ type PaperValuationReport = {
   } | null;
 };
 
+type EquitySeries = {
+  status: string; trust: string; price_set_id: string;
+  points: Array<{ day: string; cash_cents: number; market_value_cents: number; equity_cents: number }>;
+  max_drawdown_cents: number; max_drawdown_day: string | null;
+  profit_cents: number | null; digest: string;
+};
+
 type PaperAuditReport = {
   account_id: string; ok: boolean;
   checks: Array<{ name: string; ok: boolean; detail: string }>;
@@ -1349,6 +1356,26 @@ const sessionAction = async (sessionId: string, action: string): Promise<void> =
   }
 };
 
+const renderEquity = (series: EquitySeries | null): void => {
+  const block = testId<HTMLElement>("account-equity");
+  if (!series || series.status !== "valued") {
+    toggle(block, false);
+    return;
+  }
+  toggle(block, true);
+  const drawdown = series.max_drawdown_cents > 0
+    ? `最大回撤 ${money(series.max_drawdown_cents)}${series.max_drawdown_day ? `（${series.max_drawdown_day}）` : ""}`
+    : "最大回撤 ¥0.00";
+  const profit = series.profit_cents === null ? "不计算盈亏" : `盈亏 ${money(series.profit_cents)}`;
+  setText("equity-summary", `覆盖 ${series.points.length} 个交易日 · ${drawdown} · ${profit}`);
+  const list = testId<HTMLOListElement>("equity-points");
+  list.replaceChildren(...series.points.map((point) => {
+    const item = document.createElement("li");
+    item.textContent = `${point.day}：权益 ${money(point.equity_cents)}（现金 ${money(point.cash_cents)} · 市值 ${money(point.market_value_cents)}）`;
+    return item;
+  }));
+};
+
 const chinaDayOf = (value: string): string => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -1459,6 +1486,22 @@ const loadAccount = async (accountId: string): Promise<void> => {
       if (currentAccountId === accountId) renderAudit(audit);
     } catch {
       if (currentAccountId === accountId) renderAudit(null);
+    }
+    const days = Array.from(new Set(
+      orderList.map((order) => chinaDayOf(order.request.decision_at)).filter(Boolean),
+    )).sort();
+    if (days.length > 0) {
+      try {
+        const series = await api<EquitySeries>(
+          `/v2/paper-accounts/${encoded}/equity-series?days=${encodeURIComponent(days.join(","))}`,
+          new AbortController().signal,
+        );
+        if (currentAccountId === accountId) renderEquity(series);
+      } catch {
+        if (currentAccountId === accountId) renderEquity(null);
+      }
+    } else {
+      renderEquity(null);
     }
   } catch (error) {
     toggle(accountBody, false);

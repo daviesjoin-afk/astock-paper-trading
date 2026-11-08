@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 价格集合端到端与净值 UI（ADR 006/007）：冒烟改为 CSV → `make_price_set.py` → `ASTOCK_PRICE_SETS_DIR` → `/v2/price-sets` 全链路（合成集合可列出、但估值仍拒绝），并把目录纳入重启一致性流程；账户页新增“净值序列”区块——仅在覆盖齐全时展示每日权益、最大回撤与盈亏（合成集合不显示盈亏），无覆盖时隐藏。Rust 130 passed；浏览器 100 passed（stub 审核序列展示）；冒烟通过（目录 1 条、重启后一致）。
 - V2 价格集合离线生成器（ADR 006）：新增 `v2/research/make_price_set.py`（stdlib-only）——CSV（symbol/day/price/source/observed_at）→ 审核工件 JSON：元转整数分、拒绝三位小数、拒绝重复 `(symbol, day)`、校验覆盖区间与声明标的、按规范行计算 `source_digest`；`--days` 生成缺口报告，有缺口默认退出码 3 且不写文件（`--allow-gaps` 才写）。新增 7 项 Python 测试并接入既有 `unittest discover`；数据目录 README 增加生成用法。
 - V2 价格集合运行时目录（ADR 006）：移除编译期空注册表，改为只读加载 `data/price-sets/*.json`（`ASTOCK_PRICE_SETS_DIR` 可覆盖）；缺失目录视为“暂无审核数据”，文件损坏/重复 id 直接报错不跳过；新增 `v2/data/price-sets/README.md` 定义工件格式与审核清单（来源、覆盖、复权、停牌、摘要、版本）。目录仍为空，HTTP 估值/净值保持 `unavailable`。Rust 130 passed（目录加载、合成集合不被选中、重复 id、损坏文件、缺失目录）；浏览器 99 passed；冒烟断言目录为空时目录接口返回 `[]`。
 - V2 审计扩展到会话信号一致性（ADR 005）：新增第 7 项检查 `session_signals`——每个会话的订单必须与冻结信号前缀逐条一致（`signal_id = session:signal`、`decision_at`、`quote_ref`），且订单条数等于 `cursor`；篡改订单决策时刻会被发现。账户页新增可折叠“审计详情”，逐项显示通过与失败原因。Rust 129 passed（新增会话审计，旧夹具补上合法会话 spec）；浏览器 99 passed（展开详情 7 项）；冒烟断言 7 项检查名。

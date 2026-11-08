@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export ASTOCK_V2_DB="${RUNNER_TEMP:-/tmp}/astock-v2-http-smoke-${GITHUB_RUN_ID:-local}.sqlite3"
+# End-to-end price-set pipeline: CSV -> reviewed-artifact tool -> directory loader.
+PRICE_DIR="${RUNNER_TEMP:-/tmp}/astock-price-sets-${GITHUB_RUN_ID:-local}"
+rm -rf "$PRICE_DIR"
+mkdir -p "$PRICE_DIR"
+cat > "$PRICE_DIR/prices.csv" <<'CSV'
+symbol,day,price,source,observed_at
+600000.SH,2026-10-30,12.34,offline-fixture,2026-10-30T15:00:00+08:00
+600000.SH,2026-11-02,12.19,offline-fixture,2026-11-02T15:00:00+08:00
+CSV
+python research/make_price_set.py   --input "$PRICE_DIR/prices.csv" --out "$PRICE_DIR/smoke-synthetic.json"   --set-id smoke-synthetic --pack cn-offline-fixture-pack-1 --trust synthetic   --coverage-start 2026-10-30 --coverage-end 2026-11-02   --symbols 600000.SH --days 2026-10-30,2026-11-02 > /dev/null
+export ASTOCK_PRICE_SETS_DIR="$PRICE_DIR"
 rm -f "$ASTOCK_V2_DB" "$ASTOCK_V2_DB-wal" "$ASTOCK_V2_DB-shm"
 cargo run --locked --quiet >"${RUNNER_TEMP:-/tmp}/astock-v2-api.log" 2>&1 &
 server_pid=$!
@@ -8,6 +19,7 @@ cleanup() {
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
   rm -f "$ASTOCK_V2_DB" "$ASTOCK_V2_DB-wal" "$ASTOCK_V2_DB-shm"
+  rm -rf "$PRICE_DIR"
 }
 trap cleanup EXIT
 wait_ready() {
@@ -365,8 +377,12 @@ conflicting = copy.deepcopy(paper_spec)
 conflicting["initial_cash_cents"] = 20_000_000
 call("paper-accounts", conflicting, expected=409)
 call("paper-accounts/does-not-exist", expected=404)
-# The bundled reviewed price-set catalogue is empty by design: no invented prices.
-assert call("price-sets") == []
+# The directory now carries one published artifact; synthetic sets are listed
+# but never selected for a user-facing valuation.
+catalogue = call("price-sets")
+assert len(catalogue) == 1, catalogue
+assert catalogue[0]["price_set_id"] == "smoke-synthetic", catalogue
+assert catalogue[0]["trust"] == "synthetic", catalogue
 # The account ledger proves its own invariants and links fills to outcomes.
 audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit
