@@ -3341,3 +3341,51 @@ fn exposure_reports_cost_basis_and_concentration_breaches() {
     assert_eq!(breaching.breaches[0].value_bps, 3_000);
     assert_eq!(breaching.breaches[0].limit_bps, 2_500);
 }
+
+#[test]
+fn account_advance_drives_running_sessions_only() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("advance-account", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    for id in ["acct-sess-1", "acct-sess-2"] {
+        db.create_paper_session(session_spec(
+            "advance-account",
+            id,
+            vec![
+                session_signal(PaperSlotId::A, &output.signals[0]),
+                session_signal(PaperSlotId::A, &output.signals[1]),
+            ],
+        ))
+        .unwrap();
+        db.paper_session_action(id, "start").unwrap();
+    }
+    db.paper_session_action("acct-sess-2", "pause").unwrap();
+
+    let first = db.advance_account_to("advance-account", "2026-10-30").unwrap();
+    assert_eq!(first.sessions.len(), 1, "a paused session must not advance");
+    assert_eq!(first.sessions[0].session.session_id, "acct-sess-1");
+    assert_eq!(first.steps, 1);
+    assert_eq!(db.paper_session("acct-sess-2").unwrap().cursor, 0);
+
+    let second = db.advance_account_to("advance-account", "2026-11-02").unwrap();
+    assert_eq!(second.steps, 1);
+    assert_eq!(second.sessions[0].session.status, "completed");
+    assert_eq!(db.paper_session("acct-sess-2").unwrap().status, "paused");
+
+    // A day with nothing left to do is a no-op, not an error.
+    let idle = db.advance_account_to("advance-account", "2026-11-05").unwrap();
+    assert_eq!(idle.steps, 0);
+    assert!(idle.sessions.is_empty());
+
+    assert!(matches!(
+        db.advance_account_to("advance-account", "2026-13-01"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_advance_day"
+    ));
+    assert!(matches!(
+        db.advance_account_to("missing-account", "2026-11-02"),
+        Err(StoreError::NotFound(_))
+    ));
+}

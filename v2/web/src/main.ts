@@ -1771,6 +1771,32 @@ sessionForm.addEventListener("submit", (event) => {
   })();
 });
 
+const accountAdvanceButton = testId<HTMLButtonElement>("account-advance");
+accountAdvanceButton.addEventListener("click", () => {
+  const day = byId<HTMLInputElement>("account-advance-day").value;
+  if (!day) {
+    showAccountError("请先选择要推进到的交易日");
+    return;
+  }
+  accountAdvanceButton.disabled = true;
+  void (async () => {
+    clearAccountError();
+    try {
+      const result = await postJson<{ steps: number; filled: number; rejected: number }>(
+        `/v2/paper-accounts/${encodeURIComponent(currentAccountId)}/advance`,
+        { day },
+      );
+      announce(`账户推进到 ${day}：${result.steps} 步，成交 ${result.filled}，拒绝 ${result.rejected}`);
+      await loadAccount(currentAccountId);
+    } catch (error) {
+      showAccountError(`推进账户失败：${errorDetail(error)}`);
+      announce("推进账户失败");
+    } finally {
+      accountAdvanceButton.disabled = false;
+    }
+  })();
+});
+
 const loadAccounts = async (): Promise<void> => {
   clearAccountError();
   try {

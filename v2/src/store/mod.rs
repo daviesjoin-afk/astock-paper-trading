@@ -152,6 +152,17 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// Aggregate result of advancing every running session on an account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAdvance {
+    pub account_id: String,
+    pub day: String,
+    pub sessions: Vec<PaperSessionRun>,
+    pub steps: usize,
+    pub filled: usize,
+    pub rejected: usize,
+}
+
 /// One applied capital rebalance: cash moved between slots plus the weight change.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebalanceRecord {
@@ -1856,4 +1867,59 @@ fn rebalance_digest(record: &RebalanceRecord) -> StoreResult<String> {
         object.remove("digest");
     }
     Ok(crate::domain::canonical_digest(&value))
+}
+// ---------------------------------------------------------------------------
+// Account-level day advance: orchestrate every running session on one account
+// against an explicit China trading day. No daemon, no machine clock.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn advance_account_to(
+        &mut self,
+        account_id: &str,
+        day: &str,
+    ) -> StoreResult<AccountAdvance> {
+        chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .map_err(|_| StoreError::Rules(RuleError("invalid_advance_day".into())))?;
+        let exists: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT account_id FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound("paper_account_not_found".into()));
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id,status FROM v2_paper_sessions WHERE account_id=? ORDER BY session_id")?;
+        let sessions: Vec<(String, String)> = statement
+            .query_map([account_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        let mut runs = Vec::new();
+        let mut steps = 0usize;
+        let mut filled = 0usize;
+        let mut rejected = 0usize;
+        for (session_id, status) in sessions {
+            if status != "running" {
+                continue;
+            }
+            let run = self.advance_paper_session_to(&session_id, day)?;
+            steps += run.steps;
+            filled += run.filled;
+            rejected += run.rejected;
+            runs.push(run);
+        }
+        Ok(AccountAdvance {
+            account_id: account_id.into(),
+            day: day.into(),
+            sessions: runs,
+            steps,
+            filled,
+            rejected,
+        })
+    }
 }
