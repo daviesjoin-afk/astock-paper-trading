@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 进化日志分页（ADR 012）：新增 `GET /v2/evolution/events/page?limit=&before=&before_id=&after=`——游标为 `(decided_at, event_id)` 双键（均不含），同一时间戳多条事件不漏读，支持 `after` 时间下界，最大扫描 2000 条；返回 `next_before/next_before_id` 供续页。进化视图改为加载最近 20 条并提供“加载更早”，按 id 去重追加。Rust 140 passed（同时间戳分页/过滤/非法游标）；浏览器 111 passed（+1 游标加载）；冒烟覆盖分页端点。
 - V2 影子对比界面：进化视图新增“影子对比”面板——输入基准/候选实验 id，展示命中、两侧独有信号（决策时刻、标的与方向、报价引用）；空输入内联报错，比较失败给出原因。浏览器 110 passed（新增 2 项：差异渲染、必填校验；进化视图 axe 仍 0 violation）；Rust 139 / Python 32 不变。
 - V2 影子信号差异报告（ADR 015）：新增只读 `GET /v2/signal-diff?base_cycle=&candidate_cycle=`——以 `{decision_at, quote_ref, symbol, side}` 指纹做多重集合比较，输出 `matched / base_only / candidate_only / base_runs / candidate_runs` 与 canonical 摘要；不比较 signal_id、数量与成交结果。冒烟新增基准运行（审核工件 2 信号）与差异断言（命中 1、基准独有 1 买入、候选独有 0），并把既有成交计数限定为非影子实验。Rust 139 passed（差异命中/独有/确定性/404）；Python 32 / 浏览器 108 不变。
 - V2 影子候选实验边界（ADR 014）：实验接口允许 `shadow-` 前缀工件（须自洽、`source_digest` 等于某个审核策略源码摘要、研究输入为审核输入），为候选提供影子运行入口；纸面账户仍只接受审核工件，影子实验不享受审核输出复现。新增 `scripts/shadow_candidates.py`：创建实验 → 导入报价证据 → 提交冻结信号 → 输出计数；冒烟端到端验证 `lookback=3` 候选 1 条信号、`runs_total=1`。Rust 138 passed（影子接受/未知源码拒绝/漂移拒绝）；Python 32 / 浏览器 108 不变。

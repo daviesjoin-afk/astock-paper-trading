@@ -248,6 +248,41 @@ struct EvolutionListQuery {
     status: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct EvolutionPageQuery {
+    #[serde(default = "default_evolution_limit")]
+    limit: i64,
+    #[serde(default)]
+    candidate: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    before_id: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+async fn evolution_events_page(
+    State(state): State<Shared>,
+    Query(query): Query<EvolutionPageQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    let limit = query.limit.clamp(1, 200);
+    response(
+        db.evolution_events_page(
+            limit,
+            query.candidate.as_deref(),
+            query.status.as_deref(),
+            query.before.as_deref(),
+            query.before_id.as_deref(),
+            query.after.as_deref(),
+        )
+        .map_err(api_error)?,
+    )
+}
+
 fn default_evolution_limit() -> i64 {
     50
 }
@@ -517,6 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v2/evolution/events",
             post(record_evolution_event).get(evolution_events),
         )
+        .route("/v2/evolution/events/page", get(evolution_events_page))
         .route("/v2/price-sets", get(price_set_catalogue))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
         .route(

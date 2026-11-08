@@ -1433,3 +1433,92 @@ fn fingerprint(request: &SimulationRequest) -> SignalFingerprint {
         side: request.signal.side.clone(),
     }
 }
+
+impl Store {
+    /// Cursor-paginated event log. The cursor is (decided_at, event_id), both
+    /// exclusive, so events with identical timestamps are never skipped.
+    pub fn evolution_events_page(
+        &self,
+        limit: i64,
+        candidate_id: Option<&str>,
+        status: Option<&str>,
+        before: Option<&str>,
+        before_id: Option<&str>,
+        after: Option<&str>,
+    ) -> StoreResult<EvolutionEventPage> {
+        const SCAN_LIMIT: i64 = 2_000;
+        let parse = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map_err(|_| StoreError::Rules(RuleError("invalid_evolution_cursor".into())))
+        };
+        let before_at = before.map(parse).transpose()?;
+        let after_at = after.map(parse).transpose()?;
+        let mut statement = self.conn.prepare(
+            "SELECT event_id,candidate_id,status,decision_json,decided_at
+             FROM v2_evolution_events ORDER BY decided_at DESC, event_id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map([SCAN_LIMIT], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut scanned = 0usize;
+        let mut events = Vec::new();
+        for row in rows {
+            let (event_id, row_candidate, row_status, raw_decision, decided_at) = row?;
+            scanned += 1;
+            if candidate_id.is_some_and(|wanted| wanted != row_candidate) {
+                continue;
+            }
+            if status.is_some_and(|wanted| wanted != row_status) {
+                continue;
+            }
+            let at = parse(&decided_at)?;
+            if let Some(cursor) = before_at {
+                if at > cursor || (at == cursor && before_id.is_some_and(|id| event_id.as_str() >= id)) {
+                    continue;
+                }
+            }
+            if let Some(cursor) = after_at {
+                if at < cursor {
+                    continue;
+                }
+            }
+            let decision: crate::domain::EvolutionDecision = serde_json::from_str(&raw_decision)?;
+            let mut record = EvolutionEventRecord {
+                event_id,
+                candidate_id: row_candidate,
+                status: row_status,
+                decision,
+                decided_at,
+                digest: String::new(),
+            };
+            record.digest = evolution_event_digest(&record)?;
+            events.push(record);
+        }
+        let has_more = events.len() as i64 > limit;
+        if has_more {
+            events.truncate(limit as usize);
+        }
+        let next_before = if has_more {
+            events.last().map(|event| event.decided_at.clone())
+        } else {
+            None
+        };
+        let next_before_id = if has_more {
+            events.last().map(|event| event.event_id.clone())
+        } else {
+            None
+        };
+        Ok(EvolutionEventPage {
+            events,
+            next_before,
+            next_before_id,
+            scanned,
+        })
+    }
+}

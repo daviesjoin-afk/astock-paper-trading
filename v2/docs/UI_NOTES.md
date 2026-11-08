@@ -110,8 +110,9 @@ form, no valuation.
 - Evolution history: a dedicated view (shortcut 8) lists promotion/rollback
   events with candidate id, status pill, decision time and the rule reasons.
   Candidate/status filters narrow the log client-side (“没有匹配的事件” when
-  nothing matches). Empty logs and fetch failures explain themselves; the log
-  is read-only.
+  nothing matches). The log loads the newest 20 events and “加载更早” follows a
+  (decided_at, event_id) cursor. Empty logs and fetch failures explain
+  themselves; the log is read-only.
 - Account advance: a date input plus “推进账户到该日” drives every running
   session on the account in one call (paused sessions stay paused); the status
   line reports steps/fills/rejections.

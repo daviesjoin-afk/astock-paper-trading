@@ -3651,3 +3651,55 @@ fn signal_diff_reports_only_changed_signals() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+#[test]
+fn evolution_pages_use_timestamp_and_id_cursor() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let make = |id: &str| crate::domain::EvolutionDecision {
+        candidate_id: id.into(),
+        status: "kept".into(),
+        reasons: vec!["保持".into()],
+        digest: "a".repeat(64),
+    };
+    db.record_evolution_event("e1", "2026-11-05T10:00:00+08:00", make("c1")).unwrap();
+    db.record_evolution_event("e2", "2026-11-05T10:00:00+08:00", make("c2")).unwrap();
+    db.record_evolution_event("e3", "2026-11-05T09:00:00+08:00", make("c3")).unwrap();
+
+    let first = db.evolution_events_page(2, None, None, None, None, None).unwrap();
+    assert_eq!(first.events.len(), 2);
+    assert_eq!(first.events[0].event_id, "e2");
+    assert_eq!(first.events[1].event_id, "e1");
+    assert_eq!(first.next_before.as_deref(), Some("2026-11-05T10:00:00+08:00"));
+    assert_eq!(first.next_before_id.as_deref(), Some("e1"));
+    assert_eq!(first.scanned, 3);
+
+    let second = db
+        .evolution_events_page(
+            2,
+            None,
+            None,
+            first.next_before.as_deref(),
+            first.next_before_id.as_deref(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events[0].event_id, "e3");
+    assert!(second.next_before.is_none());
+
+    let after = db
+        .evolution_events_page(10, None, None, None, None, Some("2026-11-05T09:30:00+08:00"))
+        .unwrap();
+    assert_eq!(after.events.len(), 2);
+
+    let filtered = db
+        .evolution_events_page(10, Some("c3"), Some("kept"), None, None, None)
+        .unwrap();
+    assert_eq!(filtered.events.len(), 1);
+    assert_eq!(filtered.events[0].event_id, "e3");
+
+    assert!(matches!(
+        db.evolution_events_page(10, None, None, Some("not-a-time"), None, None),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_cursor"
+    ));
+}
