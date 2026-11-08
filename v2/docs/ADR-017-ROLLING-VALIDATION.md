@@ -52,6 +52,16 @@
 5. 一致时 `--decide` 正常进入 ADR 012 流程；
 6. 冒烟覆盖“合成数据 → 分段 unavailable → 一致性 unstable”。
 
+## 窗口来源（已实现）
+
+`weekly_review.py` 支持三种窗口来源，二选一：
+
+1. `--windows "d1,d2;d3"`：完全手写；
+2. `--days d1,d2,... --window-size N`：按清单切分，只保留完整窗口；
+3. `--days-from-pack PACK --symbol S --window-size N`：用 `GET /v2/price-sets/days` 返回的**审核覆盖日**切分；无覆盖 → 退出码 2。
+
+覆盖日接口只统计 `reviewed` 集合，合成数据不参与；窗口仍不自动展开日历。
+
 ## 未决问题
 
 - 窗口长度/数量的自动选择（按日历与样本量）；

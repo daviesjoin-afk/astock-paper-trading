@@ -63,17 +63,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--windows", help="e.g. 2026-10-30,2026-10-31;2026-11-02")
     parser.add_argument("--days", help="comma-separated days to split into windows")
     parser.add_argument("--window-size", type=int, default=5)
+    parser.add_argument("--days-from-pack")
+    parser.add_argument("--symbol")
     parser.add_argument("--margin-bps", type=int, default=50)
     parser.add_argument("--max-drawdown-bps", type=int, default=1_500)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        modes = sum(
+            bool(value) for value in (args.windows, args.days, args.days_from_pack)
+        )
+        if modes != 1:
+            raise ValueError("provide exactly one of --windows, --days, --days-from-pack")
         if args.windows:
             windows = parse_windows(args.windows)
         elif args.days:
             windows = chunk_days(args.days, args.window_size)
         else:
-            raise ValueError("provide --windows or --days")
+            if not args.symbol:
+                raise ValueError("days_from_pack_requires_symbol")
+            days = shadow.call(
+                args.api,
+                f"price-sets/days?pack_id={args.days_from_pack}&symbol={args.symbol}",
+            )
+            windows = chunk_days(",".join(days), args.window_size)
         base = shadow.segments(args.api, args.base_cycle, windows)
         candidate = shadow.segments(args.api, args.candidate_cycle, windows)
         consistency = shadow.rolling_consistency(

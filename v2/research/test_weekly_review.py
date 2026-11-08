@@ -33,6 +33,40 @@ class WeeklyReviewTest(unittest.TestCase):
     def tearDown(self) -> None:
         shadow.segments = self.original
 
+    def test_days_from_pack_uses_reviewed_coverage(self) -> None:
+        captured = {}
+
+        def fake(api, path, payload=None, expected=200):
+            if path.startswith("price-sets/days"):
+                captured["path"] = path
+                return ["2026-10-30", "2026-11-02"]
+            return {}
+
+        original_call = shadow.call
+        shadow.call = fake
+        shadow.segments = lambda api, cycle, windows: GOOD if cycle == "cand" else BASE
+        try:
+            code = weekly_review.main([
+                "--base-cycle", "base", "--candidate-cycle", "cand",
+                "--days-from-pack", "cn-offline-fixture-pack-1",
+                "--symbol", "600000.SH", "--window-size", "1",
+            ])
+        finally:
+            shadow.call = original_call
+        self.assertEqual(code, 0)
+        self.assertIn("pack_id=cn-offline-fixture-pack-1", captured["path"])
+        self.assertIn("symbol=600000.SH", captured["path"])
+
+    def test_days_from_pack_requires_symbol(self) -> None:
+        self.assertEqual(
+            weekly_review.main([
+                "--base-cycle", "base", "--candidate-cycle", "cand",
+                "--days-from-pack", "pack",
+            ]),
+            2,
+        )
+
+
     def test_chunk_days_builds_full_windows_only(self) -> None:
         windows = weekly_review.chunk_days("2026-10-30,2026-10-31,2026-11-02,2026-11-03", 2)
         self.assertEqual(windows, [

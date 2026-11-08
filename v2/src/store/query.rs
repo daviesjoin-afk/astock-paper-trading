@@ -1772,3 +1772,36 @@ impl Store {
         Ok(counts)
     }
 }
+
+impl Store {
+    /// Sorted distinct reviewed days covering `symbol` inside `pack`.
+    /// Synthetic sets are ignored; callers can only evaluate reviewed prices.
+    pub fn price_set_days(
+        &self,
+        pack_id: &str,
+        symbol: &str,
+    ) -> StoreResult<Vec<String>> {
+        self.price_set_days_in(&price_sets_dir(), pack_id, symbol)
+    }
+
+    pub fn price_set_days_in(
+        &self,
+        dir: &std::path::Path,
+        pack_id: &str,
+        symbol: &str,
+    ) -> StoreResult<Vec<String>> {
+        let registry = load_price_sets(dir)?;
+        let mut days = std::collections::BTreeSet::new();
+        for set in &registry.sets {
+            if set.trust != crate::domain::TRUST_REVIEWED || set.market_data_pack_id != pack_id {
+                continue;
+            }
+            for entry in &set.entries {
+                if entry.symbol == symbol {
+                    days.insert(entry.day.clone());
+                }
+            }
+        }
+        Ok(days.into_iter().collect())
+    }
+}

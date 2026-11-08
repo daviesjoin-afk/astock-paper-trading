@@ -384,6 +384,8 @@ catalogue = call("price-sets")
 assert len(catalogue) == 1, catalogue
 assert catalogue[0]["price_set_id"] == "smoke-synthetic", catalogue
 assert catalogue[0]["trust"] == "synthetic", catalogue
+# Only reviewed prices count as covered days; the catalog is synthetic.
+assert call("price-sets/days?pack_id=cn-offline-fixture-pack-1&symbol=600000.SH") == []
 # Evolution governance: evidence-based promotion, no lucky single backtest.
 evolution = call("evolution/decisions", {
     "kind": "promotion",
@@ -644,6 +646,17 @@ else
   test $? -eq 4
 fi
 grep -q "2026-10-30" "${RUNNER_TEMP:-/tmp}/astock-weekly-auto.out"
+# Coverage-day mode: no reviewed days means the review cannot build a window.
+if python scripts/weekly_review.py --base-cycle shadow-base-1 \
+    --candidate-cycle shadow-candidate-1 \
+    --days-from-pack cn-offline-fixture-pack-1 --symbol 600000.SH \
+    > "${RUNNER_TEMP:-/tmp}/astock-weekly-cover.out" 2>&1; then
+  echo "coverage-day review unexpectedly succeeded" >&2
+  exit 1
+else
+  test $? -eq 2
+fi
+
 
 
 python3 scripts/experiment_demo.py

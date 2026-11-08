@@ -3929,3 +3929,47 @@ fn accounts_overview_lists_money_sessions_and_audit() {
         rows[0].reserve_cents + rows[0].slots.iter().map(|slot| slot.cash_cents).sum::<i64>()
     );
 }
+
+#[test]
+fn price_set_days_lists_only_reviewed_covered_days() {
+    let dir = temp_price_dir("cover-days");
+    let mut reviewed = price_set("reviewed", "2026-11-02", 1_200, MARKET_DATA_PACK_ID);
+    reviewed.coverage_start = "2026-10-30".into();
+    reviewed.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: "2026-10-30".into(),
+        price_cents: 1_300,
+        source: "offline-fixture".into(),
+        observed_at: "2026-10-30T15:00:00+08:00".into(),
+    });
+    std::fs::write(dir.join("reviewed.json"), serde_json::to_string(&reviewed).unwrap()).unwrap();
+    let mut synthetic = reviewed.clone();
+    synthetic.price_set_id = "synthetic-days".into();
+    synthetic.trust = "synthetic".into();
+    std::fs::write(dir.join("synthetic.json"), serde_json::to_string(&synthetic).unwrap()).unwrap();
+
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let days = db
+        .price_set_days_in(&dir, MARKET_DATA_PACK_ID, "600000.SH")
+        .unwrap();
+    assert_eq!(days, vec!["2026-10-30".to_string(), "2026-11-02".to_string()]);
+
+    // Synthetic-only coverage never appears.
+    let only_synthetic = temp_price_dir("cover-days-synthetic");
+    std::fs::write(
+        only_synthetic.join("set.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    assert!(db
+        .price_set_days_in(&only_synthetic, MARKET_DATA_PACK_ID, "600000.SH")
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .price_set_days_in(&dir, MARKET_DATA_PACK_ID, "000001.SZ")
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(only_synthetic);
+}
