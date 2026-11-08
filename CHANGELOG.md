@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 归档目录遍历校验：`verify_archive.py --dir` 按 `<name>.sqlite3` + `<name>.export.json|json` 配对校验整目录，可选核对 `<name>.manifest.json` 侧车；缺配对/摘要不符逐条报错、退出 1；单文件模式保持原退出码语义（缺文件 2）。Python 研究套件 57 passed（+3：配对/缺配对/侧车不符）；冒烟覆盖目录模式。
 - V2 提案版本切换标记：资金提案理由中出现“窗口内发生策略版本切换”时，对应槽位追加内联「版本切换」徽标（警告色），不再只靠长文本；浏览器 128 passed（用例断言徽标数量）；Rust/Python 不变。
 - V2 状态条去重：账户页状态条只保留本账户会话计数；价格集合与最近进化事件统一由概览页展示，减少重复请求与两处不一致；浏览器 128 passed（用例改为断言全局项已移除）；Rust/Python 不变。
 - V2 一键验证脚本：新增 `v2/scripts/verify_all.sh`——按序运行 Rust 测试、研究测试、冒烟、浏览器（`--fast` 跳过）与泄露扫描（`--no-scan` 跳过），逐套件打印结果与耗时，任一失败退出 1；`--dry-run` 只列命令；`OPERATIONS.md`/README 增加入口。冒烟覆盖 dry-run 列表；实际 `--fast --no-scan` 全套通过。Rust 154 / Python 54 / 浏览器 128 不变。

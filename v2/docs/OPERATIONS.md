@@ -83,7 +83,17 @@ python scripts/verify_archive.py --db /backup/astock.sqlite3 --export evolution-
 
 退出码：0 全部通过、1 任一产物无效、2 文件缺失或不可读。退出码：0 全部通过、1 任一产物无效、2 文件缺失或不可读。
 
-加 `--manifest-out manifest.json` 会在校验通过后写出侧车清单（两文件 SHA-256、schema、事件数与合并 manifest），失败时**不写**，便于归档目录自证。
+
+
+整目录校验（`<name>.sqlite3` 配 `<name>.export.json` 或 `<name>.json`，可选 `<name>.manifest.json` 侧车会一并核对）：
+
+```bash
+python scripts/verify_archive.py --dir /backup/astock
+# pair.sqlite3 ok manifest=…
+# all 1 archives verified
+```
+
+任一副本缺配对或摘要不符 → 退出码 1，并逐条列出原因。加 `--manifest-out manifest.json` 会在校验通过后写出侧车清单（两文件 SHA-256、schema、事件数与合并 manifest），失败时**不写**，便于归档目录自证。
 
 每周复核（只读，不写账本）：
 

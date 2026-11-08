@@ -788,6 +788,14 @@ ARCHIVE
 python scripts/verify_archive.py --db "$DB_BACKUP" --export "$DB_EXPORT"   --manifest-out "$DB_EXPORT.manifest.json" | grep -q "archive ok"
 test -s "$DB_EXPORT.manifest.json"
 
+# Directory mode pairs <name>.sqlite3 with <name>.export.json.
+ARCHIVE_DIR="${RUNNER_TEMP:-/tmp}/astock-archive-dir-${GITHUB_RUN_ID:-local}"
+rm -rf "$ARCHIVE_DIR"; mkdir -p "$ARCHIVE_DIR"
+cp "$DB_BACKUP" "$ARCHIVE_DIR/pair.sqlite3"
+cp "$DB_EXPORT" "$ARCHIVE_DIR/pair.export.json"
+python scripts/verify_archive.py --dir "$ARCHIVE_DIR" | grep -q "all 1 archives verified"
+rm -rf "$ARCHIVE_DIR"
+
 rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT" "$DB_EXPORT"
 rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT"
 
