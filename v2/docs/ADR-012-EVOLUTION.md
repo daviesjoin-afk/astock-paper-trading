@@ -63,6 +63,17 @@ python research/generate_candidates.py   --base data/strategy-momentum-v1.json  
 - 输出 manifest：`schema_version / base_strategy_version_id / base_parameters_digest / candidates[] / digest`；
 - 不评估、不晋级、不写账本——只产出影子运行可消费的确定性候选清单。
 
+## 影子决策 CLI（已实现）
+
+```bash
+python scripts/shadow_candidates.py --artifact cands/X.artifact.json   --output cands/X.output.json --cycle shadow-candidate-1   --base-cycle shadow-base-1 --performance-days 2026-10-30,2026-11-02   --decide --record-event --event-id evo-shadow-1   --decided-at 2026-11-06T15:00:00+08:00
+```
+
+- 使用**同一审核价格序列**为基准与候选取绩效（ADR 016），任一缺失即返回 `unavailable`，不产生决策；
+- `--decide` 调用治理规则；`--record-event` 还需显式 `--event-id` 与 `--decided-at`（拒绝机器时间）；
+- 指标口径：`out_of_sample_days = shadow_days = 序列天数`，`trades` 来自成交；
+- 输出包含 `performance{base,candidate}`、`decision` 与 `event`。
+
 ## 未决问题
 
 - 指标来源：需要由审核净值序列（ADR 007）统一生成，禁止手工填写；
