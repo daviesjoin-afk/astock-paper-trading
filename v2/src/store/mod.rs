@@ -120,6 +120,28 @@ pub struct PaperSessionRun {
     pub rejected: usize,
 }
 
+/// One slot's price requirements for a valuation snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperValuationRequirement {
+    pub slot: String,
+    pub market_data_pack_id: String,
+    pub symbols: Vec<String>,
+}
+
+/// Why a valuation cannot be produced. Deliberately contains no value fields:
+/// until a reviewed price set exists, nothing may be marked to market.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperValuationReport {
+    pub account_id: String,
+    pub as_of_day: String,
+    pub status: String,
+    pub reason: String,
+    pub requirements: Vec<PaperValuationRequirement>,
+    pub missing: Vec<String>,
+    pub priced_symbols: usize,
+    pub digest: String,
+}
+
 /// Valuation availability for an account. Always explicit, never inferred.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperValuation {

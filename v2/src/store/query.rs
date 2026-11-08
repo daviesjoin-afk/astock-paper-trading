@@ -409,3 +409,59 @@ impl Store {
         Ok(sessions)
     }
 }
+
+impl Store {
+    /// A valuation snapshot that refuses to invent prices. It reports exactly
+    /// which packs and symbols a reviewed price set would have to cover.
+    pub fn paper_valuation(
+        &self,
+        account_id: &str,
+        as_of_day: &str,
+    ) -> StoreResult<PaperValuationReport> {
+        let day = chrono::NaiveDate::parse_from_str(as_of_day, "%Y-%m-%d")
+            .map_err(|_| StoreError::Rules(RuleError("invalid_valuation_day".into())))?;
+        if day.to_string() != as_of_day {
+            return Err(StoreError::Rules(RuleError("invalid_valuation_day".into())));
+        }
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate()?;
+        let mut requirements = Vec::new();
+        for (index, slot) in spec.slots.iter().enumerate() {
+            let state = Store::paper_slot_state(&self.conn, &spec, &split, index)?;
+            let mut symbols: Vec<String> =
+                state.lots.iter().map(|lot| lot.symbol.clone()).collect();
+            symbols.sort();
+            symbols.dedup();
+            requirements.push(PaperValuationRequirement {
+                slot: slot.slot.as_str().into(),
+                market_data_pack_id: slot.market_data_pack_id.clone(),
+                symbols,
+            });
+        }
+        let mut report = PaperValuationReport {
+            account_id: account_id.into(),
+            as_of_day: as_of_day.into(),
+            status: "unavailable".into(),
+            reason: "no_reviewed_price_set".into(),
+            requirements,
+            missing: vec!["reviewed_price_set".into()],
+            priced_symbols: 0,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
+    }
+}
