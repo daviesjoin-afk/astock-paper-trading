@@ -727,6 +727,36 @@ fi
 python3 scripts/experiment_demo.py
 python3 scripts/market_pack_demo.py
 python3 scripts/research_reproduction_demo.py
+# Backup/restore: online backup, verified restore, overwrite and corruption refusal.
+DB_BACKUP="${RUNNER_TEMP:-/tmp}/astock-backup-${GITHUB_RUN_ID:-local}.sqlite3"
+DB_RESTORED="${RUNNER_TEMP:-/tmp}/astock-restored-${GITHUB_RUN_ID:-local}.sqlite3"
+DB_CORRUPT="${RUNNER_TEMP:-/tmp}/astock-corrupt-${GITHUB_RUN_ID:-local}.sqlite3"
+rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT"
+
+python scripts/db_tool.py backup --db "$ASTOCK_V2_DB" --out "$DB_BACKUP" \
+  | grep -Eq "backup ok schema=[0-9]+ accounts=[1-9]"
+python scripts/db_tool.py verify --db "$DB_BACKUP" | grep -q "verify ok"
+python scripts/db_tool.py restore --backup "$DB_BACKUP" --db "$DB_RESTORED" | grep -q "restore ok"
+python scripts/db_tool.py verify --db "$DB_RESTORED" | grep -q "verify ok"
+
+if python scripts/db_tool.py restore --backup "$DB_BACKUP" --db "$DB_RESTORED" \
+    > /dev/null 2>&1; then
+  echo "restore overwrote an existing database without --force" >&2
+  exit 1
+else
+  test $? -eq 3
+fi
+
+head -c 4096 "$DB_BACKUP" > "$DB_CORRUPT"
+if python scripts/db_tool.py verify --db "$DB_CORRUPT" > /dev/null 2>&1; then
+  echo "corrupted database passed verification" >&2
+  exit 1
+else
+  test $? -eq 1
+fi
+
+rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT"
+
 # Reopen the exact SQLite file in a new Rust process, then verify both frozen ledgers.
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
