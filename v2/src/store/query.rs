@@ -1288,12 +1288,20 @@ impl Store {
         Ok(record)
     }
 
-    pub fn evolution_events(&self, limit: i64) -> StoreResult<Vec<EvolutionEventRecord>> {
+    /// Recent events, optionally filtered by exact candidate id and status.
+    /// Filters apply to the newest `EVENT_SCAN_LIMIT` rows, then `limit` caps.
+    pub fn evolution_events(
+        &self,
+        limit: i64,
+        candidate_id: Option<&str>,
+        status: Option<&str>,
+    ) -> StoreResult<Vec<EvolutionEventRecord>> {
+        const EVENT_SCAN_LIMIT: i64 = 200;
         let mut statement = self.conn.prepare(
             "SELECT event_id,candidate_id,status,decision_json,decided_at
              FROM v2_evolution_events ORDER BY decided_at DESC, event_id DESC LIMIT ?",
         )?;
-        let rows = statement.query_map([limit], |row| {
+        let rows = statement.query_map([EVENT_SCAN_LIMIT], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1304,18 +1312,27 @@ impl Store {
         })?;
         let mut records = Vec::new();
         for row in rows {
-            let (event_id, candidate_id, status, raw_decision, decided_at) = row?;
+            let (event_id, row_candidate, row_status, raw_decision, decided_at) = row?;
+            if candidate_id.is_some_and(|wanted| wanted != row_candidate) {
+                continue;
+            }
+            if status.is_some_and(|wanted| wanted != row_status) {
+                continue;
+            }
             let decision: crate::domain::EvolutionDecision = serde_json::from_str(&raw_decision)?;
             let mut record = EvolutionEventRecord {
                 event_id,
-                candidate_id,
-                status,
+                candidate_id: row_candidate,
+                status: row_status,
                 decision,
                 decided_at,
                 digest: String::new(),
             };
             record.digest = evolution_event_digest(&record)?;
             records.push(record);
+            if records.len() as i64 >= limit {
+                break;
+            }
         }
         Ok(records)
     }

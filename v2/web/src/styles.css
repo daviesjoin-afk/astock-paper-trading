@@ -872,6 +872,8 @@ td:first-child { font-weight: 550; }
 
 
 /* ---------- evolution ---------- */
+.evolution-filters { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-bottom: 12px; align-items: flex-end; }
+.evolution-filters input { min-width: 200px; }
 .evolution-events { display: grid; gap: 10px; }
 .evolution-card {
   border: 1px solid var(--border); border-radius: var(--radius);

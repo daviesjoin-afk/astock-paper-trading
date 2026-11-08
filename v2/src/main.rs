@@ -232,6 +232,10 @@ async fn record_evolution_event(
 struct EvolutionListQuery {
     #[serde(default = "default_evolution_limit")]
     limit: i64,
+    #[serde(default)]
+    candidate: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 fn default_evolution_limit() -> i64 {
@@ -244,7 +248,10 @@ async fn evolution_events(
 ) -> ApiResult {
     let db = state.lock().await;
     let limit = query.limit.clamp(1, 200);
-    response(db.evolution_events(limit).map_err(api_error)?)
+    response(
+        db.evolution_events(limit, query.candidate.as_deref(), query.status.as_deref())
+            .map_err(api_error)?,
+    )
 }
 
 async fn evolution_decision(Json(body): Json<EvolutionRequest>) -> ApiResult {

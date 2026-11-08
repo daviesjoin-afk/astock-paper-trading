@@ -3508,7 +3508,7 @@ fn evolution_events_are_idempotent_and_listed() {
         Err(StoreError::Conflict(ref code)) if code == "evolution_event_conflict"
     ));
 
-    let events = db.evolution_events(10).unwrap();
+    let events = db.evolution_events(10, None, None).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_id, "evo-1");
     assert_eq!(events[0].candidate_id, "cand");
@@ -3521,4 +3521,33 @@ fn evolution_events_are_idempotent_and_listed() {
         db.record_evolution_event("evo-2", "not-a-time", promoted),
         Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_time"
     ));
+}
+
+#[test]
+fn evolution_events_filter_by_candidate_and_status() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let promoted = crate::domain::EvolutionDecision {
+        candidate_id: "cand-a".into(),
+        status: "promoted".into(),
+        reasons: vec!["通过".into()],
+        digest: "a".repeat(64),
+    };
+    let rejected = crate::domain::EvolutionDecision {
+        candidate_id: "cand-b".into(),
+        status: "rejected".into(),
+        reasons: vec!["收益不足".into()],
+        digest: "b".repeat(64),
+    };
+    db.record_evolution_event("evo-a", "2026-11-05T15:00:00+08:00", promoted).unwrap();
+    db.record_evolution_event("evo-b", "2026-11-04T15:00:00+08:00", rejected).unwrap();
+
+    assert_eq!(db.evolution_events(10, None, None).unwrap().len(), 2);
+    let only_a = db.evolution_events(10, Some("cand-a"), None).unwrap();
+    assert_eq!(only_a.len(), 1);
+    assert_eq!(only_a[0].event_id, "evo-a");
+    let rejected_only = db.evolution_events(10, None, Some("rejected")).unwrap();
+    assert_eq!(rejected_only.len(), 1);
+    assert_eq!(rejected_only[0].candidate_id, "cand-b");
+    assert_eq!(db.evolution_events(10, Some("cand-a"), Some("rejected")).unwrap().len(), 0);
+    assert_eq!(db.evolution_events(1, None, None).unwrap().len(), 1);
 }

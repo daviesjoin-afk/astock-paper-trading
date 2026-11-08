@@ -573,6 +573,23 @@ python3 scripts/experiment_demo.py</code></pre>
             </header>
             <div class="panel-body">
               <p class="panel-note">晋级与回退由证据规则判定：样本外、影子天数、回撤与优势门槛，任何一条不满足都不会晋级。</p>
+              <div class="evolution-filters">
+                <label class="field field-inline">
+                  <span class="field-label">候选</span>
+                  <input id="evolution-filter-candidate" data-testid="evolution-filter-candidate" autocomplete="off" placeholder="candidate id" />
+                </label>
+                <label class="field field-inline">
+                  <span class="field-label">状态</span>
+                  <select id="evolution-filter-status" data-testid="evolution-filter-status">
+                    <option value="">全部</option>
+                    <option value="promoted">已晋级</option>
+                    <option value="rejected">已淘汰</option>
+                    <option value="reverted">已回退</option>
+                    <option value="kept">保持</option>
+                    <option value="insufficient_evidence">证据不足</option>
+                  </select>
+                </label>
+              </div>
               <div class="evolution-events" id="evolution-events" data-testid="evolution-events"></div>
               <p class="empty-state" id="evolution-empty" data-testid="evolution-empty" hidden>还没有进化事件。</p>
             </div>
