@@ -17,6 +17,8 @@ test.describe("keyboard shortcuts", () => {
 
     await page.keyboard.press("6");
     await expect(page.getByTestId("panel-experiment")).toBeVisible();
+    await page.keyboard.press("7");
+    await expect(page.getByTestId("panel-account")).toBeVisible();
     await page.keyboard.press("3");
     await expect(page.getByTestId("panel-decisions")).toBeVisible();
   });
@@ -27,6 +29,7 @@ test.describe("keyboard shortcuts", () => {
     await expect(page.getByTestId("nav-positions")).toHaveAttribute("aria-keyshortcuts", "2");
     await expect(page.getByTestId("nav-decisions")).toHaveAttribute("aria-keyshortcuts", "3");
     await expect(page.getByTestId("nav-experiment")).toHaveAttribute("aria-keyshortcuts", "6");
+    await expect(page.getByTestId("nav-account")).toHaveAttribute("aria-keyshortcuts", "7");
     await expect(page.getByTestId("refresh")).toHaveAttribute("aria-keyshortcuts", "r");
     await expect(page.getByTestId("theme-toggle")).toHaveAttribute("aria-keyshortcuts", "t");
     await expect(page.getByTestId("shortcuts-open")).toHaveAttribute("aria-keyshortcuts", "?");
@@ -70,7 +73,7 @@ test.describe("keyboard shortcuts", () => {
     await page.keyboard.press("?");
     const sheet = page.getByTestId("shortcuts");
     await expect(sheet).toBeVisible();
-    await expect(sheet).toContainText("概览 · 持仓 · 决策 · 回放 · 重做 · 实验");
+    await expect(sheet).toContainText("概览 · 持仓 · 决策 · 回放 · 重做 · 实验 · 账户");
 
     await page.keyboard.press("Escape");
     await expect(sheet).toBeHidden();

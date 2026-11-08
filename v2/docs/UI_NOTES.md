@@ -88,6 +88,23 @@ padding, stacked controls), 560px (rail grid), 480px (compact type), 420px
   damaged catalogue (`total > 0`, nothing readable) instead of “还没有实验”.
   Partially damaged catalogues stay usable with a visible warning.
 
+## Paper account console (ADR 005)
+
+`#/account` (deep link `?account=<id>`) reads the account catalogue and one
+account's slots and orders. It is a fact viewer only: no create form, no order
+form, no valuation.
+
+- Header: initial capital, reserve and account cash (reserve + both slot cash).
+- Two slot cards: strategy label, weight, budget, cash, order count and the
+  positions derived from that slot's fills only.
+- Recent orders: time (China), slot, signal label, side, result and either the
+  fill (quantity, price, fees) or the rejection reason. Raw signal ids stay in
+  the cell tooltip.
+- Empty catalogue, missing account and fetch failures are distinct states; a
+  failed read never renders a different account.
+- The page only issues GETs. Everything shown is derived from the account spec
+  and the slot order ledgers; the reserve is never spent.
+
 ## Components
 
 - **KPI cards** state one fact each and never compute an implied return.
