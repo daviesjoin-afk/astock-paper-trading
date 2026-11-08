@@ -943,6 +943,63 @@ impl Store {
             detail: if signals_ok { "session orders equal frozen signals".into() } else { signals_detail.join("; ") },
         });
 
+        // 7. Rebalance chain: weights flow without gaps and always keep the
+        // reserve, and cash only moves between distinct slots.
+        let mut chain_statement = self.conn.prepare(
+            "SELECT from_slot,to_slot,amount_cents,weights_before_json,weights_after_json
+             FROM v2_paper_transfers WHERE account_id=? ORDER BY id",
+        )?;
+        let chain_rows = chain_statement.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut chain_ok = true;
+        let mut chain_detail = Vec::new();
+        let mut previous_after: Option<[i64; 2]> = None;
+        for row in chain_rows {
+            let (from_slot, to_slot, amount_cents, raw_before, raw_after) = row?;
+            let before: Vec<i64> = serde_json::from_str(&raw_before)?;
+            let after: Vec<i64> = serde_json::from_str(&raw_after)?;
+            if before.len() != 2 || after.len() != 2 {
+                chain_ok = false;
+                chain_detail.push("weights array is not length 2".into());
+                continue;
+            }
+            let before = [before[0], before[1]];
+            let after = [after[0], after[1]];
+            if let Some(previous) = previous_after {
+                if previous != before {
+                    chain_ok = false;
+                    chain_detail.push(format!("weights gap {previous:?} -> {before:?}"));
+                }
+            }
+            if after[0] + after[1] + spec.reserve_bps != 10_000 {
+                chain_ok = false;
+                chain_detail.push(format!("weights {after:?} do not keep the reserve"));
+            }
+            if amount_cents > 0 && from_slot == to_slot {
+                chain_ok = false;
+                chain_detail.push("transfer moves cash to the same slot".into());
+            }
+            previous_after = Some(after);
+        }
+        if let Some(last) = previous_after {
+            if last != weights {
+                chain_ok = false;
+                chain_detail.push(format!("last weights {last:?} != current {weights:?}"));
+            }
+        }
+        checks.push(PaperAuditCheck {
+            name: "rebalance_chain".into(),
+            ok: chain_ok,
+            detail: if chain_ok { "rebalance weights chain consistent".into() } else { chain_detail.join("; ") },
+        });
+
         let ok = checks.iter().all(|check| check.ok);
         let mut report = PaperAuditReport {
             account_id: account_id.into(),
@@ -1037,5 +1094,55 @@ impl Store {
             scores,
             policy,
         }))
+    }
+}
+// ---------------------------------------------------------------------------
+// Rebalance read model + audit chain check (ADR 009).
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn paper_rebalances(&self, account_id: &str) -> StoreResult<Vec<RebalanceRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT account_id,from_slot,to_slot,amount_cents,applied_at,note,digest,
+                    weights_before_json,weights_after_json
+             FROM v2_paper_transfers WHERE account_id=? ORDER BY id",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (from_slot, to_slot, amount_cents, applied_at, note, digest, before, after) = row?;
+            let weights_before: [i64; 2] = serde_json::from_str::<Vec<i64>>(&before)?
+                .try_into()
+                .map_err(|_| StoreError::Integrity("rebalance_weights_invalid".into()))?;
+            let weights_after: [i64; 2] = serde_json::from_str::<Vec<i64>>(&after)?
+                .try_into()
+                .map_err(|_| StoreError::Integrity("rebalance_weights_invalid".into()))?;
+            let mut record = RebalanceRecord {
+                account_id: account_id.into(),
+                from_slot,
+                to_slot,
+                amount_cents,
+                weights_before,
+                weights_after,
+                applied_at,
+                note,
+                proposal_digest: digest,
+                digest: String::new(),
+            };
+            record.digest = rebalance_digest(&record)?;
+            records.push(record);
+        }
+        Ok(records)
     }
 }

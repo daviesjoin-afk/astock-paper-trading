@@ -172,6 +172,14 @@ async fn apply_rebalance(
     )
 }
 
+async fn paper_rebalances(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_rebalances(&id).map_err(api_error)?)
+}
+
 async fn paper_account_audit(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -390,7 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/v2/paper-accounts/{account_id}/rebalances",
-            post(apply_rebalance),
+            post(apply_rebalance).get(paper_rebalances),
         )
         .route(
             "/v2/paper-accounts/{account_id}/allocation-proposal",

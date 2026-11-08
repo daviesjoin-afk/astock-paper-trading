@@ -2928,7 +2928,7 @@ fn account_audit_balances_and_detects_tampering() {
     let report = db.paper_account_audit("audit-acct").unwrap();
     assert!(report.ok, "checks: {:?}", report.checks);
     let names: Vec<&str> = report.checks.iter().map(|check| check.name.as_str()).collect();
-    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link", "session_signals"]);
+    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link", "session_signals", "rebalance_chain"]);
     assert_eq!(report.digest.len(), 64);
     assert_eq!(report, db.paper_account_audit("audit-acct").unwrap());
 
@@ -3269,4 +3269,24 @@ fn rebalance_moves_cash_between_slots_and_keeps_history() {
         ),
         Err(StoreError::Rules(RuleError(ref code))) if code == "rebalance_weights_must_keep_reserve"
     ));
+
+    // The read model exposes exactly what was applied.
+    let applied = db.paper_rebalances("rebalance-acct").unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].weights_after, [3_500, 5_500]);
+    assert_eq!(applied[0].digest.len(), 64);
+
+    // Tampering with the stored weight chain is caught by the audit.
+    db.conn
+        .execute(
+            "UPDATE v2_paper_transfers SET weights_after_json=? WHERE account_id='rebalance-acct'",
+            [serde_json::to_string(&vec![5_000, 4_000]).unwrap()],
+        )
+        .unwrap();
+    let tampered = db.paper_account_audit("rebalance-acct").unwrap();
+    assert!(!tampered.ok);
+    assert!(tampered
+        .checks
+        .iter()
+        .any(|check| check.name == "rebalance_chain" && !check.ok));
 }

@@ -1063,6 +1063,12 @@ type PaperValuationReport = {
   } | null;
 };
 
+type RebalanceRecord = {
+  account_id: string; from_slot: string; to_slot: string; amount_cents: number;
+  weights_before: [number, number]; weights_after: [number, number];
+  applied_at: string; note: string; proposal_digest: string; digest: string;
+};
+
 type EquitySeries = {
   status: string; trust: string; price_set_id: string;
   points: Array<{ day: string; cash_cents: number; market_value_cents: number; equity_cents: number }>;
@@ -1356,6 +1362,25 @@ const sessionAction = async (sessionId: string, action: string): Promise<void> =
   }
 };
 
+const renderRebalances = (records: RebalanceRecord[]): void => {
+  const block = testId<HTMLElement>("account-rebalances");
+  if (records.length === 0) {
+    toggle(block, false);
+    return;
+  }
+  toggle(block, true);
+  const list = testId<HTMLOListElement>("account-rebalance-list");
+  list.replaceChildren(...records.slice().reverse().map((record) => {
+    const item = document.createElement("li");
+    item.textContent =
+      `${record.from_slot}→${record.to_slot} ${money(record.amount_cents)} · ` +
+      `${(record.weights_before[0] / 100).toFixed(1)}%/${(record.weights_before[1] / 100).toFixed(1)}% → ` +
+      `${(record.weights_after[0] / 100).toFixed(1)}%/${(record.weights_after[1] / 100).toFixed(1)}% · ` +
+      `${record.applied_at.slice(0, 10)}`;
+    return item;
+  }));
+};
+
 const renderEquity = (series: EquitySeries | null): void => {
   const block = testId<HTMLElement>("account-equity");
   if (!series || series.status !== "valued") {
@@ -1486,6 +1511,15 @@ const loadAccount = async (accountId: string): Promise<void> => {
       if (currentAccountId === accountId) renderAudit(audit);
     } catch {
       if (currentAccountId === accountId) renderAudit(null);
+    }
+    try {
+      const rebalances = await api<RebalanceRecord[]>(
+        `/v2/paper-accounts/${encoded}/rebalances`,
+        new AbortController().signal,
+      );
+      if (currentAccountId === accountId) renderRebalances(Array.isArray(rebalances) ? rebalances : []);
+    } catch {
+      if (currentAccountId === accountId) renderRebalances([]);
     }
     const days = Array.from(new Set(
       orderList.map((order) => chinaDayOf(order.request.decision_at)).filter(Boolean),
