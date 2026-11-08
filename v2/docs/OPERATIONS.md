@@ -76,6 +76,14 @@ python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --day
 4. `GET /v2/price-sets` 核对 `price_set_id`、信任级别与摘要；
 5. 回到账户页确认估值由 `unavailable` 变为 `valued`；失败时按 `missing` 清单补数据。
 
+发布前可用覆盖报告核对缺口：
+
+```bash
+curl -fsS "http://127.0.0.1:8765/v2/price-sets/coverage?pack_id=cn-offline-fixture-pack-1&symbols=600000.SH,000001.SZ&days=2026-10-30,2026-11-02"
+```
+
+返回 `covered_pairs` 与 `missing[]`（只统计 `reviewed` 集合）；缺口不为空时不要指望估值/绩效可用。
+
 ## 备份与恢复
 
 ```bash

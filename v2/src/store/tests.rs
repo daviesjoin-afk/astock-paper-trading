@@ -3973,3 +3973,58 @@ fn price_set_days_lists_only_reviewed_covered_days() {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(only_synthetic);
 }
+
+#[test]
+fn coverage_report_lists_missing_pairs_and_ignores_synthetic() {
+    let dir = temp_price_dir("coverage-report");
+    let mut reviewed = price_set("reviewed", "2026-11-02", 1_200, MARKET_DATA_PACK_ID);
+    reviewed.coverage_start = "2026-10-30".into();
+    reviewed.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: "2026-10-30".into(),
+        price_cents: 1_300,
+        source: "offline-fixture".into(),
+        observed_at: "2026-10-30T15:00:00+08:00".into(),
+    });
+    std::fs::write(dir.join("reviewed.json"), serde_json::to_string(&reviewed).unwrap()).unwrap();
+    let mut synthetic = reviewed.clone();
+    synthetic.price_set_id = "synthetic-coverage".into();
+    synthetic.trust = "synthetic".into();
+    std::fs::write(dir.join("synthetic.json"), serde_json::to_string(&synthetic).unwrap()).unwrap();
+
+    let db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let symbols = vec!["600000.SH".to_string(), "000001.SZ".to_string()];
+    let days = vec!["2026-10-30".to_string(), "2026-11-02".to_string()];
+    let report = db
+        .price_set_coverage_in(&dir, MARKET_DATA_PACK_ID, &symbols, &days)
+        .unwrap();
+    assert_eq!(report.covered_pairs, 2);
+    assert_eq!(report.missing.len(), 2);
+    assert!(report.missing.iter().all(|missing| missing.symbol == "000001.SZ"));
+    assert_eq!(report.digest.len(), 64);
+    assert_eq!(
+        report,
+        db.price_set_coverage_in(&dir, MARKET_DATA_PACK_ID, &symbols, &days)
+            .unwrap()
+    );
+
+    let synthetic_only = temp_price_dir("coverage-synthetic");
+    std::fs::write(
+        synthetic_only.join("set.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    let empty = db
+        .price_set_coverage_in(&synthetic_only, MARKET_DATA_PACK_ID, &symbols, &days)
+        .unwrap();
+    assert_eq!(empty.covered_pairs, 0);
+    assert_eq!(empty.missing.len(), 4);
+
+    assert!(matches!(
+        db.price_set_coverage_in(&dir, MARKET_DATA_PACK_ID, &[], &days),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "empty_coverage_request"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(synthetic_only);
+}

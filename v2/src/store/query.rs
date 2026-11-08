@@ -1805,3 +1805,64 @@ impl Store {
         Ok(days.into_iter().collect())
     }
 }
+
+impl Store {
+    pub fn price_set_coverage(
+        &self,
+        pack_id: &str,
+        symbols: &[String],
+        days: &[String],
+    ) -> StoreResult<PriceCoverageReport> {
+        self.price_set_coverage_in(&price_sets_dir(), pack_id, symbols, days)
+    }
+
+    pub fn price_set_coverage_in(
+        &self,
+        dir: &std::path::Path,
+        pack_id: &str,
+        symbols: &[String],
+        days: &[String],
+    ) -> StoreResult<PriceCoverageReport> {
+        if symbols.is_empty() || days.is_empty() {
+            return Err(StoreError::Rules(RuleError("empty_coverage_request".into())));
+        }
+        let registry = load_price_sets(dir)?;
+        let mut covered = std::collections::BTreeSet::new();
+        for set in &registry.sets {
+            if set.trust != crate::domain::TRUST_REVIEWED || set.market_data_pack_id != pack_id {
+                continue;
+            }
+            for entry in &set.entries {
+                covered.insert((entry.symbol.clone(), entry.day.clone()));
+            }
+        }
+        let mut missing = Vec::new();
+        let mut covered_pairs = 0i64;
+        for symbol in symbols {
+            for day in days {
+                if covered.contains(&(symbol.clone(), day.clone())) {
+                    covered_pairs += 1;
+                } else {
+                    missing.push(MissingPrice {
+                        symbol: symbol.clone(),
+                        day: day.clone(),
+                    });
+                }
+            }
+        }
+        let mut report = PriceCoverageReport {
+            pack_id: pack_id.into(),
+            symbols: symbols.to_vec(),
+            days: days.to_vec(),
+            covered_pairs,
+            missing,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
+    }
+}

@@ -205,6 +205,23 @@ pub struct PerformanceReport {
     pub digest: String,
 }
 
+/// Which (symbol, day) pairs a reviewed price set still has to cover.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingPrice {
+    pub symbol: String,
+    pub day: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceCoverageReport {
+    pub pack_id: String,
+    pub symbols: Vec<String>,
+    pub days: Vec<String>,
+    pub covered_pairs: i64,
+    pub missing: Vec<MissingPrice>,
+    pub digest: String,
+}
+
 /// Session counts for one account, by lifecycle status.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCounts {
