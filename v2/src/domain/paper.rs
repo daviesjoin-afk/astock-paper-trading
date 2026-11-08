@@ -11,6 +11,7 @@ use crate::domain::{QuoteRef, RuleError, Signal, StrategyArtifact};
 
 pub const PAPER_ACCOUNT_SCHEMA_VERSION: u32 = 1;
 pub const PAPER_ORDER_SCHEMA_VERSION: u32 = 1;
+pub const PAPER_SESSION_SCHEMA_VERSION: u32 = 1;
 pub const PAPER_SLOT_COUNT: usize = 2;
 pub const TOTAL_BPS: i64 = 10_000;
 
@@ -180,6 +181,67 @@ impl PaperOrderRequest {
             || !key_valid(&self.quote_ref.quote_id)
         {
             return Err(RuleError("invalid_identity".into()));
+        }
+        Ok(())
+    }
+}
+
+/// One frozen signal the session will submit when its clock reaches it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperSessionSignal {
+    pub slot: PaperSlotId,
+    pub signal_id: String,
+    pub decision_at: String,
+    pub signal: Signal,
+    pub quote_ref: QuoteRef,
+}
+
+/// A deterministic paper session: explicit start instant plus an ordered,
+/// frozen signal list. The session never reads a machine clock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperSessionSpec {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub account_id: String,
+    pub start_at: String,
+    pub signals: Vec<PaperSessionSignal>,
+}
+
+impl PaperSessionSpec {
+    pub fn validate(&self) -> Result<(), RuleError> {
+        if self.schema_version != PAPER_SESSION_SCHEMA_VERSION {
+            return Err(RuleError("unsupported_paper_session_version".into()));
+        }
+        if !key_valid(&self.session_id) || !key_valid(&self.account_id) {
+            return Err(RuleError("invalid_session_identity".into()));
+        }
+        let start = chrono::DateTime::parse_from_rfc3339(&self.start_at)
+            .map_err(|_| RuleError("invalid_session_start".into()))?;
+        if self.signals.is_empty() {
+            return Err(RuleError("paper_session_requires_signals".into()));
+        }
+        let mut previous = start;
+        for signal in &self.signals {
+            if !key_valid(&signal.signal_id) {
+                return Err(RuleError("invalid_signal_id".into()));
+            }
+            if !key_valid(&signal.quote_ref.market_data_pack_id)
+                || !key_valid(&signal.quote_ref.source)
+                || !key_valid(&signal.quote_ref.quote_id)
+            {
+                return Err(RuleError("invalid_identity".into()));
+            }
+            let at = chrono::DateTime::parse_from_rfc3339(&signal.decision_at)
+                .map_err(|_| RuleError("invalid_decision_time".into()))?;
+            if at < start {
+                return Err(RuleError("paper_session_signal_before_start".into()));
+            }
+            if at < previous {
+                return Err(RuleError("paper_session_signals_must_be_ordered".into()));
+            }
+            previous = at;
         }
         Ok(())
     }

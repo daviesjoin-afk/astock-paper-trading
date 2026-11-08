@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 确定性模拟会话（ADR 005 第二阶段起步）：新增 `PaperSessionSpec`（显式 `start_at` + 冻结信号列表，必须按时间非降序且不早于起点）与状态机 `created → running ⇄ paused → stopped/completed`；`POST /v2/paper-sessions`、`GET /v2/paper-sessions/{id}`、`POST /v2/paper-sessions/{id}/{start|pause|resume|stop|step}`。`step` 每次只提交一笔槽位订单并把显式时钟推进到该决策时刻；暂停/停止/完成后拒绝成交；会话订单以 `session_id:signal_id` 作为幂等身份。Rust 测试 118 passed（新增 4 项：逐步时钟、暂停/继续/停止、双账户确定性、非法 spec）。schema v10 → v11（`v2_paper_sessions`）。
 - V2 模拟账户控制台（ADR 005 第三阶段）：新增 `GET /v2/paper-accounts` 目录与前端「模拟账户」视图（`#/account`，深链 `?account=`）——展示初始本金、准备金、账户现金、两槽位预算/现金/持仓/订单数，以及按槽位归属的最近订单（时间按中国时区、成交或拒绝原因逐条可回溯）；账户目录为空、账户不存在、读取失败为三种独立状态，页面只发 GET。夹具新增账户与一笔槽位 A 成交；浏览器测试 6 项（拆分展示、空目录、404、深链、只读、390px），axe 增加账户视图扫描。
 - V2 账户订单路径（ADR 005 第二阶段）：新增 `PaperOrderRequest` 与 `POST /v2/paper-accounts/{id}/orders`、`GET /v2/paper-accounts/{id}/orders`；决策复用 `domain::decide`，槽位独立重建 `PortfolioState`，槽位内 append-only + 幂等键（同请求 duplicate、异载荷冲突），证据缺失按规则拒绝且不改账本；账户视图的现金与持仓改为从槽位 fill 派生，现金守恒 `reserve + Σslot.cash = initial − 净流出` 由测试与冒烟双重断言。schema v9 → v10（新增 `v2_paper_orders` / `v2_paper_fills`）。Rust 114 passed；冒烟覆盖下单、守恒、幂等与订单列表。
 - V2 模拟总账户核心（ADR 005，第一阶段）：新增 `PaperAccountSpec` 纯域契约（A/B 两槽位、权重 basis points、显式 `created_at`、每槽独立的策略工件/数据包/执行规则）；整数分划分把除不尽的余数全部留给准备金，`reserve + Σ budget = initial` 恒成立；Store 新增 `v2_paper_accounts`（schema v9）与 `create_paper_account` / `paper_account`，同 spec 幂等、异 spec 冲突、重开文件视图不变；HTTP 新增 `POST /v2/paper-accounts`、`GET /v2/paper-accounts/{account_id}`（幂等/只读，不产生交易事实）。**schema v8 → v9，旧本地数据库需重建。** 成交、自动运行与前端留在后续 PR。
