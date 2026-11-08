@@ -378,6 +378,7 @@ conflicting = copy.deepcopy(paper_spec)
 conflicting["initial_cash_cents"] = 20_000_000
 call("paper-accounts", conflicting, expected=409)
 call("paper-accounts/does-not-exist", expected=404)
+assert call("paper-accounts/smoke-account/strategy-switches") == []
 # The directory now carries one published artifact; synthetic sets are listed
 # but never selected for a user-facing valuation.
 catalogue = call("price-sets")
@@ -533,7 +534,7 @@ assert audit["ok"] is True, audit
 assert [check["name"] for check in audit["checks"]] == [
     "budget_split", "fills_replay", "capital_conservation",
     "order_fill_link", "fill_matches_outcome", "session_link", "session_signals",
-    "rebalance_chain",
+    "rebalance_chain", "switch_chain",
 ]
 # No reviewed price set is bundled: the equity series refuses instead of guessing.
 # Allocation proposals need reviewed prices; synthetic data never drives them.
@@ -607,7 +608,7 @@ contended = call("paper-accounts/concurrency-account")
 assert contended["slots"][0]["orders_total"] == 1, contended["slots"][0]
 assert call("paper-accounts/concurrency-account/audit")["ok"] is True
 health = call("health")
-assert health["schema_version"] == 14 and health["writer"] == "store-single-writer", health
+assert health["schema_version"] == 15 and health["writer"] == "store-single-writer", health
 
 # Deterministic session clock: explicit start, two frozen signals, pause gates.
 session_spec = {
@@ -635,7 +636,7 @@ assert last_step["session"]["status"] == "completed" and last_step["session"]["c
 assert call("paper-sessions/smoke-session")["status"] == "completed"
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"

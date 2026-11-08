@@ -140,6 +140,31 @@ async fn price_set_coverage(
     )
 }
 
+#[derive(Deserialize)]
+struct SwitchQuery {
+    #[serde(default)]
+    slot: Option<String>,
+}
+
+async fn strategy_switches(
+    State(state): State<Shared>,
+    Path(account_id): Path<String>,
+    Query(query): Query<SwitchQuery>,
+) -> ApiResult {
+    let slot = match query.slot.as_deref() {
+        None => None,
+        Some("A") => Some(astock_v2::domain::PaperSlotId::A),
+        Some("B") => Some(astock_v2::domain::PaperSlotId::B),
+        Some(_) => {
+            return Err(api_error(astock_v2::store::StoreError::Rules(
+                astock_v2::domain::RuleError("unknown_paper_slot".into()),
+            )))
+        }
+    };
+    let db = state.lock().await;
+    response(db.strategy_switches(&account_id, slot).map_err(api_error)?)
+}
+
 async fn accounts_overview(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     response(db.accounts_overview().map_err(api_error)?)
@@ -751,6 +776,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
         .route("/v2/paper-accounts/overview", get(accounts_overview))
+        .route(
+            "/v2/paper-accounts/{account_id}/strategy-switches",
+            get(strategy_switches),
+        )
         .route("/v2/strategies", get(strategy_catalogue))
         .route("/v2/evolution/decisions", post(evolution_decision))
         .route("/v2/signal-diff", get(signal_diff))

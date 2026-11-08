@@ -1,6 +1,6 @@
 # ADR-018: 策略版本切换（设计）
 
-状态：提议（Proposed）｜日期：2026-11-08｜依赖：ADR-005、006、012
+状态：部分实现（schema v15 + 写入方法 + 只读端点；HTTP 写端点与随动校验待做）｜日期：2026-11-08｜依赖：ADR-005、006、012
 
 ## 背景
 
@@ -62,6 +62,14 @@
 - 晋级后自动切换（仍由人或外部调度显式调用）；
 - 同一槽位并行多版本（影子实验继续在实验域运行）；
 - 按版本拆分绩效归因（后续 ADR）。
+
+## 实现进度（schema v15）
+
+- 已建表 `v2_paper_slot_switches`（严格白名单）与 `Store::record_strategy_switch`：版本连续性、幂等、时间单调、理由必填、canonical 摘要；
+- 已暴露只读 `GET /v2/paper-accounts/{id}/strategy-switches?slot=`；
+- 账户视图新增 `current_strategy_version_id` 与 `switch_count`；
+- 审计新增 `switch_chain`（位于 `rebalance_chain` 之后）；
+- **尚未接线**：HTTP 写端点、会话创建/订单提交按“当前版本”校验、切换后新会话的版本绑定。
 
 ## 待解问题
 
