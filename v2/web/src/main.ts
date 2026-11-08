@@ -1370,7 +1370,10 @@ const renderSessionStatus = (sessions: PaperSessionView[]): void => {
   setText("status-sessions", `会话：运行 ${running} · 暂停 ${paused} · 完成 ${completed}`);
 };
 
+let accountSessions: PaperSessionView[] = [];
+
 const renderSessions = (sessions: PaperSessionView[]): void => {
+  accountSessions = sessions;
   renderSessionStatus(sessions);
   const container = byId("account-sessions");
   container.replaceChildren(...sessions.map(sessionCard));
@@ -1621,6 +1624,18 @@ const submitStrategySwitch = async (): Promise<void> => {
   if (!version || !at || !reason) {
     toggle(error, true);
     error.textContent = "请填写目标版本、生效时刻与理由";
+    return;
+  }
+  const atMillis = new Date(at).getTime();
+  const latestSession = accountSessions
+    .map((session) => Date.parse(session.clock_at))
+    .filter((value) => Number.isFinite(value))
+    .reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY);
+  if (Number.isFinite(latestSession) && atMillis <= latestSession) {
+    toggle(error, true);
+    error.textContent =
+      `生效时刻必须晚于最后一次会话（${new Date(latestSession).toISOString()}）；` +
+      "否则服务端会以 switch_precedes_session 拒绝";
     return;
   }
   try {

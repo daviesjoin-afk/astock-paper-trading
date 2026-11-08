@@ -307,6 +307,26 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("live-status")).toContainText("策略版本切换已记录");
   });
 
+  test("refuses a switch that precedes the last session", async ({ page }) => {
+    let posted = false;
+    await page.route(/\/v2\/paper-accounts\/.+\/strategy-switches/, (route) => {
+      if (route.request().method() === "POST") {
+        posted = true;
+        return route.fulfill({ json: {} });
+      }
+      return route.fulfill({ json: [] });
+    });
+    await page.goto(`/?cycle_id=${CYCLES.repro}&account=e2e-session-account`);
+    await page.getByTestId("nav-account").click();
+    await expect(page.getByTestId("status-sessions")).toContainText("运行 0", { timeout: 15_000 });
+    await page.getByTestId("switch-version").fill("research-momentum-v3");
+    await page.getByTestId("switch-at").fill("2026-10-01T09:00");
+    await page.getByTestId("switch-reason").fill("too early");
+    await page.getByTestId("switch-submit").click();
+    await expect(page.getByTestId("switch-error")).toContainText("生效时刻必须晚于最后一次会话");
+    expect(posted).toBe(false);
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();
