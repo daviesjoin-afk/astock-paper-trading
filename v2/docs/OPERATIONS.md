@@ -55,6 +55,14 @@ python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --day
 
 不足一个完整窗口、或 `--window-size` 非正数时退出码 2。
 
+第三种方式：直接用**已审核价格集合覆盖的交易日**生成窗口（无审核数据时无法建窗，退出码 2）：
+
+```bash
+python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --days-from-pack cn-offline-fixture-pack-1 --symbol 600000.SH --window-size 2
+```
+
+覆盖日由 `GET /v2/price-sets/days?pack_id=&symbol=` 提供，只统计 `reviewed` 集合。
+
 
 - 只推进 `running` 会话；暂停的会话保持暂停。
 - 返回 `{sessions, steps, filled, rejected}`，可直接作为调度日志。

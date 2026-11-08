@@ -93,6 +93,23 @@ async fn research_reproduction(State(state): State<Shared>, Path(id): Path<Strin
     response(db.verify_research_reproduction(&id).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct PriceDaysQuery {
+    pack_id: String,
+    symbol: String,
+}
+
+async fn price_set_days(
+    State(state): State<Shared>,
+    Query(query): Query<PriceDaysQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(
+        db.price_set_days(&query.pack_id, &query.symbol)
+            .map_err(api_error)?,
+    )
+}
+
 async fn accounts_overview(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     response(db.accounts_overview().map_err(api_error)?)
@@ -654,6 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v2/evolution/events/page", get(evolution_events_page))
         .route("/v2/price-sets", get(price_set_catalogue))
+        .route("/v2/price-sets/days", get(price_set_days))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
         .route(
             "/v2/paper-accounts/{account_id}/valuation",
