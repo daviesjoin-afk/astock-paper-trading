@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 导出离线校验：新增 `v2/scripts/verify_export.py`——按 canonical JSON（键排序、紧凑分隔）复算导出摘要并核对 `count`，退出码 0/1/2；`OPERATIONS.md` 增加复核命令；Python 研究套件 48 passed（+4）；冒烟用真实导出文件验证“可复核、篡改必失败”，同时交叉验证 Rust 与 Python 的 canonical 规则一致。
 - V2 进化事件导出：新增 `GET /v2/evolution/events/export`——复用候选/状态/关联实验/日期过滤，返回 `count/events[]/过滤回显/digest`（除 digest 外 canonical 摘要，上限 2000，只读）；`OPERATIONS.md` 增加归档命令，ADR-012 记录契约。Rust 151 passed（过滤/摘要稳定/空导出）；冒烟覆盖导出计数与空结果。
 - V2 服务端日期过滤：事件列表与分页新增 `from_day`/`to_day`（含端点、按 decided_at 中国日），以 `EvolutionQuery`/`EvolutionPageQuery` 结构承载，非法日期 422；前端日期输入改为服务端查询并随“加载更早”携带。Rust 150 passed（同日边界/起始/分页/非法日期）；浏览器 121 passed（日期请求参数断言）；冒烟覆盖 from/to/非法日期。
 - V2 事件日期过滤：进化视图新增起始/截止日期筛选——按事件决策时刻的**中国日**比较，与实验/候选/状态过滤可叠加；无匹配时显示“没有匹配的事件”。浏览器 121 passed（+1 日期过滤）；Rust 149 / Python 44 不变。

@@ -485,6 +485,20 @@ assert len(exported["digest"]) == 64, exported
 empty_export = call("evolution/events/export?candidate=missing")
 assert empty_export["count"] == 0 and empty_export["events"] == [], empty_export
 assert len(empty_export["digest"]) == 64, empty_export
+# Offline verification: the bundle digest must recompute, and tampering must fail.
+import subprocess, json as _json, os as _os
+from pathlib import Path as _P
+_bundle = _P(_os.environ.get("RUNNER_TEMP", "/tmp")) / "astock-export.json"
+_bundle.write_text(_json.dumps(exported), encoding="utf-8")
+_ok = subprocess.run([sys.executable, "scripts/verify_export.py", str(_bundle)],
+                     capture_output=True, text=True)
+assert _ok.returncode == 0 and "verified count=1" in _ok.stdout, (_ok.returncode, _ok.stdout, _ok.stderr)
+_tampered = dict(exported)
+_tampered["count"] = 99
+_bundle.write_text(_json.dumps(_tampered), encoding="utf-8")
+_bad = subprocess.run([sys.executable, "scripts/verify_export.py", str(_bundle)],
+                      capture_output=True, text=True)
+assert _bad.returncode == 1 and "INVALID" in _bad.stderr, (_bad.returncode, _bad.stdout, _bad.stderr)
 call("evolution/events?from_day=2026-13-01", expected=422)
 _segments = call("experiments/shadow-base-1/performance/segments?segments=2026-10-30;2026-11-02")
 assert len(_segments["segments"]) == 2, _segments
