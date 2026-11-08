@@ -281,6 +281,7 @@ const resetWorkspace = (): void => {
   toggle(testId("runs-empty-state"), true);
   toggle(testId("positions-error"), false);
   toggle(testId("runs-error"), false);
+  for (const kind of VERIFY_KINDS) invalidateVerification(kind);
   setVerify("replay", "idle", "未验证", "");
   setVerify("reproduction", "idle", "未验证", "");
   asofDay = null;
@@ -486,12 +487,17 @@ const renderRuns = (runs: Run[]): void => {
   paintRuns();
 };
 
+type VerifyState = "idle" | "running" | "ok" | "fail" | "stale";
+const VERIFY_KINDS: VerifyKind[] = ["replay", "reproduction"];
+const verifyState: Record<VerifyKind, VerifyState> = { replay: "idle", reproduction: "idle" };
+
 const setVerify = (
   kind: VerifyKind,
-  state: "idle" | "running" | "ok" | "fail" | "stale",
+  state: VerifyState,
   message: string,
   detail: string,
 ): void => {
+  verifyState[kind] = state;
   const status = testId(`${kind}-status`);
   status.dataset.state = state;
   status.textContent = message;
@@ -502,6 +508,30 @@ const setVerify = (
     mirror.dataset.state = state;
     mirror.textContent = message;
   }
+};
+
+const verifyButton = (kind: VerifyKind): HTMLButtonElement => testId(`verify-${kind}`);
+
+/** A notice taking over the screen must not leave a check stuck on "running". */
+const settleInterruptedVerifications = (): void => {
+  for (const kind of VERIFY_KINDS) {
+    if (verifyState[kind] !== "running") continue;
+    invalidateVerification(kind);
+    setVerify(kind, "idle", "未验证", "");
+  }
+};
+
+/**
+ * Cancel whatever check is in flight for this kind and hand the control back.
+ * The sequence bump makes any late answer inert; the button/aria state is owned
+ * here so a reload or experiment switch can never leave a control locked.
+ */
+const invalidateVerification = (kind: VerifyKind): void => {
+  verifySeq[kind] += 1;
+  verifiedEpoch[kind] = -1;
+  const button = verifyButton(kind);
+  button.disabled = false;
+  button.removeAttribute("aria-busy");
 };
 
 // ---------------------------------------------------------------------------
@@ -563,6 +593,10 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
   cycleController = controller;
   currentCycle = cycle;
   asofSequence++;
+  // Snapshot the outgoing verification state, then stop in-flight checks so the
+  // buttons are usable again even if a late answer never lands on this screen.
+  const previousVerify: Record<VerifyKind, VerifyState> = { ...verifyState };
+  for (const kind of VERIFY_KINDS) invalidateVerification(kind);
   if (!rendered) showOnly("loading");
   if (!options.keepContent) resetWorkspace();
   setBusy(true);
@@ -586,14 +620,17 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
     const error = detail.reason;
     if (error instanceof ApiError && error.status === 404) {
       byId("unknown-cycle").textContent = cycle;
+      settleInterruptedVerifications();
       showOnly("unknown");
       announce("实验不存在");
       return;
     }
+    settleInterruptedVerifications();
     showListFailure(`读取实验失败：${errorDetail(error)}`);
     return;
   }
   if (detail.value.spec.cycle_id !== cycle) {
+    settleInterruptedVerifications();
     showListFailure(`读取实验失败：返回的实验与请求不一致（${detail.value.spec.cycle_id}）`);
     return;
   }
@@ -623,10 +660,13 @@ const loadCycle = async (cycle: string, options: { keepContent?: boolean } = {})
 
   // A fresh snapshot invalidates earlier verification results.
   dataEpoch += 1;
-  for (const kind of ["replay", "reproduction"] as VerifyKind[]) {
-    verifySeq[kind] += 1;
-    if (verifiedEpoch[kind] !== -1) {
-      verifiedEpoch[kind] = -1;
+  for (const kind of VERIFY_KINDS) {
+    if (verifyState[kind] === "running") {
+      // A check started while the reload was in flight can never describe this
+      // snapshot; stop it and ask for a re-run.
+      invalidateVerification(kind);
+      setVerify(kind, "stale", "需要重新验证", "实验数据已重新载入，请重新运行校验");
+    } else if (options.keepContent && previousVerify[kind] !== "idle") {
       setVerify(kind, "stale", "需要重新验证", "实验数据已重新载入，请重新运行校验");
     }
   }
@@ -782,8 +822,8 @@ const runVerification = async (kind: VerifyKind): Promise<void> => {
   const label = kind === "replay" ? "回放" : "研究重做";
   const seq = ++verifySeq[kind];
   const epoch = dataEpoch;
-  button.disabled = true;
-  button.setAttribute("aria-busy", "true");
+  verifyButton(kind).disabled = true;
+  verifyButton(kind).setAttribute("aria-busy", "true");
   setVerify(kind, "running", "进行中…", "");
   announce(`${label}开始`);
   const encoded = encodeURIComponent(cycle);
@@ -833,8 +873,12 @@ const runVerification = async (kind: VerifyKind): Promise<void> => {
     announce(`${label}失败`);
   } finally {
     if (seq === verifySeq[kind] && cycle === currentCycle) {
-      button.disabled = false;
-      button.removeAttribute("aria-busy");
+      verifyButton(kind).disabled = false;
+      verifyButton(kind).removeAttribute("aria-busy");
+      if (verifyState[kind] === "running") {
+        // The answer belonged to another data epoch and was dropped.
+        setVerify(kind, "idle", "未验证", "");
+      }
     }
   }
 };

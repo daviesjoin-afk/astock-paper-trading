@@ -78,6 +78,10 @@ padding, stacked controls), 560px (rail grid), 480px (compact type), 420px
   passes as `stale` (“需要重新验证”), and every check carries its own request
   sequence, so a late answer for another experiment cannot repaint the screen.
   `ok !== true` is a failure, and the report's `cycle_id` must match.
+- Verification controls have their own lifecycle: a reload, experiment switch or
+  notice invalidates the in-flight check (`invalidateVerification`), which bumps
+  the sequence, clears `aria-busy` and re-enables the button immediately. A late
+  answer can therefore neither repaint nor leave a control disabled.
 - The catalogue asks for the API maximum (`limit=500`). When a `cycle_id` is not
   in that window the UI probes `GET /v2/experiments/{id}` before deciding it is
   missing, distinguishes “not listed” from “does not exist”, and reports a

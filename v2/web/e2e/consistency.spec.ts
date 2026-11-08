@@ -283,3 +283,115 @@ test.describe("auditability of visible facts", () => {
     expect(copied).toContain("数据包标识: cn-offline-fixture-pack-1");
   });
 });
+
+test.describe("verification control lifecycle", () => {
+  test("a refresh mid-verification re-enables the button and keeps the newest result", async ({ page }) => {
+    let calls = 0;
+    await page.route("**/v2/replay?*", async (route) => {
+      calls += 1;
+      const round = calls;
+      await new Promise((resolve) => setTimeout(resolve, round === 1 ? 1_200 : 120));
+      try {
+        await route.fulfill({
+          json: {
+            cycle_id: CYCLES.holdings,
+            ok: true,
+            runs_verified: round,
+            fills_verified: round,
+            cash_cents: 9_093_000,
+          },
+        });
+      } catch {
+        // Aborted along with the page navigation.
+      }
+    });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("nav-replay").click();
+    await page.getByTestId("verify-replay").click();
+    await expect(page.getByTestId("verify-replay")).toBeDisabled();
+
+    await page.getByTestId("refresh").click();
+    await expect(page.getByTestId("verify-replay")).toBeEnabled({ timeout: 10_000 });
+    await expect(page.getByTestId("verify-replay")).not.toHaveAttribute("aria-busy", "true");
+
+    await page.getByTestId("verify-replay").click();
+    await expect(page.getByTestId("replay-status")).toContainText("通过（2 次决策", { timeout: 10_000 });
+    await page.waitForTimeout(1_500);
+    await expect(page.getByTestId("replay-status")).toContainText("通过（2 次决策");
+  });
+
+  test("switching experiments frees both controls for the new experiment", async ({ page }) => {
+    await page.route("**/v2/experiments/e2e-holdings/research-reproduction", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      try {
+        await route.fulfill({
+          json: { cycle_id: CYCLES.holdings, ok: true, signals_verified: 2 },
+        });
+      } catch {
+        // Aborted.
+      }
+    });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("nav-reproduction").click();
+    await page.getByTestId("verify-reproduction").click();
+    await expect(page.getByTestId("verify-reproduction")).toBeDisabled();
+
+    await page.getByTestId("experiment-select").selectOption(CYCLES.flat);
+    await expect(page.locator("#context-cycle")).toHaveText(CYCLES.flat);
+    await expect(page.getByTestId("verify-reproduction")).toBeEnabled({ timeout: 10_000 });
+    await expect(page.getByTestId("verify-replay")).toBeEnabled();
+
+    await page.getByTestId("verify-reproduction").click();
+    await expect(page.getByTestId("reproduction-status")).toContainText("通过", { timeout: 10_000 });
+  });
+
+  test("the two checks never lock each other", async ({ page }) => {
+    await page.route("**/v2/replay?*", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      try {
+        await route.fulfill({
+          json: { cycle_id: CYCLES.holdings, ok: true, runs_verified: 1, fills_verified: 1, cash_cents: 9_093_000 },
+        });
+      } catch {
+        // Aborted.
+      }
+    });
+    await page.goto(`/?cycle_id=${CYCLES.repro}`);
+    await page.getByTestId("nav-replay").click();
+    await page.getByTestId("verify-replay").click();
+    await expect(page.getByTestId("verify-replay")).toBeDisabled();
+    await page.getByTestId("nav-reproduction").click();
+    await expect(page.getByTestId("verify-reproduction")).toBeEnabled();
+    await page.getByTestId("verify-reproduction").click();
+    await expect(page.getByTestId("reproduction-status")).toContainText("通过", { timeout: 10_000 });
+  });
+
+  test("a failed check recovers its button and can be retried", async ({ page }) => {
+    let calls = 0;
+    await page.route("**/v2/replay?*", async (route) => {
+      calls += 1;
+      const round = calls;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      try {
+        if (round === 1) {
+          await route.fulfill({ status: 500, json: { error: "storage_error" } });
+        } else {
+          await route.fulfill({
+            json: { cycle_id: CYCLES.holdings, ok: true, runs_verified: 1, fills_verified: 1, cash_cents: 9_093_000 },
+          });
+        }
+      } catch {
+        // Aborted.
+      }
+    });
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("nav-replay").click();
+    await page.getByTestId("verify-replay").click();
+    await expect(page.getByTestId("replay-status")).toContainText("失败", { timeout: 10_000 });
+    await expect(page.getByTestId("verify-replay")).toBeEnabled();
+    await expect(page.getByTestId("verify-replay")).not.toHaveAttribute("aria-busy", "true");
+
+    await page.getByTestId("verify-replay").click();
+    await expect(page.getByTestId("replay-status")).toContainText("通过", { timeout: 10_000 });
+  });
+});
