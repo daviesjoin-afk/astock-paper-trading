@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 动态资金提案（ADR 008）：新增纯域 `AllocationPolicy` / `SlotScore` / `propose_allocation()`——按槽位独立重放成交并用审核价格集合盯市，计算 `return_bps`、`drawdown_bps`、`score_bps`（相对最差槽位归一），在 `min/max`、准备金下限、单次步长、`min_days` 约束下生成目标权重与逐槽理由；证据不足保持原权重（`insufficient_evidence`），从不输出越界或突破准备金的方案。新增 `Store::paper_allocation_proposal()` 与 `GET /v2/paper-accounts/{id}/allocation-proposal?days=`；无审核集合返回 `unavailable`，交易日 < 2 拒绝。**只读提案，不执行划拨**。Rust 131 passed（评分/边界/步长/证据不足/合成拒绝）；浏览器 100 passed（无 UI 变更）；冒烟覆盖不可用路径。
 - V2 价格集合端到端与净值 UI（ADR 006/007）：冒烟改为 CSV → `make_price_set.py` → `ASTOCK_PRICE_SETS_DIR` → `/v2/price-sets` 全链路（合成集合可列出、但估值仍拒绝），并把目录纳入重启一致性流程；账户页新增“净值序列”区块——仅在覆盖齐全时展示每日权益、最大回撤与盈亏（合成集合不显示盈亏），无覆盖时隐藏。Rust 130 passed；浏览器 100 passed（stub 审核序列展示）；冒烟通过（目录 1 条、重启后一致）。
 - V2 价格集合离线生成器（ADR 006）：新增 `v2/research/make_price_set.py`（stdlib-only）——CSV（symbol/day/price/source/observed_at）→ 审核工件 JSON：元转整数分、拒绝三位小数、拒绝重复 `(symbol, day)`、校验覆盖区间与声明标的、按规范行计算 `source_digest`；`--days` 生成缺口报告，有缺口默认退出码 3 且不写文件（`--allow-gaps` 才写）。新增 7 项 Python 测试并接入既有 `unittest discover`；数据目录 README 增加生成用法。
 - V2 价格集合运行时目录（ADR 006）：移除编译期空注册表，改为只读加载 `data/price-sets/*.json`（`ASTOCK_PRICE_SETS_DIR` 可覆盖）；缺失目录视为“暂无审核数据”，文件损坏/重复 id 直接报错不跳过；新增 `v2/data/price-sets/README.md` 定义工件格式与审核清单（来源、覆盖、复权、停牌、摘要、版本）。目录仍为空，HTTP 估值/净值保持 `unavailable`。Rust 130 passed（目录加载、合成集合不被选中、重复 id、损坏文件、缺失目录）；浏览器 99 passed；冒烟断言目录为空时目录接口返回 `[]`。

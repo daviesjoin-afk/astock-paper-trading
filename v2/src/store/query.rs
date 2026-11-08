@@ -954,3 +954,84 @@ impl Store {
         Ok(report)
     }
 }
+// ---------------------------------------------------------------------------
+// Capital allocation proposal: per-slot equity from reviewed prices -> scores
+// -> bounded, explainable target weights. Read-only; nothing is applied.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    fn slot_fills(&self, account_id: &str, slot: &str) -> StoreResult<Vec<Fill>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.fill_json FROM v2_paper_fills f
+             JOIN v2_paper_orders o ON o.id=f.order_id
+             WHERE o.account_id=? AND o.slot=? ORDER BY o.id",
+        )?;
+        let rows = statement.query_map(params![account_id, slot], |row| row.get::<_, String>(0))?;
+        let mut fills = Vec::new();
+        for row in rows {
+            fills.push(serde_json::from_str::<Fill>(&row?)?);
+        }
+        Ok(fills)
+    }
+
+    pub fn paper_allocation_proposal(
+        &self,
+        account_id: &str,
+        days: &[String],
+        dir: &std::path::Path,
+    ) -> StoreResult<Option<AllocationReport>> {
+        if days.len() < 2 {
+            return Err(StoreError::Rules(RuleError("allocation_requires_two_days".into())));
+        }
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate().map_err(StoreError::Rules)?;
+        let pack = spec.slots[0].market_data_pack_id.clone();
+        if spec.slots.iter().any(|slot| slot.market_data_pack_id != pack) {
+            return Err(StoreError::Rules(RuleError("valuation_mixed_packs".into())));
+        }
+        let registry = load_price_sets(dir)?;
+        let Some(set) = registry.select_covering(&pack, &days[0], &days[days.len() - 1]) else {
+            return Ok(None);
+        };
+
+        let mut scores = Vec::new();
+        for (index, slot) in spec.slots.iter().enumerate() {
+            let budget = split.slot_budgets[index].max(1);
+            let fills = self.slot_fills(account_id, slot.slot.as_str())?;
+            let series = crate::domain::equity_series(budget, &fills, set, days, &pack)
+                .map_err(StoreError::Rules)?;
+            let last = series.points.last().map(|point| point.equity_cents).unwrap_or(budget);
+            let return_bps = (last - budget) * 10_000 / budget;
+            let drawdown_bps = series.max_drawdown_cents * 10_000 / budget;
+            scores.push(crate::domain::SlotScore {
+                slot: slot.slot.as_str().into(),
+                return_bps,
+                drawdown_bps,
+                score_bps: return_bps - drawdown_bps,
+                days: series.points.len(),
+            });
+        }
+        let policy = crate::domain::AllocationPolicy::default();
+        let proposal = crate::domain::propose_allocation(
+            spec.slots[0].weight_bps,
+            spec.slots[1].weight_bps,
+            &scores,
+            &policy,
+        )
+        .map_err(StoreError::Rules)?;
+        Ok(Some(AllocationReport {
+            proposal,
+            scores,
+            policy,
+        }))
+    }
+}

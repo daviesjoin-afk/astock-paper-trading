@@ -152,6 +152,14 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// Allocation proposal plus the scores it was derived from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationReport {
+    pub proposal: crate::domain::AllocationProposal,
+    pub scores: Vec<crate::domain::SlotScore>,
+    pub policy: crate::domain::AllocationPolicy,
+}
+
 /// One invariant check in an account audit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperAuditCheck {

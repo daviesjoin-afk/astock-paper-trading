@@ -3078,3 +3078,98 @@ fn price_sets_load_from_a_directory_and_refuse_bad_artifacts() {
         let _ = std::fs::remove_dir_all(path);
     }
 }
+
+#[test]
+fn allocation_proposal_scores_slots_and_respects_bounds() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("alloc-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("alloc-acct", PaperSlotId::A, buy)).unwrap();
+    let day1 = order.outcome.fill.expect("filled").trade_day;
+    let day2 = "2026-11-02".to_string();
+
+    let mut set = price_set("reviewed", &day1, 1_300, MARKET_DATA_PACK_ID);
+    set.coverage_end = day2.clone();
+    set.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: day2.clone(),
+        price_cents: 1_200,
+        source: "offline-fixture".into(),
+        observed_at: format!("{day2}T15:00:00+08:00"),
+    });
+    let dir = temp_price_dir("alloc");
+    std::fs::write(dir.join("set.json"), serde_json::to_string(&set).unwrap()).unwrap();
+
+    let report = db
+        .paper_allocation_proposal("alloc-acct", &[day1.clone(), day2.clone()], &dir)
+        .unwrap()
+        .expect("reviewed set covers both days");
+    assert_eq!(report.proposal.status, "proposed");
+    assert_eq!(report.scores.len(), 2);
+    assert_eq!(report.scores[0].slot, "A");
+    assert_eq!(report.scores[0].days, 2);
+    assert!(report.scores[0].return_bps < 0, "{:?}", report.scores[0]);
+    assert_eq!(report.scores[1].return_bps, 0);
+
+    let targets: i64 = report
+        .proposal
+        .rationale
+        .iter()
+        .map(|item| item.target_bps)
+        .sum();
+    assert_eq!(targets + report.proposal.reserve_bps, 10_000);
+    for item in &report.proposal.rationale {
+        assert!((1_500..=6_000).contains(&item.target_bps), "{:?}", item);
+        if item.slot == "A" {
+            assert!(item.target_bps < 4_500);
+        } else {
+            assert!(item.target_bps > 4_500);
+        }
+    }
+    assert!(report.proposal.reserve_bps >= 1_000);
+    assert_eq!(report.proposal.digest.len(), 64);
+
+    // Too few observations keeps the current weights instead of guessing.
+    let policy = crate::domain::AllocationPolicy::default();
+    let thin = crate::domain::propose_allocation(
+        4_500,
+        4_500,
+        &[
+            crate::domain::SlotScore {
+                slot: "A".into(), return_bps: 900, drawdown_bps: 0, score_bps: 900, days: 1,
+            },
+            crate::domain::SlotScore {
+                slot: "B".into(), return_bps: 0, drawdown_bps: 0, score_bps: 0, days: 1,
+            },
+        ],
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(thin.status, "insufficient_evidence");
+    assert!(thin.rationale.iter().all(|item| item.target_bps == 4_500));
+
+    // A single requested day cannot support an allocation.
+    assert!(matches!(
+        db.paper_allocation_proposal("alloc-acct", &[day1.clone()], &dir),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "allocation_requires_two_days"
+    ));
+
+    // Synthetic data never drives an allocation.
+    let synthetic_dir = temp_price_dir("alloc-synthetic");
+    let mut synthetic = set.clone();
+    synthetic.trust = "synthetic".into();
+    std::fs::write(
+        synthetic_dir.join("set.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    assert!(db
+        .paper_allocation_proposal("alloc-acct", &[day1, day2], &synthetic_dir)
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(synthetic_dir);
+}
