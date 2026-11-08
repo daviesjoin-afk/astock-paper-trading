@@ -479,6 +479,12 @@ assert len(reverted) == 1 and reverted[0]["event_id"] == "smoke-evo-2", reverted
 assert call("evolution/events?from_day=2026-11-06")[0]["event_id"] == "smoke-evo-2"
 assert call("evolution/events?to_day=2026-11-05")[0]["event_id"] == "smoke-evo-1"
 assert call("evolution/events?from_day=2026-11-07") == []
+exported = call("evolution/events/export?to_day=2026-11-05")
+assert exported["count"] == 1 and exported["events"][0]["event_id"] == "smoke-evo-1", exported
+assert len(exported["digest"]) == 64, exported
+empty_export = call("evolution/events/export?candidate=missing")
+assert empty_export["count"] == 0 and empty_export["events"] == [], empty_export
+assert len(empty_export["digest"]) == 64, empty_export
 call("evolution/events?from_day=2026-13-01", expected=422)
 _segments = call("experiments/shadow-base-1/performance/segments?segments=2026-10-30;2026-11-02")
 assert len(_segments["segments"]) == 2, _segments

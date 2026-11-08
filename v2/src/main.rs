@@ -342,6 +342,25 @@ struct EvolutionPageQuery {
     to_day: Option<String>,
 }
 
+async fn evolution_export(
+    State(state): State<Shared>,
+    Query(query): Query<EvolutionListQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(
+        db.evolution_export(astock_v2::store::EvolutionQuery {
+            limit: 2_000,
+            candidate_id: query.candidate.as_deref(),
+            status: query.status.as_deref(),
+            base_cycle: query.base_cycle.as_deref(),
+            candidate_cycle: query.candidate_cycle.as_deref(),
+            from_day: query.from_day.as_deref(),
+            to_day: query.to_day.as_deref(),
+        })
+        .map_err(api_error)?,
+    )
+}
+
 async fn evolution_events_page(
     State(state): State<Shared>,
     Query(query): Query<EvolutionPageQuery>,
@@ -740,6 +759,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(record_evolution_event).get(evolution_events),
         )
         .route("/v2/evolution/events/page", get(evolution_events_page))
+        .route("/v2/evolution/events/export", get(evolution_export))
         .route("/v2/price-sets", get(price_set_catalogue))
         .route("/v2/price-sets/days", get(price_set_days))
         .route("/v2/price-sets/coverage", get(price_set_coverage))

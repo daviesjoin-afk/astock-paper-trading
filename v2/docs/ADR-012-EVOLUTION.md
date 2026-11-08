@@ -78,6 +78,10 @@ python scripts/shadow_candidates.py --artifact cands/X.artifact.json   --output 
 
 `POST /v2/evolution/events` 可带 `base_cycle` / `candidate_cycle`（均可选），事件因此能指向产生指标的实验；`GET` 列表与分页均返回这两个字段，进化视图显示“基准 … · 候选 …”。schema v14。
 
+## 审计导出（已实现）
+
+`GET /v2/evolution/events/export` 复用事件过滤（候选/状态/关联实验/日期），返回 `count`、`events[]`、过滤条件回显与 `digest`（对除 digest 外内容做 canonical 摘要）。上限 2000 条，只读，不写库；同一过滤重放得到同一 digest。
+
 ## 回退演练（已覆盖）
 
 冒烟在合成指标上走完“晋级 → 风险恶化 → 回退”：

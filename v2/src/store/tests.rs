@@ -4184,3 +4184,48 @@ fn evolution_events_filter_by_china_day_range() {
         Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_day"
     ));
 }
+
+#[test]
+fn evolution_export_bundles_filtered_events_with_a_digest() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let make = |id: &str, status: &str| crate::domain::EvolutionDecision {
+        candidate_id: id.into(),
+        status: status.into(),
+        reasons: vec!["依据".into()],
+        digest: "a".repeat(64),
+    };
+    db.record_evolution_event("keep-1", "2026-11-05T10:00:00+08:00", make("c1", "kept")).unwrap();
+    db.record_evolution_event("promo-1", "2026-11-06T10:00:00+08:00", make("c2", "promoted")).unwrap();
+
+    let all = db.evolution_export(crate::store::EvolutionQuery { limit: 2_000, ..Default::default() }).unwrap();
+    assert_eq!(all.count, 2);
+    assert_eq!(all.schema_version, 1);
+    assert_eq!(all.digest.len(), 64);
+    assert!(all.candidate_id.is_none());
+
+    let only_promoted = db
+        .evolution_export(crate::store::EvolutionQuery {
+            limit: 2_000,
+            status: Some("promoted"),
+            from_day: Some("2026-11-06"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(only_promoted.count, 1);
+    assert_eq!(only_promoted.events[0].event_id, "promo-1");
+    assert_eq!(only_promoted.status.as_deref(), Some("promoted"));
+    assert_eq!(only_promoted.from_day.as_deref(), Some("2026-11-06"));
+    assert_eq!(only_promoted.digest.len(), 64);
+    assert_ne!(all.digest, only_promoted.digest);
+
+    let empty = db
+        .evolution_export(crate::store::EvolutionQuery {
+            limit: 2_000,
+            from_day: Some("2026-12-01"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(empty.count, 0);
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.digest.len(), 64);
+}

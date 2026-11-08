@@ -254,6 +254,19 @@ pub struct AccountOverview {
     pub audit_ok: bool,
 }
 
+/// Auditable snapshot of a filtered slice of the evolution log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolutionExport {
+    pub schema_version: u32,
+    pub candidate_id: Option<String>,
+    pub status: Option<String>,
+    pub from_day: Option<String>,
+    pub to_day: Option<String>,
+    pub count: i64,
+    pub events: Vec<EvolutionEventRecord>,
+    pub digest: String,
+}
+
 /// Query options for the evolution event log (all filters optional).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EvolutionQuery<'a> {
