@@ -478,6 +478,8 @@ assert [check["name"] for check in audit["checks"]] == [
 # Allocation proposals need reviewed prices; synthetic data never drives them.
 allocation = call("paper-accounts/smoke-account/allocation-proposal?days=2026-10-30,2026-11-02")
 assert allocation["status"] == "unavailable" and allocation["reason"] == "no_reviewed_price_set", allocation
+perf = call("paper-accounts/smoke-account/performance?days=2026-10-30,2026-11-02")
+assert perf["status"] == "unavailable" and perf["reason"] == "no_reviewed_price_set", perf
 series = call("paper-accounts/smoke-account/equity-series?days=2026-10-30")
 assert series["status"] == "unavailable" and series["reason"] == "no_reviewed_price_set", series
 call("paper-accounts/smoke-account/equity-series?days=", expected=422)

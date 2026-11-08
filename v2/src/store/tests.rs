@@ -3703,3 +3703,79 @@ fn evolution_pages_use_timestamp_and_id_cursor() {
         Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_cursor"
     ));
 }
+
+#[test]
+fn performance_requires_complete_reviewed_coverage() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("perf-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("perf-acct", PaperSlotId::A, buy)).unwrap();
+    let fill = order.outcome.fill.expect("filled");
+    let day1 = fill.trade_day.clone();
+    let day2 = "2026-11-02".to_string();
+
+    let mut set = price_set("reviewed", &day1, 1_300, MARKET_DATA_PACK_ID);
+    set.coverage_end = day2.clone();
+    set.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: day2.clone(),
+        price_cents: 1_200,
+        source: "offline-fixture".into(),
+        observed_at: format!("{day2}T15:00:00+08:00"),
+    });
+    let dir = temp_price_dir("perf");
+    std::fs::write(dir.join("set.json"), serde_json::to_string(&set).unwrap()).unwrap();
+
+    let report = db
+        .paper_performance("perf-acct", &[day1.clone(), day2.clone()], &dir)
+        .unwrap()
+        .expect("reviewed coverage");
+    let series = db
+        .paper_equity_series_with_registry(
+            "perf-acct",
+            &[day1.clone(), day2.clone()],
+            &crate::domain::PriceSetRegistry { schema_version: 1, sets: vec![set.clone()] },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.days, 2);
+    assert_eq!(report.start_equity_cents, series.points[0].equity_cents);
+    assert_eq!(report.end_equity_cents, series.points[1].equity_cents);
+    assert_eq!(report.profit_cents, report.end_equity_cents - 10_000_000);
+    assert_eq!(report.return_bps, report.profit_cents * 10_000 / 10_000_000);
+    assert_eq!(report.fees_cents, fill.fees_cents);
+    assert_eq!(report.trades, 1);
+    let peak = series.points.iter().map(|point| point.equity_cents).max().unwrap();
+    assert_eq!(report.drawdown_bps, series.max_drawdown_cents * 10_000 / peak);
+    assert_eq!(report.max_drawdown_day.as_deref(), Some(day2.as_str()));
+    assert_eq!(report.digest.len(), 64);
+    assert_eq!(
+        report,
+        db.paper_performance("perf-acct", &[day1.clone(), day2.clone()], &dir)
+            .unwrap()
+            .unwrap()
+    );
+
+    // Synthetic or missing coverage yields no performance number at all.
+    let synthetic_dir = temp_price_dir("perf-synthetic");
+    let mut synthetic = set.clone();
+    synthetic.trust = "synthetic".into();
+    std::fs::write(
+        synthetic_dir.join("set.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    assert!(db
+        .paper_performance("perf-acct", &[day1.clone(), day2.clone()], &synthetic_dir)
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.paper_performance("perf-acct", &[], &dir),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "empty_equity_series"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(synthetic_dir);
+}

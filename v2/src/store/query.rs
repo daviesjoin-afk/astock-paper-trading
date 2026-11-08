@@ -1522,3 +1522,61 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// Performance summary derived from a complete, reviewed equity series.
+    /// Missing coverage means no performance at all - never a partial number.
+    pub fn paper_performance(
+        &self,
+        account_id: &str,
+        days: &[String],
+        dir: &std::path::Path,
+    ) -> StoreResult<Option<PerformanceReport>> {
+        let Some(series) = self.paper_equity_series_in(account_id, days, dir)? else {
+            return Ok(None);
+        };
+        let points = series.points;
+        let first = points.first().map(|point| point.equity_cents).unwrap_or(0);
+        let last = points.last().map(|point| point.equity_cents).unwrap_or(0);
+        let (_, initial_cash_cents, _) = self.account_pack(account_id)?;
+        let fills = self.account_fills(account_id)?;
+        let fees_cents = fills.iter().map(|fill| fill.fees_cents).sum();
+        let profit_cents = last - initial_cash_cents;
+        let return_bps = if initial_cash_cents > 0 {
+            profit_cents * 10_000 / initial_cash_cents
+        } else {
+            0
+        };
+        let peak = points
+            .iter()
+            .map(|point| point.equity_cents)
+            .max()
+            .unwrap_or(initial_cash_cents);
+        let drawdown_bps = if peak > 0 {
+            series.max_drawdown_cents * 10_000 / peak
+        } else {
+            0
+        };
+        let mut report = PerformanceReport {
+            account_id: account_id.into(),
+            days: points.len(),
+            start_equity_cents: first,
+            end_equity_cents: last,
+            profit_cents,
+            return_bps,
+            max_drawdown_cents: series.max_drawdown_cents,
+            max_drawdown_day: series.max_drawdown_day,
+            drawdown_bps,
+            fees_cents,
+            trades: fills.len(),
+            price_set_id: series.price_set_id,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(Some(report))
+    }
+}
