@@ -1558,6 +1558,16 @@ let accountSwitches: StrategySwitch[] = [];
 const renderStrategySwitches = (rows: StrategySwitch[]): void => {
   accountSwitches = rows;
   const current = testId<HTMLElement>("strategy-current");
+  const hint = testId<HTMLElement>("switch-hint");
+  const risky = (lastAccountView?.slots ?? []).filter(
+    (slot) => slot.positions.length > 0 || slot.orders_total > 0,
+  );
+  toggle(hint, risky.length > 0);
+  if (risky.length > 0) {
+    hint.textContent = risky
+      .map((slot) => `${slot.slot}：持仓 ${slot.positions.length}、成交 ${slot.orders_total}`)
+      .join(" · ") + "；切换不会平仓，既有持仓与成交仍按原版本管理";
+  }
   const versions = (lastAccountView?.slots ?? [])
     .map((slot) => `${slot.slot}：${slot.current_strategy_version_id ?? slot.strategy_version_id}（切换 ${slot.switch_count ?? 0} 次）`)
     .join(" · ");
