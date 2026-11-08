@@ -194,6 +194,59 @@ struct EvolutionRequest {
     policy: Option<astock_v2::domain::EvolutionPolicy>,
 }
 
+#[derive(Deserialize)]
+struct EvolutionEventRequest {
+    event_id: String,
+    decided_at: String,
+    kind: String,
+    incumbent: astock_v2::domain::CandidateMetrics,
+    candidate: astock_v2::domain::CandidateMetrics,
+    #[serde(default)]
+    policy: Option<astock_v2::domain::EvolutionPolicy>,
+}
+
+async fn record_evolution_event(
+    State(state): State<Shared>,
+    Json(body): Json<EvolutionEventRequest>,
+) -> ApiResult {
+    let policy = body.policy.clone().unwrap_or_default();
+    let decision = match body.kind.as_str() {
+        "promotion" => astock_v2::domain::decide_promotion(&body.incumbent, &body.candidate, &policy),
+        "rollback" => astock_v2::domain::decide_rollback(&body.incumbent, &body.candidate, &policy),
+        _ => {
+            return Err((
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "unsupported_evolution_kind"})),
+            ))
+        }
+    }
+    .map_err(|error| (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error.0}))))?;
+    let mut db = state.lock().await;
+    response(
+        db.record_evolution_event(&body.event_id, &body.decided_at, decision)
+            .map_err(api_error)?,
+    )
+}
+
+#[derive(Deserialize)]
+struct EvolutionListQuery {
+    #[serde(default = "default_evolution_limit")]
+    limit: i64,
+}
+
+fn default_evolution_limit() -> i64 {
+    50
+}
+
+async fn evolution_events(
+    State(state): State<Shared>,
+    Query(query): Query<EvolutionListQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    let limit = query.limit.clamp(1, 200);
+    response(db.evolution_events(limit).map_err(api_error)?)
+}
+
 async fn evolution_decision(Json(body): Json<EvolutionRequest>) -> ApiResult {
     let policy = body.policy.clone().unwrap_or_default();
     let decision = match body.kind.as_str() {
@@ -425,6 +478,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
         .route("/v2/strategies", get(strategy_catalogue))
         .route("/v2/evolution/decisions", post(evolution_decision))
+        .route(
+            "/v2/evolution/events",
+            post(record_evolution_event).get(evolution_events),
+        )
         .route("/v2/price-sets", get(price_set_catalogue))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
         .route(

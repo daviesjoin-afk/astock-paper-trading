@@ -1217,3 +1217,114 @@ impl Store {
             .map_err(StoreError::Rules)
     }
 }
+// ---------------------------------------------------------------------------
+// Evolution event log: persist promotion/rollback decisions for audit.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn record_evolution_event(
+        &mut self,
+        event_id: &str,
+        decided_at: &str,
+        decision: crate::domain::EvolutionDecision,
+    ) -> StoreResult<EvolutionEventRecord> {
+        let valid_id = !event_id.is_empty()
+            && event_id.len() <= 128
+            && event_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.:@".contains(c));
+        if !valid_id {
+            return Err(StoreError::Rules(RuleError("invalid_evolution_event_id".into())));
+        }
+        chrono::DateTime::parse_from_rfc3339(decided_at)
+            .map_err(|_| StoreError::Rules(RuleError("invalid_evolution_time".into())))?;
+        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = txn
+            .query_row(
+                "SELECT decision_json FROM v2_evolution_events WHERE event_id=?",
+                [event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw_decision = serde_json::to_string(&decision)?;
+        if let Some(stored) = existing {
+            if stored != raw_decision {
+                return Err(StoreError::Conflict("evolution_event_conflict".into()));
+            }
+            drop(txn);
+            let mut record = EvolutionEventRecord {
+                event_id: event_id.into(),
+                candidate_id: decision.candidate_id.clone(),
+                status: decision.status.clone(),
+                decision,
+                decided_at: decided_at.into(),
+                digest: String::new(),
+            };
+            record.digest = evolution_event_digest(&record)?;
+            return Ok(record);
+        }
+        txn.execute(
+            "INSERT INTO v2_evolution_events(event_id,candidate_id,status,decision_json,decided_at,digest)
+             VALUES(?,?,?,?,?,?)",
+            params![
+                event_id,
+                decision.candidate_id,
+                decision.status,
+                raw_decision,
+                decided_at,
+                "",
+            ],
+        )?;
+        txn.commit()?;
+        let mut record = EvolutionEventRecord {
+            event_id: event_id.into(),
+            candidate_id: decision.candidate_id.clone(),
+            status: decision.status.clone(),
+            decision,
+            decided_at: decided_at.into(),
+            digest: String::new(),
+        };
+        record.digest = evolution_event_digest(&record)?;
+        Ok(record)
+    }
+
+    pub fn evolution_events(&self, limit: i64) -> StoreResult<Vec<EvolutionEventRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT event_id,candidate_id,status,decision_json,decided_at
+             FROM v2_evolution_events ORDER BY decided_at DESC, event_id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (event_id, candidate_id, status, raw_decision, decided_at) = row?;
+            let decision: crate::domain::EvolutionDecision = serde_json::from_str(&raw_decision)?;
+            let mut record = EvolutionEventRecord {
+                event_id,
+                candidate_id,
+                status,
+                decision,
+                decided_at,
+                digest: String::new(),
+            };
+            record.digest = evolution_event_digest(&record)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+}
+
+fn evolution_event_digest(record: &EvolutionEventRecord) -> StoreResult<String> {
+    let mut value = serde_json::to_value(record)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("digest");
+    }
+    Ok(crate::domain::canonical_digest(&value))
+}

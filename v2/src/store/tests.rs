@@ -3463,3 +3463,62 @@ fn evolution_decisions_require_evidence_margin_and_risk() {
     assert!(reverted.reasons.iter().any(|reason| reason.contains("回撤恶化")));
     assert!(reverted.reasons.iter().any(|reason| reason.contains("优势消失")));
 }
+
+#[test]
+fn evolution_events_are_idempotent_and_listed() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let policy = crate::domain::EvolutionPolicy::default();
+    let incumbent = crate::domain::CandidateMetrics {
+        candidate_id: "base".into(),
+        out_of_sample_days: 30,
+        shadow_days: 15,
+        trades: 40,
+        return_bps: 500,
+        drawdown_bps: 800,
+    };
+    let candidate = crate::domain::CandidateMetrics {
+        candidate_id: "cand".into(),
+        out_of_sample_days: 25,
+        shadow_days: 12,
+        trades: 25,
+        return_bps: 700,
+        drawdown_bps: 900,
+    };
+    let promoted = crate::domain::decide_promotion(&incumbent, &candidate, &policy).unwrap();
+    let record = db
+        .record_evolution_event("evo-1", "2026-11-05T15:00:00+08:00", promoted.clone())
+        .unwrap();
+    assert_eq!(record.status, "promoted");
+    assert_eq!(record.digest.len(), 64);
+
+    // Same event id + same decision is idempotent.
+    let replay = db
+        .record_evolution_event("evo-1", "2026-11-05T15:00:00+08:00", promoted.clone())
+        .unwrap();
+    assert_eq!(replay.digest, record.digest);
+
+    // Same id with a different decision conflicts.
+    let risky = crate::domain::CandidateMetrics {
+        drawdown_bps: 2_000,
+        ..candidate.clone()
+    };
+    let rejected = crate::domain::decide_promotion(&incumbent, &risky, &policy).unwrap();
+    assert!(matches!(
+        db.record_evolution_event("evo-1", "2026-11-05T15:00:00+08:00", rejected),
+        Err(StoreError::Conflict(ref code)) if code == "evolution_event_conflict"
+    ));
+
+    let events = db.evolution_events(10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_id, "evo-1");
+    assert_eq!(events[0].candidate_id, "cand");
+
+    assert!(matches!(
+        db.record_evolution_event("bad id!", "2026-11-05T15:00:00+08:00", promoted.clone()),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_event_id"
+    ));
+    assert!(matches!(
+        db.record_evolution_event("evo-2", "not-a-time", promoted),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_time"
+    ));
+}
