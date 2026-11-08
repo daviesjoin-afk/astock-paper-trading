@@ -9,6 +9,7 @@ mod paper;
 mod portfolio;
 mod valuation;
 mod allocation;
+mod exposure;
 
 pub use contract::*;
 pub use digest::*;
@@ -19,6 +20,7 @@ pub use paper::*;
 pub use portfolio::*;
 pub use valuation::*;
 pub use allocation::*;
+pub use exposure::*;
 
 #[cfg(test)]
 mod tests;

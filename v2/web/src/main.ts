@@ -1063,6 +1063,18 @@ type PaperValuationReport = {
   } | null;
 };
 
+type AccountExposure = {
+  account_id: string;
+  slots: Array<{
+    slot: string; budget_cents: number; cash_cents: number; cost_cents: number;
+    cash_utilization_bps: number;
+    positions: Array<{ symbol: string; quantity: number; cost_cents: number; avg_cost_cents: number; weight_bps: number }>;
+  }>;
+  total_cost_cents: number; total_cash_cents: number;
+  breaches: Array<{ slot: string; kind: string; symbol: string | null; value_bps: number; limit_bps: number }>;
+  digest: string;
+};
+
 type RebalanceRecord = {
   account_id: string; from_slot: string; to_slot: string; amount_cents: number;
   weights_before: [number, number]; weights_after: [number, number];
@@ -1362,6 +1374,32 @@ const sessionAction = async (sessionId: string, action: string): Promise<void> =
   }
 };
 
+const renderExposure = (exposure: AccountExposure | null): void => {
+  const block = testId<HTMLElement>("account-exposure");
+  if (!exposure) {
+    toggle(block, false);
+    return;
+  }
+  toggle(block, true);
+  const summary = exposure.slots
+    .map((slot) => `${slot.slot} 成本占用 ${(slot.cash_utilization_bps / 100).toFixed(1)}%`)
+    .join(" · ");
+  setText("account-exposure-summary", summary);
+  const list = testId<HTMLUListElement>("account-exposure-breaches");
+  if (exposure.breaches.length === 0) {
+    list.replaceChildren(...[Object.assign(document.createElement("li"), { textContent: "无集中度超限" })]);
+    return;
+  }
+  list.replaceChildren(...exposure.breaches.map((breach) => {
+    const item = document.createElement("li");
+    item.dataset.state = "fail";
+    item.textContent =
+      `${breach.slot} ${breach.symbol ?? ""} ${(breach.value_bps / 100).toFixed(1)}% ` +
+      `超过上限 ${(breach.limit_bps / 100).toFixed(1)}%`;
+    return item;
+  }));
+};
+
 const renderRebalances = (records: RebalanceRecord[]): void => {
   const block = testId<HTMLElement>("account-rebalances");
   if (records.length === 0) {
@@ -1511,6 +1549,15 @@ const loadAccount = async (accountId: string): Promise<void> => {
       if (currentAccountId === accountId) renderAudit(audit);
     } catch {
       if (currentAccountId === accountId) renderAudit(null);
+    }
+    try {
+      const exposure = await api<AccountExposure>(
+        `/v2/paper-accounts/${encoded}/exposure`,
+        new AbortController().signal,
+      );
+      if (currentAccountId === accountId) renderExposure(exposure);
+    } catch {
+      if (currentAccountId === accountId) renderExposure(null);
     }
     try {
       const rebalances = await api<RebalanceRecord[]>(
