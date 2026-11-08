@@ -81,7 +81,9 @@ python scripts/verify_archive.py --db /backup/astock.sqlite3 --export evolution-
 # archive ok schema=15 accounts=2 events=4 export_count=4 manifest=…
 ```
 
-退出码：0 全部通过、1 任一产物无效、2 文件缺失或不可读。
+退出码：0 全部通过、1 任一产物无效、2 文件缺失或不可读。退出码：0 全部通过、1 任一产物无效、2 文件缺失或不可读。
+
+加 `--manifest-out manifest.json` 会在校验通过后写出侧车清单（两文件 SHA-256、schema、事件数与合并 manifest），失败时**不写**，便于归档目录自证。
 
 每周复核（只读，不写账本）：
 

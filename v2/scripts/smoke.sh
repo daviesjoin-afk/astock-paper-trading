@@ -781,7 +781,8 @@ with urllib.request.urlopen(url, timeout=10) as response:
     data = response.read()
 open(sys.argv[1], "wb").write(data)
 ARCHIVE
-python scripts/verify_archive.py --db "$DB_BACKUP" --export "$DB_EXPORT"   | grep -q "archive ok"
+python scripts/verify_archive.py --db "$DB_BACKUP" --export "$DB_EXPORT"   --manifest-out "$DB_EXPORT.manifest.json" | grep -q "archive ok"
+test -s "$DB_EXPORT.manifest.json"
 
 rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT" "$DB_EXPORT"
 rm -f "$DB_BACKUP" "$DB_RESTORED" "$DB_CORRUPT"
