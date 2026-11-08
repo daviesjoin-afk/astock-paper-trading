@@ -129,6 +129,9 @@ form, no valuation.
 - Price sets: 实验信息 shows the loaded catalogue (id, trust, pack, coverage,
   entry count, digest prefix) and a coverage checker for explicit pack/symbol/
   day inputs; reviewed-only rules are stated in the panel.
+- Account performance: one line with profit, return, drawdown, fees, trades and
+  days when reviewed prices cover the known days; hidden (never zero-filled)
+  when they do not.
 - Coverage: the account header states whether reviewed prices cover the held
   symbols on the known days (“完整 n/n” or “x/y · 缺口 …”); gaps are warnings,
   never silently treated as covered.

@@ -1545,6 +1545,21 @@ const renderRebalances = (records: RebalanceRecord[]): void => {
   }));
 };
 
+const renderAccountPerformance = (
+  report: (PerformanceReport & { status?: string; reason?: string }) | null,
+): void => {
+  const line = testId<HTMLElement>("account-performance");
+  if (!report || report.status === "unavailable") {
+    toggle(line, false);
+    return;
+  }
+  toggle(line, true);
+  line.textContent =
+    `账户绩效：收益 ${money(report.profit_cents)}（${(report.return_bps / 100).toFixed(2)}%）· ` +
+    `回撤 ${(report.drawdown_bps / 100).toFixed(2)}% · 费用 ${money(report.fees_cents)} · ` +
+    `${report.trades} 笔成交 · ${report.days} 天`;
+};
+
 const renderEquity = (series: EquitySeries | null): void => {
   const block = testId<HTMLElement>("account-equity");
   if (!series || series.status !== "valued") {
@@ -1739,6 +1754,15 @@ const loadAccount = async (accountId: string): Promise<void> => {
       if (currentAccountId === accountId) renderRebalances([]);
     }
     if (days.length > 0) {
+      try {
+        const performance = await api<PerformanceReport & { status?: string; reason?: string }>(
+          `/v2/paper-accounts/${encoded}/performance?days=${encodeURIComponent(days.join(","))}`,
+          new AbortController().signal,
+        );
+        if (currentAccountId === accountId) renderAccountPerformance(performance);
+      } catch {
+        if (currentAccountId === accountId) renderAccountPerformance(null);
+      }
       try {
         const series = await api<EquitySeries>(
           `/v2/paper-accounts/${encoded}/equity-series?days=${encodeURIComponent(days.join(","))}`,
