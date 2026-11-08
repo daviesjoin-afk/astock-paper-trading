@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 实验绩效（ADR 016）：新增 `GET /v2/experiments/{cycle_id}/performance?days=`——以实验成交与初始本金、同一审核价格集合口径计算收益/回撤/费用/笔数与摘要；影子候选可与基准同口径比较，接入 ADR-012 决策输入（需数据覆盖）。Rust 142 passed（实验绩效一致/确定性/合成与缺覆盖/缺失实验）；浏览器 112 不变；冒烟覆盖不可用路径。
 - V2 账户绩效摘要（ADR 016）：新增 `GET /v2/paper-accounts/{id}/performance?days=`——在完整审核净值序列之上计算 `profit/return_bps/max_drawdown/drawdown_bps/fees/trades` 与 canonical 摘要；无覆盖返回 `unavailable`，空日期 422，合成集合永不产生报告。账户页在净值可用时展示“收益 / 回撤 / 费用 / 笔数”。Rust 141 passed（指标一致性/确定性/合成与缺覆盖/空日期）；浏览器 112 passed（+1 绩效展示）；冒烟覆盖不可用路径。
 - V2 进化日志分页（ADR 012）：新增 `GET /v2/evolution/events/page?limit=&before=&before_id=&after=`——游标为 `(decided_at, event_id)` 双键（均不含），同一时间戳多条事件不漏读，支持 `after` 时间下界，最大扫描 2000 条；返回 `next_before/next_before_id` 供续页。进化视图改为加载最近 20 条并提供“加载更早”，按 id 去重追加。Rust 140 passed（同时间戳分页/过滤/非法游标）；浏览器 111 passed（+1 游标加载）；冒烟覆盖分页端点。
 - V2 影子对比界面：进化视图新增“影子对比”面板——输入基准/候选实验 id，展示命中、两侧独有信号（决策时刻、标的与方向、报价引用）；空输入内联报错，比较失败给出原因。浏览器 110 passed（新增 2 项：差异渲染、必填校验；进化视图 axe 仍 0 violation）；Rust 139 / Python 32 不变。

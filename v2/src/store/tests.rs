@@ -3779,3 +3779,67 @@ fn performance_requires_complete_reviewed_coverage() {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(synthetic_dir);
 }
+
+#[test]
+fn experiment_performance_uses_fills_and_reviewed_prices() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_experiment(spec("exp-perf", INITIAL_CASH_CENTS)).unwrap();
+    let output = frozen_momentum_output();
+    realise_frozen_signals(&mut db, "exp-perf", &output);
+
+    let day1 = output.signals[0].decision_at[..10].to_string();
+    let day2 = output.signals[1].decision_at[..10].to_string();
+    let mut set = price_set("reviewed", &day1, 1_300, MARKET_DATA_PACK_ID);
+    set.coverage_end = day2.clone();
+    set.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: day2.clone(),
+        price_cents: 1_200,
+        source: "offline-fixture".into(),
+        observed_at: format!("{day2}T15:00:00+08:00"),
+    });
+    let dir = temp_price_dir("exp-perf");
+    std::fs::write(dir.join("set.json"), serde_json::to_string(&set).unwrap()).unwrap();
+
+    let report = db
+        .experiment_performance("exp-perf", &[day1.clone(), day2.clone()], &dir)
+        .unwrap()
+        .expect("reviewed coverage");
+    assert_eq!(report.days, 2);
+    assert_eq!(report.cycle_id, "exp-perf");
+    assert_eq!(report.profit_cents, report.end_equity_cents - INITIAL_CASH_CENTS);
+    assert!(report.trades >= 1);
+    assert!(report.fees_cents > 0);
+    assert_eq!(report.digest.len(), 64);
+    assert_eq!(
+        report,
+        db.experiment_performance("exp-perf", &[day1, day2], &dir)
+            .unwrap()
+            .unwrap()
+    );
+
+    let synthetic_dir = temp_price_dir("exp-perf-synthetic");
+    let mut synthetic = set.clone();
+    synthetic.trust = "synthetic".into();
+    std::fs::write(
+        synthetic_dir.join("set.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    assert!(db
+        .experiment_performance(
+            "exp-perf",
+            &[output.signals[0].decision_at[..10].to_string(), output.signals[1].decision_at[..10].to_string()],
+            &synthetic_dir
+        )
+        .unwrap()
+        .is_none());
+
+    assert!(matches!(
+        db.experiment_performance("missing-cycle", &["2026-10-30".into()], &dir),
+        Err(StoreError::NotFound(_))
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(synthetic_dir);
+}

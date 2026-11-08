@@ -344,6 +344,36 @@ async fn paper_exposure(State(state): State<Shared>, Path(id): Path<String>) -> 
     response(db.paper_exposure(&id).map_err(api_error)?)
 }
 
+async fn experiment_performance(
+    State(state): State<Shared>,
+    Path(cycle_id): Path<String>,
+    Query(query): Query<EquitySeriesQuery>,
+) -> ApiResult {
+    let days: Vec<String> = query
+        .days
+        .split(',')
+        .map(|day| day.trim().to_string())
+        .filter(|day| !day.is_empty())
+        .collect();
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("ASTOCK_PRICE_SETS_DIR")
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|| "data/price-sets".into()),
+    );
+    let db = state.lock().await;
+    match db
+        .experiment_performance(&cycle_id, &days, &dir)
+        .map_err(api_error)?
+    {
+        Some(report) => response(report),
+        None => response(json!({
+            "status": "unavailable",
+            "reason": "no_reviewed_price_set",
+            "days": days.len(),
+        })),
+    }
+}
+
 async fn paper_performance(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -600,6 +630,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/performance",
             get(paper_performance),
+        )
+        .route(
+            "/v2/experiments/{cycle_id}/performance",
+            get(experiment_performance),
         )
         .route(
             "/v2/paper-accounts/{account_id}/exposure",
