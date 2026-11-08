@@ -1082,6 +1082,14 @@ type PerformanceReport = {
   max_drawdown_cents: number; drawdown_bps: number; fees_cents: number; trades: number;
 };
 
+type AllocationProposal = {
+  proposal: {
+    status: string; reserve_bps: number; digest: string;
+    rationale: Array<{ slot: string; current_bps: number; target_bps: number; score_bps: number; note: string }>;
+  };
+  scores: Array<{ slot: string; return_bps: number; drawdown_bps: number; score_bps: number; days: number }>;
+};
+
 type RebalanceRecord = {
   account_id: string; from_slot: string; to_slot: string; amount_cents: number;
   weights_before: [number, number]; weights_after: [number, number];
@@ -1407,6 +1415,59 @@ const renderExposure = (exposure: AccountExposure | null): void => {
   }));
 };
 
+let allocationReport: AllocationProposal | null = null;
+
+const renderAllocation = (report: AllocationProposal | null): void => {
+  allocationReport = report;
+  const block = testId<HTMLElement>("account-allocation");
+  if (!report || report.proposal.status === "insufficient_evidence") {
+    toggle(block, false);
+    return;
+  }
+  toggle(block, true);
+  const weights = report.proposal.rationale
+    .map((item) => `${item.slot} ${(item.target_bps / 100).toFixed(1)}%`)
+    .join(" · ");
+  setText("allocation-summary",
+    `目标：${weights} · 准备金 ${(report.proposal.reserve_bps / 100).toFixed(1)}% · 状态 ${report.proposal.status}`);
+  const list = testId<HTMLUListElement>("allocation-rationale");
+  list.replaceChildren(...report.proposal.rationale.map((item) => {
+    const li = document.createElement("li");
+    li.textContent =
+      `${item.slot}：评分 ${item.score_bps} bps · ${(item.current_bps / 100).toFixed(1)}% → ` +
+      `${(item.target_bps / 100).toFixed(1)}%（${item.note}）`;
+    return li;
+  }));
+};
+
+const applyAllocation = async (): Promise<void> => {
+  if (!allocationReport) return;
+  const targets = allocationReport.proposal.rationale.map((item) => item.target_bps);
+  if (targets.length !== 2) {
+    showAccountError("资金提案缺少两个槽位");
+    return;
+  }
+  const button = testId<HTMLButtonElement>("allocation-apply");
+  button.disabled = true;
+  try {
+    await postJson(`/v2/paper-accounts/${encodeURIComponent(currentAccountId)}/rebalances`, {
+      targets,
+      proposal_digest: allocationReport.proposal.digest,
+      applied_at: new Date().toISOString(),
+      note: "account console",
+    });
+    announce("资金再平衡已执行");
+    await loadAccount(currentAccountId);
+  } catch (error) {
+    showAccountError(`执行再平衡失败：${errorDetail(error)}`);
+    announce("执行再平衡失败");
+  } finally {
+    button.disabled = false;
+  }
+};
+
+testId<HTMLButtonElement>("allocation-apply").addEventListener("click", () => void applyAllocation());
+
 const renderRebalances = (records: RebalanceRecord[]): void => {
   const block = testId<HTMLElement>("account-rebalances");
   if (records.length === 0) {
@@ -1532,6 +1593,15 @@ const loadAccount = async (accountId: string): Promise<void> => {
     const orderList = Array.isArray(orders) ? orders : [];
     renderAccount(account, orderList);
     renderSessions(Array.isArray(sessions) ? sessions : []);
+
+    const orderDays = Array.from(new Set(
+      orderList.map((order) => chinaDayOf(order.request.decision_at)).filter(Boolean),
+    )).sort();
+    const inceptionDay = chinaDayOf(account.created_at);
+    const days = orderDays.length >= 2 || !inceptionDay || orderDays.includes(inceptionDay)
+      ? orderDays
+      : [...orderDays, inceptionDay].sort();
+
     const asOf = orderList.length > 0
       ? chinaDayOf(orderList[0].request.decision_at)
       : chinaDayOf(account.created_at);
@@ -1557,6 +1627,21 @@ const loadAccount = async (accountId: string): Promise<void> => {
     } catch {
       if (currentAccountId === accountId) renderAudit(null);
     }
+    if (days.length >= 2) {
+      try {
+        const proposal = await api<AllocationProposal>(
+          `/v2/paper-accounts/${encoded}/allocation-proposal?days=${encodeURIComponent(days.join(","))}`,
+          new AbortController().signal,
+        );
+        if (currentAccountId === accountId && "proposal" in proposal) {
+          renderAllocation(proposal);
+        }
+      } catch {
+        if (currentAccountId === accountId) renderAllocation(null);
+      }
+    } else {
+      renderAllocation(null);
+    }
     try {
       const exposure = await api<AccountExposure>(
         `/v2/paper-accounts/${encoded}/exposure`,
@@ -1575,9 +1660,6 @@ const loadAccount = async (accountId: string): Promise<void> => {
     } catch {
       if (currentAccountId === accountId) renderRebalances([]);
     }
-    const days = Array.from(new Set(
-      orderList.map((order) => chinaDayOf(order.request.decision_at)).filter(Boolean),
-    )).sort();
     if (days.length > 0) {
       try {
         const series = await api<EquitySeries>(
