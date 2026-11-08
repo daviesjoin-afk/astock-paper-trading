@@ -107,6 +107,8 @@ pub struct PaperAccountView {
     pub cash_cents: i64,
     pub reserve_cents: i64,
     pub slots: Vec<PaperSlotView>,
+    /// No reviewed price set exists yet, so no market value or return is computed.
+    pub valuation: PaperValuation,
 }
 
 /// Summary returned by a batch run.
@@ -116,6 +118,13 @@ pub struct PaperSessionRun {
     pub steps: usize,
     pub filled: usize,
     pub rejected: usize,
+}
+
+/// Valuation availability for an account. Always explicit, never inferred.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperValuation {
+    pub status: String,
+    pub reason: String,
 }
 
 /// Status snapshot of one deterministic paper session.
@@ -954,6 +963,10 @@ impl Store {
             cash_cents,
             reserve_cents: split.reserve_cents,
             slots,
+            valuation: PaperValuation {
+                status: "unavailable".into(),
+                reason: "no_reviewed_price_set".into(),
+            },
         })
     }
 
@@ -1284,6 +1297,62 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 impl Store {
+    /// Advance the clock only through signals whose China day is on/before `day`.
+    /// Future signals stay untouched: no look-ahead is ever executed.
+    pub fn advance_paper_session_to(
+        &mut self,
+        session_id: &str,
+        day: &str,
+    ) -> StoreResult<PaperSessionRun> {
+        let target = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .map_err(|_| StoreError::Rules(RuleError("invalid_advance_day".into())))?;
+        if target.to_string() != day {
+            return Err(StoreError::Rules(RuleError("invalid_advance_day".into())));
+        }
+        let mut steps = 0usize;
+        let mut filled = 0usize;
+        let mut rejected = 0usize;
+        loop {
+            let view = self.paper_session(session_id)?;
+            if view.status != "running" || view.cursor >= view.total {
+                break;
+            }
+            let spec_json: String = self.conn.query_row(
+                "SELECT spec_json FROM v2_paper_sessions WHERE session_id=?",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
+            let next = &spec.signals[view.cursor];
+            let at = chrono::DateTime::parse_from_rfc3339(&next.decision_at)
+                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+            let china = at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"));
+            if china.date_naive() > target {
+                break;
+            }
+            let step = self.step_paper_session(session_id)?;
+            match step.order {
+                Some(order) => {
+                    steps += 1;
+                    match order.outcome.status {
+                        crate::domain::DecisionStatus::Filled => filled += 1,
+                        crate::domain::DecisionStatus::Rejected => rejected += 1,
+                    }
+                }
+                None => break,
+            }
+            if steps > view.total {
+                break;
+            }
+        }
+        Ok(PaperSessionRun {
+            session: self.paper_session(session_id)?,
+            steps,
+            filled,
+            rejected,
+        })
+    }
+
     pub fn run_paper_session(&mut self, session_id: &str) -> StoreResult<PaperSessionRun> {
         let mut steps = 0usize;
         let mut filled = 0usize;

@@ -2562,3 +2562,53 @@ fn paper_session_can_be_imported_from_an_experiment() {
     assert_eq!(run.session.status, "completed");
     assert!(run.filled + run.rejected >= 1);
 }
+
+#[test]
+fn paper_session_advances_only_through_reached_days() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("advance-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    db.create_paper_session(session_spec(
+        "advance-acct",
+        "advance-session",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[0]),
+            session_signal(PaperSlotId::A, &output.signals[1]),
+        ],
+    ))
+    .unwrap();
+    db.paper_session_action("advance-session", "start").unwrap();
+
+    // Nothing is scheduled before the first decision day.
+    let early = db.advance_paper_session_to("advance-session", "2026-10-29").unwrap();
+    assert_eq!(early.steps, 0);
+    assert_eq!(early.session.cursor, 0);
+
+    let first = db.advance_paper_session_to("advance-session", "2026-10-30").unwrap();
+    assert_eq!(first.steps, 1);
+    assert_eq!(first.session.cursor, 1);
+    assert_eq!(first.session.clock_at, output.signals[0].decision_at);
+
+    // A day between decisions moves nothing.
+    let gap = db.advance_paper_session_to("advance-session", "2026-11-01").unwrap();
+    assert_eq!(gap.steps, 0);
+    assert_eq!(gap.session.cursor, 1);
+
+    let last = db.advance_paper_session_to("advance-session", "2026-11-02").unwrap();
+    assert_eq!(last.steps, 1);
+    assert_eq!(last.session.status, "completed");
+    assert_eq!(last.session.cursor, 2);
+
+    assert!(matches!(
+        db.advance_paper_session_to("advance-session", "2026-13-01"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_advance_day"
+    ));
+
+    // Accounts state their valuation availability instead of implying a value.
+    let view = db.paper_account("advance-acct").unwrap();
+    assert_eq!(view.valuation.status, "unavailable");
+    assert_eq!(view.valuation.reason, "no_reviewed_price_set");
+}

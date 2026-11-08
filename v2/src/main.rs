@@ -131,6 +131,11 @@ async fn paper_orders(
 }
 
 #[derive(Deserialize)]
+struct AdvanceBody {
+    day: String,
+}
+
+#[derive(Deserialize)]
 struct SessionFromExperiment {
     session_id: String,
     account_id: String,
@@ -183,6 +188,15 @@ async fn paper_sessions(
 async fn paper_session(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     let db = state.lock().await;
     response(db.paper_session(&id).map_err(api_error)?)
+}
+
+async fn paper_session_advance(
+    State(state): State<Shared>,
+    Path(session_id): Path<String>,
+    Json(body): Json<AdvanceBody>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(db.advance_paper_session_to(&session_id, &body.day).map_err(api_error)?)
 }
 
 async fn paper_session_action(
@@ -255,6 +269,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(create_session_from_experiment),
         )
         .route("/v2/paper-sessions/{session_id}", get(paper_session))
+        .route(
+            "/v2/paper-sessions/{session_id}/advance",
+            post(paper_session_advance),
+        )
         .route(
             "/v2/paper-sessions/{session_id}/{action}",
             post(paper_session_action),

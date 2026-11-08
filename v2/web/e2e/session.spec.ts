@@ -113,6 +113,30 @@ test.describe("paper session control", () => {
     expect(overflow).toBeLessThanOrEqual(1);
   });
 
+  test("advance-to-day stops at the requested China trading day", async ({ page, request }) => {
+    await createAccount(request, "ui-acc-advance");
+    await createSession(request, "ui-acc-advance", "ui-session-advance");
+    await openAccount(page, "ui-acc-advance");
+    const card = page.getByTestId("session-card-ui-session-advance");
+    await card.getByRole("button", { name: "启动" }).click();
+    await expect(card).toContainText("运行中");
+
+    await card.getByTestId("session-advance-date").fill("2026-10-30");
+    await card.getByTestId("session-advance").click();
+    await expect(card).toContainText("1/2", { timeout: 15_000 });
+
+    // A day between decisions moves nothing.
+    await card.getByTestId("session-advance-date").fill("2026-11-01");
+    await card.getByTestId("session-advance").click();
+    await expect(card).toContainText("1/2");
+    await expect(card).toContainText("运行中");
+
+    await card.getByTestId("session-advance-date").fill("2026-11-02");
+    await card.getByTestId("session-advance").click();
+    await expect(card).toContainText("已完成", { timeout: 15_000 });
+    await expect(card).toContainText("2/2");
+  });
+
   test("the fixture session exists for its account", async ({ page }) => {
     await openAccount(page, "e2e-session-account");
     await expect(page.getByTestId("session-card-e2e-session")).toBeVisible();

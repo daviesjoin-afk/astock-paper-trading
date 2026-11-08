@@ -107,6 +107,11 @@ ADR 001 让每个实验拥有独立资金与账本，实验是**研究身份**�
 - 空实验拒绝（`paper_session_requires_signals`）；不存在的实验返回 404。
 - 导入后的会话与手工会话同构：启动、暂停、继续、运行到结束、重放规则完全一致。
 
+### 10. 按日推进与估值占位（已实现）
+
+- `POST /v2/paper-sessions/{id}/advance { day }`：只执行**中国日 ≤ day** 的信号；两个决策之间的日期不产生任何动作；非法日期返回 `invalid_advance_day`。未来信号永远不会被提前执行（无 look-ahead）。
+- `PaperAccountView.valuation` 固定输出 `{status:"unavailable", reason:"no_reviewed_price_set"}`：在 ADR-006 定义审核价格集合之前，账户页不计算市值、净值、收益或回撤，只展示现金与持仓数量，并显式提示不可估值。
+
 ## 未决问题
 
 - 自动运行时钟（第二阶段）与账户的关系：账户是否需要"当前模拟日期"这一显式状态？倾向放入独立的 run session，而不是写进账户 spec。
