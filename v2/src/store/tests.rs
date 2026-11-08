@@ -4399,13 +4399,58 @@ fn orders_and_sessions_follow_the_switched_version() {
 
     // Sessions must name the version currently in force.
     let old_experiment = frozen_momentum_output();
-    // Plain session specs are version-agnostic; only experiment-derived sessions
-    // pin a version, and that version must be the one currently in force.
-    assert!(db
-        .create_paper_session(session_spec(
+    // Plain session specs carry no version, but they must not start before the
+    // slot's last switch (their signals would be rejected one by one anyway).
+    assert!(matches!(
+        db.create_paper_session(session_spec(
             "switch-live",
             "switch-live-session",
             vec![session_signal(PaperSlotId::A, &old_experiment.signals[0])],
-        ))
-        .is_ok());
+        )),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "session_starts_before_strategy_switch"
+    ));
+}
+
+#[test]
+fn sessions_cannot_start_before_the_last_switch() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("switch-session", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    db.record_strategy_switch(
+        "switch-session",
+        PaperSlotId::A,
+        "research-momentum-v2",
+        "2026-10-31T09:00:00+08:00",
+        "promotion",
+        "session-switch-1",
+    )
+    .unwrap();
+
+    let mut early = session_spec(
+        "switch-session",
+        "switch-session-early",
+        vec![session_signal(PaperSlotId::A, buy)],
+    );
+    early.start_at = "2026-10-30T00:00:00+08:00".into();
+    assert!(matches!(
+        db.create_paper_session(early),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "session_starts_before_strategy_switch"
+    ));
+
+    let sell = output
+        .signals
+        .iter()
+        .find(|signal| signal.side == crate::domain::Side::Sell)
+        .expect("sell signal");
+    ingest_signal_evidence(&mut db, sell);
+    let mut late = session_spec(
+        "switch-session",
+        "switch-session-late",
+        vec![session_signal(PaperSlotId::A, sell)],
+    );
+    late.start_at = "2026-11-01T00:00:00+08:00".into();
+    let created = db.create_paper_session(late).unwrap();
+    assert_eq!(created.session_id, "switch-session-late");
 }

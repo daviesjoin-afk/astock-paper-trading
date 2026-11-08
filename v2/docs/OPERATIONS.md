@@ -54,7 +54,8 @@ curl -fsS -X POST "http://127.0.0.1:8765/v2/paper-accounts/paper-001/strategy-sw
 
 - `effective_from` 必须晚于该账户最后一次会话 `clock_at`；
 - 同一 `switch_id` 重放返回原记录，内容不同则 409；
-- 切换后提交 `decision_at` 早于该时刻的订单会被拒绝（`paper_order_before_strategy_switch`）。
+- 切换后提交 `decision_at` 早于该时刻的订单会被拒绝（`paper_order_before_strategy_switch`）；
+- 会话 `start_at` 早于该槽最后切换时刻会被拒绝（`session_starts_before_strategy_switch`），避免创建“永远走不动”的会话。
 
 归档进化事件（只读导出，含 canonical 摘要）：
 
