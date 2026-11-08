@@ -372,7 +372,7 @@ audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit
 assert [check["name"] for check in audit["checks"]] == [
     "budget_split", "fills_replay", "capital_conservation",
-    "order_fill_link", "fill_matches_outcome", "session_link",
+    "order_fill_link", "fill_matches_outcome", "session_link", "session_signals",
 ]
 # No reviewed price set is bundled: the equity series refuses instead of guessing.
 series = call("paper-accounts/smoke-account/equity-series?days=2026-10-30")

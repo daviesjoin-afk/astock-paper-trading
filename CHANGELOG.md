@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 审计扩展到会话信号一致性（ADR 005）：新增第 7 项检查 `session_signals`——每个会话的订单必须与冻结信号前缀逐条一致（`signal_id = session:signal`、`decision_at`、`quote_ref`），且订单条数等于 `cursor`；篡改订单决策时刻会被发现。账户页新增可折叠“审计详情”，逐项显示通过与失败原因。Rust 129 passed（新增会话审计，旧夹具补上合法会话 spec）；浏览器 99 passed（展开详情 7 项）；冒烟断言 7 项检查名。
 - V2 账户账本自检（ADR 005）：新增 `GET /v2/paper-accounts/{id}/audit`，只读校验六项不变量——预算划分、成交可重放、资金守恒（初始 + 净现金流 = 准备金 + 两槽现金）、订单/成交一一对应、**成交必须等于订单 outcome 中的 fill（可发现篡改）**、会话 last_order_id 必须属于该账户；返回整体 `ok` 与 canonical 摘要。账户页展示「账本自检：通过/失败 + 摘要」。Rust 128 passed（审计通过、篡改成交被发现、悬空会话指针被发现）；浏览器 99 passed（自检展示）；冒烟断言六项检查名与 ok。
 - V2 净值序列与回撤（ADR 007）：新增纯域 `equity_series()`——按显式、严格递增的交易日列表逐日前向重放槽位成交（同一本账，不回滚），用审核价格集合逐日盯市，输出 `{day, cash, market_value, equity}`、最大回撤（整数分 + 发生日）与 `profit_cents`（仅 `reviewed`）；任一请求日缺覆盖、缺持仓价格或数据包不匹配 → 整条序列拒绝，不插值不裁剪。新增 `PriceSetRegistry::select_covering()` 与 `Store::paper_equity_series(_with_registry)()`；HTTP `GET /v2/paper-accounts/{id}/equity-series?days=` 在目录为空时返回 `unavailable + no_reviewed_price_set`，空列表 422。Rust 127 passed（两天序列、回撤、越界/缺价/合成集合拒绝、内置目录为空）；浏览器 99 passed（无 UI 变更）；冒烟覆盖拒绝路径。
 - V2 价格集合目录与估值接线（ADR 006）：新增 bundled `v2/data/price-sets-registry.json`（空集合，刻意不伪造数据）、`GET /v2/price-sets` 只读目录、`PriceSetRegistry::select()`（仅 `reviewed` + 数据包匹配 + 覆盖日期）；估值端点在选中集合时返回 `status:"valued"` 与市值/现金/权益/盈亏（`synthetic` 永不出现盈亏），否则维持 `unavailable`；账户页在可用时切换为“估值可用”并展示市值/权益/盈亏，不可用时仍展示需求清单。Rust 126 passed（注册表选择、审核集合正向估值、合成集合拒绝）；浏览器 99 passed（stub 审核集合的估值展示）；冒烟断言 `/v2/price-sets` 为空。

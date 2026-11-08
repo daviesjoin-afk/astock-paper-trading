@@ -830,6 +830,60 @@ impl Store {
             detail: session_detail.join("; "),
         });
 
+        // 6. Session orders must equal the frozen signal prefix of their session.
+        let mut sessions_statement = self.conn.prepare(
+            "SELECT session_id,spec_json,cursor FROM v2_paper_sessions WHERE account_id=?",
+        )?;
+        let sessions = sessions_statement.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut signals_ok = true;
+        let mut signals_detail = Vec::new();
+        for row in sessions {
+            let (session_id, raw_spec, cursor) = row?;
+            let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&raw_spec)?;
+            let prefix = format!("{session_id}:");
+            let mut orders_statement = self.conn.prepare(
+                "SELECT signal_id,request_json FROM v2_paper_orders
+                 WHERE account_id=? AND signal_id LIKE ? ORDER BY id",
+            )?;
+            let rows = orders_statement.query_map(params![account_id, format!("{prefix}%")], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut index = 0usize;
+            for row in rows {
+                let (signal_id, raw_request) = row?;
+                let request: crate::domain::PaperOrderRequest = serde_json::from_str(&raw_request)?;
+                let Some(expected) = spec.signals.get(index) else {
+                    signals_ok = false;
+                    signals_detail.push(format!("{session_id}: extra order {signal_id}"));
+                    index += 1;
+                    continue;
+                };
+                if signal_id != format!("{session_id}:{}", expected.signal_id)
+                    || request.decision_at != expected.decision_at
+                    || request.quote_ref != expected.quote_ref
+                {
+                    signals_ok = false;
+                    signals_detail.push(format!("{session_id}: order {index} does not match frozen signal"));
+                }
+                index += 1;
+            }
+            if index as i64 != cursor {
+                signals_ok = false;
+                signals_detail.push(format!("{session_id}: {index} orders vs cursor {cursor}"));
+            }
+        }
+        checks.push(PaperAuditCheck {
+            name: "session_signals".into(),
+            ok: signals_ok,
+            detail: if signals_ok { "session orders equal frozen signals".into() } else { signals_detail.join("; ") },
+        });
+
         let ok = checks.iter().all(|check| check.ok);
         let mut report = PaperAuditReport {
             account_id: account_id.into(),

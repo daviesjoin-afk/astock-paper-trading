@@ -42,6 +42,11 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-audit")).toBeVisible();
     await expect(page.getByTestId("account-audit")).toContainText("账本自检：通过");
     await expect(page.getByTestId("account-audit")).toHaveAttribute("data-state", "ok");
+    await page.getByTestId("account-audit-details").locator("summary").click();
+    const checks = page.getByTestId("account-audit-checks").locator("li");
+    await expect(checks).toHaveCount(7);
+    await expect(checks.first()).toContainText("budget_split");
+    await expect(checks.last()).toContainText("session_signals");
 
     const orders = page.getByTestId("account-orders").locator("tr");
     await expect(orders).toHaveCount(1);
