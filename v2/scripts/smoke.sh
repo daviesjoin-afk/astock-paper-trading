@@ -339,15 +339,14 @@ for _ in range(2):
 assert call("portfolio")["runs_total"] == prefix_runs + len(cases)
 
 # Paper account: one user-funded account, two frozen slots, exact split.
-reversion_strategy = json.loads(Path("data/strategy-reversion-v1.json").read_text(encoding="utf-8"))
 paper_spec = {
     "schema_version": 1, "account_id": "smoke-account", "initial_cash_cents": 10_000_000,
     "reserve_bps": 1000, "created_at": "2026-11-08T09:00:00+08:00",
     "slots": [
-        {"slot": "A", "strategy": reviewed_strategy,
+        {"slot": "A", "strategy_version_id": "research-momentum-v1",
          "market_data_pack_id": "cn-offline-fixture-pack-1",
          "execution_policy_version": "v2-paper-policy-6", "weight_bps": 4500},
-        {"slot": "B", "strategy": reversion_strategy,
+        {"slot": "B", "strategy_version_id": "research-reversion-v1",
          "market_data_pack_id": "cn-offline-fixture-pack-1",
          "execution_policy_version": "v2-paper-policy-6", "weight_bps": 4500},
     ],

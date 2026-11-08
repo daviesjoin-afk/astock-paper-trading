@@ -733,6 +733,9 @@ td:first-child { font-weight: 550; }
   .account-slots { grid-template-columns: 1fr; padding: 4px 14px 12px; }
   .account-orders-section { padding: 0 14px 14px; }
   .account-sessions-section { padding: 4px 14px 12px; }
+  .account-create { padding: 12px 14px; }
+  .account-create-actions { width: 100%; margin-left: 0; }
+  .account-create-actions .btn { flex: 1 1 auto; }
   .summary { padding: 14px 14px 2px; }
   .summary dl { gap: 10px 18px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .kpis { padding: 12px 14px 14px; }
@@ -828,6 +831,14 @@ td:first-child { font-weight: 550; }
 .account-slot-positions { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
 .account-orders-section { padding: 0 20px 16px; }
 .account-sessions-section { padding: 6px 20px 14px; }
+
+/* ---------- account creation ---------- */
+.account-create {
+  display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end;
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+}
+.account-create input { min-width: 160px; max-width: 220px; }
+.account-create-actions { display: flex; gap: 8px; margin-left: auto; }
 
 /* ---------- paper sessions ---------- */
 .account-sessions { display: grid; gap: 10px; }

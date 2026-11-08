@@ -88,6 +88,15 @@ ADR 001 让每个实验拥有独立资金与账本，实验是**研究身份**�
 - 订单信号身份加会话前缀（`session_id:signal_id`），因此会话订单与手工订单可区分，重试仍是幂等。
 - 崩溃恢复：订单先落账、会话游标后更新；重试命中幂等键后再推进游标，不会重复成交。
 
+### 8. 客户端创建账户（已实现）
+
+`PaperAccountRequest { schema_version, account_id, initial_cash_cents, reserve_bps, created_at, slots[{slot, strategy_version_id, market_data_pack_id, execution_policy_version, weight_bps}] }`
+
+- 浏览器只提交**已审核策略的 id**，服务端用内置 reviewed artifact 解析内容身份与摘要；客户端永远不携带 digest，也无法提交自定义策略。
+- `GET /v2/strategies` 返回可选策略、默认数据包、执行规则与准备金比例，作为表单的唯一事实来源。
+- 校验仍在 domain：权重和、A/B 槽位、重复策略、本金、时间、数据包/规则兼容。
+- 同 id 重复提交同内容幂等，不同内容冲突。
+
 ## 未决问题
 
 - 自动运行时钟（第二阶段）与账户的关系：账户是否需要"当前模拟日期"这一显式状态？倾向放入独立的 run session，而不是写进账户 spec。

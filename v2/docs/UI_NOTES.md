@@ -100,6 +100,10 @@ form, no valuation.
 - Recent orders: time (China), slot, signal label, side, result and either the
   fill (quantity, price, fees) or the rejection reason. Raw signal ids stay in
   the cell tooltip.
+- Creation: “新建账户” opens a small form (account id, capital in yuan, strategy A/B
+  chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
+  reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
+  capital and identical strategies are refused with an explicit message.
 - Sessions: each session card shows status (未开始/运行中/已暂停/已停止/已完成),
   the explicit clock and cursor progress, plus the controls that are legal for
   that status (启动 / 暂停 / 继续 / 运行到结束 / 停止). Controls POST only to

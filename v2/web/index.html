@@ -246,6 +246,7 @@ python3 scripts/experiment_demo.py</code></pre>
                 <h2>模拟账户</h2>
                 <p class="muted">总本金、准备金与两个策略槽位；只读展示已存事实，不计算收益。</p>
               </div>
+              <button type="button" class="btn btn-small" id="account-create-toggle" data-testid="account-create-toggle">新建账户</button>
               <label class="field field-inline">
                 <span class="field-label">账户</span>
                 <span class="select-wrap">
@@ -256,6 +257,28 @@ python3 scripts/experiment_demo.py</code></pre>
                 </span>
               </label>
             </header>
+            <form class="account-create" id="account-create" data-testid="account-create" aria-label="新建模拟账户" novalidate hidden>
+              <label class="field">
+                <span class="field-label">账户标识</span>
+                <input id="create-id" data-testid="create-id" name="account_id" autocomplete="off" placeholder="例如 paper-001" />
+              </label>
+              <label class="field">
+                <span class="field-label">初始资金（元）</span>
+                <input id="create-cash" data-testid="create-cash" type="number" min="100" step="0.01" value="100000" />
+              </label>
+              <label class="field">
+                <span class="field-label">策略 A</span>
+                <select id="create-a" data-testid="create-a"></select>
+              </label>
+              <label class="field">
+                <span class="field-label">策略 B</span>
+                <select id="create-b" data-testid="create-b"></select>
+              </label>
+              <div class="account-create-actions">
+                <button type="submit" class="btn" id="create-submit" data-testid="create-submit">创建账户</button>
+                <button type="button" class="btn btn-quiet" id="create-cancel" data-testid="create-cancel">取消</button>
+              </div>
+            </form>
             <div class="section-error" data-testid="account-error" hidden></div>
             <p class="empty" id="account-empty" data-testid="account-empty" hidden>
               还没有模拟账户。先通过本地 API 创建账户，再回到本页刷新。

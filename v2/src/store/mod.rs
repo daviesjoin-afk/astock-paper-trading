@@ -137,6 +137,23 @@ pub struct PaperSessionStep {
     pub order: Option<PaperOrderRecord>,
 }
 
+/// Everything the account form needs to build a valid request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyCatalogue {
+    pub strategies: Vec<StrategySummary>,
+    pub market_data_pack_id: String,
+    pub execution_policy_version: String,
+    pub reserve_bps: i64,
+}
+
+/// Reviewed strategy available to the account form. Content identity only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategySummary {
+    pub strategy_version_id: String,
+    pub research_input_id: String,
+    pub research_input_digest: String,
+}
+
 /// Lightweight account row for the console picker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperAccountSummarySlot {
@@ -1296,6 +1313,52 @@ impl Store {
             steps,
             filled,
             rejected,
+        })
+    }
+}
+
+impl Store {
+    /// The reviewed strategies a new account may reference. Never user-supplied.
+    pub fn strategy_catalogue(&self) -> StoreResult<StrategyCatalogue> {
+        let mut strategies = Vec::new();
+        for id in ["research-momentum-v1", "research-reversion-v1"] {
+            let artifact = reviewed_strategy_artifact(id)?;
+            strategies.push(StrategySummary {
+                strategy_version_id: artifact.strategy_version_id,
+                research_input_id: artifact.research_input_id,
+                research_input_digest: artifact.research_input_digest,
+            });
+        }
+        Ok(StrategyCatalogue {
+            strategies,
+            market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+            execution_policy_version: POLICY_VERSION.into(),
+            reserve_bps: 1_000,
+        })
+    }
+
+    /// Resolve a client request (strategy ids) into the internal spec.
+    pub fn create_paper_account_request(
+        &mut self,
+        request: crate::domain::PaperAccountRequest,
+    ) -> StoreResult<PaperAccountView> {
+        let mut slots = Vec::new();
+        for slot in &request.slots {
+            slots.push(crate::domain::PaperSlotSpec {
+                slot: slot.slot,
+                strategy: reviewed_strategy_artifact(&slot.strategy_version_id)?,
+                market_data_pack_id: slot.market_data_pack_id.clone(),
+                execution_policy_version: slot.execution_policy_version.clone(),
+                weight_bps: slot.weight_bps,
+            });
+        }
+        self.create_paper_account(crate::domain::PaperAccountSpec {
+            schema_version: crate::domain::PAPER_ACCOUNT_SCHEMA_VERSION,
+            account_id: request.account_id,
+            initial_cash_cents: request.initial_cash_cents,
+            reserve_bps: request.reserve_bps,
+            created_at: request.created_at,
+            slots,
         })
     }
 }
