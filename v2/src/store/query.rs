@@ -1580,3 +1580,83 @@ impl Store {
         Ok(Some(report))
     }
 }
+
+impl Store {
+    fn experiment_fills(&self, cycle_id: &str) -> StoreResult<Vec<Fill>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.fill_json FROM v2_fills f
+             JOIN v2_simulation_runs r ON r.id=f.run_id
+             WHERE r.cycle_id=? ORDER BY r.id",
+        )?;
+        let rows = statement.query_map([cycle_id], |row| row.get::<_, String>(0))?;
+        let mut fills = Vec::new();
+        for row in rows {
+            fills.push(serde_json::from_str::<Fill>(&row?)?);
+        }
+        Ok(fills)
+    }
+
+    /// Performance for one experiment, using only experiment fills and a
+    /// reviewed price set that covers every requested day.
+    pub fn experiment_performance(
+        &self,
+        cycle_id: &str,
+        days: &[String],
+        dir: &std::path::Path,
+    ) -> StoreResult<Option<ExperimentPerformanceReport>> {
+        let experiment = load_experiment(&self.conn, cycle_id)?;
+        let pack = experiment.spec.market_data_pack_id.clone();
+        let registry = load_price_sets(dir)?;
+        let Some(set) = registry.select_covering(&pack, &days[0], &days[days.len() - 1]) else {
+            return Ok(None);
+        };
+        let fills = self.experiment_fills(cycle_id)?;
+        let series = crate::domain::equity_series(
+            experiment.spec.initial_cash_cents,
+            &fills,
+            set,
+            days,
+            &pack,
+        )
+        .map_err(StoreError::Rules)?;
+        let first = series.points.first().map(|point| point.equity_cents).unwrap_or(0);
+        let last = series.points.last().map(|point| point.equity_cents).unwrap_or(0);
+        let peak = series
+            .points
+            .iter()
+            .map(|point| point.equity_cents)
+            .max()
+            .unwrap_or(experiment.spec.initial_cash_cents);
+        let profit_cents = last - experiment.spec.initial_cash_cents;
+        let fees_cents = fills.iter().map(|fill| fill.fees_cents).sum();
+        let mut report = ExperimentPerformanceReport {
+            cycle_id: cycle_id.into(),
+            days: series.points.len(),
+            start_equity_cents: first,
+            end_equity_cents: last,
+            profit_cents,
+            return_bps: if experiment.spec.initial_cash_cents > 0 {
+                profit_cents * 10_000 / experiment.spec.initial_cash_cents
+            } else {
+                0
+            },
+            max_drawdown_cents: series.max_drawdown_cents,
+            max_drawdown_day: series.max_drawdown_day,
+            drawdown_bps: if peak > 0 {
+                series.max_drawdown_cents * 10_000 / peak
+            } else {
+                0
+            },
+            fees_cents,
+            trades: fills.len(),
+            price_set_id: series.price_set_id,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(Some(report))
+    }
+}

@@ -446,6 +446,8 @@ assert _diff["matched"] == 1, _diff
 assert len(_diff["base_only"]) == 1 and _diff["candidate_only"] == [], _diff
 assert _diff["base_only"][0]["side"] == "buy", _diff
 assert _diff["digest"] and len(_diff["digest"]) == 64, _diff
+_exp_perf = call("experiments/shadow-base-1/performance?days=2026-10-30,2026-11-02")
+assert _exp_perf["status"] == "unavailable" and _exp_perf["reason"] == "no_reviewed_price_set", _exp_perf
 _base_output = json.loads((_ROOT / "data" / "research-output-momentum-v1.json").read_text(encoding="utf8"))
 assert len(_base_output["signals"]) == 2
 shutil.rmtree(_shadow_dir)
