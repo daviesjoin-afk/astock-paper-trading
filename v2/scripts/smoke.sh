@@ -392,6 +392,19 @@ evolution = call("evolution/decisions", {
                   "trades": 25, "return_bps": 700, "drawdown_bps": 900},
 })
 assert evolution["status"] == "promoted", evolution
+# Decisions are persisted for audit.
+event = call("evolution/events", {
+    "event_id": "smoke-evo-1",
+    "decided_at": "2026-11-05T15:00:00+08:00",
+    "kind": "promotion",
+    "incumbent": {"candidate_id": "base", "out_of_sample_days": 30, "shadow_days": 15,
+                  "trades": 40, "return_bps": 500, "drawdown_bps": 800},
+    "candidate": {"candidate_id": "cand", "out_of_sample_days": 25, "shadow_days": 12,
+                  "trades": 25, "return_bps": 700, "drawdown_bps": 900},
+})
+assert event["event_id"] == "smoke-evo-1" and event["status"] == "promoted", event
+events = call("evolution/events?limit=5")
+assert events[0]["event_id"] == "smoke-evo-1", events
 # The account ledger proves its own invariants and links fills to outcomes.
 audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit
@@ -473,7 +486,7 @@ assert last_step["session"]["status"] == "completed" and last_step["session"]["c
 assert call("paper-sessions/smoke-session")["status"] == "completed"
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
