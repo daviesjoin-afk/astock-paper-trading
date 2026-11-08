@@ -3011,3 +3011,70 @@ fn account_audit_verifies_session_orders_against_frozen_signals() {
     assert!(!tampered.ok);
     assert!(tampered.checks.iter().any(|check| check.name == "session_signals" && !check.ok));
 }
+
+fn temp_price_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "astock-price-sets-{name}-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn price_sets_load_from_a_directory_and_refuse_bad_artifacts() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("loader-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("loader-acct", PaperSlotId::A, buy)).unwrap();
+    let day = order.outcome.fill.expect("filled").trade_day;
+
+    // A missing directory means "no reviewed data yet", not an error.
+    let missing = std::env::temp_dir().join(format!("astock-missing-{}", std::process::id()));
+    assert!(db.price_set_catalogue_in(&missing).unwrap().is_empty());
+
+    // Synthetic files are listed but never selected for a user valuation.
+    let dir = temp_price_dir("synthetic");
+    let synthetic = price_set("synthetic", &day, 1_300, MARKET_DATA_PACK_ID);
+    std::fs::write(
+        dir.join("set-1.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    let catalogue = db.price_set_catalogue_in(&dir).unwrap();
+    assert_eq!(catalogue.len(), 1);
+    assert_eq!(catalogue[0].trust, "synthetic");
+    assert_eq!(catalogue[0].entries, 1);
+    assert_eq!(catalogue[0].digest.len(), 64);
+    let report = db.paper_valuation_in_dir("loader-acct", &day, &dir).unwrap();
+    assert_eq!(report.status, "unavailable");
+
+    // Duplicate ids across files are rejected by the catalogue.
+    let duplicate_dir = temp_price_dir("duplicate");
+    std::fs::write(
+        duplicate_dir.join("a.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        duplicate_dir.join("b.json"),
+        serde_json::to_string(&synthetic).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.price_set_catalogue_in(&duplicate_dir),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "duplicate_price_set_id"
+    ));
+
+    // Malformed artifacts fail loudly instead of being skipped.
+    let broken_dir = temp_price_dir("broken");
+    std::fs::write(broken_dir.join("bad.json"), "{\"schema_version\":1}").unwrap();
+    assert!(db.price_set_catalogue_in(&broken_dir).is_err());
+
+    for path in [dir, duplicate_dir, broken_dir] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
