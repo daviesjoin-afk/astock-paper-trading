@@ -1470,6 +1470,13 @@ const renderAllocation = (report: AllocationProposal | null): void => {
     li.textContent =
       `${item.slot}：评分 ${item.score_bps} bps · ${(item.current_bps / 100).toFixed(1)}% → ` +
       `${(item.target_bps / 100).toFixed(1)}%（${item.note}）`;
+    if (item.note.includes("版本切换")) {
+      const flag = document.createElement("span");
+      flag.className = "version-flag";
+      flag.dataset.testid = "version-flag";
+      flag.textContent = "版本切换";
+      li.append(" ", flag);
+    }
     return li;
   }));
 };

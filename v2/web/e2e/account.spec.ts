@@ -154,7 +154,7 @@ test.describe("paper account console", () => {
         proposal: {
           status: "proposed", reserve_bps: 1_000, digest: "a".repeat(64),
           rationale: [
-            { slot: "A", current_bps: 4_500, target_bps: 3_500, score_bps: -50, note: "保留下限" },
+            { slot: "A", current_bps: 4_500, target_bps: 3_500, score_bps: -50, note: "保留下限；窗口内发生策略版本切换，历史绩效来自旧版本" },
             { slot: "B", current_bps: 4_500, target_bps: 5_500, score_bps: 120, note: "获得更多预算" },
           ],
         },
@@ -175,6 +175,7 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-allocation")).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId("allocation-summary")).toContainText("目标：A 35.0% · B 55.0%");
     await expect(page.getByTestId("allocation-rationale")).toContainText("获得更多预算");
+    await expect(page.getByTestId("version-flag")).toHaveCount(1);
     await page.getByTestId("allocation-apply").click();
     await expect.poll(() => posted).not.toBeNull();
     expect(posted?.["targets"]).toEqual([3_500, 5_500]);
