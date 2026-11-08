@@ -100,6 +100,11 @@ form, no valuation.
 - Recent orders: time (China), slot, signal label, side, result and either the
   fill (quantity, price, fees) or the rejection reason. Raw signal ids stay in
   the cell tooltip.
+- Sessions: each session card shows status (未开始/运行中/已暂停/已停止/已完成),
+  the explicit clock and cursor progress, plus the controls that are legal for
+  that status (启动 / 暂停 / 继续 / 运行到结束 / 停止). Controls POST only to
+  `/v2/paper-sessions/{id}/{action}`; the panel reloads the account afterwards
+  so orders and cash never drift from the ledger.
 - Empty catalogue, missing account and fetch failures are distinct states; a
   failed read never renders a different account.
 - The page only issues GETs. Everything shown is derived from the account spec

@@ -1048,6 +1048,11 @@ type PaperOrderRecord = {
   duplicate: boolean;
 };
 
+type PaperSessionView = {
+  session_id: string; account_id: string; status: string;
+  clock_at: string; cursor: number; total: number; last_order_id: number | null;
+};
+
 let accounts: PaperAccountSummary[] = [];
 let currentAccountId = "";
 const accountSelect = byId<HTMLSelectElement>("account-select");
@@ -1162,15 +1167,109 @@ const renderAccount = (account: PaperAccountView, orders: PaperOrderRecord[]): v
   toggle(testId("account-orders-empty"), orders.length === 0);
 };
 
+const postJson = async <T>(path: string, body: unknown): Promise<T> => {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw new ApiError(null, error instanceof Error ? error.message : String(error));
+  }
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new ApiError(response.status, text.slice(0, 400));
+  }
+  return (await response.json()) as T;
+};
+
+const SESSION_STATUS: Record<string, string> = {
+  created: "未开始", running: "运行中", paused: "已暂停",
+  stopped: "已停止", completed: "已完成",
+};
+
+const sessionCard = (session: PaperSessionView): HTMLElement => {
+  const card = document.createElement("article");
+  card.className = "account-session";
+  card.dataset.testid = `session-card-${session.session_id}`;
+
+  const head = document.createElement("header");
+  head.className = "account-session-head";
+  const title = document.createElement("strong");
+  title.textContent = session.session_id;
+  const status = document.createElement("span");
+  status.className = "pill";
+  status.dataset.state = session.status === "running" ? "active" : session.status === "paused" ? "completed" : "idle";
+  status.textContent = SESSION_STATUS[session.status] ?? session.status;
+  head.append(title, status);
+
+  const meta = document.createElement("p");
+  meta.className = "account-session-meta";
+  meta.textContent = `时钟 ${decisionTime(session.clock_at)} · 进度 ${session.cursor}/${session.total}`;
+
+  const actions = document.createElement("div");
+  actions.className = "account-session-actions";
+  const add = (action: string, label: string, primary = false): void => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = primary ? "btn btn-small" : "btn btn-quiet btn-small";
+    button.dataset.action = action;
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      void sessionAction(session.session_id, action);
+    });
+    actions.appendChild(button);
+  };
+  if (session.status === "created") add("start", "启动", true);
+  if (session.status === "running") {
+    add("pause", "暂停");
+    add("run", "运行到结束", true);
+  }
+  if (session.status === "paused") {
+    add("resume", "继续", true);
+    add("run", "运行到结束");
+  }
+  if (session.status === "running" || session.status === "paused") add("stop", "停止");
+
+  card.append(head, meta, actions);
+  return card;
+};
+
+const renderSessions = (sessions: PaperSessionView[]): void => {
+  const container = byId("account-sessions");
+  container.replaceChildren(...sessions.map(sessionCard));
+  toggle(testId("account-sessions-empty"), sessions.length === 0);
+};
+
+const sessionAction = async (sessionId: string, action: string): Promise<void> => {
+  clearAccountError();
+  try {
+    await postJson(`/v2/paper-sessions/${encodeURIComponent(sessionId)}/${action}`, {});
+    announce(`会话 ${sessionId} 已执行 ${action}`);
+    await loadAccount(currentAccountId);
+  } catch (error) {
+    showAccountError(`会话操作失败：${errorDetail(error)}`);
+    announce("会话操作失败");
+  }
+};
+
 const loadAccount = async (accountId: string): Promise<void> => {
   if (!accountId) return;
   clearAccountError();
   currentAccountId = accountId;
   const encoded = encodeURIComponent(accountId);
   try {
-    const [account, orders] = await Promise.all([
+    const [account, orders, sessions] = await Promise.all([
       api<PaperAccountView>(`/v2/paper-accounts/${encoded}`, new AbortController().signal),
       api<PaperOrderRecord[]>(`/v2/paper-accounts/${encoded}/orders`, new AbortController().signal),
+      api<PaperSessionView[]>(
+        `/v2/paper-sessions?account_id=${encoded}`,
+        new AbortController().signal,
+      ),
     ]);
     if (account.account_id !== accountId) {
       showAccountError("返回的账户与请求不一致");
@@ -1178,6 +1277,7 @@ const loadAccount = async (accountId: string): Promise<void> => {
     }
     syncAccountUrl(accountId);
     renderAccount(account, Array.isArray(orders) ? orders : []);
+    renderSessions(Array.isArray(sessions) ? sessions : []);
   } catch (error) {
     toggle(accountBody, false);
     showAccountError(`读取账户失败：${errorDetail(error)}`);

@@ -109,6 +109,15 @@ pub struct PaperAccountView {
     pub slots: Vec<PaperSlotView>,
 }
 
+/// Summary returned by a batch run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperSessionRun {
+    pub session: PaperSessionView,
+    pub steps: usize,
+    pub filled: usize,
+    pub rejected: usize,
+}
+
 /// Status snapshot of one deterministic paper session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperSessionView {
@@ -1250,5 +1259,43 @@ impl Store {
             params![next_cursor as i64, signal.decision_at, order.id, status, session_id],
         )?;
         Ok(PaperSessionStep { session: self.paper_session(session_id)?, order: Some(order) })
+    }
+}
+// ---------------------------------------------------------------------------
+// Paper session batch run: advance the deterministic clock until the session
+// stops being "running" (paused, stopped or completed). One order per step.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn run_paper_session(&mut self, session_id: &str) -> StoreResult<PaperSessionRun> {
+        let mut steps = 0usize;
+        let mut filled = 0usize;
+        let mut rejected = 0usize;
+        loop {
+            let view = self.paper_session(session_id)?;
+            if view.status != "running" {
+                break;
+            }
+            let step = self.step_paper_session(session_id)?;
+            match step.order {
+                Some(order) => {
+                    steps += 1;
+                    match order.outcome.status {
+                        crate::domain::DecisionStatus::Filled => filled += 1,
+                        crate::domain::DecisionStatus::Rejected => rejected += 1,
+                    }
+                }
+                None => break,
+            }
+            if steps >= view.total.saturating_add(1) {
+                break;
+            }
+        }
+        Ok(PaperSessionRun {
+            session: self.paper_session(session_id)?,
+            steps,
+            filled,
+            rejected,
+        })
     }
 }

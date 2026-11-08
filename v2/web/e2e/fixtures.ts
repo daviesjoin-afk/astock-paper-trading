@@ -13,6 +13,8 @@ const dataDir = fileURLToPath(new URL("../../data/", import.meta.url));
 export const PACK = "cn-offline-fixture-pack-1";
 
 export const PAPER_ACCOUNT = "e2e-account";
+export const SESSION_ACCOUNT = "e2e-session-account";
+export const PAPER_SESSION = "e2e-session";
 
 export const CYCLES = {
   holdings: "e2e-holdings",
@@ -146,7 +148,59 @@ export async function ensureFixtures(api: APIRequestContext): Promise<void> {
   // to the other experiments (one payload per quote identity).
   await realise(api, CYCLES.rejected, [{ ...signals[1], signal_id: "e2e-rejected-sell" }]);
   await ensurePaperAccount(api, signals);
+  await ensureSessionAccount(api, signals);
   ready = true;
+}
+
+/** A second account dedicated to session control, so console tests stay stable. */
+async function ensureSessionAccount(
+  api: APIRequestContext,
+  signals: Output["signals"],
+): Promise<void> {
+  const created = await api.post("/v2/paper-accounts", {
+    data: {
+      schema_version: 1,
+      account_id: SESSION_ACCOUNT,
+      initial_cash_cents: 10_000_000,
+      reserve_bps: 1_000,
+      created_at: "2026-11-08T09:00:00+08:00",
+      slots: [
+        {
+          slot: "A", strategy: artifact(), market_data_pack_id: PACK,
+          execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
+        },
+        {
+          slot: "B", strategy: reversionArtifact(), market_data_pack_id: PACK,
+          execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
+        },
+      ],
+    },
+  });
+  if (!created.ok() && created.status() !== 409) {
+    throw new Error(`session account: ${created.status()} ${await created.text()}`);
+  }
+  const session = await api.post("/v2/paper-sessions", {
+    data: {
+      schema_version: 1,
+      session_id: PAPER_SESSION,
+      account_id: SESSION_ACCOUNT,
+      start_at: "2026-10-30T00:00:00+08:00",
+      signals: signals.map((signal) => ({
+        slot: "A",
+        signal_id: `session-${signal.signal_id}`,
+        decision_at: signal.decision_at,
+        signal: { symbol: signal.symbol, side: signal.side },
+        quote_ref: {
+          market_data_pack_id: signal.market_data_pack_id,
+          source: signal.source,
+          quote_id: signal.quote_id,
+        },
+      })),
+    },
+  });
+  if (!session.ok() && session.status() !== 409) {
+    throw new Error(`paper session: ${session.status()} ${await session.text()}`);
+  }
 }
 
 /** One user-funded account with two slots and one filled slot-A order. */

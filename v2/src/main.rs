@@ -133,6 +133,22 @@ async fn create_paper_session(
     response(db.create_paper_session(spec).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct SessionListQuery {
+    account_id: Option<String>,
+}
+
+async fn paper_sessions(
+    State(state): State<Shared>,
+    Query(query): Query<SessionListQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(
+        db.paper_sessions(query.account_id.as_deref(), 100)
+            .map_err(api_error)?,
+    )
+}
+
 async fn paper_session(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     let db = state.lock().await;
     response(db.paper_session(&id).map_err(api_error)?)
@@ -148,6 +164,7 @@ async fn paper_session_action(
             response(db.paper_session_action(&session_id, &action).map_err(api_error)?)
         }
         "step" => response(db.step_paper_session(&session_id).map_err(api_error)?),
+        "run" => response(db.run_paper_session(&session_id).map_err(api_error)?),
         _ => Err((
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error": "unsupported_paper_session_action"})),
@@ -200,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v2/paper-accounts/{account_id}/orders",
             post(submit_paper_order).get(paper_orders),
         )
-        .route("/v2/paper-sessions", post(create_paper_session))
+        .route("/v2/paper-sessions", post(create_paper_session).get(paper_sessions))
         .route("/v2/paper-sessions/{session_id}", get(paper_session))
         .route(
             "/v2/paper-sessions/{session_id}/{action}",
