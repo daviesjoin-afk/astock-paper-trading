@@ -110,6 +110,36 @@ async fn price_set_days(
     )
 }
 
+#[derive(Deserialize)]
+struct CoverageQuery {
+    pack_id: String,
+    symbols: String,
+    days: String,
+}
+
+async fn price_set_coverage(
+    State(state): State<Shared>,
+    Query(query): Query<CoverageQuery>,
+) -> ApiResult {
+    let symbols: Vec<String> = query
+        .symbols
+        .split(',')
+        .map(|symbol| symbol.trim().to_string())
+        .filter(|symbol| !symbol.is_empty())
+        .collect();
+    let days: Vec<String> = query
+        .days
+        .split(',')
+        .map(|day| day.trim().to_string())
+        .filter(|day| !day.is_empty())
+        .collect();
+    let db = state.lock().await;
+    response(
+        db.price_set_coverage(&query.pack_id, &symbols, &days)
+            .map_err(api_error)?,
+    )
+}
+
 async fn accounts_overview(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     response(db.accounts_overview().map_err(api_error)?)
@@ -672,6 +702,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/evolution/events/page", get(evolution_events_page))
         .route("/v2/price-sets", get(price_set_catalogue))
         .route("/v2/price-sets/days", get(price_set_days))
+        .route("/v2/price-sets/coverage", get(price_set_coverage))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
         .route(
             "/v2/paper-accounts/{account_id}/valuation",

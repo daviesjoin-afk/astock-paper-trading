@@ -386,6 +386,9 @@ assert catalogue[0]["price_set_id"] == "smoke-synthetic", catalogue
 assert catalogue[0]["trust"] == "synthetic", catalogue
 # Only reviewed prices count as covered days; the catalog is synthetic.
 assert call("price-sets/days?pack_id=cn-offline-fixture-pack-1&symbol=600000.SH") == []
+coverage = call("price-sets/coverage?pack_id=cn-offline-fixture-pack-1&symbols=600000.SH&days=2026-10-30,2026-11-02")
+assert coverage["covered_pairs"] == 0, coverage
+assert len(coverage["missing"]) == 2, coverage
 # Evolution governance: evidence-based promotion, no lucky single backtest.
 evolution = call("evolution/decisions", {
     "kind": "promotion",
