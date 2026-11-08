@@ -3593,3 +3593,61 @@ fn shadow_experiments_require_a_reviewed_source_digest() {
         Err(StoreError::Conflict(_)) | Err(StoreError::Rules(_))
     ));
 }
+
+#[test]
+fn signal_diff_reports_only_changed_signals() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_experiment(spec("base-cycle", INITIAL_CASH_CENTS)).unwrap();
+    let output = frozen_momentum_output();
+    realise_frozen_signals(&mut db, "base-cycle", &output);
+
+    // A shadow experiment reusing the reviewed source but different parameters.
+    let reviewed = reviewed_artifact();
+    let mut shadow = reviewed.clone();
+    shadow.strategy_version_id = "shadow-research-momentum-v1-diff".into();
+    let parameters = serde_json::json!({"lookback": 3, "threshold_bps": 25});
+    shadow.parameters_canonical = crate::domain::canonical_json_text(&parameters);
+    shadow.parameters_digest = crate::domain::canonical_digest(&parameters);
+    db.create_experiment(crate::domain::ExperimentSpec {
+        schema_version: 1,
+        cycle_id: "shadow-cycle".into(),
+        strategy: shadow.clone(),
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+        execution_policy_version: POLICY_VERSION.into(),
+        initial_cash_cents: INITIAL_CASH_CENTS,
+    })
+    .unwrap();
+
+    // Copy the first base run, retime it and re-identify it for the shadow cycle.
+    let mut request = db.runs("base-cycle", 10).unwrap().into_iter().next().unwrap().request;
+    request.cycle_id = "shadow-cycle".into();
+    request.strategy_version_id = shadow.strategy_version_id.clone();
+    request.signal_id = "shadow-diff-signal".into();
+    request.decision_at = "2026-10-30T14:30:00+08:00".into();
+    db.conn
+        .execute(
+            r#"INSERT INTO v2_simulation_runs
+             (cycle_id,strategy_version_id,signal_id,request_json,outcome_json,evidence_json,
+              calendar_version,session_policy_version,instrument_version)
+             SELECT 'shadow-cycle',?,'shadow-diff-signal',?,'{"status":"rejected","reason":"x","fill":null,"cash_after_cents":1}',
+                    evidence_json,calendar_version,session_policy_version,instrument_version
+             FROM v2_simulation_runs WHERE cycle_id='base-cycle' ORDER BY id LIMIT 1"#,
+            rusqlite::params![shadow.strategy_version_id, serde_json::to_string(&request).unwrap()],
+        )
+        .unwrap();
+
+    let diff = db.signal_diff("base-cycle", "shadow-cycle").unwrap();
+    assert_eq!(diff.base_runs, 2);
+    assert_eq!(diff.candidate_runs, 1);
+    assert_eq!(diff.matched, 0);
+    assert_eq!(diff.base_only.len() + diff.matched as usize, 2);
+    assert_eq!(diff.candidate_only.len(), 1);
+    assert_eq!(diff.candidate_only[0].decision_at, "2026-10-30T14:30:00+08:00");
+    assert_eq!(diff.digest.len(), 64);
+    assert_eq!(diff, db.signal_diff("base-cycle", "shadow-cycle").unwrap());
+
+    assert!(matches!(
+        db.signal_diff("missing-cycle", "shadow-cycle"),
+        Err(StoreError::NotFound(_))
+    ));
+}

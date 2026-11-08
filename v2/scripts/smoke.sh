@@ -431,6 +431,18 @@ _shadow_result = _shadow.run("http://127.0.0.1:8765", _artifact, _output,
 assert _shadow_result["signals"] == len(_output["signals"]) == 1, _shadow_result
 assert _shadow_result["runs_total"] == 1, _shadow_result
 assert _shadow_result["filled"] + _shadow_result["rejected"] == 1, _shadow_result
+_base_artifact = json.loads((_ROOT / "data" / "strategy-momentum-v1.json").read_text(encoding="utf8"))
+_base_output = json.loads((_ROOT / "data" / "research-output-momentum-v1.json").read_text(encoding="utf8"))
+_base_result = _shadow.run("http://127.0.0.1:8765", _base_artifact, _base_output,
+                           "shadow-base-1", 10_000_000,
+                           "cn-offline-fixture-pack-1", "v2-paper-policy-6")
+assert _base_result["signals"] == 2 and _base_result["runs_total"] == 2, _base_result
+_diff = call("signal-diff?base_cycle=shadow-base-1&candidate_cycle=shadow-candidate-1")
+assert _diff["base_runs"] == 2 and _diff["candidate_runs"] == 1, _diff
+assert _diff["matched"] == 1, _diff
+assert len(_diff["base_only"]) == 1 and _diff["candidate_only"] == [], _diff
+assert _diff["base_only"][0]["side"] == "buy", _diff
+assert _diff["digest"] and len(_diff["digest"]) == 64, _diff
 _base_output = json.loads((_ROOT / "data" / "research-output-momentum-v1.json").read_text(encoding="utf8"))
 assert len(_base_output["signals"]) == 2
 shutil.rmtree(_shadow_dir)
@@ -561,7 +573,7 @@ with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"
-    assert connection.execute("SELECT count(*) FROM v2_fills").fetchone()[0] == 3
+    assert connection.execute("SELECT count(*) FROM v2_fills f JOIN v2_simulation_runs r ON r.id=f.run_id WHERE r.cycle_id NOT LIKE 'shadow-%'").fetchone()[0] == 3
     for request_json, evidence_json, version in connection.execute("SELECT request_json,evidence_json,instrument_version FROM v2_simulation_runs"):
         assert version == instrument_version
         evidence = json.loads(evidence_json)

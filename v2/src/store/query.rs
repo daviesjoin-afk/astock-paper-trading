@@ -1354,3 +1354,82 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?)
     }
 }
+// ---------------------------------------------------------------------------
+// Signal-level diff between two experiments: what a shadow candidate actually
+// changed, independent of strategy ids and order quantities.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn signal_diff(
+        &self,
+        base_cycle: &str,
+        candidate_cycle: &str,
+    ) -> StoreResult<SignalDiffReport> {
+        let base = self.runs(base_cycle, 1000)?;
+        let candidate = self.runs(candidate_cycle, 1000)?;
+        let mut base_counts: std::collections::BTreeMap<String, (SignalFingerprint, i64)> =
+            std::collections::BTreeMap::new();
+        for run in &base {
+            let fingerprint = fingerprint(&run.request);
+            let key = serde_json::to_string(&fingerprint)?;
+            base_counts.entry(key).or_insert((fingerprint, 0)).1 += 1;
+        }
+        let mut candidate_counts: std::collections::BTreeMap<String, (SignalFingerprint, i64)> =
+            std::collections::BTreeMap::new();
+        for run in &candidate {
+            let fingerprint = fingerprint(&run.request);
+            let key = serde_json::to_string(&fingerprint)?;
+            candidate_counts
+                .entry(key)
+                .or_insert((fingerprint, 0))
+                .1 += 1;
+        }
+        let mut matched = 0i64;
+        let mut base_only = Vec::new();
+        for (key, (print, count)) in &base_counts {
+            let overlap = candidate_counts
+                .get(key)
+                .map(|(_, candidate_count)| (*candidate_count).min(*count))
+                .unwrap_or(0);
+            matched += overlap;
+            for _ in 0..(*count - overlap) {
+                base_only.push(print.clone());
+            }
+        }
+        let mut candidate_only = Vec::new();
+        for (key, (print, count)) in &candidate_counts {
+            let overlap = base_counts
+                .get(key)
+                .map(|(_, base_count)| (*base_count).min(*count))
+                .unwrap_or(0);
+            for _ in 0..(*count - overlap) {
+                candidate_only.push(print.clone());
+            }
+        }
+        let mut report = SignalDiffReport {
+            base_cycle: base_cycle.into(),
+            candidate_cycle: candidate_cycle.into(),
+            base_runs: base.len(),
+            candidate_runs: candidate.len(),
+            matched,
+            base_only,
+            candidate_only,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
+    }
+}
+
+fn fingerprint(request: &SimulationRequest) -> SignalFingerprint {
+    SignalFingerprint {
+        decision_at: request.decision_at.clone(),
+        quote_ref: request.quote_ref.clone(),
+        symbol: request.signal.symbol.clone(),
+        side: request.signal.side.clone(),
+    }
+}

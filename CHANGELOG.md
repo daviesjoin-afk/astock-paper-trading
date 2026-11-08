@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 影子信号差异报告（ADR 015）：新增只读 `GET /v2/signal-diff?base_cycle=&candidate_cycle=`——以 `{decision_at, quote_ref, symbol, side}` 指纹做多重集合比较，输出 `matched / base_only / candidate_only / base_runs / candidate_runs` 与 canonical 摘要；不比较 signal_id、数量与成交结果。冒烟新增基准运行（审核工件 2 信号）与差异断言（命中 1、基准独有 1 买入、候选独有 0），并把既有成交计数限定为非影子实验。Rust 139 passed（差异命中/独有/确定性/404）；Python 32 / 浏览器 108 不变。
 - V2 影子候选实验边界（ADR 014）：实验接口允许 `shadow-` 前缀工件（须自洽、`source_digest` 等于某个审核策略源码摘要、研究输入为审核输入），为候选提供影子运行入口；纸面账户仍只接受审核工件，影子实验不享受审核输出复现。新增 `scripts/shadow_candidates.py`：创建实验 → 导入报价证据 → 提交冻结信号 → 输出计数；冒烟端到端验证 `lookback=3` 候选 1 条信号、`runs_total=1`。Rust 138 passed（影子接受/未知源码拒绝/漂移拒绝）；Python 32 / 浏览器 108 不变。
 - V2 参数化策略与候选工件（ADR 013）：`momentum`/`reversion` 的 `signals(entries, parameters=None)` 支持从工件读取参数，`research_contract.build_output` 以 `parameters_canonical` 为准；源码变更后经 `run_research.py --emit` 重新生成审核工件与输出并通过 `--check`（默认信号不变，仅摘要更新）。新增 `research/emit_candidate_artifacts.py`：候选清单 → 自洽工件 + 冻结信号（复用审核源码 `source_digest`，独立参数与身份，字节确定）。Python 研究套件 32 passed（新增 4：自洽/信号差异/确定性/CLI）。Rust 137 / 浏览器 108 / 冒烟不变。
 - V2 运维加固（阶段 6）：`GET /v2/health` 增加 `schema_version`、`price_sets` 与 `writer` 字段；冒烟新增并发幂等验证（8 线程同订单 → 1 笔成交、7 duplicate、orders_total=1、审计通过）与健康字段断言；新增 `v2/docs/OPERATIONS.md`（单写者模型、cron 推进示例、价格集合发布、备份/恢复、升级回滚、故障排查）。Rust 137 / 浏览器 108 不变。
