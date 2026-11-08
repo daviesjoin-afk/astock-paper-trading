@@ -17,11 +17,17 @@ STRATEGY_VERSION_ID = "research-reversion-v1"
 PARAMETERS = {"lookback": 2, "threshold_bps": 40}
 
 
-def signals(entries):
-    """Return (entry, side) pairs in observation order."""
+def signals(entries, parameters=None):
+    """Return (entry, side) pairs in observation order.
+
+    `parameters` lets a reviewed candidate override the default parameter map
+    without touching the rule; it must be the exact map recorded in its
+    artifact (the runtime passes the artifact's canonical parameters).
+    """
+    active = parameters if parameters is not None else PARAMETERS
     prices = [entry["quote"]["price_cents"] for entry in entries]
-    lookback = PARAMETERS["lookback"]
-    threshold = PARAMETERS["threshold_bps"]
+    lookback = active["lookback"]
+    threshold = active["threshold_bps"]
     emitted = []
     for index, entry in enumerate(entries):
         if index < lookback:

@@ -7,6 +7,6 @@
   "research_input_id": "offline-research-input-v1",
   "runtime_version": "python-3.13-stdlib",
   "schema_version": 2,
-  "source_digest": "0575ebd0bffb093c7598b2227759d24a509bd53b96c76f84ea601233184849c4",
+  "source_digest": "3c9dde5d25149f08846c884a825e7e50e38089aa9bd689b48da3f322d68ac8d2",
   "strategy_version_id": "research-momentum-v1"
 }

@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 参数化策略与候选工件（ADR 013）：`momentum`/`reversion` 的 `signals(entries, parameters=None)` 支持从工件读取参数，`research_contract.build_output` 以 `parameters_canonical` 为准；源码变更后经 `run_research.py --emit` 重新生成审核工件与输出并通过 `--check`（默认信号不变，仅摘要更新）。新增 `research/emit_candidate_artifacts.py`：候选清单 → 自洽工件 + 冻结信号（复用审核源码 `source_digest`，独立参数与身份，字节确定）。Python 研究套件 32 passed（新增 4：自洽/信号差异/确定性/CLI）。Rust 137 / 浏览器 108 / 冒烟不变。
 - V2 运维加固（阶段 6）：`GET /v2/health` 增加 `schema_version`、`price_sets` 与 `writer` 字段；冒烟新增并发幂等验证（8 线程同订单 → 1 笔成交、7 duplicate、orders_total=1、审计通过）与健康字段断言；新增 `v2/docs/OPERATIONS.md`（单写者模型、cron 推进示例、价格集合发布、备份/恢复、升级回滚、故障排查）。Rust 137 / 浏览器 108 不变。
 - V2 进化事件筛选：`GET /v2/evolution/events` 支持 `candidate`（精确）与 `status`（精确）过滤，在最近 200 条内过滤后按 `limit` 截断；进化历史视图新增候选输入与状态下拉（客户端过滤），“无匹配”与“无事件”文案区分。Rust 137 passed（过滤组合/limit）；浏览器 108 passed（筛选用例）；冒烟覆盖状态与候选过滤。
 - V2 进化历史视图：新增第 8 个视图“进化历史”（快捷键 8）——读取 `GET /v2/evolution/events`，按事件展示候选 id、状态胶囊（已晋级/已淘汰/已回退/保持/证据不足）、决策时刻与逐条规则理由；空日志与读取失败都有明确文案，快捷键面板更新为 1–8。浏览器新增 5 项测试（列表/空态/快捷键/390px/axe），合计 107 passed；截图 `after-evolution.png`。
