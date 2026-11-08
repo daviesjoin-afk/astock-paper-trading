@@ -116,6 +116,36 @@ struct EquitySeriesQuery {
     days: String,
 }
 
+async fn paper_allocation_proposal(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<EquitySeriesQuery>,
+) -> ApiResult {
+    let days: Vec<String> = query
+        .days
+        .split(',')
+        .map(|day| day.trim().to_string())
+        .filter(|day| !day.is_empty())
+        .collect();
+    let db = state.lock().await;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("ASTOCK_PRICE_SETS_DIR")
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|| "data/price-sets".into()),
+    );
+    match db
+        .paper_allocation_proposal(&id, &days, &dir)
+        .map_err(api_error)?
+    {
+        Some(report) => response(report),
+        None => response(json!({
+            "status": "unavailable",
+            "reason": "no_reviewed_price_set",
+            "days": days.len(),
+        })),
+    }
+}
+
 async fn paper_account_audit(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -331,6 +361,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/audit",
             get(paper_account_audit),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/allocation-proposal",
+            get(paper_allocation_proposal),
         )
         .route(
             "/v2/paper-accounts/{account_id}/orders",

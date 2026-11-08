@@ -391,6 +391,9 @@ assert [check["name"] for check in audit["checks"]] == [
     "order_fill_link", "fill_matches_outcome", "session_link", "session_signals",
 ]
 # No reviewed price set is bundled: the equity series refuses instead of guessing.
+# Allocation proposals need reviewed prices; synthetic data never drives them.
+allocation = call("paper-accounts/smoke-account/allocation-proposal?days=2026-10-30,2026-11-02")
+assert allocation["status"] == "unavailable" and allocation["reason"] == "no_reviewed_price_set", allocation
 series = call("paper-accounts/smoke-account/equity-series?days=2026-10-30")
 assert series["status"] == "unavailable" and series["reason"] == "no_reviewed_price_set", series
 call("paper-accounts/smoke-account/equity-series?days=", expected=422)
