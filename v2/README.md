@@ -237,6 +237,7 @@ live trading or news learning.
 | 015 | signal-level diff |
 | 016 | performance metrics |
 | 017 | rolling-window validation |
+| 018 | explicit strategy-version switching (proposed) |
 
 ## Command cheat sheet
 
