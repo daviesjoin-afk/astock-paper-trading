@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 再平衡后下单行为验证：新增集成测试——同一账户先两步再平衡把 A 槽从 45% 缩到 30%（受步长上限约束），随后同一信号的下单量小于未再平衡基线且保持整手，现金/准备金守恒；ADR-009 记录该验证与“风控上限按当前预算成比例”的结论。Rust 149 passed；Python 44 / 浏览器 120 不变。
 - V2 事件按实验过滤：`GET /v2/evolution/events` 与分页端点新增 `base_cycle`/`candidate_cycle` 精确过滤（`evolution_events_filtered`，旧接口保持兼容），进化视图新增“实验”输入（匹配基准或候选 cycle）。Rust 148 passed（组合过滤/分页过滤/缺失组合）；浏览器 120 passed（+1 实验过滤）；冒烟覆盖实验过滤。
 - V2 进化事件关联实验（schema v14）：`POST /v2/evolution/events` 支持可选 `base_cycle/candidate_cycle`，列表与分页均返回并在进化视图展示“基准 … · 候选 …”；新增 `record_evolution_event_with_links`，旧接口保持兼容（空链接）。Rust 147 passed（写入/列表/分页关联）；浏览器 119 passed（卡片展示）；冒烟升级 v14 并覆盖带链接与无链接事件。
 - V2 价格集合发布脚本：新增 `v2/scripts/publish_price_set.sh`——生成器输出到临时目录、校验通过后安装到 `ASTOCK_PRICE_SETS_DIR`；目标已存在默认拒绝覆盖（退出码 3，`--force` 可覆盖），`--dry-run` 只打印计划，成功后输出 `published set/trust/entries/source_digest` 与覆盖核对命令。冒烟覆盖发布、拒绝覆盖与 dry-run；`OPERATIONS.md` 更新发布步骤。Rust 146 / Python 44 / 浏览器 119 不变。

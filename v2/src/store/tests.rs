@@ -4090,3 +4090,39 @@ fn evolution_events_filter_by_linked_experiments() {
     assert_eq!(page.events.len(), 1);
     assert_eq!(page.events[0].event_id, "link-a");
 }
+
+#[test]
+fn order_sizing_follows_slot_cash_after_rebalance() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("rebal-sized", 10_000_000)).unwrap();
+    db.create_paper_account(paper_spec("rebal-baseline", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+
+    let baseline = db
+        .submit_paper_order(paper_order("rebal-baseline", PaperSlotId::A, buy))
+        .unwrap();
+    let baseline_qty = baseline.outcome.fill.expect("baseline fill").quantity;
+
+    // Move money out of slot A: budget 3.0M / cash 3.0M instead of 4.5M.
+    // Step cap is 1000 bps per rebalance, so shrink in two steps.
+    for (digest, weights, at) in [
+        ("a".repeat(64), [3_500, 5_500], "2026-10-31T09:00:00+08:00"),
+        ("b".repeat(64), [3_000, 6_000], "2026-11-01T09:00:00+08:00"),
+    ] {
+        db.apply_rebalance("rebal-sized", weights, &digest, at, "shrink momentum slot")
+            .unwrap();
+    }
+    let sized = db
+        .submit_paper_order(paper_order("rebal-sized", PaperSlotId::A, buy))
+        .unwrap();
+    let fill = sized.outcome.fill.expect("sized fill");
+    assert!(fill.quantity < baseline_qty, "{} !< {}", fill.quantity, baseline_qty);
+    assert_eq!(fill.quantity % 100, 0);
+    let view = db.paper_account("rebal-sized").unwrap();
+    assert_eq!(view.slots[0].budget_cents, 3_000_000);
+    let spent = fill.quantity * fill.price_cents + fill.fees_cents;
+    assert_eq!(view.slots[0].cash_cents, 3_000_000 - spent);
+    assert_eq!(view.reserve_cents, 1_000_000);
+}
