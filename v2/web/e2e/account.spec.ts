@@ -305,6 +305,7 @@ test.describe("paper account console", () => {
     await openAccount(page);
     await expect(page.getByTestId("strategy-switch-list")).toContainText("research-momentum-v1 → research-momentum-v2", { timeout: 15_000 });
     await expect(page.getByTestId("strategy-current")).toContainText("切换 0 次");
+    await expect(page.getByTestId("switch-hint")).toContainText("切换不会平仓");
 
     await page.getByTestId("switch-version").fill("research-momentum-v3");
     await page.getByTestId("switch-at").fill("2026-11-10T09:00");
