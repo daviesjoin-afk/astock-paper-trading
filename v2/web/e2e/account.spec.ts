@@ -119,6 +119,34 @@ test.describe("paper account console", () => {
     await expect(points.first()).toContainText("2026-10-30");
   });
 
+  test("a covered series also shows return, drawdown and fees", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/.+\/equity-series\?/, (route) => route.fulfill({
+      json: {
+        status: "valued", trust: "reviewed", price_set_id: "reviewed-prices-2026-11",
+        points: [
+          { day: "2026-10-30", cash_cents: 9_600_000, market_value_cents: 390_000, equity_cents: 9_990_000 },
+          { day: "2026-11-02", cash_cents: 9_600_000, market_value_cents: 360_000, equity_cents: 9_960_000 },
+        ],
+        max_drawdown_cents: 30_000, max_drawdown_day: "2026-11-02",
+        profit_cents: -40_000, digest: "e".repeat(64),
+      },
+    }));
+    await page.route(/\/v2\/paper-accounts\/.+\/performance\?/, (route) => route.fulfill({
+      json: {
+        account_id: "e2e-account", days: 2, start_equity_cents: 9_990_000, end_equity_cents: 9_960_000,
+        profit_cents: -40_000, return_bps: -40, max_drawdown_cents: 30_000,
+        max_drawdown_day: "2026-11-02", drawdown_bps: 30, fees_cents: 500, trades: 1,
+        price_set_id: "reviewed-prices-2026-11", digest: "f".repeat(64),
+      },
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("equity-performance")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("equity-performance")).toContainText("收益 ¥-400.00");
+    await expect(page.getByTestId("equity-performance")).toContainText("回撤 0.30%");
+    await expect(page.getByTestId("equity-performance")).toContainText("费用 ¥5.00");
+    await expect(page.getByTestId("equity-performance")).toContainText("1 笔成交");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();

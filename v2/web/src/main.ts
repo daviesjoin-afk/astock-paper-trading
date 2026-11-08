@@ -1077,6 +1077,11 @@ type AccountExposure = {
   digest: string;
 };
 
+type PerformanceReport = {
+  days: number; profit_cents: number; return_bps: number;
+  max_drawdown_cents: number; drawdown_bps: number; fees_cents: number; trades: number;
+};
+
 type RebalanceRecord = {
   account_id: string; from_slot: string; to_slot: string; amount_cents: number;
   weights_before: [number, number]; weights_after: [number, number];
@@ -1580,6 +1585,24 @@ const loadAccount = async (accountId: string): Promise<void> => {
           new AbortController().signal,
         );
         if (currentAccountId === accountId) renderEquity(series);
+        if (series.status === "valued") {
+          try {
+            const performance = await api<PerformanceReport>(
+              `/v2/paper-accounts/${encoded}/performance?days=${encodeURIComponent(days.join(","))}`,
+              new AbortController().signal,
+            );
+            if (currentAccountId === accountId && "profit_cents" in performance) {
+              const line = testId<HTMLElement>("equity-performance");
+              toggle(line, true);
+              line.textContent =
+                `收益 ${money(performance.profit_cents)}（${(performance.return_bps / 100).toFixed(2)}%）· ` +
+                `回撤 ${(performance.drawdown_bps / 100).toFixed(2)}% · 费用 ${money(performance.fees_cents)} · ` +
+                `${performance.trades} 笔成交`;
+            }
+          } catch {
+            toggle(testId<HTMLElement>("equity-performance"), false);
+          }
+        }
       } catch {
         if (currentAccountId === accountId) renderEquity(null);
       }

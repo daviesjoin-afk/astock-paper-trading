@@ -126,6 +126,9 @@ form, no valuation.
   set, the panel prints “覆盖 n 个交易日 · 最大回撤 … · 盈亏 …” and one line per
   day. Without coverage the block stays hidden (no partial or interpolated
   series).
+- Performance: when a reviewed series is available, the equity block also
+  prints 收益（bps）/ 回撤 / 费用 / 成交笔数 from the performance endpoint; the
+  line stays hidden without coverage.
 - Audit: the account panel runs the read-only ledger audit on load and prints
   “账本自检：通过/失败 · 摘要”; a collapsible “审计详情” lists every check with
   its pass/fail marker and detail, so a failure is diagnosable in place.

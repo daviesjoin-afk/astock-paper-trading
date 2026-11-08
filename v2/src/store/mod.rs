@@ -152,6 +152,24 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// Performance metrics over a complete reviewed equity series.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerformanceReport {
+    pub account_id: String,
+    pub days: usize,
+    pub start_equity_cents: i64,
+    pub end_equity_cents: i64,
+    pub profit_cents: i64,
+    pub return_bps: i64,
+    pub max_drawdown_cents: i64,
+    pub max_drawdown_day: Option<String>,
+    pub drawdown_bps: i64,
+    pub fees_cents: i64,
+    pub trades: usize,
+    pub price_set_id: String,
+    pub digest: String,
+}
+
 /// One page of the evolution event log, newest first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionEventPage {
