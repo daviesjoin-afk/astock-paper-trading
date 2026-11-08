@@ -1660,3 +1660,46 @@ impl Store {
         Ok(Some(report))
     }
 }
+
+impl Store {
+    /// Value every requested window independently. A window without complete
+    /// reviewed coverage is marked unavailable instead of being skipped.
+    pub fn experiment_performance_segments(
+        &self,
+        cycle_id: &str,
+        segments: &[Vec<String>],
+        dir: &std::path::Path,
+    ) -> StoreResult<SegmentReport> {
+        if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+            return Err(StoreError::Rules(RuleError("empty_rolling_segment".into())));
+        }
+        let mut results = Vec::new();
+        for days in segments {
+            match self.experiment_performance(cycle_id, days, dir)? {
+                Some(performance) => results.push(SegmentResult {
+                    days: days.clone(),
+                    status: "valued".into(),
+                    reason: String::new(),
+                    performance: Some(performance),
+                }),
+                None => results.push(SegmentResult {
+                    days: days.clone(),
+                    status: "unavailable".into(),
+                    reason: "no_reviewed_price_set".into(),
+                    performance: None,
+                }),
+            }
+        }
+        let mut report = SegmentReport {
+            cycle_id: cycle_id.into(),
+            segments: results,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
+    }
+}

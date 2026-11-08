@@ -152,6 +152,23 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// One window of a rolling validation, valued or explicitly unavailable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentResult {
+    pub days: Vec<String>,
+    pub status: String,
+    pub reason: String,
+    pub performance: Option<ExperimentPerformanceReport>,
+}
+
+/// Rolling windows for one experiment; each window must stand on its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentReport {
+    pub cycle_id: String,
+    pub segments: Vec<SegmentResult>,
+    pub digest: String,
+}
+
 /// Performance metrics for one experiment cycle over a reviewed series.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExperimentPerformanceReport {

@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -78,6 +79,52 @@ def metrics_from_performance(report: dict) -> dict:
         "trades": report["trades"],
         "return_bps": report["return_bps"],
         "drawdown_bps": report["drawdown_bps"],
+    }
+
+
+def segments(api: str, cycle: str, windows: list[list[str]]) -> dict:
+    query = ";".join(",".join(window) for window in windows)
+    return call(
+        api,
+        f"experiments/{cycle}/performance/segments?segments={urllib.parse.quote(query, safe=',')}",
+    )
+
+
+def rolling_consistency(
+    base: dict,
+    candidate: dict,
+    *,
+    margin_bps: int = 50,
+    max_drawdown_bps: int = 1_500,
+) -> dict:
+    """Every window must stand on its own: coverage, edge over the base, risk."""
+    reasons = []
+    base_segments = base.get("segments", [])
+    candidate_segments = candidate.get("segments", [])
+    if len(base_segments) != len(candidate_segments) or not base_segments:
+        return {"status": "unstable", "reasons": ["窗口数量不一致或为空"], "windows": 0}
+    for index, (base_segment, candidate_segment) in enumerate(
+        zip(base_segments, candidate_segments, strict=True), start=1
+    ):
+        window = ",".join(candidate_segment.get("days", []))
+        if base_segment.get("status") != "valued" or candidate_segment.get("status") != "valued":
+            reasons.append(f"窗口 {index}（{window}）缺少完整覆盖")
+            continue
+        base_perf = base_segment["performance"]
+        candidate_perf = candidate_segment["performance"]
+        if candidate_perf["return_bps"] < base_perf["return_bps"] + margin_bps:
+            reasons.append(
+                f"窗口 {index}（{window}）优势不足：{candidate_perf['return_bps']} < "
+                f"{base_perf['return_bps']} + {margin_bps}"
+            )
+        if candidate_perf["drawdown_bps"] > max_drawdown_bps:
+            reasons.append(
+                f"窗口 {index}（{window}）回撤超限：{candidate_perf['drawdown_bps']} > {max_drawdown_bps}"
+            )
+    return {
+        "status": "consistent" if not reasons else "unstable",
+        "reasons": reasons,
+        "windows": len(base_segments),
     }
 
 
@@ -199,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record-event", action="store_true")
     parser.add_argument("--event-id")
     parser.add_argument("--decided-at")
+    parser.add_argument("--rolling-windows", default="")
+    parser.add_argument("--margin-bps", type=int, default=50)
+    parser.add_argument("--max-drawdown-bps", type=int, default=1_500)
     args = parser.parse_args(argv)
     artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
     output = json.loads(args.output.read_text(encoding="utf-8"))
@@ -213,7 +263,34 @@ def main(argv: list[str] | None = None) -> int:
             "base": performance(args.api, args.base_cycle, days),
             "candidate": performance(args.api, args.cycle, days),
         }
-    if args.decide and args.base_cycle and days:
+    rolling = None
+    if args.rolling_windows and args.base_cycle:
+        windows = [
+            [day.strip() for day in window.split(",") if day.strip()]
+            for window in args.rolling_windows.split(";")
+            if window.strip()
+        ]
+        base_report = segments(args.api, args.base_cycle, windows)
+        candidate_report = segments(args.api, args.cycle, windows)
+        rolling = rolling_consistency(
+            base_report,
+            candidate_report,
+            margin_bps=args.margin_bps,
+            max_drawdown_bps=args.max_drawdown_bps,
+        )
+        result["rolling"] = {
+            "windows": windows,
+            "base": base_report,
+            "candidate": candidate_report,
+            "consistency": rolling,
+        }
+    if args.decide and rolling is not None and rolling["status"] != "consistent":
+        result["decision"] = {
+            "status": "unstable",
+            "reason": "rolling_windows_failed",
+            "reasons": rolling["reasons"],
+        }
+    elif args.decide and args.base_cycle and days:
         result["decision"] = decide(
             args.api,
             args.base_cycle,

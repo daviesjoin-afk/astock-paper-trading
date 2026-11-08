@@ -3843,3 +3843,57 @@ fn experiment_performance_uses_fills_and_reviewed_prices() {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(synthetic_dir);
 }
+
+#[test]
+fn experiment_segments_require_each_window_to_be_covered() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_experiment(spec("seg-perf", INITIAL_CASH_CENTS)).unwrap();
+    let output = frozen_momentum_output();
+    realise_frozen_signals(&mut db, "seg-perf", &output);
+    let day1 = output.signals[0].decision_at[..10].to_string();
+    let day2 = output.signals[1].decision_at[..10].to_string();
+    let mut set = price_set("reviewed", &day1, 1_300, MARKET_DATA_PACK_ID);
+    set.coverage_end = day2.clone();
+    set.entries.push(crate::domain::PriceEntry {
+        symbol: "600000.SH".into(),
+        day: day2.clone(),
+        price_cents: 1_200,
+        source: "offline-fixture".into(),
+        observed_at: format!("{day2}T15:00:00+08:00"),
+    });
+    let dir = temp_price_dir("seg-perf");
+    std::fs::write(dir.join("set.json"), serde_json::to_string(&set).unwrap()).unwrap();
+
+    let report = db
+        .experiment_performance_segments(
+            "seg-perf",
+            &[vec![day1.clone()], vec![day2.clone()]],
+            &dir,
+        )
+        .unwrap();
+    assert_eq!(report.segments.len(), 2);
+    assert!(report.segments.iter().all(|segment| segment.status == "valued"));
+    assert!(report
+        .segments
+        .iter()
+        .all(|segment| segment.performance.is_some()));
+    assert_eq!(report.digest.len(), 64);
+
+    let missing = db
+        .experiment_performance_segments(
+            "seg-perf",
+            &[vec![day1.clone()], vec!["2026-11-30".into()]],
+            &dir,
+        )
+        .unwrap();
+    assert_eq!(missing.segments[0].status, "valued");
+    assert_eq!(missing.segments[1].status, "unavailable");
+    assert_eq!(missing.segments[1].reason, "no_reviewed_price_set");
+
+    assert!(matches!(
+        db.experiment_performance_segments("seg-perf", &[vec![]], &dir),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "empty_rolling_segment"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}

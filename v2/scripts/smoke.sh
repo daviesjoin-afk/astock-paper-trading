@@ -449,6 +449,11 @@ assert _diff["digest"] and len(_diff["digest"]) == 64, _diff
 _shadow_decision = _shadow.decide("http://127.0.0.1:8765", "shadow-base-1",
                                   "shadow-candidate-1", ["2026-10-30", "2026-11-02"])
 assert _shadow_decision["status"] == "unavailable", _shadow_decision
+_segments = call("experiments/shadow-base-1/performance/segments?segments=2026-10-30;2026-11-02")
+assert len(_segments["segments"]) == 2, _segments
+assert all(segment["status"] == "unavailable" for segment in _segments["segments"]), _segments
+_rolling = _shadow.rolling_consistency(_segments, _segments)
+assert _rolling["status"] == "unstable" and _rolling["windows"] == 2, _rolling
 _exp_perf = call("experiments/shadow-base-1/performance?days=2026-10-30,2026-11-02")
 assert _exp_perf["status"] == "unavailable" and _exp_perf["reason"] == "no_reviewed_price_set", _exp_perf
 _base_output = json.loads((_ROOT / "data" / "research-output-momentum-v1.json").read_text(encoding="utf8"))
