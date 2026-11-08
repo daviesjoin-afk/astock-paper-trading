@@ -3551,3 +3551,45 @@ fn evolution_events_filter_by_candidate_and_status() {
     assert_eq!(db.evolution_events(10, Some("cand-a"), Some("rejected")).unwrap().len(), 0);
     assert_eq!(db.evolution_events(1, None, None).unwrap().len(), 1);
 }
+
+#[test]
+fn shadow_experiments_require_a_reviewed_source_digest() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let reviewed = reviewed_artifact();
+    let mut shadow = reviewed.clone();
+    shadow.strategy_version_id = "shadow-research-momentum-v1-test1234".into();
+    let parameters = serde_json::json!({"lookback": 3, "threshold_bps": 25});
+    shadow.parameters_canonical = crate::domain::canonical_json_text(&parameters);
+    shadow.parameters_digest = crate::domain::canonical_digest(&parameters);
+
+    let spec = |artifact: crate::domain::StrategyArtifact| crate::domain::ExperimentSpec {
+        schema_version: 1,
+        cycle_id: "shadow-cycle".into(),
+        strategy: artifact,
+        market_data_pack_id: MARKET_DATA_PACK_ID.into(),
+        execution_policy_version: POLICY_VERSION.into(),
+        initial_cash_cents: INITIAL_CASH_CENTS,
+    };
+
+    // Same reviewed source, different parameters: allowed for research shadowing.
+    let experiment = db.create_experiment(spec(shadow.clone())).unwrap();
+    assert_eq!(experiment.spec.strategy.strategy_version_id, shadow.strategy_version_id);
+    assert_eq!(experiment.spec.strategy.parameters_digest, shadow.parameters_digest);
+
+    // A shadow id with an unknown source digest is still refused.
+    let mut unknown = shadow.clone();
+    unknown.strategy_version_id = "shadow-unknown-source".into();
+    unknown.source_digest = "0".repeat(64);
+    assert!(matches!(
+        db.create_experiment(spec(unknown)),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "unsupported_strategy_artifact"
+    ));
+
+    // Reviewed ids keep the exact-content requirement.
+    let mut drifted = reviewed.clone();
+    drifted.parameters_digest = "1".repeat(64);
+    assert!(matches!(
+        db.create_experiment(spec(drifted)),
+        Err(StoreError::Conflict(_)) | Err(StoreError::Rules(_))
+    ));
+}
