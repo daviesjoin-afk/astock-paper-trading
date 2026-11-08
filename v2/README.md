@@ -199,7 +199,71 @@ evidence. Completing A before registering B or importing B evidence cannot chang
 A's replay. This is not arbitrary data-package upload or provider authentication.
 
 Verifiable StrategyArtifact content and experiment comparison are separate future
-work. There is no dynamic plugin, V1 scheduler, strategy evolution or news learning.
+work. Paper-account capital allocation and governed evolution exist as explicit,
+audited mechanisms (ADR 005-017); there is no dynamic plugin, hidden scheduler,
+live trading or news learning.
+
+## Capability map (2026-11)
+
+| Area | What exists | Entry point |
+| --- | --- | --- |
+| Paper account | one user-funded account, two strategy slots, reserve cash, risk limits | `POST /v2/paper-accounts` |
+| Deterministic clock | created/running/paused/stopped/completed sessions, batch run, per-day and account-level advance | `/v2/paper-sessions/...` |
+| Trust and audit | 8 invariant checks incl. fill/order equality, frozen signals, rebalance chain | `GET /v2/paper-accounts/{id}/audit` |
+| Valuation | reviewed price-set registry, single-point valuation, equity series, drawdown | `GET /v2/paper-accounts/{id}/valuation` |
+| Performance | profit, return bps, drawdown, fees, trades for accounts and experiments | `/performance` |
+| Dynamic capital | proposal with bounds, audited rebalance, cost-basis exposure | `/allocation-proposal`, `/rebalances`, `/exposure` |
+| Evolution | candidate generation, parameterized artifacts, shadow runs, signal diff, rolling windows, governed decisions, event log | ADR-012-017 |
+| Operations | health with schema/price-set counts, single-writer concurrency proof, runbook, cron helpers | `docs/OPERATIONS.md` |
+
+## ADR index
+
+| ADR | Subject |
+| --- | --- |
+| 001 | experiments and market-pack identity |
+| 002 | reviewed market data packs |
+| 003 | reproducible research |
+| 004 | A/B comparison boundaries |
+| 005 | paper account, slots, orders, sessions, risk limits, audit, rebalances |
+| 006 | valuation contract and reviewed price sets |
+| 007 | equity series and drawdown |
+| 008 | allocation proposal |
+| 009 | rebalance ledger event |
+| 010 | cost-basis exposure |
+| 011 | account-level day advance |
+| 012 | evolution governance, events, candidate generation |
+| 013 | parameterized strategies and candidate artifacts |
+| 014 | shadow artifact experiment boundary |
+| 015 | signal-level diff |
+| 016 | performance metrics |
+| 017 | rolling-window validation |
+
+## Command cheat sheet
+
+```bash
+# from v2/
+cargo +1.99.1-x86_64-pc-windows-gnu test --locked
+bash scripts/smoke.sh
+python -m unittest discover -s research -p 'test_*.py'
+cd web && npx playwright test
+
+# scheduler helpers (explicit days, never machine time)
+bash scripts/daily_advance.sh --account paper-001 --day 2026-11-09 --dry-run
+python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --windows "2026-10-30;2026-11-02"
+
+# reviewed price sets
+python research/make_price_set.py --input prices.csv --out data/price-sets/x.json ...
+```
+
+## Known limits
+
+- **No reviewed price data is bundled.** Every valuation/performance/proposal path
+  fails closed with `no_reviewed_price_set` until audited data is added.
+- No annualized/Sharpe metrics, no automatic promotion execution, no daemon:
+  scheduling is the caller's job (cron/task system).
+- Schema upgrades require a fresh database; old local files are rejected by design.
+- All trading is paper-only; there is no broker integration, and the 8600
+  deployment claim remains unverified.
 
 `V1` continues to run independently and must not be reconfigured, migrated,
 or connected to the new V2 database by this PR.
