@@ -38,6 +38,15 @@
 - 请求失败（HTTP 非 2xx）退出码 3；
 - 成功输出 `advanced account=… day=… sessions=… steps=… filled=… rejected=…`，可直接作为调度日志。
 
+每周复核（只读，不写账本）：
+
+```bash
+0 16 * * 5 /opt/astock/v2/scripts/weekly_review.py   --base-cycle shadow-base-1 --candidate-cycle shadow-candidate-1   --windows "2026-10-30,2026-10-31;2026-11-02"
+```
+
+- 退出码 0 = 一致（可继续走治理决策）；4 = 不稳定（缺覆盖/优势不足/回撤超限）；2 = 参数或请求错误；
+- 输出逐窗基准/候选收益与回撤，以及最终结论与理由。
+
 
 - 只推进 `running` 会话；暂停的会话保持暂停。
 - 返回 `{sessions, steps, filled, rejected}`，可直接作为调度日志。

@@ -611,6 +611,17 @@ if bash scripts/daily_advance.sh --account smoke-account --day bad-day > /dev/nu
   exit 1
 fi
 
+# Weekly review: synthetic data means no coverage, so the verdict is unstable.
+if python scripts/weekly_review.py --base-cycle shadow-base-1 \
+    --candidate-cycle shadow-candidate-1 --windows "2026-10-30;2026-11-02" \
+    > "${RUNNER_TEMP:-/tmp}/astock-weekly.out" 2>&1; then
+  echo "weekly review unexpectedly consistent" >&2
+  exit 1
+else
+  test $? -eq 4
+fi
+grep -q "unstable" "${RUNNER_TEMP:-/tmp}/astock-weekly.out"
+
 python3 scripts/experiment_demo.py
 python3 scripts/market_pack_demo.py
 python3 scripts/research_reproduction_demo.py
