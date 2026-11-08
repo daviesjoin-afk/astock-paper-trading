@@ -104,6 +104,9 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Exposure: “仓位与集中度” prints each slot's cost utilisation and either
+  “无集中度超限” or the breaching symbols with value vs limit; cost basis only,
+  never a market value.
 - Rebalances: applied transfers are listed newest-first as
   `A→B ¥… · 45.0%/45.0% → 35.0%/55.0% · date`; the block stays hidden when no
   rebalance has been applied.

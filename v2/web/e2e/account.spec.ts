@@ -43,6 +43,9 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-audit")).toContainText("账本自检：通过");
     await expect(page.getByTestId("account-audit")).toHaveAttribute("data-state", "ok");
     await expect(page.getByTestId("account-rebalances")).toBeHidden();
+    await expect(page.getByTestId("account-exposure")).toBeVisible();
+    await expect(page.getByTestId("account-exposure-summary")).toContainText("成本占用");
+    await expect(page.getByTestId("account-exposure-breaches")).toContainText("无集中度超限");
     await page.getByTestId("account-audit-details").locator("summary").click();
     const checks = page.getByTestId("account-audit-checks").locator("li");
     await expect(checks).toHaveCount(8);

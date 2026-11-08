@@ -3290,3 +3290,54 @@ fn rebalance_moves_cash_between_slots_and_keeps_history() {
         .iter()
         .any(|check| check.name == "rebalance_chain" && !check.ok));
 }
+
+#[test]
+fn exposure_reports_cost_basis_and_concentration_breaches() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("exposure-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("exposure-acct", PaperSlotId::A, buy)).unwrap();
+    let fill = order.outcome.fill.expect("filled");
+
+    let exposure = db.paper_exposure("exposure-acct").unwrap();
+    assert_eq!(exposure.account_id, "exposure-acct");
+    assert_eq!(exposure.slots.len(), 2);
+    let slot_a = &exposure.slots[0];
+    assert_eq!(slot_a.cost_cents, fill.quantity * fill.price_cents + fill.fees_cents);
+    assert_eq!(slot_a.positions.len(), 1);
+    assert_eq!(slot_a.positions[0].quantity, fill.quantity);
+    assert_eq!(
+        slot_a.positions[0].weight_bps,
+        slot_a.cost_cents * 10_000 / slot_a.budget_cents
+    );
+    assert_eq!(slot_a.cash_utilization_bps, slot_a.positions[0].weight_bps);
+    assert!(exposure.breaches.is_empty());
+    assert_eq!(exposure.digest.len(), 64);
+
+    // Selling out clears the cost basis.
+    let sell = &output.signals[1];
+    ingest_signal_evidence(&mut db, sell);
+    db.submit_paper_order(paper_order("exposure-acct", PaperSlotId::A, sell)).unwrap();
+    let after = db.paper_exposure("exposure-acct").unwrap();
+    assert_eq!(after.slots[0].positions.len(), 0);
+    assert_eq!(after.slots[0].cost_cents, 0);
+
+    // A position above the symbol cap is reported as a breach.
+    let breaching = crate::domain::compute_exposure(
+        "manual",
+        &[crate::domain::SlotBook {
+            slot: "A".into(),
+            budget_cents: 1_000_000,
+            cash_cents: 0,
+            positions: vec![("600000.SH".into(), 10, 300_000)],
+        }],
+        2_500,
+    )
+    .unwrap();
+    assert_eq!(breaching.breaches.len(), 1);
+    assert_eq!(breaching.breaches[0].kind, "symbol_concentration");
+    assert_eq!(breaching.breaches[0].value_bps, 3_000);
+    assert_eq!(breaching.breaches[0].limit_bps, 2_500);
+}

@@ -180,6 +180,11 @@ async fn paper_rebalances(
     response(db.paper_rebalances(&id).map_err(api_error)?)
 }
 
+async fn paper_exposure(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_exposure(&id).map_err(api_error)?)
+}
+
 async fn paper_account_audit(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -395,6 +400,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/audit",
             get(paper_account_audit),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/exposure",
+            get(paper_exposure),
         )
         .route(
             "/v2/paper-accounts/{account_id}/rebalances",

@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 成本口径敞口分析（ADR 010）：新增纯域 `compute_exposure()`——按成交移动平均成本计算每槽成本占用率与逐标的占比，超过 `max_symbol_weight_bps` 时报告 `symbol_concentration` breach；不读价格、不算盈亏、不写账本，附 canonical 摘要。新增 `Store::paper_exposure()` 与 `GET /v2/paper-accounts/{id}/exposure`；账户页新增“仓位与集中度”区块（占用率 + 无超限/超限标的）。Rust 133 passed（买入成本、卖光归零、上限 breach、摘要）；浏览器 101 passed（区块展示）。
 - V2 划拨审计与展示（ADR 009）：审计新增第 8 项 `rebalance_chain`——权重链连续、每次划拨保持准备金、现金只在不同槽位间移动、最后权重等于当前权重；篡改权重链会被发现。新增 `GET /v2/paper-accounts/{id}/rebalances` 只读列表；账户页展示“资金划拨”（方向、金额、前后权重、日期），无划拨时隐藏。Rust 132 passed（审计链检查 + 篡改检测 + 读模型）；浏览器 101 passed（stub 划拨列表）；冒烟断言 8 项检查名。
 - V2 资金再平衡账本事件（ADR 009，schema v12）：新增 `v2_paper_accounts.weights_json` 与追加型 `v2_paper_transfers`；现金派生顺序固定为“初始预算 → 成交 → 划拨”，划拨只移动现金、不改写历史，权重决定预算与风控口径。新增 `POST /v2/paper-accounts/{id}/rebalances`（目标权重、提案摘要、显式时刻、备注）：越界/步长/准备金/现金不足/非法摘要硬拒绝，`(account, digest)` 幂等且同摘要不同目标冲突；审计的 `budget_split` 改为按当前权重复核。Rust 132 passed（划拨守恒、持仓不变、审计通过、幂等与冲突、边界拒绝）；浏览器 100 passed；冒烟升级到 v12 并覆盖划拨后权重/预算/审计。
 - V2 动态资金提案（ADR 008）：新增纯域 `AllocationPolicy` / `SlotScore` / `propose_allocation()`——按槽位独立重放成交并用审核价格集合盯市，计算 `return_bps`、`drawdown_bps`、`score_bps`（相对最差槽位归一），在 `min/max`、准备金下限、单次步长、`min_days` 约束下生成目标权重与逐槽理由；证据不足保持原权重（`insufficient_evidence`），从不输出越界或突破准备金的方案。新增 `Store::paper_allocation_proposal()` 与 `GET /v2/paper-accounts/{id}/allocation-proposal?days=`；无审核集合返回 `unavailable`，交易日 < 2 拒绝。**只读提案，不执行划拨**。Rust 131 passed（评分/边界/步长/证据不足/合成拒绝）；浏览器 100 passed（无 UI 变更）；冒烟覆盖不可用路径。

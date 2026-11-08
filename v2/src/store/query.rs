@@ -1146,3 +1146,74 @@ impl Store {
         Ok(records)
     }
 }
+// ---------------------------------------------------------------------------
+// Exposure read model: cost basis per slot, concentration vs risk limits.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    fn slot_cost_positions(
+        &self,
+        account_id: &str,
+        slot: &str,
+    ) -> StoreResult<Vec<(String, i64, i64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.fill_json FROM v2_paper_fills f
+             JOIN v2_paper_orders o ON o.id=f.order_id
+             WHERE o.account_id=? AND o.slot=? ORDER BY o.id",
+        )?;
+        let rows = statement.query_map(params![account_id, slot], |row| row.get::<_, String>(0))?;
+        let mut lots: std::collections::BTreeMap<String, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let fill: Fill = serde_json::from_str(&row?)?;
+            let entry = lots.entry(fill.symbol.clone()).or_insert((0, 0));
+            let gross = fill.quantity.saturating_mul(fill.price_cents);
+            match fill.side {
+                crate::domain::Side::Buy => {
+                    entry.0 += fill.quantity;
+                    entry.1 += gross + fill.fees_cents;
+                }
+                crate::domain::Side::Sell => {
+                    let sold = fill.quantity.min(entry.0);
+                    if entry.0 > 0 {
+                        let avg = entry.1 / entry.0;
+                        entry.1 -= avg * sold;
+                    }
+                    entry.0 -= sold;
+                }
+            }
+        }
+        Ok(lots
+            .into_iter()
+            .map(|(symbol, (quantity, cost))| (symbol, quantity, cost))
+            .collect())
+    }
+
+    pub fn paper_exposure(&self, account_id: &str) -> StoreResult<crate::domain::AccountExposure> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let initial = spec.validate().map_err(StoreError::Rules)?;
+        let weights = Self::account_weights(&self.conn, &spec)?;
+        let display = spec.split_with_weights(weights).map_err(StoreError::Rules)?;
+        let mut books = Vec::new();
+        for (index, slot) in spec.slots.iter().enumerate() {
+            let state = Self::paper_slot_state(&self.conn, &spec, &initial, index)?;
+            books.push(crate::domain::SlotBook {
+                slot: slot.slot.as_str().into(),
+                budget_cents: display.slot_budgets[index],
+                cash_cents: state.cash_cents,
+                positions: self.slot_cost_positions(account_id, slot.slot.as_str())?,
+            });
+        }
+        crate::domain::compute_exposure(account_id, &books, spec.limits.max_symbol_weight_bps)
+            .map_err(StoreError::Rules)
+    }
+}
