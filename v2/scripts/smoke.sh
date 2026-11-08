@@ -62,12 +62,19 @@ def call(path, payload=None, expected=200):
         return error.read()
 
 proposal = build_fixture_proposal()
+listed = call("experiments")
+assert [row["cycle_id"] for row in listed["experiments"]] == [], listed
 reviewed_strategy = json.loads(Path("data/strategy-momentum-v1.json").read_text(encoding="utf-8"))
 call("experiments", {
     "schema_version": 1, "cycle_id": proposal["cycle_id"], "initial_cash_cents": 10_000_000,
     "strategy": reviewed_strategy,
     "market_data_pack_id": "cn-offline-fixture-pack-1", "execution_policy_version": "v2-paper-policy-6",
 })
+listed = call("experiments")
+assert [row["cycle_id"] for row in listed["experiments"]] == [proposal["cycle_id"]], listed
+assert listed["experiments"][0]["status"] == "active"
+assert listed["experiments"][0]["initial_cash_cents"] == 10_000_000
+assert listed["experiments"][0]["strategy_version_id"] == "research-momentum-v1"
 quote = json.loads(Path("fixtures/quote.json").read_text())
 
 calendar_version = "sse-szse-scheduled-2026-v1"

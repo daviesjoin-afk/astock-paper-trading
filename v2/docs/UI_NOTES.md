@@ -1,0 +1,191 @@
+# V2 web dashboard: presentation notes
+
+The browser surface is a **read-only presenter**. It renders the V2 HTTP read
+models (`/v2/experiments`, `/v2/portfolio`, `/v2/simulations`, `/v2/replay`,
+`/v2/experiments/{id}/research-reproduction`). It never writes, never derives a
+valuation, a return, a ranking, or an execution rule, and it never invents an
+experiment. See `MODULE_BOUNDARIES.md` for the ownership rules this file assumes.
+
+## Files
+
+| Path | Role |
+| --- | --- |
+| `v2/web/index.html` | Static document: top bar, side navigation, panels, notices, footer |
+| `v2/web/src/main.ts` | Fetch, state, rendering, view switching, verification actions |
+| `v2/web/src/format.ts` | Business wording for kernel identifiers (cents, sides, reasons) |
+| `v2/web/src/styles.css` | Design tokens and all component styles (light + dark) |
+| `v2/web/e2e/*.spec.ts` | Browser behaviour, accessibility, resilience, evidence capture |
+
+Raw identifiers (`strategy_version_id`, pack id, digests) stay inside the
+collapsed “技术细节” block or inside a `title` tooltip. Everything else is
+business wording.
+
+## Design tokens
+
+`:root` holds the light palette, `html[data-theme="dark"]` overrides the same
+names, so components never hard-code a colour. Key tokens:
+
+- surfaces: `--bg`, `--surface`, `--surface-2`, `--surface-3`
+- text: `--text`, `--text-soft`, `--muted`
+- accent: `--accent` (text/icon), `--accent-fill` + `--accent-ink` (buttons)
+- semantics: `--ok`, `--warn`, `--danger` with `*-soft` backgrounds
+- shape: `--radius-sm|--radius|--radius-lg`, `--shadow-1|--shadow-2`
+- type: `--sans`, `--mono`; numbers use tabular figures
+
+Contrast targets: body/muted text ≥ 4.5:1, large numerals ≥ 3:1, non-text UI
+borders ≥ 3:1. The axe suite enforces WCAG A/AA on all six panels in both themes
+at desktop and mobile widths, plus the notice states (empty catalogue, service
+error, unknown experiment), an applied as-of scope, a filtered decision table,
+the shortcut dialog, and an inline validation error in dark mode.
+
+## Layout
+
+- Sticky top bar: brand, experiment selector, refresh, theme toggle, shortcut
+  reference. Below 340px the three controls become icon-only to stay on one row.
+- Sticky side rail (≥1101px); collapses to a horizontal strip at 1100px and to a
+  three-column grid at 560px so every destination stays visible on a phone.
+- One panel per view, hash-driven (`#/overview`, `#/positions`, …), so a view is
+  linkable and survives reload.
+- Shareable state lives in the URL: `?cycle_id=` selects the experiment and
+  `?result=filled|rejected` mirrors the decision filter. The context bar's
+  “复制链接” button copies the exact `location.href`, so a colleague opens the
+  same experiment, view and filter.
+- Sticky experiment context bar (desktop) keeps “which experiment” on screen
+  while a long decision table scrolls.
+- Footer closes the page; `body` is a flex column so short views do not float.
+
+Breakpoints: 1100px (rail → strip), 900px (4 → 2 KPI columns), 720px (tablet
+padding, stacked controls), 560px (rail grid), 480px (compact type), 420px
+(button labels), 360px (single-column KPIs, icon-only controls).
+
+## Facts must stay attached to their scope
+
+- A portfolio read is issued **once per refresh** with the applied `asof_day`
+  (`portfolioQuery`). The screen never chains a current read and a historical
+  read, so a current book cannot be rendered under a historical label.
+- `renderPortfolio()` rejects a response whose `cycle_id` or `asof_day` differs
+  from the request (`ScopeMismatchError`) and shows an error instead of
+  relabelling facts.
+- `asofDay` is the date the user asked for; `loadedScope` is what the API
+  actually returned and what the positions table, its count line, and the
+  overview `kpi-scope` line all read. A failed as-of query keeps the previous
+  scope on screen and says which scope is still displayed.
+- Decision times are rendered with `Intl.DateTimeFormat` fixed to
+  `Asia/Shanghai`, so `…T06:00:00Z`, `…T14:00:00+08:00` and
+  `…T20:00:00-08:00` produce the China wall-clock values the ledger uses. The
+  decisions panel states “中国时间（UTC+8）”.
+- Verification state is bound to a data epoch: a successful reload marks earlier
+  passes as `stale` (“需要重新验证”), and every check carries its own request
+  sequence, so a late answer for another experiment cannot repaint the screen.
+  `ok !== true` is a failure, and the report's `cycle_id` must match.
+- Verification controls have their own lifecycle: a reload, experiment switch or
+  notice invalidates the in-flight check (`invalidateVerification`), which bumps
+  the sequence, clears `aria-busy` and re-enables the button immediately. A late
+  answer can therefore neither repaint nor leave a control disabled.
+- The catalogue asks for the API maximum (`limit=500`). When a `cycle_id` is not
+  in that window the UI probes `GET /v2/experiments/{id}` before deciding it is
+  missing, distinguishes “not listed” from “does not exist”, and reports a
+  damaged catalogue (`total > 0`, nothing readable) instead of “还没有实验”.
+  Partially damaged catalogues stay usable with a visible warning.
+
+## Components
+
+- **KPI cards** state one fact each and never compute an implied return.
+- **Tables** right-align numeric columns, keep headers sticky, and scroll inside
+  the panel on desktop so a 100-row window does not push the page.
+- **Status pills** are spans inside cells; styling a `<td>` as a pill breaks row
+  baseline alignment.
+- **Decision rows** lead with the stored record id (`#id`) so a row can be cited
+  even when the signal id shape is unknown; unknown signal shapes render a stable
+  short fingerprint instead of a shared “模拟信号” label.
+- **Technical details** stay collapsed but carry a keyboard-reachable
+  “复制技术细节” button that copies experiment, strategy, input, pack and policy
+  identifiers as `label: value` lines.
+- **Data-pack labels** keep the pack suffix (`离线样本包 #1`, `… #2`), so two
+  packs are never shown as the same fact.
+- **Decision filters** (`全部 / 已成交 / 已拒绝`) narrow the rendered rows, carry
+  their own counts, survive experiment switches, and are written to the URL;
+  filtering never mutates stored facts.
+- **Verification states** (`idle / running / ok / fail`) are mirrored on the
+  overview card so the two independent checks stay visible from anywhere.
+- **Notices** (loading, service error, empty catalogue, unknown experiment) own
+  the screen; navigation is disabled while a notice is showing. Empty tables use
+  a flat surface with a centred icon rather than a decorative pattern.
+- **Loading** uses a shimmer skeleton, never a fake row of data; while a reload
+  is in flight `html[data-busy="true"]` spins the refresh icon and the workspace
+  carries `aria-busy`.
+
+## Keyboard and printing
+
+Shortcuts are ignored while a field has focus, while a modal is open, and while
+a notice owns the screen (nothing is navigable there anyway):
+
+| Key | Action |
+| --- | --- |
+| `1`–`6` | Switch to overview, positions, decisions, replay, reproduction, experiment |
+| `/` | Focus the experiment selector |
+| `r` | Refresh the current experiment |
+| `t` | Toggle light / dark |
+| `?` | Open the shortcut reference |
+| `Esc` | Close the reference |
+
+The reference is a native `<dialog>` (`#shortcuts`) opened from the top bar; the
+browser returns focus to that button on close.
+
+Printing (`@media print`) drops navigation, controls and footers, forces the
+light palette, removes shadows, neutralises the accent card tint, releases the
+desktop table scroller, and keeps panels from breaking across pages. Only the
+current view prints, so a printed sheet always belongs to one experiment.
+
+## Theme selection
+
+An explicit choice in the toggle is stored in `localStorage["astock-v2-theme"]`
+and wins from then on. With no stored choice the page follows
+`prefers-color-scheme` and keeps following it until the user picks a side.
+
+## Contract with the tests
+
+`data-testid` attributes are the test contract: `experiment-select`,
+`cycle-hint`, `refresh`, `theme-toggle`, `nav-*`, `panel-*`, `summary-*`,
+`kpi-*`, `positions-body`, `sellable-header`, `positions-empty-state`,
+`sellable-header`, `asof-*`, `runs-body`, `runs-empty-state`, `recent-list`,
+`verify-replay`, `verify-reproduction`, `*-status`, `*-detail`, `tech-*`,
+`service-*`, `loading`, `empty-experiments`, `unknown-experiment`,
+`live-status`, `copy-demo`, `copy-link`, `copy-tech`, `shortcuts`,
+`shortcuts-open`, `shortcuts-close`, `catalogue-broken`, `catalogue-retry`,
+`catalogue-warning`, `kpi-scope`, `positions-count`, `broken-detail`. Renaming one requires updating the specs.
+
+`#runs-filtered-empty`, `#recent-note`, `#overview-replay`,
+`#overview-reproduction`, `#context-*`, `#last-refresh` and `#recent-empty` are
+addressed by id in the specs.
+
+## Evidence screenshots
+
+```bash
+cd v2/web
+npm run build
+CAPTURE_UI=1 CAPTURE_PREFIX=after npx playwright test e2e/screenshots.spec.ts
+```
+
+Captures land in `v2/docs/assets/ui/`. They are evidence, not build output, so
+they only run when `CAPTURE_UI=1` is set. `before-*` keeps the pre-change state.
+
+## Accessibility guarantees
+
+- Skip link moves focus into `main`; `#live` is a polite, atomic status region.
+- Every interactive control is a real button/select/input with a visible focus
+  ring; nothing is click-only.
+- Motion is decorative only: panels animate transform, never opacity, so a
+  contrast audit mid-animation still sees final colours. `prefers-reduced-motion`
+  reduces it to zero.
+- `forced-colors: active` keeps borders and the active rail item visible.
+- The shortcut sheet is a modal dialog: axe scans it while open, Escape closes
+  it, and focus returns to the opener.
+
+## Known limits
+
+- `input[type="date"]` follows the browser locale, so a zh-CN page can render a
+  `mm/dd/yyyy` placeholder in an en-US browser; values are still sent verbatim.
+- The overview shows the newest three decisions; the decision panel owns the
+  full 100-row window and its filters.
+- No chart is drawn: prices and valuations are outside this surface's boundary.

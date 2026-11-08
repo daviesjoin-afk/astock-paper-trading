@@ -6,3 +6,6 @@
 *.sqlite3-wal
 *.db
 __pycache__/
+/web/test-results/
+/web/playwright-report/
+/web/.e2e/
