@@ -138,6 +138,16 @@ curl -fsS "http://127.0.0.1:8765/v2/price-sets/coverage?pack_id=cn-offline-fixtu
 
 返回 `covered_pairs` 与 `missing[]`（只统计 `reviewed` 集合）；缺口不为空时不要指望估值/绩效可用。
 
+## 一键验证
+
+```bash
+bash scripts/verify_all.sh                 # 全量：Rust / 研究 / 冒烟 / 浏览器 / 泄露扫描
+bash scripts/verify_all.sh --fast          # 跳过浏览器
+bash scripts/verify_all.sh --dry-run       # 只打印将执行的命令
+```
+
+输出按套件打印 `result` 与耗时；任一失败退出码 1。浏览器套件需要先有 release 二进制（脚本内会 `npm run build`）。
+
 ## 备份与恢复
 
 ```bash
