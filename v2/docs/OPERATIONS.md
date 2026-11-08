@@ -111,12 +111,16 @@ curl -fsS "http://127.0.0.1:8765/v2/price-sets/coverage?pack_id=cn-offline-fixtu
 ## 备份与恢复
 
 ```bash
-sqlite3 "$ASTOCK_V2_DB" ".backup '/backup/astock-$(date +%F).sqlite3'"
+python scripts/db_tool.py backup --db "$ASTOCK_V2_DB" --out /backup/astock.sqlite3
+python scripts/db_tool.py verify --db /backup/astock.sqlite3
+python scripts/db_tool.py restore --backup /backup/astock.sqlite3 --db /srv/astock/restored.sqlite3
 ```
 
-- 不要在 WAL 模式下直接复制 `.sqlite3` 文件（可能缺少 `-wal` 内容）。
-- 恢复：停服务 → 替换数据库文件 → 启动；账本、会话游标、划拨与进化事件全部来自数据库。
-- 会话推进是幂等的：重启后从 `cursor` 继续，不会重复成交。
+- 使用 SQLite 在线备份 API，服务运行中（含 WAL）也可安全备份；不依赖 `sqlite3` CLI。
+- `backup` 拒绝覆盖已有文件（退出码 3），成功后打印 `schema/accounts/events/sha256`。
+- `restore` 先校验备份（完整性 + schema），目标已存在同样需要 `--force`；恢复前清理陈旧 `-wal/-shm`。
+- `verify` 校验完整性、`user_version` 与关键表计数：0 通过 / 1 校验失败 / 2 使用或 IO 错误。
+- 账本、会话游标、划拨与进化事件全部来自数据库；会话推进幂等，重启后从 `cursor` 继续。
 
 ## 升级与回滚
 
