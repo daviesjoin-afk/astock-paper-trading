@@ -1776,6 +1776,27 @@ impl Store {
             .optional()?;
         account_exists
             .ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+
+        // A session that starts before a slot's last switch would immediately
+        // submit pre-switch decisions, which the order path rejects. Refuse it
+        // up front instead of leaving a stuck session.
+        let start_at = chrono::DateTime::parse_from_rfc3339(&spec.start_at)
+            .map_err(|_| StoreError::Rules(RuleError("invalid_session_start".into())))?;
+        let mut slots: Vec<&str> = spec.signals.iter().map(|signal| signal.slot.as_str()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            if let Some(last) = Self::slot_switches(&self.conn, &spec.account_id, slot)?.last() {
+                let switched_at = chrono::DateTime::parse_from_rfc3339(&last.effective_from)
+                    .map_err(|_| StoreError::Integrity("stored_switch_time_invalid".into()))?;
+                if start_at < switched_at {
+                    return Err(StoreError::Rules(RuleError(
+                        "session_starts_before_strategy_switch".into(),
+                    )));
+                }
+            }
+        }
+
         if let Some(existing) = self
             .conn
             .query_row(
