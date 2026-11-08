@@ -83,6 +83,26 @@ async fn research_reproduction(State(state): State<Shared>, Path(id): Path<Strin
     response(db.verify_research_reproduction(&id).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct ComparisonQuery {
+    cycle_a: String,
+    cycle_b: String,
+    start_day: String,
+    end_day: String,
+}
+
+/// Read-only A/B comparison (ADR 004). Juxtaposes stored facts only.
+async fn comparison(
+    State(state): State<Shared>,
+    Query(query): Query<ComparisonQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(
+        db.comparison(&query.cycle_a, &query.cycle_b, &query.start_day, &query.end_day)
+            .map_err(api_error)?,
+    )
+}
+
 async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
 }
@@ -127,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/quotes", post(ingest_quote))
         .route("/v2/simulations", post(submit).get(runs))
         .route("/v2/portfolio", get(portfolio))
+        .route("/v2/comparisons", get(comparison))
         .route("/v2/replay", get(replay))
         .route("/v2/experiments/{cycle_id}/research-reproduction", get(research_reproduction))
         .with_state(db);

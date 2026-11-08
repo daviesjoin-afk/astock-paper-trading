@@ -729,6 +729,9 @@ td:first-child { font-weight: 550; }
   .context-bar { padding: 10px 13px; row-gap: 8px; }
   .context-actions { margin-left: auto; }
   .panel-head { padding: 13px 14px 11px; }
+  .compare-form { padding: 12px 14px; }
+  .compare-body { padding: 12px 14px 16px; }
+  .compare-form select, .compare-form input[type="date"] { min-width: 130px; }
   .summary { padding: 14px 14px 2px; }
   .summary dl { gap: 10px 18px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .kpis { padding: 12px 14px 14px; }
@@ -737,6 +740,8 @@ td:first-child { font-weight: 550; }
   th, td { padding: 9px 14px; }
   /* Keep column widths readable; the scroller owns the overflow. */
   table { min-width: 540px; }
+  /* Comparison tables lay out their own cells and must not force page overflow. */
+  .compare-table { min-width: 0; }
   .catalogue-warning {
   margin: 0; padding: 10px 14px; border-radius: var(--radius);
   border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
@@ -794,6 +799,48 @@ td:first-child { font-weight: 550; }
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ---------- experiment comparison ---------- */
+.compare-form {
+  display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.compare-form select, .compare-form input[type="date"] { min-width: 150px; max-width: 220px; }
+.compare-body { padding: 14px 20px 18px; display: grid; gap: 16px; }
+.compare-body .verify-status { width: 100%; }
+.compare-section h3 {
+  margin: 0 0 8px; color: var(--muted);
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.05em;
+}
+.compare-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.compare-table th, .compare-table td {
+  padding: 8px 12px; text-align: left; vertical-align: top;
+  white-space: normal; overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--border);
+}
+.compare-table thead th {
+  position: static; background: var(--surface-2);
+  font-size: 11px; letter-spacing: 0.04em;
+}
+.compare-table tbody th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+.compare-table th:last-child, .compare-table td:last-child { white-space: nowrap; }
+.compare-table td:last-child { min-width: 72px; }
+.compare-table tbody tr:last-child th, .compare-table tbody tr:last-child td { border-bottom: 0; }
+.compare-reasons {
+  margin: 0; padding-left: 18px; display: grid; gap: 4px;
+  color: var(--danger); font-size: 12.5px;
+}
+.compare-fact { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; margin-bottom: 4px; }
+.compare-fact:last-child { margin-bottom: 0; }
+.compare-fact-detail { color: var(--muted); font-size: 12px; }
+.compare-time { white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+.valuation-note {
+  margin: 0; padding: 10px 13px; border-radius: 10px;
+  background: var(--warn-soft); color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
+  font-size: 12.5px; line-height: 1.5;
 }
 
 /* ---------- shortcut sheet ---------- */
@@ -890,4 +937,9 @@ kbd {
   thead th { position: static; }
   .kpi, .subcard, .recent li, .checks li, .verify-status { break-inside: avoid; }
   a { text-decoration: none; color: var(--text); }
+}
+
+@media print {
+  .compare-form, .compare-body .tech { display: none !important; }
+  .compare-table { break-inside: auto; }
 }

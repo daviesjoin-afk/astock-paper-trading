@@ -1958,3 +1958,134 @@ fn one_unreadable_experiment_row_does_not_hide_the_rest() {
     // A missing experiment is a distinct, non-integrity failure now.
     assert!(matches!(db.experiment("nope"), Err(StoreError::NotFound(_))));
 }
+
+// ---------------------------------------------------------------------------
+// ADR 004: read-only A/B comparison
+// ---------------------------------------------------------------------------
+
+fn realised_pair(db: &mut Store) {
+    let output = frozen_momentum_output();
+    db.create_experiment(spec("cycle-2", INITIAL_CASH_CENTS)).unwrap();
+    realise_frozen_signals(db, "cycle-1", &output);
+    realise_frozen_signals(db, "cycle-2", &output);
+}
+
+#[test]
+fn comparison_refuses_unequal_preconditions_and_uncovered_windows() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    realised_pair(&mut db);
+
+    // Same experiment twice is a programming error, not a comparison.
+    assert!(matches!(
+        db.comparison("cycle-1", "cycle-1", "2026-10-30", "2026-11-02"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "comparison_same_experiment"
+    ));
+    // Invalid window is rejected before any read model is produced.
+    assert!(matches!(
+        db.comparison("cycle-1", "cycle-2", "2026-11-02", "2026-10-30"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "comparison_window_invalid"
+    ));
+    assert!(matches!(
+        db.comparison("cycle-1", "cycle-2", "2026-13-01", "2026-11-02"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "comparison_window_invalid"
+    ));
+
+    // Different initial cash cannot be compared, and produces no decision slots.
+    db.create_experiment(spec("cash-diff", INITIAL_CASH_CENTS / 2)).unwrap();
+    realise_frozen_signals(&mut db, "cash-diff", &frozen_momentum_output());
+    let report = db.comparison("cycle-1", "cash-diff", "2026-10-30", "2026-11-02").unwrap();
+    assert!(!report.ok);
+    assert!(report.reasons.iter().any(|r| r == "comparison_initial_cash_mismatch"));
+    assert!(report.slots.is_empty());
+    assert_eq!(report.a.totals.decisions, 0);
+
+    // A window day that only one side covers is refused, not clipped.
+    let output = frozen_momentum_output();
+    db.create_experiment(spec("partial", INITIAL_CASH_CENTS)).unwrap();
+    let only_first = ResearchOutput {
+        signals: output.signals.iter().take(1).cloned().collect(),
+        ..output.clone()
+    };
+    realise_frozen_signals(&mut db, "partial", &only_first);
+    let report = db.comparison("cycle-1", "partial", "2026-10-30", "2026-11-02").unwrap();
+    assert!(!report.ok);
+    assert!(report.reasons.iter().any(|r| r == "comparison_window_not_covered"));
+    assert!(report.slots.is_empty());
+}
+
+#[test]
+fn comparison_aligns_decisions_by_instant_and_reports_no_valuation() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    realised_pair(&mut db);
+
+    let report = db.comparison("cycle-1", "cycle-2", "2026-10-30", "2026-11-02").unwrap();
+    assert!(report.ok, "reasons: {:?}", report.reasons);
+    assert_eq!(report.version, "comparison-v1");
+    assert_eq!(report.window.start_day, "2026-10-30");
+    assert_eq!(report.window.end_day, "2026-11-02");
+    assert!(report.comparability.iter().all(|check| check.matched));
+
+    // Two decision instants, one slot each, both sides present, nothing merged.
+    assert_eq!(report.slots.len(), 2);
+    assert_eq!(report.slots[0].decision_at, "2026-10-30T14:00:00+08:00");
+    assert_eq!(report.slots[1].decision_at, "2026-11-02T10:00:00+08:00");
+    for slot in &report.slots {
+        assert_eq!(slot.a.len(), 1);
+        assert_eq!(slot.b.len(), 1);
+        let fact = &slot.a[0];
+        assert!(fact.run_id > 0);
+        assert!(!fact.side.is_empty());
+        assert!(["filled", "rejected"].contains(&fact.status.as_str()));
+    }
+    assert_eq!(report.unmatched_a, 0);
+    assert_eq!(report.unmatched_b, 0);
+    assert_eq!(report.a.totals.decisions, 2);
+    assert_eq!(report.b.totals.decisions, 2);
+    assert!(report.a.totals.fees_cents > 0);
+    let expected_cash = db.state("cycle-1", Some("2026-11-02")).unwrap().cash_cents;
+    assert_eq!(report.a.totals.cash_cents, expected_cash);
+
+    // No reviewed valuation set exists, so nothing may be valued.
+    assert_eq!(report.valuation.status, "unavailable");
+    assert_eq!(report.valuation.reason, "no_reviewed_price_set");
+    assert!(!report.digest.is_empty());
+}
+
+#[test]
+fn comparison_never_writes_and_is_stable_across_reopen() {
+    let file = DiskDatabase::new();
+    let output = frozen_momentum_output();
+    let facts_before;
+    let first;
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        db.create_experiment(spec("cycle-2", INITIAL_CASH_CENTS)).unwrap();
+        realise_frozen_signals(&mut db, "cycle-1", &output);
+        realise_frozen_signals(&mut db, "cycle-2", &output);
+        facts_before = (
+            fills_of(&db, "cycle-1"), fills_of(&db, "cycle-2"),
+            db.state("cycle-1", None).unwrap().cash_cents,
+            db.state("cycle-2", None).unwrap().cash_cents,
+            db.state("cycle-1", None).unwrap().runs_total,
+            db.state("cycle-2", None).unwrap().runs_total,
+        );
+        first = db.comparison("cycle-1", "cycle-2", "2026-10-30", "2026-11-02").unwrap();
+        let again = db.comparison("cycle-1", "cycle-2", "2026-10-30", "2026-11-02").unwrap();
+        assert_eq!(first, again);
+        let facts_after = (
+            fills_of(&db, "cycle-1"), fills_of(&db, "cycle-2"),
+            db.state("cycle-1", None).unwrap().cash_cents,
+            db.state("cycle-2", None).unwrap().cash_cents,
+            db.state("cycle-1", None).unwrap().runs_total,
+            db.state("cycle-2", None).unwrap().runs_total,
+        );
+        assert_eq!(facts_before, facts_after, "comparison must not write");
+    }
+    // Same SQLite file, fresh process-like reopen: identical model and digest.
+    {
+        let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let reopened = db.comparison("cycle-1", "cycle-2", "2026-10-30", "2026-11-02").unwrap();
+        assert_eq!(first.digest, reopened.digest);
+        assert_eq!(first, reopened);
+    }
+}

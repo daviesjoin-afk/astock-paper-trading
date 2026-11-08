@@ -136,6 +136,7 @@ const VIEWS = {
   decisions: { panel: "panel-decisions", label: "决策记录" },
   replay: { panel: "panel-replay", label: "交易回放" },
   reproduction: { panel: "panel-reproduction", label: "研究重做" },
+  comparison: { panel: "panel-comparison", label: "实验比较" },
   experiment: { panel: "panel-experiment", label: "实验信息" },
 } as const;
 type View = keyof typeof VIEWS;
@@ -158,6 +159,7 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
     if (active) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
+  if (view === "comparison" && experiments.length > 0) hydrateComparison();
   if (options.updateUrl !== false && location.hash !== `#/${view}`) {
     history.replaceState(null, "", `#/${view}`);
     // Switching panels from a scrolled page would otherwise land mid-table.
@@ -301,6 +303,22 @@ const describeCatalogue = (selected: string, options: { unlisted?: boolean } = {
   return parts.join(" · ");
 };
 
+const compareA = byId<HTMLSelectElement>("compare-a");
+const compareB = byId<HTMLSelectElement>("compare-b");
+
+const fillSelect = (target: HTMLSelectElement, selected: string): void => {
+  target.replaceChildren();
+  for (const experiment of experiments) {
+    const option = document.createElement("option");
+    option.value = experiment.cycle_id;
+    option.textContent = experiment.cycle_id;
+    target.appendChild(option);
+  }
+  if (selected && experiments.some((experiment) => experiment.cycle_id === selected)) {
+    target.value = selected;
+  }
+};
+
 const renderSelector = (): void => {
   select.replaceChildren();
   for (const experiment of experiments) {
@@ -310,6 +328,8 @@ const renderSelector = (): void => {
     select.appendChild(option);
   }
   select.disabled = experiments.length === 0;
+  fillSelect(compareA, compareA.value || experiments[0]?.cycle_id || "");
+  fillSelect(compareB, compareB.value || experiments[1]?.cycle_id || experiments[0]?.cycle_id || "");
 };
 
 const renderSummary = (detail: ExperimentDetail): void => {
@@ -765,6 +785,7 @@ const loadList = async (): Promise<void> => {
   hint.textContent = describeCatalogue(requested, { unlisted });
   syncUrl(cycle);
   await loadCycle(cycle);
+  if (currentView === "comparison") hydrateComparison();
 };
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1033,329 @@ themeButton.addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Experiment comparison (ADR 004): read-only juxtaposition of stored facts.
+// No valuation, no return, no ranking, no writes.
+// ---------------------------------------------------------------------------
+type CompareFill = {
+  symbol: string; side: string; quantity: number; price_cents: number;
+  fees_cents: number; trade_day: string;
+};
+type CompareDecision = {
+  run_id: number; signal_id: string; side: string; status: string;
+  reason: string; fill: CompareFill | null;
+};
+type CompareSlot = { decision_at: string; a: CompareDecision[]; b: CompareDecision[] };
+type CompareCheck = { name: string; matched: boolean; a: string; b: string };
+type CompareTotals = {
+  decisions: number; filled: number; rejected: number; fees_cents: number;
+  cash_cents: number; positions: Array<{ symbol: string; quantity: number; sellable_quantity: number | null }>;
+};
+type CompareSide = {
+  identity: {
+    cycle_id: string; status: string; strategy_version_id: string; research_input_id: string;
+    market_data_pack_id: string; execution_policy_version: string; initial_cash_cents: number;
+  };
+  verification: {
+    replay_ok: boolean; runs_verified: number; fills_verified: number;
+    reproduction_ok: boolean; signals_verified: number; detail: string;
+  };
+  totals: CompareTotals;
+};
+type CompareReport = {
+  version: string; ok: boolean; reasons: string[];
+  window: { start_day: string; end_day: string };
+  a: CompareSide; b: CompareSide;
+  comparability: CompareCheck[];
+  slots: CompareSlot[];
+  unmatched_a: number; unmatched_b: number;
+  valuation: { status: string; reason: string };
+  digest: string;
+};
+
+const COMPARE_REASONS: Record<string, string> = {
+  comparison_research_input_mismatch: "研究输入不一致",
+  comparison_market_data_pack_mismatch: "市场数据包不一致",
+  comparison_execution_policy_mismatch: "执行规则或费用模型不一致",
+  comparison_initial_cash_mismatch: "初始资金不一致",
+  comparison_window_not_covered: "比较窗口没有被两个实验完整覆盖",
+  comparison_replay_failed: "交易回放未通过",
+  comparison_research_reproduction_failed: "研究重做未通过",
+};
+const COMPARE_CHECK_LABELS: Record<string, string> = {
+  research_input: "研究输入",
+  market_data_pack: "市场数据包",
+  execution_policy: "执行规则",
+  initial_cash: "初始资金",
+};
+
+let compareSeq = 0;
+let compareKey = "";
+const compareForm = byId<HTMLFormElement>("compare-form");
+const compareError = testId<HTMLElement>("compare-error");
+const compareResult = byId("compare-result");
+const compareButton = testId<HTMLButtonElement>("compare-run");
+
+const compareScope = () => ({
+  a: compareA.value,
+  b: compareB.value,
+  start: byId<HTMLInputElement>("compare-start").value,
+  end: byId<HTMLInputElement>("compare-end").value,
+});
+
+const clearCompareError = (): void => {
+  compareError.replaceChildren();
+  toggle(compareError, false);
+};
+const showCompareError = (message: string): void => {
+  compareError.textContent = message;
+  toggle(compareError, true);
+};
+
+const setCompareState = (
+  state: "idle" | "running" | "ok" | "fail",
+  message: string,
+  detail: string,
+): void => {
+  const status = testId<HTMLElement>("compare-status");
+  status.dataset.state = state;
+  status.textContent = message;
+  setText("compare-detail", detail);
+  toggle(compareResult, state !== "idle");
+};
+
+const syncCompareUrl = (scope: { a: string; b: string; start: string; end: string }): void => {
+  const url = new URL(location.href);
+  const values: Array<[string, string]> = [["a", scope.a], ["b", scope.b], ["from", scope.start], ["to", scope.end]];
+  for (const [key, value] of values) {
+    if (value) url.searchParams.set(key, value);
+    else url.searchParams.delete(key);
+  }
+  if (url.toString() !== location.href) history.replaceState(null, "", url);
+};
+
+const decisionCell = (facts: CompareDecision[]): HTMLTableCellElement => {
+  const cell = document.createElement("td");
+  cell.className = "compare-cell";
+  if (facts.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "muted";
+    empty.textContent = "无决策（不补造）";
+    cell.appendChild(empty);
+    return cell;
+  }
+  for (const fact of facts) {
+    const line = document.createElement("div");
+    line.className = "compare-fact";
+    const side = document.createElement("span");
+    side.className = fact.side === "buy" ? "side-buy" : "side-sell";
+    side.textContent = sideLabel(fact.side);
+    const status = document.createElement("span");
+    status.className = fact.status === "filled" ? "result-filled" : "result-rejected";
+    status.textContent = resultLabel(fact.status);
+    const detail = document.createElement("span");
+    detail.className = "compare-fact-detail";
+    detail.textContent = fact.fill
+      ? `${fact.fill.symbol} ${integer(fact.fill.quantity)} 股 @ ${money(fact.fill.price_cents)} · 费用 ${money(fact.fill.fees_cents)}`
+      : reasonLabel(fact.reason);
+    detail.title = fact.status === "filled" ? fact.signal_id : fact.reason;
+    line.append(side, status, detail);
+    cell.appendChild(line);
+  }
+  return cell;
+};
+
+const row = (label: string, a: string, b: string): HTMLTableRowElement => {
+  const tr = document.createElement("tr");
+  const th = document.createElement("th");
+  th.scope = "row";
+  th.textContent = label;
+  const ca = document.createElement("td");
+  ca.textContent = a;
+  const cb = document.createElement("td");
+  cb.textContent = b;
+  tr.append(th, ca, cb);
+  return tr;
+};
+
+const renderComparison = (report: CompareReport): void => {
+  setCompareState(
+    report.ok ? "ok" : "fail",
+    report.ok
+      ? `可比（${report.slots.length} 个决策时点${report.unmatched_a + report.unmatched_b > 0 ? "，含单边决策" : ""}）`
+      : "不可比",
+    report.ok ? `摘要 ${report.digest.slice(0, 12)}…` : "两侧事实不会并列展示，避免被误读为可比结果",
+  );
+
+  const reasonsWrap = byId("compare-reasons-wrap");
+  const reasonsList = byId("compare-reasons");
+  reasonsList.replaceChildren();
+  for (const reason of report.reasons) {
+    const item = document.createElement("li");
+    item.textContent = COMPARE_REASONS[reason] ?? reason;
+    reasonsList.appendChild(item);
+  }
+  toggle(reasonsWrap, report.reasons.length > 0);
+
+  const checks = byId("compare-checks");
+  checks.replaceChildren();
+  for (const check of report.comparability) {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th");
+    th.scope = "row";
+    th.textContent = COMPARE_CHECK_LABELS[check.name] ?? check.name;
+    const shorten = (value: string): string =>
+      value.length > 16 ? `${value.slice(0, 12)}…` : value;
+    const ca = document.createElement("td");
+    ca.textContent = shorten(check.a);
+    ca.title = check.a;
+    const cb = document.createElement("td");
+    cb.textContent = shorten(check.b);
+    cb.title = check.b;
+    const verdict = document.createElement("td");
+    verdict.textContent = check.matched ? "一致" : "不一致";
+    verdict.className = check.matched ? "result-filled" : "result-rejected";
+    tr.append(th, ca, cb, verdict);
+    checks.appendChild(tr);
+  }
+
+  const verification = byId("compare-verification");
+  verification.replaceChildren();
+  for (const [label, side] of [["A", report.a], ["B", report.b]] as const) {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th");
+    th.scope = "row";
+    th.textContent = label;
+    const replay = document.createElement("td");
+    replay.textContent = side.verification.replay_ok
+      ? `通过（${side.verification.runs_verified} 次决策，${side.verification.fills_verified} 次成交）`
+      : "未通过";
+    replay.className = side.verification.replay_ok ? "result-filled" : "result-rejected";
+    const repro = document.createElement("td");
+    repro.textContent = side.verification.reproduction_ok
+      ? `通过（${side.verification.signals_verified} 条研究信号）`
+      : "未通过";
+    repro.className = side.verification.reproduction_ok ? "result-filled" : "result-rejected";
+    tr.append(th, replay, repro);
+    verification.appendChild(tr);
+  }
+
+  const totals = byId("compare-totals");
+  totals.replaceChildren();
+  toggle(byId("compare-totals-wrap"), report.ok);
+  toggle(byId("compare-slots-wrap"), report.ok);
+  if (report.ok) {
+    const formatPositions = (side: CompareSide): string =>
+      side.totals.positions.length === 0
+        ? "无持仓"
+        : side.totals.positions.map((position) => `${position.symbol} ${integer(position.quantity)}`).join("；");
+    totals.append(
+      row("决策条数", integer(report.a.totals.decisions), integer(report.b.totals.decisions)),
+      row("已成交 / 已拒绝",
+        `${integer(report.a.totals.filled)} / ${integer(report.a.totals.rejected)}`,
+        `${integer(report.b.totals.filled)} / ${integer(report.b.totals.rejected)}`),
+      row("费用合计（窗口内成交）", money(report.a.totals.fees_cents), money(report.b.totals.fees_cents)),
+      row("现金（窗口末）", money(report.a.totals.cash_cents), money(report.b.totals.cash_cents)),
+      row("持仓数量（窗口末）", formatPositions(report.a), formatPositions(report.b)),
+    );
+
+    const slots = byId("compare-slots");
+    slots.replaceChildren();
+    for (const slot of report.slots) {
+      const tr = document.createElement("tr");
+      const time = document.createElement("td");
+      time.className = "compare-time";
+      time.textContent = decisionTime(slot.decision_at);
+      tr.append(time, decisionCell(slot.a), decisionCell(slot.b));
+      slots.appendChild(tr);
+    }
+    setById("compare-unmatched",
+      `单边决策：A ${report.unmatched_a} 条 · B ${report.unmatched_b} 条（逐条标注，不补造另一方交易）`);
+  }
+
+  const valuation = testId<HTMLElement>("compare-valuation");
+  toggle(valuation, report.ok);
+  valuation.textContent = report.valuation.status === "unavailable"
+    ? "估值不可用：数据包未声明审核过的盯市价格集合，因此不计算收益、净值、回撤或策略排名。"
+    : "估值可用：价格来源与版本见比较摘要。";
+
+  setText("compare-version", report.version);
+  setText("compare-window", `${report.window.start_day} ~ ${report.window.end_day}（中国时间，含首尾）`);
+  setText("compare-digest", report.digest);
+  const identityText = (side: CompareSide): string =>
+    `${side.identity.cycle_id} · ${strategyName(side.identity.strategy_version_id)} · ` +
+    `${packName(side.identity.market_data_pack_id)} · ${policyName(side.identity.execution_policy_version)}`;
+  setText("compare-identity-a", identityText(report.a));
+  setText("compare-identity-b", identityText(report.b));
+};
+
+const runComparison = async (): Promise<void> => {
+  const scope = compareScope();
+  clearCompareError();
+  if (!scope.start || !scope.end) {
+    showCompareError("请先选择比较窗口的开始日与结束日");
+    announce("请先选择比较窗口");
+    return;
+  }
+  if (scope.a === scope.b) {
+    showCompareError("实验 A 与实验 B 不能是同一个实验");
+    announce("同一个实验无法比较");
+    return;
+  }
+  compareKey = `${scope.a}|${scope.b}|${scope.start}|${scope.end}`;
+  const seq = ++compareSeq;
+  compareButton.disabled = true;
+  compareButton.setAttribute("aria-busy", "true");
+  setCompareState("running", "正在比较…", "");
+  announce("开始比较两个实验");
+  const query = "/v2/comparisons" +
+    `?cycle_a=${encodeURIComponent(scope.a)}` +
+    `&cycle_b=${encodeURIComponent(scope.b)}` +
+    `&start_day=${encodeURIComponent(scope.start)}` +
+    `&end_day=${encodeURIComponent(scope.end)}`;
+  try {
+    const report = await api<CompareReport>(query, new AbortController().signal);
+    if (seq !== compareSeq) return;
+    syncCompareUrl(scope);
+    renderComparison(report);
+    announce(report.ok
+      ? `比较完成，${report.slots.length} 个决策时点`
+      : "两个实验不可比");
+  } catch (error) {
+    if (seq !== compareSeq) return;
+    setCompareState("fail", `比较失败：${errorDetail(error)}`, "");
+    announce("比较失败");
+  } finally {
+    if (seq === compareSeq) {
+      compareButton.disabled = false;
+      compareButton.removeAttribute("aria-busy");
+    }
+  }
+};
+
+compareForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void runComparison();
+});
+
+/** Prefill and auto-run when the deep link carries a full comparison scope. */
+const hydrateComparison = (): void => {
+  const params = new URLSearchParams(location.search);
+  const a = params.get("a");
+  const b = params.get("b");
+  const from = params.get("from");
+  const to = params.get("to");
+  if (!a || !b || !from || !to) return;
+  if (!experiments.some((experiment) => experiment.cycle_id === a)) return;
+  if (!experiments.some((experiment) => experiment.cycle_id === b)) return;
+  if (`${a}|${b}|${from}|${to}` === compareKey) return;
+  compareA.value = a;
+  compareB.value = b;
+  byId<HTMLInputElement>("compare-start").value = from;
+  byId<HTMLInputElement>("compare-end").value = to;
+  void runComparison();
+};
+
+// ---------------------------------------------------------------------------
 // Keyboard shortcuts
 // ---------------------------------------------------------------------------
 const sheet = byId<HTMLDialogElement>("shortcuts");
@@ -1056,7 +1400,7 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (!workspaceVisible()) return;
-  if (key >= "1" && key <= "6") {
+  if (key >= "1" && key <= "9") {
     const view = VIEW_ORDER[Number(key) - 1];
     if (view && view !== currentView) {
       event.preventDefault();

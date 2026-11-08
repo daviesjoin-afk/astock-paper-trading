@@ -82,6 +82,117 @@ pub struct ReplayReport {
     pub cash_cents: i64,
 }
 
+/// Read-only A/B comparison contract (ADR 004). Facts are only juxtaposed;
+/// nothing is re-decided, re-filled or valued.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonWindow {
+    pub start_day: String,
+    pub end_day: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonIdentity {
+    pub cycle_id: String,
+    pub status: String,
+    pub strategy_version_id: String,
+    pub research_input_id: String,
+    pub market_data_pack_id: String,
+    pub execution_policy_version: String,
+    pub initial_cash_cents: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonCheck {
+    pub name: String,
+    pub matched: bool,
+    pub a: String,
+    pub b: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonVerification {
+    pub replay_ok: bool,
+    pub runs_verified: usize,
+    pub fills_verified: usize,
+    pub reproduction_ok: bool,
+    pub signals_verified: usize,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonFill {
+    pub symbol: String,
+    pub side: String,
+    pub quantity: i64,
+    pub price_cents: i64,
+    pub fees_cents: i64,
+    pub trade_day: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonDecision {
+    pub run_id: i64,
+    pub signal_id: String,
+    pub side: String,
+    pub status: String,
+    pub reason: String,
+    pub fill: Option<ComparisonFill>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonSlot {
+    /// Canonical China-offset instant. Several decisions may share one slot.
+    pub decision_at: String,
+    pub a: Vec<ComparisonDecision>,
+    pub b: Vec<ComparisonDecision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonPosition {
+    pub symbol: String,
+    pub quantity: i64,
+    pub sellable_quantity: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonTotals {
+    pub decisions: i64,
+    pub filled: i64,
+    pub rejected: i64,
+    pub fees_cents: i64,
+    pub cash_cents: i64,
+    pub positions: Vec<ComparisonPosition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonSide {
+    pub identity: ComparisonIdentity,
+    pub verification: ComparisonVerification,
+    pub totals: ComparisonTotals,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonValuation {
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonReport {
+    pub version: String,
+    pub ok: bool,
+    pub reasons: Vec<String>,
+    pub window: ComparisonWindow,
+    pub a: ComparisonSide,
+    pub b: ComparisonSide,
+    pub comparability: Vec<ComparisonCheck>,
+    pub slots: Vec<ComparisonSlot>,
+    pub unmatched_a: usize,
+    pub unmatched_b: usize,
+    pub valuation: ComparisonValuation,
+    pub digest: String,
+}
+
 /// Read-only catalogue: available rows plus how many stored rows exist and how
 /// many are unreadable. A single corrupt row never hides the rest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

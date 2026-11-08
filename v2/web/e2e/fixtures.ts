@@ -16,6 +16,7 @@ export const CYCLES = {
   holdings: "e2e-holdings",
   flat: "e2e-flat",
   repro: "e2e-repro",
+  reproB: "e2e-repro-b",
   empty: "e2e-empty",
   rejected: "e2e-rejected",
 } as const;
@@ -133,11 +134,13 @@ export async function ensureFixtures(api: APIRequestContext): Promise<void> {
   await create(api, CYCLES.holdings, 10_000_000);
   await create(api, CYCLES.flat, 10_000_000);
   await create(api, CYCLES.repro, 10_000_000);
+  await create(api, CYCLES.reproB, 10_000_000);
   await create(api, CYCLES.empty, 10_000_000);
   await create(api, CYCLES.rejected, 10_000_000);
   await realise(api, CYCLES.holdings, signals.slice(0, 1));
   await realise(api, CYCLES.flat, signals);
   await realise(api, CYCLES.repro, signals);
+  await realise(api, CYCLES.reproB, signals);
   // Selling without a T+1 lot is a deterministic rejection worth showing.
   // Reuse the frozen sell-side entry so the evidence identity stays identical
   // to the other experiments (one payload per quote identity).

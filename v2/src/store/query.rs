@@ -307,3 +307,322 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ADR 004: read-only A/B comparison.
+//
+// Facts from two independent experiments are juxtaposed by decision instant.
+// Nothing is re-decided, re-filled, re-valued or written.
+// ---------------------------------------------------------------------------
+
+struct ComparisonRun {
+    day: chrono::NaiveDate,
+    instant: String,
+    status: &'static str,
+    fees_cents: i64,
+    fact: ComparisonDecision,
+}
+
+fn comparison_day(raw: &str) -> StoreResult<chrono::NaiveDate> {
+    let day = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map_err(|_| StoreError::Rules(RuleError("comparison_window_invalid".into())))?;
+    if day.to_string() != raw {
+        return Err(StoreError::Rules(RuleError("comparison_window_invalid".into())));
+    }
+    Ok(day)
+}
+
+fn side_code(side: &crate::domain::Side) -> String {
+    match side {
+        crate::domain::Side::Buy => "buy".into(),
+        crate::domain::Side::Sell => "sell".into(),
+    }
+}
+
+fn push_check(
+    checks: &mut Vec<ComparisonCheck>,
+    reasons: &mut Vec<String>,
+    name: &str,
+    a: String,
+    b: String,
+) {
+    let matched = a == b;
+    if !matched {
+        reasons.push(format!("comparison_{name}_mismatch"));
+    }
+    checks.push(ComparisonCheck { name: name.into(), matched, a, b });
+}
+
+fn comparison_identity(experiment: &Experiment) -> ComparisonIdentity {
+    ComparisonIdentity {
+        cycle_id: experiment.spec.cycle_id.clone(),
+        status: match experiment.status {
+            ExperimentStatus::Active => "active".into(),
+            ExperimentStatus::Completed => "completed".into(),
+        },
+        strategy_version_id: experiment.spec.strategy.strategy_version_id.clone(),
+        research_input_id: experiment.spec.strategy.research_input_id.clone(),
+        market_data_pack_id: experiment.spec.market_data_pack_id.clone(),
+        execution_policy_version: experiment.spec.execution_policy_version.clone(),
+        initial_cash_cents: experiment.spec.initial_cash_cents,
+    }
+}
+
+fn empty_totals() -> ComparisonTotals {
+    ComparisonTotals {
+        decisions: 0,
+        filled: 0,
+        rejected: 0,
+        fees_cents: 0,
+        cash_cents: 0,
+        positions: Vec::new(),
+    }
+}
+
+impl Store {
+    fn comparison_runs(
+        &self,
+        cycle: &str,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+        china: &chrono::FixedOffset,
+    ) -> StoreResult<Vec<ComparisonRun>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,request_json,outcome_json FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id",
+        )?;
+        let rows = statement.query_map([cycle], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut runs = Vec::new();
+        for row in rows {
+            let (id, request_json, outcome_json) = row?;
+            let request: SimulationRequest = serde_json::from_str(&request_json)?;
+            let outcome: Outcome = serde_json::from_str(&outcome_json)?;
+            let at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
+                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+            let local = at.with_timezone(china);
+            let day = local.date_naive();
+            if day < start || day > end {
+                continue;
+            }
+            let status = match outcome.status {
+                crate::domain::DecisionStatus::Filled => "filled",
+                crate::domain::DecisionStatus::Rejected => "rejected",
+            };
+            let fill = outcome.fill.as_ref().map(|fill| ComparisonFill {
+                symbol: fill.symbol.clone(),
+                side: side_code(&fill.side),
+                quantity: fill.quantity,
+                price_cents: fill.price_cents,
+                fees_cents: fill.fees_cents,
+                trade_day: fill.trade_day.clone(),
+            });
+            runs.push(ComparisonRun {
+                day,
+                instant: local.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                status,
+                fees_cents: outcome.fill.as_ref().map(|fill| fill.fees_cents).unwrap_or(0),
+                fact: ComparisonDecision {
+                    run_id: id,
+                    signal_id: request.signal_id.clone(),
+                    side: side_code(&request.signal.side),
+                    status: status.into(),
+                    reason: outcome.reason.clone(),
+                    fill,
+                },
+            });
+        }
+        Ok(runs)
+    }
+
+    fn comparison_totals(
+        &self,
+        cycle: &str,
+        end_day: &str,
+        runs: &[ComparisonRun],
+    ) -> StoreResult<ComparisonTotals> {
+        // Cash and positions are projected to the end of the requested window:
+        // the same explicit as-of rule the portfolio view uses, never machine time.
+        let state = self.state(cycle, Some(end_day))?;
+        Ok(ComparisonTotals {
+            decisions: runs.len() as i64,
+            filled: runs.iter().filter(|run| run.status == "filled").count() as i64,
+            rejected: runs.iter().filter(|run| run.status == "rejected").count() as i64,
+            fees_cents: runs.iter().map(|run| run.fees_cents).sum(),
+            cash_cents: state.cash_cents,
+            positions: state.positions.iter().map(|position| ComparisonPosition {
+                symbol: position.symbol.clone(),
+                quantity: position.quantity,
+                sellable_quantity: position.sellable_quantity,
+            }).collect(),
+        })
+    }
+
+    /// Compare two experiments over a caller-supplied, fully covered window.
+    pub fn comparison(
+        &self,
+        a: &str,
+        b: &str,
+        start_day: &str,
+        end_day: &str,
+    ) -> StoreResult<ComparisonReport> {
+        if a == b {
+            return Err(StoreError::Rules(RuleError("comparison_same_experiment".into())));
+        }
+        let start = comparison_day(start_day)?;
+        let end = comparison_day(end_day)?;
+        if start > end {
+            return Err(StoreError::Rules(RuleError("comparison_window_invalid".into())));
+        }
+
+        let experiment_a = load_experiment(&self.conn, a)?;
+        let experiment_b = load_experiment(&self.conn, b)?;
+        let china = chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset");
+        let runs_a = self.comparison_runs(a, start, end, &china)?;
+        let runs_b = self.comparison_runs(b, start, end, &china)?;
+
+        let replay_a = self.verify_replay(a);
+        let replay_b = self.verify_replay(b);
+        let repro_a = self.verify_research_reproduction(a);
+        let repro_b = self.verify_research_reproduction(b);
+
+        let verification_of = |replay: &StoreResult<ReplayReport>,
+                               repro: &StoreResult<ResearchReproductionReport>|
+         -> ComparisonVerification {
+            let replay_ok = replay.as_ref().map(|report| report.ok).unwrap_or(false);
+            let reproduction_ok = repro.as_ref().map(|report| report.ok).unwrap_or(false);
+            let detail = replay
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:?}"))
+                .or_else(|| repro.as_ref().err().map(|error| format!("{error:?}")))
+                .unwrap_or_else(|| "ok".into());
+            ComparisonVerification {
+                replay_ok,
+                runs_verified: replay.as_ref().map(|report| report.runs_verified).unwrap_or(0),
+                fills_verified: replay.as_ref().map(|report| report.fills_verified).unwrap_or(0),
+                reproduction_ok,
+                signals_verified: repro.as_ref().map(|report| report.signals_verified).unwrap_or(0),
+                detail,
+            }
+        };
+        let verification_a = verification_of(&replay_a, &repro_a);
+        let verification_b = verification_of(&replay_b, &repro_b);
+
+        let mut checks = Vec::new();
+        let mut reasons = Vec::new();
+        push_check(
+            &mut checks,
+            &mut reasons,
+            "research_input",
+            experiment_a.spec.strategy.research_input_digest.clone(),
+            experiment_b.spec.strategy.research_input_digest.clone(),
+        );
+        push_check(
+            &mut checks,
+            &mut reasons,
+            "market_data_pack",
+            experiment_a.spec.market_data_pack_id.clone(),
+            experiment_b.spec.market_data_pack_id.clone(),
+        );
+        push_check(
+            &mut checks,
+            &mut reasons,
+            "execution_policy",
+            experiment_a.spec.execution_policy_version.clone(),
+            experiment_b.spec.execution_policy_version.clone(),
+        );
+        push_check(
+            &mut checks,
+            &mut reasons,
+            "initial_cash",
+            experiment_a.spec.initial_cash_cents.to_string(),
+            experiment_b.spec.initial_cash_cents.to_string(),
+        );
+
+        if !verification_a.replay_ok || !verification_b.replay_ok {
+            reasons.push("comparison_replay_failed".into());
+        }
+        if !verification_a.reproduction_ok || !verification_b.reproduction_ok {
+            reasons.push("comparison_research_reproduction_failed".into());
+        }
+
+        // Window coverage: every decision day present on either side must be
+        // covered by both. A partially covered window is refused, not clipped.
+        let days_a: std::collections::BTreeSet<chrono::NaiveDate> =
+            runs_a.iter().map(|run| run.day).collect();
+        let days_b: std::collections::BTreeSet<chrono::NaiveDate> =
+            runs_b.iter().map(|run| run.day).collect();
+        if days_a.is_empty() || days_b.is_empty() {
+            reasons.push("comparison_window_not_covered".into());
+        } else if days_a
+            .union(&days_b)
+            .any(|day| !days_a.contains(day) || !days_b.contains(day))
+        {
+            reasons.push("comparison_window_not_covered".into());
+        }
+
+        let ok = reasons.is_empty();
+        let mut slots: Vec<ComparisonSlot> = Vec::new();
+        let mut unmatched_a = 0usize;
+        let mut unmatched_b = 0usize;
+        let (totals_a, totals_b) = if ok {
+            let mut grouped: std::collections::BTreeMap<
+                String,
+                (Vec<ComparisonDecision>, Vec<ComparisonDecision>),
+            > = std::collections::BTreeMap::new();
+            for run in runs_a.iter() {
+                grouped.entry(run.instant.clone()).or_default().0.push(run.fact.clone());
+            }
+            for run in runs_b.iter() {
+                grouped.entry(run.instant.clone()).or_default().1.push(run.fact.clone());
+            }
+            for (decision_at, (a_facts, b_facts)) in grouped {
+                if a_facts.is_empty() {
+                    unmatched_b += b_facts.len();
+                }
+                if b_facts.is_empty() {
+                    unmatched_a += a_facts.len();
+                }
+                slots.push(ComparisonSlot { decision_at, a: a_facts, b: b_facts });
+            }
+            (
+                self.comparison_totals(a, end_day, &runs_a)?,
+                self.comparison_totals(b, end_day, &runs_b)?,
+            )
+        } else {
+            (empty_totals(), empty_totals())
+        };
+
+        let mut report = ComparisonReport {
+            version: "comparison-v1".into(),
+            ok,
+            reasons,
+            window: ComparisonWindow { start_day: start_day.into(), end_day: end_day.into() },
+            a: ComparisonSide {
+                identity: comparison_identity(&experiment_a),
+                verification: verification_a,
+                totals: totals_a,
+            },
+            b: ComparisonSide {
+                identity: comparison_identity(&experiment_b),
+                verification: verification_b,
+                totals: totals_b,
+            },
+            comparability: checks,
+            slots,
+            unmatched_a,
+            unmatched_b,
+            valuation: ComparisonValuation {
+                status: "unavailable".into(),
+                reason: "no_reviewed_price_set".into(),
+            },
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
+    }
+}
