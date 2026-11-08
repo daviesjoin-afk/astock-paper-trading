@@ -1814,14 +1814,21 @@ const EVOLUTION_LABELS: Record<string, string> = {
   insufficient_evidence: "证据不足",
 };
 
-const loadEvolution = async (): Promise<void> => {
+let evolutionEvents: EvolutionEvent[] = [];
+
+const renderEvolutionList = (): void => {
   const container = testId<HTMLElement>("evolution-events");
   const empty = testId<HTMLElement>("evolution-empty");
-  try {
-    const events = await api<EvolutionEvent[]>("/v2/evolution/events?limit=50", new AbortController().signal);
-    const list = Array.isArray(events) ? events : [];
-    toggle(empty, list.length === 0);
-    container.replaceChildren(...list.map((event) => {
+  const candidate = byId<HTMLInputElement>("evolution-filter-candidate").value.trim().toLowerCase();
+  const status = byId<HTMLSelectElement>("evolution-filter-status").value;
+  const list = evolutionEvents.filter((event) =>
+    (candidate === "" || event.candidate_id.toLowerCase().includes(candidate)) &&
+    (status === "" || event.status === status));
+  toggle(empty, list.length === 0);
+  if (list.length === 0) {
+    empty.textContent = evolutionEvents.length === 0 ? "还没有进化事件。" : "没有匹配的事件。";
+  }
+  container.replaceChildren(...list.map((event) => {
       const card = document.createElement("article");
       card.className = "evolution-card";
       card.dataset.testid = `evolution-event-${event.event_id}`;
@@ -1845,12 +1852,25 @@ const loadEvolution = async (): Promise<void> => {
       }));
       card.append(head, reasons);
       return card;
-    }));
+  }));
+};
+
+const loadEvolution = async (): Promise<void> => {
+  const empty = testId<HTMLElement>("evolution-empty");
+  try {
+    const events = await api<EvolutionEvent[]>("/v2/evolution/events?limit=50", new AbortController().signal);
+    evolutionEvents = Array.isArray(events) ? events : [];
+    renderEvolutionList();
   } catch (error) {
+    evolutionEvents = [];
     toggle(empty, true);
+    testId<HTMLElement>("evolution-events").replaceChildren();
     empty.textContent = `读取进化事件失败：${errorDetail(error)}`;
   }
 };
+
+byId<HTMLInputElement>("evolution-filter-candidate").addEventListener("input", renderEvolutionList);
+byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", renderEvolutionList);
 
 testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
 

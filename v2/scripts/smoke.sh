@@ -405,6 +405,9 @@ event = call("evolution/events", {
 assert event["event_id"] == "smoke-evo-1" and event["status"] == "promoted", event
 events = call("evolution/events?limit=5")
 assert events[0]["event_id"] == "smoke-evo-1", events
+assert len(call("evolution/events?status=promoted")) == 1
+assert call("evolution/events?status=reverted") == []
+assert call("evolution/events?candidate=cand")[0]["candidate_id"] == "cand"
 # The account ledger proves its own invariants and links fills to outcomes.
 audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit

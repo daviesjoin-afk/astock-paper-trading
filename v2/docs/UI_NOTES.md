@@ -106,7 +106,9 @@ form, no valuation.
   capital and identical strategies are refused with an explicit message.
 - Evolution history: a dedicated view (shortcut 8) lists promotion/rollback
   events with candidate id, status pill, decision time and the rule reasons.
-  Empty logs and fetch failures explain themselves; the log is read-only.
+  Candidate/status filters narrow the log client-side (“没有匹配的事件” when
+  nothing matches). Empty logs and fetch failures explain themselves; the log
+  is read-only.
 - Account advance: a date input plus “推进账户到该日” drives every running
   session on the account in one call (paused sessions stay paused); the status
   line reports steps/fills/rejections.
