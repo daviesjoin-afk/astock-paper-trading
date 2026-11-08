@@ -147,6 +147,42 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("equity-performance")).toContainText("1 笔成交");
   });
 
+  test("shows an allocation proposal and applies it", async ({ page }) => {
+    let posted: Record<string, unknown> | null = null;
+    await page.route(/\/v2\/paper-accounts\/.+\/allocation-proposal\?/, (route) => route.fulfill({
+      json: {
+        proposal: {
+          status: "proposed", reserve_bps: 1_000, digest: "a".repeat(64),
+          rationale: [
+            { slot: "A", current_bps: 4_500, target_bps: 3_500, score_bps: -50, note: "保留下限" },
+            { slot: "B", current_bps: 4_500, target_bps: 5_500, score_bps: 120, note: "获得更多预算" },
+          ],
+        },
+        scores: [
+          { slot: "A", return_bps: -100, drawdown_bps: 50, score_bps: -150, days: 2 },
+          { slot: "B", return_bps: 20, drawdown_bps: 0, score_bps: 20, days: 2 },
+        ],
+      },
+    }));
+    await page.route(/\/v2\/paper-accounts\/.+\/rebalances$/, (route) => {
+      if (route.request().method() === "POST") {
+        posted = route.request().postDataJSON();
+        return route.fulfill({ json: { account_id: "e2e-account", amount_cents: 1_000_000 } });
+      }
+      return route.fulfill({ json: [] });
+    });
+    await openAccount(page);
+    await expect(page.getByTestId("account-allocation")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("allocation-summary")).toContainText("目标：A 35.0% · B 55.0%");
+    await expect(page.getByTestId("allocation-rationale")).toContainText("获得更多预算");
+    await page.getByTestId("allocation-apply").click();
+    await expect.poll(() => posted).not.toBeNull();
+    expect(posted?.["targets"]).toEqual([3_500, 5_500]);
+    expect(posted?.["proposal_digest"]).toBe("a".repeat(64));
+    expect(String(posted?.["applied_at"])).toContain("T");
+    await expect(page.getByTestId("live-status")).toContainText("资金再平衡已执行");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();

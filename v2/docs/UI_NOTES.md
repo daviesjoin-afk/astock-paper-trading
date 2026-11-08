@@ -116,6 +116,11 @@ form, no valuation.
 - Account advance: a date input plus “推进账户到该日” drives every running
   session on the account in one call (paused sessions stay paused); the status
   line reports steps/fills/rejections.
+- Allocation proposal: when at least two distinct days are known (trade days,
+  else the account's inception day), the panel shows the proposed weights,
+  reserve and per-slot rationale from /allocation-proposal, plus “执行再平衡”
+  which posts targets + the proposal digest with an explicit applied_at.
+  Insufficient evidence hides the block.
 - Exposure: “仓位与集中度” prints each slot's cost utilisation and either
   “无集中度超限” or the breaching symbols with value vs limit; cost basis only,
   never a market value.
