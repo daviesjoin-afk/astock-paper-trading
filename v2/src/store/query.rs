@@ -451,7 +451,7 @@ impl Store {
         if spec.slots.iter().any(|slot| slot.market_data_pack_id != pack) {
             return Err(StoreError::Rules(RuleError("valuation_mixed_packs".into())));
         }
-        let registry = bundled_price_registry()?;
+        let registry = load_price_sets(&price_sets_dir())?;
         let mut report = PaperValuationReport {
             account_id: account_id.into(),
             as_of_day: as_of_day.into(),
@@ -531,21 +531,67 @@ impl Store {
     }
 }
 
-/// Bundled, reviewed price sets. Adding data means adding a reviewed artifact,
-/// never a runtime write.
-fn bundled_price_registry() -> StoreResult<crate::domain::PriceSetRegistry> {
-    let raw = include_str!("../../data/price-sets-registry.json");
-    let registry: crate::domain::PriceSetRegistry = serde_json::from_str(raw)?;
+/// Where reviewed price sets live. Operators publish audited JSON artifacts
+/// here; the service only reads them. Missing directory means "no data yet".
+fn price_sets_dir() -> std::path::PathBuf {
+    match std::env::var_os("ASTOCK_PRICE_SETS_DIR") {
+        Some(value) => std::path::PathBuf::from(value),
+        None => std::path::PathBuf::from("data/price-sets"),
+    }
+}
+
+/// Load every `*.json` price set from a directory and validate the catalogue.
+fn load_price_sets(dir: &std::path::Path) -> StoreResult<crate::domain::PriceSetRegistry> {
+    let mut sets = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(crate::domain::PriceSetRegistry { schema_version: 1, sets });
+        }
+        Err(error) => {
+            return Err(StoreError::Integrity(format!("price_sets_dir_unreadable: {error}")))
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| StoreError::Integrity(format!("price_sets_dir_unreadable: {error}")))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|error| StoreError::Integrity(format!("price_set_unreadable: {error}")))?;
+        let set: crate::domain::PriceSet = serde_json::from_str(&raw)?;
+        sets.push(set);
+    }
+    let registry = crate::domain::PriceSetRegistry { schema_version: 1, sets };
     registry.validate()?;
     Ok(registry)
 }
 
 impl Store {
     pub fn price_set_catalogue(&self) -> StoreResult<Vec<crate::domain::PriceSetSummary>> {
-        Ok(bundled_price_registry()?.summaries())
+        self.price_set_catalogue_in(&price_sets_dir())
+    }
+
+    pub fn price_set_catalogue_in(
+        &self,
+        dir: &std::path::Path,
+    ) -> StoreResult<Vec<crate::domain::PriceSetSummary>> {
+        Ok(load_price_sets(dir)?.summaries())
     }
 
     /// Valuation using an explicit registry (tests can supply one).
+    pub fn paper_valuation_in_dir(
+        &self,
+        account_id: &str,
+        as_of_day: &str,
+        dir: &std::path::Path,
+    ) -> StoreResult<PaperValuationReport> {
+        let registry = load_price_sets(dir)?;
+        self.paper_valuation_with_registry(account_id, as_of_day, &registry)
+    }
+
     pub fn paper_valuation_with_registry(
         &self,
         account_id: &str,
@@ -656,7 +702,16 @@ impl Store {
         account_id: &str,
         days: &[String],
     ) -> StoreResult<Option<crate::domain::EquitySeries>> {
-        let registry = bundled_price_registry()?;
+        self.paper_equity_series_in(account_id, days, &price_sets_dir())
+    }
+
+    pub fn paper_equity_series_in(
+        &self,
+        account_id: &str,
+        days: &[String],
+        dir: &std::path::Path,
+    ) -> StoreResult<Option<crate::domain::EquitySeries>> {
+        let registry = load_price_sets(dir)?;
         self.paper_equity_series_with_registry(account_id, days, &registry)
     }
 
