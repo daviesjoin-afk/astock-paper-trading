@@ -254,6 +254,28 @@ pub struct AccountOverview {
     pub audit_ok: bool,
 }
 
+/// Query options for the evolution event log (all filters optional).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvolutionQuery<'a> {
+    pub limit: i64,
+    pub candidate_id: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub base_cycle: Option<&'a str>,
+    pub candidate_cycle: Option<&'a str>,
+    /// Inclusive China-day bounds (`YYYY-MM-DD`).
+    pub from_day: Option<&'a str>,
+    pub to_day: Option<&'a str>,
+}
+
+/// Cursor-paginated variant of the same filters.
+#[derive(Clone, Copy, Debug)]
+pub struct EvolutionPageQuery<'a> {
+    pub query: EvolutionQuery<'a>,
+    pub before: Option<&'a str>,
+    pub before_id: Option<&'a str>,
+    pub after: Option<&'a str>,
+}
+
 /// One page of the evolution event log, newest first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionEventPage {
