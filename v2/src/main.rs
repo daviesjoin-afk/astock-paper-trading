@@ -180,6 +180,20 @@ async fn paper_rebalances(
     response(db.paper_rebalances(&id).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct AccountAdvanceBody {
+    day: String,
+}
+
+async fn advance_account(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Json(body): Json<AccountAdvanceBody>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(db.advance_account_to(&id, &body.day).map_err(api_error)?)
+}
+
 async fn paper_exposure(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     let db = state.lock().await;
     response(db.paper_exposure(&id).map_err(api_error)?)
@@ -404,6 +418,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/exposure",
             get(paper_exposure),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/advance",
+            post(advance_account),
         )
         .route(
             "/v2/paper-accounts/{account_id}/rebalances",

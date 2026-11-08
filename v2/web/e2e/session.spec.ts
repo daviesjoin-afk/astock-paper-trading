@@ -137,6 +137,21 @@ test.describe("paper session control", () => {
     await expect(card).toContainText("2/2");
   });
 
+  test("the account-level advance drives a running session", async ({ page, request }) => {
+    await createAccount(request, "ui-acc-advance-account");
+    await createSession(request, "ui-acc-advance-account", "ui-session-account-advance");
+    await openAccount(page, "ui-acc-advance-account");
+    const card = page.getByTestId("session-card-ui-session-account-advance");
+    await card.getByRole("button", { name: "启动" }).click();
+    await expect(card).toContainText("运行中");
+
+    await page.getByTestId("account-advance-day").fill("2026-11-02");
+    await page.getByTestId("account-advance").click();
+    await expect(card).toContainText("已完成", { timeout: 15_000 });
+    await expect(card).toContainText("2/2");
+    await expect(page.getByTestId("live-status")).toContainText("账户推进到 2026-11-02");
+  });
+
   test("the fixture session exists for its account", async ({ page }) => {
     await openAccount(page, "e2e-session-account");
     await expect(page.getByTestId("session-card-e2e-session")).toBeVisible();
