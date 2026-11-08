@@ -46,7 +46,7 @@ def emit(
     written = []
     for candidate in manifest["candidates"]:
         artifact = dict(base_artifact)
-        artifact["strategy_version_id"] = candidate["candidate_id"]
+        artifact["strategy_version_id"] = f"shadow-{candidate['candidate_id']}"
         artifact["parameters_canonical"] = candidate["parameters_canonical"]
         artifact["parameters_digest"] = candidate["parameters_digest"]
         parameters = json.loads(candidate["parameters_canonical"])
@@ -62,7 +62,7 @@ def emit(
         contract.write_json(output_path, output)
         written.append(
             {
-                "candidate_id": candidate["candidate_id"],
+                "candidate_id": artifact["strategy_version_id"],
                 "parameters_digest": candidate["parameters_digest"],
                 "signals": len(output["signals"]),
                 "artifact": artifact_path.name,

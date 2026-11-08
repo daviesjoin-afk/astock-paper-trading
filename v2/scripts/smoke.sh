@@ -409,6 +409,32 @@ assert events[0]["event_id"] == "smoke-evo-1", events
 assert len(call("evolution/events?status=promoted")) == 1
 assert call("evolution/events?status=reverted") == []
 assert call("evolution/events?candidate=cand")[0]["candidate_id"] == "cand"
+
+# Shadow wiring: candidate artifact -> experiment -> frozen signals.
+import tempfile, shutil, sys as _sys
+from pathlib import Path as _Path
+_ROOT = _Path.cwd()
+_sys.path.insert(0, str(_ROOT / "scripts"))
+_sys.path.insert(0, str(_ROOT / "research"))
+import generate_candidates as _candidates
+import emit_candidate_artifacts as _emitter
+import shadow_candidates as _shadow
+_shadow_dir = Path(tempfile.mkdtemp(prefix="astock-shadow-"))
+_base_artifact = json.loads((_ROOT / "data" / "strategy-momentum-v1.json").read_text(encoding="utf8"))
+_manifest = _candidates.build_manifest(_base_artifact, {"lookback": [3], "threshold_bps": [25]}, 32)
+_written = _emitter.emit(_manifest, _shadow_dir)
+_artifact = json.loads((_shadow_dir / _written[0]["artifact"]).read_text(encoding="utf8"))
+_output = json.loads((_shadow_dir / _written[0]["output"]).read_text(encoding="utf8"))
+_shadow_result = _shadow.run("http://127.0.0.1:8765", _artifact, _output,
+                             "shadow-candidate-1", 10_000_000,
+                             "cn-offline-fixture-pack-1", "v2-paper-policy-6")
+assert _shadow_result["signals"] == len(_output["signals"]) == 1, _shadow_result
+assert _shadow_result["runs_total"] == 1, _shadow_result
+assert _shadow_result["filled"] + _shadow_result["rejected"] == 1, _shadow_result
+_base_output = json.loads((_ROOT / "data" / "research-output-momentum-v1.json").read_text(encoding="utf8"))
+assert len(_base_output["signals"]) == 2
+shutil.rmtree(_shadow_dir)
+
 # The account ledger proves its own invariants and links fills to outcomes.
 audit = call("paper-accounts/smoke-account/audit")
 assert audit["ok"] is True, audit

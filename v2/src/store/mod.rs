@@ -906,6 +906,23 @@ fn validate_experiment_spec(spec: &ExperimentSpec) -> StoreResult<()> {
     // reviewed definition for that id, and its digests must be recomputable from
     // repository bytes and the frozen research input.
     spec.strategy.verify_content()?;
+    // Shadow candidates (ADR-014) reuse a reviewed source but carry their own
+    // parameters. They are research-only: the source digest must match one of
+    // the reviewed strategies, and the frozen input must still be reviewed.
+    if spec.strategy.strategy_version_id.starts_with("shadow-") {
+        let known_source = ["research-momentum-v1", "research-reversion-v1"]
+            .iter()
+            .filter_map(|id| reviewed_strategy_artifact(id).ok())
+            .any(|artifact| artifact.source_digest == spec.strategy.source_digest);
+        if !known_source {
+            return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into())));
+        }
+        let input = reviewed_research_input(&spec.strategy.research_input_id)?;
+        if input.content_digest != spec.strategy.research_input_digest {
+            return Err(StoreError::Integrity("research_input_digest_mismatch".into()));
+        }
+        return Ok(());
+    }
     let reviewed = reviewed_strategy_artifact(&spec.strategy.strategy_version_id)?;
     if reviewed != spec.strategy {
         return Err(StoreError::Conflict("strategy_artifact_content_mismatch".into()));
