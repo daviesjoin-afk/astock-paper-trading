@@ -1345,3 +1345,12 @@ fn evolution_event_digest(record: &EvolutionEventRecord) -> StoreResult<String> 
     }
     Ok(crate::domain::canonical_digest(&value))
 }
+
+impl Store {
+    /// Schema version actually applied to this database file.
+    pub fn schema_version(&self) -> StoreResult<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?)
+    }
+}

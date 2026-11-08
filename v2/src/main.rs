@@ -37,8 +37,18 @@ fn response<T: serde::Serialize>(value: T) -> ApiResult {
     })
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status":"ok", "system":"astock-v2", "paper_only":true}))
+async fn health(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let schema_version: i64 = db.schema_version().map_err(api_error)?;
+    let price_sets = db.price_set_catalogue().map(|sets| sets.len()).unwrap_or(0);
+    response(json!({
+        "status": "ok",
+        "system": "astock-v2",
+        "paper_only": true,
+        "schema_version": schema_version,
+        "price_sets": price_sets,
+        "writer": "store-single-writer",
+    }))
 }
 
 async fn submit(
