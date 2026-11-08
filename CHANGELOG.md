@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 账户订单路径（ADR 005 第二阶段）：新增 `PaperOrderRequest` 与 `POST /v2/paper-accounts/{id}/orders`、`GET /v2/paper-accounts/{id}/orders`；决策复用 `domain::decide`，槽位独立重建 `PortfolioState`，槽位内 append-only + 幂等键（同请求 duplicate、异载荷冲突），证据缺失按规则拒绝且不改账本；账户视图的现金与持仓改为从槽位 fill 派生，现金守恒 `reserve + Σslot.cash = initial − 净流出` 由测试与冒烟双重断言。schema v9 → v10（新增 `v2_paper_orders` / `v2_paper_fills`）。Rust 114 passed；冒烟覆盖下单、守恒、幂等与订单列表。
 - V2 模拟总账户核心（ADR 005，第一阶段）：新增 `PaperAccountSpec` 纯域契约（A/B 两槽位、权重 basis points、显式 `created_at`、每槽独立的策略工件/数据包/执行规则）；整数分划分把除不尽的余数全部留给准备金，`reserve + Σ budget = initial` 恒成立；Store 新增 `v2_paper_accounts`（schema v9）与 `create_paper_account` / `paper_account`，同 spec 幂等、异 spec 冲突、重开文件视图不变；HTTP 新增 `POST /v2/paper-accounts`、`GET /v2/paper-accounts/{account_id}`（幂等/只读，不产生交易事实）。**schema v8 → v9，旧本地数据库需重建。** 成交、自动运行与前端留在后续 PR。
 - V2 校验控件生命周期修复（PR #360 复审）：`invalidateVerification()` 在刷新、切换实验或进入通知态时统一递增请求序列号、恢复按钮可用并移除 `aria-busy`；迟到的旧响应既不改变结果也不会把新实验的按钮锁死；刷新过程中启动的校验在数据代次变更后被丢弃并提示重新验证。新增 4 项生命周期测试（刷新中校验、切换实验、互不锁定、失败恢复）。
 - V2 看板数据一致性门禁（PR #360 审查修复）：资产读取改为单口径请求并按响应 `cycle_id`/`asof_day` 校验，历史查询失败保留上次成功口径并在概览与持仓同时标注；决策时间固定按 `Asia/Shanghai` 显示（UTC/+08:00/-08:00 结果一致，跨日期正确）；回放/重做校验收紧为 `ok === true` + 报告实验身份匹配 + 数据 epoch 失效 + 请求序列号 + 单次在途；实验目录按 500 上限读取并对目录外 `cycle_id` 直接核验，区分“未列出”“不存在”“记录损坏”，部分损坏保留可用实验并提示；数据包显示可区分编号、未知信号给出稳定短标识、决策行显示记录编号、技术标识可键盘复制。新增 `e2e/consistency.spec.ts`（14 项）与对应 a11y/截图证据。

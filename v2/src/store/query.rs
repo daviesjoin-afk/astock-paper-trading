@@ -324,6 +324,44 @@ impl Store {
         let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
         let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
         let split = spec.validate()?;
-        Ok(crate::store::paper_account_view(&spec, &split))
+        crate::store::Store::paper_account_view_with_conn(&self.conn, &spec, &split)
+    }
+}
+
+impl Store {
+    /// Read one account's slot orders in append order. Facts only.
+    pub fn paper_orders(
+        &self,
+        account_id: &str,
+        limit: i64,
+    ) -> StoreResult<Vec<PaperOrderRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,account_id,slot,strategy_version_id,request_json,outcome_json
+             FROM v2_paper_orders WHERE account_id=? ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map(params![account_id, limit.clamp(1, 500)], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut orders = Vec::new();
+        for row in rows {
+            let (id, account_id, slot, strategy_version_id, request_json, outcome_json) = row?;
+            orders.push(PaperOrderRecord {
+                id,
+                account_id,
+                slot,
+                strategy_version_id,
+                request: serde_json::from_str(&request_json)?,
+                outcome: serde_json::from_str(&outcome_json)?,
+                duplicate: false,
+            });
+        }
+        Ok(orders)
     }
 }

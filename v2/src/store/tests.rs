@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{PaperAccountSpec, PaperSlotId, PaperSlotSpec};
+use crate::domain::{PaperAccountSpec, PaperOrderRequest, PaperSlotId, PaperSlotSpec};
 
 #[test]
 fn tampering_evidence_pack_identity_is_rejected_on_retry_and_replay() {
@@ -2067,5 +2067,147 @@ fn paper_account_is_idempotent_conflict_checked_and_survives_reopen() {
         let reopened = db.paper_account("acct-main").unwrap();
         assert_eq!(reopened, created, "a restart must not change the split");
         assert!(matches!(db.paper_account("acct-missing"), Err(StoreError::NotFound(_))));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR 005 order path: slot-owned orders, fills and capital conservation
+// ---------------------------------------------------------------------------
+
+fn paper_order(account: &str, slot: PaperSlotId, signal: &crate::domain::ResearchSignal) -> PaperOrderRequest {
+    PaperOrderRequest {
+        schema_version: 1,
+        account_id: account.into(),
+        slot,
+        signal_id: signal.signal_id.clone(),
+        decision_at: signal.decision_at.clone(),
+        signal: Signal { symbol: signal.symbol.clone(), side: signal.side.clone() },
+        quote_ref: frozen_quote_ref(signal),
+    }
+}
+
+fn ingest_signal_evidence(db: &mut Store, signal: &crate::domain::ResearchSignal) {
+    let manifest = frozen_manifest();
+    let entry = manifest.entry_for(&frozen_quote_ref(signal)).expect("frozen entry");
+    db.ingest_quote(frozen_evidence(MARKET_DATA_PACK_ID, entry, signal.side.clone())).unwrap();
+}
+
+#[test]
+fn paper_order_charges_only_its_slot_and_keeps_capital_conserved() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("paper-main", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+
+    let record = db.submit_paper_order(paper_order("paper-main", PaperSlotId::A, buy)).unwrap();
+    assert_eq!(record.outcome.status, DecisionStatus::Filled);
+    let fill = record.outcome.fill.as_ref().expect("filled");
+    assert!(fill.quantity > 0 && fill.quantity % 100 == 0);
+    let bought = fill.quantity;
+    let spent = fill.quantity * fill.price_cents + fill.fees_cents;
+
+    let view = db.paper_account("paper-main").unwrap();
+    let slot_a = &view.slots[0];
+    let slot_b = &view.slots[1];
+    assert_eq!(slot_a.budget_cents, 4_500_000);
+    assert_eq!(slot_a.cash_cents, 4_500_000 - spent);
+    assert_eq!(slot_b.cash_cents, 4_500_000);
+    assert_eq!(view.reserve_cents, 1_000_000);
+    assert_eq!(slot_a.positions.len(), 1);
+    assert_eq!(slot_a.positions[0].symbol, "600000.SH");
+    assert_eq!(slot_a.positions[0].quantity, bought);
+    assert!(slot_b.positions.is_empty());
+    assert_eq!(slot_a.orders_total, 1);
+    assert_eq!(slot_b.orders_total, 0);
+    // Cash conservation: the reserve and both slots explain every remaining cent.
+    assert_eq!(
+        view.reserve_cents + slot_a.cash_cents + slot_b.cash_cents,
+        view.initial_cash_cents - spent
+    );
+    assert_eq!(view.cash_cents, view.reserve_cents + slot_a.cash_cents + slot_b.cash_cents);
+
+    // The same signal is idempotent; a different payload under the same identity conflicts.
+    let again = db.submit_paper_order(paper_order("paper-main", PaperSlotId::A, buy)).unwrap();
+    assert!(again.duplicate);
+    assert_eq!(again.id, record.id);
+    let mut conflicting = paper_order("paper-main", PaperSlotId::A, buy);
+    conflicting.decision_at = "2026-10-30T14:00:01+08:00".into();
+    assert!(matches!(
+        db.submit_paper_order(conflicting),
+        Err(StoreError::Conflict(ref code)) if code == "same_signal_identity_with_different_paper_request"
+    ));
+}
+
+#[test]
+fn paper_slots_are_isolated_and_append_only() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("paper-iso", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let first = &output.signals[0];
+    let second = &output.signals[1];
+    ingest_signal_evidence(&mut db, first);
+    ingest_signal_evidence(&mut db, second);
+
+    // Slot B can hold the same signal identity without touching slot A.
+    db.submit_paper_order(paper_order("paper-iso", PaperSlotId::A, first)).unwrap();
+    let view = db.paper_account("paper-iso").unwrap();
+    let a_after_first = view.slots[0].cash_cents;
+    db.submit_paper_order(paper_order("paper-iso", PaperSlotId::B, first)).unwrap();
+    let view = db.paper_account("paper-iso").unwrap();
+    assert_eq!(view.slots[0].cash_cents, a_after_first);
+    assert!(view.slots[1].cash_cents < view.slots[1].budget_cents);
+
+    // A later decision, then an earlier one in the same slot: append-only refuses it.
+    db.submit_paper_order(paper_order("paper-iso", PaperSlotId::A, second)).unwrap();
+    let mut earlier = paper_order("paper-iso", PaperSlotId::A, first);
+    earlier.signal_id = "paper-earlier-synthetic".into();
+    assert!(matches!(
+        db.submit_paper_order(earlier),
+        Err(StoreError::Conflict(ref code)) if code == "out_of_order_paper_decision"
+    ));
+
+    let orders = db.paper_orders("paper-iso", 10).unwrap();
+    assert_eq!(orders.len(), 3);
+    assert!(orders[0].id > orders[1].id);
+}
+
+#[test]
+fn paper_order_without_evidence_is_rejected_and_changes_nothing() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("paper-no-evidence", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+
+    let record = db.submit_paper_order(paper_order("paper-no-evidence", PaperSlotId::A, buy)).unwrap();
+    assert_eq!(record.outcome.status, DecisionStatus::Rejected);
+    assert_eq!(record.outcome.reason, "quote_evidence_missing");
+    assert!(record.outcome.fill.is_none());
+
+    let view = db.paper_account("paper-no-evidence").unwrap();
+    assert_eq!(view.cash_cents, view.initial_cash_cents);
+    assert_eq!(view.slots[0].cash_cents, view.slots[0].budget_cents);
+    assert!(view.slots[0].positions.is_empty());
+}
+
+#[test]
+fn paper_account_with_orders_survives_reopen_unchanged() {
+    let file = DiskDatabase::new();
+    let output = frozen_momentum_output();
+    let before;
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        db.create_paper_account(paper_spec("paper-reopen", 10_000_000)).unwrap();
+        let buy = &output.signals[0];
+        ingest_signal_evidence(&mut db, buy);
+        db.submit_paper_order(paper_order("paper-reopen", PaperSlotId::A, buy)).unwrap();
+        before = db.paper_account("paper-reopen").unwrap();
+        assert!(before.slots[0].cash_cents < before.slots[0].budget_cents);
+    }
+    {
+        let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let after = db.paper_account("paper-reopen").unwrap();
+        assert_eq!(after, before, "restart must not change account facts");
+        assert_eq!(db.paper_orders("paper-reopen", 10).unwrap().len(), 1);
     }
 }

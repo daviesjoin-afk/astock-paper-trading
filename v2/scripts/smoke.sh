@@ -366,9 +366,32 @@ conflicting = copy.deepcopy(paper_spec)
 conflicting["initial_cash_cents"] = 20_000_000
 call("paper-accounts", conflicting, expected=409)
 call("paper-accounts/does-not-exist", expected=404)
+
+# Slot-owned order path: evidence, budget and conservation.
+paper_order = {
+    "schema_version": 1, "account_id": "smoke-account", "slot": "A",
+    "signal_id": "paper-smoke-buy",
+    "decision_at": "2026-10-30T10:00:00+08:00",
+    "signal": {"symbol": "600000.SH", "side": "buy"},
+    "quote_ref": proposal["quote_ref"],
+}
+order = call("paper-accounts/smoke-account/orders", paper_order)
+assert order["outcome"]["status"] == "filled", order
+fill = order["outcome"]["fill"]
+spent = fill["quantity"] * fill["price_cents"] + fill["fees_cents"]
+paper = call("paper-accounts/smoke-account")
+slot_a, slot_b = paper["slots"]
+assert slot_a["cash_cents"] == slot_a["budget_cents"] - spent, (slot_a, spent)
+assert slot_b["cash_cents"] == slot_b["budget_cents"]
+assert paper["reserve_cents"] + slot_a["cash_cents"] + slot_b["cash_cents"] == 10_000_000 - spent
+assert slot_a["positions"] == [{"symbol": "600000.SH", "quantity": fill["quantity"], "sellable_quantity": None}]
+assert call("paper-accounts/smoke-account/orders", paper_order)["duplicate"] is True
+orders = call("paper-accounts/smoke-account/orders")
+assert len(orders) == 1 and orders[0]["id"] == order["id"], orders
+assert orders[0]["slot"] == "A" and orders[0]["outcome"] == order["outcome"]
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"

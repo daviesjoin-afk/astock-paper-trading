@@ -94,6 +94,7 @@ pub struct PaperSlotView {
     pub budget_cents: i64,
     pub cash_cents: i64,
     pub positions: Vec<PositionView>,
+    pub orders_total: i64,
 }
 
 /// One user-funded paper account with two frozen strategy slots.
@@ -106,6 +107,18 @@ pub struct PaperAccountView {
     pub cash_cents: i64,
     pub reserve_cents: i64,
     pub slots: Vec<PaperSlotView>,
+}
+
+/// One simulated order recorded against a strategy slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperOrderRecord {
+    pub id: i64,
+    pub account_id: String,
+    pub slot: String,
+    pub strategy_version_id: String,
+    pub request: crate::domain::PaperOrderRequest,
+    pub outcome: Outcome,
+    pub duplicate: bool,
 }
 
 /// Read-only catalogue: available rows plus how many stored rows exist and how
@@ -162,7 +175,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 9;
+        const SCHEMA_VERSION: i64 = 10;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -190,10 +203,13 @@ impl Store {
                 ("v2_fills", &["id", "run_id", "fill_json"]),
                 ("v2_quote_evidence", &["pack_id", "source", "quote_id", "evidence_json"]),
                 ("v2_paper_accounts", &["account_id", "spec_json", "created_at"]),
+                ("v2_paper_orders", &["id", "account_id", "slot", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
+                ("v2_paper_fills", &["id", "order_id", "fill_json"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
-                    || (kind == "index" && name == "idx_v2_runs_cycle" && table == "v2_simulation_runs");
+                    || (kind == "index" && name == "idx_v2_runs_cycle" && table == "v2_simulation_runs")
+                || (kind == "index" && name == "idx_v2_paper_orders_account" && table == "v2_paper_orders");
                 if !known {
                     return Err(StoreError::Integrity("unknown_database_schema".into()));
                 }
@@ -277,6 +293,26 @@ impl Store {
                     account_id TEXT PRIMARY KEY NOT NULL,
                     spec_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE v2_paper_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL REFERENCES v2_paper_accounts(account_id) ON DELETE RESTRICT,
+                    slot TEXT NOT NULL CHECK(slot IN ('A','B')),
+                    strategy_version_id TEXT NOT NULL,
+                    signal_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    outcome_json TEXT NOT NULL,
+                    calendar_version TEXT NOT NULL,
+                    session_policy_version TEXT NOT NULL,
+                    instrument_version TEXT NOT NULL,
+                    UNIQUE(account_id, slot, strategy_version_id, signal_id)
+                );
+                CREATE INDEX idx_v2_paper_orders_account ON v2_paper_orders(account_id, slot, id);
+                CREATE TABLE v2_paper_fills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL UNIQUE REFERENCES v2_paper_orders(id) ON DELETE RESTRICT,
+                    fill_json TEXT NOT NULL
                 );
                 CREATE TABLE v2_quote_evidence (
                     pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,
@@ -757,49 +793,237 @@ impl Store {
             if existing != raw {
                 return Err(StoreError::Conflict("paper_account_conflict".into()));
             }
-            return Ok(paper_account_view(&spec, &split));
+            return Self::paper_account_view_with_conn(&txn, &spec, &split);
         }
         txn.execute(
             "INSERT INTO v2_paper_accounts(account_id,spec_json,created_at) VALUES(?,?,?)",
             params![spec.account_id, raw, spec.created_at],
         )?;
         txn.commit()?;
-        Ok(paper_account_view(&spec, &split))
+        Ok(Self::paper_account_view_with_conn(&self.conn, &spec, &split)?)
     }
 }
 
-/// Build the read model from a validated spec. Slot cash starts at its budget:
-/// the reserve never trades and no cash exists outside the two slots.
-pub(crate) fn paper_account_view(
-    spec: &crate::domain::PaperAccountSpec,
-    split: &crate::domain::PaperCapitalSplit,
-) -> PaperAccountView {
-    let mut slots = Vec::new();
-    for slot in &spec.slots {
-        let index = match slot.slot {
-            crate::domain::PaperSlotId::A => 0,
-            crate::domain::PaperSlotId::B => 1,
-        };
-        let budget_cents = split.slot_budgets[index];
-        slots.push(PaperSlotView {
-            slot: slot.slot.as_str().into(),
-            strategy_version_id: slot.strategy.strategy_version_id.clone(),
-            research_input_id: slot.strategy.research_input_id.clone(),
-            market_data_pack_id: slot.market_data_pack_id.clone(),
-            execution_policy_version: slot.execution_policy_version.clone(),
-            weight_bps: slot.weight_bps,
-            budget_cents,
-            cash_cents: budget_cents,
-            positions: Vec::new(),
-        });
+// ---------------------------------------------------------------------------
+// Paper account order path (ADR 005): slot-owned orders and fills.
+// Reuses the same pure decision policy as experiments; the slot owns budget,
+// cash and positions, and the reserve never trades.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    fn paper_slot_state(
+        conn: &Connection,
+        spec: &crate::domain::PaperAccountSpec,
+        split: &crate::domain::PaperCapitalSplit,
+        slot_index: usize,
+    ) -> StoreResult<PortfolioState> {
+        let slot = if slot_index == 0 { "A" } else { "B" };
+        let mut state = PortfolioState::new(split.slot_budgets[slot_index]);
+        let mut statement = conn.prepare(
+            "SELECT f.fill_json FROM v2_paper_fills f
+             JOIN v2_paper_orders o ON o.id=f.order_id
+             WHERE o.account_id=? AND o.slot=? ORDER BY o.id",
+        )?;
+        let rows = statement.query_map(params![spec.account_id, slot], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            let fill: Fill = serde_json::from_str(&row?)?;
+            state.apply(&fill).map_err(StoreError::Rules)?;
+        }
+        Ok(state)
     }
-    let cash_cents = split.reserve_cents + split.slot_budgets.iter().sum::<i64>();
-    PaperAccountView {
-        account_id: spec.account_id.clone(),
-        initial_cash_cents: spec.initial_cash_cents,
-        created_at: spec.created_at.clone(),
-        cash_cents,
-        reserve_cents: split.reserve_cents,
-        slots,
+
+    fn paper_account_view_with_conn(
+        conn: &Connection,
+        spec: &crate::domain::PaperAccountSpec,
+        split: &crate::domain::PaperCapitalSplit,
+    ) -> StoreResult<PaperAccountView> {
+        let mut slots = Vec::new();
+        let mut cash_cents = split.reserve_cents;
+        for (index, slot) in spec.slots.iter().enumerate() {
+            let state = Self::paper_slot_state(conn, spec, split, index)?;
+            let orders_total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM v2_paper_orders WHERE account_id=? AND slot=?",
+                params![spec.account_id, slot.slot.as_str()],
+                |row| row.get(0),
+            )?;
+            cash_cents += state.cash_cents;
+            slots.push(PaperSlotView {
+                slot: slot.slot.as_str().into(),
+                strategy_version_id: slot.strategy.strategy_version_id.clone(),
+                research_input_id: slot.strategy.research_input_id.clone(),
+                market_data_pack_id: slot.market_data_pack_id.clone(),
+                execution_policy_version: slot.execution_policy_version.clone(),
+                weight_bps: slot.weight_bps,
+                budget_cents: split.slot_budgets[index],
+                cash_cents: state.cash_cents,
+                positions: state
+                    .lots
+                    .iter()
+                    .fold(Vec::<PositionView>::new(), |mut acc, lot| {
+                        match acc.iter_mut().find(|position| position.symbol == lot.symbol) {
+                            Some(position) => position.quantity += lot.quantity,
+                            None => acc.push(PositionView {
+                                symbol: lot.symbol.clone(),
+                                quantity: lot.quantity,
+                                sellable_quantity: None,
+                            }),
+                        }
+                        acc
+                    }),
+                orders_total,
+            });
+        }
+        Ok(PaperAccountView {
+            account_id: spec.account_id.clone(),
+            initial_cash_cents: spec.initial_cash_cents,
+            created_at: spec.created_at.clone(),
+            cash_cents,
+            reserve_cents: split.reserve_cents,
+            slots,
+        })
+    }
+
+    /// Submit one simulated order to a slot. Append-only per slot, idempotent on
+    /// the signal identity, and fail-closed on evidence and budget.
+    pub fn submit_paper_order(
+        &mut self,
+        request: crate::domain::PaperOrderRequest,
+    ) -> StoreResult<PaperOrderRecord> {
+        request.validate()?;
+        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw_spec: Option<String> = txn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [&request.account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw_spec =
+            raw_spec.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw_spec)?;
+        let split = spec.validate()?;
+        let slot_index = spec
+            .slots
+            .iter()
+            .position(|slot| slot.slot == request.slot)
+            .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_not_found".into())))?;
+        let slot_spec = spec.slots[slot_index].clone();
+        if request.quote_ref.market_data_pack_id != slot_spec.market_data_pack_id {
+            return Err(StoreError::Conflict("paper_quote_data_pack_mismatch".into()));
+        }
+        let (calendar, sessions, instruments) =
+            load_market_context(&txn, &slot_spec.market_data_pack_id)?;
+
+        let prior: Option<(i64, String, String)> = txn
+            .query_row(
+                "SELECT id,request_json,outcome_json FROM v2_paper_orders
+                 WHERE account_id=? AND slot=? AND strategy_version_id=? AND signal_id=?",
+                params![
+                    request.account_id,
+                    slot_spec.slot.as_str(),
+                    slot_spec.strategy.strategy_version_id,
+                    request.signal_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((id, raw_request, raw_outcome)) = prior {
+            let stored: crate::domain::PaperOrderRequest = serde_json::from_str(&raw_request)?;
+            if stored != request {
+                return Err(StoreError::Conflict(
+                    "same_signal_identity_with_different_paper_request".into(),
+                ));
+            }
+            let outcome: Outcome = serde_json::from_str(&raw_outcome)?;
+            return Ok(PaperOrderRecord {
+                id,
+                account_id: request.account_id.clone(),
+                slot: slot_spec.slot.as_str().into(),
+                strategy_version_id: slot_spec.strategy.strategy_version_id,
+                request,
+                outcome,
+                duplicate: true,
+            });
+        }
+
+        // Append-only: a slot never accepts a decision earlier than its last one.
+        let previous: Option<String> = txn
+            .query_row(
+                "SELECT request_json FROM v2_paper_orders
+                 WHERE account_id=? AND slot=? ORDER BY id DESC LIMIT 1",
+                params![request.account_id, slot_spec.slot.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = previous {
+            let previous: crate::domain::PaperOrderRequest = serde_json::from_str(&raw)?;
+            let previous_at = chrono::DateTime::parse_from_rfc3339(&previous.decision_at)
+                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+            let next_at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
+                .map_err(|_| StoreError::Rules(RuleError("invalid_decision_time".into())))?;
+            if next_at < previous_at {
+                return Err(StoreError::Conflict(
+                    "out_of_order_paper_decision".into(),
+                ));
+            }
+        }
+
+        let state = Self::paper_slot_state(&txn, &spec, &split, slot_index)?;
+        let internal = SimulationRequest {
+            schema_version: 4,
+            cycle_id: spec.account_id.clone(),
+            strategy_version_id: slot_spec.strategy.strategy_version_id.clone(),
+            signal_id: request.signal_id.clone(),
+            decision_at: request.decision_at.clone(),
+            signal: request.signal.clone(),
+            quote_ref: request.quote_ref.clone(),
+        };
+        let evidence = load_evidence(&txn, &request.quote_ref)?;
+        let outcome = decide(
+            &state,
+            &internal,
+            evidence.as_ref(),
+            &calendar,
+            &sessions,
+            &instruments,
+        )
+        .map_err(StoreError::Rules)?;
+
+        txn.execute(
+            "INSERT INTO v2_paper_orders(account_id,slot,strategy_version_id,signal_id,
+                request_json,evidence_json,outcome_json,calendar_version,session_policy_version,instrument_version)
+             VALUES(?,?,?,?,?,?,?,?,?,?)",
+            params![
+                request.account_id,
+                slot_spec.slot.as_str(),
+                slot_spec.strategy.strategy_version_id,
+                request.signal_id,
+                serde_json::to_string(&request)?,
+                serde_json::to_string(&evidence)?,
+                serde_json::to_string(&outcome)?,
+                calendar.version,
+                sessions.version,
+                instruments.version,
+            ],
+        )?;
+        let id = txn.last_insert_rowid();
+        if let Some(fill) = &outcome.fill {
+            txn.execute(
+                "INSERT INTO v2_paper_fills(order_id,fill_json) VALUES(?,?)",
+                params![id, serde_json::to_string(fill)?],
+            )?;
+        }
+        txn.commit()?;
+        Ok(PaperOrderRecord {
+            id,
+            account_id: request.account_id.clone(),
+            slot: slot_spec.slot.as_str().into(),
+            strategy_version_id: slot_spec.strategy.strategy_version_id,
+            request,
+            outcome,
+            duplicate: false,
+        })
     }
 }

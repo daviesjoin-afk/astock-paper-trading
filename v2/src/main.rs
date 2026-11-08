@@ -1,5 +1,5 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{ExperimentSpec, PaperAccountSpec, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
+use astock_v2::{domain::{ExperimentSpec, PaperAccountSpec, PaperOrderRequest, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
 use axum::{
     extract::{Path, Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
@@ -96,6 +96,30 @@ async fn paper_account(State(state): State<Shared>, Path(id): Path<String>) -> A
     response(db.paper_account(&id).map_err(api_error)?)
 }
 
+async fn submit_paper_order(
+    State(state): State<Shared>,
+    Path(account_id): Path<String>,
+    Json(mut request): Json<PaperOrderRequest>,
+) -> ApiResult {
+    if request.account_id != account_id {
+        return Err((
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "paper_account_path_mismatch"})),
+        ));
+    }
+    request.account_id = account_id;
+    let mut db = state.lock().await;
+    response(db.submit_paper_order(request).map_err(api_error)?)
+}
+
+async fn paper_orders(
+    State(state): State<Shared>,
+    Path(account_id): Path<String>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_orders(&account_id, 100).map_err(api_error)?)
+}
+
 async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
 }
@@ -137,6 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/paper-accounts", post(create_paper_account))
         .route("/v2/paper-accounts/{account_id}", get(paper_account))
+        .route(
+            "/v2/paper-accounts/{account_id}/orders",
+            post(submit_paper_order).get(paper_orders),
+        )
         .route("/v2/experiments/{cycle_id}", get(experiment))
         .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))
         .route("/v2/quotes", post(ingest_quote))
