@@ -2415,3 +2415,51 @@ fn paper_session_specs_must_be_explicit_and_ordered() {
     let missing_account = session_spec("nope", "missing", vec![session_signal(PaperSlotId::A, &output.signals[0])]);
     assert!(matches!(db.create_paper_session(missing_account), Err(StoreError::NotFound(_))));
 }
+
+#[test]
+fn paper_session_run_advances_to_completion_or_pause() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("run-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    db.create_paper_session(session_spec(
+        "run-acct",
+        "run-session",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[0]),
+            session_signal(PaperSlotId::B, &output.signals[1]),
+        ],
+    ))
+    .unwrap();
+    db.paper_session_action("run-session", "start").unwrap();
+    let run = db.run_paper_session("run-session").unwrap();
+    assert_eq!(run.steps, 2);
+    assert_eq!(run.filled + run.rejected, 2);
+    assert_eq!(run.session.status, "completed");
+    assert_eq!(run.session.cursor, 2);
+    assert_eq!(run.session.clock_at, output.signals[1].decision_at);
+    let view = db.paper_account("run-acct").unwrap();
+    assert_eq!(view.slots[0].orders_total + view.slots[1].orders_total, 2);
+
+    // Paused sessions do not run; the call is safe and reports the pause.
+    db.create_paper_account(paper_spec("pause-run-acct", 10_000_000)).unwrap();
+    db.create_paper_session(session_spec(
+        "pause-run-acct",
+        "pause-run",
+        vec![session_signal(PaperSlotId::A, &output.signals[0])],
+    ))
+    .unwrap();
+    db.paper_session_action("pause-run", "start").unwrap();
+    db.paper_session_action("pause-run", "pause").unwrap();
+    let paused_run = db.run_paper_session("pause-run").unwrap();
+    assert_eq!(paused_run.steps, 0);
+    assert_eq!(paused_run.session.status, "paused");
+    assert_eq!(db.paper_account("pause-run-acct").unwrap().slots[0].orders_total, 0);
+
+    let listed = db.paper_sessions(Some("run-acct"), 10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, "run-session");
+    assert_eq!(db.paper_sessions(None, 10).unwrap().len(), 2);
+}

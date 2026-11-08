@@ -365,3 +365,47 @@ impl Store {
         Ok(orders)
     }
 }
+// ---------------------------------------------------------------------------
+// Paper session catalogue (read-only).
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn paper_sessions(
+        &self,
+        account_id: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<PaperSessionView>> {
+        let mut statement = self.conn.prepare(
+            "SELECT session_id,account_id,spec_json,status,clock_at,cursor,last_order_id
+             FROM v2_paper_sessions
+             WHERE (?1 IS NULL OR account_id = ?1)
+             ORDER BY session_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![account_id, limit.clamp(1, 200)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (session_id, account_id, spec_json, status, clock_at, cursor, last_order_id) = row?;
+            let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
+            sessions.push(PaperSessionView {
+                session_id,
+                account_id,
+                status,
+                clock_at,
+                cursor: cursor.max(0) as usize,
+                total: spec.signals.len(),
+                last_order_id,
+            });
+        }
+        Ok(sessions)
+    }
+}

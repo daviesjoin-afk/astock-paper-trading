@@ -117,6 +117,13 @@ test.describe("screenshots", () => {
     await capture(page, "account");
   });
 
+  test("paper session control", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.repro}&account=e2e-session-account#/account`);
+    await page.getByTestId("session-card-e2e-session").waitFor();
+    await settle(page);
+    await capture(page, "account-sessions");
+  });
+
   test("shortcut reference", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("summary-strategy").waitFor();
