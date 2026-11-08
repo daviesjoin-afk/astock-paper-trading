@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 影子决策 CLI（ADR 012/016）：`scripts/shadow_candidates.py` 新增 `--base-cycle/--performance-days/--decide/--record-event/--event-id/--decided-at`——用同一审核序列为基准与候选取绩效，任一缺失即 `unavailable` 不决策；`--decide` 调用治理规则，`--record-event` 需显式事件 id 与时刻。Python 研究套件 36 passed（新增 4：覆盖缺失、指标映射、事件记录、显式时刻）；冒烟覆盖“合成数据 → 决策 unavailable”；Rust 142 / 浏览器 112 不变。
 - V2 实验绩效（ADR 016）：新增 `GET /v2/experiments/{cycle_id}/performance?days=`——以实验成交与初始本金、同一审核价格集合口径计算收益/回撤/费用/笔数与摘要；影子候选可与基准同口径比较，接入 ADR-012 决策输入（需数据覆盖）。Rust 142 passed（实验绩效一致/确定性/合成与缺覆盖/缺失实验）；浏览器 112 不变；冒烟覆盖不可用路径。
 - V2 账户绩效摘要（ADR 016）：新增 `GET /v2/paper-accounts/{id}/performance?days=`——在完整审核净值序列之上计算 `profit/return_bps/max_drawdown/drawdown_bps/fees/trades` 与 canonical 摘要；无覆盖返回 `unavailable`，空日期 422，合成集合永不产生报告。账户页在净值可用时展示“收益 / 回撤 / 费用 / 笔数”。Rust 141 passed（指标一致性/确定性/合成与缺覆盖/空日期）；浏览器 112 passed（+1 绩效展示）；冒烟覆盖不可用路径。
 - V2 进化日志分页（ADR 012）：新增 `GET /v2/evolution/events/page?limit=&before=&before_id=&after=`——游标为 `(decided_at, event_id)` 双键（均不含），同一时间戳多条事件不漏读，支持 `after` 时间下界，最大扫描 2000 条；返回 `next_before/next_before_id` 供续页。进化视图改为加载最近 20 条并提供“加载更早”，按 id 去重追加。Rust 140 passed（同时间戳分页/过滤/非法游标）；浏览器 111 passed（+1 游标加载）；冒烟覆盖分页端点。

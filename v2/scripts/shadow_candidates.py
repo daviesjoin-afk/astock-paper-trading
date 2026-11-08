@@ -62,6 +62,75 @@ def quote_payload(entry: dict, side: str, pack: str) -> dict:
     }
 
 
+def performance(api: str, cycle: str, days: list[str]) -> dict | None:
+    """Reviewed-series performance, or None when coverage is missing."""
+    report = call(api, f"experiments/{cycle}/performance?days={','.join(days)}")
+    if isinstance(report, dict) and report.get("status") == "unavailable":
+        return None
+    return report
+
+
+def metrics_from_performance(report: dict) -> dict:
+    return {
+        "candidate_id": report["cycle_id"],
+        "out_of_sample_days": report["days"],
+        "shadow_days": report["days"],
+        "trades": report["trades"],
+        "return_bps": report["return_bps"],
+        "drawdown_bps": report["drawdown_bps"],
+    }
+
+
+def decide(
+    api: str,
+    base_cycle: str,
+    candidate_cycle: str,
+    days: list[str],
+    *,
+    record_event: bool = False,
+    event_id: str | None = None,
+    decided_at: str | None = None,
+    policy: dict | None = None,
+) -> dict:
+    """Compare two experiments on the same reviewed days and optionally decide.
+
+    Without coverage on both sides the result is `unavailable`: no decision is
+    invented from partial metrics.
+    """
+    base = performance(api, base_cycle, days)
+    candidate = performance(api, candidate_cycle, days)
+    if base is None or candidate is None:
+        return {
+            "status": "unavailable",
+            "reason": "no_reviewed_price_set",
+            "base_available": base is not None,
+            "candidate_available": candidate is not None,
+        }
+    payload = {
+        "kind": "promotion",
+        "incumbent": metrics_from_performance(base),
+        "candidate": metrics_from_performance(candidate),
+    }
+    if policy is not None:
+        payload["policy"] = policy
+    decision = call(api, "evolution/decisions", payload)
+    event = None
+    if record_event:
+        if not decided_at:
+            raise ValueError("record_event_requires_decided_at")
+        event_payload = dict(payload)
+        event_payload["event_id"] = event_id or f"shadow-{candidate_cycle}"
+        event_payload["decided_at"] = decided_at
+        event = call(api, "evolution/events", event_payload)
+    return {
+        "status": "decided",
+        "base": base,
+        "candidate": candidate,
+        "decision": decision,
+        "event": event,
+    }
+
+
 def run(api: str, artifact: dict, output: dict, cycle: str, cash: int, pack: str, policy: str) -> dict:
     call(
         api,
@@ -124,14 +193,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pack", default=DEFAULT_PACK)
     parser.add_argument("--policy", default=DEFAULT_POLICY)
     parser.add_argument("--api", default="http://127.0.0.1:8765")
+    parser.add_argument("--base-cycle")
+    parser.add_argument("--performance-days", default="")
+    parser.add_argument("--decide", action="store_true")
+    parser.add_argument("--record-event", action="store_true")
+    parser.add_argument("--event-id")
+    parser.add_argument("--decided-at")
     args = parser.parse_args(argv)
     artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
     output = json.loads(args.output.read_text(encoding="utf-8"))
     try:
         result = run(args.api, artifact, output, args.cycle, args.cash, args.pack, args.policy)
-    except (AssertionError, KeyError, ValueError) as error:
+    except (AssertionError, KeyError, ValueError, SystemExit) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    days = [day.strip() for day in args.performance_days.split(",") if day.strip()]
+    if days and args.base_cycle:
+        result["performance"] = {
+            "base": performance(args.api, args.base_cycle, days),
+            "candidate": performance(args.api, args.cycle, days),
+        }
+    if args.decide and args.base_cycle and days:
+        result["decision"] = decide(
+            args.api,
+            args.base_cycle,
+            args.cycle,
+            days,
+            record_event=args.record_event,
+            event_id=args.event_id,
+            decided_at=args.decided_at,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
