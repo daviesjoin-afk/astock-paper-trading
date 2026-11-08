@@ -170,6 +170,7 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
   }
   if (view === "account" && accounts.length === 0) void loadAccounts();
   if (view === "evolution") void loadEvolution();
+  if (view === "experiment") void loadPriceSets();
   announce(`已切换到${VIEWS[view].label}`);
 };
 
@@ -2169,6 +2170,75 @@ const evolutionDayParams = (): string => {
   return (fromDay ? `&from_day=${encodeURIComponent(fromDay)}` : "") +
     (toDay ? `&to_day=${encodeURIComponent(toDay)}` : "");
 };
+
+type PriceSetSummaryRow = {
+  price_set_id: string; trust: string; market_data_pack_id: string;
+  coverage_start: string; coverage_end: string; entries: number; digest: string;
+};
+
+const loadPriceSets = async (): Promise<void> => {
+  const list = testId<HTMLUListElement>("price-set-list");
+  const empty = testId<HTMLElement>("price-set-empty");
+  try {
+    const rows = await api<PriceSetSummaryRow[]>("/v2/price-sets", new AbortController().signal);
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.replaceChildren();
+      toggle(empty, true);
+      return;
+    }
+    toggle(empty, false);
+    list.replaceChildren(...rows.map((row) => {
+      const item = document.createElement("li");
+      item.dataset.testid = `price-set-${row.price_set_id}`;
+      item.textContent =
+        `${row.price_set_id} · ${row.trust} · ${row.market_data_pack_id} · ` +
+        `${row.coverage_start}~${row.coverage_end} · ${row.entries} 条 · ${row.digest.slice(0, 8)}`;
+      return item;
+    }));
+  } catch {
+    list.replaceChildren();
+    toggle(empty, true);
+  }
+};
+
+const runCoverageCheck = async (): Promise<void> => {
+  const pack = byId<HTMLInputElement>("coverage-pack").value.trim();
+  const symbols = byId<HTMLInputElement>("coverage-symbols").value.split(",")
+    .map((symbol) => symbol.trim()).filter(Boolean);
+  const days = byId<HTMLInputElement>("coverage-days").value.split(",")
+    .map((day) => day.trim()).filter(Boolean);
+  const result = testId<HTMLElement>("coverage-result");
+  if (!pack || symbols.length === 0 || days.length === 0) {
+    toggle(result, true);
+    result.dataset.state = "gap";
+    result.textContent = "请填写数据包、至少一个标的与至少一个交易日";
+    return;
+  }
+  try {
+    const report = await api<CoverageReport>(
+      `/v2/price-sets/coverage?pack_id=${encodeURIComponent(pack)}` +
+      `&symbols=${encodeURIComponent(symbols.join(","))}` +
+      `&days=${encodeURIComponent(days.join(","))}`,
+      new AbortController().signal,
+    );
+    const total = report.symbols.length * report.days.length;
+    toggle(result, true);
+    if (report.missing.length === 0) {
+      result.dataset.state = "ok";
+      result.textContent = `全部覆盖（${report.covered_pairs}/${total}）`;
+    } else {
+      result.dataset.state = "gap";
+      const missing = report.missing.slice(0, 4).map((item) => `${item.symbol}@${item.day}`).join("、");
+      result.textContent = `覆盖 ${report.covered_pairs}/${total} · 缺口 ${missing}`;
+    }
+  } catch (error) {
+    toggle(result, true);
+    result.dataset.state = "gap";
+    result.textContent = `核对失败：${errorDetail(error)}`;
+  }
+};
+
+testId<HTMLButtonElement>("coverage-run").addEventListener("click", () => void runCoverageCheck());
 
 const loadEvolution = async (): Promise<void> => {
   const empty = testId<HTMLElement>("evolution-empty");

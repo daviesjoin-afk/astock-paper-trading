@@ -682,6 +682,29 @@ python3 scripts/experiment_demo.py</code></pre>
                   <div><dt>执行规则标识</dt><dd id="tech-policy" data-testid="tech-policy">—</dd></div>
                 </dl>
               </details>
+              <section class="price-sets" id="price-sets" data-testid="price-sets">
+                <h3>价格集合</h3>
+                <p class="panel-note">只有 reviewed 集合参与估值与绩效；synthetic 仅供本地测试。</p>
+                <ul class="price-set-list" id="price-set-list" data-testid="price-set-list"></ul>
+                <p class="muted" id="price-set-empty" data-testid="price-set-empty" hidden>目录为空：尚未发布任何集合。</p>
+                <h4>覆盖核对</h4>
+                <div class="coverage-check">
+                  <label class="field field-inline">
+                    <span class="field-label">数据包</span>
+                    <input id="coverage-pack" data-testid="coverage-pack" autocomplete="off" placeholder="cn-offline-fixture-pack-1" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">标的</span>
+                    <input id="coverage-symbols" data-testid="coverage-symbols" autocomplete="off" placeholder="600000.SH" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">交易日</span>
+                    <input id="coverage-days" data-testid="coverage-days" autocomplete="off" placeholder="2026-10-30,2026-11-02" />
+                  </label>
+                  <button type="button" class="btn btn-quiet" id="coverage-run" data-testid="coverage-run">核对</button>
+                </div>
+                <p class="coverage-result" id="coverage-result" data-testid="coverage-result" hidden></p>
+              </section>
               <p class="muted">行情、成交价与容量均为离线合成输入；本页不展示净值、收益率、夏普或排行榜。</p>
             </div>
           </section>
