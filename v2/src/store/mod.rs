@@ -82,6 +82,32 @@ pub struct ReplayReport {
     pub cash_cents: i64,
 }
 
+/// One strategy slot of a paper account: its own budget, cash and positions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperSlotView {
+    pub slot: String,
+    pub strategy_version_id: String,
+    pub research_input_id: String,
+    pub market_data_pack_id: String,
+    pub execution_policy_version: String,
+    pub weight_bps: i64,
+    pub budget_cents: i64,
+    pub cash_cents: i64,
+    pub positions: Vec<PositionView>,
+}
+
+/// One user-funded paper account with two frozen strategy slots.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperAccountView {
+    pub account_id: String,
+    pub initial_cash_cents: i64,
+    pub created_at: String,
+    /// Reserve plus every slot's cash. Never below zero, never above initial.
+    pub cash_cents: i64,
+    pub reserve_cents: i64,
+    pub slots: Vec<PaperSlotView>,
+}
+
 /// Read-only catalogue: available rows plus how many stored rows exist and how
 /// many are unreadable. A single corrupt row never hides the rest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +162,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 8;
+        const SCHEMA_VERSION: i64 = 9;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -163,6 +189,7 @@ impl Store {
                 ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_fills", &["id", "run_id", "fill_json"]),
                 ("v2_quote_evidence", &["pack_id", "source", "quote_id", "evidence_json"]),
+                ("v2_paper_accounts", &["account_id", "spec_json", "created_at"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
@@ -246,6 +273,11 @@ impl Store {
                     fill_json TEXT NOT NULL
                 );
                 CREATE INDEX idx_v2_runs_cycle ON v2_simulation_runs(cycle_id, id);
+                CREATE TABLE v2_paper_accounts (
+                    account_id TEXT PRIMARY KEY NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE v2_quote_evidence (
                     pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,
                     source TEXT NOT NULL,
@@ -692,4 +724,82 @@ fn load_experiment(conn: &Connection, cycle_id: &str) -> StoreResult<Experiment>
         _ => return Err(StoreError::Integrity("invalid_experiment_status".into())),
     };
     Ok(Experiment { spec, status })
+}
+// ---------------------------------------------------------------------------
+// Paper account: one user-funded account, two frozen strategy slots.
+// Store is the only writer; the split itself stays a pure domain decision.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Register an account once. Re-posting the identical spec is idempotent;
+    /// a different spec under the same id is a conflict, never a silent update.
+    pub fn create_paper_account(
+        &mut self,
+        spec: crate::domain::PaperAccountSpec,
+    ) -> StoreResult<PaperAccountView> {
+        let split = spec.validate()?;
+        let raw = serde_json::to_string(&spec)?;
+        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for slot in &spec.slots {
+            if slot.execution_policy_version != POLICY_VERSION {
+                return Err(StoreError::Rules(RuleError("unsupported_execution_policy".into())));
+            }
+            load_market_pack(&txn, &slot.market_data_pack_id)?;
+        }
+        if let Some(existing) = txn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [&spec.account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing != raw {
+                return Err(StoreError::Conflict("paper_account_conflict".into()));
+            }
+            return Ok(paper_account_view(&spec, &split));
+        }
+        txn.execute(
+            "INSERT INTO v2_paper_accounts(account_id,spec_json,created_at) VALUES(?,?,?)",
+            params![spec.account_id, raw, spec.created_at],
+        )?;
+        txn.commit()?;
+        Ok(paper_account_view(&spec, &split))
+    }
+}
+
+/// Build the read model from a validated spec. Slot cash starts at its budget:
+/// the reserve never trades and no cash exists outside the two slots.
+pub(crate) fn paper_account_view(
+    spec: &crate::domain::PaperAccountSpec,
+    split: &crate::domain::PaperCapitalSplit,
+) -> PaperAccountView {
+    let mut slots = Vec::new();
+    for slot in &spec.slots {
+        let index = match slot.slot {
+            crate::domain::PaperSlotId::A => 0,
+            crate::domain::PaperSlotId::B => 1,
+        };
+        let budget_cents = split.slot_budgets[index];
+        slots.push(PaperSlotView {
+            slot: slot.slot.as_str().into(),
+            strategy_version_id: slot.strategy.strategy_version_id.clone(),
+            research_input_id: slot.strategy.research_input_id.clone(),
+            market_data_pack_id: slot.market_data_pack_id.clone(),
+            execution_policy_version: slot.execution_policy_version.clone(),
+            weight_bps: slot.weight_bps,
+            budget_cents,
+            cash_cents: budget_cents,
+            positions: Vec::new(),
+        });
+    }
+    let cash_cents = split.reserve_cents + split.slot_budgets.iter().sum::<i64>();
+    PaperAccountView {
+        account_id: spec.account_id.clone(),
+        initial_cash_cents: spec.initial_cash_cents,
+        created_at: spec.created_at.clone(),
+        cash_cents,
+        reserve_cents: split.reserve_cents,
+        slots,
+    }
 }

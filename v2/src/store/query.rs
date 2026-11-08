@@ -307,3 +307,23 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Paper account read model (ADR 005). Read-only; the split is recomputed from
+// the frozen spec so a restart cannot change it.
+// ---------------------------------------------------------------------------
+impl Store {
+    pub fn paper_account(&self, account_id: &str) -> StoreResult<PaperAccountView> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate()?;
+        Ok(crate::store::paper_account_view(&spec, &split))
+    }
+}

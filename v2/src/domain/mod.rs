@@ -5,6 +5,7 @@ mod digest;
 mod calendar;
 mod instrument;
 mod execution;
+mod paper;
 mod portfolio;
 
 pub use contract::*;
@@ -12,6 +13,7 @@ pub use digest::*;
 pub use calendar::*;
 pub use instrument::*;
 pub use execution::*;
+pub use paper::*;
 pub use portfolio::*;
 
 #[cfg(test)]
