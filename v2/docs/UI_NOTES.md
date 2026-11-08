@@ -141,9 +141,9 @@ form, no valuation.
 - Coverage: the account header states whether reviewed prices cover the held
   symbols on the known days (“完整 n/n” or “x/y · 缺口 …”); gaps are warnings,
   never silently treated as covered.
-- Run status: the account header shows session counts (running/paused/done),
-  loaded price-set count and the latest evolution event; any failed probe shows
-  “—”, never a stale number.
+- Run status: the account header shows only account-scoped session counts
+  (running/paused/done); global facts (price sets, latest evolution event) live
+  on the overview page, so the two views no longer duplicate each other.
 - Allocation proposal: when at least two distinct days are known (trade days,
   else the account's inception day), the panel shows the proposed weights,
   reserve and per-slot rationale from /allocation-proposal, plus “执行再平衡”

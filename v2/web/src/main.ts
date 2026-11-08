@@ -1370,33 +1370,6 @@ const renderSessionStatus = (sessions: PaperSessionView[]): void => {
   setText("status-sessions", `会话：运行 ${running} · 暂停 ${paused} · 完成 ${completed}`);
 };
 
-const renderRunStatus = async (accountId: string): Promise<void> => {
-  try {
-    const priceSets = await api<unknown[]>("/v2/price-sets", new AbortController().signal);
-    if (currentAccountId === accountId && Array.isArray(priceSets)) {
-      setText("status-price-sets", `价格集合：${priceSets.length}`);
-    }
-  } catch {
-    if (currentAccountId === accountId) setText("status-price-sets", "价格集合：—");
-  }
-  try {
-    const page = await api<{ events: EvolutionEvent[] }>(
-      "/v2/evolution/events/page?limit=1",
-      new AbortController().signal,
-    );
-    if (currentAccountId !== accountId) return;
-    const latest = page.events?.[0];
-    if (!latest) {
-      setText("status-evolution", "进化：暂无事件");
-    } else {
-      const label = EVOLUTION_LABELS[latest.status] ?? latest.status;
-      setText("status-evolution", `进化：最近 ${label} · ${latest.candidate_id}`);
-    }
-  } catch {
-    if (currentAccountId === accountId) setText("status-evolution", "进化：—");
-  }
-};
-
 const renderSessions = (sessions: PaperSessionView[]): void => {
   renderSessionStatus(sessions);
   const container = byId("account-sessions");
@@ -1784,7 +1757,6 @@ const loadAccount = async (accountId: string): Promise<void> => {
     const orderList = Array.isArray(orders) ? orders : [];
     renderAccount(account, orderList);
     renderSessions(Array.isArray(sessions) ? sessions : []);
-    void renderRunStatus(accountId);
 
     const orderDays = Array.from(new Set(
       orderList.map((order) => chinaDayOf(order.request.decision_at)).filter(Boolean),

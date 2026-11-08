@@ -183,25 +183,12 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("live-status")).toContainText("资金再平衡已执行");
   });
 
-  test("summarises sessions, price sets and the latest evolution event", async ({ page }) => {
-    await page.route(/\/v2\/price-sets$/, (route) => route.fulfill({
-      json: [{ price_set_id: "reviewed-prices-2026-11", trust: "reviewed" }],
-    }));
-    await page.route(/\/v2\/evolution\/events\/page\?limit=1/, (route) => route.fulfill({
-      json: {
-        events: [{
-          event_id: "evo-status", candidate_id: "research-momentum-v1-ab12cd34",
-          status: "promoted", decided_at: "2026-11-05T15:00:00+08:00",
-          decision: { reasons: ["通过"], digest: "a".repeat(64) }, digest: "b".repeat(64),
-        }],
-        next_before: null, next_before_id: null, scanned: 1,
-      },
-    }));
+  test("account header only carries account-scoped status", async ({ page }) => {
     await openAccount(page);
     await expect(page.getByTestId("status-sessions")).toContainText("运行 0");
-    await expect(page.getByTestId("status-price-sets")).toHaveText("价格集合：1", { timeout: 15_000 });
-    await expect(page.getByTestId("status-evolution")).toContainText("最近 已晋级");
-    await expect(page.getByTestId("status-evolution")).toContainText("research-momentum-v1-ab12cd34");
+    // Global facts (price sets, evolution) live on the overview page only.
+    await expect(page.getByTestId("status-price-sets")).toHaveCount(0);
+    await expect(page.getByTestId("status-evolution")).toHaveCount(0);
   });
 
   test("lists every account and switches on click", async ({ page }) => {
