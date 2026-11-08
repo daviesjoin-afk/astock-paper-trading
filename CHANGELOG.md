@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 运行状态总览：账户页新增状态条——会话计数（运行/暂停/完成）、已加载价格集合数量、最近进化事件（状态 + 候选）；探测失败显示“—”。浏览器 114 passed（+1 状态汇总）；Rust 143 / Python 40 不变。
 - V2 资金提案界面（ADR 008/009）：账户页新增“资金提案”区块——交易日 ≥2（不足时补上账户创建日）时读取 `/allocation-proposal`，展示目标权重、准备金与逐槽理由；“执行再平衡”以提案摘要与显式 `applied_at` 调用 `/rebalances`，成功后刷新账户。证据不足时隐藏。浏览器 113 passed（+1：提案展示与执行请求体断言）；Rust 143 / Python 40 不变。
 - V2 每周滚动复核脚本：新增 `v2/scripts/weekly_review.py`——逐窗调用分段绩效并复用 `rolling_consistency`，输出每窗基准/候选收益与回撤、最终结论与理由；退出码 0 一致 / 4 不稳定 / 2 参数或请求错误；`OPERATIONS.md` 增加每周 cron 示例。Python 研究套件 40 passed（+3：一致/缺覆盖/非法窗口）；冒烟覆盖“合成数据 → unstable 且退出码 4”；Rust 143 / 浏览器 112 不变。
 - V2 调度示例脚本：新增 `v2/scripts/daily_advance.sh`——显式交易日（非法格式退出 2）、`--dry-run` 只打印请求、HTTP 失败退出 3、成功输出 sessions/steps/filled/rejected 摘要；`OPERATIONS.md` 的 cron 示例改为调用该脚本。冒烟覆盖 dry-run、成功调用与非法日期；Rust 143 / Python 37 / 浏览器 112 不变。
