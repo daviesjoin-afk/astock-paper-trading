@@ -389,9 +389,34 @@ assert call("paper-accounts/smoke-account/orders", paper_order)["duplicate"] is 
 orders = call("paper-accounts/smoke-account/orders")
 assert len(orders) == 1 and orders[0]["id"] == order["id"], orders
 assert orders[0]["slot"] == "A" and orders[0]["outcome"] == order["outcome"]
+
+# Deterministic session clock: explicit start, two frozen signals, pause gates.
+session_spec = {
+    "schema_version": 1, "session_id": "smoke-session", "account_id": "smoke-account",
+    "start_at": "2026-10-30T00:00:00+08:00",
+    "signals": [
+        {"slot": "A", "signal_id": "session-buy", "decision_at": "2026-10-30T10:00:00+08:00",
+         "signal": {"symbol": "600000.SH", "side": "buy"}, "quote_ref": proposal["quote_ref"]},
+        {"slot": "A", "signal_id": "session-sell", "decision_at": "2026-11-02T10:00:00+08:00",
+         "signal": {"symbol": "600000.SH", "side": "sell"}, "quote_ref": proposal["quote_ref"]},
+    ],
+}
+session = call("paper-sessions", session_spec)
+assert session["status"] == "created" and session["cursor"] == 0 and session["total"] == 2, session
+assert call("paper-sessions/smoke-session/start", {})["status"] == "running"
+first_step = call("paper-sessions/smoke-session/step", {})
+assert first_step["session"]["cursor"] == 1, first_step
+assert first_step["session"]["clock_at"] == "2026-10-30T10:00:00+08:00", first_step
+assert first_step["order"]["outcome"]["status"] in ("filled", "rejected"), first_step
+assert call("paper-sessions/smoke-session/pause", {})["status"] == "paused"
+call("paper-sessions/smoke-session/step", {}, expected=409)
+assert call("paper-sessions/smoke-session/resume", {})["status"] == "running"
+last_step = call("paper-sessions/smoke-session/step", {})
+assert last_step["session"]["status"] == "completed" and last_step["session"]["cursor"] == 2, last_step
+assert call("paper-sessions/smoke-session")["status"] == "completed"
 import sqlite3
 with sqlite3.connect("file:" + os.environ["ASTOCK_V2_DB"] + "?mode=ro", uri=True) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
     snapshot = json.loads(connection.execute("SELECT json_extract(pack_json,'$.instruments') FROM v2_market_data_packs WHERE pack_id='cn-offline-fixture-pack-1'").fetchone()[0])
     assert snapshot["version"] == instrument_version
     assert snapshot["trust_level"] == "offline_fixture"

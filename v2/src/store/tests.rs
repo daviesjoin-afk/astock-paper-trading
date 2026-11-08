@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{PaperAccountSpec, PaperOrderRequest, PaperSlotId, PaperSlotSpec};
+use crate::domain::{PaperAccountSpec, PaperOrderRequest, PaperSessionSignal, PaperSessionSpec, PaperSlotId, PaperSlotSpec};
 
 #[test]
 fn tampering_evidence_pack_identity_is_rejected_on_retry_and_replay() {
@@ -2210,4 +2210,208 @@ fn paper_account_with_orders_survives_reopen_unchanged() {
         assert_eq!(after, before, "restart must not change account facts");
         assert_eq!(db.paper_orders("paper-reopen", 10).unwrap().len(), 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR 005 phase 2: deterministic paper sessions
+// ---------------------------------------------------------------------------
+
+fn session_signal(slot: PaperSlotId, signal: &crate::domain::ResearchSignal) -> PaperSessionSignal {
+    PaperSessionSignal {
+        slot,
+        signal_id: signal.signal_id.clone(),
+        decision_at: signal.decision_at.clone(),
+        signal: Signal { symbol: signal.symbol.clone(), side: signal.side.clone() },
+        quote_ref: frozen_quote_ref(signal),
+    }
+}
+
+fn session_spec(account: &str, session: &str, signals: Vec<PaperSessionSignal>) -> PaperSessionSpec {
+    PaperSessionSpec {
+        schema_version: 1,
+        session_id: session.into(),
+        account_id: account.into(),
+        start_at: "2026-10-30T00:00:00+08:00".into(),
+        signals,
+    }
+}
+
+#[test]
+fn paper_session_steps_one_frozen_signal_at_a_time() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("session-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    let spec = session_spec(
+        "session-acct",
+        "session-1",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[0]),
+            session_signal(PaperSlotId::B, &output.signals[1]),
+        ],
+    );
+    let created = db.create_paper_session(spec.clone()).unwrap();
+    assert_eq!(created.status, "created");
+    assert_eq!(created.cursor, 0);
+    assert_eq!(created.total, 2);
+    assert_eq!(created.clock_at, spec.start_at);
+    assert_eq!(db.create_paper_session(spec.clone()).unwrap(), created);
+    let mut changed = spec.clone();
+    changed.start_at = "2026-10-30T01:00:00+08:00".into();
+    assert!(matches!(db.create_paper_session(changed), Err(StoreError::Conflict(_))));
+
+    // A created session does not trade.
+    assert!(matches!(
+        db.step_paper_session("session-1"),
+        Err(StoreError::Conflict(ref code)) if code == "paper_session_not_running"
+    ));
+    let running = db.paper_session_action("session-1", "start").unwrap();
+    assert_eq!(running.status, "running");
+
+    let first = db.step_paper_session("session-1").unwrap();
+    let first_order = first.order.expect("first order");
+    assert_eq!(first_order.outcome.status, DecisionStatus::Filled);
+    assert_eq!(first.session.cursor, 1);
+    assert_eq!(first.session.clock_at, output.signals[0].decision_at);
+    assert_eq!(first.session.status, "running");
+
+    let second = db.step_paper_session("session-1").unwrap();
+    assert_eq!(second.session.cursor, 2);
+    assert_eq!(second.session.status, "completed");
+    assert_eq!(second.session.clock_at, output.signals[1].decision_at);
+    assert!(matches!(
+        db.step_paper_session("session-1"),
+        Err(StoreError::Conflict(ref code)) if code == "paper_session_not_running"
+    ));
+
+    // The account received exactly the session's two slot orders.
+    let view = db.paper_account("session-acct").unwrap();
+    assert_eq!(view.slots[0].orders_total, 1);
+    assert_eq!(view.slots[1].orders_total, 1);
+}
+
+#[test]
+fn paper_session_pause_resume_and_stop_gate_trading() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("pause-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    ingest_signal_evidence(&mut db, &output.signals[0]);
+    ingest_signal_evidence(&mut db, &output.signals[1]);
+    db.create_paper_session(session_spec(
+        "pause-acct",
+        "pause-session",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[0]),
+            session_signal(PaperSlotId::A, &output.signals[1]),
+        ],
+    ))
+    .unwrap();
+    db.paper_session_action("pause-session", "start").unwrap();
+    db.step_paper_session("pause-session").unwrap();
+
+    let paused = db.paper_session_action("pause-session", "pause").unwrap();
+    assert_eq!(paused.status, "paused");
+    assert!(matches!(
+        db.step_paper_session("pause-session"),
+        Err(StoreError::Conflict(ref code)) if code == "paper_session_not_running"
+    ));
+    // Pausing never rewrites history.
+    assert_eq!(db.paper_account("pause-acct").unwrap().slots[0].orders_total, 1);
+
+    let resumed = db.paper_session_action("pause-session", "resume").unwrap();
+    assert_eq!(resumed.status, "running");
+
+    let stopped = db.paper_session_action("pause-session", "stop").unwrap();
+    assert_eq!(stopped.status, "stopped");
+    assert!(matches!(
+        db.step_paper_session("pause-session"),
+        Err(StoreError::Conflict(ref code)) if code == "paper_session_not_running"
+    ));
+    assert!(matches!(
+        db.paper_session_action("pause-session", "resume"),
+        Err(StoreError::Conflict(ref code)) if code == "invalid_paper_session_transition"
+    ));
+    assert_eq!(db.paper_account("pause-acct").unwrap().slots[0].orders_total, 1);
+}
+
+#[test]
+fn paper_sessions_are_deterministic_across_accounts_and_reopen() {
+    let file = DiskDatabase::new();
+    let output = frozen_momentum_output();
+    let build = |session: &str, account: &str| -> PaperSessionSpec {
+        session_spec(
+            account,
+            session,
+            vec![
+                session_signal(PaperSlotId::A, &output.signals[0]),
+                session_signal(PaperSlotId::B, &output.signals[1]),
+            ],
+        )
+    };
+    let mut facts = Vec::new();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        for account in ["det-a", "det-b"] {
+            db.create_paper_account(paper_spec(account, 10_000_000)).unwrap();
+            for signal in &output.signals {
+                ingest_signal_evidence(&mut db, signal);
+            }
+        }
+        for (account, session) in [("det-a", "det-session-a"), ("det-b", "det-session-b")] {
+            db.create_paper_session(build(session, account)).unwrap();
+            db.paper_session_action(session, "start").unwrap();
+            db.step_paper_session(session).unwrap();
+            db.step_paper_session(session).unwrap();
+            let view = db.paper_account(account).unwrap();
+            let cash: Vec<i64> = view.slots.iter().map(|slot| slot.cash_cents).collect();
+            let positions: Vec<Vec<(String, i64)>> = view
+                .slots
+                .iter()
+                .map(|slot| slot.positions.iter().map(|p| (p.symbol.clone(), p.quantity)).collect())
+                .collect();
+            facts.push((cash, positions));
+        }
+        assert_eq!(facts[0], facts[1], "same inputs must produce the same ledger");
+    }
+    {
+        let db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        let reopened = db.paper_account("det-a").unwrap();
+        let cash: Vec<i64> = reopened.slots.iter().map(|slot| slot.cash_cents).collect();
+        assert_eq!(cash, facts[0].0);
+        let session = db.paper_session("det-session-a").unwrap();
+        assert_eq!(session.status, "completed");
+        assert_eq!(session.cursor, 2);
+    }
+}
+
+#[test]
+fn paper_session_specs_must_be_explicit_and_ordered() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("order-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let mut unsorted = session_spec(
+        "order-acct",
+        "unsorted",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[1]),
+            session_signal(PaperSlotId::A, &output.signals[0]),
+        ],
+    );
+    assert!(matches!(unsorted.validate(), Err(RuleError(ref code)) if code == "paper_session_signals_must_be_ordered"));
+
+    let mut before_start = session_spec(
+        "order-acct",
+        "before-start",
+        vec![session_signal(PaperSlotId::A, &output.signals[0])],
+    );
+    before_start.start_at = "2026-10-30T15:00:00+08:00".into();
+    assert!(matches!(before_start.validate(), Err(RuleError(ref code)) if code == "paper_session_signal_before_start"));
+
+    let empty = session_spec("order-acct", "empty", Vec::new());
+    assert!(matches!(empty.validate(), Err(RuleError(ref code)) if code == "paper_session_requires_signals"));
+
+    let missing_account = session_spec("nope", "missing", vec![session_signal(PaperSlotId::A, &output.signals[0])]);
+    assert!(matches!(db.create_paper_session(missing_account), Err(StoreError::NotFound(_))));
 }

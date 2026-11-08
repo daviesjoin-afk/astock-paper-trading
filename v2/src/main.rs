@@ -1,5 +1,5 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{ExperimentSpec, PaperAccountSpec, PaperOrderRequest, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
+use astock_v2::{domain::{ExperimentSpec, PaperAccountSpec, PaperOrderRequest, PaperSessionSpec, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
 use axum::{
     extract::{Path, Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
@@ -125,6 +125,36 @@ async fn paper_orders(
     response(db.paper_orders(&account_id, 100).map_err(api_error)?)
 }
 
+async fn create_paper_session(
+    State(state): State<Shared>,
+    Json(spec): Json<PaperSessionSpec>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(db.create_paper_session(spec).map_err(api_error)?)
+}
+
+async fn paper_session(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_session(&id).map_err(api_error)?)
+}
+
+async fn paper_session_action(
+    State(state): State<Shared>,
+    Path((session_id, action)): Path<(String, String)>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    match action.as_str() {
+        "start" | "pause" | "resume" | "stop" => {
+            response(db.paper_session_action(&session_id, &action).map_err(api_error)?)
+        }
+        "step" => response(db.step_paper_session(&session_id).map_err(api_error)?),
+        _ => Err((
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "unsupported_paper_session_action"})),
+        )),
+    }
+}
+
 async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
 }
@@ -169,6 +199,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/orders",
             post(submit_paper_order).get(paper_orders),
+        )
+        .route("/v2/paper-sessions", post(create_paper_session))
+        .route("/v2/paper-sessions/{session_id}", get(paper_session))
+        .route(
+            "/v2/paper-sessions/{session_id}/{action}",
+            post(paper_session_action),
         )
         .route("/v2/experiments/{cycle_id}", get(experiment))
         .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))

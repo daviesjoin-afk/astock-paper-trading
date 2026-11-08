@@ -109,6 +109,25 @@ pub struct PaperAccountView {
     pub slots: Vec<PaperSlotView>,
 }
 
+/// Status snapshot of one deterministic paper session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperSessionView {
+    pub session_id: String,
+    pub account_id: String,
+    pub status: String,
+    pub clock_at: String,
+    pub cursor: usize,
+    pub total: usize,
+    pub last_order_id: Option<i64>,
+}
+
+/// Result of advancing one deterministic step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperSessionStep {
+    pub session: PaperSessionView,
+    pub order: Option<PaperOrderRecord>,
+}
+
 /// Lightweight account row for the console picker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperAccountSummarySlot {
@@ -192,7 +211,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 10;
+        const SCHEMA_VERSION: i64 = 11;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -222,6 +241,7 @@ impl Store {
                 ("v2_paper_accounts", &["account_id", "spec_json", "created_at"]),
                 ("v2_paper_orders", &["id", "account_id", "slot", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_paper_fills", &["id", "order_id", "fill_json"]),
+                ("v2_paper_sessions", &["session_id", "account_id", "spec_json", "status", "clock_at", "cursor", "last_order_id"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
@@ -330,6 +350,15 @@ impl Store {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_id INTEGER NOT NULL UNIQUE REFERENCES v2_paper_orders(id) ON DELETE RESTRICT,
                     fill_json TEXT NOT NULL
+                );
+                CREATE TABLE v2_paper_sessions (
+                    session_id TEXT PRIMARY KEY NOT NULL,
+                    account_id TEXT NOT NULL REFERENCES v2_paper_accounts(account_id) ON DELETE RESTRICT,
+                    spec_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('created','running','paused','stopped','completed')),
+                    clock_at TEXT NOT NULL,
+                    cursor INTEGER NOT NULL,
+                    last_order_id INTEGER
                 );
                 CREATE TABLE v2_quote_evidence (
                     pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,
@@ -1081,5 +1110,145 @@ impl Store {
             });
         }
         Ok(accounts)
+    }
+}
+// ---------------------------------------------------------------------------
+// Paper session (ADR 005 phase 2): deterministic clock over a frozen signal list.
+// The session stores its own spec and status; every step submits exactly one
+// slot order and advances an explicit simulated instant.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn create_paper_session(
+        &mut self,
+        spec: crate::domain::PaperSessionSpec,
+    ) -> StoreResult<PaperSessionView> {
+        spec.validate()?;
+        let raw = serde_json::to_string(&spec)?;
+        let account_exists: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT account_id FROM v2_paper_accounts WHERE account_id=?",
+                [&spec.account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        account_exists
+            .ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        if let Some(existing) = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_sessions WHERE session_id=?",
+                [&spec.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing != raw {
+                return Err(StoreError::Conflict("paper_session_conflict".into()));
+            }
+            return self.paper_session(&spec.session_id);
+        }
+        self.conn.execute(
+            "INSERT INTO v2_paper_sessions(session_id,account_id,spec_json,status,clock_at,cursor,last_order_id)
+             VALUES(?,?,?,?,?,?,NULL)",
+            params![spec.session_id, spec.account_id, raw, "created", spec.start_at, 0i64],
+        )?;
+        self.paper_session(&spec.session_id)
+    }
+
+    pub fn paper_session(&self, session_id: &str) -> StoreResult<PaperSessionView> {
+        let (account_id, spec_json, status, clock_at, cursor, last_order_id) = self
+            .conn
+            .query_row(
+                "SELECT account_id,spec_json,status,clock_at,cursor,last_order_id
+                 FROM v2_paper_sessions WHERE session_id=?",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound("paper_session_not_found".into()))?;
+        let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
+        Ok(PaperSessionView {
+            session_id: session_id.into(),
+            account_id,
+            status,
+            clock_at,
+            cursor: cursor.max(0) as usize,
+            total: spec.signals.len(),
+            last_order_id,
+        })
+    }
+
+    fn set_session_status(&self, session_id: &str, status: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE v2_paper_sessions SET status=? WHERE session_id=?",
+            params![status, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// created → running, running → paused, paused → running, running/paused → stopped.
+    pub fn paper_session_action(
+        &mut self,
+        session_id: &str,
+        action: &str,
+    ) -> StoreResult<PaperSessionView> {
+        let current = self.paper_session(session_id)?;
+        let next = match (action, current.status.as_str()) {
+            ("start", "created") => "running",
+            ("pause", "running") => "paused",
+            ("resume", "paused") => "running",
+            ("stop", "running" | "paused") => "stopped",
+            _ => return Err(StoreError::Conflict("invalid_paper_session_transition".into())),
+        };
+        self.set_session_status(session_id, next)?;
+        self.paper_session(session_id)
+    }
+
+    /// Submit the next frozen signal. One step = one simulated instant and at
+    /// most one slot order; the session clock only moves to that decision time.
+    pub fn step_paper_session(&mut self, session_id: &str) -> StoreResult<PaperSessionStep> {
+        let current = self.paper_session(session_id)?;
+        if current.status != "running" {
+            return Err(StoreError::Conflict("paper_session_not_running".into()));
+        }
+        let spec_json: String = self.conn.query_row(
+            "SELECT spec_json FROM v2_paper_sessions WHERE session_id=?",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
+        if current.cursor >= spec.signals.len() {
+            self.set_session_status(session_id, "completed")?;
+            return Ok(PaperSessionStep { session: self.paper_session(session_id)?, order: None });
+        }
+        let signal = &spec.signals[current.cursor];
+        let request = crate::domain::PaperOrderRequest {
+            schema_version: crate::domain::PAPER_ORDER_SCHEMA_VERSION,
+            account_id: spec.account_id.clone(),
+            slot: signal.slot,
+            signal_id: format!("{}:{}", session_id, signal.signal_id),
+            decision_at: signal.decision_at.clone(),
+            signal: signal.signal.clone(),
+            quote_ref: signal.quote_ref.clone(),
+        };
+        let order = self.submit_paper_order(request)?;
+        let next_cursor = current.cursor + 1;
+        let status = if next_cursor >= spec.signals.len() { "completed" } else { "running" };
+        self.conn.execute(
+            "UPDATE v2_paper_sessions SET cursor=?, clock_at=?, last_order_id=?, status=? WHERE session_id=?",
+            params![next_cursor as i64, signal.decision_at, order.id, status, session_id],
+        )?;
+        Ok(PaperSessionStep { session: self.paper_session(session_id)?, order: Some(order) })
     }
 }
