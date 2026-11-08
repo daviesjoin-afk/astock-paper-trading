@@ -75,6 +75,28 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-valuation-detail")).toContainText("reviewed-prices-2026-11-02");
   });
 
+  test("a valued equity series renders points and drawdown", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/.+\/equity-series\?/, (route) => route.fulfill({
+      json: {
+        status: "valued", trust: "reviewed", price_set_id: "reviewed-prices-2026-11",
+        points: [
+          { day: "2026-10-30", cash_cents: 9_600_000, market_value_cents: 390_000, equity_cents: 9_990_000 },
+          { day: "2026-11-02", cash_cents: 9_600_000, market_value_cents: 360_000, equity_cents: 9_960_000 },
+        ],
+        max_drawdown_cents: 30_000, max_drawdown_day: "2026-11-02",
+        profit_cents: -40_000, digest: "e".repeat(64),
+      },
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-equity")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("equity-summary")).toContainText("覆盖 2 个交易日");
+    await expect(page.getByTestId("equity-summary")).toContainText("最大回撤");
+    await expect(page.getByTestId("equity-summary")).toContainText("盈亏");
+    const points = page.getByTestId("equity-points").locator("li");
+    await expect(points).toHaveCount(2);
+    await expect(points.first()).toContainText("2026-10-30");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();

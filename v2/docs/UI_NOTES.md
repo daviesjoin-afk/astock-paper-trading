@@ -104,6 +104,10 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Equity series: when the account's order days are covered by a reviewed price
+  set, the panel prints “覆盖 n 个交易日 · 最大回撤 … · 盈亏 …” and one line per
+  day. Without coverage the block stays hidden (no partial or interpolated
+  series).
 - Audit: the account panel runs the read-only ledger audit on load and prints
   “账本自检：通过/失败 · 摘要”; a collapsible “审计详情” lists every check with
   its pass/fail marker and detail, so a failure is diagnosable in place.
