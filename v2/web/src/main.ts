@@ -1063,6 +1063,12 @@ type PaperValuationReport = {
   } | null;
 };
 
+type PaperAuditReport = {
+  account_id: string; ok: boolean;
+  checks: Array<{ name: string; ok: boolean; detail: string }>;
+  digest: string;
+};
+
 type PaperSessionView = {
   session_id: string; account_id: string; status: string;
   clock_at: string; cursor: number; total: number; last_order_id: number | null;
@@ -1383,6 +1389,20 @@ const renderValuation = (report: PaperValuationReport | null, asOf: string): voi
   }
 };
 
+const renderAudit = (report: PaperAuditReport | null): void => {
+  const line = testId<HTMLElement>("account-audit");
+  if (!report) {
+    toggle(line, false);
+    return;
+  }
+  toggle(line, true);
+  line.dataset.state = report.ok ? "ok" : "fail";
+  const failed = report.checks.filter((check) => !check.ok).map((check) => check.name);
+  line.textContent = report.ok
+    ? `账本自检：通过（${report.checks.length} 项）· 摘要 ${report.digest.slice(0, 12)}…`
+    : `账本自检：失败（${failed.join("、")}）· 摘要 ${report.digest.slice(0, 12)}…`;
+};
+
 const loadAccount = async (accountId: string): Promise<void> => {
   if (!accountId) return;
   clearAccountError();
@@ -1420,6 +1440,15 @@ const loadAccount = async (accountId: string): Promise<void> => {
       }
     } else {
       renderValuation(null, "");
+    }
+    try {
+      const audit = await api<PaperAuditReport>(
+        `/v2/paper-accounts/${encoded}/audit`,
+        new AbortController().signal,
+      );
+      if (currentAccountId === accountId) renderAudit(audit);
+    } catch {
+      if (currentAccountId === accountId) renderAudit(null);
     }
   } catch (error) {
     toggle(accountBody, false);

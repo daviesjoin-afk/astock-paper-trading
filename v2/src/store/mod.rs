@@ -152,6 +152,23 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// One invariant check in an account audit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperAuditCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Read-only proof that the account ledger still balances and stays linked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperAuditReport {
+    pub account_id: String,
+    pub ok: bool,
+    pub checks: Vec<PaperAuditCheck>,
+    pub digest: String,
+}
+
 /// Status snapshot of one deterministic paper session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperSessionView {

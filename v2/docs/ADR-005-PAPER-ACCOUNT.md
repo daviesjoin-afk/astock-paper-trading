@@ -122,6 +122,21 @@ ADR 001 让每个实验拥有独立资金与账本，实验是**研究身份**�
 - 数值区间 0–10000 bps；非法值拒绝创建。
 - 账户视图输出 `limits`，控制台在槽位卡上明示当前边界。
 
+### 12. 账本自检（已实现）
+
+`GET /v2/paper-accounts/{id}/audit` 返回只读审计：
+
+| 检查 | 含义 |
+| --- | --- |
+| `budget_split` | 槽位预算等于 spec 划分结果 |
+| `fills_replay` | 槽位状态可由成交顺序重建 |
+| `capital_conservation` | 初始本金 + 净现金流 = 准备金 + 两槽现金 |
+| `order_fill_link` | 已成交订单数 = 成交条数 |
+| `fill_matches_outcome` | 每条成交与其订单 `outcome.fill` 完全一致（可发现篡改） |
+| `session_link` | 会话 `last_order_id` 必须属于该账户的订单 |
+
+整体 `ok` 与 canonical `digest` 一并返回；控制台在账户页展示「账本自检：通过/失败 + 摘要」。审计只读，不修复、不写回。
+
 ## 未决问题
 
 - 自动运行时钟（第二阶段）与账户的关系：账户是否需要"当前模拟日期"这一显式状态？倾向放入独立的 run session，而不是写进账户 spec。

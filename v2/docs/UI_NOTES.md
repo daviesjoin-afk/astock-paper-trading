@@ -104,6 +104,8 @@ form, no valuation.
   chosen from `GET /v2/strategies`, fixed 45/45/10). The browser sends only
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
+- Audit: the account panel runs the read-only ledger audit on load and prints
+  “账本自检：通过/失败 · 摘要”; failures list the check names.
 - Risk boundaries: every slot card prints the account's cost-basis limits
   (single order / single symbol / slot cash floor) so a rejected order can be
   explained without opening the API.

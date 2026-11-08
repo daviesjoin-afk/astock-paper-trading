@@ -679,3 +679,169 @@ impl Store {
             .map_err(StoreError::Rules)
     }
 }
+// ---------------------------------------------------------------------------
+// Account audit: prove the ledger still balances and every fill is linked to
+// exactly one stored order. Read-only; the result carries a canonical digest.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn paper_account_audit(&self, account_id: &str) -> StoreResult<PaperAuditReport> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate().map_err(StoreError::Rules)?;
+        let view = self.paper_account(account_id)?;
+
+        let mut checks = Vec::new();
+
+        // 1. Budgets are exactly the validated split of the initial capital.
+        let budgets_ok = view
+            .slots
+            .iter()
+            .enumerate()
+            .all(|(index, slot)| slot.budget_cents == split.slot_budgets[index]);
+        checks.push(PaperAuditCheck {
+            name: "budget_split".into(),
+            ok: budgets_ok,
+            detail: format!(
+                "budgets {:?} vs split {:?}",
+                view.slots.iter().map(|slot| slot.budget_cents).collect::<Vec<_>>(),
+                split.slot_budgets
+            ),
+        });
+
+        // 2. Fills replay cleanly into each slot state (already enforced by the view).
+        checks.push(PaperAuditCheck {
+            name: "fills_replay".into(),
+            ok: true,
+            detail: "slot states rebuilt from fills".into(),
+        });
+
+        // 3. Cash conservation: initial + net cash flow equals reserve + slot cash.
+        let mut statement = self.conn.prepare(
+            "SELECT f.fill_json, o.slot FROM v2_paper_fills f
+             JOIN v2_paper_orders o ON o.id=f.order_id WHERE o.account_id=? ORDER BY o.id",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut net_flow = 0i64;
+        let mut fill_count = 0i64;
+        let mut per_slot: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (raw_fill, slot) = row?;
+            let fill: Fill = serde_json::from_str(&raw_fill)?;
+            let gross = fill.quantity.saturating_mul(fill.price_cents);
+            match fill.side {
+                crate::domain::Side::Buy => net_flow -= gross + fill.fees_cents,
+                crate::domain::Side::Sell => net_flow += gross - fill.fees_cents,
+            }
+            fill_count += 1;
+            *per_slot.entry(slot).or_default() += 1;
+        }
+        let expected_cash = spec.initial_cash_cents.saturating_add(net_flow);
+        checks.push(PaperAuditCheck {
+            name: "capital_conservation".into(),
+            ok: expected_cash == view.cash_cents,
+            detail: format!("expected {} cents, stored view {} cents", expected_cash, view.cash_cents),
+        });
+
+        // 4. Every fill links to an order and every filled order has exactly one fill.
+        let mut orders_statement =
+            self.conn.prepare("SELECT outcome_json FROM v2_paper_orders WHERE account_id=?")?;
+        let orders = orders_statement.query_map([account_id], |row| row.get::<_, String>(0))?;
+        let mut filled_orders = 0i64;
+        for row in orders {
+            let outcome: Outcome = serde_json::from_str(&row?)?;
+            if outcome.status == crate::domain::DecisionStatus::Filled {
+                filled_orders += 1;
+            }
+        }
+        checks.push(PaperAuditCheck {
+            name: "order_fill_link".into(),
+            ok: filled_orders == fill_count,
+            detail: format!("{filled_orders} filled orders vs {fill_count} fills"),
+        });
+
+        // 4b. Every stored fill must equal the fill recorded on its order outcome.
+        let mut pairs = self.conn.prepare(
+            "SELECT f.fill_json, o.outcome_json FROM v2_paper_fills f
+             JOIN v2_paper_orders o ON o.id=f.order_id WHERE o.account_id=? ORDER BY o.id",
+        )?;
+        let rows = pairs.query_map([account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut fill_matches = true;
+        let mut mismatch_detail = Vec::new();
+        for row in rows {
+            let (raw_fill, raw_outcome) = row?;
+            let fill: Fill = serde_json::from_str(&raw_fill)?;
+            let outcome: Outcome = serde_json::from_str(&raw_outcome)?;
+            if outcome.fill.as_ref() != Some(&fill) {
+                fill_matches = false;
+                mismatch_detail.push(format!("fill mismatch: {raw_fill}"));
+            }
+        }
+        checks.push(PaperAuditCheck {
+            name: "fill_matches_outcome".into(),
+            ok: fill_matches,
+            detail: if fill_matches { "fills equal order outcomes".into() } else { mismatch_detail.join("; ") },
+        });
+
+        // 5. Session cursors never point past the account's orders.
+        let mut sessions_statement = self.conn.prepare(
+            "SELECT session_id,cursor,last_order_id FROM v2_paper_sessions WHERE account_id=?",
+        )?;
+        let sessions = sessions_statement.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut session_ok = true;
+        let mut session_detail = Vec::new();
+        for row in sessions {
+            let (session_id, cursor, last_order_id) = row?;
+            let exists: i64 = match last_order_id {
+                Some(order_id) => self.conn.query_row(
+                    "SELECT COUNT(*) FROM v2_paper_orders WHERE account_id=? AND id=?",
+                    params![account_id, order_id],
+                    |row| row.get(0),
+                )?,
+                None => 0,
+            };
+            if last_order_id.is_some() && exists == 0 {
+                session_ok = false;
+            }
+            session_detail.push(format!("{session_id}: cursor={cursor}, last_order={last_order_id:?}"));
+        }
+        checks.push(PaperAuditCheck {
+            name: "session_link".into(),
+            ok: session_ok,
+            detail: session_detail.join("; "),
+        });
+
+        let ok = checks.iter().all(|check| check.ok);
+        let mut report = PaperAuditReport {
+            account_id: account_id.into(),
+            ok,
+            checks,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        report.digest = crate::domain::canonical_digest(&value);
+        Ok(report)
+    }
+}

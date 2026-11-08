@@ -116,6 +116,14 @@ struct EquitySeriesQuery {
     days: String,
 }
 
+async fn paper_account_audit(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(db.paper_account_audit(&id).map_err(api_error)?)
+}
+
 async fn paper_equity_series(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -319,6 +327,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/equity-series",
             get(paper_equity_series),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/audit",
+            get(paper_account_audit),
         )
         .route(
             "/v2/paper-accounts/{account_id}/orders",
