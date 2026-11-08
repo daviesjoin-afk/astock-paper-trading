@@ -312,6 +312,10 @@ struct EvolutionListQuery {
     base_cycle: Option<String>,
     #[serde(default)]
     candidate_cycle: Option<String>,
+    #[serde(default)]
+    from_day: Option<String>,
+    #[serde(default)]
+    to_day: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +336,10 @@ struct EvolutionPageQuery {
     base_cycle: Option<String>,
     #[serde(default)]
     candidate_cycle: Option<String>,
+    #[serde(default)]
+    from_day: Option<String>,
+    #[serde(default)]
+    to_day: Option<String>,
 }
 
 async fn evolution_events_page(
@@ -341,16 +349,20 @@ async fn evolution_events_page(
     let db = state.lock().await;
     let limit = query.limit.clamp(1, 200);
     response(
-        db.evolution_events_page(
-            limit,
-            query.candidate.as_deref(),
-            query.status.as_deref(),
-            query.before.as_deref(),
-            query.before_id.as_deref(),
-            query.after.as_deref(),
-            query.base_cycle.as_deref(),
-            query.candidate_cycle.as_deref(),
-        )
+        db.evolution_events_page_query(astock_v2::store::EvolutionPageQuery {
+            query: astock_v2::store::EvolutionQuery {
+                limit,
+                candidate_id: query.candidate.as_deref(),
+                status: query.status.as_deref(),
+                base_cycle: query.base_cycle.as_deref(),
+                candidate_cycle: query.candidate_cycle.as_deref(),
+                from_day: query.from_day.as_deref(),
+                to_day: query.to_day.as_deref(),
+            },
+            before: query.before.as_deref(),
+            before_id: query.before_id.as_deref(),
+            after: query.after.as_deref(),
+        })
         .map_err(api_error)?,
     )
 }
@@ -366,13 +378,15 @@ async fn evolution_events(
     let db = state.lock().await;
     let limit = query.limit.clamp(1, 200);
     response(
-        db.evolution_events_filtered(
+        db.evolution_events_query(astock_v2::store::EvolutionQuery {
             limit,
-            query.candidate.as_deref(),
-            query.status.as_deref(),
-            query.base_cycle.as_deref(),
-            query.candidate_cycle.as_deref(),
-        )
+            candidate_id: query.candidate.as_deref(),
+            status: query.status.as_deref(),
+            base_cycle: query.base_cycle.as_deref(),
+            candidate_cycle: query.candidate_cycle.as_deref(),
+            from_day: query.from_day.as_deref(),
+            to_day: query.to_day.as_deref(),
+        })
         .map_err(api_error)?,
     )
 }

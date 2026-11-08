@@ -4126,3 +4126,61 @@ fn order_sizing_follows_slot_cash_after_rebalance() {
     assert_eq!(view.slots[0].cash_cents, 3_000_000 - spent);
     assert_eq!(view.reserve_cents, 1_000_000);
 }
+
+#[test]
+fn evolution_events_filter_by_china_day_range() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let make = |id: &str| crate::domain::EvolutionDecision {
+        candidate_id: id.into(),
+        status: "kept".into(),
+        reasons: vec!["保持".into()],
+        digest: "a".repeat(64),
+    };
+    db.record_evolution_event("morning", "2026-11-05T10:00:00+08:00", make("c1")).unwrap();
+    db.record_evolution_event("evening", "2026-11-05T23:00:00+08:00", make("c2")).unwrap();
+    db.record_evolution_event("next-day", "2026-11-06T01:00:00+08:00", make("c3")).unwrap();
+
+    let same_day = db
+        .evolution_events_query(crate::store::EvolutionQuery {
+            limit: 10,
+            from_day: Some("2026-11-05"),
+            to_day: Some("2026-11-05"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(same_day.len(), 2);
+
+    let from_next = db
+        .evolution_events_query(crate::store::EvolutionQuery {
+            limit: 10,
+            from_day: Some("2026-11-06"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(from_next.len(), 1);
+    assert_eq!(from_next[0].event_id, "next-day");
+
+    let page = db
+        .evolution_events_page_query(crate::store::EvolutionPageQuery {
+            query: crate::store::EvolutionQuery {
+                limit: 10,
+                from_day: Some("2026-11-05"),
+                to_day: Some("2026-11-05"),
+                ..Default::default()
+            },
+            before: None,
+            before_id: None,
+            after: None,
+        })
+        .unwrap();
+    assert_eq!(page.events.len(), 2);
+
+    assert!(matches!(
+        db.evolution_events_query(crate::store::EvolutionQuery {
+            limit: 10,
+            from_day: Some("2026-13-01"),
+            ..Default::default()
+        }),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_evolution_day"
+    ));
+}

@@ -475,6 +475,11 @@ assert rollback_event["base_cycle"] is None and rollback_event["candidate_cycle"
 assert event["base_cycle"] == "shadow-base-1" and event["candidate_cycle"] == "shadow-candidate-1", event
 reverted = call("evolution/events?status=reverted")
 assert len(reverted) == 1 and reverted[0]["event_id"] == "smoke-evo-2", reverted
+# Server-side date filtering spans both events (China day, inclusive).
+assert call("evolution/events?from_day=2026-11-06")[0]["event_id"] == "smoke-evo-2"
+assert call("evolution/events?to_day=2026-11-05")[0]["event_id"] == "smoke-evo-1"
+assert call("evolution/events?from_day=2026-11-07") == []
+call("evolution/events?from_day=2026-13-01", expected=422)
 _segments = call("experiments/shadow-base-1/performance/segments?segments=2026-10-30;2026-11-02")
 assert len(_segments["segments"]) == 2, _segments
 assert all(segment["status"] == "unavailable" for segment in _segments["segments"]), _segments

@@ -1324,6 +1324,28 @@ impl Store {
         base_cycle: Option<&str>,
         candidate_cycle: Option<&str>,
     ) -> StoreResult<Vec<EvolutionEventRecord>> {
+        self.evolution_events_query(EvolutionQuery {
+            limit,
+            candidate_id,
+            status,
+            base_cycle,
+            candidate_cycle,
+            from_day: None,
+            to_day: None,
+        })
+    }
+
+    pub fn evolution_events_query(
+        &self,
+        query: EvolutionQuery<'_>,
+    ) -> StoreResult<Vec<EvolutionEventRecord>> {
+        let limit = query.limit;
+        let candidate_id = query.candidate_id;
+        let status = query.status;
+        let base_cycle = query.base_cycle;
+        let candidate_cycle = query.candidate_cycle;
+        let from_day = parse_optional_day(query.from_day)?;
+        let to_day = parse_optional_day(query.to_day)?;
         const EVENT_SCAN_LIMIT: i64 = 200;
         let mut statement = self.conn.prepare(
             "SELECT event_id,candidate_id,status,decision_json,decided_at,base_cycle,candidate_cycle
@@ -1353,6 +1375,9 @@ impl Store {
                 continue;
             }
             if candidate_cycle.is_some_and(|wanted| row_candidate_cycle.as_deref() != Some(wanted)) {
+                continue;
+            }
+            if !day_in_range(&decided_at, from_day, to_day)? {
                 continue;
             }
             let decision: crate::domain::EvolutionDecision = serde_json::from_str(&raw_decision)?;
@@ -1486,6 +1511,39 @@ impl Store {
         base_cycle: Option<&str>,
         candidate_cycle: Option<&str>,
     ) -> StoreResult<EvolutionEventPage> {
+        self.evolution_events_page_query(EvolutionPageQuery {
+            query: EvolutionQuery {
+                limit,
+                candidate_id,
+                status,
+                base_cycle,
+                candidate_cycle,
+                from_day: None,
+                to_day: None,
+            },
+            before,
+            before_id,
+            after,
+        })
+    }
+
+    pub fn evolution_events_page_query(
+        &self,
+        options: EvolutionPageQuery<'_>,
+    ) -> StoreResult<EvolutionEventPage> {
+        let EvolutionPageQuery {
+            query,
+            before,
+            before_id,
+            after,
+        } = options;
+        let limit = query.limit;
+        let candidate_id = query.candidate_id;
+        let status = query.status;
+        let base_cycle = query.base_cycle;
+        let candidate_cycle = query.candidate_cycle;
+        let from_day = parse_optional_day(query.from_day)?;
+        let to_day = parse_optional_day(query.to_day)?;
         const SCAN_LIMIT: i64 = 2_000;
         let parse = |value: &str| {
             chrono::DateTime::parse_from_rfc3339(value)
@@ -1523,6 +1581,9 @@ impl Store {
                 continue;
             }
             if candidate_cycle.is_some_and(|wanted| row_candidate_cycle.as_deref() != Some(wanted)) {
+                continue;
+            }
+            if !day_in_range(&decided_at, from_day, to_day)? {
                 continue;
             }
             let at = parse(&decided_at)?;
@@ -1915,4 +1976,37 @@ impl Store {
         report.digest = crate::domain::canonical_digest(&value);
         Ok(report)
     }
+}
+
+fn parse_optional_day(value: Option<&str>) -> StoreResult<Option<chrono::NaiveDate>> {
+    match value {
+        None => Ok(None),
+        Some(day) => {
+            let parsed = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                .map_err(|_| StoreError::Rules(RuleError("invalid_evolution_day".into())))?;
+            if parsed.to_string() != day {
+                return Err(StoreError::Rules(RuleError("invalid_evolution_day".into())));
+            }
+            Ok(Some(parsed))
+        }
+    }
+}
+
+/// China day of a stored timestamp; used for inclusive date-range filtering.
+fn day_in_range(
+    decided_at: &str,
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+) -> StoreResult<bool> {
+    let at = chrono::DateTime::parse_from_rfc3339(decided_at)
+        .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+    let china = at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"));
+    let day = china.date_naive();
+    if from.is_some_and(|bound| day < bound) {
+        return Ok(false);
+    }
+    if to.is_some_and(|bound| day > bound) {
+        return Ok(false);
+    }
+    Ok(true)
 }

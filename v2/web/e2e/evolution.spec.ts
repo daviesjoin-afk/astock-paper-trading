@@ -188,10 +188,22 @@ test.describe("evolution history", () => {
   });
 
   test("filters by decision date", async ({ page }) => {
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf(events) }));
+    let dayQuery = "";
+    await page.route(/\/v2\/evolution\/events/, (route) => {
+      const url = new URL(route.request().url());
+      const fromDay = url.searchParams.get("from_day");
+      const toDay = url.searchParams.get("to_day");
+      if (fromDay || toDay) dayQuery = url.search;
+      const filtered = events.filter((event) => {
+        const day = event.decided_at.slice(0, 10);
+        return (!fromDay || day >= fromDay) && (!toDay || day <= toDay);
+      });
+      return route.fulfill({ json: pageOf(filtered) });
+    });
     await openEvolution(page);
     await page.getByTestId("evolution-from").fill("2026-11-05");
     await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(1);
+    expect(dayQuery).toContain("from_day=2026-11-05");
     await expect(page.getByTestId("evolution-event-evo-1")).toBeVisible();
 
     await page.getByTestId("evolution-from").fill("");

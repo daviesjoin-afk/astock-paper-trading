@@ -2008,11 +2008,7 @@ const renderEvolutionList = (): void => {
   const fromDay = byId<HTMLInputElement>("evolution-from").value;
   const toDay = byId<HTMLInputElement>("evolution-to").value;
   const status = byId<HTMLSelectElement>("evolution-filter-status").value;
-  const list = evolutionEvents.filter((event) => {
-    const day = chinaDayOf(event.decided_at);
-    return (fromDay === "" || day >= fromDay) &&
-      (toDay === "" || day <= toDay);
-  }).filter((event) =>
+  const list = evolutionEvents.filter((event) =>
     (candidate === "" || event.candidate_id.toLowerCase().includes(candidate)) &&
     (status === "" || event.status === status) &&
     (experiment === "" ||
@@ -2020,7 +2016,9 @@ const renderEvolutionList = (): void => {
       (event.candidate_cycle ?? "").toLowerCase().includes(experiment)));
   toggle(empty, list.length === 0);
   if (list.length === 0) {
-    empty.textContent = evolutionEvents.length === 0 ? "还没有进化事件。" : "没有匹配的事件。";
+    const filtering = candidate !== "" || experiment !== "" || status !== "" ||
+      fromDay !== "" || toDay !== "";
+    empty.textContent = filtering ? "没有匹配的事件。" : "还没有进化事件。";
   }
   container.replaceChildren(...list.map((event) => {
       const card = document.createElement("article");
@@ -2165,11 +2163,18 @@ type EvolutionPage = {
 
 let evolutionCursor: { before: string; beforeId: string } | null = null;
 
+const evolutionDayParams = (): string => {
+  const fromDay = byId<HTMLInputElement>("evolution-from").value;
+  const toDay = byId<HTMLInputElement>("evolution-to").value;
+  return (fromDay ? `&from_day=${encodeURIComponent(fromDay)}` : "") +
+    (toDay ? `&to_day=${encodeURIComponent(toDay)}` : "");
+};
+
 const loadEvolution = async (): Promise<void> => {
   const empty = testId<HTMLElement>("evolution-empty");
   try {
     const page = await api<EvolutionPage>(
-      "/v2/evolution/events/page?limit=20",
+      `/v2/evolution/events/page?limit=20${evolutionDayParams()}`,
       new AbortController().signal,
     );
     evolutionEvents = Array.isArray(page.events) ? page.events : [];
@@ -2195,7 +2200,7 @@ const loadMoreEvolution = async (): Promise<void> => {
   try {
     const page = await api<EvolutionPage>(
       `/v2/evolution/events/page?limit=20&before=${encodeURIComponent(evolutionCursor.before)}` +
-      `&before_id=${encodeURIComponent(evolutionCursor.beforeId)}`,
+      `&before_id=${encodeURIComponent(evolutionCursor.beforeId)}${evolutionDayParams()}`,
       new AbortController().signal,
     );
     const known = new Set(evolutionEvents.map((event) => event.event_id));
@@ -2222,8 +2227,8 @@ testId<HTMLButtonElement>("evolution-more").addEventListener("click", () => void
 byId<HTMLInputElement>("evolution-filter-candidate").addEventListener("input", renderEvolutionList);
 byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", renderEvolutionList);
 byId<HTMLInputElement>("evolution-filter-experiment").addEventListener("input", renderEvolutionList);
-byId<HTMLInputElement>("evolution-from").addEventListener("change", renderEvolutionList);
-byId<HTMLInputElement>("evolution-to").addEventListener("change", renderEvolutionList);
+byId<HTMLInputElement>("evolution-from").addEventListener("change", () => void loadEvolution());
+byId<HTMLInputElement>("evolution-to").addEventListener("change", () => void loadEvolution());
 
 testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
 
