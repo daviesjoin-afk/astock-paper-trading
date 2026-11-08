@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 价格集合面板：实验信息页新增目录列表（id/trust/数据包/覆盖区间/条数/摘要前缀）与覆盖核对器（数据包+标的+交易日 → 覆盖对数与缺口，缺口警告色，空输入内联提示）；浏览器 123 passed（+2 目录/核对与空目录/必填）；Rust 151 / Python 48 不变。
 - V2 策略切换设计（ADR-018，提议）：明确“追加式切换记录 + 槽位当前版本由链推导”，禁止改写历史；规定数据表 `v2_paper_slot_switches`、写入约束（已审核版本、生效时刻晚于最后会话、幂等）、审计 `switch_chain`、会话按创建时版本固定、回退即反向记录；并列出非目标与待解问题。README ADR 索引同步。
 - V2 备份/恢复工具：新增 `v2/scripts/db_tool.py`（backup/restore/verify）——在线备份 API（WAL 安全）、完整性+schema 校验、默认拒绝覆盖（退出码 3）、恢复清理陈旧 `-wal/-shm`、输出 sha256 与关键表计数；`OPERATIONS.md` 备份章节改用该工具并写明退出码。冒烟覆盖在线备份、校验恢复、拒绝覆盖与损坏库拒绝。Rust 151 / Python 48 / 浏览器 121 不变。
 - V2 导出离线校验：新增 `v2/scripts/verify_export.py`——按 canonical JSON（键排序、紧凑分隔）复算导出摘要并核对 `count`，退出码 0/1/2；`OPERATIONS.md` 增加复核命令；Python 研究套件 48 passed（+4）；冒烟用真实导出文件验证“可复核、篡改必失败”，同时交叉验证 Rust 与 Python 的 canonical 规则一致。

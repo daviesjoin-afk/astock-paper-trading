@@ -888,6 +888,17 @@ td:first-child { font-weight: 550; }
 .evolution-links { margin: 0; font-size: 11.5px; color: var(--muted); }
 .evolution-reasons { margin: 0; padding-left: 18px; display: grid; gap: 3px; font-size: 11.5px; color: var(--muted); }
 
+/* ---------- price sets ---------- */
+.price-sets { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+.price-sets h3 { margin: 0 0 6px; font-size: 14px; }
+.price-sets h4 { margin: 12px 0 6px; font-size: 12.5px; }
+.price-set-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 11.5px; color: var(--muted); }
+.coverage-check { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-end; margin-bottom: 6px; }
+.coverage-check input { min-width: 150px; }
+.coverage-result { margin: 0; font-size: 11.5px; color: var(--muted); }
+.coverage-result[data-state="ok"] { color: var(--ok); }
+.coverage-result[data-state="gap"] { color: var(--warn); }
+
 /* ---------- experiment performance ---------- */
 .experiment-performance { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
 .experiment-performance h3 { margin: 0 0 6px; font-size: 14px; }
