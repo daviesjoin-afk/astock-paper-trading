@@ -134,6 +134,7 @@ ADR 001 让每个实验拥有独立资金与账本，实验是**研究身份**�
 | `order_fill_link` | 已成交订单数 = 成交条数 |
 | `fill_matches_outcome` | 每条成交与其订单 `outcome.fill` 完全一致（可发现篡改） |
 | `session_link` | 会话 `last_order_id` 必须属于该账户的订单 |
+| `session_signals` | 会话订单必须与冻结信号前缀逐条一致（signal id、决策时刻、报价引用），且条数等于 cursor |
 
 整体 `ok` 与 canonical `digest` 一并返回；控制台在账户页展示「账本自检：通过/失败 + 摘要」。审计只读，不修复、不写回。
 

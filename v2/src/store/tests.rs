@@ -2928,7 +2928,7 @@ fn account_audit_balances_and_detects_tampering() {
     let report = db.paper_account_audit("audit-acct").unwrap();
     assert!(report.ok, "checks: {:?}", report.checks);
     let names: Vec<&str> = report.checks.iter().map(|check| check.name.as_str()).collect();
-    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link"]);
+    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link", "session_signals"]);
     assert_eq!(report.digest.len(), 64);
     assert_eq!(report, db.paper_account_audit("audit-acct").unwrap());
 
@@ -2947,14 +2947,67 @@ fn account_audit_balances_and_detects_tampering() {
     // A session cursor pointing at a missing order is caught as well.
     let mut clean = test_store(INITIAL_CASH_CENTS).unwrap();
     clean.create_paper_account(paper_spec("audit-session", 10_000_000)).unwrap();
+    let dangling = crate::domain::PaperSessionSpec {
+        schema_version: 1,
+        session_id: "s1".into(),
+        account_id: "audit-session".into(),
+        start_at: "2026-10-30T00:00:00+08:00".into(),
+        signals: vec![],
+    };
     clean.conn.execute(
         "INSERT INTO v2_paper_sessions(session_id,account_id,spec_json,status,clock_at,cursor,last_order_id)
-         VALUES('s1','audit-session','{}','created','2026-10-30T00:00:00+08:00',0,999)",
-        [],
+         VALUES('s1','audit-session',?,'created','2026-10-30T00:00:00+08:00',0,999)",
+        [serde_json::to_string(&dangling).unwrap()],
     ).unwrap();
     let linked = clean.paper_account_audit("audit-session").unwrap();
     assert!(!linked.ok);
     assert!(linked.checks.iter().any(|check| check.name == "session_link" && !check.ok));
 
     assert!(matches!(db.paper_account_audit("nope"), Err(StoreError::NotFound(_))));
+}
+
+#[test]
+fn account_audit_verifies_session_orders_against_frozen_signals() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("audit-signals", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    db.create_paper_session(session_spec(
+        "audit-signals",
+        "audit-signals-session",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[0]),
+            session_signal(PaperSlotId::A, &output.signals[1]),
+        ],
+    ))
+    .unwrap();
+    db.paper_session_action("audit-signals-session", "start").unwrap();
+    db.step_paper_session("audit-signals-session").unwrap();
+
+    let report = db.paper_account_audit("audit-signals").unwrap();
+    assert!(report.ok, "checks: {:?}", report.checks);
+    assert!(report.checks.iter().any(|check| check.name == "session_signals" && check.ok));
+
+    // Tampering with a session order's decision time is caught.
+    let raw: String = db
+        .conn
+        .query_row(
+            "SELECT request_json FROM v2_paper_orders WHERE signal_id LIKE 'audit-signals-session:%' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut request: crate::domain::PaperOrderRequest = serde_json::from_str(&raw).unwrap();
+    request.decision_at = "2026-10-30T15:00:00+08:00".into();
+    db.conn
+        .execute(
+            "UPDATE v2_paper_orders SET request_json=? WHERE signal_id LIKE 'audit-signals-session:%'",
+            [serde_json::to_string(&request).unwrap()],
+        )
+        .unwrap();
+    let tampered = db.paper_account_audit("audit-signals").unwrap();
+    assert!(!tampered.ok);
+    assert!(tampered.checks.iter().any(|check| check.name == "session_signals" && !check.ok));
 }

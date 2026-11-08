@@ -105,7 +105,8 @@ form, no valuation.
   reviewed strategy ids; the server resolves artifacts. Duplicate ids, invalid
   capital and identical strategies are refused with an explicit message.
 - Audit: the account panel runs the read-only ledger audit on load and prints
-  “账本自检：通过/失败 · 摘要”; failures list the check names.
+  “账本自检：通过/失败 · 摘要”; a collapsible “审计详情” lists every check with
+  its pass/fail marker and detail, so a failure is diagnosable in place.
 - Risk boundaries: every slot card prints the account's cost-basis limits
   (single order / single symbol / slot cash floor) so a rejected order can be
   explained without opening the API.

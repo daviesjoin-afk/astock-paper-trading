@@ -848,6 +848,11 @@ td:first-child { font-weight: 550; }
   color: var(--ok); background: var(--ok-soft);
   border-color: color-mix(in srgb, var(--ok) 28%, var(--border));
 }
+.audit-details { margin: 0 20px 12px; font-size: 11.5px; color: var(--muted); }
+.audit-details summary { cursor: pointer; }
+.audit-details ul { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 4px; }
+.audit-details li[data-state="ok"] { color: var(--ok); }
+.audit-details li[data-state="fail"] { color: var(--danger); }
 .audit-line[data-state="fail"] {
   color: var(--danger); background: var(--danger-soft);
   border-color: color-mix(in srgb, var(--danger) 28%, var(--border));

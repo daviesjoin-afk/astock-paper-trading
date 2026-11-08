@@ -1393,6 +1393,7 @@ const renderAudit = (report: PaperAuditReport | null): void => {
   const line = testId<HTMLElement>("account-audit");
   if (!report) {
     toggle(line, false);
+    toggle(testId<HTMLDetailsElement>("account-audit-details"), false);
     return;
   }
   toggle(line, true);
@@ -1401,6 +1402,15 @@ const renderAudit = (report: PaperAuditReport | null): void => {
   line.textContent = report.ok
     ? `账本自检：通过（${report.checks.length} 项）· 摘要 ${report.digest.slice(0, 12)}…`
     : `账本自检：失败（${failed.join("、")}）· 摘要 ${report.digest.slice(0, 12)}…`;
+  const details = testId<HTMLDetailsElement>("account-audit-details");
+  const list = testId<HTMLUListElement>("account-audit-checks");
+  toggle(details, true);
+  list.replaceChildren(...report.checks.map((check) => {
+    const item = document.createElement("li");
+    item.dataset.state = check.ok ? "ok" : "fail";
+    item.textContent = `${check.ok ? "✓" : "✗"} ${check.name}：${check.detail}`;
+    return item;
+  }));
 };
 
 const loadAccount = async (accountId: string): Promise<void> => {
