@@ -171,6 +171,7 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
   if (view === "account" && accounts.length === 0) void loadAccounts();
   if (view === "evolution") void loadEvolution();
   if (view === "experiment") void loadPriceSets();
+  if (view === "overview") void loadOverviewStatus();
   announce(`已切换到${VIEWS[view].label}`);
 };
 
@@ -1581,6 +1582,43 @@ const renderStrategySwitches = (rows: StrategySwitch[]): void => {
     return item;
   }));
 };
+
+async function loadOverviewStatus(): Promise<void> {
+  try {
+    const rows = await api<AccountOverviewRow[]>("/v2/paper-accounts/overview", new AbortController().signal);
+    const list = Array.isArray(rows) ? rows : [];
+    const active = list.reduce(
+      (total, row) => total + row.sessions.created + row.sessions.running + row.sessions.paused,
+      0,
+    );
+    setText("overview-accounts", `账户：${list.length}`);
+    setText("overview-sessions", `会话：活动 ${active}`);
+  } catch {
+    setText("overview-accounts", "账户：—");
+    setText("overview-sessions", "会话：—");
+  }
+  try {
+    const sets = await api<unknown[]>("/v2/price-sets", new AbortController().signal);
+    setText("overview-price-sets", `价格集合：${Array.isArray(sets) ? sets.length : 0}`);
+  } catch {
+    setText("overview-price-sets", "价格集合：—");
+  }
+  try {
+    const page = await api<{ events: EvolutionEvent[] }>(
+      "/v2/evolution/events/page?limit=1",
+      new AbortController().signal,
+    );
+    const latest = page.events?.[0];
+    if (latest) {
+      const label = EVOLUTION_LABELS[latest.status] ?? latest.status;
+      setText("overview-evolution", `进化：最近 ${label} · ${latest.candidate_id}`);
+    } else {
+      setText("overview-evolution", "进化：暂无事件");
+    }
+  } catch {
+    setText("overview-evolution", "进化：—");
+  }
+}
 
 async function loadStrategySwitches(accountId: string): Promise<void> {
   try {
