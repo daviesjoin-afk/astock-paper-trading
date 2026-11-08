@@ -1029,10 +1029,14 @@ type PaperAccountSlotView = {
   positions: Array<{ symbol: string; quantity: number; sellable_quantity: number | null }>;
   orders_total: number;
 };
+type PaperRiskLimits = {
+  max_symbol_weight_bps: number; max_order_notional_bps: number; min_slot_cash_bps: number;
+};
 type PaperAccountView = {
   account_id: string; initial_cash_cents: number; created_at: string;
   cash_cents: number; reserve_cents: number; slots: PaperAccountSlotView[];
   valuation: { status: string; reason: string };
+  limits: PaperRiskLimits;
 };
 type PaperFill = {
   symbol: string; side: string; quantity: number; price_cents: number;
@@ -1108,7 +1112,7 @@ const clearAccountError = (): void => {
   toggle(accountError, false);
 };
 
-const accountSlotCard = (slot: PaperAccountSlotView): HTMLElement => {
+const accountSlotCard = (slot: PaperAccountSlotView, limits: PaperRiskLimits): HTMLElement => {
   const card = document.createElement("section");
   card.className = "account-slot";
   card.dataset.testid = `account-slot-${slot.slot}`;
@@ -1138,13 +1142,20 @@ const accountSlotCard = (slot: PaperAccountSlotView): HTMLElement => {
     facts.appendChild(item);
   }
 
+  const risk = document.createElement("p");
+  risk.className = "account-slot-risk";
+  risk.textContent =
+    `风控：单笔 ≤ ${(limits.max_order_notional_bps / 100).toFixed(0)}% · ` +
+    `单标的 ≤ ${(limits.max_symbol_weight_bps / 100).toFixed(0)}% · ` +
+    `现金 ≥ ${(limits.min_slot_cash_bps / 100).toFixed(0)}%`;
+
   const positions = document.createElement("p");
   positions.className = "account-slot-positions";
   positions.textContent = slot.positions.length === 0
     ? "无持仓"
     : slot.positions.map((position) => `${position.symbol} ${integer(position.quantity)} 股`).join("；");
 
-  card.append(head, facts, positions);
+  card.append(head, facts, risk, positions);
   return card;
 };
 
@@ -1162,7 +1173,7 @@ const renderAccount = (account: PaperAccountView, orders: PaperOrderRecord[]): v
     : "估值可用：价格来源与版本见账户摘要。";
 
   const slots = byId("account-slots");
-  slots.replaceChildren(...account.slots.map(accountSlotCard));
+  slots.replaceChildren(...account.slots.map((slot) => accountSlotCard(slot, account.limits)));
 
   const body = byId("account-orders");
   body.replaceChildren();
@@ -1483,6 +1494,11 @@ createForm.addEventListener("submit", (event) => {
         reserve_bps: strategyCatalogue.reserve_bps,
         created_at: new Date().toISOString(),
         slots,
+        limits: {
+          max_symbol_weight_bps: 2_500,
+          max_order_notional_bps: 5_000,
+          min_slot_cash_bps: 1_000,
+        },
       });
       announce(`账户 ${accountId} 已创建`);
       closeCreateForm();

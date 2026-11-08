@@ -31,6 +31,25 @@ impl PaperSlotId {
     }
 }
 
+/// Explicit risk boundaries for a paper account. Cost-basis based, no prices
+/// are required: limits are fractions of the slot budget.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperRiskLimits {
+    /// Max cost basis of one symbol as bps of the slot budget.
+    pub max_symbol_weight_bps: i64,
+    /// Max gross notional of a single order as bps of the slot budget.
+    pub max_order_notional_bps: i64,
+    /// Slot cash that must remain after a fill, bps of the slot budget.
+    pub min_slot_cash_bps: i64,
+}
+
+impl Default for PaperRiskLimits {
+    fn default() -> Self {
+        Self { max_symbol_weight_bps: 2_500, max_order_notional_bps: 5_000, min_slot_cash_bps: 1_000 }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaperSlotSpec {
@@ -53,6 +72,8 @@ pub struct PaperAccountSpec {
     /// Explicit RFC3339 instant; the domain never reads a machine clock.
     pub created_at: String,
     pub slots: Vec<PaperSlotSpec>,
+    #[serde(default)]
+    pub limits: PaperRiskLimits,
 }
 
 /// Integer-cent split of the initial cash. Floor division per slot, with the
@@ -121,6 +142,15 @@ impl PaperAccountSpec {
         }
         if total_bps != TOTAL_BPS {
             return Err(RuleError("paper_account_weights_must_sum_to_total".into()));
+        }
+        for value in [
+            self.limits.max_symbol_weight_bps,
+            self.limits.max_order_notional_bps,
+            self.limits.min_slot_cash_bps,
+        ] {
+            if !(0..=TOTAL_BPS).contains(&value) {
+                return Err(RuleError("invalid_risk_limits".into()));
+            }
         }
 
         let mut slot_budgets = [0i64; PAPER_SLOT_COUNT];
@@ -268,4 +298,6 @@ pub struct PaperAccountRequest {
     pub reserve_bps: i64,
     pub created_at: String,
     pub slots: Vec<PaperAccountRequestSlot>,
+    #[serde(default)]
+    pub limits: PaperRiskLimits,
 }

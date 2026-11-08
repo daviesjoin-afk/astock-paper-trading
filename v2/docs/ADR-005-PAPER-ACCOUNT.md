@@ -112,6 +112,16 @@ ADR 001 让每个实验拥有独立资金与账本，实验是**研究身份**�
 - `POST /v2/paper-sessions/{id}/advance { day }`：只执行**中国日 ≤ day** 的信号；两个决策之间的日期不产生任何动作；非法日期返回 `invalid_advance_day`。未来信号永远不会被提前执行（无 look-ahead）。
 - `PaperAccountView.valuation` 固定输出 `{status:"unavailable", reason:"no_reviewed_price_set"}`：在 ADR-006 定义审核价格集合之前，账户页不计算市值、净值、收益或回撤，只展示现金与持仓数量，并显式提示不可估值。
 
+### 11. 账户风险边界（已实现）
+
+`PaperRiskLimits { max_symbol_weight_bps, max_order_notional_bps, min_slot_cash_bps }`（默认 25% / 50% / 10%，均为槽位预算的 basis points）：
+
+- **成本口径、无需价格**：单笔金额 = 数量 × 成交价；单标的成本 = (现有数量 + 本次数量) × 成交价；现金下限 = 成交后槽位现金。
+- 任一越界 → 该笔决策记为 `rejected`（`risk_order_notional_exceeded` / `risk_symbol_concentration_exceeded` / `risk_cash_floor_exceeded`），**不产生部分成交、不动账本**。
+- 卖出不受买入侧金额/集中度约束（后续如需卖出侧限制，单独建模）。
+- 数值区间 0–10000 bps；非法值拒绝创建。
+- 账户视图输出 `limits`，控制台在槽位卡上明示当前边界。
+
 ## 未决问题
 
 - 自动运行时钟（第二阶段）与账户的关系：账户是否需要"当前模拟日期"这一显式状态？倾向放入独立的 run session，而不是写进账户 spec。
