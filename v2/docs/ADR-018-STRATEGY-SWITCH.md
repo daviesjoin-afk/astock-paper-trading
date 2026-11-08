@@ -1,6 +1,6 @@
 # ADR-018: 策略版本切换（设计）
 
-状态：部分实现（schema v15 + 写入方法 + 只读端点；HTTP 写端点与随动校验待做）｜日期：2026-11-08｜依赖：ADR-005、006、012
+状态：已实现（schema v15：写端点、订单归因与时序、实验派生会话版本校验、视图与审计）｜日期：2026-11-08｜依赖：ADR-005、006、012
 
 ## 背景
 
@@ -63,13 +63,14 @@
 - 同一槽位并行多版本（影子实验继续在实验域运行）；
 - 按版本拆分绩效归因（后续 ADR）。
 
-## 实现进度（schema v15）
+## 实现进度（schema v15，已完成）
 
-- 已建表 `v2_paper_slot_switches`（严格白名单）与 `Store::record_strategy_switch`：版本连续性、幂等、时间单调、理由必填、canonical 摘要；
-- 已暴露只读 `GET /v2/paper-accounts/{id}/strategy-switches?slot=`；
-- 账户视图新增 `current_strategy_version_id` 与 `switch_count`；
-- 审计新增 `switch_chain`（位于 `rebalance_chain` 之后）；
-- **尚未接线**：HTTP 写端点、会话创建/订单提交按“当前版本”校验、切换后新会话的版本绑定。
+- 表 `v2_paper_slot_switches` 与 `Store::record_strategy_switch`：版本连续、幂等、时间单调、理由必填、canonical 摘要，且 `effective_from` 必须晚于该账户最后一次会话 `clock_at`；
+- `GET|POST /v2/paper-accounts/{id}/strategy-switches`（`slot=A|B` 过滤；POST 体为 `slot/to_version/effective_from/reason/switch_id`）；
+- 订单：归因、幂等键与请求内 `strategy_version_id` 全部使用“当前版本”；`decision_at` 早于最后一次切换 → 409 `paper_order_before_strategy_switch`；
+- 实验派生会话（`from-experiment`）校验实验版本等于“当前版本”；
+- 视图 `current_strategy_version_id` / `switch_count`；审计 `switch_chain`（末项）；
+- 普通会话规格不带版本（版本在成交时按当时链确定），这是既有设计，不在本 ADR 改动。
 
 ## 待解问题
 

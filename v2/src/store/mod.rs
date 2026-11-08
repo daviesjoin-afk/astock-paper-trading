@@ -1328,6 +1328,18 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Version currently in force for a slot (last switch wins, spec otherwise).
+    fn effective_strategy_version(
+        conn: &Connection,
+        account_id: &str,
+        slot: &crate::domain::PaperSlotSpec,
+    ) -> StoreResult<String> {
+        Ok(Self::slot_switches(conn, account_id, slot.slot.as_str())?
+            .last()
+            .map(|record| record.to_version.clone())
+            .unwrap_or_else(|| slot.strategy.strategy_version_id.clone()))
+    }
+
     /// Record one explicit strategy-version switch (no money moves).
     pub fn record_strategy_switch(
         &mut self,
@@ -1351,6 +1363,24 @@ impl Store {
         }
         if to_version.trim().is_empty() {
             return Err(StoreError::Rules(RuleError("empty_strategy_version".into())));
+        }
+        let latest_session: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(clock_at) FROM v2_paper_sessions WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(latest) = latest_session {
+            let latest_at = chrono::DateTime::parse_from_rfc3339(&latest)
+                .map_err(|_| StoreError::Integrity("stored_session_time_invalid".into()))?;
+            let at = chrono::DateTime::parse_from_rfc3339(effective_from)
+                .map_err(|_| StoreError::Rules(RuleError("invalid_switch_time".into())))?;
+            if at <= latest_at {
+                return Err(StoreError::Rules(RuleError("switch_precedes_session".into())));
+            }
         }
         let at = chrono::DateTime::parse_from_rfc3339(effective_from)
             .map_err(|_| StoreError::Rules(RuleError("invalid_switch_time".into())))?;
@@ -1538,6 +1568,21 @@ impl Store {
             .position(|slot| slot.slot == request.slot)
             .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_not_found".into())))?;
         let slot_spec = spec.slots[slot_index].clone();
+        let effective_version =
+            Self::effective_strategy_version(&txn, &request.account_id, &slot_spec)?;
+        if let Some(last_switch) =
+            Self::slot_switches(&txn, &request.account_id, slot_spec.slot.as_str())?.last()
+        {
+            let switched_at = chrono::DateTime::parse_from_rfc3339(&last_switch.effective_from)
+                .map_err(|_| StoreError::Integrity("stored_switch_time_invalid".into()))?;
+            let decided_at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
+                .map_err(|_| StoreError::Rules(RuleError("invalid_decision_time".into())))?;
+            if decided_at < switched_at {
+                return Err(StoreError::Conflict(
+                    "paper_order_before_strategy_switch".into(),
+                ));
+            }
+        }
         if request.quote_ref.market_data_pack_id != slot_spec.market_data_pack_id {
             return Err(StoreError::Conflict("paper_quote_data_pack_mismatch".into()));
         }
@@ -1551,7 +1596,7 @@ impl Store {
                 params![
                     request.account_id,
                     slot_spec.slot.as_str(),
-                    slot_spec.strategy.strategy_version_id,
+                    effective_version,
                     request.signal_id
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1569,7 +1614,7 @@ impl Store {
                 id,
                 account_id: request.account_id.clone(),
                 slot: slot_spec.slot.as_str().into(),
-                strategy_version_id: slot_spec.strategy.strategy_version_id,
+                strategy_version_id: effective_version,
                 request,
                 outcome,
                 duplicate: true,
@@ -1602,7 +1647,7 @@ impl Store {
         let internal = SimulationRequest {
             schema_version: 4,
             cycle_id: spec.account_id.clone(),
-            strategy_version_id: slot_spec.strategy.strategy_version_id.clone(),
+            strategy_version_id: effective_version.clone(),
             signal_id: request.signal_id.clone(),
             decision_at: request.decision_at.clone(),
             signal: request.signal.clone(),
@@ -1640,7 +1685,7 @@ impl Store {
             params![
                 request.account_id,
                 slot_spec.slot.as_str(),
-                slot_spec.strategy.strategy_version_id,
+                effective_version,
                 request.signal_id,
                 serde_json::to_string(&request)?,
                 serde_json::to_string(&evidence)?,
@@ -1662,7 +1707,7 @@ impl Store {
             id,
             account_id: request.account_id.clone(),
             slot: slot_spec.slot.as_str().into(),
-            strategy_version_id: slot_spec.strategy.strategy_version_id,
+            strategy_version_id: effective_version,
             request,
             outcome,
             duplicate: false,
@@ -2022,7 +2067,9 @@ impl Store {
             .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_not_found".into())))?;
 
         let experiment = load_experiment(&self.conn, cycle_id)?;
-        if experiment.spec.strategy.strategy_version_id != slot_spec.strategy.strategy_version_id {
+        let effective_version =
+            Self::effective_strategy_version(&self.conn, &account.account_id, slot_spec)?;
+        if experiment.spec.strategy.strategy_version_id != effective_version {
             return Err(StoreError::Rules(RuleError("paper_slot_strategy_mismatch".into())));
         }
         if experiment.spec.market_data_pack_id != slot_spec.market_data_pack_id {

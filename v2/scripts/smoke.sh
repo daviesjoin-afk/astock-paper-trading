@@ -651,6 +651,22 @@ print("HTTP/SQLite instrument identity/coverage/unsupported types/immutable snap
 print("HTTP execution evidence/price/capacity/missing/expiry/conflicts/retry/replay passed")
 print("HTTP calendar/session/auction/unknown-date/retry/replay passed")
 print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed")
+# Explicit strategy switch: append-only, audited, and visible in the slot view.
+switch = call("paper-accounts/smoke-account/strategy-switches", {
+    "slot": "A",
+    "to_version": "research-momentum-v2",
+    "effective_from": "2026-11-10T09:00:00+08:00",
+    "reason": "promotion rehearsal",
+    "switch_id": "smoke-switch-1",
+})
+assert switch["from_version"] == "research-momentum-v1", switch
+assert switch["to_version"] == "research-momentum-v2", switch
+chain = call("paper-accounts/smoke-account/strategy-switches?slot=A")
+assert len(chain) == 1 and chain[0]["switch_id"] == "smoke-switch-1", chain
+switched = call("paper-accounts/smoke-account")
+assert switched["slots"][0]["current_strategy_version_id"] == "research-momentum-v2", switched["slots"][0]
+assert switched["slots"][0]["switch_count"] == 1, switched["slots"][0]
+assert call("paper-accounts/smoke-account/audit")["ok"] is True
 print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed")
 PY
 # Scheduler helper: explicit day, dry-run and validation without writes.

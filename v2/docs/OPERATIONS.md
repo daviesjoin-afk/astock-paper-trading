@@ -46,6 +46,16 @@ curl -fsS "http://127.0.0.1:8765/v2/paper-accounts/paper-001/strategy-switches?s
 
 返回按生效时间升序的追加记录；空数组表示该槽仍使用创建时的版本。
 
+执行一次切换（追加式，不移动资金）：
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:8765/v2/paper-accounts/paper-001/strategy-switches"   -H 'content-type: application/json'   -d '{"slot":"A","to_version":"research-momentum-v2","effective_from":"2026-11-10T09:00:00+08:00","reason":"AD-012 promoted candidate","switch_id":"switch-2026-11-10-a"}'
+```
+
+- `effective_from` 必须晚于该账户最后一次会话 `clock_at`；
+- 同一 `switch_id` 重放返回原记录，内容不同则 409；
+- 切换后提交 `decision_at` 早于该时刻的订单会被拒绝（`paper_order_before_strategy_switch`）。
+
 归档进化事件（只读导出，含 canonical 摘要）：
 
 ```bash

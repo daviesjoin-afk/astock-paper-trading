@@ -146,6 +146,43 @@ struct SwitchQuery {
     slot: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct StrategySwitchRequest {
+    slot: String,
+    to_version: String,
+    effective_from: String,
+    reason: String,
+    switch_id: String,
+}
+
+async fn post_strategy_switch(
+    State(state): State<Shared>,
+    Path(account_id): Path<String>,
+    Json(body): Json<StrategySwitchRequest>,
+) -> ApiResult {
+    let slot = match body.slot.as_str() {
+        "A" => astock_v2::domain::PaperSlotId::A,
+        "B" => astock_v2::domain::PaperSlotId::B,
+        _ => {
+            return Err(api_error(astock_v2::store::StoreError::Rules(
+                astock_v2::domain::RuleError("unknown_paper_slot".into()),
+            )))
+        }
+    };
+    let mut db = state.lock().await;
+    response(
+        db.record_strategy_switch(
+            &account_id,
+            slot,
+            &body.to_version,
+            &body.effective_from,
+            &body.reason,
+            &body.switch_id,
+        )
+        .map_err(api_error)?,
+    )
+}
+
 async fn strategy_switches(
     State(state): State<Shared>,
     Path(account_id): Path<String>,
@@ -778,7 +815,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/paper-accounts/overview", get(accounts_overview))
         .route(
             "/v2/paper-accounts/{account_id}/strategy-switches",
-            get(strategy_switches),
+            get(strategy_switches).post(post_strategy_switch),
         )
         .route("/v2/strategies", get(strategy_catalogue))
         .route("/v2/evolution/decisions", post(evolution_decision))
