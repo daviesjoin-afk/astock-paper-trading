@@ -175,6 +175,39 @@ impl PaperAccountSpec {
         }
         Ok(PaperCapitalSplit { slot_budgets, reserve_cents })
     }
+
+    /// Recompute budgets from explicit current weights (after a rebalance).
+    /// History is untouched: this only says how the *initial* capital is
+    /// divided now, so cash must be moved separately and audited.
+    pub fn split_with_weights(
+        &self,
+        weights: [i64; PAPER_SLOT_COUNT],
+    ) -> Result<PaperCapitalSplit, RuleError> {
+        self.validate()?;
+        if weights.iter().any(|weight| *weight <= 0) {
+            return Err(RuleError("invalid_slot_weight".into()));
+        }
+        if weights.iter().sum::<i64>() + self.reserve_bps > TOTAL_BPS {
+            return Err(RuleError("paper_account_weights_must_sum_to_total".into()));
+        }
+        let mut slot_budgets = [0i64; PAPER_SLOT_COUNT];
+        for (index, weight) in weights.iter().enumerate() {
+            slot_budgets[index] = self
+                .initial_cash_cents
+                .checked_mul(*weight)
+                .ok_or_else(|| RuleError("account_cash_overflow".into()))?
+                / TOTAL_BPS;
+        }
+        let assigned: i64 = slot_budgets.iter().sum();
+        let reserve_cents = self
+            .initial_cash_cents
+            .checked_sub(assigned)
+            .ok_or_else(|| RuleError("account_cash_overflow".into()))?;
+        if reserve_cents < 0 {
+            return Err(RuleError("account_cash_overflow".into()));
+        }
+        Ok(PaperCapitalSplit { slot_budgets, reserve_cents })
+    }
 }
 
 /// One simulated order submitted to a strategy slot. The slot, not the client,

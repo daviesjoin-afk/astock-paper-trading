@@ -152,6 +152,21 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// One applied capital rebalance: cash moved between slots plus the weight change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebalanceRecord {
+    pub account_id: String,
+    pub from_slot: String,
+    pub to_slot: String,
+    pub amount_cents: i64,
+    pub weights_before: [i64; 2],
+    pub weights_after: [i64; 2],
+    pub applied_at: String,
+    pub note: String,
+    pub proposal_digest: String,
+    pub digest: String,
+}
+
 /// Allocation proposal plus the scores it was derived from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationReport {
@@ -296,7 +311,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 11;
+        const SCHEMA_VERSION: i64 = 12;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -323,10 +338,11 @@ impl Store {
                 ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_fills", &["id", "run_id", "fill_json"]),
                 ("v2_quote_evidence", &["pack_id", "source", "quote_id", "evidence_json"]),
-                ("v2_paper_accounts", &["account_id", "spec_json", "created_at"]),
+                ("v2_paper_accounts", &["account_id", "spec_json", "created_at", "weights_json"]),
                 ("v2_paper_orders", &["id", "account_id", "slot", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
                 ("v2_paper_fills", &["id", "order_id", "fill_json"]),
                 ("v2_paper_sessions", &["session_id", "account_id", "spec_json", "status", "clock_at", "cursor", "last_order_id"]),
+                ("v2_paper_transfers", &["id", "account_id", "from_slot", "to_slot", "amount_cents", "applied_at", "note", "digest", "weights_before_json", "weights_after_json"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
@@ -414,7 +430,8 @@ impl Store {
                 CREATE TABLE v2_paper_accounts (
                     account_id TEXT PRIMARY KEY NOT NULL,
                     spec_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    weights_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE v2_paper_orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -444,6 +461,19 @@ impl Store {
                     clock_at TEXT NOT NULL,
                     cursor INTEGER NOT NULL,
                     last_order_id INTEGER
+                );
+                CREATE TABLE v2_paper_transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL REFERENCES v2_paper_accounts(account_id) ON DELETE RESTRICT,
+                    from_slot TEXT NOT NULL CHECK(from_slot IN ('A','B')),
+                    to_slot TEXT NOT NULL CHECK(to_slot IN ('A','B')),
+                    amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
+                    applied_at TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    weights_before_json TEXT NOT NULL,
+                    weights_after_json TEXT NOT NULL,
+                    UNIQUE(account_id, digest)
                 );
                 CREATE TABLE v2_quote_evidence (
                     pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,
@@ -927,8 +957,16 @@ impl Store {
             return Self::paper_account_view_with_conn(&txn, &spec, &split);
         }
         txn.execute(
-            "INSERT INTO v2_paper_accounts(account_id,spec_json,created_at) VALUES(?,?,?)",
-            params![spec.account_id, raw, spec.created_at],
+            "INSERT INTO v2_paper_accounts(account_id,spec_json,created_at,weights_json) VALUES(?,?,?,?)",
+            params![
+                spec.account_id,
+                raw,
+                spec.created_at,
+                serde_json::to_string(&[
+                    spec.slots[0].weight_bps,
+                    spec.slots[1].weight_bps
+                ])?
+            ],
         )?;
         txn.commit()?;
         Ok(Self::paper_account_view_with_conn(&self.conn, &spec, &split)?)
@@ -942,6 +980,28 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 impl Store {
+    /// Current slot weights after any rebalances; falls back to the spec.
+    fn account_weights(
+        conn: &Connection,
+        spec: &crate::domain::PaperAccountSpec,
+    ) -> StoreResult<[i64; 2]> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT weights_json FROM v2_paper_accounts WHERE account_id=?",
+                [&spec.account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = raw {
+            if let Ok(weights) = serde_json::from_str::<Vec<i64>>(&raw) {
+                if weights.len() == 2 && weights.iter().all(|weight| *weight > 0) {
+                    return Ok([weights[0], weights[1]]);
+                }
+            }
+        }
+        Ok([spec.slots[0].weight_bps, spec.slots[1].weight_bps])
+    }
+
     fn paper_slot_state(
         conn: &Connection,
         spec: &crate::domain::PaperAccountSpec,
@@ -962,6 +1022,34 @@ impl Store {
             let fill: Fill = serde_json::from_str(&row?)?;
             state.apply(&fill).map_err(StoreError::Rules)?;
         }
+        // Rebalances move cash only, and always after fills, so history is
+        // never reinterpreted by a later capital decision.
+        let mut transfers = conn.prepare(
+            "SELECT from_slot,to_slot,amount_cents FROM v2_paper_transfers
+             WHERE account_id=? ORDER BY id",
+        )?;
+        let rows = transfers.query_map([&spec.account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (from, to, amount) = row?;
+            if from == slot {
+                state.cash_cents = state
+                    .cash_cents
+                    .checked_sub(amount)
+                    .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_cash_underflow".into())))?;
+            }
+            if to == slot {
+                state.cash_cents = state
+                    .cash_cents
+                    .checked_add(amount)
+                    .ok_or_else(|| StoreError::Rules(RuleError("paper_cash_overflow".into())))?;
+            }
+        }
         Ok(state)
     }
 
@@ -970,6 +1058,8 @@ impl Store {
         spec: &crate::domain::PaperAccountSpec,
         split: &crate::domain::PaperCapitalSplit,
     ) -> StoreResult<PaperAccountView> {
+        let weights = Self::account_weights(conn, spec)?;
+        let display = spec.split_with_weights(weights).map_err(StoreError::Rules)?;
         let mut slots = Vec::new();
         let mut cash_cents = split.reserve_cents;
         for (index, slot) in spec.slots.iter().enumerate() {
@@ -986,8 +1076,8 @@ impl Store {
                 research_input_id: slot.strategy.research_input_id.clone(),
                 market_data_pack_id: slot.market_data_pack_id.clone(),
                 execution_policy_version: slot.execution_policy_version.clone(),
-                weight_bps: slot.weight_bps,
-                budget_cents: split.slot_budgets[index],
+                weight_bps: weights[index],
+                budget_cents: display.slot_budgets[index],
                 cash_cents: state.cash_cents,
                 positions: state
                     .lots
@@ -1128,7 +1218,9 @@ impl Store {
         .map_err(StoreError::Rules)?;
         // Risk boundaries become an explicit rejection, never a partial fill.
         if let Some(fill) = outcome.fill.clone() {
-            let budget = split.slot_budgets[slot_index];
+            let weights = Self::account_weights(&txn, &spec)?;
+            let risk_split = spec.split_with_weights(weights).map_err(StoreError::Rules)?;
+            let budget = risk_split.slot_budgets[slot_index];
             if let Some(reason) = risk_violation(&spec.limits, budget, &state, &fill) {
                 outcome = Outcome {
                     status: crate::domain::DecisionStatus::Rejected,
@@ -1603,4 +1695,165 @@ fn risk_violation(
         return Some("risk_cash_floor_exceeded");
     }
     None
+}
+// ---------------------------------------------------------------------------
+// Capital rebalance (ADR 009): move slot cash toward the target weights and
+// record the decision. Fills stay untouched; transfers apply after them, so a
+// later capital decision can never rewrite trade history.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn apply_rebalance(
+        &mut self,
+        account_id: &str,
+        target: [i64; 2],
+        proposal_digest: &str,
+        applied_at: &str,
+        note: &str,
+    ) -> StoreResult<RebalanceRecord> {
+        if proposal_digest.len() != 64
+            || !proposal_digest.chars().all(|value| value.is_ascii_hexdigit())
+        {
+            return Err(StoreError::Rules(RuleError("invalid_proposal_digest".into())));
+        }
+        chrono::DateTime::parse_from_rfc3339(applied_at)
+            .map_err(|_| StoreError::Rules(RuleError("invalid_rebalance_time".into())))?;
+        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw: Option<String> = txn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let initial_split = spec.validate().map_err(StoreError::Rules)?;
+        let current = Self::account_weights(&txn, &spec)?;
+        let policy = crate::domain::AllocationPolicy::default();
+        if target
+            .iter()
+            .any(|weight| *weight < policy.min_slot_bps || *weight > policy.max_slot_bps)
+        {
+            return Err(StoreError::Rules(RuleError(
+                "rebalance_weight_out_of_bounds".into(),
+            )));
+        }
+        if target[0] + target[1] + spec.reserve_bps != 10_000 {
+            return Err(StoreError::Rules(RuleError(
+                "rebalance_weights_must_keep_reserve".into(),
+            )));
+        }
+        for index in 0..2 {
+            if (target[index] - current[index]).abs() > policy.max_step_bps {
+                return Err(StoreError::Rules(RuleError("rebalance_step_exceeded".into())));
+            }
+        }
+
+        // Idempotency: one transfer row per proposal digest.
+        let existing: Option<(String, String, i64)> = txn
+            .query_row(
+                "SELECT from_slot,to_slot,amount_cents FROM v2_paper_transfers
+                 WHERE account_id=? AND digest=?",
+                params![account_id, proposal_digest],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((from_slot, to_slot, amount_cents)) = existing {
+            let stored_weights: Vec<i64> = serde_json::from_str(&txn.query_row(
+                "SELECT weights_after_json FROM v2_paper_transfers WHERE account_id=? AND digest=?",
+                params![account_id, proposal_digest],
+                |row| row.get::<_, String>(0),
+            )?)?;
+            if stored_weights != vec![target[0], target[1]] {
+                return Err(StoreError::Conflict("rebalance_digest_conflict".into()));
+            }
+            txn.commit()?;
+            let mut record = RebalanceRecord {
+                account_id: account_id.into(),
+                from_slot,
+                to_slot,
+                amount_cents,
+                weights_before: current,
+                weights_after: target,
+                applied_at: applied_at.into(),
+                note: note.into(),
+                proposal_digest: proposal_digest.into(),
+                digest: String::new(),
+            };
+            record.digest = rebalance_digest(&record)?;
+            return Ok(record);
+        }
+
+        let next_split = spec
+            .split_with_weights(target)
+            .map_err(StoreError::Rules)?;
+        let state_a = Self::paper_slot_state(&txn, &spec, &initial_split, 0)?;
+        let state_b = Self::paper_slot_state(&txn, &spec, &initial_split, 1)?;
+        let delta = next_split.slot_budgets[0] - state_a.cash_cents;
+        let (from_slot, to_slot, amount_cents) = if delta > 0 {
+            if state_b.cash_cents < delta {
+                return Err(StoreError::Rules(RuleError(
+                    "rebalance_insufficient_cash".into(),
+                )));
+            }
+            ("B", "A", delta)
+        } else if delta < 0 {
+            let amount = -delta;
+            if state_a.cash_cents < amount {
+                return Err(StoreError::Rules(RuleError(
+                    "rebalance_insufficient_cash".into(),
+                )));
+            }
+            ("A", "B", amount)
+        } else {
+            ("B", "A", 0)
+        };
+
+        txn.execute(
+            "INSERT INTO v2_paper_transfers
+             (account_id,from_slot,to_slot,amount_cents,applied_at,note,digest,
+              weights_before_json,weights_after_json)
+             VALUES(?,?,?,?,?,?,?,?,?)",
+            params![
+                account_id,
+                from_slot,
+                to_slot,
+                amount_cents,
+                applied_at,
+                note,
+                proposal_digest,
+                serde_json::to_string(&current)?,
+                serde_json::to_string(&target)?,
+            ],
+        )?;
+        txn.execute(
+            "UPDATE v2_paper_accounts SET weights_json=? WHERE account_id=?",
+            params![serde_json::to_string(&target)?, account_id],
+        )?;
+        txn.commit()?;
+
+        let mut record = RebalanceRecord {
+            account_id: account_id.into(),
+            from_slot: from_slot.into(),
+            to_slot: to_slot.into(),
+            amount_cents,
+            weights_before: current,
+            weights_after: target,
+            applied_at: applied_at.into(),
+            note: note.into(),
+            proposal_digest: proposal_digest.into(),
+            digest: String::new(),
+        };
+        record.digest = rebalance_digest(&record)?;
+        Ok(record)
+    }
+}
+
+fn rebalance_digest(record: &RebalanceRecord) -> StoreResult<String> {
+    let mut value = serde_json::to_value(record)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("digest");
+    }
+    Ok(crate::domain::canonical_digest(&value))
 }

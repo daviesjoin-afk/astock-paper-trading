@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 资金再平衡账本事件（ADR 009，schema v12）：新增 `v2_paper_accounts.weights_json` 与追加型 `v2_paper_transfers`；现金派生顺序固定为“初始预算 → 成交 → 划拨”，划拨只移动现金、不改写历史，权重决定预算与风控口径。新增 `POST /v2/paper-accounts/{id}/rebalances`（目标权重、提案摘要、显式时刻、备注）：越界/步长/准备金/现金不足/非法摘要硬拒绝，`(account, digest)` 幂等且同摘要不同目标冲突；审计的 `budget_split` 改为按当前权重复核。Rust 132 passed（划拨守恒、持仓不变、审计通过、幂等与冲突、边界拒绝）；浏览器 100 passed；冒烟升级到 v12 并覆盖划拨后权重/预算/审计。
 - V2 动态资金提案（ADR 008）：新增纯域 `AllocationPolicy` / `SlotScore` / `propose_allocation()`——按槽位独立重放成交并用审核价格集合盯市，计算 `return_bps`、`drawdown_bps`、`score_bps`（相对最差槽位归一），在 `min/max`、准备金下限、单次步长、`min_days` 约束下生成目标权重与逐槽理由；证据不足保持原权重（`insufficient_evidence`），从不输出越界或突破准备金的方案。新增 `Store::paper_allocation_proposal()` 与 `GET /v2/paper-accounts/{id}/allocation-proposal?days=`；无审核集合返回 `unavailable`，交易日 < 2 拒绝。**只读提案，不执行划拨**。Rust 131 passed（评分/边界/步长/证据不足/合成拒绝）；浏览器 100 passed（无 UI 变更）；冒烟覆盖不可用路径。
 - V2 价格集合端到端与净值 UI（ADR 006/007）：冒烟改为 CSV → `make_price_set.py` → `ASTOCK_PRICE_SETS_DIR` → `/v2/price-sets` 全链路（合成集合可列出、但估值仍拒绝），并把目录纳入重启一致性流程；账户页新增“净值序列”区块——仅在覆盖齐全时展示每日权益、最大回撤与盈亏（合成集合不显示盈亏），无覆盖时隐藏。Rust 130 passed；浏览器 100 passed（stub 审核序列展示）；冒烟通过（目录 1 条、重启后一致）。
 - V2 价格集合离线生成器（ADR 006）：新增 `v2/research/make_price_set.py`（stdlib-only）——CSV（symbol/day/price/source/observed_at）→ 审核工件 JSON：元转整数分、拒绝三位小数、拒绝重复 `(symbol, day)`、校验覆盖区间与声明标的、按规范行计算 `source_digest`；`--days` 生成缺口报告，有缺口默认退出码 3 且不写文件（`--allow-gaps` 才写）。新增 7 项 Python 测试并接入既有 `unittest discover`；数据目录 README 增加生成用法。
