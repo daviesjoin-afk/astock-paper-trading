@@ -409,6 +409,9 @@ assert events[0]["event_id"] == "smoke-evo-1", events
 assert len(call("evolution/events?status=promoted")) == 1
 assert call("evolution/events?status=reverted") == []
 assert call("evolution/events?candidate=cand")[0]["candidate_id"] == "cand"
+page = call("evolution/events/page?limit=1")
+assert len(page["events"]) == 1 and page["scanned"] >= 1, page
+assert page["events"][0]["event_id"] == "smoke-evo-1", page
 
 # Shadow wiring: candidate artifact -> experiment -> frozen signals.
 import tempfile, shutil, sys as _sys

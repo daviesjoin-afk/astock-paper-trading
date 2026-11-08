@@ -1919,19 +1919,68 @@ const runDiff = async (): Promise<void> => {
 
 testId<HTMLButtonElement>("diff-run").addEventListener("click", () => void runDiff());
 
+type EvolutionPage = {
+  events: EvolutionEvent[];
+  next_before: string | null;
+  next_before_id: string | null;
+  scanned: number;
+};
+
+let evolutionCursor: { before: string; beforeId: string } | null = null;
+
 const loadEvolution = async (): Promise<void> => {
   const empty = testId<HTMLElement>("evolution-empty");
   try {
-    const events = await api<EvolutionEvent[]>("/v2/evolution/events?limit=50", new AbortController().signal);
-    evolutionEvents = Array.isArray(events) ? events : [];
+    const page = await api<EvolutionPage>(
+      "/v2/evolution/events/page?limit=20",
+      new AbortController().signal,
+    );
+    evolutionEvents = Array.isArray(page.events) ? page.events : [];
+    evolutionCursor = page.next_before && page.next_before_id
+      ? { before: page.next_before, beforeId: page.next_before_id }
+      : null;
+    toggle(testId<HTMLButtonElement>("evolution-more"), evolutionCursor !== null);
     renderEvolutionList();
   } catch (error) {
     evolutionEvents = [];
+    evolutionCursor = null;
+    toggle(testId<HTMLButtonElement>("evolution-more"), false);
     toggle(empty, true);
     testId<HTMLElement>("evolution-events").replaceChildren();
     empty.textContent = `读取进化事件失败：${errorDetail(error)}`;
   }
 };
+
+const loadMoreEvolution = async (): Promise<void> => {
+  if (!evolutionCursor) return;
+  const button = testId<HTMLButtonElement>("evolution-more");
+  button.disabled = true;
+  try {
+    const page = await api<EvolutionPage>(
+      `/v2/evolution/events/page?limit=20&before=${encodeURIComponent(evolutionCursor.before)}` +
+      `&before_id=${encodeURIComponent(evolutionCursor.beforeId)}`,
+      new AbortController().signal,
+    );
+    const known = new Set(evolutionEvents.map((event) => event.event_id));
+    evolutionEvents = [
+      ...evolutionEvents,
+      ...(page.events ?? []).filter((event) => !known.has(event.event_id)),
+    ];
+    evolutionCursor = page.next_before && page.next_before_id
+      ? { before: page.next_before, beforeId: page.next_before_id }
+      : null;
+    toggle(button, evolutionCursor !== null);
+    renderEvolutionList();
+  } catch (error) {
+    const empty = testId<HTMLElement>("evolution-empty");
+    toggle(empty, true);
+    empty.textContent = `读取更早事件失败：${errorDetail(error)}`;
+  } finally {
+    button.disabled = false;
+  }
+};
+
+testId<HTMLButtonElement>("evolution-more").addEventListener("click", () => void loadMoreEvolution());
 
 byId<HTMLInputElement>("evolution-filter-candidate").addEventListener("input", renderEvolutionList);
 byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", renderEvolutionList);

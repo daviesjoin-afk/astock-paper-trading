@@ -152,6 +152,15 @@ pub struct PaperValuation {
     pub reason: String,
 }
 
+/// One page of the evolution event log, newest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolutionEventPage {
+    pub events: Vec<EvolutionEventRecord>,
+    pub next_before: Option<String>,
+    pub next_before_id: Option<String>,
+    pub scanned: usize,
+}
+
 /// Version-independent identity of one research signal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalFingerprint {

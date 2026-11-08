@@ -24,6 +24,14 @@ test.beforeEach(async ({ request }) => {
   await ensureFixtures(request);
 });
 
+
+const pageOf = (list: unknown[], next?: { before: string; id: string }) => ({
+  events: list,
+  next_before: next?.before ?? null,
+  next_before_id: next?.id ?? null,
+  scanned: list.length,
+});
+
 const openEvolution = async (page: import("@playwright/test").Page) => {
   await page.goto(`/?cycle_id=${CYCLES.repro}#/evolution`);
   await expect(page.getByTestId("panel-evolution")).toBeVisible();
@@ -31,7 +39,7 @@ const openEvolution = async (page: import("@playwright/test").Page) => {
 
 test.describe("evolution history", () => {
   test("lists promotion and rejection events with reasons", async ({ page }) => {
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: events }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf(events) }));
     await openEvolution(page);
     const cards = page.getByTestId("evolution-events").locator("article");
     await expect(cards).toHaveCount(2);
@@ -43,7 +51,7 @@ test.describe("evolution history", () => {
   });
 
   test("filters narrow the log by candidate and status", async ({ page }) => {
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: events }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf(events) }));
     await openEvolution(page);
     await page.getByTestId("evolution-filter-status").selectOption("rejected");
     await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(1);
@@ -73,7 +81,7 @@ test.describe("evolution history", () => {
         digest: "a".repeat(64),
       },
     }));
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await openEvolution(page);
     await page.getByTestId("diff-base").fill("shadow-base-1");
     await page.getByTestId("diff-candidate").fill("shadow-candidate-1");
@@ -85,22 +93,50 @@ test.describe("evolution history", () => {
   });
 
   test("signal comparison needs both experiment ids", async ({ page }) => {
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await openEvolution(page);
     await page.getByTestId("diff-run").click();
     await expect(page.getByTestId("diff-error")).toContainText("请填写基准与候选实验 id");
     await expect(page.getByTestId("diff-result")).toBeHidden();
   });
 
+
+  test("loads older events through the cursor", async ({ page }) => {
+    await page.route(/\/v2\/evolution\/events/, (route) => {
+      const url = route.request().url();
+      if (url.includes("before=")) {
+        return route.fulfill({
+          json: pageOf([{
+            event_id: "evo-old",
+            candidate_id: "research-momentum-v1-older",
+            status: "kept",
+            decided_at: "2026-11-01T15:00:00+08:00",
+            decision: { reasons: ["保持：风险与优势均在阈值内"], digest: "e".repeat(64) },
+            digest: "f".repeat(64),
+          }]),
+        });
+      }
+      return route.fulfill({
+        json: pageOf(events, { before: "2026-11-04T15:00:00+08:00", id: "evo-2" }),
+      });
+    });
+    await openEvolution(page);
+    await expect(page.getByTestId("evolution-more")).toBeVisible();
+    await page.getByTestId("evolution-more").click();
+    await expect(page.getByTestId("evolution-event-evo-old")).toBeVisible();
+    await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(3);
+    await expect(page.getByTestId("evolution-more")).toBeHidden();
+  });
+
   test("an empty log explains itself", async ({ page }) => {
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await openEvolution(page);
     await expect(page.getByTestId("evolution-empty")).toBeVisible();
     await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(0);
   });
 
   test("the shortcut opens the evolution view", async ({ page }) => {
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: [] }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await page.goto(`/?cycle_id=${CYCLES.repro}`);
     await page.getByTestId("summary-strategy").waitFor();
     await page.keyboard.press("8");
@@ -110,7 +146,7 @@ test.describe("evolution history", () => {
 
   test("fits a 390px viewport", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: events }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf(events) }));
     await openEvolution(page);
     await expect(page.getByTestId("evolution-events").locator("article")).toHaveCount(2);
     const overflow = await page.evaluate(() =>

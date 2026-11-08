@@ -145,7 +145,7 @@ test.describe("screenshots", () => {
 
   test("evolution history", async ({ page }) => {
     await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({
-      json: [
+      json: { events: [
         {
           event_id: "evo-shot", candidate_id: "research-momentum-v1-ab12cd34",
           status: "promoted", decided_at: "2026-11-05T15:00:00+08:00",
@@ -158,7 +158,7 @@ test.describe("screenshots", () => {
           decision: { reasons: ["风险恶化：最大回撤 2000 bps 超过上限 1500 bps"], digest: "c".repeat(64) },
           digest: "d".repeat(64),
         },
-      ],
+      ], next_before: null, next_before_id: null, scanned: 2 },
     }));
     await page.goto(`/?cycle_id=${CYCLES.repro}#/evolution`);
     await page.getByTestId("evolution-event-evo-shot").waitFor();
