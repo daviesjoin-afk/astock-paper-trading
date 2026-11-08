@@ -99,6 +99,51 @@ class VerifyArchiveTest(unittest.TestCase):
             2,
         )
 
+    def clear_dir(self) -> None:
+        for path in self.dir.iterdir():
+            path.unlink(missing_ok=True)
 
+    def test_directory_mode_verifies_pairs(self) -> None:
+        self.clear_dir()
+        db = self.dir / "astock-2026-11.sqlite3"
+        make_db(db)
+        export = self.dir / "astock-2026-11.export.json"
+        make_export(export)
+        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 0)
+
+    def test_directory_mode_flags_missing_export(self) -> None:
+        self.clear_dir()
+        make_db(self.dir / "orphan.sqlite3")
+        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
+
+    def test_directory_mode_checks_sidecar_manifest(self) -> None:
+        self.clear_dir()
+        db = self.dir / "pair.sqlite3"
+        make_db(db)
+        export = self.dir / "pair.export.json"
+        make_export(export)
+        sidecar = self.dir / "pair.manifest.json"
+        sidecar.write_text(json.dumps({"manifest": "0" * 64}), encoding="utf-8")
+        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
 if __name__ == "__main__":
     unittest.main()
+
+    def test_directory_mode_verifies_pairs(self) -> None:
+        db = self.dir / "astock-2026-11.sqlite3"
+        make_db(db)
+        export = self.dir / "astock-2026-11.export.json"
+        make_export(export)
+        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 0)
+
+    def test_directory_mode_flags_missing_export(self) -> None:
+        make_db(self.dir / "orphan.sqlite3")
+        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
+
+    def test_directory_mode_checks_sidecar_manifest(self) -> None:
+        db = self.dir / "pair.sqlite3"
+        make_db(db)
+        export = self.dir / "pair.export.json"
+        make_export(export)
+        sidecar = self.dir / "pair.manifest.json"
+        sidecar.write_text(json.dumps({"manifest": "0" * 64}), encoding="utf-8")
+        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
