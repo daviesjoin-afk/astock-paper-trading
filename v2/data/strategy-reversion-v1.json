@@ -7,6 +7,6 @@
   "research_input_id": "offline-research-input-v1",
   "runtime_version": "python-3.13-stdlib",
   "schema_version": 2,
-  "source_digest": "aed1a0cae609952e6004153597ff8d3af46747a9ef76b54434aa5832d2f76e25",
+  "source_digest": "c10f982104acaa09be7374af1f2dc0903eae92f39b5e03e6f68c205bcfec2475",
   "strategy_version_id": "research-reversion-v1"
 }

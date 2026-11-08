@@ -1,7 +1,7 @@
 {
-  "algorithm_digest": "aed1a0cae609952e6004153597ff8d3af46747a9ef76b54434aa5832d2f76e25",
+  "algorithm_digest": "c10f982104acaa09be7374af1f2dc0903eae92f39b5e03e6f68c205bcfec2475",
   "algorithm_version": "research-signal-v1",
-  "content_digest": "9fd0f857019280e7ec05c8852bb7eac11bcc5bb7b3d66b270847cc58c7c0375d",
+  "content_digest": "61e37ef03aa2aa9e206c96097f2260d912af2537acced9254d7cf3d598692ac4",
   "parameters_digest": "afd38458954950fe449ffefac668ffde7fd27284d4dfca303e6ecba8f9272bfe",
   "research_input_digest": "beca60bbe45de282cf1c3a7f3a3b20f981fab56ad6104e701d376222da145fdf",
   "research_input_id": "offline-research-input-v1",

@@ -189,7 +189,8 @@ def build_output(strategy_version_id: str, artifact: dict, manifest, strategy) -
         "signal_id": signal_id(strategy_version_id, entry["sequence"], side),
         "source": entry["quote"]["source"],
         "symbol": entry["quote"]["symbol"],
-    } for entry, side in strategy.signals(manifest["entries"])]
+    } for entry, side in strategy.signals(
+        manifest["entries"], json.loads(artifact["parameters_canonical"]))]
     output = {
         "schema_version": SCHEMA_VERSION,
         "research_output_id": f"research-output-{strategy_version_id}",
