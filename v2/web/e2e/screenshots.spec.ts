@@ -134,6 +134,15 @@ test.describe("screenshots", () => {
     await capture(page, "account-create");
   });
 
+  test("session creation form", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.repro}&account=e2e-session-account#/account`);
+    await page.getByTestId("session-card-e2e-session").waitFor();
+    await page.getByTestId("session-create-toggle").click();
+    await page.getByTestId("session-create").waitFor();
+    await settle(page);
+    await capture(page, "session-create");
+  });
+
   test("shortcut reference", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("summary-strategy").waitFor();

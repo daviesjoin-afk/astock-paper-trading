@@ -292,6 +292,31 @@ python3 scripts/experiment_demo.py</code></pre>
               <div class="account-slots" id="account-slots" data-testid="account-slots"></div>
               <div class="compare-section account-sessions-section">
                 <h3>模拟会话</h3>
+                <div class="account-session-create">
+                  <button type="button" class="btn btn-quiet btn-small" id="session-create-toggle" data-testid="session-create-toggle">新建会话</button>
+                  <form class="account-session-form" id="session-create" data-testid="session-create" aria-label="从实验创建模拟会话" novalidate hidden>
+                    <label class="field">
+                      <span class="field-label">会话标识</span>
+                      <input id="session-id" data-testid="session-id" autocomplete="off" placeholder="例如 sess-001" />
+                    </label>
+                    <label class="field">
+                      <span class="field-label">槽位</span>
+                      <select id="session-slot" data-testid="session-slot">
+                        <option value="A">A</option>
+                        <option value="B">B</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span class="field-label">信号来源实验</span>
+                      <select id="session-cycle" data-testid="session-cycle"></select>
+                    </label>
+                    <div class="account-create-actions">
+                      <button type="submit" class="btn btn-small" id="session-submit" data-testid="session-submit">创建会话</button>
+                      <button type="button" class="btn btn-quiet btn-small" id="session-cancel" data-testid="session-cancel">取消</button>
+                    </div>
+                    <p class="hint" id="session-hint" data-testid="session-hint" hidden></p>
+                  </form>
+                </div>
                 <div class="account-sessions" id="account-sessions" data-testid="account-sessions"></div>
                 <p class="empty" data-testid="account-sessions-empty" hidden>这个账户还没有模拟会话。</p>
               </div>

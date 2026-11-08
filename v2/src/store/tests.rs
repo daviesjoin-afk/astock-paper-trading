@@ -2507,3 +2507,58 @@ fn paper_account_request_resolves_reviewed_strategies_by_id() {
     assert_eq!(catalogue.strategies.len(), 2);
     assert_eq!(catalogue.reserve_bps, 1_000);
 }
+
+#[test]
+fn paper_session_can_be_imported_from_an_experiment() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("import-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    realise_frozen_signals(&mut db, "cycle-1", &output);
+
+    let session = db
+        .create_paper_session_from_experiment(
+            "import-session",
+            "import-acct",
+            "cycle-1",
+            PaperSlotId::A,
+            None,
+        )
+        .unwrap();
+    assert_eq!(session.status, "created");
+    assert_eq!(session.total, output.signals.len());
+    assert_eq!(session.clock_at, "2026-10-30T00:00:00+08:00");
+
+    // The same experiment cannot feed a slot with a different strategy.
+    assert!(matches!(
+        db.create_paper_session_from_experiment("b-session", "import-acct", "cycle-1", PaperSlotId::B, None),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "paper_slot_strategy_mismatch"
+    ));
+    // An experiment without decisions cannot seed a session.
+    db.create_experiment(spec("empty-cycle", INITIAL_CASH_CENTS)).unwrap();
+    assert!(matches!(
+        db.create_paper_session_from_experiment("empty-session", "import-acct", "empty-cycle", PaperSlotId::A, None),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "paper_session_requires_signals"
+    ));
+    // A missing experiment is a distinct failure.
+    assert!(matches!(
+        db.create_paper_session_from_experiment("missing-session", "import-acct", "nope", PaperSlotId::A, None),
+        Err(StoreError::NotFound(_))
+    ));
+
+    // An explicit start instant is honoured, and the session runs the imported signals.
+    let explicit = db
+        .create_paper_session_from_experiment(
+            "explicit-session",
+            "import-acct",
+            "cycle-1",
+            PaperSlotId::A,
+            Some("2026-10-29T09:00:00+08:00".into()),
+        )
+        .unwrap();
+    assert_eq!(explicit.clock_at, "2026-10-29T09:00:00+08:00");
+    db.paper_session_action("explicit-session", "start").unwrap();
+    let run = db.run_paper_session("explicit-session").unwrap();
+    assert_eq!(run.steps, output.signals.len());
+    assert_eq!(run.session.status, "completed");
+    assert!(run.filled + run.rejected >= 1);
+}

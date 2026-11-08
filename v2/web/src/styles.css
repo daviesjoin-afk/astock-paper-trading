@@ -840,6 +840,16 @@ td:first-child { font-weight: 550; }
 .account-create input { min-width: 160px; max-width: 220px; }
 .account-create-actions { display: flex; gap: 8px; margin-left: auto; }
 
+/* ---------- session creation ---------- */
+.account-session-create { display: grid; gap: 10px; margin-bottom: 12px; }
+.account-session-form {
+  display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end;
+  padding: 12px 14px; border: 1px dashed var(--border);
+  border-radius: var(--radius); background: var(--surface);
+}
+.account-session-form input, .account-session-form select { min-width: 150px; max-width: 220px; }
+.account-session-form .hint { flex: 1 1 100%; margin: 0; }
+
 /* ---------- paper sessions ---------- */
 .account-sessions { display: grid; gap: 10px; }
 .account-session {

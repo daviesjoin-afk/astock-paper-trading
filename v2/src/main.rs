@@ -1,5 +1,5 @@
 //! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{ExperimentSpec, PaperAccountRequest, PaperOrderRequest, PaperSessionSpec, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
+use astock_v2::{domain::{ExperimentSpec, PaperAccountRequest, PaperOrderRequest, PaperSessionSpec, PaperSlotId, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
 use axum::{
     extract::{Path, Query, State}, http::StatusCode,
     routing::{get, post}, Json, Router,
@@ -130,6 +130,32 @@ async fn paper_orders(
     response(db.paper_orders(&account_id, 100).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct SessionFromExperiment {
+    session_id: String,
+    account_id: String,
+    cycle_id: String,
+    slot: PaperSlotId,
+    start_at: Option<String>,
+}
+
+async fn create_session_from_experiment(
+    State(state): State<Shared>,
+    Json(body): Json<SessionFromExperiment>,
+) -> ApiResult {
+    let mut db = state.lock().await;
+    response(
+        db.create_paper_session_from_experiment(
+            &body.session_id,
+            &body.account_id,
+            &body.cycle_id,
+            body.slot,
+            body.start_at,
+        )
+        .map_err(api_error)?,
+    )
+}
+
 async fn create_paper_session(
     State(state): State<Shared>,
     Json(spec): Json<PaperSessionSpec>,
@@ -224,6 +250,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(submit_paper_order).get(paper_orders),
         )
         .route("/v2/paper-sessions", post(create_paper_session).get(paper_sessions))
+        .route(
+            "/v2/paper-sessions/from-experiment",
+            post(create_session_from_experiment),
+        )
         .route("/v2/paper-sessions/{session_id}", get(paper_session))
         .route(
             "/v2/paper-sessions/{session_id}/{action}",
