@@ -116,6 +116,9 @@ form, no valuation.
 - Account advance: a date input plus “推进账户到该日” drives every running
   session on the account in one call (paused sessions stay paused); the status
   line reports steps/fills/rejections.
+- Run status: the account header shows session counts (running/paused/done),
+  loaded price-set count and the latest evolution event; any failed probe shows
+  “—”, never a stale number.
 - Allocation proposal: when at least two distinct days are known (trade days,
   else the account's inception day), the panel shows the proposed weights,
   reserve and per-slot rationale from /allocation-proposal, plus “执行再平衡”
