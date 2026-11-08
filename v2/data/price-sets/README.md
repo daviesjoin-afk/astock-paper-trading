@@ -57,6 +57,19 @@
 - 选择规则：`trust = reviewed` + 数据包匹配 + 覆盖请求日期（序列要求覆盖整段区间）；
 - 每次响应携带 `price_set_id` 与内容摘要，便于复核。
 
+## 离线生成
+
+原始 CSV（`symbol,day,price,source,observed_at`，价格为元）可用标准库脚本生成工件：
+
+```bash
+python v2/research/make_price_set.py   --input prices.csv --out data/price-sets/cn-close-2026-11.json   --report /tmp/report.json   --set-id cn-close-2026-11 --pack cn-offline-fixture-pack-1   --trust reviewed --coverage-start 2026-10-01 --coverage-end 2026-10-31   --symbols 600000.SH,000001.SZ   --days 2026-10-30,2026-11-02
+```
+
+- 价格转换为整数分，超过两位小数直接拒绝；
+- `source_digest` = 规范化行（排序后）的 SHA-256；
+- `--days` 给定时生成缺口报告；存在缺口默认**退出码 3 且不写工件**，`--allow-gaps` 才写入；
+- 重复 `(symbol, day)`、未声明标的、超出覆盖区间、空字段、非法日期均报错退出码 2。
+
 ## 合成数据
 
 `trust: "synthetic"` 的集合**永远不会**被用户估值选中，也不会产生盈亏字段；它只用于离线回归与文档示例。禁止把合成价格标成 `reviewed`。
