@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 一键验证脚本：新增 `v2/scripts/verify_all.sh`——按序运行 Rust 测试、研究测试、冒烟、浏览器（`--fast` 跳过）与泄露扫描（`--no-scan` 跳过），逐套件打印结果与耗时，任一失败退出 1；`--dry-run` 只列命令；`OPERATIONS.md`/README 增加入口。冒烟覆盖 dry-run 列表；实际 `--fast --no-scan` 全套通过。Rust 154 / Python 54 / 浏览器 128 不变。
 - V2 归档 manifest 侧车：`verify_archive.py --manifest-out` 在校验通过后写出清单（两文件 SHA-256、schema、事件数、合并 manifest），失败不写；`OPERATIONS.md` 补充；Python 研究套件 54 passed（+2：侧车写入/失败不写）；冒烟断言 sidecar 非空。Rust 154 / 浏览器 128 不变。
 - V2 会话切换时序保护：`create_paper_session` 拒绝起点早于该槽最后一次切换的会话（422 `session_starts_before_strategy_switch`），避免“创建成功但每条信号都被订单时序拒绝”的卡死会话；Rust 154 passed（早/晚两例）；冒烟/浏览器/研究不变。
 - V2 资金提案标注版本切换：提案计算窗口内发生切换的槽位，理由追加“历史绩效来自旧版本”并重算摘要（ADR-018 待解问题 2 结案）；权重算法与边界不变。Rust 153 passed（同用例扩展断言：B 标注、A 不标注、摘要变化）；冒烟/浏览器/研究不变。

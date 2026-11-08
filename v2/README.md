@@ -243,6 +243,7 @@ live trading or news learning.
 
 ```bash
 # from v2/
+bash scripts/verify_all.sh            # everything, one summary
 cargo +1.99.1-x86_64-pc-windows-gnu test --locked
 bash scripts/smoke.sh
 python -m unittest discover -s research -p 'test_*.py'
