@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 估值核心（ADR 006 实现）：新增纯域 `PriceSet` / `PriceEntry` / `AccountValuation` 与 `value_account()`——校验价格集合版本、`reviewed|synthetic` 信任级别、覆盖区间、重复条目与非法价格；按 as_of 日为每个持仓取价，任一持仓缺价或数据包不匹配即整体拒绝（`valuation_missing_symbol` / `valuation_pack_mismatch` / `valuation_day_outside_price_set`）；`reviewed` 才输出 `profit_cents`，`synthetic` 永远为 `None`。`Store::paper_valuation_with_set()` 从槽位成交派生持仓并汇出现金/权益。HTTP 仍只返回 `unavailable`（尚无审核价格集合），正向逻辑由单元测试覆盖。Rust 124 passed。
 - V2 估值契约（ADR 006 起步）：新增 `GET /v2/paper-accounts/{id}/valuation?as_of_day=`，在缺少审核价格集合时只返回 `unavailable + no_reviewed_price_set` 与需求清单（槽位、数据包、需覆盖标的）、`priced_symbols=0` 和 canonical 摘要，绝不包含市值/净值/盈亏字段；非法日期 422、账户缺失 404。前端账户页显示“估值快照（截至 X）：不可用 · 缺少 reviewed_price_set · 需要 600000.SH（离线样本包）”。Rust 123 passed（新增估值拒绝、字段缺失、确定性、错误码）；浏览器 98 passed（账户页展示需求明细）。
 - V2 按日推进与估值占位（ADR 005）：新增 `POST /v2/paper-sessions/{id}/advance {day}`，只执行中国日 ≤ day 的信号，间隔日不前移，非法日期拒绝；`PaperAccountView` 增加 `valuation {status:"unavailable", reason:"no_reviewed_price_set"}`，账户页显示估值不可用提示，明确不计算市值/净值/收益；运行中的会话卡新增“推进到该日”控件。测试：Rust 122 passed（按日推进 + 估值占位）；浏览器 98 passed（新增推进用例与估值断言）。
 - V2 从实验导入模拟会话（ADR 005）：新增 `POST /v2/paper-sessions/from-experiment`（会话 id + 账户 + 槽位 + 可选起始时刻），把实验已存决策按 id 顺序冻结为会话信号；校验槽位策略/数据包/执行规则一致，缺省起点取首条决策的中国日 00:00，空实验拒绝；控制台新增“新建会话”表单（槽位过滤可用实验、无匹配时禁用并提示）。测试：Rust 121 passed（导入、策略不匹配、空实验、缺失实验、显式起点）；浏览器新增 4 项（导入并运行、无匹配实验、缺会话 id 零请求、390px），合计 97 passed；会话控制测试改用每用例独立账户避免槽位顺序干扰。
