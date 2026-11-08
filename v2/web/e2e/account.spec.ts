@@ -48,9 +48,9 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-exposure-breaches")).toContainText("无集中度超限");
     await page.getByTestId("account-audit-details").locator("summary").click();
     const checks = page.getByTestId("account-audit-checks").locator("li");
-    await expect(checks).toHaveCount(8);
+    await expect(checks).toHaveCount(9);
     await expect(checks.first()).toContainText("budget_split");
-    await expect(checks.last()).toContainText("rebalance_chain");
+    await expect(checks.last()).toContainText("switch_chain");
 
     const orders = page.getByTestId("account-orders").locator("tr");
     await expect(orders).toHaveCount(1);

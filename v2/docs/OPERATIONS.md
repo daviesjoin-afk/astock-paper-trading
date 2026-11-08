@@ -38,6 +38,14 @@
 - 请求失败（HTTP 非 2xx）退出码 3；
 - 成功输出 `advanced account=… day=… sessions=… steps=… filled=… rejected=…`，可直接作为调度日志。
 
+查看槽位策略版本切换链（只读）：
+
+```bash
+curl -fsS "http://127.0.0.1:8765/v2/paper-accounts/paper-001/strategy-switches?slot=A"
+```
+
+返回按生效时间升序的追加记录；空数组表示该槽仍使用创建时的版本。
+
 归档进化事件（只读导出，含 canonical 摘要）：
 
 ```bash

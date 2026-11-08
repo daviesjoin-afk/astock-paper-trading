@@ -87,6 +87,9 @@ pub struct ReplayReport {
 pub struct PaperSlotView {
     pub slot: String,
     pub strategy_version_id: String,
+    /// Version after applying the switch chain (equals the spec version when empty).
+    pub current_strategy_version_id: String,
+    pub switch_count: i64,
     pub research_input_id: String,
     pub market_data_pack_id: String,
     pub execution_policy_version: String,
@@ -95,6 +98,19 @@ pub struct PaperSlotView {
     pub cash_cents: i64,
     pub positions: Vec<PositionView>,
     pub orders_total: i64,
+}
+
+/// One append-only strategy-version switch on a paper slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategySwitchRecord {
+    pub switch_id: String,
+    pub account_id: String,
+    pub slot: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub effective_from: String,
+    pub reason: String,
+    pub digest: String,
 }
 
 /// One user-funded paper account with two frozen strategy slots.
@@ -505,7 +521,7 @@ impl Store {
 
     fn with_connection(mut conn: Connection) -> StoreResult<Self> {
         const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 14;
+        const SCHEMA_VERSION: i64 = 15;
         // Everything above the acceptance boundary is read-only. In particular,
         // journal_mode, CREATE, metadata writes and transactions must wait.
         let objects: Vec<(String, String, String)> = conn.prepare(
@@ -538,6 +554,7 @@ impl Store {
                 ("v2_paper_sessions", &["session_id", "account_id", "spec_json", "status", "clock_at", "cursor", "last_order_id"]),
                 ("v2_paper_transfers", &["id", "account_id", "from_slot", "to_slot", "amount_cents", "applied_at", "note", "digest", "weights_before_json", "weights_after_json"]),
                 ("v2_evolution_events", &["event_id", "candidate_id", "status", "decision_json", "decided_at", "digest", "base_cycle", "candidate_cycle"]),
+            ("v2_paper_slot_switches", &["switch_id", "account_id", "slot", "from_version", "to_version", "effective_from", "reason", "digest"]),
             ];
             for (kind, name, table) in &objects {
                 let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
@@ -669,6 +686,16 @@ impl Store {
                     weights_before_json TEXT NOT NULL,
                     weights_after_json TEXT NOT NULL,
                     UNIQUE(account_id, digest)
+                );
+                CREATE TABLE v2_paper_slot_switches (
+                    switch_id TEXT PRIMARY KEY NOT NULL,
+                    account_id TEXT NOT NULL,
+                    slot TEXT NOT NULL,
+                    from_version TEXT NOT NULL,
+                    to_version TEXT NOT NULL,
+                    effective_from TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    digest TEXT NOT NULL
                 );
                 CREATE TABLE v2_evolution_events (
                     event_id TEXT PRIMARY KEY NOT NULL,
@@ -1275,6 +1302,152 @@ impl Store {
         Ok(state)
     }
 
+    /// Append-only switch chain for one slot, oldest first.
+    pub(crate) fn slot_switches(
+        conn: &Connection,
+        account_id: &str,
+        slot: &str,
+    ) -> StoreResult<Vec<StrategySwitchRecord>> {
+        let mut statement = conn.prepare(
+            "SELECT switch_id,account_id,slot,from_version,to_version,effective_from,reason,digest
+             FROM v2_paper_slot_switches WHERE account_id=? AND slot=?
+             ORDER BY effective_from ASC, switch_id ASC",
+        )?;
+        let rows = statement.query_map(params![account_id, slot], |row| {
+            Ok(StrategySwitchRecord {
+                switch_id: row.get(0)?,
+                account_id: row.get(1)?,
+                slot: row.get(2)?,
+                from_version: row.get(3)?,
+                to_version: row.get(4)?,
+                effective_from: row.get(5)?,
+                reason: row.get(6)?,
+                digest: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Record one explicit strategy-version switch (no money moves).
+    pub fn record_strategy_switch(
+        &mut self,
+        account_id: &str,
+        slot: crate::domain::PaperSlotId,
+        to_version: &str,
+        effective_from: &str,
+        reason: &str,
+        switch_id: &str,
+    ) -> StoreResult<StrategySwitchRecord> {
+        let valid_id = !switch_id.is_empty()
+            && switch_id.len() <= 128
+            && switch_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.:@".contains(c));
+        if !valid_id {
+            return Err(StoreError::Rules(RuleError("invalid_switch_id".into())));
+        }
+        if reason.trim().is_empty() || reason.len() > 500 {
+            return Err(StoreError::Rules(RuleError("invalid_switch_reason".into())));
+        }
+        if to_version.trim().is_empty() {
+            return Err(StoreError::Rules(RuleError("empty_strategy_version".into())));
+        }
+        let at = chrono::DateTime::parse_from_rfc3339(effective_from)
+            .map_err(|_| StoreError::Rules(RuleError("invalid_switch_time".into())))?;
+
+        let raw: String = self.conn.query_row(
+            "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let slot_spec = spec
+            .slots
+            .iter()
+            .find(|entry| entry.slot == slot)
+            .ok_or_else(|| StoreError::Rules(RuleError("unknown_paper_slot".into())))?;
+
+        let chain = Self::slot_switches(&self.conn, account_id, slot.as_str())?;
+        if let Some(record) = chain.iter().find(|record| record.switch_id == switch_id) {
+            let same = record.to_version == to_version
+                && record.effective_from == effective_from
+                && record.reason == reason;
+            if same {
+                return Ok(record.clone());
+            }
+            return Err(StoreError::Conflict("strategy_switch_conflict".into()));
+        }
+        let current = chain
+            .last()
+            .map(|record| record.to_version.clone())
+            .unwrap_or_else(|| slot_spec.strategy.strategy_version_id.clone());
+        if current == to_version {
+            return Err(StoreError::Rules(RuleError("strategy_version_unchanged".into())));
+        }
+        if let Some(last) = chain.last() {
+            let last_at = chrono::DateTime::parse_from_rfc3339(&last.effective_from)
+                .map_err(|_| StoreError::Integrity("stored_switch_time_invalid".into()))?;
+            if at <= last_at {
+                return Err(StoreError::Rules(RuleError("switch_time_not_monotonic".into())));
+            }
+        }
+
+        let mut record = StrategySwitchRecord {
+            switch_id: switch_id.into(),
+            account_id: account_id.into(),
+            slot: slot.as_str().into(),
+            from_version: current,
+            to_version: to_version.into(),
+            effective_from: effective_from.into(),
+            reason: reason.into(),
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&record)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        record.digest = crate::domain::canonical_digest(&value);
+
+        self.conn.execute(
+            "INSERT INTO v2_paper_slot_switches(switch_id,account_id,slot,from_version,to_version,effective_from,reason,digest)
+             VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                record.switch_id,
+                record.account_id,
+                record.slot,
+                record.from_version,
+                record.to_version,
+                record.effective_from,
+                record.reason,
+                record.digest,
+            ],
+        )?;
+        Ok(record)
+    }
+
+    /// Read the switch chain for one slot, or all slots when `slot` is None.
+    pub fn strategy_switches(
+        &self,
+        account_id: &str,
+        slot: Option<crate::domain::PaperSlotId>,
+    ) -> StoreResult<Vec<StrategySwitchRecord>> {
+        match slot {
+            Some(slot) => Self::slot_switches(&self.conn, account_id, slot.as_str()),
+            None => {
+                let mut records = Vec::new();
+                for slot in [crate::domain::PaperSlotId::A, crate::domain::PaperSlotId::B] {
+                    records.extend(Self::slot_switches(&self.conn, account_id, slot.as_str())?);
+                }
+                records.sort_by(|left, right| {
+                    left.effective_from
+                        .cmp(&right.effective_from)
+                        .then(left.switch_id.cmp(&right.switch_id))
+                });
+                Ok(records)
+            }
+        }
+    }
+
     fn paper_account_view_with_conn(
         conn: &Connection,
         spec: &crate::domain::PaperAccountSpec,
@@ -1291,10 +1464,17 @@ impl Store {
                 params![spec.account_id, slot.slot.as_str()],
                 |row| row.get(0),
             )?;
+            let switches = Self::slot_switches(conn, &spec.account_id, slot.slot.as_str())?;
+            let current_strategy_version_id = switches
+                .last()
+                .map(|record| record.to_version.clone())
+                .unwrap_or_else(|| slot.strategy.strategy_version_id.clone());
             cash_cents += state.cash_cents;
             slots.push(PaperSlotView {
                 slot: slot.slot.as_str().into(),
                 strategy_version_id: slot.strategy.strategy_version_id.clone(),
+                current_strategy_version_id,
+                switch_count: switches.len() as i64,
                 research_input_id: slot.strategy.research_input_id.clone(),
                 market_data_pack_id: slot.market_data_pack_id.clone(),
                 execution_policy_version: slot.execution_policy_version.clone(),

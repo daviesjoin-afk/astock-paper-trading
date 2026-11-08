@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 策略切换读路径（schema v15，ADR-018 部分实现）：新增 `v2_paper_slot_switches` 与 `record_strategy_switch`（版本连续/幂等/时间单调/理由必填/canonical 摘要）、只读 `GET /v2/paper-accounts/{id}/strategy-switches`、槽位视图 `current_strategy_version_id` 与 `switch_count`、审计第 9 项 `switch_chain`（末项）；HTTP 写端点与会话/订单随动校验留待下一步。Rust 152 passed（链/幂等/冲突/时间/审计）；冒烟升级 v15 并校验空链与审计项。
 - V2 账户绩效提示：账户页新增一行绩效摘要（收益/收益率/回撤/费用/成交笔数/天数），数据来自 `/v2/paper-accounts/{id}/performance`；缺审核覆盖时整行隐藏，不补零。浏览器 125 passed（+2：有覆盖/缺覆盖）；Rust 151 / Python 48 不变。
 - V2 价格集合面板：实验信息页新增目录列表（id/trust/数据包/覆盖区间/条数/摘要前缀）与覆盖核对器（数据包+标的+交易日 → 覆盖对数与缺口，缺口警告色，空输入内联提示）；浏览器 123 passed（+2 目录/核对与空目录/必填）；Rust 151 / Python 48 不变。
 - V2 策略切换设计（ADR-018，提议）：明确“追加式切换记录 + 槽位当前版本由链推导”，禁止改写历史；规定数据表 `v2_paper_slot_switches`、写入约束（已审核版本、生效时刻晚于最后会话、幂等）、审计 `switch_chain`、会话按创建时版本固定、回退即反向记录；并列出非目标与待解问题。README ADR 索引同步。

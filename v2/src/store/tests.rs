@@ -2928,7 +2928,7 @@ fn account_audit_balances_and_detects_tampering() {
     let report = db.paper_account_audit("audit-acct").unwrap();
     assert!(report.ok, "checks: {:?}", report.checks);
     let names: Vec<&str> = report.checks.iter().map(|check| check.name.as_str()).collect();
-    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link", "session_signals", "rebalance_chain"]);
+    assert_eq!(names, vec!["budget_split", "fills_replay", "capital_conservation", "order_fill_link", "fill_matches_outcome", "session_link", "session_signals", "rebalance_chain", "switch_chain"]);
     assert_eq!(report.digest.len(), 64);
     assert_eq!(report, db.paper_account_audit("audit-acct").unwrap());
 
@@ -4228,4 +4228,98 @@ fn evolution_export_bundles_filtered_events_with_a_digest() {
     assert_eq!(empty.count, 0);
     assert!(empty.events.is_empty());
     assert_eq!(empty.digest.len(), 64);
+}
+
+#[test]
+fn strategy_switches_are_append_only_and_audited() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("switch-acct", 10_000_000)).unwrap();
+
+    let view = db.paper_account("switch-acct").unwrap();
+    assert_eq!(view.slots[0].current_strategy_version_id, view.slots[0].strategy_version_id);
+    assert_eq!(view.slots[0].switch_count, 0);
+    assert!(db.strategy_switches("switch-acct", None).unwrap().is_empty());
+
+    let first = db
+        .record_strategy_switch(
+            "switch-acct",
+            PaperSlotId::A,
+            "research-momentum-v2",
+            "2026-11-06T09:00:00+08:00",
+            "promoted by ADR-012 decision",
+            "switch-1",
+        )
+        .unwrap();
+    assert_eq!(first.from_version, view.slots[0].strategy_version_id);
+    assert_eq!(first.to_version, "research-momentum-v2");
+    assert_eq!(first.digest.len(), 64);
+
+    let view = db.paper_account("switch-acct").unwrap();
+    assert_eq!(view.slots[0].current_strategy_version_id, "research-momentum-v2");
+    assert_eq!(view.slots[0].switch_count, 1);
+    assert_eq!(db.strategy_switches("switch-acct", Some(PaperSlotId::A)).unwrap().len(), 1);
+    assert!(db.paper_account_audit("switch-acct").unwrap().ok);
+
+    // Idempotent replay returns the stored record; a different payload conflicts.
+    let replay = db
+        .record_strategy_switch(
+            "switch-acct",
+            PaperSlotId::A,
+            "research-momentum-v2",
+            "2026-11-06T09:00:00+08:00",
+            "promoted by ADR-012 decision",
+            "switch-1",
+        )
+        .unwrap();
+    assert_eq!(replay.digest, first.digest);
+    assert!(matches!(
+        db.record_strategy_switch(
+            "switch-acct",
+            PaperSlotId::A,
+            "research-momentum-v3",
+            "2026-11-06T09:00:00+08:00",
+            "different",
+            "switch-1",
+        ),
+        Err(StoreError::Conflict(ref code)) if code == "strategy_switch_conflict"
+    ));
+
+    // Same version, earlier time and second identical step are all refused.
+    assert!(matches!(
+        db.record_strategy_switch(
+            "switch-acct",
+            PaperSlotId::A,
+            "research-momentum-v2",
+            "2026-11-07T09:00:00+08:00",
+            "no change",
+            "switch-2",
+        ),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "strategy_version_unchanged"
+    ));
+    let second = db
+        .record_strategy_switch(
+            "switch-acct",
+            PaperSlotId::A,
+            "research-momentum-v1",
+            "2026-11-07T09:00:00+08:00",
+            "rollback after drawdown breach",
+            "switch-2",
+        )
+        .unwrap();
+    assert_eq!(second.from_version, "research-momentum-v2");
+    assert_eq!(db.strategy_switches("switch-acct", None).unwrap().len(), 2);
+    assert!(matches!(
+        db.record_strategy_switch(
+            "switch-acct",
+            PaperSlotId::A,
+            "research-momentum-v3",
+            "2026-11-06T09:00:00+08:00",
+            "time travel",
+            "switch-3",
+        ),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "switch_time_not_monotonic"
+    ));
+    let audit = db.paper_account_audit("switch-acct").unwrap();
+    let chain = audit.checks.iter().find(|check| check.name == "switch_chain").unwrap();
+    assert!(chain.ok, "{chain:?}");
 }

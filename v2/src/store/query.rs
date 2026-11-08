@@ -757,7 +757,6 @@ impl Store {
             .split_with_weights(weights)
             .map_err(StoreError::Rules)?;
         let view = self.paper_account(account_id)?;
-
         let mut checks = Vec::new();
 
         // 1. Budgets are exactly the split of the initial capital at current weights.
@@ -998,6 +997,36 @@ impl Store {
             name: "rebalance_chain".into(),
             ok: chain_ok,
             detail: if chain_ok { "rebalance weights chain consistent".into() } else { chain_detail.join("; ") },
+        });
+
+        // 0. The strategy switch chain is continuous per slot.
+        let mut switches_ok = true;
+        let mut switches_detail = Vec::new();
+        for slot in &spec.slots {
+            let chain = Store::slot_switches(&self.conn, account_id, slot.slot.as_str())?;
+            let mut running = slot.strategy.strategy_version_id.clone();
+            for record in &chain {
+                if record.from_version != running {
+                    switches_ok = false;
+                    switches_detail.push(format!(
+                        "{} break: {} != {}",
+                        record.switch_id, record.from_version, running
+                    ));
+                }
+                running = record.to_version.clone();
+            }
+            if !switches_ok {
+                break;
+            }
+        }
+        checks.push(PaperAuditCheck {
+            name: "switch_chain".into(),
+            ok: switches_ok,
+            detail: if switches_ok {
+                "switch chain continuous".into()
+            } else {
+                switches_detail.join("; ")
+            },
         });
 
         let ok = checks.iter().all(|check| check.ok);
