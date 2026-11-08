@@ -237,6 +237,31 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("overview-e2e-session-account")).toHaveAttribute("data-state", "active");
   });
 
+  test("states whether reviewed prices cover the held symbols", async ({ page }) => {
+    let coverageUrl = "";
+    await page.route(/\/v2\/price-sets\/coverage\?/, (route) => {
+      coverageUrl = route.request().url();
+      return route.fulfill({
+        json: {
+          pack_id: "cn-offline-fixture-pack-1",
+          symbols: ["600000.SH"], days: ["2026-10-30", "2026-11-08"],
+          covered_pairs: 0,
+          missing: [
+            { symbol: "600000.SH", day: "2026-10-30" },
+            { symbol: "600000.SH", day: "2026-11-08" },
+          ],
+          digest: "a".repeat(64),
+        },
+      });
+    });
+    await openAccount(page);
+    await expect(page.getByTestId("account-coverage")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("account-coverage")).toContainText("价格覆盖：0/2");
+    await expect(page.getByTestId("account-coverage")).toContainText("600000.SH@2026-10-30");
+    await expect(page.getByTestId("account-coverage")).toHaveAttribute("data-state", "gap");
+    expect(coverageUrl).toContain("symbols=600000.SH");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();

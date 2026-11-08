@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 覆盖提示界面：账户页新增价格覆盖行——用持仓标的与已知交易日调用 `/v2/price-sets/coverage`，显示“完整 n/n”或“x/y · 缺口 标的@日期”（最多 4 项 + 计数），缺口以警告色呈现；无持仓或无交易日时隐藏。浏览器 119 passed（+1 覆盖断言含请求参数）；Rust 146 / Python 44 不变。
 - V2 价格覆盖报告：新增 `GET /v2/price-sets/coverage?pack_id=&symbols=&days=`——按 `(symbol, day)` 列出已覆盖对数与缺口清单（仅 reviewed 集合，合成数据忽略），空请求拒绝，附 canonical 摘要；`OPERATIONS.md` 增加发布前核对步骤。Rust 146 passed（覆盖/缺口/合成排除/空请求）；冒烟覆盖空目录全缺口；Python 44 / 浏览器 118 不变。
 - V2 审核覆盖日窗口：新增 `GET /v2/price-sets/days?pack_id=&symbol=`（仅 reviewed 集合的去重排序交易日）与 `weekly_review.py --days-from-pack/--symbol`——用覆盖日自动切窗，无覆盖退出 2；两种模式互斥校验。Rust 145 passed（覆盖日/合成排除/未知标的）；Python 研究套件 44 passed（+2：覆盖日路径/缺 symbol）；冒烟覆盖空覆盖 → 退出 2；浏览器 118 不变。
 - V2 窗口自动切分：`weekly_review.py` 新增 `--days/--window-size`——把显式交易日切分为连续完整窗口（丢弃不足一窗的尾部，窗口大小非法或天数不足退出 2），与 `--windows` 互斥使用；`OPERATIONS.md` 增加用法。Python 研究套件 42 passed（+2 切分/自动模式）；冒烟覆盖自动窗口路径；Rust 144 / 浏览器 118 不变。

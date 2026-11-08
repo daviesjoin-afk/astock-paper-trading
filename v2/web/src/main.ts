@@ -1424,6 +1424,28 @@ const sessionAction = async (sessionId: string, action: string): Promise<void> =
   }
 };
 
+const renderCoverage = (report: CoverageReport | null): void => {
+  const line = testId<HTMLElement>("account-coverage");
+  if (!report || report.symbols.length === 0 || report.days.length === 0) {
+    toggle(line, false);
+    return;
+  }
+  toggle(line, true);
+  const total = report.symbols.length * report.days.length;
+  if (report.missing.length === 0) {
+    line.textContent = `价格覆盖：完整（${report.covered_pairs}/${total}）· ${report.pack_id}`;
+    line.dataset.state = "ok";
+    return;
+  }
+  const missing = report.missing
+    .slice(0, 4)
+    .map((item) => `${item.symbol}@${item.day}`)
+    .join("、");
+  const suffix = report.missing.length > 4 ? ` 等 ${report.missing.length} 项` : "";
+  line.textContent = `价格覆盖：${report.covered_pairs}/${total} · 缺口 ${missing}${suffix}`;
+  line.dataset.state = "gap";
+};
+
 const renderExposure = (exposure: AccountExposure | null): void => {
   const block = testId<HTMLElement>("account-exposure");
   if (!exposure) {
@@ -1677,6 +1699,25 @@ const loadAccount = async (accountId: string): Promise<void> => {
       }
     } else {
       renderAllocation(null);
+    }
+    const heldSymbols = Array.from(new Set(
+      (lastAccountView?.slots ?? []).flatMap((slot) =>
+        slot.positions.map((position) => position.symbol)),
+    )).sort();
+    if (heldSymbols.length > 0 && days.length > 0 && lastAccountView) {
+      try {
+        const coverage = await api<CoverageReport>(
+          `/v2/price-sets/coverage?pack_id=${encodeURIComponent(lastAccountView.slots[0].market_data_pack_id)}` +
+          `&symbols=${encodeURIComponent(heldSymbols.join(","))}` +
+          `&days=${encodeURIComponent(days.join(","))}`,
+          new AbortController().signal,
+        );
+        if (currentAccountId === accountId) renderCoverage(coverage);
+      } catch {
+        if (currentAccountId === accountId) renderCoverage(null);
+      }
+    } else {
+      renderCoverage(null);
     }
     try {
       const exposure = await api<AccountExposure>(
@@ -2162,6 +2203,13 @@ byId<HTMLInputElement>("evolution-filter-candidate").addEventListener("input", r
 byId<HTMLSelectElement>("evolution-filter-status").addEventListener("change", renderEvolutionList);
 
 testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
+
+type CoverageReport = {
+  pack_id: string; symbols: string[]; days: string[];
+  covered_pairs: number;
+  missing: Array<{ symbol: string; day: string }>;
+  digest: string;
+};
 
 type AccountOverviewRow = {
   account_id: string; initial_cash_cents: number; cash_cents: number; reserve_cents: number;
