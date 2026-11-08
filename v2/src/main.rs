@@ -17,6 +17,7 @@ fn api_error(error: StoreError) -> (StatusCode, Json<Value>) {
         StoreError::Conflict(message) => (StatusCode::CONFLICT, message),
         StoreError::Rules(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.0),
         StoreError::Integrity(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
+        StoreError::NotFound(error) => (StatusCode::NOT_FOUND, error),
         StoreError::Database(error) => {
             eprintln!("V2 storage failure: {error}");
             (StatusCode::INTERNAL_SERVER_ERROR, "storage_error".into())
@@ -86,6 +87,19 @@ async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -
     response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct ListQuery {
+    limit: Option<i64>,
+}
+
+/// Read-only catalogue for the experiment picker: no write path, no derived
+/// metrics, no "latest" shortcut. Ordering is the Store's stable cycle_id order.
+async fn list_experiments(State(state): State<Shared>, Query(query): Query<ListQuery>) -> ApiResult {
+    let db = state.lock().await;
+    let catalogue = db.experiments(query.limit.unwrap_or(200)).map_err(api_error)?;
+    response(catalogue)
+}
+
 async fn create_experiment(State(state): State<Shared>, Json(spec): Json<ExperimentSpec>) -> ApiResult {
     response(state.lock().await.create_experiment(spec).map_err(api_error)?)
 }
@@ -106,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always local-only. No network exposure, broker or real-money endpoints.
     let app = Router::new()
         .route("/v2/health", get(health))
-        .route("/v2/experiments", post(create_experiment))
+        .route("/v2/experiments", post(create_experiment).get(list_experiments))
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/experiments/{cycle_id}", get(experiment))
         .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))

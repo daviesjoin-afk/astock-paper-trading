@@ -1903,3 +1903,58 @@ fn frozen_research_input_registration_is_immutable_and_tamper_proof() {
         assert_eq!(disk_snapshot(&file), before);
     }
 }
+
+#[test]
+fn experiment_catalogue_lists_stored_facts_without_writing() {
+    let file = DiskDatabase::new();
+    {
+        let mut db = test_open(file.path(), INITIAL_CASH_CENTS).unwrap();
+        db.create_experiment(spec("aaa-alpha", 5_000_000)).unwrap();
+        db.create_experiment(spec("zzz-omega", 7_000_000)).unwrap();
+        ingest_and_submit(&mut db, request("2026-10-30", "catalogue-run", Side::Buy));
+        let catalogue = db.experiments(100).unwrap();
+        assert_eq!(catalogue.total, 3);
+        assert_eq!(catalogue.skipped, 0);
+        let listed = &catalogue.experiments;
+        let cycles: Vec<&str> = listed.iter().map(|row| row.cycle_id.as_str()).collect();
+        assert_eq!(cycles, vec!["aaa-alpha", "cycle-1", "zzz-omega"], "stable cycle_id order");
+        let cycle = listed.iter().find(|row| row.cycle_id == "cycle-1").unwrap();
+        assert_eq!(cycle.status, ExperimentStatus::Active);
+        assert_eq!(cycle.strategy_version_id, "research-momentum-v1");
+        assert_eq!(cycle.research_input_id, "offline-research-input-v1");
+        assert_eq!(cycle.market_data_pack_id, MARKET_DATA_PACK_ID);
+        assert_eq!(cycle.execution_policy_version, POLICY_VERSION);
+        assert_eq!(cycle.initial_cash_cents, INITIAL_CASH_CENTS);
+        assert_eq!(cycle.runs_total, 1);
+        // Read-only: listing never changes the ledger, and limits are clamped.
+        let replay = db.verify_replay("cycle-1").unwrap();
+        assert_eq!(db.experiments(1).unwrap().experiments.len(), 1);
+        assert_eq!(db.experiments(0).unwrap().experiments.len(), 1);
+        assert_eq!(db.experiments(10_000).unwrap().experiments.len(), 3);
+        assert_eq!(db.verify_replay("cycle-1").unwrap(), replay);
+        db.complete_experiment("aaa-alpha").unwrap();
+        let completed = db.experiments(100).unwrap();
+        assert_eq!(completed.experiments[0].status, ExperimentStatus::Completed);
+    }
+    let db = Store::open(file.path()).unwrap();
+    let reopened = db.experiments(100).unwrap();
+    assert_eq!(reopened.experiments.len(), 3);
+    assert!(reopened.experiments.iter().all(|row| row.initial_cash_cents > 0));
+}
+
+#[test]
+fn one_unreadable_experiment_row_does_not_hide_the_rest() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_experiment(spec("aaa", 5_000_000)).unwrap();
+    db.create_experiment(spec("zzz", 7_000_000)).unwrap();
+    db.conn.execute("UPDATE v2_experiments SET spec_json='{}' WHERE cycle_id='aaa'", []).unwrap();
+    let catalogue = db.experiments(100).unwrap();
+    assert_eq!(catalogue.total, 3);
+    assert_eq!(catalogue.skipped, 1);
+    let cycles: Vec<&str> = catalogue.experiments.iter().map(|row| row.cycle_id.as_str()).collect();
+    assert_eq!(cycles, vec!["cycle-1", "zzz"]);
+    // The rest of the read models still work for readable experiments.
+    assert_eq!(db.verify_replay("cycle-1").unwrap().runs_verified, 0);
+    // A missing experiment is a distinct, non-integrity failure now.
+    assert!(matches!(db.experiment("nope"), Err(StoreError::NotFound(_))));
+}

@@ -46,6 +46,42 @@ jobs:
       - run: python -m unittest discover -s v2/research -p 'test_*.py' -v
       - run: python v2/research/worker.py --output /tmp/v2-fixture.json
 
+  web-e2e:
+    runs-on: ubuntu-latest
+    needs: [rust-kernel, research-contract]
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Build the kernel the browser tests drive
+        run: cargo build --release --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install web dependencies and the pinned Chromium
+        working-directory: v2/web
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Build the read-only dashboard served by the preview server
+        working-directory: v2/web
+        run: npm run build
+      - name: Browser interaction, race, failure and safety tests
+        working-directory: v2/web
+        env:
+          ASTOCK_V2_BIN: ${{ github.workspace }}/v2/target/release/astock-v2
+        run: npx playwright test
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-web-e2e-report
+          path: v2/web/playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore
+
   web-ui:
     runs-on: ubuntu-latest
     defaults:

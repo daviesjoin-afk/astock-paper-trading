@@ -110,7 +110,10 @@ For the web UI:
 ```bash
 cd v2/web
 npm ci
-npm run dev
+npm run dev                 # http://127.0.0.1:5174
+npm run build               # type-check + production build
+npx playwright install chromium
+npx playwright test         # real browser: selection, race, failures, XSS, axe
 ```
 
 Open http://127.0.0.1:5174/?cycle_id=pack-experiment-A (or pack-experiment-B). The dev server proxies `/v2` to the Rust API.
@@ -147,6 +150,10 @@ The read-only V2 UI never touches a V1 endpoint.
   no HTTP pack registration or upload route.
   Same experiment ID with different parameters or strategy ID with different research
   input returns 409. GET /v2/experiments/{cycle_id} reads these references.
+- GET /v2/experiments is a read-only catalogue for the dashboard picker: stored
+  cycle id, status, strategy and data-pack identity, initial cash and decision
+  count. It clamps the limit, skips unreadable rows instead of failing the whole
+  list, and never writes.
 - POST /v2/experiments/{cycle_id}/complete verifies the ledger then freezes new
   submissions. Exact retries remain idempotent; it cannot be reactivated.
 - GET /v2/experiments/{cycle_id}/research-reproduction proves the stored decisions

@@ -15,6 +15,7 @@ pub enum StoreError {
     Rules(RuleError),
     Conflict(String),
     Integrity(String),
+    NotFound(String),
 }
 
 impl fmt::Display for StoreError {
@@ -25,6 +26,7 @@ impl fmt::Display for StoreError {
             Self::Rules(error) => write!(f, "rules: {error}"),
             Self::Conflict(error) => write!(f, "conflict: {error}"),
             Self::Integrity(error) => write!(f, "integrity: {error}"),
+            Self::NotFound(error) => write!(f, "not found: {error}"),
         }
     }
 }
@@ -78,6 +80,29 @@ pub struct ReplayReport {
     pub runs_verified: usize,
     pub fills_verified: usize,
     pub cash_cents: i64,
+}
+
+/// Read-only catalogue: available rows plus how many stored rows exist and how
+/// many are unreadable. A single corrupt row never hides the rest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentCatalogue {
+    pub experiments: Vec<ExperimentSummary>,
+    pub total: i64,
+    pub skipped: usize,
+}
+
+/// Read-only catalogue row for the experiment picker. Summary of stored facts
+/// only: no valuation, no derived return, no invented timestamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentSummary {
+    pub cycle_id: String,
+    pub status: ExperimentStatus,
+    pub strategy_version_id: String,
+    pub research_input_id: String,
+    pub market_data_pack_id: String,
+    pub execution_policy_version: String,
+    pub initial_cash_cents: i64,
+    pub runs_total: i64,
 }
 
 /// Proof that one experiment realized exactly the reviewed research signals for
@@ -645,7 +670,8 @@ fn validate_experiment_spec(spec: &ExperimentSpec) -> StoreResult<()> {
 
 fn load_experiment(conn: &Connection, cycle_id: &str) -> StoreResult<Experiment> {
     let row: Option<(String, String, String)> = conn.query_row("SELECT spec_json,status,pack_manifest_json FROM v2_experiments WHERE cycle_id=?", [cycle_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
-    let (raw, status, raw_manifest) = row.ok_or_else(|| StoreError::Rules(RuleError("experiment_not_found".into())))?;
+    let (raw, status, raw_manifest) = row
+        .ok_or_else(|| StoreError::NotFound("experiment_not_found".into()))?;
     let spec: ExperimentSpec = serde_json::from_str(&raw)?;
     validate_experiment_spec(&spec)?;
     let pack = load_market_pack(conn, &spec.market_data_pack_id)?;
