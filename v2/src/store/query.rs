@@ -2010,3 +2010,29 @@ fn day_in_range(
     }
     Ok(true)
 }
+
+impl Store {
+    /// Read-only export bundle: the filtered events plus a canonical digest.
+    pub fn evolution_export(&self, query: EvolutionQuery<'_>) -> StoreResult<EvolutionExport> {
+        let events = self.evolution_events_query(EvolutionQuery {
+            limit: 2_000,
+            ..query
+        })?;
+        let mut export = EvolutionExport {
+            schema_version: 1,
+            candidate_id: query.candidate_id.map(str::to_string),
+            status: query.status.map(str::to_string),
+            from_day: query.from_day.map(str::to_string),
+            to_day: query.to_day.map(str::to_string),
+            count: events.len() as i64,
+            events,
+            digest: String::new(),
+        };
+        let mut value = serde_json::to_value(&export)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("digest");
+        }
+        export.digest = crate::domain::canonical_digest(&value);
+        Ok(export)
+    }
+}
