@@ -7,6 +7,7 @@ mod instrument;
 mod execution;
 mod paper;
 mod portfolio;
+mod valuation;
 
 pub use contract::*;
 pub use digest::*;
@@ -15,6 +16,7 @@ pub use instrument::*;
 pub use execution::*;
 pub use paper::*;
 pub use portfolio::*;
+pub use valuation::*;
 
 #[cfg(test)]
 mod tests;

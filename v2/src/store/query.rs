@@ -465,3 +465,54 @@ impl Store {
         Ok(report)
     }
 }
+
+impl Store {
+    /// Value an account with an explicit price set. The set must cover every
+    /// held symbol on the requested day and bind to the slots' market pack.
+    pub fn paper_valuation_with_set(
+        &self,
+        account_id: &str,
+        as_of_day: &str,
+        set: &crate::domain::PriceSet,
+    ) -> StoreResult<crate::domain::AccountValuation> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
+        let split = spec.validate()?;
+        let pack = spec.slots[0].market_data_pack_id.clone();
+        if spec
+            .slots
+            .iter()
+            .any(|slot| slot.market_data_pack_id != pack)
+        {
+            return Err(StoreError::Rules(RuleError("valuation_mixed_packs".into())));
+        }
+        let mut positions: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        let mut cash_cents = split.reserve_cents;
+        for (index, _) in spec.slots.iter().enumerate() {
+            let state = Store::paper_slot_state(&self.conn, &spec, &split, index)?;
+            cash_cents += state.cash_cents;
+            for lot in &state.lots {
+                *positions.entry(lot.symbol.clone()).or_default() += lot.quantity;
+            }
+        }
+        let positions: Vec<(String, i64)> = positions.into_iter().collect();
+        crate::domain::value_account(
+            spec.initial_cash_cents,
+            cash_cents,
+            &positions,
+            set,
+            as_of_day,
+            &pack,
+        )
+        .map_err(StoreError::Rules)
+    }
+}

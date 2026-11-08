@@ -2648,3 +2648,89 @@ fn valuation_refuses_without_a_reviewed_price_set() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+fn price_set(trust: &str, day: &str, price_cents: i64, pack: &str) -> crate::domain::PriceSet {
+    crate::domain::PriceSet {
+        schema_version: 1,
+        price_set_id: format!("reviewed-prices-{day}"),
+        market_data_pack_id: pack.into(),
+        trust: trust.into(),
+        coverage_start: day.into(),
+        coverage_end: day.into(),
+        entries: vec![crate::domain::PriceEntry {
+            symbol: "600000.SH".into(),
+            day: day.into(),
+            price_cents,
+            source: "offline-fixture".into(),
+            observed_at: format!("{day}T15:00:00+08:00"),
+        }],
+        source_digest: "0".repeat(64),
+    }
+}
+
+#[test]
+fn valuation_marks_positions_only_when_the_set_covers_them() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("value-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let buy = &output.signals[0];
+    ingest_signal_evidence(&mut db, buy);
+    let order = db.submit_paper_order(paper_order("value-acct", PaperSlotId::A, buy)).unwrap();
+    let fill = order.outcome.fill.expect("filled");
+    let day = &fill.trade_day;
+    let account = db.paper_account("value-acct").unwrap();
+
+    let synthetic = price_set("synthetic", day, 1_300, MARKET_DATA_PACK_ID);
+    let valuation = db.paper_valuation_with_set("value-acct", day, &synthetic).unwrap();
+    assert_eq!(valuation.status, "valued");
+    assert_eq!(valuation.trust, "synthetic");
+    assert_eq!(valuation.positions.len(), 1);
+    assert_eq!(valuation.positions[0].quantity, fill.quantity);
+    assert_eq!(valuation.positions[0].price_cents, 1_300);
+    assert_eq!(valuation.market_value_cents, fill.quantity * 1_300);
+    assert_eq!(valuation.cash_cents, account.cash_cents);
+    assert_eq!(valuation.equity_cents, account.cash_cents + fill.quantity * 1_300);
+    // Synthetic prices may never state profit.
+    assert_eq!(valuation.profit_cents, None);
+    assert_eq!(valuation.price_set_digest.len(), 64);
+
+    let reviewed = price_set("reviewed", day, 1_300, MARKET_DATA_PACK_ID);
+    let reviewed_value = db.paper_valuation_with_set("value-acct", day, &reviewed).unwrap();
+    assert_eq!(
+        reviewed_value.profit_cents,
+        Some(reviewed_value.equity_cents - 10_000_000)
+    );
+
+    // Missing coverage refuses the whole valuation instead of a subset.
+    let mut incomplete = price_set("reviewed", day, 1_300, MARKET_DATA_PACK_ID);
+    incomplete.entries[0].symbol = "000001.SZ".into();
+    assert!(matches!(
+        db.paper_valuation_with_set("value-acct", day, &incomplete),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "valuation_missing_symbol"
+    ));
+
+    let wrong_pack = price_set("reviewed", day, 1_300, "another-pack");
+    assert!(matches!(
+        db.paper_valuation_with_set("value-acct", day, &wrong_pack),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "valuation_pack_mismatch"
+    ));
+
+    assert!(matches!(
+        db.paper_valuation_with_set("value-acct", "2026-11-30", &reviewed),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "valuation_day_outside_price_set"
+    ));
+
+    let mut duplicate = price_set("reviewed", day, 1_300, MARKET_DATA_PACK_ID);
+    duplicate.entries.push(duplicate.entries[0].clone());
+    assert!(matches!(
+        db.paper_valuation_with_set("value-acct", day, &duplicate),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "duplicate_price_entry"
+    ));
+
+    let mut bad_trust = price_set("guessed", day, 1_300, MARKET_DATA_PACK_ID);
+    bad_trust.trust = "guessed".into();
+    assert!(matches!(
+        db.paper_valuation_with_set("value-acct", day, &bad_trust),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_price_set_trust"
+    ));
+}
