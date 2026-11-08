@@ -262,6 +262,31 @@ test.describe("paper account console", () => {
     expect(coverageUrl).toContain("symbols=600000.SH");
   });
 
+  test("shows account performance when reviewed prices exist", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/.+\/performance\?/, (route) => route.fulfill({
+      json: {
+        days: 2, trades: 1, fees_cents: 500,
+        start_equity_cents: 10_000_000, end_equity_cents: 9_960_000,
+        profit_cents: -40_000, return_bps: -40,
+        max_drawdown_cents: 30_000, max_drawdown_day: "2026-11-02",
+        drawdown_bps: 30, price_set_id: "reviewed-prices-2026-11", digest: "a".repeat(64),
+      },
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-performance")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("account-performance")).toContainText("收益 ¥-400.00");
+    await expect(page.getByTestId("account-performance")).toContainText("回撤 0.30%");
+    await expect(page.getByTestId("account-performance")).toContainText("1 笔成交");
+  });
+
+  test("hides account performance when prices are missing", async ({ page }) => {
+    await page.route(/\/v2\/paper-accounts\/.+\/performance\?/, (route) => route.fulfill({
+      json: { status: "unavailable", reason: "no_reviewed_price_set" },
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-performance")).toBeHidden();
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();
