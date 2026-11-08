@@ -634,6 +634,17 @@ else
   test $? -eq 4
 fi
 grep -q "unstable" "${RUNNER_TEMP:-/tmp}/astock-weekly.out"
+# Auto-window mode: split an explicit day list into full windows.
+if python scripts/weekly_review.py --base-cycle shadow-base-1 \
+    --candidate-cycle shadow-candidate-1 --days "2026-10-30,2026-11-02" \
+    --window-size 1 > "${RUNNER_TEMP:-/tmp}/astock-weekly-auto.out" 2>&1; then
+  echo "auto-window review unexpectedly consistent" >&2
+  exit 1
+else
+  test $? -eq 4
+fi
+grep -q "2026-10-30" "${RUNNER_TEMP:-/tmp}/astock-weekly-auto.out"
+
 
 python3 scripts/experiment_demo.py
 python3 scripts/market_pack_demo.py

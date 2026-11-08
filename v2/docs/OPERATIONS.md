@@ -47,6 +47,14 @@
 - 退出码 0 = 一致（可继续走治理决策）；4 = 不稳定（缺覆盖/优势不足/回撤超限）；2 = 参数或请求错误；
 - 输出逐窗基准/候选收益与回撤，以及最终结论与理由。
 
+也可以只给出交易日清单，由脚本按固定窗口切分（只保留完整窗口）：
+
+```bash
+python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --days 2026-10-30,2026-10-31,2026-11-02,2026-11-03 --window-size 2
+```
+
+不足一个完整窗口、或 `--window-size` 非正数时退出码 2。
+
 
 - 只推进 `running` 会话；暂停的会话保持暂停。
 - 返回 `{sessions, steps, filled, rejected}`，可直接作为调度日志。

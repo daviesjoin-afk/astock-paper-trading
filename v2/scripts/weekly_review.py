@@ -19,6 +19,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shadow_candidates as shadow  # noqa: E402
 
 
+def chunk_days(text: str, window_size: int) -> list[list[str]]:
+    """Split an explicit trading-day list into consecutive full windows."""
+    if window_size < 1:
+        raise ValueError("window_size_must_be_positive")
+    days = [day.strip() for day in text.split(",") if day.strip()]
+    if len(days) < window_size:
+        raise ValueError("not_enough_days_for_one_window")
+    windows = [days[index:index + window_size] for index in range(0, len(days) - window_size + 1, window_size)]
+    if not windows:
+        raise ValueError("no_full_window")
+    return windows
+
+
 def parse_windows(text: str) -> list[list[str]]:
     windows = [
         [day.strip() for day in window.split(",") if day.strip()]
@@ -47,13 +60,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api", default="http://127.0.0.1:8765")
     parser.add_argument("--base-cycle", required=True)
     parser.add_argument("--candidate-cycle", required=True)
-    parser.add_argument("--windows", required=True, help="e.g. 2026-10-30,2026-10-31;2026-11-02")
+    parser.add_argument("--windows", help="e.g. 2026-10-30,2026-10-31;2026-11-02")
+    parser.add_argument("--days", help="comma-separated days to split into windows")
+    parser.add_argument("--window-size", type=int, default=5)
     parser.add_argument("--margin-bps", type=int, default=50)
     parser.add_argument("--max-drawdown-bps", type=int, default=1_500)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
-        windows = parse_windows(args.windows)
+        if args.windows:
+            windows = parse_windows(args.windows)
+        elif args.days:
+            windows = chunk_days(args.days, args.window_size)
+        else:
+            raise ValueError("provide --windows or --days")
         base = shadow.segments(args.api, args.base_cycle, windows)
         candidate = shadow.segments(args.api, args.candidate_cycle, windows)
         consistency = shadow.rolling_consistency(
