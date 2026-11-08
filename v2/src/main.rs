@@ -308,6 +308,10 @@ struct EvolutionListQuery {
     candidate: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    base_cycle: Option<String>,
+    #[serde(default)]
+    candidate_cycle: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -324,6 +328,10 @@ struct EvolutionPageQuery {
     before_id: Option<String>,
     #[serde(default)]
     after: Option<String>,
+    #[serde(default)]
+    base_cycle: Option<String>,
+    #[serde(default)]
+    candidate_cycle: Option<String>,
 }
 
 async fn evolution_events_page(
@@ -340,6 +348,8 @@ async fn evolution_events_page(
             query.before.as_deref(),
             query.before_id.as_deref(),
             query.after.as_deref(),
+            query.base_cycle.as_deref(),
+            query.candidate_cycle.as_deref(),
         )
         .map_err(api_error)?,
     )
@@ -356,8 +366,14 @@ async fn evolution_events(
     let db = state.lock().await;
     let limit = query.limit.clamp(1, 200);
     response(
-        db.evolution_events(limit, query.candidate.as_deref(), query.status.as_deref())
-            .map_err(api_error)?,
+        db.evolution_events_filtered(
+            limit,
+            query.candidate.as_deref(),
+            query.status.as_deref(),
+            query.base_cycle.as_deref(),
+            query.candidate_cycle.as_deref(),
+        )
+        .map_err(api_error)?,
     )
 }
 
