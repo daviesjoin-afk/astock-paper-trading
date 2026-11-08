@@ -624,6 +624,23 @@ python3 scripts/experiment_demo.py</code></pre>
                   <ul class="diff-list" id="diff-list" data-testid="diff-list"></ul>
                 </div>
               </section>
+              <section class="experiment-performance" id="experiment-performance" data-testid="experiment-performance">
+                <h3>实验绩效</h3>
+                <p class="panel-note">按审核净值序列统计收益、回撤、费用与成交笔数；缺覆盖时明确显示不可用。</p>
+                <div class="experiment-performance-form">
+                  <label class="field field-inline">
+                    <span class="field-label">实验 id</span>
+                    <input id="perf-cycle" data-testid="perf-cycle" autocomplete="off" placeholder="例如 shadow-base-1" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">交易日</span>
+                    <input id="perf-days" data-testid="perf-days" autocomplete="off" placeholder="2026-10-30,2026-11-02" />
+                  </label>
+                  <button type="button" class="btn btn-quiet" id="perf-run" data-testid="perf-run">查询绩效</button>
+                </div>
+                <p class="section-error" id="perf-error" data-testid="perf-error" hidden></p>
+                <p class="experiment-performance-result" id="perf-result" data-testid="perf-result" hidden></p>
+              </section>
               <p class="empty-state" id="evolution-empty" data-testid="evolution-empty" hidden>还没有进化事件。</p>
             </div>
           </section>

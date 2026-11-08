@@ -128,6 +128,46 @@ test.describe("evolution history", () => {
     await expect(page.getByTestId("evolution-more")).toBeHidden();
   });
 
+  test("shows experiment performance when the series is reviewed", async ({ page }) => {
+    await page.route(/\/v2\/experiments\/.+\/performance\?/, (route) => route.fulfill({
+      json: {
+        cycle_id: "shadow-base-1", days: 2, start_equity_cents: 9_990_000,
+        end_equity_cents: 9_960_000, profit_cents: -40_000, return_bps: -40,
+        max_drawdown_cents: 30_000, max_drawdown_day: "2026-11-02",
+        drawdown_bps: 30, fees_cents: 500, trades: 1,
+        price_set_id: "reviewed-prices-2026-11", digest: "a".repeat(64),
+      },
+    }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
+    await openEvolution(page);
+    await page.getByTestId("perf-cycle").fill("shadow-base-1");
+    await page.getByTestId("perf-days").fill("2026-10-30,2026-11-02");
+    await page.getByTestId("perf-run").click();
+    await expect(page.getByTestId("perf-result")).toContainText("收益 ¥-400.00");
+    await expect(page.getByTestId("perf-result")).toContainText("回撤 0.30%");
+    await expect(page.getByTestId("perf-result")).toContainText("1 笔成交");
+  });
+
+  test("experiment performance explains missing coverage", async ({ page }) => {
+    await page.route(/\/v2\/experiments\/.+\/performance\?/, (route) => route.fulfill({
+      json: { status: "unavailable", reason: "no_reviewed_price_set", days: 2 },
+    }));
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
+    await openEvolution(page);
+    await page.getByTestId("perf-cycle").fill("shadow-base-1");
+    await page.getByTestId("perf-days").fill("2026-10-30,2026-11-02");
+    await page.getByTestId("perf-run").click();
+    await expect(page.getByTestId("perf-result")).toContainText("缺少审核价格集合");
+  });
+
+  test("experiment performance needs an id and days", async ({ page }) => {
+    await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
+    await openEvolution(page);
+    await page.getByTestId("perf-run").click();
+    await expect(page.getByTestId("perf-error")).toContainText("请填写实验 id");
+    await expect(page.getByTestId("perf-result")).toBeHidden();
+  });
+
   test("an empty log explains itself", async ({ page }) => {
     await page.route(/\/v2\/evolution\/events/, (route) => route.fulfill({ json: pageOf([]) }));
     await openEvolution(page);
