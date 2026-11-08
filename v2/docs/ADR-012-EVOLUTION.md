@@ -48,6 +48,21 @@
 5. 晋级后回撤恶化/优势消失 → `reverted`，否则 `kept`；
 6. 同一输入决策与摘要稳定。
 
+## 候选生成（已实现）
+
+`v2/research/generate_candidates.py`（stdlib-only）：
+
+```bash
+python research/generate_candidates.py   --base data/strategy-momentum-v1.json   --grid grid.json --out candidates.json --max-candidates 32
+```
+
+- `grid.json` 形如 `{"lookback":[2,3,5],"threshold_bps":[25,50]}`；
+- 只允许已声明的参数（当前 `lookback` 1–250、`threshold_bps` 1–5000），非整数/越界/缺参直接拒绝；
+- 笛卡尔积超过上限（默认 32）拒绝；与基准相同的组合被剔除；
+- 候选身份 = 参数规范 JSON 的 SHA-256（与 Rust canonical digest 口径一致，已用真实工件 `parameters_digest` 校验）；
+- 输出 manifest：`schema_version / base_strategy_version_id / base_parameters_digest / candidates[] / digest`；
+- 不评估、不晋级、不写账本——只产出影子运行可消费的确定性候选清单。
+
 ## 未决问题
 
 - 指标来源：需要由审核净值序列（ADR 007）统一生成，禁止手工填写；
