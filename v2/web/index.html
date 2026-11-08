@@ -134,6 +134,16 @@
           </button>
         </div>
         <div class="nav-group">
+          <p class="nav-title">进化</p>
+          <button type="button" class="nav-item" data-view="evolution" data-testid="nav-evolution">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M3 12.5 7 8l2.6 2.4L13.5 5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M10.6 5h2.9v2.9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>进化历史</span>
+          </button>
+        </div>
+        <div class="nav-group">
           <p class="nav-title">实验</p>
           <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">
             <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
@@ -553,6 +563,20 @@ python3 scripts/experiment_demo.py</code></pre>
           </section>
 
           <!-- 实验信息 -->
+          <section class="panel" id="panel-evolution" data-testid="panel-evolution" hidden>
+            <header class="panel-head">
+              <div>
+                <p class="eyebrow">模拟盘</p>
+                <h2>进化历史</h2>
+              </div>
+              <button type="button" class="btn btn-quiet" id="evolution-refresh" data-testid="evolution-refresh">刷新</button>
+            </header>
+            <div class="panel-body">
+              <p class="panel-note">晋级与回退由证据规则判定：样本外、影子天数、回撤与优势门槛，任何一条不满足都不会晋级。</p>
+              <div class="evolution-events" id="evolution-events" data-testid="evolution-events"></div>
+              <p class="empty-state" id="evolution-empty" data-testid="evolution-empty" hidden>还没有进化事件。</p>
+            </div>
+          </section>
           <section class="panel" id="panel-experiment" data-testid="panel-experiment" hidden>
             <header class="panel-head">
               <div>
@@ -596,7 +620,7 @@ python3 scripts/experiment_demo.py</code></pre>
         <button type="button" class="btn btn-quiet" id="shortcuts-close" data-testid="shortcuts-close">关闭</button>
       </header>
       <dl class="shortcut-list">
-        <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>6</kbd></dt>
+        <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>8</kbd></dt>
           <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 实验 · 账户</dd></div>
         <div><dt><kbd>/</kbd></dt><dd>聚焦“当前实验”选择器</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>刷新当前实验</dd></div>

@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 进化历史视图：新增第 8 个视图“进化历史”（快捷键 8）——读取 `GET /v2/evolution/events`，按事件展示候选 id、状态胶囊（已晋级/已淘汰/已回退/保持/证据不足）、决策时刻与逐条规则理由；空日志与读取失败都有明确文案，快捷键面板更新为 1–8。浏览器新增 5 项测试（列表/空态/快捷键/390px/axe），合计 107 passed；截图 `after-evolution.png`。
 - V2 候选参数生成器（ADR 012）：新增 `v2/research/generate_candidates.py`（stdlib-only）——从审核工件读取基准参数，按有界网格（lookback 1–250、threshold_bps 1–5000，笛卡尔积 ≤ 32）生成候选清单；剔除与基准相同的组合，候选身份为参数规范 JSON 的 SHA-256（与 Rust canonical digest 同口径，已用真实工件校验）；输出 manifest（基准摘要、候选参数与摘要、整体 digest）。不做评估/晋级/写入。Python 新增 6 项测试，研究套件 28 passed。
 - V2 自进化事件持久化（ADR 012，schema v13）：新增 `v2_evolution_events` 与 `POST /v2/evolution/events`（服务端计算决策后落库，`event_id` 幂等、同 id 不同决策冲突、非法 id/时刻拒绝）、`GET /v2/evolution/events?limit=`（按时间倒序）；决策、理由、指标与摘要一并保存，可审计。Rust 136 passed（事件幂等/冲突/列表/错误码）；浏览器 102 passed；冒烟升级到 v13 并覆盖事件写入与查询。
 - V2 自进化治理（ADR 012）：新增纯域 `EvolutionPolicy` / `CandidateMetrics` / `decide_promotion()` / `decide_rollback()`——样本外天数、影子天数、成交笔数、回撤上限、相对基准收益门槛全部硬约束；证据不足即使收益极高也不晋级，回撤恶化或优势消失触发回退，决策附逐条理由与 canonical 摘要。新增 `POST /v2/evolution/decisions`（promotion/rollback）。Rust 135 passed（晋级/证据不足/风险拒绝/优势不足/回退/保持）；浏览器 102 passed（无 UI 变更）；冒烟覆盖晋级决策。

@@ -138,6 +138,7 @@ const VIEWS = {
   reproduction: { panel: "panel-reproduction", label: "研究重做" },
   experiment: { panel: "panel-experiment", label: "实验信息" },
   account: { panel: "panel-account", label: "模拟账户" },
+  evolution: { panel: "panel-evolution", label: "进化历史" },
 } as const;
 type View = keyof typeof VIEWS;
 const viewFromHash = (): View => {
@@ -168,6 +169,7 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
     }
   }
   if (view === "account" && accounts.length === 0) void loadAccounts();
+  if (view === "evolution") void loadEvolution();
   announce(`已切换到${VIEWS[view].label}`);
 };
 
@@ -1796,6 +1798,61 @@ accountAdvanceButton.addEventListener("click", () => {
     }
   })();
 });
+
+type EvolutionEvent = {
+  event_id: string; candidate_id: string; status: string;
+  decided_at: string;
+  decision: { reasons: string[]; digest: string };
+  digest: string;
+};
+
+const EVOLUTION_LABELS: Record<string, string> = {
+  promoted: "已晋级",
+  rejected: "已淘汰",
+  reverted: "已回退",
+  kept: "保持",
+  insufficient_evidence: "证据不足",
+};
+
+const loadEvolution = async (): Promise<void> => {
+  const container = testId<HTMLElement>("evolution-events");
+  const empty = testId<HTMLElement>("evolution-empty");
+  try {
+    const events = await api<EvolutionEvent[]>("/v2/evolution/events?limit=50", new AbortController().signal);
+    const list = Array.isArray(events) ? events : [];
+    toggle(empty, list.length === 0);
+    container.replaceChildren(...list.map((event) => {
+      const card = document.createElement("article");
+      card.className = "evolution-card";
+      card.dataset.testid = `evolution-event-${event.event_id}`;
+      card.dataset.state = event.status;
+      const head = document.createElement("header");
+      const title = document.createElement("strong");
+      title.textContent = event.candidate_id;
+      const pill = document.createElement("span");
+      pill.className = "status-pill";
+      pill.dataset.testid = "evolution-status";
+      pill.textContent = EVOLUTION_LABELS[event.status] ?? event.status;
+      const time = document.createElement("time");
+      time.textContent = decisionTime(event.decided_at);
+      head.append(title, pill, time);
+      const reasons = document.createElement("ul");
+      reasons.className = "evolution-reasons";
+      reasons.replaceChildren(...(event.decision?.reasons ?? []).map((reason) => {
+        const item = document.createElement("li");
+        item.textContent = reason;
+        return item;
+      }));
+      card.append(head, reasons);
+      return card;
+    }));
+  } catch (error) {
+    toggle(empty, true);
+    empty.textContent = `读取进化事件失败：${errorDetail(error)}`;
+  }
+};
+
+testId<HTMLButtonElement>("evolution-refresh").addEventListener("click", () => void loadEvolution());
 
 const loadAccounts = async (): Promise<void> => {
   clearAccountError();

@@ -871,6 +871,20 @@ td:first-child { font-weight: 550; }
 }
 
 
+/* ---------- evolution ---------- */
+.evolution-events { display: grid; gap: 10px; }
+.evolution-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 12px 14px; display: grid; gap: 8px;
+}
+.evolution-card header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.evolution-card time { margin-left: auto; color: var(--muted); font-size: 11.5px; }
+.evolution-card[data-state="promoted"] { border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
+.evolution-card[data-state="rejected"], .evolution-card[data-state="reverted"] {
+  border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+}
+.evolution-reasons { margin: 0; padding-left: 18px; display: grid; gap: 3px; font-size: 11.5px; color: var(--muted); }
+
 /* ---------- account creation ---------- */
 .account-create {
   display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end;
