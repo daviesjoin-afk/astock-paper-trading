@@ -1111,13 +1111,45 @@ impl Store {
             });
         }
         let policy = crate::domain::AllocationPolicy::default();
-        let proposal = crate::domain::propose_allocation(
+        let mut proposal = crate::domain::propose_allocation(
             spec.slots[0].weight_bps,
             spec.slots[1].weight_bps,
             &scores,
             &policy,
         )
         .map_err(StoreError::Rules)?;
+
+        // A version switch inside the measured window mixes two strategies; say
+        // so instead of silently attributing old performance to the new version.
+        let window_start = chrono::NaiveDate::parse_from_str(&days[0], "%Y-%m-%d")
+            .map_err(|_| StoreError::Rules(RuleError("invalid_allocation_day".into())))?;
+        let mut annotated = false;
+        for item in &mut proposal.rationale {
+            let chain = Store::slot_switches(&self.conn, account_id, &item.slot)?;
+            let switched_in_window = chain.iter().any(|record| {
+                chrono::DateTime::parse_from_rfc3339(&record.effective_from)
+                    .map(|at| {
+                        at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"))
+                            .date_naive()
+                            > window_start
+                    })
+                    .unwrap_or(false)
+            });
+            if switched_in_window {
+                item.note = format!(
+                    "{}；窗口内发生策略版本切换，历史绩效来自旧版本",
+                    item.note
+                );
+                annotated = true;
+            }
+        }
+        if annotated {
+            let mut value = serde_json::to_value(&proposal)?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("digest");
+            }
+            proposal.digest = crate::domain::canonical_digest(&value);
+        }
         Ok(Some(AllocationReport {
             proposal,
             scores,

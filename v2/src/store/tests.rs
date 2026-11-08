@@ -3131,6 +3131,38 @@ fn allocation_proposal_scores_slots_and_respects_bounds() {
     assert!(report.proposal.reserve_bps >= 1_000);
     assert_eq!(report.proposal.digest.len(), 64);
 
+    // A switch inside the measured window must be disclosed, not silently
+    // attributed to the new version.
+    db.record_strategy_switch(
+        "alloc-acct",
+        PaperSlotId::B,
+        "research-reversion-v2",
+        "2026-11-02T09:00:00+08:00",
+        "reversion promotion",
+        "alloc-switch-1",
+    )
+    .unwrap();
+    let annotated = db
+        .paper_allocation_proposal("alloc-acct", &[day1.clone(), day2.clone()], &dir)
+        .unwrap()
+        .expect("reviewed set covers both days");
+    let slot_b = annotated
+        .proposal
+        .rationale
+        .iter()
+        .find(|item| item.slot == "B")
+        .unwrap();
+    assert!(slot_b.note.contains("窗口内发生策略版本切换"), "{slot_b:?}");
+    let slot_a = annotated
+        .proposal
+        .rationale
+        .iter()
+        .find(|item| item.slot == "A")
+        .unwrap();
+    assert!(!slot_a.note.contains("版本切换"), "{slot_a:?}");
+    assert_eq!(annotated.proposal.digest.len(), 64);
+    assert_ne!(annotated.proposal.digest, report.proposal.digest);
+
     // Too few observations keeps the current weights instead of guessing.
     let policy = crate::domain::AllocationPolicy::default();
     let thin = crate::domain::propose_allocation(
