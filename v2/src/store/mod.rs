@@ -109,6 +109,23 @@ pub struct PaperAccountView {
     pub slots: Vec<PaperSlotView>,
 }
 
+/// Lightweight account row for the console picker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperAccountSummarySlot {
+    pub slot: String,
+    pub strategy_version_id: String,
+    pub weight_bps: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperAccountSummary {
+    pub account_id: String,
+    pub initial_cash_cents: i64,
+    pub reserve_bps: i64,
+    pub created_at: String,
+    pub slots: Vec<PaperAccountSummarySlot>,
+}
+
 /// One simulated order recorded against a strategy slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperOrderRecord {
@@ -1025,5 +1042,44 @@ impl Store {
             outcome,
             duplicate: false,
         })
+    }
+}
+// ---------------------------------------------------------------------------
+// Paper account catalogue (ADR 005): read-only list for the account console.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    pub fn paper_accounts(&self, limit: i64) -> StoreResult<Vec<PaperAccountSummary>> {
+        let mut statement = self.conn.prepare(
+            "SELECT account_id,spec_json,created_at FROM v2_paper_accounts ORDER BY account_id LIMIT ?",
+        )?;
+        let rows = statement.query_map([limit.clamp(1, 200)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            let (account_id, spec_json, created_at) = row?;
+            let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&spec_json)?;
+            accounts.push(PaperAccountSummary {
+                account_id,
+                initial_cash_cents: spec.initial_cash_cents,
+                reserve_bps: spec.reserve_bps,
+                created_at,
+                slots: spec
+                    .slots
+                    .iter()
+                    .map(|slot| PaperAccountSummarySlot {
+                        slot: slot.slot.as_str().into(),
+                        strategy_version_id: slot.strategy.strategy_version_id.clone(),
+                        weight_bps: slot.weight_bps,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(accounts)
     }
 }

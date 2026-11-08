@@ -12,6 +12,8 @@ const dataDir = fileURLToPath(new URL("../../data/", import.meta.url));
 
 export const PACK = "cn-offline-fixture-pack-1";
 
+export const PAPER_ACCOUNT = "e2e-account";
+
 export const CYCLES = {
   holdings: "e2e-holdings",
   flat: "e2e-flat",
@@ -57,6 +59,7 @@ const read = <T>(name: string): T =>
   JSON.parse(readFileSync(join(dataDir, name), "utf8")) as T;
 
 export const artifact = (): Artifact => read("strategy-momentum-v1.json");
+const reversionArtifact = (): Artifact => read("strategy-reversion-v1.json");
 const manifest = (): Manifest => read("research-input-offline-v1.json");
 const output = (): Output => read("research-output-momentum-v1.json");
 
@@ -142,5 +145,54 @@ export async function ensureFixtures(api: APIRequestContext): Promise<void> {
   // Reuse the frozen sell-side entry so the evidence identity stays identical
   // to the other experiments (one payload per quote identity).
   await realise(api, CYCLES.rejected, [{ ...signals[1], signal_id: "e2e-rejected-sell" }]);
+  await ensurePaperAccount(api, signals);
   ready = true;
+}
+
+/** One user-funded account with two slots and one filled slot-A order. */
+async function ensurePaperAccount(
+  api: APIRequestContext,
+  signals: Output["signals"],
+): Promise<void> {
+  const created = await api.post("/v2/paper-accounts", {
+    data: {
+      schema_version: 1,
+      account_id: PAPER_ACCOUNT,
+      initial_cash_cents: 10_000_000,
+      reserve_bps: 1_000,
+      created_at: "2026-11-08T09:00:00+08:00",
+      slots: [
+        {
+          slot: "A", strategy: artifact(), market_data_pack_id: PACK,
+          execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
+        },
+        {
+          slot: "B", strategy: reversionArtifact(), market_data_pack_id: PACK,
+          execution_policy_version: "v2-paper-policy-6", weight_bps: 4_500,
+        },
+      ],
+    },
+  });
+  if (!created.ok() && created.status() !== 409) {
+    throw new Error(`paper account: ${created.status()} ${await created.text()}`);
+  }
+  const signal = signals[0];
+  const order = await api.post(`/v2/paper-accounts/${PAPER_ACCOUNT}/orders`, {
+    data: {
+      schema_version: 1,
+      account_id: PAPER_ACCOUNT,
+      slot: "A",
+      signal_id: "paper-e2e-buy",
+      decision_at: signal.decision_at,
+      signal: { symbol: signal.symbol, side: signal.side },
+      quote_ref: {
+        market_data_pack_id: signal.market_data_pack_id,
+        source: signal.source,
+        quote_id: signal.quote_id,
+      },
+    },
+  });
+  if (!order.ok() && order.status() !== 409) {
+    throw new Error(`paper order: ${order.status()} ${await order.text()}`);
+  }
 }

@@ -108,6 +108,15 @@ test.describe("screenshots", () => {
     await capture(page, "decisions-filtered");
   });
 
+  test("paper account console", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.repro}`);
+    await page.getByTestId("summary-strategy").waitFor();
+    await page.getByTestId("nav-account").click();
+    await page.getByTestId("account-slot-A").waitFor();
+    await settle(page);
+    await capture(page, "account");
+  });
+
   test("shortcut reference", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("summary-strategy").waitFor();

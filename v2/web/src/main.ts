@@ -137,6 +137,7 @@ const VIEWS = {
   replay: { panel: "panel-replay", label: "交易回放" },
   reproduction: { panel: "panel-reproduction", label: "研究重做" },
   experiment: { panel: "panel-experiment", label: "实验信息" },
+  account: { panel: "panel-account", label: "模拟账户" },
 } as const;
 type View = keyof typeof VIEWS;
 const viewFromHash = (): View => {
@@ -166,6 +167,7 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
       byId("main").scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
     }
   }
+  if (view === "account" && accounts.length === 0) void loadAccounts();
   announce(`已切换到${VIEWS[view].label}`);
 };
 
@@ -765,6 +767,7 @@ const loadList = async (): Promise<void> => {
   hint.textContent = describeCatalogue(requested, { unlisted });
   syncUrl(cycle);
   await loadCycle(cycle);
+  await loadAccounts();
 };
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1015,214 @@ themeButton.addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Paper account console (ADR 005): read-only facts for one account.
+// ---------------------------------------------------------------------------
+type PaperAccountSummarySlot = { slot: string; strategy_version_id: string; weight_bps: number };
+type PaperAccountSummary = {
+  account_id: string; initial_cash_cents: number; reserve_bps: number;
+  created_at: string; slots: PaperAccountSummarySlot[];
+};
+type PaperAccountSlotView = {
+  slot: string; strategy_version_id: string; research_input_id: string;
+  market_data_pack_id: string; execution_policy_version: string;
+  weight_bps: number; budget_cents: number; cash_cents: number;
+  positions: Array<{ symbol: string; quantity: number; sellable_quantity: number | null }>;
+  orders_total: number;
+};
+type PaperAccountView = {
+  account_id: string; initial_cash_cents: number; created_at: string;
+  cash_cents: number; reserve_cents: number; slots: PaperAccountSlotView[];
+};
+type PaperFill = {
+  symbol: string; side: string; quantity: number; price_cents: number;
+  fees_cents: number; trade_day: string;
+};
+type PaperOrderRecord = {
+  id: number; account_id: string; slot: string; strategy_version_id: string;
+  request: {
+    schema_version: number; account_id: string; slot: string; signal_id: string;
+    decision_at: string; signal: { symbol: string; side: string };
+    quote_ref: { market_data_pack_id: string; source: string; quote_id: string };
+  };
+  outcome: { status: string; reason: string; fill: PaperFill | null; cash_after_cents: number };
+  duplicate: boolean;
+};
+
+let accounts: PaperAccountSummary[] = [];
+let currentAccountId = "";
+const accountSelect = byId<HTMLSelectElement>("account-select");
+const accountError = testId<HTMLElement>("account-error");
+const accountBody = byId("account-body");
+const accountEmpty = testId<HTMLElement>("account-empty");
+
+const urlAccount = (): string =>
+  new URLSearchParams(location.search).get("account")?.trim() ?? "";
+
+const syncAccountUrl = (accountId: string): void => {
+  const url = new URL(location.href);
+  if (accountId) url.searchParams.set("account", accountId);
+  else url.searchParams.delete("account");
+  if (url.toString() !== location.href) history.replaceState(null, "", url);
+};
+
+const showAccountError = (message: string): void => {
+  accountError.textContent = message;
+  toggle(accountError, true);
+};
+const clearAccountError = (): void => {
+  accountError.replaceChildren();
+  toggle(accountError, false);
+};
+
+const accountSlotCard = (slot: PaperAccountSlotView): HTMLElement => {
+  const card = document.createElement("section");
+  card.className = "account-slot";
+  card.dataset.testid = `account-slot-${slot.slot}`;
+  const head = document.createElement("header");
+  head.className = "account-slot-head";
+  const title = document.createElement("h3");
+  title.textContent = `槽位 ${slot.slot} · ${strategyName(slot.strategy_version_id)}`;
+  const weight = document.createElement("span");
+  weight.className = "tag";
+  weight.textContent = `${(slot.weight_bps / 100).toFixed(1)}%`;
+  head.append(title, weight);
+
+  const facts = document.createElement("dl");
+  facts.className = "account-slot-facts";
+  const rows: Array<[string, string]> = [
+    ["预算", money(slot.budget_cents)],
+    ["现金", money(slot.cash_cents)],
+    ["订单", integer(slot.orders_total)],
+  ];
+  for (const [label, value] of rows) {
+    const item = document.createElement("div");
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    item.append(dt, dd);
+    facts.appendChild(item);
+  }
+
+  const positions = document.createElement("p");
+  positions.className = "account-slot-positions";
+  positions.textContent = slot.positions.length === 0
+    ? "无持仓"
+    : slot.positions.map((position) => `${position.symbol} ${integer(position.quantity)} 股`).join("；");
+
+  card.append(head, facts, positions);
+  return card;
+};
+
+const renderAccount = (account: PaperAccountView, orders: PaperOrderRecord[]): void => {
+  toggle(accountBody, true);
+  toggle(accountEmpty, false);
+  setText("account-initial", money(account.initial_cash_cents));
+  setText("account-reserve", money(account.reserve_cents));
+  setText("account-cash", money(account.cash_cents));
+
+  const slots = byId("account-slots");
+  slots.replaceChildren(...account.slots.map(accountSlotCard));
+
+  const body = byId("account-orders");
+  body.replaceChildren();
+  for (const order of orders) {
+    const row = document.createElement("tr");
+    const time = document.createElement("td");
+    time.className = "compare-time";
+    time.textContent = decisionTime(order.request.decision_at);
+    const slot = document.createElement("td");
+    slot.textContent = order.slot;
+    const signal = document.createElement("td");
+    signal.textContent = signalName(order.request.signal_id);
+    signal.title = order.request.signal_id;
+    const side = document.createElement("td");
+    const sidePill = document.createElement("span");
+    sidePill.className = order.request.signal.side === "buy" ? "side-buy" : "side-sell";
+    sidePill.textContent = sideLabel(order.request.signal.side);
+    side.appendChild(sidePill);
+    const result = document.createElement("td");
+    const resultPill = document.createElement("span");
+    resultPill.className = order.outcome.status === "filled" ? "result-filled" : "result-rejected";
+    resultPill.textContent = resultLabel(order.outcome.status);
+    result.appendChild(resultPill);
+    const detail = document.createElement("td");
+    detail.className = "wrap";
+    if (order.outcome.fill) {
+      const fill = order.outcome.fill;
+      detail.textContent =
+        `${fill.symbol} ${integer(fill.quantity)} 股 @ ${money(fill.price_cents)} · 费用 ${money(fill.fees_cents)}`;
+    } else {
+      detail.textContent = reasonLabel(order.outcome.reason);
+      detail.title = order.outcome.reason;
+    }
+    row.append(time, slot, signal, side, result, detail);
+    body.appendChild(row);
+  }
+  toggle(testId("account-orders-empty"), orders.length === 0);
+};
+
+const loadAccount = async (accountId: string): Promise<void> => {
+  if (!accountId) return;
+  clearAccountError();
+  currentAccountId = accountId;
+  const encoded = encodeURIComponent(accountId);
+  try {
+    const [account, orders] = await Promise.all([
+      api<PaperAccountView>(`/v2/paper-accounts/${encoded}`, new AbortController().signal),
+      api<PaperOrderRecord[]>(`/v2/paper-accounts/${encoded}/orders`, new AbortController().signal),
+    ]);
+    if (account.account_id !== accountId) {
+      showAccountError("返回的账户与请求不一致");
+      return;
+    }
+    syncAccountUrl(accountId);
+    renderAccount(account, Array.isArray(orders) ? orders : []);
+  } catch (error) {
+    toggle(accountBody, false);
+    showAccountError(`读取账户失败：${errorDetail(error)}`);
+  }
+};
+
+const loadAccounts = async (): Promise<void> => {
+  clearAccountError();
+  try {
+    const list = await api<PaperAccountSummary[]>("/v2/paper-accounts", new AbortController().signal);
+    accounts = Array.isArray(list) ? list : [];
+  } catch (error) {
+    accounts = [];
+    toggle(accountBody, false);
+    showAccountError(`读取账户列表失败：${errorDetail(error)}`);
+    return;
+  }
+  accountSelect.replaceChildren();
+  for (const account of accounts) {
+    const option = document.createElement("option");
+    option.value = account.account_id;
+    option.textContent = account.account_id;
+    accountSelect.appendChild(option);
+  }
+  accountSelect.disabled = accounts.length === 0;
+  if (accounts.length === 0) {
+    toggle(accountBody, false);
+    toggle(accountEmpty, true);
+    return;
+  }
+  toggle(accountEmpty, false);
+  const requested = urlAccount();
+  const selected = accounts.some((account) => account.account_id === requested)
+    ? requested
+    : accounts[0].account_id;
+  accountSelect.value = selected;
+  await loadAccount(selected);
+};
+
+accountSelect.addEventListener("change", () => {
+  const selected = accountSelect.value;
+  if (selected) void loadAccount(selected);
+});
+
+// ---------------------------------------------------------------------------
 // Keyboard shortcuts
 // ---------------------------------------------------------------------------
 const sheet = byId<HTMLDialogElement>("shortcuts");
@@ -1056,7 +1267,7 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (!workspaceVisible()) return;
-  if (key >= "1" && key <= "6") {
+  if (key >= "1" && key <= "9") {
     const view = VIEW_ORDER[Number(key) - 1];
     if (view && view !== currentView) {
       event.preventDefault();

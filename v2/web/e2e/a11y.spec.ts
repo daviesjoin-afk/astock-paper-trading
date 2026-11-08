@@ -15,7 +15,7 @@ const scan = async (page: import("@playwright/test").Page, name: string) => {
   expect(summary, `axe violations on ${name}`).toEqual([]);
 };
 
-const VIEWS = ["overview", "positions", "decisions", "replay", "reproduction", "experiment"] as const;
+const VIEWS = ["overview", "positions", "decisions", "replay", "reproduction", "experiment", "account"] as const;
 
 for (const viewport of [{ width: 1280, height: 800, name: "desktop" }, { width: 390, height: 844, name: "mobile" }]) {
   test(`no WCAG A/AA violations in light theme at ${viewport.name}`, async ({ page }) => {

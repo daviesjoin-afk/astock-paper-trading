@@ -81,6 +81,16 @@
     <div class="shell">
       <nav class="sidenav" aria-label="主导航">
         <div class="nav-group">
+          <p class="nav-title">模拟账户</p>
+          <button type="button" class="nav-item" data-view="account" data-testid="nav-account">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <rect x="2" y="3.4" width="12" height="9.2" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path d="M2 6.4h12M4.6 9.6h3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
+            <span>模拟账户</span>
+          </button>
+        </div>
+        <div class="nav-group">
           <p class="nav-title">研究</p>
           <button type="button" class="nav-item" data-view="overview" data-testid="nav-overview">
             <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
@@ -229,6 +239,52 @@ python3 scripts/experiment_demo.py</code></pre>
         <p class="catalogue-warning" id="catalogue-warning" data-testid="catalogue-warning" role="status" hidden></p>
 
         <div id="workspace" hidden>
+          <!-- 模拟账户 -->
+          <section class="panel" id="panel-account" data-testid="panel-account" hidden>
+            <header class="panel-head">
+              <div>
+                <h2>模拟账户</h2>
+                <p class="muted">总本金、准备金与两个策略槽位；只读展示已存事实，不计算收益。</p>
+              </div>
+              <label class="field field-inline">
+                <span class="field-label">账户</span>
+                <span class="select-wrap">
+                  <select id="account-select" data-testid="account-select"></select>
+                  <svg class="select-chevron" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                    <path d="m4 6.5 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+              </label>
+            </header>
+            <div class="section-error" data-testid="account-error" hidden></div>
+            <p class="empty" id="account-empty" data-testid="account-empty" hidden>
+              还没有模拟账户。先通过本地 API 创建账户，再回到本页刷新。
+            </p>
+            <div id="account-body" hidden>
+              <div class="account-totals">
+                <div class="acc-kpi"><h3>初始本金</h3><p class="num" data-testid="account-initial">—</p></div>
+                <div class="acc-kpi"><h3>准备金</h3><p class="num" data-testid="account-reserve">—</p></div>
+                <div class="acc-kpi"><h3>账户现金</h3><p class="num" data-testid="account-cash">—</p></div>
+              </div>
+              <div class="account-slots" id="account-slots" data-testid="account-slots"></div>
+              <div class="compare-section account-orders-section">
+                <h3>最近订单</h3>
+                <div class="table-scroll" tabindex="0" role="region" aria-label="账户最近订单，可横向滚动">
+                  <table class="compare-table">
+                    <caption class="sr-only">账户最近订单：时间、槽位、信号、方向、结果与原因或成交</caption>
+                    <thead><tr>
+                      <th scope="col">时间</th><th scope="col">槽位</th><th scope="col">信号</th>
+                      <th scope="col">方向</th><th scope="col">结果</th><th scope="col">原因 / 成交</th>
+                    </tr></thead>
+                    <tbody id="account-orders" data-testid="account-orders"></tbody>
+                  </table>
+                </div>
+                <p class="empty" data-testid="account-orders-empty" hidden>还没有订单。</p>
+              </div>
+            </div>
+            <p class="panel-foot">账户与槽位是只读事实；成交、拒绝和现金均可回溯，准备金永不参与撮合。</p>
+          </section>
+
           <!-- 概览 -->
           <section class="panel" id="panel-overview" data-testid="panel-overview" hidden>
             <header class="panel-head">
@@ -462,7 +518,7 @@ python3 scripts/experiment_demo.py</code></pre>
       </header>
       <dl class="shortcut-list">
         <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>6</kbd></dt>
-          <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 实验</dd></div>
+          <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 实验 · 账户</dd></div>
         <div><dt><kbd>/</kbd></dt><dd>聚焦“当前实验”选择器</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>刷新当前实验</dd></div>
         <div><dt><kbd>t</kbd></dt><dd>切换深色 / 浅色</dd></div>
