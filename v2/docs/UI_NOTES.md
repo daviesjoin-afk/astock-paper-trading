@@ -121,6 +121,9 @@ form, no valuation.
   line reports steps/fills/rejections.
 - Account overview: a row per account (cash, slot weights, active session
   count, audit verdict); clicking a row switches the console to that account.
+- Coverage: the account header states whether reviewed prices cover the held
+  symbols on the known days (“完整 n/n” or “x/y · 缺口 …”); gaps are warnings,
+  never silently treated as covered.
 - Run status: the account header shows session counts (running/paused/done),
   loaded price-set count and the latest evolution event; any failed probe shows
   “—”, never a stale number.
