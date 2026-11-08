@@ -7,9 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{RuleError, StrategyArtifact};
+use crate::domain::{QuoteRef, RuleError, Signal, StrategyArtifact};
 
 pub const PAPER_ACCOUNT_SCHEMA_VERSION: u32 = 1;
+pub const PAPER_ORDER_SCHEMA_VERSION: u32 = 1;
 pub const PAPER_SLOT_COUNT: usize = 2;
 pub const TOTAL_BPS: i64 = 10_000;
 
@@ -142,5 +143,44 @@ impl PaperAccountSpec {
             return Err(RuleError("account_cash_overflow".into()));
         }
         Ok(PaperCapitalSplit { slot_budgets, reserve_cents })
+    }
+}
+
+/// One simulated order submitted to a strategy slot. The slot, not the client,
+/// owns the strategy identity, budget and cash; the request only names the
+/// intent and the quote evidence it relies on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperOrderRequest {
+    pub schema_version: u32,
+    pub account_id: String,
+    pub slot: PaperSlotId,
+    pub signal_id: String,
+    pub decision_at: String,
+    pub signal: Signal,
+    pub quote_ref: QuoteRef,
+}
+
+impl PaperOrderRequest {
+    pub fn validate(&self) -> Result<(), RuleError> {
+        if self.schema_version != PAPER_ORDER_SCHEMA_VERSION {
+            return Err(RuleError("unsupported_paper_order_version".into()));
+        }
+        if !key_valid(&self.account_id) {
+            return Err(RuleError("invalid_account_id".into()));
+        }
+        if !key_valid(&self.signal_id) {
+            return Err(RuleError("invalid_signal_id".into()));
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.decision_at).is_err() {
+            return Err(RuleError("invalid_decision_time".into()));
+        }
+        if !key_valid(&self.quote_ref.market_data_pack_id)
+            || !key_valid(&self.quote_ref.source)
+            || !key_valid(&self.quote_ref.quote_id)
+        {
+            return Err(RuleError("invalid_identity".into()));
+        }
+        Ok(())
     }
 }
