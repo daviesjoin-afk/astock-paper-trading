@@ -338,13 +338,14 @@ test.describe("paper account console", () => {
     await page.addInitScript(() => {
       localStorage.setItem(
         "astock-v2-last-seen:e2e-account",
-        JSON.stringify({ orders: 0, sessions: 0, switches: 0 }),
+        JSON.stringify({ orders: 0, sessions: 0, switches: 0, events: 0 }),
       );
     });
     await openAccount(page);
     await expect(page.getByTestId("status-since")).toContainText("自上次查看", { timeout: 15_000 });
     await expect(page.getByTestId("status-since")).toContainText("成交 +1");
     await expect(page.getByTestId("status-since")).toContainText("切换 0");
+    await expect(page.getByTestId("status-since")).toContainText("进化 0");
   });
 
   test("explains why valuation is unavailable", async ({ page }) => {
