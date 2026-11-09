@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 CI 归档场景：`verify-report` 作业新增“造一对最小归档产物 → `verify_archive --dir` → 写 manifest”步骤，工件目录改为整个 `v2/artifacts`（含 `verify.json` 与 `archive-manifest.json`），首次在 Linux CI 验证归档目录路径。
 - V2 调度脚本 dry-run 升级：`daily_advance.sh --dry-run` 先调用只读预览并打印会话/步数；服务不可达时退化为打印请求计划；HTTP 非 200 退出 3。冒烟覆盖预览与降级两条路径；`OPERATIONS.md` 说明。
 - V2 推进预览：新增只读 `GET /v2/paper-accounts/{id}/advance/preview?day=`（按中国日统计运行中会话将执行的步数，不写账本）；控制台会话区增加「预览」按钮与文案；Rust 158 passed（+1：计数/不写入/非法日期/缺账户）；浏览器 132 passed（会话用例扩展）。
 - V2 账户面板 a11y 覆盖：新增用例在数据提示与策略切换面板可见后再跑 axe，避免只扫描导航瞬间的页面；浏览器 132 passed（含新增用例；一次全量因本地服务启动超时出现 2 例偶发失败，重跑通过）。
