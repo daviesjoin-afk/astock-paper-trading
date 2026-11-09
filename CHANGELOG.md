@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 归档副本明细：`/v2/archive/manifests` 增加 `entries[]`（副本名/摘要/导出名），控制台以「副本明细」展开；Rust bin 测试与浏览器用例覆盖。
 - V2 归档清单显示合并摘要：`/v2/archive/manifests` 增加 `combined`，控制台优先展示合并摘要前缀（缺省回退单副本摘要）；Rust bin 测试与浏览器用例同步。
 - V2 归档清单面板：新增只读 `GET /v2/archive/manifests`（仅读 `ASTOCK_ARCHIVE_DIR` 下的 `*.manifest.json`，逐文件报告损坏）与控制台「实验信息 → 归档清单」；冒烟覆盖未配置场景；Rust 158 + 1 bin 测试；浏览器 135 passed（+1）。
 - V2 现状页：新增 `v2/docs/STATUS.md`——一句话定位、验证基线（158/58/134、CI 8 作业、schema v15）、按域能力清单与证据、唯一未闭合项（真实审核数据）、立即可跑的验证命令与下一步；README 顶部链接。

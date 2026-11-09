@@ -51,8 +51,8 @@ test.describe("price set catalogue", () => {
       json: {
         dir: "/backup/astock",
         manifests: [
-          { name: "pair.manifest.json", manifest: "a".repeat(64), combined: "c".repeat(64), archives: 1, failed: 0, error: null },
-          { name: "broken.manifest.json", manifest: null, archives: null, failed: null, error: "bad json" },
+          { name: "pair.manifest.json", manifest: "a".repeat(64), combined: "c".repeat(64), archives: 1, failed: 0, entries: [{ name: "pair.sqlite3", manifest: "d".repeat(64), export: "pair.export.json" }], error: null },
+          { name: "broken.manifest.json", manifest: null, combined: null, archives: null, failed: null, entries: [], error: "bad json" },
         ],
       },
     }));
@@ -60,6 +60,8 @@ test.describe("price set catalogue", () => {
     await page.getByTestId("nav-experiment").click();
     await expect(page.getByTestId("archive-pair.manifest.json")).toContainText("副本 1 · 失败 0", { timeout: 15_000 });
     await expect(page.getByTestId("archive-pair.manifest.json")).toContainText("合并 cccccccccccc");
+    await page.getByTestId("archive-pair.manifest.json").getByText("副本明细").click();
+    await expect(page.getByTestId("archive-entry-pair.sqlite3")).toContainText("pair.export.json");
     await expect(page.getByTestId("archive-broken.manifest.json")).toContainText("无法解析");
   });
 
