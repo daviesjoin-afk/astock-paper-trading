@@ -51,7 +51,7 @@ test.describe("price set catalogue", () => {
       json: {
         dir: "/backup/astock",
         manifests: [
-          { name: "pair.manifest.json", manifest: "a".repeat(64), archives: 1, failed: 0, error: null },
+          { name: "pair.manifest.json", manifest: "a".repeat(64), combined: "c".repeat(64), archives: 1, failed: 0, error: null },
           { name: "broken.manifest.json", manifest: null, archives: null, failed: null, error: "bad json" },
         ],
       },
@@ -59,6 +59,7 @@ test.describe("price set catalogue", () => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("nav-experiment").click();
     await expect(page.getByTestId("archive-pair.manifest.json")).toContainText("副本 1 · 失败 0", { timeout: 15_000 });
+    await expect(page.getByTestId("archive-pair.manifest.json")).toContainText("合并 cccccccccccc");
     await expect(page.getByTestId("archive-broken.manifest.json")).toContainText("无法解析");
   });
 

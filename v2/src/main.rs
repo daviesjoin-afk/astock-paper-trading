@@ -41,6 +41,7 @@ fn response<T: serde::Serialize>(value: T) -> ApiResult {
 struct ArchiveManifestEntry {
     name: String,
     manifest: Option<String>,
+    combined: Option<String>,
     archives: Option<usize>,
     failed: Option<i64>,
     error: Option<String>,
@@ -64,6 +65,7 @@ fn archive_manifests_in(dir: &std::path::Path) -> Vec<ArchiveManifestEntry> {
             Ok(value) => entries.push(ArchiveManifestEntry {
                 name: name.to_string(),
                 manifest: value.get("manifest").and_then(|item| item.as_str()).map(str::to_string),
+                combined: value.get("combined").and_then(|item| item.as_str()).map(str::to_string),
                 archives: value
                     .get("archives")
                     .and_then(|item| item.as_array())
@@ -74,6 +76,7 @@ fn archive_manifests_in(dir: &std::path::Path) -> Vec<ArchiveManifestEntry> {
             Err(error) => entries.push(ArchiveManifestEntry {
                 name: name.to_string(),
                 manifest: None,
+                combined: None,
                 archives: None,
                 failed: None,
                 error: Some(error),
@@ -994,7 +997,7 @@ mod archive_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("pair.manifest.json"),
-            r#"{"archives":[{"name":"a"}],"manifest":"abc","failed":0}"#,
+            r#"{"archives":[{"name":"a"}],"combined":"def","manifest":"abc","failed":0}"#,
         )
         .unwrap();
         std::fs::write(dir.join("broken.manifest.json"), "{not json").unwrap();
@@ -1006,6 +1009,7 @@ mod archive_tests {
         assert!(entries[0].error.is_some());
         assert_eq!(entries[1].name, "pair.manifest.json");
         assert_eq!(entries[1].manifest.as_deref(), Some("abc"));
+        assert_eq!(entries[1].combined.as_deref(), Some("def"));
         assert_eq!(entries[1].archives, Some(1));
         assert_eq!(entries[1].failed, Some(0));
         let _ = std::fs::remove_dir_all(&dir);
