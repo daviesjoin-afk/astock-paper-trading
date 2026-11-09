@@ -723,6 +723,11 @@ bash scripts/verify_all.sh --dry-run | grep -q "^rust"
 bash scripts/verify_all.sh --dry-run | grep -q "^browser"
 bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch | grep -q "^archive"
 bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch --report /tmp/r.json | grep -q "archive.json"
+bash scripts/verify_all.sh --dry-run --only research | grep -q "^research"
+if bash scripts/verify_all.sh --dry-run --only research | grep -q "^rust"; then
+  echo "verify_all --only did not filter suites" >&2
+  exit 1
+fi
 
 # Weekly review: synthetic data means no coverage, so the verdict is unstable.
 if python scripts/weekly_review.py --base-cycle shadow-base-1 \

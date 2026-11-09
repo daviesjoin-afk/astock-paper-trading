@@ -109,3 +109,29 @@ jobs:
           python-version: "3.13"
       - name: Full Rust API + Python signal + replay smoke
         run: bash scripts/smoke.sh
+
+  verify-report:
+    runs-on: ubuntu-latest
+    needs: [rust-kernel, research-contract, integration-smoke]
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verification report (research + smoke)
+        env:
+          CARGO: cargo
+          RUSTUP_TOOLCHAIN: "1.99.1"
+        run: |
+          mkdir -p artifacts
+          bash scripts/verify_all.sh --only research,smoke --report artifacts/verify.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v2-verify-report
+          path: v2/artifacts/verify.json
+          if-no-files-found: warn
