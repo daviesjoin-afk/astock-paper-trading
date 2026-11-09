@@ -165,6 +165,7 @@ bash scripts/verify_all.sh --fast          # 跳过浏览器
 bash scripts/verify_all.sh --dry-run       # 只打印将执行的命令
 bash scripts/verify_all.sh --archive /backup/astock   # 附带整目录归档校验
 bash scripts/verify_all.sh --report /tmp/verify.json  # 输出 JSON 汇总（含每套件耗时）
+bash scripts/verify_all.sh --only research,smoke     # 只跑指定套件
 ```
 
 输出按套件打印 `result` 与耗时；任一失败退出码 1。Windows（MSYS）默认使用 `cargo +1.99.1-x86_64-pc-windows-gnu`，其他平台用 `cargo`；可用环境变量 `CARGO`/`PYTHON` 覆盖。浏览器套件需要先有 release 二进制（脚本内会 `npm run build`）。

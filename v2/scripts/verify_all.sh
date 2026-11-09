@@ -8,6 +8,7 @@
 #   --no-scan    skip the sensitive-data scan
 #   --archive D  also verify every ledger/export pair in directory D
 #   --report F   write a JSON summary of every suite to F
+#   --only LIST  comma-separated subset (e.g. research,smoke)
 #   --dry-run    print the commands instead of running them
 #
 # Exit code: 0 all green, 1 any suite failed, 2 usage error.
@@ -18,12 +19,14 @@ SCAN=1
 DRY=0
 ARCHIVE=""
 REPORT=""
+ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --fast) FAST=1; shift ;;
     --no-scan) SCAN=0; shift ;;
     --archive) ARCHIVE="${2:-}"; shift 2 ;;
     --report) REPORT="${2:-}"; shift 2 ;;
+    --only) ONLY="${2:-}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -50,7 +53,16 @@ esac
 
 NAMES=()
 COMMANDS=()
-add() { NAMES+=("$1"); COMMANDS+=("$2"); }
+add() {
+  if [ -n "$ONLY" ]; then
+    case ",$ONLY," in
+      *",$1,"*) ;;
+      *) return 0 ;;
+    esac
+  fi
+  NAMES+=("$1")
+  COMMANDS+=("$2")
+}
 
 add "rust" "$CARGO test --locked"
 add "research" "$PYTHON -m unittest discover -s research -p 'test_*.py'"
