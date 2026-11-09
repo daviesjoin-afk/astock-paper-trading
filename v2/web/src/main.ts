@@ -1729,7 +1729,9 @@ async function loadAccountDataHint(accountId: string): Promise<void> {
 
 type ArchiveManifestEntry = {
   name: string; manifest: string | null; combined: string | null;
-  archives: number | null; failed: number | null; error: string | null;
+  archives: number | null; failed: number | null;
+  entries: Array<{ name: string; manifest: string | null; export: string | null }>;
+  error: string | null;
 };
 
 async function loadArchiveManifests(): Promise<void> {
@@ -1754,6 +1756,20 @@ async function loadArchiveManifests(): Promise<void> {
         ? `${entry.name} · 无法解析：${entry.error}`
         : `${entry.name} · 副本 ${entry.archives ?? 0} · 失败 ${entry.failed ?? 0} · ` +
           `合并 ${(entry.combined ?? entry.manifest ?? "").slice(0, 12)}`;
+      if ((entry.entries ?? []).length > 0) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = "副本明细";
+        const inner = document.createElement("ul");
+        inner.replaceChildren(...entry.entries.map((row) => {
+          const li = document.createElement("li");
+          li.dataset.testid = `archive-entry-${row.name}`;
+          li.textContent = `${row.name} → ${row.export ?? "?"} · ${(row.manifest ?? "").slice(0, 12)}`;
+          return li;
+        }));
+        details.append(summary, inner);
+        item.append(details);
+      }
       return item;
     }));
   } catch {

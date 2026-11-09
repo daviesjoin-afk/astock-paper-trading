@@ -38,12 +38,20 @@ fn response<T: serde::Serialize>(value: T) -> ApiResult {
 }
 
 #[derive(serde::Serialize)]
+struct ArchiveEntryRow {
+    name: String,
+    manifest: Option<String>,
+    export: Option<String>,
+}
+
+#[derive(serde::Serialize)]
 struct ArchiveManifestEntry {
     name: String,
     manifest: Option<String>,
     combined: Option<String>,
     archives: Option<usize>,
     failed: Option<i64>,
+    entries: Vec<ArchiveEntryRow>,
     error: Option<String>,
 }
 
@@ -71,6 +79,20 @@ fn archive_manifests_in(dir: &std::path::Path) -> Vec<ArchiveManifestEntry> {
                     .and_then(|item| item.as_array())
                     .map(|items| items.len()),
                 failed: value.get("failed").and_then(|item| item.as_i64()),
+                entries: value
+                    .get("archives")
+                    .and_then(|item| item.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| ArchiveEntryRow {
+                                name: item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                manifest: item.get("manifest").and_then(|v| v.as_str()).map(str::to_string),
+                                export: item.get("export").and_then(|v| v.as_str()).map(str::to_string),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 error: None,
             }),
             Err(error) => entries.push(ArchiveManifestEntry {
@@ -79,6 +101,7 @@ fn archive_manifests_in(dir: &std::path::Path) -> Vec<ArchiveManifestEntry> {
                 combined: None,
                 archives: None,
                 failed: None,
+                entries: Vec::new(),
                 error: Some(error),
             }),
         }
@@ -997,7 +1020,7 @@ mod archive_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("pair.manifest.json"),
-            r#"{"archives":[{"name":"a"}],"combined":"def","manifest":"abc","failed":0}"#,
+            r#"{"archives":[{"name":"a","manifest":"m1","export":"e1"}],"combined":"def","manifest":"abc","failed":0}"#,
         )
         .unwrap();
         std::fs::write(dir.join("broken.manifest.json"), "{not json").unwrap();
@@ -1011,6 +1034,9 @@ mod archive_tests {
         assert_eq!(entries[1].manifest.as_deref(), Some("abc"));
         assert_eq!(entries[1].combined.as_deref(), Some("def"));
         assert_eq!(entries[1].archives, Some(1));
+        assert_eq!(entries[1].entries.len(), 1);
+        assert_eq!(entries[1].entries[0].name, "a");
+        assert_eq!(entries[1].entries[0].export.as_deref(), Some("e1"));
         assert_eq!(entries[1].failed, Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }

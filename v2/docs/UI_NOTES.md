@@ -127,7 +127,8 @@ form, no valuation.
 - Account overview: a row per account (cash, slot weights, active session
   count, audit verdict); clicking a row switches the console to that account.
 - Archive manifests: 实验信息 lists `*.manifest.json` from `ASTOCK_ARCHIVE_DIR`
-  (副本数/失败数/合并摘要前缀, unparsable files show why); empty when unset.
+  (副本数/失败数/合并摘要前缀, expandable per-copy rows with export names,
+  unparsable files show why); empty when unset.
 - Price sets: 实验信息 shows the loaded catalogue (id, trust, pack, coverage,
   entry count, digest prefix) and a coverage checker for explicit pack/symbol/
   day inputs; reviewed-only rules are stated in the panel.
