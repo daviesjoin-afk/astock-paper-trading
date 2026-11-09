@@ -1577,12 +1577,22 @@ let accountOrderCount = 0;
 
 const sinceStorageKey = (accountId: string): string => `astock-v2-last-seen:${accountId}`;
 
+let accountEventCount = 0;
+let switchesLoaded = false;
+let healthLoaded = false;
+
+const maybeRenderSinceLastVisit = (accountId: string): void => {
+  if (!switchesLoaded || !healthLoaded) return;
+  renderSinceLastVisit(accountId);
+};
+
 const renderSinceLastVisit = (accountId: string): void => {
   const line = testId<HTMLElement>("status-since");
   const current = {
     orders: accountOrderCount,
     sessions: accountSessions.length,
     switches: accountSwitches.length,
+    events: accountEventCount,
   };
   let previous: typeof current | null = null;
   try {
@@ -1604,6 +1614,7 @@ const renderSinceLastVisit = (accountId: string): void => {
     `成交 ${delta(current.orders, previous.orders)}`,
     `会话 ${delta(current.sessions, previous.sessions)}`,
     `切换 ${delta(current.switches, previous.switches)}`,
+    `进化 ${delta(current.events, previous.events ?? 0)}`,
   ];
   toggle(line, true);
   line.textContent = `自上次查看：${changes.join(" · ")}`;
@@ -1687,6 +1698,9 @@ async function loadAccountDataHint(accountId: string): Promise<void> {
     if (currentAccountId !== accountId) return;
     const reviewed = health.reviewed_price_sets ?? 0;
     const synthetic = health.synthetic_price_sets ?? 0;
+    accountEventCount = (health as { evolution_events?: number }).evolution_events ?? 0;
+    healthLoaded = true;
+    maybeRenderSinceLastVisit(accountId);
     toggle(hint, true);
     hint.textContent = reviewed === 0
       ? `审核价格集合 0 · 合成 ${synthetic}；没有审核数据时估值、绩效与资金提案保持不可用`
@@ -1705,7 +1719,8 @@ async function loadStrategySwitches(accountId: string): Promise<void> {
     );
     if (currentAccountId === accountId) {
       renderStrategySwitches(Array.isArray(rows) ? rows : []);
-      renderSinceLastVisit(accountId);
+      switchesLoaded = true;
+      maybeRenderSinceLastVisit(accountId);
     }
   } catch {
     if (currentAccountId === accountId) renderStrategySwitches([]);
@@ -1858,6 +1873,8 @@ const loadAccount = async (accountId: string): Promise<void> => {
   if (!accountId) return;
   clearAccountError();
   currentAccountId = accountId;
+  switchesLoaded = false;
+  healthLoaded = false;
   const encoded = encodeURIComponent(accountId);
   try {
     const [account, orders, sessions] = await Promise.all([

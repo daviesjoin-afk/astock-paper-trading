@@ -150,9 +150,10 @@ form, no valuation.
 - Account advance: the session area advances every runnable session to an
   explicit trading day and reports how many sessions moved, steps, fills and
   rejections.
-- Since last visit: the header compares order/session/switch counts with what
-  this browser last saw for the account (localStorage, counts only, no clock)
-  and prints the delta; first visit stays silent.
+- Since last visit: the header compares order/session/switch counters plus the
+  global evolution-event count with what this browser last saw (localStorage,
+  counts only, no clock) and prints the deltas once both probes have loaded;
+  first visit stays silent.
 - Run status: the account header shows only account-scoped session counts
   (running/paused/done); global facts (price sets, latest evolution event) live
   on the overview page, so the two views no longer duplicate each other.
