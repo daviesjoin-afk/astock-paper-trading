@@ -213,8 +213,8 @@ live trading or news learning.
 | Valuation | reviewed price-set registry, single-point valuation, equity series, drawdown | `GET /v2/paper-accounts/{id}/valuation` |
 | Performance | profit, return bps, drawdown, fees, trades for accounts and experiments | `/performance` |
 | Dynamic capital | proposal with bounds, audited rebalance, cost-basis exposure | `/allocation-proposal`, `/rebalances`, `/exposure` |
-| Evolution | candidate generation, parameterized artifacts, shadow runs, signal diff, rolling windows, governed decisions, event log | ADR-012-017 |
-| Operations | health with schema/price-set counts, single-writer concurrency proof, runbook, cron helpers | `docs/OPERATIONS.md` |
+| Evolution | candidate generation, parameterized artifacts, shadow runs, signal diff, rolling windows, governed decisions, event log (filters, export, offline verify), strategy-version switching | ADR-012-018 |
+| Operations | health with schema/price-set counts, single-writer concurrency proof, runbook, cron helpers, backup/restore, archive verification (single pair or directory, manifest sidecar), one-command verification with JSON report | `docs/OPERATIONS.md` |
 
 ## ADR index
 
@@ -237,7 +237,7 @@ live trading or news learning.
 | 015 | signal-level diff |
 | 016 | performance metrics |
 | 017 | rolling-window validation |
-| 018 | explicit strategy-version switching (proposed) |
+| 018 | explicit strategy-version switching (implemented) |
 
 ## Command cheat sheet
 
@@ -257,13 +257,22 @@ python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --win
 python research/make_price_set.py --input prices.csv --out data/price-sets/x.json ...
 ```
 
+## Verification entry points
+
+| Command | Covers |
+| --- | --- |
+| `bash scripts/verify_all.sh` | rust, research, smoke, browser, leak scan |
+| `bash scripts/verify_all.sh --archive DIR --report out.json` | adds archive verification, writes a JSON summary |
+| `bash scripts/smoke.sh` | HTTP, ledger, replays, scheduler scripts, publishing, evolution, archive |
+| `python scripts/verify_archive.py --dir DIR` | ledger/export/sidecar consistency for a backup directory |
+
 ## Known limits
 
 - **No reviewed price data is bundled.** Every valuation/performance/proposal path
   fails closed with `no_reviewed_price_set` until audited data is added.
 - No annualized/Sharpe metrics, no automatic promotion execution, no daemon:
   scheduling is the caller's job (cron/task system).
-- Schema upgrades require a fresh database; old local files are rejected by design.
+- Schema upgrades require a fresh database (current schema v15); old local files are rejected by design.
 - All trading is paper-only; there is no broker integration, and the 8600
   deployment claim remains unverified.
 
