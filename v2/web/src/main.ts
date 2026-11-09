@@ -1658,7 +1658,7 @@ async function loadOverviewStatus(): Promise<void> {
     const health = await api<{
       accounts: number; sessions_active: number;
       price_sets: number; reviewed_price_sets: number; synthetic_price_sets: number;
-      evolution_events: number;
+      evolution_events: number; archive_dir_configured: boolean;
     }>("/v2/health", new AbortController().signal);
     overviewEventCount = health.evolution_events ?? 0;
     setText("overview-accounts", `账户：${health.accounts ?? 0}`);
@@ -1666,6 +1666,10 @@ async function loadOverviewStatus(): Promise<void> {
     setText(
       "overview-price-sets",
       `价格集合：${health.price_sets ?? 0}（审核 ${health.reviewed_price_sets ?? 0} / 合成 ${health.synthetic_price_sets ?? 0}）`,
+    );
+    setText(
+      "overview-archive",
+      health.archive_dir_configured ? "归档：已配置" : "归档：未配置",
     );
     const guidance = testId<HTMLElement>("overview-data-hint");
     if ((health.reviewed_price_sets ?? 0) === 0) {
@@ -1682,6 +1686,7 @@ async function loadOverviewStatus(): Promise<void> {
     setText("overview-accounts", "账户：—");
     setText("overview-sessions", "会话：—");
     setText("overview-price-sets", "价格集合：—");
+    setText("overview-archive", "归档：—");
     toggle(testId<HTMLElement>("overview-data-hint"), false);
   }
   try {
