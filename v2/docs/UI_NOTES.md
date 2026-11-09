@@ -129,7 +129,7 @@ form, no valuation.
 - A/B comparison: 实验信息 lets you enter two experiment ids, then renders a
   side-by-side table (cash, initial capital, runs, position count, as-of day,
   replay verification) with a cash-difference note; no NAV, return or ranking
-  is shown.
+  is shown. Equal ids are refused, and the populated table is axe-scanned.
 - Archive manifests: 实验信息 lists `*.manifest.json` from `ASTOCK_ARCHIVE_DIR`
   (副本数/失败数/合并摘要前缀, expandable per-copy rows with export names,
   unparsable files show why); empty when unset.

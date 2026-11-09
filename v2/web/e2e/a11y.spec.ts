@@ -59,6 +59,22 @@ test("the account console stays accessible with the data and switch panels", asy
   await scan(page, "account-panels");
 });
 
+test("the comparison table is accessible once populated", async ({ page }) => {
+  await page.route(/\/v2\/portfolio\?cycle_id=/, (route) => route.fulfill({
+    json: {
+      cycle_id: "a11y-cycle", cash_cents: 9_900_000, initial_cash_cents: 10_000_000,
+      runs_total: 1, positions: [{ symbol: "600000.SH" }], asof_day: "2026-11-02",
+    },
+  }));
+  await page.route(/\/v2\/replay\?cycle_id=/, (route) => route.fulfill({ json: { ok: true } }));
+  await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+  await page.getByTestId("nav-experiment").click();
+  await page.getByTestId("compare-candidate").fill("a11y-candidate");
+  await page.getByTestId("compare-run").click();
+  await expect(page.getByTestId("compare-table")).toBeVisible();
+  await scan(page, "compare-table");
+});
+
 test("the session creation form is accessible", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.repro}&account=e2e-session-account#/account`);
   await page.getByTestId("session-card-e2e-session").waitFor();
