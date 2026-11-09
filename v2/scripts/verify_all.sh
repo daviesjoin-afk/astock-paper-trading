@@ -33,9 +33,20 @@ done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-CARGO="${CARGO:-cargo +1.99.1-x86_64-pc-windows-gnu}"
 PYTHON="${PYTHON:-python}"
-export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.99.1-x86_64-pc-windows-gnu}"
+# Windows here has no MSVC toolchain; use the pinned GNU toolchain by default.
+# Other platforms use plain cargo unless the caller overrides CARGO.
+case "${OSTYPE:-}" in
+  msys*|cygwin*)
+    if [ -z "${RUSTUP_TOOLCHAIN:-}" ]; then
+      export RUSTUP_TOOLCHAIN="1.99.1-x86_64-pc-windows-gnu"
+    fi
+    CARGO="${CARGO:-cargo +1.99.1-x86_64-pc-windows-gnu}"
+    ;;
+  *)
+    CARGO="${CARGO:-cargo}"
+    ;;
+esac
 
 NAMES=()
 COMMANDS=()
