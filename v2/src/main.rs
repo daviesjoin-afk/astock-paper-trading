@@ -124,6 +124,9 @@ async fn health(State(state): State<Shared>) -> ApiResult {
     let schema_version: i64 = db.schema_version().map_err(api_error)?;
     let price_sets = db.price_set_catalogue().map(|sets| sets.len()).unwrap_or(0);
     let counts = db.health_counts().ok();
+    let archive_dir_configured = std::env::var("ASTOCK_ARCHIVE_DIR")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false);
     response(json!({
         "status": "ok",
         "system": "astock-v2",
@@ -135,6 +138,7 @@ async fn health(State(state): State<Shared>) -> ApiResult {
         "accounts": counts.map(|c| c.accounts).unwrap_or(0),
         "sessions_active": counts.map(|c| c.sessions_active).unwrap_or(0),
         "evolution_events": counts.map(|c| c.evolution_events).unwrap_or(0),
+        "archive_dir_configured": archive_dir_configured,
         "writer": "store-single-writer",
     }))
 }
