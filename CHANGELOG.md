@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 CI 验证扫描路径：`verify-report` 作业改为 `--only research,smoke,security-scan`，在 CI 中实际执行验证脚本的扫描分支（此前仅独立 security 作业覆盖，路径不同源）；`OPERATIONS.md` 同步。
 - V2 修复一键验证的泄露扫描路径：脚本在 `v2/` 运行时指向不存在的 `scripts/security/...`，改为仓库根 `../scripts/security/scan-sensitive-data.py --repo ..`；`--only security-scan` 与全量 `verify_all` 现均通过；冒烟断言 dry-run 含正确路径。
 - V2 概览移动端：新增 390px 用例，确认含归档字段的状态条不产生横向溢出；浏览器 136 passed（+1）。
 - V2 概览归档状态：状态条增加「归档：已配置/未配置」（来自 health），与价格集合信任拆分并列；浏览器 135 passed（同用例断言）。

@@ -128,7 +128,7 @@ jobs:
           RUSTUP_TOOLCHAIN: "1.99.1"
         run: |
           mkdir -p artifacts
-          bash scripts/verify_all.sh --only research,smoke --report artifacts/verify.json
+          bash scripts/verify_all.sh --only research,smoke,security-scan --report artifacts/verify.json
       - name: Archive pair scenario
         run: |
           mkdir -p artifacts/archive-dir
