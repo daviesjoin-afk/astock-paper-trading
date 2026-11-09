@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 概览移动端：新增 390px 用例，确认含归档字段的状态条不产生横向溢出；浏览器 136 passed（+1）。
 - V2 概览归档状态：状态条增加「归档：已配置/未配置」（来自 health），与价格集合信任拆分并列；浏览器 135 passed（同用例断言）。
 - V2 健康暴露归档配置：`/v2/health` 增加 `archive_dir_configured`（`ASTOCK_ARCHIVE_DIR` 是否设置），便于确认控制台归档面板为何为空；冒烟断言默认 false。
 - V2 文档基线同步：`STATUS.md`/`ACCEPTANCE.md` 更新为 Rust 158 lib + 1 bin / Python 58 / 浏览器 135，补入推进预览与归档清单面板能力。

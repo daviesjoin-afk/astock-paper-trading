@@ -57,6 +57,25 @@ test.describe("overview run status", () => {
     await expect(page.getByTestId("panel-experiment")).toBeVisible();
   });
 
+  test("the status strip fits a 390px viewport", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.route(/\/v2\/health$/, (route) => route.fulfill({
+      json: {
+        status: "ok", system: "astock-v2", paper_only: true,
+        schema_version: 15, writer: "store-single-writer",
+        accounts: 2, sessions_active: 3,
+        price_sets: 2, reviewed_price_sets: 1, synthetic_price_sets: 1,
+        evolution_events: 2, archive_dir_configured: true,
+      },
+    }));
+    await page.route(/\/v2\/evolution\/events\/page/, (route) => route.fulfill({ json: pageEmpty() }));
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await expect(page.getByTestId("overview-archive")).toHaveText("归档：已配置", { timeout: 15_000 });
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow).toBeLessThanOrEqual(1);
+  });
+
   test("failed probes show dashes instead of stale numbers", async ({ page }) => {
     await page.route(/\/v2\/health$/, (route) => route.abort());
     await page.route(/\/v2\/evolution\/events\/page/, (route) => route.abort());
