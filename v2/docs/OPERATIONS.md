@@ -93,7 +93,7 @@ python scripts/verify_archive.py --dir /backup/astock
 # all 1 archives verified
 ```
 
-任一副本缺配对或摘要不符 → 退出码 1，并逐条列出原因。加 `--manifest-out manifest.json` 会在校验通过后写出侧车清单（两文件 SHA-256、schema、事件数与合并 manifest），失败时**不写**，便于归档目录自证。
+任一副本缺配对或摘要不符 → 退出码 1，并逐条列出原因。加 `--manifest-out F` 会在校验后写出 `{archives[], combined, failed}`；`verify_all --archive D --report R` 会自动把它写到 `R.archive.json`。加 `--manifest-out manifest.json` 会在校验通过后写出侧车清单（两文件 SHA-256、schema、事件数与合并 manifest），失败时**不写**，便于归档目录自证。
 
 每周复核（只读，不写账本）：
 

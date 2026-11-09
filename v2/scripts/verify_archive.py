@@ -134,6 +134,7 @@ def run_directory(args: argparse.Namespace) -> int:
         print(f"error: no *.sqlite3 found in {root}", file=sys.stderr)
         return 2
     failed = 0
+    verified: list[dict] = []
     for db_path in dbs:
         export_path = export_for(db_path)
         if export_path is None:
@@ -152,6 +153,19 @@ def run_directory(args: argparse.Namespace) -> int:
             failed += 1
             continue
         print(f"{db_path.name} ok manifest={manifest}")
+        verified.append({"name": db_path.name, "manifest": manifest, "export": export_path.name})
+    if args.manifest_out and verified:
+        combined = manifest_digest({entry["name"]: entry["manifest"] for entry in verified})
+        sidecar = Path(args.manifest_out)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(
+                {"archives": verified, "combined": combined, "failed": failed},
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
     if failed:
         print(f"{failed} of {len(dbs)} archives failed", file=sys.stderr)
         return 1
