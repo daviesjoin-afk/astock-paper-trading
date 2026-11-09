@@ -1,4 +1,4 @@
-# V2 现状（截至 2026-11-08，master `125d69c`）
+# V2 现状（截至 2026-11-08，master `a63f2da`）
 
 一页看清“系统现在能做什么、证据在哪、还缺什么”。
 
@@ -12,6 +12,7 @@
 | --- | --- |
 | Rust 测试 | 158 lib + 1 bin |
 | Python 研究测试 | 58 |
+| 扫描器自身测试 | 3（OID/允许清单排除、未知十六进制仍报告） |
 | Playwright | 136（24 skipped） |
 | 端到端冒烟 | 全链路通过（含脚本自身行为断言） |
 | CI | 8 个作业全绿；`verify-report` 跑 research/smoke/security-scan（checkout 全历史），上传验证报告 + 归档清单 |
@@ -57,6 +58,7 @@
 - 归档：`verify_archive`（单对 / 整目录 / 侧车 / 合并 manifest）；控制台可列 `ASTOCK_ARCHIVE_DIR` 下的清单（副本数/失败数/合并摘要/逐副本明细）。
 - 调度：`daily_advance.sh`（dry-run 调预览）、`weekly_review.py`（三种窗口来源）。
 - 一键验证 + JSON 报告；CI 工件留存。
+- 泄露扫描器有自身单测（排除逻辑的假阴性/假阳性控制），CI 安全作业先跑测试再扫描。
 
 ## 唯一未闭合项
 
