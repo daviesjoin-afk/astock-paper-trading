@@ -43,10 +43,45 @@ payload=$(printf '{"day":"%s"}' "$DAY")
 url="${API%/}/v2/paper-accounts/${ACCOUNT}/advance"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "POST $url"
-  echo "content-type: application/json"
-  echo "$payload"
-  exit 0
+  preview_url="${API%/}/v2/paper-accounts/${ACCOUNT}/advance/preview?day=${DAY}"
+  body=$(mktemp)
+  code=$(curl -s --max-time 5 -o "$body" -w '%{http_code}' "$preview_url" || true)
+  [ -n "$code" ] || code="000"
+  case "$code" in
+    200)
+      python - "$body" <<'PY_PREVIEW'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    preview = json.load(handle)
+print(
+    "preview account={account} day={day} sessions={sessions} steps={steps}".format(
+        account=preview.get("account_id"),
+        day=preview.get("day"),
+        sessions=len(preview.get("sessions", [])),
+        steps=preview.get("total_steps"),
+    )
+)
+for session in preview.get("sessions", []):
+    print("  {session}: {steps} step(s)".format(**session))
+PY_PREVIEW
+      rm -f "$body"
+      exit 0
+      ;;
+    000)
+      echo "preview unavailable (service not reachable); printing request only"
+      echo "POST $url"
+      echo "content-type: application/json"
+      echo "$payload"
+      rm -f "$body"
+      exit 0
+      ;;
+    *)
+      echo "preview failed (HTTP $code) for account=$ACCOUNT day=$DAY" >&2
+      cat "$body" >&2 || true
+      rm -f "$body"
+      exit 3
+      ;;
+  esac
 fi
 
 response=$(curl -fsS --max-time 30 -X POST "$url" \

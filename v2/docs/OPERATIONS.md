@@ -29,6 +29,8 @@
 ```bash
 # 每交易日 15:30（中国时区）推进账户到当天
 30 15 * * 1-5 /opt/astock/v2/scripts/daily_advance.sh   --account paper-001 --day "$(TZ=Asia/Shanghai date +%F)"
+
+`--dry-run` 会先请求只读预览（`/advance/preview`）并打印将执行的会话与步数；服务不可达时退化为打印请求计划。
 ```
 
 脚本行为：
