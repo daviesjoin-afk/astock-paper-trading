@@ -1739,6 +1739,61 @@ type ArchiveManifestEntry = {
   error: string | null;
 };
 
+type CompareSide = {
+  cycle_id: string; cash_cents: number; initial_cash_cents: number;
+  runs_total: number; positions: Array<{ symbol: string }>; asof_day: string | null;
+};
+
+const runComparison = async (): Promise<void> => {
+  const baseId = byId<HTMLInputElement>("compare-base").value.trim();
+  const candidateId = byId<HTMLInputElement>("compare-candidate").value.trim();
+  const table = testId<HTMLTableElement>("compare-table");
+  const note = testId<HTMLElement>("compare-note");
+  if (!baseId || !candidateId) {
+    toggle(table, false);
+    toggle(note, true);
+    note.textContent = "请填写两个实验标识";
+    return;
+  }
+  try {
+    const [base, candidate] = await Promise.all([
+      api<CompareSide>(`/v2/portfolio?cycle_id=${encodeURIComponent(baseId)}`, new AbortController().signal),
+      api<CompareSide>(`/v2/portfolio?cycle_id=${encodeURIComponent(candidateId)}`, new AbortController().signal),
+    ]);
+    const money = (cents: number) => `¥${(cents / 100).toFixed(2)}`;
+    const rows: Array<[string, string, string]> = [
+      ["现金", money(base.cash_cents), money(candidate.cash_cents)],
+      ["初始本金", money(base.initial_cash_cents), money(candidate.initial_cash_cents)],
+      ["运行次数", String(base.runs_total), String(candidate.runs_total)],
+      ["持仓数", String(base.positions.length), String(candidate.positions.length)],
+      ["估值日", base.asof_day ?? "—", candidate.asof_day ?? "—"],
+    ];
+    const body = testId<HTMLTableSectionElement>("compare-body");
+    body.replaceChildren(...rows.map(([label, left, right]) => {
+      const tr = document.createElement("tr");
+      const head = document.createElement("th");
+      head.scope = "row";
+      head.textContent = label;
+      const l = document.createElement("td");
+      l.textContent = left;
+      const r = document.createElement("td");
+      r.textContent = right;
+      tr.append(head, l, r);
+      return tr;
+    }));
+    toggle(table, true);
+    toggle(note, true);
+    const cashDelta = candidate.cash_cents - base.cash_cents;
+    note.textContent = cashDelta === 0
+      ? "两个实验现金一致；本页不展示净值、收益率或排名。"
+      : `候选现金相对基准 ${cashDelta > 0 ? "多" : "少"} ¥${Math.abs(cashDelta / 100).toFixed(2)}；不展示净值、收益率或排名。`;
+  } catch (error) {
+    toggle(table, false);
+    toggle(note, true);
+    note.textContent = `对比失败：${errorDetail(error)}`;
+  }
+};
+
 async function loadArchiveManifests(): Promise<void> {
   const list = testId<HTMLUListElement>("archive-list");
   const empty = testId<HTMLElement>("archive-empty");
@@ -2597,6 +2652,8 @@ const runCoverageCheck = async (): Promise<void> => {
 
 testId<HTMLButtonElement>("coverage-run").addEventListener("click", () => void runCoverageCheck());
 testId<HTMLButtonElement>("overview-coverage-link").addEventListener("click", () => showView("experiment"));
+testId<HTMLButtonElement>("compare-run").addEventListener("click", () => void runComparison());
+byId<HTMLInputElement>("compare-base").value = new URLSearchParams(location.search).get("cycle_id") ?? "";
 
 const loadEvolution = async (): Promise<void> => {
   const empty = testId<HTMLElement>("evolution-empty");
