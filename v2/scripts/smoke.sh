@@ -677,7 +677,10 @@ print("HTTP evidence ingress/conflicts/bypasses/rejections/retries/replay passed
 PY
 # Scheduler helper: explicit day, dry-run and validation without writes.
 bash scripts/daily_advance.sh --account smoke-account --day 2026-10-30 --dry-run \
-  | grep -q "POST .*/v2/paper-accounts/smoke-account/advance"
+  | grep -q "preview account=smoke-account day=2026-10-30"
+bash scripts/daily_advance.sh --account smoke-account --day 2026-10-30 --dry-run \
+  --api http://127.0.0.1:9 \
+  | grep -q "preview unavailable"
 bash scripts/daily_advance.sh --account smoke-account --day 2026-10-30 \
   | grep -q "advanced account=smoke-account day=2026-10-30"
 if bash scripts/daily_advance.sh --account smoke-account --day bad-day > /dev/null 2>&1; then
