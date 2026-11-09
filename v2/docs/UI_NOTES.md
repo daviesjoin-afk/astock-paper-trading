@@ -129,8 +129,9 @@ form, no valuation.
 - Price sets: 实验信息 shows the loaded catalogue (id, trust, pack, coverage,
   entry count, digest prefix) and a coverage checker for explicit pack/symbol/
   day inputs; reviewed-only rules are stated in the panel.
-- Overview status: the landing page prints account count, active sessions,
-  loaded price sets and the latest evolution event; a failed probe shows “—”,
+- Overview status: the landing page prints account count, active sessions and
+  price sets split by trust (审核/合成) from `/v2/health`, plus the latest
+  evolution event; a failed probe shows “—”,
   never a stale number.
 - Strategy versions: the account page prints the current version and switch
   count per slot, lists the append-only switch history, and records a switch
