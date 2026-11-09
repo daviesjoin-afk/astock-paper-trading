@@ -4494,3 +4494,21 @@ fn a_session_started_after_the_switch_books_orders_under_the_new_version() {
     assert_eq!(orders[0].strategy_version_id, "research-momentum-v2");
     assert_eq!(orders[0].slot, "A");
 }
+
+#[test]
+fn health_counts_accounts_sessions_and_price_set_trust() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("health-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    db.create_paper_session(session_spec(
+        "health-acct",
+        "health-session",
+        vec![session_signal(PaperSlotId::A, &output.signals[0])],
+    ))
+    .unwrap();
+
+    let counts = db.health_counts().unwrap();
+    assert_eq!(counts.accounts, 1);
+    assert_eq!(counts.sessions_active, 1);
+    assert_eq!(counts.reviewed_price_sets + counts.synthetic_price_sets, db.price_set_catalogue().unwrap().len() as i64);
+}

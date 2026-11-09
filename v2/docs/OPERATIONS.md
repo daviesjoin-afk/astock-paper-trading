@@ -149,6 +149,14 @@ curl -fsS "http://127.0.0.1:8765/v2/price-sets/coverage?pack_id=cn-offline-fixtu
 
 返回 `covered_pairs` 与 `missing[]`（只统计 `reviewed` 集合）；缺口不为空时不要指望估值/绩效可用。
 
+## 健康检查
+
+```bash
+curl -fsS http://127.0.0.1:8765/v2/health
+```
+
+返回 `schema_version`、`accounts`、`sessions_active`、`price_sets`（总数）、`reviewed_price_sets`、`synthetic_price_sets`、`paper_only`、`writer`。`reviewed_price_sets == 0` 时估值/绩效/资金提案必然不可用。
+
 ## 一键验证
 
 ```bash

@@ -100,6 +100,15 @@ pub struct PaperSlotView {
     pub orders_total: i64,
 }
 
+/// Counters exposed by `GET /v2/health`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCounts {
+    pub accounts: i64,
+    pub sessions_active: i64,
+    pub reviewed_price_sets: i64,
+    pub synthetic_price_sets: i64,
+}
+
 /// One append-only strategy-version switch on a paper slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrategySwitchRecord {

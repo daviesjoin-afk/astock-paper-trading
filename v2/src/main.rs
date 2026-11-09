@@ -41,12 +41,17 @@ async fn health(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     let schema_version: i64 = db.schema_version().map_err(api_error)?;
     let price_sets = db.price_set_catalogue().map(|sets| sets.len()).unwrap_or(0);
+    let counts = db.health_counts().ok();
     response(json!({
         "status": "ok",
         "system": "astock-v2",
         "paper_only": true,
         "schema_version": schema_version,
         "price_sets": price_sets,
+        "reviewed_price_sets": counts.map(|c| c.reviewed_price_sets).unwrap_or(0),
+        "synthetic_price_sets": counts.map(|c| c.synthetic_price_sets).unwrap_or(0),
+        "accounts": counts.map(|c| c.accounts).unwrap_or(0),
+        "sessions_active": counts.map(|c| c.sessions_active).unwrap_or(0),
         "writer": "store-single-writer",
     }))
 }
