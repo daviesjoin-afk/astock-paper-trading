@@ -13,6 +13,7 @@ test.describe("overview run status", () => {
         schema_version: 15, writer: "store-single-writer",
         accounts: 2, sessions_active: 3,
         price_sets: 2, reviewed_price_sets: 1, synthetic_price_sets: 1,
+        evolution_events: 2,
       },
     }));
     await page.route(/\/v2\/evolution\/events\/page\?limit=1/, (route) => route.fulfill({
@@ -29,6 +30,7 @@ test.describe("overview run status", () => {
     await expect(page.getByTestId("overview-accounts")).toHaveText("账户：2", { timeout: 15_000 });
     await expect(page.getByTestId("overview-sessions")).toHaveText("会话：活动 3");
     await expect(page.getByTestId("overview-price-sets")).toHaveText("价格集合：2（审核 1 / 合成 1）");
+    await expect(page.getByTestId("overview-evolution")).toContainText("进化：2 条");
     await expect(page.getByTestId("overview-evolution")).toContainText("最近 已晋级");
   });
 

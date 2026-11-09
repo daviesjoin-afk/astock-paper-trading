@@ -4511,6 +4511,17 @@ fn health_counts_accounts_sessions_and_price_set_trust() {
     assert_eq!(counts.accounts, 1);
     assert_eq!(counts.sessions_active, 1);
     assert_eq!(counts.reviewed_price_sets + counts.synthetic_price_sets, db.price_set_catalogue().unwrap().len() as i64);
+    assert_eq!(counts.evolution_events, 0);
+
+    let decision = crate::domain::EvolutionDecision {
+        candidate_id: "health-cand".into(),
+        status: "kept".into(),
+        reasons: vec!["保持".into()],
+        digest: "a".repeat(64),
+    };
+    db.record_evolution_event("health-event", "2026-11-05T10:00:00+08:00", decision)
+        .unwrap();
+    assert_eq!(db.health_counts().unwrap().evolution_events, 1);
 }
 
 #[test]

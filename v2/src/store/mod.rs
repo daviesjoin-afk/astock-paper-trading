@@ -122,6 +122,7 @@ pub struct HealthCounts {
     pub sessions_active: i64,
     pub reviewed_price_sets: i64,
     pub synthetic_price_sets: i64,
+    pub evolution_events: i64,
 }
 
 /// One append-only strategy-version switch on a paper slot.

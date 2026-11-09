@@ -165,7 +165,7 @@ curl -fsS "http://127.0.0.1:8765/v2/price-sets/coverage?pack_id=cn-offline-fixtu
 curl -fsS http://127.0.0.1:8765/v2/health
 ```
 
-返回 `schema_version`、`accounts`、`sessions_active`、`price_sets`（总数）、`reviewed_price_sets`、`synthetic_price_sets`、`paper_only`、`writer`。`reviewed_price_sets == 0` 时估值/绩效/资金提案必然不可用。
+返回 `schema_version`、`accounts`、`sessions_active`、`price_sets`（总数）、`reviewed_price_sets`、`synthetic_price_sets`、`evolution_events`、`paper_only`、`writer`。`reviewed_price_sets == 0` 时估值/绩效/资金提案必然不可用。
 
 ## 一键验证
 

@@ -2120,11 +2120,15 @@ impl Store {
                 }
             }
         }
+        let evolution_events: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM v2_evolution_events", [], |row| row.get(0))?;
         Ok(HealthCounts {
             accounts,
             sessions_active,
             reviewed_price_sets: reviewed,
             synthetic_price_sets: synthetic,
+            evolution_events,
         })
     }
 }
