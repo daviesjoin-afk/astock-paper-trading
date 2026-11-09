@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 数据接入指南：新增 `v2/docs/DATA_ONBOARDING.md`——CSV 列规范、`publish_price_set.sh` 一步生成安装、覆盖核对、健康/估值验证、滚动复核、归档复核、常见拒绝含义与禁止事项；README 与 `OPERATIONS.md` 链接该文档。
 - V2 概览直达覆盖核对：警告行增加「去核对覆盖」按钮，点击切到实验信息页（价格集合目录与缺口核对）；用例断言跳转；浏览器 134 passed（同用例）。
 - V2 验收对照表刷新：基线更新为 Rust 158 / Python 58 / 浏览器 134，补充 CI 8 作业与 `verify-report` 工件、失败时报告 `ok=false`、`--only/--archive/--report` 组合与退出码约定。
 - V2 概览数据指引：审核集合为 0 时落地页显示警告，指向 `data/price-set-examples` 模板与 `publish_price_set.sh`，并说明估值/绩效/提案不可用；有审核数据时隐藏；浏览器 134 passed（+1）。

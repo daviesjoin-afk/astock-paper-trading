@@ -151,6 +151,8 @@ bash scripts/publish_price_set.sh --input prices.csv --set-id cn-close-2026-11  
 4. `GET /v2/price-sets` 核对 `price_set_id`、信任级别与摘要；
 5. 回到账户页确认估值由 `unavailable` 变为 `valued`；失败时按 `missing` 清单补数据。
 
+完整数据接入流程（CSV 列、生成/安装、覆盖核对、可用性验证、归档）见 [DATA_ONBOARDING.md](DATA_ONBOARDING.md)。
+
 发布前可用覆盖报告核对缺口：
 
 ```bash
