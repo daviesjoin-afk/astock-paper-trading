@@ -37,6 +37,62 @@ fn response<T: serde::Serialize>(value: T) -> ApiResult {
     })
 }
 
+#[derive(serde::Serialize)]
+struct ArchiveManifestEntry {
+    name: String,
+    manifest: Option<String>,
+    archives: Option<usize>,
+    failed: Option<i64>,
+    error: Option<String>,
+}
+
+fn archive_manifests_in(dir: &std::path::Path) -> Vec<ArchiveManifestEntry> {
+    let mut entries = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return entries;
+    };
+    for item in read_dir.flatten() {
+        let path = item.path();
+        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        if !name.ends_with(".manifest.json") {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| error.to_string()));
+        match parsed {
+            Ok(value) => entries.push(ArchiveManifestEntry {
+                name: name.to_string(),
+                manifest: value.get("manifest").and_then(|item| item.as_str()).map(str::to_string),
+                archives: value
+                    .get("archives")
+                    .and_then(|item| item.as_array())
+                    .map(|items| items.len()),
+                failed: value.get("failed").and_then(|item| item.as_i64()),
+                error: None,
+            }),
+            Err(error) => entries.push(ArchiveManifestEntry {
+                name: name.to_string(),
+                manifest: None,
+                archives: None,
+                failed: None,
+                error: Some(error),
+            }),
+        }
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    entries
+}
+
+async fn archive_manifests() -> ApiResult {
+    let dir = std::env::var("ASTOCK_ARCHIVE_DIR").ok().filter(|value| !value.is_empty());
+    let manifests = dir
+        .as_deref()
+        .map(|path| archive_manifests_in(std::path::Path::new(path)))
+        .unwrap_or_default();
+    response(json!({ "dir": dir, "manifests": manifests }))
+}
+
 async fn health(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     let schema_version: i64 = db.schema_version().map_err(api_error)?;
@@ -829,6 +885,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always local-only. No network exposure, broker or real-money endpoints.
     let app = Router::new()
         .route("/v2/health", get(health))
+        .route("/v2/archive/manifests", get(archive_manifests))
         .route("/v2/experiments", post(create_experiment).get(list_experiments))
         .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
         .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
@@ -924,4 +981,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("astock-v2 paper-only gateway listening at http://127.0.0.1:8765");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::archive_manifests_in;
+
+    #[test]
+    fn manifests_are_listed_and_invalid_files_reported() {
+        let dir = std::env::temp_dir().join(format!("astock-arch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pair.manifest.json"),
+            r#"{"archives":[{"name":"a"}],"manifest":"abc","failed":0}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("broken.manifest.json"), "{not json").unwrap();
+        std::fs::write(dir.join("ignore.txt"), "x").unwrap();
+
+        let entries = archive_manifests_in(&dir);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "broken.manifest.json");
+        assert!(entries[0].error.is_some());
+        assert_eq!(entries[1].name, "pair.manifest.json");
+        assert_eq!(entries[1].manifest.as_deref(), Some("abc"));
+        assert_eq!(entries[1].archives, Some(1));
+        assert_eq!(entries[1].failed, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -45,6 +45,23 @@ test.describe("price set catalogue", () => {
     await expect(page.getByTestId("coverage-result")).toContainText("600000.SH@2026-11-02");
   });
 
+  test("lists archive manifests when a directory is configured", async ({ page }) => {
+    await page.route(/\/v2\/price-sets$/, (route) => route.fulfill({ json: [] }));
+    await page.route(/\/v2\/archive\/manifests$/, (route) => route.fulfill({
+      json: {
+        dir: "/backup/astock",
+        manifests: [
+          { name: "pair.manifest.json", manifest: "a".repeat(64), archives: 1, failed: 0, error: null },
+          { name: "broken.manifest.json", manifest: null, archives: null, failed: null, error: "bad json" },
+        ],
+      },
+    }));
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("nav-experiment").click();
+    await expect(page.getByTestId("archive-pair.manifest.json")).toContainText("副本 1 · 失败 0", { timeout: 15_000 });
+    await expect(page.getByTestId("archive-broken.manifest.json")).toContainText("无法解析");
+  });
+
   test("an empty catalogue says so and refuses incomplete checks", async ({ page }) => {
     await page.route(/\/v2\/price-sets$/, (route) => route.fulfill({ json: [] }));
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);

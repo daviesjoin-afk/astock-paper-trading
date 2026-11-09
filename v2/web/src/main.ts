@@ -170,7 +170,10 @@ const showView = (view: View, options: { updateUrl?: boolean } = {}): void => {
   }
   if (view === "account" && accounts.length === 0) void loadAccounts();
   if (view === "evolution") void loadEvolution();
-  if (view === "experiment") void loadPriceSets();
+  if (view === "experiment") {
+    void loadPriceSets();
+    void loadArchiveManifests();
+  }
   if (view === "overview") void loadOverviewStatus();
   announce(`已切换到${VIEWS[view].label}`);
 };
@@ -1721,6 +1724,40 @@ async function loadAccountDataHint(accountId: string): Promise<void> {
     hint.dataset.state = reviewed === 0 ? "gap" : "ok";
   } catch {
     if (currentAccountId === accountId) toggle(hint, false);
+  }
+}
+
+type ArchiveManifestEntry = {
+  name: string; manifest: string | null; archives: number | null;
+  failed: number | null; error: string | null;
+};
+
+async function loadArchiveManifests(): Promise<void> {
+  const list = testId<HTMLUListElement>("archive-list");
+  const empty = testId<HTMLElement>("archive-empty");
+  try {
+    const payload = await api<{ dir: string | null; manifests: ArchiveManifestEntry[] }>(
+      "/v2/archive/manifests",
+      new AbortController().signal,
+    );
+    const entries = payload.manifests ?? [];
+    if (entries.length === 0) {
+      list.replaceChildren();
+      toggle(empty, true);
+      return;
+    }
+    toggle(empty, false);
+    list.replaceChildren(...entries.map((entry) => {
+      const item = document.createElement("li");
+      item.dataset.testid = `archive-${entry.name}`;
+      item.textContent = entry.error
+        ? `${entry.name} · 无法解析：${entry.error}`
+        : `${entry.name} · 副本 ${entry.archives ?? 0} · 失败 ${entry.failed ?? 0} · 摘要 ${(entry.manifest ?? "").slice(0, 12)}`;
+      return item;
+    }));
+  } catch {
+    list.replaceChildren();
+    toggle(empty, true);
   }
 }
 
