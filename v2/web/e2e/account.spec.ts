@@ -347,6 +347,16 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("status-since")).toContainText("切换 0");
   });
 
+  test("explains why valuation is unavailable", async ({ page }) => {
+    await page.route(/\/v2\/health$/, (route) => route.fulfill({
+      json: { reviewed_price_sets: 0, synthetic_price_sets: 1 },
+    }));
+    await openAccount(page);
+    await expect(page.getByTestId("account-data-hint")).toContainText("审核价格集合 0", { timeout: 15_000 });
+    await expect(page.getByTestId("account-data-hint")).toContainText("保持不可用");
+    await expect(page.getByTestId("account-data-hint")).toHaveAttribute("data-state", "gap");
+  });
+
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
     await page.route("**/v2/paper-accounts", async (route) => {
       if (route.request().method() !== "GET") return route.continue();
