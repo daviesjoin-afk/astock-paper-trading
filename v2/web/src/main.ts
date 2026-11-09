@@ -1664,10 +1664,20 @@ async function loadOverviewStatus(): Promise<void> {
       "overview-price-sets",
       `价格集合：${health.price_sets ?? 0}（审核 ${health.reviewed_price_sets ?? 0} / 合成 ${health.synthetic_price_sets ?? 0}）`,
     );
+    const guidance = testId<HTMLElement>("overview-data-hint");
+    if ((health.reviewed_price_sets ?? 0) === 0) {
+      toggle(guidance, true);
+      guidance.textContent =
+        "尚无审核价格集合：按 data/price-set-examples 模板生成，再用 scripts/publish_price_set.sh 安装；" +
+        "在此之前估值、绩效与资金提案保持不可用。";
+    } else {
+      toggle(guidance, false);
+    }
   } catch {
     setText("overview-accounts", "账户：—");
     setText("overview-sessions", "会话：—");
     setText("overview-price-sets", "价格集合：—");
+    toggle(testId<HTMLElement>("overview-data-hint"), false);
   }
   try {
     const page = await api<{ events: EvolutionEvent[] }>(

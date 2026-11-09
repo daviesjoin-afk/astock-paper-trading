@@ -129,6 +129,9 @@ form, no valuation.
 - Price sets: 实验信息 shows the loaded catalogue (id, trust, pack, coverage,
   entry count, digest prefix) and a coverage checker for explicit pack/symbol/
   day inputs; reviewed-only rules are stated in the panel.
+- When no reviewed price set exists the landing page shows a warning pointing at
+  `data/price-set-examples` and `scripts/publish_price_set.sh`, and states that
+  valuation, performance and proposals stay unavailable.
 - Overview status: the landing page prints account count, active sessions and
   price sets split by trust (审核/合成) and the evolution-event count from
   `/v2/health`, plus the latest event; a failed probe shows “—”,
