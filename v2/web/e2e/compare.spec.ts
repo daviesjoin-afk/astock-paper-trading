@@ -18,6 +18,10 @@ test.describe("A/B comparison panel", () => {
         },
       });
     });
+    await page.route(/\/v2\/replay\?cycle_id=/, (route) => {
+      const cycle = new URL(route.request().url()).searchParams.get("cycle_id");
+      return route.fulfill({ json: { ok: cycle === CYCLES.holdings } });
+    });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("nav-experiment").click();
     await page.getByTestId("compare-candidate").fill(CYCLES.repro);
@@ -27,6 +31,8 @@ test.describe("A/B comparison panel", () => {
     await expect(row).toContainText("¥95000.00");
     await expect(page.getByTestId("compare-note")).toContainText("不展示净值、收益率或排名");
     await expect(page.getByTestId("compare-note")).toContainText("少");
+    const replay = page.getByTestId("compare-body").locator("tr", { hasText: "回放校验" });
+    await expect(replay).toContainText("未通过");
   });
 
   test("requires both experiment ids", async ({ page }) => {
