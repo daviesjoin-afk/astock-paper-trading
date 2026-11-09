@@ -260,7 +260,8 @@ python research/make_price_set.py --input prices.csv --out data/price-sets/x.jso
 ## Verification entry points
 
 See [the acceptance map](docs/ACCEPTANCE.md) for how each roadmap criterion is
-checked.
+checked, and [the data onboarding guide](docs/DATA_ONBOARDING.md) for turning a
+priced CSV into a reviewed price set.
 
 | Command | Covers |
 | --- | --- |
