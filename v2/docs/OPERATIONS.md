@@ -127,6 +127,7 @@ python scripts/weekly_review.py --base-cycle base --candidate-cycle cand   --day
 
 ## 价格集合发布
 
+0. 先用样例模板确认列结构（`v2/data/price-set-examples/sample-prices.csv`，注明 synthetic、非行情），命令见该目录 README。
 1. 供应商 CSV → 生成 + 安装一步完成（缺口默认失败，已存在的工件需 `--force` 才覆盖）：
 
 ```bash

@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 数据接入样例：新增 `v2/data/price-set-examples/`（CSV 模板 + README），明确标注 synthetic、非行情、仅演示列结构与校验；`OPERATIONS.md` 发布步骤先指向该模板；冒烟用模板生成并断言 `entries=3 missing=0`。Rust 155 / Python 58 / 浏览器 130 不变。
 - V2 归档目录合并 manifest：`verify_archive --dir --manifest-out` 输出 `archives[]`（逐副本摘要）+ `combined` 合并摘要 + `failed`；`verify_all --archive D --report R` 自动写到 `R.archive.json`；顺带清掉测试文件中重复的目录用例。Python 研究套件 58 passed（+1）；冒烟断言 dry-run 带出 manifest 参数。
 - V2 验收对照表：新增 `v2/docs/ACCEPTANCE.md`——把路线图验收项映射到可复现命令/证据（一键验证、审计项、fail-closed、进化门槛、归档流程），并标注唯一未闭合项（真实审核行情数据）与接入后收尾步骤；README 链接该文档。
 - V2 账户推进提示增强：推进完成后播报“n 个会话、x 步、成交 f、拒绝 r”，不再只给步数与成交；浏览器 130 passed（用例断言会话数）。本轮最初误加了重复的“账户推进”面板，发现已有同功能按钮后整段回退，只保留提示增强。Rust/Python 不变。

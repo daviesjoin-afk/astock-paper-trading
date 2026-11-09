@@ -679,6 +679,10 @@ if bash scripts/daily_advance.sh --account smoke-account --day bad-day > /dev/nu
   exit 1
 fi
 
+# Example template: the shipped CSV generates three entries, still synthetic.
+EXAMPLE_OUT="${RUNNER_TEMP:-/tmp}/astock-example-set-${GITHUB_RUN_ID:-local}.json"
+python research/make_price_set.py --input data/price-set-examples/sample-prices.csv   --out "$EXAMPLE_OUT" --report "${EXAMPLE_OUT%.json}-report.json"   --set-id example-synthetic --pack cn-offline-fixture-pack-1 --trust synthetic   --coverage-start 2026-10-30 --coverage-end 2026-11-03 --symbols 600000.SH   | grep -q "entries=3 missing=0"
+
 # Publishing helper: generate into a staging dir, install, refuse overwrite.
 PUB_DIR="${RUNNER_TEMP:-/tmp}/astock-publish-${GITHUB_RUN_ID:-local}"
 PUB_CSV="$PUB_DIR/prices.csv"
