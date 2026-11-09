@@ -1636,12 +1636,16 @@ const renderStrategySwitches = (rows: StrategySwitch[]): void => {
   }));
 };
 
+let overviewEventCount = 0;
+
 async function loadOverviewStatus(): Promise<void> {
   try {
     const health = await api<{
       accounts: number; sessions_active: number;
       price_sets: number; reviewed_price_sets: number; synthetic_price_sets: number;
+      evolution_events: number;
     }>("/v2/health", new AbortController().signal);
+    overviewEventCount = health.evolution_events ?? 0;
     setText("overview-accounts", `账户：${health.accounts ?? 0}`);
     setText("overview-sessions", `会话：活动 ${health.sessions_active ?? 0}`);
     setText(
@@ -1661,9 +1665,12 @@ async function loadOverviewStatus(): Promise<void> {
     const latest = page.events?.[0];
     if (latest) {
       const label = EVOLUTION_LABELS[latest.status] ?? latest.status;
-      setText("overview-evolution", `进化：最近 ${label} · ${latest.candidate_id}`);
+      setText(
+        "overview-evolution",
+        `进化：${overviewEventCount} 条 · 最近 ${label} · ${latest.candidate_id}`,
+      );
     } else {
-      setText("overview-evolution", "进化：暂无事件");
+      setText("overview-evolution", overviewEventCount === 0 ? "进化：暂无事件" : `进化：${overviewEventCount} 条`);
     }
   } catch {
     setText("overview-evolution", "进化：—");

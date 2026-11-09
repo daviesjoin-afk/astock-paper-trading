@@ -52,6 +52,7 @@ async fn health(State(state): State<Shared>) -> ApiResult {
         "synthetic_price_sets": counts.map(|c| c.synthetic_price_sets).unwrap_or(0),
         "accounts": counts.map(|c| c.accounts).unwrap_or(0),
         "sessions_active": counts.map(|c| c.sessions_active).unwrap_or(0),
+        "evolution_events": counts.map(|c| c.evolution_events).unwrap_or(0),
         "writer": "store-single-writer",
     }))
 }

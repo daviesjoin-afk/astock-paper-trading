@@ -130,8 +130,8 @@ form, no valuation.
   entry count, digest prefix) and a coverage checker for explicit pack/symbol/
   day inputs; reviewed-only rules are stated in the panel.
 - Overview status: the landing page prints account count, active sessions and
-  price sets split by trust (审核/合成) from `/v2/health`, plus the latest
-  evolution event; a failed probe shows “—”,
+  price sets split by trust (审核/合成) and the evolution-event count from
+  `/v2/health`, plus the latest event; a failed probe shows “—”,
   never a stale number.
 - Strategy versions: the account page prints the current version and switch
   count per slot, lists the append-only switch history, and records a switch
