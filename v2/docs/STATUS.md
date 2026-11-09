@@ -1,4 +1,4 @@
-# V2 现状（截至 2026-11-08，master `8d2bb35`）
+# V2 现状（截至 2026-11-08，master `125d69c`）
 
 一页看清“系统现在能做什么、证据在哪、还缺什么”。
 
@@ -12,9 +12,9 @@
 | --- | --- |
 | Rust 测试 | 158 lib + 1 bin |
 | Python 研究测试 | 58 |
-| Playwright | 135（24 skipped） |
+| Playwright | 136（24 skipped） |
 | 端到端冒烟 | 全链路通过（含脚本自身行为断言） |
-| CI | 8 个作业全绿（含 `verify-report`，上传验证报告 + 归档清单） |
+| CI | 8 个作业全绿；`verify-report` 跑 research/smoke/security-scan（checkout 全历史），上传验证报告 + 归档清单 |
 | Schema | v15（旧库按设计拒绝，需重建） |
 | 一键验证 | `bash scripts/verify_all.sh [--fast] [--only LIST] [--archive DIR] [--report F]` |
 
