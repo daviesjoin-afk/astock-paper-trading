@@ -1741,8 +1741,10 @@ type ArchiveManifestEntry = {
 
 type CompareSide = {
   cycle_id: string; cash_cents: number; initial_cash_cents: number;
-  runs_total: number; positions: Array<{ symbol: string }>; asof_day: string | null;
+  runs_total: number; positions: number; asof_day: string | null; replay_ok: boolean;
 };
+
+type CompareReport = { base: CompareSide; candidate: CompareSide; cash_delta_cents: number };
 
 const runComparison = async (): Promise<void> => {
   const baseId = byId<HTMLInputElement>("compare-base").value.trim();
@@ -1762,22 +1764,19 @@ const runComparison = async (): Promise<void> => {
     return;
   }
   try {
-    const [base, candidate, baseReplay, candidateReplay] = await Promise.all([
-      api<CompareSide>(`/v2/portfolio?cycle_id=${encodeURIComponent(baseId)}`, new AbortController().signal),
-      api<CompareSide>(`/v2/portfolio?cycle_id=${encodeURIComponent(candidateId)}`, new AbortController().signal),
-      api<{ ok: boolean }>(`/v2/replay?cycle_id=${encodeURIComponent(baseId)}`, new AbortController().signal)
-        .catch(() => ({ ok: false })),
-      api<{ ok: boolean }>(`/v2/replay?cycle_id=${encodeURIComponent(candidateId)}`, new AbortController().signal)
-        .catch(() => ({ ok: false })),
-    ]);
+    const report = await api<CompareReport>(
+      `/v2/compare?base=${encodeURIComponent(baseId)}&candidate=${encodeURIComponent(candidateId)}`,
+      new AbortController().signal,
+    );
+    const { base, candidate } = report;
     const money = (cents: number) => `¥${(cents / 100).toFixed(2)}`;
     const rows: Array<[string, string, string]> = [
       ["现金", money(base.cash_cents), money(candidate.cash_cents)],
       ["初始本金", money(base.initial_cash_cents), money(candidate.initial_cash_cents)],
       ["运行次数", String(base.runs_total), String(candidate.runs_total)],
-      ["持仓数", String(base.positions.length), String(candidate.positions.length)],
+      ["持仓数", String(base.positions), String(candidate.positions)],
       ["估值日", base.asof_day ?? "—", candidate.asof_day ?? "—"],
-      ["回放校验", baseReplay.ok ? "通过" : "未通过", candidateReplay.ok ? "通过" : "未通过"],
+      ["回放校验", base.replay_ok ? "通过" : "未通过", candidate.replay_ok ? "通过" : "未通过"],
     ];
     const body = testId<HTMLTableSectionElement>("compare-body");
     body.replaceChildren(...rows.map(([label, left, right]) => {
@@ -1794,7 +1793,7 @@ const runComparison = async (): Promise<void> => {
     }));
     toggle(table, true);
     toggle(note, true);
-    const cashDelta = candidate.cash_cents - base.cash_cents;
+    const cashDelta = report.cash_delta_cents;
     note.textContent = cashDelta === 0
       ? "两个实验现金一致；本页不展示净值、收益率或排名。"
       : `候选现金相对基准 ${cashDelta > 0 ? "多" : "少"} ¥${Math.abs(cashDelta / 100).toFixed(2)}；不展示净值、收益率或排名。`;

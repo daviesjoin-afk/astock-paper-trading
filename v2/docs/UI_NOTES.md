@@ -126,8 +126,8 @@ form, no valuation.
   line reports steps/fills/rejections.
 - Account overview: a row per account (cash, slot weights, active session
   count, audit verdict); clicking a row switches the console to that account.
-- A/B comparison: 实验信息 lets you enter two experiment ids, then renders a
-  side-by-side table (cash, initial capital, runs, position count, as-of day,
+- A/B comparison: 实验信息 lets you enter two experiment ids; one `/v2/compare`
+  call returns both sides, then the page renders a side-by-side table (cash, initial capital, runs, position count, as-of day,
   replay verification) with a cash-difference note; no NAV, return or ranking
   is shown. Equal ids are refused, and the populated table is axe-scanned.
 - Archive manifests: 实验信息 lists `*.manifest.json` from `ASTOCK_ARCHIVE_DIR`

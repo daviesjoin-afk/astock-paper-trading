@@ -48,6 +48,14 @@ curl -fsS "http://127.0.0.1:8765/v2/paper-accounts/paper-001/advance/preview?day
 
 返回 `sessions[]{session_id,steps}` 与 `total_steps`；控制台在“模拟会话”区提供「预览」按钮。
 
+并排对照两个实验的组合事实（只读）：
+
+```bash
+curl -fsS "http://127.0.0.1:8765/v2/compare?base=experiment-A&candidate=experiment-B"
+```
+
+返回两侧现金/初始本金/运行次数/持仓数/估值日/回放校验与 `cash_delta_cents`；`base` 与 `candidate` 相同时返回 400 `compare_same_experiment`。
+
 查看槽位策略版本切换链（只读）：
 
 ```bash

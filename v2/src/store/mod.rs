@@ -100,6 +100,25 @@ pub struct PaperSlotView {
     pub orders_total: i64,
 }
 
+/// One side of a read-only experiment comparison.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareSide {
+    pub cycle_id: String,
+    pub cash_cents: i64,
+    pub initial_cash_cents: i64,
+    pub runs_total: i64,
+    pub positions: usize,
+    pub asof_day: Option<String>,
+    pub replay_ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareReport {
+    pub base: CompareSide,
+    pub candidate: CompareSide,
+    pub cash_delta_cents: i64,
+}
+
 /// Read-only preview of what an account advance to `day` would do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvancePreview {
