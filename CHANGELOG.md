@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 验证失败路径覆盖：冒烟用 `CARGO=false --only rust` 强制失败，断言退出码 1 且报告仍写出 `ok: false`；`OPERATIONS.md` 注明失败也会产出报告。
 - V2 验证脚本 --only 校验：未知套件名或过滤后为空集合一律退出 2（此前会静默“全部通过”）；冒烟覆盖两种错误。`OPERATIONS.md` 注明。
 - V2 验证脚本套件过滤 + CI 工件：`verify_all.sh --only LIST` 只跑指定套件；CI 新增 `verify-report` 作业（`--only research,smoke --report artifacts/verify.json`）并上传 `v2-verify-report` 工件，首次在 Linux 上验证脚本可运行；冒烟断言 `--only` 生效。`OPERATIONS.md` 补充用法。
 - V2 验证脚本跨平台：`verify_all.sh` 仅在 MSYS/Cygwin 下默认使用固定 GNU 工具链，其他平台用 `cargo`；`CARGO`/`PYTHON` 仍可覆盖；`OPERATIONS.md` 说明。dry-run 两种模式均验证。

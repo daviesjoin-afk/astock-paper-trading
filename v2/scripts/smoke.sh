@@ -724,6 +724,16 @@ bash scripts/verify_all.sh --dry-run | grep -q "^browser"
 bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch | grep -q "^archive"
 bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch --report /tmp/r.json | grep -q "archive.json"
 bash scripts/verify_all.sh --dry-run --only research | grep -q "^research"
+# A failing suite must exit 1 and still produce a report with ok=false.
+FAIL_REPORT="${RUNNER_TEMP:-/tmp}/astock-verify-fail-${GITHUB_RUN_ID:-local}.json"
+if CARGO=false bash scripts/verify_all.sh --only rust --report "$FAIL_REPORT" > /dev/null 2>&1; then
+  echo "verify_all reported success for a failing suite" >&2
+  exit 1
+else
+  test $? -eq 1
+fi
+grep -q '"ok": false' "$FAIL_REPORT"
+rm -f "$FAIL_REPORT"
 if bash scripts/verify_all.sh --dry-run --only research | grep -q "^rust"; then
   echo "verify_all --only did not filter suites" >&2
   exit 1
