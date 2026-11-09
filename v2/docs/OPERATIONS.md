@@ -97,6 +97,8 @@ python scripts/verify_archive.py --db /backup/astock.sqlite3 --export evolution-
 
 整目录校验（`<name>.sqlite3` 配 `<name>.export.json` 或 `<name>.json`，可选 `<name>.manifest.json` 侧车会一并核对）：
 
+把备份目录挂到控制台（只读）：启动服务时设置 `ASTOCK_ARCHIVE_DIR=/backup/astock`，实验信息页会列出 `*.manifest.json` 的副本数、失败数与摘要前缀；未设置或为空时列表为空。
+
 ```bash
 python scripts/verify_archive.py --dir /backup/astock
 # pair.sqlite3 ok manifest=…
