@@ -137,8 +137,8 @@ form, no valuation.
   valuation, performance and proposals stay unavailable, and links straight to
   the coverage checker on the experiment page.
 - Overview status: the landing page prints account count, active sessions and
-  price sets split by trust (审核/合成) and the evolution-event count from
-  `/v2/health`, plus the latest event; a failed probe shows “—”,
+  price sets split by trust (审核/合成), the evolution-event count and whether
+  an archive directory is configured (from `/v2/health`), plus the latest event; a failed probe shows “—”,
   never a stale number.
 - Strategy versions: the account page prints the current version and switch
   count per slot, lists the append-only switch history, and records a switch

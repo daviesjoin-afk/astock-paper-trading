@@ -15,7 +15,7 @@ test.describe("overview run status", () => {
         schema_version: 15, writer: "store-single-writer",
         accounts: 2, sessions_active: 3,
         price_sets: 2, reviewed_price_sets: 1, synthetic_price_sets: 1,
-        evolution_events: 2,
+        evolution_events: 2, archive_dir_configured: true,
       },
     }));
     await page.route(/\/v2\/evolution\/events\/page\?limit=1/, (route) => route.fulfill({
@@ -34,6 +34,7 @@ test.describe("overview run status", () => {
     await expect(page.getByTestId("overview-price-sets")).toHaveText("价格集合：2（审核 1 / 合成 1）");
     await expect(page.getByTestId("overview-evolution")).toContainText("进化：2 条");
     await expect(page.getByTestId("overview-evolution")).toContainText("最近 已晋级");
+    await expect(page.getByTestId("overview-archive")).toHaveText("归档：已配置");
     await expect(page.getByTestId("overview-data-hint")).toBeHidden();
   });
 
@@ -63,5 +64,6 @@ test.describe("overview run status", () => {
     await expect(page.getByTestId("overview-accounts")).toHaveText("账户：—", { timeout: 15_000 });
     await expect(page.getByTestId("overview-price-sets")).toHaveText("价格集合：—");
     await expect(page.getByTestId("overview-evolution")).toHaveText("进化：—");
+    await expect(page.getByTestId("overview-archive")).toHaveText("归档：—");
   });
 });
