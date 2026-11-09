@@ -51,7 +51,9 @@ test.describe("overview run status", () => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await expect(page.getByTestId("overview-data-hint")).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId("overview-data-hint")).toContainText("尚无审核价格集合");
-    await expect(page.getByTestId("overview-data-hint")).toContainText("publish_price_set.sh");
+    await expect(page.getByTestId("overview-data-hint-text")).toContainText("publish_price_set.sh");
+    await page.getByTestId("overview-coverage-link").click();
+    await expect(page.getByTestId("panel-experiment")).toBeVisible();
   });
 
   test("failed probes show dashes instead of stale numbers", async ({ page }) => {
