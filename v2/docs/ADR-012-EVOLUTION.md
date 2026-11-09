@@ -1,6 +1,6 @@
 # ADR 012：自进化治理（晋级与回退规则）
 
-状态：提议（Draft）。本轮落地**决策层**：给定候选与基准的样本外/影子指标，按硬规则给出 `promoted` / `rejected` / `insufficient_evidence` / `reverted` / `kept` 及逐条理由。不做参数搜索、不写账本、不碰价格。
+状态：已实现（原提案已落地，证据见验收对照表）。本轮落地**决策层**：给定候选与基准的样本外/影子指标，按硬规则给出 `promoted` / `rejected` / `insufficient_evidence` / `reverted` / `kept` 及逐条理由。不做参数搜索、不写账本、不碰价格。
 
 ## 为什么先做决策层
 

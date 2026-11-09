@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 ADR 状态复核：ADR-003/006/007/009/010/011/012/014 由“提议”改为“已实现”（原提案已落地，证据在验收对照表）；ADR-004 保持提议，明确当前只有 ADR-015 信号差异与 ADR-016 绩效，独立并排比较页尚未实现。
 - V2 现状页补扫描器条目：`STATUS.md` 记录扫描器自身 3 个测试与“先测后扫”的 CI 顺序，基线指向 `a63f2da`。
 - V2 扫描器自身单测：新增 `scripts/security/test_scan_sensitive_data.py`（已知 OID 按值排除、未知十六进制仍报告、允许清单按值排除），CI 安全作业先跑这组测试再扫描；`OPERATIONS.md` 补充命令。
 - V2 文档基线再同步：`STATUS.md`/`ACCEPTANCE.md` 更新为浏览器 136、CI `verify-report` 含 security-scan 与全历史 checkout 说明。
