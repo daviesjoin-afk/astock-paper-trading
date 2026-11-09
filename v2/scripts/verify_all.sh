@@ -81,6 +81,24 @@ if [ -n "$ARCHIVE" ]; then
   add "archive" "$ARCHIVE_CMD"
 fi
 
+if [ -n "$ONLY" ]; then
+  KNOWN="rust research smoke browser security-scan archive"
+  IFS=',' read -r -a REQUESTED <<< "$ONLY"
+  for requested in "${REQUESTED[@]}"; do
+    case " $KNOWN " in
+      *" $requested "*) ;;
+      *)
+        echo "unknown suite in --only: $requested (known: $KNOWN)" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+if [ "${#NAMES[@]}" -eq 0 ]; then
+  echo "no suites selected" >&2
+  exit 2
+fi
+
 if [ "$DRY" -eq 1 ]; then
   for index in "${!NAMES[@]}"; do
     printf '%-14s %s\n' "${NAMES[$index]}" "${COMMANDS[$index]}"
