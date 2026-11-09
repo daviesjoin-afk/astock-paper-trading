@@ -1728,8 +1728,8 @@ async function loadAccountDataHint(accountId: string): Promise<void> {
 }
 
 type ArchiveManifestEntry = {
-  name: string; manifest: string | null; archives: number | null;
-  failed: number | null; error: string | null;
+  name: string; manifest: string | null; combined: string | null;
+  archives: number | null; failed: number | null; error: string | null;
 };
 
 async function loadArchiveManifests(): Promise<void> {
@@ -1752,7 +1752,8 @@ async function loadArchiveManifests(): Promise<void> {
       item.dataset.testid = `archive-${entry.name}`;
       item.textContent = entry.error
         ? `${entry.name} · 无法解析：${entry.error}`
-        : `${entry.name} · 副本 ${entry.archives ?? 0} · 失败 ${entry.failed ?? 0} · 摘要 ${(entry.manifest ?? "").slice(0, 12)}`;
+        : `${entry.name} · 副本 ${entry.archives ?? 0} · 失败 ${entry.failed ?? 0} · ` +
+          `合并 ${(entry.combined ?? entry.manifest ?? "").slice(0, 12)}`;
       return item;
     }));
   } catch {
