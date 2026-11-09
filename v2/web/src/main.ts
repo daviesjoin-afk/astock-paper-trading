@@ -1667,9 +1667,11 @@ async function loadOverviewStatus(): Promise<void> {
     const guidance = testId<HTMLElement>("overview-data-hint");
     if ((health.reviewed_price_sets ?? 0) === 0) {
       toggle(guidance, true);
-      guidance.textContent =
+      setText(
+        "overview-data-hint-text",
         "尚无审核价格集合：按 data/price-set-examples 模板生成，再用 scripts/publish_price_set.sh 安装；" +
-        "在此之前估值、绩效与资金提案保持不可用。";
+        "在此之前估值、绩效与资金提案保持不可用。",
+      );
     } else {
       toggle(guidance, false);
     }
@@ -2535,6 +2537,7 @@ const runCoverageCheck = async (): Promise<void> => {
 };
 
 testId<HTMLButtonElement>("coverage-run").addEventListener("click", () => void runCoverageCheck());
+testId<HTMLButtonElement>("overview-coverage-link").addEventListener("click", () => showView("experiment"));
 
 const loadEvolution = async (): Promise<void> => {
   const empty = testId<HTMLElement>("evolution-empty");
