@@ -1638,22 +1638,19 @@ const renderStrategySwitches = (rows: StrategySwitch[]): void => {
 
 async function loadOverviewStatus(): Promise<void> {
   try {
-    const rows = await api<AccountOverviewRow[]>("/v2/paper-accounts/overview", new AbortController().signal);
-    const list = Array.isArray(rows) ? rows : [];
-    const active = list.reduce(
-      (total, row) => total + row.sessions.created + row.sessions.running + row.sessions.paused,
-      0,
+    const health = await api<{
+      accounts: number; sessions_active: number;
+      price_sets: number; reviewed_price_sets: number; synthetic_price_sets: number;
+    }>("/v2/health", new AbortController().signal);
+    setText("overview-accounts", `账户：${health.accounts ?? 0}`);
+    setText("overview-sessions", `会话：活动 ${health.sessions_active ?? 0}`);
+    setText(
+      "overview-price-sets",
+      `价格集合：${health.price_sets ?? 0}（审核 ${health.reviewed_price_sets ?? 0} / 合成 ${health.synthetic_price_sets ?? 0}）`,
     );
-    setText("overview-accounts", `账户：${list.length}`);
-    setText("overview-sessions", `会话：活动 ${active}`);
   } catch {
     setText("overview-accounts", "账户：—");
     setText("overview-sessions", "会话：—");
-  }
-  try {
-    const sets = await api<unknown[]>("/v2/price-sets", new AbortController().signal);
-    setText("overview-price-sets", `价格集合：${Array.isArray(sets) ? sets.length : 0}`);
-  } catch {
     setText("overview-price-sets", "价格集合：—");
   }
   try {

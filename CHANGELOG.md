@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 概览改用健康计数：落地页状态条改读 `/v2/health`（一次请求替代账户总览+价格集合两次），并显示 `价格集合 n（审核 r / 合成 s）`，让“有没有审核数据”一眼可见；浏览器 130 passed（用例改为健康桩）；Rust/Python 不变。
 - V2 健康检查扩容：`/v2/health` 增加 `accounts`、`sessions_active`、`reviewed_price_sets`、`synthetic_price_sets`（计数查询，无账本扫描）；`OPERATIONS.md` 增加字段说明；冒烟断言初始 reviewed=0、结束后 synthetic=1 且 accounts≥1。Rust 156 passed（+1 计数）；Python 58 / 浏览器 130 不变。
 - V2 ADR 状态批量校正：ADR-005/008/012/013/015/016/017 从“提议/Draft”更新为已实现（并注明与 006/007/009/012–018 的关系）；ADR-012 中“参数搜索未实现”的表述改为已由 `generate_candidates.py` 实现、晋级仍不自动改账户。
 - V2 ADR-006 一致性复核：把“真实价格集合未实现/HTTP 不返回数字”等过时表述更新为当前实现（注册表、发布脚本、覆盖日/缺口接口、控制台面板、输入模板），并明确唯一未闭合项是真实行情数据本身；存放位置问题标记为已定。
