@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 扫描器自身单测：新增 `scripts/security/test_scan_sensitive_data.py`（已知 OID 按值排除、未知十六进制仍报告、允许清单按值排除），CI 安全作业先跑这组测试再扫描；`OPERATIONS.md` 补充命令。
 - V2 文档基线再同步：`STATUS.md`/`ACCEPTANCE.md` 更新为浏览器 136、CI `verify-report` 含 security-scan 与全历史 checkout 说明。
 - V2 CI 验证扫描路径：`verify-report` 作业改为 `--only research,smoke,security-scan`，在 CI 中实际执行验证脚本的扫描分支（此前仅独立 security 作业覆盖，路径不同源）；`OPERATIONS.md` 同步。
 - V2 修复一键验证的泄露扫描路径：脚本在 `v2/` 运行时指向不存在的 `scripts/security/...`，改为仓库根 `../scripts/security/scan-sensitive-data.py --repo ..`；`--only security-scan` 与全量 `verify_all` 现均通过；冒烟断言 dry-run 含正确路径。

@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Test the scanner's own exclusions
+        run: python -m unittest discover -s scripts/security -p 'test_*.py'
+
       - name: Scan worktree and full history for sensitive data
         run: python scripts/security/scan-sensitive-data.py --repo . --scope all
 

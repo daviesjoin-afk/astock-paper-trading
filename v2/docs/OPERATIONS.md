@@ -180,6 +180,7 @@ bash scripts/verify_all.sh --dry-run       # 只打印将执行的命令
 bash scripts/verify_all.sh --archive /backup/astock   # 附带整目录归档校验
 bash scripts/verify_all.sh --report /tmp/verify.json  # 输出 JSON 汇总（含每套件耗时；泄露扫描用仓库根脚本）
 bash scripts/verify_all.sh --only research,smoke     # 只跑指定套件（未知名称或空选择退出 2）
+python -m unittest discover -s ../scripts/security -p 'test_*.py'  # 扫描器自身测试
 # CI 的 verify-report 作业跑 research/smoke/security-scan（checkout 用完整历史，扫描器靠 OID 集合排除自身提交），另造一对最小归档产物并校验，汇总与归档清单一起上传
 ```
 
