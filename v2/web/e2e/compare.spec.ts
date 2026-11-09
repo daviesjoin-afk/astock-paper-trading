@@ -7,20 +7,19 @@ test.beforeEach(async ({ request }) => {
 
 test.describe("A/B comparison panel", () => {
   test("shows both experiments side by side without ranking", async ({ page }) => {
-    await page.route(/\/v2\/portfolio\?cycle_id=/, (route) => {
-      const cycle = new URL(route.request().url()).searchParams.get("cycle_id");
-      const cash = cycle === CYCLES.repro ? 9_500_000 : 10_000_000;
+    await page.route(/\/v2\/compare\?base=/, (route) => {
+      const url = new URL(route.request().url());
+      const side = (cycle: string | null, cash: number, runs: number, replay: boolean) => ({
+        cycle_id: cycle ?? "", cash_cents: cash, initial_cash_cents: 10_000_000,
+        runs_total: runs, positions: 1, asof_day: "2026-11-02", replay_ok: replay,
+      });
       return route.fulfill({
         json: {
-          cycle_id: cycle, cash_cents: cash, initial_cash_cents: 10_000_000,
-          runs_total: cycle === CYCLES.repro ? 2 : 1,
-          positions: [{ symbol: "600000.SH" }], asof_day: "2026-11-02",
+          base: side(url.searchParams.get("base"), 10_000_000, 1, true),
+          candidate: side(url.searchParams.get("candidate"), 9_500_000, 2, false),
+          cash_delta_cents: -500_000,
         },
       });
-    });
-    await page.route(/\/v2\/replay\?cycle_id=/, (route) => {
-      const cycle = new URL(route.request().url()).searchParams.get("cycle_id");
-      return route.fulfill({ json: { ok: cycle === CYCLES.holdings } });
     });
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("nav-experiment").click();

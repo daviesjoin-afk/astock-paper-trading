@@ -4591,3 +4591,26 @@ fn advance_preview_counts_steps_without_writing() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+#[test]
+fn compare_reports_both_sides_and_rejects_self() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    let fill = ingest_and_submit(&mut db, request("2026-10-30", "compare-quote", Side::Buy));
+    assert!(fill.outcome.fill.is_some());
+    db.create_experiment(spec("cycle-2", INITIAL_CASH_CENTS)).unwrap();
+
+    let report = db.compare_experiments("cycle-1", "cycle-2").unwrap();
+    assert_eq!(report.base.cycle_id, "cycle-1");
+    assert_eq!(report.base.runs_total, 1);
+    assert_eq!(report.base.positions, 1);
+    assert!(report.base.replay_ok);
+    assert_eq!(report.candidate.runs_total, 0);
+    assert_eq!(report.candidate.positions, 0);
+    assert_eq!(report.cash_delta_cents, report.candidate.cash_cents - report.base.cash_cents);
+    assert!(report.cash_delta_cents > 0, "unfilled side keeps more cash");
+
+    assert!(matches!(
+        db.compare_experiments("cycle-1", "cycle-1"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "compare_same_experiment"
+    ));
+}

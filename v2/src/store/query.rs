@@ -2195,3 +2195,32 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// Read-only side-by-side comparison of two experiments' portfolio facts.
+    pub fn compare_experiments(&self, base: &str, candidate: &str) -> StoreResult<CompareReport> {
+        if base == candidate {
+            return Err(StoreError::Rules(RuleError("compare_same_experiment".into())));
+        }
+        let side = |cycle: &str| -> StoreResult<CompareSide> {
+            let view = self.state(cycle, None)?;
+            let replay_ok = self.verify_replay(cycle).map(|report| report.ok).unwrap_or(false);
+            Ok(CompareSide {
+                cycle_id: view.cycle_id.clone(),
+                cash_cents: view.cash_cents,
+                initial_cash_cents: view.initial_cash_cents,
+                runs_total: view.runs_total,
+                positions: view.positions.len(),
+                asof_day: view.asof_day.clone(),
+                replay_ok,
+            })
+        };
+        let left = side(base)?;
+        let right = side(candidate)?;
+        Ok(CompareReport {
+            cash_delta_cents: right.cash_cents - left.cash_cents,
+            base: left,
+            candidate: right,
+        })
+    }
+}

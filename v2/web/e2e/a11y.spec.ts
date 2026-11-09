@@ -60,13 +60,19 @@ test("the account console stays accessible with the data and switch panels", asy
 });
 
 test("the comparison table is accessible once populated", async ({ page }) => {
-  await page.route(/\/v2\/portfolio\?cycle_id=/, (route) => route.fulfill({
+  await page.route(/\/v2\/compare\?base=/, (route) => route.fulfill({
     json: {
-      cycle_id: "a11y-cycle", cash_cents: 9_900_000, initial_cash_cents: 10_000_000,
-      runs_total: 1, positions: [{ symbol: "600000.SH" }], asof_day: "2026-11-02",
+      base: {
+        cycle_id: "a11y-base", cash_cents: 9_900_000, initial_cash_cents: 10_000_000,
+        runs_total: 1, positions: 1, asof_day: "2026-11-02", replay_ok: true,
+      },
+      candidate: {
+        cycle_id: "a11y-candidate", cash_cents: 9_800_000, initial_cash_cents: 10_000_000,
+        runs_total: 1, positions: 1, asof_day: "2026-11-02", replay_ok: true,
+      },
+      cash_delta_cents: -100_000,
     },
   }));
-  await page.route(/\/v2\/replay\?cycle_id=/, (route) => route.fulfill({ json: { ok: true } }));
   await page.goto(`/?cycle_id=${CYCLES.holdings}`);
   await page.getByTestId("nav-experiment").click();
   await page.getByTestId("compare-candidate").fill("a11y-candidate");
