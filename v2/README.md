@@ -259,6 +259,9 @@ python research/make_price_set.py --input prices.csv --out data/price-sets/x.jso
 
 ## Verification entry points
 
+See [the acceptance map](docs/ACCEPTANCE.md) for how each roadmap criterion is
+checked.
+
 | Command | Covers |
 | --- | --- |
 | `bash scripts/verify_all.sh` | rust, research, smoke, browser, leak scan |
