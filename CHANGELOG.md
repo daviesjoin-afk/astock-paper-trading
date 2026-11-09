@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 现状页补扫描器条目：`STATUS.md` 记录扫描器自身 3 个测试与“先测后扫”的 CI 顺序，基线指向 `a63f2da`。
 - V2 扫描器自身单测：新增 `scripts/security/test_scan_sensitive_data.py`（已知 OID 按值排除、未知十六进制仍报告、允许清单按值排除），CI 安全作业先跑这组测试再扫描；`OPERATIONS.md` 补充命令。
 - V2 文档基线再同步：`STATUS.md`/`ACCEPTANCE.md` 更新为浏览器 136、CI `verify-report` 含 security-scan 与全历史 checkout 说明。
 - V2 CI 验证扫描路径：`verify-report` 作业改为 `--only research,smoke,security-scan`，在 CI 中实际执行验证脚本的扫描分支（此前仅独立 security 作业覆盖，路径不同源）；`OPERATIONS.md` 同步。
