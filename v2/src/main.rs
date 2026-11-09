@@ -517,6 +517,20 @@ async fn advance_account(
     response(db.advance_account_to(&id, &body.day).map_err(api_error)?)
 }
 
+#[derive(Deserialize)]
+struct AdvancePreviewQuery {
+    day: String,
+}
+
+async fn advance_preview(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<AdvancePreviewQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    response(db.preview_account_advance(&id, &query.day).map_err(api_error)?)
+}
+
 async fn paper_exposure(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
     let db = state.lock().await;
     response(db.paper_exposure(&id).map_err(api_error)?)
@@ -866,6 +880,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v2/paper-accounts/{account_id}/advance",
             post(advance_account),
+        )
+        .route(
+            "/v2/paper-accounts/{account_id}/advance/preview",
+            get(advance_preview),
         )
         .route(
             "/v2/paper-accounts/{account_id}/rebalances",

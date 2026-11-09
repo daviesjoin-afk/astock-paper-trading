@@ -2216,6 +2216,33 @@ accountAdvanceButton.addEventListener("click", () => {
   })();
 });
 
+const previewAccountAdvance = async (): Promise<void> => {
+  const day = byId<HTMLInputElement>("account-advance-day").value;
+  const text = testId<HTMLElement>("account-advance-preview-text");
+  if (!day) {
+    toggle(text, true);
+    text.textContent = "请先选择要预览的交易日";
+    return;
+  }
+  try {
+    const preview = await api<{
+      day: string; sessions: Array<{ session_id: string; steps: number }>; total_steps: number;
+    }>(
+      `/v2/paper-accounts/${encodeURIComponent(currentAccountId)}/advance/preview?day=${encodeURIComponent(day)}`,
+      new AbortController().signal,
+    );
+    toggle(text, true);
+    text.textContent = preview.total_steps === 0
+      ? `推进到 ${preview.day} 不会执行任何信号`
+      : `推进到 ${preview.day} 将执行 ${preview.sessions.length} 个会话、${preview.total_steps} 步`;
+  } catch (error) {
+    toggle(text, true);
+    text.textContent = `预览失败：${errorDetail(error)}`;
+  }
+};
+
+testId<HTMLButtonElement>("account-advance-preview").addEventListener("click", () => void previewAccountAdvance());
+
 type EvolutionEvent = {
   event_id: string; candidate_id: string; status: string;
   decided_at: string;

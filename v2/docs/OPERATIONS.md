@@ -38,6 +38,14 @@
 - 请求失败（HTTP 非 2xx）退出码 3；
 - 成功输出 `advanced account=… day=… sessions=… steps=… filled=… rejected=…`，可直接作为调度日志。
 
+预览一次账户推进（只读，不写账本）：
+
+```bash
+curl -fsS "http://127.0.0.1:8765/v2/paper-accounts/paper-001/advance/preview?day=2026-11-02"
+```
+
+返回 `sessions[]{session_id,steps}` 与 `total_steps`；控制台在“模拟会话”区提供「预览」按钮。
+
 查看槽位策略版本切换链（只读）：
 
 ```bash

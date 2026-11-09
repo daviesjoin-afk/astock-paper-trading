@@ -2128,3 +2128,66 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// Count the signals an advance to `day` would execute, without writing.
+    pub fn preview_account_advance(
+        &self,
+        account_id: &str,
+        day: &str,
+    ) -> StoreResult<AdvancePreview> {
+        let target = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .map_err(|_| StoreError::Rules(RuleError("invalid_advance_day".into())))?;
+        if target.to_string() != day {
+            return Err(StoreError::Rules(RuleError("invalid_advance_day".into())));
+        }
+        let exists: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT account_id FROM v2_paper_accounts WHERE account_id=?",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        exists.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
+
+        let mut statement = self.conn.prepare(
+            "SELECT session_id,spec_json,cursor FROM v2_paper_sessions
+             WHERE account_id=? AND status='running' ORDER BY session_id",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut sessions = Vec::new();
+        let mut total = 0i64;
+        for row in rows {
+            let (session_id, raw_spec, cursor) = row?;
+            let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&raw_spec)?;
+            let mut steps = 0i64;
+            for signal in spec.signals.iter().skip(cursor as usize) {
+                let at = chrono::DateTime::parse_from_rfc3339(&signal.decision_at)
+                    .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
+                let china =
+                    at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"));
+                if china.date_naive() > target {
+                    break;
+                }
+                steps += 1;
+            }
+            if steps > 0 {
+                total += steps;
+                sessions.push(SessionSteps { session_id, steps });
+            }
+        }
+        Ok(AdvancePreview {
+            account_id: account_id.into(),
+            day: day.into(),
+            sessions,
+            total_steps: total,
+        })
+    }
+}

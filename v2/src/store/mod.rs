@@ -100,6 +100,21 @@ pub struct PaperSlotView {
     pub orders_total: i64,
 }
 
+/// Read-only preview of what an account advance to `day` would do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvancePreview {
+    pub account_id: String,
+    pub day: String,
+    pub sessions: Vec<SessionSteps>,
+    pub total_steps: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSteps {
+    pub session_id: String,
+    pub steps: i64,
+}
+
 /// Counters exposed by `GET /v2/health`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthCounts {

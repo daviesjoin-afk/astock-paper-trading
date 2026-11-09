@@ -374,7 +374,9 @@ python3 scripts/experiment_demo.py</code></pre>
                   <div class="account-advance">
                     <input type="date" id="account-advance-day" data-testid="account-advance-day" aria-label="推进整个账户到该交易日" />
                     <button type="button" class="btn btn-quiet btn-small" id="account-advance" data-testid="account-advance">推进账户到该日</button>
+                    <button type="button" class="btn btn-quiet btn-small" id="account-advance-preview" data-testid="account-advance-preview">预览</button>
                   </div>
+                  <p class="advance-preview-text" id="account-advance-preview-text" data-testid="account-advance-preview-text" hidden></p>
                   <button type="button" class="btn btn-quiet btn-small" id="session-create-toggle" data-testid="session-create-toggle">新建会话</button>
                   <form class="account-session-form" id="session-create" data-testid="session-create" aria-label="从实验创建模拟会话" novalidate hidden>
                     <label class="field">
