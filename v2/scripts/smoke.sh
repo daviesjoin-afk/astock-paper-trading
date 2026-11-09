@@ -728,6 +728,18 @@ if bash scripts/verify_all.sh --dry-run --only research | grep -q "^rust"; then
   echo "verify_all --only did not filter suites" >&2
   exit 1
 fi
+if bash scripts/verify_all.sh --dry-run --only nope > /dev/null 2>&1; then
+  echo "verify_all accepted an unknown suite" >&2
+  exit 1
+else
+  test $? -eq 2
+fi
+if bash scripts/verify_all.sh --dry-run --only browser --fast > /dev/null 2>&1; then
+  echo "verify_all accepted an empty suite selection" >&2
+  exit 1
+else
+  test $? -eq 2
+fi
 
 # Weekly review: synthetic data means no coverage, so the verdict is unstable.
 if python scripts/weekly_review.py --base-cycle shadow-base-1 \
