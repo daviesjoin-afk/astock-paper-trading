@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 切换后会话归因验证：新增测试——切换后新建、起点晚于切换的会话启动并推进，成交记录的 `strategy_version_id` 为新版本、会话游标正确；ADR-018 记录该验证。Rust 155 passed；冒烟/研究/浏览器不变。
 - V2 验证报告输出：`verify_all.sh --report PATH` 在运行时收集各套件结果与耗时，结束后写 JSON（`ok`、`generated_at`、`suites[]`）；`OPERATIONS.md` 补充；脚本整体重写以修复前几轮补丁造成的解析/转义问题。实测 `--fast --no-scan --report` 输出正确 JSON。Rust/Python/浏览器不变。
 - V2 再平衡二次确认：点击「执行再平衡」先展开确认区，逐槽列出划拨金额与权重变化（按初始本金换算）并保持准备金；确认后才发请求，取消不提交；浏览器 129 passed（同用例增加二次确认与取消语义）；Rust/Python 不变。
 - V2 一键验证接入归档：`verify_all.sh --archive DIR` 追加整目录归档校验套件；参数解析改为 `while` 循环（原 `for` 内 `shift` 无效导致把目录当未知参数）；`OPERATIONS.md` 更新；冒烟断言 dry-run 出现 `archive` 行。

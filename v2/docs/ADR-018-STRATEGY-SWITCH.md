@@ -70,6 +70,7 @@
 - 订单：归因、幂等键与请求内 `strategy_version_id` 全部使用“当前版本”；`decision_at` 早于最后一次切换 → 409 `paper_order_before_strategy_switch`；
 - 实验派生会话（`from-experiment`）校验实验版本等于“当前版本”；
 - 会话起点不得早于该槽最后一次切换（`session_starts_before_strategy_switch`），否则其信号会逐条被订单时序校验拒绝，形成“卡住的会话”；
+- 切换后新建并启动的会话，其成交按**当前版本**归因（已用测试覆盖：起点晚于切换的会话推进后订单版本为新版本）；
 - 视图 `current_strategy_version_id` / `switch_count`；审计 `switch_chain`（末项）；
 - 普通会话规格不带版本（版本在成交时按当时链确定），这是既有设计，不在本 ADR 改动。
 
