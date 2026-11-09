@@ -180,6 +180,7 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("allocation-confirm")).toBeVisible();
     await expect(page.getByTestId("allocation-confirm-text")).toContainText("确认执行？");
     await expect(page.getByTestId("allocation-confirm-text")).toContainText("B 增加");
+    await expect(page.getByTestId("allocation-confirm-text")).toContainText("划拨后预算 A ¥35,000.00 · B ¥55,000.00");
     expect(posted).toBeNull();
 
     await page.getByTestId("allocation-confirm-yes").click();
