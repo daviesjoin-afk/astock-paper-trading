@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 ADR 状态批量校正：ADR-005/008/012/013/015/016/017 从“提议/Draft”更新为已实现（并注明与 006/007/009/012–018 的关系）；ADR-012 中“参数搜索未实现”的表述改为已由 `generate_candidates.py` 实现、晋级仍不自动改账户。
 - V2 ADR-006 一致性复核：把“真实价格集合未实现/HTTP 不返回数字”等过时表述更新为当前实现（注册表、发布脚本、覆盖日/缺口接口、控制台面板、输入模板），并明确唯一未闭合项是真实行情数据本身；存放位置问题标记为已定。
 - V2 数据接入样例：新增 `v2/data/price-set-examples/`（CSV 模板 + README），明确标注 synthetic、非行情、仅演示列结构与校验；`OPERATIONS.md` 发布步骤先指向该模板；冒烟用模板生成并断言 `entries=3 missing=0`。Rust 155 / Python 58 / 浏览器 130 不变。
 - V2 归档目录合并 manifest：`verify_archive --dir --manifest-out` 输出 `archives[]`（逐副本摘要）+ `combined` 合并摘要 + `failed`；`verify_all --archive D --report R` 自动写到 `R.archive.json`；顺带清掉测试文件中重复的目录用例。Python 研究套件 58 passed（+1）；冒烟断言 dry-run 带出 manifest 参数。
