@@ -168,7 +168,7 @@ bash scripts/verify_all.sh --report /tmp/verify.json  # 输出 JSON 汇总（含
 bash scripts/verify_all.sh --only research,smoke     # 只跑指定套件（未知名称或空选择退出 2）
 ```
 
-输出按套件打印 `result` 与耗时；任一失败退出码 1。Windows（MSYS）默认使用 `cargo +1.99.1-x86_64-pc-windows-gnu`，其他平台用 `cargo`；可用环境变量 `CARGO`/`PYTHON` 覆盖。浏览器套件需要先有 release 二进制（脚本内会 `npm run build`）。
+输出按套件打印 `result` 与耗时；任一失败退出码 1，且 `--report` 仍会写出（`ok: false`），不会因失败而丢失报告。Windows（MSYS）默认使用 `cargo +1.99.1-x86_64-pc-windows-gnu`，其他平台用 `cargo`；可用环境变量 `CARGO`/`PYTHON` 覆盖。浏览器套件需要先有 release 二进制（脚本内会 `npm run build`）。
 
 ## 备份与恢复
 
