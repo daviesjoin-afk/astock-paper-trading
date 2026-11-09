@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 切换链篡改检测：新增测试——直接改写 `v2_paper_slot_switches.from_version` 后，审计 `ok=false` 且 `switch_chain` 详情含 `break`，证明该检查不是恒真；ADR-018 记录。Rust 157 passed；冒烟/研究/浏览器不变。
 - V2 概览改用健康计数：落地页状态条改读 `/v2/health`（一次请求替代账户总览+价格集合两次），并显示 `价格集合 n（审核 r / 合成 s）`，让“有没有审核数据”一眼可见；浏览器 130 passed（用例改为健康桩）；Rust/Python 不变。
 - V2 健康检查扩容：`/v2/health` 增加 `accounts`、`sessions_active`、`reviewed_price_sets`、`synthetic_price_sets`（计数查询，无账本扫描）；`OPERATIONS.md` 增加字段说明；冒烟断言初始 reviewed=0、结束后 synthetic=1 且 accounts≥1。Rust 156 passed（+1 计数）；Python 58 / 浏览器 130 不变。
 - V2 ADR 状态批量校正：ADR-005/008/012/013/015/016/017 从“提议/Draft”更新为已实现（并注明与 006/007/009/012–018 的关系）；ADR-012 中“参数搜索未实现”的表述改为已由 `generate_candidates.py` 实现、晋级仍不自动改账户。
