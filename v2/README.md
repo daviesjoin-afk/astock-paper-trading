@@ -1,5 +1,8 @@
 # AStock V2 — Independent paper-only kernel (MVP)
 
+Current state: [STATUS.md](docs/STATUS.md) (capabilities, evidence, the one open
+dependency).
+
 V2 is **a new system**, not an extraction or translation of V1. No V1 Python
 module, schema, task, broker or runtime database is imported or reused.
 
