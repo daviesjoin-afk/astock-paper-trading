@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 部署资产：新增 `v2/deploy/`（systemd 单元、env 示例、nginx 反代、`install.sh` 幂等安装、README），`OPERATIONS.md` 增加部署入口；安装不自动 enable/start、不覆盖已有 env，数据/备份目录交给 systemd `StateDirectory`。
 - V2 对照服务：新增只读 `GET /v2/compare?base=&candidate=`（两侧现金/初始本金/运行次数/持仓数/估值日/回放校验 + 现金差异；同一实验返回 `compare_same_experiment`），控制台改为单次调用；Rust 159 passed（+1）；ADR-004 状态改为已实现；`OPERATIONS.md` 补命令。
 - V2 文档基线：`STATUS.md`/`ACCEPTANCE.md` 更新为浏览器 140，并新增“研究辅助（A/B 对照）”能力条目与 ADR-004 部分实现说明。
 - V2 对照边界与可访问性：同一实验标识拒绝对照（提示“两个实验标识相同”）；新增对照表填充后的 axe 扫描用例；浏览器 140 passed（+2）。
