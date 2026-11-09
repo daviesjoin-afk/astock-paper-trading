@@ -51,6 +51,14 @@ test("the account creation form is accessible", async ({ page }) => {
   await scan(page, "account-create");
 });
 
+test("the account console stays accessible with the data and switch panels", async ({ page }) => {
+  await page.goto(`/?cycle_id=${CYCLES.holdings}&account=e2e-account#/account`);
+  await expect(page.getByTestId("account-data-hint")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("strategy-switches")).toBeVisible();
+  await expect(page.getByTestId("switch-version")).toBeVisible();
+  await scan(page, "account-panels");
+});
+
 test("the session creation form is accessible", async ({ page }) => {
   await page.goto(`/?cycle_id=${CYCLES.repro}&account=e2e-session-account#/account`);
   await page.getByTestId("session-card-e2e-session").waitFor();
