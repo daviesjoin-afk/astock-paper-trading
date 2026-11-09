@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 账户“自上次查看”摘要：账户头部比较成交/会话/切换计数与该浏览器上次记录（localStorage，仅计数、不读时钟），显示增量；首次访问静默；浏览器 130 passed（+1）；Rust/Python 不变。
 - V2 再平衡确认预算预览：确认区在划拨金额之外列出「划拨后预算 A ¥… · B ¥…」（按目标权重 × 初始本金），便于执行前核对结果；浏览器 129 passed（断言预算行）；Rust/Python 不变。
 - V2 切换后会话归因验证：新增测试——切换后新建、起点晚于切换的会话启动并推进，成交记录的 `strategy_version_id` 为新版本、会话游标正确；ADR-018 记录该验证。Rust 155 passed；冒烟/研究/浏览器不变。
 - V2 验证报告输出：`verify_all.sh --report PATH` 在运行时收集各套件结果与耗时，结束后写 JSON（`ok`、`generated_at`、`suites[]`）；`OPERATIONS.md` 补充；脚本整体重写以修复前几轮补丁造成的解析/转义问题。实测 `--fast --no-scan --report` 输出正确 JSON。Rust/Python/浏览器不变。

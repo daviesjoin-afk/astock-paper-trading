@@ -1573,6 +1573,42 @@ type StrategySwitch = {
 
 let accountSwitches: StrategySwitch[] = [];
 
+let accountOrderCount = 0;
+
+const sinceStorageKey = (accountId: string): string => `astock-v2-last-seen:${accountId}`;
+
+const renderSinceLastVisit = (accountId: string): void => {
+  const line = testId<HTMLElement>("status-since");
+  const current = {
+    orders: accountOrderCount,
+    sessions: accountSessions.length,
+    switches: accountSwitches.length,
+  };
+  let previous: typeof current | null = null;
+  try {
+    const raw = localStorage.getItem(sinceStorageKey(accountId));
+    if (raw) previous = JSON.parse(raw) as typeof current;
+  } catch {
+    previous = null;
+  }
+  localStorage.setItem(sinceStorageKey(accountId), JSON.stringify(current));
+  if (!previous) {
+    toggle(line, false);
+    return;
+  }
+  const delta = (now: number, before: number): string => {
+    const diff = now - before;
+    return diff > 0 ? `+${diff}` : `${diff}`;
+  };
+  const changes = [
+    `成交 ${delta(current.orders, previous.orders)}`,
+    `会话 ${delta(current.sessions, previous.sessions)}`,
+    `切换 ${delta(current.switches, previous.switches)}`,
+  ];
+  toggle(line, true);
+  line.textContent = `自上次查看：${changes.join(" · ")}`;
+};
+
 const renderStrategySwitches = (rows: StrategySwitch[]): void => {
   accountSwitches = rows;
   const current = testId<HTMLElement>("strategy-current");
@@ -1643,7 +1679,10 @@ async function loadStrategySwitches(accountId: string): Promise<void> {
       `/v2/paper-accounts/${encodeURIComponent(accountId)}/strategy-switches`,
       new AbortController().signal,
     );
-    if (currentAccountId === accountId) renderStrategySwitches(Array.isArray(rows) ? rows : []);
+    if (currentAccountId === accountId) {
+      renderStrategySwitches(Array.isArray(rows) ? rows : []);
+      renderSinceLastVisit(accountId);
+    }
   } catch {
     if (currentAccountId === accountId) renderStrategySwitches([]);
   }
@@ -1812,6 +1851,7 @@ const loadAccount = async (accountId: string): Promise<void> => {
     syncAccountUrl(accountId);
     const orderList = Array.isArray(orders) ? orders : [];
     renderAccount(account, orderList);
+    accountOrderCount = Array.isArray(orders) ? orders.length : 0;
     renderSessions(Array.isArray(sessions) ? sessions : []);
 
     const orderDays = Array.from(new Set(
