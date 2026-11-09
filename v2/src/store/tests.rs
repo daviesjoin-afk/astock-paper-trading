@@ -4512,3 +4512,33 @@ fn health_counts_accounts_sessions_and_price_set_trust() {
     assert_eq!(counts.sessions_active, 1);
     assert_eq!(counts.reviewed_price_sets + counts.synthetic_price_sets, db.price_set_catalogue().unwrap().len() as i64);
 }
+
+#[test]
+fn audit_detects_a_tampered_switch_chain() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("tamper-switch", 10_000_000)).unwrap();
+    db.record_strategy_switch(
+        "tamper-switch",
+        PaperSlotId::A,
+        "research-momentum-v2",
+        "2026-11-05T09:00:00+08:00",
+        "promotion",
+        "tamper-switch-1",
+    )
+    .unwrap();
+    assert!(db.paper_account_audit("tamper-switch").unwrap().ok);
+
+    // Rewrite history: the chain no longer starts from the slot's spec version.
+    db.conn
+        .execute(
+            "UPDATE v2_paper_slot_switches SET from_version='research-momentum-v9' WHERE switch_id='tamper-switch-1'",
+            [],
+        )
+        .unwrap();
+
+    let audit = db.paper_account_audit("tamper-switch").unwrap();
+    assert!(!audit.ok, "{:?}", audit.checks);
+    let chain = audit.checks.iter().find(|check| check.name == "switch_chain").unwrap();
+    assert!(!chain.ok);
+    assert!(chain.detail.contains("break"), "{}", chain.detail);
+}
