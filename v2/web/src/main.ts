@@ -2178,11 +2178,16 @@ accountAdvanceButton.addEventListener("click", () => {
   void (async () => {
     clearAccountError();
     try {
-      const result = await postJson<{ steps: number; filled: number; rejected: number }>(
+      const result = await postJson<{
+        sessions: Array<unknown>; steps: number; filled: number; rejected: number;
+      }>(
         `/v2/paper-accounts/${encodeURIComponent(currentAccountId)}/advance`,
         { day },
       );
-      announce(`账户推进到 ${day}：${result.steps} 步，成交 ${result.filled}，拒绝 ${result.rejected}`);
+      announce(
+        `账户推进到 ${day}：${result.sessions?.length ?? 0} 个会话，` +
+        `${result.steps} 步，成交 ${result.filled}，拒绝 ${result.rejected}`,
+      );
       await loadAccount(currentAccountId);
     } catch (error) {
       showAccountError(`推进账户失败：${errorDetail(error)}`);

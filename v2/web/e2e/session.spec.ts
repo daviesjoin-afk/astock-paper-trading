@@ -149,7 +149,7 @@ test.describe("paper session control", () => {
     await page.getByTestId("account-advance").click();
     await expect(card).toContainText("已完成", { timeout: 15_000 });
     await expect(card).toContainText("2/2");
-    await expect(page.getByTestId("live-status")).toContainText("账户推进到 2026-11-02");
+    await expect(page.getByTestId("live-status")).toContainText("账户推进到 2026-11-02：1 个会话");
   });
 
   test("the fixture session exists for its account", async ({ page }) => {

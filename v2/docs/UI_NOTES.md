@@ -141,6 +141,9 @@ form, no valuation.
 - Coverage: the account header states whether reviewed prices cover the held
   symbols on the known days (“完整 n/n” or “x/y · 缺口 …”); gaps are warnings,
   never silently treated as covered.
+- Account advance: the session area advances every runnable session to an
+  explicit trading day and reports how many sessions moved, steps, fills and
+  rejections.
 - Since last visit: the header compares order/session/switch counts with what
   this browser last saw for the account (localStorage, counts only, no clock)
   and prints the delta; first visit stays silent.
