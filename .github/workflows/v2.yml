@@ -118,6 +118,11 @@ jobs:
         working-directory: v2
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The leak scanner skips the repo's own commit ids by collecting
+          # `git rev-list --all --objects`; a shallow clone makes that set
+          # incomplete and turns historical merge ids into false positives.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: actions/setup-python@v5
         with:
@@ -128,7 +133,7 @@ jobs:
           RUSTUP_TOOLCHAIN: "1.99.1"
         run: |
           mkdir -p artifacts
-          bash scripts/verify_all.sh --only research,smoke --report artifacts/verify.json
+          bash scripts/verify_all.sh --only research,smoke,security-scan --report artifacts/verify.json
       - name: Archive pair scenario
         run: |
           mkdir -p artifacts/archive-dir
