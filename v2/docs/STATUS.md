@@ -1,4 +1,4 @@
-# V2 现状（截至 2026-11-08，master `c339a45`）
+# V2 现状（截至 2026-11-08，master `8d2bb35`）
 
 一页看清“系统现在能做什么、证据在哪、还缺什么”。
 
@@ -10,9 +10,9 @@
 
 | 项 | 当前 |
 | --- | --- |
-| Rust 测试 | 158 |
+| Rust 测试 | 158 lib + 1 bin |
 | Python 研究测试 | 58 |
-| Playwright | 134（24 skipped） |
+| Playwright | 135（24 skipped） |
 | 端到端冒烟 | 全链路通过（含脚本自身行为断言） |
 | CI | 8 个作业全绿（含 `verify-report`，上传验证报告 + 归档清单） |
 | Schema | v15（旧库按设计拒绝，需重建） |
@@ -24,7 +24,7 @@
 - 单账户 + A/B 双槽 + 准备金；权重 bps、整数分拆分、守恒。
 - 确定性会话（created/running/paused/stopped/completed），单步/按日/账户级推进；非法动作拒绝。
 - 订单：证据、T+1、整手、预算、集中度、现金底线；拒绝原因显式存储。
-- 推进预览（只读）：`GET /v2/paper-accounts/{id}/advance/preview?day=`。
+- 推进预览（只读）：`GET /v2/paper-accounts/{id}/advance/preview?day=`；控制台与 `daily_advance.sh --dry-run` 共用。
 
 ### 审计（9 项）
 `budget_split` · `fills_replay` · `capital_conservation` · `order_fill_link` · `fill_matches_outcome` · `session_link` · `session_signals` · `rebalance_chain` · `switch_chain`
@@ -54,7 +54,7 @@
 ### 运维
 - `/v2/health`：schema、账户/会话/事件计数、价格集合信任拆分。
 - 备份/恢复/校验：`db_tool`（在线 API、拒绝覆盖、损坏即失败）。
-- 归档：`verify_archive`（单对 / 整目录 / 侧车 / 合并 manifest）。
+- 归档：`verify_archive`（单对 / 整目录 / 侧车 / 合并 manifest）；控制台可列 `ASTOCK_ARCHIVE_DIR` 下的清单（副本数/失败数/合并摘要/逐副本明细）。
 - 调度：`daily_advance.sh`（dry-run 调预览）、`weekly_review.py`（三种窗口来源）。
 - 一键验证 + JSON 报告；CI 工件留存。
 
@@ -81,6 +81,6 @@ curl -fsS http://127.0.0.1:8765/v2/health                # 运行中实例
 ## 建议的下一步（按价值排序）
 
 1. 提供合规样例 CSV（或指定数据源），走 `DATA_ONBOARDING` 全链路演练；
-2. 归档 manifest 只读展示（需新增读接口）；
+2. 定期刷新本页与 `ACCEPTANCE.md`（本轮已同步）；
 3. 定期 ADR/实现一致性复核（已有两轮）；
 4. 控制台细节：概览与账户页状态信息进一步整合。
