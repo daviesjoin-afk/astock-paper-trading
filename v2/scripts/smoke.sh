@@ -610,6 +610,7 @@ assert call("paper-accounts/concurrency-account/audit")["ok"] is True
 health = call("health")
 assert health["schema_version"] == 15 and health["writer"] == "store-single-writer", health
 assert health["reviewed_price_sets"] == 0 and isinstance(health["accounts"], int), health
+assert health["archive_dir_configured"] is False, health
 archives = call("archive/manifests")
 assert archives["dir"] is None and archives["manifests"] == [], archives
 

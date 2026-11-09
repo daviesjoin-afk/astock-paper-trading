@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 健康暴露归档配置：`/v2/health` 增加 `archive_dir_configured`（`ASTOCK_ARCHIVE_DIR` 是否设置），便于确认控制台归档面板为何为空；冒烟断言默认 false。
 - V2 文档基线同步：`STATUS.md`/`ACCEPTANCE.md` 更新为 Rust 158 lib + 1 bin / Python 58 / 浏览器 135，补入推进预览与归档清单面板能力。
 - V2 归档副本明细：`/v2/archive/manifests` 增加 `entries[]`（副本名/摘要/导出名），控制台以「副本明细」展开；Rust bin 测试与浏览器用例覆盖。
 - V2 归档清单显示合并摘要：`/v2/archive/manifests` 增加 `combined`，控制台优先展示合并摘要前缀（缺省回退单副本摘要）；Rust bin 测试与浏览器用例同步。
