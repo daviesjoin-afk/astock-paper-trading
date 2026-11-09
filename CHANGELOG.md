@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 账户数据可用性提示：账户页读取 `/v2/health` 显示 `审核价格集合 r · 合成 s`；审核为 0 时明确“估值、绩效与资金提案保持不可用”（警告色），把失败原因放在用户眼前；浏览器 131 passed（+1）；Rust/Python 不变。
 - V2 验证失败路径覆盖：冒烟用 `CARGO=false --only rust` 强制失败，断言退出码 1 且报告仍写出 `ok: false`；`OPERATIONS.md` 注明失败也会产出报告。
 - V2 验证脚本 --only 校验：未知套件名或过滤后为空集合一律退出 2（此前会静默“全部通过”）；冒烟覆盖两种错误。`OPERATIONS.md` 注明。
 - V2 验证脚本套件过滤 + CI 工件：`verify_all.sh --only LIST` 只跑指定套件；CI 新增 `verify-report` 作业（`--only research,smoke --report artifacts/verify.json`）并上传 `v2-verify-report` 工件，首次在 Linux 上验证脚本可运行；冒烟断言 `--only` 生效。`OPERATIONS.md` 补充用法。

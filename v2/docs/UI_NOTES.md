@@ -136,6 +136,9 @@ form, no valuation.
 - Strategy versions: the account page prints the current version and switch
   count per slot, lists the append-only switch history, and records a switch
   (slot, target version, explicit effective time, reason) from the console.
+- Data availability: the account page states the reviewed/synthetic price-set
+  split from `/v2/health`; when reviewed == 0 it says outright that valuation,
+  performance and proposals stay unavailable.
 - Account performance: one line with profit, return, drawdown, fees, trades and
   days when reviewed prices cover the known days; hidden (never zero-filled)
   when they do not.

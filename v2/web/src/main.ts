@@ -1670,6 +1670,26 @@ async function loadOverviewStatus(): Promise<void> {
   }
 }
 
+async function loadAccountDataHint(accountId: string): Promise<void> {
+  const hint = testId<HTMLElement>("account-data-hint");
+  try {
+    const health = await api<{ reviewed_price_sets: number; synthetic_price_sets: number }>(
+      "/v2/health",
+      new AbortController().signal,
+    );
+    if (currentAccountId !== accountId) return;
+    const reviewed = health.reviewed_price_sets ?? 0;
+    const synthetic = health.synthetic_price_sets ?? 0;
+    toggle(hint, true);
+    hint.textContent = reviewed === 0
+      ? `审核价格集合 0 · 合成 ${synthetic}；没有审核数据时估值、绩效与资金提案保持不可用`
+      : `审核价格集合 ${reviewed} · 合成 ${synthetic}`;
+    hint.dataset.state = reviewed === 0 ? "gap" : "ok";
+  } catch {
+    if (currentAccountId === accountId) toggle(hint, false);
+  }
+}
+
 async function loadStrategySwitches(accountId: string): Promise<void> {
   try {
     const rows = await api<StrategySwitch[]>(
@@ -1981,6 +2001,7 @@ const loadAccount = async (accountId: string): Promise<void> => {
     showAccountError(`读取账户失败：${errorDetail(error)}`);
   }
   await loadStrategySwitches(accountId);
+  void loadAccountDataHint(accountId);
 };
 
 const loadStrategies = async (): Promise<void> => {
