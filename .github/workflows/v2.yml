@@ -129,9 +129,35 @@ jobs:
         run: |
           mkdir -p artifacts
           bash scripts/verify_all.sh --only research,smoke --report artifacts/verify.json
+      - name: Archive pair scenario
+        run: |
+          mkdir -p artifacts/archive-dir
+          python - <<'PY_PAIR'
+          import json, sqlite3, sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          import verify_export
+
+          root = Path("artifacts/archive-dir")
+          db = root / "pair.sqlite3"
+          connection = sqlite3.connect(db)
+          connection.execute("CREATE TABLE v2_paper_accounts (account_id TEXT PRIMARY KEY)")
+          connection.execute("CREATE TABLE v2_evolution_events (event_id TEXT PRIMARY KEY)")
+          connection.execute("PRAGMA user_version = 15")
+          connection.commit()
+          connection.close()
+
+          document = {
+              "schema_version": 1, "candidate_id": None, "status": None,
+              "from_day": None, "to_day": None, "count": 0, "events": [],
+          }
+          document["digest"] = verify_export.canonical_digest(document)
+          (root / "pair.export.json").write_text(json.dumps(document), encoding="utf-8")
+          PY_PAIR
+          python scripts/verify_archive.py --dir artifacts/archive-dir             --manifest-out artifacts/archive-manifest.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: v2-verify-report
-          path: v2/artifacts/verify.json
+          path: v2/artifacts
           if-no-files-found: warn
