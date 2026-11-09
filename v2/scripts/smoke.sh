@@ -711,6 +711,7 @@ rm -rf "$PUB_DIR"
 # Verification runner: dry-run lists the suites without executing them.
 bash scripts/verify_all.sh --dry-run | grep -q "^rust"
 bash scripts/verify_all.sh --dry-run | grep -q "^browser"
+bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch | grep -q "^archive"
 
 # Weekly review: synthetic data means no coverage, so the verdict is unstable.
 if python scripts/weekly_review.py --base-cycle shadow-base-1 \
