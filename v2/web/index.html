@@ -727,6 +727,26 @@ python3 scripts/experiment_demo.py</code></pre>
                   <div><dt>执行规则标识</dt><dd id="tech-policy" data-testid="tech-policy">—</dd></div>
                 </dl>
               </details>
+              <section class="compare-panel" id="ab-compare" data-testid="ab-compare">
+                <h3>A/B 对照</h3>
+                <p class="panel-note">并排查看两个实验的组合事实；不比较收益率，不做排名。</p>
+                <div class="compare-inputs">
+                  <label class="field field-inline">
+                    <span class="field-label">基准实验</span>
+                    <input id="compare-base" data-testid="compare-base" autocomplete="off" />
+                  </label>
+                  <label class="field field-inline">
+                    <span class="field-label">候选实验</span>
+                    <input id="compare-candidate" data-testid="compare-candidate" autocomplete="off" />
+                  </label>
+                  <button type="button" class="btn btn-quiet" id="compare-run" data-testid="compare-run">对比</button>
+                </div>
+                <table class="compare-table" id="compare-table" data-testid="compare-table" hidden>
+                  <thead><tr><th>项</th><th>基准</th><th>候选</th></tr></thead>
+                  <tbody id="compare-body" data-testid="compare-body"></tbody>
+                </table>
+                <p class="compare-note" id="compare-note" data-testid="compare-note" hidden></p>
+              </section>
               <section class="price-sets" id="price-sets" data-testid="price-sets">
                 <h3>价格集合</h3>
                 <p class="panel-note">只有 reviewed 集合参与估值与绩效；synthetic 仅供本地测试。</p>
