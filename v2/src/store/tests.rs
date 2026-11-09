@@ -4454,3 +4454,43 @@ fn sessions_cannot_start_before_the_last_switch() {
     let created = db.create_paper_session(late).unwrap();
     assert_eq!(created.session_id, "switch-session-late");
 }
+
+#[test]
+fn a_session_started_after_the_switch_books_orders_under_the_new_version() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("session-switch-live", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    let sell = output
+        .signals
+        .iter()
+        .find(|signal| signal.side == crate::domain::Side::Sell)
+        .expect("sell signal");
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    db.record_strategy_switch(
+        "session-switch-live",
+        PaperSlotId::A,
+        "research-momentum-v2",
+        "2026-10-31T09:00:00+08:00",
+        "promotion",
+        "session-switch-live-1",
+    )
+    .unwrap();
+
+    let mut spec = session_spec(
+        "session-switch-live",
+        "session-switch-live-session",
+        vec![session_signal(PaperSlotId::A, sell)],
+    );
+    spec.start_at = "2026-11-01T00:00:00+08:00".into();
+    db.create_paper_session(spec).unwrap();
+    db.paper_session_action("session-switch-live-session", "start").unwrap();
+
+    let view = db.advance_paper_session_to("session-switch-live-session", "2026-11-03").unwrap();
+    assert_eq!(view.session.cursor, 1);
+    let orders = db.paper_orders("session-switch-live", 10).unwrap();
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].strategy_version_id, "research-momentum-v2");
+    assert_eq!(orders[0].slot, "A");
+}
