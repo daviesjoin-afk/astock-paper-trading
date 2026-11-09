@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 验证报告输出：`verify_all.sh --report PATH` 在运行时收集各套件结果与耗时，结束后写 JSON（`ok`、`generated_at`、`suites[]`）；`OPERATIONS.md` 补充；脚本整体重写以修复前几轮补丁造成的解析/转义问题。实测 `--fast --no-scan --report` 输出正确 JSON。Rust/Python/浏览器不变。
 - V2 再平衡二次确认：点击「执行再平衡」先展开确认区，逐槽列出划拨金额与权重变化（按初始本金换算）并保持准备金；确认后才发请求，取消不提交；浏览器 129 passed（同用例增加二次确认与取消语义）；Rust/Python 不变。
 - V2 一键验证接入归档：`verify_all.sh --archive DIR` 追加整目录归档校验套件；参数解析改为 `while` 循环（原 `for` 内 `shift` 无效导致把目录当未知参数）；`OPERATIONS.md` 更新；冒烟断言 dry-run 出现 `archive` 行。
 - V2 切换前置校验：控制台在提交前比较生效时刻与该账户最后一次会话 `clock_at`，不晚于会话则内联拒绝（不发请求），避免无谓的服务端 422；浏览器 129 passed（+1：早于会话不提交）；Rust/Python 不变。
