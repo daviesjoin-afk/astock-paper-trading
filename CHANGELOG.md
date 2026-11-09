@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 “自上次查看”零值过滤：只显示发生变化的项；全部相等时显示“无变化”，减少噪声；浏览器 133 passed（+1 无变化用例，原用例改为断言不再出现零值项）。
 - V2 “自上次查看”加入进化事件数：基线记录新增 `events`（来自 health），仅在切换链与健康探测都返回后渲染，避免半状态；浏览器 132 passed（用例断言 `进化 0`；一次全量因 4173 预览服务启动超时出现偶发失败，重跑通过）。
 - V2 健康事件计数：`/v2/health` 增加 `evolution_events`，概览状态条显示“进化：n 条 · 最近 …”；Rust 健康测试覆盖 0→1；浏览器断言事件条数。Rust 158 / Python 58 / Playwright 132 不变。
 - V2 CI 归档场景：`verify-report` 作业新增“造一对最小归档产物 → `verify_archive --dir` → 写 manifest”步骤，工件目录改为整个 `v2/artifacts`（含 `verify.json` 与 `archive-manifest.json`），首次在 Linux CI 验证归档目录路径。
