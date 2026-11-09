@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 验证脚本跨平台：`verify_all.sh` 仅在 MSYS/Cygwin 下默认使用固定 GNU 工具链，其他平台用 `cargo`；`CARGO`/`PYTHON` 仍可覆盖；`OPERATIONS.md` 说明。dry-run 两种模式均验证。
 - V2 切换链篡改检测：新增测试——直接改写 `v2_paper_slot_switches.from_version` 后，审计 `ok=false` 且 `switch_chain` 详情含 `break`，证明该检查不是恒真；ADR-018 记录。Rust 157 passed；冒烟/研究/浏览器不变。
 - V2 概览改用健康计数：落地页状态条改读 `/v2/health`（一次请求替代账户总览+价格集合两次），并显示 `价格集合 n（审核 r / 合成 s）`，让“有没有审核数据”一眼可见；浏览器 130 passed（用例改为健康桩）；Rust/Python 不变。
 - V2 健康检查扩容：`/v2/health` 增加 `accounts`、`sessions_active`、`reviewed_price_sets`、`synthetic_price_sets`（计数查询，无账本扫描）；`OPERATIONS.md` 增加字段说明；冒烟断言初始 reviewed=0、结束后 synthetic=1 且 accounts≥1。Rust 156 passed（+1 计数）；Python 58 / 浏览器 130 不变。
