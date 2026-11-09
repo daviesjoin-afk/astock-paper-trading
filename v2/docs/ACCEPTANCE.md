@@ -1,6 +1,6 @@
 # V2 验收对照表
 
-把路线图的每个验收项落到**可复现的命令与证据**上。现状基线：`master` 至此轮，Rust 155 / Python 研究 57 / 浏览器 130 / 冒烟全链路。
+把路线图的每个验收项落到**可复现的命令与证据**上。现状基线：Rust 158 / Python 研究 58 / 浏览器 134 / 冒烟全链路；CI 8 个作业（含 `verify-report`，上传验证报告与归档清单）。
 
 ## 一键证据
 
@@ -8,7 +8,7 @@
 bash scripts/verify_all.sh --report /tmp/verify.json
 ```
 
-输出各套件 `pass` 与耗时，`/tmp/verify.json` 为机器可读汇总。任一失败退出 1。
+输出各套件 `pass` 与耗时，`/tmp/verify.json` 为机器可读汇总；失败时仍写出且 `ok=false`，退出 1。`--only`/`--archive`/`--report` 组合可用，未知或空选择退出 2。
 
 ## 分阶段对照
 
