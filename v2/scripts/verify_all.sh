@@ -51,7 +51,11 @@ if [ "$SCAN" -eq 1 ]; then
   add "security-scan" "$PYTHON scripts/security/scan-sensitive-data.py --repo . --scope worktree"
 fi
 if [ -n "$ARCHIVE" ]; then
-  add "archive" "$PYTHON scripts/verify_archive.py --dir '$ARCHIVE'"
+  ARCHIVE_CMD="$PYTHON scripts/verify_archive.py --dir '$ARCHIVE'"
+  if [ -n "$REPORT" ]; then
+    ARCHIVE_CMD="$ARCHIVE_CMD --manifest-out '${REPORT}.archive.json'"
+  fi
+  add "archive" "$ARCHIVE_CMD"
 fi
 
 if [ "$DRY" -eq 1 ]; then

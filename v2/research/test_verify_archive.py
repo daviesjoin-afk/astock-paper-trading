@@ -125,25 +125,25 @@ class VerifyArchiveTest(unittest.TestCase):
         sidecar = self.dir / "pair.manifest.json"
         sidecar.write_text(json.dumps({"manifest": "0" * 64}), encoding="utf-8")
         self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
+
+    def test_directory_mode_writes_combined_manifest(self) -> None:
+        self.clear_dir()
+        db = self.dir / "astock.sqlite3"
+        make_db(db)
+        export = self.dir / "astock.export.json"
+        make_export(export)
+        sidecar = self.dir / "verify.manifest.json"
+        code = verify_archive.main([
+            "--dir", str(self.dir),
+            "--manifest-out", str(sidecar),
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(payload["failed"], 0)
+        self.assertEqual(len(payload["archives"]), 1)
+        self.assertEqual(payload["archives"][0]["name"], "astock.sqlite3")
+        self.assertEqual(len(payload["combined"]), 64)
+
+
 if __name__ == "__main__":
     unittest.main()
-
-    def test_directory_mode_verifies_pairs(self) -> None:
-        db = self.dir / "astock-2026-11.sqlite3"
-        make_db(db)
-        export = self.dir / "astock-2026-11.export.json"
-        make_export(export)
-        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 0)
-
-    def test_directory_mode_flags_missing_export(self) -> None:
-        make_db(self.dir / "orphan.sqlite3")
-        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
-
-    def test_directory_mode_checks_sidecar_manifest(self) -> None:
-        db = self.dir / "pair.sqlite3"
-        make_db(db)
-        export = self.dir / "pair.export.json"
-        make_export(export)
-        sidecar = self.dir / "pair.manifest.json"
-        sidecar.write_text(json.dumps({"manifest": "0" * 64}), encoding="utf-8")
-        self.assertEqual(verify_archive.main(["--dir", str(self.dir)]), 1)
