@@ -4542,3 +4542,41 @@ fn audit_detects_a_tampered_switch_chain() {
     assert!(!chain.ok);
     assert!(chain.detail.contains("break"), "{}", chain.detail);
 }
+
+#[test]
+fn advance_preview_counts_steps_without_writing() {
+    let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
+    db.create_paper_account(paper_spec("preview-acct", 10_000_000)).unwrap();
+    let output = frozen_momentum_output();
+    for signal in &output.signals {
+        ingest_signal_evidence(&mut db, signal);
+    }
+    db.create_paper_session(session_spec(
+        "preview-acct",
+        "preview-session",
+        vec![
+            session_signal(PaperSlotId::A, &output.signals[0]),
+            session_signal(PaperSlotId::A, &output.signals[1]),
+        ],
+    ))
+    .unwrap();
+    db.paper_session_action("preview-session", "start").unwrap();
+
+    let preview = db.preview_account_advance("preview-acct", "2026-10-30").unwrap();
+    assert_eq!(preview.total_steps, 1);
+    assert_eq!(preview.sessions[0].session_id, "preview-session");
+    // Nothing was written.
+    assert_eq!(db.paper_session("preview-session").unwrap().cursor, 0);
+
+    let later = db.preview_account_advance("preview-acct", "2026-11-02").unwrap();
+    assert_eq!(later.total_steps, 2);
+
+    assert!(matches!(
+        db.preview_account_advance("preview-acct", "2026-13-01"),
+        Err(StoreError::Rules(RuleError(ref code))) if code == "invalid_advance_day"
+    ));
+    assert!(matches!(
+        db.preview_account_advance("missing-acct", "2026-11-02"),
+        Err(StoreError::NotFound(_))
+    ));
+}

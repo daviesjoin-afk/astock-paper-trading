@@ -921,6 +921,9 @@ td:first-child { font-weight: 550; }
 .switch-form { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-end; }
 .switch-form input { min-width: 150px; }
 
+/* ---------- advance preview ---------- */
+.advance-preview-text { margin: 6px 20px 0; font-size: 11.5px; color: var(--muted); }
+
 /* ---------- data hint ---------- */
 .data-hint { margin: 0 20px 10px; font-size: 11.5px; color: var(--muted); }
 .data-hint[data-state="gap"] { color: var(--warn); }

@@ -146,6 +146,9 @@ test.describe("paper session control", () => {
     await expect(card).toContainText("运行中");
 
     await page.getByTestId("account-advance-day").fill("2026-11-02");
+    await page.getByTestId("account-advance-preview").click();
+    await expect(page.getByTestId("account-advance-preview-text"))
+      .toContainText("将执行 1 个会话、2 步");
     await page.getByTestId("account-advance").click();
     await expect(card).toContainText("已完成", { timeout: 15_000 });
     await expect(card).toContainText("2/2");
