@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 再平衡二次确认：点击「执行再平衡」先展开确认区，逐槽列出划拨金额与权重变化（按初始本金换算）并保持准备金；确认后才发请求，取消不提交；浏览器 129 passed（同用例增加二次确认与取消语义）；Rust/Python 不变。
 - V2 一键验证接入归档：`verify_all.sh --archive DIR` 追加整目录归档校验套件；参数解析改为 `while` 循环（原 `for` 内 `shift` 无效导致把目录当未知参数）；`OPERATIONS.md` 更新；冒烟断言 dry-run 出现 `archive` 行。
 - V2 切换前置校验：控制台在提交前比较生效时刻与该账户最后一次会话 `clock_at`，不晚于会话则内联拒绝（不发请求），避免无谓的服务端 422；浏览器 129 passed（+1：早于会话不提交）；Rust/Python 不变。
 - V2 归档目录遍历校验：`verify_archive.py --dir` 按 `<name>.sqlite3` + `<name>.export.json|json` 配对校验整目录，可选核对 `<name>.manifest.json` 侧车；缺配对/摘要不符逐条报错、退出 1；单文件模式保持原退出码语义（缺文件 2）。Python 研究套件 57 passed（+3：配对/缺配对/侧车不符）；冒烟覆盖目录模式。

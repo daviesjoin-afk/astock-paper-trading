@@ -1484,8 +1484,33 @@ const renderAllocation = (report: AllocationProposal | null): void => {
   }));
 };
 
+const describeRebalance = (report: AllocationProposal): string => {
+  const initial = lastAccountView?.initial_cash_cents ?? 0;
+  const moves = report.proposal.rationale
+    .map((item) => {
+      const deltaBps = Math.abs(item.target_bps - item.current_bps);
+      const amount = Math.round((initial * deltaBps) / 10_000);
+      const direction = item.target_bps > item.current_bps ? "增加" : "减少";
+      return `${item.slot} ${direction} ${money(amount)}（${(item.current_bps / 100).toFixed(1)}% → ${(item.target_bps / 100).toFixed(1)}%）`;
+    })
+    .join("；");
+  return `确认执行？${moves}；准备金保持 ${(report.proposal.reserve_bps / 100).toFixed(1)}%。`;
+};
+
+const showAllocationConfirm = (show: boolean): void => {
+  toggle(testId<HTMLElement>("allocation-confirm"), show);
+};
+
 const applyAllocation = async (): Promise<void> => {
   if (!allocationReport) return;
+  const confirmText = testId<HTMLElement>("allocation-confirm-text");
+  const alreadyAsking = !testId<HTMLElement>("allocation-confirm").hidden;
+  if (!alreadyAsking) {
+    confirmText.textContent = describeRebalance(allocationReport);
+    showAllocationConfirm(true);
+    return;
+  }
+  showAllocationConfirm(false);
   const targets = allocationReport.proposal.rationale.map((item) => item.target_bps);
   if (targets.length !== 2) {
     showAccountError("资金提案缺少两个槽位");
@@ -1501,6 +1526,7 @@ const applyAllocation = async (): Promise<void> => {
       note: "account console",
     });
     announce("资金再平衡已执行");
+    showAllocationConfirm(false);
     await loadAccount(currentAccountId);
   } catch (error) {
     showAccountError(`执行再平衡失败：${errorDetail(error)}`);
@@ -1511,6 +1537,8 @@ const applyAllocation = async (): Promise<void> => {
 };
 
 testId<HTMLButtonElement>("allocation-apply").addEventListener("click", () => void applyAllocation());
+testId<HTMLButtonElement>("allocation-confirm-yes").addEventListener("click", () => void applyAllocation());
+testId<HTMLButtonElement>("allocation-confirm-no").addEventListener("click", () => showAllocationConfirm(false));
 
 const renderRebalances = (records: RebalanceRecord[]): void => {
   const block = testId<HTMLElement>("account-rebalances");
