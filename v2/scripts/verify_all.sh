@@ -71,7 +71,7 @@ if [ "$FAST" -eq 0 ]; then
   add "browser" "(cd web && npm run build && npx playwright test)"
 fi
 if [ "$SCAN" -eq 1 ]; then
-  add "security-scan" "$PYTHON scripts/security/scan-sensitive-data.py --repo . --scope worktree"
+  add "security-scan" "$PYTHON ../scripts/security/scan-sensitive-data.py --repo .. --scope worktree"
 fi
 if [ -n "$ARCHIVE" ]; then
   ARCHIVE_CMD="$PYTHON scripts/verify_archive.py --dir '$ARCHIVE'"

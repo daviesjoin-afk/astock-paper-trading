@@ -4,6 +4,7 @@
 
 ## 当前分支
 
+- V2 修复一键验证的泄露扫描路径：脚本在 `v2/` 运行时指向不存在的 `scripts/security/...`，改为仓库根 `../scripts/security/scan-sensitive-data.py --repo ..`；`--only security-scan` 与全量 `verify_all` 现均通过；冒烟断言 dry-run 含正确路径。
 - V2 概览移动端：新增 390px 用例，确认含归档字段的状态条不产生横向溢出；浏览器 136 passed（+1）。
 - V2 概览归档状态：状态条增加「归档：已配置/未配置」（来自 health），与价格集合信任拆分并列；浏览器 135 passed（同用例断言）。
 - V2 健康暴露归档配置：`/v2/health` 增加 `archive_dir_configured`（`ASTOCK_ARCHIVE_DIR` 是否设置），便于确认控制台归档面板为何为空；冒烟断言默认 false。

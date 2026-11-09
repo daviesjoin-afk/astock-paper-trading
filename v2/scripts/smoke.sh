@@ -727,6 +727,7 @@ rm -rf "$PUB_DIR"
 # Verification runner: dry-run lists the suites without executing them.
 bash scripts/verify_all.sh --dry-run | grep -q "^rust"
 bash scripts/verify_all.sh --dry-run | grep -q "^browser"
+bash scripts/verify_all.sh --dry-run | grep -q "../scripts/security/scan-sensitive-data.py"
 bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch | grep -q "^archive"
 bash scripts/verify_all.sh --dry-run --archive /tmp/astock-arch --report /tmp/r.json | grep -q "archive.json"
 bash scripts/verify_all.sh --dry-run --only research | grep -q "^research"
