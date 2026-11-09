@@ -1755,6 +1755,12 @@ const runComparison = async (): Promise<void> => {
     note.textContent = "请填写两个实验标识";
     return;
   }
+  if (baseId === candidateId) {
+    toggle(table, false);
+    toggle(note, true);
+    note.textContent = "两个实验标识相同，无法对照";
+    return;
+  }
   try {
     const [base, candidate, baseReplay, candidateReplay] = await Promise.all([
       api<CompareSide>(`/v2/portfolio?cycle_id=${encodeURIComponent(baseId)}`, new AbortController().signal),

@@ -35,6 +35,15 @@ test.describe("A/B comparison panel", () => {
     await expect(replay).toContainText("未通过");
   });
 
+  test("refuses to compare an experiment with itself", async ({ page }) => {
+    await page.goto(`/?cycle_id=${CYCLES.holdings}`);
+    await page.getByTestId("nav-experiment").click();
+    await page.getByTestId("compare-candidate").fill(CYCLES.holdings);
+    await page.getByTestId("compare-run").click();
+    await expect(page.getByTestId("compare-note")).toHaveText("两个实验标识相同，无法对照");
+    await expect(page.getByTestId("compare-table")).toBeHidden();
+  });
+
   test("requires both experiment ids", async ({ page }) => {
     await page.goto(`/?cycle_id=${CYCLES.holdings}`);
     await page.getByTestId("nav-experiment").click();
