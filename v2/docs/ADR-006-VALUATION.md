@@ -88,12 +88,13 @@ ADR 004 已禁止在缺少审核估值价格时输出收益类指标。账户与
 - **已实现（HTTP/UI）**：无价格集合时的拒绝路径与需求清单（ADR 006 §4）。
 - **已实现（目录与选择）**：bundled `data/price-sets-registry.json`（当前为空）、`GET /v2/price-sets` 只读目录、`PriceSetRegistry::select()` 仅选择 `reviewed` 且覆盖日期且绑定数据包的集合；HTTP 估值在选中集合时返回 `status:"valued"` 与 `valuation{市值,现金,权益,盈亏}`，否则维持 `unavailable`。
 - **已实现（运行时目录）**：价格集合改为从 `data/price-sets/*.json` 只读加载（可用 `ASTOCK_PRICE_SETS_DIR` 覆盖），空目录/缺失目录 = 无数据；文件损坏或 id 重复 → 整体报错，不静默跳过。工件格式与审核清单见 `v2/data/price-sets/README.md`。
-- **未实现**：真实 `reviewed` 价格集合数据（目录当前为空，刻意不伪造）；真实数据源接入。
-- **约束**：当前 HTTP 端点不会返回任何估值数字；正向逻辑只通过单元测试验证，且 `synthetic` 集合永远不产生 `profit_cents`。
+- **已实现（数据运维）**：`research/make_price_set.py` 生成（缺口/重复/越界即失败）、`scripts/publish_price_set.sh` 安装（默认拒绝覆盖、支持 dry-run）、`GET /v2/price-sets/days` 覆盖日、`GET /v2/price-sets/coverage` 缺口清单（仅统计 `reviewed`）、实验信息页目录与覆盖核对面板、`data/price-set-examples/` 输入模板（标注 synthetic）。
+- **仍未闭合**：真实 `reviewed` 行情数据本身（目录当前为空，刻意不伪造）——这是外部依赖，不是代码缺口。
+- **约束**：无 `reviewed` 覆盖时 HTTP 端点一律 `unavailable`，不返回任何估值数字；`synthetic` 集合永远不参与用户可见数字。
 
 ## 未决问题
 
-- 价格集合的存放位置：随版本发布的 bundled 工件，还是由 Store 只读加载的外部文件？倾向 bundled + 内容摘要校验。
+- ~~价格集合的存放位置~~ → 已定：`data/price-sets/*.json` 由 Store 只读加载（`ASTOCK_PRICE_SETS_DIR` 可覆盖），摘要随工件发布；见实现状态。
 - 停牌、除权除息、涨跌停时如何选取收盘价（需要明确“最后成交价”规则）。
 - 净值日序列的生成与持久化：目前倾向按需重算，不新增写入者。
 - 真实数据源接入与审核流程：需要单独的数据契约 ADR。
