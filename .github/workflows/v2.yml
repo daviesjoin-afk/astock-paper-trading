@@ -118,6 +118,11 @@ jobs:
         working-directory: v2
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The leak scanner skips the repo's own commit ids by collecting
+          # `git rev-list --all --objects`; a shallow clone makes that set
+          # incomplete and turns historical merge ids into false positives.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: actions/setup-python@v5
         with:
