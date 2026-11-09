@@ -177,6 +177,12 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("allocation-rationale")).toContainText("获得更多预算");
     await expect(page.getByTestId("version-flag")).toHaveCount(1);
     await page.getByTestId("allocation-apply").click();
+    await expect(page.getByTestId("allocation-confirm")).toBeVisible();
+    await expect(page.getByTestId("allocation-confirm-text")).toContainText("确认执行？");
+    await expect(page.getByTestId("allocation-confirm-text")).toContainText("B 增加");
+    expect(posted).toBeNull();
+
+    await page.getByTestId("allocation-confirm-yes").click();
     await expect.poll(() => posted).not.toBeNull();
     expect(posted?.["targets"]).toEqual([3_500, 5_500]);
     expect(posted?.["proposal_digest"]).toBe("a".repeat(64));

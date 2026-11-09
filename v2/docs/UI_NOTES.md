@@ -149,7 +149,8 @@ form, no valuation.
   reserve and per-slot rationale from /allocation-proposal, plus “执行再平衡”
   which posts targets + the proposal digest with an explicit applied_at.
   Insufficient evidence hides the block; a rationale that discloses a version
-  switch inside the window gets an inline “版本切换” badge.
+  switch inside the window gets an inline “版本切换” badge. Applying asks for
+  confirmation first and spells out each slot's transfer (¥ and weight delta).
 - Exposure: “仓位与集中度” prints each slot's cost utilisation and either
   “无集中度超限” or the breaching symbols with value vs limit; cost basis only,
   never a market value.
