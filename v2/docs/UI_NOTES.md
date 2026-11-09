@@ -152,8 +152,8 @@ form, no valuation.
   rejections.
 - Since last visit: the header compares order/session/switch counters plus the
   global evolution-event count with what this browser last saw (localStorage,
-  counts only, no clock) and prints the deltas once both probes have loaded;
-  first visit stays silent.
+  counts only, no clock) and prints only the deltas that changed (or
+  “无变化”) once both probes have loaded; first visit stays silent.
 - Run status: the account header shows only account-scoped session counts
   (running/paused/done); global facts (price sets, latest evolution event) live
   on the overview page, so the two views no longer duplicate each other.

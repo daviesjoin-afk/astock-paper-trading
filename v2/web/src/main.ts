@@ -1606,18 +1606,19 @@ const renderSinceLastVisit = (accountId: string): void => {
     toggle(line, false);
     return;
   }
-  const delta = (now: number, before: number): string => {
-    const diff = now - before;
-    return diff > 0 ? `+${diff}` : `${diff}`;
-  };
   const changes = [
-    `成交 ${delta(current.orders, previous.orders)}`,
-    `会话 ${delta(current.sessions, previous.sessions)}`,
-    `切换 ${delta(current.switches, previous.switches)}`,
-    `进化 ${delta(current.events, previous.events ?? 0)}`,
-  ];
+    ["成交", current.orders - previous.orders],
+    ["会话", current.sessions - previous.sessions],
+    ["切换", current.switches - previous.switches],
+    ["进化", current.events - (previous.events ?? 0)],
+  ] as Array<[string, number]>;
+  const changed = changes.filter(([, diff]) => diff !== 0);
   toggle(line, true);
-  line.textContent = `自上次查看：${changes.join(" · ")}`;
+  line.textContent = changed.length === 0
+    ? "自上次查看：无变化"
+    : `自上次查看：${changed
+        .map(([label, diff]) => `${label} ${diff > 0 ? `+${diff}` : diff}`)
+        .join(" · ")}`;
 };
 
 const renderStrategySwitches = (rows: StrategySwitch[]): void => {

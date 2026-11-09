@@ -344,8 +344,8 @@ test.describe("paper account console", () => {
     await openAccount(page);
     await expect(page.getByTestId("status-since")).toContainText("自上次查看", { timeout: 15_000 });
     await expect(page.getByTestId("status-since")).toContainText("成交 +1");
-    await expect(page.getByTestId("status-since")).toContainText("切换 0");
-    await expect(page.getByTestId("status-since")).toContainText("进化 0");
+    await expect(page.getByTestId("status-since")).not.toContainText("切换");
+    await expect(page.getByTestId("status-since")).not.toContainText("进化");
   });
 
   test("explains why valuation is unavailable", async ({ page }) => {
@@ -356,6 +356,17 @@ test.describe("paper account console", () => {
     await expect(page.getByTestId("account-data-hint")).toContainText("审核价格集合 0", { timeout: 15_000 });
     await expect(page.getByTestId("account-data-hint")).toContainText("保持不可用");
     await expect(page.getByTestId("account-data-hint")).toHaveAttribute("data-state", "gap");
+  });
+
+  test("says nothing changed when the baseline matches", async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        "astock-v2-last-seen:e2e-account",
+        JSON.stringify({ orders: 1, sessions: 0, switches: 0, events: 0 }),
+      );
+    });
+    await openAccount(page);
+    await expect(page.getByTestId("status-since")).toContainText("自上次查看：无变化", { timeout: 15_000 });
   });
 
   test("an empty catalogue explains itself instead of rendering an empty account", async ({ page }) => {
