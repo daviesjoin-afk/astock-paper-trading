@@ -1494,7 +1494,13 @@ const describeRebalance = (report: AllocationProposal): string => {
       return `${item.slot} ${direction} ${money(amount)}（${(item.current_bps / 100).toFixed(1)}% → ${(item.target_bps / 100).toFixed(1)}%）`;
     })
     .join("；");
-  return `确认执行？${moves}；准备金保持 ${(report.proposal.reserve_bps / 100).toFixed(1)}%。`;
+  const budgets = report.proposal.rationale
+    .map((item) => `${item.slot} ${money(Math.round((initial * item.target_bps) / 10_000))}`)
+    .join(" · ");
+  return (
+    `确认执行？${moves}；准备金保持 ${(report.proposal.reserve_bps / 100).toFixed(1)}%；` +
+    `划拨后预算 ${budgets}。`
+  );
 };
 
 const showAllocationConfirm = (show: boolean): void => {
