@@ -609,6 +609,7 @@ assert contended["slots"][0]["orders_total"] == 1, contended["slots"][0]
 assert call("paper-accounts/concurrency-account/audit")["ok"] is True
 health = call("health")
 assert health["schema_version"] == 15 and health["writer"] == "store-single-writer", health
+assert health["reviewed_price_sets"] == 0 and isinstance(health["accounts"], int), health
 
 # Deterministic session clock: explicit start, two frozen signals, pause gates.
 session_spec = {
@@ -651,6 +652,11 @@ print("HTTP/SQLite instrument identity/coverage/unsupported types/immutable snap
 print("HTTP execution evidence/price/capacity/missing/expiry/conflicts/retry/replay passed")
 print("HTTP calendar/session/auction/unknown-date/retry/replay passed")
 print("HTTP historical cash/holdings/counts/no-future-leak/repeated-reads passed")
+final_health = call("health")
+assert final_health["accounts"] >= 1, final_health
+assert final_health["synthetic_price_sets"] == 1, final_health
+assert final_health["reviewed_price_sets"] == 0, final_health
+
 # Explicit strategy switch: append-only, audited, and visible in the slot view.
 switch = call("paper-accounts/smoke-account/strategy-switches", {
     "slot": "A",

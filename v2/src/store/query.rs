@@ -2097,3 +2097,34 @@ impl Store {
         Ok(export)
     }
 }
+
+impl Store {
+    /// Cheap facts for the health endpoint: no ledger scan, counts only.
+    pub fn health_counts(&self) -> StoreResult<HealthCounts> {
+        let accounts: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM v2_paper_accounts", [], |row| row.get(0))?;
+        let sessions_active: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM v2_paper_sessions WHERE status IN ('created','running','paused')",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut reviewed = 0i64;
+        let mut synthetic = 0i64;
+        if let Ok(catalogue) = self.price_set_catalogue() {
+            for set in catalogue {
+                if set.trust == crate::domain::TRUST_REVIEWED {
+                    reviewed += 1;
+                } else {
+                    synthetic += 1;
+                }
+            }
+        }
+        Ok(HealthCounts {
+            accounts,
+            sessions_active,
+            reviewed_price_sets: reviewed,
+            synthetic_price_sets: synthetic,
+        })
+    }
+}
