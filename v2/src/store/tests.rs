@@ -3556,6 +3556,35 @@ fn evolution_events_are_idempotent_and_listed() {
 }
 
 #[test]
+fn evolution_event_write_owner_preserves_record_and_digest() {
+    let mut direct = test_store(INITIAL_CASH_CENTS).unwrap();
+    let mut linked = test_store(INITIAL_CASH_CENTS).unwrap();
+    let decision = crate::domain::EvolutionDecision {
+        candidate_id: "cand-owner".into(),
+        status: "promoted".into(),
+        reasons: vec!["通过".into()],
+        digest: "a".repeat(64),
+    };
+    let direct_record = direct
+        .record_evolution_event("evo-owner", "2026-11-05T15:00:00+08:00", decision.clone())
+        .unwrap();
+    let linked_record = linked
+        .record_evolution_event_with_links(
+            "evo-owner",
+            "2026-11-05T15:00:00+08:00",
+            decision,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(direct_record, linked_record);
+    assert_eq!(
+        direct.evolution_events(10, None, None).unwrap(),
+        linked.evolution_events(10, None, None).unwrap()
+    );
+}
+
+#[test]
 fn evolution_events_filter_by_candidate_and_status() {
     let mut db = test_store(INITIAL_CASH_CENTS).unwrap();
     let promoted = crate::domain::EvolutionDecision {

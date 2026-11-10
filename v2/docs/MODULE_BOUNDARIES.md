@@ -10,6 +10,7 @@
 | `src/domain/instrument.rs` | 固定离线证券身份及适用日期下受支持的数量规则 | contract、chrono、serde、标准库 | IO、时钟、网络、价格、持仓、V1 |
 | `src/domain/execution.rs` | 精确时段策略、资格与证据有效性、决策、手续费 | contract、calendar、instrument、portfolio、chrono | IO、SQLite、HTTP、V1 |
 | `src/store/mod.rs` | 单 SQLite 写入口、实验初始资金及固定引用、schema、原子提交、幂等 | domain、rusqlite | HTTP、Python、V1 schema |
+| `src/store/evolution.rs` | 进化治理事件的追加写入、幂等与摘要 | store、domain | HTTP、查询投影、V1 schema |
 | `src/store/query.rs` | 只读投影、历史回放 | store、domain | SQL 写入、提交 |
 | `src/main.rs` | localhost HTTP 路由、请求响应转换 | store、domain、axum | 交易规则复制、直接 SQL |
 | `src/domain/digest.rs` | SHA-256 与规范化 JSON 文本，供内容身份核验 | 标准库、serde_json | IO、时钟、SQLite、HTTP、V1 |

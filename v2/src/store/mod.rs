@@ -1133,6 +1133,7 @@ fn load_state(conn: &Connection, experiment: &ExperimentSpec) -> StoreResult<Por
 
 
 // Read models and replay cannot submit or commit trades.
+mod evolution;
 mod query;
 #[cfg(test)]
 mod tests;
