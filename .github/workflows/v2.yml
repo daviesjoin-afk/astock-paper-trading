@@ -94,6 +94,24 @@ jobs:
           node-version: "22"
       - run: npm ci --no-audit --no-fund
       - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-deploy-web-e42f778
+          path: v2/web/dist/
+
+  deploy-binary:
+    runs-on: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-deploy-linux-arm64-e42f778
+          path: v2/target/release/astock-v2
 
   integration-smoke:
     runs-on: ubuntu-latest
