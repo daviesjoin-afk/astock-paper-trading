@@ -427,7 +427,9 @@ html[data-busy="true"] #refresh { opacity: .65; cursor: progress; }
   color: var(--muted);
   padding: 0 2px;
 }
-.curve-scale-mid { opacity: 0.75; }
+/* No opacity: at 11px on white, fading --muted to 75% lands at 3.5:1, under
+   the 4.5 floor. The mid label is already visually secondary by position. */
+.curve-scale-mid { color: var(--muted); }
 
 .curve-summary {
   display: grid;
