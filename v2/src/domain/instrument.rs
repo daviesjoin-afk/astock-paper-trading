@@ -1,6 +1,7 @@
 //! Fixed offline instrument identity and quantity-rule applicability only.
 //! Consumed by execution; Store pins these inputs. No clock, IO or prices.
-use super::contract::{Board, Exchange, InstrumentIdentity, QuoteTrust, RuleError, SecurityType};
+use super::contract::{Board, Exchange, InstrumentIdentity, QuoteTrust, SecurityType};
+use super::RuleError;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

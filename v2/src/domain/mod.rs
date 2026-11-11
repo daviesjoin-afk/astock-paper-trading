@@ -1,28 +1,34 @@
-//! V2 pure domain: no data source or persistence access.
-//! Group by *one business responsibility*, not by function length.
-mod contract;
-mod digest;
-mod calendar;
-mod instrument;
-mod execution;
-mod paper;
-mod portfolio;
-mod valuation;
+//! Pure domain: deterministic decisions, no clock, storage or network.
+mod account;
 mod allocation;
-mod exposure;
-mod evolution;
-
-pub use contract::*;
-pub use digest::*;
-pub use calendar::*;
-pub use instrument::*;
-pub use execution::*;
-pub use paper::*;
-pub use portfolio::*;
-pub use valuation::*;
-pub use allocation::*;
-pub use exposure::*;
-pub use evolution::*;
+mod calendar;
+mod contract;
+mod execution;
+mod instrument;
+mod market;
+mod strategy;
+mod valuation;
 
 #[cfg(test)]
-mod tests;
+mod rewrite_tests;
+
+pub use account::*;
+pub use allocation::*;
+pub use calendar::*;
+pub use contract::*;
+pub use execution::*;
+pub use instrument::*;
+pub use market::*;
+pub use strategy::*;
+pub use valuation::*;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleError(pub String);
+
+impl std::fmt::Display for RuleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RuleError {}

@@ -1,5 +1,5 @@
 //! Fixed-version scheduled market-day facts. No clock, IO or mutable data source.
-use super::contract::RuleError;
+use super::RuleError;
 use chrono::{Datelike, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
 
