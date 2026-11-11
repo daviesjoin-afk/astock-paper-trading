@@ -302,10 +302,13 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
     // Prefer the whole-market bar table; fall back to a published reviewed
     // price set only when the bar table has nothing. This keeps the two-symbol
     // reviewed path working while the 5.6k-symbol bar feed becomes the norm.
-    let set = match price_set_from_store(&db, request.day.as_deref())? {
-        Some(set) => set,
+    let (set, settle_from) = match price_set_from_store(&db, request.day.as_deref())? {
+        Some(input) => (input.set, input.settle_from),
         None => match load_price_sets(&price_sets_dir()).map_err(api_error)? {
-            Some(set) => set,
+            // A reviewed set is already the exact settlement rectangle; there
+            // is no warm-up region in it, so settlement starts wherever the
+            // account left off.
+            Some(set) => (set, None),
             None => {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -316,7 +319,10 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
         },
     };
     let day = request.day.unwrap_or_else(|| set.coverage_end.clone());
-    response(db.advance(&spec, &set, &day).map_err(api_error)?)
+    response(
+        db.advance(&spec, &set, &day, settle_from.as_deref())
+            .map_err(api_error)?,
+    )
 }
 
 /// Diagnostic: how many symbols the settlement view would actually contain.
@@ -336,15 +342,16 @@ async fn settlement_preview(
         Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
         None => None,
     };
-    let set = price_set_from_store(&db, query.day.as_deref())?;
+    let input = price_set_from_store(&db, query.day.as_deref())?;
     response(json!({
         "bar_days": days.len(),
         "first_bar_day": days.first(),
         "last_bar_day": days.last(),
         "last_settled_day": last_settled,
-        "window": set.as_ref().map(|s| (s.coverage_start.clone(), s.coverage_end.clone())),
-        "symbols": set.as_ref().map(|s| s.symbols().len()).unwrap_or(0),
-        "entries": set.as_ref().map(|s| s.entries.len()).unwrap_or(0),
+        "window": input.as_ref().map(|i| (i.set.coverage_start.clone(), i.set.coverage_end.clone())),
+        "settle_from": input.as_ref().and_then(|i| i.settle_from.clone()),
+        "symbols": input.as_ref().map(|i| i.set.symbols().len()).unwrap_or(0),
+        "entries": input.as_ref().map(|i| i.set.entries.len()).unwrap_or(0),
         "max_settle_days_per_call": MAX_SETTLE_DAYS_PER_CALL,
         "warmup_days": SETTLEMENT_WARMUP_DAYS,
     }))
@@ -371,10 +378,19 @@ const SETTLEMENT_WARMUP_DAYS: usize = 120;
 /// window this is designed around. Catch-up runs should be issued per period.
 const MAX_SETTLE_DAYS_PER_CALL: usize = 260;
 
+/// The settlement window plus the first day that should actually be settled.
+///
+/// The two are not the same: the window starts earlier so strategies have
+/// trailing closes, and `settle_from` says where real settlement begins.
+struct SettlementInput {
+    set: astock_v2::domain::PriceSet,
+    settle_from: Option<String>,
+}
+
 fn price_set_from_store(
     db: &Store,
     through: Option<&str>,
-) -> Result<Option<astock_v2::domain::PriceSet>, (StatusCode, Json<Value>)> {
+) -> Result<Option<SettlementInput>, (StatusCode, Json<Value>)> {
     let days = db.bar_days().map_err(api_error)?;
     let Some(last_day) = days.last().cloned() else {
         return Ok(None);
@@ -401,12 +417,18 @@ fn price_set_from_store(
 
     // The days this call will actually settle: everything after the last
     // settlement up to `end`.
+    //
+    // A brand-new account has nothing settled yet, but that does not mean it
+    // wants three years of history replayed. It starts at `end` -- one day of
+    // settlement -- and real history work (a backtest) is a separate job.
+    // Otherwise the very first advance on a fresh account would immediately
+    // trip the size guard, which is a confusing way to learn this.
     let settle_from = match &last_settled {
         Some(day) => days
             .iter()
             .find(|candidate| candidate.as_str() > day.as_str())
             .cloned(),
-        None => days.first().cloned(),
+        None => Some(end.clone()),
     };
     let Some(settle_from) = settle_from else {
         // Nothing new to settle. A one-day window keeps `view` able to value
@@ -418,9 +440,10 @@ fn price_set_from_store(
             .next()
             .cloned()
             .unwrap_or_else(|| end.clone());
-        return db
+        return Ok(db
             .price_set_from_bars("bar-table", &start, &end)
-            .map_err(api_error);
+            .map_err(api_error)?
+            .map(|set| SettlementInput { set, settle_from: None }));
     };
     if settle_from.as_str() > end.as_str() {
         return Err((
@@ -454,8 +477,13 @@ fn price_set_from_store(
         .saturating_sub(SETTLEMENT_WARMUP_DAYS);
     let start = days[from_index].clone();
 
-    db.price_set_from_bars("bar-table", &start, &end)
-        .map_err(api_error)
+    Ok(db
+        .price_set_from_bars("bar-table", &start, &end)
+        .map_err(api_error)?
+        .map(|set| SettlementInput {
+            set,
+            settle_from: Some(settle_from),
+        }))
 }
 
 #[tokio::main]

@@ -523,6 +523,7 @@ impl Store {
         spec: &AccountSpec,
         set: &PriceSet,
         through: &str,
+        settle_from: Option<&str>,
     ) -> StoreResult<AdvanceResult> {
         if through.len() != 10
             || through < set.coverage_start.as_str()
@@ -533,12 +534,24 @@ impl Store {
             )));
         }
         let from_day = self.last_settled_day(&spec.account_id)?;
+        // The price set may start well before the day settlement begins: those
+        // earlier days are warm-up so the strategies have trailing closes.
+        //
+        // Two different lower bounds:
+        // - `from_day` is the last settled day and is always exclusive
+        //   (settling it again would be replaying, not advancing).
+        // - `settle_from` is an explicit first day and is inclusive.
+        let explicit_floor = settle_from.map(str::to_string);
         let days = set
             .days()
             .into_iter()
             .filter(|day| {
-                day.as_str() > from_day.as_deref().unwrap_or("")
-                    && day.as_str() <= through
+                let after_settled = day.as_str() > from_day.as_deref().unwrap_or("");
+                let at_or_after_floor = match &explicit_floor {
+                    Some(floor) => day.as_str() >= floor.as_str(),
+                    None => true,
+                };
+                after_settled && at_or_after_floor && day.as_str() <= through
             })
             .collect::<Vec<_>>();
         if days.is_empty() {
@@ -1797,7 +1810,7 @@ mod tests {
     fn advancing_fills_every_day_once_and_preserves_cash() {
         let mut store = store();
         let set = price_set(90);
-        let result = store.advance(&spec(), &set, &day(89)).unwrap();
+        let result = store.advance(&spec(), &set, &day(89), None).unwrap();
         assert_eq!(result.processed_days.len(), 90);
         assert!(!result.trades.is_empty());
         let books = store.books("test-account").unwrap();
@@ -1813,7 +1826,7 @@ mod tests {
                     .map(|position| position.market_value_cents.unwrap())
                     .sum::<i64>()
         );
-        let again = store.advance(&spec(), &set, &day(89)).unwrap();
+        let again = store.advance(&spec(), &set, &day(89), None).unwrap();
         assert!(again.processed_days.is_empty());
         assert!(again.trades.is_empty());
         assert_eq!(
@@ -1838,7 +1851,7 @@ mod tests {
     fn rebalance_moves_cash_and_weights_in_one_commit() {
         let mut store = store();
         let set = price_set(90);
-        store.advance(&spec(), &set, &day(89)).unwrap();
+        store.advance(&spec(), &set, &day(89), None).unwrap();
         config_change(&store, 5_400);
         let books = store.books("test-account").unwrap();
         let before: i64 = books.iter().map(|book| book.cash_cents).sum();
@@ -1896,7 +1909,7 @@ mod tests {
     fn slot_profit_uses_original_budget_and_sums_to_account_profit() {
         let mut store = store();
         let set = split_price_set(75);
-        store.advance(&spec(), &set, &day(66)).unwrap();
+        store.advance(&spec(), &set, &day(66), None).unwrap();
         let last = store.last_settled_day("test-account").unwrap().unwrap();
         let view = store.view(&spec(), Some(&set), Some(&last)).unwrap();
         let slot_profit = view
@@ -1970,7 +1983,7 @@ mod tests {
     fn divergent_strategy_returns_trigger_a_bounded_rebalance() {
         let mut store = store();
         let set = split_price_set(75);
-        store.advance(&spec(), &set, &day(66)).unwrap();
+        store.advance(&spec(), &set, &day(66), None).unwrap();
         let rebalance = store
             .rebalances("test-account")
             .unwrap()
