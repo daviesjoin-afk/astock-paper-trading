@@ -4,11 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="description" content="AStock V2 独立策略实验工作台：只读查看离线模拟实验的持仓、决策与可核验记录。" />
+    <meta name="description" content="AStock V2 模拟盘：一个本金账户，稳健与激进两个策略自动运行。" />
     <meta name="theme-color" content="#f4f6fa" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#0b1017" media="(prefers-color-scheme: dark)" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M8 21.5 13.2 15l4.1 3.6L24 10.5' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
-    <title>AStock V2 · 独立策略实验工作台</title>
+    <title>AStock V2 · 稳健与激进</title>
   </head>
   <body>
     <a class="skip-link" href="#main">跳到主要内容</a>
@@ -23,793 +23,162 @@
               <path d="M15.4 5.5H20v4.6" />
             </svg>
           </span>
-          <div class="brand-text">
+          <div>
             <h1>AStock<span class="brand-version">V2</span></h1>
-            <p class="brand-sub">独立策略实验工作台</p>
-          </div>
-          <div class="brand-tags">
-            <span class="tag">离线模拟</span>
-            <span class="tag">只读</span>
+            <p class="brand-sub">单账户 · 稳健 / 激进 · 纯模拟</p>
           </div>
         </div>
-
-        <form class="controls" id="controls" aria-label="实验选择与刷新">
-          <label class="field">
-            <span class="field-label">当前实验</span>
-            <span class="select-wrap">
-              <select id="cycle-select" data-testid="experiment-select" aria-describedby="cycle-hint"></select>
-              <svg class="select-chevron" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
-                <path d="m4 6.5 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </span>
-          </label>
-          <span id="cycle-hint" class="hint" data-testid="cycle-hint"></span>
-          <div class="control-actions">
-            <button type="button" class="btn btn-quiet" id="refresh" data-testid="refresh">
-              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6V6h-3.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-              <span>刷新</span>
-            </button>
-            <button type="button" class="btn btn-quiet" id="theme-toggle" data-testid="theme-toggle"
-                    aria-pressed="false" aria-label="切换深色模式">
-              <svg class="icon-sun" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <circle cx="8" cy="8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5" />
-                <path d="M8 1v1.6M8 13.4V15M1 8h1.6M13.4 8H15M3 3l1.1 1.1M11.9 11.9 13 13M13 3l-1.1 1.1M4.1 11.9 3 13"
-                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-              </svg>
-              <svg class="icon-moon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8 5.4 5.4 0 1 0 13.2 9.6Z"
-                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
-              </svg>
-              <span class="theme-label">深色模式</span>
-            </button>
-            <button type="button" class="btn btn-quiet btn-compact" id="shortcuts-open" data-testid="shortcuts-open"
-                    aria-haspopup="dialog" aria-label="键盘快捷键">
-              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <rect x="1.6" y="4" width="12.8" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
-                <path d="M4.4 6.6h.8M7.6 6.6h.8M10.8 6.6h.8M4.4 9.4h.8M10.8 9.4h.8M7.6 9.4h1.2"
-                      fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-              </svg>
-              <span class="btn-label">快捷键</span>
-            </button>
-          </div>
-        </form>
+        <div class="top-actions">
+            <span class="asof">已结算至 <strong data-testid="as-of">—</strong></span>
+          <button type="button" class="btn btn-quiet" data-testid="refresh" id="refresh">刷新</button>
+          <button type="button" class="btn btn-quiet" data-testid="theme-toggle" id="theme-toggle"
+                  aria-pressed="false" aria-label="切换深色模式">深色</button>
+        </div>
       </div>
     </header>
 
-    <div class="shell">
-      <nav class="sidenav" aria-label="主导航">
-        <div class="nav-group">
-          <p class="nav-title">模拟账户</p>
-          <button type="button" class="nav-item" data-view="account" data-testid="nav-account">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <rect x="2" y="3.4" width="12" height="9.2" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
-              <path d="M2 6.4h12M4.6 9.6h3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-            </svg>
-            <span>模拟账户</span>
-          </button>
-        </div>
-        <div class="nav-group">
-          <p class="nav-title">研究</p>
-          <button type="button" class="nav-item" data-view="overview" data-testid="nav-overview">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <rect x="2" y="2" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
-              <rect x="9" y="2" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
-              <rect x="2" y="9" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
-              <rect x="9" y="9" width="5" height="5" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4" />
-            </svg>
-            <span>概览</span>
-          </button>
-          <button type="button" class="nav-item" data-view="positions" data-testid="nav-positions">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <path d="M8 2 14 5 8 8 2 5l6-3Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
-              <path d="m2 8.4 6 3 6-3M2 11.6l6 3 6-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
-            </svg>
-            <span>持仓</span>
-          </button>
-          <button type="button" class="nav-item" data-view="decisions" data-testid="nav-decisions">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <path d="M3 4.2h10M3 8h10M3 11.8h6.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-            </svg>
-            <span>决策记录</span>
-          </button>
-        </div>
-        <div class="nav-group">
-          <p class="nav-title">质量校验</p>
-          <button type="button" class="nav-item" data-view="replay" data-testid="nav-replay">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <path d="M2.6 8a5.4 5.4 0 1 0 1.7-4M2.4 2.6v3.6h3.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-              <path d="M6.6 6.1 10 8l-3.4 1.9V6.1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-            </svg>
-            <span>交易回放</span>
-          </button>
-          <button type="button" class="nav-item" data-view="reproduction" data-testid="nav-reproduction">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <path d="M3 6.4h6.6a3.2 3.2 0 0 1 0 6.4H5.4M3 6.4l2.2-2.2M3 6.4l2.2 2.2"
-                    fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-              <path d="M13 9.6H6.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-            </svg>
-            <span>研究重做</span>
-          </button>
-        </div>
-        <div class="nav-group">
-          <p class="nav-title">进化</p>
-          <button type="button" class="nav-item" data-view="evolution" data-testid="nav-evolution">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <path d="M3 12.5 7 8l2.6 2.4L13.5 5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-              <path d="M10.6 5h2.9v2.9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-            <span>进化历史</span>
-          </button>
-        </div>
-        <div class="nav-group">
-          <p class="nav-title">实验</p>
-          <button type="button" class="nav-item" data-view="experiment" data-testid="nav-experiment">
-            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-              <circle cx="8" cy="8" r="5.9" fill="none" stroke="currentColor" stroke-width="1.4" />
-              <path d="M8 7.2V11M8 5.1v.9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-            </svg>
-            <span>实验信息</span>
-          </button>
-        </div>
-        <div class="nav-foot">
-          <p class="nav-foot-title">本地内核</p>
-          <p class="nav-foot-text">只读 API · 不写账本 · 不取实时行情</p>
-        </div>
-      </nav>
+    <main id="main" tabindex="-1">
+      <section class="notice" data-testid="loading" id="loading">
+        <h2>正在读取账户…</h2>
+        <p class="muted">只读取本地账本与已审核收盘价，不访问券商。</p>
+      </section>
 
-      <main id="main" tabindex="-1">
-        <section class="context-bar" id="context-bar" aria-label="实验上下文" hidden>
-          <div class="context-main">
-            <span class="context-label">当前实验</span>
-            <strong class="context-cycle" id="context-cycle">—</strong>
-            <span class="pill" id="context-status" data-state="idle">—</span>
+      <section class="notice notice-error" data-testid="service-error" id="service-error" hidden>
+        <h2>服务不可用</h2>
+        <p data-testid="service-detail"></p>
+        <p><button type="button" class="btn" data-testid="retry" id="retry">重试</button></p>
+      </section>
+
+      <section class="panel create-panel" data-testid="create-panel" id="create-panel" hidden>
+        <div class="create-copy">
+          <p class="eyebrow">开始模拟</p>
+          <h2>输入本金，系统自动分给两个策略</h2>
+          <p class="muted">初始各 50%。之后只在有完整审核行情时，按收益和回撤小幅调整资金；不需要你选策略或填比例。</p>
+        </div>
+        <form id="create-form" data-testid="create-form" novalidate>
+          <label class="field">
+            <span class="field-label">本金（元）</span>
+            <input id="principal" data-testid="principal" type="number" inputmode="decimal"
+                   min="100" max="1000000000" step="0.01" value="100000" required />
+          </label>
+          <p class="form-error" data-testid="create-error" id="create-error" role="alert" hidden></p>
+          <button type="submit" class="btn btn-primary" data-testid="create-submit" id="create-submit">开始自动运行</button>
+        </form>
+      </section>
+
+      <div id="dashboard" data-testid="dashboard" hidden>
+        <section class="hero" aria-labelledby="overview-title">
+          <div>
+            <p class="eyebrow">模拟账户</p>
+            <h2 id="overview-title">本金与总资产</h2>
+            <p class="muted" data-testid="account-note">两个策略各自独立持仓，不互相卖仓。</p>
           </div>
-          <p class="context-meta">更新于 <span id="last-refresh">—</span></p>
-          <div class="context-actions">
-            <button type="button" class="btn btn-quiet btn-small" id="copy-link" data-testid="copy-link">
-              <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
-                <path d="M6.6 9.4a2.6 2.6 0 0 0 3.7 0l1.9-1.9a2.6 2.6 0 1 0-3.7-3.7l-.8.8"
-                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-                <path d="M9.4 6.6a2.6 2.6 0 0 0-3.7 0L3.8 8.5a2.6 2.6 0 1 0 3.7 3.7l.8-.8"
-                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-              </svg>
-              <span class="copy-label">复制链接</span>
-            </button>
+          <dl class="hero-figures">
+            <div><dt>本金</dt><dd data-testid="principal-value">—</dd></div>
+            <div><dt>总资产</dt><dd data-testid="equity">—</dd></div>
+            <div><dt>累计收益</dt><dd data-testid="profit">—</dd></div>
+            <div><dt>可用现金</dt><dd data-testid="cash">—</dd></div>
+          </dl>
+        </section>
+
+        <p class="warning" data-testid="warning" id="warning" hidden></p>
+
+        <div class="run-row">
+          <div>
+            <h3>推进到最新交易日</h3>
+            <p class="muted" data-testid="coverage">等待读取价格覆盖…</p>
           </div>
-        </section>
+          <button type="button" class="btn btn-primary" data-testid="run-submit" id="run-submit">
+            推进并结算
+          </button>
+        </div>
+        <p class="run-result" data-testid="run-result" id="run-result" hidden></p>
 
-        <section class="notice skeleton-notice" id="loading" data-testid="loading" hidden>
-          <h2>正在读取实验…</h2>
-          <p class="muted">从本地服务读取已登记事实；不读取实时行情。</p>
-          <div class="skeleton" aria-hidden="true">
-            <span class="sk-line sk-line-lg"></span>
-            <span class="sk-line"></span>
-            <div class="sk-cards">
-              <span class="sk-card"></span><span class="sk-card"></span>
-              <span class="sk-card"></span><span class="sk-card"></span>
-            </div>
-          </div>
-        </section>
-
-        <section class="notice notice-error" id="service-error" data-testid="service-error" hidden>
-          <span class="notice-icon" aria-hidden="true">
-            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 4.2h10v7.6H3z" />
-              <path d="M3 6.4h10M5.6 9.4h2.2" />
-            </svg>
-          </span>
-          <h2>服务不可用</h2>
-          <p>无法连接本地内核。请确认它正在运行：<code>cd v2 &amp;&amp; cargo run --locked</code>。</p>
-          <p class="muted" data-testid="service-detail"></p>
-          <p class="notice-actions"><button type="button" class="btn" id="retry" data-testid="retry">重试</button></p>
-        </section>
-
-        <section class="notice" id="empty-experiments" data-testid="empty-experiments" hidden>
-          <span class="notice-icon" aria-hidden="true">
-            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3.4 2.4h6l3.2 3.2v8H3.4z" />
-              <path d="M9.2 2.6v3.2h3.2M5.6 9h4.8M5.6 11.2h3.4" />
-            </svg>
-          </span>
-          <h2>还没有实验</h2>
-          <p>系统不会自动创建实验。先在本地离线演示里建立固定实验，再回到本页刷新：</p>
-          <div class="cmd">
-            <pre><code id="demo-command">cd v2
-python3 scripts/experiment_demo.py</code></pre>
-            <button type="button" class="btn btn-quiet" id="copy-demo" data-testid="copy-demo">复制命令</button>
-          </div>
-        </section>
-
-        <section class="notice notice-error" id="catalogue-broken" data-testid="catalogue-broken" hidden>
-          <span class="notice-icon" aria-hidden="true">
-            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M8 2.4 14.4 13H1.6L8 2.4Z" />
-              <path d="M8 6.4v3M8 11.2v.5" />
-            </svg>
-          </span>
-          <h2>实验目录数据异常</h2>
-          <p data-testid="broken-detail"></p>
-          <p class="notice-actions"><button type="button" class="btn" id="catalogue-retry" data-testid="catalogue-retry">重新读取</button></p>
-        </section>
-
-        <section class="notice notice-warn" id="unknown-experiment" data-testid="unknown-experiment" hidden>
-          <span class="notice-icon" aria-hidden="true">
-            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="8" cy="8" r="5.6" />
-              <path d="M8 4.9v3.6M8 11.2v.6" />
-            </svg>
-          </span>
-          <h2>找不到这个实验</h2>
-          <p>地址里的 <code id="unknown-cycle"></code> 不在当前数据库中。</p>
-          <p class="muted">从上方“当前实验”选择已有实验；不会自动替换成其它实验。</p>
-        </section>
-
-        <p class="catalogue-warning" id="catalogue-warning" data-testid="catalogue-warning" role="status" hidden></p>
-
-        <div id="workspace" hidden>
-          <!-- 模拟账户 -->
-          <section class="panel" id="panel-account" data-testid="panel-account" hidden>
-            <header class="panel-head">
+        <section class="strategy-grid" aria-label="两个策略" data-testid="strategy-grid">
+          <article class="strategy-card" data-testid="strategy-steady">
+            <header>
               <div>
-                <h2>模拟账户</h2>
-                <p class="muted">总本金、准备金与两个策略槽位；只读展示已存事实，不计算收益。</p>
+                <p class="eyebrow">策略一</p>
+                <h3>稳健</h3>
               </div>
-              <button type="button" class="btn btn-small" id="account-create-toggle" data-testid="account-create-toggle">新建账户</button>
-              <div class="account-overview" id="account-overview" data-testid="account-overview" hidden></div>
-              <label class="field field-inline">
-                <span class="field-label">账户</span>
-                <span class="select-wrap">
-                  <select id="account-select" data-testid="account-select"></select>
-                  <svg class="select-chevron" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
-                    <path d="m4 6.5 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </span>
-              </label>
+              <span class="weight" data-testid="steady-weight">—</span>
             </header>
-            <form class="account-create" id="account-create" data-testid="account-create" aria-label="新建模拟账户" novalidate hidden>
-              <label class="field">
-                <span class="field-label">账户标识</span>
-                <input id="create-id" data-testid="create-id" name="account_id" autocomplete="off" placeholder="例如 paper-001" />
-              </label>
-              <label class="field">
-                <span class="field-label">初始资金（元）</span>
-                <input id="create-cash" data-testid="create-cash" type="number" min="100" step="0.01" value="100000" />
-              </label>
-              <label class="field">
-                <span class="field-label">策略 A</span>
-                <select id="create-a" data-testid="create-a"></select>
-              </label>
-              <label class="field">
-                <span class="field-label">策略 B</span>
-                <select id="create-b" data-testid="create-b"></select>
-              </label>
-              <p class="hint">风控边界：单笔 ≤ 50% · 单标的 ≤ 25% · 槽位现金 ≥ 10%</p>
-              <div class="account-create-actions">
-                <button type="submit" class="btn" id="create-submit" data-testid="create-submit">创建账户</button>
-                <button type="button" class="btn btn-quiet" id="create-cancel" data-testid="create-cancel">取消</button>
-              </div>
-            </form>
-            <div class="section-error" data-testid="account-error" hidden></div>
-            <p class="empty" id="account-empty" data-testid="account-empty" hidden>
-              还没有模拟账户。先通过本地 API 创建账户，再回到本页刷新。
-            </p>
-            <div id="account-body" hidden>
-              <div class="account-totals">
-                <div class="acc-kpi"><h3>初始本金</h3><p class="num" data-testid="account-initial">—</p></div>
-                <div class="acc-kpi"><h3>准备金</h3><p class="num" data-testid="account-reserve">—</p></div>
-                <div class="acc-kpi"><h3>账户现金</h3><p class="num" data-testid="account-cash">—</p></div>
-              </div>
-              <p class="account-status" id="account-status" data-testid="account-status">
-                <span id="status-sessions" data-testid="status-sessions">会话：—</span>
-                <span id="status-since" data-testid="status-since" hidden></span>
-              </p>
-              <p class="coverage-line" id="account-coverage" data-testid="account-coverage" hidden></p>
-              <p class="valuation-note" id="account-valuation" data-testid="account-valuation" hidden></p>
-              <p class="valuation-detail muted" id="account-valuation-detail" data-testid="account-valuation-detail" hidden></p>
-              <p class="data-hint" id="account-data-hint" data-testid="account-data-hint" hidden></p>
-              <p class="audit-line" id="account-audit" data-testid="account-audit" hidden></p>
-              <details class="audit-details" id="account-audit-details" data-testid="account-audit-details" hidden>
-                <summary>审计详情</summary>
-                <ul id="account-audit-checks" data-testid="account-audit-checks"></ul>
-              </details>
-              <section class="strategy-switches" id="strategy-switches" data-testid="strategy-switches">
-                <h4>策略版本</h4>
-                <p class="strategy-current" id="strategy-current" data-testid="strategy-current"></p>
-                <ul class="strategy-switch-list" id="strategy-switch-list" data-testid="strategy-switch-list"></ul>
-                <div class="switch-form">
-                  <label class="field field-inline">
-                    <span class="field-label">槽位</span>
-                    <select id="switch-slot" data-testid="switch-slot"><option>A</option><option>B</option></select>
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">目标版本</span>
-                    <input id="switch-version" data-testid="switch-version" autocomplete="off" placeholder="research-momentum-v2" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">生效时刻</span>
-                    <input id="switch-at" data-testid="switch-at" type="datetime-local" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">理由</span>
-                    <input id="switch-reason" data-testid="switch-reason" autocomplete="off" placeholder="晋级/回退依据" />
-                  </label>
-                  <button type="button" class="btn btn-small" id="switch-submit" data-testid="switch-submit">切换版本</button>
-                </div>
-                <p class="switch-hint" id="switch-hint" data-testid="switch-hint" hidden></p>
-                <p class="section-error" id="switch-error" data-testid="switch-error" hidden></p>
-              </section>
-              <p class="account-performance" id="account-performance" data-testid="account-performance" hidden></p>
-              <section class="account-equity" id="account-equity" data-testid="account-equity" hidden>
-                <h4>净值序列</h4>
-                <p class="equity-summary" id="equity-summary" data-testid="equity-summary"></p>
-                <p class="equity-summary" id="equity-performance" data-testid="equity-performance" hidden></p>
-                <ol class="equity-points" id="equity-points" data-testid="equity-points"></ol>
-              </section>
-              <div class="account-slots" id="account-slots" data-testid="account-slots"></div>
-              <section class="account-exposure" id="account-exposure" data-testid="account-exposure" hidden>
-                <h4>仓位与集中度</h4>
-                <p class="exposure-summary" id="account-exposure-summary" data-testid="account-exposure-summary"></p>
-                <ul class="exposure-breaches" id="account-exposure-breaches" data-testid="account-exposure-breaches"></ul>
-              </section>
-              <section class="account-allocation" id="account-allocation" data-testid="account-allocation" hidden>
-                <h4>资金提案</h4>
-                <p class="allocation-summary" id="allocation-summary" data-testid="allocation-summary"></p>
-                <ul class="allocation-rationale" id="allocation-rationale" data-testid="allocation-rationale"></ul>
-                <button type="button" class="btn btn-small" id="allocation-apply" data-testid="allocation-apply">执行再平衡</button>
-                <div class="allocation-confirm" id="allocation-confirm" data-testid="allocation-confirm" hidden>
-                  <p id="allocation-confirm-text" data-testid="allocation-confirm-text"></p>
-                  <button type="button" class="btn btn-small" id="allocation-confirm-yes" data-testid="allocation-confirm-yes">确认执行</button>
-                  <button type="button" class="btn btn-quiet btn-small" id="allocation-confirm-no" data-testid="allocation-confirm-no">取消</button>
-                </div>
-              </section>
-              <section class="account-rebalances" id="account-rebalances" data-testid="account-rebalances" hidden>
-                <h4>资金划拨</h4>
-                <ol id="account-rebalance-list" data-testid="account-rebalance-list"></ol>
-              </section>
-              <div class="compare-section account-sessions-section">
-                <h3>模拟会话</h3>
-                <div class="account-session-create">
-                  <div class="account-advance">
-                    <input type="date" id="account-advance-day" data-testid="account-advance-day" aria-label="推进整个账户到该交易日" />
-                    <button type="button" class="btn btn-quiet btn-small" id="account-advance" data-testid="account-advance">推进账户到该日</button>
-                    <button type="button" class="btn btn-quiet btn-small" id="account-advance-preview" data-testid="account-advance-preview">预览</button>
-                  </div>
-                  <p class="advance-preview-text" id="account-advance-preview-text" data-testid="account-advance-preview-text" hidden></p>
-                  <button type="button" class="btn btn-quiet btn-small" id="session-create-toggle" data-testid="session-create-toggle">新建会话</button>
-                  <form class="account-session-form" id="session-create" data-testid="session-create" aria-label="从实验创建模拟会话" novalidate hidden>
-                    <label class="field">
-                      <span class="field-label">会话标识</span>
-                      <input id="session-id" data-testid="session-id" autocomplete="off" placeholder="例如 sess-001" />
-                    </label>
-                    <label class="field">
-                      <span class="field-label">槽位</span>
-                      <select id="session-slot" data-testid="session-slot">
-                        <option value="A">A</option>
-                        <option value="B">B</option>
-                      </select>
-                    </label>
-                    <label class="field">
-                      <span class="field-label">信号来源实验</span>
-                      <select id="session-cycle" data-testid="session-cycle"></select>
-                    </label>
-                    <div class="account-create-actions">
-                      <button type="submit" class="btn btn-small" id="session-submit" data-testid="session-submit">创建会话</button>
-                      <button type="button" class="btn btn-quiet btn-small" id="session-cancel" data-testid="session-cancel">取消</button>
-                    </div>
-                    <p class="hint" id="session-hint" data-testid="session-hint" hidden></p>
-                  </form>
-                </div>
-                <div class="account-sessions" id="account-sessions" data-testid="account-sessions"></div>
-                <p class="empty" data-testid="account-sessions-empty" hidden>这个账户还没有模拟会话。</p>
-              </div>
-              <div class="compare-section account-orders-section">
-                <h3>最近订单</h3>
-                <div class="table-scroll" tabindex="0" role="region" aria-label="账户最近订单，可横向滚动">
-                  <table class="compare-table">
-                    <caption class="sr-only">账户最近订单：时间、槽位、信号、方向、结果与原因或成交</caption>
-                    <thead><tr>
-                      <th scope="col">时间</th><th scope="col">槽位</th><th scope="col">信号</th>
-                      <th scope="col">方向</th><th scope="col">结果</th><th scope="col">原因 / 成交</th>
-                    </tr></thead>
-                    <tbody id="account-orders" data-testid="account-orders"></tbody>
-                  </table>
-                </div>
-                <p class="empty" data-testid="account-orders-empty" hidden>还没有订单。</p>
-              </div>
-            </div>
-            <p class="panel-foot">账户与槽位是只读事实；成交、拒绝和现金均可回溯，准备金永不参与撮合。</p>
-          </section>
+            <p class="strategy-desc" data-testid="steady-desc">—</p>
+            <dl class="metric-grid">
+              <div><dt>策略资产</dt><dd data-testid="steady-equity">—</dd></div>
+              <div><dt>累计收益贡献</dt><dd data-testid="steady-profit">—</dd></div>
+              <div><dt>累计收益贡献率</dt><dd data-testid="steady-return">—</dd></div>
+              <div><dt>回撤</dt><dd data-testid="steady-drawdown">—</dd></div>
+              <div><dt>现金</dt><dd data-testid="steady-cash">—</dd></div>
+              <div><dt>持仓</dt><dd data-testid="steady-count">—</dd></div>
+            </dl>
+          </article>
 
-          <!-- 概览 -->
-          <section class="panel" id="panel-overview" data-testid="panel-overview" hidden>
-            <header class="panel-head">
+          <article class="strategy-card" data-testid="strategy-aggressive">
+            <header>
               <div>
-                <h2>概览</h2>
-                <p class="muted">当前实验的关键事实；不展示净值、收益率或排名。</p>
+                <p class="eyebrow">策略二</p>
+                <h3>激进</h3>
               </div>
+              <span class="weight" data-testid="aggressive-weight">—</span>
             </header>
-            <section class="overview-status" id="overview-status" data-testid="overview-status" aria-label="运行状态">
-              <span id="overview-accounts" data-testid="overview-accounts">账户：—</span>
-              <span id="overview-sessions" data-testid="overview-sessions">会话：—</span>
-              <span id="overview-price-sets" data-testid="overview-price-sets">价格集合：—</span>
-              <span id="overview-evolution" data-testid="overview-evolution">进化：—</span>
-              <span id="overview-archive" data-testid="overview-archive">归档：—</span>
-            </section>
-            <p class="overview-data-hint" id="overview-data-hint" data-testid="overview-data-hint" hidden>
-              <span id="overview-data-hint-text" data-testid="overview-data-hint-text"></span>
-              <button type="button" class="btn btn-quiet btn-small" id="overview-coverage-link" data-testid="overview-coverage-link">去核对覆盖</button>
-            </p>
-            <div class="summary" aria-label="实验摘要">
-              <dl>
-                <div><dt>实验状态</dt><dd data-testid="summary-status">—</dd></div>
-                <div><dt>策略</dt><dd data-testid="summary-strategy">—</dd></div>
-                <div><dt>研究输入</dt><dd data-testid="summary-input">—</dd></div>
-                <div><dt>数据包</dt><dd data-testid="summary-pack">—</dd></div>
-                <div><dt>执行规则</dt><dd data-testid="summary-policy">—</dd></div>
-              </dl>
-            </div>
-            <div class="kpis">
-              <article class="kpi">
-                <h2>初始资金</h2>
-                <p class="num" data-testid="kpi-initial-cash">—</p>
-                <p class="kpi-note">实验建立时固定</p>
-              </article>
-              <article class="kpi kpi-accent">
-                <h2>现金余额</h2>
-                <p class="num" data-testid="kpi-cash">—</p>
-                <p class="kpi-note">按已成交决策扣减</p>
-              </article>
-              <article class="kpi">
-                <h2>持仓标的</h2>
-                <p class="num" data-testid="kpi-positions">—</p>
-                <p class="kpi-note">当前仍有数量</p>
-              </article>
-              <article class="kpi">
-                <h2>模拟决策</h2>
-                <p class="num" data-testid="kpi-runs">—</p>
-                <p class="kpi-note">含被拒绝的决策</p>
-              </article>
-            </div>
-            <p class="kpi-scope" id="kpi-scope" data-testid="kpi-scope">资产口径：—</p>
-            <div class="quick">
-              <button type="button" class="link" data-goto="positions">查看持仓 <span aria-hidden="true">→</span></button>
-              <button type="button" class="link" data-goto="decisions">查看决策记录 <span aria-hidden="true">→</span></button>
-              <button type="button" class="link" data-goto="replay">运行交易回放 <span aria-hidden="true">→</span></button>
-            </div>
-            <div class="overview-grid">
-              <section class="subcard" aria-labelledby="recent-title">
-                <header class="subcard-head">
-                  <h3 id="recent-title">最近决策</h3>
-                  <button type="button" class="link-quiet" data-goto="decisions">全部记录 →</button>
-                </header>
-                <ul class="recent" id="recent-list" data-testid="recent-list"></ul>
-                <p class="subcard-note" id="recent-note">共 0 条决策</p>
-                <p class="subcard-empty" id="recent-empty" data-testid="recent-empty" hidden>还没有决策。研究信号需要显式提交后才会成为决策。</p>
-              </section>
-              <section class="subcard" aria-labelledby="quality-title">
-                <header class="subcard-head">
-                  <h3 id="quality-title">质量校验</h3>
-                  <button type="button" class="link-quiet" data-goto="replay">去运行 →</button>
-                </header>
-                <ul class="checks">
-                  <li><span>交易回放</span><span class="check" id="overview-replay" data-state="idle">未验证</span></li>
-                  <li><span>研究重做</span><span class="check" id="overview-reproduction" data-state="idle">未验证</span></li>
-                </ul>
-                <p class="subcard-note">两项互相独立：回放校验已存决策，重做校验研究输入。</p>
-              </section>
-            </div>
-          </section>
+            <p class="strategy-desc" data-testid="aggressive-desc">—</p>
+            <dl class="metric-grid">
+              <div><dt>策略资产</dt><dd data-testid="aggressive-equity">—</dd></div>
+              <div><dt>累计收益贡献</dt><dd data-testid="aggressive-profit">—</dd></div>
+              <div><dt>累计收益贡献率</dt><dd data-testid="aggressive-return">—</dd></div>
+              <div><dt>回撤</dt><dd data-testid="aggressive-drawdown">—</dd></div>
+              <div><dt>现金</dt><dd data-testid="aggressive-cash">—</dd></div>
+              <div><dt>持仓</dt><dd data-testid="aggressive-count">—</dd></div>
+            </dl>
+          </article>
+        </section>
 
-          <!-- 持仓 -->
-          <section class="panel" id="panel-positions" data-testid="panel-positions" hidden>
-            <header class="panel-head">
-              <div>
-                <h2>当前持仓</h2>
-                <p class="muted" id="positions-count" data-testid="positions-count">按标的汇总的剩余数量</p>
-              </div>
-              <div class="asof">
-                <label class="field field-inline">
-                  <span class="field-label">日终口径</span>
-                  <input type="date" id="asof-day" data-testid="asof-day" aria-label="日终口径日期" />
-                </label>
-                <button type="button" class="btn btn-quiet" id="asof-apply" data-testid="asof-apply">应用</button>
-                <button type="button" class="btn btn-quiet" id="asof-clear" data-testid="asof-clear">清除</button>
-                <span class="hint" id="asof-error" data-testid="asof-error" hidden>请先选择日期再应用</span>
-              </div>
-            </header>
-            <div class="section-error" data-testid="positions-error" hidden></div>
-            <p class="scroll-hint">左右滑动查看完整列</p>
-            <div class="table-scroll" tabindex="0" role="region" aria-label="当前持仓表格，可横向滚动">
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>持仓</h2><p class="muted">“可卖”受 T+1 限制，买入当天不可卖。</p></div>
+            <span class="count" data-testid="positions-count">—</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr><th>策略</th><th>代码</th><th class="num-col">数量</th><th class="num-col">可卖</th><th class="num-col">成本价</th><th class="num-col">收盘价</th><th class="num-col">市值</th></tr>
+              </thead>
+              <tbody id="positions-body" data-testid="positions-body"></tbody>
+            </table>
+          </div>
+          <p class="empty" data-testid="positions-empty" id="positions-empty">还没有持仓。</p>
+        </section>
+
+        <div class="lower-grid">
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>最近成交</h2><p class="muted">成交价来自审核收盘价；费用按固定规则计算。</p></div>
+            </div>
+            <div class="table-scroll">
               <table>
-                <caption class="sr-only">当前持仓数量；只有指定日终口径时才显示可卖数量</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">代码</th>
-                    <th scope="col" class="num-col">持仓数量</th>
-                    <th scope="col" class="num-col" id="sellable-header" data-testid="sellable-header" hidden>可卖数量</th>
-                  </tr>
-                </thead>
-                <tbody id="positions-body" data-testid="positions-body"></tbody>
+                <thead><tr><th>日期</th><th>策略</th><th>代码</th><th>方向</th><th class="num-col">数量</th><th class="num-col">价格</th></tr></thead>
+                <tbody id="trades-body" data-testid="trades-body"></tbody>
               </table>
             </div>
-            <p class="empty" data-testid="positions-empty-state" hidden>
-              <span class="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
-                  <path d="M10 2.6 17 6l-7 3.4L3 6l7-3.4Z" />
-                  <path d="m3 10.2 7 3.4 7-3.4M3 14.2l7 3.4 7-3.4" />
-                </svg>
-              </span>
-              没有持仓。当前实验的模拟决策尚未产生成交持仓。
-            </p>
-            <p class="panel-foot">日终口径只影响“可卖数量”；持仓数量本身来自已成交决策。</p>
+            <p class="empty" data-testid="trades-empty" id="trades-empty">还没有成交。</p>
           </section>
 
-          <!-- 决策 -->
-          <section class="panel" id="panel-decisions" data-testid="panel-decisions" hidden>
-            <header class="panel-head">
-              <div>
-                <h2>决策记录</h2>
-                <p class="muted">最近 100 条；按写入顺序倒序；时间按中国时间（UTC+8）显示。</p>
-              </div>
-              <div class="filter-bar" role="group" aria-label="按结果筛选决策">
-                <button type="button" class="chip" data-filter="all" aria-pressed="true">全部</button>
-                <button type="button" class="chip" data-filter="filled" aria-pressed="false">已成交</button>
-                <button type="button" class="chip" data-filter="rejected" aria-pressed="false">已拒绝</button>
-              </div>
-            </header>
-            <div class="section-error" data-testid="runs-error" hidden></div>
-            <div class="table-scroll" tabindex="0" role="region" aria-label="决策记录表格，可横向滚动">
-              <table>
-                <caption class="sr-only">最近的模拟决策：时间、信号、方向、结果与原因</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">时间</th>
-                    <th scope="col">信号</th>
-                    <th scope="col">方向</th>
-                    <th scope="col">结果</th>
-                    <th scope="col">原因</th>
-                  </tr>
-                </thead>
-                <tbody id="runs-body" data-testid="runs-body"></tbody>
-              </table>
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>资金调仓</h2><p class="muted">至少两个完整交易日后才评估。策略收益按各自初始 50% 本金计算，因此两项收益之和等于账户累计收益。</p></div>
             </div>
-            <p class="empty" data-testid="runs-empty-state" hidden>
-              <span class="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
-                  <path d="M4 5.4h12M4 10h12M4 14.6h7" />
-                </svg>
-              </span>
-              还没有决策。研究信号需要显式提交后才会成为决策。
-            </p>
-            <p class="empty" id="runs-filtered-empty" hidden>
-              当前筛选没有匹配的决策。切换到“全部”查看完整记录。
-            </p>
-            <p class="panel-foot">决策记录只读；被拒绝的决策同样保留，用于回放校验。</p>
-          </section>
-
-          <!-- 交易回放 -->
-          <section class="panel" id="panel-replay" data-testid="panel-replay" hidden>
-            <header class="panel-head">
-              <div>
-                <h2>交易回放</h2>
-                <p class="muted">用已固定的输入重新执行已存储的决策，逐字段比对请求、证据与成交。</p>
-              </div>
-            </header>
-            <div class="verify-body">
-              <p><button type="button" class="btn" data-testid="verify-replay">运行回放</button></p>
-              <p class="verify-status" data-testid="replay-status" data-state="idle">未验证</p>
-              <p class="verify-detail muted" data-testid="replay-detail"></p>
-            </div>
-            <p class="panel-foot">回放逐字段比对已存储的请求、证据与成交；通过不代表研究结论正确。</p>
-          </section>
-
-          <!-- 研究重做 -->
-          <section class="panel" id="panel-reproduction" data-testid="panel-reproduction" hidden>
-            <header class="panel-head">
-              <div>
-                <h2>研究重做</h2>
-                <p class="muted">用固定策略与冻结研究输入重新生成研究信号；不判断收益。</p>
-              </div>
-            </header>
-            <div class="verify-body">
-              <p><button type="button" class="btn" data-testid="verify-reproduction">运行重做</button></p>
-              <p class="verify-status" data-testid="reproduction-status" data-state="idle">未验证</p>
-              <p class="verify-detail muted" data-testid="reproduction-detail"></p>
-            </div>
-            <p class="panel-foot">重做只验证研究信号是否可由固定策略与冻结输入再次产生。</p>
-          </section>
-
-          <!-- 实验信息 -->
-          <section class="panel" id="panel-evolution" data-testid="panel-evolution" hidden>
-            <header class="panel-head">
-              <div>
-                <p class="eyebrow">模拟盘</p>
-                <h2>进化历史</h2>
-              </div>
-              <button type="button" class="btn btn-quiet" id="evolution-refresh" data-testid="evolution-refresh">刷新</button>
-            </header>
-            <div class="panel-body">
-              <p class="panel-note">晋级与回退由证据规则判定：样本外、影子天数、回撤与优势门槛，任何一条不满足都不会晋级。</p>
-              <div class="evolution-filters">
-                <label class="field field-inline">
-                  <span class="field-label">候选</span>
-                  <input id="evolution-filter-candidate" data-testid="evolution-filter-candidate" autocomplete="off" placeholder="candidate id" />
-                </label>
-                <label class="field field-inline">
-                  <span class="field-label">起始日</span>
-                  <input id="evolution-from" data-testid="evolution-from" type="date" />
-                </label>
-                <label class="field field-inline">
-                  <span class="field-label">截止日</span>
-                  <input id="evolution-to" data-testid="evolution-to" type="date" />
-                </label>
-                <label class="field field-inline">
-                  <span class="field-label">实验</span>
-                  <input id="evolution-filter-experiment" data-testid="evolution-filter-experiment" autocomplete="off" placeholder="base 或 candidate" />
-                </label>
-                <label class="field field-inline">
-                  <span class="field-label">状态</span>
-                  <select id="evolution-filter-status" data-testid="evolution-filter-status">
-                    <option value="">全部</option>
-                    <option value="promoted">已晋级</option>
-                    <option value="rejected">已淘汰</option>
-                    <option value="reverted">已回退</option>
-                    <option value="kept">保持</option>
-                    <option value="insufficient_evidence">证据不足</option>
-                  </select>
-                </label>
-              </div>
-              <div class="evolution-events" id="evolution-events" data-testid="evolution-events"></div>
-              <button type="button" class="btn btn-quiet" id="evolution-more" data-testid="evolution-more" hidden>加载更早</button>
-              <section class="signal-diff" id="signal-diff" data-testid="signal-diff">
-                <h3>影子对比</h3>
-                <p class="panel-note">比较两个实验的已存信号：只比较决策时刻、报价引用、标的与方向，不含数量与成交结果。</p>
-                <div class="signal-diff-form">
-                  <label class="field field-inline">
-                    <span class="field-label">基准实验</span>
-                    <input id="diff-base" data-testid="diff-base" autocomplete="off" placeholder="例如 shadow-base-1" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">候选实验</span>
-                    <input id="diff-candidate" data-testid="diff-candidate" autocomplete="off" placeholder="例如 shadow-candidate-1" />
-                  </label>
-                  <button type="button" class="btn btn-quiet" id="diff-run" data-testid="diff-run">比较</button>
-                </div>
-                <p class="section-error" id="diff-error" data-testid="diff-error" hidden></p>
-                <div id="diff-result" data-testid="diff-result" hidden>
-                  <p class="diff-summary" id="diff-summary" data-testid="diff-summary"></p>
-                  <ul class="diff-list" id="diff-list" data-testid="diff-list"></ul>
-                </div>
-              </section>
-              <section class="experiment-performance" id="experiment-performance" data-testid="experiment-performance">
-                <h3>实验绩效</h3>
-                <p class="panel-note">按审核净值序列统计收益、回撤、费用与成交笔数；缺覆盖时明确显示不可用。</p>
-                <div class="experiment-performance-form">
-                  <label class="field field-inline">
-                    <span class="field-label">实验 id</span>
-                    <input id="perf-cycle" data-testid="perf-cycle" autocomplete="off" placeholder="例如 shadow-base-1" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">交易日</span>
-                    <input id="perf-days" data-testid="perf-days" autocomplete="off" placeholder="2026-10-30,2026-11-02" />
-                  </label>
-                  <button type="button" class="btn btn-quiet" id="perf-run" data-testid="perf-run">查询绩效</button>
-                </div>
-                <p class="section-error" id="perf-error" data-testid="perf-error" hidden></p>
-                <p class="experiment-performance-result" id="perf-result" data-testid="perf-result" hidden></p>
-              </section>
-              <p class="empty-state" id="evolution-empty" data-testid="evolution-empty" hidden>还没有进化事件。</p>
-            </div>
-          </section>
-          <section class="panel" id="panel-experiment" data-testid="panel-experiment" hidden>
-            <header class="panel-head">
-              <div>
-                <h2>实验信息</h2>
-                <p class="muted">只有排障时才需要展开技术细节。</p>
-              </div>
-            </header>
-            <div class="verify-body">
-              <p>实验：<strong id="experiment-name" data-testid="experiment-name">—</strong></p>
-              <p>状态：<strong id="experiment-state" data-testid="experiment-state">—</strong></p>
-              <details class="tech">
-                <summary>技术细节</summary>
-                <p class="tech-actions">
-                  <button type="button" class="btn btn-quiet btn-small" id="copy-tech" data-testid="copy-tech">
-                    复制技术细节
-                  </button>
-                </p>
-                <dl class="tech-list">
-                  <div><dt>策略标识</dt><dd id="tech-strategy" data-testid="tech-strategy">—</dd></div>
-                  <div><dt>研究输入标识</dt><dd id="tech-input" data-testid="tech-input">—</dd></div>
-                  <div><dt>数据包标识</dt><dd id="tech-pack" data-testid="tech-pack">—</dd></div>
-                  <div><dt>执行规则标识</dt><dd id="tech-policy" data-testid="tech-policy">—</dd></div>
-                </dl>
-              </details>
-              <section class="compare-panel" id="ab-compare" data-testid="ab-compare">
-                <h3>A/B 对照</h3>
-                <p class="panel-note">并排查看两个实验的组合事实；不比较收益率，不做排名。</p>
-                <div class="compare-inputs">
-                  <label class="field field-inline">
-                    <span class="field-label">基准实验</span>
-                    <input id="compare-base" data-testid="compare-base" autocomplete="off" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">候选实验</span>
-                    <input id="compare-candidate" data-testid="compare-candidate" autocomplete="off" />
-                  </label>
-                  <button type="button" class="btn btn-quiet" id="compare-run" data-testid="compare-run">对比</button>
-                </div>
-                <table class="compare-table" id="compare-table" data-testid="compare-table" hidden>
-                  <thead><tr><th>项</th><th>基准</th><th>候选</th></tr></thead>
-                  <tbody id="compare-body" data-testid="compare-body"></tbody>
-                </table>
-                <p class="compare-note" id="compare-note" data-testid="compare-note" hidden></p>
-              </section>
-              <section class="price-sets" id="price-sets" data-testid="price-sets">
-                <h3>价格集合</h3>
-                <p class="panel-note">只有 reviewed 集合参与估值与绩效；synthetic 仅供本地测试。</p>
-                <ul class="price-set-list" id="price-set-list" data-testid="price-set-list"></ul>
-                <p class="muted" id="price-set-empty" data-testid="price-set-empty" hidden>目录为空：尚未发布任何集合。</p>
-                <h4>覆盖核对</h4>
-                <div class="coverage-check">
-                  <label class="field field-inline">
-                    <span class="field-label">数据包</span>
-                    <input id="coverage-pack" data-testid="coverage-pack" autocomplete="off" placeholder="cn-offline-fixture-pack-1" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">标的</span>
-                    <input id="coverage-symbols" data-testid="coverage-symbols" autocomplete="off" placeholder="600000.SH" />
-                  </label>
-                  <label class="field field-inline">
-                    <span class="field-label">交易日</span>
-                    <input id="coverage-days" data-testid="coverage-days" autocomplete="off" placeholder="2026-10-30,2026-11-02" />
-                  </label>
-                  <button type="button" class="btn btn-quiet" id="coverage-run" data-testid="coverage-run">核对</button>
-                </div>
-                <p class="coverage-result" id="coverage-result" data-testid="coverage-result" hidden></p>
-              </section>
-              <section class="archive-manifests" id="archive-manifests" data-testid="archive-manifests">
-                <h3>归档清单</h3>
-                <p class="panel-note">只读列出 <code>ASTOCK_ARCHIVE_DIR</code> 下的 <code>*.manifest.json</code>，用于核对备份是否经过校验。</p>
-                <ul class="archive-list" id="archive-list" data-testid="archive-list"></ul>
-                <p class="muted" id="archive-empty" data-testid="archive-empty" hidden>未配置归档目录，或目录中没有清单。</p>
-              </section>
-              <p class="muted">行情、成交价与容量均为离线合成输入；本页不展示净值、收益率、夏普或排行榜。</p>
-            </div>
+            <ol class="timeline" id="rebalances-body" data-testid="rebalances-body"></ol>
+            <p class="empty" data-testid="rebalances-empty" id="rebalances-empty">还没有调仓记录。</p>
           </section>
         </div>
-      </main>
-    </div>
 
-    <footer class="page-foot">
-      <p>AStock V2 · 模拟交易研究环境 · 数据来自本地只读 API</p>
-      <p class="page-foot-meta"><span>离线合成行情</span><span aria-hidden="true">·</span><span>不连接券商</span></p>
-    </footer>
-
-    <dialog class="sheet" id="shortcuts" data-testid="shortcuts"
-            aria-labelledby="shortcuts-title" aria-describedby="shortcuts-note">
-      <header class="sheet-head">
-        <h2 id="shortcuts-title">键盘快捷键</h2>
-        <button type="button" class="btn btn-quiet" id="shortcuts-close" data-testid="shortcuts-close">关闭</button>
-      </header>
-      <dl class="shortcut-list">
-        <div><dt><kbd>1</kbd><span class="kbd-sep">–</span><kbd>8</kbd></dt>
-          <dd>概览 · 持仓 · 决策 · 回放 · 重做 · 实验 · 账户</dd></div>
-        <div><dt><kbd>/</kbd></dt><dd>聚焦“当前实验”选择器</dd></div>
-        <div><dt><kbd>r</kbd></dt><dd>刷新当前实验</dd></div>
-        <div><dt><kbd>t</kbd></dt><dd>切换深色 / 浅色</dd></div>
-        <div><dt><kbd>?</kbd></dt><dd>打开本说明</dd></div>
-        <div><dt><kbd>Esc</kbd></dt><dd>关闭本说明</dd></div>
-      </dl>
-      <p class="sheet-note" id="shortcuts-note">在输入框或下拉框中输入时不会触发快捷键；没有实验或服务不可用时，导航类快捷键不生效。</p>
-    </dialog>
-
-    <noscript>
-      <p class="noscript">本页需要 JavaScript 才能读取本地实验数据。</p>
-    </noscript>
-
+        <footer class="page-foot">
+          <p>纯模拟盘，不连接券商、不进行真实交易。缺失的数据显示为“—”，不会用 0 或估算值代替。</p>
+          <p data-testid="price-set" id="price-set">价格集合：—</p>
+        </footer>
+      </div>
+    </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
