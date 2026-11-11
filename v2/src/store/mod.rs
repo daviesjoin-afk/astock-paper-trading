@@ -695,6 +695,7 @@ impl Store {
                 book.cash_cents,
                 &closes,
                 &book.sellable,
+                day,
             );
             for order in orders {
                 let price = closes

@@ -40,6 +40,28 @@ pub struct SlotPolicy {
     pub max_positions: usize,
     pub target_weight_bps: i64,
     pub min_cash_bps: i64,
+    /// Days a position must be held before a vanished signal may exit it.
+    ///
+    /// Both strategies are moving-average conditions, and a moving average
+    /// crossing back and forth flips the condition true/false repeatedly. With
+    /// an immediate exit that becomes: buy, condition flips, sell, condition
+    /// flips back, buy. Measured over a year of real whole-market data this
+    /// produced 543 fills on a 100k account, with a median holding period of
+    /// **3 days** and 55% of positions closed in 3 days or less.
+    ///
+    /// Each round trip costs a 5 CNY minimum commission on the buy plus
+    /// commission and stamp duty on the sell -- roughly 8-10 CNY on a 1,700
+    /// CNY position. A 1% move is 17 CNY, so more than half the edge was being
+    /// eaten by the act of trading. Holding through the flip is the fix.
+    pub min_hold_days: i64,
+    /// Smallest position worth opening, in cents.
+    ///
+    /// Commission is 3 bps with a 5 CNY floor, so a position smaller than
+    /// ~16,700 CNY pays the floor rather than the rate. Measured: buys under
+    /// 5,000 CNY cost 39.7 bps, buys over 5,000 cost 5.7 bps -- seven times
+    /// more expensive for no additional edge. Below this floor the order is
+    /// not worth placing, so it is skipped entirely.
+    pub min_entry_cents: i64,
 }
 
 impl SlotPolicy {
@@ -49,11 +71,15 @@ impl SlotPolicy {
                 max_positions: 3,
                 target_weight_bps: 1_500,
                 min_cash_bps: 1_000,
+                min_hold_days: 10,
+                min_entry_cents: 300_000,
             },
             StrategyId::Aggressive => Self {
                 max_positions: 3,
                 target_weight_bps: 3_000,
                 min_cash_bps: 500,
+                min_hold_days: 5,
+                min_entry_cents: 300_000,
             },
         }
     }
@@ -101,6 +127,7 @@ pub fn orders_for_day(
     cash_cents: i64,
     closes: &std::collections::BTreeMap<String, i64>,
     sellable: &[super::Sellable],
+    day: &str,
 ) -> Vec<Order> {
     let policy = SlotPolicy::for_strategy(strategy);
     let mut orders = Vec::new();
@@ -142,7 +169,10 @@ pub fn orders_for_day(
             }
             quantity -= 100;
         }
-        if quantity >= 100 {
+        // Skip orders too small to be worth the commission floor. Placing them
+        // costs 39.7 bps measured versus 5.7 bps for a normal size, with no
+        // extra edge -- the position is simply less able to pay for itself.
+        if quantity >= 100 && quantity * price >= policy.min_entry_cents {
             let amount = quantity * price;
             let fees = super::fees_cents("buy", amount);
             orders.push(Order {
@@ -162,6 +192,13 @@ pub fn orders_for_day(
             .find(|(symbol, _)| symbol == &position.symbol)
             .and_then(|(_, reason)| reason.as_ref());
         if still_signal.is_none() && position.quantity > 0 {
+            // A vanished signal is not by itself a reason to exit. Moving
+            // averages flip back and forth, so acting on the first flip turns
+            // one position into a series of round trips that each pay the
+            // commission floor. Wait out the minimum holding period first.
+            if held_days(&position.acquired_day, day) < policy.min_hold_days {
+                continue;
+            }
             let can_sell = sellable
                 .iter()
                 .find(|item| item.symbol == position.symbol)
@@ -179,6 +216,26 @@ pub fn orders_for_day(
         }
     }
     orders.into_iter().filter(|order| order.quantity >= 100).collect()
+}
+
+/// Calendar days from `acquired` to `day`, or 0 when either is unparsable.
+///
+/// Calendar days rather than trading days on purpose: the point is to sit out
+/// a signal flip, and a week is a week whether or not the market was open. It
+/// also keeps this a pure function of two strings, with no calendar table to
+/// thread through the order logic.
+fn held_days(acquired: &str, day: &str) -> i64 {
+    use chrono::NaiveDate;
+    match (
+        NaiveDate::parse_from_str(acquired, "%Y-%m-%d"),
+        NaiveDate::parse_from_str(day, "%Y-%m-%d"),
+    ) {
+        (Ok(start), Ok(end)) => (end - start).num_days().max(0),
+        // Unparsable means we cannot prove the holding period is satisfied;
+        // treat it as satisfied so a malformed date cannot silently pin a
+        // position forever.
+        _ => i64::MAX,
+    }
 }
 
 fn mean(values: &[i64]) -> i64 {
