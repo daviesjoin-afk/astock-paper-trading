@@ -2,6 +2,36 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+/// Build a signal entry. `score` is what the hysteresis band acts on.
+fn scored(symbol: &str, score: i64) -> (String, SignalScore) {
+    (
+        symbol.to_string(),
+        SignalScore {
+            score,
+            reason: if score >= ENTRY_SCORE {
+                "test_entry"
+            } else {
+                "test_neutral"
+            },
+        },
+    )
+}
+
+/// Strong positive score: enter and hold.
+fn strong(symbol: &str) -> (String, SignalScore) {
+    scored(symbol, ENTRY_SCORE + 20)
+}
+
+/// Below the exit band: leave.
+fn weak(symbol: &str) -> (String, SignalScore) {
+    scored(symbol, EXIT_SCORE - 20)
+}
+
+/// Inside the hysteresis band: neither enter nor exit.
+fn neutral(symbol: &str) -> (String, SignalScore) {
+    scored(symbol, 0)
+}
+
 fn bars(values: &[i64]) -> Vec<Bar> {
     values
         .iter()
@@ -65,14 +95,103 @@ fn steady_signal_requires_trend_and_low_volatility() {
 }
 
 #[test]
-fn aggressive_signal_requires_positive_momentum_and_breakout() {
+fn aggressive_score_rewards_a_fresh_break() {
     let mut values = vec![1_000i64; 61];
-    assert!(signal(StrategyId::Aggressive, &bars(&values)).unwrap().is_none());
+    // Flat market: no momentum, no break.
+    assert!(score_signal(StrategyId::Aggressive, &bars(&values)).score < ENTRY_SCORE);
+
+    // A fresh break: close just past the prior 20-day high, small run-up.
+    values[55..60].copy_from_slice(&[1_010, 1_020, 1_030, 1_040, 1_050]);
+    values[60] = 1_055;
+    let fresh = score_signal(StrategyId::Aggressive, &bars(&values));
+    assert!(
+        fresh.score >= ENTRY_SCORE,
+        "fresh break should clear the entry band, got {} ({})",
+        fresh.score,
+        fresh.reason
+    );
+
+    // Below the prior high: the break failed.
+    values[60] = 900;
+    let failed = score_signal(StrategyId::Aggressive, &bars(&values));
+    assert!(failed.score <= EXIT_SCORE, "failed break got {}", failed.score);
+}
+
+#[test]
+fn aggressive_signal_rejects_an_already_extended_breakout() {
+    // Same shape, but the close is 4.8% past the prior high. Measured over 203
+    // real entries, breaks this extended went on to lose 2.70% over 5 days --
+    // that is the tail of a move, not the start of one.
+    let mut values = vec![1_000i64; 61];
     values[55..60].copy_from_slice(&[1_010, 1_020, 1_030, 1_040, 1_050]);
     values[60] = 1_100;
-    assert!(signal(StrategyId::Aggressive, &bars(&values)).unwrap().is_some());
-    values[60] = 900;
-    assert!(signal(StrategyId::Aggressive, &bars(&values)).unwrap().is_none());
+    let scored = score_signal(StrategyId::Aggressive, &bars(&values));
+    assert!(
+        scored.score < ENTRY_SCORE,
+        "extended break must not clear the entry band, got {} ({})",
+        scored.score,
+        scored.reason
+    );
+}
+
+#[test]
+fn aggressive_signal_rejects_a_large_run_up_into_the_break() {
+    // Momentum is positive and the close does clear the prior high, but the
+    // stock has already climbed 25% off its 20-day low. Chasing that is what
+    // the old rule did.
+    let mut values = vec![1_000i64; 61];
+    for (offset, value) in (0..20).map(|i| 850 + i * 12).enumerate() {
+        values[41 + offset] = value;
+    }
+    values[60] = 1_080;
+    let scored = score_signal(StrategyId::Aggressive, &bars(&values));
+    assert!(
+        scored.score < ENTRY_SCORE,
+        "chasing an extended run-up must not enter, got {} ({})",
+        scored.score,
+        scored.reason
+    );
+}
+
+#[test]
+fn stop_loss_exits_inside_the_holding_period() {
+    // The holding period must not pin a losing position. Steady stops at -12%.
+    let mut book = book();
+    apply_buy(&mut book, "600000.SH", 1_000, 1_000, 5, "2026-11-02").unwrap();
+    settle_overnight(&mut book).unwrap();
+    // Down 13%: past the stop, but only 2 days held.
+    let closes = BTreeMap::from([("600000.SH".to_string(), 870)]);
+    let orders = orders_for_day(
+        StrategyId::Steady,
+        &book.positions,
+        &[strong("600000.SH")],
+        book.cash_cents,
+        book.cash_cents,
+        &closes,
+        &book.sellable,
+    );
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].side, "sell");
+    assert_eq!(orders[0].reason, "stop_loss");
+}
+
+#[test]
+fn a_small_drawdown_inside_the_holding_period_does_not_exit() {
+    // Down 5%, inside the 12% stop and inside the holding period: hold.
+    let mut book = book();
+    apply_buy(&mut book, "600000.SH", 1_000, 1_000, 5, "2026-11-02").unwrap();
+    settle_overnight(&mut book).unwrap();
+    let closes = BTreeMap::from([("600000.SH".to_string(), 950)]);
+    let orders = orders_for_day(
+        StrategyId::Steady,
+        &book.positions,
+        &[strong("600000.SH")],
+        book.cash_cents,
+        book.cash_cents,
+        &closes,
+        &book.sellable,
+    );
+    assert!(orders.is_empty());
 }
 
 #[test]
@@ -163,38 +282,23 @@ fn strategy_exit_uses_only_the_sellable_quantity() {
     let closed = orders_for_day(
         StrategyId::Steady,
         &book.positions,
-        &[("600000.SH".into(), None)],
+        &[weak("600000.SH")],
         book.cash_cents,
         book.cash_cents,
         &closes,
         &book.sellable,
-        "2026-10-30",
     );
     assert!(closed.is_empty());
     settle_overnight(&mut book).unwrap();
-    // Next trading day, but still inside the minimum holding period, so a
-    // vanished signal must not exit yet.
-    let held_early = orders_for_day(
-        StrategyId::Steady,
-        &book.positions,
-        &[("600000.SH".into(), None)],
-        book.cash_cents,
-        book.cash_cents,
-        &closes,
-        &book.sellable,
-        "2026-11-02",
-    );
-    assert!(held_early.is_empty());
-    // Past the holding period it exits.
+    // Next trading day with a clearly negative score: exits.
     let closed = orders_for_day(
         StrategyId::Steady,
         &book.positions,
-        &[("600000.SH".into(), None)],
+        &[weak("600000.SH")],
         book.cash_cents,
         book.cash_cents,
         &closes,
         &book.sellable,
-        "2026-11-20",
     );
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].side, "sell");
@@ -213,12 +317,11 @@ fn strategy_does_not_buy_with_cash_reserved_for_the_cash_floor() {
     let orders = orders_for_day(
         StrategyId::Steady,
         &book.positions,
-        &[("600000.SH".into(), Some("trend".into()))],
+        &[strong("600000.SH")],
         book.cash_cents,
         book.cash_cents,
         &closes,
         &book.sellable,
-        "2026-11-02",
     );
     assert_eq!(orders.len(), 1);
     let amount = orders[0].quantity * 1_000;
@@ -238,12 +341,11 @@ fn a_position_too_small_to_clear_commission_is_not_opened() {
     let orders = orders_for_day(
         StrategyId::Steady,
         &book.positions,
-        &[("600000.SH".into(), Some("trend".into()))],
+        &[strong("600000.SH")],
         book.cash_cents,
         book.cash_cents,
         &closes,
         &book.sellable,
-        "2026-11-02",
     );
     assert!(
         orders.is_empty(),
@@ -252,38 +354,41 @@ fn a_position_too_small_to_clear_commission_is_not_opened() {
 }
 
 #[test]
-fn a_position_inside_the_holding_period_is_not_exited() {
-    // Steady requires 10 calendar days. A signal that vanishes on day 3 must
-    // not exit -- that is the flip-flop that produced 543 fills in a year.
+fn a_position_stays_put_while_the_score_is_in_the_neutral_band() {
+    // This is what replaces a fixed holding period: the position is not sold
+    // merely because the score dipped, only when it falls through the exit
+    // band. A condition oscillating around its threshold stays in the band and
+    // therefore stops generating round trips.
     let mut book = book();
-    apply_buy(&mut book, "600000.SH", 1_000, 1_000, 5, "2026-11-02").unwrap();
+    apply_buy(&mut book, "600000.SH", 2_000, 1_000, 5, "2026-11-02").unwrap();
     settle_overnight(&mut book).unwrap();
     let closes = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
 
-    let early = orders_for_day(
-        StrategyId::Steady,
-        &book.positions,
-        &[("600000.SH".into(), None)],
-        book.cash_cents,
-        book.cash_cents,
-        &closes,
-        &book.sellable,
-        "2026-11-05",
-    );
-    assert!(early.is_empty(), "day 3 is inside the holding period");
+    for (label, entry) in [("neutral", neutral("600000.SH")), ("faintly positive", scored("600000.SH", 10))] {
+        let orders = orders_for_day(
+            StrategyId::Steady,
+            &book.positions,
+            &[entry],
+            book.cash_cents,
+            book.cash_cents,
+            &closes,
+            &book.sellable,
+        );
+        assert!(orders.is_empty(), "{label} must not trigger an exit");
+    }
 
-    let later = orders_for_day(
+    // Falls through the exit band: leave.
+    let exit = orders_for_day(
         StrategyId::Steady,
         &book.positions,
-        &[("600000.SH".into(), None)],
+        &[weak("600000.SH")],
         book.cash_cents,
         book.cash_cents,
         &closes,
         &book.sellable,
-        "2026-11-12",
     );
-    assert_eq!(later.len(), 1, "day 10 is past the holding period");
-    assert_eq!(later[0].side, "sell");
+    assert_eq!(exit.len(), 1);
+    assert_eq!(exit[0].side, "sell");
 }
 
 #[test]
@@ -296,12 +401,11 @@ fn buy_plan_leaves_room_for_the_minimum_commission() {
     let orders = orders_for_day(
         StrategyId::Steady,
         &book.positions,
-        &[("600000.SH".into(), Some("trend".into()))],
+        &[strong("600000.SH")],
         1_000_000,
         book.cash_cents,
         &closes,
         &book.sellable,
-        "2026-11-02",
     );
     assert!(orders.is_empty());
 }

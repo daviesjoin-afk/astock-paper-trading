@@ -10,9 +10,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{
     apply_buy, apply_sell, drawdown_bps, fees_cents, initial_split, orders_for_day, propose, score,
-    settle_overnight, signal, AccountSpec, AccountView, AdvanceResult, DayRun, IndexedPriceSet,
+    score_signal, settle_overnight, AccountSpec, AccountView, AdvanceResult, DayRun, IndexedPriceSet,
     PositionView, PriceCoverage, PriceSet, Rebalance, RuleError, SlotBook, SlotSpec, SlotView,
-    StrategyId, Trade,
+    SignalScore, StrategyId, Trade,
 };
 
 pub const SCHEMA_VERSION: i64 = 2;
@@ -613,7 +613,7 @@ impl Store {
         day: &str,
         closes: &'a BTreeMap<String, i64>,
         held: impl Iterator<Item = &'a str>,
-    ) -> StoreResult<Vec<(String, Option<String>)>> {
+    ) -> StoreResult<Vec<(String, SignalScore)>> {
         let mut candidates: BTreeSet<&'a str> = closes.keys().map(String::as_str).collect();
         candidates.extend(held);
 
@@ -623,7 +623,7 @@ impl Store {
             if bars.len() > SIGNAL_LOOKBACK_DAYS {
                 bars.drain(..bars.len() - SIGNAL_LOOKBACK_DAYS);
             }
-            signals.push((symbol.to_string(), signal(slot, &bars)?));
+            signals.push((symbol.to_string(), score_signal(slot, &bars)));
         }
         Ok(signals)
     }
@@ -695,7 +695,6 @@ impl Store {
                 book.cash_cents,
                 &closes,
                 &book.sellable,
-                day,
             );
             for order in orders {
                 let price = closes
