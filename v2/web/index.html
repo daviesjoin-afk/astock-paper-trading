@@ -37,7 +37,14 @@
       </div>
     </header>
 
+
+    <nav class="module-nav" aria-label="主功能导航">
+      <div class="module-nav-inner" id="module-nav"></div>
+    </nav>
+
     <main id="main" tabindex="-1">
+      <nav class="view-nav" aria-label="二级导航" id="view-nav" hidden></nav>
+
       <section class="notice" data-testid="loading" id="loading">
         <h2>正在读取账户…</h2>
         <p class="muted">只读取本地账本与已审核收盘价，不访问券商。</p>
@@ -66,7 +73,8 @@
         </form>
       </section>
 
-      <div id="dashboard" data-testid="dashboard" hidden>
+      <div id="view-overview-dashboard" class="view" data-view="overview/dashboard" hidden>
+      <div id="dashboard" data-testid="dashboard">
         <section class="hero" aria-labelledby="overview-title">
           <div>
             <p class="eyebrow">模拟账户</p>
@@ -81,12 +89,10 @@
           </dl>
         </section>
 
-        <p class="warning" data-testid="warning" id="warning" hidden></p>
-
         <div class="run-row">
           <div>
             <h3>推进到最新交易日</h3>
-            <p class="muted" data-testid="coverage">等待读取价格覆盖…</p>
+            <p class="muted">等待读取价格覆盖…</p>
           </div>
           <button type="button" class="btn btn-primary" data-testid="run-submit" id="run-submit">
             推进并结算
@@ -134,51 +140,189 @@
           </article>
         </section>
 
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>持仓</h2><p class="muted">“可卖”受 T+1 限制，买入当天不可卖。</p></div>
-            <span class="count" data-testid="positions-count">—</span>
-          </div>
-          <div class="table-scroll">
-            <table>
-              <thead>
-                <tr><th>策略</th><th>代码</th><th class="num-col">数量</th><th class="num-col">可卖</th><th class="num-col">成本价</th><th class="num-col">收盘价</th><th class="num-col">市值</th></tr>
-              </thead>
-              <tbody id="positions-body" data-testid="positions-body"></tbody>
-            </table>
-          </div>
-          <p class="empty" data-testid="positions-empty" id="positions-empty">还没有持仓。</p>
-        </section>
-
-        <div class="lower-grid">
-          <section class="panel">
-            <div class="panel-head">
-              <div><h2>最近成交</h2><p class="muted">成交价来自审核收盘价；费用按固定规则计算。</p></div>
-            </div>
-            <div class="table-scroll">
-              <table>
-                <thead><tr><th>日期</th><th>策略</th><th>代码</th><th>方向</th><th class="num-col">数量</th><th class="num-col">价格</th></tr></thead>
-                <tbody id="trades-body" data-testid="trades-body"></tbody>
-              </table>
-            </div>
-            <p class="empty" data-testid="trades-empty" id="trades-empty">还没有成交。</p>
-          </section>
-
-          <section class="panel">
-            <div class="panel-head">
-              <div><h2>资金调仓</h2><p class="muted">至少两个完整交易日后才评估。策略收益按各自初始 50% 本金计算，因此两项收益之和等于账户累计收益。</p></div>
-            </div>
-            <ol class="timeline" id="rebalances-body" data-testid="rebalances-body"></ol>
-            <p class="empty" data-testid="rebalances-empty" id="rebalances-empty">还没有调仓记录。</p>
-          </section>
-        </div>
-
         <footer class="page-foot">
           <p>纯模拟盘，不连接券商、不进行真实交易。缺失的数据显示为“—”，不会用 0 或估算值代替。</p>
           <p data-testid="price-set" id="price-set">价格集合：—</p>
         </footer>
       </div>
+    </div>
+
+    <div id="view-overview-signals" class="view" data-view="overview/signals" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>今日信号</h2><p class="muted">按最新交易日计算，显示各标的的评分与判断。评分在 −100 到 +100 之间，≥40 才会开仓。</p></div>
+        </div>
+        <p class="empty" id="signals-empty">推进过至少一个交易日后，这里会显示当日信号。</p>
+      </section>
+    </div>
+
+    <div id="view-market-screener" class="view" data-view="market/screener" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>全市场</h2><p class="muted">已入库的全部标的，按当日涨跌幅排序。</p></div>
+          <span class="count" id="screener-count">—</span>
+        </div>
+        <div class="toolbar">
+          <label class="field-inline"><span>交易日</span><select id="screener-day"></select></label>
+          <label class="field-inline"><span>筛选</span><input id="screener-filter" type="search" placeholder="代码或名称" /></label>
+        </div>
+        <div class="table-scroll table-tall">
+          <table>
+            <thead><tr><th>代码</th><th>名称</th><th class="num-col">收盘</th><th class="num-col">涨跌</th><th class="num-col">成交量</th></tr></thead>
+            <tbody id="screener-body"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="screener-empty">还没有行情数据。先运行数据摄取。</p>
+      </section>
+    </div>
+
+    <div id="view-market-data" class="view" data-view="market/data" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>数据覆盖</h2><p class="muted">行情入库的日期范围与标的数量。</p></div>
+        </div>
+        <dl class="metric-grid wide">
+          <div><dt>交易日数</dt><dd id="cov-days">—</dd></div>
+          <div><dt>最早</dt><dd id="cov-first">—</dd></div>
+          <div><dt>最新</dt><dd id="cov-last">—</dd></div>
+          <div><dt>最新日标的数</dt><dd id="cov-symbols">—</dd></div>
+        </dl>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>除权跳空</h2><p class="muted">收盘相对昨收跳空超过 11% 的标的。多半是除权除息，图表上不应连成实线。</p></div>
+          <span class="count" id="gaps-count">—</span>
+        </div>
+        <div class="table-scroll table-tall">
+          <table>
+            <thead><tr><th>代码</th><th>名称</th><th class="num-col">昨收</th><th class="num-col">收盘</th><th class="num-col">跳空</th></tr></thead>
+            <tbody id="gaps-body"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="gaps-empty">没有需要标记的跳空。</p>
+      </section>
+    </div>
+
+    <div id="view-trading-account" class="view" data-view="trading/account" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>净值曲线</h2><p class="muted">每天看这一张就够了：涨了多少、怎么涨的、哪根柱子不对。</p></div>
+          <div class="seg" role="group" aria-label="切换曲线">
+            <button type="button" class="seg-btn active" data-series="total">账户</button>
+            <button type="button" class="seg-btn" data-series="steady">稳健</button>
+            <button type="button" class="seg-btn" data-series="aggressive">激进</button>
+          </div>
+        </div>
+        <div class="curve-summary" id="curve-summary"></div>
+        <div class="chart-wrap">
+          <div id="equity-chart"></div>
+          <div id="daily-bars"></div>
+        </div>
+        <div class="range-row" role="group" aria-label="时间范围">
+          <button type="button" class="chip active" data-range="all">全部</button>
+          <button type="button" class="chip" data-range="120">半年</button>
+          <button type="button" class="chip" data-range="60">三个月</button>
+          <button type="button" class="chip" data-range="20">一个月</button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2>账户概览</h2></div></div>
+        <dl class="metric-grid wide">
+          <div><dt>本金</dt><dd data-testid="principal-value">—</dd></div>
+          <div><dt>总资产</dt><dd data-testid="equity">—</dd></div>
+          <div><dt>累计收益</dt><dd data-testid="profit">—</dd></div>
+          <div><dt>可用现金</dt><dd data-testid="cash">—</dd></div>
+        </dl>
+        <p class="warning" data-testid="warning" id="warning" hidden></p>
+      </section>
+    </div>
+
+    <div id="view-trading-positions" class="view" data-view="trading/positions" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>持仓</h2><p class="muted">“可卖”受 T+1 限制，买入当天不可卖。</p></div>
+          <span class="count" data-testid="positions-count">—</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>策略</th><th>代码</th><th class="num-col">数量</th><th class="num-col">可卖</th><th class="num-col">成本价</th><th class="num-col">收盘价</th><th class="num-col">市值</th><th class="num-col">盈亏</th></tr></thead>
+            <tbody id="positions-body" data-testid="positions-body"></tbody>
+          </table>
+        </div>
+        <p class="empty" data-testid="positions-empty" id="positions-empty">还没有持仓。</p>
+      </section>
+      <section class="strategy-grid" aria-label="两个策略" data-testid="strategy-grid">
+        <article class="strategy-card" data-testid="strategy-steady">
+          <header><div><p class="eyebrow">策略一</p><h3>稳健</h3></div><span class="weight" data-testid="steady-weight">—</span></header>
+          <p class="strategy-desc" data-testid="steady-desc">—</p>
+          <dl class="metric-grid">
+            <div><dt>策略资产</dt><dd data-testid="steady-equity">—</dd></div>
+            <div><dt>收益贡献</dt><dd data-testid="steady-profit">—</dd></div>
+            <div><dt>贡献率</dt><dd data-testid="steady-return">—</dd></div>
+            <div><dt>回撤</dt><dd data-testid="steady-drawdown">—</dd></div>
+            <div><dt>现金</dt><dd data-testid="steady-cash">—</dd></div>
+            <div><dt>持仓</dt><dd data-testid="steady-count">—</dd></div>
+          </dl>
+        </article>
+        <article class="strategy-card" data-testid="strategy-aggressive">
+          <header><div><p class="eyebrow">策略二</p><h3>激进</h3></div><span class="weight" data-testid="aggressive-weight">—</span></header>
+          <p class="strategy-desc" data-testid="aggressive-desc">—</p>
+          <dl class="metric-grid">
+            <div><dt>策略资产</dt><dd data-testid="aggressive-equity">—</dd></div>
+            <div><dt>收益贡献</dt><dd data-testid="aggressive-profit">—</dd></div>
+            <div><dt>贡献率</dt><dd data-testid="aggressive-return">—</dd></div>
+            <div><dt>回撤</dt><dd data-testid="aggressive-drawdown">—</dd></div>
+            <div><dt>现金</dt><dd data-testid="aggressive-cash">—</dd></div>
+            <div><dt>持仓</dt><dd data-testid="aggressive-count">—</dd></div>
+          </dl>
+        </article>
+      </section>
+    </div>
+
+    <div id="view-trading-trades" class="view" data-view="trading/trades" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>成交</h2><p class="muted">成交价来自审核收盘价；费用按固定规则计算。</p></div>
+        </div>
+        <div class="table-scroll table-tall">
+          <table>
+            <thead><tr><th>日期</th><th>策略</th><th>代码</th><th>方向</th><th class="num-col">数量</th><th class="num-col">价格</th><th class="num-col">费用</th><th>原因</th></tr></thead>
+            <tbody id="trades-body" data-testid="trades-body"></tbody>
+          </table>
+        </div>
+        <p class="empty" data-testid="trades-empty" id="trades-empty">还没有成交。</p>
+      </section>
+    </div>
+
+    <div id="view-trading-rebalances" class="view" data-view="trading/rebalances" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>资金调仓</h2><p class="muted">至少两个完整交易日后才评估。策略收益按各自初始 50% 本金计算，因此两项收益之和等于账户累计收益。</p></div>
+        </div>
+        <ol class="timeline" id="rebalances-body" data-testid="rebalances-body"></ol>
+        <p class="empty" data-testid="rebalances-empty" id="rebalances-empty">还没有调仓记录。</p>
+      </section>
+    </div>
+
+    <div id="view-trading-advance" class="view" data-view="trading/advance" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>推进与结算</h2><p class="muted">按已入库的收盘价逐日结算。重复推进同一天不会重复成交。</p></div>
+        </div>
+        <p class="muted" data-testid="coverage" id="advance-coverage">等待读取价格覆盖…</p>
+        <div class="run-row">
+          <div><h3>推进到最新交易日</h3><p class="muted">先摄取行情，再推进。</p></div>
+          <button type="button" class="btn btn-primary" data-testid="run-submit" id="run-submit">推进并结算</button>
+        </div>
+        <p class="run-result" data-testid="run-result" id="run-result" hidden></p>
+        <div class="field-inline-row">
+          <label class="field-inline"><span>指定日期</span><input id="advance-day" type="date" /></label>
+          <button type="button" class="btn btn-quiet" id="advance-day-submit">推进到该日</button>
+        </div>
+      </section>
+    </div>
     </main>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

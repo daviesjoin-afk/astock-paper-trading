@@ -140,13 +140,13 @@ pub fn score_signal(strategy: StrategyId, bars: &[Bar]) -> SignalScore {
     }
     let latest = *closes.last().expect("non-empty");
     match strategy {
-        StrategyId::Steady => steady_score(&closes, latest),
+        StrategyId::Steady => steady_score(&closes),
         StrategyId::Aggressive => aggressive_score(&closes, latest),
     }
 }
 
 /// Trend above a rising average, and calm enough to be worth holding.
-fn steady_score(closes: &[i64], latest: i64) -> SignalScore {
+fn steady_score(closes: &[i64]) -> SignalScore {
     let ma20 = mean(&closes[closes.len() - 20..]);
     let ma60 = mean(&closes[closes.len() - 60..]);
     let recent_vol = volatility(&closes[closes.len() - 20..]);

@@ -233,11 +233,22 @@ async fn bar_gaps(State(state): State<Shared>, Query(query): Query<BarsQuery>) -
             }
         },
     };
-    let threshold = query.threshold_bps.unwrap_or(1_100);
-    let rows = db.price_gaps(&day, threshold).map_err(api_error)?;
+    // Per-symbol thresholds are applied inside the query; an explicit
+    // `threshold_bps` from the caller overrides that and is filtered here.
+    let mut rows = db.price_gaps(&day).map_err(api_error)?;
+    if let Some(threshold) = query.threshold_bps {
+        rows.retain(|bar| {
+            bar.prev_close_cents > 0
+                && (bar.close_cents - bar.prev_close_cents).abs() * 10_000
+                    / bar.prev_close_cents
+                    > threshold
+        });
+    }
     response(json!({
         "day": day,
-        "threshold_bps": threshold,
+        // null means "per-board limit + 2%", applied per symbol.
+        "threshold_bps": query.threshold_bps,
+        "threshold_mode": if query.threshold_bps.is_some() { "explicit" } else { "per_board_limit" },
         "count": rows.len(),
         "bars": rows,
     }))
@@ -323,6 +334,96 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
         db.advance(&spec, &set, &day, settle_from.as_deref())
             .map_err(api_error)?,
     )
+}
+
+/// The profit curve: per-day equity for the account and each slot.
+///
+/// This is the primary read for the UI. The user's own acceptance criterion is
+/// the equity curve, so it is served as its own endpoint rather than derived
+/// from `/v2/account` (which is a point-in-time snapshot).
+async fn equity_curve(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    let rows = db.equity_curve(&spec.account_id).map_err(api_error)?;
+    if rows.is_empty() {
+        return response(json!({
+            "account_id": spec.account_id,
+            "initial_cash_cents": spec.initial_cash_cents,
+            "points": [],
+            "summary": null,
+        }));
+    }
+
+    let initial = spec.initial_cash_cents;
+    // The two slots each start with half the principal. Tracking each against
+    // its own original budget keeps a slot's reported return a statement about
+    // the strategy, not about how much cash was later moved to it.
+    let slot_budget = initial / 2;
+
+    let points: Vec<Value> = rows
+        .iter()
+        .map(|(day, steady, aggressive)| {
+            let total = steady + aggressive;
+            json!({
+                "day": day,
+                "equity_cents": total,
+                "steady_cents": steady,
+                "aggressive_cents": aggressive,
+                "profit_cents": total - initial,
+                "return_bps": if initial > 0 { (total - initial) * 10_000 / initial } else { 0 },
+                "steady_return_bps": if slot_budget > 0 { (steady - slot_budget) * 10_000 / slot_budget } else { 0 },
+                "aggressive_return_bps": if slot_budget > 0 { (aggressive - slot_budget) * 10_000 / slot_budget } else { 0 },
+            })
+        })
+        .collect();
+
+    // Peak-to-trough over the curve, which is what a user actually feels.
+    let mut peak = initial;
+    let mut max_drawdown_bps = 0i64;
+    let mut peak_day = rows[0].0.clone();
+    let mut trough_day = rows[0].0.clone();
+    for (day, steady, aggressive) in &rows {
+        let total = steady + aggressive;
+        if total > peak {
+            peak = total;
+            peak_day = day.clone();
+        }
+        if peak > 0 {
+            let drawdown = (peak - total) * 10_000 / peak;
+            if drawdown > max_drawdown_bps {
+                max_drawdown_bps = drawdown;
+                trough_day = day.clone();
+            }
+        }
+    }
+    let (_, last_steady, last_aggressive) = rows.last().expect("non-empty");
+    let last_total = last_steady + last_aggressive;
+
+    response(json!({
+        "account_id": spec.account_id,
+        "initial_cash_cents": initial,
+        "points": points,
+        "summary": {
+            "first_day": rows.first().map(|r| r.0.clone()),
+            "last_day": rows.last().map(|r| r.0.clone()),
+            "days": rows.len(),
+            "equity_cents": last_total,
+            "profit_cents": last_total - initial,
+            "return_bps": if initial > 0 { (last_total - initial) * 10_000 / initial } else { 0 },
+            "max_drawdown_bps": max_drawdown_bps,
+            "peak_day": peak_day,
+            "trough_day": trough_day,
+            "steady_return_bps": if slot_budget > 0 { (last_steady - slot_budget) * 10_000 / slot_budget } else { 0 },
+            "aggressive_return_bps": if slot_budget > 0 { (last_aggressive - slot_budget) * 10_000 / slot_budget } else { 0 },
+            "steady_cents": last_steady,
+            "aggressive_cents": last_aggressive,
+        },
+    }))
 }
 
 /// Diagnostic: how many symbols the settlement view would actually contain.
@@ -505,6 +606,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market/gaps", get(bar_gaps))
         .route("/v2/market/bars/{symbol}", get(symbol_bars))
         .route("/v2/market/settlement-preview", get(settlement_preview))
+        .route("/v2/account/equity-curve", get(equity_curve))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("astock-v2 listening at http://{address}");

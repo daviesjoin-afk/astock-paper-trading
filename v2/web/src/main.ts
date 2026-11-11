@@ -1,4 +1,6 @@
 import "./styles.css";
+import { installRouter, NAV, parseHash, pushHash, replaceHash, type Route } from "./router";
+import { moneyShort, renderCurve, renderDailyBars, type CurvePoint } from "./chart";
 
 type StrategyId = "steady" | "aggressive";
 
@@ -87,13 +89,28 @@ const byId = <T extends HTMLElement>(id: string): T => {
   if (!node) throw new Error(`missing #${id}`);
   return node as T;
 };
+/**
+ * Find an element by test id, preferring one that is actually visible.
+ *
+ * The same test id can legitimately appear in more than one view -- the account
+ * figures exist on both the overview and the account page. Rendering must
+ * target the visible copy, or updates land on a hidden node and the page
+ * silently keeps showing placeholders.
+ */
 const byTestId = <T extends HTMLElement>(id: string): T => {
-  const node = document.querySelector<T>(`[data-testid="${id}"]`);
-  if (!node) throw new Error(`missing [data-testid="${id}"]`);
-  return node;
+  const matches = Array.from(document.querySelectorAll<T>(`[data-testid="${id}"]`));
+  if (matches.length === 0) throw new Error(`missing [data-testid="${id}"]`);
+  const visible = matches.find(
+    (node) => node.offsetParent !== null || node.getClientRects().length > 0,
+  );
+  return visible ?? matches[0];
 };
 const setText = (id: string, value: string): void => {
   byTestId(id).textContent = value;
+};
+/** Write to an element addressed by its `id` attribute rather than a test id. */
+const setTextById = (id: string, value: string): void => {
+  byId(id).textContent = value;
 };
 const show = (node: HTMLElement, visible: boolean): void => {
   node.hidden = !visible;
@@ -193,21 +210,38 @@ const renderPositions = (account: AccountView): void => {
   body.replaceChildren();
   for (const position of account.positions) {
     const row = document.createElement("tr");
-    const values = [
-      strategyLabel(position.slot),
-      position.symbol,
-      number(position.quantity),
-      number(position.sellable_quantity),
-      money(position.average_cost_cents),
-      money(position.close_cents),
-      money(position.market_value_cents),
+    // Unrealised P&L per position, against its own average cost. This is the
+    // number that answers "is this position working", which the market value
+    // alone does not.
+    const pnl =
+      position.close_cents !== null && position.average_cost_cents > 0
+        ? (position.close_cents - position.average_cost_cents) * position.quantity
+        : null;
+    const pnlBps =
+      position.close_cents !== null && position.average_cost_cents > 0
+        ? ((position.close_cents - position.average_cost_cents) * 10_000) /
+          position.average_cost_cents
+        : null;
+
+    const values: Array<[string, string]> = [
+      [strategyLabel(position.slot), ""],
+      [position.symbol, ""],
+      [number(position.quantity), "num-col"],
+      [number(position.sellable_quantity), "num-col"],
+      [money(position.average_cost_cents), "num-col"],
+      [money(position.close_cents), "num-col"],
+      [money(position.market_value_cents), "num-col"],
+      [
+        pnl === null ? "—" : `${signedMoney(pnl)} (${percent(pnlBps)})`,
+        "num-col " + (pnl !== null && pnl >= 0 ? "pos" : pnl !== null ? "neg" : ""),
+      ],
     ];
-    values.forEach((value, index) => {
+    for (const [value, cls] of values) {
       const cell = document.createElement("td");
-      if (index >= 2) cell.className = "num-col";
+      if (cls) cell.className = cls;
       cell.textContent = value;
       row.appendChild(cell);
-    });
+    }
     body.appendChild(row);
   }
   setText("positions-count", `${account.positions.length} 个持仓`);
@@ -405,10 +439,408 @@ const theme = (): void => {
   button.setAttribute("aria-pressed", String(!dark));
 };
 
+// ---- navigation ------------------------------------------------------------
+
+/**
+ * Which views have been loaded at least once. A view that has never been shown
+ * has no data to keep; one that has keeps its last render so flipping back is
+ * instant and does not re-hit the API.
+ */
+const loadedViews = new Set<string>();
+
+function renderModuleNav(activeModule: string): void {
+  const host = byId("module-nav");
+  host.replaceChildren();
+  for (const module of NAV) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "module-tab" + (module.id === activeModule ? " active" : "");
+    button.dataset.module = module.id;
+    button.setAttribute("aria-current", module.id === activeModule ? "page" : "false");
+
+    const label = document.createElement("b");
+    label.textContent = module.label;
+    const hint = document.createElement("small");
+    hint.textContent = module.hint;
+    button.append(label, hint);
+
+    button.addEventListener("click", () => {
+      pushHash({ module: module.id, view: module.views[0].id });
+      // pushState does not fire hashchange, so drive the render directly.
+      applyRoute(parseHash(location.hash));
+    });
+    host.appendChild(button);
+  }
+}
+
+function renderViewNav(route: Route): void {
+  const nav = byId("view-nav");
+  const module = NAV.find((entry) => entry.id === route.module);
+  if (!module) {
+    nav.hidden = true;
+    return;
+  }
+  nav.hidden = false;
+  nav.replaceChildren();
+  for (const view of module.views) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "view-tab" + (view.id === route.view ? " active" : "");
+    button.dataset.view = view.id;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(view.id === route.view));
+    button.textContent = view.label;
+    button.addEventListener("click", () => {
+      pushHash({ module: route.module, view: view.id });
+      applyRoute(parseHash(location.hash));
+    });
+    nav.appendChild(button);
+  }
+}
+
+function applyRoute(route: Route): void {
+  replaceHash(route);
+  renderModuleNav(route.module);
+  renderViewNav(route);
+
+  const target = `${route.module}/${route.view}`;
+  for (const node of document.querySelectorAll<HTMLElement>(".view")) {
+    show(node, node.dataset.view === target);
+  }
+
+  // Every view except the first assumes an account exists. If one does not,
+  // the create panel is the only sensible thing to show.
+  if (target !== "overview/dashboard" && current === null) {
+    show(byId("loading"), false);
+    show(byTestId("create-panel"), true);
+    return;
+  }
+
+  // Re-render for the view that just became visible. `render` writes into the
+  // copy of each figure that is visible at the time it runs, and when the
+  // account was loaded on a different view these nodes were hidden -- so the
+  // figures have to be pushed again now that this view is on screen.
+  if (current) render(current);
+
+  void loadView(target);
+}
+
+/** Load whatever a view needs, once per session unless explicitly refreshed. */
+async function loadView(view: string): Promise<void> {
+  if (loadedViews.has(view)) return;
+  try {
+    switch (view) {
+      case "trading/account":
+        await loadCurve();
+        break;
+      case "market/screener":
+        await loadScreener();
+        break;
+      case "market/data":
+        await loadCoverage();
+        break;
+      default:
+        // Views backed by the account payload are already rendered by `load`.
+        break;
+    }
+    loadedViews.add(view);
+  } catch (error) {
+    announce(`加载失败：${errorDetail(error)}`);
+  }
+}
+
+// ---- equity curve ----------------------------------------------------------
+
+type CurvePointPayload = CurvePoint & {
+  profit_cents: number;
+  return_bps: number;
+  steady_return_bps: number;
+  aggressive_return_bps: number;
+};
+
+type CurvePayload = {
+  account_id: string;
+  initial_cash_cents: number;
+  points: CurvePointPayload[];
+  summary: {
+    first_day: string | null;
+    last_day: string | null;
+    days: number;
+    equity_cents: number;
+    profit_cents: number;
+    return_bps: number;
+    max_drawdown_bps: number;
+    peak_day: string;
+    trough_day: string;
+    steady_return_bps: number;
+    aggressive_return_bps: number;
+    steady_cents: number;
+    aggressive_cents: number;
+  } | null;
+};
+
+let curve: CurvePayload | null = null;
+let curveSeries: "total" | "steady" | "aggressive" = "total";
+let curveRange = "all";
+
+async function loadCurve(): Promise<void> {
+  curve = await api<CurvePayload>("/v2/account/equity-curve");
+  drawCurve();
+}
+
+function drawCurve(): void {
+  if (!curve) return;
+  const summary = byId("curve-summary");
+  const chart = byId("equity-chart");
+  const bars = byId("daily-bars");
+
+  if (!curve.summary || curve.points.length === 0) {
+    summary.replaceChildren();
+    chart.innerHTML = renderCurve({
+      points: [],
+      initialCents: curve.initial_cash_cents,
+      series: curveSeries,
+      width: 900,
+      height: 260,
+    });
+    bars.replaceChildren();
+    return;
+  }
+
+  const take = curveRange === "all" ? curve.points.length : Number(curveRange);
+  const points = curve.points.slice(-take);
+  const s = curve.summary;
+
+  const stat = (label: string, value: string, tone: string, sub: string): string =>
+    `<div class="curve-stat">
+       <span class="curve-stat-label">${label}</span>
+       <strong class="${tone}">${value}</strong>
+       <span class="muted">${sub}</span>
+     </div>`;
+
+  summary.innerHTML = [
+    stat(
+      "累计收益",
+      signedMoney(s.profit_cents),
+      s.profit_cents >= 0 ? "pos" : "neg",
+      percent(s.return_bps),
+    ),
+    stat(
+      "最大回撤",
+      percent(-s.max_drawdown_bps),
+      "neg",
+      `${s.peak_day} → ${s.trough_day}`,
+    ),
+    stat(
+      "稳健",
+      percent(s.steady_return_bps),
+      s.steady_return_bps >= 0 ? "pos" : "neg",
+      moneyShort(s.steady_cents),
+    ),
+    stat(
+      "激进",
+      percent(s.aggressive_return_bps),
+      s.aggressive_return_bps >= 0 ? "pos" : "neg",
+      moneyShort(s.aggressive_cents),
+    ),
+    stat("样本", String(points.length), "", `个交易日，${s.first_day} 起`),
+  ].join("");
+
+  chart.innerHTML = renderCurve({
+    points,
+    initialCents: curve.initial_cash_cents,
+    series: curveSeries,
+    width: 900,
+    height: 260,
+  });
+  // The day-by-day strip only makes sense on the account curve; a single slot's
+  // per-day change is already visible as the curve's slope.
+  bars.innerHTML = curveSeries === "total" ? renderDailyBars(points, 900, 64) : "";
+}
+
+// ---- market screener -------------------------------------------------------
+
+type Bar = {
+  symbol: string;
+  day: string;
+  name: string;
+  close_cents: number;
+  prev_close_cents: number;
+  volume_shares: number;
+};
+
+let screenerRows: Bar[] = [];
+
+async function loadScreener(): Promise<void> {
+  const days = await api<{ days: string[]; latest_day: string | null }>("/v2/market/days");
+  const select = byId<HTMLSelectElement>("screener-day");
+  select.replaceChildren();
+  for (const day of [...days.days].reverse()) {
+    const option = document.createElement("option");
+    option.value = day;
+    option.textContent = day;
+    select.appendChild(option);
+  }
+  if (!days.latest_day) {
+    show(byId("screener-empty"), true);
+    return;
+  }
+  select.value = days.latest_day;
+  await fetchScreenerDay(days.latest_day);
+  select.addEventListener("change", () => void fetchScreenerDay(select.value));
+  byId<HTMLInputElement>("screener-filter").addEventListener("input", renderScreener);
+}
+
+async function fetchScreenerDay(day: string): Promise<void> {
+  const payload = await api<{ bars: Bar[]; count: number }>(`/v2/market/bars?day=${day}`);
+  // Sort by absolute move so the interesting rows float to the top.
+  const move = (bar: Bar): number =>
+    bar.prev_close_cents > 0
+      ? Math.abs(bar.close_cents - bar.prev_close_cents) / bar.prev_close_cents
+      : 0;
+  screenerRows = payload.bars.slice().sort((a, b) => move(b) - move(a));
+  renderScreener();
+}
+
+function renderScreener(): void {
+  const filter = byId<HTMLInputElement>("screener-filter").value.trim().toUpperCase();
+  const body = byId("screener-body");
+  body.replaceChildren();
+  const rows = filter
+    ? screenerRows.filter(
+        (row) => row.symbol.toUpperCase().includes(filter) || row.name.includes(filter),
+      )
+    : screenerRows;
+  // Cap the rendered rows: 5.5k table rows is a lot of DOM for a list nobody
+  // scrolls to the bottom of.
+  const shown = rows.slice(0, 300);
+  for (const row of shown) {
+    const tr = document.createElement("tr");
+    const change =
+      row.prev_close_cents > 0
+        ? ((row.close_cents - row.prev_close_cents) * 10_000) / row.prev_close_cents
+        : 0;
+    const cells: Array<[string, string]> = [
+      [row.symbol, ""],
+      [row.name, ""],
+      [money(row.close_cents), "num-col"],
+      [percent(change), "num-col " + (change >= 0 ? "pos" : "neg")],
+      [number(Math.round(row.volume_shares / 100)), "num-col"],
+    ];
+    for (const [text, cls] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (cls) td.className = cls;
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+  setTextById("screener-count", `${shown.length} / ${rows.length} 只`);
+  show(byId("screener-empty"), rows.length === 0);
+}
+
+// ---- data coverage ---------------------------------------------------------
+
+async function loadCoverage(): Promise<void> {
+  const days = await api<{
+    days: string[];
+    count: number;
+    latest_day: string | null;
+    latest_symbol_count: number;
+  }>("/v2/market/days");
+
+  setTextById("cov-days", number(days.count));
+  setTextById("cov-first", days.days[0] ?? "—");
+  setTextById("cov-last", days.latest_day ?? "—");
+  setTextById("cov-symbols", number(days.latest_symbol_count));
+
+  if (!days.latest_day) {
+    show(byId("gaps-empty"), true);
+    return;
+  }
+  const gaps = await api<{ bars: Bar[]; count: number }>(
+    `/v2/market/gaps?day=${days.latest_day}`,
+  );
+  const body = byId("gaps-body");
+  body.replaceChildren();
+  for (const row of gaps.bars.slice(0, 200)) {
+    const tr = document.createElement("tr");
+    const change =
+      row.prev_close_cents > 0
+        ? ((row.close_cents - row.prev_close_cents) * 10_000) / row.prev_close_cents
+        : 0;
+    const cells: Array<[string, string]> = [
+      [row.symbol, ""],
+      [row.name, ""],
+      [money(row.prev_close_cents), "num-col"],
+      [money(row.close_cents), "num-col"],
+      [percent(change), "num-col " + (change >= 0 ? "pos" : "neg")],
+    ];
+    for (const [text, cls] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (cls) td.className = cls;
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+  setTextById("gaps-count", `${gaps.count} 只`);
+  show(byId("gaps-empty"), gaps.count === 0);
+}
+
+// ---- wiring ----------------------------------------------------------------
+
+async function runToDay(day: string): Promise<void> {
+  const line = byTestId("run-result");
+  try {
+    const result = await post<RunResult>("/v2/account/run", { day });
+    render(result.account);
+    loadedViews.delete("trading/account");
+    line.textContent = describeRun(result);
+    line.dataset.state = result.rebalances.length > 0 ? "applied" : "held";
+    show(line, true);
+    announce(describeRun(result));
+  } catch (error) {
+    line.textContent = `推进失败：${errorDetail(error)}`;
+    line.dataset.state = "error";
+    show(line, true);
+  }
+}
+
 byId("create-form").addEventListener("submit", (event) => void createAccount(event as SubmitEvent));
 byTestId("run-submit").addEventListener("click", () => void submitRun());
-byTestId("refresh").addEventListener("click", () => void load());
+byId("advance-day-submit").addEventListener("click", () => {
+  const day = byId<HTMLInputElement>("advance-day").value;
+  if (day) void runToDay(day);
+});
+byTestId("refresh").addEventListener("click", () => {
+  loadedViews.clear();
+  void load().then(() => applyRoute(parseHash(location.hash)));
+});
 byTestId("retry").addEventListener("click", () => void load());
 byTestId("theme-toggle").addEventListener("click", theme);
 
-void load();
+for (const button of document.querySelectorAll<HTMLButtonElement>(".seg-btn")) {
+  button.addEventListener("click", () => {
+    curveSeries = (button.dataset.series as typeof curveSeries) ?? "total";
+    for (const other of document.querySelectorAll(".seg-btn")) {
+      other.classList.toggle("active", other === button);
+    }
+    drawCurve();
+  });
+}
+
+for (const chip of document.querySelectorAll<HTMLButtonElement>(".chip[data-range]")) {
+  chip.addEventListener("click", () => {
+    curveRange = chip.dataset.range ?? "all";
+    for (const other of document.querySelectorAll(".chip[data-range]")) {
+      other.classList.toggle("active", other === chip);
+    }
+    drawCurve();
+  });
+}
+
+// Load the account first, then start routing: `applyRoute` needs `current` to
+// decide whether a view can render or the create panel should show instead.
+void load().then(() => installRouter((route) => applyRoute(route)));
+

@@ -404,6 +404,34 @@ impl Store {
         )))
     }
 
+    /// Per-day equity for both slots, oldest first.
+    ///
+    /// Returns `(day, steady_cents, aggressive_cents)` for every day the
+    /// account has settled. This is the profit curve -- the single number the
+    /// whole system exists to produce, so it gets a first-class query rather
+    /// than being reconstructed from trades by the caller.
+    pub fn equity_curve(&self, account_id: &str) -> StoreResult<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT day,
+                    COALESCE(SUM(CASE WHEN slot='steady' THEN equity_cents END), 0),
+                    COALESCE(SUM(CASE WHEN slot='aggressive' THEN equity_cents END), 0)
+             FROM slot_equity_day WHERE account_id = ?1
+             GROUP BY day ORDER BY day",
+        )?;
+        let rows = stmt.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Every distinct trading day we hold, oldest first.
     pub fn bar_days(&self) -> StoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT DISTINCT day FROM bar ORDER BY day")?;
@@ -427,23 +455,38 @@ impl Store {
     /// Symbols whose close jumped more than `threshold_bps` from their own
     /// `prev_close` on `day`.
     ///
-    /// This is not a validation gate — nothing is rejected or blocked. It is a
+    /// This is not a validation gate -- nothing is rejected or blocked. It is a
     /// display hint: a gap this large is either an ex-dividend/split or bad
     /// data, and either way the K-line should not draw a solid bar across it.
-    /// Default threshold 1100 bps clears the ±10% limit plus rounding; ST
-    /// stocks (5% limit) will show up too, which is intended.
-    pub fn price_gaps(&self, day: &str, threshold_bps: i64) -> StoreResult<Vec<Bar>> {
+    ///
+    /// The caller decides the threshold. A single number does not work across
+    /// boards: ChiNext and STAR move up to 20% in a day by rule, so a 11%
+    /// threshold flags every limit-up as a corporate action. See
+    /// `gap_threshold_bps`.
+    pub fn price_gaps(&self, day: &str) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
              prev_close_cents,volume_shares,amount_cents,adjust,source \
              FROM bar WHERE day = ?1 AND prev_close_cents > 0 \
-             AND abs(close_cents - prev_close_cents) * 10000 / prev_close_cents > ?2 \
              ORDER BY symbol",
         )?;
-        let rows = stmt.query_map(params![day, threshold_bps], read_bar)?;
+        let rows = stmt.query_map([day], read_bar)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let bar = row?;
+            // Per-symbol threshold: a 20%-limit board closing +13% is an
+            // ordinary day, not a corporate action, while a main-board stock
+            // closing +13% cannot happen without one.
+            // Headroom above the limit: a stock closing exactly at its limit
+            // is an ordinary day, one closing *past* it cannot be. 500 bps of
+            // margin absorbs tick rounding without hiding real gaps.
+            let threshold = daily_limit_bps(&bar.symbol) + 500;
+            if (bar.close_cents - bar.prev_close_cents).abs() * 10_000
+                / bar.prev_close_cents
+                > threshold
+            {
+                out.push(bar);
+            }
         }
         Ok(out)
     }
@@ -1432,6 +1475,24 @@ impl Bar {
     }
 }
 
+/// Daily price limit for a symbol, in basis points.
+///
+/// A-shares cap daily moves per board: 30% Beijing, 20% ChiNext and STAR, 10%
+/// main board. Getting this right matters for the gap hint -- a flat 11%
+/// threshold flags every ChiNext limit-up as a corporate action, which is what
+/// it did on 2026-11-11 (34 symbols, nearly all ordinary moves).
+pub fn daily_limit_bps(symbol: &str) -> i64 {
+    let code = symbol.split('.').next().unwrap_or("");
+    let board = symbol.rsplit('.').next().unwrap_or("");
+    let prefix = &code[..code.len().min(3)];
+    match (board, prefix) {
+        ("BJ", _) => 3_000,
+        ("SH", "688") | ("SH", "689") => 2_000,
+        ("SZ", "300") | ("SZ", "301") => 2_000,
+        _ => 1_000,
+    }
+}
+
 fn read_bar(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bar> {
     Ok(Bar {
         symbol: row.get(0)?,
@@ -1599,18 +1660,24 @@ mod tests {
         let mut store = Store::open(":memory:").unwrap();
         store
             .upsert_bars(&[
-                // -10%: ordinary limit-down, under the default 1100 bps threshold.
+                // -10%: an ordinary main-board limit move, not a gap.
                 bar("600000.SH", "2026-11-10", 900, 1_000),
-                // -20%: beyond a main-board limit, so either ex-dividend or bad data.
+                // -20%: impossible for a main-board stock without a corporate
+                // action, so it is flagged.
                 bar("600036.SH", "2026-11-10", 800, 1_000),
-                // +5%: ST limit, but under the threshold.
+                // +5%: ordinary.
                 bar("000001.SZ", "2026-11-10", 1_050, 1_000),
+                // +15% on ChiNext: under its 20% limit, so ordinary.
+                bar("300750.SZ", "2026-11-10", 1_150, 1_000),
+                // +27% on ChiNext: past its 20% limit plus headroom, so
+                // flagged. (+25% sits inside the 20%+5% margin.)
+                bar("300752.SZ", "2026-11-10", 1_270, 1_000),
             ])
             .unwrap();
 
-        let gaps = store.price_gaps("2026-11-10", 1_100).unwrap();
+        let gaps = store.price_gaps("2026-11-10").unwrap();
         let symbols: Vec<&str> = gaps.iter().map(|b| b.symbol.as_str()).collect();
-        assert_eq!(symbols, vec!["600036.SH"]);
+        assert_eq!(symbols, vec!["300752.SZ", "600036.SH"]);
     }
 
     #[test]
