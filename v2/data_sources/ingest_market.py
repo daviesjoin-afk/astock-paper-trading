@@ -225,35 +225,104 @@ def fetch_package(day: str, *, timeout: float = 90.0) -> bytes:
 
 INSERT_SQL = """
 INSERT INTO bar(symbol,day,name,open_cents,high_cents,low_cents,close_cents,
-                prev_close_cents,volume_shares,amount_cents)
-VALUES(?,?,?,?,?,?,?,?,?,?)
+                prev_close_cents,volume_shares,amount_cents,adjust,source)
+VALUES(?,?,?,?,?,?,?,?,?,?,'none','tdx')
 ON CONFLICT(symbol,day) DO UPDATE SET
   name=excluded.name, open_cents=excluded.open_cents,
   high_cents=excluded.high_cents, low_cents=excluded.low_cents,
   close_cents=excluded.close_cents, prev_close_cents=excluded.prev_close_cents,
-  volume_shares=excluded.volume_shares, amount_cents=excluded.amount_cents
+  volume_shares=excluded.volume_shares, amount_cents=excluded.amount_cents,
+  adjust=excluded.adjust, source=excluded.source
 """
 
 
-def write_rows(db_path: Path, rows: list[Row]) -> int:
+def _write_prepared(connection: sqlite3.Connection, rows: list[Row]) -> int:
+    """Write one day's rows. Caller owns the connection and the transaction."""
+    connection.executemany(
+        INSERT_SQL,
+        [
+            (
+                r.symbol, r.day, r.name, r.open_cents, r.high_cents,
+                r.low_cents, r.close_cents, r.prev_close_cents,
+                r.volume_shares, r.amount_cents,
+            )
+            for r in rows
+        ],
+    )
+    return len(rows)
+
+
+def sync_schema(db_path: Path) -> None:
+    """Bring an existing database up to the columns this importer writes.
+
+    Mirrors `Store::ensure_bar_columns` in the Rust kernel so a database can
+    be bulk-loaded before the service has ever opened it.
+    """
     connection = sqlite3.connect(db_path, timeout=30)
     try:
-        connection.execute("PRAGMA journal_mode=WAL")
+        have = {row[1] for row in connection.execute("PRAGMA table_info(bar)")}
         with connection:
-            connection.executemany(
-                INSERT_SQL,
-                [
-                    (
-                        r.symbol, r.day, r.name, r.open_cents, r.high_cents,
-                        r.low_cents, r.close_cents, r.prev_close_cents,
-                        r.volume_shares, r.amount_cents,
-                    )
-                    for r in rows
-                ],
-            )
+            for name, ddl in (
+                ("adjust", "ALTER TABLE bar ADD COLUMN adjust TEXT NOT NULL DEFAULT 'none'"),
+                ("source", "ALTER TABLE bar ADD COLUMN source TEXT NOT NULL DEFAULT 'tdx'"),
+            ):
+                if name not in have:
+                    connection.execute(ddl)
     finally:
         connection.close()
-    return len(rows)
+
+
+def _fetch_and_parse(day: str) -> tuple[str, list[Row] | None, str | None, float]:
+    """Fetch and parse one day. Safe to run in a worker thread.
+
+    Returns (day, rows, error_code, seconds). Nothing here touches the
+    database, so all the network and CPU work can overlap and the writes stay
+    single-threaded.
+    """
+    started = time.monotonic()
+    try:
+        rows = parse_package(fetch_package(day), day.replace("-", ""))
+        return (day, rows, None, time.monotonic() - started)
+    except IngestError as exc:
+        return (day, None, exc.code, time.monotonic() - started)
+
+
+def ingest_days(
+    db_path: Path,
+    days: list[str],
+    *,
+    workers: int,
+    skip_missing: bool,
+) -> tuple[int, list[tuple[str, str]]]:
+    """Fetch, parse and store many days, `workers` downloads in flight.
+
+    Writes happen on the calling thread in date order so the final database
+    state does not depend on which download finished first.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    written = 0
+    failed: list[tuple[str, str]] = []
+    connection = sqlite3.connect(db_path, timeout=60)
+    connection.execute("PRAGMA journal_mode=WAL")
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for day, rows, error, seconds in pool.map(_fetch_and_parse, days):
+                if error is not None:
+                    if skip_missing and error == "package_not_published":
+                        print(f"{day}  skipped ({error})")
+                        continue
+                    print(f"{day}  FAILED  {error}", file=sys.stderr)
+                    failed.append((day, error))
+                    continue
+                assert rows is not None
+                with connection:
+                    count = _write_prepared(connection, rows)
+                written += count
+                print(f"{day}  wrote {count} rows in {seconds:.2f}s")
+    finally:
+        connection.close()
+    return written, failed
 
 
 def _expand_days(spec: str) -> list[str]:
@@ -289,6 +358,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip days with no package instead of failing (for range catch-up)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="concurrent download+parse threads (default 8; measured 7x over serial)",
+    )
     args = parser.parse_args(argv)
 
     if not args.day and not args.days:
@@ -300,36 +375,42 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     days = [args.day] if args.day else _expand_days(args.days)
-    written = 0
-    failed: list[tuple[str, str]] = []
 
-    for day in days:
-        started = time.monotonic()
-        try:
-            content = fetch_package(day)
-            rows = parse_package(content, day.replace("-", ""))
-        except IngestError as exc:
-            if args.skip_missing and exc.code == "package_not_published":
-                print(f"{day}  skipped ({exc.code})")
-                continue
-            print(f"{day}  FAILED  {exc}", file=sys.stderr)
-            failed.append((day, exc.code))
-            continue
+    if args.dry_run:
+        from concurrent.futures import ThreadPoolExecutor
 
-        elapsed = time.monotonic() - started
-        if args.dry_run:
-            print(f"{day}  parsed {len(rows)} rows in {elapsed:.2f}s (dry run)")
-        else:
-            count = write_rows(db_path, rows)
-            written += count
-            print(f"{day}  wrote {count} rows in {elapsed:.2f}s")
+        failed: list[tuple[str, str]] = []
+        parsed = 0
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            for day, rows, error, seconds in pool.map(_fetch_and_parse, days):
+                if error is not None:
+                    if args.skip_missing and error == "package_not_published":
+                        print(f"{day}  skipped ({error})")
+                        continue
+                    print(f"{day}  FAILED  {error}", file=sys.stderr)
+                    failed.append((day, error))
+                    continue
+                assert rows is not None
+                parsed += len(rows)
+                print(f"{day}  parsed {len(rows)} rows in {seconds:.2f}s (dry run)")
+        if failed:
+            print(f"\n{len(failed)} day(s) failed", file=sys.stderr)
+            return 1
+        print(f"\ntotal parsed: {parsed}")
+        return 0
 
+    sync_schema(db_path)
+    written, failed = ingest_days(
+        db_path, days, workers=args.workers, skip_missing=args.skip_missing
+    )
     if failed:
-        print(f"\n{len(failed)} day(s) failed", file=sys.stderr)
-        return 1
-    if not args.dry_run:
-        print(f"\ntotal written: {written}")
-    return 0
+        print(f"\n{len(failed)} day(s) failed:", file=sys.stderr)
+        for day, code in failed[:20]:
+            print(f"  {day}  {code}", file=sys.stderr)
+        if len(failed) > 20:
+            print(f"  ... and {len(failed) - 20} more", file=sys.stderr)
+    print(f"\ntotal written: {written}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

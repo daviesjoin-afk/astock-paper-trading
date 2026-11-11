@@ -25,6 +25,11 @@ install -m 0755 "$REPO/v2/scripts/daily_auto.sh" "$PREFIX/scripts/daily_auto.sh"
 install -m 0755 "$REPO/v2/scripts/daily_advance.sh" "$PREFIX/scripts/daily_advance.sh"
 install -m 0755 "$REPO/v2/scripts/db_tool.py" "$PREFIX/scripts/db_tool.py"
 
+# Data ingestion lives next to the scripts so cron can run it from $PREFIX
+# without a checkout on the host.
+install -m 0644 "$REPO/v2/data_sources/ingest_market.py" "$PREFIX/scripts/ingest_market.py"
+install -m 0644 "$REPO/v2/data_sources/realtime_quotes.py" "$PREFIX/scripts/realtime_quotes.py"
+
 install -m 0644 "$REPO/v2/deploy/astock-v2.service" "$UNIT_DIR/astock-v2-rewrite.service"
 if [ ! -f "$ENV_FILE" ]; then
   install -m 0640 -o root -g astock "$REPO/v2/deploy/astock-v2.env.example" "$ENV_FILE"

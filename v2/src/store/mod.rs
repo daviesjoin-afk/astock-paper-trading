@@ -333,6 +333,68 @@ impl Store {
         Ok(out)
     }
 
+    /// Unadjusted `(symbol, day, close_cents)` rows for one day.
+    ///
+    /// This is the settlement feed: forward-adjusted rows are excluded here
+    /// rather than at the call site so no caller can forget.
+    pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, day, close_cents FROM bar \
+             WHERE day = ?1 AND adjust = 'none' AND close_cents > 0 ORDER BY symbol",
+        )?;
+        let rows = stmt.query_map([day], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Unadjusted `(symbol, day, close_cents)` rows across an inclusive range.
+    pub fn unadjusted_closes_range(
+        &self,
+        from_day: &str,
+        to_day: &str,
+    ) -> StoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, day, close_cents FROM bar \
+             WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' AND close_cents > 0 \
+             ORDER BY symbol, day",
+        )?;
+        let rows = stmt.query_map(params![from_day, to_day], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Build a `PriceSet` over the bar table for a settlement window.
+    ///
+    /// Returns `None` when the window has no unadjusted rows, so the caller
+    /// reports "no data" instead of settling against an empty set.
+    pub fn price_set_from_bars(
+        &self,
+        symbol: &str,
+        coverage_start: &str,
+        coverage_end: &str,
+    ) -> StoreResult<Option<crate::domain::PriceSet>> {
+        let rows = self.unadjusted_closes_range(coverage_start, coverage_end)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::domain::PriceSet::from_bars(
+            &rows,
+            symbol,
+            coverage_start,
+            coverage_end,
+        )))
+    }
+
     /// Every distinct trading day we hold, oldest first.
     pub fn bar_days(&self) -> StoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT DISTINCT day FROM bar ORDER BY day")?;

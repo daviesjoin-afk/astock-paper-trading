@@ -28,6 +28,84 @@ pub struct PriceEntry {
 }
 
 impl PriceSet {
+    /// Build a settlement view over the `bar` table so the kernel can settle
+    /// against whole-market data instead of a hand-published rectangle.
+    ///
+    /// Only `adjust = "none"` rows are eligible. Forward-adjusted (qfq) rows
+    /// have had ex-dividend events from the future folded into their history,
+    /// so settling on them would book gains and costs nobody could have
+    /// realised at the time.
+    ///
+    /// Symbols missing a close on any day in the window are dropped entirely
+    /// rather than carried with a stale price -- a hole in a series is not a
+    /// halt, and inventing a price for it is exactly the failure mode the
+    /// reviewed-set model existed to prevent.
+    ///
+    /// Input is `(symbol, day, close_cents)` already filtered to the window.
+    /// Keeping it a tuple avoids the domain depending on the storage type.
+    pub fn from_bars(
+        bars: &[(String, String, i64)],
+        price_set_id: impl Into<String>,
+        coverage_start: &str,
+        coverage_end: &str,
+    ) -> Self {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let in_window = bars
+            .iter()
+            .filter(|(_, day, close)| {
+                day.as_str() >= coverage_start
+                    && day.as_str() <= coverage_end
+                    && *close > 0
+            })
+            .collect::<Vec<_>>();
+
+        // The window's day set comes from *all* input rows, not just the
+        // positive ones. Deriving it from the filtered set would silently
+        // shrink the window when a whole day is missing or zero-priced, and
+        // then every remaining symbol would look complete.
+        let days: BTreeSet<&str> = bars
+            .iter()
+            .map(|(_, day, _)| day.as_str())
+            .filter(|day| *day >= coverage_start && *day <= coverage_end)
+            .collect();
+        let mut by_symbol: BTreeMap<&str, BTreeMap<&str, i64>> = BTreeMap::new();
+        for (symbol, day, close) in &in_window {
+            by_symbol
+                .entry(symbol.as_str())
+                .or_default()
+                .insert(day.as_str(), *close);
+        }
+
+        let mut entries = Vec::new();
+        for (symbol, closes) in by_symbol {
+            // Drop the symbol unless it has a close on every day in the window.
+            if closes.len() != days.len() {
+                continue;
+            }
+            for (day, price_cents) in closes {
+                entries.push(PriceEntry {
+                    symbol: symbol.to_string(),
+                    day: day.to_string(),
+                    price_cents,
+                    source: "bar/tdx".into(),
+                    observed_at: format!("{day}T15:00:00+08:00"),
+                });
+            }
+        }
+
+        Self {
+            schema_version: 1,
+            price_set_id: price_set_id.into(),
+            market_data_pack_id: "bar".into(),
+            trust: "reviewed".into(),
+            coverage_start: coverage_start.to_string(),
+            coverage_end: coverage_end.to_string(),
+            source_digest: digest_of(&entries),
+            entries,
+        }
+    }
+
     /// Reject anything the paper ledger cannot use safely. Loading is not a
     /// repair step: malformed coverage, duplicate observations and non-positive
     /// prices fail closed instead of being skipped or interpolated.
@@ -142,6 +220,40 @@ impl PriceSet {
     }
 }
 
+/// Deterministic 64-hex-digit digest over the sorted entry list.
+///
+/// `PriceSet::validate` requires a 64-character hex `source_digest`, and it
+/// exists so a price set can be identified by its content. This is FNV-1a
+/// expanded to 32 bytes by re-hashing with a rotating offset -- not a
+/// cryptographic hash, and not treated as one. Its only job is to make two
+/// differently-populated sets compare unequal and identical ones compare equal.
+fn digest_of(entries: &[PriceEntry]) -> String {
+    let mut state: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8], state: &mut u64| {
+        for byte in bytes {
+            *state ^= u64::from(*byte);
+            *state = state.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    // Entries are already emitted in (symbol, day) order from the BTreeMap.
+    for entry in entries {
+        feed(entry.symbol.as_bytes(), &mut state);
+        feed(b"|", &mut state);
+        feed(entry.day.as_bytes(), &mut state);
+        feed(b"|", &mut state);
+        feed(&entry.price_cents.to_le_bytes(), &mut state);
+    }
+    let mut out = String::with_capacity(64);
+    let mut round = state;
+    for index in 0..4 {
+        // Mix the round index so the four 16-digit blocks are not identical.
+        round ^= (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        round = round.wrapping_mul(0x0000_0100_0000_01b3).rotate_left(17);
+        out.push_str(&format!("{round:016x}"));
+    }
+    out
+}
+
 fn is_day(value: &str) -> bool {
     value.len() == 10
         && value.as_bytes()[4] == b'-'
@@ -151,4 +263,74 @@ fn is_day(value: &str) -> bool {
             .enumerate()
             .all(|(index, ch)| index == 4 || index == 7 || ch.is_ascii_digit())
         && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
+#[cfg(test)]
+mod from_bars_tests {
+    use super::*;
+
+    fn row(symbol: &str, day: &str, close: i64) -> (String, String, i64) {
+        (symbol.to_string(), day.to_string(), close)
+    }
+
+    #[test]
+    fn builds_entries_for_complete_symbols() {
+        let rows = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("000001.SZ", "2026-11-09", 1_186),
+            row("000001.SZ", "2026-11-10", 1_190),
+        ];
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
+        set.validate().expect("valid price set");
+        assert_eq!(set.days(), vec!["2026-11-09", "2026-11-10"]);
+        assert_eq!(set.symbols(), vec!["000001.SZ", "600000.SH"]);
+        assert_eq!(set.contains("600000.SH", "2026-11-10"), Some(1_020));
+    }
+
+    #[test]
+    fn drops_symbols_with_a_hole() {
+        // A missing close is not a halt. Carrying the previous price forward
+        // would invent a trade that never happened, so the symbol is dropped.
+        let rows = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("000001.SZ", "2026-11-09", 1_186),
+            // 000001.SZ has no 2026-11-10 close
+        ];
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
+        assert_eq!(set.symbols(), vec!["600000.SH"]);
+    }
+
+    #[test]
+    fn respects_the_coverage_window() {
+        let rows = vec![
+            row("600000.SH", "2026-11-06", 999),  // before window
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("600000.SH", "2026-11-11", 1_030), // after window
+        ];
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
+        assert_eq!(set.days(), vec!["2026-11-09", "2026-11-10"]);
+        assert_eq!(set.contains("600000.SH", "2026-11-06"), None);
+        assert_eq!(set.contains("600000.SH", "2026-11-11"), None);
+    }
+
+    #[test]
+    fn drops_non_positive_closes() {
+        let rows = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 0),
+        ];
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
+        // The zero leaves a hole, so the symbol cannot be settled.
+        assert!(set.symbols().is_empty());
+    }
+
+    #[test]
+    fn empty_input_produces_empty_set() {
+        let set = PriceSet::from_bars(&[], "t", "2026-11-09", "2026-11-10");
+        assert!(set.symbols().is_empty());
+        assert!(set.days().is_empty());
+    }
 }

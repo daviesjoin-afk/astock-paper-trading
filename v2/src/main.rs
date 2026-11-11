@@ -283,14 +283,52 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
             Json(json!({ "error": "account_not_found" })),
         ));
     };
-    let Some(set) = load_price_sets(&price_sets_dir()).map_err(api_error)? else {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "no_reviewed_price_set" })),
-        ));
+    // Prefer the whole-market bar table; fall back to a published reviewed
+    // price set only when the bar table has nothing. This keeps the two-symbol
+    // reviewed path working while the 5.6k-symbol bar feed becomes the norm.
+    let set = match price_set_from_store(&db)? {
+        Some(set) => set,
+        None => match load_price_sets(&price_sets_dir()).map_err(api_error)? {
+            Some(set) => set,
+            None => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "no_price_data",
+                                 "detail": "neither the bar table nor a reviewed price set has rows" })),
+                ));
+            }
+        },
     };
     let day = request.day.unwrap_or_else(|| set.coverage_end.clone());
     response(db.advance(&spec, &set, &day).map_err(api_error)?)
+}
+
+/// Settlement view built from the bar table, or `None` when it is empty.
+///
+/// The window starts at the account's last settled day (or the earliest bar
+/// we hold) so a long-running account does not rebuild every historical close
+/// on each advance.
+fn price_set_from_store(db: &Store) -> Result<Option<astock_v2::domain::PriceSet>, (StatusCode, Json<Value>)> {
+    let days = db.bar_days().map_err(api_error)?;
+    let Some(last_day) = days.last() else {
+        return Ok(None);
+    };
+    let last_settled = match db.account().map_err(api_error)? {
+        Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
+        None => None,
+    };
+    // Start one day after the last settlement; the kernel advances strictly
+    // forward and re-running a day is already idempotent.
+    let start = match last_settled {
+        Some(day) => days
+            .iter()
+            .find(|candidate| candidate.as_str() > day.as_str())
+            .cloned()
+            .unwrap_or_else(|| last_day.clone()),
+        None => days.first().cloned().unwrap_or_else(|| last_day.clone()),
+    };
+    db.price_set_from_bars("bar-table", &start, last_day)
+        .map_err(api_error)
 }
 
 #[tokio::main]
