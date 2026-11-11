@@ -27,6 +27,94 @@ pub struct PriceEntry {
     pub observed_at: String,
 }
 
+/// A `PriceSet` with an index over `(symbol, day)`.
+///
+/// `PriceSet::contains` scans `entries` linearly. That is fine for a reviewed
+/// rectangle of a handful of symbols and hopeless for the whole market: a
+/// 930-day, 5.3k-symbol set is ~4M entries, and settling one day asks for a
+/// price per held symbol. Linear lookup turns a settlement pass into an
+/// O(days x symbols x entries) crawl -- measured at >5 minutes of solid CPU
+/// for a 2.5-year advance before this existed.
+///
+/// The wire format is unchanged; this is a read-side index built once.
+#[derive(Clone, Debug)]
+pub struct IndexedPriceSet {
+    set: PriceSet,
+    by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
+    by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
+}
+
+impl IndexedPriceSet {
+    pub fn new(set: PriceSet) -> Self {
+        let mut by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
+            std::collections::BTreeMap::new();
+        let mut by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
+            std::collections::BTreeMap::new();
+        for entry in &set.entries {
+            by_day
+                .entry(entry.day.clone())
+                .or_default()
+                .insert(entry.symbol.clone(), entry.price_cents);
+            by_symbol
+                .entry(entry.symbol.clone())
+                .or_default()
+                .insert(entry.day.clone(), entry.price_cents);
+        }
+        Self { set, by_day, by_symbol }
+    }
+
+    pub fn contains(&self, symbol: &str, day: &str) -> Option<i64> {
+        self.by_day
+            .get(day)
+            .and_then(|closes| closes.get(symbol))
+            .copied()
+    }
+
+    /// All closes for one day, as symbol -> price. O(1) in the number of days.
+    pub fn closes_on(&self, day: &str) -> std::collections::BTreeMap<String, i64> {
+        self.by_day.get(day).cloned().unwrap_or_default()
+    }
+
+    /// One symbol's close history up to `through_day`, oldest first.
+    ///
+    /// Served from a per-symbol index instead of scanning every entry. The
+    /// strategy needs a symbol's full history to compute a moving average, so
+    /// this is called once per symbol per settled day; scanning ~4M entries
+    /// each time is what made a multi-year advance take minutes of solid CPU.
+    pub fn bars_for(&self, symbol: &str, through_day: &str) -> Vec<super::Bar> {
+        self.by_symbol
+            .get(symbol)
+            .map(|series| {
+                series
+                    .iter()
+                    .filter(|(day, _)| day.as_str() <= through_day)
+                    .map(|(day, price)| super::Bar {
+                        symbol: symbol.to_string(),
+                        day: day.clone(),
+                        close_cents: *price,
+                        volume: 0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set(&self) -> &PriceSet {
+        &self.set
+    }
+
+    pub fn into_set(self) -> PriceSet {
+        self.set
+    }
+}
+
+impl std::ops::Deref for IndexedPriceSet {
+    type Target = PriceSet;
+    fn deref(&self) -> &PriceSet {
+        &self.set
+    }
+}
+
 impl PriceSet {
     /// Build a settlement view over the `bar` table so the kernel can settle
     /// against whole-market data instead of a hand-published rectangle.
@@ -36,13 +124,19 @@ impl PriceSet {
     /// so settling on them would book gains and costs nobody could have
     /// realised at the time.
     ///
-    /// Symbols missing a close on any day in the window are dropped entirely
-    /// rather than carried with a stale price -- a hole in a series is not a
-    /// halt, and inventing a price for it is exactly the failure mode the
-    /// reviewed-set model existed to prevent.
+    /// Which symbols are eligible, and over what sub-window.
     ///
-    /// Input is `(symbol, day, close_cents)` already filtered to the window.
-    /// Keeping it a tuple avoids the domain depending on the storage type.
+    /// The reviewed-set model required a complete rectangle: every symbol had
+    /// a close on every declared day, or the whole batch was rejected. At two
+    /// symbols that is fine. Across the whole market it is impossible --
+    /// measured on the real feed, of 5573 symbols only **one** has a close on
+    /// all 930 trading days, because listings, delistings and suspensions are
+    /// ordinary events.
+    ///
+    /// So completeness is judged per symbol over the span *it* covers, and a
+    /// symbol joins the set from its first close to its last. Days outside a
+    /// symbol's own span are not holes; days inside it are, and a symbol with
+    /// an interior hole is dropped rather than carried at a stale price.
     pub fn from_bars(
         bars: &[(String, String, i64)],
         price_set_id: impl Into<String>,
@@ -60,15 +154,18 @@ impl PriceSet {
             })
             .collect::<Vec<_>>();
 
-        // The window's day set comes from *all* input rows, not just the
-        // positive ones. Deriving it from the filtered set would silently
-        // shrink the window when a whole day is missing or zero-priced, and
-        // then every remaining symbol would look complete.
-        let days: BTreeSet<&str> = bars
-            .iter()
-            .map(|(_, day, _)| day.as_str())
-            .filter(|day| *day >= coverage_start && *day <= coverage_end)
-            .collect();
+        // Every trading day the window actually contains, taken from all input
+        // rows. Deriving this from the filtered set would shrink the window
+        // whenever a whole day is missing and make survivors look complete.
+        let market_days: Vec<&str> = {
+            let set: BTreeSet<&str> = bars
+                .iter()
+                .map(|(_, day, _)| day.as_str())
+                .filter(|day| *day >= coverage_start && *day <= coverage_end)
+                .collect();
+            set.into_iter().collect()
+        };
+
         let mut by_symbol: BTreeMap<&str, BTreeMap<&str, i64>> = BTreeMap::new();
         for (symbol, day, close) in &in_window {
             by_symbol
@@ -79,8 +176,22 @@ impl PriceSet {
 
         let mut entries = Vec::new();
         for (symbol, closes) in by_symbol {
-            // Drop the symbol unless it has a close on every day in the window.
-            if closes.len() != days.len() {
+            let Some(first) = closes.keys().next() else {
+                continue;
+            };
+            let Some(last) = closes.keys().next_back() else {
+                continue;
+            };
+            // Days this symbol is expected to have traded on: market days
+            // inside its own [first, last] span.
+            let expected: Vec<&str> = market_days
+                .iter()
+                .copied()
+                .filter(|day| *day >= *first && *day <= *last)
+                .collect();
+            if expected.len() != closes.len() {
+                // Interior hole: a close is missing on a day the market
+                // traded and this symbol was already live. Drop it.
                 continue;
             }
             for (day, price_cents) in closes {
@@ -196,22 +307,6 @@ impl PriceSet {
         days
     }
 
-    pub fn bars_for(&self, symbol: &str, through_day: &str) -> Vec<super::Bar> {
-        let mut bars: Vec<super::Bar> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.symbol == symbol && entry.day.as_str() <= through_day)
-            .map(|entry| super::Bar {
-                symbol: entry.symbol.clone(),
-                day: entry.day.clone(),
-                close_cents: entry.price_cents,
-                volume: 0,
-            })
-            .collect();
-        bars.sort_by(|left, right| left.day.cmp(&right.day));
-        bars
-    }
-
     pub fn symbols(&self) -> Vec<String> {
         let mut symbols: Vec<String> = self.entries.iter().map(|entry| entry.symbol.clone()).collect();
         symbols.sort();
@@ -229,7 +324,7 @@ impl PriceSet {
 /// differently-populated sets compare unequal and identical ones compare equal.
 fn digest_of(entries: &[PriceEntry]) -> String {
     let mut state: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut feed = |bytes: &[u8], state: &mut u64| {
+    let feed = |bytes: &[u8], state: &mut u64| {
         for byte in bytes {
             *state ^= u64::from(*byte);
             *state = state.wrapping_mul(0x0000_0100_0000_01b3);
@@ -289,16 +384,60 @@ mod from_bars_tests {
     }
 
     #[test]
-    fn drops_symbols_with_a_hole() {
+    fn drops_symbols_with_an_interior_hole() {
         // A missing close is not a halt. Carrying the previous price forward
         // would invent a trade that never happened, so the symbol is dropped.
         let rows = vec![
             row("600000.SH", "2026-11-09", 1_010),
             row("600000.SH", "2026-11-10", 1_020),
             row("000001.SZ", "2026-11-09", 1_186),
-            // 000001.SZ has no 2026-11-10 close
+            // 000001.SZ is missing 2026-11-10 but trades again on 11-11, so
+            // the hole is interior and the symbol cannot be settled.
+            row("000001.SZ", "2026-11-11", 1_190),
         ];
-        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-11");
+        assert_eq!(set.symbols(), vec!["600000.SH"]);
+    }
+
+    #[test]
+    fn keeps_a_symbol_that_lists_mid_window() {
+        // Ordinary listings must not be mistaken for holes. This symbol simply
+        // was not trading before 2026-11-10.
+        let rows = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("600000.SH", "2026-11-11", 1_030),
+            row("301999.SZ", "2026-11-10", 2_500),
+            row("301999.SZ", "2026-11-11", 2_600),
+        ];
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-11");
+        assert_eq!(set.symbols(), vec!["301999.SZ", "600000.SH"]);
+        assert_eq!(set.contains("301999.SZ", "2026-11-09"), None);
+        assert_eq!(set.contains("301999.SZ", "2026-11-11"), Some(2_600));
+    }
+
+    #[test]
+    fn drops_a_symbol_that_delists_mid_window_with_a_gap() {
+        // Ends early with no gap: kept. Ends early *and* skips days it should
+        // have traded: dropped.
+        let clean = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("600000.SH", "2026-11-11", 1_030),
+            row("600999.SH", "2026-11-09", 900),
+        ];
+        let set = PriceSet::from_bars(&clean, "t", "2026-11-09", "2026-11-11");
+        assert_eq!(set.symbols(), vec!["600000.SH", "600999.SH"]);
+
+        let gapped = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("600000.SH", "2026-11-11", 1_030),
+            row("600999.SH", "2026-11-09", 900),
+            // skips 11-10 (market traded) then appears on 11-11
+            row("600999.SH", "2026-11-11", 910),
+        ];
+        let set = PriceSet::from_bars(&gapped, "t", "2026-11-09", "2026-11-11");
         assert_eq!(set.symbols(), vec!["600000.SH"]);
     }
 
@@ -317,14 +456,32 @@ mod from_bars_tests {
     }
 
     #[test]
-    fn drops_non_positive_closes() {
+    fn a_zero_close_is_a_hole_not_a_price() {
+        // 0 is what a halted symbol often reports. Treating it as a price
+        // would book a -100% move, so it must be a hole. Here the zero sits
+        // between two real closes, making the hole interior -> dropped.
         let rows = vec![
             row("600000.SH", "2026-11-09", 1_010),
             row("600000.SH", "2026-11-10", 0),
+            row("600000.SH", "2026-11-11", 1_020),
         ];
-        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
-        // The zero leaves a hole, so the symbol cannot be settled.
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-11");
         assert!(set.symbols().is_empty());
+    }
+
+    #[test]
+    fn a_trailing_zero_close_is_also_a_hole() {
+        // The zero is the last row, so it defines the symbol's span. Excluding
+        // it from the span would silently accept a symbol whose final day has
+        // no usable price, which is how a halted position gets valued at 0.
+        let rows = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            row("600000.SH", "2026-11-11", 0),
+        ];
+        let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-11");
+        assert_eq!(set.symbols(), vec!["600000.SH"]);
+        assert_eq!(set.contains("600000.SH", "2026-11-11"), None);
     }
 
     #[test]

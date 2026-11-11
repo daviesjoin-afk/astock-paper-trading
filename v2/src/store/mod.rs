@@ -10,11 +10,20 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{
     apply_buy, apply_sell, drawdown_bps, fees_cents, initial_split, orders_for_day, propose, score,
-    settle_overnight, signal, AccountSpec, AccountView, AdvanceResult, DayRun, PositionView,
-    PriceCoverage, PriceSet, Rebalance, RuleError, SlotBook, SlotSpec, SlotView, StrategyId, Trade,
+    settle_overnight, signal, AccountSpec, AccountView, AdvanceResult, DayRun, IndexedPriceSet,
+    PositionView, PriceCoverage, PriceSet, Rebalance, RuleError, SlotBook, SlotSpec, SlotView,
+    StrategyId, Trade,
 };
 
 pub const SCHEMA_VERSION: i64 = 2;
+
+/// How many trailing closes a strategy needs to decide today.
+///
+/// The longest requirement in `domain::strategy` is 61 closes (a 60-day mean
+/// plus the latest bar). Anything older cannot change the signal, so there is
+/// no reason to carry it through the moving-average code -- on a 5.3k-symbol
+/// universe that difference is ~4M rows versus ~320k per settled day.
+pub const SIGNAL_LOOKBACK_DAYS: usize = 61;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -548,8 +557,11 @@ impl Store {
 
         let mut all_trades = Vec::new();
         let mut all_rebalances = Vec::new();
+        // Build the lookup index once for the whole advance. Rebuilding it per
+        // day would re-walk millions of entries on every iteration.
+        let index_set = IndexedPriceSet::new(set.clone());
         for day in &days {
-            let run = self.run_day(spec, set, day)?;
+            let run = self.run_day_indexed(spec, set, &index_set, day)?;
             all_trades.extend(run.trades);
             all_rebalances.extend(run.rebalance);
         }
@@ -566,9 +578,61 @@ impl Store {
         })
     }
 
+    /// Signals for one slot on one day, over a bounded lookback window.
+    ///
+    /// Two things keep this affordable on a 5.3k-symbol universe:
+    ///
+    /// 1. **Bounded history.** The strategies need at most 61 closes (a 60-day
+    ///    average plus the latest bar). Asking for the whole series would drag
+    ///    ~930 rows per symbol through the moving-average code for no gain.
+    ///    `SIGNAL_LOOKBACK_DAYS` is the window actually needed.
+    /// 2. **Candidate filter.** A symbol is only worth a signal if it has a
+    ///    close on `day` (otherwise it cannot be traded today). Symbols already
+    ///    held are always included so exits and adds still see them.
+    ///
+    /// Everything else -- listing dates, delistings, suspensions -- shows up
+    /// as a short or missing series, which `signal` already handles by
+    /// returning `None`.
+    fn signals_for_day<'a>(
+        &self,
+        slot: StrategyId,
+        set: &'a IndexedPriceSet,
+        day: &str,
+        closes: &'a BTreeMap<String, i64>,
+        held: impl Iterator<Item = &'a str>,
+    ) -> StoreResult<Vec<(String, Option<String>)>> {
+        let mut candidates: BTreeSet<&'a str> = closes.keys().map(String::as_str).collect();
+        candidates.extend(held);
+
+        let mut signals = Vec::with_capacity(candidates.len());
+        for symbol in candidates {
+            let mut bars = set.bars_for(symbol, day);
+            if bars.len() > SIGNAL_LOOKBACK_DAYS {
+                bars.drain(..bars.len() - SIGNAL_LOOKBACK_DAYS);
+            }
+            signals.push((symbol.to_string(), signal(slot, &bars)?));
+        }
+        Ok(signals)
+    }
+
     /// Process exactly one day. Re-running a settled day returns its stored
     /// fills and rebalance without creating another trade.
     pub fn run_day(&mut self, spec: &AccountSpec, set: &PriceSet, day: &str) -> StoreResult<DayRun> {
+        // Build the index once per day rather than per lookup. `advance` calls
+        // this in a loop, so the index is rebuilt per day -- still far cheaper
+        // than the linear scans it replaces, and it keeps `run_day` usable on
+        // its own for a single-day settle.
+        let index = IndexedPriceSet::new(set.clone());
+        self.run_day_indexed(spec, set, &index, day)
+    }
+
+    fn run_day_indexed(
+        &mut self,
+        spec: &AccountSpec,
+        set: &PriceSet,
+        index_set: &IndexedPriceSet,
+        day: &str,
+    ) -> StoreResult<DayRun> {
         validate_day(set, day)?;
         if let Some(last) = self.last_settled_day(&spec.account_id)?
             && day < last.as_str()
@@ -597,12 +661,18 @@ impl Store {
             .enumerate()
         {
             let book = &books[index];
-            let symbols = set.symbols();
-            let mut signals = Vec::with_capacity(symbols.len());
-            for symbol in &symbols {
-                signals.push((symbol.clone(), signal(slot, &set.bars_for(symbol, day))?));
-            }
-            let closes = closes_for(set, day);
+            let closes = closes_for_indexed(index_set, day);
+            // Only symbols that can actually produce a signal need their
+            // history replayed: those with a position to manage, plus those
+            // with a close today. Computing a signal for a symbol that has no
+            // bar on `day` cannot change the outcome.
+            let signals = self.signals_for_day(
+                slot,
+                index_set,
+                day,
+                &closes,
+                book.positions.iter().map(|position| position.symbol.as_str()),
+            )?;
             let budget = self.slot_equity(&spec.account_id, slot)?;
             let orders = orders_for_day(
                 slot,
@@ -620,7 +690,7 @@ impl Store {
                     .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
                 planned.push((slot, order, price));
             }
-            let _ = value_book(book, set, day)?;
+            let _ = value_book_indexed(book, index_set, day)?;
         }
 
         for (slot, order, price) in &planned {
@@ -1112,6 +1182,34 @@ fn closes_for(set: &PriceSet, day: &str) -> BTreeMap<String, i64> {
         .filter(|entry| entry.day == day)
         .map(|entry| (entry.symbol.clone(), entry.price_cents))
         .collect()
+}
+
+/// Same as `closes_for` but served from the day index instead of a full scan.
+///
+/// A whole-market set is ~4M entries; rebuilding a day's close map by scanning
+/// all of them, once per trading day settled, is the difference between a
+/// settlement pass that finishes and one that does not.
+fn closes_for_indexed(index: &IndexedPriceSet, day: &str) -> BTreeMap<String, i64> {
+    index.closes_on(day)
+}
+
+fn value_book_indexed(
+    book: &SlotBook,
+    index: &IndexedPriceSet,
+    day: &str,
+) -> StoreResult<i64> {
+    let mut market = 0i64;
+    for position in &book.positions {
+        let price = index
+            .contains(&position.symbol, day)
+            .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
+        market = market
+            .checked_add(price * position.quantity)
+            .ok_or_else(|| StoreError::Rules(RuleError("amount_overflow".into())))?;
+    }
+    book.cash_cents
+        .checked_add(market)
+        .ok_or_else(|| StoreError::Rules(RuleError("amount_overflow".into())))
 }
 
 fn value_book(book: &SlotBook, set: &PriceSet, day: &str) -> StoreResult<i64> {

@@ -93,9 +93,25 @@ async fn account(State(state): State<Shared>) -> ApiResult {
             Json(json!({ "error": "account_not_found" })),
         ));
     };
-    let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
     let day = db.last_settled_day(&spec.account_id).map_err(api_error)?;
+    let set = valuation_set(&db, day.as_deref())?;
     response(db.view(&spec, set.as_ref(), day.as_deref()).map_err(api_error)?)
+}
+
+/// One day of closes, for valuing existing positions.
+///
+/// Loading a settlement window here would pull months of bars just to price a
+/// handful of positions; `view` only reads the day it is asked about.
+fn valuation_set(
+    db: &Store,
+    day: Option<&str>,
+) -> Result<Option<astock_v2::domain::PriceSet>, (StatusCode, Json<Value>)> {
+    if let Some(day) = day
+        && let Some(set) = db.price_set_from_bars("bar-table", day, day).map_err(api_error)?
+    {
+        return Ok(Some(set));
+    }
+    load_price_sets(&price_sets_dir()).map_err(api_error)
 }
 
 async fn positions(State(state): State<Shared>) -> ApiResult {
@@ -106,8 +122,8 @@ async fn positions(State(state): State<Shared>) -> ApiResult {
             Json(json!({ "error": "account_not_found" })),
         ));
     };
-    let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
     let day = db.last_settled_day(&spec.account_id).map_err(api_error)?;
+    let set = valuation_set(&db, day.as_deref())?;
     let view = db.view(&spec, set.as_ref(), day.as_deref()).map_err(api_error)?;
     response(view.positions)
 }
@@ -286,7 +302,7 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
     // Prefer the whole-market bar table; fall back to a published reviewed
     // price set only when the bar table has nothing. This keeps the two-symbol
     // reviewed path working while the 5.6k-symbol bar feed becomes the norm.
-    let set = match price_set_from_store(&db)? {
+    let set = match price_set_from_store(&db, request.day.as_deref())? {
         Some(set) => set,
         None => match load_price_sets(&price_sets_dir()).map_err(api_error)? {
             Some(set) => set,
@@ -303,31 +319,142 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
     response(db.advance(&spec, &set, &day).map_err(api_error)?)
 }
 
+/// Diagnostic: how many symbols the settlement view would actually contain.
+///
+/// Read-only. Exists because "no_price_data" from /account/run is otherwise
+/// indistinguishable from "the bar table is empty" -- this says which.
+async fn settlement_preview(
+    State(state): State<Shared>,
+    Query(query): Query<BarsQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    let days = db.bar_days().map_err(api_error)?;
+    if days.is_empty() {
+        return response(json!({ "bar_days": 0, "symbols": 0, "entries": 0 }));
+    }
+    let last_settled = match db.account().map_err(api_error)? {
+        Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
+        None => None,
+    };
+    let set = price_set_from_store(&db, query.day.as_deref())?;
+    response(json!({
+        "bar_days": days.len(),
+        "first_bar_day": days.first(),
+        "last_bar_day": days.last(),
+        "last_settled_day": last_settled,
+        "window": set.as_ref().map(|s| (s.coverage_start.clone(), s.coverage_end.clone())),
+        "symbols": set.as_ref().map(|s| s.symbols().len()).unwrap_or(0),
+        "entries": set.as_ref().map(|s| s.entries.len()).unwrap_or(0),
+        "max_settle_days_per_call": MAX_SETTLE_DAYS_PER_CALL,
+        "warmup_days": SETTLEMENT_WARMUP_DAYS,
+    }))
+}
+
 /// Settlement view built from the bar table, or `None` when it is empty.
 ///
 /// The window starts at the account's last settled day (or the earliest bar
 /// we hold) so a long-running account does not rebuild every historical close
 /// on each advance.
-fn price_set_from_store(db: &Store) -> Result<Option<astock_v2::domain::PriceSet>, (StatusCode, Json<Value>)> {
+/// Trading days of history loaded per advance, on top of the days being
+/// settled.
+///
+/// The strategies need at most 61 trailing closes; 120 calendar-ish trading
+/// days leaves comfortable headroom for suspensions without dragging years of
+/// bars into memory on every request. Long-history work (a real backtest) is a
+/// separate job, not something a single advance should quietly pay for.
+const SETTLEMENT_WARMUP_DAYS: usize = 120;
+
+/// Cap on how many days one `advance` will settle.
+///
+/// A request that asks to settle three years in one shot is almost always a
+/// mistake, and it would build a settlement view far larger than the rolling
+/// window this is designed around. Catch-up runs should be issued per period.
+const MAX_SETTLE_DAYS_PER_CALL: usize = 260;
+
+fn price_set_from_store(
+    db: &Store,
+    through: Option<&str>,
+) -> Result<Option<astock_v2::domain::PriceSet>, (StatusCode, Json<Value>)> {
     let days = db.bar_days().map_err(api_error)?;
-    let Some(last_day) = days.last() else {
+    let Some(last_day) = days.last().cloned() else {
         return Ok(None);
     };
+
+    // The window ends at the requested day when it is one we hold, otherwise
+    // at the latest day available.
+    let end = match through {
+        Some(day) if days.iter().any(|candidate| candidate == day) => day.to_string(),
+        Some(day) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "day_not_in_bar_table", "day": day,
+                             "latest": last_day })),
+            ));
+        }
+        None => last_day,
+    };
+
     let last_settled = match db.account().map_err(api_error)? {
         Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
         None => None,
     };
-    // Start one day after the last settlement; the kernel advances strictly
-    // forward and re-running a day is already idempotent.
-    let start = match last_settled {
+
+    // The days this call will actually settle: everything after the last
+    // settlement up to `end`.
+    let settle_from = match &last_settled {
         Some(day) => days
             .iter()
             .find(|candidate| candidate.as_str() > day.as_str())
-            .cloned()
-            .unwrap_or_else(|| last_day.clone()),
-        None => days.first().cloned().unwrap_or_else(|| last_day.clone()),
+            .cloned(),
+        None => days.first().cloned(),
     };
-    db.price_set_from_bars("bar-table", &start, last_day)
+    let Some(settle_from) = settle_from else {
+        // Nothing new to settle. A one-day window keeps `view` able to value
+        // existing positions without pretending there is more work.
+        let start = days
+            .iter()
+            .rev()
+            .take(1)
+            .next()
+            .cloned()
+            .unwrap_or_else(|| end.clone());
+        return db
+            .price_set_from_bars("bar-table", &start, &end)
+            .map_err(api_error);
+    };
+    if settle_from.as_str() > end.as_str() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "day_before_last_settled", "last_settled": last_settled })),
+        ));
+    }
+
+    let to_settle = days
+        .iter()
+        .filter(|day| day.as_str() >= settle_from.as_str() && day.as_str() <= end.as_str())
+        .count();
+    if to_settle > MAX_SETTLE_DAYS_PER_CALL {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "advance_too_large",
+                "days_requested": to_settle,
+                "max_per_call": MAX_SETTLE_DAYS_PER_CALL,
+                "hint": "catch up in periods, or run a backtest job instead",
+            })),
+        ));
+    }
+
+    // Load the settlement days plus a bounded warm-up so the strategies have
+    // enough trailing closes on the first day settled.
+    let from_index = days
+        .iter()
+        .position(|day| day == &settle_from)
+        .unwrap_or(0)
+        .saturating_sub(SETTLEMENT_WARMUP_DAYS);
+    let start = days[from_index].clone();
+
+    db.price_set_from_bars("bar-table", &start, &end)
         .map_err(api_error)
 }
 
@@ -349,6 +476,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market/bars", get(bars))
         .route("/v2/market/gaps", get(bar_gaps))
         .route("/v2/market/bars/{symbol}", get(symbol_bars))
+        .route("/v2/market/settlement-preview", get(settlement_preview))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("astock-v2 listening at http://{address}");
