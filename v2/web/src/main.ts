@@ -323,15 +323,25 @@ const render = (account: AccountView): void => {
   );
   setText("price-set", `价格集合：${account.price_set_id ?? "—"}`);
 
+  // The account page keeps its own set of figures under plain ids, because the
+  // dashboard already owns the `data-testid` copies.
+  setTextById("acc-principal", money(account.initial_cash_cents));
+  setTextById("acc-equity", money(account.equity_cents));
+  setTextById("acc-profit", signedMoney(account.profit_cents));
+  setTextById("acc-cash", money(account.cash_cents));
+
   for (const slot of account.slots) renderStrategy(slot);
   renderPositions(account);
   renderTrades(account);
   renderRebalances(account);
 
-  const warning = byId("warning");
   const messages = account.warnings.map((code) => warningText[code] ?? code);
-  warning.textContent = messages.join("；");
-  show(warning, messages.length > 0);
+  for (const id of ["warning", "account-warning"]) {
+    const node = document.getElementById(id);
+    if (!node) continue;
+    node.textContent = messages.join("；");
+    show(node, messages.length > 0);
+  }
 
   const run = byTestId<HTMLButtonElement>("run-submit");
   run.disabled = account.price_set_coverage_end === null;
@@ -530,6 +540,7 @@ async function loadView(view: string): Promise<void> {
   if (loadedViews.has(view)) return;
   try {
     switch (view) {
+      case "overview/dashboard":
       case "trading/account":
         await loadCurve();
         break;
@@ -543,6 +554,9 @@ async function loadView(view: string): Promise<void> {
         // Views backed by the account payload are already rendered by `load`.
         break;
     }
+    // Only mark as loaded once it actually succeeded. Marking on failure means
+    // a view that raced the account load never retries, and it stays blank for
+    // the rest of the session.
     loadedViews.add(view);
   } catch (error) {
     announce(`加载失败：${errorDetail(error)}`);
@@ -584,12 +598,91 @@ let curveSeries: "total" | "steady" | "aggressive" = "total";
 let curveRange = "all";
 
 async function loadCurve(): Promise<void> {
-  curve = await api<CurvePayload>("/v2/account/equity-curve");
+  try {
+    curve = await api<CurvePayload>("/v2/account/equity-curve");
+  } catch (error) {
+    // 404 means no account yet -- an expected state on the first visit, not a
+    // failure. Anything else is worth surfacing.
+    if (error instanceof ApiError && error.status === 404) {
+      curve = null;
+    } else {
+      throw error;
+    }
+  }
   drawCurve();
+  drawCockpit();
+}
+
+/**
+ * The dashboard's compact copy of the curve.
+ *
+ * Same data, no controls: the dashboard is for glancing at, the account page is
+ * for interrogating. Duplicating the fetch would mean the two could disagree.
+ */
+function drawCockpit(): void {
+  if (!curve) {
+    const chart = document.getElementById("cockpit-chart");
+    if (chart && chart.childElementCount === 0) {
+      chart.innerHTML =
+        '<p class="chart-empty">还没有结算记录。到「交易 → 推进与结算」跑一天试试。</p>';
+    }
+    return;
+  }
+  const summary = document.getElementById("cockpit-summary");
+  const chart = document.getElementById("cockpit-chart");
+  if (!summary || !chart) return;
+
+  const s = curve.summary;
+  if (!s || curve.points.length === 0) {
+    summary.innerHTML = "";
+    chart.innerHTML =
+      '<p class="chart-empty">还没有结算记录。到「交易 → 推进与结算」跑一天试试。</p>';
+    return;
+  }
+
+  summary.innerHTML = [
+    `<div class="curve-stat">
+       <span class="curve-stat-label">累计收益</span>
+       <strong class="${s.profit_cents >= 0 ? "pos" : "neg"}">${signedMoney(s.profit_cents)}</strong>
+       <span class="muted">${percent(s.return_bps)}</span>
+     </div>`,
+    `<div class="curve-stat">
+       <span class="curve-stat-label">最大回撤</span>
+       <strong class="neg">${percent(-s.max_drawdown_bps)}</strong>
+       <span class="muted">${s.peak_day} → ${s.trough_day}</span>
+     </div>`,
+    `<div class="curve-stat">
+       <span class="curve-stat-label">稳健</span>
+       <strong class="${s.steady_return_bps >= 0 ? "pos" : "neg"}">${percent(s.steady_return_bps)}</strong>
+       <span class="muted">${moneyShort(s.steady_cents)}</span>
+     </div>`,
+    `<div class="curve-stat">
+       <span class="curve-stat-label">激进</span>
+       <strong class="${s.aggressive_return_bps >= 0 ? "pos" : "neg"}">${percent(s.aggressive_return_bps)}</strong>
+       <span class="muted">${moneyShort(s.aggressive_cents)}</span>
+     </div>`,
+  ].join("");
+
+  chart.innerHTML = renderCurve({
+    points: curve.points.slice(-120),
+    initialCents: curve.initial_cash_cents,
+    series: "total",
+    width: 900,
+    height: 200,
+  });
 }
 
 function drawCurve(): void {
-  if (!curve) return;
+  if (!curve) {
+    // Nothing fetched yet (or the fetch failed). Say so rather than leaving an
+    // empty box the user cannot interpret.
+    const chart = document.getElementById("equity-chart");
+    if (chart && chart.childElementCount === 0) {
+      chart.innerHTML =
+        '<p class="chart-empty">还没有结算记录。到「交易 → 推进与结算」跑一天试试。</p>';
+    }
+    return;
+  }
   const summary = byId("curve-summary");
   const chart = byId("equity-chart");
   const bars = byId("daily-bars");

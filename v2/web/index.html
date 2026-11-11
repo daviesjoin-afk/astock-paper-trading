@@ -43,7 +43,7 @@
     </nav>
 
     <main id="main" tabindex="-1">
-      <nav class="view-nav" aria-label="二级导航" id="view-nav" hidden></nav>
+      <nav class="view-nav" aria-label="二级导航" id="view-nav" role="tablist" hidden></nav>
 
       <section class="notice" data-testid="loading" id="loading">
         <h2>正在读取账户…</h2>
@@ -89,55 +89,15 @@
           </dl>
         </section>
 
-        <div class="run-row">
-          <div>
-            <h3>推进到最新交易日</h3>
-            <p class="muted">等待读取价格覆盖…</p>
+        <section class="panel cockpit">
+          <div class="panel-head">
+            <div>
+              <h2>净值曲线</h2>
+              <p class="muted">每天看这一张就够了。完整视图在「交易 → 账户」。</p>
+            </div>
           </div>
-          <button type="button" class="btn btn-primary" data-testid="run-submit" id="run-submit">
-            推进并结算
-          </button>
-        </div>
-        <p class="run-result" data-testid="run-result" id="run-result" hidden></p>
-
-        <section class="strategy-grid" aria-label="两个策略" data-testid="strategy-grid">
-          <article class="strategy-card" data-testid="strategy-steady">
-            <header>
-              <div>
-                <p class="eyebrow">策略一</p>
-                <h3>稳健</h3>
-              </div>
-              <span class="weight" data-testid="steady-weight">—</span>
-            </header>
-            <p class="strategy-desc" data-testid="steady-desc">—</p>
-            <dl class="metric-grid">
-              <div><dt>策略资产</dt><dd data-testid="steady-equity">—</dd></div>
-              <div><dt>累计收益贡献</dt><dd data-testid="steady-profit">—</dd></div>
-              <div><dt>累计收益贡献率</dt><dd data-testid="steady-return">—</dd></div>
-              <div><dt>回撤</dt><dd data-testid="steady-drawdown">—</dd></div>
-              <div><dt>现金</dt><dd data-testid="steady-cash">—</dd></div>
-              <div><dt>持仓</dt><dd data-testid="steady-count">—</dd></div>
-            </dl>
-          </article>
-
-          <article class="strategy-card" data-testid="strategy-aggressive">
-            <header>
-              <div>
-                <p class="eyebrow">策略二</p>
-                <h3>激进</h3>
-              </div>
-              <span class="weight" data-testid="aggressive-weight">—</span>
-            </header>
-            <p class="strategy-desc" data-testid="aggressive-desc">—</p>
-            <dl class="metric-grid">
-              <div><dt>策略资产</dt><dd data-testid="aggressive-equity">—</dd></div>
-              <div><dt>累计收益贡献</dt><dd data-testid="aggressive-profit">—</dd></div>
-              <div><dt>累计收益贡献率</dt><dd data-testid="aggressive-return">—</dd></div>
-              <div><dt>回撤</dt><dd data-testid="aggressive-drawdown">—</dd></div>
-              <div><dt>现金</dt><dd data-testid="aggressive-cash">—</dd></div>
-              <div><dt>持仓</dt><dd data-testid="aggressive-count">—</dd></div>
-            </dl>
-          </article>
+          <div id="cockpit-summary" class="curve-summary"></div>
+          <div id="cockpit-chart" class="chart-wrap"></div>
         </section>
 
         <footer class="page-foot">
@@ -227,13 +187,13 @@
       </section>
       <section class="panel">
         <div class="panel-head"><div><h2>账户概览</h2></div></div>
-        <dl class="metric-grid wide">
-          <div><dt>本金</dt><dd data-testid="principal-value">—</dd></div>
-          <div><dt>总资产</dt><dd data-testid="equity">—</dd></div>
-          <div><dt>累计收益</dt><dd data-testid="profit">—</dd></div>
-          <div><dt>可用现金</dt><dd data-testid="cash">—</dd></div>
+        <dl class="metric-grid wide" id="account-figures">
+          <div><dt>本金</dt><dd id="acc-principal">—</dd></div>
+          <div><dt>总资产</dt><dd id="acc-equity">—</dd></div>
+          <div><dt>累计收益</dt><dd id="acc-profit">—</dd></div>
+          <div><dt>可用现金</dt><dd id="acc-cash">—</dd></div>
         </dl>
-        <p class="warning" data-testid="warning" id="warning" hidden></p>
+        <p class="warning" id="account-warning" hidden></p>
       </section>
     </div>
 
