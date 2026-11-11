@@ -251,3 +251,11 @@ value:248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
 # （git ls-remote --tags origin 可核验），不是凭据；扫描器只对可达 commit 做
 # 自身对象豁免，tag 对象按裸长 hex 报出，故逐值登记。
 value:82d50ea08110edaa6d24ed9f2cd1e8d19919e4f1
+
+# Public TDX official after-hours market-data host used by the optional
+# a-stock-data adapter; this is a documented download host, not a secret.
+host:www.tdx.com.cn
+
+# Public upstream a-stock-data v3.10.4 commit pinned for attribution in
+# v2/data_sources/{a_stock_data.py,README.md,THIRD_PARTY_NOTICES.md}.
+value:f21534946c42be3ad048ac938eecb1bad84cb8ab
