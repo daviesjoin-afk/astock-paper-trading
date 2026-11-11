@@ -200,16 +200,46 @@ impl Store {
                 prev_close_cents INTEGER NOT NULL,
                 volume_shares INTEGER NOT NULL,
                 amount_cents INTEGER NOT NULL,
+                -- 'none' (unadjusted, from the daytime package) or 'qfq'
+                -- (forward-adjusted, from the V1 archive). Forward adjustment
+                -- rewrites history using future dividends, so anything doing
+                -- walk-forward evaluation must refuse 'qfq'.
+                adjust TEXT NOT NULL DEFAULT 'none',
+                source TEXT NOT NULL DEFAULT 'tdx',
                 PRIMARY KEY(symbol, day)
             );
             CREATE INDEX IF NOT EXISTS bar_by_day ON bar(day);
             "#,
         )?;
+        self.ensure_bar_columns()?;
         if existing.is_none() {
             self.conn.execute(
                 "INSERT INTO schema_version(version) VALUES(?)",
                 [SCHEMA_VERSION],
             )?;
+        }
+        Ok(())
+    }
+
+    /// Add `adjust`/`source` to a `bar` table created before those columns
+    /// existed. Idempotent: CREATE TABLE IF NOT EXISTS does nothing when the
+    /// table is already there, so existing databases need this to catch up.
+    fn ensure_bar_columns(&self) -> StoreResult<()> {
+        let mut have: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(bar)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for row in rows {
+                have.push(row?);
+            }
+        }
+        for (name, ddl) in [
+            ("adjust", "ALTER TABLE bar ADD COLUMN adjust TEXT NOT NULL DEFAULT 'none'"),
+            ("source", "ALTER TABLE bar ADD COLUMN source TEXT NOT NULL DEFAULT 'tdx'"),
+        ] {
+            if !have.iter().any(|column| column == name) {
+                self.conn.execute(ddl, [])?;
+            }
         }
         Ok(())
     }
@@ -236,15 +266,16 @@ impl Store {
         {
             let mut stmt = txn.prepare(
                 "INSERT INTO bar(symbol,day,name,open_cents,high_cents,low_cents,\
-                 close_cents,prev_close_cents,volume_shares,amount_cents) \
-                 VALUES(?,?,?,?,?,?,?,?,?,?) \
+                 close_cents,prev_close_cents,volume_shares,amount_cents,adjust,source) \
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?) \
                  ON CONFLICT(symbol,day) DO UPDATE SET \
                    name=excluded.name, open_cents=excluded.open_cents, \
                    high_cents=excluded.high_cents, low_cents=excluded.low_cents, \
                    close_cents=excluded.close_cents, \
                    prev_close_cents=excluded.prev_close_cents, \
                    volume_shares=excluded.volume_shares, \
-                   amount_cents=excluded.amount_cents",
+                   amount_cents=excluded.amount_cents, \
+                   adjust=excluded.adjust, source=excluded.source",
             )?;
             for bar in bars {
                 stmt.execute(params![
@@ -258,6 +289,8 @@ impl Store {
                     bar.prev_close_cents,
                     bar.volume_shares,
                     bar.amount_cents,
+                    bar.adjust,
+                    bar.source,
                 ])?;
             }
         }
@@ -269,7 +302,7 @@ impl Store {
     pub fn bars_for_day(&self, day: &str) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
-             prev_close_cents,volume_shares,amount_cents \
+             prev_close_cents,volume_shares,amount_cents,adjust,source \
              FROM bar WHERE day = ?1 ORDER BY symbol",
         )?;
         let rows = stmt.query_map([day], read_bar)?;
@@ -289,7 +322,7 @@ impl Store {
     ) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
-             prev_close_cents,volume_shares,amount_cents \
+             prev_close_cents,volume_shares,amount_cents,adjust,source \
              FROM bar WHERE symbol = ?1 AND day BETWEEN ?2 AND ?3 ORDER BY day",
         )?;
         let rows = stmt.query_map(params![symbol, from_day, to_day], read_bar)?;
@@ -331,7 +364,7 @@ impl Store {
     pub fn price_gaps(&self, day: &str, threshold_bps: i64) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
-             prev_close_cents,volume_shares,amount_cents \
+             prev_close_cents,volume_shares,amount_cents,adjust,source \
              FROM bar WHERE day = ?1 AND prev_close_cents > 0 \
              AND abs(close_cents - prev_close_cents) * 10000 / prev_close_cents > ?2 \
              ORDER BY symbol",
@@ -1210,6 +1243,10 @@ pub struct Bar {
     pub prev_close_cents: i64,
     pub volume_shares: i64,
     pub amount_cents: i64,
+    /// `none` for unadjusted (daytime package), `qfq` for forward-adjusted
+    /// (V1 archive). Never mix the two in one series.
+    pub adjust: String,
+    pub source: String,
 }
 
 impl Bar {
@@ -1234,6 +1271,8 @@ fn read_bar(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bar> {
         prev_close_cents: row.get(7)?,
         volume_shares: row.get(8)?,
         amount_cents: row.get(9)?,
+        adjust: row.get(10)?,
+        source: row.get(11)?,
     })
 }
 
@@ -1316,6 +1355,8 @@ mod tests {
             prev_close_cents: prev,
             volume_shares: 1_000,
             amount_cents: close * 1_000,
+            adjust: "none".into(),
+            source: "tdx".into(),
         }
     }
 
@@ -1397,6 +1438,58 @@ mod tests {
         let gaps = store.price_gaps("2026-11-10", 1_100).unwrap();
         let symbols: Vec<&str> = gaps.iter().map(|b| b.symbol.as_str()).collect();
         assert_eq!(symbols, vec!["600036.SH"]);
+    }
+
+    #[test]
+    fn bar_adjust_and_source_round_trip() {
+        let mut store = Store::open(":memory:").unwrap();
+        let mut qfq = bar("600519.SH", "2026-11-06", 145_300, 145_200);
+        qfq.adjust = "qfq".into();
+        qfq.source = "v1-qfq".into();
+        store
+            .upsert_bars(&[qfq, bar("600000.SH", "2026-11-06", 1_003, 987)])
+            .unwrap();
+
+        let stored = store.bars_for_day("2026-11-06").unwrap();
+        assert_eq!(stored[0].adjust, "none");
+        assert_eq!(stored[0].source, "tdx");
+        assert_eq!(stored[1].adjust, "qfq");
+        assert_eq!(stored[1].source, "v1-qfq");
+    }
+
+    #[test]
+    fn older_bar_table_gains_adjust_columns_on_open() {
+        // A database created before `adjust`/`source` existed must still open,
+        // and must report the safe defaults rather than failing.
+        let dir = std::env::temp_dir().join(format!("astock-bar-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite3");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_version(version INTEGER NOT NULL);
+                INSERT INTO schema_version(version) VALUES(2);
+                CREATE TABLE bar(
+                    symbol TEXT NOT NULL, day TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                    open_cents INTEGER NOT NULL, high_cents INTEGER NOT NULL,
+                    low_cents INTEGER NOT NULL, close_cents INTEGER NOT NULL,
+                    prev_close_cents INTEGER NOT NULL, volume_shares INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL, PRIMARY KEY(symbol, day));
+                INSERT INTO bar VALUES('600000.SH','2026-11-10','x',1000,1020,990,1020,1010,100,102000);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let rows = store.bars_for_day("2026-11-10").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].adjust, "none");
+        assert_eq!(rows[0].source, "tdx");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
