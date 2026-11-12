@@ -107,6 +107,21 @@ fn pending_buys_respect_actual_cash_commission_floor_and_whole_lots() {
 }
 
 #[test]
+fn a_repeated_symbol_cannot_take_two_per_symbol_slots() {
+    let mut policy = SlotPolicy::for_strategy(StrategyId::Steady);
+    policy.max_positions = 3;
+    let closes = prices(&["000001.SZ", "600000.SH"]);
+    let orders = orders_for_day_in(StrategyId::Steady, &policy, &[],
+        &[signal("000001.SZ", 90), signal("000001.SZ", 90), signal("600000.SH", 80)],
+        5_000_000, 5_000_000, &closes, &closes, &[]);
+    assert_eq!(orders.iter().filter(|order| order.symbol == "000001.SZ").count(), 1);
+    assert_eq!(orders.len(), 2);
+    let per_symbol: i64 = orders.iter().filter(|order| order.symbol == "000001.SZ")
+        .map(|order| order.quantity * closes[&order.symbol]).sum();
+    assert!(per_symbol <= 750_000, "one name exceeded its own cap: {per_symbol}");
+}
+
+#[test]
 fn exits_do_not_pre_spend_sale_proceeds_or_free_a_position_early() {
     let mut policy = SlotPolicy::for_strategy(StrategyId::Steady);
     policy.max_positions = 1;

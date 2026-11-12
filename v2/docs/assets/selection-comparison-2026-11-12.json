@@ -219,6 +219,16 @@
       "role": "input_database",
       "path": "work/real-history/db/research-market-halt-boundary.sqlite3",
       "sha256": "683646804d062c882ff2456a4c1b1e51eab0d04839430789a5e6b3268c7dd609"
+    },
+    {
+      "role": "dedup_equivalence_dedup",
+      "path": "(ignored) work/market-layer-20261112/ab-full-dedup.json",
+      "sha256": "1d703213bb3703df40dfaa800c27ef7518047d68b9735cc4a0b77ce1584ab6a2"
+    },
+    {
+      "role": "dedup_equivalence_dedup",
+      "path": "(ignored) work/market-layer-20261112/ab-full-dedup.verification.json",
+      "sha256": "a66b6d639e0fb2f2d26ea84fdf84c3924cbb3f7114ebd6276631b8e7dfccd133"
     }
   ],
   "limitations": [
@@ -230,5 +240,11 @@
     "Ranking and sizing changed together; this comparison does not isolate their separate effects.",
     "Cash share is the arithmetic mean of end-of-day account cash/equity, reconstructed from fills and transfers.",
     "This is an in-period engineering comparison, not untouched out-of-sample performance."
-  ]
+  ],
+  "dedup_guard": {
+    "purpose": "a repeated candidate cannot spend one per-symbol cap twice",
+    "replay_exit": 0,
+    "verification_exit": 0,
+    "trades_rebalances_curves_books_identical": true
+  }
 }

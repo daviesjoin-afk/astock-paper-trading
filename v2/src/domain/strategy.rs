@@ -316,6 +316,10 @@ pub fn orders_for_day_in(
     ranked.sort_by(|left, right| {
         right.1.score.cmp(&left.1.score).then_with(|| left.0.cmp(&right.0))
     });
+    // A symbol may appear only once. Consumers already deduplicate, but a
+    // repeated entry would otherwise open the same name twice and let two
+    // orders share one per-symbol cap.
+    let mut planned: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for (symbol, scored) in ranked {
         // Enter only on a clearly positive score. The band between EXIT_SCORE
         // and the entry threshold is deliberately inert: a condition sitting on
@@ -326,6 +330,7 @@ pub fn orders_for_day_in(
         if !policy.allow_entries
             || scored.score < policy.entry_score
             || held.contains(symbol.as_str())
+            || !planned.insert(symbol.as_str())
         {
             continue;
         }
