@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-12",
+  "period": "2023-07-05..2026-11-11",
+  "variants": {
+    "unfiltered": {
+      "same-close": {
+        "ending_equity_cents": 7901873,
+        "return_pct": "-20.981270",
+        "exact_max_drawdown_pct": "32.019826",
+        "displayed_max_drawdown_bps": 3201,
+        "peak_day": "2026-01-26",
+        "trough_day": "2026-10-15",
+        "fills": 1122,
+        "fees_cents": 921427,
+        "mean_daily_cash_pct": "44.050634",
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "return_pct": "-7.009080"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "return_pct": "1.985248"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "return_pct": "5.292807"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "return_pct": "-20.867763"
+          }
+        ],
+        "audit": {
+          "mismatch_count": 0,
+          "display_precision_difference_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        }
+      },
+      "next-session": {
+        "ending_equity_cents": 7179815,
+        "return_pct": "-28.201850",
+        "exact_max_drawdown_pct": "36.251186",
+        "displayed_max_drawdown_bps": 3625,
+        "peak_day": "2023-08-03",
+        "trough_day": "2026-10-15",
+        "fills": 1122,
+        "fees_cents": 979385,
+        "mean_daily_cash_pct": "40.902908",
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "return_pct": "-3.913960"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "return_pct": "-10.435897"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "return_pct": "7.274869"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "return_pct": "-22.228408"
+          }
+        ],
+        "audit": {
+          "mismatch_count": 0,
+          "display_precision_difference_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        }
+      }
+    },
+    "filtered": {
+      "same-close": {
+        "ending_equity_cents": 11931805,
+        "return_pct": "19.318050",
+        "exact_max_drawdown_pct": "13.687267",
+        "displayed_max_drawdown_bps": 1368,
+        "peak_day": "2026-03-17",
+        "trough_day": "2026-07-09",
+        "fills": 496,
+        "fees_cents": 596095,
+        "mean_daily_cash_pct": "78.404016",
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "return_pct": "-0.056550"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "return_pct": "3.812246"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "return_pct": "10.953814"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "return_pct": "3.648015"
+          }
+        ],
+        "audit": {
+          "mismatch_count": 0,
+          "display_precision_difference_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        }
+      },
+      "next-session": {
+        "ending_equity_cents": 11055272,
+        "return_pct": "10.552720",
+        "exact_max_drawdown_pct": "13.678403",
+        "displayed_max_drawdown_bps": 1367,
+        "peak_day": "2026-01-22",
+        "trough_day": "2026-06-26",
+        "fills": 510,
+        "fees_cents": 580728,
+        "mean_daily_cash_pct": "77.070630",
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "return_pct": "2.077190"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "return_pct": "-2.697586"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "return_pct": "12.401840"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "return_pct": "-0.975264"
+          }
+        ],
+        "audit": {
+          "mismatch_count": 0,
+          "display_precision_difference_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        }
+      }
+    }
+  },
+  "artifacts": [
+    {
+      "role": "ab-full-same-close",
+      "path": "(ignored) work/market-layer-20261112/ab-full-same-close.json",
+      "sha256": "a60a0634e1a7921ef043b1a957aa970debc2a93b0aebaa9602a6cc13c6e0f470"
+    },
+    {
+      "role": "ab-full-same-close",
+      "path": "(ignored) work/market-layer-20261112/ab-full-same-close.verification.json",
+      "sha256": "c7ea33ec9a151d0a5273a4180759e37d83dbbe877152f8fd5c8c1f111187369e"
+    },
+    {
+      "role": "ab-full-next-session",
+      "path": "(ignored) work/market-layer-20261112/ab-full-next-session.json",
+      "sha256": "e5d06abe32b49dee0971228742a0becc29e318155da77760704c384a0e0d5311"
+    },
+    {
+      "role": "ab-full-next-session",
+      "path": "(ignored) work/market-layer-20261112/ab-full-next-session.verification.json",
+      "sha256": "680186227cbd74873fc8f4107bb557dbf30ce9df9c0f358c4a2bb67ede53b1c1"
+    }
+  ],
+  "notes": [
+    "Timing only changed: identical 813 input windows and identical strategy thresholds, fees and sizing.",
+    "same-close decides and fills on the same close. next-session decides on the previous close and fills at today's close, and stops are triggered by the previous close.",
+    "Limit-up/limit-down sealing is NOT modelled; measured 0.879% limit-up and 0.282% limit-down rows, 806 of them single-price limit-down days on which a sale would have been impossible. Both timings are therefore still optimistic.",
+    "No corporate-action cash/share accounting; unadjusted prices only.",
+    "In-period engineering comparison, not untouched out-of-sample and not executable total return."
+  ],
+  "settled_days": 813
+}

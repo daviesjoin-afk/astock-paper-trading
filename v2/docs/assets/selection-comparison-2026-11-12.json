@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-12",
+  "baseline_commit": "6c64f43e1d055cf9842eb068034d644e877324bf",
+  "change": "score-ranked entries and separate per-symbol/portfolio cash budgets; unchanged strategy thresholds/fees",
+  "period": {
+    "from": "2023-07-05",
+    "through": "2026-11-11",
+    "settled_days": 813,
+    "warmup_days": 120,
+    "initial_cash_cents": 10000000
+  },
+  "daily_input_windows_identical": true,
+  "replay_exit": 0,
+  "verification_exit": 0,
+  "input_database_unchanged": true,
+  "variants": {
+    "unfiltered": {
+      "baseline": {
+        "ending_equity_cents": 9765755,
+        "profit_cents": -234245,
+        "return_pct": "-2.342450",
+        "displayed_max_drawdown_bps": 1470,
+        "fills": 453,
+        "fees_cents": 441045,
+        "mean_daily_cash_pct": "80.269599",
+        "final_weights_bps": [
+          3173,
+          6827
+        ],
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "ending_equity_cents": 9794032,
+            "return_pct": "-2.059680"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "ending_equity_cents": 9306374,
+            "return_pct": "-4.979134"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "ending_equity_cents": 10852283,
+            "return_pct": "16.611292"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "ending_equity_cents": 9765755,
+            "return_pct": "-10.011976"
+          }
+        ]
+      },
+      "candidate": {
+        "ending_equity_cents": 7901873,
+        "profit_cents": -2098127,
+        "return_pct": "-20.981270",
+        "displayed_max_drawdown_bps": 3201,
+        "fills": 1122,
+        "fees_cents": 921427,
+        "mean_daily_cash_pct": "44.050634",
+        "final_weights_bps": [
+          2402,
+          7598
+        ],
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "ending_equity_cents": 9299092,
+            "return_pct": "-7.009080"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "ending_equity_cents": 9483702,
+            "return_pct": "1.985248"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "ending_equity_cents": 9985656,
+            "return_pct": "5.292807"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "ending_equity_cents": 7901873,
+            "return_pct": "-20.867763"
+          }
+        ],
+        "exact_max_drawdown_pct": "32.019826",
+        "peak_day": "2026-01-26",
+        "trough_day": "2026-10-15"
+      },
+      "audit": {
+        "mismatch_count": 0,
+        "display_precision_difference_count": 0,
+        "halted_fill_count": 0,
+        "untradeable_fill_count": 0
+      }
+    },
+    "filtered": {
+      "baseline": {
+        "ending_equity_cents": 9865420,
+        "profit_cents": -134580,
+        "return_pct": "-1.345800",
+        "displayed_max_drawdown_bps": 659,
+        "fills": 308,
+        "fees_cents": 260080,
+        "mean_daily_cash_pct": "89.827772",
+        "final_weights_bps": [
+          2000,
+          8000
+        ],
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "ending_equity_cents": 10029874,
+            "return_pct": "0.298740"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "ending_equity_cents": 9906714,
+            "return_pct": "-1.227932"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "ending_equity_cents": 9982358,
+            "return_pct": "0.763563"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "ending_equity_cents": 9865420,
+            "return_pct": "-1.171447"
+          }
+        ]
+      },
+      "candidate": {
+        "ending_equity_cents": 11931805,
+        "profit_cents": 1931805,
+        "return_pct": "19.318050",
+        "displayed_max_drawdown_bps": 1368,
+        "fills": 496,
+        "fees_cents": 596095,
+        "mean_daily_cash_pct": "78.404016",
+        "final_weights_bps": [
+          2000,
+          8000
+        ],
+        "yearly": [
+          {
+            "year": 2023,
+            "through": "2023-12-29",
+            "ending_equity_cents": 9994345,
+            "return_pct": "-0.056550"
+          },
+          {
+            "year": 2024,
+            "through": "2024-12-31",
+            "ending_equity_cents": 10375354,
+            "return_pct": "3.812246"
+          },
+          {
+            "year": 2025,
+            "through": "2025-12-31",
+            "ending_equity_cents": 11511851,
+            "return_pct": "10.953814"
+          },
+          {
+            "year": 2026,
+            "through": "2026-11-11",
+            "ending_equity_cents": 11931805,
+            "return_pct": "3.648015"
+          }
+        ],
+        "exact_max_drawdown_pct": "13.687267",
+        "peak_day": "2026-03-17",
+        "trough_day": "2026-07-09"
+      },
+      "audit": {
+        "mismatch_count": 0,
+        "display_precision_difference_count": 0,
+        "halted_fill_count": 0,
+        "untradeable_fill_count": 0
+      }
+    }
+  },
+  "artifacts": [
+    {
+      "role": "baseline_report",
+      "path": "work/real-history/ab-full-final.json",
+      "sha256": "416595c8832545b0c15bc5a64842fb1d305433541953a9959182d1a1d8fcb172"
+    },
+    {
+      "role": "candidate_report",
+      "path": "work/market-layer-20261112/ab-full-selection.json",
+      "sha256": "1d703213bb3703df40dfaa800c27ef7518047d68b9735cc4a0b77ce1584ab6a2"
+    },
+    {
+      "role": "verification",
+      "path": "work/market-layer-20261112/ab-full-selection.verification.json",
+      "sha256": "7c8ec0e772202e40c7750ac0a5bcd6fa02605ae69edbb1497c36fc9f8fc60c4d"
+    },
+    {
+      "role": "candidate_strategy",
+      "path": "v2/src/domain/strategy.rs",
+      "sha256": "2ef3097c67bd0eb10774a808aecf111f7ddf60ca91e8847f6b2d37785c0036bd"
+    },
+    {
+      "role": "input_database",
+      "path": "work/real-history/db/research-market-halt-boundary.sqlite3",
+      "sha256": "683646804d062c882ff2456a4c1b1e51eab0d04839430789a5e6b3268c7dd609"
+    },
+    {
+      "role": "dedup_equivalence_dedup",
+      "path": "(ignored) work/market-layer-20261112/ab-full-dedup.json",
+      "sha256": "1d703213bb3703df40dfaa800c27ef7518047d68b9735cc4a0b77ce1584ab6a2"
+    },
+    {
+      "role": "dedup_equivalence_dedup",
+      "path": "(ignored) work/market-layer-20261112/ab-full-dedup.verification.json",
+      "sha256": "a66b6d639e0fb2f2d26ea84fdf84c3924cbb3f7114ebd6276631b8e7dfccd133"
+    }
+  ],
+  "limitations": [
+    "Daily close simulation; signal and fill use the same close. This is not a next-session execution backtest.",
+    "Unadjusted prices do not credit dividends or corporate actions; historical jumps can distort results.",
+    "Explicit halted or zero-volume/zero-OHLC rows are valuation-only; they never fill, score or move the market regime. Delisted or wholly absent rows still fail the day rather than being carried forward.",
+    "Allocation remains enabled; slot returns remove cash transfers but the two variants may have different capital paths.",
+    "Fill counts are not completed round trips or a measure of trade quality. No profitability conclusion is implied.",
+    "Ranking and sizing changed together; this comparison does not isolate their separate effects.",
+    "Cash share is the arithmetic mean of end-of-day account cash/equity, reconstructed from fills and transfers.",
+    "This is an in-period engineering comparison, not untouched out-of-sample performance."
+  ],
+  "dedup_guard": {
+    "purpose": "a repeated candidate cannot spend one per-symbol cap twice",
+    "replay_exit": 0,
+    "verification_exit": 0,
+    "trades_rebalances_curves_books_identical": true
+  }
+}

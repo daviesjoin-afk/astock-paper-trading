@@ -1,0 +1,373 @@
+{
+  "artifacts_sha256": {
+    "ab-full-final.json": {
+      "sha256": "416595c8832545b0c15bc5a64842fb1d305433541953a9959182d1a1d8fcb172"
+    },
+    "ab-full-final.verification.json": {
+      "sha256": "b0e94a802df89caa1477f10e30b0b101f5457a0c8094135768c53951fd1e4d29"
+    },
+    "halted-backfill-manifest.json": {
+      "sha256": "e1c32db71fbd494046aa1ec11de1c0e62ebd87916085bbae162f8882b263ec6b"
+    },
+    "research_database": {
+      "sha256": "683646804d062c882ff2456a4c1b1e51eab0d04839430789a5e6b3268c7dd609"
+    },
+    "source_database": {
+      "sha256": "a8027fa7aa1fec75ee5c047a704fd68ff0c55d0132f6ff5484772e7c94b02af8"
+    }
+  },
+  "branch": "codex/v2-store-boundaries",
+  "coverage": {
+    "backfill_failed_days": 0,
+    "backfill_inserted": 7326,
+    "from": "2023-01-03",
+    "halted_rows": 11633,
+    "market_days": 933,
+    "research_rows": 5012662,
+    "source_rows": 5005336,
+    "symbols_union": 5979,
+    "through": "2026-11-11",
+    "tradable_rows": 5001029
+  },
+  "input": {
+    "adjust": "none",
+    "from": "2023-07-05",
+    "initial_cash_cents": 10000000,
+    "settled_days": 813,
+    "through": "2026-11-11",
+    "warmup_days": 120,
+    "windows": {
+      "sha256": "5080f1d17e8d543db67faaed08dcacaea44f8be6a0056aa25667d29ada344efa"
+    }
+  },
+  "limitations": [
+    "A ledger arithmetic pass does not establish realistic execution or predictive profitability.",
+    "Zero-volume/non-positive-open fills fail quote-tradeability checks even when ledger arithmetic is consistent.",
+    "A halted holding is valued at its official carried previous close and may not trade; resumption is observed from the next tradable row.",
+    "Daily bars do not prove intraday fill liquidity; price-limit execution is not validated here.",
+    "Fee arithmetic is reconciled to the engine's fixed-rate model, not to date-specific historical exchange/tax schedules.",
+    "Unadjusted bars and the exported ledger do not account for dividends, bonus shares or splits."
+  ],
+  "schema_version": 1,
+  "tools_sha256": {
+    "v2/Cargo.lock": {
+      "sha256": "12ed1ee97abf83c9fa7b122c4f85aae6c19da403063cf68d33b5e147e671dea7"
+    },
+    "v2/examples/regime_ab.rs": {
+      "sha256": "800a132e2d67f80b70127cae67e21648ebb6a8816578df3dc1acdd70b9a980aa"
+    },
+    "v2/research/backfill_halted.py": {
+      "sha256": "825e6211d0ed263754473408f594f129efaa5b80cebbb5d1a926b22b5cd8331a"
+    },
+    "v2/research/verify_ab.py": {
+      "sha256": "824b29811d60f4739ceb350b014c3343656afd514dd19b11e7660ec3ae2f84bb"
+    }
+  },
+  "units": {
+    "money": "integer_cents",
+    "rates": "basis_points",
+    "slot_returns": "time_weighted_end_of_day_flows"
+  },
+  "variants": {
+    "filtered": {
+      "checks": {
+        "board_lots": 308,
+        "coverage": 3,
+        "daily_accounting_and_dates": 14652,
+        "fill_fee": 308,
+        "fill_price": 308,
+        "fill_tradability": 308,
+        "final_book": 6,
+        "final_summary": 13,
+        "no_overdraft": 362,
+        "no_short_position": 154,
+        "performance_bps": 4884,
+        "t_plus_one": 154,
+        "transfer_direction": 108,
+        "transfer_weights": 108
+      },
+      "display_precision_difference_count": 0,
+      "fees_cents": 260080,
+      "fills": 308,
+      "final_performance": {
+        "account": {
+          "displayed_max_drawdown_bps": 659,
+          "displayed_peak_day": "2023-07-18",
+          "displayed_trough_day": "2025-08-07",
+          "equity_cents": 9865420,
+          "exact_and_display_dates_differ": false,
+          "exact_max_drawdown_bps": "659.399751931322",
+          "exact_peak_day": "2023-07-18",
+          "exact_return_bps": "-134.580000000000",
+          "exact_trough_day": "2025-08-07",
+          "net_transferred_cents": 0,
+          "profit_cents": -134580,
+          "truncated_return_bps": -134
+        },
+        "aggressive": {
+          "displayed_max_drawdown_bps": 753,
+          "displayed_peak_day": "2026-02-09",
+          "displayed_trough_day": "2026-10-09",
+          "equity_cents": 8088461,
+          "exact_and_display_dates_differ": false,
+          "exact_max_drawdown_bps": "753.276795829441",
+          "exact_peak_day": "2026-02-09",
+          "exact_return_bps": "116.247333950415",
+          "exact_trough_day": "2026-10-09",
+          "net_transferred_cents": 3002585,
+          "profit_cents": 85876,
+          "truncated_return_bps": 116
+        },
+        "steady": {
+          "displayed_max_drawdown_bps": 1487,
+          "displayed_peak_day": "2023-07-18",
+          "displayed_trough_day": "2026-07-16",
+          "equity_cents": 1776959,
+          "exact_and_display_dates_differ": false,
+          "exact_max_drawdown_bps": "1487.047452077546",
+          "exact_peak_day": "2023-07-18",
+          "exact_return_bps": "-1040.863626177304",
+          "exact_trough_day": "2026-07-16",
+          "net_transferred_cents": -3002585,
+          "profit_cents": -220456,
+          "truncated_return_bps": -1040
+        }
+      },
+      "halted_fill_count": 0,
+      "halted_holding_marks": {
+        "by_slot": {},
+        "distinct_slot_symbol_days": 0,
+        "distinct_symbol_days": 0,
+        "distinct_symbols": 0,
+        "first_examples": [],
+        "slot_symbol_days": 0,
+        "valuation_rule": "carried close equals the official previous close; no fill is allowed"
+      },
+      "halted_resumptions": {
+        "first_examples": [],
+        "resolved": 0,
+        "unresolved": [],
+        "unresolved_at_end": 0
+      },
+      "mismatch_count": 0,
+      "passed": true,
+      "reported_account": {
+        "day": "2026-11-11",
+        "equity_cents": 9865420,
+        "max_drawdown_bps": 659,
+        "net_flow_cents": 0,
+        "peak_day": "2023-07-18",
+        "profit_cents": -134580,
+        "return_bps": -134,
+        "trough_day": "2025-08-07"
+      },
+      "reported_slots": [
+        {
+          "fees_cents": 14056,
+          "fills": 24,
+          "invested_days": 320,
+          "net_transferred_cents": -3002585,
+          "open_positions": 0,
+          "performance": {
+            "day": "2026-11-11",
+            "equity_cents": 1776959,
+            "max_drawdown_bps": 1487,
+            "net_flow_cents": 0,
+            "peak_day": "2023-07-18",
+            "profit_cents": -220456,
+            "return_bps": -1040,
+            "trough_day": "2026-07-16"
+          },
+          "slot": "steady"
+        },
+        {
+          "fees_cents": 246024,
+          "fills": 284,
+          "invested_days": 400,
+          "net_transferred_cents": 3002585,
+          "open_positions": 0,
+          "performance": {
+            "day": "2026-11-11",
+            "equity_cents": 8088461,
+            "max_drawdown_bps": 753,
+            "net_flow_cents": 0,
+            "peak_day": "2026-02-09",
+            "profit_cents": 85876,
+            "return_bps": 116,
+            "trough_day": "2026-10-09"
+          },
+          "slot": "aggressive"
+        }
+      ],
+      "untradeable_fill_count": 0
+    },
+    "unfiltered": {
+      "checks": {
+        "board_lots": 453,
+        "coverage": 3,
+        "daily_accounting_and_dates": 14652,
+        "fill_fee": 453,
+        "fill_price": 453,
+        "fill_tradability": 453,
+        "final_book": 6,
+        "final_summary": 13,
+        "halted_reference_price": 1,
+        "no_overdraft": 582,
+        "no_short_position": 226,
+        "performance_bps": 4884,
+        "t_plus_one": 226,
+        "transfer_direction": 258,
+        "transfer_weights": 258
+      },
+      "display_precision_difference_count": 0,
+      "fees_cents": 441045,
+      "fills": 453,
+      "final_performance": {
+        "account": {
+          "displayed_max_drawdown_bps": 1470,
+          "displayed_peak_day": "2026-02-09",
+          "displayed_trough_day": "2026-11-11",
+          "equity_cents": 9765755,
+          "exact_and_display_dates_differ": false,
+          "exact_max_drawdown_bps": "1470.429658844437",
+          "exact_peak_day": "2026-02-09",
+          "exact_return_bps": "-234.245000000000",
+          "exact_trough_day": "2026-11-11",
+          "net_transferred_cents": 0,
+          "profit_cents": -234245,
+          "truncated_return_bps": -234
+        },
+        "aggressive": {
+          "displayed_max_drawdown_bps": 1752,
+          "displayed_peak_day": "2026-02-09",
+          "displayed_trough_day": "2026-10-22",
+          "equity_cents": 6745942,
+          "exact_and_display_dates_differ": true,
+          "exact_max_drawdown_bps": "1752.906968440488",
+          "exact_peak_day": "2026-02-09",
+          "exact_return_bps": "-161.584212775933",
+          "exact_trough_day": "2026-10-23",
+          "net_transferred_cents": 1765235,
+          "profit_cents": -19293,
+          "truncated_return_bps": -161
+        },
+        "steady": {
+          "displayed_max_drawdown_bps": 1829,
+          "displayed_peak_day": "2024-10-21",
+          "displayed_trough_day": "2026-07-20",
+          "equity_cents": 3019813,
+          "exact_and_display_dates_differ": false,
+          "exact_max_drawdown_bps": "1829.039475166220",
+          "exact_peak_day": "2024-10-21",
+          "exact_return_bps": "-779.632792347494",
+          "exact_trough_day": "2026-07-20",
+          "net_transferred_cents": -1765235,
+          "profit_cents": -214952,
+          "truncated_return_bps": -779
+        }
+      },
+      "halted_fill_count": 0,
+      "halted_holding_marks": {
+        "by_slot": {
+          "steady": 1
+        },
+        "distinct_slot_symbol_days": 1,
+        "distinct_symbol_days": 1,
+        "distinct_symbols": 1,
+        "first_examples": [
+          {
+            "close_cents": 474,
+            "day": "2024-07-01",
+            "market_value_cents": 616200,
+            "prev_close_cents": 474,
+            "quantity": 1300,
+            "slot": "steady",
+            "symbol": "000007.SZ"
+          }
+        ],
+        "slot_symbol_days": 1,
+        "valuation_rule": "carried close equals the official previous close; no fill is allowed"
+      },
+      "halted_resumptions": {
+        "first_examples": [
+          {
+            "halted_from": "2024-07-01",
+            "quantity_held": 1300,
+            "resumed_close_cents": 521,
+            "resumed_day": "2024-07-02",
+            "slot": "steady",
+            "symbol": "000007.SZ"
+          }
+        ],
+        "resolved": 1,
+        "unresolved": [],
+        "unresolved_at_end": 0
+      },
+      "mismatch_count": 0,
+      "passed": true,
+      "reported_account": {
+        "day": "2026-11-11",
+        "equity_cents": 9765755,
+        "max_drawdown_bps": 1470,
+        "net_flow_cents": 0,
+        "peak_day": "2026-02-09",
+        "profit_cents": -234245,
+        "return_bps": -234,
+        "trough_day": "2026-11-11"
+      },
+      "reported_slots": [
+        {
+          "fees_cents": 23952,
+          "fills": 39,
+          "invested_days": 552,
+          "net_transferred_cents": -1765235,
+          "open_positions": 1,
+          "performance": {
+            "day": "2026-11-11",
+            "equity_cents": 3019813,
+            "max_drawdown_bps": 1829,
+            "net_flow_cents": 132815,
+            "peak_day": "2024-10-21",
+            "profit_cents": -214952,
+            "return_bps": -779,
+            "trough_day": "2026-07-20"
+          },
+          "slot": "steady"
+        },
+        {
+          "fees_cents": 417093,
+          "fills": 414,
+          "invested_days": 650,
+          "net_transferred_cents": 1765235,
+          "open_positions": 0,
+          "performance": {
+            "day": "2026-11-11",
+            "equity_cents": 6745942,
+            "max_drawdown_bps": 1752,
+            "net_flow_cents": -132815,
+            "peak_day": "2026-02-09",
+            "profit_cents": -19293,
+            "return_bps": -161,
+            "trough_day": "2026-10-22"
+          },
+          "slot": "aggressive"
+        }
+      ],
+      "untradeable_fill_count": 0
+    }
+  },
+  "verification": {
+    "calculation": "Independent integer fill ledger and exact Fraction end-of-day-flow TWR",
+    "completed": true,
+    "executable_total_return_validated": false,
+    "passed": true,
+    "precision_policy": {
+      "account_bps": "exact integer truncation",
+      "drawdown_dates": "Compare API integer-bps event dates; also disclose exact unrounded maximum event dates",
+      "money_and_positions": "exact equality",
+      "slot_bps": "exact integer truncation; adjacent 1bp accepted only within 1e-9 bps of integer boundary, differences retained"
+    },
+    "replay_exit_code_recorded": false
+  },
+  "verified_local_date": "2026-11-11"
+}

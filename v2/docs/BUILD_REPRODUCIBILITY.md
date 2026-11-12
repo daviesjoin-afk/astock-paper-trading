@@ -18,8 +18,8 @@
 cargo test --locked --all-targets
 cargo build --release --locked
 python3 -m unittest discover -s research -p 'test_*.py' -v
+python3 -m unittest discover -s data_sources -p 'test_*.py' -v
 (cd web && npm ci --no-audit --no-fund && npm run build)
-bash scripts/smoke.sh
 ```
 
 锁文件只在有意更新依赖时重新生成，并将差异、工具链版本及完整 CI 一并提交。

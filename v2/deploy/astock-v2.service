@@ -1,6 +1,6 @@
 [Unit]
-Description=AStock V2 paper-trading kernel
-Documentation=https://github.com/daviesjoin-afk/astock-paper-trading/blob/master/v2/docs/OPERATIONS.md
+Description=AStock V2 rewrite paper-trading kernel
+Documentation=https://github.com/daviesjoin-afk/astock-paper-trading/blob/master/v2/deploy/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -8,16 +8,16 @@ Wants=network-online.target
 Type=simple
 User=astock
 Group=astock
-EnvironmentFile=/etc/astock-v2.env
-ExecStart=/opt/astock-v2/bin/astock-v2
+EnvironmentFile=/etc/astock-v2-rewrite.env
+ExecStart=/opt/astock-v2-rewrite/bin/astock-v2
 Restart=on-failure
 RestartSec=3
-StateDirectory=astock-v2
+StateDirectory=astock-v2-rewrite
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/astock-v2 /var/backups/astock-v2
+ReadWritePaths=/var/lib/astock-v2-rewrite /var/backups/astock-v2-rewrite
 AmbientCapabilities=
 
 [Install]

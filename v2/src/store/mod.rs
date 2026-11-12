@@ -1,2428 +1,2543 @@
-//! SQLite is an append-only simulation ledger with exactly one Rust write owner.
-use crate::domain::{decide, validate_quote_import, Fill, Lot, Outcome, POLICY_VERSION, PortfolioState, QuoteEvidence, QuoteImport, QuoteRef, QuoteTrust, RuleError, SimulationRequest};
-use crate::domain::{TradingCalendar, SessionPolicy, BUNDLED_CALENDAR_JSON, BUNDLED_SESSION_POLICY_JSON};
-use crate::domain::{InstrumentSnapshot, BUNDLED_INSTRUMENTS_JSON};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use crate::domain::{Experiment, ExperimentSpec, ExperimentStatus, StrategyArtifact, MARKET_DATA_PACK_ID, MarketDataPack, MarketDataPackManifest};
-use crate::domain::{ResearchInputManifest, ResearchOutput};
+//! SQLite is the only writer. A trading day is one atomic commit: settle,
+//! plan, execute, value and rebalance either all succeed or none do.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
+
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+
+use crate::domain::{
+    apply_buy, apply_sell, classify_series, drawdown_bps, fees_cents,
+    initial_split, orders_for_day_in_split, performance_curve, propose, score, score_signal, settle_overnight, AccountSpec,
+    AccountView, AdvanceResult, DayRun, IndexedPriceSet, PositionView, PriceCoverage, PriceSet,
+    PerformanceInput, PerformancePoint, Rebalance, RegimeView, RuleError, SignalScore, SlotBook, SlotPolicy, SlotSpec, SlotView,
+    StrategyId, Trade,
+};
+
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// One unadjusted bar row read for settlement, including the session fields a
+/// price-limit seal needs. The close alone cannot tell a sealed session from
+/// one that traded through its limit.
+pub struct UnadjustedRow {
+    pub symbol: String,
+    pub day: String,
+    pub price_cents: i64,
+    pub tradable: bool,
+    pub open_cents: i64,
+    pub high_cents: i64,
+    pub low_cents: i64,
+    pub prev_close_cents: i64,
+}
+
+/// How many trailing closes a strategy needs to decide today.
+///
+/// The longest requirement in `domain::strategy` is 61 closes (a 60-day mean
+/// plus the latest bar). Anything older cannot change the signal, so there is
+/// no reason to carry it through the moving-average code -- on a 5.3k-symbol
+/// universe that difference is ~4M rows versus ~320k per settled day.
+pub const SIGNAL_LOOKBACK_DAYS: usize = 61;
+
+/// Trading days of history the market-regime classifier needs.
+///
+/// Two slow windows: one to measure, one to make sure the fast average is not
+/// dominated by a handful of days when a slice of the market was missing.
+pub const REGIME_LOOKBACK_DAYS: usize = 120;
 
 #[derive(Debug)]
 pub enum StoreError {
     Database(rusqlite::Error),
     Encoding(serde_json::Error),
     Rules(RuleError),
+    NotFound(String),
     Conflict(String),
     Integrity(String),
-    NotFound(String),
 }
 
-impl fmt::Display for StoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl From<rusqlite::Error> for StoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<serde_json::Error> for StoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encoding(error)
+    }
+}
+
+impl From<RuleError> for StoreError {
+    fn from(error: RuleError) -> Self {
+        Self::Rules(error)
+    }
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Database(error) => write!(f, "database: {error}"),
-            Self::Encoding(error) => write!(f, "encoding: {error}"),
-            Self::Rules(error) => write!(f, "rules: {error}"),
-            Self::Conflict(error) => write!(f, "conflict: {error}"),
-            Self::Integrity(error) => write!(f, "integrity: {error}"),
-            Self::NotFound(error) => write!(f, "not found: {error}"),
+            Self::Database(error) => write!(formatter, "database: {error}"),
+            Self::Encoding(error) => write!(formatter, "encoding: {error}"),
+            Self::Rules(error) => write!(formatter, "rules: {error}"),
+            Self::NotFound(error) => write!(formatter, "not_found: {error}"),
+            Self::Conflict(error) => write!(formatter, "conflict: {error}"),
+            Self::Integrity(error) => write!(formatter, "integrity: {error}"),
         }
     }
 }
+
 impl std::error::Error for StoreError {}
-impl From<rusqlite::Error> for StoreError {
-    fn from(value: rusqlite::Error) -> Self { Self::Database(value) }
-}
-impl From<serde_json::Error> for StoreError {
-    fn from(value: serde_json::Error) -> Self { Self::Encoding(value) }
-}
-impl From<RuleError> for StoreError {
-    fn from(value: RuleError) -> Self { Self::Rules(value) }
-}
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunRecord {
-    pub id: i64,
-    pub request: SimulationRequest,
-    pub evidence: Option<QuoteEvidence>,
-    pub calendar_version: String,
-    pub session_policy_version: String,
-    pub instrument_version: String,
-    pub outcome: Outcome,
-    pub duplicate: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PositionView {
-    pub symbol: String,
-    pub quantity: i64,
-    pub sellable_quantity: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PortfolioView {
-    pub cycle_id: String,
-    pub initial_cash_cents: i64,
-    pub cash_cents: i64,
-    pub asof_day: Option<String>,
-    pub positions: Vec<PositionView>,
-    pub lots: Vec<Lot>,
-    pub runs_total: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayReport {
-    pub cycle_id: String,
-    pub ok: bool,
-    pub runs_verified: usize,
-    pub fills_verified: usize,
-    pub cash_cents: i64,
-}
-
-/// One strategy slot of a paper account: its own budget, cash and positions.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperSlotView {
-    pub slot: String,
-    pub strategy_version_id: String,
-    /// Version after applying the switch chain (equals the spec version when empty).
-    pub current_strategy_version_id: String,
-    pub switch_count: i64,
-    pub research_input_id: String,
-    pub market_data_pack_id: String,
-    pub execution_policy_version: String,
-    pub weight_bps: i64,
-    pub budget_cents: i64,
-    pub cash_cents: i64,
-    pub positions: Vec<PositionView>,
-    pub orders_total: i64,
-}
-
-/// One side of a read-only experiment comparison.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompareSide {
-    pub cycle_id: String,
-    pub cash_cents: i64,
-    pub initial_cash_cents: i64,
-    pub runs_total: i64,
-    pub positions: usize,
-    pub asof_day: Option<String>,
-    pub replay_ok: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompareReport {
-    pub base: CompareSide,
-    pub candidate: CompareSide,
-    pub cash_delta_cents: i64,
-}
-
-/// Read-only preview of what an account advance to `day` would do.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdvancePreview {
-    pub account_id: String,
-    pub day: String,
-    pub sessions: Vec<SessionSteps>,
-    pub total_steps: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSteps {
-    pub session_id: String,
-    pub steps: i64,
-}
-
-/// Counters exposed by `GET /v2/health`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthCounts {
-    pub accounts: i64,
-    pub sessions_active: i64,
-    pub reviewed_price_sets: i64,
-    pub synthetic_price_sets: i64,
-    pub evolution_events: i64,
-}
-
-/// One append-only strategy-version switch on a paper slot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StrategySwitchRecord {
-    pub switch_id: String,
-    pub account_id: String,
-    pub slot: String,
-    pub from_version: String,
-    pub to_version: String,
-    pub effective_from: String,
-    pub reason: String,
-    pub digest: String,
-}
-
-/// One user-funded paper account with two frozen strategy slots.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperAccountView {
-    pub account_id: String,
-    pub initial_cash_cents: i64,
-    pub created_at: String,
-    /// Reserve plus every slot's cash. Never below zero, never above initial.
-    pub cash_cents: i64,
-    pub reserve_cents: i64,
-    pub slots: Vec<PaperSlotView>,
-    /// No reviewed price set exists yet, so no market value or return is computed.
-    pub valuation: PaperValuation,
-    pub limits: crate::domain::PaperRiskLimits,
-}
-
-/// Summary returned by a batch run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperSessionRun {
-    pub session: PaperSessionView,
-    pub steps: usize,
-    pub filled: usize,
-    pub rejected: usize,
-}
-
-/// One slot's price requirements for a valuation snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperValuationRequirement {
-    pub slot: String,
-    pub market_data_pack_id: String,
-    pub symbols: Vec<String>,
-}
-
-/// Why a valuation cannot be produced. Deliberately contains no value fields:
-/// until a reviewed price set exists, nothing may be marked to market.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperValuationReport {
-    pub account_id: String,
-    pub as_of_day: String,
-    pub status: String,
-    pub reason: String,
-    pub requirements: Vec<PaperValuationRequirement>,
-    pub missing: Vec<String>,
-    pub priced_symbols: usize,
-    /// Present only when a reviewed set covered the book.
-    pub valuation: Option<crate::domain::AccountValuation>,
-    pub digest: String,
-}
-
-/// Valuation availability for an account. Always explicit, never inferred.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperValuation {
-    pub status: String,
-    pub reason: String,
-}
-
-/// One window of a rolling validation, valued or explicitly unavailable.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SegmentResult {
-    pub days: Vec<String>,
-    pub status: String,
-    pub reason: String,
-    pub performance: Option<ExperimentPerformanceReport>,
-}
-
-/// Rolling windows for one experiment; each window must stand on its own.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SegmentReport {
-    pub cycle_id: String,
-    pub segments: Vec<SegmentResult>,
-    pub digest: String,
-}
-
-/// Performance metrics for one experiment cycle over a reviewed series.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExperimentPerformanceReport {
-    pub cycle_id: String,
-    pub days: usize,
-    pub start_equity_cents: i64,
-    pub end_equity_cents: i64,
-    pub profit_cents: i64,
-    pub return_bps: i64,
-    pub max_drawdown_cents: i64,
-    pub max_drawdown_day: Option<String>,
-    pub drawdown_bps: i64,
-    pub fees_cents: i64,
-    pub trades: usize,
-    pub price_set_id: String,
-    pub digest: String,
-}
-
-/// Performance metrics over a complete reviewed equity series.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerformanceReport {
-    pub account_id: String,
-    pub days: usize,
-    pub start_equity_cents: i64,
-    pub end_equity_cents: i64,
-    pub profit_cents: i64,
-    pub return_bps: i64,
-    pub max_drawdown_cents: i64,
-    pub max_drawdown_day: Option<String>,
-    pub drawdown_bps: i64,
-    pub fees_cents: i64,
-    pub trades: usize,
-    pub price_set_id: String,
-    pub digest: String,
-}
-
-/// Which (symbol, day) pairs a reviewed price set still has to cover.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissingPrice {
-    pub symbol: String,
-    pub day: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PriceCoverageReport {
-    pub pack_id: String,
-    pub symbols: Vec<String>,
-    pub days: Vec<String>,
-    pub covered_pairs: i64,
-    pub missing: Vec<MissingPrice>,
-    pub digest: String,
-}
-
-/// Session counts for one account, by lifecycle status.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionCounts {
-    pub created: i64,
-    pub running: i64,
-    pub paused: i64,
-    pub completed: i64,
-    pub stopped: i64,
-}
-
-/// Compact slot facts for the multi-account overview.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountSlotOverview {
-    pub slot: String,
-    pub weight_bps: i64,
-    pub budget_cents: i64,
-    pub cash_cents: i64,
-}
-
-/// One row of the account overview: money, sessions and audit health.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountOverview {
-    pub account_id: String,
-    pub initial_cash_cents: i64,
-    pub cash_cents: i64,
-    pub reserve_cents: i64,
-    pub created_at: String,
-    pub slots: Vec<AccountSlotOverview>,
-    pub sessions: SessionCounts,
-    pub audit_ok: bool,
-}
-
-/// Auditable snapshot of a filtered slice of the evolution log.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvolutionExport {
-    pub schema_version: u32,
-    pub candidate_id: Option<String>,
-    pub status: Option<String>,
-    pub from_day: Option<String>,
-    pub to_day: Option<String>,
-    pub count: i64,
-    pub events: Vec<EvolutionEventRecord>,
-    pub digest: String,
-}
-
-/// Query options for the evolution event log (all filters optional).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EvolutionQuery<'a> {
-    pub limit: i64,
-    pub candidate_id: Option<&'a str>,
-    pub status: Option<&'a str>,
-    pub base_cycle: Option<&'a str>,
-    pub candidate_cycle: Option<&'a str>,
-    /// Inclusive China-day bounds (`YYYY-MM-DD`).
-    pub from_day: Option<&'a str>,
-    pub to_day: Option<&'a str>,
-}
-
-/// Cursor-paginated variant of the same filters.
-#[derive(Clone, Copy, Debug)]
-pub struct EvolutionPageQuery<'a> {
-    pub query: EvolutionQuery<'a>,
-    pub before: Option<&'a str>,
-    pub before_id: Option<&'a str>,
-    pub after: Option<&'a str>,
-}
-
-/// One page of the evolution event log, newest first.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvolutionEventPage {
-    pub events: Vec<EvolutionEventRecord>,
-    pub next_before: Option<String>,
-    pub next_before_id: Option<String>,
-    pub scanned: usize,
-}
-
-/// Version-independent identity of one research signal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignalFingerprint {
-    pub decision_at: String,
-    pub quote_ref: crate::domain::QuoteRef,
-    pub symbol: String,
-    pub side: crate::domain::Side,
-}
-
-/// Read-only comparison of two experiments' signals.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignalDiffReport {
-    pub base_cycle: String,
-    pub candidate_cycle: String,
-    pub base_runs: usize,
-    pub candidate_runs: usize,
-    pub matched: i64,
-    pub base_only: Vec<SignalFingerprint>,
-    pub candidate_only: Vec<SignalFingerprint>,
-    pub digest: String,
-}
-
-/// One persisted evolution decision. Evidence metrics travel with it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvolutionEventRecord {
-    pub event_id: String,
-    pub candidate_id: String,
-    pub status: String,
-    pub decision: crate::domain::EvolutionDecision,
-    pub decided_at: String,
-    /// Optional experiment whose metrics formed the incumbent side.
-    pub base_cycle: Option<String>,
-    /// Optional experiment that produced the candidate metrics.
-    pub candidate_cycle: Option<String>,
-    pub digest: String,
-}
-
-/// Aggregate result of advancing every running session on an account.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountAdvance {
-    pub account_id: String,
-    pub day: String,
-    pub sessions: Vec<PaperSessionRun>,
-    pub steps: usize,
-    pub filled: usize,
-    pub rejected: usize,
-}
-
-/// One applied capital rebalance: cash moved between slots plus the weight change.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebalanceRecord {
-    pub account_id: String,
-    pub from_slot: String,
-    pub to_slot: String,
-    pub amount_cents: i64,
-    pub weights_before: [i64; 2],
-    pub weights_after: [i64; 2],
-    pub applied_at: String,
-    pub note: String,
-    pub proposal_digest: String,
-    pub digest: String,
-}
-
-/// Allocation proposal plus the scores it was derived from.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllocationReport {
-    pub proposal: crate::domain::AllocationProposal,
-    pub scores: Vec<crate::domain::SlotScore>,
-    pub policy: crate::domain::AllocationPolicy,
-}
-
-/// One invariant check in an account audit.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperAuditCheck {
-    pub name: String,
-    pub ok: bool,
-    pub detail: String,
-}
-
-/// Read-only proof that the account ledger still balances and stays linked.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperAuditReport {
-    pub account_id: String,
-    pub ok: bool,
-    pub checks: Vec<PaperAuditCheck>,
-    pub digest: String,
-}
-
-/// Status snapshot of one deterministic paper session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperSessionView {
-    pub session_id: String,
-    pub account_id: String,
-    pub status: String,
-    pub clock_at: String,
-    pub cursor: usize,
-    pub total: usize,
-    pub last_order_id: Option<i64>,
-}
-
-/// Result of advancing one deterministic step.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperSessionStep {
-    pub session: PaperSessionView,
-    pub order: Option<PaperOrderRecord>,
-}
-
-/// Everything the account form needs to build a valid request.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StrategyCatalogue {
-    pub strategies: Vec<StrategySummary>,
-    pub market_data_pack_id: String,
-    pub execution_policy_version: String,
-    pub reserve_bps: i64,
-}
-
-/// Reviewed strategy available to the account form. Content identity only.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StrategySummary {
-    pub strategy_version_id: String,
-    pub research_input_id: String,
-    pub research_input_digest: String,
-}
-
-/// Lightweight account row for the console picker.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperAccountSummarySlot {
-    pub slot: String,
-    pub strategy_version_id: String,
-    pub weight_bps: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperAccountSummary {
-    pub account_id: String,
-    pub initial_cash_cents: i64,
-    pub reserve_bps: i64,
-    pub created_at: String,
-    pub slots: Vec<PaperAccountSummarySlot>,
-}
-
-/// One simulated order recorded against a strategy slot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaperOrderRecord {
-    pub id: i64,
-    pub account_id: String,
-    pub slot: String,
-    pub strategy_version_id: String,
-    pub request: crate::domain::PaperOrderRequest,
-    pub outcome: Outcome,
-    pub duplicate: bool,
-}
-
-/// Read-only catalogue: available rows plus how many stored rows exist and how
-/// many are unreadable. A single corrupt row never hides the rest.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExperimentCatalogue {
-    pub experiments: Vec<ExperimentSummary>,
-    pub total: i64,
-    pub skipped: usize,
-}
-
-/// Read-only catalogue row for the experiment picker. Summary of stored facts
-/// only: no valuation, no derived return, no invented timestamp.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExperimentSummary {
-    pub cycle_id: String,
-    pub status: ExperimentStatus,
-    pub strategy_version_id: String,
-    pub research_input_id: String,
-    pub market_data_pack_id: String,
-    pub execution_policy_version: String,
-    pub initial_cash_cents: i64,
-    pub runs_total: i64,
-}
-
-/// Proof that one experiment realized exactly the reviewed research signals for
-/// its frozen strategy definition and frozen research input. It describes
-/// research identity only: fills, prices, fees and cash stay with replay.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResearchReproductionReport {
-    pub cycle_id: String,
-    pub ok: bool,
-    pub strategy_version_id: String,
-    pub research_input_id: String,
-    pub research_output_id: String,
-    pub research_output_digest: String,
-    pub parameters_digest: String,
-    pub source_digest: String,
-    pub signals_verified: usize,
-}
-
 pub struct Store {
-    conn: Connection,
+    pub conn: Connection,
+    /// When false, the aggressive slot ignores the market regime and uses its
+    /// baseline policy.
+    ///
+    /// Exists so a replay can compare "with the filter" against "without it"
+    /// on identical data. A regime filter that cannot be switched off cannot
+    /// be shown to help, and the whole point of adding it was a measured
+    /// claim, so it has to stay measurable.
+    pub regime_filter: bool,
+    /// When true, a trading day is decided from the previous session's close
+    /// and filled at today's close. The default keeps the same-close book that
+    /// earlier results were measured on, so the two timings can be compared on
+    /// identical input instead of one replacing the other's baseline.
+    ///
+    /// A halt is still a halt: a symbol with no tradable close today remains
+    /// untouched until it trades again, so a suspended name is skipped for
+    /// that session rather than carried at a stale price.
+    pub next_session_fills: bool,
 }
 
 impl Store {
-    pub fn open(path: &str) -> StoreResult<Self> {
-        Self::with_connection(Connection::open(path)?)
-    }
-
-    pub fn in_memory() -> StoreResult<Self> {
-        Self::with_connection(Connection::open_in_memory()?)
-    }
-
-    fn with_connection(mut conn: Connection) -> StoreResult<Self> {
-        const APPLICATION_ID: i64 = 0x41535632; // ASV2, independent SQLite file identity.
-        const SCHEMA_VERSION: i64 = 15;
-        // Everything above the acceptance boundary is read-only. In particular,
-        // journal_mode, CREATE, metadata writes and transactions must wait.
-        let objects: Vec<(String, String, String)> = conn.prepare(
-            "SELECT type,name,tbl_name FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY name"
-        )?.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
-            .collect::<Result<_, _>>()?;
-        let app_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let fresh = objects.is_empty() && app_id == 0 && version == 0;
-        if !fresh {
-            if objects.iter().any(|(_, name, _)| matches!(name.as_str(),
-                "paper_orders" | "paper_fills" | "dual_ai_tuning_runs")) {
-                return Err(StoreError::Integrity("refusing_to_open_legacy_v1_database".into()));
-            }
-            if app_id != APPLICATION_ID || version != SCHEMA_VERSION {
-                return Err(StoreError::Integrity("database_identity_or_schema_version_mismatch".into()));
-            }
-            let tables: &[(&str, &[&str])] = &[
-                ("v2_meta", &["key", "value"]),
-                ("v2_experiments", &["cycle_id", "spec_json", "status", "pack_manifest_json"]),
-                ("v2_market_data_packs", &["pack_id", "pack_json"]),
-                ("v2_research_inputs", &["research_input_id", "manifest_json"]),
-                ("v2_strategy_artifacts", &["strategy_version_id", "artifact_json"]),
-                ("v2_simulation_runs", &["id", "cycle_id", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
-                ("v2_fills", &["id", "run_id", "fill_json"]),
-                ("v2_quote_evidence", &["pack_id", "source", "quote_id", "evidence_json"]),
-                ("v2_paper_accounts", &["account_id", "spec_json", "created_at", "weights_json"]),
-                ("v2_paper_orders", &["id", "account_id", "slot", "strategy_version_id", "signal_id", "request_json", "evidence_json", "outcome_json", "calendar_version", "session_policy_version", "instrument_version"]),
-                ("v2_paper_fills", &["id", "order_id", "fill_json"]),
-                ("v2_paper_sessions", &["session_id", "account_id", "spec_json", "status", "clock_at", "cursor", "last_order_id"]),
-                ("v2_paper_transfers", &["id", "account_id", "from_slot", "to_slot", "amount_cents", "applied_at", "note", "digest", "weights_before_json", "weights_after_json"]),
-                ("v2_evolution_events", &["event_id", "candidate_id", "status", "decision_json", "decided_at", "digest", "base_cycle", "candidate_cycle"]),
-            ("v2_paper_slot_switches", &["switch_id", "account_id", "slot", "from_version", "to_version", "effective_from", "reason", "digest"]),
-            ];
-            for (kind, name, table) in &objects {
-                let known = (kind == "table" && tables.iter().any(|(t, _)| t == name))
-                    || (kind == "index" && name == "idx_v2_runs_cycle" && table == "v2_simulation_runs")
-                || (kind == "index" && name == "idx_v2_paper_orders_account" && table == "v2_paper_orders");
-                if !known {
-                    return Err(StoreError::Integrity("unknown_database_schema".into()));
-                }
-            }
-            for (table, expected_columns) in tables {
-                let actual: Vec<String> = conn.prepare(&format!("PRAGMA table_info({table})"))?
-                    .query_map([], |r| r.get(1))?.collect::<Result<_, _>>()?;
-                if actual != *expected_columns {
-                    return Err(StoreError::Integrity("unexpected_or_incomplete_v2_schema".into()));
-                }
-            }
-            let pack_ids = conn.prepare("SELECT pack_id FROM v2_market_data_packs")?
-                .query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-            for id in pack_ids { load_market_pack(&conn, &id)?; }
-            let input_ids = conn.prepare("SELECT research_input_id FROM v2_research_inputs")?
-                .query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-            for id in input_ids { load_research_input(&conn, &id)?; }
-            let mut stmt = conn.prepare("SELECT cycle_id FROM v2_experiments")?;
-            let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-            for id in ids { load_experiment(&conn, &id)?; }
-
-        }
-
-        if fresh {
-            let calendar: TradingCalendar = serde_json::from_str(BUNDLED_CALENDAR_JSON)?;
-            let sessions: SessionPolicy = serde_json::from_str(BUNDLED_SESSION_POLICY_JSON)?;
-            let instruments: InstrumentSnapshot = serde_json::from_str(BUNDLED_INSTRUMENTS_JSON)?;
-            calendar.validate()?;
-            sessions.validate()?;
-            instruments.validate()?;
-        } // Existing packs and experiment references were verified above, before writes.
-        // Accepted empty/current V2 file only. No refused file reaches a write.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        if fresh {
-            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            txn.execute_batch(
-                "CREATE TABLE v2_meta (
-                    key TEXT PRIMARY KEY NOT NULL,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE v2_market_data_packs (
-                    pack_id TEXT PRIMARY KEY NOT NULL,
-                    pack_json TEXT NOT NULL
-                );
-                CREATE TABLE v2_research_inputs (
-                    research_input_id TEXT PRIMARY KEY NOT NULL,
-                    manifest_json TEXT NOT NULL
-                );
-                CREATE TABLE v2_strategy_artifacts (
-                    strategy_version_id TEXT PRIMARY KEY NOT NULL,
-                    artifact_json TEXT NOT NULL
-                );
-                CREATE TABLE v2_experiments (
-                    cycle_id TEXT PRIMARY KEY NOT NULL,
-                    spec_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('active','completed')),
-                    pack_manifest_json TEXT NOT NULL
-                );
-                CREATE TABLE v2_simulation_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cycle_id TEXT NOT NULL REFERENCES v2_experiments(cycle_id) ON DELETE RESTRICT,
-                    strategy_version_id TEXT NOT NULL,
-                    signal_id TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    outcome_json TEXT NOT NULL,
-                    calendar_version TEXT NOT NULL,
-                    session_policy_version TEXT NOT NULL,
-                    instrument_version TEXT NOT NULL,
-                    UNIQUE(cycle_id, strategy_version_id, signal_id)
-                );
-                CREATE TABLE v2_fills (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id INTEGER NOT NULL UNIQUE
-                        REFERENCES v2_simulation_runs(id) ON DELETE RESTRICT,
-                    fill_json TEXT NOT NULL
-                );
-                CREATE INDEX idx_v2_runs_cycle ON v2_simulation_runs(cycle_id, id);
-                CREATE TABLE v2_paper_accounts (
-                    account_id TEXT PRIMARY KEY NOT NULL,
-                    spec_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    weights_json TEXT NOT NULL DEFAULT '[]'
-                );
-                CREATE TABLE v2_paper_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT NOT NULL REFERENCES v2_paper_accounts(account_id) ON DELETE RESTRICT,
-                    slot TEXT NOT NULL CHECK(slot IN ('A','B')),
-                    strategy_version_id TEXT NOT NULL,
-                    signal_id TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    outcome_json TEXT NOT NULL,
-                    calendar_version TEXT NOT NULL,
-                    session_policy_version TEXT NOT NULL,
-                    instrument_version TEXT NOT NULL,
-                    UNIQUE(account_id, slot, strategy_version_id, signal_id)
-                );
-                CREATE INDEX idx_v2_paper_orders_account ON v2_paper_orders(account_id, slot, id);
-                CREATE TABLE v2_paper_fills (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id INTEGER NOT NULL UNIQUE REFERENCES v2_paper_orders(id) ON DELETE RESTRICT,
-                    fill_json TEXT NOT NULL
-                );
-                CREATE TABLE v2_paper_sessions (
-                    session_id TEXT PRIMARY KEY NOT NULL,
-                    account_id TEXT NOT NULL REFERENCES v2_paper_accounts(account_id) ON DELETE RESTRICT,
-                    spec_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('created','running','paused','stopped','completed')),
-                    clock_at TEXT NOT NULL,
-                    cursor INTEGER NOT NULL,
-                    last_order_id INTEGER
-                );
-                CREATE TABLE v2_paper_transfers (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT NOT NULL REFERENCES v2_paper_accounts(account_id) ON DELETE RESTRICT,
-                    from_slot TEXT NOT NULL CHECK(from_slot IN ('A','B')),
-                    to_slot TEXT NOT NULL CHECK(to_slot IN ('A','B')),
-                    amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
-                    applied_at TEXT NOT NULL,
-                    note TEXT NOT NULL,
-                    digest TEXT NOT NULL,
-                    weights_before_json TEXT NOT NULL,
-                    weights_after_json TEXT NOT NULL,
-                    UNIQUE(account_id, digest)
-                );
-                CREATE TABLE v2_paper_slot_switches (
-                    switch_id TEXT PRIMARY KEY NOT NULL,
-                    account_id TEXT NOT NULL,
-                    slot TEXT NOT NULL,
-                    from_version TEXT NOT NULL,
-                    to_version TEXT NOT NULL,
-                    effective_from TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    digest TEXT NOT NULL
-                );
-                CREATE TABLE v2_evolution_events (
-                    event_id TEXT PRIMARY KEY NOT NULL,
-                    candidate_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    decision_json TEXT NOT NULL,
-                    decided_at TEXT NOT NULL,
-                    digest TEXT NOT NULL,
-                    base_cycle TEXT,
-                    candidate_cycle TEXT
-                );
-                CREATE TABLE v2_quote_evidence (
-                    pack_id TEXT NOT NULL REFERENCES v2_market_data_packs(pack_id) ON DELETE RESTRICT,
-                    source TEXT NOT NULL,
-                    quote_id TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    PRIMARY KEY(pack_id, source, quote_id)
-                );"
-            )?;
-            txn.pragma_update(None, "application_id", APPLICATION_ID)?;
-            txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            txn.execute("INSERT INTO v2_meta(key,value) VALUES('storage_contract','pack-ledger-v1')", [])?;
-            register_pack(&txn, &reviewed_market_pack(MARKET_DATA_PACK_ID)?)?;
-            txn.commit()?;
-        }
-        Ok(Self { conn })
-    }
-
-    /// Explicit, immutable capital ownership; no implicit default experiment.
-    pub fn create_experiment(&mut self, spec: ExperimentSpec) -> StoreResult<Experiment> {
-        validate_experiment_spec(&spec)?;
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<String> = txn.query_row("SELECT spec_json FROM v2_experiments WHERE cycle_id=?", [&spec.cycle_id], |r| r.get(0)).optional()?;
-        if let Some(raw) = existing {
-            if serde_json::from_str::<ExperimentSpec>(&raw)? != spec {
-                return Err(StoreError::Conflict("experiment_identity_payload_conflict".into()));
-            }
-            return load_experiment(&txn, &spec.cycle_id);
-        }
-        let pack = reviewed_market_pack(&spec.market_data_pack_id)?;
-        register_pack(&txn, &pack)?;
-        register_research_input(&txn, &reviewed_research_input(&spec.strategy.research_input_id)?)?;
-        let artifact: Option<String> = txn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0)).optional()?;
-        if let Some(raw) = artifact {
-            if serde_json::from_str::<StrategyArtifact>(&raw)? != spec.strategy {
-                return Err(StoreError::Conflict("strategy_artifact_identity_conflict".into()));
-            }
-        } else {
-            txn.execute("INSERT INTO v2_strategy_artifacts VALUES(?,?)", params![spec.strategy.strategy_version_id, serde_json::to_string(&spec.strategy)?])?;
-        }
-        txn.execute("INSERT INTO v2_experiments VALUES(?,?,'active',?)", params![spec.cycle_id, serde_json::to_string(&spec)?, serde_json::to_string(&pack.manifest)?])?;
-        txn.commit()?;
-        Ok(Experiment { spec, status: ExperimentStatus::Active })
-    }
-
-    pub fn complete_experiment(&mut self, cycle_id: &str) -> StoreResult<Experiment> {
-        // The HTTP mutex serializes this verification and transition with submit.
-        // BEGIN IMMEDIATE also serializes against other SQLite connections.
-        let txn = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        self.verify_replay(cycle_id)?;
-        txn.execute("UPDATE v2_experiments SET status='completed' WHERE cycle_id=?", [cycle_id])?;
-        let result = load_experiment(&txn, cycle_id)?;
-        txn.commit()?;
-        Ok(result)
-    }
-
-    /// Only reviewed IDs are accepted; there is no arbitrary pack upload API.
-    pub fn register_reviewed_pack(&mut self, pack_id: &str) -> StoreResult<MarketDataPack> {
-        let pack = reviewed_market_pack(pack_id)?;
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        register_pack(&txn, &pack)?;
-        txn.commit()?;
-        Ok(pack)
-    }
-
-    /// Immutable evidence, owned by the same single writer as the ledger.
-    pub fn ingest_quote(&mut self, input: QuoteImport) -> StoreResult<QuoteEvidence> {
-        validate_quote_import(&input)?;
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, _, instruments) = load_market_context(&txn, &input.market_data_pack_id)?;
-        let identity = QuoteRef {
-            market_data_pack_id: input.market_data_pack_id.clone(),
-            source: input.quote.source.clone(), quote_id: input.quote.quote_id.clone(),
+    /// Offline research reads an existing rewrite database without migrations,
+    /// schema changes or creating a missing file. Ledger writes are rejected by SQLite.
+    pub fn open_market_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Pin one SQLite read snapshot for the entire comparison, even if an
+        // ingestion process appends bars while this connection is alive.
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let legacy: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let store = Self {
+            conn,
+            regime_filter: true,
+            next_session_fills: false,
         };
-        if let Some(stored) = load_evidence(&txn, &identity)? {
-            if stored.quote != input.quote || stored.available_at != input.available_at
-                || stored.execution != input.execution {
-                return Err(StoreError::Conflict("quote_identity_payload_conflict".into()));
-            }
-            verify_instrument_identity(&instruments, &stored)?;
-            return Ok(stored);
+        if legacy != 0 || store.schema_version()? != SCHEMA_VERSION {
+            return Err(StoreError::Integrity("unsupported_replay_schema".into()));
         }
-        // Only this Rust ingress records actual receipt. Caller declarations
-        // remain offline claims and never become authenticated provider facts.
-        let received_at = chrono::Utc::now()
-            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid China offset"))
-            .to_rfc3339();
-        let evidence = QuoteEvidence {
-            schema_version: 5,
-            market_data_pack_id: input.market_data_pack_id,
-            instrument: instruments.identity(&input.quote.symbol).cloned(),
-            available_at: input.available_at, quote: input.quote,
-            execution: input.execution,
-            trust_level: QuoteTrust::OfflineFixture,
-            provider_published_at: None, received_at,
-        };
-        txn.execute(
-            "INSERT INTO v2_quote_evidence(pack_id,source,quote_id,evidence_json) VALUES(?,?,?,?)",
-            params![identity.market_data_pack_id, identity.source, identity.quote_id, serde_json::to_string(&evidence)?],
-        )?;
-        txn.commit()?;
-        Ok(evidence)
+        Ok(store)
     }
 
-    /// All mutations and idempotency checks occur under one IMMEDIATE transaction.
-    pub fn submit(&mut self, request: SimulationRequest) -> StoreResult<RunRecord> {
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let experiment = load_experiment(&txn, &request.cycle_id)?;
-        if request.schema_version != 4 {
-            return Err(StoreError::Rules(RuleError("unsupported_contract_version".into())));
-        }
-        if request.strategy_version_id != experiment.spec.strategy.strategy_version_id {
-            return Err(StoreError::Conflict("experiment_strategy_mismatch".into()));
-        }
-        if request.quote_ref.market_data_pack_id != experiment.spec.market_data_pack_id {
-            return Err(StoreError::Conflict("experiment_quote_data_pack_mismatch".into()));
-        }
-        let (calendar, sessions, instruments) = load_market_context(&txn, &experiment.spec.market_data_pack_id)?;
-        let prior: Option<(i64, String, String, String, String, String, String)> = txn.query_row(
-            "SELECT id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version FROM v2_simulation_runs
-             WHERE cycle_id=? AND strategy_version_id=? AND signal_id=?",
-            params![request.cycle_id, request.strategy_version_id, request.signal_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-        ).optional()?;
-        if let Some((id, raw_request, raw_outcome, raw_evidence, calendar_version, session_policy_version, instrument_version)) = prior {
-            verify_market_versions(&calendar, &sessions, &instruments, &calendar_version, &session_policy_version, &instrument_version, id)?;
-            let old_request: SimulationRequest = serde_json::from_str(&raw_request)?;
-            if old_request != request {
-                return Err(StoreError::Conflict(
-                    "same_signal_identity_with_different_request".into()
-                ));
-            }
-            let outcome = serde_json::from_str(&raw_outcome)?;
-            let evidence: Option<QuoteEvidence> = serde_json::from_str(&raw_evidence)?;
-            if let Some(pinned) = &evidence {
-                if pinned.market_data_pack_id != request.quote_ref.market_data_pack_id
-                    || pinned.quote.source != request.quote_ref.source || pinned.quote.quote_id != request.quote_ref.quote_id {
-                    return Err(StoreError::Integrity("stored_evidence_identity_mismatch".into()));
-                }
-                verify_instrument_identity(&instruments, pinned)?;
-                if load_evidence(&txn, &request.quote_ref)?.as_ref() != Some(pinned) {
-                    return Err(StoreError::Integrity("stored_evidence_payload_mismatch".into()));
-                }
-            }
-            return Ok(RunRecord { id, request, evidence, calendar_version, session_policy_version, instrument_version, outcome, duplicate: true });
-        }
-        if experiment.status != ExperimentStatus::Active {
-            return Err(StoreError::Conflict("experiment_completed".into()));
-        }
-        // V2 is append-only. Out-of-order historical corrections require a
-        // separate explicit rebase/import operation; never silently recalculate
-        // past positions by appending a request with an earlier decision time.
-        let previous_request: Option<String> = txn.query_row(
-            "SELECT request_json FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id DESC LIMIT 1",
-            [&request.cycle_id], |row| row.get(0),
-        ).optional()?;
-        if let Some(raw) = previous_request {
-            let previous: SimulationRequest = serde_json::from_str(&raw)?;
-            let previous_at = chrono::DateTime::parse_from_rfc3339(&previous.decision_at)
-                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
-            let next_at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
-                .map_err(|_| StoreError::Rules(RuleError("invalid_decision_time".into())))?;
-            if next_at < previous_at {
-                return Err(StoreError::Conflict(
-                    "out_of_order_decision_requires_separate_replay_branch".into()
-                ));
-            }
-        }
-        let state = load_state(&txn, &experiment.spec)?;
-        let evidence = load_evidence(&txn, &request.quote_ref)?;
-        if let Some(pinned) = &evidence { verify_instrument_identity(&instruments, pinned)?; }
-        let outcome = decide(&state, &request, evidence.as_ref(), &calendar, &sessions, &instruments)?;
-        txn.execute(
-            "INSERT INTO v2_simulation_runs
-             (cycle_id,strategy_version_id,signal_id,request_json,outcome_json,evidence_json,calendar_version,session_policy_version,instrument_version)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
-                request.cycle_id, request.strategy_version_id, request.signal_id,
-                serde_json::to_string(&request)?, serde_json::to_string(&outcome)?,
-                serde_json::to_string(&evidence)?, calendar.version, sessions.version, instruments.version
-            ],
-        )?;
-        let id = txn.last_insert_rowid();
-        if let Some(fill) = &outcome.fill {
-            txn.execute(
-                "INSERT INTO v2_fills(run_id,fill_json) VALUES(?,?)",
-                params![id, serde_json::to_string(fill)?],
-            )?;
-        }
-        txn.commit()?;
-        Ok(RunRecord { id, request, evidence, calendar_version: calendar.version,
-            session_policy_version: sessions.version, instrument_version: instruments.version,
-            outcome, duplicate: false })
-    }
-
-}
-
-fn load_market_context(conn: &Connection, pack_id: &str) -> StoreResult<(TradingCalendar, SessionPolicy, InstrumentSnapshot)> {
-    let pack = load_market_pack(conn, pack_id)?;
-    Ok((pack.calendar, pack.sessions, pack.instruments))
-}
-
-/// The reviewed catalogue retains old definitions; no latest/current fallback.
-fn reviewed_market_pack(pack_id: &str) -> StoreResult<MarketDataPack> {
-    let (manifest, instruments) = match pack_id {
-        MARKET_DATA_PACK_ID => (include_str!("../../data/market-pack-1.json"), BUNDLED_INSTRUMENTS_JSON),
-        "cn-offline-fixture-pack-2" => (include_str!("../../data/market-pack-2.json"), include_str!("../../data/instruments-offline-v2.json")),
-        _ => return Err(StoreError::Rules(RuleError("unsupported_market_data_pack".into()))),
-    };
-    let pack = MarketDataPack {
-        manifest: serde_json::from_str(manifest)?,
-        calendar: serde_json::from_str(BUNDLED_CALENDAR_JSON)?,
-        sessions: serde_json::from_str(BUNDLED_SESSION_POLICY_JSON)?,
-        instruments: serde_json::from_str(instruments)?,
-    };
-    pack.calendar.validate()?;
-    pack.sessions.validate()?;
-    pack.instruments.validate()?;
-    if pack.manifest.pack_id != pack_id || pack.manifest.coverage_start != pack.instruments.coverage_start
-        || pack.manifest.coverage_end != pack.instruments.coverage_end || pack.manifest.sources.is_empty()
-        || pack.manifest.content_summary.len() != 3 {
-        return Err(StoreError::Integrity("invalid_reviewed_pack_manifest".into()));
-    }
-    Ok(pack)
-}
-
-/// Reviewed strategy research records: definition, source bytes, frozen input
-/// and the research output those two must reproduce.
-///
-/// A strategy definition is data plus the exact source bytes whose digest the
-/// artifact pins. Adding a strategy means adding both records and a reviewed
-/// definition, never accepting an uploaded one.
-fn strategy_source(strategy_version_id: &str) -> StoreResult<&'static str> {
-    Ok(match strategy_version_id {
-        "research-momentum-v1" => include_str!("../../research/strategies/momentum.py"),
-        "research-reversion-v1" => include_str!("../../research/strategies/reversion.py"),
-        _ => return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into()))),
-    })
-}
-
-fn reviewed_strategy_artifact(strategy_version_id: &str) -> StoreResult<StrategyArtifact> {
-    let raw = match strategy_version_id {
-        "research-momentum-v1" => include_str!("../../data/strategy-momentum-v1.json"),
-        "research-reversion-v1" => include_str!("../../data/strategy-reversion-v1.json"),
-        _ => return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into()))),
-    };
-    let artifact: StrategyArtifact = serde_json::from_str(raw)?;
-    artifact.verify_content()?;
-    if artifact.strategy_version_id != strategy_version_id {
-        return Err(StoreError::Integrity("reviewed_strategy_identity_mismatch".into()));
-    }
-    let source = crate::domain::normalize_newlines(strategy_source(strategy_version_id)?);
-    if artifact.source_digest != crate::domain::sha256_hex(source.as_bytes()) {
-        return Err(StoreError::Integrity("reviewed_strategy_source_digest_mismatch".into()));
-    }
-    Ok(artifact)
-}
-
-fn reviewed_research_input(research_input_id: &str) -> StoreResult<ResearchInputManifest> {
-    let raw = match research_input_id {
-        "offline-research-input-v1" => include_str!("../../data/research-input-offline-v1.json"),
-        _ => return Err(StoreError::Rules(RuleError("unsupported_research_input".into()))),
-    };
-    let manifest: ResearchInputManifest = serde_json::from_str(raw)?;
-    manifest.validate()?;
-    if manifest.research_input_id != research_input_id {
-        return Err(StoreError::Integrity("research_input_identity_mismatch".into()));
-    }
-    Ok(manifest)
-}
-
-fn reviewed_research_output(strategy_version_id: &str) -> StoreResult<ResearchOutput> {
-    let raw = match strategy_version_id {
-        "research-momentum-v1" => include_str!("../../data/research-output-momentum-v1.json"),
-        "research-reversion-v1" => include_str!("../../data/research-output-reversion-v1.json"),
-        _ => return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into()))),
-    };
-    let output: ResearchOutput = serde_json::from_str(raw)?;
-    output.validate()?;
-    if output.strategy_version_id != strategy_version_id {
-        return Err(StoreError::Integrity("reviewed_research_output_identity_mismatch".into()));
-    }
-    Ok(output)
-}
-
-fn register_research_input(conn: &Connection, manifest: &ResearchInputManifest) -> StoreResult<()> {
-    if *manifest != reviewed_research_input(&manifest.research_input_id)? {
-        return Err(StoreError::Conflict("research_input_identity_content_conflict".into()));
-    }
-    let existing: Option<String> = conn.query_row(
-        "SELECT manifest_json FROM v2_research_inputs WHERE research_input_id=?",
-        [&manifest.research_input_id], |r| r.get(0)).optional()?;
-    if let Some(raw) = existing {
-        if serde_json::from_str::<ResearchInputManifest>(&raw)? != *manifest {
-            return Err(StoreError::Conflict("research_input_identity_content_conflict".into()));
-        }
-    } else {
-        conn.execute("INSERT INTO v2_research_inputs VALUES(?,?)",
-            params![manifest.research_input_id, serde_json::to_string(manifest)?])?;
-    }
-    Ok(())
-}
-
-fn load_research_input(conn: &Connection, research_input_id: &str) -> StoreResult<ResearchInputManifest> {
-    let expected = reviewed_research_input(research_input_id)?;
-    let raw: Option<String> = conn.query_row(
-        "SELECT manifest_json FROM v2_research_inputs WHERE research_input_id=?",
-        [research_input_id], |r| r.get(0)).optional()?;
-    let saved: ResearchInputManifest = serde_json::from_str(
-        &raw.ok_or_else(|| StoreError::Integrity("research_input_missing".into()))?)?;
-    if saved != expected {
-        return Err(StoreError::Integrity("pinned_research_input_mismatch".into()));
-    }
-    Ok(saved)
-}
-
-fn register_pack(conn: &Connection, pack: &MarketDataPack) -> StoreResult<()> {
-    if *pack != reviewed_market_pack(&pack.manifest.pack_id)? {
-        return Err(StoreError::Conflict("pack_identity_content_conflict".into()));
-    }
-    let existing: Option<String> = conn.query_row("SELECT pack_json FROM v2_market_data_packs WHERE pack_id=?", [&pack.manifest.pack_id], |r| r.get(0)).optional()?;
-    if let Some(raw) = existing {
-        if serde_json::from_str::<MarketDataPack>(&raw)? != *pack {
-            return Err(StoreError::Conflict("pack_identity_content_conflict".into()));
-        }
-    } else {
-        conn.execute("INSERT INTO v2_market_data_packs VALUES(?,?)", params![pack.manifest.pack_id, serde_json::to_string(pack)?])?;
-    }
-    Ok(())
-}
-
-fn load_market_pack(conn: &Connection, pack_id: &str) -> StoreResult<MarketDataPack> {
-    let expected = reviewed_market_pack(pack_id)?;
-    let raw: Option<String> = conn.query_row("SELECT pack_json FROM v2_market_data_packs WHERE pack_id=?", [pack_id], |r| r.get(0)).optional()?;
-    let saved: MarketDataPack = serde_json::from_str(&raw.ok_or_else(|| StoreError::Integrity("market_data_pack_missing".into()))?)?;
-    if saved != expected { return Err(StoreError::Integrity("pinned_market_snapshot_mismatch".into())); }
-    Ok(saved)
-}
-
-fn verify_market_versions(
-    calendar: &TradingCalendar, sessions: &SessionPolicy, instruments: &InstrumentSnapshot,
-    calendar_version: &str, session_version: &str, instrument_version: &str, id: i64,
-) -> StoreResult<()> {
-    if calendar_version != calendar.version || session_version != sessions.version || instrument_version != instruments.version {
-        return Err(StoreError::Integrity(format!("run_market_version_mismatch_at_{id}")));
-    }
-    Ok(())
-}
-
-fn load_evidence(conn: &Connection, identity: &QuoteRef) -> StoreResult<Option<QuoteEvidence>> {
-    let raw: Option<String> = conn.query_row(
-        "SELECT evidence_json FROM v2_quote_evidence WHERE pack_id=? AND source=? AND quote_id=?",
-        params![identity.market_data_pack_id, identity.source, identity.quote_id], |row| row.get(0),
-    ).optional()?;
-    let evidence: Option<QuoteEvidence> = raw.map(|value| serde_json::from_str(&value)).transpose()?;
-    if evidence.as_ref().is_some_and(|e| e.market_data_pack_id != identity.market_data_pack_id
-        || e.quote.source != identity.source || e.quote.quote_id != identity.quote_id) {
-        return Err(StoreError::Integrity("stored_evidence_identity_mismatch".into()));
-    }
-    Ok(evidence)
-}
-
-// Storage referential integrity applies even to closed-date/rejected runs.
-fn verify_instrument_identity(snapshot: &InstrumentSnapshot, evidence: &QuoteEvidence) -> StoreResult<()> {
-    if evidence.instrument.as_ref() != snapshot.identity(&evidence.quote.symbol) {
-        return Err(StoreError::Integrity("stored_instrument_identity_mismatch".into()));
-    }
-    Ok(())
-}
-
-fn load_state(conn: &Connection, experiment: &ExperimentSpec) -> StoreResult<PortfolioState> {
-    let mut state = PortfolioState::new(experiment.initial_cash_cents);
-    let mut stmt = conn.prepare("SELECT f.fill_json FROM v2_fills f JOIN v2_simulation_runs r ON r.id=f.run_id WHERE r.cycle_id=? ORDER BY f.id")?;
-    let rows = stmt.query_map([&experiment.cycle_id], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let fill: Fill = serde_json::from_str(&row?)?;
-        state.apply(&fill)?;
-    }
-    Ok(state)
-}
-
-
-// Read models and replay cannot submit or commit trades.
-mod query;
-#[cfg(test)]
-mod tests;
-
-fn validate_experiment_spec(spec: &ExperimentSpec) -> StoreResult<()> {
-    fn key(s: &str) -> bool { !s.is_empty() && s.len() <= 128 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c)) }
-    if spec.schema_version != 1 || !key(&spec.cycle_id) || !key(&spec.strategy.strategy_version_id)
-        || !key(&spec.strategy.research_input_id) || spec.initial_cash_cents <= 0 {
-        return Err(StoreError::Rules(RuleError("invalid_experiment_spec".into())));
-    }
-    if spec.execution_policy_version != POLICY_VERSION {
-        return Err(StoreError::Rules(RuleError("unsupported_execution_policy".into())));
-    }
-    reviewed_market_pack(&spec.market_data_pack_id)?;
-    // Identity alone never authorizes an experiment: the artifact must equal the
-    // reviewed definition for that id, and its digests must be recomputable from
-    // repository bytes and the frozen research input.
-    spec.strategy.verify_content()?;
-    // Shadow candidates (ADR-014) reuse a reviewed source but carry their own
-    // parameters. They are research-only: the source digest must match one of
-    // the reviewed strategies, and the frozen input must still be reviewed.
-    if spec.strategy.strategy_version_id.starts_with("shadow-") {
-        let known_source = ["research-momentum-v1", "research-reversion-v1"]
-            .iter()
-            .filter_map(|id| reviewed_strategy_artifact(id).ok())
-            .any(|artifact| artifact.source_digest == spec.strategy.source_digest);
-        if !known_source {
-            return Err(StoreError::Rules(RuleError("unsupported_strategy_artifact".into())));
-        }
-        let input = reviewed_research_input(&spec.strategy.research_input_id)?;
-        if input.content_digest != spec.strategy.research_input_digest {
-            return Err(StoreError::Integrity("research_input_digest_mismatch".into()));
-        }
-        return Ok(());
-    }
-    let reviewed = reviewed_strategy_artifact(&spec.strategy.strategy_version_id)?;
-    if reviewed != spec.strategy {
-        return Err(StoreError::Conflict("strategy_artifact_content_mismatch".into()));
-    }
-    let input = reviewed_research_input(&spec.strategy.research_input_id)?;
-    if input.content_digest != spec.strategy.research_input_digest {
-        return Err(StoreError::Integrity("research_input_digest_mismatch".into()));
-    }
-    // The artifact fixes the input; an experiment that selects another pack can
-    // still be created, but its decisions can never match the frozen signals, so
-    // reproduction fails instead of silently claiming the same research result.
-    let output = reviewed_research_output(&spec.strategy.strategy_version_id)?;
-    if output.research_input_id != spec.strategy.research_input_id
-        || output.algorithm_version != spec.strategy.algorithm_version
-        || output.algorithm_digest != spec.strategy.source_digest
-        || output.parameters_digest != spec.strategy.parameters_digest
-        || output.research_input_digest != spec.strategy.research_input_digest {
-        return Err(StoreError::Integrity("reviewed_research_output_mismatch".into()));
-    }
-    Ok(())
-}
-
-fn load_experiment(conn: &Connection, cycle_id: &str) -> StoreResult<Experiment> {
-    let row: Option<(String, String, String)> = conn.query_row("SELECT spec_json,status,pack_manifest_json FROM v2_experiments WHERE cycle_id=?", [cycle_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
-    let (raw, status, raw_manifest) = row
-        .ok_or_else(|| StoreError::NotFound("experiment_not_found".into()))?;
-    let spec: ExperimentSpec = serde_json::from_str(&raw)?;
-    validate_experiment_spec(&spec)?;
-    let pack = load_market_pack(conn, &spec.market_data_pack_id)?;
-    if serde_json::from_str::<MarketDataPackManifest>(&raw_manifest)? != pack.manifest {
-        return Err(StoreError::Integrity("experiment_pack_reference_mismatch".into()));
-    }
-    if spec.cycle_id != cycle_id { return Err(StoreError::Integrity("experiment_identity_mismatch".into())); }
-    let raw_artifact: String = conn.query_row("SELECT artifact_json FROM v2_strategy_artifacts WHERE strategy_version_id=?", [&spec.strategy.strategy_version_id], |r| r.get(0))?;
-    if serde_json::from_str::<StrategyArtifact>(&raw_artifact)? != spec.strategy {
-        return Err(StoreError::Integrity("experiment_artifact_mismatch".into()));
-    }
-    // The frozen research input is an independently referenced fact; it must
-    // still resolve and still equal the reviewed bytes on every read.
-    load_research_input(conn, &spec.strategy.research_input_id)?;
-    let status = match status.as_str() {
-        "active" => ExperimentStatus::Active,
-        "completed" => ExperimentStatus::Completed,
-        _ => return Err(StoreError::Integrity("invalid_experiment_status".into())),
-    };
-    Ok(Experiment { spec, status })
-}
-// ---------------------------------------------------------------------------
-// Paper account: one user-funded account, two frozen strategy slots.
-// Store is the only writer; the split itself stays a pure domain decision.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    /// Register an account once. Re-posting the identical spec is idempotent;
-    /// a different spec under the same id is a conflict, never a silent update.
-    pub fn create_paper_account(
-        &mut self,
-        spec: crate::domain::PaperAccountSpec,
-    ) -> StoreResult<PaperAccountView> {
-        let split = spec.validate()?;
-        let raw = serde_json::to_string(&spec)?;
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for slot in &spec.slots {
-            if slot.execution_policy_version != POLICY_VERSION {
-                return Err(StoreError::Rules(RuleError("unsupported_execution_policy".into())));
-            }
-            load_market_pack(&txn, &slot.market_data_pack_id)?;
-        }
-        if let Some(existing) = txn
-            .query_row(
-                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
-                [&spec.account_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
+    pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        if path.as_ref() != Path::new(":memory:")
+            && let Some(parent) = path.as_ref().parent()
         {
-            if existing != raw {
-                return Err(StoreError::Conflict("paper_account_conflict".into()));
-            }
-            return Self::paper_account_view_with_conn(&txn, &spec, &split);
+            std::fs::create_dir_all(parent)
+                .map_err(|error| StoreError::Integrity(error.to_string()))?;
         }
-        txn.execute(
-            "INSERT INTO v2_paper_accounts(account_id,spec_json,created_at,weights_json) VALUES(?,?,?,?)",
-            params![
-                spec.account_id,
-                raw,
-                spec.created_at,
-                serde_json::to_string(&[
-                    spec.slots[0].weight_bps,
-                    spec.slots[1].weight_bps
-                ])?
-            ],
-        )?;
-        txn.commit()?;
-        Ok(Self::paper_account_view_with_conn(&self.conn, &spec, &split)?)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Paper account order path (ADR 005): slot-owned orders and fills.
-// Reuses the same pure decision policy as experiments; the slot owns budget,
-// cash and positions, and the reserve never trades.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    /// Current slot weights after any rebalances; falls back to the spec.
-    fn account_weights(
-        conn: &Connection,
-        spec: &crate::domain::PaperAccountSpec,
-    ) -> StoreResult<[i64; 2]> {
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT weights_json FROM v2_paper_accounts WHERE account_id=?",
-                [&spec.account_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(raw) = raw {
-            if let Ok(weights) = serde_json::from_str::<Vec<i64>>(&raw) {
-                if weights.len() == 2 && weights.iter().all(|weight| *weight > 0) {
-                    return Ok([weights[0], weights[1]]);
-                }
-            }
-        }
-        Ok([spec.slots[0].weight_bps, spec.slots[1].weight_bps])
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let store = Self {
+            conn,
+            regime_filter: true,
+            next_session_fills: false,
+        };
+        store.migrate()?;
+        Ok(store)
     }
 
-    fn paper_slot_state(
-        conn: &Connection,
-        spec: &crate::domain::PaperAccountSpec,
-        split: &crate::domain::PaperCapitalSplit,
-        slot_index: usize,
-    ) -> StoreResult<PortfolioState> {
-        let slot = if slot_index == 0 { "A" } else { "B" };
-        let mut state = PortfolioState::new(split.slot_budgets[slot_index]);
-        let mut statement = conn.prepare(
-            "SELECT f.fill_json FROM v2_paper_fills f
-             JOIN v2_paper_orders o ON o.id=f.order_id
-             WHERE o.account_id=? AND o.slot=? ORDER BY o.id",
-        )?;
-        let rows = statement.query_map(params![spec.account_id, slot], |row| {
-            row.get::<_, String>(0)
-        })?;
-        for row in rows {
-            let fill: Fill = serde_json::from_str(&row?)?;
-            state.apply(&fill).map_err(StoreError::Rules)?;
-        }
-        // Rebalances move cash only, and always after fills, so history is
-        // never reinterpreted by a later capital decision.
-        let mut transfers = conn.prepare(
-            "SELECT from_slot,to_slot,amount_cents FROM v2_paper_transfers
-             WHERE account_id=? ORDER BY id",
-        )?;
-        let rows = transfers.query_map([&spec.account_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (from, to, amount) = row?;
-            if from == slot {
-                state.cash_cents = state
-                    .cash_cents
-                    .checked_sub(amount)
-                    .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_cash_underflow".into())))?;
-            }
-            if to == slot {
-                state.cash_cents = state
-                    .cash_cents
-                    .checked_add(amount)
-                    .ok_or_else(|| StoreError::Rules(RuleError("paper_cash_overflow".into())))?;
-            }
-        }
-        Ok(state)
-    }
-
-    /// Append-only switch chain for one slot, oldest first.
-    pub(crate) fn slot_switches(
-        conn: &Connection,
-        account_id: &str,
-        slot: &str,
-    ) -> StoreResult<Vec<StrategySwitchRecord>> {
-        let mut statement = conn.prepare(
-            "SELECT switch_id,account_id,slot,from_version,to_version,effective_from,reason,digest
-             FROM v2_paper_slot_switches WHERE account_id=? AND slot=?
-             ORDER BY effective_from ASC, switch_id ASC",
-        )?;
-        let rows = statement.query_map(params![account_id, slot], |row| {
-            Ok(StrategySwitchRecord {
-                switch_id: row.get(0)?,
-                account_id: row.get(1)?,
-                slot: row.get(2)?,
-                from_version: row.get(3)?,
-                to_version: row.get(4)?,
-                effective_from: row.get(5)?,
-                reason: row.get(6)?,
-                digest: row.get(7)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// Version currently in force for a slot (last switch wins, spec otherwise).
-    fn effective_strategy_version(
-        conn: &Connection,
-        account_id: &str,
-        slot: &crate::domain::PaperSlotSpec,
-    ) -> StoreResult<String> {
-        Ok(Self::slot_switches(conn, account_id, slot.slot.as_str())?
-            .last()
-            .map(|record| record.to_version.clone())
-            .unwrap_or_else(|| slot.strategy.strategy_version_id.clone()))
-    }
-
-    /// Record one explicit strategy-version switch (no money moves).
-    pub fn record_strategy_switch(
-        &mut self,
-        account_id: &str,
-        slot: crate::domain::PaperSlotId,
-        to_version: &str,
-        effective_from: &str,
-        reason: &str,
-        switch_id: &str,
-    ) -> StoreResult<StrategySwitchRecord> {
-        let valid_id = !switch_id.is_empty()
-            && switch_id.len() <= 128
-            && switch_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_-.:@".contains(c));
-        if !valid_id {
-            return Err(StoreError::Rules(RuleError("invalid_switch_id".into())));
-        }
-        if reason.trim().is_empty() || reason.len() > 500 {
-            return Err(StoreError::Rules(RuleError("invalid_switch_reason".into())));
-        }
-        if to_version.trim().is_empty() {
-            return Err(StoreError::Rules(RuleError("empty_strategy_version".into())));
-        }
-        let latest_session: Option<String> = self
+    fn migrate(&self) -> StoreResult<()> {
+        // Check the old marker before CREATE TABLE. Opening a legacy file must
+        // be read-only unless it is already this rewrite's schema.
+        let legacy: i64 = self
             .conn
-            .query_row(
-                "SELECT MAX(clock_at) FROM v2_paper_sessions WHERE account_id=?",
-                [account_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        if let Some(latest) = latest_session {
-            let latest_at = chrono::DateTime::parse_from_rfc3339(&latest)
-                .map_err(|_| StoreError::Integrity("stored_session_time_invalid".into()))?;
-            let at = chrono::DateTime::parse_from_rfc3339(effective_from)
-                .map_err(|_| StoreError::Rules(RuleError("invalid_switch_time".into())))?;
-            if at <= latest_at {
-                return Err(StoreError::Rules(RuleError("switch_precedes_session".into())));
-            }
+            .query_row("SELECT user_version FROM pragma_user_version", [], |row| {
+                row.get(0)
+            })?;
+        if legacy > 0 {
+            return Err(StoreError::Integrity(
+                "legacy_v2_database_detected; keep it, start with a new ASTOCK_V2_DB".into(),
+            ));
         }
-        let at = chrono::DateTime::parse_from_rfc3339(effective_from)
-            .map_err(|_| StoreError::Rules(RuleError("invalid_switch_time".into())))?;
-
-        let raw: String = self.conn.query_row(
-            "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
-            [account_id],
+        let has_schema_table: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+            [],
             |row| row.get(0),
         )?;
-        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
-        let slot_spec = spec
-            .slots
-            .iter()
-            .find(|entry| entry.slot == slot)
-            .ok_or_else(|| StoreError::Rules(RuleError("unknown_paper_slot".into())))?;
-
-        let chain = Self::slot_switches(&self.conn, account_id, slot.as_str())?;
-        if let Some(record) = chain.iter().find(|record| record.switch_id == switch_id) {
-            let same = record.to_version == to_version
-                && record.effective_from == effective_from
-                && record.reason == reason;
-            if same {
-                return Ok(record.clone());
-            }
-            return Err(StoreError::Conflict("strategy_switch_conflict".into()));
-        }
-        let current = chain
-            .last()
-            .map(|record| record.to_version.clone())
-            .unwrap_or_else(|| slot_spec.strategy.strategy_version_id.clone());
-        if current == to_version {
-            return Err(StoreError::Rules(RuleError("strategy_version_unchanged".into())));
-        }
-        if let Some(last) = chain.last() {
-            let last_at = chrono::DateTime::parse_from_rfc3339(&last.effective_from)
-                .map_err(|_| StoreError::Integrity("stored_switch_time_invalid".into()))?;
-            if at <= last_at {
-                return Err(StoreError::Rules(RuleError("switch_time_not_monotonic".into())));
-            }
-        }
-
-        let mut record = StrategySwitchRecord {
-            switch_id: switch_id.into(),
-            account_id: account_id.into(),
-            slot: slot.as_str().into(),
-            from_version: current,
-            to_version: to_version.into(),
-            effective_from: effective_from.into(),
-            reason: reason.into(),
-            digest: String::new(),
+        let existing: Option<i64> = if has_schema_table > 0 {
+            self.conn
+                .query_row(
+                    "SELECT version FROM schema_version LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            None
         };
-        let mut value = serde_json::to_value(&record)?;
-        if let Some(object) = value.as_object_mut() {
-            object.remove("digest");
-        }
-        record.digest = crate::domain::canonical_digest(&value);
-
-        self.conn.execute(
-            "INSERT INTO v2_paper_slot_switches(switch_id,account_id,slot,from_version,to_version,effective_from,reason,digest)
-             VALUES(?,?,?,?,?,?,?,?)",
-            params![
-                record.switch_id,
-                record.account_id,
-                record.slot,
-                record.from_version,
-                record.to_version,
-                record.effective_from,
-                record.reason,
-                record.digest,
-            ],
-        )?;
-        Ok(record)
-    }
-
-    /// Read the switch chain for one slot, or all slots when `slot` is None.
-    pub fn strategy_switches(
-        &self,
-        account_id: &str,
-        slot: Option<crate::domain::PaperSlotId>,
-    ) -> StoreResult<Vec<StrategySwitchRecord>> {
-        match slot {
-            Some(slot) => Self::slot_switches(&self.conn, account_id, slot.as_str()),
-            None => {
-                let mut records = Vec::new();
-                for slot in [crate::domain::PaperSlotId::A, crate::domain::PaperSlotId::B] {
-                    records.extend(Self::slot_switches(&self.conn, account_id, slot.as_str())?);
-                }
-                records.sort_by(|left, right| {
-                    left.effective_from
-                        .cmp(&right.effective_from)
-                        .then(left.switch_id.cmp(&right.switch_id))
-                });
-                Ok(records)
-            }
-        }
-    }
-
-    fn paper_account_view_with_conn(
-        conn: &Connection,
-        spec: &crate::domain::PaperAccountSpec,
-        split: &crate::domain::PaperCapitalSplit,
-    ) -> StoreResult<PaperAccountView> {
-        let weights = Self::account_weights(conn, spec)?;
-        let display = spec.split_with_weights(weights).map_err(StoreError::Rules)?;
-        let mut slots = Vec::new();
-        let mut cash_cents = split.reserve_cents;
-        for (index, slot) in spec.slots.iter().enumerate() {
-            let state = Self::paper_slot_state(conn, spec, split, index)?;
-            let orders_total: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM v2_paper_orders WHERE account_id=? AND slot=?",
-                params![spec.account_id, slot.slot.as_str()],
-                |row| row.get(0),
-            )?;
-            let switches = Self::slot_switches(conn, &spec.account_id, slot.slot.as_str())?;
-            let current_strategy_version_id = switches
-                .last()
-                .map(|record| record.to_version.clone())
-                .unwrap_or_else(|| slot.strategy.strategy_version_id.clone());
-            cash_cents += state.cash_cents;
-            slots.push(PaperSlotView {
-                slot: slot.slot.as_str().into(),
-                strategy_version_id: slot.strategy.strategy_version_id.clone(),
-                current_strategy_version_id,
-                switch_count: switches.len() as i64,
-                research_input_id: slot.strategy.research_input_id.clone(),
-                market_data_pack_id: slot.market_data_pack_id.clone(),
-                execution_policy_version: slot.execution_policy_version.clone(),
-                weight_bps: weights[index],
-                budget_cents: display.slot_budgets[index],
-                cash_cents: state.cash_cents,
-                positions: state
-                    .lots
-                    .iter()
-                    .fold(Vec::<PositionView>::new(), |mut acc, lot| {
-                        match acc.iter_mut().find(|position| position.symbol == lot.symbol) {
-                            Some(position) => position.quantity += lot.quantity,
-                            None => acc.push(PositionView {
-                                symbol: lot.symbol.clone(),
-                                quantity: lot.quantity,
-                                sellable_quantity: None,
-                            }),
-                        }
-                        acc
-                    }),
-                orders_total,
-            });
-        }
-        Ok(PaperAccountView {
-            account_id: spec.account_id.clone(),
-            initial_cash_cents: spec.initial_cash_cents,
-            created_at: spec.created_at.clone(),
-            cash_cents,
-            reserve_cents: split.reserve_cents,
-            slots,
-            valuation: PaperValuation {
-                status: "unavailable".into(),
-                reason: "no_reviewed_price_set".into(),
-            },
-            limits: spec.limits.clone(),
-        })
-    }
-
-    /// Submit one simulated order to a slot. Append-only per slot, idempotent on
-    /// the signal identity, and fail-closed on evidence and budget.
-    pub fn submit_paper_order(
-        &mut self,
-        request: crate::domain::PaperOrderRequest,
-    ) -> StoreResult<PaperOrderRecord> {
-        request.validate()?;
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let raw_spec: Option<String> = txn
-            .query_row(
-                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
-                [&request.account_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let raw_spec =
-            raw_spec.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
-        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw_spec)?;
-        let split = spec.validate()?;
-        let slot_index = spec
-            .slots
-            .iter()
-            .position(|slot| slot.slot == request.slot)
-            .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_not_found".into())))?;
-        let slot_spec = spec.slots[slot_index].clone();
-        let effective_version =
-            Self::effective_strategy_version(&txn, &request.account_id, &slot_spec)?;
-        if let Some(last_switch) =
-            Self::slot_switches(&txn, &request.account_id, slot_spec.slot.as_str())?.last()
+        if let Some(version) = existing
+            && version != SCHEMA_VERSION
         {
-            let switched_at = chrono::DateTime::parse_from_rfc3339(&last_switch.effective_from)
-                .map_err(|_| StoreError::Integrity("stored_switch_time_invalid".into()))?;
-            let decided_at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
-                .map_err(|_| StoreError::Rules(RuleError("invalid_decision_time".into())))?;
-            if decided_at < switched_at {
-                return Err(StoreError::Conflict(
-                    "paper_order_before_strategy_switch".into(),
-                ));
-            }
+            return Err(StoreError::Integrity(format!(
+                "unsupported_schema_version:{version}; create a new database"
+            )));
         }
-        if request.quote_ref.market_data_pack_id != slot_spec.market_data_pack_id {
-            return Err(StoreError::Conflict("paper_quote_data_pack_mismatch".into()));
-        }
-        let (calendar, sessions, instruments) =
-            load_market_context(&txn, &slot_spec.market_data_pack_id)?;
-
-        let prior: Option<(i64, String, String)> = txn
-            .query_row(
-                "SELECT id,request_json,outcome_json FROM v2_paper_orders
-                 WHERE account_id=? AND slot=? AND strategy_version_id=? AND signal_id=?",
-                params![
-                    request.account_id,
-                    slot_spec.slot.as_str(),
-                    effective_version,
-                    request.signal_id
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((id, raw_request, raw_outcome)) = prior {
-            let stored: crate::domain::PaperOrderRequest = serde_json::from_str(&raw_request)?;
-            if stored != request {
-                return Err(StoreError::Conflict(
-                    "same_signal_identity_with_different_paper_request".into(),
-                ));
-            }
-            let outcome: Outcome = serde_json::from_str(&raw_outcome)?;
-            return Ok(PaperOrderRecord {
-                id,
-                account_id: request.account_id.clone(),
-                slot: slot_spec.slot.as_str().into(),
-                strategy_version_id: effective_version,
-                request,
-                outcome,
-                duplicate: true,
-            });
-        }
-
-        // Append-only: a slot never accepts a decision earlier than its last one.
-        let previous: Option<String> = txn
-            .query_row(
-                "SELECT request_json FROM v2_paper_orders
-                 WHERE account_id=? AND slot=? ORDER BY id DESC LIMIT 1",
-                params![request.account_id, slot_spec.slot.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(raw) = previous {
-            let previous: crate::domain::PaperOrderRequest = serde_json::from_str(&raw)?;
-            let previous_at = chrono::DateTime::parse_from_rfc3339(&previous.decision_at)
-                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
-            let next_at = chrono::DateTime::parse_from_rfc3339(&request.decision_at)
-                .map_err(|_| StoreError::Rules(RuleError("invalid_decision_time".into())))?;
-            if next_at < previous_at {
-                return Err(StoreError::Conflict(
-                    "out_of_order_paper_decision".into(),
-                ));
-            }
-        }
-
-        let state = Self::paper_slot_state(&txn, &spec, &split, slot_index)?;
-        let internal = SimulationRequest {
-            schema_version: 4,
-            cycle_id: spec.account_id.clone(),
-            strategy_version_id: effective_version.clone(),
-            signal_id: request.signal_id.clone(),
-            decision_at: request.decision_at.clone(),
-            signal: request.signal.clone(),
-            quote_ref: request.quote_ref.clone(),
-        };
-        let evidence = load_evidence(&txn, &request.quote_ref)?;
-        let mut outcome = decide(
-            &state,
-            &internal,
-            evidence.as_ref(),
-            &calendar,
-            &sessions,
-            &instruments,
-        )
-        .map_err(StoreError::Rules)?;
-        // Risk boundaries become an explicit rejection, never a partial fill.
-        if let Some(fill) = outcome.fill.clone() {
-            let weights = Self::account_weights(&txn, &spec)?;
-            let risk_split = spec.split_with_weights(weights).map_err(StoreError::Rules)?;
-            let budget = risk_split.slot_budgets[slot_index];
-            if let Some(reason) = risk_violation(&spec.limits, budget, &state, &fill) {
-                outcome = Outcome {
-                    status: crate::domain::DecisionStatus::Rejected,
-                    reason: reason.into(),
-                    fill: None,
-                    cash_after_cents: state.cash_cents,
-                };
-            }
-        }
-
-        txn.execute(
-            "INSERT INTO v2_paper_orders(account_id,slot,strategy_version_id,signal_id,
-                request_json,evidence_json,outcome_json,calendar_version,session_policy_version,instrument_version)
-             VALUES(?,?,?,?,?,?,?,?,?,?)",
-            params![
-                request.account_id,
-                slot_spec.slot.as_str(),
-                effective_version,
-                request.signal_id,
-                serde_json::to_string(&request)?,
-                serde_json::to_string(&evidence)?,
-                serde_json::to_string(&outcome)?,
-                calendar.version,
-                sessions.version,
-                instruments.version,
-            ],
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS account(
+                account_id TEXT PRIMARY KEY,
+                spec_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS slot(
+                account_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                weight_bps INTEGER NOT NULL,
+                cash_cents INTEGER NOT NULL,
+                PRIMARY KEY(account_id, slot)
+            );
+            CREATE TABLE IF NOT EXISTS position(
+                account_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                average_cost_cents INTEGER NOT NULL,
+                acquired_day TEXT NOT NULL,
+                PRIMARY KEY(account_id, slot, symbol)
+            );
+            CREATE TABLE IF NOT EXISTS sellable(
+                account_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                PRIMARY KEY(account_id, slot, symbol)
+            );
+            CREATE TABLE IF NOT EXISTS slot_equity_day(
+                account_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                day TEXT NOT NULL,
+                equity_cents INTEGER NOT NULL,
+                PRIMARY KEY(account_id, slot, day)
+            );
+            CREATE TABLE IF NOT EXISTS slot_day(
+                account_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                settled_day TEXT NOT NULL,
+                PRIMARY KEY(account_id, slot)
+            );
+            CREATE TABLE IF NOT EXISTS day_run(
+                account_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                PRIMARY KEY(account_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS trade(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price_cents INTEGER NOT NULL,
+                fees_cents INTEGER NOT NULL,
+                trade_day TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS rebalance(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                old_steady_bps INTEGER NOT NULL,
+                old_aggressive_bps INTEGER NOT NULL,
+                new_steady_bps INTEGER NOT NULL,
+                new_aggressive_bps INTEGER NOT NULL,
+                moved_cents INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                applied_day TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bar(
+                symbol TEXT NOT NULL,
+                day TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                open_cents INTEGER NOT NULL,
+                high_cents INTEGER NOT NULL,
+                low_cents INTEGER NOT NULL,
+                close_cents INTEGER NOT NULL,
+                prev_close_cents INTEGER NOT NULL,
+                volume_shares INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                -- 'none' (unadjusted, from the daytime package) or 'qfq'
+                -- (forward-adjusted, from the V1 archive). Forward adjustment
+                -- rewrites history using future dividends, so anything doing
+                -- walk-forward evaluation must refuse 'qfq'.
+                adjust TEXT NOT NULL DEFAULT 'none',
+                source TEXT NOT NULL DEFAULT 'tdx',
+                -- 1 when close_cents came from a real trade; 0 when the row
+                -- carries the official reference close for a halted symbol.
+                tradable INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(symbol, day)
+            );
+            CREATE INDEX IF NOT EXISTS bar_by_day ON bar(day);
+            "#,
         )?;
-        let id = txn.last_insert_rowid();
-        if let Some(fill) = &outcome.fill {
-            txn.execute(
-                "INSERT INTO v2_paper_fills(order_id,fill_json) VALUES(?,?)",
-                params![id, serde_json::to_string(fill)?],
+        self.ensure_bar_columns()?;
+        if existing.is_none() {
+            self.conn.execute(
+                "INSERT INTO schema_version(version) VALUES(?)",
+                [SCHEMA_VERSION],
             )?;
         }
-        txn.commit()?;
-        Ok(PaperOrderRecord {
-            id,
-            account_id: request.account_id.clone(),
-            slot: slot_spec.slot.as_str().into(),
-            strategy_version_id: effective_version,
-            request,
-            outcome,
-            duplicate: false,
-        })
-    }
-}
-// ---------------------------------------------------------------------------
-// Paper account catalogue (ADR 005): read-only list for the account console.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    pub fn paper_accounts(&self, limit: i64) -> StoreResult<Vec<PaperAccountSummary>> {
-        let mut statement = self.conn.prepare(
-            "SELECT account_id,spec_json,created_at FROM v2_paper_accounts ORDER BY account_id LIMIT ?",
-        )?;
-        let rows = statement.query_map([limit.clamp(1, 200)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut accounts = Vec::new();
-        for row in rows {
-            let (account_id, spec_json, created_at) = row?;
-            let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&spec_json)?;
-            accounts.push(PaperAccountSummary {
-                account_id,
-                initial_cash_cents: spec.initial_cash_cents,
-                reserve_bps: spec.reserve_bps,
-                created_at,
-                slots: spec
-                    .slots
-                    .iter()
-                    .map(|slot| PaperAccountSummarySlot {
-                        slot: slot.slot.as_str().into(),
-                        strategy_version_id: slot.strategy.strategy_version_id.clone(),
-                        weight_bps: slot.weight_bps,
-                    })
-                    .collect(),
-            });
-        }
-        Ok(accounts)
-    }
-}
-// ---------------------------------------------------------------------------
-// Paper session (ADR 005 phase 2): deterministic clock over a frozen signal list.
-// The session stores its own spec and status; every step submits exactly one
-// slot order and advances an explicit simulated instant.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    pub fn create_paper_session(
-        &mut self,
-        spec: crate::domain::PaperSessionSpec,
-    ) -> StoreResult<PaperSessionView> {
-        spec.validate()?;
-        let raw = serde_json::to_string(&spec)?;
-        let account_exists: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT account_id FROM v2_paper_accounts WHERE account_id=?",
-                [&spec.account_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        account_exists
-            .ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
-
-        // A session that starts before a slot's last switch would immediately
-        // submit pre-switch decisions, which the order path rejects. Refuse it
-        // up front instead of leaving a stuck session.
-        let start_at = chrono::DateTime::parse_from_rfc3339(&spec.start_at)
-            .map_err(|_| StoreError::Rules(RuleError("invalid_session_start".into())))?;
-        let mut slots: Vec<&str> = spec.signals.iter().map(|signal| signal.slot.as_str()).collect();
-        slots.sort_unstable();
-        slots.dedup();
-        for slot in slots {
-            if let Some(last) = Self::slot_switches(&self.conn, &spec.account_id, slot)?.last() {
-                let switched_at = chrono::DateTime::parse_from_rfc3339(&last.effective_from)
-                    .map_err(|_| StoreError::Integrity("stored_switch_time_invalid".into()))?;
-                if start_at < switched_at {
-                    return Err(StoreError::Rules(RuleError(
-                        "session_starts_before_strategy_switch".into(),
-                    )));
-                }
-            }
-        }
-
-        if let Some(existing) = self
-            .conn
-            .query_row(
-                "SELECT spec_json FROM v2_paper_sessions WHERE session_id=?",
-                [&spec.session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if existing != raw {
-                return Err(StoreError::Conflict("paper_session_conflict".into()));
-            }
-            return self.paper_session(&spec.session_id);
-        }
-        self.conn.execute(
-            "INSERT INTO v2_paper_sessions(session_id,account_id,spec_json,status,clock_at,cursor,last_order_id)
-             VALUES(?,?,?,?,?,?,NULL)",
-            params![spec.session_id, spec.account_id, raw, "created", spec.start_at, 0i64],
-        )?;
-        self.paper_session(&spec.session_id)
-    }
-
-    pub fn paper_session(&self, session_id: &str) -> StoreResult<PaperSessionView> {
-        let (account_id, spec_json, status, clock_at, cursor, last_order_id) = self
-            .conn
-            .query_row(
-                "SELECT account_id,spec_json,status,clock_at,cursor,last_order_id
-                 FROM v2_paper_sessions WHERE session_id=?",
-                [session_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound("paper_session_not_found".into()))?;
-        let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
-        Ok(PaperSessionView {
-            session_id: session_id.into(),
-            account_id,
-            status,
-            clock_at,
-            cursor: cursor.max(0) as usize,
-            total: spec.signals.len(),
-            last_order_id,
-        })
-    }
-
-    fn set_session_status(&self, session_id: &str, status: &str) -> StoreResult<()> {
-        self.conn.execute(
-            "UPDATE v2_paper_sessions SET status=? WHERE session_id=?",
-            params![status, session_id],
-        )?;
         Ok(())
     }
 
-    /// created → running, running → paused, paused → running, running/paused → stopped.
-    pub fn paper_session_action(
-        &mut self,
-        session_id: &str,
-        action: &str,
-    ) -> StoreResult<PaperSessionView> {
-        let current = self.paper_session(session_id)?;
-        let next = match (action, current.status.as_str()) {
-            ("start", "created") => "running",
-            ("pause", "running") => "paused",
-            ("resume", "paused") => "running",
-            ("stop", "running" | "paused") => "stopped",
-            _ => return Err(StoreError::Conflict("invalid_paper_session_transition".into())),
-        };
-        self.set_session_status(session_id, next)?;
-        self.paper_session(session_id)
-    }
-
-    /// Submit the next frozen signal. One step = one simulated instant and at
-    /// most one slot order; the session clock only moves to that decision time.
-    pub fn step_paper_session(&mut self, session_id: &str) -> StoreResult<PaperSessionStep> {
-        let current = self.paper_session(session_id)?;
-        if current.status != "running" {
-            return Err(StoreError::Conflict("paper_session_not_running".into()));
-        }
-        let spec_json: String = self.conn.query_row(
-            "SELECT spec_json FROM v2_paper_sessions WHERE session_id=?",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
-        if current.cursor >= spec.signals.len() {
-            self.set_session_status(session_id, "completed")?;
-            return Ok(PaperSessionStep { session: self.paper_session(session_id)?, order: None });
-        }
-        let signal = &spec.signals[current.cursor];
-        let request = crate::domain::PaperOrderRequest {
-            schema_version: crate::domain::PAPER_ORDER_SCHEMA_VERSION,
-            account_id: spec.account_id.clone(),
-            slot: signal.slot,
-            signal_id: format!("{}:{}", session_id, signal.signal_id),
-            decision_at: signal.decision_at.clone(),
-            signal: signal.signal.clone(),
-            quote_ref: signal.quote_ref.clone(),
-        };
-        let order = self.submit_paper_order(request)?;
-        let next_cursor = current.cursor + 1;
-        let status = if next_cursor >= spec.signals.len() { "completed" } else { "running" };
-        self.conn.execute(
-            "UPDATE v2_paper_sessions SET cursor=?, clock_at=?, last_order_id=?, status=? WHERE session_id=?",
-            params![next_cursor as i64, signal.decision_at, order.id, status, session_id],
-        )?;
-        Ok(PaperSessionStep { session: self.paper_session(session_id)?, order: Some(order) })
-    }
-}
-// ---------------------------------------------------------------------------
-// Paper session batch run: advance the deterministic clock until the session
-// stops being "running" (paused, stopped or completed). One order per step.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    /// Advance the clock only through signals whose China day is on/before `day`.
-    /// Future signals stay untouched: no look-ahead is ever executed.
-    pub fn advance_paper_session_to(
-        &mut self,
-        session_id: &str,
-        day: &str,
-    ) -> StoreResult<PaperSessionRun> {
-        let target = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
-            .map_err(|_| StoreError::Rules(RuleError("invalid_advance_day".into())))?;
-        if target.to_string() != day {
-            return Err(StoreError::Rules(RuleError("invalid_advance_day".into())));
-        }
-        let mut steps = 0usize;
-        let mut filled = 0usize;
-        let mut rejected = 0usize;
-        loop {
-            let view = self.paper_session(session_id)?;
-            if view.status != "running" || view.cursor >= view.total {
-                break;
-            }
-            let spec_json: String = self.conn.query_row(
-                "SELECT spec_json FROM v2_paper_sessions WHERE session_id=?",
-                [session_id],
-                |row| row.get(0),
-            )?;
-            let spec: crate::domain::PaperSessionSpec = serde_json::from_str(&spec_json)?;
-            let next = &spec.signals[view.cursor];
-            let at = chrono::DateTime::parse_from_rfc3339(&next.decision_at)
-                .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
-            let china = at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"));
-            if china.date_naive() > target {
-                break;
-            }
-            let step = self.step_paper_session(session_id)?;
-            match step.order {
-                Some(order) => {
-                    steps += 1;
-                    match order.outcome.status {
-                        crate::domain::DecisionStatus::Filled => filled += 1,
-                        crate::domain::DecisionStatus::Rejected => rejected += 1,
-                    }
-                }
-                None => break,
-            }
-            if steps > view.total {
-                break;
-            }
-        }
-        Ok(PaperSessionRun {
-            session: self.paper_session(session_id)?,
-            steps,
-            filled,
-            rejected,
-        })
-    }
-
-    pub fn run_paper_session(&mut self, session_id: &str) -> StoreResult<PaperSessionRun> {
-        let mut steps = 0usize;
-        let mut filled = 0usize;
-        let mut rejected = 0usize;
-        loop {
-            let view = self.paper_session(session_id)?;
-            if view.status != "running" {
-                break;
-            }
-            let step = self.step_paper_session(session_id)?;
-            match step.order {
-                Some(order) => {
-                    steps += 1;
-                    match order.outcome.status {
-                        crate::domain::DecisionStatus::Filled => filled += 1,
-                        crate::domain::DecisionStatus::Rejected => rejected += 1,
-                    }
-                }
-                None => break,
-            }
-            if steps >= view.total.saturating_add(1) {
-                break;
-            }
-        }
-        Ok(PaperSessionRun {
-            session: self.paper_session(session_id)?,
-            steps,
-            filled,
-            rejected,
-        })
-    }
-}
-
-impl Store {
-    /// The reviewed strategies a new account may reference. Never user-supplied.
-    pub fn strategy_catalogue(&self) -> StoreResult<StrategyCatalogue> {
-        let mut strategies = Vec::new();
-        for id in ["research-momentum-v1", "research-reversion-v1"] {
-            let artifact = reviewed_strategy_artifact(id)?;
-            strategies.push(StrategySummary {
-                strategy_version_id: artifact.strategy_version_id,
-                research_input_id: artifact.research_input_id,
-                research_input_digest: artifact.research_input_digest,
-            });
-        }
-        Ok(StrategyCatalogue {
-            strategies,
-            market_data_pack_id: MARKET_DATA_PACK_ID.into(),
-            execution_policy_version: POLICY_VERSION.into(),
-            reserve_bps: 1_000,
-        })
-    }
-
-    /// Resolve a client request (strategy ids) into the internal spec.
-    pub fn create_paper_account_request(
-        &mut self,
-        request: crate::domain::PaperAccountRequest,
-    ) -> StoreResult<PaperAccountView> {
-        let mut slots = Vec::new();
-        for slot in &request.slots {
-            slots.push(crate::domain::PaperSlotSpec {
-                slot: slot.slot,
-                strategy: reviewed_strategy_artifact(&slot.strategy_version_id)?,
-                market_data_pack_id: slot.market_data_pack_id.clone(),
-                execution_policy_version: slot.execution_policy_version.clone(),
-                weight_bps: slot.weight_bps,
-            });
-        }
-        self.create_paper_account(crate::domain::PaperAccountSpec {
-            schema_version: crate::domain::PAPER_ACCOUNT_SCHEMA_VERSION,
-            account_id: request.account_id,
-            initial_cash_cents: request.initial_cash_cents,
-            reserve_bps: request.reserve_bps,
-            created_at: request.created_at,
-            slots,
-            limits: request.limits,
-        })
-    }
-}
-// ---------------------------------------------------------------------------
-// Session import: turn an existing experiment's stored decisions into a frozen
-// paper-session signal list. Read-only with respect to the experiment.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    pub fn create_paper_session_from_experiment(
-        &mut self,
-        session_id: &str,
-        account_id: &str,
-        cycle_id: &str,
-        slot: crate::domain::PaperSlotId,
-        start_at: Option<String>,
-    ) -> StoreResult<PaperSessionView> {
-        let raw_spec: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
-                [account_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let raw_spec =
-            raw_spec.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
-        let account: crate::domain::PaperAccountSpec = serde_json::from_str(&raw_spec)?;
-        account.validate()?;
-        let slot_spec = account
-            .slots
-            .iter()
-            .find(|candidate| candidate.slot == slot)
-            .ok_or_else(|| StoreError::Rules(RuleError("paper_slot_not_found".into())))?;
-
-        let experiment = load_experiment(&self.conn, cycle_id)?;
-        let effective_version =
-            Self::effective_strategy_version(&self.conn, &account.account_id, slot_spec)?;
-        if experiment.spec.strategy.strategy_version_id != effective_version {
-            return Err(StoreError::Rules(RuleError("paper_slot_strategy_mismatch".into())));
-        }
-        if experiment.spec.market_data_pack_id != slot_spec.market_data_pack_id {
-            return Err(StoreError::Rules(RuleError("paper_session_pack_mismatch".into())));
-        }
-        if experiment.spec.execution_policy_version != slot_spec.execution_policy_version {
-            return Err(StoreError::Rules(RuleError("paper_session_policy_mismatch".into())));
-        }
-
-        let mut signals = Vec::new();
+    /// Add missing bar metadata and classify legacy TDX zero-quote rows once.
+    /// Existing explicit tradability is preserved on subsequent opens.
+    fn ensure_bar_columns(&self) -> StoreResult<()> {
+        let mut have: Vec<String> = Vec::new();
         {
-            let mut statement = self.conn.prepare(
-                "SELECT request_json FROM v2_simulation_runs WHERE cycle_id=? ORDER BY id",
-            )?;
-            let rows = statement.query_map([cycle_id], |row| row.get::<_, String>(0))?;
+            let mut stmt = self.conn.prepare("PRAGMA table_info(bar)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for row in rows {
-                let request: SimulationRequest = serde_json::from_str(&row?)?;
-                signals.push(crate::domain::PaperSessionSignal {
-                    slot,
-                    signal_id: request.signal_id,
-                    decision_at: request.decision_at,
-                    signal: request.signal,
-                    quote_ref: request.quote_ref,
+                have.push(row?);
+            }
+        }
+        let txn = self.conn.unchecked_transaction()?;
+        for (name, ddl) in [
+            ("adjust", "ALTER TABLE bar ADD COLUMN adjust TEXT NOT NULL DEFAULT 'none'"),
+            ("source", "ALTER TABLE bar ADD COLUMN source TEXT NOT NULL DEFAULT 'tdx'"),
+            ("tradable", "ALTER TABLE bar ADD COLUMN tradable INTEGER NOT NULL DEFAULT 1"),
+        ] {
+            if !have.iter().any(|column| column == name) {
+                txn.execute(ddl, [])?;
+                if name == "tradable" {
+                    txn.execute(
+                        "UPDATE bar SET tradable=0, \
+                         close_cents=CASE WHEN prev_close_cents>0 THEN prev_close_cents ELSE 0 END \
+                         WHERE adjust='none' AND source='tdx' \
+                         AND volume_shares=0 AND open_cents=0 AND high_cents=0 AND low_cents=0",
+                        [],
+                    )?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn schema_version(&self) -> StoreResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT version FROM schema_version LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    // ---- whole-market bar table -------------------------------------------
+
+    /// Insert or replace one day of bars in a single transaction.
+    ///
+    /// Re-running the same day is safe and idempotent: the daytime package can
+    /// be re-fetched after a partial write without creating duplicate rows.
+    pub fn upsert_bars(&mut self, bars: &[Bar]) -> StoreResult<usize> {
+        if bars.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.conn.transaction()?;
+        {
+            let mut stmt = txn.prepare(
+                "INSERT INTO bar(symbol,day,name,open_cents,high_cents,low_cents,\
+                 close_cents,prev_close_cents,volume_shares,amount_cents,adjust,source,tradable) \
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) \
+                 ON CONFLICT(symbol,day) DO UPDATE SET \
+                   name=excluded.name, open_cents=excluded.open_cents, \
+                   high_cents=excluded.high_cents, low_cents=excluded.low_cents, \
+                   close_cents=excluded.close_cents, \
+                   prev_close_cents=excluded.prev_close_cents, \
+                   volume_shares=excluded.volume_shares, \
+                   amount_cents=excluded.amount_cents, \
+                   adjust=excluded.adjust, source=excluded.source, \
+                   tradable=excluded.tradable",
+            )?;
+            for bar in bars {
+                stmt.execute(params![
+                    bar.symbol,
+                    bar.day,
+                    bar.name,
+                    bar.open_cents,
+                    bar.high_cents,
+                    bar.low_cents,
+                    bar.close_cents,
+                    bar.prev_close_cents,
+                    bar.volume_shares,
+                    bar.amount_cents,
+                    bar.adjust,
+                    bar.source,
+                    i64::from(bar.tradable),
+                ])?;
+            }
+        }
+        txn.commit()?;
+        Ok(bars.len())
+    }
+
+    /// Unadjusted closes over a day range, as symbol -> (day, close) rows
+    /// oldest first. Feeds the market-regime classifier, which needs a
+    /// contiguous window rather than whole-market snapshots.
+    pub fn unadjusted_closes_through(
+        &self,
+        from_day: &str,
+        to_day: &str,
+    ) -> StoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, day, close_cents FROM bar \
+             WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' \
+             AND close_cents > 0 AND tradable = 1 ORDER BY symbol, day",
+        )?;
+        let rows = stmt.query_map(params![from_day, to_day], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Classify the broad market as of `day`, using the same unadjusted closes
+    /// settlement uses.
+    ///
+    /// Forward-adjusted rows are excluded deliberately: a regime measured off
+    /// rewritten history would describe a market nobody traded.
+    pub fn market_regime(&self, day: &str) -> StoreResult<RegimeView> {
+        let days = self.bar_days()?;
+        let Some(position) = days.iter().position(|candidate| candidate == day) else {
+            return Ok(RegimeView::unknown(0));
+        };
+        let start = days[position.saturating_sub(REGIME_LOOKBACK_DAYS - 1)].clone();
+        let rows = self.unadjusted_closes_through(&start, day)?;
+        let mut by_symbol: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for (symbol, _, close) in rows {
+            by_symbol.entry(symbol).or_default().push(close);
+        }
+        Ok(classify_series(&by_symbol))
+    }
+
+    /// All bars for one trading day, ordered by symbol.
+    pub fn bars_for_day(&self, day: &str) -> StoreResult<Vec<Bar>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
+             prev_close_cents,volume_shares,amount_cents,adjust,source,tradable \
+             FROM bar WHERE day = ?1 ORDER BY symbol",
+        )?;
+        let rows = stmt.query_map([day], read_bar)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One symbol's bars over an inclusive day range, oldest first.
+    pub fn bars_for_symbol(
+        &self,
+        symbol: &str,
+        from_day: &str,
+        to_day: &str,
+    ) -> StoreResult<Vec<Bar>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
+             prev_close_cents,volume_shares,amount_cents,adjust,source,tradable \
+             FROM bar WHERE symbol = ?1 AND day BETWEEN ?2 AND ?3 ORDER BY day",
+        )?;
+        let rows = stmt.query_map(params![symbol, from_day, to_day], read_bar)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Unadjusted `(symbol, day, close_cents)` rows for one day.
+    ///
+    /// This is the settlement feed: forward-adjusted rows are excluded here
+    /// rather than at the call site so no caller can forget.
+    pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<UnadjustedRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, day, close_cents, tradable, open_cents, high_cents, \
+             low_cents, prev_close_cents FROM bar \
+             WHERE day = ?1 AND adjust = 'none' AND close_cents > 0 ORDER BY symbol",
+        )?;
+        let rows = stmt.query_map([day], |row| {
+            Ok(UnadjustedRow {
+                symbol: row.get(0)?,
+                day: row.get(1)?,
+                price_cents: row.get(2)?,
+                tradable: row.get(3)?,
+                open_cents: row.get(4)?,
+                high_cents: row.get(5)?,
+                low_cents: row.get(6)?,
+                prev_close_cents: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Unadjusted `(symbol, day, close_cents)` rows across an inclusive range.
+    pub fn unadjusted_closes_range(
+        &self,
+        from_day: &str,
+        to_day: &str,
+    ) -> StoreResult<Vec<UnadjustedRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, day, close_cents, tradable, open_cents, high_cents, \
+                    low_cents, prev_close_cents FROM bar \
+             WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' AND close_cents > 0 \
+             ORDER BY symbol, day",
+        )?;
+        let rows = stmt.query_map(params![from_day, to_day], |row| {
+            Ok(UnadjustedRow {
+                symbol: row.get(0)?,
+                day: row.get(1)?,
+                price_cents: row.get(2)?,
+                tradable: row.get(3)?,
+                open_cents: row.get(4)?,
+                high_cents: row.get(5)?,
+                low_cents: row.get(6)?,
+                prev_close_cents: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Build a `PriceSet` over the bar table for a settlement window.
+    ///
+    /// Returns `None` when the window has no unadjusted rows, so the caller
+    /// reports "no data" instead of settling against an empty set.
+    pub fn price_set_from_bars(
+        &self,
+        symbol: &str,
+        coverage_start: &str,
+        coverage_end: &str,
+    ) -> StoreResult<Option<crate::domain::PriceSet>> {
+        let rows = self.unadjusted_closes_range(coverage_start, coverage_end)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let rows: Vec<crate::domain::BarRow> = rows
+            .into_iter()
+            .map(|row| crate::domain::BarRow {
+                symbol: row.symbol,
+                day: row.day,
+                price_cents: row.price_cents,
+                tradable: row.tradable,
+                open_cents: row.open_cents,
+                high_cents: row.high_cents,
+                low_cents: row.low_cents,
+                prev_close_cents: row.prev_close_cents,
+            })
+            .collect();
+        Ok(Some(crate::domain::PriceSet::from_bars(
+            &rows,
+            symbol,
+            coverage_start,
+            coverage_end,
+        )))
+    }
+
+    /// Per-day equity for both slots, oldest first.
+    ///
+    /// Returns `(day, steady_cents, aggressive_cents)` for every day the
+    /// account has settled. This is the profit curve -- the single number the
+    /// whole system exists to produce, so it gets a first-class query rather
+    /// than being reconstructed from trades by the caller.
+    pub fn equity_curve(&self, account_id: &str) -> StoreResult<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT day,
+                    COALESCE(SUM(CASE WHEN slot='steady' THEN equity_cents END), 0),
+                    COALESCE(SUM(CASE WHEN slot='aggressive' THEN equity_cents END), 0)
+             FROM slot_equity_day WHERE account_id = ?1
+             GROUP BY day ORDER BY day",
+        )?;
+        let rows = stmt.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Read model only: account, steady and aggressive performance, in that
+    /// order. Slot returns remove end-of-day transfers. Optional current marks
+    /// support /account valuations after the most recent settled day.
+    pub fn account_performance(
+        &self,
+        spec: &AccountSpec,
+        mark: Option<(&str, [i64; 2])>,
+    ) -> StoreResult<[Vec<PerformancePoint>; 3]> {
+        let mut rows = self.equity_curve(&spec.account_id)?;
+        if let Some((day, equities)) = mark {
+            match rows.last_mut() {
+                Some(last) if last.0 == day => {
+                    last.1 = equities[0];
+                    last.2 = equities[1];
+                }
+                Some(last) if last.0.as_str() > day => {
+                    return Err(StoreError::Rules(RuleError(
+                        "valuation_before_last_settled".into(),
+                    )));
+                }
+                _ => rows.push((day.to_string(), equities[0], equities[1])),
+            }
+        }
+        let mut flows = BTreeMap::<String, i64>::new();
+        for item in self.rebalances(&spec.account_id)? {
+            let signed = if item.to == StrategyId::Steady {
+                item.moved_cents
+            } else {
+                -item.moved_cents
+            };
+            *flows.entry(item.applied_day).or_default() += signed;
+        }
+        let mut inputs: [Vec<PerformanceInput>; 3] =
+            std::array::from_fn(|_| Vec::with_capacity(rows.len()));
+        for (day, steady, aggressive) in rows {
+            let flow = flows.get(&day).copied().unwrap_or(0);
+            for (index, (equity, net_flow)) in
+                [(steady + aggressive, 0), (steady, flow), (aggressive, -flow)]
+                    .into_iter()
+                    .enumerate()
+            {
+                inputs[index].push(PerformanceInput {
+                    day: day.clone(),
+                    equity_cents: equity,
+                    net_flow_cents: net_flow,
                 });
             }
         }
-        if signals.is_empty() {
-            return Err(StoreError::Rules(RuleError("paper_session_requires_signals".into())));
+        let budgets = initial_split(spec.initial_cash_cents)?;
+        Ok([
+            performance_curve(spec.initial_cash_cents, &inputs[0])?,
+            performance_curve(budgets[0].cash_cents, &inputs[1])?,
+            performance_curve(budgets[1].cash_cents, &inputs[2])?,
+        ])
+    }
+
+    /// Every distinct trading day we hold, oldest first.
+    pub fn bar_days(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT day FROM bar ORDER BY day")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
-        let start_at = match start_at {
-            Some(value) => value,
-            None => {
-                let first = chrono::DateTime::parse_from_rfc3339(&signals[0].decision_at)
-                    .map_err(|_| StoreError::Integrity("stored_decision_time_invalid".into()))?;
-                let china = first.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("offset"));
-                format!("{}T00:00:00+08:00", china.date_naive())
+        Ok(out)
+    }
+
+    /// Replay dates must come from usable unadjusted data, never qfq-only days.
+    pub fn unadjusted_bar_days(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT day FROM bar WHERE adjust='none' AND close_cents>0 ORDER BY day",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Number of symbols with a bar on `day`. Used only for reporting.
+    pub fn bar_symbol_count(&self, day: &str) -> StoreResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM bar WHERE day = ?1",
+            [day],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Symbols whose close jumped more than `threshold_bps` from their own
+    /// `prev_close` on `day`.
+    ///
+    /// This is not a validation gate -- nothing is rejected or blocked. It is a
+    /// display hint: a gap this large is either an ex-dividend/split or bad
+    /// data, and either way the K-line should not draw a solid bar across it.
+    ///
+    /// The caller decides the threshold. A single number does not work across
+    /// boards: ChiNext and STAR move up to 20% in a day by rule, so a 11%
+    /// threshold flags every limit-up as a corporate action. See
+    /// `gap_threshold_bps`.
+    pub fn price_gaps(&self, day: &str) -> StoreResult<Vec<Bar>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
+             prev_close_cents,volume_shares,amount_cents,adjust,source,tradable \
+             FROM bar WHERE day = ?1 AND prev_close_cents > 0 \
+             ORDER BY symbol",
+        )?;
+        let rows = stmt.query_map([day], read_bar)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let bar = row?;
+            // Per-symbol threshold: a 20%-limit board closing +13% is an
+            // ordinary day, not a corporate action, while a main-board stock
+            // closing +13% cannot happen without one.
+            // Headroom above the limit: a stock closing exactly at its limit
+            // is an ordinary day, one closing *past* it cannot be. 500 bps of
+            // margin absorbs tick rounding without hiding real gaps.
+            let threshold = daily_limit_bps(&bar.symbol) + 500;
+            if (bar.close_cents - bar.prev_close_cents).abs() * 10_000
+                / bar.prev_close_cents
+                > threshold
+            {
+                out.push(bar);
             }
-        };
-        self.create_paper_session(crate::domain::PaperSessionSpec {
-            schema_version: crate::domain::PAPER_SESSION_SCHEMA_VERSION,
-            session_id: session_id.into(),
-            account_id: account_id.into(),
-            start_at,
-            signals,
+        }
+        Ok(out)
+    }
+
+    pub fn create_account(&mut self, spec: AccountSpec) -> StoreResult<()> {
+        let budgets = initial_split(spec.initial_cash_cents)?;
+        let txn = self.conn.transaction()?;
+        txn.execute(
+            "INSERT INTO account(account_id,spec_json,created_at) VALUES(?,?,?)",
+            params![spec.account_id, serde_json::to_string(&spec)?, spec.created_at],
+        )?;
+        for (slot, budget) in spec.slots.iter().zip(budgets.iter()) {
+            txn.execute(
+                "INSERT INTO slot(account_id,slot,weight_bps,cash_cents) VALUES(?,?,?,?)",
+                params![
+                    spec.account_id,
+                    slot_name(slot.slot),
+                    budget.weight_bps,
+                    budget.cash_cents
+                ],
+            )?;
+            txn.execute(
+                "INSERT INTO slot_day(account_id,slot,settled_day) VALUES(?,?,?)",
+                params![spec.account_id, slot_name(slot.slot), ""],
+            )?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn account(&self) -> StoreResult<Option<AccountSpec>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT spec_json FROM account LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        raw.map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub fn books(&self, account_id: &str) -> StoreResult<[SlotBook; 2]> {
+        Ok([
+            read_book(&self.conn, account_id, StrategyId::Steady)?,
+            read_book(&self.conn, account_id, StrategyId::Aggressive)?,
+        ])
+    }
+
+    pub fn weights(&self, account_id: &str) -> StoreResult<[i64; 2]> {
+        Ok([
+            slot_weight(&self.conn, account_id, StrategyId::Steady)?,
+            slot_weight(&self.conn, account_id, StrategyId::Aggressive)?,
+        ])
+    }
+
+    pub fn last_settled_day(&self, account_id: &str) -> StoreResult<Option<String>> {
+        let days = settled_days(&self.conn, account_id)?;
+        Ok(days.last().cloned())
+    }
+
+    pub fn coverage(&self, set: Option<&PriceSet>, last_settled_day: Option<String>) -> PriceCoverage {
+        PriceCoverage {
+            price_set_id: set.map(|item| item.price_set_id.clone()),
+            market_data_pack_id: set.map(|item| item.market_data_pack_id.clone()),
+            coverage_start: set.map(|item| item.coverage_start.clone()),
+            coverage_end: set.map(|item| item.coverage_end.clone()),
+            days: set.map(PriceSet::days).unwrap_or_default(),
+            symbols: set.map(PriceSet::symbols).unwrap_or_default(),
+            last_settled_day,
+        }
+    }
+
+    /// Advance through every reviewed price-set day after the last settled
+    /// day. `through` is inclusive and may not exceed the price-set coverage.
+    pub fn advance(
+        &mut self,
+        spec: &AccountSpec,
+        set: &PriceSet,
+        through: &str,
+        settle_from: Option<&str>,
+    ) -> StoreResult<AdvanceResult> {
+        if through.len() != 10
+            || through < set.coverage_start.as_str()
+            || through > set.coverage_end.as_str()
+        {
+            return Err(StoreError::Rules(RuleError(
+                "day_outside_price_set_coverage".into(),
+            )));
+        }
+        let from_day = self.last_settled_day(&spec.account_id)?;
+        // The price set may start well before the day settlement begins: those
+        // earlier days are warm-up so the strategies have trailing closes.
+        //
+        // Two different lower bounds:
+        // - `from_day` is the last settled day and is always exclusive
+        //   (settling it again would be replaying, not advancing).
+        // - `settle_from` is an explicit first day and is inclusive.
+        let explicit_floor = settle_from.map(str::to_string);
+        let days = set
+            .days()
+            .into_iter()
+            .filter(|day| {
+                let after_settled = day.as_str() > from_day.as_deref().unwrap_or("");
+                let at_or_after_floor = match &explicit_floor {
+                    Some(floor) => day.as_str() >= floor.as_str(),
+                    None => true,
+                };
+                after_settled && at_or_after_floor && day.as_str() <= through
+            })
+            .collect::<Vec<_>>();
+        if days.is_empty() {
+            let current = self
+                .account()?
+                .ok_or_else(|| StoreError::NotFound("account_not_found".into()))?;
+            return Ok(AdvanceResult {
+                from_day: from_day.clone(),
+                through_day: through.into(),
+                processed_days: Vec::new(),
+                trades: Vec::new(),
+                rebalances: Vec::new(),
+                account: self.view(&current, Some(set), Some(through))?,
+            });
+        }
+
+        let mut all_trades = Vec::new();
+        let mut all_rebalances = Vec::new();
+        // Build the lookup index once for the whole advance. Rebuilding it per
+        // day would re-walk millions of entries on every iteration.
+        let index_set = IndexedPriceSet::new(set.clone());
+        for day in &days {
+            let run = self.run_day_indexed(spec, &index_set, day)?;
+            all_trades.extend(run.trades);
+            all_rebalances.extend(run.rebalance);
+        }
+        let current = self
+            .account()?
+            .ok_or_else(|| StoreError::NotFound("account_not_found".into()))?;
+        Ok(AdvanceResult {
+            from_day,
+            through_day: through.into(),
+            processed_days: days,
+            trades: all_trades,
+            rebalances: all_rebalances,
+            account: self.view(&current, Some(set), Some(through))?,
         })
     }
-}
 
-/// Cost-basis risk check. Prices come from the fill itself, so no valuation is
-/// required and the decision stays deterministic.
-fn risk_violation(
-    limits: &crate::domain::PaperRiskLimits,
-    budget_cents: i64,
-    state: &PortfolioState,
-    fill: &Fill,
-) -> Option<&'static str> {
-    if fill.side != crate::domain::Side::Buy {
-        return None;
-    }
-    let gross = (fill.quantity as i128) * (fill.price_cents as i128);
-    let budget = budget_cents as i128;
-    if gross * 10_000 > budget * limits.max_order_notional_bps as i128 {
-        return Some("risk_order_notional_exceeded");
-    }
-    let held = state.quantity(&fill.symbol) as i128;
-    let basis = (held + fill.quantity as i128) * fill.price_cents as i128;
-    if basis * 10_000 > budget * limits.max_symbol_weight_bps as i128 {
-        return Some("risk_symbol_concentration_exceeded");
-    }
-    let cash_after = state.cash_cents as i128 - gross - fill.fees_cents as i128;
-    if cash_after * 10_000 < budget * limits.min_slot_cash_bps as i128 {
-        return Some("risk_cash_floor_exceeded");
-    }
-    None
-}
-// ---------------------------------------------------------------------------
-// Capital rebalance (ADR 009): move slot cash toward the target weights and
-// record the decision. Fills stay untouched; transfers apply after them, so a
-// later capital decision can never rewrite trade history.
-// ---------------------------------------------------------------------------
+    /// Signals for one slot on one day, over a bounded lookback window.
+    ///
+    /// Two things keep this affordable on a 5.3k-symbol universe:
+    ///
+    /// 1. **Bounded history.** The strategies need at most 61 closes (a 60-day
+    ///    average plus the latest bar). Asking for the whole series would drag
+    ///    ~930 rows per symbol through the moving-average code for no gain.
+    ///    `SIGNAL_LOOKBACK_DAYS` is the window actually needed.
+    /// 2. **Candidate filter.** A symbol is only worth a signal if it has a
+    ///    close on `day` (otherwise it cannot be traded today). Symbols already
+    ///    held are always included so exits and adds still see them.
+    ///
+    /// Everything else -- listing dates, delistings, suspensions -- shows up
+    /// as a short or missing series, which `signal` already handles by
+    /// returning `None`.
+    fn signals_for_day<'a>(
+        &self,
+        slot: StrategyId,
+        set: &'a IndexedPriceSet,
+        day: &str,
+        closes: &'a BTreeMap<String, i64>,
+        held: impl Iterator<Item = &'a str>,
+    ) -> StoreResult<Vec<(String, SignalScore)>> {
+        let mut candidates: BTreeSet<&'a str> = closes.keys().map(String::as_str).collect();
+        candidates.extend(held);
 
-impl Store {
-    pub fn apply_rebalance(
+        let mut signals = Vec::with_capacity(candidates.len());
+        for symbol in candidates {
+            let mut bars = set.bars_for(symbol, day);
+            if bars.len() > SIGNAL_LOOKBACK_DAYS {
+                bars.drain(..bars.len() - SIGNAL_LOOKBACK_DAYS);
+            }
+            signals.push((symbol.to_string(), score_signal(slot, &bars)));
+        }
+        Ok(signals)
+    }
+
+    /// Process exactly one day. Re-running a settled day returns its stored
+    /// fills and rebalance without creating another trade.
+    pub fn run_day(&mut self, spec: &AccountSpec, set: &PriceSet, day: &str) -> StoreResult<DayRun> {
+        // Build the index once per day rather than per lookup. `advance` calls
+        // this in a loop, so the index is rebuilt per day -- still far cheaper
+        // than the linear scans it replaces, and it keeps `run_day` usable on
+        // its own for a single-day settle.
+        let index = IndexedPriceSet::new(set.clone());
+        self.run_day_indexed(spec, &index, day)
+    }
+
+    /// The same atomic day settlement with a caller-owned price index. Offline
+    /// comparisons can reuse one input index across their isolated books.
+    pub fn run_day_indexed(
         &mut self,
-        account_id: &str,
-        target: [i64; 2],
-        proposal_digest: &str,
-        applied_at: &str,
-        note: &str,
-    ) -> StoreResult<RebalanceRecord> {
-        if proposal_digest.len() != 64
-            || !proposal_digest.chars().all(|value| value.is_ascii_hexdigit())
+        spec: &AccountSpec,
+        index_set: &IndexedPriceSet,
+        day: &str,
+    ) -> StoreResult<DayRun> {
+        let set = index_set.set();
+        validate_day(set, day)?;
+        if let Some(last) = self.last_settled_day(&spec.account_id)?
+            && day < last.as_str()
         {
-            return Err(StoreError::Rules(RuleError("invalid_proposal_digest".into())));
+            return Err(StoreError::Conflict("day_before_last_settled".into()));
         }
-        chrono::DateTime::parse_from_rfc3339(applied_at)
-            .map_err(|_| StoreError::Rules(RuleError("invalid_rebalance_time".into())))?;
-        let txn = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let raw: Option<String> = txn
-            .query_row(
-                "SELECT spec_json FROM v2_paper_accounts WHERE account_id=?",
-                [account_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let raw = raw.ok_or_else(|| StoreError::NotFound("paper_account_not_found".into()))?;
-        let spec: crate::domain::PaperAccountSpec = serde_json::from_str(&raw)?;
-        let initial_split = spec.validate().map_err(StoreError::Rules)?;
-        let current = Self::account_weights(&txn, &spec)?;
-        let policy = crate::domain::AllocationPolicy::default();
-        if target
-            .iter()
-            .any(|weight| *weight < policy.min_slot_bps || *weight > policy.max_slot_bps)
-        {
-            return Err(StoreError::Rules(RuleError(
-                "rebalance_weight_out_of_bounds".into(),
-            )));
-        }
-        if target[0] + target[1] + spec.reserve_bps != 10_000 {
-            return Err(StoreError::Rules(RuleError(
-                "rebalance_weights_must_keep_reserve".into(),
-            )));
-        }
-        for index in 0..2 {
-            if (target[index] - current[index]).abs() > policy.max_step_bps {
-                return Err(StoreError::Rules(RuleError("rebalance_step_exceeded".into())));
-            }
+        if day_was_run(&self.conn, &spec.account_id, day)? {
+            return Ok(DayRun {
+                day: day.into(),
+                trades: trades_for_day(&self.conn, &spec.account_id, day)?,
+                rebalance: rebalance_for_day(&self.conn, &spec.account_id, day)?,
+                already_settled: true,
+            });
         }
 
-        // Idempotency: one transfer row per proposal digest.
-        let existing: Option<(String, String, i64)> = txn
-            .query_row(
-                "SELECT from_slot,to_slot,amount_cents FROM v2_paper_transfers
-                 WHERE account_id=? AND digest=?",
-                params![account_id, proposal_digest],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((from_slot, to_slot, amount_cents)) = existing {
-            let stored_weights: Vec<i64> = serde_json::from_str(&txn.query_row(
-                "SELECT weights_after_json FROM v2_paper_transfers WHERE account_id=? AND digest=?",
-                params![account_id, proposal_digest],
-                |row| row.get::<_, String>(0),
-            )?)?;
-            if stored_weights != vec![target[0], target[1]] {
-                return Err(StoreError::Conflict("rebalance_digest_conflict".into()));
-            }
-            txn.commit()?;
-            let mut record = RebalanceRecord {
-                account_id: account_id.into(),
-                from_slot,
-                to_slot,
-                amount_cents,
-                weights_before: current,
-                weights_after: target,
-                applied_at: applied_at.into(),
-                note: note.into(),
-                proposal_digest: proposal_digest.into(),
-                digest: String::new(),
-            };
-            record.digest = rebalance_digest(&record)?;
-            return Ok(record);
+        let mut books = self.books(&spec.account_id)?;
+        let previous_day = self.last_settled_day(&spec.account_id)?;
+        if previous_day.as_deref() != Some(day) {
+            settle_overnight(&mut books[0])?;
+            settle_overnight(&mut books[1])?;
         }
-
-        let next_split = spec
-            .split_with_weights(target)
-            .map_err(StoreError::Rules)?;
-        let state_a = Self::paper_slot_state(&txn, &spec, &initial_split, 0)?;
-        let state_b = Self::paper_slot_state(&txn, &spec, &initial_split, 1)?;
-        let delta = next_split.slot_budgets[0] - state_a.cash_cents;
-        let (from_slot, to_slot, amount_cents) = if delta > 0 {
-            if state_b.cash_cents < delta {
-                return Err(StoreError::Rules(RuleError(
-                    "rebalance_insufficient_cash".into(),
-                )));
-            }
-            ("B", "A", delta)
-        } else if delta < 0 {
-            let amount = -delta;
-            if state_a.cash_cents < amount {
-                return Err(StoreError::Rules(RuleError(
-                    "rebalance_insufficient_cash".into(),
-                )));
-            }
-            ("A", "B", amount)
+        let weights = self.weights(&spec.account_id)?;
+        // Same-close book: the day's own close decides and fills. Next-session
+        // model: the previous session's close decides and today's close fills,
+        // so the price being filled at was unknown when the order was formed.
+        // Warm-up days have no prior session, so the decision window stays on
+        // `day` and the first settled day simply opens nothing new.
+        let decision_day: &str = if self.next_session_fills {
+            previous_day
+                .as_deref()
+                .filter(|prior| prior.len() == 10 && *prior < day)
+                .unwrap_or(day)
         } else {
-            ("B", "A", 0)
+            day
         };
+        // Stop trigger price: the close the decision was made from. In the
+        // same-close book that is today's own close; in the next-session book
+        // it is the previous session's. Never an empty map, which would
+        // silently disable the hard stop.
+        let trigger_closes = if self.next_session_fills && decision_day != day {
+            closes_for_indexed(index_set, decision_day)
+        } else {
+            closes_for_indexed(index_set, day)
+        };
+        // The regime is a property of the day, not of a slot, and it costs one
+        // pass over the index. Computing it once here keeps the two slots
+        // looking at the same tape.
+        let regime = regime_for_day(index_set, decision_day);
+        let mut planned = Vec::new();
+        for (index, slot) in [StrategyId::Steady, StrategyId::Aggressive]
+            .into_iter()
+            .enumerate()
+        {
+            let book = &books[index];
+            let closes = closes_for_indexed(index_set, day);
+            // Only symbols that can actually produce a signal need their
+            // history replayed: those with a position to manage, plus those
+            // with a close today. Computing a signal for a symbol that has no
+            // bar on `day` cannot change the outcome.
+            let signals = self.signals_for_day(
+                slot,
+                index_set,
+                decision_day,
+                &closes,
+                book.positions.iter().map(|position| position.symbol.as_str()),
+            )?;
+            let budget = self.slot_equity(&spec.account_id, slot)?;
+            let policy = if self.regime_filter {
+                SlotPolicy::for_strategy_in(slot, regime.regime)
+            } else {
+                SlotPolicy::for_strategy(slot)
+            };
+            let valuations: BTreeMap<String, i64> = book
+                .positions
+                .iter()
+                .map(|position| {
+                    index_set
+                        .valuation(&position.symbol, day)
+                        .map(|price| (position.symbol.clone(), price))
+                        .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))
+                })
+                .collect::<StoreResult<_>>()?;
+            let orders = orders_for_day_in_split(
+                slot,
+                &policy,
+                &book.positions,
+                &signals,
+                budget,
+                book.cash_cents,
+                &closes,
+                &trigger_closes,
+                &valuations,
+                &book.sellable,
+            );
+            for order in orders {
+                let price = closes
+                    .get(&order.symbol)
+                    .copied()
+                    .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
+                // A price-limit seal closes one side of the book. Having a
+                // tradable close is not the same as being able to fill: a
+                // single-price limit-down session has a price and no bid.
+                let open = if order.side == "buy" {
+                    index_set.can_buy(&order.symbol, day)
+                } else {
+                    index_set.can_sell(&order.symbol, day)
+                };
+                if !open {
+                    continue;
+                }
+                planned.push((slot, order, price));
+            }
+            let _ = value_book_indexed(book, index_set, day)?;
+        }
 
-        txn.execute(
-            "INSERT INTO v2_paper_transfers
-             (account_id,from_slot,to_slot,amount_cents,applied_at,note,digest,
-              weights_before_json,weights_after_json)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
-                account_id,
-                from_slot,
-                to_slot,
-                amount_cents,
-                applied_at,
-                note,
-                proposal_digest,
-                serde_json::to_string(&current)?,
-                serde_json::to_string(&target)?,
-            ],
+        for (slot, order, price) in &planned {
+            let index = slot_index(*slot);
+            let amount = order.quantity * price;
+            let fees = fees_cents(&order.side, amount);
+            match order.side.as_str() {
+                "buy" => apply_buy(&mut books[index], &order.symbol, order.quantity, *price, fees, day)?,
+                "sell" => apply_sell(&mut books[index], &order.symbol, order.quantity, *price, fees)?,
+                _ => return Err(StoreError::Rules(RuleError("unsupported_side".into()))),
+            }
+        }
+
+        let mut equities = [
+            value_book(&books[0], set, day)?,
+            value_book(&books[1], set, day)?,
+        ];
+        let rebalance = self.proposed_rebalance(
+            &spec.account_id,
+            day,
+            &weights,
+            &equities,
+            &books,
         )?;
+        if let Some(proposal) = &rebalance {
+            let from = slot_index(proposal.from);
+            let to = slot_index(proposal.to);
+            books[from].cash_cents -= proposal.moved_cents;
+            books[to].cash_cents += proposal.moved_cents;
+            equities = [
+                value_book(&books[0], set, day)?,
+                value_book(&books[1], set, day)?,
+            ];
+        }
+
+        let txn = self.conn.transaction()?;
+        for (index, slot) in [StrategyId::Steady, StrategyId::Aggressive]
+            .into_iter()
+            .enumerate()
+        {
+            write_book(&txn, &spec.account_id, slot, &books[index])?;
+            txn.execute(
+                "UPDATE slot_day SET settled_day=? WHERE account_id=? AND slot=? AND settled_day<>?",
+                params![day, spec.account_id, slot_name(slot), day],
+            )?;
+            txn.execute(
+                "INSERT INTO slot_equity_day(account_id,slot,day,equity_cents) VALUES(?,?,?,?)",
+                params![spec.account_id, slot_name(slot), day, equities[index]],
+            )?;
+        }
+        let mut trades = Vec::new();
+        for (slot, order, price) in planned {
+            let amount = order.quantity * price;
+            let fees = fees_cents(&order.side, amount);
+            txn.execute(
+                "INSERT INTO trade(account_id,slot,symbol,side,quantity,price_cents,fees_cents,trade_day,reason) VALUES(?,?,?,?,?,?,?,?,?)",
+                params![
+                    spec.account_id,
+                    slot_name(slot),
+                    order.symbol,
+                    order.side,
+                    order.quantity,
+                    price,
+                    fees,
+                    day,
+                    order.reason
+                ],
+            )?;
+            trades.push(Trade {
+                id: txn.last_insert_rowid(),
+                slot,
+                symbol: order.symbol,
+                side: order.side,
+                quantity: order.quantity,
+                price_cents: price,
+                fees_cents: fees,
+                trade_day: day.into(),
+                reason: order.reason,
+            });
+        }
+        let applied = match rebalance {
+            Some(item) => Some(insert_rebalance(&txn, &spec.account_id, item)?),
+            None => None,
+        };
+        if let Some(applied) = &applied {
+            let mut updated = spec.clone();
+            updated.slots = [
+                SlotSpec {
+                    slot: StrategyId::Steady,
+                    weight_bps: applied.new_steady_bps,
+                },
+                SlotSpec {
+                    slot: StrategyId::Aggressive,
+                    weight_bps: applied.new_aggressive_bps,
+                },
+            ];
+            txn.execute(
+                "UPDATE account SET spec_json=? WHERE account_id=?",
+                params![serde_json::to_string(&updated)?, spec.account_id],
+            )?;
+        }
         txn.execute(
-            "UPDATE v2_paper_accounts SET weights_json=? WHERE account_id=?",
-            params![serde_json::to_string(&target)?, account_id],
+            "INSERT INTO day_run(account_id,day) VALUES(?,?)",
+            params![spec.account_id, day],
         )?;
         txn.commit()?;
-
-        let mut record = RebalanceRecord {
-            account_id: account_id.into(),
-            from_slot: from_slot.into(),
-            to_slot: to_slot.into(),
-            amount_cents,
-            weights_before: current,
-            weights_after: target,
-            applied_at: applied_at.into(),
-            note: note.into(),
-            proposal_digest: proposal_digest.into(),
-            digest: String::new(),
-        };
-        record.digest = rebalance_digest(&record)?;
-        Ok(record)
+        Ok(DayRun {
+            day: day.into(),
+            trades,
+            rebalance: applied,
+            already_settled: false,
+        })
     }
-}
 
-fn rebalance_digest(record: &RebalanceRecord) -> StoreResult<String> {
-    let mut value = serde_json::to_value(record)?;
-    if let Some(object) = value.as_object_mut() {
-        object.remove("digest");
-    }
-    Ok(crate::domain::canonical_digest(&value))
-}
-// ---------------------------------------------------------------------------
-// Account-level day advance: orchestrate every running session on one account
-// against an explicit China trading day. No daemon, no machine clock.
-// ---------------------------------------------------------------------------
-
-impl Store {
-    pub fn advance_account_to(
-        &mut self,
+    fn proposed_rebalance(
+        &self,
         account_id: &str,
         day: &str,
-    ) -> StoreResult<AccountAdvance> {
-        chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
-            .map_err(|_| StoreError::Rules(RuleError("invalid_advance_day".into())))?;
-        let exists: Option<String> = self
+        weights: &[i64; 2],
+        equities: &[i64; 2],
+        books: &[SlotBook; 2],
+    ) -> StoreResult<Option<Rebalance>> {
+        // This day has not been inserted into `slot_equity_day` yet: the
+        // caller supplies its freshly valued equities below. Include today in
+        // the history so the first eligible day can actually be evaluated.
+        let mut days = settled_days(&self.conn, account_id)?;
+        if !days.iter().any(|item| item == day) {
+            days.push(day.into());
+        }
+        let Some(position) = days.iter().position(|item| item == day) else {
+            return Ok(None);
+        };
+        if position < 2 {
+            return Ok(None);
+        }
+        if let Some(last) = rebalances(&self.conn, account_id)?.first() {
+            let since = days
+                .iter()
+                .filter(|item| item.as_str() > last.applied_day.as_str() && item.as_str() <= day)
+                .count();
+            if since < 2 {
+                return Ok(None);
+            }
+        }
+        let last_applied_day = rebalances(&self.conn, account_id)?
+            .first()
+            .map(|item| item.applied_day.clone());
+        let steady_history = series_since_with_current(
+            &self.conn,
+            account_id,
+            StrategyId::Steady,
+            day,
+            equities[0],
+            last_applied_day.as_deref(),
+        )?;
+        let aggressive_history = series_since_with_current(
+            &self.conn,
+            account_id,
+            StrategyId::Aggressive,
+            day,
+            equities[1],
+            last_applied_day.as_deref(),
+        )?;
+        let steady_bps = return_bps(&steady_history, equities[0]);
+        let aggressive_bps = return_bps(&aggressive_history, equities[1]);
+        let steady_drawdown = drawdown_bps(&steady_history, *steady_history.first().unwrap_or(&1));
+        let aggressive_drawdown =
+            drawdown_bps(&aggressive_history, *aggressive_history.first().unwrap_or(&1));
+        let proposal = propose(
+            weights[0],
+            score(steady_bps, steady_drawdown),
+            score(aggressive_bps, aggressive_drawdown),
+        )?;
+        if proposal.steady_bps == weights[0] {
+            return Ok(None);
+        }
+        let delta = proposal.steady_bps - weights[0];
+        // Move the budget difference implied by the old and new weight. This
+        // is an allocation of free cash, not a transfer of either strategy's
+        // positions; the UI must not call it a change in marked equity.
+        let total = equities[0] + equities[1];
+        let old_target = total * weights[0] / 10_000;
+        let new_target = total * proposal.steady_bps / 10_000;
+        let moved = (new_target - old_target).unsigned_abs() as i64;
+        let (from, to) = if delta > 0 {
+            (StrategyId::Aggressive, StrategyId::Steady)
+        } else {
+            (StrategyId::Steady, StrategyId::Aggressive)
+        };
+        // A rebalance only moves free cash. If the source slot has already
+        // invested it, keep the current weights instead of failing the whole
+        // trading day or creating negative cash.
+        if moved > books[slot_index(from)].cash_cents {
+            return Ok(None);
+        }
+        Ok(Some(Rebalance {
+            id: 0,
+            old_steady_bps: weights[0],
+            old_aggressive_bps: weights[1],
+            new_steady_bps: proposal.steady_bps,
+            new_aggressive_bps: proposal.aggressive_bps,
+            moved_cents: moved,
+            from,
+            to,
+            reason: proposal.reason,
+            applied_day: day.into(),
+        }))
+    }
+
+    pub fn trades(&self, account_id: &str, limit: i64) -> StoreResult<Vec<Trade>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,slot,symbol,side,quantity,price_cents,fees_cents,trade_day,reason FROM trade WHERE account_id=? ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map(params![account_id, limit.clamp(1, 500)], |row| {
+            let slot: String = row.get(1)?;
+            Ok(Trade {
+                id: row.get(0)?,
+                slot: parse_slot(&slot)?,
+                symbol: row.get(2)?,
+                side: row.get(3)?,
+                quantity: row.get(4)?,
+                price_cents: row.get(5)?,
+                fees_cents: row.get(6)?,
+                trade_day: row.get(7)?,
+                reason: row.get(8)?,
+            })
+        })?;
+        let mut trades = Vec::new();
+        for row in rows {
+            trades.push(row?);
+        }
+        Ok(trades)
+    }
+
+    pub fn rebalances(&self, account_id: &str) -> StoreResult<Vec<Rebalance>> {
+        rebalances(&self.conn, account_id)
+    }
+
+    /// Current risk budget: the latest settled equity, otherwise the slot's
+    /// share of the original principal.
+    pub fn slot_equity(&self, account_id: &str, slot: StrategyId) -> StoreResult<i64> {
+        let latest: Option<i64> = self
             .conn
             .query_row(
-                "SELECT account_id FROM v2_paper_accounts WHERE account_id=?",
-                [account_id],
+                "SELECT equity_cents FROM slot_equity_day WHERE account_id=? AND slot=? ORDER BY day DESC LIMIT 1",
+                params![account_id, slot_name(slot)],
                 |row| row.get(0),
             )
             .optional()?;
-        if exists.is_none() {
-            return Err(StoreError::NotFound("paper_account_not_found".into()));
+        if let Some(value) = latest {
+            return Ok(value.max(0));
         }
-        let mut statement = self
-            .conn
-            .prepare("SELECT session_id,status FROM v2_paper_sessions WHERE account_id=? ORDER BY session_id")?;
-        let sessions: Vec<(String, String)> = statement
-            .query_map([account_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        drop(statement);
-        let mut runs = Vec::new();
-        let mut steps = 0usize;
-        let mut filled = 0usize;
-        let mut rejected = 0usize;
-        for (session_id, status) in sessions {
-            if status != "running" {
-                continue;
+        let spec = self
+            .account()?
+            .ok_or_else(|| StoreError::NotFound("account_not_found".into()))?;
+        if spec.account_id != account_id {
+            return Err(StoreError::NotFound("account_not_found".into()));
+        }
+        let weight = spec
+            .slots
+            .iter()
+            .find(|item| item.slot == slot)
+            .map(|item| item.weight_bps)
+            .ok_or_else(|| StoreError::NotFound("slot_not_found".into()))?;
+        Ok(spec.initial_cash_cents * weight / 10_000)
+    }
+
+    pub fn view(
+        &self,
+        spec: &AccountSpec,
+        set: Option<&PriceSet>,
+        day: Option<&str>,
+    ) -> StoreResult<AccountView> {
+        let books = self.books(&spec.account_id)?;
+        let weights = self.weights(&spec.account_id)?;
+        let prices = set.zip(day);
+        let market_values = match prices.as_ref() {
+            Some((set, day)) => [
+                Some(crate::domain::market_value_from_set(&books[0], set, day)?),
+                Some(crate::domain::market_value_from_set(&books[1], set, day)?),
+            ],
+            None => [None, None],
+        };
+        let mark = day.zip(market_values[0].zip(market_values[1])).map(|(day, (steady, aggressive))| {
+            (day, [books[0].cash_cents + steady, books[1].cash_cents + aggressive])
+        });
+        let performance = self.account_performance(spec, mark)?;
+        let mut slots = Vec::new();
+        let mut positions = Vec::new();
+        for (index, book) in books.iter().enumerate() {
+            let market_value = market_values[index];
+            let last = performance[index + 1].last();
+            let current_performance = mark.and(last);
+            slots.push(SlotView {
+                slot: book.slot,
+                name: book.slot.name().into(),
+                description: book.slot.description().into(),
+                weight_bps: weights[index],
+                cash_cents: book.cash_cents,
+                market_value_cents: market_value,
+                equity_cents: market_value.map(|value| book.cash_cents + value),
+                profit_cents: current_performance.map(|point| point.profit_cents),
+                return_bps: current_performance.map(|point| point.return_bps),
+                drawdown_bps: last.map(|point| point.max_drawdown_bps),
+            });
+            for position in &book.positions {
+                let close = prices
+                    .as_ref()
+                    .and_then(|(set, day)| set.valuation(&position.symbol, day));
+                positions.push(PositionView {
+                    slot: book.slot,
+                    symbol: position.symbol.clone(),
+                    quantity: position.quantity,
+                    sellable_quantity: book
+                        .sellable
+                        .iter()
+                        .find(|item| item.symbol == position.symbol)
+                        .map(|item| item.quantity),
+                    average_cost_cents: position.average_cost_cents,
+                    close_cents: close,
+                    market_value_cents: close.map(|price| price * position.quantity),
+                });
             }
-            let run = self.advance_paper_session_to(&session_id, day)?;
-            steps += run.steps;
-            filled += run.filled;
-            rejected += run.rejected;
-            runs.push(run);
         }
-        Ok(AccountAdvance {
-            account_id: account_id.into(),
-            day: day.into(),
-            sessions: runs,
-            steps,
-            filled,
-            rejected,
+        let cash_cents = books.iter().map(|book| book.cash_cents).sum();
+        let equity_cents = if slots.iter().all(|slot| slot.equity_cents.is_some()) {
+            Some(slots.iter().filter_map(|slot| slot.equity_cents).sum())
+        } else {
+            None
+        };
+        Ok(AccountView {
+            account_id: spec.account_id.clone(),
+            initial_cash_cents: spec.initial_cash_cents,
+            cash_cents,
+            equity_cents,
+            profit_cents: equity_cents.map(|value| value - spec.initial_cash_cents),
+            return_bps: equity_cents
+                .map(|value| (value - spec.initial_cash_cents) * 10_000 / spec.initial_cash_cents.max(1)),
+            as_of_day: day.map(str::to_string),
+            created_at: spec.created_at.clone(),
+            slots,
+            positions,
+            trades: self.trades(&spec.account_id, 100)?,
+            rebalances: self.rebalances(&spec.account_id)?,
+            price_set_id: set.map(|item| item.price_set_id.clone()),
+            price_set_coverage_end: set.map(|item| item.coverage_end.clone()),
+            last_settled_day: self.last_settled_day(&spec.account_id)?,
+            warnings: match set {
+                None => vec!["no_reviewed_price_set".into()],
+                Some(_) if day.is_none() => vec!["no_reviewed_close_for_valuation".into()],
+                Some(_) => Vec::new(),
+            },
         })
+    }
+
+}
+
+fn read_book(conn: &Connection, account_id: &str, slot: StrategyId) -> StoreResult<SlotBook> {
+    let cash_cents: i64 = conn.query_row(
+        "SELECT cash_cents FROM slot WHERE account_id=? AND slot=?",
+        params![account_id, slot_name(slot)],
+        |row| row.get(0),
+    )?;
+    let mut positions = Vec::new();
+    let mut statement = conn.prepare(
+        "SELECT symbol,quantity,average_cost_cents,acquired_day FROM position WHERE account_id=? AND slot=? ORDER BY symbol",
+    )?;
+    let rows = statement.query_map(params![account_id, slot_name(slot)], |row| {
+        Ok(crate::domain::Position {
+            symbol: row.get(0)?,
+            quantity: row.get(1)?,
+            average_cost_cents: row.get(2)?,
+            acquired_day: row.get(3)?,
+        })
+    })?;
+    for row in rows {
+        positions.push(row?);
+    }
+    let mut sellable = Vec::new();
+    let mut statement = conn.prepare(
+        "SELECT symbol,quantity FROM sellable WHERE account_id=? AND slot=? ORDER BY symbol",
+    )?;
+    let rows = statement.query_map(params![account_id, slot_name(slot)], |row| {
+        Ok(crate::domain::Sellable {
+            symbol: row.get(0)?,
+            quantity: row.get(1)?,
+        })
+    })?;
+    for row in rows {
+        sellable.push(row?);
+    }
+    Ok(SlotBook {
+        slot,
+        cash_cents,
+        positions,
+        sellable,
+    })
+}
+
+fn write_book(
+    txn: &Transaction<'_>,
+    account_id: &str,
+    slot: StrategyId,
+    book: &SlotBook,
+) -> StoreResult<()> {
+    txn.execute(
+        "UPDATE slot SET cash_cents=? WHERE account_id=? AND slot=?",
+        params![book.cash_cents, account_id, slot_name(slot)],
+    )?;
+    txn.execute(
+        "DELETE FROM position WHERE account_id=? AND slot=?",
+        params![account_id, slot_name(slot)],
+    )?;
+    for position in &book.positions {
+        txn.execute(
+            "INSERT INTO position(account_id,slot,symbol,quantity,average_cost_cents,acquired_day) VALUES(?,?,?,?,?,?)",
+            params![
+                account_id,
+                slot_name(slot),
+                position.symbol,
+                position.quantity,
+                position.average_cost_cents,
+                position.acquired_day
+            ],
+        )?;
+    }
+    txn.execute(
+        "DELETE FROM sellable WHERE account_id=? AND slot=?",
+        params![account_id, slot_name(slot)],
+    )?;
+    for item in &book.sellable {
+        txn.execute(
+            "INSERT INTO sellable(account_id,slot,symbol,quantity) VALUES(?,?,?,?)",
+            params![account_id, slot_name(slot), item.symbol, item.quantity],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_rebalance(
+    txn: &Transaction<'_>,
+    account_id: &str,
+    proposal: Rebalance,
+) -> StoreResult<Rebalance> {
+    let aggressive = 10_000 - proposal.new_steady_bps;
+    txn.execute(
+        "UPDATE slot SET weight_bps=? WHERE account_id=? AND slot=?",
+        params![proposal.new_steady_bps, account_id, slot_name(StrategyId::Steady)],
+    )?;
+    txn.execute(
+        "UPDATE slot SET weight_bps=? WHERE account_id=? AND slot=?",
+        params![aggressive, account_id, slot_name(StrategyId::Aggressive)],
+    )?;
+    txn.execute(
+        "INSERT INTO rebalance(account_id,old_steady_bps,old_aggressive_bps,new_steady_bps,new_aggressive_bps,moved_cents,reason,applied_day) VALUES(?,?,?,?,?,?,?,?)",
+        params![
+            account_id,
+            proposal.old_steady_bps,
+            proposal.old_aggressive_bps,
+            proposal.new_steady_bps,
+            aggressive,
+            proposal.moved_cents,
+            proposal.reason,
+            proposal.applied_day
+        ],
+    )?;
+    Ok(Rebalance {
+        id: txn.last_insert_rowid(),
+        ..proposal
+    })
+}
+
+fn validate_day(set: &PriceSet, day: &str) -> StoreResult<()> {
+    if day.len() != 10 || day < set.coverage_start.as_str() || day > set.coverage_end.as_str() {
+        return Err(StoreError::Rules(RuleError("day_outside_price_set_coverage".into())));
+    }
+    if !set.contains_day(day) {
+        return Err(StoreError::Rules(RuleError("no_reviewed_close_for_day".into())));
+    }
+    Ok(())
+}
+
+/// One day's tradable closes, served from the day index instead of a full scan.
+///
+/// A whole-market set is ~4M entries; rebuilding a day's close map by scanning
+/// all of them, once per trading day settled, is the difference between a
+/// settlement pass that finishes and one that does not.
+fn closes_for_indexed(index: &IndexedPriceSet, day: &str) -> BTreeMap<String, i64> {
+    index.tradable_closes_on(day)
+}
+
+/// Classify the broad market as of `day`, from the same snapshot the
+/// strategies settle against.
+///
+/// The lookback is bounded by `REGIME_LOOKBACK_DAYS`. Both moving averages are
+/// computed from trailing means, so history older than the slow window cannot
+/// change the answer -- but the window is twice the slow average so the index
+/// has enough points to average over even when a slice of the market is
+/// missing on some days.
+fn regime_for_day(index: &IndexedPriceSet, day: &str) -> RegimeView {
+    let by_symbol = index.recent_closes(day, REGIME_LOOKBACK_DAYS);
+    classify_series(&by_symbol)
+}
+
+fn value_book_indexed(
+    book: &SlotBook,
+    index: &IndexedPriceSet,
+    day: &str,
+) -> StoreResult<i64> {
+    let mut market = 0i64;
+    for position in &book.positions {
+        let price = index
+            .valuation(&position.symbol, day)
+            .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
+        market = market
+            .checked_add(price * position.quantity)
+            .ok_or_else(|| StoreError::Rules(RuleError("amount_overflow".into())))?;
+    }
+    book.cash_cents
+        .checked_add(market)
+        .ok_or_else(|| StoreError::Rules(RuleError("amount_overflow".into())))
+}
+
+fn value_book(book: &SlotBook, set: &PriceSet, day: &str) -> StoreResult<i64> {
+    let mut market = 0i64;
+    for position in &book.positions {
+        let price = set
+            .valuation(&position.symbol, day)
+            .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
+        market = market
+            .checked_add(price * position.quantity)
+            .ok_or_else(|| StoreError::Rules(RuleError("amount_overflow".into())))?;
+    }
+    book.cash_cents
+        .checked_add(market)
+        .ok_or_else(|| StoreError::Rules(RuleError("amount_overflow".into())))
+}
+
+fn day_was_run(conn: &Connection, account_id: &str, day: &str) -> StoreResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM day_run WHERE account_id=? AND day=?",
+        params![account_id, day],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn trades_for_day(conn: &Connection, account_id: &str, day: &str) -> StoreResult<Vec<Trade>> {
+    let mut statement = conn.prepare(
+        "SELECT id,slot,symbol,side,quantity,price_cents,fees_cents,trade_day,reason FROM trade WHERE account_id=? AND trade_day=? ORDER BY id",
+    )?;
+    let rows = statement.query_map(params![account_id, day], |row| {
+        let slot: String = row.get(1)?;
+        Ok(Trade {
+            id: row.get(0)?,
+            slot: parse_slot(&slot)?,
+            symbol: row.get(2)?,
+            side: row.get(3)?,
+            quantity: row.get(4)?,
+            price_cents: row.get(5)?,
+            fees_cents: row.get(6)?,
+            trade_day: row.get(7)?,
+            reason: row.get(8)?,
+        })
+    })?;
+    let mut trades = Vec::new();
+    for row in rows {
+        trades.push(row?);
+    }
+    Ok(trades)
+}
+
+fn rebalance_for_day(
+    conn: &Connection,
+    account_id: &str,
+    day: &str,
+) -> StoreResult<Option<Rebalance>> {
+    Ok(rebalances(conn, account_id)?
+        .into_iter()
+        .find(|item| item.applied_day == day))
+}
+
+fn rebalances(conn: &Connection, account_id: &str) -> StoreResult<Vec<Rebalance>> {
+    let mut statement = conn.prepare(
+        "SELECT id,old_steady_bps,old_aggressive_bps,new_steady_bps,new_aggressive_bps,moved_cents,reason,applied_day FROM rebalance WHERE account_id=? ORDER BY id DESC",
+    )?;
+    let rows = statement.query_map([account_id], |row| {
+        let old_steady_bps = row.get(1)?;
+        let new_steady_bps = row.get(3)?;
+        Ok(Rebalance {
+            id: row.get(0)?,
+            old_steady_bps,
+            old_aggressive_bps: row.get(2)?,
+            new_steady_bps,
+            new_aggressive_bps: row.get(4)?,
+            moved_cents: row.get(5)?,
+            from: if new_steady_bps > old_steady_bps {
+                StrategyId::Aggressive
+            } else {
+                StrategyId::Steady
+            },
+            to: if new_steady_bps > old_steady_bps {
+                StrategyId::Steady
+            } else {
+                StrategyId::Aggressive
+            },
+            reason: row.get(6)?,
+            applied_day: row.get(7)?,
+        })
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
+}
+
+fn slot_weight(conn: &Connection, account_id: &str, slot: StrategyId) -> StoreResult<i64> {
+    Ok(conn.query_row(
+        "SELECT weight_bps FROM slot WHERE account_id=? AND slot=?",
+        params![account_id, slot_name(slot)],
+        |row| row.get(0),
+    )?)
+}
+
+fn settled_days(conn: &Connection, account_id: &str) -> StoreResult<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT day FROM slot_equity_day WHERE account_id=? ORDER BY day",
+    )?;
+    let rows = statement.query_map([account_id], |row| row.get(0))?;
+    let mut days = Vec::new();
+    for row in rows {
+        days.push(row?);
+    }
+    Ok(days)
+}
+
+fn series_until(
+    conn: &Connection,
+    account_id: &str,
+    slot: StrategyId,
+    day: &str,
+) -> StoreResult<Vec<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT equity_cents FROM slot_equity_day WHERE account_id=? AND slot=? AND day<=? ORDER BY day",
+    )?;
+    let rows = statement.query_map(params![account_id, slot_name(slot), day], |row| row.get(0))?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row?);
+    }
+    Ok(values)
+}
+
+fn series_since_with_current(
+    conn: &Connection,
+    account_id: &str,
+    slot: StrategyId,
+    day: &str,
+    current: i64,
+    exclusive_start: Option<&str>,
+) -> StoreResult<Vec<i64>> {
+    let mut values = series_until(conn, account_id, slot, day)?;
+    if let Some(start) = exclusive_start {
+        let mut statement = conn.prepare(
+            "SELECT equity_cents FROM slot_equity_day WHERE account_id=? AND slot=? AND day>? AND day<? ORDER BY day",
+        )?;
+        let rows = statement.query_map(
+            params![account_id, slot_name(slot), start, day],
+            |row| row.get(0),
+        )?;
+        values.clear();
+        for row in rows {
+            values.push(row?);
+        }
+    }
+    values.push(current);
+    Ok(values)
+}
+
+fn return_bps(points: &[i64], latest: i64) -> i64 {
+    let base = points.first().copied().unwrap_or(latest).max(1);
+    (latest - base) * 10_000 / base
+}
+
+/// One day's OHLCV row in the whole-market bar table.
+///
+/// `prev_close_cents` comes straight from the daytime package and is the only
+/// cheap way to tell a real -10% limit-down from an ex-dividend gap. Without
+/// it a 10-for-5 dividend looks identical to a crash.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Bar {
+    pub symbol: String,
+    pub day: String,
+    pub name: String,
+    pub open_cents: i64,
+    pub high_cents: i64,
+    pub low_cents: i64,
+    pub close_cents: i64,
+    pub prev_close_cents: i64,
+    pub volume_shares: i64,
+    pub amount_cents: i64,
+    /// `none` for unadjusted (daytime package), `qfq` for forward-adjusted
+    /// (V1 archive). Never mix the two in one series.
+    pub adjust: String,
+    pub source: String,
+    /// A real close that may fill an order. A halted row carries the official
+    /// reference previous close in `close_cents` and must be valued only.
+    pub tradable: bool,
+}
+
+impl Bar {
+    /// Change from the previous close in basis points.
+    pub fn change_bps(&self) -> i64 {
+        if self.prev_close_cents <= 0 {
+            return 0;
+        }
+        (self.close_cents - self.prev_close_cents) * 10_000 / self.prev_close_cents
+    }
+}
+
+/// Daily price limit for a symbol, in basis points.
+///
+/// A-shares cap daily moves per board: 30% Beijing, 20% ChiNext and STAR, 10%
+/// main board. Getting this right matters for the gap hint -- a flat 11%
+/// threshold flags every ChiNext limit-up as a corporate action, which is what
+/// it did on 2026-11-11 (34 symbols, nearly all ordinary moves).
+pub fn daily_limit_bps(symbol: &str) -> i64 {
+    let code = symbol.split('.').next().unwrap_or("");
+    let board = symbol.rsplit('.').next().unwrap_or("");
+    let prefix = &code[..code.len().min(3)];
+    match (board, prefix) {
+        ("BJ", _) => 3_000,
+        ("SH", "688") | ("SH", "689") => 2_000,
+        ("SZ", "300") | ("SZ", "301") => 2_000,
+        _ => 1_000,
+    }
+}
+
+fn read_bar(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bar> {
+    Ok(Bar {
+        symbol: row.get(0)?,
+        day: row.get(1)?,
+        name: row.get(2)?,
+        open_cents: row.get(3)?,
+        high_cents: row.get(4)?,
+        low_cents: row.get(5)?,
+        close_cents: row.get(6)?,
+        prev_close_cents: row.get(7)?,
+        volume_shares: row.get(8)?,
+        amount_cents: row.get(9)?,
+        adjust: row.get(10)?,
+        source: row.get(11)?,
+        tradable: row.get(12)?,
+    })
+}
+
+pub fn slot_name(slot: StrategyId) -> &'static str {
+    match slot {
+        StrategyId::Steady => "steady",
+        StrategyId::Aggressive => "aggressive",
+    }
+}
+
+fn slot_index(slot: StrategyId) -> usize {
+    match slot {
+        StrategyId::Steady => 0,
+        StrategyId::Aggressive => 1,
+    }
+}
+
+fn parse_slot(value: &str) -> rusqlite::Result<StrategyId> {
+    match value {
+        "steady" => Ok(StrategyId::Steady),
+        "aggressive" => Ok(StrategyId::Aggressive),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+pub fn price_sets_dir() -> PathBuf {
+    std::env::var("ASTOCK_PRICE_SETS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/price-sets"))
+}
+
+pub fn load_price_sets(dir: &Path) -> StoreResult<Option<PriceSet>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Integrity(error.to_string())),
+    };
+    let mut sets = Vec::new();
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| StoreError::Integrity(error.to_string()))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|error| StoreError::Integrity(error.to_string()))?;
+        let set: PriceSet = serde_json::from_str(&raw)?;
+        set.validate()?;
+        if !ids.insert(set.price_set_id.clone()) {
+            return Err(StoreError::Integrity("duplicate_price_set_id".into()));
+        }
+        sets.push(set);
+    }
+    sets.sort_by(|left, right| {
+        right
+            .coverage_end
+            .cmp(&left.coverage_end)
+            .then_with(|| right.coverage_start.cmp(&left.coverage_start))
+            .then_with(|| right.price_set_id.cmp(&left.price_set_id))
+    });
+    Ok(sets.into_iter().next())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{PriceEntry, SlotSpec};
+
+    fn bar(symbol: &str, day: &str, close: i64, prev: i64) -> Bar {
+        Bar {
+            symbol: symbol.into(),
+            day: day.into(),
+            name: format!("n-{symbol}"),
+            open_cents: prev,
+            high_cents: close.max(prev),
+            low_cents: close.min(prev),
+            close_cents: close,
+            prev_close_cents: prev,
+            volume_shares: 1_000,
+            amount_cents: close * 1_000,
+            adjust: "none".into(),
+            source: "tdx".into(),
+            tradable: true,
+        }
+    }
+
+    #[test]
+    fn bars_round_trip_through_the_store() {
+        let mut store = Store::open(":memory:").unwrap();
+        let rows = vec![
+            bar("600000.SH", "2026-11-10", 1_020, 1_010),
+            bar("000001.SZ", "2026-11-10", 1_186, 1_189),
+        ];
+        assert_eq!(store.upsert_bars(&rows).unwrap(), 2);
+
+        let stored = store.bars_for_day("2026-11-10").unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].symbol, "000001.SZ"); // ordered by symbol
+        assert_eq!(stored[1].close_cents, 1_020);
+        assert_eq!(store.bar_symbol_count("2026-11-10").unwrap(), 2);
+        assert_eq!(store.bar_days().unwrap(), vec!["2026-11-10".to_string()]);
+    }
+
+    #[test]
+    fn research_open_is_read_only_and_pins_one_market_snapshot() {
+        let path = temp_db("research-read-only");
+        let mut writer = Store::open(&path).unwrap();
+        writer.upsert_bars(&[bar("600000.SH", "2026-11-10", 1000, 1000)]).unwrap();
+        let mut reader = Store::open_market_read_only(&path).unwrap();
+        writer.upsert_bars(&[bar("600000.SH", "2026-11-11", 1001, 1000)]).unwrap();
+        assert_eq!(reader.unadjusted_bar_days().unwrap(), ["2026-11-10"]);
+        assert!(reader.create_account(spec()).is_err());
+        assert!(reader.upsert_bars(&[bar("000001.SZ", "2026-11-10", 1000, 1000)]).is_err());
+        assert!(writer.account().unwrap().is_none());
+        assert_eq!(writer.bar_days().unwrap().len(), 2);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn research_open_does_not_create_missing_database() {
+        let path = temp_db("research-missing");
+        assert!(!path.exists());
+        assert!(Store::open_market_read_only(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn upsert_bars_is_idempotent() {
+        let mut store = Store::open(":memory:").unwrap();
+        let rows = vec![bar("600000.SH", "2026-11-10", 1_020, 1_010)];
+        store.upsert_bars(&rows).unwrap();
+        store.upsert_bars(&rows).unwrap();
+        assert_eq!(store.bar_symbol_count("2026-11-10").unwrap(), 1);
+
+        // Re-ingesting with a corrected close updates in place, no duplicate.
+        store
+            .upsert_bars(&[bar("600000.SH", "2026-11-10", 1_025, 1_010)])
+            .unwrap();
+        let stored = store.bars_for_day("2026-11-10").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].close_cents, 1_025);
+    }
+
+    #[test]
+    fn empty_batch_writes_nothing() {
+        let mut store = Store::open(":memory:").unwrap();
+        assert_eq!(store.upsert_bars(&[]).unwrap(), 0);
+        assert!(store.bar_days().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bars_for_symbol_filters_by_day_range() {
+        let mut store = Store::open(":memory:").unwrap();
+        store
+            .upsert_bars(&[
+                bar("600000.SH", "2026-11-03", 1_000, 1_000),
+                bar("600000.SH", "2026-11-04", 1_010, 1_000),
+                bar("600000.SH", "2026-11-05", 1_020, 1_010),
+                bar("000001.SZ", "2026-11-04", 1_186, 1_189),
+            ])
+            .unwrap();
+
+        let subset = store
+            .bars_for_symbol("600000.SH", "2026-11-04", "2026-11-05")
+            .unwrap();
+        assert_eq!(subset.len(), 2);
+        assert_eq!(subset[0].day, "2026-11-04");
+        assert_eq!(subset[1].day, "2026-11-05");
+    }
+
+    #[test]
+    fn price_gaps_flags_ex_dividend_and_limit_moves() {
+        let mut store = Store::open(":memory:").unwrap();
+        store
+            .upsert_bars(&[
+                // -10%: an ordinary main-board limit move, not a gap.
+                bar("600000.SH", "2026-11-10", 900, 1_000),
+                // -20%: impossible for a main-board stock without a corporate
+                // action, so it is flagged.
+                bar("600036.SH", "2026-11-10", 800, 1_000),
+                // +5%: ordinary.
+                bar("000001.SZ", "2026-11-10", 1_050, 1_000),
+                // +15% on ChiNext: under its 20% limit, so ordinary.
+                bar("300750.SZ", "2026-11-10", 1_150, 1_000),
+                // +27% on ChiNext: past its 20% limit plus headroom, so
+                // flagged. (+25% sits inside the 20%+5% margin.)
+                bar("300752.SZ", "2026-11-10", 1_270, 1_000),
+            ])
+            .unwrap();
+
+        let gaps = store.price_gaps("2026-11-10").unwrap();
+        let symbols: Vec<&str> = gaps.iter().map(|b| b.symbol.as_str()).collect();
+        assert_eq!(symbols, vec!["300752.SZ", "600036.SH"]);
+    }
+
+    #[test]
+    fn bar_adjust_and_source_round_trip() {
+        let mut store = Store::open(":memory:").unwrap();
+        let mut qfq = bar("600519.SH", "2026-11-06", 145_300, 145_200);
+        qfq.adjust = "qfq".into();
+        qfq.source = "v1-qfq".into();
+        store
+            .upsert_bars(&[qfq, bar("600000.SH", "2026-11-06", 1_003, 987)])
+            .unwrap();
+
+        let stored = store.bars_for_day("2026-11-06").unwrap();
+        assert_eq!(stored[0].adjust, "none");
+        assert_eq!(stored[0].source, "tdx");
+        assert_eq!(stored[1].adjust, "qfq");
+        assert_eq!(stored[1].source, "v1-qfq");
+    }
+
+    #[test]
+    fn older_bar_table_gains_adjust_columns_on_open() {
+        // A database created before `adjust`/`source` existed must still open,
+        // and must report the safe defaults rather than failing.
+        let dir = std::env::temp_dir().join(format!("astock-bar-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite3");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_version(version INTEGER NOT NULL);
+                INSERT INTO schema_version(version) VALUES(2);
+                CREATE TABLE bar(
+                    symbol TEXT NOT NULL, day TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                    open_cents INTEGER NOT NULL, high_cents INTEGER NOT NULL,
+                    low_cents INTEGER NOT NULL, close_cents INTEGER NOT NULL,
+                    prev_close_cents INTEGER NOT NULL, volume_shares INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL, PRIMARY KEY(symbol, day));
+                INSERT INTO bar VALUES('600000.SH','2026-11-10','x',1000,1020,990,1020,1010,100,102000);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let rows = store.bars_for_day("2026-11-10").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].adjust, "none");
+        assert_eq!(rows[0].source, "tdx");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_tdx_halts_are_classified_once_when_tradable_is_added() {
+        let path = temp_db("legacy-halt-classification");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE bar(
+                    symbol TEXT NOT NULL, day TEXT NOT NULL, name TEXT NOT NULL,
+                    open_cents INTEGER NOT NULL, high_cents INTEGER NOT NULL,
+                    low_cents INTEGER NOT NULL, close_cents INTEGER NOT NULL,
+                    prev_close_cents INTEGER NOT NULL, volume_shares INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL, adjust TEXT NOT NULL, source TEXT NOT NULL,
+                    PRIMARY KEY(symbol, day));
+                INSERT INTO bar VALUES
+                    ('000007.SZ','2026-11-10','halt',0,0,0,480,474,0,0,'none','tdx'),
+                    ('000008.SZ','2026-11-10','no-ref',0,0,0,480,0,0,0,'none','tdx'),
+                    ('600000.SH','2026-11-10','traded',1000,1020,990,1020,1010,100,102000,'none','tdx'),
+                    ('600001.SH','2026-11-10','adjusted',0,0,0,480,474,0,0,'qfq','v1-qfq');
+                "#,
+            ).unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let rows = store.bars_for_day("2026-11-10").unwrap();
+        assert_eq!((rows[0].close_cents, rows[0].tradable), (474, false));
+        assert_eq!((rows[1].close_cents, rows[1].tradable), (0, false));
+        assert_eq!((rows[2].close_cents, rows[2].tradable), (1020, true));
+        assert_eq!((rows[3].close_cents, rows[3].tradable), (480, true));
+        let prices = store.unadjusted_closes("2026-11-10").unwrap();
+        assert!(prices.iter().any(|row|
+            row.symbol == "000007.SZ" && row.price_cents == 474 && !row.tradable));
+        assert!(!prices.iter().any(|row| row.symbol == "000008.SZ"));
+
+        let mut explicit = bar("600000.SH", "2026-11-10", 1020, 1010);
+        explicit.tradable = false;
+        store.upsert_bars(&[explicit]).unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let rows = reopened.bars_for_day("2026-11-10").unwrap();
+        assert_eq!((rows[0].close_cents, rows[0].tradable), (474, false));
+        assert!(!rows[2].tradable);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bar_change_bps_is_signed_and_guards_zero_prev() {
+        assert_eq!(bar("x.SH", "d", 1_100, 1_000).change_bps(), 1_000);
+        assert_eq!(bar("x.SH", "d", 900, 1_000).change_bps(), -1_000);
+        assert_eq!(bar("x.SH", "d", 1_000, 0).change_bps(), 0);
+    }
+
+    fn spec() -> AccountSpec {
+        AccountSpec {
+            schema_version: 1,
+            account_id: "test-account".into(),
+            initial_cash_cents: 10_000_000,
+            created_at: "2026-07-01T09:00:00+08:00".into(),
+            slots: [
+                SlotSpec {
+                    slot: StrategyId::Steady,
+                    weight_bps: 5_000,
+                },
+                SlotSpec {
+                    slot: StrategyId::Aggressive,
+                    weight_bps: 5_000,
+                },
+            ],
+        }
+    }
+
+    fn day(index: usize) -> String {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        (start + chrono::Duration::days(index as i64))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn price_set(days: usize) -> PriceSet {
+        let mut entries = Vec::new();
+        for index in 0..days {
+            let close = 1_000 + index as i64 * 2;
+            for symbol in ["600000.SH", "000001.SZ"] {
+                entries.push(PriceEntry {
+                    symbol: symbol.into(),
+                    day: day(index),
+                    price_cents: close,
+                    source: "offline-test".into(),
+                    observed_at: format!("{}T15:00:00+08:00", day(index)),
+                    tradable: true,
+                    can_buy: true,
+                    can_sell: true,
+                });
+            }
+        }
+        PriceSet {
+            schema_version: 1,
+            price_set_id: "test-set".into(),
+            market_data_pack_id: "test-pack".into(),
+            trust: "reviewed".into(),
+            coverage_start: day(0),
+            coverage_end: day(days - 1),
+            entries,
+            source_digest: "a".repeat(64),
+        }
+    }
+
+    fn split_price_set(days: usize) -> PriceSet {
+        let mut entries = Vec::new();
+        for index in 0..days {
+            // Before day 60 the symbols move together, so both slots hold the
+            // same basket. From day 60 the two symbols diverge sharply.
+            let first = if index < 60 {
+                1_000 + index as i64
+            } else {
+                1_060 + (index as i64 - 60) * 40
+            };
+            let second = if index < 60 {
+                1_000 + index as i64
+            } else {
+                1_060 + (index as i64 - 60) * 20
+            };
+            for (symbol, close) in [("600000.SH", first), ("000001.SZ", second)] {
+                entries.push(PriceEntry {
+                    symbol: symbol.into(),
+                    day: day(index),
+                    price_cents: close,
+                    source: "offline-test".into(),
+                    observed_at: format!("{}T15:00:00+08:00", day(index)),
+                    tradable: true,
+                    can_buy: true,
+                    can_sell: true,
+                });
+            }
+        }
+        PriceSet {
+            schema_version: 1,
+            price_set_id: "split-test-set".into(),
+            market_data_pack_id: "test-pack".into(),
+            trust: "reviewed".into(),
+            coverage_start: day(0),
+            coverage_end: day(days - 1),
+            entries,
+            source_digest: "b".repeat(64),
+        }
+    }
+
+    fn store() -> Store {
+        let mut store = Store::open(":memory:").unwrap();
+        store.create_account(spec()).unwrap();
+        store
+    }
+
+    fn temp_db(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "astock-v2-{label}-{}.sqlite3",
+            std::process::id()
+        ));
+        for suffix in ["", "-wal", "-shm"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            let _ = std::fs::remove_file(file);
+        }
+        path
+    }
+
+    fn config_change(store: &Store, steady: i64) {
+        let mut updated = store.account().unwrap().unwrap();
+        updated.slots[0].weight_bps = steady;
+        updated.slots[1].weight_bps = 10_000 - steady;
+        store
+            .conn
+            .execute(
+                "UPDATE account SET spec_json=?",
+                [serde_json::to_string(&updated).unwrap()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE slot SET weight_bps=? WHERE slot='steady'",
+                [steady],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE slot SET weight_bps=? WHERE slot='aggressive'",
+                [10_000 - steady],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn advancing_fills_every_day_once_and_preserves_cash() {
+        let mut store = store();
+        let set = price_set(90);
+        let result = store.advance(&spec(), &set, &day(89), None).unwrap();
+        assert_eq!(result.processed_days.len(), 90);
+        assert!(!result.trades.is_empty());
+        let books = store.books("test-account").unwrap();
+        let cash: i64 = books.iter().map(|book| book.cash_cents).sum();
+        let view = store.view(&spec(), Some(&set), Some(&day(89))).unwrap();
+        assert_eq!(view.cash_cents, cash);
+        assert_eq!(
+            view.equity_cents.unwrap(),
+            cash
+                + view
+                    .positions
+                    .iter()
+                    .map(|position| position.market_value_cents.unwrap())
+                    .sum::<i64>()
+        );
+        let again = store.advance(&spec(), &set, &day(89), None).unwrap();
+        assert!(again.processed_days.is_empty());
+        assert!(again.trades.is_empty());
+        assert_eq!(
+            store.trades("test-account", 500).unwrap().len(),
+            result.trades.len()
+        );
+    }
+
+    #[test]
+    fn same_day_replay_returns_the_same_fills_without_new_rows() {
+        let mut store = store();
+        let set = price_set(90);
+        let first = store.run_day(&spec(), &set, &day(70)).unwrap();
+        let count = store.trades("test-account", 500).unwrap().len();
+        let second = store.run_day(&spec(), &set, &day(70)).unwrap();
+        assert!(second.already_settled);
+        assert_eq!(first.trades.len(), second.trades.len());
+        assert_eq!(store.trades("test-account", 500).unwrap().len(), count);
+    }
+
+    #[test]
+    fn rebalance_moves_cash_and_weights_in_one_commit() {
+        let mut store = store();
+        let set = price_set(90);
+        store.advance(&spec(), &set, &day(89), None).unwrap();
+        config_change(&store, 5_400);
+        let books = store.books("test-account").unwrap();
+        let before: i64 = books.iter().map(|book| book.cash_cents).sum();
+        let view = store.view(&spec(), Some(&set), Some(&day(89))).unwrap();
+        let total = view.equity_cents.unwrap();
+        let weights = store.weights("test-account").unwrap();
+        assert_eq!(weights[0] + weights[1], 10_000);
+        let books = store.books("test-account").unwrap();
+        let after: i64 = books.iter().map(|book| book.cash_cents).sum();
+        assert_eq!(before, after);
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn rebalanced_day_records_equity_from_the_transferred_books() {
+        let mut store = store();
+        let set = split_price_set(75);
+        let mut applied = None;
+        for index in 0..=66 {
+            let run = store.run_day(&spec(), &set, &day(index)).unwrap();
+            if let Some(item) = run.rebalance.filter(|item| item.moved_cents > 0) {
+                applied = Some((index, item));
+                break;
+            }
+        }
+        let (index, rebalance) = applied.expect("a cash-moving rebalance");
+        let books = store.books("test-account").unwrap();
+        let applied_day = day(index);
+        let mut expected = [0i64; 2];
+        for (slot_index, book) in books.iter().enumerate() {
+            let market = book
+                .positions
+                .iter()
+                .map(|position| {
+                    set.valuation(&position.symbol, &applied_day).unwrap() * position.quantity
+                })
+                .sum::<i64>();
+            expected[slot_index] = book.cash_cents + market;
+        }
+        let stored = [StrategyId::Steady, StrategyId::Aggressive].map(|slot| {
+            store
+                .conn
+                .query_row(
+                    "SELECT equity_cents FROM slot_equity_day WHERE account_id=? AND slot=? AND day=?",
+                    params!["test-account", slot_name(slot), applied_day],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        });
+        assert_eq!(stored, expected);
+        assert!(rebalance.moved_cents > 0);
+    }
+
+    #[test]
+    fn slot_profit_excludes_cash_transfers_and_sums_to_account_profit() {
+        let mut store = store();
+        let set = split_price_set(75);
+        store.advance(&spec(), &set, &day(66), None).unwrap();
+        let last = store.last_settled_day("test-account").unwrap().unwrap();
+        let view = store.view(&spec(), Some(&set), Some(&last)).unwrap();
+        let slot_profit = view
+            .slots
+            .iter()
+            .map(|slot| slot.profit_cents.unwrap())
+            .sum::<i64>();
+        assert_eq!(slot_profit, view.profit_cents.unwrap());
+        for slot in &view.slots {
+            assert_ne!(
+                slot.weight_bps, 5_000,
+                "the rebalance must resize a slot for this regression to be meaningful"
+            );
+            let net_flow: i64 = view.rebalances.iter().map(|item| {
+                if item.to == slot.slot { item.moved_cents } else { -item.moved_cents }
+            }).sum();
+            assert_ne!(net_flow, 0);
+            let expected = slot.equity_cents.unwrap() - spec().initial_cash_cents / 2 - net_flow;
+            assert_eq!(slot.profit_cents, Some(expected));
+        }
+    }
+
+    #[test]
+    fn account_view_propagates_a_missing_held_quote() {
+        let mut store = store();
+        let mut set = price_set(90);
+        let as_of = day(70);
+        store.run_day(&spec(), &set, &as_of).unwrap();
+        let held = store.books("test-account").unwrap().into_iter()
+            .flat_map(|book| book.positions).next().expect("fixture has a position").symbol;
+        set.entries.retain(|entry| entry.day != as_of || entry.symbol != held);
+        let error = store.view(&spec(), Some(&set), Some(&as_of)).unwrap_err();
+        assert!(matches!(error, StoreError::Rules(RuleError(ref message)) if message == "missing_close_price"));
+    }
+
+    #[test]
+    fn a_cash_transfer_alone_does_not_create_strategy_profit_or_drawdown() {
+        let store = store();
+        for (index, equities) in [[5_000_000, 5_000_000], [6_000_000, 4_000_000]].iter().enumerate() {
+            for (slot, equity) in ["steady", "aggressive"].into_iter().zip(equities) {
+                store.conn.execute(
+                    "INSERT INTO slot_equity_day VALUES(?,?,?,?)",
+                    params!["test-account", slot, day(index), equity],
+                ).unwrap();
+            }
+        }
+        store.conn.execute(
+            "INSERT INTO rebalance(account_id,old_steady_bps,old_aggressive_bps,new_steady_bps,new_aggressive_bps,moved_cents,reason,applied_day) VALUES(?,5000,5000,6000,4000,1000000,'test',?)",
+            params!["test-account", day(1)],
+        ).unwrap();
+        store.conn.execute("UPDATE slot SET cash_cents=6000000 WHERE slot='steady'", []).unwrap();
+        store.conn.execute("UPDATE slot SET cash_cents=4000000 WHERE slot='aggressive'", []).unwrap();
+        let view = store.view(&spec(), Some(&price_set(2)), Some(&day(1))).unwrap();
+        for slot in view.slots {
+            assert_eq!(slot.profit_cents, Some(0));
+            assert_eq!(slot.return_bps, Some(0));
+            assert_eq!(slot.drawdown_bps, Some(0));
+        }
+        let curves = store.account_performance(&spec(), None).unwrap();
+        assert!(curves.iter().flatten().all(|point| point.return_bps == 0));
+        // Revaluing the settled date must retain its flow, not count it twice.
+        assert_eq!(curves, store.account_performance(&spec(), Some((&day(1), [6_000_000, 4_000_000]))).unwrap());
+        let later = store.account_performance(&spec(), Some((&day(2), [6_600_000, 4_000_000]))).unwrap();
+        assert_eq!(later[1].last().unwrap().profit_cents, 600_000);
+        assert_eq!(later[1].last().unwrap().return_bps, 1_000);
+        assert_eq!(store.equity_curve("test-account").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rebalance_without_enough_source_cash_keeps_weights_and_does_not_fail_the_day() {
+        let mut store = store();
+        let set = price_set(4);
+        for index in 0..2 {
+            for (slot, equity) in [
+                ("steady", 5_000_000),
+                ("aggressive", if index == 0 { 6_000_000 } else { 4_000_000 }),
+            ] {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO slot_equity_day(account_id,slot,day,equity_cents) VALUES(?,?,?,?)",
+                        params!["test-account", slot, day(index), equity],
+                    )
+                    .unwrap();
+            }
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE slot SET cash_cents=5000000 WHERE slot='steady'",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE slot SET cash_cents=0 WHERE slot='aggressive'", [])
+            .unwrap();
+
+        let run = store
+            .run_day(&spec(), &set, &day(3))
+            .expect("insufficient transfer cash must not abort the day");
+        assert!(run.rebalance.is_none());
+        assert_eq!(store.weights("test-account").unwrap(), [5_000, 5_000]);
+    }
+
+    #[test]
+    fn older_v2_database_is_refused_before_it_is_reinterpreted() {
+        let path = temp_db("legacy");
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch("PRAGMA user_version = 15;").unwrap();
+        legacy
+            .execute_batch("CREATE TABLE v2_paper_accounts (account_id TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(legacy);
+        let error = Store::open(&path).err().expect("legacy db must fail");
+        assert!(matches!(error, StoreError::Integrity(ref value) if value.contains("legacy_v2")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_limit_down_seal_blocks_the_sale_and_keeps_the_position() {
+        // A held name gaps to a single-price limit-down session. The row has a
+        // real close, so a same-close model would book a fill at the bottom;
+        // the seal must leave the position open instead.
+        let mut store = store();
+        let mut set = price_set(90);
+        store.advance(&spec(), &set, &day(79), None).unwrap();
+        let before = store.books("test-account").unwrap();
+        let (book_slot, held) = before
+            .iter()
+            .flat_map(|book| book.positions.iter().map(move |item| (book.slot, item)))
+            .next()
+            .expect("fixture holds a position");
+        let symbol = held.symbol.clone();
+        let quantity = held.quantity;
+        let crash = held.average_cost_cents * 850 / 1_000;
+        for entry in set.entries.iter_mut() {
+            if entry.symbol == symbol && entry.day.as_str() > day(79).as_str() {
+                entry.price_cents = crash;
+                entry.tradable = true;
+                entry.can_buy = true;
+                entry.can_sell = false;
+            }
+        }
+        store.run_day(&spec(), &set, &day(80)).expect("sealed day still settles");
+        let after = store.books("test-account").unwrap();
+        let still_held: i64 = after
+            .iter()
+            .filter(|book| book.slot == book_slot)
+            .flat_map(|book| book.positions.iter())
+            .filter(|item| item.symbol == symbol)
+            .map(|item| item.quantity)
+            .sum();
+        assert_eq!(still_held, quantity, "a sealed limit-down sale must not fill");
+    }
+
+    #[test]
+    fn same_close_stop_still_fires_and_next_session_uses_the_prior_close() {
+        // A 13% drawdown from cost must exit on the stop day in both timings.
+        // The same-close book reads today's close; the next-session book reads
+        // the previous close. An empty trigger map would silently disable the
+        // stop, which is what this guards.
+        let mut store = store();
+        let mut set = price_set(90);
+        store.advance(&spec(), &set, &day(79), None).unwrap();
+        let holdings = store.books("test-account").unwrap();
+        let (slot, held) = holdings
+            .iter()
+            .flat_map(|book| book.positions.iter().map(move |item| (book.slot, item)))
+            .next()
+            .expect("fixture holds a position");
+        let symbol = held.symbol.clone();
+        let cost = held.average_cost_cents;
+        let crash = cost * 860 / 1_000;
+        for entry in set.entries.iter_mut() {
+            if entry.symbol == symbol && entry.day.as_str() > day(79).as_str() {
+                entry.price_cents = crash;
+            }
+        }
+        let day_name = day(80);
+        let run = store
+            .run_day(&spec(), &set, &day_name)
+            .expect("a crash day must still settle");
+        let stop = run
+            .trades
+            .iter()
+            .find(|trade| trade.side == "sell" && trade.symbol == symbol);
+        assert!(
+            stop.is_some_and(|trade| trade.reason == "stop_loss"),
+            "slot {:?} kept {symbol} through a stop-sized drop: {:?}", slot,
+            run.trades.iter().map(|t| (t.symbol.clone(), t.side.clone(), t.reason.clone())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn divergent_strategy_returns_trigger_a_bounded_rebalance() {
+        let mut store = store();
+        let set = split_price_set(75);
+        store.advance(&spec(), &set, &day(66), None).unwrap();
+        let rebalances = store.rebalances("test-account").unwrap();
+        // Day 61 is the first distinct close in the two symbol paths. Correct
+        // per-symbol sizing can expose that edge a day earlier than before.
+        assert!(rebalances.iter().all(|item| item.applied_day >= day(61)));
+        let rebalance = rebalances.iter()
+            .find(|item| item.applied_day >= day(61))
+            .expect("divergent symbol returns must trigger a rebalance");
+        assert_ne!(rebalance.old_steady_bps, rebalance.new_steady_bps);
+        assert!((rebalance.new_steady_bps - rebalance.old_steady_bps).abs() <= 1_000);
+        assert_eq!(
+            rebalance.new_steady_bps + rebalance.new_aggressive_bps,
+            10_000
+        );
+        assert!(rebalance.moved_cents > 0);
+        assert_eq!(
+            store.weights("test-account").unwrap(),
+            [rebalance.new_steady_bps, rebalance.new_aggressive_bps]
+        );
     }
 }

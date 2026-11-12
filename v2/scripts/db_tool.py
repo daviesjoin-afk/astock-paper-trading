@@ -29,16 +29,26 @@ def inspect(path: Path) -> dict:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        accounts = connection.execute("SELECT COUNT(*) FROM v2_paper_accounts").fetchone()[0]
-        events = connection.execute("SELECT COUNT(*) FROM v2_evolution_events").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "schema_version" not in tables or "account" not in tables:
+            raise sqlite3.DatabaseError("not a V2 rewrite database")
+        version = connection.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()[0]
+        accounts = connection.execute("SELECT COUNT(*) FROM account").fetchone()[0]
+        days = connection.execute("SELECT COUNT(*) FROM day_run").fetchone()[0]
     finally:
         connection.close()
     return {
         "integrity": integrity,
         "schema_version": version,
         "accounts": accounts,
-        "events": events,
+        "settled_days": days,
     }
 
 
@@ -83,7 +93,7 @@ def command_backup(args: argparse.Namespace) -> int:
     facts = inspect(target)
     print(
         f"backup ok schema={facts['schema_version']} accounts={facts['accounts']} "
-        f"events={facts['events']} out={target} sha256={sha256_file(target)}"
+        f"settled_days={facts['settled_days']} out={target} sha256={sha256_file(target)}"
     )
     return 0
 
@@ -109,7 +119,7 @@ def command_restore(args: argparse.Namespace) -> int:
     facts = inspect(target)
     print(
         f"restore ok schema={facts['schema_version']} accounts={facts['accounts']} "
-        f"events={facts['events']} db={target}"
+        f"settled_days={facts['settled_days']} db={target}"
     )
     return 0
 
@@ -122,7 +132,7 @@ def command_verify(args: argparse.Namespace) -> int:
     facts = inspect(path)
     print(
         f"verify ok schema={facts['schema_version']} accounts={facts['accounts']} "
-        f"events={facts['events']}"
+        f"settled_days={facts['settled_days']}"
     )
     return 0
 

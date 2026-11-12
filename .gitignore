@@ -17,6 +17,9 @@ reports/
 backups/
 work/
 tasks/
+# Bulk market data pulled from the server (V1 archive CSVs, tarballs).
+# Reproducible via data_sources/import_v1_klines.py given the archive.
+.data/
 .env
 .env.*
 *.pem
@@ -35,6 +38,9 @@ credentials.json
 # Agent / session scratch (not deliverables)
 .codex/
 .codex-test-tmp/
+.cargo/
+.rustup/
+.toolchain/
 .staging/
 .staging-*/
 
@@ -54,3 +60,4 @@ venv/
 Thumbs.db
 *.tmp
 *.old
+.alma-snapshots

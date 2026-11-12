@@ -1,1059 +1,629 @@
-//! Local-only V2 HTTP gateway. Only Rust can write to V2 SQLite.
-use astock_v2::{domain::{ExperimentSpec, PaperAccountRequest, PaperOrderRequest, PaperSessionSpec, PaperSlotId, QuoteImport, SimulationRequest}, store::{Store, StoreError}};
+//! Local-only V2 HTTP gateway. It serves one paper account and two strategies.
+
+use std::{env, sync::Arc};
+
+use astock_v2::domain::{AccountSpec, CreateAccountRequest, SlotSpec, StrategyId};
+use astock_v2::store::{load_price_sets, price_sets_dir, Store, StoreError};
 use axum::{
-    extract::{Path, Query, State}, http::StatusCode,
-    routing::{get, post}, Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
 };
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{env, sync::Arc};
 use tokio::sync::Mutex;
 
 type Shared = Arc<Mutex<Store>>;
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 fn api_error(error: StoreError) -> (StatusCode, Json<Value>) {
-    let (code, reason) = match error {
-        StoreError::Conflict(message) => (StatusCode::CONFLICT, message),
+    let (status, message) = match error {
         StoreError::Rules(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.0),
-        StoreError::Integrity(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
         StoreError::NotFound(error) => (StatusCode::NOT_FOUND, error),
-        StoreError::Database(error) => {
-            eprintln!("V2 storage failure: {error}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "storage_error".into())
-        }
-        StoreError::Encoding(error) => {
-            eprintln!("V2 encoding failure: {error}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "encoding_error".into())
-        }
+        StoreError::Conflict(error) => (StatusCode::CONFLICT, error),
+        StoreError::Encoding(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        StoreError::Database(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        StoreError::Integrity(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    (code, Json(json!({"error":reason})))
+    (status, Json(json!({ "error": message })))
 }
 
 fn response<T: serde::Serialize>(value: T) -> ApiResult {
     serde_json::to_value(value).map(Json).map_err(|error| {
-        (StatusCode::INTERNAL_SERVER_ERROR,
-         Json(json!({"error":format!("encoding_error: {error}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
     })
-}
-
-#[derive(serde::Serialize)]
-struct ArchiveEntryRow {
-    name: String,
-    manifest: Option<String>,
-    export: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct ArchiveManifestEntry {
-    name: String,
-    manifest: Option<String>,
-    combined: Option<String>,
-    archives: Option<usize>,
-    failed: Option<i64>,
-    entries: Vec<ArchiveEntryRow>,
-    error: Option<String>,
-}
-
-fn archive_manifests_in(dir: &std::path::Path) -> Vec<ArchiveManifestEntry> {
-    let mut entries = Vec::new();
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return entries;
-    };
-    for item in read_dir.flatten() {
-        let path = item.path();
-        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-        if !name.ends_with(".manifest.json") {
-            continue;
-        }
-        let parsed = std::fs::read_to_string(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| error.to_string()));
-        match parsed {
-            Ok(value) => entries.push(ArchiveManifestEntry {
-                name: name.to_string(),
-                manifest: value.get("manifest").and_then(|item| item.as_str()).map(str::to_string),
-                combined: value.get("combined").and_then(|item| item.as_str()).map(str::to_string),
-                archives: value
-                    .get("archives")
-                    .and_then(|item| item.as_array())
-                    .map(|items| items.len()),
-                failed: value.get("failed").and_then(|item| item.as_i64()),
-                entries: value
-                    .get("archives")
-                    .and_then(|item| item.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .map(|item| ArchiveEntryRow {
-                                name: item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                manifest: item.get("manifest").and_then(|v| v.as_str()).map(str::to_string),
-                                export: item.get("export").and_then(|v| v.as_str()).map(str::to_string),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                error: None,
-            }),
-            Err(error) => entries.push(ArchiveManifestEntry {
-                name: name.to_string(),
-                manifest: None,
-                combined: None,
-                archives: None,
-                failed: None,
-                entries: Vec::new(),
-                error: Some(error),
-            }),
-        }
-    }
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    entries
-}
-
-async fn archive_manifests() -> ApiResult {
-    let dir = std::env::var("ASTOCK_ARCHIVE_DIR").ok().filter(|value| !value.is_empty());
-    let manifests = dir
-        .as_deref()
-        .map(|path| archive_manifests_in(std::path::Path::new(path)))
-        .unwrap_or_default();
-    response(json!({ "dir": dir, "manifests": manifests }))
 }
 
 async fn health(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
-    let schema_version: i64 = db.schema_version().map_err(api_error)?;
-    let price_sets = db.price_set_catalogue().map(|sets| sets.len()).unwrap_or(0);
-    let counts = db.health_counts().ok();
-    let archive_dir_configured = std::env::var("ASTOCK_ARCHIVE_DIR")
-        .map(|value| !value.is_empty())
-        .unwrap_or(false);
+    let version = db.schema_version().map_err(api_error)?;
+    let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
+    let account = db.account().map_err(api_error)?;
+    let last_settled_day = match &account {
+        Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
+        None => None,
+    };
     response(json!({
         "status": "ok",
         "system": "astock-v2",
+        "schema_version": version,
         "paper_only": true,
-        "schema_version": schema_version,
-        "price_sets": price_sets,
-        "reviewed_price_sets": counts.map(|c| c.reviewed_price_sets).unwrap_or(0),
-        "synthetic_price_sets": counts.map(|c| c.synthetic_price_sets).unwrap_or(0),
-        "accounts": counts.map(|c| c.accounts).unwrap_or(0),
-        "sessions_active": counts.map(|c| c.sessions_active).unwrap_or(0),
-        "evolution_events": counts.map(|c| c.evolution_events).unwrap_or(0),
-        "archive_dir_configured": archive_dir_configured,
-        "writer": "store-single-writer",
+        "account": account.map(|account| account.account_id),
+        "price_set": set.as_ref().map(|set| set.price_set_id.clone()),
+        "last_settled_day": last_settled_day,
     }))
 }
 
-async fn submit(
-    State(state): State<Shared>, Json(request): Json<SimulationRequest>,
+async fn create_account(
+    State(state): State<Shared>,
+    Json(request): Json<CreateAccountRequest>,
 ) -> ApiResult {
     let mut db = state.lock().await;
-    response(db.submit(request).map_err(api_error)?)
-}
-
-async fn ingest_quote(
-    State(state): State<Shared>, Json(input): Json<QuoteImport>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(db.ingest_quote(input).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct PortfolioQuery {
-    cycle_id: String,
-    asof_day: Option<String>,
-}
-
-async fn portfolio(
-    State(state): State<Shared>, Query(query): Query<PortfolioQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(db.state(&query.cycle_id, query.asof_day.as_deref()).map_err(api_error)?)
-}
-
-async fn runs(State(state): State<Shared>, Query(query): Query<PortfolioQuery>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.runs(&query.cycle_id, 100).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct CompareQuery {
-    base: String,
-    candidate: String,
-}
-
-async fn compare(State(state): State<Shared>, Query(query): Query<CompareQuery>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.compare_experiments(&query.base, &query.candidate).map_err(api_error)?)
-}
-
-async fn replay(State(state): State<Shared>, Query(query): Query<PortfolioQuery>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.verify_replay(&query.cycle_id).map_err(api_error)?)
-}
-
-async fn research_reproduction(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.verify_research_reproduction(&id).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct PriceDaysQuery {
-    pack_id: String,
-    symbol: String,
-}
-
-async fn price_set_days(
-    State(state): State<Shared>,
-    Query(query): Query<PriceDaysQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(
-        db.price_set_days(&query.pack_id, &query.symbol)
-            .map_err(api_error)?,
-    )
-}
-
-#[derive(Deserialize)]
-struct CoverageQuery {
-    pack_id: String,
-    symbols: String,
-    days: String,
-}
-
-async fn price_set_coverage(
-    State(state): State<Shared>,
-    Query(query): Query<CoverageQuery>,
-) -> ApiResult {
-    let symbols: Vec<String> = query
-        .symbols
-        .split(',')
-        .map(|symbol| symbol.trim().to_string())
-        .filter(|symbol| !symbol.is_empty())
-        .collect();
-    let days: Vec<String> = query
-        .days
-        .split(',')
-        .map(|day| day.trim().to_string())
-        .filter(|day| !day.is_empty())
-        .collect();
-    let db = state.lock().await;
-    response(
-        db.price_set_coverage(&query.pack_id, &symbols, &days)
-            .map_err(api_error)?,
-    )
-}
-
-#[derive(Deserialize)]
-struct SwitchQuery {
-    #[serde(default)]
-    slot: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct StrategySwitchRequest {
-    slot: String,
-    to_version: String,
-    effective_from: String,
-    reason: String,
-    switch_id: String,
-}
-
-async fn post_strategy_switch(
-    State(state): State<Shared>,
-    Path(account_id): Path<String>,
-    Json(body): Json<StrategySwitchRequest>,
-) -> ApiResult {
-    let slot = match body.slot.as_str() {
-        "A" => astock_v2::domain::PaperSlotId::A,
-        "B" => astock_v2::domain::PaperSlotId::B,
-        _ => {
-            return Err(api_error(astock_v2::store::StoreError::Rules(
-                astock_v2::domain::RuleError("unknown_paper_slot".into()),
-            )))
-        }
+    if db.account().map_err(api_error)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "account_already_exists" })),
+        ));
+    }
+    let spec = AccountSpec {
+        schema_version: 1,
+        account_id: "paper-account".into(),
+        initial_cash_cents: request.initial_cash_cents,
+        created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        slots: [
+            SlotSpec { slot: StrategyId::Steady, weight_bps: 5_000 },
+            SlotSpec { slot: StrategyId::Aggressive, weight_bps: 5_000 },
+        ],
     };
-    let mut db = state.lock().await;
-    response(
-        db.record_strategy_switch(
-            &account_id,
-            slot,
-            &body.to_version,
-            &body.effective_from,
-            &body.reason,
-            &body.switch_id,
-        )
-        .map_err(api_error)?,
-    )
+    db.create_account(spec.clone()).map_err(api_error)?;
+    let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
+    response(db.view(&spec, set.as_ref(), None).map_err(api_error)?)
 }
 
-async fn strategy_switches(
-    State(state): State<Shared>,
-    Path(account_id): Path<String>,
-    Query(query): Query<SwitchQuery>,
-) -> ApiResult {
-    let slot = match query.slot.as_deref() {
+async fn account(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    let day = db.last_settled_day(&spec.account_id).map_err(api_error)?;
+    let set = valuation_set(&db, day.as_deref())?;
+    response(db.view(&spec, set.as_ref(), day.as_deref()).map_err(api_error)?)
+}
+
+/// One day of closes, for valuing existing positions.
+///
+/// Loading a settlement window here would pull months of bars just to price a
+/// handful of positions; `view` only reads the day it is asked about.
+fn valuation_set(
+    db: &Store,
+    day: Option<&str>,
+) -> Result<Option<astock_v2::domain::PriceSet>, (StatusCode, Json<Value>)> {
+    if let Some(day) = day
+        && let Some(set) = db.price_set_from_bars("bar-table", day, day).map_err(api_error)?
+    {
+        return Ok(Some(set));
+    }
+    load_price_sets(&price_sets_dir()).map_err(api_error)
+}
+
+async fn positions(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    let day = db.last_settled_day(&spec.account_id).map_err(api_error)?;
+    let set = valuation_set(&db, day.as_deref())?;
+    let view = db.view(&spec, set.as_ref(), day.as_deref()).map_err(api_error)?;
+    response(view.positions)
+}
+
+async fn trades(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    response(db.trades(&spec.account_id, 100).map_err(api_error)?)
+}
+
+async fn rebalances(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    response(db.rebalances(&spec.account_id).map_err(api_error)?)
+}
+
+async fn coverage(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
+    let last_settled_day = match db.account().map_err(api_error)? {
+        Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
         None => None,
-        Some("A") => Some(astock_v2::domain::PaperSlotId::A),
-        Some("B") => Some(astock_v2::domain::PaperSlotId::B),
-        Some(_) => {
-            return Err(api_error(astock_v2::store::StoreError::Rules(
-                astock_v2::domain::RuleError("unknown_paper_slot".into()),
-            )))
-        }
     };
-    let db = state.lock().await;
-    response(db.strategy_switches(&account_id, slot).map_err(api_error)?)
+    response(db.coverage(set.as_ref(), last_settled_day))
 }
 
-async fn accounts_overview(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.accounts_overview().map_err(api_error)?)
-}
-
-async fn paper_accounts(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.paper_accounts(100).map_err(api_error)?)
-}
-
-async fn create_paper_account(
-    State(state): State<Shared>,
-    Json(request): Json<PaperAccountRequest>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(db.create_paper_account_request(request).map_err(api_error)?)
-}
-
-async fn price_set_catalogue(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.price_set_catalogue().map_err(api_error)?)
-}
-
-async fn strategy_catalogue(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.strategy_catalogue().map_err(api_error)?)
-}
+// ---- whole-market bar endpoints -------------------------------------------
+//
+// These read the `bar` table that `data_sources/ingest_market.py` fills. The
+// reviewed-price-set path above is unchanged and still drives settlement; this
+// is the read side of the full-market data that the reviewed sets never had.
 
 #[derive(Deserialize)]
-struct ValuationQuery {
-    as_of_day: String,
+struct BarsQuery {
+    day: Option<String>,
+    /// Defaults to 1100 bps, which clears a ±10% limit plus rounding.
+    threshold_bps: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct EquitySeriesQuery {
-    days: String,
-}
-
-async fn paper_allocation_proposal(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Query(query): Query<EquitySeriesQuery>,
-) -> ApiResult {
-    let days: Vec<String> = query
-        .days
-        .split(',')
-        .map(|day| day.trim().to_string())
-        .filter(|day| !day.is_empty())
-        .collect();
+/// Trading days we hold bars for, with the symbol count of the latest day.
+/// Market regime as of a day: trending, choppy, declining, or unknown.
+///
+/// `day` defaults to the latest day held. The verdict is what the aggressive
+/// slot actually saw when it settled that day -- same snapshot, same
+/// unadjusted closes -- so the console cannot disagree with the trades.
+async fn market_regime(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
     let db = state.lock().await;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("ASTOCK_PRICE_SETS_DIR")
-            .map(std::ffi::OsString::from)
-            .unwrap_or_else(|| "data/price-sets".into()),
-    );
-    match db
-        .paper_allocation_proposal(&id, &days, &dir)
-        .map_err(api_error)?
-    {
-        Some(report) => response(report),
-        None => response(json!({
-            "status": "unavailable",
-            "reason": "no_reviewed_price_set",
-            "days": days.len(),
-        })),
+    let day = match query.day {
+        Some(day) => day,
+        None => match db.bar_days().map_err(api_error)?.last().cloned() {
+            Some(day) => day,
+            None => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "no_market_data" })),
+                ));
+            }
+        },
+    };
+    let view = db.market_regime(&day).map_err(api_error)?;
+    response(json!({
+        "day": day,
+        "regime": view.regime.as_str(),
+        "label": view.regime.label(),
+        "index_points": view.index_points,
+        "fast_average_cents": view.fast_average_cents,
+        "slow_average_cents": view.slow_average_cents,
+        "separation_bps": view.separation_bps,
+        "breadth_bps": view.breadth_bps,
+    }))
+}
+
+async fn bar_days(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let days = db.bar_days().map_err(api_error)?;
+    let latest = days.last().cloned();
+    let latest_symbols = match &latest {
+        Some(day) => db.bar_symbol_count(day).map_err(api_error)?,
+        None => 0,
+    };
+    response(json!({
+        "days": days,
+        "count": days.len(),
+        "latest_day": latest,
+        "latest_symbol_count": latest_symbols,
+    }))
+}
+
+/// All bars for one trading day. `day` defaults to the latest day held.
+async fn bars(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
+    let db = state.lock().await;
+    let day = match query.day {
+        Some(day) => day,
+        None => match db.bar_days().map_err(api_error)?.last() {
+            Some(day) => day.clone(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "no_bars_ingested" })),
+                ));
+            }
+        },
+    };
+    let rows = db.bars_for_day(&day).map_err(api_error)?;
+    if rows.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no_bars_for_day", "day": day })),
+        ));
     }
+    response(json!({ "day": day, "count": rows.len(), "bars": rows }))
 }
 
-#[derive(Deserialize)]
-struct RebalanceBody {
-    targets: [i64; 2],
-    proposal_digest: String,
-    applied_at: String,
-    note: String,
-}
-
-async fn apply_rebalance(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Json(body): Json<RebalanceBody>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(
-        db.apply_rebalance(
-            &id,
-            body.targets,
-            &body.proposal_digest,
-            &body.applied_at,
-            &body.note,
-        )
-        .map_err(api_error)?,
-    )
-}
-
-async fn paper_rebalances(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-) -> ApiResult {
+/// Bars whose close gapped past `threshold_bps` from their own prev close.
+///
+/// Not a validation result: nothing is rejected. This is the display hint that
+/// keeps an ex-dividend gap from being drawn as a solid -20% crash on a chart.
+async fn bar_gaps(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
     let db = state.lock().await;
-    response(db.paper_rebalances(&id).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct AccountAdvanceBody {
-    day: String,
-}
-
-#[derive(Deserialize)]
-struct EvolutionRequest {
-    kind: String,
-    incumbent: astock_v2::domain::CandidateMetrics,
-    candidate: astock_v2::domain::CandidateMetrics,
-    #[serde(default)]
-    policy: Option<astock_v2::domain::EvolutionPolicy>,
-}
-
-#[derive(Deserialize)]
-struct EvolutionEventRequest {
-    event_id: String,
-    decided_at: String,
-    kind: String,
-    incumbent: astock_v2::domain::CandidateMetrics,
-    candidate: astock_v2::domain::CandidateMetrics,
-    #[serde(default)]
-    policy: Option<astock_v2::domain::EvolutionPolicy>,
-    #[serde(default)]
-    base_cycle: Option<String>,
-    #[serde(default)]
-    candidate_cycle: Option<String>,
-}
-
-async fn record_evolution_event(
-    State(state): State<Shared>,
-    Json(body): Json<EvolutionEventRequest>,
-) -> ApiResult {
-    let policy = body.policy.clone().unwrap_or_default();
-    let decision = match body.kind.as_str() {
-        "promotion" => astock_v2::domain::decide_promotion(&body.incumbent, &body.candidate, &policy),
-        "rollback" => astock_v2::domain::decide_rollback(&body.incumbent, &body.candidate, &policy),
-        _ => {
-            return Err((
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error": "unsupported_evolution_kind"})),
-            ))
-        }
+    let day = match query.day {
+        Some(day) => day,
+        None => match db.bar_days().map_err(api_error)?.last() {
+            Some(day) => day.clone(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "no_bars_ingested" })),
+                ));
+            }
+        },
+    };
+    // Per-symbol thresholds are applied inside the query; an explicit
+    // `threshold_bps` from the caller overrides that and is filtered here.
+    let mut rows = db.price_gaps(&day).map_err(api_error)?;
+    if let Some(threshold) = query.threshold_bps {
+        rows.retain(|bar| {
+            bar.prev_close_cents > 0
+                && (bar.close_cents - bar.prev_close_cents).abs() * 10_000
+                    / bar.prev_close_cents
+                    > threshold
+        });
     }
-    .map_err(|error| (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error.0}))))?;
+    response(json!({
+        "day": day,
+        // null means "per-board limit + 2%", applied per symbol.
+        "threshold_bps": query.threshold_bps,
+        "threshold_mode": if query.threshold_bps.is_some() { "explicit" } else { "per_board_limit" },
+        "count": rows.len(),
+        "bars": rows,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SymbolBarsQuery {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// One symbol's recent bars, oldest first. Defaults to the last 250 days held.
+async fn symbol_bars(
+    State(state): State<Shared>,
+    Path(symbol): Path<String>,
+    Query(query): Query<SymbolBarsQuery>,
+) -> ApiResult {
+    let db = state.lock().await;
+    let days = db.bar_days().map_err(api_error)?;
+    let Some(last) = days.last().cloned() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no_bars_ingested" })),
+        ));
+    };
+    let to = query.to.unwrap_or(last);
+    let from = query.from.unwrap_or_else(|| {
+        let start = days.len().saturating_sub(250);
+        days.get(start).cloned().unwrap_or_else(|| to.clone())
+    });
+    let rows = db
+        .bars_for_symbol(&symbol, &from, &to)
+        .map_err(api_error)?;
+    if rows.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no_bars_for_symbol", "symbol": symbol })),
+        ));
+    }
+    response(json!({
+        "symbol": symbol,
+        "from": from,
+        "to": to,
+        "count": rows.len(),
+        "bars": rows,
+    }))
+}
+
+#[derive(Deserialize)]
+struct RunRequest {
+    day: Option<String>,
+}
+
+async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> ApiResult {
     let mut db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    // Prefer the whole-market bar table; fall back to a published reviewed
+    // price set only when the bar table has nothing. This keeps the two-symbol
+    // reviewed path working while the 5.6k-symbol bar feed becomes the norm.
+    let (set, settle_from) = match price_set_from_store(&db, request.day.as_deref())? {
+        Some(input) => (input.set, input.settle_from),
+        None => match load_price_sets(&price_sets_dir()).map_err(api_error)? {
+            // A reviewed set is already the exact settlement rectangle; there
+            // is no warm-up region in it, so settlement starts wherever the
+            // account left off.
+            Some(set) => (set, None),
+            None => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "no_price_data",
+                                 "detail": "neither the bar table nor a reviewed price set has rows" })),
+                ));
+            }
+        },
+    };
+    let day = request.day.unwrap_or_else(|| set.coverage_end.clone());
     response(
-        db.record_evolution_event_with_links(
-            &body.event_id,
-            &body.decided_at,
-            decision,
-            body.base_cycle.as_deref(),
-            body.candidate_cycle.as_deref(),
-        )
-        .map_err(api_error)?,
-    )
-}
-
-#[derive(Deserialize)]
-struct EvolutionListQuery {
-    #[serde(default = "default_evolution_limit")]
-    limit: i64,
-    #[serde(default)]
-    candidate: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    base_cycle: Option<String>,
-    #[serde(default)]
-    candidate_cycle: Option<String>,
-    #[serde(default)]
-    from_day: Option<String>,
-    #[serde(default)]
-    to_day: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct EvolutionPageQuery {
-    #[serde(default = "default_evolution_limit")]
-    limit: i64,
-    #[serde(default)]
-    candidate: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    before: Option<String>,
-    #[serde(default)]
-    before_id: Option<String>,
-    #[serde(default)]
-    after: Option<String>,
-    #[serde(default)]
-    base_cycle: Option<String>,
-    #[serde(default)]
-    candidate_cycle: Option<String>,
-    #[serde(default)]
-    from_day: Option<String>,
-    #[serde(default)]
-    to_day: Option<String>,
-}
-
-async fn evolution_export(
-    State(state): State<Shared>,
-    Query(query): Query<EvolutionListQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(
-        db.evolution_export(astock_v2::store::EvolutionQuery {
-            limit: 2_000,
-            candidate_id: query.candidate.as_deref(),
-            status: query.status.as_deref(),
-            base_cycle: query.base_cycle.as_deref(),
-            candidate_cycle: query.candidate_cycle.as_deref(),
-            from_day: query.from_day.as_deref(),
-            to_day: query.to_day.as_deref(),
-        })
-        .map_err(api_error)?,
-    )
-}
-
-async fn evolution_events_page(
-    State(state): State<Shared>,
-    Query(query): Query<EvolutionPageQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    let limit = query.limit.clamp(1, 200);
-    response(
-        db.evolution_events_page_query(astock_v2::store::EvolutionPageQuery {
-            query: astock_v2::store::EvolutionQuery {
-                limit,
-                candidate_id: query.candidate.as_deref(),
-                status: query.status.as_deref(),
-                base_cycle: query.base_cycle.as_deref(),
-                candidate_cycle: query.candidate_cycle.as_deref(),
-                from_day: query.from_day.as_deref(),
-                to_day: query.to_day.as_deref(),
-            },
-            before: query.before.as_deref(),
-            before_id: query.before_id.as_deref(),
-            after: query.after.as_deref(),
-        })
-        .map_err(api_error)?,
-    )
-}
-
-fn default_evolution_limit() -> i64 {
-    50
-}
-
-async fn evolution_events(
-    State(state): State<Shared>,
-    Query(query): Query<EvolutionListQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    let limit = query.limit.clamp(1, 200);
-    response(
-        db.evolution_events_query(astock_v2::store::EvolutionQuery {
-            limit,
-            candidate_id: query.candidate.as_deref(),
-            status: query.status.as_deref(),
-            base_cycle: query.base_cycle.as_deref(),
-            candidate_cycle: query.candidate_cycle.as_deref(),
-            from_day: query.from_day.as_deref(),
-            to_day: query.to_day.as_deref(),
-        })
-        .map_err(api_error)?,
-    )
-}
-
-#[derive(Deserialize)]
-struct SignalDiffQuery {
-    base_cycle: String,
-    candidate_cycle: String,
-}
-
-async fn signal_diff(
-    State(state): State<Shared>,
-    Query(query): Query<SignalDiffQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(
-        db.signal_diff(&query.base_cycle, &query.candidate_cycle)
+        db.advance(&spec, &set, &day, settle_from.as_deref())
             .map_err(api_error)?,
     )
 }
 
-async fn evolution_decision(Json(body): Json<EvolutionRequest>) -> ApiResult {
-    let policy = body.policy.clone().unwrap_or_default();
-    let decision = match body.kind.as_str() {
-        "promotion" => astock_v2::domain::decide_promotion(&body.incumbent, &body.candidate, &policy),
-        "rollback" => astock_v2::domain::decide_rollback(&body.incumbent, &body.candidate, &policy),
-        _ => return Err((
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": "unsupported_evolution_kind"})),
-        )),
+/// The profit curve: per-day equity for the account and each slot.
+///
+/// This is the primary read for the UI. The user's own acceptance criterion is
+/// the equity curve, so it is served as its own endpoint rather than derived
+/// from `/v2/account` (which is a point-in-time snapshot).
+async fn equity_curve(State(state): State<Shared>) -> ApiResult {
+    let db = state.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "account_not_found" })),
+        ));
+    };
+    let [total, steady, aggressive] = db.account_performance(&spec, None).map_err(api_error)?;
+    if total.is_empty() {
+        return response(json!({
+            "account_id": spec.account_id,
+            "initial_cash_cents": spec.initial_cash_cents,
+            "points": [],
+            "summary": null,
+        }));
     }
-    .map_err(|error| (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error.0}))))?;
-    response(decision)
-}
 
-async fn advance_account(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Json(body): Json<AccountAdvanceBody>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(db.advance_account_to(&id, &body.day).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct AdvancePreviewQuery {
-    day: String,
-}
-
-async fn advance_preview(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Query(query): Query<AdvancePreviewQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(db.preview_account_advance(&id, &query.day).map_err(api_error)?)
-}
-
-async fn paper_exposure(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.paper_exposure(&id).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct SegmentsQuery {
-    segments: String,
-}
-
-async fn experiment_performance_segments(
-    State(state): State<Shared>,
-    Path(cycle_id): Path<String>,
-    Query(query): Query<SegmentsQuery>,
-) -> ApiResult {
-    let segments: Vec<Vec<String>> = query
-        .segments
-        .split(';')
-        .map(|segment| {
-            segment
-                .split(',')
-                .map(|day| day.trim().to_string())
-                .filter(|day| !day.is_empty())
-                .collect::<Vec<_>>()
+    let points: Vec<Value> = total
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            json!({
+                "day": point.day,
+                "equity_cents": point.equity_cents,
+                "steady_cents": steady[index].equity_cents,
+                "aggressive_cents": aggressive[index].equity_cents,
+                "profit_cents": point.profit_cents,
+                "return_bps": point.return_bps,
+                "steady_return_bps": steady[index].return_bps,
+                "aggressive_return_bps": aggressive[index].return_bps,
+            })
         })
-        .filter(|segment| !segment.is_empty())
         .collect();
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("ASTOCK_PRICE_SETS_DIR")
-            .map(std::ffi::OsString::from)
-            .unwrap_or_else(|| "data/price-sets".into()),
-    );
-    let db = state.lock().await;
-    response(
-        db.experiment_performance_segments(&cycle_id, &segments, &dir)
-            .map_err(api_error)?,
-    )
+    let last = total.last().expect("non-empty");
+    let last_steady = steady.last().expect("non-empty");
+    let last_aggressive = aggressive.last().expect("non-empty");
+
+    response(json!({
+        "account_id": spec.account_id,
+        "initial_cash_cents": spec.initial_cash_cents,
+        "slot_return_method": "time_weighted_end_of_day_flows",
+        "points": points,
+        "summary": {
+            "first_day": total.first().map(|point| &point.day),
+            "last_day": last.day,
+            "days": total.len(),
+            "equity_cents": last.equity_cents,
+            "profit_cents": last.profit_cents,
+            "return_bps": last.return_bps,
+            "max_drawdown_bps": last.max_drawdown_bps,
+            "peak_day": last.peak_day,
+            "trough_day": last.trough_day,
+            "steady_return_bps": last_steady.return_bps,
+            "aggressive_return_bps": last_aggressive.return_bps,
+            "steady_cents": last_steady.equity_cents,
+            "aggressive_cents": last_aggressive.equity_cents,
+        },
+    }))
 }
 
-async fn experiment_performance(
+/// Diagnostic: how many symbols the settlement view would actually contain.
+///
+/// Read-only. Exists because "no_price_data" from /account/run is otherwise
+/// indistinguishable from "the bar table is empty" -- this says which.
+async fn settlement_preview(
     State(state): State<Shared>,
-    Path(cycle_id): Path<String>,
-    Query(query): Query<EquitySeriesQuery>,
-) -> ApiResult {
-    let days: Vec<String> = query
-        .days
-        .split(',')
-        .map(|day| day.trim().to_string())
-        .filter(|day| !day.is_empty())
-        .collect();
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("ASTOCK_PRICE_SETS_DIR")
-            .map(std::ffi::OsString::from)
-            .unwrap_or_else(|| "data/price-sets".into()),
-    );
-    let db = state.lock().await;
-    match db
-        .experiment_performance(&cycle_id, &days, &dir)
-        .map_err(api_error)?
-    {
-        Some(report) => response(report),
-        None => response(json!({
-            "status": "unavailable",
-            "reason": "no_reviewed_price_set",
-            "days": days.len(),
-        })),
-    }
-}
-
-async fn paper_performance(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Query(query): Query<EquitySeriesQuery>,
-) -> ApiResult {
-    let days: Vec<String> = query
-        .days
-        .split(',')
-        .map(|day| day.trim().to_string())
-        .filter(|day| !day.is_empty())
-        .collect();
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("ASTOCK_PRICE_SETS_DIR")
-            .map(std::ffi::OsString::from)
-            .unwrap_or_else(|| "data/price-sets".into()),
-    );
-    let db = state.lock().await;
-    match db
-        .paper_performance(&id, &days, &dir)
-        .map_err(api_error)?
-    {
-        Some(report) => response(report),
-        None => response(json!({
-            "status": "unavailable",
-            "reason": "no_reviewed_price_set",
-            "days": days.len(),
-        })),
-    }
-}
-
-async fn paper_account_audit(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
+    Query(query): Query<BarsQuery>,
 ) -> ApiResult {
     let db = state.lock().await;
-    response(db.paper_account_audit(&id).map_err(api_error)?)
-}
-
-async fn paper_equity_series(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Query(query): Query<EquitySeriesQuery>,
-) -> ApiResult {
-    let days: Vec<String> = query
-        .days
-        .split(',')
-        .map(|day| day.trim().to_string())
-        .filter(|day| !day.is_empty())
-        .collect();
+    let days = db.bar_days().map_err(api_error)?;
     if days.is_empty() {
-        return Err((
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": "empty_equity_series"})),
-        ));
+        return response(json!({ "bar_days": 0, "symbols": 0, "entries": 0 }));
     }
-    let db = state.lock().await;
-    match db.paper_equity_series(&id, &days).map_err(api_error)? {
-        Some(series) => response(series),
-        None => response(json!({
-            "status": "unavailable",
-            "reason": "no_reviewed_price_set",
-            "days": days.len(),
-        })),
-    }
+    let last_settled = match db.account().map_err(api_error)? {
+        Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
+        None => None,
+    };
+    let input = price_set_from_store(&db, query.day.as_deref())?;
+    response(json!({
+        "bar_days": days.len(),
+        "first_bar_day": days.first(),
+        "last_bar_day": days.last(),
+        "last_settled_day": last_settled,
+        "window": input.as_ref().map(|i| (i.set.coverage_start.clone(), i.set.coverage_end.clone())),
+        "settle_from": input.as_ref().and_then(|i| i.settle_from.clone()),
+        "symbols": input.as_ref().map(|i| i.set.symbols().len()).unwrap_or(0),
+        "entries": input.as_ref().map(|i| i.set.entries.len()).unwrap_or(0),
+        "max_settle_days_per_call": MAX_SETTLE_DAYS_PER_CALL,
+        "warmup_days": SETTLEMENT_WARMUP_DAYS,
+    }))
 }
 
-async fn paper_valuation(
-    State(state): State<Shared>,
-    Path(id): Path<String>,
-    Query(query): Query<ValuationQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(db.paper_valuation(&id, &query.as_of_day).map_err(api_error)?)
+/// Settlement view built from the bar table, or `None` when it is empty.
+///
+/// The window starts at the account's last settled day (or the earliest bar
+/// we hold) so a long-running account does not rebuild every historical close
+/// on each advance.
+/// Trading days of history loaded per advance, on top of the days being
+/// settled.
+///
+/// The strategies need at most 61 trailing closes; 120 calendar-ish trading
+/// days leaves comfortable headroom for suspensions without dragging years of
+/// bars into memory on every request. Long-history work (a real backtest) is a
+/// separate job, not something a single advance should quietly pay for.
+const SETTLEMENT_WARMUP_DAYS: usize = 120;
+
+/// Cap on how many days one `advance` will settle.
+///
+/// A request that asks to settle three years in one shot is almost always a
+/// mistake, and it would build a settlement view far larger than the rolling
+/// window this is designed around. Catch-up runs should be issued per period.
+const MAX_SETTLE_DAYS_PER_CALL: usize = 260;
+
+/// The settlement window plus the first day that should actually be settled.
+///
+/// The two are not the same: the window starts earlier so strategies have
+/// trailing closes, and `settle_from` says where real settlement begins.
+struct SettlementInput {
+    set: astock_v2::domain::PriceSet,
+    settle_from: Option<String>,
 }
 
-async fn paper_account(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.paper_account(&id).map_err(api_error)?)
-}
+fn price_set_from_store(
+    db: &Store,
+    through: Option<&str>,
+) -> Result<Option<SettlementInput>, (StatusCode, Json<Value>)> {
+    let days = db.bar_days().map_err(api_error)?;
+    let Some(last_day) = days.last().cloned() else {
+        return Ok(None);
+    };
 
-async fn submit_paper_order(
-    State(state): State<Shared>,
-    Path(account_id): Path<String>,
-    Json(mut request): Json<PaperOrderRequest>,
-) -> ApiResult {
-    if request.account_id != account_id {
-        return Err((
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": "paper_account_path_mismatch"})),
-        ));
-    }
-    request.account_id = account_id;
-    let mut db = state.lock().await;
-    response(db.submit_paper_order(request).map_err(api_error)?)
-}
-
-async fn paper_orders(
-    State(state): State<Shared>,
-    Path(account_id): Path<String>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(db.paper_orders(&account_id, 100).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct AdvanceBody {
-    day: String,
-}
-
-#[derive(Deserialize)]
-struct SessionFromExperiment {
-    session_id: String,
-    account_id: String,
-    cycle_id: String,
-    slot: PaperSlotId,
-    start_at: Option<String>,
-}
-
-async fn create_session_from_experiment(
-    State(state): State<Shared>,
-    Json(body): Json<SessionFromExperiment>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(
-        db.create_paper_session_from_experiment(
-            &body.session_id,
-            &body.account_id,
-            &body.cycle_id,
-            body.slot,
-            body.start_at,
-        )
-        .map_err(api_error)?,
-    )
-}
-
-async fn create_paper_session(
-    State(state): State<Shared>,
-    Json(spec): Json<PaperSessionSpec>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(db.create_paper_session(spec).map_err(api_error)?)
-}
-
-#[derive(Deserialize)]
-struct SessionListQuery {
-    account_id: Option<String>,
-}
-
-async fn paper_sessions(
-    State(state): State<Shared>,
-    Query(query): Query<SessionListQuery>,
-) -> ApiResult {
-    let db = state.lock().await;
-    response(
-        db.paper_sessions(query.account_id.as_deref(), 100)
-            .map_err(api_error)?,
-    )
-}
-
-async fn paper_session(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    let db = state.lock().await;
-    response(db.paper_session(&id).map_err(api_error)?)
-}
-
-async fn paper_session_advance(
-    State(state): State<Shared>,
-    Path(session_id): Path<String>,
-    Json(body): Json<AdvanceBody>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    response(db.advance_paper_session_to(&session_id, &body.day).map_err(api_error)?)
-}
-
-async fn paper_session_action(
-    State(state): State<Shared>,
-    Path((session_id, action)): Path<(String, String)>,
-) -> ApiResult {
-    let mut db = state.lock().await;
-    match action.as_str() {
-        "start" | "pause" | "resume" | "stop" => {
-            response(db.paper_session_action(&session_id, &action).map_err(api_error)?)
+    // The window ends at the requested day when it is one we hold, otherwise
+    // at the latest day available.
+    let end = match through {
+        Some(day) if days.iter().any(|candidate| candidate == day) => day.to_string(),
+        Some(day) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "day_not_in_bar_table", "day": day,
+                             "latest": last_day })),
+            ));
         }
-        "step" => response(db.step_paper_session(&session_id).map_err(api_error)?),
-        "run" => response(db.run_paper_session(&session_id).map_err(api_error)?),
-        _ => Err((
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": "unsupported_paper_session_action"})),
-        )),
+        None => last_day,
+    };
+
+    let last_settled = match db.account().map_err(api_error)? {
+        Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
+        None => None,
+    };
+
+    // The days this call will actually settle: everything after the last
+    // settlement up to `end`.
+    //
+    // A brand-new account has nothing settled yet, but that does not mean it
+    // wants three years of history replayed. It starts at `end` -- one day of
+    // settlement -- and real history work (a backtest) is a separate job.
+    // Otherwise the very first advance on a fresh account would immediately
+    // trip the size guard, which is a confusing way to learn this.
+    let settle_from = match &last_settled {
+        Some(day) => days
+            .iter()
+            .find(|candidate| candidate.as_str() > day.as_str())
+            .cloned(),
+        None => Some(end.clone()),
+    };
+    let Some(settle_from) = settle_from else {
+        // Nothing new to settle. A one-day window keeps `view` able to value
+        // existing positions without pretending there is more work.
+        let start = days
+            .iter()
+            .rev()
+            .take(1)
+            .next()
+            .cloned()
+            .unwrap_or_else(|| end.clone());
+        return Ok(db
+            .price_set_from_bars("bar-table", &start, &end)
+            .map_err(api_error)?
+            .map(|set| SettlementInput { set, settle_from: None }));
+    };
+    if settle_from.as_str() > end.as_str() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "day_before_last_settled", "last_settled": last_settled })),
+        ));
     }
-}
 
-async fn market_data_pack(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    response(state.lock().await.market_data_pack(&id).map_err(api_error)?)
-}
+    let to_settle = days
+        .iter()
+        .filter(|day| day.as_str() >= settle_from.as_str() && day.as_str() <= end.as_str())
+        .count();
+    if to_settle > MAX_SETTLE_DAYS_PER_CALL {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "advance_too_large",
+                "days_requested": to_settle,
+                "max_per_call": MAX_SETTLE_DAYS_PER_CALL,
+                "hint": "catch up in periods, or run a backtest job instead",
+            })),
+        ));
+    }
 
-#[derive(Deserialize)]
-struct ListQuery {
-    limit: Option<i64>,
-}
+    // Load the settlement days plus a bounded warm-up so the strategies have
+    // enough trailing closes on the first day settled.
+    let from_index = days
+        .iter()
+        .position(|day| day == &settle_from)
+        .unwrap_or(0)
+        .saturating_sub(SETTLEMENT_WARMUP_DAYS);
+    let start = days[from_index].clone();
 
-/// Read-only catalogue for the experiment picker: no write path, no derived
-/// metrics, no "latest" shortcut. Ordering is the Store's stable cycle_id order.
-async fn list_experiments(State(state): State<Shared>, Query(query): Query<ListQuery>) -> ApiResult {
-    let db = state.lock().await;
-    let catalogue = db.experiments(query.limit.unwrap_or(200)).map_err(api_error)?;
-    response(catalogue)
-}
-
-async fn create_experiment(State(state): State<Shared>, Json(spec): Json<ExperimentSpec>) -> ApiResult {
-    response(state.lock().await.create_experiment(spec).map_err(api_error)?)
-}
-async fn experiment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    response(state.lock().await.experiment(&id).map_err(api_error)?)
-}
-async fn complete_experiment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult {
-    response(state.lock().await.complete_experiment(&id).map_err(api_error)?)
+    Ok(db
+        .price_set_from_bars("bar-table", &start, &end)
+        .map_err(api_error)?
+        .map(|set| SettlementInput {
+            set,
+            settle_from: Some(settle_from),
+        }))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "./v2-market-packs.sqlite3".into());
-    if env::var_os("ASTOCK_V2_INITIAL_CASH_CENTS").is_some() {
-        return Err("global initial cash is unsupported; create an experiment explicitly".into());
+    let database = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "v2.sqlite3".into());
+    let address = env::var("ASTOCK_V2_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".into());
+    let mut store = Store::open(database).map_err(|error| format!("{error:?}"))?;
+    // `ASTOCK_V2_REGIME_FILTER=0` replays the pre-regime behaviour so the two
+    // can be compared on identical data. Default is on.
+    if env::var("ASTOCK_V2_REGIME_FILTER").is_ok_and(|value| value == "0") {
+        store.regime_filter = false;
     }
-    let db = Arc::new(Mutex::new(Store::open(&db_path)?));
-    // Always local-only. No network exposure, broker or real-money endpoints.
+    let state = Arc::new(Mutex::new(store));
     let app = Router::new()
         .route("/v2/health", get(health))
-        .route("/v2/archive/manifests", get(archive_manifests))
-        .route("/v2/experiments", post(create_experiment).get(list_experiments))
-        .route("/v2/market-data-packs/{pack_id}", get(market_data_pack))
-        .route("/v2/paper-accounts", post(create_paper_account).get(paper_accounts))
-        .route("/v2/paper-accounts/overview", get(accounts_overview))
-        .route(
-            "/v2/paper-accounts/{account_id}/strategy-switches",
-            get(strategy_switches).post(post_strategy_switch),
-        )
-        .route("/v2/strategies", get(strategy_catalogue))
-        .route("/v2/evolution/decisions", post(evolution_decision))
-        .route("/v2/signal-diff", get(signal_diff))
-        .route(
-            "/v2/evolution/events",
-            post(record_evolution_event).get(evolution_events),
-        )
-        .route("/v2/evolution/events/page", get(evolution_events_page))
-        .route("/v2/evolution/events/export", get(evolution_export))
-        .route("/v2/price-sets", get(price_set_catalogue))
-        .route("/v2/price-sets/days", get(price_set_days))
-        .route("/v2/price-sets/coverage", get(price_set_coverage))
-        .route("/v2/paper-accounts/{account_id}", get(paper_account))
-        .route(
-            "/v2/paper-accounts/{account_id}/valuation",
-            get(paper_valuation),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/equity-series",
-            get(paper_equity_series),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/audit",
-            get(paper_account_audit),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/performance",
-            get(paper_performance),
-        )
-        .route(
-            "/v2/experiments/{cycle_id}/performance",
-            get(experiment_performance),
-        )
-        .route(
-            "/v2/experiments/{cycle_id}/performance/segments",
-            get(experiment_performance_segments),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/exposure",
-            get(paper_exposure),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/advance",
-            post(advance_account),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/advance/preview",
-            get(advance_preview),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/rebalances",
-            post(apply_rebalance).get(paper_rebalances),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/allocation-proposal",
-            get(paper_allocation_proposal),
-        )
-        .route(
-            "/v2/paper-accounts/{account_id}/orders",
-            post(submit_paper_order).get(paper_orders),
-        )
-        .route("/v2/paper-sessions", post(create_paper_session).get(paper_sessions))
-        .route(
-            "/v2/paper-sessions/from-experiment",
-            post(create_session_from_experiment),
-        )
-        .route("/v2/paper-sessions/{session_id}", get(paper_session))
-        .route(
-            "/v2/paper-sessions/{session_id}/advance",
-            post(paper_session_advance),
-        )
-        .route(
-            "/v2/paper-sessions/{session_id}/{action}",
-            post(paper_session_action),
-        )
-        .route("/v2/experiments/{cycle_id}", get(experiment))
-        .route("/v2/experiments/{cycle_id}/complete", post(complete_experiment))
-        .route("/v2/quotes", post(ingest_quote))
-        .route("/v2/simulations", post(submit).get(runs))
-        .route("/v2/portfolio", get(portfolio))
-        .route("/v2/replay", get(replay))
-        .route("/v2/compare", get(compare))
-        .route("/v2/experiments/{cycle_id}/research-reproduction", get(research_reproduction))
-        .with_state(db);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8765").await?;
-    println!("astock-v2 paper-only gateway listening at http://127.0.0.1:8765");
+        .route("/v2/account", get(account).post(create_account))
+        .route("/v2/account/run", post(run))
+        .route("/v2/account/positions", get(positions))
+        .route("/v2/account/trades", get(trades))
+        .route("/v2/account/rebalances", get(rebalances))
+        .route("/v2/prices/coverage", get(coverage))
+        .route("/v2/market/days", get(bar_days))
+        .route("/v2/market/bars", get(bars))
+        .route("/v2/market/gaps", get(bar_gaps))
+        .route("/v2/market/bars/{symbol}", get(symbol_bars))
+        .route("/v2/market/settlement-preview", get(settlement_preview))
+        .route("/v2/market/regime", get(market_regime))
+        .route("/v2/account/equity-curve", get(equity_curve))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    println!("astock-v2 listening at http://{address}");
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod archive_tests {
-    use super::archive_manifests_in;
-
-    #[test]
-    fn manifests_are_listed_and_invalid_files_reported() {
-        let dir = std::env::temp_dir().join(format!("astock-arch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("pair.manifest.json"),
-            r#"{"archives":[{"name":"a","manifest":"m1","export":"e1"}],"combined":"def","manifest":"abc","failed":0}"#,
-        )
-        .unwrap();
-        std::fs::write(dir.join("broken.manifest.json"), "{not json").unwrap();
-        std::fs::write(dir.join("ignore.txt"), "x").unwrap();
-
-        let entries = archive_manifests_in(&dir);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "broken.manifest.json");
-        assert!(entries[0].error.is_some());
-        assert_eq!(entries[1].name, "pair.manifest.json");
-        assert_eq!(entries[1].manifest.as_deref(), Some("abc"));
-        assert_eq!(entries[1].combined.as_deref(), Some("def"));
-        assert_eq!(entries[1].archives, Some(1));
-        assert_eq!(entries[1].entries.len(), 1);
-        assert_eq!(entries[1].entries[0].name, "a");
-        assert_eq!(entries[1].entries[0].export.as_deref(), Some("e1"));
-        assert_eq!(entries[1].failed, Some(0));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
