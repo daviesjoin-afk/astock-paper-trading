@@ -174,6 +174,38 @@ struct BarsQuery {
 }
 
 /// Trading days we hold bars for, with the symbol count of the latest day.
+/// Market regime as of a day: trending, choppy, declining, or unknown.
+///
+/// `day` defaults to the latest day held. The verdict is what the aggressive
+/// slot actually saw when it settled that day -- same snapshot, same
+/// unadjusted closes -- so the console cannot disagree with the trades.
+async fn market_regime(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
+    let db = state.lock().await;
+    let day = match query.day {
+        Some(day) => day,
+        None => match db.bar_days().map_err(api_error)?.last().cloned() {
+            Some(day) => day,
+            None => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "no_market_data" })),
+                ));
+            }
+        },
+    };
+    let view = db.market_regime(&day).map_err(api_error)?;
+    response(json!({
+        "day": day,
+        "regime": view.regime.as_str(),
+        "label": view.regime.label(),
+        "index_points": view.index_points,
+        "fast_average_cents": view.fast_average_cents,
+        "slow_average_cents": view.slow_average_cents,
+        "separation_bps": view.separation_bps,
+        "breadth_bps": view.breadth_bps,
+    }))
+}
+
 async fn bar_days(State(state): State<Shared>) -> ApiResult {
     let db = state.lock().await;
     let days = db.bar_days().map_err(api_error)?;
@@ -349,8 +381,8 @@ async fn equity_curve(State(state): State<Shared>) -> ApiResult {
             Json(json!({ "error": "account_not_found" })),
         ));
     };
-    let rows = db.equity_curve(&spec.account_id).map_err(api_error)?;
-    if rows.is_empty() {
+    let [total, steady, aggressive] = db.account_performance(&spec, None).map_err(api_error)?;
+    if total.is_empty() {
         return response(json!({
             "account_id": spec.account_id,
             "initial_cash_cents": spec.initial_cash_cents,
@@ -359,69 +391,45 @@ async fn equity_curve(State(state): State<Shared>) -> ApiResult {
         }));
     }
 
-    let initial = spec.initial_cash_cents;
-    // The two slots each start with half the principal. Tracking each against
-    // its own original budget keeps a slot's reported return a statement about
-    // the strategy, not about how much cash was later moved to it.
-    let slot_budget = initial / 2;
-
-    let points: Vec<Value> = rows
+    let points: Vec<Value> = total
         .iter()
-        .map(|(day, steady, aggressive)| {
-            let total = steady + aggressive;
+        .enumerate()
+        .map(|(index, point)| {
             json!({
-                "day": day,
-                "equity_cents": total,
-                "steady_cents": steady,
-                "aggressive_cents": aggressive,
-                "profit_cents": total - initial,
-                "return_bps": if initial > 0 { (total - initial) * 10_000 / initial } else { 0 },
-                "steady_return_bps": if slot_budget > 0 { (steady - slot_budget) * 10_000 / slot_budget } else { 0 },
-                "aggressive_return_bps": if slot_budget > 0 { (aggressive - slot_budget) * 10_000 / slot_budget } else { 0 },
+                "day": point.day,
+                "equity_cents": point.equity_cents,
+                "steady_cents": steady[index].equity_cents,
+                "aggressive_cents": aggressive[index].equity_cents,
+                "profit_cents": point.profit_cents,
+                "return_bps": point.return_bps,
+                "steady_return_bps": steady[index].return_bps,
+                "aggressive_return_bps": aggressive[index].return_bps,
             })
         })
         .collect();
-
-    // Peak-to-trough over the curve, which is what a user actually feels.
-    let mut peak = initial;
-    let mut max_drawdown_bps = 0i64;
-    let mut peak_day = rows[0].0.clone();
-    let mut trough_day = rows[0].0.clone();
-    for (day, steady, aggressive) in &rows {
-        let total = steady + aggressive;
-        if total > peak {
-            peak = total;
-            peak_day = day.clone();
-        }
-        if peak > 0 {
-            let drawdown = (peak - total) * 10_000 / peak;
-            if drawdown > max_drawdown_bps {
-                max_drawdown_bps = drawdown;
-                trough_day = day.clone();
-            }
-        }
-    }
-    let (_, last_steady, last_aggressive) = rows.last().expect("non-empty");
-    let last_total = last_steady + last_aggressive;
+    let last = total.last().expect("non-empty");
+    let last_steady = steady.last().expect("non-empty");
+    let last_aggressive = aggressive.last().expect("non-empty");
 
     response(json!({
         "account_id": spec.account_id,
-        "initial_cash_cents": initial,
+        "initial_cash_cents": spec.initial_cash_cents,
+        "slot_return_method": "time_weighted_end_of_day_flows",
         "points": points,
         "summary": {
-            "first_day": rows.first().map(|r| r.0.clone()),
-            "last_day": rows.last().map(|r| r.0.clone()),
-            "days": rows.len(),
-            "equity_cents": last_total,
-            "profit_cents": last_total - initial,
-            "return_bps": if initial > 0 { (last_total - initial) * 10_000 / initial } else { 0 },
-            "max_drawdown_bps": max_drawdown_bps,
-            "peak_day": peak_day,
-            "trough_day": trough_day,
-            "steady_return_bps": if slot_budget > 0 { (last_steady - slot_budget) * 10_000 / slot_budget } else { 0 },
-            "aggressive_return_bps": if slot_budget > 0 { (last_aggressive - slot_budget) * 10_000 / slot_budget } else { 0 },
-            "steady_cents": last_steady,
-            "aggressive_cents": last_aggressive,
+            "first_day": total.first().map(|point| &point.day),
+            "last_day": last.day,
+            "days": total.len(),
+            "equity_cents": last.equity_cents,
+            "profit_cents": last.profit_cents,
+            "return_bps": last.return_bps,
+            "max_drawdown_bps": last.max_drawdown_bps,
+            "peak_day": last.peak_day,
+            "trough_day": last.trough_day,
+            "steady_return_bps": last_steady.return_bps,
+            "aggressive_return_bps": last_aggressive.return_bps,
+            "steady_cents": last_steady.equity_cents,
+            "aggressive_cents": last_aggressive.equity_cents,
         },
     }))
 }
@@ -591,7 +599,12 @@ fn price_set_from_store(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "v2.sqlite3".into());
     let address = env::var("ASTOCK_V2_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".into());
-    let store = Store::open(database).map_err(|error| format!("{error:?}"))?;
+    let mut store = Store::open(database).map_err(|error| format!("{error:?}"))?;
+    // `ASTOCK_V2_REGIME_FILTER=0` replays the pre-regime behaviour so the two
+    // can be compared on identical data. Default is on.
+    if env::var("ASTOCK_V2_REGIME_FILTER").is_ok_and(|value| value == "0") {
+        store.regime_filter = false;
+    }
     let state = Arc::new(Mutex::new(store));
     let app = Router::new()
         .route("/v2/health", get(health))
@@ -606,6 +619,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market/gaps", get(bar_gaps))
         .route("/v2/market/bars/{symbol}", get(symbol_bars))
         .route("/v2/market/settlement-preview", get(settlement_preview))
+        .route("/v2/market/regime", get(market_regime))
         .route("/v2/account/equity-curve", get(equity_curve))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&address).await?;

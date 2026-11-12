@@ -584,8 +584,8 @@ type CurvePayload = {
     profit_cents: number;
     return_bps: number;
     max_drawdown_bps: number;
-    peak_day: string;
-    trough_day: string;
+    peak_day: string | null;
+    trough_day: string | null;
     steady_return_bps: number;
     aggressive_return_bps: number;
     steady_cents: number;
@@ -596,6 +596,9 @@ type CurvePayload = {
 let curve: CurvePayload | null = null;
 let curveSeries: "total" | "steady" | "aggressive" = "total";
 let curveRange = "all";
+
+const drawdownPeriod = (summary: NonNullable<CurvePayload["summary"]>): string =>
+  summary.trough_day ? `${summary.peak_day ?? "初始本金"} → ${summary.trough_day}` : "尚无回撤";
 
 async function loadCurve(): Promise<void> {
   try {
@@ -649,17 +652,17 @@ function drawCockpit(): void {
     `<div class="curve-stat">
        <span class="curve-stat-label">最大回撤</span>
        <strong class="neg">${percent(-s.max_drawdown_bps)}</strong>
-       <span class="muted">${s.peak_day} → ${s.trough_day}</span>
+       <span class="muted">${drawdownPeriod(s)}</span>
      </div>`,
     `<div class="curve-stat">
        <span class="curve-stat-label">稳健</span>
        <strong class="${s.steady_return_bps >= 0 ? "pos" : "neg"}">${percent(s.steady_return_bps)}</strong>
-       <span class="muted">${moneyShort(s.steady_cents)}</span>
+       <span class="muted">资产 ${moneyShort(s.steady_cents)} · 收益已剔除调配</span>
      </div>`,
     `<div class="curve-stat">
        <span class="curve-stat-label">激进</span>
        <strong class="${s.aggressive_return_bps >= 0 ? "pos" : "neg"}">${percent(s.aggressive_return_bps)}</strong>
-       <span class="muted">${moneyShort(s.aggressive_cents)}</span>
+       <span class="muted">资产 ${moneyShort(s.aggressive_cents)} · 收益已剔除调配</span>
      </div>`,
   ].join("");
 
@@ -722,19 +725,19 @@ function drawCurve(): void {
       "最大回撤",
       percent(-s.max_drawdown_bps),
       "neg",
-      `${s.peak_day} → ${s.trough_day}`,
+      drawdownPeriod(s),
     ),
     stat(
       "稳健",
       percent(s.steady_return_bps),
       s.steady_return_bps >= 0 ? "pos" : "neg",
-      moneyShort(s.steady_cents),
+      `资产 ${moneyShort(s.steady_cents)} · 收益已剔除调配`,
     ),
     stat(
       "激进",
       percent(s.aggressive_return_bps),
       s.aggressive_return_bps >= 0 ? "pos" : "neg",
-      moneyShort(s.aggressive_cents),
+      `资产 ${moneyShort(s.aggressive_cents)} · 收益已剔除调配`,
     ),
     stat("样本", String(points.length), "", `个交易日，${s.first_day} 起`),
   ].join("");

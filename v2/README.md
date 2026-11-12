@@ -44,7 +44,30 @@ API 默认在 `http://127.0.0.1:8765`（本机开发）。服务器重写版沿�
 
 ## 行情数据
 
-服务自身不联网。行情先通过离线命令生成“已审核价格集合”：
+服务自身不联网。两条离线取数入口分别是全市场 `bar` 摄取和显式审核价格集合。
+
+### 全市场 bar 摄取
+
+先按快速开始让内核创建全新的 schema 2 数据库并停止该进程，然后在 `v2/` 执行：
+
+```bash
+python data_sources/ingest_market.py --db ./v2.sqlite3 \
+  --day 2026-11-10 --workers 4
+```
+
+`ingest_market.py` 从通达信盘后包直接写入 `bar` 表，标记 `adjust=none`、
+`source=tdx`；这是本轮真实历史回放使用的入口。它检查日包结构和市场规模，
+不执行双源逐股审核，也不会自动生成 `trust=reviewed` 的价格集合。
+数据库必须已存在。区间补数与公司电脑复现见
+[接续入口](docs/HANDOFF-COMPANY-2026-11-11.md)。
+
+普通 A 股停牌由通达信日包保留为 `tradable=0` 的估值行：官方参考昨收只用于
+给已有持仓计市值，不能成交、不能参与评分或市场状态。完全缺行或没有可用
+参考价时仍明确报 `missing_close_price`，不会前填或跳过结算日。
+
+### 显式审核价格集合
+
+指定股票/日期的双源审核与发布流程：
 
 ```bash
 python data_sources/a_stock_data.py fetch \
@@ -58,11 +81,10 @@ bash scripts/fetch_and_publish_reviewed.sh \
 ```
 
 `a-stock-data` 适配器同时核对腾讯日线与通达信盘后包，并检查新浪复权因子。
-任一股缺日、停牌、零成交、价格或成交量不一致，整批拒绝，不会写出半份数据。
-细节见 `data_sources/README.md`。
-
-生产目录只接受 `trust=reviewed`。演示/测试可用 `ASTOCK_ALLOW_SYNTHETIC=1`
-在隔离目录读取合成数据，不得把合成数据放进生产价格目录。
+任一股缺日、价格或成交量不一致，整批拒绝，不会写出半份数据；细节见
+`data_sources/README.md`。审核集合目录只接受 `trust=reviewed`。
+演示/测试可用 `ASTOCK_ALLOW_SYNTHETIC=1` 在隔离目录读取合成数据，不得把
+合成数据放进生产价格目录。
 
 ## 页面与接口
 
@@ -111,5 +133,8 @@ Oracle 单机部署、nginx、cron 与回滚见 `deploy/README.md`。
 旧 V2 数据库（`PRAGMA user_version > 0`）会被明确拒绝，保留原文件并用新
 `ASTOCK_V2_DB` 启动；本项目不尝试就地迁移。
 
-接手人请从 [交接文档](docs/HANDOFF-2026-11-11.md) 开始，里面包含当前部署状态、
-日常命令、备份恢复、验收证据和未完成项。
+跨电脑继续请从 [公司电脑接续入口](docs/HANDOFF-COMPANY-2026-11-11.md) 开始，并阅读
+[真实历史核验结果](docs/REAL-HISTORY-REGIME-2026-11-11.md) 与
+[最新优化路线与离线对照工具](docs/OPTIMIZATION-2026-11-11.md)。
+[早期本机交接文档](docs/HANDOFF-2026-11-11-V3.md) 保留为历史快照，
+其中旧提交状态、数据缺失说明和旧收益表应以本轮接续入口为准。

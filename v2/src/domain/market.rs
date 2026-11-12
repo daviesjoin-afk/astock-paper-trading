@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use super::RuleError;
 
+/// One unadjusted row from the `bar` table, before it becomes a `PriceEntry`.
+#[derive(Clone, Debug)]
+pub struct BarRow {
+    pub symbol: String,
+    pub day: String,
+    pub price_cents: i64,
+    /// A real close that may fill an order. A halted row carries the official
+    /// reference previous close and is valuation-only.
+    pub tradable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PriceSet {
@@ -25,6 +36,25 @@ pub struct PriceEntry {
     pub price_cents: i64,
     pub source: String,
     pub observed_at: String,
+    /// Whether this price is a real close that may fill an order.
+    #[serde(default = "default_tradable")]
+    pub tradable: bool,
+}
+
+fn default_tradable() -> bool {
+    true
+}
+
+/// A held symbol's market value on a settlement day.
+///
+/// A row with `tradable = true` is a real close and may be used to fill an
+/// order. A halted symbol has no close of its own; its `price_cents` is the
+/// exchange's official previous close, which may value an existing position but
+/// must never become a fill or a scoring input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quote {
+    pub price_cents: i64,
+    pub tradable: bool,
 }
 
 /// A `PriceSet` with an index over `(symbol, day)`.
@@ -40,39 +70,64 @@ pub struct PriceEntry {
 #[derive(Clone, Debug)]
 pub struct IndexedPriceSet {
     set: PriceSet,
-    by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
-    by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
+    by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>>,
+    by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>>,
 }
 
 impl IndexedPriceSet {
     pub fn new(set: PriceSet) -> Self {
-        let mut by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
+        let mut by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>> =
             std::collections::BTreeMap::new();
-        let mut by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
+        let mut by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>> =
             std::collections::BTreeMap::new();
         for entry in &set.entries {
+            let quote = Quote {
+                price_cents: entry.price_cents,
+                tradable: entry.tradable,
+            };
             by_day
                 .entry(entry.day.clone())
                 .or_default()
-                .insert(entry.symbol.clone(), entry.price_cents);
+                .insert(entry.symbol.clone(), quote);
             by_symbol
                 .entry(entry.symbol.clone())
                 .or_default()
-                .insert(entry.day.clone(), entry.price_cents);
+                .insert(entry.day.clone(), quote);
         }
         Self { set, by_day, by_symbol }
     }
 
-    pub fn contains(&self, symbol: &str, day: &str) -> Option<i64> {
+    /// The valuation mark for a held symbol, regardless of tradeability.
+    pub fn valuation(&self, symbol: &str, day: &str) -> Option<i64> {
         self.by_day
             .get(day)
             .and_then(|closes| closes.get(symbol))
-            .copied()
+            .map(|quote| quote.price_cents)
     }
 
-    /// All closes for one day, as symbol -> price. O(1) in the number of days.
-    pub fn closes_on(&self, day: &str) -> std::collections::BTreeMap<String, i64> {
-        self.by_day.get(day).cloned().unwrap_or_default()
+    /// Whether `symbol` has a real, fillable close on `day`.
+    pub fn is_tradable(&self, symbol: &str, day: &str) -> bool {
+        self.by_day
+            .get(day)
+            .and_then(|closes| closes.get(symbol))
+            .is_some_and(|quote| quote.tradable)
+    }
+
+    /// All tradable closes for one day, as symbol -> price.
+    ///
+    /// Halted valuations stay out: a signal computed from a carried reference
+    /// price would invent a trade that could not happen.
+    pub fn tradable_closes_on(&self, day: &str) -> std::collections::BTreeMap<String, i64> {
+        self.by_day
+            .get(day)
+            .map(|closes| {
+                closes
+                    .iter()
+                    .filter(|(_, quote)| quote.tradable)
+                    .map(|(symbol, quote)| (symbol.clone(), quote.price_cents))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// One symbol's close history up to `through_day`, oldest first.
@@ -88,15 +143,47 @@ impl IndexedPriceSet {
                 series
                     .iter()
                     .filter(|(day, _)| day.as_str() <= through_day)
-                    .map(|(day, price)| super::Bar {
+                    .filter(|(_, quote)| quote.tradable)
+                    .map(|(day, quote)| super::Bar {
                         symbol: symbol.to_string(),
                         day: day.clone(),
-                        close_cents: *price,
+                        close_cents: quote.price_cents,
                         volume: 0,
+                        tradable: true,
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Per-symbol close history through `through_day`, capped at the most
+    /// recent `days` bars per symbol.
+    ///
+    /// Served straight from the per-symbol index rather than through
+    /// `bars_for`, which allocates a `Bar` (and clones a symbol string) per
+    /// row. The regime classifier only needs numbers, and on 5.5k symbols a
+    /// settle day that is 5.5k x 120 needless allocations.
+    pub fn recent_closes(
+        &self,
+        through_day: &str,
+        days: usize,
+    ) -> std::collections::BTreeMap<String, Vec<i64>> {
+        let mut out = std::collections::BTreeMap::new();
+        for (symbol, series) in &self.by_symbol {
+            let mut closes: Vec<i64> = series
+                .iter()
+                .filter(|(day, _)| day.as_str() <= through_day)
+                .filter(|(_, quote)| quote.tradable)
+                .map(|(_, quote)| quote.price_cents)
+                .collect();
+            if closes.len() > days {
+                closes.drain(..closes.len() - days);
+            }
+            if !closes.is_empty() {
+                out.insert(symbol.clone(), closes);
+            }
+        }
+        out
     }
 
     pub fn set(&self) -> &PriceSet {
@@ -137,8 +224,13 @@ impl PriceSet {
     /// symbol joins the set from its first close to its last. Days outside a
     /// symbol's own span are not holes; days inside it are, and a symbol with
     /// an interior hole is dropped rather than carried at a stale price.
+    ///
+    /// A halted row is kept separately: its price is the official previous
+    /// close, used only to value a position that was already held. The symbol
+    /// remains complete over its own span so a halt does not erase its history,
+    /// but its score, market-regime input and fills exclude the halted day.
     pub fn from_bars(
-        bars: &[(String, String, i64)],
+        bars: &[BarRow],
         price_set_id: impl Into<String>,
         coverage_start: &str,
         coverage_end: &str,
@@ -147,10 +239,10 @@ impl PriceSet {
 
         let in_window = bars
             .iter()
-            .filter(|(_, day, close)| {
-                day.as_str() >= coverage_start
-                    && day.as_str() <= coverage_end
-                    && *close > 0
+            .filter(|row| {
+                row.day.as_str() >= coverage_start
+                    && row.day.as_str() <= coverage_end
+                    && row.price_cents > 0
             })
             .collect::<Vec<_>>();
 
@@ -160,18 +252,18 @@ impl PriceSet {
         let market_days: Vec<&str> = {
             let set: BTreeSet<&str> = bars
                 .iter()
-                .map(|(_, day, _)| day.as_str())
+                .map(|row| row.day.as_str())
                 .filter(|day| *day >= coverage_start && *day <= coverage_end)
                 .collect();
             set.into_iter().collect()
         };
 
-        let mut by_symbol: BTreeMap<&str, BTreeMap<&str, i64>> = BTreeMap::new();
-        for (symbol, day, close) in &in_window {
+        let mut by_symbol: BTreeMap<&str, BTreeMap<&str, (i64, bool)>> = BTreeMap::new();
+        for row in &in_window {
             by_symbol
-                .entry(symbol.as_str())
+                .entry(row.symbol.as_str())
                 .or_default()
-                .insert(day.as_str(), *close);
+                .insert(row.day.as_str(), (row.price_cents, row.tradable));
         }
 
         let mut entries = Vec::new();
@@ -190,17 +282,19 @@ impl PriceSet {
                 .filter(|day| *day >= *first && *day <= *last)
                 .collect();
             if expected.len() != closes.len() {
-                // Interior hole: a close is missing on a day the market
-                // traded and this symbol was already live. Drop it.
+                // Interior hole: no row at all on a day the market traded
+                // while this symbol was already live. A halt must be ingested
+                // as an explicit valuation-only row, not inferred from a gap.
                 continue;
             }
-            for (day, price_cents) in closes {
+            for (day, (price_cents, tradable)) in closes {
                 entries.push(PriceEntry {
                     symbol: symbol.to_string(),
                     day: day.to_string(),
                     price_cents,
                     source: "bar/tdx".into(),
                     observed_at: format!("{day}T15:00:00+08:00"),
+                    tradable,
                 });
             }
         }
@@ -278,7 +372,19 @@ impl PriceSet {
         Ok(())
     }
 
-    pub fn contains(&self, symbol: &str, day: &str) -> Option<i64> {
+    /// The close used to decide and fill a trade.
+    ///
+    /// A halted row is deliberately invisible here; only `valuation` may read
+    /// its carried reference price.
+    pub fn tradable_close(&self, symbol: &str, day: &str) -> Option<i64> {
+        self.entries
+            .iter()
+            .find(|entry| entry.symbol == symbol && entry.day == day && entry.tradable)
+            .map(|entry| entry.price_cents)
+    }
+
+    /// The mark used only to value a position that is already held.
+    pub fn valuation(&self, symbol: &str, day: &str) -> Option<i64> {
         self.entries
             .iter()
             .find(|entry| entry.symbol == symbol && entry.day == day)
@@ -337,6 +443,11 @@ fn digest_of(entries: &[PriceEntry]) -> String {
         feed(entry.day.as_bytes(), &mut state);
         feed(b"|", &mut state);
         feed(&entry.price_cents.to_le_bytes(), &mut state);
+        if !entry.tradable {
+            // Keep every existing tradable-set digest stable: the halt marker
+            // is appended only where it distinguishes content.
+            feed(b"|halted", &mut state);
+        }
     }
     let mut out = String::with_capacity(64);
     let mut round = state;
@@ -364,8 +475,22 @@ fn is_day(value: &str) -> bool {
 mod from_bars_tests {
     use super::*;
 
-    fn row(symbol: &str, day: &str, close: i64) -> (String, String, i64) {
-        (symbol.to_string(), day.to_string(), close)
+    fn row(symbol: &str, day: &str, close: i64) -> BarRow {
+        BarRow {
+            symbol: symbol.to_string(),
+            day: day.to_string(),
+            price_cents: close,
+            tradable: true,
+        }
+    }
+
+    fn halted(symbol: &str, day: &str, reference: i64) -> BarRow {
+        BarRow {
+            symbol: symbol.to_string(),
+            day: day.to_string(),
+            price_cents: reference,
+            tradable: false,
+        }
     }
 
     #[test]
@@ -380,7 +505,7 @@ mod from_bars_tests {
         set.validate().expect("valid price set");
         assert_eq!(set.days(), vec!["2026-11-09", "2026-11-10"]);
         assert_eq!(set.symbols(), vec!["000001.SZ", "600000.SH"]);
-        assert_eq!(set.contains("600000.SH", "2026-11-10"), Some(1_020));
+        assert_eq!(set.tradable_close("600000.SH", "2026-11-10"), Some(1_020));
     }
 
     #[test]
@@ -412,8 +537,8 @@ mod from_bars_tests {
         ];
         let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-11");
         assert_eq!(set.symbols(), vec!["301999.SZ", "600000.SH"]);
-        assert_eq!(set.contains("301999.SZ", "2026-11-09"), None);
-        assert_eq!(set.contains("301999.SZ", "2026-11-11"), Some(2_600));
+        assert_eq!(set.tradable_close("301999.SZ", "2026-11-09"), None);
+        assert_eq!(set.tradable_close("301999.SZ", "2026-11-11"), Some(2_600));
     }
 
     #[test]
@@ -451,8 +576,8 @@ mod from_bars_tests {
         ];
         let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-10");
         assert_eq!(set.days(), vec!["2026-11-09", "2026-11-10"]);
-        assert_eq!(set.contains("600000.SH", "2026-11-06"), None);
-        assert_eq!(set.contains("600000.SH", "2026-11-11"), None);
+        assert_eq!(set.tradable_close("600000.SH", "2026-11-06"), None);
+        assert_eq!(set.tradable_close("600000.SH", "2026-11-11"), None);
     }
 
     #[test]
@@ -481,7 +606,39 @@ mod from_bars_tests {
         ];
         let set = PriceSet::from_bars(&rows, "t", "2026-11-09", "2026-11-11");
         assert_eq!(set.symbols(), vec!["600000.SH"]);
-        assert_eq!(set.contains("600000.SH", "2026-11-11"), None);
+        assert_eq!(set.tradable_close("600000.SH", "2026-11-11"), None);
+    }
+
+    #[test]
+    fn a_halted_row_values_a_position_but_cannot_be_filled_or_scored() {
+        let source = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            halted("600000.SH", "2026-11-10", 1_005),
+            row("600000.SH", "2026-11-11", 1_020),
+        ];
+        let set = PriceSet::from_bars(&source, "t", "2026-11-09", "2026-11-11");
+        set.validate().expect("explicit halt keeps the row");
+        assert_eq!(set.tradable_close("600000.SH", "2026-11-10"), None);
+        assert_eq!(set.valuation("600000.SH", "2026-11-10"), Some(1_005));
+        assert!(
+            !set.entries
+                .iter()
+                .find(|entry| entry.day == "2026-11-10")
+                .expect("halted row")
+                .tradable
+        );
+    }
+
+    #[test]
+    fn a_halted_trailing_row_does_not_become_a_fill_price() {
+        let source = vec![
+            row("600000.SH", "2026-11-09", 1_010),
+            row("600000.SH", "2026-11-10", 1_020),
+            halted("600000.SH", "2026-11-11", 1_020),
+        ];
+        let set = PriceSet::from_bars(&source, "t", "2026-11-09", "2026-11-11");
+        assert_eq!(set.tradable_close("600000.SH", "2026-11-11"), None);
+        assert_eq!(set.valuation("600000.SH", "2026-11-11"), Some(1_020));
     }
 
     #[test]

@@ -6,13 +6,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::domain::{
-    apply_buy, apply_sell, drawdown_bps, fees_cents, initial_split, orders_for_day, propose, score,
-    score_signal, settle_overnight, AccountSpec, AccountView, AdvanceResult, DayRun, IndexedPriceSet,
-    PositionView, PriceCoverage, PriceSet, Rebalance, RuleError, SlotBook, SlotSpec, SlotView,
-    SignalScore, StrategyId, Trade,
+    apply_buy, apply_sell, classify_series, drawdown_bps, fees_cents,
+    initial_split, orders_for_day_in, performance_curve, propose, score, score_signal, settle_overnight, AccountSpec,
+    AccountView, AdvanceResult, DayRun, IndexedPriceSet, PositionView, PriceCoverage, PriceSet,
+    PerformanceInput, PerformancePoint, Rebalance, RegimeView, RuleError, SignalScore, SlotBook, SlotPolicy, SlotSpec, SlotView,
+    StrategyId, Trade,
 };
 
 pub const SCHEMA_VERSION: i64 = 2;
@@ -24,6 +25,12 @@ pub const SCHEMA_VERSION: i64 = 2;
 /// no reason to carry it through the moving-average code -- on a 5.3k-symbol
 /// universe that difference is ~4M rows versus ~320k per settled day.
 pub const SIGNAL_LOOKBACK_DAYS: usize = 61;
+
+/// Trading days of history the market-regime classifier needs.
+///
+/// Two slow windows: one to measure, one to make sure the fast average is not
+/// dominated by a handful of days when a slice of the market was missing.
+pub const REGIME_LOOKBACK_DAYS: usize = 120;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -72,9 +79,35 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 pub struct Store {
     pub conn: Connection,
+    /// When false, the aggressive slot ignores the market regime and uses its
+    /// baseline policy.
+    ///
+    /// Exists so a replay can compare "with the filter" against "without it"
+    /// on identical data. A regime filter that cannot be switched off cannot
+    /// be shown to help, and the whole point of adding it was a measured
+    /// claim, so it has to stay measurable.
+    pub regime_filter: bool,
 }
 
 impl Store {
+    /// Offline research reads an existing rewrite database without migrations,
+    /// schema changes or creating a missing file. Ledger writes are rejected by SQLite.
+    pub fn open_market_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Pin one SQLite read snapshot for the entire comparison, even if an
+        // ingestion process appends bars while this connection is alive.
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let legacy: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let store = Self {
+            conn,
+            regime_filter: true,
+        };
+        if legacy != 0 || store.schema_version()? != SCHEMA_VERSION {
+            return Err(StoreError::Integrity("unsupported_replay_schema".into()));
+        }
+        Ok(store)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if path.as_ref() != Path::new(":memory:")
             && let Some(parent) = path.as_ref().parent()
@@ -85,7 +118,10 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            regime_filter: true,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -215,6 +251,9 @@ impl Store {
                 -- walk-forward evaluation must refuse 'qfq'.
                 adjust TEXT NOT NULL DEFAULT 'none',
                 source TEXT NOT NULL DEFAULT 'tdx',
+                -- 1 when close_cents came from a real trade; 0 when the row
+                -- carries the official reference close for a halted symbol.
+                tradable INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY(symbol, day)
             );
             CREATE INDEX IF NOT EXISTS bar_by_day ON bar(day);
@@ -230,9 +269,8 @@ impl Store {
         Ok(())
     }
 
-    /// Add `adjust`/`source` to a `bar` table created before those columns
-    /// existed. Idempotent: CREATE TABLE IF NOT EXISTS does nothing when the
-    /// table is already there, so existing databases need this to catch up.
+    /// Add missing bar metadata and classify legacy TDX zero-quote rows once.
+    /// Existing explicit tradability is preserved on subsequent opens.
     fn ensure_bar_columns(&self) -> StoreResult<()> {
         let mut have: Vec<String> = Vec::new();
         {
@@ -242,14 +280,26 @@ impl Store {
                 have.push(row?);
             }
         }
+        let txn = self.conn.unchecked_transaction()?;
         for (name, ddl) in [
             ("adjust", "ALTER TABLE bar ADD COLUMN adjust TEXT NOT NULL DEFAULT 'none'"),
             ("source", "ALTER TABLE bar ADD COLUMN source TEXT NOT NULL DEFAULT 'tdx'"),
+            ("tradable", "ALTER TABLE bar ADD COLUMN tradable INTEGER NOT NULL DEFAULT 1"),
         ] {
             if !have.iter().any(|column| column == name) {
-                self.conn.execute(ddl, [])?;
+                txn.execute(ddl, [])?;
+                if name == "tradable" {
+                    txn.execute(
+                        "UPDATE bar SET tradable=0, \
+                         close_cents=CASE WHEN prev_close_cents>0 THEN prev_close_cents ELSE 0 END \
+                         WHERE adjust='none' AND source='tdx' \
+                         AND volume_shares=0 AND open_cents=0 AND high_cents=0 AND low_cents=0",
+                        [],
+                    )?;
+                }
             }
         }
+        txn.commit()?;
         Ok(())
     }
 
@@ -275,8 +325,8 @@ impl Store {
         {
             let mut stmt = txn.prepare(
                 "INSERT INTO bar(symbol,day,name,open_cents,high_cents,low_cents,\
-                 close_cents,prev_close_cents,volume_shares,amount_cents,adjust,source) \
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?) \
+                 close_cents,prev_close_cents,volume_shares,amount_cents,adjust,source,tradable) \
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) \
                  ON CONFLICT(symbol,day) DO UPDATE SET \
                    name=excluded.name, open_cents=excluded.open_cents, \
                    high_cents=excluded.high_cents, low_cents=excluded.low_cents, \
@@ -284,7 +334,8 @@ impl Store {
                    prev_close_cents=excluded.prev_close_cents, \
                    volume_shares=excluded.volume_shares, \
                    amount_cents=excluded.amount_cents, \
-                   adjust=excluded.adjust, source=excluded.source",
+                   adjust=excluded.adjust, source=excluded.source, \
+                   tradable=excluded.tradable",
             )?;
             for bar in bars {
                 stmt.execute(params![
@@ -300,6 +351,7 @@ impl Store {
                     bar.amount_cents,
                     bar.adjust,
                     bar.source,
+                    i64::from(bar.tradable),
                 ])?;
             }
         }
@@ -307,11 +359,53 @@ impl Store {
         Ok(bars.len())
     }
 
+    /// Unadjusted closes over a day range, as symbol -> (day, close) rows
+    /// oldest first. Feeds the market-regime classifier, which needs a
+    /// contiguous window rather than whole-market snapshots.
+    pub fn unadjusted_closes_through(
+        &self,
+        from_day: &str,
+        to_day: &str,
+    ) -> StoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, day, close_cents FROM bar \
+             WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' \
+             AND close_cents > 0 AND tradable = 1 ORDER BY symbol, day",
+        )?;
+        let rows = stmt.query_map(params![from_day, to_day], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Classify the broad market as of `day`, using the same unadjusted closes
+    /// settlement uses.
+    ///
+    /// Forward-adjusted rows are excluded deliberately: a regime measured off
+    /// rewritten history would describe a market nobody traded.
+    pub fn market_regime(&self, day: &str) -> StoreResult<RegimeView> {
+        let days = self.bar_days()?;
+        let Some(position) = days.iter().position(|candidate| candidate == day) else {
+            return Ok(RegimeView::unknown(0));
+        };
+        let start = days[position.saturating_sub(REGIME_LOOKBACK_DAYS - 1)].clone();
+        let rows = self.unadjusted_closes_through(&start, day)?;
+        let mut by_symbol: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for (symbol, _, close) in rows {
+            by_symbol.entry(symbol).or_default().push(close);
+        }
+        Ok(classify_series(&by_symbol))
+    }
+
     /// All bars for one trading day, ordered by symbol.
     pub fn bars_for_day(&self, day: &str) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
-             prev_close_cents,volume_shares,amount_cents,adjust,source \
+             prev_close_cents,volume_shares,amount_cents,adjust,source,tradable \
              FROM bar WHERE day = ?1 ORDER BY symbol",
         )?;
         let rows = stmt.query_map([day], read_bar)?;
@@ -331,7 +425,7 @@ impl Store {
     ) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
-             prev_close_cents,volume_shares,amount_cents,adjust,source \
+             prev_close_cents,volume_shares,amount_cents,adjust,source,tradable \
              FROM bar WHERE symbol = ?1 AND day BETWEEN ?2 AND ?3 ORDER BY day",
         )?;
         let rows = stmt.query_map(params![symbol, from_day, to_day], read_bar)?;
@@ -346,13 +440,18 @@ impl Store {
     ///
     /// This is the settlement feed: forward-adjusted rows are excluded here
     /// rather than at the call site so no caller can forget.
-    pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<(String, String, i64)>> {
+    pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<(String, String, i64, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol, day, close_cents FROM bar \
+            "SELECT symbol, day, close_cents, tradable FROM bar \
              WHERE day = ?1 AND adjust = 'none' AND close_cents > 0 ORDER BY symbol",
         )?;
         let rows = stmt.query_map([day], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -366,14 +465,19 @@ impl Store {
         &self,
         from_day: &str,
         to_day: &str,
-    ) -> StoreResult<Vec<(String, String, i64)>> {
+    ) -> StoreResult<Vec<(String, String, i64, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol, day, close_cents FROM bar \
+            "SELECT symbol, day, close_cents, tradable FROM bar \
              WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' AND close_cents > 0 \
              ORDER BY symbol, day",
         )?;
         let rows = stmt.query_map(params![from_day, to_day], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -396,6 +500,15 @@ impl Store {
         if rows.is_empty() {
             return Ok(None);
         }
+        let rows: Vec<crate::domain::BarRow> = rows
+            .into_iter()
+            .map(|(symbol, day, price_cents, tradable)| crate::domain::BarRow {
+                symbol,
+                day,
+                price_cents,
+                tradable,
+            })
+            .collect();
         Ok(Some(crate::domain::PriceSet::from_bars(
             &rows,
             symbol,
@@ -432,6 +545,62 @@ impl Store {
         Ok(out)
     }
 
+    /// Read model only: account, steady and aggressive performance, in that
+    /// order. Slot returns remove end-of-day transfers. Optional current marks
+    /// support /account valuations after the most recent settled day.
+    pub fn account_performance(
+        &self,
+        spec: &AccountSpec,
+        mark: Option<(&str, [i64; 2])>,
+    ) -> StoreResult<[Vec<PerformancePoint>; 3]> {
+        let mut rows = self.equity_curve(&spec.account_id)?;
+        if let Some((day, equities)) = mark {
+            match rows.last_mut() {
+                Some(last) if last.0 == day => {
+                    last.1 = equities[0];
+                    last.2 = equities[1];
+                }
+                Some(last) if last.0.as_str() > day => {
+                    return Err(StoreError::Rules(RuleError(
+                        "valuation_before_last_settled".into(),
+                    )));
+                }
+                _ => rows.push((day.to_string(), equities[0], equities[1])),
+            }
+        }
+        let mut flows = BTreeMap::<String, i64>::new();
+        for item in self.rebalances(&spec.account_id)? {
+            let signed = if item.to == StrategyId::Steady {
+                item.moved_cents
+            } else {
+                -item.moved_cents
+            };
+            *flows.entry(item.applied_day).or_default() += signed;
+        }
+        let mut inputs: [Vec<PerformanceInput>; 3] =
+            std::array::from_fn(|_| Vec::with_capacity(rows.len()));
+        for (day, steady, aggressive) in rows {
+            let flow = flows.get(&day).copied().unwrap_or(0);
+            for (index, (equity, net_flow)) in
+                [(steady + aggressive, 0), (steady, flow), (aggressive, -flow)]
+                    .into_iter()
+                    .enumerate()
+            {
+                inputs[index].push(PerformanceInput {
+                    day: day.clone(),
+                    equity_cents: equity,
+                    net_flow_cents: net_flow,
+                });
+            }
+        }
+        let budgets = initial_split(spec.initial_cash_cents)?;
+        Ok([
+            performance_curve(spec.initial_cash_cents, &inputs[0])?,
+            performance_curve(budgets[0].cash_cents, &inputs[1])?,
+            performance_curve(budgets[1].cash_cents, &inputs[2])?,
+        ])
+    }
+
     /// Every distinct trading day we hold, oldest first.
     pub fn bar_days(&self) -> StoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT DISTINCT day FROM bar ORDER BY day")?;
@@ -441,6 +610,15 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Replay dates must come from usable unadjusted data, never qfq-only days.
+    pub fn unadjusted_bar_days(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT day FROM bar WHERE adjust='none' AND close_cents>0 ORDER BY day",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Number of symbols with a bar on `day`. Used only for reporting.
@@ -466,7 +644,7 @@ impl Store {
     pub fn price_gaps(&self, day: &str) -> StoreResult<Vec<Bar>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol,day,name,open_cents,high_cents,low_cents,close_cents,\
-             prev_close_cents,volume_shares,amount_cents,adjust,source \
+             prev_close_cents,volume_shares,amount_cents,adjust,source,tradable \
              FROM bar WHERE day = ?1 AND prev_close_cents > 0 \
              ORDER BY symbol",
         )?;
@@ -617,7 +795,7 @@ impl Store {
         // day would re-walk millions of entries on every iteration.
         let index_set = IndexedPriceSet::new(set.clone());
         for day in &days {
-            let run = self.run_day_indexed(spec, set, &index_set, day)?;
+            let run = self.run_day_indexed(spec, &index_set, day)?;
             all_trades.extend(run.trades);
             all_rebalances.extend(run.rebalance);
         }
@@ -679,16 +857,18 @@ impl Store {
         // than the linear scans it replaces, and it keeps `run_day` usable on
         // its own for a single-day settle.
         let index = IndexedPriceSet::new(set.clone());
-        self.run_day_indexed(spec, set, &index, day)
+        self.run_day_indexed(spec, &index, day)
     }
 
-    fn run_day_indexed(
+    /// The same atomic day settlement with a caller-owned price index. Offline
+    /// comparisons can reuse one input index across their isolated books.
+    pub fn run_day_indexed(
         &mut self,
         spec: &AccountSpec,
-        set: &PriceSet,
         index_set: &IndexedPriceSet,
         day: &str,
     ) -> StoreResult<DayRun> {
+        let set = index_set.set();
         validate_day(set, day)?;
         if let Some(last) = self.last_settled_day(&spec.account_id)?
             && day < last.as_str()
@@ -711,6 +891,10 @@ impl Store {
             settle_overnight(&mut books[1])?;
         }
         let weights = self.weights(&spec.account_id)?;
+        // The regime is a property of the day, not of a slot, and it costs one
+        // pass over the index. Computing it once here keeps the two slots
+        // looking at the same tape.
+        let regime = regime_for_day(index_set, day);
         let mut planned = Vec::new();
         for (index, slot) in [StrategyId::Steady, StrategyId::Aggressive]
             .into_iter()
@@ -730,13 +914,30 @@ impl Store {
                 book.positions.iter().map(|position| position.symbol.as_str()),
             )?;
             let budget = self.slot_equity(&spec.account_id, slot)?;
-            let orders = orders_for_day(
+            let policy = if self.regime_filter {
+                SlotPolicy::for_strategy_in(slot, regime.regime)
+            } else {
+                SlotPolicy::for_strategy(slot)
+            };
+            let valuations: BTreeMap<String, i64> = book
+                .positions
+                .iter()
+                .map(|position| {
+                    index_set
+                        .valuation(&position.symbol, day)
+                        .map(|price| (position.symbol.clone(), price))
+                        .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))
+                })
+                .collect::<StoreResult<_>>()?;
+            let orders = orders_for_day_in(
                 slot,
+                &policy,
                 &book.positions,
                 &signals,
                 budget,
                 book.cash_cents,
                 &closes,
+                &valuations,
                 &book.sellable,
             );
             for order in orders {
@@ -1022,27 +1223,24 @@ impl Store {
     ) -> StoreResult<AccountView> {
         let books = self.books(&spec.account_id)?;
         let weights = self.weights(&spec.account_id)?;
-        let initial_budgets = initial_split(spec.initial_cash_cents)?;
-        let prices = set.zip(day).map(|(set, day)| closes_for(set, day));
+        let prices = set.zip(day);
+        let market_values = match prices.as_ref() {
+            Some((set, day)) => [
+                Some(crate::domain::market_value_from_set(&books[0], set, day)?),
+                Some(crate::domain::market_value_from_set(&books[1], set, day)?),
+            ],
+            None => [None, None],
+        };
+        let mark = day.zip(market_values[0].zip(market_values[1])).map(|(day, (steady, aggressive))| {
+            (day, [books[0].cash_cents + steady, books[1].cash_cents + aggressive])
+        });
+        let performance = self.account_performance(spec, mark)?;
         let mut slots = Vec::new();
         let mut positions = Vec::new();
         for (index, book) in books.iter().enumerate() {
-            let market_value = prices.as_ref().and_then(|prices| {
-                book.positions
-                    .iter()
-                    .try_fold(0i64, |total, position| {
-                        prices
-                            .get(&position.symbol)
-                            .map(|price| total + price * position.quantity)
-                    })
-            });
-            // Every slot starts from exactly half of the principal. Report
-            // cumulative P&L against that original budget. Later cash
-            // transfers only resize the risk budget, so using the live
-            // weight here would make one slot look profitable merely because
-            // capital was moved to it, while the other would look impaired.
-            let budget = initial_budgets[index].cash_cents;
-            let history = series(&self.conn, &spec.account_id, book.slot)?;
+            let market_value = market_values[index];
+            let last = performance[index + 1].last();
+            let current_performance = mark.and(last);
             slots.push(SlotView {
                 slot: book.slot,
                 name: book.slot.name().into(),
@@ -1051,14 +1249,14 @@ impl Store {
                 cash_cents: book.cash_cents,
                 market_value_cents: market_value,
                 equity_cents: market_value.map(|value| book.cash_cents + value),
-                profit_cents: market_value.map(|value| book.cash_cents + value - budget),
-                return_bps: market_value.map(|value| {
-                    (book.cash_cents + value - budget) * 10_000 / budget.max(1)
-                }),
-                drawdown_bps: (!history.is_empty()).then_some(drawdown_bps(&history, budget)),
+                profit_cents: current_performance.map(|point| point.profit_cents),
+                return_bps: current_performance.map(|point| point.return_bps),
+                drawdown_bps: last.map(|point| point.max_drawdown_bps),
             });
             for position in &book.positions {
-                let close = prices.as_ref().and_then(|map| map.get(&position.symbol).copied());
+                let close = prices
+                    .as_ref()
+                    .and_then(|(set, day)| set.valuation(&position.symbol, day));
                 positions.push(PositionView {
                     slot: book.slot,
                     symbol: position.symbol.clone(),
@@ -1232,21 +1430,26 @@ fn validate_day(set: &PriceSet, day: &str) -> StoreResult<()> {
     Ok(())
 }
 
-fn closes_for(set: &PriceSet, day: &str) -> BTreeMap<String, i64> {
-    set.entries
-        .iter()
-        .filter(|entry| entry.day == day)
-        .map(|entry| (entry.symbol.clone(), entry.price_cents))
-        .collect()
-}
-
-/// Same as `closes_for` but served from the day index instead of a full scan.
+/// One day's tradable closes, served from the day index instead of a full scan.
 ///
 /// A whole-market set is ~4M entries; rebuilding a day's close map by scanning
 /// all of them, once per trading day settled, is the difference between a
 /// settlement pass that finishes and one that does not.
 fn closes_for_indexed(index: &IndexedPriceSet, day: &str) -> BTreeMap<String, i64> {
-    index.closes_on(day)
+    index.tradable_closes_on(day)
+}
+
+/// Classify the broad market as of `day`, from the same snapshot the
+/// strategies settle against.
+///
+/// The lookback is bounded by `REGIME_LOOKBACK_DAYS`. Both moving averages are
+/// computed from trailing means, so history older than the slow window cannot
+/// change the answer -- but the window is twice the slow average so the index
+/// has enough points to average over even when a slice of the market is
+/// missing on some days.
+fn regime_for_day(index: &IndexedPriceSet, day: &str) -> RegimeView {
+    let by_symbol = index.recent_closes(day, REGIME_LOOKBACK_DAYS);
+    classify_series(&by_symbol)
 }
 
 fn value_book_indexed(
@@ -1257,7 +1460,7 @@ fn value_book_indexed(
     let mut market = 0i64;
     for position in &book.positions {
         let price = index
-            .contains(&position.symbol, day)
+            .valuation(&position.symbol, day)
             .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
         market = market
             .checked_add(price * position.quantity)
@@ -1272,7 +1475,7 @@ fn value_book(book: &SlotBook, set: &PriceSet, day: &str) -> StoreResult<i64> {
     let mut market = 0i64;
     for position in &book.positions {
         let price = set
-            .contains(&position.symbol, day)
+            .valuation(&position.symbol, day)
             .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
         market = market
             .checked_add(price * position.quantity)
@@ -1382,18 +1585,6 @@ fn settled_days(conn: &Connection, account_id: &str) -> StoreResult<Vec<String>>
     Ok(days)
 }
 
-fn series(conn: &Connection, account_id: &str, slot: StrategyId) -> StoreResult<Vec<i64>> {
-    let mut statement = conn.prepare(
-        "SELECT equity_cents FROM slot_equity_day WHERE account_id=? AND slot=? ORDER BY day",
-    )?;
-    let rows = statement.query_map(params![account_id, slot_name(slot)], |row| row.get(0))?;
-    let mut values = Vec::new();
-    for row in rows {
-        values.push(row?);
-    }
-    Ok(values)
-}
-
 fn series_until(
     conn: &Connection,
     account_id: &str,
@@ -1463,6 +1654,9 @@ pub struct Bar {
     /// (V1 archive). Never mix the two in one series.
     pub adjust: String,
     pub source: String,
+    /// A real close that may fill an order. A halted row carries the official
+    /// reference previous close in `close_cents` and must be valued only.
+    pub tradable: bool,
 }
 
 impl Bar {
@@ -1507,6 +1701,7 @@ fn read_bar(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bar> {
         amount_cents: row.get(9)?,
         adjust: row.get(10)?,
         source: row.get(11)?,
+        tradable: row.get(12)?,
     })
 }
 
@@ -1591,6 +1786,7 @@ mod tests {
             amount_cents: close * 1_000,
             adjust: "none".into(),
             source: "tdx".into(),
+            tradable: true,
         }
     }
 
@@ -1609,6 +1805,31 @@ mod tests {
         assert_eq!(stored[1].close_cents, 1_020);
         assert_eq!(store.bar_symbol_count("2026-11-10").unwrap(), 2);
         assert_eq!(store.bar_days().unwrap(), vec!["2026-11-10".to_string()]);
+    }
+
+    #[test]
+    fn research_open_is_read_only_and_pins_one_market_snapshot() {
+        let path = temp_db("research-read-only");
+        let mut writer = Store::open(&path).unwrap();
+        writer.upsert_bars(&[bar("600000.SH", "2026-11-10", 1000, 1000)]).unwrap();
+        let mut reader = Store::open_market_read_only(&path).unwrap();
+        writer.upsert_bars(&[bar("600000.SH", "2026-11-11", 1001, 1000)]).unwrap();
+        assert_eq!(reader.unadjusted_bar_days().unwrap(), ["2026-11-10"]);
+        assert!(reader.create_account(spec()).is_err());
+        assert!(reader.upsert_bars(&[bar("000001.SZ", "2026-11-10", 1000, 1000)]).is_err());
+        assert!(writer.account().unwrap().is_none());
+        assert_eq!(writer.bar_days().unwrap().len(), 2);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn research_open_does_not_create_missing_database() {
+        let path = temp_db("research-missing");
+        assert!(!path.exists());
+        assert!(Store::open_market_read_only(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1733,6 +1954,51 @@ mod tests {
     }
 
     #[test]
+    fn legacy_tdx_halts_are_classified_once_when_tradable_is_added() {
+        let path = temp_db("legacy-halt-classification");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE bar(
+                    symbol TEXT NOT NULL, day TEXT NOT NULL, name TEXT NOT NULL,
+                    open_cents INTEGER NOT NULL, high_cents INTEGER NOT NULL,
+                    low_cents INTEGER NOT NULL, close_cents INTEGER NOT NULL,
+                    prev_close_cents INTEGER NOT NULL, volume_shares INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL, adjust TEXT NOT NULL, source TEXT NOT NULL,
+                    PRIMARY KEY(symbol, day));
+                INSERT INTO bar VALUES
+                    ('000007.SZ','2026-11-10','halt',0,0,0,480,474,0,0,'none','tdx'),
+                    ('000008.SZ','2026-11-10','no-ref',0,0,0,480,0,0,0,'none','tdx'),
+                    ('600000.SH','2026-11-10','traded',1000,1020,990,1020,1010,100,102000,'none','tdx'),
+                    ('600001.SH','2026-11-10','adjusted',0,0,0,480,474,0,0,'qfq','v1-qfq');
+                "#,
+            ).unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let rows = store.bars_for_day("2026-11-10").unwrap();
+        assert_eq!((rows[0].close_cents, rows[0].tradable), (474, false));
+        assert_eq!((rows[1].close_cents, rows[1].tradable), (0, false));
+        assert_eq!((rows[2].close_cents, rows[2].tradable), (1020, true));
+        assert_eq!((rows[3].close_cents, rows[3].tradable), (480, true));
+        let prices = store.unadjusted_closes("2026-11-10").unwrap();
+        assert!(prices.iter().any(|(symbol, _, price, tradable)|
+            symbol == "000007.SZ" && *price == 474 && !tradable));
+        assert!(!prices.iter().any(|(symbol, _, _, _)| symbol == "000008.SZ"));
+
+        let mut explicit = bar("600000.SH", "2026-11-10", 1020, 1010);
+        explicit.tradable = false;
+        store.upsert_bars(&[explicit]).unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let rows = reopened.bars_for_day("2026-11-10").unwrap();
+        assert_eq!((rows[0].close_cents, rows[0].tradable), (474, false));
+        assert!(!rows[2].tradable);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn bar_change_bps_is_signed_and_guards_zero_prev() {
         assert_eq!(bar("x.SH", "d", 1_100, 1_000).change_bps(), 1_000);
         assert_eq!(bar("x.SH", "d", 900, 1_000).change_bps(), -1_000);
@@ -1776,6 +2042,7 @@ mod tests {
                     price_cents: close,
                     source: "offline-test".into(),
                     observed_at: format!("{}T15:00:00+08:00", day(index)),
+                    tradable: true,
                 });
             }
         }
@@ -1813,6 +2080,7 @@ mod tests {
                     price_cents: close,
                     source: "offline-test".into(),
                     observed_at: format!("{}T15:00:00+08:00", day(index)),
+                    tradable: true,
                 });
             }
         }
@@ -1953,7 +2221,7 @@ mod tests {
                 .positions
                 .iter()
                 .map(|position| {
-                    set.contains(&position.symbol, &applied_day).unwrap() * position.quantity
+                    set.valuation(&position.symbol, &applied_day).unwrap() * position.quantity
                 })
                 .sum::<i64>();
             expected[slot_index] = book.cash_cents + market;
@@ -1973,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_profit_uses_original_budget_and_sums_to_account_profit() {
+    fn slot_profit_excludes_cash_transfers_and_sums_to_account_profit() {
         let mut store = store();
         let set = split_price_set(75);
         store.advance(&spec(), &set, &day(66), None).unwrap();
@@ -1990,9 +2258,59 @@ mod tests {
                 slot.weight_bps, 5_000,
                 "the rebalance must resize a slot for this regression to be meaningful"
             );
-            let expected = slot.equity_cents.unwrap() - spec().initial_cash_cents / 2;
+            let net_flow: i64 = view.rebalances.iter().map(|item| {
+                if item.to == slot.slot { item.moved_cents } else { -item.moved_cents }
+            }).sum();
+            assert_ne!(net_flow, 0);
+            let expected = slot.equity_cents.unwrap() - spec().initial_cash_cents / 2 - net_flow;
             assert_eq!(slot.profit_cents, Some(expected));
         }
+    }
+
+    #[test]
+    fn account_view_propagates_a_missing_held_quote() {
+        let mut store = store();
+        let mut set = price_set(90);
+        let as_of = day(70);
+        store.run_day(&spec(), &set, &as_of).unwrap();
+        let held = store.books("test-account").unwrap().into_iter()
+            .flat_map(|book| book.positions).next().expect("fixture has a position").symbol;
+        set.entries.retain(|entry| entry.day != as_of || entry.symbol != held);
+        let error = store.view(&spec(), Some(&set), Some(&as_of)).unwrap_err();
+        assert!(matches!(error, StoreError::Rules(RuleError(ref message)) if message == "missing_close_price"));
+    }
+
+    #[test]
+    fn a_cash_transfer_alone_does_not_create_strategy_profit_or_drawdown() {
+        let store = store();
+        for (index, equities) in [[5_000_000, 5_000_000], [6_000_000, 4_000_000]].iter().enumerate() {
+            for (slot, equity) in ["steady", "aggressive"].into_iter().zip(equities) {
+                store.conn.execute(
+                    "INSERT INTO slot_equity_day VALUES(?,?,?,?)",
+                    params!["test-account", slot, day(index), equity],
+                ).unwrap();
+            }
+        }
+        store.conn.execute(
+            "INSERT INTO rebalance(account_id,old_steady_bps,old_aggressive_bps,new_steady_bps,new_aggressive_bps,moved_cents,reason,applied_day) VALUES(?,5000,5000,6000,4000,1000000,'test',?)",
+            params!["test-account", day(1)],
+        ).unwrap();
+        store.conn.execute("UPDATE slot SET cash_cents=6000000 WHERE slot='steady'", []).unwrap();
+        store.conn.execute("UPDATE slot SET cash_cents=4000000 WHERE slot='aggressive'", []).unwrap();
+        let view = store.view(&spec(), Some(&price_set(2)), Some(&day(1))).unwrap();
+        for slot in view.slots {
+            assert_eq!(slot.profit_cents, Some(0));
+            assert_eq!(slot.return_bps, Some(0));
+            assert_eq!(slot.drawdown_bps, Some(0));
+        }
+        let curves = store.account_performance(&spec(), None).unwrap();
+        assert!(curves.iter().flatten().all(|point| point.return_bps == 0));
+        // Revaluing the settled date must retain its flow, not count it twice.
+        assert_eq!(curves, store.account_performance(&spec(), Some((&day(1), [6_000_000, 4_000_000]))).unwrap());
+        let later = store.account_performance(&spec(), Some((&day(2), [6_600_000, 4_000_000]))).unwrap();
+        assert_eq!(later[1].last().unwrap().profit_cents, 600_000);
+        assert_eq!(later[1].last().unwrap().return_bps, 1_000);
+        assert_eq!(store.equity_curve("test-account").unwrap().len(), 2);
     }
 
     #[test]

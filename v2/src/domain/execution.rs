@@ -64,7 +64,7 @@ pub fn closing_prices(
     let mut prices = BTreeMap::new();
     for symbol in symbols {
         let price = set
-            .contains(symbol, day)
+            .tradable_close(symbol, day)
             .ok_or_else(|| RuleError("missing_close_price".into()))?;
         prices.insert(symbol.clone(), price);
     }

@@ -6,6 +6,7 @@ mod contract;
 mod execution;
 mod instrument;
 mod market;
+mod regime;
 mod strategy;
 mod valuation;
 
@@ -19,6 +20,7 @@ pub use contract::*;
 pub use execution::*;
 pub use instrument::*;
 pub use market::*;
+pub use regime::*;
 pub use strategy::*;
 pub use valuation::*;
 

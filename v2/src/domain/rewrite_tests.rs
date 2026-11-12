@@ -41,6 +41,7 @@ fn bars(values: &[i64]) -> Vec<Bar> {
             day: format!("2026-04-{:02}", index + 1),
             close_cents: *close,
             volume: 1,
+            tradable: true,
         })
         .collect()
 }
@@ -168,6 +169,7 @@ fn stop_loss_exits_inside_the_holding_period() {
         book.cash_cents,
         book.cash_cents,
         &closes,
+        &closes,
         &book.sellable,
     );
     assert_eq!(orders.len(), 1);
@@ -188,6 +190,7 @@ fn a_small_drawdown_inside_the_holding_period_does_not_exit() {
         &[strong("600000.SH")],
         book.cash_cents,
         book.cash_cents,
+        &closes,
         &closes,
         &book.sellable,
     );
@@ -286,6 +289,7 @@ fn strategy_exit_uses_only_the_sellable_quantity() {
         book.cash_cents,
         book.cash_cents,
         &closes,
+        &closes,
         &book.sellable,
     );
     assert!(closed.is_empty());
@@ -298,11 +302,98 @@ fn strategy_exit_uses_only_the_sellable_quantity() {
         book.cash_cents,
         book.cash_cents,
         &closes,
+        &closes,
         &book.sellable,
     );
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].side, "sell");
     assert_eq!(closed[0].quantity, 100);
+}
+
+#[test]
+fn a_halted_position_is_not_sold_without_a_tradable_close() {
+    let mut book = book();
+    apply_buy(&mut book, "600000.SH", 100, 1_000, 5, "2026-10-30").unwrap();
+    settle_overnight(&mut book).unwrap();
+    // The halted row has an official reference close for valuation, but no
+    // fillable close today. The exit signal must wait for a trading day.
+    let closes = BTreeMap::new();
+    let valuations = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
+    let orders = orders_for_day(
+        StrategyId::Steady,
+        &book.positions,
+        &[weak("600000.SH")],
+        book.cash_cents,
+        book.cash_cents,
+        &closes,
+        &valuations,
+        &book.sellable,
+    );
+    assert!(orders.is_empty(), "a halt must not emit an unfillable sell");
+}
+
+#[test]
+fn a_halted_position_still_occupies_its_slot_budget() {
+    let mut book = book();
+    book.cash_cents = 5_000_000;
+    apply_buy(&mut book, "000001.SZ", 500, 1_000, 5, "2026-10-30").unwrap();
+    settle_overnight(&mut book).unwrap();
+    let cash_after_buy = book.cash_cents;
+    // 000001.SZ is halted today: only its valuation mark exists. The slot's
+    // 15% target leaves 250,000 cents of room; the halted 500,000 cents must
+    // still count as held, or the new buy would overshoot the target.
+    let closes = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
+    let valuations = BTreeMap::from([
+        ("000001.SZ".to_string(), 1_000),
+        ("600000.SH".to_string(), 1_000),
+    ]);
+    let orders = orders_for_day(
+        StrategyId::Steady,
+        &book.positions,
+        &[strong("600000.SH")],
+        5_000_000,
+        cash_after_buy,
+        &closes,
+        &valuations,
+        &book.sellable,
+    );
+    assert!(
+        orders.is_empty(),
+        "a 250,000-cent order is below the 300,000-cent entry floor; \
+         the halted position must reduce the room instead of being treated as cash"
+    );
+}
+
+#[test]
+fn a_halted_bar_never_changes_the_score() {
+    let trading: Vec<_> = (0..61)
+        .map(|index| {
+            let mut bar = Bar {
+                symbol: "600000.SH".into(),
+                day: format!("2026-04-{:02}", index + 1),
+                close_cents: 1_000 + index * 2,
+                volume: 1,
+                tradable: true,
+            };
+            if index == 60 {
+                bar.close_cents = 1_120;
+            }
+            bar
+        })
+        .collect();
+    let expected = score_registered("steady-v1", &trading).unwrap();
+    let mut with_reference = trading;
+    with_reference.push(Bar {
+        symbol: "600000.SH".into(),
+        day: "2026-06-01".into(),
+        close_cents: 9_999,
+        volume: 0,
+        tradable: false,
+    });
+    assert_eq!(
+        score_registered("steady-v1", &with_reference).unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -320,6 +411,7 @@ fn strategy_does_not_buy_with_cash_reserved_for_the_cash_floor() {
         &[strong("600000.SH")],
         book.cash_cents,
         book.cash_cents,
+        &closes,
         &closes,
         &book.sellable,
     );
@@ -344,6 +436,7 @@ fn a_position_too_small_to_clear_commission_is_not_opened() {
         &[strong("600000.SH")],
         book.cash_cents,
         book.cash_cents,
+        &closes,
         &closes,
         &book.sellable,
     );
@@ -372,6 +465,7 @@ fn a_position_stays_put_while_the_score_is_in_the_neutral_band() {
             book.cash_cents,
             book.cash_cents,
             &closes,
+            &closes,
             &book.sellable,
         );
         assert!(orders.is_empty(), "{label} must not trigger an exit");
@@ -384,6 +478,7 @@ fn a_position_stays_put_while_the_score_is_in_the_neutral_band() {
         &[weak("600000.SH")],
         book.cash_cents,
         book.cash_cents,
+        &closes,
         &closes,
         &book.sellable,
     );
@@ -404,6 +499,7 @@ fn buy_plan_leaves_room_for_the_minimum_commission() {
         &[strong("600000.SH")],
         1_000_000,
         book.cash_cents,
+        &closes,
         &closes,
         &book.sellable,
     );
@@ -431,6 +527,7 @@ fn price_set_validation_rejects_non_reviewed_duplicates_and_bad_days() {
             price_cents: 1_000,
             source: "reviewed-source".into(),
             observed_at: "2026-10-30T15:00:00+08:00".into(),
+            tradable: true,
         }],
         source_digest: "a".repeat(64),
     };
@@ -466,6 +563,7 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 price_cents: 1_000,
                 source: "reviewed-source".into(),
                 observed_at: "2026-10-30T15:00:00+08:00".into(),
+                tradable: true,
             },
             PriceEntry {
                 symbol: "600000.SH".into(),
@@ -473,6 +571,7 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 price_cents: 1_010,
                 source: "reviewed-source".into(),
                 observed_at: "2026-11-02T15:00:00+08:00".into(),
+                tradable: true,
             },
             PriceEntry {
                 symbol: "000001.SZ".into(),
@@ -480,6 +579,7 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 price_cents: 1_100,
                 source: "reviewed-source".into(),
                 observed_at: "2026-10-30T15:00:00+08:00".into(),
+                tradable: true,
             },
         ],
         source_digest: "c".repeat(64),
@@ -491,6 +591,7 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
         price_cents: 1_110,
         source: "reviewed-source".into(),
         observed_at: "2026-11-02T15:00:00+08:00".into(),
+        tradable: true,
     });
     set.validate().unwrap();
 }
@@ -505,7 +606,212 @@ fn missing_close_price_fails_the_whole_valuation() {
 }
 
 #[test]
+fn halted_price_set_valuations_use_the_reference_close_and_still_fail_when_absent() {
+    let mut book = book();
+    apply_buy(&mut book, "600000.SH", 100, 1_000, 5, "2026-11-02").unwrap();
+    let halted = BarRow {
+        symbol: "600000.SH".into(),
+        day: "2026-11-03".into(),
+        price_cents: 995,
+        tradable: false,
+    };
+    let set = PriceSet::from_bars(&[halted], "halted", "2026-11-03", "2026-11-03");
+    set.validate().expect("a halt is a complete one-day row");
+    assert_eq!(set.tradable_close("600000.SH", "2026-11-03"), None);
+    assert_eq!(set.valuation("600000.SH", "2026-11-03"), Some(995));
+    assert_eq!(
+        market_value_from_set(&book, &set, "2026-11-03").unwrap(),
+        99_500
+    );
+    assert_eq!(
+        market_value_from_set(&book, &set, "2026-11-04")
+            .unwrap_err()
+            .0,
+        "missing_close_price"
+    );
+}
+
+#[test]
 fn drawdown_uses_running_peak() {
     assert_eq!(drawdown_bps(&[100, 120, 90, 130, 117], 100), 2_500);
     assert_eq!(drawdown_bps(&[], 100), 0);
+}
+
+// --- Market regime applied to the slots -------------------------------
+
+#[test]
+fn steady_is_not_rewritten_by_the_market_regime() {
+    // The steady score already demands a trend and low volatility per symbol.
+    // Gating it again would double-count and stop it trading for no reason.
+    for regime in [
+        MarketRegime::Trending,
+        MarketRegime::Choppy,
+        MarketRegime::Declining,
+        MarketRegime::Unknown,
+    ] {
+        let policy = SlotPolicy::for_strategy_in(StrategyId::Steady, regime);
+        assert_eq!(policy.entry_score, ENTRY_SCORE, "{regime:?}");
+        assert!(policy.allow_entries, "{regime:?}");
+        assert_eq!(policy.target_weight_bps, 1_500, "{regime:?}");
+        assert_eq!(policy.max_positions, 3, "{regime:?}");
+    }
+}
+
+#[test]
+fn trending_keeps_the_aggressive_baseline() {
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Trending);
+    let baseline = SlotPolicy::for_strategy(StrategyId::Aggressive);
+    assert_eq!(policy.entry_score, baseline.entry_score);
+    assert!(policy.allow_entries);
+    assert_eq!(policy.target_weight_bps, baseline.target_weight_bps);
+    assert_eq!(policy.max_positions, baseline.max_positions);
+}
+
+#[test]
+fn choppy_raises_the_entry_bar_and_shrinks_exposure() {
+    for regime in [MarketRegime::Choppy, MarketRegime::Unknown] {
+        let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, regime);
+        assert_eq!(policy.entry_score, CHOPPY_ENTRY_SCORE, "{regime:?}");
+        assert!(policy.entry_score > ENTRY_SCORE, "{regime:?}");
+        assert!(policy.allow_entries, "{regime:?}");
+        assert!(policy.target_weight_bps < 3_000, "{regime:?}");
+        assert!(policy.max_positions < 3, "{regime:?}");
+        // The exit band is untouched: the slot still leaves on the same
+        // evidence, it just stops adding.
+        assert_eq!(policy.stop_loss_bps, 700, "{regime:?}");
+    }
+}
+
+#[test]
+fn declining_blocks_entries_but_keeps_the_stop() {
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Declining);
+    assert!(!policy.allow_entries);
+    assert_eq!(policy.stop_loss_bps, 700);
+}
+
+#[test]
+fn a_declining_market_refuses_new_entries_even_on_a_strong_score() {
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Declining);
+    let signals = vec![strong("600000.SH")];
+    let closes = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive,
+        &policy,
+        &[],
+        &signals,
+        1_000_000,
+        1_000_000,
+        &closes,
+        &closes,
+        &[],
+    );
+    assert!(orders.is_empty(), "no entries in a declining market");
+}
+
+#[test]
+fn choppy_still_enters_on_a_score_above_the_raised_bar() {
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Choppy);
+    let closes = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
+    // Exactly at the old threshold: refused, the bar moved.
+    let marginal = vec![scored("600000.SH", ENTRY_SCORE + 5)];
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive,
+        &policy,
+        &[],
+        &marginal,
+        1_000_000,
+        1_000_000,
+        &closes,
+        &closes,
+        &[],
+    );
+    assert!(orders.is_empty(), "a marginal break is not worth taking in a range");
+
+    // Comfortably above the raised bar: taken. The budget is large enough
+    // that the reduced 20% weight still clears `min_entry_cents`; in a choppy
+    // market a small slot correctly skips the order as not worth the
+    // commission, which is covered separately.
+    let strong_signal = vec![scored("600000.SH", CHOPPY_ENTRY_SCORE + 10)];
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive,
+        &policy,
+        &[],
+        &strong_signal,
+        10_000_000,
+        10_000_000,
+        &closes,
+        &closes,
+        &[],
+    );
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].side, "buy");
+}
+
+#[test]
+fn choppy_still_exits_a_position_whose_score_turned() {
+    // The raised entry bar must not raise the exit bar: getting out is not
+    // subject to a regime filter.
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Choppy);
+    let mut book = book();
+    apply_buy(&mut book, "600000.SH", 100, 1_000, 5, "2026-10-30").unwrap();
+    settle_overnight(&mut book).unwrap();
+    let closes = BTreeMap::from([("600000.SH".to_string(), 1_010)]);
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive,
+        &policy,
+        &book.positions,
+        &[weak("600000.SH")],
+        book.cash_cents,
+        book.cash_cents,
+        &closes,
+        &closes,
+        &book.sellable,
+    );
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].side, "sell");
+}
+
+#[test]
+fn declining_still_runs_the_hard_stop() {
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Declining);
+    let mut book = book();
+    apply_buy(&mut book, "600000.SH", 100, 1_000, 5, "2026-10-30").unwrap();
+    settle_overnight(&mut book).unwrap();
+    // 8% below cost: past the aggressive 7% stop, but the score is neutral.
+    let closes = BTreeMap::from([("600000.SH".to_string(), 920)]);
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive,
+        &policy,
+        &book.positions,
+        &[neutral("600000.SH")],
+        book.cash_cents,
+        book.cash_cents,
+        &closes,
+        &closes,
+        &book.sellable,
+    );
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].reason, "stop_loss");
+}
+
+#[test]
+fn choppy_small_slot_skips_an_order_that_cannot_pay_its_commission() {
+    // A 20% weight on a 10,000 CNY slot is 2,000 CNY, under the 3,000 CNY
+    // minimum entry. Placing it would pay the 5 CNY commission floor on a
+    // position too small to earn it back, so the slot correctly stands aside.
+    let policy = SlotPolicy::for_strategy_in(StrategyId::Aggressive, MarketRegime::Choppy);
+    let closes = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
+    let signals = vec![scored("600000.SH", CHOPPY_ENTRY_SCORE + 10)];
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive,
+        &policy,
+        &[],
+        &signals,
+        1_000_000,
+        1_000_000,
+        &closes,
+        &closes,
+        &[],
+    );
+    assert!(orders.is_empty());
 }

@@ -94,7 +94,7 @@ print("600000.SH closes:", [b["close_cents"] for b in payload["bars"]])
 PY
 
 echo "== /v2/market/gaps =="
-GAPS=$(curl -fsS "http://127.0.0.1:$PORT/v2/market/gaps?day=2026-11-10")
+GAPS=$(curl -fsS "http://127.0.0.1:$PORT/v2/market/gaps?day=2026-11-10&threshold_bps=1100")
 python - "$GAPS" <<'PY'
 import json, sys
 payload = json.loads(sys.argv[1])

@@ -83,6 +83,7 @@ class Row:
     prev_close_cents: int
     volume_shares: int
     amount_cents: int
+    tradable: bool
 
     def change_bps(self) -> int:
         """Change from previous close in basis points; 0 when prev close absent."""
@@ -162,11 +163,33 @@ def parse_package(content: bytes, ymd: str) -> list[Row]:
                 raise IngestError("package_non_finite", f"{market}{code}")
             if close <= 0:
                 # Indices and TDX-internal board codes carry an all-zero block.
-                continue
-            priced += 1
-            if not is_ordinary_a_share(market, code):
-                continue
-            volume = struct.unpack("<Q", block[56:64])[0]
+                # A halted ordinary A-share is different: the quote block is
+                # zero, but the package still carries the official previous
+                # close. Keep that row as valuation-only instead of dropping it.
+                if not is_ordinary_a_share(market, code) or prev_close <= 0:
+                    continue
+                close = prev_close
+                open_ = high = low = 0.0
+                amount = 0.0
+                volume = 0
+                tradable = False
+            else:
+                priced += 1
+                if not is_ordinary_a_share(market, code):
+                    continue
+                volume = struct.unpack("<Q", block[56:64])[0]
+                # A positive close with no volume and all-zero open/high/low is
+                # a carried quote, not a fill. The official previous close is
+                # the only price that may value an existing position.
+                if volume == 0 and open_ == 0 and high == 0 and low == 0:
+                    if prev_close <= 0:
+                        continue
+                    close = prev_close
+                    open_ = high = low = 0.0
+                    amount = 0.0
+                    tradable = False
+                else:
+                    tradable = True
             raw_name = record[40:72].split(b"\x00")[0]
             try:
                 name = raw_name.decode("gbk").strip()
@@ -187,6 +210,7 @@ def parse_package(content: bytes, ymd: str) -> list[Row]:
                     prev_close_cents=_cents(prev_close),
                     volume_shares=volume,
                     amount_cents=int(round(amount * 100)),
+                    tradable=tradable,
                 )
             )
         # The floor is checked on *priced* rows (bonds, funds, indices included)
@@ -225,14 +249,14 @@ def fetch_package(day: str, *, timeout: float = 90.0) -> bytes:
 
 INSERT_SQL = """
 INSERT INTO bar(symbol,day,name,open_cents,high_cents,low_cents,close_cents,
-                prev_close_cents,volume_shares,amount_cents,adjust,source)
-VALUES(?,?,?,?,?,?,?,?,?,?,'none','tdx')
+                prev_close_cents,volume_shares,amount_cents,adjust,source,tradable)
+VALUES(?,?,?,?,?,?,?,?,?,?,'none','tdx',?)
 ON CONFLICT(symbol,day) DO UPDATE SET
   name=excluded.name, open_cents=excluded.open_cents,
   high_cents=excluded.high_cents, low_cents=excluded.low_cents,
   close_cents=excluded.close_cents, prev_close_cents=excluded.prev_close_cents,
   volume_shares=excluded.volume_shares, amount_cents=excluded.amount_cents,
-  adjust=excluded.adjust, source=excluded.source
+  adjust=excluded.adjust, source=excluded.source, tradable=excluded.tradable
 """
 
 
@@ -244,7 +268,7 @@ def _write_prepared(connection: sqlite3.Connection, rows: list[Row]) -> int:
             (
                 r.symbol, r.day, r.name, r.open_cents, r.high_cents,
                 r.low_cents, r.close_cents, r.prev_close_cents,
-                r.volume_shares, r.amount_cents,
+                r.volume_shares, r.amount_cents, int(r.tradable),
             )
             for r in rows
         ],
@@ -262,12 +286,24 @@ def sync_schema(db_path: Path) -> None:
     try:
         have = {row[1] for row in connection.execute("PRAGMA table_info(bar)")}
         with connection:
+            # Keep column creation and the one-time classification atomic.
+            connection.execute("BEGIN")
             for name, ddl in (
                 ("adjust", "ALTER TABLE bar ADD COLUMN adjust TEXT NOT NULL DEFAULT 'none'"),
                 ("source", "ALTER TABLE bar ADD COLUMN source TEXT NOT NULL DEFAULT 'tdx'"),
+                ("tradable", "ALTER TABLE bar ADD COLUMN tradable INTEGER NOT NULL DEFAULT 1"),
             ):
                 if name not in have:
                     connection.execute(ddl)
+                    if name == "tradable":
+                        connection.execute("""
+                            UPDATE bar SET tradable=0,
+                                close_cents=CASE WHEN prev_close_cents>0
+                                    THEN prev_close_cents ELSE 0 END
+                            WHERE adjust='none' AND source='tdx'
+                                AND volume_shares=0 AND open_cents=0
+                                AND high_cents=0 AND low_cents=0
+                        """)
     finally:
         connection.close()
 

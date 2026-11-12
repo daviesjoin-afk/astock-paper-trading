@@ -15,6 +15,8 @@ export type CurvePoint = {
   equity_cents: number;
   steady_cents: number;
   aggressive_cents: number;
+  steady_return_bps: number;
+  aggressive_return_bps: number;
 };
 
 export type CurveSpec = {
@@ -43,9 +45,9 @@ export function moneyShort(cents: number): string {
 function valueOf(point: CurvePoint, series: CurveSpec["series"]): number {
   switch (series) {
     case "steady":
-      return point.steady_cents;
+      return point.steady_return_bps;
     case "aggressive":
-      return point.aggressive_cents;
+      return point.aggressive_return_bps;
     default:
       return point.equity_cents;
   }
@@ -64,7 +66,10 @@ export function renderCurve(spec: CurveSpec): string {
   }
 
   const values = points.map((point) => valueOf(point, series));
-  const baseline = series === "total" ? initialCents : initialCents / 2;
+  // Slot assets include capital transfers. Draw their API-provided returns
+  // instead, so moving cash cannot create a jump in a strategy's performance.
+  const baseline = series === "total" ? initialCents : 0;
+  const label = series === "total" ? moneyShort : (bps: number): string => `${(bps / 100).toFixed(2)}%`;
   const minValue = Math.min(...values, baseline);
   const maxValue = Math.max(...values, baseline);
   // Guard against a zero range (a single flat day) so the scale maths does not
@@ -116,9 +121,9 @@ export function renderCurve(spec: CurveSpec): string {
             text-anchor="end">${lastDay}</text>
     </svg>
     <div class="curve-scale">
-      <span>${moneyShort(minValue)}</span>
-      <span class="curve-scale-mid">起始 ${moneyShort(baseline)}</span>
-      <span>${moneyShort(maxValue)}</span>
+      <span>${label(minValue)}</span>
+      <span class="curve-scale-mid">${series === "total" ? "起始" : "剔除资金调配"} ${label(baseline)}</span>
+      <span>${label(maxValue)}</span>
     </div>
   `;
 }

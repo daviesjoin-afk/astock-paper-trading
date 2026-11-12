@@ -2,7 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Order, Position, RuleError};
+use super::{MarketRegime, Order, Position, RuleError};
+
+mod aggressive;
+mod steady;
+
+#[cfg(test)]
+mod library_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -12,6 +18,14 @@ pub enum StrategyId {
 }
 
 impl StrategyId {
+    /// The ledger slot stays fixed while its scoring algorithm has a library ID.
+    pub fn algorithm_id(self) -> &'static str {
+        match self {
+            StrategyId::Steady => steady::ID,
+            StrategyId::Aggressive => aggressive::ID,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             StrategyId::Steady => "稳健",
@@ -33,6 +47,8 @@ pub struct Bar {
     pub day: String,
     pub close_cents: i64,
     pub volume: i64,
+    /// A real close. Reference prices for halted symbols never enter scoring.
+    pub tradable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +56,15 @@ pub struct SlotPolicy {
     pub max_positions: usize,
     pub target_weight_bps: i64,
     pub min_cash_bps: i64,
+    /// Score needed to open a new position.
+    ///
+    /// Normally `ENTRY_SCORE`. A choppy market raises it, because the measured
+    /// problem there is not the number of signals but their quality: the same
+    /// rule that made +2% a month in a trend lost 3% a month in a range.
+    pub entry_score: i64,
+    /// Whether the slot may open anything at all today. A declining market
+    /// turns this off; exits and stops keep running.
+    pub allow_entries: bool,
     /// Smallest position worth opening, in cents.
     ///
     /// Commission is 3 bps with a 5 CNY floor, so a position smaller than
@@ -58,6 +83,7 @@ pub struct SlotPolicy {
 }
 
 impl SlotPolicy {
+    /// Baseline policy: what the slot does in a normal, tradeable tape.
     pub fn for_strategy(strategy: StrategyId) -> Self {
         match strategy {
             StrategyId::Steady => Self {
@@ -66,6 +92,8 @@ impl SlotPolicy {
                 min_cash_bps: 1_000,
                 min_entry_cents: 300_000,
                 stop_loss_bps: 1_200,
+                entry_score: ENTRY_SCORE,
+                allow_entries: true,
             },
             StrategyId::Aggressive => Self {
                 max_positions: 3,
@@ -73,8 +101,44 @@ impl SlotPolicy {
                 min_cash_bps: 500,
                 min_entry_cents: 300_000,
                 stop_loss_bps: 700,
+                entry_score: ENTRY_SCORE,
+                allow_entries: true,
             },
         }
+    }
+
+    /// Policy for a slot given what the broad market is doing.
+    ///
+    /// The steady slot is deliberately left alone. Its score already demands a
+    /// confirmed trend and falling volatility *per symbol*, which is the same
+    /// test a regime filter would apply at the market level -- gating it again
+    /// would double-count and simply stop it trading. The aggressive slot is a
+    /// pure breakout rule with no such self-filter, which is the one that
+    /// measured -51.5% through a range-bound year.
+    pub fn for_strategy_in(strategy: StrategyId, regime: MarketRegime) -> Self {
+        let mut policy = Self::for_strategy(strategy);
+        if strategy == StrategyId::Steady {
+            return policy;
+        }
+        match regime {
+            // A trend is exactly the tape a breakout rule is built for.
+            MarketRegime::Trending => {}
+            // Nothing is more expensive than a breakout that fails. Demand a
+            // much stronger score, take fewer names and carry less weight.
+            MarketRegime::Choppy | MarketRegime::Unknown => {
+                policy.entry_score = CHOPPY_ENTRY_SCORE;
+                policy.target_weight_bps = 2_000;
+                policy.max_positions = 2;
+            }
+            // No participation is the sum of "breakouts fail" and "losses
+            // run", so stop opening. Existing positions are still managed by
+            // the score and the stop, which is what gets them out.
+            MarketRegime::Declining => {
+                policy.allow_entries = false;
+                policy.target_weight_bps = 1_500;
+            }
+        }
+        policy
     }
 }
 
@@ -99,6 +163,20 @@ impl SignalScore {
     }
 }
 
+/// A deterministic close-price scoring algorithm, independent of a ledger slot.
+///
+/// Implementations receive at least 61 closes, oldest first, through
+/// `score_registered`. Position sizing, market filters and exits remain owned
+/// by `SlotPolicy` and `orders_for_day_in`.
+pub trait Strategy: Sync {
+    fn id(&self) -> &'static str;
+    fn score_closes(&self, closes: &[i64]) -> SignalScore;
+}
+
+/// Adding an algorithm here makes it available for explicit scoring; it does
+/// not bind another trading slot or enable it in the paper account.
+pub static STRATEGY_LIBRARY: &[&dyn Strategy] = &[&steady::Steady, &aggressive::Aggressive];
+
 /// Score below which an open position is closed, and below which a new one is
 /// not opened.
 ///
@@ -110,6 +188,15 @@ impl SignalScore {
 /// condition wobbles.
 pub const ENTRY_SCORE: i64 = 40;
 pub const EXIT_SCORE: i64 = -20;
+
+/// Entry score required of the aggressive slot while the market is choppy.
+///
+/// Raised from 40 to 60, which on the measured score distribution roughly
+/// halves the qualifying names. The intent is not "trade less" but "only take
+/// the ones that would have qualified anyway": a breakout that also carries
+/// mild momentum and a shallow run-up, rather than the marginal break that
+/// only worked while the tape was going up.
+pub const CHOPPY_ENTRY_SCORE: i64 = 60;
 
 /// Break past the prior 20-day high that still counts as fresh, in bps.
 ///
@@ -134,139 +221,26 @@ pub const MILD_RUN_UP_BPS: i64 = 930;
 /// that (a) the exit decision can differ from the entry decision, and (b) an
 /// eventual AI overlay has a real number to argue with instead of a boolean.
 pub fn score_signal(strategy: StrategyId, bars: &[Bar]) -> SignalScore {
-    let closes: Vec<i64> = bars.iter().map(|bar| bar.close_cents).collect();
+    score_registered(strategy.algorithm_id(), bars)
+        .expect("fixed slot algorithm must be registered")
+}
+
+/// Score an explicitly selected library algorithm. This is the one history
+/// boundary for all registered algorithms; longer histories are kept intact.
+pub fn score_registered(algorithm_id: &str, bars: &[Bar]) -> Result<SignalScore, RuleError> {
+    let algorithm = STRATEGY_LIBRARY
+        .iter()
+        .find(|algorithm| algorithm.id() == algorithm_id)
+        .ok_or_else(|| RuleError(format!("unknown_strategy:{algorithm_id}")))?;
+    let closes: Vec<i64> = bars
+        .iter()
+        .filter(|bar| bar.tradable)
+        .map(|bar| bar.close_cents)
+        .collect();
     if closes.len() < 61 {
-        return SignalScore::flat();
+        return Ok(SignalScore::flat());
     }
-    let latest = *closes.last().expect("non-empty");
-    match strategy {
-        StrategyId::Steady => steady_score(&closes),
-        StrategyId::Aggressive => aggressive_score(&closes, latest),
-    }
-}
-
-/// Trend above a rising average, and calm enough to be worth holding.
-fn steady_score(closes: &[i64]) -> SignalScore {
-    let ma20 = mean(&closes[closes.len() - 20..]);
-    let ma60 = mean(&closes[closes.len() - 60..]);
-    let recent_vol = volatility(&closes[closes.len() - 20..]);
-    let base_vol = median_volatility(closes);
-
-    // Trend: how far the 20-day average sits above the 60-day, in bps.
-    let trend = if ma60 > 0 {
-        (ma20 - ma60) * 10_000 / ma60
-    } else {
-        0
-    };
-    // Volatility: positive when recent volatility is BELOW the historical
-    // median (calm), negative when it is above.
-    let calm = if base_vol > 0 {
-        (base_vol - recent_vol) * 10_000 / base_vol
-    } else {
-        0
-    };
-
-    // Trend contributes up to ±50, calm up to ±30. A stock in a firm uptrend
-    // scores high even in choppy conditions; a stock that is merely quiet but
-    // going nowhere does not.
-    let mut score = 0;
-    score += (trend / 20).clamp(-50, 50);
-    score += (calm / 20).clamp(-30, 30);
-
-    let reason = if score >= ENTRY_SCORE {
-        "trend_and_low_volatility"
-    } else if score <= EXIT_SCORE {
-        "trend_broken"
-    } else {
-        "trend_flattening"
-    };
-    SignalScore { score, reason }
-}
-
-/// A fresh break past the prior 20-day high, not an extended chase.
-///
-/// Weights are calibrated against 197 real entries, each bucketed by quartile
-/// of the factor value and scored by the next 5 sessions' return:
-///
-///   5-day momentum   Q1 (+0.55%)  Q2 (-0.87%)  Q3 (-0.39%)  Q4 (-3.22%)
-///   breakout size    Q1 (+1.80%)  Q2 (-1.27%)  Q3 (-2.43%)  Q4 (-2.05%)
-///   20-day run-up    Q1 (+0.97%)  Q2 (-0.44%)  Q3 (-1.14%)  Q4 (-3.32%)
-///
-/// Every factor is monotonically *worse* as it gets larger. The only quarter
-/// with a clearly positive expectancy is a small, fresh break. So the score
-/// rewards "barely past the high" and punishes "already run", and the
-/// penalties are much steeper than the rewards -- being late is the expensive
-/// mistake, not being early.
-fn aggressive_score(closes: &[i64], latest: i64) -> SignalScore {
-    let momentum = latest - closes[closes.len() - 6];
-    let prior_high = closes[closes.len() - 21..closes.len() - 1]
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
-    if prior_high <= 0 {
-        return SignalScore::flat();
-    }
-
-    // Breakout size, in bps past the prior high. This is the dominant signal:
-    // it separates +1.80% from -2% on its own.
-    let breakout_bps = (latest - prior_high) * 10_000 / prior_high;
-    let breakout_score = if breakout_bps < 0 {
-        // Fell back below the prior high. Distance matters: a deep failure is
-        // worse than a marginal one.
-        (breakout_bps / 10).clamp(-70, 0)
-    } else if breakout_bps == 0 {
-        // Close exactly at the prior high: no break at all. Without this the
-        // "smallest break is best" scale would hand a flat market full marks.
-        0
-    } else if breakout_bps <= FRESH_BREAKOUT_BPS {
-        // A genuinely fresh break: the only positive-expectancy bucket.
-        // Best right at the high, tapering as the break extends.
-        60 - (breakout_bps * 30 / FRESH_BREAKOUT_BPS.max(1))
-    } else {
-        // Past the fresh band. Measured Q2-Q4 lost 1.3-2.4% over 5 days, so
-        // this is a penalty, not a smaller bonus.
-        -30 - ((breakout_bps - FRESH_BREAKOUT_BPS) / 8).clamp(0, 40)
-    };
-
-    // 5-day momentum. Q4 (over ~10%) lost 3.22%; Q1 (under ~3.4%) made 0.55%.
-    // Reward mild momentum, punish a spike.
-    let momentum_bps = momentum * 10_000 / prior_high;
-    let momentum_score = if momentum_bps < 0 {
-        (momentum_bps / 25).clamp(-40, 0)
-    } else if momentum_bps <= MILD_MOMENTUM_BPS {
-        (momentum_bps * 25 / MILD_MOMENTUM_BPS.max(1)).clamp(0, 25)
-    } else {
-        -((momentum_bps - MILD_MOMENTUM_BPS) / 40).clamp(0, 45)
-    };
-
-    // 20-day run-up off the low. Q1 (under ~9.3%) made 0.97%; Q4 (over ~21.8%)
-    // lost 3.32%. Matters most as a veto on chasing.
-    let recent_low = closes[closes.len() - 20..]
-        .iter()
-        .copied()
-        .min()
-        .unwrap_or(0);
-    let run_up_score = if recent_low > 0 {
-        let run_up_bps = (latest - recent_low) * 10_000 / recent_low;
-        if run_up_bps <= MILD_RUN_UP_BPS {
-            (run_up_bps * 20 / MILD_RUN_UP_BPS.max(1)).clamp(0, 20)
-        } else {
-            -((run_up_bps - MILD_RUN_UP_BPS) / 25).clamp(5, 50)
-        }
-    } else {
-        0
-    };
-
-    let score = breakout_score + momentum_score + run_up_score;
-    let reason = if score >= ENTRY_SCORE {
-        "fresh_breakout"
-    } else if score <= EXIT_SCORE {
-        "momentum_lost"
-    } else {
-        "momentum_stalling"
-    };
-    SignalScore { score, reason }
+    Ok(algorithm.score_closes(&closes))
 }
 
 /// Back-compat shim: `Some` when the score clears the entry threshold.
@@ -282,16 +256,52 @@ pub fn orders_for_day(
     budget_cents: i64,
     cash_cents: i64,
     closes: &std::collections::BTreeMap<String, i64>,
+    valuations: &std::collections::BTreeMap<String, i64>,
     sellable: &[super::Sellable],
 ) -> Vec<Order> {
-    let policy = SlotPolicy::for_strategy(strategy);
+    orders_for_day_in(
+        strategy,
+        &SlotPolicy::for_strategy(strategy),
+        positions,
+        signals,
+        budget_cents,
+        cash_cents,
+        closes,
+        valuations,
+        sellable,
+    )
+}
+
+/// Same as `orders_for_day`, with the policy supplied by the caller.
+///
+/// The policy carries the market-regime decision (`allow_entries`,
+/// `entry_score`) as well as the per-slot sizing rules, so the exit path and
+/// the sizing path stay in one place instead of being re-derived at the call
+/// site from a regime the caller happened to compute.
+#[allow(clippy::too_many_arguments)]
+pub fn orders_for_day_in(
+    strategy: StrategyId,
+    policy: &SlotPolicy,
+    positions: &[Position],
+    signals: &[(String, SignalScore)],
+    budget_cents: i64,
+    cash_cents: i64,
+    closes: &std::collections::BTreeMap<String, i64>,
+    valuations: &std::collections::BTreeMap<String, i64>,
+    sellable: &[super::Sellable],
+) -> Vec<Order> {
     let mut orders = Vec::new();
     let held: std::collections::BTreeSet<&str> =
         positions.iter().map(|item| item.symbol.as_str()).collect();
     let target = budget_cents * policy.target_weight_bps / 10_000;
     let mut used: i64 = positions
         .iter()
-        .filter_map(|item| closes.get(&item.symbol).map(|price| *price * item.quantity))
+        .map(|item| {
+            valuations
+                .get(&item.symbol)
+                .map(|price| price * item.quantity)
+                .expect("every held position must have a valuation")
+        })
         .sum();
     let cash_floor = budget_cents * policy.min_cash_bps / 10_000;
     // The target is based on the slot's marked equity, but an order can only
@@ -302,10 +312,15 @@ pub fn orders_for_day(
         .max(0);
     for (symbol, scored) in signals {
         // Enter only on a clearly positive score. The band between EXIT_SCORE
-        // and ENTRY_SCORE is deliberately inert: a condition sitting on its
-        // threshold would otherwise open and close the same position
-        // repeatedly.
-        if scored.score < ENTRY_SCORE || held.contains(symbol.as_str()) {
+        // and the entry threshold is deliberately inert: a condition sitting on
+        // its threshold would otherwise open and close the same position
+        // repeatedly. In a choppy market the entry threshold is raised, which
+        // narrows the entries without touching the exit band -- so the slot
+        // still leaves on the same evidence, it just stops adding.
+        if !policy.allow_entries
+            || scored.score < policy.entry_score
+            || held.contains(symbol.as_str())
+        {
             continue;
         }
         let pending = orders
@@ -382,7 +397,9 @@ pub fn orders_for_day(
                 exit_reason = Some("stop_loss");
             }
 
-            if let Some(reason) = exit_reason {
+            // A halt has a valuation mark but no fill. Do not emit a sell that
+            // settlement would have to reject for want of a tradable close.
+            if let Some(reason) = exit_reason.filter(|_| closes.contains_key(&position.symbol)) {
                 let can_sell = sellable
                     .iter()
                     .find(|item| item.symbol == position.symbol)

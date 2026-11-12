@@ -170,4 +170,45 @@ test.describe("single account with 稳健 and 激进", () => {
       );
     }
   });
+
+  test("strategy curves stay flat when only capital moves", async ({ page }, testInfo) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+    page.on("requestfailed", (request) => errors.push(request.url()));
+    await ensureAccount(page);
+    // Rendering fixture only: real settlement is covered by the preceding
+    // tests. Assets change with the transfer while API strategy returns stay 0.
+    await page.route("**/v2/account/equity-curve", (route) => route.fulfill({
+      json: {
+        account_id: "rendering-fixture", initial_cash_cents: 10_000_000,
+        points: [
+          { day: "2026-11-09", equity_cents: 10_000_000, steady_cents: 5_000_000, aggressive_cents: 5_000_000, steady_return_bps: 0, aggressive_return_bps: 0, profit_cents: 0, return_bps: 0 },
+          { day: "2026-11-10", equity_cents: 10_000_000, steady_cents: 6_000_000, aggressive_cents: 4_000_000, steady_return_bps: 0, aggressive_return_bps: 0, profit_cents: 0, return_bps: 0 },
+        ],
+        summary: {
+          first_day: "2026-11-09", last_day: "2026-11-10", days: 2,
+          equity_cents: 10_000_000, profit_cents: 0, return_bps: 0,
+          max_drawdown_bps: 0, peak_day: null, trough_day: null,
+          steady_cents: 6_000_000, aggressive_cents: 4_000_000,
+          steady_return_bps: 0, aggressive_return_bps: 0,
+        },
+      },
+    }));
+    await page.goto("/#/trading/account");
+    await expect(page.locator("#curve-summary")).toContainText("尚无回撤");
+    for (const series of ["steady", "aggressive"]) {
+      await page.locator(`.seg-btn[data-series="${series}"]`).click();
+      await expect(page.locator("#equity-chart .curve-scale")).toContainText("剔除资金调配 0.00%");
+      const path = await page.locator('#equity-chart path[fill="none"]').getAttribute("d");
+      const heights = [...(path ?? "").matchAll(/[ML][\d.]+,([\d.]+)/g)].map((match) => match[1]);
+      expect(heights).toHaveLength(2);
+      expect(new Set(heights).size).toBe(1);
+    }
+    await page.screenshot({ path: testInfo.outputPath("performance-desktop.png"), fullPage: true });
+    await page.setViewportSize({ width: 320, height: 720 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: testInfo.outputPath("performance-mobile.png"), fullPage: true });
+    expect(errors).toEqual([]);
+  });
 });

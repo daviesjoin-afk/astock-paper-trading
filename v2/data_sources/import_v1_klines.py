@@ -59,6 +59,7 @@ class Imported:
     amount_cents: int
     adjust: str
     source: str
+    tradable: bool
 
 
 def to_cents(value: str) -> int:
@@ -123,6 +124,7 @@ def read_symbol(path: Path, code: str) -> tuple[list[Imported], str]:
                     amount_cents=to_cents(record.get("amount") or "0"),
                     adjust="qfq",
                     source="v1-qfq",
+                    tradable=True,
                 )
             )
             prev_close = close_c
@@ -145,14 +147,14 @@ def manifest_adjustments(dir_path: Path) -> dict[str, str]:
 
 INSERT_SQL = """
 INSERT INTO bar(symbol,day,name,open_cents,high_cents,low_cents,close_cents,
-                prev_close_cents,volume_shares,amount_cents,adjust,source)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                prev_close_cents,volume_shares,amount_cents,adjust,source,tradable)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(symbol,day) DO UPDATE SET
   open_cents=excluded.open_cents, high_cents=excluded.high_cents,
   low_cents=excluded.low_cents, close_cents=excluded.close_cents,
   prev_close_cents=excluded.prev_close_cents,
   volume_shares=excluded.volume_shares, amount_cents=excluded.amount_cents,
-  adjust=excluded.adjust, source=excluded.source
+  adjust=excluded.adjust, source=excluded.source, tradable=excluded.tradable
 """
 
 
@@ -228,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                     row.symbol, row.day, name, row.open_cents, row.high_cents,
                     row.low_cents, row.close_cents, row.prev_close_cents,
                     row.volume_shares, row.amount_cents, kind, row.source,
+                    int(row.tradable),
                 )
             )
         total_rows += len(rows)

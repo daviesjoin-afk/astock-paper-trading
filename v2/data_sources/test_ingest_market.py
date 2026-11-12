@@ -6,8 +6,12 @@ All package bytes are synthesised here so the suite never touches the network.
 
 from __future__ import annotations
 
+from contextlib import closing
 import io
+from pathlib import Path
+import sqlite3
 import struct
+import tempfile
 import unittest
 import zipfile
 
@@ -16,24 +20,28 @@ from ingest_market import (
     _expand_days,
     is_ordinary_a_share,
     parse_package,
+    sync_schema,
 )
 
 
 def build_package(
     ymd: str,
-    markets: dict[str, list[tuple[str, str, float, float]]],
+    markets: dict[str, list[tuple[str, str, float, float]] | list[tuple[str, str, float, float, float]]],
 ) -> bytes:
     """Build a minimal but structurally valid daytime package.
 
     `markets` maps market -> list of (code, name, close, prev_close). A close
-    of 0 produces an all-zero block, the way TDX encodes indices.
+    of 0 produces an all-zero block, the way TDX encodes indices. A fifth
+    tuple value overrides the volume for a positive close.
     """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         for market, entries in markets.items():
             cod = bytearray()
             md1 = bytearray()
-            for seq, (code, name, close, prev_close) in enumerate(entries):
+            for seq, record_values in enumerate(entries):
+                code, name, close, prev_close = record_values[:4]
+                volume = record_values[4] if len(record_values) == 5 else 1000
                 record = bytearray(150)
                 record[0:6] = code.encode("ascii")
                 record[32:34] = struct.pack("<H", seq)
@@ -45,11 +53,14 @@ def build_package(
 
                 block = bytearray(512)
                 block[4:12] = struct.pack("<d", prev_close)
-                block[12:20] = struct.pack("<d", close)  # open
-                block[20:28] = struct.pack("<d", close)  # high
-                block[28:36] = struct.pack("<d", close)  # low
+                # A zero volume is the fixture for a carried quote: open, high
+                # and low stay zero while the positive close remains present.
+                quote = 0.0 if volume == 0 else close
+                block[12:20] = struct.pack("<d", quote)  # open
+                block[20:28] = struct.pack("<d", quote)  # high
+                block[28:36] = struct.pack("<d", quote)  # low
                 block[36:44] = struct.pack("<d", close)  # close
-                block[56:64] = struct.pack("<Q", 1000)  # volume
+                block[56:64] = struct.pack("<Q", volume)
                 block[72:80] = struct.pack("<d", 12345.67)  # amount
                 md1.extend(block)
             archive.writestr(f"{market}{ymd[2:]}.cod", bytes(cod))
@@ -161,6 +172,43 @@ class ParseTests(unittest.TestCase):
         rows = parse_package(content, "20261110")
         self.assertNotIn("688999.SH", {r.symbol for r in rows})
 
+    def test_zero_close_with_official_reference_is_valuation_only(self):
+        entries = big_market("sh", 10_100)
+        entries.append(("688999", "HALTED", 0.0, 10.25))
+        content = build_package(
+            "20261110",
+            {"sh": entries, "sz": big_market("sz", 3_100), "bj": big_market("bj", 60)},
+        )
+        rows = parse_package(content, "20261110")
+        halted = next(r for r in rows if r.symbol == "688999.SH")
+        self.assertFalse(halted.tradable)
+        self.assertEqual(halted.close_cents, 1025)
+        self.assertEqual(halted.prev_close_cents, 1025)
+        self.assertEqual(halted.volume_shares, 0)
+
+    def test_zero_close_without_reference_is_dropped(self):
+        entries = big_market("sh", 10_100)
+        entries.append(("688999", "HALTED", 0.0, 0.0))
+        content = build_package(
+            "20261110",
+            {"sh": entries, "sz": big_market("sz", 3_100), "bj": big_market("bj", 60)},
+        )
+        rows = parse_package(content, "20261110")
+        self.assertNotIn("688999.SH", {r.symbol for r in rows})
+
+    def test_positive_close_with_zero_volume_and_zero_ohlc_is_valuation_only(self):
+        entries = big_market("sh", 10_100)
+        entries.append(("688999", "STALE", 10.25, 10.20, 0))
+        content = build_package(
+            "20261110",
+            {"sh": entries, "sz": big_market("sz", 3_100), "bj": big_market("bj", 60)},
+        )
+        rows = parse_package(content, "20261110")
+        stale = next(r for r in rows if r.symbol == "688999.SH")
+        self.assertFalse(stale.tradable)
+        self.assertEqual(stale.close_cents, 1020)
+        self.assertEqual(stale.volume_shares, 0)
+
     def test_below_floor_rejected(self):
         content = build_package(
             "20261110",
@@ -191,6 +239,54 @@ class ParseTests(unittest.TestCase):
         )
         rows = parse_package(content, "20211210")
         self.assertEqual({r.symbol.split(".")[1] for r in rows}, {"SH", "SZ"})
+
+
+class SchemaTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.db = Path(self.temp.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executescript("""
+                CREATE TABLE bar(
+                    symbol TEXT, day TEXT, name TEXT,
+                    open_cents INTEGER, high_cents INTEGER, low_cents INTEGER,
+                    close_cents INTEGER, prev_close_cents INTEGER,
+                    volume_shares INTEGER, amount_cents INTEGER,
+                    adjust TEXT, source TEXT, PRIMARY KEY(symbol, day));
+                INSERT INTO bar VALUES
+                    ('000007.SZ','2026-11-10','halt',0,0,0,480,474,0,0,'none','tdx'),
+                    ('000008.SZ','2026-11-10','no-reference',0,0,0,480,0,0,0,'none','tdx'),
+                    ('600000.SH','2026-11-10','traded',1000,1020,990,1020,1010,100,102000,'none','tdx'),
+                    ('600001.SH','2026-11-10','adjusted',0,0,0,480,474,0,0,'qfq','v1-qfq');
+            """)
+
+    def rows(self):
+        connection = sqlite3.connect(self.db)
+        try:
+            return dict((symbol, (price, tradable)) for symbol, price, tradable
+                        in connection.execute("SELECT symbol,close_cents,tradable FROM bar"))
+        finally:
+            connection.close()
+
+    def test_legacy_halt_uses_reference_without_allowing_a_trade(self):
+        sync_schema(self.db)
+        self.assertEqual(self.rows()["000007.SZ"], (474, 0))
+        self.assertEqual(self.rows()["600000.SH"], (1020, 1))
+        self.assertEqual(self.rows()["600001.SH"], (480, 1))
+
+    def test_legacy_zero_quote_without_reference_stays_unpriced(self):
+        sync_schema(self.db)
+        self.assertEqual(self.rows()["000008.SZ"], (0, 0))
+
+    def test_reinitialization_preserves_existing_explicit_tradability(self):
+        sync_schema(self.db)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE bar SET tradable=0 WHERE symbol='600000.SH'")
+        before = self.rows()
+        sync_schema(self.db)
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.rows()["600000.SH"], (1020, 0))
 
 
 class DayRangeTests(unittest.TestCase):
