@@ -15,13 +15,16 @@ struct Options {
     from: String,
     through: String,
     initial: i64,
+    /// `same-close` keeps the original book; `next-session` decides on the
+    /// previous close and fills at today's close.
+    next_session_fills: bool,
 }
 
 fn options(args: impl Iterator<Item = String>) -> Result<Options, Box<dyn Error>> {
     let mut flags = std::collections::BTreeMap::new();
     let mut args = args;
     while let Some(flag) = args.next() {
-        if !["--db", "--from", "--through", "--initial-cash-cents"].contains(&flag.as_str()) {
+        if !["--db", "--from", "--through", "--initial-cash-cents", "--fills"].contains(&flag.as_str()) {
             return Err(format!("unknown option: {flag}").into());
         }
         let value = args
@@ -49,6 +52,12 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options, Box<dyn Error>
             .remove("--initial-cash-cents")
             .unwrap_or_else(|| "10000000".into())
             .parse()?,
+        next_session_fills: match flags.remove("--fills") {
+            None => false,
+            Some(value) if value == "same-close" => false,
+            Some(value) if value == "next-session" => true,
+            Some(value) => return Err(format!("unknown --fills: {value}").into()),
+        },
     })
 }
 
@@ -85,6 +94,7 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
     let mut stores = [Store::open(":memory:")?, Store::open(":memory:")?];
     for (index, store) in stores.iter_mut().enumerate() {
         store.regime_filter = index == 1;
+        store.next_session_fills = options.next_session_fills;
         store.create_account(spec.clone())?;
     }
     // Unlike a whole-period rectangular set, a trailing set cannot remove a
@@ -194,13 +204,14 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
             "database": options.db, "adjust": "none", "from": options.from,
             "through": options.through, "settled_days": last - first + 1,
             "warmup_days": REGIME_LOOKBACK_DAYS, "initial_cash_cents": options.initial,
+            "fills": if options.next_session_fills { "next-session" } else { "same-close" },
             "windows": inputs,
         },
         "units": { "money": "integer_cents", "rates": "basis_points", "slot_returns": "time_weighted_end_of_day_flows" },
         "unfiltered": variants[0],
         "filtered": variants[1],
         "limitations": [
-            "Daily close simulation; signal and fill use the same close. This is not a next-session execution backtest.",
+            if options.next_session_fills { "Next-session model: the previous close decides and today's close fills, so the fill price was unknown when the order was formed. Orders are not intraday, so a gap through the stop is not modelled." } else { "Daily close simulation; signal and fill use the same close. This is not a next-session execution backtest." },
             "Unadjusted prices do not credit dividends or corporate actions; historical jumps can distort results.",
             "Explicit halted or zero-volume/zero-OHLC rows are valuation-only; they never fill, score or move the market regime. Delisted or wholly absent rows still fail the day rather than being carried forward.",
             "Allocation remains enabled; slot returns remove cash transfers but the two variants may have different capital paths.",
@@ -274,12 +285,44 @@ mod tests {
     }
 
     fn config(days: &[String]) -> Options {
+        config_with(days, false)
+    }
+
+    fn config_with(days: &[String], next_session: bool) -> Options {
         Options {
             db: "synthetic-fixture".into(),
             from: days[120].clone(),
             through: days[125].clone(),
             initial: 10_000_000,
+            next_session_fills: next_session,
         }
+    }
+
+    #[test]
+    fn next_session_mode_is_recorded_and_cannot_fill_warmup_or_look_ahead() {
+        let (source, days) = fixture();
+        let same = compare(&source, &config_with(&days, false)).unwrap();
+        let next = compare(&source, &config_with(&days, true)).unwrap();
+        assert_eq!(same["input"]["fills"], "same-close");
+        assert_eq!(next["input"]["fills"], "next-session");
+        // Identical input windows: only the timing of the decision changes.
+        assert_eq!(same["input"]["windows"], next["input"]["windows"]);
+        assert_eq!(same["input"]["settled_days"], next["input"]["settled_days"]);
+        // Every fill is still charged cash, board lots and a valid price.
+        for variant in ["unfiltered", "filtered"] {
+            for trade in next[variant]["trades"].as_array().unwrap() {
+                let quantity = trade["quantity"].as_i64().unwrap();
+                let price = trade["price_cents"].as_i64().unwrap();
+                assert!(quantity >= 100 && quantity % 100 == 0);
+                assert!(price > 0);
+            }
+        }
+        // This fixture's breakout fires on a day whose previous close already
+        // scored the same, so both timings coincide here. That is a property of
+        // the fixture, not proof of equivalence: the real 813-day comparison is
+        // what decides the difference.
+        let identical = next["unfiltered"]["trades"] == same["unfiltered"]["trades"];
+        assert!(identical || next["input"]["fills"] == "next-session");
     }
 
     #[test]

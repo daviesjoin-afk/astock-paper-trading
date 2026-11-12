@@ -107,6 +107,56 @@ fn pending_buys_respect_actual_cash_commission_floor_and_whole_lots() {
 }
 
 #[test]
+fn a_next_session_stop_triggers_on_the_prior_close_not_the_fill_price() {
+    // Position cost 1,000. Yesterday closed at 880 (a 12% break of the steady
+    // stop), but today gaps back to 1,000. A same-close book sees no stop and
+    // holds; a next-session book must exit on the evidence it had.
+    let mut book = book();
+    book.cash_cents = 20_000_000;
+    apply_buy(&mut book, "600000.SH", 1_000, 10_000,
+        fees_cents("buy", 10_000_000), "2026-11-10").unwrap();
+    settle_overnight(&mut book).unwrap();
+    let policy = {
+        let mut policy = SlotPolicy::for_strategy(StrategyId::Steady);
+        policy.max_positions = 3;
+        policy
+    };
+    let fill = BTreeMap::from([("600000.SH".to_string(), 10_000)]);
+    let trigger = BTreeMap::from([("600000.SH".to_string(), 8_800)]);
+    let signals = [signal("600000.SH", 0)];
+
+    let same_close = orders_for_day_in_split(StrategyId::Steady, &policy, &book.positions,
+        &signals, 5_000_000, book.cash_cents, &fill, &fill, &fill, &book.sellable);
+    assert!(same_close.is_empty(), "the same-close book sees no loss: {same_close:?}");
+
+    let next_session = orders_for_day_in_split(StrategyId::Steady, &policy, &book.positions,
+        &signals, 5_000_000, book.cash_cents, &fill, &trigger, &fill, &book.sellable);
+    assert_eq!(next_session.len(), 1);
+    assert_eq!((next_session[0].side.as_str(), next_session[0].quantity), ("sell", 1_000));
+}
+
+#[test]
+fn a_next_session_buy_is_priced_by_the_fill_map_not_the_decision_map() {
+    // The decision map stands in for what the strategy already knew; the fill
+    // map is the only price that may enter a quantity or a recorded trade.
+    let policy = SlotPolicy::for_strategy(StrategyId::Steady);
+    let decision = BTreeMap::from([("600000.SH".to_string(), 500)]);
+    let fill = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
+    let orders = orders_for_day_in_split(StrategyId::Steady, &policy, &[],
+        &[signal("600000.SH", 90)], 5_000_000, 5_000_000, &fill, &decision, &fill, &[]);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].quantity, 700, "sized at the fill price, not the stale one");
+    assert_eq!(orders[0].quantity * fill["600000.SH"], 700_000);
+
+    // A name with no tradable close today cannot be filled, whatever the
+    // decision map says about yesterday.
+    let blocked = orders_for_day_in_split(StrategyId::Steady, &policy, &[],
+        &[signal("600000.SH", 90)], 5_000_000, 5_000_000,
+        &BTreeMap::new(), &decision, &BTreeMap::new(), &[]);
+    assert!(blocked.is_empty(), "a halt must not be filled at a stale price");
+}
+
+#[test]
 fn a_repeated_symbol_cannot_take_two_per_symbol_slots() {
     let mut policy = SlotPolicy::for_strategy(StrategyId::Steady);
     policy.max_positions = 3;

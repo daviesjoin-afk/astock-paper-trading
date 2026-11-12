@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::domain::{
     apply_buy, apply_sell, classify_series, drawdown_bps, fees_cents,
-    initial_split, orders_for_day_in, performance_curve, propose, score, score_signal, settle_overnight, AccountSpec,
+    initial_split, orders_for_day_in_split, performance_curve, propose, score, score_signal, settle_overnight, AccountSpec,
     AccountView, AdvanceResult, DayRun, IndexedPriceSet, PositionView, PriceCoverage, PriceSet,
     PerformanceInput, PerformancePoint, Rebalance, RegimeView, RuleError, SignalScore, SlotBook, SlotPolicy, SlotSpec, SlotView,
     StrategyId, Trade,
@@ -87,6 +87,15 @@ pub struct Store {
     /// be shown to help, and the whole point of adding it was a measured
     /// claim, so it has to stay measurable.
     pub regime_filter: bool,
+    /// When true, a trading day is decided from the previous session's close
+    /// and filled at today's close. The default keeps the same-close book that
+    /// earlier results were measured on, so the two timings can be compared on
+    /// identical input instead of one replacing the other's baseline.
+    ///
+    /// A halt is still a halt: a symbol with no tradable close today remains
+    /// untouched until it trades again, so a suspended name is skipped for
+    /// that session rather than carried at a stale price.
+    pub next_session_fills: bool,
 }
 
 impl Store {
@@ -101,6 +110,7 @@ impl Store {
         let store = Self {
             conn,
             regime_filter: true,
+            next_session_fills: false,
         };
         if legacy != 0 || store.schema_version()? != SCHEMA_VERSION {
             return Err(StoreError::Integrity("unsupported_replay_schema".into()));
@@ -121,6 +131,7 @@ impl Store {
         let store = Self {
             conn,
             regime_filter: true,
+            next_session_fills: false,
         };
         store.migrate()?;
         Ok(store)
@@ -891,10 +902,32 @@ impl Store {
             settle_overnight(&mut books[1])?;
         }
         let weights = self.weights(&spec.account_id)?;
+        // Same-close book: the day's own close decides and fills. Next-session
+        // model: the previous session's close decides and today's close fills,
+        // so the price being filled at was unknown when the order was formed.
+        // Warm-up days have no prior session, so the decision window stays on
+        // `day` and the first settled day simply opens nothing new.
+        let decision_day: &str = if self.next_session_fills {
+            previous_day
+                .as_deref()
+                .filter(|prior| prior.len() == 10 && *prior < day)
+                .unwrap_or(day)
+        } else {
+            day
+        };
+        // Stop trigger price: the close the decision was made from. In the
+        // same-close book that is today's own close; in the next-session book
+        // it is the previous session's. Never an empty map, which would
+        // silently disable the hard stop.
+        let trigger_closes = if self.next_session_fills && decision_day != day {
+            closes_for_indexed(index_set, decision_day)
+        } else {
+            closes_for_indexed(index_set, day)
+        };
         // The regime is a property of the day, not of a slot, and it costs one
         // pass over the index. Computing it once here keeps the two slots
         // looking at the same tape.
-        let regime = regime_for_day(index_set, day);
+        let regime = regime_for_day(index_set, decision_day);
         let mut planned = Vec::new();
         for (index, slot) in [StrategyId::Steady, StrategyId::Aggressive]
             .into_iter()
@@ -909,7 +942,7 @@ impl Store {
             let signals = self.signals_for_day(
                 slot,
                 index_set,
-                day,
+                decision_day,
                 &closes,
                 book.positions.iter().map(|position| position.symbol.as_str()),
             )?;
@@ -929,7 +962,7 @@ impl Store {
                         .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))
                 })
                 .collect::<StoreResult<_>>()?;
-            let orders = orders_for_day_in(
+            let orders = orders_for_day_in_split(
                 slot,
                 &policy,
                 &book.positions,
@@ -937,6 +970,7 @@ impl Store {
                 budget,
                 book.cash_cents,
                 &closes,
+                &trigger_closes,
                 &valuations,
                 &book.sellable,
             );
@@ -2362,6 +2396,44 @@ mod tests {
         let error = Store::open(&path).err().expect("legacy db must fail");
         assert!(matches!(error, StoreError::Integrity(ref value) if value.contains("legacy_v2")));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn same_close_stop_still_fires_and_next_session_uses_the_prior_close() {
+        // A 13% drawdown from cost must exit on the stop day in both timings.
+        // The same-close book reads today's close; the next-session book reads
+        // the previous close. An empty trigger map would silently disable the
+        // stop, which is what this guards.
+        let mut store = store();
+        let mut set = price_set(90);
+        store.advance(&spec(), &set, &day(79), None).unwrap();
+        let holdings = store.books("test-account").unwrap();
+        let (slot, held) = holdings
+            .iter()
+            .flat_map(|book| book.positions.iter().map(move |item| (book.slot, item)))
+            .next()
+            .expect("fixture holds a position");
+        let symbol = held.symbol.clone();
+        let cost = held.average_cost_cents;
+        let crash = cost * 860 / 1_000;
+        for entry in set.entries.iter_mut() {
+            if entry.symbol == symbol && entry.day.as_str() > day(79).as_str() {
+                entry.price_cents = crash;
+            }
+        }
+        let day_name = day(80);
+        let run = store
+            .run_day(&spec(), &set, &day_name)
+            .expect("a crash day must still settle");
+        let stop = run
+            .trades
+            .iter()
+            .find(|trade| trade.side == "sell" && trade.symbol == symbol);
+        assert!(
+            stop.is_some_and(|trade| trade.reason == "stop_loss"),
+            "slot {:?} kept {symbol} through a stop-sized drop: {:?}", slot,
+            run.trades.iter().map(|t| (t.symbol.clone(), t.side.clone(), t.reason.clone())).collect::<Vec<_>>()
+        );
     }
 
     #[test]

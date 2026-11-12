@@ -290,6 +290,32 @@ pub fn orders_for_day_in(
     valuations: &std::collections::BTreeMap<String, i64>,
     sellable: &[super::Sellable],
 ) -> Vec<Order> {
+    orders_for_day_in_split(
+        strategy, policy, positions, signals, budget_cents, cash_cents, closes, closes,
+        valuations, sellable,
+    )
+}
+
+/// Orders whose stop trigger and fill price come from different sessions.
+///
+/// `fill_closes` is today's tradable close: it prices every order and decides
+/// whether the name can trade at all. `trigger_closes` is the previous
+/// session's close, used only for the hard stop. Separating them is what makes
+/// a next-session model honest: the decision that produced the order could not
+/// see the price it fills at. With both maps equal this is the same-close book.
+#[allow(clippy::too_many_arguments)]
+pub fn orders_for_day_in_split(
+    strategy: StrategyId,
+    policy: &SlotPolicy,
+    positions: &[Position],
+    signals: &[(String, SignalScore)],
+    budget_cents: i64,
+    cash_cents: i64,
+    fill_closes: &std::collections::BTreeMap<String, i64>,
+    trigger_closes: &std::collections::BTreeMap<String, i64>,
+    valuations: &std::collections::BTreeMap<String, i64>,
+    sellable: &[super::Sellable],
+) -> Vec<Order> {
     let mut orders = Vec::new();
     let held: std::collections::BTreeSet<&str> =
         positions.iter().map(|item| item.symbol.as_str()).collect();
@@ -341,7 +367,7 @@ pub fn orders_for_day_in(
         if positions.len() + pending >= policy.max_positions {
             continue;
         }
-        let Some(price) = closes.get(symbol) else {
+        let Some(price) = fill_closes.get(symbol) else {
             continue;
         };
         // The target is per symbol. Existing holdings already reduce the
@@ -399,7 +425,7 @@ pub fn orders_for_day_in(
             // roughly intact; once the price has fallen past the stop, waiting
             // just deepens the loss. Measured: introducing a holding period
             // without a stop took the aggressive slot from -48% to -74%.
-            let stop_hit = closes.get(&position.symbol).is_some_and(|price| {
+            let stop_hit = trigger_closes.get(&position.symbol).is_some_and(|price| {
                 position.average_cost_cents > 0
                     && (*price - position.average_cost_cents) * 10_000
                         / position.average_cost_cents
@@ -411,7 +437,7 @@ pub fn orders_for_day_in(
 
             // A halt has a valuation mark but no fill. Do not emit a sell that
             // settlement would have to reject for want of a tradable close.
-            if let Some(reason) = exit_reason.filter(|_| closes.contains_key(&position.symbol)) {
+            if let Some(reason) = exit_reason.filter(|_| fill_closes.contains_key(&position.symbol)) {
                 let can_sell = sellable
                     .iter()
                     .find(|item| item.symbol == position.symbol)

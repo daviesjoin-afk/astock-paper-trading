@@ -150,7 +150,8 @@ Oracle 单机部署、nginx、cron 与回滚见 `deploy/README.md`。
 `ASTOCK_V2_DB` 启动；本项目不尝试就地迁移。
 
 跨电脑继续请从 [公司电脑接续入口](docs/HANDOFF-COMPANY-2026-11-11.md) 开始，并阅读
-[公共数据层](docs/PUBLIC-MARKET-DATA.md)、[排序/仓位修复的新全期结果](docs/SELECTION-VALIDATION-2026-11-12.md)。
+[公共数据层](docs/PUBLIC-MARKET-DATA.md)、[排序/仓位修复的新全期结果](docs/SELECTION-VALIDATION-2026-11-12.md)、
+[成交时点对照（同日 vs 次日）](docs/FILLS-TIMING-2026-11-12.md)。
 [11-11 基线核验](docs/REAL-HISTORY-REGIME-2026-11-11.md) 与
 [上一轮优化路线和离线工具](docs/OPTIMIZATION-2026-11-11.md) 保留为基线；最新下一步先处理成交时点与公司行为权益。
 [早期本机交接文档](docs/HANDOFF-2026-11-11-V3.md) 保留为历史快照，
