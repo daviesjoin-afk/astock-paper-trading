@@ -18,6 +18,20 @@ use crate::domain::{
 
 pub const SCHEMA_VERSION: i64 = 2;
 
+/// One unadjusted bar row read for settlement, including the session fields a
+/// price-limit seal needs. The close alone cannot tell a sealed session from
+/// one that traded through its limit.
+pub struct UnadjustedRow {
+    pub symbol: String,
+    pub day: String,
+    pub price_cents: i64,
+    pub tradable: bool,
+    pub open_cents: i64,
+    pub high_cents: i64,
+    pub low_cents: i64,
+    pub prev_close_cents: i64,
+}
+
 /// How many trailing closes a strategy needs to decide today.
 ///
 /// The longest requirement in `domain::strategy` is 61 closes (a 60-day mean
@@ -451,18 +465,23 @@ impl Store {
     ///
     /// This is the settlement feed: forward-adjusted rows are excluded here
     /// rather than at the call site so no caller can forget.
-    pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<(String, String, i64, bool)>> {
+    pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<UnadjustedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol, day, close_cents, tradable FROM bar \
+            "SELECT symbol, day, close_cents, tradable, open_cents, high_cents, \
+             low_cents, prev_close_cents FROM bar \
              WHERE day = ?1 AND adjust = 'none' AND close_cents > 0 ORDER BY symbol",
         )?;
         let rows = stmt.query_map([day], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, bool>(3)?,
-            ))
+            Ok(UnadjustedRow {
+                symbol: row.get(0)?,
+                day: row.get(1)?,
+                price_cents: row.get(2)?,
+                tradable: row.get(3)?,
+                open_cents: row.get(4)?,
+                high_cents: row.get(5)?,
+                low_cents: row.get(6)?,
+                prev_close_cents: row.get(7)?,
+            })
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -476,19 +495,24 @@ impl Store {
         &self,
         from_day: &str,
         to_day: &str,
-    ) -> StoreResult<Vec<(String, String, i64, bool)>> {
+    ) -> StoreResult<Vec<UnadjustedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol, day, close_cents, tradable FROM bar \
+            "SELECT symbol, day, close_cents, tradable, open_cents, high_cents, \
+                    low_cents, prev_close_cents FROM bar \
              WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' AND close_cents > 0 \
              ORDER BY symbol, day",
         )?;
         let rows = stmt.query_map(params![from_day, to_day], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, bool>(3)?,
-            ))
+            Ok(UnadjustedRow {
+                symbol: row.get(0)?,
+                day: row.get(1)?,
+                price_cents: row.get(2)?,
+                tradable: row.get(3)?,
+                open_cents: row.get(4)?,
+                high_cents: row.get(5)?,
+                low_cents: row.get(6)?,
+                prev_close_cents: row.get(7)?,
+            })
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -513,11 +537,15 @@ impl Store {
         }
         let rows: Vec<crate::domain::BarRow> = rows
             .into_iter()
-            .map(|(symbol, day, price_cents, tradable)| crate::domain::BarRow {
-                symbol,
-                day,
-                price_cents,
-                tradable,
+            .map(|row| crate::domain::BarRow {
+                symbol: row.symbol,
+                day: row.day,
+                price_cents: row.price_cents,
+                tradable: row.tradable,
+                open_cents: row.open_cents,
+                high_cents: row.high_cents,
+                low_cents: row.low_cents,
+                prev_close_cents: row.prev_close_cents,
             })
             .collect();
         Ok(Some(crate::domain::PriceSet::from_bars(
@@ -979,6 +1007,17 @@ impl Store {
                     .get(&order.symbol)
                     .copied()
                     .ok_or_else(|| StoreError::Rules(RuleError("missing_close_price".into())))?;
+                // A price-limit seal closes one side of the book. Having a
+                // tradable close is not the same as being able to fill: a
+                // single-price limit-down session has a price and no bid.
+                let open = if order.side == "buy" {
+                    index_set.can_buy(&order.symbol, day)
+                } else {
+                    index_set.can_sell(&order.symbol, day)
+                };
+                if !open {
+                    continue;
+                }
                 planned.push((slot, order, price));
             }
             let _ = value_book_indexed(book, index_set, day)?;
@@ -2016,9 +2055,9 @@ mod tests {
         assert_eq!((rows[2].close_cents, rows[2].tradable), (1020, true));
         assert_eq!((rows[3].close_cents, rows[3].tradable), (480, true));
         let prices = store.unadjusted_closes("2026-11-10").unwrap();
-        assert!(prices.iter().any(|(symbol, _, price, tradable)|
-            symbol == "000007.SZ" && *price == 474 && !tradable));
-        assert!(!prices.iter().any(|(symbol, _, _, _)| symbol == "000008.SZ"));
+        assert!(prices.iter().any(|row|
+            row.symbol == "000007.SZ" && row.price_cents == 474 && !row.tradable));
+        assert!(!prices.iter().any(|row| row.symbol == "000008.SZ"));
 
         let mut explicit = bar("600000.SH", "2026-11-10", 1020, 1010);
         explicit.tradable = false;
@@ -2077,6 +2116,8 @@ mod tests {
                     source: "offline-test".into(),
                     observed_at: format!("{}T15:00:00+08:00", day(index)),
                     tradable: true,
+                    can_buy: true,
+                    can_sell: true,
                 });
             }
         }
@@ -2115,6 +2156,8 @@ mod tests {
                     source: "offline-test".into(),
                     observed_at: format!("{}T15:00:00+08:00", day(index)),
                     tradable: true,
+                    can_buy: true,
+                    can_sell: true,
                 });
             }
         }
@@ -2396,6 +2439,43 @@ mod tests {
         let error = Store::open(&path).err().expect("legacy db must fail");
         assert!(matches!(error, StoreError::Integrity(ref value) if value.contains("legacy_v2")));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_limit_down_seal_blocks_the_sale_and_keeps_the_position() {
+        // A held name gaps to a single-price limit-down session. The row has a
+        // real close, so a same-close model would book a fill at the bottom;
+        // the seal must leave the position open instead.
+        let mut store = store();
+        let mut set = price_set(90);
+        store.advance(&spec(), &set, &day(79), None).unwrap();
+        let before = store.books("test-account").unwrap();
+        let (book_slot, held) = before
+            .iter()
+            .flat_map(|book| book.positions.iter().map(move |item| (book.slot, item)))
+            .next()
+            .expect("fixture holds a position");
+        let symbol = held.symbol.clone();
+        let quantity = held.quantity;
+        let crash = held.average_cost_cents * 850 / 1_000;
+        for entry in set.entries.iter_mut() {
+            if entry.symbol == symbol && entry.day.as_str() > day(79).as_str() {
+                entry.price_cents = crash;
+                entry.tradable = true;
+                entry.can_buy = true;
+                entry.can_sell = false;
+            }
+        }
+        store.run_day(&spec(), &set, &day(80)).expect("sealed day still settles");
+        let after = store.books("test-account").unwrap();
+        let still_held: i64 = after
+            .iter()
+            .filter(|book| book.slot == book_slot)
+            .flat_map(|book| book.positions.iter())
+            .filter(|item| item.symbol == symbol)
+            .map(|item| item.quantity)
+            .sum();
+        assert_eq!(still_held, quantity, "a sealed limit-down sale must not fill");
     }
 
     #[test]

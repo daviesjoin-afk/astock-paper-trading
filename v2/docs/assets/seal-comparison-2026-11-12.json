@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-12",
+  "period": "2023-07-05..2026-11-11",
+  "settled_days": 813,
+  "rule": "A single-price session at a board price limit closes one side of the book: limit-down cannot sell, limit-up cannot buy. Decided from the exchange reference close, the session OHLC and the board limit.",
+  "variants": {
+    "unfiltered": {
+      "same-close": {
+        "ending_equity_cents": 7901873,
+        "return_pct": "-20.981270",
+        "exact_max_drawdown_pct": "32.019826",
+        "fills": 1122,
+        "fees_cents": 921427,
+        "audit": {
+          "mismatch_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        },
+        "before_seal": {
+          "ending_equity_cents": 7901873,
+          "return_bps": -2098,
+          "fills": 1122
+        }
+      },
+      "next-session": {
+        "ending_equity_cents": 7070718,
+        "return_pct": "-29.292820",
+        "exact_max_drawdown_pct": "36.441560",
+        "fills": 1102,
+        "fees_cents": 1014082,
+        "audit": {
+          "mismatch_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        },
+        "before_seal": {
+          "ending_equity_cents": 7179815,
+          "return_bps": -2820,
+          "fills": 1122
+        }
+      }
+    },
+    "filtered": {
+      "same-close": {
+        "ending_equity_cents": 11931805,
+        "return_pct": "19.318050",
+        "exact_max_drawdown_pct": "13.687267",
+        "fills": 496,
+        "fees_cents": 596095,
+        "audit": {
+          "mismatch_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        },
+        "before_seal": {
+          "ending_equity_cents": 11931805,
+          "return_bps": 1931,
+          "fills": 496
+        }
+      },
+      "next-session": {
+        "ending_equity_cents": 11055272,
+        "return_pct": "10.552720",
+        "exact_max_drawdown_pct": "13.678403",
+        "fills": 510,
+        "fees_cents": 580728,
+        "audit": {
+          "mismatch_count": 0,
+          "halted_fill_count": 0,
+          "untradeable_fill_count": 0
+        },
+        "before_seal": {
+          "ending_equity_cents": 11055272,
+          "return_bps": 1055,
+          "fills": 510
+        }
+      }
+    }
+  },
+  "artifacts": [
+    {
+      "role": "ab-seal-same-close",
+      "path": "(ignored) work/market-layer-20261112/ab-seal-same-close.json",
+      "sha256": "a60a0634e1a7921ef043b1a957aa970debc2a93b0aebaa9602a6cc13c6e0f470"
+    },
+    {
+      "role": "ab-seal-same-close",
+      "path": "(ignored) work/market-layer-20261112/ab-seal-same-close.verification.json",
+      "sha256": "de6cda54e7e641107fa493a91d3825cc40e18bcb465ef705ca2f7aa46681525c"
+    },
+    {
+      "role": "ab-seal-next-session",
+      "path": "(ignored) work/market-layer-20261112/ab-seal-next-session.json",
+      "sha256": "5b2480d0584adbfef2ab6fa64aaca9657c0e0e1500f2b57a9755d50e30bb2efc"
+    },
+    {
+      "role": "ab-seal-next-session",
+      "path": "(ignored) work/market-layer-20261112/ab-seal-next-session.verification.json",
+      "sha256": "79a515ffa8689c50c05e9a1038217d99f3ff2e4635a9bcbf259f17bf3f25db98"
+    }
+  ],
+  "limitations": [
+    "Fills are still at the close: gaps through a stop, liquidity and limit-up queueing are not modelled.",
+    "ST stocks use their board limit because no ST flag is available; first-day listings have no limit and are also treated by board.",
+    "No corporate-action cash/share accounting; unadjusted prices only.",
+    "In-period engineering comparison, not untouched out-of-sample and not executable total return."
+  ]
+}

@@ -115,16 +115,20 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
         let day = &days[index];
         let start = &days[index - REGIME_LOOKBACK_DAYS];
         if index > first {
-        window.retain(|(_, observed, _, _)| observed >= start);
+            window.retain(|row| row.day.as_str() >= start);
             window.extend(source.unadjusted_closes(day)?);
         }
         let bars: Vec<_> = window
             .iter()
-            .map(|(symbol, observed, price_cents, tradable)| astock_v2::domain::BarRow {
-                symbol: symbol.clone(),
-                day: observed.clone(),
-                price_cents: *price_cents,
-                tradable: *tradable,
+            .map(|row| astock_v2::domain::BarRow {
+                symbol: row.symbol.clone(),
+                day: row.day.clone(),
+                price_cents: row.price_cents,
+                tradable: row.tradable,
+                open_cents: row.open_cents,
+                high_cents: row.high_cents,
+                low_cents: row.low_cents,
+                prev_close_cents: row.prev_close_cents,
             })
             .collect();
         let set = PriceSet::from_bars(&bars, "regime-ab", start, day);

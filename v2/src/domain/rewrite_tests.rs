@@ -528,6 +528,8 @@ fn price_set_validation_rejects_non_reviewed_duplicates_and_bad_days() {
             source: "reviewed-source".into(),
             observed_at: "2026-10-30T15:00:00+08:00".into(),
             tradable: true,
+            can_buy: true,
+            can_sell: true,
         }],
         source_digest: "a".repeat(64),
     };
@@ -564,6 +566,8 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 source: "reviewed-source".into(),
                 observed_at: "2026-10-30T15:00:00+08:00".into(),
                 tradable: true,
+                can_buy: true,
+                can_sell: true,
             },
             PriceEntry {
                 symbol: "600000.SH".into(),
@@ -572,6 +576,8 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 source: "reviewed-source".into(),
                 observed_at: "2026-11-02T15:00:00+08:00".into(),
                 tradable: true,
+                can_buy: true,
+                can_sell: true,
             },
             PriceEntry {
                 symbol: "000001.SZ".into(),
@@ -580,6 +586,8 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 source: "reviewed-source".into(),
                 observed_at: "2026-10-30T15:00:00+08:00".into(),
                 tradable: true,
+                can_buy: true,
+                can_sell: true,
             },
         ],
         source_digest: "c".repeat(64),
@@ -592,6 +600,8 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
         source: "reviewed-source".into(),
         observed_at: "2026-11-02T15:00:00+08:00".into(),
         tradable: true,
+        can_buy: true,
+        can_sell: true,
     });
     set.validate().unwrap();
 }
@@ -614,6 +624,10 @@ fn halted_price_set_valuations_use_the_reference_close_and_still_fail_when_absen
         day: "2026-11-03".into(),
         price_cents: 995,
         tradable: false,
+        open_cents: 0,
+        high_cents: 0,
+        low_cents: 0,
+        prev_close_cents: 0,
     };
     let set = PriceSet::from_bars(&[halted], "halted", "2026-11-03", "2026-11-03");
     set.validate().expect("a halt is a complete one-day row");

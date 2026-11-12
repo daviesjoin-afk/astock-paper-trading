@@ -7,6 +7,7 @@ mod execution;
 mod instrument;
 mod market;
 mod regime;
+mod session;
 mod strategy;
 mod valuation;
 
@@ -14,6 +15,8 @@ mod valuation;
 mod rewrite_tests;
 #[cfg(test)]
 mod selection_tests;
+#[cfg(test)]
+mod session_tests;
 
 pub use account::*;
 pub use allocation::*;
@@ -23,6 +26,7 @@ pub use execution::*;
 pub use instrument::*;
 pub use market::*;
 pub use regime::*;
+pub use session::*;
 pub use strategy::*;
 pub use valuation::*;
 

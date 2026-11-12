@@ -13,6 +13,13 @@ pub struct BarRow {
     /// A real close that may fill an order. A halted row carries the official
     /// reference previous close and is valuation-only.
     pub tradable: bool,
+    /// The session's own open/high/low and official previous close. Used only
+    /// to decide whether a price-limit seal blocked one side of the book;
+    /// zero means the input did not carry them and no seal is inferred.
+    pub open_cents: i64,
+    pub high_cents: i64,
+    pub low_cents: i64,
+    pub prev_close_cents: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +46,21 @@ pub struct PriceEntry {
     /// Whether this price is a real close that may fill an order.
     #[serde(default = "default_tradable")]
     pub tradable: bool,
+    /// Whether the buy side, respectively the sell side, could fill on this
+    /// session. A price-limit seal closes one of them. Defaults keep older
+    /// authored price sets valid: an explicit close is an open session unless
+    /// the row proves otherwise.
+    #[serde(default = "default_tradable")]
+    pub can_buy: bool,
+    #[serde(default = "default_tradable")]
+    pub can_sell: bool,
+}
+
+/// One symbol-day as the settlement view holds it.
+struct Session {
+    price_cents: i64,
+    tradable: bool,
+    tradeability: super::Tradeability,
 }
 
 fn default_tradable() -> bool {
@@ -55,6 +77,10 @@ fn default_tradable() -> bool {
 pub struct Quote {
     pub price_cents: i64,
     pub tradable: bool,
+    /// Which side of the book was open. A limit-down seal still has a price to
+    /// value a position at, but nothing could be sold into it.
+    pub can_buy: bool,
+    pub can_sell: bool,
 }
 
 /// A `PriceSet` with an index over `(symbol, day)`.
@@ -84,6 +110,8 @@ impl IndexedPriceSet {
             let quote = Quote {
                 price_cents: entry.price_cents,
                 tradable: entry.tradable,
+                can_buy: entry.can_buy,
+                can_sell: entry.can_sell,
             };
             by_day
                 .entry(entry.day.clone())
@@ -111,6 +139,38 @@ impl IndexedPriceSet {
             .get(day)
             .and_then(|closes| closes.get(symbol))
             .is_some_and(|quote| quote.tradable)
+    }
+
+    /// Whether a purchase could fill: a real close and no limit-up seal.
+    pub fn can_buy(&self, symbol: &str, day: &str) -> bool {
+        self.by_day
+            .get(day)
+            .and_then(|closes| closes.get(symbol))
+            .is_some_and(|quote| quote.tradable && quote.can_buy)
+    }
+
+    /// Whether a sale could fill: a real close and no limit-down seal.
+    pub fn can_sell(&self, symbol: &str, day: &str) -> bool {
+        self.by_day
+            .get(day)
+            .and_then(|closes| closes.get(symbol))
+            .is_some_and(|quote| quote.tradable && quote.can_sell)
+    }
+
+    /// Tradable closes with the buy side open.
+    pub fn buyable_closes_on(&self, day: &str) -> std::collections::BTreeMap<String, i64> {
+        self.tradable_closes_on(day)
+            .into_iter()
+            .filter(|(symbol, _)| self.can_buy(symbol, day))
+            .collect()
+    }
+
+    /// Tradable closes with the sell side open.
+    pub fn sellable_closes_on(&self, day: &str) -> std::collections::BTreeMap<String, i64> {
+        self.tradable_closes_on(day)
+            .into_iter()
+            .filter(|(symbol, _)| self.can_sell(symbol, day))
+            .collect()
     }
 
     /// All tradable closes for one day, as symbol -> price.
@@ -258,12 +318,25 @@ impl PriceSet {
             set.into_iter().collect()
         };
 
-        let mut by_symbol: BTreeMap<&str, BTreeMap<&str, (i64, bool)>> = BTreeMap::new();
+        let mut by_symbol: BTreeMap<&str, BTreeMap<&str, Session>> = BTreeMap::new();
         for row in &in_window {
+            let session = Session {
+                price_cents: row.price_cents,
+                tradable: row.tradable,
+                tradeability: super::tradeability(
+                    &row.symbol,
+                    row.prev_close_cents,
+                    row.open_cents,
+                    row.high_cents,
+                    row.low_cents,
+                    row.price_cents,
+                    row.tradable,
+                ),
+            };
             by_symbol
                 .entry(row.symbol.as_str())
                 .or_default()
-                .insert(row.day.as_str(), (row.price_cents, row.tradable));
+                .insert(row.day.as_str(), session);
         }
 
         let mut entries = Vec::new();
@@ -287,14 +360,16 @@ impl PriceSet {
                 // as an explicit valuation-only row, not inferred from a gap.
                 continue;
             }
-            for (day, (price_cents, tradable)) in closes {
+            for (day, session) in closes {
                 entries.push(PriceEntry {
                     symbol: symbol.to_string(),
                     day: day.to_string(),
-                    price_cents,
+                    price_cents: session.price_cents,
                     source: "bar/tdx".into(),
                     observed_at: format!("{day}T15:00:00+08:00"),
-                    tradable,
+                    tradable: session.tradable,
+                    can_buy: session.tradeability.can_buy,
+                    can_sell: session.tradeability.can_sell,
                 });
             }
         }
@@ -481,6 +556,10 @@ mod from_bars_tests {
             day: day.to_string(),
             price_cents: close,
             tradable: true,
+            open_cents: 0,
+            high_cents: 0,
+            low_cents: 0,
+            prev_close_cents: 0,
         }
     }
 
@@ -490,6 +569,10 @@ mod from_bars_tests {
             day: day.to_string(),
             price_cents: reference,
             tradable: false,
+            open_cents: 0,
+            high_cents: 0,
+            low_cents: 0,
+            prev_close_cents: 0,
         }
     }
 
