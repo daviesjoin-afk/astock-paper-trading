@@ -2369,14 +2369,15 @@ mod tests {
         let mut store = store();
         let set = split_price_set(75);
         store.advance(&spec(), &set, &day(66), None).unwrap();
-        let rebalance = store
-            .rebalances("test-account")
-            .unwrap()
-            .into_iter()
-            .find(|item| item.applied_day >= day(62))
+        let rebalances = store.rebalances("test-account").unwrap();
+        // Day 61 is the first distinct close in the two symbol paths. Correct
+        // per-symbol sizing can expose that edge a day earlier than before.
+        assert!(rebalances.iter().all(|item| item.applied_day >= day(61)));
+        let rebalance = rebalances.iter()
+            .find(|item| item.applied_day >= day(61))
             .expect("divergent symbol returns must trigger a rebalance");
         assert_ne!(rebalance.old_steady_bps, rebalance.new_steady_bps);
-        assert!(rebalance.new_steady_bps - rebalance.old_steady_bps <= 1_000);
+        assert!((rebalance.new_steady_bps - rebalance.old_steady_bps).abs() <= 1_000);
         assert_eq!(
             rebalance.new_steady_bps + rebalance.new_aggressive_bps,
             10_000

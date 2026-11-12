@@ -12,6 +12,8 @@ mod valuation;
 
 #[cfg(test)]
 mod rewrite_tests;
+#[cfg(test)]
+mod selection_tests;
 
 pub use account::*;
 pub use allocation::*;

@@ -31,6 +31,12 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from functools import partial
+
+try:
+    from .source_http import SourceHttp, SourceHttpError, tdx_identity, add_cache_arguments, transport_from_args
+except ImportError:
+    from source_http import SourceHttp, SourceHttpError, tdx_identity, add_cache_arguments, transport_from_args
 
 PACKAGE_URL = "https://www.tdx.com.cn/products/data/data/g4day/{ymd}.zip"
 USER_AGENT = "Mozilla/5.0 (compatible; astock-v2)"
@@ -226,25 +232,22 @@ def parse_package(content: bytes, ymd: str) -> list[Row]:
     return rows
 
 
-def fetch_package(day: str, *, timeout: float = 90.0) -> bytes:
-    ymd = day.replace("-", "")
-    url = PACKAGE_URL.format(ymd=ymd)
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def fetch_package(day: str, *, timeout: float = 90.0,
+                  http: SourceHttp | None = None, as_of: str | None = None) -> bytes:
+    transport = http or SourceHttp(timeout=timeout)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            content = response.read()
+        return transport.request(
+            tdx_identity(day), headers={"User-Agent": USER_AGENT}, as_of=as_of,
+            validate=lambda raw: parse_package(raw, day.replace("-", "")),
+        ).raw
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise IngestError(
-                "package_not_published",
-                f"{day}: not a trading day, or the package is not out yet",
-            ) from exc
-        raise IngestError("package_http_error", f"{exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
+            raise IngestError("package_not_published", day) from exc
+        raise IngestError("package_http_error", str(exc.code)) from exc
+    except SourceHttpError as exc:
+        raise IngestError(exc.code, exc.detail) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise IngestError("package_network_error", str(exc)) from exc
-    if not content.startswith(b"PK"):
-        raise IngestError("package_not_zip", "response is not a zip archive")
-    return content
 
 
 INSERT_SQL = """
@@ -308,7 +311,7 @@ def sync_schema(db_path: Path) -> None:
         connection.close()
 
 
-def _fetch_and_parse(day: str) -> tuple[str, list[Row] | None, str | None, float]:
+def _fetch_and_parse(day: str, *, http: SourceHttp | None = None, as_of: str | None = None) -> tuple[str, list[Row] | None, str | None, float]:
     """Fetch and parse one day. Safe to run in a worker thread.
 
     Returns (day, rows, error_code, seconds). Nothing here touches the
@@ -317,7 +320,7 @@ def _fetch_and_parse(day: str) -> tuple[str, list[Row] | None, str | None, float
     """
     started = time.monotonic()
     try:
-        rows = parse_package(fetch_package(day), day.replace("-", ""))
+        rows = parse_package(fetch_package(day, http=http, as_of=as_of), day.replace("-", ""))
         return (day, rows, None, time.monotonic() - started)
     except IngestError as exc:
         return (day, None, exc.code, time.monotonic() - started)
@@ -329,6 +332,8 @@ def ingest_days(
     *,
     workers: int,
     skip_missing: bool,
+    http: SourceHttp | None = None,
+    as_of: str | None = None,
 ) -> tuple[int, list[tuple[str, str]]]:
     """Fetch, parse and store many days, `workers` downloads in flight.
 
@@ -343,7 +348,7 @@ def ingest_days(
     connection.execute("PRAGMA journal_mode=WAL")
     try:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            for day, rows, error, seconds in pool.map(_fetch_and_parse, days):
+            for day, rows, error, seconds in pool.map(partial(_fetch_and_parse, http=http, as_of=as_of), days):
                 if error is not None:
                     if skip_missing and error == "package_not_published":
                         print(f"{day}  skipped ({error})")
@@ -400,7 +405,9 @@ def main(argv: list[str] | None = None) -> int:
         default=8,
         help="concurrent download+parse threads (default 8; measured 7x over serial)",
     )
+    add_cache_arguments(parser)
     args = parser.parse_args(argv)
+    http = transport_from_args(args)
 
     if not args.day and not args.days:
         parser.error("one of --day or --days is required")
@@ -418,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         failed: list[tuple[str, str]] = []
         parsed = 0
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            for day, rows, error, seconds in pool.map(_fetch_and_parse, days):
+            for day, rows, error, seconds in pool.map(partial(_fetch_and_parse, http=http, as_of=args.as_of), days):
                 if error is not None:
                     if args.skip_missing and error == "package_not_published":
                         print(f"{day}  skipped ({error})")
@@ -437,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sync_schema(db_path)
     written, failed = ingest_days(
-        db_path, days, workers=args.workers, skip_missing=args.skip_missing
+        db_path, days, workers=args.workers, skip_missing=args.skip_missing, http=http, as_of=args.as_of
     )
     if failed:
         print(f"\n{len(failed)} day(s) failed:", file=sys.stderr)

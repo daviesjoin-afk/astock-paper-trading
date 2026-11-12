@@ -19,3 +19,19 @@ The upstream project is licensed under the Apache License, Version 2.0. A copy
 of that license is available at:
 
 https://www.apache.org/licenses/LICENSE-2.0
+
+Modification note (2026-11-12): the existing adapters now use the project's
+stdlib HTTP/snapshot-cache owner; original parsing/cross-check and reviewed-set
+boundaries remain. `public_data.py` exposes on-demand queries without embedding
+an upstream framework.
+
+## Reference-data endpoint research
+
+The SZSE, Eastmoney and CNINFO adapters in `company_disclosures.py` are independent
+stdlib implementations of the public response formats and small samples recorded
+in [the source investigation](../docs/MARKET-SOURCES-RESEARCH-2026-11-12.md).
+The investigation also compares AKShare (MIT), efinance (MIT), mootdx (MIT),
+adata (Apache-2.0), and a-stock-data (Apache-2.0) at pinned commits; those packages
+are not bundled or imported by this layer. No upstream endorsement is implied.
+Code licenses do not grant rights to redistribute the underlying market data or
+announcement PDFs; source identity and website usage terms remain separate.

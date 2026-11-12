@@ -19,8 +19,12 @@ for all changes under `v2/`. Read `docs/REWRITE-SPEC.md` and
 - `store/mod.rs` exclusively owns durable writes, schema, transactions,
   idempotency and storage policy. A trading day, including any cash transfer,
   is one transaction.
-- `data_sources/` only fetches and cross-checks public daily bars; it never
-  writes the ledger or publishes a reviewed set by itself.
+- `data_sources/` fetches and normalizes public bars, quote snapshots, company
+  profiles and disclosures. `public_data.py` owns query semantics;
+  `source_http.py` owns opt-in raw/query snapshot cache artifacts. It never
+  writes the ledger or publishes a reviewed set by itself. Reference data must
+  preserve source, fetch time and publication precision; current snapshots
+  cannot be silently used as historically known facts.
 - `research/make_price_set.py` only builds an artifact from explicit CSV rows.
   TypeScript only presents V2 API read models; it must not replicate paper
   execution rules.

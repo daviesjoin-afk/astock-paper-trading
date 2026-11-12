@@ -339,12 +339,12 @@ fn a_halted_position_still_occupies_its_slot_budget() {
     apply_buy(&mut book, "000001.SZ", 500, 1_000, 5, "2026-10-30").unwrap();
     settle_overnight(&mut book).unwrap();
     let cash_after_buy = book.cash_cents;
-    // 000001.SZ is halted today: only its valuation mark exists. The slot's
-    // 15% target leaves 250,000 cents of room; the halted 500,000 cents must
-    // still count as held, or the new buy would overshoot the target.
+    // Only the halted position's valuation mark exists. Against the fixed
+    // 5,000,000-cent risk budget, its 4,250,000-cent mark and the 500,000-cent
+    // cash floor leave 250,000 cents for all new buys, below minimum entry.
     let closes = BTreeMap::from([("600000.SH".to_string(), 1_000)]);
     let valuations = BTreeMap::from([
-        ("000001.SZ".to_string(), 1_000),
+        ("000001.SZ".to_string(), 8_500),
         ("600000.SH".to_string(), 1_000),
     ]);
     let orders = orders_for_day(

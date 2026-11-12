@@ -39,6 +39,11 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+try:
+    from .source_http import SourceHttp, SourceHttpError, RequestIdentity, tdx_identity, add_cache_arguments, transport_from_args
+except ImportError:
+    from source_http import SourceHttp, SourceHttpError, RequestIdentity, tdx_identity, add_cache_arguments, transport_from_args
+
 UPSTREAM_REPO = "https://github.com/simonlin1212/a-stock-data"
 UPSTREAM_VERSION = "3.10.4"
 UPSTREAM_COMMIT = "f21534946c42be3ad048ac938eecb1bad84cb8ab"
@@ -359,12 +364,8 @@ def parse_tencent_payload(
 
 
 def fetch_tencent_daily(
-    symbol: str,
-    start: str,
-    end: str,
-    *,
-    timeout: float = 30.0,
-    opener=urllib.request.urlopen,
+    symbol: str, start: str, end: str, *, timeout: float = 30.0,
+    opener=urllib.request.urlopen, http: SourceHttp | None = None, as_of: str | None = None,
 ) -> TencentBatch:
     normalized, market, code = normalize_symbol(symbol)
     _parse_day(start)
@@ -372,34 +373,29 @@ def fetch_tencent_daily(
     if start > end:
         raise DataSourceError("invalid_range", f"{start} > {end}")
     param = f"{market}{code},day,{start},{end},640,"
-    errors: list[str] = []
+    transport = http or SourceHttp(timeout=timeout, opener=opener)
+    errors = []
     for host in TENCENT_HOSTS:
         url = f"{host}{TENCENT_KLINE_PATH}?{urllib.parse.urlencode({'param': param})}"
-        request = urllib.request.Request(url, headers=TENCENT_HEADERS)
+        def validate(raw):
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise DataSourceError("tencent_invalid_json") from exc
+            return parse_tencent_payload(payload, normalized, start, end, url, _sha256(raw))
         try:
-            with opener(request, timeout=timeout) as response:
-                raw = response.read()
-                status = getattr(response, "status", 200)
+            snap = transport.request(RequestIdentity("tencent-daily", url, symbol=normalized,
+                                                     date=start + ":" + end),
+                                     headers=TENCENT_HEADERS, validate=validate, as_of=as_of)
+            return validate(snap.raw)
+        except SourceHttpError as error:
+            raise DataSourceError(error.code, error.detail) from error
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403, 429):
+                raise DataSourceError("tencent_http_error", str(error.code)) from error
+            errors.append(f"{host}: HTTP {error.code}")
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             errors.append(f"{host}: {type(error).__name__}")
-            continue
-        if status >= 400:
-            errors.append(f"{host}: HTTP {status}")
-            continue
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            errors.append(f"{host}: invalid JSON")
-            continue
-        try:
-            return parse_tencent_payload(
-                payload,
-                normalized,
-                start,
-                end,
-                url,
-                _sha256(raw),
-            )
         except DataSourceError as error:
             if error.code in {"tencent_param_error", "unexpected_adjusted_series"}:
                 raise
@@ -525,38 +521,26 @@ def parse_tdx_package(
 
 
 def fetch_tdx_daily(
-    day: str,
-    *,
-    timeout: float = 90.0,
-    opener=urllib.request.urlopen,
+    day: str, *, timeout: float = 90.0, opener=urllib.request.urlopen,
+    http: SourceHttp | None = None, as_of: str | None = None,
 ) -> TdxBatch:
     _parse_day(day)
-    url = TDX_PACKAGE_URL.format(ymd=day.replace("-", ""))
-    request = urllib.request.Request(url, headers=TENCENT_HEADERS)
+    identity = tdx_identity(day)
+    transport = http or SourceHttp(timeout=timeout, opener=opener)
+    def validate(raw):
+        return parse_tdx_package(raw, day, source_url=identity.url)
     try:
-        with opener(request, timeout=timeout) as response:
-            raw = response.read()
-            status = getattr(response, "status", 200)
+        snapshot = transport.request(identity, headers=TENCENT_HEADERS,
+                                     validate=validate, as_of=as_of)
+        return validate(snapshot.raw)
     except urllib.error.HTTPError as error:
         if error.code == 404:
-            raise DataSourceError(
-                "tdx_package_unavailable",
-                f"{day}: non-trading day, not published yet, or outside retention",
-            ) from error
+            raise DataSourceError("tdx_package_unavailable", day) from error
         raise DataSourceError("tdx_http_error", f"{day}: HTTP {error.code}") from error
+    except SourceHttpError as error:
+        raise DataSourceError(error.code, error.detail) from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise DataSourceError(
-            "tdx_unavailable",
-            f"{day}: {type(error).__name__}",
-        ) from error
-    if status >= 400:
-        raise DataSourceError("tdx_http_error", f"{day}: HTTP {status}")
-    return parse_tdx_package(
-        raw,
-        day,
-        source_url=url,
-        raw_sha256=_sha256(raw),
-    )
+        raise DataSourceError("tdx_unavailable", f"{day}: {type(error).__name__}") from error
 
 
 def parse_sina_adjust_payload(
@@ -615,38 +599,30 @@ def parse_sina_adjust_payload(
 
 
 def fetch_sina_adjust(
-    symbol: str,
-    kind: str = "qfq",
-    *,
-    timeout: float = 20.0,
-    opener=urllib.request.urlopen,
+    symbol: str, kind: str = "qfq", *, timeout: float = 20.0,
+    opener=urllib.request.urlopen, http: SourceHttp | None = None, as_of: str | None = None,
 ) -> AdjustSeries:
     normalized, market, code = normalize_symbol(symbol)
     if kind not in {"qfq", "hfq"}:
         raise DataSourceError("invalid_adjust_kind", kind)
     url = SINA_ADJUST_URL.format(symbol=f"{market}{code}", kind=kind)
-    request = urllib.request.Request(url, headers=TENCENT_HEADERS)
+    transport = http or SourceHttp(timeout=timeout, opener=opener)
+    def validate(raw):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise DataSourceError("sina_adjust_not_utf8", normalized) from error
+        return parse_sina_adjust_payload(text, normalized, kind, source_url=url, raw_sha256=_sha256(raw))
     try:
-        with opener(request, timeout=timeout) as response:
-            raw = response.read()
-            status = getattr(response, "status", 200)
+        snap = transport.request(RequestIdentity("sina-adjust", url, symbol=normalized, adjust=kind),
+                                 headers=TENCENT_HEADERS, validate=validate, as_of=as_of)
+        return validate(snap.raw)
+    except SourceHttpError as error:
+        raise DataSourceError(error.code, error.detail) from error
+    except urllib.error.HTTPError as error:
+        raise DataSourceError("sina_adjust_http_error", f"{normalized}: HTTP {error.code}") from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise DataSourceError(
-            "sina_adjust_unavailable", f"{normalized}: {type(error).__name__}"
-        ) from error
-    if status >= 400:
-        raise DataSourceError("sina_adjust_http_error", f"{normalized}: HTTP {status}")
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise DataSourceError("sina_adjust_not_utf8", normalized) from error
-    return parse_sina_adjust_payload(
-        text,
-        normalized,
-        kind,
-        source_url=url,
-        raw_sha256=_sha256(raw),
-    )
+        raise DataSourceError("sina_adjust_unavailable", f"{normalized}: {type(error).__name__}") from error
 
 
 def review_findings(
@@ -1044,9 +1020,11 @@ def main(argv: list[str] | None = None) -> int:
     fetch.add_argument("--out", required=True, type=Path, help="canonical CSV path")
     fetch.add_argument("--report", type=Path, help="audit JSON path")
     fetch.add_argument("--timeout", type=float, default=60.0)
+    add_cache_arguments(fetch)
     args = parser.parse_args(argv)
 
     try:
+        http = transport_from_args(args)
         symbols = _split_csv(args.symbols, "symbols")
         days = _split_csv(args.days, "days")
         normalized_symbols = [normalize_symbol(symbol)[0] for symbol in symbols]
@@ -1055,10 +1033,10 @@ def main(argv: list[str] | None = None) -> int:
             normalized_symbols,
             checked_days,
             lambda symbol, start, end: fetch_tencent_daily(
-                symbol, start, end, timeout=args.timeout
+                symbol, start, end, timeout=args.timeout, http=http, as_of=args.as_of
             ),
-            lambda day: fetch_tdx_daily(day, timeout=args.timeout),
-            lambda symbol: fetch_sina_adjust(symbol, timeout=args.timeout),
+            lambda day: fetch_tdx_daily(day, timeout=args.timeout, http=http, as_of=args.as_of),
+            lambda symbol: fetch_sina_adjust(symbol, timeout=args.timeout, http=http, as_of=args.as_of),
         )
     except DataSourceError as error:
         print(f"error: {error}", file=sys.stderr)

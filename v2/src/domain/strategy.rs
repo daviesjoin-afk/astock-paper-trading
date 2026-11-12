@@ -294,7 +294,7 @@ pub fn orders_for_day_in(
     let held: std::collections::BTreeSet<&str> =
         positions.iter().map(|item| item.symbol.as_str()).collect();
     let target = budget_cents * policy.target_weight_bps / 10_000;
-    let mut used: i64 = positions
+    let used: i64 = positions
         .iter()
         .map(|item| {
             valuations
@@ -310,7 +310,13 @@ pub fn orders_for_day_in(
     let mut available_cash = (budget_cents - cash_floor - used)
         .min(cash_cents - cash_floor)
         .max(0);
-    for (symbol, scored) in signals {
+    // Spend limited cash and position slots on the strongest evidence first.
+    // Symbol order breaks equal scores so caller iteration cannot change fills.
+    let mut ranked: Vec<_> = signals.iter().collect();
+    ranked.sort_by(|left, right| {
+        right.1.score.cmp(&left.1.score).then_with(|| left.0.cmp(&right.0))
+    });
+    for (symbol, scored) in ranked {
         // Enter only on a clearly positive score. The band between EXIT_SCORE
         // and the entry threshold is deliberately inert: a condition sitting on
         // its threshold would otherwise open and close the same position
@@ -333,7 +339,9 @@ pub fn orders_for_day_in(
         let Some(price) = closes.get(symbol) else {
             continue;
         };
-        let room = (target - used).min(available_cash);
+        // The target is per symbol. Existing holdings already reduce the
+        // shared cash budget above; they do not consume another symbol's cap.
+        let room = target.min(available_cash);
         let mut quantity = room / price / 100 * 100;
         while quantity >= 100 {
             let amount = quantity * price;
@@ -356,7 +364,6 @@ pub fn orders_for_day_in(
                 quantity,
                 reason: scored.reason.to_string(),
             });
-            used += amount;
             available_cash -= amount + fees;
         }
     }

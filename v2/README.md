@@ -46,6 +46,22 @@ API 默认在 `http://127.0.0.1:8765`（本机开发）。服务器重写版沿�
 
 服务自身不联网。两条离线取数入口分别是全市场 `bar` 摄取和显式审核价格集合。
 
+### 公共查询与共享缓存（2026-11-12）
+
+日线、报价、公司资料与公告现有统一 Python SDK/CLI；原三个取数器也复用相同的
+传输和可选缓存。公司资料默认 SZ→深交所、SH/BJ→明确标记的东财来源；公告用巨潮。
+不引入新服务或重量级金融框架，Rust 核心仍不联网。
+
+```bash
+python data_sources/public_data.py company --symbol 000001.SZ --cache-dir ../data_cache/public
+python data_sources/public_data.py announcements --symbol 000001.SZ \
+  --start-day 2026-10-20 --end-day 2026-10-27 --cache-dir ../data_cache/public
+```
+
+使用方法、覆盖与时间限制见 [公共数据层](docs/PUBLIC-MARKET-DATA.md)，项目对比与
+实测见 [数据源研究](docs/MARKET-SOURCES-RESEARCH-2026-11-12.md)。缓存不是历史版本档案；
+刚抓的公司资料和日期精度公告不会自动用于早期回测或生成公司行为入账。
+
 ### 全市场 bar 摄取
 
 先按快速开始让内核创建全新的 schema 2 数据库并停止该进程，然后在 `v2/` 执行：
@@ -134,7 +150,8 @@ Oracle 单机部署、nginx、cron 与回滚见 `deploy/README.md`。
 `ASTOCK_V2_DB` 启动；本项目不尝试就地迁移。
 
 跨电脑继续请从 [公司电脑接续入口](docs/HANDOFF-COMPANY-2026-11-11.md) 开始，并阅读
-[真实历史核验结果](docs/REAL-HISTORY-REGIME-2026-11-11.md) 与
-[最新优化路线与离线对照工具](docs/OPTIMIZATION-2026-11-11.md)。
+[公共数据层](docs/PUBLIC-MARKET-DATA.md)、[排序/仓位修复的新全期结果](docs/SELECTION-VALIDATION-2026-11-12.md)。
+[11-11 基线核验](docs/REAL-HISTORY-REGIME-2026-11-11.md) 与
+[上一轮优化路线和离线工具](docs/OPTIMIZATION-2026-11-11.md) 保留为基线；最新下一步先处理成交时点与公司行为权益。
 [早期本机交接文档](docs/HANDOFF-2026-11-11-V3.md) 保留为历史快照，
 其中旧提交状态、数据缺失说明和旧收益表应以本轮接续入口为准。

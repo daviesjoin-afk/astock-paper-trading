@@ -1,4 +1,11 @@
-# 数据源适配器：a-stock-data 交叉核对
+# 公共数据入口与 a-stock-data 交叉核对
+
+2026-11-12 起，日线、报价、公司资料、公告统一入口为 `public_data.py`。SDK/CLI、
+共享缓存、来源与时间边界见 [公共数据层指南](../docs/PUBLIC-MARKET-DATA.md)；
+AKShare 等五项目及官方来源比较见 [调研记录](../docs/MARKET-SOURCES-RESEARCH-2026-11-12.md)。
+`ingest_market.py`、`a_stock_data.py`、`realtime_quotes.py` 已复用 `source_http.py`；
+缓存需显式启用，单个 TDX 日包可跨股票和采集器复用。以下双源交叉核对及人工审核流程保持。
+
 
 目标：把公开 A 股日线变成**可追溯、可复核**的输入，再交给现有
 `research/make_price_set.py` 和 `scripts/publish_price_set.sh`。本目录不访问

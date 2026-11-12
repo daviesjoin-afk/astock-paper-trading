@@ -259,3 +259,20 @@ host:www.tdx.com.cn
 # Public upstream a-stock-data v3.10.4 commit pinned for attribution in
 # v2/data_sources/{a_stock_data.py,README.md,THIRD_PARTY_NOTICES.md}.
 value:f21534946c42be3ad048ac938eecb1bad84cb8ab
+
+# --- public primary sources for the V2 on-demand reference-data layer (2026-11-12) ---
+# Official disclosure and company-profile hosts cited by company_disclosures.py,
+# its offline fixtures and docs/MARKET-SOURCES-RESEARCH-2026-11-12.md. Exact hosts
+# only; the code still restricts attachment URLs to official HTTPS CNINFO hosts.
+host:www.cninfo.com.cn
+host:webapi.cninfo.com.cn
+host:akshare.akfamily.xyz
+host:tushare.pro
+
+# Upstream open-source commits pinned for attribution in
+# docs/MARKET-SOURCES-RESEARCH-2026-11-12.md (AKShare, efinance, mootdx, adata).
+# Public GitHub commit identifiers, not credentials.
+value:1947bcd4aec1c256c70a205b0b32347555226a36
+value:c8fd370a3109b2d14a121e3a32a86e9c8354b01b
+value:e99ae34382d970c68654c6d17c45512e728f130d
+value:8217a4ec593e7bf6c9cf32a1aa74b711e7baa720

@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable, Sequence
 
 BATCH_SIZE = 800
@@ -107,40 +108,34 @@ def _parse_record(symbol: str, payload: str, observed_at: str) -> Quote | None:
             high_cents=_to_cents(fields[_F_HIGH]),
             low_cents=_to_cents(fields[_F_LOW]),
             volume_shares=int(fields[_F_VOLUME_HAND] or 0) * 100,
-            amount_cents=int(fields[_F_AMOUNT_WAN] or 0) * 10_000 * 100,
+            amount_cents=int((Decimal(fields[_F_AMOUNT_WAN] or '0') * 1_000_000).quantize(Decimal('1'), rounding=ROUND_HALF_UP)),
             observed_at=observed_at,
         )
-    except (QuoteError, ValueError):
+    except (QuoteError, ValueError, InvalidOperation, OverflowError):
         return None
 
 
-def fetch_quotes(symbols: Sequence[str], *, timeout: float = 10.0) -> list[Quote]:
-    """Fetch quotes for `symbols` (format `600000.SH`) in batches.
+def fetch_quotes(symbols: Sequence[str], *, timeout: float = 10.0,
+                 http=None, as_of: str | None = None) -> list[Quote]:
+    """Legacy scan adapter: failed batches are skipped; strict client reports errors.
 
-    Batches that fail are skipped rather than retried: the next scan is 3
-    minutes away, and a tight retry loop is exactly what gets an IP throttled.
+    Both callers share the validated HTTP/cache path and the Tencent parser.
     """
-    observed_at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
-    out: list[Quote] = []
+    try:
+        from .public_data import PublicDataClient
+        from .source_http import SourceHttp, SourceHttpError
+    except ImportError:
+        from public_data import PublicDataClient
+        from source_http import SourceHttp, SourceHttpError
+    client = PublicDataClient(http or SourceHttp(timeout=timeout))
+    out = []
+    fields = Quote.__dataclass_fields__
     for start in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[start:start + BATCH_SIZE]
-        query = ",".join(_to_tencent(s) for s in batch)
-        request = urllib.request.Request(
-            ENDPOINT + query, headers={"User-Agent": USER_AGENT}
-        )
         try:
-            raw = urllib.request.urlopen(request, timeout=timeout).read()
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+            result = client.quotes(symbols[start:start + BATCH_SIZE], as_of=as_of)
+        except (SourceHttpError, urllib.error.URLError, TimeoutError, OSError):
             continue
-        text = raw.decode("gbk", "replace")
-        by_symbol = dict(zip(batch, _records(text)))
-        for symbol in batch:
-            record = by_symbol.get(symbol)
-            if record is None:
-                continue
-            quote = _parse_record(symbol, record, observed_at)
-            if quote is not None:
-                out.append(quote)
+        out.extend(Quote(**{key: row[key] for key in fields}) for row in result["rows"])
     return out
 
 
