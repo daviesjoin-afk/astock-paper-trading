@@ -136,7 +136,7 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
         let day = &days[index];
         let start = &days[index - REGIME_LOOKBACK_DAYS];
         if index > first {
-            window.retain(|row| row.day.as_str() >= start);
+            window.retain(|row| row.day.as_str() >= start.as_str());
             window.extend(source.unadjusted_closes(day)?);
         }
         let bars: Vec<_> = window

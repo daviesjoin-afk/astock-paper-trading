@@ -1256,6 +1256,10 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli_args: Vec<String> = env::args().skip(1).collect();
+    if let Some(code) = astock_v2::cli::maybe_run(&cli_args) {
+        std::process::exit(code);
+    }
     let database = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "v2.sqlite3".into());
     let address = env::var("ASTOCK_V2_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".into());
     let mut store = Store::open(&database).map_err(|error| format!("{error:?}"))?;

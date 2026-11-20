@@ -328,3 +328,6 @@ value:072ca0857c48212d7220a97744ab2f7dcc86b7d622e1139de44df954ba49c799
 value: 284fd2106ce520ac1021e126edef8edcc090d11e
 value: 78228e03cda03aece0ef5b5378f7ee19c2f70bf7
 value: 9949fd5cb6a3111ae9e85c7d15a73c81c98379cd
+
+# Public SHA-256 digest of v2/data/price-set-examples/sample-prices.csv normalized rows.
+value:1a2ca8ef81169150a331fa1a805cd3af2c5c6938a6e69d7c6c14c5e97fa2c5bc

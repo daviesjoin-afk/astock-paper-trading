@@ -120,6 +120,28 @@ GET  /v2/prices/coverage
 
 没有实验、回放、研究复现或进化事件接口。
 
+## Rust 运维与盘中命令
+
+从 `v2/` 构建后运行。`astock-v2` 无参或显式传入 `serve` 时启动 HTTP 服务。
+
+```bash
+./target/release/astock-v2 db backup --db ./v2.sqlite3 --out ./backups/v2.sqlite3
+./target/release/astock-v2 db verify --db ./backups/v2.sqlite3
+./target/release/astock-v2 db restore --backup ./backups/v2.sqlite3 --db ./recovered.sqlite3
+./target/release/astock-v2 price-set --help
+./target/release/astock-v2 live-feed --universe ./work/live-a-universe.txt
+./target/release/astock-v2 live-loop --api http://127.0.0.1:8765   --universe ./work/live-a-universe.txt --log ./work/live/intraday-loop.log --ai off --once
+```
+
+备份和恢复先生成并校验 SQLite 快照，包含源库已提交的 WAL 数据。使用 `--force`
+替换已有数据库前，需关闭正在使用目标库的进程。
+
+`live-feed` 使用 `ureq` 的 rustls HTTPS 和 `encoding_rs` 的 GB18030 解码，从腾讯获取公开行情。
+可用 `--history-db` 指定只读历史库或含 `through_day` 的历史 JSON。`live-loop` 在上海交易时段向
+已有模拟盘 API 提交当前上海交易日内有源时间的行情，成交和风控由内核执行。
+省略 `--once` 会持续按轮询间隔运行。
+启用 AI 建议或使用自定义时区仍用 `scripts/live_paper_loop.py`。
+
 ## 验证
 
 ```powershell
