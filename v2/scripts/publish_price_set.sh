@@ -6,6 +6,7 @@
 # the live catalog.
 #
 # Env: ASTOCK_PRICE_SETS_DIR (default data/price-sets)
+#      ASTOCK_V2_BIN (default: this checkout's release binary)
 set -euo pipefail
 
 INPUT=""
@@ -63,6 +64,11 @@ if [ ! -f "$INPUT" ]; then
   exit 2
 fi
 
+BINARY="${ASTOCK_V2_BIN:-$(dirname "${BASH_SOURCE[0]}")/../target/release/astock-v2}"
+if [ -z "${ASTOCK_V2_BIN:-}" ] && [ ! -x "$BINARY" ] && [ -x "$BINARY.exe" ]; then
+  BINARY="$BINARY.exe"
+fi
+
 TARGET="$OUT_DIR/$SET_ID.json"
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -77,7 +83,9 @@ if [ -n "$DAYS" ]; then
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "python research/make_price_set.py ${GEN_ARGS[*]}"
+  printf '%q price-set' "$BINARY"
+  printf ' %q' "${GEN_ARGS[@]}"
+  printf '\n'
   echo "install: $STAGED -> $TARGET"
   exit 0
 fi
@@ -87,20 +95,28 @@ if [ -e "$TARGET" ] && [ "$FORCE" -ne 1 ]; then
   exit 3
 fi
 
-python research/make_price_set.py "${GEN_ARGS[@]}"
+if [ -d "$TARGET" ]; then
+  echo "artifact destination is a directory: $TARGET" >&2
+  exit 2
+fi
+
+BUILD_SUMMARY=$("$BINARY" price-set "${GEN_ARGS[@]}")
+printf '%s\n' "$BUILD_SUMMARY"
+# Use the builder's validated metadata from its success line.
+if [[ $BUILD_SUMMARY =~ \ entries=([0-9]+)\ missing=0\ source_digest=([0-9a-f]{64})$ ]]; then
+  ENTRIES="${BASH_REMATCH[1]}"
+  DIGEST="${BASH_REMATCH[2]}"
+else
+  echo "unexpected price-set build summary" >&2
+  exit 2
+fi
 mkdir -p "$OUT_DIR"
 cp "$STAGED" "$TARGET"
+if [ ! -f "$TARGET" ]; then
+  echo "artifact was not installed as a file: $TARGET" >&2
+  exit 2
+fi
 chmod 0644 "$TARGET" 2>/dev/null || true
 
-DIGEST=$(python - "$TARGET" <<'PY'
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-print(
-    "published set={} trust={} entries={} source_digest={}".format(
-        data["price_set_id"], data["trust"], len(data["entries"]), data["source_digest"]
-    )
-)
-PY
-)
-echo "$DIGEST"
+printf 'published set=%s trust=%s entries=%s source_digest=%s\n' "$SET_ID" "$TRUST" "$ENTRIES" "$DIGEST"
 echo "next: GET /v2/price-sets and GET /v2/price-sets/coverage?pack_id=$PACK&symbols=$SYMBOLS&days=${DAYS:-$START,$END}"

@@ -1,6 +1,5 @@
 //! Build a reviewed A-share close price set artifact from a CSV export.
-//! Rust equivalent of `v2/research/make_price_set.py` with identical digest and
-//! validation semantics.
+//! Records a digest of the normalized input rows and can report coverage gaps.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -53,58 +52,53 @@ pub struct GapReport {
 }
 
 pub fn parse_price(raw: &str) -> Result<i64, String> {
+    let invalid = || format!("price_not_a_number:{raw}");
+    let nonpositive = || format!("price_must_be_positive:{raw}");
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('+') {
-        return Err(if trimmed.starts_with('-') {
-            format!("price_must_be_positive:{raw}")
-        } else {
-            format!("price_not_a_number:{raw}")
-        });
-    }
-    let mut parts = trimmed.split('.');
-    let whole_str = parts.next().unwrap_or("");
-    let frac_str = parts.next();
-    if parts.next().is_some() {
-        return Err(format!("price_not_a_number:{raw}"));
-    }
-    if whole_str.is_empty() && frac_str.is_none_or(str::is_empty) {
-        return Err(format!("price_not_a_number:{raw}"));
-    }
-    if !whole_str.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("price_not_a_number:{raw}"));
-    }
-    let whole: i64 = if whole_str.is_empty() {
-        0
-    } else {
-        whole_str
-            .parse()
-            .map_err(|_| format!("price_not_a_number:{raw}"))?
+    let unsigned = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().map_err(|_| invalid())?),
+        None => (unsigned, 0),
     };
-    let frac_cents: i64 = match frac_str {
-        None => 0,
-        Some(f) => {
-            if !f.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(format!("price_not_a_number:{raw}"));
-            }
-            if f.len() > 2 {
-                // Reject only when non-zero beyond two decimals, matching Decimal * 100 integral check.
-                if !f[2..].bytes().all(|b| b == b'0') {
-                    return Err(format!("price_more_than_two_decimals:{raw}"));
-                }
-            }
-            let d1 = f.as_bytes().first().copied().unwrap_or(b'0') - b'0';
-            let d2 = f.as_bytes().get(1).copied().unwrap_or(b'0') - b'0';
-            i64::from(d1) * 10 + i64::from(d2)
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let digits = format!("{whole}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Err(nonpositive());
+    }
+    // Shift the decimal point into cents exactly, without rounding or floating point.
+    let shift = exponent
+        .saturating_add(2)
+        .saturating_sub(fraction.len() as i64);
+    let (significant, zeros) = if shift < 0 {
+        let removed = usize::try_from(shift.unsigned_abs()).unwrap_or(usize::MAX);
+        let keep = digits.len().saturating_sub(removed);
+        if !digits[keep..].bytes().all(|b| b == b'0') {
+            return Err(format!("price_more_than_two_decimals:{raw}"));
         }
+        (&digits[..keep], 0)
+    } else {
+        (digits, shift)
     };
-    let cents = whole
-        .checked_mul(100)
-        .and_then(|v| v.checked_add(frac_cents))
-        .ok_or_else(|| format!("price_not_a_number:{raw}"))?;
-    if cents <= 0 {
-        return Err(format!("price_must_be_positive:{raw}"));
+    if trimmed.starts_with('-') {
+        return Err(nonpositive());
     }
-    Ok(cents)
+    if zeros > 18 {
+        return Err(invalid());
+    }
+    significant
+        .parse::<i64>()
+        .ok()
+        .and_then(|cents| cents.checked_mul(10_i64.pow(zeros as u32)))
+        .ok_or_else(invalid)
 }
 
 fn csv_record(
@@ -295,68 +289,51 @@ pub fn gap_report(entries: &[PriceSetEntry], symbols: &[String], days: &[String]
 
 pub fn run(args: &[String]) -> i32 {
     const USAGE: &str = "usage: astock-v2 price-set --input <csv> --out <json> --set-id <id> --pack <id> --coverage-start <day> --coverage-end <day> --symbols <csv> [--days <csv>] [--report <json>] [--trust reviewed|synthetic] [--allow-gaps]";
-    if args
-        .iter()
-        .any(|flag| matches!(flag.as_str(), "-h" | "--help"))
-    {
-        println!("{USAGE}");
-        return 0;
-    }
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut report_path: Option<PathBuf> = None;
-    let mut set_id: Option<String> = None;
-    let mut pack: Option<String> = None;
-    let mut trust = "reviewed".to_string();
-    let mut coverage_start: Option<String> = None;
-    let mut coverage_end: Option<String> = None;
-    let mut symbols_raw: Option<String> = None;
-    let mut days_raw = String::new();
+    let mut set_id: Option<&str> = None;
+    let mut pack: Option<&str> = None;
+    let mut trust = "reviewed";
+    let mut coverage_start: Option<&str> = None;
+    let mut coverage_end: Option<&str> = None;
+    let mut symbols_raw: Option<&str> = None;
+    let mut days_raw = "";
     let mut allow_gaps = false;
 
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] != "--allow-gaps" && args.get(i + 1).is_none_or(|value| value.starts_with("--"))
-        {
-            eprintln!("error: missing value for {}", args[i]);
-            return 2;
-        }
-        let take = |i: &mut usize| -> Option<String> {
-            if *i + 1 < args.len() {
-                let val = args[*i + 1].clone();
-                *i += 2;
-                Some(val)
-            } else {
-                None
+    let mut flags = args.iter().map(String::as_str).peekable();
+    while let Some(arg) = flags.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "-h" | "--help" if inline.is_none() => {
+                println!("{USAGE}");
+                return 0;
             }
-        };
-        match args[i].as_str() {
-            "--input" => input = take(&mut i).map(PathBuf::from),
-            "--out" => out = take(&mut i).map(PathBuf::from),
-            "--report" => report_path = take(&mut i).map(PathBuf::from),
-            "--set-id" => set_id = take(&mut i),
-            "--pack" => pack = take(&mut i),
-            "--trust" => {
-                if let Some(v) = take(&mut i) {
-                    trust = v;
-                } else {
-                    return 2;
-                }
-            }
-            "--coverage-start" => coverage_start = take(&mut i),
-            "--coverage-end" => coverage_end = take(&mut i),
-            "--symbols" => symbols_raw = take(&mut i),
-            "--days" => {
-                if let Some(v) = take(&mut i) {
-                    days_raw = v;
-                } else {
-                    return 2;
-                }
-            }
-            "--allow-gaps" => {
+            "--allow-gaps" if inline.is_none() => {
                 allow_gaps = true;
-                i += 1;
+                continue;
             }
+            _ => {}
+        }
+        let value =
+            inline.or_else(|| flags.next_if(|next| !next.starts_with("--") && *next != "-h"));
+        let Some(value) = value else {
+            eprintln!("error: missing value for {flag}");
+            return 2;
+        };
+        match flag {
+            "--input" => input = Some(PathBuf::from(value)),
+            "--out" => out = Some(PathBuf::from(value)),
+            "--report" => report_path = Some(PathBuf::from(value)),
+            "--set-id" => set_id = Some(value),
+            "--pack" => pack = Some(value),
+            "--trust" => trust = value,
+            "--coverage-start" => coverage_start = Some(value),
+            "--coverage-end" => coverage_end = Some(value),
+            "--symbols" => symbols_raw = Some(value),
+            "--days" => days_raw = value,
             other => {
                 eprintln!("error: unknown argument: {other}");
                 return 2;
@@ -382,9 +359,7 @@ pub fn run(args: &[String]) -> i32 {
         symbols_raw,
     )
     else {
-        eprintln!(
-            "usage: astock-v2 price-set --input <csv> --out <json> --set-id <id> --pack <id> --coverage-start <day> --coverage-end <day> --symbols <csv> [--days <csv>] [--report <json>] [--trust reviewed|synthetic] [--allow-gaps]"
-        );
+        eprintln!("{USAGE}");
         return 2;
     };
 
@@ -408,7 +383,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let artifact = match build_set(rows, &set_id, &pack, &trust, &cov_start, &cov_end, &symbols) {
+    let artifact = match build_set(rows, set_id, pack, trust, cov_start, cov_end, &symbols) {
         Ok(a) => a,
         Err(err) => {
             eprintln!("error: {err}");
@@ -478,6 +453,12 @@ mod tests {
         assert_eq!(parse_price("12.34"), Ok(1234));
         assert_eq!(parse_price("12.3"), Ok(1230));
         assert_eq!(parse_price("12"), Ok(1200));
+        assert_eq!(parse_price("+1.2340e1"), Ok(1234));
+        assert_eq!(parse_price("1E-2"), Ok(1));
+        assert_eq!(parse_price("92233720368547758.07"), Ok(i64::MAX));
+        assert!(parse_price("92233720368547758.08").is_err());
+        assert!(parse_price("1e-3").is_err());
+        assert!(parse_price("1e100").is_err());
         assert!(parse_price("12.345").is_err());
         assert!(parse_price("0").is_err());
         assert!(parse_price("-1.00").is_err());
@@ -505,7 +486,102 @@ mod tests {
     }
 
     #[test]
-    fn sample_prices_digest_matches_python_implementation() {
+    fn cli_builds_reviewed_artifacts_and_reports_gaps() {
+        let dir = std::env::temp_dir().join(format!("astock-price-set-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("prices.csv");
+        let out = dir.join("set.json");
+        let report = dir.join("report.json");
+        fs::write(&input, format!("{HEADER}{ROWS}")).unwrap();
+        let mut args = vec![
+            format!("--input={}", input.display()),
+            format!("--out={}", out.display()),
+            format!("--report={}", report.display()),
+            "--set-id=cn-close-2026-11".into(),
+            "--pack=cn-offline-fixture-pack-1".into(),
+            "--coverage-start=2026-10-30".into(),
+            "--coverage-end=2026-11-02".into(),
+            "--symbols=600000.SH".into(),
+            "--days=2026-10-30,2026-11-02,2026-11-03".into(),
+        ];
+        let read_json = |path: &Path| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+        };
+        assert_eq!(run(&args), 3);
+        assert!(!out.exists());
+        assert_eq!(
+            read_json(&report)["missing"],
+            serde_json::json!([{"symbol": "600000.SH", "day": "2026-11-03"}])
+        );
+        args.push("--allow-gaps".into());
+        assert_eq!(run(&args), 0);
+        let artifact = read_json(&out);
+        assert_eq!(artifact["schema_version"], 1);
+        assert_eq!(artifact["trust"], "reviewed");
+        assert_eq!(artifact["entries"][0]["price_cents"], 1234);
+        assert_eq!(artifact["entries"][1]["price_cents"], 1219);
+        assert_eq!(
+            artifact["source_digest"],
+            "353a24025fdb8aa8aaee094af829ec27de7441f21c9dc76fbec450597bb51d8c"
+        );
+        args.pop();
+        *args.last_mut().unwrap() = "--days=2026-10-30,2026-11-02".into();
+        assert_eq!(run(&args), 0);
+        let complete_report = read_json(&report);
+        assert_eq!(complete_report["missing"], serde_json::json!([]));
+        assert_eq!(complete_report["entries"], 2);
+        assert_eq!(complete_report["source_digest"], artifact["source_digest"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    const HEADER: &str = "symbol,day,price,source,observed_at
+";
+    const ROWS: &str = concat!(
+        "600000.SH,2026-10-30,12.34,vendor-close,2026-10-30T15:00:00+08:00
+",
+        "600000.SH,2026-11-02,12.19,vendor-close,2026-11-02T15:00:00+08:00
+",
+    );
+
+    #[test]
+    fn rejects_duplicate_undeclared_and_out_of_coverage_rows() {
+        let duplicate = ROWS.lines().next().unwrap();
+        assert_eq!(
+            parse_rows(&format!(
+                "{HEADER}{ROWS}{duplicate}
+"
+            )),
+            Err("duplicate_row:600000.SH:2026-10-30".into())
+        );
+        let rows = parse_rows(&format!("{HEADER}{ROWS}")).unwrap();
+        assert_eq!(
+            build_set(
+                rows.clone(),
+                "s",
+                "pack",
+                "reviewed",
+                "2026-10-30",
+                "2026-11-02",
+                &["000001.SZ".into()]
+            ),
+            Err("symbol_not_declared:600000.SH".into())
+        );
+        assert_eq!(
+            build_set(
+                rows,
+                "s",
+                "pack",
+                "reviewed",
+                "2026-11-01",
+                "2026-11-02",
+                &["600000.SH".into()]
+            ),
+            Err("entry_outside_coverage:600000.SH:2026-10-30".into())
+        );
+    }
+
+    #[test]
+    fn sample_prices_digest_is_stable() {
         let sample =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("data/price-set-examples/sample-prices.csv");
         let rows = load_rows(&sample).unwrap();

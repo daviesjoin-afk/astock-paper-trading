@@ -1,6 +1,7 @@
 //! Wall-clock scheduler and transport for the intraday paper kernel.
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use crate::domain::{BUNDLED_CALENDAR_JSON, CalendarDay, TradingCalendar};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -12,6 +13,9 @@ use std::time::Duration;
 const DEFAULT_API: &str = "http://127.0.0.1:8765";
 const DEFAULT_INTERVAL: u64 = 180;
 const DEFAULT_BATCH: usize = 800;
+// The watchdog allows seven minutes: two default three-minute polls plus one
+// minute of slack. Keep the same fixed ceiling even if --interval is longer.
+pub(super) const LIVE_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(7);
 const TIMEZONE: &str = "Asia/Shanghai";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONSECUTIVE_WAITS: usize = 5;
@@ -26,6 +30,7 @@ Options:
   --api URL           Kernel base URL (default: http://127.0.0.1:8765)
   --universe PATH     Symbol list (default: v2/work/live-a-universe.txt)
   --history-db PATH   Optional SQLite bar database (default: ASTOCK_HISTORY_DB)
+  --calendar PATH     Trading calendar JSON (default: bundled 2026 SH/SZ schedule)
   --interval SECONDS  Polling interval (default: 180)
   --close HH:MM       Session close cutoff (default: 15:00)
   --ai off            Deterministic mode (default: off)
@@ -35,13 +40,15 @@ Options:
   --log PATH          Append JSON lines (default: v2/work/live/intraday-loop.log)
   -h, --help          Show help
 
+Quote source time must be observed in the current session, no later than fetch,
+and within seven minutes of submission (two default polls plus one minute).
 Use v2/scripts/live_paper_loop.py for --ai on or a custom timezone.";
 
 const fn market_time(hour: u32, minute: u32) -> NaiveTime {
     NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
 }
 
-fn shanghai() -> FixedOffset {
+pub(super) fn shanghai() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).unwrap()
 }
 
@@ -49,6 +56,7 @@ struct Config {
     api: String,
     universe: PathBuf,
     history_db: Option<PathBuf>,
+    calendar_path: Option<PathBuf>,
     interval: u64,
     close: NaiveTime,
     max_rounds: Option<u64>,
@@ -65,6 +73,7 @@ impl Config {
             history_db: std::env::var_os("ASTOCK_HISTORY_DB")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
+            calendar_path: None,
             interval: DEFAULT_INTERVAL,
             close: AFTERNOON_CLOSE,
             max_rounds: None,
@@ -81,7 +90,7 @@ impl Config {
                 ("--once", None) => config.once = true,
                 (
                     "--api" | "--universe" | "--history-db" | "--interval" | "--close" | "--ai"
-                    | "--max-rounds" | "--timezone" | "--log",
+                    | "--max-rounds" | "--timezone" | "--log" | "--calendar",
                     _,
                 ) => {
                     let value = inline
@@ -93,6 +102,7 @@ impl Config {
                         "--history-db" => {
                             config.history_db = (!value.is_empty()).then(|| value.into())
                         }
+                        "--calendar" => config.calendar_path = Some(value.into()),
                         "--interval" => config.interval = positive(flag, value)?,
                         "--close" => {
                             config.close =
@@ -141,8 +151,20 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let calendar = match load_calendar(config.calendar_path.as_deref()) {
+        Ok(calendar) => calendar,
+        Err(reason) => {
+            emit_log(
+                &config.log,
+                "calendar_unavailable",
+                json!({"reason": reason}),
+            );
+            return 1;
+        }
+    };
     run_loop(
         &config,
+        &calendar,
         || Utc::now().with_timezone(&shanghai()),
         thread::sleep,
         || {
@@ -161,6 +183,28 @@ pub fn run(args: &[String]) -> i32 {
         },
         |event, fields| emit_log(&config.log, event, fields),
     )
+}
+
+pub(super) fn load_calendar(path: Option<&Path>) -> Result<TradingCalendar, &'static str> {
+    let calendar = match path {
+        Some(path) => {
+            let contents = fs::read_to_string(path).map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => "FileNotFoundError",
+                io::ErrorKind::PermissionDenied => "PermissionError",
+                io::ErrorKind::InvalidData => "UnicodeDecodeError",
+                _ => "OSError",
+            })?;
+            serde_json::from_str(&contents)
+        }
+        None => serde_json::from_str(BUNDLED_CALENDAR_JSON),
+    }
+    .map_err(|error| match error.classify() {
+        serde_json::error::Category::Data => "invalid_calendar",
+        _ => "JSONDecodeError",
+    })?;
+    let calendar: TradingCalendar = calendar;
+    calendar.validate().map_err(|_| "invalid_calendar")?;
+    Ok(calendar)
 }
 
 fn emit_log(path: &Path, event: &str, mut fields: Value) {
@@ -190,23 +234,37 @@ fn write_stdout(line: &str) {
     let _ = writeln!(stdout, "{line}").and_then(|_| stdout.flush());
 }
 
-fn in_session(now: DateTime<FixedOffset>, close: NaiveTime) -> bool {
-    let wall = now.time();
-    !is_weekend(now)
-        && ((MORNING_OPEN..=MORNING_CLOSE).contains(&wall)
-            || (AFTERNOON_OPEN..=AFTERNOON_CLOSE.min(close)).contains(&wall))
-}
-
-fn is_weekend(now: DateTime<FixedOffset>) -> bool {
-    now.weekday().num_days_from_monday() >= 5
-}
-
-fn next_session_open(now: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
-    let mut candidate = now.date_naive().and_time(MORNING_OPEN);
-    while candidate <= now.naive_local() || candidate.weekday().num_days_from_monday() >= 5 {
-        candidate += Duration::from_secs(86_400);
+fn session_open(wall: NaiveTime, close: NaiveTime) -> Option<NaiveTime> {
+    if (MORNING_OPEN..=MORNING_CLOSE).contains(&wall) {
+        Some(MORNING_OPEN)
+    } else if (AFTERNOON_OPEN..=AFTERNOON_CLOSE.min(close)).contains(&wall) {
+        Some(AFTERNOON_OPEN)
+    } else {
+        None
     }
-    shanghai().from_local_datetime(&candidate).single().unwrap()
+}
+
+fn next_session_open(
+    calendar: &TradingCalendar,
+    now: DateTime<FixedOffset>,
+) -> Option<DateTime<FixedOffset>> {
+    let mut day = now.date_naive();
+    loop {
+        match calendar.day(day).ok()? {
+            CalendarDay::Trading => {
+                let open = day
+                    .and_time(MORNING_OPEN)
+                    .and_local_timezone(shanghai())
+                    .single()?;
+                if open > now {
+                    return Some(open);
+                }
+            }
+            CalendarDay::Unknown => return None,
+            CalendarDay::Holiday | CalendarDay::Weekend => {}
+        }
+        day = day.succ_opt()?;
+    }
 }
 
 fn next_boundary(now: DateTime<FixedOffset>, interval: u64) -> Duration {
@@ -316,7 +374,9 @@ fn blocked_top3(decisions: &[Value]) -> Vec<(&str, usize)> {
 fn run_round(
     state: &mut RoundState,
     snapshot: Result<Value, String>,
-    session_day: NaiveDate,
+    scheduled_at: DateTime<FixedOffset>,
+    checked_at: DateTime<FixedOffset>,
+    close: NaiveTime,
     post: &mut impl FnMut(&str, &Value) -> Result<Value, String>,
     emit: &mut impl FnMut(&str, Value),
 ) -> bool {
@@ -345,11 +405,42 @@ fn run_round(
         );
         return false;
     };
-    if snapshot["quote_time_estimated"].as_bool() == Some(true) || local.date_naive() != session_day
+    let session_day = scheduled_at.date_naive();
+    if !matches!(
+        snapshot.get("quote_time_estimated"),
+        None | Some(Value::Bool(false))
+    ) || local.date_naive() != session_day
     {
         emit(
             "round_skipped",
             json!({"reason": "quote_time_not_observed_in_session_day", "quote_time": quote_time, "session_day": session_day.to_string()}),
+        );
+        return false;
+    }
+    let fetched_at = snapshot["fetched_at"]
+        .as_str()
+        .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok());
+    let reason = match fetched_at {
+        _ if checked_at.date_naive() != session_day
+            || session_open(local.time(), close) != session_open(scheduled_at.time(), close) =>
+        {
+            Some("quote_time_outside_session")
+        }
+        // Compare actual instants so future source or fetch times cannot extend freshness.
+        Some(fetched_at) if local <= fetched_at && fetched_at <= checked_at => {
+            (checked_at - local > LIVE_GRACE).then_some("stale_quote_snapshot")
+        }
+        _ => Some("invalid_quote_fetch_chronology"),
+    };
+    if let Some(reason) = reason {
+        emit(
+            "round_skipped",
+            json!({
+                "reason": reason,
+                "quote_time": quote_time,
+                "fetched_at": snapshot["fetched_at"],
+                "checked_at": checked_at.to_rfc3339(),
+            }),
         );
         return false;
     }
@@ -430,6 +521,7 @@ fn close_evolve(
 
 fn run_loop(
     config: &Config,
+    calendar: &TradingCalendar,
     mut clock: impl FnMut() -> DateTime<FixedOffset>,
     mut sleep: impl FnMut(Duration),
     mut snapshot: impl FnMut() -> Result<Value, String>,
@@ -442,13 +534,35 @@ fn run_loop(
     let mut last_idle_reason = None;
     loop {
         let mut now = clock();
-        if in_session(now, config.close) {
+        let day = now.date_naive();
+        let calendar_day = match calendar.day(day) {
+            Ok(CalendarDay::Unknown) => {
+                emit(
+                    "calendar_unavailable",
+                    json!({"reason": "calendar_coverage_missing", "day": day.to_string()}),
+                );
+                return 1;
+            }
+            Ok(calendar_day) => calendar_day,
+            Err(_) => {
+                emit(
+                    "calendar_unavailable",
+                    json!({"reason": "invalid_calendar", "day": day.to_string()}),
+                );
+                return 1;
+            }
+        };
+        let trading = calendar_day == CalendarDay::Trading;
+        if trading && session_open(now.time(), config.close).is_some() {
             last_idle_reason = None;
             waits = 0;
+            let input = snapshot();
             let posted = run_round(
                 &mut state,
-                snapshot(),
-                now.date_naive(),
+                input,
+                now,
+                clock(),
+                config.close,
                 &mut post,
                 &mut emit,
             );
@@ -458,11 +572,14 @@ fn run_loop(
             rounds += u64::from(posted);
             // A slow round can cross a polling boundary or the session close.
             now = clock();
+            if now.date_naive() != day {
+                continue;
+            }
         } else {
-            let reason = if is_weekend(now) {
-                "weekend"
-            } else {
-                "not_in_session"
+            let reason = match calendar_day {
+                CalendarDay::Weekend => "weekend",
+                CalendarDay::Holiday => "market_holiday",
+                _ => "not_in_session",
             };
             if last_idle_reason != Some(reason) {
                 last_idle_reason = Some(reason);
@@ -475,15 +592,21 @@ fn run_loop(
                 return 0;
             }
         }
-        let past_close = now.time() >= config.close || is_weekend(now);
-        if past_close {
+        let past_close = now.time() >= config.close;
+        if trading && past_close && state.day == Some(day) {
             close_evolve(&mut state, now, &mut post, &mut emit);
         }
         if config.max_rounds.is_some_and(|limit| rounds >= limit) {
             return 0;
         }
-        if past_close {
-            let target = next_session_open(now);
+        if past_close || !trading {
+            let Some(target) = next_session_open(calendar, now) else {
+                emit(
+                    "calendar_unavailable",
+                    json!({"reason": "calendar_coverage_missing", "day": day.to_string()}),
+                );
+                return 1;
+            };
             waits += 1;
             if waits > MAX_CONSECUTIVE_WAITS {
                 emit(
@@ -527,7 +650,7 @@ mod tests {
     fn snapshot(time: &str) -> Value {
         json!({
             "quote_time": time,
-            "fetched_at": "2026-11-20T10:03:07+08:00",
+            "fetched_at": source_time(&json!(time)).map(|stamp| stamp.to_rfc3339()),
             "quote_time_estimated": false,
             "quotes": [{"symbol": "600000.SH", "price_cents": 1010, "tradable": false}],
         })
@@ -554,6 +677,7 @@ mod tests {
             "bars.sqlite",
             "--interval",
             "90",
+            "--calendar=calendar.json",
             "--close",
             "14:30",
             "--ai=off",
@@ -566,6 +690,10 @@ mod tests {
         assert_eq!(parsed.universe, Path::new("universe.txt"));
         assert_eq!(parsed.history_db.as_deref(), Some(Path::new("bars.sqlite")));
         assert_eq!(parsed.interval, 90);
+        assert_eq!(
+            parsed.calendar_path.as_deref(),
+            Some(Path::new("calendar.json"))
+        );
         assert_eq!(parsed.close, market_time(14, 30));
         assert_eq!(parsed.max_rounds, Some(2));
         assert!(parsed.once);
@@ -574,13 +702,14 @@ mod tests {
 
     #[test]
     fn once_posts_one_unfiltered_snapshot_with_source_identity() {
-        let mut times = [local("2026-11-20T10:03:05")].into_iter();
+        let now = local("2026-11-20T10:03:05");
         let snapshot = snapshot("2026-11-20T02:00:02.123Z");
         let mut events = Vec::new();
         let mut calls = 0;
         let code = run_loop(
             &config(&["--once"]),
-            || times.next().unwrap(),
+            &load_calendar(None).unwrap(),
+            || now,
             |_| panic!("--once must not sleep"),
             || Ok(snapshot.clone()),
             |path, body| {
@@ -632,6 +761,8 @@ mod tests {
         estimated["quote_time_estimated"] = json!(true);
         for (at, input, code, expected) in [
             ("2026-11-21T10:03:05", None, 0, "outside_session"),
+            ("2026-10-05T10:03:05", None, 0, "outside_session"),
+            ("2027-01-04T10:03:05", None, 1, "calendar_unavailable"),
             ("2026-11-20T12:03:05", None, 0, "outside_session"),
             ("2026-11-20T09:29:59", None, 0, "outside_session"),
             ("2026-11-20T14:30:01", None, 0, "outside_session"),
@@ -671,6 +802,7 @@ mod tests {
             assert_eq!(
                 run_loop(
                     &config(&["--once", "--close=14:30"]),
+                    &load_calendar(None).unwrap(),
                     || local(at),
                     |_| panic!("--once must not sleep"),
                     || input.take().expect("feed must not be called"),
@@ -684,6 +816,87 @@ mod tests {
     }
 
     #[test]
+    fn freshness_uses_post_fetch_clock_and_requires_current_session_quotes() {
+        for (quote, fetched, reason) in [
+            ("10:03:00", "10:03:05", None),
+            ("10:02:59.999", "10:03:05", Some("stale_quote_snapshot")),
+            (
+                "10:03:06",
+                "10:03:05",
+                Some("invalid_quote_fetch_chronology"),
+            ),
+            (
+                "10:03:06",
+                "10:10:01",
+                Some("invalid_quote_fetch_chronology"),
+            ),
+            (
+                "10:03:06",
+                "invalid",
+                Some("invalid_quote_fetch_chronology"),
+            ),
+            ("09:29:59", "10:03:05", Some("quote_time_outside_session")),
+        ] {
+            let scheduled = local("2026-11-20T10:03:04");
+            let checked = local("2026-11-20T10:10:00");
+            let mut clocks = [scheduled, checked].into_iter();
+            let mut input = snapshot(&format!("2026-11-20T{quote}+08:00"));
+            input["fetched_at"] = json!(format!("2026-11-20T{fetched}+08:00"));
+            let mut sent = false;
+            assert_eq!(
+                run_loop(
+                    &config(&["--once", "--interval=1200"]),
+                    &load_calendar(None).unwrap(),
+                    || clocks.next().unwrap(),
+                    |_| panic!("--once must not sleep"),
+                    || Ok(input.clone()),
+                    |path, _| {
+                        assert_eq!(path, "/v2/live/round");
+                        sent = true;
+                        Ok(json!({}))
+                    },
+                    |event, fields| match reason {
+                        Some(reason) => {
+                            assert_eq!(event, "round_skipped");
+                            assert_eq!(fields["reason"], reason);
+                        }
+                        None => assert_eq!(event, "round"),
+                    },
+                ),
+                i32::from(reason.is_some())
+            );
+            assert_eq!(sent, reason.is_none());
+        }
+    }
+
+    #[test]
+    fn scheduler_jumps_holidays_and_stops_at_calendar_end() {
+        let calendar = load_calendar(None).unwrap();
+        assert_eq!(
+            next_session_open(&calendar, local("2026-09-30T15:00:00")),
+            Some(local("2026-10-08T09:30:00"))
+        );
+        let mut events = Vec::new();
+        assert_eq!(
+            run_loop(
+                &config(&[]),
+                &calendar,
+                || local("2026-12-31T15:01:00"),
+                |_| panic!("must not schedule beyond coverage"),
+                || panic!("must not fetch outside the session"),
+                |_, _| panic!("must not post without rounds"),
+                |event, fields| events.push((event.to_owned(), fields)),
+            ),
+            1
+        );
+        assert_eq!(events.last().unwrap().0, "calendar_unavailable");
+        assert_eq!(
+            events.last().unwrap().1["reason"],
+            "calendar_coverage_missing"
+        );
+    }
+
+    #[test]
     fn failed_posts_retry_on_poll_boundaries_with_the_same_id() {
         let now = Cell::new(local("2026-11-20T10:02:59"));
         let mut polls = Vec::new();
@@ -692,6 +905,7 @@ mod tests {
         let mut delays = Vec::new();
         let code = run_loop(
             &config(&["--max-rounds=1"]),
+            &load_calendar(None).unwrap(),
             || now.get(),
             |delay| {
                 delays.push(delay.as_secs());
@@ -737,6 +951,7 @@ mod tests {
         let mut calls = Vec::new();
         let code = run_loop(
             &config(&["--max-rounds=3"]),
+            &load_calendar(None).unwrap(),
             || now.get(),
             |delay| {
                 pauses.push(delay.as_secs());
@@ -799,6 +1014,7 @@ mod tests {
         let mut events = Vec::new();
         let code = run_loop(
             &config(&[]),
+            &load_calendar(None).unwrap(),
             || local("2026-11-21T10:03:05"),
             |_| sleeps += 1,
             || panic!("weekend must not fetch"),

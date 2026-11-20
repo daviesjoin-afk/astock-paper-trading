@@ -532,7 +532,7 @@ async fn coverage(State(state): State<AppState>) -> ApiResult {
 
 // ---- whole-market bar endpoints -------------------------------------------
 //
-// These read the `bar` table that `data_sources/ingest_market.py` fills. The
+// These read the `bar` table that `astock-v2 ingest` fills. The
 // reviewed-price-set path above is unchanged and still drives settlement; this
 // is the read side of the full-market data that the reviewed sets never had.
 

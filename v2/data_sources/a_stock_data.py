@@ -4,7 +4,7 @@
 This module is deliberately outside the Rust domain and store. It never opens
 the ledger, never decides order quantity and never writes a price set. Its only
 output is a canonical CSV plus an audit report for the existing
-`research/make_price_set.py` pipeline.
+`astock-v2 price-set` pipeline.
 
 The Tencent K-line and Tongdaxin after-hours package logic is adapted from
 simonlin1212/a-stock-data v3.10.4 (Apache-2.0), commit

@@ -59,13 +59,22 @@
 
 ## 离线生成
 
-原始 CSV（`symbol,day,price,source,observed_at`，价格为元）可用标准库脚本生成工件：
+在 `v2/` 执行 `cargo build --release --locked`，再用原始 CSV
+（`symbol,day,price,source,observed_at`，价格为元）生成工件：
 
 ```bash
-python v2/research/make_price_set.py   --input prices.csv --out data/price-sets/cn-close-2026-11.json   --report /tmp/report.json   --set-id cn-close-2026-11 --pack cn-offline-fixture-pack-1   --trust reviewed --coverage-start 2026-10-01 --coverage-end 2026-10-31   --symbols 600000.SH,000001.SZ   --days 2026-10-30,2026-11-02
+./target/release/astock-v2 price-set \
+  --input prices.csv --out /tmp/cn-close-2026-11.json \
+  --report /tmp/report.json --set-id cn-close-2026-11 \
+  --pack cn-offline-fixture-pack-1 --trust reviewed \
+  --coverage-start 2026-10-30 --coverage-end 2026-11-02 \
+  --symbols 600000.SH,000001.SZ --days 2026-10-30,2026-11-02
 ```
 
-- 价格转换为整数分，超过两位小数直接拒绝；
+完成审核后，通过 `scripts/publish_price_set.sh` 发布。脚本默认使用本项目的 release
+可执行文件，也可通过 `ASTOCK_V2_BIN` 指定其他已构建或已安装的 `astock-v2`。
+
+- 价格转换为整数分，无法精确转换为整数分的价格直接拒绝；
 - `source_digest` = 规范化行（排序后）的 SHA-256；
 - `--days` 给定时生成缺口报告；存在缺口默认**退出码 3 且不写工件**，`--allow-gaps` 才写入；
 - 重复 `(symbol, day)`、未声明标的、超出覆盖区间、空字段、非法日期均报错退出码 2。

@@ -1,5 +1,5 @@
 //! Online backup, restore and verification for V2 SQLite databases.
-//! Rust equivalent of `v2/scripts/db_tool.py` using SQLite's online backup API.
+//! Uses SQLite snapshots that include committed WAL data.
 
 use std::{
     fs, io,
@@ -272,63 +272,65 @@ pub fn verify_db(path: &Path) -> i32 {
 }
 
 pub fn run(args: &[String]) -> i32 {
+    const USAGE: &str = "usage: astock-v2 db <backup|restore|verify> ...";
     let Some((sub, rest)) = args.split_first() else {
-        eprintln!("usage: astock-v2 db <backup|restore|verify> ...");
+        eprintln!("{USAGE}");
         return 2;
     };
+    let usage = match sub.as_str() {
+        "backup" => "usage: astock-v2 db backup --db <path> --out <path> [--force]",
+        "restore" => "usage: astock-v2 db restore --backup <path> --db <path> [--force]",
+        "verify" => "usage: astock-v2 db verify --db <path>",
+        "-h" | "--help" => {
+            println!("{USAGE}");
+            return 0;
+        }
+        other => {
+            eprintln!("error: unknown db subcommand: {other}");
+            return 2;
+        }
+    };
+
     let mut db = None;
     let mut out = None;
     let mut backup = None;
     let mut force = false;
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--db" if i + 1 < rest.len() => {
-                db = Some(Path::new(&rest[i + 1]).to_path_buf());
-                i += 2;
-            }
-            "--out" if i + 1 < rest.len() => {
-                out = Some(Path::new(&rest[i + 1]).to_path_buf());
-                i += 2;
-            }
-            "--backup" if i + 1 < rest.len() => {
-                backup = Some(Path::new(&rest[i + 1]).to_path_buf());
-                i += 2;
-            }
-            "--force" => {
+    let mut flags = rest.iter().map(String::as_str).peekable();
+    while let Some(arg) = flags.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        let destination = match flag {
+            "--db" => &mut db,
+            "--out" if sub == "backup" => &mut out,
+            "--backup" if sub == "restore" => &mut backup,
+            "--force" if sub != "verify" && inline.is_none() => {
                 force = true;
-                i += 1;
+                continue;
             }
-            other => {
-                eprintln!("error: unknown argument: {other}");
+            "-h" | "--help" if inline.is_none() => {
+                println!("{usage}");
+                return 0;
+            }
+            _ => {
+                eprintln!("error: unknown argument: {arg}");
                 return 2;
             }
-        }
+        };
+        let value =
+            inline.or_else(|| flags.next_if(|next| !next.starts_with("--") && *next != "-h"));
+        let Some(value) = value else {
+            eprintln!("error: missing value for {flag}");
+            return 2;
+        };
+        *destination = Some(Path::new(value));
     }
-    match sub.as_str() {
-        "backup" => match (db, out) {
-            (Some(src), Some(dst)) => backup_db(&src, &dst, force),
-            _ => {
-                eprintln!("usage: astock-v2 db backup --db <path> --out <path> [--force]");
-                2
-            }
-        },
-        "restore" => match (backup, db) {
-            (Some(src), Some(dst)) => restore_db(&src, &dst, force),
-            _ => {
-                eprintln!("usage: astock-v2 db restore --backup <path> --db <path> [--force]");
-                2
-            }
-        },
-        "verify" => match db {
-            Some(path) => verify_db(&path),
-            None => {
-                eprintln!("usage: astock-v2 db verify --db <path>");
-                2
-            }
-        },
-        other => {
-            eprintln!("error: unknown db subcommand: {other}");
+    match (sub.as_str(), db, out, backup) {
+        ("backup", Some(src), Some(dst), _) => backup_db(src, dst, force),
+        ("restore", Some(dst), _, Some(src)) => restore_db(src, dst, force),
+        ("verify", Some(path), _, _) => verify_db(path),
+        _ => {
+            eprintln!("{usage}");
             2
         }
     }
@@ -358,6 +360,18 @@ mod tests {
              CREATE TABLE day_run(account_id TEXT, day TEXT);",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cli_preserves_help_and_rejects_invalid_flags() {
+        let call =
+            |args: &[&str]| run(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+        assert_eq!(call(&["--help"]), 0);
+        assert_eq!(call(&["backup", "--help"]), 0);
+        assert_eq!(call(&["restore", "-h"]), 0);
+        assert_eq!(call(&["verify", "--help"]), 0);
+        assert_eq!(call(&["backup", "--db", "--out", "backup.sqlite3"]), 2);
+        assert_eq!(call(&["verify", "--force", "--db=anything.sqlite3"]), 2);
     }
 
     #[test]

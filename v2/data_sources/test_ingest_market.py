@@ -6,21 +6,15 @@ All package bytes are synthesised here so the suite never touches the network.
 
 from __future__ import annotations
 
-from contextlib import closing
 import io
-from pathlib import Path
-import sqlite3
 import struct
-import tempfile
 import unittest
 import zipfile
 
 from ingest_market import (
     IngestError,
-    _expand_days,
     is_ordinary_a_share,
     parse_package,
-    sync_schema,
 )
 
 
@@ -239,74 +233,6 @@ class ParseTests(unittest.TestCase):
         )
         rows = parse_package(content, "20211210")
         self.assertEqual({r.symbol.split(".")[1] for r in rows}, {"SH", "SZ"})
-
-
-class SchemaTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.db = Path(self.temp.name) / "legacy.sqlite3"
-        with closing(sqlite3.connect(self.db)) as connection, connection:
-            connection.executescript("""
-                CREATE TABLE bar(
-                    symbol TEXT, day TEXT, name TEXT,
-                    open_cents INTEGER, high_cents INTEGER, low_cents INTEGER,
-                    close_cents INTEGER, prev_close_cents INTEGER,
-                    volume_shares INTEGER, amount_cents INTEGER,
-                    adjust TEXT, source TEXT, PRIMARY KEY(symbol, day));
-                INSERT INTO bar VALUES
-                    ('000007.SZ','2026-11-10','halt',0,0,0,480,474,0,0,'none','tdx'),
-                    ('000008.SZ','2026-11-10','no-reference',0,0,0,480,0,0,0,'none','tdx'),
-                    ('600000.SH','2026-11-10','traded',1000,1020,990,1020,1010,100,102000,'none','tdx'),
-                    ('600001.SH','2026-11-10','adjusted',0,0,0,480,474,0,0,'qfq','v1-qfq');
-            """)
-
-    def rows(self):
-        connection = sqlite3.connect(self.db)
-        try:
-            return dict((symbol, (price, tradable)) for symbol, price, tradable
-                        in connection.execute("SELECT symbol,close_cents,tradable FROM bar"))
-        finally:
-            connection.close()
-
-    def test_legacy_halt_uses_reference_without_allowing_a_trade(self):
-        sync_schema(self.db)
-        self.assertEqual(self.rows()["000007.SZ"], (474, 0))
-        self.assertEqual(self.rows()["600000.SH"], (1020, 1))
-        self.assertEqual(self.rows()["600001.SH"], (480, 1))
-
-    def test_legacy_zero_quote_without_reference_stays_unpriced(self):
-        sync_schema(self.db)
-        self.assertEqual(self.rows()["000008.SZ"], (0, 0))
-
-    def test_reinitialization_preserves_existing_explicit_tradability(self):
-        sync_schema(self.db)
-        with closing(sqlite3.connect(self.db)) as connection, connection:
-            connection.execute("UPDATE bar SET tradable=0 WHERE symbol='600000.SH'")
-        before = self.rows()
-        sync_schema(self.db)
-        self.assertEqual(self.rows(), before)
-        self.assertEqual(self.rows()["600000.SH"], (1020, 0))
-
-
-class DayRangeTests(unittest.TestCase):
-    def test_single_day(self):
-        self.assertEqual(_expand_days("2026-11-10"), ["2026-11-10"])
-
-    def test_inclusive_range_across_weekend(self):
-        days = _expand_days("2026-11-06:2026-11-10")
-        self.assertEqual(
-            days,
-            ["2026-11-06", "2026-11-07", "2026-11-08", "2026-11-09", "2026-11-10"],
-        )
-
-    def test_reversed_range_rejected(self):
-        with self.assertRaises(IngestError):
-            _expand_days("2026-11-10:2026-11-01")
-
-    def test_malformed_range_rejected(self):
-        with self.assertRaises(IngestError):
-            _expand_days("2026-11-10:")
 
 
 if __name__ == "__main__":

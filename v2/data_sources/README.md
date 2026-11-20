@@ -8,11 +8,11 @@ python data_sources/public_data.py datasets
 python data_sources/public_data.py dataset --name cls_telegraph --params '{"page_size":3}'
 ```
 
-原 `ingest_market.py`、`a_stock_data.py`、`realtime_quotes.py` 和共享 `SourceHttp` 保留，旧接口契约见 [公共数据层指南](../docs/PUBLIC-MARKET-DATA.md)。**以下章节保留早期双源价格集合流程及其当时边界，不代表当前公共层的数据范围或 Rust 功能全集。**双源核对与人工 reviewed 发布流程继续有效。
+`a_stock_data.py`、`realtime_quotes.py` 和共享 `SourceHttp` 保留；`ingest_market.py` 现在只提供公共 SDK 使用的解析与下载适配，日线写库由 `astock-v2 ingest` 负责。旧接口契约见 [公共数据层指南](../docs/PUBLIC-MARKET-DATA.md)。**以下章节保留早期双源价格集合流程及其当时边界，不代表当前公共层的数据范围或 Rust 功能全集。**双源核对与人工 reviewed 发布流程继续有效。
 
 
 目标：把公开 A 股日线变成**可追溯、可复核**的输入，再交给现有
-`research/make_price_set.py` 和 `scripts/publish_price_set.sh`。本目录不访问
+`astock-v2 price-set` 和 `scripts/publish_price_set.sh`。本目录不访问
 SQLite 账本、不决定下单数量、不自动发布 `reviewed` 数据。
 
 ## 1. 它解决什么问题
@@ -107,10 +107,11 @@ bash scripts/fetch_and_publish_reviewed.sh \
 ## 4. 接入价格集合
 
 先按现有指南审核来源、覆盖区间、复权口径和停牌处理，再决定信任级别。
-建议第一次先用 `synthetic` 跑通链路：
+建议第一次先用 `synthetic` 跑通链路。在 `v2/` 执行：
 
 ```bash
-python research/make_price_set.py \
+cargo build --release --locked
+./target/release/astock-v2 price-set \
   --input ../work/prices.csv \
   --out ../work/cn-close-check.json \
   --report ../work/cn-close-check.report.json \

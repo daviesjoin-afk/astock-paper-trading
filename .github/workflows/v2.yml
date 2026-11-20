@@ -26,6 +26,62 @@ jobs:
         run: cargo test --locked --all-targets --verbose
       - name: Rust release build
         run: cargo build --release --locked
+      - name: Verify price-set publication from fixture rows
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          args=(--input data/price-set-examples/sample-prices.csv
+            --set-id ci-example --pack ci-pack --trust synthetic
+            --coverage-start 2026-10-30 --coverage-end 2026-11-03
+            --symbols 600000.SH --out "$work/catalog")
+          days=2026-10-30,2026-11-02,2026-11-03
+          bash scripts/publish_price_set.sh "${args[@]}" --days "$days" --dry-run
+          test ! -e "$work/catalog"
+          status=0
+          bash scripts/publish_price_set.sh "${args[@]}" --days "$days,2026-11-04" || status=$?
+          test "$status" -eq 3
+          test ! -e "$work/catalog"
+          summary=$(bash scripts/publish_price_set.sh "${args[@]}" --days "$days")
+          echo "$summary"
+          grep -Fx 'published set=ci-example trust=synthetic entries=3 source_digest=1a2ca8ef81169150a331fa1a805cd3af2c5c6938a6e69d7c6c14c5e97fa2c5bc' <<< "$summary"
+          test -s "$work/catalog/ci-example.json"
+          status=0
+          bash scripts/publish_price_set.sh "${args[@]}" --days "$days" || status=$?
+          test "$status" -eq 3
+          bash scripts/publish_price_set.sh "${args[@]}" --days "$days" --force
+      - name: Verify database backup tooling
+        run: |
+          python3 - <<'PY'
+          import sqlite3, subprocess, tempfile
+          from pathlib import Path
+
+          with tempfile.TemporaryDirectory() as temp:
+              root = Path(temp)
+              db = root / "v2.sqlite3"
+              backup = root / "backup.sqlite3"
+              restored = root / "restored.sqlite3"
+              connection = sqlite3.connect(db)
+              connection.executescript(
+                  """
+                  CREATE TABLE schema_version(version INTEGER NOT NULL);
+                  INSERT INTO schema_version VALUES(2);
+                  CREATE TABLE account(account_id TEXT PRIMARY KEY);
+                  CREATE TABLE day_run(account_id TEXT, day TEXT);
+                  """
+              )
+              connection.commit()
+              connection.close()
+              for args in (
+                  ["backup", "--db", str(db), "--out", str(backup)],
+                  ["verify", "--db", str(backup)],
+                  ["restore", "--backup", str(backup), "--db", str(restored)],
+                  ["verify", "--db", str(restored)],
+              ):
+                  subprocess.run(
+                      ["target/release/astock-v2", "db", *args],
+                      check=True,
+                  )
+          PY
 
   data-sources:
     runs-on: ubuntu-latest
@@ -43,48 +99,6 @@ jobs:
       # apparatus while the kernel stayed green.
       - name: Research tooling tests
         run: python -m unittest discover -s v2/scripts -p 'test_*.py' -v
-      - name: Verify a complete price set builds from fixture rows
-        run: |
-          python v2/research/make_price_set.py \
-            --input v2/data/price-set-examples/sample-prices.csv \
-            --out /tmp/v2-price-set.json \
-            --set-id ci-example \
-            --pack ci-pack \
-            --trust synthetic \
-            --coverage-start 2026-10-30 \
-            --coverage-end 2026-11-03 \
-            --symbols 600000.SH \
-            --days 2026-10-30,2026-11-02,2026-11-03
-      - name: Verify database backup tooling
-        run: |
-          python - <<'PY'
-          import sqlite3, subprocess, sys, tempfile
-          from pathlib import Path
-
-          with tempfile.TemporaryDirectory() as temp:
-              root = Path(temp)
-              db = root / "v2.sqlite3"
-              backup = root / "backup.sqlite3"
-              connection = sqlite3.connect(db)
-              connection.executescript(
-                  """
-                  CREATE TABLE schema_version(version INTEGER NOT NULL);
-                  INSERT INTO schema_version VALUES(2);
-                  CREATE TABLE account(account_id TEXT PRIMARY KEY);
-                  CREATE TABLE day_run(account_id TEXT, day TEXT);
-                  """
-              )
-              connection.commit()
-              connection.close()
-              for args in (
-                  ["backup", "--db", str(db), "--out", str(backup)],
-                  ["verify", "--db", str(backup)],
-              ):
-                  subprocess.run(
-                      [sys.executable, "v2/scripts/db_tool.py", *args],
-                      check=True,
-                  )
-          PY
 
   web-e2e:
     runs-on: ubuntu-latest

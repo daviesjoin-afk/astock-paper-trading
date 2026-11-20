@@ -14,7 +14,7 @@
 - 槽收益/回撤按现金流中性口径计算，金额盈亏扣净转入；账户曲线显示实际资产。
 - TDX 停牌行保留官方参考昨收用于估值，`tradable=0` 的行不能成交、评分或进入市场状态；缺行/缺参考仍明确失败。
 - Rust/Python 两个旧表初始化入口首次增加 `tradable` 时，在同一事务分类已有 `none/tdx` 零报价行；重复初始化保留显式标志。
-- 离线回放 `v2/examples/regime_ab.rs`、独立核算 `v2/research/verify_ab.py`、停牌回填 `v2/research/backfill_halted.py` 及其测试随代码提供。
+- 离线回放 `v2/examples/regime_ab.rs`、独立核算 `v2/research/verify_ab.py`、停牌回填 `astock-v2 backfill-halted` 及其测试随代码提供。
 - 全期 813 日完整产物已独立核算，账本、收益、日期差异 0；停牌错误成交回归、正常成交对照和迁移故障回滚均通过。
 
 最新排序/预算修复后的本金 ¥100,000、2023-07-05 至 2026-11-11 对照：关闭过滤器期末 ¥79,018.73，开启 ¥119,318.05；精确最大回撤约 32.0198% / 13.6873%。新回放与独立核算均退出 0。明细与风险边界见 [11-12 新核验](SELECTION-VALIDATION-2026-11-12.md)。11-11 基线的 ¥97,657.55 / ¥98,654.20 与两组亏损结论保留在 [基线研究](REAL-HISTORY-REGIME-2026-11-11.md)，不代表修复后的新结果。
@@ -123,7 +123,7 @@ python -B v2/research/verify_ab.py work/company/ab-full.json \
 
 回放失败退出 2 时不能使用重定向产生的空文件或部分日志计算收益。新建 SQLite 的字节布局可能不同，数据库文件 SHA256 不必与旧副本一致；要比较原始日包、逻辑行和逐日窗口输入。
 
-`backfill_halted.py` 用于修复**关闭的旧研究副本**，要求已具备 `bar.tradable`，不能直接对原始留存库或活动账本运行。它的 manifest 支持续跑，失败日须归零再进入回放。
+`astock-v2 backfill-halted --confirm-research-copy` 用于修复**关闭的旧研究副本**，要求已具备 `bar.tradable`，不能直接对原始留存库或活动账本运行。它的 manifest 支持续跑，失败日须归零再进入回放。
 
 ## 公司电脑从哪里继续优化
 

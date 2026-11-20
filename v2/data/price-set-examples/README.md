@@ -1,9 +1,10 @@
 # 价格集合样例（模板，非审核数据）
 
-`sample-prices.csv` 是 `make_price_set.py` 的输入模板：
+`sample-prices.csv` 是 `astock-v2 price-set` 的输入模板。在 `v2/` 执行：
 
 ```bash
-python research/make_price_set.py \
+cargo build --release --locked
+./target/release/astock-v2 price-set \
   --input data/price-set-examples/sample-prices.csv \
   --out /tmp/example.json \
   --report /tmp/example-report.json \

@@ -9,6 +9,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V2_DIR="$(cd "$HERE/.." && pwd)"
 PORT="${ASTOCK_SMOKE_PORT:-18791}"
+BIN="${ASTOCK_BIN:-$V2_DIR/target/debug/astock-v2}"
+if [ -z "${ASTOCK_BIN:-}" ] && [ ! -x "$BIN" ] && [ -x "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+if [ ! -x "$BIN" ]; then echo "missing Rust binary: $BIN" >&2; exit 2; fi
 # Keep the smoke artifact inside the project work tree: Windows /tmp paths can
 # resolve differently between Bash and native tools.
 WORK="$V2_DIR/work/p0-bar-smoke"
@@ -40,17 +43,18 @@ conn.execute("""CREATE TABLE IF NOT EXISTS bar(
   close_cents INTEGER NOT NULL, prev_close_cents INTEGER NOT NULL,
   volume_shares INTEGER NOT NULL, amount_cents INTEGER NOT NULL,
   adjust TEXT NOT NULL DEFAULT 'none', source TEXT NOT NULL DEFAULT 'tdx',
+  tradable INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(symbol, day))""")
 conn.execute("CREATE INDEX IF NOT EXISTS bar_by_day ON bar(day)")
 conn.commit(); conn.close()
 PY
 
 echo "== ingesting two real days =="
-python data_sources/ingest_market.py --db "$DB" --days 2026-11-09:2026-11-10
+"$BIN" ingest --db "$DB" --days 2026-11-09:2026-11-10
 
 echo "== starting server on 127.0.0.1:$PORT =="
-ASTOCK_V2_DB="$DB" ASTOCK_V2_ADDR="127.0.0.1:$PORT" \
-  "${ASTOCK_BIN:-$V2_DIR/target/debug/astock-v2.exe}" >"$LOG" 2>&1 &
+ASTOCK_V2_DB="$DB" ASTOCK_V2_LIVE_DB="$WORK/live.sqlite3" ASTOCK_V2_ADDR="127.0.0.1:$PORT" \
+  "$BIN" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 40); do

@@ -5,7 +5,7 @@
 # were separate manual steps and the gap between them is exactly where a
 # day silently gets skipped:
 #
-#   1. ingest the after-close package for $DAY     (data_sources/ingest_market.py)
+#   1. ingest the after-close package for $DAY     (astock-v2 ingest)
 #   2. POST /v2/account/run with that day          (kernel settles + trades)
 #
 # Order matters and is enforced: the account never advances on a day whose
@@ -14,7 +14,7 @@
 #
 # Env: ASTOCK_API        kernel base URL           (default http://127.0.0.1:18765)
 #      ASTOCK_V2_DB      database path            (required)
-#      ASTOCK_SCRIPTS    dir holding ingest_market.py (default: this script's dir)
+#      ASTOCK_V2_BIN     astock-v2 executable (defaults to the installed or release binary)
 #
 # Usage:
 #   daily_cycle.sh --day 2026-11-10
@@ -32,7 +32,11 @@ DB="${ASTOCK_V2_DB:-}"
 DAY=""
 DRY_RUN="no"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS="${ASTOCK_SCRIPTS:-$HERE}"
+BIN="${ASTOCK_V2_BIN:-$HERE/../bin/astock-v2}"
+if [ -z "${ASTOCK_V2_BIN:-}" ] && [ ! -x "$BIN" ]; then
+  BIN="$HERE/../target/release/astock-v2"
+  if [ ! -x "$BIN" ] && [ -x "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+fi
 
 usage() {
   cat <<'TEXT'
@@ -41,7 +45,7 @@ usage: daily_cycle.sh --day YYYY-MM-DD [--dry-run]
 Env:
   ASTOCK_V2_DB    database path (required)
   ASTOCK_API      kernel base URL (default http://127.0.0.1:18765)
-  ASTOCK_SCRIPTS  dir with ingest_market.py (default: this script's dir)
+  ASTOCK_V2_BIN   astock-v2 executable (defaults to the installed or release binary)
 
 Example cron entry (weekdays after the after-close package is published):
   10 18 * * 1-5 ASTOCK_V2_DB=/var/lib/astock-v2-rewrite/v2.sqlite3 \
@@ -68,22 +72,24 @@ if [ -z "$DB" ]; then
   echo "ASTOCK_V2_DB is required" >&2
   exit 2
 fi
-INGEST="$SCRIPTS/ingest_market.py"
-if [ ! -f "$INGEST" ]; then
-  echo "ingest script not found: $INGEST" >&2
+if ! command -v "$BIN" >/dev/null 2>&1; then
+  echo "astock-v2 executable not found: $BIN" >&2
   exit 2
 fi
 
+args=(ingest --db "$DB" --day "$DAY" --workers 8)
+if [ "$DRY_RUN" = "yes" ]; then args+=(--dry-run); fi
 echo "=== step 1/2 ingest $DAY ==="
-# --workers 8 measured 7x over serial; a single day is ~2.4s wall clock.
-if ! python3 "$INGEST" --db "$DB" --day "$DAY" --workers 8; then
+if ! "$BIN" "${args[@]}"; then
   echo "ingest failed for $DAY; account NOT advanced" >&2
   exit 4
 fi
+if [ "$DRY_RUN" = "yes" ]; then
+  echo "--dry-run: skipping database writes and advance"
+  exit 0
+fi
 
-# Confirm rows actually landed. ingest_market.py exits 0 for a published
-# package even if every row were filtered out, which would let the kernel
-# settle against a day with no prices.
+# Confirm the transaction actually left unadjusted bars before advancing.
 rows=$(python3 - "$DB" "$DAY" <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
@@ -101,11 +107,6 @@ if [ "$rows" -eq 0 ]; then
   exit 5
 fi
 echo "ingested rows for $DAY: $rows"
-
-if [ "$DRY_RUN" = "yes" ]; then
-  echo "--dry-run: skipping advance"
-  exit 0
-fi
 
 echo "=== step 2/2 advance to $DAY ==="
 payload=$(printf '{"day":"%s"}' "$DAY")

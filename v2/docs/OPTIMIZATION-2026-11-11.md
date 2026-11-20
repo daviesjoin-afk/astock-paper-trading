@@ -12,7 +12,7 @@
 - 停牌行保留官方参考昨收，只能给已有持仓估值，不能交易、评分或进入市场状态。旧 `none/tdx` 表新增 `tradable` 时一次性分类，列创建和分类原子提交；已有显式标志和前复权行不被重写。
 - `examples/regime_ab.rs` 复用原 `Store::advance`，输入只读固定快照，账本只在内存；每天只使用截至当日的窗口，不用未来区间筛选股票。
 - 两算法已接入 [策略库](STRATEGY-LIBRARY.md) 的统一接口及显式注册表，120 组真实输入的分数/原因与旧实现逐项一致；固定两槽、下单和风控政策保持。
-- `research/verify_ab.py` 从成交独立重建整数账本及精确收益；`research/backfill_halted.py` 从官方日包补旧研究副本并留来源 manifest，两者与行为测试一起纳入代码。
+- `research/verify_ab.py` 从成交独立重建整数账本及精确收益；`astock-v2 backfill-halted` 从官方日包补旧研究副本并留来源 manifest，两者与行为测试一起纳入代码。
 
 ## 全期研究结果
 

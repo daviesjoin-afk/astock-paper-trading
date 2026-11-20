@@ -67,11 +67,11 @@ python data_sources/public_data.py announcements --symbol 000001.SZ \
 先按快速开始让内核创建全新的 schema 2 数据库并停止该进程，然后在 `v2/` 执行：
 
 ```bash
-python data_sources/ingest_market.py --db ./v2.sqlite3 \
+./target/release/astock-v2 ingest --db ./v2.sqlite3 \
   --day 2026-11-10 --workers 4
 ```
 
-`ingest_market.py` 从通达信盘后包直接写入 `bar` 表，标记 `adjust=none`、
+`astock-v2 ingest` 从通达信盘后包直接写入 `bar` 表，标记 `adjust=none`、
 `source=tdx`；这是本轮真实历史回放使用的入口。它检查日包结构和市场规模，
 不执行双源逐股审核，也不会自动生成 `trust=reviewed` 的价格集合。
 数据库必须已存在。区间补数与公司电脑复现见
@@ -129,8 +129,13 @@ GET  /v2/prices/coverage
 ./target/release/astock-v2 db verify --db ./backups/v2.sqlite3
 ./target/release/astock-v2 db restore --backup ./backups/v2.sqlite3 --db ./recovered.sqlite3
 ./target/release/astock-v2 price-set --help
+./target/release/astock-v2 ingest --help
+./target/release/astock-v2 backfill-halted --help
+./target/release/astock-v2 paper-daemon --help
+./target/release/astock-v2 live-watch --help
 ./target/release/astock-v2 live-feed --universe ./work/live-a-universe.txt
-./target/release/astock-v2 live-loop --api http://127.0.0.1:8765   --universe ./work/live-a-universe.txt --log ./work/live/intraday-loop.log --ai off --once
+./target/release/astock-v2 live-loop --api http://127.0.0.1:8765 \
+  --universe ./work/live-a-universe.txt --log ./work/live/intraday-loop.log --ai off --once
 ```
 
 备份和恢复先生成并校验 SQLite 快照，包含源库已提交的 WAL 数据。使用 `--force`
@@ -139,8 +144,13 @@ GET  /v2/prices/coverage
 `live-feed` 使用 `ureq` 的 rustls HTTPS 和 `encoding_rs` 的 GB18030 解码，从腾讯获取公开行情。
 可用 `--history-db` 指定只读历史库或含 `through_day` 的历史 JSON。`live-loop` 在上海交易时段向
 已有模拟盘 API 提交当前上海交易日内有源时间的行情，成交和风控由内核执行。
-省略 `--once` 会持续按轮询间隔运行。
+省略 `--once` 会持续按轮询间隔运行。`live-loop` 和 `live-watch` 共用交易日历，可通过
+`--calendar` 提供覆盖目标日期的日历。
 启用 AI 建议或使用自定义时区仍用 `scripts/live_paper_loop.py`。
+
+历史停牌回补只对关闭的研究库副本运行。`backfill-halted` 需要
+`--confirm-research-copy`、`--manifest` 和 `--packages`，可按清单续跑。
+日线摄取 CLI 由 Rust 提供。公共数据 SDK 保留 Python 解析接口，独立核算也继续使用 Python。
 
 ## 验证
 
@@ -163,7 +173,7 @@ pwsh scripts/rewrite_smoke.ps1
 ## 备份与部署
 
 ```bash
-python scripts/db_tool.py backup --db /var/lib/astock-v2-rewrite/v2.sqlite3 \
+/opt/astock-v2-rewrite/bin/astock-v2 db backup --db /var/lib/astock-v2-rewrite/v2.sqlite3 \
   --out /var/backups/astock-v2-rewrite/v2-$(date +%F).sqlite3
 ```
 

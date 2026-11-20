@@ -23,17 +23,24 @@ cp -a "$WEB_SRC/." "$PREFIX/web/"
 install -d -m 0755 "$PREFIX/scripts"
 install -m 0755 "$REPO/v2/scripts/daily_auto.sh" "$PREFIX/scripts/daily_auto.sh"
 install -m 0755 "$REPO/v2/scripts/daily_advance.sh" "$PREFIX/scripts/daily_advance.sh"
-install -m 0755 "$REPO/v2/scripts/db_tool.py" "$PREFIX/scripts/db_tool.py"
 
-# Data ingestion lives next to the scripts so cron can run it from $PREFIX
-# without a checkout on the host.
-install -m 0644 "$REPO/v2/data_sources/ingest_market.py" "$PREFIX/scripts/ingest_market.py"
-install -m 0644 "$REPO/v2/data_sources/realtime_quotes.py" "$PREFIX/scripts/realtime_quotes.py"
+# Ingestion and quote fetching are subcommands of the installed binary, so no
+# Python copy is deployed next to cron. Retire the old copies on upgrade.
+for legacy in ingest_market.py realtime_quotes.py; do
+  if [ -f "$PREFIX/scripts/$legacy" ]; then
+    rm -- "$PREFIX/scripts/$legacy"
+  fi
+done
 
 install -m 0644 "$REPO/v2/deploy/astock-v2.service" "$UNIT_DIR/astock-v2-rewrite.service"
 if [ ! -f "$ENV_FILE" ]; then
   install -m 0640 -o root -g astock "$REPO/v2/deploy/astock-v2.env.example" "$ENV_FILE"
   echo "wrote $ENV_FILE (edit before starting)"
+fi
+
+# Retire the legacy helper on upgrades after installing the binary that replaces it.
+if [ -f "$PREFIX/scripts/db_tool.py" ]; then
+  rm -- "$PREFIX/scripts/db_tool.py"
 fi
 
 echo "installed binary -> $PREFIX/bin/astock-v2"

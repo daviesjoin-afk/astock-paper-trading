@@ -25,7 +25,7 @@ for all changes under `v2/`. Read `docs/REWRITE-SPEC.md` and
   writes the ledger or publishes a reviewed set by itself. Reference data must
   preserve source, fetch time and publication precision; current snapshots
   cannot be silently used as historically known facts.
-- `research/make_price_set.py` only builds an artifact from explicit CSV rows.
+- `astock-v2 price-set` only builds an artifact from explicit CSV rows.
   TypeScript only presents V2 API read models; it must not replicate paper
   execution rules.
 - Do not import, reuse, mutate, auto-migrate or query legacy V1 runtime code,

@@ -124,13 +124,13 @@ curl -fsS http://127.0.0.1:18765/v2/health
 ## 8. 备份
 
 ```bash
-sudo python3 /opt/astock-v2-rewrite/scripts/db_tool.py backup \
+sudo /opt/astock-v2-rewrite/bin/astock-v2 db backup \
   --db /var/lib/astock-v2-rewrite/v2.sqlite3 \
   --out /var/backups/astock-v2-rewrite/v2-$(date +%F).sqlite3
 ```
 
-`db_tool.py` 使用 SQLite 在线备份，校验 schema 和完整性；拒绝无 `--force`
-覆盖已有备份。
+`astock-v2 db` 提供在线备份、校验和恢复。备份和恢复包含源库已提交的 WAL 数据。
+现有定时任务若使用旧 Python 备份入口，请更新为上面的命令，再校验新备份。
 
 ## 9. 边界
 

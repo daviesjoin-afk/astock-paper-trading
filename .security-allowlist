@@ -331,3 +331,9 @@ value: 9949fd5cb6a3111ae9e85c7d15a73c81c98379cd
 
 # Public SHA-256 digest of v2/data/price-set-examples/sample-prices.csv normalized rows.
 value:1a2ca8ef81169150a331fa1a805cd3af2c5c6938a6e69d7c6c14c5e97fa2c5bc
+
+# Public SHA-256 digests asserted by Rust CLI fixtures: a TDX snapshot cache key
+# (identity JSON) and the normalized-row digest of sample-prices.csv. Neither is
+# a credential; both are recomputable from committed public inputs.
+value:815770730aed38e151bf944ab6b5fb845379238f096bd48945fd307186ed128d
+value:353a24025fdb8aa8aaee094af829ec27de7441f21c9dc76fbec450597bb51d8c

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for daily_cycle.sh's decision logic.
 #
-# These run against a stub `python3` and a stub server so the ordering and
+# These run against a stub `astock-v2`, a stub `python3`, and a stub server so the ordering and
 # failure behaviour can be checked without the network. What matters here is
 # not that ingest works (bar_smoke.sh covers the real path) but that the cycle
 # refuses to advance when ingest failed or produced nothing -- that is the one
@@ -22,20 +22,20 @@ trap cleanup EXIT
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
-# A python3 stub that answers the two ways the script calls it: the ingest
-# script (first arg ends in ingest_market.py) and the row-count here-doc.
+# Stub only the external ingest and row-count calls.
 make_stub() {
   local ingest_exit="$1" row_count="$2" dir="$3"
+  cat >"$dir/astock-v2" <<EOF
+#!/usr/bin/env bash
+[ "\$1" = ingest ] || exit 2
+printf '%s\n' "\$*" >> "\$STUB_INGEST_LOG"
+exit $ingest_exit
+EOF
   cat >"$dir/python3" <<EOF
 #!/usr/bin/env bash
-if [ "\${1##*/}" = "ingest_market.py" ]; then
-  echo "[stub] ingest called"
-  exit $ingest_exit
-fi
-# Row-count here-doc: emit the configured count.
-echo "$row_count"
+if [ "\$1" = "-" ]; then echo "$row_count"; fi
 EOF
-  chmod +x "$dir/python3"
+  chmod +x "$dir/astock-v2" "$dir/python3"
 }
 
 # A curl stub that records the advance call and returns a valid RunResult.
@@ -50,15 +50,14 @@ EOF
 }
 
 touch "$WORK/fake.sqlite3"
-mkdir -p "$WORK/scripts" "$WORK/bin"
-cp "$HERE/../../v2/data_sources/ingest_market.py" "$WORK/scripts/ingest_market.py" 2>/dev/null \
-  || printf '#!/usr/bin/env python3\n' >"$WORK/scripts/ingest_market.py"
+mkdir -p "$WORK/bin"
 export STUB_CURL_LOG="$WORK/curl.log"
+export STUB_INGEST_LOG="$WORK/ingest.log"
 
 run_cycle() {
   PATH="$WORK/bin:$PATH" \
   ASTOCK_V2_DB="$WORK/fake.sqlite3" \
-  ASTOCK_SCRIPTS="$WORK/scripts" \
+  ASTOCK_V2_BIN="$WORK/bin/astock-v2" \
   ASTOCK_API="http://127.0.0.1:19999" \
   bash "$SCRIPT" "$@"
 }
@@ -121,12 +120,13 @@ else
   ok "no credential sent"
 fi
 
-echo "== dry-run ingests but does not advance =="
+echo "== dry-run parses without writes or advance =="
 make_stub 0 5576 "$WORK/bin"
 : >"$STUB_CURL_LOG"
 set +e
 run_cycle --day 2026-11-10 --dry-run >/dev/null 2>&1; code=$?
 set -e
+tail -n 1 "$STUB_INGEST_LOG" | grep -q -- --dry-run && ok "dry-run reaches Rust ingest" || bad "dry-run would write rows"
 [ "$code" -eq 0 ] && ok "dry-run exits 0" || bad "dry-run exit $code"
 if [ -s "$STUB_CURL_LOG" ]; then bad "dry-run advanced the account"; else ok "dry-run did not advance"; fi
 
