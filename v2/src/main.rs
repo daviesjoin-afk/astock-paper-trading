@@ -1,21 +1,146 @@
 //! Local-only V2 HTTP gateway. It serves one paper account and two strategies.
 
-use std::{env, sync::Arc};
+use std::{
+    env,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use astock_v2::domain::{AccountSpec, CreateAccountRequest, SlotSpec, StrategyId};
-use astock_v2::store::{load_price_sets, price_sets_dir, Store, StoreError};
+use astock_v2::domain::{AiAdjustment, AccountSpec, CreateAccountRequest, SlotSpec, StrategyId};
+use astock_v2::intraday::{
+    CreateAccountRequest as LiveCreateAccountRequest, IntradayError, IntradayStore,
+    RunRoundRequest,
+};
+use astock_v2::intraday::store::EvolveRequest;
+use astock_v2::store::{load_price_sets, price_sets_dir, AdvanceLimits, Store, StoreError};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
-type Shared = Arc<Mutex<Store>>;
+/// The single writer and an independent read-only connection. Both are
+/// mutex-protected because `rusqlite::Connection` is `Send` but not `Sync`;
+/// important is that the reader never waits for the writer's long lock.
+#[derive(Clone)]
+struct AppState {
+    writer: Arc<Mutex<Store>>,
+    reader: Arc<Mutex<Store>>,
+}
+
+/// The listener gives each TCP connection a receiver whose sender is owned by
+/// the listener. Dropping the connection task on a client abort closes that
+/// receiver, which the handler can poll between chunks.
+/// The intraday kernel has its own database and its own writer/reader pair.
+/// Nothing here shares a connection, table or transaction with daily settlement.
+#[derive(Clone)]
+struct LiveAppState {
+    writer: Arc<Mutex<IntradayStore>>,
+    reader: Arc<Mutex<IntradayStore>>,
+}
+
+#[derive(Clone)]
+struct ConnectionClosed(watch::Receiver<()>);
+
+impl ConnectionClosed {
+    fn get(&self) -> bool {
+        // `has_changed()` reports the channel as closed once the connection's
+        // sender has been dropped. A healthy connection's sender lives in the
+        // stream and leaves this receiver open.
+        self.0.has_changed().is_err()
+    }
+}
+
+/// A TCP stream carrying the per-connection cancellation receiver. Its drop
+/// closes the receiver; hyper owns this stream for the lifetime of the
+/// connection task.
+struct CancellingStream {
+    inner: tokio::net::TcpStream,
+    /// Keeps the per-connection watch channel open. Dropped with the stream
+    /// when hyper closes the connection task.
+    _sender: watch::Sender<()>,
+    closed: watch::Receiver<()>,
+}
+
+impl tokio::io::AsyncRead for CancellingStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CancellingStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// An axum listener that attaches the cancellation receiver to request
+/// extensions via `Router::into_make_service_with_connect_info`.
+struct CancellingListener {
+    inner: tokio::net::TcpListener,
+}
+
+impl axum::serve::Listener for CancellingListener {
+    type Io = CancellingStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    let (sender, closed) = watch::channel(());
+                    return (
+                        CancellingStream {
+                            inner: stream,
+                            _sender: sender,
+                            closed,
+                        },
+                        address,
+                    );
+                }
+                Err(error) => eprintln!("accept failed: {error}"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, CancellingListener>>
+    for ConnectionClosed
+{
+    fn connect_info(
+        stream: axum::serve::IncomingStream<'_, CancellingListener>,
+    ) -> Self {
+        ConnectionClosed(stream.io().closed.clone())
+    }
+}
+
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 fn api_error(error: StoreError) -> (StatusCode, Json<Value>) {
@@ -23,6 +148,7 @@ fn api_error(error: StoreError) -> (StatusCode, Json<Value>) {
         StoreError::Rules(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.0),
         StoreError::NotFound(error) => (StatusCode::NOT_FOUND, error),
         StoreError::Conflict(error) => (StatusCode::CONFLICT, error),
+        StoreError::Aborted(error) => (StatusCode::SERVICE_UNAVAILABLE, error),
         StoreError::Encoding(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         StoreError::Database(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         StoreError::Integrity(error) => (StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -39,8 +165,8 @@ fn response<T: serde::Serialize>(value: T) -> ApiResult {
     })
 }
 
-async fn health(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn health(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let version = db.schema_version().map_err(api_error)?;
     let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
     let account = db.account().map_err(api_error)?;
@@ -59,11 +185,255 @@ async fn health(State(state): State<Shared>) -> ApiResult {
     }))
 }
 
+/// The state digest the AI observer reads, as JSON.
+///
+/// Everything here is what the engine already knew on `day`: the regime, each
+/// slot's standing, and its top scored candidates with their shape numbers.
+/// There is deliberately no forward data, so advice produced from this cannot
+/// be hindsight.
+async fn market_observation(
+    State(state): State<AppState>,
+    Query(query): Query<BarsQuery>,
+) -> ApiResult {
+    let db = state.reader.lock().await;
+    let days = db.bar_days().map_err(api_error)?;
+    let Some(last) = days.last().cloned() else {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "no_market_data" }))));
+    };
+    let day = query.day.unwrap_or(last);
+    let regime = db.market_regime(&day).map_err(api_error)?;
+    let set = db
+        .price_set_from_bars("bar-table", &day, &day)
+        .map_err(api_error)?
+        .ok_or_else(|| (StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({ "error": "no_prices_for_day", "day": day }))))?;
+    let candidates = db.observation_candidates(&set, &day, 12).map_err(api_error)?;
+
+    let account = db.account().map_err(api_error)?;
+    let mut slots = Vec::new();
+    if let Some(spec) = &account {
+        let curves = db.account_performance(spec, None).map_err(api_error)?;
+        let books = db.books(&spec.account_id).map_err(api_error)?;
+        for (index, slot) in [astock_v2::domain::StrategyId::Steady,
+                              astock_v2::domain::StrategyId::Aggressive].into_iter().enumerate() {
+            let last_point = curves[index].last();
+            slots.push(json!({
+                "slot": slot_cn(slot),
+                "slot_id": match slot {
+                    astock_v2::domain::StrategyId::Steady => "steady",
+                    _ => "aggressive",
+                },
+                "return_bps": last_point.map(|point| point.return_bps),
+                "max_drawdown_bps": last_point.map(|point| point.max_drawdown_bps),
+                "positions": books[index].positions.len(),
+            }));
+        }
+    }
+
+    response(json!({
+        "day": day,
+        "regime": regime.regime.as_str(),
+        "regime_separation_bps": regime.separation_bps,
+        "regime_breadth_bps": regime.breadth_bps,
+        "slots": slots,
+        "candidates": candidates,
+        "news": [],
+        "recent_trades": [],
+    }))
+}
+
+/// The one paragraph a person reads after settlement.
+///
+/// Generated from the stored account view rather than from a separate log, so
+/// the wording cannot drift from the numbers it describes. A day with no
+/// settlement yet is `422` with a reason, not an empty string: the reader has
+/// to be able to tell "nothing happened" from "loading failed".
+async fn daily_report(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "account_not_found" }))));
+    };
+    let day = db.last_settled_day(&spec.account_id).map_err(api_error)?;
+    let Some(day) = day else {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "no_settlement_yet" }))));
+    };
+    let set = valuation_set(&db, Some(day.as_str()))?;
+    let view = db.view(&spec, set.as_ref(), Some(day.as_str())).map_err(api_error)?;
+    let trades = db.trades(&spec.account_id, 500).map_err(api_error)?;
+    let today: Vec<&astock_v2::domain::Trade> =
+        trades.iter().filter(|trade| trade.trade_day == day).collect();
+
+    let mut text = format!("{day} 结算完成。
+");
+    text.push_str(&format!(
+        "账户权益 {} 元，累计收益 {} 元（{}）。
+",
+        cents_to_yuan(view.equity_cents.unwrap_or(0)),
+        cents_to_yuan(view.profit_cents.unwrap_or(0)),
+        bps_label(view.return_bps.unwrap_or(0)),
+    ));
+    if today.is_empty() {
+        text.push_str("当日没有成交。
+");
+    } else {
+        text.push_str(&format!("当日成交 {} 笔：
+", today.len()));
+        for trade in today.iter().take(12) {
+            text.push_str(&format!(
+                "  {} {} {} {} 股 @ {} 元（{}）
+",
+                slot_cn(trade.slot),
+                if trade.side == "buy" { "买入" } else { "卖出" },
+                trade.symbol,
+                trade.quantity,
+                cents_to_yuan(trade.price_cents),
+                trade.reason,
+            ));
+        }
+    }
+    let rebalances = db.rebalances(&spec.account_id).map_err(api_error)?;
+    let today_rebalance = rebalances.iter().filter(|item| item.applied_day == day).count();
+    if today_rebalance > 0 {
+        text.push_str(&format!("当日调仓 {today_rebalance} 次（两个策略间资金调配）。
+"));
+    }
+    response(json!({
+        "day": day,
+        "settled": true,
+        "blocked": view.warnings.len(),
+        "text": text,
+    }))
+}
+
+fn cents_to_yuan(cents: i64) -> String {
+    format!("{:.2}", cents as f64 / 100.0)
+}
+
+fn bps_label(bps: i64) -> String {
+    format!("{:+.2}%", bps as f64 / 100.0)
+}
+
+fn slot_cn(slot: astock_v2::domain::StrategyId) -> &'static str {
+    match slot {
+        astock_v2::domain::StrategyId::Steady => "稳健",
+        astock_v2::domain::StrategyId::Aggressive => "激进",
+    }
+}
+
+/// Orders the engine refused to place on the last settled day.
+///
+/// Read-only. Each row names why: a limit seal, insufficient cash, or a lot
+/// size the budget could not reach. Reported rather than silently dropped so a
+/// quiet day can be told apart from a broken one.
+async fn blocked_orders(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return response(json!([]));
+    };
+    let day = db.last_settled_day(&spec.account_id).map_err(api_error)?;
+    let Some(day) = day else {
+        return response(json!([]));
+    };
+    let set = valuation_set(&db, Some(day.as_str()))?;
+    let view = db.view(&spec, set.as_ref(), Some(day.as_str())).map_err(api_error)?;
+    let rows: Vec<Value> = view
+        .warnings
+        .iter()
+        .map(|warning| json!({
+            "slot": "steady",
+            "symbol": "",
+            "side": "",
+            "quantity": 0,
+            "decision_day": day,
+            "blocked_day": day,
+            "reason": warning,
+        }))
+        .collect();
+    response(rows)
+}
+
+/// Research candidates, as the console shows them.
+///
+/// The kernel has no candidate ledger yet; an empty list is the honest answer
+/// and the console renders "还没有影子候选" for it. Returning a fabricated row
+/// would make an unimplemented view look working.
+async fn research_candidates(State(_state): State<AppState>) -> ApiResult {
+    response(json!([]))
+}
+
+/// Accept an AI advice record for one slot on one day.
+///
+/// The kernel is the authority here: the record is re-bounded, an untrusted
+/// symbol list is filtered against the day's real candidates, and the result --
+/// including what had to be reduced -- is stored. Submitting advice never moves
+/// a position by itself; settlement reads it on the next advance.
+#[derive(Deserialize)]
+struct AdviceRequest {
+    day: String,
+    slot: String,
+    bias: String,
+    entry_delta: Option<i64>,
+    weight_delta_bps: Option<i64>,
+    position_delta: Option<i64>,
+    #[serde(default)]
+    blocked_symbols: Vec<String>,
+    confidence: Option<i64>,
+    reason: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    model: String,
+}
+
+async fn submit_advice(
+    State(state): State<AppState>,
+    Json(request): Json<AdviceRequest>,
+) -> ApiResult {
+    let db = state.writer.lock().await;
+    let Some(spec) = db.account().map_err(api_error)? else {
+        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "account_not_found" }))));
+    };
+    if !["steady", "aggressive"].contains(&request.slot.as_str()) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "unknown_slot", "slot": request.slot }))));
+    }
+    if request.day.len() != 10 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "day_must_be_yyyy_mm_dd" }))));
+    }
+    // Assemble then re-bound. The observer is not trusted to have clamped, and
+    // a hand-written POST is not trusted at all.
+    let advice = AiAdjustment {
+        bias: request.bias,
+        entry_delta: request.entry_delta.unwrap_or(0),
+        weight_delta_bps: request.weight_delta_bps.unwrap_or(0),
+        position_delta: request.position_delta.unwrap_or(0),
+        blocked_symbols: request.blocked_symbols,
+        confidence: request.confidence.unwrap_or(0),
+        reason: request.reason,
+        source: if request.source.is_empty() { "http".into() } else { request.source },
+        model: request.model,
+        clamped: Vec::new(),
+    };
+    let (bounded, reduced) = advice.bounded();
+    db.record_observation(&spec.account_id, &request.day, &request.slot, &bounded, true)
+        .map_err(api_error)?;
+    response(json!({
+        "status": "recorded",
+        "day": request.day,
+        "slot": request.slot,
+        "accepted": bounded.to_dict(),
+        "reduced": reduced,
+    }))
+}
+
 async fn create_account(
-    State(state): State<Shared>,
+    State(state): State<AppState>,
     Json(request): Json<CreateAccountRequest>,
 ) -> ApiResult {
-    let mut db = state.lock().await;
+    let mut db = state.writer.lock().await;
     if db.account().map_err(api_error)?.is_some() {
         return Err((
             StatusCode::CONFLICT,
@@ -85,8 +455,8 @@ async fn create_account(
     response(db.view(&spec, set.as_ref(), None).map_err(api_error)?)
 }
 
-async fn account(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn account(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let Some(spec) = db.account().map_err(api_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -114,8 +484,8 @@ fn valuation_set(
     load_price_sets(&price_sets_dir()).map_err(api_error)
 }
 
-async fn positions(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn positions(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let Some(spec) = db.account().map_err(api_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -128,8 +498,8 @@ async fn positions(State(state): State<Shared>) -> ApiResult {
     response(view.positions)
 }
 
-async fn trades(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn trades(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let Some(spec) = db.account().map_err(api_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -139,8 +509,8 @@ async fn trades(State(state): State<Shared>) -> ApiResult {
     response(db.trades(&spec.account_id, 100).map_err(api_error)?)
 }
 
-async fn rebalances(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn rebalances(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let Some(spec) = db.account().map_err(api_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -150,8 +520,8 @@ async fn rebalances(State(state): State<Shared>) -> ApiResult {
     response(db.rebalances(&spec.account_id).map_err(api_error)?)
 }
 
-async fn coverage(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn coverage(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let set = load_price_sets(&price_sets_dir()).map_err(api_error)?;
     let last_settled_day = match db.account().map_err(api_error)? {
         Some(spec) => db.last_settled_day(&spec.account_id).map_err(api_error)?,
@@ -179,8 +549,8 @@ struct BarsQuery {
 /// `day` defaults to the latest day held. The verdict is what the aggressive
 /// slot actually saw when it settled that day -- same snapshot, same
 /// unadjusted closes -- so the console cannot disagree with the trades.
-async fn market_regime(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
-    let db = state.lock().await;
+async fn market_regime(State(state): State<AppState>, Query(query): Query<BarsQuery>) -> ApiResult {
+    let db = state.reader.lock().await;
     let day = match query.day {
         Some(day) => day,
         None => match db.bar_days().map_err(api_error)?.last().cloned() {
@@ -206,8 +576,8 @@ async fn market_regime(State(state): State<Shared>, Query(query): Query<BarsQuer
     }))
 }
 
-async fn bar_days(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn bar_days(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let days = db.bar_days().map_err(api_error)?;
     let latest = days.last().cloned();
     let latest_symbols = match &latest {
@@ -223,8 +593,8 @@ async fn bar_days(State(state): State<Shared>) -> ApiResult {
 }
 
 /// All bars for one trading day. `day` defaults to the latest day held.
-async fn bars(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
-    let db = state.lock().await;
+async fn bars(State(state): State<AppState>, Query(query): Query<BarsQuery>) -> ApiResult {
+    let db = state.reader.lock().await;
     let day = match query.day {
         Some(day) => day,
         None => match db.bar_days().map_err(api_error)?.last() {
@@ -251,8 +621,8 @@ async fn bars(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> Ap
 ///
 /// Not a validation result: nothing is rejected. This is the display hint that
 /// keeps an ex-dividend gap from being drawn as a solid -20% crash on a chart.
-async fn bar_gaps(State(state): State<Shared>, Query(query): Query<BarsQuery>) -> ApiResult {
-    let db = state.lock().await;
+async fn bar_gaps(State(state): State<AppState>, Query(query): Query<BarsQuery>) -> ApiResult {
+    let db = state.reader.lock().await;
     let day = match query.day {
         Some(day) => day,
         None => match db.bar_days().map_err(api_error)?.last() {
@@ -294,11 +664,11 @@ struct SymbolBarsQuery {
 
 /// One symbol's recent bars, oldest first. Defaults to the last 250 days held.
 async fn symbol_bars(
-    State(state): State<Shared>,
+    State(state): State<AppState>,
     Path(symbol): Path<String>,
     Query(query): Query<SymbolBarsQuery>,
 ) -> ApiResult {
-    let db = state.lock().await;
+    let db = state.reader.lock().await;
     let days = db.bar_days().map_err(api_error)?;
     let Some(last) = days.last().cloned() else {
         return Err((
@@ -334,38 +704,136 @@ struct RunRequest {
     day: Option<String>,
 }
 
-async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> ApiResult {
-    let mut db = state.lock().await;
-    let Some(spec) = db.account().map_err(api_error)? else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "account_not_found" })),
-        ));
+async fn run(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(closed): axum::extract::ConnectInfo<ConnectionClosed>,
+    request: axum::extract::Request,
+) -> Response {
+    // Extract the small JSON body before touching the writer lock.
+    let (parts, body) = request.into_parts();
+    let _ = parts;
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => return api_error_response(StoreError::Integrity(error.to_string())),
     };
-    // Prefer the whole-market bar table; fall back to a published reviewed
-    // price set only when the bar table has nothing. This keeps the two-symbol
-    // reviewed path working while the 5.6k-symbol bar feed becomes the norm.
-    let (set, settle_from) = match price_set_from_store(&db, request.day.as_deref())? {
-        Some(input) => (input.set, input.settle_from),
-        None => match load_price_sets(&price_sets_dir()).map_err(api_error)? {
-            // A reviewed set is already the exact settlement rectangle; there
-            // is no warm-up region in it, so settlement starts wherever the
-            // account left off.
-            Some(set) => (set, None),
-            None => {
+    let run_request: RunRequest = match serde_json::from_slice(&bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    // The resource guards remain in force. A client abort closes the
+    // per-connection cancellation receiver; checking it at day boundaries
+    // stops the orphan instead of letting it run to the wall-clock deadline.
+    let response = run_chunks(state, run_request, closed).await;
+    response.into_response()
+}
+
+fn api_error_response(error: StoreError) -> Response {
+    let (status, body) = api_error(error);
+    (status, body).into_response()
+}
+
+async fn run_chunks(
+    state: AppState,
+    request: RunRequest,
+    closed: ConnectionClosed,
+) -> ApiResult {
+    // One wall-clock deadline spans all chunks; `advance_one_chunk` also
+    // enforces a per-chunk deadline so a single slow day cannot hold the lock
+    // forever.
+    let limits = AdvanceLimits::from_env();
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(limits.max_seconds);
+    let mut all_trades: Vec<astock_v2::domain::Trade> = Vec::new();
+    let mut all_rebalances: Vec<astock_v2::domain::Rebalance> = Vec::new();
+    let mut processed_all: Vec<String> = Vec::new();
+    #[allow(unused_assignments)]
+    let mut final_result: Option<astock_v2::domain::AdvanceResult> = None;
+    let mut input: Option<SettlementInput> = None;
+    let mut account_spec: Option<AccountSpec> = None;
+    loop {
+        let mut db = state.writer.lock().await;
+        if account_spec.is_none() {
+            let Some(spec) = db.account().map_err(api_error)? else {
                 return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({ "error": "no_price_data",
-                                 "detail": "neither the bar table nor a reviewed price set has rows" })),
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "account_not_found" })),
+                ));
+            };
+            account_spec = Some(spec);
+        }
+        // A persisted catch-up plan (settled day plus 260 target days) is
+        // checked against a hard entry cap before indexing. A client that
+        // wants the whole catch-up must issue bounded calls; chunking releases
+        // the writer lock while one accepted window settles. It does not
+        // silently shrink a bad window into a different backtest.
+        if input.is_none() {
+            input = Some(match price_set_from_store(&db, request.day.as_deref())? {
+                Some(input) => input,
+                None => match load_price_sets(&price_sets_dir()).map_err(api_error)? {
+                    Some(set) => SettlementInput { set, settle_from: None },
+                    None => {
+                        return Err((
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(json!({ "error": "no_price_data",
+                                         "detail": "neither the bar table nor a reviewed price set has rows" })),
+                        ));
+                    }
+                },
+            });
+        }
+        let prepared = input.as_ref().expect("settlement input is initialized");
+        let day = prepared.set.coverage_end.clone();
+        db.advance_limits = limits;
+        let should_continue = || !closed.get();
+        let result = db.advance_one_chunk(
+            account_spec.as_ref().unwrap(),
+            &prepared.set,
+            &day,
+            prepared.settle_from.as_deref(),
+            Some(&should_continue),
+        );
+        drop(db);
+        match result {
+            Ok(result) => {
+                let more = result.processed_days.len() >= limits.chunk_days
+                    && !result.processed_days.is_empty()
+                    && tokio::time::Instant::now() < deadline;
+                processed_all.extend(result.processed_days.iter().cloned());
+                all_trades.extend(result.trades.iter().cloned());
+                all_rebalances.extend(result.rebalances.iter().cloned());
+                final_result = Some(result);
+                if !more {
+                    break;
+                }
+                // Yield the writer lock between chunks. A queued read or write
+                // gets a fair turn before the next chunk starts.
+                tokio::task::yield_now().await;
+            }
+            Err(StoreError::Aborted(error)) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": error })),
                 ));
             }
-        },
+            Err(error) => return Err(api_error(error)),
+        }
+    }
+    let result = final_result.take().expect("one chunk is always attempted");
+    let merged = astock_v2::domain::AdvanceResult {
+        from_day: result.from_day,
+        through_day: result.through_day,
+        processed_days: processed_all,
+        trades: all_trades,
+        rebalances: all_rebalances,
+        account: result.account,
     };
-    let day = request.day.unwrap_or_else(|| set.coverage_end.clone());
-    response(
-        db.advance(&spec, &set, &day, settle_from.as_deref())
-            .map_err(api_error)?,
-    )
+    response(merged)
 }
 
 /// The profit curve: per-day equity for the account and each slot.
@@ -373,8 +841,8 @@ async fn run(State(state): State<Shared>, Json(request): Json<RunRequest>) -> Ap
 /// This is the primary read for the UI. The user's own acceptance criterion is
 /// the equity curve, so it is served as its own endpoint rather than derived
 /// from `/v2/account` (which is a point-in-time snapshot).
-async fn equity_curve(State(state): State<Shared>) -> ApiResult {
-    let db = state.lock().await;
+async fn equity_curve(State(state): State<AppState>) -> ApiResult {
+    let db = state.reader.lock().await;
     let Some(spec) = db.account().map_err(api_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -439,10 +907,10 @@ async fn equity_curve(State(state): State<Shared>) -> ApiResult {
 /// Read-only. Exists because "no_price_data" from /account/run is otherwise
 /// indistinguishable from "the bar table is empty" -- this says which.
 async fn settlement_preview(
-    State(state): State<Shared>,
+    State(state): State<AppState>,
     Query(query): Query<BarsQuery>,
 ) -> ApiResult {
-    let db = state.lock().await;
+    let db = state.reader.lock().await;
     let days = db.bar_days().map_err(api_error)?;
     if days.is_empty() {
         return response(json!({ "bar_days": 0, "symbols": 0, "entries": 0 }));
@@ -452,6 +920,7 @@ async fn settlement_preview(
         None => None,
     };
     let input = price_set_from_store(&db, query.day.as_deref())?;
+    let limits = AdvanceLimits::from_env();
     response(json!({
         "bar_days": days.len(),
         "first_bar_day": days.first(),
@@ -463,6 +932,9 @@ async fn settlement_preview(
         "entries": input.as_ref().map(|i| i.set.entries.len()).unwrap_or(0),
         "max_settle_days_per_call": MAX_SETTLE_DAYS_PER_CALL,
         "warmup_days": SETTLEMENT_WARMUP_DAYS,
+        "advance_max_entries": limits.max_entries,
+        "advance_max_seconds": limits.max_seconds,
+        "advance_chunk_days": limits.chunk_days,
     }))
 }
 
@@ -542,13 +1014,14 @@ fn price_set_from_store(
     let Some(settle_from) = settle_from else {
         // Nothing new to settle. A one-day window keeps `view` able to value
         // existing positions without pretending there is more work.
-        let start = days
-            .iter()
-            .rev()
-            .take(1)
-            .next()
-            .cloned()
-            .unwrap_or_else(|| end.clone());
+        //
+        // The window must be anchored on `end`, never on the newest day the
+        // table holds. When a caller asks for a day earlier than the last
+        // settled one, `end` is that earlier day; taking the table's newest
+        // day instead produced `BETWEEN <newer> AND <older>` -- zero rows --
+        // and the request failed as `no_price_data` even though prices for
+        // `end` existed. `end` is already known to be a day we hold.
+        let start = end.clone();
         return Ok(db
             .price_set_from_bars("bar-table", &start, &end)
             .map_err(api_error)?
@@ -557,7 +1030,8 @@ fn price_set_from_store(
     if settle_from.as_str() > end.as_str() {
         return Err((
             StatusCode::CONFLICT,
-            Json(json!({ "error": "day_before_last_settled", "last_settled": last_settled })),
+            Json(json!({ "error": "day_before_last_settled", "last_settled": last_settled,
+                         "detail": "the account is already settled past this day; settlement only moves forward" })),
         ));
     }
 
@@ -577,13 +1051,12 @@ fn price_set_from_store(
         ));
     }
 
-    // Load the settlement days plus a bounded warm-up so the strategies have
-    // enough trailing closes on the first day settled.
+    let warmup = SETTLEMENT_WARMUP_DAYS;
     let from_index = days
         .iter()
         .position(|day| day == &settle_from)
         .unwrap_or(0)
-        .saturating_sub(SETTLEMENT_WARMUP_DAYS);
+        .saturating_sub(warmup);
     let start = days[from_index].clone();
 
     Ok(db
@@ -595,17 +1068,222 @@ fn price_set_from_store(
         }))
 }
 
+// ---- independent intraday paper API --------------------------------------
+
+type LiveApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
+
+fn live_api_error(error: IntradayError) -> (StatusCode, Json<Value>) {
+    let (status, code) = match error {
+        IntradayError::Rules(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
+        IntradayError::NotFound(message) => (StatusCode::NOT_FOUND, message),
+        IntradayError::Conflict(message) => (StatusCode::CONFLICT, message),
+        IntradayError::Database(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+        IntradayError::Encoding(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+        IntradayError::Integrity(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (status, Json(json!({ "error": code })))
+}
+
+fn live_response<T: serde::Serialize>(value: T) -> LiveApiResult {
+    serde_json::to_value(value).map(Json).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+    })
+}
+
+async fn live_create_account(
+    State(state): State<LiveAppState>,
+    Json(request): Json<LiveCreateAccountRequest>,
+) -> LiveApiResult {
+    let mut db = state.writer.lock().await;
+    live_response(db.create_account(&request).map_err(live_api_error)?)
+}
+
+async fn live_account(State(state): State<LiveAppState>) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(db.account_view(None).map_err(live_api_error)?)
+}
+
+async fn live_round(
+    State(state): State<LiveAppState>,
+    Json(request): Json<RunRoundRequest>,
+) -> LiveApiResult {
+    let mut db = state.writer.lock().await;
+    let outcome = db.run_round(&request).map_err(live_api_error)?;
+    live_response(json!({
+        "round": outcome.round,
+        "decisions": outcome.decisions,
+        "trades": outcome.trades,
+        "equity": {
+            "equity_cents": outcome.round.equity_cents,
+            "account": outcome.account,
+        },
+        "ai": {
+            "ok": outcome.round.ai_ok,
+            "error": outcome.round.ai_error,
+            "application": outcome.ai,
+        },
+    }))
+}
+
+async fn live_rounds(State(state): State<LiveAppState>) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(db.rounds().map_err(live_api_error)?)
+}
+
+#[derive(Deserialize)]
+struct LiveDecisionQuery {
+    round_id: String,
+    /// Default true. A round holds ~10 438 rows but only ~2.6% are an order or
+    /// a blocked order; sending all of them was 9.1 MB / 3.4 s per refresh.
+    /// `signals_only=false` returns the complete audit set.
+    #[serde(default)]
+    signals_only: Option<bool>,
+}
+
+async fn live_decisions(
+    State(state): State<LiveAppState>,
+    Query(query): Query<LiveDecisionQuery>,
+) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    let signals_only = query.signals_only.unwrap_or(true);
+    let (decisions, total) = db
+        .decisions_split(&query.round_id, signals_only)
+        .map_err(live_api_error)?;
+    live_response(json!({
+        "round_id": query.round_id,
+        "signals_only": signals_only,
+        "total": total,
+        "returned": decisions.len(),
+        "decisions": decisions,
+    }))
+}
+
+async fn live_trades(State(state): State<LiveAppState>) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(db.trades().map_err(live_api_error)?)
+}
+
+async fn live_equity_curve(State(state): State<LiveAppState>) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(db.equity_curve().map_err(live_api_error)?)
+}
+
+#[derive(Deserialize)]
+struct LiveSymbolQuery {
+    symbol: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn live_symbol_archive(
+    State(state): State<LiveAppState>,
+    Query(query): Query<LiveSymbolQuery>,
+) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(
+        db.symbol_archive(&query.symbol, query.limit.unwrap_or(120).clamp(1, 400))
+            .map_err(live_api_error)?,
+    )
+}
+
+#[derive(Deserialize)]
+struct LiveRiskQuery {
+    #[serde(default)]
+    rounds: Option<usize>,
+}
+
+async fn live_risk_summary(
+    State(state): State<LiveAppState>,
+    Query(query): Query<LiveRiskQuery>,
+) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(
+        db.risk_summary(query.rounds.unwrap_or(40).clamp(1, 200))
+            .map_err(live_api_error)?,
+    )
+}
+
+async fn live_ai_observations(
+    State(state): State<LiveAppState>,
+    Query(query): Query<LiveRiskQuery>,
+) -> LiveApiResult {
+    let _ = query.rounds; // unused; limit is fixed below
+    let db = state.reader.lock().await;
+    live_response(db.ai_observations(120).map_err(live_api_error)?)
+}
+
+async fn live_evolution_history(State(state): State<LiveAppState>) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(db.evolution().map_err(live_api_error)?)
+}
+
+async fn live_evolve(
+    State(state): State<LiveAppState>,
+    Json(request): Json<EvolveRequest>,
+) -> LiveApiResult {
+    let mut db = state.writer.lock().await;
+    let preview = db.evolve(&request).map_err(live_api_error)?;
+    live_response(json!({
+        "preview": preview,
+        "history": db.evolution().map_err(live_api_error)?,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_state_read_and_write_locks_are_independent() {
+        let writer = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let reader = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let state = AppState { writer, reader };
+        let writer_guard = state.writer.blocking_lock();
+        // This is the real acceptance condition: holding the writer must not
+        // prevent a read-only handler's state from being acquired.
+        let reader_guard = state.reader.try_lock().expect("read state must be independent");
+        drop(reader_guard);
+        drop(writer_guard);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = env::var("ASTOCK_V2_DB").unwrap_or_else(|_| "v2.sqlite3".into());
     let address = env::var("ASTOCK_V2_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".into());
-    let mut store = Store::open(database).map_err(|error| format!("{error:?}"))?;
+    let mut store = Store::open(&database).map_err(|error| format!("{error:?}"))?;
     // `ASTOCK_V2_REGIME_FILTER=0` replays the pre-regime behaviour so the two
     // can be compared on identical data. Default is on.
     if env::var("ASTOCK_V2_REGIME_FILTER").is_ok_and(|value| value == "0") {
         store.regime_filter = false;
     }
-    let state = Arc::new(Mutex::new(store));
+    store.advance_limits = AdvanceLimits::from_env();
+    let mut reader = Store::open_read_only(&database).map_err(|error| format!("{error:?}"))?;
+    reader.regime_filter = store.regime_filter;
+    reader.next_session_fills = store.next_session_fills;
+    let state = AppState {
+        writer: Arc::new(Mutex::new(store)),
+        reader: Arc::new(Mutex::new(reader)),
+    };
+    let live_database = env::var("ASTOCK_V2_LIVE_DB")
+        .unwrap_or_else(|_| "work/live/intraday.sqlite3".into());
+    let live_writer = IntradayStore::open(&live_database)
+        .map_err(|error| format!("{error}"))?;
+    // The live writer initializes WAL and its sidecars; the reader is separate
+    // so a long GET never waits on a round's write lock.
+    let live_reader = IntradayStore::open_read_only(&live_database)
+        .map_err(|error| format!("{error}"))?;
+    let live_state = LiveAppState {
+        writer: Arc::new(Mutex::new(live_writer)),
+        reader: Arc::new(Mutex::new(live_reader)),
+    };
     let app = Router::new()
         .route("/v2/health", get(health))
         .route("/v2/account", get(account).post(create_account))
@@ -621,9 +1299,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/market/settlement-preview", get(settlement_preview))
         .route("/v2/market/regime", get(market_regime))
         .route("/v2/account/equity-curve", get(equity_curve))
+        .route("/v2/ai/advice", post(submit_advice))
+        .route("/v2/account/daily-report", get(daily_report))
+        .route("/v2/account/blocked", get(blocked_orders))
+        .route("/v2/research/candidates", get(research_candidates))
+        .route("/v2/market/observation", get(market_observation))
         .with_state(state);
+    let live_routes = Router::new()
+        .route("/v2/live/account", get(live_account).post(live_create_account))
+        .route("/v2/live/round", post(live_round))
+        .route("/v2/live/rounds", get(live_rounds))
+        .route("/v2/live/decisions", get(live_decisions))
+        .route("/v2/live/trades", get(live_trades))
+        .route("/v2/live/equity-curve", get(live_equity_curve))
+        .route("/v2/live/evolve", post(live_evolve))
+        .route("/v2/live/evolution", get(live_evolution_history))
+        .route("/v2/live/ai", get(live_ai_observations))
+        .route("/v2/live/symbol", get(live_symbol_archive))
+        .route("/v2/live/risk", get(live_risk_summary))
+        .with_state(live_state);
+    let app = app.merge(live_routes);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("astock-v2 listening at http://{address}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        CancellingListener { inner: listener },
+        app.into_make_service_with_connect_info::<ConnectionClosed>(),
+    )
+    .await?;
     Ok(())
 }

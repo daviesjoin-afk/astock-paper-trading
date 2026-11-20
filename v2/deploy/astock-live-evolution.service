@@ -1,0 +1,25 @@
+[Unit]
+Description=AStock V2 read-only close research and isolated strategy replay
+After=astock-live.service
+StartLimitIntervalSec=2h
+StartLimitBurst=2
+
+[Service]
+Type=oneshot
+User=astock
+Group=astock
+WorkingDirectory=/opt/astock-paper-evolution
+EnvironmentFile=/etc/astock-paper.env
+StateDirectory=astock-paper-evolution
+StateDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/bin/python3 -B /opt/astock-paper-evolution/scripts/intraday_evolution.py daily --db /var/lib/astock-paper/intraday.sqlite3 --history /opt/astock-paper/history-closes.json --calendar /opt/astock-paper/data/calendar-2026-v1.json --root /var/lib/astock-paper-evolution --replay-executable /opt/astock-paper-evolution/bin/intraday_evolution --ai
+TimeoutStartSec=90min
+Restart=on-failure
+RestartSec=10min
+Nice=15
+MemoryMax=2G
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

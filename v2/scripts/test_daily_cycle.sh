@@ -8,9 +8,11 @@
 # mistake that silently settles an account against a stale price.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPT="$HERE/daily_cycle.sh"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/astock-cycle-test-XXXXXX")"
+WORK="$HERE/../work/p0-daily-cycle-test"
+rm -rf "$WORK"
+mkdir -p "$WORK"
 PASS=0
 FAIL=0
 
@@ -103,6 +105,21 @@ case "$output" in
   *"ingested rows for 2026-11-10: 5576"*) ok "reports ingested row count" ;;
   *) bad "missing row count report" ;;
 esac
+
+echo "== leftover access environment does not affect advance =="
+make_stub 0 5576 "$WORK/bin"
+make_curl_stub "$WORK/bin"
+: >"$STUB_CURL_LOG"
+set +e
+ASTOCK_V2_TOKEN="ignored-legacy-value" run_cycle --day 2026-11-10 >/dev/null 2>&1; code=$?
+set -e
+[ "$code" -eq 0 ] && ok "legacy environment is ignored" || bad "legacy environment exit $code"
+grep -q "v2/account/run" "$STUB_CURL_LOG" && ok "advance needs no credential" || bad "advance not called"
+if grep -qi -e 'Authorization[ :]' -e 'Bearer' -e 'ignored-legacy-value' "$STUB_CURL_LOG"; then
+  bad "unexpected credential header or value"
+else
+  ok "no credential sent"
+fi
 
 echo "== dry-run ingests but does not advance =="
 make_stub 0 5576 "$WORK/bin"

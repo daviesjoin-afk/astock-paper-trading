@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Run every fold and report the distribution, not a single verdict.
+
+`oos_report.py` answers "did this one window hold up". This answers "over
+several windows, is the result consistent" — which is the only form of the
+question that can distinguish skill from a lucky year.
+
+What it refuses to do:
+
+* Compare folds against each other and declare a winner. Folds are samples of
+  the same configuration, not competing candidates.
+* Average the returns into one number. A mean hides the spread, and the spread
+  is the finding: four folds at +2%, -3%, +1%, -9% and one fold at -2% are
+  different claims.
+* Retune between folds. Every fold runs the same parameters; that is the point.
+
+Usage:
+    python scripts/run_folds.py --folds folds.json --binary regime_ab.exe \
+        --db market.sqlite3 --out folds-report.json --workdir runs
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import statistics
+import subprocess
+import sys
+
+
+def run_fold(binary: Path, db: Path, fold: dict, workdir: Path,
+             variant: str, timeout: float) -> dict:
+    """Replay one fold end to end and read the account out of the report."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    out_path = workdir / f"fold-{fold['fold']}.json"
+    cmd = [
+        str(binary), "--db", str(db),
+        "--from", fold["test"][0], "--through", fold["test"][1],
+        "--initial-cash-cents", "10000000",
+    ]
+    try:
+        with out_path.open("w", encoding="utf-8") as handle:
+            result = subprocess.run(cmd, stdout=handle, stderr=subprocess.PIPE,
+                                    text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # A binary that cannot run is a failed fold, not a zero return. Raising
+        # here would abort the whole sweep and lose the folds that did run.
+        return {
+            "fold": fold["fold"], "test": fold["test"],
+            "status": "failed",
+            "error": [f"{type(error).__name__}: {error}"],
+        }
+    if result.returncode != 0:
+        # Keep the whole tail, not just the last line. A replay that dies on
+        # `missing_close_price` prints the offending day and the held symbol
+        # above the summary line, and that context is the difference between
+        # "the fold failed" and "the fold failed because of a data gap on
+        # 2024-12-30" -- which is a data problem, not a strategy problem.
+        lines = [line for line in (result.stderr or "").strip().splitlines() if line.strip()]
+        tail = lines[-6:] or ["exit code %d" % result.returncode]
+        return {
+            "fold": fold["fold"],
+            "test": fold["test"],
+            "status": "failed",
+            "error": tail,
+            "exit_code": result.returncode,
+        }
+    try:
+        payload = json.loads(out_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        return {
+            "fold": fold["fold"], "test": fold["test"],
+            "status": "failed", "error": [f"report unreadable: {error}"],
+        }
+    data = payload.get(variant)
+    if not data:
+        return {
+            "fold": fold["fold"], "test": fold["test"],
+            "status": "failed", "error": [f"no {variant} variant in report"],
+        }
+    account = data.get("account") or {}
+    return {
+        "fold": fold["fold"],
+        # `train` is descriptive: the replay only settles the test window. A
+        # fold spec without it is still runnable, so it is not required.
+        "train": fold.get("train"),
+        "test": fold["test"],
+        "status": "ok",
+        "return_bps": account.get("return_bps"),
+        "max_drawdown_bps": account.get("max_drawdown_bps"),
+        "fills": data.get("fills"),
+        "days": len((payload.get("input") or {}).get("windows") or []),
+    }
+
+
+def summarise(results: list[dict]) -> dict:
+    """Describe the distribution without collapsing it into a verdict."""
+    ok = [row for row in results if row["status"] == "ok" and row["return_bps"] is not None]
+    failed = [row for row in results if row["status"] != "ok"]
+    if not ok:
+        return {
+            "folds_run": len(results), "folds_ok": 0, "folds_failed": len(failed),
+            "verdict": "no_usable_fold",
+            "note": "No fold produced an account curve; nothing can be said.",
+        }
+    returns = [row["return_bps"] for row in ok]
+    positive = sum(1 for value in returns if value > 0)
+    summary = {
+        "folds_run": len(results),
+        "folds_ok": len(ok),
+        "folds_failed": len(failed),
+        "returns_bps": returns,
+        "positive_folds": positive,
+        "negative_folds": len(returns) - positive,
+        "mean_bps": round(statistics.fmean(returns)),
+        "median_bps": round(statistics.median(returns)),
+        "worst_bps": min(returns),
+        "best_bps": max(returns),
+        # Spread is the finding, so it is reported next to the mean rather than
+        # left for a reader to subtract.
+        "spread_bps": max(returns) - min(returns),
+        "note": (
+            "Folds are samples of one configuration, not competing candidates. "
+            "A mean without the spread invites a conclusion the data does not support."
+        ),
+    }
+    if len(returns) < 3:
+        summary["verdict"] = "too_few_folds"
+        summary["why"] = (
+            f"{len(returns)} usable fold(s). Three is the minimum before a spread "
+            "means anything; below that it is one observation."
+        )
+    elif positive == len(returns):
+        summary["verdict"] = "all_positive"
+        summary["why"] = "Every fold positive. Stronger than one window, still not a forecast."
+    elif positive == 0:
+        summary["verdict"] = "all_negative"
+        summary["why"] = "Every fold negative. The configuration is not supported."
+    else:
+        summary["verdict"] = "mixed"
+        summary["why"] = (
+            f"{positive} of {len(returns)} folds positive — the sign depends on the "
+            "window, which is the definition of an unstable edge."
+        )
+    if failed:
+        summary["failed_folds"] = [row["fold"] for row in failed]
+    return summary
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--folds", required=True, type=Path)
+    parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--db", required=True, type=Path)
+    parser.add_argument("--variant", default="filtered", choices=["filtered", "unfiltered"])
+    parser.add_argument("--workdir", required=True, type=Path)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--timeout", type=float, default=3600.0)
+    parser.add_argument("--only", default="", help="comma separated fold numbers")
+    args = parser.parse_args(argv)
+
+    for path in (args.folds, args.binary, args.db):
+        if not path.exists():
+            raise SystemExit(f"not found: {path}")
+
+    spec = json.loads(args.folds.read_text(encoding="utf-8"))
+    folds = spec.get("folds") or []
+    if not folds:
+        raise SystemExit("fold file contains no folds")
+    if args.only:
+        wanted = {int(part) for part in args.only.split(",") if part.strip()}
+        folds = [fold for fold in folds if fold["fold"] in wanted]
+
+    results = []
+    for fold in folds:
+        print(f"fold {fold['fold']}: test {fold['test'][0]}..{fold['test'][1]}",
+              file=sys.stderr)
+        results.append(run_fold(args.binary, args.db, fold, args.workdir,
+                                args.variant, args.timeout))
+
+    report = {
+        "variant": args.variant,
+        "folds_file": str(args.folds),
+        "mode": spec.get("mode"),
+        "summary": summarise(results),
+        "results": results,
+        "caveats": [
+            "Every fold runs the same parameters; nothing is retuned between folds.",
+            "Folds may share training history (expanding window); only the test windows are independent.",
+            "Unmodelled: slippage, order-book depth, ST liquidity beyond the turnover cap.",
+        ],
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

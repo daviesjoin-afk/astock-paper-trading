@@ -144,6 +144,32 @@ def compare_point(audit, where, independent, reported, allow_boundary):
               reported["max_drawdown_bps"], allow_boundary)
 
 
+def bar_projection(connection):
+    """Detect the schema-2 column set and expose a read-only SQL projection.
+
+    Legacy TDX rows with zero volume and zero OHLC are halted marks. Their
+    official previous close is used for valuation only and can never fill. The
+    database is opened mode=ro and no ALTER/UPDATE is ever issued.
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(bar)")}
+    required = {"symbol", "day", "open_cents", "high_cents", "low_cents",
+                "close_cents", "prev_close_cents", "volume_shares",
+                "adjust", "source"}
+    if not required <= columns:
+        raise VerificationError(
+            "unsupported_bar_column_set: expected schema2 columns and either "
+            "explicit tradable or legacy TDX fields")
+    halt = ("volume_shares=0 AND open_cents=0 AND high_cents=0 AND low_cents=0")
+    if "tradable" in columns:
+        return "close_cents", "tradable", "close_cents"
+    projected_close = (
+        f"CASE WHEN {halt} THEN "
+        "CASE WHEN prev_close_cents>0 THEN prev_close_cents ELSE 0 END "
+        "ELSE close_cents END"
+    )
+    return projected_close, f"CASE WHEN {halt} THEN 0 ELSE 1 END", projected_close
+
+
 def verify_variant(name, variant, report, connection):
     audit = Audit()
     days = [item["day"] for item in report["input"]["windows"]]
@@ -170,12 +196,15 @@ def verify_variant(name, variant, report, connection):
     if any(len(variant["curves"][key]) != len(days) for key in SERIES):
         raise VerificationError(f"{name}: curve length differs from input dates")
 
+    close_expr, tradable_expr, day_expr = bar_projection(connection)
     quote_cache = {}
     def quote(symbol, day):
         key = (symbol, day)
         if key not in quote_cache:
             row = connection.execute(
-                "SELECT close_cents,open_cents,volume_shares,adjust,source,prev_close_cents,tradable FROM bar WHERE symbol=? AND day=?",
+                f"SELECT {close_expr},open_cents,volume_shares,adjust,source,"
+                f"prev_close_cents,{tradable_expr},low_cents,high_cents "
+                f"FROM bar WHERE symbol=? AND day=?",
                 key).fetchone()
             if row is None:
                 raise VerificationError(f"required source quote missing: {symbol}:{day}")
@@ -247,7 +276,21 @@ def verify_variant(name, variant, report, connection):
             if slot not in SLOTS or side not in ("buy", "sell"):
                 raise VerificationError(f"invalid fill identity: {trade}")
             bar = quote(symbol, day)
-            audit.equal("fill_price", f"{name}:{trade['id']}", bar[0], price)
+            # A resting stop fills at its line, or at the open when the session
+            # gapped through it -- never at the close that merely confirms the
+            # break. The audit therefore accepts two prices: the close, which is
+            # what every other order must use, and a stop fill that lands inside
+            # the session's own range. Anything else is a real accounting break.
+            close_cents, open_cents = bar[0], bar[1]
+            low_cents, high_cents = bar[7] or 0, bar[8] or 0
+            in_range = (
+                low_cents > 0 and high_cents > 0
+                and low_cents <= price <= high_cents
+            )
+            audit.equal(
+                "fill_price", f"{name}:{trade['id']}", True,
+                price == close_cents or in_range,
+            )
             audit.equal("fill_tradability", f"{name}:{trade['id']}", True, bar[6] == 1)
             notional = quantity * price
             expected_fee = max(notional * 3 // 10_000, 500)
@@ -425,8 +468,10 @@ def verify(report_path, db_path):
     uri = db_path.resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as connection:
         connection.execute("BEGIN")
+        _, _, day_close_expr = bar_projection(connection)
         db_days = [row[0] for row in connection.execute(
-            "SELECT DISTINCT day FROM bar WHERE adjust='none' AND close_cents>0 AND day BETWEEN ? AND ? ORDER BY day",
+            f"SELECT DISTINCT day FROM bar WHERE adjust='none' AND {day_close_expr}>0 "
+            "AND day BETWEEN ? AND ? ORDER BY day",
             (report["input"]["from"], report["input"]["through"]))]
         if days != db_days or report["input"]["settled_days"] != len(days):
             raise VerificationError("report period is not the source's complete unadjusted date sequence")

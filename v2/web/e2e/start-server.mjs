@@ -1,6 +1,6 @@
 // Boot the real Rust kernel for browser tests on an isolated database file.
 // The kernel has no test mode: the UI tests hit the same localhost API as users.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { join } from "node:path";
@@ -24,12 +24,22 @@ if (!instance) {
   process.exit(1);
 }
 const database = process.env.ASTOCK_V2_E2E_DB || join(root, ".e2e", `v2-e2e-${instance}.sqlite3`);
+// The live UI reads a separate intraday database. Keep it empty and isolated:
+// e2e asserts explicit "no account / no rounds" states, never live numbers.
+const liveDatabase =
+  process.env.ASTOCK_V2_LIVE_DB || join(root, ".e2e", `live-e2e-${instance}.sqlite3`);
 const priceSets =
   process.env.ASTOCK_PRICE_SETS_DIR || join(root, ".e2e", `price-sets-${instance}`);
 if (!process.env.ASTOCK_V2_E2E_DB) {
   mkdirSync(dirname(database), { recursive: true });
   for (const suffix of ["", "-wal", "-shm"]) {
     rmSync(database + suffix, { force: true });
+  }
+}
+if (!process.env.ASTOCK_V2_LIVE_DB) {
+  mkdirSync(dirname(liveDatabase), { recursive: true });
+  for (const suffix of ["", "-wal", "-shm"]) {
+    rmSync(liveDatabase + suffix, { force: true });
   }
 }
 mkdirSync(priceSets, { recursive: true });
@@ -49,6 +59,7 @@ while (tradingDays.length < 70) {
   }
   start.setUTCDate(start.getUTCDate() + 1);
 }
+const bars = [];
 const entries = [];
 for (const [symbol, base, slope] of [
   ["600000.SH", 1000, 3],
@@ -62,6 +73,15 @@ for (const [symbol, base, slope] of [
       price_cents: price,
       source: "e2e-synthetic",
       observed_at: `${day}T15:00:00+08:00`,
+    });
+    // The market screens read the `bar` table, not the reviewed price set.
+    // Without these rows the scrper's list and the symbol page are empty for
+    // a reason that has nothing to do with the code under test.
+    bars.push({
+      symbol,
+      day,
+      close: price,
+      prev: index === 0 ? price : base + (index - 1) * slope,
     });
   });
 }
@@ -79,10 +99,36 @@ writeFileSync(
   }),
 );
 
+// Seed `bar` rows so the market list and symbol page have data. The kernel
+// owns the schema, so boot it once (isolated DB) to create the file, then let
+// e2e/seed-bars.py insert with Python's stdlib — no new npm dependency.
+const bootstrap = spawnSync(binary, {
+  env: {
+    ...process.env,
+    ASTOCK_V2_DB: database,
+    ASTOCK_V2_LIVE_DB: liveDatabase,
+    ASTOCK_V2_ADDR: "127.0.0.1:0",
+  },
+  stdio: "ignore",
+  timeout: 10_000,
+});
+void bootstrap; // exiting here is expected; the seed below is the real check
+
+const seeded = spawnSync(
+  process.env.ASTOCK_PYTHON || "python",
+  ["-B", join(root, "e2e", "seed-bars.py"), database],
+  { stdio: "inherit" },
+);
+if (seeded.status !== 0) {
+  console.error("e2e bar seed failed");
+  process.exit(seeded.status ?? 1);
+}
+
 const child = spawn(binary, {
   env: {
     ...process.env,
     ASTOCK_V2_DB: database,
+    ASTOCK_V2_LIVE_DB: liveDatabase,
     ASTOCK_V2_ADDR: process.env.ASTOCK_V2_ADDR || "127.0.0.1:18766",
     ASTOCK_PRICE_SETS_DIR: priceSets,
     ASTOCK_ALLOW_SYNTHETIC: "1",

@@ -9,7 +9,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V2_DIR="$(cd "$HERE/.." && pwd)"
 PORT="${ASTOCK_SMOKE_PORT:-18791}"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/astock-bar-smoke-XXXXXX")"
+# Keep the smoke artifact inside the project work tree: Windows /tmp paths can
+# resolve differently between Bash and native tools.
+WORK="$V2_DIR/work/p0-bar-smoke"
+rm -rf "$WORK"
+mkdir -p "$WORK"
 DB="$WORK/smoke.sqlite3"
 LOG="$WORK/server.log"
 
@@ -35,6 +39,7 @@ conn.execute("""CREATE TABLE IF NOT EXISTS bar(
   open_cents INTEGER NOT NULL, high_cents INTEGER NOT NULL, low_cents INTEGER NOT NULL,
   close_cents INTEGER NOT NULL, prev_close_cents INTEGER NOT NULL,
   volume_shares INTEGER NOT NULL, amount_cents INTEGER NOT NULL,
+  adjust TEXT NOT NULL DEFAULT 'none', source TEXT NOT NULL DEFAULT 'tdx',
   PRIMARY KEY(symbol, day))""")
 conn.execute("CREATE INDEX IF NOT EXISTS bar_by_day ON bar(day)")
 conn.commit(); conn.close()

@@ -17,15 +17,30 @@ export type Route = {
   view: string;
 };
 
-/** Every module and its views, in navigation order. */
+/**
+ * Every module and its views, in navigation order.
+ *
+ * The intraday module is first because it is the only account that actually
+ * trades. The former daily modules (`overview`, `trading`) are deliberately
+ * absent: their "开始自动运行" button created a *separate* daily ledger that no
+ * scheduler ever advanced, so a running intraday account could sit beside an
+ * empty daily one and look broken. The daily kernel still exists behind
+ * `/v2/account*`; this console no longer offers a misleading entry point.
+ */
 export const NAV = [
   {
-    id: "overview",
-    label: "总览",
-    hint: "净值 · 今日盈亏 · 告警",
+    id: "live",
+    label: "盘中",
+    hint: "实时总览 · 决策 · 成交 · 轮次",
     views: [
-      { id: "dashboard", label: "驾驶舱" },
-      { id: "signals", label: "今日信号" },
+      { id: "dashboard", label: "实时总览" },
+      { id: "signals", label: "决策信号" },
+      { id: "trades", label: "实时成交" },
+      { id: "rounds", label: "调度记录" },
+      { id: "ai", label: "AI 观测" },
+      { id: "evolution", label: "进化提案" },
+      { id: "risk", label: "风控拦截" },
+      { id: "symbol", label: "个股档案" },
     ],
   },
   {
@@ -35,19 +50,14 @@ export const NAV = [
     views: [
       { id: "screener", label: "全市场" },
       { id: "detail", label: "个股详情" },
-      { id: "data", label: "数据覆盖" },
     ],
   },
   {
-    id: "trading",
-    label: "交易",
-    hint: "账户 · 持仓 · 成交",
+    id: "research",
+    label: "研究",
+    hint: "候选治理 · 证据 · 历史",
     views: [
-      { id: "account", label: "账户" },
-      { id: "positions", label: "持仓" },
-      { id: "trades", label: "委托与成交" },
-      { id: "rebalances", label: "调仓记录" },
-      { id: "advance", label: "推进与结算" },
+      { id: "candidates", label: "候选评审" },
     ],
   },
 ] as const;

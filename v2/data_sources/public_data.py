@@ -1,4 +1,9 @@
-"""On-demand public data. No ledger writes, implicit fill or adjusted prices.
+"""Common public data SDK/CLI with an explicit capability catalog.
+
+Legacy bars/quotes/company/announcements retain their original contracts.
+Additional upstream datasets preserve their declared units, adjustment and
+history/snapshot/derived semantics; discovery never performs network I/O.
+No query writes the account ledger or implicitly fills missing market data.
 
 The public client owns query semantics; SourceHttp owns raw snapshot persistence.
 Defaults: company SZ=SZSE, SH/BJ=Eastmoney; announcements=CNINFO.
@@ -10,12 +15,14 @@ Run: python v2/data_sources/public_data.py --help
 from __future__ import annotations
 
 import argparse
+import ast
 import io
 import json
+import math
 import re
 import sqlite3
 import urllib.error
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from decimal import Decimal, InvalidOperation
 from dataclasses import asdict
 from datetime import date, datetime, timezone, timedelta
@@ -59,6 +66,35 @@ def day_id(value: str) -> str:
     except (ValueError, TypeError):
         raise PublicDataError("invalid_day", str(value)) from None
     return value
+
+
+def _dataset_value(value):
+    """Project native dataset values to finite JSON without losing frame attrs."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if type(value).__module__.startswith("pandas") and type(value).__name__ in ("NAType", "NaTType"):
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value) if value.is_finite() else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _dataset_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dataset_value(v) for v in value]
+    if hasattr(value, "columns") and callable(getattr(value, "to_dict", None)):
+        return dict(frame=True, columns=[str(c) for c in value.columns],
+                    rows=_dataset_value(value.to_dict(orient="records")),
+                    attrs=_dataset_value(dict(value.attrs)))
+    if callable(getattr(value, "item", None)):
+        return _dataset_value(value.item())
+    if callable(getattr(value, "tolist", None)):
+        return _dataset_value(value.tolist())
+    raise PublicDataError("unsupported_dataset_result", type(value).__name__)
 
 
 def parse_quote_bytes(raw: bytes, symbols: Sequence[str]) -> list[dict]:
@@ -129,6 +165,158 @@ class PublicDataClient:
         self.provider_source = provider_source
         self.company_provider_version = company_provider_version
         self.announcements_provider_version = announcements_provider_version
+
+    @staticmethod
+    def datasets(category: str | None = None) -> list[dict]:
+        """Discover upstream capabilities and the project's existing sources."""
+        try:
+            from .astock_public import catalog
+            from .astock_public.source_snapshot import python_blocks
+        except ImportError:
+            from astock_public import catalog
+            from astock_public.source_snapshot import python_blocks
+        signatures = {}
+        for block in python_blocks():
+            for node in ast.parse(block).body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    signatures[node.name] = [arg.arg for arg in
+                                             node.args.posonlyargs + node.args.args + node.args.kwonlyargs]
+        legacy = [
+            dict(name="bars", category="market", source="tdx/local", origin="project"),
+            dict(name="quotes", category="market", source="tencent-quotes", origin="project"),
+            dict(name="company", category="fundamentals", source="szse/eastmoney", origin="project"),
+            dict(name="announcements", category="news", source="cninfo", origin="project"),
+        ]
+        upstream = catalog()
+        items = legacy + [dict(item, label=item["name"], name=item["id"], category=item["layer"],
+                               parameters=item.get("parameters", signatures.get(item["functions"][0], [])))
+                          for item in upstream["capabilities"]]
+        seen = {item["name"] for item in items}
+        for item in upstream["capabilities"]:
+            for function in item["functions"]:
+                if function not in seen:
+                    items.append(dict(item, name=function, alias_of=item["id"], category=item["layer"],
+                                      parameters=item.get("parameters", signatures.get(function, []))))
+                    seen.add(function)
+        helpers = list(upstream["local_helpers"]) + [
+            dict(id="helper." + function, function=function, description="Upstream utility")
+            for function in ("cn_today", "dedup_articles", "limit_up_sentiment")]
+        for item in helpers:
+            for alias in (item["id"], item["function"]):
+                if alias not in seen:
+                    items.append(dict(item, name=alias, category="helpers", source="upstream",
+                                      parameters=signatures.get(item["function"], [])))
+                    seen.add(alias)
+        return [item for item in items if category is None or item.get("category") == category]
+
+    def dataset(self, name: str, /, *, as_of: str | None = None, **params) -> dict:
+        """Query one registered capability; reuse existing routes and cache.
+
+        Strict historical reads require a previously frozen semantic result.
+        Effective dates returned by an upstream endpoint never waive that rule.
+        """
+        if name in ("bars", "quotes", "company", "announcements"):
+            return getattr(self, name)(as_of=as_of, **params)
+        try:
+            from .astock_public import PublicClient, UPSTREAM_COMMIT, catalog
+        except ImportError:
+            from astock_public import PublicClient, UPSTREAM_COMMIT, catalog
+        if not isinstance(name, str) or not name:
+            raise PublicDataError("dataset_required")
+        if any(key.lower() in ("api_key", "token", "password", "authorization", "secret")
+               for key in params):
+            raise PublicDataError("credentials_require_environment")
+        try:
+            request_params = json.dumps(
+                {"params": params, "types": {k: type(v).__module__ + "." + type(v).__name__
+                                               for k, v in params.items()}},
+                default=_dataset_value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise PublicDataError("invalid_dataset_params", "finite serializable parameters required") from exc
+        identity = RequestIdentity("astock-public:v2:" + UPSTREAM_COMMIT,
+                                   "https://public-data.invalid/dataset/" + name,
+                                   date=request_params)
+
+        inventory = catalog()
+        capability = next((item for item in inventory["capabilities"]
+                           if name in (item["id"], item["name"]) or name in item["functions"]), None)
+        live_snapshot = capability is not None and capability["temporal"] in (
+            "same_trading_day", "current_snapshot")
+        ttl = min(self.http.ttl, 30) if live_snapshot else self.http.ttl
+
+        class DatasetFailure(Exception):
+            def __init__(self, result):
+                self.result = result
+
+        def validate(raw):
+            result = json.loads(raw)
+            if not isinstance(result, dict) or result.get("status") not in ("ok", "empty"):
+                raise PublicDataError("invalid_dataset_result", name)
+            return result
+
+        def opener(request, timeout):
+            # Raw endpoint bytes are not persisted before the dataset parser has
+            # accepted them. The outer SourceHttp freezes only a successful result.
+            transport = SourceHttp(timeout=self.http.timeout, retries=self.http.retries,
+                                   opener=self.http.opener, clock=self.http.clock, sleep=self.http.sleep)
+            upstream = PublicClient(http=transport)
+            output = io.StringIO()
+            try:
+                with redirect_stdout(output):
+                    if capability is not None:
+                        options = dict(params)
+                        if name in capability["functions"]:
+                            options.setdefault("function", name)
+                        answer = upstream.query(capability["id"], **options)
+                        data = _dataset_value(answer.result)
+                        provenance = answer.provenance
+                    else:
+                        helpers = list(inventory["local_helpers"]) + [
+                            dict(id="helper." + function, function=function)
+                            for function in ("cn_today", "dedup_articles", "limit_up_sentiment")]
+                        helper = next((item for item in helpers
+                                       if name in (item["id"], item["function"])), None)
+                        if helper is None:
+                            raise PublicDataError("dataset_not_found", name)
+                        data = _dataset_value(upstream.call(helper["function"], **params))
+                        provenance = dict(source="upstream helper", temporal="caller_inputs",
+                                          historical_first_seen_verified=False)
+            except Exception as exc:
+                code = str(getattr(exc, "code", "source_error"))
+                result = dict(status="blocked" if code in ("credential_required", "optional_dependency_missing")
+                              else "error", capability=name, code=code, detail=str(exc)[:300])
+                raise DatasetFailure(result) from exc
+            messages = output.getvalue().splitlines()[:10]
+            warnings = [line for line in messages if any(token in line.lower()
+                        for token in ("warn", "error", "失败"))]
+            rows = data.get("rows", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+            result = dict(status="ok", capability=name, rows=rows, data=data, warnings=warnings,
+                          source=provenance.get("source"), temporal=provenance.get("temporal"),
+                          provenance=provenance, historical_first_seen_verified=False)
+            network_empty = (capability is not None
+                             and capability["temporal"] != "local_computation"
+                             and (data == [] or (isinstance(data, dict) and data.get("frame") and not rows)))
+            incomplete = isinstance(data, dict) and (data.get("attrs") or {}).get("complete") is False
+            if warnings or network_empty or incomplete:
+                result.update(status="partial" if rows else "error",
+                              code="source_warning" if warnings else "source_empty_unverified" if network_empty
+                                   else "source_incomplete",
+                              fetched_at=timestamp(self.http.clock().isoformat()).isoformat(),
+                              cache_hit=False)
+                raise DatasetFailure(result)
+            return io.BytesIO(json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+
+        frozen = SourceHttp(self.http.cache_dir, ttl=ttl, offline=self.http.offline,
+                            timeout=self.http.timeout, opener=opener, clock=self.http.clock)
+        try:
+            snap = frozen.request(identity, validate=validate, as_of=as_of)
+        except DatasetFailure as exc:
+            return exc.result
+        result = validate(snap.raw)
+        result.update(cache_hit=snap.cache_hit, snapshot_sha256=snap.sha256,
+                      fetched_at=snap.fetched_at, snapshot_fetched_at=snap.fetched_at,
+                      availability="frozen_fetch_time" if as_of else "retrieved_version")
+        return result
 
     def quotes(self, symbols: Sequence[str], *, as_of: str | None = None) -> dict:
         symbols = sorted(set(symbol_id(s) for s in symbols))
@@ -368,8 +556,11 @@ class PublicDataClient:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kind", choices=("bars", "quotes", "company", "announcements"))
-    parser.add_argument("--symbol", required=True, help="canonical symbol; comma-separated for quotes")
+    parser.add_argument("kind", choices=("bars", "quotes", "company", "announcements", "datasets", "dataset"))
+    parser.add_argument("--symbol", help="canonical symbol; comma-separated for quotes")
+    parser.add_argument("--name", help="capability name from datasets, for dataset queries")
+    parser.add_argument("--params", default="{}", help="JSON object of capability-specific arguments")
+    parser.add_argument("--category", help="filter the capability catalog")
     parser.add_argument("--start-day")
     parser.add_argument("--end-day")
     parser.add_argument("--source", help="bars: tdx (default)/local; quotes: tencent-quotes; "
@@ -381,6 +572,24 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         client = PublicDataClient(SourceHttp(args.cache_dir, ttl=args.cache_ttl, offline=args.offline), bar_db=args.bar_db)
+        if args.kind in ("datasets", "dataset"):
+            if (args.symbol is not None or args.start_day is not None or args.end_day is not None
+                    or args.source is not None or args.days is not None or args.adjust != "none"
+                    or args.bar_db is not None):
+                raise PublicDataError("capability_params_required", "put dataset arguments in --params JSON")
+            if args.kind == "datasets":
+                result = {"status": "ok", "kind": "datasets", "datasets": client.datasets(args.category)}
+            else:
+                if not args.name:
+                    raise PublicDataError("dataset_required", "use --name from datasets")
+                params = json.loads(args.params)
+                if not isinstance(params, dict):
+                    raise PublicDataError("invalid_dataset_params", "--params requires a JSON object")
+                result = client.dataset(args.name, as_of=args.as_of, **params)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
+            return 0 if result.get("status") in ("ok", "empty") else 3 if result.get("status") == "partial" else 2
+        if args.symbol is None:
+            raise PublicDataError("symbols_required")
         if args.adjust != "none":
             raise PublicDataError("unsupported_adjust", args.adjust)
         if args.kind in ("company", "quotes") and (args.start_day is not None or args.end_day is not None):

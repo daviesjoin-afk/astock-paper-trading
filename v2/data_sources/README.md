@@ -1,10 +1,14 @@
 # 公共数据入口与 a-stock-data 交叉核对
 
-2026-11-12 起，日线、报价、公司资料、公告统一入口为 `public_data.py`。SDK/CLI、
-共享缓存、来源与时间边界见 [公共数据层指南](../docs/PUBLIC-MARKET-DATA.md)；
-AKShare 等五项目及官方来源比较见 [调研记录](../docs/MARKET-SOURCES-RESEARCH-2026-11-12.md)。
-`ingest_market.py`、`a_stock_data.py`、`realtime_quotes.py` 已复用 `source_http.py`；
-缓存需显式启用，单个 TDX 日包可跨股票和采集器复用。以下双源交叉核对及人工审核流程保持。
+2026-11-15 起，统一入口 `public_data.py` 同时提供原有日线、报价、公司资料、公告和上游全量能力目录。新增 `datasets()` / `dataset(name, **params)` 覆盖 15 类数据能力及辅助计算，组件与更新说明见 [全量适配器](astock_public/README.md)，本轮验收见 [执行记录](../docs/PUBLIC-DATA-EXECUTION-2026-11-14.md)。
+
+```bash
+# 在 v2/ 执行；先查能力及真实参数，再按任务取数
+python data_sources/public_data.py datasets
+python data_sources/public_data.py dataset --name cls_telegraph --params '{"page_size":3}'
+```
+
+原 `ingest_market.py`、`a_stock_data.py`、`realtime_quotes.py` 和共享 `SourceHttp` 保留，旧接口契约见 [公共数据层指南](../docs/PUBLIC-MARKET-DATA.md)。**以下章节保留早期双源价格集合流程及其当时边界，不代表当前公共层的数据范围或 Rust 功能全集。**双源核对与人工 reviewed 发布流程继续有效。
 
 
 目标：把公开 A 股日线变成**可追溯、可复核**的输入，再交给现有

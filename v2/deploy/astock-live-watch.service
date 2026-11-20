@@ -1,0 +1,14 @@
+[Unit]
+Description=Read-only AStock V2 paper-session health check
+
+[Service]
+Type=oneshot
+User=astock
+Group=astock
+WorkingDirectory=/opt/astock-paper
+ExecStart=/usr/bin/python3 -B /opt/astock-paper/scripts/live_paper_watch.py --calendar /opt/astock-paper/data/calendar-2026-v1.json
+TimeoutStartSec=30s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

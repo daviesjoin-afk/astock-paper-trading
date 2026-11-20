@@ -18,13 +18,20 @@ struct Options {
     /// `same-close` keeps the original book; `next-session` decides on the
     /// previous close and fills at today's close.
     next_session_fills: bool,
+    /// Compare against the lower-wick candidate filter instead of the regime
+    /// filter. Default keeps the existing regime comparison so old callers and
+    /// the fold harness see no change.
+    klow_filter: bool,
+    /// Share of the cross-section to drop, in bps (2_000 = worst 20%).
+    klow_cut_bps: i64,
 }
 
 fn options(args: impl Iterator<Item = String>) -> Result<Options, Box<dyn Error>> {
     let mut flags = std::collections::BTreeMap::new();
     let mut args = args;
     while let Some(flag) = args.next() {
-        if !["--db", "--from", "--through", "--initial-cash-cents", "--fills"].contains(&flag.as_str()) {
+        if !["--db", "--from", "--through", "--initial-cash-cents", "--fills",
+             "--klow-filter", "--klow-cut-bps"].contains(&flag.as_str()) {
             return Err(format!("unknown option: {flag}").into());
         }
         let value = args
@@ -52,6 +59,11 @@ fn options(args: impl Iterator<Item = String>) -> Result<Options, Box<dyn Error>
             .remove("--initial-cash-cents")
             .unwrap_or_else(|| "10000000".into())
             .parse()?,
+        klow_filter: flags.remove("--klow-filter").is_some(),
+        klow_cut_bps: match flags.remove("--klow-cut-bps") {
+            Some(text) => text.parse::<i64>().map_err(|_| "--klow-cut-bps must be an integer")?,
+            None => 2_000,
+        },
         next_session_fills: match flags.remove("--fills") {
             None => false,
             Some(value) if value == "same-close" => false,
@@ -93,7 +105,16 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
     };
     let mut stores = [Store::open(":memory:")?, Store::open(":memory:")?];
     for (index, store) in stores.iter_mut().enumerate() {
-        store.regime_filter = index == 1;
+        // Exactly one switch is compared at a time, so a result can be
+        // attributed to it. Turning both on would make "which one helped"
+        // unanswerable from a single run.
+        if options.klow_filter {
+            store.regime_filter = true;
+            store.klow_filter = index == 1;
+            store.klow_cut_bps = options.klow_cut_bps;
+        } else {
+            store.regime_filter = index == 1;
+        }
         store.next_session_fills = options.next_session_fills;
         store.create_account(spec.clone())?;
     }
@@ -129,6 +150,7 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
                 high_cents: row.high_cents,
                 low_cents: row.low_cents,
                 prev_close_cents: row.prev_close_cents,
+                volume_shares: row.volume_shares,
             })
             .collect();
         let set = PriceSet::from_bars(&bars, "regime-ab", start, day);
@@ -139,7 +161,7 @@ fn compare(source: &Store, options: &Options) -> Result<Value, Box<dyn Error>> {
             "day": day, "window_start": start, "symbols": set.symbols().len(),
             "entries": set.entries.len(), "price_set_digest": set.source_digest,
         }));
-        let price_index = IndexedPriceSet::new(set);
+        let price_index = IndexedPriceSet::new(&set);
         let prepared = started.elapsed();
         for (variant, store) in stores.iter_mut().enumerate() {
             let run = match store.run_day_indexed(&spec, &price_index, day) {
@@ -299,6 +321,8 @@ mod tests {
             through: days[125].clone(),
             initial: 10_000_000,
             next_session_fills: next_session,
+            klow_filter: false,
+            klow_cut_bps: 2_000,
         }
     }
 

@@ -138,3 +138,10 @@ sudo python3 /opt/astock-v2-rewrite/scripts/db_tool.py backup \
 - 单写者：只有 Rust 内核写 SQLite，网页只读；
 - 行情 fail-closed：没有 reviewed 价格时不下单、不估值；
 - 旧 schema 不迁移：保留旧库，新库重新开始。
+
+
+## 盘中巡查与收盘研究
+
+`astock-live-watch.*` 和 `astock-live-evolution.*` 是安装模板。使用前，请按自己的部署调整服务文件中的程序、账本、日历与配置文件路径。
+如需启用模型，请在服务环境中设置 `ASTOCK_LLM_BASE`、`ASTOCK_LLM_MODEL` 和 `ASTOCK_LLM_KEY`。未配置模型地址时，盘中建议走中性回退。
+本地测试使用隔离账本和行情样本。

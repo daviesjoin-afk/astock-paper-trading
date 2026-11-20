@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the paper session and its close summary every five minutes
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:40/5:00 Asia/Shanghai
+OnCalendar=Mon..Fri *-*-* 10:00/5:00 Asia/Shanghai
+OnCalendar=Mon..Fri *-*-* 11:00..30/5:00 Asia/Shanghai
+OnCalendar=Mon..Fri *-*-* 13:10/5:00 Asia/Shanghai
+OnCalendar=Mon..Fri *-*-* 14:00/5:00 Asia/Shanghai
+OnCalendar=Mon..Fri *-*-* 15:10:00 Asia/Shanghai
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

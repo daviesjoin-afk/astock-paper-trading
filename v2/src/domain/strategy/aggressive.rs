@@ -96,6 +96,6 @@ impl Strategy for Aggressive {
         } else {
             "momentum_stalling"
         };
-        SignalScore { score, reason }
+        SignalScore { score, reason, short_window: false }
     }
 }

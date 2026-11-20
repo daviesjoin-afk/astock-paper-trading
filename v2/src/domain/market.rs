@@ -20,6 +20,10 @@ pub struct BarRow {
     pub high_cents: i64,
     pub low_cents: i64,
     pub prev_close_cents: i64,
+    /// Whole shares traded on the session. Zero means the input did not carry
+    /// it; a volume-derived factor must skip the symbol rather than read a
+    /// fabricated zero as "nobody traded".
+    pub volume_shares: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,11 +58,29 @@ pub struct PriceEntry {
     pub can_buy: bool,
     #[serde(default = "default_tradable")]
     pub can_sell: bool,
+    /// Session open/high/low in cents, and whole shares traded.
+    ///
+    /// Optional so every previously authored price set keeps deserialising.
+    /// Zero means "the input did not carry it", which is deliberately
+    /// distinguishable from a real zero: a factor needing the field has to
+    /// skip the symbol rather than compute on a fabricated value.
+    #[serde(default)]
+    pub open_cents: i64,
+    #[serde(default)]
+    pub high_cents: i64,
+    #[serde(default)]
+    pub low_cents: i64,
+    #[serde(default)]
+    pub volume_shares: i64,
 }
 
 /// One symbol-day as the settlement view holds it.
 struct Session {
     price_cents: i64,
+    open_cents: i64,
+    high_cents: i64,
+    low_cents: i64,
+    volume_shares: i64,
     tradable: bool,
     tradeability: super::Tradeability,
 }
@@ -76,6 +98,10 @@ fn default_tradable() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quote {
     pub price_cents: i64,
+    pub open_cents: i64,
+    pub high_cents: i64,
+    pub low_cents: i64,
+    pub volume_shares: i64,
     pub tradable: bool,
     /// Which side of the book was open. A limit-down seal still has a price to
     /// value a position at, but nothing could be sold into it.
@@ -93,67 +119,147 @@ pub struct Quote {
 /// for a 2.5-year advance before this existed.
 ///
 /// The wire format is unchanged; this is a read-side index built once.
+///
+/// The index stores integer dictionary keys instead of duplicating each
+/// `PriceEntry`'s four `String`s in two BTreeMaps. The dictionaries themselves
+/// hold one copy of each distinct symbol and day. `set()`/`Deref` still expose
+/// the original `&PriceSet`; consumers that ask for owned strings still receive
+/// freshly allocated ones, exactly as before.
+///
+/// The index is deliberately built around references: `advance` and `run_day`
+/// can keep their caller-owned `PriceSet` and pass a borrow here. Dropping the
+/// owned copy removes the second full window of strings from the settlement
+/// peak; the two BTreeMaps now hold `u32` keys plus a `Copy` quote.
 #[derive(Clone, Debug)]
-pub struct IndexedPriceSet {
-    set: PriceSet,
-    by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>>,
-    by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>>,
+pub struct IndexedPriceSet<'a> {
+    set: &'a PriceSet,
+    symbols: Vec<String>,
+    days: Vec<String>,
+    by_day: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Quote>>,
+    by_symbol: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Quote>>,
+    /// Point-in-time factors for factor scoring.
+    ///
+    /// Carried with the index rather than threaded through every call: the
+    /// factor is a property of the input series, and `run_day_indexed` already
+    /// takes the series. An empty book means "no known actions", which is a
+    /// factor of one, not a missing input.
+    adjustments: crate::domain::AdjustmentBook,
 }
 
-impl IndexedPriceSet {
-    pub fn new(set: PriceSet) -> Self {
-        let mut by_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>> =
+impl<'a> IndexedPriceSet<'a> {
+    pub fn new(set: &'a PriceSet) -> Self {
+        Self::with_adjustments(set, crate::domain::AdjustmentBook::identity())
+    }
+
+    /// Build the index with corporate-action factors attached.
+    pub fn with_adjustments(set: &'a PriceSet, adjustments: crate::domain::AdjustmentBook) -> Self {
+        let mut indexed = Self::index(set);
+        indexed.adjustments = adjustments;
+        indexed
+    }
+
+    /// Factors in force for this series; empty means unadjusted scoring.
+    pub fn adjustments(&self) -> &crate::domain::AdjustmentBook {
+        &self.adjustments
+    }
+
+    fn index(set: &'a PriceSet) -> Self {
+        let mut distinct_symbols = std::collections::BTreeSet::new();
+        let mut distinct_days = std::collections::BTreeSet::new();
+        for entry in &set.entries {
+            distinct_symbols.insert(entry.symbol.as_str());
+            distinct_days.insert(entry.day.as_str());
+        }
+        let symbols: Vec<String> = distinct_symbols.into_iter().map(str::to_string).collect();
+        let days: Vec<String> = distinct_days.into_iter().map(str::to_string).collect();
+        // Both dictionaries are sorted, so one binary search locates the
+        // integer key for any symbol or day without a second string map.
+        let symbol_key = |symbol: &str| -> u32 {
+            symbols.binary_search_by(|probe| probe.as_str().cmp(symbol)).unwrap_or(0) as u32
+        };
+        let day_key = |day: &str| -> u32 {
+            days.binary_search_by(|probe| probe.as_str().cmp(day)).unwrap_or(0) as u32
+        };
+        let mut by_day: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Quote>> =
             std::collections::BTreeMap::new();
-        let mut by_symbol: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Quote>> =
+        let mut by_symbol: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Quote>> =
             std::collections::BTreeMap::new();
         for entry in &set.entries {
             let quote = Quote {
                 price_cents: entry.price_cents,
+                open_cents: entry.open_cents,
+                high_cents: entry.high_cents,
+                low_cents: entry.low_cents,
+                volume_shares: entry.volume_shares,
                 tradable: entry.tradable,
                 can_buy: entry.can_buy,
                 can_sell: entry.can_sell,
             };
-            by_day
-                .entry(entry.day.clone())
-                .or_default()
-                .insert(entry.symbol.clone(), quote);
-            by_symbol
-                .entry(entry.symbol.clone())
-                .or_default()
-                .insert(entry.day.clone(), quote);
+            let symbol = symbol_key(&entry.symbol);
+            let day = day_key(&entry.day);
+            by_day.entry(day).or_default().insert(symbol, quote);
+            by_symbol.entry(symbol).or_default().insert(day, quote);
         }
-        Self { set, by_day, by_symbol }
+        Self {
+            set,
+            symbols,
+            days,
+            by_day,
+            by_symbol,
+            adjustments: crate::domain::AdjustmentBook::identity(),
+        }
+    }
+
+    fn keys(&self, symbol: &str, day: &str) -> Option<(u32, u32)> {
+        let symbol = self
+            .symbols
+            .binary_search_by(|probe| probe.as_str().cmp(symbol))
+            .ok()? as u32;
+        let day = self
+            .days
+            .binary_search_by(|probe| probe.as_str().cmp(day))
+            .ok()? as u32;
+        Some((symbol, day))
+    }
+
+    fn quote(&self, symbol: &str, day: &str) -> Option<&Quote> {
+        let (symbol, day) = self.keys(symbol, day)?;
+        self.by_day.get(&day)?.get(&symbol)
+    }
+
+    fn day_key(&self, day: &str) -> Option<u32> {
+        self.days
+            .binary_search_by(|probe| probe.as_str().cmp(day))
+            .ok()
+            .map(|key| key as u32)
+    }
+
+    fn symbol_key(&self, symbol: &str) -> Option<u32> {
+        self.symbols
+            .binary_search_by(|probe| probe.as_str().cmp(symbol))
+            .ok()
+            .map(|key| key as u32)
     }
 
     /// The valuation mark for a held symbol, regardless of tradeability.
     pub fn valuation(&self, symbol: &str, day: &str) -> Option<i64> {
-        self.by_day
-            .get(day)
-            .and_then(|closes| closes.get(symbol))
-            .map(|quote| quote.price_cents)
+        self.quote(symbol, day).map(|quote| quote.price_cents)
     }
 
     /// Whether `symbol` has a real, fillable close on `day`.
     pub fn is_tradable(&self, symbol: &str, day: &str) -> bool {
-        self.by_day
-            .get(day)
-            .and_then(|closes| closes.get(symbol))
-            .is_some_and(|quote| quote.tradable)
+        self.quote(symbol, day).is_some_and(|quote| quote.tradable)
     }
 
     /// Whether a purchase could fill: a real close and no limit-up seal.
     pub fn can_buy(&self, symbol: &str, day: &str) -> bool {
-        self.by_day
-            .get(day)
-            .and_then(|closes| closes.get(symbol))
+        self.quote(symbol, day)
             .is_some_and(|quote| quote.tradable && quote.can_buy)
     }
 
     /// Whether a sale could fill: a real close and no limit-down seal.
     pub fn can_sell(&self, symbol: &str, day: &str) -> bool {
-        self.by_day
-            .get(day)
-            .and_then(|closes| closes.get(symbol))
+        self.quote(symbol, day)
             .is_some_and(|quote| quote.tradable && quote.can_sell)
     }
 
@@ -178,13 +284,18 @@ impl IndexedPriceSet {
     /// Halted valuations stay out: a signal computed from a carried reference
     /// price would invent a trade that could not happen.
     pub fn tradable_closes_on(&self, day: &str) -> std::collections::BTreeMap<String, i64> {
+        let Some(day) = self.day_key(day) else {
+            return std::collections::BTreeMap::new();
+        };
         self.by_day
-            .get(day)
+            .get(&day)
             .map(|closes| {
                 closes
                     .iter()
                     .filter(|(_, quote)| quote.tradable)
-                    .map(|(symbol, quote)| (symbol.clone(), quote.price_cents))
+                    .map(|(symbol, quote)| {
+                        (self.symbols[*symbol as usize].clone(), quote.price_cents)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -197,18 +308,24 @@ impl IndexedPriceSet {
     /// this is called once per symbol per settled day; scanning ~4M entries
     /// each time is what made a multi-year advance take minutes of solid CPU.
     pub fn bars_for(&self, symbol: &str, through_day: &str) -> Vec<super::Bar> {
+        let Some(symbol_key) = self.symbol_key(symbol) else {
+            return Vec::new();
+        };
         self.by_symbol
-            .get(symbol)
+            .get(&symbol_key)
             .map(|series| {
                 series
                     .iter()
-                    .filter(|(day, _)| day.as_str() <= through_day)
+                    .filter(|(day, _)| self.days[**day as usize].as_str() <= through_day)
                     .filter(|(_, quote)| quote.tradable)
                     .map(|(day, quote)| super::Bar {
                         symbol: symbol.to_string(),
-                        day: day.clone(),
+                        day: self.days[*day as usize].clone(),
                         close_cents: quote.price_cents,
-                        volume: 0,
+                        volume: quote.volume_shares,
+                        open_cents: quote.open_cents,
+                        high_cents: quote.high_cents,
+                        low_cents: quote.low_cents,
                         tradable: true,
                     })
                     .collect()
@@ -232,7 +349,7 @@ impl IndexedPriceSet {
         for (symbol, series) in &self.by_symbol {
             let mut closes: Vec<i64> = series
                 .iter()
-                .filter(|(day, _)| day.as_str() <= through_day)
+                .filter(|(day, _)| self.days[**day as usize].as_str() <= through_day)
                 .filter(|(_, quote)| quote.tradable)
                 .map(|(_, quote)| quote.price_cents)
                 .collect();
@@ -240,25 +357,131 @@ impl IndexedPriceSet {
                 closes.drain(..closes.len() - days);
             }
             if !closes.is_empty() {
-                out.insert(symbol.clone(), closes);
+                out.insert(self.symbols[*symbol as usize].clone(), closes);
             }
         }
         out
     }
 
-    pub fn set(&self) -> &PriceSet {
-        &self.set
+    /// One symbol's bar on `day`, with its session shape intact.
+    ///
+    /// `bars_for` returns a series filtered to tradable sessions; this answers
+    /// the single-day question a cross-sectional filter needs, and returns
+    /// `None` when the symbol has no row that day.
+    pub fn latest_bar(&self, symbol: &str, day: &str) -> Option<super::Bar> {
+        let symbol_key = self.symbol_key(symbol)?;
+        let day_key = self.day_key(day)?;
+        let quote = self.by_symbol.get(&symbol_key)?.get(&day_key)?;
+        Some(super::Bar {
+            symbol: symbol.to_string(),
+            day: day.to_string(),
+            close_cents: quote.price_cents,
+            volume: quote.volume_shares,
+            open_cents: quote.open_cents,
+            high_cents: quote.high_cents,
+            low_cents: quote.low_cents,
+            tradable: quote.tradable,
+        })
     }
 
-    pub fn into_set(self) -> PriceSet {
+    pub fn set(&self) -> &PriceSet {
+        self.set
+    }
+
+    pub fn into_set(self) -> &'a PriceSet {
         self.set
     }
 }
 
-impl std::ops::Deref for IndexedPriceSet {
+impl<'a> std::ops::Deref for IndexedPriceSet<'a> {
     type Target = PriceSet;
     fn deref(&self) -> &PriceSet {
-        &self.set
+        self.set
+    }
+}
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+
+    fn entry(symbol: &str, day: &str, price: i64, tradable: bool, buy: bool, sell: bool) -> PriceEntry {
+        PriceEntry {
+            open_cents: 0,
+            high_cents: 0,
+            low_cents: 0,
+            volume_shares: 0,
+            symbol: symbol.into(),
+            day: day.into(),
+            price_cents: price,
+            source: "fixture".into(),
+            observed_at: format!("{day}T15:00:00+08:00"),
+            tradable,
+            can_buy: buy,
+            can_sell: sell,
+        }
+    }
+
+    fn set() -> PriceSet {
+        PriceSet {
+            schema_version: 1,
+            price_set_id: "index-memory".into(),
+            market_data_pack_id: "fixture".into(),
+            trust: "reviewed".into(),
+            coverage_start: "2026-01-05".into(),
+            coverage_end: "2026-01-07".into(),
+            entries: vec![
+                entry("000001.SZ", "2026-01-05", 1000, true, true, true),
+                entry("600000.SH", "2026-01-05", 2000, true, true, true),
+                entry("000001.SZ", "2026-01-06", 1100, true, false, true),
+                entry("600000.SH", "2026-01-06", 2100, false, true, false),
+                entry("000001.SZ", "2026-01-07", 1200, true, true, false),
+                entry("600000.SH", "2026-01-07", 2200, true, true, true),
+            ],
+            source_digest: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn integer_key_index_preserves_all_read_semantics() {
+        let raw = set();
+        let index = IndexedPriceSet::new(&raw);
+        // `set()` and Deref must still expose the original PriceSet.
+        assert_eq!(index.set(), &raw);
+        assert_eq!(index.entries.len(), raw.entries.len());
+        assert_eq!(index.coverage_end, "2026-01-07");
+        assert_eq!(index.into_set(), &raw);
+
+        let index = IndexedPriceSet::new(&raw);
+        assert_eq!(index.valuation("600000.SH", "2026-01-06"), Some(2100));
+        assert_eq!(index.valuation("600000.SH", "2026-01-01"), None);
+        assert!(!index.is_tradable("600000.SH", "2026-01-06"));
+        assert!(!index.can_buy("000001.SZ", "2026-01-06"));
+        assert!(index.can_sell("000001.SZ", "2026-01-06"));
+        assert!(!index.can_sell("000001.SZ", "2026-01-07"));
+        assert_eq!(index.tradable_closes_on("2026-01-06").len(), 1);
+        assert_eq!(index.tradable_closes_on("2026-01-06")["000001.SZ"], 1100);
+        assert_eq!(index.buyable_closes_on("2026-01-05").len(), 2);
+        assert_eq!(index.sellable_closes_on("2026-01-07")["600000.SH"], 2200);
+
+        let bars = index.bars_for("000001.SZ", "2026-01-07");
+        assert_eq!(bars.len(), 3);
+        assert_eq!(bars[0].day, "2026-01-05");
+        assert_eq!(bars[2].close_cents, 1200);
+        assert!(index.bars_for("missing", "2026-01-07").is_empty());
+        let recent = index.recent_closes("2026-01-07", 2);
+        assert_eq!(recent["000001.SZ"], vec![1100, 1200]);
+        // The halted row stays out of closes, but is still a valuation mark.
+        assert_eq!(recent["600000.SH"], vec![2000, 2200]);
+    }
+
+    #[test]
+    fn indexing_holds_one_string_per_distinct_symbol_and_day() {
+        let raw = set();
+        let index = IndexedPriceSet::new(&raw);
+        assert_eq!(index.symbols, vec!["000001.SZ", "600000.SH"]);
+        assert_eq!(index.days, vec!["2026-01-05", "2026-01-06", "2026-01-07"]);
+        // Negative control: the two maps must not contain owned String keys.
+        assert_eq!(std::mem::size_of_val(&index.by_day), std::mem::size_of_val(&index.by_symbol));
     }
 }
 
@@ -319,9 +542,13 @@ impl PriceSet {
         };
 
         let mut by_symbol: BTreeMap<&str, BTreeMap<&str, Session>> = BTreeMap::new();
-        for row in &in_window {
+        for row in in_window.iter().copied() {
             let session = Session {
                 price_cents: row.price_cents,
+                open_cents: row.open_cents,
+                high_cents: row.high_cents,
+                low_cents: row.low_cents,
+                volume_shares: row.volume_shares,
                 tradable: row.tradable,
                 tradeability: super::tradeability(
                     &row.symbol,
@@ -370,6 +597,10 @@ impl PriceSet {
                     tradable: session.tradable,
                     can_buy: session.tradeability.can_buy,
                     can_sell: session.tradeability.can_sell,
+                    open_cents: session.open_cents,
+                    high_cents: session.high_cents,
+                    low_cents: session.low_cents,
+                    volume_shares: session.volume_shares,
                 });
             }
         }
@@ -560,6 +791,7 @@ mod from_bars_tests {
             high_cents: 0,
             low_cents: 0,
             prev_close_cents: 0,
+            volume_shares: 0,
         }
     }
 
@@ -573,6 +805,7 @@ mod from_bars_tests {
             high_cents: 0,
             low_cents: 0,
             prev_close_cents: 0,
+            volume_shares: 0,
         }
     }
 

@@ -9,9 +9,9 @@ use std::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::domain::{
-    apply_buy, apply_sell, classify_series, drawdown_bps, fees_cents,
-    initial_split, orders_for_day_in_split, performance_curve, propose, score, score_signal, settle_overnight, AccountSpec,
-    AccountView, AdvanceResult, DayRun, IndexedPriceSet, PositionView, PriceCoverage, PriceSet,
+    apply_to_policy, apply_buy, apply_sell, classify_series, drawdown_bps, fees_cents,
+    initial_split, orders_for_day_in_split, performance_curve, propose, score, score_signal_adjusted, settle_overnight, AccountSpec,
+    AccountView, AdjustmentBook, AdvanceResult, DayRun, IndexedPriceSet, PositionView, PriceCoverage, PriceSet,
     PerformanceInput, PerformancePoint, Rebalance, RegimeView, RuleError, SignalScore, SlotBook, SlotPolicy, SlotSpec, SlotView,
     StrategyId, Trade,
 };
@@ -30,6 +30,8 @@ pub struct UnadjustedRow {
     pub high_cents: i64,
     pub low_cents: i64,
     pub prev_close_cents: i64,
+    /// Whole shares traded. Zero when the source carried none.
+    pub volume_shares: i64,
 }
 
 /// How many trailing closes a strategy needs to decide today.
@@ -53,6 +55,10 @@ pub enum StoreError {
     Rules(RuleError),
     NotFound(String),
     Conflict(String),
+    /// A run was deliberately stopped by a resource/deadline guard.
+    /// Days already committed are durable; the response reports the break
+    /// instead of pretending the whole batch ran.
+    Aborted(String),
     Integrity(String),
 }
 
@@ -82,6 +88,7 @@ impl std::fmt::Display for StoreError {
             Self::Rules(error) => write!(formatter, "rules: {error}"),
             Self::NotFound(error) => write!(formatter, "not_found: {error}"),
             Self::Conflict(error) => write!(formatter, "conflict: {error}"),
+            Self::Aborted(error) => write!(formatter, "aborted: {error}"),
             Self::Integrity(error) => write!(formatter, "integrity: {error}"),
         }
     }
@@ -90,6 +97,52 @@ impl std::fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// One advance request's resource ceiling. Kept in `store` because the store
+/// owns the whole-window settlement view; the HTTP layer supplies values from
+/// environment configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvanceLimits {
+    /// Retained `PriceEntry` rows, each with several Strings. 700k keeps the
+    /// ordinary daily window and rejects the old 260-day catch-up before the
+    /// memory-heavy index is built.
+    pub max_entries: usize,
+    /// Maximum wall-clock seconds for one advance. Zero means no deadline.
+    pub max_seconds: u64,
+    /// Maximum trading days committed per lock chunk.
+    pub chunk_days: usize,
+}
+
+impl Default for AdvanceLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 700_000,
+            max_seconds: 90,
+            chunk_days: 10,
+        }
+    }
+}
+
+impl AdvanceLimits {
+    /// The hard cap is deliberately generous compared with an ordinary daily
+    /// advance and below the measured 1.4 GB whole-market catch-up window.
+    pub fn from_env() -> Self {
+        fn positive(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        }
+        let defaults = Self::default();
+        Self {
+            max_entries: positive("ASTOCK_V2_MAX_ADVANCE_ENTRIES", defaults.max_entries),
+            max_seconds: positive("ASTOCK_V2_MAX_ADVANCE_SECONDS", defaults.max_seconds as usize)
+                as u64,
+            chunk_days: positive("ASTOCK_V2_ADVANCE_CHUNK_DAYS", defaults.chunk_days),
+        }
+    }
+}
 
 pub struct Store {
     pub conn: Connection,
@@ -110,6 +163,32 @@ pub struct Store {
     /// untouched until it trades again, so a suspended name is skipped for
     /// that session rather than carried at a stale price.
     pub next_session_fills: bool,
+    /// Drop the worst lower-wick tail from each day's candidate set.
+    ///
+    /// Measured on 122 real sessions: the longest-wick quintile underperformed
+    /// the market by 89 bps over 5 days (t=-4.8), monotone across ten buckets,
+    /// and the effect survived volatility, size and industry neutralisation.
+    /// Removing that tail lifted the remaining universe by 14.7 bps over five
+    /// days (t=4.1) without changing turnover.
+    ///
+    /// Off by default and switchable so a replay can compare against the
+    /// unfiltered book on identical input. A filter that cannot be turned off
+    /// cannot be shown to help.
+    pub klow_filter: bool,
+    /// Fraction of the cross-section to exclude from the lower-wick tail, in
+    /// bps of the candidate count (2_000 = drop the worst 20%).
+    pub klow_cut_bps: i64,
+    /// Let a recorded AI observation narrow today's slot policy.
+    ///
+    /// Off by default and switchable so a replay can compare against the
+    /// deterministic policy on identical input. With no observation stored the
+    /// flag makes no difference at all, which is what makes "the model was
+    /// unreachable" indistinguishable from "the model agreed" unless the
+    /// `ai_observation` table is consulted -- and it is.
+    pub ai_policy: bool,
+    /// Resource guard for one advance. Tests may lower `max_entries` to prove
+    /// the guard rejects before a large window is indexed.
+    pub advance_limits: AdvanceLimits,
 }
 
 impl Store {
@@ -125,7 +204,43 @@ impl Store {
             conn,
             regime_filter: true,
             next_session_fills: false,
+            klow_filter: false,
+            klow_cut_bps: 2_000,
+            ai_policy: false,
+            advance_limits: AdvanceLimits::default(),
         };
+        if legacy != 0 || store.schema_version()? != SCHEMA_VERSION {
+            return Err(StoreError::Integrity("unsupported_replay_schema".into()));
+        }
+        Ok(store)
+    }
+
+    /// Open a live read-only connection after `Store::open` has initialized the
+    /// schema. Unlike `open_market_read_only`, this does not pin a long-lived
+    /// snapshot: WAL autocommit gives each fresh statement the committed state
+    /// as of that statement.
+    ///
+    /// SQLite's read-only WAL mode needs a readable `-shm` file. The writer
+    /// must already have created the database and its WAL sidecars, which the
+    /// HTTP server guarantees by calling `Store::open` first.
+    pub fn open_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let store = Self {
+            conn,
+            regime_filter: true,
+            next_session_fills: false,
+            klow_filter: false,
+            klow_cut_bps: 2_000,
+            ai_policy: false,
+            advance_limits: AdvanceLimits::default(),
+        };
+        let legacy: i64 =
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))?;
         if legacy != 0 || store.schema_version()? != SCHEMA_VERSION {
             return Err(StoreError::Integrity("unsupported_replay_schema".into()));
         }
@@ -146,6 +261,10 @@ impl Store {
             conn,
             regime_filter: true,
             next_session_fills: false,
+            klow_filter: false,
+            klow_cut_bps: 2_000,
+            ai_policy: false,
+            advance_limits: AdvanceLimits::default(),
         };
         store.migrate()?;
         Ok(store)
@@ -235,6 +354,28 @@ impl Store {
                 account_id TEXT NOT NULL,
                 day TEXT NOT NULL,
                 PRIMARY KEY(account_id, day)
+            );
+            -- What the AI observer advised for a slot on a day, after clamping.
+            -- Stored whether or not it changed anything: a decision that was
+            -- considered and ignored is evidence too, and without it a later
+            -- reviewer cannot tell "the model said nothing" from "the model was
+            -- never asked".
+            CREATE TABLE IF NOT EXISTS ai_observation(
+                account_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                bias TEXT NOT NULL,
+                entry_delta INTEGER NOT NULL,
+                weight_delta_bps INTEGER NOT NULL,
+                position_delta INTEGER NOT NULL,
+                blocked_symbols TEXT NOT NULL,
+                confidence INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT NOT NULL,
+                clamped TEXT NOT NULL,
+                applied INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(account_id, day, slot)
             );
             CREATE TABLE IF NOT EXISTS trade(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -468,7 +609,7 @@ impl Store {
     pub fn unadjusted_closes(&self, day: &str) -> StoreResult<Vec<UnadjustedRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol, day, close_cents, tradable, open_cents, high_cents, \
-             low_cents, prev_close_cents FROM bar \
+             low_cents, prev_close_cents, volume_shares FROM bar \
              WHERE day = ?1 AND adjust = 'none' AND close_cents > 0 ORDER BY symbol",
         )?;
         let rows = stmt.query_map([day], |row| {
@@ -481,6 +622,7 @@ impl Store {
                 high_cents: row.get(5)?,
                 low_cents: row.get(6)?,
                 prev_close_cents: row.get(7)?,
+                volume_shares: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -498,7 +640,7 @@ impl Store {
     ) -> StoreResult<Vec<UnadjustedRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT symbol, day, close_cents, tradable, open_cents, high_cents, \
-                    low_cents, prev_close_cents FROM bar \
+                    low_cents, prev_close_cents, volume_shares FROM bar \
              WHERE day BETWEEN ?1 AND ?2 AND adjust = 'none' AND close_cents > 0 \
              ORDER BY symbol, day",
         )?;
@@ -512,6 +654,7 @@ impl Store {
                 high_cents: row.get(5)?,
                 low_cents: row.get(6)?,
                 prev_close_cents: row.get(7)?,
+                volume_shares: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -546,6 +689,7 @@ impl Store {
                 high_cents: row.high_cents,
                 low_cents: row.low_cents,
                 prev_close_cents: row.prev_close_cents,
+                volume_shares: row.volume_shares,
             })
             .collect();
         Ok(Some(crate::domain::PriceSet::from_bars(
@@ -600,9 +744,14 @@ impl Store {
                     last.2 = equities[1];
                 }
                 Some(last) if last.0.as_str() > day => {
-                    return Err(StoreError::Rules(RuleError(
-                        "valuation_before_last_settled".into(),
-                    )));
+                    // Asking to value the book before a day it has already
+                    // settled past is a conflict about the requested day, not
+                    // a data gap: the prices exist, the run simply has nothing
+                    // to do. Reporting it as a rules error sent callers looking
+                    // for missing market data.
+                    return Err(StoreError::Conflict(
+                        "day_before_last_settled".into(),
+                    ));
                 }
                 _ => rows.push((day.to_string(), equities[0], equities[1])),
             }
@@ -759,6 +908,69 @@ impl Store {
         ])
     }
 
+    /// Record what the observer advised for one slot on one day.
+    ///
+    /// Re-running the same day overwrites: the observer is advisory, and the
+    /// last word for that day is the one settlement saw. Keeping every
+    /// historical attempt would make "what did we act on" ambiguous.
+    pub fn record_observation(
+        &self,
+        account_id: &str,
+        day: &str,
+        slot: &str,
+        adjustment: &crate::domain::AiAdjustment,
+        applied: bool,
+    ) -> StoreResult<()> {
+        let blocked = serde_json::to_string(&adjustment.blocked_symbols)?;
+        let clamped = serde_json::to_string(&adjustment.clamped)?;
+        self.conn.execute(
+            "INSERT INTO ai_observation(account_id,day,slot,bias,entry_delta,             weight_delta_bps,position_delta,blocked_symbols,confidence,reason,             source,model,clamped,applied)              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)              ON CONFLICT(account_id,day,slot) DO UPDATE SET                bias=excluded.bias, entry_delta=excluded.entry_delta,                weight_delta_bps=excluded.weight_delta_bps,                position_delta=excluded.position_delta,                blocked_symbols=excluded.blocked_symbols,                confidence=excluded.confidence, reason=excluded.reason,                source=excluded.source, model=excluded.model,                clamped=excluded.clamped, applied=excluded.applied",
+            params![account_id, day, slot, adjustment.bias,
+                    adjustment.entry_delta, adjustment.weight_delta_bps,
+                    adjustment.position_delta, blocked, adjustment.confidence,
+                    adjustment.reason, adjustment.source, adjustment.model,
+                    clamped, i64::from(applied)],
+        )?;
+        Ok(())
+    }
+
+    /// The adjustment recorded for a slot on a day, if any.
+    ///
+    /// `None` means the observer was never asked, not that it said "no change".
+    /// Settlement treats both as neutral, but an audit needs the difference.
+    pub fn observation_for(
+        &self,
+        account_id: &str,
+        day: &str,
+        slot: &str,
+    ) -> StoreResult<Option<crate::domain::AiAdjustment>> {
+        let row: Option<(String, i64, i64, i64, String, i64, String, String, String, String, i64)> =
+            self.conn
+                .query_row(
+                    "SELECT bias, entry_delta, weight_delta_bps, position_delta,                      blocked_symbols, confidence, reason, source, model, clamped, applied                      FROM ai_observation WHERE account_id=? AND day=? AND slot=?",
+                    params![account_id, day, slot],
+                    |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                            row.get(8)?, row.get(9)?, row.get(10)?))
+                    },
+                )
+                .optional()?;
+        Ok(row.map(|(bias, entry, weight, position, blocked, confidence, reason,
+                    source, model, clamped, _applied)| crate::domain::AiAdjustment {
+            bias,
+            entry_delta: entry,
+            weight_delta_bps: weight,
+            position_delta: position,
+            blocked_symbols: serde_json::from_str(&blocked).unwrap_or_default(),
+            confidence,
+            reason,
+            source,
+            model,
+            clamped: serde_json::from_str(&clamped).unwrap_or_default(),
+        }))
+    }
+
     pub fn last_settled_day(&self, account_id: &str) -> StoreResult<Option<String>> {
         let days = settled_days(&self.conn, account_id)?;
         Ok(days.last().cloned())
@@ -778,12 +990,19 @@ impl Store {
 
     /// Advance through every reviewed price-set day after the last settled
     /// day. `through` is inclusive and may not exceed the price-set coverage.
-    pub fn advance(
+    ///
+    /// `should_continue` is checked before each committed day. Returning false
+    /// stops the batch with `Aborted`; earlier daily transactions remain
+    /// durable. Passing `None` keeps the old behavior for offline tests and
+    /// examples.
+    fn advance_inner(
         &mut self,
         spec: &AccountSpec,
         set: &PriceSet,
         through: &str,
         settle_from: Option<&str>,
+        should_continue: Option<&dyn Fn() -> bool>,
+        max_days: usize,
     ) -> StoreResult<AdvanceResult> {
         if through.len() != 10
             || through < set.coverage_start.as_str()
@@ -828,26 +1047,123 @@ impl Store {
             });
         }
 
+        if set.entries.len() > self.advance_limits.max_entries {
+            return Err(StoreError::Aborted(format!(
+                "advance_memory_limit:{}>{}",
+                set.entries.len(), self.advance_limits.max_entries
+            )));
+        }
+        let deadline = (self.advance_limits.max_seconds > 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(self.advance_limits.max_seconds));
         let mut all_trades = Vec::new();
         let mut all_rebalances = Vec::new();
+        let mut processed = Vec::with_capacity(days.len());
         // Build the lookup index once for the whole advance. Rebuilding it per
         // day would re-walk millions of entries on every iteration.
-        let index_set = IndexedPriceSet::new(set.clone());
-        for day in &days {
+        let index_set = IndexedPriceSet::new(set);
+        let deadline_expired = || deadline.is_some_and(|end| std::time::Instant::now() >= end);
+        let cancelled = |predicate: Option<&dyn Fn() -> bool>| {
+            predicate.is_some_and(|predicate| !predicate())
+        };
+        for (number, day) in days.iter().enumerate() {
+            if deadline_expired() {
+                return Err(StoreError::Aborted(format!(
+                    "advance_time_limit:{}s", self.advance_limits.max_seconds
+                )));
+            }
+            if cancelled(should_continue) {
+                return Err(StoreError::Aborted("advance_cancelled".into()));
+            }
             let run = self.run_day_indexed(spec, &index_set, day)?;
             all_trades.extend(run.trades);
             all_rebalances.extend(run.rebalance);
+            processed.push(day.clone());
+            let last_in_chunk = max_days != usize::MAX && (number + 1) % max_days == 0;
+            if last_in_chunk && number + 1 < days.len() {
+                // The caller drops its writer guard here, so reads and other
+                // queued writes can run between chunks. The next chunk starts
+                // from the durable per-day commit.
+                return self.finish_advance(
+                    spec, set, through, from_day, processed,
+                    all_trades, all_rebalances, false,
+                );
+            }
         }
+        self.finish_advance(
+            spec, set, through, from_day, processed,
+            all_trades, all_rebalances, true,
+        )
+    }
+
+    /// Settle every day from the last settled day through `through`.
+    ///
+    /// This keeps the original contract: one call advances as far as the input
+    /// allows. Chunking exists so the HTTP layer can release its writer lock
+    /// between batches, but a caller that asks this function to advance 90 days
+    /// must get 90 days -- silently stopping at the chunk boundary changed
+    /// results, not just latency.
+    pub fn advance(
+        &mut self,
+        spec: &AccountSpec,
+        set: &PriceSet,
+        through: &str,
+        settle_from: Option<&str>,
+    ) -> StoreResult<AdvanceResult> {
+        self.advance_inner(spec, set, through, settle_from, None, usize::MAX)
+    }
+
+    /// Advance at most one chunk, then return what was settled.
+    ///
+    /// The HTTP handler loops on this, dropping its lock between calls. A
+    /// resource/deadline guard stops the loop instead of leaving an orphaned
+    /// multi-minute job holding the writer.
+    pub fn advance_one_chunk(
+        &mut self,
+        spec: &AccountSpec,
+        set: &PriceSet,
+        through: &str,
+        settle_from: Option<&str>,
+        should_continue: Option<&dyn Fn() -> bool>,
+    ) -> StoreResult<AdvanceResult> {
+        let chunk = self.advance_limits.chunk_days.max(1);
+        self.advance_inner(spec, set, through, settle_from, should_continue, chunk)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_advance(
+        &self,
+        _spec: &AccountSpec,
+        set: &PriceSet,
+        through: &str,
+        from_day: Option<String>,
+        processed_days: Vec<String>,
+        trades: Vec<Trade>,
+        rebalances: Vec<Rebalance>,
+        completed: bool,
+    ) -> StoreResult<AdvanceResult> {
+        // Value at the last day actually settled, not at the day the caller
+        // asked for: a chunked advance stops early when it hits a limit, and
+        // valuing past that point would mark the book on prices it never
+        // reached.
+        let valuation_day = if completed {
+            through.to_string()
+        } else {
+            processed_days
+                .last()
+                .cloned()
+                .unwrap_or_else(|| through.to_string())
+        };
         let current = self
             .account()?
             .ok_or_else(|| StoreError::NotFound("account_not_found".into()))?;
+        let account = self.view(&current, Some(set), Some(valuation_day.as_str()))?;
         Ok(AdvanceResult {
             from_day,
             through_day: through.into(),
-            processed_days: days,
-            trades: all_trades,
-            rebalances: all_rebalances,
-            account: self.view(&current, Some(set), Some(through))?,
+            processed_days,
+            trades,
+            rebalances,
+            account,
         })
     }
 
@@ -866,24 +1182,137 @@ impl Store {
     /// Everything else -- listing dates, delistings, suspensions -- shows up
     /// as a short or missing series, which `signal` already handles by
     /// returning `None`.
-    fn signals_for_day<'a>(
+    /// What the slots scored on one day, for the AI observer to read.
+    ///
+    /// Read-only and bounded: the top `limit` names per slot, with the score,
+    /// the reason, and the three session-shape numbers. Deliberately no
+    /// forward-looking field -- the observer must see exactly what the engine
+    /// saw at decision time, or its advice is hindsight dressed as judgement.
+    pub fn observation_candidates(
+        &self,
+        set: &PriceSet,
+        day: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::domain::ScoredCandidate>> {
+        let index = IndexedPriceSet::new(set);
+        let closes = index.tradable_closes_on(day);
+        if closes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Only names that can actually produce a signal today: a close exists.
+        let candidates: std::collections::BTreeSet<&str> =
+            closes.keys().map(String::as_str).collect();
+        let mut rows = Vec::new();
+        for slot in [StrategyId::Steady, StrategyId::Aggressive] {
+            let mut scored = self.signals_for_day(
+                slot, &index, day, &closes, std::iter::empty(), index.adjustments(),
+            )?;
+            scored.sort_by(|left, right| {
+                right.1.score.cmp(&left.1.score).then_with(|| left.0.cmp(&right.0))
+            });
+            for (symbol, score) in scored.into_iter().take(limit) {
+                let shape = index.latest_bar(&symbol, day).and_then(|bar| crate::domain::KBars::from_bar(&bar));
+                rows.push(crate::domain::ScoredCandidate {
+                    slot: match slot {
+                        StrategyId::Steady => "steady".into(),
+                        StrategyId::Aggressive => "aggressive".into(),
+                    },
+                    symbol,
+                    score: score.score,
+                    reason: score.reason_with_history(),
+                    klow_bps: shape.map(|s| s.klow_bps),
+                    klen_bps: shape.map(|s| s.klen_bps),
+                    kmid_bps: shape.map(|s| s.kmid_bps),
+                });
+            }
+        }
+        let _ = candidates;
+        Ok(rows)
+    }
+
+    /// The symbols in the worst `klow_cut_bps` of the day's lower-wick tail.
+    ///
+    /// Lower wick in bps of the session open: `(min(open, close) - low) / open`.
+    /// Computed only from the day's own bar, so it cannot see the future.
+    ///
+    /// A symbol whose bar carries no usable shape is *not* excluded: the filter
+    /// is a claim about measured wicks, and a missing open/low is an absence of
+    /// evidence rather than evidence of a long wick. Excluding those would make
+    /// the filter quietly drop every name whose feed lacks OHLC.
+    fn worst_lower_wick_tail(
+        &self,
+        set: &IndexedPriceSet<'_>,
+        day: &str,
+        candidates: &BTreeSet<&str>,
+        held: &BTreeSet<&str>,
+    ) -> BTreeSet<String> {
+        let mut scored: Vec<(&str, i64)> = Vec::with_capacity(candidates.len());
+        for symbol in candidates {
+            // Never consider a holding for exclusion: the caller exempts it,
+            // but leaving it out of the ranking as well keeps the cut fraction
+            // honest about how many *tradeable* names it is removing.
+            if held.contains(symbol) {
+                continue;
+            }
+            let Some(bar) = set.latest_bar(symbol, day) else {
+                continue;
+            };
+            if !bar.has_session_shape() || bar.open_cents <= 0 {
+                continue;
+            }
+            let lower = bar.open_cents.min(bar.close_cents) - bar.low_cents;
+            let wick_bps = lower * 10_000 / bar.open_cents;
+            scored.push((symbol, wick_bps));
+        }
+        let cut = (scored.len() as i64 * self.klow_cut_bps / 10_000) as usize;
+        if cut == 0 || cut >= scored.len() {
+            return BTreeSet::new();
+        }
+        // Sort ascending by wick, take the longest tail.
+        scored.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+        scored[scored.len() - cut..]
+            .iter()
+            .map(|(symbol, _)| symbol.to_string())
+            .collect()
+    }
+
+    fn signals_for_day<'a, 'set>(
         &self,
         slot: StrategyId,
-        set: &'a IndexedPriceSet,
+        set: &IndexedPriceSet<'set>,
         day: &str,
         closes: &'a BTreeMap<String, i64>,
         held: impl Iterator<Item = &'a str>,
+        adjustment: &AdjustmentBook,
     ) -> StoreResult<Vec<(String, SignalScore)>> {
+        // Held symbols are collected first: the filter has to exempt them,
+        // because a position dropped from the signal list would never see its
+        // exit rule -- a far worse failure than buying one extra long-wick
+        // name. They also join the candidate set, so adds and exits are scored.
+        let held_set: BTreeSet<&'a str> = held.collect();
         let mut candidates: BTreeSet<&'a str> = closes.keys().map(String::as_str).collect();
-        candidates.extend(held);
+        candidates.extend(held_set.iter().copied());
 
         let mut signals = Vec::with_capacity(candidates.len());
+        let excluded = if self.klow_filter {
+            self.worst_lower_wick_tail(set, day, &candidates, &held_set)
+        } else {
+            BTreeSet::new()
+        };
         for symbol in candidates {
+            if excluded.contains(symbol) && !held_set.contains(symbol) {
+                continue;
+            }
             let mut bars = set.bars_for(symbol, day);
             if bars.len() > SIGNAL_LOOKBACK_DAYS {
                 bars.drain(..bars.len() - SIGNAL_LOOKBACK_DAYS);
             }
-            signals.push((symbol.to_string(), score_signal(slot, &bars)));
+            // Factors are applied inside scoring, never to the stored price:
+            // the fill below uses `closes`, which stays unadjusted.
+            signals.push((
+                symbol.to_string(),
+                score_signal_adjusted(slot, &bars, adjustment.for_symbol(symbol)),
+            ));
         }
         Ok(signals)
     }
@@ -895,7 +1324,7 @@ impl Store {
         // this in a loop, so the index is rebuilt per day -- still far cheaper
         // than the linear scans it replaces, and it keeps `run_day` usable on
         // its own for a single-day settle.
-        let index = IndexedPriceSet::new(set.clone());
+        let index = IndexedPriceSet::new(set);
         self.run_day_indexed(spec, &index, day)
     }
 
@@ -904,7 +1333,7 @@ impl Store {
     pub fn run_day_indexed(
         &mut self,
         spec: &AccountSpec,
-        index_set: &IndexedPriceSet,
+        index_set: &IndexedPriceSet<'_>,
         day: &str,
     ) -> StoreResult<DayRun> {
         let set = index_set.set();
@@ -973,13 +1402,23 @@ impl Store {
                 decision_day,
                 &closes,
                 book.positions.iter().map(|position| position.symbol.as_str()),
+                index_set.adjustments(),
             )?;
             let budget = self.slot_equity(&spec.account_id, slot)?;
-            let policy = if self.regime_filter {
+            let mut policy = if self.regime_filter {
                 SlotPolicy::for_strategy_in(slot, regime.regime)
             } else {
                 SlotPolicy::for_strategy(slot)
             };
+            // The observer may narrow this slot for today. It is applied after
+            // the regime policy so the two compose instead of one overwriting
+            // the other, and it is bounded inside `apply_to_policy`: an
+            // advisory input can raise the bar but cannot invert the strategy.
+            if self.ai_policy {
+                if let Some(advice) = self.observation_for(&spec.account_id, day, slot_name(slot))? {
+                    apply_to_policy(&mut policy, &advice);
+                }
+            }
             let valuations: BTreeMap<String, i64> = book
                 .positions
                 .iter()
@@ -1508,7 +1947,7 @@ fn validate_day(set: &PriceSet, day: &str) -> StoreResult<()> {
 /// A whole-market set is ~4M entries; rebuilding a day's close map by scanning
 /// all of them, once per trading day settled, is the difference between a
 /// settlement pass that finishes and one that does not.
-fn closes_for_indexed(index: &IndexedPriceSet, day: &str) -> BTreeMap<String, i64> {
+fn closes_for_indexed(index: &IndexedPriceSet<'_>, day: &str) -> BTreeMap<String, i64> {
     index.tradable_closes_on(day)
 }
 
@@ -1520,14 +1959,14 @@ fn closes_for_indexed(index: &IndexedPriceSet, day: &str) -> BTreeMap<String, i6
 /// change the answer -- but the window is twice the slow average so the index
 /// has enough points to average over even when a slice of the market is
 /// missing on some days.
-fn regime_for_day(index: &IndexedPriceSet, day: &str) -> RegimeView {
+fn regime_for_day(index: &IndexedPriceSet<'_>, day: &str) -> RegimeView {
     let by_symbol = index.recent_closes(day, REGIME_LOOKBACK_DAYS);
     classify_series(&by_symbol)
 }
 
 fn value_book_indexed(
     book: &SlotBook,
-    index: &IndexedPriceSet,
+    index: &IndexedPriceSet<'_>,
     day: &str,
 ) -> StoreResult<i64> {
     let mut market = 0i64;
@@ -1949,6 +2388,40 @@ mod tests {
         assert_eq!(subset[1].day, "2026-11-05");
     }
 
+    /// A settlement window whose start is later than its end returns nothing.
+    ///
+    /// This is the trap behind a real defect: an account already settled to the
+    /// newest day, asked to run again for an earlier day, built its one-day
+    /// window from the table's newest day instead of from the requested day.
+    /// `BETWEEN <newer> AND <older>` is empty, so the caller reported
+    /// `no_price_data` for a day whose prices were present. The window must be
+    /// anchored on the requested day; this test pins the empty result that the
+    /// caller has to avoid.
+    #[test]
+    fn inverted_window_has_no_rows_so_the_window_must_follow_the_requested_day() {
+        let mut store = Store::open(":memory:").unwrap();
+        store
+            .upsert_bars(&[
+                bar("600000.SH", "2026-11-11", 1_000, 1_000),
+                bar("600000.SH", "2026-11-12", 1_010, 1_000),
+                bar("600000.SH", "2026-11-13", 1_020, 1_010),
+            ])
+            .unwrap();
+
+        let inverted = store
+            .price_set_from_bars("bar-table", "2026-11-13", "2026-11-12")
+            .unwrap();
+        assert!(inverted.is_none(), "a reversed window must not invent a set");
+
+        let anchored = store
+            .price_set_from_bars("bar-table", "2026-11-12", "2026-11-12")
+            .unwrap()
+            .expect("the requested day itself has prices");
+        assert_eq!(anchored.days(), vec!["2026-11-12"]);
+        assert!(anchored.contains_day("2026-11-12"));
+        assert_eq!(anchored.symbols(), vec!["600000.SH".to_string()]);
+    }
+
     #[test]
     fn price_gaps_flags_ex_dividend_and_limit_moves() {
         let mut store = Store::open(":memory:").unwrap();
@@ -2118,6 +2591,10 @@ mod tests {
                     tradable: true,
                     can_buy: true,
                     can_sell: true,
+                    open_cents: 0,
+                    high_cents: 0,
+                    low_cents: 0,
+                    volume_shares: 0,
                 });
             }
         }
@@ -2158,6 +2635,10 @@ mod tests {
                     tradable: true,
                     can_buy: true,
                     can_sell: true,
+                    open_cents: 0,
+                    high_cents: 0,
+                    low_cents: 0,
+                    volume_shares: 0,
                 });
             }
         }
@@ -2390,6 +2871,27 @@ mod tests {
         assert_eq!(store.equity_curve("test-account").unwrap().len(), 2);
     }
 
+    /// Marking the book before a day the account already settled past is a
+    /// conflict about the request, not a missing-price rules error.
+    ///
+    /// The old code reported `valuation_before_last_settled` as a rules error,
+    /// which the HTTP layer turned into a generic 422 that callers misread as
+    /// "no market data for that day".
+    #[test]
+    fn marking_before_a_settled_day_is_a_conflict_not_a_missing_price() {
+        let mut store = store();
+        let set = price_set(4);
+        let settled = store.advance(&spec(), &set, &day(3), None).unwrap();
+        assert_eq!(settled.processed_days.last().map(String::as_str), Some(day(3).as_str()));
+        let error = store
+            .account_performance(&spec(), Some((&day(1), [6_000_000, 4_000_000])))
+            .unwrap_err();
+        match error {
+            StoreError::Conflict(code) => assert_eq!(code, "day_before_last_settled"),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rebalance_without_enough_source_cash_keeps_weights_and_does_not_fail_the_day() {
         let mut store = store();
@@ -2539,5 +3041,212 @@ mod tests {
             store.weights("test-account").unwrap(),
             [rebalance.new_steady_bps, rebalance.new_aggressive_bps]
         );
+    }
+
+    #[test]
+    fn advance_memory_guard_rejects_before_building_the_window() {
+        let mut store = store();
+        let set = price_set(3);
+        store.advance_limits.max_entries = set.entries.len() - 1;
+        let error = store.advance(&spec(), &set, &day(2), None).unwrap_err();
+        match error {
+            StoreError::Aborted(code) => assert!(code.starts_with("advance_memory_limit:")),
+            other => panic!("expected a memory-limit abort, got {other:?}"),
+        }
+        // Negative control: no day was committed by the rejected batch.
+        assert!(store.last_settled_day("test-account").unwrap().is_none());
+    }
+
+    #[test]
+    fn advance_chunks_preserve_the_same_fills_as_one_batch() {
+        let mut chunked = store();
+        chunked.advance_limits.chunk_days = 2;
+        let mut whole = store();
+        let set = price_set(7);
+        let mut all_days = Vec::new();
+        loop {
+            let run = chunked.advance_one_chunk(&spec(), &set, &day(6), None, None).unwrap();
+            if run.processed_days.is_empty() {
+                break;
+            }
+            all_days.extend(run.processed_days);
+            if all_days.len() == 7 {
+                break;
+            }
+        }
+        let one = whole.advance(&spec(), &set, &day(6), None).unwrap();
+        assert_eq!(all_days, one.processed_days);
+        assert_eq!(
+            chunked.trades("test-account", 500).unwrap().len(),
+            whole.trades("test-account", 500).unwrap().len()
+        );
+        assert_eq!(
+            chunked
+                .view(&spec(), Some(&set), Some(&day(6)))
+                .unwrap()
+                .equity_cents,
+            whole
+                .view(&spec(), Some(&set), Some(&day(6)))
+                .unwrap()
+                .equity_cents
+        );
+    }
+
+    #[test]
+    fn live_read_only_connection_is_read_only() {
+        let path = temp_db("live-read-only");
+        let mut writer = Store::open(&path).unwrap();
+        writer.create_account(spec()).unwrap();
+        // A live read-only connection opens the initialized schema without
+        // migration, sees committed rows, and cannot write. It deliberately
+        // does not pin an old snapshot like `open_market_read_only`.
+        let reader = Store::open_read_only(&path).unwrap();
+        assert_eq!(reader.account().unwrap().unwrap().account_id, "test-account");
+        assert!(reader
+            .conn
+            .execute("UPDATE account SET created_at='bad'", [])
+            .is_err());
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    // ---- lower-wick candidate filter ---------------------------------------
+
+    fn wick_row(symbol: &str, day: &str, open: i64, low: i64, close: i64) -> Bar {
+        Bar {
+            symbol: symbol.into(),
+            day: day.into(),
+            name: String::new(),
+            open_cents: open,
+            high_cents: open,
+            low_cents: low,
+            close_cents: close,
+            prev_close_cents: close,
+            volume_shares: 100_000,
+            amount_cents: close * 100_000,
+            adjust: "none".into(),
+            source: "tdx".into(),
+            tradable: true,
+        }
+    }
+
+    /// Ten symbols with strictly increasing lower wicks on 2026-02-16.
+    fn wick_universe() -> Vec<Bar> {
+        let mut bars = Vec::new();
+        for index in 0..10 {
+            let symbol = format!("60000{index}.SH");
+            for day in 1..=40 {
+                let close = 1_000 + day * 2;
+                bars.push(wick_row(&symbol, &format!("2026-01-{day:02}"), close, close, close));
+            }
+            let open = 1_100;
+            let low = open - index as i64 * 10;
+            bars.push(wick_row(&symbol, "2026-02-16", open, low, open));
+        }
+        bars
+    }
+
+    fn scored_symbols(filter: bool, cut_bps: i64, held: &[&str]) -> Vec<String> {
+        let mut store = Store::open(":memory:").unwrap();
+        store.create_account(spec()).unwrap();
+        store.klow_filter = filter;
+        store.klow_cut_bps = cut_bps;
+        store.upsert_bars(&wick_universe()).unwrap();
+        let set = store
+            .price_set_from_bars("wick", "2026-01-01", "2026-02-16")
+            .unwrap()
+            .expect("a price set over the fixture");
+        let index = IndexedPriceSet::new(&set);
+        let closes = closes_for_indexed(&index, "2026-02-16");
+        store
+            .signals_for_day(
+                StrategyId::Steady,
+                &index,
+                "2026-02-16",
+                &closes,
+                held.iter().copied(),
+                index.adjustments(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect()
+    }
+
+    #[test]
+    fn the_wick_filter_is_off_by_default_and_would_not_fire_unasked() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(!store.klow_filter);
+        assert_eq!(store.klow_cut_bps, 2_000);
+        assert_eq!(scored_symbols(false, 2_000, &[]).len(), 10);
+    }
+
+    #[test]
+    fn enabling_the_filter_drops_the_longest_lower_wicks() {
+        let all = scored_symbols(false, 2_000, &[]);
+        let kept = scored_symbols(true, 2_000, &[]);
+        assert_eq!(all.len(), 10, "unfiltered scores every symbol");
+        assert!(kept.len() < all.len(), "the filter must remove names");
+        assert!(!kept.iter().any(|s| s == "600009.SH"), "longest wick excluded");
+        assert!(!kept.iter().any(|s| s == "600008.SH"), "second longest excluded");
+        assert!(kept.iter().any(|s| s == "600000.SH"), "flat wick kept");
+    }
+
+    #[test]
+    fn a_held_name_is_scored_even_when_its_wick_is_the_worst() {
+        // Dropping a holding from the signal list would skip its exit rules.
+        let kept = scored_symbols(true, 2_000, &["600009.SH"]);
+        assert!(kept.iter().any(|s| s == "600009.SH"));
+    }
+
+    #[test]
+    fn a_bar_without_session_shape_is_not_read_as_a_long_wick() {
+        // Only closes: no open/low to measure. Absence is not evidence.
+        let mut store = Store::open(":memory:").unwrap();
+        store.create_account(spec()).unwrap();
+        store.klow_filter = true;
+        let mut rows = Vec::new();
+        for index in 0..10 {
+            let symbol = format!("60000{index}.SH");
+            for day in 1..=40 {
+                let close = 1_000 + day * 2;
+                rows.push(wick_row(&symbol, &format!("2026-01-{day:02}"), close, close, close));
+            }
+            // Reproduce the shape-less case through the price-set path: the
+            // column exists but carries zero.
+            let mut row = wick_row(&symbol, "2026-02-16", 1_100, 1_100, 1_100);
+            row.open_cents = 0;
+            row.high_cents = 0;
+            row.low_cents = 0;
+            rows.push(row);
+        }
+        store.upsert_bars(&rows).unwrap();
+        let set = store
+            .price_set_from_bars("wick", "2026-01-01", "2026-02-16")
+            .unwrap()
+            .expect("set");
+        let index = IndexedPriceSet::new(&set);
+        let closes = closes_for_indexed(&index, "2026-02-16");
+        let kept: Vec<String> = store
+            .signals_for_day(
+                StrategyId::Steady,
+                &index,
+                "2026-02-16",
+                &closes,
+                std::iter::empty(),
+                index.adjustments(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect();
+        assert_eq!(kept.len(), 10, "nothing measurable means nothing to exclude");
+    }
+
+    #[test]
+    fn a_zero_or_full_cut_cannot_empty_the_universe() {
+        assert_eq!(scored_symbols(true, 0, &[]).len(), 10);
+        assert!(!scored_symbols(true, 10_000, &[]).is_empty());
     }
 }

@@ -221,6 +221,11 @@ td { padding: 10px 12px; border-top: 1px solid var(--border); white-space: nowra
 tbody tr:hover { background: var(--surface-soft); }
 .num-col { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .empty { padding: 18px 20px; color: var(--muted); font-size: 12.5px; }
+/* A paragraph that is a direct child of a panel has no wrapper to inherit the
+   inset from, which left "尚未加载价格集合" and the empty research note flush
+   against the card edge. */
+.panel > p.muted,
+.panel > p.notice-line { padding: 12px 20px; margin: 0; }
 
 .timeline { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
 .timeline li { padding: 13px 20px; border-bottom: 1px solid var(--border); }
@@ -499,7 +504,12 @@ html[data-busy="true"] #refresh { opacity: .65; cursor: progress; }
   gap: 12px;
   flex-wrap: wrap;
   align-items: center;
-  margin: 10px 0;
+  /* Panel children sit flush to the border; the head owns the horizontal
+     inset, so every other direct child has to repeat it or it touches the
+     edge. This was visible on the screener and advance pages. */
+  padding: 12px 20px;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
 }
 .field-inline {
   display: inline-flex;
@@ -522,16 +532,55 @@ html[data-busy="true"] #refresh { opacity: .65; cursor: progress; }
   gap: 10px;
   align-items: center;
   flex-wrap: wrap;
+  padding: 12px 20px;
   margin-top: 14px;
   padding-top: 14px;
   border-top: 1px solid var(--border);
 }
 .metric-grid.wide { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
 
+/* ---- 盘中实时视图 -------------------------------------------------------- */
+
+:root, html[data-theme="dark"] {
+  --foreground: var(--text);
+}
+
+#live-module { display: grid; gap: 14px; min-width: 0; }
+.live-status { padding: 12px 20px; border-bottom: 1px solid var(--border); }
+.live-status[data-state="error"] { color: var(--negative); }
+.live-status[data-state="loading"] { color: var(--muted); }
+.live-note { color: var(--foreground); }
+.live-strategy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.live-strategy-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; }
+.live-strategy-card[data-slot="steady"]::before { background: var(--steady); }
+.live-strategy-card[data-slot="aggressive"]::before { background: var(--aggressive); }
+.live-table td { white-space: normal; overflow-wrap: anywhere; }
+.live-table td.live-nowrap { white-space: nowrap; }
+.live-dim { color: var(--muted); }
+.live-flag {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--border-strong); background: var(--surface-soft);
+  color: var(--foreground); font-size: 11px; white-space: nowrap;
+}
+.live-flag[data-state="ok"] { border-color: var(--positive); color: var(--positive); }
+.live-flag[data-state="error"] { border-color: var(--negative); color: var(--negative); }
+.live-flag[data-state="applied"] { border-color: var(--accent); color: var(--accent); }
+.live-flag[data-state="plain"] { color: var(--muted); background: var(--surface-soft); }
+.live-link {
+  padding: 0; border: 0; background: transparent; color: var(--accent);
+  cursor: pointer; text-decoration: underline;
+}
+.live-link:hover { color: var(--accent-strong); }
+.live-scale {
+  display: flex; flex-wrap: wrap; gap: 4px 16px; justify-content: space-between;
+  padding: 6px 10px 2px; color: var(--muted); font: 11px var(--mono);
+}
+
 @media (max-width: 640px) {
   .module-nav-inner, .view-nav { padding-left: 12px; padding-right: 12px; }
   .curve { height: 200px; }
   .curve-summary { grid-template-columns: repeat(2, 1fr); }
+  .live-strategy-grid { grid-template-columns: 1fr; }
 }
 
 /* Narrow screens: the summary grid and the SVG both need explicit caps, or
@@ -557,4 +606,86 @@ html[data-theme="dark"] .view-tab.active,
 html[data-theme="dark"] .seg-btn.active,
 html[data-theme="dark"] .chip.active {
   color: var(--accent-strong);
+}
+
+/* The daily report is preformatted on purpose: it is meant to be copied and
+   pasted elsewhere, so its line breaks are part of the content. */
+.report-text {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: var(--radius, 10px);
+  background: var(--secondary, #f4f6fa);
+  color: var(--foreground, #1a2233);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* Decision-signal pager. One round holds ~10k rows (5.2k symbols × 2 slots);
+   rendering them all froze the tab, so only the current page is in the DOM. */
+.live-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 4px;
+  font-size: 13px;
+}
+
+.live-page {
+  font: inherit;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--foreground);
+  cursor: pointer;
+}
+
+.live-page:hover:not(:disabled) { border-color: var(--accent-strong); }
+
+.live-page:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Stock names carry the meaning; the code is a verification handle. */
+.live-name { font-weight: 600; }
+.live-code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Score is shown as a word plus its number, never a bare value. */
+.live-score { font-weight: 600; }
+.live-score-up { color: var(--positive); }
+.live-score-down { color: var(--negative); }
+.live-score-flat { color: var(--muted); }
+
+/* Long human sentences in the round table must not blow up the layout. */
+.live-note {
+  max-width: 26ch;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+/* Raw AI advice is audit text: keep its line breaks and its monospace shape,
+   but let the preformatted block scroll inside the table instead of widening
+   the whole page on a 320px viewport. */
+.live-details { max-width: 20ch; }
+.live-details summary { color: var(--accent); cursor: pointer; }
+.live-raw {
+  max-width: 100%;
+  margin: 8px 0 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--text);
+  font: 11px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

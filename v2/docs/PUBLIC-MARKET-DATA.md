@@ -1,6 +1,8 @@
 # 公共行情、公司资料与公告数据层
 
-更新：2026-11-12。选型证据见 [开源项目与来源研究](MARKET-SOURCES-RESEARCH-2026-11-12.md)。现有 TDX/腾讯行情入口继续使用；参考 AKShare 等项目的接口与字段经验，独立实现小型适配器，没有整体引入 AKShare、efinance、adata、mootdx、Qlib 或新增服务。
+更新：2026-11-15。原四类查询的契约继续有效；新增上游全量能力入口 `PublicDataClient.datasets()` / `dataset(name, **params)`，覆盖行情之外的研报、资金与筹码、新闻事件、宏观、指数与衍生品等 15 类能力。组件、参数、限制及可重复更新方式见 [全量适配器](../data_sources/astock_public/README.md)；实际验证见 [本轮执行记录](PUBLIC-DATA-EXECUTION-2026-11-14.md)。
+
+以下表格和普通 A 股标识限制针对原四类接口；`dataset` 按各能力声明接受 ETF、指数、期货、期权等各自代码形式。早期选型证据保留在 [开源来源研究](MARKET-SOURCES-RESEARCH-2026-11-12.md)，原有 TDX/腾讯源已经融合保留，本轮未新增服务。
 
 ## 入口与能力
 

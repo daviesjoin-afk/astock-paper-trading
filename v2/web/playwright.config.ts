@@ -1,7 +1,9 @@
 import { defineConfig } from "@playwright/test";
 
-const baseURL = "http://127.0.0.1:4173";
-const apiURL = "http://127.0.0.1:18766";
+const baseURL = process.env.ASTOCK_V2_E2E_WEB_URL || "http://127.0.0.1:4173";
+const apiURL = process.env.ASTOCK_V2_E2E_API_URL || "http://127.0.0.1:18766";
+// Explicit test ports keep isolated runs separate from existing services.
+const browserBin = process.env.ASTOCK_V2_BIN;
 
 export default defineConfig({
   testDir: "e2e",
@@ -28,10 +30,11 @@ export default defineConfig({
       env: {
         ASTOCK_V2_ADDR: new URL(apiURL).host,
         ASTOCK_V2_E2E_INSTANCE: "rewrite",
+        ...(browserBin ? { ASTOCK_V2_BIN: browserBin } : {}),
       },
     },
     {
-      command: "npx vite preview --host 127.0.0.1 --port 4173 --strictPort",
+      command: `npx vite preview --host ${new URL(baseURL).hostname} --port ${new URL(baseURL).port} --strictPort`,
       url: baseURL,
       reuseExistingServer: false,
       timeout: 60_000,

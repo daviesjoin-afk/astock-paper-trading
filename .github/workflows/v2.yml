@@ -36,6 +36,13 @@ jobs:
           python-version: "3.13"
       - run: python -m unittest discover -s v2/research -p 'test_*.py' -v
       - run: python -m unittest discover -s v2/data_sources -p 'test_*.py' -v
+      # The research tooling under v2/scripts is what every measurement in the
+      # optimization loop runs through: fold generation, factor scans, power
+      # checks and the evolution-cycle gate. Those tests existed and passed but
+      # were never executed by CI, so a change could break the measurement
+      # apparatus while the kernel stayed green.
+      - name: Research tooling tests
+        run: python -m unittest discover -s v2/scripts -p 'test_*.py' -v
       - name: Verify a complete price set builds from fixture rows
         run: |
           python v2/research/make_price_set.py \

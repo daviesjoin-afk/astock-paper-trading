@@ -122,14 +122,69 @@ try:
 except json.JSONDecodeError:
     print("advance response is not valid JSON", file=sys.stderr)
     raise SystemExit(3)
-print(
-    "advance day={day} processed={processed} trades={trades} rebalances={rebalances} "
-    "last_settled={last}".format(
-        day=result.get("through_day"),
-        processed=len(result.get("processed_days") or []),
-        trades=len(result.get("trades") or []),
-        rebalances=len(result.get("rebalances") or []),
-        last=(result.get("account") or {}).get("last_settled_day"),
+summary = result.get("summary") or {}
+# The kernel already composed the sentence; printing it keeps the script from
+# inventing a second, subtly different description of the same run.
+if summary.get("sentence"):
+    print(summary["sentence"])
+else:
+    print(
+        "advance day={day} processed={processed} trades={trades} rebalances={rebalances} "
+        "last_settled={last}".format(
+            day=result.get("through_day"),
+            processed=len(result.get("processed_days") or []),
+            trades=len(result.get("trades") or []),
+            rebalances=len(result.get("rebalances") or []),
+            last=(result.get("account") or {}).get("last_settled_day"),
+        )
     )
-)
 '
+
+# === step 3/3 daily report ===
+# Written next to the database so the day's outcome survives the terminal
+# scrollback. A failure here must not fail the cycle: the trade already settled.
+REPORT_DIR="${ASTOCK_REPORT_DIR:-$(dirname "$DB")/reports}"
+if mkdir -p "$REPORT_DIR" 2>/dev/null; then
+  report=$(curl -fsS --max-time 60 "${API%/}/v2/account/daily-report?day=$DAY") || report=""
+  if [ -n "$report" ]; then
+    printf '%s' "$report" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+text = data.get('text') or ''
+if text:
+    print(text)
+    open(sys.argv[1], 'w', encoding='utf-8').write(text)
+" "$REPORT_DIR/$DAY.txt" || echo "daily report unavailable for $DAY" >&2
+    echo "report saved: $REPORT_DIR/$DAY.txt"
+  else
+    echo "daily report request failed for $DAY" >&2
+  fi
+fi
+
+# === step 4/4 AI review (optional) ===
+# Runs after the numbers exist and never changes them. Missing configuration or
+# an unreachable model leaves the deterministic report untouched; a trading day
+# must not depend on a third-party service.
+if [ -n "${ASTOCK_LLM_BASE:-}" ] && [ -n "${ASTOCK_LLM_KEY:-}" ]; then
+  REVIEWER="$(dirname "$0")/daily_review.py"
+  if [ -f "$REVIEWER" ]; then
+    python3 "$REVIEWER" --api "$API" --day "$DAY" --report-dir "$REPORT_DIR" \
+      || echo "ai review failed for $DAY (report kept as produced)" >&2
+  else
+    echo "daily_review.py not found; skipping AI review" >&2
+  fi
+else
+  echo "AI review skipped: ASTOCK_LLM_BASE / ASTOCK_LLM_KEY not set"
+fi
+
+# 5/5 Optional: run every LLM task the day's data supports.
+# Runs only when a model is configured; never fails the cycle.
+if [ -n "${ASTOCK_LLM_BASE:-}" ] && [ -n "${ASTOCK_LLM_KEY:-}" ]; then
+  echo "-- LLM tasks"
+  python3 "$HERE/llm_daily.py" --day "$DAY" --out "$REPORT_DIR"     || echo "warning: llm_daily reported a problem; the ledger is unaffected"
+else
+  echo "-- LLM tasks: skipped (ASTOCK_LLM_BASE / ASTOCK_LLM_KEY not set)"
+fi

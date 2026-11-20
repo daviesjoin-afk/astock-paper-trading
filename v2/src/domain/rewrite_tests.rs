@@ -13,6 +13,7 @@ fn scored(symbol: &str, score: i64) -> (String, SignalScore) {
             } else {
                 "test_neutral"
             },
+            short_window: false,
         },
     )
 }
@@ -41,6 +42,9 @@ fn bars(values: &[i64]) -> Vec<Bar> {
             day: format!("2026-04-{:02}", index + 1),
             close_cents: *close,
             volume: 1,
+            open_cents: 0,
+            high_cents: 0,
+            low_cents: 0,
             tradable: true,
         })
         .collect()
@@ -373,6 +377,9 @@ fn a_halted_bar_never_changes_the_score() {
                 day: format!("2026-04-{:02}", index + 1),
                 close_cents: 1_000 + index * 2,
                 volume: 1,
+                open_cents: 0,
+                high_cents: 0,
+                low_cents: 0,
                 tradable: true,
             };
             if index == 60 {
@@ -381,17 +388,20 @@ fn a_halted_bar_never_changes_the_score() {
             bar
         })
         .collect();
-    let expected = score_registered("steady-v1", &trading).unwrap();
+    let expected = score_registered("steady-v1", &trading, None).unwrap();
     let mut with_reference = trading;
     with_reference.push(Bar {
         symbol: "600000.SH".into(),
         day: "2026-06-01".into(),
         close_cents: 9_999,
         volume: 0,
+        open_cents: 0,
+        high_cents: 0,
+        low_cents: 0,
         tradable: false,
     });
     assert_eq!(
-        score_registered("steady-v1", &with_reference).unwrap(),
+        score_registered("steady-v1", &with_reference, None).unwrap(),
         expected
     );
 }
@@ -530,6 +540,10 @@ fn price_set_validation_rejects_non_reviewed_duplicates_and_bad_days() {
             tradable: true,
             can_buy: true,
             can_sell: true,
+            open_cents: 0,
+            high_cents: 0,
+            low_cents: 0,
+            volume_shares: 0,
         }],
         source_digest: "a".repeat(64),
     };
@@ -568,6 +582,10 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 tradable: true,
                 can_buy: true,
                 can_sell: true,
+                open_cents: 0,
+                high_cents: 0,
+                low_cents: 0,
+                volume_shares: 0,
             },
             PriceEntry {
                 symbol: "600000.SH".into(),
@@ -578,6 +596,10 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 tradable: true,
                 can_buy: true,
                 can_sell: true,
+                open_cents: 0,
+                high_cents: 0,
+                low_cents: 0,
+                volume_shares: 0,
             },
             PriceEntry {
                 symbol: "000001.SZ".into(),
@@ -588,6 +610,10 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
                 tradable: true,
                 can_buy: true,
                 can_sell: true,
+                open_cents: 0,
+                high_cents: 0,
+                low_cents: 0,
+                volume_shares: 0,
             },
         ],
         source_digest: "c".repeat(64),
@@ -602,6 +628,10 @@ fn price_set_validation_rejects_a_sparse_reviewed_rectangle() {
         tradable: true,
         can_buy: true,
         can_sell: true,
+        open_cents: 0,
+        high_cents: 0,
+        low_cents: 0,
+        volume_shares: 0,
     });
     set.validate().unwrap();
 }
@@ -628,6 +658,7 @@ fn halted_price_set_valuations_use_the_reference_close_and_still_fail_when_absen
         high_cents: 0,
         low_cents: 0,
         prev_close_cents: 0,
+        volume_shares: 0,
     };
     let set = PriceSet::from_bars(&[halted], "halted", "2026-11-03", "2026-11-03");
     set.validate().expect("a halt is a complete one-day row");

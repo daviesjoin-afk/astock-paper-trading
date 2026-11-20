@@ -1,3 +1,5 @@
 //! Independent V2 domain and store. Do not import or bind any V1 runtime module.
 pub mod domain;
+/// Independent intraday paper kernel; daily settlement remains in `store`.
+pub mod intraday;
 pub mod store;

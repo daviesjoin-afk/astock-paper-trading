@@ -1,82 +1,6 @@
 import "./styles.css";
 import { installRouter, NAV, parseHash, pushHash, replaceHash, type Route } from "./router";
-import { moneyShort, renderCurve, renderDailyBars, type CurvePoint } from "./chart";
-
-type StrategyId = "steady" | "aggressive";
-
-type Trade = {
-  id: number;
-  slot: StrategyId;
-  symbol: string;
-  side: "buy" | "sell";
-  quantity: number;
-  price_cents: number;
-  fees_cents: number;
-  trade_day: string;
-  reason: string;
-};
-
-type Rebalance = {
-  id: number;
-  old_steady_bps: number;
-  old_aggressive_bps: number;
-  new_steady_bps: number;
-  new_aggressive_bps: number;
-  moved_cents: number;
-  reason: string;
-  applied_day: string;
-};
-
-type SlotView = {
-  slot: StrategyId;
-  name: string;
-  description: string;
-  weight_bps: number;
-  cash_cents: number;
-  market_value_cents: number | null;
-  equity_cents: number | null;
-  profit_cents: number | null;
-  return_bps: number | null;
-  drawdown_bps: number | null;
-};
-
-type PositionView = {
-  slot: StrategyId;
-  symbol: string;
-  quantity: number;
-  sellable_quantity: number | null;
-  average_cost_cents: number;
-  close_cents: number | null;
-  market_value_cents: number | null;
-};
-
-type AccountView = {
-  account_id: string;
-  initial_cash_cents: number;
-  cash_cents: number;
-  equity_cents: number | null;
-  profit_cents: number | null;
-  return_bps: number | null;
-  as_of_day: string | null;
-  created_at: string;
-  slots: SlotView[];
-  positions: PositionView[];
-  trades: Trade[];
-  rebalances: Rebalance[];
-  price_set_id: string | null;
-  price_set_coverage_end: string | null;
-  last_settled_day: string | null;
-  warnings: string[];
-};
-
-type RunResult = {
-  from_day: string | null;
-  through_day: string;
-  processed_days: string[];
-  trades: Trade[];
-  rebalances: Rebalance[];
-  account: AccountView;
-};
+import { buildLiveReport, refreshLiveData as refreshLive, renderLive, setLiveRouteApplier } from "./live";
 
 class ApiError extends Error {
   constructor(readonly status: number | null, readonly detail: string) {
@@ -89,21 +13,11 @@ const byId = <T extends HTMLElement>(id: string): T => {
   if (!node) throw new Error(`missing #${id}`);
   return node as T;
 };
-/**
- * Find an element by test id, preferring one that is actually visible.
- *
- * The same test id can legitimately appear in more than one view -- the account
- * figures exist on both the overview and the account page. Rendering must
- * target the visible copy, or updates land on a hidden node and the page
- * silently keeps showing placeholders.
- */
+/** Find a node by its test id; the console now owns at most one copy of each. */
 const byTestId = <T extends HTMLElement>(id: string): T => {
-  const matches = Array.from(document.querySelectorAll<T>(`[data-testid="${id}"]`));
-  if (matches.length === 0) throw new Error(`missing [data-testid="${id}"]`);
-  const visible = matches.find(
-    (node) => node.offsetParent !== null || node.getClientRects().length > 0,
-  );
-  return visible ?? matches[0];
+  const node = document.querySelector<T>(`[data-testid="${id}"]`);
+  if (!node) throw new Error(`missing [data-testid="${id}"]`);
+  return node;
 };
 const setText = (id: string, value: string): void => {
   byTestId(id).textContent = value;
@@ -128,30 +42,22 @@ const money = (cents: number | null | undefined): string => {
 };
 const number = (value: number | null | undefined): string =>
   value === null || value === undefined ? "—" : value.toLocaleString("zh-CN");
-const signedMoney = (cents: number | null | undefined): string => {
-  if (cents === null || cents === undefined) return "—";
-  return (cents > 0 ? "+" : "") + money(cents);
-};
 const percent = (bps: number | null | undefined): string => {
   if (bps === null || bps === undefined) return "—";
   const value = bps / 100;
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
-};
-const weight = (bps: number | null | undefined): string =>
-  bps === null || bps === undefined ? "—" : `${(bps / 100).toFixed(1)}%`;
-const strategyLabel = (slot: StrategyId): string => (slot === "steady" ? "稳健" : "激进");
-const sideLabel = (side: string): string => {
-  if (side === "buy") return "买入";
-  if (side === "sell") return "卖出";
-  return side;
 };
 
 const errorDetail = (error: unknown): string => {
   if (error instanceof ApiError) {
     if (error.status === null) return "无法连接本地服务";
     try {
-      const body = JSON.parse(error.detail) as { error?: string };
+      const body = JSON.parse(error.detail) as {
+        error?: string | { code?: string; detail?: unknown };
+      };
       if (typeof body.error === "string") return body.error;
+      const code = body.error?.code;
+      if (typeof code === "string") return code;
     } catch {
       // Preserve the raw status for unexpected responses.
     }
@@ -160,16 +66,12 @@ const errorDetail = (error: unknown): string => {
   return error instanceof Error ? error.message : String(error);
 };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
-      ...init,
       cache: "no-store",
-      headers: {
-        Accept: "application/json",
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      },
+      headers: { Accept: "application/json" },
     });
   } catch (error) {
     throw new ApiError(null, error instanceof Error ? error.message : String(error));
@@ -180,265 +82,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const api = <T>(path: string): Promise<T> => request<T>(path);
-const post = <T>(path: string, body: unknown): Promise<T> =>
-  request<T>(path, { method: "POST", body: JSON.stringify(body) });
 
 const setBusy = (busy: boolean): void => {
   document.documentElement.dataset.busy = String(busy);
   byId("main").setAttribute("aria-busy", String(busy));
 };
 
-let current: AccountView | null = null;
-
-const renderStrategy = (slot: SlotView): void => {
-  const prefix = slot.slot;
-  setText(`${prefix}-weight`, weight(slot.weight_bps));
-  setText(`${prefix}-desc`, slot.description);
-  setText(`${prefix}-equity`, money(slot.equity_cents));
-  setText(`${prefix}-profit`, signedMoney(slot.profit_cents));
-  setText(`${prefix}-return`, percent(slot.return_bps));
-  setText(`${prefix}-drawdown`, percent(slot.drawdown_bps));
-  setText(`${prefix}-cash`, money(slot.cash_cents));
-  setText(
-    `${prefix}-count`,
-    current ? number(current.positions.filter((position) => position.slot === slot.slot).length) : "—",
-  );
-};
-
-const renderPositions = (account: AccountView): void => {
-  const body = byId("positions-body");
-  body.replaceChildren();
-  for (const position of account.positions) {
-    const row = document.createElement("tr");
-    // Unrealised P&L per position, against its own average cost. This is the
-    // number that answers "is this position working", which the market value
-    // alone does not.
-    const pnl =
-      position.close_cents !== null && position.average_cost_cents > 0
-        ? (position.close_cents - position.average_cost_cents) * position.quantity
-        : null;
-    const pnlBps =
-      position.close_cents !== null && position.average_cost_cents > 0
-        ? ((position.close_cents - position.average_cost_cents) * 10_000) /
-          position.average_cost_cents
-        : null;
-
-    const values: Array<[string, string]> = [
-      [strategyLabel(position.slot), ""],
-      [position.symbol, ""],
-      [number(position.quantity), "num-col"],
-      [number(position.sellable_quantity), "num-col"],
-      [money(position.average_cost_cents), "num-col"],
-      [money(position.close_cents), "num-col"],
-      [money(position.market_value_cents), "num-col"],
-      [
-        pnl === null ? "—" : `${signedMoney(pnl)} (${percent(pnlBps)})`,
-        "num-col " + (pnl !== null && pnl >= 0 ? "pos" : pnl !== null ? "neg" : ""),
-      ],
-    ];
-    for (const [value, cls] of values) {
-      const cell = document.createElement("td");
-      if (cls) cell.className = cls;
-      cell.textContent = value;
-      row.appendChild(cell);
-    }
-    body.appendChild(row);
-  }
-  setText("positions-count", `${account.positions.length} 个持仓`);
-  show(byTestId("positions-empty"), account.positions.length === 0);
-};
-
-const renderTrades = (account: AccountView): void => {
-  const body = byId("trades-body");
-  body.replaceChildren();
-  for (const trade of account.trades.slice(0, 30)) {
-    const row = document.createElement("tr");
-    const values = [
-      trade.trade_day,
-      strategyLabel(trade.slot),
-      trade.symbol,
-      sideLabel(trade.side),
-      number(trade.quantity),
-      money(trade.price_cents),
-    ];
-    values.forEach((value, index) => {
-      const cell = document.createElement("td");
-      if (index >= 4) cell.className = "num-col";
-      cell.textContent = value;
-      row.appendChild(cell);
-    });
-    body.appendChild(row);
-  }
-  show(byTestId("trades-empty"), account.trades.length === 0);
-};
-
-const renderRebalances = (account: AccountView): void => {
-  const list = byId("rebalances-body");
-  list.replaceChildren();
-  for (const item of account.rebalances) {
-    const entry = document.createElement("li");
-    const head = document.createElement("div");
-    head.className = "timeline-head";
-    const day = document.createElement("strong");
-    day.textContent = item.applied_day;
-    const moved = document.createElement("span");
-    moved.textContent = money(item.moved_cents);
-    head.append(day, moved);
-    const detail = document.createElement("p");
-    detail.textContent =
-      `稳健 ${weight(item.old_steady_bps)} → ${weight(item.new_steady_bps)}；` +
-      `激进 ${weight(item.old_aggressive_bps)} → ${weight(item.new_aggressive_bps)}`;
-    const reason = document.createElement("p");
-    reason.className = "muted";
-    reason.textContent = item.reason;
-    entry.append(head, detail, reason);
-    list.appendChild(entry);
-  }
-  show(byTestId("rebalances-empty"), account.rebalances.length === 0);
-};
-
-const warningText: Record<string, string> = {
-  no_reviewed_price_set: "没有可用的已审核价格集合，当前无法估值，也不会下单。",
-  no_reviewed_close_for_valuation: "价格集合已加载，但还没有对应交易日的收盘价。",
-};
-
-const render = (account: AccountView): void => {
-  current = account;
-  show(byId("loading"), false);
-  show(byTestId("create-panel"), false);
-  show(byId("dashboard"), true);
-
-  setText("principal-value", money(account.initial_cash_cents));
-  setText("equity", money(account.equity_cents));
-  setText("profit", signedMoney(account.profit_cents));
-  setText("cash", money(account.cash_cents));
-  setText("as-of", account.last_settled_day ?? "—");
-  setText(
-    "coverage",
-    account.price_set_coverage_end && account.last_settled_day
-      ? `行情覆盖至 ${account.price_set_coverage_end}；账户已结算至 ${account.last_settled_day}`
-      : account.price_set_coverage_end
-        ? `已加载价格集合至 ${account.price_set_coverage_end}，账户尚未开始`
-      : "尚未加载价格集合",
-  );
-  setText("price-set", `价格集合：${account.price_set_id ?? "—"}`);
-
-  // The account page keeps its own set of figures under plain ids, because the
-  // dashboard already owns the `data-testid` copies.
-  setTextById("acc-principal", money(account.initial_cash_cents));
-  setTextById("acc-equity", money(account.equity_cents));
-  setTextById("acc-profit", signedMoney(account.profit_cents));
-  setTextById("acc-cash", money(account.cash_cents));
-
-  for (const slot of account.slots) renderStrategy(slot);
-  renderPositions(account);
-  renderTrades(account);
-  renderRebalances(account);
-
-  const messages = account.warnings.map((code) => warningText[code] ?? code);
-  for (const id of ["warning", "account-warning"]) {
-    const node = document.getElementById(id);
-    if (!node) continue;
-    node.textContent = messages.join("；");
-    show(node, messages.length > 0);
-  }
-
-  const run = byTestId<HTMLButtonElement>("run-submit");
-  run.disabled = account.price_set_coverage_end === null;
-  announce("账户与策略已更新");
-};
-
-const load = async (): Promise<void> => {
-  setBusy(true);
-  show(byId("service-error"), false);
-  try {
-    render(await api<AccountView>("/v2/account"));
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 404) {
-      show(byId("loading"), false);
-      show(byId("dashboard"), false);
-      show(byTestId("create-panel"), true);
-      byTestId<HTMLInputElement>("principal").focus();
-    } else {
-      show(byId("loading"), false);
-      show(byId("service-error"), true);
-      setText("service-detail", errorDetail(error));
-    }
-  } finally {
-    setBusy(false);
-  }
-};
-
-const describeRun = (result: RunResult): string => {
-  if (result.processed_days.length === 0) {
-    return `已经是最新交易日 ${result.through_day}，本次没有重复成交。`;
-  }
-  const parts = [
-    `补齐 ${result.processed_days.length} 个交易日（${result.processed_days[0]} 至 ${result.processed_days[result.processed_days.length - 1]}）`,
-    `成交 ${result.trades.length} 笔`,
-  ];
-  if (result.rebalances.length > 0) {
-    const last = result.rebalances[result.rebalances.length - 1];
-    parts.push(
-      `调仓 ${result.rebalances.length} 次，最近一次 ${money(last.moved_cents)}（稳健 ${weight(last.new_steady_bps)} / 激进 ${weight(last.new_aggressive_bps)}）`,
-    );
-  } else {
-    parts.push("本次未触发调仓");
-  }
-  return parts.join(" · ");
-};
-
-const submitRun = async (): Promise<void> => {
-  const button = byTestId<HTMLButtonElement>("run-submit");
-  button.disabled = true;
-  show(byTestId("run-result"), false);
-  setBusy(true);
-  try {
-    const result = await post<RunResult>("/v2/account/run", {});
-    render(result.account);
-    const line = byTestId("run-result");
-    line.textContent = describeRun(result);
-    line.dataset.state = result.rebalances.length > 0 ? "applied" : "held";
-    show(line, true);
-    announce(describeRun(result));
-  } catch (error) {
-    const line = byTestId("run-result");
-    line.textContent = `推进失败：${errorDetail(error)}`;
-    line.dataset.state = "error";
-    show(line, true);
-    announce("推进失败");
-  } finally {
-    button.disabled = false;
-    setBusy(false);
-  }
-};
-
-const createAccount = async (event: SubmitEvent): Promise<void> => {
-  event.preventDefault();
-  const input = byTestId<HTMLInputElement>("principal");
-  const error = byTestId("create-error");
-  const yuan = Number(input.value);
-  const cents = Math.round(yuan * 100);
-  show(error, false);
-  if (!Number.isFinite(yuan) || !Number.isInteger(cents) || cents < 10_000 || cents > 100_000_000_000) {
-    error.textContent = "请输入 100 元到 10 亿元之间的本金（最多两位小数）。";
-    show(error, true);
-    return;
-  }
-  const button = byTestId<HTMLButtonElement>("create-submit");
-  button.disabled = true;
-  setBusy(true);
-  try {
-    render(await post<AccountView>("/v2/account", { initial_cash_cents: cents }));
-    announce("账户已创建");
-  } catch (failure) {
-    error.textContent = `创建失败：${errorDetail(failure)}`;
-    show(error, true);
-  } finally {
-    button.disabled = false;
-    setBusy(false);
-  }
-};
+/** Text copied by the report-copy control: live views use the live ledger only. */
+let reportText = "";
 
 const theme = (): void => {
   const root = document.documentElement;
@@ -457,6 +108,14 @@ const theme = (): void => {
  * instant and does not re-hit the API.
  */
 const loadedViews = new Set<string>();
+setLiveRouteApplier((route) => applyRoute(route));
+
+/**
+ * Views that must re-read on every visit because something outside the browser
+ * can change them. Caching these showed "还没有影子候选" while the API was
+ * already returning one.
+ */
+const ALWAYS_FRESH = new Set<string>(["research/candidates"]);
 
 function renderModuleNav(activeModule: string): void {
   const host = byId("module-nav");
@@ -475,9 +134,10 @@ function renderModuleNav(activeModule: string): void {
     button.append(label, hint);
 
     button.addEventListener("click", () => {
-      pushHash({ module: module.id, view: module.views[0].id });
+      const next = { module: module.id, view: module.views[0].id };
+      pushHash(next);
       // pushState does not fire hashchange, so drive the render directly.
-      applyRoute(parseHash(location.hash));
+      applyRoute(next);
     });
     host.appendChild(button);
   }
@@ -501,8 +161,9 @@ function renderViewNav(route: Route): void {
     button.setAttribute("aria-selected", String(view.id === route.view));
     button.textContent = view.label;
     button.addEventListener("click", () => {
-      pushHash({ module: route.module, view: view.id });
-      applyRoute(parseHash(location.hash));
+      const next = { module: route.module, view: view.id };
+      pushHash(next);
+      applyRoute(next);
     });
     nav.appendChild(button);
   }
@@ -514,46 +175,48 @@ function applyRoute(route: Route): void {
   renderViewNav(route);
 
   const target = `${route.module}/${route.view}`;
-  for (const node of document.querySelectorAll<HTMLElement>(".view")) {
+  for (const node of document.querySelectorAll<HTMLElement>(".view[data-view]")) {
     show(node, node.dataset.view === target);
   }
-
-  // Every view except the first assumes an account exists. If one does not,
-  // the create panel is the only sensible thing to show.
-  if (target !== "overview/dashboard" && current === null) {
-    show(byId("loading"), false);
-    show(byTestId("create-panel"), true);
+  // 盘中模块用同一个容器承载 8 个视图，仅在 live 激活时接管渲染与定时刷新。
+  // renderLive() 在首次进入（!loaded）时自动调用 refreshLive()。
+  if (route.module === "live") {
+    show(byId("live-module"), true);
+    renderLive(route);
     return;
   }
-
-  // Re-render for the view that just became visible. `render` writes into the
-  // copy of each figure that is visible at the time it runs, and when the
-  // account was loaded on a different view these nodes were hidden -- so the
-  // figures have to be pushed again now that this view is on screen.
-  if (current) render(current);
-
+  show(byId("live-module"), false);
+  renderLive(route); // 离开盘中模块时停止定时器并清空容器
   void loadView(target);
 }
 
 /** Load whatever a view needs, once per session unless explicitly refreshed. */
 async function loadView(view: string): Promise<void> {
-  if (loadedViews.has(view)) return;
+  // The symbol page is parameterised and intentionally never cached.
+  // The research page reports candidate state, which `shadow_advance.sh` changes
+  // outside this browser; a cached copy would claim "no candidates" long after
+  // one appeared.
+  if (!ALWAYS_FRESH.has(view) && loadedViews.has(view)) return;
   try {
     switch (view) {
-      case "overview/dashboard":
-      case "trading/account":
-        await loadCurve();
-        break;
       case "market/screener":
         await loadScreener();
         break;
-      case "market/data":
-        await loadCoverage();
+      case "research/candidates":
+        await loadCandidates();
         break;
+      case "market/detail": {
+        // Deliberately not cached: the symbol changes between visits, and a
+        // cached "already loaded" would leave the previous chart on screen.
+        await loadDetail(
+          byId<HTMLInputElement>("detail-input").value.trim().toUpperCase(),
+        );
+        break;
+      }
       default:
-        // Views backed by the account payload are already rendered by `load`.
         break;
     }
+    if (view === "market/detail") return; // never cached: symbol can change
     // Only mark as loaded once it actually succeeded. Marking on failure means
     // a view that raced the account load never retries, and it stays blank for
     // the rest of the session.
@@ -563,195 +226,92 @@ async function loadView(view: string): Promise<void> {
   }
 }
 
-// ---- equity curve ----------------------------------------------------------
+// ---- research candidates ---------------------------------------------------
 
-type CurvePointPayload = CurvePoint & {
-  profit_cents: number;
-  return_bps: number;
-  steady_return_bps: number;
-  aggressive_return_bps: number;
+type CandidateRow = {
+  candidate_id: string;
+  algorithm_id: string;
+  algorithm_version: string;
+  state: string;
+  created_day: string;
+  updated_day: string;
+  shadow_days: number;
 };
 
-type CurvePayload = {
-  account_id: string;
-  initial_cash_cents: number;
-  points: CurvePointPayload[];
-  summary: {
-    first_day: string | null;
-    last_day: string | null;
-    days: number;
-    equity_cents: number;
-    profit_cents: number;
-    return_bps: number;
-    max_drawdown_bps: number;
-    peak_day: string | null;
-    trough_day: string | null;
-    steady_return_bps: number;
-    aggressive_return_bps: number;
-    steady_cents: number;
-    aggressive_cents: number;
-  } | null;
+type HistoryRow = {
+  from: string;
+  to: string;
+  day: string;
+  allowed: boolean;
+  reasons: unknown;
+  shortfalls: unknown;
 };
 
-let curve: CurvePayload | null = null;
-let curveSeries: "total" | "steady" | "aggressive" = "total";
-let curveRange = "all";
-
-const drawdownPeriod = (summary: NonNullable<CurvePayload["summary"]>): string =>
-  summary.trough_day ? `${summary.peak_day ?? "初始本金"} → ${summary.trough_day}` : "尚无回撤";
-
-async function loadCurve(): Promise<void> {
-  try {
-    curve = await api<CurvePayload>("/v2/account/equity-curve");
-  } catch (error) {
-    // 404 means no account yet -- an expected state on the first visit, not a
-    // failure. Anything else is worth surfacing.
-    if (error instanceof ApiError && error.status === 404) {
-      curve = null;
-    } else {
-      throw error;
-    }
-  }
-  drawCurve();
-  drawCockpit();
+/**
+ * Why a candidate is not where its owner wants it.
+ *
+ * The gate's own shortfalls are shown verbatim rather than summarised: a
+ * reader who sees "ir_bps: 1 of 300" can judge the gap, while "not eligible"
+ * tells them nothing and invites a retry.
+ */
+function describeGate(history: HistoryRow[]): string {
+  const last = history[history.length - 1];
+  if (!last) return "还没有门禁记录";
+  if (last.allowed) return `允许：${last.from} → ${last.to}`;
+  const shortfalls = Array.isArray(last.shortfalls) ? last.shortfalls : [];
+  if (shortfalls.length === 0) return `拒绝：${last.from} → ${last.to}`;
+  return shortfalls
+    .map((item) => {
+      const row = item as { gate?: string; required?: number; actual?: number };
+      return `${row.gate ?? "?"} ${row.actual ?? "?"}/${row.required ?? "?"}`;
+    })
+    .join("；");
 }
 
 /**
- * The dashboard's compact copy of the curve.
- *
- * Same data, no controls: the dashboard is for glancing at, the account page is
- * for interrogating. Duplicating the fetch would mean the two could disagree.
+ * Bumped on every candidate render. `describeGate` awaits one request per row,
+ * so two renders can interleave: the second clears the table, the first then
+ * appends its rows to the cleared body. Without this guard the table shows
+ * every candidate twice.
  */
-function drawCockpit(): void {
-  if (!curve) {
-    const chart = document.getElementById("cockpit-chart");
-    if (chart && chart.childElementCount === 0) {
-      chart.innerHTML =
-        '<p class="chart-empty">还没有结算记录。到「交易 → 推进与结算」跑一天试试。</p>';
+let candidateRender = 0;
+
+async function loadCandidates(): Promise<void> {
+  const table = byTestId<HTMLTableElement>("research-table");
+  const empty = byTestId<HTMLElement>("research-empty");
+  const body = byId<HTMLTableSectionElement>("research-rows");
+  const generation = ++candidateRender;
+  const rows = await api<CandidateRow[]>("/v2/research/candidates");
+  if (generation !== candidateRender) return;
+  body.replaceChildren();
+  if (rows.length === 0) {
+    show(table, false);
+    show(empty, true);
+    return;
+  }
+  show(empty, false);
+  show(table, true);
+  for (const row of rows) {
+    let gate = "—";
+    try {
+      const history = await api<HistoryRow[]>(
+        `/v2/research/candidates/${encodeURIComponent(row.candidate_id)}/history`,
+      );
+      gate = describeGate(history);
+    } catch {
+      gate = "历史读取失败";
     }
-    return;
-  }
-  const summary = document.getElementById("cockpit-summary");
-  const chart = document.getElementById("cockpit-chart");
-  if (!summary || !chart) return;
-
-  const s = curve.summary;
-  if (!s || curve.points.length === 0) {
-    summary.innerHTML = "";
-    chart.innerHTML =
-      '<p class="chart-empty">还没有结算记录。到「交易 → 推进与结算」跑一天试试。</p>';
-    return;
-  }
-
-  summary.innerHTML = [
-    `<div class="curve-stat">
-       <span class="curve-stat-label">累计收益</span>
-       <strong class="${s.profit_cents >= 0 ? "pos" : "neg"}">${signedMoney(s.profit_cents)}</strong>
-       <span class="muted">${percent(s.return_bps)}</span>
-     </div>`,
-    `<div class="curve-stat">
-       <span class="curve-stat-label">最大回撤</span>
-       <strong class="neg">${percent(-s.max_drawdown_bps)}</strong>
-       <span class="muted">${drawdownPeriod(s)}</span>
-     </div>`,
-    `<div class="curve-stat">
-       <span class="curve-stat-label">稳健</span>
-       <strong class="${s.steady_return_bps >= 0 ? "pos" : "neg"}">${percent(s.steady_return_bps)}</strong>
-       <span class="muted">资产 ${moneyShort(s.steady_cents)} · 收益已剔除调配</span>
-     </div>`,
-    `<div class="curve-stat">
-       <span class="curve-stat-label">激进</span>
-       <strong class="${s.aggressive_return_bps >= 0 ? "pos" : "neg"}">${percent(s.aggressive_return_bps)}</strong>
-       <span class="muted">资产 ${moneyShort(s.aggressive_cents)} · 收益已剔除调配</span>
-     </div>`,
-  ].join("");
-
-  chart.innerHTML = renderCurve({
-    points: curve.points.slice(-120),
-    initialCents: curve.initial_cash_cents,
-    series: "total",
-    width: 900,
-    height: 200,
-  });
-}
-
-function drawCurve(): void {
-  if (!curve) {
-    // Nothing fetched yet (or the fetch failed). Say so rather than leaving an
-    // empty box the user cannot interpret.
-    const chart = document.getElementById("equity-chart");
-    if (chart && chart.childElementCount === 0) {
-      chart.innerHTML =
-        '<p class="chart-empty">还没有结算记录。到「交易 → 推进与结算」跑一天试试。</p>';
+    if (generation !== candidateRender) return;
+    const tr = document.createElement("tr");
+    for (const text of [row.candidate_id, `${row.algorithm_id}@${row.algorithm_version}`,
+                        row.state, String(row.shadow_days), gate]) {
+      const cell = document.createElement("td");
+      cell.textContent = text;
+      tr.appendChild(cell);
     }
-    return;
+    body.appendChild(tr);
   }
-  const summary = byId("curve-summary");
-  const chart = byId("equity-chart");
-  const bars = byId("daily-bars");
-
-  if (!curve.summary || curve.points.length === 0) {
-    summary.replaceChildren();
-    chart.innerHTML = renderCurve({
-      points: [],
-      initialCents: curve.initial_cash_cents,
-      series: curveSeries,
-      width: 900,
-      height: 260,
-    });
-    bars.replaceChildren();
-    return;
-  }
-
-  const take = curveRange === "all" ? curve.points.length : Number(curveRange);
-  const points = curve.points.slice(-take);
-  const s = curve.summary;
-
-  const stat = (label: string, value: string, tone: string, sub: string): string =>
-    `<div class="curve-stat">
-       <span class="curve-stat-label">${label}</span>
-       <strong class="${tone}">${value}</strong>
-       <span class="muted">${sub}</span>
-     </div>`;
-
-  summary.innerHTML = [
-    stat(
-      "累计收益",
-      signedMoney(s.profit_cents),
-      s.profit_cents >= 0 ? "pos" : "neg",
-      percent(s.return_bps),
-    ),
-    stat(
-      "最大回撤",
-      percent(-s.max_drawdown_bps),
-      "neg",
-      drawdownPeriod(s),
-    ),
-    stat(
-      "稳健",
-      percent(s.steady_return_bps),
-      s.steady_return_bps >= 0 ? "pos" : "neg",
-      `资产 ${moneyShort(s.steady_cents)} · 收益已剔除调配`,
-    ),
-    stat(
-      "激进",
-      percent(s.aggressive_return_bps),
-      s.aggressive_return_bps >= 0 ? "pos" : "neg",
-      `资产 ${moneyShort(s.aggressive_cents)} · 收益已剔除调配`,
-    ),
-    stat("样本", String(points.length), "", `个交易日，${s.first_day} 起`),
-  ].join("");
-
-  chart.innerHTML = renderCurve({
-    points,
-    initialCents: curve.initial_cash_cents,
-    series: curveSeries,
-    width: 900,
-    height: 260,
-  });
-  // The day-by-day strip only makes sense on the account curve; a single slot's
-  // per-day change is already visible as the curve's slope.
-  bars.innerHTML = curveSeries === "total" ? renderDailyBars(points, 900, 64) : "";
+  announce(`候选 ${rows.length} 个`);
 }
 
 // ---- market screener -------------------------------------------------------
@@ -800,7 +360,7 @@ async function fetchScreenerDay(day: string): Promise<void> {
 
 function renderScreener(): void {
   const filter = byId<HTMLInputElement>("screener-filter").value.trim().toUpperCase();
-  const body = byId("screener-body");
+  const body = byId<HTMLTableSectionElement>("screener-body");
   body.replaceChildren();
   const rows = filter
     ? screenerRows.filter(
@@ -829,114 +389,202 @@ function renderScreener(): void {
       if (cls) td.className = cls;
       tr.appendChild(td);
     }
+    // The list is a way in, not the destination: a row opens its own page so
+    // the K-line and gap markers are one click away.
+    tr.tabIndex = 0;
+    tr.dataset.symbol = row.symbol;
+    tr.addEventListener("click", () => openDetail(row.symbol));
+    tr.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") openDetail(row.symbol);
+    });
     body.appendChild(tr);
   }
   setTextById("screener-count", `${shown.length} / ${rows.length} 只`);
   show(byId("screener-empty"), rows.length === 0);
 }
 
-// ---- data coverage ---------------------------------------------------------
-
-async function loadCoverage(): Promise<void> {
-  const days = await api<{
-    days: string[];
-    count: number;
-    latest_day: string | null;
-    latest_symbol_count: number;
-  }>("/v2/market/days");
-
-  setTextById("cov-days", number(days.count));
-  setTextById("cov-first", days.days[0] ?? "—");
-  setTextById("cov-last", days.latest_day ?? "—");
-  setTextById("cov-symbols", number(days.latest_symbol_count));
-
-  if (!days.latest_day) {
-    show(byId("gaps-empty"), true);
-    return;
-  }
-  const gaps = await api<{ bars: Bar[]; count: number }>(
-    `/v2/market/gaps?day=${days.latest_day}`,
-  );
-  const body = byId("gaps-body");
-  body.replaceChildren();
-  for (const row of gaps.bars.slice(0, 200)) {
-    const tr = document.createElement("tr");
-    const change =
-      row.prev_close_cents > 0
-        ? ((row.close_cents - row.prev_close_cents) * 10_000) / row.prev_close_cents
-        : 0;
-    const cells: Array<[string, string]> = [
-      [row.symbol, ""],
-      [row.name, ""],
-      [money(row.prev_close_cents), "num-col"],
-      [money(row.close_cents), "num-col"],
-      [percent(change), "num-col " + (change >= 0 ? "pos" : "neg")],
-    ];
-    for (const [text, cls] of cells) {
-      const td = document.createElement("td");
-      td.textContent = text;
-      if (cls) td.className = cls;
-      tr.appendChild(td);
-    }
-    body.appendChild(tr);
-  }
-  setTextById("gaps-count", `${gaps.count} 只`);
-  show(byId("gaps-empty"), gaps.count === 0);
-}
-
 // ---- wiring ----------------------------------------------------------------
 
-async function runToDay(day: string): Promise<void> {
-  const line = byTestId("run-result");
+/** The report-copy control never mixes the retired daily account with the
+ *  intraday ledger; other modules still read their own daily report API. */
+async function loadReport(): Promise<void> {
+  if (parseHash(location.hash).module === "live") {
+    reportText = buildLiveReport();
+    announce("复盘已更新");
+    return;
+  }
+  setBusy(true);
   try {
-    const result = await post<RunResult>("/v2/account/run", { day });
-    render(result.account);
-    loadedViews.delete("trading/account");
-    line.textContent = describeRun(result);
-    line.dataset.state = result.rebalances.length > 0 ? "applied" : "held";
-    show(line, true);
-    announce(describeRun(result));
-  } catch (error) {
-    line.textContent = `推进失败：${errorDetail(error)}`;
-    line.dataset.state = "error";
-    show(line, true);
+    const report = await api<{ text?: string }>("/v2/account/daily-report");
+    reportText = report.text ?? "";
+    announce("复盘已更新");
+  } catch {
+    reportText = "";
+  } finally {
+    setBusy(false);
   }
 }
 
-byId("create-form").addEventListener("submit", (event) => void createAccount(event as SubmitEvent));
-byTestId("run-submit").addEventListener("click", () => void submitRun());
-byId("advance-day-submit").addEventListener("click", () => {
-  const day = byId<HTMLInputElement>("advance-day").value;
-  if (day) void runToDay(day);
-});
 byTestId("refresh").addEventListener("click", () => {
+  const route = parseHash(location.hash);
+  if (route.module === "live") {
+    void refreshLive(); // 盘中模块的刷新只调 live API，不触碰日线账户
+    return;
+  }
   loadedViews.clear();
-  void load().then(() => applyRoute(parseHash(location.hash)));
+  setBusy(true);
+  void Promise.allSettled([
+    loadReport(),
+    loadView(`${route.module}/${route.view}`),
+  ]).then(() => setBusy(false));
 });
-byTestId("retry").addEventListener("click", () => void load());
+const reportCopy = document.getElementById("report-copy");
+if (reportCopy) {
+  reportCopy.addEventListener("click", async () => {
+    if (!reportText) await loadReport();
+    if (!reportText) return;
+    try {
+      await navigator.clipboard.writeText(reportText);
+      reportCopy.textContent = "已复制";
+      setTimeout(() => {
+        reportCopy.textContent = "复制复盘";
+      }, 1500);
+    } catch {
+      reportCopy.textContent = "复制失败";
+    }
+  });
+}
+byId("detail-load").addEventListener("click", () => {
+  const symbol = byId<HTMLInputElement>("detail-input").value.trim().toUpperCase();
+  void loadDetail(symbol);
+});
+byId<HTMLInputElement>("detail-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    const symbol = byId<HTMLInputElement>("detail-input").value.trim().toUpperCase();
+    void loadDetail(symbol);
+  }
+});
 byTestId("theme-toggle").addEventListener("click", theme);
 
-for (const button of document.querySelectorAll<HTMLButtonElement>(".seg-btn")) {
-  button.addEventListener("click", () => {
-    curveSeries = (button.dataset.series as typeof curveSeries) ?? "total";
-    for (const other of document.querySelectorAll(".seg-btn")) {
-      other.classList.toggle("active", other === button);
-    }
-    drawCurve();
-  });
+function openDetail(symbol: string): void {
+  byId<HTMLInputElement>("detail-input").value = symbol;
+  // Navigation in this app pushes the hash and then applies the route
+  // explicitly: `history.pushState` does not fire `hashchange`, so relying on
+  // the router callback would leave the old view rendered.
+  loadedViews.delete("market/detail");
+  const next: Route = { module: "market", view: "detail" };
+  pushHash(next);
+  applyRoute(next);
 }
 
-for (const chip of document.querySelectorAll<HTMLButtonElement>(".chip[data-range]")) {
-  chip.addEventListener("click", () => {
-    curveRange = chip.dataset.range ?? "all";
-    for (const other of document.querySelectorAll(".chip[data-range]")) {
-      other.classList.toggle("active", other === chip);
+async function loadDetail(symbol: string): Promise<void> {
+  const chart = byId("detail-chart");
+  const empty = byTestId("detail-empty");
+  if (!symbol) {
+    chart.replaceChildren();
+    setText("detail-symbol", "—");
+    for (const id of ["detail-close", "detail-change", "detail-range", "detail-days"]) setText(id, "—");
+    show(empty, true);
+    return;
+  }
+  setText("detail-symbol", symbol);
+  let rows: Bar[];
+  try {
+    const payload = await api<{ bars: Bar[] }>(
+      `/v2/market/bars/${encodeURIComponent(symbol)}`,
+    );
+    rows = payload.bars;
+  } catch (error) {
+    // A 404 here is a normal answer ("that code is not ingested"), not a
+    // service failure: say which code is missing rather than "加载失败".
+    const missing = error instanceof ApiError && error.status === 404;
+    chart.replaceChildren();
+    setText("detail-close", "—");
+    setText("detail-change", "—");
+    setText("detail-range", "—");
+    setText("detail-days", "0");
+    empty.textContent = missing ? `没有 ${symbol} 的入库行情。` : `加载失败：${errorDetail(error)}`;
+    show(empty, true);
+    return;
+  }
+  show(empty, rows.length === 0);
+  if (rows.length === 0) return;
+  empty.textContent = "输入代码查看个股走势。";
+
+  const closes = rows.map((row) => row.close_cents);
+  const last = closes[closes.length - 1];
+  const first = closes[0];
+  const high = Math.max(...closes);
+  const low = Math.min(...closes);
+  setText("detail-close", money(last));
+  setText("detail-change", first > 0 ? percent(((last - first) * 10_000) / first) : "—");
+  setText("detail-range", `${money(high)} / ${money(low)}`);
+  setText("detail-days", String(rows.length));
+
+  // Gaps are drawn as a break, never a solid bar: an ex-dividend or split
+  // session is not a real move and must not look like one.
+  const gaps = new Set<string>();
+  for (let index = 1; index < rows.length; index += 1) {
+    const prev = rows[index - 1].close_cents;
+    const current = rows[index].close_cents;
+    if (prev > 0 && Math.abs(current - prev) * 10_000 / prev > 1_500) {
+      gaps.add(rows[index].day);
     }
-    drawCurve();
-  });
+  }
+  chart.replaceChildren(buildLine(closes, gaps, rows.map((row) => row.day)));
 }
 
-// Load the account first, then start routing: `applyRoute` needs `current` to
-// decide whether a view can render or the create panel should show instead.
-void load().then(() => installRouter((route) => applyRoute(route)));
+function buildLine(values: number[], gaps: Set<string>, days: string[]): SVGSVGElement {
+  const width = 720;
+  const height = 200;
+  const padX = 8;
+  const padY = 12;
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = Math.max(max - min, 1);
+  const x = (index: number): number =>
+    padX + ((width - padX * 2) * index) / Math.max(values.length - 1, 1);
+  const y = (value: number): number =>
+    padY + (height - padY * 2) * (1 - (value - min) / span);
 
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", "100%");
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "收盘价走势");
+
+  let path = "";
+  let pen = false;
+  values.forEach((value, index) => {
+    if (gaps.has(days[index])) pen = false; // lift the pen across the gap
+    path += `${pen ? "L" : "M"}${x(index).toFixed(1)},${y(value).toFixed(1)} `;
+    pen = true;
+  });
+  const line = document.createElementNS(ns, "path");
+  line.setAttribute("d", path.trim());
+  line.setAttribute("fill", "none");
+  line.setAttribute("stroke", "var(--chart-1, #4f8cff)");
+  line.setAttribute("stroke-width", "1.6");
+  line.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(line);
+
+  for (const [index, day] of days.entries()) {
+    if (!gaps.has(day)) continue;
+    const mark = document.createElementNS(ns, "circle");
+    mark.setAttribute("cx", x(index).toFixed(1));
+    mark.setAttribute("cy", y(values[index]).toFixed(1));
+    mark.setAttribute("r", "3");
+    mark.setAttribute("fill", "var(--muted-foreground, #999)");
+    const title = document.createElementNS(ns, "title");
+    title.textContent = `${day} 缺口（除权/拆股），不连成实线`;
+    mark.appendChild(title);
+    svg.appendChild(mark);
+  }
+  return svg;
+}
+
+// Startup needs no daily account round-trip: live views fetch /v2/live/* on
+// first render, while market and research load their own read models per route.
+installRouter((route) => applyRoute(route));

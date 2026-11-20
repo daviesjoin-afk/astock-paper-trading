@@ -409,6 +409,9 @@ mod tests {
             day: "2026-11-10".into(),
             close_cents,
             volume: 0,
+            open_cents: 0,
+            high_cents: 0,
+            low_cents: 0,
             tradable,
         };
         let by_symbol = closes_by_symbol(

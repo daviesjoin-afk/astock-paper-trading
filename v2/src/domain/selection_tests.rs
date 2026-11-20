@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::*;
 
 fn signal(symbol: &str, score: i64) -> (String, SignalScore) {
-    (symbol.into(), SignalScore { score, reason: "selection_fixture" })
+    (symbol.into(), SignalScore { score, reason: "selection_fixture", short_window: false })
 }
 
 fn book() -> SlotBook {
@@ -192,4 +192,60 @@ fn exits_do_not_pre_spend_sale_proceeds_or_free_a_position_early() {
         assert_eq!(orders[0].side, "sell");
         assert_eq!(orders[0].symbol, "600000.SH");
     }
+}
+
+#[test]
+fn a_stronger_score_gets_a_larger_share_of_its_target() {
+    // Measured: aggressive entries scoring >=96 averaged +153 bps, those under
+    // 90 averaged -103. A flat target sizes both the same, so the spread never
+    // reaches the account.
+    let mut policy = SlotPolicy::for_strategy(StrategyId::Aggressive);
+    policy.max_positions = 3;
+    policy.target_weight_bps = 1_500;
+    policy.score_tiers = vec![(96, 20_000), (0, 10_000)];
+    let closes = prices(&["600000.SH"]);
+
+    let strong = orders_for_day_in(
+        StrategyId::Aggressive, &policy, &[], &[signal("600000.SH", 98)],
+        5_000_000, 5_000_000, &closes, &closes, &[],
+    );
+    let weak = orders_for_day_in(
+        StrategyId::Aggressive, &policy, &[], &[signal("600000.SH", 70)],
+        5_000_000, 5_000_000, &closes, &closes, &[],
+    );
+    // Whole lots at a 1000 price, with commission: the top tier's 1,500,000
+    // fills exactly, while the base tier's 750,000 steps down to 700 shares.
+    assert_eq!(strong[0].quantity * closes["600000.SH"], 1_500_000,
+               "the top tier doubles the target");
+    assert_eq!(weak[0].quantity * closes["600000.SH"], 700_000,
+               "the base tier uses the plain target");
+}
+
+#[test]
+fn an_empty_tier_list_keeps_every_entry_at_the_full_target() {
+    // The steady slot carries no tiers; its sizing must not change.
+    let mut policy = SlotPolicy::for_strategy(StrategyId::Steady);
+    policy.max_positions = 3;
+    policy.score_tiers = Vec::new();
+    let closes = prices(&["600000.SH"]);
+    let orders = orders_for_day_in(
+        StrategyId::Steady, &policy, &[], &[signal("600000.SH", 60)],
+        5_000_000, 5_000_000, &closes, &closes, &[],
+    );
+    assert_eq!(orders[0].quantity * closes["600000.SH"], 700_000);
+}
+
+#[test]
+fn the_highest_matching_tier_wins() {
+    // Tiers are declared highest-first; a score clearing several takes the first.
+    let mut policy = SlotPolicy::for_strategy(StrategyId::Aggressive);
+    policy.max_positions = 3;
+    policy.target_weight_bps = 1_000;
+    policy.score_tiers = vec![(96, 30_000), (90, 20_000), (0, 10_000)];
+    let closes = prices(&["600000.SH"]);
+    let orders = orders_for_day_in(
+        StrategyId::Aggressive, &policy, &[], &[signal("600000.SH", 97)],
+        5_000_000, 5_000_000, &closes, &closes, &[],
+    );
+    assert_eq!(orders[0].quantity * closes["600000.SH"], 1_500_000);
 }

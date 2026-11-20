@@ -276,3 +276,55 @@ value:1947bcd4aec1c256c70a205b0b32347555226a36
 value:c8fd370a3109b2d14a121e3a32a86e9c8354b01b
 value:e99ae34382d970c68654c6d17c45512e728f130d
 value:8217a4ec593e7bf6c9cf32a1aa74b711e7baa720
+
+# Full a-stock-data public reference layer (2026-11-15). Exact published vendor
+# hosts from the pinned SKILL.md routes: news/disclosures, macro/rates, indices
+# and commodity exchanges. No private service host, path-wide exception or IP.
+host:openapi.iwencai.com
+host:www.iwencai.com
+host:pdf.dfcfw.com
+host:www.cls.cn
+host:api-one-wscn.awtmt.com
+host:tv.cctv.com
+host:quotes.sina.cn
+host:www.swsresearch.com
+host:irm.cninfo.com.cn
+host:sns.sseinfo.com
+host:www.pbc.gov.cn
+host:www.stats.gov.cn
+host:yield.chinabond.com.cn
+host:www.chinamoney.com.cn
+host:oss-ch.csindex.com.cn
+host:www.cnindex.com.cn
+host:www.shfe.com.cn
+host:www.ine.cn
+host:www.czce.com.cn
+host:www.cffex.com.cn
+host:www.gfex.com.cn
+host:www.sge.com.cn
+# Public product/social documentation links retained for upstream attribution.
+host:www.workbuddy.cn
+host:muse.ai
+host:x.ai
+host:x.com
+# RFC 2606 example placeholders in offline upstream tests, never real hosts.
+host:official.example
+host:sina.example
+# Original public source SHA-256, not a credential. The derived mirror has its
+# own checked digest and modifications; neither replaces source attribution.
+value:304e7cc270b595c3031b3c9bd5431d6617ae684b66396092bebbc9f8622f60a6
+
+# Published Eastmoney browser-client ut selectors in pinned source sections
+# for limit-up/market-statistics APIs; constant public data-flow identifiers,
+# not a user credential or authentication exemption. Exact values only.
+value:7eea3edcaed734bea9cbfc24409ed989
+value:f057cbcbce2a86e2866ab8877db1d059
+
+# Exact SHA-256 of the reviewable publication derivative of pinned upstream
+# SKILL.md; recomputed by astock_public/refresh_upstream.py, not a credential.
+value:072ca0857c48212d7220a97744ab2f7dcc86b7d622e1139de44df954ba49c799
+
+# Public Git commit references cited in historical V2 documentation.
+value: 284fd2106ce520ac1021e126edef8edcc090d11e
+value: 78228e03cda03aece0ef5b5378f7ee19c2f70bf7
+value: 9949fd5cb6a3111ae9e85c7d15a73c81c98379cd

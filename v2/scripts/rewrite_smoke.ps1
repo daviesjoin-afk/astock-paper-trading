@@ -5,7 +5,7 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$work = Join-Path $env:TEMP ("astock-v2-rewrite-" + [guid]::NewGuid().ToString("N"))
+$work = Join-Path $root ("work\p0-rewrite-smoke-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path (Join-Path $work "prices") | Out-Null
 
 try {
