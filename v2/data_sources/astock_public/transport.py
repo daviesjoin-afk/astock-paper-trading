@@ -333,6 +333,12 @@ class UrllibRequestShim(types.ModuleType):
         self._dispatch = dispatch
         self.Request = urllib.request.Request
         self.urlopen = self._urlopen
+        # Preserve pure parsing/proxy helpers so optional libraries (e.g.
+        # mootdx -> httpx) can import under the shim without opening sockets.
+        self.parse_http_list = urllib.request.parse_http_list
+        self.parse_keqv_list = urllib.request.parse_keqv_list
+        self.getproxies = urllib.request.getproxies
+        self.proxy_bypass = urllib.request.proxy_bypass
         # Preserve real error types so upstream exception clauses remain valid.
         self.HTTPError = urllib.error.HTTPError
         self.URLError = urllib.error.URLError

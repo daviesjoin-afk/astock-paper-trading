@@ -310,9 +310,23 @@ class TransportInjectionTests(unittest.TestCase):
             client = PublicClient(http=http)
             response = client.call("_v39_http", "https://example.test/missing", allow_status=(404,))
             self.assertEqual(response.status_code, 404)
-            with self.assertRaises(ValueError):
-                client.query("bars.tdx_daily_package", "2021-01-04")
-        self.assertEqual(len(calls), 2)
+            if importlib.util.find_spec("pandas") is not None:
+                with self.assertRaises(ValueError):
+                    client.query("bars.tdx_daily_package", "2021-01-04")
+                self.assertEqual(len(calls), 2)
+            else:
+                with self.assertRaises(CapabilityError) as caught:
+                    client.query("bars.tdx_daily_package", "2021-01-04")
+                self.assertEqual(caught.exception.code, "optional_dependency_missing")
+                self.assertEqual(len(calls), 1)
+
+    def test_urllib_shim_exposes_pure_helpers_while_blocking_egress(self):
+        from astock_public.transport import build_denied_transport, import_overrides
+        with import_overrides(build_denied_transport()):
+            from urllib.request import parse_http_list, urlopen
+            self.assertEqual(parse_http_list("a, b"), ["a", "b"])
+            with self.assertRaises(Exception):
+                urlopen("https://example.test/blocked")
 
 
 class PublicationDerivativeTests(unittest.TestCase):
