@@ -1,0 +1,24 @@
+[Unit]
+Description=AStock V2 intraday paper-trading kernel
+Documentation=https://github.com/daviesjoin-afk/astock-paper-trading/blob/master/v2/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astock
+Group=astock
+WorkingDirectory=/opt/astock-live
+EnvironmentFile=/etc/astock-live.env
+ExecStart=/opt/astock-live/bin/astock-v2
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/astock-live
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

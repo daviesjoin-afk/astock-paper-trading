@@ -1,0 +1,27 @@
+# The scheduler keeps running the Python loop because Rust `live-loop`
+# deliberately rejects `--ai on`, and `intraday_evolution.py` imports this
+# module. Switch to `astock-v2 live-loop --ai off` only after AI advice moves.
+[Unit]
+Description=AStock V2 intraday quote feed, AI observer and 3-minute scheduler
+After=network-online.target astock-live.service
+Wants=network-online.target
+Requires=astock-live.service
+
+[Service]
+Type=simple
+User=astock
+Group=astock
+WorkingDirectory=/opt/astock-live
+EnvironmentFile=/etc/astock-live.env
+ExecStart=/usr/bin/python3 scripts/live_paper_loop.py --api http://127.0.0.1:18765 --universe /opt/astock-live/live-a-universe.txt --history-db /opt/astock-live/history-closes.json --interval 180 --ai on --timezone Asia/Shanghai
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/astock-live /opt/astock-live/work
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

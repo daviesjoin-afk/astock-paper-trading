@@ -12,12 +12,12 @@ EnvironmentFile=/etc/astock-v2-rewrite.env
 ExecStart=/opt/astock-v2-rewrite/bin/astock-v2
 Restart=on-failure
 RestartSec=3
-StateDirectory=astock-v2-rewrite
+StateDirectory=__STATE_DIR__
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/astock-v2-rewrite /var/backups/astock-v2-rewrite
+ReadWritePaths=__STATE_PATH__ __BACKUP_PATH__
 AmbientCapabilities=
 
 [Install]

@@ -60,7 +60,14 @@ struct Options {
 impl Options {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut options = Self {
-            universe: PathBuf::from("work/live-a-universe.txt"),
+            // Deployments export ASTOCK_UNIVERSE (see /etc/astock-live.env); the
+            // repository-relative path is only the developer default. Without
+            // this, running the command from an install directory failed with
+            // "cannot read universe work/live-a-universe.txt".
+            universe: std::env::var_os("ASTOCK_UNIVERSE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("work/live-a-universe.txt")),
             history: std::env::var_os("ASTOCK_HISTORY_DB")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),

@@ -3,9 +3,13 @@
 # Never enables or starts anything implicitly: review, then `systemctl enable --now`.
 set -euo pipefail
 
+# Installs the review-only service (`astock-live`). The intraday deployment
+# uses PREFIX=/opt/astock-live ENV_FILE=/etc/astock-live.env.
 PREFIX="${PREFIX:-/opt/astock-v2-rewrite}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 ENV_FILE="${ENV_FILE:-/etc/astock-v2-rewrite.env}"
+UNIT_NAME="${UNIT_NAME:-astock-v2-rewrite}"
+STATE_DIR="${STATE_DIR:-astock-v2-rewrite}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WEB_SRC="${WEB_SRC:-$REPO/v2/web/dist}"
 BIN_SRC="${BIN_SRC:-$REPO/v2/target/release/astock-v2}"
@@ -32,7 +36,10 @@ for legacy in ingest_market.py realtime_quotes.py; do
   fi
 done
 
-install -m 0644 "$REPO/v2/deploy/astock-v2.service" "$UNIT_DIR/astock-v2-rewrite.service"
+# The unit file hard-codes PREFIX and ENV_FILE, so rewrite them for the
+# chosen install root instead of shipping a template that points elsewhere.
+sed -e "s#/opt/astock-v2-rewrite#$PREFIX#g"     -e "s#/etc/astock-v2-rewrite.env#$ENV_FILE#g"     -e "s#__STATE_DIR__#$STATE_DIR#g"     -e "s#__STATE_PATH__#/var/lib/$STATE_DIR#g"     -e "s#__BACKUP_PATH__#/var/backups/$STATE_DIR#g"     "$REPO/v2/deploy/astock-v2.service" > "$UNIT_DIR/$UNIT_NAME.service"
+chmod 0644 "$UNIT_DIR/$UNIT_NAME.service"
 if [ ! -f "$ENV_FILE" ]; then
   install -m 0640 -o root -g astock "$REPO/v2/deploy/astock-v2.env.example" "$ENV_FILE"
   echo "wrote $ENV_FILE (edit before starting)"
@@ -46,4 +53,4 @@ fi
 echo "installed binary -> $PREFIX/bin/astock-v2"
 echo "installed console -> $PREFIX/web"
 echo "next: edit $ENV_FILE, install v2/deploy/nginx.conf as astock-v2-rewrite.conf,"
-echo "      then systemctl daemon-reload && systemctl enable --now astock-v2-rewrite"
+echo "      then systemctl daemon-reload && systemctl enable --now $UNIT_NAME"

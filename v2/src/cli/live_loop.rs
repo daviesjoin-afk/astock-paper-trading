@@ -11,6 +11,13 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_API: &str = "http://127.0.0.1:8765";
+
+/// Read a non-empty environment value, treating `""` as unset.
+fn env_path(name: &str) -> Option<String> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
+}
 const DEFAULT_INTERVAL: u64 = 180;
 const DEFAULT_BATCH: usize = 800;
 // The watchdog allows seven minutes: two default three-minute polls plus one
@@ -27,8 +34,8 @@ const AFTERNOON_CLOSE: NaiveTime = market_time(15, 0);
 const HELP: &str = "Usage: astock-v2 live-loop [OPTIONS]
 
 Options:
-  --api URL           Kernel base URL (default: http://127.0.0.1:8765)
-  --universe PATH     Symbol list (default: v2/work/live-a-universe.txt)
+  --api URL           Kernel base URL (default: $ASTOCK_API, else :8765)
+  --universe PATH     Symbol list (default: $ASTOCK_UNIVERSE, else work/...)
   --history-db PATH   Optional SQLite bar database (default: ASTOCK_HISTORY_DB)
   --calendar PATH     Trading calendar JSON (default: bundled 2026 SH/SZ schedule)
   --interval SECONDS  Polling interval (default: 180)
@@ -68,8 +75,16 @@ impl Config {
     fn parse(args: &[String]) -> Result<Option<Self>, String> {
         let work = Path::new("work");
         let mut config = Self {
-            api: DEFAULT_API.into(),
-            universe: work.join("live-a-universe.txt"),
+            // ASTOCK_API / ASTOCK_UNIVERSE are what the deployed unit and env
+            // file already set; honouring them keeps a bare `live-loop` from
+            // talking to 8765 while the kernel listens on 18765.
+            api: env_path("ASTOCK_API")
+                .unwrap_or_else(|| DEFAULT_API.to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
+            universe: env_path("ASTOCK_UNIVERSE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| work.join("live-a-universe.txt")),
             history_db: std::env::var_os("ASTOCK_HISTORY_DB")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
@@ -654,6 +669,31 @@ mod tests {
             "quote_time_estimated": false,
             "quotes": [{"symbol": "600000.SH", "price_cents": 1010, "tradable": false}],
         })
+    }
+
+    #[test]
+    fn api_and_universe_defaults_come_from_the_deployment_environment() {
+        // The installed unit exports these; a bare invocation must not fall
+        // back to 8765, which is a different service.
+        unsafe {
+            std::env::set_var("ASTOCK_API", "http://127.0.0.1:18765/");
+            std::env::set_var("ASTOCK_UNIVERSE", "/opt/astock-live/live-a-universe.txt");
+        }
+        let parsed = config(&["--once"]);
+        assert_eq!(parsed.api, "http://127.0.0.1:18765");
+        assert_eq!(
+            parsed.universe,
+            Path::new("/opt/astock-live/live-a-universe.txt")
+        );
+        // An explicit flag still wins over the environment.
+        let explicit = config(&["--once", "--api", "http://127.0.0.1:9999"]);
+        assert_eq!(explicit.api, "http://127.0.0.1:9999");
+        unsafe {
+            std::env::remove_var("ASTOCK_API");
+            std::env::remove_var("ASTOCK_UNIVERSE");
+        }
+        let fallback = config(&["--once"]);
+        assert_eq!(fallback.api, "http://127.0.0.1:8765");
     }
 
     #[test]

@@ -135,7 +135,55 @@ fn snapshot(source: &Path, staged: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse to replace a database that a live process still has open.
+///
+/// `rename(2)` over an open SQLite file succeeds on Linux, so `--force` would
+/// swap the directory entry while the service keeps writing the *old* inode:
+/// every post-restore write goes to a file nobody reads any more. On Windows
+/// the open handle already blocks the replace, which is why this guard has to
+/// be explicit. A missing `lsof` is not treated as proof of safety on POSIX;
+/// the operator then has to pass `--force` with the service stopped.
+fn database_in_use(target: &Path) -> Result<bool, String> {
+    let path = target.to_str().ok_or("non-UTF-8 database path")?;
+    let output = std::process::Command::new("lsof")
+        .args(["-t", "--", path])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(!output.stdout.is_empty()),
+        Ok(output) => {
+            // Exit 1 means "no open file"; anything else (no permission, ...)
+            // must not be read as "safe to overwrite".
+            if output.status.code() == Some(1) {
+                Ok(false)
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn check_destination(source: &Path, target: &Path, force: bool, label: &str) -> Result<(), i32> {
+    if target.exists() {
+        match database_in_use(target) {
+            Ok(true) => {
+                eprintln!(
+                    "error: {label} {} is still open by another process; stop the service before replacing it",
+                    target.display()
+                );
+                return Err(2);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!(
+                    "error: cannot check whether {} is in use: {error}",
+                    target.display()
+                );
+                return Err(2);
+            }
+        }
+    }
     match fs::symlink_metadata(target) {
         Ok(_) if !force => {
             eprintln!(

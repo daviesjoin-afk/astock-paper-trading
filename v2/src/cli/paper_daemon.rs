@@ -19,7 +19,7 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(900);
 const HELP: &str = "Usage: astock-v2 paper-daemon --db PATH [OPTIONS]
 
   --db PATH           Existing V2 market database (required)
-  --api URL           Kernel base URL (default: http://127.0.0.1:8765)
+  --api URL           Kernel base URL (default: $ASTOCK_API, else :8765)
   --interval SECONDS  Positive seconds between cycles (default: 900)
   --once              Run one cycle and exit
   --no-settle         Ingest without advancing the account";
@@ -35,7 +35,10 @@ struct Config {
 impl Config {
     fn parse(args: &[String]) -> Result<Option<Self>, String> {
         let mut db = None;
-        let mut api = DEFAULT_API.to_owned();
+        let mut api = std::env::var_os("ASTOCK_API")
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| DEFAULT_API.to_owned());
         let mut interval = DEFAULT_INTERVAL;
         let mut once = false;
         let mut no_settle = false;
