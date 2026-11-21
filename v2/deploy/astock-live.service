@@ -3,6 +3,8 @@ Description=AStock V2 intraday paper-trading kernel
 Documentation=https://github.com/daviesjoin-afk/astock-paper-trading/blob/master/v2/deploy/README.md
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
