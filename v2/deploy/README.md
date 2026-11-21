@@ -140,8 +140,34 @@ sudo /opt/astock-v2-rewrite/bin/astock-v2 db backup \
 - 旧 schema 不迁移：保留旧库，新库重新开始。
 
 
-## 盘中巡查与收盘研究
+## 线上盘中服务与收盘研究
 
-`astock-live-watch.*` 和 `astock-live-evolution.*` 是安装模板。使用前，请按自己的部署调整服务文件中的程序、账本、日历与配置文件路径。
-如需启用模型，请在服务环境中设置 `ASTOCK_LLM_BASE`、`ASTOCK_LLM_MODEL` 和 `ASTOCK_LLM_KEY`。未配置模型地址时，盘中建议走中性回退。
-本地测试使用隔离账本和行情样本。
+线上盘中内核是 `/opt/astock-live/bin/astock-v2`，监听 `127.0.0.1:18765`。
+nginx 的 8600 入口从 `/opt/astock-v2-rewrite/web` 提供静态文件，并将 `/v2/` 转发给内核。
+更新线上盘中组件时，内核和静态文件分别部署到这两个路径。前文的 `install.sh`
+用于独立的日线环境，线上盘中服务使用本目录的 `astock-live.*` 单元。
+
+`astock-live-evolution.service` 通过 `--kernel /opt/astock-live/bin/astock-v2`
+调用 `replay-intraday`。回放只从标准输入读取研究样本，使用内存账本，跟随内核版本。
+进化脚本和对应的 `live_ai.py`、`live_quote_feed.py` 一起安装到
+`/opt/astock-live-evolution/scripts/`。现有研究文件仍放在 `/var/lib/astock-live-evolution`。
+
+正常交易时段，先用线上股票池和日历观察 Rust 接受的有源时间行情数量：
+
+```bash
+sudo -u astock /opt/astock-live/bin/astock-v2 live-loop --once --observe-only \
+  --calendar /opt/astock-live/data/calendar-2026-v1.json \
+  --universe /opt/astock-live/live-a-universe.txt \
+  --log /opt/astock-live/work/live/quote-preflight.log
+```
+
+比对 `sample_count` 和 `universe_count`，并确认早盘、午后覆盖符合实际行情。
+通过后，将现有盘中循环单元的 `ExecStart` 换成下面的命令，确认只有一个盘中循环在提交轮次：
+
+```ini
+ExecStart=/opt/astock-live/bin/astock-v2 live-loop --api http://127.0.0.1:18765 --universe /opt/astock-live/live-a-universe.txt --history-db /opt/astock-live/history-closes.json --calendar /opt/astock-live/data/calendar-2026-v1.json --interval 180 --ai on --ai-script /opt/astock-live/scripts/live_ai.py --log /opt/astock-live/work/live/intraday-loop.log
+```
+
+通过 systemd drop-in 替换 `ExecStart` 时，先添加空的 `ExecStart=`。模型设置继续从
+`/etc/astock-live.env` 读取。部署 `live_ai.py` 时在同目录提供 `live_quote_feed.py`。
+模型超时或不可用时使用空建议，行情在模型返回时已经过期则跳过轮次。

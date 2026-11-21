@@ -1,6 +1,7 @@
 //! Read-only host probe for the scheduled V2 paper account.
 
-use super::live_loop::{LIVE_GRACE, load_calendar, shanghai};
+use super::LIVE_GRACE;
+use super::live_loop::{load_calendar, shanghai};
 use crate::domain::{CalendarDay, TradingCalendar};
 use chrono::{DateTime, FixedOffset, NaiveTime, SecondsFormat, Utc};
 use serde::Deserialize;

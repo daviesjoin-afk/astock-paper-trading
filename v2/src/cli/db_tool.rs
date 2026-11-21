@@ -135,56 +135,8 @@ fn snapshot(source: &Path, staged: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse to replace a database that a live process still has open.
-///
-/// `rename(2)` over an open SQLite file succeeds on Linux, so `--force` would
-/// swap the directory entry while the service keeps writing the *old* inode:
-/// every post-restore write goes to a file nobody reads any more. On Windows
-/// the open handle already blocks the replace, which is why this guard has to
-/// be explicit. A missing `lsof` is not treated as proof of safety on POSIX;
-/// the operator then has to pass `--force` with the service stopped.
-fn database_in_use(target: &Path) -> Result<bool, String> {
-    let path = target.to_str().ok_or("non-UTF-8 database path")?;
-    let output = std::process::Command::new("lsof")
-        .args(["-t", "--", path])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => Ok(!output.stdout.is_empty()),
-        Ok(output) => {
-            // Exit 1 means "no open file"; anything else (no permission, ...)
-            // must not be read as "safe to overwrite".
-            if output.status.code() == Some(1) {
-                Ok(false)
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn check_destination(source: &Path, target: &Path, force: bool, label: &str) -> Result<(), i32> {
-    if target.exists() {
-        match database_in_use(target) {
-            Ok(true) => {
-                eprintln!(
-                    "error: {label} {} is still open by another process; stop the service before replacing it",
-                    target.display()
-                );
-                return Err(2);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!(
-                    "error: cannot check whether {} is in use: {error}",
-                    target.display()
-                );
-                return Err(2);
-            }
-        }
-    }
-    match fs::symlink_metadata(target) {
+fn check_destination(source: &Path, target: &Path, force: bool, label: &str) -> Result<bool, i32> {
+    let exists = match fs::symlink_metadata(target) {
         Ok(_) if !force => {
             eprintln!(
                 "refusing to overwrite {label}: {} (use --force)",
@@ -193,7 +145,7 @@ fn check_destination(source: &Path, target: &Path, force: bool, label: &str) -> 
             return Err(3);
         }
         Ok(metadata) => {
-            if !metadata.is_file() || fs::canonicalize(source).ok() == fs::canonicalize(target).ok()
+            if !metadata.is_file() || !matches!(same_file::is_same_file(source, target), Ok(false))
             {
                 eprintln!(
                     "error: destination must be a separate regular file: {}",
@@ -201,13 +153,14 @@ fn check_destination(source: &Path, target: &Path, force: bool, label: &str) -> 
                 );
                 return Err(2);
             }
+            true
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => {
             eprintln!("error: cannot inspect destination: {error}");
             return Err(2);
         }
-    }
+    };
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = target.as_os_str().to_os_string();
         sidecar.push(suffix);
@@ -222,7 +175,29 @@ fn check_destination(source: &Path, target: &Path, force: bool, label: &str) -> 
             }
         }
     }
-    Ok(())
+    Ok(exists)
+}
+
+/// Keep the destination inode and let SQLite acquire its own write lock and
+/// commit or roll back the replacement. A file-level rename can orphan a
+/// connection that opens the destination after a separate occupancy probe.
+fn replace_database(staged: &Path, target: &Path) -> Result<(), String> {
+    let source = Connection::open_with_flags(staged, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let mut destination = Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|error| error.to_string())?;
+    destination
+        .busy_timeout(std::time::Duration::ZERO)
+        .map_err(|error| error.to_string())?;
+    destination
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| error.to_string())?;
+    let copy = rusqlite::backup::Backup::new(&source, &mut destination)
+        .map_err(|error| error.to_string())?;
+    match copy.step(-1).map_err(|error| error.to_string())? {
+        rusqlite::backup::StepResult::Done => Ok(()),
+        _ => Err("destination database is busy or locked".into()),
+    }
 }
 
 fn publish_snapshot(source: &Path, target: &Path, force: bool, restore: bool) -> Result<(), i32> {
@@ -245,14 +220,6 @@ fn publish_snapshot(source: &Path, target: &Path, force: bool, restore: bool) ->
         1
     })?;
     let facts = require_ok(&staged, label)?;
-    let digest = if restore {
-        None
-    } else {
-        Some(sha256_file(&staged).map_err(|error| {
-            eprintln!("error: failed to hash backup: {error}");
-            2
-        })?)
-    };
     fs::OpenOptions::new()
         .write(true)
         .open(&staged)
@@ -261,21 +228,28 @@ fn publish_snapshot(source: &Path, target: &Path, force: bool, restore: bool) ->
             eprintln!("error: failed to sync snapshot: {error}");
             2
         })?;
-    check_destination(source, target, force, label)?;
-    let published = if force {
-        fs::rename(&staged, target)
-    } else {
-        fs::hard_link(&staged, target)
-    };
-    published.map_err(|error| {
-        eprintln!("error: failed to publish {label}: {error}");
-        if !force && error.kind() == io::ErrorKind::AlreadyExists {
-            3
-        } else {
+    let existing = check_destination(source, target, force, label)?;
+    if existing {
+        require_ok(target, label)?;
+        replace_database(&staged, target).map_err(|error| {
+            eprintln!("error: cannot replace {label} via SQLite: {error}");
             2
-        }
-    })?;
-    if let Some(digest) = digest {
+        })?;
+    } else {
+        fs::hard_link(&staged, target).map_err(|error| {
+            eprintln!("error: failed to publish {label}: {error}");
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                3
+            } else {
+                2
+            }
+        })?;
+    }
+    if !restore {
+        let digest = sha256_file(target).map_err(|error| {
+            eprintln!("error: failed to hash backup: {error}");
+            2
+        })?;
         println!(
             "backup ok schema={} accounts={} settled_days={} out={} sha256={digest}",
             facts.schema_version,
@@ -481,6 +455,58 @@ mod tests {
         assert_eq!(inspect(&restored).unwrap().settled_days, 1);
         assert_eq!(restore_db(&restored, &db, true), 2);
         drop(writer);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn force_uses_sqlite_locking_without_replacing_the_file() {
+        let dir = temp_dir("sqlite-locking");
+        let backup = dir.join("backup.sqlite3");
+        let target = dir.join("target.sqlite3");
+        seed_v2_db(&backup);
+        seed_v2_db(&target);
+        let source = Connection::open(&backup).unwrap();
+        source
+            .execute("INSERT INTO account VALUES ('new')", [])
+            .unwrap();
+        drop(source);
+
+        let target_identity = same_file::Handle::from_path(&target).unwrap();
+        let reader = Connection::open(&target).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT * FROM account;")
+            .unwrap();
+        assert_eq!(restore_db(&backup, &target, true), 2);
+        assert_eq!(inspect(&target).unwrap().accounts, 0);
+        reader.execute_batch("ROLLBACK;").unwrap();
+        drop(reader);
+
+        assert_eq!(restore_db(&backup, &target, true), 0);
+        assert_eq!(inspect(&target).unwrap().accounts, 1);
+        assert_eq!(
+            target_identity,
+            same_file::Handle::from_path(&target).unwrap()
+        );
+        drop(target_identity);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn force_refuses_hard_link_alias_and_incompatible_destination() {
+        let dir = temp_dir("alias");
+        let db = dir.join("source.sqlite3");
+        let alias = dir.join("alias.sqlite3");
+        let incompatible = dir.join("incompatible.sqlite3");
+        seed_v2_db(&db);
+        fs::hard_link(&db, &alias).unwrap();
+        assert_eq!(restore_db(&db, &alias, true), 2);
+        seed_v2_db(&incompatible);
+        let connection = Connection::open(&incompatible).unwrap();
+        connection.execute_batch("PRAGMA user_version=1;").unwrap();
+        drop(connection);
+        let bytes = fs::read(&incompatible).unwrap();
+        assert_eq!(restore_db(&db, &incompatible, true), 1);
+        assert_eq!(fs::read(&incompatible).unwrap(), bytes);
         fs::remove_dir_all(dir).unwrap();
     }
 

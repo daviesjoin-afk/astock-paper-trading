@@ -139,14 +139,18 @@ GET  /v2/prices/coverage
 ```
 
 备份和恢复先生成并校验 SQLite 快照，包含源库已提交的 WAL 数据。使用 `--force`
-替换已有数据库前，需关闭正在使用目标库的进程。
+替换已有数据库前，需关闭正在使用目标库的进程。强制替换会校验目标库并在同一文件内
+通过 SQLite 事务提交，碰到活动的写入、阻塞提交的读取或现有日志文件会拒绝执行。
 
 `live-feed` 使用 `ureq` 的 rustls HTTPS 和 `encoding_rs` 的 GB18030 解码，从腾讯获取公开行情。
 可用 `--history-db` 指定只读历史库或含 `through_day` 的历史 JSON。`live-loop` 在上海交易时段向
 已有模拟盘 API 提交当前上海交易日内有源时间的行情，成交和风控由内核执行。
 省略 `--once` 会持续按轮询间隔运行。`live-loop` 和 `live-watch` 共用交易日历，可通过
 `--calendar` 提供覆盖目标日期的日历。
-启用 AI 建议或使用自定义时区仍用 `scripts/live_paper_loop.py`。
+启用 AI 用 `--ai on --ai-script scripts/live_ai.py`。Rust 校验行情时效并提交轮次，
+Python 适配器负责构造摘要和请求模型。`--once --observe-only` 可在交易时段检查
+行情覆盖，不调用内核或模型。自定义时区仍用 `scripts/live_paper_loop.py`。
+盘后研究可通过 `astock-v2 replay-intraday` 在内存账本中执行隔离回放。
 
 历史停牌回补只对关闭的研究库副本运行。`backfill-halted` 需要
 `--confirm-research-copy`、`--manifest` 和 `--packages`，可按清单续跑。

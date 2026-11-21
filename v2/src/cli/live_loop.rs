@@ -1,12 +1,15 @@
 //! Wall-clock scheduler and transport for the intraday paper kernel.
 
+use super::LIVE_GRACE;
 use crate::domain::{BUNDLED_CALENDAR_JSON, CalendarDay, TradingCalendar};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -20,9 +23,6 @@ fn env_path(name: &str) -> Option<String> {
 }
 const DEFAULT_INTERVAL: u64 = 180;
 const DEFAULT_BATCH: usize = 800;
-// The watchdog allows seven minutes: two default three-minute polls plus one
-// minute of slack. Keep the same fixed ceiling even if --interval is longer.
-pub(super) const LIVE_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(7);
 const TIMEZONE: &str = "Asia/Shanghai";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONSECUTIVE_WAITS: usize = 5;
@@ -40,7 +40,9 @@ Options:
   --calendar PATH     Trading calendar JSON (default: bundled 2026 SH/SZ schedule)
   --interval SECONDS  Polling interval (default: 180)
   --close HH:MM       Session close cutoff (default: 15:00)
-  --ai off            Deterministic mode (default: off)
+  --ai on|off         Include model advice (default: off)
+  --ai-script PATH    Python advice adapter (required with --ai on)
+  --observe-only      Check source freshness without calling the kernel or model
   --max-rounds COUNT  Exit after this many successful round posts
   --once              Attempt one round during the current session
   --timezone ZONE     Asia/Shanghai only
@@ -49,7 +51,7 @@ Options:
 
 Quote source time must be observed in the current session, no later than fetch,
 and within seven minutes of submission (two default polls plus one minute).
-Use v2/scripts/live_paper_loop.py for --ai on or a custom timezone.";
+Use v2/scripts/live_paper_loop.py for a custom timezone.";
 
 const fn market_time(hour: u32, minute: u32) -> NaiveTime {
     NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
@@ -68,23 +70,38 @@ struct Config {
     close: NaiveTime,
     max_rounds: Option<u64>,
     once: bool,
+    observe_only: bool,
+    ai_script: Option<PathBuf>,
     log: PathBuf,
 }
 
 impl Config {
     fn parse(args: &[String]) -> Result<Option<Self>, String> {
+        Self::parse_with_env(
+            args,
+            env_path("ASTOCK_API"),
+            std::env::var_os("ASTOCK_UNIVERSE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        )
+    }
+
+    fn parse_with_env(
+        args: &[String],
+        api: Option<String>,
+        universe: Option<PathBuf>,
+    ) -> Result<Option<Self>, String> {
         let work = Path::new("work");
+        let mut ai_on = false;
         let mut config = Self {
             // ASTOCK_API / ASTOCK_UNIVERSE are what the deployed unit and env
             // file already set; honouring them keeps a bare `live-loop` from
             // talking to 8765 while the kernel listens on 18765.
-            api: env_path("ASTOCK_API")
+            api: api
                 .unwrap_or_else(|| DEFAULT_API.to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
-            universe: env_path("ASTOCK_UNIVERSE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| work.join("live-a-universe.txt")),
+            universe: universe.unwrap_or_else(|| work.join("live-a-universe.txt")),
             history_db: std::env::var_os("ASTOCK_HISTORY_DB")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
@@ -93,6 +110,8 @@ impl Config {
             close: AFTERNOON_CLOSE,
             max_rounds: None,
             once: false,
+            observe_only: false,
+            ai_script: None,
             log: work.join("live").join("intraday-loop.log"),
         };
         let mut args = args.iter().map(String::as_str).peekable();
@@ -103,9 +122,10 @@ impl Config {
             match (flag, inline) {
                 ("-h" | "--help", None) => return Ok(None),
                 ("--once", None) => config.once = true,
+                ("--observe-only", None) => config.observe_only = true,
                 (
                     "--api" | "--universe" | "--history-db" | "--interval" | "--close" | "--ai"
-                    | "--max-rounds" | "--timezone" | "--log" | "--calendar",
+                    | "--max-rounds" | "--timezone" | "--log" | "--calendar" | "--ai-script",
                     _,
                 ) => {
                     let value = inline
@@ -125,10 +145,9 @@ impl Config {
                                     format!("invalid --close time {value:?}, expected HH:MM")
                                 })?;
                         }
-                        "--ai" if value == "on" => {
-                            return Err("--ai on requires v2/scripts/live_paper_loop.py".into());
-                        }
-                        "--ai" if value != "off" => return Err("--ai must be off or on".into()),
+                        "--ai" if matches!(value, "on" | "off") => ai_on = value == "on",
+                        "--ai" => return Err("--ai must be off or on".into()),
+                        "--ai-script" => config.ai_script = Some(value.into()),
                         "--timezone" if value != TIMEZONE => {
                             return Err(format!(
                                 "--timezone {value:?} requires v2/scripts/live_paper_loop.py (Rust supports {TIMEZONE})"
@@ -142,6 +161,15 @@ impl Config {
                 _ => return Err(format!("unknown argument {arg:?}")),
             }
         }
+        if ai_on && config.ai_script.is_none() {
+            return Err("--ai on requires --ai-script PATH".into());
+        }
+        if !ai_on && config.ai_script.is_some() {
+            return Err("--ai-script requires --ai on".into());
+        }
+        if config.observe_only && ai_on {
+            return Err("--observe-only requires --ai off".into());
+        }
         Ok(Some(config))
     }
 }
@@ -152,6 +180,67 @@ fn positive(flag: &str, value: &str) -> Result<u64, String> {
         .ok()
         .filter(|&value| value > 0)
         .ok_or_else(|| format!("{flag} must be positive"))
+}
+
+#[derive(Default, serde::Deserialize)]
+struct Advice {
+    advice: Value,
+    events: Vec<Value>,
+}
+
+fn request_advice(config: &Config, snapshot: &Value, round_id: &str) -> Result<Advice, String> {
+    let script = config.ai_script.as_ref().ok_or("missing AI adapter")?;
+    let get = |path| {
+        super::http::json(
+            &format!("{}{path}", config.api),
+            None,
+            Duration::from_secs(5),
+        )
+    };
+    let mut read_events = Vec::new();
+    let mut get_optional = |path, event| match get(path) {
+        Ok(value) => value,
+        Err(error) => {
+            read_events.push(json!({"event": event, "round_id": round_id, "reason": error}));
+            Value::Null
+        }
+    };
+    let input = json!({
+        "snapshot": snapshot,
+        "round_id": round_id,
+        "account": get_optional("/v2/live/account", "account_read_failed"),
+        "trades": get_optional("/v2/live/trades", "trades_read_failed"),
+    });
+    let mut child = Command::new("python3")
+        .args(["-B", "-X", "utf8"])
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot start AI adapter: {error}"))?;
+    let mut stdin = child.stdin.take().expect("AI adapter stdin is piped");
+    if let Err(error) = serde_json::to_writer(&mut stdin, &input) {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("cannot send AI adapter input: {error}"));
+    }
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!("AI adapter exited with {}", output.status));
+    }
+    let mut result: Advice =
+        serde_json::from_slice(&output.stdout).map_err(|_| "AI adapter returned invalid JSON")?;
+    if !result.advice.is_null() && !result.advice.is_object() {
+        return Err("AI adapter returned invalid advice".into());
+    }
+    read_events.append(&mut result.events);
+    result.events = read_events;
+    Ok(result)
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -182,13 +271,15 @@ pub fn run(args: &[String]) -> i32 {
         &calendar,
         || Utc::now().with_timezone(&shanghai()),
         thread::sleep,
-        || {
-            super::feed::build_snapshot(
+        |session| {
+            super::feed::build_snapshot_for_session(
                 &config.universe,
                 config.history_db.as_deref(),
                 DEFAULT_BATCH,
+                Some(session),
             )
         },
+        |snapshot, round_id| request_advice(&config, snapshot, round_id),
         |path, payload| {
             super::http::json(
                 &format!("{}{path}", config.api),
@@ -391,7 +482,9 @@ fn run_round(
     snapshot: Result<Value, String>,
     scheduled_at: DateTime<FixedOffset>,
     checked_at: DateTime<FixedOffset>,
-    close: NaiveTime,
+    config: &Config,
+    clock: &mut impl FnMut() -> DateTime<FixedOffset>,
+    advise: &mut impl FnMut(&Value, &str) -> Result<Advice, String>,
     post: &mut impl FnMut(&str, &Value) -> Result<Value, String>,
     emit: &mut impl FnMut(&str, Value),
 ) -> bool {
@@ -409,7 +502,8 @@ fn run_round(
     else {
         emit(
             "round_skipped",
-            json!({"reason": "empty_quote_snapshot", "quote_time": quote_time}),
+            json!({"reason": "empty_quote_snapshot", "quote_time": quote_time,
+                   "universe_count": snapshot["universe_count"]}),
         );
         return false;
     };
@@ -420,6 +514,7 @@ fn run_round(
         );
         return false;
     };
+    let close = config.close;
     let session_day = scheduled_at.date_naive();
     if !matches!(
         snapshot.get("quote_time_estimated"),
@@ -461,14 +556,61 @@ fn run_round(
     }
     let quote_time = local.to_rfc3339();
     let round_id = local.format("%Y-%m-%d-%H%M%S").to_string();
+    if config.observe_only {
+        emit(
+            "quote_ready",
+            json!({"round_id": round_id, "quote_time": quote_time,
+                                  "sample_count": quotes.len(), "universe_count": snapshot["universe_count"]}),
+        );
+        return true;
+    }
+    let advice = if config.ai_script.is_some() {
+        let advice = match advise(&snapshot, &round_id) {
+            Ok(advice) => {
+                for mut fields in advice.events {
+                    if let Some(event) = fields
+                        .as_object_mut()
+                        .and_then(|fields| fields.remove("event"))
+                    {
+                        if let Some(event) = event.as_str() {
+                            emit(event, fields);
+                        }
+                    }
+                }
+                advice.advice
+            }
+            Err(reason) => {
+                emit(
+                    "ai_unavailable",
+                    json!({"round_id": round_id, "reason": reason}),
+                );
+                Value::Null
+            }
+        };
+        let send_at = clock();
+        if send_at.date_naive() != session_day
+            || send_at < checked_at
+            || send_at - local > LIVE_GRACE
+        {
+            emit(
+                "round_skipped",
+                json!({"round_id": round_id, "reason": "quote_expired_during_advice"}),
+            );
+            return false;
+        }
+        advice
+    } else {
+        Value::Null
+    };
     state.start_day(local.date_naive());
     let payload = json!({
         "round_id": round_id,
         "quote_time": quote_time,
         "fetched_at": snapshot["fetched_at"],
         "quotes": quotes,
-        "advice": null,
-        "note": "live_paper_loop transport",
+        "advice": advice,
+        "note": if config.ai_script.is_some() { "live_paper_loop transport with raw LLM advice" }
+                else { "live_paper_loop transport" },
     });
     let response = match post("/v2/live/round", &payload) {
         Ok(response) => response,
@@ -489,7 +631,7 @@ fn run_round(
             "quote_time": quote_time,
             "quote_time_estimated": snapshot["quote_time_estimated"].as_bool().unwrap_or(false),
             "sample_count": quotes.len(),
-            "advice": false,
+            "advice": !advice.is_null(),
             "decisions": decisions.map(Vec::len),
             "trades": response["trades"].as_array().map(Vec::len),
             "equity": response["equity"]["equity_cents"],
@@ -539,7 +681,8 @@ fn run_loop(
     calendar: &TradingCalendar,
     mut clock: impl FnMut() -> DateTime<FixedOffset>,
     mut sleep: impl FnMut(Duration),
-    mut snapshot: impl FnMut() -> Result<Value, String>,
+    mut snapshot: impl FnMut(RangeInclusive<DateTime<FixedOffset>>) -> Result<Value, String>,
+    mut advise: impl FnMut(&Value, &str) -> Result<Advice, String>,
     mut post: impl FnMut(&str, &Value) -> Result<Value, String>,
     mut emit: impl FnMut(&str, Value),
 ) -> i32 {
@@ -568,16 +711,31 @@ fn run_loop(
             }
         };
         let trading = calendar_day == CalendarDay::Trading;
-        if trading && session_open(now.time(), config.close).is_some() {
+        if let Some(open) = trading
+            .then(|| session_open(now.time(), config.close))
+            .flatten()
+        {
             last_idle_reason = None;
             waits = 0;
-            let input = snapshot();
+            let session_start = now.with_time(open).single().expect("fixed Shanghai offset");
+            let close = if open == MORNING_OPEN {
+                MORNING_CLOSE
+            } else {
+                AFTERNOON_CLOSE.min(config.close)
+            };
+            let session_end = now
+                .with_time(close)
+                .single()
+                .expect("fixed Shanghai offset");
+            let input = snapshot(session_start..=session_end);
             let posted = run_round(
                 &mut state,
                 input,
                 now,
                 clock(),
-                config.close,
+                config,
+                &mut clock,
+                &mut advise,
                 &mut post,
                 &mut emit,
             );
@@ -673,33 +831,43 @@ mod tests {
 
     #[test]
     fn api_and_universe_defaults_come_from_the_deployment_environment() {
-        // The installed unit exports these; a bare invocation must not fall
-        // back to 8765, which is a different service.
-        unsafe {
-            std::env::set_var("ASTOCK_API", "http://127.0.0.1:18765/");
-            std::env::set_var("ASTOCK_UNIVERSE", "/opt/astock-live/live-a-universe.txt");
-        }
-        let parsed = config(&["--once"]);
+        let parse = |args: &[&str], api: Option<&str>, universe: Option<&str>| {
+            let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+            Config::parse_with_env(&args, api.map(str::to_owned), universe.map(PathBuf::from))
+                .unwrap()
+                .unwrap()
+        };
+        let parsed = parse(
+            &["--once"],
+            Some("http://127.0.0.1:18765/"),
+            Some("/opt/astock-live/live-a-universe.txt"),
+        );
         assert_eq!(parsed.api, "http://127.0.0.1:18765");
         assert_eq!(
             parsed.universe,
             Path::new("/opt/astock-live/live-a-universe.txt")
         );
-        // An explicit flag still wins over the environment.
-        let explicit = config(&["--once", "--api", "http://127.0.0.1:9999"]);
+        let explicit = parse(
+            &[
+                "--once",
+                "--api",
+                "http://127.0.0.1:9999",
+                "--universe",
+                "flag.txt",
+            ],
+            Some("http://127.0.0.1:18765"),
+            Some("env.txt"),
+        );
         assert_eq!(explicit.api, "http://127.0.0.1:9999");
-        unsafe {
-            std::env::remove_var("ASTOCK_API");
-            std::env::remove_var("ASTOCK_UNIVERSE");
-        }
-        let fallback = config(&["--once"]);
+        assert_eq!(explicit.universe, Path::new("flag.txt"));
+        let fallback = parse(&["--once"], None, None);
         assert_eq!(fallback.api, "http://127.0.0.1:8765");
     }
 
     #[test]
     fn flags_reject_unsupported_modes_and_invalid_values() {
         for (args, message) in [
-            (["--ai", "on"], "live_paper_loop.py"),
+            (["--ai", "on"], "--ai-script"),
             (["--timezone", "UTC"], "live_paper_loop.py"),
             (["--interval", "0"], "must be positive"),
             (["--max-rounds", "-1"], "must be positive"),
@@ -741,6 +909,66 @@ mod tests {
     }
 
     #[test]
+    fn model_advice_uses_valid_quotes_and_times_out_to_a_neutral_round() {
+        for (failure, expired, observe_only) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let args: &[&str] = if observe_only {
+                &["--once", "--observe-only"]
+            } else {
+                &["--once", "--ai", "on", "--ai-script", "fixture.py"]
+            };
+            let now = std::cell::Cell::new(local("2026-11-20T10:02:00"));
+            let quotes = snapshot("2026-11-20T10:00:00+08:00");
+            let advice = json!({"model": "fixture", "raw_advice": {"bias": 1}});
+            let mut posts = 0;
+            let mut requests = 0;
+            let mut events = Vec::new();
+            let code = run_loop(
+                &config(args),
+                &load_calendar(None).unwrap(),
+                || now.get(),
+                |_| panic!("--once must not sleep"),
+                |_| Ok(quotes.clone()),
+                |input, id| {
+                    requests += 1;
+                    assert_eq!(input, &quotes);
+                    assert_eq!(id, "2026-11-20-100000");
+                    if expired {
+                        now.set(local("2026-11-20T10:07:01"));
+                    }
+                    if failure {
+                        Err("provider unavailable".into())
+                    } else {
+                        Ok(Advice {
+                            advice: advice.clone(),
+                            events: vec![],
+                        })
+                    }
+                },
+                |path, payload| {
+                    posts += 1;
+                    assert_eq!(path, "/v2/live/round");
+                    assert_eq!(
+                        payload["advice"],
+                        if failure { Value::Null } else { advice.clone() }
+                    );
+                    Ok(json!({}))
+                },
+                |event, _| events.push(event.to_owned()),
+            );
+            assert_eq!(posts, usize::from(!expired && !observe_only));
+            assert_eq!(requests, usize::from(!observe_only));
+            assert_eq!(code, i32::from(expired));
+            assert_eq!(events.contains(&"ai_unavailable".to_owned()), failure);
+            assert_eq!(events.contains(&"quote_ready".to_owned()), observe_only);
+        }
+    }
+
+    #[test]
     fn once_posts_one_unfiltered_snapshot_with_source_identity() {
         let now = local("2026-11-20T10:03:05");
         let snapshot = snapshot("2026-11-20T02:00:02.123Z");
@@ -751,7 +979,8 @@ mod tests {
             &load_calendar(None).unwrap(),
             || now,
             |_| panic!("--once must not sleep"),
-            || Ok(snapshot.clone()),
+            |_| Ok(snapshot.clone()),
+            |_, _| panic!("AI disabled"),
             |path, body| {
                 calls += 1;
                 assert_eq!(path, "/v2/live/round");
@@ -845,7 +1074,8 @@ mod tests {
                     &load_calendar(None).unwrap(),
                     || local(at),
                     |_| panic!("--once must not sleep"),
-                    || input.take().expect("feed must not be called"),
+                    |_| input.take().expect("feed must not be called"),
+                    |_, _| panic!("AI disabled"),
                     |_, _| panic!("kernel must not be called"),
                     |event, _| events.push(event.to_owned()),
                 ),
@@ -889,7 +1119,8 @@ mod tests {
                     &load_calendar(None).unwrap(),
                     || clocks.next().unwrap(),
                     |_| panic!("--once must not sleep"),
-                    || Ok(input.clone()),
+                    |_| Ok(input.clone()),
+                    |_, _| panic!("AI disabled"),
                     |path, _| {
                         assert_eq!(path, "/v2/live/round");
                         sent = true;
@@ -923,7 +1154,8 @@ mod tests {
                 &calendar,
                 || local("2026-12-31T15:01:00"),
                 |_| panic!("must not schedule beyond coverage"),
-                || panic!("must not fetch outside the session"),
+                |_| panic!("must not fetch outside the session"),
+                |_, _| panic!("AI disabled"),
                 |_, _| panic!("must not post without rounds"),
                 |event, fields| events.push((event.to_owned(), fields)),
             ),
@@ -951,7 +1183,7 @@ mod tests {
                 delays.push(delay.as_secs());
                 now.set(now.get() + delay);
             },
-            || {
+            |_| {
                 polls.push(now.get());
                 if polls.len() == 1 {
                     now.set(now.get() + Duration::from_secs(35));
@@ -959,6 +1191,7 @@ mod tests {
                 }
                 Ok(snapshot("2026-11-20 10:03:00"))
             },
+            |_, _| panic!("AI disabled"),
             |path, body| {
                 assert_eq!(path, "/v2/live/round");
                 attempts.push(body["round_id"].clone());
@@ -997,7 +1230,8 @@ mod tests {
                 pauses.push(delay.as_secs());
                 now.set(now.get() + delay);
             },
-            || Ok(snapshot(&now.get().to_rfc3339())),
+            |_| Ok(snapshot(&now.get().to_rfc3339())),
+            |_, _| panic!("AI disabled"),
             |path, body| {
                 calls.push(path.to_owned());
                 match path {
@@ -1057,7 +1291,8 @@ mod tests {
             &load_calendar(None).unwrap(),
             || local("2026-11-21T10:03:05"),
             |_| sleeps += 1,
-            || panic!("weekend must not fetch"),
+            |_| panic!("weekend must not fetch"),
+            |_, _| panic!("AI disabled"),
             |_, _| panic!("weekend with no observed rounds must not post"),
             |event, _| events.push(event.to_owned()),
         );

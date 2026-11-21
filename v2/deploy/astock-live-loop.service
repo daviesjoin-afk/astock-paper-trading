@@ -1,6 +1,5 @@
-# The scheduler keeps running the Python loop because Rust `live-loop`
-# deliberately rejects `--ai on`, and `intraday_evolution.py` imports this
-# module. Switch to `astock-v2 live-loop --ai off` only after AI advice moves.
+# Compatibility scheduler until the Rust loop has verified production quote
+# coverage during trading hours. See deploy/README.md for the cutover.
 [Unit]
 Description=AStock V2 intraday quote feed, AI observer and 3-minute scheduler
 After=network-online.target astock-live.service

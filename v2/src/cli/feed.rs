@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -130,23 +131,40 @@ pub(crate) fn build_snapshot(
     history_path: Option<&Path>,
     batch_size: usize,
 ) -> Result<Value, String> {
+    build_snapshot_for_session(universe_path, history_path, batch_size, None)
+}
+
+pub(super) fn build_snapshot_for_session(
+    universe_path: &Path,
+    history_path: Option<&Path>,
+    batch_size: usize,
+    session: Option<RangeInclusive<DateTime<FixedOffset>>>,
+) -> Result<Value, String> {
     let agent = http::agent(Duration::from_secs(10), true);
-    snapshot_with(universe_path, history_path, batch_size, Utc::now, |codes| {
-        let mut response = agent
-            .get(format!("{ENDPOINT}{}", codes.join(",")))
-            .call()
-            .map_err(|error| error.to_string())?;
-        response
-            .body_mut()
-            .read_to_vec()
-            .map_err(|error| error.to_string())
-    })
+    snapshot_with(
+        universe_path,
+        history_path,
+        batch_size,
+        session,
+        Utc::now,
+        |codes| {
+            let mut response = agent
+                .get(format!("{ENDPOINT}{}", codes.join(",")))
+                .call()
+                .map_err(|error| error.to_string())?;
+            response
+                .body_mut()
+                .read_to_vec()
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 fn snapshot_with(
     universe_path: &Path,
     history_path: Option<&Path>,
     batch_size: usize,
+    session: Option<RangeInclusive<DateTime<FixedOffset>>>,
     now: impl FnOnce() -> DateTime<Utc>,
     mut fetch: impl FnMut(&[String]) -> Result<Vec<u8>, String>,
 ) -> Result<Value, String> {
@@ -161,6 +179,14 @@ fn snapshot_with(
         result.map_err(|error| format!("{SOURCE} batch {} failed: {error}", index + 1))?;
     }
     let fetched_at = now();
+    if let Some(window) = &session {
+        let earliest = (*window.start()).max(fetched_at.fixed_offset() - super::LIVE_GRACE);
+        let latest = (*window.end()).min(fetched_at.fixed_offset());
+        rows.retain(|_, row| {
+            row.time
+                .is_some_and(|time| time >= earliest && time <= latest)
+        });
+    }
     let observed = codes.iter().filter_map(|code| rows.get(code)?.time).min();
     let history = match (history_path, observed) {
         (Some(path), Some(time)) => load_history(path, time.with_timezone(&SHANGHAI).date_naive()),
@@ -181,6 +207,9 @@ fn snapshot_with(
         "quote_time": observed.unwrap_or_else(|| fetched_at.fixed_offset()).to_rfc3339(),
         "fetched_at": fetched_at.to_rfc3339(),
     });
+    if session.is_some() {
+        result["universe_count"] = json!(symbols.len());
+    }
     if observed.is_none() {
         result["quote_time_estimated"] = json!(true);
     }
@@ -463,6 +492,48 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_drops_unverified_quotes_without_changing_public_snapshot() {
+        let fixture = Fixtures::new();
+        let universe = fixture.write(
+            "universe.txt",
+            "600000.SH
+000001.SZ
+600001.SH
+600002.SH
+",
+        );
+        let now = || {
+            DateTime::parse_from_rfc3339("2026-11-20T10:03:00+08:00")
+                .unwrap()
+                .to_utc()
+        };
+        let data = [
+            record("sh600000", &[(30, "20261120100200")]),
+            record("sz000001", &[(30, "20261119150000")]),
+            record("sh600001", &[(30, "20261120100400")]),
+            record("sh600002", &[(30, "")]),
+        ]
+        .concat();
+        let fetch = |_: &[String]| Ok(data.clone());
+        let ordinary = snapshot_with(&universe, None, 8, None, now, fetch).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-11-20T09:30:00+08:00").unwrap();
+        let live = snapshot_with(
+            &universe,
+            None,
+            8,
+            Some(start..=now().fixed_offset()),
+            now,
+            fetch,
+        )
+        .unwrap();
+        assert_eq!(ordinary["count"], 4);
+        assert_eq!(live["count"], 1);
+        assert_eq!(live["universe_count"], 4);
+        assert_eq!(live["quotes"][0]["symbol"], "600000.SH");
+        assert_eq!(live["quote_time"], "2026-11-20T10:02:00+08:00");
+    }
+
+    #[test]
     fn batches_gb18030_quotes_with_source_time_and_no_fabricated_fields() {
         let fixtures = Fixtures::new();
         let universe = fixtures.write(
@@ -501,7 +572,7 @@ mod tests {
         );
         stale.extend_from_slice(&record("bj920001", &[(4, "NaN")]));
         let mut calls = Vec::new();
-        let result = snapshot_with(&universe, None, 2, now, |codes| {
+        let result = snapshot_with(&universe, None, 2, None, now, |codes| {
             calls.push(codes.to_vec());
             if calls.len() == 1 {
                 Ok([stale.clone(), active.clone()].concat())
@@ -556,7 +627,7 @@ mod tests {
             }
         }
         let run = |source_time| {
-            snapshot_with(&universe, Some(&database), 2, now, |_| {
+            snapshot_with(&universe, Some(&database), 2, None, now, |_| {
                 Ok([
                     record("sh600000", &[(30, source_time)]),
                     record("sz000001", &[]),
@@ -589,7 +660,7 @@ mod tests {
                 "through_day": through_day,
                 "per_symbol": {"600000.SH": [1, 2, 3, 4, 5, 6], "000001.SZ": [2, 3, 4, 5, 6]}
             }).to_string());
-                snapshot_with(&universe, Some(&history), 2, now, |_| {
+                snapshot_with(&universe, Some(&history), 2, None, now, |_| {
                     Ok([
                         record("sh600000", &[(30, "2026-11-15T17:00:00+00:00")]),
                         record("sz000001", &[]),
@@ -612,9 +683,11 @@ mod tests {
     fn a_failed_batch_fails_the_snapshot() {
         let fixtures = Fixtures::new();
         let universe = fixtures.write("universe.txt", "600000.SH\n000001.SZ\n");
-        let error = snapshot_with(&universe, None, 1, now, |codes| match codes[0].as_str() {
-            "sh600000" => Ok(record("sh600000", &[])),
-            _ => Ok(vec![0x81]),
+        let error = snapshot_with(&universe, None, 1, None, now, |codes| {
+            match codes[0].as_str() {
+                "sh600000" => Ok(record("sh600000", &[])),
+                _ => Ok(vec![0x81]),
+            }
         })
         .unwrap_err();
         assert_eq!(

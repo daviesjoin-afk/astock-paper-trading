@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import datetime, time as time_cls, timedelta, timezone
 import io
 import json
+import os
+import subprocess
 from pathlib import Path
 import sys
 import unittest
@@ -53,6 +55,22 @@ def round_response(*, equity=10_100_000):
         "equity": {"equity_cents": equity, "account": {}},
         "ai": {"ok": False, "error": "no_advice", "application": {}},
     }
+
+
+class AdviceAdapterTests(unittest.TestCase):
+    def test_subprocess_returns_structured_neutral_advice_without_credentials(self):
+        env = {key: value for key, value in os.environ.items() if not key.startswith("ASTOCK_LLM_")}
+        script = Path(__file__).with_name("live_ai.py")
+        result = subprocess.run(
+            [sys.executable, "-B", "-X", "utf8", str(script)],
+            input=json.dumps({"snapshot": snapshot(), "account": None, "trades": None,
+                              "round_id": "fixture"}),
+            encoding="utf-8", capture_output=True, env=env, check=True, timeout=10,
+        )
+        reply = json.loads(result.stdout)
+        self.assertIsNone(reply["advice"])
+        self.assertEqual(reply["events"], [{"event": "ai_unavailable", "round_id": "fixture",
+                                            "reason": "missing_llm_credentials", "attempts": 0}])
 
 
 class FakeOpener:
