@@ -22,6 +22,10 @@ const ROUTES = {
   "market/screener": "全市场",
   "market/detail": "个股详情",
   "research/candidates": "候选评审",
+  "research/coverage": "数据底座",
+  "research/evidence": "策略证据",
+  "settings/ai": "AI 模型",
+  "settings/runtime": "长期运行",
 } as const;
 
 type RoutePath = keyof typeof ROUTES;
@@ -263,6 +267,40 @@ test.describe("current console routes", () => {
     expect(apiPaths).not.toContain("/v2/account/daily-report");
   });
 
+  test("copying the report from market views still uses the intraday ledger without 404", async ({ page }) => {
+    const apiPaths: string[] = [];
+    const failedUrls: string[] = [];
+    page.on("request", (request) => {
+      apiPaths.push(new URL(request.url()).pathname);
+    });
+    page.on("response", (response) => {
+      if (response.status() >= 400 && new URL(response.url()).pathname === "/v2/account/daily-report") {
+        failedUrls.push(`${response.status()} ${response.url()}`);
+      }
+    });
+    await openRoute(page, "market/screener");
+    await expect(page.locator("#screener-body tr")).not.toHaveCount(0, { timeout: 20_000 });
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: (value: string) => {
+            (window as typeof window & { __copiedMarketReport?: string }).__copiedMarketReport = value;
+            return Promise.resolve();
+          },
+        },
+      });
+    });
+    await page.getByTestId("report-copy").click();
+    await expect(page.getByTestId("report-copy")).toHaveText("已复制");
+    const copied = await page.evaluate(
+      () => (window as typeof window & { __copiedMarketReport?: string }).__copiedMarketReport ?? "",
+    );
+    expect(copied).toContain("盘中模拟盘复盘");
+    expect(apiPaths).not.toContain("/v2/account/daily-report");
+    expect(failedUrls).toEqual([]);
+  });
+
   test("a screener row opens the symbol detail page with a drawn series", async ({ page }) => {
     await openRoute(page, "market/screener");
     // The fixture feeds two symbols; a row must be clickable, not decorative.
@@ -408,5 +446,49 @@ test.describe("current console routes", () => {
         [],
       );
     }
+  });
+
+  test("upgraded market and research views work end-to-end without overflow or a11y issues", async ({ page }) => {
+    await openRoute(page, "market/screener");
+    await expect(page.locator("#screener-body tr")).not.toHaveCount(0, { timeout: 20_000 });
+    await expect(page.locator("#screener-summary .summary-tile")).toHaveCount(5);
+    await page.locator("#screener-chips button[data-filter='up']").click();
+    await page.locator("#screener-chips button[data-filter='all']").click();
+    await page.locator(".sort-btn[data-sort='symbol']").click();
+
+    await page.locator("#screener-body tr").first().click();
+    await expect(page).toHaveURL(/#\/market\/detail$/);
+    await expect(page.locator("#detail-volume svg")).toHaveCount(1);
+    await expect(page.locator("#detail-history-body tr")).not.toHaveCount(0);
+    await page.locator("#detail-ranges button[data-range='20']").click();
+    await expect(page.getByTestId("detail-days")).toHaveText("20");
+    await page.locator("#detail-to-live").click();
+    await expect(page).toHaveURL(/#\/live\/symbol$/);
+
+    for (const sub of ["research/coverage", "research/evidence", "settings/ai", "settings/runtime"] as const) {
+      await openRoute(page, sub as RoutePath);
+      const results = await new AxeBuilder({ page }).analyze();
+      const serious = results.violations.filter((item) =>
+        ["serious", "critical"].includes(item.impact ?? ""),
+      );
+      expect(serious, `a11y violations on ${sub}`).toEqual([]);
+      await page.setViewportSize({ width: 320, height: 720 });
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow, `${sub} overflow on 320px`).toBeLessThanOrEqual(1);
+      await page.setViewportSize({ width: 1280, height: 800 });
+    }
+
+    // Verify research evaluation runner generates real candidates & curve comparison
+    await openRoute(page, "research/candidates");
+    await page.locator("#research-run").click();
+    await expect(page.getByTestId("research-rows").locator("tr")).toHaveCount(3, { timeout: 15_000 });
+    await expect(page.locator("#research-curve svg path")).toHaveCount(3);
+
+    // Verify settings save persists AI depth & runtime config
+    await openRoute(page, "settings/ai");
+    await page.locator("#settings-ai-save").click();
+    await expect(page.locator("#settings-ai-feedback")).toContainText("已保存");
   });
 });

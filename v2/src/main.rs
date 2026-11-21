@@ -13,7 +13,20 @@ use astock_v2::intraday::{
     RunRoundRequest,
 };
 use astock_v2::intraday::store::EvolveRequest;
+use astock_v2::research_engine::{self, evaluate_candidates};
+use astock_v2::settings::{
+    self, apply_patch, call_ai_live_advice, load_settings, redacted_view, save_settings,
+    test_ai_connection, DaemonRuntimeStatus, SettingsPatch, SystemSettings,
+};
 use astock_v2::store::{load_price_sets, price_sets_dir, AdvanceLimits, Store, StoreError};
+
+/// Shared settings & long-running daemon status state.
+#[derive(Clone)]
+struct SettingsAppState {
+    path: std::path::PathBuf,
+    settings: Arc<Mutex<SystemSettings>>,
+    runtime: Arc<Mutex<DaemonRuntimeStatus>>,
+}
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -203,8 +216,14 @@ async fn market_observation(
     };
     let day = query.day.unwrap_or(last);
     let regime = db.market_regime(&day).map_err(api_error)?;
+    let from_index = days
+        .iter()
+        .position(|item| item == &day)
+        .unwrap_or(days.len().saturating_sub(1))
+        .saturating_sub(SETTLEMENT_WARMUP_DAYS);
+    let start = days[from_index].clone();
     let set = db
-        .price_set_from_bars("bar-table", &day, &day)
+        .price_set_from_bars("bar-table", &start, &day)
         .map_err(api_error)?
         .ok_or_else(|| (StatusCode::UNPROCESSABLE_ENTITY,
                         Json(json!({ "error": "no_prices_for_day", "day": day }))))?;
@@ -360,7 +379,111 @@ async fn blocked_orders(State(state): State<AppState>) -> ApiResult {
 /// and the console renders "还没有影子候选" for it. Returning a fabricated row
 /// would make an unimplemented view look working.
 async fn research_candidates(State(_state): State<AppState>) -> ApiResult {
-    response(json!([]))
+    let live_db = env::var("ASTOCK_V2_LIVE_DB")
+        .unwrap_or_else(|_| "work/live/intraday.sqlite3".into());
+    let path = research_engine::research_store_path(&live_db);
+    response(research_engine::load_candidates(&path))
+}
+
+async fn run_research(State(state): State<AppState>) -> ApiResult {
+    let daily_bars = {
+        let db = state.reader.lock().await;
+        let days = db.bar_days().map_err(api_error)?;
+        let recent_days: Vec<String> = days.into_iter().rev().take(60).collect::<Vec<_>>().into_iter().rev().collect();
+        let mut out = Vec::with_capacity(recent_days.len());
+        for day in recent_days {
+            let bars = db.bars_for_day(&day).map_err(api_error)?;
+            out.push((day, bars));
+        }
+        out
+    };
+    if daily_bars.len() < 2 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "insufficient_market_bars", "detail": "至少需要 2 个交易日的行情数据才能运行研究评估。" })),
+        ));
+    }
+    let candidates = evaluate_candidates(&daily_bars);
+    let live_db = env::var("ASTOCK_V2_LIVE_DB")
+        .unwrap_or_else(|_| "work/live/intraday.sqlite3".into());
+    let path = research_engine::research_store_path(&live_db);
+    if let Err(err) = research_engine::save_candidates(&path, &candidates) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": err }))));
+    }
+    response(json!({
+        "count": candidates.len(),
+        "candidates": candidates,
+    }))
+}
+
+async fn get_settings(State(state): State<SettingsAppState>) -> ApiResult {
+    let settings = state.settings.lock().await.clone();
+    let runtime = state.runtime.lock().await.clone();
+    response(redacted_view(&settings, &runtime))
+}
+
+async fn update_settings(
+    State(state): State<SettingsAppState>,
+    Json(patch): Json<SettingsPatch>,
+) -> ApiResult {
+    let mut settings = state.settings.lock().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    apply_patch(&mut settings, patch, &now);
+    if let Err(err) = save_settings(&state.path, &settings) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": err }))));
+    }
+    let mut runtime = state.runtime.lock().await;
+    runtime.daemon_enabled = settings.live_daemon_enabled;
+    runtime.phase = if settings.live_daemon_enabled {
+        "已开启托管守护（按交易时段自动调度）".into()
+    } else {
+        "未开启托管（当前由外部 systemd / 手动调度）".into()
+    };
+    response(redacted_view(&settings, &runtime))
+}
+
+#[derive(Deserialize)]
+struct TestAiRequest {
+    ai_base_url: Option<String>,
+    ai_model: Option<String>,
+    ai_api_key: Option<String>,
+    ai_timeout_secs: Option<u64>,
+}
+
+async fn test_ai_settings(
+    State(state): State<SettingsAppState>,
+    Json(req): Json<TestAiRequest>,
+) -> ApiResult {
+    let current = state.settings.lock().await.clone();
+    let base = req.ai_base_url.unwrap_or(current.ai_base_url);
+    let model = req.ai_model.unwrap_or(current.ai_model);
+    let timeout = req.ai_timeout_secs.unwrap_or(current.ai_timeout_secs);
+    let key = match req.ai_api_key {
+        Some(k) if !k.trim().is_empty() && !k.contains("****") => k,
+        _ => current.ai_api_key,
+    };
+    let result = tokio::task::spawn_blocking(move || test_ai_connection(&base, &key, &model, timeout))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
+    response(result)
+}
+
+async fn ai_advice_from_settings(
+    State(state): State<SettingsAppState>,
+    Json(context): Json<Value>,
+) -> ApiResult {
+    let settings = state.settings.lock().await.clone();
+    if !settings.ai_enabled {
+        return response(json!({ "ok": false, "disabled": true, "advice": null }));
+    }
+    let depth = settings.ai_depth.clone();
+    let res = tokio::task::spawn_blocking(move || call_ai_live_advice(&settings, &context))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
+    match res {
+        Ok(advice) => response(json!({ "ok": true, "mode": depth, "advice": advice })),
+        Err(err) => response(json!({ "ok": false, "mode": depth, "error": err, "advice": null })),
+    }
 }
 
 /// Accept an AI advice record for one slot on one day.
@@ -1224,6 +1347,11 @@ async fn live_evolution_history(State(state): State<LiveAppState>) -> LiveApiRes
     live_response(db.evolution().map_err(live_api_error)?)
 }
 
+async fn live_sentiment(State(state): State<LiveAppState>) -> LiveApiResult {
+    let db = state.reader.lock().await;
+    live_response(db.latest_sentiment().map_err(live_api_error)?)
+}
+
 async fn live_evolve(
     State(state): State<LiveAppState>,
     Json(request): Json<EvolveRequest>,
@@ -1234,24 +1362,6 @@ async fn live_evolve(
         "preview": preview,
         "history": db.evolution().map_err(live_api_error)?,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn app_state_read_and_write_locks_are_independent() {
-        let writer = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
-        let reader = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
-        let state = AppState { writer, reader };
-        let writer_guard = state.writer.blocking_lock();
-        // This is the real acceptance condition: holding the writer must not
-        // prevent a read-only handler's state from being acquired.
-        let reader_guard = state.reader.try_lock().expect("read state must be independent");
-        drop(reader_guard);
-        drop(writer_guard);
-    }
 }
 
 #[tokio::main]
@@ -1284,10 +1394,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so a long GET never waits on a round's write lock.
     let live_reader = IntradayStore::open_read_only(&live_database)
         .map_err(|error| format!("{error}"))?;
+    // Backfill any daily closing OHLCV snapshots from the intraday ledger into
+    // the market `bar` table so `/v2/market/*` and `/v2/research/*` stay current.
+    if let Ok(live_bars) = live_reader.closing_bars_from_snapshots(None)
+        && !live_bars.is_empty()
+    {
+        let mut db = state.writer.lock().await;
+        let _ = db.upsert_bars(&live_bars);
+    }
     let live_state = LiveAppState {
         writer: Arc::new(Mutex::new(live_writer)),
         reader: Arc::new(Mutex::new(live_reader)),
     };
+    let settings_file = settings::settings_path(&live_database);
+    let loaded_settings = load_settings(&settings_file);
+    let initial_runtime = DaemonRuntimeStatus {
+        daemon_enabled: loaded_settings.live_daemon_enabled,
+        running: true,
+        os: std::env::consts::OS.to_string(),
+        phase: if loaded_settings.live_daemon_enabled {
+            "托管守护就绪（等待交易时段）".into()
+        } else {
+            "手动 / systemd 外部调度模式".into()
+        },
+        last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
+        last_round_id: None,
+        last_error: None,
+    };
+    let settings_state = SettingsAppState {
+        path: settings_file,
+        settings: Arc::new(Mutex::new(loaded_settings)),
+        runtime: Arc::new(Mutex::new(initial_runtime)),
+    };
+    // Background heartbeat & long-running daemon status updater for Oracle Cloud / standalone deployments.
+    {
+        let daemon_settings = settings_state.settings.clone();
+        let daemon_runtime = settings_state.runtime.clone();
+        let sync_daily_writer = state.writer.clone();
+        let sync_live_reader = live_state.reader.clone();
+        tokio::spawn(async move {
+            let mut last_synced_count = 0usize;
+            loop {
+                let (enabled, interval_secs) = {
+                    let s = daemon_settings.lock().await;
+                    (s.live_daemon_enabled, s.live_interval_secs.clamp(30, 1800))
+                };
+                if let Ok(live_bars) = sync_live_reader.lock().await.closing_bars_from_snapshots(None)
+                    && live_bars.len() != last_synced_count
+                    && !live_bars.is_empty()
+                {
+                    last_synced_count = live_bars.len();
+                    let _ = sync_daily_writer.lock().await.upsert_bars(&live_bars);
+                }
+                {
+                    let mut rt = daemon_runtime.lock().await;
+                    rt.daemon_enabled = enabled;
+                    rt.last_heartbeat = Some(chrono::Utc::now().to_rfc3339());
+                    if !enabled {
+                        rt.phase = "手动 / systemd 外部调度模式".into();
+                    } else {
+                        rt.phase = format!("托管守护在线（每 {interval_secs} 秒巡检一次）");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs.min(30))).await;
+            }
+        });
+    }
     let app = Router::new()
         .route("/v2/health", get(health))
         .route("/v2/account", get(account).post(create_account))
@@ -1307,6 +1479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/account/daily-report", get(daily_report))
         .route("/v2/account/blocked", get(blocked_orders))
         .route("/v2/research/candidates", get(research_candidates))
+        .route("/v2/research/run", post(run_research))
         .route("/v2/market/observation", get(market_observation))
         .with_state(state);
     let live_routes = Router::new()
@@ -1321,8 +1494,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/live/ai", get(live_ai_observations))
         .route("/v2/live/symbol", get(live_symbol_archive))
         .route("/v2/live/risk", get(live_risk_summary))
+        .route("/v2/live/sentiment", get(live_sentiment))
         .with_state(live_state);
-    let app = app.merge(live_routes);
+    let settings_routes = Router::new()
+        .route("/v2/settings", get(get_settings).post(update_settings))
+        .route("/v2/settings/test-ai", post(test_ai_settings))
+        .route("/v2/settings/ai-advice", post(ai_advice_from_settings))
+        .with_state(settings_state);
+    let app = app.merge(live_routes).merge(settings_routes);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("astock-v2 listening at http://{address}");
     axum::serve(
@@ -1331,4 +1510,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_state_read_and_write_locks_are_independent() {
+        let writer = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let reader = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let state = AppState { writer, reader };
+        let writer_guard = state.writer.blocking_lock();
+        // This is the real acceptance condition: holding the writer must not
+        // prevent a read-only handler's state from being acquired.
+        let reader_guard = state.reader.try_lock().expect("read state must be independent");
+        drop(reader_guard);
+        drop(writer_guard);
+    }
 }

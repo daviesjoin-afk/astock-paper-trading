@@ -477,3 +477,145 @@ pub fn apply_sell(
     }
     Ok(())
 }
+
+/// Real-time A-share cross-sectional market sentiment & money-making effect gauge.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketSentiment {
+    pub round_id: Option<String>,
+    pub quote_time: Option<String>,
+    pub total_quotes: usize,
+    pub up_count: usize,
+    pub down_count: usize,
+    pub flat_count: usize,
+    pub up_ratio_bps: i64,
+    pub strong_count: usize,
+    pub weak_count: usize,
+    pub limit_up_count: usize,
+    pub limit_down_count: usize,
+    /// Stocks that surged >= +6% intraday (`high_cents`) but pulled back >= 2% from the high.
+    pub bull_trap_count: usize,
+    /// Proportion of >= +6% intraday surges that faded >= 2%, in bps (0..10000).
+    pub bull_trap_rate_bps: i64,
+    /// Composite sentiment temperature in 0..=100 (50 = neutral).
+    pub score: i64,
+    pub label: String,
+    pub posture: String,
+    pub recommended_max_exposure_bps: i64,
+}
+
+pub fn compute_market_sentiment(
+    quotes: &[Quote],
+    round_id: Option<String>,
+    quote_time: Option<String>,
+) -> MarketSentiment {
+    let mut total = 0usize;
+    let mut up = 0usize;
+    let mut down = 0usize;
+    let mut flat = 0usize;
+    let mut strong = 0usize;
+    let mut weak = 0usize;
+    let mut limit_up = 0usize;
+    let mut limit_down = 0usize;
+    let mut high_surge = 0usize;
+    let mut bull_trap = 0usize;
+
+    for q in quotes {
+        if !q.has_live_price() || q.prev_close_cents <= 0 {
+            continue;
+        }
+        total += 1;
+        let chg_bps = (q.price_cents - q.prev_close_cents) * 10_000 / q.prev_close_cents;
+        if chg_bps > 0 {
+            up += 1;
+        } else if chg_bps < 0 {
+            down += 1;
+        } else {
+            flat += 1;
+        }
+        if chg_bps >= 500 {
+            strong += 1;
+        } else if chg_bps <= -500 {
+            weak += 1;
+        }
+        if !q.can_buy() || chg_bps >= 950 {
+            limit_up += 1;
+        }
+        if !q.can_sell() || chg_bps <= -950 {
+            limit_down += 1;
+        }
+        if let Some(high) = q.high_cents
+            && high > q.prev_close_cents
+        {
+            let high_bps = (high - q.prev_close_cents) * 10_000 / q.prev_close_cents;
+            if high_bps >= 600 {
+                high_surge += 1;
+                let pullback_bps = (high - q.price_cents) * 10_000 / high.max(1);
+                if pullback_bps >= 200 {
+                    bull_trap += 1;
+                }
+            }
+        }
+    }
+
+    if total == 0 {
+        return MarketSentiment {
+            round_id,
+            quote_time,
+            score: 50,
+            label: "暂无数据".into(),
+            posture: "等待盘中实时行情快照".into(),
+            recommended_max_exposure_bps: 7_000,
+            ..Default::default()
+        };
+    }
+
+    let up_ratio_bps = (up as i64 * 10_000) / total as i64;
+    let bull_trap_rate_bps = if high_surge > 0 {
+        (bull_trap as i64 * 10_000) / high_surge as i64
+    } else {
+        0
+    };
+
+    let breadth_term = ((up_ratio_bps - 5_000) / 200).clamp(-20, 20);
+    let tail_term = (((strong as i64 - weak as i64) * 180) / total as i64).clamp(-15, 15);
+    let limit_term = (((limit_up as i64 - limit_down as i64) * 250) / total as i64).clamp(-10, 10);
+    let trap_penalty = (bull_trap_rate_bps / 500).clamp(0, 15);
+
+    let score = (50 + breadth_term + tail_term + limit_term - trap_penalty).clamp(0, 100);
+    let (label, mut posture, mut max_exp) = if score < 25 {
+        ("情绪冰点", "亏钱效应显著，严控新开仓，防守控仓 ≤50%", 5_000)
+    } else if score < 42 {
+        ("情绪偏冷", "市场分化偏弱，仅保留低位高确定性标的，控仓 ≤65%", 6_500)
+    } else if score < 60 {
+        ("情绪中性", "多空均衡，按双槽纪律择强汰弱，建议仓位 ≤80%", 8_000)
+    } else if score < 80 {
+        ("情绪偏暖", "赚钱效应良好，顺势参与主线动量与趋势，建议仓位 ≤90%", 9_000)
+    } else {
+        ("情绪亢奋", "多头情绪高涨，警惕高潮次日分化，切忌追买高位缩量板", 8_500)
+    };
+
+    if bull_trap_rate_bps >= 3_500 && high_surge >= 10 {
+        posture = "盘中炸板/冲高回落率偏高（抛压重），严禁追高开仓，优先去弱留强";
+        max_exp = max_exp.min(6_500);
+    }
+
+    MarketSentiment {
+        round_id,
+        quote_time,
+        total_quotes: total,
+        up_count: up,
+        down_count: down,
+        flat_count: flat,
+        up_ratio_bps,
+        strong_count: strong,
+        weak_count: weak,
+        limit_up_count: limit_up,
+        limit_down_count: limit_down,
+        bull_trap_count: bull_trap,
+        bull_trap_rate_bps,
+        score,
+        label: label.into(),
+        posture: posture.into(),
+        recommended_max_exposure_bps: max_exp,
+    }
+}

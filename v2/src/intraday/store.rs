@@ -1172,6 +1172,130 @@ impl IntradayStore {
             created_at: created_at.to_string(),
         })
     }
+
+    /// Extract daily closing OHLCV bars from the final trading round of each
+    /// recorded day in `quote_snapshot` (or a single `day_filter`).
+    pub fn closing_bars_from_snapshots(
+        &self,
+        day_filter: Option<&str>,
+    ) -> IntradayResult<Vec<crate::store::Bar>> {
+        let mut round_stmt = self.conn.prepare(
+            "SELECT substr(round_id, 1, 10) AS d, MAX(round_id) \
+             FROM round \
+             WHERE round_id NOT LIKE '%-close' AND length(round_id) >= 10 \
+             GROUP BY d ORDER BY d ASC",
+        )?;
+        let day_rounds: Vec<(String, String)> = round_stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut snap_stmt = self.conn.prepare(
+            "SELECT symbol, COALESCE(name, ''), price_cents, prev_close_cents, \
+             COALESCE(open_cents, price_cents), COALESCE(high_cents, price_cents), \
+             COALESCE(low_cents, price_cents), COALESCE(volume, 0), COALESCE(amount, 0) \
+             FROM quote_snapshot WHERE round_id = ?1 AND price_cents > 0 ORDER BY symbol ASC",
+        )?;
+        let mut out = Vec::new();
+        for (day, round_id) in day_rounds {
+            if day.len() != 10 || day.as_bytes().get(4) != Some(&b'-') {
+                continue;
+            }
+            if let Some(target) = day_filter
+                && day != target
+            {
+                continue;
+            }
+            let rows = snap_stmt.query_map(params![round_id], |row| {
+                let close_cents: i64 = row.get(2)?;
+                let prev_close_cents: i64 = row.get(3)?;
+                let open_cents: i64 = row.get(4)?;
+                let high_cents: i64 = row.get(5)?;
+                let low_cents: i64 = row.get(6)?;
+                let volume: i64 = row.get(7)?;
+                let amount: i64 = row.get(8)?;
+                Ok(crate::store::Bar {
+                    symbol: row.get(0)?,
+                    day: day.clone(),
+                    name: row.get(1)?,
+                    open_cents: if open_cents > 0 { open_cents } else { close_cents },
+                    high_cents: if high_cents > 0 {
+                        high_cents.max(close_cents)
+                    } else {
+                        close_cents
+                    },
+                    low_cents: if low_cents > 0 {
+                        low_cents.min(close_cents)
+                    } else {
+                        close_cents
+                    },
+                    close_cents,
+                    prev_close_cents: if prev_close_cents > 0 {
+                        prev_close_cents
+                    } else {
+                        close_cents
+                    },
+                    volume_shares: volume.max(0),
+                    amount_cents: amount.max(0),
+                    adjust: "none".into(),
+                    source: "live".into(),
+                    tradable: close_cents > 0,
+                })
+            })?;
+            for bar in rows {
+                out.push(bar?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compute real-time cross-sectional market sentiment from the newest round's snapshot.
+    pub fn latest_sentiment(&self) -> IntradayResult<super::MarketSentiment> {
+        let latest: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT round_id, started_at FROM round \
+                 WHERE round_id NOT LIKE '%-close' \
+                 ORDER BY round_id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((round_id, quote_time)) = latest else {
+            return Ok(super::compute_market_sentiment(&[], None, None));
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol, name, price_cents, prev_close_cents, open_cents, high_cents, \
+             low_cents, limit_up_cents, limit_down_cents, volume, amount \
+             FROM quote_snapshot WHERE round_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![round_id], |row| {
+            Ok(Quote {
+                symbol: row.get(0)?,
+                name: row.get(1)?,
+                price_cents: row.get(2)?,
+                prev_close_cents: row.get(3)?,
+                open_cents: row.get(4)?,
+                high_cents: row.get(5)?,
+                low_cents: row.get(6)?,
+                limit_up_cents: row.get(7)?,
+                limit_down_cents: row.get(8)?,
+                volume: row.get(9)?,
+                avg_volume: None,
+                amount_cents: row.get(10)?,
+                tradable: Some(true),
+                trailing_closes: Vec::new(),
+            })
+        })?;
+        let mut quotes = Vec::new();
+        for q in rows {
+            quotes.push(q?);
+        }
+        Ok(super::compute_market_sentiment(
+            &quotes,
+            Some(round_id),
+            Some(quote_time),
+        ))
+    }
 }
 
 fn validate_round_request(request: &RunRoundRequest) -> IntradayResult<()> {
@@ -1648,9 +1772,9 @@ fn execute_signals(
 ) -> IntradayResult<Vec<TradeRecord>> {
     let mut out = Vec::new();
 
-    /// A decided order that produced no fill must leave its reason on the
-    /// decision row. A silent `continue` would show "卖出/买入" on the console
-    /// with no trade and no explanation — the exact gap V1's 风控中心 closed.
+    // A decided order that produced no fill must leave its reason on the
+    // decision row. A silent `continue` would show "卖出/买入" on the console
+    // with no trade and no explanation — the exact gap V1's 风控中心 closed.
     let record_skip = |transaction: &Transaction<'_>,
                        signal: &DecisionSignal,
                        reason: &str,
@@ -1750,6 +1874,25 @@ fn execute_signals(
     }
 
     // Buys are ordered by score, then symbol/slot for deterministic ties.
+    let full_market_round = request.quotes.len() >= 100;
+    let sentiment_max_exposure_bps = if full_market_round {
+        super::compute_market_sentiment(&request.quotes, None, None).recommended_max_exposure_bps
+    } else {
+        10_000
+    };
+    let is_morning_cooldown = full_market_round && {
+        // 09:30~09:41 CST (or 01:30~01:41 UTC) opening impulse window
+        let qt = request.quote_time.as_str();
+        qt.contains("T09:3")
+            || qt.contains(" 09:3")
+            || qt.contains("T01:3")
+            || qt.contains("T09:40")
+            || qt.contains(" 09:40")
+            || qt.contains("T01:40")
+            || qt.contains("T09:41")
+            || qt.contains(" 09:41")
+            || qt.contains("T01:41")
+    };
     let mut buys: Vec<&DecisionSignal> = signals
         .iter()
         .filter(|signal| signal.side == "buy")
@@ -1770,7 +1913,25 @@ fn execute_signals(
         }
         let index = slot_index(signal.slot);
         let mut notes: Vec<String> = signal.note.split("; ").map(str::to_string).collect();
-        if books[index].positions.len() >= signal.slot.max_positions()
+        if is_morning_cooldown && quote.prev_close_cents > 0 {
+            let chg_bps = (quote.price_cents - quote.prev_close_cents) * 10_000 / quote.prev_close_cents;
+            let fading_open = quote.open_cents.is_some_and(|o| quote.price_cents < o);
+            if chg_bps >= 450 || fading_open {
+                record_skip(transaction, signal, "morning_cooldown_guard", &mut notes)?;
+                continue;
+            }
+        }
+        let deep_target_bps = if ai.is_deep() {
+            ai.active_suggestions()
+                .iter()
+                .find(|item| item.symbol == signal.symbol && item.side == "buy" && item.matches_slot(signal.slot))
+                .and_then(|item| item.target_weight_bps)
+                .filter(|&w| w > 0)
+        } else {
+            None
+        };
+        if deep_target_bps.is_none()
+            && books[index].positions.len() >= signal.slot.max_positions()
             && !books[index]
                 .positions
                 .iter()
@@ -1781,6 +1942,16 @@ fn execute_signals(
         }
         let (single_bps, cash_floor_bps) = signal.slot.risk_bps();
         let slot_equity = slot_equity(&books[index], marks)?;
+        let sentiment_cash_floor = if full_market_round {
+            let cap_bps = if signal.slot == Slot::Steady {
+                sentiment_max_exposure_bps.min(8_500)
+            } else {
+                sentiment_max_exposure_bps
+            };
+            slot_equity * (10_000 - cap_bps).max(cash_floor_bps) / 10_000
+        } else {
+            slot_equity * cash_floor_bps / 10_000
+        };
         let current_value = books[index]
             .positions
             .iter()
@@ -1791,10 +1962,19 @@ fn execute_signals(
                     .map(|quote| position.quantity * quote.price_cents)
             })
             .unwrap_or(0);
-        let single_limit = slot_equity * single_bps / 10_000;
-        let cash_floor = slot_equity * cash_floor_bps / 10_000;
-        let available = (single_limit - current_value)
-            .min(books[index].cash_cents - cash_floor);
+        let available = if let Some(target_bps) = deep_target_bps {
+            // Deep AI mode: AI sets target position weight; Rust enforces cash & full-market sentiment circuit breaker.
+            let target_value = slot_equity * target_bps / 10_000;
+            let spendable_cash = if full_market_round {
+                (books[index].cash_cents - sentiment_cash_floor).max(0)
+            } else {
+                books[index].cash_cents
+            };
+            (target_value - current_value).min(spendable_cash)
+        } else {
+            let single_limit = slot_equity * single_bps / 10_000;
+            (single_limit - current_value).min(books[index].cash_cents - sentiment_cash_floor)
+        };
         if available <= 0 {
             record_skip(transaction, signal, "cash_budget", &mut notes)?;
             continue;
@@ -2048,17 +2228,6 @@ fn read_books(conn: &impl ConnLike) -> IntradayResult<[SlotBook; 2]> {
         books[slot_index(position.slot)].positions.push(position);
     }
     Ok(books)
-}
-
-/// One query for every symbol's newest *priced* snapshot. Ranking follows the
-/// round's real `started_at` (a snapshot inserted ahead of its round marker
-/// falls back to `fetched_at`, which is the same caller-owned timestamp), with
-/// round_id and rowid only as deterministic tie-breakers. Rows without a live
-/// price are excluded *before* ranking, so a halted symbol keeps its own last
-/// real price instead of being dragged to NULL by the newest round; avg_cost
-/// and prev_close are never consulted. No per-symbol query, no N+1.
-fn latest_prices(conn: &impl ConnLike) -> IntradayResult<BTreeMap<String, i64>> {
-    latest_prices_for(conn, None)
 }
 
 /// Latest price per symbol, optionally restricted to the symbols a caller holds.

@@ -274,9 +274,18 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         except Exception as error:  # noqa: BLE001 - digest state is optional
             log.emit("trades_read_failed", reason=str(error))
         digest = market_digest(snapshot, account=account, trades=trades)
-        advice = raw_advice(digest, base_url=config.llm_base,
-                            api_key=config.llm_key, model=config.llm_model,
-                            opener=config.opener, log=log, round_id=round_id)
+        settings_used = False
+        try:
+            settings_resp = kernel.post("/v2/settings/ai-advice", digest)
+            if isinstance(settings_resp, dict) and (settings_resp.get("ok") or settings_resp.get("disabled")):
+                advice = settings_resp.get("advice")
+                settings_used = True
+        except Exception:  # noqa: BLE001 - fall back to direct raw_advice if endpoint unavailable
+            settings_used = False
+        if not settings_used:
+            advice = raw_advice(digest, base_url=config.llm_base,
+                                api_key=config.llm_key, model=config.llm_model,
+                                opener=config.opener, log=log, round_id=round_id)
 
     payload = {
         "round_id": round_id,

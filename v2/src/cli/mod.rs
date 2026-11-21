@@ -4,7 +4,7 @@
 mod backfill;
 pub mod db_tool;
 mod feed;
-mod http;
+pub(crate) mod http;
 mod ingest;
 mod intraday_replay;
 mod live_loop;

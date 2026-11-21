@@ -49,19 +49,36 @@
       <div id="view-market-screener" class="view" data-view="market/screener" hidden>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>全市场</h2><p class="muted">已入库的全部标的，按当日涨跌幅排序。</p></div>
+            <div><h2>全市场</h2><p class="muted">已入库的全部标的，支持涨跌筛选、表头排序与分页查看。</p></div>
             <span class="count" id="screener-count">—</span>
           </div>
+          <div class="screener-summary" id="screener-summary" aria-label="当日市场概览"></div>
           <div class="toolbar">
             <label class="field-inline"><span>交易日</span><select id="screener-day"></select></label>
             <label class="field-inline"><span>筛选</span><input id="screener-filter" type="search" placeholder="代码或名称" /></label>
+            <div class="seg" role="group" aria-label="涨跌筛选" id="screener-chips">
+              <button type="button" class="seg-btn active" data-filter="all">全部</button>
+              <button type="button" class="seg-btn" data-filter="up">上涨</button>
+              <button type="button" class="seg-btn" data-filter="down">下跌</button>
+              <button type="button" class="seg-btn" data-filter="strong">强势 ≥5%</button>
+              <button type="button" class="seg-btn" data-filter="weak">弱势 ≤-5%</button>
+            </div>
           </div>
           <div class="table-scroll table-tall">
             <table>
-              <thead><tr><th>代码</th><th>名称</th><th class="num-col">收盘</th><th class="num-col">涨跌</th><th class="num-col">成交量</th></tr></thead>
+              <thead>
+                <tr>
+                  <th><button type="button" class="sort-btn" data-sort="symbol">代码</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="name">名称</button></th>
+                  <th class="num-col"><button type="button" class="sort-btn" data-sort="close">收盘</button></th>
+                  <th class="num-col"><button type="button" class="sort-btn active" data-sort="change">涨跌 ↓</button></th>
+                  <th class="num-col"><button type="button" class="sort-btn" data-sort="volume">成交量</button></th>
+                </tr>
+              </thead>
               <tbody id="screener-body"></tbody>
             </table>
           </div>
+          <div class="live-pager" id="screener-pager" style="padding:10px 20px" hidden></div>
           <p class="empty" id="screener-empty">还没有行情数据。先运行数据摄取。</p>
         </section>
       </div>
@@ -70,11 +87,20 @@
         <section class="panel">
           <div class="panel-head">
             <div><h2>个股详情</h2><p class="muted">收盘价来自已入库的不复权行情；除权除息日的缺口单独标注。</p></div>
-            <span class="count" id="detail-symbol" data-testid="detail-symbol">—</span>
+            <div class="top-actions">
+              <span class="count" id="detail-symbol" data-testid="detail-symbol">—</span>
+              <button type="button" class="btn btn-quiet" id="detail-to-live" hidden>查看盘中档案 →</button>
+            </div>
           </div>
           <div class="toolbar">
             <label class="field-inline"><span>代码</span><input id="detail-input" type="search" placeholder="600000.SH" /></label>
-            <button type="button" id="detail-load">查看</button>
+            <button type="button" class="btn" id="detail-load">查看</button>
+            <div class="seg" role="group" aria-label="显示区间" id="detail-ranges">
+              <button type="button" class="seg-btn" data-range="20">近 20 日</button>
+              <button type="button" class="seg-btn" data-range="60">近 60 日</button>
+              <button type="button" class="seg-btn" data-range="120">近 120 日</button>
+              <button type="button" class="seg-btn active" data-range="all">全部</button>
+            </div>
           </div>
           <dl class="metrics" id="detail-metrics">
             <div><dt>最新收盘</dt><dd id="detail-close" data-testid="detail-close">—</dd></div>
@@ -82,27 +108,228 @@
             <div><dt>最高 / 最低</dt><dd id="detail-range" data-testid="detail-range">—</dd></div>
             <div><dt>交易日数</dt><dd id="detail-days" data-testid="detail-days">—</dd></div>
           </dl>
+          <div id="detail-hover" class="detail-hover" hidden></div>
           <div id="detail-chart" data-testid="detail-chart"></div>
+          <div id="detail-volume" class="detail-volume" hidden></div>
+          <div id="detail-gaps" class="detail-gaps" hidden></div>
           <p class="empty" id="detail-empty" data-testid="detail-empty">输入代码查看个股走势。</p>
+        </section>
+        <section class="panel" id="detail-history-panel" hidden>
+          <div class="panel-head">
+            <div><h2>近期日线明细</h2><p class="muted">展示所选区间最近 20 个交易日的收盘价、日涨跌与成交量。</p></div>
+            <span class="count" id="detail-history-count">—</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>交易日</th><th class="num-col">收盘价</th><th class="num-col">日涨跌</th><th class="num-col">成交量（手）</th><th>标注</th></tr></thead>
+              <tbody id="detail-history-body"></tbody>
+            </table>
+          </div>
         </section>
       </div>
 
       <div id="view-research-candidates" class="view" data-view="research/candidates" hidden>
         <section class="panel">
           <div class="panel-head">
-            <h2>候选因子评审</h2>
-            <p class="muted">只读：这里显示门禁的判断，不改变任何状态。晋升要跑
-              <code>promote_candidate.py --apply</code>。</p>
+            <div>
+              <h2>候选因子评审</h2>
+              <p class="muted">基于已入库全市场日线运行多策略对比评估，检验收益率、回撤与门禁达标情况。</p>
+            </div>
+            <div class="top-actions">
+              <span class="count" id="research-count">—</span>
+              <button type="button" class="btn btn-primary" id="research-run">运行研究评估</button>
+            </div>
           </div>
+          <dl class="metrics" id="research-stats">
+            <div><dt>候选总数</dt><dd id="research-stat-total">0</dd></div>
+            <div><dt>影子观察</dt><dd id="research-stat-shadow">0</dd></div>
+            <div><dt>已晋升</dt><dd id="research-stat-promoted">0</dd></div>
+            <div><dt>已淘汰</dt><dd id="research-stat-rejected">0</dd></div>
+          </dl>
           <p class="muted" data-testid="research-empty" id="research-empty" hidden>
-            还没有影子候选。先跑 <code>shadow_advance.sh</code> 让候选进影子。
+            当前暂无研究候选。若已有入库日线行情，可直接点击右上角「运行研究评估」生成多策略对比结果。
           </p>
-          <table class="table" data-testid="research-table" id="research-table" hidden>
-            <thead>
-              <tr><th>候选</th><th>算法</th><th>状态</th><th>影子天数</th><th>门禁</th></tr>
-            </thead>
-            <tbody id="research-rows" data-testid="research-rows"></tbody>
-          </table>
+          <div class="table-scroll">
+            <table class="table" data-testid="research-table" id="research-table" hidden>
+              <thead>
+                <tr><th>候选</th><th>算法</th><th>状态</th><th>影子天数</th><th class="num-col">区间收益</th><th class="num-col">最大回撤</th><th>门禁</th></tr>
+              </thead>
+              <tbody id="research-rows" data-testid="research-rows"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel" id="research-curve-panel" hidden>
+          <div class="panel-head">
+            <div><h2>候选策略净值曲线对照</h2><p class="muted">同一行情区间下各候选策略的模拟净值走势（基准 1.000）。</p></div>
+            <span class="count" id="research-curve-legend">—</span>
+          </div>
+          <div id="research-curve" class="chart-wrap"></div>
+        </section>
+      </div>
+
+      <div id="view-research-coverage" class="view" data-view="research/coverage" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>行情数据底座</h2><p class="muted">核查已入库的全市场日线规模、价格集覆盖区间与当日跳空缺口。</p></div>
+            <span class="count" id="coverage-latest">—</span>
+          </div>
+          <dl class="metrics" id="coverage-metrics">
+            <div><dt>已入库交易日</dt><dd id="cov-bar-days">—</dd></div>
+            <div><dt>最新日标的数</dt><dd id="cov-bar-symbols">—</dd></div>
+            <div><dt>价格集覆盖区间</dt><dd id="cov-set-range">—</dd></div>
+            <div><dt>最近结算日</dt><dd id="cov-settled-day">—</dd></div>
+          </dl>
+          <p class="empty" id="coverage-note" hidden></p>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>当日异常跳空 / 除权缺口</h2><p class="muted">超过各板块涨跌幅限制 +2% 的标的，用于绘图断线提示（点击代码可查看 K 线）。</p></div>
+            <span class="count" id="gaps-count">—</span>
+          </div>
+          <div class="table-scroll table-tall">
+            <table>
+              <thead><tr><th>代码</th><th>名称</th><th class="num-col">前收</th><th class="num-col">今收</th><th class="num-col">跳空幅度</th><th class="num-col">成交量（手）</th></tr></thead>
+              <tbody id="gaps-body"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="gaps-empty" hidden>最近交易日没有检测到超过涨跌停限制的跳空缺口。</p>
+        </section>
+      </div>
+
+      <div id="view-research-evidence" class="view" data-view="research/evidence" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>市场环境与观测候选</h2><p class="muted">基于全市场不复权收盘价计算的均线分离度与市场宽度，以及当日重点观测标的。</p></div>
+            <span class="count" id="evidence-day">—</span>
+          </div>
+          <dl class="metrics" id="evidence-regime-metrics">
+            <div><dt>市场环境</dt><dd id="ev-regime">—</dd></div>
+            <div><dt>等权指数点位</dt><dd id="ev-index">—</dd></div>
+            <div><dt>均线分离度</dt><dd id="ev-sep">—</dd></div>
+            <div><dt>上涨宽度</dt><dd id="ev-breadth">—</dd></div>
+          </dl>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>策略槽位</th><th>代码</th><th class="num-col">策略评分</th><th class="num-col">收盘 / 涨跌</th><th>打分依据</th></tr></thead>
+              <tbody id="evidence-candidates-body"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="evidence-empty" hidden>暂无全市场观测数据。</p>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>盘中策略进化证据</h2><p class="muted">来自 `/v2/live/evolution` 的历史进化提案与基线对照记录。</p></div>
+            <span class="count" id="evidence-evo-count">—</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>交易日</th><th>提案状态</th><th>参数调整</th><th>基线收益 / 回撤</th><th>说明</th></tr></thead>
+              <tbody id="evidence-evo-body"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="evidence-evo-empty" hidden>还没有盘中进化提案记录。</p>
+        </section>
+      </div>
+      <div id="view-settings-ai" class="view" data-view="settings/ai" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>AI 模型与接入深度设置</h2><p class="muted">配置 OpenAI 兼容接口（DeepSeek / 通义千问 / 硅基流动 / 自定义），密钥仅保存在服务端。</p></div>
+            <span class="count" id="settings-ai-updated">—</span>
+          </div>
+          <div class="settings-form">
+            <div class="field">
+              <span class="field-label">快捷提供商预设</span>
+              <div class="seg" id="settings-provider-presets" role="group" aria-label="AI 提供商预设">
+                <button type="button" class="seg-btn active" data-provider="deepseek" data-url="https://api.deepseek.com/v1" data-model="deepseek-chat">DeepSeek</button>
+                <button type="button" class="seg-btn" data-provider="qwen" data-url="https://dashscope.aliyuncs.com/compatible-mode/v1" data-model="qwen-plus">通义千问</button>
+                <button type="button" class="seg-btn" data-provider="siliconflow" data-url="https://api.siliconflow.cn/v1" data-model="deepseek-ai/DeepSeek-V3">硅基流动</button>
+                <button type="button" class="seg-btn" data-provider="openai" data-url="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</button>
+                <button type="button" class="seg-btn" data-provider="custom" data-url="" data-model="">自定义</button>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label class="field">
+                <span class="field-label">API Base URL</span>
+                <input id="set-ai-base" type="text" placeholder="https://api.deepseek.com/v1" />
+              </label>
+              <label class="field">
+                <span class="field-label">模型名称（Model）</span>
+                <input id="set-ai-model" type="text" placeholder="deepseek-chat" />
+              </label>
+              <label class="field">
+                <span class="field-label">API Key（留空则保留已保存密钥）</span>
+                <input id="set-ai-key" type="text" autocomplete="off" placeholder="sk-..." />
+              </label>
+              <label class="field">
+                <span class="field-label">请求超时（秒）</span>
+                <input id="set-ai-timeout" type="number" min="5" max="120" value="25" />
+              </label>
+              <label class="field">
+                <span class="field-label">AI 接入状态</span>
+                <select id="set-ai-enabled">
+                  <option value="true">开启 AI 决策</option>
+                  <option value="false">关闭（仅用纯规则引擎）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">AI 介入深度</span>
+                <select id="set-ai-depth">
+                  <option value="deep">深度托管（AI 决定买卖与目标仓位，仅保留资金/T+1/涨跌停底线）</option>
+                  <option value="advisory">保守顾问（仅微调门槛 ±15 分与小幅权重倾斜）</option>
+                </select>
+              </label>
+            </div>
+            <div class="top-actions">
+              <button type="button" class="btn btn-primary" id="settings-ai-save">保存 AI 设置</button>
+              <button type="button" class="btn" id="settings-ai-test">测试连通性</button>
+              <span class="muted" id="settings-ai-feedback"></span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div id="view-settings-runtime" class="view" data-view="settings/runtime" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>盘中长期运行版本配置（甲骨文服务器 / 独立部署）</h2><p class="muted">管理盘中 3 分钟调度周期、收盘自动进化复盘与长期运行守护状态。</p></div>
+            <span class="count" id="settings-rt-os">—</span>
+          </div>
+          <dl class="metrics">
+            <div><dt>守护模式</dt><dd id="rt-phase">—</dd></div>
+            <div><dt>最近心跳</dt><dd id="rt-heartbeat">—</dd></div>
+            <div><dt>运行环境</dt><dd id="rt-os">—</dd></div>
+            <div><dt>AI 接入状态</dt><dd id="rt-ai-ready">—</dd></div>
+          </dl>
+          <div class="settings-form">
+            <div class="settings-grid">
+              <label class="field">
+                <span class="field-label">内置长期托管守护</span>
+                <select id="set-rt-daemon">
+                  <option value="true">开启（服务端长期巡检模式）</option>
+                  <option value="false">关闭（由甲骨文服务器 systemd 外部调度）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">盘中轮询间隔（秒）</span>
+                <input id="set-rt-interval" type="number" min="30" max="1800" value="180" />
+              </label>
+              <label class="field">
+                <span class="field-label">收盘自动进化复盘</span>
+                <select id="set-rt-evolve">
+                  <option value="true">开启（15:00 收盘后自动生成进化提案）</option>
+                  <option value="false">关闭</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">自选 / 标的池路径（可选）</span>
+                <input id="set-rt-universe" type="text" placeholder="/opt/astock-live/live-a-universe.txt" />
+              </label>
+            </div>
+            <div class="top-actions">
+              <button type="button" class="btn btn-primary" id="settings-rt-save">保存运行设置</button>
+              <span class="muted" id="settings-rt-feedback"></span>
+            </div>
+          </div>
         </section>
       </div>
     </main>

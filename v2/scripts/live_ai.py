@@ -28,7 +28,7 @@ LIVE_SYSTEM_PROMPT = """你审查 A 股模拟盘本轮风险，输出建议，�
 
 先判断市场广度和振幅，再看槽位、持仓与候选。change_distribution 的涨跌平家数只覆盖能比较现价与昨收的标的，sample_count 是收到的报价总数，*_bps 的 100 等于 1%。稳健看趋势持续性和回撤风险，激进看动量与趋势是否一致。输出建议作用于股票代码，不能限定到某个槽位。
 
-- 排名只是相对强弱。弱市允许整轮不点名买入。有现金、排名靠前或贴近涨停都不能单独成为买入依据。buy 会请求内核对未持有的槽位发出明确买入信号。点名前检查趋势、日内位置、振幅、已持仓槽位和可用预算；distance_to_limit_up_bps 按昨收计算。若接近或到达涨停、关键证据缺失，或只剩涨幅可支持，放弃点名。已有持仓的代码也可能在另一槽触发开仓。
+- 排名只是相对强弱。弱市允许整轮不点名买入。有现金、排名靠前或贴近涨停都不能单独成为买入依据。buy 会请求内核对未持有的槽位发出明确买入信号。点名前检查趋势、日内位置、振幅、日内均价线偏离（vwap_distance_bps）、诱多风险分（bull_trap_risk）、近期诱多错题本（recent_bull_trap_lessons）、已持仓槽位和可用预算；distance_to_limit_up_bps 按昨收计算。若接近或到达涨停、破日内均价线（vwap_distance_bps <= -120）、冲高留长上影（upper_wick_bps >= 150）、bull_trap_risk >= 30、关键证据缺失，或只剩涨幅可支持，放弃点名。已有持仓的代码也可能在另一槽触发开仓。
 - 检查持仓时看本轮是否有有效价格、风险是否恶化。浮亏本身不构成卖出证据。同日账本显示可卖量为 0 时，不重复给卖出建议。用 account_as_of_round_id 的日期识别账本交易日。若账本属于上一交易日，开盘 T+1 由内核滚动，可卖量以本轮内核为准。sell 只对已持仓代码提出，并陈述依据。
 - blocked_symbols 限制开仓和加仓。只填有明确禁买依据的代码。同一代码只出现一次，不同时列入禁买和买入建议。证据冲突或不足时，调整值填 0，可使用空列表。风险方向明确时优先使用一个全局调整，避免重复施压。所有数字发出前检查范围。
 
@@ -119,11 +119,54 @@ def ranked_candidates(quotes: Sequence[Mapping[str, Any]], *,
 
         closes = quote.get("trailing_closes") or ()
         trend = None
+        trend_3d = None
+        dist_20d_high = None
         if isinstance(closes, (list, tuple)) and len(closes) >= 5:
             first, last = closes[-5], closes[-1]
             if isinstance(first, (int, float)) and isinstance(last, (int, float)):
                 if first > 0 and last > 0:
                     trend = _pct_bps(float(last) - float(first), float(first))
+            if len(closes) >= 3:
+                c3 = closes[-3]
+                if isinstance(c3, (int, float)) and c3 > 0:
+                    trend_3d = _pct_bps(float(price) - float(c3), float(c3))
+            high_20d = max((float(c) for c in closes[-20:] if isinstance(c, (int, float)) and c > 0), default=0.0)
+            if high_20d > 0:
+                dist_20d_high = _pct_bps(float(price) - high_20d, high_20d)
+
+        open_c = quote.get("open_cents")
+        open_mom = None
+        upper_wick = None
+        if isinstance(open_c, (int, float)) and open_c > 0:
+            open_mom = _pct_bps(float(price) - float(open_c), float(open_c))
+            if isinstance(high, (int, float)) and high > 0:
+                body_top = max(float(price), float(open_c))
+                if high > body_top:
+                    upper_wick = _pct_bps(float(high) - body_top, float(open_c))
+
+        vol = quote.get("volume")
+        amt = quote.get("amount_cents")
+        vwap_dist = None
+        if isinstance(vol, (int, float)) and isinstance(amt, (int, float)) and vol > 0 and amt > 0:
+            vwap = float(amt) / float(vol)
+            if vwap > 0:
+                vwap_dist = _pct_bps(float(price) - vwap, vwap)
+
+        bull_trap_risk = 0
+        trap_flags: list[str] = []
+        if vwap_dist is not None and vwap_dist <= -120:
+            bull_trap_risk += 35
+            trap_flags.append("破日内均价线(VWAP)")
+        if upper_wick is not None and upper_wick >= 150:
+            bull_trap_risk += 30
+            trap_flags.append("长上影冲高回落")
+        if momentum >= 300 and open_mom is not None and open_mom <= -50:
+            bull_trap_risk += 25
+            trap_flags.append("假阳真阴(高开低走)")
+        if trend_3d is not None and trend_3d >= 1800 and (position is not None and position < 7500):
+            bull_trap_risk += 25
+            trap_flags.append("3日连涨高位派发")
+        bull_trap_risk = min(100, bull_trap_risk)
 
         # Transparent blend: momentum dominates, intraday position confirms,
         # trend adds persistence. Components that are absent contribute zero
@@ -147,6 +190,17 @@ def ranked_candidates(quotes: Sequence[Mapping[str, Any]], *,
             entry["amplitude_bps"] = amplitude
         if trend is not None:
             entry["trend_5d_bps"] = trend
+        if trend_3d is not None:
+            entry["cum_gain_3d_bps"] = trend_3d
+        if dist_20d_high is not None:
+            entry["dist_20d_high_bps"] = dist_20d_high
+        if vwap_dist is not None:
+            entry["vwap_distance_bps"] = vwap_dist
+        if upper_wick is not None:
+            entry["upper_wick_bps"] = upper_wick
+        if bull_trap_risk > 0:
+            entry["bull_trap_risk"] = bull_trap_risk
+            entry["bull_trap_flags"] = trap_flags
         limit_up = quote.get("limit_up_cents")
         if type(limit_up) is int and limit_up > 0:
             entry["distance_to_limit_up_bps"] = _pct_bps(limit_up - price, prev)
@@ -195,6 +249,150 @@ def held_positions(account: Any, quotes: Sequence[Mapping[str, Any]], *,
         if len(out) >= limit:
             break
     return out
+
+
+def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compute real-time cross-sectional market sentiment & bull-trap rate."""
+    total = up = down = flat = strong = weak = limit_up = limit_down = high_surge = bull_trap = 0
+    for q in quotes:
+        if not isinstance(q, Mapping) or q.get("tradable") is False:
+            continue
+        price = q.get("price_cents")
+        prev = q.get("prev_close_cents")
+        if not isinstance(price, (int, float)) or not isinstance(prev, (int, float)) or price <= 0 or prev <= 0:
+            continue
+        total += 1
+        chg_bps = int(round((float(price) - float(prev)) / float(prev) * 10_000))
+        if chg_bps > 0:
+            up += 1
+        elif chg_bps < 0:
+            down += 1
+        else:
+            flat += 1
+        if chg_bps >= 500:
+            strong += 1
+        elif chg_bps <= -500:
+            weak += 1
+        lu = q.get("limit_up_cents")
+        ld = q.get("limit_down_cents")
+        if (isinstance(lu, int) and lu > 0 and price >= lu) or chg_bps >= 950:
+            limit_up += 1
+        if (isinstance(ld, int) and ld > 0 and price <= ld) or chg_bps <= -950:
+            limit_down += 1
+        high = q.get("high_cents")
+        if isinstance(high, (int, float)) and high > prev:
+            high_bps = int(round((float(high) - float(prev)) / float(prev) * 10_000))
+            if high_bps >= 600:
+                high_surge += 1
+                pullback_bps = int(round((float(high) - float(price)) / max(float(high), 1.0) * 10_000))
+                if pullback_bps >= 200:
+                    bull_trap += 1
+    if total == 0:
+        return {"score": 50, "label": "暂无数据", "up_ratio_bps": 0, "bull_trap_rate_bps": 0}
+    up_ratio_bps = int(round(up * 10_000 / total))
+    bull_trap_rate_bps = int(round(bull_trap * 10_000 / high_surge)) if high_surge > 0 else 0
+    breadth_term = max(-20, min(20, (up_ratio_bps - 5000) // 200))
+    tail_term = max(-15, min(15, (strong - weak) * 180 // total))
+    limit_term = max(-10, min(10, (limit_up - limit_down) * 250 // total))
+    trap_penalty = max(0, min(15, bull_trap_rate_bps // 500))
+    score = max(0, min(100, 50 + breadth_term + tail_term + limit_term - trap_penalty))
+    label = ("情绪冰点" if score < 25 else "情绪偏冷" if score < 42
+             else "情绪中性" if score < 60 else "情绪偏暖" if score < 80 else "情绪亢奋")
+    return {
+        "score": score,
+        "label": label,
+        "up_ratio_bps": up_ratio_bps,
+        "strong_count": strong,
+        "weak_count": weak,
+        "limit_up_count": limit_up,
+        "limit_down_count": limit_down,
+        "bull_trap_count": bull_trap,
+        "bull_trap_rate_bps": bull_trap_rate_bps,
+    }
+
+
+def build_slot_candidates(quotes: Sequence[Mapping[str, Any]], *, limit: int = 8) -> dict[str, list[dict[str, Any]]]:
+    """Separate, anti-bull-trap candidate pools for steady and aggressive slots."""
+    steady_pool: list[tuple[float, dict[str, Any]]] = []
+    aggr_pool: list[tuple[float, dict[str, Any]]] = []
+    for item in ranked_candidates(quotes, limit=120):
+        mom = item.get("momentum_bps") or 0
+        pos = item.get("position_in_range_bps")
+        amp = item.get("amplitude_bps")
+        dist_lu = item.get("distance_to_limit_up_bps")
+        trend = item.get("trend_5d_bps") or 0
+        trap_risk = item.get("bull_trap_risk") or 0
+        vwap_dist = item.get("vwap_distance_bps")
+        if dist_lu is not None and dist_lu < 180:
+            continue
+        if pos is not None and pos < 6000:
+            continue
+        if vwap_dist is not None and vwap_dist < -100:
+            continue
+        if 30 <= mom <= 450 and (amp is None or amp <= 500) and trend >= 0 and trap_risk <= 25:
+            steady_pool.append((trend * 0.5 + mom * 0.3 - trap_risk * 2.0, item))
+        if 150 <= mom <= 650 and (pos is None or pos >= 7000) and (dist_lu is None or dist_lu >= 220) and trap_risk <= 35:
+            aggr_pool.append((mom * 0.6 + trend * 0.4 - trap_risk * 2.0, item))
+    steady_pool.sort(key=lambda x: x[0], reverse=True)
+    aggr_pool.sort(key=lambda x: x[0], reverse=True)
+    return {
+        "steady": [row for _, row in steady_pool[:limit]],
+        "aggressive": [row for _, row in aggr_pool[:limit]],
+    }
+
+
+def extract_bull_trap_lessons(
+    held: Sequence[Mapping[str, Any]],
+    trades: Any,
+    quotes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Distill recent losing positions and stop-loss fills into concrete negative examples for AI."""
+    lessons: list[dict[str, Any]] = []
+    quote_map = {
+        q["symbol"]: q
+        for q in quotes
+        if isinstance(q, Mapping) and isinstance(q.get("symbol"), str)
+    }
+    seen: set[str] = set()
+    for pos in held:
+        sym = pos.get("symbol")
+        pnl = pos.get("pnl_bps")
+        if not isinstance(sym, str) or not isinstance(pnl, (int, float)) or pnl > -300:
+            continue
+        seen.add(sym)
+        q = quote_map.get(sym, {})
+        lessons.append({
+            "symbol": sym,
+            "name": pos.get("name") or q.get("name"),
+            "slot": pos.get("slot"),
+            "type": "当前持仓被套",
+            "pnl_bps": int(pnl),
+            "lesson": f"持仓浮亏 {pnl / 100:.2f}%，切勿在弱势或跌破均价线时盲目补仓摊平，优先去弱留强",
+        })
+        if len(lessons) >= 5:
+            return lessons
+    if isinstance(trades, list):
+        for tr in trades[:40]:
+            if not isinstance(tr, Mapping):
+                continue
+            sym = tr.get("symbol")
+            side = tr.get("side")
+            reason = str(tr.get("reason") or "")
+            if not isinstance(sym, str) or sym in seen:
+                continue
+            if side == "sell" and ("stop" in reason or "exit" in reason):
+                seen.add(sym)
+                lessons.append({
+                    "symbol": sym,
+                    "name": tr.get("name"),
+                    "slot": tr.get("slot"),
+                    "type": "近期止损教训",
+                    "round_id": tr.get("round_id"),
+                    "lesson": f"曾因 {reason} 触发止损出局，说明早盘/高位追涨极易遭遇T+1次日低开闷杀，本轮严禁对同类冲高回落股追高",
+                })
+                if len(lessons) >= 5:
+                    break
+    return lessons
 
 
 def market_digest(snapshot: Mapping[str, Any], *, account: Any,
@@ -248,6 +446,7 @@ def market_digest(snapshot: Mapping[str, Any], *, account: Any,
                     "price_cents": item.get("price_cents"),
                     "reason": item.get("reason"),
                 })
+    held = held_positions(account, quotes)
     return {
         "quote_time": snapshot.get("quote_time"),
         "quote_time_estimated": bool(snapshot.get("quote_time_estimated")),
@@ -257,8 +456,11 @@ def market_digest(snapshot: Mapping[str, Any], *, account: Any,
                                   if amplitudes else None),
         "account_as_of_round_id": account.get("as_of_round_id") if isinstance(account, Mapping) else None,
         "slots": slots,
-        "held_positions": held_positions(account, quotes),
+        "held_positions": held,
         "ranked_candidates": ranked_candidates(quotes),
+        "slot_candidates": build_slot_candidates(quotes),
+        "market_sentiment": compute_market_sentiment(quotes),
+        "recent_bull_trap_lessons": extract_bull_trap_lessons(held, trades, quotes),
         "recent_trades": recent,
     }
 

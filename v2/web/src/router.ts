@@ -55,9 +55,20 @@ export const NAV = [
   {
     id: "research",
     label: "研究",
-    hint: "候选治理 · 证据 · 历史",
+    hint: "候选 · 数据底座 · 证据",
     views: [
       { id: "candidates", label: "候选评审" },
+      { id: "coverage", label: "数据底座" },
+      { id: "evidence", label: "策略证据" },
+    ],
+  },
+  {
+    id: "settings",
+    label: "设置",
+    hint: "AI 模型 · 长期运行",
+    views: [
+      { id: "ai", label: "AI 模型" },
+      { id: "runtime", label: "长期运行" },
     ],
   },
 ] as const;

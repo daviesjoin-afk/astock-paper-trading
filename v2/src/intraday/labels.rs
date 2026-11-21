@@ -136,6 +136,8 @@ pub fn blocked_label(blocked_reason: Option<&str>) -> String {
         Some("max_positions") => "持仓已满",
         Some("lot_too_expensive") => "一手买不起（股价过高）",
         Some("fee_exceeds_notional") => "手续费超过金额",
+        Some("morning_cooldown_guard") => "早盘开盘冷静期（09:30-09:41 防冲高诱多）",
+        Some("bull_trap_divergence") => "主力诱多形态拦截（破均价线/冲高长上影回落）",
         Some(other) => other,
     }
     .to_string()

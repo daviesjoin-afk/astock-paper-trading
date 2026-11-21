@@ -234,6 +234,26 @@ type SymbolArchive = {
   events: SymbolArchiveEvent[];
 };
 
+type LiveSentiment = {
+  round_id: string | null;
+  quote_time: string | null;
+  total_quotes: number;
+  up_count: number;
+  down_count: number;
+  flat_count: number;
+  up_ratio_bps: number;
+  strong_count: number;
+  weak_count: number;
+  limit_up_count: number;
+  limit_down_count: number;
+  bull_trap_count: number;
+  bull_trap_rate_bps: number;
+  score: number;
+  label: string;
+  posture: string;
+  recommended_max_exposure_bps: number;
+};
+
 type LiveData = {
   account: LiveAccountView | null;
   rounds: LiveRound[] | null;
@@ -243,6 +263,7 @@ type LiveData = {
   decisionsTotal: number | null;
   trades: LiveTrade[] | null;
   curve: LiveEquityPoint[] | null;
+  sentiment: LiveSentiment | null;
   /** null = not loaded yet; [] = loaded and empty. */
   ai: AiObservation[] | null;
   evolution: EvolutionPreview[] | null;
@@ -328,6 +349,7 @@ const data: LiveData = {
   decisionsTotal: null,
   trades: null,
   curve: null,
+  sentiment: null,
   ai: null,
   evolution: null,
   risk: null,
@@ -376,6 +398,11 @@ const percent = (bps: number | null | undefined): string => {
   if (bps === null || bps === undefined || !Number.isFinite(bps)) return EMPTY;
   const value = bps / 100;
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+};
+
+const pnlClass = (value: number | null | undefined): string => {
+  if (value === null || value === undefined || !Number.isFinite(value) || value === 0) return "";
+  return value > 0 ? "pos" : "neg";
 };
 
 const finite = (value: number | null | undefined): number | null =>
@@ -437,10 +464,75 @@ const blockedFallback = (reason: string | null | undefined): string => {
     no_live_price: "没有实时价格",
     max_positions: "持仓已满",
     no_live_quote: "没有行情",
+    morning_cooldown_guard: "早盘冷静期（防冲动追高）",
+    bull_trap_divergence: "主力诱多形态拦截（破均价线/冲高长上影回落）",
+    ai_blocked: "AI 建议回避",
+    research_entry_gate: "弱市提高开仓门槛",
   };
   return table[reason] ??
     (reason.startsWith("invalid_quote") ? "行情数据异常" : text(reason));
 };
+
+const translateTokens = (
+  raw: string | null | undefined,
+  table: Record<string, string>,
+): string => {
+  if (!raw || !raw.trim()) return EMPTY;
+  const parts = raw
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      if (part.startsWith("ai_reason:")) return `AI 依据：${escapeHtml(part.slice(10))}`;
+      return table[part] ?? escapeHtml(part);
+    });
+  return parts.length > 0 ? parts.join("；") : EMPTY;
+};
+
+const aiReasonLabel = (reason: string | null | undefined): string =>
+  translateTokens(reason, {
+    no_advice: "本轮未提供建议",
+    no_reason: "未附理由",
+    low_confidence: "置信度不足，未采纳",
+    below_confidence_threshold: "低于置信度门槛，未采纳",
+    clamped: "已按风控边界裁剪",
+    accepted: "已采纳",
+  });
+
+const evolutionReasonLabel = (reason: string | null | undefined): string =>
+  translateTokens(reason, {
+    proposal_not_validated: "提案未通过验证",
+    kept_inert: "保持未生效（仅待人工评审）",
+    insufficient_rounds: "轮次不足",
+    no_change: "无需调整",
+  });
+
+const symbolNoteLabel = (note: string | null | undefined): string =>
+  translateTokens(note, {
+    ai_force_buy: "AI 强化买入",
+    ai_force_sell: "AI 强化卖出",
+    ai_chase_guarded: "防追高/炸板护栏拦截",
+    vwap_breakdown_trap: "跌破日内均价线（疑似诱多派发）",
+    bull_trap_divergence: "主力诱多形态拦截",
+    morning_cooldown_guard: "早盘冷静期（防冲动追高）",
+    ai_block: "AI 建议回避",
+    ai_entry_pause: "AI 建议暂缓开仓",
+    ai_weak_buffer: "AI 弱市提高门槛",
+    ai_strong_relief: "AI 强市适度放宽",
+    amount_audit_only: "成交额仅作审计",
+    amount_missing_audit: "缺少成交额",
+    volume_ratio_missing: "缺少量比基准",
+    explicit_trailing_closes_used: "使用历史收盘序列",
+    limit_fallback_board: "按板块规则估算涨跌停",
+    volume_used_only_for_volume_ratio: "成交量仅用于量比",
+    snapshot_only: "仅用盘中快照评分",
+    scale_in: "持仓加仓",
+    t_plus_one: "今天刚买，明天才能卖",
+    cash_budget: "现金不够",
+    limit_up_sealed: "已涨停，买不进",
+    limit_down_sealed: "已跌停，卖不出",
+    max_positions: "持仓已满",
+  });
 
 /** "AI 看法" combines direction and confidence into one phrase a person reads. */
 const aiViewCell = (
@@ -682,6 +774,22 @@ async function refreshLive(): Promise<void> {
     data.rounds = isArray<LiveRound>(rounds) ? rounds : [];
     data.trades = isArray<LiveTrade>(trades) ? trades : [];
     data.curve = isArray<LiveEquityPoint>(curve) ? curve : [];
+    if (isArray<LiveRound>(rounds) && rounds.length > 0) {
+      try {
+        const sResp = await fetch("/v2/live/sentiment", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (sResp.ok) {
+          const sJson = (await sResp.json()) as unknown;
+          if (isRecord(sJson)) data.sentiment = sJson as unknown as LiveSentiment;
+        }
+      } catch {
+        // Optional sentiment gauge never blocks core dashboard rendering.
+      }
+    } else {
+      data.sentiment = null;
+    }
     filters.roundId = desired;
     data.decisions = desired && payload !== null ? payload.decisions : [];
     data.decisionsTotal = desired && payload !== null ? payload.total : null;
@@ -751,6 +859,7 @@ function statusPanel(): string {
   const statusState = state.status === "loading" || state.status === "error" ? state.status : "ready";
   return `<section class="panel live-status" data-state="${statusState}" aria-live="polite">
     <div class="toolbar" style="border-bottom:0">
+      <span class="live-dot" aria-hidden="true"></span>
       <span>${statusMessage}</span>
       <span class="live-dim">${fetched}</span>
       <button type="button" class="btn btn-quiet" id="live-refresh" data-testid="live-refresh"${loading ? " disabled" : ""}>刷新</button>
@@ -799,6 +908,14 @@ function renderEquityCurve(points: LiveEquityPoint[]): string {
     .join(" ");
   const area = `${path} L${x(points.length - 1).toFixed(2)},${(padY + plotHeight).toFixed(2)} L${x(0).toFixed(2)},${(padY + plotHeight).toFixed(2)} Z`;
   const stroke = values[values.length - 1] >= values[0] ? "var(--positive)" : "var(--negative)";
+  const guideYs = [padY + plotHeight * 0.25, padY + plotHeight * 0.5, padY + plotHeight * 0.75];
+  const guides = guideYs
+    .map((gy) => `<line class="curve-baseline" x1="${padX}" y1="${gy.toFixed(1)}" x2="${width - padX}" y2="${gy.toFixed(1)}" />`)
+    .join("");
+  const lastX = x(points.length - 1).toFixed(2);
+  const lastY = y(values[values.length - 1]).toFixed(2);
+  const endDot = `<circle cx="${lastX}" cy="${lastY}" r="6" fill="${stroke}" fill-opacity="0.18" />
+    <circle cx="${lastX}" cy="${lastY}" r="3.2" fill="${stroke}" />`;
   return `<div class="chart-wrap">
     <svg class="curve" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"
          role="img" aria-label="盘中权益曲线，共 ${points.length} 个轮次">
@@ -808,14 +925,14 @@ function renderEquityCurve(points: LiveEquityPoint[]): string {
           <stop offset="100%" stop-color="${stroke}" stop-opacity="0.02" />
         </linearGradient>
       </defs>
+      ${guides}
       <path d="${area}" fill="url(#live-fill)" stroke="none" />
-      <path d="${path}" fill="none" stroke="${stroke}" stroke-width="1.8"
+      <path d="${path}" fill="none" stroke="${stroke}" stroke-width="2"
             stroke-linejoin="round" stroke-linecap="round" />
-      <text class="curve-label" x="${padX}" y="${height - 4}">${timeLabel(points[0].quote_time)}</text>
-      <text class="curve-label curve-label-end" x="${width - padX}" y="${height - 4}"
-            text-anchor="end">${timeLabel(points[points.length - 1].quote_time)}</text>
+      ${endDot}
     </svg>
-    <div class="live-scale"><span>${money(min)}</span><span>最高 ${money(max)}</span><span>${money(values[values.length - 1])}</span></div>
+    <div class="live-scale"><span>${timeLabel(points[0].quote_time)}</span><span>${timeLabel(points[points.length - 1].quote_time)}</span></div>
+    <div class="live-scale"><span>最低 ${money(min)}</span><span>最高 ${money(max)}</span><span>最新 ${money(values[values.length - 1])}</span></div>
   </div>`;
 }
 
@@ -836,8 +953,8 @@ function renderDashboard(): string {
     <dl class="hero-figures">
       <div><dt>本金</dt><dd>${money(account?.initial_cash_cents)}</dd></div>
       <div><dt>总资产</dt><dd>${money(account?.equity_cents)}</dd></div>
-      <div><dt>累计收益</dt><dd>${signedMoney(account?.profit_cents)}</dd></div>
-      <div><dt>收益率</dt><dd>${percent(account?.return_bps)}</dd></div>
+      <div><dt>累计收益</dt><dd class="${pnlClass(account?.profit_cents)}">${signedMoney(account?.profit_cents)}</dd></div>
+      <div><dt>收益率</dt><dd class="${pnlClass(account?.return_bps)}">${percent(account?.return_bps)}</dd></div>
       <div><dt>可用现金</dt><dd>${money(account?.cash_cents)}</dd></div>
     </dl>
   </section>`;
@@ -850,7 +967,7 @@ function renderDashboard(): string {
       ? "挑走势稳、波动小的股票，单只最多投 15%"
       : "追近期涨得快的股票，单只最多投 30%";
     return `<article class="strategy-card live-strategy-card" data-slot="${id}">
-      <header><div><p class="eyebrow">${id === "steady" ? "求稳" : "求快"}</p><h3>${title}</h3></div></header>
+      <header><div><span class="slot-badge">${id === "steady" ? "求稳" : "求快"}</span><h3>${title}</h3></div></header>
       <p class="strategy-desc">${desc}。</p>
       <dl class="metric-grid">
         <div><dt>这个策略的钱</dt><dd>${money(view?.equity_cents)}</dd></div>
@@ -858,7 +975,7 @@ function renderDashboard(): string {
         <div><dt>还剩现金</dt><dd>${money(view?.cash_cents)}</dd></div>
         <div><dt>持有几只</dt><dd>${count(view?.positions)}</dd></div>
         <div><dt>今天能卖几只</dt><dd>${count(view?.sellable_positions)}</dd></div>
-        <div><dt>赚了多少</dt><dd>${view ? signedMoney(profitFromPoints(view.slot)) : EMPTY}</dd></div>
+        <div><dt>赚了多少</dt><dd class="${view ? pnlClass(profitFromPoints(view.slot)) : ""}">${view ? signedMoney(profitFromPoints(view.slot)) : EMPTY}</dd></div>
       </dl>
     </article>`;
   };
@@ -871,9 +988,6 @@ function renderDashboard(): string {
       pickLabel(round.ai_label, aiLabel(round.ai_ok)),
       aiClass(round.ai_ok),
     )
-    : EMPTY;
-  const snapshotTime = curve.length > 0
-    ? timeLabel(curve[curve.length - 1].quote_time)
     : EMPTY;
   const summary = section(
     "刚才那一轮",
@@ -911,7 +1025,7 @@ function renderDashboard(): string {
             <td class="num-col">${money(item.avg_cost_cents)}</td>
             <td class="num-col">${money(item.last_price_cents)}</td>
             <td class="num-col">${money(item.market_value_cents)}</td>
-            <td class="num-col">${signedMoney(pnl)}${pnlPct !== null ? ` <span class="live-dim">(${pnlPct > 0 ? "+" : ""}${(pnlPct / 100).toFixed(2)}%)</span>` : ""}</td>
+            <td class="num-col ${pnlClass(pnl)}">${signedMoney(pnl)}${pnlPct !== null ? ` <span class="live-dim">(${pnlPct > 0 ? "+" : ""}${(pnlPct / 100).toFixed(2)}%)</span>` : ""}</td>
             <td>${item.sellable_quantity > 0 ? "可以" : `<span class="live-dim">明天</span>`}</td>
           </tr>`;
         }).join("")}</tbody></table></div>`;
@@ -923,7 +1037,24 @@ function renderDashboard(): string {
     holdingsBody,
     `<span class="count">${positions.length} 只</span>`,
   );
-  return `${statusPanel()}${figures}${slotCards}${holdings}${summary}${section(
+  const s = data.sentiment;
+  const sentimentSection = s && s.total_quotes > 0
+    ? section(
+      "市场情绪与赚钱效应温度计",
+      escapeHtml(s.posture || "基于本轮全市场涨跌广度、涨跌停比与冲高回落（炸板）率实时合成。"),
+      `<dl class="metric-grid wide" style="padding:16px 20px;margin:0">
+        <div><dt>情绪温度</dt><dd class="${s.score >= 58 ? "pos" : s.score <= 40 ? "neg" : ""}">${count(s.score)} / 100 · ${escapeHtml(s.label)}</dd></div>
+        <div><dt>涨跌广度</dt><dd>${count(s.up_count)} 涨 / ${count(s.down_count)} 跌（${(s.up_ratio_bps / 100).toFixed(1)}%）</dd></div>
+        <div><dt>大涨 / 大跌 (≥5%)</dt><dd><span class="pos">${count(s.strong_count)}</span> / <span class="neg">${count(s.weak_count)}</span></dd></div>
+        <div><dt>涨停 / 跌停</dt><dd><span class="pos">${count(s.limit_up_count)}</span> / <span class="neg">${count(s.limit_down_count)}</span></dd></div>
+        <div><dt>炸板 / 冲高回落率</dt><dd class="${s.bull_trap_rate_bps >= 3500 ? "neg" : ""}">${(s.bull_trap_rate_bps / 100).toFixed(1)}%（${count(s.bull_trap_count)} 只）</dd></div>
+        <div><dt>建议槽位仓位上限</dt><dd>${(s.recommended_max_exposure_bps / 100).toFixed(0)}%</dd></div>
+      </dl>`,
+      `<span class="count">全市场 ${count(s.total_quotes)} 只</span>`,
+    )
+    : "";
+
+  return `${statusPanel()}${figures}${sentimentSection}${slotCards}${holdings}${summary}${section(
     "账户总值变化", "每跑完一轮记一个点，你能看到钱是怎么变的。", renderEquityCurve(curve),
     `<span class="count">共 ${curve.length} 点 · 最新 ${lastEquity}</span>`,
   )}`;
@@ -1098,7 +1229,7 @@ function renderAi(): string {
             <td class="num-col">${count(item.confidence)}</td>
             <td>${item.accepted ? flag("已采纳", "ok") : flag("未采纳", "plain")}</td>
             <td>${item.clamped ? flag("已裁剪", "applied") : flag("无", "plain")}</td>
-            <td class="live-note">${text(item.reason)}</td>
+            <td class="live-note">${aiReasonLabel(item.reason)}</td>
             <td>${renderSignalBaseline(item.signal_baseline)}</td>
             <td><details class="live-details"><summary>查看原文</summary><pre class="live-raw">${text(item.raw_advice)}</pre></details></td>
           </tr>`).join("")}</tbody></table></div>`;
@@ -1127,10 +1258,10 @@ function renderEvolution(): string {
               <td class="num-col">${delta("max_positions_delta")}</td>
               <td class="num-col">${delta("cash_floor_delta_bps")}</td>
               <td>${item.accepted ? flag("已采纳", "ok") : flag("待人工评审", "plain")}</td>
-              <td class="num-col">${percent(numericField(before, "profit_bps"))}</td>
+              <td class="num-col ${pnlClass(numericField(before, "profit_bps"))}">${percent(numericField(before, "profit_bps"))}</td>
               <td class="num-col">${count(numericField(before, "round_count"))}</td>
               <td class="num-col">${percent(numericField(before, "max_drawdown_bps"))}</td>
-              <td class="live-note">${text(item.reason)}</td>
+              <td class="live-note">${evolutionReasonLabel(item.reason)}</td>
             </tr>`;
           }).join("")}</tbody></table></div>`;
   return `${statusPanel()}${section("进化提案", "收盘后根据已落盘权益生成的调整建议。提案只供人工评审，不会自动生效。", body, `<span class="count">${rows ? `共 ${rows.length} 条` : EMPTY}</span>`)}`;
@@ -1188,8 +1319,8 @@ function renderSymbol(): string {
         <td>${pickLabel(item.side_label, sideLabel(item.side))}</td>
         <td class="num-col">${item.kind === "trade" ? count(item.quantity) : EMPTY}</td>
         <td class="num-col">${item.kind === "trade" ? money(item.price_cents) : EMPTY}</td>
-        <td class="num-col">${item.kind === "decision" ? count(item.score) : EMPTY}</td>
-        <td class="live-note">${pickLabel(item.blocked_label, text(item.note))}</td>
+        <td class="num-col">${item.kind === "decision" ? scoreCell(item.score) : EMPTY}</td>
+        <td class="live-note">${pickLabel(item.blocked_label, symbolNoteLabel(item.note))}</td>
       </tr>`).join("")}</tbody></table></div>`;
     result = `${section("档案汇总", stockText(archive.name, archive.symbol), metrics)}${section("事件记录", "成交与信号按时间从新到旧排列。", events, `<span class="count">共 ${archive.events.length} 条</span>`)}`;
   }
@@ -1402,6 +1533,21 @@ export function buildLiveReport(): string {
     lines.push(`AI 采纳情况：最近 ${count(observations.length)} 条中 ${count(accepted)} 条已采纳、${count(observations.length - accepted)} 条未采纳`);
   }
   return lines.join("\n");
+}
+
+/** 确保在任意页面点击「复制复盘」都能拿到盘中复盘，不触碰已退居后台的日线接口。 */
+export async function ensureLiveReport(): Promise<string> {
+  if (!loaded && !loading) {
+    const [account, rounds, trades] = await Promise.all([
+      optional<LiveAccountView>("account", "/v2/live/account"),
+      optional<LiveRound[]>("rounds", "/v2/live/rounds"),
+      optional<LiveTrade[]>("trades", "/v2/live/trades"),
+    ]);
+    if (data.account === null && isRecord(account)) data.account = account;
+    if (data.rounds === null && isArray<LiveRound>(rounds)) data.rounds = rounds;
+    if (data.trades === null && isArray<LiveTrade>(trades)) data.trades = trades;
+  }
+  return buildLiveReport();
 }
 
 /** Header 刷新按钮在 live 模块激活时只刷新盘中接口。 */

@@ -48,6 +48,7 @@ pub struct CorporateAction {
 
 impl CorporateAction {
     /// Whether this event changes the share count and therefore the price.
+    #[cfg(test)]
     fn is_pure_cash(&self) -> bool {
         self.bonus_per_ten == 0 && self.transfer_per_ten == 0
     }

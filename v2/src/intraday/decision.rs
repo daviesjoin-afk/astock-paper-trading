@@ -43,6 +43,8 @@ pub struct Advice {
     pub suggestions: Vec<AdviceSuggestion>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
     /// An opaque LLM JSON object or a string containing that JSON. Rust parses
     /// it when structured fields are absent, and stores the original for audit.
     #[serde(default)]
@@ -59,6 +61,12 @@ pub struct AdviceSuggestion {
     pub score_delta: Option<i64>,
     #[serde(default)]
     pub weight_bps: Option<i64>,
+    #[serde(default)]
+    pub target_weight_bps: Option<i64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub slot: Option<String>,
 }
 
 /// A bounded suggestion. Unknown sides become inert `ignore`.
@@ -68,6 +76,22 @@ pub struct ClampedSuggestion {
     pub side: String,
     pub score_delta: i64,
     pub weight_bps: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_weight_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+}
+
+impl ClampedSuggestion {
+    pub fn matches_slot(&self, slot: Slot) -> bool {
+        match self.slot.as_deref() {
+            Some("steady") => slot == Slot::Steady,
+            Some("aggressive") => slot == Slot::Aggressive,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -104,6 +128,8 @@ pub struct AiApplication {
     pub ai_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_baseline: Option<SignalBaseline>,
+    #[serde(default)]
+    pub mode: String,
 }
 
 impl AiApplication {
@@ -124,11 +150,16 @@ impl AiApplication {
             clamped_fields: Vec::new(),
             ai_error: Some(reason.into()),
             signal_baseline: None,
+            mode: "advisory".into(),
         }
     }
 
     pub fn ai_ok(&self) -> bool {
         self.accepted && self.ai_error.is_none()
+    }
+
+    pub fn is_deep(&self) -> bool {
+        self.ai_ok() && self.mode == "deep"
     }
 
     pub fn effective_confidence(&self) -> i64 {
@@ -379,13 +410,35 @@ fn clamp_inner(round_id: &str, advice: Option<Advice>) -> AiApplication {
             &format!("suggestion_weight_bps:{symbol}"),
             &mut notes,
         );
+        let target_weight_bps = item.target_weight_bps.map(|w| w.clamp(0, 10_000));
+        let reason_text = item
+            .reason
+            .as_deref()
+            .map(|r| truncate_chars(r.trim(), MAX_TEXT_CHARS))
+            .filter(|r| !r.is_empty());
+        let slot_filter = item
+            .slot
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "steady" | "aggressive"));
         suggestions.push(ClampedSuggestion {
             symbol,
             side,
             score_delta,
             weight_bps,
+            target_weight_bps,
+            reason: reason_text,
+            slot: slot_filter,
         });
     }
+    let mode = match advice
+        .mode
+        .as_deref()
+        .or_else(|| raw_map.get("mode").and_then(Value::as_str))
+    {
+        Some("deep") => "deep".to_string(),
+        _ => "advisory".to_string(),
+    };
 
     if confidence < MIN_AI_CONFIDENCE {
         errors.push("below_confidence_floor".into());
@@ -432,6 +485,7 @@ fn clamp_inner(round_id: &str, advice: Option<Advice>) -> AiApplication {
         clamped_fields: notes,
         signal_baseline: None,
         ai_error,
+        mode,
     }
 }
 
@@ -854,20 +908,57 @@ pub(super) fn score_candidates_for_research(
                     || advice.effective_weight_tilt_bps() != 0
                     || !advice.active_blocked_symbols().is_empty()
                     || !advice.active_suggestions().is_empty());
-            let suggestion_side = advice
+            let matched_suggestion = advice
                 .active_suggestions()
                 .iter()
-                .find(|item| item.symbol == symbol && item.side != "ignore")
-                .map(|item| item.side.as_str());
+                .find(|item| item.symbol == symbol && item.side != "ignore" && item.matches_slot(slot));
+            let suggestion_side = matched_suggestion.map(|item| item.side.as_str());
+            let mom_prev = evaluated.factors.momentum_prev_close_bps.unwrap_or(0);
+            let mom_open = evaluated.factors.momentum_open_bps.unwrap_or(0);
+            let upper_wick = evaluated.factors.kbar_upper_wick_bps.unwrap_or(0);
+            let limit_dist = evaluated.factors.limit_distance_bps.unwrap_or(1_000);
+            // Compute intraday VWAP distance in bps when both volume and amount are present
+            let vwap_distance_bps: Option<i64> = quote.and_then(|q| {
+                let vol = q.volume()?;
+                let amt = q.amount()?;
+                let vwap = amt / vol;
+                if vwap > 0 {
+                    checked_bps(q.price_cents as i128 - vwap as i128, vwap as i128)
+                } else {
+                    None
+                }
+            });
+            if let Some(vwap_bps) = vwap_distance_bps
+                && vwap_bps <= -150
+                && mom_prev >= 300
+            {
+                notes.push("vwap_breakdown_trap".into());
+            }
+            let chase_or_bull_trap = (mom_prev >= 650 && (mom_open <= -50 || upper_wick >= 150))
+                || (slot == Slot::Steady && mom_prev >= 600 && limit_dist <= 180)
+                || (mom_prev >= 350 && vwap_distance_bps.is_some_and(|v| v <= -180) && mom_open <= -50);
             if ai_active {
                 if held.is_some() && suggestion_side == Some("sell") {
                     side = "sell".into();
                     notes.push("ai_force_sell".into());
                     ai_applied = true;
-                } else if held.is_none() && !ai_blocked && suggestion_side == Some("buy") {
-                    side = "buy".into();
-                    notes.push("ai_force_buy".into());
-                    ai_applied = true;
+                } else if !ai_blocked
+                    && suggestion_side == Some("buy")
+                    && (held.is_none() || advice.is_deep())
+                {
+                    if chase_or_bull_trap {
+                        notes.push("ai_chase_guarded".into());
+                    } else {
+                        if held.is_some() && side != "buy" {
+                            notes.push("scale_in".into());
+                        }
+                        side = "buy".into();
+                        notes.push("ai_force_buy".into());
+                        ai_applied = true;
+                    }
+                }
+                if let Some(reason_note) = matched_suggestion.and_then(|s| s.reason.as_deref()) {
+                    notes.push(format!("ai_reason:{reason_note}"));
                 }
             }
 
@@ -893,9 +984,19 @@ pub(super) fn score_candidates_for_research(
                 {
                     blocked_reason = Some("ai_blocked".into());
                     ai_applied = true;
+                } else if held.is_none()
+                    && side == "buy"
+                    && (mom_prev >= 650 && mom_open <= -100 && upper_wick >= 180
+                        || (mom_prev >= 450 && vwap_distance_bps.is_some_and(|v| v <= -220) && mom_open <= -80))
+                {
+                    blocked_reason = Some("bull_trap_divergence".into());
                 }
             }
-            if blocked_reason.is_none() && held.is_none() && side == "buy"
+            let deep_force_buy = advice.is_deep() && suggestion_side == Some("buy");
+            if blocked_reason.is_none()
+                && held.is_none()
+                && side == "buy"
+                && !deep_force_buy
                 && (pause_new_entries || (new_entry_delta > 0 && !reached_threshold))
             {
                 blocked_reason = Some("research_entry_gate".into());
@@ -1009,6 +1110,7 @@ mod tests {
                 side: "buy".into(),
                 score_delta: Some(999),
                 weight_bps: Some(999),
+                ..AdviceSuggestion::default()
             }],
             ..Advice::default()
         };

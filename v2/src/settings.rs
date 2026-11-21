@@ -1,0 +1,368 @@
+//! Persistent runtime & AI provider settings plus live AI connectivity testing.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::cli::http;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SystemSettings {
+    pub ai_provider: String,
+    pub ai_base_url: String,
+    pub ai_model: String,
+    pub ai_api_key: String,
+    pub ai_enabled: bool,
+    /// "advisory" (bounded tilt) or "deep" (AI-led buy/sell/weight within cash & T+1/limit-band rules).
+    pub ai_depth: String,
+    pub ai_timeout_secs: u64,
+    pub live_interval_secs: u64,
+    pub live_auto_evolve: bool,
+    pub live_daemon_enabled: bool,
+    pub live_universe_path: String,
+    pub updated_at: String,
+}
+
+impl Default for SystemSettings {
+    fn default() -> Self {
+        let env_base = std::env::var("ASTOCK_LLM_BASE").unwrap_or_default();
+        let env_key = std::env::var("ASTOCK_LLM_KEY").unwrap_or_default();
+        let env_model = std::env::var("ASTOCK_LLM_MODEL").unwrap_or_default();
+        let env_universe = std::env::var("ASTOCK_UNIVERSE").unwrap_or_default();
+        Self {
+            ai_provider: if env_base.contains("deepseek") || env_base.is_empty() {
+                "deepseek".into()
+            } else {
+                "custom".into()
+            },
+            ai_base_url: if env_base.is_empty() {
+                "https://api.deepseek.com/v1".into()
+            } else {
+                env_base
+            },
+            ai_model: if env_model.is_empty() {
+                "deepseek-chat".into()
+            } else {
+                env_model
+            },
+            ai_api_key: env_key,
+            ai_enabled: true,
+            ai_depth: "deep".into(),
+            ai_timeout_secs: 25,
+            live_interval_secs: 180,
+            live_auto_evolve: true,
+            live_daemon_enabled: false,
+            live_universe_path: env_universe,
+            updated_at: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DaemonRuntimeStatus {
+    pub daemon_enabled: bool,
+    pub running: bool,
+    pub os: String,
+    pub phase: String,
+    pub last_heartbeat: Option<String>,
+    pub last_round_id: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SettingsPatch {
+    pub ai_provider: Option<String>,
+    pub ai_base_url: Option<String>,
+    pub ai_model: Option<String>,
+    pub ai_api_key: Option<String>,
+    pub ai_enabled: Option<bool>,
+    pub ai_depth: Option<String>,
+    pub ai_timeout_secs: Option<u64>,
+    pub live_interval_secs: Option<u64>,
+    pub live_auto_evolve: Option<bool>,
+    pub live_daemon_enabled: Option<bool>,
+    pub live_universe_path: Option<String>,
+}
+
+pub fn settings_path(live_db_path: &str) -> PathBuf {
+    if let Ok(explicit) = std::env::var("ASTOCK_SETTINGS_PATH")
+        && !explicit.trim().is_empty()
+    {
+        return PathBuf::from(explicit);
+    }
+    let db = Path::new(live_db_path);
+    match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("settings.json"),
+        _ => PathBuf::from("settings.json"),
+    }
+}
+
+pub fn load_settings(path: &Path) -> SystemSettings {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<SystemSettings>(&raw).unwrap_or_default(),
+        Err(_) => SystemSettings::default(),
+    }
+}
+
+pub fn save_settings(path: &Path, settings: &SystemSettings) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("create settings dir failed: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("serialize settings failed: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("write settings tmp failed: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| format!("replace settings failed: {e}"))?;
+    Ok(())
+}
+
+pub fn mask_key(key: &str) -> String {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 8 {
+        return "****".into();
+    }
+    let head: String = chars[..3].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}****{tail}")
+}
+
+pub fn apply_patch(current: &mut SystemSettings, patch: SettingsPatch, now: &str) {
+    if let Some(v) = patch.ai_provider {
+        current.ai_provider = v.trim().to_string();
+    }
+    if let Some(v) = patch.ai_base_url {
+        current.ai_base_url = v.trim().trim_end_matches('/').to_string();
+    }
+    if let Some(v) = patch.ai_model {
+        current.ai_model = v.trim().to_string();
+    }
+    if let Some(v) = patch.ai_api_key {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() && !trimmed.contains("****") {
+            current.ai_api_key = trimmed.to_string();
+        }
+    }
+    if let Some(v) = patch.ai_enabled {
+        current.ai_enabled = v;
+    }
+    if let Some(v) = patch.ai_depth {
+        current.ai_depth = if v == "advisory" {
+            "advisory".into()
+        } else {
+            "deep".into()
+        };
+    }
+    if let Some(v) = patch.ai_timeout_secs {
+        current.ai_timeout_secs = v.clamp(5, 120);
+    }
+    if let Some(v) = patch.live_interval_secs {
+        current.live_interval_secs = v.clamp(30, 1800);
+    }
+    if let Some(v) = patch.live_auto_evolve {
+        current.live_auto_evolve = v;
+    }
+    if let Some(v) = patch.live_daemon_enabled {
+        current.live_daemon_enabled = v;
+    }
+    if let Some(v) = patch.live_universe_path {
+        current.live_universe_path = v.trim().to_string();
+    }
+    current.updated_at = now.to_string();
+}
+
+pub fn redacted_view(settings: &SystemSettings, runtime: &DaemonRuntimeStatus) -> Value {
+    json!({
+        "ai_provider": settings.ai_provider,
+        "ai_base_url": settings.ai_base_url,
+        "ai_model": settings.ai_model,
+        "has_api_key": !settings.ai_api_key.trim().is_empty(),
+        "ai_api_key_masked": mask_key(&settings.ai_api_key),
+        "ai_enabled": settings.ai_enabled,
+        "ai_depth": settings.ai_depth,
+        "ai_timeout_secs": settings.ai_timeout_secs,
+        "live_interval_secs": settings.live_interval_secs,
+        "live_auto_evolve": settings.live_auto_evolve,
+        "live_daemon_enabled": settings.live_daemon_enabled,
+        "live_universe_path": settings.live_universe_path,
+        "updated_at": settings.updated_at,
+        "runtime": runtime,
+    })
+}
+
+pub fn test_ai_connection(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    timeout_secs: u64,
+) -> Value {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() || model.trim().is_empty() || api_key.trim().is_empty() {
+        return json!({
+            "ok": false,
+            "error": "请先填写 Base URL、模型名称和 API Key",
+        });
+    }
+    let endpoint = format!("{base}/chat/completions");
+    let body = json!({
+        "model": model.trim(),
+        "messages": [
+            {"role": "system", "content": "You are a concise trading connectivity check."},
+            {"role": "user", "content": "Reply with OK"}
+        ],
+        "max_tokens": 16,
+        "temperature": 0
+    });
+    let started = Instant::now();
+    let agent = http::agent(Duration::from_secs(timeout_secs.clamp(5, 60)), false);
+    let resp = agent
+        .post(&endpoint)
+        .header("Authorization", &format!("Bearer {}", api_key.trim()))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .send(body.to_string().as_bytes());
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match resp {
+        Ok(mut res) => match res.body_mut().read_to_vec() {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(parsed) => {
+                    let reply = parsed["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or("OK")
+                        .trim()
+                        .to_string();
+                    json!({
+                        "ok": true,
+                        "latency_ms": latency_ms,
+                        "model": parsed["model"].as_str().unwrap_or(model.trim()),
+                        "reply": reply,
+                    })
+                }
+                Err(e) => json!({
+                    "ok": false,
+                    "latency_ms": latency_ms,
+                    "error": format!("返回非 JSON：{e}"),
+                }),
+            },
+            Err(e) => json!({
+                "ok": false,
+                "latency_ms": latency_ms,
+                "error": format!("读取响应失败：{e}"),
+            }),
+        },
+        Err(e) => json!({
+            "ok": false,
+            "latency_ms": latency_ms,
+            "error": format!("请求失败：{e}"),
+        }),
+    }
+}
+
+/// Build an enriched context prompt (account equity, positions, market breadth, top quotes)
+/// and ask the configured LLM provider for structured intraday trading advice.
+pub fn call_ai_live_advice(
+    settings: &SystemSettings,
+    context_snapshot: &Value,
+) -> Result<Value, String> {
+    let base = settings.ai_base_url.trim().trim_end_matches('/');
+    if !settings.ai_enabled || base.is_empty() || settings.ai_model.trim().is_empty() || settings.ai_api_key.trim().is_empty() {
+        return Err("ai_not_configured".into());
+    }
+    let endpoint = format!("{base}/chat/completions");
+    let depth_instruction = if settings.ai_depth == "deep" {
+        "当前为【深度托管模式】：你可以直接决定个股的买卖方向（buy/sell/hold/avoid）与目标仓位万分比 target_weight_bps（0~10000，例如 2500 代表 25% 槽位资产）。请务必严格执行【主力意图与反诱多五维纪律】：\n\
+         1. 看情绪与炸板率（market_sentiment）：当 score < 42（冰点/偏冷）或 bull_trap_rate_bps >= 3000（炸板率≥30%）时，主力极易拉高出货，严禁追高开仓，优先去弱留强或空仓观望；\n\
+         2. 查日内均价线（vwap_distance_bps）：现价跌破日内成交均价线（vwap_distance_bps < 0，尤其是 <= -120 bps）说明当日追高筹码全线被套，属典型主力拉高派发（钓鱼线），一票否决买入；\n\
+         3. 辨假阳真阴与长上影（upper_wick_bps / bull_trap_risk）：若 bull_trap_risk >= 30 或 upper_wick_bps >= 150（冲高留长上影）或高开低走，严禁买入并列入 avoid/blocked_symbols；\n\
+         4. 防高位接盘（cum_gain_3d_bps / dist_20d_high_bps）：近 3 日累计涨幅 cum_gain_3d_bps >= 1800（18%）且日内分位不足 80% 的高位加速股，属于击鼓传花末端，严禁接盘；\n\
+         5. 读近期诱多错题本（recent_bull_trap_lessons）：牢记本账户近期被套与止损教训，绝不在同类形态上重蹈覆辙；\n\
+         6. 双槽隔离与 T+1 约束：为每条建议明确指定 slot（\"steady\" 或 \"aggressive\"），优先从 slot_candidates 对应池选股；早盘 09:30~09:45 审慎开新仓，sellable_quantity=0 的当日新仓不可卖出。"
+    } else {
+        "当前为【顾问模式】：请结合 market_sentiment、候选股的 vwap_distance_bps / bull_trap_risk 反诱多指标以及 recent_bull_trap_lessons 错题本，给出全局市场偏向 bias（-20~20）、入场门槛调整 entry_delta（-15~15）、权重倾斜 weight_tilt_bps（-1000~1000）和分槽位建议 suggestions。"
+    };
+    let system_prompt = format!(
+        "你是 A 股盘中量化模拟交易 AI 决策引擎（内置主力诱多识破机制）。请严格根据提供的实时市场情绪（market_sentiment）、双槽抗诱多候选（slot_candidates）、日内均价线偏离（vwap_distance_bps）、诱多风险分（bull_trap_risk）、近期诱多错题本（recent_bull_trap_lessons）与 T+1 可卖股数输出纯 JSON（不要包含 markdown 代码块）。\n\
+         {depth_instruction}\n\
+         JSON 格式：{{\"mode\":\"{}\",\"confidence\":0-100,\"bias\":-20..20,\"entry_delta\":-15..15,\"weight_tilt_bps\":-1000..1000,\"blocked_symbols\":[\"高诱多风险代码\"],\"reason\":\"简明中文判断（含情绪温度、主力诱多识别结论与仓位策略）\",\"suggestions\":[{{\"symbol\":\"600000.SH\",\"slot\":\"steady|aggressive\",\"side\":\"buy|sell|avoid|hold\",\"target_weight_bps\":0-10000,\"score_delta\":-20..20,\"reason\":\"中文理由（说明均价线/诱多风险/趋势依据）\"}}]}}",
+        settings.ai_depth
+    );
+    let body = json!({
+        "model": settings.ai_model.trim(),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context_snapshot.to_string()}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900
+    });
+    let agent = http::agent(Duration::from_secs(settings.ai_timeout_secs.clamp(5, 120)), false);
+    let mut res = agent
+        .post(&endpoint)
+        .header("Authorization", &format!("Bearer {}", settings.ai_api_key.trim()))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .send(body.to_string().as_bytes())
+        .map_err(|e| format!("ai_http_error: {e}"))?;
+    let bytes = res
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| format!("ai_read_error: {e}"))?;
+    let parsed: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("ai_json_error: {e}"))?;
+    let content = parsed["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| "ai_empty_content".to_string())?;
+    let cleaned = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let mut advice: Value = serde_json::from_str(cleaned)
+        .map_err(|e| format!("ai_advice_parse_error: {e}"))?;
+    if let Some(obj) = advice.as_object_mut() {
+        obj.entry("model".to_string())
+            .or_insert_with(|| Value::String(settings.ai_model.clone()));
+        obj.entry("mode".to_string())
+            .or_insert_with(|| Value::String(settings.ai_depth.clone()));
+    }
+    Ok(advice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_and_patch_preserve_existing_secret_when_masked_or_empty() {
+        let mut s = SystemSettings {
+            ai_api_key: "sk-1234567890abcdef".into(),
+            ..Default::default()
+        };
+        assert_eq!(mask_key(&s.ai_api_key), "sk-****cdef");
+
+        apply_patch(
+            &mut s,
+            SettingsPatch {
+                ai_api_key: Some("sk-****cdef".into()),
+                ai_depth: Some("deep".into()),
+                live_interval_secs: Some(120),
+                ..Default::default()
+            },
+            "2026-11-20T15:00:00+08:00",
+        );
+        assert_eq!(s.ai_api_key, "sk-1234567890abcdef");
+        assert_eq!(s.ai_depth, "deep");
+        assert_eq!(s.live_interval_secs, 120);
+    }
+}

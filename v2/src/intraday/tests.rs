@@ -276,9 +276,10 @@ fn clamped_ai_advice_changes_the_fill_but_never_escapes_rust_bounds() {
             symbol: "600000.SH".into(),
             side: "buy".into(),
             score_delta: Some(99_999),
-            weight_bps: Some(-99_999),
+            weight_bps: Some(-99_999), ..Default::default()
         }],
         reason: Some("clamped in Rust".into()),
+        mode: None,
         raw_advice: None,
     });
     let ai = ai_store.run_round(&ai_request).unwrap();
@@ -322,9 +323,10 @@ fn low_confidence_or_broken_advice_fails_closed_to_neutral() {
                 symbol: "600000.SH".into(),
                 side: "buy".into(),
                 score_delta: Some(100),
-                weight_bps: Some(100),
+                weight_bps: Some(100), ..Default::default()
             }],
             reason: Some("ignore".into()),
+            mode: None,
             raw_advice: None,
         }),
     );
@@ -418,7 +420,7 @@ fn cash_never_goes_negative_and_a_missing_price_never_becomes_prev_close() {
             symbol: "600000.SH".into(),
             side: "buy".into(),
             score_delta: Some(20),
-            weight_bps: Some(500),
+            weight_bps: Some(500), ..Default::default()
         }],
         ..Advice::default()
     });
@@ -1477,7 +1479,7 @@ fn hold_decisions_store_a_compact_factor_summary_orders_keep_everything() {
     quiet.high_cents = Some(1_002);
     quiet.low_cents = Some(999);
     quiet.open_cents = Some(1_000);
-    let outcome = store
+    let _outcome = store
         .run_round(&request(
             "r-compact",
             "2026-11-20T09:31:00+08:00",
@@ -1674,7 +1676,7 @@ fn ai_entry_block_wins_over_buy_but_never_forces_a_held_position_to_sell() {
         blocked_symbols: vec!["600000.SH".into(), "600001.SH".into()],
         suggestions: vec![AdviceSuggestion {
             symbol: "600001.SH".into(), side: "buy".into(),
-            score_delta: None, weight_bps: None,
+            score_delta: None, weight_bps: None, ..Default::default()
         }],
         ..Advice::default()
     });
@@ -1695,7 +1697,7 @@ fn ai_entry_block_wins_over_buy_but_never_forces_a_held_position_to_sell() {
     round.round_id = "explicit-exit".into();
     round.advice.as_mut().unwrap().suggestions.push(AdviceSuggestion {
         symbol: "600000.SH".into(), side: "sell".into(),
-        score_delta: None, weight_bps: None,
+        score_delta: None, weight_bps: None, ..Default::default()
     });
     let exit = db.run_round(&round).unwrap();
     assert_eq!(exit.trades.len(), 2);
@@ -1736,7 +1738,7 @@ fn a_slot_holds_five_names_and_tops_up_under_its_ceiling() {
         model: Some("test-llm".into()), confidence: Some(90),
         suggestions: vec![AdviceSuggestion {
             symbol: "600000.SH".into(), side: "buy".into(),
-            score_delta: None, weight_bps: Some(-2_000),
+            score_delta: None, weight_bps: Some(-2_000), ..Default::default()
         }],
         ..Advice::default()
     });
@@ -1791,7 +1793,7 @@ fn research_entry_pause_blocks_ai_buys_in_weak_market_only() {
     ]);
     round.advice = Some(Advice { confidence: Some(95), suggestions: vec![
         AdviceSuggestion { symbol: "600000.SH".into(), side: "buy".into(),
-            score_delta: None, weight_bps: None },
+            score_delta: None, weight_bps: None, ..Default::default() },
     ], ..Advice::default() });
     let control = baseline.run_round(&round).unwrap();
     assert_eq!(control.round.regime, "risk_off");
@@ -1856,7 +1858,7 @@ fn research_weak_buffer_applies_to_an_ai_buy_below_the_new_threshold() {
     ]);
     round.advice = Some(Advice { confidence: Some(95), suggestions: vec![
         AdviceSuggestion { symbol: "600000.SH".into(), side: "buy".into(),
-            score_delta: None, weight_bps: None },
+            score_delta: None, weight_bps: None, ..Default::default() },
     ], ..Advice::default() });
     assert_eq!(control.run_round(&round).unwrap().trades.len(), 2);
     let trial = candidate.run_research_round(&round, WeakEntryBuffer { points: 5 }).unwrap();
