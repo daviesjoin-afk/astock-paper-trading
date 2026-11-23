@@ -337,3 +337,15 @@ value:1a2ca8ef81169150a331fa1a805cd3af2c5c6938a6e69d7c6c14c5e97fa2c5bc
 # a credential; both are recomputable from committed public inputs.
 value:815770730aed38e151bf944ab6b5fb845379238f096bd48945fd307186ed128d
 value:353a24025fdb8aa8aaee094af829ec27de7441f21c9dc76fbec450597bb51d8c
+
+# Public AI provider API endpoints offered in the settings UI: the user picks a
+# provider and these are its documented base URLs, not a private deployment.
+host:api.deepseek.com
+host:dashscope.aliyuncs.com
+host:api.siliconflow.cn
+host:api.openai.com
+
+# Public Git commit ids cited as historical baselines in CHANGELOG and the
+# selection-validation record. They are repository object ids, not credentials.
+value:96a79ff64111109d5c258a965cc0dd8048f88426
+value:6c64f43e1d055cf9842eb068034d644e877324bf
