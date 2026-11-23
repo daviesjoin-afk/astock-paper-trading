@@ -294,8 +294,11 @@ pub fn call_ai_live_advice(
     // Only facts that are byte-identical across rounds belong here. The slot
     // books carry cash/equity, which changes with every fill, so they stay in
     // the volatile tail: caching them would break the prefix on every trade.
-    const STABLE_KEYS: [&str; 3] = [
-        "market_table", "recent_bull_trap_lessons", "account_as_of_round_id",
+    // `own_track_record` is measured once per session, so it belongs with the
+    // stable structure rather than in the volatile tail.
+    const STABLE_KEYS: [&str; 4] = [
+        "market_table", "own_track_record", "recent_bull_trap_lessons",
+        "account_as_of_round_id",
     ];
     let mut stable = serde_json::Map::new();
     let mut volatile = serde_json::Map::new();
@@ -452,6 +455,7 @@ pub fn live_advice_prompt(settings: &SystemSettings) -> (String, String) {
         "你是 A 股盘中量化模拟交易 AI 决策引擎（内置主力诱多识破机制）。请严格根据提供的实时市场情绪（market_sentiment）、双槽抗诱多候选（slot_candidates）、日内均价线偏离（vwap_distance_bps）、诱多风险分（bull_trap_risk）、近期诱多错题本（recent_bull_trap_lessons）与 T+1 可卖股数输出纯 JSON（不要包含 markdown 代码块）。
          {depth_instruction}
          【符号约定，最容易搞反】entry_delta 直接加到开仓门槛分数上：正值 = 更严格、更难买；负值 = 更宽松、更容易买。看空、要求收紧、禁止追高时必须给正值；只有明确要放宽门槛去找机会时才给负值。输出前自检：reason 说防守，entry_delta 就必须是正数。bias 同为负值更谨慎。
+         【先读自己的成绩单】own_track_record 按市场状态给出你历史上的实测结果：blocked_symbols.mean_bps 是你禁买后这些股票的平均涨跌（正数 = 你拦错了，错过了涨幅）；named_buys.mean_bps 是你点名买入后的平均涨跌（负数 = 你点错了）。cases 过少的状态不会出现，不要外推。若当前状态下你拦错的幅度明显为正，本轮该状态必须收紧禁买标准，只拦硬证据（涨停封板、破均价线、长上影），不得因排名靠前就拦；若点名买入长期为负，就不点名，交给内核信号执行。
          【禁买清单】全市场表里凡满足禁买条件的代码都要写进 blocked_symbols（最多 40 个），不要只挑几个；漏写等于默许买入。
          JSON 格式：{{\"mode\":\"{}\",\"confidence\":0-100,\"bias\":-20..20,\"entry_delta\":-15..15,\"weight_tilt_bps\":-1000..1000,\"blocked_symbols\":[\"高诱多风险代码\"],\"reason\":\"简明中文判断（含情绪温度、主力诱多识别结论与仓位策略）\",\"suggestions\":[{{\"symbol\":\"600000.SH\",\"slot\":\"steady|aggressive\",\"side\":\"buy|sell|avoid|hold\",\"target_weight_bps\":0-10000,\"score_delta\":-20..20,\"reason\":\"中文理由（说明均价线/诱多风险/趋势依据）\"}}]}}",
         settings.ai_depth
@@ -505,7 +509,7 @@ mod tests {
             let mut stable = serde_json::Map::new();
             let mut volatile = serde_json::Map::new();
             for (key, item) in value.as_object().unwrap() {
-                if ["market_table", "recent_bull_trap_lessons",
+                if ["market_table", "own_track_record", "recent_bull_trap_lessons",
                     "account_as_of_round_id"].contains(&key.as_str()) {
                     stable.insert(key.clone(), item.clone());
                 } else {

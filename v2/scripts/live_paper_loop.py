@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_quote_feed as feed  # noqa: E402
 from live_ai import (
+    attach_track_record,
     DIGEST_CANDIDATES, DIGEST_POSITIONS, LIVE_SYSTEM_PROMPT, RECENT_TRADES,
     Log, _parse_model_json, held_positions, json_line, market_digest,
     ranked_candidates, raw_advice,
@@ -274,6 +275,10 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         except Exception as error:  # noqa: BLE001 - digest state is optional
             log.emit("trades_read_failed", reason=str(error))
         digest = market_digest(snapshot, account=account, trades=trades)
+        # The observer is otherwise stateless: it cannot see that its own blocks
+        # in this regime gave up real gains. Load the measured record once per
+        # session and hand it over, so advice is conditioned on its own results.
+        digest = attach_track_record(digest, config.track_record)
         settings_used = False
         try:
             settings_resp = kernel.post("/v2/settings/ai-advice", digest)
@@ -354,12 +359,14 @@ class Config:
                  opener: Callable[..., Any] = urllib.request.urlopen,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sleep: Callable[[float], None] = time.sleep,
-                 feed_builder: Callable[..., Mapping[str, Any]] | None = None):
+                 feed_builder: Callable[..., Mapping[str, Any]] | None = None,
+                 track_record: Mapping[str, Any] | None = None):
         self.api, self.universe, self.history_db = api, universe, history_db
         self.interval, self.close = interval, close
         self.ai_on, self.max_rounds, self.once = ai_on, max_rounds, once
         self.zone, self.llm_base = zone, llm_base
         self.llm_key, self.llm_model = llm_key, llm_model
+        self.track_record = track_record
         self.batch, self.log_path = batch, log_path
         self.opener, self.clock, self.sleep = opener, clock, sleep
         self.feed_builder = feed_builder or feed.build_snapshot
@@ -458,6 +465,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", default=DEFAULT_API)
     parser.add_argument("--universe", default=str(feed.DEFAULT_UNIVERSE))
+    parser.add_argument("--ledger-db",
+                        help="read-only intraday ledger used to measure the observer's "
+                             "own track record; omitted means no track record is sent")
     parser.add_argument("--history-db",
                         default=os.environ.get("ASTOCK_HISTORY_DB"),
                         help="optional sqlite bar DB; missing means no history")
@@ -469,6 +479,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--log", default=str(DEFAULT_LOG_PATH))
     return parser
+
+
+def load_track_record(path: str | None) -> Mapping[str, Any] | None:
+    """Measure the observer's own record from the ledger, or send nothing.
+
+    A failure here must never block trading: an unreadable ledger simply means
+    the model reasons without its history, exactly as it did before.
+    """
+    if not path:
+        return None
+    try:
+        from ai_memory import scorecard, collect
+        from pathlib import Path as _Path
+        import sqlite3
+        db = sqlite3.connect(_Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only=ON")
+        try:
+            return scorecard(collect(db))
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
+        return None
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -485,6 +518,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         llm_key=os.environ.get("ASTOCK_LLM_KEY", ""),
         llm_model=os.environ.get("ASTOCK_LLM_MODEL", feed.DEFAULT_LLM_MODEL),
         log_path=args.log,
+        track_record=load_track_record(args.ledger_db),
     )
 
 
