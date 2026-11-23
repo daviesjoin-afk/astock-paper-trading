@@ -233,3 +233,121 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def fetch_hot_and_sectors(client: Any, *, limit: int = 30) -> dict[str, Any]:
+    """Market-wide heat and concept tags from the source layer's own endpoints.
+
+    The observer has prices but no notion of what the market is talking about:
+    which names are attracting attention, and which theme a symbol belongs to.
+    Both endpoints already ship with the upstream layer, so this only normalises
+    them. A missing endpoint yields an empty block rather than a guess.
+    """
+    hot: list[dict[str, Any]] = []
+    try:
+        rows = client.call("ths_hot_list") or []
+    except Exception:  # noqa: BLE001 - heat is additive
+        rows = []
+    for row in rows[:limit]:
+        if not isinstance(row, Mapping):
+            continue
+        code = row.get("code")
+        if not isinstance(code, str) or not code:
+            continue
+        try:
+            heat = int(float(row.get("heat")))
+        except (TypeError, ValueError):
+            heat = None
+        hot.append({
+            "symbol": _full_symbol(code),
+            "name": _clip(row.get("name"), 20),
+            "heat": heat,
+            "rank_change": row.get("rank_chg"),
+            "concepts": [str(c) for c in (row.get("concepts") or [])][:4],
+        })
+    return {"items": hot, "note": "热度榜按人气排序；concepts 为该股所属概念标签，来自同花顺热榜。"}
+
+
+def _full_symbol(code: str) -> str:
+    """Attach the exchange suffix the kernel uses; unknown prefixes pass through."""
+    text = str(code).strip().upper()
+    if not text or "." in text:
+        return text
+    if text.startswith(("60", "68", "51", "58", "11")):
+        return text + ".SH"
+    if text.startswith(("00", "30", "15", "16", "12")):
+        return text + ".SZ"
+    if text.startswith(("8", "4", "92")):
+        return text + ".BJ"
+    return text
+
+
+def attach_hot(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    if block and block.get("items"):
+        digest["market_heat"] = block
+    return digest
+
+
+def fetch_northbound(client: Any) -> dict[str, Any] | None:
+    """Intraday northbound flows, the one capital-flow fact the source really has.
+
+    Order-flow by size bucket is not available (the project already refuses to
+    substitute volume for it), but the沪股通/深股通 series is published minute by
+    minute. It answers "is foreign money buying this morning" without inventing
+    anything. Values are in 亿元 as published; the first and last sample are kept
+    so the block shows a direction, not one bare number.
+    """
+    try:
+        frame = client.call("hsgt_realtime")
+    except Exception:  # noqa: BLE001 - a missing flow series is not fatal
+        return None
+    try:
+        rows = [{str(k): v for k, v in rec.items()} for rec in frame.to_dict("records")]
+    except Exception:  # noqa: BLE001 - a non-frame return means parse failure
+        return None
+    if not rows:
+        return None
+
+    def num(value: Any) -> float | None:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if out == out else None  # reject NaN
+
+    # Each leg can go NaN independently near the close (observed: sgt is NaN
+    # from 14:58 while hgt keeps printing), so take the last *valid* value per
+    # leg rather than assuming the final row is usable for both.
+    def series(key: str) -> list[float]:
+        return [v for v in (num(row.get(key)) for row in rows) if v is not None]
+
+    def last_valid(key: str) -> float | None:
+        values = series(key)
+        return values[-1] if values else None
+
+    def as_of(key: str) -> str | None:
+        for row in reversed(rows):
+            if num(row.get(key)) is not None:
+                return str(row.get("time"))
+        return None
+
+    sh_now, sz_now = last_valid("sgt_yi"), last_valid("hgt_yi")
+    if sh_now is None and sz_now is None:
+        return None
+    sh_open = series("sgt_yi")[0] if series("sgt_yi") else None
+    sz_open = series("hgt_yi")[0] if series("hgt_yi") else None
+    return {
+        "as_of": as_of("hgt_yi") or as_of("sgt_yi"),
+        # sgt_yi carries 沪股通's cumulative net buy; hgt_yi carries 深股通's.
+        "shanghai_net_yi": sh_now,
+        "shenzhen_net_yi": sz_now,
+        "shanghai_delta_yi": None if sh_now is None or sh_open is None else round(sh_now - sh_open, 2),
+        "shenzhen_delta_yi": None if sz_now is None or sz_open is None else round(sz_now - sz_open, 2),
+        "note": "sgt_yi=沪股通、hgt_yi=深股通当日累计净买入（亿元）；delta 为相对当日首个有效值的增量。",
+    }
+
+
+def attach_northbound(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    if block:
+        digest["northbound"] = block
+    return digest

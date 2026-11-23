@@ -32,6 +32,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_quote_feed as feed  # noqa: E402
 from live_ai import (
+    attach_hot,
+    attach_northbound,
     attach_news,
     attach_resident_memory,
     attach_track_record,
@@ -288,6 +290,8 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         # ranked names still match against the two market wires already in hand.
         news_block = fetch_news_block(snapshot, list(dict.fromkeys(held)))
         digest = attach_news(digest, news_block)
+        digest = attach_hot(digest, fetch_heat_block())
+        digest = attach_northbound(digest, fetch_northbound_block())
         digest = attach_track_record(digest, config.track_record)
         if config.resident_memory:
             digest = attach_resident_memory(digest, config.resident_memory)
@@ -523,6 +527,28 @@ def refresh_resident_block(path: str | None, ledger_db: str | None) -> str | Non
         return render_resident(read_resident(_Path(path))) or None
     except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
         return load_resident_block(path)
+
+
+def fetch_northbound_block() -> Mapping[str, Any] | None:
+    """Northbound flows for this round, when the source can serve them."""
+    try:
+        from live_news import fetch_northbound
+        from astock_public import PublicClient
+        from source_http import SourceHttp
+        return fetch_northbound(PublicClient(http=SourceHttp()))
+    except Exception:  # noqa: BLE001 - flow is additive
+        return None
+
+
+def fetch_heat_block() -> Mapping[str, Any] | None:
+    """Market heat and concept tags, fetched once per round."""
+    try:
+        from live_news import fetch_hot_and_sectors
+        from astock_public import PublicClient
+        from source_http import SourceHttp
+        return fetch_hot_and_sectors(PublicClient(http=SourceHttp()), limit=30)
+    except Exception:  # noqa: BLE001 - heat is additive
+        return None
 
 
 def fetch_news_block(snapshot: Mapping[str, Any], watch: Sequence[str]) -> Mapping[str, Any] | None:

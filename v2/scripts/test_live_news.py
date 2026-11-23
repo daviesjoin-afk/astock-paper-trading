@@ -101,3 +101,76 @@ class FetchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HotListTests(unittest.TestCase):
+    def test_exchange_suffix_is_attached_from_the_code_prefix(self):
+        self.assertEqual(news._full_symbol("600000"), "600000.SH")
+        self.assertEqual(news._full_symbol("300750"), "300750.SZ")
+        self.assertEqual(news._full_symbol("830001"), "830001.BJ")
+        self.assertEqual(news._full_symbol("600000.SH"), "600000.SH")
+
+    def test_a_missing_endpoint_yields_an_empty_block(self):
+        client = FakeClient({"ths_hot_list": RuntimeError("down")})
+        block = news.fetch_hot_and_sectors(client)
+        self.assertEqual(block["items"], [])
+
+    def test_rows_are_normalised_and_bounded(self):
+        client = FakeClient({"ths_hot_list": [
+            {"code": "002242", "name": "九阳股份", "heat": "1493299.0",
+             "rank_chg": 0, "concepts": ["净水概念", "绿色电力", "x", "y", "z"]}
+        ] + [{"code": f"{i:06d}", "name": f"n{i}", "heat": "1"} for i in range(60)]})
+        block = news.fetch_hot_and_sectors(client, limit=5)
+        self.assertEqual(len(block["items"]), 5)
+        first = block["items"][0]
+        self.assertEqual(first["symbol"], "002242.SZ")
+        self.assertEqual(first["heat"], 1493299)
+        self.assertEqual(len(first["concepts"]), 4)
+
+
+class Frame:
+    """Stands in for the pandas DataFrame the flow endpoint returns."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def to_dict(self, _orient):
+        return list(self._rows)
+
+
+class NorthboundTests(unittest.TestCase):
+    def test_open_and_latest_are_kept_so_a_direction_is_visible(self):
+        client = FakeClient({"hsgt_realtime": Frame([
+            {"time": "09:10", "sgt_yi": 0.00, "hgt_yi": 0.00},
+            {"time": "13:00", "sgt_yi": 12.5, "hgt_yi": -3.2},
+            {"time": "14:56", "sgt_yi": 20.0, "hgt_yi": -5.0},
+        ])})
+        block = news.fetch_northbound(client)
+        self.assertEqual(block["as_of"], "14:56")
+        self.assertEqual(block["shanghai_net_yi"], 20.0)
+        self.assertEqual(block["shanghai_delta_yi"], 20.0)
+        self.assertEqual(block["shenzhen_net_yi"], -5.0)
+
+    def test_one_leg_going_nan_keeps_the_other_legs_last_valid_value(self):
+        # Observed in production: sgt_yi is NaN from 14:58 while hgt_yi prints.
+        client = FakeClient({"hsgt_realtime": Frame([
+            {"time": "09:10", "sgt_yi": 364.81, "hgt_yi": 0.0},
+            {"time": "09:11", "sgt_yi": 365.5, "hgt_yi": 0.03},
+            {"time": "15:00", "sgt_yi": "nan", "hgt_yi": -9.28},
+        ])})
+        block = news.fetch_northbound(client)
+        self.assertEqual(block["shanghai_net_yi"], 365.5, "last valid, not NaN")
+        self.assertEqual(block["shenzhen_net_yi"], -9.28)
+        self.assertEqual(block["as_of"], "15:00")
+
+    def test_a_missing_series_returns_nothing_rather_than_a_zero(self):
+        client = FakeClient({"hsgt_realtime": RuntimeError("down")})
+        self.assertIsNone(news.fetch_northbound(client))
+        self.assertIsNone(news.fetch_northbound(FakeClient({"hsgt_realtime": Frame([])})))
+
+    def test_nan_is_rejected_not_rendered_as_a_number(self):
+        client = FakeClient({"hsgt_realtime": Frame([
+            {"time": "09:10", "sgt_yi": None, "hgt_yi": "nan"},
+            {"time": "14:56", "sgt_yi": None, "hgt_yi": "nan"},
+        ])})
+        self.assertIsNone(news.fetch_northbound(client))

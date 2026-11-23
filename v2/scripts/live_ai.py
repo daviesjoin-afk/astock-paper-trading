@@ -38,6 +38,8 @@ LIVE_SYSTEM_PROMPT = """你审查 A 股模拟盘本轮风险，输出建议，�
 
 仅输出 JSON 对象，不能有 Markdown。顶层字段固定，不要输出 slot_recommendations、suggested_orders 或 risk_flags。
 - "confidence" 为 0 至 100 的整数。"bias" 为 -20 至 20 的整数，负值更谨慎。"entry_delta" 为 -15 至 15 的整数，正值提高开仓门槛（更难买）、负值降低门槛（更容易买）。看空或要求收紧时必须给正值，输出前自检：reason 说防守，entry_delta 就必须是正数。"weight_tilt_bps" 为 -1000 至 1000 的整数，表示动量相对形态的偏移。
+- northbound 是沪股通/深股通当日净买入额（亿元）及相对开盘的 delta。它是外资当日的真实资金方向：持续净流入说明外部资金在买，持续净流出说明在撤。只作环境判断与仓位松紧的参考，不是个股买入依据；数值缺失时按未知处理，不要用成交额替代。
+- market_heat 是人气榜与概念标签（前 30）。用来看"市场这轮在炒什么、我的持仓和候选属于哪个题材"：若某候选恰在人气榜且概念与当前热点一致，可作为加分；若候选概念已连续退潮或热度排名大幅下滑，不要追。热度不等于价值，不能单独作为买入依据；不要在 reason 里罗列整张榜。
 - news 是本轮抓到的、标题或摘要里出现你持仓或候选代码/名称的财经快讯与个股新闻。**每轮必须先读 news，并在 reason 里点明它对本轮的影响**（无影响也要说"新闻无实质影响"）。
   · 涉及立案、处罚、虚假记载、退市风险、业绩暴雷、大额减持等重大负面时：该代码一律不得买入，并列入 blocked_symbols；若已持仓且可卖，应提出卖出，说明依据来自哪条新闻。
   · 涉及中标、重组、业绩预增、大额增持等实质利好时，只可作为加分项，仍必须通过趋势、均价线、诱多风险的检验才能点名买入。
@@ -649,6 +651,20 @@ def attach_track_record(digest: dict[str, Any], card: Mapping[str, Any] | None) 
     """
     if card:
         digest["own_track_record"] = card
+    return digest
+
+
+def attach_northbound(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Add the published northbound net-buy series for this morning."""
+    if block:
+        digest["northbound"] = block
+    return digest
+
+
+def attach_hot(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Add the market heat list and its concept tags, when the source returned it."""
+    if block and block.get("items"):
+        digest["market_heat"] = block
     return digest
 
 
