@@ -746,6 +746,35 @@ class EmptyCompletionTests(unittest.TestCase):
         self.assertEqual(result["raw_advice"]["bias"], 5)
 
 
+class SummaryCompletenessTests(unittest.TestCase):
+    """Every anti-trap field the prompt names must reach the model."""
+
+    def snapshot(self):
+        return {"quote_time": "2026-11-23T10:33:00+08:00", "quotes": [
+            {"symbol": "600000.SH", "name": "示例", "price_cents": 1_000,
+             "prev_close_cents": 990, "open_cents": 995, "high_cents": 1_010,
+             "low_cents": 990, "limit_up_cents": 1_089, "limit_down_cents": 891,
+             "volume": 100_000, "amount_cents": 100_000 * 1_002, "tradable": True,
+             "trailing_closes": [900, 920, 950, 970, 990]},
+        ]}
+
+    def test_candidates_carry_vwap_wick_and_trap_risk(self):
+        digest = loop.market_digest(self.snapshot(), account=None, trades=None)
+        candidate = digest["ranked_candidates"][0]
+        self.assertEqual(candidate["vwap_distance_bps"], -20)
+        self.assertIn("upper_wick_bps", candidate)
+        self.assertIn("bull_trap_risk", candidate)
+        self.assertEqual(digest["market_table"]["cols"][0], "symbol")
+        row = digest["market_table"]["rows"][0]
+        self.assertEqual(row[digest["market_table"]["cols"].index("vwap_distance_bps")], -20)
+
+    def test_a_far_off_turnover_price_is_reported_unknown_not_a_huge_gap(self):
+        snapshot = self.snapshot()
+        snapshot["quotes"][0]["amount_cents"] *= 100
+        candidate = loop.market_digest(snapshot, account=None, trades=None)["ranked_candidates"][0]
+        self.assertNotIn("vwap_distance_bps", candidate)
+
+
 class AdviceRetryTests(unittest.TestCase):
     empty = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
              "usage": {"completion_tokens_details": {"reasoning_tokens": 2_000}}}
@@ -783,7 +812,8 @@ class AdviceRetryTests(unittest.TestCase):
         self.assertEqual(result, {"model": "deepseek-v4.1-flash",
                                   "raw_advice": {"bias": 5, "confidence": 71}})
         self.assertEqual([call[1] for call in sent], [30])
-        self.assertNotIn("thinking", sent[0][0])
+        self.assertEqual(sent[0][0]["thinking"], {"type": "disabled"})
+        self.assertEqual(sent[0][0]["max_tokens"], 1_200)
         self.assertEqual(json.loads(sent[0][0]["messages"][1]["content"]),
                          {"sample_count": 3})
         self.assertEqual(events[0], ("ai_completed", {"round_id": "r1", "attempts": 1,
@@ -793,12 +823,14 @@ class AdviceRetryTests(unittest.TestCase):
         self.assertEqual(fields["elapsed_ms"], 7_060)
         self.assertIsNone(fields["total_tokens"])
 
-    def test_confirmed_empty_reasoning_retry_uses_same_digest_and_no_thinking(self):
+    def test_empty_retry_drops_the_switch_and_widens_the_budget(self):
         result, sent, events = self.invoke([self.empty, self.good], durations=(7.06, 3.84))
         self.assertEqual(result["raw_advice"], {"bias": 5, "confidence": 71})
         self.assertEqual([call[1] for call in sent], [30, 15])
-        self.assertNotIn("thinking", sent[0][0])
-        self.assertEqual(sent[1][0], {**sent[0][0], "thinking": {"type": "disabled"}})
+        self.assertEqual(sent[0][0]["thinking"], {"type": "disabled"})
+        self.assertNotIn("thinking", sent[1][0])
+        self.assertEqual(sent[1][0]["max_tokens"], 8_000)
+        self.assertEqual(sent[1][0]["messages"], sent[0][0]["messages"])
         self.assertEqual([event for event, _ in events],
                          ["ai_usage", "ai_retry", "ai_completed", "ai_usage"])
         self.assertTrue(all(fields["round_id"] == "r1" for _, fields in events))

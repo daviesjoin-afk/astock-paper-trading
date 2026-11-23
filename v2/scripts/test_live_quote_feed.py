@@ -55,6 +55,32 @@ class FakeClient:
         return self.results.get(tuple(codes), {})
 
 
+class VolumeRecoveryTests(unittest.TestCase):
+    """The upstream snapshot has amount and turnover but no share count."""
+
+    # Published facts for one real session: price 10.80, 337.32亿元 traded,
+    # 0.09% turnover, 3,597.03亿元 free float.
+    ROW = {"price": 10.80, "last_close": 10.62, "open": 10.80, "high": 10.83,
+           "low": 10.64, "amount_wan": 33_732.0, "turnover_pct": 0.09,
+           "float_mcap_yi": 3_597.03}
+
+    def test_turnover_and_free_float_recover_volume(self):
+        quote = feed.quote_from_snapshot("600000.SH", self.ROW)
+        free_float_shares = 3_597.03e8 / 10.80
+        assert quote["volume"] == round(0.0009 * free_float_shares)
+        implied = quote["amount_cents"] / quote["volume"] / 100
+        # 0.09% is rounded to two decimals upstream, so the recovered VWAP for a
+        # slow-turning blue chip is only good to roughly a percent. That is the
+        # honest precision of the published fact, not a modelling error.
+        assert abs(implied / 10.80 - 1) < 0.05, "recovered turnover price is near spot"
+
+    def test_an_implausible_turnover_price_leaves_volume_unknown(self):
+        for broken in ({"turnover_pct": None}, {"float_mcap_yi": None},
+                       {"amount_wan": 1.0}, {"float_mcap_yi": 1.0}):
+            quote = feed.quote_from_snapshot("600000.SH", {**self.ROW, **broken})
+            assert "volume" not in quote, broken
+
+
 class LiveQuoteFeedTests(unittest.TestCase):
     def snapshot(self, results, *, history=None, batch_size=200):
         client = FakeClient(results)

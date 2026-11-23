@@ -18,9 +18,13 @@ import urllib.request
 import live_quote_feed as feed
 
 RECENT_TRADES = 8
-# How many ranked candidates the AI observer gets to see. Enough for it to
-# reason about specific names, small enough to stay a summary, not a payload.
-DIGEST_CANDIDATES = 15
+# Ranked names get the full anti-trap detail; the whole tradable market rides
+# along as a compact integer table. Measured on the live model (1M window):
+# 5,210 symbols -> 294 KB / 147k prompt tokens / 5-7 s, and a repeat round hits
+# the prompt cache, so seeing the whole market costs far less than being blind
+# to it.
+DIGEST_CANDIDATES = 40
+MARKET_TABLE_LIMIT = 6_000
 # How many held positions to describe by symbol (with live P&L).
 DIGEST_POSITIONS = 12
 
@@ -148,8 +152,11 @@ def ranked_candidates(quotes: Sequence[Mapping[str, Any]], *,
         amt = quote.get("amount_cents")
         vwap_dist = None
         if isinstance(vol, (int, float)) and isinstance(amt, (int, float)) and vol > 0 and amt > 0:
+            # amount_cents is money, volume is shares, price is cents: the
+            # cents cancel, so turnover price = amount / volume in one unit.
+            # Scaling either side by 100 produced a fake -9,999 bps gap.
             vwap = float(amt) / float(vol)
-            if vwap > 0:
+            if vwap > 0 and 0.2 <= vwap / float(price) <= 5.0:
                 vwap_dist = _pct_bps(float(price) - vwap, vwap)
 
         bull_trap_risk = 0
@@ -198,8 +205,12 @@ def ranked_candidates(quotes: Sequence[Mapping[str, Any]], *,
             entry["vwap_distance_bps"] = vwap_dist
         if upper_wick is not None:
             entry["upper_wick_bps"] = upper_wick
-        if bull_trap_risk > 0:
-            entry["bull_trap_risk"] = bull_trap_risk
+        # Always state the risk score, including a real zero: the prompt asks
+        # the model to reject >= 30, and an absent field reads as "unknown" and
+        # silently disables that rule. Flags stay conditional (they describe
+        # which signals fired).
+        entry["bull_trap_risk"] = bull_trap_risk
+        if trap_flags:
             entry["bull_trap_flags"] = trap_flags
         limit_up = quote.get("limit_up_cents")
         if type(limit_up) is int and limit_up > 0:
@@ -311,11 +322,11 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
     }
 
 
-def build_slot_candidates(quotes: Sequence[Mapping[str, Any]], *, limit: int = 8) -> dict[str, list[dict[str, Any]]]:
+def build_slot_candidates(quotes: Sequence[Mapping[str, Any]], *, limit: int = 30) -> dict[str, list[dict[str, Any]]]:
     """Separate, anti-bull-trap candidate pools for steady and aggressive slots."""
     steady_pool: list[tuple[float, dict[str, Any]]] = []
     aggr_pool: list[tuple[float, dict[str, Any]]] = []
-    for item in ranked_candidates(quotes, limit=120):
+    for item in ranked_candidates(quotes, limit=400):
         mom = item.get("momentum_bps") or 0
         pos = item.get("position_in_range_bps")
         amp = item.get("amplitude_bps")
@@ -395,6 +406,30 @@ def extract_bull_trap_lessons(
     return lessons
 
 
+MARKET_TABLE_COLUMNS = (
+    "symbol", "momentum_bps", "position_in_range_bps", "amplitude_bps",
+    "vwap_distance_bps", "upper_wick_bps", "bull_trap_risk", "distance_to_limit_up_bps",
+)
+
+
+def market_table(quotes: Sequence[Mapping[str, Any]], *,
+                 limit: int = MARKET_TABLE_LIMIT) -> dict[str, Any]:
+    """Every tradable symbol as one compact integer row, strongest first.
+
+    Coding the columns once keeps a full-market view inside a fraction of the
+    window instead of repeating keys 5,210 times. Null means unknown; a symbol
+    missing a previous close is absent rather than scored on a fake zero, so the
+    model cannot mistake an unreported price for a flat one.
+    """
+    rows = [[item.get(column) for column in MARKET_TABLE_COLUMNS]
+            for item in ranked_candidates(quotes, limit=limit)]
+    return {
+        "cols": list(MARKET_TABLE_COLUMNS),
+        "rows": rows,
+        "note": "全市场可交易标的，按动量降序；null 表示该字段未知。",
+    }
+
+
 def market_digest(snapshot: Mapping[str, Any], *, account: Any,
                   trades: Any) -> dict[str, Any]:
     """A state summary the observer can actually reason about.
@@ -450,6 +485,7 @@ def market_digest(snapshot: Mapping[str, Any], *, account: Any,
     return {
         "quote_time": snapshot.get("quote_time"),
         "quote_time_estimated": bool(snapshot.get("quote_time_estimated")),
+        "market_table": market_table(quotes),
         "sample_count": len(quotes),
         "change_distribution": {"up": up, "down": down, "flat": flat},
         "average_amplitude_bps": (round(sum(amplitudes) * 10_000 / len(amplitudes))
@@ -599,8 +635,13 @@ def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
     body = {
         "model": model,
         "temperature": 0.2,
-        "max_tokens": 2_000,
+        "max_tokens": 1_200,
         "response_format": {"type": "json_object"},
+        # Measured on the live model: with reasoning enabled the 2,000-token
+        # budget was spent entirely on hidden reasoning and the reply was empty
+        # every round, so the scheduler paid for a retry each time. Asking for
+        # the JSON directly answers in ~3s for ~4.9k tokens instead.
+        "thinking": {"type": "disabled"},
     }
     reason = "empty_completion"
     attempts = 0
@@ -613,7 +654,10 @@ def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
                 reason = "reasoning_retry_budget_exhausted"
                 break
             request_timeout = min(retry_limit, remaining)
-            body["thinking"] = {"type": "disabled"}
+            # The first call already asked for direct JSON; the fallback is for
+            # a provider that rejects that switch, so allow reasoning room.
+            body.pop("thinking", None)
+            body["max_tokens"] = 8_000
             if log:
                 log.emit("ai_retry", round_id=round_id, reason=reason,
                          elapsed_ms=round(elapsed * 1_000))

@@ -302,12 +302,52 @@ def quote_from_snapshot(symbol: str, row: Mapping[str, Any] | None,
     if amount_wan is not None and amount_wan > 0:
         quote["amount_cents"] = int(round(amount_wan * AMOUNT_WAN_TO_CENTS))
     volume = integral_value(row.get("volume"))
+    if volume is None:
+        volume = _volume_from_turnover(row, quote)
     if volume is not None:
         quote["volume"] = volume
     # No avg_volume: vol_ratio/turnover/volume are not an explicit trailing
     # average-volume series, and Rust treats an absent field as an absent factor.
     return quote
 
+
+
+# A recovered share count is only believable if the turnover price it implies
+# sits near the live price. Low-priced, heavily-turned names round badly; a gap
+# beyond this is treated as unknown rather than fed to the model as a real VWAP.
+VWAP_SANITY_BPS = 1_000
+
+
+def _volume_from_turnover(row: Mapping[str, Any], quote: Mapping[str, Any]) -> int | None:
+    """Recover today's traded shares from cumulative turnover.
+
+    The upstream snapshot carries traded value and turnover, but no share
+    count, which left the VWAP line the prompt reasons about permanently
+    unknown. Turnover percent is traded shares over free-float shares, and
+    free-float shares = float market cap / price, so the share count follows
+    from three published facts. Anything outside the sanity bound stays absent:
+    a plausible-looking wrong VWAP is worse than an acknowledged gap.
+    """
+    amount_wan = finite_number(row.get("amount_wan"))
+    turnover = finite_number(row.get("turnover_pct"))
+    float_cap_yi = finite_number(row.get("float_mcap_yi"))
+    price_cents = quote.get("price_cents")
+    amount_cents = quote.get("amount_cents")
+    if not isinstance(amount_cents, int) or amount_cents <= 0 or not price_cents:
+        return None
+    if amount_wan is None or amount_wan <= 0 or turnover is None or turnover <= 0:
+        return None
+    if float_cap_yi is None or float_cap_yi <= 0:
+        return None
+    price = price_cents / 100
+    free_float_shares = float_cap_yi * 1e8 / price
+    shares = int(round(turnover / 100 * free_float_shares))
+    if shares <= 0:
+        return None
+    implied_cents = amount_cents / shares
+    if abs(implied_cents / price_cents - 1) * 10_000 > VWAP_SANITY_BPS:
+        return None
+    return shares
 
 def build_snapshot(universe_path: str | Path = DEFAULT_UNIVERSE, *,
                    batch_size: int = DEFAULT_BATCH_SIZE,

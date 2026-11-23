@@ -274,40 +274,68 @@ pub fn call_ai_live_advice(
     settings: &SystemSettings,
     context_snapshot: &Value,
 ) -> Result<Value, String> {
-    let base = settings.ai_base_url.trim().trim_end_matches('/');
-    if !settings.ai_enabled || base.is_empty() || settings.ai_model.trim().is_empty() || settings.ai_api_key.trim().is_empty() {
-        return Err("ai_not_configured".into());
-    }
-    let endpoint = format!("{base}/chat/completions");
-    let depth_instruction = if settings.ai_depth == "deep" {
-        "当前为【深度托管模式】：你可以直接决定个股的买卖方向（buy/sell/hold/avoid）与目标仓位万分比 target_weight_bps（0~10000，例如 2500 代表 25% 槽位资产）。请务必严格执行【主力意图与反诱多五维纪律】：\n\
-         1. 看情绪与炸板率（market_sentiment）：当 score < 42（冰点/偏冷）或 bull_trap_rate_bps >= 3000（炸板率≥30%）时，主力极易拉高出货，严禁追高开仓，优先去弱留强或空仓观望；\n\
-         2. 查日内均价线（vwap_distance_bps）：现价跌破日内成交均价线（vwap_distance_bps < 0，尤其是 <= -120 bps）说明当日追高筹码全线被套，属典型主力拉高派发（钓鱼线），一票否决买入；\n\
-         3. 辨假阳真阴与长上影（upper_wick_bps / bull_trap_risk）：若 bull_trap_risk >= 30 或 upper_wick_bps >= 150（冲高留长上影）或高开低走，严禁买入并列入 avoid/blocked_symbols；\n\
-         4. 防高位接盘（cum_gain_3d_bps / dist_20d_high_bps）：近 3 日累计涨幅 cum_gain_3d_bps >= 1800（18%）且日内分位不足 80% 的高位加速股，属于击鼓传花末端，严禁接盘；\n\
-         5. 读近期诱多错题本（recent_bull_trap_lessons）：牢记本账户近期被套与止损教训，绝不在同类形态上重蹈覆辙；\n\
-         6. 双槽隔离与 T+1 约束：为每条建议明确指定 slot（\"steady\" 或 \"aggressive\"），优先从 slot_candidates 对应池选股；早盘 09:30~09:45 审慎开新仓，sellable_quantity=0 的当日新仓不可卖出。"
-    } else {
-        "当前为【顾问模式】：请结合 market_sentiment、候选股的 vwap_distance_bps / bull_trap_risk 反诱多指标以及 recent_bull_trap_lessons 错题本，给出全局市场偏向 bias（-20~20）、入场门槛调整 entry_delta（-15~15）、权重倾斜 weight_tilt_bps（-1000~1000）和分槽位建议 suggestions。"
-    };
-    let system_prompt = format!(
-        "你是 A 股盘中量化模拟交易 AI 决策引擎（内置主力诱多识破机制）。请严格根据提供的实时市场情绪（market_sentiment）、双槽抗诱多候选（slot_candidates）、日内均价线偏离（vwap_distance_bps）、诱多风险分（bull_trap_risk）、近期诱多错题本（recent_bull_trap_lessons）与 T+1 可卖股数输出纯 JSON（不要包含 markdown 代码块）。\n\
-         {depth_instruction}\n\
-         JSON 格式：{{\"mode\":\"{}\",\"confidence\":0-100,\"bias\":-20..20,\"entry_delta\":-15..15,\"weight_tilt_bps\":-1000..1000,\"blocked_symbols\":[\"高诱多风险代码\"],\"reason\":\"简明中文判断（含情绪温度、主力诱多识别结论与仓位策略）\",\"suggestions\":[{{\"symbol\":\"600000.SH\",\"slot\":\"steady|aggressive\",\"side\":\"buy|sell|avoid|hold\",\"target_weight_bps\":0-10000,\"score_delta\":-20..20,\"reason\":\"中文理由（说明均价线/诱多风险/趋势依据）\"}}]}}",
-        settings.ai_depth
-    );
+    let (system_prompt, mode) = live_advice_prompt(settings);
     let body = json!({
         "model": settings.ai_model.trim(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": context_snapshot.to_string()}
         ],
-        "temperature": 0.2,
-        "max_tokens": 900
+        "temperature": 0.2
     });
-    let agent = http::agent(Duration::from_secs(settings.ai_timeout_secs.clamp(5, 120)), false);
+    let endpoint = live_advice_endpoint(settings)?;
+    // A reasoning model spends the whole budget on hidden reasoning before it
+    // emits any content: at 900 tokens every live call came back empty, so the
+    // scheduler paid for a second, non-reasoning call each round. Ask for the
+    // JSON directly first; only a provider that rejects the switch falls back
+    // to reasoning with a budget large enough to finish.
+    let attempts = live_advice_attempts(settings, &body);
+    let mut errors = Vec::new();
+    for (request_body, timeout_secs) in attempts {
+        match live_advice_once(&endpoint, settings, &request_body, timeout_secs) {
+            Ok(advice) => return Ok(stamp_live_advice(advice, settings, &mode)),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn live_advice_endpoint(settings: &SystemSettings) -> Result<String, String> {
+    let base = settings.ai_base_url.trim().trim_end_matches('/');
+    if !settings.ai_enabled || base.is_empty() || settings.ai_model.trim().is_empty() || settings.ai_api_key.trim().is_empty() {
+        return Err("ai_not_configured".into());
+    }
+    Ok(format!("{base}/chat/completions"))
+}
+
+fn live_advice_request(body: &Value, _settings: &SystemSettings, max_tokens: u64, think: bool) -> Value {
+    let mut request = body.clone();
+    request["max_tokens"] = json!(max_tokens);
+    if think {
+        request["thinking"] = json!({"type": "disabled"});
+    }
+    request
+}
+
+fn live_advice_once(
+    endpoint: &str,
+    settings: &SystemSettings,
+    body: &Value,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let agent = http::agent(Duration::from_secs(timeout_secs), false);
+    live_advice_with(endpoint, settings, body, &agent)
+}
+
+/// Split out so a test can drive the request/parse contract without a network.
+fn live_advice_with(
+    endpoint: &str,
+    settings: &SystemSettings,
+    body: &Value,
+    agent: &ureq::Agent,
+) -> Result<Value, String> {
     let mut res = agent
-        .post(&endpoint)
+        .post(endpoint)
         .header("Authorization", &format!("Bearer {}", settings.ai_api_key.trim()))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
@@ -328,15 +356,48 @@ pub fn call_ai_live_advice(
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    let mut advice: Value = serde_json::from_str(cleaned)
-        .map_err(|e| format!("ai_advice_parse_error: {e}"))?;
+    if cleaned.is_empty() {
+        return Err("ai_empty_content".into());
+    }
+    serde_json::from_str(cleaned).map_err(|e| format!("ai_advice_parse_error: {e}"))
+}
+
+fn live_advice_attempts(settings: &SystemSettings, body: &Value) -> Vec<(Value, u64)> {
+    vec![
+        (live_advice_request(body, settings, 1_200, true), settings.ai_timeout_secs.clamp(5, 120)),
+        (live_advice_request(body, settings, 8_000, false), settings.ai_timeout_secs.clamp(5, 120)),
+    ]
+}
+
+fn stamp_live_advice(mut advice: Value, settings: &SystemSettings, mode: &str) -> Value {
     if let Some(obj) = advice.as_object_mut() {
         obj.entry("model".to_string())
             .or_insert_with(|| Value::String(settings.ai_model.clone()));
         obj.entry("mode".to_string())
-            .or_insert_with(|| Value::String(settings.ai_depth.clone()));
+            .or_insert_with(|| Value::String(mode.to_string()));
     }
-    Ok(advice)
+    advice
+}
+
+pub fn live_advice_prompt(settings: &SystemSettings) -> (String, String) {
+    let depth_instruction = if settings.ai_depth == "deep" {
+        "当前为【深度托管模式】：你可以直接决定个股的买卖方向（buy/sell/hold/avoid）与目标仓位万分比 target_weight_bps（0~10000，例如 2500 代表 25% 槽位资产）。请务必严格执行【主力意图与反诱多五维纪律】：
+         1. 看情绪与炸板率（market_sentiment）：当 score < 42（冰点/偏冷）或 bull_trap_rate_bps >= 3000（炸板率≥30%）时，主力极易拉高出货，严禁追高开仓，优先去弱留强或空仓观望；
+         2. 查日内均价线（vwap_distance_bps）：现价跌破日内成交均价线（vwap_distance_bps < 0，尤其是 <= -120 bps）说明当日追高筹码全线被套，属典型主力拉高派发（钓鱼线），一票否决买入；
+         3. 辨假阳真阴与长上影（upper_wick_bps / bull_trap_risk）：若 bull_trap_risk >= 30 或 upper_wick_bps >= 150（冲高留长上影）或高开低走，严禁买入并列入 avoid/blocked_symbols；
+         4. 防高位接盘（cum_gain_3d_bps / dist_20d_high_bps）：近 3 日累计涨幅 cum_gain_3d_bps >= 1800（18%）且日内分位不足 80% 的高位加速股，属于击鼓传花末端，严禁接盘；
+         5. 读近期诱多错题本（recent_bull_trap_lessons）：牢记本账户近期被套与止损教训，绝不在同类形态上重蹈覆辙；
+         6. 双槽隔离与 T+1 约束：为每条建议明确指定 slot（\"steady\" 或 \"aggressive\"），优先从 slot_candidates 对应池选股；早盘 09:30~09:45 审慎开新仓，sellable_quantity=0 的当日新仓不可卖出。"
+    } else {
+        "当前为【顾问模式】：请结合 market_sentiment、候选股的 vwap_distance_bps / bull_trap_risk 反诱多指标以及 recent_bull_trap_lessons 错题本，给出全局市场偏向 bias（-20~20）、入场门槛调整 entry_delta（-15~15）、权重倾斜 weight_tilt_bps（-1000~1000）和分槽位建议 suggestions。"
+    };
+    let system_prompt = format!(
+        "你是 A 股盘中量化模拟交易 AI 决策引擎（内置主力诱多识破机制）。请严格根据提供的实时市场情绪（market_sentiment）、双槽抗诱多候选（slot_candidates）、日内均价线偏离（vwap_distance_bps）、诱多风险分（bull_trap_risk）、近期诱多错题本（recent_bull_trap_lessons）与 T+1 可卖股数输出纯 JSON（不要包含 markdown 代码块）。
+         {depth_instruction}
+         JSON 格式：{{\"mode\":\"{}\",\"confidence\":0-100,\"bias\":-20..20,\"entry_delta\":-15..15,\"weight_tilt_bps\":-1000..1000,\"blocked_symbols\":[\"高诱多风险代码\"],\"reason\":\"简明中文判断（含情绪温度、主力诱多识别结论与仓位策略）\",\"suggestions\":[{{\"symbol\":\"600000.SH\",\"slot\":\"steady|aggressive\",\"side\":\"buy|sell|avoid|hold\",\"target_weight_bps\":0-10000,\"score_delta\":-20..20,\"reason\":\"中文理由（说明均价线/诱多风险/趋势依据）\"}}]}}",
+        settings.ai_depth
+    );
+    (system_prompt, settings.ai_depth.clone())
 }
 
 #[cfg(test)]
@@ -364,5 +425,40 @@ mod tests {
         assert_eq!(s.ai_api_key, "sk-1234567890abcdef");
         assert_eq!(s.ai_depth, "deep");
         assert_eq!(s.live_interval_secs, 120);
+    }
+
+    #[test]
+    fn live_advice_asks_for_direct_json_before_spending_reasoning_tokens() {
+        let s = SystemSettings::default();
+        let body = json!({"model": "deepseek-v4.1-flash", "messages": []});
+        let attempts = live_advice_attempts(&s, &body);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].0["thinking"], json!({"type": "disabled"}));
+        assert_eq!(attempts[0].0["max_tokens"], json!(1_200));
+        assert!(attempts[1].0.get("thinking").is_none());
+        assert_eq!(attempts[1].0["max_tokens"], json!(8_000));
+        assert_eq!(attempts[0].0["model"], json!("deepseek-v4.1-flash"));
+    }
+
+    #[test]
+    fn an_empty_or_truncated_completion_is_an_error_not_advice() {
+        for content in [json!(""), json!("   "), json!("{\"bias\":")] {
+            let payload = json!({"choices": [{"message": {"content": content}}]});
+            let cleaned = payload["choices"][0]["message"]["content"].as_str().unwrap().trim();
+            assert!(serde_json::from_str::<Value>(cleaned).is_err() || cleaned.is_empty());
+        }
+        // Environment-independent: the default reads env vars, so build an
+        // explicit configured instance and an explicitly disabled one.
+        let configured = SystemSettings {
+            ai_enabled: true,
+            ai_base_url: "https://llm.example/v1/".into(),
+            ai_model: "deepseek-v4.1-flash".into(),
+            ai_api_key: "test-key".into(),
+            ..SystemSettings::default()
+        };
+        assert_eq!(live_advice_endpoint(&configured).unwrap(),
+                   "https://llm.example/v1/chat/completions");
+        let off = SystemSettings { ai_enabled: false, ..configured };
+        assert_eq!(live_advice_endpoint(&off).unwrap_err(), "ai_not_configured");
     }
 }
