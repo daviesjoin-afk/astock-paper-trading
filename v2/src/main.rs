@@ -481,7 +481,17 @@ async fn ai_advice_from_settings(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
     match res {
-        Ok(advice) => response(json!({ "ok": true, "mode": depth, "advice": advice })),
+        Ok(outcome) => response(json!({
+            "ok": true,
+            "mode": depth,
+            "advice": outcome.advice,
+            "usage": {
+                "prompt_tokens": outcome.prompt_tokens,
+                "cached_prompt_tokens": outcome.cached_prompt_tokens,
+                "total_tokens": outcome.total_tokens,
+                "attempts": outcome.attempts,
+            },
+        })),
         Err(err) => response(json!({ "ok": false, "mode": depth, "error": err, "advice": null })),
     }
 }

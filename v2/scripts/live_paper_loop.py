@@ -280,6 +280,16 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
             if isinstance(settings_resp, dict) and (settings_resp.get("ok") or settings_resp.get("disabled")):
                 advice = settings_resp.get("advice")
                 settings_used = True
+                # The kernel owns this call, so only it can report what the
+                # provider billed. Without this the round logged no usage at all
+                # and prompt-cache behaviour was invisible.
+                usage = settings_resp.get("usage") or {}
+                log.emit("ai_usage", round_id=round_id, attempt=usage.get("attempts") or 1,
+                         model=config.llm_model, status="completed",
+                         prompt_tokens=usage.get("prompt_tokens"),
+                         cached_prompt_tokens=usage.get("cached_prompt_tokens"),
+                         total_tokens=usage.get("total_tokens"),
+                         path="settings")
         except Exception:  # noqa: BLE001 - fall back to direct raw_advice if endpoint unavailable
             settings_used = False
         if not settings_used:

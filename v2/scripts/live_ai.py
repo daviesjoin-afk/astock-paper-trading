@@ -618,6 +618,37 @@ def _provider_tokens(payload: Any) -> dict[str, int | None]:
     }
 
 
+# Keys that hold the whole market table and the account books. They change only
+# when a position or a quote changes, and putting them AFTER the volatile block
+# would defeat the prompt cache, so they lead.
+# Only facts that are byte-identical across rounds. The slot books carry
+# cash/equity, which moves with every fill, so they stay volatile.
+STABLE_DIGEST_KEYS = ("market_table", "recent_bull_trap_lessons",
+                      "account_as_of_round_id")
+
+
+def digest_messages(system_prompt: str, digest: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Order the payload so the cached prefix is as long as possible.
+
+    A provider caches the longest common prefix of the prompt. Serialising the
+    dict in its natural order put the minute-by-minute fields first, so every
+    round diverged in the opening kilobytes and the measured hit rate was 0.2%.
+    Stable structure leads; the volatile tail follows.
+    """
+    stable = {key: digest[key] for key in STABLE_DIGEST_KEYS if key in digest}
+    volatile = {key: value for key, value in digest.items() if key not in stable}
+    # ``sort_keys`` would alphabetise the wrapper and put "round" ahead of
+    # "stable", shortening the cached prefix by the whole market table. Sort
+    # inside each block instead and keep the two-block order explicit.
+    payload = ('{"stable":' + json.dumps(dict(sorted(stable.items())), ensure_ascii=False)
+               + ',"round":' + json.dumps(dict(sorted(volatile.items())), ensure_ascii=False)
+               + '}')
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": payload},
+    ]
+
+
 def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
                model: str, timeout: float = 30.0,
                opener: Callable[..., Any] = urllib.request.urlopen,
@@ -667,11 +698,7 @@ def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
         status = "request_error"
         try:
             if attempt == 1:
-                body["messages"] = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(
-                        digest, ensure_ascii=False, allow_nan=False)},
-                ]
+                body["messages"] = digest_messages(system_prompt, digest)
             request = urllib.request.Request(
                 base_url.rstrip("/") + "/chat/completions",
                 data=json.dumps(body, ensure_ascii=False).encode("utf-8"),

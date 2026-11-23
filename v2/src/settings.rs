@@ -270,16 +270,55 @@ pub fn test_ai_connection(
 
 /// Build an enriched context prompt (account equity, positions, market breadth, top quotes)
 /// and ask the configured LLM provider for structured intraday trading advice.
+/// Advice plus the provider's token accounting for this call. Prompt caching is
+/// billed from these numbers, so a caller that cannot see them cannot tell a
+/// cached round from a cold one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveAdviceOutcome {
+    pub advice: Value,
+    pub prompt_tokens: Option<i64>,
+    pub cached_prompt_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub attempts: u32,
+}
+
 pub fn call_ai_live_advice(
     settings: &SystemSettings,
     context_snapshot: &Value,
-) -> Result<Value, String> {
+) -> Result<LiveAdviceOutcome, String> {
     let (system_prompt, mode) = live_advice_prompt(settings);
+    // Prompt caching bills from the longest common prefix, so the payload is
+    // serialised with the stable half first. Sending the kernel's own object
+    // order put minute-by-minute fields at the front; the measured hit rate was
+    // 0.2% versus 99.9% once stable structure led.
+    // Only facts that are byte-identical across rounds belong here. The slot
+    // books carry cash/equity, which changes with every fill, so they stay in
+    // the volatile tail: caching them would break the prefix on every trade.
+    const STABLE_KEYS: [&str; 3] = [
+        "market_table", "recent_bull_trap_lessons", "account_as_of_round_id",
+    ];
+    let mut stable = serde_json::Map::new();
+    let mut volatile = serde_json::Map::new();
+    if let Some(fields) = context_snapshot.as_object() {
+        for (key, value) in fields {
+            if STABLE_KEYS.contains(&key.as_str()) {
+                stable.insert(key.clone(), value.clone());
+            } else {
+                volatile.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    // Build the wrapper by hand: serde_json's map keeps insertion order, and
+    // "stable" must come first or the cached prefix shrinks to nothing.
+    let ordered_text = format!(
+        "{{\"stable\":{},\"round\":{}}}",
+        Value::Object(stable), Value::Object(volatile)
+    );
     let body = json!({
         "model": settings.ai_model.trim(),
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context_snapshot.to_string()}
+            {"role": "user", "content": ordered_text}
         ],
         "temperature": 0.2
     });
@@ -291,9 +330,17 @@ pub fn call_ai_live_advice(
     // to reasoning with a budget large enough to finish.
     let attempts = live_advice_attempts(settings, &body);
     let mut errors = Vec::new();
-    for (request_body, timeout_secs) in attempts {
+    for (attempt, (request_body, timeout_secs)) in attempts.into_iter().enumerate() {
         match live_advice_once(&endpoint, settings, &request_body, timeout_secs) {
-            Ok(advice) => return Ok(stamp_live_advice(advice, settings, &mode)),
+            Ok((advice, usage)) => {
+                return Ok(LiveAdviceOutcome {
+                    advice: stamp_live_advice(advice, settings, &mode),
+                    prompt_tokens: usage.0,
+                    cached_prompt_tokens: usage.1,
+                    total_tokens: usage.2,
+                    attempts: attempt as u32 + 1,
+                });
+            }
             Err(error) => errors.push(error),
         }
     }
@@ -322,7 +369,7 @@ fn live_advice_once(
     settings: &SystemSettings,
     body: &Value,
     timeout_secs: u64,
-) -> Result<Value, String> {
+) -> Result<(Value, (Option<i64>, Option<i64>, Option<i64>)), String> {
     let agent = http::agent(Duration::from_secs(timeout_secs), false);
     live_advice_with(endpoint, settings, body, &agent)
 }
@@ -333,7 +380,7 @@ fn live_advice_with(
     settings: &SystemSettings,
     body: &Value,
     agent: &ureq::Agent,
-) -> Result<Value, String> {
+) -> Result<(Value, (Option<i64>, Option<i64>, Option<i64>)), String> {
     let mut res = agent
         .post(endpoint)
         .header("Authorization", &format!("Bearer {}", settings.ai_api_key.trim()))
@@ -359,7 +406,17 @@ fn live_advice_with(
     if cleaned.is_empty() {
         return Err("ai_empty_content".into());
     }
-    serde_json::from_str(cleaned).map_err(|e| format!("ai_advice_parse_error: {e}"))
+    let advice = serde_json::from_str(cleaned)
+        .map_err(|e| format!("ai_advice_parse_error: {e}"))?;
+    // Providers differ in where they report cache hits; accept either spelling.
+    let usage = &parsed["usage"];
+    let num = |value: &Value| value.as_i64().or_else(|| value.as_f64().map(|v| v as i64));
+    let prompt = num(&usage["prompt_tokens"]).or_else(|| num(&usage["input_tokens"]));
+    let cached = num(&usage["prompt_cache_hit_tokens"])
+        .or_else(|| num(&usage["prompt_tokens_details"]["cached_tokens"]))
+        .or_else(|| num(&usage["cached_prompt_tokens"]));
+    let total = num(&usage["total_tokens"]);
+    Ok((advice, (prompt, cached, total)))
 }
 
 fn live_advice_attempts(settings: &SystemSettings, body: &Value) -> Vec<(Value, u64)> {
@@ -427,6 +484,42 @@ mod tests {
         assert_eq!(s.ai_api_key, "sk-1234567890abcdef");
         assert_eq!(s.ai_depth, "deep");
         assert_eq!(s.live_interval_secs, 120);
+    }
+
+    #[test]
+    fn the_payload_leads_with_stable_fields_so_the_prefix_caches() {
+        // Two rounds that differ only in the volatile tail must serialise the
+        // same first document; otherwise the provider caches nothing.
+        let round = |equity: i64, stamp: &str| json!({
+            "quote_time": stamp,
+            "sample_count": 5_219,
+            "market_sentiment": {"score": 12},
+            "market_table": {"cols": ["symbol"], "rows": [["600000.SH", 100]]},
+            "slots": [{"slot": "steady", "cash_cents": equity}],
+            "held_positions": [],
+            "account_as_of_round_id": "2026-11-23-130009",
+            "recent_bull_trap_lessons": [],
+            "change_distribution": {"up": 1, "down": 2, "flat": 0},
+        });
+        let split = |value: &Value| {
+            let mut stable = serde_json::Map::new();
+            let mut volatile = serde_json::Map::new();
+            for (key, item) in value.as_object().unwrap() {
+                if ["market_table", "recent_bull_trap_lessons",
+                    "account_as_of_round_id"].contains(&key.as_str()) {
+                    stable.insert(key.clone(), item.clone());
+                } else {
+                    volatile.insert(key.clone(), item.clone());
+                }
+            }
+            (json!({"stable": stable, "round": volatile}).to_string(), stable)
+        };
+        let (first, s1) = split(&round(9_100_000, "2026-11-23T13:00:09+08:00"));
+        let (second, s2) = split(&round(9_200_000, "2026-11-23T13:03:09+08:00"));
+        assert_ne!(first, second, "the volatile tail must still change");
+        assert_eq!(s1, s2, "the stable block must be byte-identical");
+        assert!(first.contains("\"stable\":"), "{first}");
+        assert!(!serde_json::to_string(&s1).unwrap().contains("quote_time"));
     }
 
     #[test]

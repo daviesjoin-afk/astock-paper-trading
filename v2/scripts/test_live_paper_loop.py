@@ -240,7 +240,9 @@ class LivePaperLoopTests(unittest.TestCase):
                            snapshot=config.feed_builder())
         llm_call = next(call for call in opener.calls
                         if "/chat/completions" in call[1])
-        digest = json.loads(llm_call[2]["messages"][1]["content"])
+        payload = json.loads(llm_call[2]["messages"][1]["content"])
+        self.assertEqual(list(payload)[0], "stable", "cached prefix must lead")
+        digest = {**payload["stable"], **payload["round"]}
         self.assertEqual(digest["quote_time"], QUOTE_TIME)
         self.assertEqual(digest["sample_count"], 2)
         self.assertEqual(digest["change_distribution"],
@@ -775,6 +777,32 @@ class SummaryCompletenessTests(unittest.TestCase):
         self.assertNotIn("vwap_distance_bps", candidate)
 
 
+from live_ai import digest_messages  # noqa: E402
+import live_ai as ai  # noqa: E402
+
+
+class PromptCacheShapeTests(unittest.TestCase):
+    """A cached prefix is the whole point of a 160k-token round."""
+
+    def digest(self):
+        return {"quote_time": "2026-11-23T13:00:09+08:00", "sample_count": 5219,
+                "market_table": {"cols": ["symbol"], "rows": [["600000.SH", 100]]},
+                "slots": [{"slot": "steady"}], "held_positions": [],
+                "recent_bull_trap_lessons": [], "account_as_of_round_id": "r1",
+                "change_distribution": {"up": 1, "down": 2, "flat": 0}}
+
+    def test_stable_block_is_identical_across_rounds_and_leads(self):
+        first = ai.digest_messages("SYS", self.digest())
+        second = ai.digest_messages("SYS", {**self.digest(), "quote_time": "13:03"})
+        self.assertEqual(first[0], second[0])
+        self.assertNotEqual(first[1], second[1], "the volatile tail must change")
+        payload = json.loads(first[1]["content"])
+        self.assertEqual(list(payload)[0], "stable")
+        self.assertIn("market_table", payload["stable"])
+        self.assertNotIn("slots", payload["stable"], "cash changes every fill")
+        self.assertNotIn("quote_time", payload["stable"])
+
+
 class PromptContractTests(unittest.TestCase):
     """The kernel adds entry_delta to the threshold, so the sign must be spelled
     out: a defensive round that returns a negative delta silently loosens the
@@ -827,7 +855,7 @@ class AdviceRetryTests(unittest.TestCase):
         self.assertEqual(sent[0][0]["thinking"], {"type": "disabled"})
         self.assertEqual(sent[0][0]["max_tokens"], 1_200)
         self.assertEqual(json.loads(sent[0][0]["messages"][1]["content"]),
-                         {"sample_count": 3})
+                         {"stable": {}, "round": {"sample_count": 3}})
         self.assertEqual(events[0], ("ai_completed", {"round_id": "r1", "attempts": 1,
                                                      "elapsed_ms": 7_060}))
         event, fields = events[-1]
