@@ -501,7 +501,8 @@ impl Store {
                    volume_shares=excluded.volume_shares, \
                    amount_cents=excluded.amount_cents, \
                    adjust=excluded.adjust, source=excluded.source, \
-                   tradable=excluded.tradable",
+                   tradable=excluded.tradable \
+                 WHERE NOT (bar.source='tdx' AND excluded.source<>'tdx')",
             )?;
             for bar in bars {
                 stmt.execute(params![
@@ -2342,6 +2343,36 @@ mod tests {
         assert!(!path.exists());
         assert!(Store::open_market_read_only(&path).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_official_row_is_not_overwritten_by_a_live_or_archived_one() {
+        // `bar` is keyed by (symbol, day). A live intraday print and an
+        // imported V1 k-line both want that key; if either wins, the day's
+        // official close disappears from every `adjust='none'` read.
+        let mut store = Store::open(":memory:").unwrap();
+        let official = bar("600000.SH", "2026-11-10", 1_020, 1_010);
+        store.upsert_bars(&[official.clone()]).unwrap();
+
+        let mut live = official.clone();
+        live.close_cents = 1_055;
+        live.source = "live".into();
+        let mut archive = official.clone();
+        archive.close_cents = 1_090;
+        archive.source = "v1-archive".into();
+        store.upsert_bars(&[live, archive]).unwrap();
+
+        let rows = store.unadjusted_closes_range("2026-11-10", "2026-11-10").unwrap();
+        let row = rows.iter().find(|item| item.symbol == "600000.SH").unwrap();
+        assert_eq!(row.price_cents, 1_020, "the exchange's own close survives");
+
+        // A corrected official row may still be re-ingested in place.
+        let mut corrected = official.clone();
+        corrected.close_cents = 1_030;
+        store.upsert_bars(&[corrected]).unwrap();
+        let rows = store.unadjusted_closes_range("2026-11-10", "2026-11-10").unwrap();
+        let row = rows.iter().find(|item| item.symbol == "600000.SH").unwrap();
+        assert_eq!(row.price_cents, 1_030);
     }
 
     #[test]

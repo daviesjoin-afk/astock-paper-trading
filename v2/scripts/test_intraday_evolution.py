@@ -79,5 +79,119 @@ class CloseReviewTests(unittest.TestCase):
                 self.assertTrue((root/'rounds'/'2026-11-20.jsonl.gz').is_file())
 
 
+class AdvanceTrialsTests(unittest.TestCase):
+    """``advance_trials`` used to reference an undefined ``executable``, so the
+    NameError aborted the close job even when there was nothing to advance — the
+    review never ran and no trial was ever recorded."""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / 'rounds').mkdir()
+        (self.root / 'reviews').mkdir()
+        (self.root / 'trials').mkdir()
+        self.binary = self.root / 'replay.bin'
+        self.binary.write_bytes(b'replay-binary-v1')
+
+    def review(self, formed_on, candidate_id='c1', policy=None):
+        policy = policy or {'kind': 'weak_entry_buffer', 'points': 5}
+        evolution.write_json(self.root / 'reviews' / f'{formed_on}.json', {
+            'model_review_status': 'complete',
+            'model_review': {'candidates': [
+                {'mechanism': 'm', 'evidence': ['pnl'], 'policy': policy,
+                 'candidate_id': candidate_id, 'formed_on': formed_on}]},
+        })
+
+    def archive(self, day):
+        (self.root / 'rounds' / f'{day}.jsonl.gz').write_bytes(b'')
+
+    def test_an_empty_candidate_set_returns_without_touching_anything(self):
+        self.archive('2026-11-19')
+        # No review at all: nothing to advance. This used to raise NameError.
+        evolution.advance_trials(self.root, '2026-11-20', [str(self.binary), 'replay-intraday'],
+                                 25, 100, replay_executable=self.binary)
+        self.assertEqual(list((self.root / 'trials').glob('*.json')), [])
+
+    def test_an_empty_candidate_set_returns_even_without_a_binary(self):
+        evolution.advance_trials(self.root, '2026-11-20',
+                                 [str(self.root / 'missing'), 'replay-intraday'],
+                                 25, 100, replay_executable=self.root / 'missing')
+        self.assertEqual(list((self.root / 'trials').glob('*.json')), [])
+
+    def test_a_missing_replay_binary_is_a_clear_error_not_a_hash_of_nothing(self):
+        self.review('2026-11-19')
+        self.archive('2026-11-19')
+        self.archive('2026-11-20')
+        missing = self.root / 'absent-binary'
+        with self.assertRaisesRegex(ValueError, 'replay executable does not exist'):
+            evolution.advance_trials(self.root, '2026-11-20',
+                                     [str(missing), 'replay-intraday'], 25, 100,
+                                     replay_executable=missing)
+
+    def test_a_trial_records_the_hash_of_the_passed_binary(self):
+        import hashlib
+        self.review('2026-11-19')
+        self.archive('2026-11-19')
+        self.archive('2026-11-20')
+        recorded = {'status': 'collecting', 'reasons': ['insufficient_forward_days'],
+                    'evaluated_through': '2026-11-20'}
+        with patch.object(evolution, 'run_trial', return_value=dict(recorded)) as run:
+            evolution.advance_trials(self.root, '2026-11-20',
+                                     [str(self.binary), 'replay-intraday'], 25, 100,
+                                     replay_executable=self.binary)
+        self.assertEqual(run.call_count, 1)
+        trial = evolution.json.loads(
+            (self.root / 'trials' / 'c1.json').read_text(encoding='utf-8'))
+        self.assertEqual(trial['binary_sha256'],
+                         hashlib.sha256(b'replay-binary-v1').hexdigest())
+        self.assertEqual(trial['status'], 'collecting')
+
+    def test_the_binary_defaults_to_the_command_when_not_given(self):
+        import hashlib
+        self.review('2026-11-19')
+        self.archive('2026-11-19')
+        self.archive('2026-11-20')
+        with patch.object(evolution, 'run_trial',
+                          return_value={'status': 'collecting',
+                                        'reasons': ['insufficient_forward_days']}):
+            evolution.advance_trials(self.root, '2026-11-20', [str(self.binary)], 25, 100)
+        trial = evolution.json.loads(
+            (self.root / 'trials' / 'c1.json').read_text(encoding='utf-8'))
+        self.assertEqual(trial['binary_sha256'],
+                         hashlib.sha256(b'replay-binary-v1').hexdigest())
+
+    def test_a_changed_binary_blocks_an_existing_collecting_trial(self):
+        self.review('2026-11-19')
+        self.archive('2026-11-19')
+        self.archive('2026-11-20')
+        evolution.write_json(self.root / 'trials' / 'c1.json', {
+            'candidate_id': 'c1', 'status': 'collecting', 'evaluated_through': '2026-11-20',
+            'binary_sha256': 'not-the-current-build', 'formed_on': '2026-11-19',
+            'expected_bps': 25, 'pilot_stdev_bps': 100})
+        with patch.object(evolution, 'run_trial') as run:
+            evolution.advance_trials(self.root, '2026-11-21', [str(self.binary)], 25, 100,
+                                     replay_executable=self.binary)
+        run.assert_not_called()
+        trial = evolution.json.loads(
+            (self.root / 'trials' / 'c1.json').read_text(encoding='utf-8'))
+        self.assertEqual(trial['status'], 'blocked')
+        self.assertEqual(trial['reasons'], ['replay_binary_changed_requires_review'])
+
+    def test_daily_passes_the_binary_through_to_the_trial_step(self):
+        db = Mock()
+        db.execute.return_value.fetchall.return_value = [(0,)]
+        self.binary.write_bytes(b'replay-binary-v1')
+        with patch.object(evolution, 'collect', return_value={'day': '2026-11-20'}), \
+             patch.object(evolution, 'export'), \
+             patch.object(evolution, 'review',
+                          return_value={'model_review_status': 'complete'}), \
+             patch.object(evolution, 'advance_trials') as advance:
+            evolution.daily(db, self.root, '2026-11-20', self.root / 'unused.json',
+                            model_on=False, replay_command=[str(self.binary), 'replay-intraday'],
+                            replay_executable=self.binary)
+        self.assertEqual(advance.call_args.kwargs['replay_executable'], self.binary)
+
+
 if __name__ == '__main__':
     unittest.main()

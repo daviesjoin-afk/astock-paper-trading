@@ -14,6 +14,14 @@ The two rules that make the numbers mean anything:
    must exist. Missing labels are dropped, never filled with zero -- a zero
    forward return is a claim that the price did not move.
 
+**The label ends on a market day, not on a record count.** The first version
+took "this symbol's `horizon`-th remaining row" as the end of the label. A name
+that halted for a week has fewer rows than a name that did not, so the two
+labels covered different amounts of time and were compared as if they were the
+same question. The end is now the `horizon`-th trading day after the decision
+day on the market calendar; a symbol with no bar on that day is dropped from
+that cross-section rather than measured to a nearer date.
+
 Output is per-factor, per-day RankIC, then aggregated to mean IC / IR, plus the
 top-minus-bottom quintile spread. IR here is mean(IC)/std(IC) over days, which
 is the standard definition and is what the project's ≥300 bps promotion gate
@@ -140,6 +148,20 @@ def load_series(db: str):
     return series
 
 
+def market_calendar(series: dict[str, list]) -> list[str]:
+    """The market's tradable days: the union of every symbol's sessions.
+
+    The label endpoint is counted on this calendar, not on a symbol's own rows.
+    A halted name does not lose market days; it merely has no bar on some of
+    them.
+    """
+    return sorted({bar[0] for bars in series.values() for bar in bars})
+
+
+def close_by_day(bars: list) -> dict[str, int]:
+    return {bar[0]: bar[4] for bar in bars}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True)
@@ -158,6 +180,13 @@ def main(argv: list[str] | None = None) -> int:
         print("no rows", file=sys.stderr)
         return 2
 
+    # One market calendar for every symbol: the label end of a decision made on
+    # day D is the day `horizon` market sessions later, whoever traded it. A
+    # symbol with no bar on that day has an unknown label and is dropped, not
+    # measured to its own nearer row.
+    calendar = market_calendar(series)
+    calendar_position = {day: position for position, day in enumerate(calendar)}
+
     # Per day: for each factor, the (factor, forward) pairs across symbols.
     per_day: dict[str, dict[str, list[tuple[float, float]]]] = defaultdict(
         lambda: {name: [] for name in KBAR_FIELDS}
@@ -165,14 +194,26 @@ def main(argv: list[str] | None = None) -> int:
     graded = 0
     skipped_label = 0
     skipped_shape = 0
+    skipped_label_endpoint = 0
 
     for symbol, bars in series.items():
         if len(bars) < args.horizon + 2:
             continue
-        for index in range(len(bars) - args.horizon):
+        closes = close_by_day(bars)
+        for index in range(len(bars) - 1):
             day, o, h, l, c, _v = bars[index]
-            _next_day, _o2, _h2, _l2, future_close, _v2 = bars[index + args.horizon]
             if c <= 0:
+                continue
+            position = calendar_position.get(day)
+            if position is None or position + args.horizon >= len(calendar):
+                skipped_label_endpoint += 1
+                continue
+            label_day = calendar[position + args.horizon]
+            future_close = closes.get(label_day)
+            if future_close is None:
+                # Halted through the label endpoint: the forward return over
+                # the market's window does not exist for this name.
+                skipped_label_endpoint += 1
                 continue
             forward_bps = (future_close - c) * 10_000 // c
             if args.max_abs_forward and abs(forward_bps) > args.max_abs_forward:
@@ -227,9 +268,17 @@ def main(argv: list[str] | None = None) -> int:
         "db": args.db,
         "horizon_days": args.horizon,
         "symbols": len(series),
+        "market_sessions": len(calendar),
+        "label_endpoint_rule": (
+            "the label ends on the market's `horizon`-th session after the decision "
+            "day; a symbol with no bar that day is dropped"
+        ),
         "graded_observations": graded,
         "skipped_no_shape": skipped_shape,
         "skipped_no_field": skipped_label,
+        # Separate from skipped_no_field: these are names that traded on the
+        # decision day but had no bar on the market label endpoint.
+        "skipped_label_endpoint": skipped_label_endpoint,
         "factors": results,
     }
     if args.json:

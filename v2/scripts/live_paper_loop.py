@@ -49,6 +49,13 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_LOG_PATH = (Path(__file__).resolve().parent.parent
                     / "work" / "live" / "intraday-loop.log")
 MORNING_OPEN, MORNING_CLOSE = time_cls(9, 30), time_cls(11, 30)
+# How many ranked candidates join the holdings in the news watch list. This
+# only widens substring matching against the market wires already fetched, so
+# it costs no extra request; the cap stops a broad-market digest from being
+# dominated by candidates at the expense of the names actually held.
+NEWS_CANDIDATE_LIMIT = 20
+# How many held symbols get the (slower) per-symbol news request.
+NEWS_PER_SYMBOL_LIMIT = 6
 # Safety valve: if the clock never reaches a session after this many
 # sleep-to-open cycles, exit and let the supervisor restart us.
 MAX_CONSECUTIVE_WAITS = 5
@@ -162,6 +169,64 @@ def round_identity(snapshot: Mapping[str, Any]) -> tuple[str, str]:
     return f"{day}-{local:%H%M%S}", day
 
 
+MAX_QUOTE_AGE = timedelta(minutes=10)
+"""How old a quote may be and still be priced or filled.
+
+The Rust live-loop refuses a snapshot it cannot date inside the session day;
+the Python scheduler used to accept a snapshot whose source time was missing
+(flagged only in a log line) and then waited through a multi-second AI call
+before posting it. A stale or estimated quote could therefore be scored, valued
+and filled. Same rule here, applied again *after* the AI call, because that wait
+is long enough for a fresh quote to become stale.
+"""
+
+
+class StaleQuote(LoopError):
+    """The snapshot cannot be trusted as a live price for this round."""
+
+
+def require_fresh_quote(snapshot: Mapping[str, Any], *,
+                        now: datetime | None = None,
+                        elapsed: timedelta | None = None) -> datetime:
+    """Return the observed time, or raise if this snapshot may not trade.
+
+    Two ages matter and they are different questions:
+
+    * how old the *data* already was when we fetched it — `quote_time` against
+      `fetched_at`. A source that hands back an hour-old print is not a price;
+    * how long *we* have held it — `elapsed`, measured from the moment the
+      snapshot was taken. The AI call sits in between and can run for minutes.
+
+    Fail-closed on purpose: a missing source time is not "now", it is unknown.
+    """
+    if snapshot.get("quote_time_estimated"):
+        raise StaleQuote("quote_time_estimated: the source did not date its own quote")
+    observed = feed.source_datetime(snapshot.get("quote_time"))
+    if observed is None:
+        raise StaleQuote(f"quote_time cannot be read: {snapshot.get('quote_time')!r}")
+    local = observed.astimezone(feed.SHANGHAI)
+    fetched = feed.source_datetime(snapshot.get("fetched_at"))
+    if fetched is not None:
+        age = fetched - local
+        if age > MAX_QUOTE_AGE:
+            raise StaleQuote(
+                f"quote_stale: observed {local.isoformat()} was already "
+                f"{age.total_seconds():.0f}s old when fetched")
+        if age < -MAX_QUOTE_AGE:
+            raise StaleQuote(
+                f"quote_from_the_future: observed {local.isoformat()} leads its own fetch")
+    if elapsed is not None and elapsed > MAX_QUOTE_AGE:
+        raise StaleQuote(
+            f"quote_stale: held for {elapsed.total_seconds():.0f}s before posting")
+    if now is not None:
+        drift = now.astimezone(feed.SHANGHAI) - local
+        if drift > MAX_QUOTE_AGE:
+            raise StaleQuote(
+                f"quote_stale: observed {local.isoformat()} is "
+                f"{drift.total_seconds():.0f}s behind the scheduler")
+    return local
+
+
 def blocked_top3(decisions: Any) -> list[list[Any]]:
     reasons = Counter(
         item.get("blocked_reason")
@@ -260,12 +325,14 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
                  quote_time=snapshot.get("quote_time"))
         return False
     try:
+        require_fresh_quote(snapshot)
         round_id, day = round_identity(snapshot)
     except LoopError as error:
         log.emit("round_skipped", reason=str(error),
                  quote_time=snapshot.get("quote_time"))
         return False
     state.start_day(day)
+    held_since = time.monotonic()
 
     advice = None
     if config.ai_on:
@@ -284,11 +351,11 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         # session and hand it over, so advice is conditioned on its own results.
         # Which names deserve a news lookup: what we hold, plus what the ranking
         # surfaced. Searching the whole market would add latency for noise.
-        held = [item.get("symbol") for item in (digest.get("held_positions") or [])
-                if item.get("symbol")]
+        held, candidates = news_watch_scope(digest)
         # Per-symbol lookups are the slow part, so only holdings get one; the
         # ranked names still match against the two market wires already in hand.
-        news_block = fetch_news_block(snapshot, list(dict.fromkeys(held)))
+        news_block = fetch_news_block(snapshot, held + candidates,
+                                      per_symbol_watch=held[:NEWS_PER_SYMBOL_LIMIT])
         digest = attach_news(digest, news_block)
         digest = attach_hot(digest, fetch_heat_block())
         digest = attach_northbound(digest, fetch_northbound_block())
@@ -317,6 +384,17 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
             advice = raw_advice(digest, base_url=config.llm_base,
                                 api_key=config.llm_key, model=config.llm_model,
                                 opener=config.opener, log=log, round_id=round_id)
+
+    # The AI call can take long enough for the quote to age out; the freshness
+    # rule has to hold at the moment of posting, not only at ingest.
+    if config.ai_on:
+        try:
+            require_fresh_quote(
+                snapshot, elapsed=timedelta(seconds=time.monotonic() - held_since))
+        except StaleQuote as error:
+            log.emit("round_skipped", round_id=round_id, reason=str(error),
+                     quote_time=snapshot.get("quote_time"))
+            return False
 
     payload = {
         "round_id": round_id,
@@ -551,17 +629,43 @@ def fetch_heat_block() -> Mapping[str, Any] | None:
         return None
 
 
-def fetch_news_block(snapshot: Mapping[str, Any], watch: Sequence[str]) -> Mapping[str, Any] | None:
+def news_watch_scope(digest: Mapping[str, Any], *,
+                     candidate_limit: int = NEWS_CANDIDATE_LIMIT
+                     ) -> tuple[list[str], list[str]]:
+    """``(holdings, ranked candidates)`` — the names worth a news lookup.
+
+    A name the model may be asked to buy deserves the same news coverage as a
+    holding: blocking a fresh headline about a candidate because only positions
+    were watched is how a round buys into a downgrade it never saw. The
+    candidate list is capped because it only widens substring matching against
+    the two market wires already in hand — it adds no requests, but an unbounded
+    list would let a broad-market digest crowd out the held names.
+    """
+    held = [item.get("symbol") for item in (digest.get("held_positions") or [])
+            if isinstance(item, Mapping) and item.get("symbol")]
+    held = list(dict.fromkeys(held))
+    ranked = [item.get("symbol") for item in (digest.get("ranked_candidates") or [])
+              if isinstance(item, Mapping) and item.get("symbol")]
+    candidates = [symbol for symbol in dict.fromkeys(ranked)
+                  if symbol not in set(held)][:candidate_limit]
+    return held, candidates
+
+
+def fetch_news_block(snapshot: Mapping[str, Any], watch: Sequence[str], *,
+                     per_symbol_watch: Sequence[str] | None = None
+                     ) -> Mapping[str, Any] | None:
     """Symbol-linked headlines for this round, or nothing when the wires fail.
 
     News is additive: a provider outage must not stop a round, so a failure
     returns None and the observer simply reasons without headlines.
+    ``per_symbol_watch`` keeps the slow per-symbol requests on the holdings.
     """
     try:
         from live_news import digest_news
         from astock_public import PublicClient
         from source_http import SourceHttp
-        return digest_news(PublicClient(http=SourceHttp()), snapshot, watch=watch)
+        return digest_news(PublicClient(http=SourceHttp()), snapshot, watch=watch,
+                           per_symbol_watch=per_symbol_watch)
     except Exception:  # noqa: BLE001 - news is an enhancement, not a precondition
         return None
 

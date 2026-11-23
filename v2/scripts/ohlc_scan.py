@@ -23,6 +23,12 @@ The one thing this must not repeat is the look-ahead that was caught earlier:
 the factor is measured strictly before the forward window, and a test asserts
 that changing the forward window cannot change the factor value.
 
+The second thing it must not repeat is the mixed cross-section: counting
+backwards from each symbol's own last row put a halted name on a different
+decision day from everyone else, so one "rank IC" mixed several dates. The
+decision day is now one market day, shared by the whole cross-section, and a
+symbol with no bar that day is excluded from it.
+
 Usage:
     python scripts/ohlc_scan.py --db market.sqlite3 \
         --periods 2023-09-01:2024-03-15,... --out ohlc-scan.json
@@ -35,8 +41,10 @@ from pathlib import Path
 import sqlite3
 import statistics
 
+
 MIN_POINTS = 80
 HORIZON = 20
+MIN_LOOKBACK = 60
 
 FACTORS = (
     "upper_shadow_ratio",
@@ -121,48 +129,110 @@ def compute(name: str, points: list[tuple]) -> float | None:
     raise ValueError(f"unknown factor {name}")
 
 
-def factor_values(series: dict, name: str, horizon: int = HORIZON) -> dict[str, float]:
-    """Value strictly before the forward window.
+def market_calendar(conn: sqlite3.Connection, start: str, end: str) -> list[str]:
+    """The market's trading days inside the window: the union of all OHLC bars.
+
+    Same convention as `volume_scan.market_calendar` and the Rust store's
+    `--from`/`--through`: a day is a market day when some symbol has a bar on
+    it. This is the only calendar the database can attest to; a day on which
+    nothing traded is invisible here and is surfaced by the session-count guard
+    in `main` instead of being scored as a cross-section.
+    """
+    return [row[0] for row in conn.execute(
+        "SELECT DISTINCT day FROM bar WHERE adjust='none' AND day BETWEEN ? AND ? "
+        "AND close_cents > 0 ORDER BY day",
+        (start, end),
+    )]
+
+
+def decision_and_label_days(calendar: list[str], horizon: int = HORIZON):
+    """The one decision day and one label day shared by the cross-section."""
+    if len(calendar) < horizon + 1:
+        return None, None
+    return calendar[-1 - horizon], calendar[-1]
+
+
+def _series_index(points: list) -> dict[str, int]:
+    return {point[0]: position for position, point in enumerate(points)}
+
+
+def factor_values(series: dict, name: str, horizon: int = HORIZON,
+                  calendar: list[str] | None = None,
+                  decision_day: str | None = None) -> dict[str, float]:
+    """Value strictly before the forward window, on a shared decision day.
 
     Same cut as `volume_scan`: the factor is evaluated at the decision bar and
-    the label starts one step after it, so no bar is used on both sides.
+    the label starts one session after it, so no bar is used on both sides. The
+    decision bar is located by date on the supplied calendar; a symbol with no
+    bar that day is not part of this cross-section.
     """
+    if calendar is None:
+        calendar = sorted({point[0] for points in series.values() for point in points})
+    if decision_day is None:
+        decision_day, _label_day = decision_and_label_days(calendar, horizon)
+    if decision_day is None or decision_day not in calendar:
+        return {}
+    decision_index = calendar.index(decision_day)
     out: dict[str, float] = {}
     for symbol, points in series.items():
-        if len(points) < MIN_POINTS:
+        position = _series_index(points).get(decision_day)
+        if position is None:
+            # Halted or missing through the shared decision day.
             continue
-        decision_index = len(points) - 1 - horizon
-        if decision_index < 60:
+        if decision_index < MIN_LOOKBACK or position < MIN_LOOKBACK:
             continue
-        value = compute(name, points[: decision_index + 1])
+        value = compute(name, points[: position + 1])
         if value is not None:
             out[symbol] = value
     return out
 
 
-def forward_returns(series: dict, horizon: int = HORIZON) -> dict[str, float]:
+def forward_returns(series: dict, horizon: int = HORIZON,
+                    calendar: list[str] | None = None,
+                    decision_day: str | None = None,
+                    label_day: str | None = None) -> dict[str, float]:
+    """Return from the shared decision day to the shared label day.
+
+    Both ends come from the market calendar, so every label spans the same
+    number of sessions even when one symbol halted mid-window.
+    """
+    if calendar is None:
+        calendar = sorted({point[0] for points in series.values() for point in points})
+    if decision_day is None or label_day is None:
+        derived_decision, derived_label = decision_and_label_days(calendar, horizon)
+        decision_day = decision_day or derived_decision
+        label_day = label_day or derived_label
+    if decision_day is None or label_day is None:
+        return {}
     out: dict[str, float] = {}
     for symbol, points in series.items():
-        if len(points) < MIN_POINTS:
+        index = _series_index(points)
+        start, end = index.get(decision_day), index.get(label_day)
+        if start is None or end is None or end < start:
+            # Unknown label, dropped rather than filled with zero.
             continue
-        closes = [point[4] for point in points]
-        decision_index = len(points) - 1 - horizon
-        if decision_index < 0:
-            continue
-        base = closes[decision_index]
+        base = points[start][4]
         if base <= 0:
             continue
-        out[symbol] = (closes[-1] - base) * 10_000 / base
+        out[symbol] = (points[end][4] - base) * 10_000 / base
     return out
 
 
-def scan(conn: sqlite3.Connection, start: str, end: str) -> dict[str, dict]:
+def scan(conn: sqlite3.Connection, start: str, end: str) -> dict:
     series = load_window(conn, start, end)
-    forwards = forward_returns(series)
+    calendar = market_calendar(conn, start, end)
+    decision_day, label_day = decision_and_label_days(calendar, HORIZON)
+    if decision_day is None:
+        return {**{name: {"samples": 0, "rank_ic_bps": None} for name in FACTORS},
+                "decision_day": None, "label_day": None,
+                "calendar_sessions": len(calendar), "cross_section": 0}
+    forwards = forward_returns(series, HORIZON, calendar, decision_day, label_day)
     results = {}
+    cross_section = 0
     for name in FACTORS:
-        values = factor_values(series, name)
+        values = factor_values(series, name, HORIZON, calendar, decision_day)
         common = sorted(set(values) & set(forwards))
+        cross_section = max(cross_section, len(common))
         if len(common) < 100:
             results[name] = {"samples": len(common), "rank_ic_bps": None}
             continue
@@ -171,7 +241,13 @@ def scan(conn: sqlite3.Connection, start: str, end: str) -> dict[str, dict]:
             "samples": len(common),
             "rank_ic_bps": None if rho is None else round(rho * 10_000),
         }
-    return results
+    return {
+        **results,
+        "decision_day": decision_day,
+        "label_day": label_day,
+        "calendar_sessions": len(calendar),
+        "cross_section": cross_section,
+    }
 
 
 def main(argv=None) -> int:
@@ -244,8 +320,14 @@ def main(argv=None) -> int:
     report = {
         "windows": windows,
         "horizon_sessions": HORIZON,
+        "per_window": per_window,
         "summary": summary,
         "ranking": ordered,
+        "decision_day_rule": (
+            "one market decision day per window (the bar 20 market sessions before "
+            "the last), shared by the whole cross-section; a symbol without a bar "
+            "on that day is excluded from the cross-section"
+        ),
         "note": ("Open/high/low were ingested from day one and never used by a "
                  "signal. The factor is measured before the forward window, and "
                  "a test asserts that changing the label cannot move it."),

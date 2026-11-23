@@ -18,7 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import oos_report  # noqa: E402
 
 
-def variant(return_bps: int, drawdown_bps: int = 1_000, fills: int = 10) -> dict:
+TRAIN_DAYS = ("2023-07-05", "2025-12-31")
+TEST_DAYS = ("2026-01-05", "2026-11-11")
+
+
+def variant(return_bps: int, drawdown_bps: int = 1_000, fills: int = 10,
+            days: tuple[str, ...] = TEST_DAYS) -> dict:
     return {
         "account": {
             "equity_cents": 10_000_000 + return_bps * 1_000,
@@ -33,7 +38,9 @@ def variant(return_bps: int, drawdown_bps: int = 1_000, fills: int = 10) -> dict
         # `regime_ab` puts the settled days under input.windows, so the fixture
         # must too — a top-level `windows` would read as zero days.
         "windows": [],
-        "input": {"windows": [{"day": "2026-01-05"}, {"day": "2026-01-06"}]},
+        # The artifact must actually cover the window declared on the command
+        # line; a declaration the artifact does not back is rejected now.
+        "input": {"windows": [{"day": day} for day in days]},
     }
 
 
@@ -42,19 +49,25 @@ def write(path: Path, payload: dict) -> None:
 
 
 def run(train: dict, test: dict) -> dict:
-    """`train`/`test` are already full payloads, keyed by variant name."""
+    """A payload pair whose declarations the artifacts back end to end."""
+    report, code = run_with_code(train, test)
+    assert code == 0, report.get("declaration_problems")
+    return report
+
+
+def run_with_code(train: dict, test: dict) -> tuple[dict, int]:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         write(root / "train.json", train)
         write(root / "test.json", test)
         out = root / "oos.json"
-        oos_report.main([
+        code = oos_report.main([
             "--train", str(root / "train.json"), "--test", str(root / "test.json"),
             "--train-window", "2023-07-05:2025-12-31",
             "--test-window", "2026-01-05:2026-11-11",
             "--out", str(out),
         ])
-        return json.loads(out.read_text(encoding="utf-8"))
+        return json.loads(out.read_text(encoding="utf-8")), code
 
 
 class TestNoLeak(unittest.TestCase):
@@ -88,49 +101,58 @@ class TestNoLeak(unittest.TestCase):
 
 class TestVerdicts(unittest.TestCase):
     def test_positive_in_both_windows_is_only_weak_support(self):
-        report = run({"filtered": variant(800)}, {"filtered": variant(300)})
+        report = run({"filtered": variant(800, days=TRAIN_DAYS)}, {"filtered": variant(300)})
         self.assertEqual(report["verdict"], "consistent_positive")
         self.assertIn("one held-out sample", report["why"])
 
     def test_negative_in_both_windows_is_a_finding(self):
-        report = run({"filtered": variant(-500)}, {"filtered": variant(-300)})
+        report = run({"filtered": variant(-500, days=TRAIN_DAYS)}, {"filtered": variant(-300)})
         self.assertEqual(report["verdict"], "consistent_negative")
 
     def test_positive_only_in_sample_is_the_overfit_signature(self):
         # This is the case that matters: a result that exists only where the
         # parameters were chosen is not a result.
-        report = run({"filtered": variant(1200)}, {"filtered": variant(-800)})
+        report = run({"filtered": variant(1200, days=TRAIN_DAYS)}, {"filtered": variant(-800)})
         self.assertEqual(report["verdict"], "in_sample_only")
         self.assertIn("overfit", report["why"])
 
     def test_a_sign_flip_is_not_a_win(self):
-        report = run({"filtered": variant(-400)}, {"filtered": variant(200)})
+        report = run({"filtered": variant(-400, days=TRAIN_DAYS)}, {"filtered": variant(200)})
         self.assertEqual(report["verdict"], "sign_flip")
 
     def test_missing_curve_is_incomplete_not_zero(self):
         bad = {"filtered": {"account": {}, "fills": None, "fees_cents": None,
                             "rebalances": [], "slots": [], "windows": [],
                             "input": {"windows": []}}}
-        report = run(bad, {"filtered": variant(100)})
+        # An artifact with no account curve cannot be verified against any
+        # declaration, so it is reported as invalid rather than as a verdict.
+        report, code = run_with_code(bad, {"filtered": variant(100)})
+        # No curve is "incomplete", never "zero" and never a positive verdict;
+        # the report is still written, and the exit code refuses to bless it.
         self.assertEqual(report["verdict"], "incomplete")
+        self.assertEqual(code, 2)
+        self.assertTrue(any("no settled day" in p
+                            for p in report["declaration_problems"]))
 
 
 class TestReportShape(unittest.TestCase):
     def test_both_windows_are_reported_with_their_dates(self):
-        report = run({"filtered": variant(100)}, {"filtered": variant(-100)})
+        report = run({"filtered": variant(100, days=TRAIN_DAYS)}, {"filtered": variant(-100)})
         self.assertEqual(report["train"]["window"], "2023-07-05:2025-12-31")
         self.assertEqual(report["test"]["window"], "2026-01-05:2026-11-11")
         self.assertEqual(report["train"]["days"], 2)
 
     def test_caveats_travel_with_the_numbers(self):
         # A number without its limitations gets quoted alone. These ride along.
-        report = run({"filtered": variant(100)}, {"filtered": variant(100)})
+        report = run({"filtered": variant(100, days=TRAIN_DAYS)},
+                 {"filtered": variant(100)})
         joined = " ".join(report["caveats"])
         self.assertIn("One held-out window", joined)
         self.assertIn("No dividends", joined)
 
     def test_the_report_forbids_retuning_on_the_held_out_window(self):
-        report = run({"filtered": variant(100)}, {"filtered": variant(-900)})
+        report = run({"filtered": variant(100, days=TRAIN_DAYS)},
+                 {"filtered": variant(-900)})
         self.assertIn("not a prompt", report["note"])
 
     def test_a_missing_variant_is_an_error_not_an_empty_row(self):
@@ -149,3 +171,44 @@ class TestReportShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDeclaredWindowsAreCheckedAgainstArtifacts(unittest.TestCase):
+    """The whole point: a declaration the artifact does not back proves nothing."""
+
+    def test_the_same_artifact_cannot_be_train_and_test(self):
+        # One positive replay handed in twice with two tidy disjoint date
+        # ranges. The old version printed overlap=false / consistent_positive.
+        same = {"filtered": variant(900, days=TRAIN_DAYS)}
+        report, code = run_with_code(same, same)
+        self.assertEqual(code, 2)
+        self.assertEqual(report["verdict"], "invalid")
+        self.assertNotEqual(report["verdict"], "consistent_positive")
+        self.assertTrue(report["windows"]["actual_overlap"])
+        self.assertFalse(report["windows"]["overlap"] is False)
+
+    def test_an_artifact_that_does_not_cover_its_declared_window_is_invalid(self):
+        report, code = run_with_code(
+            {"filtered": variant(900, days=TRAIN_DAYS)},
+            {"filtered": variant(900, days=("2026-01-05", "2026-03-02"))},
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(report["verdict"], "invalid")
+        self.assertTrue(any("declared window" in p for p in report["declaration_problems"]))
+
+    def test_an_artifact_with_no_settled_day_is_invalid(self):
+        empty = {"filtered": {"account": {"return_bps": 500}, "fills": 1, "fees_cents": 0,
+                              "rebalances": [], "slots": [], "windows": [],
+                              "input": {"windows": []}}}
+        report, code = run_with_code({"filtered": variant(900, days=TRAIN_DAYS)}, empty)
+        self.assertEqual(code, 2)
+        self.assertEqual(report["verdict"], "invalid")
+
+    def test_different_fill_models_are_not_one_configuration(self):
+        train = {"filtered": variant(900, days=TRAIN_DAYS)}
+        train["filtered"]["input"]["fills"] = "next-open"
+        test = {"filtered": variant(300)}
+        test["filtered"]["input"]["fills"] = "same-close"
+        report, code = run_with_code(train, test)
+        self.assertEqual(code, 2)
+        self.assertTrue(any("fill models" in p for p in report["declaration_problems"]))

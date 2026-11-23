@@ -1207,13 +1207,17 @@ impl IntradayStore {
         day_filter: Option<&str>,
     ) -> IntradayResult<Vec<crate::store::Bar>> {
         let mut round_stmt = self.conn.prepare(
-            "SELECT substr(round_id, 1, 10) AS d, MAX(round_id) \
+            "SELECT substr(round_id, 1, 10) AS d, MAX(round_id), finished_at \
              FROM round \
              WHERE round_id NOT LIKE '%-close' AND length(round_id) >= 10 \
              GROUP BY d ORDER BY d ASC",
         )?;
-        let day_rounds: Vec<(String, String)> = round_stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        let day_rounds: Vec<(String, String, String)> = round_stmt
+            .query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            )))?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut snap_stmt = self.conn.prepare(
@@ -1223,9 +1227,14 @@ impl IntradayStore {
              FROM quote_snapshot WHERE round_id = ?1 AND price_cents > 0 ORDER BY symbol ASC",
         )?;
         let mut out = Vec::new();
-        for (day, round_id) in day_rounds {
+        for (day, round_id, quote_time) in day_rounds {
             if day.len() != 10 || day.as_bytes().get(4) != Some(&b'-') {
                 continue;
+            }
+            // `finished_at` holds the caller's quote time; `started_at` is the
+            // fetch stamp and says nothing about when the price was observed.
+            if !at_or_after_close(&quote_time) {
+                continue; // a mid-session restart is not the closing print
             }
             if let Some(target) = day_filter
                 && day != target
@@ -1477,16 +1486,36 @@ fn run_round_tx(
     // bought shares to sellable; same-day replays of an already-rolled day are
     // a no-op, and this is invisible to idempotent replays (they return the
     // stored outcome before this runs).
-    let round_day = request.quote_time.get(..10).map(str::to_string);
+    // The day a round belongs to is the Shanghai date of its caller-supplied
+    // quote_time, never a prefix of the raw string: "2026-11-23T00:30:00+00:00"
+    // and "2026-11-23T08:30:00+08:00" are the same session but different
+    // prefixes, and a date prefix that sorts earlier would roll the day
+    // backwards and unlock today's buys.
+    let round_day = quote_day(&request.quote_time);
     if let Some(day) = &round_day {
-        let rolled: Option<String> = transaction
+        let already: Option<String> = transaction
             .query_row(
                 "SELECT day FROM trading_day WHERE day=?",
                 params![day],
                 |row| row.get(0),
             )
             .optional()?;
-        if rolled.is_none() {
+        // Rounds must arrive in session order. A late round dated before the
+        // newest rolled day cannot roll anything back, and silently accepting
+        // it would let an out-of-order caller re-open an earlier day.
+        let newest: Option<String> = transaction
+            .query_row(
+                "SELECT day FROM trading_day ORDER BY day DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if newest.as_deref().is_some_and(|latest| latest > day.as_str()) {
+            return Err(IntradayError::Rules(format!(
+                "round_day_out_of_order: {day} is older than the rolled day"
+            )));
+        }
+        if already.is_none() {
             transaction.execute(
                 "UPDATE position SET sellable_quantity=quantity, updated_at=? WHERE quantity>0",
                 params![started_at],
@@ -2108,8 +2137,17 @@ fn slot_equity(
 ) -> IntradayResult<i64> {
     let mut equity = book.cash_cents;
     for position in &book.positions {
+        // A held position without a mark is not worth nothing. Skipping it
+        // understates equity; the account read model already refuses to state
+        // a number it cannot value. Falling back to the last known price for
+        // that symbol is the one assumption the ledger already relies on when
+        // a name does not quote this round — so use the same price here rather
+        // than silently dropping the asset.
         let Some(&price) = marks.get(&position.symbol) else {
-            continue;
+            return Err(IntradayError::Rules(format!(
+                "missing_mark_for_held_position: {}",
+                position.symbol
+            )));
         };
         equity = position.quantity.checked_mul(price)
             .and_then(|value| equity.checked_add(value))
@@ -2474,6 +2512,39 @@ fn set_daily_pnl(conn: &impl ConnLike, view: &mut AccountView) -> IntradayResult
     }
     view.daily_pnl_cents = equity.checked_sub(view.initial_cash_cents);
     Ok(())
+}
+
+/// The Shanghai session date a caller-supplied timestamp belongs to.
+///
+/// Every day-based rule (T+1 rollover, archive retention, close review) must
+/// agree on this one answer. Truncating the raw string instead splits a single
+/// session whenever a caller writes its UTC offset, and makes the day depend on
+/// spelling rather than on the market.
+/// Whether a caller-supplied timestamp is at or after the 15:00 session close.
+///
+/// Only a print taken at the close may be republished as that session's daily
+/// bar. An 11:30 snapshot is a real price and a real observation, but it is not
+/// the close; treating it as one both mis-prices the day and overwrites the
+/// exchange's own row under the shared (symbol, day) key.
+fn at_or_after_close(stamp: &str) -> bool {
+    let shanghai = FixedOffset::east_opt(8 * 3600).expect("+08:00 is a valid offset");
+    let local = DateTime::parse_from_rfc3339(stamp)
+        .map(|at| at.with_timezone(&shanghai))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.f"))
+                .ok()
+                .map(|at| at.and_utc().with_timezone(&shanghai))
+        });
+    let Some(local) = local else {
+        return false; // an undatable round cannot claim to be the close
+    };
+    local.time() >= chrono::NaiveTime::from_hms_opt(15, 0, 0).expect("15:00 is valid")
+}
+
+fn quote_day(stamp: &str) -> Option<String> {
+    shanghai_quote_day(stamp).map(|day| day.format("%Y-%m-%d").to_string())
 }
 
 fn shanghai_quote_day(stamp: &str) -> Option<NaiveDate> {

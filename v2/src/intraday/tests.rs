@@ -207,6 +207,62 @@ fn a_live_quote_produces_real_fills_with_fees_and_whole_lots() {
 }
 
 #[test]
+fn a_utc_spelling_of_the_same_session_does_not_roll_the_day() {
+    // 2026-11-20T00:30:00+00:00 and 2026-11-20T08:30:00+08:00 are the same
+    // Shanghai session. Truncating the raw string made the second one look like
+    // a *newer* day in one direction and an older one in the other; either way
+    // it could roll the day and unlock shares bought this morning.
+    let mut store = store();
+    buy(&mut store, "r-buy", "2026-11-20", "600000.SH");
+    let mut bearish = quote("600000.SH", 900, 1_060);
+    bearish.high_cents = Some(905);
+    bearish.low_cents = Some(895);
+    bearish.open_cents = Some(900);
+    bearish.volume = Some(20_000);
+    bearish.avg_volume = Some(300_000);
+    let same_session = store
+        .run_round(&request(
+            "r-utc-spelling",
+            "2026-11-20T01:57:00+00:00", // 09:57 Shanghai, same day
+            vec![bearish.clone()],
+        ))
+        .unwrap();
+    assert!(
+        same_session.trades.iter().all(|trade| trade.side != "sell"),
+        "a differently spelled timestamp of the same session must not unlock T+1"
+    );
+    let account = store.account_view().unwrap();
+    let held: Vec<_> = account.positions.iter().filter(|item| item.quantity > 0).collect();
+    assert!(!held.is_empty(), "the position is still held");
+    assert!(
+        held.iter().all(|item| item.sellable_quantity == 0),
+        "T+1 still blocks the sale"
+    );
+}
+
+#[test]
+fn a_round_dated_before_the_rolled_day_is_refused() {
+    // Out-of-order rounds must fail closed. Accepting one would let a caller
+    // step the day backwards and re-open an already-closed session.
+    let mut store = store();
+    buy(&mut store, "r-buy", "2026-11-20", "600000.SH");
+    store
+        .roll_trading_day("2026-11-21", "2026-11-21T09:15:00+08:00")
+        .unwrap();
+    let error = store
+        .run_round(&request(
+            "r-late",
+            "2026-11-20T14:57:00+08:00",
+            vec![quote("600000.SH", 1_050, 1_000)],
+        ))
+        .expect_err("an earlier session cannot be revisited");
+    assert!(
+        error.to_string().contains("round_day_out_of_order"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn same_day_bought_shares_are_not_sellable_and_a_new_day_rolls_once() {
     let mut store = store();
     buy(&mut store, "r-buy", "2026-11-20", "600000.SH");
@@ -1977,4 +2033,39 @@ fn research_strong_relief_can_grab_a_near_threshold_opportunity() {
     assert_eq!(after.round.regime, "risk_on");
     assert!(before.trades.iter().all(|trade| trade.slot != Slot::Steady));
     assert!(after.trades.iter().any(|trade| trade.slot == Slot::Steady && trade.side == "buy"));
+}
+
+#[test]
+fn a_mid_session_round_is_not_republished_as_the_daily_close() {
+    // A restart at 11:30 leaves a real round behind. It is a genuine
+    // observation, but it is not the close: republishing it as `bar` for that
+    // day both mis-prices the session and overwrites the exchange's own row.
+    let mut store = store();
+    // Round ids carry the session date in production; the close snapshot is
+    // republished under that date, so the fixture has to use the real shape.
+    let midday = request(
+        "2026-11-20-113000",
+        "2026-11-20T11:30:00+08:00",
+        vec![quote("600000.SH", 1_050, 1_000)],
+    );
+    store.run_round(&midday).unwrap();
+    assert!(
+        store.closing_bars_from_snapshots(None).unwrap().is_empty(),
+        "an 11:30 print is not the day's close"
+    );
+
+    // A genuine close-time round is republished, with the close price.
+    let closing = request(
+        "2026-11-20-150000",
+        "2026-11-20T15:00:00+08:00",
+        vec![quote("600000.SH", 1_080, 1_000)],
+    );
+    store.run_round(&closing).unwrap();
+    let bars = store.closing_bars_from_snapshots(None).unwrap();
+    let bar = bars
+        .iter()
+        .find(|item| item.symbol == "600000.SH" && item.day == "2026-11-20")
+        .expect("the closing round is republished");
+    assert_eq!(bar.close_cents, 1_080);
+    assert_eq!(bar.source, "live");
 }

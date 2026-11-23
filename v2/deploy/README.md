@@ -73,7 +73,18 @@ sudoedit /etc/astock-v2-rewrite.env
 | 变量 | 作用 |
 | --- | --- |
 | `ASTOCK_V2_DB` | 新数据库路径，例如 `/var/lib/astock-v2-rewrite/v2.sqlite3` |
+| `ASTOCK_V2_LIVE_DB` | **必填**，盘中独立账本，例如 `/var/lib/astock-v2-rewrite/live/intraday.sqlite3` |
 | `ASTOCK_PRICE_SETS_DIR` | 已审核价格集合目录，例如 `/var/lib/astock-v2-rewrite/price-sets` |
+| `ASTOCK_SETTINGS_PATH` | AI/长期运行设置 JSON，例如 `/var/lib/astock-v2-rewrite/settings.json` |
+
+三个路径都必须写成**绝对路径**，并落在 unit 允许写入的目录里
+（`StateDirectory=astock-v2-rewrite`，即 `/var/lib/astock-v2-rewrite`；
+`ProtectSystem=strict` 会挡住其余位置）。
+
+`ASTOCK_V2_LIVE_DB` 不设置时内核会退回相对路径 `work/live/intraday.sqlite3`，
+需要先有可写的 `WorkingDirectory` 才能创建；全新安装没有那个目录时内核在监听
+端口前就退出。`ASTOCK_SETTINGS_PATH` 不设置时默认取 live 库同目录的
+`settings.json`，也不能指向 `/var/lib/astock-live`（那是另一个单元的状态目录）。
 
 `ASTOCK_ARCHIVE_DIR` 已不再是新内核的功能，可保留旧值但不会被读取。
 不要把 `synthetic` 演示数据放进生产目录。
@@ -107,9 +118,70 @@ curl -fsS http://127.0.0.1:18765/v2/health
 
 ## 7. 每日调度（可选）
 
+cron 有两个独立的坑：`%` 在 crontab 里是**换行**而不是字面百分号，`date +%F`
+不转义会把命令截断在 `date +` ；`TZ=Asia/Shanghai` 只作用于 `date` 这一条命令，
+不影响 cron 自己在哪个时区判定 `30 15` 是什么时刻。所以要么转义 `%` 并显式给
+cron 设时区，要么交给 systemd timer（它用 `Timezone=`，不经过 shell）。
+
+方案 A：crontab（转义 `%`，并用 `CRON_TZ` 让调度本身按上海时间）
+
 ```cron
+CRON_TZ=Asia/Shanghai
 30 15 * * 1-5 ASTOCK_API=http://127.0.0.1:18765 \
-  /opt/astock-v2-rewrite/scripts/daily_auto.sh --day "$(TZ=Asia/Shanghai date +%F)"
+  /opt/astock-v2-rewrite/scripts/daily_auto.sh --day "$(date +\%F)"
+```
+
+`CRON_TZ` 是 cronie（Oracle Linux / RHEL / 多数发行版）支持的；若换成不支持
+它的 cron 实现，就不要依赖 `CRON_TZ`，改按 UTC 写调度时刻（上海 15:30 等于
+UTC 07:30），`date` 仍然显式带 `TZ`：
+
+```cron
+30 7 * * 1-5 ASTOCK_API=http://127.0.0.1:18765 \
+  /opt/astock-v2-rewrite/scripts/daily_auto.sh --day "$(TZ=Asia/Shanghai date +\%F)"
+```
+
+注意这里 `%` 依然要转义成 `\%`，否则 cron 在把命令交给 shell 之前就已经截断。
+
+方案 B：systemd timer（推荐，不经过 shell，没有 `%` 问题）
+
+```ini
+# /etc/systemd/system/astock-v2-daily.service
+[Unit]
+Description=Advance the V2 paper account one trading day
+
+[Service]
+Type=oneshot
+User=astock
+Environment=ASTOCK_API=http://127.0.0.1:18765
+# `date` is run with an explicit timezone; the timer below uses Timezone= too.
+ExecStart=/bin/sh -c '/opt/astock-v2-rewrite/scripts/daily_auto.sh --day "$(TZ=Asia/Shanghai date +%%F)"'
+```
+
+```ini
+# /etc/systemd/system/astock-v2-daily.timer
+[Unit]
+Description=Daily V2 advance at 15:30 Asia/Shanghai
+
+[Timer]
+OnCalendar=Mon..Fri 15:30:00
+Timezone=Asia/Shanghai
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+```
+
+`%%F` 是 systemd 对 unit 文件里 `%` 的转义（`%` 在 unit 中是说明符前缀）；
+直接写在 unit 的 `ExecStart` 里，不需要经过 crontab 的换行规则。
+`[Timer] Timezone=` 需要 systemd ≥ 252（Oracle Linux 9 / Ubuntu 24.04 起提供）；
+更老的 systemd 请删掉 `Timezone=`，把 `OnCalendar` 换算成服务器本地时间再写。
+
+启用：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now astock-v2-daily.timer
+systemctl list-timers astock-v2-daily.timer
 ```
 
 `daily_auto.sh` 只调用 `POST /v2/account/run`；没有对应已审核日期时服务会

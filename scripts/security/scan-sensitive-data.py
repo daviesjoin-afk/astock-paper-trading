@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 """Sensitive-data scanner for Git repositories (worktree + full reachable history).
 
-Exit codes: 0 = clean, 1 = violations. Designed to run standalone (local pre-push)
-and as a CI gate. It never prints raw sensitive values unless --write-raw-file is
-given, and that file is written outside the repository by default.
+Exit codes:
+    0 = clean (every requested scope was fully covered, nothing found)
+    1 = violations found, and every requested scope was fully covered
+    2 = the scan did NOT complete: some part of the requested scope could not be
+        enumerated or read. Findings collected so far are still printed, but a
+        clean result is never claimed for the uncovered range. This is a
+        failure, not a pass -- a gate must treat it as blocking.
+
+The three ways a scan used to look finished while it was not are now reported
+explicitly: a failing `git` command (previously an empty string), a batch blob
+read that stopped early (previously a silent `break`), and an empty ref/object
+enumeration (previously an early `return` that exited 0).
+
+Designed to run standalone (local pre-push) and as a CI gate. It never prints
+raw sensitive values unless --write-raw-file is given, and that file is written
+outside the repository by default.
 
 Usage:
-    python scan-sensitive-data.py [--repo PATH] [--scope all|worktree|history]
+    python scan-sensitive-data.py [--repo PATH] [--scope all|worktree|history|diff]
+                                  [--diff PATH]
                                   [--write-raw-file PATH] [--max-findings N]
                                   [--json PATH]
 """
@@ -274,11 +288,48 @@ class AllowList:
         return value in self.values
 
 
-def run(args, cwd=None, binary=False):
-    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if proc.returncode != 0:
-        return b"" if binary else ""
-    return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
+class GitCommandError(RuntimeError):
+    """A git command needed for coverage failed. Never silently becomes ""."""
+
+    def __init__(self, args, returncode: int, stderr: str = ""):
+        self.argv = list(args)
+        self.returncode = returncode
+        # Only the masked first line: git echoes paths, and this scanner exists
+        # to avoid publishing them.
+        self.detail = mask_line(stderr.strip().splitlines()[0]) if stderr.strip() else ""
+        super().__init__(f"{' '.join(self.argv[:4])} exited {returncode}: {self.detail}")
+
+
+class Coverage:
+    """Which parts of the requested scope were actually scanned.
+
+    A gate that only counts accumulated findings cannot tell "clean" from
+    "never looked". Every gap that a scan could not cover is recorded here, and
+    any gap makes the exit code non-zero with the uncovered range spelled out.
+    """
+
+    def __init__(self) -> None:
+        self.gaps: list = []
+        self.scanned: dict = {}
+
+    def gap(self, scope: str, detail: str) -> None:
+        entry = f"{scope}: {detail}"
+        if entry not in self.gaps:
+            self.gaps.append(entry)
+
+    def note(self, scope: str, count: int) -> None:
+        self.scanned[scope] = self.scanned.get(scope, 0) + count
+
+    def complete(self) -> bool:
+        return not self.gaps
+
+
+def run(args, cwd=None, *, allow_failure=False) -> str:
+    """Run git, and raise instead of pretending the output was empty."""
+    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 and not allow_failure:
+        raise GitCommandError(args, proc.returncode, proc.stderr.decode("utf-8", "replace"))
+    return proc.stdout.decode("utf-8", "replace")
 
 
 def is_binary_bytes(data: bytes) -> bool:
@@ -551,11 +602,21 @@ def scan_text(text: str, location: str, findings: Findings, *, include_long_hex=
                 findings.add("DB_CREDENTIAL_URL", value, location, context=ctx)
 
 
-def iter_worktree_files(repo: str):
+def iter_worktree_files(repo: str, coverage: "Coverage | None" = None):
     """Yield (absolute_path, relative_path). Prefers git's own file list so that
-    .gitignore'd runtime state (databases, caches, logs) never enters the scan."""
+    .gitignore'd runtime state (databases, caches, logs) never enters the scan.
+
+    When git fails, the caller is told through `coverage` instead of receiving an
+    empty file list that looks exactly like a clean worktree.
+    """
     if os.path.isdir(os.path.join(repo, ".git")) or os.path.isfile(os.path.join(repo, ".git")):
-        listed = run(["git", "-C", repo, "ls-files", "--cached", "--others", "--exclude-standard"])
+        try:
+            listed = run(["git", "-C", repo, "ls-files", "--cached", "--others",
+                          "--exclude-standard"])
+        except GitCommandError as error:
+            if coverage is not None:
+                coverage.gap("worktree", f"git ls-files failed, no file was scanned ({error})")
+            listed = ""
         seen = set()
         for rel in listed.splitlines():
             rel = rel.strip()
@@ -573,8 +634,10 @@ def iter_worktree_files(repo: str):
             yield path, os.path.relpath(path, repo).replace("\\", "/")
 
 
-def scan_worktree(repo: str, findings: Findings, manual_review: list, allow: "AllowList"):
-    for path, rel in iter_worktree_files(repo):
+def scan_worktree(repo: str, findings: Findings, manual_review: list,
+                  allow: "AllowList", coverage: "Coverage | None" = None):
+    coverage = coverage if coverage is not None else Coverage()
+    for path, rel in iter_worktree_files(repo, coverage):
         name = os.path.basename(path)
         ext = os.path.splitext(name)[1].lower()
         if SCANNER_SELF_RE.search(rel):
@@ -595,8 +658,11 @@ def scan_worktree(repo: str, findings: Findings, manual_review: list, allow: "Al
         try:
             with open(path, "rb") as handle:
                 data = handle.read()
-        except OSError:
+        except OSError as error:
+            # A file we cannot read is not a file we cleared.
+            coverage.gap("worktree", f"{rel} unreadable ({type(error).__name__})")
             continue
+        coverage.note("worktree", 1)
         if is_binary_bytes(data):
             continue
         scan_text(data.decode("utf-8", "replace"), f"worktree:{rel}", findings, allow=allow)
@@ -619,24 +685,47 @@ def reachable_refs(repo: str) -> list:
         tags = run(["git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/tags"], cwd=repo)
         refs += [line.strip() for line in tags.splitlines() if line.strip()]
         # pull_request 场景是 detached HEAD：symbolic-ref 为空，必须回退到 HEAD 本身，
-        # 否则当前检出的修订不会被纳入历史扫描（评审 P1）。
-        head = run(["git", "-C", repo, "symbolic-ref", "-q", "HEAD"], cwd=repo).strip()
+        # 否则当前检出的修订不会被纳入历史扫描（评审 P1）。--verify 在没有提交的空仓库里
+        # 退出非零是合法状态，因此这里允许失败；其它 git 失败照常抛出。
+        head = run(["git", "-C", repo, "symbolic-ref", "-q", "HEAD"], cwd=repo,
+                   allow_failure=True).strip()
         if not head:
-            head = run(["git", "-C", repo, "rev-parse", "--verify", "HEAD"], cwd=repo).strip()
+            head = run(["git", "-C", repo, "rev-parse", "--verify", "HEAD"], cwd=repo,
+                       allow_failure=True).strip()
         if head and head not in refs:
             refs.append(head)
     return refs
 
 
-def scan_history(repo: str, findings: Findings, manual_review: list, allow: "AllowList"):
+def scan_history(repo: str, findings: Findings, manual_review: list, allow: "AllowList",
+                 coverage: "Coverage | None" = None) -> None:
+    """Scan commit identities/messages and every reachable blob.
+
+    Any interruption -- a failing git command, an empty ref list, an empty
+    object list, or a broken `cat-file --batch` pipe -- is recorded as a
+    coverage gap, so the run cannot end "clean" over a range it never read.
+    """
+    coverage = coverage if coverage is not None else Coverage()
+
     def skip(value: str) -> bool:
         return allow.evaluate_value(value)
 
-    refs = reachable_refs(repo)
+    try:
+        refs = reachable_refs(repo)
+    except GitCommandError as error:
+        coverage.gap("history", f"ref enumeration failed, no history was scanned ({error})")
+        return
+    if not refs:
+        coverage.gap("history", "no refs enumerated, no history was scanned")
+        return
 
     # 1) metadata + messages
     fmt = "%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e"
-    raw = run(["git", "log", "--format=" + fmt, *refs], cwd=repo)
+    try:
+        raw = run(["git", "log", "--format=" + fmt, *refs], cwd=repo)
+    except GitCommandError as error:
+        coverage.gap("history", f"git log failed, no commit was scanned ({error})")
+        return
     for record in raw.split("\x1e"):
         record = record.strip("\n")
         if not record.strip():
@@ -664,7 +753,11 @@ def scan_history(repo: str, findings: Findings, manual_review: list, allow: "All
     # 2) every reachable blob (de-duplicated by object id: metadata-only rewrites keep
     #    the same blob ids, so identity-only rewrites stay cheap; content rewrites
     #    cascade and every rewritten blob is genuinely new).
-    objects = run(["git", "rev-list", "--objects", *refs], cwd=repo)
+    try:
+        objects = run(["git", "rev-list", "--objects", *refs], cwd=repo)
+    except GitCommandError as error:
+        coverage.gap("history", f"object enumeration failed, no blob was scanned ({error})")
+        return
     seen_blobs = {}
     for line in objects.splitlines():
         parts = line.split(" ", 1)
@@ -672,47 +765,148 @@ def scan_history(repo: str, findings: Findings, manual_review: list, allow: "All
             seen_blobs.setdefault(parts[0], parts[1])
     blobs = list(seen_blobs.items())
     if not blobs:
+        coverage.gap("history", f"{len(refs)} ref(s) exposed no reachable blob")
         return
     proc = subprocess.Popen(
         ["git", "cat-file", "--batch"],
         cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
-    for sha, path in blobs:
-        ext = os.path.splitext(path)[1].lower()
-        if SCANNER_SELF_RE.search(path):
-            continue
-        if SENSITIVE_FILE_RE.search(path) and not path.endswith(SENSITIVE_FILE_ALLOW) and not FIXTURE_PATH_RE.search(path):
-            if not skip(path):
-                findings.add("SENSITIVE_FILE", path, f"history:{sha[:10]}")
-        if ext in BINARY_EXT:
-            if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf") and IMAGE_REVIEW_HINT_RE.search(path):
-                manual_review.append(f"IMAGE_REVIEW | {path} | {sha[:10]}")
-            continue
-        try:
-            proc.stdin.write(f"{sha}\n".encode())
-            proc.stdin.flush()
-            header = proc.stdout.readline().decode("utf-8", "replace").strip()
-            if not header or header.endswith(("missing", "ambiguous")):
-                continue
-            size = int(header.split()[2])
-            data = proc.stdout.read(size)
-            proc.stdout.read(1)  # trailing newline
-        except (BrokenPipeError, ValueError, IndexError):
-            break
-        if is_binary_bytes(data):
-            continue
-        scan_text(data.decode("utf-8", "replace"), f"history:{path}@{sha[:10]}", findings, allow=allow)
+    scanned = 0
+    stopped_at = None
     try:
-        proc.stdin.close()
-        proc.wait(timeout=30)
-    except Exception:  # noqa: BLE001
-        proc.kill()
+        for sha, path in blobs:
+            ext = os.path.splitext(path)[1].lower()
+            if SCANNER_SELF_RE.search(path):
+                continue
+            if SENSITIVE_FILE_RE.search(path) and not path.endswith(SENSITIVE_FILE_ALLOW) and not FIXTURE_PATH_RE.search(path):
+                if not skip(path):
+                    findings.add("SENSITIVE_FILE", path, f"history:{sha[:10]}")
+            if ext in BINARY_EXT:
+                if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf") and IMAGE_REVIEW_HINT_RE.search(path):
+                    manual_review.append(f"IMAGE_REVIEW | {path} | {sha[:10]}")
+                continue
+            try:
+                proc.stdin.write(f"{sha}\n".encode())
+                proc.stdin.flush()
+                header = proc.stdout.readline().decode("utf-8", "replace").strip()
+                if not header:
+                    # The pipe closed mid-stream: the remaining blobs are unread.
+                    stopped_at = (sha, path, "empty header")
+                    break
+                if header.endswith(("missing", "ambiguous")):
+                    coverage.gap("history", f"blob {sha[:10]} ({path}) is {header.split()[-1]}")
+                    continue
+                size = int(header.split()[2])
+                data = proc.stdout.read(size)
+                if len(data) != size:
+                    stopped_at = (sha, path, f"short read {len(data)}/{size}")
+                    break
+                proc.stdout.read(1)  # trailing newline
+            except (BrokenPipeError, ValueError, IndexError, OSError) as error:
+                stopped_at = (sha, path, type(error).__name__)
+                break
+            scanned += 1
+            coverage.note("history-blobs", 1)
+            if is_binary_bytes(data):
+                continue
+            scan_text(data.decode("utf-8", "replace"), f"history:{path}@{sha[:10]}", findings, allow=allow)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if stopped_at is not None:
+        sha, path, why = stopped_at
+        coverage.gap(
+            "history",
+            f"blob batch read stopped at {sha[:10]} ({path}): {why}; "
+            f"{scanned} of {len(blobs)} blob(s) were read and the rest are unchecked",
+        )
+
+
+def _diff_path(lines: list, fallback: str) -> str:
+    """The target file of a unified-diff hunk header, if it names one."""
+    for line in reversed(lines):
+        match = re.match(r"^\+\+\+ (?:\w+/)?(.+?)(?:\t.*)?$", line)
+        if match:
+            path = match.group(1).strip()
+            return "" if path == "/dev/null" else path
+    return fallback
+
+
+def scan_diff(path: str, findings: Findings, manual_review: list,
+              allow: "AllowList", coverage: "Coverage | None" = None) -> None:
+    """Scan the *added* lines of a unified diff (the PR fast-feedback pass).
+
+    Only what the pull request introduces is scanned, which is the point: the
+    full-history pass covers the rest. The diff file is a required input -- a
+    missing or empty diff is a coverage gap, not "nothing to report".
+    """
+    coverage = coverage if coverage is not None else Coverage()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError as error:
+        coverage.gap("diff", f"{path} unreadable ({type(error).__name__})")
+        return
+    if not text.strip():
+        coverage.gap("diff", f"{path} is empty, no pull-request change was scanned")
+        return
+
+    current: list = []
+    target = ""
+    added: list = []
+    files = 0
+    for line in text.splitlines():
+        if line.startswith("diff --git ") or line.startswith("--- "):
+            if added:
+                _scan_diff_block(target, added, findings, manual_review, allow)
+                coverage.note("diff-lines", len(added))
+                added = []
+            if line.startswith("diff --git "):
+                files += 1
+                target = ""
+                current = []
+            continue
+        if line.startswith("+++ "):
+            target = _diff_path([line], target)
+            continue
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            manual_review.append(f"IMAGE_REVIEW | diff-binary | {target or path}")
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    if added:
+        _scan_diff_block(target, added, findings, manual_review, allow)
+        coverage.note("diff-lines", len(added))
+    if files == 0 and not coverage.gaps:
+        coverage.gap("diff", f"{path} contains no file section; nothing was scanned")
+
+
+def _scan_diff_block(path: str, added: list, findings: Findings,
+                     manual_review: list, allow: "AllowList") -> None:
+    rel = path or "<unknown-path>"
+    if (SENSITIVE_FILE_RE.search(rel) and not rel.endswith(SENSITIVE_FILE_ALLOW)
+            and not FIXTURE_PATH_RE.search(rel) and not allow.evaluate_location(rel)):
+        findings.add("SENSITIVE_FILE", rel, "diff")
+    if SCANNER_SELF_RE.search(rel):
+        return
+    scan_text("\n".join(added), f"diff:{rel}", findings, allow=allow)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Scan a Git repository for sensitive data.")
     parser.add_argument("--repo", default=".", help="repository path (default: current dir)")
-    parser.add_argument("--scope", choices=["all", "worktree", "history"], default="all")
+    parser.add_argument("--scope", choices=["all", "worktree", "history", "diff"], default="all")
+    parser.add_argument("--diff", help="unified diff to scan (needed by --scope diff)")
     parser.add_argument("--write-raw-file", help="write RAW values here (LOCAL ONLY, never commit)")
     parser.add_argument("--json", help="write machine-readable summary here")
     parser.add_argument("--max-findings", type=int, default=60, help="max findings printed")
@@ -723,29 +917,40 @@ def main() -> int:
     repo = os.path.abspath(args.repo)
     findings = Findings()
     manual_review: list = []
-    exceptions: list = []
+    coverage = Coverage()
     allowlist = AllowList(repo)
     # 只对本仓库做一次对象 id 收集，用于排除"自身提交 id"这类标识符。
+    # 非仓库场景退化为空集合，但这本身不影响覆盖声明——覆盖由各 scope 自己记录。
     try:
         findings.known_oids = {
             line.strip().lower()
             for line in run(["git", "-C", repo, "rev-list", "--all", "--objects"]).splitlines()
             if line.strip()
         }
-    except Exception:  # noqa: BLE001 - 非仓库场景下退化为空集合
+    except (GitCommandError, OSError):
         findings.known_oids = set()
 
+    wants_diff = args.scope == "diff" or bool(args.diff)
+    if args.scope == "diff" and not args.diff:
+        coverage.gap("diff", "--scope diff requires --diff PATH; nothing was scanned")
+
     if args.scope in ("all", "worktree"):
-        scan_worktree(repo, findings, manual_review, allowlist)
+        scan_worktree(repo, findings, manual_review, allowlist, coverage)
     if args.scope in ("all", "history"):
-        scan_history(repo, findings, manual_review, allowlist)
+        scan_history(repo, findings, manual_review, allowlist, coverage)
+    if wants_diff and args.diff:
+        scan_diff(args.diff, findings, manual_review, allowlist, coverage)
 
     summary = {
         "repo": repo,
         "scope": args.scope,
+        "diff": args.diff,
         "distinct_values": findings.count(),
         "by_kind": {},
         "manual_review": sorted(set(manual_review)),
+        "coverage": {"complete": coverage.complete(),
+                     "scanned": dict(sorted(coverage.scanned.items())),
+                     "uncovered": list(coverage.gaps)},
         "findings": [],
     }
     for value, entry in findings.by_value.items():
@@ -759,9 +964,11 @@ def main() -> int:
         })
 
     print(f"repo   : {repo}")
-    print(f"scope  : {args.scope}")
+    print(f"scope  : {args.scope}" + (f" (diff={args.diff})" if args.diff else ""))
     print(f"kinds  : " + (", ".join(f"{k}={v}" for k, v in sorted(summary['by_kind'].items())) or "none"))
     print(f"values : {findings.count()}")
+    if coverage.scanned:
+        print("scanned: " + ", ".join(f"{scope}={count}" for scope, count in sorted(coverage.scanned.items())))
     if args.preview:
         print("")
         print("== 脱敏预览（ID / 类型 / 预览 / 上下文）==")
@@ -780,6 +987,12 @@ def main() -> int:
         print(f"manual review: {len(summary['manual_review'])} 项（截图/二进制）")
         for item in summary["manual_review"][:10]:
             print(f"  {item}")
+    if not coverage.complete():
+        print("")
+        print(f"UNVERIFIED: {len(coverage.gaps)} range(s) of the requested scope were "
+              f"NOT scanned; this run proves nothing about them")
+        for gap in coverage.gaps:
+            print(f"  {gap}")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
@@ -793,6 +1006,10 @@ def main() -> int:
                     continue
                 handle.write(f"{entry['id']}\t{entry['kind']}\t{value}\n")
 
+    # Exit codes are the contract: 0 clean, 1 violations, 2 incomplete scan.
+    # An incomplete scan wins over a clean one -- it must never look like a pass.
+    if not coverage.complete():
+        return 2
     return 1 if findings.count() else 0
 
 

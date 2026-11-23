@@ -1,12 +1,17 @@
 name: v2-independent-kernel
 
 # V2 is the only application in this repository, so these checks are required
-# on every pull request and every master push. Do not re-add a `paths:` filter:
-# a retirement or repository-level change must not skip the kernel suite.
+# on every pull request and every push to a branch that can be deployed or
+# published. Do not re-add a `paths:` filter: a retirement or repository-level
+# change must not skip the kernel suite.
+# `release/**` is pushed directly (the snapshot branch is not merged through a
+# PR), so listing only `master` let exactly those pushes ship untested.
 on:
   pull_request:
   push:
-    branches: [master]
+    branches:
+      - master
+      - "release/**"
 
 permissions:
   contents: read

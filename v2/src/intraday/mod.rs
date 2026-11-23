@@ -493,9 +493,11 @@ pub struct MarketSentiment {
     pub limit_up_count: usize,
     pub limit_down_count: usize,
     /// Stocks that surged >= +6% intraday (`high_cents`) but pulled back >= 2% from the high.
-    pub bull_trap_count: usize,
-    /// Proportion of >= +6% intraday surges that faded >= 2%, in bps (0..10000).
-    pub bull_trap_rate_bps: i64,
+    /// This is a surge-and-fade count, not a failed-limit count: it says nothing
+    /// about whether a name ever reached its ceiling and then opened.
+    pub surge_fade_count: usize,
+    /// Share of >= +6% intraday surges that faded >= 2%, in bps (0..10000).
+    pub surge_fade_rate_bps: i64,
     /// Composite sentiment temperature in 0..=100 (50 = neutral).
     pub score: i64,
     pub label: String,
@@ -517,7 +519,7 @@ pub fn compute_market_sentiment(
     let mut limit_up = 0usize;
     let mut limit_down = 0usize;
     let mut high_surge = 0usize;
-    let mut bull_trap = 0usize;
+    let mut surge_fade = 0usize;
 
     for q in quotes {
         if !q.has_live_price() || q.prev_close_cents <= 0 {
@@ -551,7 +553,7 @@ pub fn compute_market_sentiment(
                 high_surge += 1;
                 let pullback_bps = (high - q.price_cents) * 10_000 / high.max(1);
                 if pullback_bps >= 200 {
-                    bull_trap += 1;
+                    surge_fade += 1;
                 }
             }
         }
@@ -570,8 +572,8 @@ pub fn compute_market_sentiment(
     }
 
     let up_ratio_bps = (up as i64 * 10_000) / total as i64;
-    let bull_trap_rate_bps = if high_surge > 0 {
-        (bull_trap as i64 * 10_000) / high_surge as i64
+    let surge_fade_rate_bps = if high_surge > 0 {
+        (surge_fade as i64 * 10_000) / high_surge as i64
     } else {
         0
     };
@@ -579,9 +581,9 @@ pub fn compute_market_sentiment(
     let breadth_term = ((up_ratio_bps - 5_000) / 200).clamp(-20, 20);
     let tail_term = (((strong as i64 - weak as i64) * 180) / total as i64).clamp(-15, 15);
     let limit_term = (((limit_up as i64 - limit_down as i64) * 250) / total as i64).clamp(-10, 10);
-    let trap_penalty = (bull_trap_rate_bps / 500).clamp(0, 15);
+    let fade_penalty = (surge_fade_rate_bps / 500).clamp(0, 15);
 
-    let score = (50 + breadth_term + tail_term + limit_term - trap_penalty).clamp(0, 100);
+    let score = (50 + breadth_term + tail_term + limit_term - fade_penalty).clamp(0, 100);
     let (label, mut posture, mut max_exp) = if score < 25 {
         ("情绪冰点", "亏钱效应显著，严控新开仓，防守控仓 ≤50%", 5_000)
     } else if score < 42 {
@@ -594,8 +596,10 @@ pub fn compute_market_sentiment(
         ("情绪亢奋", "多头情绪高涨，警惕高潮次日分化，切忌追买高位缩量板", 8_500)
     };
 
-    if bull_trap_rate_bps >= 3_500 && high_surge >= 10 {
-        posture = "盘中炸板/冲高回落率偏高（抛压重），严禁追高开仓，优先去弱留强";
+    if surge_fade_rate_bps >= 3_500 && high_surge >= 10 {
+        // Words chosen carefully: a fade is a fade. Calling it a failed limit
+        // would claim a ceiling touch this data never observed.
+        posture = "盘中冲高回落占比偏高（追高风险大），谨慎开新仓，优先去弱留强";
         max_exp = max_exp.min(6_500);
     }
 
@@ -611,8 +615,8 @@ pub fn compute_market_sentiment(
         weak_count: weak,
         limit_up_count: limit_up,
         limit_down_count: limit_down,
-        bull_trap_count: bull_trap,
-        bull_trap_rate_bps,
+        surge_fade_count: surge_fade,
+        surge_fade_rate_bps,
         score,
         label: label.into(),
         posture: posture.into(),

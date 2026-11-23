@@ -1,6 +1,12 @@
 import "./styles.css";
 import { installRouter, NAV, parseHash, pushHash, replaceHash, type Route } from "./router";
-import { ensureLiveReport, refreshLiveData as refreshLive, renderLive, setLiveRouteApplier } from "./live";
+import {
+  ensureLiveReport,
+  openLiveSymbolArchive,
+  refreshLiveData as refreshLive,
+  renderLive,
+  setLiveRouteApplier,
+} from "./live";
 
 class ApiError extends Error {
   constructor(readonly status: number | null, readonly detail: string) {
@@ -718,13 +724,29 @@ let screenerAsc = false;
 let screenerPage = 0;
 const SCREENER_PAGE_SIZE = 100;
 
+/**
+ * Request generation for the day slice of the screener.
+ *
+ * Switching the trading day twice quickly puts two requests in flight and the
+ * browser makes no promise about which resolves first. Without a generation
+ * the late answer of the *first* day overwrites the rows and the summary of
+ * the day the user is actually looking at. Every read increments this token;
+ * only the token that is still current may write back.
+ */
+let screenerGeneration = 0;
+
 const barChangeBps = (bar: Bar): number =>
   bar.prev_close_cents > 0
     ? ((bar.close_cents - bar.prev_close_cents) * 10_000) / bar.prev_close_cents
     : 0;
 
 async function loadScreener(): Promise<void> {
+  const generation = ++screenerGeneration;
   const days = await api<{ days: string[]; latest_day: string | null }>("/v2/market/days");
+  // The day list arrived after the user already picked a day (or another
+  // refresh started): rebuilding the picker here would move the selection
+  // back and re-render rows the user did not ask for.
+  if (generation !== screenerGeneration) return;
   const select = byId<HTMLSelectElement>("screener-day");
   select.replaceChildren();
   for (const day of [...days.days].reverse()) {
@@ -739,18 +761,36 @@ async function loadScreener(): Promise<void> {
     return;
   }
   select.value = days.latest_day;
-  await fetchScreenerDay(days.latest_day);
+  await fetchScreenerDay(days.latest_day, generation);
 }
 
-async function fetchScreenerDay(day: string): Promise<void> {
+/**
+ * Load one trading day into the screener.
+ *
+ * `generation` is the token captured by whoever started this read. A response
+ * that is no longer the newest one writes nothing at all: not the rows, not
+ * the summary tiles, not the count. That is what keeps a slow answer for
+ * Monday from repainting Tuesday.
+ */
+async function fetchScreenerDay(day: string, generation: number): Promise<void> {
   const [barsPayload, regimeRes] = await Promise.all([
     api<{ bars: Bar[]; count: number }>(`/v2/market/bars?day=${encodeURIComponent(day)}`),
     api<RegimeInfo>(`/v2/market/regime?day=${encodeURIComponent(day)}`).catch(() => null),
   ]);
+  if (generation !== screenerGeneration) return;
   screenerRows = barsPayload.bars.slice();
   screenerPage = 0;
   renderScreenerSummary(day, screenerRows, regimeRes);
   renderScreener();
+}
+
+/** The day picker starts a new generation, so any in-flight day is now stale. */
+function selectScreenerDay(day: string): void {
+  const generation = ++screenerGeneration;
+  void fetchScreenerDay(day, generation).catch((error: unknown) => {
+    if (generation !== screenerGeneration) return;
+    announce(`加载失败：${errorDetail(error)}`);
+  });
 }
 
 function renderScreenerSummary(day: string, bars: Bar[], regime: RegimeInfo | null): void {
@@ -912,7 +952,7 @@ byTestId("refresh").addEventListener("click", () => {
 byId<HTMLSelectElement>("screener-day").addEventListener("change", (event) => {
   const target = event.currentTarget;
   if (target instanceof HTMLSelectElement && target.value) {
-    void fetchScreenerDay(target.value);
+    selectScreenerDay(target.value);
   }
 });
 byId<HTMLInputElement>("screener-filter").addEventListener("input", () => {
@@ -996,14 +1036,12 @@ byId("detail-to-live").addEventListener("click", () => {
   const next: Route = { module: "live", view: "symbol" };
   pushHash(next);
   applyRoute(next);
-  setTimeout(() => {
-    const input = document.getElementById("live-symbol-input");
-    const loadBtn = document.getElementById("live-symbol-load");
-    if (input instanceof HTMLInputElement && loadBtn instanceof HTMLButtonElement) {
-      input.value = symbol;
-      loadBtn.click();
-    }
-  }, 60);
+  // Set the target state directly instead of pressing the live view's button
+  // on a timer: `applyRoute` has just rendered that view, and a programmatic
+  // click on a *disabled* button (the view is loading its own refresh) is
+  // silently dropped, leaving the symbol page empty while the URL says
+  // otherwise.
+  openLiveSymbolArchive(symbol);
 });
 byId("research-run").addEventListener("click", async () => {
   const btn = byId<HTMLButtonElement>("research-run");
@@ -1125,6 +1163,18 @@ type DetailRange = "20" | "60" | "120" | "all";
 let detailAllRows: Bar[] = [];
 let detailSymbol = "";
 let detailRange: DetailRange = "all";
+/**
+ * Request generation for the (parameterised, never cached) symbol page.
+ *
+ * Looking up two codes in a row leaves two reads in flight. Without a
+ * generation the slower first answer either repaints the chart with the old
+ * symbol or, worse, lands after the new title is already on screen and empties
+ * the new symbol's panels. Only the newest read may touch the DOM.
+ */
+let detailGeneration = 0;
+
+/** Which symbol the panels currently on screen were drawn for (null = none). */
+let detailRenderedSymbol: string | null = null;
 
 function clearDetailPanels(): void {
   byId("detail-chart").replaceChildren();
@@ -1140,29 +1190,60 @@ function clearDetailPanels(): void {
 
 async function loadDetail(symbol: string): Promise<void> {
   const empty = byTestId("detail-empty");
+  // Every call — including the "cleared input" branch — starts a new
+  // generation, so an answer for the previous symbol can never be applied on
+  // top of the state this call is about to establish.
+  const generation = ++detailGeneration;
   if (!symbol) {
     detailAllRows = [];
     detailSymbol = "";
+    detailRenderedSymbol = null;
     clearDetailPanels();
     setText("detail-symbol", "—");
     for (const id of ["detail-close", "detail-change", "detail-range", "detail-days"]) setText(id, "—");
     byTestId("detail-change").className = "";
+    empty.textContent = "输入代码查看个股走势。";
     show(empty, true);
     return;
   }
   detailSymbol = symbol;
+  // Switching symbols must not leave the *previous* chart standing under the
+  // new title (the exact complaint this fixes), so the panels are cleared when
+  // the rendered symbol differs. A re-read of the same symbol keeps its chart
+  // until the new numbers arrive instead of flashing empty.
+  if (detailRenderedSymbol !== symbol) {
+    detailAllRows = [];
+    clearDetailPanels();
+    // Nothing is drawn any more, so the next read of the same symbol must
+    // clear again rather than assume the (now empty) panels still match.
+    detailRenderedSymbol = null;
+    setText("detail-close", "—");
+    setText("detail-change", "—");
+    byTestId("detail-change").className = "";
+    setText("detail-range", "—");
+    setText("detail-days", "—");
+    empty.textContent = `正在读取 ${symbol} 的行情…`;
+    show(empty, true);
+  }
+  // The title changes with the request, never with the response: the reader
+  // asked for this code. Everything else waits behind the generation guard.
   setText("detail-symbol", symbol);
   let rows: Bar[];
   try {
     const payload = await api<{ bars: Bar[] }>(
       `/v2/market/bars/${encodeURIComponent(symbol)}`,
     );
+    if (generation !== detailGeneration) return;
     rows = payload.bars;
   } catch (error) {
+    // A slower failure must not clobber the newer symbol the reader switched
+    // to while this request was in flight.
+    if (generation !== detailGeneration) return;
     // A 404 here is a normal answer ("that code is not ingested"), not a
     // service failure: say which code is missing rather than "加载失败".
     const missing = error instanceof ApiError && error.status === 404;
     detailAllRows = [];
+    detailRenderedSymbol = symbol;
     clearDetailPanels();
     setText("detail-close", "—");
     setText("detail-change", "—");
@@ -1174,9 +1255,12 @@ async function loadDetail(symbol: string): Promise<void> {
     return;
   }
   detailAllRows = rows;
+  detailRenderedSymbol = symbol;
   show(empty, rows.length === 0);
   if (rows.length === 0) {
     clearDetailPanels();
+    // Never leave the in-flight placeholder standing as the final answer.
+    empty.textContent = `${symbol} 没有可绘制的日线。`;
     return;
   }
   empty.textContent = "输入代码查看个股走势。";

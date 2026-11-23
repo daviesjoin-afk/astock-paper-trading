@@ -17,12 +17,27 @@ Usage:
         --train-window 2023-07-05:2025-12-31 \
         --test-window 2026-01-02:2026-11-11 \
         --out work/oos-report.json
+
+The declared windows are checked against the artifacts, not trusted. Two
+replays can be handed in as `train` and `test` with two tidy non-overlapping
+date ranges typed on the command line while both artifacts cover the same
+days; the old version accepted that and printed `overlap: false` with
+`consistent_positive`. Now the first and last *settled* day are read out of
+each artifact and compared with what was declared. A mismatch, or artifact
+spans that overlap, marks the report invalid and no positive verdict is
+produced.
+
+Exit codes: 0 when the comparison was performed (whatever the verdict),
+2 when the report is invalid — the file is still written so the reason is
+readable.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
+import sys
 
 
 def load_variant(path: Path, variant: str) -> dict:
@@ -30,6 +45,7 @@ def load_variant(path: Path, variant: str) -> dict:
     data = payload.get(variant)
     if not data:
         raise SystemExit(f"{path} has no {variant} variant")
+    input_block = (data.get("input") or {}) or (payload.get("input") or {})
     return {
         "account": data.get("account") or {},
         "fills": data.get("fills"),
@@ -40,22 +56,48 @@ def load_variant(path: Path, variant: str) -> dict:
         # report may nest it inside the variant. Read both rather than pick.
         "windows": ((data.get("input") or {}).get("windows")
                     or (payload.get("input") or {}).get("windows") or []),
+        # Identity of the run that produced the artifact, where it is recorded.
+        "engine_version": payload.get("engine_version"),
+        "declared_from": input_block.get("from"),
+        "declared_through": input_block.get("through"),
+        "declared_fills": input_block.get("fills"),
+        "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "path": str(path),
     }
+
+
+def actual_span(row: dict) -> tuple[str | None, str | None]:
+    """The first and last settled trading day the artifact actually contains.
+
+    Taken from the sorted day list, not from the order the rows happen to be
+    written in: a report whose windows were appended out of order would
+    otherwise claim a span it never traded.
+    """
+    days = sorted(window.get("day") for window in row["windows"]
+                  if isinstance(window, dict) and window.get("day"))
+    if not days:
+        return None, None
+    return days[0], days[-1]
 
 
 def summarise(row: dict) -> dict:
     account = row["account"]
+    first_day, last_day = actual_span(row)
     return {
         "equity_cents": account.get("equity_cents"),
         "return_bps": account.get("return_bps"),
         "max_drawdown_bps": account.get("max_drawdown_bps"),
         "profit_cents": account.get("profit_cents"),
         "fills": row["fills"],
+        "fills_mode": row.get("declared_fills"),
         "fees_cents": row["fees_cents"],
         "rebalances": row["rebalances"],
         "days": len(row["windows"]),
-        "first_day": row["windows"][0]["day"] if row["windows"] else None,
-        "last_day": row["windows"][-1]["day"] if row["windows"] else None,
+        "first_day": first_day,
+        "last_day": last_day,
+        "artifact": row.get("path"),
+        "artifact_sha256": row.get("digest"),
+        "engine_version": row.get("engine_version"),
     }
 
 
@@ -96,6 +138,98 @@ def check_no_leak(train_window: str, test_window: str) -> dict:
     }
 
 
+def verify_artifacts(train: dict, test: dict,
+                     train_window: str, test_window: str) -> dict:
+    """Check the declared windows against what the artifacts actually contain.
+
+    The check this script used to be missing. Validating only the strings typed
+    on the command line meant the same replay could be passed as `train` and
+    `test`, with two tidy non-overlapping ranges declared, and the report would
+    print `overlap: false` and `consistent_positive` — a held-out result made
+    entirely of days the parameters had already seen.
+
+    Three things are compared, all of them facts from the artifact rather than
+    from the command line:
+
+    * the first and last *settled* day the run produced, against the declared
+      range;
+    * the run's own recorded `input.from`/`input.through`, when it has one;
+    * whether the two artifacts' real spans touch each other.
+
+    Run identity is compared too: two returns produced by different engine
+    versions, or under different fill models, are not two windows of one
+    configuration.
+    """
+    problems: list[str] = []
+    spans: dict[str, dict] = {}
+    for label, row, window in (("train", train, train_window),
+                               ("test", test, test_window)):
+        declared_start, declared_end = parse_window(window)
+        first_day, last_day = actual_span(row)
+        span = {
+            "declared": [declared_start, declared_end],
+            "actual_first_day": first_day,
+            "actual_last_day": last_day,
+            "settled_days": len(row["windows"]),
+        }
+        spans[label] = span
+        if first_day is None or last_day is None:
+            problems.append(
+                f"{label}: the artifact contains no settled day, so the declared "
+                f"window {declared_start}..{declared_end} cannot be verified"
+            )
+            continue
+        if first_day != declared_start or last_day != declared_end:
+            problems.append(
+                f"{label}: the artifact settles {first_day}..{last_day}, but the "
+                f"declared window is {declared_start}..{declared_end}. The verdict "
+                "would describe the declaration, not the numbers in the report."
+            )
+        recorded_from = row.get("declared_from")
+        recorded_through = row.get("declared_through")
+        if recorded_from and recorded_through:
+            span["artifact_input"] = [recorded_from, recorded_through]
+            if recorded_from != declared_start or recorded_through != declared_end:
+                problems.append(
+                    f"{label}: the run itself records {recorded_from}..{recorded_through}, "
+                    f"but {declared_start}..{declared_end} was declared"
+                )
+
+    train_span, test_span = spans["train"], spans["test"]
+    overlapped = False
+    if all(span["actual_first_day"] and span["actual_last_day"]
+           for span in (train_span, test_span)):
+        latest_start = max(train_span["actual_first_day"], test_span["actual_first_day"])
+        earliest_end = min(train_span["actual_last_day"], test_span["actual_last_day"])
+        overlapped = latest_start <= earliest_end
+        if overlapped:
+            problems.append(
+                "the artifacts' real trading spans overlap "
+                f"({latest_start}..{earliest_end}): the test window is not held out, "
+                "whatever dates were declared"
+            )
+
+    if train.get("engine_version") and test.get("engine_version") \
+            and train["engine_version"] != test["engine_version"]:
+        problems.append(
+            "the two artifacts were produced by different engine versions "
+            f"({train['engine_version']} vs {test['engine_version']})"
+        )
+    if train.get("declared_fills") and test.get("declared_fills") \
+            and train["declared_fills"] != test["declared_fills"]:
+        problems.append(
+            "the two artifacts used different fill models "
+            f"({train['declared_fills']} vs {test['declared_fills']})"
+        )
+
+    return {
+        "valid": not problems,
+        "problems": problems,
+        "spans": spans,
+        "actual_overlap": overlapped,
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train", required=True, type=Path)
@@ -112,6 +246,7 @@ def main(argv=None) -> int:
     test = load_variant(args.test, args.variant)
     train_summary = summarise(train)
     test_summary = summarise(test)
+    verification = verify_artifacts(train, test, args.train_window, args.test_window)
 
     # The honest read: a held-out window is one sample. Agreement in sign is
     # weak support; disagreement is strong evidence against.
@@ -120,6 +255,12 @@ def main(argv=None) -> int:
     if train_return is None or test_return is None:
         verdict = "incomplete"
         why = "one of the windows produced no account curve"
+    elif not verification["valid"]:
+        # No sign agreement is reported from artifacts whose declared windows
+        # do not describe them. `consistent_positive` here was the bug.
+        verdict = "invalid"
+        why = ("the declared windows do not match the artifacts: "
+               + "; ".join(verification["problems"]))
     elif train_return > 0 and test_return > 0:
         verdict = "consistent_positive"
         why = "both windows positive; still one held-out sample, not a forecast"
@@ -139,7 +280,19 @@ def main(argv=None) -> int:
         "test": {"window": args.test_window, **test_summary},
         "verdict": verdict,
         "why": why,
-        "windows": windows,
+        "valid": verification["valid"],
+        "declaration_problems": verification["problems"],
+        "artifact_spans": verification["spans"],
+        # `overlap` answers the question the reader actually asks — do the two
+        # windows share a trading day — using the artifacts' real spans. It
+        # stays false only when the declared *and* the actual spans are disjoint.
+        "windows": {
+            "train": windows["train"],
+            "test": windows["test"],
+            "declared_overlap": windows["overlap"],
+            "actual_overlap": verification["actual_overlap"],
+            "overlap": windows["overlap"] or verification["actual_overlap"],
+        },
         "caveats": [
             "Parameters were chosen on the training window; the test window is the only new evidence.",
             "One held-out window is one sample. It cannot establish a distribution of outcomes.",
@@ -153,10 +306,17 @@ def main(argv=None) -> int:
 
     print(f"{args.variant}")
     print(f"  train {args.train_window}: return {train_return} bps, "
-          f"dd {train_summary['max_drawdown_bps']} bps, fills {train_summary['fills']}")
+          f"dd {train_summary['max_drawdown_bps']} bps, fills {train_summary['fills']} "
+          f"(settled {train_summary['first_day']}..{train_summary['last_day']})")
     print(f"  test  {args.test_window}: return {test_return} bps, "
-          f"dd {test_summary['max_drawdown_bps']} bps, fills {test_summary['fills']}")
+          f"dd {test_summary['max_drawdown_bps']} bps, fills {test_summary['fills']} "
+          f"(settled {test_summary['first_day']}..{test_summary['last_day']})")
     print(f"  verdict: {verdict} — {why}")
+    if not verification["valid"]:
+        # A written-but-invalid report must not read as a success downstream.
+        print(f"  INVALID: {len(verification['problems'])} declaration problem(s); "
+              "no out-of-sample claim is supported", file=sys.stderr)
+        return 2
     return 0
 
 

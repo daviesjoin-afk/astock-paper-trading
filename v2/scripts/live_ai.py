@@ -271,8 +271,17 @@ def held_positions(account: Any, quotes: Sequence[Mapping[str, Any]], *,
 
 
 def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Compute real-time cross-sectional market sentiment & bull-trap rate."""
-    total = up = down = flat = strong = weak = limit_up = limit_down = high_surge = bull_trap = 0
+    """Real-time cross-sectional market sentiment, plus the surge-fade share.
+
+    ``surge_fade_rate_bps`` is the share of names that reached +6% intraday and
+    then gave back at least 2% from that high. It is a *price* statistic, not a
+    limit-up board statistic: A-share 炸板率 counts only names that actually
+    touched their limit-up price and then opened, which this measure does not
+    know and cannot know from a quote snapshot. The field is named for what it
+    measures so no reader can mistake one for the other, and it is one input to
+    the temperature, never a verdict about 主力 intent.
+    """
+    total = up = down = flat = strong = weak = limit_up = limit_down = high_surge = surge_fade = 0
     for q in quotes:
         if not isinstance(q, Mapping) or q.get("tradable") is False:
             continue
@@ -310,16 +319,18 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
                 high_surge += 1
                 pullback_bps = int(round((float(high) - float(price)) / max(float(high), 1.0) * 10_000))
                 if pullback_bps >= 200:
-                    bull_trap += 1
+                    surge_fade += 1
     if total == 0:
-        return {"score": 50, "label": "暂无数据", "up_ratio_bps": 0, "bull_trap_rate_bps": 0}
+        return {"score": 50, "label": "暂无数据", "up_ratio_bps": 0,
+                "surge_fade_rate_bps": 0, "surge_fade_count": 0,
+                "surge_fade_basis": "冲高≥6%且较日内高点回落≥2%的占比，不是炸板率"}
     up_ratio_bps = int(round(up * 10_000 / total))
-    bull_trap_rate_bps = int(round(bull_trap * 10_000 / high_surge)) if high_surge > 0 else 0
+    surge_fade_rate_bps = int(round(surge_fade * 10_000 / high_surge)) if high_surge > 0 else 0
     breadth_term = max(-20, min(20, (up_ratio_bps - 5000) // 200))
     tail_term = max(-15, min(15, (strong - weak) * 180 // total))
     limit_term = max(-10, min(10, (limit_up - limit_down) * 250 // total))
-    trap_penalty = max(0, min(15, bull_trap_rate_bps // 500))
-    score = max(0, min(100, 50 + breadth_term + tail_term + limit_term - trap_penalty))
+    fade_penalty = max(0, min(15, surge_fade_rate_bps // 500))
+    score = max(0, min(100, 50 + breadth_term + tail_term + limit_term - fade_penalty))
     label = ("情绪冰点" if score < 25 else "情绪偏冷" if score < 42
              else "情绪中性" if score < 60 else "情绪偏暖" if score < 80 else "情绪亢奋")
     return {
@@ -330,8 +341,12 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
         "weak_count": weak,
         "limit_up_count": limit_up,
         "limit_down_count": limit_down,
-        "bull_trap_count": bull_trap,
-        "bull_trap_rate_bps": bull_trap_rate_bps,
+        "surge_fade_count": surge_fade,
+        "surge_fade_rate_bps": surge_fade_rate_bps,
+        # Spelled out in the payload as well as the prompt: this is the field
+        # most likely to be read as 炸板率, and reading it that way is wrong.
+        "surge_fade_basis": ("冲高≥6%且较日内高点回落≥2%的只数占全部冲高≥6%只数的比例；"
+                             "不等于炸板率（炸板率只统计触板后开板），不能单独据以判定主力意图"),
     }
 
 

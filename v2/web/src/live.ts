@@ -248,8 +248,8 @@ type LiveSentiment = {
   weak_count: number;
   limit_up_count: number;
   limit_down_count: number;
-  bull_trap_count: number;
-  bull_trap_rate_bps: number;
+  surge_fade_count: number;
+  surge_fade_rate_bps: number;
   score: number;
   label: string;
   posture: string;
@@ -344,6 +344,13 @@ let filters: Filters = {
 let state: LoadState = { status: "loading", message: "正在读取盘中数据…", fetchedAt: null };
 const errors: Partial<Record<keyof LiveData | "symbol", string>> = {};
 const extraLoading: Partial<Record<LiveExtraKey, number>> = {};
+/**
+ * Monotonic per-key generation for the lazily loaded read models.
+ *
+ * Kept apart from `extraLoading` (which doubles as the "正在读取…" marker) so
+ * releasing the marker cannot also erase the fact that a newer read started.
+ */
+const extraSequence: Record<LiveExtraKey, number> = { ai: 0, evolution: 0, risk: 0 };
 const data: LiveData = {
   account: null,
   rounds: null,
@@ -692,15 +699,18 @@ function todayInShanghai(): string {
  *  core live data, but load only after their own view has been visited. */
 async function loadLiveExtra(key: LiveExtraKey, force = false): Promise<void> {
   if (!force && (data[key] !== null || extraLoading[key])) return;
-  const generation = (extraLoading[key] ?? 0) + 1;
+  const generation = ++extraSequence[key];
   extraLoading[key] = generation;
   if (activeView === key) draw();
   const value: unknown = await optional<unknown>(key, EXTRA_PATHS[key]);
-  if (!active || extraLoading[key] !== generation) return;
+  // Release the loading marker on *every* path, including the ones that return
+  // early. Leaving it set after the reader navigated away made the panel say
+  // "正在读取…" forever once they came back.
+  if (extraLoading[key] === generation) delete extraLoading[key];
+  if (!active || generation !== extraSequence[key]) return;
   if (key === "ai") data.ai = isArray<AiObservation>(value) ? value : [];
   else if (key === "evolution") data.evolution = isArray<EvolutionPreview>(value) ? value : [];
   else data.risk = isRecord(value) ? value as unknown as RiskSummary : null;
-  delete extraLoading[key];
   draw();
 }
 
@@ -724,11 +734,34 @@ async function loadSymbolArchive(symbol: string): Promise<void> {
     "symbol",
     `/v2/live/symbol?symbol=${encodeURIComponent(clean)}&limit=120`,
   );
-  if (!active || generation !== symbolToken) return;
+  // Only a superseded read keeps the marker: a newer lookup for another code
+  // owns `loading` and this answer must not touch it. A read whose view was
+  // left behind still commits its result and *always* clears the marker —
+  // returning early here is what used to leave the page saying 「正在读取…」
+  // forever after the reader navigated away and came back.
+  if (generation !== symbolToken) return;
   symbolState.loading = false;
   symbolState.error = errors.symbol ?? null;
   symbolState.archive = isRecord(archive) ? archive as unknown as SymbolArchive : null;
-  draw();
+  if (active) draw();
+}
+
+/**
+ * Hand-off from the daily symbol page: set the live view's target state
+ * directly.
+ *
+ * The previous implementation waited 60 ms and then clicked `#live-symbol-load`
+ * programmatically. That button is disabled while the view is refreshing, and a
+ * click on a disabled button is dropped by the browser — the URL said
+ * `live/symbol` while the archive stayed empty. Writing the intended state is
+ * unconditional, so it cannot depend on another control's disabled state.
+ */
+export function openLiveSymbolArchive(symbol: string): void {
+  const clean = symbol.trim().toUpperCase();
+  symbolState.input = clean;
+  const input = document.getElementById("live-symbol-input");
+  if (input instanceof HTMLInputElement) input.value = clean;
+  void loadSymbolArchive(clean);
 }
 
 function roundsNewestFirst(rounds: LiveRound[]): LiveRound[] {
@@ -776,6 +809,10 @@ async function refreshLive(): Promise<void> {
     data.rounds = isArray<LiveRound>(rounds) ? rounds : [];
     data.trades = isArray<LiveTrade>(trades) ? trades : [];
     data.curve = isArray<LiveEquityPoint>(curve) ? curve : [];
+    // The sentiment read is awaited in the middle of the batch. Waiting is
+    // exactly when the reader can switch rounds, so the response is parked in
+    // a local and committed only after re-reading the current round below.
+    let sentiment: LiveSentiment | null = null;
     if (isArray<LiveRound>(rounds) && rounds.length > 0) {
       try {
         const sResp = await fetch("/v2/live/sentiment", {
@@ -784,14 +821,17 @@ async function refreshLive(): Promise<void> {
         });
         if (sResp.ok) {
           const sJson = (await sResp.json()) as unknown;
-          if (isRecord(sJson)) data.sentiment = sJson as unknown as LiveSentiment;
+          if (isRecord(sJson)) sentiment = sJson as unknown as LiveSentiment;
         }
       } catch {
         // Optional sentiment gauge never blocks core dashboard rendering.
       }
-    } else {
-      data.sentiment = null;
+      // Re-read the token and the request sequence after the await: if the
+      // round changed while sentiment was in flight, this batch is history and
+      // must not resurrect the round and signals captured before it.
+      if (!active || seq !== requestSeq || generation !== decisionToken) return;
     }
+    data.sentiment = sentiment;
     filters.roundId = desired;
     data.decisions = desired && payload !== null ? payload.decisions : [];
     data.decisionsTotal = desired && payload !== null ? payload.total : null;
@@ -1054,7 +1094,7 @@ function renderDashboard(): string {
         <div><dt>涨跌广度</dt><dd>${count(s.up_count)} 涨 / ${count(s.down_count)} 跌（${(s.up_ratio_bps / 100).toFixed(1)}%）</dd></div>
         <div><dt>大涨 / 大跌 (≥5%)</dt><dd><span class="pos">${count(s.strong_count)}</span> / <span class="neg">${count(s.weak_count)}</span></dd></div>
         <div><dt>涨停 / 跌停</dt><dd><span class="pos">${count(s.limit_up_count)}</span> / <span class="neg">${count(s.limit_down_count)}</span></dd></div>
-        <div><dt>炸板 / 冲高回落率</dt><dd class="${s.bull_trap_rate_bps >= 3500 ? "neg" : ""}">${(s.bull_trap_rate_bps / 100).toFixed(1)}%（${count(s.bull_trap_count)} 只）</dd></div>
+        <div><dt>冲高回落占比</dt><dd class="${s.surge_fade_rate_bps >= 3500 ? "neg" : ""}">${(s.surge_fade_rate_bps / 100).toFixed(1)}%（${count(s.surge_fade_count)} 只）</dd></div>
         <div><dt>建议槽位仓位上限</dt><dd>${(s.recommended_max_exposure_bps / 100).toFixed(0)}%</dd></div>
       </dl>`,
       `<span class="count">全市场 ${count(s.total_quotes)} 只</span>`,

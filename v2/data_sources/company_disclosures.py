@@ -4,6 +4,14 @@ Consumers inject fetch(url, method='GET', data=None, headers=None) -> bytes.
 Errors never return partial rows. Source timestamps do not establish historical
 availability. first_seen_at is this call's observation; a durable consumer must
 preserve its earliest observation on subsequent upserts.
+
+Date-precision announcements: CNINFO timestamps are Shanghai midnight, so the
+day is the only fact the source asserts. A row dated `d` therefore carries
+`availability_rule='next_tradable_session_after_source_date'` and
+`available_from_date=d`: it may only be used from the first trading session
+strictly after `d`, because the publication may have happened after the close
+of `d`. `publication_precision_day` makes that shift mechanical for consumers
+instead of leaving each one to re-derive it (and get it wrong).
 """
 from __future__ import annotations
 
@@ -273,12 +281,20 @@ def _announcement(item, symbol, org, start, end, observed):
         _fail('DateRangeMismatch', f'{source_id}: {local.date()} outside requested range')
     detail = 'https://www.cninfo.com.cn/new/disclosure/detail?' + urlencode(
         {'stockCode': code, 'announcementId': source_id, 'orgId': org})
+    # CNINFO reports Shanghai midnight, so the date is the only fact available.
+    # A dated announcement may have been published after that day's close, so
+    # it becomes usable only from the next trading session onward. The row
+    # states that rule instead of leaving the shift to each consumer.
+    source_day = local.date().isoformat()
     return dict(symbol=symbol, source_id=source_id, announcement_id=source_id,
                 org_id=org, title=_text(item.get('announcementTitle'), 'announcementTitle', required=True),
-                category_raw=item.get('announcementType'), source_date=local.date().isoformat(),
-                announcement_date=local.date().isoformat(), source_timestamp_raw=millis,
+                category_raw=item.get('announcementType'), source_date=source_day,
+                announcement_date=source_day, source_timestamp_raw=millis,
                 source_timestamp_unit='milliseconds', source_datetime=local.isoformat(),
                 timezone='Asia/Shanghai', published_at=None, publication_precision='date',
+                publication_precision_day=True,
+                availability_rule='next_tradable_session_after_source_date',
+                available_from_date=source_day,
                 source='cninfo', source_url=detail, attachment_url=_attachment(item.get('adjunctUrl')),
                 fetched_at=observed, first_seen_at=observed, known_at=observed,
                 available_at=None)

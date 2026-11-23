@@ -76,10 +76,11 @@ class AdviceAdapterTests(unittest.TestCase):
 class FakeOpener:
     """Mock urlopen; records JSON requests and returns scripted responses."""
 
-    def __init__(self, *, get=None, post=None, llm=None):
+    def __init__(self, *, get=None, post=None, llm=None, fail_get=()):
         self.get = get or {}
         self.post = post or {}
         self.llm = llm
+        self.fail_get = set(fail_get)
         self.calls = []
 
     def __call__(self, request, timeout=None):
@@ -97,6 +98,8 @@ class FakeOpener:
             return io.BytesIO(json.dumps(body).encode("utf-8"))
         path = url.split("/v2/live")[-1]
         if request.get_method() == "GET":
+            if path in self.fail_get:
+                raise OSError(f"kernel unavailable: {path}")
             return io.BytesIO(json.dumps(self.get.get(path, {})).encode("utf-8"))
         return io.BytesIO(json.dumps(self.post.get(path, round_response())).encode("utf-8"))
 
@@ -221,6 +224,53 @@ class LivePaperLoopTests(unittest.TestCase):
         self.assertEqual(record["ai"], {"ok": False, "error": "no_advice"})
         self.assertEqual(record["blocked_top3"],
                          [["cash_budget", 2], ["t_plus_one", 1]])
+
+    def test_a_stale_quote_is_not_posted(self):
+        # The Rust live-loop already refuses a snapshot it cannot place in the
+        # session; the Python scheduler accepted one whose source time was
+        # missing. A price that is an hour old is not the current market.
+        opener = FakeOpener(post={"/round": round_response()})
+        config = make_config(opener)
+        stale = {**snapshot(), "quote_time": "2026-11-13T09:03:00+08:00",
+                 "fetched_at": "2026-11-13T02:03:05+00:00"}  # 1h old at fetch
+        output = io.StringIO()
+        with loop.Log(None, stdout=output) as log:
+            posted = loop.run_round(
+                config=config, kernel=loop.Kernel(config.api, opener=opener),
+                log=log, state=loop.RoundState(), snapshot=stale)
+        self.assertFalse(posted)
+        self.assertEqual(opener.calls, [], "no round may be submitted")
+        self.assertIn("quote_stale", output.getvalue())
+
+    def test_an_undated_quote_is_refused_rather_than_treated_as_now(self):
+        opener = FakeOpener(post={"/round": round_response()})
+        config = make_config(opener)
+        estimated = {**snapshot(), "quote_time_estimated": True}
+        output = io.StringIO()
+        with loop.Log(None, stdout=output) as log:
+            posted = loop.run_round(
+                config=config, kernel=loop.Kernel(config.api, opener=opener),
+                log=log, state=loop.RoundState(), snapshot=estimated)
+        self.assertFalse(posted)
+        self.assertEqual(opener.calls, [])
+        self.assertIn("quote_time_estimated", output.getvalue())
+
+    def test_a_quote_that_ages_out_during_the_ai_call_is_not_posted(self):
+        # The AI call is the long pole. Freshness has to be re-checked at the
+        # moment of posting, not only when the snapshot was ingested.
+        opener = FakeOpener(get={"/account": {}, "/trades": []},
+                            post={"/round": round_response()},
+                            llm=json.dumps({"bias": 0, "blocked_symbols": []}))
+        config = make_config(opener, ai_on=True)
+        fresh = config.feed_builder()
+        # The AI call took 15 minutes: measure the held time, not the clock.
+        with loop.Log(None, stdout=io.StringIO()) as log,                 mock.patch.object(loop.time, "monotonic", side_effect=[100.0, 1000.0]):
+            posted = loop.run_round(
+                config=config, kernel=loop.Kernel(config.api, opener=opener),
+                log=log, state=loop.RoundState(), snapshot=fresh)
+        self.assertFalse(posted, "a quote that aged 15 minutes must not trade")
+        self.assertFalse(any(call[1].endswith("/v2/live/round")
+                             for call in opener.calls))
 
     def test_raw_llm_json_is_transported_verbatim_without_python_policy(self):
         model_json = {"confidence": 7, "bias": 999999,
@@ -1000,6 +1050,98 @@ class AdviceRetryTests(unittest.TestCase):
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0]["advice"], {
             "model": config.llm_model, "raw_advice": {"bias": 5, "confidence": 71}})
+
+
+class NewsWatchScopeTests(unittest.TestCase):
+    """The comment said "holdings plus what the ranking surfaced", but only the
+    holdings were passed. A candidate could therefore be bought on a round whose
+    news block never looked at it."""
+
+    def digest(self, held, ranked):
+        return {
+            "held_positions": [{"symbol": symbol} for symbol in held],
+            "ranked_candidates": [{"symbol": symbol} for symbol in ranked],
+        }
+
+    def test_candidates_join_the_watch_list_alongside_holdings(self):
+        held, candidates = loop.news_watch_scope(
+            self.digest(["600000.SH"], ["002242.SZ", "300750.SZ"]))
+        self.assertEqual(held, ["600000.SH"])
+        self.assertEqual(candidates, ["002242.SZ", "300750.SZ"])
+        self.assertEqual(held + candidates,
+                         ["600000.SH", "002242.SZ", "300750.SZ"])
+
+    def test_a_held_name_is_not_repeated_in_the_candidate_list(self):
+        held, candidates = loop.news_watch_scope(
+            self.digest(["600000.SH"], ["600000.SH", "002242.SZ"]))
+        self.assertEqual(held, ["600000.SH"])
+        self.assertEqual(candidates, ["002242.SZ"])
+
+    def test_the_candidate_list_is_capped_without_dropping_a_holding(self):
+        ranked = [f"{i:06d}.SZ" for i in range(80)]
+        held, candidates = loop.news_watch_scope(self.digest(["600000.SH"], ranked))
+        self.assertEqual(len(candidates), loop.NEWS_CANDIDATE_LIMIT)
+        self.assertEqual(held, ["600000.SH"], "holdings are never capped away")
+
+    def test_the_round_passes_holdings_and_candidates_with_per_symbol_on_holdings(self):
+        # Behavioural: run a real round with the AI path on and read what the
+        # news transport was actually given.
+        opener = FakeOpener(get={
+            "/account": {"positions": [{"symbol": "600000.SH", "quantity": 100,
+                                        "sellable_quantity": 100,
+                                        "avg_cost_cents": 1000}]},
+            "/trades": [],
+        }, post={"/settings/ai-advice": {"ok": False}, "/round": round_response()})
+        config = make_config(opener, ai_on=True,
+                             feed_result=snapshot(quotes=[
+                                 {"symbol": "600000.SH", "price_cents": 1010,
+                                  "prev_close_cents": 1000, "high_cents": 1020,
+                                  "low_cents": 990, "tradable": True},
+                                 {"symbol": "002242.SZ", "price_cents": 1050,
+                                  "prev_close_cents": 1000, "high_cents": 1055,
+                                  "low_cents": 998, "tradable": True},
+                             ]))
+        seen = {}
+
+        def fake_news(snapshot_, watch, *, per_symbol_watch=None):
+            seen["watch"] = list(watch)
+            seen["per_symbol"] = list(per_symbol_watch or [])
+            return None
+
+        with mock.patch.object(loop, "fetch_news_block", side_effect=fake_news), \
+             mock.patch.object(loop, "fetch_heat_block", return_value=None), \
+             mock.patch.object(loop, "fetch_northbound_block", return_value=None), \
+             loop.Log(None, stdout=io.StringIO()) as log:
+            self.assertTrue(loop.run_round(
+                config=config, kernel=loop.Kernel(config.api, opener=opener),
+                log=log, state=loop.RoundState(), snapshot=config.feed_builder()))
+        self.assertIn("002242.SZ", seen["watch"], "a ranked candidate must be covered")
+        self.assertIn("600000.SH", seen["watch"])
+        self.assertEqual(seen["per_symbol"], ["600000.SH"],
+                         "the slow per-symbol request stays on the holdings")
+
+    def test_an_unreadable_account_still_watches_the_ranked_names(self):
+        opener = FakeOpener(get={"/trades": []},
+                            post={"/settings/ai-advice": {"ok": False},
+                                  "/round": round_response()},
+                            fail_get=("/account",))
+        config = make_config(opener, ai_on=True)
+        seen = {}
+
+        def fake_news(snapshot_, watch, *, per_symbol_watch=None):
+            seen["watch"] = list(watch)
+            seen["per_symbol"] = list(per_symbol_watch or [])
+            return None
+
+        with mock.patch.object(loop, "fetch_news_block", side_effect=fake_news), \
+             mock.patch.object(loop, "fetch_heat_block", return_value=None), \
+             mock.patch.object(loop, "fetch_northbound_block", return_value=None), \
+             loop.Log(None, stdout=io.StringIO()) as log:
+            loop.run_round(config=config, kernel=loop.Kernel(config.api, opener=opener),
+                           log=log, state=loop.RoundState(),
+                           snapshot=config.feed_builder())
+        self.assertEqual(len(seen["watch"]), 2, "both ranked names are watched")
+        self.assertEqual(seen["per_symbol"], [], "no holdings, no per-symbol request")
 
 
 if __name__ == "__main__":

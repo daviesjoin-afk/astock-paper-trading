@@ -430,19 +430,79 @@ fn live_advice_attempts(settings: &SystemSettings, body: &Value) -> Vec<(Value, 
 }
 
 fn stamp_live_advice(mut advice: Value, settings: &SystemSettings, mode: &str) -> Value {
-    if let Some(obj) = advice.as_object_mut() {
-        obj.entry("model".to_string())
-            .or_insert_with(|| Value::String(settings.ai_model.clone()));
-        obj.entry("mode".to_string())
-            .or_insert_with(|| Value::String(mode.to_string()));
-    }
+    let Some(obj) = advice.as_object_mut() else {
+        return advice;
+    };
+    obj.entry("model".to_string())
+        .or_insert_with(|| Value::String(settings.ai_model.clone()));
+    // The configured mode decides how deep the observer may go. Letting the
+    // model's own `mode` field through meant a stray string in the answer could
+    // switch the round into deep mode (and its position sizing) on its own.
+    obj.insert("mode".to_string(), Value::String(mode.to_string()));
+    normalize_live_advice(obj);
     advice
+}
+
+/// Coerce the fields the kernel reads into their declared types.
+///
+/// A model that writes `"confidence": "7"` or `"blocked_symbols": null` is not
+/// making a different trading decision, but the strongly-typed round request
+/// rejects the whole body on a type mismatch — and then the deterministic
+/// strategy does not run either. Normalise the known fields here, drop ones
+/// that cannot be read, and leave anything unrecognised untouched (the kernel
+/// denies unknown fields, so the caller's own validation still applies).
+fn normalize_live_advice(obj: &mut serde_json::Map<String, Value>) {
+    fn number(value: &Value) -> Option<i64> {
+        match value {
+            Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|v| v as i64)),
+            Value::String(text) => text.trim().parse::<f64>().ok().map(|v| v as i64),
+            _ => None,
+        }
+    }
+    for key in ["confidence", "bias"] {
+        let converted = obj.get(key).and_then(number).map(Value::from);
+        match converted {
+            Some(value) => {
+                obj.insert(key.to_string(), value);
+            }
+            None => {
+                obj.remove(key);
+            }
+        }
+    }
+    for key in ["blocked_symbols", "avoid"] {
+        if obj.get(key).is_some_and(Value::is_null) {
+            obj.insert(key.to_string(), Value::Array(Vec::new()));
+        }
+    }
+    for key in ["suggestions", "active_suggestions"] {
+        let Some(Value::Array(items)) = obj.get(key) else {
+            continue;
+        };
+        let cleaned: Vec<Value> = items
+            .iter()
+            .filter_map(|item| {
+                let mut item = item.as_object()?.clone();
+                if let Some(side) = item.get("side").and_then(Value::as_str) {
+                    let lowered = side.trim().to_ascii_lowercase();
+                    item.insert("side".to_string(), Value::String(lowered));
+                }
+                for field in ["target_weight_bps", "confidence"] {
+                    if let Some(value) = item.get(field).and_then(number) {
+                        item.insert(field.to_string(), Value::from(value));
+                    }
+                }
+                Some(Value::Object(item))
+            })
+            .collect();
+        obj.insert(key.to_string(), Value::Array(cleaned));
+    }
 }
 
 pub fn live_advice_prompt(settings: &SystemSettings) -> (String, String) {
     let depth_instruction = if settings.ai_depth == "deep" {
         "当前为【深度托管模式】：你可以直接决定个股的买卖方向（buy/sell/hold/avoid）与目标仓位万分比 target_weight_bps（0~10000，例如 2500 代表 25% 槽位资产）。请务必严格执行【主力意图与反诱多五维纪律】：
-         1. 看情绪与炸板率（market_sentiment）：当 score < 42（冰点/偏冷）或 bull_trap_rate_bps >= 3000（炸板率≥30%）时，主力极易拉高出货，严禁追高开仓，优先去弱留强或空仓观望；
+         1. 看情绪（market_sentiment）：当 score < 42（冰点/偏冷）时市场承接弱，严禁追高开仓，优先去弱留强。surge_fade_rate_bps 是「冲高≥6% 且回落≥2%」的占比，**不是炸板率**：它只说明当日冲高后收窄有多普遍，既不能证明触及涨停后打开，也不能单独断定主力派发，必须结合 vwap_distance_bps、upper_wick_bps、成交量与 position_in_range 一起判断；
          2. 查日内均价线（vwap_distance_bps）：现价跌破日内成交均价线（vwap_distance_bps < 0，尤其是 <= -120 bps）说明当日追高筹码全线被套，属典型主力拉高派发（钓鱼线），一票否决买入；
          3. 辨假阳真阴与长上影（upper_wick_bps / bull_trap_risk）：若 bull_trap_risk >= 30 或 upper_wick_bps >= 150（冲高留长上影）或高开低走，严禁买入并列入 avoid/blocked_symbols；
          4. 防高位接盘（cum_gain_3d_bps / dist_20d_high_bps）：近 3 日累计涨幅 cum_gain_3d_bps >= 1800（18%）且日内分位不足 80% 的高位加速股，属于击鼓传花末端，严禁接盘；
@@ -490,6 +550,52 @@ mod tests {
         assert_eq!(s.ai_api_key, "sk-1234567890abcdef");
         assert_eq!(s.ai_depth, "deep");
         assert_eq!(s.live_interval_secs, 120);
+    }
+
+    #[test]
+    fn a_stringly_typed_answer_is_repaired_instead_of_rejecting_the_round() {
+        // The model writes "7" for confidence and null for the blocked list.
+        // The strongly-typed round request would refuse the whole body — and
+        // the deterministic strategy would not run that round either.
+        let settings = SystemSettings::default();
+        let advice = stamp_live_advice(
+            json!({
+                "confidence": "7",
+                "bias": "-3",
+                "blocked_symbols": null,
+                "suggestions": [
+                    {"symbol": "600000.SH", "side": "BUY", "target_weight_bps": "2500"},
+                    null
+                ]
+            }),
+            &settings,
+            "advise",
+        );
+        assert_eq!(advice["confidence"], json!(7));
+        assert_eq!(advice["bias"], json!(-3));
+        assert_eq!(advice["blocked_symbols"], json!([]));
+        assert_eq!(advice["suggestions"][0]["side"], json!("buy"));
+        assert_eq!(advice["suggestions"][0]["target_weight_bps"], json!(2500));
+        assert_eq!(advice["suggestions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_configured_mode_wins_over_a_mode_the_model_writes() {
+        // A stray "mode" in the answer must not switch the round into deep
+        // mode, where the observer may size positions on its own.
+        let settings = SystemSettings { ai_depth: "advise".into(), ..Default::default() };
+        let advice = stamp_live_advice(json!({"mode": "deep", "bias": 0}), &settings, "advise");
+        assert_eq!(advice["mode"], json!("advise"));
+    }
+
+    #[test]
+    fn an_unreadable_confidence_is_dropped_rather_than_guessed() {
+        let settings = SystemSettings::default();
+        let advice = stamp_live_advice(
+            json!({"confidence": "very high", "blocked_symbols": ["600000.SH"]}),
+            &settings, "advise");
+        assert!(advice.get("confidence").is_none(), "no invented number");
+        assert_eq!(advice["blocked_symbols"], json!(["600000.SH"]));
     }
 
     #[test]
