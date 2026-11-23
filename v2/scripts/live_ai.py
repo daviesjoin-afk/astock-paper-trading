@@ -292,9 +292,14 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
             weak += 1
         lu = q.get("limit_up_cents")
         ld = q.get("limit_down_cents")
-        if (isinstance(lu, int) and lu > 0 and price >= lu) or chg_bps >= 950:
+        # The 9.5% fallback is only for a row with no published limit. Applied
+        # to a name whose real band is 5% (ST) or 30% (北交所) it invents a
+        # limit-up: on 2026-11-23 it reported 237 against 142 at the ceiling.
+        if (isinstance(lu, int) and lu > 0 and price >= lu) or (
+                not (isinstance(lu, int) and lu > 0) and chg_bps >= 950):
             limit_up += 1
-        if (isinstance(ld, int) and ld > 0 and price <= ld) or chg_bps <= -950:
+        if (isinstance(ld, int) and ld > 0 and price <= ld) or (
+                not (isinstance(ld, int) and ld > 0) and chg_bps <= -950):
             limit_down += 1
         high = q.get("high_cents")
         if isinstance(high, (int, float)) and high > prev:

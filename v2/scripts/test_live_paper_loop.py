@@ -781,6 +781,31 @@ from live_ai import digest_messages  # noqa: E402
 import live_ai as ai  # noqa: E402
 
 
+class SentimentLimitTests(unittest.TestCase):
+    """A limit-up count must follow the published band, not a flat 9.5%."""
+
+    def quote(self, symbol, price, prev, limit_up=None, limit_down=None):
+        return {"symbol": symbol, "price_cents": price, "prev_close_cents": prev,
+                "limit_up_cents": limit_up, "limit_down_cents": limit_down,
+                "high_cents": price, "open_cents": prev, "tradable": True}
+
+    def test_only_names_at_their_published_ceiling_are_counted(self):
+        quotes = [self.quote("600001.SH", 1050, 1000, limit_up=1050),   # at ceiling
+                  self.quote("600002.SH", 1040, 1000, limit_up=1050)]   # 4%, below
+        self.assertEqual(ai.compute_market_sentiment(quotes)["limit_up_count"], 1)
+
+    def test_the_flat_fallback_only_applies_without_a_published_limit(self):
+        # With a published limit, the band decides; a 30% board name at +10% is
+        # nowhere near its ceiling and must not be counted.
+        quotes = [self.quote("830001.BJ", 1100, 1000, limit_up=1300)]
+        result = ai.compute_market_sentiment(quotes)
+        self.assertEqual(result["limit_up_count"], 0)
+        # Without a published limit the 9.5% fallback still applies.
+        quotes = [self.quote("600003.SH", 1100, 1000)]
+        result = ai.compute_market_sentiment(quotes)
+        self.assertEqual(result["limit_up_count"], 1)
+
+
 class PromptCacheShapeTests(unittest.TestCase):
     """A cached prefix is the whole point of a 160k-token round."""
 
