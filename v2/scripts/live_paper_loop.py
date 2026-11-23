@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_quote_feed as feed  # noqa: E402
 from live_ai import (
+    attach_resident_memory,
     attach_track_record,
     DIGEST_CANDIDATES, DIGEST_POSITIONS, LIVE_SYSTEM_PROMPT, RECENT_TRADES,
     Log, _parse_model_json, held_positions, json_line, market_digest,
@@ -279,6 +280,8 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         # in this regime gave up real gains. Load the measured record once per
         # session and hand it over, so advice is conditioned on its own results.
         digest = attach_track_record(digest, config.track_record)
+        if config.resident_memory:
+            digest = attach_resident_memory(digest, config.resident_memory)
         settings_used = False
         try:
             settings_resp = kernel.post("/v2/settings/ai-advice", digest)
@@ -360,13 +363,15 @@ class Config:
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sleep: Callable[[float], None] = time.sleep,
                  feed_builder: Callable[..., Mapping[str, Any]] | None = None,
-                 track_record: Mapping[str, Any] | None = None):
+                 track_record: Mapping[str, Any] | None = None,
+                 resident_memory: str | None = None):
         self.api, self.universe, self.history_db = api, universe, history_db
         self.interval, self.close = interval, close
         self.ai_on, self.max_rounds, self.once = ai_on, max_rounds, once
         self.zone, self.llm_base = zone, llm_base
         self.llm_key, self.llm_model = llm_key, llm_model
         self.track_record = track_record
+        self.resident_memory = resident_memory
         self.batch, self.log_path = batch, log_path
         self.opener, self.clock, self.sleep = opener, clock, sleep
         self.feed_builder = feed_builder or feed.build_snapshot
@@ -465,6 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", default=DEFAULT_API)
     parser.add_argument("--universe", default=str(feed.DEFAULT_UNIVERSE))
+    parser.add_argument("--memory-root",
+                        help="directory holding the observer's resident memory")
     parser.add_argument("--ledger-db",
                         help="read-only intraday ledger used to measure the observer's "
                              "own track record; omitted means no track record is sent")
@@ -479,6 +486,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--log", default=str(DEFAULT_LOG_PATH))
     return parser
+
+
+def load_resident_block(path: str | None) -> str | None:
+    """The resident memory block the observer reads every round.
+
+    Regenerated from the committed ledger by ``ai_resident.refresh``; reading it
+    here is a plain file read so a missing or corrupt block degrades to "no
+    memory" rather than blocking the session.
+    """
+    if not path:
+        return None
+    try:
+        from ai_resident import read_resident, render_resident
+        block = render_resident(read_resident(Path(path)))
+        return block or None
+    except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
+        return None
 
 
 def load_track_record(path: str | None) -> Mapping[str, Any] | None:
@@ -519,6 +543,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         llm_model=os.environ.get("ASTOCK_LLM_MODEL", feed.DEFAULT_LLM_MODEL),
         log_path=args.log,
         track_record=load_track_record(args.ledger_db),
+        resident_memory=load_resident_block(args.memory_root),
     )
 
 

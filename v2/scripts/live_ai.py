@@ -624,7 +624,7 @@ def _provider_tokens(payload: Any) -> dict[str, int | None]:
 # would defeat the prompt cache, so they lead.
 # Only facts that are byte-identical across rounds. The slot books carry
 # cash/equity, which moves with every fill, so they stay volatile.
-STABLE_DIGEST_KEYS = ("market_table", "own_track_record",
+STABLE_DIGEST_KEYS = ("resident_memory", "market_table", "own_track_record",
                       "recent_bull_trap_lessons", "account_as_of_round_id")
 
 
@@ -639,6 +639,19 @@ def attach_track_record(digest: dict[str, Any], card: Mapping[str, Any] | None) 
     """
     if card:
         digest["own_track_record"] = card
+    return digest
+
+
+def attach_resident_memory(digest: dict[str, Any], block: str | None) -> dict[str, Any]:
+    """Inject the small always-on memory tier, bounded by the writer.
+
+    This is the resident layer of the three-tier design: a few dozen lines that
+    ride in every round, unlike ``own_track_record`` which is the searchable
+    evidence and unlike the trial ledger which is only read when deciding a
+    change.
+    """
+    if block:
+        digest["resident_memory"] = block
     return digest
 
 
