@@ -488,6 +488,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def refresh_resident_block(path: str | None, ledger_db: str | None) -> str | None:
+    """Re-measure the resident block from the ledger, then read it back.
+
+    A frozen block describes the days it was built on and slowly stops being
+    true. Re-deriving at each session start keeps the facts on the newest
+    settled sessions while learned rules survive in ``resident.json``.
+    """
+    if not path:
+        return None
+    try:
+        from ai_memory import collect, scorecard
+        from ai_resident import refresh, render_resident, read_resident
+        from pathlib import Path as _Path
+        import sqlite3
+
+        if ledger_db:
+            db = sqlite3.connect(_Path(ledger_db).resolve().as_uri() + "?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            try:
+                refresh(_Path(path), scorecard(collect(db)))
+            finally:
+                db.close()
+        return render_resident(read_resident(_Path(path))) or None
+    except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
+        return load_resident_block(path)
+
+
 def load_resident_block(path: str | None) -> str | None:
     """The resident memory block the observer reads every round.
 
@@ -543,7 +571,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         llm_model=os.environ.get("ASTOCK_LLM_MODEL", feed.DEFAULT_LLM_MODEL),
         log_path=args.log,
         track_record=load_track_record(args.ledger_db),
-        resident_memory=load_resident_block(args.memory_root),
+        resident_memory=refresh_resident_block(args.memory_root, args.ledger_db),
     )
 
 
