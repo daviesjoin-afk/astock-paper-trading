@@ -16,6 +16,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_folds import run_fold, summarise  # noqa: E402
+from _probe_stub import make_probe_stub  # noqa: E402
 
 NEWLINE = chr(10)
 
@@ -44,12 +45,7 @@ def make_stub(root: Path, payload: dict | None, exit_code: int = 0) -> Path:
     lines.append(f"sys.exit({exit_code})")
     script.write_text(NEWLINE.join(lines) + NEWLINE, encoding="utf-8")
 
-    stub = root / "stub.bat"
-    stub.write_text(
-        "@echo off" + NEWLINE + f'"{sys.executable}" "{script}"' + NEWLINE,
-        encoding="utf-8",
-    )
-    return stub
+    return make_probe_stub(root, script)
 
 
 class TestVerdicts(unittest.TestCase):
@@ -125,11 +121,7 @@ class TestRunFold(unittest.TestCase):
                 "sys.exit(2)" + NEWLINE,
                 encoding="utf-8",
             )
-            stub = root / "stub.bat"
-            stub.write_text(
-                "@echo off" + NEWLINE + f'"{sys.executable}" "{script}"' + NEWLINE,
-                encoding="utf-8",
-            )
+            stub = make_probe_stub(root, script)
             result = run_fold(stub, root / "db.sqlite3",
                               {"fold": 0, "test": ["2025-01-01", "2025-06-30"]},
                               root / "runs", "filtered", timeout=10)
@@ -176,11 +168,7 @@ class TestRunFold(unittest.TestCase):
             root = Path(tmp)
             script = root / "emit.py"
             script.write_text("print('not-json')" + NEWLINE, encoding="utf-8")
-            stub = root / "stub.bat"
-            stub.write_text(
-                "@echo off" + NEWLINE + f'"{sys.executable}" "{script}"' + NEWLINE,
-                encoding="utf-8",
-            )
+            stub = make_probe_stub(root, script)
             result = run_fold(stub, root / "db.sqlite3",
                               {"fold": 0, "test": ["2025-01-01", "2025-06-30"]},
                               root / "runs", "filtered", timeout=10)
