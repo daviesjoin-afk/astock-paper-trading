@@ -349,3 +349,7 @@ host:api.openai.com
 # selection-validation record. They are repository object ids, not credentials.
 value:96a79ff64111109d5c258a965cc0dd8048f88426
 value:6c64f43e1d055cf9842eb068034d644e877324bf
+
+# Documentation placeholder for a self-hosted LLM gateway (RFC 2606 `.example`):
+# it appears in older settings examples and names no real host.
+host:llm.example
