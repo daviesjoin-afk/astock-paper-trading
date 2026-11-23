@@ -229,7 +229,8 @@ class SuccessfulRefresh(SnapshotFixture):
         self.assertIn("tests/fixtures/sina_adjust/sample.csv", files)
         skill = files["SKILL.md"].decode("utf-8")
         self.assertNotIn("an.author@example.net", skill)
-        self.assertNotIn("tdx-primary.example.net", skill, "hard-coded peers must not be published")
+        self.assertNotIn("tdx-primary.example.net", skill,
+                         "hard-coded peers must not be published")
         self.assertIn("ASTOCK_TDX_SERVERS", skill)
         self.assertNotIn("helper@example.net",
                          files["README.md"].decode("utf-8"))
