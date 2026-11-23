@@ -83,6 +83,20 @@ def collect(db: sqlite3.Connection) -> dict[str, Any]:
         if closing is None:
             continue
         close_id, close_prices = closing
+        # The market's own move that session. A name that rose 2% while the
+        # market rose 4% did not reward a buyer: it lost 200 bps of ground, and
+        # only this subtraction tells a good block from a lucky one.
+        opening = db.execute(
+            "SELECT round_id FROM round WHERE round_id LIKE ? ORDER BY rowid LIMIT 1",
+            (day + "-%",)).fetchone()
+        baseline = None
+        if opening:
+            open_prices = _quote_rows(db, opening["round_id"])
+            drift = [_move_bps(price, close_prices[symbol])
+                     for symbol, price in open_prices.items() if close_prices.get(symbol)]
+            drift = sorted(m for m in drift if m is not None)
+            if drift:
+                baseline = drift[len(drift) // 2]  # median, robust to a few limit-ups
         rows = db.execute(
             "SELECT o.round_id, o.application_json, r.regime FROM ai_observation o "
             "JOIN round r USING(round_id) WHERE o.round_id LIKE ? ORDER BY o.rowid",
@@ -103,9 +117,12 @@ def collect(db: sqlite3.Connection) -> dict[str, Any]:
                 if symbol not in buyable:
                     continue  # sealed at the ceiling: nothing was given up
                 move = _move_bps(prices.get(symbol, 0), close_prices.get(symbol, 0))
-                if move is not None:
-                    blocked_cases.append({"round_id": row["round_id"], "symbol": symbol,
-                                          "regime": regime, "move_bps": move})
+                if move is None:
+                    continue
+                excess = move - baseline if baseline is not None else None
+                blocked_cases.append({"round_id": row["round_id"], "symbol": symbol,
+                                      "regime": regime, "move_bps": move,
+                                      "excess_bps": excess})
             for item in app.get("active_suggestions") or app.get("suggestions") or []:
                 if item.get("side") != "buy":
                     continue
@@ -113,7 +130,9 @@ def collect(db: sqlite3.Connection) -> dict[str, Any]:
                 move = _move_bps(prices.get(symbol, 0), close_prices.get(symbol, 0))
                 if move is not None:
                     buy_cases.append({"round_id": row["round_id"], "symbol": symbol,
-                                      "regime": regime, "move_bps": move})
+                                      "regime": regime, "move_bps": move,
+                                      "excess_bps": (move - baseline
+                                                     if baseline is not None else None)})
             # The regime call itself: did the market drift up or down? Sealed
             # names are excluded on both sides so this stays a drift measure and
             # not a disguised copy of the blocked-symbol result.
@@ -126,23 +145,39 @@ def collect(db: sqlite3.Connection) -> dict[str, Any]:
                                     "entry_delta": app.get("entry_delta"),
                                     "bias": app.get("bias"),
                                     "mean_move_bps": sum(moves) // len(moves)})
-    return {"days": days, "blocked": blocked_cases, "buys": buy_cases, "rounds": round_cases}
+    return {"days": days, "blocked": blocked_cases, "buys": buy_cases,
+            "rounds": round_cases, "baseline": "session_median_move"}
 
 
 def _summary(cases: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
-    moves = [c["move_bps"] for c in cases]
+    rows = list(cases)
+    moves = [c["move_bps"] for c in rows]
     if len(moves) < MIN_CASES:
         return None
-    return {"cases": len(moves), "mean_bps": sum(moves) // len(moves),
-            "up": sum(1 for m in moves if m > 0),
-            "down": sum(1 for m in moves if m < 0)}
+    excess = [c["excess_bps"] for c in rows if c.get("excess_bps") is not None]
+    out = {
+        "cases": len(moves),
+        "mean_bps": sum(moves) // len(moves),
+        "up": sum(1 for m in moves if m > 0),
+        "down": sum(1 for m in moves if m < 0),
+        # The verdict rests on excess, not on the raw move: a rising tide lifts
+        # every name, and raw return would call a bad block a missed gain.
+        "excess_bps": (sum(excess) // len(excess)) if len(excess) >= MIN_CASES else None,
+        "excess_cases": len(excess),
+        "beat_market": sum(1 for x in excess if x > 0),
+        "lagged_market": sum(1 for x in excess if x < 0),
+    }
+    return out
 
 
 def scorecard(memory: Mapping[str, Any]) -> dict[str, Any]:
     """What the model should know about its own track record, per regime.
 
-    `blocked.mean_bps` is the cost of being wrong: a positive number means the
-    names it refused to buy went on to rise, so the block lost that much.
+    `blocked.excess_bps` is the honest verdict: the blocked names' move minus
+    that session's market median. Positive means they outperformed the market,
+    so refusing them cost something real; negative means the block was right even
+    on a day when everything rose. `mean_bps` is the raw move and is reported
+    only as context -- on a strong day it flatters every block.
     """
     by_regime: dict[str, dict[str, Any]] = {}
     for regime in sorted({c["regime"] for c in memory["blocked"]} |
@@ -154,7 +189,8 @@ def scorecard(memory: Mapping[str, Any]) -> dict[str, Any]:
         if blocked or buys or rounds:
             by_regime[regime] = {"blocked_symbols": blocked, "named_buys": buys,
                                  "market_drift": rounds}
-    return {"basis": "session_close_of_the_same_day", "min_cases": MIN_CASES,
+    return {"basis": "session_close_minus_session_market_median",
+            "verdict_on": "excess_bps", "min_cases": MIN_CASES,
             "sessions": len(memory["days"]), "by_regime": by_regime}
 
 

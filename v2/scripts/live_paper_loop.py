@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_quote_feed as feed  # noqa: E402
 from live_ai import (
+    attach_news,
     attach_resident_memory,
     attach_track_record,
     DIGEST_CANDIDATES, DIGEST_POSITIONS, LIVE_SYSTEM_PROMPT, RECENT_TRADES,
@@ -279,6 +280,14 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         # The observer is otherwise stateless: it cannot see that its own blocks
         # in this regime gave up real gains. Load the measured record once per
         # session and hand it over, so advice is conditioned on its own results.
+        # Which names deserve a news lookup: what we hold, plus what the ranking
+        # surfaced. Searching the whole market would add latency for noise.
+        held = [item.get("symbol") for item in (digest.get("held_positions") or [])
+                if item.get("symbol")]
+        # Per-symbol lookups are the slow part, so only holdings get one; the
+        # ranked names still match against the two market wires already in hand.
+        news_block = fetch_news_block(snapshot, list(dict.fromkeys(held)))
+        digest = attach_news(digest, news_block)
         digest = attach_track_record(digest, config.track_record)
         if config.resident_memory:
             digest = attach_resident_memory(digest, config.resident_memory)
@@ -514,6 +523,21 @@ def refresh_resident_block(path: str | None, ledger_db: str | None) -> str | Non
         return render_resident(read_resident(_Path(path))) or None
     except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
         return load_resident_block(path)
+
+
+def fetch_news_block(snapshot: Mapping[str, Any], watch: Sequence[str]) -> Mapping[str, Any] | None:
+    """Symbol-linked headlines for this round, or nothing when the wires fail.
+
+    News is additive: a provider outage must not stop a round, so a failure
+    returns None and the observer simply reasons without headlines.
+    """
+    try:
+        from live_news import digest_news
+        from astock_public import PublicClient
+        from source_http import SourceHttp
+        return digest_news(PublicClient(http=SourceHttp()), snapshot, watch=watch)
+    except Exception:  # noqa: BLE001 - news is an enhancement, not a precondition
+        return None
 
 
 def load_resident_block(path: str | None) -> str | None:

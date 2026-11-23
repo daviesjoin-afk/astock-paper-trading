@@ -38,6 +38,7 @@ LIVE_SYSTEM_PROMPT = """你审查 A 股模拟盘本轮风险，输出建议，�
 
 仅输出 JSON 对象，不能有 Markdown。顶层字段固定，不要输出 slot_recommendations、suggested_orders 或 risk_flags。
 - "confidence" 为 0 至 100 的整数。"bias" 为 -20 至 20 的整数，负值更谨慎。"entry_delta" 为 -15 至 15 的整数，正值提高开仓门槛（更难买）、负值降低门槛（更容易买）。看空或要求收紧时必须给正值，输出前自检：reason 说防守，entry_delta 就必须是正数。"weight_tilt_bps" 为 -1000 至 1000 的整数，表示动量相对形态的偏移。
+- news 是本轮抓到的、标题或摘要里出现你持仓或候选代码/名称的财经快讯（财联社 + 东财两条线）。只用它判断事件方向（利好/利空/不确定），不要臆造新闻里没有的数字；标题与摘要冲突或过于笼统时按不确定处理。新闻只能作为加减分依据，不能单独触发买入：仍需趋势、均价线、诱多风险支持。若 news 为空表示本轮没有关联新闻，不要因此推断没有事件。
 - own_track_record 是你自己的历史成绩单，按市场状态分组：blocked_symbols.mean_bps 是你禁买后那些股票的平均涨跌（正数说明你拦错了，错过了涨幅）；named_buys.mean_bps 是你点名买入后的平均涨跌（负数说明你点错了）。cases 太少的状态不会出现，不要外推。每轮务必先读它：若某状态下你拦错的平均幅度明显为正，本轮该状态就要明显收紧禁买标准（只拦硬证据，如涨停封板、破均价线、长上影），而不是凭排名靠前就拦；若点名买入长期为负，就不要点名，让内核按自身信号执行。
 - 全市场表里凡触发禁买条件的代码都要写进 "blocked_symbols"（最多 40 个），不要只挑几个。"suggestions" 最多 8 条，每条用 {"symbol":"输入中的完整代码","side":"buy|sell|hold","score_delta":0,"weight_bps":0} 的结构。score_delta 限 ±20，weight_bps 限 ±2000。
 - "reason" 用一句中文写建议和主要依据。"market_state" 用 {"evidence":"可核对的数值或代码","counterpoint":"主要反证或缺失的数据"}，两项各一句。"""
@@ -639,6 +640,13 @@ def attach_track_record(digest: dict[str, Any], card: Mapping[str, Any] | None) 
     """
     if card:
         digest["own_track_record"] = card
+    return digest
+
+
+def attach_news(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Add the symbol-linked headlines, when any were found for this round."""
+    if block and block.get("items"):
+        digest["news"] = block
     return digest
 
 

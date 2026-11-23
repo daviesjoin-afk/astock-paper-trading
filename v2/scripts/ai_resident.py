@@ -79,33 +79,45 @@ def _entry(kind: str, text: str, source: str, *, cases: int = 0,
 def facts_from_scorecard(card: Mapping[str, Any]) -> list[Entry]:
     """Turn the measured track record into statements the model can act on.
 
-    Only regimes that cleared the case floor appear in ``card``; the same floor
-    applies here, so a thin sample never becomes a confident sentence.
+    The verdict is excess over that session's market median, never the raw move:
+    on a day when the whole market rises 3%, a blocked name that rises 2% still
+    underperformed, and calling that a missed gain would teach the wrong lesson.
+    Only regimes that cleared the case floor appear, so a thin sample never
+    becomes a confident sentence.
     """
     out: list[Entry] = []
     for regime, block in sorted((card.get("by_regime") or {}).items()):
         blocked = block.get("blocked_symbols") or {}
         buys = block.get("named_buys") or {}
         if blocked.get("cases", 0) >= MIN_CASES:
-            mean = blocked.get("mean_bps")
-            if mean is not None:
-                verdict = "拦错了" if mean > 20 else ("拦对了" if mean < -20 else "接近中性")
+            excess = blocked.get("excess_bps")
+            if excess is not None:
+                if excess > 20:
+                    verdict = ("拦错了：这些票跑赢大盘，说明你的禁买在这类行情里过度保守。"
+                               "只保留硬证据——涨停封板、破日内均价线、长上影冲高回落——"
+                               "其余交给内核评分。")
+                elif excess < -20:
+                    verdict = "拦对了：这些票跑输大盘，禁买有效，继续按现有标准执行。"
+                else:
+                    verdict = "接近中性：禁买对超额收益影响不大，不必因此放宽或收紧。"
                 out.append(_entry(
                     "fact",
-                    f"{regime} 状态下你禁买后这些股票平均 {mean:+d} bps"
-                    f"（{blocked['cases']} 例，{verdict}）。"
-                    + ("这类状态下只拦硬证据：涨停封板、破均价线、长上影。"
-                       if mean > 20 else ""),
+                    f"{regime} 状态：你禁买的股票相对大盘中位 {excess:+d} bps"
+                    f"（{blocked['cases']} 例，跑赢 {blocked.get('beat_market', 0)} /"
+                    f" 跑输 {blocked.get('lagged_market', 0)}）。{verdict}",
                     source="ai_memory.scorecard", cases=blocked["cases"]))
         if buys.get("cases", 0) >= MIN_CASES:
-            mean = buys.get("mean_bps")
-            if mean is not None:
-                out.append(_entry(
-                    "fact",
-                    f"{regime} 状态下你点名的买入平均 {mean:+d} bps"
-                    f"（{buys['cases']} 例）。"
-                    + ("点名为负，这类状态不要点名，交给内核信号。" if mean < -20 else ""),
-                    source="ai_memory.scorecard", cases=buys["cases"]))
+            excess = buys.get("excess_bps")
+            if excess is not None:
+                detail = (f"相对大盘 {excess:+d} bps（{buys['cases']} 例）")
+                if excess < -20:
+                    detail += "。点名的超额为负，这类状态不要点名，交给内核信号。"
+                elif excess > 20:
+                    detail += "。点名的超额为正，这类状态可以点名，但仍需硬证据。"
+                else:
+                    detail += "。点名与大盘接近，点名不构成优势。"
+                out.append(_entry("fact", f"{regime} 状态：你点名的买入{detail}",
+                                  source="ai_memory.scorecard", cases=buys["cases"]))
     return out
 
 

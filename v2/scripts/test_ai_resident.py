@@ -25,19 +25,30 @@ def card(**regimes) -> dict:
 
 class FactTests(unittest.TestCase):
     def test_a_thin_sample_produces_no_fact(self):
-        thin = card(risk_off={"blocked_symbols": {"cases": 3, "mean_bps": 400}})
+        thin = card(risk_off={"blocked_symbols": {"cases": 3, "excess_bps": 400}})
         self.assertEqual(mem.facts_from_scorecard(thin), [])
 
-    def test_a_wrong_block_becomes_a_hard_evidence_rule(self):
-        good = card(mixed={"blocked_symbols": {"cases": 214, "mean_bps": 144}})
+    def test_a_block_that_beat_the_market_is_called_a_mistake(self):
+        good = card(mixed={"blocked_symbols": {"cases": 214, "excess_bps": 145,
+                                              "beat_market": 154, "lagged_market": 43}})
         facts = mem.facts_from_scorecard(good)
         self.assertEqual(len(facts), 1)
         self.assertIn("拦错了", facts[0].text)
         self.assertIn("硬证据", facts[0].text)
         self.assertEqual(facts[0].cases, 214)
 
+    def test_a_block_that_lagged_the_market_is_called_correct(self):
+        # Raw return can be positive on a strong day while still losing ground;
+        # the verdict must follow the excess, not the raw move.
+        good = card(risk_on={"blocked_symbols": {"cases": 777, "excess_bps": -381,
+                                                "mean_bps": 1, "beat_market": 200,
+                                                "lagged_market": 577}})
+        facts = mem.facts_from_scorecard(good)
+        self.assertIn("拦对了", facts[0].text)
+        self.assertNotIn("拦错了", facts[0].text)
+
     def test_a_costly_named_buy_tells_the_model_to_stop_naming(self):
-        good = card(mixed={"named_buys": {"cases": 129, "mean_bps": -122}})
+        good = card(mixed={"named_buys": {"cases": 129, "excess_bps": -122}})
         facts = mem.facts_from_scorecard(good)
         self.assertIn("不要点名", facts[0].text)
 
@@ -133,14 +144,14 @@ class RefreshTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             mem.write_resident(root, [mem._entry("rule", "这条规则要保留", "observer")])
-            first = card(risk_off={"blocked_symbols": {"cases": 100, "mean_bps": 26}})
+            first = card(risk_off={"blocked_symbols": {"cases": 100, "excess_bps": 26}})
             mem.refresh(root, first)
-            second = card(risk_off={"blocked_symbols": {"cases": 120, "mean_bps": 40}})
+            second = card(risk_off={"blocked_symbols": {"cases": 120, "excess_bps": 40}})
             entries = mem.refresh(root, second)
             texts = [e.text for e in entries]
             self.assertTrue(any("这条规则要保留" in t for t in texts))
-            self.assertFalse(any("平均 +26 bps" in t for t in texts), "old fact replaced")
-            self.assertTrue(any("平均 +40 bps" in t for t in texts))
+            self.assertFalse(any("+26 bps" in t for t in texts), "old fact replaced")
+            self.assertTrue(any("+40 bps" in t for t in texts))
 
 
 if __name__ == "__main__":
