@@ -154,4 +154,9 @@
 ### 尚未验证（不能算完成）
 
 - 交易日内的自然调度行为：部署时已收盘，调度进入 `waiting_for_open`（明早 09:30）。T+1 换日、时效闸门、涨停口径、新闻/北向/热度四项联合效果都**要等 2026-11-24 开盘**才能验收。
-- CI 全绿：已推送，检查在跑，未看到最终结论。
+- ~~CI 全绿~~ → **已全绿**：`data-sources`、`rust-kernel`、`security-leak-scan`、`web-e2e`、`web-ui` 五项 SUCCESS（head `1570df2`）。
+
+### 过程中修掉的两个自身问题
+
+1. 新加的 `scripts/test_update_astock_public_snapshot.py` 里用了 `example-net.com` 与 RFC5737 文档地址，被密钥扫描器判为私有邮箱/远端主机。改用 RFC 2606 保留域名后工作区清零。
+2. 首次修复只改了工作区，**历史提交里仍留有旧字符串**，扫描器按 history 重扫仍报 6 项。已用 `git filter-branch` 改写本分支 21 个提交中的该文件，全历史复查为空，`--force-with-lease` 推送（仅为未合并的功能分支）。
