@@ -1230,7 +1230,7 @@ async fn live_create_account(
 
 async fn live_account(State(state): State<LiveAppState>) -> LiveApiResult {
     let db = state.reader.lock().await;
-    live_response(db.account_view(None).map_err(live_api_error)?)
+    live_response(db.account_view().map_err(live_api_error)?)
 }
 
 async fn live_round(

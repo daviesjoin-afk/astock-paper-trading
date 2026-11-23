@@ -775,6 +775,18 @@ class SummaryCompletenessTests(unittest.TestCase):
         self.assertNotIn("vwap_distance_bps", candidate)
 
 
+class PromptContractTests(unittest.TestCase):
+    """The kernel adds entry_delta to the threshold, so the sign must be spelled
+    out: a defensive round that returns a negative delta silently loosens the
+    entry gate and buys more."""
+
+    def test_prompt_states_the_direction_of_entry_delta(self):
+        prompt = loop.LIVE_SYSTEM_PROMPT
+        self.assertIn("正值提高开仓门槛", prompt)
+        self.assertIn("负值降低门槛", prompt)
+        self.assertIn("reason 说防守", prompt)
+
+
 class AdviceRetryTests(unittest.TestCase):
     empty = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
              "usage": {"completion_tokens_details": {"reasoning_tokens": 2_000}}}

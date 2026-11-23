@@ -567,7 +567,7 @@ impl IntradayStore {
             params![steady, aggressive],
         )?;
         transaction.commit()?;
-        self.account_view(None)
+        self.account_view()
     }
 
     /// Move yesterday's bought shares into `sellable_quantity`. This is an
@@ -717,7 +717,26 @@ impl IntradayStore {
         Ok(outcome)
     }
 
-    pub fn account_view(&self, as_of_round_id: Option<&str>) -> IntradayResult<AccountView> {
+    /// The read model describes the live books, so its identity is the newest
+    /// committed round. The AI digest uses this date to tell "today's ledger"
+    /// (T+1 blocks every sale) from "yesterday's, rolled at the open"; leaving
+    /// it NULL made the model report the ledger date as unknown every round.
+    pub fn account_view(&self) -> IntradayResult<AccountView> {
+        let latest: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT round_id FROM round ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        self.account_view_as_of(latest.as_deref())
+    }
+
+    pub fn account_view_as_of(
+        &self,
+        as_of_round_id: Option<&str>,
+    ) -> IntradayResult<AccountView> {
         let snapshot = self.conn.unchecked_transaction()?;
         let account = ensure_account(&snapshot)?;
         let books = read_books(&snapshot)?;

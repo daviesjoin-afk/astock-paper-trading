@@ -938,6 +938,12 @@ pub(super) fn score_candidates_for_research(
                 || (slot == Slot::Steady && mom_prev >= 600 && limit_dist <= 180)
                 || (mom_prev >= 350 && vwap_distance_bps.is_some_and(|v| v <= -180) && mom_open <= -50);
             if ai_active {
+                // The model sometimes names a symbol it only read in the market
+                // table. A sale of something not held cannot execute; record it
+                // instead of letting the audit imply an order was placed.
+                if held.is_none() && suggestion_side == Some("sell") {
+                    notes.push("ai_sell_without_position".into());
+                }
                 if held.is_some() && suggestion_side == Some("sell") {
                     side = "sell".into();
                     notes.push("ai_force_sell".into());
