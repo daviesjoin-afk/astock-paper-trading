@@ -62,6 +62,8 @@ type LiveAccountView = {
   as_of_round_id: string | null;
   equity_cents: number | null;
   profit_cents: number | null;
+  daily_pnl_cents?: number | null;
+  daily_pnl_day?: string | null;
   return_bps: number | null;
   slots: LiveSlotView[];
   positions: LivePosition[];
@@ -944,15 +946,20 @@ function renderDashboard(): string {
   const account = data.account;
   const round = latestRound();
   const curve = data.curve ?? [];
+  const pnlDay = account?.daily_pnl_day;
+  const pnlTitle = pnlDay && pnlDay !== todayInShanghai()
+    ? `交易日盈亏 · ${escapeHtml(pnlDay.slice(5))}`
+    : "今日盈亏";
   const figures = `<section class="hero" aria-labelledby="live-overview-title">
     <div>
       <p class="eyebrow">模拟资金 · 不涉及真实交易</p>
       <h2 id="live-overview-title">我的模拟账户</h2>
       <p class="muted live-note">系统每 3 分钟自动买卖一次，用的是实时行情（有几十秒延迟）。${errors.account ? ` 账户读取失败：${escapeHtml(errors.account)}` : ""}</p>
     </div>
-    <dl class="hero-figures">
+    <dl class="hero-figures live-hero-figures">
       <div><dt>本金</dt><dd>${money(account?.initial_cash_cents)}</dd></div>
       <div><dt>总资产</dt><dd>${money(account?.equity_cents)}</dd></div>
+      <div><dt>${pnlTitle}</dt><dd data-testid="live-daily-pnl" class="${pnlClass(account?.daily_pnl_cents)}">${signedMoney(account?.daily_pnl_cents)}</dd></div>
       <div><dt>累计收益</dt><dd class="${pnlClass(account?.profit_cents)}">${signedMoney(account?.profit_cents)}</dd></div>
       <div><dt>收益率</dt><dd class="${pnlClass(account?.return_bps)}">${percent(account?.return_bps)}</dd></div>
       <div><dt>可用现金</dt><dd>${money(account?.cash_cents)}</dd></div>

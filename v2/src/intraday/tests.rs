@@ -79,6 +79,58 @@ fn buy(store: &mut IntradayStore, round_id: &str, day: &str, symbol: &str) -> Ve
 }
 
 #[test]
+fn daily_pnl_uses_the_previous_session_last_equity_and_keeps_cumulative_profit() {
+    let mut db = store();
+    let no_round = db.account_view(None).unwrap();
+    assert_eq!(no_round.daily_pnl_cents, None);
+    assert_eq!(no_round.daily_pnl_day, None);
+
+    let snapshot = |id, time, quotes| {
+        let mut round = request(id, time, quotes);
+        round.fetched_at = None;
+        round
+    };
+    let market = |price, previous| vec![quote("600000.SH", price, previous)];
+    let first = db.run_round(&snapshot(
+        "open", "2026-11-20T09:30:00+08:00", vec![strong_quote("600000.SH")],
+    )).unwrap();
+    assert!(!first.trades.is_empty());
+    let equity = |outcome: &super::RoundOutcome| outcome.account.equity_cents.unwrap();
+    assert_eq!(first.account.daily_pnl_cents, Some(equity(&first) - CASH));
+    let close = db.run_round(&snapshot(
+        "close", "2026-11-20T14:57:00+08:00", market(1080, 1000),
+    )).unwrap();
+    assert_ne!(equity(&close), equity(&first));
+    assert_eq!(close.account.daily_pnl_cents, Some(equity(&close) - CASH));
+    let monday = db.run_round(&snapshot(
+        "mon-open", "2026-11-23T09:30:00+08:00", market(1075, 1080),
+    )).unwrap();
+    let monday_next = snapshot("mon-next", "2026-11-23T01:33:00Z", market(1070, 1080));
+    let latest = db.run_round(&monday_next).unwrap();
+    assert_ne!(equity(&latest), equity(&monday));
+    let expected = equity(&latest) - equity(&close);
+    assert!(expected < 0);
+    assert_eq!(latest.account.daily_pnl_cents, Some(expected));
+    assert_eq!(latest.account.daily_pnl_day.as_deref(), Some("2026-11-23"));
+    assert_eq!(latest.account.profit_cents, Some(equity(&latest) - CASH));
+    let read = db.account_view(None).unwrap();
+    assert_eq!(read.daily_pnl_cents, latest.account.daily_pnl_cents);
+    assert_eq!(read.daily_pnl_day, latest.account.daily_pnl_day);
+    assert_eq!(db.run_round(&monday_next).unwrap().account, latest.account);
+}
+
+#[test]
+fn daily_pnl_converts_offset_timestamps_to_shanghai_and_rejects_bad_baselines() {
+    let mut db = store();
+    let leg = |id, at| request(id, at, vec![quote("600000.SH", 1000, 1000)]);
+    db.run_round(&leg("bad", "invalid-timestamp")).unwrap();
+    let latest = db.run_round(&leg("offset", "2026-11-22T19:00:00-06:00")).unwrap();
+    assert_eq!(latest.account.daily_pnl_day.as_deref(), Some("2026-11-23"));
+    assert_eq!(latest.account.daily_pnl_cents, None);
+    assert_eq!(db.account_view(None).unwrap().daily_pnl_cents, None);
+}
+
+#[test]
 fn a_live_quote_produces_real_fills_with_fees_and_whole_lots() {
     let mut store = store();
     let trades = buy(

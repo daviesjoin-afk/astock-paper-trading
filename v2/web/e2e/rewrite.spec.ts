@@ -75,6 +75,27 @@ test.describe("current console routes", () => {
     expect(apiPaths.some((path) => path.startsWith("/v2/live/"))).toBe(true);
   });
 
+  test("shows daily P&L separately from cumulative P&L and dates a previous session", async ({ page }) => {
+    const account = {
+      id: "paper", initial_cash_cents: 10_000_000, cash_cents: 4_000_000,
+      equity_cents: 9_115_345, profit_cents: -884_655, return_bps: -884,
+      daily_pnl_cents: -12_345, daily_pnl_day: "2026-11-23", slots: [], positions: [],
+    };
+    await page.clock.setFixedTime(new Date("2026-11-23T02:00:00Z"));
+    await page.route("**/v2/live/account", (route) => route.fulfill({ json: account }));
+    await openRoute(page, "live/dashboard");
+    const daily = page.getByTestId("live-daily-pnl");
+    await expect(daily).toHaveText("¥-123.45");
+    await expect(daily).toHaveClass("neg");
+    await expect(page.getByText("今日盈亏", { exact: true })).toBeVisible();
+    await expect(page.locator(".live-hero-figures").getByText("¥-8,846.55", { exact: true })).toBeVisible();
+
+    await page.clock.setFixedTime(new Date("2026-11-24T00:00:00Z"));
+    await page.reload();
+    await expect(daily).toHaveText("¥-123.45");
+    await expect(page.getByText("交易日盈亏 · 11-23", { exact: true })).toBeVisible();
+  });
+
   test("all four live views are reachable by URL with the correct active tab", async ({ page }) => {
     const emptyStates: Record<string, RegExp> = {
       "live/dashboard": /现在没有持股|还没有开始/,

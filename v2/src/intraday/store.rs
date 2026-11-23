@@ -10,6 +10,7 @@ use std::{
     path::Path,
 };
 
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +74,10 @@ pub struct AccountView {
     pub as_of_round_id: Option<String>,
     pub equity_cents: Option<i64>,
     pub profit_cents: Option<i64>,
+    #[serde(default)]
+    pub daily_pnl_cents: Option<i64>,
+    #[serde(default)]
+    pub daily_pnl_day: Option<String>,
     pub return_bps: Option<i64>,
     pub slots: Vec<SlotView>,
     pub positions: Vec<Position>,
@@ -713,15 +718,16 @@ impl IntradayStore {
     }
 
     pub fn account_view(&self, as_of_round_id: Option<&str>) -> IntradayResult<AccountView> {
-        let account = ensure_account(&self.conn)?;
-        let books = read_books(&self.conn)?;
+        let snapshot = self.conn.unchecked_transaction()?;
+        let account = ensure_account(&snapshot)?;
+        let books = read_books(&snapshot)?;
         // Only the held symbols need a mark. Ranking the whole snapshot archive
         // makes this read grow with every round ever run.
         let held: Vec<String> = books
             .iter()
             .flat_map(|book| book.positions.iter().map(|position| position.symbol.clone()))
             .collect();
-        let (prices, names) = latest_quotes(&self.conn, &held)?;
+        let (prices, names) = latest_quotes(&snapshot, &held)?;
         // A position's name is the most recent real name for its symbol. The
         // name map already excludes blanks and placeholders; absent stays NULL.
         let position_names: BTreeMap<String, Option<String>> = books
@@ -732,13 +738,15 @@ impl IntradayStore {
                 (symbol, name)
             })
             .collect();
-        Ok(account_view_from(
+        let mut view = account_view_from(
             &account,
             &books,
             &prices,
             &position_names,
             as_of_round_id,
-        ))
+        );
+        set_daily_pnl(&snapshot, &mut view)?;
+        Ok(view)
     }
 
     pub fn decisions(&self, round_id: &str) -> IntradayResult<Vec<StoredDecision>> {
@@ -1623,13 +1631,14 @@ fn run_round_tx(
         Some(&round_quotes),
         &position_symbols,
     )?;
-    let account_view = account_view_from(
+    let mut account_view = account_view_from(
         account,
         books,
         &marks,
         &round_names,
         Some(&request.round_id),
     );
+    set_daily_pnl(transaction, &mut account_view)?;
     transaction.execute(
         "INSERT INTO round(round_id, started_at, finished_at, quote_count, trade_count, \
          ai_ok, ai_error, equity_cents, regime, note, account_json) \
@@ -2244,7 +2253,8 @@ fn latest_prices_for(
              SELECT q.symbol AS symbol, q.price_cents AS price_cents, \
                     ROW_NUMBER() OVER ( \
                         PARTITION BY q.symbol \
-                        ORDER BY COALESCE(r.started_at, q.fetched_at) DESC, \
+                        ORDER BY julianday(COALESCE(r.started_at, q.fetched_at)) DESC, \
+                                 COALESCE(r.started_at, q.fetched_at) DESC, \
                                  q.round_id DESC, q.rowid DESC \
                     ) AS recency \
              FROM quote_snapshot q \
@@ -2401,6 +2411,8 @@ fn account_view_from(
         as_of_round_id: as_of_round_id.map(str::to_string),
         equity_cents,
         profit_cents,
+        daily_pnl_cents: None,
+        daily_pnl_day: None,
         return_bps: profit_cents.map(|profit| {
             if account.initial_cash_cents > 0 {
                 profit * 10_000 / account.initial_cash_cents
@@ -2411,6 +2423,50 @@ fn account_view_from(
         slots,
         positions,
     }
+}
+
+/// Use the last committed valuation from an earlier Shanghai session. A
+/// ledger with no earlier session starts from its original cash. The caller
+/// keeps account, marks, and the equity baseline in the same read snapshot.
+fn set_daily_pnl(conn: &impl ConnLike, view: &mut AccountView) -> IntradayResult<()> {
+    let mut statement = conn.prepare(
+        "SELECT quote_time, equity_cents FROM equity_point ORDER BY rowid DESC",
+    )?;
+    let mut points = statement.query([])?;
+    let Some(latest) = points.next()? else {
+        return Ok(());
+    };
+    let Some(day) = shanghai_quote_day(&latest.get::<_, String>(0)?) else {
+        return Ok(());
+    };
+    view.daily_pnl_day = Some(day.to_string());
+    let Some(equity) = view.equity_cents else {
+        return Ok(());
+    };
+    while let Some(point) = points.next()? {
+        match shanghai_quote_day(&point.get::<_, String>(0)?) {
+            Some(prior_day) if prior_day == day => continue,
+            Some(prior_day) if prior_day < day => {
+                view.daily_pnl_cents = equity.checked_sub(point.get(1)?);
+            }
+            _ => {} // A malformed or out-of-order predecessor cannot supply a baseline.
+        }
+        return Ok(());
+    }
+    view.daily_pnl_cents = equity.checked_sub(view.initial_cash_cents);
+    Ok(())
+}
+
+fn shanghai_quote_day(stamp: &str) -> Option<NaiveDate> {
+    if let Ok(at) = DateTime::parse_from_rfc3339(stamp) {
+        return Some(at.with_timezone(&FixedOffset::east_opt(8 * 3600)?).date_naive());
+    }
+    // Legacy callers used local timestamp strings. Never truncate an offset
+    // string that failed to parse, since it may belong to another session.
+    ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(stamp, format).ok().map(|at| at.date()))
+        .or_else(|| NaiveDate::parse_from_str(stamp, "%Y-%m-%d").ok())
 }
 
 fn stored_round_outcome_tx(

@@ -163,6 +163,10 @@ main {
   margin: 3px 0 0; font: 600 17px/1.3 var(--mono);
   font-variant-numeric: tabular-nums;
 }
+@media (min-width: 861px) {
+  .live-hero-figures { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .live-hero-figures dd { overflow-wrap: anywhere; font-size: 15px; }
+}
 .pos { color: var(--positive); }
 .neg { color: var(--negative); }
 
