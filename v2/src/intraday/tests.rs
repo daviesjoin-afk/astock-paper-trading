@@ -2069,3 +2069,49 @@ fn a_mid_session_round_is_not_republished_as_the_daily_close() {
     assert_eq!(bar.close_cents, 1_080);
     assert_eq!(bar.source, "live");
 }
+
+#[test]
+fn the_stated_basis_is_persisted_so_a_close_review_can_read_it() {
+    // Both prompts ask for market_state.evidence. Dropping it on the way into
+    // the ledger left the close review reading the prose reason for hints
+    // instead of the numbers the model said it used.
+    let mut store = store();
+    let mut round = request(
+        "2026-11-20-093100",
+        "2026-11-20T09:31:00+08:00",
+        vec![strong_quote("600000.SH")],
+    );
+    round.advice = Some(super::Advice {
+        model: Some("test-model".into()),
+        raw_advice: Some(json!({
+            "bias": 0,
+            "reason": "观察",
+            "market_state": {
+                "evidence": "沪股通 +379.8 亿 / 深股通 -9.3 亿",
+                "counterpoint": "冲高回落占比偏高"
+            }
+        })),
+        ..Default::default()
+    });
+    let outcome = store.run_round(&round).unwrap();
+    let state = outcome
+        .ai
+        .market_state
+        .as_ref()
+        .expect("the stated basis is kept");
+    assert_eq!(state.evidence.as_deref(), Some("沪股通 +379.8 亿 / 深股通 -9.3 亿"));
+    assert_eq!(state.counterpoint.as_deref(), Some("冲高回落占比偏高"));
+
+    // An answer without a basis stores none rather than inventing one.
+    let mut plain = request(
+        "2026-11-20-093400",
+        "2026-11-20T09:34:00+08:00",
+        vec![strong_quote("600000.SH")],
+    );
+    plain.advice = Some(super::Advice {
+        model: Some("test-model".into()),
+        raw_advice: Some(json!({"bias": 0, "reason": "观察"})),
+        ..Default::default()
+    });
+    assert!(store.run_round(&plain).unwrap().ai.market_state.is_none());
+}

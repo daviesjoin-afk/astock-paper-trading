@@ -134,6 +134,20 @@ pub struct AiApplication {
     pub signal_baseline: Option<SignalBaseline>,
     #[serde(default)]
     pub mode: String,
+    /// The model's own stated basis, when it gives one. Both prompts ask for
+    /// `market_state.evidence` / `counterpoint`; persisting it is what lets a
+    /// close review check *why* a round decided what it did instead of reading
+    /// the prose `reason` for hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_state: Option<MarketState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterpoint: Option<String>,
 }
 
 impl AiApplication {
@@ -155,6 +169,7 @@ impl AiApplication {
             ai_error: Some(reason.into()),
             signal_baseline: None,
             mode: "advisory".into(),
+            market_state: None,
         }
     }
 
@@ -490,6 +505,16 @@ fn clamp_inner(round_id: &str, advice: Option<Advice>) -> AiApplication {
         signal_baseline: None,
         ai_error,
         mode,
+        market_state: raw_map.get("market_state").and_then(|value| {
+            let object = value.as_object()?;
+            let field = |key: &str| {
+                object.get(key).and_then(Value::as_str)
+                    .map(|text| truncate_chars(text.trim(), MAX_TEXT_CHARS))
+                    .filter(|text| !text.is_empty())
+            };
+            let state = MarketState { evidence: field("evidence"), counterpoint: field("counterpoint") };
+            (state.evidence.is_some() || state.counterpoint.is_some()).then_some(state)
+        }),
     }
 }
 
