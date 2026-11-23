@@ -18,7 +18,11 @@ pub const MAX_WEIGHT_TILT_BPS: i64 = 1_000;
 pub const MAX_SUGGESTION_SCORE_DELTA: i64 = 20;
 pub const MAX_SUGGESTION_WEIGHT_BPS: i64 = 2_000;
 pub const MAX_ADVICE_ITEMS: usize = 8;
-pub const MAX_BLOCKED_SYMBOLS: usize = 5;
+// The live AI sees the whole tradable market, so the "do not buy" list must be
+// able to name every name it actually found dangerous. At 5 the model was
+// structurally forced to drop the rest: measured 11:03-11:09, 5-15 candidates
+// per round carried trap risk >= 30 while only 1-2 of them ever appeared here.
+pub const MAX_BLOCKED_SYMBOLS: usize = 40;
 pub const MAX_TEXT_CHARS: usize = 512;
 pub const MAX_RAW_ADVICE_CHARS: usize = 16_000;
 const MAX_FACTOR_BPS: i64 = 1_000_000;
@@ -1139,7 +1143,9 @@ mod tests {
                 "bias": 1000,
                 "entry_delta": -1000,
                 "weight_tilt_bps": 5000,
-                "blocked_symbols": ["A", "B", "C", "D", "E", "F"],
+                "blocked_symbols": (0..MAX_BLOCKED_SYMBOLS + 3)
+                    .map(|i| format!("B{i:03}"))
+                    .collect::<Vec<_>>(),
                 "suggestions": [
                     {"symbol": "600000.SH", "side": "buy", "score_delta": 1000, "weight_bps": 9999}
                 ],

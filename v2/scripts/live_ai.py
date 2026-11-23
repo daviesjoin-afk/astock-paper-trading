@@ -38,7 +38,7 @@ LIVE_SYSTEM_PROMPT = """你审查 A 股模拟盘本轮风险，输出建议，�
 
 仅输出 JSON 对象，不能有 Markdown。顶层字段固定，不要输出 slot_recommendations、suggested_orders 或 risk_flags。
 - "confidence" 为 0 至 100 的整数。"bias" 为 -20 至 20 的整数，负值更谨慎。"entry_delta" 为 -15 至 15 的整数，正值提高开仓门槛（更难买）、负值降低门槛（更容易买）。看空或要求收紧时必须给正值，输出前自检：reason 说防守，entry_delta 就必须是正数。"weight_tilt_bps" 为 -1000 至 1000 的整数，表示动量相对形态的偏移。
-- "blocked_symbols" 最多 5 个代码。"suggestions" 最多 8 条，每条用 {"symbol":"输入中的完整代码","side":"buy|sell|hold","score_delta":0,"weight_bps":0} 的结构。score_delta 限 ±20，weight_bps 限 ±2000。
+- 全市场表里凡触发禁买条件的代码都要写进 "blocked_symbols"（最多 40 个），不要只挑几个。"suggestions" 最多 8 条，每条用 {"symbol":"输入中的完整代码","side":"buy|sell|hold","score_delta":0,"weight_bps":0} 的结构。score_delta 限 ±20，weight_bps 限 ±2000。
 - "reason" 用一句中文写建议和主要依据。"market_state" 用 {"evidence":"可核对的数值或代码","counterpoint":"主要反证或缺失的数据"}，两项各一句。"""
 
 
