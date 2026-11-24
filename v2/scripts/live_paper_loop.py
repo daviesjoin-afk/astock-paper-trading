@@ -403,9 +403,12 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         except Exception:  # noqa: BLE001 - fall back to direct raw_advice if endpoint unavailable
             settings_used = False
         if not settings_used:
+            # Give the transport a timeout inside the deadline so it fails on
+            # its own terms and logs a real reason, rather than being abandoned.
             advice = _with_deadline(
                 lambda: raw_advice(digest, base_url=config.llm_base,
                                    api_key=config.llm_key, model=config.llm_model,
+                                   timeout=AI_DEADLINE_SECS - 2,
                                    opener=config.opener, log=log, round_id=round_id),
                 seconds=AI_DEADLINE_SECS, label="ai-direct")
 
