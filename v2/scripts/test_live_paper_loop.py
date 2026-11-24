@@ -242,18 +242,34 @@ class LivePaperLoopTests(unittest.TestCase):
         self.assertEqual(opener.calls, [], "no round may be submitted")
         self.assertIn("quote_stale", output.getvalue())
 
-    def test_an_undated_quote_is_refused_rather_than_treated_as_now(self):
+    def test_an_undated_quote_is_tradeable_only_inside_the_session(self):
+        # `tencent_quote` returns prices with no timestamp at all, so every
+        # round from it is flagged `quote_time_estimated`. Refusing all of them
+        # stalled the scheduler for a whole session. The rule is narrower:
+        # unverified provenance is acceptable only while we fetched it inside
+        # the session ourselves, and unusable outside one.
         opener = FakeOpener(post={"/round": round_response()})
         config = make_config(opener)
         estimated = {**snapshot(), "quote_time_estimated": True}
-        output = io.StringIO()
-        with loop.Log(None, stdout=output) as log:
+        with loop.Log(None, stdout=io.StringIO()) as log:
             posted = loop.run_round(
                 config=config, kernel=loop.Kernel(config.api, opener=opener),
                 log=log, state=loop.RoundState(), snapshot=estimated)
-        self.assertFalse(posted)
-        self.assertEqual(opener.calls, [])
-        self.assertIn("quote_time_estimated", output.getvalue())
+        self.assertTrue(posted, "a 10:03 fetch is a live quote even without a source stamp")
+
+        opener2 = FakeOpener(post={"/round": round_response()})
+        config2 = make_config(opener2)
+        outside = {**snapshot(), "quote_time_estimated": True,
+                   "quote_time": "2026-11-13T20:03:00+08:00",   # after the close
+                   "fetched_at": "2026-11-13T12:03:05+00:00"}
+        output = io.StringIO()
+        with loop.Log(None, stdout=output) as log:
+            refused = loop.run_round(
+                config=config2, kernel=loop.Kernel(config2.api, opener=opener2),
+                log=log, state=loop.RoundState(), snapshot=outside)
+        self.assertFalse(refused)
+        self.assertEqual(opener2.calls, [])
+        self.assertIn("quote_not_self_dated", output.getvalue())
 
     def test_a_quote_that_ages_out_during_the_ai_call_is_not_posted(self):
         # The AI call is the long pole. Freshness has to be re-checked at the
@@ -271,6 +287,25 @@ class LivePaperLoopTests(unittest.TestCase):
         self.assertFalse(posted, "a quote that aged 15 minutes must not trade")
         self.assertFalse(any(call[1].endswith("/v2/live/round")
                              for call in opener.calls))
+
+    def test_the_real_tencent_shape_keeps_rounds_running_all_session(self):
+        # Reproduces the production 2026-11-24 stall: the source hands back no
+        # timestamp, so `quote_time` is our fetch clock and the flag is true.
+        # Every round was skipped and the session produced nothing. Inside a
+        # session this must trade; outside one it must not.
+        inside = [beijing("2026-11-24", 9, 33), beijing("2026-11-24", 11, 27),
+                  beijing("2026-11-24", 13, 9), beijing("2026-11-24", 14, 57)]
+        for moment in inside:
+            stamp = moment.isoformat()
+            ok = loop.require_fresh_quote(
+                {"quote_time": stamp, "fetched_at": stamp, "quote_time_estimated": True})
+            self.assertEqual(ok.hour, moment.hour, f"{stamp} must trade")
+        for moment in (beijing("2026-11-24", 8, 55), beijing("2026-11-24", 12, 10),
+                       beijing("2026-11-24", 15, 20), beijing("2026-11-22", 10, 30)):
+            stamp = moment.isoformat()
+            with self.assertRaises(loop.StaleQuote):
+                loop.require_fresh_quote(
+                    {"quote_time": stamp, "fetched_at": stamp, "quote_time_estimated": True})
 
     def test_raw_llm_json_is_transported_verbatim_without_python_policy(self):
         model_json = {"confidence": 7, "bias": 999999,

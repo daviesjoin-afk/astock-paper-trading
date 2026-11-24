@@ -188,26 +188,44 @@ class StaleQuote(LoopError):
 def require_fresh_quote(snapshot: Mapping[str, Any], *,
                         now: datetime | None = None,
                         elapsed: timedelta | None = None) -> datetime:
-    """Return the observed time, or raise if this snapshot may not trade.
+    """Return the round's reference time, or raise if it may not trade.
 
-    Two ages matter and they are different questions:
+    Three separate questions, and only the first two can be answered by the
+    snapshot alone:
 
-    * how old the *data* already was when we fetched it — `quote_time` against
-      `fetched_at`. A source that hands back an hour-old print is not a price;
-    * how long *we* have held it — `elapsed`, measured from the moment the
-      snapshot was taken. The AI call sits in between and can run for minutes.
+    * **When was this snapshot taken?** `fetched_at` is our own clock at fetch
+      time; `quote_time` is the *source's* own observation time when the source
+      supplies one. `tencent_quote` does not — it returns prices with no
+      timestamp at all — so `quote_time` there is our fetch clock, flagged
+      `quote_time_estimated`. That flag means "unverified provenance", not
+      "stale": refusing every such round stalled the whole scheduler for a
+      session, which is the opposite of fail-closed.
+    * **How long have we held it?** `elapsed`, measured across the AI call.
+    * **Is the market open?** A quote fetched outside the session cannot be
+      traded regardless of provenance.
 
-    Fail-closed on purpose: a missing source time is not "now", it is unknown.
+    So: refuse when provenance is unknown *and* the fetch clock is outside the
+    session, or when we have held the snapshot too long. Pass a verified source
+    time when one exists.
     """
-    if snapshot.get("quote_time_estimated"):
-        raise StaleQuote("quote_time_estimated: the source did not date its own quote")
-    observed = feed.source_datetime(snapshot.get("quote_time"))
-    if observed is None:
-        raise StaleQuote(f"quote_time cannot be read: {snapshot.get('quote_time')!r}")
-    local = observed.astimezone(feed.SHANGHAI)
     fetched = feed.source_datetime(snapshot.get("fetched_at"))
+    observed = feed.source_datetime(snapshot.get("quote_time"))
+    estimated = bool(snapshot.get("quote_time_estimated"))
+    reference = (now or fetched or datetime.now(tz=timezone.utc)).astimezone(feed.SHANGHAI)
+    if elapsed is not None and elapsed > MAX_QUOTE_AGE:
+        raise StaleQuote(
+            f"quote_stale: held for {elapsed.total_seconds():.0f}s before posting")
+    if estimated or observed is None:
+        # Provenance unknown: the snapshot is only usable if we took it inside
+        # the session ourselves. Any other case is an untradeable guess.
+        if not in_session(reference, time_cls(15, 0)):
+            raise StaleQuote(
+                "quote_not_self_dated: the source did not date its quote and it "
+                f"was fetched outside the session ({reference.isoformat()})")
+        return reference
+    local = observed.astimezone(feed.SHANGHAI)
     if fetched is not None:
-        age = fetched - local
+        age = fetched.astimezone(feed.SHANGHAI) - local
         if age > MAX_QUOTE_AGE:
             raise StaleQuote(
                 f"quote_stale: observed {local.isoformat()} was already "
@@ -215,9 +233,6 @@ def require_fresh_quote(snapshot: Mapping[str, Any], *,
         if age < -MAX_QUOTE_AGE:
             raise StaleQuote(
                 f"quote_from_the_future: observed {local.isoformat()} leads its own fetch")
-    if elapsed is not None and elapsed > MAX_QUOTE_AGE:
-        raise StaleQuote(
-            f"quote_stale: held for {elapsed.total_seconds():.0f}s before posting")
     if now is not None:
         drift = now.astimezone(feed.SHANGHAI) - local
         if drift > MAX_QUOTE_AGE:
