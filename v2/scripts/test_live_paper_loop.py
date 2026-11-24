@@ -288,6 +288,55 @@ class LivePaperLoopTests(unittest.TestCase):
         self.assertFalse(any(call[1].endswith("/v2/live/round")
                              for call in opener.calls))
 
+    def test_a_hung_advice_call_cannot_stall_the_round(self):
+        # The 2026-11-24 pattern: connect() to a dead provider stays in
+        # SYN-SENT, urllib's per-operation timeout never fires, and rounds
+        # spaced 18 minutes apart. The round must survive on the deadline.
+        import time as clock_module
+        opener = FakeOpener(post={"/round": round_response()})
+        config = make_config(opener)
+
+        real_post = loop.Kernel.post
+
+        def hang_on_advice(self, path, payload):
+            if path == "/v2/settings/ai-advice":
+                clock_module.sleep(30)
+            return real_post(self, path, payload)
+
+        started = clock_module.monotonic()
+        with mock.patch.object(loop, "AI_DEADLINE_SECS", 0.5):
+            with mock.patch.object(loop.Kernel, "post", hang_on_advice):
+                with loop.Log(None, stdout=io.StringIO()) as log:
+                    posted = loop.run_round(
+                        config=config, kernel=loop.Kernel(config.api, opener=opener),
+                        log=log, state=loop.RoundState())
+        elapsed = clock_module.monotonic() - started
+        # The advice call is cut off, yet the round still posts on the
+        # deterministic strategy rather than being lost.
+        self.assertTrue(posted, "the round survives a dead provider")
+        self.assertLess(elapsed, 10.0, f"the deadline must cut the call, took {elapsed:.1f}s")
+
+    def test_an_unreachable_enrichment_does_not_hold_the_round(self):
+        # 2026-11-24: an unreachable host left the socket in SYN-SENT and a
+        # serial lookup stacked past the transport timeout, so five rounds were
+        # lost while one enrichment call hung. A deadline must cut it off.
+        import time as clock_module
+        started = clock_module.monotonic()
+
+        def hang():
+            clock_module.sleep(30)
+            return {"items": []}
+
+        result = loop._with_deadline(hang, seconds=0.5, label="test")
+        elapsed = clock_module.monotonic() - started
+        self.assertIsNone(result, "an overdue enrichment yields nothing")
+        self.assertLess(elapsed, 5.0, f"the deadline must cut it short, took {elapsed:.1f}s")
+
+    def test_a_failing_enrichment_yields_nothing_and_never_raises(self):
+        def boom():
+            raise RuntimeError("provider down")
+        self.assertIsNone(loop._with_deadline(boom, seconds=5, label="test"))
+
     def test_the_real_tencent_shape_keeps_rounds_running_all_session(self):
         # Reproduces the production 2026-11-24 stall: the source hands back no
         # timestamp, so `quote_time` is our fetch clock and the flag is true.

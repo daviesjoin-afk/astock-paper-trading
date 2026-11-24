@@ -379,7 +379,14 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
             digest = attach_resident_memory(digest, config.resident_memory)
         settings_used = False
         try:
-            settings_resp = kernel.post("/v2/settings/ai-advice", digest)
+            # `urllib`'s timeout bounds a single socket operation, not the
+            # handshake: an unreachable provider leaves connect() in SYN-SENT
+            # and the call hangs far past any per-op timer. Give the whole
+            # request a wall-clock deadline so one dead endpoint cannot cost
+            # the session its rounds.
+            settings_resp = _with_deadline(
+                lambda: kernel.post("/v2/settings/ai-advice", digest),
+                seconds=AI_DEADLINE_SECS, label="ai")
             if isinstance(settings_resp, dict) and (settings_resp.get("ok") or settings_resp.get("disabled")):
                 advice = settings_resp.get("advice")
                 settings_used = True
@@ -396,9 +403,11 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         except Exception:  # noqa: BLE001 - fall back to direct raw_advice if endpoint unavailable
             settings_used = False
         if not settings_used:
-            advice = raw_advice(digest, base_url=config.llm_base,
-                                api_key=config.llm_key, model=config.llm_model,
-                                opener=config.opener, log=log, round_id=round_id)
+            advice = _with_deadline(
+                lambda: raw_advice(digest, base_url=config.llm_base,
+                                   api_key=config.llm_key, model=config.llm_model,
+                                   opener=config.opener, log=log, round_id=round_id),
+                seconds=AI_DEADLINE_SECS, label="ai-direct")
 
     # The AI call can take long enough for the quote to age out; the freshness
     # rule has to hold at the moment of posting, not only at ingest.
@@ -622,26 +631,60 @@ def refresh_resident_block(path: str | None, ledger_db: str | None) -> str | Non
         return load_resident_block(path)
 
 
+AI_DEADLINE_SECS = 45.0
+"""Wall-clock ceiling for one advice request, including the kernel's own wait.
+
+The kernel already clamps its provider timeout to 25s; this allowance covers
+that plus transport overhead, and exists to stop a dead endpoint from stalling
+the round indefinitely.
+"""
+
+NEWS_DEADLINE_SECS = 20.0
+"""Hard ceiling for one additive enrichment call.
+
+These fetches are enhancement only: a provider that stops answering must not
+hold the round. The transport timeout alone was not enough — an unreachable
+host leaves the socket in SYN-SENT, and several serial lookups stack up far
+past the timer, which is exactly how 2026-11-24 lost five rounds. Enriched
+blocks are therefore run on a worker thread with a wall-clock deadline and
+abandoned when it passes.
+"""
+
+
+def _with_deadline(work: Callable[[], Any], seconds: float = NEWS_DEADLINE_SECS,
+                   label: str = "enrichment") -> Any:
+    """Run ``work`` but give up after ``seconds``; never propagates its errors."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(work).result(timeout=seconds)
+    except FutureTimeout:
+        return None
+    except Exception:  # noqa: BLE001 - additive data is never a precondition
+        return None
+    finally:
+        # Do not join: the abandoned call may still be waiting on a socket.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def fetch_northbound_block() -> Mapping[str, Any] | None:
     """Northbound flows for this round, when the source can serve them."""
-    try:
+    def work() -> Mapping[str, Any] | None:
         from live_news import fetch_northbound
         from astock_public import PublicClient
         from source_http import SourceHttp
-        return fetch_northbound(PublicClient(http=SourceHttp()))
-    except Exception:  # noqa: BLE001 - flow is additive
-        return None
+        return fetch_northbound(PublicClient(http=SourceHttp(timeout=6)))
+    return _with_deadline(work, label="northbound")
 
 
 def fetch_heat_block() -> Mapping[str, Any] | None:
     """Market heat and concept tags, fetched once per round."""
-    try:
+    def work() -> Mapping[str, Any] | None:
         from live_news import fetch_hot_and_sectors
         from astock_public import PublicClient
         from source_http import SourceHttp
-        return fetch_hot_and_sectors(PublicClient(http=SourceHttp()), limit=30)
-    except Exception:  # noqa: BLE001 - heat is additive
-        return None
+        return fetch_hot_and_sectors(PublicClient(http=SourceHttp(timeout=6)), limit=30)
+    return _with_deadline(work, label="heat")
 
 
 def news_watch_scope(digest: Mapping[str, Any], *,
@@ -675,14 +718,13 @@ def fetch_news_block(snapshot: Mapping[str, Any], watch: Sequence[str], *,
     returns None and the observer simply reasons without headlines.
     ``per_symbol_watch`` keeps the slow per-symbol requests on the holdings.
     """
-    try:
+    def work() -> Mapping[str, Any] | None:
         from live_news import digest_news
         from astock_public import PublicClient
         from source_http import SourceHttp
-        return digest_news(PublicClient(http=SourceHttp()), snapshot, watch=watch,
-                           per_symbol_watch=per_symbol_watch)
-    except Exception:  # noqa: BLE001 - news is an enhancement, not a precondition
-        return None
+        return digest_news(PublicClient(http=SourceHttp(timeout=6)), snapshot,
+                           watch=watch, per_symbol_watch=per_symbol_watch)
+    return _with_deadline(work, label="news")
 
 
 def load_resident_block(path: str | None) -> str | None:
