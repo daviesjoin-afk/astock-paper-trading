@@ -8,15 +8,25 @@ Wants=network-online.target
 Type=simple
 User=astock
 Group=astock
+# Absolute working directory inside the writable state tree. Without it the
+# kernel starts in a read-only directory (the unit has no other default) and
+# any relative path — notably the `work/live/intraday.sqlite3` fallback used
+# when ASTOCK_V2_LIVE_DB is unset — cannot be created before the listener binds.
+WorkingDirectory=__STATE_PATH__
 EnvironmentFile=/etc/astock-v2-rewrite.env
 ExecStart=/opt/astock-v2-rewrite/bin/astock-v2
 Restart=on-failure
 RestartSec=3
+# Creates /var/lib/<state dir> owned by the service user; the databases,
+# settings JSON and research artifacts all live below it.
 StateDirectory=__STATE_DIR__
+StateDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# Explicit write access: the reviewed price sets, the intraday ledger and the
+# settings file stay inside __STATE_PATH__, backups inside __BACKUP_PATH__.
 ReadWritePaths=__STATE_PATH__ __BACKUP_PATH__
 AmbientCapabilities=
 

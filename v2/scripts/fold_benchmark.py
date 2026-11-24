@@ -16,6 +16,18 @@ The benchmark here is the **median return of every symbol that traded on both
 ends of the window**. Median, not mean: the mean is dragged by a handful of
 doublers, and a benchmark nobody can actually hold is not a benchmark.
 
+"The ends of the window" means the market's first and last trading day, not
+each symbol's own first and last row. The first version accepted any symbol
+with enough rows, which quietly admitted two kinds of non-comparable names:
+
+* a listing that started mid-window had no return over the window at all,
+  and its partial move was counted as a full-window one;
+* a name halted for the whole period has rows (reference closes, `tradable=0`)
+  but never traded, so it was priced as a flat zero return.
+
+Both are now excluded, and the counts are reported with the reason, so a thin
+benchmark is visible rather than inferred.
+
 Usage:
     python scripts/fold_benchmark.py --folds folds.json --db market.sqlite3 \
         --results fold-result.json --out benchmark.json
@@ -30,43 +42,94 @@ import sqlite3
 import statistics
 
 
-def market_median_bps(db: Path, start: str, end: str, min_days: int = 10) -> dict:
-    """Median window return across symbols present at both ends.
+def market_bounds(conn: sqlite3.Connection, start: str, end: str) -> tuple[str, str] | None:
+    """First and last market trading day in the window.
 
-    A symbol needs `min_days` observations inside the window, so a name that
-    listed on the last day or halted for the whole period cannot contribute a
-    zero-length return.
+    The union of days any symbol traded on — the same convention the Rust store
+    and the scans use for a market calendar in this database.
+    """
+    row = conn.execute(
+        "SELECT MIN(day), MAX(day) FROM bar "
+        "WHERE adjust='none' AND day BETWEEN ? AND ? AND close_cents > 0",
+        (start, end),
+    ).fetchone()
+    if not row or not row[0] or not row[1]:
+        return None
+    return row[0], row[1]
+
+
+def market_median_bps(db: Path, start: str, end: str, min_days: int = 10) -> dict:
+    """Median window return across symbols that traded at both ends.
+
+    A symbol must have a *tradable* bar on the window's first and last market
+    day. `min_days` remains a floor inside the window so a two-day listing
+    cannot contribute either. The excluded names and why are counted, because a
+    benchmark built from 40 of 5 000 symbols is not the market.
     """
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
+        bounds = market_bounds(conn, start, end)
+        if bounds is None:
+            return {"symbols": 0, "median_bps": None, "mean_bps": None,
+                    "first_day": None, "last_day": None,
+                    "excluded": {}, "note": "no market day in the window"}
+        first_day, last_day = bounds
         rows = conn.execute(
-            "SELECT symbol, day, close_cents FROM bar "
+            "SELECT symbol, day, close_cents, tradable FROM bar "
             "WHERE adjust='none' AND day BETWEEN ? AND ? AND close_cents > 0",
             (start, end),
         ).fetchall()
     finally:
         conn.close()
 
-    series: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    for symbol, day, close in rows:
-        series[symbol].append((day, close))
+    series: dict[str, dict[str, tuple[int, int]]] = defaultdict(dict)
+    for symbol, day, close, tradable in rows:
+        series[symbol][day] = (close, 1 if tradable is None else int(tradable))
 
+    excluded = {"missing_first_day": 0, "missing_last_day": 0,
+                "untradable_at_first_day": 0, "untradable_at_last_day": 0,
+                "too_few_observations": 0}
     returns = []
     for points in series.values():
-        if len(points) < min_days:
+        size = len(points)
+        first = points.get(first_day)
+        last = points.get(last_day)
+        if size < min_days:
+            excluded["too_few_observations"] += 1
             continue
-        points.sort()
-        first, last = points[0][1], points[-1][1]
-        if first <= 0:
+        if first is None:
+            # Listed after the window opened: no window return exists.
+            excluded["missing_first_day"] += 1
             continue
-        returns.append((last - first) * 10_000 // first)
+        if last is None:
+            excluded["missing_last_day"] += 1
+            continue
+        if first[1] != 1:
+            # A halt on the first day: its "close" is a reference price, not a
+            # trade, so a return measured from it is not tradable.
+            excluded["untradable_at_first_day"] += 1
+            continue
+        if last[1] != 1:
+            excluded["untradable_at_last_day"] += 1
+            continue
+        base = first[0]
+        if base <= 0:
+            excluded["untradable_at_first_day"] += 1
+            continue
+        returns.append((last[0] - base) * 10_000 // base)
 
     if not returns:
-        return {"symbols": 0, "median_bps": None, "mean_bps": None}
+        return {"symbols": 0, "median_bps": None, "mean_bps": None,
+                "first_day": first_day, "last_day": last_day,
+                "excluded": excluded,
+                "note": "nobody traded at both ends of the window"}
     return {
         "symbols": len(returns),
         "median_bps": int(statistics.median(returns)),
         "mean_bps": round(statistics.fmean(returns)),
+        "first_day": first_day,
+        "last_day": last_day,
+        "excluded": excluded,
         # The median is the benchmark; the mean is reported so a reader can see
         # how much the tail moves it.
         "note": "median is the benchmark; mean is shown to expose tail weight",
@@ -164,6 +227,10 @@ def main(argv=None) -> int:
             "status": "ok",
             "market_bps": market["median_bps"],
             "market_symbols": market["symbols"],
+            "market_first_day": market.get("first_day"),
+            "market_last_day": market.get("last_day"),
+            # Who was left out of the benchmark, so a thin median is visible.
+            "market_excluded": market.get("excluded"),
             "strat_bps": strat,
             "excess_bps": excess,
             "label": classify(market["median_bps"], excess),
@@ -178,6 +245,9 @@ def main(argv=None) -> int:
             "The benchmark is the median symbol, not a tradable index; it has no fees or turnover.",
             "A median is not what anyone can hold — it is a yardstick for direction, not a rival strategy.",
             "Excess against a falling market is defence, not skill at picking winners.",
+            "Only symbols with a tradable bar on both the window's first and last market "
+            "day are included; listings, delistings and names halted at either end are "
+            "excluded and counted in market_excluded.",
         ],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

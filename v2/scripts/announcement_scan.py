@@ -8,10 +8,14 @@ cannot be used in a backtest at all.
 
 Two things this scan insists on:
 
-* **The factor is measured strictly before the forward window.** An
-  announcement dated `d` is known at the close of `d`, so a decision taken at
-  `d` may count it, and the label starts at `d + 1`. A test asserts that moving
-  the horizon cannot change the factor.
+* **A dated announcement is not usable on its own date.** CNINFO gives a date,
+  not a time of day, so an announcement dated `d` may have appeared after the
+  close of `d`. It therefore counts for a decision taken at `d'` only when
+  `d < d'` -- that is, from the next trading session onward. The label must
+  respect the same rule: it starts at the close of the first session *after*
+  the decision day, never at the decision day's own close. A test asserts that
+  moving the horizon cannot change the factor, and another asserts that the
+  decision-day close never enters the label.
 * **A sign needs more than one window.** With fewer than three windows the
   scan refuses to compute a sign-consistency summary, because one window's
   sign is not a sign.
@@ -30,6 +34,9 @@ import statistics
 
 MIN_POINTS = 60
 HORIZON = 20
+# A daily announcement is only knowable from the next session, so the forward
+# label must start there too: the decision-day close is not a tradable entry.
+LABEL_START_OFFSET = 1
 
 FACTORS = (
     "announcements_5d",
@@ -92,8 +99,14 @@ def load_closes(conn: sqlite3.Connection, start: str, end: str) -> dict[str, lis
 
 
 def factor_value(name: str, days: list[str], decision_day: str) -> float | None:
-    """Value at `decision_day`, counting only announcements dated <= that day."""
-    known = [day for day in days if day <= decision_day]
+    """Value at `decision_day`, counting only announcements dated before that day.
+
+    A CNINFO date carries no time of day, so an announcement dated `d` may have
+    been published after the close of `d`; it is therefore not knowable at a
+    decision taken at `d`. Only strictly earlier dates count, which is exactly
+    "usable from the next trading session onward".
+    """
+    known = [day for day in days if day < decision_day]
     if not known:
         # "No announcement ever" and "no announcement in the window" are
         # different claims; a symbol with no history cannot be scored.
@@ -131,16 +144,20 @@ def scan(announcements, closes, start: str, end: str) -> dict:
         for symbol, series in closes.items():
             if len(series) < MIN_POINTS:
                 continue
-            # The label needs HORIZON sessions after the decision; cut the
-            # series so the decision index is always inside the window.
+            # The factor at bar `index` uses only announcements dated before
+            # that bar, and the label starts one session later: the close that
+            # produced the decision is not a price anyone could still trade at,
+            # and it is also the bar a same-day announcement might have landed
+            # after. Both ends therefore move by one session.
             days_only = [day for day, _ in series]
-            for index in range(MIN_POINTS, len(series) - HORIZON):
+            for index in range(MIN_POINTS, len(series) - HORIZON - LABEL_START_OFFSET):
                 decision_day = days_only[index]
                 value = factor_value(name, announcements.get(symbol, []), decision_day)
                 if value is None:
                     continue
-                base = series[index][1]
-                future = series[index + HORIZON][1]
+                base_index = index + LABEL_START_OFFSET
+                base = series[base_index][1]
+                future = series[base_index + HORIZON][1]
                 if base <= 0:
                     continue
                 values.append(value)
@@ -214,11 +231,16 @@ def main(argv=None) -> int:
     report = {
         "windows": windows,
         "horizon_sessions": HORIZON,
+        "label_start_offset_sessions": LABEL_START_OFFSET,
+        "announcement_availability": "next_tradable_session_after_source_date",
         "summary": summary,
         "ranking": ordered,
-        "note": ("Announcement-dated factors, measured at the close of the decision "
-                 "day and labelled from the next session. A test asserts the "
-                 "factor cannot move when the horizon changes."),
+        "note": ("Announcement-dated factors use only announcements dated strictly "
+                 "before the decision day (a date-precision announcement may be "
+                 "published after that day's close), and the label starts at the "
+                 "next session's close. Tests assert that the factor cannot move "
+                 "when the horizon changes and that the decision-day close never "
+                 "enters the label."),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

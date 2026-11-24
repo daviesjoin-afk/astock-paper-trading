@@ -16,6 +16,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from factor_scan import CANDIDATES, rank_candidates, score  # noqa: E402
+from _probe_stub import make_probe_stub  # noqa: E402
 
 
 def row(name: str, ics: list[int], usable: bool = True) -> dict:
@@ -61,12 +62,10 @@ class TestScore(unittest.TestCase):
     def test_a_probe_failure_is_reported_not_hidden(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            stub = root / "stub.bat"
             script = root / "emit.py"
             script.write_text("import sys; sys.stderr.write('boom'); sys.exit(2)",
                               encoding="utf-8")
-            stub.write_text(f'@echo off\n"{sys.executable}" "{script}"\n',
-                            encoding="utf-8")
+            stub = make_probe_stub(root, script)
             result = score("x", {"momentum": {"window": 20}}, stub, root / "db",
                            ["2025-01-01"], 10)
         self.assertFalse(result["usable"])
@@ -84,9 +83,7 @@ class TestScore(unittest.TestCase):
             script.write_text(
                 f"import sys;sys.stdout.write(open(r'{report}',encoding='utf-8').read())",
                 encoding="utf-8")
-            stub = root / "stub.bat"
-            stub.write_text(f'@echo off\n"{sys.executable}" "{script}"\n',
-                            encoding="utf-8")
+            stub = make_probe_stub(root, script)
             result = score("x", {"momentum": {"window": 20}}, stub, root / "db",
                            periods, 10)
         self.assertTrue(result["usable"])
@@ -105,9 +102,7 @@ class TestScore(unittest.TestCase):
             script.write_text(
                 f"import sys;sys.stdout.write(open(r'{report}',encoding='utf-8').read())",
                 encoding="utf-8")
-            stub = root / "stub.bat"
-            stub.write_text(f'@echo off\n"{sys.executable}" "{script}"\n',
-                            encoding="utf-8")
+            stub = make_probe_stub(root, script)
             result = score("x", {"momentum": {"window": 20}}, stub, root / "db",
                            ["2025-01-01"], 10)
         self.assertFalse(result["usable"])

@@ -481,7 +481,17 @@ async fn ai_advice_from_settings(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
     match res {
-        Ok(advice) => response(json!({ "ok": true, "mode": depth, "advice": advice })),
+        Ok(outcome) => response(json!({
+            "ok": true,
+            "mode": depth,
+            "advice": outcome.advice,
+            "usage": {
+                "prompt_tokens": outcome.prompt_tokens,
+                "cached_prompt_tokens": outcome.cached_prompt_tokens,
+                "total_tokens": outcome.total_tokens,
+                "attempts": outcome.attempts,
+            },
+        })),
         Err(err) => response(json!({ "ok": false, "mode": depth, "error": err, "advice": null })),
     }
 }
@@ -1230,7 +1240,7 @@ async fn live_create_account(
 
 async fn live_account(State(state): State<LiveAppState>) -> LiveApiResult {
     let db = state.reader.lock().await;
-    live_response(db.account_view(None).map_err(live_api_error)?)
+    live_response(db.account_view().map_err(live_api_error)?)
 }
 
 async fn live_round(

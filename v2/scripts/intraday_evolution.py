@@ -363,10 +363,22 @@ def run_trial(root: Path, command: list[str], candidate: dict, archives: list[Pa
     return {**result, 'candidate_id': candidate['candidate_id'], 'days': replay['days']}
 
 
-def advance_trials(root: Path, day: str, command: list[str], expected_bps: float, pilot_stdev_bps: float) -> None:
-    """Freeze the earliest candidate per policy and add later observations."""
-    observations = sorted((root / 'rounds').glob('*.jsonl.gz'))
-    candidates = {}
+def advance_trials(root: Path, day: str, command: list[str], expected_bps: float,
+                   pilot_stdev_bps: float, *,
+                   replay_executable: Path | None = None) -> None:
+    """Freeze the earliest candidate per policy and add later observations.
+
+    ``replay_executable`` is the binary whose hash gates a trial: a trial that
+    was measured against a different build cannot be extended. It has to be
+    passed in (or derivable from ``command[0]``) and has to exist; a missing
+    path must be a clear error, not a hash of whatever ``executable`` happened
+    to name, because the whole point of the hash is to pin the build that
+    produced the numbers.
+
+    A day with no candidate to advance is a normal outcome (most days): the
+    function returns without touching anything.
+    """
+    candidates: dict[str, dict] = {}
     for review_path in sorted((root / 'reviews').glob('*.json')):
         if review_path.stem >= day:
             continue
@@ -374,7 +386,16 @@ def advance_trials(root: Path, day: str, command: list[str], expected_bps: float
         for item in recorded.get('model_review', {}).get('candidates', []):
             policy = validate_policy(item['policy'])
             candidates.setdefault(json.dumps(policy, sort_keys=True), item)
-    with executable.open('rb') as file:
+    if not candidates:
+        return
+    observations = sorted((root / 'rounds').glob('*.jsonl.gz'))
+    if not observations:
+        return  # nothing archived to replay against, so nothing to hash
+    binary = Path(replay_executable) if replay_executable is not None \
+        else Path(command[0])
+    if not binary.is_file():
+        raise ValueError(f'replay executable does not exist: {binary}')
+    with binary.open('rb') as file:
         binary_sha256 = hashlib.file_digest(file, 'sha256').hexdigest()
     pending = 0
     for candidate in candidates.values():
@@ -408,8 +429,14 @@ def advance_trials(root: Path, day: str, command: list[str], expected_bps: float
 
 def daily(db: sqlite3.Connection, root: Path, day: str, history: Path, *, model_on: bool,
           replay_command: list[str] | None = None, expected_bps: float = 25,
-          pilot_stdev_bps: float = 100) -> dict:
-    """Persist each session for later paired runs beyond live audit retention."""
+          pilot_stdev_bps: float = 100,
+          replay_executable: Path | None = None) -> dict:
+    """Persist each session for later paired runs beyond live audit retention.
+
+    ``replay_executable`` pins the build a trial is measured against. It is
+    separate from ``replay_command`` because the command may start a wrapper
+    (``kernel replay-intraday``) while the hash must cover the binary.
+    """
     archive = root / 'rounds' / f'{day}.jsonl.gz'
     result = root / 'reviews' / f'{day}.json'
     evidence = collect(db, day)
@@ -427,7 +454,8 @@ def daily(db: sqlite3.Connection, root: Path, day: str, history: Path, *, model_
         finally:
             temp.unlink(missing_ok=True)
     if replay_command is not None:
-        advance_trials(root, day, replay_command, expected_bps, pilot_stdev_bps)
+        advance_trials(root, day, replay_command, expected_bps, pilot_stdev_bps,
+                       replay_executable=replay_executable)
     if result.exists():
         prior = json.loads(result.read_text(encoding='utf-8'))
         if not model_on or prior['model_review_status'] == 'complete':
@@ -499,15 +527,20 @@ def main() -> int:
             parser.error('daily research requires calendar coverage and price history')
         if any(item['start'] <= day <= item['end'] for item in calendar['holidays']):
             return 0
-        replay_command = None
+        replay_command = replay_binary = None
         if args.kernel is not None:
-            replay_command = [str(args.kernel.resolve()), 'replay-intraday']
+            replay_binary = args.kernel.resolve()
+            replay_command = [str(replay_binary), 'replay-intraday']
         elif args.replay_executable is not None:
-            replay_command = [str(args.replay_executable.resolve())]
+            replay_binary = args.replay_executable.resolve()
+            replay_command = [str(replay_binary)]
+        if replay_binary is not None and not replay_binary.is_file():
+            parser.error(f'replay binary does not exist: {replay_binary}')
         with closing(read_ledger(args.db)) as db:
             result = daily(db, args.root, day, args.history, model_on=args.ai,
                            replay_command=replay_command, expected_bps=args.expected_bps,
-                           pilot_stdev_bps=args.pilot_stdev_bps)
+                           pilot_stdev_bps=args.pilot_stdev_bps,
+                           replay_executable=replay_binary)
         print(json.dumps({'day': day, 'model_review_status': result['model_review_status']}))
         return 2 if args.ai and result['model_review_status'] != 'complete' else 0
     with closing(read_ledger(args.db)) as db:

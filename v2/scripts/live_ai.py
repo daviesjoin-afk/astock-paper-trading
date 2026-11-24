@@ -18,9 +18,13 @@ import urllib.request
 import live_quote_feed as feed
 
 RECENT_TRADES = 8
-# How many ranked candidates the AI observer gets to see. Enough for it to
-# reason about specific names, small enough to stay a summary, not a payload.
-DIGEST_CANDIDATES = 15
+# Ranked names get the full anti-trap detail; the whole tradable market rides
+# along as a compact integer table. Measured on the live model (1M window):
+# 5,210 symbols -> 294 KB / 147k prompt tokens / 5-7 s, and a repeat round hits
+# the prompt cache, so seeing the whole market costs far less than being blind
+# to it.
+DIGEST_CANDIDATES = 40
+MARKET_TABLE_LIMIT = 6_000
 # How many held positions to describe by symbol (with live P&L).
 DIGEST_POSITIONS = 12
 
@@ -33,8 +37,16 @@ LIVE_SYSTEM_PROMPT = """你审查 A 股模拟盘本轮风险，输出建议，�
 - blocked_symbols 限制开仓和加仓。只填有明确禁买依据的代码。同一代码只出现一次，不同时列入禁买和买入建议。证据冲突或不足时，调整值填 0，可使用空列表。风险方向明确时优先使用一个全局调整，避免重复施压。所有数字发出前检查范围。
 
 仅输出 JSON 对象，不能有 Markdown。顶层字段固定，不要输出 slot_recommendations、suggested_orders 或 risk_flags。
-- "confidence" 为 0 至 100 的整数。"bias" 为 -20 至 20 的整数，负值更谨慎。"entry_delta" 为 -15 至 15 的整数，正值提高开仓门槛。"weight_tilt_bps" 为 -1000 至 1000 的整数，表示动量相对形态的偏移。
-- "blocked_symbols" 最多 5 个代码。"suggestions" 最多 8 条，每条用 {"symbol":"输入中的完整代码","side":"buy|sell|hold","score_delta":0,"weight_bps":0} 的结构。score_delta 限 ±20，weight_bps 限 ±2000。
+- "confidence" 为 0 至 100 的整数。"bias" 为 -20 至 20 的整数，负值更谨慎。"entry_delta" 为 -15 至 15 的整数，正值提高开仓门槛（更难买）、负值降低门槛（更容易买）。看空或要求收紧时必须给正值，输出前自检：reason 说防守，entry_delta 就必须是正数。"weight_tilt_bps" 为 -1000 至 1000 的整数，表示动量相对形态的偏移。
+- northbound 是沪股通/深股通当日累计净买入（亿元）及相对首个有效值的 delta。它是外资当日的真实资金方向。**你必须在 market_state.evidence 里写出这两个数值**（例如"沪股通 +379.8 亿 / 深股通 -9.3 亿"），并说明它支持还是不支持本轮的开仓松紧。它只决定整体仓位倾向，不是个股买入依据；缺失时写"未知"，绝不用成交额替代。
+- market_heat 是人气榜与概念标签（前 30）。用来看"市场这轮在炒什么、我的持仓和候选属于哪个题材"：若某候选恰在人气榜且概念与当前热点一致，可作为加分；若候选概念已连续退潮或热度排名大幅下滑，不要追。热度不等于价值，不能单独作为买入依据；不要在 reason 里罗列整张榜。
+- news 是本轮抓到的、标题或摘要里出现你持仓或候选代码/名称的财经快讯与个股新闻。**每轮必须先读 news，并在 reason 里点明它对本轮的影响**（无影响也要说"新闻无实质影响"）。
+  · 涉及立案、处罚、虚假记载、退市风险、业绩暴雷、大额减持等重大负面时：该代码一律不得买入，并列入 blocked_symbols；若已持仓且可卖，应提出卖出，说明依据来自哪条新闻。
+  · 涉及中标、重组、业绩预增、大额增持等实质利好时，只可作为加分项，仍必须通过趋势、均价线、诱多风险的检验才能点名买入。
+  · 只用新闻里写明的信息判断方向，不要臆造数字；标题与摘要冲突或过于笼统时按"不确定"处理，不要为了凑理由把它说成利好或利空。
+  · news 为空表示本轮没有关联新闻，不等于"没有事件"，不要据此推断。
+- own_track_record 是你自己的历史成绩单，按市场状态分组：blocked_symbols.mean_bps 是你禁买后那些股票的平均涨跌（正数说明你拦错了，错过了涨幅）；named_buys.mean_bps 是你点名买入后的平均涨跌（负数说明你点错了）。cases 太少的状态不会出现，不要外推。每轮务必先读它：若某状态下你拦错的平均幅度明显为正，本轮该状态就要明显收紧禁买标准（只拦硬证据，如涨停封板、破均价线、长上影），而不是凭排名靠前就拦；若点名买入长期为负，就不要点名，让内核按自身信号执行。
+- 全市场表里凡触发禁买条件的代码都要写进 "blocked_symbols"（最多 40 个），不要只挑几个。"suggestions" 最多 8 条，每条用 {"symbol":"输入中的完整代码","side":"buy|sell|hold","score_delta":0,"weight_bps":0} 的结构。score_delta 限 ±20，weight_bps 限 ±2000。
 - "reason" 用一句中文写建议和主要依据。"market_state" 用 {"evidence":"可核对的数值或代码","counterpoint":"主要反证或缺失的数据"}，两项各一句。"""
 
 
@@ -148,8 +160,11 @@ def ranked_candidates(quotes: Sequence[Mapping[str, Any]], *,
         amt = quote.get("amount_cents")
         vwap_dist = None
         if isinstance(vol, (int, float)) and isinstance(amt, (int, float)) and vol > 0 and amt > 0:
+            # amount_cents is money, volume is shares, price is cents: the
+            # cents cancel, so turnover price = amount / volume in one unit.
+            # Scaling either side by 100 produced a fake -9,999 bps gap.
             vwap = float(amt) / float(vol)
-            if vwap > 0:
+            if vwap > 0 and 0.2 <= vwap / float(price) <= 5.0:
                 vwap_dist = _pct_bps(float(price) - vwap, vwap)
 
         bull_trap_risk = 0
@@ -198,8 +213,12 @@ def ranked_candidates(quotes: Sequence[Mapping[str, Any]], *,
             entry["vwap_distance_bps"] = vwap_dist
         if upper_wick is not None:
             entry["upper_wick_bps"] = upper_wick
-        if bull_trap_risk > 0:
-            entry["bull_trap_risk"] = bull_trap_risk
+        # Always state the risk score, including a real zero: the prompt asks
+        # the model to reject >= 30, and an absent field reads as "unknown" and
+        # silently disables that rule. Flags stay conditional (they describe
+        # which signals fired).
+        entry["bull_trap_risk"] = bull_trap_risk
+        if trap_flags:
             entry["bull_trap_flags"] = trap_flags
         limit_up = quote.get("limit_up_cents")
         if type(limit_up) is int and limit_up > 0:
@@ -252,8 +271,17 @@ def held_positions(account: Any, quotes: Sequence[Mapping[str, Any]], *,
 
 
 def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Compute real-time cross-sectional market sentiment & bull-trap rate."""
-    total = up = down = flat = strong = weak = limit_up = limit_down = high_surge = bull_trap = 0
+    """Real-time cross-sectional market sentiment, plus the surge-fade share.
+
+    ``surge_fade_rate_bps`` is the share of names that reached +6% intraday and
+    then gave back at least 2% from that high. It is a *price* statistic, not a
+    limit-up board statistic: A-share 炸板率 counts only names that actually
+    touched their limit-up price and then opened, which this measure does not
+    know and cannot know from a quote snapshot. The field is named for what it
+    measures so no reader can mistake one for the other, and it is one input to
+    the temperature, never a verdict about 主力 intent.
+    """
+    total = up = down = flat = strong = weak = limit_up = limit_down = high_surge = surge_fade = 0
     for q in quotes:
         if not isinstance(q, Mapping) or q.get("tradable") is False:
             continue
@@ -275,9 +303,14 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
             weak += 1
         lu = q.get("limit_up_cents")
         ld = q.get("limit_down_cents")
-        if (isinstance(lu, int) and lu > 0 and price >= lu) or chg_bps >= 950:
+        # The 9.5% fallback is only for a row with no published limit. Applied
+        # to a name whose real band is 5% (ST) or 30% (北交所) it invents a
+        # limit-up: on 2026-11-23 it reported 237 against 142 at the ceiling.
+        if (isinstance(lu, int) and lu > 0 and price >= lu) or (
+                not (isinstance(lu, int) and lu > 0) and chg_bps >= 950):
             limit_up += 1
-        if (isinstance(ld, int) and ld > 0 and price <= ld) or chg_bps <= -950:
+        if (isinstance(ld, int) and ld > 0 and price <= ld) or (
+                not (isinstance(ld, int) and ld > 0) and chg_bps <= -950):
             limit_down += 1
         high = q.get("high_cents")
         if isinstance(high, (int, float)) and high > prev:
@@ -286,16 +319,18 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
                 high_surge += 1
                 pullback_bps = int(round((float(high) - float(price)) / max(float(high), 1.0) * 10_000))
                 if pullback_bps >= 200:
-                    bull_trap += 1
+                    surge_fade += 1
     if total == 0:
-        return {"score": 50, "label": "暂无数据", "up_ratio_bps": 0, "bull_trap_rate_bps": 0}
+        return {"score": 50, "label": "暂无数据", "up_ratio_bps": 0,
+                "surge_fade_rate_bps": 0, "surge_fade_count": 0,
+                "surge_fade_basis": "冲高≥6%且较日内高点回落≥2%的占比，不是炸板率"}
     up_ratio_bps = int(round(up * 10_000 / total))
-    bull_trap_rate_bps = int(round(bull_trap * 10_000 / high_surge)) if high_surge > 0 else 0
+    surge_fade_rate_bps = int(round(surge_fade * 10_000 / high_surge)) if high_surge > 0 else 0
     breadth_term = max(-20, min(20, (up_ratio_bps - 5000) // 200))
     tail_term = max(-15, min(15, (strong - weak) * 180 // total))
     limit_term = max(-10, min(10, (limit_up - limit_down) * 250 // total))
-    trap_penalty = max(0, min(15, bull_trap_rate_bps // 500))
-    score = max(0, min(100, 50 + breadth_term + tail_term + limit_term - trap_penalty))
+    fade_penalty = max(0, min(15, surge_fade_rate_bps // 500))
+    score = max(0, min(100, 50 + breadth_term + tail_term + limit_term - fade_penalty))
     label = ("情绪冰点" if score < 25 else "情绪偏冷" if score < 42
              else "情绪中性" if score < 60 else "情绪偏暖" if score < 80 else "情绪亢奋")
     return {
@@ -306,16 +341,20 @@ def compute_market_sentiment(quotes: Sequence[Mapping[str, Any]]) -> dict[str, A
         "weak_count": weak,
         "limit_up_count": limit_up,
         "limit_down_count": limit_down,
-        "bull_trap_count": bull_trap,
-        "bull_trap_rate_bps": bull_trap_rate_bps,
+        "surge_fade_count": surge_fade,
+        "surge_fade_rate_bps": surge_fade_rate_bps,
+        # Spelled out in the payload as well as the prompt: this is the field
+        # most likely to be read as 炸板率, and reading it that way is wrong.
+        "surge_fade_basis": ("冲高≥6%且较日内高点回落≥2%的只数占全部冲高≥6%只数的比例；"
+                             "不等于炸板率（炸板率只统计触板后开板），不能单独据以判定主力意图"),
     }
 
 
-def build_slot_candidates(quotes: Sequence[Mapping[str, Any]], *, limit: int = 8) -> dict[str, list[dict[str, Any]]]:
+def build_slot_candidates(quotes: Sequence[Mapping[str, Any]], *, limit: int = 30) -> dict[str, list[dict[str, Any]]]:
     """Separate, anti-bull-trap candidate pools for steady and aggressive slots."""
     steady_pool: list[tuple[float, dict[str, Any]]] = []
     aggr_pool: list[tuple[float, dict[str, Any]]] = []
-    for item in ranked_candidates(quotes, limit=120):
+    for item in ranked_candidates(quotes, limit=400):
         mom = item.get("momentum_bps") or 0
         pos = item.get("position_in_range_bps")
         amp = item.get("amplitude_bps")
@@ -395,6 +434,30 @@ def extract_bull_trap_lessons(
     return lessons
 
 
+MARKET_TABLE_COLUMNS = (
+    "symbol", "momentum_bps", "position_in_range_bps", "amplitude_bps",
+    "vwap_distance_bps", "upper_wick_bps", "bull_trap_risk", "distance_to_limit_up_bps",
+)
+
+
+def market_table(quotes: Sequence[Mapping[str, Any]], *,
+                 limit: int = MARKET_TABLE_LIMIT) -> dict[str, Any]:
+    """Every tradable symbol as one compact integer row, strongest first.
+
+    Coding the columns once keeps a full-market view inside a fraction of the
+    window instead of repeating keys 5,210 times. Null means unknown; a symbol
+    missing a previous close is absent rather than scored on a fake zero, so the
+    model cannot mistake an unreported price for a flat one.
+    """
+    rows = [[item.get(column) for column in MARKET_TABLE_COLUMNS]
+            for item in ranked_candidates(quotes, limit=limit)]
+    return {
+        "cols": list(MARKET_TABLE_COLUMNS),
+        "rows": rows,
+        "note": "全市场可交易标的，按动量降序；null 表示该字段未知。",
+    }
+
+
 def market_digest(snapshot: Mapping[str, Any], *, account: Any,
                   trades: Any) -> dict[str, Any]:
     """A state summary the observer can actually reason about.
@@ -450,6 +513,7 @@ def market_digest(snapshot: Mapping[str, Any], *, account: Any,
     return {
         "quote_time": snapshot.get("quote_time"),
         "quote_time_estimated": bool(snapshot.get("quote_time_estimated")),
+        "market_table": market_table(quotes),
         "sample_count": len(quotes),
         "change_distribution": {"up": up, "down": down, "flat": flat},
         "average_amplitude_bps": (round(sum(amplitudes) * 10_000 / len(amplitudes))
@@ -582,6 +646,85 @@ def _provider_tokens(payload: Any) -> dict[str, int | None]:
     }
 
 
+# Keys that hold the whole market table and the account books. They change only
+# when a position or a quote changes, and putting them AFTER the volatile block
+# would defeat the prompt cache, so they lead.
+# Only facts that are byte-identical across rounds. The slot books carry
+# cash/equity, which moves with every fill, so they stay volatile.
+STABLE_DIGEST_KEYS = ("resident_memory", "market_table", "own_track_record",
+                      "recent_bull_trap_lessons", "account_as_of_round_id")
+
+
+def attach_track_record(digest: dict[str, Any], card: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Give the observer its own measured track record.
+
+    Without this the model reasons from first principles every round and cannot
+    notice that, say, its blocks in `mixed` sessions gave up 144 bps on average
+    while its named buys lost 122. The numbers come from the committed ledger,
+    scored at the same session's close; a regime below the case floor is omitted
+    rather than shown as a confident-looking average of a handful of names.
+    """
+    if card:
+        digest["own_track_record"] = card
+    return digest
+
+
+def attach_northbound(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Add the published northbound net-buy series for this morning."""
+    if block:
+        digest["northbound"] = block
+    return digest
+
+
+def attach_hot(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Add the market heat list and its concept tags, when the source returned it."""
+    if block and block.get("items"):
+        digest["market_heat"] = block
+    return digest
+
+
+def attach_news(digest: dict[str, Any], block: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Add the symbol-linked headlines, when any were found for this round."""
+    if block and block.get("items"):
+        digest["news"] = block
+    return digest
+
+
+def attach_resident_memory(digest: dict[str, Any], block: str | None) -> dict[str, Any]:
+    """Inject the small always-on memory tier, bounded by the writer.
+
+    This is the resident layer of the three-tier design: a few dozen lines that
+    ride in every round, unlike ``own_track_record`` which is the searchable
+    evidence and unlike the trial ledger which is only read when deciding a
+    change.
+    """
+    if block:
+        digest["resident_memory"] = block
+    return digest
+
+
+def digest_messages(system_prompt: str, digest: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Order the payload so the cached prefix is as long as possible.
+
+    A provider caches the longest common prefix of the prompt. Serialising the
+    dict in its natural order put the minute-by-minute fields first, so every
+    round diverged in the opening kilobytes and the measured hit rate was 0.2%.
+    Stable structure leads; the volatile tail follows.
+    """
+    stable = {key: digest[key] for key in STABLE_DIGEST_KEYS if key in digest}
+    volatile = {key: value for key, value in digest.items() if key not in stable}
+    # ``sort_keys`` would alphabetise the wrapper and put "round" ahead of
+    # "stable", shortening the cached prefix by the whole market table. Sort
+    # inside each block instead and keep the two-block order explicit.
+    payload = ('{"stable":' + json.dumps(dict(sorted(stable.items())), ensure_ascii=False)
+               + ',"round":' + json.dumps(dict(sorted(volatile.items())), ensure_ascii=False)
+               + '}')
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": payload},
+    ]
+
+
 def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
                model: str, timeout: float = 30.0,
                opener: Callable[..., Any] = urllib.request.urlopen,
@@ -599,8 +742,13 @@ def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
     body = {
         "model": model,
         "temperature": 0.2,
-        "max_tokens": 2_000,
+        "max_tokens": 1_200,
         "response_format": {"type": "json_object"},
+        # Measured on the live model: with reasoning enabled the 2,000-token
+        # budget was spent entirely on hidden reasoning and the reply was empty
+        # every round, so the scheduler paid for a retry each time. Asking for
+        # the JSON directly answers in ~3s for ~4.9k tokens instead.
+        "thinking": {"type": "disabled"},
     }
     reason = "empty_completion"
     attempts = 0
@@ -613,7 +761,10 @@ def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
                 reason = "reasoning_retry_budget_exhausted"
                 break
             request_timeout = min(retry_limit, remaining)
-            body["thinking"] = {"type": "disabled"}
+            # The first call already asked for direct JSON; the fallback is for
+            # a provider that rejects that switch, so allow reasoning room.
+            body.pop("thinking", None)
+            body["max_tokens"] = 8_000
             if log:
                 log.emit("ai_retry", round_id=round_id, reason=reason,
                          elapsed_ms=round(elapsed * 1_000))
@@ -623,11 +774,7 @@ def raw_advice(digest: Mapping[str, Any], *, base_url: str, api_key: str,
         status = "request_error"
         try:
             if attempt == 1:
-                body["messages"] = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(
-                        digest, ensure_ascii=False, allow_nan=False)},
-                ]
+                body["messages"] = digest_messages(system_prompt, digest)
             request = urllib.request.Request(
                 base_url.rstrip("/") + "/chat/completions",
                 data=json.dumps(body, ensure_ascii=False).encode("utf-8"),

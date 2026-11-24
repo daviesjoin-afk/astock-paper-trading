@@ -84,16 +84,17 @@ class TestMarketMedian(unittest.TestCase):
         self.db = Path(self.tmp.name) / "m.sqlite3"
         conn = sqlite3.connect(self.db)
         conn.executescript(
-            "CREATE TABLE bar(symbol TEXT, day TEXT, close_cents INTEGER, adjust TEXT);"
+            "CREATE TABLE bar(symbol TEXT, day TEXT, close_cents INTEGER, adjust TEXT, "
+            "tradable INTEGER);"
         )
         # Three symbols: +100%, +0%, -50% over the window.
         rows = []
         for index in range(12):
             day = f"2024-01-{index + 1:02d}"
-            rows.append(("A", day, 1000 + index * 100, "none"))
-            rows.append(("B", day, 1000, "none"))
-            rows.append(("C", day, 1000 - index * 40, "none"))
-        conn.executemany("INSERT INTO bar VALUES(?,?,?,?)", rows)
+            rows.append(("A", day, 1000 + index * 100, "none", 1))
+            rows.append(("B", day, 1000, "none", 1))
+            rows.append(("C", day, 1000 - index * 40, "none", 1))
+        conn.executemany("INSERT INTO bar VALUES(?,?,?,?,?)", rows)
         conn.commit()
         conn.close()
 
@@ -108,13 +109,38 @@ class TestMarketMedian(unittest.TestCase):
 
     def test_short_series_are_excluded(self):
         conn = sqlite3.connect(self.db)
-        conn.execute("INSERT INTO bar VALUES('D','2024-01-01',500,'none')")
-        conn.execute("INSERT INTO bar VALUES('D','2024-01-12',900,'none')")
+        conn.execute("INSERT INTO bar VALUES('D','2024-01-01',500,'none',1)")
+        conn.execute("INSERT INTO bar VALUES('D','2024-01-12',900,'none',1)")
         conn.commit()
         conn.close()
         # D has only 2 observations, below the min_days floor.
         result = market_median_bps(self.db, "2024-01-01", "2024-01-12", min_days=5)
         self.assertEqual(result["symbols"], 3)
+
+    def test_a_halt_with_only_reference_closes_is_excluded(self):
+        # A name suspended through the window carries rows, but at tradable=0.
+        # A return measured off a reference close was never available to trade.
+        conn = sqlite3.connect(self.db)
+        for index in range(12):
+            conn.execute("INSERT INTO bar VALUES('H',?,800,'none',0)",
+                         (f"2024-01-{index + 1:02d}",))
+        conn.commit()
+        conn.close()
+        result = market_median_bps(self.db, "2024-01-01", "2024-01-12")
+        self.assertEqual(result["symbols"], 3)
+        self.assertEqual(result["excluded"].get("untradable_at_first_day"), 1)
+
+    def test_a_symbol_missing_the_first_day_is_excluded(self):
+        # Its first row is 2024-01-02, so its "window return" starts a day late.
+        conn = sqlite3.connect(self.db)
+        for index in range(1, 12):
+            conn.execute("INSERT INTO bar VALUES('L',?,1000,'none',1)",
+                         (f"2024-01-{index + 1:02d}",))
+        conn.commit()
+        conn.close()
+        result = market_median_bps(self.db, "2024-01-01", "2024-01-12")
+        self.assertEqual(result["symbols"], 3)
+        self.assertEqual(result["excluded"].get("missing_first_day"), 1)
 
     def test_empty_window_returns_none_not_zero(self):
         result = market_median_bps(self.db, "2030-01-01", "2030-12-31")

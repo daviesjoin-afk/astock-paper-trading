@@ -15,6 +15,12 @@ Method, per trading day (cross-section):
    - past 5-day return volatility
 3. Keep the residual, rank it, and correlate with the forward 5-day return.
 
+The forward return ends on the market's fifth session after the factor day, not
+on the symbol's own fifth remaining row. A halted name has fewer rows than a
+name that traded throughout, so counting its own rows made a three-session move
+and a five-session move the same label. A symbol with no bar on the market
+label day is dropped from that cross-section, and the count is reported.
+
 If the residual IC stays near the raw IC, `klow` carries information that those
 controls do not. If it collapses, the factor was a repackaging of them.
 
@@ -177,6 +183,70 @@ def industry_on(book: dict[str, list[tuple[str, str]]], symbol: str, day: str) -
     return entries[index][1]
 
 
+def market_calendar(series: dict[str, list]) -> list[str]:
+    """The market's tradable days: the union of every symbol's sessions.
+
+    The label endpoint is counted on this calendar rather than on each symbol's
+    own rows. A name that halted for a week does not shorten the market's
+    window; it simply has no close on some of those days.
+    """
+    return sorted({bar[0] for bars in series.values() for bar in bars})
+
+
+def build_observations(series: dict[str, list], industry: dict, horizon: int,
+                       max_abs_forward: int = 2_500) -> tuple[dict[str, list], dict]:
+    """Collect per-day cross-sections on the market's own session grid.
+
+    For each decision day, `klow`, its controls, and the forward return over
+    the market's `horizon`-th next session. A symbol with no bar on the label
+    day is excluded from that day's cross-section; the alternative — reaching
+    for its own nearer row — compares a 3-day move with a 5-day one.
+
+    Returns `(per_day, stats)`; `stats` counts what was dropped and why, so a
+    thin cross-section is visible instead of inferred.
+    """
+    calendar = market_calendar(series)
+    position = {day: index for index, day in enumerate(calendar)}
+    per_day: dict[str, list] = collections.defaultdict(list)
+    stats = {"calendar_sessions": len(calendar), "missing_label_endpoint": 0}
+
+    for symbol, bars in series.items():
+        if len(bars) < 12:
+            continue
+        closes = [bar[3] for bar in bars]
+        by_day = {bar[0]: index for index, bar in enumerate(bars)}
+        for day, index in by_day.items():
+            if index < 6:
+                continue
+            grid = position.get(day)
+            if grid is None or grid + horizon >= len(calendar):
+                continue
+            label_day = calendar[grid + horizon]
+            label_index = by_day.get(label_day)
+            if label_index is None:
+                stats["missing_label_endpoint"] += 1
+                continue
+            _d, open_c, low, close, amount = bars[index]
+            value = klow_bps(open_c, low, close)
+            if value is None:
+                continue
+            past = [
+                (closes[j] - closes[j - 1]) * 10_000 // closes[j - 1]
+                for j in range(index - 4, index + 1)
+                if closes[j - 1] > 0
+            ]
+            if len(past) < 5:
+                continue
+            vol = statistics.pstdev(past)
+            future = (closes[label_index] - close) * 10_000 // close
+            if abs(future) > max_abs_forward:
+                continue
+            code = industry_on(industry, symbol, day)
+            per_day[day].append((float(value), code, math.log1p(max(1, amount)),
+                                 float(vol), float(future)))
+    return per_day, stats
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True)
@@ -200,30 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     for symbol, day, open_c, low, close, amount in rows:
         series[symbol].append((day, open_c, low, close, amount))
 
-    # Per day: (klow, industry, log amount, past volatility, forward return)
-    per_day: dict[str, list] = collections.defaultdict(list)
-    for symbol, bars in series.items():
-        if len(bars) < 12:
-            continue
-        closes = [b[3] for b in bars]
-        for index in range(6, len(bars) - args.horizon):
-            day, open_c, low, close, amount = bars[index]
-            value = klow_bps(open_c, low, close)
-            if value is None:
-                continue
-            past = [
-                (closes[j] - closes[j - 1]) * 10_000 // closes[j - 1]
-                for j in range(index - 4, index + 1)
-                if closes[j - 1] > 0
-            ]
-            if len(past) < 5:
-                continue
-            vol = statistics.pstdev(past)
-            future = (closes[index + args.horizon] - close) * 10_000 // close
-            if abs(future) > 2_500:
-                continue
-            code = industry_on(industry, symbol, day)
-            per_day[day].append((float(value), code, math.log1p(max(1, amount)), float(vol), float(future)))
+    # Per day: (klow, industry, log amount, past volatility, forward return).
+    # Days come from the market calendar, so every forward return in one
+    # cross-section spans the same number of sessions.
+    per_day, observation_stats = build_observations(series, industry, args.horizon)
 
     results = {}
     for label, use_industry, use_size, use_vol in (
@@ -262,7 +312,14 @@ def main(argv: list[str] | None = None) -> int:
         }
 
     payload = {"db": args.db, "horizon_days": args.horizon,
-               "symbols": len(series), "results": results}
+               "symbols": len(series), "results": results,
+               "market_sessions": observation_stats["calendar_sessions"],
+               "skipped_label_endpoint": observation_stats["missing_label_endpoint"],
+               "label_endpoint_rule": (
+                   "the label ends on the market's `horizon`-th session after the "
+                   "decision day; a symbol with no bar that day is dropped from "
+                   "that cross-section"
+               )}
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)

@@ -65,10 +65,12 @@ class TestNoLookAhead(unittest.TestCase):
         # Two series identical up to the decision bar and different after it must
         # produce identical factor values. This is the guard the volume scan
         # earned the hard way.
-        head = [point(f"d{i}", 1_000 + (i % 5), 1_020 + (i % 7), 980 - (i % 3), 1_000, 1_000)
+        # Day names must sort in chronological order: the decision day is
+        # located by date on a calendar, so "d10" before "d9" would move it.
+        head = [point(f"d{i:03d}", 1_000 + (i % 5), 1_020 + (i % 7), 980 - (i % 3), 1_000, 1_000)
                 for i in range(80)]
-        rising = head + [point(f"e{i}", 1_000, 1_500, 1_000, 1_400, 1_000) for i in range(20)]
-        falling = head + [point(f"e{i}", 1_000, 1_050, 600, 700, 1_000) for i in range(20)]
+        rising = head + [point(f"e{i:03d}", 1_000, 1_500, 1_000, 1_400, 1_000) for i in range(20)]
+        falling = head + [point(f"e{i:03d}", 1_000, 1_050, 600, 700, 1_000) for i in range(20)]
         for name in ("upper_shadow_ratio", "close_location", "body_ratio", "gap_bps"):
             a = factor_values({"A": rising}, name)
             b = factor_values({"A": falling}, name)
@@ -77,17 +79,19 @@ class TestNoLookAhead(unittest.TestCase):
 
     def test_the_label_starts_after_the_decision_bar(self):
         # Flat first 80 sessions, then a doubling: the label sees only the rise.
-        head = [point(f"d{i}", 1_000, 1_000, 1_000, 1_000, 1_000) for i in range(80)]
-        tail = [point(f"e{i}", 1_000, 1_000, 1_000, 1_000 * 2 ** i, 1_000) for i in range(1, 21)]
+        head = [point(f"d{i:03d}", 1_000, 1_000, 1_000, 1_000, 1_000) for i in range(80)]
+        tail = [point(f"e{i:03d}", 1_000, 1_000, 1_000, 1_000 * 2 ** i, 1_000)
+                for i in range(1, 21)]
         result = forward_returns({"A": head + tail})
         self.assertGreater(result["A"], 0)
 
     def test_a_series_that_only_moves_before_the_split_has_no_label_move(self):
         # The last pre-split close must equal the flat tail, otherwise the split
         # itself is a move and the label is correctly non-zero.
-        head = [point(f"d{i}", 1_000, 1_000, 1_000, 1_000 + i * 5, 1_000) for i in range(79)]
-        head.append(point("d79", 1_395, 1_395, 1_395, 1_395, 1_390))
-        tail = [point(f"e{i}", 1_395, 1_395, 1_395, 1_395, 1_395) for i in range(20)]
+        head = [point(f"d{i:03d}", 1_000, 1_000, 1_000, 1_000 + i * 5, 1_000)
+                for i in range(79)]
+        head.append(point("d079", 1_395, 1_395, 1_395, 1_395, 1_390))
+        tail = [point(f"e{i:03d}", 1_395, 1_395, 1_395, 1_395, 1_395) for i in range(20)]
         self.assertEqual(forward_returns({"A": head + tail})["A"], 0.0)
 
 

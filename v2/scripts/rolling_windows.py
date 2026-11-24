@@ -5,7 +5,7 @@ One held-out window gives one number. One number cannot distinguish "the
 strategy works" from "this year happened to suit it". This module builds the
 successive (train, test) pairs that turn one number into a distribution.
 
-The two rules it enforces, both learned from getting them wrong:
+The rules it enforces, all learned from getting them wrong:
 
 1. **No overlap.** The test window must start strictly after the training
    window ends. A share-by-one-day overlap silently turns an out-of-sample
@@ -14,6 +14,12 @@ The two rules it enforces, both learned from getting them wrong:
    (Qlib's `ROLL_EX`): each fold adds history. A fixed-width rolling window is
    available, but it discards old data and is a different claim — so it is
    opt-in, not the default.
+3. **Overlapping test windows are declared, not implied.** A `--step-days`
+   shorter than `--test-days` reuses test days in later folds. The capability
+   stays (a sliding window is sometimes what you want), but every fold now
+   carries how many days it reuses from the fold before it, and the summary
+   states `test_windows_overlap`. Downstream aggregation must not call such
+   folds independent samples — the count overstates the evidence.
 
 Usage:
     python scripts/rolling_windows.py --start 2023-01-03 --end 2026-11-11 \
@@ -24,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 
 def parse_day(raw: str) -> tuple[int, int, int]:
@@ -70,6 +77,7 @@ def build_folds(
     folds: list[dict] = []
     index = 0
     fold = 0
+    previous_test_end: int | None = None
     while True:
         train_end_index = min_train_days - 1 + index
         test_start_index = train_end_index + 1
@@ -89,32 +97,101 @@ def build_folds(
         assert train_end < test_start, (
             f"fold {fold} would leak: train ends {train_end}, test starts {test_start}"
         )
+        # How many of this fold's test days the previous fold already tested.
+        # A `step_days` shorter than `test_days` produces a positive count, and
+        # those folds are not independent samples of the configuration.
+        reused = 0
+        if previous_test_end is not None and test_start_index <= previous_test_end:
+            reused = previous_test_end - test_start_index + 1
         folds.append({
             "fold": fold,
             "train": [train_start, train_end],
             "test": [test_start, test_end],
             "train_days": train_end_index - train_start_index + 1,
             "test_days": test_days,
+            "overlaps_previous": reused > 0,
+            "reused_test_days": reused,
         })
+        previous_test_end = test_end_index
         fold += 1
         index += step_days
     return folds
 
 
+def test_window_overlaps(folds: list[dict]) -> dict:
+    """Whether successive test windows share days, and how many.
+
+    This is a fact about the fold set, not a style choice: overlapping test
+    windows mean the folds are not independent draws, so a "four of five folds
+    positive" claim is counting the same days twice.
+    """
+    pairs = []
+    for earlier, later in zip(folds, folds[1:]):
+        reused = later.get("reused_test_days")
+        if reused is None:
+            reused = 0
+            if later["test"][0] <= earlier["test"][1]:
+                reused = sum(1 for day in _days_between(later["test"][0], later["test"][1])
+                             if day <= earlier["test"][1])
+        pairs.append({"earlier_fold": earlier["fold"], "later_fold": later["fold"],
+                      "reused_days": reused})
+    total = sum(pair["reused_days"] for pair in pairs)
+    return {
+        "test_windows_overlap": total > 0,
+        "reused_test_days": total,
+        "pairs": pairs,
+    }
+
+
+def _days_between(start: str, end: str) -> list[str]:
+    """Calendar strings between two `YYYY-MM-DD` bounds, inclusive.
+
+    Only used for fold specs that were written before `reused_test_days`
+    existed; the day count there is an upper bound on reused sessions, which is
+    enough to flag the overlap rather than to quantify it.
+    """
+    from datetime import date, timedelta
+
+    def parse(day: str) -> date:
+        year, month, day_of_month = parse_day(day)
+        return date(year, month, day_of_month)
+
+    days = []
+    cursor, last = parse(start), parse(end)
+    while cursor <= last:
+        days.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return days
+
+
 def summarize(folds: list[dict]) -> dict:
     if not folds:
         return {"folds": 0, "note": "history too short for one fold"}
-    return {
+    overlap = test_window_overlaps(folds)
+    summary = {
         "folds": len(folds),
         "first_train_start": folds[0]["train"][0],
         "last_test_end": folds[-1]["test"][1],
         "train_days": [fold["train_days"] for fold in folds],
         "test_days": [fold["test_days"] for fold in folds],
-        "note": (
-            "Every test window starts strictly after its training window ends. "
-            "One fold is one sample; the point of several is the spread."
-        ),
+        **overlap,
     }
+    if overlap["test_windows_overlap"]:
+        summary["independent_samples"] = False
+        summary["note"] = (
+            "Test windows overlap: "
+            f"{overlap['reused_test_days']} test days are reused by a later fold. "
+            "The folds are a sliding window over the same days, not independent "
+            "samples, and a 'N of M folds' count overstates the evidence."
+        )
+    else:
+        summary["independent_samples"] = True
+        summary["note"] = (
+            "Every test window starts strictly after its training window ends, and "
+            "no test day is reused. One fold is one sample; the point of several "
+            "is the spread."
+        )
+    return summary
 
 
 def main(argv=None) -> int:
@@ -157,6 +234,8 @@ def main(argv=None) -> int:
         "source": source,
         "mode": "rolling" if args.rolling else "expanding",
         "calendar_days": len(days),
+        "test_days_requested": args.test_days,
+        "step_days_requested": args.step_days,
         "folds": folds,
         "summary": summarize(folds),
     }
@@ -165,8 +244,13 @@ def main(argv=None) -> int:
 
     print(json.dumps(report["summary"], ensure_ascii=False))
     for fold in folds:
+        note = (f" [reuses {fold['reused_test_days']}d from fold {fold['fold'] - 1}]"
+                if fold["overlaps_previous"] else "")
         print(f"  fold {fold['fold']}: train {fold['train'][0]}..{fold['train'][1]} "
-              f"({fold['train_days']}d) -> test {fold['test'][0]}..{fold['test'][1]}")
+              f"({fold['train_days']}d) -> test {fold['test'][0]}..{fold['test'][1]}{note}")
+    if report["summary"]["test_windows_overlap"]:
+        print("WARNING: test windows overlap; these are not independent samples.",
+              file=sys.stderr)
     return 0
 
 

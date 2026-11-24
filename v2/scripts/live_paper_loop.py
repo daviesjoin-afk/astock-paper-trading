@@ -32,6 +32,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_quote_feed as feed  # noqa: E402
 from live_ai import (
+    attach_hot,
+    attach_northbound,
+    attach_news,
+    attach_resident_memory,
+    attach_track_record,
     DIGEST_CANDIDATES, DIGEST_POSITIONS, LIVE_SYSTEM_PROMPT, RECENT_TRADES,
     Log, _parse_model_json, held_positions, json_line, market_digest,
     ranked_candidates, raw_advice,
@@ -44,6 +49,13 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_LOG_PATH = (Path(__file__).resolve().parent.parent
                     / "work" / "live" / "intraday-loop.log")
 MORNING_OPEN, MORNING_CLOSE = time_cls(9, 30), time_cls(11, 30)
+# How many ranked candidates join the holdings in the news watch list. This
+# only widens substring matching against the market wires already fetched, so
+# it costs no extra request; the cap stops a broad-market digest from being
+# dominated by candidates at the expense of the names actually held.
+NEWS_CANDIDATE_LIMIT = 20
+# How many held symbols get the (slower) per-symbol news request.
+NEWS_PER_SYMBOL_LIMIT = 6
 # Safety valve: if the clock never reaches a session after this many
 # sleep-to-open cycles, exit and let the supervisor restart us.
 MAX_CONSECUTIVE_WAITS = 5
@@ -157,6 +169,79 @@ def round_identity(snapshot: Mapping[str, Any]) -> tuple[str, str]:
     return f"{day}-{local:%H%M%S}", day
 
 
+MAX_QUOTE_AGE = timedelta(minutes=10)
+"""How old a quote may be and still be priced or filled.
+
+The Rust live-loop refuses a snapshot it cannot date inside the session day;
+the Python scheduler used to accept a snapshot whose source time was missing
+(flagged only in a log line) and then waited through a multi-second AI call
+before posting it. A stale or estimated quote could therefore be scored, valued
+and filled. Same rule here, applied again *after* the AI call, because that wait
+is long enough for a fresh quote to become stale.
+"""
+
+
+class StaleQuote(LoopError):
+    """The snapshot cannot be trusted as a live price for this round."""
+
+
+def require_fresh_quote(snapshot: Mapping[str, Any], *,
+                        now: datetime | None = None,
+                        elapsed: timedelta | None = None) -> datetime:
+    """Return the round's reference time, or raise if it may not trade.
+
+    Three separate questions, and only the first two can be answered by the
+    snapshot alone:
+
+    * **When was this snapshot taken?** `fetched_at` is our own clock at fetch
+      time; `quote_time` is the *source's* own observation time when the source
+      supplies one. `tencent_quote` does not — it returns prices with no
+      timestamp at all — so `quote_time` there is our fetch clock, flagged
+      `quote_time_estimated`. That flag means "unverified provenance", not
+      "stale": refusing every such round stalled the whole scheduler for a
+      session, which is the opposite of fail-closed.
+    * **How long have we held it?** `elapsed`, measured across the AI call.
+    * **Is the market open?** A quote fetched outside the session cannot be
+      traded regardless of provenance.
+
+    So: refuse when provenance is unknown *and* the fetch clock is outside the
+    session, or when we have held the snapshot too long. Pass a verified source
+    time when one exists.
+    """
+    fetched = feed.source_datetime(snapshot.get("fetched_at"))
+    observed = feed.source_datetime(snapshot.get("quote_time"))
+    estimated = bool(snapshot.get("quote_time_estimated"))
+    reference = (now or fetched or datetime.now(tz=timezone.utc)).astimezone(feed.SHANGHAI)
+    if elapsed is not None and elapsed > MAX_QUOTE_AGE:
+        raise StaleQuote(
+            f"quote_stale: held for {elapsed.total_seconds():.0f}s before posting")
+    if estimated or observed is None:
+        # Provenance unknown: the snapshot is only usable if we took it inside
+        # the session ourselves. Any other case is an untradeable guess.
+        if not in_session(reference, time_cls(15, 0)):
+            raise StaleQuote(
+                "quote_not_self_dated: the source did not date its quote and it "
+                f"was fetched outside the session ({reference.isoformat()})")
+        return reference
+    local = observed.astimezone(feed.SHANGHAI)
+    if fetched is not None:
+        age = fetched.astimezone(feed.SHANGHAI) - local
+        if age > MAX_QUOTE_AGE:
+            raise StaleQuote(
+                f"quote_stale: observed {local.isoformat()} was already "
+                f"{age.total_seconds():.0f}s old when fetched")
+        if age < -MAX_QUOTE_AGE:
+            raise StaleQuote(
+                f"quote_from_the_future: observed {local.isoformat()} leads its own fetch")
+    if now is not None:
+        drift = now.astimezone(feed.SHANGHAI) - local
+        if drift > MAX_QUOTE_AGE:
+            raise StaleQuote(
+                f"quote_stale: observed {local.isoformat()} is "
+                f"{drift.total_seconds():.0f}s behind the scheduler")
+    return local
+
+
 def blocked_top3(decisions: Any) -> list[list[Any]]:
     reasons = Counter(
         item.get("blocked_reason")
@@ -255,12 +340,14 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
                  quote_time=snapshot.get("quote_time"))
         return False
     try:
+        require_fresh_quote(snapshot)
         round_id, day = round_identity(snapshot)
     except LoopError as error:
         log.emit("round_skipped", reason=str(error),
                  quote_time=snapshot.get("quote_time"))
         return False
     state.start_day(day)
+    held_since = time.monotonic()
 
     advice = None
     if config.ai_on:
@@ -274,18 +361,67 @@ def run_round(*, config: "Config", kernel: Kernel, log: Log,
         except Exception as error:  # noqa: BLE001 - digest state is optional
             log.emit("trades_read_failed", reason=str(error))
         digest = market_digest(snapshot, account=account, trades=trades)
+        # The observer is otherwise stateless: it cannot see that its own blocks
+        # in this regime gave up real gains. Load the measured record once per
+        # session and hand it over, so advice is conditioned on its own results.
+        # Which names deserve a news lookup: what we hold, plus what the ranking
+        # surfaced. Searching the whole market would add latency for noise.
+        held, candidates = news_watch_scope(digest)
+        # Per-symbol lookups are the slow part, so only holdings get one; the
+        # ranked names still match against the two market wires already in hand.
+        news_block = fetch_news_block(snapshot, held + candidates,
+                                      per_symbol_watch=held[:NEWS_PER_SYMBOL_LIMIT])
+        digest = attach_news(digest, news_block)
+        digest = attach_hot(digest, fetch_heat_block())
+        digest = attach_northbound(digest, fetch_northbound_block())
+        digest = attach_track_record(digest, config.track_record)
+        if config.resident_memory:
+            digest = attach_resident_memory(digest, config.resident_memory)
         settings_used = False
         try:
-            settings_resp = kernel.post("/v2/settings/ai-advice", digest)
+            # `urllib`'s timeout bounds a single socket operation, not the
+            # handshake: an unreachable provider leaves connect() in SYN-SENT
+            # and the call hangs far past any per-op timer. Give the whole
+            # request a wall-clock deadline so one dead endpoint cannot cost
+            # the session its rounds.
+            settings_resp = _with_deadline(
+                lambda: kernel.post("/v2/settings/ai-advice", digest),
+                seconds=AI_DEADLINE_SECS, label="ai")
             if isinstance(settings_resp, dict) and (settings_resp.get("ok") or settings_resp.get("disabled")):
                 advice = settings_resp.get("advice")
                 settings_used = True
+                # The kernel owns this call, so only it can report what the
+                # provider billed. Without this the round logged no usage at all
+                # and prompt-cache behaviour was invisible.
+                usage = settings_resp.get("usage") or {}
+                log.emit("ai_usage", round_id=round_id, attempt=usage.get("attempts") or 1,
+                         model=config.llm_model, status="completed",
+                         prompt_tokens=usage.get("prompt_tokens"),
+                         cached_prompt_tokens=usage.get("cached_prompt_tokens"),
+                         total_tokens=usage.get("total_tokens"),
+                         path="settings")
         except Exception:  # noqa: BLE001 - fall back to direct raw_advice if endpoint unavailable
             settings_used = False
         if not settings_used:
-            advice = raw_advice(digest, base_url=config.llm_base,
-                                api_key=config.llm_key, model=config.llm_model,
-                                opener=config.opener, log=log, round_id=round_id)
+            # Give the transport a timeout inside the deadline so it fails on
+            # its own terms and logs a real reason, rather than being abandoned.
+            advice = _with_deadline(
+                lambda: raw_advice(digest, base_url=config.llm_base,
+                                   api_key=config.llm_key, model=config.llm_model,
+                                   timeout=AI_DEADLINE_SECS - 2,
+                                   opener=config.opener, log=log, round_id=round_id),
+                seconds=AI_DEADLINE_SECS, label="ai-direct")
+
+    # The AI call can take long enough for the quote to age out; the freshness
+    # rule has to hold at the moment of posting, not only at ingest.
+    if config.ai_on:
+        try:
+            require_fresh_quote(
+                snapshot, elapsed=timedelta(seconds=time.monotonic() - held_since))
+        except StaleQuote as error:
+            log.emit("round_skipped", round_id=round_id, reason=str(error),
+                     quote_time=snapshot.get("quote_time"))
+            return False
 
     payload = {
         "round_id": round_id,
@@ -344,12 +480,16 @@ class Config:
                  opener: Callable[..., Any] = urllib.request.urlopen,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sleep: Callable[[float], None] = time.sleep,
-                 feed_builder: Callable[..., Mapping[str, Any]] | None = None):
+                 feed_builder: Callable[..., Mapping[str, Any]] | None = None,
+                 track_record: Mapping[str, Any] | None = None,
+                 resident_memory: str | None = None):
         self.api, self.universe, self.history_db = api, universe, history_db
         self.interval, self.close = interval, close
         self.ai_on, self.max_rounds, self.once = ai_on, max_rounds, once
         self.zone, self.llm_base = zone, llm_base
         self.llm_key, self.llm_model = llm_key, llm_model
+        self.track_record = track_record
+        self.resident_memory = resident_memory
         self.batch, self.log_path = batch, log_path
         self.opener, self.clock, self.sleep = opener, clock, sleep
         self.feed_builder = feed_builder or feed.build_snapshot
@@ -448,6 +588,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", default=DEFAULT_API)
     parser.add_argument("--universe", default=str(feed.DEFAULT_UNIVERSE))
+    parser.add_argument("--memory-root",
+                        help="directory holding the observer's resident memory")
+    parser.add_argument("--ledger-db",
+                        help="read-only intraday ledger used to measure the observer's "
+                             "own track record; omitted means no track record is sent")
     parser.add_argument("--history-db",
                         default=os.environ.get("ASTOCK_HISTORY_DB"),
                         help="optional sqlite bar DB; missing means no history")
@@ -459,6 +604,171 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--log", default=str(DEFAULT_LOG_PATH))
     return parser
+
+
+def refresh_resident_block(path: str | None, ledger_db: str | None) -> str | None:
+    """Re-measure the resident block from the ledger, then read it back.
+
+    A frozen block describes the days it was built on and slowly stops being
+    true. Re-deriving at each session start keeps the facts on the newest
+    settled sessions while learned rules survive in ``resident.json``.
+    """
+    if not path:
+        return None
+    try:
+        from ai_memory import collect, scorecard
+        from ai_resident import refresh, render_resident, read_resident
+        from pathlib import Path as _Path
+        import sqlite3
+
+        if ledger_db:
+            db = sqlite3.connect(_Path(ledger_db).resolve().as_uri() + "?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            try:
+                refresh(_Path(path), scorecard(collect(db)))
+            finally:
+                db.close()
+        return render_resident(read_resident(_Path(path))) or None
+    except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
+        return load_resident_block(path)
+
+
+AI_DEADLINE_SECS = 26.0
+"""Wall-clock ceiling for one advice request.
+
+The kernel clamps its own provider timeout to 25s, so a healthy call answers
+well inside this bound. The ceiling exists for the failure mode the kernel
+cannot see: connect() to a dead host sitting in SYN-SENT, where no per-socket
+timer fires and the round would otherwise wait far longer than any budget.
+"""
+
+NEWS_DEADLINE_SECS = 20.0
+"""Hard ceiling for one additive enrichment call.
+
+These fetches are enhancement only: a provider that stops answering must not
+hold the round. The transport timeout alone was not enough — an unreachable
+host leaves the socket in SYN-SENT, and several serial lookups stack up far
+past the timer, which is exactly how 2026-11-24 lost five rounds. Enriched
+blocks are therefore run on a worker thread with a wall-clock deadline and
+abandoned when it passes.
+"""
+
+
+def _with_deadline(work: Callable[[], Any], seconds: float = NEWS_DEADLINE_SECS,
+                   label: str = "enrichment") -> Any:
+    """Run ``work`` but give up after ``seconds``; never propagates its errors."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(work).result(timeout=seconds)
+    except FutureTimeout:
+        return None
+    except Exception:  # noqa: BLE001 - additive data is never a precondition
+        return None
+    finally:
+        # Do not join: the abandoned call may still be waiting on a socket.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def fetch_northbound_block() -> Mapping[str, Any] | None:
+    """Northbound flows for this round, when the source can serve them."""
+    def work() -> Mapping[str, Any] | None:
+        from live_news import fetch_northbound
+        from astock_public import PublicClient
+        from source_http import SourceHttp
+        return fetch_northbound(PublicClient(http=SourceHttp(timeout=6)))
+    return _with_deadline(work, label="northbound")
+
+
+def fetch_heat_block() -> Mapping[str, Any] | None:
+    """Market heat and concept tags, fetched once per round."""
+    def work() -> Mapping[str, Any] | None:
+        from live_news import fetch_hot_and_sectors
+        from astock_public import PublicClient
+        from source_http import SourceHttp
+        return fetch_hot_and_sectors(PublicClient(http=SourceHttp(timeout=6)), limit=30)
+    return _with_deadline(work, label="heat")
+
+
+def news_watch_scope(digest: Mapping[str, Any], *,
+                     candidate_limit: int = NEWS_CANDIDATE_LIMIT
+                     ) -> tuple[list[str], list[str]]:
+    """``(holdings, ranked candidates)`` — the names worth a news lookup.
+
+    A name the model may be asked to buy deserves the same news coverage as a
+    holding: blocking a fresh headline about a candidate because only positions
+    were watched is how a round buys into a downgrade it never saw. The
+    candidate list is capped because it only widens substring matching against
+    the two market wires already in hand — it adds no requests, but an unbounded
+    list would let a broad-market digest crowd out the held names.
+    """
+    held = [item.get("symbol") for item in (digest.get("held_positions") or [])
+            if isinstance(item, Mapping) and item.get("symbol")]
+    held = list(dict.fromkeys(held))
+    ranked = [item.get("symbol") for item in (digest.get("ranked_candidates") or [])
+              if isinstance(item, Mapping) and item.get("symbol")]
+    candidates = [symbol for symbol in dict.fromkeys(ranked)
+                  if symbol not in set(held)][:candidate_limit]
+    return held, candidates
+
+
+def fetch_news_block(snapshot: Mapping[str, Any], watch: Sequence[str], *,
+                     per_symbol_watch: Sequence[str] | None = None
+                     ) -> Mapping[str, Any] | None:
+    """Symbol-linked headlines for this round, or nothing when the wires fail.
+
+    News is additive: a provider outage must not stop a round, so a failure
+    returns None and the observer simply reasons without headlines.
+    ``per_symbol_watch`` keeps the slow per-symbol requests on the holdings.
+    """
+    def work() -> Mapping[str, Any] | None:
+        from live_news import digest_news
+        from astock_public import PublicClient
+        from source_http import SourceHttp
+        return digest_news(PublicClient(http=SourceHttp(timeout=6)), snapshot,
+                           watch=watch, per_symbol_watch=per_symbol_watch)
+    return _with_deadline(work, label="news")
+
+
+def load_resident_block(path: str | None) -> str | None:
+    """The resident memory block the observer reads every round.
+
+    Regenerated from the committed ledger by ``ai_resident.refresh``; reading it
+    here is a plain file read so a missing or corrupt block degrades to "no
+    memory" rather than blocking the session.
+    """
+    if not path:
+        return None
+    try:
+        from ai_resident import read_resident, render_resident
+        block = render_resident(read_resident(Path(path)))
+        return block or None
+    except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
+        return None
+
+
+def load_track_record(path: str | None) -> Mapping[str, Any] | None:
+    """Measure the observer's own record from the ledger, or send nothing.
+
+    A failure here must never block trading: an unreadable ledger simply means
+    the model reasons without its history, exactly as it did before.
+    """
+    if not path:
+        return None
+    try:
+        from ai_memory import scorecard, collect
+        from pathlib import Path as _Path
+        import sqlite3
+        db = sqlite3.connect(_Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only=ON")
+        try:
+            return scorecard(collect(db))
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 - memory is an enhancement, not a precondition
+        return None
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -475,6 +785,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         llm_key=os.environ.get("ASTOCK_LLM_KEY", ""),
         llm_model=os.environ.get("ASTOCK_LLM_MODEL", feed.DEFAULT_LLM_MODEL),
         log_path=args.log,
+        track_record=load_track_record(args.ledger_db),
+        resident_memory=refresh_resident_block(args.memory_root, args.ledger_db),
     )
 
 

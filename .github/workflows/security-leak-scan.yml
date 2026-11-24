@@ -34,6 +34,14 @@ jobs:
       - name: Scan the pull request diff only (fast feedback)
         if: github.event_name == 'pull_request'
         run: |
+          # Generate the PR diff and actually scan it. Writing /tmp/pr.diff and
+          # then scanning the worktree meant this step re-reported what the
+          # previous step already covered and never looked at the diff at all.
           git fetch --no-tags origin "${{ github.base_ref }}"
-          git diff --unified=0 "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff || true
-          python scripts/security/scan-sensitive-data.py --repo . --scope worktree
+          git diff --unified=0 "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff
+          wc -l /tmp/pr.diff
+          # `--scope diff --diff` scans the *added* lines of that file. An empty
+          # or unreadable diff is reported as a coverage gap (exit 2) rather than
+          # "clean", so a broken generation cannot pass silently.
+          python scripts/security/scan-sensitive-data.py \
+            --repo . --scope diff --diff /tmp/pr.diff

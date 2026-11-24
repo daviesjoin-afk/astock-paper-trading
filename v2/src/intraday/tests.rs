@@ -79,6 +79,97 @@ fn buy(store: &mut IntradayStore, round_id: &str, day: &str, symbol: &str) -> Ve
 }
 
 #[test]
+fn daily_pnl_uses_the_previous_session_last_equity_and_keeps_cumulative_profit() {
+    let mut db = store();
+    let no_round = db.account_view().unwrap();
+    assert_eq!(no_round.daily_pnl_cents, None);
+    assert_eq!(no_round.daily_pnl_day, None);
+
+    let snapshot = |id, time, quotes| {
+        let mut round = request(id, time, quotes);
+        round.fetched_at = None;
+        round
+    };
+    let market = |price, previous| vec![quote("600000.SH", price, previous)];
+    let first = db.run_round(&snapshot(
+        "open", "2026-11-20T09:30:00+08:00", vec![strong_quote("600000.SH")],
+    )).unwrap();
+    assert!(!first.trades.is_empty());
+    let equity = |outcome: &super::RoundOutcome| outcome.account.equity_cents.unwrap();
+    assert_eq!(first.account.daily_pnl_cents, Some(equity(&first) - CASH));
+    let close = db.run_round(&snapshot(
+        "close", "2026-11-20T14:57:00+08:00", market(1080, 1000),
+    )).unwrap();
+    assert_ne!(equity(&close), equity(&first));
+    assert_eq!(close.account.daily_pnl_cents, Some(equity(&close) - CASH));
+    let monday = db.run_round(&snapshot(
+        "mon-open", "2026-11-23T09:30:00+08:00", market(1075, 1080),
+    )).unwrap();
+    let monday_next = snapshot("mon-next", "2026-11-23T01:33:00Z", market(1070, 1080));
+    let latest = db.run_round(&monday_next).unwrap();
+    assert_ne!(equity(&latest), equity(&monday));
+    let expected = equity(&latest) - equity(&close);
+    assert!(expected < 0);
+    assert_eq!(latest.account.daily_pnl_cents, Some(expected));
+    assert_eq!(latest.account.daily_pnl_day.as_deref(), Some("2026-11-23"));
+    assert_eq!(latest.account.profit_cents, Some(equity(&latest) - CASH));
+    let read = db.account_view().unwrap();
+    assert_eq!(read.daily_pnl_cents, latest.account.daily_pnl_cents);
+    assert_eq!(read.daily_pnl_day, latest.account.daily_pnl_day);
+    assert_eq!(db.run_round(&monday_next).unwrap().account, latest.account);
+}
+
+#[test]
+fn an_ai_sell_of_an_unheld_name_is_recorded_and_cannot_trade() {
+    let mut db = store();
+    let mut round = request("ai-sell", "2026-11-20T09:33:00+08:00",
+                            vec![quote("600000.SH", 1000, 1000)]);
+    round.advice = Some(Advice {
+        confidence: Some(95),
+        suggestions: vec![AdviceSuggestion {
+            symbol: "600000.SH".into(), side: "sell".into(),
+            score_delta: None, weight_bps: None, target_weight_bps: None,
+            reason: None, slot: None,
+        }],
+        ..Advice::default()
+    });
+    let outcome = db.run_round(&round).unwrap();
+    assert!(outcome.trades.is_empty(), "nothing held, so nothing can be sold");
+    let signal = outcome.decisions.iter()
+        .find(|item| item.symbol == "600000.SH").unwrap();
+    assert_ne!(signal.side, "sell");
+    assert!(signal.note.contains("ai_sell_without_position"), "{}", signal.note);
+}
+
+#[test]
+fn the_account_read_carries_the_newest_round_it_describes() {
+    let mut db = store();
+    assert_eq!(db.account_view().unwrap().as_of_round_id, None);
+    db.run_round(&request("r-one", "2026-11-20T09:33:00+08:00",
+                          vec![quote("600000.SH", 1000, 1000)])).unwrap();
+    db.run_round(&request("r-two", "2026-11-20T09:36:00+08:00",
+                          vec![quote("600000.SH", 1005, 1000)])).unwrap();
+    let view = db.account_view().unwrap();
+    assert_eq!(view.as_of_round_id.as_deref(), Some("r-two"));
+    // A replay still describes the round it was committed with, not the newest.
+    let replay = db.run_round(&request("r-one", "2026-11-20T09:33:00+08:00",
+                                       vec![quote("600000.SH", 1000, 1000)])).unwrap();
+    assert!(replay.round.idempotent);
+    assert_eq!(replay.account.as_of_round_id.as_deref(), Some("r-one"));
+}
+
+#[test]
+fn daily_pnl_converts_offset_timestamps_to_shanghai_and_rejects_bad_baselines() {
+    let mut db = store();
+    let leg = |id, at| request(id, at, vec![quote("600000.SH", 1000, 1000)]);
+    db.run_round(&leg("bad", "invalid-timestamp")).unwrap();
+    let latest = db.run_round(&leg("offset", "2026-11-22T19:00:00-06:00")).unwrap();
+    assert_eq!(latest.account.daily_pnl_day.as_deref(), Some("2026-11-23"));
+    assert_eq!(latest.account.daily_pnl_cents, None);
+    assert_eq!(db.account_view().unwrap().daily_pnl_cents, None);
+}
+
+#[test]
 fn a_live_quote_produces_real_fills_with_fees_and_whole_lots() {
     let mut store = store();
     let trades = buy(
@@ -95,7 +186,7 @@ fn a_live_quote_produces_real_fills_with_fees_and_whole_lots() {
         assert_eq!(trade.price_cents, 1_060);
         assert!(trade.fee_cents >= 500, "commission floor is an integer cent");
     }
-    let account = store.account_view(Some("2026-11-20-r1")).unwrap();
+    let account = store.account_view_as_of(Some("2026-11-20-r1")).unwrap();
     assert_eq!(
         account.cash_cents,
         account
@@ -113,6 +204,62 @@ fn a_live_quote_produces_real_fills_with_fees_and_whole_lots() {
     let curve = store.equity_curve().unwrap();
     assert_eq!(curve.len(), 1);
     assert!(curve[0].equity_cents > 0);
+}
+
+#[test]
+fn a_utc_spelling_of_the_same_session_does_not_roll_the_day() {
+    // 2026-11-20T00:30:00+00:00 and 2026-11-20T08:30:00+08:00 are the same
+    // Shanghai session. Truncating the raw string made the second one look like
+    // a *newer* day in one direction and an older one in the other; either way
+    // it could roll the day and unlock shares bought this morning.
+    let mut store = store();
+    buy(&mut store, "r-buy", "2026-11-20", "600000.SH");
+    let mut bearish = quote("600000.SH", 900, 1_060);
+    bearish.high_cents = Some(905);
+    bearish.low_cents = Some(895);
+    bearish.open_cents = Some(900);
+    bearish.volume = Some(20_000);
+    bearish.avg_volume = Some(300_000);
+    let same_session = store
+        .run_round(&request(
+            "r-utc-spelling",
+            "2026-11-20T01:57:00+00:00", // 09:57 Shanghai, same day
+            vec![bearish.clone()],
+        ))
+        .unwrap();
+    assert!(
+        same_session.trades.iter().all(|trade| trade.side != "sell"),
+        "a differently spelled timestamp of the same session must not unlock T+1"
+    );
+    let account = store.account_view().unwrap();
+    let held: Vec<_> = account.positions.iter().filter(|item| item.quantity > 0).collect();
+    assert!(!held.is_empty(), "the position is still held");
+    assert!(
+        held.iter().all(|item| item.sellable_quantity == 0),
+        "T+1 still blocks the sale"
+    );
+}
+
+#[test]
+fn a_round_dated_before_the_rolled_day_is_refused() {
+    // Out-of-order rounds must fail closed. Accepting one would let a caller
+    // step the day backwards and re-open an already-closed session.
+    let mut store = store();
+    buy(&mut store, "r-buy", "2026-11-20", "600000.SH");
+    store
+        .roll_trading_day("2026-11-21", "2026-11-21T09:15:00+08:00")
+        .unwrap();
+    let error = store
+        .run_round(&request(
+            "r-late",
+            "2026-11-20T14:57:00+08:00",
+            vec![quote("600000.SH", 1_050, 1_000)],
+        ))
+        .expect_err("an earlier session cannot be revisited");
+    assert!(
+        error.to_string().contains("round_day_out_of_order"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -145,7 +292,7 @@ fn same_day_bought_shares_are_not_sellable_and_a_new_day_rolls_once() {
     store
         .roll_trading_day("2026-11-21", "2026-11-21T09:15:00+08:00")
         .unwrap();
-    let account = store.account_view(None).unwrap();
+    let account = store.account_view().unwrap();
     assert_eq!(account.positions.len(), 2);
     assert!(account.positions.iter().all(|item| item.sellable_quantity == item.quantity));
     let next_day = store
@@ -163,7 +310,7 @@ fn same_day_bought_shares_are_not_sellable_and_a_new_day_rolls_once() {
             .count(),
         2
     );
-    assert!(store.account_view(None).unwrap().positions.is_empty());
+    assert!(store.account_view().unwrap().positions.is_empty());
     assert!(
         store
             .roll_trading_day("2026-11-21", "2026-11-21T10:00:00+08:00")
@@ -222,7 +369,7 @@ fn sealed_limit_up_and_limit_down_quotes_cannot_fill_their_blocked_side() {
             .iter()
             .all(|decision| decision.blocked_reason.as_deref() == Some("limit_down_sealed"))
     );
-    assert_eq!(db.account_view(None).unwrap().positions.len(), 2);
+    assert_eq!(db.account_view().unwrap().positions.len(), 2);
 }
 
 #[test]
@@ -305,7 +452,7 @@ fn clamped_ai_advice_changes_the_fill_but_never_escapes_rust_bounds() {
         .sum();
     let ai_quantity: i64 = ai.trades.iter().map(|trade| trade.quantity).sum();
     assert!(ai_quantity > 0 && ai_quantity < neutral_quantity);
-    assert!(ai_store.account_view(None).unwrap().cash_cents >= 0);
+    assert!(ai_store.account_view().unwrap().cash_cents >= 0);
 }
 
 #[test]
@@ -399,7 +546,7 @@ fn cash_never_goes_negative_and_a_missing_price_never_becomes_prev_close() {
             vec![expensive.clone()],
         ))
         .unwrap();
-    let account = db.account_view(Some("r-expensive")).unwrap();
+    let account = db.account_view_as_of(Some("r-expensive")).unwrap();
     assert!(account.cash_cents >= 0);
     assert!(account.slots.iter().all(|slot| slot.cash_cents >= 0));
     assert_eq!(account.cash_cents, CASH - outcome.trades.iter().map(|item| {
@@ -466,7 +613,7 @@ fn two_slots_hold_separate_books_and_all_candidates_are_auditable() {
     assert!(outcome.round.note.contains("snapshot_only=2"), "{}", outcome.round.note);
     assert!(!outcome.round.note.contains("no_trailing_history_supplied"),
             "{}", outcome.round.note);
-    let account = store.account_view(None).unwrap();
+    let account = store.account_view().unwrap();
     assert_eq!(account.slots.len(), 2);
     assert_eq!(
         account.slots[0].cash_cents + account.slots[1].cash_cents,
@@ -636,7 +783,7 @@ fn one_named_quote_reaches_trades_positions_decisions_and_labels() {
         "r-later", "2026-11-20T09:34:00+08:00", vec![later])).unwrap();
     assert!(later_outcome.decisions.iter()
         .all(|decision| decision.name.as_deref() == Some("平安银行")));
-    let view = store.account_view(None).unwrap();
+    let view = store.account_view().unwrap();
     assert!(view.positions.iter()
         .all(|position| position.name.as_deref() == Some("平安银行")));
     assert!(store.trades().unwrap().iter()
@@ -687,7 +834,7 @@ fn a_missing_name_stays_null_and_is_never_inferred_from_the_symbol() {
     assert!(outcome.decisions.iter().all(|decision| decision.name.is_none()));
     assert!(outcome.account.positions.iter()
         .all(|position| position.name.is_none()));
-    let view = store.account_view(None).unwrap();
+    let view = store.account_view().unwrap();
     assert!(view.positions.iter().all(|position| position.name.is_none()));
     assert!(store.trades().unwrap().iter().all(|trade| trade.name.is_none()));
     assert!(store.decisions("r-blank").unwrap().iter()
@@ -764,7 +911,7 @@ fn account_positions_carry_latest_price_and_real_market_value() {
         vec![quote("600000.SH", 1_100, 1_060)],
     )).unwrap();
 
-    let view = store.account_view(None).unwrap();
+    let view = store.account_view().unwrap();
     assert_eq!(view.positions.len(), 2, "both independent slot books hold it");
     for position in &view.positions {
         assert_eq!(position.last_price_cents, Some(1_100),
@@ -821,7 +968,7 @@ fn a_symbol_without_a_price_in_the_newest_round_keeps_its_own_last_real_mark() {
         [], |row| row.get(0)).unwrap();
     assert_eq!(stored_zero, 0, "the halt row really has no live price");
 
-    let view = store.account_view(None).unwrap();
+    let view = store.account_view().unwrap();
     assert!(halt.trades.iter().all(|trade| trade.symbol != "600000.SH"));
     assert!(halt.decisions.iter().filter(|decision| decision.symbol == "600000.SH")
         .all(|decision| decision.blocked_reason.as_deref() == Some("no_live_price")));
@@ -874,7 +1021,7 @@ fn a_position_without_any_snapshot_has_null_mark_and_market_value() {
         "SELECT count(*) FROM quote_snapshot WHERE symbol='999999.SH'",
         [], |row| row.get::<_, i64>(0)).unwrap(), 0);
 
-    let view = store.account_view(None).unwrap();
+    let view = store.account_view().unwrap();
     let position = view.positions.iter()
         .find(|item| item.symbol == "999999.SH").expect("seeded position is read");
     assert_eq!(position.last_price_cents, None, "no snapshot is not zero");
@@ -925,7 +1072,7 @@ fn derived_marks_are_never_written_into_the_position_table() {
         .collect::<Result<_, _>>().unwrap();
     assert_eq!(raw.len(), 2);
     assert!(raw.iter().all(|(quantity, avg_cost)| *quantity > 0 && *avg_cost == 1_060));
-    let view = store.account_view(None).unwrap();
+    let view = store.account_view().unwrap();
     assert!(view.positions.iter()
         .all(|position| position.last_price_cents == Some(1_300)));
     assert_eq!(store.conn.query_row(
@@ -1886,4 +2033,85 @@ fn research_strong_relief_can_grab_a_near_threshold_opportunity() {
     assert_eq!(after.round.regime, "risk_on");
     assert!(before.trades.iter().all(|trade| trade.slot != Slot::Steady));
     assert!(after.trades.iter().any(|trade| trade.slot == Slot::Steady && trade.side == "buy"));
+}
+
+#[test]
+fn a_mid_session_round_is_not_republished_as_the_daily_close() {
+    // A restart at 11:30 leaves a real round behind. It is a genuine
+    // observation, but it is not the close: republishing it as `bar` for that
+    // day both mis-prices the session and overwrites the exchange's own row.
+    let mut store = store();
+    // Round ids carry the session date in production; the close snapshot is
+    // republished under that date, so the fixture has to use the real shape.
+    let midday = request(
+        "2026-11-20-113000",
+        "2026-11-20T11:30:00+08:00",
+        vec![quote("600000.SH", 1_050, 1_000)],
+    );
+    store.run_round(&midday).unwrap();
+    assert!(
+        store.closing_bars_from_snapshots(None).unwrap().is_empty(),
+        "an 11:30 print is not the day's close"
+    );
+
+    // A genuine close-time round is republished, with the close price.
+    let closing = request(
+        "2026-11-20-150000",
+        "2026-11-20T15:00:00+08:00",
+        vec![quote("600000.SH", 1_080, 1_000)],
+    );
+    store.run_round(&closing).unwrap();
+    let bars = store.closing_bars_from_snapshots(None).unwrap();
+    let bar = bars
+        .iter()
+        .find(|item| item.symbol == "600000.SH" && item.day == "2026-11-20")
+        .expect("the closing round is republished");
+    assert_eq!(bar.close_cents, 1_080);
+    assert_eq!(bar.source, "live");
+}
+
+#[test]
+fn the_stated_basis_is_persisted_so_a_close_review_can_read_it() {
+    // Both prompts ask for market_state.evidence. Dropping it on the way into
+    // the ledger left the close review reading the prose reason for hints
+    // instead of the numbers the model said it used.
+    let mut store = store();
+    let mut round = request(
+        "2026-11-20-093100",
+        "2026-11-20T09:31:00+08:00",
+        vec![strong_quote("600000.SH")],
+    );
+    round.advice = Some(super::Advice {
+        model: Some("test-model".into()),
+        raw_advice: Some(json!({
+            "bias": 0,
+            "reason": "观察",
+            "market_state": {
+                "evidence": "沪股通 +379.8 亿 / 深股通 -9.3 亿",
+                "counterpoint": "冲高回落占比偏高"
+            }
+        })),
+        ..Default::default()
+    });
+    let outcome = store.run_round(&round).unwrap();
+    let state = outcome
+        .ai
+        .market_state
+        .as_ref()
+        .expect("the stated basis is kept");
+    assert_eq!(state.evidence.as_deref(), Some("沪股通 +379.8 亿 / 深股通 -9.3 亿"));
+    assert_eq!(state.counterpoint.as_deref(), Some("冲高回落占比偏高"));
+
+    // An answer without a basis stores none rather than inventing one.
+    let mut plain = request(
+        "2026-11-20-093400",
+        "2026-11-20T09:34:00+08:00",
+        vec![strong_quote("600000.SH")],
+    );
+    plain.advice = Some(super::Advice {
+        model: Some("test-model".into()),
+        raw_advice: Some(json!({"bias": 0, "reason": "观察"})),
+        ..Default::default()
+    });
+    assert!(store.run_round(&plain).unwrap().ai.market_state.is_none());
 }

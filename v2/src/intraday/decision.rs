@@ -18,7 +18,11 @@ pub const MAX_WEIGHT_TILT_BPS: i64 = 1_000;
 pub const MAX_SUGGESTION_SCORE_DELTA: i64 = 20;
 pub const MAX_SUGGESTION_WEIGHT_BPS: i64 = 2_000;
 pub const MAX_ADVICE_ITEMS: usize = 8;
-pub const MAX_BLOCKED_SYMBOLS: usize = 5;
+// The live AI sees the whole tradable market, so the "do not buy" list must be
+// able to name every name it actually found dangerous. At 5 the model was
+// structurally forced to drop the rest: measured 11:03-11:09, 5-15 candidates
+// per round carried trap risk >= 30 while only 1-2 of them ever appeared here.
+pub const MAX_BLOCKED_SYMBOLS: usize = 40;
 pub const MAX_TEXT_CHARS: usize = 512;
 pub const MAX_RAW_ADVICE_CHARS: usize = 16_000;
 const MAX_FACTOR_BPS: i64 = 1_000_000;
@@ -130,6 +134,20 @@ pub struct AiApplication {
     pub signal_baseline: Option<SignalBaseline>,
     #[serde(default)]
     pub mode: String,
+    /// The model's own stated basis, when it gives one. Both prompts ask for
+    /// `market_state.evidence` / `counterpoint`; persisting it is what lets a
+    /// close review check *why* a round decided what it did instead of reading
+    /// the prose `reason` for hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_state: Option<MarketState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterpoint: Option<String>,
 }
 
 impl AiApplication {
@@ -151,6 +169,7 @@ impl AiApplication {
             ai_error: Some(reason.into()),
             signal_baseline: None,
             mode: "advisory".into(),
+            market_state: None,
         }
     }
 
@@ -486,6 +505,16 @@ fn clamp_inner(round_id: &str, advice: Option<Advice>) -> AiApplication {
         signal_baseline: None,
         ai_error,
         mode,
+        market_state: raw_map.get("market_state").and_then(|value| {
+            let object = value.as_object()?;
+            let field = |key: &str| {
+                object.get(key).and_then(Value::as_str)
+                    .map(|text| truncate_chars(text.trim(), MAX_TEXT_CHARS))
+                    .filter(|text| !text.is_empty())
+            };
+            let state = MarketState { evidence: field("evidence"), counterpoint: field("counterpoint") };
+            (state.evidence.is_some() || state.counterpoint.is_some()).then_some(state)
+        }),
     }
 }
 
@@ -938,6 +967,12 @@ pub(super) fn score_candidates_for_research(
                 || (slot == Slot::Steady && mom_prev >= 600 && limit_dist <= 180)
                 || (mom_prev >= 350 && vwap_distance_bps.is_some_and(|v| v <= -180) && mom_open <= -50);
             if ai_active {
+                // The model sometimes names a symbol it only read in the market
+                // table. A sale of something not held cannot execute; record it
+                // instead of letting the audit imply an order was placed.
+                if held.is_none() && suggestion_side == Some("sell") {
+                    notes.push("ai_sell_without_position".into());
+                }
                 if held.is_some() && suggestion_side == Some("sell") {
                     side = "sell".into();
                     notes.push("ai_force_sell".into());
@@ -1133,7 +1168,9 @@ mod tests {
                 "bias": 1000,
                 "entry_delta": -1000,
                 "weight_tilt_bps": 5000,
-                "blocked_symbols": ["A", "B", "C", "D", "E", "F"],
+                "blocked_symbols": (0..MAX_BLOCKED_SYMBOLS + 3)
+                    .map(|i| format!("B{i:03}"))
+                    .collect::<Vec<_>>(),
                 "suggestions": [
                     {"symbol": "600000.SH", "side": "buy", "score_delta": 1000, "weight_bps": 9999}
                 ],
