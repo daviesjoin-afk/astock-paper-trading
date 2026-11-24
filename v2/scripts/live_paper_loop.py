@@ -631,12 +631,13 @@ def refresh_resident_block(path: str | None, ledger_db: str | None) -> str | Non
         return load_resident_block(path)
 
 
-AI_DEADLINE_SECS = 45.0
-"""Wall-clock ceiling for one advice request, including the kernel's own wait.
+AI_DEADLINE_SECS = 26.0
+"""Wall-clock ceiling for one advice request.
 
-The kernel already clamps its provider timeout to 25s; this allowance covers
-that plus transport overhead, and exists to stop a dead endpoint from stalling
-the round indefinitely.
+The kernel clamps its own provider timeout to 25s, so a healthy call answers
+well inside this bound. The ceiling exists for the failure mode the kernel
+cannot see: connect() to a dead host sitting in SYN-SENT, where no per-socket
+timer fires and the round would otherwise wait far longer than any budget.
 """
 
 NEWS_DEADLINE_SECS = 20.0
