@@ -5,6 +5,78 @@
 
 ---
 
+## 〇、接入方式（交接第一站）
+
+### 服务器
+
+```bash
+ssh -F /dev/null -i ~/.ssh/id_ed25519_astock     -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10     ubuntu@138.2.225.86
+```
+
+| 项 | 值 |
+| --- | --- |
+| 主机 | `138.2.225.86`（Oracle Cloud，公网 IP） |
+| 用户 | `ubuntu`（有免密 sudo） |
+| 私钥 | `~/.ssh/id_ed25519_astock`（当前用户 `Administrator`） |
+| 架构 | `aarch64` / ARM64 — **必须在服务器本机编译**，不能传 Windows 产物 |
+| 公网前端 | `http://138.2.225.86:8600`（nginx，默认 `#/live/dashboard`） |
+| 内核 API | `127.0.0.1:18765`（仅本机回环，不对外） |
+
+固定路径：
+
+| 路径 | 用途 |
+| --- | --- |
+| `/opt/astock-live/bin/astock-v2` | 内核二进制 |
+| `/opt/astock-live/scripts/` | 调度与 AI 脚本（`live_paper_loop.py` 等） |
+| `/opt/astock-live/data_sources/` | 数据层 |
+| `/etc/astock-live.env` | 环境变量与 LLM 凭据（`root` 可读） |
+| `/var/lib/astock-live/intraday.sqlite3` | **盘中账本**（唯一事实来源） |
+| `/var/lib/astock-live-memory/resident.json` | AI 常驻记忆 |
+| `/opt/astock-v2-rewrite/web/` | nginx 静态根（**不是** `/opt/astock-live/web`） |
+| `/opt/astock-live/backups/` | 部署备份，回滚从这里取 |
+
+服务（systemd）：
+
+| 单元 | 作用 |
+| --- | --- |
+| `astock-live.service` | Rust 内核（HTTP + 账本） |
+| `astock-live-loop.service` | Python 调度：每 180 s 一轮，含 AI 观察 |
+| `astock-live-watch.timer` | 看门狗（只记录，不改状态） |
+| `astock-live-evolution.timer` | 收盘进化 |
+| `nginx.service` | 公网 8600 |
+
+### GitHub
+
+| 项 | 值 |
+| --- | --- |
+| 仓库 | `https://github.com/daviesjoin-afk/astock-paper-trading` |
+| PR | **#493** `codex/v2-ai-context-and-daily-pnl` → `release/v2-source-2026-11-20`（OPEN / MERGEABLE） |
+| 工作副本 | `D:/Codex/astock-v2/work/v2-today-pnl` |
+| 当前 HEAD | `1934db5`（已推送到 PR 分支） |
+
+**注意分支名不一致**：本地分支叫 `codex/v2-today-pnl`，推送目标是 `codex/v2-ai-context-and-daily-pnl`（即 PR #493 的 head）。推送时必须显式指定：
+
+```bash
+cd D:/Codex/astock-v2/work/v2-today-pnl
+git push origin HEAD:refs/heads/codex/v2-ai-context-and-daily-pnl
+```
+
+CI（5 项，PR 触发）：`rust-kernel`、`data-sources`、`web-ui`、`web-e2e`、`security-leak-scan`。全部为绿才算可合并。
+
+### 本轮连接状态（2026-11-24 10:30）
+
+**当前连不上服务器。** 实测：
+
+- `ping 138.2.225.86` → 2 发包 0 收，100% 丢包
+- TCP `22` / `8600` / `443` → 全部 blocked
+- 同期 `github.com`、`api.github.com` → 200，出网正常
+
+即本机到该主机的路由/防火墙中断，不是密钥或账号问题（`known_hosts` 有该主机记录，私钥存在）。
+上一节「当前运行状态」的数据采集于 **10:24–10:25**，当时连接正常；之后失去连接。
+**恢复方式**：先在 Oracle Cloud 控制台确认实例是否在运行、安全组是否放行 22；如在运行则多半是网络侧，重启实例或更换出网路径。
+
+---
+
 ## 一、当前运行状态（事实）
 
 | 项 | 实测值 |
@@ -167,3 +239,4 @@ ssh ... 'for u in https://qt.gtimg.cn/ https://push2.eastmoney.com/ https://dq.1
 - 今日 +¥3,349 的归因只能到"规则策略"，**不能归因于 AI**。
 - 交易时段内改了调度脚本（加超时上限）并重启过一次 loop，09:59 之后轮次才恢复。09:41–09:59 的轮次缺失是这个原因，不是账本问题。
 - 未验证：AI 恢复后的实际决策质量、新闻输入恢复后的禁买效果、恢复后的缓存命中率。
+- **10:30 之后无法连接服务器**（ping 与 22/8600/443 全不通，同期 GitHub 正常）。文档里所有运行数据止于 10:25，之后的状态未知，不能当作仍在正常运行。
